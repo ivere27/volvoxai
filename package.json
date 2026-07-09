@@ -1,0 +1,33 @@
+{
+  "name": "volvoxai",
+  "version": "0.1.0",
+  "description": "A Zero-Dependency, Bare-Metal Deep Learning Engine for the Browser and Node.js",
+  "main": "js/index.js",
+  "type": "module",
+  "bin": {
+    "volvox": "./bin/volvox.js"
+  },
+  "files": [
+    "bin/",
+    "dist/",
+    "docs/",
+    "js/",
+    "shaders/",
+    "volvoxai.wasm"
+  ],
+  "scripts": {
+    "build": "esbuild js/index.js --bundle --format=esm --loader:.wgsl=text --outfile=dist/volvoxai.js",
+    "build:min": "esbuild js/index.js --bundle --minify --format=esm --loader:.wgsl=text --outfile=dist/volvoxai.min.js",
+    "build:all": "npm run build && npm run build:min",
+    "test": "echo 'Run tests manually for now'",
+    "start": "node ./bin/volvox.js"
+  },
+  "dependencies": {
+    "commander": "^11.1.0"
+  },
+  "devDependencies": {
+    "esbuild": "^0.28.1"
+  },
+  "author": "",
+  "license": "MIT"
+}

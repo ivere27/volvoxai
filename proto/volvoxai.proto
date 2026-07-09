@@ -1,0 +1,513 @@
+// VolvoxAI Protocol Contract
+//
+// One contract, two transports: Synurang FFI (in-process libvolvoxai) and
+// network gRPC (volvoxai as a server). Because Synurang implements
+// grpc.ClientConnInterface, the generated client is identical whether messages
+// travel over FFI, IPC, or TCP — only the dial call differs.
+//
+// ─── Model model ───
+//
+// A "model" is a Volvox blueprint: a config.json graph plus a .safetensors
+// weight file (the topology may instead be embedded in the safetensors
+// __metadata__). LoadModel parses the blueprint and builds the graph ONCE,
+// returning a model_id handle (cf. native/engine.h engine_init). Every
+// inference RPC references that handle (cf. engine_forward); UnloadModel frees
+// it (cf. engine_free_ctx). Weights are never reloaded per call.
+//
+// ─── Two layers ───
+//
+//   Layer 1 — generic tensor I/O (Run, Generate, GetTensor): a 1:1 mapping of
+//     the C engine that works for any blueprint.
+//   Layer 2 — task convenience (Classify, Detect, RecognizeCTC): bakes in the
+//     pre/post-processing that lives in native/main.c (image decode + normalize,
+//     top-k, non-max suppression, tokenizer) so thin clients send an image and
+//     get results.
+//
+// ─── Partial-update semantics ───
+//
+// Configuration uses `optional` fields. Only fields that are explicitly set are
+// applied; unset fields keep the engine default (matching the CLI flag
+// defaults in native/main.c).
+//
+// ─── FFI zero-copy contract ───
+//
+// Per Synurang, `bytes` fields are passed zero-copy but the backing memory is
+// only valid for the duration of the call. Handlers MUST copy input bytes into
+// the engine arena synchronously, and MUST fully populate output bytes before
+// returning. Streamed messages (GenerateEvent) must own their data.
+//
+// ─── Tensor layout ───
+//
+// Tensor.data is little-endian, row-major (C-contiguous), matching the engine's
+// in-memory buffers. VolvoxAI is channels-last only: every 4-D image/feature
+// tensor is NHWC. There is no NCHW path — exporters must transpose to NHWC at
+// export time.
+
+syntax = "proto3";
+package volvoxai.v1;
+
+import "google/protobuf/empty.proto";
+
+option go_package   = "github.com/ivere27/volvoxai/go/api/v1";
+option java_package = "io.github.ivere27.volvoxai";
+option java_multiple_files = true;
+
+// ═══════════════════════════════════════════════════════════
+// VolvoxAIService — the whole surface, one service.
+// ═══════════════════════════════════════════════════════════
+service VolvoxAIService {
+  // ── Health & capabilities ──
+  rpc Ping(google.protobuf.Empty)          returns (PingResponse);
+  rpc GetCapabilities(google.protobuf.Empty) returns (Capabilities);
+
+  // ── Model lifecycle & introspection ──
+  rpc LoadModel(LoadModelRequest)       returns (LoadModelResponse);    // engine_init
+  rpc UnloadModel(ModelRef)             returns (google.protobuf.Empty); // engine_free_ctx
+  rpc GetModelInfo(ModelRef)            returns (ModelInfo);
+  rpc ListModels(google.protobuf.Empty) returns (ListModelsResponse);
+
+  // ── Layer 1: generic tensor I/O (any blueprint) ──
+  rpc Run(RunRequest)                   returns (RunResponse);          // engine_forward
+  rpc Generate(GenerateRequest)         returns (stream GenerateEvent); // prefill + decode
+  rpc GetTensor(GetTensorRequest)       returns (Tensor);               // engine_tensor_ptr (debug)
+
+  // ── Layer 2: task convenience (bakes in pre/post-processing) ──
+  rpc Classify(ClassifyRequest)         returns (ClassifyResponse);
+  rpc Detect(DetectRequest)             returns (DetectResponse);       // includes NMS
+  rpc RecognizeCTC(CTCRequest)          returns (CTCResponse);          // OCR
+}
+
+// ═══════════════════════════════════════════════════════════
+// Building blocks
+// ═══════════════════════════════════════════════════════════
+
+// Element / storage type of a tensor. Numbers are grouped by family with gaps
+// so new types can be appended without renumbering. NEVER reuse or renumber a
+// value once shipped — that silently breaks the wire format.
+//
+//   1–7    floating point
+//   8–15   signed integer   (incl. sub-byte)
+//   16–23  unsigned integer (incl. sub-byte)
+//   24+    misc
+//
+// Sub-byte types (I4/U4) pack two elements per byte: element 2k in the low
+// nibble, 2k+1 in the high nibble. Each row along the last dimension is packed
+// independently; an odd-length row leaves the final high nibble unused. F16/BF16
+// are little-endian 2-byte. Quantized values carry their scale/zero-point in
+// Tensor.quant, so a sub-byte dtype here is only the *storage*; the dequant
+// scheme (per-tensor / per-channel / per-block) lives in Quantization.
+enum DType {
+  DTYPE_UNSPECIFIED = 0;
+
+  // floating point
+  DTYPE_F32  = 1;
+  DTYPE_F16  = 2;
+  DTYPE_BF16 = 3;
+  DTYPE_F64  = 4;
+
+  // signed integer
+  DTYPE_I8   = 8;
+  DTYPE_I16  = 9;
+  DTYPE_I32  = 10;
+  DTYPE_I64  = 11;
+  DTYPE_I4   = 12;   // packed 2-per-byte
+
+  // unsigned integer
+  DTYPE_U8   = 16;
+  DTYPE_U16  = 17;
+  DTYPE_U32  = 18;
+  DTYPE_U64  = 19;
+  DTYPE_U4   = 20;   // packed 2-per-byte
+
+  // misc
+  DTYPE_BOOL = 24;
+}
+
+// Raw tensor. `data` is little-endian, row-major (C-contiguous), matching the
+// engine's in-memory layout — enables zero-copy over FFI. For quantized/packed
+// integer dtypes, `quant` says how to dequantize; absent means `dtype` is the
+// literal value type.
+message Tensor {
+  string                name  = 1;
+  repeated int64        shape = 2;   // NHWC (channels-last), e.g. [1,224,224,3]
+  DType                 dtype = 3;
+  bytes                 data  = 4;
+  optional Quantization quant = 5;
+}
+
+// Dequantization descriptor: real = (stored - zero_point) * scale.
+//   PER_TENSOR  one scale/zero_point for the whole tensor.
+//   PER_AXIS    one per slice along `axis` (a.k.a. per-channel).
+//   PER_BLOCK   one per contiguous group of `block_size` elements along `axis`
+//               (a.k.a. group-wise; what int4/int8 weight quant typically uses).
+// `zero_points` empty ⇒ symmetric (zero_point = 0). `scales`/`zero_points`
+// length is 1 for PER_TENSOR, dim(axis) for PER_AXIS, or num_blocks for
+// PER_BLOCK. Leaving quant unset marks the tensor as not quantized.
+message Quantization {
+  QuantScheme    scheme      = 1;
+  int32          axis        = 2;   // PER_AXIS / PER_BLOCK
+  int32          block_size  = 3;   // PER_BLOCK: elements per group (e.g. 32/64/128)
+  repeated float scales      = 4;
+  repeated int32 zero_points = 5;
+}
+enum QuantScheme {
+  QUANT_SCHEME_UNSPECIFIED = 0;
+  QUANT_PER_TENSOR = 1;
+  QUANT_PER_AXIS   = 2;
+  QUANT_PER_BLOCK  = 3;
+}
+
+// Shape/dtype only, for introspection.
+message TensorSpec {
+  string         name  = 1;
+  repeated int64 shape = 2;        // -1 marks a dynamic dimension
+  DType          dtype = 3;
+}
+
+enum Backend {
+  BACKEND_UNSPECIFIED = 0;         // auto-select (CPU unless a GPU backend is requested)
+  BACKEND_CPU    = 1;
+  BACKEND_VULKAN = 2;
+  BACKEND_OPENGL = 3;
+  BACKEND_METAL  = 4;
+  BACKEND_NNAPI  = 5;
+}
+
+// Execution options. Partial-update: only set fields are applied. May be given
+// at LoadModel (handle default) and/or per call (override). Maps to the CLI
+// flags in native/main.c.
+message ExecOptions {
+  optional Backend backend     = 1;   // --vulkan | --opengl | --metal | --nnapi
+  optional int32   num_threads = 2;   // --num_threads
+  optional bool    debug       = 3;   // --debug
+  optional int32   warmup_runs = 4;   // --warmup_runs
+  optional int32   num_runs    = 5;   // --num_runs (bench; fills Timing)
+}
+
+// Per-run timing, reported when num_runs > 1.
+message Timing {
+  double first_ms = 1;
+  double avg_ms   = 2;
+  double min_ms   = 3;
+  double max_ms   = 4;
+}
+
+// Image input for the task layer. The server decodes `encoded` via stb_image.
+message Image {
+  oneof source {
+    bytes  encoded = 1;   // PNG/JPEG bytes -> decoded to NHWC
+    Tensor tensor  = 2;   // already-decoded [1,H,W,C] or [H,W,C]
+  }
+  string    input_name = 3;   // graph input to bind (optional if unambiguous)
+  Normalize normalize  = 4;
+}
+enum Normalize {
+  NORMALIZE_ZERO_ONE      = 0;  // /255 (default)   --image-normalize zero-one
+  NORMALIZE_MINUS_ONE_ONE = 1;  //                  minus-one-one
+  NORMALIZE_RAW_255       = 2;  //                  raw-255
+}
+
+// Blueprint operator (the `opType` of a graph node). Mirrors docs/operation_list.md.
+// Numbers are grouped by family with gaps; append new ops in the right block and
+// NEVER renumber. Where an op is reported (OpSupport, OpCount) the raw opType
+// string travels alongside, so a value this enum does not yet know still arrives
+// by name as OP_UNSPECIFIED + op_name. Exporter aliases (Linear/Gemm, SiLU/Swish,
+// Expand/Broadcast, Where/Mask, Interp1D/InterpLinear1D, Upsample2x/
+// UpsampleNearest2D, AveragePool/AveragePool2D) each keep a distinct value; the
+// graph loader normalizes them at load time.
+enum OpType {
+  OP_UNSPECIFIED = 0;
+
+  // Dense / matmul
+  OP_MATMUL = 1;
+  OP_LINEAR = 2;
+  OP_GEMM   = 3;
+
+  // Convolution
+  OP_CONV2D           = 10;
+  OP_CONV1D           = 11;
+  OP_CONV_TRANSPOSE2D = 12;
+  OP_QCONV2D          = 13;
+
+  // Normalization
+  OP_LAYER_NORM   = 20;
+  OP_RMS_NORM     = 21;
+  OP_BATCH_NORM2D = 22;
+
+  // Embedding / attention
+  OP_EMBEDDING       = 30;
+  OP_SDPA            = 31;
+  OP_CROSS_SDPA      = 32;
+  OP_CROSS_ATTENTION = 33;
+
+  // Pooling
+  OP_MAX_POOL2D          = 40;
+  OP_AVERAGE_POOL        = 41;
+  OP_AVERAGE_POOL2D      = 42;
+  OP_GLOBAL_AVERAGE_POOL = 43;
+
+  // Resize / interpolation
+  OP_RESIZE             = 50;
+  OP_RESIZE_NEAREST2D   = 51;
+  OP_UPSAMPLE_NEAREST2D = 52;
+  OP_UPSAMPLE2X         = 53;
+  OP_INTERP_LINEAR1D    = 54;
+  OP_INTERP1D           = 55;
+
+  // Activations
+  OP_RELU         = 60;
+  OP_LEAKY_RELU   = 61;
+  OP_PRELU        = 62;
+  OP_GELU         = 63;
+  OP_SILU         = 64;
+  OP_SWISH        = 65;
+  OP_SIGMOID      = 66;
+  OP_HARD_SWISH   = 67;
+  OP_HARD_SIGMOID = 68;
+  OP_TANH         = 69;
+  OP_CLIP         = 70;
+
+  // Elementwise binary
+  OP_ADD = 80;
+  OP_MUL = 81;
+  OP_SUB = 82;
+  OP_DIV = 83;
+
+  // Reductions
+  OP_SOFTMAX     = 90;
+  OP_LOG_SOFTMAX = 91;
+  OP_REDUCE_SUM  = 92;
+  OP_REDUCE_MEAN = 93;
+  OP_ARGMAX      = 94;
+
+  // Shape / data movement
+  OP_TRANSPOSE = 100;
+  OP_CONCAT    = 101;
+  OP_CONCAT2   = 102;
+  OP_SPLIT     = 103;
+  OP_SLICE     = 104;
+  OP_PAD       = 105;
+  OP_EXPAND    = 106;
+  OP_BROADCAST = 107;
+  OP_RESHAPE   = 108;
+  OP_FLATTEN   = 109;
+  OP_SQUEEZE   = 110;
+  OP_UNSQUEEZE = 111;
+
+  // Gather
+  OP_GATHER          = 120;
+  OP_GATHER_ELEMENTS = 121;
+
+  // Select / cast
+  OP_WHERE = 130;
+  OP_MASK  = 131;
+  OP_CAST  = 132;
+
+  // Quantization
+  OP_DEQUANTIZE_LINEAR = 140;
+  OP_QUANTIZE_LINEAR   = 141;
+
+  // Detection
+  OP_NON_MAX_SUPPRESSION = 150;
+
+  // Custom vision primitives
+  OP_SPATIAL_SOFTARGMAX_Y = 160;
+  OP_PROFILE_X            = 161;
+  OP_PROFILE_Y            = 162;
+  OP_MEAN_HEIGHT          = 163;
+
+  // Passthrough / shape info
+  OP_DROPOUT  = 170;
+  OP_IDENTITY = 171;
+  OP_SHAPE    = 172;
+  OP_SIZE     = 173;
+  OP_TOPK     = 174;
+}
+
+// Per-op support level on a backend. Mirrors the operation_list.md status legend.
+enum SupportLevel {
+  SUPPORT_UNSPECIFIED = 0;
+  SUPPORT_FULL      = 1;   // implemented on the normal runtime path
+  SUPPORT_PARTIAL   = 2;   // shape/axis/dtype/layout/size/mode limits
+  SUPPORT_FALLBACK  = 3;   // delegates to a lower-level reference helper
+  SUPPORT_MISSING   = 4;   // not wired on this backend
+  SUPPORT_ALIAS     = 5;   // shape-only / alternate spelling of another op
+  SUPPORT_INIT_ONLY = 6;   // backend initializes but has no per-op dispatch
+}
+
+// Handle to a loaded model.
+message ModelRef { string model_id = 1; }
+
+// ═══════════════════════════════════════════════════════════
+// Health
+// ═══════════════════════════════════════════════════════════
+message PingResponse {
+  string           version            = 1;
+  repeated Backend available_backends = 2;   // backends that loaded successfully
+}
+
+// Machine-readable form of docs/operation_list.md: which op each backend runs,
+// and at what level. Lets a client check whether a graph will run on a backend
+// before loading it.
+message Capabilities {
+  string                     version  = 1;
+  repeated BackendCapability backends = 2;
+}
+message BackendCapability {
+  Backend            backend   = 1;
+  bool               available = 2;   // this backend loaded on this host
+  repeated OpSupport ops       = 3;
+}
+message OpSupport {
+  OpType       op      = 1;
+  string       op_name = 2;   // raw opType string (set even when op is UNSPECIFIED)
+  SupportLevel level   = 3;
+  string       note    = 4;   // e.g. "head_dim <= 64", "last-axis only"
+}
+
+// ═══════════════════════════════════════════════════════════
+// Model lifecycle & introspection
+// ═══════════════════════════════════════════════════════════
+message LoadModelRequest {
+  oneof source {
+    ModelPaths paths  = 1;   // server-side: engine reads from disk
+    ModelBytes inline = 2;   // embedded/FFI: caller ships the blob
+  }
+  optional ExecOptions exec  = 3;   // default backend/threads for this handle
+  optional string      alias = 4;   // friendly id; else the server assigns one
+}
+message ModelPaths {
+  string config_path    = 1;   // config.json (optional if embedded in safetensors metadata)
+  string weights_path   = 2;   // model.safetensors
+  string tokenizer_path = 3;   // dir/file with vocab.bin (+ merges.txt) — text/chat models
+}
+message ModelBytes {
+  bytes config_json = 1;       // optional if embedded in safetensors __metadata__
+  bytes safetensors = 2;
+  bytes tokenizer   = 3;       // optional
+}
+message LoadModelResponse {
+  string    model_id = 1;
+  ModelInfo info     = 2;
+}
+message ModelInfo {
+  repeated TensorSpec inputs            = 1;
+  repeated TensorSpec outputs           = 2;
+  int32               num_ops           = 3;
+  bool                supports_kv_cache = 4;   // prefill/decode available (autoregressive)
+  bool                has_tokenizer     = 5;
+  repeated OpCount    op_counts         = 6;   // histogram of ops used by this graph
+}
+message OpCount {
+  OpType op      = 1;
+  string op_name = 2;   // raw opType string (set even when op is UNSPECIFIED)
+  int32  count   = 3;
+}
+message ListModelsResponse {
+  repeated ModelInfo models    = 1;
+  repeated string    model_ids = 2;
+}
+
+// ═══════════════════════════════════════════════════════════
+// Layer 1: generic tensor I/O
+// ═══════════════════════════════════════════════════════════
+message RunRequest {
+  string          model_id     = 1;
+  repeated Tensor inputs       = 2;
+  repeated string output_names = 3;   // empty = all graph outputs
+  optional int32  last_token   = 4;   // --last-token: return one logits row from a sequence output
+  optional ExecOptions exec    = 5;   // per-call override of the handle default
+}
+message RunResponse {
+  repeated Tensor outputs = 1;
+  Timing          timing  = 2;
+}
+
+message GenerateRequest {
+  string  model_id = 1;
+  string  prompt   = 2;
+  optional bytes            image = 3;   // VLM/KIE chat: encoded PNG/JPEG
+  optional GenerationConfig gen   = 4;
+  optional ExecOptions      exec  = 5;
+}
+message GenerationConfig {
+  optional int32  max_new_tokens = 1;   // --max-new (default 50)
+  optional int32  eos_token      = 2;   // --eos-token
+  optional int32  pad_token      = 3;   // --pad-token (default 50256)
+  optional float  temperature    = 4;
+  optional float  top_p          = 5;
+  optional int32  top_k          = 6;
+  optional uint64 seed           = 7;
+  optional string template       = 8;   // chat template family (kie_chat `family`)
+}
+message GenerateEvent {
+  oneof event {
+    Token        token = 1;   // streamed as decoded
+    GenerateDone done  = 2;   // final frame
+  }
+}
+message Token { int32 id = 1; string text = 2; int32 position = 3; }
+message GenerateDone {
+  string       text       = 1;   // full detokenized output
+  int32        num_tokens = 2;
+  FinishReason reason     = 3;
+  Timing       timing     = 4;
+}
+enum FinishReason {
+  FINISH_UNSPECIFIED = 0;
+  FINISH_EOS    = 1;
+  FINISH_LENGTH = 2;
+  FINISH_STOP   = 3;
+}
+
+message GetTensorRequest { string model_id = 1; string name = 2; }
+
+// ═══════════════════════════════════════════════════════════
+// Layer 2: task convenience
+// ═══════════════════════════════════════════════════════════
+message ClassifyRequest {
+  string          model_id      = 1;
+  Image           image         = 2;   // or use Run for raw-tensor inputs
+  optional string logits_tensor = 3;   // default: final output
+  optional int32  top_k         = 4;   // --top-k (default 5)
+  repeated string labels        = 5;   // optional class names
+  optional ExecOptions exec     = 6;
+}
+message ClassifyResponse {
+  repeated ClassScore classes = 1;
+  Timing              timing  = 2;
+}
+message ClassScore { int32 index = 1; float score = 2; string label = 3; }
+
+message DetectRequest {
+  string          model_id        = 1;
+  Image           image           = 2;
+  optional string boxes_tensor    = 3;   // [...,4]
+  optional string scores_tensor   = 4;   // [N] or [N,C]
+  optional string classes_tensor  = 5;   // optional [N]
+  optional int32  max_detections  = 6;   // --max-det (default 20)
+  optional float  score_threshold = 7;
+  optional float  iou_threshold   = 8;   // NonMaxSuppression
+  repeated string labels          = 9;
+  optional ExecOptions exec       = 10;
+}
+message DetectResponse {
+  repeated Detection detections = 1;
+  Timing             timing     = 2;
+}
+message Detection { Box box = 1; float score = 2; int32 class_id = 3; string label = 4; }
+message Box { float x1 = 1; float y1 = 2; float x2 = 3; float y2 = 4; }
+
+message CTCRequest {
+  string          model_id      = 1;
+  Image           image         = 2;
+  optional string logits_tensor = 3;   // [...,T,C]
+  optional int32  blank         = 4;   // --blank (default 0)
+  repeated string labels        = 5;
+  optional ExecOptions exec     = 6;
+}
+message CTCResponse {
+  string         text      = 1;
+  repeated int32 token_ids = 2;
+  Timing         timing    = 3;
+}

@@ -1,0 +1,117 @@
+<!doctype html>
+<html>
+<head><meta charset="utf-8"><title>Volvox WebGPU op tests</title></head>
+<body>
+<pre id="out">RUNNING…</pre>
+<script type="module">
+// End-to-end per-op correctness test for the WebGPU (Tier 2) executor. Each op is
+// run through the REAL GraphExecutor on WebGPU and compared against the pure-JS
+// CPUEngine reference. Prints one PASS/FAIL line per op plus a final summary.
+import { VolvoxAI, CPUEngine, Graph } from '../dist/volvoxai.js';
+
+const out = document.getElementById('out');
+const log = (s) => { out.textContent += s + '\n'; };
+
+function buildGraph(spec) {
+  const g = new Graph();
+  for (const inp of (spec.inputs || [])) g.addInput(inp.name, inp.shape, inp.dtype || 'float32');
+  for (const w of (spec.weights || [])) { const t = g.addWeight(w.name, w.shape, w.dtype || 'float32'); t.buffer = w.data; }
+  const inMap = {};
+  for (const [k, v] of Object.entries(spec.opInputs)) inMap[k] = g.tensors.get(v);
+  const outs = g.addOp(spec.opType, inMap, { out: spec.outShape }, spec.params || {});
+  g.outputNames = [outs.out.name];
+  return g;
+}
+
+function maxAbsDiff(a, b) {
+  if (a.length !== b.length) return Infinity;
+  let m = 0;
+  for (let i = 0; i < a.length; i++) m = Math.max(m, Math.abs(a[i] - b[i]));
+  return m;
+}
+
+async function runCase(engine, spec) {
+  // Reference on CPU
+  const cpu = new CPUEngine();
+  const gc = buildGraph(spec);
+  cpu.allocateGraph(gc);
+  const rc = await cpu.execute(gc, spec.inputData || {});
+  const expected = spec.expected || Array.from(rc[gc.outputNames[0]]);
+
+  // WebGPU
+  const gg = buildGraph(spec);
+  const exec = await engine.compile(gg);
+  const outBuf = await exec.execute(spec.inputData || {});
+  const got = Array.from(await exec.readBuffer(outBuf, expected.length * 4));
+
+  const diff = maxAbsDiff(expected, got);
+  const ok = diff < 1e-3;
+  log(`${ok ? 'PASS' : 'FAIL'}  ${spec.name.padEnd(18)} maxdiff=${diff.toExponential(2)}` +
+      (ok ? '' : `\n   expected ${JSON.stringify(expected.slice(0, 8))}\n   got      ${JSON.stringify(got.slice(0, 8))}`));
+  return ok;
+}
+
+const ramp = (n, f = 1) => Float32Array.from({ length: n }, (_, i) => (i % 9 - 4) * f);
+
+const specs = [
+  // sanity: existing ops through the full WebGPU pipeline
+  { name: 'ReLU', opType: 'ReLU', inputs: [{ name: 'x', shape: [1, 8] }], opInputs: { input: 'x' },
+    outShape: [1, 8], inputData: { x: Float32Array.from([-3, -1, 0, 2, -5, 4, -2, 6]) } },
+  { name: 'Conv2D', opType: 'Conv2D',
+    inputs: [{ name: 'x', shape: [1, 4, 4, 2] }],
+    weights: [{ name: 'w', shape: [3, 3, 2, 3], data: ramp(54, 0.1) }, { name: 'b', shape: [3], data: Float32Array.from([0.1, -0.2, 0.3]) }],
+    opInputs: { input: 'x', weight: 'w', bias: 'b' }, outShape: [1, 4, 4, 3],
+    params: { stride: [1, 1], padding: [1, 1], groups: 1, relu: 0 },
+    inputData: { x: ramp(32, 0.3) } },
+  // newly wired ops
+  { name: 'Slice', opType: 'Slice', inputs: [{ name: 'x', shape: [1, 1, 4, 4] }], opInputs: { input: 'x' },
+    outShape: [1, 1, 2, 2], params: { axes: [2, 3], starts: [1, 1], steps: [1, 1] }, inputData: { x: ramp(16) } },
+  { name: 'Pad', opType: 'Pad', inputs: [{ name: 'x', shape: [1, 1, 2, 2] }], opInputs: { input: 'x' },
+    outShape: [1, 1, 4, 4], params: { pads: [0, 0, 1, 1, 0, 0, 1, 1], value: 0 }, inputData: { x: Float32Array.from([1, 2, 3, 4]) } },
+  { name: 'ConvTranspose2D', opType: 'ConvTranspose2D',
+    inputs: [{ name: 'x', shape: [1, 2, 2, 1] }],
+    weights: [{ name: 'w', shape: [1, 1, 2, 2], data: Float32Array.from([1, 2, 3, 4]) }],
+    opInputs: { input: 'x', weight: 'w' }, outShape: [1, 4, 4, 1],
+    params: { kernel: [2, 2], stride: [2, 2], padding: [0, 0] }, inputData: { x: Float32Array.from([1, 2, 3, 4]) } },
+  { name: 'Where', opType: 'Where',
+    inputs: [{ name: 'c', shape: [8] }, { name: 'a', shape: [8] }, { name: 'b', shape: [8] }],
+    opInputs: { cond: 'c', x: 'a', y: 'b' }, outShape: [8],
+    inputData: { c: Float32Array.from([1, 0, 1, 0, 1, 1, 0, 0]), a: ramp(8), b: ramp(8, -1) } },
+  { name: 'Gather', opType: 'Gather',
+    weights: [{ name: 't', shape: [4, 3], data: ramp(12) }, { name: 'idx', shape: [2], data: Float32Array.from([0, 2]) }],
+    opInputs: { input: 't', indices: 'idx' }, outShape: [2, 3], params: { axis: 0 }, inputData: {} },
+  { name: 'ReduceSum', opType: 'ReduceSum', inputs: [{ name: 'x', shape: [2, 3] }], opInputs: { input: 'x' },
+    outShape: [2], params: {}, inputData: { x: Float32Array.from([1, 2, 3, 4, 5, 6]) } },
+  { name: 'ReduceMean', opType: 'ReduceMean', inputs: [{ name: 'x', shape: [2, 3] }], opInputs: { input: 'x' },
+    outShape: [2], params: {}, inputData: { x: Float32Array.from([1, 2, 3, 4, 5, 6]) } },
+  { name: 'AveragePool', opType: 'AveragePool', inputs: [{ name: 'x', shape: [1, 4, 4, 1] }], opInputs: { input: 'x' },
+    outShape: [1, 2, 2, 1], params: { kernel: [2, 2], stride: [2, 2] }, inputData: { x: ramp(16) } },
+  { name: 'DequantizeLinear', opType: 'DequantizeLinear',
+    inputs: [{ name: 'x', shape: [4] }], weights: [{ name: 's', shape: [1], data: Float32Array.from([0.5]) }],
+    opInputs: { input: 'x', scale: 's' }, outShape: [4], inputData: { x: Float32Array.from([2, 4, 6, 8]) } },
+  { name: 'Cast', opType: 'Cast', inputs: [{ name: 'x', shape: [4] }], opInputs: { input: 'x' },
+    outShape: [4], inputData: { x: Float32Array.from([1.5, -2.5, 3, 4]) } },
+  // Expand: CPU _cpuExpand is broadcast-buggy, so check against an explicit expected.
+  { name: 'Expand(chan)', opType: 'Expand', inputs: [{ name: 'x', shape: [1, 2, 1, 1] }], opInputs: { input: 'x' },
+    outShape: [1, 2, 2, 2], inputData: { x: Float32Array.from([10, 20]) },
+    expected: [10, 10, 10, 10, 20, 20, 20, 20] },
+];
+
+(async () => {
+  try {
+    if (!navigator.gpu) { out.textContent = 'FATAL no navigator.gpu'; return; }
+    const engine = await VolvoxAI.init('webgpu');
+    const adapter = await navigator.gpu.requestAdapter();
+    const info = adapter.info || {};
+    out.textContent = `adapter: ${info.vendor || '?'} / ${info.architecture || '?'} ${info.description || ''}\n`;
+    let pass = 0, fail = 0;
+    for (const spec of specs) {
+      try { (await runCase(engine, spec)) ? pass++ : fail++; }
+      catch (e) { fail++; log(`FAIL  ${spec.name.padEnd(18)} threw: ${e.message}`); }
+    }
+    log(`\nSUMMARY ${pass}/${pass + fail} passed` + (fail === 0 ? '  ALL_PASS' : `  ${fail}_FAILED`));
+  } catch (e) { out.textContent += '\nFATAL ' + e.message + '\n' + e.stack; }
+})();
+</script>
+</body>
+</html>

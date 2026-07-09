@@ -1,0 +1,23 @@
+[package]
+name = "volvoxai-runtime"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Synurang service wrapper over the VolvoxAI C inference engine (single cdylib)."
+
+[lib]
+name = "volvoxai"
+# One artifact: libvolvoxai.so — the Synurang plugin. rlib so it can also be
+# linked/tested from Rust.
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+prost = "0.12"
+ctor = "0.2"           # self-register the plugin on library load
+
+[build-dependencies]
+prost-build = "0.12"
+cc = "1"               # compiles native/*.c into the cdylib
+
+[dev-dependencies]
+serde_json = "1"       # tests parse model config.json to build inputs

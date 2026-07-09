@@ -1,0 +1,33 @@
+@group(0) @binding(0) var<storage, read> input : array<f32>;
+            @group(0) @binding(1) var<storage, read> weight : array<f32>;
+            @group(0) @binding(2) var<storage, read> bias : array<f32>;
+            @group(0) @binding(3) var<storage, read_write> output : array<f32>;
+            
+            struct Params { rows : u32, d_model : u32 }
+            @group(0) @binding(4) var<uniform> params : Params;
+
+            @compute @workgroup_size(64)
+            fn main(@builtin(global_invocation_id) global_id : vec3<u32>) {
+                let row = global_id.x;
+                if (row >= params.rows) { return; }
+                let d_model = params.d_model;
+                let offset = row * d_model;
+                
+                var sum : f32 = 0.0;
+                var sq_sum : f32 = 0.0;
+                
+                for (var i = 0u; i < d_model; i = i + 1u) {
+                    let val = input[offset + i];
+                    sum = sum + val;
+                    sq_sum = sq_sum + (val * val);
+                }
+                
+                let mean = sum / f32(d_model);
+                let variance = (sq_sum / f32(d_model)) - (mean * mean);
+                let inv_std = inverseSqrt(variance + 1e-5);
+                
+                for (var i = 0u; i < d_model; i = i + 1u) {
+                    let norm_val = (input[offset + i] - mean) * inv_std;
+                    output[offset + i] = norm_val * weight[i] + bias[i];
+                }
+            }
