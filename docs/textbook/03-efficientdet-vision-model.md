@@ -1,16 +1,33 @@
 # Chapter 3 — A Vision Model, op by op (EfficientDet-Lite0)
 
+*Read the badges that match you: 🌱 **Idea** (anyone, no code) · 🔧 **Build** (a little code) · 🔬 **Deep**
+(engine developers). New here? Follow just the 🌱 sections.*
+
 *Goal: follow a **320×320 photo** through an object detector until it outputs labeled boxes
 ("dog at (x0,y0,x1,y1)"). Different ops than Chapter 2 — but the same idea: a graph of small
 kernels on tensors.*
 
-The model lives in `models/efficientdet_lite0_*/`. **EfficientDet-Lite0** is a compact
+> 🌱 **The big idea.** Last chapter the machine read words; this chapter it looks at a **photo** and
+> draws boxes around the things in it ("dog here, bicycle there"). Amazingly, it's the *same kind of
+> machine* — a graph of tiny math steps on grids of numbers — just with a different star operation.
+> Instead of words looking at each other, a little **filter slides across the picture** hunting for
+> patterns (edges, then eyes, then whole dogs). At the end the machine has thousands of guessed
+> boxes, and a final cleanup step keeps only the few good ones. Same skeleton as the language model,
+> pointed at pixels.
+
+🔧 The model lives in `models/efficientdet_lite0_*/`. **EfficientDet-Lite0** is a compact
 [object detector](https://arxiv.org/abs/1911.09070): given an image, it finds *what* objects are
 present and *where*. It ships here in three numeric precisions — **fp32, fp16, int8** — that
 compute the same thing at different size/speed trade-offs. This chapter traces the **fp32**
-version (ops named `Conv2D`); Chapter 4 explains how int8 swaps in `QConv2D`.
+version (ops named `Conv2D`); Chapter 6 explains how int8 swaps in `QConv2D`.
 
 ## 3.1 What the model consumes and produces
+
+> 🌱 **Idea.** In goes one photo. Out comes a huge pile of *candidate* boxes — about 19,000 of them
+> — each with a guess of "how likely is this a dog? a car? a person?" Most are junk; we'll throw
+> them away at the end and keep the handful that are confident and don't overlap.
+
+🔧
 
 ```
 INPUT   input0 : shape [1, 320, 320, 3]   one 320×320 RGB image (NHWC)
@@ -22,7 +39,7 @@ OUTPUT  scores : shape [1, 19206, 90]     for each of 19206 candidate boxes, 90 
 
 The network proposes **19,206 candidate boxes** covering the image at many positions and sizes,
 scores each against **90 object classes** (the COCO label set — person, car, dog, …), and you
-keep the few confident, non-overlapping ones. Where does 19,206 come from? Five detection grids
+keep the few confident, non-overlapping ones. 🔬 Where does 19,206 come from? Five detection grids
 of decreasing resolution, 9 candidate boxes ("anchors") per cell:
 
 ```
@@ -35,7 +52,7 @@ grid  3× 3 × 9 =    81   (finds big objects)
           total  19206
 ```
 
-The whole graph is **262 nodes** (265 for int8). Inventory:
+🔬 The whole graph is **262 nodes** (265 for int8). Inventory:
 
 ```
 182 Conv2D   42 Add   14 MaxPool2D   12 ResizeNearest2D   10 Reshape   2 Concat
@@ -43,6 +60,13 @@ The whole graph is **262 nodes** (265 for int8). Inventory:
 ```
 
 ## 3.2 The pipeline at a glance
+
+> 🌱 **Idea.** Three learned stages, then a cleanup. First a **backbone** boils the photo down into
+> "features" (what's where). Then a **mixer** (BiFPN) lets big-picture and fine-detail views share
+> notes. Then two **heads** turn features into "what class?" and "what box?" guesses. Finally a
+> fixed cleanup turns the raw numbers into the few boxes you actually draw.
+
+🔧
 
 ```mermaid
 flowchart TD
@@ -76,7 +100,14 @@ them into boxes you can draw. Let's take them in order — but first, the one op
 
 ## 3.3 The core op: convolution (`Conv2D`)
 
-Where the language model leans on `MatMul`, a vision model leans on `Conv2D`. A convolution
+> 🌱 **Idea.** Take a tiny stencil — say 3×3 — and slide it across the whole picture. At each spot,
+> multiply the stencil's numbers by the pixels underneath and add them up to get one number. Slide
+> it everywhere and you get a new picture that "lights up" wherever the stencil's pattern appears.
+> One stencil finds vertical edges; another finds a patch of fur; a later one finds an eye. Stack
+> enough of these and the machine goes from edges → parts → whole objects. That sliding-stencil
+> move is **convolution**, and it's to vision what attention is to language.
+
+🔧 Where the language model leans on `MatMul`, a vision model leans on `Conv2D`. A convolution
 slides a small **filter** (a little grid of weights, e.g. 3×3) across the image. At each
 position it multiplies the filter by the pixels underneath and sums — a **dot product** — to
 produce one output value. Slide it everywhere and you get a new image ("feature map") that lights
@@ -91,7 +122,7 @@ up wherever that filter's pattern (an edge, a texture, an eye) appears.
    └──────────┘       └──────────┘        (then slide right by `stride` and repeat)
 ```
 
-The real reference kernel (`js/ops/conv2D.js`) is just those slides written as nested loops —
+🔬 The real reference kernel (`ts/ops/conv2D.ts`) is just those slides written as nested loops —
 batch, output-row, output-col, output-channel, then the filter taps:
 
 ```javascript
@@ -112,7 +143,7 @@ for (let oh = 0; oh < out_h; oh++)
   }
 ```
 
-Two flavors of convolution appear, and their combination is the whole efficiency trick of this
+🔧 Two flavors of convolution appear, and their combination is the whole efficiency trick of this
 model family:
 
 | | **Pointwise** (1×1) | **Depthwise** (3×3, `groups = channels`) |
@@ -121,12 +152,13 @@ model family:
 | Job | "recombine features" | "look at local patterns" |
 | Cost | cheap per pixel, but all-to-all channels | very cheap — no channel mixing |
 
-A regular conv does both at once (expensive). **Depthwise-separable** convolution splits it into
-a depthwise (spatial) + pointwise (channel) pair that costs a fraction as much for nearly the
-same power. That pairing is the `MBConv` block, the backbone's Lego brick — and why 80 of the
-182 convs are depthwise.
+🌱 A regular convolution does both jobs at once, which is expensive. The trick this model uses is
+to split them into two cheap halves — one looks at *shape*, the other mixes *colors/features* —
+getting almost the same result for a fraction of the work. 🔬 That pairing (**depthwise-separable**
+convolution) is the `MBConv` block, the backbone's Lego brick — and why 80 of the 182 convs are
+depthwise.
 
-> **`groups`** in the code: `groups = in_c` means "each channel is convolved by its own filter"
+> 🔬 **`groups`** in the code: `groups = in_c` means "each channel is convolved by its own filter"
 > (depthwise). `groups = 1` means "every output channel sees every input channel" (regular). The
 > same kernel handles both by looping over the right channel range.
 
@@ -134,7 +166,13 @@ same power. That pairing is the `MBConv` block, the backbone's Lego brick — an
 
 ## 3.4 Stage 1 — Backbone: image → features
 
-The **backbone** (an *EfficientNet-Lite0*) is a feature extractor. It repeatedly:
+> 🌱 **Idea.** The backbone slowly shrinks the picture while growing the amount of *meaning* it
+> carries. Early layers notice edges and colors; middle layers notice textures and parts (an eye, a
+> wheel); late layers recognize whole objects. Nobody programmed "this is an eye" — the machine
+> *learned* that ladder from examples. It spits out five versions of the picture at different zoom
+> levels, because a close-up bird and a giant bus are easiest to spot at different zooms.
+
+🔧 The **backbone** (an *EfficientNet-Lite0*) is a feature extractor. It repeatedly:
 
 1. **Shrinks** the spatial size (via stride-2 convs and pooling) — 320→160→80→40→20→10→…
 2. **Grows** the channel count — 3→32→…→320+ — trading "where" for "what."
@@ -152,15 +190,20 @@ outputs 5 feature maps at strides 8,16,32,64,128:
 The **residual `Add`** inside each MBConv is the same trick as the transformer: add the block's
 output back onto its input so deep stacks stay trainable. Same idea, different domain.
 
-Why five feature maps instead of one? **Scale.** A 40×40 map has fine detail (good for small
-objects); a 3×3 map sees huge receptive fields (good for big objects). Detecting at multiple
-scales is how one network finds both a distant bird and a close-up bus.
+🌱 Why five feature maps instead of one? **Scale.** A fine 40×40 map is great for tiny objects; a
+coarse 3×3 map takes in the whole scene, great for big objects. Looking at several zooms is how one
+network finds both a distant bird and a close-up bus.
 
 ---
 
 ## 3.5 Stage 2 — BiFPN: mix the scales together
 
-A small feature map knows *"there's an object here"* but is spatially coarse; a large one is
+> 🌱 **Idea.** The zoomed-out view knows *"there's something big here"* but is blurry; the zoomed-in
+> view is sharp but doesn't see the big picture. BiFPN just lets these views **trade notes** — shrink
+> or grow maps until they line up, then add them together — so every zoom level ends up both sharp
+> *and* wise. It's built from ops you already know: resize, pool, add. No new math.
+
+🔧 A small feature map knows *"there's an object here"* but is spatially coarse; a large one is
 precise but semantically shallow. The **BiFPN** (Bi-directional Feature Pyramid Network) lets the
 five scales exchange information, top-down and bottom-up, so every scale gets both fine detail
 and high-level meaning. It uses exactly three ops you already understand:
@@ -180,7 +223,7 @@ flowchart TB
 
 - **`ResizeNearest2D`** upsamples a small map to a bigger one (top-down path). *12 of these.*
 - **`MaxPool2D`** downsamples a big map to a smaller one (bottom-up path). *14 of these.* The
-  kernel (`js/ops/maxPool2D.js`) just keeps the max value in each window.
+  kernel (`ts/ops/maxPool2D.ts`) just keeps the max value in each window.
 - **`Add`** (often *weighted* — learnable importance per input) fuses two aligned maps. *42
   Adds* across the model do this fusion and the backbone residuals.
 
@@ -191,7 +234,11 @@ math.
 
 ## 3.6 Stage 3 — Heads: features → per-anchor predictions
 
-Two small conv stacks (shared across the five scales) read the fused features and, at **every**
+> 🌱 **Idea.** Two small readers scan the mixed features. One guesses *what* is at each spot (dog?
+> car?); the other guesses *where* the box should be. Instead of inventing boxes from thin air, they
+> start from a fixed set of pre-drawn "reference boxes" and just nudge them — much easier to learn.
+
+🔧 Two small conv stacks (shared across the five scales) read the fused features and, at **every**
 grid cell, output predictions for that cell's **9 anchors** (9 reference box shapes of different
 sizes/aspect ratios centered on the cell):
 
@@ -199,7 +246,7 @@ sizes/aspect ratios centered on the cell):
 - **Box head** → `4` numbers per anchor: adjustments (dx, dy, dw, dh) to the anchor's position
   and size.
 
-> **Anchors** are the clever bit. Rather than predict boxes from nothing, the model predicts
+> 🔬 **Anchors** are the clever bit. Rather than predict boxes from nothing, the model predicts
 > small *corrections* to a fixed grid of prior boxes. Predicting "shift this reference box a bit"
 > is far easier to learn than "invent a box at (173, 92, 240, 210) from scratch."
 
@@ -207,7 +254,10 @@ sizes/aspect ratios centered on the cell):
 
 ## 3.7 Stage 4 — Reshape + Concat: flatten five grids into one list
 
-Each of the 5 scales produced predictions in its own grid shape. `Reshape` flattens each grid to
+> 🌱 **Idea.** The five zoom levels each produced their guesses in their own little grid. Here we
+> just pour them all into one long list of ~19,000 candidates. No math — only rearranging.
+
+🔧 Each of the 5 scales produced predictions in its own grid shape. `Reshape` flattens each grid to
 a plain list of anchors, and `Concat` stacks all five lists into one (this is the tail of the
 graph — see the real node shapes):
 
@@ -220,7 +270,7 @@ class predictions:  [1,40,40,…] → [1,14400,90]  ┐
 box predictions:    … same five grids …        ─Concat─▶ boxes  [1,19206,4]
 ```
 
-`Reshape` doesn't move numbers around in memory at all — it just reinterprets the same flat
+🔬 `Reshape` doesn't move numbers around in memory at all — it just reinterprets the same flat
 buffer with a new shape (recall §1.2). In this repo it's a copy-through op. **The network's job
 is now done:** two tensors, 19,206 scored candidate boxes.
 
@@ -228,7 +278,12 @@ is now done:** two tensors, 19,206 scored candidate boxes.
 
 ## 3.8 Stage 5 — Postprocess: 19,206 candidates → a few boxes
 
-The raw outputs aren't drawable yet. Three fixed (non-learned) steps finish the job:
+> 🌱 **Idea.** Now the cleanup. Turn the raw scores into "how confident, 0–100%." Turn each nudged
+> reference box into real pixel corners. Then throw away duplicates: when five overlapping boxes all
+> shout "dog!", keep the most confident one and delete the rest. What's left is the handful of boxes
+> you draw on the photo.
+
+🔧 The raw outputs aren't drawable yet. Three fixed (non-learned) steps finish the job:
 
 1. **Sigmoid** the class scores → probabilities in `[0,1]`. (In the int8 export this `Sigmoid`
    was folded away for speed, so `scores` are raw logits; apply sigmoid yourself, or just compare
@@ -237,21 +292,23 @@ The raw outputs aren't drawable yet. Three fixed (non-learned) steps finish the 
    applying them to that anchor's reference box.
 3. **Non-Max Suppression (NMS)**: the same object usually fires several overlapping anchors. NMS
    keeps the highest-scoring box and deletes others that overlap it too much (high *IoU*,
-   intersection-over-union), per class. VolvoxAI has this as an op — `js/ops/nonMaxSuppression.js`.
+   intersection-over-union), per class. VolvoxAI has this as an op — `ts/ops/nonMaxSuppression.ts`.
 
 ```
 before NMS:  ▢▢▢  three overlapping "dog" boxes, scores 0.91, 0.88, 0.72
 after  NMS:  ▢    keep the 0.91; suppress the two that overlap it > 50%
 ```
 
-The native `detect` command (`native/main.c`, `print_detections`) uses a **simplified** version
-of step 3 for the demo: it takes the top-`max_det` boxes by their best class score and prints
-them as a ranked table (label lookup via `labels.txt`):
+🔬 The opt-in native `detect` example
+(`examples/native_task_cli/main.c`, `print_detections`) uses a **simplified**
+version of step 3: it takes the top-`max_det` boxes by their best class score
+and prints them as a ranked table (label lookup via `labels.txt`):
+The `score_pct` column shows the same score as a percentage.
 
 ```
-rank  index  score   class  x0     y0     x1     y1
-1     4213   0.91    17     0.31   0.44   0.62   0.88     ← "dog"
-2     991    0.86     2     0.05   0.10   0.40   0.95     ← "bicycle"
+rank  index  score   score_pct  class  label    x0     y0     x1     y1
+1     4213   0.91    91.00%     17     dog      0.31   0.44   0.62   0.88
+2     991    0.86    86.00%      1     bicycle  0.05   0.10   0.40   0.95
 ```
 
 Draw those rectangles on the original photo and you have object detection.
@@ -260,7 +317,12 @@ Draw those rectangles on the original photo and you have object detection.
 
 ## 3.9 The two models, side by side
 
-You've now traced both worlds. Notice how much they share:
+> 🌱 **Idea recap.** You've now watched the *same kind of machine* read words and look at pictures.
+> Different star operation (attention for words, convolution for pixels), different cleanup — but
+> underneath, both are just a graph of tiny math steps on grids of numbers, with learned weights.
+> Learn that skeleton once and every model becomes readable.
+
+🔧 You've now traced both worlds. Notice how much they share:
 
 | | TinyStories (language) | EfficientDet-Lite0 (vision) |
 |---|---|---|
@@ -275,7 +337,12 @@ You've now traced both worlds. Notice how much they share:
 Same skeleton — *a graph of small tensor ops with learned weights* — solving text and pixels.
 That transfer is the whole point: learn the skeleton once and every model becomes readable.
 
-The last big question is the one the three EfficientDet folders raise: **fp32 vs fp16 vs int8.**
-What are those, and why ship the same model three times? That's Chapter 4.
+That closes **Part I**. We have now followed two *trained* models — a language model and a
+detector — from input to answer, op by op. But we quietly took the hardest thing for granted: the
+**weights**, those learned tables that make each op do something useful. Where do they come from?
+**Part II** opens that box: the **backward pass**, the optimizer, and the training loop.
 
-**Next:** [Chapter 4 — Precision & Quantization →](04-precision-and-quantization.md)
+*(The fp32 / fp16 / int8 question those three EfficientDet folders raise is answered later, in
+Chapter 6, once we have a trained model worth shrinking.)*
+
+**Next:** [Chapter 4 — The Backward Pass →](04-backward-pass.md)

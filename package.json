@@ -1,32 +1,46 @@
 {
   "name": "volvoxai",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "A Zero-Dependency, Bare-Metal Deep Learning Engine for the Browser and Node.js",
-  "main": "js/index.js",
+  "main": "./dist/0.2.0/volvoxai.js",
+  "exports": {
+    ".": "./dist/0.2.0/volvoxai.js",
+    "./min": "./dist/0.2.0/volvoxai.min.js",
+    "./full": "./dist/0.2.0/volvoxai.full.js",
+    "./full/min": "./dist/0.2.0/volvoxai.full.min.js",
+    "./training": "./dist/0.2.0/volvoxai.full.js",
+    "./wasm": "./dist/0.2.0/volvoxai.wasm.js",
+    "./wasm/min": "./dist/0.2.0/volvoxai.wasm.min.js",
+    "./volvoxai.wasm": "./dist/0.2.0/volvoxai.wasm",
+    "./volvoxai.full.wasm": "./dist/0.2.0/volvoxai.full.wasm"
+  },
   "type": "module",
   "bin": {
     "volvox": "./bin/volvox.js"
   },
   "files": [
     "bin/",
-    "dist/",
-    "docs/",
-    "js/",
-    "shaders/",
-    "volvoxai.wasm"
+    "dist/0.2.0/"
   ],
   "scripts": {
-    "build": "esbuild js/index.js --bundle --format=esm --loader:.wgsl=text --outfile=dist/volvoxai.js",
-    "build:min": "esbuild js/index.js --bundle --minify --format=esm --loader:.wgsl=text --outfile=dist/volvoxai.min.js",
-    "build:all": "npm run build && npm run build:min",
-    "test": "echo 'Run tests manually for now'",
+    "clean:dist": "node tools/build_web.mjs clean",
+    "build": "npm run typecheck && node tools/build_web.mjs normal",
+    "build:min": "npm run typecheck && node tools/build_web.mjs min",
+    "build:all": "npm run typecheck && node tools/build_web.mjs all",
+    "check:release": "node tools/check_release_artifacts.mjs",
+    "prepack": "npm run check:release",
+    "typecheck": "tsc --project tsconfig.json",
+    "test": "tsx --test tests/*.test.mjs examples/*/tests/*.test.mjs",
     "start": "node ./bin/volvox.js"
   },
   "dependencies": {
     "commander": "^11.1.0"
   },
   "devDependencies": {
-    "esbuild": "^0.28.1"
+    "@webgpu/types": "^0.1.71",
+    "esbuild": "^0.28.1",
+    "tsx": "^4.23.1",
+    "typescript": "^7.0.2"
   },
   "author": "",
   "license": "MIT"

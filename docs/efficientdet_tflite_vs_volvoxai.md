@@ -9,8 +9,8 @@ Machine/runtime:
 - CPU: AMD Ryzen 5 5600U with Radeon Graphics, single-thread runs
 - TFLite: `/tmp/benchmark_model`, XNNPACK enabled, `--num_threads=1`,
   `--warmup_runs=2`, `--num_runs=20`
-- VolvoxAI: `./native/volvoxai detect ... --num_threads 1 --warmup_runs 2
-  --num_runs 20`
+- VolvoxAI task example: `examples/target/bin/volvoxai-tasks detect ...
+  --num_threads 1 --warmup_runs 2 --num_runs 20`
 - Test image for VolvoxAI: `/tmp/volvox_dog.jpg`
 
 Android GPU runtime:
@@ -18,14 +18,15 @@ Android GPU runtime:
 - Device: Samsung SM-A528N, Qualcomm `lahaina`, Adreno 642L, Android SDK 34
 - TFLite: `/data/local/tmp/benchmark_model`, GPU delegate, `--gpu_backend=gl`,
   `--warmup_runs=2`, `--num_runs=20`
-- VolvoxAI: Android arm64 build, `--opengl`, OpenGL ES 3.2,
+- VolvoxAI: Android arm64 build of `examples/native_task_cli/`, `--opengl`, OpenGL ES 3.2,
   `--warmup_runs 2`, `--num_runs 20`
 - Test image for VolvoxAI: `/data/local/tmp/volvoxai_gltest/volvoxai_object_test.jpg`
 
 Important caveats:
 
-- TFLite `benchmark_model` measures generated tensor input. VolvoxAI `detect forward`
-  is the graph forward after the image input is loaded.
+- TFLite `benchmark_model` measures generated tensor input. The VolvoxAI task
+  example's `detect forward` timing is the graph forward after the image input
+  is loaded.
 - VolvoxAI prints raw detection tensors. This is a speed comparison, not a validation of
   MediaPipe postprocessing/NMS correctness.
 - TFLite GPU defaults to allowing lower precision. The Android section includes both
@@ -48,6 +49,27 @@ Important caveats:
 | `models/efficientdet_lite0_int8` | `4.4M` | `4.0M` | `3.4M` | `148K` | direct TFLite NHWC, quantized `QConv2D`, `I8` OHWI/1HWO weights |
 | `models/efficientdet_lite0_fp16` | `7.0M` | `13M` | `6.4M` | `108K` | direct TFLite NHWC, `F16` OHWI/1HWO weights |
 | `models/efficientdet_lite0_fp32` | `14M` | `13M` | `13M` | `108K` | direct TFLite NHWC, FP32 OHWI/1HWO weights |
+
+## Detection Score Parity
+
+These scores use byte-identical inputs produced by the native task example's
+`image_io.c` path. TFLite Runtime 2.14.0 used XNNPACK with one thread; ONNX
+Runtime 1.23.2 used the CPU execution provider. Every run selected anchor 19011,
+class 17 (`dog`) or anchor 19013, class 16 (`cat`), as appropriate.
+
+| Package | Image | TFLite | ONNX | VolvoxAI CPU |
+| --- | --- | ---: | ---: | ---: |
+| int8 | dog | `91.796875%` | `91.796875%` | `91.7969%` |
+| int8 | cat | `81.640625%` | `81.640625%` | `80.8594%` |
+| fp16 | dog | `91.165912%` | `91.165906%` | `91.0401%` |
+| fp16 | cat | `77.409363%` | `77.409363%` | `77.4408%` |
+| fp32 | dog | `91.170549%` | `91.170549%` | `91.0444%` |
+| fp32 | cat | `77.464628%` | `77.464622%` | `77.5092%` |
+
+The float ONNX and TFLite score tensors agree within `9e-7`. The int8 VolvoxAI
+cat score differs by one output quantization bin, while preserving the same
+winning anchor and class. The ONNX files are local tf2onnx conversions of the
+MediaPipe TFLite sources, not separately published vendor models.
 
 The fp16-source package preserves half-precision storage in safetensors:
 
@@ -81,17 +103,16 @@ w0 regular Conv2D   (32, 3, 3, 3)    # OHWI
 w2 depthwise Conv2D (1, 3, 3, 32)    # 1HWO
 ```
 
-The int8 VolvoxAI debug log confirms the quantized path is active:
+The int8 VolvoxAI debug log confirms that the typed quantized path is active:
 
 ```text
-QConv2D backend=cpu-qconv
-QConv2D backend=cpu-qconv-f32
-QConv2D backend=cpu-qconv-f32
+QConv2D backend=cpu-qconv-w8a8
+QAdd backend=cpu-qadd-w8a8
 ```
 
-Most Conv nodes keep quantized NHWC activations and int8 weights with int32
-accumulation/requantization. Some output-head nodes produce FP32 output
-where the graph leaves the quantized island.
+Conv nodes keep typed quantized NHWC activations and int8 weights with int32
+accumulation/requantization. Output heads leave the quantized island only at an
+explicit `DequantizeLinear` boundary.
 
 ## Export Commands
 
@@ -115,11 +136,15 @@ Export TFLite directly to VolvoxAI:
 ```bash
 python3 tools/export_safetensors.py \
   --model models/efficientdet_lite0_fp16/efficientdet_lite0_float16.tflite \
-  --out models/efficientdet_lite0_fp16/model.safetensors
+  --out models/efficientdet_lite0_fp16/model.safetensors \
+  --image-normalization input0=zero-one \
+  --output-name scores --output-name boxes
 
 python3 tools/export_safetensors.py \
   --model models/efficientdet_lite0_fp32/efficientdet_lite0_float32.tflite \
-  --out models/efficientdet_lite0_fp32/model.safetensors
+  --out models/efficientdet_lite0_fp32/model.safetensors \
+  --image-normalization input0=zero-one \
+  --output-name scores --output-name boxes
 ```
 
 The exporter auto-selects `F16` storage for the float16 TFLite model because its constant
@@ -154,18 +179,10 @@ the TFLite op-sum tables below.
 VolvoxAI:
 
 ```bash
-clang -O3 -mavx2 -mfma -pthread -Inative \
-  native/cJSON.c native/safetensors.c native/kernels.c native/quant_cpu_opt.c \
-  native/conv_f32_opt.c native/tensor_f32_opt.c native/engine_runtime.c \
-  native/engine.c native/image_io.c native/kie_runtime.c native/vulkan_engine.c \
-  native/opengl_engine.c native/tokenizer.c native/nnapi_engine.c native/main.c \
-  -o native/volvoxai -lm -ldl
+make -C examples native_task_cli
 
-./native/volvoxai detect models/efficientdet_lite0_int8 \
+examples/target/bin/volvoxai-tasks detect models/efficientdet_lite0_int8 \
   --image input0=/tmp/volvox_dog.jpg \
-  --image-normalize raw-255 \
-  --boxes boxes \
-  --scores scores \
   --max-det 5 \
   --num_threads 1 \
   --warmup_runs 2 \
@@ -174,8 +191,11 @@ clang -O3 -mavx2 -mfma -pthread -Inative \
 
 Add `--debug` to reproduce the VolvoxAI op-sum and load/init tables below.
 
-For the float-source packages, replace the model directory with
-`models/efficientdet_lite0_fp16` or `models/efficientdet_lite0_fp32`.
+For the float-source packages, replace only the model directory with
+`models/efficientdet_lite0_fp16` or `models/efficientdet_lite0_fp32`. Generated
+packages declare `raw-255` normalization for int8 and `zero-one` for fp16/fp32,
+so the task CLI selects the correct preprocessing automatically. An explicit
+`--image-normalize` remains available as an override.
 
 Android TFLite OpenGL GPU:
 
@@ -194,15 +214,12 @@ adb shell 'cd /data/local/tmp && ./benchmark_model \
 
 Add `--gpu_precision_loss_allowed=false` for the strict fp32 GPU rerun.
 
-Android VolvoxAI OpenGL ES:
+Android VolvoxAI OpenGL ES task-example binary:
 
 ```bash
-adb shell 'cd /data/local/tmp/volvoxai_gltest && ./volvoxai detect \
+adb shell 'cd /data/local/tmp/volvoxai_gltest && ./volvoxai-tasks detect \
   models/efficientdet_lite0_fp32 \
   --image input0=volvoxai_object_test.jpg \
-  --image-normalize raw-255 \
-  --boxes boxes \
-  --scores scores \
   --max-det 3 \
   --opengl \
   --warmup_runs 2 \
@@ -332,7 +349,7 @@ One-thread blockers:
 
 ## Native GPU Status
 
-OpenGL waits at the end of `engine_forward`, so reported forward time includes real
+OpenGL waits at the end of `volvoxai_engine_forward`, so reported forward time includes real
 queued GPU work rather than only CPU-side dispatch/enqueue time.
 
 Linux fp32 EfficientDet Lite0 timings on the Ryzen 5 5600U machine:
@@ -347,8 +364,8 @@ Representative corrected debug summaries show that most elapsed time is in the f
 wait, not in CPU enqueue:
 
 ```text
-OpenGL: engine_forward 46.823 ms, GPUWait 40.46 ms, Conv2D enqueue 3.42 ms
-Vulkan: engine_forward 43.100 ms, GPUWait 39.41 ms, Conv2D enqueue 1.67 ms
+OpenGL: volvoxai_engine_forward 46.823 ms, GPUWait 40.46 ms, Conv2D enqueue 3.42 ms
+Vulkan: volvoxai_engine_forward 43.100 ms, GPUWait 39.41 ms, Conv2D enqueue 1.67 ms
 ```
 
 ## Android OpenGL GPU Result
@@ -387,7 +404,7 @@ Qualcomm / Adreno (TM) 642L / OpenGL ES 3.2
 The `--debug` run is not the benchmark average, but it identifies where the time goes:
 
 ```text
-[debug] engine_forward nodes=262 159.649 ms
+[debug] volvoxai_engine_forward nodes=262 159.649 ms
 [debug] --- op time summary (by total) ---
 [debug]   GPUWait            114.84 ms  (n=1)
 [debug]   Conv2D              11.90 ms  (n=182)

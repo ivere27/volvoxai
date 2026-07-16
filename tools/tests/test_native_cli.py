@@ -1,0 +1,155 @@
+#!/usr/bin/env python3
+"""Focused integration checks for the fixed model-agnostic native CLI."""
+
+from __future__ import annotations
+
+import json
+import math
+import struct
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+
+def run(binary: Path, *args: str) -> subprocess.CompletedProcess[bytes]:
+    return subprocess.run(
+        [str(binary), *args],
+        check=False,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+
+
+def require(condition: bool, message: str, result: subprocess.CompletedProcess[bytes] | None = None) -> None:
+    if condition:
+        return
+    if result is not None:
+        message += (
+            f"\nexit={result.returncode}"
+            f"\nstdout={result.stdout.decode(errors='replace')}"
+            f"\nstderr={result.stderr.decode(errors='replace')}"
+        )
+    raise AssertionError(message)
+
+
+def main() -> int:
+    if len(sys.argv) != 2:
+        print(f"Usage: {sys.argv[0]} <native-volvoxai-binary>", file=sys.stderr)
+        return 2
+    binary = Path(sys.argv[1]).resolve()
+    require(binary.is_file(), f"Native CLI not found: {binary}")
+
+    with tempfile.TemporaryDirectory(prefix="volvoxai-cli-") as temporary:
+        root = Path(temporary)
+        config = root / "config.json"
+        x_path = root / "x.f32"
+        ids_path = root / "ids.i32"
+        ids_wrong_suffix = root / "ids.f32"
+        ids_short = root / "ids-short.i32"
+        output = root / "y.f32"
+        ids_output = root / "ids-out.i32"
+        unresolved = root / "unresolved.json"
+
+        config.write_text(
+            json.dumps(
+                {
+                    "inputs": {
+                        "x": {"shape": [2], "dtype": "float32"},
+                        "ids": {"shape": [2], "dtype": "int32"},
+                    },
+                    "nodes": [
+                        {
+                            "opType": "Sin",
+                            "inputs": {"input": "x"},
+                            "outputs": {"out": "y"},
+                            "outputs_shape": {"out": [2]},
+                        }
+                    ],
+                    "outputs": ["y", "ids"],
+                }
+            ),
+            encoding="utf-8",
+        )
+        x_path.write_bytes(struct.pack("=2f", 0.0, 1.0))
+        ids_path.write_bytes(struct.pack("=2i", 7, 11))
+        ids_wrong_suffix.write_bytes(ids_path.read_bytes())
+        ids_short.write_bytes(struct.pack("=i", 7))
+        unresolved.write_text(
+            json.dumps(
+                {
+                    "inputs": {"x": {"shape": [1, 2], "dtype": "float32"}},
+                    "nodes": [
+                        {
+                            "opType": "MatMul",
+                            "inputs": {"input": "x", "weight": "missing.weight"},
+                            "outputs": {"out": "logits"},
+                            "outputs_shape": {"out": [1, 1]},
+                        }
+                    ],
+                    "outputs": ["logits"],
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        result = run(
+            binary,
+            "run",
+            str(config),
+            "--input",
+            f"x={x_path}",
+            "--input",
+            f"ids={ids_path}",
+            "--output",
+            f"y={output}",
+            "--output",
+            f"ids={ids_output}",
+        )
+        require(result.returncode == 0, "Weightless F32/I32 run failed", result)
+        values = struct.unpack("=2f", output.read_bytes())
+        require(abs(values[0]) < 1.0e-6 and abs(values[1] - math.sin(1.0)) < 1.0e-6,
+                f"Unexpected output: {values}")
+        require(struct.unpack("=2i", ids_output.read_bytes()) == (7, 11),
+                "I32 output was not written as exact raw data")
+
+        result = run(binary, "run", str(unresolved))
+        require(result.returncode != 0 and b"Native init failed" in result.stderr,
+                "Weightless initialization accepted an unresolved weight", result)
+
+        result = run(binary, "run", str(config), "--input", f"x={x_path}",
+                     "--input", f"ids={ids_wrong_suffix}")
+        require(result.returncode != 0 and b"requires a .i32 file" in result.stderr,
+                "Input dtype/suffix mismatch was not rejected", result)
+
+        result = run(binary, "run", str(config), "--input", f"x={x_path}",
+                     "--input", f"ids={ids_short}")
+        require(result.returncode != 0 and b"expects 8 raw bytes" in result.stderr,
+                "Short raw input was not rejected", result)
+
+        wrong_output = root / "ids-out.f32"
+        result = run(binary, "run", str(config), "--input", f"x={x_path}",
+                     "--input", f"ids={ids_path}", "--output", f"ids={wrong_output}")
+        require(result.returncode != 0 and b"requires a .i32 file" in result.stderr,
+                "Output dtype/suffix mismatch was not rejected", result)
+
+        for invalid_row in ("not-a-row", "2147483648", "-2"):
+            result = run(binary, "run", str(config), "--row", invalid_row)
+            require(result.returncode == 2 and b"--row must be" in result.stderr,
+                    f"Invalid row was not rejected: {invalid_row}", result)
+
+        dev_full = Path("/dev/full")
+        if dev_full.exists():
+            full_output = root / "full.f32"
+            full_output.symlink_to(dev_full)
+            result = run(binary, "run", str(config), "--input", f"x={x_path}",
+                         "--input", f"ids={ids_path}", "--output", f"y={full_output}")
+            require(result.returncode != 0 and b"Cannot write output file" in result.stderr,
+                    "Output write failure was not reported", result)
+
+    print("Native CLI input tests passed.")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

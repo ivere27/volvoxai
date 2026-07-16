@@ -2,9 +2,15 @@
 // through the JS CPUEngine to capture the reference output, and writes everything to
 // an output dir. The native C engine consumes the same files.
 // Usage: node tools/gen_test_model.mjs <outdir>
-import { Graph, CPUEngine } from '../dist/volvoxai.js';
-import { writeFileSync, mkdirSync } from 'node:fs';
+import { writeFileSync, mkdirSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
+
+const packageVersion = JSON.parse(
+  readFileSync(new URL('../package.json', import.meta.url), 'utf8'),
+).version;
+const { Graph, CPUEngine } = await import(
+  new URL(`../dist/${packageVersion}/volvoxai.js`, import.meta.url)
+);
 
 const outdir = process.argv[2] || '/tmp/volvox_model';
 mkdirSync(outdir, { recursive: true });

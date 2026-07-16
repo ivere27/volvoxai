@@ -1,0 +1,38 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  javascript:
+    name: JavaScript and WASM profiles
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm run build:all
+      - run: make build_wasm
+      - run: npm run check:release
+      - run: npm test
+
+  native:
+    name: Native engine regression
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      # CMake + CTest build inside the pinned Docker toolchain image (Docker is
+      # preinstalled on the runner). build_native handles the shader pipeline;
+      # no npm/node needed for the native suite.
+      - run: make test_native_all
+      - run: make verify_native_isa

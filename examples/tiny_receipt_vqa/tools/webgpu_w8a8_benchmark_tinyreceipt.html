@@ -1,0 +1,242 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>VolvoxAI WebGPU W8A8 TinyReceipt benchmark</title>
+  <style>
+    :root { color-scheme: light dark; font-family: ui-monospace, SFMono-Regular, Consolas, monospace; }
+    body { margin: 2rem auto; max-width: 1100px; padding: 0 1rem; }
+    h1 { font: 600 1.4rem system-ui, sans-serif; }
+    pre { border: 1px solid #8886; padding: 1rem; white-space: pre-wrap; overflow-wrap: anywhere; }
+  </style>
+</head>
+<body>
+  <h1>VolvoxAI TinyReceipt end-to-end WebGPU benchmark</h1>
+  <pre id="out">Starting…</pre>
+
+<script type="module">
+import {
+  Graph,
+  GraphLoader,
+  ReadOnlySafetensorsCache,
+  WebGPUEngine,
+} from '/dist/0.2.0/volvoxai.js';
+import {
+  TinyReceiptW8A8Session,
+  preprocessTinyReceiptImage,
+} from '/examples/tiny_receipt_vqa/TinyReceiptW8A8Session.js';
+
+const out = document.getElementById('out');
+const query = new URLSearchParams(location.search);
+const prompt = query.get('prompt') || 'phone number last one';
+const modelUrl = query.get('model') || '/__tinyreceipt_model__/package_manifest.json';
+const imageUrl = query.get('image') || '/__tinyreceipt_image__';
+
+function boundedInteger(name, fallback, minimum, maximum) {
+  const raw = query.get(name);
+  if (raw == null) return fallback;
+  const value = Number(raw);
+  if (!Number.isInteger(value) || value < minimum || value > maximum) {
+    throw new Error(`${name} must be an integer in [${minimum},${maximum}]`);
+  }
+  return value;
+}
+
+function rounded(value) {
+  return typeof value === 'number' ? Number(value.toFixed(3)) : value;
+}
+
+function show(value) {
+  out.textContent = JSON.stringify(value, (_key, item) => rounded(item), 2);
+}
+
+window.__webgpuW8A8BenchmarkResult = { status: 'running' };
+
+try {
+  const maxNewTokens = boundedInteger('maxNewTokens', 192, 1, 192);
+  const deviceFeedbackChunkSize = boundedInteger('chunk', 16, 1, 192);
+  const incremental = query.get('incremental') !== '0';
+  const deviceFeedback = query.get('feedback') !== '0';
+  const fetchCounts = new Map();
+  const benchmarkFetch = async (input, init) => {
+    const url = new URL(input instanceof Request ? input.url : String(input), location.href).href;
+    fetchCounts.set(url, (fetchCounts.get(url) || 0) + 1);
+    return fetch(input, init);
+  };
+
+  const initStarted = performance.now();
+  let baseEngine = null;
+  for (let attempt = 0; attempt < 5 && !baseEngine; attempt++) {
+    baseEngine = await WebGPUEngine.init();
+    if (!baseEngine) await new Promise((resolve) => setTimeout(resolve, 400));
+  }
+  if (!baseEngine) throw new Error('WebGPU initialization returned no adapter/device');
+  const runtime = {
+    loadGraph() { throw new Error('benchmark installs an explicit graph loader'); },
+    compile() { throw new Error('benchmark installs an explicit graph compiler'); },
+  };
+  const runtimeInitMs = performance.now() - initStarted;
+  const cache = new ReadOnlySafetensorsCache();
+  const graphLoads = [];
+  const compiles = [];
+  const engines = [];
+  let activeRun = null;
+
+  const sessionStarted = performance.now();
+  const session = await TinyReceiptW8A8Session.load({
+    runtime,
+    packageUrl: modelUrl,
+    fetch: benchmarkFetch,
+    safetensorsCache: cache,
+    graphLoader: async ({ weightsUrl, configUrl, kind, family }) => {
+      const started = performance.now();
+      try {
+        return await GraphLoader.load(new Graph(), weightsUrl, {
+          configUrl,
+          fetch: benchmarkFetch,
+          safetensorsCache: cache,
+        });
+      } finally {
+        graphLoads.push({ kind, family, ms: performance.now() - started });
+      }
+    },
+    compileGraph: async (graph) => {
+      const label = graph.tensors.has('image') ? 'family' : 'router';
+      const started = performance.now();
+      const engine = baseEngine.fork();
+      await engine.allocateGraph(graph);
+      compiles.push({ label, nodes: graph.nodes.length, ms: performance.now() - started });
+      const record = { label, feedback: [[], []], fullReadbacks: [[], []] };
+      if (deviceFeedback && typeof engine.executeDeviceFeedbackDecode === 'function') {
+        const executeFeedback = engine.executeDeviceFeedbackDecode.bind(engine);
+        engine.executeDeviceFeedbackDecode = async (inputs, options) => {
+          const call = {
+            startPosition: options.startPosition ?? 0,
+            endPosition: options.endPosition ?? options.tokenCount,
+            started: performance.now(),
+          };
+          const result = await executeFeedback(inputs, options);
+          call.enqueueMs = performance.now() - call.started;
+          if (activeRun != null) record.feedback[activeRun].push(call);
+          return result;
+        };
+      } else if (!deviceFeedback) {
+        Object.defineProperty(engine, 'executeDeviceFeedbackDecode', {
+          configurable: true,
+          value: undefined,
+        });
+      }
+      const readRange = engine.readBufferRange?.bind(engine);
+      if (readRange) engine.readBufferRange = async (buffer, byteOffset, sizeBytes, dtype) => {
+        const started = performance.now();
+        const result = await readRange(buffer, byteOffset, sizeBytes, dtype);
+        if (activeRun != null) {
+          const call = record.feedback[activeRun].at(-1);
+          if (label === 'family' && call && call.completeMs == null) {
+            call.completeMs = performance.now() - call.started;
+            call.readbackMs = performance.now() - started;
+            call.bytes = sizeBytes;
+          }
+        }
+        return result;
+      };
+      const readFull = engine.readBuffer?.bind(engine);
+      if (readFull) engine.readBuffer = async (buffer, sizeBytes, dtype) => {
+        const started = performance.now();
+        const result = await readFull(buffer, sizeBytes, dtype);
+        if (activeRun != null) {
+          record.fullReadbacks[activeRun].push({
+            bytes: sizeBytes,
+            ms: performance.now() - started,
+          });
+        }
+        return result;
+      };
+      engines.push(record);
+      return engine;
+    },
+  });
+  const sessionLoadMs = performance.now() - sessionStarted;
+
+  const imageResponse = await benchmarkFetch(imageUrl);
+  if (!imageResponse.ok) throw new Error(`image fetch failed: HTTP ${imageResponse.status}`);
+  const bitmap = await createImageBitmap(await imageResponse.blob());
+  const preprocessStarted = performance.now();
+  const image = await preprocessTinyReceiptImage(bitmap, session.package.preprocessing);
+  const preprocessMs = performance.now() - preprocessStarted;
+  bitmap.close();
+
+  const runs = [];
+  for (let index = 0; index < 2; index++) {
+    activeRun = index;
+    const started = performance.now();
+    let answer;
+    try {
+      answer = await session.generate({
+        image,
+        prompt,
+        preprocessed: true,
+        incremental,
+        maxNewTokens,
+        deviceFeedbackChunkSize,
+      });
+    } finally {
+      activeRun = null;
+    }
+    runs.push({
+      name: index === 0 ? 'cold-graphs' : 'hot-graphs',
+      generationMs: performance.now() - started,
+      family: answer.family,
+      execution: answer.execution,
+      tokens: answer.tokenIds.length,
+      stoppedAtEos: answer.stoppedAtEos,
+      text: answer.text,
+    });
+  }
+  if (runs[0].family !== runs[1].family || runs[0].text !== runs[1].text ||
+      runs[0].tokens !== runs[1].tokens) {
+    throw new Error('cold and hot WebGPU generations produced different answers');
+  }
+
+  const familyRecord = engines.find(({ label }) => label === 'family');
+  for (let index = 0; index < runs.length; index++) {
+    const chunks = familyRecord?.feedback[index] || [];
+    runs[index].chunks = chunks.map(({ started: _started, ...call }) => call);
+    runs[index].firstChunkCompleteMs = chunks[0]?.completeMs || 0;
+    runs[index].laterChunkMeanMs = chunks.length > 1
+      ? chunks.slice(1).reduce((sum, call) => sum + call.completeMs, 0) / (chunks.length - 1)
+      : 0;
+    runs[index].fullReadbacks = familyRecord?.fullReadbacks[index] || [];
+  }
+
+  const result = {
+    status: 'pass',
+    adapter: baseEngine.device?.label || 'WebGPU device',
+    packedDot4: navigator.gpu.wgslLanguageFeatures?.has('packed_4x8_integer_dot_product') === true,
+    prompt,
+    maxNewTokens,
+    deviceFeedbackChunkSize,
+    incremental,
+    deviceFeedback,
+    runtimeInitMs,
+    sessionLoadMs,
+    preprocessMs,
+    graphLoads,
+    compiles,
+    fetchCounts: [...fetchCounts.entries()].map(([url, requests]) => ({ url, requests })),
+    runs,
+  };
+  window.__webgpuW8A8BenchmarkResult = result;
+  show(result);
+} catch (error) {
+  const result = {
+    status: 'fail',
+    error: error?.stack || error?.message || String(error),
+  };
+  window.__webgpuW8A8BenchmarkResult = result;
+  show(result);
+}
+</script>
+</body>
+</html>

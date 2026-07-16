@@ -16,7 +16,78 @@ microkernel architecture:
 4. **Register tiling**: hardcode loop unrolling around the target register file, such as
    computing multiple pixels and output channels per kernel call.
 
-## 2. Indirection Buffers
+## 2. Dense MatMul: the implemented anatomy
+
+For a dense layer, write the computation as `C[M,N] = A[M,K] * B[K,N]`.
+VolvoxAI deliberately keeps the pure-JS implementation as the readable triple-loop
+reference. The optimized tiers preserve that math but use different storage and tile
+shapes:
+
+| Target | Weight preparation | Compute tile | Small/decode path |
+|---|---|---|---|
+| Native CPU F32 | Immutable weights become `[ceil(N/8),K,8]` panels and are cached per graph node | `MR=4`, `NR=8`, AVX2/FMA or Arm NEON selected automatically, threaded across independent output tiles | Dedicated `M=1` microkernel |
+| WASM SIMD F32 | The same panel format is packed once during graph compilation and shared by nodes using the same weight | `MR=4`, `NR=8`, two `f32x4` vectors per row | Dedicated `M=1` SIMD microkernel |
+| Native CPU/WASM W8A32 and W8A8 | Byte weights use private `NR=8` panels with padded tails and precomputed raw sums | `MR=4`, `NR=8`; native W8A8 uses packed panels for `M>1` | Native W8A8 `M=1` keeps the K-vectorized VNNI/AVX2/NEON/SDOT dispatcher. WASM W8A8 can use the embedded Relaxed-SIMD child; symmetric signed-I8 W8A32 decode rows use two compensated baseline `f32x4` accumulators per output panel inside the audited Tiny VQA envelope. |
+| WebGPU/Vulkan/OpenGL/Metal F32 | Model weights stay resident on the device; one-shot Vulkan also caches its required output-major transpose | An `8x8` workgroup computes a `16x16` output tile through 16-wide workgroup-memory K tiles | The 64-lane scalar shader handles `M=1` and tiny matrices |
+| GPU W8A8 | Canonical packed bytes remain resident; no serialized blocked-weight format is introduced | An `8x8` workgroup stages 8 rows x 32 output channels without packed-output write races | The scalar packed-byte shader handles `M=1`, small K/N, and unsupported shapes |
+
+Packing and tiling solve related but different problems. **Packing** changes the
+persistent weight layout so a CPU inner loop reads consecutive SIMD lanes. **Tiling**
+changes the order of computation so a small A/B working set is reused before eviction.
+GPU workgroup-memory staging is tiling; it is not described as persistent panel packing.
+
+### The 32 KiB L1 policy
+
+The F32 CPU/WASM kernel assumes a conservative 32 KiB L1D when the target cannot report
+one. Native code detects the cache exactly once through `sysconf` on Linux/Android or
+`sysctl` on macOS, and caches the resulting tile policy together with its ISA selection.
+There is no environment-variable tuning surface. WASM uses the deterministic 32 KiB
+fallback because browsers expose no reliable cache-topology query. The kernel reserves
+25% for stack data and cache conflicts, then chooses K blocking from:
+
+```text
+working_set = (MR + NR) * KC * sizeof(float)
+            + MR * NR * sizeof(float)
+working_set <= 0.75 * L1D
+```
+
+With `MR=4`, `NR=8`, and a 32 KiB L1D, this selects `KC=496`: 23,936 bytes
+inside a 24,576-byte budget. Each worker operates on its own tile, so this is a
+per-core budget. Quantized kernels use `KC=960`; their one-byte B panel leaves enough
+room for either byte activations or four F32 activation rows and the accumulators.
+
+This is XNNPACK-style in the important sense—ISA-specific microkernels, packed immutable
+weights, shape-specific paths, and cache-bounded tiles—but it is not a claim of XNNPACK's
+full per-microarchitecture tuning database. The selection is fully automatic within the
+implemented AVX2/FMA, Arm NEON, WASM SIMD, and scalar kernel families; 32 KiB remains the
+safe fallback when cache topology is unavailable.
+
+### Lifecycle and correctness rules
+
+- Native packs only immutable model weights. Weight updates and model reloads clear the
+  packed caches before the next forward pass.
+- WASM compilation packs immutable weights once; dynamic weights retain the original raw
+  kernel so their contents cannot become stale.
+- The WASM W8A32 `f32x4` path is an approximate FP32-accumulation fast path,
+  not a bit-exact replacement for the portable double accumulator. It is
+  limited to `M=1`, signed-I8 weights, effective zero point zero, `K<=1280`,
+  weight scales at most `0.025`, and finite activations in `[-35,35]`;
+  every other valid descriptor retains the scalar/double path. The SIMD
+  accumulator uses compensated summation to control cancellation error.
+- Odd M/N/K tails are zero-padded or masked, never read outside the logical tensor.
+- GPU backward uses the same 16x16 cooperative tiling for `dX` and `dW`; bias remains an
+  independent reduction.
+- Allocation, device-limit, or shader-dispatch failure declines to the existing safe
+  backend path instead of publishing a partial output.
+
+The focused checks and benchmarks are:
+
+```bash
+make test_native
+make benchmark_native
+```
+
+## 3. Indirection Buffers
 
 Branching inside the MAC loop for padding stalls the CPU pipeline. Precompute an array of
 input pointers instead. Padded areas point to a zero buffer, so the microkernel can do
@@ -46,7 +117,7 @@ for (int oy = 0; oy < output_height; oy++) {
 }
 ```
 
-## 3. Data Type Strategies
+## 4. Data Type Strategies
 
 ### INT8
 
@@ -144,10 +215,11 @@ void microkernel_conv2d_fp32_avx2(
 }
 ```
 
-## Action Plan
+## Next steps
 
 1. Add reusable indirection-buffer builders during graph initialization.
-2. Extend weight-packing caches so each hot op has a layout matched to its microkernel.
-3. Replace generic inner loops in `quant_cpu_opt.c` with CPU-feature-routed microkernels.
+2. Add more per-ISA dense microkernels where benchmarks justify a different MR/NR/KC.
+3. Continue replacing generic convolution loops in `quant_cpu_opt.c` with
+   CPU-feature-routed microkernels.
 4. Keep the activation arena planner enabled for transient tensors with non-overlapping
    lifetimes.
