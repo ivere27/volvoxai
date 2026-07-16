@@ -1,17 +1,23 @@
 #!/usr/bin/env node
 
 import { Command } from 'commander';
-import { VolvoxAI } from '../js/index.js';
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
+
+const packageVersion = JSON.parse(
+  fs.readFileSync(new URL('../package.json', import.meta.url), 'utf8'),
+).version;
+const { VolvoxAI } = await import(
+  new URL(`../dist/${packageVersion}/volvoxai.js`, import.meta.url)
+);
 
 const program = new Command();
 
 program
   .name('volvox')
   .description('Volvox AI CLI for running local inference')
-  .version('0.1.0');
+  .version(packageVersion);
 
 program
   .command('run')
@@ -23,7 +29,7 @@ program
       installFileFetchShim();
       console.log(`[Volvox CLI] Initializing Engine (Backend: ${options.backend})...`);
       const cliDir = path.dirname(fileURLToPath(import.meta.url));
-      const wasmPath = path.resolve(cliDir, '..', 'volvoxai.wasm');
+      const wasmPath = path.resolve(cliDir, '..', 'dist', packageVersion, 'volvoxai.wasm');
       const engine = await VolvoxAI.init(options.backend, wasmPath);
 
       console.log(`[Volvox CLI] Loading Model: ${options.model}`);

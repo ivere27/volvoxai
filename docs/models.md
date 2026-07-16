@@ -12,8 +12,9 @@ Install exporter dependencies once:
 make models_deps
 ```
 
-This installs `tools/requirements-export.txt`, including numpy, flatbuffers,
-safetensors, torch, and transformers.
+This installs the generic ONNX/TFLite dependencies from
+`tools/requirements-export.txt` and the family-specific TinyStories exporter
+dependencies from `examples/tinystories/requirements-export.txt`.
 
 ## Commands
 
@@ -24,9 +25,10 @@ safetensors, torch, and transformers.
 | `make models_tinystories` | Export `roneneldan/TinyStories-1M` plus tokenizer assets. |
 | `make models_clean` | Remove regenerated example model directories. |
 
-`tools/fetch_models.sh` accepts `efficientdet`, `tinystories`, or `all`. For
-EfficientDet, set `ONLY=int8`, `ONLY=float16`, or `ONLY=float32` to fetch one
-precision.
+Each model family owns its acquisition policy under `examples/`.
+`tools/fetch_models.sh` remains only as a compatibility dispatcher for
+`efficientdet`, `tinystories`, or `all`. For EfficientDet, set `ONLY=int8`,
+`ONLY=float16`, or `ONLY=float32` to fetch one precision.
 
 ## EfficientDet Lite0
 
@@ -55,7 +57,17 @@ boxes:  [1, 19206, 4]
 The COCO label file keeps the 90-slot class-id alignment. `???` entries are unused
 placeholders and should not be deleted.
 
+The fetcher, labels, and exporter smoke test live under
+[`../examples/efficientdet_lite0/`](../examples/efficientdet_lite0/). The
+generic ONNX/TFLite exporter assigns positional output names by default; this
+example explicitly names the MediaPipe outputs `scores` and `boxes`.
+
 ## TinyStories
+
+GPT-Neo graph construction, tokenizer export, and checkpoint acquisition live
+under `examples/tinystories/`; the root exporter accepts only ONNX and TFLite
+sources. See [`../examples/tinystories/README.md`](../examples/tinystories/README.md)
+for direct exporter commands and offline tests.
 
 TinyStories exports:
 
@@ -68,36 +80,15 @@ tokens.i32
 positions.i32
 ```
 
-The native runtime can use the package directly:
+The opt-in native task example can use the package directly:
 
 ```bash
-./native/volvoxai generate models/tinystories_1m \
+make -C examples native_task_cli
+
+examples/target/bin/volvoxai-tasks generate models/tinystories_1m \
   --prompt "Once upon a time, Lily" \
   --max-new 50
 ```
 
-## TinyReceiptKIE
-
-Custom TinyReceiptKIE checkpoints can be exported into the same package layout:
-
-```bash
-python3 tools/export_kie_safetensors.py \
-  --checkpoint checkpoint.pt \
-  --out models/tiny_receipt_kie
-```
-
-Then run it through the native chat alias:
-
-```bash
-./native/volvoxai chat models/tiny_receipt_kie \
-  --image image=receipt.jpg \
-  --prompt "What is the first number of the store's phone number?" \
-  --family auto \
-  --max-new 128
-```
-
-The package declares the `tiny_receipt_kie` chat interface in `config.json` and keeps
-weights in `model.safetensors`. LoRA is folded into dense linear weights during
-export. If the checkpoint is a base model plus components, add `--lora lora.pt` and
-repeat `--adapter family=adapter_family.pt` for each adapter family.
-
+The fixed `native/volvoxai` executable remains vocabulary-agnostic and can run
+the same graph only through named raw tensor inputs and outputs.

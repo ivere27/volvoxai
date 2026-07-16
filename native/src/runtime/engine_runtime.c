@@ -1,0 +1,86 @@
+#include "volvoxai.h"
+#include "engine_internal.h"
+#include "backend.h"
+#include "backend_sdk.h"
+#include "w8a8_device_ops.h"
+#include "attention_mask.h"
+#include "sequence_runtime.h"
+#if VOLVOXAI_ENABLE_TRAINING
+#include "volvoxai_training.h"
+#endif
+#include "adapter_runtime_internal.h"
+#include "cJSON.h"
+#include "fusion_ops.h"
+#include "inference_kernels.h"
+#include "json_validation.h"
+#include "quant_cpu_opt.h"
+#include "safetensors.h"
+#include "thread_pool.h"
+#if VOLVOXAI_ENABLE_VULKAN
+#include "vulkan_engine.h"
+#endif
+#if VOLVOXAI_ENABLE_OPENGL
+#include "opengl_engine.h"
+#endif
+#if VOLVOXAI_ENABLE_METAL
+#include "metal_engine.h"
+#endif
+#include "conv_f32_opt.h"
+#include "tensor_f32_opt.h"
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <stdint.h>
+#include <stddef.h>
+#include <limits.h>
+#include <math.h>
+#include <time.h>
+#ifdef _WIN32
+#include <windows.h>
+#endif
+
+static char g_removed_graph_outputs[MAXT][128];
+static int g_removed_graph_output_count;
+static T g_graph_patch_reused_old_tensors[MAXT];
+static int g_graph_patch_reused_indices[MAXT];
+static int g_graph_patch_reused_count;
+
+#if VOLVOXAI_ENABLE_NNAPI
+extern void nnapi_matmul(const float*, const float*, const float*, float*, int, int, int);
+#endif
+
+#if VOLVOXAI_ENABLE_VULKAN
+extern int vk_matmul(const float*, const float*, const float*, float*, int, int, int);
+#endif
+
+double volvoxai_engine_now_ms(void) {
+#ifdef _WIN32
+    LARGE_INTEGER freq, counter;
+    QueryPerformanceFrequency(&freq);
+    QueryPerformanceCounter(&counter);
+    return (double)counter.QuadPart * 1000.0 / (double)freq.QuadPart;
+#else
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec * 1000.0 + (double)ts.tv_nsec / 1000000.0;
+#endif
+}
+
+static T* nin(Node* n, const char* key);
+static int quantized_weight_i32(const T* wt, long idx);
+static int widen_f16_tensor_to_f32(T* t);
+static int p_int(cJSON* p, const char* k, int def);
+static float p_flt(cJSON* p, const char* k, float def);
+static int layout_is(const char* layout, const char* want);
+static int linear_node_weight_layout(Node* node, const T* input, const T* output,
+                                     const T* weight, int* out_in);
+static int route_index_read(const T* indices, long index, int* value);
+
+/* These private fragments stay in one translation unit to preserve static
+ * runtime state and the inference/full compilation boundary. */
+#include "engine_runtime_model.inc"
+#include "engine_runtime_f32_cpu.inc"
+#include "engine_runtime_f32_gpu.inc"
+#include "profiler.inc"
+#include "engine_runtime_w8a8.inc"
+#include "engine_runtime_dispatch.inc"

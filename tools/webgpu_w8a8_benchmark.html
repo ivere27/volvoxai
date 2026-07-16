@@ -1,0 +1,595 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>VolvoxAI WebGPU W8A8 benchmark</title>
+  <style>
+    :root { color-scheme: light dark; font-family: ui-monospace, SFMono-Regular, Consolas, monospace; }
+    body { margin: 2rem auto; max-width: 1000px; padding: 0 1rem; }
+    h1 { font: 600 1.4rem system-ui, sans-serif; }
+    table { border-collapse: collapse; width: 100%; margin: 1rem 0; }
+    th, td { border: 1px solid #8886; padding: .45rem; text-align: left; }
+    th { background: #8882; }
+    .pass { color: #1a8f42; }
+    .fail { color: #d33; }
+    .skip { color: #b07800; }
+    pre { border: 1px solid #8886; padding: 1rem; white-space: pre-wrap; overflow-wrap: anywhere; }
+  </style>
+</head>
+<body>
+  <h1>VolvoxAI standalone WebGPU W8A8 benchmark</h1>
+  <p>This page loads the repository WGSL directly; it does not load an engine bundle.</p>
+  <table>
+    <thead><tr><th>Kernel</th><th>Correctness</th><th>Mean queue-complete latency</th><th>Speedup</th></tr></thead>
+    <tbody id="results"></tbody>
+  </table>
+  <pre id="out">Starting…</pre>
+
+<script type="module">
+const out = document.getElementById('out');
+const rowsElement = document.getElementById('results');
+const lines = [];
+const measurements = [];
+const query = new URLSearchParams(location.search);
+const requireDot = query.get('requireDot') === '1';
+const warmupIterations = boundedInteger(query.get('warmup'), 1, 0, 20);
+const timedIterations = boundedInteger(query.get('iterations'), 20, 1, 50);
+window.__webgpuW8A8BenchmarkResult = { status: 'running' };
+
+function boundedInteger(value, fallback, minimum, maximum) {
+  if (value == null) return fallback;
+  const parsed = Number(value);
+  return Number.isInteger(parsed) ? Math.min(maximum, Math.max(minimum, parsed)) : fallback;
+}
+
+function log(message = '') {
+  lines.push(String(message));
+  out.textContent = lines.join('\n');
+}
+
+function addResult(name, correctness, milliseconds, speedup, status = 'pass') {
+  const row = document.createElement('tr');
+  const cells = [name, correctness, milliseconds == null ? '—' : `${milliseconds.toFixed(3)} ms`, speedup == null ? '—' : `${speedup.toFixed(2)}×`];
+  for (const value of cells) {
+    const cell = document.createElement('td');
+    cell.textContent = value;
+    row.appendChild(cell);
+  }
+  row.className = status;
+  rowsElement.appendChild(row);
+}
+
+function align4(value) { return (value + 3) & ~3; }
+function ceilDiv(value, divisor) { return Math.ceil(value / divisor); }
+function signedByte(value) { return value >= 128 ? value - 256 : value; }
+function typedByte(value, type) { return type === 2 ? signedByte(value) : value; }
+
+function xorshift(seed) {
+  let state = seed >>> 0;
+  return () => {
+    state ^= state << 13;
+    state ^= state >>> 17;
+    state ^= state << 5;
+    return state >>> 0;
+  };
+}
+
+function packBytes(bytes) {
+  // The extra zero word makes unaligned four-byte reads at the last logical
+  // element safe. It is part of the canonical packed-buffer fixture here.
+  const words = new Uint32Array(ceilDiv(bytes.length, 4) + 1);
+  const packed = new Uint8Array(words.buffer);
+  packed.set(bytes);
+  return words;
+}
+
+function quantize(accumulator, inputScale, scale, outputScale, outputZeroPoint, outputType) {
+  const multiplier = Math.fround(Math.fround(inputScale * scale) / outputScale);
+  const transformed = Math.fround(Math.fround(accumulator) * multiplier + outputZeroPoint);
+  const minimum = outputType === 2 ? -128 : 0;
+  const maximum = outputType === 2 ? 127 : 255;
+  let result;
+  if (Number.isNaN(transformed)) result = outputZeroPoint;
+  else if (transformed <= minimum) result = minimum;
+  else if (transformed >= maximum) result = maximum;
+  else {
+    const lower = Math.floor(transformed);
+    const fraction = transformed - lower;
+    result = fraction < 0.5 ? lower : fraction > 0.5 ? lower + 1 : ((lower & 1) === 0 ? lower : lower + 1);
+  }
+  return result & 255;
+}
+
+function makeLinearCase(rows, dIn, dOut, seed, symmetric = false) {
+  const inputType = symmetric ? 2 : 3;
+  const weightType = 2;
+  const outputType = 2;
+  const inputZeroPoint = symmetric ? 0 : 127;
+  const outputZeroPoint = symmetric ? 0 : -3;
+  const inputScale = 0.125;
+  const outputScale = 0.25;
+  const random = xorshift(seed);
+  const input = new Uint8Array(rows * dIn);
+  const weight = new Uint8Array(dOut * dIn);
+  const scales = new Float32Array(dOut);
+  const zeroPoints = new Int32Array(dOut);
+  const bias = new Int32Array(dOut);
+  for (let i = 0; i < input.length; ++i) input[i] = (inputZeroPoint + (random() % 25) - 12) & 255;
+  for (let outputChannel = 0; outputChannel < dOut; ++outputChannel) {
+    const zeroPoint = symmetric ? 0 : (outputChannel % 5) - 2;
+    zeroPoints[outputChannel] = zeroPoint;
+    scales[outputChannel] = [0.125, 0.25, 0.5][outputChannel % 3];
+    bias[outputChannel] = ((outputChannel % 11) - 5) * 7;
+    const base = outputChannel * dIn;
+    for (let inputChannel = 0; inputChannel < dIn; ++inputChannel) {
+      weight[base + inputChannel] = (zeroPoint + (random() % 15) - 7) & 255;
+    }
+  }
+  return { rows, dIn, dOut, inputType, weightType, outputType, inputZeroPoint,
+    outputZeroPoint, inputScale, outputScale, input, weight, scales, zeroPoints, bias };
+}
+
+function referenceLinear(test) {
+  const output = new Uint8Array(test.rows * test.dOut);
+  for (let row = 0; row < test.rows; ++row) {
+    const inputBase = row * test.dIn;
+    for (let outputChannel = 0; outputChannel < test.dOut; ++outputChannel) {
+      const weightBase = outputChannel * test.dIn;
+      let accumulator = test.bias[outputChannel];
+      for (let inputChannel = 0; inputChannel < test.dIn; ++inputChannel) {
+        accumulator += (typedByte(test.input[inputBase + inputChannel], test.inputType) - test.inputZeroPoint) *
+          (typedByte(test.weight[weightBase + inputChannel], test.weightType) - test.zeroPoints[outputChannel]);
+      }
+      output[row * test.dOut + outputChannel] = quantize(accumulator, test.inputScale, test.scales[outputChannel],
+        test.outputScale, test.outputZeroPoint, test.outputType);
+    }
+  }
+  return output;
+}
+
+function makeConvCase(symmetric = false) {
+  const test = {
+    batch: 1, inputHeight: 16, inputWidth: 16, inputChannels: 64,
+    outputHeight: 16, outputWidth: 16, outputChannels: 64,
+    kernelHeight: 3, kernelWidth: 3, strideY: 1, strideX: 1,
+    dilationY: 1, dilationX: 1, padTop: 1, padLeft: 1, groups: 1,
+    inputType: symmetric ? 2 : 3, weightType: 2, outputType: 2, relu: 0,
+    inputZeroPoint: symmetric ? 0 : 129, outputZeroPoint: symmetric ? 0 : -2,
+    inputScale: 0.125, outputScale: 0.25,
+  };
+  const random = xorshift(0xc0ffee);
+  test.input = new Uint8Array(test.batch * test.inputHeight * test.inputWidth * test.inputChannels);
+  test.weight = new Uint8Array(test.outputChannels * test.kernelHeight * test.kernelWidth * test.inputChannels);
+  test.scales = new Float32Array(test.outputChannels);
+  test.zeroPoints = new Int32Array(test.outputChannels);
+  test.bias = new Int32Array(test.outputChannels);
+  for (let i = 0; i < test.input.length; ++i) test.input[i] = (test.inputZeroPoint + (random() % 25) - 12) & 255;
+  const terms = test.kernelHeight * test.kernelWidth * test.inputChannels;
+  for (let outputChannel = 0; outputChannel < test.outputChannels; ++outputChannel) {
+    const zeroPoint = symmetric ? 0 : (outputChannel % 5) - 2;
+    test.zeroPoints[outputChannel] = zeroPoint;
+    test.scales[outputChannel] = [0.125, 0.25, 0.5][outputChannel % 3];
+    test.bias[outputChannel] = ((outputChannel % 13) - 6) * 5;
+    for (let term = 0; term < terms; ++term) {
+      test.weight[outputChannel * terms + term] = (zeroPoint + (random() % 15) - 7) & 255;
+    }
+  }
+  return test;
+}
+
+function referenceConv(test) {
+  const output = new Uint8Array(test.batch * test.outputHeight * test.outputWidth * test.outputChannels);
+  const inputPerGroup = test.inputChannels / test.groups;
+  const outputPerGroup = test.outputChannels / test.groups;
+  for (let batch = 0; batch < test.batch; ++batch) {
+    for (let outputY = 0; outputY < test.outputHeight; ++outputY) {
+      for (let outputX = 0; outputX < test.outputWidth; ++outputX) {
+        for (let outputChannel = 0; outputChannel < test.outputChannels; ++outputChannel) {
+          const group = Math.floor(outputChannel / outputPerGroup);
+          let accumulator = test.bias[outputChannel];
+          for (let kernelY = 0; kernelY < test.kernelHeight; ++kernelY) {
+            const inputY = outputY * test.strideY + kernelY * test.dilationY - test.padTop;
+            if (inputY < 0 || inputY >= test.inputHeight) continue;
+            for (let kernelX = 0; kernelX < test.kernelWidth; ++kernelX) {
+              const inputX = outputX * test.strideX + kernelX * test.dilationX - test.padLeft;
+              if (inputX < 0 || inputX >= test.inputWidth) continue;
+              for (let localChannel = 0; localChannel < inputPerGroup; ++localChannel) {
+                const inputChannel = group * inputPerGroup + localChannel;
+                const inputIndex = (((batch * test.inputHeight + inputY) * test.inputWidth + inputX) * test.inputChannels) + inputChannel;
+                const weightIndex = (((outputChannel * test.kernelHeight + kernelY) * test.kernelWidth + kernelX) * inputPerGroup) + localChannel;
+                accumulator += (typedByte(test.input[inputIndex], test.inputType) - test.inputZeroPoint) *
+                  (typedByte(test.weight[weightIndex], test.weightType) - test.zeroPoints[outputChannel]);
+              }
+            }
+          }
+          const outputIndex = (((batch * test.outputHeight + outputY) * test.outputWidth + outputX) * test.outputChannels) + outputChannel;
+          output[outputIndex] = quantize(accumulator, test.inputScale, test.scales[outputChannel], test.outputScale,
+            test.outputZeroPoint, test.outputType);
+        }
+      }
+    }
+  }
+  return output;
+}
+
+function linearParams(test) {
+  const buffer = new ArrayBuffer(64);
+  const u32 = new Uint32Array(buffer);
+  const i32 = new Int32Array(buffer);
+  const f32 = new Float32Array(buffer);
+  u32.set([test.rows, test.dIn, test.dOut, test.inputType, test.weightType, test.outputType], 0);
+  i32[8] = test.inputZeroPoint;
+  i32[9] = test.outputZeroPoint;
+  f32[12] = test.inputScale;
+  f32[13] = test.outputScale;
+  return new Uint8Array(buffer);
+}
+
+function convParams(test) {
+  const buffer = new ArrayBuffer(112);
+  const u32 = new Uint32Array(buffer);
+  const i32 = new Int32Array(buffer);
+  const f32 = new Float32Array(buffer);
+  u32.set([test.batch, test.inputHeight, test.inputWidth, test.inputChannels,
+    test.outputHeight, test.outputWidth, test.outputChannels, test.kernelHeight,
+    test.kernelWidth, test.strideY, test.strideX, test.dilationY, test.dilationX,
+    test.padTop, test.padLeft, test.groups, test.inputType, test.weightType,
+    test.outputType, test.relu], 0);
+  i32[20] = test.inputZeroPoint;
+  i32[21] = test.outputZeroPoint;
+  f32[24] = test.inputScale;
+  f32[25] = test.outputScale;
+  return new Uint8Array(buffer);
+}
+
+function assertEqual(actual, expected, label) {
+  if (actual.length !== expected.length) throw new Error(`${label}: length ${actual.length}, expected ${expected.length}`);
+  for (let index = 0; index < actual.length; ++index) {
+    if (actual[index] !== expected[index]) {
+      throw new Error(`${label}: byte ${index} is ${actual[index]}, expected ${expected[index]}`);
+    }
+  }
+}
+
+async function adapterDescription(adapter) {
+  let info = adapter.info;
+  if (!info && adapter.requestAdapterInfo) {
+    try { info = await adapter.requestAdapterInfo(); } catch { /* Optional API. */ }
+  }
+  if (!info) return 'adapter info unavailable';
+  return ['vendor', 'architecture', 'device', 'description']
+    .map((key) => info[key] ? `${key}=${info[key]}` : null).filter(Boolean).join(', ') || 'adapter info empty';
+}
+
+async function requestAdapterWithRetries(attempts = 5) {
+  for (let attempt = 1; attempt <= attempts; ++attempt) {
+    const adapter = await navigator.gpu.requestAdapter();
+    if (adapter) return adapter;
+    if (attempt < attempts) {
+      log(`requestAdapter returned null (attempt ${attempt}/${attempts}); retrying in 400 ms`);
+      await new Promise((accept) => setTimeout(accept, 400));
+    }
+  }
+  return null;
+}
+
+async function fetchSources() {
+  const paths = {
+    linearPortable: '../shaders/inference/qLinearInt8.wgsl',
+    linearPortableTiled: '../shaders/inference/qLinearInt8Tiled.wgsl',
+    linearDot: '../shaders/inference/qLinearInt8Dot.wgsl',
+    linearDotTiled: '../shaders/inference/qLinearInt8DotTiled.wgsl',
+    convPortable: '../shaders/inference/qConv2DInt8.wgsl',
+    convPortableTiled: '../shaders/inference/qConv2DInt8Tiled.wgsl',
+    convDotTiled: '../shaders/inference/qConv2DInt8DotTiled.wgsl',
+  };
+  const result = {};
+  await Promise.all(Object.entries(paths).map(async ([name, path]) => {
+    const response = await fetch(path, { cache: 'no-store' });
+    if (!response.ok) throw new Error(`fetch ${path}: HTTP ${response.status}`);
+    result[name] = { path, source: await response.text() };
+  }));
+  return result;
+}
+
+async function compile(device, name, shader) {
+  device.pushErrorScope('validation');
+  let pipeline;
+  let thrown;
+  const start = performance.now();
+  try {
+    const module = device.createShaderModule({ label: name, code: shader.source });
+    if (module.getCompilationInfo) {
+      const info = await module.getCompilationInfo();
+      const errors = info.messages.filter((message) => message.type === 'error');
+      if (errors.length) {
+        throw new Error(`${name} compile: ${errors.map((message) => `${message.lineNum}:${message.linePos} ${message.message}`).join(' | ')}`);
+      }
+    }
+    pipeline = await device.createComputePipelineAsync({
+      label: name,
+      layout: 'auto',
+      compute: { module, entryPoint: 'main' },
+    });
+  } catch (error) {
+    thrown = error;
+  }
+  const validationError = await device.popErrorScope();
+  if (thrown) throw thrown;
+  if (validationError) throw new Error(`${name}: ${validationError.message}`);
+  log(`COMPILE ${name}: ${(performance.now() - start).toFixed(1)} ms (${shader.path})`);
+  return pipeline;
+}
+
+function upload(device, data, usage, label) {
+  const bytes = new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
+  const buffer = device.createBuffer({ label, size: Math.max(4, align4(bytes.byteLength)), usage, mappedAtCreation: true });
+  new Uint8Array(buffer.getMappedRange(), 0, bytes.byteLength).set(bytes);
+  buffer.unmap();
+  return buffer;
+}
+
+function makeResources(device, test, params, outputElements) {
+  const buffers = [
+    upload(device, packBytes(test.input), GPUBufferUsage.STORAGE, 'input packed I8/U8'),
+    upload(device, packBytes(test.weight), GPUBufferUsage.STORAGE, 'weight packed I8'),
+    upload(device, test.scales, GPUBufferUsage.STORAGE, 'weight scales'),
+    upload(device, test.zeroPoints, GPUBufferUsage.STORAGE, 'weight zero points'),
+    upload(device, test.bias, GPUBufferUsage.STORAGE, 'bias I32'),
+    device.createBuffer({ label: 'packed output', size: align4(outputElements),
+      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST }),
+    upload(device, params, GPUBufferUsage.UNIFORM, 'params'),
+  ];
+  return {
+    buffers,
+    outputElements,
+    bindGroup(pipeline) {
+      return device.createBindGroup({
+        layout: pipeline.getBindGroupLayout(0),
+        entries: buffers.map((buffer, binding) => ({ binding, resource: { buffer } })),
+      });
+    },
+    destroy() { for (const buffer of buffers) buffer.destroy(); },
+  };
+}
+
+function encodeDispatch(device, pipeline, bindGroup, workgroups, outputBuffer = null, copyTarget = null, copyBytes = 0) {
+  const encoder = device.createCommandEncoder();
+  const pass = encoder.beginComputePass();
+  pass.setPipeline(pipeline);
+  pass.setBindGroup(0, bindGroup);
+  pass.dispatchWorkgroups(...workgroups);
+  pass.end();
+  if (copyTarget) encoder.copyBufferToBuffer(outputBuffer, 0, copyTarget, 0, copyBytes);
+  return encoder.finish();
+}
+
+function encodeRepeatedDispatches(device, pipeline, bindGroup, workgroups, repetitions) {
+  const encoder = device.createCommandEncoder();
+  const pass = encoder.beginComputePass();
+  pass.setPipeline(pipeline);
+  pass.setBindGroup(0, bindGroup);
+  for (let iteration = 0; iteration < repetitions; ++iteration) pass.dispatchWorkgroups(...workgroups);
+  pass.end();
+  return encoder.finish();
+}
+
+async function readDispatch(device, pipeline, resources, workgroups) {
+  const bindGroup = resources.bindGroup(pipeline);
+  const copyBytes = align4(resources.outputElements);
+  const readback = device.createBuffer({ size: copyBytes, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
+  device.queue.submit([encodeDispatch(device, pipeline, bindGroup, workgroups, resources.buffers[5], readback, copyBytes)]);
+  await device.queue.onSubmittedWorkDone();
+  await readback.mapAsync(GPUMapMode.READ);
+  const result = new Uint8Array(readback.getMappedRange(), 0, resources.outputElements).slice();
+  readback.unmap();
+  readback.destroy();
+  return result;
+}
+
+async function benchmark(device, pipeline, resources, workgroups, iterations) {
+  const bindGroup = resources.bindGroup(pipeline);
+  if (warmupIterations > 0) {
+    device.queue.submit([encodeRepeatedDispatches(device, pipeline, bindGroup, workgroups, warmupIterations)]);
+    await device.queue.onSubmittedWorkDone();
+  }
+  const timeBatch = async (repetitions) => {
+    const commands = encodeRepeatedDispatches(device, pipeline, bindGroup, workgroups, repetitions);
+    const start = performance.now();
+    device.queue.submit([commands]);
+    await device.queue.onSubmittedWorkDone();
+    return performance.now() - start;
+  };
+  let repetitions = iterations;
+  let totalMilliseconds = await timeBatch(repetitions);
+  // performance.now() is coarse on non-isolated pages. If the requested batch
+  // is too short, measure a larger second batch so the reported mean is stable.
+  for (let growthAttempt = 0; totalMilliseconds < 50 && repetitions < 1000 && growthAttempt < 3; ++growthAttempt) {
+    repetitions = Math.min(1000, Math.max(repetitions + 1,
+      Math.ceil(repetitions * 50 / Math.max(totalMilliseconds, 0.1))));
+    totalMilliseconds = await timeBatch(repetitions);
+  }
+  return { meanMilliseconds: totalMilliseconds / repetitions, totalMilliseconds, iterations: repetitions };
+}
+
+async function runPair(device, definition) {
+  log(`\nCASE ${definition.name}: ${definition.description}`);
+  const expectedStart = performance.now();
+  const expected = definition.reference(definition.test);
+  log(`CPU reference: ${(performance.now() - expectedStart).toFixed(1)} ms, ${expected.length} output bytes`);
+  const resources = makeResources(device, definition.test, definition.params(definition.test), expected.length);
+  try {
+    const portableActual = await readDispatch(device, definition.portable.pipeline, resources, definition.portable.groups);
+    assertEqual(portableActual, expected, `${definition.name} portable vs CPU`);
+    const portableTiming = await benchmark(device, definition.portable.pipeline, resources,
+      definition.portable.groups, definition.iterations);
+    const portableMs = portableTiming.meanMilliseconds;
+    measurements.push({ kernel: definition.portable.label, milliseconds: portableMs,
+      totalMilliseconds: portableTiming.totalMilliseconds, iterations: portableTiming.iterations });
+    addResult(definition.portable.label, 'exact CPU parity', portableMs, null);
+    log(`PASS ${definition.portable.label}: exact CPU parity; ${portableMs.toFixed(3)} ms mean ` +
+      `(${portableTiming.iterations} dispatches in ${portableTiming.totalMilliseconds.toFixed(1)} ms)`);
+
+    if (!definition.dot) {
+      addResult(`${definition.name} DP4a`, 'feature unavailable', null, null, 'skip');
+      log(`SKIP ${definition.name} DP4a: packed_4x8_integer_dot_product unavailable`);
+      return { portable: portableTiming, dot: null };
+    }
+    const dotActual = await readDispatch(device, definition.dot.pipeline, resources, definition.dot.groups);
+    assertEqual(dotActual, expected, `${definition.name} DP4a vs CPU`);
+    assertEqual(dotActual, portableActual, `${definition.name} DP4a vs portable`);
+    const dotTiming = await benchmark(device, definition.dot.pipeline, resources,
+      definition.dot.groups, definition.iterations);
+    const dotMs = dotTiming.meanMilliseconds;
+    const speedup = portableMs / dotMs;
+    measurements.push({ kernel: definition.dot.label, milliseconds: dotMs,
+      totalMilliseconds: dotTiming.totalMilliseconds, iterations: dotTiming.iterations, speedup });
+    addResult(definition.dot.label, 'exact CPU + portable parity', dotMs, speedup);
+    log(`PASS ${definition.dot.label}: exact CPU + portable parity; ${dotMs.toFixed(3)} ms mean ` +
+      `(${dotTiming.iterations} dispatches in ${dotTiming.totalMilliseconds.toFixed(1)} ms); ${speedup.toFixed(2)}x`);
+    return { portable: portableTiming, dot: dotTiming };
+  } finally {
+    resources.destroy();
+  }
+}
+
+async function main() {
+  log(`Parameters: warmup=${warmupIterations}, timed=${timedIterations}, requireDot=${requireDot}`);
+  if (!navigator.gpu) throw new Error('navigator.gpu is unavailable');
+  const wgslFeatures = navigator.gpu.wgslLanguageFeatures;
+  const hasDot = Boolean(wgslFeatures && wgslFeatures.has('packed_4x8_integer_dot_product'));
+  log(`WGSL packed_4x8_integer_dot_product: ${hasDot ? 'available' : 'unavailable'}`);
+  if (wgslFeatures) log(`WGSL language features: ${Array.from(wgslFeatures).sort().join(', ') || '(none)'}`);
+  if (requireDot && !hasDot) throw new Error('packed_4x8_integer_dot_product is required but unavailable');
+
+  const adapter = await requestAdapterWithRetries();
+  if (!adapter) throw new Error('requestAdapter returned null after 5 attempts');
+  log(`Adapter: ${await adapterDescription(adapter)}`);
+  log(`Adapter features: ${Array.from(adapter.features).sort().join(', ') || '(none)'}`);
+  const device = await adapter.requestDevice();
+  let lostReason = null;
+  device.lost.then((info) => { lostReason = `${info.reason}: ${info.message}`; });
+
+  const sources = await fetchSources();
+  log(`Fetched ${Object.keys(sources).length} WGSL files (portable tiles plus all DP4a sources)`);
+  const pipelines = {
+    linearPortable: await compile(device, 'QLinear portable scalar', sources.linearPortable),
+    linearPortableTiled: await compile(device, 'QLinear portable tiled', sources.linearPortableTiled),
+    convPortable: await compile(device, 'QConv portable', sources.convPortable),
+    convPortableTiled: await compile(device, 'QConv portable tiled', sources.convPortableTiled),
+  };
+  if (hasDot) {
+    pipelines.linearDot = await compile(device, 'QLinear DP4a scalar', sources.linearDot);
+    pipelines.linearDotTiled = await compile(device, 'QLinear DP4a tiled', sources.linearDotTiled);
+    pipelines.convDotTiled = await compile(device, 'QConv DP4a tiled', sources.convDotTiled);
+  } else {
+    log('DP4a compilation skipped because its required WGSL language feature is unavailable');
+  }
+
+  const decoder = makeLinearCase(1, 256, 760, 0x51a7e, true);
+  const decoderTiming = await runPair(device, {
+    name: 'QLinear decoder row (symmetric)',
+    description: '[1,256] x [760,256], symmetric packed I8 activations/weights, all zero points 0',
+    test: decoder, reference: referenceLinear, params: linearParams,
+    iterations: Math.max(5, timedIterations * 2),
+    portable: { label: 'QLinear portable scalar (symmetric)', pipeline: pipelines.linearPortable,
+      groups: [ceilDiv(decoder.rows * decoder.dOut, 4 * 64), 1, 1] },
+    dot: hasDot ? { label: 'QLinear DP4a scalar (symmetric)', pipeline: pipelines.linearDot,
+      groups: [ceilDiv(decoder.rows * decoder.dOut, 4 * 64), 1, 1] } : null,
+  });
+
+  const asymmetricDecoder = makeLinearCase(1, 256, 760, 0xa51c0, false);
+  const asymmetricTiming = await runPair(device, {
+    name: 'QLinear decoder row (asymmetric correction)',
+    description: '[1,256] x [760,256], U8 activation zp=127 and per-channel I8 weight zero points',
+    test: asymmetricDecoder, reference: referenceLinear, params: linearParams,
+    iterations: Math.max(5, timedIterations * 2),
+    portable: { label: 'QLinear portable scalar (asymmetric)', pipeline: pipelines.linearPortable,
+      groups: [ceilDiv(asymmetricDecoder.rows * asymmetricDecoder.dOut, 4 * 64), 1, 1] },
+    dot: hasDot ? { label: 'QLinear DP4a scalar (asymmetric correction)', pipeline: pipelines.linearDot,
+      groups: [ceilDiv(asymmetricDecoder.rows * asymmetricDecoder.dOut, 4 * 64), 1, 1] } : null,
+  });
+  if (decoderTiming.dot && asymmetricTiming.dot) {
+    const correctionRatio = asymmetricTiming.dot.meanMilliseconds / decoderTiming.dot.meanMilliseconds;
+    measurements.push({ comparison: 'QLinear DP4a asymmetric/symmetric', ratio: correctionRatio });
+    log(`ASYMMETRIC_CORRECTION_COST DP4a: ${correctionRatio.toFixed(2)}x symmetric latency ` +
+      `(${asymmetricTiming.dot.meanMilliseconds.toFixed(3)} vs ${decoderTiming.dot.meanMilliseconds.toFixed(3)} ms)`);
+  }
+
+  const encoderProjection = makeLinearCase(192, 256, 256, 0xb47c11, true);
+  const projectionScalarTiming = await runPair(device, {
+    name: 'QLinear encoder projection scalar DP4a comparison',
+    description: '[192,256] x [256,256], portable cooperative tile versus scalar DP4a',
+    test: encoderProjection, reference: referenceLinear, params: linearParams,
+    iterations: timedIterations,
+    portable: { label: 'QLinear portable tiled (scalar comparison)', pipeline: pipelines.linearPortableTiled,
+      groups: [ceilDiv(encoderProjection.dOut / 4, 8), ceilDiv(encoderProjection.rows, 8), 1] },
+    dot: hasDot ? { label: 'QLinear DP4a scalar (multirow)', pipeline: pipelines.linearDot,
+      groups: [ceilDiv(encoderProjection.rows * encoderProjection.dOut, 4 * 64), 1, 1] } : null,
+  });
+  const projectionTiledTiming = await runPair(device, {
+    name: 'QLinear encoder projection',
+    description: '[192,256] x [256,256], symmetric I8 cooperative 8x8 kernels',
+    test: encoderProjection, reference: referenceLinear, params: linearParams,
+    iterations: timedIterations,
+    portable: { label: 'QLinear portable tiled', pipeline: pipelines.linearPortableTiled,
+      groups: [ceilDiv(encoderProjection.dOut / 4, 8), ceilDiv(encoderProjection.rows, 8), 1] },
+    dot: hasDot ? { label: 'QLinear DP4a tiled', pipeline: pipelines.linearDotTiled,
+      groups: [ceilDiv(encoderProjection.dOut / 4, 8), ceilDiv(encoderProjection.rows, 8), 1] } : null,
+  });
+  if (projectionScalarTiming.dot && projectionTiledTiming.dot) {
+    const tiledSpeedup = projectionScalarTiming.dot.meanMilliseconds / projectionTiledTiming.dot.meanMilliseconds;
+    measurements.push({ comparison: 'QLinear DP4a tiled/scalar multirow', speedup: tiledSpeedup });
+    addResult('QLinear DP4a tiled vs scalar (multirow)', 'same exact CPU output',
+      projectionTiledTiming.dot.meanMilliseconds, tiledSpeedup);
+    log(`DP4A_TILING_SPEEDUP: ${tiledSpeedup.toFixed(2)}x ` +
+      `(${projectionScalarTiming.dot.meanMilliseconds.toFixed(3)} ms scalar vs ` +
+      `${projectionTiledTiming.dot.meanMilliseconds.toFixed(3)} ms tiled)`);
+  }
+
+  const convolution = makeConvCase(true);
+  const spatial = convolution.batch * convolution.outputHeight * convolution.outputWidth;
+  const convolutionElements = spatial * convolution.outputChannels;
+  await runPair(device, {
+    name: 'QConv encoder feature map portable tiling',
+    description: 'symmetric I8 NHWC [1,16,16,64], OHWI [64,3,3,64], stride 1, pad 1',
+    test: convolution, reference: referenceConv, params: convParams,
+    iterations: timedIterations,
+    portable: { label: 'QConv portable scalar', pipeline: pipelines.convPortable,
+      groups: [ceilDiv(convolutionElements, 4 * 64), 1, 1] },
+    dot: { label: 'QConv portable tiled', pipeline: pipelines.convPortableTiled,
+      groups: [ceilDiv(convolution.outputChannels / 4, 8), ceilDiv(spatial, 4), 1] },
+  });
+  await runPair(device, {
+    name: 'QConv encoder feature map DP4a',
+    description: 'symmetric I8 NHWC [1,16,16,64], OHWI [64,3,3,64], stride 1, pad 1',
+    test: convolution, reference: referenceConv, params: convParams,
+    iterations: timedIterations,
+    portable: { label: 'QConv portable tiled (DP4a comparison)', pipeline: pipelines.convPortableTiled,
+      groups: [ceilDiv(convolution.outputChannels / 4, 8), ceilDiv(spatial, 4), 1] },
+    dot: hasDot ? { label: 'QConv DP4a tiled', pipeline: pipelines.convDotTiled,
+      groups: [ceilDiv(convolution.outputChannels / 4, 8), ceilDiv(spatial, 4), 1] } : null,
+  });
+
+  await device.queue.onSubmittedWorkDone();
+  if (lostReason) throw new Error(`device lost: ${lostReason}`);
+  const result = {
+    status: 'pass',
+    dotFeature: hasDot,
+    adapter: await adapterDescription(adapter),
+    measurements,
+  };
+  window.__webgpuW8A8BenchmarkResult = result;
+  log(`\nSUMMARY ALL_PASS${hasDot ? '' : ' (DP4a unavailable; portable paths verified)'}`);
+}
+
+main().catch((error) => {
+  const result = { status: 'fail', error: error?.stack || String(error), measurements };
+  window.__webgpuW8A8BenchmarkResult = result;
+  log(`\nFATAL ${result.error}`);
+  log('SUMMARY FAILED');
+});
+</script>
+</body>
+</html>

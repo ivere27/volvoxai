@@ -1,9 +1,20 @@
 # Chapter 2 — A Language Model, op by op (TinyStories)
 
-*Goal: follow the words **"Once upon a time, Lily"** through a real GPT-style transformer and
-watch it predict the next word. Every op here is one of the small kernels from `js/ops/`.*
+*Read the badges that match you: 🌱 **Idea** (anyone, no code) · 🔧 **Build** (a little code) · 🔬 **Deep**
+(engine developers). New here? Follow just the 🌱 sections.*
 
-The model lives in `models/tinystories_1m/`. It is a tiny GPT (a **decoder-only transformer**)
+*Goal: follow the words **"Once upon a time, Lily"** through a real GPT-style transformer and
+watch it predict the next word. Every op here is one of the small kernels from `ts/ops/`.*
+
+> 🌱 **The big idea.** A language model is an extremely good **"guess the next word" machine.** You
+> give it "Once upon a time, Lily" and it guesses " was". Then you glue " was" onto the end and ask
+> again, and it guesses " a". Do this over and over and it writes a whole story, one word at a
+> time. That is *exactly* how ChatGPT types. This chapter opens up the machine and shows that the
+> "guessing" is just the four LEGO pieces from Chapter 1 — grids of numbers flowing through tiny
+> math steps. The one genuinely clever step is called **attention**, and its whole job is letting
+> each word *look back at the earlier words* to decide what comes next.
+
+🔧 The model lives in `models/tinystories_1m/`. It is a tiny GPT (a **decoder-only transformer**)
 trained on the [TinyStories](https://arxiv.org/abs/2305.07759) dataset of simple children's
 stories. "Tiny" is real: its internal vector width is **64**, it has **8** layers, and yet it
 writes coherent little stories. Studying it teaches you the *exact* architecture behind
@@ -11,7 +22,11 @@ GPT-2/3/4, LLaMA, and Mistral — those are this graph, scaled up.
 
 ## 2.1 The model's dimensions (read them off the blueprint)
 
-From `config.json`, one number at a time:
+> 🌱 **Idea.** Every model has a few "size knobs" — how wide its thoughts are, how many thinking
+> stages it has, how many words it knows. Below are this little model's knobs. You don't need the
+> numbers; just know that big models like ChatGPT are *this same list of knobs turned way up*.
+
+🔧 From `config.json`, one number at a time:
 
 | Symbol | Value | Meaning |
 |---|---|---|
@@ -27,7 +42,7 @@ From `config.json`, one number at a time:
 > two such tables (input + output). In tiny LMs, the *vocabulary*, not the *layers*, dominates
 > the file. That's a real lesson: model size ≠ model depth.
 
-The whole graph is **85 nodes**. Their inventory:
+🔬 The whole graph is **85 nodes**. Their inventory:
 
 ```
 33 MatMul   17 LayerNorm   17 Add   8 SDPA   8 GELU   2 Embedding
@@ -35,6 +50,13 @@ The whole graph is **85 nodes**. Their inventory:
 ```
 
 ## 2.2 The pipeline at a glance
+
+> 🌱 **Idea.** Here's the whole assembly line for turning your prompt into the next word. Read it
+> top to bottom: the words get turned into numbers, the numbers flow through 8 identical "thinking"
+> stages, and at the end the machine produces a score for every word it knows and picks the
+> winner. The rest of the chapter walks each stage.
+
+🔧
 
 ```mermaid
 flowchart TD
@@ -63,8 +85,13 @@ Now we walk it, stage by stage, with the real kernels.
 
 ## 2.3 Stage 0 — Tokenize: text becomes integers
 
-A neural net cannot read letters; it reads numbers. The **tokenizer** (`js/Tokenizer.js`,
-`native/tokenizer.c`) chops text into **tokens** (common word-pieces) and maps each to an
+> 🌱 **Idea.** Computers can't read letters, only numbers. So first we chop the sentence into
+> chunks (whole words, or common word-pieces) and swap each chunk for its ID number — like a
+> coat-check ticket. "Lily" might become `20037`. Now the sentence is a list of numbers the machine
+> can work with.
+
+🔧 A neural net cannot read letters; it reads numbers. The **tokenizer** (`ts/core/Tokenizer.ts`,
+`native/src/tokenization/tokenizer.c`) chops text into **tokens** (common word-pieces) and maps each to an
 integer ID using a vocabulary + a list of **merge rules** (this is **Byte-Pair Encoding**, BPE).
 
 ```
@@ -82,17 +109,24 @@ Two integer tensors go into the graph: **`tokens`** (what the words are) and **`
 (their order, `0,1,2,…`). Both are shape `[1, 256]` — the sequence is padded to the 256-token
 context window.
 
-> **Why positions?** The attention math (below) is order-blind by itself — it would treat
-> "dog bites man" and "man bites dog" identically. Feeding in an explicit position number lets
-> the model learn word order.
+> **Why positions?** 🌱 The next step (attention) is like everyone in a room talking at once — by
+> itself it can't tell who spoke *first*. So we staple a seat number to each word. 🔬 The attention
+> math is order-blind by itself — it would treat "dog bites man" and "man bites dog" identically.
+> Feeding in an explicit position number lets the model learn word order.
 
 ---
 
 ## 2.4 Stage 1 — Embedding: integers become vectors
 
-An ID like `20037` ("Lily") is meaningless as a *number* (it isn't 20037× anything). We replace
+> 🌱 **Idea.** An ID number like `20037` is just a ticket stub — it doesn't *mean* anything on its
+> own. So we look each word up in a big table and replace it with a little list of 64 numbers that
+> captures its *meaning* (words with similar meanings get similar lists). This "meaning list" is
+> called an **embedding**. Now every word is a small cloud of numbers the machine can actually
+> reason with.
+
+🔧 An ID like `20037` ("Lily") is meaningless as a *number* (it isn't 20037× anything). We replace
 it with a learned **vector** of 64 numbers — its **embedding** — that encodes meaning. The
-`Embedding` op is pure table lookup. Here is the entire kernel (`js/ops/embedding.js`):
+`Embedding` op is pure table lookup. Here is the entire kernel (`ts/ops/embedding.ts`):
 
 ```javascript
 for (let i = 0; i < seq_len; i++) {
@@ -126,15 +160,24 @@ hidden_0:  256 rows (one per token position), each a 64-number vector
 
 ## 2.5 Stage 2 — A transformer block (this happens 8×)
 
-Each block refines the residual stream with two sub-steps: **attention** (tokens share
+> 🌱 **Idea.** Now the words go through 8 identical "thinking rooms," one after another. Each room
+> does two things: first the words **talk to each other** (attention — "given the earlier words,
+> what matters to me?"), then each word **thinks by itself** for a moment (a small calculation).
+> After 8 rooms, the words have quietly passed enough notes to figure out what should come next.
+
+🔧 Each block refines the residual stream with two sub-steps: **attention** (tokens share
 information) and a **feed-forward MLP** (each token thinks on its own). Both are wrapped in the
 **pre-norm + residual** pattern that makes deep networks trainable.
 
 ### 2.5a LayerNorm — keep the numbers sane
 
-Before each sub-step, `LayerNorm` rescales each token's 64-vector to have mean 0 and variance 1,
+> 🌱 **Idea.** Before each step, we tidy the numbers so none of them blow up too big or shrink to
+> nothing — like normalizing the volume on a track so it's neither deafening nor silent. This keeps
+> the 8 stacked rooms stable.
+
+🔧 Before each sub-step, `LayerNorm` rescales each token's 64-vector to have mean 0 and variance 1,
 then applies a learned scale (`weight`) and shift (`bias`). This stops values from exploding or
-vanishing across 8 layers. The real kernel (`js/ops/layerNorm.js`), per token row:
+vanishing across 8 layers. The real kernel (`ts/ops/layerNorm.ts`), per token row:
 
 ```javascript
 const mean = sum / d_model;
@@ -145,7 +188,14 @@ out[j] = (in[j] - mean) * inv_std * weight[j] + bias[j]; // normalize, then re-s
 
 ### 2.5b Attention — "which earlier words matter to me?"
 
-This is the heart of a transformer. First a single `MatMul` projects each 64-vector up to **192**
+> 🌱 **Idea.** This is the clever part. Imagine each word asking a question out loud — *"who here is
+> relevant to me?"* — and every earlier word holding up a sign. Words whose signs match the
+> question get listened to more; words that don't get ignored. So when the model reaches "Lily", it
+> can look back and notice "time" and "Lily" matter most right now, and use them to guess what
+> comes next. That "look back and weight the earlier words" move is **attention**, and it's the
+> heart of every large language model.
+
+🔧 This is the heart of a transformer. First a single `MatMul` projects each 64-vector up to **192**
 numbers (`qkv_proj`, shape `[1,256,192]`). Those 192 are three 64-vectors glued together: the
 **Query**, **Key**, and **Value** (Q, K, V). Intuition:
 
@@ -156,7 +206,7 @@ numbers (`qkv_proj`, shape `[1,256,192]`). Those 192 are three 64-vectors glued 
 Then `SDPA` (**Scaled Dot-Product Attention**) does the actual looking. For each token *q*, it
 compares its Query to every earlier token's Key (a dot product = similarity), turns the
 similarities into weights with **softmax**, and returns a weighted blend of those tokens' Values.
-The real causal kernel (`js/ops/sDPA.js`), lightly annotated:
+The real causal kernel (`ts/ops/sDPA.ts`), lightly annotated:
 
 ```javascript
 for (let h = 0; h < num_heads; h++) {                 // 16 independent heads
@@ -172,11 +222,12 @@ for (let h = 0; h < num_heads; h++) {                 // 16 independent heads
 
 Two ideas worth pausing on:
 
-- **Causal masking** (`k <= q`): a token may only attend to itself and *earlier* tokens, never
-  future ones. That's what makes it a left-to-right text *generator* — position 3 can't cheat by
-  peeking at position 4.
-- **Multi-head** (`h`): the 64 dims are split into 16 groups of 4. Each "head" learns a different
-  kind of relationship (e.g. one tracks subjects, another tracks punctuation) in parallel.
+- **Causal masking** (`k <= q`): 🌱 a word may only listen to itself and the words *before* it,
+  never peek ahead — because when you're writing, you don't yet know what comes next. That one-way
+  rule is what makes it a left-to-right *writer*.
+- **Multi-head** (`h`): 🌱 several "listeners" run at once, each paying attention to a different
+  kind of relationship (one tracks *who did what*, another tracks punctuation), and their notes get
+  combined. 🔬 The 64 dims are split into 16 groups of 4; each head attends independently.
 
 ```
 Attention for the token " Lily" (illustrative weights after softmax):
@@ -189,13 +240,18 @@ Attention for the token " Lily" (illustrative weights after softmax):
 ```
 
 A final `MatMul` (`out_proj`, with bias) mixes the 16 heads' outputs back into a 64-vector, and a
-**residual `Add`** adds it onto the stream: `add1 = hidden + attention_output`. "Residual" means
-we *add* the block's result instead of replacing the stream — so information is never lost and
-gradients flow during training.
+**residual `Add`** adds it onto the stream: `add1 = hidden + attention_output`. 🌱 "Residual" just
+means we *add* the new insight on top of what we already had instead of overwriting it — so nothing
+gets lost. 🔬 It also keeps gradients flowing cleanly during training.
 
 ### 2.5c Feed-forward MLP — each token thinks
 
-After tokens have shared info, each one is transformed on its own by a 2-layer MLP:
+> 🌱 **Idea.** After the words have compared notes, each one takes a quiet moment to think on its
+> own: expand into more room to compute, make a nonlinear decision, then compress back. That
+> "nonlinear" bit matters — without it, stacking steps would collapse into one boring straight-line
+> step and the model could never learn interesting patterns.
+
+🔧 After tokens have shared info, each one is transformed on its own by a 2-layer MLP:
 
 ```
 c_fc  : MatMul 64 → 256   (+bias)     "expand: give it room to compute"
@@ -204,7 +260,7 @@ c_proj: MatMul 256 → 64   (+bias)     "compress back to stream width"
 Add   : residual                      hidden_next = add1 + mlp_output
 ```
 
-`GELU` (`js/ops/gELU.js`) is the nonlinearity — a smooth gate that lets small negatives leak and
+`GELU` (`ts/ops/gELU.ts`) is the nonlinearity — a smooth gate that lets small negatives leak and
 passes positives. Without a nonlinearity like this, stacking MatMuls would collapse into a single
 MatMul and the network could only learn straight-line relationships:
 
@@ -220,7 +276,11 @@ back.
 
 ## 2.6 Stage 3 — Head: vectors become word-scores
 
-After the 8th block, one last `LayerNorm` (`ln_f`) cleans up the stream. Then the **language-model
+> 🌱 **Idea.** After the 8 rooms, the machine turns its final thought into a **score for every word
+> it knows** — 50,257 scores, one per word. A high score means "this word is a good next word." We
+> only care about the scores sitting after the *last* word of your prompt: that's the prediction.
+
+🔧 After the 8th block, one last `LayerNorm` (`ln_f`) cleans up the stream. Then the **language-model
 head** — a single `MatMul` by `lm_head.weight [50257, 64]` — turns each 64-vector into **50257
 scores**, one per vocabulary word:
 
@@ -236,18 +296,23 @@ token** — that's the prediction for what comes after the prompt.
 
 ## 2.7 Stage 4 — Sample: scores become the next word
 
-We now have 50257 scores for the next token. This repo's generator (`native/main.c`,
-`command_generate`) uses the simplest rule, **greedy / argmax** — just take the highest:
+> 🌱 **Idea.** We have a score for every word; now we pick one. The simplest rule is "just take the
+> highest score" — that's what this repo does. Real chatbots roll a little weighted dice instead,
+> which is why ChatGPT gives a slightly different answer each time you ask.
+
+🔧 We now have 50257 scores for the next token. This repo's opt-in generator
+(`examples/native_task_cli/main.c`, `command_generate`) uses the simplest rule,
+**greedy / argmax** — just take the highest:
 
 ```c
 int best_id = 0; float best_val = -1e30f;
 for (int i = 0; i < vocab_count; i++)
     if (logits[i] > best_val) { best_val = logits[i]; best_id = i; }   // argmax
 // best_id is the next token; decode it back to text:
-printf("%s", tokenizer_decode(tok, best_id));
+printf("%s", volvoxai_tokenizer_decode(tok, best_id));
 ```
 
-> **Real generators add randomness** — *temperature* (flatten/sharpen the scores), *top-k* /
+> 🔬 **Real generators add randomness** — *temperature* (flatten/sharpen the scores), *top-k* /
 > *top-p* (sample only from the most likely few). Those turn logits into a probability
 > distribution with `softmax` and roll a weighted die, which is why ChatGPT gives different
 > answers each time. Greedy is the deterministic special case; it's perfect for a textbook.
@@ -256,7 +321,11 @@ printf("%s", tokenizer_decode(tok, best_id));
 
 ## 2.8 The loop — one word at a time (autoregression)
 
-A transformer predicts **one** token per forward pass. To write a sentence, you append the new
+> 🌱 **Idea.** The machine only ever predicts **one** word. To get a whole story, you glue that new
+> word onto the end of the sentence and run the machine again — and again, and again. That
+> feed-the-output-back-in loop is the entire trick behind text that seems to "type itself."
+
+🔧 A transformer predicts **one** token per forward pass. To write a sentence, you append the new
 token and run again. This is **autoregressive generation**:
 
 ```mermaid
@@ -277,21 +346,30 @@ step 3:  … → " girl" → " who" → " loved" → " to" → " play" …
 That is literally how ChatGPT types word-by-word: it is running this loop, each new token fed
 back in as input.
 
-> **KV-cache (an optimization you'll hear about).** Naively, step *N* recomputes attention over
+> 🔬 **KV-cache (an optimization you'll hear about).** Naively, step *N* recomputes attention over
 > all *N* tokens from scratch — wasteful. Production engines *cache* each token's Key and Value
-> so each step only computes the new token's. VolvoxAI's native runner exposes this split as
-> `engine_prefill()` (process the whole prompt once) and `engine_decode()` (one new token at a
-> time). The math is identical; the cache just avoids repeating work.
+> so each step only computes the new token's. VolvoxAI's native runtime exposes this split through
+> the generic sequence APIs: `volvoxai_engine_forward_prefix()` processes the prompt rows once,
+> `volvoxai_engine_forward_row()` advances one row, and `volvoxai_engine_tensor_row_f32()` reads
+> that row from the graph's declared output. The math is identical; the cache just avoids
+> repeating work.
 
 ---
 
 ## 2.9 What you just learned
 
+> 🌱 **Idea recap.** A language model is a next-word guesser. It turns words into numbers, lets the
+> words look back at each other (**attention**) through several thinking stages, scores every
+> possible next word, picks one, glues it on, and repeats. ChatGPT is this exact machine, just much
+> bigger.
+
+🔧
+
 - A language model is: **tokenize → embed → (LayerNorm, attention, MLP) × N → head → sample →
   loop.** Nothing more.
 - **Attention** lets tokens share information ("which earlier words matter to me?"); the **MLP**
   lets each token compute on its own; **residuals + LayerNorm** make the stack trainable and deep.
-- Every op is one small kernel in `js/ops/` — `MatMul`, `SDPA`, `LayerNorm`, `GELU`, `Add`,
+- Every op is one small kernel in `ts/ops/` — `MatMul`, `SDPA`, `LayerNorm`, `GELU`, `Add`,
   `Embedding`. GPT-2/3/4 and LLaMA are **this exact graph, wider and deeper**.
 
 Next we switch domains entirely — from text to pixels — and you'll see the *same skeleton*

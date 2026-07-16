@@ -1,11 +1,10 @@
-# Python dependencies for regenerating the models under models/ (see tools/fetch_models.sh).
+# Python dependencies for generic ONNX/TFLite package export.
 # These are DEV-ONLY: the VolvoxAI runtime has no Python dependency. Install with:
 #   python3 -m pip install -r tools/requirements-export.txt
 #
 # Needed by tools/export_safetensors.py:
 numpy>=1.24
-flatbuffers>=23.5.26   # parse .tflite flatbuffers (EfficientDet export)
+flatbuffers>=23.5.26   # parse generic .tflite flatbuffers
 safetensors>=0.4.0     # write model.safetensors
-torch>=2.0             # tensor container + HF model loading (TinyStories export)
-transformers>=4.36     # HuggingFace AutoModelForCausalLM (TinyStories export)
+torch>=2.0             # tensor container for exported weights
 onnx>=1.15             # only if exporting from a .onnx source (optional)

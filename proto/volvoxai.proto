@@ -10,24 +10,25 @@
 // A "model" is a Volvox blueprint: a config.json graph plus a .safetensors
 // weight file (the topology may instead be embedded in the safetensors
 // __metadata__). LoadModel parses the blueprint and builds the graph ONCE,
-// returning a model_id handle (cf. native/engine.h engine_init). Every
-// inference RPC references that handle (cf. engine_forward); UnloadModel frees
-// it (cf. engine_free_ctx). Weights are never reloaded per call.
+// returning a model_id handle (cf. native/include/volvoxai.h volvoxai_engine_init). Every
+// inference RPC references that handle (cf. volvoxai_engine_forward); UnloadModel frees
+// it (cf. volvoxai_engine_shutdown). Weights are never reloaded per call.
 //
 // ─── Two layers ───
 //
-//   Layer 1 — generic tensor I/O (Run, Generate, GetTensor): a 1:1 mapping of
-//     the C engine that works for any blueprint.
-//   Layer 2 — task convenience (Classify, Detect, RecognizeCTC): bakes in the
-//     pre/post-processing that lives in native/main.c (image decode + normalize,
-//     top-k, non-max suppression, tokenizer) so thin clients send an image and
-//     get results.
+//   Layer 1 — generic tensor I/O (Run, GetTensor, SetTensor, GetGraph,
+//     PatchGraph): a 1:1 mapping of the public C engine that works for any
+//     blueprint.
+//   Layer 2 — downstream application convenience (Generate, Classify, Detect,
+//     RecognizeCtc, Seq2SeqTrainStep): owns generation/training transforms and
+//     the pre/post-processing exemplified under examples/native_task_cli, so
+//     thin clients can exchange task-level requests without putting that policy
+//     into the fixed native CLI or engine.
 //
 // ─── Partial-update semantics ───
 //
 // Configuration uses `optional` fields. Only fields that are explicitly set are
-// applied; unset fields keep the engine default (matching the CLI flag
-// defaults in native/main.c).
+// applied; unset fields keep the service method's documented default.
 //
 // ─── FFI zero-copy contract ───
 //
@@ -46,81 +47,128 @@
 syntax = "proto3";
 package volvoxai.v1;
 
-import "google/protobuf/empty.proto";
-
 option go_package   = "github.com/ivere27/volvoxai/go/api/v1";
 option java_package = "io.github.ivere27.volvoxai";
 option java_multiple_files = true;
 
 // ═══════════════════════════════════════════════════════════
-// VolvoxAIService — the whole surface, one service.
+// VolvoxAiService — the whole surface, one service.
 // ═══════════════════════════════════════════════════════════
-service VolvoxAIService {
+service VolvoxAiService {
   // ── Health & capabilities ──
-  rpc Ping(google.protobuf.Empty)          returns (PingResponse);
-  rpc GetCapabilities(google.protobuf.Empty) returns (Capabilities);
+  rpc Ping(Empty)          returns (PingResponse);
+  rpc GetCapabilities(Empty) returns (Capabilities);
 
   // ── Model lifecycle & introspection ──
-  rpc LoadModel(LoadModelRequest)       returns (LoadModelResponse);    // engine_init
-  rpc UnloadModel(ModelRef)             returns (google.protobuf.Empty); // engine_free_ctx
+  rpc LoadModel(LoadModelRequest)       returns (LoadModelResponse);    // volvoxai_engine_init
+  rpc CreateModel(CreateModelRequest)   returns (LoadModelResponse);    // API graph + private backing
+  rpc UnloadModel(ModelRef)             returns (Empty); // volvoxai_engine_shutdown
   rpc GetModelInfo(ModelRef)            returns (ModelInfo);
-  rpc ListModels(google.protobuf.Empty) returns (ListModelsResponse);
+  rpc InspectModel(InspectModelRequest) returns (ModelInspection);
+  rpc SaveModelWeights(SaveModelWeightsRequest) returns (SaveModelWeightsResponse);
+  rpc AddModelTensor(AddModelTensorRequest) returns (TensorSpec);
+  rpc RemoveModelTensor(RemoveModelTensorRequest) returns (Empty);
+  rpc SaveTrainingCheckpoint(SaveTrainingCheckpointRequest) returns (TrainingCheckpointInfo);
+  rpc LoadTrainingCheckpoint(LoadTrainingCheckpointRequest) returns (LoadTrainingCheckpointResponse);
+  rpc GetGraph(ModelRef)                returns (GraphInfo);
+  rpc ListModels(Empty) returns (ListModelsResponse);
+
+  // ── Safetensors file utilities (for adapters/checkpoints) ──
+  rpc InspectSafetensors(InspectSafetensorsRequest) returns (SafetensorsInfo);
+  rpc CreateSafetensors(CreateSafetensorsRequest)   returns (SafetensorsInfo);
+
+  // Adapter lifecycle. Adapter tensor payloads are immutable once staged;
+  // UpdateAdapter creates a new version rather than changing a live version.
+  rpc StageAdapter(StageAdapterRequest)       returns (AdapterInfo);
+  rpc LoadAdapter(LoadAdapterRequest)         returns (AdapterInfo);
+  rpc ListAdapters(ListAdaptersRequest)       returns (ListAdaptersResponse);
+  rpc ActivateAdapter(ActivateAdapterRequest) returns (AdapterState);
+  rpc UpdateAdapter(UpdateAdapterRequest)     returns (AdapterInfo);
+  rpc RemoveAdapter(RemoveAdapterRequest)     returns (Empty);
+  rpc MergeAdapter(MergeAdapterRequest)       returns (AdapterState);
+  rpc UnmergeAdapter(UnmergeAdapterRequest)   returns (AdapterState);
+  rpc SaveAdapter(SaveAdapterRequest)         returns (SaveAdapterResponse);
 
   // ── Layer 1: generic tensor I/O (any blueprint) ──
-  rpc Run(RunRequest)                   returns (RunResponse);          // engine_forward
+  rpc Run(RunRequest)                   returns (RunResponse);          // volvoxai_engine_forward
   rpc Generate(GenerateRequest)         returns (stream GenerateEvent); // prefill + decode
-  rpc GetTensor(GetTensorRequest)       returns (Tensor);               // engine_tensor_ptr (debug)
+  rpc GetTensor(GetTensorRequest)       returns (Tensor);               // locked tensor snapshot (debug)
+  rpc SetTensor(SetTensorRequest)       returns (TensorSpec);           // in-place weight edit
+  rpc ApplyTensorUpdates(ApplyTensorUpdatesRequest) returns (ApplyTensorUpdatesResponse);
+  rpc TrainStep(TrainStepRequest)       returns (TrainStepResponse);
+  rpc Seq2SeqTrainStep(Seq2SeqTrainStepRequest) returns (TrainStepResponse);
+  rpc TrainLoRaStep(LoRaTrainStepRequest) returns (LoRaTrainStepResponse) {
+    option deprecated = true; // compatibility alias for TrainStep
+  }
+  rpc PatchGraph(PatchGraphRequest)     returns (PatchGraphResponse);   // fast node edit
 
   // ── Layer 2: task convenience (bakes in pre/post-processing) ──
   rpc Classify(ClassifyRequest)         returns (ClassifyResponse);
   rpc Detect(DetectRequest)             returns (DetectResponse);       // includes NMS
-  rpc RecognizeCTC(CTCRequest)          returns (CTCResponse);          // OCR
+  rpc RecognizeCtc(CtcRequest)          returns (CtcResponse);          // OCR
 }
 
 // ═══════════════════════════════════════════════════════════
 // Building blocks
 // ═══════════════════════════════════════════════════════════
 
-// Element / storage type of a tensor. Numbers are grouped by family with gaps
-// so new types can be appended without renumbering. NEVER reuse or renumber a
-// value once shipped — that silently breaks the wire format.
+// Local empty payload keeps every generated language self-contained.
+message Empty {}
+
+// Explicit entry messages retain the exact protobuf map wire layout while
+// generating ordinary typed repeated fields in every Synurang target.
+message StringEntry {
+  string key   = 1;
+  string value = 2;
+}
+
+message TensorShapeEntry {
+  string      key   = 1;
+  TensorShape value = 2;
+}
+
+// Element / storage type of a tensor. This mirrors the current Hugging Face
+// safetensors Dtype vocabulary and order:
+// https://raw.githubusercontent.com/huggingface/safetensors/main/safetensors/src/tensor.rs
+// Safetensors stores dtype names as strings, so keep these names in lockstep
+// with the file format.
 //
-//   1–7    floating point
-//   8–15   signed integer   (incl. sub-byte)
-//   16–23  unsigned integer (incl. sub-byte)
-//   24+    misc
-//
-// Sub-byte types (I4/U4) pack two elements per byte: element 2k in the low
-// nibble, 2k+1 in the high nibble. Each row along the last dimension is packed
-// independently; an odd-length row leaves the final high nibble unused. F16/BF16
-// are little-endian 2-byte. Quantized values carry their scale/zero-point in
-// Tensor.quant, so a sub-byte dtype here is only the *storage*; the dequant
-// scheme (per-tensor / per-channel / per-block) lives in Quantization.
-enum DType {
-  DTYPE_UNSPECIFIED = 0;
+// Sub-byte safetensors dtypes (F4/F6) are packed by bit width and may require
+// byte-aligned slices. F16/BF16 are little-endian 2-byte. Quantized values carry
+// their scale/zero-point in Tensor.quant, so dtype here is only the storage; the
+// dequant scheme (per-tensor / per-channel / per-block) lives in Quantization.
+enum DataType {
+  DATA_TYPE_UNSPECIFIED = 0;
 
-  // floating point
-  DTYPE_F32  = 1;
-  DTYPE_F16  = 2;
-  DTYPE_BF16 = 3;
-  DTYPE_F64  = 4;
+  DATA_TYPE_BOOL        = 1;
+  DATA_TYPE_F4          = 2;
+  DATA_TYPE_F6_E2M3     = 3;
+  DATA_TYPE_F6_E3M2     = 4;
+  DATA_TYPE_U8          = 5;
+  DATA_TYPE_I8          = 6;
+  DATA_TYPE_F8_E5M2     = 7;
+  DATA_TYPE_F8_E4M3     = 8;
+  DATA_TYPE_F8_E8M0     = 9;
+  DATA_TYPE_F8_E4M3FNUZ = 10;
+  DATA_TYPE_F8_E5M2FNUZ = 11;
+  DATA_TYPE_I16         = 12;
+  DATA_TYPE_U16         = 13;
+  DATA_TYPE_F16         = 14;
+  DATA_TYPE_BF16        = 15;
+  DATA_TYPE_I32         = 16;
+  DATA_TYPE_U32         = 17;
+  DATA_TYPE_F32         = 18;
+  DATA_TYPE_C64         = 19;
+  DATA_TYPE_F64         = 20;
+  DATA_TYPE_I64         = 21;
+  DATA_TYPE_U64         = 22;
+}
 
-  // signed integer
-  DTYPE_I8   = 8;
-  DTYPE_I16  = 9;
-  DTYPE_I32  = 10;
-  DTYPE_I64  = 11;
-  DTYPE_I4   = 12;   // packed 2-per-byte
-
-  // unsigned integer
-  DTYPE_U8   = 16;
-  DTYPE_U16  = 17;
-  DTYPE_U32  = 18;
-  DTYPE_U64  = 19;
-  DTYPE_U4   = 20;   // packed 2-per-byte
-
-  // misc
-  DTYPE_BOOL = 24;
+// Bit values used in Tensor.access_flags and TensorSpec.access_flags.
+enum TensorAccessFlag {
+  TENSOR_ACCESS_FLAG_UNSPECIFIED = 0;
+  TENSOR_ACCESS_FLAG_READABLE    = 1;
+  TENSOR_ACCESS_FLAG_WRITABLE    = 2;
 }
 
 // Raw tensor. `data` is little-endian, row-major (C-contiguous), matching the
@@ -130,9 +178,33 @@ enum DType {
 message Tensor {
   string                name  = 1;
   repeated int64        shape = 2;   // NHWC (channels-last), e.g. [1,224,224,3]
-  DType                 dtype = 3;
+  DataType              dtype = 3;
   bytes                 data  = 4;
   optional Quantization quant = 5;
+  uint32                access_flags = 6; // bitwise OR of TensorAccessFlag values
+  // CreateModel/AddModelTensor may omit data when this is present. Initializers
+  // currently produce F32 tensors. Random draws use the same Mulberry32 stream
+  // as ts/training/Initializers.ts (the seed is truncated to uint32). Normal values use
+  // Box-Muller in pairs, cosine first and sine second, making a (seed, shape,
+  // initializer) reproducible across VolvoxAI implementations.
+  optional TensorInitializer initializer = 7;
+}
+
+enum TensorInitializerKind {
+  TENSOR_INITIALIZER_UNSPECIFIED    = 0;
+  TENSOR_INITIALIZER_ZEROS         = 1;
+  TENSOR_INITIALIZER_ONES          = 2;
+  TENSOR_INITIALIZER_NORMAL        = 3; // rank-agnostic; mean=0, stddev=0.02 by default
+  TENSOR_INITIALIZER_XAVIER_UNIFORM = 4;
+  TENSOR_INITIALIZER_XAVIER_NORMAL  = 5;
+}
+
+message TensorInitializer {
+  TensorInitializerKind kind = 1;
+  optional uint64 seed       = 2; // default 0; always deterministic
+  optional float mean        = 3; // NORMAL only; default 0
+  optional float stddev      = 4; // NORMAL only; default 0.02
+  optional float gain        = 5; // Xavier only; default 1
 }
 
 // Dequantization descriptor: real = (stored - zero_point) * scale.
@@ -161,7 +233,29 @@ enum QuantScheme {
 message TensorSpec {
   string         name  = 1;
   repeated int64 shape = 2;        // -1 marks a dynamic dimension
-  DType          dtype = 3;
+  DataType       dtype = 3;
+  uint32         access_flags = 4;  // bitwise OR of TensorAccessFlag values
+  int64          size_bytes = 5;
+}
+
+message TensorShape {
+  repeated int64 dims = 1;
+}
+
+message SafetensorsTensorInfo {
+  string         name = 1;
+  repeated int64 shape = 2;
+  DataType       dtype = 3;
+  int64          data_start = 4;
+  int64          data_end = 5;
+  uint32         access_flags = 6;
+}
+
+message SafetensorsInfo {
+  string                         path = 1;
+  int64                          size_bytes = 2;
+  repeated SafetensorsTensorInfo tensors = 3;
+  repeated StringEntry           metadata = 4;
 }
 
 enum Backend {
@@ -173,9 +267,10 @@ enum Backend {
   BACKEND_NNAPI  = 5;
 }
 
-// Execution options. Partial-update: only set fields are applied. May be given
-// at LoadModel (handle default) and/or per call (override). Maps to the CLI
-// flags in native/main.c.
+// Execution options. Backend selection is model-scoped: choose it at
+// LoadModel/CreateModel/LoadTrainingCheckpoint. Per-call messages may omit the
+// backend or repeat the model backend, but cannot switch a live model between
+// device runtimes. Other present fields remain per-call options.
 message ExecOptions {
   optional Backend backend     = 1;   // --vulkan | --opengl | --metal | --nnapi
   optional int32   num_threads = 2;   // --num_threads
@@ -222,6 +317,9 @@ enum OpType {
   OP_MATMUL = 1;
   OP_LINEAR = 2;
   OP_GEMM   = 3;
+  OP_QLINEAR = 4;
+  OP_QMATMUL = 5;
+  OP_QGEMM   = 6;
 
   // Convolution
   OP_CONV2D           = 10;
@@ -233,12 +331,23 @@ enum OpType {
   OP_LAYER_NORM   = 20;
   OP_RMS_NORM     = 21;
   OP_BATCH_NORM2D = 22;
+  OP_GROUP_NORM   = 23;
+  OP_QLAYER_NORM  = 24;
+  OP_QGROUP_NORM  = 25;
 
   // Embedding / attention
   OP_EMBEDDING       = 30;
   OP_SDPA            = 31;
   OP_CROSS_SDPA      = 32;
   OP_CROSS_ATTENTION = 33;
+  // MoERouter: input [...,d], weight [d,E] -> indices/weights [...,k].
+  // MoELinear: input [...,din], expert_weight [E,din,dout] plus matching
+  // route_indices/route_weights [...,k] -> out [...,dout].
+  OP_MOE_ROUTER      = 34;
+  OP_MOE_LINEAR      = 35;
+  OP_QEMBEDDING      = 36;
+  OP_QMASKED_MEAN    = 37;
+  OP_QSDPA           = 38;
 
   // Pooling
   OP_MAX_POOL2D          = 40;
@@ -266,12 +375,17 @@ enum OpType {
   OP_HARD_SIGMOID = 68;
   OP_TANH         = 69;
   OP_CLIP         = 70;
+  OP_QGELU        = 71;
+  OP_QSILU        = 72;
+  OP_SIN          = 73;
+  OP_COS          = 74;
 
   // Elementwise binary
   OP_ADD = 80;
   OP_MUL = 81;
   OP_SUB = 82;
   OP_DIV = 83;
+  OP_QADD = 84;
 
   // Reductions
   OP_SOFTMAX     = 90;
@@ -279,6 +393,7 @@ enum OpType {
   OP_REDUCE_SUM  = 92;
   OP_REDUCE_MEAN = 93;
   OP_ARGMAX      = 94;
+  OP_QARGMAX     = 95;
 
   // Shape / data movement
   OP_TRANSPOSE = 100;
@@ -306,6 +421,7 @@ enum OpType {
   // Quantization
   OP_DEQUANTIZE_LINEAR = 140;
   OP_QUANTIZE_LINEAR   = 141;
+  OP_REQUANTIZE_LINEAR = 142;
 
   // Detection
   OP_NON_MAX_SUPPRESSION = 150;
@@ -322,6 +438,12 @@ enum OpType {
   OP_SHAPE    = 172;
   OP_SIZE     = 173;
   OP_TOPK     = 174;
+
+  // Sequence models
+  OP_ROPE              = 180;
+  OP_ROTARY_EMBEDDING  = 181;
+  OP_SSM_SCAN          = 182;
+  OP_SELECTIVE_SCAN    = 183;
 }
 
 // Per-op support level on a backend. Mirrors the operation_list.md status legend.
@@ -352,6 +474,16 @@ message PingResponse {
 message Capabilities {
   string                     version  = 1;
   repeated BackendCapability backends = 2;
+  AdapterCapabilities        adapters = 3;
+}
+message AdapterCapabilities {
+  repeated AdapterKind kinds               = 1;
+  bool                 immutable_versions  = 2;
+  bool                 hot_swap            = 3;
+  bool                 per_batch_routing   = 4;
+  bool                 adapter_only_persistence = 5;
+  bool                 merge_unmerge       = 6;
+  bool                 gpu_grouped_matmul  = 7; // false until a grouped GPU adapter kernel exists
 }
 message BackendCapability {
   Backend            backend   = 1;
@@ -375,16 +507,47 @@ message LoadModelRequest {
   }
   optional ExecOptions exec  = 3;   // default backend/threads for this handle
   optional string      alias = 4;   // friendly id; else the server assigns one
+  optional ModelEditOptions edit = 5;
+}
+
+// Builds a model directly from API graph/tensor definitions. The server owns
+// private config/safetensors backing for the lifetime of the returned handle,
+// so callers do not need to create server-visible files. Created models are
+// tensor-writable and graph-patchable; output_names are also used when Run
+// omits its per-call output_names list. `graph` and `output_names` may be empty
+// for an incremental builder that inserts its first node with PatchGraph.
+message CreateModelRequest {
+  repeated TensorSpec inputs       = 1; // declared graph inputs; data is supplied by Run/train calls
+  GraphInfo           graph        = 2;
+  repeated Tensor     tensors      = 3; // initial constants/weights
+  repeated string     output_names = 4; // must name graph-produced tensors
+  optional ExecOptions exec        = 5;
+  bytes               tokenizer    = 6; // optional vocab/tokenizer bytes owned with the model
+  repeated StringEntry metadata     = 7;
+}
+
+message ModelEditOptions {
+  bool open_weights_writable = 1;   // open safetensors with writable views
+  bool allow_tensor_updates  = 2;   // enable SetTensor for this handle
+  bool allow_graph_patches   = 3;   // enable PatchGraph for this handle
 }
 message ModelPaths {
   string config_path    = 1;   // config.json (optional if embedded in safetensors metadata)
-  string weights_path   = 2;   // model.safetensors
+  string weights_path   = 2;   // primary model.safetensors
   string tokenizer_path = 3;   // dir/file with vocab.bin (+ merges.txt) — text/chat models
+  // Base shards lack adapter metadata and join volvoxai_engine_init_with_weight_files. Files with a
+  // volvox_adapter_manifest entry are staged as inactive adapter versions.
+  repeated string extra_weights_paths = 4;
 }
 message ModelBytes {
   bytes config_json = 1;       // optional if embedded in safetensors __metadata__
   bytes safetensors = 2;
   bytes tokenizer   = 3;       // optional
+  repeated NamedBytes extra_safetensors = 4;
+}
+message NamedBytes {
+  string name = 1;
+  bytes  data = 2;
 }
 message LoadModelResponse {
   string    model_id = 1;
@@ -397,6 +560,8 @@ message ModelInfo {
   bool                supports_kv_cache = 4;   // prefill/decode available (autoregressive)
   bool                has_tokenizer     = 5;
   repeated OpCount    op_counts         = 6;   // histogram of ops used by this graph
+  bool                writable_weights  = 7;
+  bool                patchable_graph   = 8;
 }
 message OpCount {
   OpType op      = 1;
@@ -408,6 +573,270 @@ message ListModelsResponse {
   repeated string    model_ids = 2;
 }
 
+message InspectModelRequest {
+  string model_id = 1;
+  bool   include_graph = 2;
+  bool   include_tensors = 3;
+  bool   include_weight_files = 4;
+  bool   include_params_json = 5;
+}
+
+message ModelInspection {
+  ModelInfo                info = 1;
+  repeated TensorSpec      tensors = 2;
+  GraphInfo                graph = 3;
+  repeated SafetensorsInfo weight_files = 4;
+}
+
+message SaveModelWeightsRequest {
+  string          model_id = 1;
+  repeated string weight_paths = 2; // empty = overwrite original loaded safetensors paths
+  // Stages and fsyncs every shard before coordinated per-file atomic renames;
+  // failures roll back, but multiple filenames cannot become visible at one instant.
+  bool            atomic = 3;
+}
+
+message SaveModelWeightsResponse {
+  repeated SafetensorsInfo weight_files = 1;
+  repeated string          weight_paths = 2;
+}
+
+// Adds/removes safetensors-backed source tensors without rebuilding the model.
+// Removal fails while any graph node references the tensor. These operations
+// are atomic for the single named tensor and are serialized with execution.
+message AddModelTensorRequest {
+  string model_id = 1;
+  Tensor tensor   = 2;
+}
+
+message RemoveModelTensorRequest {
+  string model_id = 1;
+  string name     = 2;
+}
+
+// A training checkpoint is a server-side directory containing the authoritative
+// graph config, all weight shards, optimizer moments/training step, a manifest,
+// and optional tokenizer bytes. Loading it restores the next implicit optimizer
+// step as well as model tensors and topology. Saving rejects a pending gradient
+// accumulation window; flush or reset that window first.
+message SaveTrainingCheckpointRequest {
+  string model_id  = 1;
+  string directory = 2;
+  bool overwrite   = 3;
+  optional bytes tokenizer = 4; // overrides the model tokenizer bytes when present
+  repeated StringEntry metadata = 5;
+}
+
+message LoadTrainingCheckpointRequest {
+  string directory = 1;
+  optional ExecOptions exec = 2;
+}
+
+message TrainingCheckpointInfo {
+  string directory = 1;
+  string format = 2;
+  int64 training_step = 3;
+  ModelPaths paths = 4;
+  repeated SafetensorsInfo weight_files = 5;
+  SafetensorsInfo optimizer_file = 6;
+  repeated StringEntry metadata = 7;
+}
+
+message LoadTrainingCheckpointResponse {
+  LoadModelResponse model = 1;
+  TrainingCheckpointInfo checkpoint = 2;
+}
+
+message InspectSafetensorsRequest {
+  string path = 1;
+  bool   include_metadata = 2;
+}
+
+message CreateSafetensorsRequest {
+  string              path = 1;
+  repeated Tensor     tensors = 2;
+  repeated StringEntry metadata = 3;
+  bool                overwrite = 4;
+}
+
+// Adapter-only checkpoints store this manifest as the string-valued
+// `volvox_adapter_manifest` safetensors metadata entry. The JSON object has
+// `format: "volvox.adapter.v1"`. Runtime matrices are normalized to
+// A=[din,rank], B=[rank,dout], independent of the source layout.
+enum AdapterKind {
+  ADAPTER_KIND_UNSPECIFIED = 0;
+  ADAPTER_LORA             = 1;
+}
+
+// Layout of adapter A/B matrices in the submitted checkpoint/payload. This
+// does not describe base-weight storage; the runtime derives that from the
+// loaded graph. Every staged version is normalized to CANONICAL internally.
+enum AdapterMatrixLayout {
+  ADAPTER_MATRIX_LAYOUT_UNSPECIFIED = 0;
+  ADAPTER_MATRIX_LAYOUT_PEFT        = 1; // A=[r,din], B=[dout,r]
+  ADAPTER_MATRIX_LAYOUT_CANONICAL   = 2; // A=[din,r], B=[r,dout]
+}
+
+enum AdapterTensorRole {
+  ADAPTER_TENSOR_UNSPECIFIED = 0;
+  ADAPTER_TENSOR_A           = 1;
+  ADAPTER_TENSOR_B           = 2;
+}
+
+message AdapterTensorBinding {
+  AdapterTensorRole role      = 1;
+  string            tensor_name = 2;
+  TensorSpec        spec      = 3;
+}
+
+message AdapterTarget {
+  string              target_id   = 1;
+  string              op_id       = 2;
+  string              base_tensor = 3;
+  AdapterMatrixLayout adapter_layout = 4;
+  int32               rank        = 5;
+  float               alpha       = 6;
+  optional float      scale       = 7; // overrides alpha/r
+  repeated AdapterTensorBinding tensors = 8;
+}
+
+message AdapterManifest {
+  string                     format     = 1; // must be "volvox.adapter.v1"
+  string                     adapter_id = 2; // stable family id; server assigns when empty
+  AdapterKind                kind       = 3;
+  repeated AdapterTarget     targets    = 4;
+  repeated StringEntry       metadata   = 5;
+}
+
+// Stable adapter family plus one immutable tensor version.
+message AdapterVersionRef {
+  string adapter_id = 1;
+  string version_id = 2; // globally unique within the loaded model context
+}
+
+message AdapterRoute {
+  AdapterVersionRef adapter = 1; // absent selects the base model for this batch item
+  optional float    scale   = 2; // request-local multiplier; default 1
+}
+
+// Presence is meaningful: absent on Run/Generate uses the model's active
+// default; present with no routes selects the base model. One route broadcasts
+// to the batch, while N routes select one adapter version per batch item.
+message AdapterSelection {
+  repeated AdapterRoute routes = 1;
+}
+
+message AdapterInfo {
+  AdapterVersionRef adapter          = 1;
+  AdapterManifest   manifest         = 2;
+  string            parent_version_id = 3;
+  string            source_path      = 4;
+  int64             size_bytes       = 5;
+  bool              active           = 6;
+  bool              merged           = 7;
+  int64             optimizer_step   = 8;
+}
+
+message AdapterState {
+  AdapterSelection active     = 1;
+  AdapterVersionRef merged    = 2;
+  uint64            generation = 3;
+}
+
+message StageAdapterRequest {
+  string          model_id = 1;
+  AdapterManifest manifest = 2;
+  repeated Tensor tensors  = 3;
+  bool            activate = 4;
+}
+
+message LoadAdapterRequest {
+  string                   model_id   = 1;
+  string                   path       = 2;
+  optional string          adapter_id = 3; // expected stable id; mismatch is rejected
+  optional AdapterManifest manifest   = 4; // expected file manifest; mismatch is rejected
+  bool                     activate   = 5;
+}
+
+message ListAdaptersRequest {
+  string model_id        = 1;
+  optional string adapter_id = 2;
+}
+
+message ListAdaptersResponse {
+  repeated AdapterInfo adapters = 1;
+  AdapterState         state    = 2;
+}
+
+message ActivateAdapterRequest {
+  string           model_id = 1;
+  AdapterSelection selection = 2;
+}
+
+enum AdapterUpdateMode {
+  ADAPTER_UPDATE_ASSIGN = 0;
+  ADAPTER_UPDATE_ADD    = 1;
+}
+
+message AdapterTensorUpdate {
+  Tensor            tensor = 1;
+  AdapterUpdateMode mode   = 2;
+}
+
+// A continual-learning update is copy-on-write. Only named tensors are
+// patched; all other tensors and metadata are inherited from the immutable
+// parent, which remains routable until explicitly removed.
+message UpdateAdapterRequest {
+  string            model_id = 1;
+  AdapterVersionRef parent   = 2;
+  repeated AdapterTensorUpdate updates = 3;
+  bool              activate = 4;
+  int64             optimizer_step = 5;
+}
+
+message RemoveAdapterRequest {
+  string            model_id = 1;
+  AdapterVersionRef adapter  = 2;
+}
+
+message MergeAdapterRequest {
+  string            model_id = 1;
+  AdapterVersionRef adapter  = 2;
+}
+
+message UnmergeAdapterRequest {
+  string                     model_id = 1;
+  optional AdapterVersionRef adapter  = 2; // optional guard against unmerging another version
+}
+
+message SaveAdapterRequest {
+  string            model_id = 1;
+  AdapterVersionRef adapter  = 2;
+  string            path     = 3;
+  bool              atomic   = 4; // same-directory staged write + fsync + atomic rename
+}
+
+message SaveAdapterResponse {
+  AdapterInfo      adapter = 1;
+  SafetensorsInfo weight_file = 2;
+  string          path    = 3;
+}
+
+message GraphInfo {
+  repeated GraphNode nodes = 1;
+}
+
+message GraphNode {
+  int32                    index         = 1; // PatchGraph target; indices shift after insert/delete
+  string                   id            = 2; // descriptive only; PatchGraph is numeric-index based
+  OpType                   op            = 3;
+  string                   op_name       = 4;   // raw opType string
+  repeated StringEntry      inputs        = 5;
+  repeated StringEntry      outputs       = 6;
+  repeated TensorShapeEntry output_shapes = 7;
+  optional string          params_json   = 8;   // UTF-8 JSON object from config.json
+}
+
 // ═══════════════════════════════════════════════════════════
 // Layer 1: generic tensor I/O
 // ═══════════════════════════════════════════════════════════
@@ -416,7 +845,8 @@ message RunRequest {
   repeated Tensor inputs       = 2;
   repeated string output_names = 3;   // empty = all graph outputs
   optional int32  last_token   = 4;   // --last-token: return one logits row from a sequence output
-  optional ExecOptions exec    = 5;   // per-call override of the handle default
+  optional ExecOptions exec    = 5;   // backend, when present, must match the model backend
+  optional AdapterSelection adapters = 6;
 }
 message RunResponse {
   repeated Tensor outputs = 1;
@@ -429,6 +859,7 @@ message GenerateRequest {
   optional bytes            image = 3;   // VLM/KIE chat: encoded PNG/JPEG
   optional GenerationConfig gen   = 4;
   optional ExecOptions      exec  = 5;
+  optional AdapterSelection adapters = 6;
 }
 message GenerationConfig {
   optional int32  max_new_tokens = 1;   // --max-new (default 50)
@@ -438,7 +869,7 @@ message GenerationConfig {
   optional float  top_p          = 5;
   optional int32  top_k          = 6;
   optional uint64 seed           = 7;
-  optional string template       = 8;   // chat template family (kie_chat `family`)
+  optional string template       = 8;   // application-defined chat template family
 }
 message GenerateEvent {
   oneof event {
@@ -461,6 +892,228 @@ enum FinishReason {
 }
 
 message GetTensorRequest { string model_id = 1; string name = 2; }
+
+message SetTensorRequest {
+  string          model_id = 1;
+  Tensor          tensor   = 2;
+  bool            persist_safetensors = 3;   // write through to disk; requires writable weights
+  optional string safetensors_path    = 4;   // override path for persisted edits
+}
+
+// Batched tensor editing for external training loops. VolvoxAI intentionally does
+// not own autograd; callers run forward/backward wherever they prefer, then send
+// trainable adapter/base tensor assignments, deltas, or gradients here. Updates
+// are hot while the model is loaded, but serialized with inference: apply them
+// between Run/Generate calls, not concurrently while a kernel is reading weights.
+// SGD and AdamW currently operate on F32 tensors; ASSIGN accepts any
+// runtime-writable dtype supported by the native engine.
+enum TensorUpdateMode {
+  TENSOR_UPDATE_ASSIGN = 0; // tensor.data replaces the target tensor bytes
+  TENSOR_UPDATE_ADD    = 1; // target += tensor.data (F32)
+  TENSOR_UPDATE_SGD    = 2; // target -= lr * (grad + weight_decay * target)
+  TENSOR_UPDATE_ADAMW  = 3; // AdamW with engine-held moment buffers
+}
+
+message OptimizerOptions {
+  float          learning_rate = 1;
+  optional float beta1         = 2; // default 0.9
+  optional float beta2         = 3; // default 0.999
+  optional float epsilon       = 4; // default 1e-8
+  optional float weight_decay  = 5; // default 0
+  optional float max_grad_norm = 6; // per-tensor clip; 0 disables, negatives are invalid
+  optional int64 step          = 7; // when present must be >0 and newer than the model step
+}
+
+message TensorUpdate {
+  Tensor            tensor    = 1; // assignment/delta/gradient payload
+  TensorUpdateMode  mode      = 2;
+  OptimizerOptions  optimizer = 3; // overrides request.optimizer when set
+}
+
+message ApplyTensorUpdatesRequest {
+  string            model_id = 1;
+  repeated TensorUpdate updates = 2;
+  OptimizerOptions  optimizer = 3;
+  bool              persist_safetensors = 4;
+  repeated string   weight_paths = 5; // empty = overwrite loaded safetensors paths
+}
+
+message ApplyTensorUpdatesResponse {
+  repeated TensorSpec      updated_tensors = 1;
+  repeated SafetensorsInfo weight_files = 2;
+  int64                    step = 3;
+}
+
+// General supervised autograd step. The runtime runs forward, attaches softmax
+// cross-entropy to logits_tensor, backpropagates through supported graph ops,
+// and updates the named F32 tensors with SGD or AdamW. This covers base/CNN/
+// transformer/MoE graphs as well as explicit LoRA branches in the graph.
+// Training pins the base route: any active staged runtime adapter remains
+// active and unchanged, while explicit LoRA tensors in the graph are trainable.
+message TrainStepRequest {
+  string            model_id = 1;
+  repeated Tensor   inputs = 2;
+  string            logits_tensor = 3;       // F32 logits tensor to attach CE loss
+  repeated int64    target_ids = 4;          // one target, one per logits row, or trailing rows
+  repeated string   trainable_tensors = 5;   // unique F32 tensors to update
+  OptimizerOptions  optimizer = 6;
+  optional TensorUpdateMode update_mode = 7; // default AdamW; SGD/AdamW supported
+  bool              persist_safetensors = 8; // a later file-save error does not roll back the live update
+  repeated string   weight_paths = 9;
+  optional int32    last_token = 10;         // matches RunRequest last_token behavior
+  optional int32    ignore_id = 11;          // labels equal to this value do not contribute to CE
+  // When non-empty, replaces logits_tensor/target_ids/last_token/ignore_id with
+  // independently normalized weighted CE objectives. Loss names must be unique.
+  repeated CrossEntropyLoss losses = 12;
+  GradientAccumulationOptions accumulation = 13;
+}
+
+message TrainStepResponse {
+  float                    loss = 1;    // sum of weighted losses, cumulative in the active window
+  int32                    correct = 2; // sum across loss metrics
+  int32                    examples = 3; // sum across loss metrics
+  repeated TensorSpec      updated_tensors = 4; // empty until update_applied
+  repeated SafetensorsInfo weight_files = 5;
+  int64                    step = 6;
+  repeated CrossEntropyLossMetric losses = 7;
+  // Cumulative microbatches in the active window, including this request. This
+  // is the completed window size when update_applied is true.
+  int32 accumulated_microbatches = 8;
+  int32 accumulation_steps = 9;
+  bool  update_applied = 10;
+}
+
+// One independently normalized softmax cross-entropy objective. With gradient
+// accumulation, normalizer is required so each microbatch contributes its exact
+// share of the full-window objective instead of averaging microbatch means.
+message CrossEntropyLoss {
+  string         name = 1;
+  string         logits_tensor = 2;
+  repeated int64 target_ids = 3;
+  optional float weight = 4;       // default 1; finite and non-negative
+  optional int32 ignore_id = 5;
+  optional int32 last_token = 6;
+  optional float normalizer = 7;   // default active examples; must be >0 when set
+}
+
+message CrossEntropyLossMetric {
+  string name = 1;
+  float  loss = 2;                 // weighted, normalized, cumulative in the window
+  int32  correct = 3;
+  int32  examples = 4;
+  float  normalizer = 5;
+}
+
+message GradientAccumulationOptions {
+  int32 steps = 1;                 // 0 and 1 both mean immediate update
+  bool  flush = 2;                 // apply the current partial window
+  bool  reset = 3;                 // discard a pending window before this microbatch
+}
+
+// Teacher-forced encoder-decoder training without an external training
+// framework. source_ids and target_ids are row-major rectangular I32 arrays.
+// The runtime feeds encoder tokens unchanged, shifts each target row right with
+// bos_id for decoder tokens, creates binary I32 masks, converts pad_id labels to
+// ignore_id, and passes the full rectangular target labels to TrainStep.
+message Seq2SeqTrainStepRequest {
+  string model_id = 1;
+  repeated int32 source_ids = 2;
+  repeated int32 target_ids = 3;
+  int32 batch_size = 4;
+  int32 source_length = 5;
+  int32 target_length = 6;
+  string encoder_tokens_input = 7;
+  string decoder_tokens_input = 8;
+  optional string encoder_mask_input = 9;
+  optional string decoder_mask_input = 10;
+  int32 bos_id = 11;
+  int32 pad_id = 12;
+  optional int32 ignore_id = 13; // default INT32_MIN; never inferred from pad_id
+  string logits_tensor = 14;
+  repeated string trainable_tensors = 15;
+  OptimizerOptions optimizer = 16;
+  optional TensorUpdateMode update_mode = 17;
+  bool persist_safetensors = 18;
+  repeated string weight_paths = 19;
+  optional string encoder_positions_input = 20;
+  optional string decoder_positions_input = 21;
+}
+
+// Deprecated source-compatible LoRA naming. The server delegates this RPC to
+// TrainStep; its request/response retain the original wire layout.
+message LoRaTrainStepRequest {
+  string            model_id = 1;
+  repeated Tensor   inputs = 2;
+  string            logits_tensor = 3;       // F32 logits tensor to attach CE loss
+  repeated int64    target_ids = 4;          // one target, one per logits row, or trailing rows
+  repeated string   trainable_tensors = 5;   // F32 LoRA tensors to update
+  OptimizerOptions  optimizer = 6;
+  optional TensorUpdateMode update_mode = 7; // default AdamW; SGD/AdamW supported
+  bool              persist_safetensors = 8; // a later file-save error does not roll back the live update
+  repeated string   weight_paths = 9;
+  optional int32    last_token = 10;         // matches RunRequest last_token behavior
+  optional int32    ignore_id = 11;
+}
+
+message LoRaTrainStepResponse {
+  float                    loss = 1;
+  int32                    correct = 2;
+  int32                    examples = 3;
+  repeated TensorSpec      updated_tensors = 4;
+  repeated SafetensorsInfo weight_files = 5;
+  int64                    step = 6;
+}
+
+// Default MERGE mode updates only the fields present in the patch. REPLACE
+// swaps the full node payload. INSERT modes create a new node near the target.
+// DELETE removes the target node.
+enum NodePatchMode {
+  NODE_PATCH_MODE_UNSPECIFIED   = 0;
+  NODE_PATCH_MODE_MERGE         = 1;
+  NODE_PATCH_MODE_REPLACE       = 2;
+  NODE_PATCH_MODE_INSERT_BEFORE = 3;
+  NODE_PATCH_MODE_INSERT_AFTER  = 4;
+  NODE_PATCH_MODE_DELETE        = 5;
+}
+
+message GraphNodePatch {
+  // Required numeric target. With INSERT_AFTER, -1 appends to the graph (and
+  // inserts the first node when empty). Other modes require an existing index.
+  optional int32           node_index    = 1;
+  reserved 2;
+  reserved "node_id";
+  optional NodePatchMode   mode          = 3;
+  optional OpType          op            = 4;
+  optional string          op_name       = 5;
+  repeated StringEntry      inputs        = 6;
+  repeated StringEntry      outputs       = 7;
+  repeated TensorShapeEntry output_shapes = 8;
+  optional string          params_json   = 9;
+}
+
+// Presence is meaningful in PatchGraphRequest: absent leaves ModelInfo.outputs
+// unchanged, present with no names clears them, and present with names replaces
+// them after verifying every name is produced by the resulting graph.
+message DeclaredOutputsUpdate {
+  repeated string names = 1;
+}
+
+message PatchGraphRequest {
+  string                  model_id       = 1;
+  repeated GraphNodePatch patches        = 2;
+  // Compatibility hint. Patch batches rebuild once transactionally; structural
+  // edits force this regardless of false.
+  optional bool           rebuild_plan   = 3;
+  optional bool           reoptimize     = 4;   // true forces a rebuilt/optimized plan; false adds no work
+  bool                    persist_config = 5;   // write patched config.json or metadata
+  optional DeclaredOutputsUpdate declared_outputs = 6;
+}
+
+message PatchGraphResponse {
+  ModelInfo       info                 = 1;
+  repeated int32  changed_node_indices = 2;
+  repeated string changed_tensor_names = 3; // patched outputs plus declared names added/removed
+}
 
 // ═══════════════════════════════════════════════════════════
 // Layer 2: task convenience
@@ -498,7 +1151,7 @@ message DetectResponse {
 message Detection { Box box = 1; float score = 2; int32 class_id = 3; string label = 4; }
 message Box { float x1 = 1; float y1 = 2; float x2 = 3; float y2 = 4; }
 
-message CTCRequest {
+message CtcRequest {
   string          model_id      = 1;
   Image           image         = 2;
   optional string logits_tensor = 3;   // [...,T,C]
@@ -506,7 +1159,7 @@ message CTCRequest {
   repeated string labels        = 5;
   optional ExecOptions exec     = 6;
 }
-message CTCResponse {
+message CtcResponse {
   string         text      = 1;
   repeated int32 token_ids = 2;
   Timing         timing    = 3;

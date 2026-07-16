@@ -1,24 +1,14 @@
 #!/usr/bin/env python3
+"""Export ONNX or TFLite graphs as model-agnostic VolvoxAI packages.
+
+Model-family graph construction and vocabulary policy live with their examples.
 """
-VolvoxAI - Universal Safetensors Exporter
-Automatically detects model architecture and exports PyTorch weights to Safetensors format,
-embedding the VolvoxAI Graph topology into the config.json.
-"""
-import os
 import argparse
 import json
 import re
 from pathlib import Path
 import torch
-from transformers import AutoModelForCausalLM, AutoConfig
 from safetensors.torch import save_file
-
-def quantize_to_int8(tensor):
-    if not tensor.is_floating_point(): return tensor, None
-    max_val = tensor.abs().max()
-    scale = max_val / 127.0
-    if scale == 0: return tensor.to(torch.int8), torch.tensor([1.0], dtype=torch.float32)
-    return torch.round(tensor / scale).to(torch.int8), scale.view(1).float()
 
 
 def dumps_with_compact_lists(obj, indent=2):
@@ -100,6 +90,55 @@ def _resolve_onnx_float_storage(model_path: str, model, requested: str) -> str:
     return "float32"
 
 
+def _resolve_output_names(output_count: int, requested=None):
+    """Return model-agnostic canonical names in source-output order."""
+    if requested is None:
+        return [f"output{index}" for index in range(output_count)]
+    names = list(requested)
+    if len(names) != output_count:
+        raise ValueError(
+            f"Expected {output_count} --output-name value(s), received {len(names)}"
+        )
+    if any(not isinstance(name, str) or not name.strip() for name in names):
+        raise ValueError("Output names must be non-empty strings")
+    if len(set(names)) != len(names):
+        raise ValueError("Output names must be unique")
+    return names
+
+
+_IMAGE_NORMALIZATION_MODES = {"zero-one", "minus-one-one", "raw-255"}
+
+
+def _apply_image_normalizations(inputs, requested=None):
+    """Attach explicit application preprocessing contracts to graph inputs."""
+    if requested is None:
+        return
+    seen = set()
+    for value in requested:
+        if not isinstance(value, str) or "=" not in value:
+            raise ValueError(
+                "--image-normalization expects INPUT=MODE, where MODE is "
+                "zero-one, minus-one-one, or raw-255"
+            )
+        name, mode = value.split("=", 1)
+        name = name.strip()
+        mode = mode.strip()
+        if not name or mode not in _IMAGE_NORMALIZATION_MODES:
+            raise ValueError(
+                "--image-normalization expects INPUT=MODE, where MODE is "
+                "zero-one, minus-one-one, or raw-255"
+            )
+        if name not in inputs:
+            raise ValueError(
+                f"Image normalization names unknown exported input {name!r}; "
+                f"available inputs: {', '.join(inputs) or '<none>'}"
+            )
+        if name in seen:
+            raise ValueError(f"Image normalization for input {name!r} was specified more than once")
+        seen.add(name)
+        inputs[name]["image_normalization"] = mode
+
+
 def optimize_export_nodes(nodes):
     """Fold simple single-consumer activation nodes into their producer."""
     removed = {}
@@ -163,7 +202,13 @@ def optimize_export_nodes(nodes):
     return nodes, removed
 
 
-def export_onnx_model(model_path: str, out_path: str, weight_dtype: str = "auto"):
+def export_onnx_model(
+    model_path: str,
+    out_path: str,
+    weight_dtype: str = "auto",
+    output_names=None,
+    image_normalizations=None,
+):
     import numpy as np
     import onnx
     from onnx import numpy_helper, shape_inference
@@ -222,10 +267,10 @@ def export_onnx_model(model_path: str, out_path: str, weight_dtype: str = "auto"
     for idx, inp in enumerate(graph_inputs):
         s = short(inp.name, f"input{idx}")
         inputs_def[s] = {"shape": shape_map.get(inp.name, []), "dtype": "float32", "source_name": inp.name}
+    _apply_image_normalizations(inputs_def, image_normalizations)
 
-    for out in model.graph.output:
-        shape = shape_map.get(out.name, [])
-        preferred = "boxes" if shape and shape[-1] == 4 else "scores"
+    canonical_outputs = _resolve_output_names(len(model.graph.output), output_names)
+    for out, preferred in zip(model.graph.output, canonical_outputs):
         short(out.name, preferred)
 
     alias = {}
@@ -577,112 +622,13 @@ def export_onnx_model(model_path: str, out_path: str, weight_dtype: str = "auto"
     print(f"[Export] Wrote {out_path} and {config_path}")
 
 
-def build_kie_graph(cfg):
-    nodes = []
-    d_model = cfg.get("d_model", 320)
-    for i in range(4):
-        in_name = "images" if i == 0 else f"stem_{i-1}_out"
-        nodes.append({"op": "Conv2D", "inputs": {"input": in_name, "weight": f"stem.{i}.net.0.weight"}, "outputs": {"out": f"stem_{i}_out"}, "outputs_shape": {"out": [1, 32, 112, 112]}, "params": {"stride": 2 if i < 2 else 1, "padding": 1}})
-        
-    last_out = "stem_3_out"
-    for i in range(cfg.get("enc_layers", 6)):
-        prefix = f"encoder.layers.{i}"
-        nodes.append({"op": "LayerNorm", "inputs": {"input": last_out, "weight": f"{prefix}.norm1.weight", "bias": f"{prefix}.norm1.bias"}, "outputs": {"out": f"enc_{i}_n1"}, "outputs_shape": {"out": [1, 196, d_model]}, "params": {"d_model": d_model}})
-        nodes.append({"op": "MatMul", "inputs": {"input": f"enc_{i}_n1", "weight": f"{prefix}.self_attn.in_proj_weight", "scale": f"{prefix}.self_attn.in_proj_weight_scale", "bias": f"{prefix}.self_attn.in_proj_bias"}, "outputs": {"out": f"enc_{i}_qkv"}, "outputs_shape": {"out": [1, 196, d_model*3]}})
-        nodes.append({"op": "SDPA", "inputs": {"qkv": f"enc_{i}_qkv"}, "outputs": {"out": f"enc_{i}_attn"}, "outputs_shape": {"out": [1, 196, d_model]}, "params": {"heads": cfg.get("heads", 8)}})
-        nodes.append({"op": "MatMul", "inputs": {"input": f"enc_{i}_attn", "weight": f"{prefix}.self_attn.out_proj.weight", "scale": f"{prefix}.self_attn.out_proj.weight_scale", "bias": f"{prefix}.self_attn.out_proj.bias"}, "outputs": {"out": f"enc_{i}_attn_proj"}, "outputs_shape": {"out": [1, 196, d_model]}})
-        nodes.append({"op": "Add", "inputs": {"a": last_out, "b": f"enc_{i}_attn_proj"}, "outputs": {"out": f"enc_{i}_add1"}, "outputs_shape": {"out": [1, 196, d_model]}})
-        nodes.append({"op": "LayerNorm", "inputs": {"input": f"enc_{i}_add1", "weight": f"{prefix}.norm2.weight", "bias": f"{prefix}.norm2.bias"}, "outputs": {"out": f"enc_{i}_n2"}, "outputs_shape": {"out": [1, 196, d_model]}, "params": {"d_model": d_model}})
-        nodes.append({"op": "MatMul", "inputs": {"input": f"enc_{i}_n2", "weight": f"{prefix}.linear1.weight", "scale": f"{prefix}.linear1.weight_scale", "bias": f"{prefix}.linear1.bias"}, "outputs": {"out": f"enc_{i}_ff1"}, "outputs_shape": {"out": [1, 196, d_model*4]}})
-        nodes.append({"op": "GELU", "inputs": {"input": f"enc_{i}_ff1"}, "outputs": {"out": f"enc_{i}_gelu"}, "outputs_shape": {"out": [1, 196, d_model*4]}})
-        nodes.append({"op": "MatMul", "inputs": {"input": f"enc_{i}_gelu", "weight": f"{prefix}.linear2.weight", "scale": f"{prefix}.linear2.weight_scale", "bias": f"{prefix}.linear2.bias"}, "outputs": {"out": f"enc_{i}_ff2"}, "outputs_shape": {"out": [1, 196, d_model]}})
-        nodes.append({"op": "Add", "inputs": {"a": f"enc_{i}_add1", "b": f"enc_{i}_ff2"}, "outputs": {"out": f"enc_{i}_out"}, "outputs_shape": {"out": [1, 196, d_model]}})
-        last_out = f"enc_{i}_out"
-        
-    nodes.append({"op": "Embedding", "inputs": {"input": "q_tokens", "weight": "q_pos"}, "outputs": {"out": "dec_in"}, "outputs_shape": {"out": [1, 192, d_model]}})
-    dec_out = "dec_in"
-    for i in range(cfg.get("dec_layers", 4)):
-        prefix = f"decoder.layers.{i}"
-        nodes.append({"op": "LayerNorm", "inputs": {"input": dec_out, "weight": f"{prefix}.norm1.weight", "bias": f"{prefix}.norm1.bias"}, "outputs": {"out": f"dec_{i}_n1"}, "outputs_shape": {"out": [1, 192, d_model]}, "params": {"d_model": d_model}})
-        nodes.append({"op": "MatMul", "inputs": {"input": f"dec_{i}_n1", "weight": f"{prefix}.self_attn.in_proj_weight", "scale": f"{prefix}.self_attn.in_proj_weight_scale", "bias": f"{prefix}.self_attn.in_proj_bias"}, "outputs": {"out": f"dec_{i}_qkv"}, "outputs_shape": {"out": [1, 192, d_model*3]}})
-        nodes.append({"op": "SDPA", "inputs": {"qkv": f"dec_{i}_qkv"}, "outputs": {"out": f"dec_{i}_attn"}, "outputs_shape": {"out": [1, 192, d_model]}, "params": {"heads": cfg.get("heads", 8)}})
-        nodes.append({"op": "MatMul", "inputs": {"input": f"dec_{i}_attn", "weight": f"{prefix}.self_attn.out_proj.weight", "scale": f"{prefix}.self_attn.out_proj.weight_scale", "bias": f"{prefix}.self_attn.out_proj.bias"}, "outputs": {"out": f"dec_{i}_attn_proj"}, "outputs_shape": {"out": [1, 192, d_model]}})
-        nodes.append({"op": "Add", "inputs": {"a": dec_out, "b": f"dec_{i}_attn_proj"}, "outputs": {"out": f"dec_{i}_add1"}, "outputs_shape": {"out": [1, 192, d_model]}})
-        nodes.append({"op": "LayerNorm", "inputs": {"input": f"dec_{i}_add1", "weight": f"{prefix}.norm2.weight", "bias": f"{prefix}.norm2.bias"}, "outputs": {"out": f"dec_{i}_n2"}, "outputs_shape": {"out": [1, 192, d_model]}, "params": {"d_model": d_model}})
-        nodes.append({"op": "MatMul", "inputs": {"input": f"dec_{i}_n2", "weight": f"{prefix}.multihead_attn.q_proj_weight", "scale": f"{prefix}.multihead_attn.q_proj_scale", "bias": f"{prefix}.multihead_attn.q_proj_bias"}, "outputs": {"out": f"dec_{i}_q"}, "outputs_shape": {"out": [1, 192, d_model]}})
-        nodes.append({"op": "MatMul", "inputs": {"input": last_out, "weight": f"{prefix}.multihead_attn.k_proj_weight", "scale": f"{prefix}.multihead_attn.k_proj_scale", "bias": f"{prefix}.multihead_attn.k_proj_bias"}, "outputs": {"out": f"dec_{i}_k"}, "outputs_shape": {"out": [1, 196, d_model]}})
-        nodes.append({"op": "MatMul", "inputs": {"input": last_out, "weight": f"{prefix}.multihead_attn.v_proj_weight", "scale": f"{prefix}.multihead_attn.v_proj_scale", "bias": f"{prefix}.multihead_attn.v_proj_bias"}, "outputs": {"out": f"dec_{i}_v"}, "outputs_shape": {"out": [1, 196, d_model]}})
-        nodes.append({"op": "CrossSDPA", "inputs": {"q": f"dec_{i}_q", "k": f"dec_{i}_k", "v": f"dec_{i}_v"}, "outputs": {"out": f"dec_{i}_cross"}, "outputs_shape": {"out": [1, 192, d_model]}, "params": {"heads": cfg.get("heads", 8)}})
-        nodes.append({"op": "MatMul", "inputs": {"input": f"dec_{i}_cross", "weight": f"{prefix}.multihead_attn.out_proj.weight", "scale": f"{prefix}.multihead_attn.out_proj.weight_scale", "bias": f"{prefix}.multihead_attn.out_proj.bias"}, "outputs": {"out": f"dec_{i}_cross_proj"}, "outputs_shape": {"out": [1, 192, d_model]}})
-        nodes.append({"op": "Add", "inputs": {"a": f"dec_{i}_add1", "b": f"dec_{i}_cross_proj"}, "outputs": {"out": f"dec_{i}_add2"}, "outputs_shape": {"out": [1, 192, d_model]}})
-        nodes.append({"op": "LayerNorm", "inputs": {"input": f"dec_{i}_add2", "weight": f"{prefix}.norm3.weight", "bias": f"{prefix}.norm3.bias"}, "outputs": {"out": f"dec_{i}_n3"}, "outputs_shape": {"out": [1, 192, d_model]}, "params": {"d_model": d_model}})
-        nodes.append({"op": "MatMul", "inputs": {"input": f"dec_{i}_n3", "weight": f"{prefix}.linear1.weight", "scale": f"{prefix}.linear1.weight_scale", "bias": f"{prefix}.linear1.bias"}, "outputs": {"out": f"dec_{i}_ff1"}, "outputs_shape": {"out": [1, 192, d_model*4]}})
-        nodes.append({"op": "GELU", "inputs": {"input": f"dec_{i}_ff1"}, "outputs": {"out": f"dec_{i}_gelu"}, "outputs_shape": {"out": [1, 192, d_model*4]}})
-        nodes.append({"op": "MatMul", "inputs": {"input": f"dec_{i}_gelu", "weight": f"{prefix}.linear2.weight", "scale": f"{prefix}.linear2.weight_scale", "bias": f"{prefix}.linear2.bias"}, "outputs": {"out": f"dec_{i}_ff2"}, "outputs_shape": {"out": [1, 192, d_model]}})
-        nodes.append({"op": "Add", "inputs": {"a": f"dec_{i}_add2", "b": f"dec_{i}_ff2"}, "outputs": {"out": f"dec_{i}_out"}, "outputs_shape": {"out": [1, 192, d_model]}})
-        dec_out = f"dec_{i}_out"
-
-    nodes.append({"op": "LayerNorm", "inputs": {"input": dec_out, "weight": "encoder.layers.0.norm1.weight", "bias": "encoder.layers.0.norm1.bias"}, "outputs": {"out": "final_norm"}, "outputs_shape": {"out": [1, 192, d_model]}, "params": {"d_model": d_model}})
-    nodes.append({"op": "MatMul", "inputs": {"input": "final_norm", "weight": "encoder.layers.0.self_attn.out_proj.weight", "scale": "encoder.layers.0.self_attn.out_proj.weight_scale", "bias": "out_bias"}, "outputs": {"out": "logits"}, "outputs_shape": {"out": [1, 192, cfg.get("vocab_size", 530)]}})
-    return nodes
-
-def build_gptneo_graph(cfg, sd, out_tensors):
-    nodes = []
-    d_model = cfg.hidden_size
-    n_layers = cfg.num_layers
-    
-    for k, v in sd.items():
-        k_new = k.replace("transformer.", "")
-        out_tensors[k_new] = v.float().contiguous()
-        
-    nodes.append({"op": "Embedding", "inputs": {"input": "tokens", "weight": "wte.weight"}, "outputs": {"out": "emb_tok"}, "outputs_shape": {"out": [1, 256, d_model]}})
-    nodes.append({"op": "Embedding", "inputs": {"input": "positions", "weight": "wpe.weight"}, "outputs": {"out": "emb_pos"}, "outputs_shape": {"out": [1, 256, d_model]}})
-    nodes.append({"op": "Add", "inputs": {"a": "emb_tok", "b": "emb_pos"}, "outputs": {"out": "hidden_0"}, "outputs_shape": {"out": [1, 256, d_model]}})
-    
-    last_hidden = "hidden_0"
-    for i in range(n_layers):
-        prefix = f"h.{i}"
-        nodes.append({"op": "LayerNorm", "inputs": {"input": last_hidden, "weight": f"{prefix}.ln_1.weight", "bias": f"{prefix}.ln_1.bias"}, "outputs": {"out": f"ln1_{i}"}, "outputs_shape": {"out": [1, 256, d_model]}, "params": {"eps": cfg.layer_norm_epsilon, "d_model": d_model}})
-        
-        q_w = out_tensors.pop(f"{prefix}.attn.attention.q_proj.weight").t()
-        k_w = out_tensors.pop(f"{prefix}.attn.attention.k_proj.weight").t()
-        v_w = out_tensors.pop(f"{prefix}.attn.attention.v_proj.weight").t()
-        out_tensors[f"{prefix}.attn.qkv_proj.weight"] = torch.cat([q_w, k_w, v_w], dim=1).contiguous()
-        
-        nodes.append({"op": "MatMul", "inputs": {"input": f"ln1_{i}", "weight": f"{prefix}.attn.qkv_proj.weight"}, "outputs": {"out": f"qkv_{i}"}, "outputs_shape": {"out": [1, 256, d_model*3]}})
-        nodes.append({"op": "SDPA", "inputs": {"qkv": f"qkv_{i}"}, "outputs": {"out": f"attn_{i}"}, "outputs_shape": {"out": [1, 256, d_model]}, "params": {"heads": cfg.num_heads, "scale": 1.0}})
-        
-        out_tensors[f"{prefix}.attn.out_proj.weight"] = out_tensors.pop(f"{prefix}.attn.attention.out_proj.weight").t().contiguous()
-        out_tensors[f"{prefix}.attn.out_proj.bias"] = out_tensors.pop(f"{prefix}.attn.attention.out_proj.bias").contiguous()
-        
-        nodes.append({"op": "MatMul", "inputs": {"input": f"attn_{i}", "weight": f"{prefix}.attn.out_proj.weight", "bias": f"{prefix}.attn.out_proj.bias"}, "outputs": {"out": f"attn_proj_{i}"}, "outputs_shape": {"out": [1, 256, d_model]}})
-        nodes.append({"op": "Add", "inputs": {"a": last_hidden, "b": f"attn_proj_{i}"}, "outputs": {"out": f"add1_{i}"}, "outputs_shape": {"out": [1, 256, d_model]}})
-        nodes.append({"op": "LayerNorm", "inputs": {"input": f"add1_{i}", "weight": f"{prefix}.ln_2.weight", "bias": f"{prefix}.ln_2.bias"}, "outputs": {"out": f"ln2_{i}"}, "outputs_shape": {"out": [1, 256, d_model]}, "params": {"eps": cfg.layer_norm_epsilon, "d_model": d_model}})
-        
-        out_tensors[f"{prefix}.mlp.c_fc.weight"] = out_tensors.pop(f"{prefix}.mlp.c_fc.weight").t().contiguous()
-        out_tensors[f"{prefix}.mlp.c_fc.bias"] = out_tensors.pop(f"{prefix}.mlp.c_fc.bias").contiguous()
-        
-        nodes.append({"op": "MatMul", "inputs": {"input": f"ln2_{i}", "weight": f"{prefix}.mlp.c_fc.weight", "bias": f"{prefix}.mlp.c_fc.bias"}, "outputs": {"out": f"mlp1_{i}"}, "outputs_shape": {"out": [1, 256, cfg.hidden_size * 4]}})
-        nodes.append({"op": "GELU", "inputs": {"input": f"mlp1_{i}"}, "outputs": {"out": f"mlp_act_{i}"}, "outputs_shape": {"out": [1, 256, cfg.hidden_size * 4]}})
-        
-        out_tensors[f"{prefix}.mlp.c_proj.weight"] = out_tensors.pop(f"{prefix}.mlp.c_proj.weight").t().contiguous()
-        out_tensors[f"{prefix}.mlp.c_proj.bias"] = out_tensors.pop(f"{prefix}.mlp.c_proj.bias").contiguous()
-        
-        nodes.append({"op": "MatMul", "inputs": {"input": f"mlp_act_{i}", "weight": f"{prefix}.mlp.c_proj.weight", "bias": f"{prefix}.mlp.c_proj.bias"}, "outputs": {"out": f"mlp2_{i}"}, "outputs_shape": {"out": [1, 256, d_model]}})
-        nodes.append({"op": "Add", "inputs": {"a": f"add1_{i}", "b": f"mlp2_{i}"}, "outputs": {"out": f"hidden_{i+1}"}, "outputs_shape": {"out": [1, 256, d_model]}})
-        last_hidden = f"hidden_{i+1}"
-
-    nodes.append({"op": "LayerNorm", "inputs": {"input": last_hidden, "weight": "ln_f.weight", "bias": "ln_f.bias"}, "outputs": {"out": "final_norm"}, "outputs_shape": {"out": [1, 256, d_model]}, "params": {"eps": cfg.layer_norm_epsilon, "d_model": d_model}})
-    if "lm_head.weight" in out_tensors:
-        out_tensors["lm_head.weight"] = out_tensors.pop("lm_head.weight").t()
-    else:
-        out_tensors["lm_head.weight"] = out_tensors["wte.weight"].t()
-        
-    nodes.append({"op": "MatMul", "inputs": {"input": "final_norm", "weight": "lm_head.weight"}, "outputs": {"out": "logits"}, "outputs_shape": {"out": [1, 256, cfg.vocab_size]}})
-    return nodes
-
-
-def export_tflite_model(model_path: str, out_path: str, weight_dtype: str = "auto"):
+def export_tflite_model(
+    model_path: str,
+    out_path: str,
+    weight_dtype: str = "auto",
+    output_names=None,
+    image_normalizations=None,
+):
     import math
     import struct
     from collections import Counter
@@ -895,22 +841,75 @@ def export_tflite_model(model_path: str, out_path: str, weight_dtype: str = "aut
     value_name = {}
     value_shape = {}
     value_layout = {}
+
+    # Canonical W8A8 graph metadata is carried by the typed tensor edge, not
+    # by an adjacent Conv/Linear parameter list.  Keep the TFLite descriptor
+    # extraction in one place so inputs, node outputs, and physical weights
+    # agree exactly.
+    def tensor_dtype(tid):
+        return dtype_names.get(tensors_meta[resolve_const(tid)]["dtype"])
+
+    def tensor_quantization(tid, *, axis_override=None, axis_length=None, force_per_axis=False):
+        source_tid = resolve_const(tid)
+        meta = tensors_meta[source_tid]
+        dtype = dtype_names.get(meta["dtype"])
+        if dtype not in ("int8", "uint8"):
+            return None
+        scales = [float(value) for value in meta.get("scale", [])]
+        zero_points = [int(value) for value in meta.get("zero_point", [])] or [0] * len(scales)
+        if not scales or len(zero_points) not in (1, len(scales)):
+            return None
+        if not all(math.isfinite(value) and value > 0.0 for value in scales):
+            return None
+        minimum, maximum = (-128, 127) if dtype == "int8" else (0, 255)
+        if not all(isinstance(value, int) and minimum <= value <= maximum for value in zero_points):
+            return None
+        if len(zero_points) == 1 and len(scales) > 1:
+            zero_points = zero_points * len(scales)
+        if len(scales) == 1 and not force_per_axis:
+            return {
+                "scheme": "per_tensor",
+                "scale": float(scales[0]),
+                "zero_point": int(zero_points[0]),
+            }
+        axis = int(meta.get("quantized_dimension", 0)) if axis_override is None else axis_override
+        if not isinstance(axis, int) or axis < 0 or axis >= len(meta["shape"]):
+            return None
+        channels = int(meta["shape"][axis]) if axis_length is None else int(axis_length)
+        if channels <= 0:
+            return None
+        if len(scales) == 1:
+            scales = scales * channels
+            zero_points = zero_points * channels
+        if len(scales) != channels:
+            return None
+        return {
+            "scheme": "per_axis",
+            "axis": int(axis),
+            "scales": [float(value) for value in scales],
+            "zero_points": [int(value) for value in zero_points],
+        }
+
     for idx, tid in enumerate(input_tids):
         name = short(tkey(tid), f"input{idx}")
         shape = tensors_meta[tid]["shape"]
         dtype = dtype_names.get(tensors_meta[tid]["dtype"], "float32")
         inputs_def[name] = {"shape": shape, "dtype": dtype, "source_name": tensors_meta[tid]["name"]}
+        quantization = tensor_quantization(tid)
+        if quantization is not None:
+            inputs_def[name]["quantization"] = quantization
         value_name[tid] = name
         value_shape[tid] = shape
         value_layout[tid] = "NHWC" if len(shape) == 4 else "other"
+    _apply_image_normalizations(inputs_def, image_normalizations)
 
-    for idx, tid in enumerate(output_tids):
-        shape = tensors_meta[tid]["shape"]
-        preferred = "boxes" if shape and shape[-1] == 4 else ("scores" if shape and shape[-1] > 4 else f"output{idx}")
+    canonical_outputs = _resolve_output_names(len(output_tids), output_names)
+    for tid, preferred in zip(output_tids, canonical_outputs):
         short(tkey(tid), preferred)
 
     tensors = {}
     weight_names = {}
+    weights_quantization = {}
     nodes = []
 
     def save_array(name, arr):
@@ -954,11 +953,40 @@ def export_tflite_model(model_path: str, out_path: str, weight_dtype: str = "aut
                 raise RuntimeError(f"Depthwise weight tensor {tid} has unsupported shape {list(arr.shape)}")
             # TFLite depthwise filters are 1HWO, where O = input_channels * multiplier.
             # Keep that artifact layout; native prepares HWCM for compute.
+        elif transform == "depthwise_q":
+            if arr.ndim != 4 or arr.shape[0] != 1:
+                raise RuntimeError(f"Quantized depthwise weight tensor {tid} has unsupported shape {list(arr.shape)}")
+            # The canonical QConv2D contract is OHWI for both regular and
+            # depthwise convolution. TFLite's 1HWO becomes [O,H,W,1].
+            arr = np.transpose(arr, (3, 1, 2, 0)).copy()
         elif transform != "raw":
             raise RuntimeError(f"Unknown weight transform: {transform}")
         name = short(f"{tkey(source_tid)}_{transform}", weight=True)
         save_array(name, arr)
         weight_names[key] = name
+        return name
+
+    def ensure_quantized_conv_weight(tid, transform):
+        name = ensure_weight(tid, transform)
+        source_tid = resolve_const(tid)
+        source_meta = tensors_meta[source_tid]
+        if transform == "depthwise_q":
+            # Per-output scale values are ordered by the original O axis 3;
+            # after conversion that becomes canonical axis 0.
+            descriptor = tensor_quantization(source_tid, axis_override=0,
+                axis_length=int(tensors[name].shape[0]), force_per_axis=True)
+            if descriptor is not None:
+                descriptor["axis"] = 0
+                channels = int(tensors[name].shape[0])
+                if len(descriptor["scales"]) != channels:
+                    descriptor = None
+        else:
+            descriptor = tensor_quantization(source_tid, force_per_axis=True)
+            if descriptor is not None and descriptor.get("axis") != 0:
+                descriptor = None
+        if descriptor is None:
+            raise RuntimeError(f"TFLite quantized convolution weight {tid} lacks canonical output-channel quantization metadata")
+        weights_quantization[name] = descriptor
         return name
 
     def ensure_qparam_weight(tid, kind):
@@ -978,33 +1006,36 @@ def export_tflite_model(model_path: str, out_path: str, weight_dtype: str = "aut
         weight_names[key] = name
         return name
 
-    def ensure_dequant_bias(tid):
+    def ensure_typed_zero_point(tid):
         source_tid = resolve_const(tid)
-        key = (source_tid, "dequant_bias")
+        key = (source_tid, "typed_zero_point")
         if key in weight_names:
             return weight_names[key]
-        arr = tensor_array(source_tid)
-        if arr is None:
-            raise RuntimeError(f"TFLite bias tensor {tid} is not constant")
+        dtype = tensor_dtype(source_tid)
         q = qparams(source_tid)
-        scales = np.asarray(q["scale"] or [1.0], dtype=np.float32)
-        zps = np.asarray(q["zero_point"] or [0], dtype=np.float32)
-        if scales.size == 1:
-            out = (arr.astype(np.float32) - float(zps.reshape(-1)[0])) * float(scales.reshape(-1)[0])
-        else:
-            out = (arr.astype(np.float32) - zps.reshape(arr.shape)) * scales.reshape(arr.shape)
-        name = short(f"{tkey(source_tid)}_dequant_bias", weight=True)
-        save_array(name, out.astype(np.float32))
+        if dtype not in ("int8", "uint8") or len(q["zero_point"] or [0]) != 1:
+            raise RuntimeError(f"TFLite tensor {tid} needs a scalar I8/U8 zero point")
+        array_dtype = np.int8 if dtype == "int8" else np.uint8
+        name = short(f"{tkey(source_tid)}_typed_zero_point", weight=True)
+        save_array(name, np.asarray([q_scalar(q, "zero_point", 0)], dtype=array_dtype))
         weight_names[key] = name
         return name
 
-    def add_node(op, inputs, out_name, out_shape, params=None):
+    def add_node(op, inputs, out_name, out_shape, params=None, out_tid=None):
         node = {
             "op": op,
             "inputs": inputs,
             "outputs": {"out": out_name},
             "outputs_shape": {"out": [int(v) for v in out_shape]},
         }
+        if out_tid is not None:
+            dtype = tensor_dtype(out_tid)
+            if dtype not in ("float32", "int32", "int8", "uint8"):
+                raise RuntimeError(f"Unsupported exported tensor dtype {dtype!r} on TFLite tensor {out_tid}")
+            node["outputs_dtype"] = {"out": dtype}
+            quantization = tensor_quantization(out_tid)
+            if quantization is not None:
+                node["outputs_quantization"] = {"out": quantization}
         if params:
             node["params"] = params
         nodes.append(node)
@@ -1070,16 +1101,15 @@ def export_tflite_model(model_path: str, out_path: str, weight_dtype: str = "aut
             out_name = short(tkey(outputs[0]))
             q = qparams(inputs[0])
             scale = ensure_qparam_weight(inputs[0], "scale")
-            zero_point = ensure_qparam_weight(inputs[0], "zero_point")
             add_node("DequantizeLinear", {
                 "input": in_name,
                 "scale": scale,
-                "zero_point": zero_point,
+                "zero_point": ensure_typed_zero_point(inputs[0]),
             }, out_name, out_shape, {
                 "scale": float(q_scalar(q, "scale", 1.0)),
                 "zero_point": int(q_scalar(q, "zero_point", 0)),
                 "data_layout": "NHWC" if len(out_shape) == 4 else "other",
-            })
+            }, out_tid=outputs[0])
             set_value(outputs[0], out_name, out_shape, "NHWC" if len(out_shape) == 4 else "other")
             continue
 
@@ -1093,16 +1123,25 @@ def export_tflite_model(model_path: str, out_path: str, weight_dtype: str = "aut
             if len(inputs) != 1 or len(outputs) != 1:
                 raise RuntimeError("Unsupported TFLite QUANTIZE arity")
             in_name = name_for_value(inputs[0])
-            in_q = qparams(inputs[0])
-            out_q = qparams(outputs[0])
-            params = {
-                "input_scale": float(q_scalar(in_q, "scale", 0.0)),
-                "input_zero_point": int(q_scalar(in_q, "zero_point", 0)),
-                "output_scale": float(q_scalar(out_q, "scale", 1.0)),
-                "output_zero_point": int(q_scalar(out_q, "zero_point", 0)),
-                "data_layout": "NHWC" if len(out_tflite_shape) == 4 else "other",
-            }
-            add_node("QuantizeLinear", {"input": in_name}, out_name, out_tflite_shape, params)
+            output_quantization = tensor_quantization(out_tid)
+            if output_quantization is None or output_quantization.get("scheme") != "per_tensor":
+                raise RuntimeError(f"TFLite QUANTIZE output {out_tid} needs scalar I8/U8 quantization metadata")
+            input_dtype = tensor_dtype(inputs[0])
+            if input_dtype in ("int8", "uint8"):
+                input_quantization = tensor_quantization(inputs[0])
+                if input_quantization is None or input_quantization.get("scheme") != "per_tensor":
+                    raise RuntimeError(f"TFLite QUANTIZE input {inputs[0]} needs scalar I8/U8 quantization metadata")
+                add_node("RequantizeLinear", {"input": in_name}, out_name, out_tflite_shape,
+                         {"data_layout": "NHWC" if len(out_tflite_shape) == 4 else "other"}, out_tid=out_tid)
+            elif input_dtype == "float32":
+                add_node("QuantizeLinear", {
+                    "input": in_name,
+                    "scale": ensure_qparam_weight(out_tid, "scale"),
+                    "zero_point": ensure_typed_zero_point(out_tid),
+                }, out_name, out_tflite_shape,
+                {"data_layout": "NHWC" if len(out_tflite_shape) == 4 else "other"}, out_tid=out_tid)
+            else:
+                raise RuntimeError(f"TFLite QUANTIZE input {inputs[0]} has unsupported dtype {input_dtype}")
             set_value(out_tid, out_name, out_tflite_shape, "NHWC" if len(out_tflite_shape) == 4 else "other")
             lowered_quantize += 1
             continue
@@ -1115,17 +1154,14 @@ def export_tflite_model(model_path: str, out_path: str, weight_dtype: str = "aut
             if value_layout.get(inputs[0], "NHWC") != "NHWC" or len(in_shape) != 4 or len(out_tflite_shape) != 4:
                 raise RuntimeError(f"{op_name} expects rank-4 tensors")
             out_shape = out_tflite_shape
-            in_q = qparams(inputs[0])
-            out_q = qparams(out_tid)
-            weight_q = qparams(inputs[1])
             weight_meta = tensors_meta[resolve_const(inputs[1])]
             use_qconv = (
                 weight_meta["dtype"] in (3, 9)
-                and bool(in_q["scale"])
-                and bool(weight_q["scale"])
+                and tensor_quantization(inputs[0]) is not None
+                and tensor_quantization(out_tid) is not None
             )
             if op_name == "CONV_2D":
-                weight = ensure_weight(inputs[1], "conv")
+                weight = ensure_quantized_conv_weight(inputs[1], "conv") if use_qconv else ensure_weight(inputs[1], "conv")
                 weight_shape = list(tensors[weight].shape)
                 kernel = weight_shape[1:3]
                 groups = 1
@@ -1140,11 +1176,11 @@ def export_tflite_model(model_path: str, out_path: str, weight_dtype: str = "aut
                 ]
                 act = scalar(options, 3, 0, N.Int8Flags) if options else 0
             else:
-                weight = ensure_weight(inputs[1], "depthwise")
+                weight = ensure_quantized_conv_weight(inputs[1], "depthwise_q") if use_qconv else ensure_weight(inputs[1], "depthwise")
                 weight_shape = list(tensors[weight].shape)
                 kernel = weight_shape[1:3]
                 groups = int(in_shape[3])
-                weight_layout = "1HWO"
+                weight_layout = "OHWI" if use_qconv else "1HWO"
                 stride = [
                     scalar(options, 2, 1, N.Int32Flags) if options else 1,
                     scalar(options, 1, 1, N.Int32Flags) if options else 1,
@@ -1157,12 +1193,10 @@ def export_tflite_model(model_path: str, out_path: str, weight_dtype: str = "aut
             padding = scalar(options, 0, 0, N.Int8Flags) if options else 0
             pads = conv_pads(padding, in_shape, out_shape, kernel, stride, dilation, layout="NHWC")
             node_inputs = {"input": in_name, "weight": weight}
-            if use_qconv:
-                node_inputs["weight_scale"] = ensure_qparam_weight(inputs[1], "scale")
-                if any(v != 0 for v in weight_q["zero_point"]):
-                    node_inputs["weight_zero_point"] = ensure_qparam_weight(inputs[1], "zero_point")
             if len(inputs) > 2 and inputs[2] >= 0:
-                node_inputs["bias"] = ensure_dequant_bias(inputs[2]) if use_qconv else ensure_weight(inputs[2], "raw")
+                if use_qconv and tensor_dtype(inputs[2]) != "int32":
+                    raise RuntimeError(f"TFLite QConv2D bias {inputs[2]} must use I32 accumulator storage")
+                node_inputs["bias"] = ensure_weight(inputs[2], "raw")
             params = {
                 "stride": stride,
                 "dilation": dilation,
@@ -1172,16 +1206,10 @@ def export_tflite_model(model_path: str, out_path: str, weight_dtype: str = "aut
                 "data_layout": "NHWC",
                 "weight_layout": weight_layout,
             }
-            if use_qconv:
-                params["input_scale"] = float(q_scalar(in_q, "scale", 1.0))
-                params["input_zero_point"] = int(q_scalar(in_q, "zero_point", 0))
-                params["output_scale"] = float(q_scalar(out_q, "scale", 0.0))
-                params["output_zero_point"] = int(q_scalar(out_q, "zero_point", 0))
-                params["weight_axis"] = int(weight_q.get("axis", 0))
             relu = activation_param(act)
             if relu:
                 params["relu"] = relu
-            add_node("QConv2D" if use_qconv else "Conv2D", node_inputs, out_name, out_shape, params)
+            add_node("QConv2D" if use_qconv else "Conv2D", node_inputs, out_name, out_shape, params, out_tid=out_tid)
             set_value(out_tid, out_name, out_shape, "NHWC")
             continue
 
@@ -1194,7 +1222,13 @@ def export_tflite_model(model_path: str, out_path: str, weight_dtype: str = "aut
             relu = activation_param(act)
             if relu:
                 params["relu"] = relu
-            add_node("Add", {"a": a_name, "b": b_name}, out_name, out_shape, params)
+            quantized_add = (tensor_quantization(inputs[0]) is not None and
+                             tensor_quantization(inputs[1]) is not None and
+                             tensor_quantization(out_tid) is not None)
+            if quantized_add and tensors_meta[inputs[0]]["shape"] != tensors_meta[inputs[1]]["shape"]:
+                raise RuntimeError("Direct TFLite export needs explicit typed broadcast lowering before QAdd")
+            add_node("QAdd" if quantized_add else "Add", {"a": a_name, "b": b_name},
+                     out_name, out_shape, params, out_tid=out_tid)
             set_value(out_tid, out_name, out_shape, "NHWC" if len(out_tflite_shape) == 4 else "other")
             continue
 
@@ -1221,7 +1255,7 @@ def export_tflite_model(model_path: str, out_path: str, weight_dtype: str = "aut
                 "pads": pads,
                 "padding": [pads[0], pads[1]],
                 "data_layout": "NHWC",
-            })
+            }, out_tid=out_tid)
             set_value(out_tid, out_name, out_shape, "NHWC")
             continue
 
@@ -1232,14 +1266,14 @@ def export_tflite_model(model_path: str, out_path: str, weight_dtype: str = "aut
                 "mode": "nearest",
                 "coordinate_transformation_mode": "asymmetric",
                 "data_layout": "NHWC",
-            })
+            }, out_tid=out_tid)
             set_value(out_tid, out_name, out_shape, "NHWC")
             continue
 
         if op_name == "RESHAPE":
             in_tid = inputs[0]
             in_name = name_for_value(in_tid)
-            add_node("Reshape", {"input": in_name}, out_name, out_tflite_shape)
+            add_node("Reshape", {"input": in_name}, out_name, out_tflite_shape, out_tid=out_tid)
             set_value(out_tid, out_name, out_tflite_shape, "NHWC" if len(out_tflite_shape) == 4 else "other")
             continue
 
@@ -1257,14 +1291,29 @@ def export_tflite_model(model_path: str, out_path: str, weight_dtype: str = "aut
                 out_shape = out_tflite_shape
                 node_inputs = {f"input{i}": name_for_value(tid) for i, tid in enumerate(inputs)}
                 layout = "other"
-            add_node("Concat", node_inputs, out_name, out_shape, {"axis": axis, "count": len(inputs)})
+            add_node("Concat", node_inputs, out_name, out_shape, {"axis": axis, "count": len(inputs)}, out_tid=out_tid)
             set_value(out_tid, out_name, out_shape, layout)
             continue
 
         if op_name == "LOGISTIC":
             in_name = name_for_value(inputs[0])
             in_shape = value_shape.get(inputs[0], tensors_meta[inputs[0]]["shape"])
-            add_node("Sigmoid", {"input": in_name}, out_name, in_shape)
+            if tensor_quantization(inputs[0]) is not None and tensor_quantization(out_tid) is not None:
+                f32_input = short(f"{tkey(out_tid)}_sigmoid_input")
+                f32_output = short(f"{tkey(out_tid)}_sigmoid_f32")
+                add_node("DequantizeLinear", {
+                    "input": in_name,
+                    "scale": ensure_qparam_weight(inputs[0], "scale"),
+                    "zero_point": ensure_typed_zero_point(inputs[0]),
+                }, f32_input, in_shape, {"data_layout": "NHWC" if len(in_shape) == 4 else "other"})
+                add_node("Sigmoid", {"input": f32_input}, f32_output, in_shape)
+                add_node("QuantizeLinear", {
+                    "input": f32_output,
+                    "scale": ensure_qparam_weight(out_tid, "scale"),
+                    "zero_point": ensure_typed_zero_point(out_tid),
+                }, out_name, in_shape, {"data_layout": "NHWC" if len(in_shape) == 4 else "other"}, out_tid=out_tid)
+            else:
+                add_node("Sigmoid", {"input": in_name}, out_name, in_shape, out_tid=out_tid)
             set_value(out_tid, out_name, in_shape, value_layout.get(inputs[0], "other"))
             continue
 
@@ -1274,7 +1323,7 @@ def export_tflite_model(model_path: str, out_path: str, weight_dtype: str = "aut
         wanted = short(tkey(tid))
         current = name_for_value(tid)
         if current != wanted:
-            add_node("Identity", {"input": current}, wanted, value_shape.get(tid, tensors_meta[tid]["shape"]))
+            add_node("Identity", {"input": current}, wanted, value_shape.get(tid, tensors_meta[tid]["shape"]), out_tid=tid)
             set_value(tid, wanted, value_shape.get(tid, tensors_meta[tid]["shape"]), value_layout.get(tid, "other"))
 
     raw_node_count = len(nodes)
@@ -1293,9 +1342,11 @@ def export_tflite_model(model_path: str, out_path: str, weight_dtype: str = "aut
             "op_histogram": dict(op_counter),
             "internal_layout": "NHWC",
             "conv_weight_layout": "OHWI",
-            "depthwise_weight_layout": "1HWO",
+            "depthwise_weight_layout": "OHWI",
+            "quantized_graph_contract": "w8a8-v1",
         },
         "inputs": inputs_def,
+        **({"weights_quantization": weights_quantization} if weights_quantization else {}),
         "outputs": {tensors_meta[tid]["name"]: short(tkey(tid)) for tid in output_tids},
         "nodes": nodes,
     }
@@ -1307,81 +1358,46 @@ def export_tflite_model(model_path: str, out_path: str, weight_dtype: str = "aut
     print(f"[Export] Wrote {out_path} and {config_path}")
 
 
-def export_model(model_id_or_path: str, out_path: str, weight_dtype: str = "auto"):
-    print(f"[Export] Detecting architecture for {model_id_or_path}...")
-    if model_id_or_path.lower().endswith(".onnx"):
-        export_onnx_model(model_id_or_path, out_path, weight_dtype=weight_dtype)
+def export_model(
+    model_path: str,
+    out_path: str,
+    weight_dtype: str = "auto",
+    output_names=None,
+    image_normalizations=None,
+):
+    suffix = Path(model_path).suffix.lower()
+    if suffix == ".onnx":
+        export_onnx_model(
+            model_path,
+            out_path,
+            weight_dtype=weight_dtype,
+            output_names=output_names,
+            image_normalizations=image_normalizations,
+        )
         return
-    if model_id_or_path.lower().endswith(".tflite"):
-        export_tflite_model(model_id_or_path, out_path, weight_dtype=weight_dtype)
+    if suffix == ".tflite":
+        export_tflite_model(
+            model_path,
+            out_path,
+            weight_dtype=weight_dtype,
+            output_names=output_names,
+            image_normalizations=image_normalizations,
+        )
         return
-    out_dir = Path(out_path).parent
-    out_dir.mkdir(parents=True, exist_ok=True)
-    out_tensors = {}
-    
-    # Check if it's a local KIE checkpoint or a HuggingFace CausalLM model
-    if os.path.exists(model_id_or_path) and not os.path.isdir(model_id_or_path):
-        # Local KIE Checkpoint
-        print(f"[Export] Discovered local PyTorch Checkpoint. Using Vision-Encoder-Decoder Graph Builder.")
-        ckpt = torch.load(model_id_or_path, map_location="cpu", weights_only=False)
-        state_dict = ckpt.get("model", ckpt)
-        cfg = ckpt.get("config", {})
-        
-        for key, tensor in state_dict.items():
-            if "multihead_attn.in_proj_weight" in key:
-                q_w, k_w, v_w = tensor.chunk(3, dim=0)
-                prefix = key.replace(".in_proj_weight", "")
-                for name, w in zip(["q_proj_weight", "k_proj_weight", "v_proj_weight"], [q_w, k_w, v_w]):
-                    q_tensor, scale = quantize_to_int8(w)
-                    out_tensors[f"{prefix}.{name}"] = q_tensor
-                    out_tensors[f"{prefix}.{name.replace('weight', 'scale')}"] = scale.view(1)
-            elif "multihead_attn.in_proj_bias" in key:
-                q_b, k_b, v_b = tensor.chunk(3, dim=0)
-                prefix = key.replace(".in_proj_bias", "")
-                out_tensors[f"{prefix}.q_proj_bias"] = q_b.float()
-                out_tensors[f"{prefix}.k_proj_bias"] = k_b.float()
-                out_tensors[f"{prefix}.v_proj_bias"] = v_b.float()
-            elif tensor.dim() == 2 and ("weight" in key and "norm" not in key):
-                q_tensor, scale = quantize_to_int8(tensor)
-                out_tensors[key] = q_tensor
-                out_tensors[f"{key}_scale"] = scale.view(1)
-            else:
-                out_tensors[key] = tensor.float()
-                
-        inputs_def = {"images": {"shape": [1, 3, 224, 224], "dtype": "float32"}, "q_tokens": {"shape": [1, 192], "dtype": "int32"}}
-        nodes = build_kie_graph(cfg)
-        
-    else:
-        # HuggingFace Transformer Model
-        print(f"[Export] Fetching HuggingFace Config. Using GPT-Neo Graph Builder.")
-        model = AutoModelForCausalLM.from_pretrained(model_id_or_path)
-        cfg = model.config
-        sd = model.state_dict()
-        
-        inputs_def = {"tokens": {"shape": [1, 256], "dtype": "int32"}, "positions": {"shape": [1, 256], "dtype": "int32"}}
-        nodes = build_gptneo_graph(cfg, sd, out_tensors)
-        
-        import numpy as np
-        tok_in = np.ones((1, 256), dtype=np.int32) * 50256
-        tok_in[0, 0:5] = [123, 456, 789, 1011, 1213]
-        pos_in = np.arange(256, dtype=np.int32).reshape(1, 256)
-        with open(out_dir / "tokens.i32", "wb") as f: f.write(tok_in.tobytes())
-        with open(out_dir / "positions.i32", "wb") as f: f.write(pos_in.tobytes())
+    raise ValueError(
+        f"Unsupported source {model_path!r}; the generic exporter accepts only "
+        ".onnx and .tflite files. Use an example-owned exporter for model-family "
+        "checkpoints."
+    )
 
-    print(f"[Export] Saving standard Safetensors to {out_path}...")
-    final_tensors = {k: v.clone().contiguous() for k, v in out_tensors.items()}
-    save_file(final_tensors, out_path)
-    
-    config_path = out_dir / "config.json"
-    print(f"[Export] Saving graph topology to {config_path}...")
-    with open(config_path, "w") as f:
-        f.write(dumps_with_compact_lists({"inputs": inputs_def, "nodes": nodes}, indent=2))
-        
-    print(f"[Export] Success! Safetensors size: {Path(out_path).stat().st_size / (1024*1024):.2f} MB")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model", required=True, help="HuggingFace model ID or local checkpoint path")
+    parser.add_argument(
+        "--model",
+        required=True,
+        help="ONNX or TFLite source model",
+    )
     parser.add_argument("--out", required=True, help="Output safetensors path (e.g. models/model.safetensors)")
     parser.add_argument(
         "--weight-dtype",
@@ -1389,5 +1405,30 @@ if __name__ == "__main__":
         default="auto",
         help="Storage dtype for floating ONNX tensors. auto preserves FLOAT16 initializers and treats fp16/float16 filenames as float16.",
     )
+    parser.add_argument(
+        "--output-name",
+        action="append",
+        dest="output_names",
+        help=(
+            "Canonical output tensor name in source-output order; repeat once per "
+            "output. Defaults to output0, output1, ... without model-specific inference."
+        ),
+    )
+    parser.add_argument(
+        "--image-normalization",
+        action="append",
+        dest="image_normalizations",
+        metavar="INPUT=MODE",
+        help=(
+            "Declare image preprocessing for one canonical exported input; MODE "
+            "is zero-one, minus-one-one, or raw-255. Repeat for multiple inputs."
+        ),
+    )
     args = parser.parse_args()
-    export_model(args.model, args.out, weight_dtype=args.weight_dtype)
+    export_model(
+        args.model,
+        args.out,
+        weight_dtype=args.weight_dtype,
+        output_names=args.output_names,
+        image_normalizations=args.image_normalizations,
+    )

@@ -1,0 +1,5 @@
+# Development-only dependencies for regenerating the TinyStories example.
+numpy>=1.24
+safetensors>=0.4.0
+torch>=2.0
+transformers>=4.36
