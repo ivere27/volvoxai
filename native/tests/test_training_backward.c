@@ -1,8 +1,8 @@
 #include "cJSON.h"
 #include "adapter_runtime_internal.h"
-#include "volvoxai.h"
-#include "volvoxai_backend.h"
-#include "volvoxai_training.h"
+#include "engine_core.h"
+#include "runtime_state.h"
+#include "training/training_core.h"
 #include "engine_internal.h"
 #include "safetensors.h"
 #if VOLVOXAI_ENABLE_VULKAN
@@ -14,6 +14,9 @@ static int vk_init(void) { return -1; }
 static int vk_training_available(void) { return 0; }
 static void vk_cleanup(void) {}
 #endif
+#if VOLVOXAI_ENABLE_CUDA
+#include "cuda_engine.h"
+#endif
 
 #include <math.h>
 #include <limits.h>
@@ -22,32 +25,6 @@ static void vk_cleanup(void) {}
 #include <string.h>
 
 #define CHECK(x) do { if (!(x)) { fprintf(stderr, "FAIL %s:%d: %s\n", __FILE__, __LINE__, #x); return -1; } } while (0)
-
-static int g_training_sdk_supports;
-static int g_training_sdk_teardowns;
-
-static int training_sdk_init(void* user_data) {
-    (void)user_data;
-    return VX_INIT_READY;
-}
-
-static int training_sdk_supports(void* user_data, const VxNode* node) {
-    (void)user_data;
-    (void)node;
-    g_training_sdk_supports++;
-    return VX_DECLINED;
-}
-
-static int training_sdk_run(void* user_data, const VxNode* node) {
-    (void)user_data;
-    (void)node;
-    return VX_ERROR;
-}
-
-static void training_sdk_teardown(void* user_data) {
-    (void)user_data;
-    g_training_sdk_teardowns++;
-}
 
 static T* add_tensor(const char* name, const int* shape, int ndim, const float* values) {
     if (g_nt >= MAXT) return NULL;
@@ -195,36 +172,23 @@ static float reference_gelu_derivative(float x, int approximate_tanh) {
         x * 0.3989422804014327f * expf(-0.5f * x * x);
 }
 
-static int test_public_backend_bypasses_training_tape(void) {
-    const VxBackendV1 backend = {
-        .struct_size = sizeof(VxBackendV1),
-        .abi_version = VX_BACKEND_ABI_V1,
-        .name = "training-guard-probe",
-        .init = training_sdk_init,
-        .supports = training_sdk_supports,
-        .run = training_sdk_run,
-        .teardown = training_sdk_teardown,
-    };
-    CHECK(volvoxai_register_backend(&backend) == 0);
-    CHECK(volvoxai_engine_configure_backend("training-guard-probe") == 0);
-    begin_graph();
-    const int shape[2] = {1, 2};
-    const float input[2] = {-0.5f, 1.0f};
-    CHECK(add_tensor("probe.input", shape, 2, input));
-    CHECK(add_tensor("logits", shape, 2, NULL));
-    Node* node = add_node("GELU", "logits", NULL);
-    CHECK(node && node_input(node, "input", "probe.input") == 0);
-    CHECK(volvoxai_engine_forward() == 0);
-    CHECK(g_training_sdk_supports == 1);
-    const int target[1] = {1};
-    const char* trainable[1] = {"probe.input"};
-    CHECK(volvoxai_engine_train_step("logits", target, 1, INT_MIN, trainable, 1,
-                                     VOLVOXAI_TENSOR_UPDATE_SGD, 0.01f,
-                                     0.9f, 0.999f, 1e-8f, 0.0f, 0.0f,
-                                     1, NULL, NULL, NULL) == 0);
-    CHECK(g_training_sdk_supports == 1);
-    CHECK(finish_graph() == 0);
-    CHECK(g_training_sdk_teardowns == 1);
+static int test_training_backend_policy_ids(void) {
+    CHECK(volvoxai_engine_require_training_backend(0) == 0);
+    /* Native backend values 4 and 5 are NNAPI/custom, not strict native
+       training backends. CUDA preserves its stable native ABI value 6. */
+    CHECK(volvoxai_engine_require_training_backend(4) != 0);
+    CHECK(volvoxai_engine_require_training_backend(5) != 0);
+#if VOLVOXAI_ENABLE_CUDA
+    CHECK(VOLVOXAI_TRAINING_BACKEND_CUDA == VOLVOXAI_BACKEND_CUDA);
+    CHECK(volvoxai_engine_require_training_backend(
+              VOLVOXAI_TRAINING_BACKEND_CUDA) == 0);
+    CHECK(volvoxai_engine_require_training_backend(0) == 0);
+#else
+    CHECK(VOLVOXAI_TRAINING_BACKEND_CUDA == VOLVOXAI_BACKEND_CUDA);
+    CHECK(volvoxai_engine_require_training_backend(
+              VOLVOXAI_TRAINING_BACKEND_CUDA) != 0);
+#endif
+    CHECK(volvoxai_engine_require_training_backend(7) != 0);
     return 0;
 }
 
@@ -658,8 +622,11 @@ static int test_patch_graph_transactions(void) {
     const float input[2] = {1.0f, -2.0f};
     CHECK(add_tensor("x", shape, 2, input));
     g_t[0].is_graph_input = 1;
-    g_cfg_root = cJSON_Parse("{\"inputs\":{\"x\":{\"shape\":[1,2]}},\"nodes\":[]}");
-    CHECK(g_cfg_root != NULL);
+    g_graph_root = cJSON_Parse(
+        "{\"format\":\"volvox-graph/v1\",\"inputs\":{\"x\":{"
+        "\"shape\":[1,2],\"dtype\":\"float32\"}},\"nodes\":[],"
+        "\"outputs\":[\"z\"]}");
+    CHECK(g_graph_root != NULL);
     const char* add_y =
         "{\"opType\":\"Identity\",\"inputs\":{\"input\":\"x\"},"
         "\"outputs\":{\"output\":\"y\"},\"output_shapes\":{\"output\":[1,2]}}";
@@ -678,7 +645,7 @@ static int test_patch_graph_transactions(void) {
     CHECK(inspected && cJSON_GetObjectItem(inspected, "num_ops")->valueint == 2 &&
           cJSON_GetArraySize(cJSON_GetObjectItem(inspected, "nodes")) == 2);
     cJSON_Delete(inspected);
-    CHECK(volvoxai_engine_save_config(saved_path) == 0);
+    CHECK(volvoxai_engine_save_graph(saved_path) == 0);
     long saved_size = 0;
     char* saved_text = read_file(saved_path, &saved_size);
     cJSON* saved = saved_text ? cJSON_Parse(saved_text) : NULL;
@@ -707,7 +674,7 @@ static int test_patch_graph_transactions(void) {
         "\"opType\":\"Identity\",\"inputs\":{\"input\":\"z\"},"
         "\"outputs\":{\"output\":\"persist_fail\"},"
         "\"output_shapes\":{\"output\":[1,2]}}}],"
-        "\"persist_config_path\":\"/no/such/volvox/directory/config.json\"}";
+        "\"persist_graph_path\":\"/no/such/volvox/directory/graph.json\"}";
     CHECK(volvoxai_engine_patch_graph_json(failed_persist, 0, 1) == -1);
     CHECK(g_nn == 2 && g_nt == 3 && t_find("persist_fail") == NULL && volvoxai_engine_forward() == 0);
 
@@ -718,6 +685,8 @@ static int test_patch_graph_transactions(void) {
         "{\"node_index\":0,\"mode\":5,\"patch\":{}}]";
     CHECK(volvoxai_engine_patch_graph_json(delete_both, 0, 0) == 0);
     CHECK(g_nn == 0);
+    CHECK(volvoxai_engine_patch_graph_json(
+              "{\"patches\":[],\"declared_outputs\":[\"x\"]}", 0, 0) == 0);
     inspection = volvoxai_engine_inspect_model_json(1, 1, 0, 0);
     CHECK(inspection != NULL);
     inspected = cJSON_Parse(inspection);
@@ -735,7 +704,7 @@ static int test_patch_graph_transactions(void) {
     CHECK(volvoxai_engine_patch_node_json(-1, consume_removed,
                                            VOLVOXAI_ENGINE_NODE_PATCH_MODE_INSERT_AFTER, 0) == -1);
     CHECK(g_nn == 0 && t_find("q") == NULL);
-    CHECK(volvoxai_engine_save_config(saved_path) == 0);
+    CHECK(volvoxai_engine_save_graph(saved_path) == 0);
     saved_text = read_file(saved_path, &saved_size);
     saved = saved_text ? cJSON_Parse(saved_text) : NULL;
     free(saved_text);
@@ -760,12 +729,13 @@ static int test_patch_graph_transactions(void) {
     CHECK(volvoxai_engine_forward() == 0);
     CHECK(volvoxai_engine_patch_graph_json(
               "{\"patches\":[],\"declared_outputs\":[\"z_31\"],"
-              "\"persist_config_path\":\"/tmp/volvox-patch-graph.json\"}", 0, 0) == 0);
+              "\"persist_graph_path\":\"/tmp/volvox-patch-graph.json\"}", 0, 0) == 0);
     saved_text = read_file(saved_path, &saved_size);
     saved = saved_text ? cJSON_Parse(saved_text) : NULL;
     free(saved_text);
     cJSON* declared = saved ? cJSON_GetObjectItem(saved, "outputs") : NULL;
-    cJSON* declared_name = declared ? cJSON_GetObjectItem(declared, "z_31") : NULL;
+    cJSON* declared_name = cJSON_IsArray(declared)
+        ? cJSON_GetArrayItem(declared, 0) : NULL;
     CHECK(saved && cJSON_GetArraySize(cJSON_GetObjectItem(saved, "nodes")) == 2 &&
           cJSON_IsString(declared_name) && !strcmp(declared_name->valuestring, "z_31"));
     cJSON_Delete(saved);
@@ -777,8 +747,9 @@ static int test_patch_graph_transactions(void) {
     safetensors_free(&empty_weights);
     volvoxai_engine_shutdown();
     CHECK(volvoxai_engine_init(saved_path, empty_weights_path) == 0);
-    declared = cJSON_GetObjectItem(g_cfg_root, "outputs");
-    declared_name = declared ? cJSON_GetObjectItem(declared, "z_31") : NULL;
+    declared = cJSON_GetObjectItem(g_graph_root, "outputs");
+    declared_name = cJSON_IsArray(declared)
+        ? cJSON_GetArrayItem(declared, 0) : NULL;
     CHECK(cJSON_IsString(declared_name) && !strcmp(declared_name->valuestring, "z_31"));
     long input_count = 0;
     float* reloaded_input = volvoxai_engine_input_ptr("x", &input_count);
@@ -1313,10 +1284,10 @@ static int test_native_seq2seq_training(void) {
 }
 
 static int test_fused_graph_training(void) {
-    const char* config_path = "/tmp/volvox-training-fused.json";
+    const char* graph_path = "/tmp/volvox-training-fused.json";
     const char* weights_path = "/tmp/volvox-training-fused.safetensors";
-    const char* config =
-        "{\"inputs\":{\"x\":{\"shape\":[1,1,1,1]}},\"nodes\":["
+    const char* graph =
+        "{\"format\":\"volvox-graph/v1\",\"inputs\":{\"x\":{\"shape\":[1,1,1,1],\"dtype\":\"float32\"}},\"nodes\":["
         "{\"opType\":\"Conv2D\",\"inputs\":{\"input\":\"x\",\"weight\":\"conv.weight\"},"
         "\"outputs\":{\"output\":\"conv\"},\"outputs_shape\":{\"output\":[1,1,1,2]},"
         "\"params\":{\"weight_layout\":\"HWIO\"}},"
@@ -1326,9 +1297,9 @@ static int test_fused_graph_training(void) {
         "{\"opType\":\"GlobalAveragePool\",\"inputs\":{\"input\":\"clipped\"},"
         "\"outputs\":{\"output\":\"gap\"},\"outputs_shape\":{\"output\":[1,2]}},"
         "{\"opType\":\"MatMul\",\"inputs\":{\"input\":\"gap\",\"weight\":\"head.weight\"},"
-        "\"outputs\":{\"output\":\"logits\"},\"outputs_shape\":{\"output\":[1,2]}}]}";
-    FILE* f = fopen(config_path, "wb");
-    CHECK(f && fwrite(config, 1, strlen(config), f) == strlen(config) && fclose(f) == 0);
+        "\"outputs\":{\"output\":\"logits\"},\"outputs_shape\":{\"output\":[1,2]}}],\"outputs\":[\"logits\"]}";
+    FILE* f = fopen(graph_path, "wb");
+    CHECK(f && fwrite(graph, 1, strlen(graph), f) == strlen(graph) && fclose(f) == 0);
     const int conv_shape[4] = {1, 1, 1, 2};
     const int head_shape[2] = {2, 2};
     const float conv_weight[2] = {0.5f, 1.0f};
@@ -1341,7 +1312,7 @@ static int test_fused_graph_training(void) {
                                  head_shape, 2, head_weight, sizeof(head_weight)) == 0);
     CHECK(safetensors_save(weights_path, &weights) == 0);
     safetensors_free(&weights);
-    CHECK(volvoxai_engine_init(config_path, weights_path) == 0);
+    CHECK(volvoxai_engine_init(graph_path, weights_path) == 0);
     CHECK(g_nn == 4 && g_n[0].fuse_relu6 == 1 && g_n[1].skip == 1 && !strcmp(g_n[0].out, "clipped"));
     long count = 0;
     float* x = volvoxai_engine_input_ptr("x", &count);
@@ -1373,16 +1344,16 @@ static int test_fused_graph_training(void) {
     CHECK(g_n[0].fuse_relu6 == 1 && g_n[1].skip == 1 && !strcmp(g_n[0].out, "clipped"));
     CHECK(volvoxai_engine_forward() == 0);
     volvoxai_engine_shutdown();
-    remove(config_path);
+    remove(graph_path);
     remove(weights_path);
     return 0;
 }
 
 static int test_optimized_dropout_alias_training(void) {
-    const char* config_path = "/tmp/volvox-training-dropout-alias.json";
+    const char* graph_path = "/tmp/volvox-training-dropout-alias.json";
     const char* weights_path = "/tmp/volvox-training-dropout-alias.safetensors";
-    const char* config =
-        "{\"inputs\":{},\"nodes\":["
+    const char* graph =
+        "{\"format\":\"volvox-graph/v1\",\"inputs\":{},\"nodes\":["
         "{\"opType\":\"Dropout\",\"inputs\":{\"input\":\"features\"},"
         "\"outputs\":{\"output\":\"dropped\"},\"outputs_shape\":{\"output\":[1,64]},"
         "\"params\":{\"p\":0.5,\"seed\":12345}},"
@@ -1390,9 +1361,9 @@ static int test_optimized_dropout_alias_training(void) {
         "\"outputs\":{\"output\":\"reshaped\"},\"outputs_shape\":{\"output\":[1,64]}},"
         "{\"opType\":\"MatMul\",\"inputs\":{\"input\":\"reshaped\","
         "\"weight\":\"head.weight\"},\"outputs\":{\"output\":\"logits\"},"
-        "\"outputs_shape\":{\"output\":[1,2]}}]}";
-    FILE* file = fopen(config_path, "wb");
-    CHECK(file && fwrite(config, 1, strlen(config), file) == strlen(config) && fclose(file) == 0);
+        "\"outputs_shape\":{\"output\":[1,2]}}],\"outputs\":[\"logits\"]}";
+    FILE* file = fopen(graph_path, "wb");
+    CHECK(file && fwrite(graph, 1, strlen(graph), file) == strlen(graph) && fclose(file) == 0);
     const int feature_shape[2] = {1, 64};
     const int head_shape[2] = {64, 2};
     float features[64], head[128];
@@ -1411,7 +1382,7 @@ static int test_optimized_dropout_alias_training(void) {
     safetensors_free(&weights);
 
     g_use_vulkan = g_use_nnapi = g_use_opengl = g_use_metal = 0;
-    CHECK(volvoxai_engine_init(config_path, weights_path) == 0);
+    CHECK(volvoxai_engine_init(graph_path, weights_path) == 0);
     T* feature_tensor = t_find("features");
     T* dropped_tensor = t_find("dropped");
     T* reshaped_tensor = t_find("reshaped");
@@ -1440,7 +1411,7 @@ static int test_optimized_dropout_alias_training(void) {
     CHECK(memcmp(logits_before, t_find("logits")->data, sizeof(logits_before)) == 0);
 
     volvoxai_engine_shutdown();
-    remove(config_path);
+    remove(graph_path);
     remove(weights_path);
     return 0;
 }
@@ -1573,6 +1544,298 @@ static int test_dropout_training_and_inference(void) {
     CHECK(memcmp(t_find("features")->data, t_find("dropped")->data, sizeof(features)) == 0);
     return finish_graph();
 }
+
+#if VOLVOXAI_ENABLE_CUDA
+static int run_dropout_runtime_parity_case(int use_cuda, float* updated) {
+    const int feature_shape[2] = {1, 64};
+    float features[64];
+    for (int index = 0; index < 64; index++)
+        features[index] = ((float)(index % 13) - 6.0f) * 0.125f;
+    begin_graph();
+    g_use_vulkan = g_use_nnapi = g_use_opengl = g_use_metal = 0;
+    g_use_cuda = use_cuda;
+    if (use_cuda && cuda_init() != 0) {
+        CHECK(finish_graph() == 0);
+        return cuda_init_failure_is_unavailable() ? 1 : -1;
+    }
+    CHECK(volvoxai_engine_require_training_backend(
+        use_cuda ? VOLVOXAI_BACKEND_CUDA : VOLVOXAI_BACKEND_CPU) == 0);
+    CHECK(add_tensor("dropout.weight", feature_shape, 2, features));
+    CHECK(add_tensor("logits", feature_shape, 2, NULL));
+    Node* node = add_node("Dropout", "logits", "{\"p\":0.5,\"seed\":12345}");
+    CHECK(node && node_input(node, "input", "dropout.weight") == 0);
+    const int target[1] = {17};
+    const char* trainable[1] = {"dropout.weight"};
+    CHECK(volvoxai_engine_train_step("logits", target, 1, INT_MIN,
+        trainable, 1, 2, 0.01f, 0.9f, 0.999f, 1.0e-8f,
+        0.0f, 0.0f, 7, NULL, NULL, NULL) == 0);
+    CHECK(volvoxai_engine_last_training_backend() ==
+          (use_cuda ? VOLVOXAI_BACKEND_CUDA : VOLVOXAI_BACKEND_CPU));
+    CHECK(volvoxai_engine_copy_tensor_f32(
+        "dropout.weight", updated, 64) == 0);
+    CHECK(volvoxai_engine_require_training_backend(VOLVOXAI_BACKEND_CPU) == 0);
+    return finish_graph();
+}
+
+static int test_cuda_dropout_runtime_optional(void) {
+    float cpu_updated[64];
+    float cuda_updated[64];
+    CHECK(run_dropout_runtime_parity_case(0, cpu_updated) == 0);
+    int cuda_result = run_dropout_runtime_parity_case(1, cuda_updated);
+    if (cuda_result == 1) {
+        puts("native CUDA dropout TrainStep integration skipped: no CUDA device");
+        return 0;
+    }
+    CHECK(cuda_result == 0);
+    for (int index = 0; index < 64; index++)
+        CHECK(fabsf(cpu_updated[index] - cuda_updated[index]) < 2.0e-6f);
+    return 0;
+}
+
+static int run_linear_runtime_parity_case(int use_cuda, float* updated_weight,
+                                          float* updated_bias) {
+    const int input_shape[2] = {2, 2};
+    const int weight_shape[2] = {3, 2};
+    const int bias_shape[1] = {3};
+    const int output_shape[2] = {2, 3};
+    const float input[4] = {1.0f, -0.5f, 0.25f, 2.0f};
+    const float weight[6] = {0.2f, -0.4f, 0.1f, 0.3f, -0.5f, 0.25f};
+    const float bias[3] = {0.05f, -0.1f, 0.2f};
+    const int targets[2] = {2, 0};
+    const char* trainables[2] = {"linear.weight", "linear.bias"};
+
+    begin_graph();
+    g_use_vulkan = g_use_nnapi = g_use_opengl = g_use_metal = 0;
+    g_use_cuda = use_cuda;
+    if (use_cuda && cuda_init() != 0) {
+        CHECK(finish_graph() == 0);
+        return cuda_init_failure_is_unavailable() ? 1 : -1;
+    }
+    CHECK(volvoxai_engine_require_training_backend(
+        use_cuda ? VOLVOXAI_BACKEND_CUDA : VOLVOXAI_BACKEND_CPU) == 0);
+    CHECK(add_tensor("linear.input", input_shape, 2, input));
+    CHECK(add_tensor("linear.weight", weight_shape, 2, weight));
+    CHECK(add_tensor("linear.bias", bias_shape, 1, bias));
+    CHECK(add_tensor("logits", output_shape, 2, NULL));
+    Node* node = add_node("Linear", "logits",
+                          "{\"weight_layout\":\"OUT_IN\"}");
+    CHECK(node && node_input(node, "input", "linear.input") == 0 &&
+          node_input(node, "weight", "linear.weight") == 0 &&
+          node_input(node, "bias", "linear.bias") == 0);
+    CHECK(volvoxai_engine_train_step("logits", targets, 2, INT_MIN,
+        trainables, 2, 2, 0.025f, 0.9f, 0.999f, 1.0e-8f,
+        0.0f, 0.0f, 11, NULL, NULL, NULL) == 0);
+    CHECK(volvoxai_engine_last_training_backend() ==
+          (use_cuda ? VOLVOXAI_BACKEND_CUDA : VOLVOXAI_BACKEND_CPU));
+    CHECK(volvoxai_engine_copy_tensor_f32(
+        "linear.weight", updated_weight, 6) == 0);
+    CHECK(volvoxai_engine_copy_tensor_f32(
+        "linear.bias", updated_bias, 3) == 0);
+    CHECK(volvoxai_engine_require_training_backend(VOLVOXAI_BACKEND_CPU) == 0);
+    return finish_graph();
+}
+
+static int test_cuda_linear_runtime_optional(void) {
+    float cpu_weight[6];
+    float cuda_weight[6];
+    float cpu_bias[3];
+    float cuda_bias[3];
+    CHECK(run_linear_runtime_parity_case(0, cpu_weight, cpu_bias) == 0);
+    int cuda_result = run_linear_runtime_parity_case(
+        1, cuda_weight, cuda_bias);
+    if (cuda_result == 1) {
+        puts("native CUDA Linear TrainStep integration skipped: no CUDA device");
+        return 0;
+    }
+    CHECK(cuda_result == 0);
+    for (int index = 0; index < 6; index++)
+        CHECK(fabsf(cpu_weight[index] - cuda_weight[index]) < 2.0e-6f);
+    for (int index = 0; index < 3; index++)
+        CHECK(fabsf(cpu_bias[index] - cuda_bias[index]) < 2.0e-6f);
+    return 0;
+}
+
+static int run_composed_runtime_parity_case(int use_cuda, float* updated_weight,
+                                            float* updated_bias,
+                                            float* updated_offset) {
+    const int input_shape[2] = {2, 2};
+    const int weight_shape[2] = {3, 2};
+    const int channel_shape[1] = {3};
+    const int output_shape[2] = {2, 3};
+    const float input[4] = {1.0f, -0.5f, -0.75f, 1.5f};
+    const float weight[6] = {0.2f, -0.4f, 0.1f, 0.3f, -0.5f, 0.25f};
+    const float bias[3] = {0.05f, -0.1f, 0.2f};
+    const float offset[3] = {0.125f, -0.25f, 0.375f};
+    const int targets[2] = {1, 2};
+    const char* trainables[3] = {
+        "composed.weight", "composed.bias", "composed.offset",
+    };
+
+    begin_graph();
+    g_use_vulkan = g_use_nnapi = g_use_opengl = g_use_metal = 0;
+    g_use_cuda = use_cuda;
+    if (use_cuda && cuda_init() != 0) {
+        CHECK(finish_graph() == 0);
+        return cuda_init_failure_is_unavailable() ? 1 : -1;
+    }
+    CHECK(volvoxai_engine_require_training_backend(
+        use_cuda ? VOLVOXAI_BACKEND_CUDA : VOLVOXAI_BACKEND_CPU) == 0);
+    CHECK(add_tensor("composed.input", input_shape, 2, input));
+    CHECK(add_tensor("composed.weight", weight_shape, 2, weight));
+    CHECK(add_tensor("composed.bias", channel_shape, 1, bias));
+    CHECK(add_tensor("composed.offset", channel_shape, 1, offset));
+    CHECK(add_tensor("composed.linear", output_shape, 2, NULL));
+    CHECK(add_tensor("composed.relu", output_shape, 2, NULL));
+    CHECK(add_tensor("logits", output_shape, 2, NULL));
+    Node* node = add_node("Linear", "composed.linear",
+                          "{\"weight_layout\":\"OUT_IN\"}");
+    CHECK(node && node_input(node, "input", "composed.input") == 0 &&
+          node_input(node, "weight", "composed.weight") == 0 &&
+          node_input(node, "bias", "composed.bias") == 0);
+    node = add_node("ReLU", "composed.relu", NULL);
+    CHECK(node && node_input(node, "input", "composed.linear") == 0);
+    node = add_node("Add", "logits", NULL);
+    CHECK(node && node_input(node, "a", "composed.relu") == 0 &&
+          node_input(node, "b", "composed.offset") == 0);
+    CHECK(volvoxai_engine_train_step("logits", targets, 2, INT_MIN,
+        trainables, 3, 2, 0.02f, 0.9f, 0.999f, 1.0e-8f,
+        0.0f, 0.0f, 13, NULL, NULL, NULL) == 0);
+    CHECK(volvoxai_engine_last_training_backend() ==
+          (use_cuda ? VOLVOXAI_BACKEND_CUDA : VOLVOXAI_BACKEND_CPU));
+    CHECK(volvoxai_engine_copy_tensor_f32(
+        "composed.weight", updated_weight, 6) == 0);
+    CHECK(volvoxai_engine_copy_tensor_f32(
+        "composed.bias", updated_bias, 3) == 0);
+    CHECK(volvoxai_engine_copy_tensor_f32(
+        "composed.offset", updated_offset, 3) == 0);
+    CHECK(volvoxai_engine_require_training_backend(VOLVOXAI_BACKEND_CPU) == 0);
+    return finish_graph();
+}
+
+static int test_cuda_composed_runtime_optional(void) {
+    float cpu_weight[6], cuda_weight[6];
+    float cpu_bias[3], cuda_bias[3];
+    float cpu_offset[3], cuda_offset[3];
+    CHECK(run_composed_runtime_parity_case(
+        0, cpu_weight, cpu_bias, cpu_offset) == 0);
+    int cuda_result = run_composed_runtime_parity_case(
+        1, cuda_weight, cuda_bias, cuda_offset);
+    if (cuda_result == 1) {
+        puts("native CUDA composed TrainStep integration skipped: no CUDA device");
+        return 0;
+    }
+    CHECK(cuda_result == 0);
+    for (int index = 0; index < 6; index++)
+        CHECK(fabsf(cpu_weight[index] - cuda_weight[index]) < 2.0e-6f);
+    for (int index = 0; index < 3; index++) {
+        CHECK(fabsf(cpu_bias[index] - cuda_bias[index]) < 2.0e-6f);
+        CHECK(fabsf(cpu_offset[index] - cuda_offset[index]) < 2.0e-6f);
+    }
+    return 0;
+}
+
+static int run_attention_runtime_parity_case(
+        int use_cuda, float* updated_qkv, float* updated_q,
+        float* updated_k, float* updated_v) {
+    const int qkv_shape[2] = {2, 6};
+    const int vector_shape[2] = {2, 2};
+    const int mask_shape[2] = {2, 2};
+    const float qkv[12] = {
+        0.4f, -0.2f, 0.1f, 0.5f, 0.7f, -0.3f,
+        -0.1f, 0.6f, 0.3f, -0.4f, 0.2f, 0.8f,
+    };
+    const float q[4] = {0.4f, -0.2f, -0.1f, 0.6f};
+    const float k[4] = {0.1f, 0.5f, 0.3f, -0.4f};
+    const float v[4] = {0.7f, -0.3f, 0.2f, 0.8f};
+    const int32_t mask[4] = {1, 1, 1, 0};
+    const int targets[2] = {0, 1};
+    const char* qkv_trainable[1] = {"attention.qkv"};
+    const char* cross_trainables[3] = {
+        "attention.q", "attention.k", "attention.v",
+    };
+
+    begin_graph();
+    g_use_vulkan = g_use_nnapi = g_use_opengl = g_use_metal = 0;
+    g_use_cuda = use_cuda;
+    if (use_cuda && cuda_init() != 0) {
+        CHECK(finish_graph() == 0);
+        return cuda_init_failure_is_unavailable() ? 1 : -1;
+    }
+    CHECK(volvoxai_engine_require_training_backend(
+        use_cuda ? VOLVOXAI_BACKEND_CUDA : VOLVOXAI_BACKEND_CPU) == 0);
+    CHECK(add_tensor("attention.qkv", qkv_shape, 2, qkv));
+    CHECK(add_i32_tensor("attention.mask", mask_shape, 2, mask));
+    CHECK(add_tensor("logits", vector_shape, 2, NULL));
+    Node* node = add_node("SDPA", "logits",
+        "{\"heads\":1,\"scale\":0.7071067811865475,\"causal\":false,"
+        "\"dropout\":0.5,\"dropout_seed\":18}");
+    CHECK(node && node_input(node, "qkv", "attention.qkv") == 0 &&
+          node_input(node, "mask", "attention.mask") == 0);
+    CHECK(volvoxai_engine_train_step("logits", targets, 2, INT_MIN,
+        qkv_trainable, 1, 2, 0.1f, 0.9f, 0.999f, 1.0e-8f,
+        0.0f, 0.0f, 7, NULL, NULL, NULL) == 0);
+    CHECK(volvoxai_engine_last_training_backend() ==
+          (use_cuda ? VOLVOXAI_BACKEND_CUDA : VOLVOXAI_BACKEND_CPU));
+    CHECK(volvoxai_engine_copy_tensor_f32(
+        "attention.qkv", updated_qkv, 12) == 0);
+    CHECK(volvoxai_engine_require_training_backend(VOLVOXAI_BACKEND_CPU) == 0);
+    CHECK(finish_graph() == 0);
+
+    begin_graph();
+    g_use_vulkan = g_use_nnapi = g_use_opengl = g_use_metal = 0;
+    g_use_cuda = use_cuda;
+    if (use_cuda) CHECK(cuda_init() == 0);
+    CHECK(volvoxai_engine_require_training_backend(
+        use_cuda ? VOLVOXAI_BACKEND_CUDA : VOLVOXAI_BACKEND_CPU) == 0);
+    CHECK(add_tensor("attention.q", vector_shape, 2, q));
+    CHECK(add_tensor("attention.k", vector_shape, 2, k));
+    CHECK(add_tensor("attention.v", vector_shape, 2, v));
+    CHECK(add_i32_tensor("attention.mask", mask_shape, 2, mask));
+    CHECK(add_tensor("logits", vector_shape, 2, NULL));
+    node = add_node("CrossSDPA", "logits",
+        "{\"heads\":1,\"scale\":0.7071067811865475,\"causal\":false,"
+        "\"attention_dropout\":0.5,\"training_seed\":18}");
+    CHECK(node && node_input(node, "q", "attention.q") == 0 &&
+          node_input(node, "k", "attention.k") == 0 &&
+          node_input(node, "v", "attention.v") == 0 &&
+          node_input(node, "mask", "attention.mask") == 0);
+    CHECK(volvoxai_engine_train_step("logits", targets, 2, INT_MIN,
+        cross_trainables, 3, 2, 0.1f, 0.9f, 0.999f, 1.0e-8f,
+        0.0f, 0.0f, 7, NULL, NULL, NULL) == 0);
+    CHECK(volvoxai_engine_last_training_backend() ==
+          (use_cuda ? VOLVOXAI_BACKEND_CUDA : VOLVOXAI_BACKEND_CPU));
+    CHECK(volvoxai_engine_copy_tensor_f32(
+        "attention.q", updated_q, 4) == 0);
+    CHECK(volvoxai_engine_copy_tensor_f32(
+        "attention.k", updated_k, 4) == 0);
+    CHECK(volvoxai_engine_copy_tensor_f32(
+        "attention.v", updated_v, 4) == 0);
+    CHECK(volvoxai_engine_require_training_backend(VOLVOXAI_BACKEND_CPU) == 0);
+    return finish_graph();
+}
+
+static int test_cuda_attention_runtime_optional(void) {
+    float cpu_qkv[12], cuda_qkv[12];
+    float cpu_q[4], cuda_q[4], cpu_k[4], cuda_k[4], cpu_v[4], cuda_v[4];
+    CHECK(run_attention_runtime_parity_case(
+        0, cpu_qkv, cpu_q, cpu_k, cpu_v) == 0);
+    int cuda_result = run_attention_runtime_parity_case(
+        1, cuda_qkv, cuda_q, cuda_k, cuda_v);
+    if (cuda_result == 1) {
+        puts("native CUDA attention TrainStep integration skipped: no CUDA device");
+        return 0;
+    }
+    CHECK(cuda_result == 0);
+    for (int index = 0; index < 12; index++)
+        CHECK(fabsf(cpu_qkv[index] - cuda_qkv[index]) < 8.0e-4f);
+    for (int index = 0; index < 4; index++) {
+        CHECK(fabsf(cpu_q[index] - cuda_q[index]) < 8.0e-4f);
+        CHECK(fabsf(cpu_k[index] - cuda_k[index]) < 8.0e-4f);
+        CHECK(fabsf(cpu_v[index] - cuda_v[index]) < 8.0e-4f);
+    }
+    return 0;
+}
+#endif
 
 static int test_attention_dropout_training_and_inference(void) {
     const int qkv_shape[2] = {2, 6};
@@ -1861,8 +2124,59 @@ static int test_weighted_multi_loss_accumulation(void) {
     return finish_graph();
 }
 
+#if VOLVOXAI_ENABLE_CUDA
+#include "test_training_cuda_conv_norm_shape.inc"
+#include "test_training_cuda_moe.inc"
+#include "test_training_cuda_accum_optimizer.inc"
+#endif
+
+static int test_training_state_is_context_owned(VxEngineState* first) {
+    VxEngineState* second = (VxEngineState*)calloc(1, sizeof(*second));
+    CHECK(first && second && vx_engine_state_init(second) == 0);
+    first->native_training_mode = 1;
+    first->native_training_counter = 41;
+    first->required_training_backend = NATIVE_GPU_TRAINING_VULKAN;
+    first->last_training_backend = NATIVE_GPU_TRAINING_OPENGL;
+    first->dynamic_autograd_forward_capture = 1;
+    first->dynamic_autograd_forward_backend = VOLVOXAI_BACKEND_CUDA;
+    first->training_accumulation.active = 1;
+    first->optimizer_states[0].numel = 17;
+    first->gpu_training_dummy[0] = 29;
+    CHECK(second->native_training_mode == 0 &&
+          second->native_training_counter == 0 &&
+          second->required_training_backend == NATIVE_GPU_TRAINING_NONE &&
+          second->last_training_backend == NATIVE_GPU_TRAINING_NONE &&
+          second->dynamic_autograd_forward_capture == 0 &&
+          second->dynamic_autograd_forward_backend == -1 &&
+          second->training_accumulation.active == 0 &&
+          second->optimizer_states[0].numel == 0 &&
+          second->gpu_training_dummy[0] == 0);
+    second->native_training_counter = 73;
+    CHECK(first->native_training_counter == 41);
+    first->native_training_mode = 0;
+    first->native_training_counter = 0;
+    first->required_training_backend = NATIVE_GPU_TRAINING_NONE;
+    first->last_training_backend = NATIVE_GPU_TRAINING_NONE;
+    first->dynamic_autograd_forward_capture = 0;
+    first->dynamic_autograd_forward_backend = -1;
+    first->training_accumulation.active = 0;
+    first->optimizer_states[0].numel = 0;
+    first->gpu_training_dummy[0] = 0;
+    vx_engine_state_deinit(second);
+    free(second);
+    return 0;
+}
+
 int main(void) {
-    CHECK(test_public_backend_bypasses_training_tape() == 0);
+    VxEngineState* state = (VxEngineState*)calloc(1, sizeof(*state));
+    VxEngineStateScope scope;
+    if (!state || vx_engine_state_init(state) != 0) {
+        free(state);
+        return 1;
+    }
+    scope = vx_engine_state_scope_enter(state);
+    CHECK(test_training_state_is_context_owned(state) == 0);
+    CHECK(test_training_backend_policy_ids() == 0);
     CHECK(test_gelu_exact_and_tanh() == 0);
     CHECK(test_transformer_backward() == 0);
     CHECK(test_cnn_backward() == 0);
@@ -1877,6 +2191,16 @@ int main(void) {
     CHECK(test_native_seq2seq_training() == 0);
     CHECK(test_groupnorm_training() == 0);
     CHECK(test_dropout_training_and_inference() == 0);
+#if VOLVOXAI_ENABLE_CUDA
+    CHECK(test_cuda_dropout_runtime_optional() == 0);
+    CHECK(test_cuda_linear_runtime_optional() == 0);
+    CHECK(test_cuda_composed_runtime_optional() == 0);
+    CHECK(test_cuda_attention_runtime_optional() == 0);
+    CHECK(test_cuda_conv_norm_shape_runtime_optional() == 0);
+    CHECK(test_cuda_moe_runtime_optional() == 0);
+    CHECK(test_cuda_accum_optimizer_runtime_optional() == 0);
+    CHECK(test_cuda_optimizer_handoff_checkpoint_runtime_optional() == 0);
+#endif
     CHECK(test_attention_dropout_training_and_inference() == 0);
     CHECK(test_train_step_global_gradient_clipping() == 0);
     CHECK(test_shape_aware_broadcast_and_reduction_backward() == 0);
@@ -1886,6 +2210,10 @@ int main(void) {
     CHECK(test_append_first_node() == 0);
     CHECK(test_patch_graph_transactions() == 0);
     CHECK(test_vulkan_engine_train_step_optional() == 0);
+    volvoxai_engine_shutdown();
+    vx_engine_state_scope_leave(scope);
+    vx_engine_state_deinit(state);
+    free(state);
     puts("native training backward tests passed");
     return 0;
 }

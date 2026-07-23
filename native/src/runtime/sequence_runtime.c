@@ -265,7 +265,7 @@ int vx_sequence_node_run(Node* node, long element_offset, int element_count,
         if (backend_name) *backend_name = "cpu";
         return sequence_unary(node, element_offset, element_count, 0);
     }
-    if (!strcmp(node->op, "RoPE") || !strcmp(node->op, "RotaryEmbedding")) {
+    if (!strcmp(node->op, "RoPE")) {
         if (backend_name) *backend_name = "cpu-rope";
         return sequence_rope(node);
     }

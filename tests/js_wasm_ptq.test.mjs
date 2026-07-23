@@ -8,13 +8,11 @@ import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
 
 import {
-  WASM_PTQ_ABI_VERSION,
-  WasmEngine,
-  WasmPTQ,
-  WasmVolvoxAI,
+  PTQ,
   createPTQ,
-  createWasmPTQ,
 } from '../ts/wasm.js';
+import { WasmEngine } from '../ts/backends/WasmEngine.js';
+import { WASM_PTQ_ABI_VERSION } from '../ts/training/WasmPTQ.js';
 
 const run = promisify(execFile);
 const repositoryRoot = fileURLToPath(new URL('../', import.meta.url));
@@ -46,7 +44,7 @@ function close(actual, expected, tolerance = 1e-6) {
   );
 }
 
-test('WasmPTQ exposes generic C PTQ through an isolated scratch instance', {
+test('PTQ exposes generic C PTQ through an isolated scratch instance', {
   timeout: 120_000,
 }, async (t) => {
   try {
@@ -113,20 +111,10 @@ test('WasmPTQ exposes generic C PTQ through an isolated scratch instance', {
     const sentinel = new Uint8Array(engine.mem.buffer, sentinelPointer, 16);
     sentinel.set([1, 3, 5, 7, 9, 11, 13, 15]);
 
-    const originalFork = engine.fork.bind(engine);
-    let ptqForkOptions = null;
-    engine.fork = async (options) => {
-      ptqForkOptions = options;
-      return originalFork(options);
-    };
-    const ptq = await createWasmPTQ(engine);
-    assert.ok(ptq instanceof WasmPTQ);
-    assert.deepEqual(ptqForkOptions, { relaxedSimd: false });
+    const ptq = await createPTQ({ wasmUrl: fullPath });
+    assert.ok(ptq instanceof PTQ);
     assert.equal(ptq.abiVersion, WASM_PTQ_ABI_VERSION);
     assert.equal(ptq.capabilities, 0x1f);
-    assert.equal(typeof createPTQ, 'function');
-    assert.equal(typeof WasmVolvoxAI.prototype.createPTQ, 'function');
-    assert.equal(typeof WasmVolvoxAI.prototype.createWasmPTQ, 'function');
 
     const observer = ptq.createObserver();
     observer.observe(Float32Array.of(-2, 1));
@@ -224,10 +212,8 @@ test('WasmPTQ exposes generic C PTQ through an isolated scratch instance', {
       /disposed/,
     );
 
-    const inferenceEngine = await WasmEngine.init(inferencePath);
-    assert.ok(inferenceEngine);
     await assert.rejects(
-      createWasmPTQ(inferenceEngine),
+      createPTQ({ wasmUrl: inferencePath }),
       /missing PTQ export/,
     );
   } finally {

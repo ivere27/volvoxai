@@ -61,7 +61,7 @@ fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
     }
     if (output_index >= params.dimensions.w) { continue; }
     var selected = indices[output_index];
-    // GatherElements, unlike Gather, accepts ONNX-style negative indices.
+    // ONNX gather-family indices normalize once by the selected axis size.
     if (selected < 0) { selected = selected + i32(input_dim(axis)); }
     if (selected == i32(axis_coordinate)) {
       sum = sum + grad_output[output_index];

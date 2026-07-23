@@ -145,7 +145,7 @@ fn weight_word_padded(base : u32, count : u32, zero_point : i32) -> u32 {
 
 fn typed_byte(word : u32, lane : u32, dtype : u32) -> i32 {
   let value = (word >> (lane * 8u)) & 255u;
-  if (dtype == 2u && value >= 128u) { return i32(value) - 256; }
+  if (dtype == 6u && value >= 128u) { return i32(value) - 256; }
   return i32(value);
 }
 
@@ -179,8 +179,8 @@ fn output_byte(value : i32) -> u32 {
 fn requantize(accumulator : i32, channel : u32) -> u32 {
   let multiplier = (params.input_scale * weight_scales[channel]) / params.output_scale;
   let transformed = f32(accumulator) * multiplier + f32(params.output_zero_point);
-  let minimum = select(0, -128, params.output_type == 2u);
-  let maximum = select(255, 127, params.output_type == 2u);
+  let minimum = select(0, -128, params.output_type == 6u);
+  let maximum = select(255, 127, params.output_type == 6u);
   var quantized : i32;
   if (transformed != transformed) { quantized = params.output_zero_point; }
   else if (transformed <= f32(minimum)) { quantized = minimum; }

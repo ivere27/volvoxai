@@ -1,5 +1,5 @@
-// Generates a small CNN blueprint (config.json + .safetensors + input.f32), runs it
-// through the JS CPUEngine to capture the reference output, and writes everything to
+// Generates a small CNN graph document (graph.json + .safetensors + input.f32), runs it
+// through the public CPU runtime to capture the reference output, and writes everything to
 // an output dir. The native C engine consumes the same files.
 // Usage: node tools/gen_test_model.mjs <outdir>
 import { writeFileSync, mkdirSync, readFileSync } from 'node:fs';
@@ -8,7 +8,7 @@ import { join } from 'node:path';
 const packageVersion = JSON.parse(
   readFileSync(new URL('../package.json', import.meta.url), 'utf8'),
 ).version;
-const { Graph, CPUEngine } = await import(
+const { Graph, VolvoxAI } = await import(
   new URL(`../dist/${packageVersion}/volvoxai.js`, import.meta.url)
 );
 
@@ -36,24 +36,40 @@ t = g.addOp('Add', { a: t, b: t }, { out: [1, 4, 4, 16] }).out;      // same-sha
 t = g.addOp('GlobalAveragePool', { input: t }, { out: [1, 1, 1, 16] }).out;
 t = g.addOp('Reshape', { input: t }, { out: [1, 16] }).out;
 t = g.addOp('MatMul', { input: t, weight: W('fc.w', [16, 10], 8), bias: W('fc.b', [10], 9) }, { out: [1, 10] }).out;
-g.outputNames = [t.name];
+g.setOutputs(t);
 
-// ---- reference run on the JS CPU engine ----
+// ---- reference run on the JS CPU runtime ----
 const input = fill(1 * 8 * 8 * 3, 42);
-const cpu = new CPUEngine();
-cpu.allocateGraph(g);
-const res = await cpu.execute(g, { x: input });
-const expected = Array.from(res[t.name]);
+const runtime = await VolvoxAI.createRuntime({ backends: ['cpu'] });
+const model = runtime.createModel(g);
+let compiled;
+let context;
+let result;
+let expected;
+try {
+  compiled = await model.compile({
+    backend: { mode: 'require', backend: 'cpu', operatorFallback: 'forbid' },
+  });
+  context = await compiled.createContext();
+  result = await context.execute({ x: input });
+  expected = Array.from(await result.output(t.name).read());
+} finally {
+  await result?.close();
+  await context?.close();
+  await compiled?.close();
+  await model.close();
+  await runtime.close();
+}
 
-// ---- serialize blueprint the native engine (and GraphLoader) can read ----
-const config = { inputs: { x: { shape: x.shape, dtype: 'float32' } }, nodes: [] };
+// ---- serialize graph document the native engine (and GraphLoader) can read ----
+const graphDocument = { format: 'volvox-graph/v1', inputs: { x: { shape: x.shape, dtype: 'float32' } }, nodes: [] };
 for (const node of g.nodes) {
   const inputs = {}; for (const [k, tt] of Object.entries(node.inputs)) inputs[k] = tt.name;
   const outputs = {}, outputs_shape = {};
   for (const [k, tt] of Object.entries(node.outputs)) { outputs[k] = tt.name; outputs_shape[k] = tt.shape; }
-  config.nodes.push({ opType: node.opType, inputs, outputs, outputs_shape, params: node.params });
+  graphDocument.nodes.push({ opType: node.opType, inputs, outputs, outputs_shape, params: node.params });
 }
-writeFileSync(join(outdir, 'config.json'), JSON.stringify(config, null, 1));
+writeFileSync(join(outdir, 'graph.json'), JSON.stringify(graphDocument, null, 1));
 
 // ---- safetensors (F32 weights) ----
 const header = {}; let offset = 0; const chunks = [];
@@ -77,5 +93,5 @@ writeFileSync(join(outdir, 'model.safetensors'), out);
 // ---- input + expected ----
 writeFileSync(join(outdir, 'input.f32'), Buffer.from(input.buffer));
 writeFileSync(join(outdir, 'expected.json'), JSON.stringify(expected));
-console.log(`wrote ${outdir}/ {config.json, model.safetensors, input.f32, expected.json}`);
+console.log(`wrote ${outdir}/ {graph.json, model.safetensors, input.f32, expected.json}`);
 console.log('JS reference output:', expected.map((v) => v.toFixed(5)).join(' '));

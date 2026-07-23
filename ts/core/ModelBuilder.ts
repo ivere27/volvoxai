@@ -1,12 +1,14 @@
 import { Graph } from './Graph.js';
+import { SafetensorsFile } from './Safetensors.js';
 import type { Tensor } from './Tensor.js';
 import type {
   AdapterDescription,
+  AdapterSelector,
   AdapterSpec,
   AdapterStageOptions,
   AdapterVersion,
   AddTensorOptions,
-  BlueprintConfig,
+  GraphDocument,
   GraphNode,
   GraphNodePatch,
   GraphNodeSpec,
@@ -14,9 +16,8 @@ import type {
   NodeOutputSpec,
   NodeParameters,
   RuntimeDType,
-  SerializedQuantization,
+  SerializedAffineQuantizationReference,
   TensorPatch,
-  TensorQuantization,
   TensorReference,
   TensorStorage,
 } from '../types.js';
@@ -54,29 +55,9 @@ interface MoeLinearOptions {
   name?: string;
 }
 
-interface AdapterRoute {
-  name: string;
-  version?: AdapterVersion;
-  scale: number;
-}
-
-function serializeQuantization(quantization: null): null;
-function serializeQuantization(quantization: TensorQuantization): SerializedQuantization;
-function serializeQuantization(quantization: TensorQuantization | null): SerializedQuantization | null {
-  if (!quantization) return null;
-  if (quantization.scheme === 'per_axis') {
-    return {
-      scheme: quantization.scheme,
-      axis: quantization.axis,
-      scales: [...quantization.scales],
-      zero_points: [...quantization.zero_points],
-    };
-  }
-  return {
-    scheme: quantization.scheme,
-    scale: quantization.scale,
-    zero_point: quantization.zero_point,
-  };
+export interface ModelBuilderGraphPackage {
+  graph: GraphDocument;
+  quantizationParameters: SafetensorsFile;
 }
 
 /**
@@ -118,15 +99,6 @@ export class ModelBuilder {
     return this.graph.addTensor(name, shape, dtype, options);
   }
 
-  addTensor(
-    name: string,
-    shape: readonly number[],
-    dtype: RuntimeDType = "float32",
-    options: AddTensorOptions = {},
-  ): Tensor {
-    return this.tensor(name, shape, dtype, options);
-  }
-
   input(
     name: string,
     shape: readonly number[],
@@ -134,15 +106,6 @@ export class ModelBuilder {
     options: AddTensorOptions = {},
   ): Tensor {
     return this.graph.addInput(name, shape, dtype, options);
-  }
-
-  addInput(
-    name: string,
-    shape: readonly number[],
-    dtype: RuntimeDType = "float32",
-    options: AddTensorOptions = {},
-  ): Tensor {
-    return this.input(name, shape, dtype, options);
   }
 
   weight(
@@ -155,15 +118,6 @@ export class ModelBuilder {
       ? { buffer: dataOrOptions }
       : dataOrOptions;
     return this.graph.addWeight(name, shape, dtype, options);
-  }
-
-  addWeight(
-    name: string,
-    shape: readonly number[],
-    dtype: RuntimeDType = "float32",
-    dataOrOptions: AddTensorOptions | TensorStorage = {},
-  ): Tensor {
-    return this.weight(name, shape, dtype, dataOrOptions);
   }
 
   getTensor(name: string): Tensor | undefined {
@@ -186,11 +140,7 @@ export class ModelBuilder {
     return this.graph.addNode(spec);
   }
 
-  node(spec: ConcreteNodeSpec): ConcreteNode {
-    return this.addNode(spec);
-  }
-
-  /** Existing Graph.addOp-compatible convenience that returns output tensors. */
+  /** Add an operator and return its named output tensors. */
   addOp(
     opType: string,
     inputs: Record<string, ConcreteTensorReference>,
@@ -199,16 +149,6 @@ export class ModelBuilder {
     options: NodeOptions = {},
   ): Record<string, Tensor> {
     return this.graph.addNode({ ...options, opType, inputs, outputs, params }).outputs;
-  }
-
-  op(
-    opType: string,
-    inputs: Record<string, ConcreteTensorReference>,
-    outputs: Record<string, NodeOutputSpec<Tensor>>,
-    params: NodeParameters = {},
-    options: NodeOptions = {},
-  ): Record<string, Tensor> {
-    return this.addOp(opType, inputs, outputs, params, options);
   }
 
   /** Add NHWC GroupNorm with trainable per-channel affine tensors supplied by the caller. */
@@ -336,18 +276,18 @@ export class ModelBuilder {
   }
 
   /** Build an execution selector accepted by CPU and WebGPU execute(). */
-  adapterRoute(name: string | null, version?: AdapterVersion, scale = 1): AdapterRoute | null {
+  adapterRoute(name: string | null, version?: number, scale = 1): AdapterSelector | null {
     if (name == null) return null;
     return { name, ...(version == null ? {} : { version }), scale };
   }
 
   /** Build per-request or per-batch adapter routing options. */
-  adapterRouting(...routes: Array<AdapterRoute | null | readonly (AdapterRoute | null)[]>): {
-    adapters: readonly (AdapterRoute | null)[];
+  adapterRouting(...routes: Array<AdapterSelector | null | readonly (AdapterSelector | null)[]>): {
+    adapters: readonly (AdapterSelector | null)[];
   } {
-    const list: readonly (AdapterRoute | null)[] = routes.length === 1 && Array.isArray(routes[0])
+    const list: readonly (AdapterSelector | null)[] = routes.length === 1 && Array.isArray(routes[0])
       ? routes[0]
-      : routes as Array<AdapterRoute | null>;
+      : routes as Array<AdapterSelector | null>;
     return { adapters: list };
   }
 
@@ -408,15 +348,16 @@ export class ModelBuilder {
     return this.graph;
   }
 
-  /** Export the graph as a Volvox blueprint config (weights remain external). */
-  toConfig({ includeOutputs = true }: { includeOutputs?: boolean } = {}): BlueprintConfig {
-    const inputs: BlueprintConfig['inputs'] = {};
+  private _graphDocument(
+    quantizationReferences: ReadonlyMap<string, SerializedAffineQuantizationReference>,
+    nodeInputOverrides: ReadonlyMap<ConcreteNode, ReadonlyMap<string, string>> = new Map(),
+  ): GraphDocument {
+    const inputs: GraphDocument['inputs'] = {};
     for (const tensor of this.graph.tensors.values()) {
       if (tensor.isInput) {
         inputs[tensor.name] = {
           shape: [...tensor.shape],
           dtype: tensor.dtype,
-          ...(tensor.quantization ? { quantization: serializeQuantization(tensor.quantization) } : {}),
         };
       }
     }
@@ -429,32 +370,239 @@ export class ModelBuilder {
         const inputChannels = (node.inputs.input || node.inputs.x)?.shape?.at(-1);
         params.weight_layout = params.groups === inputChannels ? "HWCM" : "HWIO";
       }
-      const outputsQuantization = Object.fromEntries(
-        Object.entries(node.outputs || {})
-          .filter(([, tensor]) => tensor.quantization)
-          .map(([key, tensor]) => [key, serializeQuantization(tensor.quantization!)]),
+      const inputs = Object.fromEntries(
+        Object.entries(node.inputs || {}).map(([key, tensor]) => [key, tensor.name]),
       );
+      for (const [key, name] of nodeInputOverrides.get(node) || []) inputs[key] = name;
       return {
         id: node.id,
         opType: node.opType,
-        inputs: Object.fromEntries(Object.entries(node.inputs || {}).map(([key, tensor]) => [key, tensor.name])),
+        inputs,
         outputs: Object.fromEntries(Object.entries(node.outputs || {}).map(([key, tensor]) => [key, tensor.name])),
         outputs_shape: Object.fromEntries(Object.entries(node.outputs || {}).map(([key, tensor]) => [key, [...tensor.shape]])),
         outputs_dtype: Object.fromEntries(Object.entries(node.outputs || {}).map(([key, tensor]) => [key, tensor.dtype])),
-        ...(Object.keys(outputsQuantization).length ? { outputs_quantization: outputsQuantization } : {}),
         params,
       };
     });
-    const weightsQuantization = Object.fromEntries(
-      [...this.graph.tensors.values()]
-        .filter((tensor) => tensor.isWeight && tensor.quantization)
-        .map((tensor) => [tensor.name, serializeQuantization(tensor.quantization!)]),
-    );
+    const quantization = Object.fromEntries(quantizationReferences);
     return {
+      format: 'volvox-graph/v1',
       inputs,
       nodes,
-      ...(Object.keys(weightsQuantization).length ? { weights_quantization: weightsQuantization } : {}),
-      ...(includeOutputs ? { outputs: [...this.graph.outputNames] } : {}),
+      ...(Object.keys(quantization).length ? {
+        quantization: {
+          format: 'volvox-affine-safetensors/v1' as const,
+          tensors: quantization,
+        },
+      } : {}),
+      outputs: [...this.graph.outputNames],
+    };
+  }
+
+  /** Export an unquantized graph document. Quantized graphs require the package API. */
+  toGraphDocument(): GraphDocument {
+    if ([...this.graph.tensors.values()].some((tensor) => tensor.quantization)) {
+      throw new Error(
+        'Quantized graphs must use toGraphPackage() so scale and zero-point data are emitted to Safetensors.',
+      );
+    }
+    return this._graphDocument(new Map());
+  }
+
+  /** Export graph.json plus the immutable Safetensors affine parameter shard. */
+  toGraphPackage(): ModelBuilderGraphPackage {
+    const parameterFile = SafetensorsFile.empty();
+    const references = new Map<string, SerializedAffineQuantizationReference>();
+    const existingNames = new Set(this.graph.tensors.keys());
+    const generatedDescriptors = new Map<string, SerializedAffineQuantizationReference>();
+    const boundaryDescriptors = new Map<string, SerializedAffineQuantizationReference>();
+    const nodeInputOverrides = new Map<ConcreteNode, Map<string, string>>();
+    let parameterId = 0;
+
+    const allocateParameterPair = (): [string, string] => {
+      let scaleName: string;
+      let zeroName: string;
+      do {
+        parameterId++;
+        scaleName = `__quant__.${parameterId}.scale`;
+        zeroName = `__quant__.${parameterId}.zero_point`;
+      } while (existingNames.has(scaleName) || existingNames.has(zeroName));
+      existingNames.add(scaleName);
+      existingNames.add(zeroName);
+      return [scaleName, zeroName];
+    };
+
+    const parameterValues = (tensor: Tensor): { scales: number[]; zeroPoints: number[] } => {
+      const quantization = tensor.quantization;
+      if (!quantization) {
+        throw new Error(`Quantization boundary tensor '${tensor.name}' has no affine descriptor.`);
+      }
+      return quantization.scheme === 'per_axis'
+        ? { scales: [...quantization.scales], zeroPoints: [...quantization.zero_points] }
+        : { scales: [quantization.scale], zeroPoints: [quantization.zero_point] };
+    };
+
+    const addParameter = (
+      name: string,
+      dtype: 'F32' | 'I8' | 'U8',
+      values: Float32Array | Int8Array | Uint8Array,
+    ): void => {
+      const existing = parameterFile.getTensor(name);
+      if (existing) {
+        const stored = parameterFile.toRuntimeTypedArray(existing);
+        if (existing.dtype !== dtype || existing.shape.length !== 1 ||
+            existing.shape[0] !== values.length || stored.length !== values.length ||
+            Array.from(stored).some((value, index) => !Object.is(value, values[index]))) {
+          throw new Error(`Quantization parameter tensor '${name}' has conflicting payloads.`);
+        }
+        return;
+      }
+      parameterFile.addTensor(name, dtype, [values.length], values);
+    };
+
+    const addExistingParameter = (
+      parameter: Tensor,
+      dtype: 'F32' | 'I8' | 'U8',
+      expectedValues: readonly number[],
+      targetName: string,
+    ): void => {
+      const expectedDtype = dtype === 'F32' ? 'float32' : dtype === 'I8' ? 'int8' : 'uint8';
+      const expectedClass = dtype === 'F32' ? Float32Array : dtype === 'I8' ? Int8Array : Uint8Array;
+      if (parameter.dtype !== expectedDtype || parameter.shape.length !== 1 ||
+          parameter.shape[0] !== expectedValues.length || !(parameter.buffer instanceof expectedClass) ||
+          parameter.buffer.length !== expectedValues.length) {
+        throw new Error(
+          `Quantization parameter '${parameter.name}' for '${targetName}' must be ` +
+          `a stored rank-1 ${expectedDtype} tensor of length ${expectedValues.length}.`,
+        );
+      }
+      for (let index = 0; index < expectedValues.length; index++) {
+        const expected = dtype === 'F32' ? Math.fround(expectedValues[index]) : expectedValues[index];
+        if (!Object.is(parameter.buffer[index], expected)) {
+          throw new Error(
+            `Quantization parameter '${parameter.name}' does not match '${targetName}' metadata at index ${index}.`,
+          );
+        }
+      }
+      addParameter(parameter.name, dtype, parameter.buffer as Float32Array | Int8Array | Uint8Array);
+    };
+
+    const descriptorFor = (
+      tensor: Tensor,
+      scaleName: string,
+      zeroName: string,
+    ): SerializedAffineQuantizationReference => tensor.quantization!.scheme === 'per_axis'
+      ? {
+          scheme: 'per_axis',
+          axis: tensor.quantization!.axis,
+          scale_tensor: scaleName,
+          zero_point_tensor: zeroName,
+        }
+      : {
+          scheme: 'per_tensor',
+          scale_tensor: scaleName,
+          zero_point_tensor: zeroName,
+        };
+
+    const bindBoundary = (node: ConcreteNode, target: Tensor): void => {
+      const quantization = target.quantization;
+      if (!quantization || (target.dtype !== 'int8' && target.dtype !== 'uint8')) {
+        throw new Error(
+          `${node.opType} node '${String(node.id)}' requires an affine I8/U8 boundary tensor.`,
+        );
+      }
+      const { scales, zeroPoints } = parameterValues(target);
+      const scale = node.inputs.scale;
+      if (!scale) {
+        throw new Error(`${node.opType} node '${String(node.id)}' requires a scale tensor input.`);
+      }
+      addExistingParameter(scale, 'F32', scales, target.name);
+      const zero = node.inputs.zero_point;
+      if (zero) {
+        addExistingParameter(zero, target.dtype === 'int8' ? 'I8' : 'U8', zeroPoints, target.name);
+      }
+
+      let descriptor = boundaryDescriptors.get(target.name);
+      if (!descriptor) {
+        let zeroName: string;
+        if (zero) {
+          zeroName = zero.name;
+        } else {
+          [, zeroName] = allocateParameterPair();
+          addParameter(
+            zeroName,
+            target.dtype === 'int8' ? 'I8' : 'U8',
+            target.dtype === 'int8' ? new Int8Array(zeroPoints) : new Uint8Array(zeroPoints),
+          );
+        }
+        descriptor = descriptorFor(target, scale.name, zeroName);
+        boundaryDescriptors.set(target.name, descriptor);
+      } else if (descriptor.scheme !== quantization.scheme ||
+                 (descriptor.scheme === 'per_axis' &&
+                  (quantization.scheme !== 'per_axis' || descriptor.axis !== quantization.axis))) {
+        throw new Error(`Quantization boundary tensor '${target.name}' has conflicting schemes.`);
+      }
+      let overrides = nodeInputOverrides.get(node);
+      if (!overrides) {
+        overrides = new Map();
+        nodeInputOverrides.set(node, overrides);
+      }
+      overrides.set('scale', descriptor.scale_tensor);
+      overrides.set('zero_point', descriptor.zero_point_tensor);
+    };
+
+    for (const node of this.graph.nodes) {
+      if (node.opType === 'QuantizeLinear') {
+        for (const target of Object.values(node.outputs || {})) bindBoundary(node, target);
+      } else if (node.opType === 'DequantizeLinear') {
+        const target = node.inputs.input;
+        if (!target) {
+          throw new Error(`DequantizeLinear node '${String(node.id)}' requires an input tensor.`);
+        }
+        bindBoundary(node, target);
+      }
+    }
+
+    for (const tensor of [...this.graph.tensors.values()]
+      .filter((value) => value.quantization)
+      .sort((left, right) => left.name.localeCompare(right.name))) {
+      const quantization = tensor.quantization!;
+      const scales = quantization.scheme === 'per_axis'
+        ? [...quantization.scales]
+        : [quantization.scale];
+      const zeroPoints = quantization.scheme === 'per_axis'
+        ? [...quantization.zero_points]
+        : [quantization.zero_point];
+      const key = JSON.stringify([
+        quantization.scheme,
+        quantization.scheme === 'per_axis' ? quantization.axis : null,
+        tensor.dtype,
+        scales,
+        zeroPoints,
+      ]);
+      let descriptor = boundaryDescriptors.get(tensor.name) || generatedDescriptors.get(key);
+      if (!descriptor) {
+        const [scaleName, zeroName] = allocateParameterPair();
+        addParameter(
+          scaleName,
+          'F32',
+          new Float32Array(scales),
+        );
+        addParameter(
+          zeroName,
+          tensor.dtype === 'int8' ? 'I8' : 'U8',
+          tensor.dtype === 'int8'
+            ? new Int8Array(zeroPoints)
+            : new Uint8Array(zeroPoints),
+        );
+        descriptor = descriptorFor(tensor, scaleName, zeroName);
+        generatedDescriptors.set(key, descriptor);
+      }
+      references.set(tensor.name, descriptor);
+    }
+    return {
+      graph: this._graphDocument(references, nodeInputOverrides),
+      quantizationParameters: parameterFile,
     };
   }
 }

@@ -4,7 +4,7 @@
 set -e
 bin="$1"
 "$bin" --help >/dev/null
-if nm "$bin" | grep -Eq ' (vk_init|opengl_init|metal_init|nnapi_init)$'; then
+if nm "$bin" | grep -Eq ' (vk_init|opengl_init|metal_init|nnapi_init|cuda_init)$'; then
   echo 'CPU-only binary unexpectedly contains a device backend.'
   exit 1
 fi

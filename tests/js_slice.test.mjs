@@ -5,7 +5,11 @@ import { _cpuSlice } from '../ts/ops/slice.js';
 
 function tensor(shape, values = null) {
   const elements = shape.reduce((count, dimension) => count * dimension, 1);
-  return { shape, buffer: values ? new Float32Array(values) : new Float32Array(elements) };
+  return {
+    shape,
+    dtype: 'float32',
+    buffer: values ? new Float32Array(values) : new Float32Array(elements),
+  };
 }
 
 test('CPU Slice maps canonical rank-five normalized axes and starts', () => {

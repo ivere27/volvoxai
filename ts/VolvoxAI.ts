@@ -3,25 +3,30 @@ import { WasmEngine } from './backends/WasmEngine.js';
 import { WebGPUEngine } from './backends/WebGPUEngine.js';
 import { WebNNEngine } from './backends/WebNNEngine.js';
 import {
-  InferenceRuntime,
-  caughtMessage,
-  checkedEngine,
-  type RuntimeEngine,
-} from './core/InferenceRuntime.js';
-import type {
-  BackendFactory,
-  BackendSelection,
-} from './types.js';
+  BuiltInBackendProvider,
+  assertBackendProvider,
+  type BackendProvider,
+  type BackendProviderFactory,
+} from './backends/BackendProvider.js';
+import { Runtime, type RuntimeOptions } from './core/ContextRuntime.js';
+import { VolvoxAIError } from './core/RuntimeErrors.js';
 
 const BUILTIN_BACKENDS = Object.freeze(['webnn', 'webgpu', 'wasm', 'cpu']);
-const BUILTIN_BACKEND_SET = new Set(BUILTIN_BACKENDS);
-const registeredBackendFactories = new Map<string, BackendFactory>();
+
+export type RuntimeProviderSource = BackendProvider | BackendProviderFactory;
+
+export interface CreateRuntimeOptions extends RuntimeOptions {
+  readonly backends?: readonly string[];
+  readonly providers?: Readonly<Record<string, RuntimeProviderSource>>;
+  readonly wasmUrl?: string | URL;
+}
 
 interface BrowserMLContextFactory {
   createContext(options: { deviceType: string }): Promise<unknown>;
 }
 
 interface BrowserGPUAdapter {
+  info?: import('./backends/WebGPUEngine.js').WebGPUAdapterIdentity;
   requestDevice(): Promise<GPUDevice>;
 }
 
@@ -40,164 +45,172 @@ function browserNavigator(): BrowserBackendNavigator | undefined {
     : navigator as Navigator & BrowserBackendNavigator;
 }
 
-function backendName(name: string): string {
+function checkedName(name: string): string {
   if (typeof name !== 'string' || !/^[a-z][a-z0-9._-]*$/.test(name)) {
-    throw new Error('[VolvoxAI] Backend names must begin with a lowercase letter and contain only lowercase letters, digits, dot, underscore, or dash.');
+    throw new VolvoxAIError('INVALID_ARGUMENT',
+      '[VolvoxAI] Backend names must begin with a lowercase letter and contain only lowercase letters, digits, dot, underscore, or dash.', {
+        phase: 'initialization',
+      });
   }
   return name;
 }
 
-export class VolvoxAI extends InferenceRuntime {
-
-  /** Register an out-of-tree browser backend without changing the core enum. */
-  static registerBackend(name: string, factory: BackendFactory): () => boolean {
-    name = backendName(name);
-    if (name === 'auto' || BUILTIN_BACKEND_SET.has(name)) {
-      throw new Error(`[VolvoxAI] Built-in backend '${name}' cannot be replaced.`);
-    }
-    if (typeof factory !== 'function') {
-      throw new Error(`[VolvoxAI] Backend '${name}' factory must be a function.`);
-    }
-    if (registeredBackendFactories.has(name)) {
-      throw new Error(`[VolvoxAI] Backend '${name}' is already registered.`);
-    }
-    registeredBackendFactories.set(name, factory);
-    return () => registeredBackendFactories.get(name) === factory &&
-      registeredBackendFactories.delete(name);
-  }
-
-  static unregisterBackend(name: string): boolean {
-    return registeredBackendFactories.delete(backendName(name));
-  }
-
-  static listBackends(): readonly string[] {
-    return Object.freeze([...BUILTIN_BACKENDS, ...registeredBackendFactories.keys()]);
-  }
-  
-  static async init(
-    preferredBackend: BackendSelection = "auto",
-    wasmUrl: string | URL = new URL("./volvoxai.wasm", import.meta.url),
-  ): Promise<VolvoxAI> {
-    const instance = new this();
-    const stringOrders: Record<string, readonly string[]> = {
-      auto: ["webnn", "webgpu", "wasm", "cpu"],
-      webnn: ["webnn", "wasm", "cpu"],
-      webgpu: ["webgpu", "wasm", "cpu"],
-      wasm: ["wasm", "cpu"],
-      cpu: ["cpu"],
-    };
-    const strictList = typeof preferredBackend !== 'string';
-    const order: string[] | null = typeof preferredBackend !== 'string'
-      ? [...preferredBackend]
-      : (stringOrders[preferredBackend] ? [...stringOrders[preferredBackend]] : null) ||
-        (registeredBackendFactories.has(preferredBackend) ? [preferredBackend] : null);
-
-    if (!order || order.length === 0) {
-      throw new Error(`[VolvoxAI] Invalid backend selection: ${JSON.stringify(preferredBackend)}`);
-    }
-
-    for (const backend of order) {
-      if (!BUILTIN_BACKEND_SET.has(backend) && !registeredBackendFactories.has(backend)) {
-        throw new Error(`[VolvoxAI] Unknown backend '${backend}'. Available backends: ${this.listBackends().join(', ')}.`);
-      }
-    }
-
-    const added = new Set();
-    for (const backend of order) {
-      if (added.has(backend)) continue;
-
-      if (backend === "webnn") {
-        const runtimeNavigator = browserNavigator();
-        if (runtimeNavigator?.ml) {
-          try {
-            const context = await runtimeNavigator.ml.createContext({ deviceType: 'npu' });
-            console.log("[VolvoxAI] WebNN Engine (NPU) Initialized successfully.");
-            instance.engines.push({
-              type: 'webnn',
-              engine: new WebNNEngine(context) as unknown as RuntimeEngine,
-            });
-            added.add(backend);
-          } catch (e) {
-            console.warn("[VolvoxAI] WebNN initialization failed.", caughtMessage(e));
-          }
-        } else if (strictList || preferredBackend === "webnn") {
-          console.warn("[VolvoxAI] WebNN is not supported.");
-        }
-      } else if (backend === "webgpu") {
-        const runtimeNavigator = browserNavigator();
-        if (runtimeNavigator?.gpu) {
-          try {
-            const adapter = await runtimeNavigator.gpu.requestAdapter();
-            if (adapter) {
-              const device = await adapter.requestDevice();
-              console.log("[VolvoxAI] WebGPU Engine Initialized successfully.");
-              instance.engines.push({
-                type: 'webgpu',
-                engine: new WebGPUEngine(device) as unknown as RuntimeEngine,
-                // Retain the old entry.device integration point for training.
-                device,
-              });
-              added.add(backend);
-            } else {
-              console.warn("[VolvoxAI] WebGPU adapter is not available.");
-            }
-          } catch (e) {
-            console.warn("[VolvoxAI] WebGPU initialization failed.", caughtMessage(e));
-          }
-        } else if (strictList || preferredBackend === "webgpu") {
-          console.warn("[VolvoxAI] WebGPU is not supported.");
-        }
-      } else if (backend === "wasm") {
-        const wasmEngine = await WasmEngine.init(wasmUrl);
-        if (wasmEngine) {
-          console.log("[VolvoxAI] WASM Engine Initialized successfully.");
-          instance.engines.push({
-            type: 'wasm',
-            engine: wasmEngine as unknown as RuntimeEngine,
-          });
-          added.add(backend);
-        } else {
-          console.warn("[VolvoxAI] WASM initialization failed.");
-        }
-      } else if (backend === "cpu") {
-        console.log("[VolvoxAI] Pure JS CPU Engine Initialized.");
-        instance.engines.push({
-          type: 'cpu',
-          engine: new CPUEngine() as unknown as RuntimeEngine,
-        });
-        added.add(backend);
-      } else {
-        try {
-          const factory = registeredBackendFactories.get(backend)!;
-          const candidate = await factory({
-            name: backend,
-            runtime: instance,
-            wasmUrl,
-          });
-          if (candidate == null) {
-            console.warn(`[VolvoxAI] Registered backend '${backend}' is not available.`);
-            continue;
-          }
-          const engine = checkedEngine(candidate, `[VolvoxAI] Registered backend '${backend}'`);
-          if (engine.backendName !== backend) {
-            throw new Error(`[VolvoxAI] Registered backend '${backend}' returned backendName '${engine.backendName}'.`);
-          }
-          instance.engines.push({ type: backend, engine, device: engine.device });
-          added.add(backend);
-        } catch (e) {
-          console.warn(
-            `[VolvoxAI] Registered backend '${backend}' initialization failed.`,
-            caughtMessage(e),
-          );
-        }
-      }
-    }
-
-    if (instance.engines.length === 0) {
-      throw new Error(`[VolvoxAI] None of the requested backends initialized: ${order.join(", ")}`);
-    }
-
-    return instance;
-  }
-
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
 }
+
+async function requestWebGPUAdapter(factory: BrowserGPUFactory): Promise<BrowserGPUAdapter | null> {
+  // A freshly launched Chromium/Vulkan process can transiently return null
+  // while its surfaceless adapter finishes initializing. Bound the retry so a
+  // genuinely unavailable device still falls through promptly.
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const adapter = await factory.requestAdapter();
+    if (adapter) return adapter;
+    if (attempt < 2) await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+  return null;
+}
+
+async function initializeBuiltin(
+  name: string,
+  wasmUrl: string | URL,
+): Promise<BackendProvider> {
+  if (name === 'cpu') return new BuiltInBackendProvider(new CPUEngine());
+  if (name === 'wasm') {
+    const engine = await WasmEngine.init(wasmUrl);
+    if (!engine) throw new Error(`WASM could not load '${String(wasmUrl)}'.`);
+    return new BuiltInBackendProvider(engine);
+  }
+  if (name === 'webgpu') {
+    const runtimeNavigator = browserNavigator();
+    if (!runtimeNavigator?.gpu) throw new Error('WebGPU is unavailable.');
+    const adapter = await requestWebGPUAdapter(runtimeNavigator.gpu);
+    if (!adapter) throw new Error('WebGPU adapter is unavailable.');
+    const device = await adapter.requestDevice();
+    return new BuiltInBackendProvider(new WebGPUEngine(device, { adapterInfo: adapter.info }));
+  }
+  if (name === 'webnn') {
+    const runtimeNavigator = browserNavigator();
+    if (!runtimeNavigator?.ml) throw new Error('WebNN is unavailable.');
+    const context = await runtimeNavigator.ml.createContext({ deviceType: 'npu' });
+    return new BuiltInBackendProvider(new WebNNEngine(context));
+  }
+  throw new Error(`Unknown built-in backend '${name}'.`);
+}
+
+function runtimeProviderSources(
+  providers: Readonly<Record<string, RuntimeProviderSource>>,
+): Map<string, RuntimeProviderSource> {
+  if (!providers || typeof providers !== 'object' || Array.isArray(providers)) {
+    throw new VolvoxAIError('INVALID_ARGUMENT',
+      '[VolvoxAI] Runtime providers must be a name-to-provider object.', {
+        phase: 'initialization',
+      });
+  }
+  const prototype = Object.getPrototypeOf(providers);
+  if (prototype !== Object.prototype && prototype !== null) {
+    throw new VolvoxAIError('INVALID_ARGUMENT',
+      '[VolvoxAI] Runtime providers must be a plain name-to-provider object.', {
+        phase: 'initialization',
+      });
+  }
+  const result = new Map<string, RuntimeProviderSource>();
+  for (const [rawName, source] of Object.entries(providers)) {
+    const name = checkedName(rawName);
+    if (BUILTIN_BACKENDS.includes(name)) {
+      throw new VolvoxAIError('INVALID_ARGUMENT',
+        `[VolvoxAI] Built-in backend provider '${name}' cannot be replaced.`, {
+          phase: 'initialization', backend: name,
+        });
+    }
+    if (typeof source !== 'function' && (!source || typeof source !== 'object')) {
+      throw new VolvoxAIError('ABI_UNSUPPORTED',
+        `[VolvoxAI] Backend provider '${name}' must be a provider instance or factory.`, {
+          phase: 'initialization', backend: name,
+        });
+    }
+    result.set(name, source);
+  }
+  return result;
+}
+
+/** Create the root handle for the Runtime -> Model -> Context lifecycle. */
+export async function createRuntime(options: CreateRuntimeOptions = {}): Promise<Runtime> {
+  if (!options || typeof options !== 'object' || Array.isArray(options)) {
+    throw new VolvoxAIError('INVALID_ARGUMENT',
+      '[VolvoxAI] Runtime options must be an object.', { phase: 'initialization' });
+  }
+  const {
+    backends = BUILTIN_BACKENDS,
+    providers = {},
+    wasmUrl = new URL('./volvoxai.wasm', import.meta.url),
+    onDiagnostic = null,
+  } = options;
+  if (!Array.isArray(backends) || backends.length === 0) {
+    throw new VolvoxAIError('INVALID_ARGUMENT',
+      '[VolvoxAI] Runtime backends must be a non-empty ordered array.', {
+        phase: 'initialization',
+      });
+  }
+  if (!((typeof wasmUrl === 'string' && wasmUrl.length > 0) || wasmUrl instanceof URL)) {
+    throw new VolvoxAIError('INVALID_ARGUMENT',
+      '[VolvoxAI] wasmUrl must be a non-empty string or URL.', {
+        phase: 'initialization',
+      });
+  }
+  const order = [...backends];
+  const providerSources = runtimeProviderSources(providers);
+  const seen = new Set<string>();
+  for (const name of order) {
+    checkedName(name);
+    if (seen.has(name)) {
+      throw new VolvoxAIError('INVALID_ARGUMENT',
+        `[VolvoxAI] Runtime backend '${name}' occurs more than once.`, {
+          phase: 'initialization', backend: name,
+        });
+    }
+    seen.add(name);
+    if (!BUILTIN_BACKENDS.includes(name) && !providerSources.has(name)) {
+      throw new VolvoxAIError('INVALID_ARGUMENT',
+        `[VolvoxAI] Unknown backend provider '${name}'.`, {
+          phase: 'initialization', backend: name,
+        });
+    }
+  }
+
+  const runtime = new Runtime({ onDiagnostic });
+  for (const name of order) {
+    let candidate: unknown = null;
+    let retained = false;
+    try {
+      const source = providerSources.get(name);
+      candidate = BUILTIN_BACKENDS.includes(name)
+        ? await initializeBuiltin(name, wasmUrl)
+        : typeof source === 'function'
+          ? await source({ name, runtime, wasmUrl })
+          : source;
+      if (!candidate) {
+        runtime._addInitializationFailure(name, `Backend provider '${name}' is unavailable.`);
+        continue;
+      }
+      const provider = assertBackendProvider(candidate, `Backend provider '${name}'`);
+      runtime._addProvider(name, provider);
+      retained = true;
+    } catch (error) {
+      const close = (candidate as Partial<BackendProvider> | null)?.close;
+      if (!retained && typeof close === 'function') {
+        try { await close.call(candidate); } catch { /* Preserve initialization evidence. */ }
+      }
+      runtime._addInitializationFailure(
+        name,
+        `Backend provider '${name}' initialization failed: ${errorMessage(error)}`,
+      );
+    }
+  }
+  return runtime;
+}
+
+/** Stateless namespace; concrete state starts at Runtime. */
+export const VolvoxAI = Object.freeze({
+  createRuntime,
+});

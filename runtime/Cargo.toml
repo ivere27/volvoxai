@@ -1,15 +1,22 @@
 [package]
 name = "volvoxai-runtime"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 license = "MIT"
-description = "Synurang service wrapper over the VolvoxAI C inference engine (single cdylib)."
+description = "In-process Synurang FFI over the VolvoxAI full native lifecycle."
 
 [lib]
 name = "volvoxai"
 # One platform cdylib (`libvolvoxai.so`/`libvolvoxai.dylib`) — the Synurang
 # plugin. rlib so it can also be linked/tested from Rust.
 crate-type = ["cdylib", "rlib"]
+
+[features]
+default = []
+# Opt-in CUDA full-profile composition. The build script compiles the
+# authoritative forward and training .cu sources to embedded PTX; the native
+# backend loads only the NVIDIA Driver API at runtime.
+cuda = []
 
 [dependencies]
 prost = "0.12"

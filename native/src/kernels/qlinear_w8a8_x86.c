@@ -9,9 +9,12 @@
  * portable implementation.
  */
 #include "quant_cpu_opt.h"
+#include "w8a8_affine.h"
 #include "cpu_features.h"
+#include "kernel_platform.h"
 #include "qlinear_w8a8_arm.h"
 #include "thread_pool.h"
+#include "../../include/volvoxai_enums.h"
 
 #include <limits.h>
 #include <math.h>
@@ -43,8 +46,8 @@ extern int qlinear_i8u8(const void *input, const void *weight, const int32_t *bi
 
 #if VX_W8A8_X86_AVX2
 enum {
-    VX_W8A8_I8 = 2u,
-    VX_W8A8_U8 = 3u,
+    VX_W8A8_I8 = VX_DTYPE_I8,
+    VX_W8A8_U8 = VX_DTYPE_U8,
     /* Amortize pool wake-up below roughly one million multiply-adds.  In
      * particular, every incremental decoder M=1 call stays on the caller. */
     VX_W8A8_QLINEAR_PARALLEL_PRODUCTS = 1024u * 1024u,
@@ -80,52 +83,11 @@ typedef struct {
 static int vx_w8a8_qlinear_parallel_alias_safe(
         const VxW8A8QLinearCall *call);
 
-static int vx_w8a8_finite_f32(float value) {
-    union { float f; uint32_t u; } bits = { value };
-    return ((bits.u >> 23u) & 0xffu) != 0xffu;
-}
-
-static int vx_w8a8_mul_size(size_t *value, size_t factor) {
-    if (factor && *value > (size_t)-1 / factor) return 0;
-    *value *= factor;
-    return 1;
-}
-
-static int vx_w8a8_byte_dtype(uint32_t dtype) {
-    return dtype == VX_W8A8_I8 || dtype == VX_W8A8_U8;
-}
-
-static int vx_w8a8_zero_point_valid(int32_t value, uint32_t dtype) {
-    if (dtype == VX_W8A8_I8) return value >= -128 && value <= 127;
-    if (dtype == VX_W8A8_U8) return value >= 0 && value <= 255;
-    return 0;
-}
-
-static int32_t vx_w8a8_byte_value(const void *data, uint32_t dtype, size_t index) {
-    return dtype == VX_W8A8_I8 ? (int32_t)((const int8_t *)data)[index] :
-        (int32_t)((const uint8_t *)data)[index];
-}
-
-static int32_t vx_w8a8_round_ties_even(float value) {
-    int32_t lower = (int32_t)floorf(value);
-    float fraction = value - (float)lower;
-    if (fraction < 0.5f) return lower;
-    if (fraction > 0.5f) return lower + 1;
-    return lower % 2 == 0 ? lower : lower + 1;
-}
-
-static int32_t vx_w8a8_quantize_transformed(float transformed,
-        int32_t minimum, int32_t maximum, int32_t nan_value) {
-    if (transformed != transformed) return nan_value;
-    if (transformed <= (float)minimum) return minimum;
-    if (transformed >= (float)maximum) return maximum;
-    return vx_w8a8_round_ties_even(transformed);
-}
-
-static void vx_w8a8_store_byte(void *output, uint32_t dtype,
-        size_t index, int32_t value) {
-    if (dtype == VX_W8A8_I8) ((int8_t *)output)[index] = (int8_t)value;
-    else ((uint8_t *)output)[index] = (uint8_t)value;
+static int vx_w8a8_positive_product_multiplier(
+        float input_scale, float weight_scale, float output_scale) {
+    volatile float product_scale = input_scale * weight_scale;
+    volatile float multiplier = product_scale / output_scale;
+    return vx_w8a8_finite_f32(multiplier) && multiplier > 0.0f;
 }
 
 /* The portable ABI detects an I32 accumulator overflow after every product.
@@ -158,6 +120,8 @@ static int vx_w8a8_avx2_eligible(const void *input, const void *weight,
         uint64_t bias_magnitude = bias[column] < 0
             ? (uint64_t)(-(int64_t)bias[column]) : (uint64_t)bias[column];
         if (!vx_w8a8_finite_f32(weight_scales[column]) || weight_scales[column] <= 0.0f ||
+            !vx_w8a8_positive_product_multiplier(
+                input_scale, weight_scales[column], output_scale) ||
             !vx_w8a8_zero_point_valid(weight_zero_points[column], weight_dtype) ||
             product_bound > (uint64_t)INT32_MAX ||
             bias_magnitude > (uint64_t)INT32_MAX - product_bound) return 0;
@@ -225,7 +189,7 @@ static VX_W8A8_TARGET_AVX2 void vx_w8a8_qlinear_avx2_range(
                 const float multiplier = product_scale / output_scale;
                 const float scaled = (float)accumulator * multiplier;
                 const float transformed = scaled + (float)output_zero_point;
-                int32_t quantized = vx_w8a8_quantize_transformed(transformed,
+                int32_t quantized = vx_w8a8_requantize(transformed,
                     output_minimum, output_maximum, output_zero_point);
                 vx_w8a8_store_byte(output, output_dtype,
                     output_offset + column, quantized);
@@ -235,11 +199,11 @@ static VX_W8A8_TARGET_AVX2 void vx_w8a8_qlinear_avx2_range(
 }
 
 /* Seed inference supplies hundreds of independent activation rows for one
- * immutable weight matrix.  Keep four rows live while walking a weight row so
+ * immutable weight matrix.  Keep eight rows live while walking a weight row so
  * each 16-byte weight load, sign extension, and zero-point subtraction feeds
- * four dot products.  The per-row vector reduction and scalar tail retain the
- * exact operation order of vx_w8a8_qlinear_avx2_range().  Aliased ABI calls
- * stay on that historical row-ordered implementation. */
+ * eight dot products.  The per-row vector reduction and scalar tail retain the
+ * exact operation order of vx_w8a8_qlinear_avx2_range(). Aliased ABI calls
+ * stay on the serial row-ordered implementation. */
 static VX_W8A8_TARGET_AVX2 void vx_w8a8_qlinear_avx2_tiled_range(
         const VxW8A8QLinearCall *call, uint32_t begin, uint32_t end) {
     const unsigned char *input_bytes = (const unsigned char *)call->input;
@@ -250,22 +214,30 @@ static VX_W8A8_TARGET_AVX2 void vx_w8a8_qlinear_avx2_tiled_range(
     const int32_t output_minimum = call->output_dtype == VX_W8A8_I8 ? -128 : 0;
     const int32_t output_maximum = call->output_dtype == VX_W8A8_I8 ? 127 : 255;
     uint32_t row = begin;
-    if (end - begin < 4u || !vx_w8a8_qlinear_parallel_alias_safe(call)) {
+    if (end - begin < 8u || !vx_w8a8_qlinear_parallel_alias_safe(call)) {
         vx_w8a8_qlinear_avx2_range(call, begin, end);
         return;
     }
-    for (; row + 4u <= end; row += 4u) {
-        const size_t input_offsets[4] = {
+    for (; row + 8u <= end; row += 8u) {
+        const size_t input_offsets[8] = {
             (size_t)row * d_in,
             (size_t)(row + 1u) * d_in,
             (size_t)(row + 2u) * d_in,
             (size_t)(row + 3u) * d_in,
+            (size_t)(row + 4u) * d_in,
+            (size_t)(row + 5u) * d_in,
+            (size_t)(row + 6u) * d_in,
+            (size_t)(row + 7u) * d_in,
         };
-        const size_t output_offsets[4] = {
+        const size_t output_offsets[8] = {
             (size_t)row * d_out,
             (size_t)(row + 1u) * d_out,
             (size_t)(row + 2u) * d_out,
             (size_t)(row + 3u) * d_out,
+            (size_t)(row + 4u) * d_out,
+            (size_t)(row + 5u) * d_out,
+            (size_t)(row + 6u) * d_out,
+            (size_t)(row + 7u) * d_out,
         };
         for (uint32_t column = 0; column < d_out; column++) {
             const size_t weight_offset = (size_t)column * d_in;
@@ -275,8 +247,15 @@ static VX_W8A8_TARGET_AVX2 void vx_w8a8_qlinear_avx2_tiled_range(
             __m256i sums1 = _mm256_setzero_si256();
             __m256i sums2 = _mm256_setzero_si256();
             __m256i sums3 = _mm256_setzero_si256();
+            __m256i sums4 = _mm256_setzero_si256();
+            __m256i sums5 = _mm256_setzero_si256();
+            __m256i sums6 = _mm256_setzero_si256();
+            __m256i sums7 = _mm256_setzero_si256();
             int32_t lanes0[8], lanes1[8], lanes2[8], lanes3[8];
-            int64_t accumulators[4] = {
+            int32_t lanes4[8], lanes5[8], lanes6[8], lanes7[8];
+            int64_t accumulators[8] = {
+                call->bias[column], call->bias[column],
+                call->bias[column], call->bias[column],
                 call->bias[column], call->bias[column],
                 call->bias[column], call->bias[column],
             };
@@ -304,22 +283,34 @@ static VX_W8A8_TARGET_AVX2 void vx_w8a8_qlinear_avx2_tiled_range(
                 VX_W8A8_AVX2_ACCUMULATE_ROW(1, sums1);
                 VX_W8A8_AVX2_ACCUMULATE_ROW(2, sums2);
                 VX_W8A8_AVX2_ACCUMULATE_ROW(3, sums3);
+                VX_W8A8_AVX2_ACCUMULATE_ROW(4, sums4);
+                VX_W8A8_AVX2_ACCUMULATE_ROW(5, sums5);
+                VX_W8A8_AVX2_ACCUMULATE_ROW(6, sums6);
+                VX_W8A8_AVX2_ACCUMULATE_ROW(7, sums7);
 #undef VX_W8A8_AVX2_ACCUMULATE_ROW
             }
             _mm256_storeu_si256((__m256i *)(void *)lanes0, sums0);
             _mm256_storeu_si256((__m256i *)(void *)lanes1, sums1);
             _mm256_storeu_si256((__m256i *)(void *)lanes2, sums2);
             _mm256_storeu_si256((__m256i *)(void *)lanes3, sums3);
+            _mm256_storeu_si256((__m256i *)(void *)lanes4, sums4);
+            _mm256_storeu_si256((__m256i *)(void *)lanes5, sums5);
+            _mm256_storeu_si256((__m256i *)(void *)lanes6, sums6);
+            _mm256_storeu_si256((__m256i *)(void *)lanes7, sums7);
             for (uint32_t lane = 0; lane < 8u; lane++) {
                 accumulators[0] += lanes0[lane];
                 accumulators[1] += lanes1[lane];
                 accumulators[2] += lanes2[lane];
                 accumulators[3] += lanes3[lane];
+                accumulators[4] += lanes4[lane];
+                accumulators[5] += lanes5[lane];
+                accumulators[6] += lanes6[lane];
+                accumulators[7] += lanes7[lane];
             }
             for (; dimension < d_in; dimension++) {
                 const int32_t weight_value = vx_w8a8_byte_value(
                     call->weight, call->weight_dtype, weight_offset + dimension);
-                for (uint32_t tile_row = 0; tile_row < 4u; tile_row++) {
+                for (uint32_t tile_row = 0; tile_row < 8u; tile_row++) {
                     const int32_t input_value = vx_w8a8_byte_value(
                         call->input, call->input_dtype,
                         input_offsets[tile_row] + dimension);
@@ -333,11 +324,11 @@ static VX_W8A8_TARGET_AVX2 void vx_w8a8_qlinear_avx2_tiled_range(
                 const float product_scale =
                     call->input_scale * call->weight_scales[column];
                 const float multiplier = product_scale / call->output_scale;
-                for (uint32_t tile_row = 0; tile_row < 4u; tile_row++) {
+                for (uint32_t tile_row = 0; tile_row < 8u; tile_row++) {
                     const float scaled = (float)accumulators[tile_row] * multiplier;
                     const float transformed =
                         scaled + (float)call->output_zero_point;
-                    const int32_t quantized = vx_w8a8_quantize_transformed(
+                    const int32_t quantized = vx_w8a8_requantize(
                         transformed, output_minimum, output_maximum,
                         call->output_zero_point);
                     vx_w8a8_store_byte(call->output, call->output_dtype,
@@ -349,10 +340,12 @@ static VX_W8A8_TARGET_AVX2 void vx_w8a8_qlinear_avx2_tiled_range(
     if (row < end) vx_w8a8_qlinear_avx2_range(call, row, end);
 }
 
-/* Return the sum of bytes after the signed-I8-to-U8 bit remapping used by
- * VPDPBUSD. With xor_sign set, the raw byte is reinterpreted as I8 and shifted
- * by +128 (xor 0x80); otherwise it is already the desired U8 value. */
-static VX_W8A8_TARGET_AVXVNNI int64_t vx_w8a8_sum_remapped_u8_avxvnni(
+/* Return the sum of bytes after the signed-I8-to-U8 bit remapping used by the
+ * U8 x I8 dot kernels. With xor_sign set, the raw byte is reinterpreted as I8
+ * and shifted by +128 (xor 0x80); otherwise it is already the desired U8
+ * value. This helper intentionally needs only AVX2 so both PMADDUBSW and VNNI
+ * specializations can call it after their respective runtime feature gates. */
+static VX_W8A8_TARGET_AVX2 int64_t vx_w8a8_sum_remapped_u8_avx2(
         const unsigned char *values, uint32_t count, int xor_sign) {
     const __m256i zero = _mm256_setzero_si256();
     const __m256i sign_bit = _mm256_set1_epi8((char)0x80);
@@ -371,6 +364,262 @@ static VX_W8A8_TARGET_AVXVNNI int64_t vx_w8a8_sum_remapped_u8_avxvnni(
         total += xor_sign ? (int64_t)(values[index] ^ 0x80u) : (int64_t)values[index];
     }
     return total;
+}
+
+/* VPMADDUBSW is fast for U8 x I8 products but its adjacent-pair result
+ * saturates to I16. Splitting each unsigned activation byte exactly into
+ * min(a,127) + (a-min(a,127)) bounds the two independent pair sums:
+ *
+ *   2 * 127 * 128 <= 32512,  2 * 128 * 128 >= -32768.
+ *
+ * Each PMADDUBSW is therefore non-saturating for every legal I8 weight byte.
+ * Their results are widened separately with PMADDWD and combined only in I32.
+ * Affine compensation then restores arbitrary I8/U8 input and weight zero
+ * points without changing the portable kernel's exact integer result. */
+static VX_W8A8_TARGET_AVX2 void vx_w8a8_qlinear_avx2_maddubs_range(
+        const VxW8A8QLinearCall *call, uint32_t begin, uint32_t end) {
+    const unsigned char *input_bytes = (const unsigned char *)call->input;
+    const unsigned char *weight_bytes = (const unsigned char *)call->weight;
+    const int input_xor_sign = call->input_dtype == VX_W8A8_I8;
+    const int weight_xor_sign = call->weight_dtype == VX_W8A8_U8;
+    const int32_t input_zero_unsigned = call->input_zero_point +
+        (input_xor_sign ? 128 : 0);
+    const __m256i sign_bit = _mm256_set1_epi8((char)0x80);
+    const __m256i split_point = _mm256_set1_epi8(127);
+    const __m256i ones16 = _mm256_set1_epi16(1);
+    const __m256i zero = _mm256_setzero_si256();
+    const int32_t output_minimum = call->output_dtype == VX_W8A8_I8 ? -128 : 0;
+    const int32_t output_maximum = call->output_dtype == VX_W8A8_I8 ? 127 : 255;
+    for (uint32_t row = begin; row < end; row++) {
+        const size_t input_offset = (size_t)row * call->d_in;
+        const size_t output_offset = (size_t)row * call->d_out;
+        const int64_t input_sum = vx_w8a8_sum_remapped_u8_avx2(
+            input_bytes + input_offset, call->d_in, input_xor_sign);
+        for (uint32_t column = 0; column < call->d_out; column++) {
+            const size_t weight_offset = (size_t)column * call->d_in;
+            const int32_t weight_zero_signed = call->weight_zero_points[column] -
+                (weight_xor_sign ? 128 : 0);
+            __m256i dot_lanes = _mm256_setzero_si256();
+            __m256i weight_sum_lanes = _mm256_setzero_si256();
+            int32_t dot_lane_values[8];
+            uint64_t weight_sum_lane_values[4];
+            int64_t dot = 0;
+            int64_t weight_sum;
+            uint32_t dimension = 0;
+            for (; dimension + 32u <= call->d_in; dimension += 32u) {
+                __m256i input_values = _mm256_loadu_si256(
+                    (const __m256i *)(const void *)
+                    (input_bytes + input_offset + dimension));
+                __m256i weight_values = _mm256_loadu_si256(
+                    (const __m256i *)(const void *)
+                    (weight_bytes + weight_offset + dimension));
+                const __m256i input_unsigned = input_xor_sign
+                    ? _mm256_xor_si256(input_values, sign_bit) : input_values;
+                const __m256i weight_signed = weight_xor_sign
+                    ? _mm256_xor_si256(weight_values, sign_bit) : weight_values;
+                const __m256i input_low =
+                    _mm256_min_epu8(input_unsigned, split_point);
+                const __m256i input_high =
+                    _mm256_sub_epi8(input_unsigned, input_low);
+                const __m256i products_low =
+                    _mm256_maddubs_epi16(input_low, weight_signed);
+                const __m256i products_high =
+                    _mm256_maddubs_epi16(input_high, weight_signed);
+                dot_lanes = _mm256_add_epi32(dot_lanes,
+                    _mm256_madd_epi16(products_low, ones16));
+                dot_lanes = _mm256_add_epi32(dot_lanes,
+                    _mm256_madd_epi16(products_high, ones16));
+                weight_sum_lanes = _mm256_add_epi64(weight_sum_lanes,
+                    _mm256_sad_epu8(
+                        _mm256_xor_si256(weight_signed, sign_bit), zero));
+            }
+            _mm256_storeu_si256((__m256i *)(void *)dot_lane_values, dot_lanes);
+            for (uint32_t lane = 0; lane < 8u; lane++)
+                dot += dot_lane_values[lane];
+            _mm256_storeu_si256((__m256i *)(void *)weight_sum_lane_values,
+                                 weight_sum_lanes);
+            weight_sum = -(int64_t)128 * (int64_t)dimension;
+            for (uint32_t lane = 0; lane < 4u; lane++)
+                weight_sum += (int64_t)weight_sum_lane_values[lane];
+            for (; dimension < call->d_in; dimension++) {
+                const int64_t input_unsigned = input_xor_sign
+                    ? (int64_t)(input_bytes[input_offset + dimension] ^ 0x80u)
+                    : (int64_t)input_bytes[input_offset + dimension];
+                const int64_t weight_signed = weight_xor_sign
+                    ? (int64_t)(int8_t)
+                        (weight_bytes[weight_offset + dimension] ^ 0x80u)
+                    : (int64_t)(int8_t)
+                        weight_bytes[weight_offset + dimension];
+                dot += input_unsigned * weight_signed;
+                weight_sum += weight_signed;
+            }
+            {
+                const int64_t accumulator = (int64_t)call->bias[column] + dot -
+                    (int64_t)weight_zero_signed * input_sum -
+                    (int64_t)input_zero_unsigned * weight_sum +
+                    (int64_t)call->d_in * input_zero_unsigned *
+                        weight_zero_signed;
+                const float product_scale =
+                    call->input_scale * call->weight_scales[column];
+                const float multiplier = product_scale / call->output_scale;
+                const float scaled = (float)accumulator * multiplier;
+                const float transformed =
+                    scaled + (float)call->output_zero_point;
+                const int32_t quantized = vx_w8a8_requantize(
+                    transformed, output_minimum, output_maximum,
+                    call->output_zero_point);
+                vx_w8a8_store_byte(call->output, call->output_dtype,
+                    output_offset + column, quantized);
+            }
+        }
+    }
+}
+
+/* Multi-row prefill reuses one remapped weight vector and its affine sum for
+ * four activation rows. This recovers the weight locality of the ordinary
+ * AVX2 tile while retaining the exact non-saturating PMADDUBSW split above. */
+static VX_W8A8_TARGET_AVX2 void vx_w8a8_qlinear_avx2_maddubs_tiled_range(
+        const VxW8A8QLinearCall *call, uint32_t begin, uint32_t end) {
+    const unsigned char *input_bytes = (const unsigned char *)call->input;
+    const unsigned char *weight_bytes = (const unsigned char *)call->weight;
+    const int input_xor_sign = call->input_dtype == VX_W8A8_I8;
+    const int weight_xor_sign = call->weight_dtype == VX_W8A8_U8;
+    const int32_t input_zero_unsigned = call->input_zero_point +
+        (input_xor_sign ? 128 : 0);
+    const __m256i sign_bit = _mm256_set1_epi8((char)0x80);
+    const __m256i split_point = _mm256_set1_epi8(127);
+    const __m256i ones16 = _mm256_set1_epi16(1);
+    const __m256i zero = _mm256_setzero_si256();
+    const int32_t output_minimum = call->output_dtype == VX_W8A8_I8 ? -128 : 0;
+    const int32_t output_maximum = call->output_dtype == VX_W8A8_I8 ? 127 : 255;
+    uint32_t row = begin;
+    if (end - begin < 4u || !vx_w8a8_qlinear_parallel_alias_safe(call)) {
+        vx_w8a8_qlinear_avx2_maddubs_range(call, begin, end);
+        return;
+    }
+    for (; row + 4u <= end; row += 4u) {
+        const size_t input_offsets[4] = {
+            (size_t)row * call->d_in,
+            (size_t)(row + 1u) * call->d_in,
+            (size_t)(row + 2u) * call->d_in,
+            (size_t)(row + 3u) * call->d_in,
+        };
+        const size_t output_offsets[4] = {
+            (size_t)row * call->d_out,
+            (size_t)(row + 1u) * call->d_out,
+            (size_t)(row + 2u) * call->d_out,
+            (size_t)(row + 3u) * call->d_out,
+        };
+        const int64_t input_sums[4] = {
+            vx_w8a8_sum_remapped_u8_avx2(input_bytes + input_offsets[0],
+                call->d_in, input_xor_sign),
+            vx_w8a8_sum_remapped_u8_avx2(input_bytes + input_offsets[1],
+                call->d_in, input_xor_sign),
+            vx_w8a8_sum_remapped_u8_avx2(input_bytes + input_offsets[2],
+                call->d_in, input_xor_sign),
+            vx_w8a8_sum_remapped_u8_avx2(input_bytes + input_offsets[3],
+                call->d_in, input_xor_sign),
+        };
+        for (uint32_t column = 0; column < call->d_out; column++) {
+            const size_t weight_offset = (size_t)column * call->d_in;
+            const int32_t weight_zero_signed = call->weight_zero_points[column] -
+                (weight_xor_sign ? 128 : 0);
+            __m256i dots0 = _mm256_setzero_si256();
+            __m256i dots1 = _mm256_setzero_si256();
+            __m256i dots2 = _mm256_setzero_si256();
+            __m256i dots3 = _mm256_setzero_si256();
+            __m256i weight_sum_lanes = _mm256_setzero_si256();
+            int32_t dot_lanes[4][8];
+            uint64_t weight_sum_lane_values[4];
+            int64_t dots[4] = {0, 0, 0, 0};
+            int64_t weight_sum;
+            uint32_t dimension = 0;
+            for (; dimension + 32u <= call->d_in; dimension += 32u) {
+                const __m256i weight_values = _mm256_loadu_si256(
+                    (const __m256i *)(const void *)
+                    (weight_bytes + weight_offset + dimension));
+                const __m256i weight_signed = weight_xor_sign
+                    ? _mm256_xor_si256(weight_values, sign_bit) : weight_values;
+                weight_sum_lanes = _mm256_add_epi64(weight_sum_lanes,
+                    _mm256_sad_epu8(
+                        _mm256_xor_si256(weight_signed, sign_bit), zero));
+#define VX_W8A8_MADDUBS_ACCUMULATE_ROW(ROW, DOTS) do { \
+                const __m256i input_values = _mm256_loadu_si256( \
+                    (const __m256i *)(const void *) \
+                    (input_bytes + input_offsets[(ROW)] + dimension)); \
+                const __m256i input_unsigned = input_xor_sign \
+                    ? _mm256_xor_si256(input_values, sign_bit) : input_values; \
+                const __m256i input_low = \
+                    _mm256_min_epu8(input_unsigned, split_point); \
+                const __m256i input_high = \
+                    _mm256_sub_epi8(input_unsigned, input_low); \
+                (DOTS) = _mm256_add_epi32((DOTS), _mm256_madd_epi16( \
+                    _mm256_maddubs_epi16(input_low, weight_signed), ones16)); \
+                (DOTS) = _mm256_add_epi32((DOTS), _mm256_madd_epi16( \
+                    _mm256_maddubs_epi16(input_high, weight_signed), ones16)); \
+            } while (0)
+                VX_W8A8_MADDUBS_ACCUMULATE_ROW(0, dots0);
+                VX_W8A8_MADDUBS_ACCUMULATE_ROW(1, dots1);
+                VX_W8A8_MADDUBS_ACCUMULATE_ROW(2, dots2);
+                VX_W8A8_MADDUBS_ACCUMULATE_ROW(3, dots3);
+#undef VX_W8A8_MADDUBS_ACCUMULATE_ROW
+            }
+            _mm256_storeu_si256((__m256i *)(void *)dot_lanes[0], dots0);
+            _mm256_storeu_si256((__m256i *)(void *)dot_lanes[1], dots1);
+            _mm256_storeu_si256((__m256i *)(void *)dot_lanes[2], dots2);
+            _mm256_storeu_si256((__m256i *)(void *)dot_lanes[3], dots3);
+            for (uint32_t lane = 0; lane < 8u; lane++) {
+                dots[0] += dot_lanes[0][lane];
+                dots[1] += dot_lanes[1][lane];
+                dots[2] += dot_lanes[2][lane];
+                dots[3] += dot_lanes[3][lane];
+            }
+            _mm256_storeu_si256((__m256i *)(void *)weight_sum_lane_values,
+                                 weight_sum_lanes);
+            weight_sum = -(int64_t)128 * (int64_t)dimension;
+            for (uint32_t lane = 0; lane < 4u; lane++)
+                weight_sum += (int64_t)weight_sum_lane_values[lane];
+            for (; dimension < call->d_in; dimension++) {
+                const int64_t weight_signed = weight_xor_sign
+                    ? (int64_t)(int8_t)
+                        (weight_bytes[weight_offset + dimension] ^ 0x80u)
+                    : (int64_t)(int8_t)
+                        weight_bytes[weight_offset + dimension];
+                weight_sum += weight_signed;
+                for (uint32_t tile_row = 0; tile_row < 4u; tile_row++) {
+                    const int64_t input_unsigned = input_xor_sign
+                        ? (int64_t)(input_bytes[
+                              input_offsets[tile_row] + dimension] ^ 0x80u)
+                        : (int64_t)input_bytes[
+                              input_offsets[tile_row] + dimension];
+                    dots[tile_row] += input_unsigned * weight_signed;
+                }
+            }
+            {
+                const float product_scale =
+                    call->input_scale * call->weight_scales[column];
+                const float multiplier = product_scale / call->output_scale;
+                for (uint32_t tile_row = 0; tile_row < 4u; tile_row++) {
+                    const int64_t accumulator = (int64_t)call->bias[column] +
+                        dots[tile_row] -
+                        (int64_t)weight_zero_signed * input_sums[tile_row] -
+                        (int64_t)input_zero_unsigned * weight_sum +
+                        (int64_t)call->d_in * input_zero_unsigned *
+                            weight_zero_signed;
+                    const float scaled = (float)accumulator * multiplier;
+                    const float transformed =
+                        scaled + (float)call->output_zero_point;
+                    const int32_t quantized = vx_w8a8_requantize(
+                        transformed, output_minimum, output_maximum,
+                        call->output_zero_point);
+                    vx_w8a8_store_byte(call->output, call->output_dtype,
+                        output_offsets[tile_row] + column, quantized);
+                }
+            }
+        }
+    }
+    if (row < end)
+        vx_w8a8_qlinear_avx2_maddubs_range(call, row, end);
 }
 
 static VX_W8A8_TARGET_AVX512VNNI int64_t vx_w8a8_sum_remapped_u8_avx512vnni(
@@ -394,476 +643,83 @@ static VX_W8A8_TARGET_AVX512VNNI int64_t vx_w8a8_sum_remapped_u8_avx512vnni(
     return total;
 }
 
-/* AVX-VNNI exposes a U8 x I8 dot product. Convert every canonical raw domain
- * into that representation without losing asymmetric zero points:
- *
- *   a = input                  (U8) or input + 128 (I8),
- *   b = weight - 128           (U8) or weight       (I8).
- *
- * Writing az/bz for the corresponding remapped zero points gives
- * sum((a-az)(b-bz)) = sum(a*b) - bz*sum(a) - az*sum(b) + K*az*bz.
- * The caller uses the same conservative I32-prefix bound as AVX2, so the
- * regrouped vector dot and compensation cannot hide an overflow. */
-static VX_W8A8_TARGET_AVXVNNI void vx_w8a8_qlinear_avxvnni_range(
-        const VxW8A8QLinearCall *call, uint32_t begin, uint32_t end) {
-    const void *input = call->input;
-    const void *weight = call->weight;
-    const int32_t *bias = call->bias;
-    const float *weight_scales = call->weight_scales;
-    const int32_t *weight_zero_points = call->weight_zero_points;
-    void *output = call->output;
-    const uint32_t d_in = call->d_in;
-    const uint32_t d_out = call->d_out;
-    const float input_scale = call->input_scale;
-    const int32_t input_zero_point = call->input_zero_point;
-    const float output_scale = call->output_scale;
-    const int32_t output_zero_point = call->output_zero_point;
-    const uint32_t input_dtype = call->input_dtype;
-    const uint32_t weight_dtype = call->weight_dtype;
-    const uint32_t output_dtype = call->output_dtype;
-    const unsigned char *input_bytes = (const unsigned char *)input;
-    const unsigned char *weight_bytes = (const unsigned char *)weight;
-    const int input_xor_sign = input_dtype == VX_W8A8_I8;
-    const int weight_xor_sign = weight_dtype == VX_W8A8_U8;
-    const int32_t input_zero_unsigned = input_zero_point + (input_xor_sign ? 128 : 0);
-    const __m256i sign_bit = _mm256_set1_epi8((char)0x80);
-    const __m256i zero = _mm256_setzero_si256();
-    const int32_t output_minimum = output_dtype == VX_W8A8_I8 ? -128 : 0;
-    const int32_t output_maximum = output_dtype == VX_W8A8_I8 ? 127 : 255;
-    for (uint32_t row = begin; row < end; row++) {
-        const size_t input_offset = (size_t)row * d_in;
-        const size_t output_offset = (size_t)row * d_out;
-        const int64_t input_sum = vx_w8a8_sum_remapped_u8_avxvnni(
-            input_bytes + input_offset, d_in, input_xor_sign);
-        for (uint32_t column = 0; column < d_out; column++) {
-            const size_t weight_offset = (size_t)column * d_in;
-            const int32_t weight_zero_signed = weight_zero_points[column] -
-                (weight_dtype == VX_W8A8_U8 ? 128 : 0);
-            __m256i dot_lanes = _mm256_setzero_si256();
-            __m256i weight_sum_lanes = _mm256_setzero_si256();
-            int32_t dot_lane_values[8];
-            uint64_t weight_sum_lane_values[4];
-            int64_t dot = 0;
-            int64_t weight_sum;
-            uint32_t dimension = 0;
-            for (; dimension + 32u <= d_in; dimension += 32u) {
-                __m256i input_values = _mm256_loadu_si256((const __m256i *)(const void *)
-                    (input_bytes + input_offset + dimension));
-                __m256i weight_values = _mm256_loadu_si256((const __m256i *)(const void *)
-                    (weight_bytes + weight_offset + dimension));
-                __m256i input_unsigned = input_xor_sign
-                    ? _mm256_xor_si256(input_values, sign_bit) : input_values;
-                __m256i weight_signed = weight_xor_sign
-                    ? _mm256_xor_si256(weight_values, sign_bit) : weight_values;
-                __m256i weight_unsigned = _mm256_xor_si256(weight_signed, sign_bit);
-                dot_lanes = _mm256_dpbusd_avx_epi32(dot_lanes, input_unsigned,
-                                                     weight_signed);
-                weight_sum_lanes = _mm256_add_epi64(weight_sum_lanes,
-                    _mm256_sad_epu8(weight_unsigned, zero));
-            }
-            _mm256_storeu_si256((__m256i *)(void *)dot_lane_values, dot_lanes);
-            for (uint32_t lane = 0; lane < 8u; lane++) dot += dot_lane_values[lane];
-            _mm256_storeu_si256((__m256i *)(void *)weight_sum_lane_values,
-                                 weight_sum_lanes);
-            weight_sum = -(int64_t)128 * (int64_t)dimension;
-            for (uint32_t lane = 0; lane < 4u; lane++)
-                weight_sum += (int64_t)weight_sum_lane_values[lane];
-            for (; dimension < d_in; dimension++) {
-                const int64_t input_unsigned = input_xor_sign
-                    ? (int64_t)(input_bytes[input_offset + dimension] ^ 0x80u)
-                    : (int64_t)input_bytes[input_offset + dimension];
-                const int64_t weight_signed = weight_xor_sign
-                    ? (int64_t)(int8_t)(weight_bytes[weight_offset + dimension] ^ 0x80u)
-                    : (int64_t)(int8_t)weight_bytes[weight_offset + dimension];
-                dot += input_unsigned * weight_signed;
-                weight_sum += weight_signed;
-            }
-            {
-                const int64_t accumulator = (int64_t)bias[column] + dot -
-                    (int64_t)weight_zero_signed * input_sum -
-                    (int64_t)input_zero_unsigned * weight_sum +
-                    (int64_t)d_in * input_zero_unsigned * weight_zero_signed;
-                const float product_scale = input_scale * weight_scales[column];
-                const float multiplier = product_scale / output_scale;
-                const float scaled = (float)accumulator * multiplier;
-                const float transformed = scaled + (float)output_zero_point;
-                const int32_t quantized = vx_w8a8_quantize_transformed(transformed,
-                    output_minimum, output_maximum, output_zero_point);
-                vx_w8a8_store_byte(output, output_dtype,
-                    output_offset + column, quantized);
-            }
-        }
-    }
-}
 
-/* Reuse one YMM weight vector across four seed rows.  Weight-domain sums are
- * likewise invariant across those rows, while each row keeps the same
- * VPDPBUSD lane grouping and reduction order as the single-row path. */
-static VX_W8A8_TARGET_AVXVNNI void vx_w8a8_qlinear_avxvnni_tiled_range(
-        const VxW8A8QLinearCall *call, uint32_t begin, uint32_t end) {
-    const unsigned char *input_bytes = (const unsigned char *)call->input;
-    const unsigned char *weight_bytes = (const unsigned char *)call->weight;
-    const uint32_t d_in = call->d_in;
-    const uint32_t d_out = call->d_out;
-    const int input_xor_sign = call->input_dtype == VX_W8A8_I8;
-    const int weight_xor_sign = call->weight_dtype == VX_W8A8_U8;
-    const int32_t input_zero_unsigned = call->input_zero_point +
-        (input_xor_sign ? 128 : 0);
-    const __m256i sign_bit = _mm256_set1_epi8((char)0x80);
-    const __m256i zero = _mm256_setzero_si256();
-    const int32_t output_minimum = call->output_dtype == VX_W8A8_I8 ? -128 : 0;
-    const int32_t output_maximum = call->output_dtype == VX_W8A8_I8 ? 127 : 255;
-    uint32_t row = begin;
-    if (end - begin < 4u || !vx_w8a8_qlinear_parallel_alias_safe(call)) {
-        vx_w8a8_qlinear_avxvnni_range(call, begin, end);
-        return;
-    }
-    for (; row + 4u <= end; row += 4u) {
-        const size_t input_offsets[4] = {
-            (size_t)row * d_in,
-            (size_t)(row + 1u) * d_in,
-            (size_t)(row + 2u) * d_in,
-            (size_t)(row + 3u) * d_in,
-        };
-        const size_t output_offsets[4] = {
-            (size_t)row * d_out,
-            (size_t)(row + 1u) * d_out,
-            (size_t)(row + 2u) * d_out,
-            (size_t)(row + 3u) * d_out,
-        };
-        const int64_t input_sums[4] = {
-            vx_w8a8_sum_remapped_u8_avxvnni(input_bytes + input_offsets[0],
-                d_in, input_xor_sign),
-            vx_w8a8_sum_remapped_u8_avxvnni(input_bytes + input_offsets[1],
-                d_in, input_xor_sign),
-            vx_w8a8_sum_remapped_u8_avxvnni(input_bytes + input_offsets[2],
-                d_in, input_xor_sign),
-            vx_w8a8_sum_remapped_u8_avxvnni(input_bytes + input_offsets[3],
-                d_in, input_xor_sign),
-        };
-        for (uint32_t column = 0; column < d_out; column++) {
-            const size_t weight_offset = (size_t)column * d_in;
-            const int32_t weight_zero_signed = call->weight_zero_points[column] -
-                (call->weight_dtype == VX_W8A8_U8 ? 128 : 0);
-            __m256i dots0 = _mm256_setzero_si256();
-            __m256i dots1 = _mm256_setzero_si256();
-            __m256i dots2 = _mm256_setzero_si256();
-            __m256i dots3 = _mm256_setzero_si256();
-            __m256i weight_sum_lanes = _mm256_setzero_si256();
-            int32_t dot_lanes0[8], dot_lanes1[8], dot_lanes2[8], dot_lanes3[8];
-            uint64_t weight_sum_lane_values[4];
-            int64_t dots[4] = {0, 0, 0, 0};
-            int64_t weight_sum;
-            uint32_t dimension = 0;
-            for (; dimension + 32u <= d_in; dimension += 32u) {
-                const __m256i weight_values = _mm256_loadu_si256(
-                    (const __m256i *)(const void *)
-                    (weight_bytes + weight_offset + dimension));
-                const __m256i weight_signed = weight_xor_sign
-                    ? _mm256_xor_si256(weight_values, sign_bit) : weight_values;
-                const __m256i weight_unsigned =
-                    _mm256_xor_si256(weight_signed, sign_bit);
-                weight_sum_lanes = _mm256_add_epi64(weight_sum_lanes,
-                    _mm256_sad_epu8(weight_unsigned, zero));
-#define VX_W8A8_AVXVNNI_ACCUMULATE_ROW(ROW, DOTS) do { \
-                const __m256i input_values = _mm256_loadu_si256( \
-                    (const __m256i *)(const void *) \
-                    (input_bytes + input_offsets[(ROW)] + dimension)); \
-                const __m256i input_unsigned = input_xor_sign \
-                    ? _mm256_xor_si256(input_values, sign_bit) : input_values; \
-                (DOTS) = _mm256_dpbusd_avx_epi32((DOTS), input_unsigned, \
-                                                  weight_signed); \
-            } while (0)
-                VX_W8A8_AVXVNNI_ACCUMULATE_ROW(0, dots0);
-                VX_W8A8_AVXVNNI_ACCUMULATE_ROW(1, dots1);
-                VX_W8A8_AVXVNNI_ACCUMULATE_ROW(2, dots2);
-                VX_W8A8_AVXVNNI_ACCUMULATE_ROW(3, dots3);
-#undef VX_W8A8_AVXVNNI_ACCUMULATE_ROW
-            }
-            _mm256_storeu_si256((__m256i *)(void *)dot_lanes0, dots0);
-            _mm256_storeu_si256((__m256i *)(void *)dot_lanes1, dots1);
-            _mm256_storeu_si256((__m256i *)(void *)dot_lanes2, dots2);
-            _mm256_storeu_si256((__m256i *)(void *)dot_lanes3, dots3);
-            for (uint32_t lane = 0; lane < 8u; lane++) {
-                dots[0] += dot_lanes0[lane];
-                dots[1] += dot_lanes1[lane];
-                dots[2] += dot_lanes2[lane];
-                dots[3] += dot_lanes3[lane];
-            }
-            _mm256_storeu_si256((__m256i *)(void *)weight_sum_lane_values,
-                                 weight_sum_lanes);
-            weight_sum = -(int64_t)128 * (int64_t)dimension;
-            for (uint32_t lane = 0; lane < 4u; lane++)
-                weight_sum += (int64_t)weight_sum_lane_values[lane];
-            for (; dimension < d_in; dimension++) {
-                const int64_t weight_signed = weight_xor_sign
-                    ? (int64_t)(int8_t)
-                        (weight_bytes[weight_offset + dimension] ^ 0x80u)
-                    : (int64_t)(int8_t)weight_bytes[weight_offset + dimension];
-                weight_sum += weight_signed;
-                for (uint32_t tile_row = 0; tile_row < 4u; tile_row++) {
-                    const int64_t input_unsigned = input_xor_sign
-                        ? (int64_t)(input_bytes[input_offsets[tile_row] + dimension] ^
-                            0x80u)
-                        : (int64_t)input_bytes[input_offsets[tile_row] + dimension];
-                    dots[tile_row] += input_unsigned * weight_signed;
-                }
-            }
-            {
-                const float product_scale =
-                    call->input_scale * call->weight_scales[column];
-                const float multiplier = product_scale / call->output_scale;
-                for (uint32_t tile_row = 0; tile_row < 4u; tile_row++) {
-                    const int64_t accumulator = (int64_t)call->bias[column] +
-                        dots[tile_row] -
-                        (int64_t)weight_zero_signed * input_sums[tile_row] -
-                        (int64_t)input_zero_unsigned * weight_sum +
-                        (int64_t)d_in * input_zero_unsigned * weight_zero_signed;
-                    const float scaled = (float)accumulator * multiplier;
-                    const float transformed =
-                        scaled + (float)call->output_zero_point;
-                    const int32_t quantized = vx_w8a8_quantize_transformed(
-                        transformed, output_minimum, output_maximum,
-                        call->output_zero_point);
-                    vx_w8a8_store_byte(call->output, call->output_dtype,
-                        output_offsets[tile_row] + column, quantized);
-                }
-            }
-        }
-    }
-    if (row < end) vx_w8a8_qlinear_avxvnni_range(call, row, end);
-}
+/* --- VNNI QLinear instantiations ------------------------------------------
+ * Both widths come from qlinear_vnni_kernel.inc.  AVX-VNNI is 256-bit and so
+ * reuses the 256-bit operand-sum helper the AVX2 kernels already provide;
+ * AVX-512-VNNI has its own 512-bit helper above. */
+#if VX_W8A8_X86_AVX2
+#define VX_MK_TARGET        VX_W8A8_TARGET_AVXVNNI
+#define VX_MK_SUFFIX        avxvnni
+#define VX_MK_VEC           __m256i
+#define VX_MK_BYTES         32u
+#define VX_MK_L32           8u
+#define VX_MK_L64           4u
+#define VX_MK_SUM_REMAPPED  vx_w8a8_sum_remapped_u8_avx2
+#define VX_MK_ZERO()        _mm256_setzero_si256()
+#define VX_MK_SET1_I8(x)    _mm256_set1_epi8(x)
+#define VX_MK_XOR(a, b)     _mm256_xor_si256((a), (b))
+#define VX_MK_ADD_I64(a, b) _mm256_add_epi64((a), (b))
+#define VX_MK_SAD_U8(a, b)  _mm256_sad_epu8((a), (b))
+#define VX_MK_DPBUSD(a, b, c) _mm256_dpbusd_avx_epi32((a), (b), (c))
+#define VX_MK_LOADU(p)      _mm256_loadu_si256((const __m256i *)(const void *)(p))
+#define VX_MK_STOREU(p, v)  _mm256_storeu_si256((__m256i *)(void *)(p), (v))
+#include "qlinear_vnni_kernel.inc"
+#undef VX_MK_TARGET
+#undef VX_MK_SUFFIX
+#undef VX_MK_VEC
+#undef VX_MK_BYTES
+#undef VX_MK_L32
+#undef VX_MK_L64
+#undef VX_MK_SUM_REMAPPED
+#undef VX_MK_ZERO
+#undef VX_MK_SET1_I8
+#undef VX_MK_XOR
+#undef VX_MK_ADD_I64
+#undef VX_MK_SAD_U8
+#undef VX_MK_DPBUSD
+#undef VX_MK_LOADU
+#undef VX_MK_STOREU
 
-/* The AVX-512 VNNI specialization uses the same canonical U8 x I8 remapping
- * and compensation identity as the AVX-VNNI implementation, but consumes a
- * full 64-byte K block with ZMM VPDPBUSD. The eligibility proof bounds the raw
- * dot lanes as well as the centered result; dimensions after the last complete
- * ZMM block remain an ordinary scalar tail. */
-static VX_W8A8_TARGET_AVX512VNNI void vx_w8a8_qlinear_avx512vnni_range(
-        const VxW8A8QLinearCall *call, uint32_t begin, uint32_t end) {
-    const void *input = call->input;
-    const void *weight = call->weight;
-    const int32_t *bias = call->bias;
-    const float *weight_scales = call->weight_scales;
-    const int32_t *weight_zero_points = call->weight_zero_points;
-    void *output = call->output;
-    const uint32_t d_in = call->d_in;
-    const uint32_t d_out = call->d_out;
-    const float input_scale = call->input_scale;
-    const int32_t input_zero_point = call->input_zero_point;
-    const float output_scale = call->output_scale;
-    const int32_t output_zero_point = call->output_zero_point;
-    const uint32_t input_dtype = call->input_dtype;
-    const uint32_t weight_dtype = call->weight_dtype;
-    const uint32_t output_dtype = call->output_dtype;
-    const unsigned char *input_bytes = (const unsigned char *)input;
-    const unsigned char *weight_bytes = (const unsigned char *)weight;
-    const int input_xor_sign = input_dtype == VX_W8A8_I8;
-    const int weight_xor_sign = weight_dtype == VX_W8A8_U8;
-    const int32_t input_zero_unsigned = input_zero_point + (input_xor_sign ? 128 : 0);
-    const __m512i sign_bit = _mm512_set1_epi8((char)0x80);
-    const __m512i zero = _mm512_setzero_si512();
-    const int32_t output_minimum = output_dtype == VX_W8A8_I8 ? -128 : 0;
-    const int32_t output_maximum = output_dtype == VX_W8A8_I8 ? 127 : 255;
-    for (uint32_t row = begin; row < end; row++) {
-        const size_t input_offset = (size_t)row * d_in;
-        const size_t output_offset = (size_t)row * d_out;
-        const int64_t input_sum = vx_w8a8_sum_remapped_u8_avx512vnni(
-            input_bytes + input_offset, d_in, input_xor_sign);
-        for (uint32_t column = 0; column < d_out; column++) {
-            const size_t weight_offset = (size_t)column * d_in;
-            const int32_t weight_zero_signed = weight_zero_points[column] -
-                (weight_dtype == VX_W8A8_U8 ? 128 : 0);
-            __m512i dot_lanes = _mm512_setzero_si512();
-            __m512i weight_sum_lanes = _mm512_setzero_si512();
-            int32_t dot_lane_values[16];
-            uint64_t weight_sum_lane_values[8];
-            int64_t dot = 0;
-            int64_t weight_sum;
-            uint32_t dimension = 0;
-            for (; dimension + 64u <= d_in; dimension += 64u) {
-                __m512i input_values = _mm512_loadu_si512((const void *)
-                    (input_bytes + input_offset + dimension));
-                __m512i weight_values = _mm512_loadu_si512((const void *)
-                    (weight_bytes + weight_offset + dimension));
-                __m512i input_unsigned = input_xor_sign
-                    ? _mm512_xor_si512(input_values, sign_bit) : input_values;
-                __m512i weight_signed = weight_xor_sign
-                    ? _mm512_xor_si512(weight_values, sign_bit) : weight_values;
-                __m512i weight_unsigned = _mm512_xor_si512(weight_signed, sign_bit);
-                dot_lanes = _mm512_dpbusd_epi32(dot_lanes, input_unsigned,
-                                                 weight_signed);
-                weight_sum_lanes = _mm512_add_epi64(weight_sum_lanes,
-                    _mm512_sad_epu8(weight_unsigned, zero));
-            }
-            _mm512_storeu_si512((void *)dot_lane_values, dot_lanes);
-            for (uint32_t lane = 0; lane < 16u; lane++) dot += dot_lane_values[lane];
-            _mm512_storeu_si512((void *)weight_sum_lane_values, weight_sum_lanes);
-            weight_sum = -(int64_t)128 * (int64_t)dimension;
-            for (uint32_t lane = 0; lane < 8u; lane++)
-                weight_sum += (int64_t)weight_sum_lane_values[lane];
-            for (; dimension < d_in; dimension++) {
-                const int64_t input_unsigned = input_xor_sign
-                    ? (int64_t)(input_bytes[input_offset + dimension] ^ 0x80u)
-                    : (int64_t)input_bytes[input_offset + dimension];
-                const int64_t weight_signed = weight_xor_sign
-                    ? (int64_t)(int8_t)(weight_bytes[weight_offset + dimension] ^ 0x80u)
-                    : (int64_t)(int8_t)weight_bytes[weight_offset + dimension];
-                dot += input_unsigned * weight_signed;
-                weight_sum += weight_signed;
-            }
-            {
-                const int64_t accumulator = (int64_t)bias[column] + dot -
-                    (int64_t)weight_zero_signed * input_sum -
-                    (int64_t)input_zero_unsigned * weight_sum +
-                    (int64_t)d_in * input_zero_unsigned * weight_zero_signed;
-                const float product_scale = input_scale * weight_scales[column];
-                const float multiplier = product_scale / output_scale;
-                const float scaled = (float)accumulator * multiplier;
-                const float transformed = scaled + (float)output_zero_point;
-                const int32_t quantized = vx_w8a8_quantize_transformed(transformed,
-                    output_minimum, output_maximum, output_zero_point);
-                vx_w8a8_store_byte(output, output_dtype,
-                    output_offset + column, quantized);
-            }
-        }
-    }
-}
+#define VX_MK_TARGET        VX_W8A8_TARGET_AVX512VNNI
+#define VX_MK_SUFFIX        avx512vnni
+#define VX_MK_VEC           __m512i
+#define VX_MK_BYTES         64u
+#define VX_MK_L32           16u
+#define VX_MK_L64           8u
+#define VX_MK_SUM_REMAPPED  vx_w8a8_sum_remapped_u8_avx512vnni
+#define VX_MK_ZERO()        _mm512_setzero_si512()
+#define VX_MK_SET1_I8(x)    _mm512_set1_epi8(x)
+#define VX_MK_XOR(a, b)     _mm512_xor_si512((a), (b))
+#define VX_MK_ADD_I64(a, b) _mm512_add_epi64((a), (b))
+#define VX_MK_SAD_U8(a, b)  _mm512_sad_epu8((a), (b))
+#define VX_MK_DPBUSD(a, b, c) _mm512_dpbusd_epi32((a), (b), (c))
+#define VX_MK_LOADU(p)      _mm512_loadu_si512((const void *)(p))
+#define VX_MK_STOREU(p, v)  _mm512_storeu_si512((void *)(p), (v))
+#include "qlinear_vnni_kernel.inc"
+#undef VX_MK_TARGET
+#undef VX_MK_SUFFIX
+#undef VX_MK_VEC
+#undef VX_MK_BYTES
+#undef VX_MK_L32
+#undef VX_MK_L64
+#undef VX_MK_SUM_REMAPPED
+#undef VX_MK_ZERO
+#undef VX_MK_SET1_I8
+#undef VX_MK_XOR
+#undef VX_MK_ADD_I64
+#undef VX_MK_SAD_U8
+#undef VX_MK_DPBUSD
+#undef VX_MK_LOADU
+#undef VX_MK_STOREU
+#endif
 
-/* ZMM counterpart of the four-row seed tile.  Keeping four accumulator
- * vectors live remains well within the AVX-512 register file and turns every
- * 64-byte weight load into four exact VPDPBUSD updates. */
-static VX_W8A8_TARGET_AVX512VNNI void vx_w8a8_qlinear_avx512vnni_tiled_range(
-        const VxW8A8QLinearCall *call, uint32_t begin, uint32_t end) {
-    const unsigned char *input_bytes = (const unsigned char *)call->input;
-    const unsigned char *weight_bytes = (const unsigned char *)call->weight;
-    const uint32_t d_in = call->d_in;
-    const uint32_t d_out = call->d_out;
-    const int input_xor_sign = call->input_dtype == VX_W8A8_I8;
-    const int weight_xor_sign = call->weight_dtype == VX_W8A8_U8;
-    const int32_t input_zero_unsigned = call->input_zero_point +
-        (input_xor_sign ? 128 : 0);
-    const __m512i sign_bit = _mm512_set1_epi8((char)0x80);
-    const __m512i zero = _mm512_setzero_si512();
-    const int32_t output_minimum = call->output_dtype == VX_W8A8_I8 ? -128 : 0;
-    const int32_t output_maximum = call->output_dtype == VX_W8A8_I8 ? 127 : 255;
-    uint32_t row = begin;
-    if (end - begin < 4u || !vx_w8a8_qlinear_parallel_alias_safe(call)) {
-        vx_w8a8_qlinear_avx512vnni_range(call, begin, end);
-        return;
-    }
-    for (; row + 4u <= end; row += 4u) {
-        const size_t input_offsets[4] = {
-            (size_t)row * d_in,
-            (size_t)(row + 1u) * d_in,
-            (size_t)(row + 2u) * d_in,
-            (size_t)(row + 3u) * d_in,
-        };
-        const size_t output_offsets[4] = {
-            (size_t)row * d_out,
-            (size_t)(row + 1u) * d_out,
-            (size_t)(row + 2u) * d_out,
-            (size_t)(row + 3u) * d_out,
-        };
-        const int64_t input_sums[4] = {
-            vx_w8a8_sum_remapped_u8_avx512vnni(input_bytes + input_offsets[0],
-                d_in, input_xor_sign),
-            vx_w8a8_sum_remapped_u8_avx512vnni(input_bytes + input_offsets[1],
-                d_in, input_xor_sign),
-            vx_w8a8_sum_remapped_u8_avx512vnni(input_bytes + input_offsets[2],
-                d_in, input_xor_sign),
-            vx_w8a8_sum_remapped_u8_avx512vnni(input_bytes + input_offsets[3],
-                d_in, input_xor_sign),
-        };
-        for (uint32_t column = 0; column < d_out; column++) {
-            const size_t weight_offset = (size_t)column * d_in;
-            const int32_t weight_zero_signed = call->weight_zero_points[column] -
-                (call->weight_dtype == VX_W8A8_U8 ? 128 : 0);
-            __m512i dots0 = _mm512_setzero_si512();
-            __m512i dots1 = _mm512_setzero_si512();
-            __m512i dots2 = _mm512_setzero_si512();
-            __m512i dots3 = _mm512_setzero_si512();
-            __m512i weight_sum_lanes = _mm512_setzero_si512();
-            int32_t dot_lanes0[16], dot_lanes1[16], dot_lanes2[16], dot_lanes3[16];
-            uint64_t weight_sum_lane_values[8];
-            int64_t dots[4] = {0, 0, 0, 0};
-            int64_t weight_sum;
-            uint32_t dimension = 0;
-            for (; dimension + 64u <= d_in; dimension += 64u) {
-                const __m512i weight_values = _mm512_loadu_si512(
-                    (const void *)(weight_bytes + weight_offset + dimension));
-                const __m512i weight_signed = weight_xor_sign
-                    ? _mm512_xor_si512(weight_values, sign_bit) : weight_values;
-                const __m512i weight_unsigned =
-                    _mm512_xor_si512(weight_signed, sign_bit);
-                weight_sum_lanes = _mm512_add_epi64(weight_sum_lanes,
-                    _mm512_sad_epu8(weight_unsigned, zero));
-#define VX_W8A8_AVX512VNNI_ACCUMULATE_ROW(ROW, DOTS) do { \
-                const __m512i input_values = _mm512_loadu_si512( \
-                    (const void *)(input_bytes + input_offsets[(ROW)] + dimension)); \
-                const __m512i input_unsigned = input_xor_sign \
-                    ? _mm512_xor_si512(input_values, sign_bit) : input_values; \
-                (DOTS) = _mm512_dpbusd_epi32((DOTS), input_unsigned, \
-                                              weight_signed); \
-            } while (0)
-                VX_W8A8_AVX512VNNI_ACCUMULATE_ROW(0, dots0);
-                VX_W8A8_AVX512VNNI_ACCUMULATE_ROW(1, dots1);
-                VX_W8A8_AVX512VNNI_ACCUMULATE_ROW(2, dots2);
-                VX_W8A8_AVX512VNNI_ACCUMULATE_ROW(3, dots3);
-#undef VX_W8A8_AVX512VNNI_ACCUMULATE_ROW
-            }
-            _mm512_storeu_si512((void *)dot_lanes0, dots0);
-            _mm512_storeu_si512((void *)dot_lanes1, dots1);
-            _mm512_storeu_si512((void *)dot_lanes2, dots2);
-            _mm512_storeu_si512((void *)dot_lanes3, dots3);
-            for (uint32_t lane = 0; lane < 16u; lane++) {
-                dots[0] += dot_lanes0[lane];
-                dots[1] += dot_lanes1[lane];
-                dots[2] += dot_lanes2[lane];
-                dots[3] += dot_lanes3[lane];
-            }
-            _mm512_storeu_si512((void *)weight_sum_lane_values, weight_sum_lanes);
-            weight_sum = -(int64_t)128 * (int64_t)dimension;
-            for (uint32_t lane = 0; lane < 8u; lane++)
-                weight_sum += (int64_t)weight_sum_lane_values[lane];
-            for (; dimension < d_in; dimension++) {
-                const int64_t weight_signed = weight_xor_sign
-                    ? (int64_t)(int8_t)
-                        (weight_bytes[weight_offset + dimension] ^ 0x80u)
-                    : (int64_t)(int8_t)weight_bytes[weight_offset + dimension];
-                weight_sum += weight_signed;
-                for (uint32_t tile_row = 0; tile_row < 4u; tile_row++) {
-                    const int64_t input_unsigned = input_xor_sign
-                        ? (int64_t)(input_bytes[input_offsets[tile_row] + dimension] ^
-                            0x80u)
-                        : (int64_t)input_bytes[input_offsets[tile_row] + dimension];
-                    dots[tile_row] += input_unsigned * weight_signed;
-                }
-            }
-            {
-                const float product_scale =
-                    call->input_scale * call->weight_scales[column];
-                const float multiplier = product_scale / call->output_scale;
-                for (uint32_t tile_row = 0; tile_row < 4u; tile_row++) {
-                    const int64_t accumulator = (int64_t)call->bias[column] +
-                        dots[tile_row] -
-                        (int64_t)weight_zero_signed * input_sums[tile_row] -
-                        (int64_t)input_zero_unsigned * weight_sum +
-                        (int64_t)d_in * input_zero_unsigned * weight_zero_signed;
-                    const float scaled = (float)accumulator * multiplier;
-                    const float transformed =
-                        scaled + (float)call->output_zero_point;
-                    const int32_t quantized = vx_w8a8_quantize_transformed(
-                        transformed, output_minimum, output_maximum,
-                        call->output_zero_point);
-                    vx_w8a8_store_byte(call->output, call->output_dtype,
-                        output_offsets[tile_row] + column, quantized);
-                }
-            }
-        }
-    }
-    if (row < end) vx_w8a8_qlinear_avx512vnni_range(call, row, end);
-}
+
+
+
+
+
+
 
 static void vx_w8a8_qlinear_parallel_worker(void *opaque, int begin, int end) {
     const VxW8A8QLinearParallelContext *context =
@@ -885,21 +741,8 @@ static int vx_w8a8_qlinear_parallel_worthwhile(
     return products >= VX_W8A8_QLINEAR_PARALLEL_PRODUCTS;
 }
 
-static int vx_w8a8_qlinear_ranges_overlap(const void *left, size_t left_size,
-                                            const void *right, size_t right_size) {
-    const uintptr_t left_begin = (uintptr_t)left;
-    const uintptr_t right_begin = (uintptr_t)right;
-    uintptr_t left_end, right_end;
-    if (!left_size || !right_size) return 0;
-    if (left_begin > UINTPTR_MAX - left_size ||
-        right_begin > UINTPTR_MAX - right_size) return 1;
-    left_end = left_begin + left_size;
-    right_end = right_begin + right_size;
-    return left_begin < right_end && right_begin < left_end;
-}
-
-/* The canonical ABI historically permits aliased buffers and evaluates rows
- * in increasing order.  Keep such calls serial so parallel row scheduling
+/* The canonical ABI permits aliased buffers and evaluates rows in increasing
+ * order. Keep such calls serial so parallel row scheduling
  * cannot turn an ordered dependency into a data race. */
 static int vx_w8a8_qlinear_parallel_alias_safe(
         const VxW8A8QLinearCall *call) {
@@ -912,15 +755,15 @@ static int vx_w8a8_qlinear_parallel_alias_safe(
     if (!vx_w8a8_mul_size(&bias_bytes, sizeof(int32_t)) ||
         !vx_w8a8_mul_size(&scale_bytes, sizeof(float)) ||
         !vx_w8a8_mul_size(&zero_point_bytes, sizeof(int32_t))) return 0;
-    if (vx_w8a8_qlinear_ranges_overlap(call->output, output_elements,
+    if (vx_w8a8_ranges_overlap(call->output, output_elements,
                                         call->input, input_elements) ||
-        vx_w8a8_qlinear_ranges_overlap(call->output, output_elements,
+        vx_w8a8_ranges_overlap(call->output, output_elements,
                                         call->weight, weight_elements) ||
-        vx_w8a8_qlinear_ranges_overlap(call->output, output_elements,
+        vx_w8a8_ranges_overlap(call->output, output_elements,
                                         call->bias, bias_bytes) ||
-        vx_w8a8_qlinear_ranges_overlap(call->output, output_elements,
+        vx_w8a8_ranges_overlap(call->output, output_elements,
                                         call->weight_scales, scale_bytes) ||
-        vx_w8a8_qlinear_ranges_overlap(call->output, output_elements,
+        vx_w8a8_ranges_overlap(call->output, output_elements,
                                         call->weight_zero_points,
                                         zero_point_bytes)) return 0;
     return 1;
@@ -937,13 +780,20 @@ static int vx_w8a8_qlinear_parallel_enabled(
 /* Rows are independent.  Four dynamically assigned row tiles per worker
  * balance scheduling without paying a mutex acquisition for every row. */
 static int vx_w8a8_qlinear_run(const VxW8A8QLinearCall *call,
-                                VxW8A8QLinearRangeFn function) {
+                                VxW8A8QLinearRangeFn function,
+                                uint32_t tile_rows) {
     const int threads = vx_w8a8_qlinear_parallel_enabled(call)
         ? vx_kernels_thread_count() : 1;
     if (threads > 1) {
         const uint32_t target_tiles = (uint32_t)threads * 4u;
         uint32_t grain = (call->rows + target_tiles - 1u) / target_tiles;
         VxW8A8QLinearParallelContext context = {call, function};
+        /* Preserve the row microkernel boundary for every pool chunk.  Without
+         * this rounding, a 100-row prefix with four workers produces 7-row
+         * chunks, forcing each four-row dot kernel to execute a three-row
+         * scalar tail and reload the same weights. */
+        if (tile_rows > 1u)
+            grain = ((grain + tile_rows - 1u) / tile_rows) * tile_rows;
         if (grain > (uint32_t)INT_MAX) grain = (uint32_t)INT_MAX;
         vx_kernels_parallel_for((int)call->rows, (int)grain,
                                 vx_w8a8_qlinear_parallel_worker, &context);
@@ -990,9 +840,11 @@ int vx_qlinear_i8u8_native_will_parallelize(const void *input,
         .output_dtype = output_dtype,
     };
     if (!vx_w8a8_qlinear_parallel_worthwhile(&call)) return 0;
+    const VxKernelPlatform* platform = vx_kernel_platform();
     const int native_isa =
-        (d_in >= 64u && vx_cpu_has_avx512_vnni()) ||
-        (d_in >= 32u && vx_cpu_has_avx_vnni()) || vx_cpu_has_avx2();
+        vx_kernel_qlinear_prefers_avx512_vnni(platform, d_in) ||
+        (d_in >= platform->qlinear_avx_vnni_min_d_in &&
+         platform->has_avx_vnni) || platform->has_avx2;
     return native_isa && vx_w8a8_avx2_eligible(input, weight, bias,
         weight_scales, weight_zero_points, output, rows, d_in, d_out,
         input_scale, input_zero_point, output_scale, output_zero_point,
@@ -1054,19 +906,33 @@ int vx_qlinear_i8u8_native(const void *input, const void *weight,
         .weight_dtype = weight_dtype,
         .output_dtype = output_dtype,
     };
+    const VxKernelPlatform* platform = vx_kernel_platform();
     const int avx2_eligible = vx_w8a8_avx2_eligible(input, weight, bias,
         weight_scales, weight_zero_points, output, rows, d_in, d_out,
         input_scale, input_zero_point, output_scale, output_zero_point,
         input_dtype, weight_dtype, output_dtype);
-    if (avx2_eligible && d_in >= 64u && vx_cpu_has_avx512_vnni()) {
+    /* Widest usable integer dot first, then the narrower kernels.  Each tier
+     * carries its own minimum reduction length: below it the setup cost is not
+     * amortized and the narrower kernel wins. */
+    if (avx2_eligible && vx_kernel_qlinear_prefers_avx512_vnni(platform, d_in)) {
         return vx_w8a8_qlinear_run(&call,
-                                    vx_w8a8_qlinear_avx512vnni_tiled_range);
+                                    vx_w8a8_qlinear_avx512vnni_tiled_range,
+                                    4u);
     }
-    if (avx2_eligible && d_in >= 32u && vx_cpu_has_avx_vnni()) {
-        return vx_w8a8_qlinear_run(&call, vx_w8a8_qlinear_avxvnni_tiled_range);
+    if (avx2_eligible && platform->has_avx_vnni &&
+        d_in >= platform->qlinear_avx_vnni_min_d_in) {
+        return vx_w8a8_qlinear_run(&call,
+                                    vx_w8a8_qlinear_avxvnni_tiled_range, 4u);
     }
-    if (avx2_eligible && vx_cpu_has_avx2()) {
-        return vx_w8a8_qlinear_run(&call, vx_w8a8_qlinear_avx2_tiled_range);
+    if (avx2_eligible && platform->has_avx2 &&
+        d_in >= platform->qlinear_maddubs_min_d_in) {
+        return vx_w8a8_qlinear_run(&call,
+                                    vx_w8a8_qlinear_avx2_maddubs_tiled_range,
+                                    4u);
+    }
+    if (avx2_eligible && platform->has_avx2) {
+        return vx_w8a8_qlinear_run(&call,
+                                    vx_w8a8_qlinear_avx2_tiled_range, 8u);
     }
 #endif
     return qlinear_i8u8(input, weight, bias, weight_scales, weight_zero_points,

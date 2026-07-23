@@ -1,7 +1,50 @@
 #ifndef VOLVOXAI_PACKED_QUANT_GEMM_H
 #define VOLVOXAI_PACKED_QUANT_GEMM_H
 
+#include <stddef.h>
 #include <stdint.h>
+#include "../../include/volvoxai_enums.h"
+
+/*
+ * Private in-memory V8Q2 contract shared by the baseline parent and the
+ * optional Relaxed-SIMD child.  Packs are derived runtime state and are never
+ * serialized or exposed through the public C ABI.
+ */
+enum {
+    VX_PACKED_Q8_MAGIC = 0x32513856u, /* "V8Q2" in little endian. */
+    VX_PACKED_Q8_NR = 8u,
+};
+
+typedef struct {
+    uint32_t magic;
+    uint32_t bytes;
+    uint32_t d_in;
+    uint32_t d_out;
+    uint32_t n_blocks;
+    uint32_t weight_dtype;
+    uint32_t sums_offset;
+    uint32_t data_offset;
+    uint32_t pair_n_blocks;
+    uint32_t pair_k_blocks;
+    uint32_t pair_data_offset;
+    uint32_t pair_flags;
+} VxPackedQ8Header;
+
+#if defined(__cplusplus)
+static_assert(sizeof(VxPackedQ8Header) == 48u,
+              "V8Q2 packed header size must remain stable");
+static_assert(offsetof(VxPackedQ8Header, sums_offset) == 24u,
+              "V8Q2 sums offset field must remain stable");
+static_assert(offsetof(VxPackedQ8Header, pair_n_blocks) == 32u,
+              "V8Q2 extension offset must remain stable");
+#else
+_Static_assert(sizeof(VxPackedQ8Header) == 48u,
+               "V8Q2 packed header size must remain stable");
+_Static_assert(offsetof(VxPackedQ8Header, sums_offset) == 24u,
+               "V8Q2 sums offset field must remain stable");
+_Static_assert(offsetof(VxPackedQ8Header, pair_n_blocks) == 32u,
+               "V8Q2 extension offset must remain stable");
+#endif
 
 #ifdef __cplusplus
 extern "C" {
@@ -29,10 +72,13 @@ int vx_qlinear_i8u8_packed(const void* input, const void* packed_weight,
         float output_scale, int32_t output_zero_point,
         uint32_t input_dtype, uint32_t weight_dtype, uint32_t output_dtype);
 
-/* Native physical-QLinear policy. The raw ISA dispatcher wins the M=1 decode
- * shape; the packed AVX2 B-panel kernel wins once multiple rows share B.
- * Other ISAs retain their existing runtime-gated raw microkernels. */
-int vx_packed_q8_preferred_for_native_w8a8(uint32_t rows);
+/* Native physical-QLinear policy. The exact packed AVX2 K4/N16 kernel is
+ * available only for symmetric I8 weights. Packs without -128 use a bounded
+ * signed-absolute dot; other packs retain the exact unsigned split. Short-K
+ * M=1 adapter projections also benefit, while ordinary M=1 decode keeps the
+ * raw GEMV dispatcher. Other ISAs retain their runtime-gated raw kernels. */
+int vx_packed_q8_preferred_for_native_w8a8(uint32_t rows, uint32_t d_in,
+        uint32_t d_out, uint32_t weight_dtype, int weight_zero_all_zero);
 
 #ifdef __cplusplus
 }

@@ -60,7 +60,7 @@ function qGroupNormGraph({
       quantization: outputQuantization,
     },
   }, params);
-  graph.outputNames = [out.name];
+  graph.setOutputs([out.name]);
   return { graph, inputValues: bytes(inputDtype, inputValues), out };
 }
 
@@ -86,7 +86,7 @@ function qGroupNormDynamicAffineGraph() {
       quantization: { scheme: 'per_tensor', scale: 0.125, zero_point: -3 },
     },
   }, { num_groups: 2, eps: 1e-5 });
-  graph.outputNames = [out.name];
+  graph.setOutputs([out.name]);
   return { graph, inputValues, out };
 }
 

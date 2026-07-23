@@ -14,16 +14,18 @@
                 let offset = row * d_model;
                 
                 var sum : f32 = 0.0;
-                var sq_sum : f32 = 0.0;
                 
                 for (var i = 0u; i < d_model; i = i + 1u) {
-                    let val = input[offset + i];
-                    sum = sum + val;
-                    sq_sum = sq_sum + (val * val);
+                    sum = sum + input[offset + i];
                 }
                 
                 let mean = sum / f32(d_model);
-                let variance = (sq_sum / f32(d_model)) - (mean * mean);
+                var variance_sum : f32 = 0.0;
+                for (var i = 0u; i < d_model; i = i + 1u) {
+                    let centered = input[offset + i] - mean;
+                    variance_sum = variance_sum + (centered * centered);
+                }
+                let variance = variance_sum / f32(d_model);
                 let inv_std = inverseSqrt(variance + params.eps);
                 
                 for (var i = 0u; i < d_model; i = i + 1u) {

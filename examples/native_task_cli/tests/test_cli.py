@@ -57,32 +57,60 @@ def write_rgb_png(path: Path, width: int, height: int, pixels: bytes) -> None:
     )
 
 
-def write_image_identity_config(
+def write_image_identity_graph(
     path: Path,
     dtype: str,
     *,
     scale: float | None = None,
     zero_point: int = 0,
     image_normalization: str | None = None,
-) -> None:
+) -> Path | None:
     input_descriptor: dict[str, object] = {
         "shape": [1, 1, 2, 3],
         "dtype": dtype,
     }
-    output_descriptor: dict[str, object] = {}
+    graph_quantization: dict[str, object] | None = None
+    weights_path: Path | None = None
     if scale is not None:
-        quantization = {
+        require(dtype in {"int8", "uint8"}, "Quantized image dtype must be I8/U8")
+        scale_name = "__quant__.image.scale"
+        zero_name = "__quant__.image.zero_point"
+        descriptor = {
             "scheme": "per_tensor",
-            "scale": scale,
-            "zero_point": zero_point,
+            "scale_tensor": scale_name,
+            "zero_point_tensor": zero_name,
         }
-        input_descriptor["quantization"] = quantization
-        output_descriptor["outputs_quantization"] = {"out": quantization}
+        graph_quantization = {
+            "format": "volvox-affine-safetensors/v1",
+            "tensors": {"image": descriptor, "pixels": descriptor},
+        }
+        scale_bytes = struct.pack("<f", scale)
+        zero_bytes = struct.pack("b" if dtype == "int8" else "B", zero_point)
+        tensors = {
+            scale_name: {
+                "dtype": "F32",
+                "shape": [1],
+                "data_offsets": [0, len(scale_bytes)],
+            },
+            zero_name: {
+                "dtype": "I8" if dtype == "int8" else "U8",
+                "shape": [1],
+                "data_offsets": [len(scale_bytes), len(scale_bytes) + len(zero_bytes)],
+            },
+        }
+        header = json.dumps(tensors, separators=(",", ":")).encode("utf-8")
+        header += b" " * ((-len(header)) % 8)
+        weights_path = path.with_suffix(".safetensors")
+        weights_path.write_bytes(
+            struct.pack("<Q", len(header)) + header + scale_bytes + zero_bytes
+        )
     if image_normalization is not None:
         input_descriptor["image_normalization"] = image_normalization
     path.write_text(
         json.dumps(
             {
+                "format": "volvox-graph/v1",
+                **({"quantization": graph_quantization} if graph_quantization else {}),
                 "inputs": {"image": input_descriptor},
                 "nodes": [
                     {
@@ -91,7 +119,6 @@ def write_image_identity_config(
                         "outputs": {"out": "pixels"},
                         "outputs_shape": {"out": [1, 1, 2, 3]},
                         "outputs_dtype": {"out": dtype},
-                        **output_descriptor,
                     }
                 ],
                 "outputs": ["pixels"],
@@ -99,6 +126,7 @@ def write_image_identity_config(
         ),
         encoding="utf-8",
     )
+    return weights_path
 
 
 def main() -> int:
@@ -111,8 +139,13 @@ def main() -> int:
     help_result = run(binary, "--help")
     require(help_result.returncode == 0, "Task CLI help failed", help_result)
     help_text = help_result.stdout.decode(errors="replace")
-    for command in ("run", "generate", "classify", "detect", "ctc", "seq2seq", "chat"):
+    for command in ("run", "classify", "detect", "decode"):
         require(f"  {command} " in help_text, f"Missing task CLI command: {command}")
+    for undeclared in ("generate", "ctc", "seq2seq", "chat", "train"):
+        require(
+            f"  {undeclared} " not in help_text,
+            f"Undeclared task command is exposed: {undeclared}",
+        )
 
     detect_help = run(binary, "detect", "--help")
     require(detect_help.returncode == 0, "Detect help failed", detect_help)
@@ -121,18 +154,24 @@ def main() -> int:
         "Detect help does not describe label files",
         detect_help,
     )
+    require(
+        b"--include_transfers" in detect_help.stdout,
+        "Detect help does not describe transfer-inclusive timing",
+        detect_help,
+    )
 
     with tempfile.TemporaryDirectory(prefix="volvoxai-task-cli-") as temporary:
         root = Path(temporary)
-        config = root / "config.json"
+        graph = root / "graph.json"
         x_path = root / "x.f32"
         ids_path = root / "ids.i32"
         y_output = root / "y.f32"
         ids_output = root / "ids-out.i32"
 
-        config.write_text(
+        graph.write_text(
             json.dumps(
                 {
+                    "format": "volvox-graph/v1",
                     "inputs": {
                         "x": {"shape": [2], "dtype": "float32"},
                         "ids": {"shape": [2], "dtype": "int32"},
@@ -185,10 +224,10 @@ def main() -> int:
             ("uint8", ".u8", 0.0078125, 127, image_pixels),
             ("int8", ".i8", 0.03125, -3, bytes((128, 192, 255, 0, 72, 127))),
         ):
-            image_config = root / f"image-{dtype}-raw.json"
+            image_graph = root / f"image-{dtype}-raw.graph.json"
             image_output = root / f"image-{dtype}-raw{suffix}"
-            write_image_identity_config(
-                image_config,
+            image_weights = write_image_identity_graph(
+                image_graph,
                 dtype,
                 scale=scale,
                 zero_point=zero_point,
@@ -197,7 +236,9 @@ def main() -> int:
             result = run(
                 binary,
                 "run",
-                str(image_config),
+                str(image_graph),
+                "--weights",
+                str(image_weights),
                 "--image",
                 f"image={image_path}",
                 "--output",
@@ -222,10 +263,10 @@ def main() -> int:
             ),
         )
         for dtype, suffix, normalize, scale, zero_point, expected in normalized_cases:
-            image_config = root / f"image-{dtype}-{normalize}.json"
+            image_graph = root / f"image-{dtype}-{normalize}.graph.json"
             image_output = root / f"image-{dtype}-{normalize}{suffix}"
-            write_image_identity_config(
-                image_config,
+            image_weights = write_image_identity_graph(
+                image_graph,
                 dtype,
                 scale=scale,
                 zero_point=zero_point,
@@ -234,7 +275,9 @@ def main() -> int:
             result = run(
                 binary,
                 "run",
-                str(image_config),
+                str(image_graph),
+                "--weights",
+                str(image_weights),
                 "--image",
                 f"image={image_path}",
                 "--output",
@@ -247,15 +290,15 @@ def main() -> int:
                 result,
             )
 
-        f32_image_config = root / "image-f32.json"
+        f32_image_graph = root / "image-f32.graph.json"
         f32_image_output = root / "image-f32.f32"
-        write_image_identity_config(
-            f32_image_config, "float32", image_normalization="zero-one"
+        write_image_identity_graph(
+            f32_image_graph, "float32", image_normalization="zero-one"
         )
         result = run(
             binary,
             "run",
-            str(f32_image_config),
+            str(f32_image_graph),
             "--image",
             f"image={image_path}",
             "--output",
@@ -274,7 +317,7 @@ def main() -> int:
         result = run(
             binary,
             "run",
-            str(f32_image_config),
+            str(f32_image_graph),
             "--image",
             f"image={image_path}",
             "--image-normalize",
@@ -291,13 +334,13 @@ def main() -> int:
             result,
         )
 
-        f32_unannotated_config = root / "image-f32-unannotated.json"
+        f32_unannotated_graph = root / "image-f32-unannotated.graph.json"
         f32_unannotated_output = root / "image-f32-unannotated.f32"
-        write_image_identity_config(f32_unannotated_config, "float32")
+        write_image_identity_graph(f32_unannotated_graph, "float32")
         result = run(
             binary,
             "run",
-            str(f32_unannotated_config),
+            str(f32_unannotated_graph),
             "--image",
             f"image={image_path}",
             "--output",
@@ -314,7 +357,7 @@ def main() -> int:
         result = run(
             binary,
             "run",
-            str(f32_unannotated_config),
+            str(f32_unannotated_graph),
             "--image",
             f"image={image_path}",
             "--image-normalize",
@@ -328,14 +371,14 @@ def main() -> int:
             result,
         )
 
-        f32_invalid_config = root / "image-f32-invalid.json"
-        write_image_identity_config(
-            f32_invalid_config, "float32", image_normalization="automatic"
+        f32_invalid_graph = root / "image-f32-invalid.graph.json"
+        write_image_identity_graph(
+            f32_invalid_graph, "float32", image_normalization="automatic"
         )
         result = run(
             binary,
             "run",
-            str(f32_invalid_config),
+            str(f32_invalid_graph),
             "--image",
             f"image={image_path}",
         )
@@ -350,7 +393,7 @@ def main() -> int:
         result = run(
             binary,
             "run",
-            str(config),
+            str(graph),
             "--input",
             f"x={x_path}",
             "--input",
@@ -366,15 +409,16 @@ def main() -> int:
 
         detector = root / "detector"
         detector.mkdir()
-        detector_config = detector / "config.json"
+        detector_graph = detector / "graph.json"
         boxes_input = detector / "boxes.f32"
         scores_input = detector / "scores.f32"
         labels = detector / "labels.txt"
         override_labels = root / "override-labels.txt"
 
-        detector_config.write_text(
+        detector_graph.write_text(
             json.dumps(
                 {
+                    "format": "volvox-graph/v1",
                     "inputs": {
                         "box_in": {"shape": [2, 4], "dtype": "float32"},
                         "score_in": {"shape": [2, 3], "dtype": "float32"},
@@ -435,8 +479,30 @@ def main() -> int:
             result,
         )
 
+        result = run(
+            binary,
+            *detect_args,
+            "--warmup_runs",
+            "1",
+            "--num_runs",
+            "2",
+            "--include_transfers",
+        )
+        require(result.returncode == 0, "Transfer-inclusive detection failed", result)
+        require(
+            b"[bench] detect:" in result.stderr
+            and b"warmup=1, runs=2, transfers=on" in result.stderr,
+            "Transfer-inclusive detection did not report its timed scope",
+            result,
+        )
+        require(
+            b"1\t0\t0.9\t90.00%\t2\tdog\t0.1\t0.2\t0.3\t0.4" in result.stdout,
+            "Transfer-inclusive timing changed detection output",
+            result,
+        )
+
         unlabeled_args = list(detect_args)
-        unlabeled_args[1] = str(detector_config)
+        unlabeled_args[1] = str(detector_graph)
         result = run(binary, *unlabeled_args)
         require(result.returncode == 0, "Unlabeled detection failed", result)
         require(
@@ -462,15 +528,15 @@ def main() -> int:
             result,
         )
 
-        custom_detector_config = detector / "custom-outputs.json"
-        custom_detector_config.write_text(
-            detector_config.read_text(encoding="utf-8")
+        custom_detector_graph = detector / "custom-outputs.graph.json"
+        custom_detector_graph.write_text(
+            detector_graph.read_text(encoding="utf-8")
             .replace('"boxes"', '"custom_boxes"')
             .replace('"scores"', '"custom_scores"'),
             encoding="utf-8",
         )
         custom_args = list(detect_args)
-        custom_args[1] = str(custom_detector_config)
+        custom_args[1] = str(custom_detector_graph)
         result = run(binary, *custom_args)
         require(
             result.returncode != 0

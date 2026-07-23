@@ -8,6 +8,16 @@ permissions:
   contents: read
 
 jobs:
+  synurang-ffi:
+    name: Synurang FFI adapter
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo check --locked --manifest-path runtime/Cargo.toml
+      - run: cargo test --locked --manifest-path runtime/Cargo.toml
+
   javascript:
     name: JavaScript and WASM profiles
     runs-on: ubuntu-latest
@@ -18,10 +28,13 @@ jobs:
         with:
           node-version: 20
           cache: npm
+      - run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
       - run: npm ci
+      - run: make proto_codegen_check
       - run: npm run typecheck
       - run: npm run build:all
       - run: make build_wasm
+      - run: make build_native
       - run: npm run check:release
       - run: npm test
 
@@ -36,3 +49,50 @@ jobs:
       # no npm/node needed for the native suite.
       - run: make test_native_all
       - run: make verify_native_isa
+
+  parity:
+    name: Cross-tier parity and benchmark
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - run: npm ci
+      - run: npm run build:all
+      - run: make build_wasm
+      # Model packages are git-ignored (docs/models.md); regenerate from public
+      # sources, cached across runs so most builds skip the heavy export.
+      - uses: actions/cache@v4
+        with:
+          path: models
+          key: parity-models-v4-${{ hashFiles('tools/requirements-export.txt', 'examples/**/requirements-export.txt', 'tools/**/*.py', 'examples/**/tools/**', 'tests/parity/policy.json') }}
+      - run: |
+          if [ ! -f models/tinystories_1m/graph.json ]; then
+            make models_deps && make models
+          fi
+      - run: make validate_model_packages
+      - run: make build_native
+      # External correctness oracle (ONNX Runtime) — best-effort; make parity
+      # runs it under a leading '-' so a missing install never breaks the gate.
+      - run: pip install -r tests/parity/external/requirements.txt || true
+      # Gates on pure-JS (oracle) vs WASM vs native-CPU for all shipped models,
+      # plus a best-effort ONNX Runtime correctness check on the fp32 detector.
+      - run: make parity
+      # Level 1 per-op + Level 2 mixed-graph matrices (gate WASM + native-CPU vs
+      # pure-JS; PyTorch oracle best-effort, skipped unless torch is installed).
+      - run: make parity_ops
+      - run: make parity_graphs
+      - run: make parity_coverage
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: parity-report
+          path: |
+            tests/parity/out/report.md
+            tests/parity/out/report.json
+            tests/parity/out/op_matrix.md
+            tests/parity/out/graph_matrix.md
+            tests/parity/out/coverage.md

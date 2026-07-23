@@ -1,150 +1,440 @@
 # Backend SDK
 
-VolvoxAI has one backend lifecycle on native and browser targets. A device
-integration registers a stable name, advertises the nodes it can execute, and
-declines the rest. The portable CPU implementation remains the final
-correctness fallback, so a vendor backend can start with one or two high-value
-operators without copying the runtime or editing a core backend enum.
+VolvoxAI has one provider SPI ownership contract across JavaScript and native
+targets. The SPI composes backend implementations into a runtime; it is not an
+application-facing Synurang operation:
 
-## Native C ABI
+~~~text
+provider runtime instance
+  compiled-model instance
+    execution-context instance
+      stable output snapshot
+~~~
 
-Include the public engine and backend headers, fill a `VxBackendV1`, and
-register it before loading a model:
+A provider receives explicit scope at every callback. It must not use
+process-global graph, tensor, request, decode, or output state. Different
+contexts created from one compiled model must own independent mutable execution
+state.
 
-```c
-#include "volvoxai.h"
-#include "volvoxai_backend.h"
-#include <string.h>
+Provider selection and operator routing are separate policies. Compilation
+finishes provider selection before execution begins, and execution failure is
+never retried on another provider.
 
-static int device_init(void* context) { /* open the driver */ return VX_INIT_READY; }
-static int device_supports(void* context, const VxNode* node) {
-    return vendor_can_execute_exactly(context, node) ? VX_HANDLED : VX_DECLINED;
-}
-static int device_run(void* context, const VxNode* node) {
-    const VxTensor* input = vx_node_input_by_key(node, "input");
-    const VxTensor* weight = vx_node_input_by_key(node, "weight");
-    VxTensor* output = vx_node_output_by_key(node, "out");
-    return vendor_linear(context, input, weight, output) == 0
-        ? VX_HANDLED : VX_ERROR;
-}
-static void device_teardown(void* context) { /* close the driver */ }
+## JavaScript provider SPI
 
-VxBackendV1 backend = {
-    .struct_size = sizeof(VxBackendV1),
-    .abi_version = VX_BACKEND_ABI_V1,
-    .name = "my-npu",
-    .user_data = &driver,
-    .init = device_init,
-    .supports = device_supports,
-    .run = device_run,
-    .teardown = device_teardown,
+Supply a provider factory under a canonical lowercase name when creating its
+owning Runtime:
+
+~~~javascript
+import {
+  VOLVOXAI_BACKEND_PROVIDER_VERSION,
+  VolvoxAI,
+  createBackendDeviceIdentity,
+  createBackendProviderCapabilities,
+} from 'volvoxai';
+
+const myNpuProvider = async ({ name }) => {
+    const device = await openVendorDevice();
+    const deviceIdentity = createBackendDeviceIdentity({
+      vendor: device.vendor,
+      model: device.model,
+    });
+
+    return {
+      providerVersion: VOLVOXAI_BACKEND_PROVIDER_VERSION,
+      backendName: name,
+      deviceIdentity,
+      capabilities: createBackendProviderCapabilities({
+        operatorFallback: 'none',
+        outputLocation: 'host',
+      }),
+
+      async compile(snapshot, options) {
+        const plan = await compileVendorPlan(snapshot, options);
+
+        return {
+          backendName: name,
+          compilationEvidence: {
+            device: deviceIdentity,
+            allocationBytes: plan.allocationBytes ?? null,
+          },
+
+          async createContext(contextOptions = {}) {
+            const state = await plan.createExecutionState(contextOptions);
+
+            return {
+              backendName: name,
+
+              async execute(inputs, executionOptions = {}) {
+                const outputs = await state.execute(
+                  inputs,
+                  executionOptions,
+                );
+                return {
+                  outputs,
+                  backendReport: {
+                    route: {
+                      operatorFallbackUsed: false,
+                    },
+                  },
+                };
+              },
+
+              async close() {
+                await state.close();
+              },
+            };
+          },
+
+          async close() {
+            await plan.close();
+          },
+        };
+      },
+
+      async close() {
+        await device.close();
+      },
+    };
 };
 
-volvoxai_register_backend(&backend);
-volvoxai_engine_configure_backend("my-npu");
-volvoxai_engine_init("config.json", "model.safetensors");
-```
-
-The compilable [host backend example](../examples/backend_sdk/host_backend.c)
-is a public-header-only starting point for an out-of-tree integration. The
-[Android NNAPI example](../examples/backend_sdk/android_nnapi_backend.c) uses
-the same ABI for one conservative accelerator operation.
-
-`VxNode` and `VxTensor` are borrowed opaque views. Use the accessors for
-operator names, semantic operand keys, shapes, dtypes, storage, attributes, and
-per-tensor/per-axis quantization; never include private `Node` or `T` headers.
-The descriptor and name are copied, while `user_data` and the state it reaches
-remain caller-owned while the backend can be selected.
-
-All backend callbacks run under the engine model lock. They must not call
-`volvoxai_engine_*` APIs. `supports()` and `run()` inspect their borrowed graph
-views only with the public `vx_*` accessors; lifecycle callbacks may call the
-vendor driver directly. The one intentional nested callback is
-`run()` → `vx_tensor_sync_host()` → the selected backend's `sync_host()`, so
-`sync_host()` must not wait on a vendor lock already held by `run()`. Handles
-and metadata pointers are callback-scoped. A device backend may retain only a
-tensor data pointer's identity as an opaque storage key until `reset()` or
-`teardown()`, and may dereference it only when host storage is current.
-`teardown()` is called after every non-ready `init()` attempt, so partially
-initialized driver state should be released there.
-
-`supports()` is a semantic promise, not just an operator-name filter. Check
-every dtype, shape/layout relation, optional operand, attribute, quantization
-descriptor, and fused behavior that changes the result. Return `VX_DECLINED`
-for an otherwise valid node outside that exact subset so CPU can execute it;
-reserve `VX_ERROR` for driver or execution failures after accepting the node.
-
-ABI v1 describes complete ordinary-inference nodes only. The runtime therefore
-bypasses public SDK callbacks during native training, adapter-modified Linear,
-legacy QTensor execution, and active prefix/row/execution-row windows; the
-remaining built-in registry routes, ending in CPU, retain those semantics. A
-future ABI must expose an execution window explicitly before an out-of-tree
-backend can opt into partial-node work. V1 also has no contract for publishing
-the runtime-private attention K/V rows, so selecting any public backend makes
-`volvoxai_engine_incremental_row_supported()` return false and rejects a
-decode session that requires row mode. Complete-node dependency incremental
-execution remains available.
-
-Registration is discovery, not activation. `volvoxai_engine_configure_backend`
-selects one registered backend by name, and an unavailable explicitly selected
-device fails instead of silently changing policy. Built-in enum values remain
-for source compatibility, but a new accelerator does not add another enum
-member or another per-node `#if` branch.
-
-A host-output backend writes through `vx_tensor_data()`. A backend that retains
-device-resident outputs sets `VX_BACKEND_FLAG_DEVICE_RESIDENT_OUTPUTS` and
-implements the paired forward/coherence hooks. The runtime keys coherence by
-the borrowed host allocation, allowing the vendor to keep a private device
-buffer table without putting device handles on the public tensor object.
-
-## Browser contract
-
-`BackendEngine` defines the matching JavaScript lifecycle:
-
-- `allocateGraph(graph)` binds and prepares one graph;
-- `execute(inputs, options)` runs it;
-- `capabilities` declares incremental execution, row execution, and host/device
-  output location;
-- `createDecodeSession()` provides backend-neutral autoregressive caching.
-
-`CPUEngine`, `WasmEngine`, `WebGPUEngine`, and `WebNNEngine` are peers under
-that contract. `WebGPUEngine` owns the lower-level `GraphExecutor`, so WebGPU no
-longer needs a special branch in `VolvoxAI.compile()`.
-
-Out-of-tree browser devices register a factory by name:
-
-```js
-VolvoxAI.registerBackend('my-npu', async ({ name, runtime }) => {
-  return new MyNpuEngine({ name, runtime });
+const runtime = await VolvoxAI.createRuntime({
+  backends: ['my-npu'],
+  providers: { 'my-npu': myNpuProvider },
 });
+~~~
 
-const runtime = await VolvoxAI.init('my-npu');
-```
+The factory receives name, runtime, and wasmUrl. It may return null when its
+device is unavailable. The descriptor must use the exported provider version,
+return frozen capabilities from createBackendProviderCapabilities(), and use a
+backendName matching the configured name. createBackendDeviceIdentity() copies
+non-empty string fields into frozen serializable metadata. Built-in names are
+reserved.
 
-The engine may subclass `BackendEngine` or implement the complete structural
-API v1 equivalent: matching `backendApiVersion`/`backendName`, frozen
-capabilities, `allocateGraph()`, `execute()`, and `createDecodeSession()`.
-An engine advertising incremental execution must additionally implement
-`resetDecodeCache()` and expose a non-negative, monotonically increasing safe
-integer `decodeCacheGeneration`; extending `BackendEngine` provides both.
-Built-in names cannot be replaced.
+A provider factory or already-created provider instance belongs only to the
+Runtime whose `providers` option receives it. Runtime closure closes the
+initialized provider; there is no process-global provider registry.
 
-## Android and NNAPI
+### Compilation
 
-The existing NNAPI selection remains a compatibility backend for older
-deployments, but NNAPI was deprecated in Android 15. New Android integrations
-should use the named backend SDK for a vendor runtime or delegate instead of
-adding another Android API branch. Google documents both the
-[NNAPI migration path](https://developer.android.com/ndk/guides/neuralnetworks/migration-guide)
-and [vendor NPU delegates for LiteRT](https://ai.google.dev/edge/litert/android/npu).
-The VolvoxAI contract is deliberately model-runtime-neutral: a QNN, LiteRT,
-or custom driver adapter implements the same opaque node/tensor ABI.
+compile() receives an immutable ModelSnapshot and:
 
-The SDK example registers as `android-nnapi-add`; it does not replace the
-legacy `VOLVOXAI_BACKEND_NNAPI` enum or `--nnapi` option. Its eligibility
-contract is deliberately narrow: exact-shape rank 1–4 F32 `Add`, with no
-broadcasting or fused activation. The `test_backend_sdk` CTest case (run by
-`make test_native`) compiles the example using only the public VolvoxAI headers;
-an Android build cross-compiles it with the NDK CMake toolchain. See the
-[example README](../examples/backend_sdk/README.md)
-for integration and performance limitations.
+~~~ts
+interface BackendProviderCompileOptions {
+  readonly operatorFallback: 'allow' | 'forbid';
+}
+~~~
+
+The snapshot identifies its definition, topology revision, weight revision,
+declared outputs, tensor count, and node count. A provider may create a private
+execution Graph through snapshot.createExecutionGraph(). It must not retain or
+mutate the caller's original Graph or Tensor storage.
+
+Compilation must reject unsupported operators, dtypes, shapes, layouts,
+attributes, quantization descriptors, or fallback policy. A provider that
+advertises operatorFallback: 'none' promises the complete selected graph stays
+on that provider.
+
+The optional compilationEvidence object records a provider-reported device
+identity and a non-negative allocation-byte total, or null when the provider
+cannot report them. VolvoxAI copies this evidence into the immutable
+compilation report together with compile time and route evidence; it does not
+invent a physical-device string.
+
+The object returned by `compile()` is VolvoxAI's backend-prepared graph owner.
+There is no additional public `PreparedGraph` lifecycle and no backend-specific
+graph document. A provider may resolve operator routing, select kernels, build
+an immutable schedule, prepack constant weights, choose physical layouts, plan
+memory, or create pipelines and target code here. All such state is derived
+from the exact snapshot revision and must be discarded or rebuilt when that
+revision changes. The portable deployment source remains the optimized
+`volvox-graph/v1` document plus safetensors.
+
+Prepared state shared by contexts must be immutable. Pointer tables into a
+context-owned heap, request-dependent shapes, scratch arenas, inputs, outputs,
+adapter/decode state, and mutable command state are materialized by
+`createContext()` and never shared between contexts. Rebuildable binary or
+packed-weight caches are optional implementation details, not package inputs.
+
+### Contexts
+
+Each createContext() call returns a distinct mutable execution owner:
+
+~~~ts
+interface BackendProviderExecutionContext {
+  readonly backendName: string;
+  execute(inputs, options?): Promise<BackendExecutionSnapshot>;
+  decodeSeed?(inputs, options?): Promise<BackendExecutionSnapshot>;
+  decodeStep?(inputs, options?): Promise<BackendExecutionSnapshot>;
+  decodeReset?(): Promise<void>;
+  close(): Promise<void> | void;
+}
+~~~
+
+Inputs are typed arrays keyed by declared graph input name. A context may own
+device allocations, scratch, command encoders, adapter routing, and decode/KV
+state. It must not share those mutable resources with another context.
+
+close() is required. VolvoxAI serializes accepted context work and waits for it
+before calling close.
+
+### Output snapshots
+
+A successful execution returns every declared graph output exactly once and by
+exact name. Host output entries have this shape:
+
+~~~javascript
+{
+  name: 'logits',
+  shape: [1, 32, 8000],
+  dtype: 'float32',
+  location: 'host',
+  data: new Float32Array(values),
+}
+~~~
+
+Returning the snapshot transfers exclusive ownership of host data to
+`ExecutionResult`. A provider must allocate isolated storage and must not retain
+or mutate it after returning. `ExecutionResult` validates and adopts that
+storage; each public `read()` still returns a fresh caller-owned copy. Supported
+dtypes are float32, int32, int8, and uint8.
+
+A device entry provides a result-owned GPUBuffer plus read and release
+callbacks:
+
+~~~javascript
+{
+  name: 'logits',
+  shape: [1, 32, 8000],
+  dtype: 'float32',
+  location: 'device',
+  deviceBuffer,
+  async read() {
+    return copyDeviceBufferToFloat32(deviceBuffer);
+  },
+  release() {
+    deviceBuffer.destroy();
+  },
+}
+~~~
+
+The provider transfers ownership of that snapshot to ExecutionResult. Device
+buffers must remain valid across later context executions and context closure,
+until release is called during result close. read() must return storage
+compatible with the declared dtype and shape.
+
+backendReport may contain only copyable JSON data. A provider with
+operatorFallback: 'reported' must set route.operatorFallbackUsed on every
+execution and may name route.offendingNode. Decode implementations should
+report decode mode, cache generation, and position. VolvoxAI validates and
+freezes that evidence into the execution report together with elapsed time,
+context identity, device identity, and pinned revisions.
+
+### Provider lifetime
+
+- Runtime owns the provider.
+- CompiledModel owns the provider's compiled object.
+- ExecutionContext owns the provider context.
+- ExecutionResult owns host copies or retained device snapshots.
+- Starting close rejects new work and drains already accepted work.
+- Provider close occurs only after retained compiled children close.
+- Every close implementation must tolerate exactly one call from the runtime;
+  resource cleanup within the provider should still be idempotent.
+
+## Native C provider SPI
+
+Include the public headers:
+
+~~~c
+#include "volvoxai.h"
+#include "volvoxai_backend.h"
+~~~
+
+VxBackendProvider supplies explicit runtime, compiled, and context instances:
+
+~~~c
+static VxStatus provider_runtime_create(
+    void* user_data,
+    const VxRuntimeOptions* options,
+    void** out_runtime,
+    VxReport* report);
+
+static VxStatus provider_compile(
+    void* runtime_instance,
+    const VxModelSource* source,
+    const VxBackendPolicy* policy,
+    void** out_compiled,
+    VxReport* report);
+
+static VxStatus provider_context_create(
+    void* compiled_instance,
+    const VxContextOptions* options,
+    void** out_context,
+    VxReport* report);
+
+static VxStatus provider_context_set_input(
+    void* context_instance,
+    const char* name,
+    VxDataType dtype,
+    const void* data,
+    size_t byte_size,
+    VxReport* report);
+
+static VxStatus provider_context_execute(
+    void* context_instance,
+    const VxBackendOutputSink* sink,
+    VxReport* report);
+
+static VxStatus provider_context_select_adapter(
+    void* context_instance,
+    uint64_t adapter_id,
+    uint64_t adapter_revision,
+    const char* package_path,
+    const char* version_name,
+    VxReport* report);
+~~~
+
+Define the complete descriptor, then register it on each runtime that may
+select it:
+
+~~~c
+VxBackendProvider provider = {
+    .struct_size = sizeof(VxBackendProvider),
+    .abi_version = VX_BACKEND_ABI_VERSION,
+    .name = "my-npu",
+    .user_data = &driver,
+    .runtime_create = provider_runtime_create,
+    .runtime_destroy = provider_runtime_destroy,
+    .compile = provider_compile,
+    .compiled_destroy = provider_compiled_destroy,
+    .context_create = provider_context_create,
+    .context_set_input = provider_context_set_input,
+    .context_execute = provider_context_execute,
+    .context_select_adapter = provider_context_select_adapter,
+    .context_close = provider_context_close,
+    .context_destroy = provider_context_destroy,
+};
+~~~
+
+Names are canonical lowercase identifiers; cpu is reserved. The runtime copies
+the descriptor and name. Callback code, user_data, and everything reachable
+from them must remain valid for all handles created from the provider.
+
+The provider owns each returned instance:
+
+- runtime_destroy runs once for each successful runtime_create.
+- compiled_destroy runs once for each successful compile.
+- context_destroy runs once for each successful context_create.
+- context_close is optional logical close and may run before context_destroy.
+
+Partial construction must clean up before returning an error because no
+successful instance was transferred.
+
+### Native outputs
+
+context_execute writes every declared output exactly once through the supplied
+sink:
+
+~~~c
+float output[2] = { first, second };
+int64_t shape[1] = { 2 };
+
+return sink->write(
+    sink->user_data,
+    "logits",
+    VX_DTYPE_F32,
+    shape,
+    1,
+    output,
+    sizeof(output));
+~~~
+
+The public execution dtypes are F32, I32, I8, and U8. Each sink write must
+match the descriptor retained from `graph.json` exactly: name, dtype, rank,
+every dimension, and byte size. An unknown, duplicate, missing, or mismatched
+output rejects the complete result; no partial output snapshot is published.
+
+The sink copies each output before write returns. Names must be unique and
+non-empty. The dtype, rank, dimensions, and byte size must agree.
+
+### Composing and selecting the provider
+
+A native host composes the provider with a Runtime, then uses the same
+opaque-handle lifecycle as a built-in provider:
+
+~~~c
+VxRuntimeOptions runtime_options = VX_RUNTIME_OPTIONS_INIT;
+VxModelSource source = VX_MODEL_SOURCE_INIT;
+VxBackendPolicy policy = VX_BACKEND_POLICY_INIT;
+VxContextOptions context_options = VX_CONTEXT_OPTIONS_INIT;
+VxReport report = VX_REPORT_INIT;
+
+VxRuntime* runtime = NULL;
+VxModel* model = NULL;
+VxCompiledModel* compiled = NULL;
+VxExecutionContext* context = NULL;
+VxResult* result = NULL;
+
+source.graph_path = "model/graph.json";
+source.weight_paths = weight_paths;
+source.weight_path_count = weight_count;
+
+vx_runtime_create(&runtime_options, &runtime, &report);
+vx_runtime_register_provider(runtime, &provider, &report);
+vx_runtime_load_model(runtime, &source, &model, &report);
+
+policy.mode = VX_BACKEND_REQUIRE;
+policy.operator_fallback = VX_OPERATOR_FALLBACK_FORBID;
+const char* required_backends[] = { "my-npu" };
+policy.backends = required_backends;
+policy.backend_count = 1;
+vx_model_compile(model, &policy, &compiled, &report);
+vx_compiled_model_create_context(
+    compiled, &context_options, &context, &report);
+
+vx_execution_context_set_input(
+    context, "input", VX_DTYPE_F32, input, input_bytes, &report);
+vx_execution_context_execute(context, &result, &report);
+~~~
+
+`vx_runtime_register_provider` is a provider-host SPI operation, not a
+Synurang application call. A Synurang deployment composes providers in its
+implementation before accepting calls. Its application controls provider
+selection through protobuf `BackendPolicy` and observes provider use through
+generated compilation and execution reports.
+
+VX_BACKEND_REQUIRE requires one backend entry. VX_BACKEND_PREFER tries
+policy.backends in order; a null list with count zero selects the default
+CPU-only preference. Operator-fallback policy is independent from that order.
+
+Check every returned VxStatus in production code. VxReport records stage,
+backend, device, reason, message, and execution identity.
+
+Results are independent handles. They remain readable after context release:
+
+~~~c
+vx_execution_context_release(context);
+vx_compiled_model_release(compiled);
+vx_model_release(model);
+vx_runtime_release(runtime);
+
+size_t required = 0;
+vx_result_read(result, "logits", NULL, 0, &required, &report);
+vx_result_read(result, "logits", output, required, NULL, &report);
+vx_result_release(result);
+~~~
+
+release(NULL) is a no-op. Child handles retain every parent needed for their
+operation.
+
+## Android providers
+
+Android integrations should wrap the selected vendor runtime or delegate in
+the same provider SPI. NNAPI is deprecated in Android 15; current vendor APIs
+can still implement the VolvoxAI runtime/compiled/context ownership boundary
+without adding an Android-specific branch to the public runtime.
+
+Use the provider's compile callback to validate the complete semantic contract:
+operator, dtype, shape and layout relations, optional operands, attributes,
+quantization, output names, and strict fallback policy. Decline compilation
+before creating a context when any part is unsupported.

@@ -1,4 +1,5 @@
 #include "conv_f32_opt.h"
+#include "runtime_state.h"
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
@@ -14,14 +15,17 @@ extern void conv2d_depthwise_s2_avx2(const float*, float*, const float*, const f
 
 #define VX_CONV_OPT_MAX_NODES 1024
 
-static float* g_pwf32_pack[VX_CONV_OPT_MAX_NODES];
-static float* g_dw_pw_tmp[VX_CONV_OPT_MAX_NODES];
-static long g_dw_pw_tmp_cap[VX_CONV_OPT_MAX_NODES];
-static const float** g_f32_igemm_indir[VX_CONV_OPT_MAX_NODES];
-static long g_f32_igemm_indir_cap[VX_CONV_OPT_MAX_NODES];
-static uint64_t g_f32_igemm_indir_key[VX_CONV_OPT_MAX_NODES];
-static float* g_f32_igemm_zero[VX_CONV_OPT_MAX_NODES];
-static int g_f32_igemm_zero_cap[VX_CONV_OPT_MAX_NODES];
+#define g_pwf32_pack (vx_engine_state_current()->conv_pwf32_pack)
+#define g_dw_pw_tmp (vx_engine_state_current()->conv_dw_pw_tmp)
+#define g_dw_pw_tmp_cap (vx_engine_state_current()->conv_dw_pw_tmp_cap)
+#define g_f32_igemm_indir (vx_engine_state_current()->conv_f32_igemm_indir)
+#define g_f32_igemm_indir_cap \
+    (vx_engine_state_current()->conv_f32_igemm_indir_cap)
+#define g_f32_igemm_indir_key \
+    (vx_engine_state_current()->conv_f32_igemm_indir_key)
+#define g_f32_igemm_zero (vx_engine_state_current()->conv_f32_igemm_zero)
+#define g_f32_igemm_zero_cap \
+    (vx_engine_state_current()->conv_f32_igemm_zero_cap)
 
 static inline float vx_relu6_apply(float x, int relu) {
     if (relu) {
@@ -61,7 +65,8 @@ const float* vx_pwf32_pack_cache(int node_idx, const float* wgt, int c, int out_
 // Feeds a broadcast-based MR6xNR16 microkernel (12 accumulators) — no permute/shuffle
 // ports, unlike the s4 path. Better on the thin-K expand convs (K=in_c small) where
 // per-tile startup dominates and 6 pixels amortize it better than 4.
-static float* g_pwf32_pack_plain[VX_CONV_OPT_MAX_NODES];
+#define g_pwf32_pack_plain \
+    (vx_engine_state_current()->conv_pwf32_pack_plain)
 
 static const float* vx_pwf32_pack_plain_cache(int node_idx, const float* wgt, int c, int out_c) {
     if (node_idx < 0 || node_idx >= VX_CONV_OPT_MAX_NODES || out_c < 16 || c < 1) return NULL;
@@ -82,14 +87,10 @@ static const float* vx_pwf32_pack_plain_cache(int node_idx, const float* wgt, in
 }
 
 // Default-on: the plain MR6xNR16 GEMM measured ~5% faster (warm) than the s4
-// permute path on this AVX2 CPU. Set VOLVOX_PW_GEMM=0 to fall back to the s4 path.
+// permute path on this AVX2 CPU. Set VOLVOX_PW_GEMM=0 before creating an
+// engine to fall back to the s4 path for that engine.
 static int vx_pw_gemm_enabled(void) {
-    static int v = -1;
-    if (v < 0) {
-        const char* e = getenv("VOLVOX_PW_GEMM");
-        v = (e && e[0] && !strcmp(e, "0")) ? 0 : 1;
-    }
-    return v;
+    return vx_engine_state_current()->conv_pw_gemm_enabled;
 }
 
 #if defined(__AVX2__)

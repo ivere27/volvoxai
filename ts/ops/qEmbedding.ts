@@ -100,9 +100,6 @@ export function _cpuQEmbedding(node) {
   const output = node?.outputs?.out;
 
   const tokens = requireRawTensor(input, 'input IDs', node, ['int32'], { positiveRank: true });
-  if (input.isInput !== true) {
-    throw new Error(`QEmbedding node ${nodeLabel(node)} requires token IDs to be a graph input so they can be preflighted before output writes.`);
-  }
   const weightElements = requireRawTensor(weight, 'weight', node, ['int8', 'uint8'], { positiveRank: true });
   const outputElements = requireRawTensor(output, 'output', node, ['int8', 'uint8'], { positiveRank: true });
   if (weight.shape.length !== 2) {

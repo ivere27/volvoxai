@@ -1,67 +1,48 @@
 // --- 7. Cross SDPA ---
-static int cross_key_allowed(const int32_t* mask, int mask_mode,
-                             int query, int key, int seq_len_kv, int causal) {
-    if (causal && key > query) return 0;
-    if (!mask || mask_mode == 0) return 1;
-    if (mask_mode == 1) return mask[key] != 0;                    // [K]
-    if (mask_mode == 2) return mask[query * seq_len_kv + key] != 0; // [Q,K]
-    return 0;
-}
+/*
+ * Scaled dot-product attention over an explicit K/V memory.
+ *
+ * The previous implementation walked the key axis three times per (query, head)
+ * — once to find the maximum logit, once to accumulate the softmax denominator,
+ * and once to accumulate the output — recomputing the same Q.K dot on every
+ * pass.  With the TinyReceiptVQA decoder's 402-row memory that made each cross
+ * node cost three times the necessary arithmetic, all of it scalar: 31 ms per
+ * node per token, which was 92% of an FP32 decode step.
+ *
+ * The online-softmax recurrence that replaced it lives in
+ * attention_f32_core.h, shared with sdpa.c, which had the same defect in a
+ * worse form.  Each key is visited once and the Q.K dot is computed exactly
+ * once.  Live state is one head's accumulator rather than a full score row,
+ * which is what lets the same code serve the incremental single-row path and a
+ * full uncached forward without a scratch allocation.
+ *
+ * The AVX2 body is selected at runtime through vx_kernel_platform(), so a
+ * binary built for a baseline CPU still vectorizes here.  Vectorizing an FP32
+ * reduction reorders additions, so the AVX2 and portable paths agree to a
+ * floating-point tolerance rather than bit-exactly.  The row-versus-full-forward
+ * invariant that test_incremental_runtime asserts is unaffected: each query
+ * row's recurrence reads only that row, so computing one row alone and
+ * computing it inside a batch follow the identical sequence of operations.
+ */
+#include "attention_f32_isa.h"
+
 
 void cross_sdpa_f32(const float* q_in, const float* k_in, const float* v_in, float* output,
                     int seq_len_q, int seq_len_kv, int d_model, int num_heads,
                     int head_dim, float scale, const int32_t* mask,
                     int mask_mode, int causal) {
-    for (int q_idx = 0; q_idx < seq_len_q; q_idx++) {
-        for (int h_idx = 0; h_idx < num_heads; h_idx++) {
-            float max_logit = -1e38f;
-            int valid_keys = 0;
-            for (int k_idx = 0; k_idx < seq_len_kv; k_idx++) {
-                if (!cross_key_allowed(mask, mask_mode, q_idx, k_idx, seq_len_kv, causal)) continue;
-                float score = 0.0f;
-                for (int d = 0; d < head_dim; d++) {
-                    float q = q_in[q_idx*d_model + h_idx*head_dim + d];
-                    float k = k_in[k_idx*d_model + h_idx*head_dim + d];
-                    score += q * k;
-                }
-                score *= scale;
-                if (score > max_logit) max_logit = score;
-                valid_keys++;
-            }
-            if (!valid_keys) {
-                for (int d = 0; d < head_dim; d++)
-                    output[q_idx*d_model + h_idx*head_dim + d] = 0.0f;
-                continue;
-            }
-            float sum_exp = 0.0f;
-            for (int k_idx = 0; k_idx < seq_len_kv; k_idx++) {
-                if (!cross_key_allowed(mask, mask_mode, q_idx, k_idx, seq_len_kv, causal)) continue;
-                float score = 0.0f;
-                for (int d = 0; d < head_dim; d++) {
-                    float q = q_in[q_idx*d_model + h_idx*head_dim + d];
-                    float k = k_in[k_idx*d_model + h_idx*head_dim + d];
-                    score += q * k;
-                }
-                score *= scale;
-                sum_exp += fast_expf(score - max_logit);
-            }
-            for (int d = 0; d < head_dim; d++) {
-                float out_val = 0.0f;
-                for (int k_idx = 0; k_idx < seq_len_kv; k_idx++) {
-                    if (!cross_key_allowed(mask, mask_mode, q_idx, k_idx, seq_len_kv, causal)) continue;
-                    float score = 0.0f;
-                    for (int kd = 0; kd < head_dim; kd++) {
-                        float q = q_in[q_idx*d_model + h_idx*head_dim + kd];
-                        float k = k_in[k_idx*d_model + h_idx*head_dim + kd];
-                        score += q * k;
-                    }
-                    score *= scale;
-                    float w = fast_expf(score - max_logit) / sum_exp;
-                    float v = v_in[k_idx*d_model + h_idx*head_dim + d];
-                    out_val += w * v;
-                }
-                output[q_idx*d_model + h_idx*head_dim + d] = out_val;
-            }
-        }
+#if VX_SDPA_X86_AVX2
+    if (head_dim <= VX_SDPA_MAX_HEAD_DIM && vx_kernel_platform()->has_avx2) {
+        /* The tiled kernel serves one query row and a full forward alike, and
+         * uses it for both deliberately: sharing one path is what makes the
+         * incremental row bit-identical to the same row of a full pass. */
+        vx_attention_tiled_avx2(q_in, k_in, v_in, d_model, output, d_model,
+                                seq_len_q, seq_len_kv, num_heads, head_dim,
+                                scale, mask, mask_mode, causal);
+        return;
     }
+#endif
+    vx_attention_f32_portable(q_in, k_in, v_in, d_model, output, d_model,
+                              seq_len_q, seq_len_kv, num_heads, head_dim, scale,
+                              mask, mask_mode, causal);
 }

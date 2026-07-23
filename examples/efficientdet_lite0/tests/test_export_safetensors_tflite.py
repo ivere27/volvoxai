@@ -150,24 +150,31 @@ class DirectTfliteW8A8ExportTests(unittest.TestCase):
                 f"{EFFICIENTDET_INT8}"
             )
 
-    def assert_typed_quantized_output(self, node) -> None:
+    def assert_typed_quantized_output(self, graph, tensors, node) -> None:
         dtype = node.get("outputs_dtype", {}).get("out")
         self.assertIn(dtype, ("int8", "uint8"), node)
-        quantization = node.get("outputs_quantization", {}).get("out")
+        output = node.get("outputs", {}).get("out")
+        quantization = graph.get("quantization", {}).get("tensors", {}).get(output)
         self.assertIsInstance(quantization, dict, node)
         self.assertEqual(quantization.get("scheme"), "per_tensor", node)
-        self.assertTrue(math.isfinite(quantization.get("scale", float("nan"))), node)
-        self.assertGreater(quantization["scale"], 0.0, node)
-        zero_point = quantization.get("zero_point")
-        self.assertIsInstance(zero_point, int, node)
+        scale = tensors[quantization["scale_tensor"]]
+        zero_point = tensors[quantization["zero_point_tensor"]]
+        self.assertEqual(scale.dtype, self.torch.float32, node)
+        self.assertEqual(scale.numel(), 1, node)
+        self.assertTrue(math.isfinite(float(scale.item())), node)
+        self.assertGreater(float(scale.item()), 0.0, node)
+        self.assertEqual(zero_point.numel(), 1, node)
+        zero_value = int(zero_point.item())
         if dtype == "int8":
-            self.assertGreaterEqual(zero_point, -128, node)
-            self.assertLessEqual(zero_point, 127, node)
+            self.assertEqual(zero_point.dtype, self.torch.int8, node)
+            self.assertGreaterEqual(zero_value, -128, node)
+            self.assertLessEqual(zero_value, 127, node)
         else:
-            self.assertGreaterEqual(zero_point, 0, node)
-            self.assertLessEqual(zero_point, 255, node)
+            self.assertEqual(zero_point.dtype, self.torch.uint8, node)
+            self.assertGreaterEqual(zero_value, 0, node)
+            self.assertLessEqual(zero_value, 255, node)
 
-    def test_efficientdet_direct_export_is_canonical_w8a8(self) -> None:
+    def test_efficientdet_direct_export_is_canonical_hybrid_int8(self) -> None:
         with tempfile.TemporaryDirectory(prefix="volvoxai-tflite-export-") as temporary:
             output_dir = Path(temporary)
             output_path = output_dir / "model.safetensors"
@@ -197,39 +204,44 @@ class DirectTfliteW8A8ExportTests(unittest.TestCase):
                 f"exporter failed:\nstdout:\n{completed.stdout}\nstderr:\n{completed.stderr}",
             )
 
-            config_path = output_dir / "config.json"
+            graph_path = output_dir / "graph.json"
             self.assertTrue(output_path.is_file())
-            self.assertTrue(config_path.is_file())
-            config = json.loads(config_path.read_text(encoding="utf-8"))
+            self.assertTrue(graph_path.is_file())
+            graph = json.loads(graph_path.read_text(encoding="utf-8"))
             tensors = self.safetensors_torch.load_file(str(output_path), device="cpu")
 
-        self.assertEqual(config.get("format"), "volvoxai-tflite-v1")
+        self.assertEqual(graph.get("format"), "volvox-graph/v1")
         self.assertEqual(
-            config.get("inputs", {}).get("input0", {}).get("image_normalization"),
+            graph.get("inputs", {}).get("input0", {}).get("image_normalization"),
             "raw-255",
         )
-        self.assertEqual(list(config.get("outputs", {}).values()), ["scores", "boxes"])
-        self.assertEqual(
-            config.get("source", {}).get("quantized_graph_contract"), "w8a8-v1"
-        )
+        self.assertEqual(graph.get("outputs"), ["scores", "boxes"])
+        self.assertEqual(graph.get("source", {}).get("package_class"), "hybrid")
+        self.assertNotIn("quantized_graph_contract", graph.get("source", {}))
         self.assertGreater(len(tensors), 0)
-        self.assertNotIn("input_scale", set(_iter_keys(config)))
-        self.assertNotIn("weight_scale", set(_iter_keys(config)))
+        self.assertNotIn("input_scale", set(_iter_keys(graph)))
+        self.assertNotIn("weight_scale", set(_iter_keys(graph)))
 
-        nodes = config.get("nodes", [])
-        requantize_nodes = [node for node in nodes if node.get("op") == "RequantizeLinear"]
-        qconv_nodes = [node for node in nodes if node.get("op") == "QConv2D"]
-        qadd_nodes = [node for node in nodes if node.get("op") == "QAdd"]
+        nodes = graph.get("nodes", [])
+        requantize_nodes = [node for node in nodes if node.get("opType") == "RequantizeLinear"]
+        qconv_nodes = [node for node in nodes if node.get("opType") == "QConv2D"]
+        qadd_nodes = [node for node in nodes if node.get("opType") == "QAdd"]
+        sigmoid_nodes = [node for node in nodes if node.get("opType") == "Sigmoid"]
         self.assertGreater(len(requantize_nodes), 0)
         self.assertGreater(len(qconv_nodes), 0)
         self.assertGreater(len(qadd_nodes), 0)
+        self.assertEqual(len(sigmoid_nodes), 1)
 
         for node in requantize_nodes + qconv_nodes + qadd_nodes:
-            self.assert_typed_quantized_output(node)
+            self.assert_typed_quantized_output(graph, tensors, node)
 
-        weights_quantization = config.get("weights_quantization")
-        self.assertIsInstance(weights_quantization, dict)
-        self.assertGreater(len(weights_quantization), 0)
+        quantization = graph.get("quantization")
+        self.assertEqual(quantization.get("format"), "volvox-affine-safetensors/v1")
+        quantized_tensors = quantization.get("tensors")
+        self.assertIsInstance(quantized_tensors, dict)
+        self.assertGreater(len(quantized_tensors), 0)
+        self.assertNotIn("weights_quantization", graph)
+        self.assertNotIn("weights_quantization_storage", graph)
 
         for node in qconv_nodes:
             params = node.get("params", {})
@@ -246,12 +258,16 @@ class DirectTfliteW8A8ExportTests(unittest.TestCase):
             self.assertEqual(weight.ndim, 4, node)
             self.assertEqual(bias.numel(), weight.shape[0], node)
 
-            descriptor = weights_quantization.get(inputs["weight"])
+            descriptor = quantized_tensors.get(inputs["weight"])
             self.assertIsInstance(descriptor, dict, node)
             self.assertEqual(descriptor.get("scheme"), "per_axis", node)
             self.assertEqual(descriptor.get("axis"), 0, node)
-            self.assertEqual(len(descriptor.get("scales", [])), weight.shape[0], node)
-            self.assertEqual(len(descriptor.get("zero_points", [])), weight.shape[0], node)
+            scales = tensors[descriptor["scale_tensor"]]
+            zero_points = tensors[descriptor["zero_point_tensor"]]
+            self.assertEqual(scales.dtype, self.torch.float32, node)
+            self.assertEqual(scales.numel(), weight.shape[0], node)
+            self.assertEqual(zero_points.dtype, weight.dtype, node)
+            self.assertEqual(zero_points.numel(), weight.shape[0], node)
 
 
 class EfficientDetNativeEndToEndTests(unittest.TestCase):
@@ -321,9 +337,9 @@ class EfficientDetNativeEndToEndTests(unittest.TestCase):
                 0,
                 f"exporter failed:\nstdout:\n{exported.stdout}\nstderr:\n{exported.stderr}",
             )
-            config = json.loads((model_dir / "config.json").read_text(encoding="utf-8"))
+            graph = json.loads((model_dir / "graph.json").read_text(encoding="utf-8"))
             self.assertEqual(
-                config.get("inputs", {}).get("input0", {}).get("image_normalization"),
+                graph.get("inputs", {}).get("input0", {}).get("image_normalization"),
                 variant["normalization"],
             )
             shutil.copyfile(LABELS, model_dir / "labels.txt")

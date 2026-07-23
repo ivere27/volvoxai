@@ -132,11 +132,11 @@ fn weight_word_padded(base : u32, count : u32, zero_point : i32) -> u32 {
   return result;
 }
 fn signed_word(word : u32, dtype : u32) -> u32 {
-  if (dtype == 3u) { return word ^ 0x80808080u; }
+  if (dtype == 5u) { return word ^ 0x80808080u; }
   return word;
 }
 fn centered_zero_point(zero_point : i32, dtype : u32) -> i32 {
-  if (dtype == 3u) { return zero_point - 128; }
+  if (dtype == 5u) { return zero_point - 128; }
   return zero_point;
 }
 fn corrected_dot(input_word_raw : u32, weight_word_raw : u32,
@@ -167,8 +167,8 @@ fn output_byte(value : i32) -> u32 { return bitcast<u32>(value) & 255u; }
 fn requantize(accumulator : i32, channel : u32) -> u32 {
   let multiplier = (params.input_scale * weight_scales[channel]) / params.output_scale;
   let transformed = f32(accumulator) * multiplier + f32(params.output_zero_point);
-  let minimum = select(0, -128, params.output_type == 2u);
-  let maximum = select(255, 127, params.output_type == 2u);
+  let minimum = select(0, -128, params.output_type == 6u);
+  let maximum = select(255, 127, params.output_type == 6u);
   var quantized : i32;
   if (transformed != transformed) { quantized = params.output_zero_point; }
   else if (transformed <= f32(minimum)) { quantized = minimum; }

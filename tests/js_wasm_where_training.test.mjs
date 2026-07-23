@@ -8,7 +8,7 @@ import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
 
 import { Graph } from '../ts/index.js';
-import { TrainingVolvoxAI } from '../ts/training/TrainingVolvoxAI.js';
+import { createWasmStepRunner } from './helpers/training_session.mjs';
 import { CPUAutograd } from '../ts/training/CPUAutograd.js';
 
 const run = promisify(execFile);
@@ -29,7 +29,7 @@ function whereGraph(opType, conditionDtype) {
     x: left,
     y: right,
   }, { out: [1, 3] });
-  graph.outputNames = [out.name];
+  graph.setOutputs([out.name]);
   return graph;
 }
 
@@ -43,7 +43,7 @@ function sliceGraph() {
     starts: [1],
     steps: [2],
   });
-  graph.outputNames = [out.name];
+  graph.setOutputs([out.name]);
   return graph;
 }
 
@@ -56,7 +56,7 @@ function gatherGraph(opType) {
   const indices = graph.addInput('indices', indicesShape, 'int32');
   const outputShape = [2, 2];
   const { out } = graph.addOp(opType, { input, indices }, { out: outputShape }, { axis: 1 });
-  graph.outputNames = [out.name];
+  graph.setOutputs([out.name]);
   return graph;
 }
 
@@ -67,7 +67,7 @@ function visionProfileGraph(opType) {
   });
   const outputShape = opType === 'ProfileX' || opType === 'ProfileY' ? [1, 2, 2] : [1, 1, 2];
   const { out } = graph.addOp(opType, { input }, { out: outputShape });
-  graph.outputNames = [out.name];
+  graph.setOutputs([out.name]);
   return graph;
 }
 
@@ -102,7 +102,7 @@ test('WASM training matches CPU branch routing for Where and Mask', {
   try {
     const wasmPath = join(directory, 'volvoxai.full.wasm');
     await buildFullWasm(wasmPath);
-    const api = await TrainingVolvoxAI.init(['wasm'], wasmPath);
+    const runWasmStep = createWasmStepRunner(wasmPath);
 
     for (const [opType, conditionDtype, condition] of [
       ['Where', 'int32', Int32Array.of(1, 0, -2)],
@@ -117,13 +117,13 @@ test('WASM training matches CPU branch routing for Where and Mask', {
         updateMode: 'sgd',
         optimizer: { learningRate: 0.01 },
       };
-      const wasm = await api.trainStep(wasmGraph, { ...options, backend: 'wasm' });
+      const wasm = await runWasmStep(wasmGraph, { ...options, backend: 'wasm' });
       const cpu = await CPUAutograd.trainStep(cpuGraph, options);
       assert.equal(wasm.backend, 'wasm');
       assert.ok(Math.abs(wasm.loss - cpu.loss) < 2e-5, `${opType} loss`);
       for (const name of ['left', 'right']) {
         closeArray(wasm.gradients.get(name), cpu.gradients.get(name), `${opType} ${name} gradient`);
-        closeArray(wasmGraph.getTensor(name).buffer, cpuGraph.getTensor(name).buffer,
+        closeArray(wasm.publishedGraph.getTensor(name).buffer, cpuGraph.getTensor(name).buffer,
           `${opType} ${name} update`);
       }
     }
@@ -146,7 +146,7 @@ test('WASM training scatters positive-step Slice gradients to the selected value
   try {
     const wasmPath = join(directory, 'volvoxai.full.wasm');
     await buildFullWasm(wasmPath);
-    const api = await TrainingVolvoxAI.init(['wasm'], wasmPath);
+    const runWasmStep = createWasmStepRunner(wasmPath);
     const wasmGraph = sliceGraph();
     const cpuGraph = sliceGraph();
     const options = {
@@ -155,12 +155,12 @@ test('WASM training scatters positive-step Slice gradients to the selected value
       updateMode: 'sgd',
       optimizer: { learningRate: 0.01 },
     };
-    const wasm = await api.trainStep(wasmGraph, { ...options, backend: 'wasm' });
+    const wasm = await runWasmStep(wasmGraph, { ...options, backend: 'wasm' });
     const cpu = await CPUAutograd.trainStep(cpuGraph, options);
     assert.equal(wasm.backend, 'wasm');
     assert.ok(Math.abs(wasm.loss - cpu.loss) < 2e-5, 'Slice loss');
     closeArray(wasm.gradients.get('input'), cpu.gradients.get('input'), 'Slice input gradient');
-    closeArray(wasmGraph.getTensor('input').buffer, cpuGraph.getTensor('input').buffer,
+    closeArray(wasm.publishedGraph.getTensor('input').buffer, cpuGraph.getTensor('input').buffer,
       'Slice input update');
   } finally {
     await rm(directory, { recursive: true, force: true });
@@ -181,9 +181,9 @@ test('WASM training matches CPU scatter-add gradients for Gather and GatherEleme
   try {
     const wasmPath = join(directory, 'volvoxai.full.wasm');
     await buildFullWasm(wasmPath);
-    const api = await TrainingVolvoxAI.init(['wasm'], wasmPath);
+    const runWasmStep = createWasmStepRunner(wasmPath);
     for (const [opType, indices] of [
-      ['Gather', Int32Array.of(2, 0)],
+      ['Gather', Int32Array.of(-1, 0)],
       ['GatherElements', Int32Array.of(-1, 0, 1, 2)],
     ]) {
       const wasmGraph = gatherGraph(opType);
@@ -195,12 +195,12 @@ test('WASM training matches CPU scatter-add gradients for Gather and GatherEleme
         updateMode: 'sgd',
         optimizer: { learningRate: 0.01 },
       };
-      const wasm = await api.trainStep(wasmGraph, { ...options, backend: 'wasm' });
+      const wasm = await runWasmStep(wasmGraph, { ...options, backend: 'wasm' });
       const cpu = await CPUAutograd.trainStep(cpuGraph, options);
       assert.equal(wasm.backend, 'wasm');
       assert.ok(Math.abs(wasm.loss - cpu.loss) < 2e-5, `${opType} loss`);
       closeArray(wasm.gradients.get('input'), cpu.gradients.get('input'), `${opType} input gradient`);
-      closeArray(wasmGraph.getTensor('input').buffer, cpuGraph.getTensor('input').buffer,
+      closeArray(wasm.publishedGraph.getTensor('input').buffer, cpuGraph.getTensor('input').buffer,
         `${opType} input update`);
     }
   } finally {
@@ -222,7 +222,7 @@ test('WASM training matches CPU for NHWC vision profile primitive gradients', {
   try {
     const wasmPath = join(directory, 'volvoxai.full.wasm');
     await buildFullWasm(wasmPath);
-    const api = await TrainingVolvoxAI.init(['wasm'], wasmPath);
+    const runWasmStep = createWasmStepRunner(wasmPath);
     for (const opType of ['MeanHeight', 'ProfileX', 'ProfileY', 'SpatialSoftargmaxY']) {
       const wasmGraph = visionProfileGraph(opType);
       const cpuGraph = visionProfileGraph(opType);
@@ -232,12 +232,12 @@ test('WASM training matches CPU for NHWC vision profile primitive gradients', {
         updateMode: 'sgd',
         optimizer: { learningRate: 0.01 },
       };
-      const wasm = await api.trainStep(wasmGraph, { ...options, backend: 'wasm' });
+      const wasm = await runWasmStep(wasmGraph, { ...options, backend: 'wasm' });
       const cpu = await CPUAutograd.trainStep(cpuGraph, options);
       assert.equal(wasm.backend, 'wasm');
       assert.ok(Math.abs(wasm.loss - cpu.loss) < 3e-5, `${opType} loss`);
       closeArray(wasm.gradients.get('input'), cpu.gradients.get('input'), `${opType} input gradient`, 4e-5);
-      closeArray(wasmGraph.getTensor('input').buffer, cpuGraph.getTensor('input').buffer,
+      closeArray(wasm.publishedGraph.getTensor('input').buffer, cpuGraph.getTensor('input').buffer,
         `${opType} input update`, 4e-5);
     }
   } finally {

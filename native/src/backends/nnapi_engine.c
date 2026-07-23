@@ -1,29 +1,87 @@
 #include <stdio.h>
+#include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
+
 #include "nnapi_engine.h"
+#include "runtime_state.h"
 
 #ifdef __ANDROID__
 #include <android/NeuralNetworks.h>
 
-#define WT_CACHE_MAX 512
-// The transposed weight and (when absent) the zero bias are referenced by the model
-// for its whole lifetime — NNAPI does NOT copy operand values larger than 128 bytes.
-// The model is cached and reused, so these buffers must outlive it: we own them here
-// and free them in nnapi_free_weight_cache().
-static struct {
-    const float* src;
+/* NNAPI retains constant operand storage for the lifetime of a model. Each
+ * compiled model and its backing allocations therefore belong to the engine
+ * context whose graph supplied the source pointers. Pointer equality across
+ * engines must never alias a compilation. */
+typedef struct {
+    const float* source_weight;
+    const float* source_bias;
+    int sequence;
+    int input_width;
+    int output_width;
     ANeuralNetworksModel* model;
     ANeuralNetworksCompilation* compilation;
-    float* w_transposed;
-    float* bias_owned;
-} wt_cache[WT_CACHE_MAX];
-static int wt_cache_n = 0;
+    float* transposed_weight;
+    float* owned_bias;
+} NnapiWeightEntry;
+
+typedef struct {
+    NnapiWeightEntry* weight_entries;
+    size_t weight_entry_count;
+    size_t weight_entry_capacity;
+} NnapiContextState;
+
+static void nnapi_context_state_destroy(void* opaque_state);
+
+static NnapiContextState* nnapi_context_state_get(int create) {
+    VxEngineState* owner = vx_engine_state_current();
+    if (!owner) return NULL;
+    NnapiContextState* state =
+        (NnapiContextState*)owner->nnapi_context_state;
+    if (!state && create) {
+        state = (NnapiContextState*)calloc(1, sizeof(*state));
+        if (!state) return NULL;
+        owner->nnapi_context_state = state;
+        owner->nnapi_context_state_destroy = nnapi_context_state_destroy;
+    }
+    return state;
+}
+
+static void nnapi_weight_entry_release(NnapiWeightEntry* entry) {
+    if (!entry) return;
+    ANeuralNetworksCompilation_free(entry->compilation);
+    ANeuralNetworksModel_free(entry->model);
+    free(entry->transposed_weight);
+    free(entry->owned_bias);
+    memset(entry, 0, sizeof(*entry));
+}
+
+static void nnapi_weight_cache_release(NnapiContextState* state) {
+    if (!state) return;
+    for (size_t index = 0; index < state->weight_entry_count; index++)
+        nnapi_weight_entry_release(&state->weight_entries[index]);
+    free(state->weight_entries);
+    state->weight_entries = NULL;
+    state->weight_entry_count = 0;
+    state->weight_entry_capacity = 0;
+}
+
+static void nnapi_context_state_destroy(void* opaque_state) {
+    NnapiContextState* state = (NnapiContextState*)opaque_state;
+    if (!state) return;
+    nnapi_weight_cache_release(state);
+    free(state);
+}
 
 int nnapi_init(void) {
     uint32_t device_count = 0;
-    // Available since API 29. If the symbol resolves and reports devices, NNAPI is usable.
-    if (ANeuralNetworks_getDeviceCount(&device_count) != ANEURALNETWORKS_NO_ERROR || device_count == 0) {
+    NnapiContextState* state = nnapi_context_state_get(1);
+    if (!state) return -1;
+    /* Available since API 29. A successful query with at least one device is
+     * the backend availability contract; no process-global graph state is
+     * created here. */
+    if (ANeuralNetworks_getDeviceCount(&device_count) !=
+            ANEURALNETWORKS_NO_ERROR || device_count == 0) {
         printf("[VolvoxAI NNAPI] No NNAPI devices available.\n");
         return -1;
     }
@@ -32,106 +90,190 @@ int nnapi_init(void) {
 }
 
 void nnapi_free_weight_cache(void) {
-    for (int i = 0; i < wt_cache_n; i++) {
-        ANeuralNetworksCompilation_free(wt_cache[i].compilation);
-        ANeuralNetworksModel_free(wt_cache[i].model);
-        free(wt_cache[i].w_transposed);
-        free(wt_cache[i].bias_owned);
-    }
-    wt_cache_n = 0;
+    nnapi_weight_cache_release(nnapi_context_state_get(0));
 }
 
 void nnapi_cleanup(void) {
-    nnapi_free_weight_cache();
+    VxEngineState* owner = vx_engine_state_current();
+    if (!owner || !owner->nnapi_context_state) return;
+    NnapiContextState* state =
+        (NnapiContextState*)owner->nnapi_context_state;
+    owner->nnapi_context_state = NULL;
+    owner->nnapi_context_state_destroy = NULL;
+    nnapi_context_state_destroy(state);
 }
 
-#define NN_CHECK(call, msg) do { if ((call) != ANEURALNETWORKS_NO_ERROR) { \
-    fprintf(stderr, "[VolvoxAI NNAPI] %s failed\n", msg); return; } } while (0)
+static NnapiWeightEntry* nnapi_weight_entry_find(
+    NnapiContextState* state, const float* weight, const float* bias,
+    int sequence, int input_width, int output_width) {
+    if (!state) return NULL;
+    for (size_t index = 0; index < state->weight_entry_count; index++) {
+        NnapiWeightEntry* entry = &state->weight_entries[index];
+        if (entry->source_weight == weight && entry->source_bias == bias &&
+            entry->sequence == sequence && entry->input_width == input_width &&
+            entry->output_width == output_width) return entry;
+    }
+    return NULL;
+}
 
-void nnapi_matmul(const float* in, const float* w, const float* b, float* out, int seq, int d_in, int d_out) {
-    ANeuralNetworksCompilation* compilation = NULL;
+static NnapiWeightEntry* nnapi_weight_entry_append(NnapiContextState* state) {
+    if (!state) return NULL;
+    if (state->weight_entry_count == state->weight_entry_capacity) {
+        size_t next_capacity = state->weight_entry_capacity
+            ? state->weight_entry_capacity * 2u : 16u;
+        if (next_capacity < state->weight_entry_capacity ||
+            next_capacity > SIZE_MAX / sizeof(*state->weight_entries)) return NULL;
+        NnapiWeightEntry* next = (NnapiWeightEntry*)realloc(
+            state->weight_entries, next_capacity * sizeof(*next));
+        if (!next) return NULL;
+        memset(next + state->weight_entry_capacity, 0,
+               (next_capacity - state->weight_entry_capacity) * sizeof(*next));
+        state->weight_entries = next;
+        state->weight_entry_capacity = next_capacity;
+    }
+    return &state->weight_entries[state->weight_entry_count++];
+}
+
+static int nnapi_compile_matmul(NnapiWeightEntry* entry, const float* weight,
+                                const float* bias, int sequence,
+                                int input_width, int output_width) {
     ANeuralNetworksModel* model = NULL;
-    for (int i = 0; i < wt_cache_n; i++) {
-        if (wt_cache[i].src == w) { model = wt_cache[i].model; compilation = wt_cache[i].compilation; break; }
+    ANeuralNetworksCompilation* compilation = NULL;
+    float* transposed_weight = NULL;
+    float* owned_bias = NULL;
+    if (!entry || ANeuralNetworksModel_create(&model) !=
+            ANEURALNETWORKS_NO_ERROR) return -1;
+
+    uint32_t input_dims[] = {(uint32_t)sequence, (uint32_t)input_width};
+    ANeuralNetworksOperandType input_type = {
+        ANEURALNETWORKS_TENSOR_FLOAT32, 2, input_dims, 0.0f, 0};
+    uint32_t weight_dims[] = {(uint32_t)output_width, (uint32_t)input_width};
+    ANeuralNetworksOperandType weight_type = {
+        ANEURALNETWORKS_TENSOR_FLOAT32, 2, weight_dims, 0.0f, 0};
+    uint32_t bias_dims[] = {(uint32_t)output_width};
+    ANeuralNetworksOperandType bias_type = {
+        ANEURALNETWORKS_TENSOR_FLOAT32, 1, bias_dims, 0.0f, 0};
+    ANeuralNetworksOperandType activation_type = {
+        ANEURALNETWORKS_INT32, 0, NULL, 0.0f, 0};
+    uint32_t output_dims[] = {(uint32_t)sequence, (uint32_t)output_width};
+    ANeuralNetworksOperandType output_type = {
+        ANEURALNETWORKS_TENSOR_FLOAT32, 2, output_dims, 0.0f, 0};
+    if (ANeuralNetworksModel_addOperand(model, &input_type) !=
+            ANEURALNETWORKS_NO_ERROR ||
+        ANeuralNetworksModel_addOperand(model, &weight_type) !=
+            ANEURALNETWORKS_NO_ERROR ||
+        ANeuralNetworksModel_addOperand(model, &bias_type) !=
+            ANEURALNETWORKS_NO_ERROR ||
+        ANeuralNetworksModel_addOperand(model, &activation_type) !=
+            ANEURALNETWORKS_NO_ERROR ||
+        ANeuralNetworksModel_addOperand(model, &output_type) !=
+            ANEURALNETWORKS_NO_ERROR) goto fail;
+
+    if ((size_t)input_width > SIZE_MAX / (size_t)output_width ||
+        (size_t)input_width * (size_t)output_width >
+            SIZE_MAX / sizeof(float)) goto fail;
+    size_t weight_elements = (size_t)input_width * (size_t)output_width;
+    transposed_weight = (float*)malloc(weight_elements * sizeof(float));
+    if (!transposed_weight) goto fail;
+    for (int row = 0; row < input_width; row++) {
+        for (int column = 0; column < output_width; column++) {
+            transposed_weight[(size_t)column * (size_t)input_width +
+                              (size_t)row] =
+                weight[(size_t)row * (size_t)output_width + (size_t)column];
+        }
+    }
+    if (ANeuralNetworksModel_setOperandValue(
+            model, 1, transposed_weight,
+            weight_elements * sizeof(float)) != ANEURALNETWORKS_NO_ERROR)
+        goto fail;
+
+    if (bias) {
+        if (ANeuralNetworksModel_setOperandValue(
+                model, 2, bias, (size_t)output_width * sizeof(float)) !=
+                ANEURALNETWORKS_NO_ERROR) goto fail;
+    } else {
+        owned_bias = (float*)calloc((size_t)output_width, sizeof(float));
+        if (!owned_bias || ANeuralNetworksModel_setOperandValue(
+                model, 2, owned_bias,
+                (size_t)output_width * sizeof(float)) !=
+                ANEURALNETWORKS_NO_ERROR) goto fail;
+    }
+    int32_t fused_activation = ANEURALNETWORKS_FUSED_NONE;
+    if (ANeuralNetworksModel_setOperandValue(
+            model, 3, &fused_activation, sizeof(fused_activation)) !=
+            ANEURALNETWORKS_NO_ERROR) goto fail;
+    uint32_t operation_inputs[] = {0, 1, 2, 3};
+    uint32_t operation_outputs[] = {4};
+    uint32_t model_inputs[] = {0};
+    uint32_t model_outputs[] = {4};
+    if (ANeuralNetworksModel_addOperation(
+            model, ANEURALNETWORKS_FULLY_CONNECTED, 4, operation_inputs, 1,
+            operation_outputs) != ANEURALNETWORKS_NO_ERROR ||
+        ANeuralNetworksModel_identifyInputsAndOutputs(
+            model, 1, model_inputs, 1, model_outputs) !=
+            ANEURALNETWORKS_NO_ERROR ||
+        ANeuralNetworksModel_finish(model) != ANEURALNETWORKS_NO_ERROR ||
+        ANeuralNetworksCompilation_create(model, &compilation) !=
+            ANEURALNETWORKS_NO_ERROR ||
+        ANeuralNetworksCompilation_finish(compilation) !=
+            ANEURALNETWORKS_NO_ERROR) goto fail;
+
+    entry->source_weight = weight;
+    entry->source_bias = bias;
+    entry->sequence = sequence;
+    entry->input_width = input_width;
+    entry->output_width = output_width;
+    entry->model = model;
+    entry->compilation = compilation;
+    entry->transposed_weight = transposed_weight;
+    entry->owned_bias = owned_bias;
+    return 0;
+
+fail:
+    ANeuralNetworksCompilation_free(compilation);
+    ANeuralNetworksModel_free(model);
+    free(transposed_weight);
+    free(owned_bias);
+    return -1;
+}
+
+void nnapi_matmul(const float* input, const float* weight, const float* bias,
+                  float* output, int sequence, int input_width,
+                  int output_width) {
+    NnapiContextState* state = nnapi_context_state_get(0);
+    if (!state || !input || !weight || !output || sequence <= 0 ||
+        input_width <= 0 || output_width <= 0) return;
+    NnapiWeightEntry* entry = nnapi_weight_entry_find(
+        state, weight, bias, sequence, input_width, output_width);
+    if (!entry) {
+        entry = nnapi_weight_entry_append(state);
+        if (!entry || nnapi_compile_matmul(entry, weight, bias, sequence,
+                                           input_width, output_width) != 0) {
+            if (entry && state->weight_entry_count != 0) {
+                state->weight_entry_count--;
+                memset(entry, 0, sizeof(*entry));
+            }
+            fprintf(stderr, "[VolvoxAI NNAPI] model compilation failed\n");
+            return;
+        }
     }
 
-    if (!compilation) {
-        if (ANeuralNetworksModel_create(&model) != ANEURALNETWORKS_NO_ERROR) {
-            fprintf(stderr, "[VolvoxAI NNAPI] model_create failed\n"); return;
-        }
-
-        uint32_t in_dims[] = {(uint32_t)seq, (uint32_t)d_in};
-        ANeuralNetworksOperandType in_type = {ANEURALNETWORKS_TENSOR_FLOAT32, 2, in_dims, 0.0f, 0};
-        ANeuralNetworksModel_addOperand(model, &in_type);
-
-        uint32_t w_dims[] = {(uint32_t)d_out, (uint32_t)d_in};
-        ANeuralNetworksOperandType w_type = {ANEURALNETWORKS_TENSOR_FLOAT32, 2, w_dims, 0.0f, 0};
-        ANeuralNetworksModel_addOperand(model, &w_type);
-
-        uint32_t b_dims[] = {(uint32_t)d_out};
-        ANeuralNetworksOperandType b_type = {ANEURALNETWORKS_TENSOR_FLOAT32, 1, b_dims, 0.0f, 0};
-        ANeuralNetworksModel_addOperand(model, &b_type);
-
-        ANeuralNetworksOperandType act_type = {ANEURALNETWORKS_INT32, 0, NULL, 0.0f, 0};
-        ANeuralNetworksModel_addOperand(model, &act_type);
-
-        uint32_t out_dims[] = {(uint32_t)seq, (uint32_t)d_out};
-        ANeuralNetworksOperandType out_type = {ANEURALNETWORKS_TENSOR_FLOAT32, 2, out_dims, 0.0f, 0};
-        ANeuralNetworksModel_addOperand(model, &out_type);
-
-        // FULLY_CONNECTED wants weights [num_units, input_size] = [d_out, d_in]; the
-        // exported weight is [d_in, d_out], so transpose. This buffer must persist for
-        // the model's lifetime (NNAPI keeps the pointer), so it is owned by the cache.
-        float* w_transposed = (float*)malloc((size_t)d_in * d_out * sizeof(float));
-        for (int r = 0; r < d_in; r++)
-            for (int c = 0; c < d_out; c++)
-                w_transposed[c * d_in + r] = w[r * d_out + c];
-        ANeuralNetworksModel_setOperandValue(model, 1, w_transposed, (size_t)d_in * d_out * sizeof(float));
-
-        float* bias_owned = NULL;
-        if (b) {
-            // b points into the resident safetensors blob (persists), so no copy needed.
-            ANeuralNetworksModel_setOperandValue(model, 2, b, (size_t)d_out * sizeof(float));
-        } else {
-            bias_owned = (float*)calloc(d_out, sizeof(float));  // owned; persists with the model
-            ANeuralNetworksModel_setOperandValue(model, 2, bias_owned, (size_t)d_out * sizeof(float));
-        }
-
-        int32_t fused_activation = ANEURALNETWORKS_FUSED_NONE;
-        ANeuralNetworksModel_setOperandValue(model, 3, &fused_activation, sizeof(int32_t));
-
-        uint32_t inputs[] = {0, 1, 2, 3};
-        uint32_t outputs[] = {4};
-        ANeuralNetworksModel_addOperation(model, ANEURALNETWORKS_FULLY_CONNECTED, 4, inputs, 1, outputs);
-
-        uint32_t model_inputs[] = {0};
-        uint32_t model_outputs[] = {4};
-        ANeuralNetworksModel_identifyInputsAndOutputs(model, 1, model_inputs, 1, model_outputs);
-        if (ANeuralNetworksModel_finish(model) != ANEURALNETWORKS_NO_ERROR ||
-            ANeuralNetworksCompilation_create(model, &compilation) != ANEURALNETWORKS_NO_ERROR ||
-            ANeuralNetworksCompilation_finish(compilation) != ANEURALNETWORKS_NO_ERROR) {
-            fprintf(stderr, "[VolvoxAI NNAPI] model/compilation finish failed\n");
-            ANeuralNetworksCompilation_free(compilation); ANeuralNetworksModel_free(model);
-            free(w_transposed); free(bias_owned); return;
-        }
-
-        if (wt_cache_n < WT_CACHE_MAX) {
-            wt_cache[wt_cache_n].src = w; wt_cache[wt_cache_n].model = model;
-            wt_cache[wt_cache_n].compilation = compilation;
-            wt_cache[wt_cache_n].w_transposed = w_transposed;
-            wt_cache[wt_cache_n].bias_owned = bias_owned;
-            wt_cache_n++;
-        }
-        // else: cache full (>512 distinct weights, not expected) — the model + buffers
-        // are used for this call and then leak rather than risk a use-after-free.
+    ANeuralNetworksExecution* execution = NULL;
+    if (ANeuralNetworksExecution_create(entry->compilation, &execution) !=
+            ANEURALNETWORKS_NO_ERROR ||
+        ANeuralNetworksExecution_setInput(
+            execution, 0, NULL, input,
+            (size_t)sequence * (size_t)input_width * sizeof(float)) !=
+            ANEURALNETWORKS_NO_ERROR ||
+        ANeuralNetworksExecution_setOutput(
+            execution, 0, NULL, output,
+            (size_t)sequence * (size_t)output_width * sizeof(float)) !=
+            ANEURALNETWORKS_NO_ERROR ||
+        ANeuralNetworksExecution_compute(execution) !=
+            ANEURALNETWORKS_NO_ERROR) {
+        fprintf(stderr,
+                "[VolvoxAI NNAPI] execute failed (output left unwritten)\n");
     }
-
-    ANeuralNetworksExecution* execution;
-    NN_CHECK(ANeuralNetworksExecution_create(compilation, &execution), "execution_create");
-    ANeuralNetworksExecution_setInput(execution, 0, NULL, in, (size_t)seq * d_in * sizeof(float));
-    ANeuralNetworksExecution_setOutput(execution, 0, NULL, out, (size_t)seq * d_out * sizeof(float));
-    if (ANeuralNetworksExecution_compute(execution) != ANEURALNETWORKS_NO_ERROR)
-        fprintf(stderr, "[VolvoxAI NNAPI] execute failed (output left unwritten)\n");
     ANeuralNetworksExecution_free(execution);
 }
 
@@ -139,7 +281,17 @@ void nnapi_matmul(const float* in, const float* w, const float* b, float* out, i
 
 int nnapi_init(void) { return -1; }
 void nnapi_cleanup(void) {}
-void nnapi_matmul(const float* in, const float* w, const float* b, float* out, int seq, int d_in, int d_out) {}
+void nnapi_matmul(const float* input, const float* weight, const float* bias,
+                  float* output, int sequence, int input_width,
+                  int output_width) {
+    (void)input;
+    (void)weight;
+    (void)bias;
+    (void)output;
+    (void)sequence;
+    (void)input_width;
+    (void)output_width;
+}
 void nnapi_free_weight_cache(void) {}
 
 #endif

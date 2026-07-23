@@ -3,12 +3,42 @@
 
 Model-family graph construction and vocabulary policy live with their examples.
 """
-import argparse
+import importlib
 import json
 import re
 from pathlib import Path
-import torch
-from safetensors.torch import save_file
+from safetensors.numpy import save_file
+
+
+def _exporter_module(name: str):
+    """Resolve exporter modules for package, script, and repository imports."""
+
+    roots = (f"{__package__}.exporter",) if __package__ else (
+        "exporter",
+        "tools.exporter",
+    )
+    missing: ModuleNotFoundError | None = None
+    for root in roots:
+        module_name = f"{root}.{name}"
+        try:
+            return importlib.import_module(module_name)
+        except ModuleNotFoundError as error:
+            # Fall through only when this candidate package itself is absent;
+            # a missing frontend dependency must retain its original error.
+            if error.name is None or not (
+                module_name == error.name or module_name.startswith(error.name + ".")
+            ):
+                raise
+            missing = error
+    assert missing is not None
+    raise missing
+
+
+classify_package = _exporter_module("capabilities").classify_package
+GRAPH_FORMAT = _exporter_module("quantization_storage").GRAPH_FORMAT
+concrete_broadcast_shape = _exporter_module(
+    "typed_broadcast"
+).concrete_broadcast_shape
 
 
 def dumps_with_compact_lists(obj, indent=2):
@@ -43,51 +73,9 @@ def dumps_with_compact_lists(obj, indent=2):
     return render(obj) + "\n"
 
 
-def _attr(node, name, default=None):
-    import onnx
-    for a in node.attribute:
-        if a.name == name:
-            return onnx.helper.get_attribute_value(a)
-    return default
-
-
-def _shape_from_value_info(value_info):
-    tt = value_info.type.tensor_type
-    return [d.dim_value if d.dim_value else 0 for d in tt.shape.dim]
-
-
-def _dequantize_array(x, scale, zero_point, axis=0):
-    import numpy as np
-    xf = x.astype(np.float32)
-    sf = np.asarray(scale, dtype=np.float32)
-    zp = np.asarray(zero_point, dtype=np.float32)
-    if sf.ndim == 0 or sf.size == 1:
-        return (xf - float(zp.reshape(-1)[0] if zp.size else 0.0)) * float(sf.reshape(-1)[0])
-    shape = [1] * xf.ndim
-    shape[axis] = sf.shape[0]
-    return (xf - zp.reshape(shape)) * sf.reshape(shape)
-
-
 def _path_suggests_float16(path: str) -> bool:
     name = Path(path).name.lower()
     return any(token in name for token in ("float16", "fp16", "f16"))
-
-
-def _resolve_onnx_float_storage(model_path: str, model, requested: str) -> str:
-    requested = (requested or "auto").lower()
-    if requested in ("float16", "fp16", "f16"):
-        return "float16"
-    if requested in ("float32", "fp32", "f32"):
-        return "float32"
-    if requested != "auto":
-        raise ValueError(f"Unsupported weight dtype: {requested}")
-
-    import onnx
-    if any(init.data_type == onnx.TensorProto.FLOAT16 for init in model.graph.initializer):
-        return "float16"
-    if _path_suggests_float16(model_path):
-        return "float16"
-    return "float32"
 
 
 def _resolve_output_names(output_count: int, requested=None):
@@ -139,487 +127,49 @@ def _apply_image_normalizations(inputs, requested=None):
         inputs[name]["image_normalization"] = mode
 
 
-def optimize_export_nodes(nodes):
-    """Fold simple single-consumer activation nodes into their producer."""
-    removed = {}
-
-    def out_name(node):
-        return (node.get("outputs") or {}).get("out")
-
-    def out_shape(node):
-        return (node.get("outputs_shape") or {}).get("out", [])
-
-    def add_removed(op):
-        removed[op] = removed.get(op, 0) + 1
-
-    changed = True
-    while changed:
-        changed = False
-        uses = {}
-        producers = {}
-        for idx, node in enumerate(nodes):
-            out = out_name(node)
-            if out:
-                producers[out] = idx
-            for inp in (node.get("inputs") or {}).values():
-                uses[inp] = uses.get(inp, 0) + 1
-
-        next_nodes = []
-        for idx, node in enumerate(nodes):
-            op = node.get("op", "")
-            inputs = node.get("inputs") or {}
-            params = node.get("params") or {}
-            src = inputs.get("input")
-
-            if op == "Clip" and src and uses.get(src, 0) == 1:
-                if float(params.get("min", -1e30)) == 0.0 and float(params.get("max", 1e30)) == 6.0:
-                    prod_idx = producers.get(src, -1)
-                    if 0 <= prod_idx < len(nodes):
-                        prod = nodes[prod_idx]
-                        if prod.get("op") in ("Conv2D", "QConv2D"):
-                            prod.setdefault("params", {})["relu"] = 2
-                            prod.setdefault("outputs", {})["out"] = out_name(node)
-                            prod.setdefault("outputs_shape", {})["out"] = out_shape(node)
-                            add_removed(op)
-                            changed = True
-                            continue
-
-            if op == "Sigmoid" and src and uses.get(src, 0) == 1:
-                prod_idx = producers.get(src, -1)
-                if 0 <= prod_idx < len(nodes):
-                    prod = nodes[prod_idx]
-                    if prod.get("op") == "Concat":
-                        prod.setdefault("params", {})["sigmoid"] = 1
-                        prod.setdefault("outputs", {})["out"] = out_name(node)
-                        prod.setdefault("outputs_shape", {})["out"] = out_shape(node)
-                        add_removed(op)
-                        changed = True
-                        continue
-
-            next_nodes.append(node)
-        nodes = next_nodes
-
-    return nodes, removed
-
-
 def export_onnx_model(
     model_path: str,
     out_path: str,
     weight_dtype: str = "auto",
     output_names=None,
     image_normalizations=None,
+    input_shapes=None,
+    input_dtypes=None,
+    output_dtypes=None,
+    specialize_inputs=None,
+    quant_mode: str = "preserve",
+    enable_static_qdq_layout_optimization: bool = True,
 ):
-    import numpy as np
-    import onnx
-    from onnx import numpy_helper, shape_inference
+    """Compile a static ONNX graph through the typed current frontend.
 
-    print(f"[Export] Loading ONNX graph {model_path}...")
-    model = shape_inference.infer_shapes(onnx.load(model_path))
-    float_storage = _resolve_onnx_float_storage(model_path, model, weight_dtype)
-    store_float16 = float_storage == "float16"
-    print(f"[Export] ONNX float tensor storage: {float_storage}")
-    out_path = Path(out_path)
-    out_dir = out_path.parent
-    out_dir.mkdir(parents=True, exist_ok=True)
+    The source-faithful import boundary preserves QDQ, integer ABIs, LoRA
+    branches, and static selectors before verified RuntimeIR lowering.
+    """
+    if quant_mode not in ("preserve", "require-w8a8"):
+        raise ValueError(f"Unsupported quant mode: {quant_mode}")
+    compile_onnx_model = _exporter_module("frontend_onnx").compile_onnx_model
 
-    shape_map = {}
-    elem_map = {}
-    for vi in list(model.graph.input) + list(model.graph.value_info) + list(model.graph.output):
-        if vi.type.HasField("tensor_type"):
-            shape_map[vi.name] = _shape_from_value_info(vi)
-            elem_map[vi.name] = vi.type.tensor_type.elem_type
-
-    initializer_names = {i.name for i in model.graph.initializer}
-    arrays = {i.name: numpy_helper.to_array(i) for i in model.graph.initializer}
-    for name, arr in arrays.items():
-        shape_map.setdefault(name, list(arr.shape))
-
-    name_map = {}
-    used = set()
-    next_tmp = 0
-    next_w = 0
-
-    def short(original, preferred=None, weight=False):
-        nonlocal next_tmp, next_w
-        if original in name_map:
-            return name_map[original]
-        if preferred:
-            base = preferred
-        elif weight:
-            base = f"w{next_w}"
-            next_w += 1
-        else:
-            base = f"v{next_tmp}"
-            next_tmp += 1
-        base = re.sub(r"[^A-Za-z0-9_.-]+", "_", base)[:96].strip("._-") or "t"
-        candidate = base
-        suffix = 1
-        while candidate in used:
-            suffix += 1
-            candidate = f"{base}_{suffix}"
-        used.add(candidate)
-        name_map[original] = candidate
-        return candidate
-
-    graph_inputs = [i for i in model.graph.input if i.name not in initializer_names]
-    graph_input_names = {i.name for i in graph_inputs}
-    inputs_def = {}
-    for idx, inp in enumerate(graph_inputs):
-        s = short(inp.name, f"input{idx}")
-        inputs_def[s] = {"shape": shape_map.get(inp.name, []), "dtype": "float32", "source_name": inp.name}
-    _apply_image_normalizations(inputs_def, image_normalizations)
-
-    canonical_outputs = _resolve_output_names(len(model.graph.output), output_names)
-    for out, preferred in zip(model.graph.output, canonical_outputs):
-        short(out.name, preferred)
-
-    alias = {}
-    dq_info = {}
-    tensors = {}
-    nodes = []
-    skipped_qdq = 0
-
-    def resolve(name):
-        while name in alias:
-            name = alias[name]
-        return name
-
-    def const_array(name):
-        name = resolve(name)
-        return arrays.get(name)
-
-    def clean_shape(shape):
-        return [int(d) if int(d) > 0 else 0 for d in shape] if shape else []
-
-    def is_concrete(shape):
-        return bool(shape) and all(int(d) > 0 for d in shape)
-
-    def shape_of(name):
-        rn = resolve(name)
-        if rn in arrays:
-            return list(arrays[rn].shape)
-        return clean_shape(shape_map.get(rn) or shape_map.get(name) or [])
-
-    def out_shape(name):
-        return clean_shape(shape_map.get(name, []))
-
-    def product(shape):
-        v = 1
-        for d in shape:
-            if d <= 0:
-                return 0
-            v *= d
-        return v
-
-    def broadcast_shape(a, b):
-        if not a:
-            return b
-        if not b:
-            return a
-        out = []
-        for i in range(1, max(len(a), len(b)) + 1):
-            da = a[-i] if i <= len(a) else 1
-            db = b[-i] if i <= len(b) else 1
-            if da == db:
-                out.append(da)
-            elif da == 1:
-                out.append(db)
-            elif db == 1:
-                out.append(da)
-            elif da == 0:
-                out.append(db)
-            elif db == 0:
-                out.append(da)
-            else:
-                raise RuntimeError(f"Cannot broadcast ONNX shapes {a} and {b}")
-        return list(reversed(out))
-
-    def conv_shape(node):
-        x = shape_of(node.input[0])
-        w = shape_of(node.input[1])
-        if len(x) != 4 or len(w) != 4:
-            return []
-        strides = list(_attr(node, "strides", [1, 1]))
-        dilations = list(_attr(node, "dilations", [1, 1]))
-        pads = list(_attr(node, "pads", [0, 0, 0, 0]))
-        kh = dilations[0] * (w[2] - 1) + 1
-        kw = dilations[1] * (w[3] - 1) + 1
-        oh = (x[2] + pads[0] + pads[2] - kh) // strides[0] + 1 if x[2] and w[2] else 0
-        ow = (x[3] + pads[1] + pads[3] - kw) // strides[1] + 1 if x[3] and w[3] else 0
-        return [x[0], w[0], oh, ow]
-
-    def pool_shape(node):
-        x = shape_of(node.input[0])
-        if len(x) != 4:
-            return []
-        kernel = list(_attr(node, "kernel_shape", [1, 1]))
-        strides = list(_attr(node, "strides", kernel))
-        pads = list(_attr(node, "pads", [0, 0, 0, 0]))
-        dilations = list(_attr(node, "dilations", [1, 1]))
-        kh = dilations[0] * (kernel[0] - 1) + 1
-        kw = dilations[1] * (kernel[1] - 1) + 1
-        oh = (x[2] + pads[0] + pads[2] - kh) // strides[0] + 1 if x[2] else 0
-        ow = (x[3] + pads[1] + pads[3] - kw) // strides[1] + 1 if x[3] else 0
-        return [x[0], x[1], oh, ow]
-
-    def resize_shape(node):
-        x = shape_of(node.input[0])
-        if not x:
-            return []
-        sizes = const_array(node.input[3]) if len(node.input) > 3 and node.input[3] else None
-        if sizes is not None:
-            return [int(v) for v in np.asarray(sizes).reshape(-1)]
-        scales = const_array(node.input[2]) if len(node.input) > 2 and node.input[2] else None
-        if scales is not None:
-            sv = np.asarray(scales, dtype=np.float32).reshape(-1)
-            if len(sv) == len(x):
-                return [int(round(float(d) * float(s))) if d else 0 for d, s in zip(x, sv)]
-        return []
-
-    def reshape_shape(node):
-        x = shape_of(node.input[0])
-        target = const_array(node.input[1]) if len(node.input) > 1 else None
-        if target is None:
-            return []
-        allowzero = int(_attr(node, "allowzero", 0))
-        out = [int(v) for v in np.asarray(target).reshape(-1)]
-        for i, d in enumerate(out):
-            if d == 0 and not allowzero and i < len(x):
-                out[i] = x[i]
-        if -1 in out:
-            infer_idx = out.index(-1)
-            known = 1
-            for d in out:
-                if d != -1:
-                    known *= d
-            total = product(x)
-            out[infer_idx] = total // known if total and known else 0
-        return out
-
-    def concat_shape(node):
-        shapes = [shape_of(inp) for inp in node.input]
-        shapes = [s for s in shapes if s]
-        if not shapes:
-            return []
-        out = list(shapes[0])
-        axis = int(_attr(node, "axis", 1))
-        if axis < 0:
-            axis += len(out)
-        out[axis] = 0
-        for s in shapes:
-            if axis >= len(s):
-                return []
-            out[axis] += s[axis]
-            for i, d in enumerate(s):
-                if i != axis and out[i] == 0:
-                    out[i] = d
-        return out
-
-    def transpose_shape(node):
-        x = shape_of(node.input[0])
-        if not x:
-            return []
-        perm = list(_attr(node, "perm", list(range(len(x)))))
-        return [x[i] for i in perm]
-
-    def ensure_weight(name):
-        name = resolve(name)
-        if name in tensors:
-            return short(name, weight=True)
-        arr = arrays.get(name)
-        if arr is None:
-            return short(name)
-        dtype = np.float16 if store_float16 and np.asarray(arr).dtype.kind == "f" else np.float32
-        tensors[short(name, weight=True)] = torch.from_numpy(np.asarray(arr, dtype=dtype).copy()).contiguous()
-        return short(name)
-
-    def ensure_weight_preserve(name):
-        name = resolve(name)
-        if name in tensors:
-            return short(name, weight=True)
-        arr = arrays.get(name)
-        if arr is None:
-            return short(name)
-        arr = np.asarray(arr)
-        if arr.dtype == np.int8:
-            tensors[short(name, weight=True)] = torch.from_numpy(arr.copy()).contiguous()
-        elif arr.dtype == np.uint8:
-            tensors[short(name, weight=True)] = torch.from_numpy(arr.copy()).contiguous()
-        elif arr.dtype == np.int32:
-            tensors[short(name, weight=True)] = torch.from_numpy(arr.copy()).contiguous()
-        else:
-            dtype = np.float16 if store_float16 and arr.dtype.kind == "f" else np.float32
-            tensors[short(name, weight=True)] = torch.from_numpy(np.asarray(arr, dtype=dtype).copy()).contiguous()
-        return short(name)
-
-    def q_scalar(arr, default=0):
-        if arr is None:
-            return default
-        a = np.asarray(arr).reshape(-1)
-        return int(a[0]) if a.size else default
-
-    def add_node(op, inputs, output, params=None, shape=None, prefer_shape=False):
-        declared = out_shape(output)
-        final_shape = clean_shape(shape) if shape and (prefer_shape or not is_concrete(declared)) else declared
-        if not final_shape and shape:
-            final_shape = clean_shape(shape)
-        if final_shape:
-            shape_map[output] = final_shape
-        nodes.append({
-            "op": op,
-            "inputs": inputs,
-            "outputs": {"out": short(output)},
-            "outputs_shape": {"out": final_shape},
-            **({"params": params} if params else {}),
-        })
-
-    for node in model.graph.node:
-        op = node.op_type
-        output = node.output[0] if node.output else ""
-        if op == "DequantizeLinear":
-            x = resolve(node.input[0])
-            scale = const_array(node.input[1]) if len(node.input) > 1 else None
-            zp = const_array(node.input[2]) if len(node.input) > 2 else np.array(0, dtype=np.float32)
-            dq_info[output] = {
-                "input": x,
-                "scale": resolve(node.input[1]) if len(node.input) > 1 else "",
-                "zero_point": resolve(node.input[2]) if len(node.input) > 2 else "",
-                "axis": int(_attr(node, "axis", 0)),
-            }
-            if x in arrays and scale is not None:
-                arrays[output] = _dequantize_array(arrays[x], scale, zp, int(_attr(node, "axis", 0))).astype(np.float32)
-                shape_map[output] = list(arrays[output].shape)
-            elif x in graph_input_names and scale is not None:
-                in_shape = shape_of(x)
-                scale_v = float(np.asarray(scale).reshape(-1)[0])
-                zp_v = float(np.asarray(zp).reshape(-1)[0]) if zp is not None and np.asarray(zp).size else 0.0
-                neg_name = f"{output}__neg_zero_point"
-                scale_name = f"{output}__scale"
-                add_out = f"{output}__centered"
-                arrays[neg_name] = np.asarray([-zp_v], dtype=np.float32)
-                arrays[scale_name] = np.asarray([scale_v], dtype=np.float32)
-                shape_map[neg_name] = [1]
-                shape_map[scale_name] = [1]
-                add_node("Add", {"a": short(x), "b": ensure_weight(neg_name)}, add_out, shape=in_shape, prefer_shape=True)
-                add_node("Mul", {"a": short(add_out), "b": ensure_weight(scale_name)}, output, shape=in_shape, prefer_shape=True)
-            else:
-                alias[output] = x
-                shape_map[output] = shape_of(x)
-            skipped_qdq += 1
-            continue
-        if op == "QuantizeLinear":
-            alias[output] = resolve(node.input[0])
-            shape_map[output] = shape_of(node.input[0])
-            skipped_qdq += 1
-            continue
-
-        if op == "Conv":
-            inferred_shape = conv_shape(node)
-            attrs = {
-                "stride": list(_attr(node, "strides", [1, 1])),
-                "dilation": list(_attr(node, "dilations", [1, 1])),
-                "groups": int(_attr(node, "group", 1)),
-                "data_layout": "NHWC",
-                "weight_layout": "OIHW",
-            }
-            pads = list(_attr(node, "pads", [0, 0, 0, 0]))
-            attrs["pads"] = pads
-            attrs["padding"] = [pads[0], pads[1]]
-            input_q = dq_info.get(node.input[0])
-            weight_q = dq_info.get(node.input[1])
-            weight_source = weight_q["input"] if weight_q else ""
-            weight_arr = arrays.get(weight_source)
-            input_scale = const_array(input_q["scale"]) if input_q and input_q.get("scale") else None
-            input_zp = const_array(input_q["zero_point"]) if input_q and input_q.get("zero_point") else None
-            use_qconv = (
-                input_q is not None and weight_q is not None and weight_arr is not None
-                and np.asarray(weight_arr).dtype in (np.int8, np.uint8)
-                and input_scale is not None and np.asarray(input_scale).size == 1
-            )
-            if use_qconv:
-                attrs["input_scale"] = float(np.asarray(input_scale).reshape(-1)[0])
-                attrs["input_zero_point"] = q_scalar(input_zp, 0)
-                attrs["weight_axis"] = int(weight_q.get("axis", 0))
-                inputs = {
-                    "input": short(resolve(node.input[0])),
-                    "weight": ensure_weight_preserve(weight_source),
-                    "weight_scale": ensure_weight_preserve(weight_q["scale"]),
-                }
-                if weight_q.get("zero_point"):
-                    inputs["weight_zero_point"] = ensure_weight_preserve(weight_q["zero_point"])
-                if len(node.input) > 2 and node.input[2]:
-                    inputs["bias"] = ensure_weight(node.input[2])
-                add_node("QConv2D", inputs, output, attrs, inferred_shape)
-            else:
-                inputs = {"input": short(resolve(node.input[0])), "weight": ensure_weight(node.input[1])}
-                if len(node.input) > 2 and node.input[2]:
-                    inputs["bias"] = ensure_weight(node.input[2])
-                add_node("Conv2D", inputs, output, attrs, inferred_shape)
-        elif op == "Add":
-            inferred_shape = broadcast_shape(shape_of(node.input[0]), shape_of(node.input[1]))
-            add_node("Add", {"a": short(resolve(node.input[0])), "b": short(resolve(node.input[1]))}, output, shape=inferred_shape)
-        elif op == "Clip":
-            mn = const_array(node.input[1]) if len(node.input) > 1 and node.input[1] else None
-            mx = const_array(node.input[2]) if len(node.input) > 2 and node.input[2] else None
-            params = {}
-            if mn is not None: params["min"] = float(np.asarray(mn).reshape(-1)[0])
-            if mx is not None: params["max"] = float(np.asarray(mx).reshape(-1)[0])
-            add_node("Clip", {"input": short(resolve(node.input[0]))}, output, params, shape_of(node.input[0]))
-        elif op == "MaxPool":
-            pads = list(_attr(node, "pads", [0, 0, 0, 0]))
-            add_node("MaxPool2D", {"input": short(resolve(node.input[0]))}, output, {
-                "kernel": list(_attr(node, "kernel_shape", [1, 1])),
-                "stride": list(_attr(node, "strides", [1, 1])),
-                "pads": pads,
-                "padding": [pads[0], pads[1]],
-                "data_layout": "NHWC",
-            }, pool_shape(node))
-        elif op == "Resize":
-            add_node("ResizeNearest2D", {"input": short(resolve(node.input[0]))}, output, {
-                "mode": "nearest",
-                "coordinate_transformation_mode": (_attr(node, "coordinate_transformation_mode", b"asymmetric") or b"").decode("utf-8", "ignore"),
-                "data_layout": "NHWC",
-            }, resize_shape(node), prefer_shape=True)
-        elif op == "Concat":
-            add_node("Concat", {f"input{i}": short(resolve(inp)) for i, inp in enumerate(node.input)}, output,
-                     {"axis": int(_attr(node, "axis", 1)), "count": len(node.input)}, concat_shape(node))
-        elif op == "Reshape":
-            add_node("Reshape", {"input": short(resolve(node.input[0]))}, output, shape=reshape_shape(node), prefer_shape=True)
-        elif op == "Sigmoid":
-            add_node("Sigmoid", {"input": short(resolve(node.input[0]))}, output, shape=shape_of(node.input[0]))
-        elif op == "Transpose":
-            add_node("Transpose", {"input": short(resolve(node.input[0]))}, output,
-                     {"perm": list(_attr(node, "perm", []))}, transpose_shape(node))
-        else:
-            raise RuntimeError(f"Unsupported ONNX op for Volvox export: {op}")
-
-    for out in model.graph.output:
-        resolved = resolve(out.name)
-        if short(resolved) != short(out.name):
-            add_node("Identity", {"input": short(resolved)}, out.name, shape=shape_of(resolved), prefer_shape=True)
-
-    raw_node_count = len(nodes)
-    nodes, optimized_removed = optimize_export_nodes(nodes)
-
-    config = {
-        "format": "volvoxai-onnx-v1",
-        "source": {
-            "onnx": Path(model_path).name,
-            "skipped_qdq_nodes": skipped_qdq,
-            "float_storage": float_storage,
-            "raw_nodes": raw_node_count,
-            "optimized_nodes_removed": optimized_removed,
-        },
-        "inputs": inputs_def,
-        "outputs": {out.name: short(out.name) for out in model.graph.output},
-        "nodes": nodes,
-    }
-
-    save_file(tensors, str(out_path))
-    config_path = out_dir / "config.json"
-    config_path.write_text(dumps_with_compact_lists(config, indent=2), encoding="utf-8")
-    print(f"[Export] ONNX lowered nodes={raw_node_count} optimized_nodes={len(nodes)} weights={len(tensors)} skipped_qdq={skipped_qdq}")
-    print(f"[Export] Wrote {out_path} and {config_path}")
+    graph = compile_onnx_model(
+        model_path,
+        out_path,
+        weight_dtype=weight_dtype,
+        output_names=output_names,
+        image_normalizations=image_normalizations,
+        input_shapes=input_shapes,
+        input_dtypes=input_dtypes,
+        output_dtypes=output_dtypes,
+        specialize_inputs=specialize_inputs,
+        enable_static_qdq_layout_optimization=(
+            enable_static_qdq_layout_optimization
+        ),
+    )
+    package_class = classify_package(graph)
+    if quant_mode == "require-w8a8" and package_class != "w8a8-v1":
+        raise RuntimeError(
+            "require-w8a8 requested, but the source graph does not describe a "
+            "complete canonical W8A8 activation island"
+        )
+    return graph
 
 
 def export_tflite_model(
@@ -628,6 +178,7 @@ def export_tflite_model(
     weight_dtype: str = "auto",
     output_names=None,
     image_normalizations=None,
+    enable_static_qdq_layout_optimization: bool = True,
 ):
     import math
     import struct
@@ -636,6 +187,13 @@ def export_tflite_model(
     import numpy as np
     from flatbuffers import number_types as N
     from flatbuffers.table import Table
+
+    import_tflite_source = _exporter_module("importers").import_tflite_source
+
+    # Decode and verify the complete FlatBuffer through the official LiteRT
+    # schema before any target lowering. The source IR is the lossless audit
+    # boundary; recognizers below may only lower constructs they can prove.
+    source_ir = import_tflite_source(model_path)
 
     print(f"[Export] Loading TFLite flatbuffer {model_path}...")
     raw = bytearray(Path(model_path).read_bytes())
@@ -838,6 +396,7 @@ def export_tflite_model(
         return f"tflite_{tid}"
 
     inputs_def = {}
+    affine_descriptors = {}
     value_name = {}
     value_shape = {}
     value_layout = {}
@@ -897,7 +456,7 @@ def export_tflite_model(
         inputs_def[name] = {"shape": shape, "dtype": dtype, "source_name": tensors_meta[tid]["name"]}
         quantization = tensor_quantization(tid)
         if quantization is not None:
-            inputs_def[name]["quantization"] = quantization
+            affine_descriptors[name] = quantization
         value_name[tid] = name
         value_shape[tid] = shape
         value_layout[tid] = "NHWC" if len(shape) == 4 else "other"
@@ -909,7 +468,6 @@ def export_tflite_model(
 
     tensors = {}
     weight_names = {}
-    weights_quantization = {}
     nodes = []
 
     def save_array(name, arr):
@@ -919,7 +477,7 @@ def export_tflite_model(
             arr = np.asarray(arr, dtype=dtype)
         elif arr.dtype not in (np.int8, np.uint8, np.int32, np.int64):
             arr = np.asarray(arr, dtype=np.float32)
-        tensors[name] = torch.from_numpy(arr.copy()).contiguous()
+        tensors[name] = np.ascontiguousarray(arr)
 
     def qparams(tid):
         meta = tensors_meta[resolve_const(tid)]
@@ -986,7 +544,7 @@ def export_tflite_model(
                 descriptor = None
         if descriptor is None:
             raise RuntimeError(f"TFLite quantized convolution weight {tid} lacks canonical output-channel quantization metadata")
-        weights_quantization[name] = descriptor
+        affine_descriptors[name] = descriptor
         return name
 
     def ensure_qparam_weight(tid, kind):
@@ -1021,21 +579,27 @@ def export_tflite_model(
         weight_names[key] = name
         return name
 
-    def add_node(op, inputs, out_name, out_shape, params=None, out_tid=None):
+    def add_node(
+        op, inputs, out_name, out_shape, params=None, out_tid=None, *,
+        out_dtype=None,
+    ):
         node = {
-            "op": op,
+            "opType": op,
             "inputs": inputs,
             "outputs": {"out": out_name},
             "outputs_shape": {"out": [int(v) for v in out_shape]},
         }
+        dtype = tensor_dtype(out_tid) if out_tid is not None else out_dtype
+        if dtype not in ("float32", "int32", "int8", "uint8"):
+            source = f"TFLite tensor {out_tid}" if out_tid is not None else "synthetic output"
+            raise RuntimeError(
+                f"Unsupported exported tensor dtype {dtype!r} on {source}"
+            )
+        node["outputs_dtype"] = {"out": dtype}
         if out_tid is not None:
-            dtype = tensor_dtype(out_tid)
-            if dtype not in ("float32", "int32", "int8", "uint8"):
-                raise RuntimeError(f"Unsupported exported tensor dtype {dtype!r} on TFLite tensor {out_tid}")
-            node["outputs_dtype"] = {"out": dtype}
             quantization = tensor_quantization(out_tid)
             if quantization is not None:
-                node["outputs_quantization"] = {"out": quantization}
+                affine_descriptors[out_name] = quantization
         if params:
             node["params"] = params
         nodes.append(node)
@@ -1099,15 +663,12 @@ def export_tflite_model(
             in_name = name_for_value(inputs[0])
             out_shape = tensors_meta[outputs[0]]["shape"]
             out_name = short(tkey(outputs[0]))
-            q = qparams(inputs[0])
             scale = ensure_qparam_weight(inputs[0], "scale")
             add_node("DequantizeLinear", {
                 "input": in_name,
                 "scale": scale,
                 "zero_point": ensure_typed_zero_point(inputs[0]),
             }, out_name, out_shape, {
-                "scale": float(q_scalar(q, "scale", 1.0)),
-                "zero_point": int(q_scalar(q, "zero_point", 0)),
                 "data_layout": "NHWC" if len(out_shape) == 4 else "other",
             }, out_tid=outputs[0])
             set_value(outputs[0], out_name, out_shape, "NHWC" if len(out_shape) == 4 else "other")
@@ -1225,8 +786,36 @@ def export_tflite_model(
             quantized_add = (tensor_quantization(inputs[0]) is not None and
                              tensor_quantization(inputs[1]) is not None and
                              tensor_quantization(out_tid) is not None)
-            if quantized_add and tensors_meta[inputs[0]]["shape"] != tensors_meta[inputs[1]]["shape"]:
-                raise RuntimeError("Direct TFLite export needs explicit typed broadcast lowering before QAdd")
+            if quantized_add:
+                input_shapes = [
+                    value_shape.get(tid, tensors_meta[tid]["shape"])
+                    for tid in inputs[:2]
+                ]
+                if concrete_broadcast_shape(
+                    input_shapes[0], input_shapes[1],
+                ) != tuple(out_shape):
+                    raise RuntimeError(
+                        "TFLite quantized ADD output is not the exact static broadcast shape"
+                    )
+                names = [a_name, b_name]
+                for port, (tid, shape) in enumerate(
+                    zip(inputs[:2], input_shapes)
+                ):
+                    if tuple(shape) == tuple(out_shape):
+                        continue
+                    descriptor = tensor_quantization(tid)
+                    if descriptor is None or descriptor.get("scheme") != "per_tensor":
+                        raise RuntimeError(
+                            "TFLite quantized ADD broadcast requires per-tensor I8/U8 operands"
+                        )
+                    expanded = short(f"{tkey(out_tid)}_qadd_input{port}_expanded")
+                    add_node(
+                        "Expand", {"input": names[port]}, expanded, out_shape,
+                        out_dtype=tensor_dtype(tid),
+                    )
+                    affine_descriptors[expanded] = descriptor
+                    names[port] = expanded
+                a_name, b_name = names
             add_node("QAdd" if quantized_add else "Add", {"a": a_name, "b": b_name},
                      out_name, out_shape, params, out_tid=out_tid)
             set_value(out_tid, out_name, out_shape, "NHWC" if len(out_tflite_shape) == 4 else "other")
@@ -1305,8 +894,13 @@ def export_tflite_model(
                     "input": in_name,
                     "scale": ensure_qparam_weight(inputs[0], "scale"),
                     "zero_point": ensure_typed_zero_point(inputs[0]),
-                }, f32_input, in_shape, {"data_layout": "NHWC" if len(in_shape) == 4 else "other"})
-                add_node("Sigmoid", {"input": f32_input}, f32_output, in_shape)
+                }, f32_input, in_shape,
+                {"data_layout": "NHWC" if len(in_shape) == 4 else "other"},
+                out_dtype="float32")
+                add_node(
+                    "Sigmoid", {"input": f32_input}, f32_output, in_shape,
+                    out_dtype="float32",
+                )
                 add_node("QuantizeLinear", {
                     "input": f32_output,
                     "scale": ensure_qparam_weight(out_tid, "scale"),
@@ -1327,35 +921,86 @@ def export_tflite_model(
             set_value(tid, wanted, value_shape.get(tid, tensors_meta[tid]["shape"]), value_layout.get(tid, "other"))
 
     raw_node_count = len(nodes)
-    nodes, optimized_removed = optimize_export_nodes(nodes)
+    declared_tensors = set(inputs_def) | set(tensors)
+    for node in nodes:
+        declared_tensors.update(
+            name for name in (node.get("outputs") or {}).values()
+            if isinstance(name, str)
+        )
+    affine_descriptors = {
+        name: descriptor for name, descriptor in affine_descriptors.items()
+        if name in declared_tensors
+    }
+    package_class = classify_package(
+        {"inputs": inputs_def, "nodes": nodes},
+        tensors,
+    )
 
-    config = {
-        "format": "volvoxai-tflite-v1",
+    graph = {
+        "format": GRAPH_FORMAT,
         "source": {
             "tflite": Path(model_path).name,
+            "source_ir": {
+                "dialect": source_ir.dialect.value,
+                "fingerprint": source_ir.fingerprint(),
+                "nodes": len(source_ir.nodes),
+                "tensors": len(source_ir.tensors),
+                "subgraphs": len(source_ir.metadata.get("tflite_additional_subgraphs", ())) + 1,
+            },
             "float_storage": float_storage,
             "raw_tflite_ops": len(op_tables),
             "folded_dequantize_nodes": folded_dequantize,
             "lowered_quantize_nodes": lowered_quantize,
             "raw_nodes": raw_node_count,
-            "optimized_nodes_removed": optimized_removed,
             "op_histogram": dict(op_counter),
             "internal_layout": "NHWC",
             "conv_weight_layout": "OHWI",
             "depthwise_weight_layout": "OHWI",
-            "quantized_graph_contract": "w8a8-v1",
+            "package_class": package_class,
+            **({"quantized_graph_contract": "w8a8-v1"} if package_class == "w8a8-v1" else {}),
         },
         "inputs": inputs_def,
-        **({"weights_quantization": weights_quantization} if weights_quantization else {}),
-        "outputs": {tensors_meta[tid]["name"]: short(tkey(tid)) for tid in output_tids},
+        "outputs": [short(tkey(tid)) for tid in output_tids],
         "nodes": nodes,
     }
 
+    externalize_quantization = _exporter_module(
+        "quantization_storage"
+    ).externalize_quantization
+    quantization_report = externalize_quantization(
+        graph, tensors, affine_descriptors
+    )
+    graph["source"]["quantization_parameters"] = {
+        "tensors": quantization_report.tensors,
+        "scales_created": quantization_report.scales_created,
+        "zero_points_created": quantization_report.zero_points_created,
+        "parameters_reused": quantization_report.parameters_reused,
+    }
+
+    typed_pipeline = _exporter_module("optimizer.typed_pipeline")
+    optimize_runtime_package = typed_pipeline.optimize_runtime_package
+    serialize_pipeline_report = typed_pipeline.serialize_pipeline_report
+    graph, optimized_tensors, typed_report = optimize_runtime_package(
+        graph,
+        tensors,
+        source_name=f"{Path(model_path).name}:lowered",
+        enable_static_qdq_layout_optimization=(
+            enable_static_qdq_layout_optimization
+        ),
+    )
+    tensors = {name: np.asarray(value) for name, value in optimized_tensors.items()}
+    graph["source"]["typed_optimizer"] = serialize_pipeline_report(typed_report)
+
     save_file(tensors, str(out_path))
-    config_path = out_dir / "config.json"
-    config_path.write_text(dumps_with_compact_lists(config, indent=2), encoding="utf-8")
-    print(f"[Export] TFLite ops={len(op_tables)} folded_dequantize={folded_dequantize} lowered_nodes={raw_node_count} optimized_nodes={len(nodes)} weights={len(tensors)}")
-    print(f"[Export] Wrote {out_path} and {config_path}")
+    graph_path = out_dir / "graph.json"
+    graph_path.write_text(dumps_with_compact_lists(graph, indent=2), encoding="utf-8")
+    print(
+        f"[Export] TFLite ops={len(op_tables)} "
+        f"folded_dequantize={folded_dequantize} "
+        f"lowered_nodes={raw_node_count} "
+        f"optimized_nodes={len(graph['nodes'])} weights={len(tensors)}"
+    )
+    print(f"[Export] Wrote {out_path} and {graph_path}")
 
 
 def export_model(
@@ -1364,7 +1009,15 @@ def export_model(
     weight_dtype: str = "auto",
     output_names=None,
     image_normalizations=None,
+    input_shapes=None,
+    input_dtypes=None,
+    output_dtypes=None,
+    specialize_inputs=None,
+    quant_mode: str = "preserve",
+    enable_static_qdq_layout_optimization: bool = True,
 ):
+    if quant_mode not in ("preserve", "require-w8a8"):
+        raise ValueError(f"Unsupported quant mode: {quant_mode}")
     suffix = Path(model_path).suffix.lower()
     if suffix == ".onnx":
         export_onnx_model(
@@ -1373,16 +1026,36 @@ def export_model(
             weight_dtype=weight_dtype,
             output_names=output_names,
             image_normalizations=image_normalizations,
+            input_shapes=input_shapes,
+            input_dtypes=input_dtypes,
+            output_dtypes=output_dtypes,
+            specialize_inputs=specialize_inputs,
+            quant_mode=quant_mode,
+            enable_static_qdq_layout_optimization=(
+                enable_static_qdq_layout_optimization
+            ),
         )
         return
     if suffix == ".tflite":
+        if input_shapes or input_dtypes or output_dtypes or specialize_inputs:
+            raise ValueError(
+                "TFLite input shape/dtype bindings and specialization are not "
+                "enabled until the TFLite frontend uses the shared static IR"
+            )
         export_tflite_model(
             model_path,
             out_path,
             weight_dtype=weight_dtype,
             output_names=output_names,
             image_normalizations=image_normalizations,
+            enable_static_qdq_layout_optimization=(
+                enable_static_qdq_layout_optimization
+            ),
         )
+        if quant_mode == "require-w8a8":
+            graph = json.loads((Path(out_path).parent / "graph.json").read_text(encoding="utf-8"))
+            if classify_package(graph) != "w8a8-v1":
+                raise ValueError("require-w8a8 requested, but the TFLite source is not canonical W8A8")
         return
     raise ValueError(
         f"Unsupported source {model_path!r}; the generic exporter accepts only "
@@ -1392,43 +1065,5 @@ def export_model(
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument(
-        "--model",
-        required=True,
-        help="ONNX or TFLite source model",
-    )
-    parser.add_argument("--out", required=True, help="Output safetensors path (e.g. models/model.safetensors)")
-    parser.add_argument(
-        "--weight-dtype",
-        choices=["auto", "float32", "float16"],
-        default="auto",
-        help="Storage dtype for floating ONNX tensors. auto preserves FLOAT16 initializers and treats fp16/float16 filenames as float16.",
-    )
-    parser.add_argument(
-        "--output-name",
-        action="append",
-        dest="output_names",
-        help=(
-            "Canonical output tensor name in source-output order; repeat once per "
-            "output. Defaults to output0, output1, ... without model-specific inference."
-        ),
-    )
-    parser.add_argument(
-        "--image-normalization",
-        action="append",
-        dest="image_normalizations",
-        metavar="INPUT=MODE",
-        help=(
-            "Declare image preprocessing for one canonical exported input; MODE "
-            "is zero-one, minus-one-one, or raw-255. Repeat for multiple inputs."
-        ),
-    )
-    args = parser.parse_args()
-    export_model(
-        args.model,
-        args.out,
-        weight_dtype=args.weight_dtype,
-        output_names=args.output_names,
-        image_normalizations=args.image_normalizations,
-    )
+    exporter_main = _exporter_module("cli").main
+    raise SystemExit(exporter_main(export_model))

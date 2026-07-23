@@ -48,7 +48,7 @@ function qGELUGraph({
       quantization: outputQuantization,
     },
   }, params);
-  graph.outputNames = [out.name];
+  graph.setOutputs([out.name]);
   return { graph, inputValues: bytes(inputDtype, inputValues), out };
 }
 

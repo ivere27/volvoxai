@@ -31,7 +31,7 @@ function castGraph(inputDtype, outputDtype, to) {
   const { out } = graph.addOp('Cast', { input }, {
     out: { name: 'out', shape: [4], dtype: outputDtype },
   }, { to });
-  graph.outputNames = [out.name];
+  graph.setOutputs([out.name]);
   return graph;
 }
 
@@ -43,7 +43,7 @@ function dequantGraph(inputDtype, zeroDtype) {
   const { out } = graph.addOp('DequantizeLinear', { input, scale, zero_point: zeroPoint }, {
     out: { name: 'out', shape: [4], dtype: 'float32' },
   });
-  graph.outputNames = [out.name];
+  graph.setOutputs([out.name]);
   return graph;
 }
 
@@ -58,7 +58,7 @@ function quantizeGraph(outputDtype, zeroDtype, zeroValue) {
       quantization: { scheme: 'per_tensor', scale: 0.25, zero_point: zeroValue },
     },
   });
-  graph.outputNames = [out.name];
+  graph.setOutputs([out.name]);
   return graph;
 }
 

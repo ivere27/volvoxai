@@ -7,7 +7,7 @@ import {
   preprocessTinyReceiptImage,
   TINY_RECEIPT_W8A8_FAMILY_ORDER,
 } from '../TinyReceiptW8A8Session.js';
-import { CPUEngine, DecodeSession } from '../../../ts/index.js';
+import { CPUEngine } from '../../../ts/backends/CPUEngine.js';
 
 const PACKAGE_URL = 'https://example.test/tiny-receipt/package_manifest.json';
 
@@ -49,7 +49,7 @@ function graphForFamily(family) {
 
 function packageManifest() {
   const family = {
-    config: 'family.config.json',
+    graph: 'family.graph.json',
     interface: {
       inputs: {
         image: 'image', q_ids: 'q_ids', router_keep: 'router_keep', memory_keep: 'memory_keep',
@@ -63,7 +63,7 @@ function packageManifest() {
     weights: { file: 'model.safetensors' },
     family_order: [...TINY_RECEIPT_W8A8_FAMILY_ORDER],
     router: {
-      config: 'router.config.json', output_name: 'router_family',
+      graph: 'router.graph.json', output_name: 'router_family',
       inputs: { q_ids: 'q_ids', router_keep: 'router_keep' },
     },
     explicit_families: Object.fromEntries(TINY_RECEIPT_W8A8_FAMILY_ORDER.map((name) => [name, family])),
@@ -87,112 +87,98 @@ function cloneInputs(inputs) {
   return Object.fromEntries(Object.entries(inputs).map(([name, value]) => [name, value.slice()]));
 }
 
-async function syntheticSession({ gpuReadback = false, incrementalSupport = false,
-  incrementalDecodeSupport = false, decodeSessionSupport = false,
-  deviceFeedbackSupport = false, safetensorsCache = null } = {}) {
+async function syntheticSession({ gpuReadback = false, safetensorsCache = null } = {}) {
   const resources = new Map([
     [PACKAGE_URL, packageManifest()],
     ['https://example.test/tiny-receipt/vocab.json', { itos: ['<pad>', '<bos>', '<eos>', '<unk>', 'A', '😀'] }],
   ]);
   const graphLoads = [];
   const calls = [];
-  const decodeSessions = [];
+  const contexts = [];
   const readbacks = [];
-  const runtime = { loadGraph() {}, compile() {} };
+  const lifecycle = { models: 0, compiled: 0, contexts: 0 };
+  const runtime = {
+    createModel(graph) {
+      return {
+        async compile(options) {
+          const outputName = graph.kind === 'router' ? 'router_family' : 'token_ids';
+          const resultFor = (inputs) => {
+            if (graph.kind === 'router') return Int32Array.of(1); // address
+            const step = inputs.y_keep.reduce(
+              (count, keep) => count + (keep !== 0 ? 1 : 0),
+              0,
+            ) - 1;
+            const output = new Int32Array(3);
+            output[step] = step === 0 ? 4 : 2; // A, then EOS
+            return output;
+          };
+          return {
+            async createContext(contextOptions) {
+              const record = { options, contextOptions, resets: 0, closes: 0 };
+              const execute = async (inputs, executionOptions, method) => {
+                calls.push({
+                  kind: graph.kind,
+                  family: graph.family,
+                  inputs: cloneInputs(inputs),
+                  options: executionOptions,
+                  method,
+                });
+                const value = resultFor(inputs);
+                let closed = false;
+                return {
+                  output(name) {
+                    assert.equal(name, outputName);
+                    return {
+                      async read() {
+                        if (gpuReadback) {
+                          readbacks.push({
+                            kind: graph.kind,
+                            mode: 'full',
+                            sizeBytes: value.byteLength,
+                          });
+                        }
+                        return value.slice();
+                      },
+                    };
+                  },
+                  async close() { closed = true; },
+                  get closed() { return closed; },
+                };
+              };
+              const context = {
+                execute: (inputs, executionOptions) =>
+                  execute(inputs, executionOptions, 'execute'),
+                decode: {
+                  reset: async () => { record.resets++; },
+                  seed: (inputs, executionOptions) =>
+                    execute(inputs, executionOptions, 'decode-seed'),
+                  step: (inputs, executionOptions) =>
+                    execute(inputs, executionOptions, 'decode-step'),
+                },
+                async close() { record.closes++; lifecycle.contexts++; },
+              };
+              record.context = context;
+              contexts.push(record);
+              return context;
+            },
+            async close() { lifecycle.compiled++; },
+          };
+        },
+        async close() { lifecycle.models++; },
+      };
+    },
+  };
   const session = await TinyReceiptW8A8Session.load({
     runtime,
     packageUrl: PACKAGE_URL,
     fetch: fakeFetch(resources),
     ...(safetensorsCache == null ? {} : { safetensorsCache }),
-    graphLoader: async ({ kind, family, configUrl, weightsUrl }) => {
-      graphLoads.push({ kind, family, configUrl, weightsUrl });
+    graphLoader: async ({ kind, family, graphUrl, weightsUrl }) => {
+      graphLoads.push({ kind, family, graphUrl, weightsUrl });
       return kind === 'router' ? graphForRouter() : graphForFamily(family);
     },
-    compileGraph: async (graph) => {
-      const outputName = graph.kind === 'router' ? 'router_family' : 'token_ids';
-      const resultFor = (inputs) => {
-        if (graph.kind === 'router') return Int32Array.of(1); // address
-        const step = inputs.y_keep.reduce((count, keep) => count + (keep !== 0 ? 1 : 0), 0) - 1;
-        const output = new Int32Array(3);
-        output[step] = step === 0 ? 4 : 2; // A, then EOS
-        return output;
-      };
-      const decorate = (engine) => {
-        if (!decodeSessionSupport) return engine;
-        engine.createDecodeSession = function createDecodeSession(options) {
-          const record = { options, seeds: 0, steps: [], closes: 0 };
-          const decode = new DecodeSession(this, options);
-          const seed = decode.seed.bind(decode);
-          const step = decode.step.bind(decode);
-          const close = decode.close.bind(decode);
-          decode.seed = (...args) => { record.seeds++; return seed(...args); };
-          decode.step = (inputs, stepOptions) => {
-            record.steps.push(stepOptions);
-            return step(inputs, stepOptions);
-          };
-          decode.close = (...args) => { record.closes++; return close(...args); };
-          record.session = decode;
-          decodeSessions.push(record);
-          return decode;
-        };
-        return engine;
-      };
-      if (gpuReadback) {
-        const outputBuffer = { graph, outputName };
-        const engine = {
-          graph,
-          supportsIncrementalExecution: incrementalSupport,
-          supportsIncrementalRows: incrementalDecodeSupport,
-          gpuBuffers: new Map([[outputName, outputBuffer]]),
-          async execute(inputs, options) {
-            calls.push({ kind: graph.kind, family: graph.family, inputs: cloneInputs(inputs), options, method: 'execute' });
-            this.last = resultFor(inputs);
-            return outputBuffer;
-          },
-          async readBuffer(buffer, sizeBytes, dtype) {
-            assert.equal(buffer, outputBuffer);
-            assert.equal(dtype, 'int32');
-            assert.equal(sizeBytes, graph.tensors.get(outputName).sizeBytes);
-            readbacks.push({ kind: graph.kind, mode: 'full', sizeBytes });
-            return this.last;
-          },
-          async readBufferRange(buffer, byteOffset, sizeBytes, dtype) {
-            assert.equal(buffer, outputBuffer);
-            assert.equal(dtype, 'int32');
-            assert.equal(byteOffset % Int32Array.BYTES_PER_ELEMENT, 0);
-            assert.equal(sizeBytes % Int32Array.BYTES_PER_ELEMENT, 0);
-            readbacks.push({ kind: graph.kind, mode: 'range', byteOffset, sizeBytes });
-            const begin = byteOffset / Int32Array.BYTES_PER_ELEMENT;
-            return this.last.slice(begin, begin + sizeBytes / Int32Array.BYTES_PER_ELEMENT);
-          },
-        };
-        if (deviceFeedbackSupport) {
-          engine.executeDeviceFeedbackDecode = async function executeDeviceFeedbackDecode(inputs, options) {
-            calls.push({
-              kind: graph.kind,
-              family: graph.family,
-              inputs: inputs == null ? null : cloneInputs(inputs),
-              options,
-              method: 'device-feedback',
-            });
-            this.last = Int32Array.of(4, 4, 2);
-            return outputBuffer;
-          };
-        }
-        return decorate(engine);
-      }
-      return decorate({
-        graph,
-        supportsIncrementalExecution: incrementalSupport,
-        supportsIncrementalRows: incrementalDecodeSupport,
-        async execute(inputs, options) {
-          calls.push({ kind: graph.kind, family: graph.family, inputs: cloneInputs(inputs), options, method: 'execute' });
-          return { [outputName]: resultFor(inputs) };
-        },
-      });
-    },
   });
-  return { session, graphLoads, calls, decodeSessions, readbacks };
+  return { session, graphLoads, calls, contexts, readbacks, lifecycle };
 }
 
 test('TinyReceipt CharVocab keeps source clean-text, code-point, EOS, and special-token semantics', () => {
@@ -202,6 +188,13 @@ test('TinyReceipt CharVocab keeps source clean-text, code-point, EOS, and specia
   // Whitespace is normalized to one ordinary space. This synthetic vocabulary
   // deliberately has no space character, so it becomes the source <unk> ID.
   assert.deepEqual(vocab.encodeQuestion('  A\t😀\n', 4), [4, 3, 5, 2]);
+  assert.deepEqual(
+    new TinyReceiptCharVocab(
+      ['<pad>', '<bos>', '<eos>', '<unk>', 'é'],
+      { pad: 0, bos: 1, eos: 2, unk: 3 },
+    ).encodeQuestion(' e\u0301 ', 3),
+    [4, 2],
+  );
   assert.deepEqual(vocab.encodeQuestion('AAAA', 3), [4, 4, 2]);
   assert.equal(vocab.decode([1, 4, 0, 5, 2, 4]), 'A😀');
 });
@@ -228,6 +221,48 @@ test('TinyReceipt accepts the read-only safetensors cache exported by a separate
   const cache = { size: 0, async load() {}, clear() {} };
   const { session } = await syntheticSession({ safetensorsCache: cache });
   assert.ok(session instanceof TinyReceiptW8A8Session);
+});
+
+test('TinyReceipt requires an explicit public graph loader', async () => {
+  const resources = new Map([
+    [PACKAGE_URL, packageManifest()],
+    ['https://example.test/tiny-receipt/vocab.json', {
+      itos: ['<pad>', '<bos>', '<eos>', '<unk>', 'A', '😀'],
+    }],
+  ]);
+  await assert.rejects(TinyReceiptW8A8Session.load({
+    runtime: { createModel() {} },
+    packageUrl: PACKAGE_URL,
+    fetch: fakeFetch(resources),
+  }), /requires a graphLoader function/);
+});
+
+test('TinyReceipt requires the exact package interface schema', async () => {
+  const cases = [
+    {
+      mutate(manifest) { delete manifest.family_order; },
+      expected: /family_order must be/,
+    },
+    {
+      mutate(manifest) { manifest.router.inputs.q_ids = { name: 'q_ids' }; },
+      expected: /router\.inputs\.q_ids must be a non-empty string/,
+    },
+    {
+      mutate(manifest) { manifest.preprocessing.normalization = 'minus_one_one'; },
+      expected: /grayscale \+ bilinear \+ minus-one-one/,
+    },
+  ];
+  for (const { mutate, expected } of cases) {
+    const manifest = packageManifest();
+    mutate(manifest);
+    const resources = new Map([[PACKAGE_URL, manifest]]);
+    await assert.rejects(TinyReceiptW8A8Session.load({
+      runtime: { createModel() {} },
+      packageUrl: PACKAGE_URL,
+      fetch: fakeFetch(resources),
+      graphLoader: async () => { throw new Error('graph loading must not begin'); },
+    }), expected);
+  }
 });
 
 test('TinyReceipt session runs router then selected family with raw I32/QArgMax IDs and ordinary forward', async () => {
@@ -290,126 +325,44 @@ test('TinyReceipt preload assembles router and selected family graphs exactly on
   );
 });
 
-test('TinyReceipt incremental mode resets once per image and marks only decoder inputs changed', async () => {
-  const { session, calls } = await syntheticSession({ incrementalSupport: true });
+test('TinyReceipt owns decode state through ExecutionContext and disposes every child handle', async () => {
+  const { session, calls, contexts, lifecycle } = await syntheticSession();
   const result = await session.generate({
     prompt: 'A', incremental: true,
     image: { data: Uint8Array.of(0, 255, 128, 64), width: 2, height: 2, channels: 1 },
     maxNewTokens: 3,
   });
+  assert.equal(result.execution, 'context-decode');
   assert.equal(result.text, 'A');
-  assert.equal(result.execution, 'incremental-dependency-cache');
   const familyCalls = calls.filter((call) => call.kind === 'family');
-  assert.equal(familyCalls.length, 2);
-  assert.equal(familyCalls[0].options.incremental, true);
-  assert.equal(familyCalls[0].options.incrementalReset, true);
-  assert.deepEqual(familyCalls[1].options.changedInputs, ['y_ids', 'y_keep']);
-  assert.equal(familyCalls[1].options.incrementalReset, false);
-  assert.equal(Object.prototype.hasOwnProperty.call(familyCalls[1].options, 'incrementalRowPosition'), false);
+  assert.deepEqual(familyCalls.map(({ method }) => method), ['decode-seed', 'decode-step']);
+  assert.deepEqual(familyCalls.map(({ options }) => options), [undefined, { position: 1 }]);
+  const familyContext = contexts.find(({ contextOptions }) =>
+    contextOptions.decode.changedInputs.length > 0);
+  assert.deepEqual(familyContext.contextOptions, {
+    decode: { changedInputs: ['y_ids', 'y_keep'], rowMode: 'auto' },
+  });
+  assert.equal(familyContext.resets, 1);
+
+  await session.close();
+  await session.close();
+  assert.deepEqual(lifecycle, { models: 2, compiled: 2, contexts: 2 });
+  await assert.rejects(session.route('A'), /session is closed/);
 });
 
-test('TinyReceipt negotiates CPU/WASM row decode after the full incremental seed', async () => {
-  const { session, calls } = await syntheticSession({
-    incrementalSupport: true,
-    incrementalDecodeSupport: true,
-  });
+test('TinyReceipt reads backend-independent stable result tensors', async () => {
+  const { session, readbacks } = await syntheticSession({ gpuReadback: true });
   const result = await session.generate({
     prompt: 'A', incremental: true,
-    image: { data: Uint8Array.of(0, 255, 128, 64), width: 2, height: 2, channels: 1 },
-    maxNewTokens: 3,
+    image: new Float32Array(4), preprocessed: true, maxNewTokens: 3,
   });
   assert.equal(result.text, 'A');
-  assert.equal(result.execution, 'incremental-row-kv-cache');
-  const familyCalls = calls.filter((call) => call.kind === 'family');
-  assert.equal(Object.prototype.hasOwnProperty.call(familyCalls[0].options, 'incrementalRowPosition'), false);
-  assert.equal(familyCalls[1].options.incrementalRowPosition, 1);
-  assert.deepEqual(familyCalls[1].options.changedInputs, ['y_ids', 'y_keep']);
-});
-
-test('TinyReceipt reads only the current I32 token from WebGPU row decode', async () => {
-  const { session, readbacks } = await syntheticSession({
-    gpuReadback: true,
-    incrementalSupport: true,
-    incrementalDecodeSupport: true,
-  });
-  const result = await session.generate({
-    prompt: 'A', incremental: true,
-    image: { data: Uint8Array.of(0, 255, 128, 64), width: 2, height: 2, channels: 1 },
-    maxNewTokens: 3,
-  });
-  assert.equal(result.text, 'A');
-  assert.equal(result.execution, 'incremental-row-kv-cache');
   assert.deepEqual(readbacks, [
     { kind: 'router', mode: 'full', sizeBytes: Int32Array.BYTES_PER_ELEMENT },
-    { kind: 'family', mode: 'range', byteOffset: 0, sizeBytes: Int32Array.BYTES_PER_ELEMENT },
-    { kind: 'family', mode: 'range', byteOffset: Int32Array.BYTES_PER_ELEMENT,
-      sizeBytes: Int32Array.BYTES_PER_ELEMENT },
+    { kind: 'family', mode: 'full', sizeBytes: 3 * Int32Array.BYTES_PER_ELEMENT },
+    { kind: 'family', mode: 'full', sizeBytes: 3 * Int32Array.BYTES_PER_ELEMENT },
   ]);
-});
-
-test('TinyReceipt batches WebGPU token feedback and EOS checks entirely on-device', async () => {
-  const { session, calls, readbacks } = await syntheticSession({
-    gpuReadback: true,
-    incrementalSupport: true,
-    incrementalDecodeSupport: true,
-    deviceFeedbackSupport: true,
-  });
-  const result = await session.generate({
-    prompt: 'A', incremental: true, deviceFeedbackChunkSize: 2,
-    image: { data: Uint8Array.of(0, 255, 128, 64), width: 2, height: 2, channels: 1 },
-    maxNewTokens: 3,
-  });
-  assert.equal(result.text, 'AA');
-  assert.deepEqual(result.tokenIds, [4, 4, 2]);
-  assert.equal(result.execution, 'device-feedback-row-kv-cache');
-  const familyCalls = calls.filter((call) => call.kind === 'family');
-  assert.equal(familyCalls.length, 2);
-  assert.equal(familyCalls.every((call) => call.method === 'device-feedback'), true);
-  assert.ok(familyCalls[0].inputs);
-  assert.equal(familyCalls[1].inputs, null);
-  assert.deepEqual(familyCalls.map(({ options }) => options), [
-    {
-      tokenInput: 'y_ids', keepInput: 'y_keep', output: 'token_ids',
-      startPosition: 0, endPosition: 2, rowsPerSubmission: 1,
-    },
-    {
-      tokenInput: 'y_ids', keepInput: 'y_keep', output: 'token_ids',
-      startPosition: 2, endPosition: 3, rowsPerSubmission: 1,
-    },
-  ]);
-  assert.deepEqual(readbacks, [
-    { kind: 'router', mode: 'full', sizeBytes: Int32Array.BYTES_PER_ELEMENT },
-    { kind: 'family', mode: 'range', byteOffset: 0,
-      sizeBytes: 2 * Int32Array.BYTES_PER_ELEMENT },
-    { kind: 'family', mode: 'range', byteOffset: 2 * Int32Array.BYTES_PER_ELEMENT,
-      sizeBytes: Int32Array.BYTES_PER_ELEMENT },
-  ]);
-});
-
-test('TinyReceipt consumes the backend DecodeSession facade when available', async () => {
-  const { session, calls, decodeSessions } = await syntheticSession({
-    incrementalSupport: true,
-    incrementalDecodeSupport: true,
-    decodeSessionSupport: true,
-  });
-  const result = await session.generate({
-    prompt: 'A', incremental: true,
-    image: { data: Uint8Array.of(0, 255, 128, 64), width: 2, height: 2, channels: 1 },
-    maxNewTokens: 3,
-  });
-  assert.equal(result.execution, 'incremental-row-kv-cache');
-  assert.equal(decodeSessions.length, 1);
-  assert.deepEqual(decodeSessions[0].options, {
-    changedInputs: ['y_ids', 'y_keep'], rowMode: 'auto',
-  });
-  assert.equal(decodeSessions[0].seeds, 1);
-  assert.deepEqual(decodeSessions[0].steps, [{
-    changedInputs: ['y_ids', 'y_keep'], position: 1,
-  }]);
-  assert.equal(decodeSessions[0].closes, 1);
-  const familyCalls = calls.filter((call) => call.kind === 'family');
-  assert.equal(familyCalls[0].options.incrementalReset, true);
-  assert.equal(familyCalls[1].options.incrementalRowPosition, 1);
+  await session.close();
 });
 
 test('CPU incremental executor invalidates a failed reset before retrying', async () => {

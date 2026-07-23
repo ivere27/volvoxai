@@ -30,7 +30,7 @@ fn signed_byte(value : u32) -> i32 {
 
 fn input_value(index : u32) -> i32 {
   let byte = word_byte(input_words[index / 4u], index);
-  if (params.input_type == 2u) { return signed_byte(byte); }
+  if (params.input_type == 6u) { return signed_byte(byte); }
   return i32(byte);
 }
 
@@ -50,8 +50,8 @@ fn output_byte(value : i32) -> u32 {
 
 fn qsilu_one(index : u32) -> u32 {
   if (index >= params.elements) { return 0u; }
-  let minimum = select(0, -128, params.output_type == 2u);
-  let maximum = select(255, 127, params.output_type == 2u);
+  let minimum = select(0, -128, params.output_type == 6u);
+  let maximum = select(255, 127, params.output_type == 6u);
   let x = f32(input_value(index) - params.input_zero_point) * params.input_scale;
   let silu = x / (1.0 + exp(-x));
   let transformed = silu / params.output_scale + f32(params.output_zero_point);

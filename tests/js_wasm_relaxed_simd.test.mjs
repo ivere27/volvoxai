@@ -95,7 +95,7 @@ function decodeQLinearGraph() {
       quantization: { scheme: 'per_tensor', scale: 0.125, zero_point: 0 },
     },
   });
-  graph.outputNames = [out.name];
+  graph.setOutputs([out.name]);
   return graph;
 }
 
@@ -234,14 +234,25 @@ test('WASM Relaxed-SIMD child loading is optional and fail-closed', async (t) =>
 });
 
 test('WASM Relaxed-SIMD QLinear dispatch is decode-row-only and preserves fallbacks', async (t) => {
-  await t.test('an eligible immutable packed row calls the child before baseline SIMD', async () => {
+  await t.test('an eligible immutable packed row keeps the faster baseline SIMD path', async () => {
     const graph = decodeQLinearGraph();
     const { engine, calls } = mockQLinearEngine(() => 1);
     await seedAndStep(engine, graph);
 
-    assert.equal(calls.packed, 1, 'the full seed uses the baseline packed kernel');
+    assert.equal(calls.packed, 2, 'the full seed and incremental row use packed SIMD');
     assert.equal(calls.raw, 0);
-    assert.equal(calls.relaxed.length, 1, 'only the incremental row uses Relaxed SIMD');
+    assert.equal(calls.relaxed.length, 0,
+      'the slower optional child is not called after packed SIMD succeeds');
+  });
+
+  await t.test('a packed rejection delegates one decode row to the optional child', async () => {
+    const graph = decodeQLinearGraph();
+    const { engine, calls } = mockQLinearEngine(() => 1, { packedResult: 0 });
+    await seedAndStep(engine, graph);
+
+    assert.equal(calls.packed, 2);
+    assert.equal(calls.raw, 1, 'the full seed cannot use the row-only child');
+    assert.equal(calls.relaxed.length, 1);
     const args = calls.relaxed[0];
     const descriptor = engine.nodeMetadata.get(graph.nodes[0]);
     assert.equal(args.length, 17);
@@ -253,31 +264,25 @@ test('WASM Relaxed-SIMD QLinear dispatch is decode-row-only and preserves fallba
     assert.deepEqual(args.slice(8, 10), [3, 2]);
   });
 
-  await t.test('a child descriptor rejection falls through to baseline packed SIMD', async () => {
-    const graph = decodeQLinearGraph();
-    const { engine, calls } = mockQLinearEngine(() => 0);
-    await seedAndStep(engine, graph);
-    assert.equal(calls.relaxed.length, 1);
-    assert.equal(calls.packed, 2, 'seed and rejected relaxed row both use baseline packed SIMD');
-    assert.equal(calls.raw, 0);
-  });
-
-  await t.test('a child trap falls through to baseline packed SIMD', async () => {
-    const graph = decodeQLinearGraph();
-    const { engine, calls } = mockQLinearEngine(() => { throw new Error('child trap'); });
-    await seedAndStep(engine, graph);
-    assert.equal(calls.relaxed.length, 1);
-    assert.equal(calls.packed, 2);
-    assert.equal(calls.raw, 0);
-    assert.equal(engine.relaxedSimdEnabled, false, 'a trapping child is disabled permanently');
-  });
-
-  await t.test('child and packed rejection retain the canonical raw fallback', async () => {
+  await t.test('packed and child descriptor rejection retain the canonical raw fallback', async () => {
     const graph = decodeQLinearGraph();
     const { engine, calls } = mockQLinearEngine(() => 0, { packedResult: 0 });
     await seedAndStep(engine, graph);
     assert.equal(calls.relaxed.length, 1);
     assert.equal(calls.packed, 2);
-    assert.equal(calls.raw, 2, 'both seed and decode row reach the raw kernel');
+    assert.equal(calls.raw, 2);
+  });
+
+  await t.test('a fallback child trap disables it and retains the canonical raw path', async () => {
+    const graph = decodeQLinearGraph();
+    const { engine, calls } = mockQLinearEngine(
+      () => { throw new Error('child trap'); },
+      { packedResult: 0 },
+    );
+    await seedAndStep(engine, graph);
+    assert.equal(calls.relaxed.length, 1);
+    assert.equal(calls.packed, 2);
+    assert.equal(calls.raw, 2);
+    assert.equal(engine.relaxedSimdEnabled, false, 'a trapping child is disabled permanently');
   });
 });

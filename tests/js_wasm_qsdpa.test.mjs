@@ -57,7 +57,7 @@ function qSDPAGraph({
   const { out } = graph.addOp('QSDPA', inputs, {
     out: { name: 'out', shape: qShape, dtype: outputDtype, quantization: outputQuantization },
   }, params);
-  graph.outputNames = [out.name];
+  graph.setOutputs([out.name]);
   return { graph, qValues: bytes(qDtype, qValues), kValues: bytes(kDtype, kValues),
     vValues: bytes(vDtype, vValues), maskValues: mask ? Int32Array.from(maskValues) : null, out, q, k, v, mask };
 }

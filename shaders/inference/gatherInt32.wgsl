@@ -1,5 +1,4 @@
-// General ONNX-style Gather for F32 data and I32 indices. The legacy
-// gather.wgsl remains the axis-0 F32-index kernel used by native backends.
+// General ONNX-style Gather for F32 data and I32 indices.
 @group(0) @binding(0) var<storage, read> input : array<f32>;
 @group(0) @binding(1) var<storage, read> indices : array<i32>;
 @group(0) @binding(2) var<storage, read_write> output : array<f32>;
@@ -51,10 +50,13 @@ fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
     let output_dimension = axis + index_dimension;
     index_offset = index_offset * output_dim(output_dimension) + output_coords[output_dimension];
   }
-  let gathered = indices[index_offset];
+  var gathered = indices[index_offset];
+  if (gathered < 0) {
+    gathered = gathered + i32(data_dim(axis));
+  }
   if (gathered < 0 || gathered >= i32(data_dim(axis))) {
-    // Match the portable Gather reference's negative-index sentinel while
-    // avoiding an out-of-bounds storage read for any invalid positive index.
+    // Match the portable Gather sentinel without forming an out-of-bounds
+    // address when one ONNX negative-index normalization is still invalid.
     output[output_index] = -1.0;
     return;
   }

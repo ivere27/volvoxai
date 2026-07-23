@@ -36,6 +36,11 @@ the shape of the backward pass.
 > 🌱 **Idea.** First we need a **score for how wrong** the guess was — a single number. Think of it
 > like a golf score: 0 means perfect, and the bigger it is, the worse the guess. Training is just
 > "keep playing until the score gets low." This wrongness-number is called the **loss**.
+>
+> *A tiny example.* Suppose the true next word is "was" and the model gives it probability 0.5. The
+> cross-entropy loss is `−ln(0.5) ≈ 0.69`. Had it been surer — 0.9 — the loss would be
+> `−ln(0.9) ≈ 0.11` (better). Perfectly sure and right → loss 0; confident and *wrong* → loss huge.
+> The loss is really just "how surprised was the model by the correct answer."
 
 🔧 The forward pass ends with 50257 logits — a score per vocabulary word. During generation we just
 took the `argmax`. During **training** we know the *right* answer (the actual next word in the
@@ -43,18 +48,15 @@ training text), so instead we ask a sharper question: **how wrong were these sco
 
 A **loss function** collapses the entire output into a single number — bigger means more wrong. For a
 language model the loss is **cross-entropy**: it rewards putting high probability on the correct
-token and punishes confidence in the wrong ones. 🔬 VolvoxAI computes it in one kernel that returns
-both the loss *and* the first gradient (`native/src/kernels/training_kernels.c`):
+token and punishes confidence in the wrong ones. 🔬 Trainer computes it with a fused kernel that
+returns both the loss *and* the first gradient:
 
 ```c
-// volvoxai_training_cross_entropy_f32 — loss AND its gradient in one pass
+// loss AND its gradient in one pass
 //   logits[e, :]  the model's scores for example e   (classes = 50257)
 //   targets[e]    the correct token id for example e
 //   grad          filled with dLoss/dLogits          (same shape as logits)
-uint32_t volvoxai_training_cross_entropy_f32(
-    const float *logits, const int32_t *rows, const int32_t *targets, float *grad,
-    uint32_t examples, uint32_t classes, float gradient_scale,
-    float *loss_sum, uint32_t *correct);
+loss_sum, grad, correct = cross_entropy_with_gradient(logits, targets)
 ```
 
 🔧 Two outputs matter:
@@ -63,6 +65,13 @@ uint32_t volvoxai_training_cross_entropy_f32(
 - **`grad`** — for every one of the 50257 logits, `dLoss/dLogit`: *if this score went up by a
   hair, how much would the loss change?* 🔬 For cross-entropy this has a famously clean form,
   `softmax(logits) − onehot(target)`: the predicted probabilities, minus 1.0 on the true token.
+
+> 🔬 **Under the hood: one fused, stable kernel.** Cross-entropy is `−log softmax(logits)[target]`, and
+> its gradient collapses to that tidy `softmax(logits) − onehot(target)` — so the kernel computes the
+> probabilities **once** and reuses them for *both* the loss and the seed gradient in a single pass. It
+> runs the softmax in **log-sum-exp** form (subtract the row max, exactly as in §2.5b) so a large logit
+> can't overflow `exp`, and it tallies a `correct` count (did `argmax` hit the target?) so you get
+> accuracy for free next to the loss.
 
 That `grad` tensor is the **seed of the backward pass**. Everything from here is about carrying it
 backward through the graph until every *weight* has one too.
@@ -120,6 +129,13 @@ each op converting the gradient of its output into the gradient of its input —
 weights, computing `dLoss/dweight` on the way. That is literally all backprop is: a `for` loop over
 the graph, backwards, mirroring the forward `for` loop from Chapter 1.
 
+> 🔬 **Under the hood: why *reverse*, and why it's cheap.** You could compute slopes front-to-back
+> (forward-mode), but that costs one full pass *per input weight* — hopeless with millions. Going
+> **backward** from the single loss produces the gradient for **every** weight in **one** pass, because
+> each op's `dLoss/d(output)` is reused for all the weights feeding it. That asymmetry — one scalar out,
+> millions of knobs in — is the whole reason training is affordable, and it's why a backward pass costs
+> roughly the same as a forward one, not a million times more.
+
 🔬 **Every forward op has a backward twin.** The naming is one-to-one:
 
 | Forward op (Part I) | Backward twin (`training_kernels.c` / `shaders/training/`) | Produces |
@@ -153,7 +169,7 @@ Forward, `Add` just sums: `y = a + b`. So nudging `a` by ε nudges `y` by ε, an
 The gradient therefore flows to **both** inputs unchanged — the backward twin is a copy:
 
 ```c
-// volvoxai_training_add_backward_f32: gradient of y = a + b
+// gradient of y = a + b
 for (uint32_t i = 0; i < n; i++) {
     da[i] += dy[i];    // ∂y/∂a = 1
     db[i] += dy[i];    // ∂y/∂b = 1
@@ -176,7 +192,7 @@ Forward: `y = x · W` (the projection that appears four times per transformer bl
 *three* gradients — for the input, the weight, and the bias:
 
 ```c
-// volvoxai_training_linear_backward_f32, in words:
+// Linear backward, in words:
 //   dx = dy · Wᵀ            gradient to pass to the previous op
 //   dW = xᵀ · dy            gradient of THIS layer's weight   ← what we'll update
 //   db = column-sum of dy   gradient of the bias
@@ -187,13 +203,18 @@ symmetry — the forward pass multiplies by `W`; the backward pass multiplies by
 matmul is a matmul, which is why backward is about as expensive as forward (and reuses the same fast
 GEMM).
 
+> 🔬 **Under the hood: the shapes line up.** With `x` shape `[m, k]` and `W` shape `[k, n]`, `y = x·W`
+> is `[m, n]`. Then `dx = dy · Wᵀ` is `[m, n]·[n, k] = [m, k]` (matches `x`), and `dW = xᵀ · dy` is
+> `[k, m]·[m, n] = [k, n]` (matches `W`). A gradient always has the **same shape** as the thing it's the
+> gradient of — a free sanity check for any twin you read.
+
 ### `GELU` (and friends) — a local gate
 
 An activation acts element-by-element, so its twin is a per-element multiply by the slope of its
 curve at that point:
 
 ```c
-// volvoxai_training_activation_backward_f32(kind = GELU, …):
+// activation backward for GELU:
 dx[i] = dy[i] * gelu_prime(x[i]);   // scale the incoming gradient by the local slope
 ```
 
@@ -208,13 +229,19 @@ the gradient back into exactly those rows — and if the same token appeared twi
 add up:
 
 ```c
-// volvoxai_training_embedding_backward_f32, in words:
+// Embedding backward, in words:
 for each token t in the sequence:
     dW[ ids[t] , : ] += dy[ t , : ];   // scatter this token's gradient onto its row
 ```
 
 🌱 Only the word-rows that actually showed up get adjusted this round — which is why rare words learn
 slowly (they rarely get their turn). This is the mirror of the table *lookup* from Chapter 2 §2.4.
+
+> 🔬 **Under the hood: scatter-add needs care in parallel.** Because two positions can hold the *same*
+> token, two threads may add into the same table row at once — a data race. GPU embedding-backward
+> kernels serialize those writes (atomics, or a per-row reduction) so no update is lost; the CPU kernel
+> just loops in order. It's the one backward twin where "in what order do the `+=`s happen" has to be
+> handled on purpose.
 
 ## 4.5 The transformer block, in reverse
 
@@ -249,10 +276,17 @@ gradient down both branches (§4.4), the branches recombine with `+=`, and every
 `LayerNorm'`, and `SDPA'` deposits a `dW` for its weights along the way. Run this for all 8 blocks,
 then back through the embedding, and **every weight in the model now has a gradient**.
 
-🔬 `SDPA'` (`volvoxai_training_sdpa_backward_f32`) is the busiest twin — it must route gradient back
+🔬 `SDPA'` is the busiest twin — it must route gradient back
 through the softmax *and* the Q·K similarities *and* the value blend — but conceptually it is still
 just "given `dLoss/d(attention output)`, produce `dLoss/d(qkv)`." The causal mask that blocked
 forward information flow (§2.5b) blocks it the same way in reverse.
+
+> 🔬 **Under the hood: backward needs the forward's leftovers.** To differentiate the softmax, `SDPA'`
+> needs the attention **probabilities** from the forward pass. It can either **save** them (fast, but
+> `O(seq²)` memory per head) or **recompute** them (little memory, more math — the idea behind
+> flash-attention). This is the general rule: *every* twin needs some forward value (`x`, `y`, or both),
+> which is why training uses far more memory than inference — you must keep activations alive until
+> their twin has run.
 
 ## 4.6 Where gradients stop
 
@@ -265,11 +299,17 @@ forward information flow (§2.5b) blocks it the same way in reverse.
 - **Sampling / argmax** — picking the next token is a hard choice with no useful slope. Training
   never backpropagates through the sampler; it backpropagates through the *loss on the logits*
   (§4.1), which is smooth.
-- **Casts to integers and quantization** — `volvoxai_training_cast_backward_f32` deliberately
-  **stops** the gradient for any integer-involved cast. (Quantization-aware training gets around this
-  with a special twin, `volvoxai_training_dequantize_linear_backward_f32` — that's Chapter 7.)
-- **Non-finite guards** — `volvoxai_training_all_finite_f32` lets the trainer detect a NaN/Inf
+- **Casts to integers and quantization** — an integer-involved cast deliberately **stops** the
+  gradient. Quantization-aware training uses an explicit fake-quant straight-through rule instead
+  (Chapter 7).
+- **Non-finite guards** — Trainer detects a NaN/Inf
   gradient (from a too-large learning rate or numerical blow-up) *before* it corrupts the weights.
+
+> 🔬 **Under the hood: the memory bill, and how to pay less.** Because each twin needs forward
+> activations (§4.5), a naïve backward pass keeps *every* intermediate tensor alive — usually the
+> dominant memory cost of training. **Gradient checkpointing** trades compute for memory: store only a
+> few activations and *recompute* the rest during backward. It's the standard lever for training a
+> model that wouldn't fit if you saved everything.
 
 ## 4.7 What you just learned
 

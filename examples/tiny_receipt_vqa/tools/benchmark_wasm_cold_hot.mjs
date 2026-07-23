@@ -6,26 +6,35 @@ import { join } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { performance } from 'node:perf_hooks';
 
-import { VolvoxAI } from '../../../ts/VolvoxAI.js';
-import { WasmEngine } from '../../../ts/backends/WasmEngine.js';
 import {
-  TinyReceiptW8A8Session,
-  preprocessTinyReceiptImage,
-} from '../TinyReceiptW8A8Session.js';
+  Graph,
+  GraphLoader,
+  ReadOnlySafetensorsCache,
+  VolvoxAI,
+} from '../../../ts/index.js';
+import {
+  TinyReceiptSplitSession,
+} from '../TinyReceiptSplitSession.js';
+import { preprocessTinyReceiptImage } from '../TinyReceiptW8A8Session.js';
 
 const repository = fileURLToPath(new URL('../../../', import.meta.url));
-const packageDir = process.argv[2] || '/tmp/volvoxai-tinyreceipt-safetensors-v1';
-const navercapRoot = process.env.NAVERCAP_ROOT;
-const imagePath = process.argv[3] || (navercapRoot
-  ? join(navercapRoot, 'eval', 'heldout', 'images', '00002.jpg')
+const packageDir = process.argv[2] || '/tmp/volvoxai-bpe1536-int8-canonical-root';
+const receiptDataRoot = process.env.RECEIPT_VQA_DATA_ROOT;
+const imagePath = process.argv[3] || (receiptDataRoot
+  ? join(receiptDataRoot, 'eval', 'heldout', 'images', '00002.jpg')
   : null);
 if (!imagePath) {
   throw new Error(
-    'pass an image path as argument 2 or set NAVERCAP_ROOT=/path/to/navercap',
+    'pass an image path as argument 2 or set '
+    + 'RECEIPT_VQA_DATA_ROOT=/path/to/receipt-vqa-data',
   );
 }
 const prompt = process.argv[4] || 'phone number last one';
-const wasmPath = process.argv[5] || `${repository}/dist/0.2.0/volvoxai.wasm`;
+const wasmPath = process.argv[5] || `${repository}/dist/0.3.0/volvoxai.wasm`;
+const maxNewTokens = Number(process.argv[6] || 191);
+if (!Number.isInteger(maxNewTokens) || maxNewTokens < 1 || maxNewTokens > 191) {
+  throw new Error('max-new-tokens argument must be an integer in [1, 191]');
+}
 
 const fetchRecords = new Map();
 async function fileFetch(input) {
@@ -64,68 +73,66 @@ const rawImage = {
   channels: 3,
 };
 
-const baseRuntime = new VolvoxAI();
 const graphLoads = [];
-const runtime = {
-  async loadGraph(sources, options) {
-    const started = performance.now();
-    try {
-      return await baseRuntime.loadGraph(sources, options);
-    } finally {
-      graphLoads.push({
-        configUrl: options.configUrl,
-        ms: performance.now() - started,
-      });
-    }
-  },
-  compile() {
-    throw new Error('benchmark compileGraph override was not installed');
-  },
-};
-
 let activeRun = null;
-const engines = [];
+const compilations = [];
+const contextLabels = new Map();
+const executions = { encoder: [[], []], decoder: [[], []] };
+const runtimeInitStarted = performance.now();
+const runtime = await VolvoxAI.createRuntime({
+  backends: ['wasm'],
+  wasmUrl: pathToFileURL(wasmPath),
+  onDiagnostic(event) {
+    if (event.kind === 'compilation') {
+      compilations.push({
+        label: compilations.length === 0 ? 'encoder' : 'decoder',
+        report: event.report,
+      });
+      return;
+    }
+    if (event.kind !== 'execution' || activeRun == null) return;
+    if (!contextLabels.has(event.report.contextId)) {
+      contextLabels.set(event.report.contextId, contextLabels.size === 0 ? 'encoder' : 'decoder');
+    }
+    const label = contextLabels.get(event.report.contextId);
+    executions[label][activeRun].push({
+      ms: event.report.executionTimeMs ?? 0,
+      executionId: event.report.executionId,
+      contextId: event.report.contextId,
+      backend: event.report.backend,
+      device: event.report.device,
+      outcome: event.report.outcome,
+      operatorFallback: event.report.operatorFallback,
+      routeEvidence: event.report.routeEvidence,
+      decodeState: event.report.decodeState,
+    });
+  },
+});
+const runtimeInitMs = performance.now() - runtimeInitStarted;
+const sessionCache = new ReadOnlySafetensorsCache();
 const sessionLoadStarted = performance.now();
-const session = await TinyReceiptW8A8Session.load({
+const session = await TinyReceiptSplitSession.load({
   runtime,
   packageUrl: pathToFileURL(`${packageDir}/package_manifest.json`),
   fetch: fileFetch,
-  // One backend instance per graph keeps router and family allocations live
-  // simultaneously; this is the intended host contract for this benchmark.
-  compileGraph: async (graph) => {
-    const label = graph.tensors.has('image') ? 'family' : 'router';
-    const initStarted = performance.now();
-    const engine = await WasmEngine.init(pathToFileURL(wasmPath));
-    const initMs = performance.now() - initStarted;
-    if (!engine) throw new Error('strict WASM initialization failed');
-    const compileStarted = performance.now();
-    engine.allocateGraph(graph);
-    const compileMs = performance.now() - compileStarted;
-    const record = {
-      label,
-      initMs,
-      compileMs,
-      relaxedSimdEnabled: engine.relaxedSimdEnabled,
-      heapMiB: engine.mem.buffer.byteLength / 1048576,
-      executions: [[], []],
-    };
-    const execute = engine.execute.bind(engine);
-    engine.execute = async (inputs, options) => {
-      const started = performance.now();
-      try {
-        return await execute(inputs, options);
-      } finally {
-        if (activeRun != null) {
-          record.executions[activeRun].push({
-            ms: performance.now() - started,
-            reset: options?.incrementalReset === true,
-            row: options?.incrementalRowPosition ?? null,
-          });
-        }
-      }
-    };
-    engines.push(record);
-    return engine;
+  safetensorsCache: sessionCache,
+  decodePolicy: 'required',
+  compileOptions: {
+    backend: { mode: 'require', backend: 'wasm', operatorFallback: 'forbid' },
+  },
+  graphLoader: async ({ weightsUrl, graphUrl, kind }) => {
+    const started = performance.now();
+    try {
+      const graph = new Graph();
+      await GraphLoader.load(graph, weightsUrl, {
+        graphUrl,
+        fetch: fileFetch,
+        safetensorsCache: sessionCache,
+      });
+      return graph;
+    } finally {
+      graphLoads.push({ graphUrl, kind, ms: performance.now() - started });
+    }
   },
 });
 const sessionLoadMs = performance.now() - sessionLoadStarted;
@@ -145,7 +152,7 @@ for (let runIndex = 0; runIndex < 2; runIndex++) {
       prompt,
       family: 'auto',
       preprocessed: true,
-      incremental: true,
+      maxNewTokens,
     });
   } finally {
     activeRun = null;
@@ -157,63 +164,189 @@ for (let runIndex = 0; runIndex < 2; runIndex++) {
   });
 }
 
-if (runs[0].answer.family !== runs[1].answer.family ||
-    runs[0].answer.text !== runs[1].answer.text ||
-    runs[0].answer.tokenIds.length !== runs[1].answer.tokenIds.length) {
-  throw new Error('cold and hot generations produced different answers');
+function strictRoute(route, label) {
+  if (route?.tierFallback !== false ||
+      route?.operator?.attestation !== 'none' ||
+      route.operator.used !== false ||
+      route.operator.offendingNode != null) {
+    throw new Error(`${label} does not prove a strict WASM no-fallback route`);
+  }
 }
 
-function executionSummary(runIndex) {
-  const router = engines.find((record) => record.label === 'router')?.executions[runIndex] || [];
-  const family = engines.find((record) => record.label === 'family')?.executions[runIndex] || [];
-  const steady = family.slice(1).map(({ ms }) => ms);
-  const steadyMean = steady.length
-    ? steady.reduce((sum, value) => sum + value, 0) / steady.length
+function answerSignature(answer) {
+  return JSON.stringify({
+    family: answer.family,
+    familyId: answer.familyId,
+    requestedFamily: answer.requestedFamily,
+    requestedFamilyId: answer.requestedFamilyId,
+    questionTokenIds: [...answer.questionTokenIds],
+    tokenIds: [...answer.tokenIds],
+    text: answer.text,
+    stoppedAtEos: answer.stoppedAtEos,
+    execution: answer.execution,
+    decodeMode: answer.decodeMode,
+    decoderSeedExecutions: answer.decoderSeedExecutions,
+    decoderRowExecutions: answer.decoderRowExecutions,
+    decoderOrdinaryExecutions: answer.decoderOrdinaryExecutions,
+    routerLogits: [...answer.routerLogits],
+  });
+}
+
+if (answerSignature(runs[0].answer) !== answerSignature(runs[1].answer)) {
+  throw new Error('cold and hot generations produced different exact answers');
+}
+
+if (compilations.length !== 2) {
+  throw new Error(`expected two WASM compilations, received ${compilations.length}`);
+}
+for (const [index, { label, report }] of compilations.entries()) {
+  const expectedLabel = index === 0 ? 'encoder' : 'decoder';
+  if (label !== expectedLabel ||
+      report?.requestedPolicy?.mode !== 'require' ||
+      report.requestedPolicy.backend !== 'wasm' ||
+      report.requestedPolicy.operatorFallback !== 'forbid' ||
+      report.selectedBackend !== 'wasm' ||
+      !Array.isArray(report.candidates) ||
+      report.candidates.length !== 1 ||
+      report.candidates[0]?.backend !== 'wasm' ||
+      report.candidates[0]?.outcome !== 'selected') {
+    throw new Error(`${expectedLabel} compilation did not strictly select WASM`);
+  }
+  strictRoute(report.routeEvidence, `${expectedLabel} compilation`);
+  strictRoute(report.candidates[0].routeEvidence, `${expectedLabel} compilation candidate`);
+}
+
+function strictExecution(record, label) {
+  if (record?.backend !== 'wasm' ||
+      record.outcome !== 'success' ||
+      record.operatorFallback !== 'none') {
+    throw new Error(`${label} did not execute successfully on strict WASM`);
+  }
+  strictRoute(record.routeEvidence, label);
+}
+
+function executionSummary(runIndex, endToEndMs) {
+  const encoder = executions.encoder[runIndex];
+  const decoder = executions.decoder[runIndex];
+  const answer = runs[runIndex].answer;
+  if (answer.execution !== 'context-decode-retained-row' ||
+      answer.decodeMode !== 'incremental-row-required' ||
+      answer.decoderSeedExecutions !== 1 ||
+      answer.decoderRowExecutions !== Math.max(0, answer.tokenIds.length - 1) ||
+      answer.decoderOrdinaryExecutions !== 0) {
+    throw new Error(`run ${runIndex} did not report the required retained-row contract`);
+  }
+  if (encoder.length !== 1 || decoder.length !== answer.tokenIds.length || decoder.length < 1) {
+    throw new Error(
+      `run ${runIndex} expected one encoder and ${answer.tokenIds.length} decoder executions`,
+    );
+  }
+  strictExecution(encoder[0], `run ${runIndex} encoder`);
+  if (encoder[0].decodeState?.operation !== 'execute' ||
+      encoder[0].decodeState.mode != null ||
+      encoder[0].decodeState.position != null) {
+    throw new Error(`run ${runIndex} encoder did not use an ordinary execution`);
+  }
+  const seed = decoder[0];
+  strictExecution(seed, `run ${runIndex} decoder seed`);
+  if (seed.decodeState?.operation !== 'seed' ||
+      seed.decodeState.mode !== 'incremental-seed' ||
+      seed.decodeState.cacheState !== 'seeded' ||
+      seed.decodeState.position != null) {
+    throw new Error(`run ${runIndex} decoder did not begin with one incremental seed`);
+  }
+  const rows = decoder.slice(1);
+  for (const [index, row] of rows.entries()) {
+    const position = index + 1;
+    strictExecution(row, `run ${runIndex} decoder row ${position}`);
+    if (row.decodeState?.operation !== 'step' ||
+        row.decodeState.mode !== 'incremental-row' ||
+        row.decodeState.cacheState !== 'advanced' ||
+        row.decodeState.position !== position) {
+      throw new Error(`run ${runIndex} decoder row ${position} was not retained-row execution`);
+    }
+  }
+  if (encoder[0].contextId === seed.contextId ||
+      decoder.some(({ contextId }) => contextId !== seed.contextId)) {
+    throw new Error(`run ${runIndex} did not isolate encoder and decoder contexts`);
+  }
+
+  const steadyTotal = rows.reduce((sum, { ms }) => sum + ms, 0);
+  const steadyMean = rows.length
+    ? steadyTotal / rows.length
     : 0;
+  const decoderTotal = decoder.reduce((sum, { ms }) => sum + ms, 0);
   return {
-    routerMs: router.reduce((sum, value) => sum + value.ms, 0),
-    familySeedMs: family[0]?.ms || 0,
-    steadySteps: steady.length,
+    encoderMs: encoder.reduce((sum, value) => sum + value.ms, 0),
+    decoderSeedMs: seed.ms,
+    decoderSteadySteps: rows.length,
+    decoderSteadyTotalMs: steadyTotal,
+    decoderSteadyMeanMs: steadyMean,
+    decoderSteadyTokensPerSecond: steadyMean ? 1000 / steadyMean : 0,
+    decoderTotalMs: decoderTotal,
+    endToEndMs,
+    // Retain the original field names for existing report consumers.
+    decoderFirstStepMs: seed.ms,
+    steadySteps: rows.length,
     steadyMeanMs: steadyMean,
     steadyTokensPerSecond: steadyMean ? 1000 / steadyMean : 0,
+    executionEvidence: {
+      encoderOperation: encoder[0].decodeState.operation,
+      decoderSeedMode: seed.decodeState.mode,
+      decoderSteadyMode: rows.length ? 'incremental-row' : null,
+      strictNoFallback: true,
+    },
   };
 }
+
+const executionSummaries = runs.map((run, index) =>
+  executionSummary(index, run.generationMs));
 
 const output = {
   provenance: {
     packageDir,
     imagePath,
     prompt,
+    maxNewTokens,
     wasmPath,
     node: process.version,
     imageDecode: 'Pillow RGB',
-    preprocessing: 'TinyReceiptW8A8Session JavaScript',
-    coldDefinition: 'session manifest/vocab loaded; router/family graphs and WASM executors absent',
+    preprocessing: 'TinyReceipt split-session JavaScript',
+    coldDefinition: 'runtime and manifest/vocab loaded; encoder/decoder models not compiled',
+    endToEndDefinition: 'TinyReceiptSplitSession.generate on the preprocessed image',
+    decodePolicy: 'required retained-row WASM',
   },
   sourceImage: { width: sourceWidth, height: sourceHeight },
+  runtimeInitMs,
   sessionLoadMs,
   preprocessMs,
   fetches: [...fetchRecords.entries()].map(([url, record]) => ({ url, ...record })),
   graphLoads: graphLoads.map((record) => ({ ...record })),
-  engines: engines.map((record) => ({
-    label: record.label,
-    initMs: record.initMs,
-    compileMs: record.compileMs,
-    relaxedSimdEnabled: record.relaxedSimdEnabled,
-    heapMiB: record.heapMiB,
-  })),
+  compilations: compilations.map(({ label, report }) => ({ label, report })),
   runs: runs.map((run, index) => ({
     name: run.name,
     generationMs: run.generationMs,
     family: run.answer.family,
+    familyId: run.answer.familyId,
+    requestedFamily: run.answer.requestedFamily,
     text: run.answer.text,
+    tokenIds: [...run.answer.tokenIds],
     tokens: run.answer.tokenIds.length,
+    stoppedAtEos: run.answer.stoppedAtEos,
     execution: run.answer.execution,
-    ...executionSummary(index),
+    decodeMode: run.answer.decodeMode,
+    decoderSeedExecutions: run.answer.decoderSeedExecutions,
+    decoderRowExecutions: run.answer.decoderRowExecutions,
+    decoderOrdinaryExecutions: run.answer.decoderOrdinaryExecutions,
+    ...executionSummaries[index],
   })),
+  coldHotExactAnswerMatch: true,
   coldMinusHotMs: runs[0].generationMs - runs[1].generationMs,
   coldToHotRatio: runs[0].generationMs / runs[1].generationMs,
 };
+
+await session.close();
+await runtime.close();
 
 console.log('WASM_TINYRECEIPT_COLD_HOT ' + JSON.stringify(output, (_key, value) =>
   typeof value === 'number' ? Number(value.toFixed(3)) : value, 2));

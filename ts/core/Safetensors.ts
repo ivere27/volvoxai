@@ -62,6 +62,36 @@ export const SAFETENSORS_TENSOR_WRITABLE = 1 << 1;
 export const SAFETENSORS_OPEN_READ_ONLY = 0;
 export const SAFETENSORS_OPEN_READ_WRITE = 1 << 0;
 
+export function assertLosslessJSONValue(value: unknown, label = 'JSON'): void {
+  const seen = new WeakSet<object>();
+  const visit = (item: unknown, path: string): void => {
+    if (item == null || typeof item === 'string' || typeof item === 'boolean') return;
+    if (typeof item === 'number') {
+      if (!Number.isFinite(item)) {
+        throw new SyntaxError(`${path} contains a non-finite JSON number.`);
+      }
+      if (Number.isInteger(item) && !Number.isSafeInteger(item)) {
+        throw new SyntaxError(`${path} contains an integer outside JSON's safe range.`);
+      }
+      return;
+    }
+    if (typeof item !== 'object') {
+      throw new SyntaxError(`${path} contains a non-JSON ${typeof item} value.`);
+    }
+    if (seen.has(item)) throw new SyntaxError(`${path} contains a JSON cycle.`);
+    seen.add(item);
+    if (Array.isArray(item)) {
+      item.forEach((child, index) => visit(child, `${path}[${index}]`));
+    } else {
+      for (const [key, child] of Object.entries(item)) {
+        visit(child, `${path}.${key}`);
+      }
+    }
+    seen.delete(item);
+  };
+  visit(value, label);
+}
+
 export function parseStrictJSON(source: string, label = 'JSON'): unknown {
   const parsed = JSON.parse(source);
   let cursor = 0;
@@ -147,6 +177,7 @@ export function parseStrictJSON(source: string, label = 'JSON'): unknown {
     }
   }
   scanValue();
+  assertLosslessJSONValue(parsed, label);
   return parsed;
 }
 

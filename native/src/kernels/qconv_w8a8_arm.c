@@ -10,7 +10,10 @@
  * baseline translation unit remains safe for every ARM deployment.
  */
 #include "qconv_w8a8_arm.h"
+#include "w8a8_affine.h"
 #include "cpu_features.h"
+#include "kernel_platform.h"
+#include "../../include/volvoxai_enums.h"
 
 #include <limits.h>
 #include <math.h>
@@ -32,58 +35,9 @@
 
 #if VX_W8A8_QCONV_ARM_NEON
 enum {
-    VX_W8A8_QCONV_ARM_I8 = 2u,
-    VX_W8A8_QCONV_ARM_U8 = 3u,
+    VX_W8A8_QCONV_ARM_I8 = VX_DTYPE_I8,
+    VX_W8A8_QCONV_ARM_U8 = VX_DTYPE_U8,
 };
-
-static int vx_w8a8_qconv_arm_finite_f32(float value) {
-    union { float f; uint32_t u; } bits = { value };
-    return ((bits.u >> 23u) & 0xffu) != 0xffu;
-}
-
-static int vx_w8a8_qconv_arm_mul_size(size_t* value, size_t factor) {
-    if (factor && *value > (size_t)-1 / factor) return 0;
-    *value *= factor;
-    return 1;
-}
-
-static int vx_w8a8_qconv_arm_byte_dtype(uint32_t dtype) {
-    return dtype == VX_W8A8_QCONV_ARM_I8 || dtype == VX_W8A8_QCONV_ARM_U8;
-}
-
-static int vx_w8a8_qconv_arm_zero_point_valid(int32_t value, uint32_t dtype) {
-    if (dtype == VX_W8A8_QCONV_ARM_I8) return value >= -128 && value <= 127;
-    if (dtype == VX_W8A8_QCONV_ARM_U8) return value >= 0 && value <= 255;
-    return 0;
-}
-
-static int32_t vx_w8a8_qconv_arm_byte_value(const void* data, uint32_t dtype,
-                                             size_t index) {
-    return dtype == VX_W8A8_QCONV_ARM_I8 ? (int32_t)((const int8_t*)data)[index] :
-        (int32_t)((const uint8_t*)data)[index];
-}
-
-static int32_t vx_w8a8_qconv_arm_round_ties_even(float value) {
-    int32_t lower = (int32_t)floorf(value);
-    float fraction = value - (float)lower;
-    if (fraction < 0.5f) return lower;
-    if (fraction > 0.5f) return lower + 1;
-    return lower % 2 == 0 ? lower : lower + 1;
-}
-
-static int32_t vx_w8a8_qconv_arm_quantize_transformed(float transformed,
-        int32_t minimum, int32_t maximum, int32_t nan_value) {
-    if (transformed != transformed) return nan_value;
-    if (transformed <= (float)minimum) return minimum;
-    if (transformed >= (float)maximum) return maximum;
-    return vx_w8a8_qconv_arm_round_ties_even(transformed);
-}
-
-static void vx_w8a8_qconv_arm_store_byte(void* output, uint32_t dtype,
-                                          size_t index, int32_t value) {
-    if (dtype == VX_W8A8_QCONV_ARM_I8) ((int8_t*)output)[index] = (int8_t)value;
-    else ((uint8_t*)output)[index] = (uint8_t)value;
-}
 
 /* This repeats the portable kernel's shape and I32 bound validation before
  * vector products are grouped. The eight-lane NEON accumulators are safe only
@@ -110,24 +64,24 @@ static int vx_w8a8_qconv_arm_eligible(const void* input, const void* weight,
         !output_height || !output_width || !output_channels || !kernel_height ||
         !kernel_width || input_per_group < 8u || !stride_y || !stride_x ||
         !dilation_y || !dilation_x || !groups || relu > 2u ||
-        !vx_w8a8_qconv_arm_byte_dtype(input_dtype) ||
-        !vx_w8a8_qconv_arm_byte_dtype(weight_dtype) ||
-        !vx_w8a8_qconv_arm_byte_dtype(output_dtype) ||
-        !vx_w8a8_qconv_arm_finite_f32(input_scale) || input_scale <= 0.0f ||
-        !vx_w8a8_qconv_arm_finite_f32(output_scale) || output_scale <= 0.0f ||
-        !vx_w8a8_qconv_arm_zero_point_valid(input_zero_point, input_dtype) ||
-        !vx_w8a8_qconv_arm_zero_point_valid(output_zero_point, output_dtype) ||
+        !vx_w8a8_byte_dtype(input_dtype) ||
+        !vx_w8a8_byte_dtype(weight_dtype) ||
+        !vx_w8a8_byte_dtype(output_dtype) ||
+        !vx_w8a8_finite_f32(input_scale) || input_scale <= 0.0f ||
+        !vx_w8a8_finite_f32(output_scale) || output_scale <= 0.0f ||
+        !vx_w8a8_zero_point_valid(input_zero_point, input_dtype) ||
+        !vx_w8a8_zero_point_valid(output_zero_point, output_dtype) ||
         input_channels % groups || output_channels % groups ||
         (uint64_t)input_per_group * groups != input_channels) return 0;
-    if (!vx_w8a8_qconv_arm_mul_size(&input_elements, input_height) ||
-        !vx_w8a8_qconv_arm_mul_size(&input_elements, input_width) ||
-        !vx_w8a8_qconv_arm_mul_size(&input_elements, input_channels) ||
-        !vx_w8a8_qconv_arm_mul_size(&weight_elements, kernel_height) ||
-        !vx_w8a8_qconv_arm_mul_size(&weight_elements, kernel_width) ||
-        !vx_w8a8_qconv_arm_mul_size(&weight_elements, input_per_group) ||
-        !vx_w8a8_qconv_arm_mul_size(&output_elements, output_height) ||
-        !vx_w8a8_qconv_arm_mul_size(&output_elements, output_width) ||
-        !vx_w8a8_qconv_arm_mul_size(&output_elements, output_channels)) return 0;
+    if (!vx_w8a8_mul_size(&input_elements, input_height) ||
+        !vx_w8a8_mul_size(&input_elements, input_width) ||
+        !vx_w8a8_mul_size(&input_elements, input_channels) ||
+        !vx_w8a8_mul_size(&weight_elements, kernel_height) ||
+        !vx_w8a8_mul_size(&weight_elements, kernel_width) ||
+        !vx_w8a8_mul_size(&weight_elements, input_per_group) ||
+        !vx_w8a8_mul_size(&output_elements, output_height) ||
+        !vx_w8a8_mul_size(&output_elements, output_width) ||
+        !vx_w8a8_mul_size(&output_elements, output_channels)) return 0;
     padded_height = (uint64_t)input_height + padding_top + padding_bottom;
     padded_width = (uint64_t)input_width + padding_left + padding_right;
     effective_height = (uint64_t)(kernel_height - 1u) * dilation_y + 1u;
@@ -153,9 +107,9 @@ static int vx_w8a8_qconv_arm_eligible(const void* input, const void* weight,
         uint64_t accumulator_bound;
         uint64_t bias_magnitude = 0;
         int32_t weight_zero_point = weight_zero_points[output_channel];
-        if (!vx_w8a8_qconv_arm_finite_f32(weight_scales[output_channel]) ||
+        if (!vx_w8a8_finite_f32(weight_scales[output_channel]) ||
             weight_scales[output_channel] <= 0.0f ||
-            !vx_w8a8_qconv_arm_zero_point_valid(weight_zero_point, weight_dtype)) return 0;
+            !vx_w8a8_zero_point_valid(weight_zero_point, weight_dtype)) return 0;
         weight_low = (int64_t)(weight_dtype == VX_W8A8_QCONV_ARM_I8 ? -128 : 0) -
             weight_zero_point;
         weight_high = (int64_t)(weight_dtype == VX_W8A8_QCONV_ARM_I8 ? 127 : 255) -
@@ -221,7 +175,7 @@ static int vx_w8a8_qconv_arm_neon(const void* input, const void* weight,
     if (relu >= 2u) {
         const float relu6_scaled = 6.0f / output_scale;
         const float relu6_transformed = relu6_scaled + (float)output_zero_point;
-        relu6_upper = vx_w8a8_qconv_arm_quantize_transformed(relu6_transformed,
+        relu6_upper = vx_w8a8_requantize(relu6_transformed,
             output_minimum, output_maximum, 0);
     }
     for (uint32_t batch_index = 0; batch_index < batch; batch_index++) {
@@ -267,9 +221,9 @@ static int vx_w8a8_qconv_arm_neon(const void* input, const void* weight,
                                     vget_high_s16(input_values), vget_high_s16(weight_values)));
                             }
                             for (; local_channel < input_per_group; local_channel++) {
-                                int32_t input_value = vx_w8a8_qconv_arm_byte_value(input, input_dtype,
+                                int32_t input_value = vx_w8a8_byte_value(input, input_dtype,
                                     input_index + local_channel);
-                                int32_t weight_value = vx_w8a8_qconv_arm_byte_value(weight, weight_dtype,
+                                int32_t weight_value = vx_w8a8_byte_value(weight, weight_dtype,
                                     weight_index + local_channel);
                                 accumulator += (int64_t)(input_value - input_zero_point) *
                                     (int64_t)(weight_value - weight_zero_points[output_channel]);
@@ -291,13 +245,13 @@ static int vx_w8a8_qconv_arm_neon(const void* input, const void* weight,
                         scaled = (float)accumulator * multiplier;
                         transformed = scaled + (float)output_zero_point;
                         transformed_nan = transformed != transformed;
-                        quantized = vx_w8a8_qconv_arm_quantize_transformed(transformed,
+                        quantized = vx_w8a8_requantize(transformed,
                             output_minimum, output_maximum, output_zero_point);
                         if (!transformed_nan && relu) {
                             if (quantized < output_zero_point) quantized = output_zero_point;
                             if (relu >= 2u && quantized > relu6_upper) quantized = relu6_upper;
                         }
-                        vx_w8a8_qconv_arm_store_byte(output, output_dtype, output_index, quantized);
+                        vx_w8a8_store_byte(output, output_dtype, output_index, quantized);
                     }
                 }
             }
@@ -336,7 +290,7 @@ int vx_qconv2d_i8u8_arm_try(const void* input, const void* weight,
             output_dtype)) return 0;
 #if VX_W8A8_QCONV_ARM_HAS_DOTPROD_OBJECT && (defined(__linux__) || defined(__ANDROID__))
     if (vx_w8a8_qconv_arm_dotprod_eligible(kernel_height, kernel_width,
-            input_per_group) && vx_cpu_has_arm_dotprod() &&
+            input_per_group) && vx_kernel_platform()->has_arm_dotprod &&
         vx_qconv2d_i8u8_arm_dotprod_try(input, weight, bias, weight_scales,
             weight_zero_points, output, batch, input_height, input_width,
             input_channels, output_height, output_width, output_channels,

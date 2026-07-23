@@ -27,10 +27,13 @@ program
   .action(async (options) => {
     try {
       installFileFetchShim();
-      console.log(`[Volvox CLI] Initializing Engine (Backend: ${options.backend})...`);
+      console.log(`[Volvox CLI] Initializing runtime (backend: ${options.backend})...`);
       const cliDir = path.dirname(fileURLToPath(import.meta.url));
       const wasmPath = path.resolve(cliDir, '..', 'dist', packageVersion, 'volvoxai.wasm');
-      const engine = await VolvoxAI.init(options.backend, wasmPath);
+      const runtime = await VolvoxAI.createRuntime({
+        backends: [options.backend],
+        wasmUrl: wasmPath,
+      });
 
       console.log(`[Volvox CLI] Loading Model: ${options.model}`);
       if (!fs.existsSync(options.model)) {
@@ -39,14 +42,20 @@ program
       }
       
       const modelUrl = 'file://' + path.resolve(options.model);
-      const graph = await engine.loadGraph(modelUrl);
-      
-      console.log(`[Volvox CLI] Compiling Model...`);
-      const executor = await engine.compile(graph, modelUrl);
+      const model = await runtime.loadModel(modelUrl);
 
-      console.log(`[Volvox CLI] Model Ready! Provide input data via scripts for full inference.`);
-      // TODO: In a real CLI, we would parse JSON inputs or specific tensors,
-      // and call executor.execute(inputs).
+      console.log('[Volvox CLI] Compiling model...');
+      const compiled = await model.compile({
+        backend: {
+          mode: 'require',
+          backend: options.backend,
+          operatorFallback: 'forbid',
+        },
+      });
+      console.log(`[Volvox CLI] Model ready on ${compiled.backend}.`);
+      await compiled.close();
+      await model.close();
+      await runtime.close();
       
     } catch (err) {
       console.error('[Volvox CLI] Error during execution:', err);

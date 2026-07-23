@@ -5,14 +5,13 @@ on top of VolvoxAI's public C APIs. It owns the application-facing behavior
 that does not belong in the model-agnostic engine or fixed release commands:
 
 - image binding and normalization policy, using `../native_support/image_io.c`;
-- vocabulary and merges-file discovery;
-- autoregressive and encoder-decoder loops;
-- classification, detection, and CTC postprocessing.
+- raw named-tensor file binding;
+- classification and detection postprocessing; and
+- generic decode operations over one retained execution context.
 
 The fixed `native/volvoxai` and `native/volvoxai-full` executables do not link
-this source. They expose raw tensor `run`, with generic `train` available only
-in the full profile, plus help and version output. `volvoxai-tasks` is an
-example binary and is not one of the fixed release artifacts.
+this source. They expose the model-neutral raw-tensor runtime; `volvoxai-tasks`
+is an example binary and is not one of the fixed release artifacts.
 
 ## Build
 
@@ -31,9 +30,9 @@ examples/target/bin/volvoxai-tasks
 ## Commands
 
 ```bash
-examples/target/bin/volvoxai-tasks generate models/tinystories_1m \
-  --prompt "Once upon a time, Lily" \
-  --max-new 50
+examples/target/bin/volvoxai-tasks run models/my_model \
+  --input input=input.f32 \
+  --output logits=logits.f32
 
 examples/target/bin/volvoxai-tasks classify models/classifier \
   --image image=photo.jpg \
@@ -46,24 +45,30 @@ examples/target/bin/volvoxai-tasks detect models/efficientdet_lite0_int8 \
   --max-det 20
 ```
 
-The remaining task commands are `ctc`, `seq2seq`, and `chat`. Run the root or
-command help for the full option list:
+Detection benchmarking accepts `--warmup_runs` and `--num_runs`. Add
+`--include_transfers` to materialize every declared raw graph output on the
+host inside each warmup and timed iteration. On a device backend this reports
+input H2D, graph execution, synchronization, and output D2H without including
+output file writes. Ordinary device forwards already refresh host-owned graph
+inputs; the flag adds synchronized output materialization to that timed path.
+
+The fourth command is `decode`, which exposes model-neutral seed, step, and
+reset operations without assigning token semantics. Run the root or command
+help for the exact options:
 
 ```bash
 examples/target/bin/volvoxai-tasks --help
-examples/target/bin/volvoxai-tasks seq2seq --help
+examples/target/bin/volvoxai-tasks decode --help
 ```
 
-When a model directory is passed, text commands may discover `vocab.bin` and
-`merges.txt` there; `--vocab` and `--merges` override those paths. Detection
-also discovers `labels.txt` from the model directory and prints a `label`
-column; `--labels` overrides that path. Detection tables retain the raw
+When a model directory is passed, detection discovers `labels.txt` and prints
+a `label` column; `--labels` overrides that path. Detection tables retain the raw
 `score` and add `score_pct` (`score` multiplied by 100) as a human-readable
 percentage. Detection reads `boxes` and `scores` by default. Models with other
 output names must select them explicitly with `--boxes` and `--scores`; the
 application does not guess detection semantics from tensor shapes. Image
 commands accept named `--image tensor=file` bindings. When an input declares
-`image_normalization` in `config.json`, the application automatically selects
+`image_normalization` in `graph.json`, the application automatically selects
 its `zero-one`, `minus-one-one`, or `raw-255` mode. An explicit
 `--image-normalize` overrides package metadata for every image binding. If
 metadata is absent and no override is provided, the application fails instead
@@ -76,6 +81,10 @@ zero point. The EfficientDet export workflow records `raw-255` for int8 and
 `zero-one` for fp16/fp32.
 
 CPU is the default backend. Pass at most one of `--vulkan`, `--opengl`,
-`--metal`, or `--nnapi`; an explicitly requested unavailable backend is an
-error. The application passes this policy through `VolvoxAIEngineOptions` and
-uses only public engine and tokenizer APIs.
+`--metal`, `--nnapi`, or `--cuda`; an explicitly requested unavailable backend is an
+error. The application translates this choice into `VxBackendPolicy`, compiles
+through `vx_model_compile()`, and executes through opaque
+`VxExecutionContext` handles. It uses only the public runtime and
+result APIs. See the
+[native CUDA status](../../docs/cuda.md) for CUDA build composition, strict
+routing, operator limits, and RTX 3090 benchmark scope.

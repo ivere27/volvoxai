@@ -2,7 +2,7 @@
 
 /**
  * Calibrate and materialize one Linear island from the native TinyReceipt
- * trainer's F32 `full_model` package.
+ * F32 `full_model` checkpoint package.
  *
  * This intentionally is not a whole-model graph lowering pass. The trained
  * graph still contains routing, MoELinear, CrossSDPA, residuals, and LoRA
@@ -19,11 +19,11 @@ import { basename, join, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 
 import {
-  CPUEngine,
   Graph,
   GraphLoader,
+  PTQCalibrator,
   SafetensorsFile,
-  calibratePTQ,
+  VolvoxAI,
   materializePTQWeights,
   quantizePTQ,
 } from '../../../ts/full.js';
@@ -35,7 +35,7 @@ export const LINEAR_SAMPLE_FORMAT =
 export const LINEAR_ISLAND_PACKAGE_FORMAT =
   'volvoxai-tiny-receipt-vqa-trained-linear-w8a8-island-v1';
 
-const SOURCE_GRAPH_FORMAT = 'volvox.api.v1';
+const SOURCE_GRAPH_FORMAT = 'volvox-graph/v1';
 const SOURCE_MODEL_FORMAT = 'tiny_receipt_vqa.volvox.v2';
 const SOURCE_WEIGHT_LAYOUT = 'IN_OUT';
 const TARGET_WEIGHT_LAYOUT = 'OUT_IN';
@@ -109,8 +109,8 @@ function typedValues(dtype, values, expectedLength, label) {
 
 function sourceFetch(source) {
   return async (url) => {
-    if (url === source.configPath) {
-      return { ok: true, json: async () => source.config };
+    if (url === source.graphPath) {
+      return { ok: true, json: async () => source.graphDocument };
     }
     if (url === source.weightsPath) {
       return { ok: true, arrayBuffer: async () => source.weightsBuffer.slice(0) };
@@ -119,15 +119,15 @@ function sourceFetch(source) {
   };
 }
 
-function assertSourceContract(config, weights) {
-  object(config, 'trained config');
-  if (config.format !== SOURCE_GRAPH_FORMAT) {
+function assertSourceContract(graph, weights) {
+  object(graph, 'trained graph');
+  if (graph.format !== SOURCE_GRAPH_FORMAT) {
     throw new Error(
-      `trained config.format must be '${SOURCE_GRAPH_FORMAT}', got '${String(config.format)}'.`,
+      `trained graph.format must be '${SOURCE_GRAPH_FORMAT}', got '${String(graph.format)}'.`,
     );
   }
-  if (!Array.isArray(config.nodes) || !config.inputs || !config.outputs) {
-    throw new Error('trained config must contain inputs, outputs, and nodes.');
+  if (!Array.isArray(graph.nodes) || !graph.inputs || !graph.outputs) {
+    throw new Error('trained graph must contain inputs, outputs, and nodes.');
   }
   const metadata = object(weights.metadata, 'trained weights metadata');
   if (metadata.format !== SOURCE_MODEL_FORMAT ||
@@ -141,23 +141,23 @@ function assertSourceContract(config, weights) {
   }
 }
 
-/** Load and validate the native trainer's `full_model` package pair. */
+/** Load and validate the trained `full_model` package pair. */
 export async function loadTrainedTinyReceiptPackage(directory) {
   const root = resolve(directory);
-  const configPath = join(root, 'config.json');
+  const graphPath = join(root, 'graph.json');
   const weightsPath = join(root, 'model.safetensors');
-  let configBytes;
+  let graphBytes;
   let weightsBytes;
   try {
-    [configBytes, weightsBytes] = await Promise.all([readFile(configPath), readFile(weightsPath)]);
+    [graphBytes, weightsBytes] = await Promise.all([readFile(graphPath), readFile(weightsPath)]);
   } catch (error) {
     throw new Error(`could not read trained TinyReceipt package '${root}': ${error.message}`);
   }
-  let config;
+  let graphDocument;
   try {
-    config = JSON.parse(configBytes.toString('utf8'));
+    graphDocument = JSON.parse(graphBytes.toString('utf8'));
   } catch (error) {
-    throw new Error(`trained config.json is invalid JSON: ${error.message}`);
+    throw new Error(`trained graph.json is invalid JSON: ${error.message}`);
   }
   let weights;
   try {
@@ -165,19 +165,19 @@ export async function loadTrainedTinyReceiptPackage(directory) {
   } catch (error) {
     throw new Error(`trained model.safetensors is invalid: ${error.message}`);
   }
-  assertSourceContract(config, weights);
+  assertSourceContract(graphDocument, weights);
   return Object.freeze({
     format: TRAINED_SOURCE_FORMAT,
     root,
-    configPath,
+    graphPath,
     weightsPath,
-    config,
+    graphDocument,
     weights,
-    configBytes,
+    graphBytes,
     weightsBytes,
     weightsBuffer: arrayBufferOf(weightsBytes),
     hashes: Object.freeze({
-      config_sha256: sha256(configBytes),
+      graph_sha256: sha256(graphBytes),
       weights_sha256: sha256(weightsBytes),
     }),
   });
@@ -188,8 +188,8 @@ function linearMapping(source, weightName) {
   if (!weightName.startsWith('vqa.') || !weightName.endsWith('.weight')) {
     throw new Error("source Linear weight must be a TinyReceipt 'vqa.*.weight' tensor.");
   }
-  const matches = source.config.nodes.filter((node) =>
-    (node?.opType ?? node?.op) === 'Linear' && node?.inputs?.weight === weightName);
+  const matches = source.graphDocument.nodes.filter((node) =>
+    node?.opType === 'Linear' && node?.inputs?.weight === weightName);
   if (matches.length !== 1) {
     throw new Error(
       `source Linear weight '${weightName}' must be consumed by exactly one Linear node; found ${matches.length}.`,
@@ -271,7 +271,7 @@ function linearMapping(source, weightName) {
 export async function assembleTrainedSourceGraph(source) {
   const graph = new Graph();
   await GraphLoader.load(graph, source.weightsPath, {
-    configUrl: source.configPath,
+    graphUrl: source.graphPath,
     fetch: sourceFetch(source),
   });
   return Object.freeze({ ...source, graph });
@@ -281,8 +281,8 @@ export async function assembleTrainedSourceGraph(source) {
 export async function inspectTrainedLinearMappings(sourcePackage) {
   const source = sourcePackage.graph ? sourcePackage : await assembleTrainedSourceGraph(sourcePackage);
   const candidates = [];
-  for (const node of source.config.nodes) {
-    const weightName = (node?.opType ?? node?.op) === 'Linear' ? node?.inputs?.weight : null;
+  for (const node of source.graphDocument.nodes) {
+    const weightName = node?.opType === 'Linear' ? node?.inputs?.weight : null;
     if (typeof weightName !== 'string' || !weightName.startsWith('vqa.')) continue;
     try {
       const mapping = linearMapping(source, weightName);
@@ -355,29 +355,152 @@ function transposeInOutToOutIn(values, inputWidth, outputWidth) {
   return output;
 }
 
-function packageFetch(config, weightsBuffer) {
-  return async (url) => url === 'config.json'
-    ? { ok: true, json: async () => config }
+function packageFetch(graphDocument, weightsBuffer) {
+  return async (url) => url === 'graph.json'
+    ? { ok: true, json: async () => graphDocument }
     : url === 'model.safetensors'
       ? { ok: true, arrayBuffer: async () => weightsBuffer.slice(0) }
       : { ok: false, statusText: `unexpected generated package source ${url}` };
 }
 
-async function validateIsland(config, weightsBuffer, firstSourceInput, inputParameters,
-                              referenceOutput) {
+/**
+ * Observe selected F32 values through the public retained runtime lifecycle.
+ * The Model captures a graph snapshot while the selected values are declared
+ * outputs; the caller's output selection is restored before execution starts.
+ */
+export async function calibrateRuntimeOutputs(
+  graph,
+  samples,
+  tensorNames,
+  { captureSampleIndex = null } = {},
+) {
+  if (!(graph instanceof Graph)) throw new Error('runtime calibration requires a Graph.');
+  if (!Array.isArray(tensorNames) || tensorNames.length === 0) {
+    throw new Error('runtime calibration requires at least one tensor name.');
+  }
+  if (!samples || (typeof samples[Symbol.iterator] !== 'function' &&
+      typeof samples[Symbol.asyncIterator] !== 'function')) {
+    throw new Error('runtime calibration samples must be an iterable or async iterable.');
+  }
+  for (const name of tensorNames) {
+    const tensor = graph.getTensor(name);
+    if (!tensor || tensor.dtype !== 'float32') {
+      throw new Error(`runtime calibration tensor '${name}' must be an F32 graph tensor.`);
+    }
+  }
+  if (captureSampleIndex != null &&
+      (!Number.isSafeInteger(captureSampleIndex) || captureSampleIndex < 0)) {
+    throw new Error('captureSampleIndex must be a non-negative safe integer or null.');
+  }
+
+  const originalOutputs = [...graph.outputNames];
+  let outputsRestored = false;
+  let runtime;
+  let model;
+  let compiled;
+  let context;
+  try {
+    graph.setOutputs(tensorNames);
+    runtime = await VolvoxAI.createRuntime({ backends: ['cpu'] });
+    model = runtime.createModel(graph);
+    graph.setOutputs(originalOutputs);
+    outputsRestored = true;
+
+    compiled = await model.compile({
+      backend: {
+        mode: 'require',
+        backend: 'cpu',
+        operatorFallback: 'forbid',
+      },
+    });
+    context = await compiled.createContext();
+
+    const calibrator = new PTQCalibrator();
+    let captured = null;
+    let executionIndex = 0;
+    for await (const sample of samples) {
+      if (!sample || typeof sample !== 'object' || Array.isArray(sample)) {
+        throw new Error(`runtime calibration sample ${executionIndex} must be a named input object.`);
+      }
+      const result = await context.execute(sample);
+      try {
+        const observations = [];
+        for (const name of tensorNames) {
+          const values = await result.output(name).read();
+          if (!(values instanceof Float32Array)) {
+            throw new Error(`runtime calibration tensor '${name}' did not return F32 values.`);
+          }
+          for (let index = 0; index < values.length; index++) {
+            if (!Number.isFinite(values[index])) {
+              throw new Error(
+                `runtime calibration tensor '${name}' contains a non-finite value at index ${index}.`,
+              );
+            }
+          }
+          observations.push([name, values]);
+        }
+        for (const [name, values] of observations) calibrator.observe(name, values);
+        if (executionIndex === captureSampleIndex) {
+          captured = Object.freeze(Object.fromEntries(
+            observations.map(([name, values]) => [name, new Float32Array(values)]),
+          ));
+        }
+        executionIndex++;
+      } finally {
+        await result.close();
+      }
+    }
+    if (executionIndex === 0) {
+      throw new Error('runtime calibration received no samples.');
+    }
+    if (captureSampleIndex != null && captured == null) {
+      throw new Error(`runtime calibration did not receive sample ${captureSampleIndex}.`);
+    }
+    return Object.freeze({ calibrator, captured });
+  } finally {
+    if (!outputsRestored) {
+      try { graph.setOutputs(originalOutputs); } catch { /* Preserve the primary failure. */ }
+    }
+    await context?.close().catch(() => undefined);
+    await compiled?.close().catch(() => undefined);
+    await model?.close().catch(() => undefined);
+    await runtime?.close().catch(() => undefined);
+  }
+}
+
+async function validateIsland(graphDocument, weightsBuffer, firstSourceInput, inputParameters,
+                              outputParameters, referenceOutput) {
   const graph = new Graph();
   await GraphLoader.load(graph, 'model.safetensors', {
-    configUrl: 'config.json',
-    fetch: packageFetch(config, weightsBuffer),
+    graphUrl: 'graph.json',
+    fetch: packageFetch(graphDocument, weightsBuffer),
   });
-  const engine = new CPUEngine().allocateGraph(graph);
   const packedInput = quantizePTQ(firstSourceInput, inputParameters);
-  const result = await engine.execute({ 'island.input': packedInput.data });
-  const output = result['island.output'];
+  let runtime;
+  let model;
+  let compiled;
+  let context;
+  let result;
+  let output;
+  try {
+    runtime = await VolvoxAI.createRuntime({ backends: ['cpu'] });
+    model = runtime.createModel(graph);
+    compiled = await model.compile({
+      backend: { mode: 'require', backend: 'cpu', operatorFallback: 'forbid' },
+    });
+    context = await compiled.createContext();
+    result = await context.execute({ 'island.input': packedInput.data });
+    output = await result.output('island.output').read();
+  } finally {
+    await result?.close().catch(() => undefined);
+    await context?.close().catch(() => undefined);
+    await compiled?.close().catch(() => undefined);
+    await model?.close().catch(() => undefined);
+    await runtime?.close().catch(() => undefined);
+  }
   if (!(output instanceof Int8Array) || output.length !== referenceOutput.length) {
     throw new Error('generated QLinear island did not return canonical I8 output storage.');
   }
-  const outputParameters = config.nodes[0].outputs_quantization.out;
   let maximumError = 0;
   for (let index = 0; index < output.length; index++) {
     const dequantized = (output[index] - outputParameters.zero_point) * outputParameters.scale;
@@ -430,10 +553,12 @@ export async function materializeTrainedLinearIsland({
     ? [makeTrainedStructuralSample(source)]
     : normalizeTrainedCalibrationSamples(source, sampleDocument);
 
-  const executor = new CPUEngine().allocateGraph(source.graph);
-  const calibrator = await calibratePTQ(executor, samples, {
-    tensorNames: [mapping.source.input, mapping.source.output],
-  });
+  const { calibrator, captured } = await calibrateRuntimeOutputs(
+    source.graph,
+    samples,
+    [mapping.source.input, mapping.source.output],
+    { captureSampleIndex: 0 },
+  );
   const parameters = calibrator.parameters({ dtype: 'int8', scheme: 'symmetric' });
   const inputParameters = parameters[mapping.source.input];
   const outputParameters = parameters[mapping.source.output];
@@ -464,21 +589,39 @@ export async function materializeTrainedLinearIsland({
       target_weight_layout: TARGET_WEIGHT_LAYOUT,
     },
   });
+  const inputScaleName = `${mapping.target.input}.scale`;
+  const inputZeroPointName = `${mapping.target.input}.zero_point`;
+  const outputScaleName = `${mapping.target.output}.scale`;
+  const outputZeroPointName = `${mapping.target.output}.zero_point`;
+  artifact.weights.addTensor(inputScaleName, 'F32', [1], Float32Array.of(inputParameters.scale));
+  artifact.weights.addTensor(inputZeroPointName, 'I8', [1], Int8Array.of(inputParameters.zero_point));
+  artifact.weights.addTensor(outputScaleName, 'F32', [1], Float32Array.of(outputParameters.scale));
+  artifact.weights.addTensor(outputZeroPointName, 'I8', [1], Int8Array.of(outputParameters.zero_point));
   const weightsBuffer = artifact.weights.toArrayBuffer();
-  const config = {
+  const graphDocument = {
     format: SOURCE_GRAPH_FORMAT,
     inputs: {
       [mapping.target.input]: {
         shape: [...mapping.inputShape],
         dtype: 'int8',
-        quantization: {
+      },
+    },
+    quantization: {
+      format: 'volvox-affine-safetensors/v1',
+      tensors: {
+        ...artifact.quantization.tensors,
+        [mapping.target.input]: {
           scheme: 'per_tensor',
-          scale: inputParameters.scale,
-          zero_point: inputParameters.zero_point,
+          scale_tensor: inputScaleName,
+          zero_point_tensor: inputZeroPointName,
+        },
+        [mapping.target.output]: {
+          scheme: 'per_tensor',
+          scale_tensor: outputScaleName,
+          zero_point_tensor: outputZeroPointName,
         },
       },
     },
-    weights_quantization: artifact.weightsQuantization,
     nodes: [{
       id: `ptq.${mapping.source.weight}`,
       opType: 'QLinear',
@@ -490,32 +633,25 @@ export async function materializeTrainedLinearIsland({
       outputs: { out: mapping.target.output },
       outputs_shape: { out: [...mapping.outputShape] },
       outputs_dtype: { out: 'int8' },
-      outputs_quantization: {
-        out: {
-          scheme: 'per_tensor',
-          scale: outputParameters.scale,
-          zero_point: outputParameters.zero_point,
-        },
-      },
       params: {},
     }],
     outputs: [mapping.target.output],
   };
 
-  const sourceReference = await executor.execute(samples[0]);
-  const calibratedIslandInput = source.graph.tensors.get(mapping.source.input)?.buffer;
+  const calibratedIslandInput = captured?.[mapping.source.input];
   if (!(calibratedIslandInput instanceof Float32Array)) {
-    throw new Error(`calibrated Linear input '${mapping.source.input}' has no F32 host storage.`);
+    throw new Error(`calibrated Linear input '${mapping.source.input}' has no F32 result.`);
   }
-  const referenceOutput = sourceReference[mapping.source.output];
+  const referenceOutput = captured?.[mapping.source.output];
   if (!(referenceOutput instanceof Float32Array)) {
-    throw new Error(`calibrated Linear output '${mapping.source.output}' has no F32 host storage.`);
+    throw new Error(`calibrated Linear output '${mapping.source.output}' has no F32 result.`);
   }
   const validation = await validateIsland(
-    config,
+    graphDocument,
     weightsBuffer,
     new Float32Array(calibratedIslandInput),
     inputParameters,
+    outputParameters,
     new Float32Array(referenceOutput),
   );
   const calibration = {
@@ -535,9 +671,9 @@ export async function materializeTrainedLinearIsland({
     source: {
       format: TRAINED_SOURCE_FORMAT,
       directory_basename: basename(source.root),
-      config_format: SOURCE_GRAPH_FORMAT,
+      graph_format: SOURCE_GRAPH_FORMAT,
       model_metadata_format: SOURCE_MODEL_FORMAT,
-      config_sha256: source.hashes.config_sha256,
+      graph_sha256: source.hashes.graph_sha256,
       weights_sha256: source.hashes.weights_sha256,
     },
     mapping: {
@@ -559,7 +695,7 @@ export async function materializeTrainedLinearIsland({
     calibration,
     validation,
     files: {
-      config: 'config.json',
+      graph: 'graph.json',
       weights: 'model.safetensors',
       calibration: 'calibration.json',
     },
@@ -575,13 +711,13 @@ export async function materializeTrainedLinearIsland({
   if (outputDirectory != null) {
     const output = await prepareOutputDirectory(outputDirectory, source.root);
     await Promise.all([
-      writeFile(join(output, 'config.json'), `${JSON.stringify(config, null, 2)}\n`),
+      writeFile(join(output, 'graph.json'), `${JSON.stringify(graphDocument, null, 2)}\n`),
       writeFile(join(output, 'model.safetensors'), new Uint8Array(weightsBuffer)),
       writeFile(join(output, 'calibration.json'), `${JSON.stringify(calibration, null, 2)}\n`),
       writeFile(join(output, 'island_manifest.json'), `${JSON.stringify(manifest, null, 2)}\n`),
     ]);
   }
-  return Object.freeze({ source, mapping, calibration, config, artifact, weightsBuffer, manifest });
+  return Object.freeze({ source, mapping, calibration, graphDocument, artifact, weightsBuffer, manifest });
 }
 
 function parseArguments(argv) {

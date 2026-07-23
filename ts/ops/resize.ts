@@ -13,10 +13,12 @@ function assertCanonicalTypedNearest(node) {
   } else if (params.mode != null && params.mode !== 'nearest') {
     throw new Error(`ResizeNearest2D node ${node.id || '<unnamed>'} only supports mode "nearest" for raw I8/U8 storage.`);
   }
-  for (const key of ['coordinate_transformation_mode', 'coordinate_transform_mode']) {
-    if (params[key] != null && params[key] !== 'asymmetric') {
-      throw new Error(`Resize node ${node.id || '<unnamed>'} supports raw I8/U8 nearest resize only with ${key} "asymmetric".`);
-    }
+  if (params.coordinate_transform_mode != null) {
+    throw new Error(`Resize node ${node.id || '<unnamed>'} does not define coordinate_transform_mode; use coordinate_transformation_mode.`);
+  }
+  if (params.coordinate_transformation_mode != null &&
+      params.coordinate_transformation_mode !== 'asymmetric') {
+    throw new Error(`Resize node ${node.id || '<unnamed>'} supports raw I8/U8 nearest resize only with coordinate_transformation_mode "asymmetric".`);
   }
   if (params.nearest_mode != null && params.nearest_mode !== 'floor') {
     throw new Error(`Resize node ${node.id || '<unnamed>'} supports raw I8/U8 nearest resize only with nearest_mode "floor".`);

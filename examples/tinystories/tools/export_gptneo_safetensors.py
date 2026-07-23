@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 from pathlib import Path
 from typing import Any, Mapping, MutableMapping, Sequence
 
@@ -73,10 +74,11 @@ def build_gptneo_graph(
         params: Mapping[str, Any] | None = None,
     ) -> None:
         node: dict[str, Any] = {
-            "op": op,
+            "opType": op,
             "inputs": dict(inputs),
             "outputs": {"out": output},
             "outputs_shape": {"out": list(shape)},
+            "outputs_dtype": {"out": "float32"},
         }
         if params is not None:
             node["params"] = dict(params)
@@ -124,13 +126,18 @@ def build_gptneo_graph(
             },
             f"qkv_{index}",
             [1, SEQUENCE_LENGTH, d_model * 3],
+            {"weight_layout": "IN_OUT"},
         )
         add_node(
             "SDPA",
             {"qkv": f"qkv_{index}"},
             f"attn_{index}",
             hidden_shape,
-            {"heads": config.num_heads, "scale": 1.0},
+            {
+                "heads": config.num_heads,
+                "scale": 1.0 / math.sqrt(d_model // config.num_heads),
+                "causal": True,
+            },
         )
 
         output_tensors[f"{prefix}.attn.out_proj.weight"] = output_tensors.pop(
@@ -149,6 +156,7 @@ def build_gptneo_graph(
             },
             f"attn_proj_{index}",
             hidden_shape,
+            {"weight_layout": "IN_OUT"},
         )
         add_node(
             "Add",
@@ -184,6 +192,7 @@ def build_gptneo_graph(
             },
             f"mlp1_{index}",
             feed_forward_shape,
+            {"weight_layout": "IN_OUT"},
         )
         add_node(
             "GELU",
@@ -207,6 +216,7 @@ def build_gptneo_graph(
             },
             f"mlp2_{index}",
             hidden_shape,
+            {"weight_layout": "IN_OUT"},
         )
         add_node(
             "Add",
@@ -232,6 +242,7 @@ def build_gptneo_graph(
         {"input": "final_norm", "weight": "lm_head.weight"},
         "logits",
         [1, SEQUENCE_LENGTH, config.vocab_size],
+        {"weight_layout": "IN_OUT"},
     )
     return nodes
 
@@ -261,16 +272,17 @@ def export_model(model_id_or_path: str, output_path: Path) -> None:
     save_file(final_tensors, str(output_path))
 
     graph = {
+        "format": "volvox-graph/v1",
         "inputs": {
             "tokens": {"shape": [1, SEQUENCE_LENGTH], "dtype": "int32"},
             "positions": {"shape": [1, SEQUENCE_LENGTH], "dtype": "int32"},
         },
         "nodes": nodes,
-        "outputs": {"logits": "logits"},
+        "outputs": ["logits"],
     }
-    config_path = output_path.parent / "config.json"
-    config_path.write_text(dumps_with_compact_lists(graph), encoding="utf-8")
-    print(f"[Export] Wrote {output_path} and {config_path}")
+    graph_path = output_path.parent / "graph.json"
+    graph_path.write_text(dumps_with_compact_lists(graph), encoding="utf-8")
+    print(f"[Export] Wrote {output_path} and {graph_path}")
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:

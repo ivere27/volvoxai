@@ -6,7 +6,7 @@
 *Goal: turn the gradients from Chapter 4 into a model that actually gets better. We meet the two
 optimizers VolvoxAI ships (SGD and AdamW), assemble one full training step, then wrap it in the loop
 — batches, gradient accumulation, train-vs-eval mode, checkpoints, and **LoRA** fine-tuning — using
-the real `tiny_receipt_vqa_train` example as our worked case.*
+the full profile's retained `Trainer` lifecycle throughout.*
 
 > 🌱 **The big idea.** Last chapter every knob got a note: *"turn me this way to be less wrong."* This
 > chapter actually **turns the knobs** — a little, in the right direction — and then does it again,
@@ -17,8 +17,9 @@ the real `tiny_receipt_vqa_train` example as our worked case.*
 
 🔧 Chapter 4 left every weight holding a **gradient**: the direction that would increase the loss. To
 *decrease* the loss we step each weight a little the other way. Doing that once is the **optimizer**;
-doing it over and over across data is the **training loop**. Both live behind
-`volvoxai_engine_train_step(...)` and the kernels in `native/src/kernels/training_kernels.c`.
+doing it over and over across data is the **training loop**. The full profile's
+`Trainer` owns the gradients, optimizer slots, accumulation window, and
+private working revision.
 
 ## 5.1 The simplest optimizer: SGD
 
@@ -26,9 +27,13 @@ doing it over and over across data is the **training loop**. Both live behind
 > way. Small steps = slow but safe. Big steps = fast but you might overshoot the valley and tumble
 > out the other side. How big a step you take is called the **learning rate**, and it's the single
 > most important dial in all of training.
+>
+> *One step, by hand.* Weight is `0.5`, its note (gradient) is `+2.0` ("uphill is this way"), learning
+> rate `0.1`. New weight `= 0.5 − 0.1·2.0 = 0.3` — a small nudge downhill. The next batch gives a new
+> note and you nudge again. That's the whole loop, one arithmetic line at a time.
 
 🔧 If `grad` points uphill, walk downhill — a small step opposite the gradient. That is **Stochastic
-Gradient Descent**, and its update is one line (`volvoxai_training_sgd_update_f32`):
+Gradient Descent**, and its update is one line:
 
 ```c
 // for every weight element i:
@@ -38,6 +43,12 @@ weights[i] -= learning_rate * (gradient[i] + weight_decay * weights[i]);
 - **`learning_rate`** — how big a step. Too small: training crawls. Too big: it overshoots and the
   loss diverges (this is the single most important knob).
 - **`weight_decay`** — a gentle pull toward zero that discourages huge weights (regularization).
+
+> 🔬 **Under the hood: what "stochastic" and "decay" really mean.** *Stochastic* is the **S** in SGD:
+> the gradient comes from a **random minibatch**, not the whole dataset, so every step follows a *noisy
+> estimate* of the true downhill direction — cheaper per step, and the noise even helps jiggle out of
+> bad spots. `weight_decay · weights[i]` is **L2 regularization**: a constant tug toward 0 that stops
+> any single weight from growing huge and memorizing the training set.
 
 ```
    loss                    each step: w ← w − lr · slope
@@ -60,15 +71,8 @@ training uses something smarter.
 > than just running the model.
 
 🔧 **AdamW** gives each weight its *own* adaptive step size by remembering two running averages
-(called **moments**) of that weight's gradient history:
-
-```c
-uint32_t volvoxai_training_adamw_update_f32(
-    float *weights, const float *gradient,
-    float *first_moment, float *second_moment, uint32_t n,   // ← persistent per-weight state
-    float learning_rate, float beta1, float beta2, float epsilon,
-    float weight_decay, uint32_t step);
-```
+(called **moments**) of that weight's gradient history. `Trainer.trainStep()` selects it with
+`updateMode: "adamw"` and optimizer options.
 
 - **`first_moment`** (decayed by `beta1`, ~0.9) — a smoothed *average* gradient: momentum. It keeps
   moving in a consistent direction and rides out noisy single-batch gradients.
@@ -79,18 +83,22 @@ uint32_t volvoxai_training_adamw_update_f32(
 - **`weight_decay`** — the "W" in AdamW: decoupled decay applied directly to the weight, not folded
   into the gradient (the detail that makes it behave better than plain Adam).
 
+> 🔬 **Under the hood: the AdamW update in five lines.** Per weight, with gradient `g` at step `t`:
+> `m = β1·m + (1−β1)·g` (momentum) and `v = β2·v + (1−β2)·g²` (typical magnitude); then **bias-correct**
+> the cold start `m̂ = m/(1−β1ᵗ)`, `v̂ = v/(1−β2ᵗ)`; step `w −= lr · m̂ / (√v̂ + ε)`; and finally the
+> **decoupled** decay `w −= lr · weight_decay · w`. The bias-correction only matters for the first few
+> steps (the moments start at 0 and would otherwise read too small), and the decoupling — decaying `w`
+> directly instead of folding `weight_decay·g` into the gradient — is the single change from plain Adam
+> and the reason AdamW generalizes better.
+
 🔬 The cost is memory: Adam keeps **two extra full-size buffers per trainable weight**. That is why
 an optimizer state file is ~2× the model, and why memory planning (Chapter 9) matters for training.
 The `first_moment`/`second_moment` buffers are exactly what a **checkpoint** must save to resume
 cleanly (§5.7).
 
-🔬 VolvoxAI selects the rule per update through a mode enum (`volvoxai_training.h`):
-
-```c
-VOLVOXAI_TENSOR_UPDATE_SGD    // the §5.1 step
-VOLVOXAI_TENSOR_UPDATE_ADAMW  // the §5.2 step   (the default for real training)
-VOLVOXAI_TENSOR_UPDATE_ADD / _ASSIGN   // raw tensor edits, not gradient steps
-```
+🔬 VolvoxAI selects the rule per update through `updateMode: "sgd"` or
+`updateMode: "adamw"`. Optimizer state and the private working revision belong
+to that Trainer, never to an inference context.
 
 ## 5.3 One training step, end to end
 
@@ -98,30 +106,43 @@ VOLVOXAI_TENSOR_UPDATE_ADD / _ASSIGN   // raw tensor edits, not gradient steps
 > pass the blame backward, and nudge the knobs. One button does all four. It also lets you say
 > *which* knobs are even allowed to move — handy for the sticky-note trick later.
 
-🔧 A single step chains everything from Chapters 4–5. The engine exposes it as one call
-(`volvoxai_engine_train_step`), which internally does forward → loss → backward → update:
+🔧 A single step chains everything from Chapters 4–5: forward → loss → backward → update.
 
-```c
-volvoxai_engine_train_step(
-    "logits",              // where the forward pass wrote its scores
-    targets, target_count, // the correct next-token ids for this batch
-    ignore_index,          // a target value to skip (e.g. padding)
-    trainable_names, trainable_count,   // WHICH tensors are allowed to change
-    VOLVOXAI_TENSOR_UPDATE_ADAMW,
-    learning_rate, beta1, beta2, epsilon, weight_decay,
-    max_grad_norm,         // gradient clipping (see §5.4)
-    step,
-    &out_loss, &out_correct, &out_examples);   // metrics to log
+```javascript
+const trainer = await VolvoxAI.createTrainer(model, {
+  backend: 'cpu',
+});
+
+const step = await trainer.trainStep({
+  inputs,
+  logitsTensor: 'logits',
+  targets,
+  ignoreIndex: -1,
+  trainableTensors,
+  updateMode: 'adamw',
+  optimizer: {
+    learningRate,
+    weightDecay,
+    maxGradNorm,
+  },
+});
+
+// Publish the private working revision before compiling it for inference.
+await trainer.commit();
 ```
 
 Two design choices worth noting:
 
-- **`trainable_names` is an explicit allow-list.** Only the tensors you name receive gradients and
+- **`trainableTensors` is an explicit allow-list.** Only the tensors you name receive gradients and
   updates; everything else is frozen. This is the exact mechanism LoRA and adapter fine-tuning use
   (§5.8) — freeze the base model, list only the adapters.
 - **The loss target lives in the call, not the graph.** The *same* forward graph you run for
   inference is reused for training; the cross-entropy loss is attached to its `logits` output at
   train time. There is no separate "training model."
+
+`trainStep()` changes only the Trainer's private working revision. There is no
+implicit publication: `commit()` atomically publishes it, while `rollback()`
+discards uncommitted work and restores the last committed baseline.
 
 ## 5.4 Keeping it stable: gradient clipping
 
@@ -131,9 +152,15 @@ Two design choices worth noting:
 
 🔧 A single bad batch can produce a huge gradient that blows the weights apart. **Gradient clipping**
 caps the overall gradient size before the step: if the global gradient norm exceeds `max_grad_norm`,
-every gradient is scaled down to fit. Combined with the `volvoxai_training_all_finite_f32` NaN/Inf
-check from Chapter 4, this is what keeps long training runs from diverging. The `tiny_receipt`
-trainer clips every step; it is cheap insurance.
+every gradient is scaled down to fit. Combined with the Trainer's NaN/Inf
+rejection, this is what keeps long training runs from diverging. Set
+`maxGradNorm` on the optimizer options to apply it.
+
+> 🔬 **Under the hood: it's one *global* norm.** Clipping measures the norm across **all** gradients at
+> once — `total = √(Σ g²)` over every weight in the model — and if `total > max_grad_norm`, multiplies
+> *every* gradient by `max_grad_norm / total`. Scaling all of them by the same factor keeps the
+> combined step pointing the same **direction** and only shortens its length. (The CUDA trainer in
+> [Chapter 9C §9C.11](09c-cuda-backend.md) computes exactly this one global norm on the device.)
 
 ## 5.5 Batches and gradient accumulation
 
@@ -148,7 +175,7 @@ but they also hold every example's activations in memory at once.
 
 When the batch you *want* doesn't fit in memory, **gradient accumulation** fakes it: run several
 small (even size-1) batches, **add** their gradients into the same buffer, and only *then* take one
-optimizer step. VolvoxAI does this natively through `volvoxai_engine_train_step_multi`:
+optimizer step. `Trainer.trainStep()` owns this accumulation window:
 
 ```
    accumulation_steps = 24, batch_size = 1   → effective batch of 24
@@ -157,9 +184,15 @@ optimizer step. VolvoxAI does this natively through `volvoxai_engine_train_step_
    (grads += )        (grads += )   (moments update, grads zeroed)
 ```
 
-🔬 This is exactly the `tiny_receipt` default: `--batch-size 1 --accumulation-steps 24` reproduces an
-effective batch of 24 "without retaining 24 copies of every activation." The backward pass's `+=`
-accumulation from Chapter 4 §4.4 is the same machinery — here reused *across* microbatches.
+🔬 For example, batch size 1 with 24 accumulation steps produces an effective batch of 24 without
+retaining 24 copies of every activation. The backward pass's `+=` accumulation from Chapter 4 §4.4
+is the same machinery — here reused *across* microbatches.
+
+> 🔬 **Under the hood: don't forget to divide.** Accumulating 24 microbatches *sums* 24 gradients, but
+> an effective batch of 24 wants their **average** — so the trainer scales each contribution by
+> `1/accumulation_steps` (equivalently, scales the loss by `1/N`) before adding. Skip that and your real
+> learning rate is silently 24× too large. The optimizer fires **once per window**, so `step` — and
+> with it the LR schedule and Adam's bias-correction — advances per *update*, not per microbatch.
 
 ## 5.6 Two modes: training vs evaluation
 
@@ -172,9 +205,15 @@ accumulation from Chapter 4 §4.4 is the same machinery — here reused *across*
 🔧 Some ops behave differently while learning:
 
 - **Dropout** randomly zeros a fraction of activations *during training* (so the model can't lean on
-  any single unit), then is **off** at inference. VolvoxAI's `volvoxai_training_dropout_f32` is a
-  deterministic *inverted* dropout — it scales the survivors up during training so the eval-time
-  pass needs no correction.
+  any single unit), then is **off** at inference. VolvoxAI uses deterministic *inverted* dropout —
+  it scales the survivors up during training so the eval-time pass needs no correction.
+
+> 🔬 **Under the hood: inverted, and deterministic.** With drop probability `p`, dropout zeros each
+> activation with chance `p` and multiplies the survivors by `1/(1−p)` — so the *average* signal is
+> unchanged and inference can be a plain identity with no rescale. VolvoxAI's kernel is also
+> **deterministic**: it derives the mask from a `(seed, counter)` pair rather than global RNG state, so
+> the same step reproduces the same mask on every backend and its backward twin can regenerate it
+> exactly (those are the `seed`/`counter`/`threshold` params you saw in the CUDA dropout, Chapter 9C).
 - **Normalization** likewise has train/eval distinctions to respect.
 
 So a training run alternates **two modes**: *train* mode (dropout on, weights updating) over the
@@ -189,13 +228,14 @@ classic bug.
 > improving; and **save your progress** so a crash doesn't cost you days of practice. Slow down the
 > step size as you near the end, so the model settles gently into a good answer instead of bouncing.
 
-🔧 A real run (again, `tiny_receipt_vqa_train`) looks like:
+🔧 A complete application-owned run looks like:
 
 ```
 for each epoch:
     for each batch of the TRAINING data:        # train mode
-        loss = train_step(..., step)            # forward→loss→backward→AdamW
+        loss = trainer.trainStep(...)            # forward→loss→backward→AdamW
         learning_rate = cosine_schedule(step)   # anneal LR down over the run
+    trainer.commit()                            # publish this private revision
     for each batch of the VALIDATION data:      # eval mode, no updates
         measure exact-match accuracy
     if validation improved:  save "best.checkpoint"
@@ -207,12 +247,20 @@ for each epoch:
 - **Learning-rate schedule.** The LR isn't constant — a **cosine schedule** warms up then decays it
   smoothly toward zero, which trains faster and lands softer. In VolvoxAI this is *caller policy*
   (the example computes it and passes the new `learning_rate` each step); the engine just applies it.
-- **Evaluation metric.** Loss guides the optimizer, but humans want a task metric — `tiny_receipt`
-  reports **exact-match** accuracy per task/field, and even a learned `router_accuracy`.
-- **Checkpoints.** `volvoxai_engine_save_optimizer_state` / `load_optimizer_state` persist not just
-  the weights but the **AdamW moments, the step counter, and the cosine horizon** — everything needed
-  so `--resume last.checkpoint` continues *bit-for-bit* rather than restarting the optimizer cold.
-  The example keeps both a rolling `last` and the best-so-far `best`.
+- **Evaluation metric.** Loss guides the optimizer, but applications still compute the task metric
+  that matters to users, such as exact-match accuracy or a routing score.
+- **Checkpoints.** `await trainer.exportCheckpoint()` persists weights, AdamW moments,
+  per-parameter steps, the training step, and application metadata from the private working
+  revision. Build a Model from `importModelCheckpoint(checkpoint).graph`, then pass `checkpoint`
+  to `VolvoxAI.createTrainer(model, options)` to resume. The application owns rolling and
+  best-so-far checkpoint policy.
+
+> 🔬 **Under the hood: the cosine curve, and why "best" ≠ "last".** A cosine schedule ramps the LR up
+> over a short **warmup**, then follows `lr = ½·lr_max·(1 + cos(π · t / T))` down toward ~0 by the
+> horizon `T` — big steps early to explore, tiny steps late to settle into a minimum. Saving both `best`
+> (highest validation score) and `last` (most recent) exists because training eventually **overfits**:
+> past some point the training loss keeps dropping while validation loss turns back *up*. `best` is your
+> early-stopping insurance; `last` is what `--resume` continues from.
 
 ## 5.8 LoRA: fine-tuning without touching the base model
 
@@ -224,8 +272,7 @@ for each epoch:
 
 🔧 Full training updates every weight — expensive, and it produces a whole new multi-gigabyte model.
 **LoRA** (Low-Rank Adaptation) is the modern shortcut: **freeze the pretrained weights** and inject a
-tiny pair of low-rank matrices (rank 8 in `tiny_receipt`) beside each big Linear. Only those adapters
-train.
+tiny pair of low-rank matrices of a chosen rank beside each big Linear. Only those adapters train.
 
 ```
    frozen base:  y = x · W          (W stays exactly as pretrained)
@@ -233,8 +280,9 @@ train.
 ```
 
 🔬 Because rank 8 is minuscule next to a full weight matrix, the trainable set shrinks by orders of
-magnitude — which is precisely what the `trainable_names` allow-list (§5.3) expresses. VolvoxAI gives
-LoRA its own step entry, `volvoxai_engine_lora_train_step`, and a matching artifact layout:
+magnitude — which is precisely what the `trainableTensors` allow-list (§5.3) expresses.
+`ModelBuilder.loraLinear()` creates explicit A/B graph weights and returns their names;
+the ordinary `Trainer.trainStep()` updates only those names. Deployment policy can then export:
 
 - **`lora.safetensors`** — just the trained deltas, tiny and shareable.
 - **`lora_base/`** — the untouched base package (zero inline LoRA tensors).
@@ -244,6 +292,14 @@ LoRA its own step entry, `volvoxai_engine_lora_train_step`, and a matching artif
 
 This is why the capstone (Chapter 10) can adapt one shared multimodal model to eight receipt tasks
 without eight full copies — eight small adapters over one frozen backbone.
+
+> 🔬 **Under the hood: why LoRA starts as a no-op and stays cheap.** The adapter is `ΔW = (α/r)·A·B`
+> with `A` initialized random and `B` initialized to **zero**, so on the first step `ΔW = 0` — the
+> fine-tune begins *exactly* as the pretrained model and only departs as `B` learns; the `α/r` factor
+> keeps the update's scale sane as you change rank `r`. The parameter math is the whole point: a
+> `[in, out]` matrix has `in·out` weights, but its rank-8 adapter has only `8·(in + out)` — for a
+> `1024×1024` layer that's ~16k versus ~1M, a ~60× shrink. At inference you can **merge** `W + ΔW` into
+> one matrix, so a merged LoRA model costs nothing extra to run.
 
 ## 5.9 What you just learned
 
@@ -257,8 +313,9 @@ without eight full copies — eight small adapters over one frozen backbone.
 - The **optimizer** turns each weight's gradient into an actual step. **SGD** is `w -= lr·grad`;
   **AdamW** gives every weight an adaptive step from two running gradient **moments** (at the cost of
   two extra buffers per weight — the bulk of a training checkpoint).
-- One **training step** is forward → loss → backward → update, exposed as `train_step`, with an
-  explicit **`trainable_names`** allow-list deciding what may change.
+- One **training step** is forward → loss → backward → update, exposed as
+  `Trainer.trainStep()`, with an explicit **`trainableTensors`** allow-list deciding what may
+  change.
 - The **loop** adds the parts that make it work in practice: **batches** and **gradient
   accumulation** (effective batch 24 from physical batch 1), **gradient clipping** for stability,
   **train-vs-eval mode** (dropout on/off), a **cosine LR schedule**, a **task metric**, and

@@ -46,7 +46,7 @@ function ropeGraph() {
   const neox = graph.addOp('RoPE', { input }, {
     out: { name: 'neox', shape: [2, 2, 6] },
   }, { rotary_dim: 4, theta: 10, position_offset: 1, interleaved: false }).out;
-  const gptj = graph.addOp('RotaryEmbedding', { input, position_ids: positions }, {
+  const gptj = graph.addOp('RoPE', { input, position_ids: positions }, {
     out: { name: 'gptj', shape: [2, 2, 6] },
   }, { rotary_dim: 4, theta: 10, interleaved: true }).out;
   graph.setOutputs([neox.name, gptj.name]);

@@ -1,8 +1,9 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
-import { CPUEngine, Graph } from '../ts/index.js';
-import { CPUAutograd } from '../ts/training/index.js';
+import { Graph } from '../ts/index.js';
+import { CPUEngine } from '../ts/backends/CPUEngine.js';
+import { CPUAutograd } from '../ts/training/CPUAutograd.js';
 
 function graphFor(opType) {
   const graph = new Graph();
@@ -12,7 +13,7 @@ function graphFor(opType) {
   const outputShape = opType === 'ProfileX' ? [1, 2, 2]
     : opType === 'ProfileY' ? [1, 2, 3] : [1, 1, 2];
   const { out } = graph.addOp(opType, { input }, { out: outputShape });
-  graph.outputNames = [out.name];
+  graph.setOutputs([out.name]);
   return graph;
 }
 

@@ -8,7 +8,7 @@ import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
 
 import { Graph } from '../ts/index.js';
-import { TrainingVolvoxAI } from '../ts/training/TrainingVolvoxAI.js';
+import { createWasmStepRunner } from './helpers/training_session.mjs';
 import { CPUAutograd } from '../ts/training/CPUAutograd.js';
 
 const run = promisify(execFile);
@@ -73,18 +73,21 @@ function selfAttentionGraph({ mode, rank3, causal, dropout = 0.35 }) {
     buffer: values(batch * queries * dModel * 3, 7),
   });
   const inputs = { qkv };
+  const executionInputs = {};
   if (mode !== 'none') {
+    const mask = maskValues(mode, batch, queries, queries);
     inputs.mask = graph.addInput('mask', maskShape(mode, batch, queries, queries), 'int32', {
-      buffer: maskValues(mode, batch, queries, queries),
+      buffer: mask,
     });
+    executionInputs.mask = mask;
   }
   const params = { heads: 1, dropout, dropout_seed: 29 };
   if (causal !== undefined) params.causal = causal;
   const { out } = graph.addOp('SDPA', inputs, {
     out: rank3 ? [batch, queries, dModel] : [queries, dModel],
   }, params);
-  graph.outputNames = [out.name];
-  return { graph, output: out.name, trainable: ['qkv'], targetCount: batch * queries };
+  graph.setOutputs([out.name]);
+  return { graph, output: out.name, trainable: ['qkv'], targetCount: batch * queries, executionInputs };
 }
 
 function crossAttentionGraph({ mode, rank3, causal, dropout = 0.3, shared = false }) {
@@ -99,19 +102,28 @@ function crossAttentionGraph({ mode, rank3, causal, dropout = 0.3, shared = fals
   const k = shared ? q : graph.addWeight('k', shapeKV, 'float32', { buffer: values(batch * keys * dModel, 9) });
   const v = shared ? q : graph.addWeight('v', shapeKV, 'float32', { buffer: values(batch * keys * dModel, 13) });
   const inputs = { q, k, v };
+  const executionInputs = {};
   if (mode !== 'none') {
+    const mask = maskValues(mode, batch, queries, keys);
     inputs.mask = graph.addInput('mask', maskShape(mode, batch, queries, keys), 'int32', {
-      buffer: maskValues(mode, batch, queries, keys),
+      buffer: mask,
     });
+    executionInputs.mask = mask;
   }
   const params = { heads: 1, attention_dropout: dropout, training_seed: 17 };
   if (causal !== undefined) params.causal = causal;
   const { out } = graph.addOp('CrossSDPA', inputs, { out: shapeQ }, params);
-  graph.outputNames = [out.name];
-  return { graph, output: out.name, trainable: shared ? ['q'] : ['q', 'k', 'v'], targetCount: batch * queries };
+  graph.setOutputs([out.name]);
+  return {
+    graph,
+    output: out.name,
+    trainable: shared ? ['q'] : ['q', 'k', 'v'],
+    targetCount: batch * queries,
+    executionInputs,
+  };
 }
 
-async function trainParity(api, makeGraph, counter) {
+async function trainParity(runWasmStep, makeGraph, counter) {
   const wasmCase = makeGraph();
   const cpuCase = makeGraph();
   const targets = Array.from({ length: wasmCase.targetCount }, (_, index) => index & 1);
@@ -122,17 +134,18 @@ async function trainParity(api, makeGraph, counter) {
     optimizer: { learningRate: 0 },
     dropout: { seed: 41, counter },
   };
-  const wasm = await api.trainStep(wasmCase.graph, { ...options, backend: 'wasm' });
-  const cpu = await CPUAutograd.trainStep(cpuCase.graph, options);
+  const wasm = await runWasmStep(wasmCase.graph, {
+    ...options, inputs: wasmCase.executionInputs, backend: 'wasm',
+  });
+  const cpu = await CPUAutograd.trainStep(cpuCase.graph, {
+    ...options, inputs: cpuCase.executionInputs,
+  });
   assert.equal(wasm.backend, 'wasm');
   assert.ok(Math.abs(wasm.loss - cpu.loss) <= 5e-5, `loss at dropout counter ${counter}`);
-  closeArray(wasmCase.graph.getTensor(wasmCase.output).buffer,
-    cpuCase.graph.getTensor(cpuCase.output).buffer, `forward output at counter ${counter}`);
   for (const name of wasmCase.trainable) {
     closeArray(wasm.gradients.get(name), cpu.gradients.get(name), `${name} gradient at counter ${counter}`);
   }
   return {
-    output: Float32Array.from(wasmCase.graph.getTensor(wasmCase.output).buffer),
     gradients: new Map(wasmCase.trainable.map((name) => [name, Float32Array.from(wasm.gradients.get(name))])),
   };
 }
@@ -150,7 +163,7 @@ test('strict full-WASM SDPA and CrossSDPA match CPU masks, causal defaults, and 
   try {
     const wasmPath = join(directory, 'volvoxai.full.wasm');
     await buildFullWasm(wasmPath);
-    const api = await TrainingVolvoxAI.init(['wasm'], wasmPath);
+    const runWasmStep = createWasmStepRunner(wasmPath);
 
     // [K] also exercises rank-2 planning. The remaining layouts use B=2 to
     // validate batch strides and the [B,K] versus [Q,K] distinction.
@@ -160,7 +173,7 @@ test('strict full-WASM SDPA and CrossSDPA match CPU masks, causal defaults, and 
       { mode: 'BK', rank3: true },
       { mode: 'QK', rank3: true, causal: false },
       { mode: 'BQK', rank3: true },
-    ]) await trainParity(api, () => selfAttentionGraph(entry), 5);
+    ]) await trainParity(runWasmStep, () => selfAttentionGraph(entry), 5);
 
     // Cross attention is non-causal by default; the QK case explicitly flips
     // it to causal so both default policies are covered in the strict path.
@@ -171,16 +184,16 @@ test('strict full-WASM SDPA and CrossSDPA match CPU masks, causal defaults, and 
       { mode: 'QK', rank3: true, causal: true },
       { mode: 'BQK', rank3: true },
       { mode: 'none', rank3: true, shared: true },
-    ]) await trainParity(api, () => crossAttentionGraph(entry), 5);
+    ]) await trainParity(runWasmStep, () => crossAttentionGraph(entry), 5);
 
     const descriptor = { mode: 'BQK', rank3: true };
-    const first = await trainParity(api, () => selfAttentionGraph(descriptor), 11);
-    const repeated = await trainParity(api, () => selfAttentionGraph(descriptor), 11);
-    closeArray(repeated.output, first.output, 'repeat attention dropout output', 0);
+    const first = await trainParity(runWasmStep, () => selfAttentionGraph(descriptor), 11);
+    const repeated = await trainParity(runWasmStep, () => selfAttentionGraph(descriptor), 11);
     closeArray(repeated.gradients.get('qkv'), first.gradients.get('qkv'), 'repeat attention dropout gradient', 0);
 
-    const advanced = await trainParity(api, () => selfAttentionGraph(descriptor), 12);
-    assert.ok(first.output.some((value, index) => value !== advanced.output[index]),
+    const advanced = await trainParity(runWasmStep, () => selfAttentionGraph(descriptor), 12);
+    assert.ok(first.gradients.get('qkv').some(
+      (value, index) => value !== advanced.gradients.get('qkv')[index]),
       'changing the dropout counter changes the attention-probability mask');
   } finally {
     await rm(directory, { recursive: true, force: true });

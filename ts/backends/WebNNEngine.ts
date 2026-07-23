@@ -3,7 +3,7 @@
 // can't express throw during build so VolvoxAI cleanly falls back to a lower
 // tier. Note: graph.tensors is a Map and node.inputs/outputs hold Tensor OBJECTS.
 import { geluApproximation } from '../ops/gELU.js';
-import { BackendEngine } from './BackendEngine.js';
+import { assertInferenceExecutionOptions, BackendEngine } from './BackendEngine.js';
 import type { Graph } from '../core/Graph.js';
 import type { TensorLike } from '../types.js';
 
@@ -39,6 +39,15 @@ export class WebNNEngine extends BackendEngine {
     return new WebNNEngine(this.context);
   }
 
+  dispose() {
+    this.resetDecodeCache();
+    this.graph = null;
+    this.compiledGraph = null;
+    this.operands = {};
+    this.inputs = [];
+    this.outputs = [];
+  }
+
   async allocateGraph(graph: Graph) {
     this._assertPortableQuantizedGraph(graph);
     this.resetDecodeCache();
@@ -48,9 +57,7 @@ export class WebNNEngine extends BackendEngine {
     this.graph = graph;
     this.operands = {}; this.inputs = []; this.outputs = [];
     const builder = new MLGraphBuilder(this.context);
-    // MLOperandDescriptor changed across WebNN versions (dimensions→shape, added dataType).
-    // Provide all spellings so constants/inputs build on old and new implementations.
-    const desc = (shape) => { const d = shape.length ? shape : [1]; return { dataType: 'float32', type: 'float32', shape: d, dimensions: d }; };
+    const desc = (shape) => ({ dataType: 'float32', shape: shape.length ? shape : [1] });
 
     // Weights become constants; anything else not produced by a node is a graph input.
     const generated = new Set();
@@ -99,7 +106,7 @@ export class WebNNEngine extends BackendEngine {
             throw new Error(`WebNN GELU node ${node.id} supports only approximate='none'.`);
           }
           this.operands[outName] = builder.gelu(getOp(nin(node, "input")));
-        } else if (op === "SiLU" || op === "Swish") {
+        } else if (op === "SiLU") {
           const x = getOp(nin(node, "input"));
           this.operands[outName] = builder.mul(x, builder.sigmoid(x));
         } else if (op === "Sigmoid") {
@@ -187,6 +194,7 @@ export class WebNNEngine extends BackendEngine {
   }
 
   async execute(inputsMap: Record<string, Float32Array>, options: Record<string, any> = {}) {
+    assertInferenceExecutionOptions(options, 'WebNN inference');
     if (!this.compiledGraph || !this.graph) throw new Error("WebNN graph not compiled.");
     const graph = this.graph;
     graph.assertTopologyRevision?.(this.compiledTopologyRevision, "WebNN");
@@ -201,31 +209,36 @@ export class WebNNEngine extends BackendEngine {
     const numel = (name: string) => { const t = graph.tensors.get(name); return t ? t.shape.reduce((a, b) => a * b, 1) : 1; };
     const shapeOf = (name: string) => { const t = graph.tensors.get(name); return t && t.shape.length ? t.shape : [1]; };
 
-    // Legacy API: MLContext.compute(graph, inputs, outputs) with plain ArrayBufferViews.
-    if (typeof ctx.compute === "function") {
-      const ins: Record<string, Float32Array> = {};
-      const outs: Record<string, Float32Array> = {};
-      for (const name of this.inputs) ins[name] = inputsMap[name] || new Float32Array(numel(name));
-      for (const name of this.outputs) outs[name] = new Float32Array(numel(name));
-      return (await ctx.compute(this.compiledGraph, ins, outs)).outputs;
+    if (typeof ctx.createTensor !== "function" || typeof ctx.writeTensor !== "function" ||
+        typeof ctx.dispatch !== "function" || typeof ctx.readTensor !== "function") {
+      throw new Error("WebNN context does not implement createTensor/writeTensor/dispatch/readTensor.");
     }
-
-    // Current API: MLTensor + dispatch + readTensor.
     const inT: Record<string, any> = {};
     const outT: Record<string, any> = {};
-    for (const name of this.inputs) {
-      const t = await ctx.createTensor({ dataType: "float32", shape: shapeOf(name), dimensions: shapeOf(name), writable: true });
-      ctx.writeTensor(t, inputsMap[name] || new Float32Array(numel(name)));
-      inT[name] = t;
+    try {
+      for (const name of this.inputs) {
+        const t = await ctx.createTensor({ dataType: "float32", shape: shapeOf(name), writable: true });
+        inT[name] = t;
+        ctx.writeTensor(t, inputsMap[name] || new Float32Array(numel(name)));
+      }
+      for (const name of this.outputs) {
+        outT[name] = await ctx.createTensor({
+          dataType: "float32", shape: shapeOf(name), readable: true,
+        });
+      }
+
+      ctx.dispatch(this.compiledGraph, inT, outT);
+
+      const results: Record<string, Float32Array> = {};
+      for (const name of this.outputs) {
+        const bytes = await ctx.readTensor(outT[name]);
+        results[name] = new Float32Array(bytes);
+      }
+      return results;
+    } finally {
+      for (const tensor of [...Object.values(outT), ...Object.values(inT)]) {
+        try { tensor?.destroy?.(); } catch { /* Execution failure remains authoritative. */ }
+      }
     }
-    for (const name of this.outputs)
-      outT[name] = await ctx.createTensor({ dataType: "float32", shape: shapeOf(name), dimensions: shapeOf(name), readable: true });
-
-    ctx.dispatch(this.compiledGraph, inT, outT);
-
-    const results: Record<string, Float32Array> = {};
-    for (const name of this.outputs) { const ab = await ctx.readTensor(outT[name]); results[name] = new Float32Array(ab); outT[name].destroy?.(); }
-    for (const name of this.inputs) inT[name].destroy?.();
-    return results;
   }
 }

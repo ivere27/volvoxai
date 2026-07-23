@@ -21,43 +21,9 @@ typedef enum {
     GRAPH_OPT_BACKEND_WGSL       = 1u << 3,
     GRAPH_OPT_BACKEND_VULKAN     = 1u << 4,
     GRAPH_OPT_BACKEND_OPENGL     = 1u << 5,
-    GRAPH_OPT_BACKEND_METAL      = 1u << 6
+    GRAPH_OPT_BACKEND_METAL      = 1u << 6,
+    GRAPH_OPT_BACKEND_CUDA       = 1u << 7
 } GraphOptBackend;
-
-typedef enum {
-    GRAPH_FUSION_CONV_BIAS = 1,
-    GRAPH_FUSION_CONV_BIAS_ACT,
-    GRAPH_FUSION_CONV_BIAS_HARDSWISH,
-    GRAPH_FUSION_CONV_ADD,
-    GRAPH_FUSION_CONV_ADD_ACT,
-    GRAPH_FUSION_DEPTHWISE_ACT,
-    GRAPH_FUSION_DEPTHWISE_POINTWISE,
-    GRAPH_FUSION_DECONV_ACT,
-    GRAPH_FUSION_CONV1D_ACT,
-    GRAPH_FUSION_CONV3D_ACT,
-    GRAPH_FUSION_MATMUL_BIAS,
-    GRAPH_FUSION_MATMUL_BIAS_ACT,
-    GRAPH_FUSION_MATMUL_ADD,
-    GRAPH_FUSION_MATMUL_SOFTMAX,
-    GRAPH_FUSION_ATTENTION_SCALE_MASK_SOFTMAX,
-    GRAPH_FUSION_SWIGLU,
-    GRAPH_FUSION_ADD_ACT,
-    GRAPH_FUSION_MUL_ADD,
-    GRAPH_FUSION_MUL_SIGMOID,
-    GRAPH_FUSION_CHAINED_ELEMENTWISE,
-    GRAPH_FUSION_ADD_CLAMP,
-    GRAPH_FUSION_SOFTMAX_DECOMPOSED,
-    GRAPH_FUSION_LAYERNORM_MATMUL,
-    GRAPH_FUSION_RMSNORM_MUL,
-    GRAPH_FUSION_INSTANCENORM_ACT,
-    GRAPH_FUSION_GLOBAL_AVGPOOL_FLATTEN,
-    GRAPH_FUSION_MAXPOOL_ACT,
-    GRAPH_FUSION_ARGMAX_GATHER,
-    GRAPH_FUSION_SPLIT_MATMUL,
-    GRAPH_FUSION_QDQ_REQUANT,
-    GRAPH_FUSION_CONCAT_SIGMOID_INTERNAL,
-    GRAPH_FUSION_ALIAS_PASSTHROUGH_INTERNAL
-} GraphFusionId;
 
 typedef enum {
     GRAPH_OPT_STAT_RELU6 = 0,
@@ -67,16 +33,6 @@ typedef enum {
     GRAPH_OPT_STAT_DEPTHWISE_POINTWISE,
     GRAPH_OPT_STAT_CHAINED_ADD
 } GraphOptStatSlot;
-
-typedef struct {
-    int relu6;
-    int alias;
-    int concat_sigmoid;
-    int conv_add;
-    int depthwise_pointwise;
-    int chained_add;
-    int skipped;
-} GraphOptStats;
 
 typedef int (*GraphOptPassFn)(void);
 
@@ -90,18 +46,8 @@ typedef struct {
     GraphOptPassFn run;
 } GraphOptPass;
 
-typedef struct {
-    GraphFusionId id;
-    unsigned backend_mask;
-    int peer_idx;
-    char aux_tensor[128];
-} GraphNodeFusion;
-
 #define GRAPH_OPT_CPU_ALL (GRAPH_OPT_BACKEND_CPU_SCALAR | GRAPH_OPT_BACKEND_CPU_AVX2 | GRAPH_OPT_BACKEND_CPU_NEON)
-#define GRAPH_OPT_GPU_ALL (GRAPH_OPT_BACKEND_WGSL | GRAPH_OPT_BACKEND_VULKAN | GRAPH_OPT_BACKEND_OPENGL | GRAPH_OPT_BACKEND_METAL)
-
-static GraphOptStats g_graph_opt_stats;
-static GraphNodeFusion g_node_fusion[MAXN];
+#define GRAPH_OPT_GPU_ALL (GRAPH_OPT_BACKEND_WGSL | GRAPH_OPT_BACKEND_VULKAN | GRAPH_OPT_BACKEND_OPENGL | GRAPH_OPT_BACKEND_METAL | GRAPH_OPT_BACKEND_CUDA)
 
 static int env_truthy(const char* name) {
     const char* v = getenv(name);
@@ -112,6 +58,9 @@ static unsigned graph_opt_current_backend(void) {
     if (g_use_vulkan) return GRAPH_OPT_BACKEND_VULKAN;
     if (g_use_opengl) return GRAPH_OPT_BACKEND_OPENGL;
     if (g_use_metal) return GRAPH_OPT_BACKEND_METAL;
+#if VOLVOXAI_ENABLE_CUDA
+    if (g_use_cuda) return GRAPH_OPT_BACKEND_CUDA;
+#endif
 #if defined(__AVX2__)
     return GRAPH_OPT_BACKEND_CPU_AVX2;
 #elif defined(__ARM_NEON) || defined(__ARM_NEON__)
@@ -145,6 +94,7 @@ static void graph_opt_reset_state(void) {
         g_node_fusion[i].id = 0;
         g_node_fusion[i].backend_mask = 0;
         g_node_fusion[i].peer_idx = -1;
+        g_node_fusion[i].source_tensor[0] = 0;
         g_node_fusion[i].aux_tensor[0] = 0;
     }
     for (int i = 0; i < MAXN; i++) g_concat_sigmoid_fuse[i] = -1;
@@ -157,6 +107,19 @@ static const GraphNodeFusion* graph_opt_node_fusion(int node_idx, GraphFusionId 
     unsigned backend = graph_opt_current_backend();
     if (f->backend_mask && !(f->backend_mask & backend)) return NULL;
     return f;
+}
+
+static int graph_opt_declared_output(const char* name) {
+    cJSON* outputs;
+    if (!name || !name[0] || !g_graph_root) return 0;
+    outputs = cJSON_GetObjectItem(g_graph_root, "outputs");
+    if (!outputs || (!cJSON_IsArray(outputs) && !cJSON_IsObject(outputs)))
+        return 0;
+    for (cJSON* output = outputs->child; output; output = output->next) {
+        if (cJSON_IsString(output) && output->valuestring &&
+            !strcmp(output->valuestring, name)) return 1;
+    }
+    return 0;
 }
 
 static int fuse_relu6_pass(void) {
@@ -207,17 +170,25 @@ static int fuse_conv_add_pass(void) {
     for (int i = 0; i < g_nn; i++) {
         Node* add = &g_n[i];
         if (add->skip || strcmp(add->op, "Add")) continue;
+        if (g_node_fusion[i].id || add->nin != 2) continue;
         if (p_int(add->params, "relu", 0)) continue;
         T* add_out = t_find(add->out);
-        if (!add_out || add_out->dtype != T_F32 || add->nin < 2) continue;
+        if (!add_out || add_out->dtype != T_F32) continue;
 
-        for (int ai = 0; ai < add->nin; ai++) {
+        for (int ai = 0; ai < 2; ai++) {
             const char* conv_out_name = add->ins[ai].name;
             int conv_idx = producer_index_for(conv_out_name);
-            if (conv_idx < 0) continue;
+            if (conv_idx < 0 || conv_idx >= i) continue;
             Node* conv = &g_n[conv_idx];
-            if (conv->skip || strcmp(conv->op, "Conv2D")) continue;
+            if (conv->skip || g_node_fusion[conv_idx].id ||
+                strcmp(conv->op, "Conv2D")) continue;
             if (tensor_use_count(conv->out) != 1) continue;
+            if (graph_opt_declared_output(conv->out)) continue;
+            int conv_occurrences = 0;
+            for (int input_index = 0; input_index < 2; input_index++)
+                if (!strcmp(add->ins[input_index].name, conv->out))
+                    conv_occurrences++;
+            if (conv_occurrences != 1) continue;
 
             T* conv_out = t_find(conv->out);
             T* in = nin(conv, "input");
@@ -248,25 +219,21 @@ static int fuse_conv_add_pass(void) {
             }
             if (kh != 1 || kw != 1) continue;
 
-            const char* res_name = NULL;
-            T* res = NULL;
-            for (int ri = 0; ri < add->nin; ri++) {
-                if (ri == ai) continue;
-                T* t = t_find(add->ins[ri].name);
-                if (t && t->dtype == T_F32 && tensor_same_shape(t, add_out)) {
-                    res_name = add->ins[ri].name;
-                    res = t;
-                    break;
-                }
-            }
+            int ri = 1 - ai;
+            const char* res_name = add->ins[ri].name;
+            T* res = t_find(res_name);
             if (!res_name || !res) continue;
+            if (!strcmp(res_name, conv->out) || res->dtype != T_F32 ||
+                !tensor_same_shape(res, add_out)) continue;
             int res_prod = producer_index_any(res_name);
             if (res_prod >= 0 && res_prod > conv_idx) continue;
             if (!strcmp(res_name, add->out) || !strcmp(conv->out, add->out)) continue;
 
             g_node_fusion[conv_idx].id = GRAPH_FUSION_CONV_ADD;
-            g_node_fusion[conv_idx].backend_mask = GRAPH_OPT_CPU_ALL;
+            g_node_fusion[conv_idx].backend_mask = graph_opt_current_backend();
             g_node_fusion[conv_idx].peer_idx = i;
+            strncpy(g_node_fusion[conv_idx].source_tensor, conv->out, 127);
+            g_node_fusion[conv_idx].source_tensor[127] = 0;
             strncpy(g_node_fusion[conv_idx].aux_tensor, res_name, 127);
             g_node_fusion[conv_idx].aux_tensor[127] = 0;
             strncpy(conv->out, add->out, 127);
@@ -373,10 +340,16 @@ static int fuse_chained_add_pass(void) {
     for (int i = 0; i < g_nn; i++) {
         Node* add0 = &g_n[i];
         if (add0->skip || strcmp(add0->op, "Add")) continue;
+        if (g_node_fusion[i].id || add0->nin != 2) continue;
         if (p_int(add0->params, "relu", 0)) continue;
         T* add0_out = t_find(add0->out);
-        if (!add0_out || add0_out->dtype != T_F32 || add0->nin < 2) continue;
+        if (!add0_out || add0_out->dtype != T_F32) continue;
         if (tensor_use_count(add0->out) != 1) continue;
+        if (graph_opt_declared_output(add0->out)) continue;
+        T* runtime_a = nin(add0, "a");
+        if (!runtime_a) runtime_a = nin(add0, "input");
+        T* runtime_b = nin(add0, "b");
+        if (!runtime_a || !runtime_b) continue;
 
         int add1_idx = -1;
         for (int j = i + 1; j < g_nn; j++) {
@@ -391,34 +364,34 @@ static int fuse_chained_add_pass(void) {
         }
         if (add1_idx < 0) continue;
         Node* add1 = &g_n[add1_idx];
-        if (strcmp(add1->op, "Add") || add1->nin < 2) continue;
+        if (strcmp(add1->op, "Add") || add1->nin != 2 ||
+            g_node_fusion[add1_idx].id) continue;
+        int peer_relu = p_int(add1->params, "relu", 0);
+        if (peer_relu < 0 || peer_relu > 2) continue;
         T* add1_out = t_find(add1->out);
         if (!add1_out || add1_out->dtype != T_F32 || !tensor_same_shape(add0_out, add1_out)) continue;
 
         const char* third_name = NULL;
-        for (int k = 0; k < add1->nin; k++) {
-            if (strcmp(add1->ins[k].name, add0->out)) {
-                third_name = add1->ins[k].name;
-                break;
-            }
+        int prior_occurrences = 0;
+        for (int k = 0; k < 2; k++) {
+            if (!strcmp(add1->ins[k].name, add0->out)) prior_occurrences++;
+            else third_name = add1->ins[k].name;
         }
+        if (prior_occurrences != 1 || !third_name) continue;
         T* third = t_find(third_name);
         if (!third || third->dtype != T_F32 || !tensor_same_shape(third, add1_out)) continue;
         int third_prod = producer_index_any(third_name);
         if (third_prod >= i) continue;
 
-        for (int k = 0; k < add0->nin; k++) {
-            T* in = t_find(add0->ins[k].name);
-            if (!in || in->dtype != T_F32 || !tensor_same_shape(in, add1_out)) {
-                third_name = NULL;
-                break;
-            }
-        }
-        if (!third_name) continue;
+        if (runtime_a->dtype != T_F32 || runtime_b->dtype != T_F32 ||
+            !tensor_same_shape(runtime_a, add1_out) ||
+            !tensor_same_shape(runtime_b, add1_out)) continue;
 
         g_node_fusion[i].id = GRAPH_FUSION_CHAINED_ELEMENTWISE;
-        g_node_fusion[i].backend_mask = GRAPH_OPT_BACKEND_OPENGL;
+        g_node_fusion[i].backend_mask = graph_opt_current_backend();
         g_node_fusion[i].peer_idx = add1_idx;
+        strncpy(g_node_fusion[i].source_tensor, add0->out, 127);
+        g_node_fusion[i].source_tensor[127] = 0;
         strncpy(g_node_fusion[i].aux_tensor, third_name, 127);
         g_node_fusion[i].aux_tensor[127] = 0;
         strncpy(add0->out, add1->out, 127);
@@ -443,6 +416,8 @@ static int alias_quantization_compatible(const T* in, const T* out) {
 }
 
 static int alias_passthrough_pass(void) {
+    /* CUDA consumes the resulting host pointer through its normal slot lookup;
+     * this pass does not create or share backend-owned device allocations. */
     if (g_use_vulkan || g_use_opengl) return 0;
     int applied = 0;
     for (int i = 0; i < g_nn; i++) {
@@ -483,7 +458,7 @@ static const GraphOptPass g_operator_fusion_passes[] = {
     {
         GRAPH_FUSION_ALIAS_PASSTHROUGH_INTERNAL,
         GRAPH_OPT_CAT_INTERNAL,
-        GRAPH_OPT_CPU_ALL,
+        GRAPH_OPT_CPU_ALL | GRAPH_OPT_BACKEND_CUDA,
         "alias_passthrough",
         NULL,
         GRAPH_OPT_STAT_ALIAS,
@@ -508,9 +483,18 @@ static const GraphOptPass g_operator_fusion_passes[] = {
         fuse_chained_add_pass
     },
     {
+        GRAPH_FUSION_CHAINED_ELEMENTWISE,
+        GRAPH_OPT_CAT_ELEMENTWISE,
+        GRAPH_OPT_BACKEND_CUDA,
+        "chained_add_cuda",
+        NULL,
+        GRAPH_OPT_STAT_CHAINED_ADD,
+        fuse_chained_add_pass
+    },
+    {
         GRAPH_FUSION_CONV_ADD,
         GRAPH_OPT_CAT_CONV,
-        GRAPH_OPT_BACKEND_CPU_AVX2,
+        GRAPH_OPT_BACKEND_CPU_AVX2 | GRAPH_OPT_BACKEND_CUDA,
         "conv_add",
         NULL,
         GRAPH_OPT_STAT_CONV_ADD,

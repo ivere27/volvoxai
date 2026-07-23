@@ -21,11 +21,11 @@ question as a batch replicated across every adapter family ``[0..7]``.  That
 does not change the auto-router golden path; it supplies distinct first-token
 coverage evidence and makes reference hooks observe all task-adapter modules.
 
-It is not a model converter and it is intentionally not a
-``--conversion-contract`` input for ``import_tiny_receipt_vqa_int8.py``.  A
-Volvox graph still needs explicit activation-edge descriptors, graph lowering,
-and backend execution validation.  Keeping this boundary explicit prevents a
-reference observation file from being mistaken for an executable W8A8 model.
+It is not a model converter or the source-bound per-edge profile consumed by
+the strict W8A8 materializer. A Volvox graph still needs explicit
+activation-edge descriptors, graph lowering, and backend execution validation.
+Keeping this boundary explicit prevents a reference observation file from
+being mistaken for an executable W8A8 model.
 
 The reference model is loaded from ``modeling_tiny_receipt_vqa.py`` packaged
 beside the release.  Treat that code as part of the trusted development
@@ -1281,24 +1281,25 @@ def generate_calibration_contract(
     )
 
 
-def _navercap_path(*parts: str) -> Path | None:
-    root = os.environ.get("NAVERCAP_ROOT")
+def _receipt_data_path(*parts: str) -> Path | None:
+    root = os.environ.get("RECEIPT_VQA_DATA_ROOT")
     if not root:
         return None
     return Path(root).expanduser().joinpath(*parts)
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
-    release_dir = _navercap_path(
+    release_dir = _receipt_data_path(
         "temp", "tiny-receipt-vqa-structured-qa-21m-lora-router-e100-v1"
     )
-    annotations_dir = _navercap_path("eval", "heldout", "annotations")
-    images_dir = _navercap_path("eval", "heldout", "images")
+    annotations_dir = _receipt_data_path("eval", "heldout", "annotations")
+    images_dir = _receipt_data_path("eval", "heldout", "images")
     parser = argparse.ArgumentParser(
         description="Generate development-only TinyReceiptVQA W8A8 reference calibration/goldens.",
         epilog=(
-            "Set NAVERCAP_ROOT=/path/to/navercap to use the standard release and "
-            "heldout-data locations, or pass all three path options explicitly."
+            "Set RECEIPT_VQA_DATA_ROOT=/path/to/receipt-vqa-data to use the "
+            "standard release and heldout-data locations, or pass all three "
+            "path options explicitly."
         ),
     )
     parser.add_argument(
@@ -1308,7 +1309,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         required=release_dir is None,
         help=(
             "release root containing int8/manifest.json and modeling_tiny_receipt_vqa.py "
-            "(default: standard path under $NAVERCAP_ROOT)"
+            "(default: standard path under $RECEIPT_VQA_DATA_ROOT)"
         ),
     )
     parser.add_argument(
@@ -1316,14 +1317,20 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         type=Path,
         default=annotations_dir,
         required=annotations_dir is None,
-        help="local heldout annotations directory (default: $NAVERCAP_ROOT/eval/heldout/annotations)",
+        help=(
+            "local heldout annotations directory "
+            "(default: $RECEIPT_VQA_DATA_ROOT/eval/heldout/annotations)"
+        ),
     )
     parser.add_argument(
         "--images-dir",
         type=Path,
         default=images_dir,
         required=images_dir is None,
-        help="local heldout images directory (default: $NAVERCAP_ROOT/eval/heldout/images)",
+        help=(
+            "local heldout images directory "
+            "(default: $RECEIPT_VQA_DATA_ROOT/eval/heldout/images)"
+        ),
     )
     parser.add_argument(
         "--out",

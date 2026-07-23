@@ -15,7 +15,7 @@ make models_tinystories
 That produces the existing package filenames under `models/tinystories_1m/`:
 
 ```text
-config.json
+graph.json
 model.safetensors
 vocab.bin
 vocab.json

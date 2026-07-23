@@ -21,6 +21,13 @@ present and *where*. It ships here in three numeric precisions — **fp32, fp16,
 compute the same thing at different size/speed trade-offs. This chapter traces the **fp32**
 version (ops named `Conv2D`); Chapter 6 explains how int8 swaps in `QConv2D`.
 
+> **🌱 Where this model comes from.** EfficientDet-Lite0 isn't trained here either — the weights come
+> from **Google's MediaPipe** model store (the public `efficientdet_lite0.tflite`, released in
+> fp32/fp16/int8). VolvoxAI **converts** that TFLite model into the two-file graph package (`graph.json` +
+> `model.safetensors` + `labels.txt`); `make models_efficientdet` regenerates it from the public source.
+> Same pattern as the language model: a real, pretrained model brought into VolvoxAI's format, not
+> trained from scratch here. (Details: `docs/models.md`, `examples/efficientdet_lite0/`.)
+
 ## 3.1 What the model consumes and produces
 
 > 🌱 **Idea.** In goes one photo. Out comes a huge pile of *candidate* boxes — about 19,000 of them
@@ -106,6 +113,11 @@ them into boxes you can draw. Let's take them in order — but first, the one op
 > One stencil finds vertical edges; another finds a patch of fur; a later one finds an eye. Stack
 > enough of these and the machine goes from edges → parts → whole objects. That sliding-stencil
 > move is **convolution**, and it's to vision what attention is to language.
+>
+> *A stencil you can read:* the 3×3 filter `[[-1,0,1],[-1,0,1],[-1,0,1]]` subtracts the left column
+> from the right, so its output lights up exactly where the image goes dark→light moving rightward — a
+> **vertical-edge detector**. Early layers learn dozens of little filters like this; the machine just
+> isn't told in advance which ones to learn.
 
 🔧 Where the language model leans on `MatMul`, a vision model leans on `Conv2D`. A convolution
 slides a small **filter** (a little grid of weights, e.g. 3×3) across the image. At each
@@ -143,6 +155,15 @@ for (let oh = 0; oh < out_h; oh++)
   }
 ```
 
+> 🔬 **Under the hood: a convolution is a matrix multiply in disguise.** The nested loops are the
+> *definition*; fast engines don't run them literally. The usual trick is **im2col** — unfold every
+> sliding patch into a row of a big matrix so the whole convolution becomes one **GEMM**, reusing the
+> exact tuned code the language model's `MatMul` uses. The native engine even **prepacks** conv weights
+> at load time into that GEMM-friendly layout (`prepack_conv_weights`, Chapter 9). And the cost is
+> worth carrying: a `Conv2D` does `out_h · out_w · out_c · in_c · k_h · k_w` multiply-adds — the stem
+> alone is `160·160·32·3·9 ≈ 22M` — which is why the cheaper convolution in the next paragraph matters
+> so much.
+
 🔧 Two flavors of convolution appear, and their combination is the whole efficiency trick of this
 model family:
 
@@ -162,6 +183,12 @@ depthwise.
 > (depthwise). `groups = 1` means "every output channel sees every input channel" (regular). The
 > same kernel handles both by looping over the right channel range.
 
+> 🔬 **Under the hood: why depthwise-separable is ~8× cheaper.** Replace one regular `C→C` 3×3 conv
+> over an `H×W` map — cost `H·W·C·C·9` — with a **depthwise** 3×3 (`H·W·C·9`, no channel mixing) then a
+> **pointwise** 1×1 (`H·W·C·C`, no spatial mixing). The cost ratio is `(1/C) + (1/9)`, so at `C = 128`
+> the pair runs at about **1/8** of the regular conv for nearly the same modeling power. Do that in all
+> 16 MBConv blocks and you get a detector that fits on a phone.
+
 ---
 
 ## 3.4 Stage 1 — Backbone: image → features
@@ -179,6 +206,14 @@ depthwise.
 
 Early layers detect edges and colors; middle layers detect textures and parts (an eye, a wheel);
 late layers detect whole objects. This hierarchy is *learned*, not programmed.
+
+> 🔬 **Under the hood: the inverted residual (MBConv).** Each MBConv block is **expand → depthwise →
+> project**: a 1×1 conv first *widens* the channels (often 4×), a cheap depthwise 3×3 does the spatial
+> work in that wide space, then a 1×1 conv *projects* back down, with a residual `Add` when the shapes
+> match. It's called an **inverted** residual because — unlike a classic bottleneck with a thin middle —
+> the middle is the *widest* part and the ends are thin. The five feature maps are tapped at strides
+> **8 / 16 / 32 / 64 / 128**, so P3 reacts to ~8-pixel regions and P7 to ~128-pixel regions: the
+> zoom ladder is literally built from where you tap the backbone.
 
 ```
 stem:      [1,320,320,  3]  --Conv2D stride2-->  [1,160,160, 32]
@@ -230,6 +265,13 @@ flowchart TB
 That's it — BiFPN is "resize until two maps are the same size, then add them," repeated. No new
 math.
 
+> 🔬 **Under the hood: weighted (fast normalized) fusion.** The `Add`s that merge two scales aren't
+> plain sums — each input gets a small **learned weight**, kept non-negative and normalized to sum to 1
+> (`wᵢ / (Σ wⱼ + ε)`), so the network learns *which* scale to trust at each merge point without the
+> weights running away. One full top-down + bottom-up sweep is a single **BiFPN layer**, and
+> EfficientDet stacks a few of them — which is why the 12 resizes and 14 pools recur in a regular
+> pattern rather than appearing once.
+
 ---
 
 ## 3.6 Stage 3 — Heads: features → per-anchor predictions
@@ -249,6 +291,12 @@ sizes/aspect ratios centered on the cell):
 > 🔬 **Anchors** are the clever bit. Rather than predict boxes from nothing, the model predicts
 > small *corrections* to a fixed grid of prior boxes. Predicting "shift this reference box a bit"
 > is far easier to learn than "invent a box at (173, 92, 240, 210) from scratch."
+>
+> 🔬 **Under the hood: 9 anchors, shared heads.** The 9 anchors per cell are **3 sizes × 3 aspect
+> ratios** (tall, square, wide), so one cell can propose a skinny pedestrian and a wide car at the same
+> time. The class and box heads are **shared across all five scales** — the *same* conv weights run on
+> P3…P7 — so a single head covers objects from tiny to huge; the scale comes from *which* feature map
+> it reads, not from a separate head per size.
 
 ---
 
@@ -282,6 +330,11 @@ is now done:** two tensors, 19,206 scored candidate boxes.
 > reference box into real pixel corners. Then throw away duplicates: when five overlapping boxes all
 > shout "dog!", keep the most confident one and delete the rest. What's left is the handful of boxes
 > you draw on the photo.
+>
+> *Two everyday numbers.* **Sigmoid** turns a raw score into a 0–100% confidence — a big positive
+> score becomes ~99%, a negative one ~1%. **IoU** ("intersection over union") measures overlap: two
+> boxes covering the exact same area score 1.0, boxes that barely touch score near 0. NMS deletes a box
+> when its IoU with a stronger box crosses a threshold like 0.5.
 
 🔧 The raw outputs aren't drawable yet. Three fixed (non-learned) steps finish the job:
 
@@ -293,6 +346,14 @@ is now done:** two tensors, 19,206 scored candidate boxes.
 3. **Non-Max Suppression (NMS)**: the same object usually fires several overlapping anchors. NMS
    keeps the highest-scoring box and deletes others that overlap it too much (high *IoU*,
    intersection-over-union), per class. VolvoxAI has this as an op — `ts/ops/nonMaxSuppression.ts`.
+
+> 🔬 **Under the hood: decode and NMS, precisely.** *Decode* turns the 4 box deltas into pixels
+> relative to the anchor: the center shifts by `(dy, dx)` scaled to the anchor's size, and the
+> width/height scale by `exp(dh)` / `exp(dw)` — the `exp` guarantees a positive size and lets one delta
+> express "half" or "double." *NMS* then works per class: sort candidates by score, greedily keep the
+> top one, discard any later box whose IoU with a kept box exceeds the threshold, repeat — an `O(n²)`
+> sweep in the worst case, which is why a score threshold prunes the ~19,206 candidates to a few dozen
+> *before* NMS runs.
 
 ```
 before NMS:  ▢▢▢  three overlapping "dog" boxes, scores 0.91, 0.88, 0.72

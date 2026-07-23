@@ -1,5 +1,5 @@
-@group(0) @binding(0) var<storage, read> input: array<f32>;
-@group(0) @binding(1) var<storage, read_write> output: array<f32>;
+@group(0) @binding(0) var<storage, read> input: array<u32>;
+@group(0) @binding(1) var<storage, read_write> output: array<u32>;
 
 struct Params {
   dimensions: vec4<u32>, // input_rank, output_rank, unused, output_elements

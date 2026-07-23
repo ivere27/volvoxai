@@ -1,4 +1,5 @@
-#include "volvoxai_training.h"
+#include "training/training_core.h"
+#include "runtime/runtime_state.h"
 #include "adapter_runtime_internal.h"
 #include "safetensors.h"
 
@@ -73,8 +74,8 @@ static int stage_ptq_adapter(void) {
 }
 
 static int test_qlinear_package(void) {
-    const char* source_config_path = "/tmp/volvox-ptq-package-source.json";
-    const char* template_config_path = "/tmp/volvox-ptq-package-template.json";
+    const char* source_graph_path = "/tmp/volvox-ptq-package-source.graph.json";
+    const char* template_graph_path = "/tmp/volvox-ptq-package-template.graph.json";
     const char* invalid_template_path = "/tmp/volvox-ptq-package-invalid-template.json";
     const char* wrong_layout_template_path = "/tmp/volvox-ptq-package-in-out-template.json";
     const char* missing_dependency_template_path = "/tmp/volvox-ptq-package-missing-template.json";
@@ -82,41 +83,41 @@ static int test_qlinear_package(void) {
     const char* bias_descriptor_template_path = "/tmp/volvox-ptq-package-bias-descriptor.json";
     const char* mixed_template_path = "/tmp/volvox-ptq-package-mixed-template.json";
     const char* source_weights_path = "/tmp/volvox-ptq-package-source.safetensors";
+    const char* legacy_weights_path = "/tmp/volvox-ptq-package-legacy.safetensors";
     const char* mixed_weights_path = "/tmp/volvox-ptq-package-mixed.safetensors";
-    const char* output_config_path = "/tmp/volvox-ptq-package-output.json";
+    const char* output_graph_path = "/tmp/volvox-ptq-package-output.graph.json";
     const char* output_weights_path = "/tmp/volvox-ptq-package-output.safetensors";
     const char* source_config =
-        "{\"inputs\":{\"x\":{\"shape\":[2,3],\"dtype\":\"float32\"}},"
+        "{\"format\":\"volvox-graph/v1\",\"inputs\":{\"x\":{\"shape\":[2,3],\"dtype\":\"float32\"}},"
         "\"nodes\":[{\"opType\":\"Linear\","
         "\"inputs\":{\"input\":\"x\",\"weight\":\"weight\",\"bias\":\"bias\"},"
         "\"outputs\":{\"out\":\"y\"},\"outputs_shape\":{\"out\":[2,2]},"
-        "\"params\":{\"weight_layout\":\"OUT_IN\"}}]}";
+        "\"params\":{\"weight_layout\":\"OUT_IN\"}}],\"outputs\":[\"y\"]}";
     const char* target_template =
-        "{\"inputs\":{\"x\":{\"shape\":[2,3],\"dtype\":\"int8\"}},"
+        "{\"format\":\"volvox-graph/v1\",\"inputs\":{\"x\":{\"shape\":[2,3],\"dtype\":\"int8\"}},"
         "\"nodes\":[{\"opType\":\"QLinear\","
         "\"inputs\":{\"input\":\"x\",\"weight\":\"weight.i8\","
         "\"bias\":\"bias.i32\"},\"outputs\":{\"out\":\"y\"},"
         "\"outputs_shape\":{\"out\":[2,2]},"
         "\"outputs_dtype\":{\"out\":\"int8\"},"
-        "\"params\":{\"weight_layout\":\"OUT_IN\"}}],"
-        "\"weights_quantization\":{\"weight\":{},\"bias\":{}}}";
+        "\"params\":{\"weight_layout\":\"OUT_IN\"}}],\"outputs\":[\"y\"]}";
     const char* invalid_template =
-        "{\"inputs\":{\"x\":{\"shape\":[2,3],\"dtype\":\"int8\"}},"
+        "{\"format\":\"volvox-graph/v1\",\"inputs\":{\"x\":{\"shape\":[2,3],\"dtype\":\"int8\"}},"
         "\"nodes\":[{\"opType\":\"Linear\","
         "\"inputs\":{\"input\":\"x\",\"weight\":\"weight.i8\","
         "\"bias\":\"bias.i32\"},\"outputs\":{\"out\":\"y\"},"
         "\"outputs_shape\":{\"out\":[2,2]},"
-        "\"outputs_dtype\":{\"out\":\"int8\"},\"params\":{}}]}";
+        "\"outputs_dtype\":{\"out\":\"int8\"},\"params\":{}}],\"outputs\":[\"y\"]}";
     const char* wrong_layout_template =
-        "{\"inputs\":{\"x\":{\"shape\":[2,3],\"dtype\":\"int8\"}},"
+        "{\"format\":\"volvox-graph/v1\",\"inputs\":{\"x\":{\"shape\":[2,3],\"dtype\":\"int8\"}},"
         "\"nodes\":[{\"opType\":\"QLinear\","
         "\"inputs\":{\"input\":\"x\",\"weight\":\"weight.i8\","
         "\"bias\":\"bias.i32\"},\"outputs\":{\"out\":\"y\"},"
         "\"outputs_shape\":{\"out\":[2,2]},"
         "\"outputs_dtype\":{\"out\":\"int8\"},"
-        "\"params\":{\"weight_layout\":\"IN_OUT\"}}]}";
+        "\"params\":{\"weight_layout\":\"IN_OUT\"}}],\"outputs\":[\"y\"]}";
     const char* missing_dependency_template =
-        "{\"inputs\":{\"x\":{\"shape\":[2,3],\"dtype\":\"int8\"}},"
+        "{\"format\":\"volvox-graph/v1\",\"inputs\":{\"x\":{\"shape\":[2,3],\"dtype\":\"int8\"}},"
         "\"nodes\":[{\"opType\":\"QLinear\","
         "\"inputs\":{\"input\":\"x\",\"weight\":\"weight.i8\","
         "\"bias\":\"bias.i32\"},\"outputs\":{\"out\":\"y\"},"
@@ -125,27 +126,27 @@ static int test_qlinear_package(void) {
         "\"params\":{\"weight_layout\":\"OUT_IN\"}},"
         "{\"opType\":\"Add\",\"inputs\":{\"a\":\"y\",\"b\":\"missing.weight\"},"
         "\"outputs\":{\"out\":\"z\"},\"outputs_shape\":{\"out\":[2,2]},"
-        "\"outputs_dtype\":{\"out\":\"int8\"},\"params\":{}}]}";
+        "\"outputs_dtype\":{\"out\":\"int8\"},\"params\":{}}],\"outputs\":[\"z\"]}";
     const char* namespace_collision_template =
-        "{\"inputs\":{\"x\":{\"shape\":[2,3],\"dtype\":\"int8\"},"
+        "{\"format\":\"volvox-graph/v1\",\"inputs\":{\"x\":{\"shape\":[2,3],\"dtype\":\"int8\"},"
         "\"weight.i8\":{\"shape\":[2,3],\"dtype\":\"int8\"}},"
         "\"nodes\":[{\"opType\":\"QLinear\","
         "\"inputs\":{\"input\":\"x\",\"weight\":\"weight.i8\","
         "\"bias\":\"bias.i32\"},\"outputs\":{\"out\":\"y\"},"
         "\"outputs_shape\":{\"out\":[2,2]},"
         "\"outputs_dtype\":{\"out\":\"int8\"},"
-        "\"params\":{\"weight_layout\":\"OUT_IN\"}}]}";
+        "\"params\":{\"weight_layout\":\"OUT_IN\"}}],\"outputs\":[\"y\"]}";
     const char* bias_descriptor_template =
-        "{\"inputs\":{\"x\":{\"shape\":[2,3],\"dtype\":\"int8\"}},"
+        "{\"format\":\"volvox-graph/v1\",\"inputs\":{\"x\":{\"shape\":[2,3],\"dtype\":\"int8\"}},"
         "\"nodes\":[{\"opType\":\"QLinear\","
         "\"inputs\":{\"input\":\"x\",\"weight\":\"weight.i8\","
         "\"bias\":\"bias.i32\"},\"outputs\":{\"out\":\"y\"},"
         "\"outputs_shape\":{\"out\":[2,2]},"
         "\"outputs_dtype\":{\"out\":\"int8\"},"
         "\"params\":{\"weight_layout\":\"OUT_IN\"}}],"
-        "\"weights_quantization\":{\"bias.i32\":{}}}";
+        "\"weights_quantization\":{\"bias.i32\":{}},\"outputs\":[\"y\"]}";
     const char* mixed_template =
-        "{\"inputs\":{\"x\":{\"shape\":[2,3],\"dtype\":\"int8\"}},"
+        "{\"format\":\"volvox-graph/v1\",\"inputs\":{\"x\":{\"shape\":[2,3],\"dtype\":\"int8\"}},"
         "\"nodes\":[{\"opType\":\"QLinear\","
         "\"inputs\":{\"input\":\"x\",\"weight\":\"weight.i8\","
         "\"bias\":\"bias.i32\"},\"outputs\":{\"out\":\"y\"},"
@@ -154,7 +155,7 @@ static int test_qlinear_package(void) {
         "\"params\":{\"weight_layout\":\"OUT_IN\"}},"
         "{\"opType\":\"Identity\",\"inputs\":{\"input\":\"other.bias\"},"
         "\"outputs\":{\"out\":\"pass\"},\"outputs_shape\":{\"out\":[2]},"
-        "\"outputs_dtype\":{\"out\":\"float32\"},\"params\":{}}]}";
+        "\"outputs_dtype\":{\"out\":\"float32\"},\"params\":{}}],\"outputs\":[\"y\",\"pass\"]}";
     const int matrix_shape[2] = {2, 3};
     const int vector_shape[1] = {2};
     const float weights[6] = {1.0f, 2.0f, -1.0f, -2.0f, 0.5f, 3.0f};
@@ -164,8 +165,8 @@ static int test_qlinear_package(void) {
     const float mixed_other_bias[2] = {30.0f, 40.0f};
     const float sample0[6] = {1.0f, -1.0f, 0.5f, 0.0f, 2.0f, -1.0f};
     const float sample1[6] = {-2.0f, 0.5f, 1.5f, 3.0f, -4.0f, 2.0f};
-    remove(source_config_path);
-    remove(template_config_path);
+    remove(source_graph_path);
+    remove(template_graph_path);
     remove(invalid_template_path);
     remove(wrong_layout_template_path);
     remove(missing_dependency_template_path);
@@ -173,12 +174,13 @@ static int test_qlinear_package(void) {
     remove(bias_descriptor_template_path);
     remove(mixed_template_path);
     remove(source_weights_path);
+    remove(legacy_weights_path);
     remove(mixed_weights_path);
-    remove(output_config_path);
+    remove(output_graph_path);
     remove(output_weights_path);
 
-    CHECK(write_text(source_config_path, source_config) == 0);
-    CHECK(write_text(template_config_path, target_template) == 0);
+    CHECK(write_text(source_graph_path, source_config) == 0);
+    CHECK(write_text(template_graph_path, target_template) == 0);
     CHECK(write_text(invalid_template_path, invalid_template) == 0);
     CHECK(write_text(wrong_layout_template_path, wrong_layout_template) == 0);
     CHECK(write_text(missing_dependency_template_path,
@@ -201,6 +203,9 @@ static int test_qlinear_package(void) {
                                  vector_shape, 1, other_bias,
                                  sizeof(other_bias)) == 0);
     CHECK(safetensors_save(source_weights_path, &source_file) == 0);
+    CHECK(safetensors_set_metadata_json(
+              &source_file, "{\"weights_quantization\":\"legacy\"}") == 0);
+    CHECK(safetensors_save(legacy_weights_path, &source_file) == 0);
     safetensors_free(&source_file);
     CHECK(safetensors_init_empty(&source_file, SAFETENSORS_OPEN_READ_WRITE) == 0);
     CHECK(safetensors_add_tensor(&source_file, "weight", SAFETENSORS_DTYPE_F32,
@@ -216,17 +221,28 @@ static int test_qlinear_package(void) {
     CHECK(safetensors_save(mixed_weights_path, &source_file) == 0);
     safetensors_free(&source_file);
 
-    CHECK(volvoxai_engine_init(source_config_path, source_weights_path) == 0);
+    CHECK(volvoxai_engine_init(source_graph_path, source_weights_path) == 0);
     int helper_scale_count = 0;
     CHECK(volvoxai_engine_ptq_materialize_weight_i8(
-              "weight", "scratch.weight.i8", "scratch.weight.scale", 0,
-              &helper_scale_count) == 0);
+              "weight", "scratch.weight.i8", "scratch.weight.scale",
+              "scratch.weight.zero_point", 0, &helper_scale_count) == 0);
     CHECK(helper_scale_count == 2);
     long helper_count = 0;
     int helper_dtype = -1;
     CHECK(volvoxai_engine_tensor_info_ex("scratch.weight.i8", &helper_count,
                                          NULL, NULL, &helper_dtype, NULL) == 0);
     CHECK(helper_count == 6 && helper_dtype == VOLVOXAI_DTYPE_I8);
+    CHECK(volvoxai_engine_tensor_info_ex(
+              "scratch.weight.zero_point", &helper_count, NULL, NULL,
+              &helper_dtype, NULL) == 0);
+    CHECK(helper_count == 2 && helper_dtype == VOLVOXAI_DTYPE_I8);
+    int8_t helper_zero_points[2] = {1, 1};
+    CHECK(volvoxai_engine_copy_tensor_raw(
+              "scratch.weight.zero_point", helper_zero_points,
+              sizeof(helper_zero_points)) == 0);
+    CHECK(helper_zero_points[0] == 0 && helper_zero_points[1] == 0);
+    CHECK(volvoxai_engine_remove_model_tensor(
+              "scratch.weight.zero_point") == 0);
     CHECK(volvoxai_engine_remove_model_tensor("scratch.weight.scale") == 0);
     CHECK(volvoxai_engine_remove_model_tensor("scratch.weight.i8") == 0);
     CHECK(volvoxai_engine_set_input_raw("x", VOLVOXAI_DTYPE_F32,
@@ -241,8 +257,8 @@ static int test_qlinear_package(void) {
     CHECK(volvoxai_engine_adapter_activate("ptq-active") == 0);
     CHECK(volvoxai_ptq_plan_create() == NULL);
     CHECK(volvoxai_engine_ptq_materialize_weight_i8(
-              "weight", "active.weight.i8", "active.weight.scale", 0,
-              NULL) != 0);
+              "weight", "active.weight.i8", "active.weight.scale",
+              "active.weight.zero_point", 0, NULL) != 0);
     CHECK(volvoxai_engine_tensor_info("active.weight.i8", NULL, NULL, NULL) != 0);
     CHECK(volvoxai_engine_adapter_activate("") == 0);
     VolvoxAIPTQPlan* adapter_stale = volvoxai_ptq_plan_create();
@@ -323,26 +339,29 @@ static int test_qlinear_package(void) {
     CHECK(closef(output_params.observed_max, 8.25f, 1.0e-6f));
 
     volvoxai_ptq_package_options_t package = VOLVOXAI_PTQ_PACKAGE_OPTIONS_INIT;
-    package.template_config_path = invalid_template_path;
+    package.template_graph_path = invalid_template_path;
     package.source_weights_path = source_weights_path;
-    package.output_config_path = output_config_path;
+    package.output_graph_path = output_graph_path;
     package.output_weights_path = output_weights_path;
     CHECK(volvoxai_ptq_plan_write_package(plan, &package) != 0);
-    CHECK(fopen(output_config_path, "rb") == NULL);
+    CHECK(fopen(output_graph_path, "rb") == NULL);
     CHECK(fopen(output_weights_path, "rb") == NULL);
-    package.template_config_path = wrong_layout_template_path;
+    package.template_graph_path = wrong_layout_template_path;
     CHECK(volvoxai_ptq_plan_write_package(plan, &package) != 0);
-    package.template_config_path = missing_dependency_template_path;
+    package.template_graph_path = missing_dependency_template_path;
     CHECK(volvoxai_ptq_plan_write_package(plan, &package) != 0);
-    package.template_config_path = namespace_collision_template_path;
+    package.template_graph_path = namespace_collision_template_path;
     CHECK(volvoxai_ptq_plan_write_package(plan, &package) != 0);
-    package.template_config_path = bias_descriptor_template_path;
+    package.template_graph_path = bias_descriptor_template_path;
     CHECK(volvoxai_ptq_plan_write_package(plan, &package) != 0);
-    package.template_config_path = mixed_template_path;
+    package.template_graph_path = template_graph_path;
+    package.source_weights_path = legacy_weights_path;
+    CHECK(volvoxai_ptq_plan_write_package(plan, &package) != 0);
+    package.template_graph_path = mixed_template_path;
     package.source_weights_path = mixed_weights_path;
     CHECK(volvoxai_ptq_plan_write_package(plan, &package) != 0);
     package.source_weights_path = source_weights_path;
-    package.template_config_path = template_config_path;
+    package.template_graph_path = template_graph_path;
 #if defined(__unix__) || defined(__APPLE__) || defined(__ANDROID__)
     int start_pipe[2];
     CHECK(pipe(start_pipe) == 0);
@@ -374,10 +393,18 @@ static int test_qlinear_package(void) {
 #else
     CHECK(volvoxai_ptq_plan_write_package(plan, &package) == 0);
 #endif
-    CHECK(file_contains(output_config_path,
+    CHECK(file_contains(output_graph_path,
+                        "\"format\":\"volvox-graph/v1\""));
+    CHECK(file_contains(output_graph_path,
                         "\"samples\":[\"receipt-0\",\"receipt-1\"]"));
-    CHECK(!file_contains(output_config_path, "\"weight\":{}"));
-    CHECK(!file_contains(output_config_path, "\"bias\":{}"));
+    CHECK(file_contains(output_graph_path,
+                        "\"format\":\"volvox-affine-safetensors/v1\""));
+    CHECK(file_contains(output_graph_path, "\"scale_tensor\":"));
+    CHECK(file_contains(output_graph_path, "\"zero_point_tensor\":"));
+    CHECK(!file_contains(output_graph_path, "\"weights_quantization\":"));
+    CHECK(!file_contains(output_graph_path, "\"outputs_quantization\":"));
+    CHECK(!file_contains(output_graph_path, "\"weight\":{}"));
+    CHECK(!file_contains(output_graph_path, "\"bias\":{}"));
     /* Safe authoring does not replace an existing package implicitly. */
     CHECK(volvoxai_ptq_plan_write_package(plan, &package) != 0);
     volvoxai_ptq_plan_destroy(plan);
@@ -399,7 +426,7 @@ static int test_qlinear_package(void) {
     CHECK(safetensors_find_tensor(&materialized, "other.bias") != NULL);
     safetensors_free(&materialized);
 
-    CHECK(volvoxai_engine_init(output_config_path, output_weights_path) == 0);
+    CHECK(volvoxai_engine_init(output_graph_path, output_weights_path) == 0);
     int8_t quantized_input[6] = {0};
     int8_t quantized_output[4] = {0};
     CHECK(volvoxai_ptq_quantize_f32(sample0, 6, &input_params,
@@ -418,11 +445,11 @@ static int test_qlinear_package(void) {
     }
     volvoxai_engine_shutdown();
 
-    const char* stale_config_path = "/tmp/volvox-ptq-stale-output.json";
+    const char* stale_graph_path = "/tmp/volvox-ptq-stale-output.graph.json";
     const char* stale_weights_path = "/tmp/volvox-ptq-stale-output.safetensors";
-    remove(stale_config_path);
+    remove(stale_graph_path);
     remove(stale_weights_path);
-    CHECK(volvoxai_engine_init(source_config_path, source_weights_path) == 0);
+    CHECK(volvoxai_engine_init(source_graph_path, source_weights_path) == 0);
     VolvoxAIPTQPlan* stale_plan = volvoxai_ptq_plan_create();
     CHECK(stale_plan != NULL);
     tensor_spec.tensor_name = "x";
@@ -434,22 +461,22 @@ static int test_qlinear_package(void) {
     CHECK(volvoxai_engine_ptq_plan_calibrate_sample(
               stale_plan, "before-reload", &binding, 1) == 0);
     volvoxai_engine_shutdown();
-    CHECK(volvoxai_engine_init(source_config_path, source_weights_path) == 0);
+    CHECK(volvoxai_engine_init(source_graph_path, source_weights_path) == 0);
     CHECK(volvoxai_engine_ptq_plan_calibrate_sample(
               stale_plan, "after-reload", &binding, 1) != 0);
     CHECK(volvoxai_ptq_plan_tensor_params(stale_plan, "x", &input_params) != 0);
     CHECK(volvoxai_ptq_plan_calibration_samples(stale_plan) == 0);
-    package.template_config_path = template_config_path;
-    package.output_config_path = stale_config_path;
+    package.template_graph_path = template_graph_path;
+    package.output_graph_path = stale_graph_path;
     package.output_weights_path = stale_weights_path;
     CHECK(volvoxai_ptq_plan_write_package(stale_plan, &package) != 0);
-    CHECK(fopen(stale_config_path, "rb") == NULL);
+    CHECK(fopen(stale_graph_path, "rb") == NULL);
     CHECK(fopen(stale_weights_path, "rb") == NULL);
     volvoxai_ptq_plan_destroy(stale_plan);
     volvoxai_engine_shutdown();
 
-    remove(source_config_path);
-    remove(template_config_path);
+    remove(source_graph_path);
+    remove(template_graph_path);
     remove(invalid_template_path);
     remove(wrong_layout_template_path);
     remove(missing_dependency_template_path);
@@ -457,31 +484,32 @@ static int test_qlinear_package(void) {
     remove(bias_descriptor_template_path);
     remove(mixed_template_path);
     remove(source_weights_path);
+    remove(legacy_weights_path);
     remove(mixed_weights_path);
-    remove(output_config_path);
+    remove(output_graph_path);
     remove(output_weights_path);
-    remove(stale_config_path);
+    remove(stale_graph_path);
     remove(stale_weights_path);
     return 0;
 }
 
 static int test_qconv2d_package(void) {
-    const char* source_config_path = "/tmp/volvox-ptq-qconv-source.json";
-    const char* template_config_path = "/tmp/volvox-ptq-qconv-template.json";
+    const char* source_graph_path = "/tmp/volvox-ptq-qconv-source.graph.json";
+    const char* template_graph_path = "/tmp/volvox-ptq-qconv-template.graph.json";
     const char* source_weights_path = "/tmp/volvox-ptq-qconv-source.safetensors";
-    const char* output_config_path = "/tmp/volvox-ptq-qconv-output.json";
+    const char* output_graph_path = "/tmp/volvox-ptq-qconv-output.graph.json";
     const char* output_weights_path = "/tmp/volvox-ptq-qconv-output.safetensors";
     const char* source_config =
-        "{\"inputs\":{\"cx\":{\"shape\":[1,3,3,1],\"dtype\":\"float32\"}},"
+        "{\"format\":\"volvox-graph/v1\",\"inputs\":{\"cx\":{\"shape\":[1,3,3,1],\"dtype\":\"float32\"}},"
         "\"nodes\":[{\"opType\":\"Conv2D\","
         "\"inputs\":{\"input\":\"cx\",\"weight\":\"conv.weight\","
         "\"bias\":\"conv.bias\"},\"outputs\":{\"out\":\"cy\"},"
         "\"outputs_shape\":{\"out\":[1,2,2,2]},\"params\":{"
         "\"data_layout\":\"NHWC\",\"weight_layout\":\"OHWI\","
         "\"stride\":[1,1],\"padding\":[0,0],\"dilation\":[1,1],"
-        "\"groups\":1}}]}";
+        "\"groups\":1}}],\"outputs\":[\"cy\"]}";
     const char* target_template =
-        "{\"inputs\":{\"cx\":{\"shape\":[1,3,3,1],\"dtype\":\"int8\"}},"
+        "{\"format\":\"volvox-graph/v1\",\"inputs\":{\"cx\":{\"shape\":[1,3,3,1],\"dtype\":\"int8\"}},"
         "\"nodes\":[{\"opType\":\"QConv2D\","
         "\"inputs\":{\"input\":\"cx\",\"weight\":\"conv.weight.i8\","
         "\"bias\":\"conv.bias.i32\"},\"outputs\":{\"out\":\"cy\"},"
@@ -489,7 +517,7 @@ static int test_qconv2d_package(void) {
         "\"outputs_dtype\":{\"out\":\"int8\"},\"params\":{"
         "\"data_layout\":\"NHWC\",\"weight_layout\":\"OHWI\","
         "\"stride\":[1,1],\"padding\":[0,0],\"dilation\":[1,1],"
-        "\"groups\":1}}]}";
+        "\"groups\":1}}],\"outputs\":[\"cy\"]}";
     const int weight_shape[4] = {2, 2, 2, 1};
     const int bias_shape[1] = {2};
     const float weight[8] = {1.0f, 0.0f, 0.0f, -1.0f,
@@ -501,13 +529,13 @@ static int test_qconv2d_package(void) {
     const float sample1[9] = {-1.0f, -2.0f, -3.0f,
                               -4.0f, -5.0f, -6.0f,
                               -7.0f, -8.0f, -9.0f};
-    remove(source_config_path);
-    remove(template_config_path);
+    remove(source_graph_path);
+    remove(template_graph_path);
     remove(source_weights_path);
-    remove(output_config_path);
+    remove(output_graph_path);
     remove(output_weights_path);
-    CHECK(write_text(source_config_path, source_config) == 0);
-    CHECK(write_text(template_config_path, target_template) == 0);
+    CHECK(write_text(source_graph_path, source_config) == 0);
+    CHECK(write_text(template_graph_path, target_template) == 0);
     SafetensorsFile source_file;
     CHECK(safetensors_init_empty(&source_file, SAFETENSORS_OPEN_READ_WRITE) == 0);
     CHECK(safetensors_add_tensor(&source_file, "conv.weight", SAFETENSORS_DTYPE_F32,
@@ -517,7 +545,7 @@ static int test_qconv2d_package(void) {
     CHECK(safetensors_save(source_weights_path, &source_file) == 0);
     safetensors_free(&source_file);
 
-    CHECK(volvoxai_engine_init(source_config_path, source_weights_path) == 0);
+    CHECK(volvoxai_engine_init(source_graph_path, source_weights_path) == 0);
     VolvoxAIPTQPlan* plan = volvoxai_ptq_plan_create();
     CHECK(plan != NULL);
     volvoxai_ptq_tensor_spec_t tensor = VOLVOXAI_PTQ_TENSOR_SPEC_INIT;
@@ -526,7 +554,7 @@ static int test_qconv2d_package(void) {
     tensor.tensor_name = "cy";
     CHECK(volvoxai_ptq_plan_add_tensor(plan, &tensor) == 0);
     volvoxai_ptq_layer_spec_t layer = VOLVOXAI_PTQ_LAYER_SPEC_INIT;
-    layer.kind = VOLVOXAI_PTQ_LAYER_QCONV2D;
+    layer.kind = VX_PTQ_LAYER_QCONV2D;
     layer.node_index = 0;
     layer.input_tensor_name = "cx";
     layer.output_tensor_name = "cy";
@@ -549,15 +577,15 @@ static int test_qconv2d_package(void) {
     CHECK(volvoxai_ptq_plan_tensor_params(plan, "cx", &input_params) == 0);
     CHECK(volvoxai_ptq_plan_tensor_params(plan, "cy", &output_params) == 0);
     volvoxai_ptq_package_options_t package = VOLVOXAI_PTQ_PACKAGE_OPTIONS_INIT;
-    package.template_config_path = template_config_path;
+    package.template_graph_path = template_graph_path;
     package.source_weights_path = source_weights_path;
-    package.output_config_path = output_config_path;
+    package.output_graph_path = output_graph_path;
     package.output_weights_path = output_weights_path;
     CHECK(volvoxai_ptq_plan_write_package(plan, &package) == 0);
     volvoxai_ptq_plan_destroy(plan);
     volvoxai_engine_shutdown();
 
-    CHECK(volvoxai_engine_init(output_config_path, output_weights_path) == 0);
+    CHECK(volvoxai_engine_init(output_graph_path, output_weights_path) == 0);
     int8_t quantized_input[9] = {0};
     int8_t quantized_output[8] = {0};
     CHECK(volvoxai_ptq_quantize_f32(sample0, 9, &input_params,
@@ -578,10 +606,10 @@ static int test_qconv2d_package(void) {
         CHECK(closef(dequantized, expected_output[index], 0.7f));
     }
     volvoxai_engine_shutdown();
-    remove(source_config_path);
-    remove(template_config_path);
+    remove(source_graph_path);
+    remove(template_graph_path);
     remove(source_weights_path);
-    remove(output_config_path);
+    remove(output_graph_path);
     remove(output_weights_path);
     return 0;
 }
@@ -591,20 +619,20 @@ static int test_rejects_noncanonical_source_layouts(void) {
     const char* linear_path = "/tmp/volvox-ptq-layout-linear.json";
     const char* conv_path = "/tmp/volvox-ptq-layout-conv.json";
     const char* linear_config =
-        "{\"inputs\":{\"x\":{\"shape\":[1,2],\"dtype\":\"float32\"}},"
+        "{\"format\":\"volvox-graph/v1\",\"inputs\":{\"x\":{\"shape\":[1,2],\"dtype\":\"float32\"}},"
         "\"nodes\":[{\"opType\":\"Linear\","
         "\"inputs\":{\"input\":\"x\",\"weight\":\"w\",\"bias\":\"b\"},"
         "\"outputs\":{\"out\":\"y\"},\"outputs_shape\":{\"out\":[1,2]},"
-        "\"params\":{\"weight_layout\":\"IN_OUT\"}}]}";
+        "\"params\":{\"weight_layout\":\"IN_OUT\"}}],\"outputs\":[\"y\"]}";
     const char* conv_config =
-        "{\"inputs\":{\"cx\":{\"shape\":[1,2,2,1],\"dtype\":\"float32\"}},"
+        "{\"format\":\"volvox-graph/v1\",\"inputs\":{\"cx\":{\"shape\":[1,2,2,1],\"dtype\":\"float32\"}},"
         "\"nodes\":[{\"opType\":\"Conv2D\","
         "\"inputs\":{\"input\":\"cx\",\"weight\":\"cw\",\"bias\":\"cb\"},"
         "\"outputs\":{\"out\":\"cy\"},"
         "\"outputs_shape\":{\"out\":[1,2,2,1]},\"params\":{"
         "\"data_layout\":\"NHWC\",\"weight_layout\":\"HWIO\","
         "\"stride\":[1,1],\"padding\":[0,0],\"dilation\":[1,1],"
-        "\"groups\":1}}]}";
+        "\"groups\":1}}],\"outputs\":[\"cy\"]}";
     const int matrix_shape[2] = {2, 2};
     const int vector_shape[1] = {2};
     const int conv_shape[4] = {1, 1, 1, 1};
@@ -660,7 +688,7 @@ static int test_rejects_noncanonical_source_layouts(void) {
     CHECK(volvoxai_ptq_plan_add_tensor(plan, &tensor) == 0);
     tensor.tensor_name = "cy";
     CHECK(volvoxai_ptq_plan_add_tensor(plan, &tensor) == 0);
-    layer.kind = VOLVOXAI_PTQ_LAYER_QCONV2D;
+    layer.kind = VX_PTQ_LAYER_QCONV2D;
     layer.input_tensor_name = "cx";
     layer.output_tensor_name = "cy";
     layer.source_weight_name = "cw";
@@ -677,9 +705,18 @@ static int test_rejects_noncanonical_source_layouts(void) {
 }
 
 int main(void) {
+    VxEngineState* state = (VxEngineState*)calloc(1, sizeof(*state));
+    VxEngineStateScope state_scope;
+    CHECK(state != NULL);
+    CHECK(vx_engine_state_init(state) == 0);
+    state_scope = vx_engine_state_scope_enter(state);
     CHECK(test_qlinear_package() == 0);
     CHECK(test_qconv2d_package() == 0);
     CHECK(test_rejects_noncanonical_source_layouts() == 0);
+    volvoxai_engine_shutdown();
+    vx_engine_state_scope_leave(state_scope);
+    vx_engine_state_deinit(state);
+    free(state);
     puts("native PTQ package tests passed");
     return 0;
 }

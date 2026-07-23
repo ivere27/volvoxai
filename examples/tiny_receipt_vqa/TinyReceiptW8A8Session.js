@@ -1,8 +1,7 @@
 /*
  * Example typed host session for a materialized TinyReceiptVQA W8A8 package.
  *
- * This deliberately lives outside the legacy TinyReceipt model builders.  A
- * materialized package exposes two ordinary Volvox graphs: an I32/QArgMax
+ * A materialized package exposes two ordinary Volvox graphs: an I32/QArgMax
  * router and one I32/QArgMax explicit-family graph.  Keeping the sequencing
  * here makes the model-format contract equally usable by the JS CPU, WASM,
  * and WebGPU graph executors without slipping back to an F32-logit host path.
@@ -25,14 +24,6 @@ function isReadOnlySafetensorsCache(value) {
   return !!value && typeof value === 'object' &&
     typeof value.load === 'function' && typeof value.clear === 'function' &&
     Number.isInteger(value.size) && value.size >= 0;
-}
-
-async function createReadOnlySafetensorsCache() {
-  // Source-checkout tools run through tsx and can load GraphLoader.ts directly.
-  // Browser examples inject the cache exported by the built bundle, so they
-  // never request repository TypeScript.
-  const { ReadOnlySafetensorsCache } = await import('../../ts/core/GraphLoader.ts');
-  return new ReadOnlySafetensorsCache();
 }
 
 function nonEmptyString(value, label) {
@@ -71,10 +62,8 @@ function assetUrl(manifest, asset, label) {
   return new URL(assetPath(asset, label), new URL('.', manifest)).toString();
 }
 
-function inputAlias(value, fallback, label) {
-  if (typeof value === 'string') return nonEmptyString(value, label);
-  if (isRecord(value)) return value.name == null ? fallback : nonEmptyString(value.name, `${label}.name`);
-  fail(`${label} must be an input alias string or descriptor object.`);
+function inputName(value, label) {
+  return nonEmptyString(value, label);
 }
 
 function inputTensor(graph, name, label) {
@@ -111,7 +100,7 @@ function assertQArgMaxOutput(graph, name, shape, label) {
     fail(`${label} '${name}' must be an unquantized I32 [${shape.join(',')}] tensor.`);
   }
   if (Array.isArray(graph?.outputNames) && !graph.outputNames.includes(name)) {
-    fail(`${label} '${name}' must be declared in the blueprint outputs list.`);
+    fail(`${label} '${name}' must be declared in the graph document outputs list.`);
   }
   const producer = graph?.nodes?.find((node) => Object.values(node.outputs || {}).some((output) => output?.name === name));
   if (!producer || producer.opType !== 'QArgMax') {
@@ -144,11 +133,12 @@ function validateFamilyGraph(graph, family, preprocessing, expectedQLength) {
 }
 
 function cleanText(value) {
-  // Equivalent to the source `re.sub(r"\\s+", " ", str(value).replace("\\n", " ")).strip()`
-  // for JavaScript string inputs. `for...of` below then walks Unicode code
-  // points, matching Python's CharVocab character indexing rather than UTF-8
-  // bytes or the generic BPE tokenizer.
-  return String(value ?? '').replace(/\n/g, ' ').replace(/\s+/gu, ' ').trim();
+  // Normalize canonically, then apply the source
+  // `re.sub(r"\\s+", " ", str(value).replace("\\n", " ")).strip()` policy.
+  // `for...of` below walks Unicode code points, matching Python's CharVocab
+  // character indexing rather than UTF-8 bytes or the generic BPE tokenizer.
+  return String(value ?? '').normalize('NFC')
+    .replace(/\n/g, ' ').replace(/\s+/gu, ' ').trim();
 }
 
 function clamp(value, minimum, maximum) {
@@ -342,8 +332,8 @@ function normalizeManifest(manifest, url) {
       manifest.preprocessing.color_space !== 'grayscale' ||
       manifest.preprocessing.resize.resample !== 'bilinear' ||
       manifest.preprocessing.normalization !== 'minus-one-one' ||
-      (manifest.preprocessing.model_input_layout != null && manifest.preprocessing.model_input_layout !== 'NHWC') ||
-      (manifest.preprocessing.model_input_dtype != null && manifest.preprocessing.model_input_dtype !== 'float32')) {
+      manifest.preprocessing.model_input_layout !== 'NHWC' ||
+      manifest.preprocessing.model_input_dtype !== 'float32') {
     fail('package preprocessing must be grayscale + bilinear + minus-one-one F32 NHWC.');
   }
   const width = manifest.preprocessing.resize.width;
@@ -355,16 +345,16 @@ function normalizeManifest(manifest, url) {
 
   if (!isRecord(manifest.router) || !isRecord(manifest.router.inputs)) fail('package manifest requires router.inputs.');
   normalized.router = Object.freeze({
-    configUrl: assetUrl(url, manifest.router.config, 'router.config'),
+    graphUrl: assetUrl(url, manifest.router.graph, 'router.graph'),
     outputName: nonEmptyString(manifest.router.output_name, 'router.output_name'),
     inputs: Object.freeze({
-      qIds: inputAlias(manifest.router.inputs.q_ids, 'q_ids', 'router.inputs.q_ids'),
-      routerKeep: inputAlias(manifest.router.inputs.router_keep, 'router_keep', 'router.inputs.router_keep'),
+      qIds: inputName(manifest.router.inputs.q_ids, 'router.inputs.q_ids'),
+      routerKeep: inputName(manifest.router.inputs.router_keep, 'router.inputs.router_keep'),
     }),
   });
 
   if (!isRecord(manifest.explicit_families)) fail('package manifest requires explicit_families.');
-  const declaredOrder = manifest.family_order == null ? FAMILY_ORDER : manifest.family_order;
+  const declaredOrder = manifest.family_order;
   if (!Array.isArray(declaredOrder) || declaredOrder.length !== FAMILY_ORDER.length ||
       declaredOrder.some((name, index) => name !== FAMILY_ORDER[index])) {
     fail(`package family_order must be ${JSON.stringify(FAMILY_ORDER)}.`);
@@ -377,19 +367,19 @@ function normalizeManifest(manifest, url) {
   for (const name of FAMILY_ORDER) {
     const definition = manifest.explicit_families[name];
     if (!isRecord(definition) || !isRecord(definition.interface) || !isRecord(definition.interface.inputs)) {
-      fail(`explicit_families.${name} requires config and interface.inputs.`);
+      fail(`explicit_families.${name} requires graph and interface.inputs.`);
     }
     const inputs = definition.interface.inputs;
     normalized.families.set(name, Object.freeze({
-      configUrl: assetUrl(url, definition.config, `explicit_families.${name}.config`),
+      graphUrl: assetUrl(url, definition.graph, `explicit_families.${name}.graph`),
       outputName: nonEmptyString(definition.interface.output_name, `explicit_families.${name}.interface.output_name`),
       inputs: Object.freeze({
-        image: inputAlias(inputs.image, 'image', `explicit_families.${name}.interface.inputs.image`),
-        qIds: inputAlias(inputs.q_ids, 'q_ids', `explicit_families.${name}.interface.inputs.q_ids`),
-        routerKeep: inputAlias(inputs.router_keep, 'router_keep', `explicit_families.${name}.interface.inputs.router_keep`),
-        memoryKeep: inputAlias(inputs.memory_keep, 'memory_keep', `explicit_families.${name}.interface.inputs.memory_keep`),
-        yIds: inputAlias(inputs.y_ids, 'y_ids', `explicit_families.${name}.interface.inputs.y_ids`),
-        yKeep: inputAlias(inputs.y_keep, 'y_keep', `explicit_families.${name}.interface.inputs.y_keep`),
+        image: inputName(inputs.image, `explicit_families.${name}.interface.inputs.image`),
+        qIds: inputName(inputs.q_ids, `explicit_families.${name}.interface.inputs.q_ids`),
+        routerKeep: inputName(inputs.router_keep, `explicit_families.${name}.interface.inputs.router_keep`),
+        memoryKeep: inputName(inputs.memory_keep, `explicit_families.${name}.interface.inputs.memory_keep`),
+        yIds: inputName(inputs.y_ids, `explicit_families.${name}.interface.inputs.y_ids`),
+        yKeep: inputName(inputs.y_keep, `explicit_families.${name}.interface.inputs.y_keep`),
       }),
     }));
   }
@@ -426,22 +416,23 @@ async function fetchJson(fetchImpl, url, label) {
  * Host-side session for a materialized TinyReceiptVQA W8A8 package.
  *
  * ```js
- * const runtime = await VolvoxAI.init('auto');
+ * const runtime = await VolvoxAI.createRuntime({ backends: ['webgpu', 'wasm', 'cpu'] });
+ * const graphLoader = ({ weightsUrl, graphUrl, fetch, safetensorsCache }) =>
+ *   GraphLoader.load(new Graph(), weightsUrl, { graphUrl, fetch, safetensorsCache });
  * const session = await TinyReceiptW8A8Session.load({ runtime,
+ *   graphLoader,
  *   packageUrl: '/models/tiny-receipt/package_manifest.json' });
  * const result = await session.generate({ image: imageData, prompt: 'phone number?' });
  * ```
  *
- * `runtime` is an ordinary `VolvoxAI` inference instance.  A custom
- * `graphLoader`, `compileGraph`, and `fetch` are accepted for Node resource
- * adapters and embedding hosts; none import training code or a Node-only
- * image dependency into the browser inference entry.
+ * `runtime` is a Runtime handle. A custom `graphLoader` and `fetch` can adapt
+ * package I/O without importing training code or a Node-only image dependency.
  */
 export class TinyReceiptW8A8Session {
   static async load(options = {}) {
-    const runtime = options.runtime || options.volvox;
-    if (!runtime || typeof runtime.loadGraph !== 'function' || typeof runtime.compile !== 'function') {
-      fail('load requires a VolvoxAI inference runtime with loadGraph() and compile().');
+    const runtime = options.runtime;
+    if (!runtime || typeof runtime.createModel !== 'function') {
+      fail('load requires a Runtime handle with createModel().');
     }
     const url = manifestUrl(options.packageUrl);
     const fetchImpl = options.fetch || globalThis.fetch?.bind(globalThis);
@@ -449,34 +440,36 @@ export class TinyReceiptW8A8Session {
     const packageInfo = normalizeManifest(rawManifest, url);
     const rawVocab = await fetchJson(fetchImpl, packageInfo.vocabUrl, 'vocab.json');
     const vocab = new TinyReceiptCharVocab(rawVocab?.itos, packageInfo.tokenIds);
-    const safetensorsCache = options.safetensorsCache || await createReadOnlySafetensorsCache();
-    if (!isReadOnlySafetensorsCache(safetensorsCache)) {
+    const safetensorsCache = options.safetensorsCache ?? null;
+    if (safetensorsCache != null && !isReadOnlySafetensorsCache(safetensorsCache)) {
       fail('safetensorsCache must be a ReadOnlySafetensorsCache when provided.');
     }
-    const graphLoader = options.graphLoader || (async ({ weightsUrl, configUrl }) =>
-      runtime.loadGraph(weightsUrl, { configUrl, fetch: fetchImpl, safetensorsCache }));
-    if (typeof graphLoader !== 'function') fail('graphLoader must be a function when provided.');
-    const compileGraph = options.compileGraph || ((graph) =>
-      typeof runtime.compileDetached === 'function'
-        ? runtime.compileDetached(graph)
-        : runtime.compile(graph));
-    if (typeof compileGraph !== 'function') fail('compileGraph must be a function when provided.');
+    const graphLoader = options.graphLoader;
+    if (typeof graphLoader !== 'function') fail('load requires a graphLoader function.');
     return new TinyReceiptW8A8Session({
-      runtime, packageInfo, vocab, graphLoader, compileGraph, safetensorsCache,
+      runtime,
+      packageInfo,
+      vocab,
+      graphLoader,
+      compileOptions: options.compileOptions,
+      fetchImpl,
+      safetensorsCache,
     });
   }
 
-  constructor({ runtime, packageInfo, vocab, graphLoader, compileGraph, safetensorsCache }) {
+  constructor({ runtime, packageInfo, vocab, graphLoader, compileOptions, fetchImpl, safetensorsCache }) {
     this.runtime = runtime;
     this.package = packageInfo;
     this.vocab = vocab;
+    this._fetch = fetchImpl;
     this._safetensorsCache = safetensorsCache;
     this._graphLoader = graphLoader;
-    this._compileGraph = compileGraph;
+    this._compileOptions = compileOptions || {};
     this._graphs = new Map();
-    this._executors = new Map();
-    this._executorGraphs = new WeakMap();
+    this._contexts = new Map();
     this._tail = Promise.resolve();
+    this._closed = false;
+    this._closePromise = null;
   }
 
   _exclusive(task) {
@@ -486,14 +479,17 @@ export class TinyReceiptW8A8Session {
     return previous.catch(() => undefined).then(task).finally(release);
   }
 
-  async _loadGraph(key, configUrl, kind, family = null) {
+  async _loadGraph(key, graphUrl, kind, family = null) {
+    if (this._closed) fail('session is closed.');
     let graph = this._graphs.get(key);
     if (!graph) {
       graph = await this._graphLoader({
         weightsUrl: this.package.weightsUrl,
-        configUrl,
+        graphUrl,
         kind,
         family,
+        fetch: this._fetch,
+        safetensorsCache: this._safetensorsCache,
       });
       if (!graph || !graph.tensors || !Array.isArray(graph.nodes)) fail(`${kind} graph loader returned an invalid graph.`);
       this._graphs.set(key, graph);
@@ -501,58 +497,56 @@ export class TinyReceiptW8A8Session {
     return graph;
   }
 
-  async _executorFor(key, graph) {
-    const cached = this._executors.get(key);
-    const boundGraph = cached?.executor?.graph || this._executorGraphs.get(cached?.executor) || cached?.graph;
-    if (cached && boundGraph === graph) {
-      return cached.executor;
+  async _contextFor(key, graph, changedInputs = []) {
+    const cached = this._contexts.get(key);
+    if (cached?.graph === graph) return cached.context;
+    const model = this.runtime.createModel(graph);
+    let compiled;
+    let context;
+    try {
+      compiled = await model.compile(this._compileOptions);
+      context = await compiled.createContext({
+        decode: { changedInputs, rowMode: 'auto' },
+      });
+    } catch (error) {
+      await context?.close();
+      await compiled?.close();
+      await model.close();
+      throw error;
     }
-    const executor = await this._compileGraph(graph);
-    if (!executor || typeof executor.execute !== 'function') fail('compiled graph executor must expose execute(inputs).');
-    this._executorGraphs.set(executor, graph);
-    this._executors.set(key, { executor, graph });
-    return executor;
+    this._contexts.set(key, { graph, model, compiled, context });
+    return context;
   }
 
-  async _executeOutput(executor, graph, outputName, inputs, options = undefined) {
-    const executionResult = await executor.execute(inputs, options);
-    return this._outputFromExecution(executor, graph, outputName, executionResult);
+  async _executeOutput(context, outputName, inputs, options = undefined) {
+    const executionResult = await context.execute(inputs, options);
+    return this._outputFromExecution(outputName, executionResult);
   }
 
-  async _outputFromExecution(executor, graph, outputName, executionResult,
+  async _outputFromExecution(outputName, executionResult,
     { elementOffset = null, elementCount = null } = {}) {
-    let output = executionResult?.[outputName];
-    if (output == null && elementOffset != null && elementCount != null &&
-        typeof executor.readBufferRange === 'function') {
-      const outputTensor = tensor(graph, outputName, 'graph output');
-      if (outputTensor.dtype !== 'int32' || !Number.isInteger(elementOffset) ||
-          elementOffset < 0 || !Number.isInteger(elementCount) || elementCount <= 0 ||
-          elementOffset + elementCount > outputTensor.sizeBytes / Int32Array.BYTES_PER_ELEMENT) {
-        fail(`graph output '${outputName}' requested an invalid I32 element range.`);
+    try {
+      let output = await executionResult.output(outputName).read();
+      if (!(output instanceof Int32Array)) {
+        fail(`graph output '${outputName}' must be read as raw Int32 QArgMax IDs.`);
       }
-      const gpuBuffer = executor.gpuBuffers?.get?.(outputName) || executionResult;
-      if (!gpuBuffer) fail(`WebGPU graph did not expose output buffer '${outputName}'.`);
-      output = await executor.readBufferRange(
-        gpuBuffer,
-        elementOffset * Int32Array.BYTES_PER_ELEMENT,
-        elementCount * Int32Array.BYTES_PER_ELEMENT,
-        outputTensor.dtype,
-      );
-    } else if (output == null && typeof executor.readBuffer === 'function') {
-      const outputTensor = tensor(graph, outputName, 'graph output');
-      const gpuBuffer = executor.gpuBuffers?.get?.(outputName) || executionResult;
-      if (!gpuBuffer) fail(`WebGPU graph did not expose output buffer '${outputName}'.`);
-      output = await executor.readBuffer(gpuBuffer, outputTensor.sizeBytes, outputTensor.dtype);
+      if (elementOffset != null || elementCount != null) {
+        if (!Number.isInteger(elementOffset) || elementOffset < 0 ||
+            !Number.isInteger(elementCount) || elementCount <= 0 ||
+            elementOffset + elementCount > output.length) {
+          fail(`graph output '${outputName}' requested an invalid I32 element range.`);
+        }
+        output = output.slice(elementOffset, elementOffset + elementCount);
+      }
+      return output;
+    } finally {
+      await executionResult.close();
     }
-    if (!(output instanceof Int32Array)) {
-      fail(`graph output '${outputName}' must be read as raw Int32 QArgMax IDs.`);
-    }
-    return output;
   }
 
   async _routeImpl(prompt) {
     const router = this.package.router;
-    const graph = await this._loadGraph('router', router.configUrl, 'router');
+    const graph = await this._loadGraph('router', router.graphUrl, 'router');
     const abi = validateRouterGraph(graph, router);
     const encoded = this.vocab.encodeQuestion(prompt, abi.qLength);
     const qIds = new Int32Array(abi.qLength);
@@ -560,8 +554,8 @@ export class TinyReceiptW8A8Session {
     qIds.set(encoded);
     const routerKeep = new Int32Array(abi.qLength);
     for (let index = 0; index < encoded.length; index++) routerKeep[index] = 1;
-    const executor = await this._executorFor('router', graph);
-    const result = await this._executeOutput(executor, graph, router.outputName, {
+    const context = await this._contextFor('router', graph);
+    const result = await this._executeOutput(context, router.outputName, {
       [router.inputs.qIds]: qIds,
       [router.inputs.routerKeep]: routerKeep,
     });
@@ -590,12 +584,12 @@ export class TinyReceiptW8A8Session {
     }
     const uniqueFamilies = [...new Set(selected)];
     const router = this.package.router;
-    const routerGraph = await this._loadGraph('router', router.configUrl, 'router');
+    const routerGraph = await this._loadGraph('router', router.graphUrl, 'router');
     const routerAbi = validateRouterGraph(routerGraph, router);
     for (const family of uniqueFamilies) {
       const definition = this.package.families.get(family);
       const graph = await this._loadGraph(
-        `family:${family}`, definition.configUrl, 'explicit-family', family,
+        `family:${family}`, definition.graphUrl, 'explicit-family', family,
       );
       validateFamilyGraph(graph, definition, this.package.preprocessing, routerAbi.qLength);
     }
@@ -607,8 +601,7 @@ export class TinyReceiptW8A8Session {
 
   /**
    * Fetch and assemble the router plus selected family graphs ahead of the
-   * first request. Executor compilation remains lazy because a default
-   * VolvoxAI runtime may use one mutable backend engine for several graphs.
+   * first request. Model compilation remains lazy until the graph is executed.
    */
   async preload(options = {}) {
     return this._exclusive(() => this._preloadImpl(options));
@@ -630,14 +623,14 @@ export class TinyReceiptW8A8Session {
   }
 
   async _generateImpl({ image, prompt, family = 'auto', maxNewTokens = null,
-    preprocessed = false, incremental = false, deviceFeedbackChunkSize = 16 } = {}) {
+    preprocessed = false, incremental = false } = {}) {
     const routed = await this._routeImpl(prompt);
     if (family !== 'auto' && !FAMILY_ORDER.includes(family)) {
       fail(`family must be 'auto' or one of ${FAMILY_ORDER.join(', ')}.`);
     }
     const selectedFamily = family === 'auto' ? routed.family : family;
     const definition = this.package.families.get(selectedFamily);
-    const graph = await this._loadGraph(`family:${selectedFamily}`, definition.configUrl, 'explicit-family', selectedFamily);
+    const graph = await this._loadGraph(`family:${selectedFamily}`, definition.graphUrl, 'explicit-family', selectedFamily);
     const abi = validateFamilyGraph(graph, definition, this.package.preprocessing, routed.qIds.length);
     const imageInput = await this._prepareImage(image, preprocessed);
     const memoryKeep = new Int32Array(abi.memoryLength);
@@ -650,27 +643,12 @@ export class TinyReceiptW8A8Session {
     yKeep[0] = 1;
     const limit = maxNewTokens == null ? abi.decoderLength : maxNewTokens;
     if (!Number.isInteger(limit) || limit < 0) fail('maxNewTokens must be a non-negative integer.');
-    if (!Number.isInteger(deviceFeedbackChunkSize) || deviceFeedbackChunkSize <= 0) {
-      fail('deviceFeedbackChunkSize must be a positive integer.');
-    }
-    const executor = await this._executorFor(`family:${selectedFamily}`, graph);
+    const context = await this._contextFor(
+      `family:${selectedFamily}`,
+      graph,
+      [definition.inputs.yIds, definition.inputs.yKeep],
+    );
     const incrementalRequested = incremental === true;
-    const deviceFeedback = incrementalRequested && executor.supportsIncrementalRows === true &&
-      typeof executor.executeDeviceFeedbackDecode === 'function' &&
-      typeof executor.readBufferRange === 'function';
-    const decodeSession = incrementalRequested && !deviceFeedback &&
-      typeof executor.createDecodeSession === 'function'
-      ? executor.createDecodeSession({
-          changedInputs: [definition.inputs.yIds, definition.inputs.yKeep],
-          rowMode: 'auto',
-        })
-      : null;
-    const incrementalExecution = deviceFeedback || (incrementalRequested && (decodeSession
-      ? decodeSession.mode !== 'ordinary-forward'
-      : executor.supportsIncrementalExecution === true));
-    const incrementalRows = deviceFeedback || (incrementalExecution && (decodeSession
-      ? decodeSession.mode === 'incremental-row'
-      : executor.supportsIncrementalRows === true));
     const tokenIds = [];
     let stoppedAtEos = false;
     const tokenLimit = Math.min(limit, abi.decoderLength);
@@ -682,98 +660,35 @@ export class TinyReceiptW8A8Session {
       [definition.inputs.yIds]: yIds,
       [definition.inputs.yKeep]: yKeep,
     };
-    // The package ABI remains fixed-size I32 + terminal QArgMax. Incremental
-    // mode changes graph scheduling: the first step seeds all intermediates,
-    // then the executor reruns descendants of y_ids/y_keep. CPU/WASM executors
-    // that advertise row decode additionally update only the current decoder
-    // row while retaining self-attention K/V prefixes and encoder K/V. WebGPU
-    // can feed QArgMax back to y_ids entirely on-device and synchronizes only
-    // once per chunk to inspect EOS.
-    try {
-      if (deviceFeedback && tokenLimit > 0) {
-        for (let startPosition = 0;
-          startPosition < tokenLimit && !stoppedAtEos;
-          startPosition += deviceFeedbackChunkSize) {
-          const endPosition = Math.min(
-            startPosition + deviceFeedbackChunkSize, tokenLimit,
-          );
-          const executionResult = await executor.executeDeviceFeedbackDecode(
-            startPosition === 0 ? executionInputs : null,
-            {
-              tokenInput: definition.inputs.yIds,
-              keepInput: definition.inputs.yKeep,
-              output: definition.outputName,
-              startPosition,
-              endPosition,
-              rowsPerSubmission: 1,
-            },
-          );
-          const output = await this._outputFromExecution(
-            executor, graph, definition.outputName, executionResult,
-            { elementOffset: startPosition, elementCount: endPosition - startPosition },
-          );
-          if (output.length !== endPosition - startPosition) {
-            fail(`family output '${definition.outputName}' chunk length changed during device-feedback execution.`);
-          }
-          for (const next of output) {
-            if (!Number.isInteger(next) || next < 0 || next >= this.vocab.itos.length) {
-              fail(`terminal QArgMax emitted out-of-vocabulary token ${next}.`);
-            }
-            tokenIds.push(next);
-            if (next === this.vocab.eos) {
-              stoppedAtEos = true;
-              break;
-            }
-          }
-        }
-      } else {
-        for (let step = 0; step < tokenLimit; step++) {
-          let output;
-          const outputRange = incrementalRows && typeof executor.readBufferRange === 'function'
-            ? { elementOffset: step, elementCount: 1 }
-            : undefined;
-          if (decodeSession) {
-            const executionResult = step === 0
-              ? await decodeSession.seed(executionInputs)
-              : await decodeSession.step(executionInputs, {
-                  changedInputs: [definition.inputs.yIds, definition.inputs.yKeep],
-                  ...(incrementalRows ? { position: step } : {}),
-                });
-            output = await this._outputFromExecution(
-              executor, graph, definition.outputName, executionResult, outputRange,
-            );
-          } else {
-            const executionOptions = incrementalExecution ? {
-              incremental: true,
-              incrementalReset: step === 0,
-              changedInputs: step === 0 ? Object.keys(executionInputs) : [definition.inputs.yIds, definition.inputs.yKeep],
-              ...(incrementalRows && step > 0 ? { incrementalRowPosition: step } : {}),
-            } : undefined;
-            const executionResult = await executor.execute(executionInputs, executionOptions);
-            output = await this._outputFromExecution(
-              executor, graph, definition.outputName, executionResult, outputRange,
-            );
-          }
-          if (output.length !== 1 && output.length !== abi.decoderLength) {
-            fail(`family output '${definition.outputName}' length changed during execution.`);
-          }
-          const next = output.length === 1 ? output[0] : output[step];
-          if (!Number.isInteger(next) || next < 0 || next >= this.vocab.itos.length) {
-            fail(`terminal QArgMax emitted out-of-vocabulary token ${next}.`);
-          }
-          tokenIds.push(next);
-          if (next === this.vocab.eos) {
-            stoppedAtEos = true;
-            break;
-          }
-          if (step + 1 < abi.decoderLength) {
-            yIds[step + 1] = next;
-            yKeep[step + 1] = 1;
-          }
-        }
+    // The package ABI remains fixed-size I32 plus terminal QArgMax. A decode
+    // context owns all backend cache state; each result owns its output snapshot.
+    if (incrementalRequested) await context.decode.reset();
+    for (let step = 0; step < tokenLimit; step++) {
+      const executionResult = incrementalRequested
+        ? step === 0
+          ? await context.decode.seed(executionInputs)
+          : await context.decode.step(executionInputs, { position: step })
+        : await context.execute(executionInputs);
+      const output = await this._outputFromExecution(
+        definition.outputName,
+        executionResult,
+      );
+      if (output.length !== 1 && output.length !== abi.decoderLength) {
+        fail(`family output '${definition.outputName}' length changed during execution.`);
       }
-    } finally {
-      await decodeSession?.close?.();
+      const next = output.length === 1 ? output[0] : output[step];
+      if (!Number.isInteger(next) || next < 0 || next >= this.vocab.itos.length) {
+        fail(`terminal QArgMax emitted out-of-vocabulary token ${next}.`);
+      }
+      tokenIds.push(next);
+      if (next === this.vocab.eos) {
+        stoppedAtEos = true;
+        break;
+      }
+      if (step + 1 < abi.decoderLength) {
+        yIds[step + 1] = next;
+        yKeep[step + 1] = 1;
+      }
     }
     return Object.freeze({
       family: selectedFamily,
@@ -784,20 +699,33 @@ export class TinyReceiptW8A8Session {
       tokenIds: Object.freeze([...tokenIds]),
       text: this.vocab.decode(tokenIds),
       stoppedAtEos,
-      execution: deviceFeedback ? 'device-feedback-row-kv-cache' :
-        incrementalRows ? 'incremental-row-kv-cache' :
-        incrementalExecution ? 'incremental-dependency-cache' : 'ordinary-forward',
+      execution: incrementalRequested ? 'context-decode' : 'ordinary-forward',
     });
   }
 
   /**
    * Route once, select one explicit family graph, and autoregress using raw
-   * terminal QArgMax token IDs. The session serializes calls because CPU/WASM
-   * graph executors own mutable graph input buffers.
+   * terminal QArgMax token IDs. The session serializes calls because an
+   * ExecutionContext owns mutable decode state.
    */
   async generate(options = {}) {
     return this._exclusive(() => this._generateImpl(options));
   }
+
+  close() {
+    if (this._closePromise) return this._closePromise;
+    this._closePromise = this._exclusive(async () => {
+      this._closed = true;
+      const records = [...this._contexts.values()];
+      for (const { context } of records) await context.close();
+      for (const { compiled } of records) await compiled.close();
+      for (const { model } of records) await model.close();
+      this._contexts.clear();
+      this._graphs.clear();
+    });
+    return this._closePromise;
+  }
+
 }
 
 export { FAMILY_ORDER as TINY_RECEIPT_W8A8_FAMILY_ORDER, PACKAGE_FORMAT as TINY_RECEIPT_W8A8_PACKAGE_FORMAT };

@@ -22,6 +22,18 @@ typedef int (*VxSplitF32Fn)(const float*, float*, long, long, int, int, int, int
 typedef int (*VxProfileF32Fn)(const float*, float*, int, int, int, int);
 typedef int (*VxNmsF32Fn)(const float*, const float*, float*, int, int, int, int, int,
                           float, float);
+typedef int (*VxCompareI32Fn)(const int32_t*, long, const int32_t*, long,
+                              int32_t*, long, const uint32_t*, const uint32_t*,
+                              const uint32_t*, int, int);
+typedef int (*VxNotI32Fn)(const int32_t*, int32_t*, long);
+typedef int (*VxClipI32Fn)(const int32_t*, int32_t*, long, int32_t, int32_t);
+typedef int (*VxWhere32Fn)(const int32_t*, const void*, const void*, void*, long);
+typedef int (*VxCastTypedFn)(const void*, int, void*, int, long);
+typedef int (*VxCopy32Fn)(const void*, void*, long);
+typedef int (*VxConcat32Fn)(const void* const*, const long*, const int*, int,
+                            void*, int, int);
+typedef int (*VxArgMaxF32I32Fn)(const float*, int32_t*, uint32_t, uint32_t,
+                                uint32_t);
 #if VOLVOXAI_ENABLE_TRAINING
 typedef int (*VxSdpaTrainingF32Fn)(const float*, const int32_t*, long, float*,
                                    int, int, int, int, int, float, int, int,
@@ -53,6 +65,14 @@ typedef struct {
     VxProfileF32Fn profile_y;
     VxProfileF32Fn mean_height;
     VxNmsF32Fn nms;
+    VxCompareI32Fn compare_i32;
+    VxNotI32Fn not_i32;
+    VxClipI32Fn clip_i32;
+    VxWhere32Fn where_32;
+    VxCastTypedFn cast_typed;
+    VxCopy32Fn copy_32;
+    VxConcat32Fn concat_32;
+    VxArgMaxF32I32Fn argmax_f32_i32;
 } VxF32Ops;
 
 #if VOLVOXAI_ENABLE_VULKAN
@@ -69,7 +89,10 @@ static const VxF32Ops g_vulkan_f32_ops = {
     vk_graph_cross_attention_f32, vk_graph_dequantize_linear_f32,
     vk_graph_quantize_linear_i8, vk_graph_split_f32,
     vk_graph_spatial_softargmax_y_f32, vk_graph_profile_x_f32,
-    vk_graph_profile_y_f32, vk_graph_mean_height_f32, vk_graph_nms_f32
+    vk_graph_profile_y_f32, vk_graph_mean_height_f32, vk_graph_nms_f32,
+    vk_graph_compare_i32, vk_graph_not_i32, vk_graph_clip_i32,
+    vk_graph_where_32, vk_graph_cast_typed, vk_graph_copy_32,
+    vk_graph_concat_32, vk_graph_argmax_f32
 };
 #endif
 
@@ -87,7 +110,10 @@ static const VxF32Ops g_opengl_f32_ops = {
     opengl_graph_cross_attention_f32, opengl_graph_dequantize_linear_f32,
     opengl_graph_quantize_linear_i8, opengl_graph_split_f32,
     opengl_graph_spatial_softargmax_y_f32, opengl_graph_profile_x_f32,
-    opengl_graph_profile_y_f32, opengl_graph_mean_height_f32, opengl_graph_nms_f32
+    opengl_graph_profile_y_f32, opengl_graph_mean_height_f32, opengl_graph_nms_f32,
+    opengl_graph_compare_i32, opengl_graph_not_i32, opengl_graph_clip_i32,
+    opengl_graph_where_32, opengl_graph_cast_typed, opengl_graph_copy_32,
+    opengl_graph_concat_32, opengl_graph_argmax_f32
 };
 #endif
 
@@ -105,13 +131,45 @@ static const VxF32Ops g_metal_f32_ops = {
     metal_graph_cross_attention_f32, metal_graph_dequantize_linear_f32,
     metal_graph_quantize_linear_i8, metal_graph_split_f32,
     metal_graph_spatial_softargmax_y_f32, metal_graph_profile_x_f32,
-    metal_graph_profile_y_f32, metal_graph_mean_height_f32, metal_graph_nms_f32
+    metal_graph_profile_y_f32, metal_graph_mean_height_f32, metal_graph_nms_f32,
+    metal_graph_compare_i32, metal_graph_not_i32, metal_graph_clip_i32,
+    metal_graph_where_32, metal_graph_cast_typed, metal_graph_copy_32,
+    metal_graph_concat_32, metal_graph_argmax_f32
 };
 #endif
 
-static int output_ref_cmp(const Ref* a, const Ref* b) {
-    return strcmp(a->key, b->key);
-}
+#if VOLVOXAI_ENABLE_CUDA
+static const VxF32Ops g_cuda_f32_ops = {
+    .binary = cuda_graph_binary_f32,
+    .conv1d = cuda_graph_conv1d_f32,
+    .embedding = cuda_graph_embedding_f32,
+    .sdpa = cuda_graph_sdpa_f32,
+#if VOLVOXAI_ENABLE_TRAINING
+    .sdpa_training = cuda_graph_sdpa_training_f32,
+#endif
+    .cross_sdpa = cuda_graph_cross_sdpa_f32,
+#if VOLVOXAI_ENABLE_TRAINING
+    .cross_sdpa_training = cuda_graph_cross_sdpa_training_f32,
+#endif
+    .cross_attention = cuda_graph_cross_attention_f32,
+    .dequantize_linear = cuda_graph_dequantize_linear_f32,
+    .quantize_linear = cuda_graph_quantize_linear_i8,
+    .split = cuda_graph_split_f32,
+    .spatial_softargmax_y = cuda_graph_spatial_softargmax_y_f32,
+    .profile_x = cuda_graph_profile_x_f32,
+    .profile_y = cuda_graph_profile_y_f32,
+    .mean_height = cuda_graph_mean_height_f32,
+    .nms = cuda_graph_nms_f32,
+    .compare_i32 = cuda_graph_compare_i32,
+    .not_i32 = cuda_graph_not_i32,
+    .clip_i32 = cuda_graph_clip_i32,
+    .where_32 = cuda_graph_where_32,
+    .cast_typed = cuda_graph_cast_typed,
+    .copy_32 = cuda_graph_copy_32,
+    .concat_32 = cuda_graph_concat_32,
+    .argmax_f32_i32 = NULL,
+};
+#endif
 
 static T* node_data_input(Node* n, T* input) {
     if (input) return input;
@@ -131,6 +189,253 @@ static int tensor_inner_after_axis(const T* t, int axis) {
     if (!t || axis < 0 || axis >= t->ndim) return 0;
     for (int i = axis + 1; i < t->ndim; i++) inner *= t->shape[i];
     return inner;
+}
+
+static int gpu_output_strides_u32(const T* output, uint32_t strides[8]) {
+    uint64_t stride = 1u;
+    if (!output || !strides || output->ndim <= 0 || output->ndim > 8 ||
+        output->numel <= 0 || output->numel > UINT32_MAX)
+        return 0;
+    memset(strides, 0, 8u * sizeof(uint32_t));
+    for (int dimension = output->ndim - 1; dimension >= 0; dimension--) {
+        if (output->shape[dimension] <= 0 || stride > UINT32_MAX)
+            return 0;
+        strides[dimension] = (uint32_t)stride;
+        stride *= (uint32_t)output->shape[dimension];
+        if (stride > UINT32_MAX) return 0;
+    }
+    return stride == (uint64_t)output->numel;
+}
+
+static int try_gpu_graph_compare_i32(Node* node, T* output,
+                                     const VxF32Ops* ops, int operation) {
+    T* a = nin(node, "a");
+    T* b = nin(node, "b");
+    uint32_t output_strides[8] = {0};
+    uint32_t a_strides[8] = {0};
+    uint32_t b_strides[8] = {0};
+    if (!ops || !ops->compare_i32 || !a || !b || !output ||
+        a->dtype != T_I32 || b->dtype != T_I32 ||
+        output->dtype != T_I32 || (operation != 0 && operation != 1) ||
+        gpu_broadcast_strides(a, output, a_strides) != 0 ||
+        gpu_broadcast_strides(b, output, b_strides) != 0 ||
+        !gpu_output_strides_u32(output, output_strides))
+        return 0;
+    return ops->compare_i32(
+        (const int32_t*)a->data, a->numel,
+        (const int32_t*)b->data, b->numel,
+        (int32_t*)output->data, output->numel,
+        output_strides, a_strides, b_strides, output->ndim, operation);
+}
+
+static int try_gpu_graph_argmax_f32_i32(Node* node, T* output,
+                                        const VxF32Ops* ops) {
+    T* input = node_input_default(node);
+    uint64_t outer = 1u;
+    uint64_t inner = 1u;
+    int axis;
+    int keepdims;
+    if (!ops || !ops->argmax_f32_i32 || !node || !input || !output ||
+        input->dtype != T_F32 || output->dtype != T_I32 ||
+        input->ndim <= 0 || input->ndim > 8 || input->data == output->data)
+        return 0;
+    axis = normalize_axis(p_int(node->params, "axis", 0), input->ndim);
+    keepdims = p_int(node->params, "keepdims", 1);
+    if (axis < 0 || axis >= input->ndim ||
+        (keepdims != 0 && keepdims != 1) ||
+        p_int(node->params, "select_last_index", 0) != 0 ||
+        input->shape[axis] <= 0)
+        return 0;
+    for (int dimension = 0; dimension < axis; dimension++) {
+        if (input->shape[dimension] <= 0 ||
+            outer > UINT32_MAX / (uint32_t)input->shape[dimension])
+            return 0;
+        outer *= (uint32_t)input->shape[dimension];
+    }
+    for (int dimension = axis + 1; dimension < input->ndim; dimension++) {
+        if (input->shape[dimension] <= 0 ||
+            inner > UINT32_MAX / (uint32_t)input->shape[dimension])
+            return 0;
+        inner *= (uint32_t)input->shape[dimension];
+    }
+    if (outer == 0 || inner == 0 || outer * inner != (uint64_t)output->numel)
+        return 0;
+    if (keepdims) {
+        if (output->ndim != input->ndim) return 0;
+        for (int dimension = 0; dimension < input->ndim; dimension++) {
+            int expected = dimension == axis ? 1 : input->shape[dimension];
+            if (output->shape[dimension] != expected) return 0;
+        }
+    } else {
+        if (output->ndim != input->ndim - 1) return 0;
+        for (int dimension = 0; dimension < input->ndim; dimension++) {
+            int output_dimension;
+            if (dimension == axis) continue;
+            output_dimension = dimension < axis ? dimension : dimension - 1;
+            if (output->shape[output_dimension] != input->shape[dimension])
+                return 0;
+        }
+    }
+    return ops->argmax_f32_i32(
+        input->data, (int32_t*)output->data, (uint32_t)outer,
+        (uint32_t)input->shape[axis], (uint32_t)inner);
+}
+
+static int try_gpu_graph_concat_i32(Node* node, T* output,
+                                    const VxF32Ops* ops) {
+    const void* inputs[MAXIN];
+    long sizes[MAXIN];
+    int input_axes[MAXIN];
+    long total = 0;
+    long summed_axis = 0;
+    int axis;
+    int inner;
+    if (!ops || !ops->concat_32 || !node || !output ||
+        output->dtype != T_I32 || output->ndim <= 0 ||
+        output->ndim > 8 || node->nin <= 0 || node->nin > MAXIN)
+        return 0;
+    axis = normalize_axis(p_int(node->params, "axis", 1), output->ndim);
+    if (axis < 0 || axis >= output->ndim || output->shape[axis] <= 0)
+        return 0;
+    for (int input_index = 0; input_index < node->nin; input_index++) {
+        T* input = t_find(node->ins[input_index].name);
+        if (!input || input->dtype != T_I32 ||
+            input->ndim != output->ndim || input->shape[axis] <= 0)
+            return 0;
+        for (int dimension = 0; dimension < output->ndim; dimension++) {
+            if (dimension != axis &&
+                input->shape[dimension] != output->shape[dimension])
+                return 0;
+        }
+        inputs[input_index] = input->data;
+        sizes[input_index] = input->numel;
+        input_axes[input_index] = input->shape[axis];
+        total += input->numel;
+        summed_axis += input->shape[axis];
+    }
+    inner = tensor_inner_after_axis(output, axis);
+    if (total != output->numel ||
+        summed_axis != output->shape[axis] || inner <= 0)
+        return 0;
+    return ops->concat_32(
+        inputs, sizes, input_axes, node->nin, output->data,
+        output->shape[axis], inner);
+}
+
+/* Shared typed-control route for Vulkan, OpenGL, and Metal. These operators
+ * preserve ordinary F32/I32 graph storage; none is a quantized byte-domain
+ * shortcut. The backend entry points use the same validation contract as the
+ * CUDA typed graph path so strict all-device compilation cannot silently
+ * accept a narrower implementation on one native GPU. */
+static int try_gpu_graph_typed_control(Node* node, T* input, T* output,
+                                       const VxF32Ops* ops) {
+    const char* op;
+    if (!node || !output || !ops) return 0;
+    op = node->op;
+    if (!strcmp(op, "Equal") || !strcmp(op, "GreaterOrEqual"))
+        return try_gpu_graph_compare_i32(
+            node, output, ops, !strcmp(op, "GreaterOrEqual") ? 1 : 0);
+    if (!strcmp(op, "Not")) {
+        T* source = node_input_default(node);
+        return ops->not_i32 && source && source->dtype == T_I32 &&
+            output->dtype == T_I32 && tensor_same_shape(source, output) &&
+            ops->not_i32((const int32_t*)source->data,
+                         (int32_t*)output->data, output->numel);
+    }
+    if (!strcmp(op, "Clip") && output->dtype == T_I32) {
+        T* source = node_input_default(node);
+        int32_t minimum;
+        int32_t maximum;
+        return ops->clip_i32 && source && source->dtype == T_I32 &&
+            tensor_same_shape(source, output) &&
+            node_i32_parameter(node->params, "min", INT32_MIN, &minimum) == 0 &&
+            node_i32_parameter(node->params, "max", INT32_MAX, &maximum) == 0 &&
+            minimum <= maximum &&
+            ops->clip_i32((const int32_t*)source->data,
+                          (int32_t*)output->data, output->numel,
+                          minimum, maximum);
+    }
+    if (!strcmp(op, "Where") || !strcmp(op, "Mask")) {
+        T* condition = nin(node, "condition");
+        T* a = nin(node, "x");
+        T* b = nin(node, "y");
+        if (!condition) condition = nin(node, "cond");
+        if (!condition) condition = nin(node, "mask");
+        if (!a) a = nin(node, "a");
+        if (!b) b = nin(node, "b");
+        return ops->where_32 && condition && a && b &&
+            condition->dtype == T_I32 && tensor_plain_32(a) &&
+            tensor_plain_32(b) && tensor_plain_32(output) &&
+            a->dtype == b->dtype && output->dtype == a->dtype &&
+            tensor_same_shape(condition, output) &&
+            tensor_same_shape(a, output) && tensor_same_shape(b, output) &&
+            ops->where_32((const int32_t*)condition->data, a->data, b->data,
+                          output->data, output->numel);
+    }
+    if (!strcmp(op, "Cast")) {
+        T* source = input ? input : node_input_default(node);
+        cJSON* target = node->params
+            ? cJSON_GetObjectItemCaseSensitive(node->params, "to") : NULL;
+        int target_dtype;
+        if (!ops->cast_typed || !source || source->numel != output->numel ||
+            !tensor_plain_32(source) || !tensor_plain_32(output) || !target ||
+            (target_dtype = graph_declared_dtype(target)) < 0 ||
+            target_dtype != output->dtype)
+            return 0;
+        return ops->cast_typed(
+            source->data, source->dtype, output->data, output->dtype,
+            output->numel);
+    }
+    if ((!strcmp(op, "Reshape") || !strcmp(op, "Flatten") ||
+         !strcmp(op, "Squeeze") || !strcmp(op, "Unsqueeze") ||
+         !strcmp(op, "Identity")) && output->dtype == T_I32) {
+        T* source = input ? input : node_input_default(node);
+        return ops->copy_32 && source && source->dtype == T_I32 &&
+            source->numel == output->numel &&
+            ops->copy_32(source->data, output->data, output->numel);
+    }
+    if (!strcmp(op, "Concat") && output->dtype == T_I32)
+        return try_gpu_graph_concat_i32(node, output, ops);
+    if (!strcmp(op, "ArgMax"))
+        return try_gpu_graph_argmax_f32_i32(node, output, ops);
+    return 0;
+}
+
+static int gather_i32_dimensions(const T* data, const T* indices,
+                                 const T* output, int axis,
+                                 int* outer, int* axis_size, int* inner,
+                                 int* indices_elements, int* output_elements) {
+    uint64_t outer_count = 1;
+    uint64_t inner_count = 1;
+    uint64_t expected_input;
+    uint64_t expected_output;
+    if (!data || !indices || !output || !outer || !axis_size || !inner ||
+        !indices_elements || !output_elements || data->dtype != T_F32 ||
+        indices->dtype != T_I32 || output->dtype != T_F32 ||
+        data->ndim <= 0 || data->ndim > 8 || axis < 0 || axis >= data->ndim ||
+        data->shape[axis] <= 0 || indices->numel <= 0 || output->numel <= 0)
+        return 0;
+    for (int dimension = 0; dimension < axis; dimension++) {
+        if (data->shape[dimension] <= 0 ||
+            outer_count > INT_MAX / (uint32_t)data->shape[dimension]) return 0;
+        outer_count *= (uint32_t)data->shape[dimension];
+    }
+    for (int dimension = axis + 1; dimension < data->ndim; dimension++) {
+        if (data->shape[dimension] <= 0 ||
+            inner_count > INT_MAX / (uint32_t)data->shape[dimension]) return 0;
+        inner_count *= (uint32_t)data->shape[dimension];
+    }
+    if (indices->numel > INT_MAX || output->numel > INT_MAX) return 0;
+    expected_input = outer_count * (uint32_t)data->shape[axis] * inner_count;
+    expected_output = outer_count * (uint32_t)indices->numel * inner_count;
+    if (expected_input != (uint64_t)data->numel ||
+        expected_output != (uint64_t)output->numel) return 0;
+    *outer = (int)outer_count;
+    *axis_size = data->shape[axis];
+    *inner = (int)inner_count;
+    *indices_elements = (int)indices->numel;
+    *output_elements = (int)output->numel;
+    return 1;
 }
 
 static int try_gpu_graph_binary(Node* n, T* in, T* o, const VxF32Ops* ops) {
@@ -329,66 +634,19 @@ static int try_gpu_graph_cross_attention(Node* n, T* o, const VxF32Ops* ops) {
         d_model, heads, head_dim, batch, scale != NULL, bias != NULL);
 }
 
-static int try_gpu_graph_dequantize_linear(Node* n, T* in, T* o, const VxF32Ops* ops) {
-    T* x = node_data_input(n, in);
-    T* scale = nin(n, "scale");
-    T* zp = nin(n, "zero_point");
-    if (!x || !scale || !o || x->numel != o->numel || scale->numel <= 0) return 0;
-    QTensor* q = qt_get(x);
-    if (q && q->valid && q->has_params) return 0;
-    materialize_tensor_f32(x);
-    materialize_tensor_f32(scale);
-    if (zp) materialize_tensor_f32(zp);
-    if (x->dtype != T_F32 || scale->dtype != T_F32 || (zp && zp->dtype != T_F32)) return 0;
-    return ops && ops->dequantize_linear && ops->dequantize_linear(
-        x->data, scale->data, zp ? zp->data : NULL, o->data, o->numel, zp != NULL);
-}
-
-static int try_gpu_graph_quantize_linear(Node* n, T* in, T* o, const VxF32Ops* ops) {
-    T* x = node_data_input(n, in);
-    if (!n || !x || !o || x->dtype != T_F32 || o->dtype != T_F32 || x->numel != o->numel) return 0;
-    float input_scale = p_flt(n->params, "input_scale", 0.0f);
-    int input_zp = p_int(n->params, "input_zero_point", 0);
-    float output_scale = p_flt(n->params, "output_scale", 0.0f);
-    int output_zp = p_int(n->params, "output_zero_point", 0);
-    if (output_scale <= 0.0f) return 0;
-
-    QTensor* qi = qt_get(x);
-    int materialized_qinput = qi && qi->valid && qi->has_params;
-    materialize_tensor_f32(x);
-    if (materialized_qinput) vk_mark_host_tensor(x);
-    if (qt_alloc_for(o, output_scale, output_zp) != 0) return 0;
-    QTensor* qo = qt_get(o);
-    if (!qo || !qo->data) return 0;
-    qo->valid = 0;
-
-    int ok = ops && ops->quantize_linear && ops->quantize_linear(
-        x->data, qo->data, x->numel, input_scale, input_zp, output_scale, output_zp);
-    if (!ok) return 0;
-    qo->valid = 1;
-    return 1;
-}
-
 static int try_gpu_graph_split(Node* n, T* in, const VxF32Ops* ops) {
     T* x = node_data_input(n, in);
     if (!x || n->nout <= 0) return 0;
     int axis = normalize_axis(p_int(n->params, "axis", 0), x->ndim);
     if (axis < 0 || axis >= x->ndim) return 0;
-    int order[MAXIN];
-    for (int i = 0; i < n->nout; i++) order[i] = i;
-    for (int i = 0; i < n->nout; i++) {
-        for (int j = i + 1; j < n->nout; j++) {
-            if (output_ref_cmp(&n->outs[order[j]], &n->outs[order[i]]) < 0) {
-                int tmp = order[i]; order[i] = order[j]; order[j] = tmp;
-            }
-        }
-    }
     materialize_tensor_f32(x);
     if (x->dtype != T_F32) return 0;
     int inner = tensor_inner_after_axis(x, axis);
+    /* Graph parsing retains declaration order in n->outs.  That order defines
+     * Split slices; lexical key sorting would place out10 before out2. */
     int offset = 0;
     for (int oi = 0; oi < n->nout; oi++) {
-        T* dst = t_find(n->outs[order[oi]].name);
+        T* dst = t_find(n->outs[oi].name);
         if (!dst || dst->dtype != T_F32 || dst->ndim != x->ndim) return 0;
         for (int d = 0; d < x->ndim; d++) {
             if (d != axis && dst->shape[d] != x->shape[d]) return 0;
@@ -398,7 +656,7 @@ static int try_gpu_graph_split(Node* n, T* in, const VxF32Ops* ops) {
     if (offset != x->shape[axis]) return 0;
     offset = 0;
     for (int oi = 0; oi < n->nout; oi++) {
-        T* dst = t_find(n->outs[order[oi]].name);
+        T* dst = t_find(n->outs[oi].name);
         int split_size = dst->shape[axis];
         int ok = ops && ops->split && ops->split(
             x->data, dst->data, x->numel, dst->numel, inner, split_size, x->shape[axis], offset);
@@ -410,38 +668,38 @@ static int try_gpu_graph_split(Node* n, T* in, const VxF32Ops* ops) {
 
 static int cpu_split(Node* n, T* in) {
     T* x = node_data_input(n, in);
-    if (!x || x->dtype != T_F32 || x->ndim <= 0 || n->nout <= 0) return -1;
+    if (!tensor_plain_32(x) || x->ndim <= 0 || n->nout <= 0) return -1;
     int axis = normalize_axis(p_int(n->params, "axis", 0), x->ndim);
     if (axis < 0 || axis >= x->ndim || x->shape[axis] <= 0) return -1;
-    int order[MAXIN];
-    for (int i = 0; i < n->nout; i++) order[i] = i;
-    for (int i = 0; i < n->nout; i++) {
-        for (int j = i + 1; j < n->nout; j++) {
-            if (output_ref_cmp(&n->outs[order[j]], &n->outs[order[i]]) < 0) {
-                int tmp = order[i]; order[i] = order[j]; order[j] = tmp;
-            }
-        }
-    }
     materialize_tensor_f32(x);
     int inner = tensor_inner_after_axis(x, axis);
     long outer = inner > 0 ? x->numel / ((long)x->shape[axis] * inner) : 0;
     if (inner <= 0 || outer <= 0 || x->numel != outer * x->shape[axis] * inner) return -1;
+    /* Match the declaration order used by every device Split path. */
     int axis_offset = 0;
     for (int oi = 0; oi < n->nout; oi++) {
-        T* dst = t_find(n->outs[order[oi]].name);
-        if (!dst || dst->dtype != T_F32 || dst->ndim != x->ndim || dst->shape[axis] <= 0) return -1;
+        T* dst = t_find(n->outs[oi].name);
+        if (!tensor_plain_32(dst) || dst->dtype != x->dtype ||
+            dst->ndim != x->ndim || dst->shape[axis] <= 0) return -1;
         for (int d = 0; d < x->ndim; d++) {
             if (d != axis && dst->shape[d] != x->shape[d]) return -1;
         }
         if (axis_offset > x->shape[axis] - dst->shape[axis]) return -1;
         long block = (long)dst->shape[axis] * inner;
         if (dst->numel != outer * block) return -1;
-        if (outer > (long)UINT32_MAX ||
-            !split_slice_f32(x->data, dst->data, (uint32_t)outer,
-                             (uint32_t)x->shape[axis],
-                             (uint32_t)dst->shape[axis], (uint32_t)inner,
-                             (uint32_t)axis_offset))
-            return -1;
+        if (outer > (long)UINT32_MAX) return -1;
+        int ok = x->dtype == T_F32
+            ? split_slice_f32(
+                x->data, dst->data, (uint32_t)outer,
+                (uint32_t)x->shape[axis],
+                (uint32_t)dst->shape[axis], (uint32_t)inner,
+                (uint32_t)axis_offset)
+            : split_slice_u32(
+                (const uint32_t*)x->data, (uint32_t*)dst->data,
+                (uint32_t)outer, (uint32_t)x->shape[axis],
+                (uint32_t)dst->shape[axis], (uint32_t)inner,
+                (uint32_t)axis_offset);
+        if (!ok) return -1;
         vk_mark_host_tensor(dst);
         axis_offset += dst->shape[axis];
     }
@@ -506,7 +764,12 @@ static int try_vulkan_graph_node(Node* n, int idx, const char** node_backend) {
     T* in = nin(n, "input");
     cJSON* p = n->params;
     const char* op = n->op;
-    if (!o || o->dtype != T_F32) return 0;
+    if (!o) return 0;
+    if (try_gpu_graph_typed_control(n, in, o, &g_vulkan_f32_ops)) {
+        *node_backend = "vulkan-graph";
+        return 1;
+    }
+    if (o->dtype != T_F32) return 0;
 
     if (!strcmp(op, "QConv2D")) {
         return 0;
@@ -585,7 +848,7 @@ static int try_vulkan_graph_node(Node* n, int idx, const char** node_backend) {
         return 0;
     }
 
-    if (!strcmp(op, "ReLU") || !strcmp(op, "GELU") || !strcmp(op, "SiLU") || !strcmp(op, "Swish") ||
+    if (!strcmp(op, "ReLU") || !strcmp(op, "GELU") || !strcmp(op, "SiLU") ||
         !strcmp(op, "Tanh") || !strcmp(op, "HardSwish") || !strcmp(op, "HardSigmoid")) {
         if (!in) return 0;
         materialize_tensor_f32(in);
@@ -597,7 +860,7 @@ static int try_vulkan_graph_node(Node* n, int idx, const char** node_backend) {
             if (gelu_approximate_tanh(p, &approximate_tanh) != 0) return 0;
             ok = vk_graph_gelu_f32(in->data, o->data, o->numel, approximate_tanh);
         }
-        else if (!strcmp(op, "SiLU") || !strcmp(op, "Swish")) ok = vk_graph_silu_f32(in->data, o->data, o->numel);
+        else if (!strcmp(op, "SiLU")) ok = vk_graph_silu_f32(in->data, o->data, o->numel);
         else if (!strcmp(op, "Tanh")) ok = vk_graph_tanh_f32(in->data, o->data, o->numel);
         else if (!strcmp(op, "HardSwish")) ok = vk_graph_hardswish_f32(in->data, o->data, o->numel);
         else ok = vk_graph_hardsigmoid_f32(in->data, o->data, o->numel);
@@ -631,13 +894,17 @@ static int try_vulkan_graph_node(Node* n, int idx, const char** node_backend) {
 
     if (!strcmp(op, "LayerNorm")) {
         T* w = nin(n, "weight"); T* b = nin(n, "bias");
-        if (!in || !w || !b) return 0;
+        if (!in || !w || !b || in->ndim <= 0) return 0;
         materialize_tensor_f32(in); materialize_tensor_f32(w); materialize_tensor_f32(b);
         int d_model = p_int(p, "d_model", in->shape[in->ndim - 1]);
-        int rows = d_model > 0 ? (int)(in->numel / d_model) : 0;
+        long rows = d_model > 0 ? in->numel / d_model : 0;
+        float epsilon = p_flt(p, "eps", 1.0e-6f);
         if (in->dtype == T_F32 && w->dtype == T_F32 && b->dtype == T_F32 && o->numel == in->numel &&
-            w->numel >= d_model && b->numel >= d_model &&
-            vk_graph_layernorm_f32(in->data, w->data, b->data, o->data, rows, d_model)) {
+            d_model > 0 && in->numel % d_model == 0 && rows > 0 && rows <= INT32_MAX &&
+            w->numel == d_model && b->numel == d_model &&
+            epsilon > 0.0f && isfinite(epsilon) &&
+            vk_graph_layernorm_f32(in->data, w->data, b->data, o->data,
+                                   (int)rows, d_model, epsilon)) {
             *node_backend = "vulkan-graph";
             return 1;
         }
@@ -747,7 +1014,7 @@ static int try_vulkan_graph_node(Node* n, int idx, const char** node_backend) {
         return 0;
     }
 
-    if (!strcmp(op, "AveragePool") || !strcmp(op, "AveragePool2D")) {
+    if (!strcmp(op, "AveragePool2D")) {
         if (!in || in->ndim != 4 || o->ndim != 4) return 0;
         materialize_tensor_f32(in);
         int ky, kx, sy, sx, py, px;
@@ -801,8 +1068,10 @@ static int try_vulkan_graph_node(Node* n, int idx, const char** node_backend) {
     if (!strcmp(op, "Transpose")) {
         if (!in || in->ndim <= 0 || in->ndim > 8) return 0;
         materialize_tensor_f32(in);
-        int perm[8]; for (int i = 0; i < in->ndim; i++) perm[i] = i;
-        p_iarr(p, "perm", perm, in->ndim, 0);
+        int perm[8];
+        for (int i = 0; i < in->ndim; i++) perm[i] = in->ndim - 1 - i;
+        if (p && cJSON_GetObjectItem(p, "perm"))
+            p_iarr(p, "perm", perm, in->ndim, 0);
         if (in->dtype == T_F32 && o->numel == in->numel &&
             vk_graph_transpose_f32(in->data, o->data, in->shape, perm, in->ndim)) {
             *node_backend = "vulkan-graph";
@@ -816,22 +1085,6 @@ static int try_vulkan_graph_node(Node* n, int idx, const char** node_backend) {
         if (!x) return 0;
         materialize_tensor_f32(x);
         if (x->dtype == T_F32 && x->numel == o->numel && vk_graph_cast_copy_f32(x->data, o->data, o->numel)) {
-            *node_backend = "vulkan-graph";
-            return 1;
-        }
-        return 0;
-    }
-
-    if (!strcmp(op, "QuantizeLinear")) {
-        if (try_gpu_graph_quantize_linear(n, in, o, &g_vulkan_f32_ops)) {
-            *node_backend = "vulkan-graph";
-            return 1;
-        }
-        return 0;
-    }
-
-    if (!strcmp(op, "DequantizeLinear")) {
-        if (try_gpu_graph_dequantize_linear(n, in, o, &g_vulkan_f32_ops)) {
             *node_backend = "vulkan-graph";
             return 1;
         }
@@ -866,14 +1119,17 @@ static int try_vulkan_graph_node(Node* n, int idx, const char** node_backend) {
 
     if (!strcmp(op, "Gather")) {
         T* idx = nin(n, "indices");
+        int outer, axis_size, inner, indices_elements, output_elements;
+        int axis;
         if (!in || !idx || in->ndim <= 0) return 0;
-        int axis = p_int(p, "axis", 0); if (axis < 0) axis += in->ndim;
-        if (axis != 0) return 0;
-        materialize_tensor_f32(in); materialize_tensor_f32(idx);
-        int row_size = 1; for (int i = 1; i < in->ndim; i++) row_size *= in->shape[i];
-        int num_idx = row_size > 0 ? (int)(o->numel / row_size) : 0;
-        if (in->dtype == T_F32 && idx->dtype == T_F32 && num_idx > 0 &&
-            vk_graph_gather_axis0_f32(in->data, idx->data, o->data, row_size, in->shape[0], num_idx)) {
+        axis = normalize_axis(p_int(p, "axis", 0), in->ndim);
+        materialize_tensor_f32(in);
+        if (gather_i32_dimensions(in, idx, o, axis, &outer, &axis_size,
+                                  &inner, &indices_elements,
+                                  &output_elements) &&
+            vk_graph_gather_i32_f32(in->data, (const int32_t*)idx->data,
+                                    o->data, outer, axis_size, inner,
+                                    indices_elements, output_elements)) {
             *node_backend = "vulkan-graph";
             return 1;
         }
@@ -990,7 +1246,7 @@ static int try_vulkan_graph_node(Node* n, int idx, const char** node_backend) {
         return 0;
     }
 
-    if (!strcmp(op, "InterpLinear1D") || !strcmp(op, "Interp1D")) {
+    if (!strcmp(op, "Interpolate1D")) {
         if (!in || in->ndim != 2 || o->ndim != 2) return 0;
         materialize_tensor_f32(in);
         int channels = in->shape[in->ndim - 2];
@@ -1078,7 +1334,12 @@ static int try_opengl_graph_node(Node* n, int idx, const char** node_backend) {
     T* in = nin(n, "input");
     cJSON* p = n->params;
     const char* op = n->op;
-    if (!o || o->dtype != T_F32) return 0;
+    if (!o) return 0;
+    if (try_gpu_graph_typed_control(n, in, o, &g_opengl_f32_ops)) {
+        *node_backend = "opengl-graph";
+        return 1;
+    }
+    if (o->dtype != T_F32) return 0;
 
     if (!strcmp(op, "QConv2D")) {
         return 0;
@@ -1172,7 +1433,7 @@ static int try_opengl_graph_node(Node* n, int idx, const char** node_backend) {
         return 0;
     }
 
-    if (!strcmp(op, "ReLU") || !strcmp(op, "GELU") || !strcmp(op, "SiLU") || !strcmp(op, "Swish") ||
+    if (!strcmp(op, "ReLU") || !strcmp(op, "GELU") || !strcmp(op, "SiLU") ||
         !strcmp(op, "Tanh") || !strcmp(op, "HardSwish") || !strcmp(op, "HardSigmoid")) {
         if (!in) return 0;
         materialize_tensor_f32(in);
@@ -1184,7 +1445,7 @@ static int try_opengl_graph_node(Node* n, int idx, const char** node_backend) {
             if (gelu_approximate_tanh(p, &approximate_tanh) != 0) return 0;
             ok = opengl_graph_gelu_f32(in->data, o->data, o->numel, approximate_tanh);
         }
-        else if (!strcmp(op, "SiLU") || !strcmp(op, "Swish")) ok = opengl_graph_silu_f32(in->data, o->data, o->numel);
+        else if (!strcmp(op, "SiLU")) ok = opengl_graph_silu_f32(in->data, o->data, o->numel);
         else if (!strcmp(op, "Tanh")) ok = opengl_graph_tanh_f32(in->data, o->data, o->numel);
         else if (!strcmp(op, "HardSwish")) ok = opengl_graph_hardswish_f32(in->data, o->data, o->numel);
         else ok = opengl_graph_hardsigmoid_f32(in->data, o->data, o->numel);
@@ -1218,13 +1479,17 @@ static int try_opengl_graph_node(Node* n, int idx, const char** node_backend) {
 
     if (!strcmp(op, "LayerNorm")) {
         T* w = nin(n, "weight"); T* b = nin(n, "bias");
-        if (!in || !w || !b) return 0;
+        if (!in || !w || !b || in->ndim <= 0) return 0;
         materialize_tensor_f32(in); materialize_tensor_f32(w); materialize_tensor_f32(b);
         int d_model = p_int(p, "d_model", in->shape[in->ndim - 1]);
-        int rows = d_model > 0 ? (int)(in->numel / d_model) : 0;
+        long rows = d_model > 0 ? in->numel / d_model : 0;
+        float epsilon = p_flt(p, "eps", 1.0e-6f);
         if (in->dtype == T_F32 && w->dtype == T_F32 && b->dtype == T_F32 && o->numel == in->numel &&
-            w->numel >= d_model && b->numel >= d_model &&
-            opengl_graph_layernorm_f32(in->data, w->data, b->data, o->data, rows, d_model)) {
+            d_model > 0 && in->numel % d_model == 0 && rows > 0 && rows <= INT32_MAX &&
+            w->numel == d_model && b->numel == d_model &&
+            epsilon > 0.0f && isfinite(epsilon) &&
+            opengl_graph_layernorm_f32(in->data, w->data, b->data, o->data,
+                                       (int)rows, d_model, epsilon)) {
             *node_backend = "opengl-graph";
             return 1;
         }
@@ -1334,7 +1599,7 @@ static int try_opengl_graph_node(Node* n, int idx, const char** node_backend) {
         return 0;
     }
 
-    if (!strcmp(op, "AveragePool") || !strcmp(op, "AveragePool2D")) {
+    if (!strcmp(op, "AveragePool2D")) {
         if (!in || in->ndim != 4 || o->ndim != 4) return 0;
         materialize_tensor_f32(in);
         int ky, kx, sy, sx, py, px;
@@ -1388,8 +1653,10 @@ static int try_opengl_graph_node(Node* n, int idx, const char** node_backend) {
     if (!strcmp(op, "Transpose")) {
         if (!in || in->ndim <= 0 || in->ndim > 8) return 0;
         materialize_tensor_f32(in);
-        int perm[8]; for (int i = 0; i < in->ndim; i++) perm[i] = i;
-        p_iarr(p, "perm", perm, in->ndim, 0);
+        int perm[8];
+        for (int i = 0; i < in->ndim; i++) perm[i] = in->ndim - 1 - i;
+        if (p && cJSON_GetObjectItem(p, "perm"))
+            p_iarr(p, "perm", perm, in->ndim, 0);
         if (in->dtype == T_F32 && o->numel == in->numel &&
             opengl_graph_transpose_f32(in->data, o->data, in->shape, perm, in->ndim)) {
             *node_backend = "opengl-graph";
@@ -1403,22 +1670,6 @@ static int try_opengl_graph_node(Node* n, int idx, const char** node_backend) {
         if (!x) return 0;
         materialize_tensor_f32(x);
         if (x->dtype == T_F32 && x->numel == o->numel && opengl_graph_cast_copy_f32(x->data, o->data, o->numel)) {
-            *node_backend = "opengl-graph";
-            return 1;
-        }
-        return 0;
-    }
-
-    if (!strcmp(op, "QuantizeLinear")) {
-        if (try_gpu_graph_quantize_linear(n, in, o, &g_opengl_f32_ops)) {
-            *node_backend = "opengl-graph";
-            return 1;
-        }
-        return 0;
-    }
-
-    if (!strcmp(op, "DequantizeLinear")) {
-        if (try_gpu_graph_dequantize_linear(n, in, o, &g_opengl_f32_ops)) {
             *node_backend = "opengl-graph";
             return 1;
         }
@@ -1453,14 +1704,18 @@ static int try_opengl_graph_node(Node* n, int idx, const char** node_backend) {
 
     if (!strcmp(op, "Gather")) {
         T* idx = nin(n, "indices");
+        int outer, axis_size, inner, indices_elements, output_elements;
+        int axis;
         if (!in || !idx || in->ndim <= 0) return 0;
-        int axis = p_int(p, "axis", 0); if (axis < 0) axis += in->ndim;
-        if (axis != 0) return 0;
-        materialize_tensor_f32(in); materialize_tensor_f32(idx);
-        int row_size = 1; for (int i = 1; i < in->ndim; i++) row_size *= in->shape[i];
-        int num_idx = row_size > 0 ? (int)(o->numel / row_size) : 0;
-        if (in->dtype == T_F32 && idx->dtype == T_F32 && num_idx > 0 &&
-            opengl_graph_gather_axis0_f32(in->data, idx->data, o->data, row_size, in->shape[0], num_idx)) {
+        axis = normalize_axis(p_int(p, "axis", 0), in->ndim);
+        materialize_tensor_f32(in);
+        if (gather_i32_dimensions(in, idx, o, axis, &outer, &axis_size,
+                                  &inner, &indices_elements,
+                                  &output_elements) &&
+            opengl_graph_gather_i32_f32(in->data,
+                                        (const int32_t*)idx->data, o->data,
+                                        outer, axis_size, inner,
+                                        indices_elements, output_elements)) {
             *node_backend = "opengl-graph";
             return 1;
         }
@@ -1577,7 +1832,7 @@ static int try_opengl_graph_node(Node* n, int idx, const char** node_backend) {
         return 0;
     }
 
-    if (!strcmp(op, "InterpLinear1D") || !strcmp(op, "Interp1D")) {
+    if (!strcmp(op, "Interpolate1D")) {
         if (!in || in->ndim != 2 || o->ndim != 2) return 0;
         materialize_tensor_f32(in);
         int channels = in->shape[in->ndim - 2];
@@ -1658,6 +1913,8 @@ static int try_opengl_graph_node(Node* n, int idx, const char** node_backend) {
 }
 #endif
 
+#include "engine_runtime_cuda_f32.inc"
+
 #if VOLVOXAI_ENABLE_METAL
 static int try_metal_graph_node(Node* n, int idx, const char** node_backend) {
     if (!n || g_active_row >= 0 || g_prefix_rows > 0) return 0;
@@ -1665,7 +1922,12 @@ static int try_metal_graph_node(Node* n, int idx, const char** node_backend) {
     T* in = nin(n, "input");
     cJSON* p = n->params;
     const char* op = n->op;
-    if (!o || o->dtype != T_F32) return 0;
+    if (!o) return 0;
+    if (try_gpu_graph_typed_control(n, in, o, &g_metal_f32_ops)) {
+        *node_backend = "metal-graph";
+        return 1;
+    }
+    if (o->dtype != T_F32) return 0;
 
     if (!strcmp(op, "Conv2D")) {
         T* weight = nin(n, "weight");
@@ -1728,7 +1990,18 @@ static int try_metal_graph_node(Node* n, int idx, const char** node_backend) {
         return 0;
     }
 
-    if (!strcmp(op, "GELU") || !strcmp(op, "SiLU") || !strcmp(op, "Swish")) {
+    if (!strcmp(op, "Sigmoid")) {
+        if (!in || !tensor_same_shape(in, o)) return 0;
+        materialize_tensor_f32(in);
+        if (in->dtype == T_F32 &&
+            metal_graph_sigmoid_f32(in->data, o->data, o->numel)) {
+            *node_backend = "metal-graph";
+            return 1;
+        }
+        return 0;
+    }
+
+    if (!strcmp(op, "GELU") || !strcmp(op, "SiLU")) {
         if (!in || in->dtype != T_F32 || in->numel != o->numel) return 0;
         int ok;
         if (!strcmp(op, "GELU")) {
@@ -1782,6 +2055,27 @@ static int try_metal_graph_node(Node* n, int idx, const char** node_backend) {
         return 0;
     }
 
+    if (!strcmp(op, "Softmax")) {
+        long rows;
+        int axis;
+        int d;
+        if (!in || in->ndim <= 0 || !tensor_same_shape(in, o)) return 0;
+        axis = p_int(p, "axis", in->ndim - 1);
+        if (axis < 0) axis += in->ndim;
+        if (axis != in->ndim - 1) return 0;
+        materialize_tensor_f32(in);
+        d = in->shape[in->ndim - 1];
+        if (in->dtype != T_F32 || d <= 0 || in->numel <= 0 ||
+            in->numel % d != 0) return 0;
+        rows = in->numel / d;
+        if (rows <= 0 || rows > INT32_MAX) return 0;
+        if (metal_graph_softmax_f32(in->data, o->data, (int)rows, d)) {
+            *node_backend = "metal-graph";
+            return 1;
+        }
+        return 0;
+    }
+
     if (!strcmp(op, "ReduceSum") || !strcmp(op, "ReduceMean")) {
         T* source = NULL;
         long rows = 0;
@@ -1800,9 +2094,131 @@ static int try_metal_graph_node(Node* n, int idx, const char** node_backend) {
         if (!in || in->dtype != T_F32 || in->ndim <= 0 || in->ndim > 8 ||
             in->ndim != o->ndim || in->numel != o->numel) return 0;
         int perm[8];
-        for (int dimension = 0; dimension < in->ndim; dimension++) perm[dimension] = dimension;
-        p_iarr(p, "perm", perm, in->ndim, 0);
+        for (int dimension = 0; dimension < in->ndim; dimension++)
+            perm[dimension] = in->ndim - 1 - dimension;
+        if (p && cJSON_GetObjectItem(p, "perm"))
+            p_iarr(p, "perm", perm, in->ndim, 0);
         if (metal_graph_transpose_f32(in->data, o->data, in->shape, perm, in->ndim)) {
+            *node_backend = "metal-graph";
+            return 1;
+        }
+        return 0;
+    }
+
+    if (!strcmp(op, "Expand") || !strcmp(op, "Broadcast")) {
+        T* source = in ? in : nin(n, "data");
+        if (!source) return 0;
+        materialize_tensor_f32(source);
+        if (source->dtype == T_F32 &&
+            metal_graph_expand_f32(source->data, o->data,
+                                   source->shape, source->ndim,
+                                   o->shape, o->ndim)) {
+            *node_backend = "metal-graph";
+            return 1;
+        }
+        return 0;
+    }
+
+    if (!strcmp(op, "Gather")) {
+        T* indices = nin(n, "indices");
+        int outer;
+        int axis_size;
+        int inner;
+        int indices_elements;
+        int output_elements;
+        int axis;
+        int expected_rank;
+        int output_dimension = 0;
+        if (!in || !indices || in->ndim <= 0 ||
+            indices->ndim < 0 || indices->ndim > 8)
+            return 0;
+        axis = normalize_axis(p_int(p, "axis", 0), in->ndim);
+        expected_rank = in->ndim - 1 + indices->ndim;
+        if (axis < 0 || axis >= in->ndim ||
+            expected_rank < 0 || expected_rank > 8 ||
+            o->ndim != expected_rank)
+            return 0;
+        for (int dimension = 0; dimension < axis; dimension++) {
+            if (o->shape[output_dimension++] != in->shape[dimension])
+                return 0;
+        }
+        for (int dimension = 0; dimension < indices->ndim; dimension++) {
+            if (indices->shape[dimension] <= 0 ||
+                o->shape[output_dimension++] != indices->shape[dimension])
+                return 0;
+        }
+        for (int dimension = axis + 1; dimension < in->ndim; dimension++) {
+            if (o->shape[output_dimension++] != in->shape[dimension])
+                return 0;
+        }
+        materialize_tensor_f32(in);
+        if (gather_i32_dimensions(in, indices, o, axis, &outer,
+                                  &axis_size, &inner, &indices_elements,
+                                  &output_elements) &&
+            metal_graph_gather_i32_f32(
+                in->data, (const int32_t*)indices->data, o->data,
+                outer, axis_size, inner, indices_elements,
+                output_elements)) {
+            *node_backend = "metal-graph";
+            return 1;
+        }
+        return 0;
+    }
+
+    if (!strcmp(op, "Slice")) {
+        T* source = in ? in : nin(n, "data");
+        cJSON* starts_node =
+            p ? cJSON_GetObjectItemCaseSensitive(p, "starts") : NULL;
+        cJSON* axes_node =
+            p ? cJSON_GetObjectItemCaseSensitive(p, "axes") : NULL;
+        cJSON* steps_node =
+            p ? cJSON_GetObjectItemCaseSensitive(p, "steps") : NULL;
+        if (!source || source->ndim <= 0 || source->ndim > 4 ||
+            o->ndim != source->ndim ||
+            !cJSON_IsArray(starts_node) || !cJSON_IsArray(axes_node) ||
+            !cJSON_IsArray(steps_node))
+            return 0;
+        int slice_axes = cJSON_GetArraySize(axes_node);
+        if (slice_axes <= 0 || slice_axes > source->ndim ||
+            cJSON_GetArraySize(starts_node) != slice_axes ||
+            cJSON_GetArraySize(steps_node) != slice_axes)
+            return 0;
+        int starts[4] = {0, 0, 0, 0};
+        int axes[4] = {0, 1, 2, 3};
+        int steps[4] = {1, 1, 1, 1};
+        int starts4[4] = {0, 0, 0, 0};
+        int steps4[4] = {1, 1, 1, 1};
+        unsigned selected_axes = 0u;
+        p_iarr(p, "starts", starts, 4, 0);
+        p_iarr(p, "axes", axes, 4, 0);
+        p_iarr(p, "steps", steps, 4, 1);
+        int base = 4 - source->ndim;
+        for (int index = 0; index < slice_axes; index++) {
+            int slice_axis = axes[index];
+            if (slice_axis < 0) slice_axis += source->ndim;
+            if (slice_axis < 0 || slice_axis >= source->ndim ||
+                (selected_axes & (1u << slice_axis)) ||
+                steps[index] <= 0)
+                return 0;
+            int start = starts[index] < 0
+                ? starts[index] + source->shape[slice_axis]
+                : starts[index];
+            if (start < 0 || start >= source->shape[slice_axis])
+                return 0;
+            selected_axes |= 1u << slice_axis;
+            starts4[base + slice_axis] = start;
+            steps4[base + slice_axis] = steps[index];
+        }
+        for (int dimension = 0; dimension < source->ndim; dimension++) {
+            if (!(selected_axes & (1u << dimension)) &&
+                o->shape[dimension] != source->shape[dimension])
+                return 0;
+        }
+        materialize_tensor_f32(source);
+        if (source->dtype == T_F32 &&
+            metal_graph_slice4d_f32(
+                source->data, o->data, source->shape, source->ndim,
+                o->shape, o->ndim, starts4, steps4)) {
             *node_backend = "metal-graph";
             return 1;
         }
@@ -1890,22 +2306,6 @@ static int try_metal_graph_node(Node* n, int idx, const char** node_backend) {
 
     if (!strcmp(op, "Embedding")) {
         if (try_gpu_graph_embedding(n, in, o, &g_metal_f32_ops)) {
-            *node_backend = "metal-graph";
-            return 1;
-        }
-        return 0;
-    }
-
-    if (!strcmp(op, "QuantizeLinear")) {
-        if (try_gpu_graph_quantize_linear(n, in, o, &g_metal_f32_ops)) {
-            *node_backend = "metal-graph";
-            return 1;
-        }
-        return 0;
-    }
-
-    if (!strcmp(op, "DequantizeLinear")) {
-        if (try_gpu_graph_dequantize_linear(n, in, o, &g_metal_f32_ops)) {
             *node_backend = "metal-graph";
             return 1;
         }

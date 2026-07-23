@@ -31,7 +31,6 @@ import argMaxF32Shader from '../../shaders/inference/argMaxF32.wgsl';
 import argMaxI32Shader from '../../shaders/inference/argMaxI32.wgsl';
 import argMaxI8Shader from '../../shaders/inference/argMaxI8.wgsl';
 import averagePool2DShader from '../../shaders/inference/averagePool2D.wgsl';
-import gatherShader from '../../shaders/inference/gather.wgsl';
 import gatherInt32Shader from '../../shaders/inference/gatherInt32.wgsl';
 import gatherElementsShader from '../../shaders/inference/gatherElements.wgsl';
 import whereShader from '../../shaders/inference/where.wgsl';
@@ -59,6 +58,7 @@ import qArgMaxInt8Shader from '../../shaders/inference/qArgMaxInt8.wgsl';
 import qSiLUInt8Shader from '../../shaders/inference/qSiLUInt8.wgsl';
 import requantizeLinearTypedShader from '../../shaders/inference/requantizeLinearTyped.wgsl';
 import expandShader from '../../shaders/inference/expand.wgsl';
+import expandTypedShader from '../../shaders/inference/expandTyped.wgsl';
 import padShader from '../../shaders/inference/pad.wgsl';
 import convTranspose2DShader from '../../shaders/inference/convTranspose2D.wgsl';
 import reLUShader from '../../shaders/inference/reLU.wgsl';
@@ -76,6 +76,7 @@ import concatCopyTypedShader from '../../shaders/inference/concatCopyTyped.wgsl'
 import concat2Shader from '../../shaders/inference/concat2.wgsl';
 import broadcastBinaryShader from '../../shaders/inference/broadcastBinary.wgsl';
 import generalTransposeShader from '../../shaders/inference/generalTranspose.wgsl';
+import transposeTypedShader from '../../shaders/inference/transposeTyped.wgsl';
 import splitShader from '../../shaders/inference/split.wgsl';
 import profileYShader from '../../shaders/inference/profileY.wgsl';
 import profileXShader from '../../shaders/inference/profileX.wgsl';
@@ -96,6 +97,14 @@ import nonMaxSuppressionShader from '../../shaders/inference/nonMaxSuppression.w
 import moeRouterShader from '../../shaders/inference/moeRouter.wgsl';
 import moeLinearShader from '../../shaders/inference/moeLinear.wgsl';
 import loraApplyShader from '../../shaders/inference/loraApply.wgsl';
+import incrementalRowByteCopyShader from '../../shaders/inference/incrementalRowByteCopy.wgsl';
+import batchMatMulShader from '../../shaders/inference/batchMatMul.wgsl';
+import qBatchMatMulShader from '../../shaders/inference/qBatchMatMul.wgsl';
+import compareI32Shader from '../../shaders/inference/compareI32.wgsl';
+import notI32Shader from '../../shaders/inference/notI32.wgsl';
+import clipTypedShader from '../../shaders/inference/clipTyped.wgsl';
+import concatCopy32Shader from '../../shaders/inference/concatCopy32.wgsl';
+import copy32Shader from '../../shaders/inference/copy32.wgsl';
 
 export class ShaderLibrary {
   static getLinearF32Shader() {
@@ -197,9 +206,6 @@ export class ShaderLibrary {
   static getAveragePool2DShader() {
     return averagePool2DShader;
   }
-  static getGatherShader() {
-    return gatherShader;
-  }
   static getGatherInt32Shader() {
     return gatherInt32Shader;
   }
@@ -281,6 +287,9 @@ export class ShaderLibrary {
   static getExpandShader() {
     return expandShader;
   }
+  static getTypedExpandShader() {
+    return expandTypedShader;
+  }
   static getPadShader() {
     return padShader;
   }
@@ -332,6 +341,9 @@ export class ShaderLibrary {
   }
   static getGeneralTransposeShader() {
     return generalTransposeShader;
+  }
+  static getTypedTransposeShader() {
+    return transposeTypedShader;
   }
   static getSplitShader() {
     return splitShader;
@@ -392,5 +404,29 @@ export class ShaderLibrary {
   }
   static getLoRAApplyShader() {
     return loraApplyShader;
+  }
+  static getIncrementalRowByteCopyShader() {
+    return incrementalRowByteCopyShader;
+  }
+  static getBatchMatMulShader() {
+    return batchMatMulShader;
+  }
+  static getQBatchMatMulShader() {
+    return qBatchMatMulShader;
+  }
+  static getCompareI32Shader() {
+    return compareI32Shader;
+  }
+  static getNotI32Shader() {
+    return notI32Shader;
+  }
+  static getTypedClipShader() {
+    return clipTypedShader;
+  }
+  static getConcatCopy32Shader() {
+    return concatCopy32Shader;
+  }
+  static getCopy32Shader() {
+    return copy32Shader;
   }
 }

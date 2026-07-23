@@ -1,13 +1,8 @@
-static void matmul_f32_out_in(const float* input, const float* weight, const float* bias,
-                              float* output, int rows, int d_in, int d_out) {
-    for (int row = 0; row < rows; row++) {
-        for (int j = 0; j < d_out; j++) {
-            float sum = bias ? bias[j] : 0.0f;
-            for (int k = 0; k < d_in; k++) sum += input[(size_t)row * d_in + k] * weight[(size_t)j * d_in + k];
-            output[(size_t)row * d_out + j] = sum;
-        }
-    }
-}
+/* Lives beside matmul_f32 in broadcast_ops.c so both layouts share one runtime
+ * ISA dispatch; it used to be a scalar loop here and was the only Linear
+ * fallback left unvectorized. */
+void matmul_f32_out_in(const float* input, const float* weight, const float* bias,
+                       float* output, int rows, int d_in, int d_out);
 
 static int linear_node_weight_layout(Node* node, const T* input, const T* output,
                                      const T* weight, int* out_in) {
@@ -59,7 +54,7 @@ static int route_index_write(T* indices, long index, int value) {
     return -1;
 }
 
-static int moe_router_forward(Node* n) {
+static int moe_router_forward(Node* n, int use_cuda) {
     T* in = node_input_default(n);
     T* w = nin(n, "weight");
     T* b = nin(n, "bias");
@@ -81,9 +76,22 @@ static int moe_router_forward(Node* n) {
     long tokens = in->numel / d_model;
     if (in->numel != tokens * d_model || indices->numel != tokens * top_k ||
         weights->numel != tokens * top_k || tokens <= 0 ||
-        tokens > UINT32_MAX || indices->numel > UINT32_MAX ||
+        tokens > INT_MAX || indices->numel > UINT32_MAX ||
         (size_t)indices->numel > SIZE_MAX / sizeof(float) ||
         w->numel != (long)d_model * num_experts) return -1;
+#if VOLVOXAI_ENABLE_CUDA
+    if (use_cuda) {
+        if (indices->dtype != T_F32 ||
+            !cuda_graph_moe_router_f32(
+                in->data, w->data, b ? b->data : NULL, indices->data,
+                weights->data, (int)tokens, d_model, num_experts, top_k,
+                temperature, p_int(n->params, "normalize", 1) ? 1 : 0))
+            return -1;
+        return 0;
+    }
+#else
+    if (use_cuda) return -1;
+#endif
     float* kernel_indices = indices->dtype == T_F32 ? indices->data :
         (float*)malloc((size_t)indices->numel * sizeof(float));
     if (!kernel_indices) return -1;
@@ -104,7 +112,7 @@ static int moe_router_forward(Node* n) {
     return ok ? 0 : -1;
 }
 
-static int moe_linear_forward(Node* n, T* out) {
+static int moe_linear_forward(Node* n, T* out, int use_cuda) {
     T* in = node_input_default(n);
     T* ew = nin(n, "expert_weight");
     T* eb = nin(n, "expert_bias");
@@ -126,10 +134,23 @@ static int moe_linear_forward(Node* n, T* out) {
     if (out->numel != tokens * d_out || tokens <= 0 || indices->numel != weights->numel ||
         indices->numel % tokens) return -1;
     int top_k = (int)(indices->numel / tokens);
-    if (top_k <= 0 || top_k > num_experts || tokens > UINT32_MAX ||
+    if (top_k <= 0 || top_k > num_experts || tokens > INT_MAX ||
         indices->numel > UINT32_MAX ||
         (size_t)indices->numel > SIZE_MAX / sizeof(float) ||
         ew->numel != (long)num_experts * d_in * d_out) return -1;
+#if VOLVOXAI_ENABLE_CUDA
+    if (use_cuda) {
+        if (indices->dtype != T_F32 ||
+            !cuda_graph_moe_linear_f32(
+                in->data, ew->data, eb ? eb->data : NULL, indices->data,
+                weights->data, out->data, (int)tokens, d_in, d_out,
+                num_experts, top_k))
+            return -1;
+        return 0;
+    }
+#else
+    if (use_cuda) return -1;
+#endif
     float* kernel_indices = indices->dtype == T_F32 ? indices->data :
         (float*)malloc((size_t)indices->numel * sizeof(float));
     if (!kernel_indices) return -1;
@@ -156,34 +177,10 @@ static int moe_linear_forward(Node* n, T* out) {
  * model lock.  Keep the per-node dispatch facts here rather than widening the
  * public VxBackend ABI with engine-private graph metadata. */
 typedef struct {
-    int active;
-    int idx;
-    int is_last;
-    int adapter_linear;
-    int native_w8a8;
-    int native_physical_qlinear;
-    int native_physical_qembedding;
-    int native_physical_qconv;
-    int native_physical_qadd;
-    int native_physical_qsilu;
-    int native_physical_qgelu;
-    int native_physical_qgroupnorm;
-    int native_physical_qlayernorm;
-    int native_physical_qsdpa;
-    int native_physical_qargmax;
-    int native_physical_qmaskedmean;
-    int native_physical_requantize;
-    int native_physical_quantize;
-    int native_physical_dequantize;
-    int native_physical_shape;
-    int qtensor_node;
-    const char** node_backend;
-} VxRuntimeNodeState;
-
-typedef struct {
     const VxW8A8Ops* (*w8a8_ops)(void);
     int (*try_graph_node)(Node* node, int index, const char** node_backend);
     const char* qlinear_label;
+    const char* qbatch_matmul_label;
     const char* qembedding_label;
     const char* qconv_label;
     const char* qadd_label;
@@ -199,49 +196,25 @@ typedef struct {
     const char* dequantize_label;
     const char* shape_alias_label;
     const char* copy_label;
+    const char* transpose_label;
     const char* resize_label;
     const char* maxpool_label;
     const char* concat_label;
 } VxDeviceRoute;
 
-static VxRuntimeNodeState g_vx_runtime_node;
-static int g_vx_cpu_dispatch;
-
-/* V1 deliberately exposes complete inference nodes, not the runtime's
- * training tape, adapter composition, legacy QTensor sidecars, or partial-row
- * execution window.  Until a future ABI describes those semantics, decline
- * the public SDK bridge and let the remaining built-in registry entries keep
- * their existing correctness behavior. */
-int vx_runtime_backend_sdk_execution_eligible(void) {
+/* Static graph replay is disabled while request-specific execution state is
+ * active. */
+int vx_runtime_full_graph_execution_eligible(void) {
 #if VOLVOXAI_ENABLE_TRAINING
     if (g_native_training_mode) return 0;
 #endif
     return g_active_row < 0 && g_prefix_rows == 0 && g_execution_row < 0;
 }
 
-int vx_runtime_backend_sdk_node_eligible(const Node* node) {
-    int index;
-    if (!node || !g_vx_runtime_node.active ||
-        !vx_runtime_backend_sdk_execution_eligible() ||
-        g_vx_runtime_node.adapter_linear || g_vx_runtime_node.qtensor_node)
-        return 0;
-
-    /* Fusion passes may redirect Node.out, skip a consumer, or attach private
-     * epilogue/peer state that V1 intentionally does not expose.  Offering the
-     * original public operands in that state would let a backend write the
-     * pre-fusion tensor while the runtime marks the redirected output current.
-     * Keep every transformed producer on the built-in correctness path. */
-    index = g_vx_runtime_node.idx;
-    if (node->fuse_relu6 ||
-        (node->nout > 0 && strcmp(node->out, node->outs[0].name)) ||
-        (index >= 0 && index < MAXN &&
-         (g_node_fusion[index].id || g_concat_sigmoid_fuse[index] >= 0)))
-        return 0;
-    return 1;
-}
-
 static int vx_runtime_node_has_physical_gpu_op(const VxRuntimeNodeState* state) {
-    return state->native_physical_qlinear || state->native_physical_qembedding ||
+    return state->native_physical_qlinear ||
+        state->native_physical_qbatch_matmul ||
+        state->native_physical_qembedding ||
         state->native_physical_qconv || state->native_physical_qadd ||
         state->native_physical_qsilu || state->native_physical_qgelu ||
         state->native_physical_qgroupnorm || state->native_physical_qlayernorm ||
@@ -260,10 +233,16 @@ static int vx_device_route_run(const Node* node, T* input, T* output,
     if (!node || !output || !route || !state->active || !state->node_backend)
         return VX_BACKEND_DECLINED;
     w8a8 = route->w8a8_ops ? route->w8a8_ops() : NULL;
-    if (state->adapter_linear || state->native_w8a8) return VX_BACKEND_DECLINED;
+    if (state->adapter_linear) return VX_BACKEND_DECLINED;
     if (state->native_physical_qlinear)
-        return qlinear_physical_gpu_forward(state->idx, mutable_node, output, w8a8,
+        return qlinear_physical_gpu_forward(state->idx, mutable_node, output,
+                                             state->is_last, w8a8,
                                              route->qlinear_label, state->node_backend)
+            ? VX_BACKEND_HANDLED : VX_BACKEND_DECLINED;
+    if (state->native_physical_qbatch_matmul)
+        return qbatch_matmul_physical_gpu_forward(
+                   mutable_node, output, w8a8, route->qbatch_matmul_label,
+                   state->node_backend)
             ? VX_BACKEND_HANDLED : VX_BACKEND_DECLINED;
     if (state->native_physical_qconv)
         return qconv2d_physical_gpu_forward(state->idx, mutable_node, output, w8a8,
@@ -320,11 +299,12 @@ static int vx_device_route_run(const Node* node, T* input, T* output,
     if (state->native_physical_shape)
         return physical_shape_gpu_forward(mutable_node, state->idx, output, w8a8,
                                           route->shape_alias_label, route->copy_label,
-                                          route->resize_label, route->maxpool_label,
+                                          route->transpose_label, route->resize_label,
+                                          route->maxpool_label,
                                           route->concat_label, state->node_backend)
             ? VX_BACKEND_HANDLED : VX_BACKEND_DECLINED;
-    if (vx_runtime_node_has_physical_gpu_op(state) || state->qtensor_node ||
-        !route->try_graph_node) return VX_BACKEND_DECLINED;
+    if (vx_runtime_node_has_physical_gpu_op(state) || !route->try_graph_node)
+        return VX_BACKEND_DECLINED;
     return route->try_graph_node(mutable_node, state->idx, state->node_backend)
         ? VX_BACKEND_HANDLED : VX_BACKEND_DECLINED;
 }
@@ -334,6 +314,7 @@ static const VxDeviceRoute g_vx_vulkan_route = {
     .w8a8_ops = vx_w8a8_vulkan_ops,
     .try_graph_node = try_vulkan_graph_node,
     .qlinear_label = "vulkan-qlinear-w8a8",
+    .qbatch_matmul_label = "vulkan-qbatch-matmul-w8a8",
     .qembedding_label = "vulkan-qembedding-w8a8",
     .qconv_label = "vulkan-qconv-w8a8",
     .qadd_label = "vulkan-qadd-w8a8",
@@ -349,6 +330,7 @@ static const VxDeviceRoute g_vx_vulkan_route = {
     .dequantize_label = "vulkan-dequantize-w8a8",
     .shape_alias_label = "vulkan-shape-alias-w8a8",
     .copy_label = "vulkan-copy-w8a8",
+    .transpose_label = "vulkan-transpose-w8a8",
     .resize_label = "vulkan-resize-w8a8",
     .maxpool_label = "vulkan-maxpool-w8a8",
     .concat_label = "vulkan-concat-w8a8",
@@ -360,6 +342,7 @@ static const VxDeviceRoute g_vx_opengl_route = {
     .w8a8_ops = vx_w8a8_opengl_ops,
     .try_graph_node = try_opengl_graph_node,
     .qlinear_label = "opengl-qlinear-w8a8",
+    .qbatch_matmul_label = "opengl-qbatch-matmul-w8a8",
     .qembedding_label = "opengl-qembedding-w8a8",
     .qconv_label = "opengl-qconv-w8a8",
     .qadd_label = "opengl-qadd-w8a8",
@@ -375,6 +358,7 @@ static const VxDeviceRoute g_vx_opengl_route = {
     .dequantize_label = "opengl-dequantize-w8a8",
     .shape_alias_label = "opengl-shape-alias-w8a8",
     .copy_label = "opengl-copy-w8a8",
+    .transpose_label = "opengl-transpose-w8a8",
     .resize_label = "opengl-resize-w8a8",
     .maxpool_label = "opengl-maxpool-w8a8",
     .concat_label = "opengl-concat-w8a8",
@@ -386,6 +370,7 @@ static const VxDeviceRoute g_vx_metal_route = {
     .w8a8_ops = vx_w8a8_metal_ops,
     .try_graph_node = try_metal_graph_node,
     .qlinear_label = "metal-qlinear-w8a8",
+    .qbatch_matmul_label = "metal-qbatch-matmul-w8a8",
     .qembedding_label = "metal-qembedding-w8a8",
     .qconv_label = "metal-qconv-w8a8",
     .qadd_label = "metal-qadd-w8a8",
@@ -401,9 +386,38 @@ static const VxDeviceRoute g_vx_metal_route = {
     .dequantize_label = "metal-dequantize-w8a8",
     .shape_alias_label = "metal-shape-alias-w8a8",
     .copy_label = "metal-copy-w8a8",
+    .transpose_label = "metal-transpose-w8a8",
     .resize_label = "metal-resize-w8a8",
     .maxpool_label = "metal-maxpool-w8a8",
     .concat_label = "metal-concat-w8a8",
+};
+#endif
+
+#if VOLVOXAI_ENABLE_CUDA
+static const VxDeviceRoute g_vx_cuda_route = {
+    .w8a8_ops = vx_w8a8_cuda_ops,
+    .try_graph_node = try_cuda_graph_node,
+    .qlinear_label = "cuda-qlinear-w8a8",
+    .qbatch_matmul_label = "cuda-qbatch-matmul-w8a8",
+    .qembedding_label = "cuda-qembedding-w8a8",
+    .qconv_label = "cuda-qconv-w8a8",
+    .qadd_label = "cuda-qadd-w8a8",
+    .qsilu_label = "cuda-qsilu-w8a8",
+    .qgelu_label = "cuda-qgelu-w8a8",
+    .qgroupnorm_label = "cuda-qgroupnorm-w8a8",
+    .qlayernorm_label = "cuda-qlayernorm-w8a8",
+    .qsdpa_label = "cuda-qsdpa-w8a8",
+    .qargmax_label = "cuda-qargmax-w8a8",
+    .qmaskedmean_label = "cuda-qmaskedmean-w8a8",
+    .requantize_label = "cuda-requantize-w8a8",
+    .quantize_label = "cuda-quantize-w8a8",
+    .dequantize_label = "cuda-dequantize-w8a8",
+    .shape_alias_label = "cuda-shape-alias-w8a8",
+    .copy_label = "cuda-copy-w8a8",
+    .transpose_label = "cuda-transpose-w8a8",
+    .resize_label = "cuda-resize-w8a8",
+    .maxpool_label = "cuda-maxpool-w8a8",
+    .concat_label = "cuda-concat-w8a8",
 };
 #endif
 
@@ -427,6 +441,18 @@ static int vx_metal_graph_supports(void* user_data, const Node* node) {
     return node && g_use_metal ? VX_BACKEND_HANDLED : VX_BACKEND_DECLINED;
 }
 #endif
+#if VOLVOXAI_ENABLE_CUDA
+static int vx_cuda_linear_node(const Node* node) {
+    return node && (!strcmp(node->op, "Linear") ||
+                    !strcmp(node->op, "MatMul") ||
+                    !strcmp(node->op, "Gemm"));
+}
+
+static int vx_cuda_graph_supports(void* user_data, const Node* node) {
+    (void)user_data;
+    return node && g_use_cuda ? VX_BACKEND_HANDLED : VX_BACKEND_DECLINED;
+}
+#endif
 #if VOLVOXAI_ENABLE_VULKAN
 static int vx_vulkan_graph_run(void* user_data, const Node* node, T* input, T* output) {
     (void)user_data;
@@ -445,8 +471,40 @@ static int vx_metal_graph_run(void* user_data, const Node* node, T* input, T* ou
     return vx_device_route_run(node, input, output, &g_vx_metal_route);
 }
 #endif
+#if VOLVOXAI_ENABLE_CUDA
+static int vx_cuda_graph_run(void* user_data, const Node* node, T* input, T* output) {
+    int status;
+    (void)user_data;
+    if (node && !strcmp(node->op, "MoERouter")) {
+        if (moe_router_forward((Node*)node, 1) != 0) {
+            fprintf(stderr, "[CUDA] node 'MoERouter' failed in the CUDA graph route\n");
+            return VX_BACKEND_ERROR;
+        }
+        if (g_vx_runtime_node.node_backend)
+            *g_vx_runtime_node.node_backend = "cuda-moe-router";
+        return VX_BACKEND_HANDLED;
+    }
+    if (node && !strcmp(node->op, "MoELinear")) {
+        if (moe_linear_forward((Node*)node, output, 1) != 0) {
+            fprintf(stderr, "[CUDA] node 'MoELinear' failed in the CUDA graph route\n");
+            return VX_BACKEND_ERROR;
+        }
+        if (g_vx_runtime_node.node_backend)
+            *g_vx_runtime_node.node_backend = "cuda-moe-linear";
+        return VX_BACKEND_HANDLED;
+    }
+    status = vx_device_route_run(node, input, output, &g_vx_cuda_route);
+    if (status != VX_BACKEND_DECLINED) return status;
+    /* A decline remains part of the selected built-in CUDA provider's route.
+     * The registry may reach its CPU operator entry when operator fallback is
+     * allowed; compile/execution route attestation rejects that exact route
+     * when fallback is forbidden. */
+    return VX_BACKEND_DECLINED;
+}
+#endif
 
 typedef struct {
+    const char* weight_name;
     const float* input;
     const float* weight;
     const float* bias;
@@ -454,10 +512,17 @@ typedef struct {
     int rows;
     int d_in;
     int d_out;
+    int out_in;
+    int batch_size;
+    long row_start;
+    long total_rows;
 } VxOneShotLinear;
 
 static int vx_prepare_one_shot_linear(const Node* node, T* input, T* output,
-                                      VxOneShotLinear* call) {
+                                      VxOneShotLinear* call,
+                                      long minimum_cost,
+                                      int full_tensor,
+                                      int allow_adapter) {
     const VxRuntimeNodeState* state = &g_vx_runtime_node;
     Node* mutable_node = (Node*)node;
     T* weight;
@@ -473,9 +538,10 @@ static int vx_prepare_one_shot_linear(const Node* node, T* input, T* output,
     int row_start;
     int row_count;
     long cost;
-    if (!node || !input || !output || !call || !state->active || state->adapter_linear ||
-        state->native_w8a8 || (strcmp(node->op, "MatMul") && strcmp(node->op, "Gemm") &&
-                               strcmp(node->op, "Linear"))) return 0;
+    if (!node || !input || !output || !call || !state->active ||
+        (state->adapter_linear && !allow_adapter) ||
+        (strcmp(node->op, "MatMul") && strcmp(node->op, "Gemm") &&
+         strcmp(node->op, "Linear"))) return 0;
     materialize_tensor_f32(input);
     weight = nin(mutable_node, "weight");
     bias = nin(mutable_node, "bias");
@@ -484,7 +550,7 @@ static int vx_prepare_one_shot_linear(const Node* node, T* input, T* output,
     d_in = input->shape[input->ndim - 1];
     d_out = output->shape[output->ndim - 1];
     if (d_in <= 0 || d_out <= 0 || linear_node_weight_layout(mutable_node, input, output,
-                                                               weight, &out_in) != 0 || out_in)
+                                                               weight, &out_in) != 0)
         return 0;
     prepared_weight = weight;
     prepared_bias = bias;
@@ -511,14 +577,21 @@ static int vx_prepare_one_shot_linear(const Node* node, T* input, T* output,
         return 0;
     total = input->numel / d_in;
     if (total <= 0 || input->numel != total * d_in || output->numel != total * d_out) return 0;
-    seq_range(total, &row_start, &row_count);
-    if (state->is_last && g_active_row < 0 && g_execution_row >= 0 && total > 1) {
-        row_start = g_execution_row;
-        row_count = 1;
+    if (full_tensor) {
+        if (total > INT_MAX) return 0;
+        row_start = 0;
+        row_count = (int)total;
+    } else {
+        seq_range(total, &row_start, &row_count);
+        if (state->is_last && g_active_row < 0 && g_execution_row >= 0 && total > 1) {
+            row_start = g_execution_row;
+            row_count = 1;
+        }
     }
     if (row_start < 0 || row_count <= 0 || (long)row_start + row_count > total) return 0;
     cost = (long)row_count * d_in * d_out;
-    if (cost < (1L << 20)) return 0;
+    if (minimum_cost > 0 && cost < minimum_cost) return 0;
+    call->weight_name = weight->name;
     call->input = input->data + (long)row_start * d_in;
     call->weight = prepared_weight->data;
     call->bias = prepared_bias ? prepared_bias->data : NULL;
@@ -526,6 +599,10 @@ static int vx_prepare_one_shot_linear(const Node* node, T* input, T* output,
     call->rows = row_count;
     call->d_in = d_in;
     call->d_out = d_out;
+    call->out_in = out_in;
+    call->batch_size = input->ndim >= 2 ? input->shape[0] : 1;
+    call->row_start = row_start;
+    call->total_rows = total;
     return 1;
 }
 
@@ -538,7 +615,10 @@ static int vx_nnapi_linear_run(void* user_data, const Node* node, T* input, T* o
     VxOneShotLinear call;
     (void)user_data;
     if (vk_sync_node_inputs((Node*)node) != 0) return VX_BACKEND_ERROR;
-    if (!vx_prepare_one_shot_linear(node, input, output, &call)) return VX_BACKEND_DECLINED;
+    if (!vx_prepare_one_shot_linear(node, input, output, &call,
+                                    1L << 20, 0, 0) ||
+        call.out_in)
+        return VX_BACKEND_DECLINED;
     nnapi_matmul(call.input, call.weight, call.bias, call.output,
                  call.rows, call.d_in, call.d_out);
     if (g_vx_runtime_node.node_backend) *g_vx_runtime_node.node_backend = "nnapi";
@@ -554,7 +634,10 @@ static int vx_vulkan_linear_run(void* user_data, const Node* node, T* input, T* 
     VxOneShotLinear call;
     (void)user_data;
     if (vk_sync_node_inputs((Node*)node) != 0) return VX_BACKEND_ERROR;
-    if (!vx_prepare_one_shot_linear(node, input, output, &call)) return VX_BACKEND_DECLINED;
+    if (!vx_prepare_one_shot_linear(node, input, output, &call,
+                                    1L << 20, 0, 0) ||
+        call.out_in)
+        return VX_BACKEND_DECLINED;
     if (!vk_matmul(call.input, call.weight, call.bias, call.output,
                    call.rows, call.d_in, call.d_out)) return VX_BACKEND_DECLINED;
     if (g_vx_runtime_node.node_backend) *g_vx_runtime_node.node_backend = "vulkan";
@@ -570,17 +653,92 @@ static int vx_opengl_linear_run(void* user_data, const Node* node, T* input, T* 
     VxOneShotLinear call;
     (void)user_data;
     if (vk_sync_node_inputs((Node*)node) != 0) return VX_BACKEND_ERROR;
-    if (!vx_prepare_one_shot_linear(node, input, output, &call)) return VX_BACKEND_DECLINED;
+    if (!vx_prepare_one_shot_linear(node, input, output, &call,
+                                    1L << 20, 0, 0) ||
+        call.out_in)
+        return VX_BACKEND_DECLINED;
     if (!opengl_matmul(call.input, call.weight, call.bias, call.output,
                        call.rows, call.d_in, call.d_out)) return VX_BACKEND_DECLINED;
     if (g_vx_runtime_node.node_backend) *g_vx_runtime_node.node_backend = "opengl";
     return VX_BACKEND_HANDLED;
 }
 #endif
+#if VOLVOXAI_ENABLE_CUDA
+static int vx_cuda_linear_supports(void* user_data, const Node* node) {
+    (void)user_data;
+    return g_use_cuda && vx_cuda_linear_node(node)
+        ? VX_BACKEND_HANDLED : VX_BACKEND_DECLINED;
+}
+static int vx_cuda_linear_run(void* user_data, const Node* node, T* input, T* output) {
+    VxOneShotLinear call;
+    VxAdapterLinearSegment* segments = NULL;
+    int segment_count = 0;
+    int adapter_linear = g_vx_runtime_node.adapter_linear;
+    (void)user_data;
+    /* The CUDA graph allocator resolves these host slices as interior views
+     * of the full resident tensor.  This keeps prefix/row execution local to
+     * the requested sequence window without treating stale host bytes as a
+     * second allocation. */
+    if (!vx_prepare_one_shot_linear(node, input, output, &call,
+                                    0, 0, 1)) {
+        return VX_BACKEND_DECLINED;
+    }
+    if (adapter_linear) {
+        segment_count = vx_adapter_run_linear_segments(
+            call.weight_name, call.batch_size, call.row_start, call.rows,
+            call.total_rows, call.d_in, call.d_out, NULL, 0);
+        if (segment_count < 0 ||
+            (segment_count > 0 &&
+             !(segments = (VxAdapterLinearSegment*)calloc(
+                 (size_t)segment_count, sizeof(*segments)))) ||
+            (segment_count > 0 && vx_adapter_run_linear_segments(
+                call.weight_name, call.batch_size, call.row_start, call.rows,
+                call.total_rows, call.d_in, call.d_out, segments,
+                segment_count) != segment_count)) {
+            free(segments);
+            fprintf(stderr,
+                    "[CUDA] node '%s' has an invalid routed LoRA binding\n",
+                    node && node->op[0] ? node->op : "<invalid>");
+            return VX_BACKEND_ERROR;
+        }
+    }
+    if (!cuda_graph_matmul_layout_f32(call.input, call.weight, call.bias,
+                                      call.output, call.rows, call.d_in,
+                                      call.d_out, call.out_in)) {
+        free(segments);
+        fprintf(stderr, "[CUDA] node '%s' failed in the CUDA Linear route\n",
+                node && node->op[0] ? node->op : "<invalid>");
+        return VX_BACKEND_ERROR;
+    }
+    for (int segment_index = 0; segment_index < segment_count;
+         segment_index++) {
+        VxAdapterLinearSegment* segment = &segments[segment_index];
+        if (!cuda_graph_lora_apply_f32(
+                call.input + (long)segment->row_start * call.d_in,
+                segment->a, segment->b,
+                call.output + (long)segment->row_start * call.d_out,
+                segment->row_count, call.d_in, segment->rank,
+                call.d_out, segment->scale)) {
+            free(segments);
+            fprintf(stderr,
+                    "[CUDA] node '%s' failed in the CUDA LoRA route\n",
+                    node && node->op[0] ? node->op : "<invalid>");
+            return VX_BACKEND_ERROR;
+        }
+    }
+    free(segments);
+    if (g_vx_runtime_node.node_backend)
+        *g_vx_runtime_node.node_backend = adapter_linear
+            ? "cuda-linear+lora" : "cuda-linear";
+    return VX_BACKEND_HANDLED;
+}
+#endif
 
 static int vx_cpu_backend_supports(void* user_data, const Node* node) {
     (void)user_data;
-    return node ? VX_BACKEND_HANDLED : VX_BACKEND_ERROR;
+    if (!node) return VX_BACKEND_ERROR;
+    return vx_kernel_registry_find("native-cpu", node->op)
+        ? VX_BACKEND_HANDLED : VX_BACKEND_ERROR;
 }
 static int vx_cpu_backend_run(void* user_data, const Node* node, T* input, T* output) {
     int result;
@@ -652,6 +810,33 @@ static int vx_metal_graph_sync(void* user_data, const void* host, size_t bytes, 
     return !g_use_metal || metal_graph_sync_host(host, bytes, is_weight) ? 1 : 0;
 }
 #endif
+#if VOLVOXAI_ENABLE_CUDA
+static void vx_cuda_graph_reset(void* user_data) { (void)user_data; cuda_graph_reset(); }
+static void vx_cuda_graph_begin(void* user_data) {
+    (void)user_data;
+    if (g_use_cuda)
+        cuda_graph_begin_runtime_forward(g_vx_cuda_replay_eligible,
+                                         g_vx_cuda_replay_generation);
+}
+static int vx_cuda_graph_end(void* user_data) {
+    (void)user_data;
+    return !g_use_cuda || cuda_graph_end_runtime_forward(g_vx_forward_ok) == 0
+        ? 0 : -1;
+}
+static void vx_cuda_graph_mark(void* user_data, const void* host, size_t bytes,
+                               int is_weight) {
+    (void)user_data;
+    if (g_use_cuda) cuda_graph_mark_host(host, bytes, is_weight);
+}
+static int vx_cuda_graph_sync(void* user_data, const void* host, size_t bytes,
+                              int is_weight) {
+    (void)user_data;
+    /* A CUDA optimizer slot can remain device-authoritative while policy is
+     * handing execution to CPU. Sync must therefore follow slot ownership,
+     * not only the currently selected route flag. */
+    return cuda_graph_sync_host(host, bytes, is_weight) ? 1 : 0;
+}
+#endif
 
 #if VOLVOXAI_ENABLE_VULKAN
 static const VxBackend g_vx_vulkan_graph_backend = {
@@ -683,6 +868,16 @@ static const VxBackend g_vx_metal_graph_backend = {
     .sync_host = vx_metal_graph_sync, .teardown = vx_backend_detach,
 };
 #endif
+#if VOLVOXAI_ENABLE_CUDA
+static const VxBackend g_vx_cuda_graph_backend = {
+    .name = "cuda-graph", .init = vx_backend_attach,
+    .supports = vx_cuda_graph_supports, .run = vx_cuda_graph_run,
+    .outputs_device_resident = 1,
+    .reset = vx_cuda_graph_reset, .begin_forward = vx_cuda_graph_begin,
+    .end_forward = vx_cuda_graph_end, .mark_host = vx_cuda_graph_mark,
+    .sync_host = vx_cuda_graph_sync, .teardown = vx_backend_detach,
+};
+#endif
 #if VOLVOXAI_ENABLE_NNAPI
 static const VxBackend g_vx_nnapi_linear_backend = {
     .name = "nnapi-linear", .init = vx_backend_attach,
@@ -704,21 +899,27 @@ static const VxBackend g_vx_opengl_linear_backend = {
     .teardown = vx_backend_detach,
 };
 #endif
+#if VOLVOXAI_ENABLE_CUDA
+static const VxBackend g_vx_cuda_linear_backend = {
+    .name = "cuda-linear", .init = vx_backend_attach,
+    .supports = vx_cuda_linear_supports, .run = vx_cuda_linear_run,
+    .outputs_device_resident = 1,
+    .mark_host = vx_cuda_graph_mark, .sync_host = vx_cuda_graph_sync,
+    .teardown = vx_backend_detach,
+};
+#endif
 static const VxBackend g_vx_cpu_backend = {
     .name = "cpu", .init = vx_backend_attach,
     .supports = vx_cpu_backend_supports, .run = vx_cpu_backend_run,
     .teardown = vx_backend_detach,
 };
 
-static VxBackendRegistry g_vx_backend_registry;
-static int vx_runtime_backend_registry_init(VxBackendRegistry* registry,
-                                            const VxBackend* sdk_backend) {
-    /* Graph routes precede the host-resident one-shot Linear routes.  Keeping
-     * those as separate entries preserves the historic order: graph Vulkan /
-     * OpenGL / Metal first, then NNAPI, Vulkan Linear, OpenGL Linear, CPU. */
+static int vx_runtime_backend_registry_init(VxBackendRegistry* registry) {
+    /* Graph routes precede the host-resident one-shot Linear routes. Keeping
+     * them separate preserves device-first routing and lets an unsupported
+     * graph node continue to a matching dense offload or required CPU fallback. */
     const VxBackend* backends[VX_BACKEND_MAX];
     size_t count = 0;
-    if (sdk_backend) backends[count++] = sdk_backend;
 #if VOLVOXAI_ENABLE_VULKAN
     backends[count++] = &g_vx_vulkan_graph_backend;
 #endif
@@ -727,6 +928,9 @@ static int vx_runtime_backend_registry_init(VxBackendRegistry* registry,
 #endif
 #if VOLVOXAI_ENABLE_METAL
     backends[count++] = &g_vx_metal_graph_backend;
+#endif
+#if VOLVOXAI_ENABLE_CUDA
+    backends[count++] = &g_vx_cuda_graph_backend;
 #endif
 #if VOLVOXAI_ENABLE_NNAPI
     backends[count++] = &g_vx_nnapi_linear_backend;
@@ -737,28 +941,69 @@ static int vx_runtime_backend_registry_init(VxBackendRegistry* registry,
 #if VOLVOXAI_ENABLE_OPENGL
     backends[count++] = &g_vx_opengl_linear_backend;
 #endif
+#if VOLVOXAI_ENABLE_CUDA
+    backends[count++] = &g_vx_cuda_linear_backend;
+#endif
     backends[count++] = &g_vx_cpu_backend;
     return vx_backend_registry_init(registry, backends, count, &g_vx_cpu_backend);
 }
 
 static int vx_runtime_backend_registry_ensure(void) {
     return g_vx_backend_registry.ready ? 0 :
-        vx_runtime_backend_registry_init(&g_vx_backend_registry,
-                                         vx_sdk_selected_backend());
+        vx_runtime_backend_registry_init(&g_vx_backend_registry);
 }
 
-int vx_runtime_backend_stage(const VxBackend* sdk_backend) {
+int vx_runtime_backend_stage(void) {
     VxBackendRegistry next = {0};
-    const VxBackend* active_sdk = g_vx_backend_registry.ready &&
-        g_vx_backend_registry.count > 0 &&
-        g_vx_backend_registry.backends[0]->required
-        ? g_vx_backend_registry.backends[0] : NULL;
-    if (g_vx_backend_registry.ready && active_sdk == sdk_backend) return 0;
-    if (vx_runtime_backend_registry_init(&next, sdk_backend) != 0)
+    if (vx_runtime_backend_registry_init(&next) != 0)
         return -1;
     vx_backend_registry_teardown(&g_vx_backend_registry);
     g_vx_backend_registry = next;
     return 0;
+}
+
+#if VOLVOXAI_ENABLE_CUDA
+static int vx_cuda_replay_safe_op(const char* op) {
+    if (!op || !op[0]) return 0;
+    return !strcmp(op, "Linear") || !strcmp(op, "Gemm") ||
+        !strcmp(op, "MatMul") || !strcmp(op, "PReLU") ||
+        !strcmp(op, "QBatchMatMul") ||
+        !strcmp(op, "Conv2D") || !strcmp(op, "Add") ||
+        !strcmp(op, "Concat") || !strcmp(op, "MaxPool2D") ||
+        !strcmp(op, "ResizeNearest2D") || !strcmp(op, "Reshape") ||
+        !strcmp(op, "Transpose") ||
+        !strcmp(op, "Sigmoid") || !strcmp(op, "QConv2D") ||
+        !strcmp(op, "QAdd") || !strcmp(op, "QuantizeLinear") ||
+        !strcmp(op, "DequantizeLinear") ||
+        !strcmp(op, "RequantizeLinear");
+}
+#endif
+
+int vx_runtime_backend_cuda_replay_eligible(void) {
+#if !VOLVOXAI_ENABLE_CUDA
+    return 0;
+#else
+    if (!g_use_cuda || g_debug || g_nn <= 0 ||
+        !vx_runtime_full_graph_execution_eligible() ||
+        volvoxai_engine_adapter_effect_active_locked()) return 0;
+#if VOLVOXAI_ENABLE_VULKAN
+    if (g_use_vulkan) return 0;
+#endif
+#if VOLVOXAI_ENABLE_OPENGL
+    if (g_use_opengl) return 0;
+#endif
+#if VOLVOXAI_ENABLE_METAL
+    if (g_use_metal) return 0;
+#endif
+    for (int node = 0; node < g_nn; node++) {
+        Node* current = &g_n[node];
+        if (current->skip || current->disabled) continue;
+        if (!vx_cuda_replay_safe_op(current->op)) return 0;
+        for (int input = 0; input < current->nin; input++)
+            if (vx_adapter_run_has_target(current->ins[input].name)) return 0;
+    }
+    return 1;
+#endif
 }
 
 void vx_runtime_backend_reset(void) {
@@ -767,18 +1012,53 @@ void vx_runtime_backend_reset(void) {
         release_retired_f16_storage();
     }
 }
+void vx_runtime_backend_reset_transients(void) {
+#if VOLVOXAI_ENABLE_CUDA
+    /* A configured built-in CUDA route is the only graph backend whose slots
+     * survive activation-address changes. Other routes retain the full reset
+     * contract used before persistent CUDA residency existed. */
+    if (g_use_cuda) {
+        cuda_graph_release_transients();
+        release_retired_f16_storage();
+        return;
+    }
+#endif
+    vx_runtime_backend_reset();
+}
 void vx_runtime_backend_teardown(void) {
     vx_backend_registry_teardown(&g_vx_backend_registry);
     release_retired_f16_storage();
     vx_kernels_shutdown();
 }
-void vx_runtime_backend_begin_forward(void) {
+void vx_runtime_backend_begin_forward(int ordinary_static_replay_eligible,
+                                      uint64_t model_generation) {
+    g_vx_cuda_replay_eligible = ordinary_static_replay_eligible;
+    g_vx_cuda_route_tracking = ordinary_static_replay_eligible;
+    g_vx_cuda_replay_generation = model_generation;
+    g_vx_forward_ok = 0;
     if (vx_runtime_backend_registry_ensure() == 0)
         vx_backend_registry_begin_forward(&g_vx_backend_registry);
+#if VOLVOXAI_ENABLE_CUDA && VOLVOXAI_ENABLE_TRAINING
+    if (g_use_cuda && cuda_profile_route_tracking_active())
+        g_vx_cuda_route_tracking = 1;
+#endif
 }
-int vx_runtime_backend_end_forward(void) {
-    return vx_runtime_backend_registry_ensure() == 0
+int vx_runtime_backend_prepare_forward(void) {
+#if VOLVOXAI_ENABLE_CUDA
+    if (g_use_cuda && cuda_graph_prepare_runtime_forward() != 0) return -1;
+#endif
+    return 0;
+}
+int vx_runtime_backend_end_forward(int forward_ok) {
+    int result;
+    g_vx_forward_ok = forward_ok;
+    result = vx_runtime_backend_registry_ensure() == 0
         ? vx_backend_registry_end_forward(&g_vx_backend_registry) : -1;
+    g_vx_cuda_replay_eligible = 0;
+    g_vx_cuda_route_tracking = 0;
+    g_vx_cuda_replay_generation = 0;
+    g_vx_forward_ok = 0;
+    return result;
 }
 void vx_runtime_backend_mark_host(const void* host, size_t bytes, int is_weight) {
     if (vx_runtime_backend_registry_ensure() == 0)
@@ -789,10 +1069,7 @@ int vx_runtime_backend_sync_host(const void* host, size_t bytes, int is_weight) 
         ? vx_backend_registry_sync_host(&g_vx_backend_registry, host, bytes, is_weight) : -1;
 }
 int vx_runtime_backend_has_graph(void) {
-    const VxBackend* sdk_backend = vx_sdk_selected_backend();
     return
-        (sdk_backend && (sdk_backend->outputs_device_resident ||
-                         sdk_backend->begin_forward || sdk_backend->mark_host)) ||
 #if VOLVOXAI_ENABLE_VULKAN
         g_use_vulkan ||
 #endif
@@ -802,12 +1079,51 @@ int vx_runtime_backend_has_graph(void) {
 #if VOLVOXAI_ENABLE_METAL
         g_use_metal ||
 #endif
+#if VOLVOXAI_ENABLE_CUDA
+        g_use_cuda ||
+#endif
         0;
 }
 
 static int vx_incremental_row_tensor_3d(const T* tensor, int row) {
     return tensor && tensor->ndim == 3 && tensor->shape[0] == 1 &&
         tensor->shape[1] > row && tensor->shape[2] > 0;
+}
+
+/* Compatibility is queried before the hybrid GPU-to-CPU ownership handoff,
+ * while g_dirty contains only the changed roots.  Mirror dependency
+ * propagation through the nodes preceding this one so a produced right-hand
+ * QBatchMatMul operand cannot be mistaken for a retained seed tensor. */
+static int vx_incremental_tensor_dirty_before_node(
+        const T* target, int node_index) {
+    unsigned char dirty[MAXT];
+    int target_index = t_index(target);
+    if (!target || target_index < 0 || target_index >= g_nt ||
+        node_index < 0 || node_index > g_nn || !g_incremental_plan.valid ||
+        g_incremental_plan.tensor_count != g_nt ||
+        g_incremental_plan.node_count != g_nn)
+        return 1;
+    memcpy(dirty, g_dirty, (size_t)g_nt);
+    for (int node = 0; node < node_index; node++) {
+        int should_run = 0;
+        if (g_incremental_plan.input_counts[node] > MAXIN ||
+            g_incremental_plan.output_counts[node] > MAXIN + 1)
+            return 1;
+        for (int input = 0;
+             input < g_incremental_plan.input_counts[node]; input++) {
+            int index = g_incremental_plan.input_indices[node][input];
+            if (index < 0 || index >= g_nt) return 1;
+            if (dirty[index]) should_run = 1;
+        }
+        if (!should_run) continue;
+        for (int output = 0;
+             output < g_incremental_plan.output_counts[node]; output++) {
+            int index = g_incremental_plan.output_indices[node][output];
+            if (index < 0 || index >= g_nt) return 1;
+            dirty[index] = 1;
+        }
+    }
+    return dirty[target_index] != 0;
 }
 
 /* A device seed may be handed to the existing CPU row implementation only
@@ -851,6 +1167,58 @@ int vx_runtime_node_incremental_row_compatible(Node* node, int idx, int row) {
             descriptor.tokens->ndim == 2 && descriptor.tokens->shape[0] == 1 &&
             descriptor.tokens->shape[1] > row &&
             vx_incremental_row_tensor_3d(output, row);
+    }
+
+    if (!strcmp(node->op, "QuantizeLinear")) {
+        T* scale = nin(node, "scale");
+        T* zero_point = nin(node, "zero_point");
+        if (!quantize_physical_row_compatible(node, output, row)) return 0;
+        if (g_cache_valid &&
+            ((scale && vx_incremental_tensor_dirty_before_node(scale, idx)) ||
+             (zero_point &&
+              vx_incremental_tensor_dirty_before_node(zero_point, idx)))) return 0;
+        return 1;
+    }
+
+    if (!strcmp(node->op, "DequantizeLinear")) {
+        T* scale = nin(node, "scale");
+        T* zero_point = nin(node, "zero_point");
+        if (!dequantize_physical_row_compatible(node, output, row)) return 0;
+        if (g_cache_valid &&
+            ((scale && vx_incremental_tensor_dirty_before_node(scale, idx)) ||
+             (zero_point &&
+              vx_incremental_tensor_dirty_before_node(zero_point, idx)))) return 0;
+        return 1;
+    }
+
+    if (!strcmp(node->op, "QBatchMatMul")) {
+        QBatchMatMulPhysicalDescriptor descriptor;
+        QBatchMatMulPhysicalRowDescriptor row_descriptor;
+        int b_dirty;
+        /* Model capability probing happens before a seed exists and uses a
+         * synthetic dirty root.  The real post-seed handoff is revalidated
+         * against the current dependency closure. */
+        if (qbatch_matmul_physical_validate(
+                node, output, &descriptor) != 0) return 0;
+        b_dirty = g_cache_valid
+            ? vx_incremental_tensor_dirty_before_node(descriptor.b, idx)
+            : 0;
+        return qbatch_matmul_physical_row_validate(
+                   &descriptor, row, b_dirty, &row_descriptor) == 0;
+    }
+
+    if (!strcmp(node->op, "Expand")) {
+        PhysicalByteExpandDescriptor descriptor;
+        if (physical_shape_expand_validate(node, output, &descriptor) != 0 ||
+            descriptor.input_rank != 3 || descriptor.output_rank != 3 ||
+            descriptor.input_shape[0] != 1u ||
+            descriptor.input_shape[1] != 1u ||
+            descriptor.output_shape[0] != 1u ||
+            descriptor.output_shape[1] <= (uint32_t)row ||
+            descriptor.input_shape[2] != descriptor.output_shape[2] ||
+            (g_cache_valid && vx_incremental_tensor_dirty_before_node(
+                descriptor.input, idx))) return 0;
+        return 1;
     }
 
     if (!strcmp(node->op, "QAdd")) {
@@ -911,6 +1279,8 @@ int vx_runtime_node_incremental_row_compatible(Node* node, int idx, int row) {
 
 // ---- run one node ---------------------------------------------------------
 int run_node(Node* n, int idx, int is_last) {
+    if (idx >= 0 && idx < MAXN)
+        vx_engine_state_current()->runtime_route_backend[idx] = NULL;
     if (n->skip || n->disabled) return 0;  // node fused/aliased or disabled by graph patching
     cJSON* p = n->params;
     T* o = t_find(n->out);
@@ -930,11 +1300,13 @@ int run_node(Node* n, int idx, int is_last) {
     int is_linear = !strcmp(op, "MatMul") || !strcmp(op, "Gemm") || !strcmp(op, "Linear");
     T* adapter_weight = is_linear ? nin(n, "weight") : NULL;
     int adapter_linear = adapter_weight && vx_adapter_run_has_target(adapter_weight->name);
-    QLinearParams native_qparams;
-    int native_w8a8 = is_linear ? qlinear_params(n, &native_qparams) : 0;
-    if (native_w8a8 < 0) return -1;
     int native_physical_qlinear = native_qlinear_op(op);
     if (native_physical_qlinear && (idx < 0 || idx >= MAXN || !g_qlinear_meta[idx].valid)) return -1;
+    QBatchMatMulPhysicalDescriptor qbatch_matmul_descriptor;
+    int native_physical_qbatch_matmul =
+        !strcmp(op, "QBatchMatMul") &&
+        qbatch_matmul_physical_validate(
+            n, o, &qbatch_matmul_descriptor) == 0;
     int native_physical_qembedding = native_qembedding_op(op);
     if (native_physical_qembedding &&
         (idx < 0 || idx >= MAXN || !g_qembedding_meta[idx].valid)) return -1;
@@ -958,7 +1330,6 @@ int run_node(Node* n, int idx, int is_last) {
     int native_physical_dequantize = !strcmp(op, "DequantizeLinear") &&
         dequantize_physical_candidate(n);
     int native_physical_shape = physical_shape_candidate(n, o);
-    int qtensor_node = node_uses_qtensor(n, o);
     int log_node = g_debug;
     double node_t0 = log_node ? volvoxai_engine_now_ms() : 0.0;
     const char* node_backend = "cpu";
@@ -975,8 +1346,10 @@ int run_node(Node* n, int idx, int is_last) {
         int dispatch_result;
         g_vx_runtime_node = (VxRuntimeNodeState){
             .active = 1, .idx = idx, .is_last = is_last,
-            .adapter_linear = adapter_linear, .native_w8a8 = native_w8a8,
+            .adapter_linear = adapter_linear,
             .native_physical_qlinear = native_physical_qlinear,
+            .native_physical_qbatch_matmul =
+                native_physical_qbatch_matmul,
             .native_physical_qembedding = native_physical_qembedding,
             .native_physical_qconv = native_physical_qconv,
             .native_physical_qadd = native_physical_qadd,
@@ -991,7 +1364,7 @@ int run_node(Node* n, int idx, int is_last) {
             .native_physical_quantize = native_physical_quantize,
             .native_physical_dequantize = native_physical_dequantize,
             .native_physical_shape = native_physical_shape,
-            .qtensor_node = qtensor_node, .node_backend = &node_backend,
+            .node_backend = &node_backend,
         };
         if (vx_runtime_backend_registry_ensure() != 0) {
             g_vx_runtime_node.active = 0;
@@ -1000,9 +1373,24 @@ int run_node(Node* n, int idx, int is_last) {
         dispatch_result = vx_backend_registry_dispatch(&g_vx_backend_registry,
                                                        n, in, o, &selected);
         g_vx_runtime_node.active = 0;
+#if VOLVOXAI_ENABLE_TRAINING
+        dynamic_autograd_note_forward_backend(selected ? selected->name : NULL);
+#endif
+#if VOLVOXAI_ENABLE_CUDA
+        if (g_vx_cuda_route_tracking) {
+            int built_in_cuda = dispatch_result == VX_BACKEND_HANDLED &&
+                selected && (selected == &g_vx_cuda_graph_backend ||
+                             selected == &g_vx_cuda_linear_backend);
+            cuda_graph_note_node_route(built_in_cuda);
+        }
+#endif
         if (dispatch_result != VX_BACKEND_HANDLED || !selected) return -1;
-        if (selected == &g_vx_cpu_backend) return 0;
-        if (selected == vx_sdk_selected_backend()) node_backend = selected->name;
+        if (selected == &g_vx_cpu_backend) {
+            if (idx >= 0 && idx < MAXN)
+                vx_engine_state_current()->runtime_route_backend[idx] =
+                    selected->name;
+            return 0;
+        }
         ran_gpu_graph = selected->outputs_device_resident;
         goto done;
     }
@@ -1062,25 +1450,11 @@ int run_node(Node* n, int idx, int is_last) {
     } else if (native_physical_shape) {
         if (physical_shape_forward(n, idx, o) != 0) return -1;
         node_backend = "cpu-shape-w8a8";
-    } else if (!strcmp(op, "QuantizeLinear")) {
-        int qdone = q_quantize_linear(n, in, o);
-        if (qdone < 0) return -1;
-        if (!qdone) return -1;
-        node_backend = "cpu-quant";
-    } else if (!strcmp(op, "DequantizeLinear")) {
-        materialize_tensor_f32(in);
-        if (in != o && in && o && in->numel == o->numel) memcpy(o->data, in->data, (size_t)o->numel * sizeof(float));
     } else if (!strcmp(op, "MoERouter")) {
-        if (moe_router_forward(n) != 0) return -1;
-        T* route_indices = nout(n, "indices");
-        T* route_weights = nout(n, "weights");
-        if (!route_indices) route_indices = nout(n, "route_indices");
-        if (!route_weights) route_weights = nout(n, "route_weights");
-        vk_mark_host_tensor(route_indices);
-        vk_mark_host_tensor(route_weights);
+        if (moe_router_forward(n, 0) != 0) return -1;
         node_backend = "cpu-moe-router";
     } else if (!strcmp(op, "MoELinear")) {
-        if (moe_linear_forward(n, o) != 0) return -1;
+        if (moe_linear_forward(n, o, 0) != 0) return -1;
         node_backend = "cpu-moe-linear";
     } else if (!strcmp(op, "QConv2D")) {
         T* w = nin(n, "weight"); T* ws = nin(n, "weight_scale"); T* wzp = nin(n, "weight_zero_point"); T* b = nin(n, "bias");
@@ -1159,36 +1533,19 @@ int run_node(Node* n, int idx, int is_last) {
                 node_backend = add ? "cpu-conv+add" : "cpu-conv";
             }
             conv2d_f32_image(idx, in, o, wp, bp, add, sy, sx, pads, groups, dy, dx, relu);
+    } else if (!strcmp(op, "QBatchMatMul")) {
+        if (qbatch_matmul_physical_forward(n, o) != 0) return -1;
+        node_backend = "cpu-qbatch-matmul-w8a8";
+    } else if (!strcmp(op, "BatchMatMul")) {
+        T* a = nin(n, "a");
+        T* b = nin(n, "b");
+        materialize_tensor_f32(a);
+        materialize_tensor_f32(b);
+        if (batch_matmul_f32_forward(n) != 0) return -1;
     } else if (!strcmp(op, "MatMul") || !strcmp(op, "Gemm") || !strcmp(op, "Linear")) {
-        /* Dispatch the fully quantized form before materializing `in`: the
-         * ordinary I8-weight path below is intentionally W8A32. */
-        QLinearParams qparams = native_qparams;
-        int has_qlinear_params = native_w8a8;
-        if (has_qlinear_params) {
-            T* qin = in;
-            if (!qin) qin = nin(n, "x");
-            if (!qin) qin = nin(n, "a");
-            T* qw = nin(n, "weight");
-            T* qb = nin(n, "bias");
-            if (!qin || !qw || !o || qin->dtype != T_F32 || o->dtype != T_F32 ||
-                (qw->dtype != T_I8 && qw->dtype != T_U8) || adapter_linear) return -1;
-            int q_d_in = qin->shape[qin->ndim - 1];
-            int q_d_out = o->shape[o->ndim - 1];
-            int q_out_in = 0;
-            if (q_d_in <= 0 || q_d_out <= 0 ||
-                linear_node_weight_layout(n, qin, o, qw, &q_out_in) != 0) return -1;
-            long q_total = qin->numel / q_d_in;
-            int q_r0, q_rc;
-            seq_range(q_total, &q_r0, &q_rc);
-            if (is_last && g_active_row < 0 && g_execution_row >= 0 && q_total > 1) {
-                q_r0 = g_execution_row;
-                q_rc = 1;
-            }
-            if (quantized_linear_i8(n, qin, qw, qb, o, q_r0, q_rc,
-                                    q_d_in, q_d_out, q_out_in, &qparams) != 1) return -1;
-            node_backend = "cpu-qlinear-i8";
-            goto done;
-        }
+        /* Generic Linear/MatMul/Gemm keeps F32 activations. I8/U8 weights are
+         * the current W8A32 form and obtain scale/zero-point values only from
+         * named tensor operands. Fully quantized execution uses QLinear. */
         materialize_tensor_f32(in);
         T* w = nin(n, "weight"); T* b = nin(n, "bias");
         if (!in || !w || !o || in->dtype != T_F32 || o->dtype != T_F32) return -1;
@@ -1231,6 +1588,7 @@ int run_node(Node* n, int idx, int is_last) {
              * Dynamic graph values retain the scalar reference path. */
             if (volvoxai_engine_tensor_is_model_weight_locked(w->name)) {
                 const float* packed_weight = vx_gemm_f32_pack_cache(
+                    &vx_engine_state_current()->gemm_f32_cache,
                     idx, wp->data, (uint32_t)d_in, (uint32_t)d_out, out_in);
                 if (packed_weight) {
                     packed_ran = vx_gemm_f32_run_packed(
@@ -1284,21 +1642,45 @@ int run_node(Node* n, int idx, int is_last) {
                                   p_flt(p, "eps", 1.0e-5f)) != 0) return -1;
     } else if (!strcmp(op, "MaxPool2D")) {
         int ky, kx, sy, sx, py, px; p_pair(p, "kernel", 1, &ky, &kx); p_pair(p, "stride", 1, &sy, &sx); p_pair(p, "padding", 0, &py, &px);
-        int qdone = q_maxpool2d_quantized(in, o, ky, kx, sy, sx, py, px);
-        if (qdone < 0) return -1;
-        if (qdone) node_backend = "cpu-qmaxpool";
-        else {
-            materialize_tensor_f32(in);
-            maxpool2d_f32_image(in, o, ky, kx, sy, sx, py, px);
-            node_backend = "cpu-maxpool";
-        }
+        materialize_tensor_f32(in);
+        maxpool2d_f32_image(in, o, ky, kx, sy, sx, py, px);
+        node_backend = "cpu-maxpool";
     } else if (!strcmp(op, "GlobalAveragePool")) {
         materialize_tensor_f32(in);
         global_average_pool_f32(in->data, o->data, in->shape[0], in->shape[1], in->shape[2], in->shape[3]);
     } else if (!strcmp(op, "Add"))  {
         materialize_node_inputs(n);
-        if (binop(n, 0) != 0) return -1;
-    } else if (!strcmp(op, "Mul"))  { materialize_node_inputs(n); if (binop(n, 1) != 0) return -1;
+        if (binop(n, VX_PORTABLE_BINARY_ADD) != 0) return -1;
+    } else if (!strcmp(op, "Mul")) {
+        materialize_node_inputs(n);
+        if (binop(n, VX_PORTABLE_BINARY_MUL) != 0) return -1;
+    } else if (!strcmp(op, "Sub")) {
+        materialize_node_inputs(n);
+        if (binop(n, VX_PORTABLE_BINARY_SUB) != 0) return -1;
+    } else if (!strcmp(op, "Div")) {
+        materialize_node_inputs(n);
+        if (binop(n, VX_PORTABLE_BINARY_DIV) != 0) return -1;
+    } else if (!strcmp(op, "Equal")) {
+        if (compare_i32_forward(n, 0) != 0) return -1;
+    } else if (!strcmp(op, "GreaterOrEqual")) {
+        if (compare_i32_forward(n, 1) != 0) return -1;
+    } else if (!strcmp(op, "Not")) {
+        if (not_i32_forward(n) != 0) return -1;
+    } else if (!strcmp(op, "Where")) {
+        materialize_node_inputs(n);
+        if (where_plain_32_forward(n) != 0) return -1;
+    } else if (!strcmp(op, "Gather")) {
+        materialize_tensor_f32(node_input_default(n));
+        if (gather_f32_i32_forward(n) != 0) return -1;
+    } else if (!strcmp(op, "Expand")) {
+        materialize_tensor_f32(node_input_default(n));
+        if (expand_plain_32_forward(n) != 0) return -1;
+    } else if (!strcmp(op, "Slice")) {
+        materialize_tensor_f32(node_input_default(n));
+        if (slice_plain_32_forward(n) != 0) return -1;
+    } else if (!strcmp(op, "Cast")) {
+        materialize_tensor_f32(node_input_default(n));
+        if (cast_forward(n) != 0) return -1;
     } else if (!strcmp(op, "ReLU")) { materialize_tensor_f32(in); relu_f32(in->data + e_off, o->data + e_off, e_cnt);
     } else if (!strcmp(op, "Sigmoid"))     { materialize_tensor_f32(in); sigmoid_f32(in->data + e_off, o->data + e_off, e_cnt);
     } else if (!strcmp(op, "GELU")) {
@@ -1309,7 +1691,7 @@ int run_node(Node* n, int idx, int is_last) {
             gelu_tanh_f32(in->data + e_off, o->data + e_off, e_cnt);
         else
             gelu_f32(in->data + e_off, o->data + e_off, e_cnt);
-    } else if (!strcmp(op, "SiLU") || !strcmp(op, "Swish")) { materialize_tensor_f32(in); silu_f32(in->data + e_off, o->data + e_off, e_cnt);
+    } else if (!strcmp(op, "SiLU")) { materialize_tensor_f32(in); silu_f32(in->data + e_off, o->data + e_off, e_cnt);
     } else if (!strcmp(op, "Tanh"))        { materialize_tensor_f32(in); tanh_f32(in->data + e_off, o->data + e_off, e_cnt);
     } else if (!strcmp(op, "LeakyReLU"))   { materialize_tensor_f32(in); leakyrelu_f32(in->data + e_off, o->data + e_off, e_cnt, p_flt(p, "alpha", 0.01f));
     } else if (!strcmp(op, "PReLU")) {
@@ -1332,11 +1714,15 @@ int run_node(Node* n, int idx, int is_last) {
         }
     } else if (!strcmp(op, "HardSwish"))   { materialize_tensor_f32(in); hardswish_f32(in->data + e_off, o->data + e_off, e_cnt);
     } else if (!strcmp(op, "HardSigmoid")) { materialize_tensor_f32(in); hardsigmoid_f32(in->data + e_off, o->data + e_off, e_cnt);
-    } else if (!strcmp(op, "Clip"))        { materialize_tensor_f32(in); clip_f32(in->data + e_off, o->data + e_off, e_cnt, p_flt(p, "min", -1e30f), p_flt(p, "max", 1e30f));
+    } else if (!strcmp(op, "Clip")) {
+        materialize_tensor_f32(in);
+        if (clip_plain_forward(n) != 0) return -1;
     } else if (!strcmp(op, "Transpose")) {
         materialize_tensor_f32(in);
-        int perm[8]; for (int i = 0; i < in->ndim; i++) perm[i] = i;
-        p_iarr(p, "perm", perm, in->ndim, 0);
+        int perm[8];
+        for (int i = 0; i < in->ndim; i++) perm[i] = in->ndim - 1 - i;
+        if (p && cJSON_GetObjectItem(p, "perm"))
+            p_iarr(p, "perm", perm, in->ndim, 0);
         if (transpose_tensor(in, o, perm) != 0) return -1;
     } else if (!strcmp(op, "Concat")) {
         materialize_node_inputs(n);
@@ -1356,14 +1742,9 @@ int run_node(Node* n, int idx, int is_last) {
     } else if (!strcmp(op, "Split")) {
         if (cpu_split(n, in) != 0) return -1;
     } else if (!strcmp(op, "ResizeNearest2D") || !strcmp(op, "UpsampleNearest2D")) {
-        int qdone = q_resize_nearest2d_quantized(in, o);
-        if (qdone < 0) return -1;
-        if (qdone) node_backend = "cpu-qresize";
-        else {
-            materialize_tensor_f32(in);
-            if (resize_nearest2d_image(in, o) != 0) return -1;
-            node_backend = "cpu-resize";
-        }
+        materialize_tensor_f32(in);
+        if (resize_nearest2d_image(in, o) != 0) return -1;
+        node_backend = "cpu-resize";
     } else if (!strcmp(op, "Dropout")) {
         materialize_tensor_f32(in);
         if (!in || !o || in->dtype != T_F32 || o->dtype != T_F32 ||
@@ -1381,20 +1762,35 @@ int run_node(Node* n, int idx, int is_last) {
     } else if (!strcmp(op, "Reshape") || !strcmp(op, "Flatten") || !strcmp(op, "Squeeze")
             || !strcmp(op, "Unsqueeze") || !strcmp(op, "Identity")) {
         materialize_tensor_f32(in);
-        if (e_off == 0 && e_cnt == o->numel) memcpy(o->data, in->data, (size_t)o->numel * sizeof(float));
-        else copy_f32(in->data + e_off, o->data + e_off, e_cnt);
+        if (tensor_copy_plain_32(in, o) != 0) return -1;
     } else if (!strcmp(op, "LayerNorm")) {
-        materialize_tensor_f32(in);
         T* w = nin(n, "weight"); T* b = nin(n, "bias");
+        if (!in || !o || !w || in->ndim <= 0) return -1;
         int d_model = p_int(p, "d_model", in->shape[in->ndim - 1]);
-        long total = in->numel / d_model; int r0, rc; seq_range(total, &r0, &rc);
-        layernorm_f32(in->data + (long)r0 * d_model, w->data, b ? b->data : NULL, o->data + (long)r0 * d_model, rc, d_model, p_flt(p, "eps", 1e-6f));
-    } else if (!strcmp(op, "RMSNorm")) {
+        float epsilon = p_flt(p, "eps", 1e-6f);
+        long total;
+        if (normalization_dimensions(in, o, w, b, d_model, &total) != 0 ||
+            !(epsilon > 0.0f) || !isfinite(epsilon)) return -1;
         materialize_tensor_f32(in);
+        materialize_tensor_f32(w);
+        if (b) materialize_tensor_f32(b);
+        int r0, rc; seq_range(total, &r0, &rc);
+        layernorm_f32(in->data + (long)r0 * d_model, w->data,
+                      b ? b->data : NULL,
+                      o->data + (long)r0 * d_model, rc, d_model, epsilon);
+    } else if (!strcmp(op, "RMSNorm")) {
         T* w = nin(n, "weight");
+        if (!in || !o || !w || in->ndim <= 0) return -1;
         int d_model = p_int(p, "d_model", in->shape[in->ndim - 1]);
-        long total = in->numel / d_model; int r0, rc; seq_range(total, &r0, &rc);
-        rmsnorm_f32(in->data + (long)r0 * d_model, w->data, o->data + (long)r0 * d_model, rc, d_model, p_flt(p, "eps", 1e-6f));
+        float epsilon = p_flt(p, "eps", 1e-6f);
+        long total;
+        if (normalization_dimensions(in, o, w, NULL, d_model, &total) != 0 ||
+            !(epsilon > 0.0f) || !isfinite(epsilon)) return -1;
+        materialize_tensor_f32(in);
+        materialize_tensor_f32(w);
+        int r0, rc; seq_range(total, &r0, &rc);
+        rmsnorm_f32(in->data + (long)r0 * d_model, w->data,
+                    o->data + (long)r0 * d_model, rc, d_model, epsilon);
     } else if (!strcmp(op, "Softmax") || !strcmp(op, "LogSoftmax")) {
         materialize_tensor_f32(in);
         if (!in || !o || in->dtype != T_F32 || o->dtype != T_F32 ||
@@ -1587,6 +1983,8 @@ int run_node(Node* n, int idx, int is_last) {
         return -1;
     }
 done:
+    if (idx >= 0 && idx < MAXN)
+        vx_engine_state_current()->runtime_route_backend[idx] = node_backend;
     /* The hybrid handoff is a one-way ownership transition. Its device slots
      * were cleared before the first CPU row and are discarded before GPU
      * execution can resume, so per-node host-dirty bookkeeping is redundant. */

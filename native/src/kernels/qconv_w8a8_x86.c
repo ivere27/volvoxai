@@ -7,15 +7,20 @@
  * cannot change the portable overflow behavior.
  */
 #include "quant_cpu_opt.h"
+#include "w8a8_affine.h"
+#include "packed_quant_gemm.h"
 #include "qconv_w8a8_arm.h"
 #include "cpu_features.h"
+#include "kernel_platform.h"
 #include "thread_pool.h"
+#include "../../include/volvoxai_enums.h"
 
 #include <limits.h>
 #include <math.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <stdlib.h>
+#include <string.h>
 
 extern int qconv2d_i8u8(const void *input, const void *weight, const int32_t *bias,
         const float *weight_scales, const int32_t *weight_zero_points,
@@ -47,17 +52,19 @@ extern int qconv2d_i8u8(const void *input, const void *weight, const int32_t *bi
 
 #if VX_W8A8_QCONV_X86_AVX2
 enum {
-    VX_W8A8_QCONV_I8 = 2u,
-    VX_W8A8_QCONV_U8 = 3u,
+    VX_W8A8_QCONV_I8 = VX_DTYPE_I8,
+    VX_W8A8_QCONV_U8 = VX_DTYPE_U8,
     /* Amortize pool wake-up and scheduling below roughly one million dot
      * products. Small decoder-side and pointwise calls stay on the caller. */
     VX_W8A8_QCONV_PARALLEL_PRODUCTS = 1024u * 1024u,
+    VX_W8A8_QCONV_IM2COL_MAX_BYTES = 128u * 1024u * 1024u,
 };
 
 typedef struct {
     const void *input;
     const void *weight;
     const unsigned char *small_c_packed_weight;
+    const void *packed_qlinear_weight;
     const int32_t *bias;
     const float *weight_scales;
     const int32_t *weight_zero_points;
@@ -97,54 +104,11 @@ typedef struct {
     VxW8A8QConvRangeFn function;
 } VxW8A8QConvParallelContext;
 
-static int vx_w8a8_qconv_finite_f32(float value) {
-    union { float f; uint32_t u; } bits = { value };
-    return ((bits.u >> 23u) & 0xffu) != 0xffu;
-}
-
-static int vx_w8a8_qconv_mul_size(size_t *value, size_t factor) {
-    if (factor && *value > (size_t)-1 / factor) return 0;
-    *value *= factor;
-    return 1;
-}
-
-static int vx_w8a8_qconv_byte_dtype(uint32_t dtype) {
-    return dtype == VX_W8A8_QCONV_I8 || dtype == VX_W8A8_QCONV_U8;
-}
-
-static int vx_w8a8_qconv_zero_point_valid(int32_t value, uint32_t dtype) {
-    if (dtype == VX_W8A8_QCONV_I8) return value >= -128 && value <= 127;
-    if (dtype == VX_W8A8_QCONV_U8) return value >= 0 && value <= 255;
-    return 0;
-}
-
-static int32_t vx_w8a8_qconv_byte_value(const void *data, uint32_t dtype,
-        size_t index) {
-    return dtype == VX_W8A8_QCONV_I8 ? (int32_t)((const int8_t *)data)[index] :
-        (int32_t)((const uint8_t *)data)[index];
-}
-
-static int32_t vx_w8a8_qconv_round_ties_even(float value) {
-    int32_t lower = (int32_t)floorf(value);
-    float fraction = value - (float)lower;
-    if (fraction < 0.5f) return lower;
-    if (fraction > 0.5f) return lower + 1;
-    return lower % 2 == 0 ? lower : lower + 1;
-}
-
-static int32_t vx_w8a8_qconv_quantize_transformed(float transformed,
-        int32_t minimum, int32_t maximum, int32_t nan_value) {
-    if (transformed != transformed) return nan_value;
-    if (transformed <= (float)minimum) return minimum;
-    if (transformed >= (float)maximum) return maximum;
-    return vx_w8a8_qconv_round_ties_even(transformed);
-}
-
-static void vx_w8a8_qconv_store_byte(void *output, uint32_t dtype,
-        size_t index, int32_t value) {
-    if (dtype == VX_W8A8_QCONV_I8) ((int8_t *)output)[index] = (int8_t)value;
-    else ((uint8_t *)output)[index] = (uint8_t)value;
-}
+typedef struct {
+    const VxW8A8QConvCall *call;
+    unsigned char *matrix;
+    size_t row_bytes;
+} VxW8A8QConvIm2ColContext;
 
 /* Match the portable kernel's complete shape and accumulator proof before
  * changing product grouping. The universal bound covers every accumulator
@@ -172,24 +136,24 @@ static int vx_w8a8_qconv_avx2_eligible(const void *input, const void *weight,
         !output_height || !output_width || !output_channels || !kernel_height ||
         !kernel_width || !input_per_group || !stride_y || !stride_x ||
         !dilation_y || !dilation_x || !groups || relu > 2u ||
-        !vx_w8a8_qconv_byte_dtype(input_dtype) ||
-        !vx_w8a8_qconv_byte_dtype(weight_dtype) ||
-        !vx_w8a8_qconv_byte_dtype(output_dtype) ||
-        !vx_w8a8_qconv_finite_f32(input_scale) || input_scale <= 0.0f ||
-        !vx_w8a8_qconv_finite_f32(output_scale) || output_scale <= 0.0f ||
-        !vx_w8a8_qconv_zero_point_valid(input_zero_point, input_dtype) ||
-        !vx_w8a8_qconv_zero_point_valid(output_zero_point, output_dtype) ||
+        !vx_w8a8_byte_dtype(input_dtype) ||
+        !vx_w8a8_byte_dtype(weight_dtype) ||
+        !vx_w8a8_byte_dtype(output_dtype) ||
+        !vx_w8a8_finite_f32(input_scale) || input_scale <= 0.0f ||
+        !vx_w8a8_finite_f32(output_scale) || output_scale <= 0.0f ||
+        !vx_w8a8_zero_point_valid(input_zero_point, input_dtype) ||
+        !vx_w8a8_zero_point_valid(output_zero_point, output_dtype) ||
         input_channels % groups || output_channels % groups ||
         (uint64_t)input_per_group * groups != input_channels) return 0;
-    if (!vx_w8a8_qconv_mul_size(&input_elements, input_height) ||
-        !vx_w8a8_qconv_mul_size(&input_elements, input_width) ||
-        !vx_w8a8_qconv_mul_size(&input_elements, input_channels) ||
-        !vx_w8a8_qconv_mul_size(&weight_elements, kernel_height) ||
-        !vx_w8a8_qconv_mul_size(&weight_elements, kernel_width) ||
-        !vx_w8a8_qconv_mul_size(&weight_elements, input_per_group) ||
-        !vx_w8a8_qconv_mul_size(&output_elements, output_height) ||
-        !vx_w8a8_qconv_mul_size(&output_elements, output_width) ||
-        !vx_w8a8_qconv_mul_size(&output_elements, output_channels)) return 0;
+    if (!vx_w8a8_mul_size(&input_elements, input_height) ||
+        !vx_w8a8_mul_size(&input_elements, input_width) ||
+        !vx_w8a8_mul_size(&input_elements, input_channels) ||
+        !vx_w8a8_mul_size(&weight_elements, kernel_height) ||
+        !vx_w8a8_mul_size(&weight_elements, kernel_width) ||
+        !vx_w8a8_mul_size(&weight_elements, input_per_group) ||
+        !vx_w8a8_mul_size(&output_elements, output_height) ||
+        !vx_w8a8_mul_size(&output_elements, output_width) ||
+        !vx_w8a8_mul_size(&output_elements, output_channels)) return 0;
     padded_height = (uint64_t)input_height + padding_top + padding_bottom;
     padded_width = (uint64_t)input_width + padding_left + padding_right;
     effective_height = (uint64_t)(kernel_height - 1u) * dilation_y + 1u;
@@ -212,9 +176,9 @@ static int vx_w8a8_qconv_avx2_eligible(const void *input, const void *weight,
         int64_t weight_low, weight_high;
         uint64_t weight_magnitude, accumulator_bound, bias_magnitude = 0;
         int32_t weight_zero_point = weight_zero_points[output_channel];
-        if (!vx_w8a8_qconv_finite_f32(weight_scales[output_channel]) ||
+        if (!vx_w8a8_finite_f32(weight_scales[output_channel]) ||
             weight_scales[output_channel] <= 0.0f ||
-            !vx_w8a8_qconv_zero_point_valid(weight_zero_point, weight_dtype)) return 0;
+            !vx_w8a8_zero_point_valid(weight_zero_point, weight_dtype)) return 0;
         weight_low = (int64_t)(weight_dtype == VX_W8A8_QCONV_I8 ? -128 : 0) -
             weight_zero_point;
         weight_high = (int64_t)(weight_dtype == VX_W8A8_QCONV_I8 ? 127 : 255) -
@@ -309,7 +273,7 @@ static VX_W8A8_QCONV_TARGET_AVX2 void vx_w8a8_qconv_avx2_range(
     if (relu >= 2u) {
         const float relu6_scaled = 6.0f / output_scale;
         const float relu6_transformed = relu6_scaled + (float)output_zero_point;
-        relu6_upper = vx_w8a8_qconv_quantize_transformed(relu6_transformed,
+        relu6_upper = vx_w8a8_requantize(relu6_transformed,
             output_minimum, output_maximum, 0);
     }
     for (size_t location = begin; location < end; location++) {
@@ -392,7 +356,7 @@ static VX_W8A8_QCONV_TARGET_AVX2 void vx_w8a8_qconv_avx2_range(
                             }
                         }
                         for (; local_channel < input_per_group; local_channel++) {
-                            const int32_t input_value = vx_w8a8_qconv_byte_value(
+                            const int32_t input_value = vx_w8a8_byte_value(
                                 input, input_dtype, input_index + local_channel) -
                                 input_zero_point;
                             for (uint32_t block_channel = 0;
@@ -400,7 +364,7 @@ static VX_W8A8_QCONV_TARGET_AVX2 void vx_w8a8_qconv_avx2_range(
                                 const size_t weight_index =
                                     weight_channel_offsets[block_channel] +
                                     weight_tap_offset + local_channel;
-                                const int32_t weight_value = vx_w8a8_qconv_byte_value(
+                                const int32_t weight_value = vx_w8a8_byte_value(
                                     weight, weight_dtype, weight_index) -
                                     weight_zero_points[output_base + block_channel];
                                 accumulators[block_channel] +=
@@ -430,7 +394,7 @@ static VX_W8A8_QCONV_TARGET_AVX2 void vx_w8a8_qconv_avx2_range(
                     scaled = (float)accumulator * multiplier;
                     transformed = scaled + (float)output_zero_point;
                     transformed_nan = transformed != transformed;
-                    quantized = vx_w8a8_qconv_quantize_transformed(transformed,
+                    quantized = vx_w8a8_requantize(transformed,
                         output_minimum, output_maximum, output_zero_point);
                     if (!transformed_nan && relu) {
                         if (quantized < output_zero_point)
@@ -438,7 +402,7 @@ static VX_W8A8_QCONV_TARGET_AVX2 void vx_w8a8_qconv_avx2_range(
                         if (relu >= 2u && quantized > relu6_upper)
                             quantized = relu6_upper;
                     }
-                    vx_w8a8_qconv_store_byte(output, output_dtype, output_index,
+                    vx_w8a8_store_byte(output, output_dtype, output_index,
                                               quantized);
                 }
             }
@@ -466,7 +430,7 @@ static VX_W8A8_QCONV_TARGET_AVX2 void vx_w8a8_qconv_avx2_small_c_range(
         const float relu6_scaled = 6.0f / call->output_scale;
         const float relu6_transformed = relu6_scaled +
                                         (float)call->output_zero_point;
-        relu6_upper = vx_w8a8_qconv_quantize_transformed(relu6_transformed,
+        relu6_upper = vx_w8a8_requantize(relu6_transformed,
             output_minimum, output_maximum, 0);
     }
     for (size_t location = begin; location < end; location++) {
@@ -514,7 +478,7 @@ static VX_W8A8_QCONV_TARGET_AVX2 void vx_w8a8_qconv_avx2_small_c_range(
                         for (uint32_t local_channel = 0;
                                 local_channel < call->input_per_group;
                                 local_channel++) {
-                            const int32_t input_value = vx_w8a8_qconv_byte_value(
+                            const int32_t input_value = vx_w8a8_byte_value(
                                 call->input, call->input_dtype,
                                 input_base + local_channel) - call->input_zero_point;
                             const size_t packed_index = packed_group_offset +
@@ -547,7 +511,7 @@ static VX_W8A8_QCONV_TARGET_AVX2 void vx_w8a8_qconv_avx2_small_c_range(
                         const float transformed = scaled +
                             (float)call->output_zero_point;
                         const int transformed_nan = transformed != transformed;
-                        int32_t quantized = vx_w8a8_qconv_quantize_transformed(
+                        int32_t quantized = vx_w8a8_requantize(
                             transformed, output_minimum, output_maximum,
                             call->output_zero_point);
                         if (!transformed_nan && call->relu) {
@@ -556,7 +520,7 @@ static VX_W8A8_QCONV_TARGET_AVX2 void vx_w8a8_qconv_avx2_small_c_range(
                             if (call->relu >= 2u && quantized > relu6_upper)
                                 quantized = relu6_upper;
                         }
-                        vx_w8a8_qconv_store_byte(call->output, call->output_dtype,
+                        vx_w8a8_store_byte(call->output, call->output_dtype,
                                                   output_index, quantized);
                     }
                 }
@@ -619,7 +583,7 @@ static VX_W8A8_QCONV_TARGET_AVXVNNI void vx_w8a8_qconv_avxvnni_range(
     if (relu >= 2u) {
         const float relu6_scaled = 6.0f / output_scale;
         const float relu6_transformed = relu6_scaled + (float)output_zero_point;
-        relu6_upper = vx_w8a8_qconv_quantize_transformed(relu6_transformed,
+        relu6_upper = vx_w8a8_requantize(relu6_transformed,
             output_minimum, output_maximum, 0);
     }
     for (size_t location = begin; location < end; location++) {
@@ -721,13 +685,13 @@ static VX_W8A8_QCONV_TARGET_AVXVNNI void vx_w8a8_qconv_avxvnni_range(
                         const float scaled = (float)accumulator * multiplier;
                         const float transformed = scaled + (float)output_zero_point;
                         const int transformed_nan = transformed != transformed;
-                        int32_t quantized = vx_w8a8_qconv_quantize_transformed(transformed,
+                        int32_t quantized = vx_w8a8_requantize(transformed,
                             output_minimum, output_maximum, output_zero_point);
                         if (!transformed_nan && relu) {
                             if (quantized < output_zero_point) quantized = output_zero_point;
                             if (relu >= 2u && quantized > relu6_upper) quantized = relu6_upper;
                         }
-                        vx_w8a8_qconv_store_byte(output, output_dtype, output_index, quantized);
+                        vx_w8a8_store_byte(output, output_dtype, output_index, quantized);
                     }
                 }
     }
@@ -783,7 +747,7 @@ static VX_W8A8_QCONV_TARGET_AVX512VNNI void vx_w8a8_qconv_avx512vnni_range(
     if (relu >= 2u) {
         const float relu6_scaled = 6.0f / output_scale;
         const float relu6_transformed = relu6_scaled + (float)output_zero_point;
-        relu6_upper = vx_w8a8_qconv_quantize_transformed(relu6_transformed,
+        relu6_upper = vx_w8a8_requantize(relu6_transformed,
             output_minimum, output_maximum, 0);
     }
     for (size_t location = begin; location < end; location++) {
@@ -883,13 +847,13 @@ static VX_W8A8_QCONV_TARGET_AVX512VNNI void vx_w8a8_qconv_avx512vnni_range(
                         const float scaled = (float)accumulator * multiplier;
                         const float transformed = scaled + (float)output_zero_point;
                         const int transformed_nan = transformed != transformed;
-                        int32_t quantized = vx_w8a8_qconv_quantize_transformed(transformed,
+                        int32_t quantized = vx_w8a8_requantize(transformed,
                             output_minimum, output_maximum, output_zero_point);
                         if (!transformed_nan && relu) {
                             if (quantized < output_zero_point) quantized = output_zero_point;
                             if (relu >= 2u && quantized > relu6_upper) quantized = relu6_upper;
                         }
-                        vx_w8a8_qconv_store_byte(output, output_dtype, output_index, quantized);
+                        vx_w8a8_store_byte(output, output_dtype, output_index, quantized);
                     }
                 }
     }
@@ -948,19 +912,6 @@ static int vx_w8a8_qconv_parallel_worthwhile(const VxW8A8QConvCall *call,
     return products >= VX_W8A8_QCONV_PARALLEL_PRODUCTS;
 }
 
-static int vx_w8a8_qconv_ranges_overlap(const void *left, size_t left_size,
-                                         const void *right, size_t right_size) {
-    const uintptr_t left_begin = (uintptr_t)left;
-    const uintptr_t right_begin = (uintptr_t)right;
-    uintptr_t left_end, right_end;
-    if (!left_size || !right_size) return 0;
-    if (left_begin > UINTPTR_MAX - left_size ||
-        right_begin > UINTPTR_MAX - right_size) return 1;
-    left_end = left_begin + left_size;
-    right_end = right_begin + right_size;
-    return left_begin < right_end && right_begin < left_end;
-}
-
 /* Graph execution normally uses distinct tensors, but the public kernel ABI
  * does not promise non-aliasing. Keep aliased calls on the original ordered
  * path so threading never turns a caller's dependency into a data race. */
@@ -973,19 +924,204 @@ static int vx_w8a8_qconv_parallel_alias_safe(const VxW8A8QConvCall *call,
     const size_t output_elements = locations * call->output_channels;
     size_t int_channel_bytes = call->output_channels;
     size_t scale_channel_bytes = call->output_channels;
-    if (!vx_w8a8_qconv_mul_size(&int_channel_bytes, sizeof(int32_t)) ||
-        !vx_w8a8_qconv_mul_size(&scale_channel_bytes, sizeof(float))) return 0;
-    if (vx_w8a8_qconv_ranges_overlap(call->output, output_elements,
+    if (!vx_w8a8_mul_size(&int_channel_bytes, sizeof(int32_t)) ||
+        !vx_w8a8_mul_size(&scale_channel_bytes, sizeof(float))) return 0;
+    if (vx_w8a8_ranges_overlap(call->output, output_elements,
                                       call->input, input_elements) ||
-        vx_w8a8_qconv_ranges_overlap(call->output, output_elements,
+        vx_w8a8_ranges_overlap(call->output, output_elements,
                                       call->weight, weight_elements) ||
-        vx_w8a8_qconv_ranges_overlap(call->output, output_elements,
+        vx_w8a8_ranges_overlap(call->output, output_elements,
                                       call->weight_scales, scale_channel_bytes) ||
-        vx_w8a8_qconv_ranges_overlap(call->output, output_elements,
+        vx_w8a8_ranges_overlap(call->output, output_elements,
                                       call->weight_zero_points, int_channel_bytes) ||
-        (call->bias && vx_w8a8_qconv_ranges_overlap(
+        (call->bias && vx_w8a8_ranges_overlap(
             call->output, output_elements, call->bias, int_channel_bytes))) return 0;
     return 1;
+}
+
+static void vx_w8a8_qconv_im2col_worker(void *opaque, int begin, int end) {
+    const VxW8A8QConvIm2ColContext *context =
+        (const VxW8A8QConvIm2ColContext *)opaque;
+    const VxW8A8QConvCall *call = context->call;
+    const unsigned char padding_value =
+        (unsigned char)call->input_zero_point;
+    const unsigned char *input = (const unsigned char *)call->input;
+    const size_t output_plane =
+        (size_t)call->output_height * call->output_width;
+    for (int item = begin; item < end; item++) {
+        const size_t location = (size_t)item;
+        const uint32_t batch_index = (uint32_t)(location / output_plane);
+        const size_t plane_index = location -
+            (size_t)batch_index * output_plane;
+        const uint32_t output_y =
+            (uint32_t)(plane_index / call->output_width);
+        const uint32_t output_x = (uint32_t)(plane_index -
+            (size_t)output_y * call->output_width);
+        unsigned char *row = context->matrix + location * context->row_bytes;
+        for (uint32_t kernel_y = 0; kernel_y < call->kernel_height;
+                kernel_y++) {
+            const uint64_t padded_y = (uint64_t)output_y * call->stride_y +
+                (uint64_t)kernel_y * call->dilation_y;
+            for (uint32_t kernel_x = 0; kernel_x < call->kernel_width;
+                    kernel_x++) {
+                const uint64_t padded_x = (uint64_t)output_x * call->stride_x +
+                    (uint64_t)kernel_x * call->dilation_x;
+                unsigned char *block = row +
+                    ((size_t)kernel_y * call->kernel_width + kernel_x) *
+                    call->input_channels;
+                if (padded_y < call->padding_top ||
+                    padded_y - call->padding_top >= call->input_height ||
+                    padded_x < call->padding_left ||
+                    padded_x - call->padding_left >= call->input_width) {
+                    memset(block, padding_value, call->input_channels);
+                } else {
+                    const size_t input_index =
+                        (((size_t)batch_index * call->input_height +
+                          (uint32_t)(padded_y - call->padding_top)) *
+                         call->input_width +
+                         (uint32_t)(padded_x - call->padding_left)) *
+                        call->input_channels;
+                    memcpy(block, input + input_index, call->input_channels);
+                }
+            }
+        }
+    }
+}
+
+/* Common encoder 3x3 convolutions are contiguous within each input row.
+ * Partition by output rows so the inner X walk avoids a division per output
+ * location, and copy each interior 3*C strip at once instead of performing
+ * three independently checked C-byte copies.  Border bytes remain the exact
+ * input zero point used by the canonical im2col spelling. */
+static void vx_w8a8_qconv_im2col_3x3_rows_worker(
+        void *opaque, int begin, int end) {
+    const VxW8A8QConvIm2ColContext *context =
+        (const VxW8A8QConvIm2ColContext *)opaque;
+    const VxW8A8QConvCall *call = context->call;
+    const unsigned char padding_value =
+        (unsigned char)call->input_zero_point;
+    const unsigned char *input = (const unsigned char *)call->input;
+    const size_t output_plane =
+        (size_t)call->output_height * call->output_width;
+    const size_t input_plane =
+        (size_t)call->input_height * call->input_width;
+    const size_t strip_bytes = (size_t)3u * call->input_channels;
+    for (int item = begin; item < end; item++) {
+        const uint32_t batch_index =
+            (uint32_t)item / call->output_height;
+        const uint32_t output_y =
+            (uint32_t)item - batch_index * call->output_height;
+        const int64_t input_y_origin =
+            (int64_t)output_y * call->stride_y - call->padding_top;
+        for (uint32_t output_x = 0; output_x < call->output_width;
+                output_x++) {
+            const size_t location = (size_t)batch_index * output_plane +
+                (size_t)output_y * call->output_width + output_x;
+            unsigned char *row =
+                context->matrix + location * context->row_bytes;
+            const int64_t input_x_origin =
+                (int64_t)output_x * call->stride_x - call->padding_left;
+            for (uint32_t kernel_y = 0; kernel_y < 3u; kernel_y++) {
+                unsigned char *block = row +
+                    (size_t)kernel_y * strip_bytes;
+                const int64_t input_y = input_y_origin + kernel_y;
+                if (input_y < 0 || input_y >= call->input_height) {
+                    memset(block, padding_value, strip_bytes);
+                } else if (input_x_origin >= 0 &&
+                           input_x_origin + 2 < call->input_width) {
+                    const size_t input_index =
+                        ((size_t)batch_index * input_plane +
+                         (size_t)input_y * call->input_width +
+                         (size_t)input_x_origin) * call->input_channels;
+                    memcpy(block, input + input_index, strip_bytes);
+                } else {
+                    for (uint32_t kernel_x = 0; kernel_x < 3u; kernel_x++) {
+                        const int64_t input_x = input_x_origin + kernel_x;
+                        unsigned char *channel_block = block +
+                            (size_t)kernel_x * call->input_channels;
+                        if (input_x < 0 || input_x >= call->input_width) {
+                            memset(channel_block, padding_value,
+                                   call->input_channels);
+                        } else {
+                            const size_t input_index =
+                                ((size_t)batch_index * input_plane +
+                                 (size_t)input_y * call->input_width +
+                                 (size_t)input_x) * call->input_channels;
+                            memcpy(channel_block, input + input_index,
+                                   call->input_channels);
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/* Dense 3x3 encoder convolutions benefit from reusing the QLinear ISA
+ * hierarchy: VNNI when available, otherwise the exact two-part
+ * VPMADDUBSW path. Padding bytes are the input zero point, so the expanded
+ * matrix is algebraically identical to skipping out-of-bounds QConv terms. */
+static int vx_w8a8_qconv_im2col_qlinear_try(
+        const VxW8A8QConvCall *call) {
+    size_t locations = call->batch;
+    size_t row_bytes = call->kernel_height;
+    size_t matrix_bytes;
+    unsigned char *matrix;
+    int result;
+    if (call->groups != 1u || call->relu != 0u || !call->bias ||
+        call->input_per_group != call->input_channels ||
+        call->kernel_height != 3u || call->kernel_width != 3u ||
+        call->output_channels < 16u ||
+        !vx_w8a8_mul_size(&locations, call->output_height) ||
+        !vx_w8a8_mul_size(&locations, call->output_width) ||
+        !vx_w8a8_mul_size(&row_bytes, call->kernel_width) ||
+        !vx_w8a8_mul_size(&row_bytes, call->input_channels) ||
+        locations > UINT32_MAX || locations > INT_MAX ||
+        row_bytes > UINT32_MAX ||
+        !vx_w8a8_qconv_parallel_alias_safe(call, locations)) return 0;
+    matrix_bytes = locations;
+    if (!vx_w8a8_mul_size(&matrix_bytes, row_bytes) ||
+        matrix_bytes > VX_W8A8_QCONV_IM2COL_MAX_BYTES) return 0;
+    matrix = (unsigned char *)malloc(matrix_bytes);
+    if (!matrix) return 0;
+    {
+        const int threads = vx_kernels_thread_count();
+        VxW8A8QConvIm2ColContext context = {call, matrix, row_bytes};
+        const int use_3x3_rows = call->dilation_y == 1u &&
+            call->dilation_x == 1u &&
+            (uint64_t)call->batch * call->output_height <= INT_MAX;
+        const size_t tasks = use_3x3_rows
+            ? (size_t)call->batch * call->output_height : locations;
+        if (threads > 1 && tasks > 1u) {
+            const size_t target_tiles = (size_t)threads * 4u;
+            size_t grain = (tasks + target_tiles - 1u) / target_tiles;
+            if (grain > INT_MAX) grain = INT_MAX;
+            vx_kernels_parallel_for((int)tasks, (int)grain,
+                use_3x3_rows ? vx_w8a8_qconv_im2col_3x3_rows_worker :
+                               vx_w8a8_qconv_im2col_worker,
+                &context);
+        } else if (use_3x3_rows) {
+            vx_w8a8_qconv_im2col_3x3_rows_worker(
+                &context, 0, (int)tasks);
+        } else {
+            vx_w8a8_qconv_im2col_worker(&context, 0, (int)locations);
+        }
+    }
+    result = call->packed_qlinear_weight
+        ? vx_qlinear_i8u8_packed(matrix, call->packed_qlinear_weight,
+            call->bias, call->weight_scales, call->weight_zero_points,
+            call->output, (uint32_t)locations, (uint32_t)row_bytes,
+            call->output_channels, call->input_scale, call->input_zero_point,
+            call->output_scale, call->output_zero_point, call->input_dtype,
+            call->weight_dtype, call->output_dtype)
+        : vx_qlinear_i8u8_native(matrix, call->weight, call->bias,
+            call->weight_scales, call->weight_zero_points, call->output,
+            (uint32_t)locations, (uint32_t)row_bytes, call->output_channels,
+            call->input_scale, call->input_zero_point, call->output_scale,
+            call->output_zero_point, call->input_dtype, call->weight_dtype,
+            call->output_dtype);
+    free(matrix);
+    return result == 1;
 }
 
 /* Output locations are independent NHWC tiles. Use four dynamically assigned
@@ -1013,7 +1149,7 @@ static int vx_w8a8_qconv_run(const VxW8A8QConvCall *call,
 
 #endif
 
-int vx_qconv2d_i8u8_native(const void *input, const void *weight,
+int vx_qconv2d_i8u8_native_prepacked(const void *input, const void *weight,
         const int32_t *bias, const float *weight_scales,
         const int32_t *weight_zero_points, void *output,
         uint32_t batch, uint32_t input_height, uint32_t input_width,
@@ -1024,7 +1160,8 @@ int vx_qconv2d_i8u8_native(const void *input, const void *weight,
         uint32_t padding_left, uint32_t padding_bottom, uint32_t padding_right,
         uint32_t groups, uint32_t relu, float input_scale,
         int32_t input_zero_point, float output_scale, int32_t output_zero_point,
-        uint32_t input_dtype, uint32_t weight_dtype, uint32_t output_dtype) {
+        uint32_t input_dtype, uint32_t weight_dtype, uint32_t output_dtype,
+        const void *packed_qlinear_weight) {
 #if defined(__aarch64__) || defined(__arm__)
     if (vx_qconv2d_i8u8_arm_try(input, weight, bias, weight_scales,
             weight_zero_points, output, batch, input_height, input_width,
@@ -1039,6 +1176,7 @@ int vx_qconv2d_i8u8_native(const void *input, const void *weight,
     VxW8A8QConvCall call = {
         .input = input,
         .weight = weight,
+        .packed_qlinear_weight = packed_qlinear_weight,
         .bias = bias,
         .weight_scales = weight_scales,
         .weight_zero_points = weight_zero_points,
@@ -1076,19 +1214,31 @@ int vx_qconv2d_i8u8_native(const void *input, const void *weight,
         padding_top, padding_left, padding_bottom, padding_right, groups, relu,
         input_scale, input_zero_point, output_scale, output_zero_point, input_dtype,
         weight_dtype, output_dtype);
-    if (avxvnni_eligible && input_per_group >= 64u && vx_cpu_has_avx512_vnni()) {
-        return vx_w8a8_qconv_run(&call, vx_w8a8_qconv_avx512vnni_range);
-    }
-    if (avxvnni_eligible && vx_cpu_has_avx_vnni()) {
-        return vx_w8a8_qconv_run(&call, vx_w8a8_qconv_avxvnni_range);
-    }
-    if (vx_cpu_has_avx2() && vx_w8a8_qconv_avx2_eligible(input, weight, bias,
+    const VxKernelPlatform* platform = vx_kernel_platform();
+    const int avx2_eligible = platform->has_avx2 &&
+        vx_w8a8_qconv_avx2_eligible(input, weight, bias,
             weight_scales, weight_zero_points, output, batch, input_height, input_width,
             input_channels, output_height, output_width, output_channels, kernel_height,
             kernel_width, input_per_group, stride_y, stride_x, dilation_y, dilation_x,
             padding_top, padding_left, padding_bottom, padding_right, groups, relu,
             input_scale, input_zero_point, output_scale, output_zero_point, input_dtype,
-            weight_dtype, output_dtype)) {
+            weight_dtype, output_dtype);
+    /* Try im2col over packed QLinear before the direct convolution kernels.
+     * It is not an AVX2-only route: the QLinear dispatcher independently
+     * selects AVX-512 VNNI, AVX-VNNI, or AVX2, so this keeps the widest
+     * available dot-product instruction and additionally gains weight packing
+     * and GEMM blocking that no direct convolution kernel here performs.
+     * Ordering it after the VNNI branches would silently withdraw packing on
+     * exactly the machines with the best integer throughput. */
+    if (avx2_eligible && vx_w8a8_qconv_im2col_qlinear_try(&call)) return 1;
+    if (avxvnni_eligible && platform->has_avx512_vnni &&
+        input_per_group >= platform->qconv_avx512_vnni_min_input_per_group) {
+        return vx_w8a8_qconv_run(&call, vx_w8a8_qconv_avx512vnni_range);
+    }
+    if (avxvnni_eligible && platform->has_avx_vnni) {
+        return vx_w8a8_qconv_run(&call, vx_w8a8_qconv_avxvnni_range);
+    }
+    if (avx2_eligible) {
         const size_t locations = (size_t)batch * output_height * output_width;
         const uint32_t output_channels_per_group = output_channels / groups;
         if (input_per_group < 16u && output_channels_per_group % 8u == 0u &&
@@ -1113,4 +1263,26 @@ int vx_qconv2d_i8u8_native(const void *input, const void *weight,
         stride_y, stride_x, dilation_y, dilation_x, padding_top, padding_left,
         padding_bottom, padding_right, groups, relu, input_scale, input_zero_point,
         output_scale, output_zero_point, input_dtype, weight_dtype, output_dtype);
+}
+
+int vx_qconv2d_i8u8_native(const void *input, const void *weight,
+        const int32_t *bias, const float *weight_scales,
+        const int32_t *weight_zero_points, void *output,
+        uint32_t batch, uint32_t input_height, uint32_t input_width,
+        uint32_t input_channels, uint32_t output_height, uint32_t output_width,
+        uint32_t output_channels, uint32_t kernel_height, uint32_t kernel_width,
+        uint32_t input_per_group, uint32_t stride_y, uint32_t stride_x,
+        uint32_t dilation_y, uint32_t dilation_x, uint32_t padding_top,
+        uint32_t padding_left, uint32_t padding_bottom, uint32_t padding_right,
+        uint32_t groups, uint32_t relu, float input_scale,
+        int32_t input_zero_point, float output_scale, int32_t output_zero_point,
+        uint32_t input_dtype, uint32_t weight_dtype, uint32_t output_dtype) {
+    return vx_qconv2d_i8u8_native_prepacked(input, weight, bias,
+        weight_scales, weight_zero_points, output, batch, input_height,
+        input_width, input_channels, output_height, output_width,
+        output_channels, kernel_height, kernel_width, input_per_group,
+        stride_y, stride_x, dilation_y, dilation_x, padding_top, padding_left,
+        padding_bottom, padding_right, groups, relu, input_scale,
+        input_zero_point, output_scale, output_zero_point, input_dtype,
+        weight_dtype, output_dtype, NULL);
 }

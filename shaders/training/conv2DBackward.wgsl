@@ -26,7 +26,8 @@ struct Params {
     relu : u32,
     has_bias : u32,
     weight_count : u32,
-    _pad : u32,
+    // 0=HWIO, 1=HWCM, 2=OHWI, 3=1HWO/1HWM.
+    weight_layout : u32,
 }
 @group(0) @binding(7) var<uniform> params : Params;
 
@@ -36,6 +37,27 @@ fn activated_gradient(b : u32, oh : u32, ow : u32, oc : u32) -> f32 {
     if (params.relu == 1u && y <= 0.0) { return 0.0; }
     if (params.relu >= 2u && (y <= 0.0 || y >= 6.0)) { return 0.0; }
     return grad_output[offset];
+}
+
+fn weight_index(ky : u32, kx : u32, ic : u32, oc : u32) -> u32 {
+    let in_per_group = params.in_c / params.groups;
+    let out_per_group = params.out_c / params.groups;
+    let group = oc / out_per_group;
+    let local_ic = ic - group * in_per_group;
+    if (params.weight_layout == 0u) {
+        return (((ky * params.kw + kx) * in_per_group + local_ic) *
+            params.out_c) + oc;
+    }
+    if (params.weight_layout == 1u) {
+        let multiplier = params.out_c / params.in_c;
+        let m = oc - ic * multiplier;
+        return (((ky * params.kw + kx) * params.in_c + ic) * multiplier) + m;
+    }
+    if (params.weight_layout == 2u) {
+        return (((oc * params.kh + ky) * params.kw + kx) *
+            in_per_group) + local_ic;
+    }
+    return (ky * params.kw + kx) * params.out_c + oc;
 }
 
 @compute @workgroup_size(64)
@@ -64,15 +86,7 @@ fn input_main(@builtin(global_invocation_id) gid : vec3<u32>) {
                 if (ow_num < 0 || ow_num % i32(params.sx) != 0) { continue; }
                 let ow = u32(ow_num / i32(params.sx));
                 if (ow >= params.out_w) { continue; }
-                var wi = 0u;
-                if (params.groups == params.in_c) {
-                    let multiplier = params.out_c / params.in_c;
-                    let m = oc - ic * multiplier;
-                    wi = (((ky * params.kw + kx) * params.in_c + ic) * multiplier) + m;
-                } else {
-                    let local_ic = ic - group * in_per_group;
-                    wi = (((ky * params.kw + kx) * in_per_group + local_ic) * params.out_c) + oc;
-                }
+                let wi = weight_index(ky, kx, ic, oc);
                 sum = sum + activated_gradient(b, oh, ow, oc) * weight[wi];
             }
         }
@@ -85,20 +99,34 @@ fn weight_main(@builtin(global_invocation_id) gid : vec3<u32>) {
     let flat = gid.x;
     if (flat >= params.weight_count) { return; }
     var ky = 0u; var kx = 0u; var ic = 0u; var oc = 0u;
-    if (params.groups == params.in_c) {
+    if (params.weight_layout == 1u) {
         let multiplier = params.out_c / params.in_c;
         var tmp = flat;
         let m = tmp % multiplier; tmp = tmp / multiplier;
         ic = tmp % params.in_c; tmp = tmp / params.in_c;
         kx = tmp % params.kw; ky = tmp / params.kw;
         oc = ic * multiplier + m;
-    } else {
+    } else if (params.weight_layout == 3u) {
+        let multiplier = params.out_c / params.in_c;
+        var tmp = flat;
+        oc = tmp % params.out_c; tmp = tmp / params.out_c;
+        kx = tmp % params.kw; ky = tmp / params.kw;
+        ic = oc / multiplier;
+    } else if (params.weight_layout == 0u) {
         let in_per_group = params.in_c / params.groups;
         let out_per_group = params.out_c / params.groups;
         var tmp = flat;
         oc = tmp % params.out_c; tmp = tmp / params.out_c;
         let local_ic = tmp % in_per_group; tmp = tmp / in_per_group;
         kx = tmp % params.kw; ky = tmp / params.kw;
+        ic = (oc / out_per_group) * in_per_group + local_ic;
+    } else {
+        let in_per_group = params.in_c / params.groups;
+        let out_per_group = params.out_c / params.groups;
+        var tmp = flat;
+        let local_ic = tmp % in_per_group; tmp = tmp / in_per_group;
+        kx = tmp % params.kw; tmp = tmp / params.kw;
+        ky = tmp % params.kh; oc = tmp / params.kh;
         ic = (oc / out_per_group) * in_per_group + local_ic;
     }
     var sum = 0.0;

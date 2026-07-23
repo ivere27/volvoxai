@@ -84,7 +84,7 @@ static char* read_file_bytes(const char* path, long* out_size) {
     return data;
 }
 
-SafetensorsDType safetensors_dtype_from_name(const char* dtype) {
+VxDataType safetensors_dtype_from_name(const char* dtype) {
     if (!dtype) return SAFETENSORS_DTYPE_UNKNOWN;
     if (strcmp(dtype, "BOOL") == 0) return SAFETENSORS_DTYPE_BOOL;
     if (strcmp(dtype, "F4") == 0) return SAFETENSORS_DTYPE_F4;
@@ -111,7 +111,7 @@ SafetensorsDType safetensors_dtype_from_name(const char* dtype) {
     return SAFETENSORS_DTYPE_UNKNOWN;
 }
 
-const char* safetensors_dtype_name(SafetensorsDType dtype) {
+const char* safetensors_dtype_name(VxDataType dtype) {
     switch (dtype) {
         case SAFETENSORS_DTYPE_BOOL: return "BOOL";
         case SAFETENSORS_DTYPE_F4: return "F4";
@@ -140,7 +140,7 @@ const char* safetensors_dtype_name(SafetensorsDType dtype) {
     }
 }
 
-size_t safetensors_dtype_bit_width(SafetensorsDType dtype) {
+size_t safetensors_dtype_bit_width(VxDataType dtype) {
     switch (dtype) {
         case SAFETENSORS_DTYPE_F4:
             return 4;
@@ -176,7 +176,7 @@ size_t safetensors_dtype_bit_width(SafetensorsDType dtype) {
     }
 }
 
-size_t safetensors_dtype_byte_width(SafetensorsDType dtype) {
+size_t safetensors_dtype_byte_width(VxDataType dtype) {
     size_t bits = safetensors_dtype_bit_width(dtype);
     return bits && bits % 8 == 0 ? bits / 8 : 0;
 }
@@ -196,7 +196,7 @@ void safetensors_free(SafetensorsFile* file) {
     memset(file, 0, sizeof(*file));
 }
 
-static int tensor_nbytes(SafetensorsDType dtype, const int* shape, int ndim, size_t* out_nbytes) {
+static int tensor_nbytes(VxDataType dtype, const int* shape, int ndim, size_t* out_nbytes) {
     size_t bits = safetensors_dtype_bit_width(dtype);
     if (bits == 0) return -1;
     size_t elems = 1;
@@ -211,7 +211,7 @@ static int tensor_nbytes(SafetensorsDType dtype, const int* shape, int ndim, siz
     return 0;
 }
 
-int safetensors_tensor_nbytes(SafetensorsDType dtype, const int* shape, int ndim, size_t* out_nbytes) {
+int safetensors_tensor_nbytes(VxDataType dtype, const int* shape, int ndim, size_t* out_nbytes) {
     return tensor_nbytes(dtype, shape, ndim, out_nbytes);
 }
 
@@ -223,7 +223,7 @@ static int parse_tensor_entry(cJSON* node, long data_base, long file_size, Safet
         return -1;
     }
 
-    SafetensorsDType dtype = safetensors_dtype_from_name(dtype_node->valuestring);
+    VxDataType dtype = safetensors_dtype_from_name(dtype_node->valuestring);
     if (dtype == SAFETENSORS_DTYPE_UNKNOWN) return -1;
 
     int ndim = cJSON_GetArraySize(shape_node);
@@ -605,7 +605,7 @@ int safetensors_set_metadata_json(SafetensorsFile* file, const char* metadata_js
     return 0;
 }
 
-int safetensors_add_tensor(SafetensorsFile* file, const char* name, SafetensorsDType dtype,
+int safetensors_add_tensor(SafetensorsFile* file, const char* name, VxDataType dtype,
                            const int* shape, int ndim, const void* data, size_t nbytes) {
     if (!file || !name || !name[0] || !shape || ndim < 0 || ndim > 8 ||
         !(file->flags & SAFETENSORS_OPEN_READ_WRITE)) return -1;

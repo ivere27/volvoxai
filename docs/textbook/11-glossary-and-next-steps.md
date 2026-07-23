@@ -32,6 +32,10 @@ two running gradient *moments*, plus decoupled weight decay (the "W").
 **Anchor** — a fixed reference box (a prior) that a detector adjusts, instead of predicting a box
 from scratch. EfficientDet-Lite0 uses 9 per grid cell → 19,206 total.
 
+**Arithmetic intensity (roofline)** — FLOPs done per byte moved from memory. High intensity (a 1×1
+conv, a matmul) is *compute-bound*, where SIMD helps; low intensity (an elementwise `Add`) is
+*memory-bound*, where fusion and buffer reuse help instead (Chapter 8).
+
 **Attention (SDPA)** — the transformer mechanism where each token compares its **Query** to every
 token's **Key** and blends their **Values** by similarity. "Which earlier words matter to me?"
 
@@ -70,11 +74,23 @@ channel mixer; the two together (**depthwise-separable**) are cheap and power th
 **Cross-entropy** — the language-model training loss: how wrong the predicted next-token
 distribution is versus the true token. Its gradient seeds the backward pass (Chapter 4).
 
+**CUDA** — NVIDIA's system for running your own programs (**kernels**) on their GPUs. VolvoxAI's CUDA
+backend uses only the NVIDIA **Driver API** plus its own **PTX** kernels — no cuBLAS/cuDNN/cudart
+(Chapter 9C).
+
+**CUDA Graph (capture / replay)** — record a fixed sequence of GPU launches once, then replay the whole
+recording with far less per-launch overhead. VolvoxAI uses it as a conservative inference speed-up that
+never changes the answer (Chapter 9C §9C.7).
+
 **Dequantize** — convert int8 back to float: `r = (q − zero_point) × scale`.
 
 **dlopen / dlsym** — load a shared library and look up its functions *at runtime* (not link
 time). How VolvoxAI's native binary uses a GPU driver (`libvulkan`, `libGL`) without linking any
 GPU SDK — the "no static GPU dependency" design.
+
+**Driver API** — the small, stable set of low-level NVIDIA functions (make device memory, copy, launch a
+kernel) that live in the always-present GPU driver. VolvoxAI resolves it at runtime via `dlopen`, so no
+CUDA toolkit is linked (Chapter 9C §9C.2).
 
 **Dropout** — randomly zeroing a fraction of activations *during training* (off at inference) so the
 model can't over-rely on any single unit (Chapter 5).
@@ -101,7 +117,10 @@ changes if that weight moves. The backward pass computes one per weight (Chapter
 **Gradient accumulation** — summing gradients over several small microbatches before one optimizer
 step, to emulate a large batch that wouldn't fit in memory (Chapter 5).
 
-**Graph** — the model's op list: nodes (ops) connected by named tensors. Stored as `config.json`.
+**Gradient checkpointing** — saving only some forward activations and *recomputing* the rest during
+the backward pass, trading extra compute for much lower memory (Chapter 4).
+
+**Graph** — the model's op list: nodes (ops) connected by named tensors. Stored as `graph.json`.
 
 **Head** — the final task-specific layer(s): the LM head (→ vocabulary logits) or the detector's
 class/box heads.
@@ -112,8 +131,8 @@ class/box heads.
 bytes). See Chapter 6.
 
 **KV-cache** — caching past tokens' Keys and Values so each generation step only computes the new
-token's attention. In this repo: `volvoxai_engine_forward_prefix` +
-`volvoxai_engine_forward_row`.
+token's attention. In JavaScript it belongs to an ExecutionContext and is controlled through
+context.decode.seed(), step(), and reset().
 
 **LayerNorm / RMSNorm** — normalize a vector (mean 0, variance 1, then learned scale/shift) to
 keep deep-network numbers stable.
@@ -160,8 +179,16 @@ name; "kernel" is a specific implementation of it.
 **PTQ (Post-Training Quantization)** — quantizing an already-trained model by calibrating ranges and
 packing weights, with no retraining (Chapter 7).
 
+**PTX** — NVIDIA's portable GPU instruction format — a "recipe in the GPU's own handwriting." VolvoxAI
+compiles its `.cu` kernels to PTX, embeds it in the binary, and the driver JIT-compiles it for the exact
+card at runtime (Chapter 9C §9C.3).
+
 **QAT (Quantization-Aware Training)** — training *with* simulated int8 rounding in the forward pass
 so the weights learn to tolerate it; gradients flow via the straight-through estimator (Chapter 7).
+
+**Residency (device-resident)** — keeping a tensor's data on the GPU between steps instead of copying it
+back to the CPU each time. VolvoxAI's CUDA backend maps each host pointer to a device slot and keeps
+weights resident, so it copies only when the CPU truly needs the data (Chapter 9C §9C.6).
 
 **Residual (skip connection)** — adding a block's input to its output (`out = x + f(x)`) so
 information and gradients survive deep stacks. In both models.
@@ -178,18 +205,19 @@ gradient, `w -= lr·grad` (Chapter 5).
 
 **SPIR-V** — the binary shader format Vulkan consumes; `naga` compiles VolvoxAI's WGSL to it.
 
-**Prefill / Decode** — the two phases of native text generation: *prefill* runs the prompt once
-to fill the KV-cache; *decode* runs one new token at a time using the cache. The generic public APIs
-name these operations `volvoxai_engine_forward_prefix` / `volvoxai_engine_forward_row`; callers
-read a declared output row with `volvoxai_engine_tensor_row_f32`.
+**Prefill / Decode** — the two phases of text generation: *prefill* runs the prompt once to fill the
+KV-cache; *decode* runs one new token at a time using the cache. JavaScript callers use
+ExecutionContext.decode.seed() and step(), and read each stable ExecutionResult by output name.
+Native applications use their VxExecutionContext and declared VxResult outputs; the public C API
+does not expose separate prefix/row functions.
 
 **Straight-through estimator** — the QAT trick of treating the non-differentiable round-to-int step
 as the identity in the backward pass, so gradients keep flowing (Chapter 7).
 
 **Tensor** — a multi-dimensional array of numbers with a shape; the only data type in the engine.
 
-**Tier** — one of VolvoxAI's four browser backends (WebNN / WebGPU / WASM / Pure-JS), picked by
-capability.
+**Tier** — one of VolvoxAI's browser providers (WebNN / WebGPU / WASM / CPU), selected and fixed by
+Model.compile() policy.
 
 **Token** — a chunk of text (word/sub-word/byte) mapped to an integer id.
 
@@ -208,8 +236,8 @@ You don't need to touch the repo to keep learning:
 
 - **Re-read the 🌱 thread as one story.** Skim just the "big idea" boxes, Chapter 1 → 9, back to back.
   It's a complete, plain-language account of how AI works — it lands harder the second time.
-- **Watch a model actually run.** Ask someone with the repo to run the `detect` or `generate` command
-  (§11.3) on your photo or prompt, and match what happens to the stages in Chapters 2–3.
+- **Watch a model actually run.** Ask someone with the repo to run the `detect` command
+  (§11.3) on your photo, and match what happens to the stages in Chapter 3.
 - **Explain it to someone else.** Try to describe "what attention does" or "why quantization shrinks a
   model" in your own words. Teaching it is the real test of understanding.
 - **Do the 🌱 exercises** in §11.4 — they need only pen, paper, and the ideas you already have.
@@ -232,8 +260,8 @@ Read in this order to go from "I get the concepts" to "I can modify the engine":
 1. **The data model** — `ts/core/Tensor.ts`, `ts/core/Graph.ts`. Tiny; read fully.
 2. **The executor** — `ts/backends/CPUEngine.ts` (the loop + dispatch).
 3. **Four naive kernels** — `ts/ops/add.ts`, `embedding.ts`, `layerNorm.ts`, `matMul.ts`.
-4. **The two models' blueprints** — skim `models/tinystories_1m/config.json` and
-   `models/efficientdet_lite0_fp32/config.json`. Match nodes to Chapters 2–3.
+4. **The two models' graph documents** — skim `models/tinystories_1m/graph.json` and
+   `models/efficientdet_lite0_fp32/graph.json`. Match nodes to Chapters 2–3.
 5. **The attention + conv kernels** — `ts/ops/sDPA.ts`, `ts/ops/conv2D.ts`.
 6. **Quantization** — `ts/ops/dequantizeLinear.ts`, then `native/src/kernels/quant_cpu_opt.c`.
 7. **Optimization** — diff `ts/ops/conv2D.ts` against `native/src/kernels/conv_f32_opt.c` while reading
@@ -255,29 +283,25 @@ Read in this order to go from "I get the concepts" to "I can modify the engine":
 # Build the opt-in image/vocabulary/task frontend.
 make -C examples native_task_cli
 
-# Language model — generate text (greedy).
-examples/target/bin/volvoxai-tasks generate models/tinystories_1m \
-  --prompt "Once upon a time, Lily" --max-new 50 [--debug]
-
 # Raw graph runner — dump the logits tensor for a fixed set of tokens.
 make build_native
 ./native/volvoxai run models/tinystories_1m \
   --input tokens=models/tinystories_1m/tokens.i32 \
   --input positions=models/tinystories_1m/positions.i32 \
-  --output logits=out.f32 --row 4
+  --output logits=out.f32
 
 # Object detector — decode an image into ranked boxes.
 examples/target/bin/volvoxai-tasks detect models/efficientdet_lite0_int8 \
   --image input0=photo.png --image-normalize raw-255 \
   --boxes boxes --scores scores --max-det 20
 
-# In Node (WASM / pure-JS tiers), smoke-test any blueprint:
+# In Node (WASM / pure-JS tiers), smoke-test any graph package:
 node bin/volvox.js run --model models/tinystories_1m/model.safetensors --backend wasm
 ```
 
-Add `--debug` to the task example's `generate` command to see per-node timing
-and tokens/sec — a great way to *feel* where time goes (and to watch the
-optimizations from Chapter 8 pay off).
+Add `--debug` to a task example command to see per-node timing. This is a
+direct way to observe where execution time goes and how Chapter 8's
+optimizations change it.
 
 ---
 
@@ -297,7 +321,7 @@ optimizations from Chapter 8 pay off).
 
 1. **Trace by hand.** Take the sequence `[5, 5]` (two identical tokens) and a made-up 2-dim
    embedding. Walk `Embedding → Add(position) → LayerNorm` with pen and paper. Confirm the shapes
-   match `config.json`.
+   match `graph.json`.
 2. **Break causality.** In `ts/ops/sDPA.ts`, change `k <= q` to `k < seq_len`. Predict what
    happens to generated text and why. (Then revert.)
 3. **Quantize a weight.** Pick `scale = 0.02`, `zero_point = -5`. Quantize `r = 0.31`, then
@@ -308,7 +332,7 @@ optimizations from Chapter 8 pay off).
    depthwise-separable cheaper?
 5. **Add an op.** Implement an element-wise `Abs` kernel in `ts/ops/`, wire it into
    `CPUEngine.ts`'s `switch`, and confirm it dispatches. (Follow `ts/ops/reLU.ts` as a template.)
-6. **Find a fusion.** In `models/efficientdet_lite0_fp32/config.json`, find a `Conv2D` whose
+6. **Find a fusion.** In `models/efficientdet_lite0_fp32/graph.json`, find a `Conv2D` whose
    `relu` param is set — that's a Conv+ReLU fusion already baked in. Explain what two ops it
    represents.
 
@@ -331,13 +355,18 @@ platform. The honest remaining gaps:
 | **Data & pipelines** | Dataset manifests, streaming/input pipelines, augmentation, cleaning, tokenizer training, and train/validation/test splits with leakage checks. | Model quality is usually bounded by data quality and experimental hygiene. |
 | **Evaluation & experimentation** | Standard task metrics, baselines, ablations, hyperparameter sweeps, and bias-variance analysis, beyond the per-task exact-match the examples report. | This is how you know a model is actually better, not just different. |
 | **Math foundations** | Linear-algebra derivations, calculus for the chain rule and gradients, probability, and entropy / KL / likelihood. | The tools for explaining *why* training and evaluation behave the way they do. |
-| **Frontier LLM stack** | Pretraining at scale, RLHF/DPO preference training, distributed data/model parallelism, FlashAttention, and grouped-query-attention / SwiGLU blocks. | The engine already has RoPE, RMSNorm, MoE, LoRA, and int8 — but not the largest-scale recipes or fused-attention kernels. |
+| **Frontier LLM stack** | Pretraining at scale, RLHF/DPO preference training, distributed data/model parallelism, FlashAttention, and *prebuilt* grouped-query-attention / SwiGLU blocks. | The engine already has RoPE, RMSNorm, MoE, LoRA, and int8 — but not the largest-scale recipes or fused-attention kernels. (SwiGLU is composable today from `SiLU`+`Mul`+`Linear`; only the one-call block is missing.) |
 | **Sub-8-bit quantization** | int4 / group-quantized weight formats and their unpack-in-register kernels. | The extra memory-bandwidth win for large LLM weights; documented as a future microkernel direction, not a shipping format. |
 | **Architecture breadth** | Diffusion, graph neural networks, RNN/LSTM, reinforcement learning, VAE/GAN, retrieval/embedding, and state-space models. | The walkthrough covers a transformer LM, a CNN detector, and (Chapter 10) a multimodal VQA capstone; other domains use different inductive biases. |
 | **Research practice** | Paper reproduction, controlled experiments, and scaling-law / error analysis. | The difference between running or training a model and producing reliable new knowledge. |
 
 Listing these keeps the scope honest: a strong inference **and** training/optimization foundation,
 not a complete training-and-research curriculum.
+
+> 🔬 **Engine gaps vs. this list.** The table above is *capability-level*. For the concrete,
+> near-term **engine** gaps that are already on the to-do list — missing GPU/WebNN op coverage,
+> INT4 weights, a browser streaming helper, parity/benchmark harnesses — see the live
+> [`docs/roadmap.md`](../roadmap.md).
 
 ---
 
@@ -350,7 +379,8 @@ The natural next steps split into two tracks:
   `shaders/{inference,training}/*.wgsl` and the native GPU backends.
 - **Scale the transformer.** GPT-2/3, LLaMA, Mistral, Qwen are Chapter 2's graph, wider/deeper,
   with tweaks: **RMSNorm** instead of LayerNorm, **RoPE** rotary positions instead of learned
-  `wpe`, **grouped-query attention**, **SwiGLU** MLPs. Each is a small variation on ops you know.
+  `wpe`, **grouped-query attention**, **SwiGLU** MLPs (compose them from `SiLU` + `Mul` + `Linear` —
+  those ops already ship). Each is a small variation on ops you know.
 - **Broaden architectures.** Classification, segmentation, pose, diffusion, retrieval,
   multimodal, MoE, and SSM systems all reuse the tensor/graph mental model, but add different
   blocks and training objectives.

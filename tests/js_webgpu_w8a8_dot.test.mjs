@@ -55,7 +55,7 @@ test('WebGPU packed-dot shaders alone require the optional WGSL language feature
   assert.match(executor,
     /wgslLanguageFeatures\s*=\s*globalThis\.navigator\?\.gpu\?\.wgslLanguageFeatures/);
   assert.match(executor,
-    /languageFeatures\?\.has\?\.\(WEBGPU_PACKED_DOT4_FEATURE\)\s*===\s*true/);
+    /wgslLanguageFeatures\?\.has\?\.\('packed_4x8_integer_dot_product'\)\s*===\s*true/);
 });
 
 test('WebGPU tiled W8A8 convolution cooperatively caches input and weight reduction tiles', async () => {

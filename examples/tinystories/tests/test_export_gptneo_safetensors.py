@@ -85,11 +85,11 @@ class TinyStoriesExporterTests(unittest.TestCase):
                 "transformer.h.0.ln_2.bias": torch.zeros(2),
                 "transformer.h.0.mlp.c_fc.weight": torch.arange(
                     16, dtype=torch.float32
-                ).reshape(2, 8),
+                ).reshape(8, 2),
                 "transformer.h.0.mlp.c_fc.bias": torch.zeros(8),
                 "transformer.h.0.mlp.c_proj.weight": torch.arange(
                     16, dtype=torch.float32
-                ).reshape(8, 2),
+                ).reshape(2, 8),
                 "transformer.h.0.mlp.c_proj.bias": torch.zeros(2),
             }
         )
@@ -101,10 +101,20 @@ class TinyStoriesExporterTests(unittest.TestCase):
 
         self.assertNotIn("h.0.attn.attention.q_proj.weight", tensors)
         self.assertEqual(tuple(tensors["h.0.attn.qkv_proj.weight"].shape), (2, 6))
-        self.assertEqual(tuple(tensors["h.0.mlp.c_fc.weight"].shape), (8, 2))
+        self.assertEqual(tuple(tensors["h.0.mlp.c_fc.weight"].shape), (2, 8))
+        self.assertEqual(tuple(tensors["h.0.mlp.c_proj.weight"].shape), (8, 2))
         self.assertEqual(tuple(tensors["lm_head.weight"].shape), (2, 5))
         self.assertEqual(nodes[-1]["outputs"], {"out": "logits"})
         self.assertEqual(nodes[-1]["outputs_shape"]["out"], [1, 256, 5])
+        self.assertTrue(all(node["outputs_dtype"] == {"out": "float32"}
+                            for node in nodes))
+        self.assertTrue(all(
+            node.get("params", {}).get("weight_layout") == "IN_OUT"
+            for node in nodes if node["opType"] == "MatMul"
+        ))
+        attention = next(node for node in nodes if node["opType"] == "SDPA")
+        self.assertTrue(attention["params"]["causal"])
+        self.assertAlmostEqual(attention["params"]["scale"], 1 / np.sqrt(2))
 
     def test_export_preserves_example_package_filenames(self):
         model = SimpleNamespace(config=minimal_config(), state_dict=minimal_state_dict)
@@ -120,12 +130,13 @@ class TinyStoriesExporterTests(unittest.TestCase):
             ):
                 exporter.export_model("local-checkpoint", output_path)
 
-            graph = json.loads((output_dir / "config.json").read_text(encoding="utf-8"))
+            graph = json.loads((output_dir / "graph.json").read_text(encoding="utf-8"))
+            self.assertEqual(graph["format"], "volvox-graph/v1")
             tensors = load_file(str(output_path), device="cpu")
             tokens = np.fromfile(output_dir / "tokens.i32", dtype=np.int32)
             positions = np.fromfile(output_dir / "positions.i32", dtype=np.int32)
 
-        self.assertEqual(graph["outputs"], {"logits": "logits"})
+        self.assertEqual(graph["outputs"], ["logits"])
         self.assertEqual(graph["inputs"]["tokens"]["shape"], [1, 256])
         self.assertIn("lm_head.weight", tensors)
         self.assertEqual(tokens.shape, (256,))

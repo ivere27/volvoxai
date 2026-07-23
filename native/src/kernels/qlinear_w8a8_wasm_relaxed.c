@@ -15,7 +15,7 @@
  *       input_zero_point, output_scale, output_zero_point, input_dtype,
  *       weight_dtype, output_dtype)
  *
- * raw_weight is canonical [d_out,d_in].  packed_weight is the existing V8Q1
+ * raw_weight is canonical [d_out,d_in].  packed_weight is the existing V8Q2
  * panel and supplies validated per-output weight sums.  The function returns 1
  * only after writing a complete output row.  It returns 0 without writing any
  * output for unsupported or unsafe descriptors, so the baseline kernel can run.
@@ -24,6 +24,8 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <wasm_simd128.h>
+#include "packed_quant_gemm.h"
+#include "w8a8_affine.h"
 
 #if !defined(__wasm__) || !defined(__wasm_simd128__) || \
     !defined(__wasm_relaxed_simd__)
@@ -31,34 +33,13 @@
 #endif
 
 enum {
-    VX_RELAXED_Q8_MAGIC = 0x31513856u, /* "V8Q1" in little endian. */
-    VX_RELAXED_Q8_NR = 8u,
-    VX_RELAXED_I8 = 2u,
-    VX_RELAXED_U8 = 3u,
+    VX_RELAXED_Q8_NR = VX_PACKED_Q8_NR,
+    VX_RELAXED_I8 = VX_DTYPE_I8,
+    VX_RELAXED_U8 = VX_DTYPE_U8,
 };
-
-typedef struct {
-    uint32_t magic;
-    uint32_t bytes;
-    uint32_t d_in;
-    uint32_t d_out;
-    uint32_t n_blocks;
-    uint32_t weight_dtype;
-    uint32_t sums_offset;
-    uint32_t data_offset;
-} VxRelaxedPackedQ8Header;
 
 static uint32_t vx_relaxed_align16(uint32_t value) {
     return (value + 15u) & ~15u;
-}
-
-static int vx_relaxed_byte_dtype(uint32_t dtype) {
-    return dtype == VX_RELAXED_I8 || dtype == VX_RELAXED_U8;
-}
-
-static int vx_relaxed_zero_valid(int32_t value, uint32_t dtype) {
-    return dtype == VX_RELAXED_I8 ? value >= -128 && value <= 127 :
-        dtype == VX_RELAXED_U8 && value >= 0 && value <= 255;
 }
 
 static uint32_t vx_relaxed_max_centered_byte(int32_t zero_point,
@@ -68,11 +49,6 @@ static uint32_t vx_relaxed_max_centered_byte(int32_t zero_point,
     uint32_t below = (uint32_t)(zero_point - minimum);
     uint32_t above = (uint32_t)(maximum - zero_point);
     return below > above ? below : above;
-}
-
-static int vx_relaxed_finite_f32(float value) {
-    union { float f; uint32_t u; } bits = { value };
-    return ((bits.u >> 23u) & 0xffu) != 0xffu;
 }
 
 static int vx_relaxed_span_valid(const void* pointer, uint64_t bytes,
@@ -85,37 +61,47 @@ static int vx_relaxed_span_valid(const void* pointer, uint64_t bytes,
 static uint32_t vx_relaxed_packed_size(uint32_t d_in, uint32_t d_out) {
     uint64_t n_blocks;
     uint64_t sums_bytes;
+    uint64_t data_bytes;
     uint64_t data_offset;
+    uint64_t pair_data_offset;
     uint64_t total;
     if (!d_in || !d_out || d_in > (uint32_t)(INT32_MAX / 255)) return 0;
     n_blocks = ((uint64_t)d_out - 1u) / VX_RELAXED_Q8_NR + 1u;
     sums_bytes = n_blocks * VX_RELAXED_Q8_NR * sizeof(int32_t);
-    data_offset = ((uint64_t)sizeof(VxRelaxedPackedQ8Header) + sums_bytes + 15u) &
+    data_bytes = n_blocks * d_in * VX_RELAXED_Q8_NR;
+    data_offset = ((uint64_t)sizeof(VxPackedQ8Header) + sums_bytes + 15u) &
         ~(uint64_t)15u;
-    total = data_offset + n_blocks * d_in * VX_RELAXED_Q8_NR;
+    pair_data_offset = (data_offset + data_bytes + 15u) & ~(uint64_t)15u;
+    /* The wasm parent has no native AVX2 pair payload, but V8Q2 still records
+     * its aligned offset as the end of the allocation. */
+    total = pair_data_offset;
     return total <= UINT32_MAX ? (uint32_t)total : 0u;
 }
 
-static const VxRelaxedPackedQ8Header* vx_relaxed_validate_packed(
+static const VxPackedQ8Header* vx_relaxed_validate_packed(
         const void* packed, uint32_t d_in, uint32_t d_out,
         uint32_t weight_dtype, uint64_t memory_bytes) {
-    const VxRelaxedPackedQ8Header* header =
-        (const VxRelaxedPackedQ8Header*)packed;
+    const VxPackedQ8Header* header = (const VxPackedQ8Header*)packed;
     uint32_t expected = vx_relaxed_packed_size(d_in, d_out);
     uint32_t n_blocks;
     uint32_t sums_offset;
     uint32_t data_offset;
+    uint32_t pair_data_offset;
     if (!expected || !vx_relaxed_span_valid(packed, expected, memory_bytes))
         return NULL;
     n_blocks = (d_out - 1u) / VX_RELAXED_Q8_NR + 1u;
     sums_offset = vx_relaxed_align16((uint32_t)sizeof(*header));
     data_offset = vx_relaxed_align16(sums_offset +
         n_blocks * VX_RELAXED_Q8_NR * (uint32_t)sizeof(int32_t));
-    if (header->magic != VX_RELAXED_Q8_MAGIC || header->bytes != expected ||
+    pair_data_offset = vx_relaxed_align16(data_offset +
+        n_blocks * d_in * VX_RELAXED_Q8_NR);
+    if (header->magic != VX_PACKED_Q8_MAGIC || header->bytes != expected ||
         header->d_in != d_in || header->d_out != d_out ||
         header->n_blocks != n_blocks || header->weight_dtype != weight_dtype ||
         header->sums_offset != sums_offset || header->data_offset != data_offset ||
-        (uint64_t)data_offset + (uint64_t)n_blocks * d_in * VX_RELAXED_Q8_NR != expected)
+        header->pair_n_blocks != 0u || header->pair_k_blocks != 0u ||
+        header->pair_data_offset != pair_data_offset ||
+        header->pair_flags != 0u || pair_data_offset != expected)
         return NULL;
     return header;
 }
@@ -135,22 +121,6 @@ static uint64_t vx_relaxed_abs_i64(int64_t value) {
     return value < 0 ? (uint64_t)(-value) : (uint64_t)value;
 }
 
-static int32_t vx_relaxed_round_ties_even(float value) {
-    int32_t lower = (int32_t)__builtin_floorf(value);
-    float fraction = value - (float)lower;
-    if (fraction < 0.5f) return lower;
-    if (fraction > 0.5f) return lower + 1;
-    return lower % 2 == 0 ? lower : lower + 1;
-}
-
-static int32_t vx_relaxed_requantize(float transformed, int32_t minimum,
-        int32_t maximum, int32_t nan_value) {
-    if (transformed != transformed) return nan_value;
-    if (transformed <= (float)minimum) return minimum;
-    if (transformed >= (float)maximum) return maximum;
-    return vx_relaxed_round_ties_even(transformed);
-}
-
 static void vx_relaxed_store(void* output, uint32_t dtype, uint32_t index,
         int32_t value) {
     if (dtype == VX_RELAXED_I8) ((int8_t*)output)[index] = (int8_t)value;
@@ -161,7 +131,7 @@ static int32_t vx_relaxed_quantize(int32_t accumulator, float input_scale,
         float weight_scale, float output_scale, int32_t output_zero_point,
         int32_t output_minimum, int32_t output_maximum) {
     float multiplier = input_scale * weight_scale / output_scale;
-    return vx_relaxed_requantize((float)accumulator * multiplier +
+    return vx_w8a8_requantize((float)accumulator * multiplier +
         (float)output_zero_point, output_minimum, output_maximum,
         output_zero_point);
 }
@@ -185,7 +155,7 @@ int vx_qlinear_i8u8_relaxed(const void* input_pointer,
         uint32_t output_dtype) {
     const uint8_t* input = (const uint8_t*)input_pointer;
     const uint8_t* raw_weight = (const uint8_t*)raw_weight_pointer;
-    const VxRelaxedPackedQ8Header* header;
+    const VxPackedQ8Header* header;
     const int32_t* raw_weight_sums;
     int64_t input_sum = 0;
     uint64_t raw_dot_bound;
@@ -198,9 +168,9 @@ int vx_qlinear_i8u8_relaxed(const void* input_pointer,
 
     /* Validate every fallible condition before the first output store. */
     if (rows != 1u || d_in < 16u || !d_out ||
-        !vx_relaxed_byte_dtype(input_dtype) ||
-        !vx_relaxed_byte_dtype(weight_dtype) ||
-        !vx_relaxed_byte_dtype(output_dtype) ||
+        !vx_w8a8_byte_dtype(input_dtype) ||
+        !vx_w8a8_byte_dtype(weight_dtype) ||
+        !vx_w8a8_byte_dtype(output_dtype) ||
         !vx_relaxed_span_valid(input, d_in, memory_bytes) ||
         !vx_relaxed_span_valid(raw_weight, weight_bytes, memory_bytes) ||
         !vx_relaxed_span_valid(bias, (uint64_t)d_out * sizeof(*bias),
@@ -210,10 +180,10 @@ int vx_qlinear_i8u8_relaxed(const void* input_pointer,
         !vx_relaxed_span_valid(weight_zero_points,
             (uint64_t)d_out * sizeof(*weight_zero_points), memory_bytes) ||
         !vx_relaxed_span_valid(output, d_out, memory_bytes) ||
-        !vx_relaxed_finite_f32(input_scale) || input_scale <= 0.0f ||
-        !vx_relaxed_finite_f32(output_scale) || output_scale <= 0.0f ||
-        !vx_relaxed_zero_valid(input_zero_point, input_dtype) ||
-        !vx_relaxed_zero_valid(output_zero_point, output_dtype)) return 0;
+        !vx_w8a8_finite_f32(input_scale) || input_scale <= 0.0f ||
+        !vx_w8a8_finite_f32(output_scale) || output_scale <= 0.0f ||
+        !vx_w8a8_zero_point_valid(input_zero_point, input_dtype) ||
+        !vx_w8a8_zero_point_valid(output_zero_point, output_dtype)) return 0;
 
     header = vx_relaxed_validate_packed(packed_weight_pointer, d_in, d_out,
         weight_dtype, memory_bytes);
@@ -236,9 +206,13 @@ int vx_qlinear_i8u8_relaxed(const void* input_pointer,
         int64_t centered_weight_sum;
         int64_t correction;
         uint64_t canonical_bound;
-        if (!vx_relaxed_finite_f32(weight_scales[column]) ||
+        volatile float product_scale =
+            input_scale * weight_scales[column];
+        volatile float multiplier = product_scale / output_scale;
+        if (!vx_w8a8_finite_f32(weight_scales[column]) ||
             weight_scales[column] <= 0.0f ||
-            !vx_relaxed_zero_valid(weight_zero_point, weight_dtype)) return 0;
+            !vx_w8a8_finite_f32(multiplier) || multiplier <= 0.0f ||
+            !vx_w8a8_zero_point_valid(weight_zero_point, weight_dtype)) return 0;
         signed_weight_zero_point = weight_zero_point -
             (weight_dtype == VX_RELAXED_U8 ? 128 : 0);
         centered_weight_sum = (int64_t)raw_weight_sums[column] -

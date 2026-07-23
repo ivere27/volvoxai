@@ -1,13 +1,12 @@
 #!/usr/bin/env bash
 #
-# Compatibility dispatcher for example-owned model fetchers.
+# Dispatcher for example-owned model fetchers.
 #
 # Usage:
 #   tools/fetch_models.sh                 # everything (EfficientDet variants + TinyStories)
 #   tools/fetch_models.sh efficientdet    # only the EfficientDet-Lite0 detector (fp32/fp16/int8)
 #   tools/fetch_models.sh tinystories     # only the TinyStories-1M language model
 #
-# New automation should call the fetcher under each example directly.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"

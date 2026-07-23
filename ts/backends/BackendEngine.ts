@@ -1,8 +1,10 @@
 import { DecodeSession } from './DecodeSession.js';
 import { validatePortableQuantizedGraph } from '../ops/quantizedGraphValidation.js';
+import { memoryLocations } from '../generated/volvoxaiEnums.js';
 import type { PortableQuantizedGraph } from '../ops/quantizedGraphValidation.js';
+import type { MemoryLocationValue } from '../generated/volvoxaiEnums.js';
 
-export type BackendOutputLocation = 'host' | 'device';
+export type BackendOutputLocation = MemoryLocationValue;
 
 export interface BackendCapabilityOptions {
   incrementalExecution?: boolean;
@@ -26,12 +28,10 @@ export interface BackendExecutionOptions {
 }
 
 export interface BackendEngineLike {
-  backendApiVersion: number;
   backendName: string;
   capabilities: BackendCapabilities;
-  supportsIncrementalExecution?: boolean;
-  supportsIncrementalRows?: boolean;
   decodeCacheGeneration?: number;
+  adapterInfo?: Readonly<Record<string, string>> | null;
   allocateGraph(...args: any[]): any;
   execute(...args: any[]): Promise<any> | any;
   createDecodeSession(options?: any): DecodeSession;
@@ -39,11 +39,25 @@ export interface BackendEngineLike {
   _claimDecodeSessionExecution?(options: BackendExecutionOptions, generation: number | null): BackendExecutionOptions;
 }
 
-/** Version of the public JavaScript backend lifecycle contract. */
-export const VOLVOXAI_BACKEND_API_VERSION = 1;
-
-const OUTPUT_LOCATIONS = new Set(['host', 'device']);
+const OUTPUT_LOCATIONS = new Set<unknown>(memoryLocations);
 const DECODE_SESSION_CLAIM = Symbol('volvoxai.decodeSessionClaim');
+const FORBIDDEN_INFERENCE_OPTIONS = Object.freeze([
+  'training', 'trainingMode', 'dropout', 'dropoutSeed', 'dropoutCounter',
+  'rng', 'seed', 'counter',
+]);
+
+/** @internal Reject training control data at every built-in inference engine. */
+export function assertInferenceExecutionOptions(options: unknown, label: string): void {
+  if (options == null) return;
+  if (typeof options !== 'object' || Array.isArray(options)) {
+    throw new Error(`${label} options must be an object.`);
+  }
+  for (const name of FORBIDDEN_INFERENCE_OPTIONS) {
+    if (Object.prototype.hasOwnProperty.call(options, name)) {
+      throw new Error(`${label} does not accept training or Dropout RNG options.`);
+    }
+  }
+}
 
 export function createBackendCapabilities({
   incrementalExecution = false,
@@ -63,20 +77,10 @@ export function createBackendCapabilities({
   });
 }
 
-/**
- * Public browser-backend contract.
- *
- * Implementations bind one Graph with `allocateGraph(graph)`, then execute it
- * through `execute(inputs, options)`. Extensible backends registered on
- * `VolvoxAI` may subclass this class or provide the same public properties and
- * methods. Device-output backends also expose their own explicit readback API.
- */
+/** @internal Shared implementation base for VolvoxAI's built-in engines. */
 export abstract class BackendEngine {
-  backendApiVersion!: number;
   backendName!: string;
   capabilities!: Readonly<BackendCapabilities>;
-  supportsIncrementalExecution!: boolean;
-  supportsIncrementalRows!: boolean;
   protected _decodeCacheGeneration: number;
   protected _decodeCacheGenerationListener: ((generation: number) => void) | null;
   protected _incrementalCacheValid = false;
@@ -94,12 +98,8 @@ export abstract class BackendEngine {
     if (typeof name !== 'string' || name.length === 0) {
       throw new Error('BackendEngine requires a non-empty backend name.');
     }
-    this.backendApiVersion = VOLVOXAI_BACKEND_API_VERSION;
     this.backendName = name;
     this.capabilities = createBackendCapabilities(capabilities);
-    // Compatibility aliases used by existing model sessions.
-    this.supportsIncrementalExecution = this.capabilities.incrementalExecution;
-    this.supportsIncrementalRows = this.capabilities.incrementalRows;
   }
 
   /** @internal Reject byte-domain graphs that bypassed package loading. */
@@ -144,8 +144,8 @@ export abstract class BackendEngine {
 
   /**
    * @internal Begin a backend execution before it reads or writes retained
-   * intermediates. Direct legacy execute() calls replace the current session's
-   * ownership while preserving their established incremental-cache behavior.
+   * intermediates. A direct engine execution replaces the current session's
+   * cache ownership.
    */
   _beginDecodeExecution(options: BackendExecutionOptions = {}) {
     if (this.capabilities.incrementalExecution !== true) return false;
@@ -165,8 +165,8 @@ export abstract class BackendEngine {
   }
 }
 
-/** Validate the structural contract accepted from a registered backend factory. */
-export function assertBackendEngine(engine: any, label = 'Backend'): BackendEngineLike {
+/** @internal Validate the structural contract shared by built-in engines. */
+export function assertBuiltInEngine(engine: any, label = 'Built-in backend'): BackendEngineLike {
   const capabilities = engine?.capabilities;
   const validCapabilities = capabilities && Object.isFrozen(capabilities) &&
     typeof capabilities.incrementalExecution === 'boolean' &&
@@ -177,11 +177,11 @@ export function assertBackendEngine(engine: any, label = 'Backend'): BackendEngi
     (typeof engine.resetDecodeCache === 'function' &&
       Number.isSafeInteger(engine.decodeCacheGeneration) &&
       engine.decodeCacheGeneration >= 0);
-  if (!engine || engine.backendApiVersion !== VOLVOXAI_BACKEND_API_VERSION ||
-      typeof engine.backendName !== 'string' || !validCapabilities || !validIncrementalLifecycle ||
+  if (!engine || typeof engine.backendName !== 'string' ||
+      !validCapabilities || !validIncrementalLifecycle ||
       typeof engine.allocateGraph !== 'function' || typeof engine.execute !== 'function' ||
       typeof engine.createDecodeSession !== 'function') {
-    throw new Error(`${label} must implement BackendEngine API v${VOLVOXAI_BACKEND_API_VERSION}.`);
+    throw new Error(`${label} does not implement the built-in engine lifecycle.`);
   }
   return engine;
 }

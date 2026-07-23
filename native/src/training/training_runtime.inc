@@ -20,3 +20,4 @@
 #include "training_backward_cpu.inc"
 #include "training_gpu_plan.inc"
 #include "training_step.inc"
+#include "dynamic_autograd.inc"

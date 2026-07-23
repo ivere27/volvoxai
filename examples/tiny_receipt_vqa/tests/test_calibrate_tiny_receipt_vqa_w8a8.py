@@ -205,26 +205,29 @@ class TinyReceiptCalibrationPureTests(unittest.TestCase):
         self.assertEqual(explicit_coverage["adapter_module_probe_coverage"], adapter_coverage)
 
     def test_cli_parses_opt_in_explicit_family_flag(self):
-        with patch.dict(os.environ, {"NAVERCAP_ROOT": "/path/to/navercap"}):
+        with patch.dict(
+            os.environ,
+            {"RECEIPT_VQA_DATA_ROOT": "/path/to/receipt-vqa-data"},
+        ):
             args = calibration.parse_args(["--out", "out.json", "--include-explicit-families"])
         self.assertTrue(args.include_explicit_families)
         self.assertEqual(
             args.release_dir,
             Path(
-                "/path/to/navercap/temp/"
+                "/path/to/receipt-vqa-data/temp/"
                 "tiny-receipt-vqa-structured-qa-21m-lora-router-e100-v1"
             ),
         )
         self.assertEqual(
             args.annotations_dir,
-            Path("/path/to/navercap/eval/heldout/annotations"),
+            Path("/path/to/receipt-vqa-data/eval/heldout/annotations"),
         )
         self.assertEqual(
             args.images_dir,
-            Path("/path/to/navercap/eval/heldout/images"),
+            Path("/path/to/receipt-vqa-data/eval/heldout/images"),
         )
 
-    def test_cli_accepts_explicit_paths_without_navercap_environment(self):
+    def test_cli_accepts_explicit_paths_without_data_root_environment(self):
         with patch.dict(os.environ, {}, clear=True):
             args = calibration.parse_args([
                 "--release-dir", "/path/to/release",

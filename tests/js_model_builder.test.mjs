@@ -1,7 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
-import { CPUEngine, Graph, GraphLoader, ModelBuilder, VolvoxAI } from '../ts/index.js';
+import { Graph, GraphLoader, ModelBuilder } from '../ts/index.js';
+import { CPUEngine } from '../ts/backends/CPUEngine.js';
 import { TrainingModelBuilder } from '../ts/training/TrainingModelBuilder.js';
 
 test('inference builder exposes generic GroupNorm without training authoring helpers', () => {
@@ -23,6 +24,46 @@ test('inference builder exposes generic GroupNorm without training authoring hel
   assert.equal(builder.dropout, undefined);
   assert.equal(builder.loraLinear, undefined);
   assert.equal(builder.routedBottleneckAdapter, undefined);
+  for (const undeclaredName of ['addTensor', 'addInput', 'addWeight', 'node', 'op']) {
+    assert.equal(builder[undeclaredName], undefined, `${undeclaredName} is not a ModelBuilder method`);
+  }
+});
+
+test('Graph and ModelBuilder reject undeclared node, storage, and output fields', () => {
+  const builder = new ModelBuilder();
+  assert.throws(
+    () => builder.tensor('invalid-data', [1], 'float32', { data: Float32Array.of(1) }),
+    /unsupported field 'data'.*use 'buffer'/,
+  );
+  const input = builder.input('x', [1]);
+  for (const spec of [
+    { op: 'Identity', inputs: { input }, outputs: { out: [1] } },
+    {
+      opType: 'Identity', inputs: { input },
+      outputs: { out: { name: 'data-out', shape: [1], data: Float32Array.of(1) } },
+    },
+    {
+      opType: 'Identity', inputs: { input },
+      outputs: { out: { name: 'replace-out', shape: [1], replace: true } },
+    },
+    {
+      opType: 'Identity', inputs: { input },
+      outputs: { out: { name: 'reuse-out', shape: [1], reuse: true } },
+    },
+  ]) {
+    assert.throws(() => builder.addNode(spec), /unsupported field/);
+  }
+  assert.equal(builder.graph.nodes.length, 0);
+
+  assert.throws(
+    () => GraphLoader._buildFromGraphDocument(builder.graph, {
+      nodes: [{
+        op: 'Identity', inputs: { input: 'x' },
+        outputs: { out: 'y' }, outputs_shape: { out: [1] },
+      }],
+    }, new Map([['x', input]])),
+    /unsupported field 'op'/,
+  );
 });
 
 test('training builder composes Dropout and routed bottleneck adapters', () => {
@@ -262,10 +303,9 @@ test('replace and remove support automatic downstream rewrites and safe deletion
 });
 
 test('tensor CRUD maintains references, selected outputs, and topology guards', () => {
-  const api = new VolvoxAI();
-  const builder = api.createModel();
+  const builder = new ModelBuilder();
   assert.ok(builder instanceof ModelBuilder);
-  const input = builder.addInput('x', [1]);
+  const input = builder.input('x', [1]);
   builder.addNode({
     id: 'identity', opType: 'Identity', inputs: { input }, outputs: { out: { name: 'y', shape: [1] } },
   });
@@ -299,13 +339,14 @@ test('loaded adapter versions lock structural builder mutations', () => {
   assert.throws(() => builder.input('another', [1]), /Remove all adapter versions/);
 });
 
-test('builder exports a blueprint config with stable tensor names', () => {
+test('builder exports a canonical graph document with stable tensor names', () => {
   const builder = new ModelBuilder();
   const input = builder.input('tokens', [1, 4], 'int32');
   builder.addNode({
     id: 'copy', opType: 'Identity', inputs: { input }, outputs: { out: { name: 'copied', shape: [1, 4], dtype: 'int32' } },
   });
-  assert.deepEqual(builder.toConfig(), {
+  assert.deepEqual(builder.toGraphDocument(), {
+    format: 'volvox-graph/v1',
     inputs: { tokens: { shape: [1, 4], dtype: 'int32' } },
     nodes: [{
       id: 'copy',
@@ -320,10 +361,11 @@ test('builder exports a blueprint config with stable tensor names', () => {
   });
 });
 
-test('blueprint loading preserves an explicit output selection', () => {
+test('graph document loading preserves an explicit output selection and rejects mappings', () => {
   const graph = new Graph();
   const input = graph.addInput('x', [1], 'float32');
-  const config = {
+  const document = {
+    format: 'volvox-graph/v1',
     inputs: { x: { shape: [1], dtype: 'float32' } },
     nodes: [
       {
@@ -343,39 +385,39 @@ test('blueprint loading preserves an explicit output selection', () => {
     ],
     outputs: ['visible'],
   };
-  GraphLoader._buildFromBlueprint(graph, config, new Map([['x', input]]));
+  GraphLoader._buildFromGraphDocument(graph, document, new Map([['x', input]]));
   assert.deepEqual(graph.outputNames, ['visible']);
 
-  const legacyGraph = new Graph();
-  const legacyInput = legacyGraph.addInput('x', [1], 'float32');
-  GraphLoader._buildFromBlueprint(legacyGraph, {
-    ...config,
+  const mappedGraph = new Graph();
+  const mappedInput = mappedGraph.addInput('x', [1], 'float32');
+  assert.throws(() => GraphLoader._buildFromGraphDocument(mappedGraph, {
+    ...document,
     outputs: { source_output_name: 'visible' },
-  }, new Map([['x', legacyInput]]));
-  assert.deepEqual(legacyGraph.outputNames, ['visible']);
+  }, new Map([['x', mappedInput]])), /graph outputs must be a non-empty array/);
+  assert.equal(mappedGraph.nodes.length, 0);
 
   const invalidOutputGraph = new Graph();
   const invalidOutputInput = invalidOutputGraph.addInput('x', [1], 'float32');
   const invalidRevision = invalidOutputGraph.topologyRevision;
-  assert.throws(() => GraphLoader._buildFromBlueprint(invalidOutputGraph, {
-    ...config,
+  assert.throws(() => GraphLoader._buildFromGraphDocument(invalidOutputGraph, {
+    ...document,
     outputs: ['missing'],
-  }, new Map([['x', invalidOutputInput]])), /config\.outputs/);
+  }, new Map([['x', invalidOutputInput]])), /graph outputs/);
   assert.equal(invalidOutputGraph.nodes.length, 0);
   assert.equal(invalidOutputGraph.topologyRevision, invalidRevision);
 
-  for (const outputs of [['visible', 'visible'], { first: 'visible', second: 'visible' }]) {
+  for (const outputs of [['visible', 'visible']]) {
     const duplicateGraph = new Graph();
     const duplicateInput = duplicateGraph.addInput('x', [1], 'float32');
-    assert.throws(() => GraphLoader._buildFromBlueprint(duplicateGraph, {
-      ...config,
+    assert.throws(() => GraphLoader._buildFromGraphDocument(duplicateGraph, {
+      ...document,
       outputs,
-    }, new Map([['x', duplicateInput]])), /unique graph tensor/);
+    }, new Map([['x', duplicateInput]])), /unique, non-empty graph tensor/);
     assert.equal(duplicateGraph.nodes.length, 0);
   }
 });
 
-test('blueprints serialize canonical linear layout for square weights', async () => {
+test('graph documents serialize canonical linear layout for square weights', async () => {
   const builder = new ModelBuilder();
   const input = builder.input('x', [1, 2]);
   const weight = builder.weight('w', [2, 2], 'float32', Float32Array.from([1, 2, 3, 4]));
@@ -383,32 +425,32 @@ test('blueprints serialize canonical linear layout for square weights', async ()
     id: 'square', opType: 'MatMul', inputs: { input, weight },
     outputs: { out: { name: 'y', shape: [1, 2] } }, wLayout: 'din',
   });
-  const config = builder.toConfig();
-  assert.equal(config.nodes[0].params.weight_layout, 'IN_OUT');
-  assert.equal(Object.hasOwn(config.nodes[0], 'wLayout'), false);
+  const document = builder.toGraphDocument();
+  assert.equal(document.nodes[0].params.weight_layout, 'IN_OUT');
+  assert.equal(Object.hasOwn(document.nodes[0], 'wLayout'), false);
 
   const loaded = new Graph();
   const loadedInput = loaded.addInput('x', [1, 2]);
   const loadedWeight = loaded.addWeight('w', [2, 2], 'float32', {
     buffer: Float32Array.from([1, 2, 3, 4]),
   });
-  GraphLoader._buildFromBlueprint(loaded, config, new Map([
+  GraphLoader._buildFromGraphDocument(loaded, document, new Map([
     ['x', loadedInput], ['w', loadedWeight],
   ]));
   GraphLoader._resolveMatMulLayouts(loaded);
-  loaded.outputNames = ['y'];
+  loaded.setOutputs(['y']);
   assert.equal(loaded.nodes[0].wLayout, 'din');
   const engine = new CPUEngine();
   engine.allocateGraph(loaded);
   assert.deepEqual([...(await engine.execute({ x: Float32Array.from([1, 0]) })).y], [1, 2]);
 });
 
-test('blueprints reject undeclared inputs instead of inventing an image tensor', () => {
+test('graph documents reject undeclared inputs instead of inventing an image tensor', () => {
   assert.throws(
-    () => GraphLoader._buildFromBlueprint(new Graph(), {
+    () => GraphLoader._buildFromGraphDocument(new Graph(), {
       nodes: [{
         id: 'missing_input',
-        op: 'Identity',
+        opType: 'Identity',
         inputs: { input: 'undeclared' },
         outputs: { out: 'result' },
         outputs_shape: { out: [1] },
@@ -418,17 +460,17 @@ test('blueprints reject undeclared inputs instead of inventing an image tensor',
   );
 });
 
-test('blueprints reject output collisions before mutating the graph', () => {
+test('graph documents reject output collisions before mutating the graph', () => {
   const graph = new Graph();
   const input = graph.addInput('x', [1]);
   const tensors = new Map([['x', input]]);
   const revision = graph.topologyRevision;
 
   assert.throws(
-    () => GraphLoader._buildFromBlueprint(graph, {
+    () => GraphLoader._buildFromGraphDocument(graph, {
       nodes: [{
         id: 'overwrite-input',
-        op: 'Identity',
+        opType: 'Identity',
         inputs: { input: 'x' },
         outputs: { out: 'x' },
         outputs_shape: { out: [1] },
@@ -442,14 +484,14 @@ test('blueprints reject output collisions before mutating the graph', () => {
   graph.assertValid();
 
   assert.throws(
-    () => GraphLoader._buildFromBlueprint(graph, {
+    () => GraphLoader._buildFromGraphDocument(graph, {
       nodes: [
         {
-          id: 'first', op: 'Identity', inputs: { input: 'x' },
+          id: 'first', opType: 'Identity', inputs: { input: 'x' },
           outputs: { out: 'shared' }, outputs_shape: { out: [1] },
         },
         {
-          id: 'second', op: 'Identity', inputs: { input: 'shared' },
+          id: 'second', opType: 'Identity', inputs: { input: 'shared' },
           outputs: { out: 'shared' }, outputs_shape: { out: [1] },
         },
       ],
@@ -460,26 +502,30 @@ test('blueprints reject output collisions before mutating the graph', () => {
   assert.equal(graph.topologyRevision, revision);
 });
 
-test('blueprint loading validates and commits one staged topology transaction', () => {
+test('graph document loading validates and commits one staged topology transaction', () => {
   const graph = new Graph();
   const input = graph.addInput('input', [1]);
   const tensors = new Map([['input', input]]);
   const revision = graph.topologyRevision;
-  GraphLoader._buildFromBlueprint(graph, {
+  GraphLoader._buildFromGraphDocument(graph, {
     nodes: [
       {
-        op: 'Identity', inputs: { input: 'input' }, outputs: { out: 'first' },
+        opType: 'Identity', inputs: { input: 'input' }, outputs: { out: 'first' },
         outputs_shape: { out: [1] },
+        outputs_dtype: { out: 'float32' },
       },
       {
-        op: 'Identity', inputs: { input: 'first' }, outputs: { out: 'second' },
+        opType: 'Identity', inputs: { input: 'first' }, outputs: { out: 'second' },
         outputs_shape: { out: [1] },
+        outputs_dtype: { out: 'float32' },
       },
       {
-        op: 'Identity', inputs: { input: 'second' }, outputs: { out: 'third' },
+        opType: 'Identity', inputs: { input: 'second' }, outputs: { out: 'third' },
         outputs_shape: { out: [1] },
+        outputs_dtype: { out: 'float32' },
       },
     ],
+    outputs: ['third'],
   }, tensors);
   assert.equal(graph.topologyRevision, revision + 1);
   assert.equal(graph.nodes.length, 3);
@@ -490,17 +536,20 @@ test('blueprint loading validates and commits one staged topology transaction', 
   const failedInput = failed.addInput('input', [1]);
   const failedAliases = new Map([['input', failedInput]]);
   const failedRevision = failed.topologyRevision;
-  assert.throws(() => GraphLoader._buildFromBlueprint(failed, {
+  assert.throws(() => GraphLoader._buildFromGraphDocument(failed, {
     nodes: [
       {
-        op: 'Identity', inputs: { input: 'input' }, outputs: { out: 'staged_only' },
+        opType: 'Identity', inputs: { input: 'input' }, outputs: { out: 'staged_only' },
         outputs_shape: { out: [1] },
+        outputs_dtype: { out: 'float32' },
       },
       {
-        op: 'Identity', inputs: { input: 'staged_only' }, outputs: { out: 'invalid' },
+        opType: 'Identity', inputs: { input: 'staged_only' }, outputs: { out: 'invalid' },
         outputs_shape: { out: [0] },
+        outputs_dtype: { out: 'float32' },
       },
     ],
+    outputs: ['invalid'],
   }, failedAliases), /positive integer/);
   assert.equal(failed.topologyRevision, failedRevision);
   assert.equal(failed.nodes.length, 0);
@@ -509,18 +558,18 @@ test('blueprint loading validates and commits one staged topology transaction', 
   failed.assertValid();
 });
 
-test('blueprints serialize explicit Conv2D image-weight layouts', () => {
+test('graph documents serialize explicit Conv2D image-weight layouts', () => {
   const regular = new ModelBuilder();
   const image = regular.input('image', [1, 2, 2, 2]);
   const regularWeight = regular.weight('regular_weight', [1, 1, 2, 3], 'float32', new Float32Array(6));
   regular.addOp('Conv2D', { input: image, weight: regularWeight }, { out: [1, 2, 2, 3] });
-  assert.equal(regular.toConfig().nodes[0].params.weight_layout, 'HWIO');
+  assert.equal(regular.toGraphDocument().nodes[0].params.weight_layout, 'HWIO');
 
   const depthwise = new ModelBuilder();
   const depthImage = depthwise.input('image', [1, 2, 2, 2]);
   const depthWeight = depthwise.weight('depth_weight', [1, 1, 2, 1], 'float32', new Float32Array(2));
   depthwise.addOp('Conv2D', { input: depthImage, weight: depthWeight }, { out: [1, 2, 2, 2] }, { groups: 2 });
-  assert.equal(depthwise.toConfig().nodes[0].params.weight_layout, 'HWCM');
+  assert.equal(depthwise.toGraphDocument().nodes[0].params.weight_layout, 'HWCM');
 });
 
 test('browser Conv2D layout normalization transforms shared depthwise weights once', () => {
@@ -566,69 +615,80 @@ test('tensor payload dtype and byte length are validated transactionally', () =>
   assert.equal(builder.graph.topologyRevision, revision);
 });
 
-test('dynamic graph bookkeeping remains compatible with blueprint output renaming', () => {
+test('dynamic graph bookkeeping preserves explicitly selected outputs across renaming', () => {
   const graph = new Graph();
   const tensors = new Map();
   tensors.set('x', graph.addInput('x', [1]));
-  GraphLoader._buildFromBlueprint(graph, {
+  GraphLoader._buildFromGraphDocument(graph, {
     nodes: [
-      { op: 'Identity', inputs: { input: 'x' }, outputs: { out: 'hidden' }, outputs_shape: { out: [1] } },
-      { op: 'Identity', inputs: { input: 'hidden' }, outputs: { out: 'result' }, outputs_shape: { out: [1] } },
+      {
+        opType: 'Identity', inputs: { input: 'x' }, outputs: { out: 'hidden' },
+        outputs_shape: { out: [1] }, outputs_dtype: { out: 'float32' },
+      },
+      {
+        opType: 'Identity', inputs: { input: 'hidden' }, outputs: { out: 'result' },
+        outputs_shape: { out: [1] }, outputs_dtype: { out: 'float32' },
+      },
     ],
+    outputs: ['result'],
   }, tensors);
-  graph.outputNames = ['result'];
+  graph.setOutputs(['result']);
   assert.equal(graph.validate().valid, true);
   assert.deepEqual(graph.nodes.map((node) => node.outputs.out.name), ['hidden', 'result']);
   assert.deepEqual(graph.nodes.map((node) => node.outputs.out.dtype), ['float32', 'float32']);
+  assert.throws(() => { graph.outputNames = ['hidden']; }, TypeError);
+  assert.throws(() => { graph.outputNames.push('hidden'); }, TypeError);
 });
 
-test('blueprints round-trip declared output dtypes and reject malformed dtype maps', () => {
+test('graph documents round-trip declared output dtypes and reject malformed dtype maps', () => {
   const builder = new ModelBuilder();
   const input = builder.input('bytes', [2], 'int8');
   builder.addNode({
     id: 'typed-copy', opType: 'Identity', inputs: { input },
     outputs: { out: { name: 'copy', shape: [2], dtype: 'int8' } },
   });
-  const config = builder.toConfig();
-  assert.deepEqual(config.nodes[0].outputs_dtype, { out: 'int8' });
+  const document = builder.toGraphDocument();
+  assert.deepEqual(document.nodes[0].outputs_dtype, { out: 'int8' });
 
   const loaded = new Graph();
   const loadedInput = loaded.addInput('bytes', [2], 'int8');
-  GraphLoader._buildFromBlueprint(loaded, config, new Map([['bytes', loadedInput]]));
+  GraphLoader._buildFromGraphDocument(loaded, document, new Map([['bytes', loadedInput]]));
   assert.equal(loaded.getTensor('copy').dtype, 'int8');
 
-  const invalidBlueprint = (outputs_dtype) => ({
+  const invalidGraphDocument = (outputs_dtype) => ({
     nodes: [{
-      id: 'typed-copy', op: 'Identity', inputs: { input: 'x' }, outputs: { out: 'y' },
+      id: 'typed-copy', opType: 'Identity', inputs: { input: 'x' }, outputs: { out: 'y' },
       outputs_shape: { out: [1] }, outputs_dtype,
     }],
+    outputs: ['y'],
   });
   const loadInvalid = (outputs_dtype) => {
     const graph = new Graph();
     const inputTensor = graph.addInput('x', [1]);
-    GraphLoader._buildFromBlueprint(graph, invalidBlueprint(outputs_dtype), new Map([['x', inputTensor]]));
+    GraphLoader._buildFromGraphDocument(graph, invalidGraphDocument(outputs_dtype), new Map([['x', inputTensor]]));
   };
-  assert.throws(() => loadInvalid({}), /output 'out' requires a declared dtype/);
+  assert.throws(() => loadInvalid(undefined), /outputs_dtype must exactly describe/);
+  assert.throws(() => loadInvalid({}), /outputs_dtype must exactly describe/);
   assert.throws(() => loadInvalid({ out: 'float64' }), /unsupported dtype 'float64'/);
-  assert.throws(() => loadInvalid({ out: 'int8', extra: 'int8' }), /declares unknown output 'extra'/);
-  assert.throws(() => loadInvalid('int8'), /outputs_dtype must be an object/);
-  const conflictingQuantization = {
+  assert.throws(() => loadInvalid({ out: 'int8', extra: 'int8' }), /outputs_dtype must exactly describe/);
+  assert.throws(() => loadInvalid('int8'), /outputs_dtype must exactly describe/);
+  const embeddedDescriptor = {
     nodes: [{
-      id: 'ambiguous-q', op: 'Identity', inputs: { input: 'x' }, outputs: { out: 'y' },
-      outputs_shape: { out: { shape: [1], quantization: { scheme: 'per_tensor', scale: 0.25, zero_point: 0 } } },
-      outputs_dtype: { out: 'int8' },
-      outputs_quantization: { out: { scheme: 'per_tensor', scale: 0.5, zero_point: 0 } },
+      id: 'embedded-dtype', opType: 'Identity', inputs: { input: 'x' }, outputs: { out: 'y' },
+      outputs_shape: { out: { shape: [1], dtype: 'int8' } },
+      outputs_dtype: { out: 'float32' },
     }],
+    outputs: ['y'],
   };
-  const conflictingGraph = new Graph();
-  const conflictingInput = conflictingGraph.addInput('x', [1]);
+  const descriptorGraph = new Graph();
+  const descriptorInput = descriptorGraph.addInput('x', [1]);
   assert.throws(
-    () => GraphLoader._buildFromBlueprint(conflictingGraph, conflictingQuantization, new Map([['x', conflictingInput]])),
-    /cannot declare quantization in both its shape descriptor and outputs_quantization/,
+    () => GraphLoader._buildFromGraphDocument(descriptorGraph, embeddedDescriptor, new Map([['x', descriptorInput]])),
+    /requires a shape array/,
   );
 });
 
-test('blueprints preserve immutable quantization descriptors on typed tensor edges', () => {
+test('graph packages store immutable quantization parameters only in Safetensors', () => {
   const builder = new ModelBuilder();
   const input = builder.input('input', [1, 2], 'uint8', {
     quantization: { scheme: 'per_tensor', scale: 0.25, zero_point: 128 },
@@ -646,21 +706,57 @@ test('blueprints preserve immutable quantization descriptors on typed tensor edg
       },
     },
   });
-  const config = builder.toConfig();
-  assert.deepEqual(config.inputs.input.quantization, { scheme: 'per_tensor', scale: 0.25, zero_point: 128 });
-  assert.deepEqual(config.weights_quantization.weight, {
-    scheme: 'per_axis', axis: 0, scales: [0.5, 0.25], zero_points: [0, 0],
-  });
-  assert.deepEqual(config.nodes[0].outputs_quantization.out, {
-    scheme: 'per_tensor', scale: 0.25, zero_point: 128,
-  });
+  assert.throws(() => builder.toGraphDocument(), /must use toGraphPackage/);
+  const { graph: document, quantizationParameters } = builder.toGraphPackage();
+  assert.equal(Object.hasOwn(document.inputs.input, 'quantization'), false);
+  assert.equal(Object.hasOwn(document, 'weights_quantization'), false);
+  assert.equal(Object.hasOwn(document.nodes[0], 'outputs_quantization'), false);
+  assert.equal(document.quantization.format, 'volvox-affine-safetensors/v1');
+  assert.equal(Object.keys(document.quantization.tensors).length, 3);
+  const inputDescriptor = document.quantization.tensors.input;
+  const outputDescriptor = document.quantization.tensors.output;
+  const weightDescriptor = document.quantization.tensors.weight;
+  assert.deepEqual(inputDescriptor, outputDescriptor);
+  assert.equal(weightDescriptor.scheme, 'per_axis');
+  assert.equal(weightDescriptor.axis, 0);
+  assert.deepEqual(
+    [...quantizationParameters.toRuntimeTypedArray(
+      quantizationParameters.getTensor(inputDescriptor.scale_tensor),
+    )],
+    [0.25],
+  );
+  assert.deepEqual(
+    [...quantizationParameters.toRuntimeTypedArray(
+      quantizationParameters.getTensor(inputDescriptor.zero_point_tensor),
+    )],
+    [128],
+  );
+  assert.deepEqual(
+    [...quantizationParameters.toRuntimeTypedArray(
+      quantizationParameters.getTensor(weightDescriptor.scale_tensor),
+    )],
+    [0.5, 0.25],
+  );
+  assert.equal(JSON.stringify(document).includes('"scale":'), false);
+  assert.equal(JSON.stringify(document).includes('"zero_point":'), false);
 
   const loaded = new Graph();
   const loadedInput = loaded.addInput('input', [1, 2], 'uint8', {
-    quantization: config.inputs.input.quantization,
+    quantization: input.quantization,
   });
-  GraphLoader._buildFromBlueprint(loaded, config, new Map([['input', loadedInput]]));
-  assert.deepEqual(loaded.getTensor('output').quantization, config.nodes[0].outputs_quantization.out);
+  GraphLoader._buildFromGraphDocument(
+    loaded,
+    document,
+    new Map([['input', loadedInput]]),
+    { quantizationByTensor: {
+      input: input.quantization,
+      output: { scheme: 'per_tensor', scale: 0.25, zero_point: 128 },
+      weight: weight.quantization,
+    } },
+  );
+  assert.deepEqual(loaded.getTensor('output').quantization, outputDescriptor.scheme === 'per_tensor'
+    ? { scheme: 'per_tensor', scale: 0.25, zero_point: 128 }
+    : null);
   assert.equal(Object.isFrozen(loaded.getTensor('output').quantization), true);
   assert.throws(
     () => builder.input('bad', [1], 'float32', { quantization: { scale: 0.25, zero_point: 0 } }),
@@ -669,60 +765,79 @@ test('blueprints preserve immutable quantization descriptors on typed tensor edg
   const badGraph = new Graph();
   const badInput = badGraph.addInput('input', [1]);
   assert.throws(
-    () => GraphLoader._buildFromBlueprint(badGraph, {
+    () => GraphLoader._buildFromGraphDocument(badGraph, {
       nodes: [{
-        id: 'bad', op: 'Identity', inputs: { input: 'input' }, outputs: { out: 'out' },
+        id: 'bad', opType: 'Identity', inputs: { input: 'input' }, outputs: { out: 'out' },
         outputs_shape: { out: [1] },
         outputs_quantization: { out: { scheme: 'per_tensor', scale: 0.25, zero_point: 0 } },
       }],
+      outputs: ['out'],
     }, new Map([['input', badInput]])),
-    /quantization requires an explicit outputs_dtype/,
+    /forbidden inline quantization/,
   );
 });
 
-test('browser graph loading accepts canonical physical W8A8 QConv2D and rejects the legacy sidecar form', () => {
+test('browser graph loading accepts canonical physical W8A8 QConv2D and rejects noncanonical sidecar metadata', () => {
   const graph = new Graph();
   const tensors = new Map();
   tensors.set('x', graph.addInput('x', [1, 1, 1, 1], 'float32'));
   tensors.set('input_scale', graph.addWeight('input_scale', [1], 'float32', { buffer: Float32Array.of(0.25) }));
   tensors.set('input_zero_point', graph.addWeight('input_zero_point', [1], 'int8', { buffer: Int8Array.of(0) }));
+  tensors.set('weight_scale', graph.addWeight('weight_scale', [1], 'float32', { buffer: Float32Array.of(0.25) }));
+  tensors.set('weight_zero_point', graph.addWeight('weight_zero_point', [1], 'int8', { buffer: Int8Array.of(0) }));
   tensors.set('w', graph.addWeight('w', [1, 1, 1, 1], 'int8', {
     buffer: Int8Array.of(1),
     quantization: { scheme: 'per_axis', axis: 0, scales: [0.25], zero_points: [0] },
   }));
   tensors.set('bias', graph.addWeight('bias', [1], 'int32', { buffer: Int32Array.of(0) }));
-  GraphLoader._buildFromBlueprint(graph, {
+  const quantizedDocument = {
+    format: 'volvox-graph/v1',
+    inputs: { x: { shape: [1, 1, 1, 1], dtype: 'float32' } },
+    quantization: {
+      format: 'volvox-affine-safetensors/v1',
+      tensors: {
+        qx: { scheme: 'per_tensor', scale_tensor: 'input_scale', zero_point_tensor: 'input_zero_point' },
+        w: { scheme: 'per_axis', axis: 0, scale_tensor: 'weight_scale', zero_point_tensor: 'weight_zero_point' },
+        y: { scheme: 'per_tensor', scale_tensor: 'input_scale', zero_point_tensor: 'input_zero_point' },
+      },
+    },
     nodes: [
       {
-        op: 'QuantizeLinear', inputs: { input: 'x', scale: 'input_scale', zero_point: 'input_zero_point' }, outputs: { out: 'qx' },
+        opType: 'QuantizeLinear', inputs: { input: 'x', scale: 'input_scale', zero_point: 'input_zero_point' }, outputs: { out: 'qx' },
         outputs_shape: { out: [1, 1, 1, 1] },
         outputs_dtype: { out: 'int8' },
-        outputs_quantization: { out: { scheme: 'per_tensor', scale: 0.25, zero_point: 0 } },
         params: {},
       },
       {
-        op: 'QConv2D', inputs: { input: 'qx', weight: 'w', bias: 'bias' }, outputs: { out: 'y' },
+        opType: 'QConv2D', inputs: { input: 'qx', weight: 'w', bias: 'bias' }, outputs: { out: 'y' },
         outputs_shape: { out: [1, 1, 1, 1] },
         outputs_dtype: { out: 'int8' },
-        outputs_quantization: { out: { scheme: 'per_tensor', scale: 0.25, zero_point: 0 } },
         params: { data_layout: 'NHWC', weight_layout: 'OHWI' },
       },
     ],
-  }, tensors);
+    outputs: ['y'],
+  };
+  GraphLoader._buildFromGraphDocument(graph, quantizedDocument, tensors, {
+    quantizationByTensor: {
+      qx: { scheme: 'per_tensor', scale: 0.25, zero_point: 0 },
+      w: { scheme: 'per_axis', axis: 0, scales: [0.25], zero_points: [0] },
+      y: { scheme: 'per_tensor', scale: 0.25, zero_point: 0 },
+    },
+  });
   assert.equal(graph.getTensor('qx').dtype, 'int8');
   assert.doesNotThrow(() => GraphLoader._assertBrowserQuantizationSupported(graph));
 
-  const legacy = new Graph();
-  const qx = legacy.addInput('qx', [1, 1, 1, 1], 'int8', {
+  const noncanonical = new Graph();
+  const qx = noncanonical.addInput('qx', [1, 1, 1, 1], 'int8', {
     quantization: { scheme: 'per_tensor', scale: 0.25, zero_point: 0 },
   });
-  const weight = legacy.addWeight('w', [1, 1, 1, 1], 'int8', { buffer: Int8Array.of(1) });
-  const scale = legacy.addWeight('scale', [1], 'float32', { buffer: Float32Array.of(0.25) });
-  legacy.addOp('QConv2D', { input: qx, weight, weight_scale: scale }, {
+  const weight = noncanonical.addWeight('w', [1, 1, 1, 1], 'int8', { buffer: Int8Array.of(1) });
+  const scale = noncanonical.addWeight('scale', [1], 'float32', { buffer: Float32Array.of(0.25) });
+  noncanonical.addOp('QConv2D', { input: qx, weight, weight_scale: scale }, {
     out: { name: 'y', shape: [1, 1, 1, 1] },
   }, { input_scale: 0.25, input_zero_point: 0, output_scale: 0.25, output_zero_point: 0 });
   assert.throws(
-    () => GraphLoader._assertBrowserQuantizationSupported(legacy),
+    () => GraphLoader._assertBrowserQuantizationSupported(noncanonical),
     /must use canonical physical I8\/U8 NHWC\/OHWI storage/,
   );
 });
@@ -799,5 +914,78 @@ test('browser W8A8 gate rejects unsupported typed MaxPool and Resize semantics',
   assert.throws(
     () => GraphLoader._assertBrowserQuantizationSupported(resize),
     /coordinate_transformation_mode "asymmetric"/,
+  );
+});
+
+test('browser W8A8 gate validates canonical QBatchMatMul broadcast and F32 multiplier bounds', () => {
+  const graph = new Graph();
+  const a = graph.addInput('a', [2, 1, 2, 3], 'uint8', {
+    quantization: { scheme: 'per_tensor', scale: 0.5, zero_point: 10 },
+  });
+  const b = graph.addInput('b', [1, 2, 3, 2], 'int8', {
+    quantization: { scheme: 'per_tensor', scale: 0.25, zero_point: -1 },
+  });
+  graph.addOp('QBatchMatMul', { a, b }, {
+    out: {
+      name: 'out',
+      shape: [2, 2, 2, 2],
+      dtype: 'uint8',
+      quantization: { scheme: 'per_tensor', scale: 0.125, zero_point: 100 },
+    },
+  });
+  assert.doesNotThrow(() => GraphLoader._assertBrowserQuantizationSupported(graph));
+
+  const minimumF32 = 1.401298464324817e-45;
+  const underflow = new Graph();
+  const tinyA = underflow.addInput('a', [1, 1], 'uint8', {
+    quantization: {
+      scheme: 'per_tensor', scale: minimumF32, zero_point: 0,
+    },
+  });
+  const tinyB = underflow.addInput('b', [1, 1], 'int8', {
+    quantization: {
+      scheme: 'per_tensor', scale: minimumF32, zero_point: 0,
+    },
+  });
+  underflow.addOp('QBatchMatMul', { a: tinyA, b: tinyB }, {
+    out: {
+      name: 'out',
+      shape: [1, 1],
+      dtype: 'uint8',
+      quantization: { scheme: 'per_tensor', scale: 1, zero_point: 0 },
+    },
+  });
+  assert.throws(
+    () => GraphLoader._assertBrowserQuantizationSupported(underflow),
+    /requantization multiplier not representable as positive F32/,
+  );
+});
+
+test('browser W8A8 gate rejects a non-representable QLinear multiplier', () => {
+  const minimumF32 = 1.401298464324817e-45;
+  const graph = new Graph();
+  const input = graph.addInput('input', [1, 1], 'int8', {
+    quantization: { scheme: 'per_tensor', scale: minimumF32, zero_point: 0 },
+  });
+  const weight = graph.addWeight('weight', [1, 1], 'int8', {
+    buffer: Int8Array.of(1),
+    quantization: {
+      scheme: 'per_axis', axis: 0, scales: [minimumF32], zero_points: [0],
+    },
+  });
+  const bias = graph.addWeight('bias', [1], 'int32', {
+    buffer: Int32Array.of(0),
+  });
+  graph.addOp('QLinear', { input, weight, bias }, {
+    out: {
+      name: 'out',
+      shape: [1, 1],
+      dtype: 'int8',
+      quantization: { scheme: 'per_tensor', scale: 1, zero_point: 0 },
+    },
+  });
+  assert.throws(
+    () => GraphLoader._assertBrowserQuantizationSupported(graph),
+    /requantization multiplier not representable as positive F32/,
   );
 });

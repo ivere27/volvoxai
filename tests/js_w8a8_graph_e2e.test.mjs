@@ -8,16 +8,15 @@ import { GraphLoader } from '../ts/core/GraphLoader.js';
 const qInput = { scheme: 'per_tensor', scale: 0.25, zero_point: 128 };
 const qActivation = { scheme: 'per_tensor', scale: 0.25, zero_point: 0 };
 
-function typedOutput(name, shape, dtype = 'int8', quantization = qActivation) {
+function typedOutput(name, shape, dtype = 'int8') {
   return {
     outputs_shape: { out: shape },
     outputs_dtype: { out: dtype },
-    ...(quantization ? { outputs_quantization: { out: quantization } } : {}),
     outputs: { out: name },
   };
 }
 
-test('canonical W8A8 blueprint preserves physical bytes through a browser CPU inference island', async () => {
+test('canonical W8A8 graph document preserves physical bytes through a browser CPU inference island', async () => {
   const graph = new Graph();
   const tensors = new Map();
   const addInput = (name, shape, dtype, options) => {
@@ -36,10 +35,34 @@ test('canonical W8A8 blueprint preserves physical bytes through a browser CPU in
     quantization: { scheme: 'per_axis', axis: 0, scales: [0.5], zero_points: [0] },
   });
   addWeight('bias', [1], 'int32', { buffer: Int32Array.of(0) });
+  addWeight('input_scale', [1], 'float32', { buffer: Float32Array.of(0.25) });
+  addWeight('input_zero_point', [1], 'uint8', { buffer: Uint8Array.of(128) });
+  addWeight('weight_scale', [1], 'float32', { buffer: Float32Array.of(0.5) });
+  addWeight('weight_zero_point', [1], 'int8', { buffer: Int8Array.of(0) });
   addWeight('out_scale', [1], 'float32', { buffer: Float32Array.of(0.25) });
   addWeight('out_zero_point', [1], 'int8', { buffer: Int8Array.of(0) });
 
-  const config = {
+  const document = {
+    format: 'volvox-graph/v1',
+    quantization: {
+      format: 'volvox-affine-safetensors/v1',
+      tensors: {
+        input: {
+          scheme: 'per_tensor', scale_tensor: 'input_scale',
+          zero_point_tensor: 'input_zero_point',
+        },
+        weight: {
+          scheme: 'per_axis', axis: 0, scale_tensor: 'weight_scale',
+          zero_point_tensor: 'weight_zero_point',
+        },
+        ...Object.fromEntries(
+          ['qx', 'conv', 'added', 'pooled', 'resized', 'flat', 'concat'].map((name) => [name, {
+            scheme: 'per_tensor', scale_tensor: 'out_scale',
+            zero_point_tensor: 'out_zero_point',
+          }]),
+        ),
+      },
+    },
     nodes: [
       {
         opType: 'RequantizeLinear', inputs: { input: 'input' },
@@ -75,11 +98,21 @@ test('canonical W8A8 blueprint preserves physical bytes through a browser CPU in
       },
       {
         opType: 'DequantizeLinear', inputs: { input: 'concat', scale: 'out_scale', zero_point: 'out_zero_point' },
-        ...typedOutput('result', [1, 4], 'float32', null),
+        ...typedOutput('result', [1, 4], 'float32'),
       },
     ],
+    outputs: ['result'],
   };
-  GraphLoader._buildFromBlueprint(graph, config, tensors);
+  GraphLoader._buildFromGraphDocument(graph, document, tensors, {
+    quantizationByTensor: Object.fromEntries(
+      ['qx', 'conv', 'added', 'pooled', 'resized', 'flat', 'concat']
+        .map((name) => [name, qActivation]),
+    ),
+    reservedNames: new Set([
+      'input_scale', 'input_zero_point', 'weight_scale', 'weight_zero_point',
+      'out_scale', 'out_zero_point',
+    ]),
+  });
   assert.deepEqual(graph.outputNames, ['result']);
   graph.assertValid();
   assert.equal(graph.getTensor('qx').dtype, 'int8');
@@ -137,14 +170,43 @@ test('canonical W8A8 decoder island keeps embedding, attention, logits, and toke
     quantization: { scheme: 'per_axis', axis: 0, scales: [1, 1, 1], zero_points: [0, 0, 0] },
   });
   addWeight('logit_bias', [3], 'int32', { buffer: Int32Array.of(0, 0, 0) });
+  addWeight('activation_scale', [1], 'float32', { buffer: Float32Array.of(1) });
+  addWeight('activation_zero_point', [1], 'int8', { buffer: Int8Array.of(0) });
+  addWeight('row_scale', [4], 'float32', { buffer: Float32Array.of(1, 1, 1, 1) });
+  addWeight('row_zero_point', [4], 'int8', { buffer: Int8Array.of(0, 0, 0, 0) });
+  addWeight('logit_scale', [3], 'float32', { buffer: Float32Array.of(1, 1, 1) });
+  addWeight('logit_zero_point', [3], 'int8', { buffer: Int8Array.of(0, 0, 0) });
 
-  const typed = (name, shape, dtype = 'int8', quantization = activation) => ({
+  const typed = (name, shape, dtype = 'int8') => ({
     outputs: { out: name },
     outputs_shape: { out: shape },
     outputs_dtype: { out: dtype },
-    ...(quantization ? { outputs_quantization: { out: quantization } } : {}),
   });
-  const config = {
+  const document = {
+    format: 'volvox-graph/v1',
+    quantization: {
+      format: 'volvox-affine-safetensors/v1',
+      tensors: {
+        table: {
+          scheme: 'per_axis', axis: 0, scale_tensor: 'row_scale',
+          zero_point_tensor: 'row_zero_point',
+        },
+        identity: {
+          scheme: 'per_axis', axis: 0, scale_tensor: 'row_scale',
+          zero_point_tensor: 'row_zero_point',
+        },
+        logit_weight: {
+          scheme: 'per_axis', axis: 0, scale_tensor: 'logit_scale',
+          zero_point_tensor: 'logit_zero_point',
+        },
+        ...Object.fromEntries(
+          ['embedded', 'q', 'k', 'v', 'attended', 'logits'].map((name) => [name, {
+            scheme: 'per_tensor', scale_tensor: 'activation_scale',
+            zero_point_tensor: 'activation_zero_point',
+          }]),
+        ),
+      },
+    },
     nodes: [
       { opType: 'QEmbedding', inputs: { input: 'ids', weight: 'table' }, ...typed('embedded', [2, 4]) },
       { opType: 'QLinear', inputs: { input: 'embedded', weight: 'identity', bias: 'identity_bias' }, ...typed('q', [2, 4]) },
@@ -164,8 +226,18 @@ test('canonical W8A8 decoder island keeps embedding, attention, logits, and toke
         params: { axis: -1 },
       },
     ],
+    outputs: ['token_ids'],
   };
-  GraphLoader._buildFromBlueprint(graph, config, tensors);
+  GraphLoader._buildFromGraphDocument(graph, document, tensors, {
+    quantizationByTensor: Object.fromEntries(
+      ['embedded', 'q', 'k', 'v', 'attended', 'logits']
+        .map((name) => [name, activation]),
+    ),
+    reservedNames: new Set([
+      'activation_scale', 'activation_zero_point', 'row_scale', 'row_zero_point',
+      'logit_scale', 'logit_zero_point',
+    ]),
+  });
   graph.assertValid();
   for (const name of ['embedded', 'q', 'k', 'v', 'attended', 'logits']) {
     assert.equal(graph.getTensor(name).dtype, 'int8');

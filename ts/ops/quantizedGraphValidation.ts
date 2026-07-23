@@ -1,6 +1,9 @@
-import type { TensorLike } from '../types.js';
+import type { PerTensorQuantization, TensorLike } from '../types.js';
+import { runtimeDTypes } from '../generated/volvoxaiEnums.js';
 
 type ValidationTensor = TensorLike;
+
+const RUNTIME_DTYPES = new Set<unknown>(runtimeDTypes);
 
 interface ValidationNode {
   id: string | number;
@@ -12,6 +15,57 @@ interface ValidationNode {
 
 export interface PortableQuantizedGraph {
   nodes: ValidationNode[];
+}
+
+function sameTensor(left: ValidationTensor | undefined, right: ValidationTensor | undefined): boolean {
+  return left != null && right != null && (
+    left === right || (typeof left.name === 'string' && left.name === right.name)
+  );
+}
+
+/** Prove that every QEmbedding ID is checked before any output write.
+ *
+ * Public I32 inputs are host-preflighted. Internal IDs are accepted only when
+ * a canonical I32 Clip proves an inclusive range inside the immutable table.
+ * This deliberately does not infer ranges through arbitrary integer graphs.
+ */
+export function qEmbeddingIdsArePreflightComplete(
+  graph: PortableQuantizedGraph,
+  node: ValidationNode,
+): boolean {
+  const ids = node.inputs?.input;
+  const weight = node.inputs?.weight;
+  const vocabulary = weight?.shape?.[0];
+  if (!ids || ids.dtype !== 'int32' || !Number.isInteger(vocabulary) || vocabulary <= 0) {
+    return false;
+  }
+  if (ids.isInput === true) return true;
+
+  const consumerIndex = graph.nodes.indexOf(node);
+  const producers = graph.nodes.filter((candidate, index) =>
+    index < consumerIndex && Object.values(candidate.outputs || {}).some((output) =>
+      sameTensor(output, ids)));
+  if (producers.length !== 1) return false;
+  const producer = producers[0];
+  const source = producer.inputs?.input;
+  const outputs = Object.values(producer.outputs || {}).filter(Boolean);
+  const params = producer.params || {};
+  const minimum = params.min;
+  const maximum = params.max;
+  return producer.opType === 'Clip' && Object.keys(producer.inputs || {}).length === 1 &&
+    Object.prototype.hasOwnProperty.call(producer.inputs || {}, 'input') &&
+    outputs.length === 1 && sameTensor(outputs[0], ids) &&
+    source?.dtype === 'int32' && sameShapeForProof(source.shape, ids.shape) &&
+    Object.keys(params).length === 2 &&
+    Object.prototype.hasOwnProperty.call(params, 'min') &&
+    Object.prototype.hasOwnProperty.call(params, 'max') &&
+    Number.isInteger(minimum) && Number.isInteger(maximum) &&
+    minimum >= 0 && maximum >= minimum && maximum < vocabulary;
+}
+
+function sameShapeForProof(left: unknown, right: unknown): boolean {
+  return Array.isArray(left) && Array.isArray(right) && left.length === right.length &&
+    left.every((dimension, index) => dimension === right[index]);
 }
 
 export class PortableQuantizedGraphValidator {
@@ -95,11 +149,12 @@ export class PortableQuantizedGraphValidator {
       } else if (mode != null && mode !== 'nearest') {
         reject(node, 'supports raw I8/U8 ResizeNearest2D only with mode "nearest".');
       }
-      for (const key of ['coordinate_transformation_mode', 'coordinate_transform_mode']) {
-        const transform = node.params?.[key];
-        if (transform != null && transform !== 'asymmetric') {
-          reject(node, `supports raw I8/U8 nearest resize only with ${key} "asymmetric".`);
-        }
+      if (node.params?.coordinate_transform_mode != null) {
+        reject(node, 'does not define coordinate_transform_mode; use coordinate_transformation_mode.');
+      }
+      const transform = node.params?.coordinate_transformation_mode;
+      if (transform != null && transform !== 'asymmetric') {
+        reject(node, 'supports raw I8/U8 nearest resize only with coordinate_transformation_mode "asymmetric".');
       }
       const nearestMode = node.params?.nearest_mode;
       if (nearestMode != null && nearestMode !== 'floor') {
@@ -157,18 +212,87 @@ export class PortableQuantizedGraphValidator {
         reject(node, 'must use canonical typed [...,d_in] activations, [d_out,d_in] byte weights, I32 bias, and [...,d_out] output.');
       }
       requirePerAxisWeight(node, weight, output.shape.at(-1), node.opType);
+      const inputQuantization = input.quantization as PerTensorQuantization;
+      const outputQuantization = output.quantization as PerTensorQuantization;
+      const inputScale = Math.fround(inputQuantization.scale);
+      const outputScale = Math.fround(outputQuantization.scale);
+      if (weight.quantization.scales.some((scale) => {
+        const multiplier = Math.fround(
+          Math.fround(inputScale * Math.fround(scale)) / outputScale,
+        );
+        return !Number.isFinite(multiplier) || multiplier <= 0;
+      })) {
+        reject(node, 'has a requantization multiplier not representable as positive F32.');
+      }
+    };
+    const canonicalQBatchMatMul = (node) => {
+      requireOnlyInputs(node, ['a', 'b']);
+      const a = node.inputs.a;
+      const b = node.inputs.b;
+      const output = requireSingleOutput(node);
+      const validShape = (tensor) => Array.isArray(tensor?.shape) &&
+        tensor.shape.length >= 2 && tensor.shape.length <= 8 &&
+        tensor.shape.every((dimension) => Number.isInteger(dimension) && dimension > 0);
+      if (!perTensor(a) || !perTensor(b) || !perTensor(output) ||
+          !validShape(a) || !validShape(b) || !validShape(output) ||
+          Object.keys(node.params || {}).length !== 0) {
+        reject(node, 'must use per-tensor I8/U8 rank-2..8 operands and no parameters.');
+      }
+      const m = a.shape.at(-2);
+      const k = a.shape.at(-1);
+      const otherK = b.shape.at(-2);
+      const n = b.shape.at(-1);
+      const aBatch = a.shape.slice(0, -2);
+      const bBatch = b.shape.slice(0, -2);
+      const batchRank = Math.max(aBatch.length, bBatch.length);
+      const paddedA = [...new Array(batchRank - aBatch.length).fill(1), ...aBatch];
+      const paddedB = [...new Array(batchRank - bBatch.length).fill(1), ...bBatch];
+      const outputBatch: number[] = [];
+      for (let axis = 0; axis < batchRank; axis++) {
+        if (paddedA[axis] !== paddedB[axis] && paddedA[axis] !== 1 && paddedB[axis] !== 1) {
+          reject(node, `has incompatible broadcast batch dimensions at axis ${axis}.`);
+        }
+        outputBatch.push(Math.max(paddedA[axis], paddedB[axis]));
+      }
+      const expected = [...outputBatch, m, n];
+      if (k !== otherK || output.shape.length !== expected.length ||
+          output.shape.some((dimension, axis) => dimension !== expected[axis])) {
+        reject(node, 'has incompatible ONNX matrix or output dimensions.');
+      }
+      const centeredMagnitude = (tensor) => {
+        const minimum = tensor.dtype === 'int8' ? -128 : 0;
+        const maximum = tensor.dtype === 'int8' ? 127 : 255;
+        return Math.max(
+          Math.abs(minimum - tensor.quantization.zero_point),
+          Math.abs(maximum - tensor.quantization.zero_point),
+        );
+      };
+      const maximumAccumulator = centeredMagnitude(a) * centeredMagnitude(b) * k;
+      if (!Number.isSafeInteger(maximumAccumulator) || maximumAccumulator > 0x7fffffff) {
+        reject(node, 'may overflow its defined I32 accumulator.');
+      }
+      const aQuantization = a.quantization as PerTensorQuantization;
+      const bQuantization = b.quantization as PerTensorQuantization;
+      const outputQuantization = output.quantization as PerTensorQuantization;
+      const multiplier = Math.fround(
+        Math.fround(aQuantization.scale * bQuantization.scale) /
+          outputQuantization.scale,
+      );
+      if (!Number.isFinite(multiplier) || multiplier <= 0) {
+        reject(node, 'has a requantization multiplier not representable as positive F32.');
+      }
     };
     const canonicalQEmbedding = (node) => {
       requireOnlyInputs(node, ['input', 'weight']);
       const input = nodeInput(node, ['input'], 'token IDs');
       const weight = node.inputs.weight;
       const output = requireSingleOutput(node);
-      if (!input?.isInput || input.dtype !== 'int32' || input.shape.length < 1 || !byteTensor(weight) ||
+      if (!qEmbeddingIdsArePreflightComplete(graph, node) || input.shape.length < 1 || !byteTensor(weight) ||
           !perTensor(output) || weight.shape.length !== 2 ||
           output.shape.length !== input.shape.length + 1 ||
           output.shape.slice(0, -1).some((dimension, index) => dimension !== input.shape[index]) ||
           output.shape.at(-1) !== weight.shape[1]) {
-        reject(node, 'must use a graph-input I32 token tensor, [vocab,hidden] I8/U8 weight with axis-0 row metadata, and a per-tensor I8/U8 [...token,hidden] output.');
+        reject(node, 'must use preflight-complete I32 IDs (public input or vocabulary-bounded Clip), [vocab,hidden] I8/U8 weight with axis-0 row metadata, and a per-tensor I8/U8 [...token,hidden] output.');
       }
       requirePerAxisWeight(node, weight, weight.shape[0], 'QEmbedding');
     };
@@ -477,7 +601,7 @@ export class PortableQuantizedGraphValidator {
       const scale = node.inputs.scale;
       const zeroPoint = node.inputs.zero_point || null;
       const output = requireSingleOutput(node);
-      const supportedInput = input && ['float32', 'int32', 'int8', 'uint8'].includes(input.dtype);
+      const supportedInput = input && RUNTIME_DTYPES.has(input.dtype);
       const supportedZeroPoint = !zeroPoint ||
         (['float32', 'int32'].includes(zeroPoint.dtype) && zeroPoint.sizeBytes === 4) ||
         (['int8', 'uint8'].includes(zeroPoint.dtype) && zeroPoint.sizeBytes === 1);
@@ -494,6 +618,61 @@ export class PortableQuantizedGraphValidator {
       if (!perTensor(input) || !perTensor(output) || !sameByteDomain(input, output) ||
           input.sizeBytes !== output.sizeBytes) {
         reject(node, 'requires equal-size I8/U8 storage with identical per-tensor quantization metadata.');
+      }
+    };
+    const canonicalTranspose = (node) => {
+      requireOnlyInputs(node, ['input', 'x', 'data']);
+      const input = nodeInput(node, ['input', 'x', 'data'], 'activation');
+      const output = requireSingleOutput(node);
+      const rank = input?.shape?.length;
+      const parameterNames = Object.keys(node.params || {});
+      const perm = node.params?.perm ??
+        (Number.isInteger(rank)
+          ? Array.from({ length: rank }, (_, index) => rank - 1 - index)
+          : null);
+      if (!perTensor(input) || !perTensor(output) || !sameByteDomain(input, output) ||
+          !Number.isInteger(rank) || rank < 1 || rank > 8 ||
+          output.shape.length !== rank || input.sizeBytes !== output.sizeBytes ||
+          parameterNames.some((name) => name !== 'perm') || !Array.isArray(perm) ||
+          perm.length !== rank || new Set(perm).size !== rank ||
+          perm.some((axis) => !Number.isInteger(axis) || axis < 0 || axis >= rank) ||
+          output.shape.some((dimension, index) => dimension !== input.shape[perm[index]])) {
+        reject(node, 'requires a descriptor-preserving rank-1..8 I8/U8 permutation.');
+      }
+    };
+    // Slice and Expand move elements without changing their values, so byte
+    // storage passes through with an identical descriptor. Unlike the
+    // equal-size shape copies they change the element count, so the size
+    // relation is directional rather than an equality.
+    const canonicalSlice = (node) => {
+      requireOnlyInputs(node, ['input', 'x', 'data']);
+      const input = nodeInput(node, ['input', 'x', 'data'], 'activation');
+      const output = requireSingleOutput(node);
+      const rank = input?.shape?.length;
+      if (!perTensor(input) || !perTensor(output) || !sameByteDomain(input, output) ||
+          !Number.isInteger(rank) || rank < 1 || rank > 8 ||
+          output.shape.length !== rank || output.sizeBytes > input.sizeBytes) {
+        reject(node, 'requires a descriptor-preserving rank-1..8 I8/U8 selection no larger than its input.');
+      }
+    };
+    const canonicalExpand = (node) => {
+      requireOnlyInputs(node, ['input', 'x', 'data']);
+      const input = nodeInput(node, ['input', 'x', 'data'], 'activation');
+      const output = requireSingleOutput(node);
+      const inputRank = input?.shape?.length;
+      const outputRank = output?.shape?.length;
+      const offset = outputRank - inputRank;
+      const exactBroadcast = Number.isInteger(inputRank) && Number.isInteger(outputRank) &&
+        inputRank >= 1 && inputRank <= outputRank && outputRank <= 8 &&
+        output.shape.every((dimension, axis) => {
+          const source = axis < offset ? 1 : input.shape[axis - offset];
+          return source === 1 || source === dimension;
+        });
+      if (!perTensor(input) || !perTensor(output) || !sameByteDomain(input, output) ||
+          !Array.isArray(input.shape) || !Array.isArray(output.shape) ||
+          !exactBroadcast || output.sizeBytes < input.sizeBytes || input === output ||
+          Object.keys(node.params || {}).length !== 0) {
+        reject(node, 'requires a distinct descriptor-preserving rank-1..8 I8/U8 exact broadcast with no parameters.');
       }
     };
     const canonicalResize = (node) => {
@@ -558,6 +737,7 @@ export class PortableQuantizedGraphValidator {
       QLinear: canonicalQLinear,
       QMatMul: canonicalQLinear,
       QGemm: canonicalQLinear,
+      QBatchMatMul: canonicalQBatchMatMul,
       QEmbedding: canonicalQEmbedding,
       QAdd: canonicalQAdd,
       QGELU: canonicalQGELU,
@@ -578,6 +758,9 @@ export class PortableQuantizedGraphValidator {
       Squeeze: canonicalShapeCopy,
       Unsqueeze: canonicalShapeCopy,
       Identity: canonicalShapeCopy,
+      Transpose: canonicalTranspose,
+      Slice: canonicalSlice,
+      Expand: canonicalExpand,
       Concat: canonicalConcat,
     };
     const metadataOnlyInputs = new Set([
@@ -585,7 +768,9 @@ export class PortableQuantizedGraphValidator {
       'input_scale', 'input_zero_point', 'output_scale', 'output_zero_point',
     ]);
     const explicitCanonicalOperators = new Set([
-      'QConv2D', 'QLinear', 'QMatMul', 'QGemm', 'QAdd', 'QGELU', 'QGroupNorm', 'QLayerNorm', 'QMaskedMean', 'QSDPA', 'QArgMax', 'QSiLU',
+      'QConv2D', 'QLinear', 'QMatMul', 'QGemm', 'QBatchMatMul',
+      'QAdd', 'QGELU', 'QGroupNorm', 'QLayerNorm', 'QMaskedMean',
+      'QSDPA', 'QArgMax', 'QSiLU',
       'QEmbedding',
       'RequantizeLinear', 'QuantizeLinear', 'DequantizeLinear',
     ]);
@@ -619,7 +804,7 @@ export class PortableQuantizedGraphValidator {
         if (!handler) reject(node, 'routes canonical raw I8/U8 storage to an unsupported generic operator; insert an explicit DequantizeLinear boundary or implement a typed operator.');
         handler!(node);
       }
-      if (['ReLU', 'Sigmoid', 'HardSwish', 'HardSigmoid', 'SiLU', 'Swish', 'Tanh'].includes(node.opType)) {
+      if (['ReLU', 'Sigmoid', 'HardSwish', 'HardSigmoid', 'SiLU', 'Tanh'].includes(node.opType)) {
         const input = node.inputs.input || node.inputs.x || node.inputs.data;
         const output = outputOf(node);
         if (byteTensor(input) || byteTensor(output)) {

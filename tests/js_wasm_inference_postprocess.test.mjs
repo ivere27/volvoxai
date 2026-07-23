@@ -39,7 +39,7 @@ function argMaxGraph({ inputDtype = 'float32', outputDtype = 'int32', axis }) {
   const { out } = graph.addOp('ArgMax', { input }, {
     out: { name: 'out', shape: inputShape.filter((_, index) => index !== normalizedAxis), dtype: outputDtype },
   }, { axis });
-  graph.outputNames = [out.name];
+  graph.setOutputs([out.name]);
   return graph;
 }
 
@@ -59,7 +59,7 @@ function nmsGraph(outputDtype) {
   }, {
     out: { name: 'out', shape: [3, 3], dtype: outputDtype },
   });
-  graph.outputNames = [out.name];
+  graph.setOutputs([out.name]);
   return graph;
 }
 

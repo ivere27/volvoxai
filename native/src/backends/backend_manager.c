@@ -1,6 +1,7 @@
 #include "backend_manager.h"
 
 #include "backend_config.h"
+#include "runtime_state.h"
 #if VOLVOXAI_ENABLE_VULKAN
 #include "vulkan_engine.h"
 #endif
@@ -13,21 +14,23 @@
 #if VOLVOXAI_ENABLE_NNAPI
 #include "nnapi_engine.h"
 #endif
+#if VOLVOXAI_ENABLE_CUDA
+#include "cuda_engine.h"
+#endif
 
-/* Runtime dispatch reads these private flags. Their storage belongs to the
- * backend integration layer, never to a CLI or embedding application. */
-int g_use_vulkan;
-int g_use_nnapi;
-int g_use_opengl;
-int g_use_metal;
-
-static VolvoxAIEngineBackend g_backend = VOLVOXAI_BACKEND_CPU;
+#define g_use_vulkan (vx_engine_state_current()->use_vulkan)
+#define g_use_nnapi (vx_engine_state_current()->use_nnapi)
+#define g_use_opengl (vx_engine_state_current()->use_opengl)
+#define g_use_metal (vx_engine_state_current()->use_metal)
+#define g_use_cuda (vx_engine_state_current()->use_cuda)
+#define g_backend (vx_engine_state_current()->backend)
 
 static void clear_backend_flags(void) {
     g_use_vulkan = 0;
     g_use_nnapi = 0;
     g_use_opengl = 0;
     g_use_metal = 0;
+    g_use_cuda = 0;
 }
 
 static void cleanup_backend(VolvoxAIEngineBackend backend) {
@@ -52,6 +55,11 @@ static void cleanup_backend(VolvoxAIEngineBackend backend) {
             nnapi_cleanup();
 #endif
             break;
+        case VOLVOXAI_BACKEND_CUDA:
+#if VOLVOXAI_ENABLE_CUDA
+            cuda_cleanup();
+#endif
+            break;
         case VOLVOXAI_BACKEND_CPU:
         default:
             break;
@@ -66,6 +74,7 @@ static void select_backend(VolvoxAIEngineBackend backend) {
         case VOLVOXAI_BACKEND_OPENGL: g_use_opengl = 1; break;
         case VOLVOXAI_BACKEND_METAL: g_use_metal = 1; break;
         case VOLVOXAI_BACKEND_NNAPI: g_use_nnapi = 1; break;
+        case VOLVOXAI_BACKEND_CUDA: g_use_cuda = 1; break;
         case VOLVOXAI_BACKEND_CPU:
         default: break;
     }
@@ -77,8 +86,9 @@ void vx_backend_manager_deactivate(void) {
 }
 
 int vx_backend_manager_activate(VolvoxAIEngineBackend backend) {
-    if (backend < VOLVOXAI_BACKEND_CPU || backend > VOLVOXAI_BACKEND_NNAPI) return -1;
-    if (backend == g_backend) return 0;
+    if (backend < VOLVOXAI_BACKEND_CPU || backend > VOLVOXAI_BACKEND_CUDA)
+        return -1;
+    if ((int)backend == g_backend) return 0;
     int status = -1;
     switch (backend) {
         case VOLVOXAI_BACKEND_CPU:
@@ -104,7 +114,12 @@ int vx_backend_manager_activate(VolvoxAIEngineBackend backend) {
             status = nnapi_init();
 #endif
             break;
-        case VOLVOXAI_BACKEND_CUSTOM:
+        case VOLVOXAI_BACKEND_CUDA:
+#if VOLVOXAI_ENABLE_CUDA
+            status = cuda_init();
+#endif
+            break;
+        default:
             break;
     }
     if (status != 0) {
@@ -127,6 +142,7 @@ const char* vx_backend_manager_name(void) {
         case VOLVOXAI_BACKEND_OPENGL: return "OpenGL";
         case VOLVOXAI_BACKEND_METAL: return "Metal";
         case VOLVOXAI_BACKEND_NNAPI: return "NNAPI";
+        case VOLVOXAI_BACKEND_CUDA: return "CUDA";
         case VOLVOXAI_BACKEND_CPU:
         default: return "CPU";
     }

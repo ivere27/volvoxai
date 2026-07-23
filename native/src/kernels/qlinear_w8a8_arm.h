@@ -7,7 +7,7 @@
  * It returns 1 only after writing a complete result; 0 means that the caller
  * must use the authoritative portable qlinear_i8u8 implementation instead.
  * The declaration is intentionally separate from quant_cpu_opt.h so the ARM
- * implementation can evolve without coupling to legacy QTensor kernels. */
+ * implementation can evolve without coupling to the W8A32 kernels. */
 int vx_qlinear_i8u8_arm_try(const void* input, const void* weight,
                             const int32_t* bias, const float* weight_scales,
                             const int32_t* weight_zero_points, void* output,

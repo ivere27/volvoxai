@@ -1,4 +1,5 @@
 #include "mathcompat.h"
+#include "../../include/volvoxai_enums.h"
 #include <stdint.h>
 // --- Missing CV & NLP Primitives (Batch 2) ---
 void prelu_f32(const float* input, const float* weight, float* output, int b, int h, int w, int c) {
@@ -45,35 +46,31 @@ void reduce_sum_f32(const float* input, float* output, int b, int d) {
     }
 }
 
-/* Keep these private to the freestanding kernel bundle.  The values match the
- * dtype codes selected by WasmEngine; they are not part of a native public API. */
-enum {
-    VX_KERNEL_DTYPE_F32 = 0,
-    VX_KERNEL_DTYPE_I32 = 1,
-    VX_KERNEL_DTYPE_I8 = 2,
-    VX_KERNEL_DTYPE_U8 = 3,
-};
-
 static double vx_kernel_value_at(const void* values, int dtype, long index) {
     switch (dtype) {
-        case VX_KERNEL_DTYPE_F32: return ((const float*)values)[index];
-        case VX_KERNEL_DTYPE_I32: return ((const int32_t*)values)[index];
-        case VX_KERNEL_DTYPE_I8: return ((const int8_t*)values)[index];
-        case VX_KERNEL_DTYPE_U8: return ((const uint8_t*)values)[index];
+        case VX_DTYPE_F32: return ((const float*)values)[index];
+        case VX_DTYPE_I32: return ((const int32_t*)values)[index];
+        case VX_DTYPE_I8: return ((const int8_t*)values)[index];
+        case VX_DTYPE_U8: return ((const uint8_t*)values)[index];
         default: return 0.0;
     }
 }
 
+static int vx_kernel_dtype_supported(int dtype) {
+    return dtype == VX_DTYPE_F32 || dtype == VX_DTYPE_I32 ||
+        dtype == VX_DTYPE_I8 || dtype == VX_DTYPE_U8;
+}
+
 static void vx_kernel_store_index(void* values, int dtype, long index, int value) {
     switch (dtype) {
-        case VX_KERNEL_DTYPE_F32:
+        case VX_DTYPE_F32:
             ((float*)values)[index] = (float)value;
             break;
-        case VX_KERNEL_DTYPE_I32:
+        case VX_DTYPE_I32:
             ((int32_t*)values)[index] = (int32_t)value;
             break;
-        case VX_KERNEL_DTYPE_I8:
-        case VX_KERNEL_DTYPE_U8:
+        case VX_DTYPE_I8:
+        case VX_DTYPE_U8:
             /* Store the byte representation directly so Int8Array and
              * Uint8Array retain JavaScript TypedArray wrapping semantics. */
             ((uint8_t*)values)[index] = (uint8_t)value;
@@ -86,8 +83,8 @@ static void vx_kernel_store_index(void* values, int dtype, long index, int value
 void argmax_axis_typed(const void* input, void* output, int outer, int axis_size,
                        int inner, int input_dtype, int output_dtype) {
     if (!input || !output || outer <= 0 || axis_size <= 0 || inner <= 0 ||
-        input_dtype < VX_KERNEL_DTYPE_F32 || input_dtype > VX_KERNEL_DTYPE_U8 ||
-        output_dtype < VX_KERNEL_DTYPE_F32 || output_dtype > VX_KERNEL_DTYPE_U8) return;
+        !vx_kernel_dtype_supported(input_dtype) ||
+        !vx_kernel_dtype_supported(output_dtype)) return;
     for (int outer_index = 0; outer_index < outer; outer_index++) {
         for (int inner_index = 0; inner_index < inner; inner_index++) {
             long base = ((long)outer_index * axis_size * inner) + inner_index;
@@ -111,7 +108,7 @@ void argmax_axis_typed(const void* input, void* output, int outer, int axis_size
 
 void argmax_f32(const float* input, float* output, int b, int d) {
     argmax_axis_typed(input, output, b, d, 1,
-        VX_KERNEL_DTYPE_F32, VX_KERNEL_DTYPE_F32);
+        VX_DTYPE_F32, VX_DTYPE_F32);
 }
 
 static double vx_kernel_max(double left, double right) {
@@ -158,10 +155,9 @@ void non_max_suppression_typed(const void* boxes, const void* scores, void* outp
                                double max_output_boxes_per_class, double iou_threshold,
                                double score_threshold) {
     if (!boxes || !scores || !output || batches < 0 || spatial < 0 || classes < 0 ||
-        output_records < 0 || boxes_dtype < VX_KERNEL_DTYPE_F32 ||
-        boxes_dtype > VX_KERNEL_DTYPE_U8 || scores_dtype < VX_KERNEL_DTYPE_F32 ||
-        scores_dtype > VX_KERNEL_DTYPE_U8 || output_dtype < VX_KERNEL_DTYPE_F32 ||
-        output_dtype > VX_KERNEL_DTYPE_U8) return;
+        output_records < 0 || !vx_kernel_dtype_supported(boxes_dtype) ||
+        !vx_kernel_dtype_supported(scores_dtype) ||
+        !vx_kernel_dtype_supported(output_dtype)) return;
 
     int output_index = 0;
     for (int batch = 0; batch < batches && output_index < output_records; batch++) {

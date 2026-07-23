@@ -5,13 +5,16 @@
 #include <limits.h>
 #include <math.h>
 #include <dlfcn.h>
+#include <pthread.h>
 #define VK_NO_PROTOTYPES
 #include <vulkan/vulkan.h>
 #include "shader_store.h"
 #include "vulkan_engine.h"
-
-static void* vulkan_lib = NULL;
-static PFN_vkGetInstanceProcAddr vkGetInstanceProcAddr = NULL;
+#include "runtime_state.h"
+#include "expand_f32_plan.h"
+#include "qbatch_matmul_plan.h"
+#include "qlinear_multiplier.h"
+#include "typed_control_plan.h"
 
 void vk_set_shader_root(const char* root) {
     if (volvoxai_shader_store_set_override_root(root) != VOLVOXAI_SHADER_STORE_OK) {
@@ -19,7 +22,10 @@ void vk_set_shader_root(const char* root) {
     }
 }
 
-#define VK_FUNC(name) static PFN_##name name = NULL;
+#define VK_FUNC(name) PFN_##name p_##name;
+typedef struct {
+    void* loader;
+    PFN_vkGetInstanceProcAddr get_instance_proc_addr;
 VK_FUNC(vkCreateInstance)
 #if defined(VK_VERSION_1_1)
 VK_FUNC(vkEnumerateInstanceVersion)
@@ -76,46 +82,13 @@ VK_FUNC(vkCreateFence)
 VK_FUNC(vkResetFences)
 VK_FUNC(vkWaitForFences)
 VK_FUNC(vkDestroyFence)
+} VulkanApi;
+#undef VK_FUNC
 
 #define LOAD_GLOBAL(name) name = (PFN_##name)vkGetInstanceProcAddr(NULL, #name);
 #define LOAD_INST(name) name = (PFN_##name)vkGetInstanceProcAddr(instance, #name);
-#define LOAD_DEV(name) name = (PFN_##name)vkGetInstanceProcAddr(instance, #name); // using instance level is fine
 
 #define ALIGN_UP(x, a) (((x) + ((a) - 1)) & ~((a) - 1))
-
-static VkInstance instance = VK_NULL_HANDLE;
-static VkPhysicalDevice physical_device = VK_NULL_HANDLE;
-static VkDevice device = VK_NULL_HANDLE;
-static VkQueue compute_queue = VK_NULL_HANDLE;
-static uint32_t queue_family_index = 0;
-static VkPhysicalDeviceMemoryProperties mem_props;
-static uint32_t max_compute_workgroups[3] = {0, 0, 0};
-static int vulkan_packed_dot = 0;
-static int vulkan_packed_dot_warned = 0;
-#if VOLVOXAI_ENABLE_TRAINING
-static uint32_t training_max_storage_bindings = 0;
-static uint32_t training_max_uniform_bindings = 0;
-static uint32_t training_max_workgroup_size_x = 0;
-static uint32_t training_max_workgroup_invocations = 0;
-static VkDeviceSize training_max_storage_range = 0;
-static VkDeviceSize training_max_uniform_range = 0;
-#endif
-
-// Memory mapping
-static VkBuffer io_buffer;
-static VkDeviceMemory io_memory;
-static void* io_mapped = NULL;
-static size_t io_size = 1024 * 1024 * 512; // overridable with VOLVOX_VULKAN_MB
-
-static VkDescriptorSetLayout desc_layout;
-static VkPipelineLayout pipeline_layout;
-static VkPipeline matmul_pipeline;
-static VkPipeline matmul_tiled_pipeline;
-static VkCommandPool cmd_pool;
-static VkCommandBuffer cmd_buf;
-static VkFence compute_fence = VK_NULL_HANDLE;
-static VkDescriptorPool desc_pool;
-static VkDescriptorSet desc_set;
 
 typedef struct {
     const char* name;
@@ -127,7 +100,11 @@ typedef struct {
     VkPipeline pipeline;
     VkDescriptorSet desc_set;
     int ready;
-} VkKernel;
+} VkKernelDefinition;
+
+/* Kernel declarations below are immutable shader/pipeline specifications.
+ * Prepared Vulkan handles live in the current engine's Vulkan context. */
+#define VkKernel const VkKernelDefinition
 
 static VkKernel k_conv2d    = {"conv2D",      "spv/conv2D.spv",      5, 4, VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE, 0};
 static VkKernel k_conv2d_c3out16 = {"conv2DRegularC3Out16", "spv/conv2DRegularC3Out16.spv", 5, 4, VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE, 0};
@@ -164,6 +141,10 @@ static VkKernel k_dropout = {"dropout", "spv/dropout.spv", 3, 2, VK_NULL_HANDLE,
 static VkKernel k_embedding = {"embedding",   "spv/embedding.spv",   4, 3, VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE, 0};
 static VkKernel k_transpose = {"generalTranspose", "spv/generalTranspose.spv", 3, -1, VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE, 0};
 static VkKernel k_where     = {"where",       "spv/where.spv",       5, 4, VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE, 0};
+static VkKernel k_typed_control_32 = {"typedControl32Native", "spv/typedControl32Native.spv", 4, -1, VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE, 0};
+static VkKernel k_where_32 = {"where32Native", "spv/where32Native.spv", 5, 4, VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE, 0};
+static VkKernel k_argmax_f32_i32 = {"argMaxF32I32Native", "spv/argMaxF32I32Native.spv", 3, 2, VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE, 0};
+static VkKernel k_concat_32 = {"concatCopy32Native", "spv/concatCopy32Native.spv", 3, 2, VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE, 0};
 static VkKernel k_expand    = {"expand",      "spv/expand.spv",      3, 2, VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE, 0};
 static VkKernel k_pad       = {"pad",         "spv/pad.spv",         3, 2, VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE, 0};
 static VkKernel k_slice     = {"slice",       "spv/slice.spv",       3, 2, VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE, 0};
@@ -195,6 +176,7 @@ static VkKernel k_qconv2d_int8_dot_tiled = {"qConv2DInt8DotTiled", "spv/qConv2DI
 static VkKernel k_quantize_typed_i8u8 = {"quantizeLinearTyped", "spv/quantizeLinearTyped.spv", 5, 4, VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE, 0};
 static VkKernel k_dequantize_typed_i8u8 = {"dequantizeLinearTyped", "spv/dequantizeLinearTyped.spv", 5, 4, VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE, 0};
 static VkKernel k_qadd_i8u8 = {"qAdd", "spv/qAdd.spv", 4, 3, VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE, 0};
+static VkKernel k_qbatch_matmul_i8u8 = {"qBatchMatMul", "spv/qBatchMatMul.spv", 5, 4, VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE, 0};
 static VkKernel k_qsilu_i8u8 = {"qSiLUInt8", "spv/qSiLUInt8.spv", 3, 2, VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE, 0};
 static VkKernel k_qgelu_i8u8 = {"qGELUInt8", "spv/qGELUInt8.spv", 3, 2, VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE, 0};
 static VkKernel k_qgroupnorm_stats = {"qGroupNormStats", "spv/qGroupNormStats.spv", 3, 2, VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE, 0};
@@ -209,6 +191,7 @@ static VkKernel k_copy_typed_i8u8 = {"copyTyped", "spv/copyTyped.spv", 3, 2, VK_
 static VkKernel k_concat_typed_i8u8 = {"concatCopyTyped", "spv/concatCopyTyped.spv", 3, 2, VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE, 0};
 static VkKernel k_maxpool_typed_i8u8 = {"maxPool2DTyped", "spv/maxPool2DTyped.spv", 3, 2, VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE, 0};
 static VkKernel k_resize_nearest_typed_i8u8 = {"resizeNearestTyped", "spv/resizeNearestTyped.spv", 3, 2, VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE, 0};
+static VkKernel k_transpose_typed_i8u8 = {"transposeTyped", "spv/transposeTyped.spv", 3, -1, VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE, 0};
 static VkKernel k_spatial_softargmax_y = {"spatialSoftargmaxY", "spv/spatialSoftargmaxY.spv", 3, 2, VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE, 0};
 static VkKernel k_profile_x = {"profileX",    "spv/profileX.spv",    3, 2, VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE, 0};
 static VkKernel k_profile_y = {"profileY",    "spv/profileY.spv",    3, 2, VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE, 0};
@@ -222,46 +205,14 @@ static VkKernel k_concat_sigmoid = {"concatSigmoidCopy", "spv/concatSigmoidCopy.
 static VkKernel k_maxpool   = {"maxPool2D",   "spv/maxPool2D.spv",   3, 2, VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE, 0};
 static VkKernel k_resize    = {"resize",      "spv/resize.spv",      3, 2, VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE, 0};
 
-static VkKernel* graph_kernels[] = {
-    &k_conv2d, &k_conv2d_c3out16, &k_conv2d_dw4, &k_conv2d_dw8,
-    &k_conv2d_pw8, &k_conv2d_pw8v2, &k_conv2d_pw8v4, &k_conv2d_pw16,
-    &k_conv2d_pw16tile, &k_sigmoid, &k_clip, &k_copy, &k_relu, &k_gelu,
-    &k_silu, &k_tanh, &k_hardswish, &k_hardsigmoid, &k_leaky_relu, &k_prelu,
-    &k_layernorm, &k_rmsnorm, &k_softmax, &k_logsoftmax, &k_reduce,
-    &k_globalavg, &k_avgpool, &k_batchnorm, &k_groupnorm,
-#if VOLVOXAI_ENABLE_TRAINING
-    &k_dropout,
-#endif
-    &k_embedding, &k_transpose,
-    &k_where, &k_expand, &k_pad, &k_slice, &k_gather, &k_convtranspose,
-    &k_interp1d, &k_mul, &k_sub, &k_div, &k_broadcast_binary, &k_split, &k_conv1d, &k_sdpa,
-    &k_cross_sdpa,
-#if VOLVOXAI_ENABLE_TRAINING
-    &k_sdpa_training, &k_cross_sdpa_training,
-#endif
-    &k_cross_attention, &k_quantize, &k_dequantize, &k_qlinear_int8, &k_qlinear_int8_tiled,
-    &k_qlinear_int8_dot, &k_qlinear_int8_dot_tiled,
-    &k_qembedding_int8, &k_qconv2d_int8, &k_qconv2d_int8_dot_tiled,
-    &k_quantize_typed_i8u8, &k_dequantize_typed_i8u8,
-    &k_qadd_i8u8, &k_qsilu_i8u8, &k_qgelu_i8u8,
-    &k_qgroupnorm_stats, &k_qgroupnorm_apply,
-    &k_qlayernorm_stats, &k_qlayernorm_apply, &k_qsdpa_int8, &k_qargmax_int8,
-    &k_qmaskedmean_int8,
-    &k_requantize_linear_i8u8,
-    &k_copy_typed_i8u8, &k_concat_typed_i8u8, &k_maxpool_typed_i8u8,
-    &k_resize_nearest_typed_i8u8,
-    &k_spatial_softargmax_y, &k_profile_x, &k_profile_y, &k_mean_height,
-    &k_nms, &k_add, &k_add_relu, &k_upsample, &k_concat, &k_concat_sigmoid,
-    &k_maxpool, &k_resize,
-};
-
 #define VK_GRAPH_MAX_TENSORS 8192
 #define VK_GRAPH_MAX_DISPATCH_SETS 4096
 #define VK_GRAPH_SCRATCH_BYTES ((size_t)1024 * 1024)
 #define VK_GRAPH_BASE ((size_t)128 * 1024 * 1024)
 #define VK_GRAPH_ALIGN 256
-
-static size_t graph_alignment = VK_GRAPH_ALIGN;
+#define VK_PREPARED_KERNEL_MAX 160
+#define WT_CACHE_MAX 512
+#define WEIGHTS_LIMIT ((size_t)64 * 1024 * 1024)
 
 typedef struct {
     const void* host;
@@ -272,11 +223,6 @@ typedef struct {
     int is_weight;
 } VkTensorSlot;
 
-static VkTensorSlot graph_slots[VK_GRAPH_MAX_TENSORS];
-static int graph_slot_count = 0;
-static size_t graph_bump = VK_GRAPH_BASE;
-static size_t scratch_bump = 0;
-
 /* A NULL canonical QConv2D bias still needs an output-channel-sized storage
  * binding. Keep every allocation alive until backend cleanup so graph slots
  * never retain a dangling host key while a forward chain is resident. */
@@ -286,9 +232,7 @@ typedef struct QConvZeroBiasBacking {
     struct QConvZeroBiasBacking* next;
 } QConvZeroBiasBacking;
 
-static QConvZeroBiasBacking* qconv_zero_bias_backings = NULL;
 static const int32_t* qconv_zero_bias_get(uint32_t output_channels);
-static void qconv_zero_bias_release(void);
 
 /* qSDPAInt8 always declares mask binding 3.  When no logical mask exists,
  * bind durable conventional I32 storage rather than retyping an activation
@@ -297,22 +241,227 @@ static const int32_t qsdpa_dummy_mask[1] = {0};
 
 typedef struct {
     VkKernel* kernel;
-    VkDescriptorSet desc_set;
+    VkDescriptorSet descriptor_set;
 } VkGraphDispatchSet;
 
-static VkGraphDispatchSet graph_dispatch_sets[VK_GRAPH_MAX_DISPATCH_SETS];
-static int graph_dispatch_set_count = 0;
-static int graph_dispatch_set_cursor = 0;
-static int graph_cmd_recording = 0;
-static int graph_cmd_pending = 0;
+typedef struct {
+    VkKernel* definition;
+    VkDescriptorSetLayout prepared_desc_layout;
+    VkPipelineLayout prepared_pipeline_layout;
+    VkPipeline pipeline;
+    int ready;
+} VkPreparedKernel;
+
+typedef struct {
+    const float* src;
+    int d_in;
+    int d_out;
+    size_t bytes;
+    size_t off;
+} VkWeightCacheEntry;
+
+#if VOLVOXAI_ENABLE_TRAINING
+typedef struct VkTrainingKernelSlot VkTrainingKernelSlot;
+#endif
+
+/* Process-shared state is limited to the physical device, queue, immutable
+ * capability limits, and synchronized model-independent pipeline caches. */
+typedef struct {
+    pthread_mutex_t mutex;
+    VulkanApi api;
+    VkInstance instance_handle;
+    VkPhysicalDevice physical_device_handle;
+    VkDevice device_handle;
+    VkQueue compute_queue_handle;
+    uint32_t queue_family_index;
+    VkPhysicalDeviceMemoryProperties memory_properties;
+    uint32_t max_workgroups[3];
+    size_t graph_alignment;
+    int packed_dot;
+    int packed_dot_warned;
+#if VOLVOXAI_ENABLE_TRAINING
+    uint32_t training_max_storage_bindings;
+    uint32_t training_max_uniform_bindings;
+    uint32_t training_max_workgroup_size_x;
+    uint32_t training_max_workgroup_invocations;
+    VkDeviceSize training_max_storage_range;
+    VkDeviceSize training_max_uniform_range;
+#endif
+    VkDescriptorSetLayout matmul_desc_layout;
+    VkPipelineLayout matmul_pipeline_layout;
+    VkPipeline matmul_pipeline;
+    VkPipeline matmul_tiled_pipeline;
+    unsigned context_count;
+    int initialized;
+} VulkanDeviceState;
+
+/* Every field below is owned by exactly one VxEngineState. It may be used by
+ * only that engine's FIFO execution context at a time. */
+typedef struct {
+    int device_acquired;
+    VkBuffer buffer;
+    VkDeviceMemory memory;
+    void* mapped;
+    size_t arena_size;
+    VkDescriptorPool graph_descriptor_pool;
+    VkDescriptorSet matmul_set;
+    VkCommandPool pool;
+    VkCommandBuffer command;
+    VkFence fence;
+    VkTensorSlot* tensor_slots;
+    int tensor_slot_count;
+    size_t arena_bump;
+    size_t scratch_cursor;
+    QConvZeroBiasBacking* zero_bias_backings;
+    VkGraphDispatchSet* dispatch_sets;
+    int dispatch_set_count;
+    int dispatch_set_cursor;
+    int command_recording;
+    int command_pending;
+    int packed_dot_disabled;
+    VkPreparedKernel prepared_kernels[VK_PREPARED_KERNEL_MAX];
+    int prepared_kernel_count;
+    VkWeightCacheEntry weight_cache[WT_CACHE_MAX];
+    int weight_cache_count;
+    size_t weight_bump;
+#if VOLVOXAI_ENABLE_TRAINING
+    VkTrainingKernelSlot* training_kernel_slots;
+    int training_kernel_slot_count;
+    VkDescriptorPool training_pool;
+    VkGraphDispatchSet* training_sets;
+    int training_set_count;
+    int training_set_cursor;
+    VkTensorSlot** training_touched;
+    int training_touched_count_value;
+    int training_is_active;
+#endif
+} VulkanContextState;
+
+static VulkanDeviceState g_vulkan_device = {
+    .mutex = PTHREAD_MUTEX_INITIALIZER,
+    .graph_alignment = VK_GRAPH_ALIGN,
+};
+
+static VulkanContextState* vk_context_current(void) {
+    VxEngineState* owner = vx_engine_state_current();
+    return owner ? (VulkanContextState*)owner->vulkan_context_state : NULL;
+}
+
+#define vulkan_lib (g_vulkan_device.api.loader)
+#define vkGetInstanceProcAddr (g_vulkan_device.api.get_instance_proc_addr)
+#define vkCreateInstance (g_vulkan_device.api.p_vkCreateInstance)
+#define vkEnumerateInstanceVersion (g_vulkan_device.api.p_vkEnumerateInstanceVersion)
+#define vkDestroyInstance (g_vulkan_device.api.p_vkDestroyInstance)
+#define vkEnumeratePhysicalDevices (g_vulkan_device.api.p_vkEnumeratePhysicalDevices)
+#define vkGetPhysicalDeviceProperties (g_vulkan_device.api.p_vkGetPhysicalDeviceProperties)
+#define vkGetPhysicalDeviceFeatures2 (g_vulkan_device.api.p_vkGetPhysicalDeviceFeatures2)
+#define vkGetPhysicalDeviceProperties2 (g_vulkan_device.api.p_vkGetPhysicalDeviceProperties2)
+#define vkGetPhysicalDeviceQueueFamilyProperties (g_vulkan_device.api.p_vkGetPhysicalDeviceQueueFamilyProperties)
+#define vkGetPhysicalDeviceMemoryProperties (g_vulkan_device.api.p_vkGetPhysicalDeviceMemoryProperties)
+#define vkCreateDevice (g_vulkan_device.api.p_vkCreateDevice)
+#define vkDestroyDevice (g_vulkan_device.api.p_vkDestroyDevice)
+#define vkGetDeviceQueue (g_vulkan_device.api.p_vkGetDeviceQueue)
+#define vkCreateCommandPool (g_vulkan_device.api.p_vkCreateCommandPool)
+#define vkDestroyCommandPool (g_vulkan_device.api.p_vkDestroyCommandPool)
+#define vkAllocateCommandBuffers (g_vulkan_device.api.p_vkAllocateCommandBuffers)
+#define vkCreateBuffer (g_vulkan_device.api.p_vkCreateBuffer)
+#define vkDestroyBuffer (g_vulkan_device.api.p_vkDestroyBuffer)
+#define vkGetBufferMemoryRequirements (g_vulkan_device.api.p_vkGetBufferMemoryRequirements)
+#define vkAllocateMemory (g_vulkan_device.api.p_vkAllocateMemory)
+#define vkFreeMemory (g_vulkan_device.api.p_vkFreeMemory)
+#define vkBindBufferMemory (g_vulkan_device.api.p_vkBindBufferMemory)
+#define vkMapMemory (g_vulkan_device.api.p_vkMapMemory)
+#define vkUnmapMemory (g_vulkan_device.api.p_vkUnmapMemory)
+#define vkCreateShaderModule (g_vulkan_device.api.p_vkCreateShaderModule)
+#define vkDestroyShaderModule (g_vulkan_device.api.p_vkDestroyShaderModule)
+#define vkCreateDescriptorSetLayout (g_vulkan_device.api.p_vkCreateDescriptorSetLayout)
+#define vkDestroyDescriptorSetLayout (g_vulkan_device.api.p_vkDestroyDescriptorSetLayout)
+#define vkCreatePipelineLayout (g_vulkan_device.api.p_vkCreatePipelineLayout)
+#define vkDestroyPipelineLayout (g_vulkan_device.api.p_vkDestroyPipelineLayout)
+#define vkCreateComputePipelines (g_vulkan_device.api.p_vkCreateComputePipelines)
+#define vkDestroyPipeline (g_vulkan_device.api.p_vkDestroyPipeline)
+#define vkCreateDescriptorPool (g_vulkan_device.api.p_vkCreateDescriptorPool)
+#define vkDestroyDescriptorPool (g_vulkan_device.api.p_vkDestroyDescriptorPool)
+#define vkResetDescriptorPool (g_vulkan_device.api.p_vkResetDescriptorPool)
+#define vkAllocateDescriptorSets (g_vulkan_device.api.p_vkAllocateDescriptorSets)
+#define vkUpdateDescriptorSets (g_vulkan_device.api.p_vkUpdateDescriptorSets)
+#define vkBeginCommandBuffer (g_vulkan_device.api.p_vkBeginCommandBuffer)
+#define vkCmdBindPipeline (g_vulkan_device.api.p_vkCmdBindPipeline)
+#define vkCmdBindDescriptorSets (g_vulkan_device.api.p_vkCmdBindDescriptorSets)
+#define vkCmdPushConstants (g_vulkan_device.api.p_vkCmdPushConstants)
+#define vkCmdDispatch (g_vulkan_device.api.p_vkCmdDispatch)
+#define vkCmdPipelineBarrier (g_vulkan_device.api.p_vkCmdPipelineBarrier)
+#define vkEndCommandBuffer (g_vulkan_device.api.p_vkEndCommandBuffer)
+#define vkQueueSubmit (g_vulkan_device.api.p_vkQueueSubmit)
+#define vkQueueWaitIdle (g_vulkan_device.api.p_vkQueueWaitIdle)
+#define vkDeviceWaitIdle (g_vulkan_device.api.p_vkDeviceWaitIdle)
+#define vkCreateFence (g_vulkan_device.api.p_vkCreateFence)
+#define vkResetFences (g_vulkan_device.api.p_vkResetFences)
+#define vkWaitForFences (g_vulkan_device.api.p_vkWaitForFences)
+#define vkDestroyFence (g_vulkan_device.api.p_vkDestroyFence)
+
+#define instance (g_vulkan_device.instance_handle)
+#define physical_device (g_vulkan_device.physical_device_handle)
+#define device (g_vulkan_device.device_handle)
+#define compute_queue (g_vulkan_device.compute_queue_handle)
+#define queue_family_index (g_vulkan_device.queue_family_index)
+#define mem_props (g_vulkan_device.memory_properties)
+#define max_compute_workgroups (g_vulkan_device.max_workgroups)
+#define graph_alignment (g_vulkan_device.graph_alignment)
+#define vulkan_packed_dot (g_vulkan_device.packed_dot)
+#define vulkan_packed_dot_warned (g_vulkan_device.packed_dot_warned)
+#define desc_layout (g_vulkan_device.matmul_desc_layout)
+#define pipeline_layout (g_vulkan_device.matmul_pipeline_layout)
+#define matmul_pipeline (g_vulkan_device.matmul_pipeline)
+#define matmul_tiled_pipeline (g_vulkan_device.matmul_tiled_pipeline)
+#if VOLVOXAI_ENABLE_TRAINING
+#define training_max_storage_bindings (g_vulkan_device.training_max_storage_bindings)
+#define training_max_uniform_bindings (g_vulkan_device.training_max_uniform_bindings)
+#define training_max_workgroup_size_x (g_vulkan_device.training_max_workgroup_size_x)
+#define training_max_workgroup_invocations (g_vulkan_device.training_max_workgroup_invocations)
+#define training_max_storage_range (g_vulkan_device.training_max_storage_range)
+#define training_max_uniform_range (g_vulkan_device.training_max_uniform_range)
+#endif
+
+#define VX_VK_CONTEXT (*vk_context_current())
+#define io_buffer (VX_VK_CONTEXT.buffer)
+#define io_memory (VX_VK_CONTEXT.memory)
+#define io_mapped (VX_VK_CONTEXT.mapped)
+#define io_size (VX_VK_CONTEXT.arena_size)
+#define desc_pool (VX_VK_CONTEXT.graph_descriptor_pool)
+#define desc_set (VX_VK_CONTEXT.matmul_set)
+#define cmd_pool (VX_VK_CONTEXT.pool)
+#define cmd_buf (VX_VK_CONTEXT.command)
+#define compute_fence (VX_VK_CONTEXT.fence)
+#define graph_slots (VX_VK_CONTEXT.tensor_slots)
+#define graph_slot_count (VX_VK_CONTEXT.tensor_slot_count)
+#define graph_bump (VX_VK_CONTEXT.arena_bump)
+#define scratch_bump (VX_VK_CONTEXT.scratch_cursor)
+#define qconv_zero_bias_backings (VX_VK_CONTEXT.zero_bias_backings)
+#define graph_dispatch_sets (VX_VK_CONTEXT.dispatch_sets)
+#define graph_dispatch_set_count (VX_VK_CONTEXT.dispatch_set_count)
+#define graph_dispatch_set_cursor (VX_VK_CONTEXT.dispatch_set_cursor)
+#define graph_cmd_recording (VX_VK_CONTEXT.command_recording)
+#define graph_cmd_pending (VX_VK_CONTEXT.command_pending)
+#define wt_cache (VX_VK_CONTEXT.weight_cache)
+#define wt_cache_n (VX_VK_CONTEXT.weight_cache_count)
+#define wt_bump (VX_VK_CONTEXT.weight_bump)
+#if VOLVOXAI_ENABLE_TRAINING
+#define training_kernels (VX_VK_CONTEXT.training_kernel_slots)
+#define training_kernel_count (VX_VK_CONTEXT.training_kernel_slot_count)
+#define training_desc_pool (VX_VK_CONTEXT.training_pool)
+#define training_dispatch_sets (VX_VK_CONTEXT.training_sets)
+#define training_dispatch_set_count (VX_VK_CONTEXT.training_set_count)
+#define training_dispatch_set_cursor (VX_VK_CONTEXT.training_set_cursor)
+#define training_touched_slots (VX_VK_CONTEXT.training_touched)
+#define training_touched_count (VX_VK_CONTEXT.training_touched_count_value)
+#define training_active (VX_VK_CONTEXT.training_is_active)
+#endif
 
 static int vk_graph_flush_wait(void);
-static const char* vk_kernel_entry_point(const VkKernel* kernel);
-static VkDescriptorPool vk_kernel_descriptor_pool(const VkKernel* kernel);
-#if VOLVOXAI_ENABLE_TRAINING
-static void vk_training_release_host_state(void);
-static void vk_training_destroy_device_state(void);
-#endif
+static int vk_is_ready(void);
+static void vk_context_destroy(void* opaque);
+static const char* vk_kernel_entry_point(VkKernel* kernel);
 
 static uint32_t find_preferred_memory_type(uint32_t type_filter,
                                            VkMemoryPropertyFlags required,
@@ -326,6 +475,22 @@ static uint32_t find_preferred_memory_type(uint32_t type_filter,
         if (fallback == UINT32_MAX) fallback = i;
     }
     return fallback != UINT32_MAX ? fallback : 0;
+}
+
+// First memory type that has all `required` flags but none of `avoid`. Used to fall
+// back from a device-local host-visible type (a small PCIe BAR heap on discrete GPUs)
+// to plain host-visible system memory when the BAR is too small for io_size.
+static uint32_t find_memory_type_avoiding(uint32_t type_filter,
+                                          VkMemoryPropertyFlags required,
+                                          VkMemoryPropertyFlags avoid) {
+    for (uint32_t i = 0; i < mem_props.memoryTypeCount; i++) {
+        if (!(type_filter & (1u << i))) continue;
+        VkMemoryPropertyFlags flags = mem_props.memoryTypes[i].propertyFlags;
+        if ((flags & required) != required) continue;
+        if (flags & avoid) continue;
+        return i;
+    }
+    return UINT32_MAX;
 }
 
 
@@ -373,12 +538,13 @@ static int create_matmul_pipeline(const char* path, VkPipeline* output) {
     return result == VK_SUCCESS;
 }
 
-int vk_init() {
+static int vk_device_initialize_locked(void) {
     const char* names[] = { "libvulkan.so.1", "libvulkan.so", "vulkan-1.dll" };
     uint32_t instance_api_version = VK_API_VERSION_1_0;
 #if defined(VK_VERSION_1_3) && defined(VK_KHR_shader_integer_dot_product)
     VkPhysicalDeviceShaderIntegerDotProductFeatures dot_features = {0};
 #endif
+    if (g_vulkan_device.initialized) return 0;
     if (!vulkan_lib) {
         for (unsigned i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
             vulkan_lib = dlopen(names[i], RTLD_NOW | RTLD_LOCAL);
@@ -581,46 +747,8 @@ int vk_init() {
     if (vkCreateDevice(physical_device, &device_info, NULL, &device) != VK_SUCCESS) return -1;
     vkGetDeviceQueue(device, queue_family_index, 0, &compute_queue);
 
-    const char* mb_env = getenv("VOLVOX_VULKAN_MB");
-    if (mb_env && mb_env[0]) {
-        long mb = strtol(mb_env, NULL, 10);
-        if (mb >= 192 && mb <= 4096) io_size = (size_t)mb * 1024 * 1024;
-    }
-
-    // Create one mapped IO buffer. This is intentionally simple; a faster backend should
-    // split device-local tensors from a smaller staging buffer and add a liveness planner.
-    VkBufferCreateInfo buffer_info = {0};
-    buffer_info.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
-    buffer_info.size = io_size;
-    buffer_info.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
-    buffer_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
-    vkCreateBuffer(device, &buffer_info, NULL, &io_buffer);
-
-    VkMemoryRequirements mem_reqs;
-    vkGetBufferMemoryRequirements(device, io_buffer, &mem_reqs);
-    VkMemoryAllocateInfo alloc_info = {0};
-    alloc_info.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
-    alloc_info.allocationSize = mem_reqs.size;
-    alloc_info.memoryTypeIndex = find_preferred_memory_type(
-        mem_reqs.memoryTypeBits,
-        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
-        VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-    
-    if (vkAllocateMemory(device, &alloc_info, NULL, &io_memory) != VK_SUCCESS) {
-        printf("[VolvoxAI GPU] vkAllocateMemory failed.\n");
-        return -1;
-    }
-    vkBindBufferMemory(device, io_buffer, io_memory, 0);
-    if (vkMapMemory(device, io_memory, 0, io_size, 0, &io_mapped) != VK_SUCCESS) {
-        printf("[VolvoxAI GPU] vkMapMemory failed.\n");
-        return -1;
-    }
-    if (!io_mapped) {
-        printf("[VolvoxAI GPU] io_mapped is NULL after successful vkMapMemory!\n");
-        return -1;
-    }
-
-    // Setup Pipeline
+    /* Model-independent matmul pipelines are immutable after initialization
+     * and shared through the synchronized device state. */
     VkDescriptorSetLayoutBinding bindings[6];
     for(int i=0; i<6; i++) {
         bindings[i].binding = i;
@@ -646,145 +774,52 @@ int vk_init() {
     if (!create_matmul_pipeline("spv/linearF32.spv", &matmul_pipeline) ||
         !create_matmul_pipeline("spv/linearF32Tiled.spv", &matmul_tiled_pipeline)) return -1;
 
-    // Descriptor Pool
-    VkDescriptorPoolSize pool_sizes[2] = {0};
-    pool_sizes[0].type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-    pool_sizes[0].descriptorCount = 16384;
-    pool_sizes[1].type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
-    pool_sizes[1].descriptorCount = 4096;
-    VkDescriptorPoolCreateInfo pool_info = {0};
-    pool_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
-    pool_info.maxSets = VK_GRAPH_MAX_DISPATCH_SETS + 64;
-    pool_info.poolSizeCount = 2;
-    pool_info.pPoolSizes = pool_sizes;
-    vkCreateDescriptorPool(device, &pool_info, NULL, &desc_pool);
-
-    VkDescriptorSetAllocateInfo alloc_set_info = {0};
-    alloc_set_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
-    alloc_set_info.descriptorPool = desc_pool;
-    alloc_set_info.descriptorSetCount = 1;
-    alloc_set_info.pSetLayouts = &desc_layout;
-    vkAllocateDescriptorSets(device, &alloc_set_info, &desc_set);
-
-    // Descriptor update deferred to dispatch
-
-    VkCommandPoolCreateInfo cmd_pool_info = {0};
-    cmd_pool_info.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
-    cmd_pool_info.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
-    cmd_pool_info.queueFamilyIndex = queue_family_index;
-    vkCreateCommandPool(device, &cmd_pool_info, NULL, &cmd_pool);
-
-    VkCommandBufferAllocateInfo cmd_buf_info = {0};
-    cmd_buf_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
-    cmd_buf_info.commandPool = cmd_pool;
-    cmd_buf_info.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-    cmd_buf_info.commandBufferCount = 1;
-    vkAllocateCommandBuffers(device, &cmd_buf_info, &cmd_buf);
-
-    VkFenceCreateInfo fence_info = {0};
-    fence_info.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
-    vkCreateFence(device, &fence_info, NULL, &compute_fence);
-
+    g_vulkan_device.initialized = 1;
     printf("[VolvoxAI GPU] Vulkan Compute initialized successfully! Device: %s; packed INT8 dot: %s\n",
            best_props.deviceName, vulkan_packed_dot ? "enabled" : "unavailable");
     return 0;
 }
 
-static void vk_destroy_kernel(VkKernel* kernel) {
+static void vk_destroy_prepared_kernel_locked(VkPreparedKernel* kernel) {
     if (!kernel || device == VK_NULL_HANDLE) return;
-    if (kernel->pipeline != VK_NULL_HANDLE && vkDestroyPipeline) {
+    if (kernel->pipeline != VK_NULL_HANDLE && vkDestroyPipeline)
         vkDestroyPipeline(device, kernel->pipeline, NULL);
-    }
-    if (kernel->pipeline_layout != VK_NULL_HANDLE && vkDestroyPipelineLayout) {
-        vkDestroyPipelineLayout(device, kernel->pipeline_layout, NULL);
-    }
-    if (kernel->desc_layout != VK_NULL_HANDLE && vkDestroyDescriptorSetLayout) {
-        vkDestroyDescriptorSetLayout(device, kernel->desc_layout, NULL);
-    }
-    kernel->pipeline = VK_NULL_HANDLE;
-    kernel->pipeline_layout = VK_NULL_HANDLE;
-    kernel->desc_layout = VK_NULL_HANDLE;
-    kernel->desc_set = VK_NULL_HANDLE;
-    kernel->ready = 0;
+    if (kernel->prepared_pipeline_layout != VK_NULL_HANDLE && vkDestroyPipelineLayout)
+        vkDestroyPipelineLayout(device, kernel->prepared_pipeline_layout, NULL);
+    if (kernel->prepared_desc_layout != VK_NULL_HANDLE && vkDestroyDescriptorSetLayout)
+        vkDestroyDescriptorSetLayout(device, kernel->prepared_desc_layout, NULL);
+    memset(kernel, 0, sizeof(*kernel));
 }
 
-void vk_cleanup() {
-#if VOLVOXAI_ENABLE_TRAINING
-    vk_training_end();
-#endif
+static void vk_device_destroy_locked(void) {
     if (device != VK_NULL_HANDLE) {
         if (vkDeviceWaitIdle) (void)vkDeviceWaitIdle(device);
-#if VOLVOXAI_ENABLE_TRAINING
-        vk_training_destroy_device_state();
-#endif
-        for (size_t i = 0; i < sizeof(graph_kernels) / sizeof(graph_kernels[0]); i++) {
-            vk_destroy_kernel(graph_kernels[i]);
-        }
-        if (matmul_pipeline != VK_NULL_HANDLE && vkDestroyPipeline) {
+        if (matmul_pipeline != VK_NULL_HANDLE && vkDestroyPipeline)
             vkDestroyPipeline(device, matmul_pipeline, NULL);
-        }
-        if (matmul_tiled_pipeline != VK_NULL_HANDLE && vkDestroyPipeline) {
+        if (matmul_tiled_pipeline != VK_NULL_HANDLE && vkDestroyPipeline)
             vkDestroyPipeline(device, matmul_tiled_pipeline, NULL);
-        }
-        if (pipeline_layout != VK_NULL_HANDLE && vkDestroyPipelineLayout) {
+        if (pipeline_layout != VK_NULL_HANDLE && vkDestroyPipelineLayout)
             vkDestroyPipelineLayout(device, pipeline_layout, NULL);
-        }
-        if (desc_layout != VK_NULL_HANDLE && vkDestroyDescriptorSetLayout) {
+        if (desc_layout != VK_NULL_HANDLE && vkDestroyDescriptorSetLayout)
             vkDestroyDescriptorSetLayout(device, desc_layout, NULL);
-        }
-        if (desc_pool != VK_NULL_HANDLE && vkDestroyDescriptorPool) {
-            vkDestroyDescriptorPool(device, desc_pool, NULL);
-        }
-        if (compute_fence != VK_NULL_HANDLE && vkDestroyFence) {
-            vkDestroyFence(device, compute_fence, NULL);
-        }
-        if (cmd_pool != VK_NULL_HANDLE && vkDestroyCommandPool) {
-            vkDestroyCommandPool(device, cmd_pool, NULL);
-        }
-        if (io_mapped && vkUnmapMemory) vkUnmapMemory(device, io_memory);
-        io_mapped = NULL;
-        if (io_buffer != VK_NULL_HANDLE && vkDestroyBuffer) {
-            vkDestroyBuffer(device, io_buffer, NULL);
-        }
-        if (io_memory != VK_NULL_HANDLE && vkFreeMemory) {
-            vkFreeMemory(device, io_memory, NULL);
-        }
         if (vkDestroyDevice) vkDestroyDevice(device, NULL);
-        device = VK_NULL_HANDLE;
     }
-    if (instance != VK_NULL_HANDLE) {
-        if (vkDestroyInstance) vkDestroyInstance(instance, NULL);
-        instance = VK_NULL_HANDLE;
-    }
-    /* Keep the loader resident for the process lifetime. GPU drivers may own
-       worker-thread/TLS destructors inside the loader; devices, allocations,
-       pipelines and command resources are still destroyed above. */
-    io_buffer = VK_NULL_HANDLE;
-    io_memory = VK_NULL_HANDLE;
+    if (instance != VK_NULL_HANDLE && vkDestroyInstance)
+        vkDestroyInstance(instance, NULL);
+    instance = VK_NULL_HANDLE;
     physical_device = VK_NULL_HANDLE;
+    device = VK_NULL_HANDLE;
     compute_queue = VK_NULL_HANDLE;
-    compute_fence = VK_NULL_HANDLE;
+    queue_family_index = 0;
+    memset(&mem_props, 0, sizeof(mem_props));
+    memset(max_compute_workgroups, 0, sizeof(g_vulkan_device.max_workgroups));
+    graph_alignment = VK_GRAPH_ALIGN;
+    vulkan_packed_dot = 0;
+    vulkan_packed_dot_warned = 0;
     desc_layout = VK_NULL_HANDLE;
     pipeline_layout = VK_NULL_HANDLE;
     matmul_pipeline = VK_NULL_HANDLE;
     matmul_tiled_pipeline = VK_NULL_HANDLE;
-    desc_pool = VK_NULL_HANDLE;
-    desc_set = VK_NULL_HANDLE;
-    cmd_pool = VK_NULL_HANDLE;
-    cmd_buf = VK_NULL_HANDLE;
-    graph_slot_count = 0;
-    graph_bump = VK_GRAPH_BASE;
-    scratch_bump = 0;
-    graph_dispatch_set_count = 0;
-    graph_dispatch_set_cursor = 0;
-    graph_cmd_recording = 0;
-    graph_cmd_pending = 0;
-    graph_alignment = VK_GRAPH_ALIGN;
-    max_compute_workgroups[0] = 0;
-    max_compute_workgroups[1] = 0;
-    max_compute_workgroups[2] = 0;
-    vulkan_packed_dot = 0;
-    vulkan_packed_dot_warned = 0;
 #if VOLVOXAI_ENABLE_TRAINING
     training_max_storage_bindings = 0;
     training_max_uniform_bindings = 0;
@@ -793,17 +828,258 @@ void vk_cleanup() {
     training_max_storage_range = 0;
     training_max_uniform_range = 0;
 #endif
-    memset(graph_slots, 0, sizeof(graph_slots));
-    memset(graph_dispatch_sets, 0, sizeof(graph_dispatch_sets));
-    qconv_zero_bias_release();
-    vk_free_weight_cache();
+    g_vulkan_device.initialized = 0;
+}
+
+static VulkanContextState* vk_context_allocate(VxEngineState* owner) {
+    VulkanContextState* context;
+    if (!owner) return NULL;
+    if (owner->vulkan_context_state)
+        return (VulkanContextState*)owner->vulkan_context_state;
+    context = (VulkanContextState*)calloc(1, sizeof(*context));
+    if (!context) return NULL;
+    context->tensor_slots = (VkTensorSlot*)calloc(
+        VK_GRAPH_MAX_TENSORS, sizeof(*context->tensor_slots));
+    context->dispatch_sets = (VkGraphDispatchSet*)calloc(
+        VK_GRAPH_MAX_DISPATCH_SETS, sizeof(*context->dispatch_sets));
+    if (!context->tensor_slots || !context->dispatch_sets) {
+        free(context->dispatch_sets);
+        free(context->tensor_slots);
+        free(context);
+        return NULL;
+    }
+    context->arena_size = (size_t)512 * 1024 * 1024;
+    context->arena_bump = VK_GRAPH_BASE;
+    owner->vulkan_context_state = context;
+    return context;
+}
+
+#if defined(VOLVOXAI_VULKAN_TESTING)
+int vk_test_context_state_write(const VkContextStateProbe* probe) {
+    VxEngineState* owner = vx_engine_state_current();
+    VulkanContextState* context;
+    if (!owner || !probe || probe->slot_count < 0 ||
+        probe->slot_count > VK_GRAPH_MAX_TENSORS ||
+        probe->dispatch_cursor < 0 ||
+        probe->dispatch_cursor > VK_GRAPH_MAX_DISPATCH_SETS ||
+        probe->touched_count < 0 ||
+        probe->touched_count > VK_GRAPH_MAX_TENSORS) return -1;
+    context = vk_context_allocate(owner);
+    if (!context) return -1;
+    owner->vulkan_context_state_destroy = vk_context_destroy;
+    context->tensor_slot_count = probe->slot_count;
+    context->arena_bump = probe->arena_cursor;
+    context->dispatch_set_cursor = probe->dispatch_cursor;
 #if VOLVOXAI_ENABLE_TRAINING
-    vk_training_release_host_state();
+    context->training_touched_count_value = probe->touched_count;
+    context->training_is_active = probe->is_training ? 1 : 0;
+#else
+    if (probe->touched_count != 0 || probe->is_training) return -1;
 #endif
+    return 0;
+}
+
+int vk_test_context_state_read(VkContextStateProbe* probe) {
+    VulkanContextState* context = vk_context_current();
+    if (!context || !probe) return -1;
+    probe->slot_count = context->tensor_slot_count;
+    probe->arena_cursor = context->arena_bump;
+    probe->dispatch_cursor = context->dispatch_set_cursor;
+#if VOLVOXAI_ENABLE_TRAINING
+    probe->touched_count = context->training_touched_count_value;
+    probe->is_training = context->training_is_active;
+#else
+    probe->touched_count = 0;
+    probe->is_training = 0;
+#endif
+    return 0;
+}
+#endif
+
+static int vk_context_create_resources_locked(VulkanContextState* context) {
+    VkBufferCreateInfo buffer_info = {0};
+    VkMemoryRequirements memory_requirements;
+    VkMemoryAllocateInfo allocation_info = {0};
+    VkResult allocation_result;
+    VkDescriptorPoolSize pool_sizes[2] = {0};
+    VkDescriptorPoolCreateInfo pool_info = {0};
+    VkDescriptorSetAllocateInfo set_info = {0};
+    VkCommandPoolCreateInfo command_pool_info = {0};
+    VkCommandBufferAllocateInfo command_buffer_info = {0};
+    VkFenceCreateInfo fence_info = {0};
+    const VkMemoryPropertyFlags host_requirements =
+        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+    const char* mb_env;
+    uint32_t primary_type;
+    if (!context || !g_vulkan_device.initialized) return -1;
+
+    mb_env = getenv("VOLVOX_VULKAN_MB");
+    if (mb_env && mb_env[0]) {
+        long mb = strtol(mb_env, NULL, 10);
+        if (mb >= 192 && mb <= 4096)
+            context->arena_size = (size_t)mb * 1024 * 1024;
+    }
+    buffer_info.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+    buffer_info.size = context->arena_size;
+    buffer_info.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+    buffer_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    if (vkCreateBuffer(device, &buffer_info, NULL, &context->buffer) != VK_SUCCESS)
+        return -1;
+    vkGetBufferMemoryRequirements(device, context->buffer, &memory_requirements);
+    allocation_info.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+    allocation_info.allocationSize = memory_requirements.size;
+    primary_type = find_preferred_memory_type(
+        memory_requirements.memoryTypeBits, host_requirements,
+        VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    allocation_info.memoryTypeIndex = primary_type;
+    allocation_result = vkAllocateMemory(
+        device, &allocation_info, NULL, &context->memory);
+    if (allocation_result != VK_SUCCESS) {
+        uint32_t fallback_type = find_memory_type_avoiding(
+            memory_requirements.memoryTypeBits, host_requirements,
+            VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+        if (fallback_type != UINT32_MAX && fallback_type != primary_type) {
+            allocation_info.memoryTypeIndex = fallback_type;
+            allocation_result = vkAllocateMemory(
+                device, &allocation_info, NULL, &context->memory);
+        }
+    }
+    if (allocation_result != VK_SUCCESS) return -1;
+    if (vkBindBufferMemory(device, context->buffer,
+                           context->memory, 0) != VK_SUCCESS) return -1;
+    if (vkMapMemory(device, context->memory, 0, context->arena_size, 0,
+                    &context->mapped) != VK_SUCCESS || !context->mapped) return -1;
+
+    pool_sizes[0].type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    pool_sizes[0].descriptorCount = 16384;
+    pool_sizes[1].type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+    pool_sizes[1].descriptorCount = 4096;
+    pool_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+    pool_info.maxSets = VK_GRAPH_MAX_DISPATCH_SETS + 64;
+    pool_info.poolSizeCount = 2;
+    pool_info.pPoolSizes = pool_sizes;
+    if (vkCreateDescriptorPool(device, &pool_info, NULL,
+                               &context->graph_descriptor_pool) != VK_SUCCESS) return -1;
+    set_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+    set_info.descriptorPool = context->graph_descriptor_pool;
+    set_info.descriptorSetCount = 1;
+    set_info.pSetLayouts = &desc_layout;
+    if (vkAllocateDescriptorSets(device, &set_info,
+                                 &context->matmul_set) != VK_SUCCESS) return -1;
+
+    command_pool_info.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
+    command_pool_info.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
+    command_pool_info.queueFamilyIndex = queue_family_index;
+    if (vkCreateCommandPool(device, &command_pool_info, NULL,
+                            &context->pool) != VK_SUCCESS) return -1;
+    command_buffer_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+    command_buffer_info.commandPool = context->pool;
+    command_buffer_info.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+    command_buffer_info.commandBufferCount = 1;
+    if (vkAllocateCommandBuffers(device, &command_buffer_info,
+                                 &context->command) != VK_SUCCESS) return -1;
+    fence_info.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
+    if (vkCreateFence(device, &fence_info, NULL,
+                      &context->fence) != VK_SUCCESS) return -1;
+    return 0;
+}
+
+static void vk_context_destroy(void* opaque) {
+    VulkanContextState* context = (VulkanContextState*)opaque;
+    if (!context) return;
+    if (context->device_acquired) {
+        pthread_mutex_lock(&g_vulkan_device.mutex);
+        if (device != VK_NULL_HANDLE) {
+            if (context->command_pending && vkWaitForFences)
+                (void)vkWaitForFences(device, 1, &context->fence,
+                                      VK_TRUE, UINT64_MAX);
+            for (int i = 0; i < context->prepared_kernel_count; i++)
+                vk_destroy_prepared_kernel_locked(&context->prepared_kernels[i]);
+#if VOLVOXAI_ENABLE_TRAINING
+            if (context->training_pool != VK_NULL_HANDLE &&
+                vkDestroyDescriptorPool)
+                vkDestroyDescriptorPool(device, context->training_pool, NULL);
+#endif
+            if (context->graph_descriptor_pool != VK_NULL_HANDLE && vkDestroyDescriptorPool)
+                vkDestroyDescriptorPool(device, context->graph_descriptor_pool, NULL);
+            if (context->fence != VK_NULL_HANDLE && vkDestroyFence)
+                vkDestroyFence(device, context->fence, NULL);
+            if (context->pool != VK_NULL_HANDLE && vkDestroyCommandPool)
+                vkDestroyCommandPool(device, context->pool, NULL);
+            if (context->mapped && vkUnmapMemory)
+                vkUnmapMemory(device, context->memory);
+            if (context->buffer != VK_NULL_HANDLE && vkDestroyBuffer)
+                vkDestroyBuffer(device, context->buffer, NULL);
+            if (context->memory != VK_NULL_HANDLE && vkFreeMemory)
+                vkFreeMemory(device, context->memory, NULL);
+        }
+        context->device_acquired = 0;
+        if (g_vulkan_device.context_count > 0)
+            g_vulkan_device.context_count--;
+        if (g_vulkan_device.context_count == 0)
+            vk_device_destroy_locked();
+        pthread_mutex_unlock(&g_vulkan_device.mutex);
+    }
+    while (context->zero_bias_backings) {
+        QConvZeroBiasBacking* block = context->zero_bias_backings;
+        context->zero_bias_backings = block->next;
+        free(block->values);
+        free(block);
+    }
+#if VOLVOXAI_ENABLE_TRAINING
+    free(context->training_kernel_slots);
+    free(context->training_sets);
+    free(context->training_touched);
+#endif
+    free(context->dispatch_sets);
+    free(context->tensor_slots);
+    free(context);
+}
+
+int vk_init(void) {
+    VxEngineState* owner = vx_engine_state_current();
+    VulkanContextState* context;
+    if (!owner) return -1;
+    context = vk_context_allocate(owner);
+    if (!context) return -1;
+    owner->vulkan_context_state_destroy = vk_context_destroy;
+    if (context->device_acquired) return vk_is_ready() ? 0 : -1;
+
+    pthread_mutex_lock(&g_vulkan_device.mutex);
+    if (vk_device_initialize_locked() != 0) {
+        vk_device_destroy_locked();
+        pthread_mutex_unlock(&g_vulkan_device.mutex);
+        return -1;
+    }
+    context->device_acquired = 1;
+    g_vulkan_device.context_count++;
+    if (vk_context_create_resources_locked(context) != 0) {
+        pthread_mutex_unlock(&g_vulkan_device.mutex);
+        vk_cleanup();
+        return -1;
+    }
+    pthread_mutex_unlock(&g_vulkan_device.mutex);
+    return 0;
+}
+
+void vk_cleanup(void) {
+    VxEngineState* owner = vx_engine_state_current();
+    VulkanContextState* context;
+    if (!owner || !owner->vulkan_context_state) return;
+#if VOLVOXAI_ENABLE_TRAINING
+    vk_training_end();
+#endif
+    context = (VulkanContextState*)owner->vulkan_context_state;
+    owner->vulkan_context_state = NULL;
+    owner->vulkan_context_state_destroy = NULL;
+    vk_context_destroy(context);
 }
 
 static int vk_is_ready(void) {
-    return device != VK_NULL_HANDLE && io_buffer != VK_NULL_HANDLE && io_mapped != NULL;
+    VulkanContextState* context = vk_context_current();
+    return context && context->device_acquired &&
+        device != VK_NULL_HANDLE && context->buffer != VK_NULL_HANDLE &&
+        context->mapped != NULL;
 }
 
 static int graph_find_slot(const void* host) {
@@ -921,6 +1197,7 @@ static size_t graph_scratch_upload(const void* data, size_t bytes) {
 }
 
 void vk_graph_reset(void) {
+    if (!vk_context_current()) return;
     vk_graph_flush_wait();
     graph_slot_count = 0;
     graph_bump = VK_GRAPH_BASE;
@@ -929,12 +1206,14 @@ void vk_graph_reset(void) {
 }
 
 void vk_graph_begin_forward(void) {
+    if (!vk_context_current()) return;
     vk_graph_flush_wait();
     scratch_bump = 0;
     graph_dispatch_set_cursor = 0;
 }
 
 int vk_graph_end_forward(void) {
+    if (!vk_context_current()) return -1;
     return vk_graph_flush_wait() ? 0 : -1;
 }
 
@@ -965,10 +1244,20 @@ int vk_graph_sync_host(const void* host, size_t bytes, int is_weight) {
     return 1;
 }
 
-static int vk_prepare_kernel(VkKernel* k) {
-    if (!vk_is_ready() || !k) return 0;
-    if (k->ready) return 1;
+static VkPreparedKernel* vk_prepare_kernel(VkKernel* k) {
+    VulkanContextState* context = vk_context_current();
+    VkPreparedKernel prepared = {0};
+    if (!vk_is_ready() || !k || !context) return NULL;
+    for (int i = 0; i < context->prepared_kernel_count; i++) {
+        if (context->prepared_kernels[i].definition == k &&
+            context->prepared_kernels[i].ready)
+            return &context->prepared_kernels[i];
+    }
+    if (context->prepared_kernel_count >= VK_PREPARED_KERNEL_MAX) return NULL;
     if (k->binding_count <= 0 || k->binding_count > 16) return 0;
+
+    pthread_mutex_lock(&g_vulkan_device.mutex);
+    prepared.definition = k;
 
     VkDescriptorSetLayoutBinding bindings[16];
     memset(bindings, 0, sizeof(bindings));
@@ -982,17 +1271,19 @@ static int vk_prepare_kernel(VkKernel* k) {
     layout_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
     layout_info.bindingCount = (uint32_t)k->binding_count;
     layout_info.pBindings = bindings;
-    if (vkCreateDescriptorSetLayout(device, &layout_info, NULL, &k->desc_layout) != VK_SUCCESS) return 0;
+    if (vkCreateDescriptorSetLayout(device, &layout_info, NULL,
+                                    &prepared.prepared_desc_layout) != VK_SUCCESS) goto fail;
 
     VkPipelineLayoutCreateInfo pl_info = {0};
     pl_info.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
     pl_info.setLayoutCount = 1;
-    pl_info.pSetLayouts = &k->desc_layout;
-    if (vkCreatePipelineLayout(device, &pl_info, NULL, &k->pipeline_layout) != VK_SUCCESS) return 0;
+    pl_info.pSetLayouts = &prepared.prepared_desc_layout;
+    if (vkCreatePipelineLayout(device, &pl_info, NULL,
+                               &prepared.prepared_pipeline_layout) != VK_SUCCESS) goto fail;
 
     size_t spv_size = 0;
     uint32_t* spv = load_spv(k->path, &spv_size);
-    if (!spv) return 0;
+    if (!spv) goto fail;
     VkShaderModuleCreateInfo shader_info = {0};
     shader_info.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
     shader_info.codeSize = spv_size;
@@ -1000,7 +1291,7 @@ static int vk_prepare_kernel(VkKernel* k) {
     VkShaderModule shader_module = VK_NULL_HANDLE;
     VkResult sm_res = vkCreateShaderModule(device, &shader_info, NULL, &shader_module);
     free(spv);
-    if (sm_res != VK_SUCCESS) return 0;
+    if (sm_res != VK_SUCCESS) goto fail;
 
     VkComputePipelineCreateInfo pipe_info = {0};
     pipe_info.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
@@ -1008,21 +1299,21 @@ static int vk_prepare_kernel(VkKernel* k) {
     pipe_info.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
     pipe_info.stage.module = shader_module;
     pipe_info.stage.pName = vk_kernel_entry_point(k);
-    pipe_info.layout = k->pipeline_layout;
+    pipe_info.layout = prepared.prepared_pipeline_layout;
     VkResult pipeline_result = vkCreateComputePipelines(
-        device, VK_NULL_HANDLE, 1, &pipe_info, NULL, &k->pipeline);
+        device, VK_NULL_HANDLE, 1, &pipe_info, NULL, &prepared.pipeline);
     if (vkDestroyShaderModule) vkDestroyShaderModule(device, shader_module, NULL);
-    if (pipeline_result != VK_SUCCESS) return 0;
+    if (pipeline_result != VK_SUCCESS) goto fail;
 
-    VkDescriptorSetAllocateInfo set_info = {0};
-    set_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
-    set_info.descriptorPool = vk_kernel_descriptor_pool(k);
-    set_info.descriptorSetCount = 1;
-    set_info.pSetLayouts = &k->desc_layout;
-    if (vkAllocateDescriptorSets(device, &set_info, &k->desc_set) != VK_SUCCESS) return 0;
+    prepared.ready = 1;
+    context->prepared_kernels[context->prepared_kernel_count] = prepared;
+    pthread_mutex_unlock(&g_vulkan_device.mutex);
+    return &context->prepared_kernels[context->prepared_kernel_count++];
 
-    k->ready = 1;
-    return 1;
+fail:
+    vk_destroy_prepared_kernel_locked(&prepared);
+    pthread_mutex_unlock(&g_vulkan_device.mutex);
+    return NULL;
 }
 
 typedef struct {
@@ -1030,22 +1321,23 @@ typedef struct {
     size_t bytes;
 } VkGraphBinding;
 
-static VkDescriptorSet vk_graph_dispatch_set(VkKernel* k) {
-    if (!k || !k->desc_layout) return VK_NULL_HANDLE;
+static VkDescriptorSet vk_graph_dispatch_set(VkKernel* k,
+                                             const VkPreparedKernel* prepared) {
+    if (!k || !prepared || !prepared->prepared_desc_layout) return VK_NULL_HANDLE;
     if (graph_dispatch_set_cursor >= VK_GRAPH_MAX_DISPATCH_SETS) return VK_NULL_HANDLE;
     int idx = graph_dispatch_set_cursor++;
     VkGraphDispatchSet* s = &graph_dispatch_sets[idx];
-    if (s->desc_set != VK_NULL_HANDLE && s->kernel == k) return s->desc_set;
+    if (s->descriptor_set != VK_NULL_HANDLE && s->kernel == k) return s->descriptor_set;
 
     VkDescriptorSetAllocateInfo set_info = {0};
     set_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
     set_info.descriptorPool = desc_pool;
     set_info.descriptorSetCount = 1;
-    set_info.pSetLayouts = &k->desc_layout;
-    if (vkAllocateDescriptorSets(device, &set_info, &s->desc_set) != VK_SUCCESS) return VK_NULL_HANDLE;
+    set_info.pSetLayouts = &prepared->prepared_desc_layout;
+    if (vkAllocateDescriptorSets(device, &set_info, &s->descriptor_set) != VK_SUCCESS) return VK_NULL_HANDLE;
     s->kernel = k;
     if (idx >= graph_dispatch_set_count) graph_dispatch_set_count = idx + 1;
-    return s->desc_set;
+    return s->descriptor_set;
 }
 
 static int vk_graph_begin_recording(void) {
@@ -1069,8 +1361,13 @@ static int vk_graph_submit_recording(void) {
     submit_info.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
     submit_info.commandBufferCount = 1;
     submit_info.pCommandBuffers = &cmd_buf;
-    vkResetFences(device, 1, &compute_fence);
-    if (vkQueueSubmit(compute_queue, 1, &submit_info, compute_fence) != VK_SUCCESS) {
+    pthread_mutex_lock(&g_vulkan_device.mutex);
+    VkResult reset_result = vkResetFences(device, 1, &compute_fence);
+    VkResult submit_result = reset_result == VK_SUCCESS
+        ? vkQueueSubmit(compute_queue, 1, &submit_info, compute_fence)
+        : reset_result;
+    pthread_mutex_unlock(&g_vulkan_device.mutex);
+    if (submit_result != VK_SUCCESS) {
         graph_cmd_recording = 0;
         return 0;
     }
@@ -1098,9 +1395,12 @@ static int vk_dispatch_dimensions_valid(uint32_t gx, uint32_t gy, uint32_t gz) {
 
 static int vk_dispatch_kernel(VkKernel* k, const VkGraphBinding* binds,
                               uint32_t gx, uint32_t gy, uint32_t gz) {
-    if (!vk_dispatch_dimensions_valid(gx, gy, gz) || !vk_prepare_kernel(k)) return 0;
+    VkPreparedKernel* prepared;
+    if (!vk_dispatch_dimensions_valid(gx, gy, gz)) return 0;
+    prepared = vk_prepare_kernel(k);
+    if (!prepared) return 0;
     if (!binds || k->binding_count <= 0 || k->binding_count > 16) return 0;
-    VkDescriptorSet dispatch_set = vk_graph_dispatch_set(k);
+    VkDescriptorSet dispatch_set = vk_graph_dispatch_set(k, prepared);
     if (dispatch_set == VK_NULL_HANDLE) return 0;
 
     VkDescriptorBufferInfo infos[16];
@@ -1121,8 +1421,11 @@ static int vk_dispatch_kernel(VkKernel* k, const VkGraphBinding* binds,
     vkUpdateDescriptorSets(device, (uint32_t)k->binding_count, writes, 0, NULL);
 
     if (!vk_graph_begin_recording()) return 0;
-    vkCmdBindPipeline(cmd_buf, VK_PIPELINE_BIND_POINT_COMPUTE, k->pipeline);
-    vkCmdBindDescriptorSets(cmd_buf, VK_PIPELINE_BIND_POINT_COMPUTE, k->pipeline_layout, 0, 1, &dispatch_set, 0, NULL);
+    vkCmdBindPipeline(cmd_buf, VK_PIPELINE_BIND_POINT_COMPUTE,
+                      prepared->pipeline);
+    vkCmdBindDescriptorSets(cmd_buf, VK_PIPELINE_BIND_POINT_COMPUTE,
+                            prepared->prepared_pipeline_layout, 0, 1,
+                            &dispatch_set, 0, NULL);
     vkCmdDispatch(cmd_buf, gx, gy, gz);
     if (vkCmdPipelineBarrier) {
         VkMemoryBarrier barrier = {0};
@@ -1211,50 +1514,14 @@ static const VkTrainingSpec training_specs[] = {
 #define VK_TRAINING_MAX_KERNELS 48
 #define VK_TRAINING_MAX_DISPATCH_SETS 4096
 
-typedef struct {
+struct VkTrainingKernelSlot {
     const VkTrainingSpec* spec;
     char path[160];
-    VkKernel kernel;
-} VkTrainingKernelSlot;
-
-static VkTrainingKernelSlot* training_kernels = NULL;
-static int training_kernel_count = 0;
-static VkDescriptorPool training_desc_pool = VK_NULL_HANDLE;
-static VkGraphDispatchSet* training_dispatch_sets = NULL;
-static int training_dispatch_set_count = 0;
-static int training_dispatch_set_cursor = 0;
-static VkTensorSlot** training_touched_slots = NULL;
-static int training_touched_count = 0;
-static int training_active = 0;
-
-static void vk_training_destroy_device_state(void) {
-    if (device == VK_NULL_HANDLE) return;
-    for (int i = 0; i < training_kernel_count; i++) {
-        vk_destroy_kernel(&training_kernels[i].kernel);
-    }
-    if (training_desc_pool != VK_NULL_HANDLE && vkDestroyDescriptorPool) {
-        vkDestroyDescriptorPool(device, training_desc_pool, NULL);
-    }
-    training_desc_pool = VK_NULL_HANDLE;
-}
-
-static void vk_training_release_host_state(void) {
-    free(training_kernels);
-    free(training_dispatch_sets);
-    free(training_touched_slots);
-    training_kernels = NULL;
-    training_dispatch_sets = NULL;
-    training_touched_slots = NULL;
-    training_kernel_count = 0;
-    training_dispatch_set_count = 0;
-    training_dispatch_set_cursor = 0;
-    training_touched_count = 0;
-    training_desc_pool = VK_NULL_HANDLE;
-    training_active = 0;
-}
+    VkKernelDefinition kernel;
+};
 #endif
 
-static const char* vk_kernel_entry_point(const VkKernel* kernel) {
+static const char* vk_kernel_entry_point(VkKernel* kernel) {
 #if VOLVOXAI_ENABLE_TRAINING
     for (int i = 0; i < training_kernel_count; i++) {
         if (&training_kernels[i].kernel == kernel && training_kernels[i].spec) {
@@ -1265,17 +1532,6 @@ static const char* vk_kernel_entry_point(const VkKernel* kernel) {
     (void)kernel;
 #endif
     return "main";
-}
-
-static VkDescriptorPool vk_kernel_descriptor_pool(const VkKernel* kernel) {
-#if VOLVOXAI_ENABLE_TRAINING
-    for (int i = 0; i < training_kernel_count; i++) {
-        if (&training_kernels[i].kernel == kernel) return training_desc_pool;
-    }
-#else
-    (void)kernel;
-#endif
-    return desc_pool;
 }
 
 #if VOLVOXAI_ENABLE_TRAINING
@@ -1328,7 +1584,11 @@ static int vk_training_prepare_pool(void) {
     info.maxSets = VK_TRAINING_MAX_DISPATCH_SETS + VK_TRAINING_MAX_KERNELS;
     info.poolSizeCount = 2;
     info.pPoolSizes = sizes;
-    if (vkCreateDescriptorPool(device, &info, NULL, &training_desc_pool) != VK_SUCCESS) {
+    pthread_mutex_lock(&g_vulkan_device.mutex);
+    VkResult pool_result = vkCreateDescriptorPool(
+        device, &info, NULL, &training_desc_pool);
+    pthread_mutex_unlock(&g_vulkan_device.mutex);
+    if (pool_result != VK_SUCCESS) {
         free(kernels);
         free(sets);
         free(touched);
@@ -1363,36 +1623,40 @@ static VkKernel* vk_training_kernel(const VkTrainingSpec* spec) {
     return &slot->kernel;
 }
 
-static VkDescriptorSet vk_training_dispatch_set(VkKernel* kernel) {
-    if (!kernel || kernel->desc_layout == VK_NULL_HANDLE ||
+static VkDescriptorSet vk_training_dispatch_set(
+        VkKernel* kernel, const VkPreparedKernel* prepared) {
+    if (!kernel || !prepared || prepared->prepared_desc_layout == VK_NULL_HANDLE ||
         training_dispatch_set_cursor >= VK_TRAINING_MAX_DISPATCH_SETS) {
         return VK_NULL_HANDLE;
     }
     int index = training_dispatch_set_cursor++;
     VkGraphDispatchSet* slot = &training_dispatch_sets[index];
-    if (slot->desc_set != VK_NULL_HANDLE && slot->kernel == kernel) return slot->desc_set;
+    if (slot->descriptor_set != VK_NULL_HANDLE && slot->kernel == kernel) return slot->descriptor_set;
 
     VkDescriptorSetAllocateInfo info = {0};
     info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
     info.descriptorPool = training_desc_pool;
     info.descriptorSetCount = 1;
-    info.pSetLayouts = &kernel->desc_layout;
-    if (vkAllocateDescriptorSets(device, &info, &slot->desc_set) != VK_SUCCESS) {
-        slot->desc_set = VK_NULL_HANDLE;
+    info.pSetLayouts = &prepared->prepared_desc_layout;
+    if (vkAllocateDescriptorSets(device, &info, &slot->descriptor_set) != VK_SUCCESS) {
+        slot->descriptor_set = VK_NULL_HANDLE;
         slot->kernel = NULL;
         return VK_NULL_HANDLE;
     }
     slot->kernel = kernel;
     if (index >= training_dispatch_set_count) training_dispatch_set_count = index + 1;
-    return slot->desc_set;
+    return slot->descriptor_set;
 }
 
 static int vk_training_dispatch_kernel(VkKernel* kernel,
                                        const VkGraphBinding* bindings,
                                        uint32_t gx, uint32_t gy, uint32_t gz) {
-    if (!vk_dispatch_dimensions_valid(gx, gy, gz) || !vk_prepare_kernel(kernel) ||
-        !bindings || kernel->binding_count > 16) return 0;
-    VkDescriptorSet set = vk_training_dispatch_set(kernel);
+    VkPreparedKernel* prepared;
+    if (!vk_dispatch_dimensions_valid(gx, gy, gz) || !bindings ||
+        kernel->binding_count > 16) return 0;
+    prepared = vk_prepare_kernel(kernel);
+    if (!prepared) return 0;
+    VkDescriptorSet set = vk_training_dispatch_set(kernel, prepared);
     if (set == VK_NULL_HANDLE) return 0;
 
     VkDescriptorBufferInfo infos[16];
@@ -1414,9 +1678,10 @@ static int vk_training_dispatch_kernel(VkKernel* kernel,
     vkUpdateDescriptorSets(device, (uint32_t)kernel->binding_count, writes, 0, NULL);
 
     if (!vk_graph_begin_recording()) return 0;
-    vkCmdBindPipeline(cmd_buf, VK_PIPELINE_BIND_POINT_COMPUTE, kernel->pipeline);
+    vkCmdBindPipeline(cmd_buf, VK_PIPELINE_BIND_POINT_COMPUTE,
+                      prepared->pipeline);
     vkCmdBindDescriptorSets(cmd_buf, VK_PIPELINE_BIND_POINT_COMPUTE,
-                            kernel->pipeline_layout, 0, 1, &set, 0, NULL);
+                            prepared->prepared_pipeline_layout, 0, 1, &set, 0, NULL);
     vkCmdDispatch(cmd_buf, gx, gy, gz);
     if (vkCmdPipelineBarrier) {
         VkMemoryBarrier barrier = {0};
@@ -1674,6 +1939,104 @@ int vk_graph_clip_f32(const float* in, float* out, long n, float min_v, float ma
     return 1;
 }
 
+static int vk_graph_typed_control_32(
+        const void* a, size_t a_bytes, const void* b, size_t b_bytes,
+        void* output, size_t output_bytes,
+        const VxTypedControlMetadata* metadata) {
+    graph_scratch_begin();
+    VkTensorSlot* a_slot = graph_ensure_device(a, a_bytes, 0);
+    VkTensorSlot* b_slot = graph_ensure_device(b, b_bytes, 0);
+    VkTensorSlot* output_slot = graph_output_slot(output, output_bytes);
+    if (!a_slot || !b_slot || !output_slot || !metadata) return 0;
+    size_t metadata_offset =
+        graph_scratch_upload(metadata, sizeof(*metadata));
+    if (metadata_offset == SIZE_MAX) return 0;
+    VkGraphBinding bindings[4] = {
+        {a_slot->offset, a_bytes},
+        {b_slot->offset, b_bytes},
+        {output_slot->offset, output_bytes},
+        {metadata_offset, sizeof(*metadata)},
+    };
+    uint32_t elements = metadata->values[0];
+    if (!vk_dispatch_kernel(
+            &k_typed_control_32, bindings,
+            (elements + 63u) / 64u, 1u, 1u))
+        return 0;
+    graph_mark_device(output_slot);
+    return 1;
+}
+
+int vk_graph_compare_i32(
+        const int32_t* a, long a_elements,
+        const int32_t* b, long b_elements,
+        int32_t* output, long output_elements,
+        const uint32_t* output_strides,
+        const uint32_t* a_strides,
+        const uint32_t* b_strides,
+        int rank, int operation) {
+    VxTypedControlMetadata metadata;
+    size_t a_bytes;
+    size_t b_bytes;
+    size_t output_bytes;
+    if (!vx_typed_control_compare_plan(
+            a, a_elements, b, b_elements, output, output_elements,
+            output_strides, a_strides, b_strides, rank, operation,
+            &metadata, &a_bytes, &b_bytes, &output_bytes))
+        return 0;
+    return vk_graph_typed_control_32(
+        a, a_bytes, b, b_bytes, output, output_bytes, &metadata);
+}
+
+static int vk_graph_unary_i32(
+        const int32_t* input, int32_t* output, long elements,
+        int operation, int32_t minimum, int32_t maximum) {
+    VxTypedControlMetadata metadata;
+    size_t bytes;
+    if (!vx_typed_control_unary_plan(
+            input, output, elements, operation, minimum, maximum,
+            &metadata, &bytes))
+        return 0;
+    return vk_graph_typed_control_32(
+        input, bytes, input, bytes, output, bytes, &metadata);
+}
+
+int vk_graph_not_i32(
+        const int32_t* input, int32_t* output, long elements) {
+    return vk_graph_unary_i32(
+        input, output, elements, VX_TYPED_CONTROL_NOT_I32, 0, 0);
+}
+
+int vk_graph_clip_i32(
+        const int32_t* input, int32_t* output, long elements,
+        int32_t minimum, int32_t maximum) {
+    return vk_graph_unary_i32(
+        input, output, elements, VX_TYPED_CONTROL_CLIP_I32,
+        minimum, maximum);
+}
+
+int vk_graph_copy_32(const void* input, void* output, long elements) {
+    VxTypedControlMetadata metadata;
+    size_t bytes;
+    if (!vx_typed_control_copy_plan(
+            input, output, elements, &metadata, &bytes))
+        return 0;
+    return vk_graph_typed_control_32(
+        input, bytes, input, bytes, output, bytes, &metadata);
+}
+
+int vk_graph_cast_typed(
+        const void* input, int input_dtype,
+        void* output, int output_dtype, long elements) {
+    VxTypedControlMetadata metadata;
+    size_t bytes;
+    if (!vx_typed_control_cast_plan(
+            input, input_dtype, output, output_dtype, elements,
+            &metadata, &bytes))
+        return 0;
+    return vk_graph_typed_control_32(
+        input, bytes, input, bytes, output, bytes, &metadata);
+}
+
 int vk_graph_sigmoid_f32(const float* in, float* out, long n) {
     if (n <= 0 || !in || !out) return 0;
     size_t bytes = (size_t)n * sizeof(float);
@@ -1774,8 +2137,9 @@ int vk_graph_prelu_f32(const float* in, const float* weight, float* out, long n,
 }
 
 int vk_graph_layernorm_f32(const float* in, const float* weight, const float* bias,
-                           float* out, int rows, int d_model) {
-    if (rows <= 0 || d_model <= 0 || !in || !weight || !bias || !out) return 0;
+                           float* out, int rows, int d_model, float eps) {
+    if (rows <= 0 || d_model <= 0 || !in || !weight || !bias || !out ||
+        !(eps > 0.0f) || !isfinite(eps)) return 0;
     size_t bytes = (size_t)rows * d_model * sizeof(float);
     size_t wbytes = (size_t)d_model * sizeof(float);
     graph_scratch_begin();
@@ -1784,8 +2148,14 @@ int vk_graph_layernorm_f32(const float* in, const float* weight, const float* bi
     VkTensorSlot* b = graph_ensure_device(bias, wbytes, 1);
     VkTensorSlot* dst = graph_output_slot(out, bytes);
     if (!src || !w || !b || !dst) return 0;
-    uint32_t params[2] = {(uint32_t)rows, (uint32_t)d_model};
-    size_t p_off = graph_scratch_upload(params, sizeof(params));
+    struct {
+        uint32_t rows;
+        uint32_t d_model;
+        float eps;
+        uint32_t pad;
+    } params = {(uint32_t)rows, (uint32_t)d_model, eps, 0u};
+    _Static_assert(sizeof(params) == 16, "LayerNorm uniform ABI");
+    size_t p_off = graph_scratch_upload(&params, sizeof(params));
     if (p_off == SIZE_MAX) return 0;
     VkGraphBinding binds[5] = {
         {src->offset, bytes}, {w->offset, wbytes}, {b->offset, wbytes},
@@ -2073,6 +2443,72 @@ int vk_graph_where_f32(const float* cond, const float* a, const float* b, float*
     return 1;
 }
 
+int vk_graph_where_32(
+        const int32_t* condition, const void* a,
+        const void* b, void* output, long elements) {
+    uint32_t count;
+    size_t bytes;
+    if (!vx_typed_control_where_plan(
+            condition, a, b, output, elements, &count, &bytes))
+        return 0;
+    graph_scratch_begin();
+    VkTensorSlot* condition_slot =
+        graph_ensure_device(condition, bytes, 0);
+    VkTensorSlot* a_slot = graph_ensure_device(a, bytes, 0);
+    VkTensorSlot* b_slot = graph_ensure_device(b, bytes, 0);
+    VkTensorSlot* output_slot = graph_output_slot(output, bytes);
+    if (!condition_slot || !a_slot || !b_slot || !output_slot) return 0;
+    uint32_t params[4] = {count, 0u, 0u, 0u};
+    size_t params_offset = graph_scratch_upload(params, sizeof(params));
+    if (params_offset == SIZE_MAX) return 0;
+    VkGraphBinding bindings[5] = {
+        {condition_slot->offset, bytes},
+        {a_slot->offset, bytes},
+        {b_slot->offset, bytes},
+        {output_slot->offset, bytes},
+        {params_offset, sizeof(params)},
+    };
+    if (!vk_dispatch_kernel(
+            &k_where_32, bindings, (count + 63u) / 64u, 1u, 1u))
+        return 0;
+    graph_mark_device(output_slot);
+    return 1;
+}
+
+int vk_graph_argmax_f32(
+        const float* input, int32_t* output,
+        uint32_t outer, uint32_t axis_size, uint32_t inner) {
+    uint32_t input_elements;
+    uint32_t output_elements;
+    size_t input_bytes;
+    size_t output_bytes;
+    if (!vx_typed_control_argmax_plan(
+            input, output, outer, axis_size, inner,
+            &input_elements, &output_elements,
+            &input_bytes, &output_bytes))
+        return 0;
+    graph_scratch_begin();
+    VkTensorSlot* input_slot =
+        graph_ensure_device(input, input_bytes, 0);
+    VkTensorSlot* output_slot =
+        graph_output_slot(output, output_bytes);
+    if (!input_slot || !output_slot) return 0;
+    uint32_t params[4] = {outer, axis_size, inner, 0u};
+    size_t params_offset = graph_scratch_upload(params, sizeof(params));
+    if (params_offset == SIZE_MAX) return 0;
+    VkGraphBinding bindings[3] = {
+        {input_slot->offset, input_bytes},
+        {output_slot->offset, output_bytes},
+        {params_offset, sizeof(params)},
+    };
+    if (!vk_dispatch_kernel(
+            &k_argmax_f32_i32, bindings,
+            (output_elements + 63u) / 64u, 1u, 1u))
+        return 0;
+    graph_mark_device(output_slot);
+    return 1;
+}
+
 int vk_graph_upsample2x_f32(const float* in, float* out, int n, int h, int w, int c) {
     if (n <= 0 || c <= 0 || h <= 0 || w <= 0 || !in || !out) return 0;
     size_t in_bytes = (size_t)n * h * w * c * sizeof(float);
@@ -2131,48 +2567,68 @@ static void pad4_shape(const int* shape, int rank, uint32_t out[4]) {
 
 int vk_graph_expand_f32(const float* in, float* out, const int* in_shape, int in_rank,
                         const int* out_shape, int out_rank) {
-    if (!in || !out || !in_shape || !out_shape || in_rank <= 0 || out_rank <= 0 || in_rank > 4 || out_rank > 4) return 0;
-    uint32_t is[4], os[4];
-    pad4_shape(in_shape, in_rank, is);
-    pad4_shape(out_shape, out_rank, os);
-    size_t in_elems = (size_t)is[0] * is[1] * is[2] * is[3];
-    size_t out_elems = (size_t)os[0] * os[1] * os[2] * os[3];
-    size_t in_bytes = in_elems * sizeof(float);
-    size_t out_bytes = out_elems * sizeof(float);
+    VxExpandF32Plan plan;
+    if (!vx_expand_f32_plan(
+            in, out, in_shape, in_rank, out_shape, out_rank, &plan))
+        return 0;
     graph_scratch_begin();
-    VkTensorSlot* src = graph_ensure_device(in, in_bytes, 0);
-    VkTensorSlot* dst = graph_output_slot(out, out_bytes);
+    VkTensorSlot* src = graph_ensure_device(in, plan.input_bytes, 0);
+    VkTensorSlot* dst = graph_output_slot(out, plan.output_bytes);
     if (!src || !dst) return 0;
-    uint32_t params[8] = {is[0], is[1], is[2], is[3], os[0], os[1], os[2], os[3]};
-    size_t p_off = graph_scratch_upload(params, sizeof(params));
+    size_t p_off = graph_scratch_upload(plan.params, sizeof(plan.params));
     if (p_off == SIZE_MAX) return 0;
     VkGraphBinding binds[3] = {
-        {src->offset, in_bytes}, {dst->offset, out_bytes}, {p_off, sizeof(params)}
+        {src->offset, plan.input_bytes},
+        {dst->offset, plan.output_bytes},
+        {p_off, sizeof(plan.params)}
     };
-    if (!vk_dispatch_kernel(&k_expand, binds, ((uint32_t)out_elems + 63u) / 64u, 1, 1)) return 0;
+    if (!vk_dispatch_kernel(
+            &k_expand, binds, (plan.output_elements + 63u) / 64u, 1u, 1u))
+        return 0;
     graph_mark_device(dst);
     return 1;
 }
 
-int vk_graph_gather_axis0_f32(const float* in, const float* indices, float* out,
-                              int row_size, int input_rows, int num_idx) {
-    if (row_size <= 0 || input_rows <= 0 || num_idx <= 0 || !in || !indices || !out) return 0;
-    long total = (long)row_size * num_idx;
-    size_t in_bytes = (size_t)input_rows * row_size * sizeof(float);
-    size_t idx_bytes = (size_t)num_idx * sizeof(float);
-    size_t out_bytes = (size_t)total * sizeof(float);
+int vk_graph_gather_i32_f32(const float* input, const int32_t* indices,
+                            float* output, int outer, int axis_size, int inner,
+                            int indices_elements, int output_elements) {
+    uint64_t input_count;
+    uint64_t expected_output;
+    size_t input_bytes;
+    size_t index_bytes;
+    size_t output_bytes;
+    if (!input || !indices || !output || outer <= 0 || axis_size <= 0 ||
+        inner <= 0 || indices_elements <= 0 || output_elements <= 0) return 0;
+    input_count = (uint64_t)(uint32_t)outer * (uint32_t)axis_size *
+        (uint32_t)inner;
+    expected_output = (uint64_t)(uint32_t)outer * (uint32_t)indices_elements *
+        (uint32_t)inner;
+    if (input_count > SIZE_MAX / sizeof(float) ||
+        expected_output != (uint32_t)output_elements ||
+        expected_output > SIZE_MAX / sizeof(float)) return 0;
+    input_bytes = (size_t)input_count * sizeof(float);
+    index_bytes = (size_t)(uint32_t)indices_elements * sizeof(int32_t);
+    if (index_bytes / sizeof(int32_t) !=
+        (size_t)(uint32_t)indices_elements) return 0;
+    output_bytes = (size_t)expected_output * sizeof(float);
     graph_scratch_begin();
-    VkTensorSlot* src = graph_ensure_device(in, in_bytes, 0);
-    VkTensorSlot* idx = graph_ensure_device(indices, idx_bytes, 0);
-    VkTensorSlot* dst = graph_output_slot(out, out_bytes);
+    VkTensorSlot* src = graph_ensure_device(input, input_bytes, 0);
+    VkTensorSlot* idx = graph_ensure_device(indices, index_bytes, 0);
+    VkTensorSlot* dst = graph_output_slot(output, output_bytes);
     if (!src || !idx || !dst) return 0;
-    uint32_t params[3] = {(uint32_t)row_size, (uint32_t)num_idx, (uint32_t)total};
+    uint32_t params[5] = {
+        (uint32_t)outer, (uint32_t)axis_size, (uint32_t)inner,
+        (uint32_t)indices_elements, (uint32_t)output_elements,
+    };
     size_t p_off = graph_scratch_upload(params, sizeof(params));
     if (p_off == SIZE_MAX) return 0;
     VkGraphBinding binds[4] = {
-        {src->offset, in_bytes}, {idx->offset, idx_bytes}, {dst->offset, out_bytes}, {p_off, sizeof(params)}
+        {src->offset, input_bytes}, {idx->offset, index_bytes},
+        {dst->offset, output_bytes}, {p_off, sizeof(params)}
     };
-    if (!vk_dispatch_kernel(&k_gather, binds, ((uint32_t)total + 63u) / 64u, 1, 1)) return 0;
+    if (!vk_dispatch_kernel(&k_gather, binds,
+                            ((uint32_t)output_elements + 63u) / 64u,
+                            1, 1)) return 0;
     graph_mark_device(dst);
     return 1;
 }
@@ -2631,23 +3087,31 @@ typedef struct {
 _Static_assert(sizeof(VkQLinearParams) == 64, "qLinearInt8 uniform ABI");
 
 static void vk_disable_packed_dot_after_failure(const char* kernel_name) {
-    vulkan_packed_dot = 0;
+    VulkanContextState* context = vk_context_current();
+    if (context) context->packed_dot_disabled = 1;
+    pthread_mutex_lock(&g_vulkan_device.mutex);
     if (!vulkan_packed_dot_warned) {
         fprintf(stderr,
                 "[Vulkan] packed INT8 dot kernel '%s' unavailable; using portable shader path\n",
                 kernel_name ? kernel_name : "unknown");
         vulkan_packed_dot_warned = 1;
     }
+    pthread_mutex_unlock(&g_vulkan_device.mutex);
+}
+
+static int vk_packed_dot_enabled(void) {
+    VulkanContextState* context = vk_context_current();
+    return vulkan_packed_dot && context && !context->packed_dot_disabled;
 }
 
 static int qlinear_dtype_bounds(uint32_t dtype, int32_t zero_point,
                                 int64_t* maximum_distance) {
     int32_t minimum;
     int32_t maximum;
-    if (dtype == 2u) {
+    if (dtype == VX_DTYPE_I8) {
         minimum = -128;
         maximum = 127;
-    } else if (dtype == 3u) {
+    } else if (dtype == VX_DTYPE_U8) {
         minimum = 0;
         maximum = 255;
     } else {
@@ -2679,7 +3143,7 @@ static int qlinear_gpu_args_valid(const void* input, const void* weight,
     if (!qlinear_dtype_bounds(input_dtype, input_zero_point, &input_distance) ||
         !qlinear_dtype_bounds(output_dtype, output_zero_point, &output_distance)) return 0;
     (void)output_distance;
-    if (weight_dtype != 2u && weight_dtype != 3u) return 0;
+    if (weight_dtype != VX_DTYPE_I8 && weight_dtype != VX_DTYPE_U8) return 0;
     if (rows > UINT32_MAX / d_in || rows > UINT32_MAX / d_out ||
         d_out > UINT32_MAX / d_in) return 0;
     uint64_t input_elements = (uint64_t)rows * d_in;
@@ -2717,24 +3181,42 @@ int vk_graph_qlinear_i8u8(const void* input, const void* weight,
                           uint32_t input_dtype, uint32_t weight_dtype,
                           uint32_t output_dtype) {
     size_t input_bytes, weight_bytes, output_bytes;
+    size_t multiplier_bytes;
+    float* multipliers;
     if (!qlinear_gpu_args_valid(input, weight, weight_scales, weight_zero_points, bias, output,
                                 rows, d_in, d_out, input_scale, input_zero_point,
                                 output_scale, output_zero_point, input_dtype, weight_dtype,
                                 output_dtype, &input_bytes, &weight_bytes, &output_bytes)) return 0;
     size_t packed_output_bytes;
     if (!graph_packed_bytes(output_bytes, &packed_output_bytes)) return 0;
+    multiplier_bytes = (size_t)d_out * sizeof(*multipliers);
+    multipliers = (float*)malloc(multiplier_bytes);
+    if (!multipliers ||
+        !vx_qlinear_build_multipliers(
+            input_scale, weight_scales, output_scale, d_out, multipliers)) {
+        free(multipliers);
+        return 0;
+    }
     graph_scratch_begin();
     VkTensorSlot* src = graph_ensure_packed_bytes(input, input_bytes, 0);
     VkTensorSlot* wt = graph_ensure_packed_bytes(weight, weight_bytes, 1);
-    VkTensorSlot* scales = graph_ensure_device(weight_scales,
-                                                (size_t)d_out * sizeof(*weight_scales), 1);
     VkTensorSlot* zero_points = graph_ensure_device(weight_zero_points,
                                                      (size_t)d_out * sizeof(*weight_zero_points), 1);
     VkTensorSlot* biases = graph_ensure_device(bias, (size_t)d_out * sizeof(*bias), 1);
     VkTensorSlot* dst = graph_output_packed_bytes(output, output_bytes);
-    if (!src || !wt || !scales || !zero_points || !biases || !dst) return 0;
+    if (!src || !wt || !zero_points || !biases || !dst) {
+        free(multipliers);
+        return 0;
+    }
+    size_t multiplier_offset =
+        graph_scratch_upload(multipliers, multiplier_bytes);
+    free(multipliers);
+    if (multiplier_offset == SIZE_MAX) return 0;
     VkQLinearParams params = {
-        rows, d_in, d_out, input_dtype, weight_dtype, output_dtype, 0u, 0u,
+        rows, d_in, d_out,
+        input_dtype,
+        weight_dtype,
+        output_dtype, 0u, 0u,
         input_zero_point, output_zero_point, 0, 0,
         input_scale, output_scale, 0.0f, 0.0f
     };
@@ -2742,7 +3224,8 @@ int vk_graph_qlinear_i8u8(const void* input, const void* weight,
     if (params_offset == SIZE_MAX) return 0;
     VkGraphBinding binds[7] = {
         {src->offset, src->bytes}, {wt->offset, wt->bytes},
-        {scales->offset, scales->bytes}, {zero_points->offset, zero_points->bytes},
+        {multiplier_offset, multiplier_bytes},
+        {zero_points->offset, zero_points->bytes},
         {biases->offset, biases->bytes}, {dst->offset, packed_output_bytes},
         {params_offset, sizeof(params)}
     };
@@ -2751,7 +3234,7 @@ int vk_graph_qlinear_i8u8(const void* input, const void* weight,
     uint32_t groups_x = tiled ? ((d_out / 4u + 7u) / 8u) : ((packed_words + 63u) / 64u);
     uint32_t groups_y = tiled ? ((rows + 7u) / 8u) : 1u;
     int dispatched = 0;
-    if (vulkan_packed_dot) {
+    if (vk_packed_dot_enabled()) {
         VkKernel* dot_kernel = tiled
             ? &k_qlinear_int8_dot_tiled : &k_qlinear_int8_dot;
         dispatched = vk_dispatch_kernel(dot_kernel, binds,
@@ -2794,7 +3277,7 @@ static int qembedding_gpu_args_valid(const int32_t* tokens, const void* weight,
         !token_count || !vocab || !hidden || !isfinite(output_scale) ||
         output_scale <= 0.0f || !qlinear_dtype_bounds(output_dtype, output_zero_point,
                                                         &distance) ||
-        (weight_dtype != 2u && weight_dtype != 3u) ||
+        (weight_dtype != VX_DTYPE_I8 && weight_dtype != VX_DTYPE_U8) ||
         token_count > UINT32_MAX / hidden || vocab > UINT32_MAX / hidden) return 0;
     weight_elements = (uint64_t)vocab * hidden;
     output_elements = (uint64_t)token_count * hidden;
@@ -2840,7 +3323,9 @@ int vk_graph_qembedding_i8u8(const int32_t* tokens, const void* weight,
     VkTensorSlot* dst = graph_output_packed_bytes(output, output_bytes);
     if (!ids || !table || !scales || !zero_points || !dst) return 0;
     VkQEmbeddingParams params = {
-        token_count, vocab, hidden, weight_dtype, output_dtype, output_zero_point,
+        token_count, vocab, hidden,
+        weight_dtype,
+        output_dtype, output_zero_point,
         output_scale, 0u
     };
     size_t params_offset = graph_scratch_upload(&params, sizeof(params));
@@ -2873,6 +3358,28 @@ typedef struct {
 } VkQAddParams;
 
 _Static_assert(sizeof(VkQAddParams) == 48, "qAdd uniform ABI");
+
+typedef struct {
+    uint32_t batch_rank;
+    uint32_t m;
+    uint32_t k;
+    uint32_t n;
+    uint32_t output_elements;
+    uint32_t a_type;
+    uint32_t b_type;
+    uint32_t output_type;
+    int32_t a_zero_point;
+    int32_t b_zero_point;
+    int32_t output_zero_point;
+    int32_t pad0;
+    float a_scale;
+    float b_scale;
+    float output_scale;
+    float pad1;
+} VkQBatchMatMulParams;
+
+_Static_assert(sizeof(VkQBatchMatMulParams) == 64,
+               "qBatchMatMul uniform ABI");
 
 typedef struct {
     uint32_t elements;
@@ -2933,8 +3440,8 @@ _Static_assert(sizeof(VkQLayerNormParams) == 48,
                "qLayerNormStats/qLayerNormApply uniform ABI");
 
 /* Five tightly packed 16-byte blocks shared verbatim with qSDPAInt8.wgsl.
- * The four dtype codes occupy one u32 so every backend uses the same 80-byte
- * uniform layout without backend-specific padding. */
+ * The four canonical protobuf dtype values occupy byte lanes in one u32 so
+ * every backend uses the same 80-byte uniform layout. */
 typedef struct {
     uint32_t seq_q;
     uint32_t seq_kv;
@@ -3009,8 +3516,8 @@ _Static_assert(sizeof(VkRequantizeLinearParams) == 48,
                "requantizeLinearTyped uniform ABI");
 
 static int qbyte_dtype_zero_point_valid(uint32_t dtype, int32_t zero_point) {
-    if (dtype == 2u) return zero_point >= -128 && zero_point <= 127;
-    if (dtype == 3u) return zero_point >= 0 && zero_point <= 255;
+    if (dtype == VX_DTYPE_I8) return zero_point >= -128 && zero_point <= 127;
+    if (dtype == VX_DTYPE_U8) return zero_point >= 0 && zero_point <= 255;
     return 0;
 }
 
@@ -3149,10 +3656,10 @@ static int qsdpa_centered_magnitude(uint32_t dtype, int32_t zero_point,
     int64_t high;
     uint64_t magnitude;
     if (!magnitude_out) return 0;
-    if (dtype == 2u) {
+    if (dtype == VX_DTYPE_I8) {
         low = -128 - (int64_t)zero_point;
         high = 127 - (int64_t)zero_point;
-    } else if (dtype == 3u) {
+    } else if (dtype == VX_DTYPE_U8) {
         low = -(int64_t)zero_point;
         high = 255 - (int64_t)zero_point;
     } else {
@@ -3270,7 +3777,7 @@ static int qargmax_gpu_args_valid(const void* input, int32_t* output,
     uint64_t output_elements = outer;
     if (!input || !output || !outer || !axis_size || !inner ||
         axis_size > (uint32_t)INT32_MAX ||
-        (input_dtype != 2u && input_dtype != 3u) ||
+        (input_dtype != VX_DTYPE_I8 && input_dtype != VX_DTYPE_U8) ||
         !input_bytes || !output_bytes || !output_elements_out ||
         input_elements > UINT32_MAX / axis_size) return 0;
     input_elements *= axis_size;
@@ -3323,7 +3830,7 @@ static int qmaskedmean_gpu_args_valid(const void* input, const int32_t* mask,
     if (!input_elements || !mask_elements || !output_elements ||
         input_elements > SIZE_MAX || mask_elements > SIZE_MAX / sizeof(*mask) ||
         output_elements > SIZE_MAX) return 0;
-    if (input_dtype == 2u) {
+    if (input_dtype == VX_DTYPE_I8) {
         low = -128 - (int64_t)input_zero_point;
         high = 127 - (int64_t)input_zero_point;
     } else {
@@ -3361,6 +3868,73 @@ static int requantize_gpu_args_valid(const void* input, uint32_t input_elements,
     return 1;
 }
 
+int vk_graph_qbatch_matmul_i8u8(
+        const void* a, const int* a_shape, int a_rank,
+        float a_scale, int32_t a_zero_point, uint32_t a_dtype,
+        const void* b, const int* b_shape, int b_rank,
+        float b_scale, int32_t b_zero_point, uint32_t b_dtype,
+        void* output, const int* output_shape, int output_rank,
+        float output_scale, int32_t output_zero_point,
+        uint32_t output_dtype) {
+    VxQBatchMatMulDevicePlan plan;
+    uint32_t metadata[24] = {0};
+    uint32_t metadata_words;
+    size_t metadata_bytes;
+    size_t a_packed_bytes;
+    size_t b_packed_bytes;
+    size_t output_packed_bytes;
+    if (!vx_qbatch_matmul_device_plan(
+            a, a_shape, a_rank, a_scale, a_zero_point, a_dtype,
+            b, b_shape, b_rank, b_scale, b_zero_point, b_dtype,
+            output, output_shape, output_rank, output_scale,
+            output_zero_point, output_dtype, &plan) ||
+        !graph_packed_bytes(plan.a_bytes, &a_packed_bytes) ||
+        !graph_packed_bytes(plan.b_bytes, &b_packed_bytes) ||
+        !graph_packed_bytes(plan.output_bytes, &output_packed_bytes))
+        return 0;
+    graph_scratch_begin();
+    VkTensorSlot* a_slot =
+        graph_ensure_packed_bytes(a, plan.a_bytes, 0);
+    VkTensorSlot* b_slot =
+        graph_ensure_packed_bytes(b, plan.b_bytes, 0);
+    VkTensorSlot* output_slot =
+        graph_output_packed_bytes(output, plan.output_bytes);
+    if (!a_slot || !b_slot || !output_slot) return 0;
+    memcpy(metadata, plan.output_batch_strides,
+           plan.batch_rank * sizeof(uint32_t));
+    memcpy(metadata + plan.batch_rank, plan.a_batch_strides,
+           plan.batch_rank * sizeof(uint32_t));
+    memcpy(metadata + 2u * plan.batch_rank, plan.b_batch_strides,
+           plan.batch_rank * sizeof(uint32_t));
+    metadata_words = plan.batch_rank ? 3u * plan.batch_rank : 1u;
+    metadata_bytes = (size_t)metadata_words * sizeof(uint32_t);
+    VkQBatchMatMulParams params = {
+        plan.batch_rank, plan.m, plan.k, plan.n,
+        plan.output_elements, a_dtype, b_dtype, output_dtype,
+        a_zero_point, b_zero_point, output_zero_point, 0,
+        a_scale, b_scale, output_scale, 0.0f,
+    };
+    size_t metadata_offset =
+        graph_scratch_upload(metadata, metadata_bytes);
+    size_t params_offset = graph_scratch_upload(&params, sizeof(params));
+    if (metadata_offset == SIZE_MAX || params_offset == SIZE_MAX) return 0;
+    VkGraphBinding binds[5] = {
+        {a_slot->offset, a_packed_bytes},
+        {b_slot->offset, b_packed_bytes},
+        {output_slot->offset, output_packed_bytes},
+        {metadata_offset, metadata_bytes},
+        {params_offset, sizeof(params)},
+    };
+    uint32_t packed_words =
+        (uint32_t)(output_packed_bytes / sizeof(uint32_t));
+    if (!vk_dispatch_kernel(
+            &k_qbatch_matmul_i8u8, binds,
+            (packed_words + 63u) / 64u, 1u, 1u))
+        return 0;
+    graph_mark_device(output_slot);
+    return 1;
+}
+
 int vk_graph_qadd_i8u8(const void* a, uint32_t a_elements,
                        const void* b, uint32_t b_elements,
                        void* output, uint32_t output_elements,
@@ -3382,7 +3956,9 @@ int vk_graph_qadd_i8u8(const void* a, uint32_t a_elements,
     VkTensorSlot* output_slot = graph_output_packed_bytes(output, logical_bytes);
     if (!a_slot || !b_slot || !output_slot) return 0;
     VkQAddParams params = {
-        a_elements, a_dtype, b_dtype, output_dtype,
+        a_elements, a_dtype,
+        b_dtype,
+        output_dtype,
         a_zero_point, b_zero_point, output_zero_point, 0,
         a_scale, b_scale, output_scale, relu
     };
@@ -3414,7 +3990,8 @@ int vk_graph_qsilu_i8u8(const void* input, void* output, uint32_t elements,
     VkTensorSlot* output_slot = graph_output_packed_bytes(output, logical_bytes);
     if (!input_slot || !output_slot) return 0;
     VkQByteUnaryParams params = {
-        elements, input_dtype, output_dtype, 0u,
+        elements, input_dtype,
+        output_dtype, 0u,
         input_zero_point, output_zero_point, 0, 0,
         input_scale, output_scale, 0.0f, 0.0f
     };
@@ -3446,7 +4023,8 @@ int vk_graph_qgelu_i8u8(const void* input, void* output, uint32_t elements,
     VkTensorSlot* output_slot = graph_output_packed_bytes(output, logical_bytes);
     if (!input_slot || !output_slot) return 0;
     VkQByteUnaryParams params = {
-        elements, input_dtype, output_dtype, 0u,
+        elements, input_dtype,
+        output_dtype, 0u,
         input_zero_point, output_zero_point, 0, 0,
         input_scale, output_scale, 0.0f, 0.0f
     };
@@ -3493,7 +4071,9 @@ int vk_graph_qgroupnorm_i8u8(const void* input, const float* weight,
     size_t stats_offset = graph_scratch_alloc(stats_bytes);
     if (stats_offset == SIZE_MAX) return 0;
     VkQGroupNormParams params = {
-        batch, height, width, channels, groups, input_dtype, output_dtype, 0u,
+        batch, height, width, channels, groups,
+        input_dtype,
+        output_dtype, 0u,
         input_zero_point, output_zero_point, 0, 0,
         input_scale, output_scale, epsilon, 0.0f
     };
@@ -3545,7 +4125,8 @@ int vk_graph_qlayernorm_i8u8(const void* input, const float* weight,
     size_t stats_offset = graph_scratch_alloc(stats_bytes);
     if (stats_offset == SIZE_MAX) return 0;
     VkQLayerNormParams params = {
-        rows, d_model, input_dtype, output_dtype,
+        rows, d_model, input_dtype,
+        output_dtype,
         input_zero_point, output_zero_point, 0, 0,
         input_scale, output_scale, epsilon, 0.0f
     };
@@ -3604,7 +4185,10 @@ int vk_graph_qsdpa_i8u8(const void* q, const void* k, const void* v,
     VkQSDPAParams params = {
         seq_q, seq_kv, d_model, heads,
         batch, mask_mode, causal,
-        q_dtype | (k_dtype << 8u) | (v_dtype << 16u) | (output_dtype << 24u),
+        q_dtype |
+            (k_dtype << 8u) |
+            (v_dtype << 16u) |
+            (output_dtype << 24u),
         q_zero_point, k_zero_point, v_zero_point, output_zero_point,
         q_scale, k_scale, v_scale, output_scale,
         attention_scale, 0.0f, 0.0f, 0.0f
@@ -3637,7 +4221,9 @@ int vk_graph_qargmax_i8u8(const void* input, int32_t* output,
     VkTensorSlot* input_slot = graph_ensure_packed_bytes(input, input_bytes, 0);
     VkTensorSlot* output_slot = graph_output_slot(output, output_bytes);
     if (!input_slot || !output_slot) return 0;
-    VkQArgMaxParams params = {outer, axis_size, inner, input_dtype};
+    VkQArgMaxParams params = {
+        outer, axis_size, inner, input_dtype
+    };
     size_t params_offset = graph_scratch_upload(&params, sizeof(params));
     if (params_offset == SIZE_MAX) return 0;
     VkGraphBinding binds[3] = {
@@ -3714,7 +4300,8 @@ int vk_graph_requantize_linear_i8u8(const void* input, uint32_t input_elements,
     VkTensorSlot* output_slot = graph_output_packed_bytes(output, logical_bytes);
     if (!input_slot || !output_slot) return 0;
     VkRequantizeLinearParams params = {
-        input_elements, input_dtype, output_dtype, 0u,
+        input_elements, input_dtype,
+        output_dtype, 0u,
         input_zero_point, output_zero_point, 0, 0,
         multiplier, 0.0f, 0.0f, 0.0f
     };
@@ -3784,15 +4371,6 @@ static const int32_t* qconv_zero_bias_get(uint32_t output_channels) {
     return block->values;
 }
 
-static void qconv_zero_bias_release(void) {
-    while (qconv_zero_bias_backings) {
-        QConvZeroBiasBacking* block = qconv_zero_bias_backings;
-        qconv_zero_bias_backings = block->next;
-        free(block->values);
-        free(block);
-    }
-}
-
 static int qconv_mul_u64(uint64_t left, uint64_t right, uint64_t* out) {
     if (!out || (left != 0 && right > UINT64_MAX / left)) return 0;
     *out = left * right;
@@ -3847,7 +4425,7 @@ static int qconv_gpu_args_valid(const void* input, const void* weight,
         !isfinite(output_scale) || output_scale <= 0.0f ||
         !qbyte_dtype_zero_point_valid(input_dtype, input_zero_point) ||
         !qbyte_dtype_zero_point_valid(output_dtype, output_zero_point) ||
-        (weight_dtype != 2u && weight_dtype != 3u) ||
+        (weight_dtype != VX_DTYPE_I8 && weight_dtype != VX_DTYPE_U8) ||
         input_channels % groups || output_channels % groups ||
         (uint64_t)input_per_group * groups != input_channels) return 0;
     if (!qconv_mul_u64(input_elements, batch, &input_elements) ||
@@ -3881,8 +4459,10 @@ static int qconv_gpu_args_valid(const void* input, const void* weight,
     expected_width = (padded_width - effective_width) / stride_x + 1u;
     if (expected_height != output_height || expected_width != output_width) return 0;
     {
-        int64_t low = (int64_t)(input_dtype == 2u ? -128 : 0) - input_zero_point;
-        int64_t high = (int64_t)(input_dtype == 2u ? 127 : 255) - input_zero_point;
+        int64_t low = (int64_t)(input_dtype == VX_DTYPE_I8 ? -128 : 0) -
+            input_zero_point;
+        int64_t high = (int64_t)(input_dtype == VX_DTYPE_I8 ? 127 : 255) -
+            input_zero_point;
         uint64_t low_magnitude = (uint64_t)(low < 0 ? -low : low);
         uint64_t high_magnitude = (uint64_t)(high < 0 ? -high : high);
         input_magnitude = low_magnitude > high_magnitude ? low_magnitude : high_magnitude;
@@ -3895,8 +4475,10 @@ static int qconv_gpu_args_valid(const void* input, const void* weight,
         uint64_t weight_magnitude, accumulator_bound, bias_magnitude = 0;
         if (!isfinite(weight_scale) || weight_scale <= 0.0f ||
             !qbyte_dtype_zero_point_valid(weight_dtype, weight_zero_point)) return 0;
-        low = (int64_t)(weight_dtype == 2u ? -128 : 0) - weight_zero_point;
-        high = (int64_t)(weight_dtype == 2u ? 127 : 255) - weight_zero_point;
+        low = (int64_t)(weight_dtype == VX_DTYPE_I8 ? -128 : 0) -
+            weight_zero_point;
+        high = (int64_t)(weight_dtype == VX_DTYPE_I8 ? 127 : 255) -
+            weight_zero_point;
         weight_magnitude = (uint64_t)(low < 0 ? -low : low);
         {
             uint64_t high_magnitude = (uint64_t)(high < 0 ? -high : high);
@@ -3968,7 +4550,9 @@ int vk_graph_qconv2d_i8u8(const void* input, const void* weight,
         output_height, output_width, output_channels, kernel_height,
         kernel_width, stride_y, stride_x, dilation_y,
         dilation_x, padding_top, padding_left, groups,
-        input_dtype, weight_dtype, output_dtype, relu,
+        input_dtype,
+        weight_dtype,
+        output_dtype, relu,
         input_zero_point, output_zero_point, 0, 0,
         input_scale, output_scale, 0.0f, 0.0f
     };
@@ -3982,7 +4566,8 @@ int vk_graph_qconv2d_i8u8(const void* input, const void* weight,
     };
     uint32_t packed_words = (uint32_t)(packed_output_bytes / sizeof(uint32_t));
     int dispatched = 0;
-    if (vulkan_packed_dot && groups == 1u && (output_channels & 3u) == 0u) {
+    if (vk_packed_dot_enabled() && groups == 1u &&
+        (output_channels & 3u) == 0u) {
         const uint32_t spatial = batch * output_height * output_width;
         const uint32_t output_words_per_spatial = output_channels / 4u;
         const uint32_t groups_x = (output_words_per_spatial + 7u) / 8u;
@@ -4057,7 +4642,7 @@ static uint32_t typed_shape_packed_groups(size_t packed_bytes) {
 }
 
 static uint32_t typed_shape_zero_word(int32_t zero_point, uint32_t dtype) {
-    return dtype == 2u ? (uint32_t)(uint8_t)(int8_t)zero_point :
+    return dtype == VX_DTYPE_I8 ? (uint32_t)(uint8_t)(int8_t)zero_point :
         (uint32_t)(uint8_t)zero_point;
 }
 
@@ -4075,7 +4660,9 @@ int vk_graph_quantize_typed_f32_i8u8(const float* input, uint32_t elements,
     VkTensorSlot* output_slot = graph_output_packed_bytes(output, output_bytes);
     if (!input_slot || !output_slot) return 0;
     uint32_t zero_word = typed_shape_zero_word(output_zero_point, output_dtype);
-    VkTypedQuantizeParams params = {elements, output_dtype, output_dtype, 1u};
+    VkTypedQuantizeParams params = {
+        elements, output_dtype, output_dtype, 1u
+    };
     size_t scale_offset = graph_scratch_upload(&output_scale, sizeof(output_scale));
     size_t zero_offset = graph_scratch_upload(&zero_word, sizeof(zero_word));
     size_t params_offset = graph_scratch_upload(&params, sizeof(params));
@@ -4105,7 +4692,10 @@ int vk_graph_dequantize_typed_i8u8_f32(const void* input, uint32_t elements,
     VkTensorSlot* output_slot = graph_output_slot(output, (size_t)elements * sizeof(float));
     if (!input_slot || !output_slot) return 0;
     uint32_t zero_word = typed_shape_zero_word(input_zero_point, input_dtype);
-    VkTypedDequantizeParams params = {elements, input_dtype, 0u, input_dtype, 0u, 1u, 0u, 0u};
+    VkTypedDequantizeParams params = {
+        elements, input_dtype, VX_DTYPE_F32, input_dtype,
+        VX_DTYPE_F32, 1u, 0u, 0u
+    };
     size_t scale_offset = graph_scratch_upload(&input_scale, sizeof(input_scale));
     size_t zero_offset = graph_scratch_upload(&zero_word, sizeof(zero_word));
     size_t params_offset = graph_scratch_upload(&params, sizeof(params));
@@ -4144,6 +4734,77 @@ int vk_graph_copy_i8u8(const void* input, uint32_t input_elements,
     };
     if (!vk_dispatch_kernel(&k_copy_typed_i8u8, binds,
                             typed_shape_packed_groups(packed_bytes), 1u, 1u)) return 0;
+    graph_mark_device(output_slot);
+    return 1;
+}
+
+int vk_graph_transpose_i8u8(const void* input, void* output,
+                            const uint32_t* input_shape,
+                            const uint32_t* permutation, uint32_t rank,
+                            uint32_t elements, float input_scale,
+                            int32_t input_zero_point, float output_scale,
+                            int32_t output_zero_point, uint32_t input_dtype,
+                            uint32_t output_dtype) {
+    uint32_t input_strides[8] = {0};
+    uint32_t output_shape[8] = {0};
+    uint32_t output_strides[8] = {0};
+    uint32_t metadata[18] = {0};
+    uint32_t seen = 0;
+    uint64_t product = 1;
+    uint64_t stride = 1;
+    size_t packed_bytes;
+    if (!input || !output || !input_shape || !permutation ||
+        rank == 0 || rank > 8 || elements == 0 ||
+        !typed_shape_qdesc_same(input_scale, input_zero_point, input_dtype,
+                                output_scale, output_zero_point, output_dtype) ||
+        qsdpa_ranges_overlap(output, elements, input, elements)) return 0;
+    for (uint32_t reverse = rank; reverse-- > 0;) {
+        if (!input_shape[reverse] || stride > UINT32_MAX) return 0;
+        input_strides[reverse] = (uint32_t)stride;
+        stride *= input_shape[reverse];
+        if (stride > UINT32_MAX) return 0;
+    }
+    if (stride != elements) return 0;
+    for (uint32_t dimension = 0; dimension < rank; dimension++) {
+        uint32_t source = permutation[dimension];
+        if (source >= rank || (seen & (1u << source))) return 0;
+        seen |= 1u << source;
+        output_shape[dimension] = input_shape[source];
+        if (product > UINT32_MAX / output_shape[dimension]) return 0;
+        product *= output_shape[dimension];
+    }
+    if (product != elements) return 0;
+    stride = 1;
+    for (uint32_t reverse = rank; reverse-- > 0;) {
+        output_strides[reverse] = (uint32_t)stride;
+        stride *= output_shape[reverse];
+    }
+    if (!graph_packed_bytes(elements, &packed_bytes)) return 0;
+    graph_scratch_begin();
+    VkTensorSlot* input_slot =
+        graph_ensure_packed_bytes(input, elements, 0);
+    VkTensorSlot* output_slot =
+        graph_output_packed_bytes(output, elements);
+    if (!input_slot || !output_slot) return 0;
+    metadata[0] = elements;
+    metadata[1] = rank;
+    for (uint32_t dimension = 0; dimension < rank; dimension++) {
+        metadata[2 + dimension] = output_strides[dimension];
+        metadata[2 + rank + dimension] =
+            input_strides[permutation[dimension]];
+    }
+    size_t metadata_bytes = (size_t)(2 + 2 * rank) * sizeof(uint32_t);
+    size_t metadata_offset =
+        graph_scratch_upload(metadata, metadata_bytes);
+    if (metadata_offset == SIZE_MAX) return 0;
+    VkGraphBinding binds[3] = {
+        {input_slot->offset, packed_bytes},
+        {output_slot->offset, packed_bytes},
+        {metadata_offset, metadata_bytes},
+    };
+    if (!vk_dispatch_kernel(&k_transpose_typed_i8u8, binds,
+                            typed_shape_packed_groups(packed_bytes),
+                            1u, 1u)) return 0;
     graph_mark_device(output_slot);
     return 1;
 }
@@ -4445,6 +5106,52 @@ int vk_graph_concat_f32(const float** inputs, const long* sizes, const int* inpu
     return vk_graph_concat_common(inputs, sizes, input_axes, count, out, output_axis, inner, sigmoid);
 }
 
+int vk_graph_concat_32(
+        const void* const* inputs, const long* sizes,
+        const int* input_axes, int count, void* output,
+        int output_axis, int inner) {
+    uint32_t output_elements;
+    size_t output_bytes;
+    if (!vx_typed_control_concat_plan(
+            inputs, sizes, input_axes, count, output,
+            output_axis, inner, &output_elements, &output_bytes))
+        return 0;
+    graph_scratch_begin();
+    VkTensorSlot* output_slot =
+        graph_output_slot(output, output_bytes);
+    if (!output_slot) return 0;
+    uint32_t axis_offset = 0u;
+    for (int index = 0; index < count; index++) {
+        uint32_t input_elements = (uint32_t)sizes[index];
+        size_t input_bytes =
+            (size_t)input_elements * sizeof(uint32_t);
+        VkTensorSlot* input_slot =
+            graph_ensure_device(inputs[index], input_bytes, 0);
+        if (!input_slot) return 0;
+        uint32_t params[8] = {
+            input_elements, axis_offset,
+            (uint32_t)input_axes[index], (uint32_t)output_axis,
+            (uint32_t)inner, 0u, 0u, 0u,
+        };
+        size_t params_offset =
+            graph_scratch_upload(params, sizeof(params));
+        if (params_offset == SIZE_MAX) return 0;
+        VkGraphBinding bindings[3] = {
+            {input_slot->offset, input_bytes},
+            {output_slot->offset, output_bytes},
+            {params_offset, sizeof(params)},
+        };
+        if (!vk_dispatch_kernel(
+                &k_concat_32, bindings,
+                (input_elements + 63u) / 64u, 1u, 1u))
+            return 0;
+        axis_offset += (uint32_t)input_axes[index];
+    }
+    graph_mark_device(output_slot);
+    (void)output_elements;
+    return 1;
+}
+
 int vk_graph_concat_flat_f32(const float** inputs, const long* sizes, int count, float* out) {
     long total = 0;
     if (!sizes || count <= 0) return 0;
@@ -4589,18 +5296,6 @@ int vk_graph_conv2d_f32(const float* in, float* out, const float* w, const float
 // RESIDENT region exactly once instead of being copied per dispatch.
 // linearF32.wgsl reads weight[col*d_in + k] (layout [d_out,d_in]);
 // the exported weight is [d_in, d_out], so we transpose straight into GPU memory.
-#define WT_CACHE_MAX 512
-#define WEIGHTS_LIMIT ((size_t)64 * 1024 * 1024)   // weights in [0,64MB); transient above
-static struct {
-    const float* src;
-    int d_in;
-    int d_out;
-    size_t bytes;
-    size_t off;
-} wt_cache[WT_CACHE_MAX];
-static int wt_cache_n = 0;
-static size_t wt_bump = 0;
-
 static int checked_float_matrix_bytes(int rows, int columns, size_t* bytes) {
     size_t elements;
     if (!bytes || rows <= 0 || columns <= 0 ||
@@ -4662,7 +5357,11 @@ static int upload_weight(const float* w, int d_in, int d_out, size_t weight_byte
 
 // Reset the resident-weight arena (called when the engine reloads, so freed weight
 // pointers are never matched against a newly-loaded model that reused the address).
-void vk_free_weight_cache(void) { wt_cache_n = 0; wt_bump = 0; }
+void vk_free_weight_cache(void) {
+    if (!vk_context_current()) return;
+    wt_cache_n = 0;
+    wt_bump = 0;
+}
 
 // Vulkan MatMul dispatch. M=1 uses the scalar shader; sufficiently large
 // multi-row matrices use the cooperative 16x16 tiled shader.
@@ -4678,7 +5377,8 @@ int vk_matmul(const float* in, const float* w, const float* b, float* out,
     VkPipeline selected_pipeline;
     uint32_t groups_x;
     uint32_t groups_y;
-    if (!in || !w || !out || !io_mapped || io_buffer == VK_NULL_HANDLE ||
+    if (!vk_context_current() || !in || !w || !out ||
+        !io_mapped || io_buffer == VK_NULL_HANDLE ||
         seq <= 0 || d_in <= 0 || d_out <= 0 || !vk_graph_flush_wait() ||
         !checked_float_matrix_bytes(seq, d_in, &in_sz) ||
         !checked_float_matrix_bytes(d_in, d_out, &w_sz) ||
@@ -4746,9 +5446,15 @@ int vk_matmul(const float* in, const float* w, const float* b, float* out,
     submit_info.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
     submit_info.commandBufferCount = 1;
     submit_info.pCommandBuffers = &cmd_buf;
-    if (vkResetFences(device, 1, &compute_fence) != VK_SUCCESS ||
-        vkQueueSubmit(compute_queue, 1, &submit_info, compute_fence) != VK_SUCCESS ||
-        vkWaitForFences(device, 1, &compute_fence, VK_TRUE, UINT64_MAX) != VK_SUCCESS) return 0;
+    pthread_mutex_lock(&g_vulkan_device.mutex);
+    VkResult reset_result = vkResetFences(device, 1, &compute_fence);
+    VkResult submit_result = reset_result == VK_SUCCESS
+        ? vkQueueSubmit(compute_queue, 1, &submit_info, compute_fence)
+        : reset_result;
+    pthread_mutex_unlock(&g_vulkan_device.mutex);
+    if (submit_result != VK_SUCCESS ||
+        vkWaitForFences(device, 1, &compute_fence,
+                        VK_TRUE, UINT64_MAX) != VK_SUCCESS) return 0;
     memcpy(out, (char*)io_mapped + offset_out, out_sz);
     return 1;
 }

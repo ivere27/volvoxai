@@ -1,4 +1,8 @@
-import type { WasmEngine } from '../backends/WasmEngine.js';
+import { WasmEngine } from '../backends/WasmEngine.js';
+import { DataType } from '../generated/volvoxaiEnums.js';
+import type { RuntimeDType as ProtoRuntimeDType } from '../generated/volvoxaiEnums.js';
+import { PtqScheme as ProtoPtqScheme } from '../generated/volvoxaiFullEnums.js';
+import type { PtqSchemeValue } from '../generated/volvoxaiFullEnums.js';
 
 export const WASM_PTQ_ABI_VERSION = 1;
 
@@ -19,32 +23,32 @@ const PARAMETERS_BYTES = 32;
 const SATURATION_BYTES = 8;
 
 const DTYPE_CODE = Object.freeze({
-  int8: 1,
-  uint8: 2,
+  int8: DataType.I8,
+  uint8: DataType.U8,
 });
 
 const SCHEME_CODE = Object.freeze({
-  symmetric: 0,
-  asymmetric: 1,
+  symmetric: ProtoPtqScheme.Symmetric,
+  asymmetric: ProtoPtqScheme.Asymmetric,
 });
 
-export type WasmPTQDType = keyof typeof DTYPE_CODE;
-export type WasmPTQScheme = keyof typeof SCHEME_CODE;
+export type PTQDType = Extract<ProtoRuntimeDType, 'int8' | 'uint8'>;
+export type PTQScheme = PtqSchemeValue;
 
-export interface WasmPTQRange {
+export interface PTQRange {
   minimum: number;
   maximum: number;
   sampleCount: number;
 }
 
-export interface WasmPTQParameterOptions {
-  dtype?: WasmPTQDType;
-  scheme?: WasmPTQScheme;
+export interface PTQParameterOptions {
+  dtype?: PTQDType;
+  scheme?: PTQScheme;
 }
 
-export interface WasmPTQParameters {
-  dtype: WasmPTQDType;
-  scheme: WasmPTQScheme;
+export interface PTQParameters {
+  dtype: PTQDType;
+  scheme: PTQScheme;
   scale: number;
   zero_point: number;
   observed_min: number;
@@ -52,17 +56,17 @@ export interface WasmPTQParameters {
   sample_count: number;
 }
 
-export interface WasmPTQQuantized {
+export interface PTQQuantized {
   data: Int8Array | Uint8Array;
   saturationCount: number;
 }
 
-export interface WasmPTQWeightOptions {
+export interface PTQWeightOptions {
   axis?: number;
   name?: string | null;
 }
 
-export interface WasmPTQPackedWeight {
+export interface PTQPackedWeight {
   name?: string;
   shape: readonly number[];
   dtype: 'int8';
@@ -77,19 +81,23 @@ export interface WasmPTQPackedWeight {
   }>;
 }
 
+export interface PTQOptions {
+  readonly wasmUrl?: string | URL;
+}
+
 type WasmArgument = number | bigint;
 type WasmFunction = (...args: WasmArgument[]) => number | bigint | void;
 
-interface WasmPTQApi {
+interface PTQApi {
   memory: WebAssembly.Memory;
   alloc_bytes: WasmFunction;
   reset_heap: WasmFunction;
   [name: string]: unknown;
 }
 
-type WasmPTQTypedArray =
+type PTQTypedArray =
   Float32Array | Int32Array | Int8Array | Uint8Array | Uint32Array;
-type WasmPTQTypedArrayConstructor =
+type PTQTypedArrayConstructor =
   Float32ArrayConstructor | Int32ArrayConstructor | Int8ArrayConstructor |
   Uint8ArrayConstructor | Uint32ArrayConstructor;
 
@@ -97,7 +105,7 @@ interface ArenaEntry {
   name: string;
   value: ArrayBufferView | null;
   bytes: number;
-  ArrayType: WasmPTQTypedArrayConstructor;
+  ArrayType: PTQTypedArrayConstructor;
   read: boolean;
 }
 
@@ -107,7 +115,7 @@ interface ObserverState {
   sampleCount: number;
 }
 
-function requireFunction(api: WasmPTQApi, name: string): WasmFunction {
+function requireFunction(api: PTQApi, name: string): WasmFunction {
   const candidate = api[name];
   if (typeof candidate !== 'function') {
     throw new Error(`The full WASM module is missing PTQ export '${name}'.`);
@@ -164,13 +172,13 @@ function saturationCount(words: Uint32Array): number {
   return count;
 }
 
-function dtypeFromCode(code: number): WasmPTQDType {
+function dtypeFromCode(code: number): PTQDType {
   if (code === DTYPE_CODE.int8) return 'int8';
   if (code === DTYPE_CODE.uint8) return 'uint8';
   throw new Error(`The WASM PTQ module returned unsupported dtype code ${code}.`);
 }
 
-function schemeFromCode(code: number): WasmPTQScheme {
+function schemeFromCode(code: number): PTQScheme {
   if (code === SCHEME_CODE.symmetric) return 'symmetric';
   if (code === SCHEME_CODE.asymmetric) return 'asymmetric';
   throw new Error(`The WASM PTQ module returned unsupported scheme code ${code}.`);
@@ -194,7 +202,7 @@ function decodeObserver(bytes: Uint8Array): ObserverState {
   };
 }
 
-function encodeParameters(parameters: Readonly<WasmPTQParameters>): Uint8Array {
+function encodeParameters(parameters: Readonly<PTQParameters>): Uint8Array {
   if (!Object.prototype.hasOwnProperty.call(DTYPE_CODE, parameters.dtype)) {
     throw new Error(`Unsupported WASM PTQ dtype '${parameters.dtype}'.`);
   }
@@ -224,7 +232,7 @@ function encodeParameters(parameters: Readonly<WasmPTQParameters>): Uint8Array {
   return bytes;
 }
 
-function decodeParameters(bytes: Uint8Array): Readonly<WasmPTQParameters> {
+function decodeParameters(bytes: Uint8Array): Readonly<PTQParameters> {
   const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
   return Object.freeze({
     dtype: dtypeFromCode(view.getInt32(0, true)),
@@ -237,8 +245,8 @@ function decodeParameters(bytes: Uint8Array): Readonly<WasmPTQParameters> {
   });
 }
 
-function normalizeRange(range: WasmPTQObserver | WasmPTQRange): ObserverState {
-  const value = range instanceof WasmPTQObserver ? range.snapshot() : range;
+function normalizeRange(range: PTQObserver | PTQRange): ObserverState {
+  const value = range instanceof PTQObserver ? range.snapshot() : range;
   if (!value || typeof value !== 'object') {
     throw new Error('WASM PTQ range must be an observer or range object.');
   }
@@ -288,11 +296,11 @@ function shapeInfo(shape: readonly number[], axis: number): {
 }
 
 /** A reusable C-backed min/max observer tied to one isolated PTQ instance. */
-export class WasmPTQObserver {
-  private readonly ptq: WasmPTQ;
+export class PTQObserver {
+  private readonly ptq: PTQ;
   private state: ObserverState;
 
-  constructor(ptq: WasmPTQ) {
+  constructor(ptq: PTQ) {
     this.ptq = ptq;
     this.state = ptq._resetObserver();
   }
@@ -307,14 +315,14 @@ export class WasmPTQObserver {
     return this;
   }
 
-  snapshot(): Readonly<WasmPTQRange> {
+  snapshot(): Readonly<PTQRange> {
     if (this.state.sampleCount <= 0) {
       throw new Error('WASM PTQ observer has no observations.');
     }
     return Object.freeze({ ...this.state });
   }
 
-  parameters(options: WasmPTQParameterOptions = {}): Readonly<WasmPTQParameters> {
+  parameters(options: PTQParameterOptions = {}): Readonly<PTQParameters> {
     return this.ptq.deriveParameters(this, options);
   }
 }
@@ -323,16 +331,16 @@ export class WasmPTQObserver {
  * Generic PTQ math executed by the existing C implementation in an isolated
  * full-WASM instance. Arena resets never touch the live inference engine heap.
  */
-export class WasmPTQ {
+export class PTQ {
   readonly abiVersion: number;
   readonly capabilities: number;
   private scratchEngine: WasmEngine | null;
-  private api: WasmPTQApi | null;
+  private api: PTQApi | null;
   private memory: WebAssembly.Memory | null;
 
   private constructor(
     scratchEngine: WasmEngine,
-    api: WasmPTQApi,
+    api: PTQApi,
     abiVersion: number,
     capabilities: number,
   ) {
@@ -343,12 +351,19 @@ export class WasmPTQ {
     this.capabilities = capabilities;
   }
 
-  static async create(sourceEngine: WasmEngine): Promise<WasmPTQ> {
-    if (!sourceEngine || typeof sourceEngine.fork !== 'function') {
-      throw new Error('WasmPTQ.create requires an initialized WasmEngine.');
+  static async create({
+    wasmUrl = new URL('./volvoxai.full.wasm', import.meta.url),
+  }: PTQOptions = {}): Promise<PTQ> {
+    const sourceEngine = await WasmEngine.init(wasmUrl);
+    if (!sourceEngine) {
+      throw new Error(`PTQ could not load the full WASM module '${String(wasmUrl)}'.`);
     }
+    return PTQ.#fromEngine(sourceEngine);
+  }
+
+  static async #fromEngine(sourceEngine: WasmEngine): Promise<PTQ> {
     const scratchEngine = await sourceEngine.fork({ relaxedSimd: false });
-    const api = scratchEngine.api as unknown as WasmPTQApi;
+    const api = scratchEngine.api as unknown as PTQApi;
     if (!(api.memory instanceof WebAssembly.Memory) ||
         typeof api.alloc_bytes !== 'function' || typeof api.reset_heap !== 'function') {
       throw new Error('The full WASM module is missing memory or allocator exports for PTQ.');
@@ -373,18 +388,18 @@ export class WasmPTQ {
       const missing = REQUIRED_CAPABILITIES & ~capabilities;
       throw new Error(`The full WASM module is missing PTQ capability bits 0x${missing.toString(16)}.`);
     }
-    return new WasmPTQ(scratchEngine, api, abiVersion, capabilities);
+    return new PTQ(scratchEngine, api, abiVersion, capabilities);
   }
 
-  createObserver(): WasmPTQObserver {
+  createObserver(): PTQObserver {
     this._active();
-    return new WasmPTQObserver(this);
+    return new PTQObserver(this);
   }
 
   deriveParameters(
-    range: WasmPTQObserver | WasmPTQRange,
-    { dtype = 'int8', scheme = 'symmetric' }: WasmPTQParameterOptions = {},
-  ): Readonly<WasmPTQParameters> {
+    range: PTQObserver | PTQRange,
+    { dtype = 'int8', scheme = 'symmetric' }: PTQParameterOptions = {},
+  ): Readonly<PTQParameters> {
     const { api } = this._active();
     if (!Object.prototype.hasOwnProperty.call(DTYPE_CODE, dtype)) {
       throw new Error(`Unsupported WASM PTQ dtype '${dtype}'.`);
@@ -409,16 +424,16 @@ export class WasmPTQ {
   }
 
   parameters(
-    range: WasmPTQObserver | WasmPTQRange,
-    options: WasmPTQParameterOptions = {},
-  ): Readonly<WasmPTQParameters> {
+    range: PTQObserver | PTQRange,
+    options: PTQParameterOptions = {},
+  ): Readonly<PTQParameters> {
     return this.deriveParameters(range, options);
   }
 
   quantize(
     values: Float32Array,
-    parameters: Readonly<WasmPTQParameters>,
-  ): WasmPTQQuantized {
+    parameters: Readonly<PTQParameters>,
+  ): PTQQuantized {
     const { api } = this._active();
     const source = requireFloat32Array(values, 'WASM PTQ quantization input');
     requireFiniteValues(source, 'WASM PTQ quantization input');
@@ -453,8 +468,8 @@ export class WasmPTQ {
   packWeight(
     values: Float32Array,
     shape: readonly number[],
-    { axis = 0, name = null }: WasmPTQWeightOptions = {},
-  ): WasmPTQPackedWeight {
+    { axis = 0, name = null }: PTQWeightOptions = {},
+  ): PTQPackedWeight {
     const { api } = this._active();
     const source = requireFloat32Array(values, 'WASM PTQ weight');
     requireFiniteValues(source, 'WASM PTQ weight');
@@ -584,11 +599,11 @@ export class WasmPTQ {
     this.memory = null;
   }
 
-  private _active(): { api: WasmPTQApi; memory: WebAssembly.Memory } {
+  private _active(): { api: PTQApi; memory: WebAssembly.Memory } {
     const api = this.api;
     const memory = this.memory;
     if (this.scratchEngine === null || api === null || memory === null) {
-      throw new Error('WasmPTQ has been disposed.');
+      throw new Error('PTQ has been disposed.');
     }
     return { api, memory };
   }
@@ -596,7 +611,7 @@ export class WasmPTQ {
   private _entry(
     name: string,
     value: ArrayBufferView,
-    ArrayType: WasmPTQTypedArrayConstructor,
+    ArrayType: PTQTypedArrayConstructor,
     read = false,
   ): ArenaEntry {
     return this._scratch(name, value.byteLength, ArrayType, value, read);
@@ -605,7 +620,7 @@ export class WasmPTQ {
   private _scratch(
     name: string,
     bytes: number,
-    ArrayType: WasmPTQTypedArrayConstructor,
+    ArrayType: PTQTypedArrayConstructor,
     value: ArrayBufferView | null = null,
     read = false,
   ): ArenaEntry {
@@ -618,10 +633,10 @@ export class WasmPTQ {
   private _runArena(
     entries: ArenaEntry[],
     invoke: (pointers: Record<string, number>) => number | bigint | void,
-  ): { value: number | bigint | void; outputs: Record<string, WasmPTQTypedArray> } {
+  ): { value: number | bigint | void; outputs: Record<string, PTQTypedArray> } {
     const { api, memory } = this._active();
     // This reset is safe because `api` belongs to the private fork created in
-    // `WasmPTQ.create`, never the source engine executing the user's graph.
+    // `PTQ.create`, never the source engine executing the user's graph.
     api.reset_heap();
     const pointers: Record<string, number> = {};
     for (const entry of entries) {
@@ -648,14 +663,14 @@ export class WasmPTQ {
       new Uint8Array(memory.buffer, pointers[entry.name], entry.bytes).set(bytes);
     }
     const value = invoke(pointers);
-    const outputs: Record<string, WasmPTQTypedArray> = {};
+    const outputs: Record<string, PTQTypedArray> = {};
     for (const entry of entries) {
       if (!entry.read) continue;
       const bytes = memory.buffer.slice(
         pointers[entry.name],
         pointers[entry.name] + entry.bytes,
       );
-      outputs[entry.name] = new entry.ArrayType(bytes) as WasmPTQTypedArray;
+      outputs[entry.name] = new entry.ArrayType(bytes) as PTQTypedArray;
     }
     return { value, outputs };
   }
@@ -667,10 +682,6 @@ export class WasmPTQ {
   }
 }
 
-export function createWasmPTQ(sourceEngine: WasmEngine): Promise<WasmPTQ> {
-  return WasmPTQ.create(sourceEngine);
-}
-
-export function createPTQ(sourceEngine: WasmEngine): Promise<WasmPTQ> {
-  return createWasmPTQ(sourceEngine);
+export function createPTQ(options: PTQOptions = {}): Promise<PTQ> {
+  return PTQ.create(options);
 }

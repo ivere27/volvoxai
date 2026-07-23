@@ -1,6 +1,7 @@
-const UPDATE_MODES = Object.freeze(["assign", "add", "sgd", "adamw"] as const);
+import { TrainingOptimizerKind } from '../generated/volvoxaiFullEnums.js';
+import type { TrainingOptimizerKindValue } from '../generated/volvoxaiFullEnums.js';
 
-export type TrainingUpdateMode = 'sgd' | 'adamw';
+export type TrainingUpdateMode = TrainingOptimizerKindValue;
 
 export interface TrainingOptimizerOptions {
   learningRate?: number;
@@ -29,10 +30,12 @@ export interface TrainingOptimizerDescriptor {
 
 export function normalizeTrainingUpdateMode(value: unknown = "adamw"): TrainingUpdateMode {
   const normalized = typeof value === 'number' && Number.isInteger(value)
-    ? UPDATE_MODES[value]
+    ? value === TrainingOptimizerKind.Sgd ? 'sgd'
+      : value === TrainingOptimizerKind.Adamw ? 'adamw'
+        : null
     : typeof value === "string" ? value.toLowerCase() : null;
   if (normalized !== "sgd" && normalized !== "adamw") {
-    throw new Error("Training updateMode must be SGD/AdamW (2/3).");
+    throw new Error("Training updateMode must be SGD or AdamW.");
   }
   return normalized;
 }

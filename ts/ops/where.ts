@@ -5,14 +5,16 @@ export function _cpuWhere(node) {
   const output = node.outputs.out || Object.values(node.outputs || {})[0];
   const sameShape = (left, right) => Array.isArray(left) && Array.isArray(right) &&
     left.length === right.length && left.every((dimension, index) => dimension === right[index]);
+  const dataDtype = a?.dtype;
   if (!condition || !a || !b || !output ||
       (condition.dtype !== 'float32' && condition.dtype !== 'int32') ||
-      a.dtype !== 'float32' || b.dtype !== 'float32' || output.dtype !== 'float32' ||
+      (dataDtype !== 'float32' && dataDtype !== 'int32') ||
+      b.dtype !== dataDtype || output.dtype !== dataDtype ||
       !sameShape(condition.shape, output.shape) || !sameShape(a.shape, output.shape) ||
       !sameShape(b.shape, output.shape) || !condition.buffer || !a.buffer || !b.buffer || !output.buffer ||
       condition.buffer.length !== output.buffer.length || a.buffer.length !== output.buffer.length ||
       b.buffer.length !== output.buffer.length) {
-    throw new Error(`${node.opType || 'Where'} requires exact-shape F32 operands/output and an F32 or I32 condition.`);
+    throw new Error(`${node.opType || 'Where'} requires exact-shape same-dtype F32/I32 operands/output and an F32 or I32 condition.`);
   }
 
   for (let index = 0; index < output.buffer.length; index++) {

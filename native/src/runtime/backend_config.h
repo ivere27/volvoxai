@@ -28,6 +28,12 @@
 #endif
 #endif
 
+/* CUDA requires generated kernels and its driver integration, so direct
+ * source builds keep it disabled unless their build composition opts in. */
+#ifndef VOLVOXAI_ENABLE_CUDA
+#define VOLVOXAI_ENABLE_CUDA 0
+#endif
+
 #if VOLVOXAI_ENABLE_METAL && !defined(__APPLE__)
 #error "VOLVOXAI_ENABLE_METAL requires an Apple target"
 #endif

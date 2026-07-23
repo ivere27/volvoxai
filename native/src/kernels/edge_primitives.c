@@ -1,27 +1,19 @@
 // --- Edge AI Primitives (Phase 1, 2, 3) ---
-#if defined(__AVX2__)
-#include <immintrin.h>
-#endif
-
 void sigmoid_f32(const float* input, float* output, int n) {
-#if defined(__AVX2__)
-    const __m256 one = _mm256_set1_ps(1.0f);
-    const __m256 c0 = _mm256_set1_ps(12102203.0f);
-    const __m256 c1 = _mm256_set1_ps(1064866805.0f);
-    const __m256 lo = _mm256_set1_ps(-80.0f);
-    const __m256 hi = _mm256_set1_ps(80.0f);
+    /*
+     * Sigmoid feeds SiLU blocks in imported ONNX vision encoders.  The old
+     * bit-level exp approximation could miss sigmoid by about 8e-3 and that
+     * error compounded across residual blocks.  accurate_expf remains
+     * freestanding for WASM while keeping native/WASM numerics aligned with
+     * the canonical exp definition.
+     */
     int i = 0;
-    for (; i + 8 <= n; i += 8) {
-        __m256 y = _mm256_sub_ps(_mm256_setzero_ps(), _mm256_loadu_ps(input + i));
-        y = _mm256_min_ps(_mm256_max_ps(y, lo), hi);
-        __m256 bits_f = _mm256_add_ps(_mm256_mul_ps(c0, y), c1);
-        __m256 exp_y = _mm256_castsi256_ps(_mm256_cvttps_epi32(bits_f));
-        _mm256_storeu_ps(output + i, _mm256_div_ps(one, _mm256_add_ps(one, exp_y)));
-    }
-    for (; i < n; i++) output[i] = 1.0f / (1.0f + fast_expf(-input[i]));
-#else
-    for (int i = 0; i < n; i++) output[i] = 1.0f / (1.0f + fast_expf(-input[i]));
+#if VX_FASTMATH_X86_AVX2
+    if (vx_kernel_platform()->has_avx2) i = vx_sigmoid_f32_avx2(input, output, n);
 #endif
+    for (; i < n; i++) {
+        output[i] = 1.0f / (1.0f + accurate_expf(-input[i]));
+    }
 }
 
 void hardswish_f32(const float* input, float* output, int n) {

@@ -47,7 +47,7 @@ function qSiLUGraph({
       quantization: outputQuantization,
     },
   });
-  graph.outputNames = [out.name];
+  graph.setOutputs([out.name]);
   return { graph, inputValues: bytes(inputDtype, inputValues), out };
 }
 

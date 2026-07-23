@@ -12,6 +12,7 @@ import {
   attentionDropoutEffectiveSeed,
   attentionDropoutProbability,
 } from '../ops/attentionDropout.js';
+import { DataType, runtimeDTypes } from '../generated/volvoxaiEnums.js';
 
 const ABI_VERSION = 1;
 const CAPABILITIES = Object.freeze({
@@ -28,11 +29,12 @@ const CAPABILITIES = Object.freeze({
 const REQUIRED_CAPABILITIES = Object.values(CAPABILITIES).reduce((mask, bit) => mask | bit, 0);
 const MAX_ALLOCATION_BYTES = 0x7ffffff0;
 const MAX_U32 = 0xffffffff;
+const RUNTIME_DTYPES = new Set<unknown>(runtimeDTypes);
 const TYPED_DTYPE = Object.freeze({
-  float32: 0,
-  int32: 1,
-  int8: 2,
-  uint8: 3,
+  float32: DataType.F32,
+  int32: DataType.I32,
+  int8: DataType.I8,
+  uint8: DataType.U8,
 });
 
 const WEIGHT_SCALE_POLICY = Object.freeze({
@@ -656,7 +658,7 @@ export class WasmTrainingKernels {
     const byNode = new Map<any, WasmKernelPlan>();
     const staticTypedWeights: any[] = [];
     for (const tensor of graph.tensors.values()) {
-      if (!['float32', 'int32', 'int8', 'uint8'].includes(tensor.dtype)) {
+      if (!RUNTIME_DTYPES.has(tensor.dtype)) {
         throw new Error(`WASM training tensor '${tensor.name}' has unsupported dtype '${tensor.dtype}'.`);
       }
       if (tensor.sizeBytes <= 0 || tensor.sizeBytes > MAX_ALLOCATION_BYTES) {
@@ -735,7 +737,7 @@ export class WasmTrainingKernels {
 
     if (op === 'Split') {
       const x = requireTensor(input, 'float32', `Split input at node '${node.id}'`);
-      const entries = Object.entries(node.outputs || {}).sort(([a], [b]) => a.localeCompare(b));
+      const entries = Object.entries(node.outputs || {});
       let axis = node.params?.axis ?? 0;
       if (axis < 0) axis += x.shape.length;
       if (!entries.length || !Number.isInteger(axis) || axis < 0 || axis >= x.shape.length || x.shape[axis] % entries.length) throw new Error(`WASM training Split node '${node.id}' requires equal-sized outputs on a valid axis.`);
@@ -911,9 +913,8 @@ export class WasmTrainingKernels {
       const k = x.shape.at(-1);
       const n = out.shape.at(-1);
       const doutFirst = node.wLayout === 'dout';
-      // A square matrix is ambiguous in the legacy CPU shape heuristic. The
-      // full WASM profile accepts both physical layouts, so require an explicit
-      // layout there instead of silently training the transposed model.
+      // A square matrix does not identify its physical layout. Require the
+      // graph to declare it instead of silently training a transposed model.
       const ambiguousLayout = node.wLayout == null && weight.shape[0] === n && weight.shape[1] === k;
       if (node.inputs.scale || ambiguousLayout || weight.shape.length !== 2 ||
           (node.wLayout != null && node.wLayout !== 'din' && node.wLayout !== 'dout')) {
@@ -1079,7 +1080,7 @@ export class WasmTrainingKernels {
       this._requireExport('volvoxai_training_pad2d_f32'); return {kind:'pad2d',node,x,output:out,batch,height,width,channels,padTop,padBottom,padLeft,padRight,value};
     }
 
-    if(op==='Interp1D'||op==='InterpLinear1D'){
+    if(op==='Interpolate1D'||op==='Interp1D'||op==='InterpLinear1D'){
       const x=requireTensor(input,'float32',`${op} input at node '${node.id}'`),out=requireTensor(output,'float32',`${op} output at node '${node.id}'`);
       if(x.shape.length!==3||out.shape.length!==3||out.shape[0]!==x.shape[0]||out.shape[1]!==x.shape[1]||out.shape[2]!==node.params?.size) throw new Error(`WASM training ${op} node '${node.id}' requires matching rank-3 NCL tensors.`);
       this._requireExport('volvoxai_training_interp1d_f32');return{kind:'interp1d',node,x,output:out,batch:x.shape[0],channels:x.shape[1],inputLength:x.shape[2],outputLength:out.shape[2]};
@@ -1239,7 +1240,8 @@ export class WasmTrainingKernels {
       this._requireExport('volvoxai_training_where_f32');
       return {
         kind: 'where', node, condition, a: left, b: right, output: out,
-        conditionType: condition.dtype === 'int32' ? 1 : 0, elements: elementCount(out.shape),
+        conditionType: condition.dtype === 'int32' ? DataType.I32 : DataType.F32,
+        elements: elementCount(out.shape),
       };
     }
 
@@ -1528,7 +1530,7 @@ export class WasmTrainingKernels {
         } else if (item.kind === 'pad2d') {
           apiResult(this.api.volvoxai_training_pad2d_f32(pointer(item.x),pointer(item.output),item.batch,item.height,item.width,item.channels,item.padTop,item.padBottom,item.padLeft,item.padRight,item.value),`Pad forward at node '${item.node.id}'`);
         } else if(item.kind==='interp1d'){
-          apiResult(this.api.volvoxai_training_interp1d_f32(pointer(item.x),pointer(item.output),item.batch,item.channels,item.inputLength,item.outputLength),`Interp1D forward at node '${item.node.id}'`);
+          apiResult(this.api.volvoxai_training_interp1d_f32(pointer(item.x),pointer(item.output),item.batch,item.channels,item.inputLength,item.outputLength),`Interpolate1D forward at node '${item.node.id}'`);
         } else if (item.kind === 'prelu') {
           apiResult(this.api.volvoxai_training_prelu_f32(pointer(item.x), pointer(item.slope), pointer(item.output), item.elements, item.slopeElements, item.channels), `PReLU forward at node '${item.node.id}'`);
         } else if (item.kind === 'globalAveragePool') {
@@ -2179,7 +2181,7 @@ export class WasmTrainingKernels {
       apiResult(value,`Pad backward at node '${node.id}'`);dx.set(outputs.dx);return true;
     }
     if(item.kind==='interp1d'){
-      const dx=gradientFor(item.x),{value,outputs}=this._runArena([this._floatEntry('dy',outputGradient),this._floatEntry('dx',dx,true)],p=>this.api.volvoxai_training_interp1d_backward_f32(p.dy,p.dx,item.batch,item.channels,item.inputLength,item.outputLength));apiResult(value,`Interp1D backward at node '${node.id}'`);dx.set(outputs.dx);return true;
+      const dx=gradientFor(item.x),{value,outputs}=this._runArena([this._floatEntry('dy',outputGradient),this._floatEntry('dx',dx,true)],p=>this.api.volvoxai_training_interp1d_backward_f32(p.dy,p.dx,item.batch,item.channels,item.inputLength,item.outputLength));apiResult(value,`Interpolate1D backward at node '${node.id}'`);dx.set(outputs.dx);return true;
     }
 
     if (item.kind === 'prelu') {

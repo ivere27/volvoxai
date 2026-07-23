@@ -1,8 +1,9 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
-import { CPUEngine, Graph } from '../ts/index.js';
-import { CPUAutograd } from '../ts/training/index.js';
+import { Graph } from '../ts/index.js';
+import { CPUEngine } from '../ts/backends/CPUEngine.js';
+import { CPUAutograd } from '../ts/training/CPUAutograd.js';
 
 function addWeight(graph, name, shape, values) {
   const tensor = graph.addWeight(name, shape);
@@ -71,7 +72,7 @@ test('CPU SDPA supports full attention and masks forward/backward consistently',
   const { out } = graph.addOp(
     'SDPA', { qkv, mask }, { out: [1, 3, 2] }, { heads: 1, scale: 0.43, causal: false },
   );
-  graph.outputNames = [out.name];
+  graph.setOutputs([out.name]);
   const inputs = { mask: Int32Array.of(1, 0, 1) };
   const targets = [0, 1, 0];
 
@@ -107,7 +108,7 @@ test('CPU CrossSDPA applies query masks and defaults to non-causal attention', a
   const { out } = graph.addOp(
     'CrossSDPA', { q, k, v, mask }, { out: [1, 2, 2] }, { heads: 1, scale: 0.37 },
   );
-  graph.outputNames = [out.name];
+  graph.setOutputs([out.name]);
   const inputs = { mask: Int32Array.of(1, 0, 1, 0, 0, 0) };
   const targets = [0, 1];
 
@@ -147,7 +148,7 @@ test('CPU attention accepts batch and batch-query mask layouts', async (t) => {
       const { out } = graph.addOp(
         'SDPA', { qkv, mask }, { out: [2, 1, 2] }, { heads: 1, causal: false },
       );
-      graph.outputNames = [out.name];
+      graph.setOutputs([out.name]);
       const engine = new CPUEngine();
       engine.allocateGraph(graph);
       await engine.execute({ mask: Int32Array.of(1, 0) });
@@ -161,7 +162,7 @@ test('CPU attention accepts batch and batch-query mask layouts', async (t) => {
 test('CPU trainStep honors ignoreIndex and lossMask and advances successful steps once', async () => {
   const graph = new Graph();
   const logits = addWeight(graph, 'logits', [1, 4, 3], new Array(12).fill(0));
-  graph.outputNames = [logits.name];
+  graph.setOutputs([logits.name]);
   const result = await zeroRateGradients(
     graph,
     ['logits'],
@@ -226,7 +227,7 @@ test('CPU embedding training accepts conventional Int32 token IDs', async () => 
     0.9, -0.1, 0.5,
   ]);
   const { out } = graph.addOp('Embedding', { input: tokens, weight: table }, { out: [2, 3] });
-  graph.outputNames = [out.name];
+  graph.setOutputs([out.name]);
   const result = await zeroRateGradients(
     graph, ['table'], Int32Array.of(1, 2), { tokens: Int32Array.of(0, 2) },
   );
@@ -238,7 +239,7 @@ test('CPU embedding training accepts conventional Int32 token IDs', async () => 
 test('CPU optimizer descriptors are validated before any mutation', async () => {
   const graph = new Graph();
   const logits = addWeight(graph, 'logits', [1, 2], [0.25, -0.25]);
-  graph.outputNames = [logits.name];
+  graph.setOutputs([logits.name]);
   const before = new Float32Array(logits.buffer);
   await assert.rejects(
     () => CPUAutograd.trainStep(graph, {
@@ -260,7 +261,7 @@ test('CPU inputs require exact graph dtype and cannot target parameters', async 
   const ids = graph.addInput('ids', [1], 'int32');
   const table = addWeight(graph, 'table', [2, 2], [1, 0, 0, 1]);
   const { out } = graph.addOp('Embedding', { input: ids, weight: table }, { out: [1, 2] });
-  graph.outputNames = [out.name];
+  graph.setOutputs([out.name]);
   const engine = new CPUEngine();
   engine.allocateGraph(graph);
   await assert.rejects(() => engine.execute({ ids: Float32Array.of(1) }), /typed storage/);

@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 /**
- * Normalize the native TinyReceipt trainer's F32 package into the named INT8
+ * Normalize a TinyReceipt F32 checkpoint package into the named INT8
  * source contract consumed by materialize_tiny_receipt_vqa_w8a8.py.
  *
  * Quantization math is owned by ts/training/Quantization.ts. This file owns
@@ -14,9 +14,7 @@ import { join, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 
 import {
-  CPUEngine,
   Graph,
-  calibratePTQ,
   derivePTQParameters,
   materializePTQWeights,
 } from '../../../ts/full.js';
@@ -24,6 +22,7 @@ import {
   LINEAR_SAMPLE_FORMAT,
   TRAINED_SOURCE_FORMAT,
   assembleTrainedSourceGraph,
+  calibrateRuntimeOutputs,
   loadTrainedTinyReceiptPackage,
   makeTrainedStructuralSample,
   normalizeTrainedCalibrationSamples,
@@ -32,13 +31,14 @@ import {
 export const NORMALIZED_TRAINED_SOURCE_FORMAT =
   'tiny_receipt_vqa_volvox_trained_int8_safetensors_v1';
 export const NORMALIZED_TRAINED_SOURCE_RUNTIME =
-  'volvoxai-js-ptq-native-trained-f32-v1';
+  'volvoxai-js-ptq-trained-f32-v1';
 export const ACTIVATION_PROFILE_FORMAT =
   'volvoxai-tiny-receipt-vqa-w8a8-activation-scales-v1';
 
 export const NAMED_SOURCE_LAYOUT = Object.freeze({
   int8_per_out: 'quantized.<state_dict_key>',
   scale_fp32: 'scale.<state_dict_key>',
+  zero_point_i8: 'quantized.<state_dict_key>.zero_point',
   float32: 'float32.<state_dict_key>',
 });
 export const NAMED_SOURCE_QUANTIZATION = 'symmetric per-output-channel INT8';
@@ -178,7 +178,7 @@ function contiguousLayerCount(names, expression, label) {
 }
 
 function graphOp(node) {
-  return node?.opType ?? node?.op;
+  return node?.opType;
 }
 
 function deriveDimensions(source, vocab) {
@@ -199,7 +199,7 @@ function deriveDimensions(source, vocab) {
     names, /^vqa\.decoder\.(\d+)\.self_attention\.qkv\.weight$/, 'decoder',
   );
   const heads = new Set(
-    source.config.nodes
+    source.graphDocument.nodes
       .filter((node) => ['SDPA', 'CrossSDPA'].includes(graphOp(node)))
       .map((node) => node.params?.heads),
   );
@@ -456,8 +456,12 @@ function materializeNamedWeights(mapping) {
   });
   const token = artifact.weights.getTensor('quantized.tok.weight');
   const tokenScale = artifact.weights.getTensor('scale.tok.weight');
+  const tokenZeroPoint = artifact.weights.getTensor('quantized.tok.weight.zero_point');
   artifact.weights.addTensor('quantized.head.weight', 'I8', token.shape, token.getBytes());
   artifact.weights.addTensor('scale.head.weight', 'F32', tokenScale.shape, tokenScale.getBytes());
+  artifact.weights.addTensor(
+    'quantized.head.weight.zero_point', 'I8', tokenZeroPoint.shape, tokenZeroPoint.getBytes(),
+  );
   for (const entry of mapping.float32) {
     artifact.weights.addTensor(
       `float32.${entry.key}`, 'F32', entry.target.shape, byteView(entry.target.data),
@@ -482,11 +486,10 @@ function manifestTensors(mapping) {
 }
 
 async function globalActivationProfile(source, samples, representative) {
-  const executor = new CPUEngine().allocateGraph(source.graph);
   const tensorNames = [...source.graph.tensors.values()]
     .filter((tensor) => !tensor.isWeight && tensor.dtype === 'float32')
     .map((tensor) => tensor.name);
-  const calibrator = await calibratePTQ(executor, samples, { tensorNames });
+  const { calibrator } = await calibrateRuntimeOutputs(source.graph, samples, tensorNames);
   let minimum = Infinity;
   let maximum = -Infinity;
   let sampleCount = 0;
@@ -587,7 +590,7 @@ export async function exportTrainedPTQSource({
     tensors: manifestTensors(mapping),
     source: {
       format: TRAINED_SOURCE_FORMAT,
-      config_sha256: source.hashes.config_sha256,
+      graph_sha256: source.hashes.graph_sha256,
       weights_sha256: source.hashes.weights_sha256,
       layout_mapping: {
         conv: 'HWIO_to_OIHW',

@@ -1,9 +1,7 @@
 import type { Graph } from '../core/Graph.js';
 import type { BackendExecutionOptions } from './BackendEngine.js';
 
-interface IncrementalExecutionOptions extends BackendExecutionOptions {
-  training?: unknown;
-}
+interface IncrementalExecutionOptions extends BackendExecutionOptions {}
 
 /* Compute the dependency closure for opt-in inference-only intermediate
  * caching. Executor tensor storage already survives execute() calls; selected
@@ -46,17 +44,10 @@ export function incrementalNodeSelection(
 export function incrementalExecutionEnabled(
   options: IncrementalExecutionOptions,
   adapterPlan: unknown = null,
-  runtimeEnabled = true,
 ) {
   if (options?.incremental !== true) return false;
-  if (!runtimeEnabled) {
-    throw new Error('Incremental execution is unavailable after the backend enters training mode.');
-  }
   if (adapterPlan != null) {
     throw new Error('Incremental execution is unavailable while an adapter is active.');
-  }
-  if (options.training != null) {
-    throw new Error('Incremental execution cannot be combined with training execution.');
   }
   return true;
 }

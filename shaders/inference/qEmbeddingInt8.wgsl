@@ -31,7 +31,7 @@ fn signed_byte(value : u32) -> i32 {
 }
 
 fn typed_byte(byte : u32, dtype : u32) -> i32 {
-  if (dtype == 2u) { return signed_byte(byte); }
+  if (dtype == 6u) { return signed_byte(byte); }
   return i32(byte);
 }
 
@@ -67,8 +67,8 @@ fn qembedding_one(index : u32) -> u32 {
   let dequantized = centered * weight_scales[row];
   let scaled = dequantized / params.output_scale;
   let transformed = scaled + f32(params.output_zero_point);
-  let minimum = select(0, -128, params.output_type == 2u);
-  let maximum = select(255, 127, params.output_type == 2u);
+  let minimum = select(0, -128, params.output_type == 6u);
+  let maximum = select(255, 127, params.output_type == 6u);
   if (transformed != transformed) { return output_byte(params.output_zero_point); }
   if (transformed <= f32(minimum)) { return output_byte(minimum); }
   if (transformed >= f32(maximum)) { return output_byte(maximum); }

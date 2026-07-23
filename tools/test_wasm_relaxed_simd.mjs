@@ -62,8 +62,14 @@ const child = await WebAssembly.instantiate(childModule, { env: { memory } });
 const qlinear = child.exports.qlinear_i8u8_relaxed;
 assert.equal(typeof qlinear, 'function');
 
-const I8 = 2;
-const U8 = 3;
+// Canonical protobuf DataType values used by the public native/WASM ABI.
+const VX_DTYPE_U8 = 5;
+const VX_DTYPE_I8 = 6;
+const VX_DTYPE_I32 = 16;
+const VX_PACKED_Q8_MAGIC_V8Q1 = 0x31513856;
+const VX_PACKED_Q8_MAGIC_V8Q2 = 0x32513856;
+const VX_PACKED_Q8_HEADER_WORDS = 12;
+const VX_PACKED_Q8_NR = 8;
 const dIn = 17;
 const dOut = 7;
 const rawInput = Uint8Array.from([
@@ -110,8 +116,41 @@ function writeBytes(pointer, values) {
   );
 }
 
+function align16(value) {
+  return Math.ceil(value / 16) * 16;
+}
+
+function expectedV8Q2HeaderWords(inputDimension, outputDimension,
+    weightDtype, bytes) {
+  const nBlocks = Math.ceil(outputDimension / VX_PACKED_Q8_NR);
+  const sumsOffset = align16(VX_PACKED_Q8_HEADER_WORDS * 4);
+  const dataOffset = align16(
+    sumsOffset + nBlocks * VX_PACKED_Q8_NR * Int32Array.BYTES_PER_ELEMENT,
+  );
+  const pairDataOffset = align16(
+    dataOffset + nBlocks * inputDimension * VX_PACKED_Q8_NR,
+  );
+  assert.equal(bytes, pairDataOffset,
+    'the wasm V8Q2 pack must end at its aligned pair-data offset');
+  return [
+    VX_PACKED_Q8_MAGIC_V8Q2, bytes, inputDimension, outputDimension,
+    nBlocks, weightDtype, sumsOffset, dataOffset,
+    0, 0, pairDataOffset, 0,
+  ];
+}
+
+function readPackedHeaderWords(pointer) {
+  const view = new DataView(
+    memory.buffer, pointer, VX_PACKED_Q8_HEADER_WORDS * 4,
+  );
+  return Array.from(
+    { length: VX_PACKED_Q8_HEADER_WORDS },
+    (_, index) => view.getUint32(index * 4, true),
+  );
+}
+
 function semanticByte(raw, dtype) {
-  return dtype === I8 && raw >= 128 ? raw - 256 : raw;
+  return dtype === VX_DTYPE_I8 && raw >= 128 ? raw - 256 : raw;
 }
 
 function roundTiesEven(value) {
@@ -124,8 +163,8 @@ function roundTiesEven(value) {
 
 function expectedOutput(inputDtype, weightDtype, outputDtype, inputZeroPoint,
     weightZeroPoints, outputZeroPoint) {
-  const minimum = outputDtype === I8 ? -128 : 0;
-  const maximum = outputDtype === I8 ? 127 : 255;
+  const minimum = outputDtype === VX_DTYPE_I8 ? -128 : 0;
+  const maximum = outputDtype === VX_DTYPE_I8 ? 127 : 255;
   return Array.from({ length: dOut }, (_, column) => {
     let accumulator = biasValues[column];
     for (let k = 0; k < dIn; k++) {
@@ -136,7 +175,8 @@ function expectedOutput(inputDtype, weightDtype, outputDtype, inputZeroPoint,
     }
     const transformed = accumulator * weightScales[column] / 256 + outputZeroPoint;
     const quantized = Math.max(minimum, Math.min(maximum, roundTiesEven(transformed)));
-    return outputDtype === I8 && quantized < 0 ? quantized + 256 : quantized;
+    return outputDtype === VX_DTYPE_I8 && quantized < 0 ?
+      quantized + 256 : quantized;
   });
 }
 
@@ -145,19 +185,24 @@ writeBytes(weightPointer, rawWeights);
 writeBytes(biasPointer, biasValues);
 writeBytes(scalesPointer, weightScales);
 
-for (const inputDtype of [I8, U8]) {
-  for (const weightDtype of [I8, U8]) {
-    for (const outputDtype of [I8, U8]) {
-      const inputZeroPoint = inputDtype === I8 ? -7 : 131;
-      const outputZeroPoint = outputDtype === I8 ? -3 : 121;
-      const weightZeroPoints = weightDtype === I8
+for (const inputDtype of [VX_DTYPE_I8, VX_DTYPE_U8]) {
+  for (const weightDtype of [VX_DTYPE_I8, VX_DTYPE_U8]) {
+    for (const outputDtype of [VX_DTYPE_I8, VX_DTYPE_U8]) {
+      const inputZeroPoint = inputDtype === VX_DTYPE_I8 ? -7 : 131;
+      const outputZeroPoint = outputDtype === VX_DTYPE_I8 ? -3 : 121;
+      const weightZeroPoints = weightDtype === VX_DTYPE_I8
         ? signedWeightZeroPoints : unsignedWeightZeroPoints;
       writeBytes(zeroPointsPointer, weightZeroPoints);
       new Uint8Array(memory.buffer, outputPointer, dOut).fill(0xa5);
       new Uint8Array(memory.buffer, baselineOutputPointer, dOut).fill(0xa5);
       assert.equal(parent.exports.pack_q8_weight(
         packedPointer, packedBytes, weightPointer, dIn, dOut, weightDtype, 1,
-      ), 1, 'parent must create the canonical V8Q1 panel');
+      ), 1, 'parent must create the canonical V8Q2 panel');
+      assert.deepEqual(
+        readPackedHeaderWords(packedPointer),
+        expectedV8Q2HeaderWords(dIn, dOut, weightDtype, packedBytes),
+        'parent and child must share the exact wasm V8Q2 header contract',
+      );
       assert.equal(parent.exports.qlinear_i8u8(
         inputPointer, weightPointer, biasPointer, scalesPointer,
         zeroPointsPointer, baselineOutputPointer,
@@ -185,11 +230,58 @@ for (const inputDtype of [I8, U8]) {
   }
 }
 
+function assertCorruptPackedHeaderRejected(word, replacement, label) {
+  const byteOffset = word * 4;
+  const header = new DataView(
+    memory.buffer, packedPointer, VX_PACKED_Q8_HEADER_WORDS * 4,
+  );
+  const original = header.getUint32(byteOffset, true);
+  header.setUint32(byteOffset, replacement, true);
+  try {
+    new Uint8Array(memory.buffer, outputPointer, dOut).fill(0xa5);
+    assert.equal(qlinear(
+      inputPointer, weightPointer, packedPointer, biasPointer,
+      scalesPointer, zeroPointsPointer, outputPointer,
+      1, dIn, dOut, 1, 131, 256, 121,
+      VX_DTYPE_U8, VX_DTYPE_U8, VX_DTYPE_U8,
+    ), 0, label);
+    assert.deepEqual(
+      [...new Uint8Array(memory.buffer, outputPointer, dOut)],
+      Array(dOut).fill(0xa5),
+      `${label}: rejection must precede the first output write`,
+    );
+  } finally {
+    header.setUint32(byteOffset, original, true);
+  }
+}
+
+assertCorruptPackedHeaderRejected(
+  0, VX_PACKED_Q8_MAGIC_V8Q1,
+  'a legacy V8Q1 magic must not be interpreted as a V8Q2 pack',
+);
+assertCorruptPackedHeaderRejected(
+  1, packedBytes - 16,
+  'a truncated V8Q2 byte count must fail closed',
+);
+assertCorruptPackedHeaderRejected(
+  6, 32,
+  'a legacy V8Q1 sums offset must fail closed',
+);
+assertCorruptPackedHeaderRejected(
+  10, packedBytes - 16,
+  'a malformed V8Q2 pair-data offset must fail closed',
+);
+assertCorruptPackedHeaderRejected(
+  11, 1,
+  'unexpected wasm V8Q2 pair flags must fail closed',
+);
+
 new Uint8Array(memory.buffer, outputPointer, dOut).fill(0xa5);
 assert.equal(qlinear(
   inputPointer, weightPointer, packedPointer, biasPointer,
   scalesPointer, zeroPointsPointer, outputPointer,
-  2, dIn, dOut, 1, 131, 256, 121, U8, U8, U8,
+  2, dIn, dOut, 1, 131, 256, 121,
+  VX_DTYPE_U8, VX_DTYPE_U8, VX_DTYPE_U8,
 ), 0, 'M>1 must fail closed to the baseline path');
 assert.deepEqual([...new Uint8Array(memory.buffer, outputPointer, dOut)],
   Array(dOut).fill(0xa5), 'rejected descriptors must not write output bytes');
@@ -199,7 +291,8 @@ new Uint8Array(memory.buffer, crossingOutputPointer, 1).fill(0xa5);
 assert.equal(qlinear(
   inputPointer, weightPointer, packedPointer, biasPointer,
   scalesPointer, zeroPointsPointer, crossingOutputPointer,
-  1, dIn, dOut, 1, 131, 256, 121, U8, U8, U8,
+  1, dIn, dOut, 1, 131, 256, 121,
+  VX_DTYPE_U8, VX_DTYPE_U8, VX_DTYPE_U8,
 ), 0, 'a descriptor crossing the current imported-memory bound must fail closed');
 assert.equal(new Uint8Array(memory.buffer, crossingOutputPointer, 1)[0], 0xa5,
   'an out-of-memory output span must be rejected before its first write');
@@ -228,19 +321,21 @@ writeBytes(prefixScalePointer, Float32Array.of(1));
 writeBytes(prefixZeroPointPointer, Int32Array.of(-54));
 assert.equal(parent.exports.pack_q8_weight(
   prefixPackedPointer, prefixPackedBytes, prefixWeightPointer,
-  prefixK, 1, I8, 1,
+  prefixK, 1, VX_DTYPE_I8, 1,
 ), 1);
 new Uint8Array(memory.buffer, prefixChildOutput, 1).fill(0xa5);
 new Uint8Array(memory.buffer, prefixParentOutput, 1).fill(0xa5);
 assert.equal(parent.exports.qlinear_i8u8(
   prefixInputPointer, prefixWeightPointer, prefixBiasPointer,
   prefixScalePointer, prefixZeroPointPointer, prefixParentOutput,
-  1, prefixK, 1, 1, 215, 1, 0, U8, I8, I8,
+  1, prefixK, 1, 1, 215, 1, 0,
+  VX_DTYPE_U8, VX_DTYPE_I8, VX_DTYPE_I8,
 ), 0, 'the portable kernel must reject an overflowing canonical K prefix');
 assert.equal(qlinear(
   prefixInputPointer, prefixWeightPointer, prefixPackedPointer,
   prefixBiasPointer, prefixScalePointer, prefixZeroPointPointer,
-  prefixChildOutput, 1, prefixK, 1, 1, 215, 1, 0, U8, I8, I8,
+  prefixChildOutput, 1, prefixK, 1, 1, 215, 1, 0,
+  VX_DTYPE_U8, VX_DTYPE_I8, VX_DTYPE_I8,
 ), 0, 'the child must preserve the portable prefix-overflow rejection');
 assert.equal(new Uint8Array(memory.buffer, prefixParentOutput, 1)[0], 0xa5);
 assert.equal(new Uint8Array(memory.buffer, prefixChildOutput, 1)[0], 0xa5);
@@ -258,7 +353,7 @@ const benchmarkBias = new Int32Array(benchmarkN);
 const benchmarkScales = new Float32Array(benchmarkN).fill(0.0078125);
 const benchmarkZeroPoints = new Int32Array(benchmarkN);
 const benchmarkInputF32 = Float32Array.from(
-  benchmarkInput, (raw) => semanticByte(raw, I8) * 0.25,
+  benchmarkInput, (raw) => semanticByte(raw, VX_DTYPE_I8) * 0.25,
 );
 const benchmarkBiasF32 = new Float32Array(benchmarkN);
 const benchmarkInputPointer = allocate(benchmarkK);
@@ -285,29 +380,32 @@ writeBytes(benchmarkInputF32Pointer, benchmarkInputF32);
 writeBytes(benchmarkBiasF32Pointer, benchmarkBiasF32);
 assert.equal(parent.exports.pack_q8_weight(
   benchmarkPackedPointer, benchmarkPackedBytes, benchmarkWeightPointer,
-  benchmarkK, benchmarkN, I8, 1,
+  benchmarkK, benchmarkN, VX_DTYPE_I8, 1,
 ), 1);
 
 const relaxedCall = () => qlinear(
   benchmarkInputPointer, benchmarkWeightPointer, benchmarkPackedPointer,
   benchmarkBiasPointer, benchmarkScalesPointer, benchmarkZeroPointsPointer,
   benchmarkRelaxedOutput, 1, benchmarkK, benchmarkN,
-  0.25, 0, 8, 0, I8, I8, I8,
+  0.25, 0, 8, 0, VX_DTYPE_I8, VX_DTYPE_I8, VX_DTYPE_I8,
 );
 const packedCall = () => parent.exports.qlinear_i8u8_packed(
   benchmarkInputPointer, benchmarkPackedPointer, benchmarkBiasPointer,
   benchmarkScalesPointer, benchmarkZeroPointsPointer, benchmarkPackedOutput,
-  1, benchmarkK, benchmarkN, 0.25, 0, 8, 0, I8, I8, I8,
+  1, benchmarkK, benchmarkN, 0.25, 0, 8, 0,
+  VX_DTYPE_I8, VX_DTYPE_I8, VX_DTYPE_I8,
 );
 const portableCall = () => parent.exports.qlinear_i8u8(
   benchmarkInputPointer, benchmarkWeightPointer, benchmarkBiasPointer,
   benchmarkScalesPointer, benchmarkZeroPointsPointer, benchmarkPortableOutput,
-  1, benchmarkK, benchmarkN, 0.25, 0, 8, 0, I8, I8, I8,
+  1, benchmarkK, benchmarkN, 0.25, 0, 8, 0,
+  VX_DTYPE_I8, VX_DTYPE_I8, VX_DTYPE_I8,
 );
 const w8a32Call = () => parent.exports.matmul_quantized_f32_packed(
   benchmarkInputF32Pointer, benchmarkPackedPointer, benchmarkScalesPointer,
   benchmarkZeroPointsPointer, benchmarkBiasF32Pointer, benchmarkW8A32Output,
-  1, benchmarkK, benchmarkN, I8, benchmarkN, 1, benchmarkN,
+  1, benchmarkK, benchmarkN, VX_DTYPE_I8, benchmarkN,
+  VX_DTYPE_I32, benchmarkN,
 );
 assert.equal(relaxedCall(), 1);
 assert.equal(packedCall(), 1);
@@ -327,7 +425,8 @@ const expectedW8A32 = Float32Array.from({ length: benchmarkN }, (_, column) => {
   let accumulator = 0;
   for (let k = 0; k < benchmarkK; k++) {
     accumulator += benchmarkInputF32[k] *
-      semanticByte(benchmarkWeight[column * benchmarkK + k], I8);
+      semanticByte(
+        benchmarkWeight[column * benchmarkK + k], VX_DTYPE_I8);
   }
   return accumulator * benchmarkScales[column];
 });
@@ -365,11 +464,12 @@ writeBytes(probeScalePointer, probeScale);
 writeBytes(probeBiasPointer, probeBias);
 assert.equal(parent.exports.pack_q8_weight(
   probePackedPointer, probePackedBytes, probeWeightPointer,
-  probeK, probeN, I8, 1,
+  probeK, probeN, VX_DTYPE_I8, 1,
 ), 1);
 assert.equal(parent.exports.matmul_quantized_f32_packed(
   probeInputPointer, probePackedPointer, probeScalePointer, 0,
-  probeBiasPointer, probeOutputPointer, 1, probeK, probeN, I8, probeN, 0, 0,
+  probeBiasPointer, probeOutputPointer, 1, probeK, probeN,
+  VX_DTYPE_I8, probeN, 0, 0,
 ), 1);
 const expectedCompensated = new Float32Array(probeN);
 const scalarDouble = new Float32Array(probeN);

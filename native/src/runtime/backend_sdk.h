@@ -1,15 +1,23 @@
 #ifndef VOLVOX_RUNTIME_BACKEND_SDK_H
 #define VOLVOX_RUNTIME_BACKEND_SDK_H
 
-#include "backend.h"
+#include "volvoxai_backend.h"
 
-/* Internal selection bridge.  Registration is public, but registered entries
- * remain dormant until engine.c selects exactly one by name.  Callers of the
- * selection helpers hold the engine model lock. */
-int vx_sdk_select_backend(const char* name);
-void vx_sdk_clear_backend(void);
-const char* vx_sdk_selected_name(void);
-const VxBackend* vx_sdk_selected_backend(void);
-const VxBackend* vx_sdk_find_backend(const char* name);
+typedef struct VxProviderRegistry VxProviderRegistry;
+
+typedef struct VxProviderBinding {
+    const VxBackendProvider* provider;
+    void* runtime_instance;
+} VxProviderBinding;
+
+VxProviderRegistry* vx_provider_registry_create(void);
+void vx_provider_registry_destroy(VxProviderRegistry* registry);
+VxStatus vx_provider_registry_register(VxProviderRegistry* registry,
+                                       const VxRuntimeOptions* options,
+                                       const VxBackendProvider* provider,
+                                       VxReport* report);
+int vx_provider_registry_find(VxProviderRegistry* registry,
+                              const char* name,
+                              VxProviderBinding* binding);
 
 #endif /* VOLVOX_RUNTIME_BACKEND_SDK_H */

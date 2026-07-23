@@ -1,0 +1,78 @@
+{
+  "_comment": "Cross-tier whole-model parity policy. Tolerances are per numeric class; every model names its inputs, the output slice to compare, the tiers to run, and which tiers gate CI. Edit here — never bury an exception in code.",
+  "_tol_note": "fp32/fp16 gate on global stats too. int8 sets statsGate=false: a true-int8 backend vs an int8-folded-to-fp32 reference can differ in raw magnitudes. Synthetic-input true-int8 GPU and ONNX tiers are explicitly diagnostic; the exact GPU consensus and real-image parity targets are the correctness gates.",
+  "tolerances": {
+    "fp32": { "rtol": 1e-3, "atol": 2e-4, "statsGate": true },
+    "fp16": { "rtol": 1e-2, "atol": 1e-3, "statsGate": true },
+    "int8": { "rtol": 1.5e-2, "atol": 6e-3, "statsGate": false },
+    "external": { "rtol": 2e-2, "atol": 1e-2, "statsGate": false }
+  },
+  "models": {
+    "tinystories_1m": {
+      "dir": "models/tinystories_1m",
+      "dtype": "fp32",
+      "inputs": [
+        { "name": "tokens", "file": "models/tinystories_1m/tokens.i32", "dtype": "i32" },
+        { "name": "positions", "file": "models/tinystories_1m/positions.i32", "dtype": "i32" }
+      ],
+      "outputs": [
+        { "name": "logits", "kind": "row", "rows": 256, "cols": 50257, "row": 4, "shape": [50257], "sampleAxes": [0], "topk": 10 }
+      ],
+      "tiers": ["cpu", "wasm", "native-cpu", "webgpu", "native-vulkan", "native-opengl"],
+      "gate": ["cpu", "wasm", "native-cpu"],
+      "external": {
+        "source": "pytorch",
+        "repo": "roneneldan/TinyStories-1M",
+        "revision": "77f1b168e219585646439073245fe87e56b3023e",
+        "note": "Pinned GPT-Neo checkpoint via transformers; see external/tinystories_torch_oracle.py"
+      }
+    },
+    "efficientdet_lite0_int8": {
+      "dir": "models/efficientdet_lite0_int8",
+      "dtype": "int8",
+      "inputs": [
+        { "name": "input0", "gen": "seededU8", "dtype": "u8", "shape": [1, 320, 320, 3], "seed": 1234 }
+      ],
+      "outputs": [
+        { "name": "scores", "kind": "flat", "shape": [1, 19206, 90], "sampleAxes": [1, 2], "topk": 10 },
+        { "name": "boxes", "kind": "flat", "shape": [1, 19206, 4], "sampleAxes": [1, 2], "topk": 0 }
+      ],
+      "tiers": ["cpu", "wasm", "native-cpu", "webgpu", "native-vulkan", "native-opengl"],
+      "gate": ["cpu", "wasm"],
+      "diagnosticTiers": ["webgpu", "native-vulkan", "native-opengl", "onnx"],
+      "external": {
+        "onnx": "models/efficientdet_lite0_int8/efficientdet_lite0.onnx",
+        "inputs": { "input0": "serving_default_images:0" },
+        "outputs": { "StatefulPartitionedCall:1": "scores", "StatefulPartitionedCall:0": "boxes" }
+      }
+    },
+    "efficientdet_lite0_fp32": {
+      "dir": "models/efficientdet_lite0_fp32",
+      "dtype": "fp32",
+      "inputs": [
+        { "name": "input0", "gen": "seededF32", "dtype": "f32", "shape": [1, 320, 320, 3], "seed": 1234, "lo": 0, "hi": 1 }
+      ],
+      "outputs": [
+        { "name": "scores", "kind": "flat", "shape": [1, 19206, 90], "sampleAxes": [1, 2], "topk": 10 },
+        { "name": "boxes", "kind": "flat", "shape": [1, 19206, 4], "sampleAxes": [1, 2], "topk": 0 }
+      ],
+      "tiers": ["cpu", "wasm", "native-cpu", "webgpu", "native-vulkan", "native-opengl"],
+      "gate": ["cpu", "wasm"],
+      "toleranceOverrides": {
+        "native-cpu": {
+          "scores": {
+            "rtol": 0.001,
+            "atol": 0.01,
+            "statsGate": true,
+            "reason": "native CPU uses the declared approximate Sigmoid kernel (about 9e-3 worst-case score error); boxes retain fp32 tolerance"
+          }
+        }
+      },
+      "external": {
+        "onnx": "models/efficientdet_lite0_fp32/efficientdet_lite0_float32.onnx",
+        "inputs": { "input0": "serving_default_images:0" },
+        "outputs": { "StatefulPartitionedCall:1": "scores", "StatefulPartitionedCall:0": "boxes" }
+      }
+    }
+  }
+}

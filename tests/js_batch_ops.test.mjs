@@ -15,7 +15,11 @@ import { _cpuInterp1D } from '../ts/ops/interp1D.js';
 
 function tensor(shape, values = null) {
   const size = shape.reduce((count, dim) => count * dim, 1);
-  return { shape, buffer: values ? new Float32Array(values) : new Float32Array(size) };
+  return {
+    shape,
+    dtype: 'float32',
+    buffer: values ? new Float32Array(values) : new Float32Array(size),
+  };
 }
 
 function close(actual, expected, tolerance = 1e-6) {
@@ -148,7 +152,7 @@ test('CPU Expand applies standard right-aligned broadcasting beyond rank four', 
   }), /cannot broadcast/);
 });
 
-test('CPU Interp1D keeps NCL batch rows independent', () => {
+test('CPU Interpolate1D kernel keeps NCL batch rows independent', () => {
   const input=tensor([2,1,2],[0,2,10,14]),out=tensor([2,1,4]);
   _cpuInterp1D({inputs:{input},outputs:{out},params:{size:4}});
   assert.deepEqual([...out.buffer],[0,.5,1.5,2,10,11,13,14]);

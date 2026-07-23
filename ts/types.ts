@@ -1,6 +1,11 @@
 /** Public inference contracts shared by the TypeScript core and facade. */
 
-export type RuntimeDType = 'float32' | 'int32' | 'int8' | 'uint8';
+import type {
+  MemoryLocationValue,
+  RuntimeDType as ProtoRuntimeDType,
+} from './generated/volvoxaiEnums.js';
+
+export type RuntimeDType = ProtoRuntimeDType;
 
 export type RuntimeTypedArray =
   | Float32Array
@@ -67,10 +72,7 @@ export interface TensorDescriptor {
   shape: readonly number[];
   dtype?: RuntimeDType;
   buffer?: TensorStorage;
-  data?: TensorStorage;
   quantization?: TensorQuantizationInput | TensorQuantization | null;
-  replace?: boolean;
-  reuse?: boolean;
 }
 
 export type NodeOutputSpec<TTensor extends TensorLike = TensorLike> =
@@ -96,8 +98,7 @@ export interface GraphNode<TTensor extends TensorLike = TensorLike> {
 
 export interface GraphNodeSpec<TTensor extends TensorLike = TensorLike> {
   id?: string | number;
-  opType?: string;
-  op?: string;
+  opType: string;
   inputs: Record<string, TensorReference<TTensor>>;
   outputs: Record<string, NodeOutputSpec<TTensor>>;
   params?: NodeParameters;
@@ -108,7 +109,6 @@ export interface GraphNodeSpec<TTensor extends TensorLike = TensorLike> {
 export interface GraphNodePatch<TTensor extends TensorLike = TensorLike> {
   id?: string | number;
   opType?: string;
-  op?: string;
   inputs?: Record<string, TensorReference<TTensor>>;
   outputs?: Record<string, NodeOutputSpec<TTensor>>;
   params?: NodeParameters;
@@ -123,7 +123,6 @@ export interface AddTensorOptions {
   isInput?: boolean;
   isWeight?: boolean;
   buffer?: TensorStorage;
-  data?: TensorStorage;
   quantization?: TensorQuantizationInput | TensorQuantization | null;
 }
 
@@ -176,43 +175,43 @@ export interface GraphInspection {
   activeAdapter: AdapterDescription | null;
 }
 
-export type SerializedQuantization =
+export type SerializedAffineQuantizationReference =
   | {
       scheme: 'per_tensor';
-      scale: number;
-      zero_point: number;
+      scale_tensor: string;
+      zero_point_tensor: string;
     }
   | {
       scheme: 'per_axis';
       axis: number;
-      scales: number[];
-      zero_points: number[];
+      scale_tensor: string;
+      zero_point_tensor: string;
     };
 
-export interface BlueprintConfig {
+export interface GraphDocument {
+  format: 'volvox-graph/v1';
   inputs: Record<string, {
     shape: number[];
     dtype: RuntimeDType;
-    quantization?: SerializedQuantization;
   }>;
   nodes: Array<{
-    id: string | number;
+    id?: string | number;
     opType: string;
     inputs: Record<string, string>;
     outputs: Record<string, string>;
     outputs_shape: Record<string, number[]>;
     outputs_dtype: Record<string, RuntimeDType>;
-    outputs_quantization?: Record<string, SerializedQuantization | null>;
-    params: NodeParameters;
+    params?: NodeParameters;
   }>;
-  weights_quantization?: Record<string, SerializedQuantization | null>;
-  outputs?: string[];
+  quantization?: {
+    format: 'volvox-affine-safetensors/v1';
+    tensors: Record<string, SerializedAffineQuantizationReference>;
+  };
+  outputs: string[];
 }
 
 export interface AdapterTensorValue {
-  data?: ArrayLike<number> | ArrayBuffer | ArrayBufferView;
-  values?: ArrayLike<number> | ArrayBuffer | ArrayBufferView;
-  buffer?: ArrayLike<number> | ArrayBuffer | ArrayBufferView;
+  data: ArrayLike<number> | ArrayBuffer | ArrayBufferView;
   shape?: readonly number[];
 }
 
@@ -223,32 +222,24 @@ export type AdapterTensorInput =
   | AdapterTensorValue;
 
 export interface AdapterTargetSpec {
-  weight?: string;
-  baseTensor?: string;
-  target?: string;
-  kind?: 'lora';
+  weight: string;
   layout?: string;
   rank?: number;
   alpha?: number;
   scale?: number;
-  A?: AdapterTensorInput;
-  a?: AdapterTensorInput;
-  B?: AdapterTensorInput;
-  b?: AdapterTensorInput;
-  adapterB?: AdapterTensorInput;
+  A: AdapterTensorInput;
+  B: AdapterTensorInput;
 }
 
 export interface AdapterSpec {
-  kind?: 'lora';
-  type?: 'lora';
+  kind: 'lora';
   layout?: string;
   rank?: number;
   alpha?: number;
   scale?: number;
-  activate?: boolean;
   sourceVersion?: string | number | null;
   metadata?: Record<string, string>;
-  targets: readonly AdapterTargetSpec[] | Record<string, AdapterTargetSpec>;
+  targets: readonly AdapterTargetSpec[];
 }
 
 export interface AdapterDescription {
@@ -273,6 +264,13 @@ export interface AdapterDescription {
 
 export type AdapterVersion = number | string | null | undefined;
 
+/** Canonical execution-time adapter selector. */
+export interface AdapterSelector {
+  name: string;
+  version?: number;
+  scale?: number;
+}
+
 export interface AdapterStageOptions {
   activate?: boolean;
 }
@@ -293,24 +291,18 @@ export interface AdapterExportOptions {
 export interface BackendCapabilityContract {
   readonly incrementalExecution: boolean;
   readonly incrementalRows: boolean;
-  readonly outputLocation: 'host' | 'device';
+  readonly outputLocation: MemoryLocationValue;
 }
 
 export type ExecutionInputs = Record<string, RuntimeTypedArray>;
-export type ExecutionOptions = Record<string, unknown>;
+export interface ExecutionOptions {
+  readonly adapter?: Readonly<AdapterSelector> | null;
+  readonly adapters?: readonly (Readonly<AdapterSelector> | null)[];
+}
 
-export interface BackendEngineContract {
-  readonly backendApiVersion: number;
-  readonly backendName: string;
-  readonly capabilities: BackendCapabilityContract;
-  readonly decodeCacheGeneration?: number;
-  readonly device?: unknown;
-  allocateGraph(graph: GraphContract): Promise<unknown> | unknown;
-  execute(inputs: ExecutionInputs, options?: ExecutionOptions): Promise<unknown> | unknown;
-  createDecodeSession(options?: ExecutionOptions): unknown;
-  resetDecodeCache?(): void;
-  fork?(): Promise<BackendEngineContract> | BackendEngineContract;
-  dispose?(): void;
+export interface DecodeExecutionOptions extends ExecutionOptions {
+  readonly changedInputs?: readonly string[];
+  readonly position?: number;
 }
 
 export interface GraphContract {
@@ -320,11 +312,3 @@ export interface GraphContract {
   topologyRevision: number;
   weightRevision: number;
 }
-
-export type BackendFactory = (context: {
-  name: string;
-  runtime: unknown;
-  wasmUrl: string | URL;
-}) => BackendEngineContract | null | Promise<BackendEngineContract | null>;
-
-export type BackendSelection = string | readonly string[];

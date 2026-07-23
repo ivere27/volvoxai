@@ -1,7 +1,8 @@
-// Browser-only canonical positive-step Slice. The native-facing slice.wgsl
-// remains the historical 4-D ABI; this path supports rank 1..8 metadata.
-@group(0) @binding(0) var<storage, read> input : array<f32>;
-@group(0) @binding(1) var<storage, read_write> output : array<f32>;
+// @volvoxai-browser-only
+// Browser-only canonical positive-step Slice. The native-facing slice.wgsl has
+// a rank-4 contract; this path supports rank 1..8 metadata.
+@group(0) @binding(0) var<storage, read> input : array<u32>;
+@group(0) @binding(1) var<storage, read_write> output : array<u32>;
 
 struct Params {
   // rank, output_elements, pad, pad

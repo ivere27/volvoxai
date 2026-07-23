@@ -39,13 +39,30 @@ VX_ADAPTER_INTERNAL int vx_adapter_run_has_target(const char* weight_name);
 VX_ADAPTER_INTERNAL unsigned long vx_adapter_debug_run_registry_lock_count(void);
 VX_ADAPTER_INTERNAL void vx_adapter_debug_reset_run_registry_lock_count(void);
 
+/* A request may route one adapter per batch member. Linear backends query the
+ * resulting contiguous row segments while the run holds version references;
+ * A/B pointers remain valid until vx_adapter_run_end(). row_start is relative
+ * to the caller's selected row window. */
+typedef struct {
+    const float* a;
+    const float* b;
+    int row_start;
+    int row_count;
+    int rank;
+    float scale;
+} VxAdapterLinearSegment;
+VX_ADAPTER_INTERNAL int vx_adapter_run_linear_segments(
+    const char* weight_name, int batch_size, long row_offset, int rows,
+    long total_rows, int d_in, int d_out,
+    VxAdapterLinearSegment* segments, int capacity);
+
 VX_ADAPTER_INTERNAL int vx_adapter_apply_linear(const char* weight_name, const float* input,
-                                                const void* base_weight, int base_dtype, const float* bias,
+                                                const void* base_weight, VxDataType base_dtype, const float* bias,
                                                 float* output, int rows, int d_in, int d_out,
                                                 int base_out_in, int batch_size, long row_offset, long total_rows);
 
 VX_ADAPTER_INTERNAL int vx_adapter_materialize_weight(const char* version_id, const char* weight_name,
-                                                      const void* base_weight, int base_dtype,
+                                                      const void* base_weight, VxDataType base_dtype,
                                                       int d_in, int d_out, int base_out_in, float* out_weight);
 VX_ADAPTER_INTERNAL int vx_adapter_target_count(const char* version_id);
 VX_ADAPTER_INTERNAL int vx_adapter_target_info(const char* version_id, int index, VxAdapterTargetInfo* out);

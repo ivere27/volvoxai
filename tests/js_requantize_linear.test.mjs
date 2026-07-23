@@ -10,7 +10,7 @@ function makeGraph(inputDtype, inputQuantization, outputDtype, outputQuantizatio
   const { out } = graph.addOp('RequantizeLinear', { input }, {
     out: { name: 'out', shape: [7], dtype: outputDtype, quantization: outputQuantization },
   });
-  graph.outputNames = [out.name];
+  graph.setOutputs([out.name]);
   return graph;
 }
 

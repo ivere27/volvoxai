@@ -40,6 +40,22 @@ static long tensor_broadcast_index(long output_index, int rank,
     return input_index;
 }
 
+static int tensor_plain_32(const T* tensor) {
+    return tensor && tensor->data && tensor->elem_size == sizeof(uint32_t) &&
+        (tensor->dtype == T_F32 || tensor->dtype == T_I32);
+}
+
+static int tensor_copy_plain_32(const T* input, T* output) {
+    if (!tensor_plain_32(input) || !tensor_plain_32(output) ||
+        input->dtype != output->dtype || input->numel != output->numel ||
+        input->numel <= 0 || (size_t)input->numel > SIZE_MAX / sizeof(uint32_t))
+        return -1;
+    if (input->data != output->data)
+        memcpy(output->data, input->data,
+               (size_t)input->numel * sizeof(uint32_t));
+    return 0;
+}
+
 static T* node_input_default(Node* n) {
     T* in = nin(n, "input");
     if (!in) in = nin(n, "x");
@@ -63,6 +79,27 @@ static int groupnorm_dimensions(const T* in, const T* out, const T* weight,
     if (height) *height = h;
     if (width) *width = w;
     if (channels) *channels = c;
+    return 0;
+}
+
+static int normalization_dimensions(const T* in, const T* out,
+                                    const T* weight, const T* bias,
+                                    int width, long* rows) {
+    long row_count;
+    if (!in || !out || !weight || in->dtype != T_F32 ||
+        out->dtype != T_F32 || weight->dtype != T_F32 ||
+        in->ndim <= 0 || !tensor_same_shape(in, out) ||
+        width <= 0 || in->shape[in->ndim - 1] != width ||
+        weight->ndim != 1 || weight->shape[0] != width ||
+        weight->numel != width ||
+        (bias && (bias->dtype != T_F32 || bias->ndim != 1 ||
+                  bias->shape[0] != width || bias->numel != width)))
+        return -1;
+    row_count = in->numel / width;
+    if (row_count <= 0 || row_count > INT32_MAX ||
+        in->numel != row_count * width)
+        return -1;
+    if (rows) *rows = row_count;
     return 0;
 }
 
@@ -202,23 +239,54 @@ static int gpu_broadcast_strides(const T* input, const T* output, uint32_t strid
 #include "../training/training_runtime.inc"
 #endif
 
-// ---- Shape-aware Add/Mul (row-windowed) -----------------------------------
-static int binop(Node* n, int is_mul) {
+// ---- Shape-aware F32 binary arithmetic (row-windowed) ----------------------
+static int binop(Node* n, int operation) {
     T* a = nin(n, "a"); T* b = nin(n, "b"); T* o = t_find(n->out);
     if (!a) a = nin(n, "input");
     if (!a || !b || !o || a->dtype != T_F32 || b->dtype != T_F32 || o->dtype != T_F32 ||
-        o->ndim <= 0 || o->ndim > 8) return -1;
+        o->ndim <= 0 || o->ndim > 8 ||
+        operation < VX_PORTABLE_BINARY_ADD ||
+        operation > VX_PORTABLE_BINARY_DIV) return -1;
     long output_strides[8] = {0}, a_strides[8] = {0}, b_strides[8] = {0};
     if (tensor_contiguous_strides(o, output_strides) != 0 ||
         tensor_broadcast_strides(a, o, a_strides) != 0 ||
         tensor_broadcast_strides(b, o, b_strides) != 0) return -1;
-    int D = o->shape[o->ndim - 1]; long total = o->numel / D;
-    int r0, rc; seq_range(total, &r0, &rc);
+    int D = o->shape[o->ndim - 1];
+    long total = D > 0 ? o->numel / D : 0;
+    int r0, rc;
+    if (D <= 0 || total <= 0 || total > INT_MAX || o->numel != total * D)
+        return -1;
+    /* seq_range() is a token-row window only for [S,D], [1,S,D], and the
+     * sequence-major singleton-batch spelling [S,1,D]. In multi-head
+     * attention tensors, the token axis can precede or follow a head/feature
+     * axis; treating active_row as one flattened outer row would update only
+     * one head. Keep those layouts correct by recomputing this inexpensive
+     * elementwise node over its complete retained tensor. */
+    if (g_active_row >= 0 &&
+        !(o->ndim == 2 ||
+          (o->ndim == 3 && (o->shape[0] == 1 || o->shape[1] == 1)))) {
+        r0 = 0;
+        rc = (int)total;
+    } else {
+        seq_range(total, &r0, &rc);
+    }
     long off = (long)r0 * D; int cnt = rc * D;
     int relu = p_int(n->params, "relu", 0);
     if (a->numel == o->numel && b->numel == o->numel) {
-        if (is_mul) mul_f32(a->data + off, b->data + off, o->data + off, cnt);
-        else        vx_fused_add_relu_f32(a->data + off, b->data + off, o->data + off, cnt, relu);
+        if (operation == VX_PORTABLE_BINARY_ADD)
+            vx_fused_add_relu_f32(a->data + off, b->data + off,
+                                  o->data + off, cnt, relu);
+        else if (operation == VX_PORTABLE_BINARY_MUL)
+            mul_f32(a->data + off, b->data + off, o->data + off, cnt);
+        else {
+            for (int index = 0; index < cnt; index++) {
+                float left = a->data[off + index];
+                float right = b->data[off + index];
+                o->data[off + index] =
+                    operation == VX_PORTABLE_BINARY_SUB
+                        ? left - right : left / right;
+            }
+        }
     } else if (a->ndim > 0 && b->ndim > 0 && off == 0 && cnt == o->numel &&
                o->numel <= UINT32_MAX) {
         uint32_t a_shape[8], b_shape[8], output_shape[8];
@@ -231,12 +299,11 @@ static int binop(Node* n, int is_mul) {
         if (!binary_broadcast_f32(
                 a->data, b->data, o->data, a_shape, b_shape, output_shape,
                 (uint32_t)a->ndim, (uint32_t)b->ndim, (uint32_t)o->ndim,
-                (uint32_t)o->numel,
-                is_mul ? VX_PORTABLE_BINARY_MUL : VX_PORTABLE_BINARY_ADD))
+                (uint32_t)o->numel, (uint32_t)operation))
             return -1;
-        if (!is_mul && relu == 1)
+        if (operation == VX_PORTABLE_BINARY_ADD && relu == 1)
             relu_f32(o->data, o->data, (int)o->numel);
-        else if (!is_mul && relu >= 2)
+        else if (operation == VX_PORTABLE_BINARY_ADD && relu >= 2)
             clip_f32(o->data, o->data, (int)o->numel, 0.0f, 6.0f);
     } else {
         for (long output_index = off; output_index < off + cnt; output_index++) {
@@ -244,9 +311,13 @@ static int binop(Node* n, int is_mul) {
                                                   output_strides, a_strides);
             long b_index = tensor_broadcast_index(output_index, o->ndim,
                                                   output_strides, b_strides);
-            float value = is_mul ? a->data[a_index] * b->data[b_index]
-                                 : a->data[a_index] + b->data[b_index];
-            if (!is_mul && relu) {
+            float left = a->data[a_index];
+            float right = b->data[b_index];
+            float value = operation == VX_PORTABLE_BINARY_ADD ? left + right :
+                operation == VX_PORTABLE_BINARY_MUL ? left * right :
+                operation == VX_PORTABLE_BINARY_SUB ? left - right :
+                left / right;
+            if (operation == VX_PORTABLE_BINARY_ADD && relu) {
                 if (value < 0.0f) value = 0.0f;
                 if (relu >= 2 && value > 6.0f) value = 6.0f;
             }
@@ -256,9 +327,147 @@ static int binop(Node* n, int is_mul) {
     return 0;
 }
 
+static int compare_i32_forward(Node* node, int comparison) {
+    T* a = nin(node, "a");
+    T* b = nin(node, "b");
+    T* output = t_find(node->out);
+    long output_strides[8] = {0};
+    long a_strides[8] = {0};
+    long b_strides[8] = {0};
+    if (!a || !b || !output || a->dtype != T_I32 || b->dtype != T_I32 ||
+        output->dtype != T_I32 || output->ndim <= 0 || output->ndim > 8 ||
+        output->numel <= 0 || (comparison != 0 && comparison != 1) ||
+        tensor_contiguous_strides(output, output_strides) != 0 ||
+        tensor_broadcast_strides(a, output, a_strides) != 0 ||
+        tensor_broadcast_strides(b, output, b_strides) != 0)
+        return -1;
+    const int32_t* left = (const int32_t*)a->data;
+    const int32_t* right = (const int32_t*)b->data;
+    int32_t* result = (int32_t*)output->data;
+    for (long index = 0; index < output->numel; index++) {
+        long left_index = tensor_broadcast_index(
+            index, output->ndim, output_strides, a_strides);
+        long right_index = tensor_broadcast_index(
+            index, output->ndim, output_strides, b_strides);
+        result[index] = comparison == 0
+            ? left[left_index] == right[right_index]
+            : left[left_index] >= right[right_index];
+    }
+    return 0;
+}
+
+static int not_i32_forward(Node* node) {
+    T* input = node_input_default(node);
+    T* output = t_find(node->out);
+    if (!input || !output || input->dtype != T_I32 ||
+        output->dtype != T_I32 || !tensor_same_shape(input, output))
+        return -1;
+    const int32_t* source = (const int32_t*)input->data;
+    int32_t* destination = (int32_t*)output->data;
+    for (long index = 0; index < output->numel; index++)
+        destination[index] = source[index] == 0;
+    return 0;
+}
+
+static int where_plain_32_forward(Node* node) {
+    T* condition = nin(node, "condition");
+    T* x = nin(node, "x");
+    T* y = nin(node, "y");
+    T* output = t_find(node->out);
+    if (!condition) condition = nin(node, "cond");
+    if (!x) x = nin(node, "a");
+    if (!y) y = nin(node, "b");
+    if (!condition || !x || !y || !output ||
+        condition->dtype != T_I32 || !tensor_plain_32(x) ||
+        !tensor_plain_32(y) || !tensor_plain_32(output) ||
+        x->dtype != y->dtype || output->dtype != x->dtype ||
+        !tensor_same_shape(condition, output) ||
+        !tensor_same_shape(x, output) || !tensor_same_shape(y, output))
+        return -1;
+    const int32_t* selected = (const int32_t*)condition->data;
+    const uint32_t* left = (const uint32_t*)x->data;
+    const uint32_t* right = (const uint32_t*)y->data;
+    uint32_t* result = (uint32_t*)output->data;
+    for (long index = 0; index < output->numel; index++)
+        result[index] = selected[index] != 0 ? left[index] : right[index];
+    return 0;
+}
+
+static int batch_matmul_f32_forward(Node* node) {
+    T* a = nin(node, "a");
+    T* b = nin(node, "b");
+    T* output = t_find(node->out);
+    int coordinates[6] = {0};
+    if (!a || !b || !output || a->dtype != T_F32 || b->dtype != T_F32 ||
+        output->dtype != T_F32 || a->ndim < 2 || b->ndim < 2 ||
+        a->ndim > 8 || b->ndim > 8 ||
+        output->ndim != (a->ndim > b->ndim ? a->ndim : b->ndim) ||
+        output->ndim < 2 || output->ndim > 8)
+        return -1;
+    int m = a->shape[a->ndim - 2];
+    int k = a->shape[a->ndim - 1];
+    int b_k = b->shape[b->ndim - 2];
+    int n = b->shape[b->ndim - 1];
+    int batch_rank = output->ndim - 2;
+    if (m <= 0 || k <= 0 || n <= 0 || b_k != k ||
+        output->shape[output->ndim - 2] != m ||
+        output->shape[output->ndim - 1] != n)
+        return -1;
+    long batch_count = 1;
+    for (int dimension = 0; dimension < batch_rank; dimension++) {
+        int a_source = dimension - (batch_rank - (a->ndim - 2));
+        int b_source = dimension - (batch_rank - (b->ndim - 2));
+        int a_size = a_source < 0 ? 1 : a->shape[a_source];
+        int b_size = b_source < 0 ? 1 : b->shape[b_source];
+        int expected = a_size > b_size ? a_size : b_size;
+        if (a_size <= 0 || b_size <= 0 ||
+            (a_size != 1 && b_size != 1 && a_size != b_size) ||
+            output->shape[dimension] != expected ||
+            batch_count > LONG_MAX / expected)
+            return -1;
+        batch_count *= expected;
+    }
+    long a_batches = a->numel / ((long)m * k);
+    long b_batches = b->numel / ((long)k * n);
+    if (a->numel != a_batches * (long)m * k ||
+        b->numel != b_batches * (long)k * n ||
+        output->numel != batch_count * (long)m * n)
+        return -1;
+    for (long batch = 0; batch < batch_count; batch++) {
+        long remainder = batch;
+        for (int dimension = batch_rank - 1; dimension >= 0; dimension--) {
+            int size = output->shape[dimension];
+            coordinates[dimension] = (int)(remainder % size);
+            remainder /= size;
+        }
+        long a_batch = 0;
+        int a_offset = batch_rank - (a->ndim - 2);
+        for (int dimension = 0; dimension < a->ndim - 2; dimension++) {
+            int size = a->shape[dimension];
+            int coordinate = size == 1 ? 0 : coordinates[a_offset + dimension];
+            a_batch = a_batch * size + coordinate;
+        }
+        long b_batch = 0;
+        int b_offset = batch_rank - (b->ndim - 2);
+        for (int dimension = 0; dimension < b->ndim - 2; dimension++) {
+            int size = b->shape[dimension];
+            int coordinate = size == 1 ? 0 : coordinates[b_offset + dimension];
+            b_batch = b_batch * size + coordinate;
+        }
+        matmul_f32(
+            a->data + a_batch * (long)m * k,
+            b->data + b_batch * (long)k * n,
+            NULL,
+            output->data + batch * (long)m * n,
+            m, k, n);
+    }
+    return 0;
+}
+
 static int transpose_tensor(const T* in, T* out, const int* perm) {
     uint32_t input_shape[8], permutation[8];
-    if (!in || !out || !perm || in->dtype != T_F32 || out->dtype != T_F32 ||
+    if (!in || !out || !perm || !tensor_plain_32(in) ||
+        !tensor_plain_32(out) || in->dtype != out->dtype ||
         in->ndim <= 0 || in->ndim > 8 || out->ndim != in->ndim ||
         in->numel != out->numel || in->numel <= 0 || in->numel > UINT32_MAX)
         return -1;
@@ -269,13 +478,47 @@ static int transpose_tensor(const T* in, T* out, const int* perm) {
         input_shape[axis] = (uint32_t)in->shape[axis];
         permutation[axis] = (uint32_t)perm[axis];
     }
-    return transpose_nd_f32(in->data, out->data, input_shape, permutation,
-                            (uint32_t)in->ndim,
-                            (uint32_t)in->numel) ? 0 : -1;
+    /* Swapping a singleton batch axis with the sequence axis preserves the
+     * physical order of every [token, feature] row. During incremental decode
+     * only the active row can have changed, so copying that one contiguous row
+     * is both exact and substantially cheaper than replaying the full
+     * transpose. No other permutation is inferred from shape alone. */
+    if (g_active_row >= 0 && in->ndim == 3 && perm[0] == 1 &&
+        perm[1] == 0 && perm[2] == 2 && in->shape[2] > 0 &&
+        ((in->shape[0] == 1 && out->shape[1] == 1 &&
+          out->shape[0] == in->shape[1]) ||
+         (in->shape[1] == 1 && out->shape[0] == 1 &&
+          out->shape[1] == in->shape[0]))) {
+        const long sequence = in->shape[0] == 1
+            ? in->shape[1] : in->shape[0];
+        const size_t width = (size_t)in->shape[2];
+        size_t offset;
+        if (g_active_row >= sequence ||
+            (size_t)g_active_row > SIZE_MAX / width) return -1;
+        offset = (size_t)g_active_row * width;
+        if (offset > (size_t)in->numel ||
+            width > (size_t)in->numel - offset ||
+            offset > SIZE_MAX / sizeof(uint32_t) ||
+            width > SIZE_MAX / sizeof(uint32_t) - offset) return -1;
+        if (in->data != out->data)
+            memmove((uint32_t*)out->data + offset,
+                    (const uint32_t*)in->data + offset,
+                    width * sizeof(uint32_t));
+        return 0;
+    }
+    int ok = in->dtype == T_F32
+        ? vx_transpose_nd_f32_native_validated(
+                           in->data, out->data, input_shape, permutation,
+                           (uint32_t)in->ndim, (uint32_t)in->numel)
+        : transpose_nd_u32((const uint32_t*)in->data,
+                           (uint32_t*)out->data, input_shape, permutation,
+                           (uint32_t)in->ndim, (uint32_t)in->numel);
+    return ok ? 0 : -1;
 }
 
 static int concat_tensor(Node* n, T* out, int axis) {
-    if (!n || !out || out->dtype != T_F32 || out->ndim <= 0 || out->ndim > 8)
+    if (!n || !tensor_plain_32(out) || out->ndim <= 0 ||
+        out->ndim > 8 || n->nin <= 0)
         return -1;
     if (axis < 0) axis += out->ndim;
     if (axis < 0 || axis >= out->ndim || out->shape[axis] <= 0) return -1;
@@ -292,8 +535,8 @@ static int concat_tensor(Node* n, T* out, int axis) {
     int axis_offset = 0;
     for (int input_index = 0; input_index < n->nin; input_index++) {
         T* source = t_find(n->ins[input_index].name);
-        if (!source) continue;
-        if (source->dtype != T_F32 || source->ndim != out->ndim ||
+        if (!tensor_plain_32(source) || source->dtype != out->dtype ||
+            source->ndim != out->ndim ||
             source->shape[axis] <= 0 ||
             axis_offset > out->shape[axis] - source->shape[axis])
             return -1;
@@ -303,14 +546,326 @@ static int concat_tensor(Node* n, T* out, int axis) {
         }
         if (source->numel != outer * (long)source->shape[axis] * inner)
             return -1;
-        if (!concat_slice_f32(source->data, out->data, (uint32_t)outer,
-                              (uint32_t)source->shape[axis],
-                              (uint32_t)out->shape[axis], (uint32_t)inner,
-                              (uint32_t)axis_offset, 0u))
-            return -1;
+        int ok = source->dtype == T_F32
+            ? concat_slice_f32(
+                source->data, out->data, (uint32_t)outer,
+                (uint32_t)source->shape[axis],
+                (uint32_t)out->shape[axis], (uint32_t)inner,
+                (uint32_t)axis_offset, 0u)
+            : concat_slice_u32(
+                (const uint32_t*)source->data, (uint32_t*)out->data,
+                (uint32_t)outer, (uint32_t)source->shape[axis],
+                (uint32_t)out->shape[axis], (uint32_t)inner,
+                (uint32_t)axis_offset);
+        if (!ok) return -1;
         axis_offset += source->shape[axis];
     }
     return axis_offset == out->shape[axis] ? 0 : -1;
+}
+
+static int json_i32_value(const cJSON* value, int32_t* output) {
+    double number;
+    if (!value || !output || !cJSON_IsNumber(value)) return -1;
+    number = value->valuedouble;
+    if (!isfinite(number) || number < (double)INT32_MIN ||
+        number > (double)INT32_MAX || trunc(number) != number)
+        return -1;
+    *output = (int32_t)number;
+    return 0;
+}
+
+static int node_i32_parameter(cJSON* params, const char* key,
+                              int32_t default_value, int32_t* output) {
+    cJSON* value;
+    if (!output) return -1;
+    value = params ? cJSON_GetObjectItemCaseSensitive(params, key) : NULL;
+    if (!value) {
+        *output = default_value;
+        return 0;
+    }
+    return json_i32_value(value, output);
+}
+
+static int clip_plain_forward(Node* node) {
+    T* input = node_input_default(node);
+    T* output = t_find(node->out);
+    if (!input || !output || !tensor_plain_32(input) ||
+        !tensor_plain_32(output) || input->dtype != output->dtype ||
+        !tensor_same_shape(input, output))
+        return -1;
+    if (input->dtype == T_F32) {
+        float minimum = p_flt(node->params, "min", -INFINITY);
+        float maximum = p_flt(node->params, "max", INFINITY);
+        if (isnan(minimum) || isnan(maximum) || minimum > maximum)
+            return -1;
+        clip_f32(input->data, output->data, (int)output->numel,
+                 minimum, maximum);
+        return 0;
+    }
+    int32_t minimum;
+    int32_t maximum;
+    if (node_i32_parameter(node->params, "min", INT32_MIN, &minimum) != 0 ||
+        node_i32_parameter(node->params, "max", INT32_MAX, &maximum) != 0 ||
+        minimum > maximum)
+        return -1;
+    const int32_t* source = (const int32_t*)input->data;
+    int32_t* destination = (int32_t*)output->data;
+    for (long index = 0; index < output->numel; index++) {
+        int32_t value = source[index];
+        if (value < minimum) value = minimum;
+        if (value > maximum) value = maximum;
+        destination[index] = value;
+    }
+    return 0;
+}
+
+static uint32_t cast_f32_to_u32_mod(float value) {
+    union { float value; uint32_t bits; } source = {value};
+    uint32_t exponent = (source.bits >> 23u) & 0xffu;
+    uint32_t significand;
+    uint32_t magnitude;
+    int32_t shift;
+    if (exponent == 0xffu || exponent < 127u) return 0u;
+    significand = (source.bits & 0x7fffffu) | 0x800000u;
+    shift = (int32_t)exponent - 127 - 23;
+    if (shift >= 32) magnitude = 0u;
+    else if (shift >= 0) magnitude = significand << (uint32_t)shift;
+    else magnitude = significand >> (uint32_t)(-shift);
+    return (source.bits & 0x80000000u) ? 0u - magnitude : magnitude;
+}
+
+static int32_t cast_i32_from_u32(uint32_t value) {
+    return value <= 0x7fffffffu
+        ? (int32_t)value
+        : (int32_t)(value - 0x80000000u) - 2147483647 - 1;
+}
+
+static int8_t cast_i8_from_u8(uint8_t value) {
+    return value <= 127u
+        ? (int8_t)value
+        : (int8_t)(value - 128u) - 128;
+}
+
+static int cast_value_to_i32(const T* input, long index, int32_t* output) {
+    if (input->dtype == T_I32) {
+        *output = ((const int32_t*)input->data)[index];
+        return 0;
+    }
+    if (input->dtype == T_I8) {
+        *output = ((const int8_t*)input->data)[index];
+        return 0;
+    }
+    if (input->dtype == T_U8) {
+        *output = ((const uint8_t*)input->data)[index];
+        return 0;
+    }
+    if (input->dtype == T_F32) {
+        *output = cast_i32_from_u32(cast_f32_to_u32_mod(input->data[index]));
+        return 0;
+    }
+    return -1;
+}
+
+static int cast_forward(Node* node) {
+    T* input = node_input_default(node);
+    T* output = t_find(node->out);
+    cJSON* target = node->params
+        ? cJSON_GetObjectItemCaseSensitive(node->params, "to") : NULL;
+    int target_dtype;
+    if (!input || !output || !input->data || !output->data ||
+        input->numel != output->numel || input->numel <= 0 ||
+        !target || (target_dtype = graph_declared_dtype(target)) < 0 ||
+        target_dtype != output->dtype ||
+        (input->dtype != T_F32 && input->dtype != T_I32 &&
+         input->dtype != T_I8 && input->dtype != T_U8))
+        return -1;
+    if (input->dtype == output->dtype) {
+        size_t bytes = (size_t)input->numel * input->elem_size;
+        if (input->data != output->data) memcpy(output->data, input->data, bytes);
+        return 0;
+    }
+    for (long index = 0; index < output->numel; index++) {
+        if (output->dtype == T_F32) {
+            int32_t integer;
+            if (cast_value_to_i32(input, index, &integer) != 0) return -1;
+            output->data[index] = (float)integer;
+        } else {
+            int32_t integer;
+            if (cast_value_to_i32(input, index, &integer) != 0) return -1;
+            if (output->dtype == T_I32)
+                ((int32_t*)output->data)[index] = integer;
+            else if (output->dtype == T_I8)
+                ((int8_t*)output->data)[index] =
+                    cast_i8_from_u8((uint8_t)integer);
+            else if (output->dtype == T_U8)
+                ((uint8_t*)output->data)[index] = (uint8_t)integer;
+            else
+                return -1;
+        }
+    }
+    return 0;
+}
+
+static int expand_plain_32_forward(Node* node) {
+    T* input = node_input_default(node);
+    T* output = t_find(node->out);
+    long output_strides[8] = {0};
+    long input_strides[8] = {0};
+    if (!input || !output || !tensor_plain_32(input) ||
+        !tensor_plain_32(output) || input->dtype != output->dtype ||
+        output->ndim <= 0 || output->ndim > 8 ||
+        tensor_contiguous_strides(output, output_strides) != 0 ||
+        tensor_broadcast_strides(input, output, input_strides) != 0)
+        return -1;
+    const uint32_t* source = (const uint32_t*)input->data;
+    uint32_t* destination = (uint32_t*)output->data;
+    for (long index = 0; index < output->numel; index++) {
+        long input_index = tensor_broadcast_index(
+            index, output->ndim, output_strides, input_strides);
+        destination[index] = source[input_index];
+    }
+    return 0;
+}
+
+static int gather_f32_i32_forward(Node* node) {
+    T* input = node_input_default(node);
+    T* indices = nin(node, "indices");
+    T* output = t_find(node->out);
+    int axis;
+    long outer = 1;
+    long inner = 1;
+    if (!input || !indices || !output || input->dtype != T_F32 ||
+        indices->dtype != T_I32 || output->dtype != T_F32 ||
+        input->ndim <= 0 || input->ndim > 8 || indices->ndim < 0 ||
+        indices->ndim > 8)
+        return -1;
+    axis = p_int(node->params, "axis", 0);
+    if (axis < 0) axis += input->ndim;
+    if (axis < 0 || axis >= input->ndim || input->shape[axis] <= 0 ||
+        output->ndim != input->ndim - 1 + indices->ndim)
+        return -1;
+    int output_dimension = 0;
+    for (int dimension = 0; dimension < axis; dimension++) {
+        if (input->shape[dimension] <= 0 ||
+            output->shape[output_dimension++] != input->shape[dimension] ||
+            outer > LONG_MAX / input->shape[dimension])
+            return -1;
+        outer *= input->shape[dimension];
+    }
+    for (int dimension = 0; dimension < indices->ndim; dimension++) {
+        if (indices->shape[dimension] <= 0 ||
+            output->shape[output_dimension++] != indices->shape[dimension])
+            return -1;
+    }
+    for (int dimension = axis + 1; dimension < input->ndim; dimension++) {
+        if (input->shape[dimension] <= 0 ||
+            output->shape[output_dimension++] != input->shape[dimension] ||
+            inner > LONG_MAX / input->shape[dimension])
+            return -1;
+        inner *= input->shape[dimension];
+    }
+    if (indices->numel <= 0 || outer > LONG_MAX / indices->numel ||
+        outer * indices->numel > LONG_MAX / inner ||
+        output->numel != outer * indices->numel * inner)
+        return -1;
+    const int32_t* selections = (const int32_t*)indices->data;
+    int axis_size = input->shape[axis];
+    for (long index = 0; index < indices->numel; index++) {
+        int64_t selected = selections[index];
+        if (selected < 0) selected += axis_size;
+        if (selected < 0 || selected >= axis_size) return -1;
+    }
+    for (long outer_index = 0; outer_index < outer; outer_index++) {
+        for (long index = 0; index < indices->numel; index++) {
+            int64_t selected = selections[index];
+            if (selected < 0) selected += axis_size;
+            const float* source = input->data +
+                ((outer_index * axis_size + selected) * inner);
+            float* destination = output->data +
+                ((outer_index * indices->numel + index) * inner);
+            memcpy(destination, source, (size_t)inner * sizeof(float));
+        }
+    }
+    return 0;
+}
+
+static int json_i32_array_item(const cJSON* array, int index, int* output) {
+    int32_t parsed;
+    if (!array || !cJSON_IsArray(array) ||
+        json_i32_value(cJSON_GetArrayItem(array, index), &parsed) != 0)
+        return -1;
+    *output = (int)parsed;
+    return 0;
+}
+
+static int slice_plain_32_forward(Node* node) {
+    T* input = node_input_default(node);
+    T* output = t_find(node->out);
+    cJSON* starts_node = node->params
+        ? cJSON_GetObjectItemCaseSensitive(node->params, "starts") : NULL;
+    cJSON* axes_node = node->params
+        ? cJSON_GetObjectItemCaseSensitive(node->params, "axes") : NULL;
+    cJSON* steps_node = node->params
+        ? cJSON_GetObjectItemCaseSensitive(node->params, "steps") : NULL;
+    int starts[8] = {0};
+    int steps[8] = {1, 1, 1, 1, 1, 1, 1, 1};
+    unsigned seen = 0;
+    long input_strides[8] = {0};
+    if (!input || !output || !tensor_plain_32(input) ||
+        !tensor_plain_32(output) || input->dtype != output->dtype ||
+        input->ndim <= 0 || input->ndim > 8 ||
+        output->ndim != input->ndim ||
+        !cJSON_IsArray(starts_node) || !cJSON_IsArray(axes_node) ||
+        !cJSON_IsArray(steps_node))
+        return -1;
+    int count = cJSON_GetArraySize(starts_node);
+    if (count <= 0 || count > input->ndim ||
+        cJSON_GetArraySize(axes_node) != count ||
+        cJSON_GetArraySize(steps_node) != count ||
+        tensor_contiguous_strides(input, input_strides) != 0)
+        return -1;
+    for (int index = 0; index < count; index++) {
+        int start;
+        int axis;
+        int step;
+        if (json_i32_array_item(starts_node, index, &start) != 0 ||
+            json_i32_array_item(axes_node, index, &axis) != 0 ||
+            json_i32_array_item(steps_node, index, &step) != 0)
+            return -1;
+        if (axis < 0) axis += input->ndim;
+        if (axis < 0 || axis >= input->ndim || step <= 0 || start < 0 ||
+            (seen & (1u << (unsigned)axis)))
+            return -1;
+        starts[axis] = start;
+        steps[axis] = step;
+        seen |= 1u << (unsigned)axis;
+    }
+    for (int dimension = 0; dimension < input->ndim; dimension++) {
+        if (input->shape[dimension] <= 0 || output->shape[dimension] <= 0)
+            return -1;
+        if (!(seen & (1u << (unsigned)dimension))) {
+            if (output->shape[dimension] != input->shape[dimension])
+                return -1;
+        } else {
+            int64_t last = starts[dimension] +
+                (int64_t)(output->shape[dimension] - 1) * steps[dimension];
+            if (last < 0 || last >= input->shape[dimension]) return -1;
+        }
+    }
+    const uint32_t* source = (const uint32_t*)input->data;
+    uint32_t* destination = (uint32_t*)output->data;
+    for (long output_index = 0; output_index < output->numel; output_index++) {
+        long remainder = output_index;
+        long input_index = 0;
+        for (int dimension = input->ndim - 1; dimension >= 0; dimension--) {
+            int coordinate = (int)(remainder % output->shape[dimension]);
+            remainder /= output->shape[dimension];
+            input_index += (starts[dimension] + (long)coordinate * steps[dimension]) *
+                input_strides[dimension];
+        }
+        destination[output_index] = source[input_index];
+    }
+    return 0;
 }
 
 static void concat_tensor_sigmoid(Node* n, T* out, int axis) {

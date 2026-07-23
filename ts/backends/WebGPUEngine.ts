@@ -1,5 +1,7 @@
 import { BackendEngine } from './BackendEngine.js';
 import { GraphExecutor } from './GraphExecutor.js';
+import { WebGPUDeviceState } from './WebGPUDeviceState.js';
+import type { WebGPUOutputSnapshot } from './WebGPUResults.js';
 import type {
   DeviceFeedbackDecodeOptions,
   GraphExecutorOptions,
@@ -11,7 +13,19 @@ import type { RuntimeDType, RuntimeTypedArray } from '../types.js';
 
 export interface WebGPUEngineOptions {
   shaderLibrary?: GraphExecutorOptions['shaderLibrary'];
-  training?: boolean;
+  adapterInfo?: WebGPUAdapterIdentity | null;
+  /** @internal Shared model-independent state for context forks. */
+  deviceState?: WebGPUDeviceState | null;
+}
+
+export interface WebGPUAdapterIdentity {
+  vendor?: string;
+  architecture?: string;
+  device?: string;
+  description?: string;
+  backend?: string;
+  deviceType?: string;
+  driver?: string;
 }
 
 export interface WebGPUInitOptions {
@@ -19,24 +33,38 @@ export interface WebGPUInitOptions {
   deviceDescriptor?: GPUDeviceDescriptor;
 }
 
-/**
- * WebGPU backend peer for CPUEngine, WasmEngine, and WebNNEngine.
- *
- * GraphExecutor remains the lower-level scheduler/resource owner. This class
- * supplies the shared backend lifecycle (`allocateGraph`, `execute`, decode
- * sessions) while forwarding the established WebGPU readback and training
- * integration points for compatibility.
- */
+function normalizeAdapterIdentity(info: WebGPUAdapterIdentity | null | undefined): Readonly<WebGPUAdapterIdentity> | null {
+  if (!info || typeof info !== 'object') return null;
+  if (Object.isFrozen(info) && Object.keys(info).length > 0) return info;
+  const result: WebGPUAdapterIdentity = {};
+  for (const key of ['vendor', 'architecture', 'device', 'description', 'backend', 'deviceType', 'driver'] as const) {
+    if (typeof info[key] === 'string' && info[key]!.trim()) result[key] = info[key]!.trim();
+  }
+  return Object.keys(result).length ? Object.freeze(result) : null;
+}
+
+function adapterIdentity(adapter: GPUAdapter): Readonly<WebGPUAdapterIdentity> | null {
+  return normalizeAdapterIdentity((adapter as GPUAdapter & { info?: WebGPUAdapterIdentity }).info);
+}
+
+/** Internal WebGPU engine. GraphExecutor owns context resources while the
+ * retained WebGPUDeviceState owns model-independent device caches. */
 export class WebGPUEngine extends BackendEngine {
   declare device: GPUDevice;
   declare shaderLibrary: GraphExecutorOptions['shaderLibrary'];
-  declare training: boolean;
+  declare deviceState: WebGPUDeviceState;
   declare executor: GraphExecutor | null;
   declare _graph: Graph | null;
+  declare _disposed: boolean;
+  declare readonly adapterInfo: Readonly<WebGPUAdapterIdentity> | null;
 
   constructor(
     device: GPUDevice,
-    { shaderLibrary = null, training = false }: WebGPUEngineOptions = {},
+    {
+      shaderLibrary = null,
+      adapterInfo = null,
+      deviceState = null,
+    }: WebGPUEngineOptions = {},
   ) {
     super('webgpu', {
       incrementalExecution: true,
@@ -45,10 +73,17 @@ export class WebGPUEngine extends BackendEngine {
     });
     if (!device) throw new Error('WebGPUEngine requires a GPUDevice.');
     this.device = device;
+    this.deviceState = (deviceState || new WebGPUDeviceState(device)).retain();
+    if (this.deviceState.device !== device) {
+      throw new Error('WebGPUEngine deviceState belongs to a different GPUDevice.');
+    }
     this.shaderLibrary = shaderLibrary;
-    this.training = training === true;
+    // GPUAdapterInfo fields are prototype getters in several implementations
+    // (including Deno/wgpu), so an object spread would silently erase them.
+    this.adapterInfo = normalizeAdapterIdentity(adapterInfo);
     this.executor = null;
     this._graph = null;
+    this._disposed = false;
   }
 
   static async init({
@@ -59,25 +94,28 @@ export class WebGPUEngine extends BackendEngine {
     const adapter = await navigator.gpu.requestAdapter(adapterOptions);
     if (!adapter) return null;
     const device = await adapter.requestDevice(deviceDescriptor);
-    return new WebGPUEngine(device);
+    return new WebGPUEngine(device, { adapterInfo: adapterIdentity(adapter) });
   }
 
   /** Create an unallocated peer that shares the device but owns independent graph state. */
   fork(): WebGPUEngine {
+    if (this._disposed) throw new Error('WebGPUEngine is disposed.');
     return new WebGPUEngine(this.device, {
       shaderLibrary: this.shaderLibrary,
-      training: this.training,
+      adapterInfo: this.adapterInfo,
+      deviceState: this.deviceState,
     });
   }
 
   _createExecutor(graph: Graph): GraphExecutor {
     return new GraphExecutor(this.device, graph, {
       shaderLibrary: this.shaderLibrary,
-      training: this.training,
+      deviceState: this.deviceState,
     });
   }
 
   async allocateGraph(graph: Graph | null): Promise<this> {
+    if (this._disposed) throw new Error('WebGPUEngine is disposed.');
     if (!graph || !(graph.tensors instanceof Map) || !Array.isArray(graph.nodes)) {
       throw new Error('WebGPUEngine.allocateGraph requires a Graph.');
     }
@@ -102,11 +140,6 @@ export class WebGPUEngine extends BackendEngine {
     this.executor = executor;
     this._graph = graph;
     return this;
-  }
-
-  /** Compatibility alias for callers that previously compiled WebGPU directly. */
-  compile(graph: Graph | null = this._graph): Promise<this> {
-    return this.allocateGraph(graph);
   }
 
   async execute(
@@ -151,6 +184,11 @@ export class WebGPUEngine extends BackendEngine {
     return this.executor.readBufferRange(gpuBuffer, byteOffset, sizeBytes, dtype);
   }
 
+  snapshotOutputs(): ReadonlyMap<string, WebGPUOutputSnapshot> {
+    if (!this.executor) throw new Error('WebGPUEngine.snapshotOutputs requires an allocated graph.');
+    return this.executor.snapshotOutputs();
+  }
+
   executeDeviceFeedbackDecode(
     inputs: WebGPUExecutionInputs,
     options: DeviceFeedbackDecodeOptions = {},
@@ -162,14 +200,6 @@ export class WebGPUEngine extends BackendEngine {
     return this.executor.executeDeviceFeedbackDecode(inputs, options);
   }
 
-  async prepareForTraining(): Promise<this> {
-    if (!this.executor) throw new Error('WebGPUEngine.prepareForTraining requires an allocated graph.');
-    this.resetDecodeCache();
-    await this.executor.prepareForTraining();
-    this.training = true;
-    return this;
-  }
-
   releaseAdapterTargets(
     targets: Parameters<GraphExecutor['releaseAdapterTargets']>[0],
   ): void {
@@ -177,12 +207,15 @@ export class WebGPUEngine extends BackendEngine {
   }
 
   dispose(): void {
+    if (this._disposed) return;
+    this._disposed = true;
     this.resetDecodeCache();
     const executor = this.executor;
     executor?._setDecodeCacheGenerationListener?.(null);
     executor?.dispose?.();
     this.executor = null;
     this._graph = null;
+    this.deviceState.release();
   }
 
   get graph(): Graph | null { return (this.executor?.graph as Graph | undefined) || this._graph; }

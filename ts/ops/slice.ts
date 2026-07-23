@@ -1,3 +1,5 @@
+import { assertRawQuantizedShapeTensors } from './quantizedShape.js';
+
 const MAX_SLICE_RANK = 8;
 const MAX_U32 = 0xffffffff;
 
@@ -18,12 +20,17 @@ function canonicalPositiveSlice(node, input, output) {
   const axesInput = node.params?.axes ??
     (Array.isArray(startsInput) ? startsInput.map((_, index) => index) : null);
   if (!input || !output || inputElements == null || outputElements == null ||
+      !['float32', 'int32', 'int8', 'uint8'].includes(input.dtype) ||
+      output.dtype !== input.dtype ||
       !Number.isInteger(rank) || rank < 1 || rank > MAX_SLICE_RANK ||
       output.shape.length !== rank || !Array.isArray(startsInput) ||
       !Array.isArray(stepsInput) || !Array.isArray(axesInput) ||
       startsInput.length !== stepsInput.length || startsInput.length !== axesInput.length) {
-    throw new Error(`Slice node '${node.id}' requires rank 1..8 input/output tensors with matching parameter arrays.`);
+    throw new Error(`Slice node '${node.id}' requires rank 1..8 input/output tensors with matching F32/I32/I8/U8 dtype and parameter arrays.`);
   }
+  // Slice selects a subset of elements without touching their values, so a
+  // quantized input passes through with its descriptor unchanged.
+  assertRawQuantizedShapeTensors(node, [input, output], 'Slice');
   if (!input.buffer || !output.buffer || input.buffer.length !== inputElements ||
       output.buffer.length !== outputElements) {
     throw new Error(`Slice node '${node.id}' tensor storage does not match its shape.`);

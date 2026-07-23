@@ -1,0 +1,6 @@
+# External correctness oracle for the parity harness (best-effort; not a runtime dep).
+# ONNX Runtime runs the source .onnx so VolvoxAI is checked against an independent
+# runtime, not just its own pure-JS reference. torch/numpy serve the per-op oracle.
+numpy>=1.24
+onnxruntime>=1.16
+# torch  # (optional) per-op correctness oracle — see tests/parity (L1, planned)

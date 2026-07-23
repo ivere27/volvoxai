@@ -10,8 +10,9 @@ import { promisify } from 'node:util';
 const run = promisify(execFile);
 const repositoryRoot = fileURLToPath(new URL('../', import.meta.url));
 const clang = process.env.CLANG || 'clang';
-const I8 = 2;
-const U8 = 3;
+// Canonical protobuf DataType values used by the public native/WASM ABI.
+const VX_DTYPE_U8 = 5;
+const VX_DTYPE_I8 = 6;
 
 async function buildInstrumentedWasm(directory) {
   const output = join(directory, 'volvoxai-w8a8-simd.wasm');
@@ -57,7 +58,7 @@ function writeArray(memory, allocate, values) {
 }
 
 function byteValues(length, dtype, stride, offset) {
-  if (dtype === I8) {
+  if (dtype === VX_DTYPE_I8) {
     return Int8Array.from({ length }, (_, index) =>
       ((index * stride + offset) % 255) - 127);
   }
@@ -70,6 +71,7 @@ function executeCase(api, memory, spec) {
     name, rows, dIn, dOut, inputDtype, weightDtype, outputDtype,
     inputZeroPoint, outputZeroPoint, expectedSimdCalls,
     expectedSymmetricCalls = 0,
+    expectedResult = 1,
     inputScale = 0.03125, outputScale = 0.0625,
     weightScale = (column) => 0.00390625 * (1 + column % 7),
     inputValues = null, weightValues = null, biasValues = null,
@@ -86,7 +88,7 @@ function executeCase(api, memory, spec) {
     weightScale(column));
   const zeroPoints = weightZeroPointValues ?? Int32Array.from(
     { length: dOut }, (_, column) =>
-      weightDtype === I8 ? column % 19 - 9 : 111 + column % 23);
+      weightDtype === VX_DTYPE_I8 ? column % 19 - 9 : 111 + column % 23);
   const inputPointer = writeArray(memory, allocate, input);
   const weightPointer = writeArray(memory, allocate, weight);
   const biasPointer = writeArray(memory, allocate, bias);
@@ -94,6 +96,8 @@ function executeCase(api, memory, spec) {
   const zeroPointPointer = writeArray(memory, allocate, zeroPoints);
   const portableOutputPointer = allocate(rows * dOut);
   const packedOutputPointer = allocate(rows * dOut);
+  new Uint8Array(memory.buffer, portableOutputPointer, rows * dOut).fill(0xa5);
+  new Uint8Array(memory.buffer, packedOutputPointer, rows * dOut).fill(0xa5);
   const packedBytes = Number(api.packed_q8_weight_size(dIn, dOut));
   const packedPointer = allocate(packedBytes);
 
@@ -105,13 +109,13 @@ function executeCase(api, memory, spec) {
     portableOutputPointer, rows, dIn, dOut,
     inputScale, inputZeroPoint, outputScale, outputZeroPoint,
     inputDtype, weightDtype, outputDtype,
-  ), 1, `${name}: portable reference`);
+  ), expectedResult, `${name}: portable reference`);
   assert.equal(api.qlinear_i8u8_packed(
     inputPointer, packedPointer, biasPointer, scalePointer, zeroPointPointer,
     packedOutputPointer, rows, dIn, dOut,
     inputScale, inputZeroPoint, outputScale, outputZeroPoint,
     inputDtype, weightDtype, outputDtype,
-  ), 1, `${name}: packed kernel`);
+  ), expectedResult, `${name}: packed kernel`);
   assert.equal(api.w8a8_wasm_simd_calls(), expectedSimdCalls,
     `${name}: SIMD dispatch count`);
   assert.equal(api.w8a8_wasm_symmetric_i8_calls(), expectedSymmetricCalls,
@@ -148,31 +152,36 @@ test('baseline WASM SIMD128 packed W8A8 is exact across byte types and tails', {
     executeCase(api, memory, {
       name: 'I8 input/weight/output with odd MR, K, and N tails',
       rows: 5, dIn: 67, dOut: 13,
-      inputDtype: I8, weightDtype: I8, outputDtype: I8,
+      inputDtype: VX_DTYPE_I8, weightDtype: VX_DTYPE_I8,
+      outputDtype: VX_DTYPE_I8,
       inputZeroPoint: -7, outputZeroPoint: 3, expectedSimdCalls: 1,
     });
     executeCase(api, memory, {
       name: 'U8 input/weight/output with asymmetric zero points',
       rows: 3, dIn: 19, dOut: 11,
-      inputDtype: U8, weightDtype: U8, outputDtype: U8,
+      inputDtype: VX_DTYPE_U8, weightDtype: VX_DTYPE_U8,
+      outputDtype: VX_DTYPE_U8,
       inputZeroPoint: 131, outputZeroPoint: 127, expectedSimdCalls: 1,
     });
     executeCase(api, memory, {
       name: 'U8 input and I8 weight with I8 output',
       rows: 6, dIn: 18, dOut: 16,
-      inputDtype: U8, weightDtype: I8, outputDtype: I8,
+      inputDtype: VX_DTYPE_U8, weightDtype: VX_DTYPE_I8,
+      outputDtype: VX_DTYPE_I8,
       inputZeroPoint: 149, outputZeroPoint: -11, expectedSimdCalls: 1,
     });
     executeCase(api, memory, {
       name: 'I8 input and U8 weight with U8 output',
       rows: 2, dIn: 33, dOut: 9,
-      inputDtype: I8, weightDtype: U8, outputDtype: U8,
+      inputDtype: VX_DTYPE_I8, weightDtype: VX_DTYPE_U8,
+      outputDtype: VX_DTYPE_U8,
       inputZeroPoint: -19, outputZeroPoint: 173, expectedSimdCalls: 1,
     });
     executeCase(api, memory, {
       name: 'TinyReceipt seed M=402 K=320 N=320',
       rows: 402, dIn: 320, dOut: 320,
-      inputDtype: I8, weightDtype: I8, outputDtype: I8,
+      inputDtype: VX_DTYPE_I8, weightDtype: VX_DTYPE_I8,
+      outputDtype: VX_DTYPE_I8,
       inputZeroPoint: 0, outputZeroPoint: 0, expectedSimdCalls: 1,
       expectedSymmetricCalls: 1,
       weightZeroPointValues: new Int32Array(320),
@@ -180,7 +189,8 @@ test('baseline WASM SIMD128 packed W8A8 is exact across byte types and tails', {
     executeCase(api, memory, {
       name: 'symmetric I8 odd M and K tails',
       rows: 7, dIn: 67, dOut: 16,
-      inputDtype: I8, weightDtype: I8, outputDtype: I8,
+      inputDtype: VX_DTYPE_I8, weightDtype: VX_DTYPE_I8,
+      outputDtype: VX_DTYPE_I8,
       inputZeroPoint: 0, outputZeroPoint: 0, expectedSimdCalls: 1,
       expectedSymmetricCalls: 1,
       weightZeroPointValues: new Int32Array(16),
@@ -188,7 +198,8 @@ test('baseline WASM SIMD128 packed W8A8 is exact across byte types and tails', {
     executeCase(api, memory, {
       name: 'vector requantization preserves round-to-nearest ties-to-even',
       rows: 1, dIn: 1, dOut: 8,
-      inputDtype: I8, weightDtype: I8, outputDtype: I8,
+      inputDtype: VX_DTYPE_I8, weightDtype: VX_DTYPE_I8,
+      outputDtype: VX_DTYPE_I8,
       inputZeroPoint: 0, outputZeroPoint: 0, expectedSimdCalls: 1,
       expectedSymmetricCalls: 1,
       inputScale: 1, outputScale: 2, weightScale: () => 1,
@@ -198,10 +209,12 @@ test('baseline WASM SIMD128 packed W8A8 is exact across byte types and tails', {
       weightZeroPointValues: new Int32Array(8),
     });
     executeCase(api, memory, {
-      name: 'non-finite multiplier keeps the portable scalar semantics',
+      name: 'non-finite multiplier is rejected by portable and packed kernels',
       rows: 2, dIn: 3, dOut: 8,
-      inputDtype: I8, weightDtype: I8, outputDtype: I8,
+      inputDtype: VX_DTYPE_I8, weightDtype: VX_DTYPE_I8,
+      outputDtype: VX_DTYPE_I8,
       inputZeroPoint: 0, outputZeroPoint: 17, expectedSimdCalls: 0,
+      expectedResult: 0,
       inputScale: 3.4028234663852886e38,
       outputScale: 1.1754943508222875e-38,
       weightScale: () => 3.4028234663852886e38,

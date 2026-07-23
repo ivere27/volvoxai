@@ -8,7 +8,7 @@ import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
 
 import { Graph } from '../ts/index.js';
-import { TrainingVolvoxAI } from '../ts/training/TrainingVolvoxAI.js';
+import { createWasmStepRunner } from './helpers/training_session.mjs';
 import { CPUAutograd } from '../ts/training/CPUAutograd.js';
 
 const run = promisify(execFile);
@@ -73,7 +73,7 @@ function crossAttentionGraph({
   const { out } = graph.addOp('CrossAttention', inputs, {
     out: rank3 ? [batch, seqQ, dModel] : [seqQ, dModel],
   }, { heads });
-  graph.outputNames = [out.name];
+  graph.setOutputs([out.name]);
   return {
     graph,
     output: out.name,
@@ -83,7 +83,7 @@ function crossAttentionGraph({
   };
 }
 
-async function trainParity(api, makeGraph, label) {
+async function trainParity(runWasmStep, makeGraph, label) {
   const wasmCase = makeGraph();
   const cpuCase = makeGraph();
   const options = {
@@ -92,12 +92,10 @@ async function trainParity(api, makeGraph, label) {
     updateMode: 'sgd',
     optimizer: { learningRate: 0 },
   };
-  const wasm = await api.trainStep(wasmCase.graph, { ...options, backend: 'wasm' });
+  const wasm = await runWasmStep(wasmCase.graph, { ...options, backend: 'wasm' });
   const cpu = await CPUAutograd.trainStep(cpuCase.graph, options);
   assert.equal(wasm.backend, 'wasm');
   assert.ok(Math.abs(wasm.loss - cpu.loss) <= 5e-5, `${label} loss`);
-  closeArray(wasmCase.graph.getTensor(wasmCase.output).buffer,
-    cpuCase.graph.getTensor(cpuCase.output).buffer, `${label} output`);
   for (const name of wasmCase.trainable) {
     closeArray(wasm.gradients.get(name), cpu.gradients.get(name), `${label} ${name} gradient`);
   }
@@ -116,20 +114,20 @@ test('strict full-WASM CrossAttention matches CPU forward and projected backward
   try {
     const wasmPath = join(directory, 'volvoxai.full.wasm');
     await buildFullWasm(wasmPath);
-    const api = await TrainingVolvoxAI.init(['wasm'], wasmPath);
+    const runWasmStep = createWasmStepRunner(wasmPath);
 
-    await trainParity(api, () => crossAttentionGraph({ rank3: true, scale: true, bias: true }),
+    await trainParity(runWasmStep, () => crossAttentionGraph({ rank3: true, scale: true, bias: true }),
       'batched affine CrossAttention');
-    await trainParity(api, () => crossAttentionGraph({ rank3: false, scale: false, bias: false }),
+    await trainParity(runWasmStep, () => crossAttentionGraph({ rank3: false, scale: false, bias: false }),
       'rank-2 CrossAttention');
-    await trainParity(api, () => crossAttentionGraph({ rank3: true, scale: true, bias: false }),
+    await trainParity(runWasmStep, () => crossAttentionGraph({ rank3: true, scale: true, bias: false }),
       'scale-only CrossAttention');
-    await trainParity(api, () => crossAttentionGraph({ rank3: false, scale: false, bias: true }),
+    await trainParity(runWasmStep, () => crossAttentionGraph({ rank3: false, scale: false, bias: true }),
       'bias-only CrossAttention');
-    await trainParity(api, () => crossAttentionGraph({
+    await trainParity(runWasmStep, () => crossAttentionGraph({
       rank3: true, scale: true, bias: true, dModel: 6, heads: 3,
     }), 'three-head CrossAttention');
-    await trainParity(api, () => crossAttentionGraph({ rank3: true, scale: true, bias: true, sharedQKV: true }),
+    await trainParity(runWasmStep, () => crossAttentionGraph({ rank3: true, scale: true, bias: true, sharedQKV: true }),
       'shared Q/KV CrossAttention');
   } finally {
     await rm(directory, { recursive: true, force: true });

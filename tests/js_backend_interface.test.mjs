@@ -2,16 +2,19 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 
 import {
-  BackendEngine,
-  CPUEngine,
   Graph,
-  GraphExecutor,
-  VOLVOXAI_BACKEND_API_VERSION,
+  VOLVOXAI_BACKEND_PROVIDER_VERSION,
   VolvoxAI,
-  WebGPUEngine,
-  WebNNEngine,
-  assertBackendEngine,
+  createBackendProviderCapabilities,
 } from '../ts/index.js';
+import { BackendEngine, assertBuiltInEngine } from '../ts/backends/BackendEngine.js';
+import { BuiltInBackendProvider } from '../ts/backends/BackendProvider.js';
+import { CPUEngine } from '../ts/backends/CPUEngine.js';
+import { GraphExecutor } from '../ts/backends/GraphExecutor.js';
+import { WasmEngine } from '../ts/backends/WasmEngine.js';
+import { WebGPUEngine } from '../ts/backends/WebGPUEngine.js';
+import { WebNNEngine } from '../ts/backends/WebNNEngine.js';
+import { ModelSnapshot } from '../ts/core/ModelSnapshot.js';
 
 class RecordingBackend extends BackendEngine {
   constructor(name = 'recording', capabilities = {}) {
@@ -37,7 +40,7 @@ function emptyGraph() {
   return { tensors: new Map(), nodes: [], outputNames: [] };
 }
 
-function reluGraph(adapters = null) {
+function internalReluGraph(adapters = null) {
   const input = {
     name: 'x', shape: [1], dtype: 'float32', sizeBytes: 4,
     isInput: true, buffer: new Float32Array(1),
@@ -55,6 +58,16 @@ function reluGraph(adapters = null) {
   };
 }
 
+function identityGraph() {
+  const graph = new Graph();
+  const input = graph.addInput('x', [1]);
+  const output = graph.addOp('Identity', { input }, {
+    out: { name: 'y', shape: [1] },
+  }).out;
+  graph.setOutputs(output);
+  return graph;
+}
+
 function genericByteAddGraph({ quantized = true, dtype = 'int8' } = {}) {
   const graph = new Graph();
   const quantization = { scheme: 'per_tensor', scale: 0.25, zero_point: 0 };
@@ -67,15 +80,23 @@ function genericByteAddGraph({ quantized = true, dtype = 'int8' } = {}) {
       ...(quantized ? { quantization } : {}),
     },
   });
-  graph.outputNames = [out.name];
+  graph.setOutputs(out);
   return graph;
 }
 
-test('built-in browser engines expose backend API v1 and one lifecycle shape', () => {
+function hostOutput(value) {
+  return Object.freeze({
+    name: 'y',
+    shape: Object.freeze([1]),
+    dtype: 'float32',
+    location: 'host',
+    data: Float32Array.of(value),
+  });
+}
+
+test('built-in engine lifecycle stays private and structurally consistent', () => {
   const cpu = new CPUEngine();
   const webnn = new WebNNEngine({});
-  assert.equal(VOLVOXAI_BACKEND_API_VERSION, 1);
-  assert.equal(cpu.backendApiVersion, 1);
   assert.equal(cpu.backendName, 'cpu');
   assert.deepEqual(cpu.capabilities, {
     incrementalExecution: true, incrementalRows: true, outputLocation: 'host',
@@ -85,33 +106,221 @@ test('built-in browser engines expose backend API v1 and one lifecycle shape', (
     incrementalExecution: false, incrementalRows: false, outputLocation: 'host',
   });
   for (const engine of [cpu, webnn]) {
+    assert.equal(assertBuiltInEngine(engine), engine);
     assert.equal(typeof engine.allocateGraph, 'function');
     assert.equal(typeof engine.execute, 'function');
     assert.equal(typeof engine.createDecodeSession, 'function');
   }
   assert.equal(typeof GraphExecutor.prototype.createDecodeSession, 'function');
   assert.throws(
-    () => assertBackendEngine({ allocateGraph() {}, execute() {} }, 'Incomplete backend'),
-    /must implement BackendEngine API v1/,
+    () => assertBuiltInEngine({ allocateGraph() {}, execute() {} }, 'Incomplete backend'),
+    /built-in engine lifecycle/,
   );
   assert.throws(
-    () => assertBackendEngine({
-      backendApiVersion: 1,
+    () => assertBuiltInEngine({
       backendName: 'unsafe-incremental',
       capabilities: Object.freeze({
-        incrementalExecution: true,
-        incrementalRows: false,
+        incrementalExecution: false,
+        incrementalRows: true,
         outputLocation: 'host',
       }),
       allocateGraph() {},
       execute() {},
       createDecodeSession() {},
     }, 'Unsafe incremental backend'),
-    /must implement BackendEngine API v1/,
+    /built-in engine lifecycle/,
   );
 });
 
-test('built-in browser allocation rejects generic arithmetic on quantized byte tensors', async () => {
+test('built-in CompiledModel owns one immutable prepared graph across contexts', async () => {
+  const events = { prepare: 0, allocations: [], disposed: 0 };
+  class PreparedBackend extends RecordingBackend {
+    constructor() { super('prepared'); }
+    prepareGraph(graph) {
+      events.prepare++;
+      return Object.freeze({ nodeCount: graph.nodes.length });
+    }
+    fork() { return new PreparedBackend(); }
+    allocateGraph(graph, preparedGraph) {
+      events.allocations.push({ graph, preparedGraph, engine: this });
+      return super.allocateGraph(graph);
+    }
+    dispose() { events.disposed++; }
+  }
+
+  const provider = new BuiltInBackendProvider(new PreparedBackend());
+  const compiled = await provider.compile(ModelSnapshot.capture(identityGraph()), {
+    operatorFallback: 'forbid',
+  });
+  const first = await compiled.createContext();
+  const second = await compiled.createContext();
+
+  assert.equal(events.prepare, 1);
+  assert.equal(events.allocations.length, 2);
+  assert.equal(events.allocations[0].preparedGraph, events.allocations[1].preparedGraph);
+  assert.equal(Object.isFrozen(events.allocations[0].preparedGraph), true);
+  assert.notEqual(events.allocations[0].graph, events.allocations[1].graph,
+    'contexts retain private tensor graphs while sharing only the prepared blueprint');
+  assert.notEqual(events.allocations[0].engine, events.allocations[1].engine);
+
+  await first.close();
+  await second.close();
+  await compiled.close();
+  await provider.close();
+  assert.equal(events.disposed, 3);
+});
+
+test('WASM prepared schedules are frozen, pointer-free, and reject unknown operators', () => {
+  const engine = new WasmEngine({
+    instance: { exports: { memory: new WebAssembly.Memory({ initial: 1 }) } },
+  });
+  const prepared = engine.prepareGraph(identityGraph());
+
+  assert.equal(Object.isFrozen(prepared), true);
+  assert.equal(Object.isFrozen(prepared.schedule), true);
+  assert.equal(Object.isFrozen(prepared.schedule[0]), true);
+  assert.deepEqual(prepared.schedule.map(({ nodeIndex, opType, kernelRoute }) => ({
+    nodeIndex, opType, kernelRoute,
+  })), [{ nodeIndex: 0, opType: 'Identity', kernelRoute: 'shape-copy' }]);
+  assert.equal(prepared.schedule[0].node, undefined);
+  assert.equal(prepared.schedule[0].tensor, undefined);
+  assert.throws(() => prepared.schedule.push({}), TypeError);
+
+  const unsupported = new Graph();
+  const input = unsupported.addInput('x', [1]);
+  const output = unsupported.addOp('UnknownKernel', { input }, {
+    out: { name: 'y', shape: [1] },
+  }).out;
+  unsupported.setOutputs(output);
+  assert.throws(() => engine.prepareGraph(unsupported), /operator 'UnknownKernel' is unsupported/);
+});
+
+test('provider capability validation uses typed initialization failures', () => {
+  for (const options of [
+    { operatorFallback: 'sometimes' },
+    { outputLocation: 'remote' },
+  ]) {
+    assert.throws(() => createBackendProviderCapabilities(options), (error) => {
+      assert.equal(error.code, 'INVALID_ARGUMENT');
+      assert.equal(error.phase, 'initialization');
+      return true;
+    });
+  }
+});
+
+test('WebNN uses only the current dataType/shape descriptor contract', async () => {
+  const previousBuilder = globalThis.MLGraphBuilder;
+  const operandDescriptors = [];
+  const tensorDescriptors = [];
+  class CurrentWebNNBuilder {
+    input(name, descriptor) {
+      operandDescriptors.push(descriptor);
+      return { name, dataType: descriptor.dataType, shape: descriptor.shape };
+    }
+    relu(input) { return { ...input, name: 'y' }; }
+    async build(outputs) { return outputs; }
+  }
+  globalThis.MLGraphBuilder = CurrentWebNNBuilder;
+  const context = {
+    async createTensor(descriptor) {
+      tensorDescriptors.push(descriptor);
+      return { descriptor, destroy() {} };
+    },
+    writeTensor() {},
+    dispatch() {},
+    async readTensor() { return Float32Array.of(3).buffer; },
+  };
+  try {
+    const graph = new Graph();
+    const input = graph.addInput('x', [1]);
+    const output = graph.addOp('ReLU', { input }, {
+      out: { name: 'y', shape: [1] },
+    }).out;
+    graph.setOutputs(output);
+    const engine = new WebNNEngine(context);
+    await engine.allocateGraph(graph);
+    assert.deepEqual(operandDescriptors, [
+      { dataType: 'float32', shape: [1] },
+    ]);
+    const result = await engine.execute({ x: Float32Array.of(3) });
+    assert.deepEqual(result.y, Float32Array.of(3));
+    assert.deepEqual(tensorDescriptors, [
+      { dataType: 'float32', shape: [1], writable: true },
+      { dataType: 'float32', shape: [1], readable: true },
+    ]);
+    assert.equal(tensorDescriptors.some((descriptor) =>
+      'type' in descriptor || 'dimensions' in descriptor), false);
+  } finally {
+    if (previousBuilder === undefined) delete globalThis.MLGraphBuilder;
+    else globalThis.MLGraphBuilder = previousBuilder;
+  }
+});
+
+test('WebNN releases every partially created request tensor after failure', async () => {
+  const previousBuilder = globalThis.MLGraphBuilder;
+  class CurrentWebNNBuilder {
+    input(name, descriptor) { return { name, ...descriptor }; }
+    relu(input) { return { ...input, name: 'y' }; }
+    async build(outputs) { return outputs; }
+  }
+  globalThis.MLGraphBuilder = CurrentWebNNBuilder;
+  const makeGraph = () => {
+    const graph = new Graph();
+    const input = graph.addInput('x', [1]);
+    const output = graph.addOp('ReLU', { input }, {
+      out: { name: 'y', shape: [1] },
+    }).out;
+    graph.setOutputs(output);
+    return graph;
+  };
+  const makeTensor = () => ({
+    destroyed: false,
+    destroy() { this.destroyed = true; },
+  });
+  try {
+    const partial = [];
+    let createCount = 0;
+    const createFailure = new WebNNEngine({
+      async createTensor() {
+        createCount++;
+        if (createCount === 2) throw new Error('output allocation failed');
+        const tensor = makeTensor();
+        partial.push(tensor);
+        return tensor;
+      },
+      writeTensor() {}, dispatch() {}, async readTensor() { return new ArrayBuffer(4); },
+    });
+    await createFailure.allocateGraph(makeGraph());
+    await assert.rejects(
+      createFailure.execute({ x: Float32Array.of(1) }),
+      /output allocation failed/,
+    );
+    assert.deepEqual(partial.map((tensor) => tensor.destroyed), [true]);
+
+    const dispatched = [];
+    const dispatchFailure = new WebNNEngine({
+      async createTensor() {
+        const tensor = makeTensor();
+        dispatched.push(tensor);
+        return tensor;
+      },
+      writeTensor() {},
+      dispatch() { throw new Error('dispatch failed'); },
+      async readTensor() { return new ArrayBuffer(4); },
+    });
+    await dispatchFailure.allocateGraph(makeGraph());
+    await assert.rejects(
+      dispatchFailure.execute({ x: Float32Array.of(1) }),
+      /dispatch failed/,
+    );
+    assert.deepEqual(dispatched.map((tensor) => tensor.destroyed), [true, true]);
+  } finally {
+    if (previousBuilder === undefined) delete globalThis.MLGraphBuilder;
+    else globalThis.MLGraphBuilder = previousBuilder;
+  }
+});
+
+test('built-in allocation rejects generic arithmetic on quantized byte tensors', async () => {
   const error = /unsupported generic operator/;
   assert.throws(() => new CPUEngine().allocateGraph(genericByteAddGraph()), error);
   await assert.rejects(
@@ -139,7 +348,7 @@ test('generic arithmetic cannot reinterpret unannotated byte tensors as F32', as
   executor.dispose();
 });
 
-test('DecodeSession maps seed and row steps onto the compatibility option contract', async () => {
+test('DecodeSession maps seed and row steps onto internal execution options', async () => {
   const engine = new RecordingBackend('row-device', {
     incrementalExecution: true,
     incrementalRows: true,
@@ -170,9 +379,8 @@ test('DecodeSession maps seed and row steps onto the compatibility option contra
   await assert.rejects(decode.seed({ tokens: Int32Array.of(1) }), /closed/);
 });
 
-test('DecodeSession falls back to ordinary forward and detects a replaced cache', async () => {
+test('DecodeSession falls back to forward execution and detects a replaced cache', async () => {
   const ordinary = new RecordingBackend('ordinary');
-  ordinary.supportsIncrementalExecution = true;
   ordinary.allocateGraph(emptyGraph());
   const fallback = ordinary.createDecodeSession();
   assert.equal(fallback.mode, 'ordinary-forward');
@@ -194,7 +402,7 @@ test('DecodeSession falls back to ordinary forward and detects a replaced cache'
   await second.step({ x: Float32Array.of(4) });
 });
 
-test('closing a stale or unseeded DecodeSession preserves the active cache owner', async () => {
+test('closing stale, unseeded, and concurrent sessions preserves one cache owner', async () => {
   const shared = new RecordingBackend('shared', { incrementalExecution: true });
   shared.allocateGraph(emptyGraph());
   const stale = shared.createDecodeSession();
@@ -207,9 +415,7 @@ test('closing a stale or unseeded DecodeSession preserves the active cache owner
   const unseeded = shared.createDecodeSession();
   await unseeded.close();
   await active.step({ x: Float32Array.of(4) });
-});
 
-test('concurrent sessions serialize async seeds and retain one cache owner', async () => {
   let releaseFirst;
   let signalFirstStarted;
   const firstStarted = new Promise((resolve) => { signalFirstStarted = resolve; });
@@ -250,7 +456,7 @@ test('concurrent sessions serialize async seeds and retain one cache owner', asy
   await second.step({ x: Float32Array.of(4) });
 });
 
-test('a direct legacy execute replaces an active DecodeSession cache owner', async () => {
+test('direct execution replaces active decode-cache ownership', async () => {
   const engine = new RecordingBackend('shared', { incrementalExecution: true });
   engine.allocateGraph(emptyGraph());
   const decode = engine.createDecodeSession();
@@ -267,8 +473,8 @@ test('a direct legacy execute replaces an active DecodeSession cache owner', asy
   );
 });
 
-test('DecodeSession rejects unknown changed inputs and dynamically unavailable caching', async () => {
-  const graph = reluGraph();
+test('DecodeSession rejects unknown inputs and dynamically unavailable caching', async () => {
+  const graph = internalReluGraph();
   const engine = new CPUEngine();
   engine.allocateGraph(graph);
 
@@ -284,7 +490,7 @@ test('DecodeSession rejects unknown changed inputs and dynamically unavailable c
   const training = engine.createDecodeSession({ requireIncremental: true });
   await assert.rejects(
     training.seed({ x: Float32Array.of(1) }, { training: {} }),
-    /cannot be combined with training execution/,
+    /does not accept training or Dropout RNG options/,
   );
 
   graph.adapters = {
@@ -298,7 +504,7 @@ test('DecodeSession rejects unknown changed inputs and dynamically unavailable c
   );
 });
 
-test('WebGPUEngine owns a GraphExecutor peer while preserving device readback access', async () => {
+test('WebGPU context forks share only device caches and release them at the final owner', async () => {
   const outputBuffer = { label: 'output' };
   const events = [];
   class StubExecutor extends BackendEngine {
@@ -326,7 +532,6 @@ test('WebGPUEngine owns a GraphExecutor peer while preserving device readback ac
       events.push({ deviceFeedback: true, inputs, options });
       return outputBuffer;
     }
-    async prepareForTraining() { this.resetDecodeCache(); events.push('prepare-training'); }
     dispose() { this.resetDecodeCache(); events.push('dispose'); }
   }
   class StubWebGPUEngine extends WebGPUEngine {
@@ -335,7 +540,9 @@ test('WebGPUEngine owns a GraphExecutor peer while preserving device readback ac
     }
   }
 
-  const engine = new StubWebGPUEngine({ label: 'device' });
+  const engine = new StubWebGPUEngine({ label: 'device' }, {
+    adapterInfo: { vendor: 'TestVendor', device: 'Test GPU' },
+  });
   const graph = emptyGraph();
   assert.equal(await engine.allocateGraph(graph), engine);
   assert.equal(engine.graph, graph);
@@ -347,16 +554,18 @@ test('WebGPUEngine owns a GraphExecutor peer while preserving device readback ac
   assert.equal(await engine.executeDeviceFeedbackDecode({ ids: Int32Array.of(0) }, {
     tokenInput: 'ids', keepInput: 'keep', output: 'out', tokenCount: 1,
   }), outputBuffer);
-  assert.ok(engine.decodeCacheGeneration > generationBeforeFeedback,
-    'a direct device-feedback call replaces wrapper decode-cache ownership');
-  assert.equal(engine.backendName, 'webgpu');
+  assert.ok(engine.decodeCacheGeneration > generationBeforeFeedback);
   assert.equal(engine.capabilities.outputLocation, 'device');
-  assert.equal(engine.supportsIncrementalRows, true);
+  assert.deepEqual(engine.adapterInfo, { vendor: 'TestVendor', device: 'Test GPU' });
+
   const peer = engine.fork();
-  assert.ok(peer instanceof WebGPUEngine);
   assert.notEqual(peer, engine);
   assert.equal(peer.device, engine.device);
+  assert.equal(peer.deviceState, engine.deviceState);
+  assert.equal(engine.deviceState.referenceCount, 2);
   assert.equal(peer.executor, null);
+  engine.deviceState.rejectedSpecializedShaders.add('retained-test-shader');
+
   const decode = engine.createDecodeSession();
   await decode.seed({ x: Float32Array.of(1) });
   await engine.executor.execute({ x: Float32Array.of(2) });
@@ -365,42 +574,116 @@ test('WebGPUEngine owns a GraphExecutor peer while preserving device readback ac
     /cache was reset or replaced/,
   );
   await decode.seed({ x: Float32Array.of(1) });
-  await engine.prepareForTraining();
-  await assert.rejects(
-    decode.step({ x: Float32Array.of(2) }),
-    /cache was reset or replaced/,
-  );
+  assert.equal(engine.prepareForTraining, undefined,
+    'inference WebGPU engines expose no training preparation');
+  await decode.step({ x: Float32Array.of(2) });
+
   engine.dispose();
+  assert.equal(peer.deviceState.referenceCount, 1);
+  assert.equal(peer.deviceState.rejectedSpecializedShaders.has('retained-test-shader'), true);
+  peer.dispose();
+  assert.equal(peer.deviceState.referenceCount, 0);
+  assert.equal(peer.deviceState.rejectedSpecializedShaders.size, 0);
   assert.equal(events[0], 'compile');
 });
 
-test('VolvoxAI registers a named out-of-tree backend without editing built-in selection', async () => {
-  const name = 'test-npu';
-  const unregister = VolvoxAI.registerBackend(name, () => new RecordingBackend(name));
-  try {
-    assert.ok(VolvoxAI.listBackends().includes(name));
-    const runtime = await VolvoxAI.init(name);
-    assert.deepEqual(runtime.engines.map(({ type }) => type), [name]);
-    const graph = emptyGraph();
-    const engine = await runtime.compile(graph);
-    assert.equal(engine.backendName, name);
-    assert.equal(engine.graph, graph);
-  } finally {
-    unregister();
-  }
-  assert.equal(VolvoxAI.listBackends().includes(name), false);
+test('runtime-local provider composition covers Model, contexts, decode, and results', async () => {
+  const name = 'interface-fixture';
+  const events = [];
+  let nextContext = 0;
+  const provider = {
+    providerVersion: VOLVOXAI_BACKEND_PROVIDER_VERSION,
+    backendName: name,
+    capabilities: createBackendProviderCapabilities({
+      operatorFallback: 'none',
+      outputLocation: 'host',
+    }),
+    async compile(snapshot, options) {
+      events.push(['compile', snapshot.outputNames, options]);
+      return {
+        backendName: name,
+        async createContext() {
+          const contextId = ++nextContext;
+          let closed = false;
+          const execute = async (inputs, options = {}) => {
+            assert.equal(closed, false);
+            events.push(['execute', contextId, options]);
+            return Object.freeze({
+              outputs: Object.freeze([hostOutput(inputs.x[0] + contextId)]),
+              backendReport: Object.freeze({ contextId }),
+            });
+          };
+          return {
+            backendName: name,
+            execute,
+            decodeSeed: execute,
+            decodeStep: execute,
+            async decodeReset() { events.push(['decode-reset', contextId]); },
+            async close() { closed = true; events.push(['context-close', contextId]); },
+          };
+        },
+        async close() { events.push(['compiled-close']); },
+      };
+    },
+    async close() { events.push(['provider-close']); },
+  };
+  const runtime = await VolvoxAI.createRuntime({
+    backends: [name],
+    providers: {
+      [name]: async ({ name: requested }) => {
+        assert.equal(requested, name);
+        return provider;
+      },
+    },
+  });
+  assert.deepEqual(runtime.listBackends(), [name]);
+  const model = runtime.createModel(identityGraph());
+  const compiled = await model.compile({
+    backend: { mode: 'require', backend: name, operatorFallback: 'forbid' },
+  });
+  assert.equal(compiled.backend, name);
+  assert.equal(compiled.report.selectedBackend, name);
+
+  const firstContext = await compiled.createContext();
+  const secondContext = await compiled.createContext();
+  const first = await firstContext.execute({ x: Float32Array.of(2) });
+  const second = await secondContext.decode.seed({ x: Float32Array.of(5) });
+  assert.deepEqual(await first.output('y').read(), Float32Array.of(3));
+  assert.deepEqual(await second.output('y').read(), Float32Array.of(7));
+  assert.deepEqual(first.report.backendReport, { contextId: 1 });
+  await secondContext.decode.reset();
+
+  await firstContext.close();
+  assert.deepEqual(await first.output('y').read(), Float32Array.of(3));
+  await secondContext.close();
+  await compiled.close();
+  await model.close();
+  await runtime.close();
+  assert.deepEqual(events.slice(-4), [
+    ['context-close', 1],
+    ['context-close', 2],
+    ['compiled-close'],
+    ['provider-close'],
+  ]);
+  await Promise.all([first.close(), second.close()]);
 });
 
-test('VolvoxAI detached compilation preserves the runtime engine graph owner', async () => {
-  const runtime = new VolvoxAI();
-  const primary = new CPUEngine();
-  const primaryGraph = reluGraph();
-  primary.allocateGraph(primaryGraph);
-  runtime.engines.push({ type: 'cpu', engine: primary });
-
-  const detachedGraph = reluGraph();
-  const detached = await runtime.compileDetached(detachedGraph);
-  assert.notEqual(detached, primary);
-  assert.equal(primary.graph, primaryGraph);
-  assert.equal(detached.graph, detachedGraph);
+test('inference entry exposes handles and the provider contract, not engine facades', async () => {
+  const api = await import('../ts/index.js');
+  for (const hidden of [
+    'BackendEngine',
+    'DecodeSession',
+    'CPUEngine',
+    'WasmEngine',
+    'WebGPUEngine',
+    'WebNNEngine',
+    'GraphExecutor',
+  ]) {
+    assert.equal(hidden in api, false, `${hidden} must remain internal`);
+  }
+  assert.equal(typeof VolvoxAI, 'object');
+  assert.equal(Object.isFrozen(VolvoxAI), true);
+  assert.deepEqual(Object.keys(VolvoxAI).sort(), [
+    'createRuntime',
+  ]);
 });

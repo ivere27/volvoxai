@@ -31,7 +31,8 @@ const api = instance.exports;
 const memory = api.memory;
 assert.ok(memory instanceof WebAssembly.Memory);
 
-const I8 = 2;
+// Canonical protobuf DataType value used by the public native/WASM ABI.
+const VX_DTYPE_I8 = 6;
 const inputScale = 1 / 32;
 const inputZeroPoint = 0;
 const outputScale = 1 / 16;
@@ -181,7 +182,7 @@ function runQConvCase({ label, inputChannels }) {
   write(zeroPointsPointer, zeroPoints);
   assert.equal(api.pack_q8_weight(
     packedWeightPointer, packedBytes, weightPointer,
-    packedDIn, outputChannels, I8, 1,
+    packedDIn, outputChannels, VX_DTYPE_I8, 1,
   ), 1, `${label} weight packing failed`);
 
   const portableCall = () => api.qconv2d_i8u8(
@@ -189,20 +190,22 @@ function runQConvCase({ label, inputChannels }) {
     portableOutputPointer, 1, inputHeight, inputWidth, inputChannels,
     outputHeight, outputWidth, outputChannels, kernelHeight, kernelWidth,
     inputChannels, 2, 2, 1, 1, 1, 1, 1, 1, 1, 0,
-    inputScale, inputZeroPoint, outputScale, outputZeroPoint, I8, I8, I8,
+    inputScale, inputZeroPoint, outputScale, outputZeroPoint,
+    VX_DTYPE_I8, VX_DTYPE_I8, VX_DTYPE_I8,
   );
   const im2colCall = () => api.qconv2d_im2col_i8u8?.(
     inputPointer, columnsPointer, biasPointer, zeroPointsPointer,
     1, inputHeight, inputWidth, inputChannels,
     outputHeight, outputWidth, outputChannels, kernelHeight, kernelWidth,
-    2, 2, 1, 1, 1, 1, 1, 1, inputZeroPoint, I8,
-    I8,
+    2, 2, 1, 1, 1, 1, 1, 1, inputZeroPoint, VX_DTYPE_I8,
+    VX_DTYPE_I8,
   ) ?? 0;
   const packedGemmCall = () => api.qlinear_i8u8_packed(
     columnsPointer, packedWeightPointer, biasPointer, scalesPointer,
     zeroPointsPointer, packedOutputPointer, outputHeight * outputWidth,
     packedDIn, outputChannels, inputScale, inputZeroPoint,
-    outputScale, outputZeroPoint, I8, I8, I8,
+    outputScale, outputZeroPoint,
+    VX_DTYPE_I8, VX_DTYPE_I8, VX_DTYPE_I8,
   );
   const im2colPackedCall = () => im2colCall() === 1 ? packedGemmCall() : 0;
 
@@ -272,18 +275,21 @@ function runLinearCase(test) {
   write(scalesPointer, scales);
   write(zeroPointsPointer, zeroPoints);
   assert.equal(api.pack_q8_weight(
-    packedPointer, packedBytes, weightPointer, test.dIn, test.dOut, I8, 1,
+    packedPointer, packedBytes, weightPointer, test.dIn, test.dOut,
+    VX_DTYPE_I8, 1,
   ), 1, `${test.label} weight packing failed`);
 
   const portableCall = () => api.qlinear_i8u8(
     inputPointer, weightPointer, biasPointer, scalesPointer, zeroPointsPointer,
     referencePointer, test.rows, test.dIn, test.dOut,
-    inputScale, inputZeroPoint, outputScale, outputZeroPoint, I8, I8, I8,
+    inputScale, inputZeroPoint, outputScale, outputZeroPoint,
+    VX_DTYPE_I8, VX_DTYPE_I8, VX_DTYPE_I8,
   );
   const packedCall = () => api.qlinear_i8u8_packed(
     inputPointer, packedPointer, biasPointer, scalesPointer, zeroPointsPointer,
     packedOutputPointer, test.rows, test.dIn, test.dOut,
-    inputScale, inputZeroPoint, outputScale, outputZeroPoint, I8, I8, I8,
+    inputScale, inputZeroPoint, outputScale, outputZeroPoint,
+    VX_DTYPE_I8, VX_DTYPE_I8, VX_DTYPE_I8,
   );
   assert.equal(portableCall(), 1, `${test.label} portable QLinear rejected its descriptor`);
   assert.equal(packedCall(), 1, `${test.label} packed QLinear rejected its descriptor`);

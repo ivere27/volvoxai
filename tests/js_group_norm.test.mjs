@@ -1,8 +1,9 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
-import { CPUEngine, Graph } from '../ts/index.js';
-import { CPUAutograd } from '../ts/training/index.js';
+import { Graph } from '../ts/index.js';
+import { CPUEngine } from '../ts/backends/CPUEngine.js';
+import { CPUAutograd } from '../ts/training/CPUAutograd.js';
 import { GraphExecutor } from '../ts/backends/GraphExecutor.js';
 import { WebGPUAutograd } from '../ts/training/WebGPUAutograd.js';
 
@@ -93,7 +94,7 @@ test('CPU GroupNorm normalizes NHWC values independently per sample and group', 
     num_groups: 2,
     eps: 0.05,
   });
-  graph.outputNames = [out.name];
+  graph.setOutputs([out.name]);
 
   const values = Float32Array.from([
     1, 2, 3, 4, 5, 6, 7, 8,
@@ -119,7 +120,7 @@ test('CPU GroupNorm backward matches finite differences for input and affine par
     num_groups: 2,
     eps: 0.07,
   });
-  graph.outputNames = [out.name];
+  graph.setOutputs([out.name]);
   const targets = [1, 3];
 
   const analytic = await CPUAutograd.trainStep(graph, {

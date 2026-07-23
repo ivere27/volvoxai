@@ -1,3 +1,12 @@
+#ifndef _POSIX_C_SOURCE
+#define _POSIX_C_SOURCE 200809L
+#endif
+
+#include "volvoxai.h"
+
+#include "cJSON.h"
+#include "image_io.h"
+
 #include <errno.h>
 #include <limits.h>
 #include <math.h>
@@ -7,21 +16,6 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <time.h>
-#ifdef _WIN32
-#include <windows.h>
-#endif
-
-#ifndef VOLVOXAI_ENABLE_TRAINING
-#define VOLVOXAI_ENABLE_TRAINING 0
-#endif
-
-#include "volvoxai.h"
-#if VOLVOXAI_ENABLE_TRAINING
-#include "volvoxai_training.h"
-#endif
-#include "cJSON.h"
-#include "image_io.h"
-#include "volvoxai_tokenizer.h"
 
 #ifndef PATH_MAX
 #define PATH_MAX 4096
@@ -37,55 +31,64 @@
 #define VOLVOXAI_BUILD_DATE "unknown"
 #endif
 
-int g_warmup_runs = 0;   // --warmup_runs: discarded forwards before timing
-int g_num_runs = 1;      // --num_runs: timed forwards (reports first/avg/min/max)
-
 #define MAX_BINDINGS 32
+#define MAX_WEIGHT_PATHS 32
 
-typedef struct {
+typedef struct Binding {
     char name[128];
     char path[PATH_MAX];
 } Binding;
 
-typedef struct {
-    char config[PATH_MAX];
-    char weights[PATH_MAX];
-    char vocab[PATH_MAX];
-    char merges[PATH_MAX];
+typedef struct ModelPaths {
+    char graph[PATH_MAX];
+    char default_weights[PATH_MAX];
 } ModelPaths;
 
-typedef struct {
-    const char* weights;
-    VolvoxAIEngineOptions engine;
+typedef struct TaskOptions {
+    const char* weight_paths[MAX_WEIGHT_PATHS];
+    size_t weight_path_count;
     Binding inputs[MAX_BINDINGS];
     Binding images[MAX_BINDINGS];
     Binding outputs[MAX_BINDINGS];
-    int n_inputs;
-    int n_images;
-    int n_outputs;
-    int image_norm;
-    int image_norm_explicit;
-    int execution_row;
-} GraphOptions;
+    size_t input_count;
+    size_t image_count;
+    size_t output_count;
+    const char* backend;
+    int debug;
+    int cpu_threads;
+    int image_normalization;
+    int image_normalization_explicit;
+    int warmup_runs;
+    int timed_runs;
+    int include_transfers;
+} TaskOptions;
 
-typedef struct {
+typedef struct TaskSession {
+    VxRuntime* runtime;
+    VxModel* model;
+    VxCompiledModel* compiled;
+    VxExecutionContext* context;
+    VxResult* result;
+    VxReport report;
+    char graph_path[PATH_MAX];
+} TaskSession;
+
+typedef struct LabelList {
+    char* storage;
     char** items;
-    int count;
+    size_t count;
 } LabelList;
 
-static void print_release_info(void);
+typedef struct RankedValue {
+    size_t index;
+    int class_id;
+    float score;
+} RankedValue;
 
 static double now_ms(void) {
-#ifdef _WIN32
-    LARGE_INTEGER freq, counter;
-    QueryPerformanceFrequency(&freq);
-    QueryPerformanceCounter(&counter);
-    return (double)counter.QuadPart * 1000.0 / (double)freq.QuadPart;
-#else
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (double)ts.tv_sec * 1000.0 + (double)ts.tv_nsec / 1000000.0;
-#endif
+    struct timespec value;
+    clock_gettime(CLOCK_MONOTONIC, &value);
+    return (double)value.tv_sec * 1000.0 + (double)value.tv_nsec / 1000000.0;
 }
 
 static int file_exists(const char* path) {
@@ -93,2115 +96,1044 @@ static int file_exists(const char* path) {
     return path && path[0] && stat(path, &st) == 0 && S_ISREG(st.st_mode);
 }
 
-static int is_dir(const char* path) {
+static int is_directory(const char* path) {
     struct stat st;
     return path && path[0] && stat(path, &st) == 0 && S_ISDIR(st.st_mode);
 }
 
-static void join_path(char* out, size_t out_size, const char* a, const char* b) {
-    size_t n = strlen(a);
-    snprintf(out, out_size, "%s%s%s", a, (n && a[n - 1] == '/') ? "" : "/", b);
+static int copy_string(char* destination, size_t capacity, const char* value) {
+    int written;
+    if (!destination || !capacity || !value) return -1;
+    written = snprintf(destination, capacity, "%s", value);
+    return written >= 0 && (size_t)written < capacity ? 0 : -1;
 }
 
-static int resolve_model_paths(const char* model, const char* weights, const char* vocab,
-                               const char* merges, ModelPaths* out) {
-    memset(out, 0, sizeof(*out));
-    if (is_dir(model)) {
-        join_path(out->config, sizeof(out->config), model, "config.json");
-        join_path(out->weights, sizeof(out->weights), model, "model.safetensors");
-        join_path(out->vocab, sizeof(out->vocab), model, "vocab.bin");
-        join_path(out->merges, sizeof(out->merges), model, "merges.txt");
-        if (!file_exists(out->weights)) out->weights[0] = '\0';
-    } else {
-        snprintf(out->config, sizeof(out->config), "%s", model);
+static int join_path(char* destination, size_t capacity,
+                     const char* directory, const char* leaf) {
+    size_t length;
+    int written;
+    if (!destination || !capacity || !directory || !leaf) return -1;
+    length = strlen(directory);
+    written = snprintf(destination, capacity, "%s%s%s", directory,
+                       length && directory[length - 1] == '/' ? "" : "/", leaf);
+    return written >= 0 && (size_t)written < capacity ? 0 : -1;
+}
+
+static int resolve_model_paths(const char* model, ModelPaths* paths) {
+    if (!model || !model[0] || !paths) return -1;
+    memset(paths, 0, sizeof(*paths));
+    if (is_directory(model)) {
+        if (join_path(paths->graph, sizeof(paths->graph), model, "graph.json") != 0 ||
+            join_path(paths->default_weights, sizeof(paths->default_weights), model,
+                      "model.safetensors") != 0) {
+            fprintf(stderr, "Model path is too long: %s\n", model);
+            return -1;
+        }
+        if (!file_exists(paths->default_weights)) paths->default_weights[0] = 0;
+    } else if (copy_string(paths->graph, sizeof(paths->graph), model) != 0) {
+        fprintf(stderr, "Graph path is too long: %s\n", model);
+        return -1;
     }
-    if (weights) snprintf(out->weights, sizeof(out->weights), "%s", weights);
-    if (vocab) snprintf(out->vocab, sizeof(out->vocab), "%s", vocab);
-    if (merges) snprintf(out->merges, sizeof(out->merges), "%s", merges);
-    if (!file_exists(out->config)) {
-        fprintf(stderr, "Missing config.json: %s\n", out->config);
+    if (!file_exists(paths->graph)) {
+        fprintf(stderr, "Missing graph.json: %s\n", paths->graph);
         return -1;
     }
     return 0;
 }
 
-static const char* resolve_labels_path(const char* model, const char* labels,
-                                       char* discovered, size_t discovered_size) {
-    if (labels) return labels;
-    if (!is_dir(model)) return NULL;
-    join_path(discovered, discovered_size, model, "labels.txt");
-    return file_exists(discovered) ? discovered : NULL;
-}
-
-static int parse_binding(const char* arg, Binding* b, int require_name) {
-    const char* eq = strchr(arg, '=');
-    memset(b, 0, sizeof(*b));
-    if (eq) {
-        size_t n = (size_t)(eq - arg);
-        if (n == 0 || n >= sizeof(b->name)) return -1;
-        memcpy(b->name, arg, n);
-        b->name[n] = 0;
-        snprintf(b->path, sizeof(b->path), "%s", eq + 1);
-        return b->path[0] ? 0 : -1;
-    }
-    if (require_name) return -1;
-    snprintf(b->path, sizeof(b->path), "%s", arg);
-    return b->path[0] ? 0 : -1;
-}
-
-static int has_suffix(const char* path, const char* suffix) {
-    size_t lp = strlen(path), ls = strlen(suffix);
-    if (lp < ls) return 0;
-    return strcmp(path + lp - ls, suffix) == 0;
-}
-
-static const char* dtype_name(int dtype) {
-    switch (dtype) {
-        case VOLVOXAI_DTYPE_F32: return "F32";
-        case VOLVOXAI_DTYPE_I8: return "I8";
-        case VOLVOXAI_DTYPE_U8: return "U8";
-        case VOLVOXAI_DTYPE_I32: return "I32";
-        case VOLVOXAI_DTYPE_F16: return "F16";
-        default: return "unknown";
-    }
-}
-
-static const char* dtype_file_suffix(int dtype) {
-    switch (dtype) {
-        case VOLVOXAI_DTYPE_F32: return ".f32";
-        case VOLVOXAI_DTYPE_I8: return ".i8";
-        case VOLVOXAI_DTYPE_U8: return ".u8";
-        case VOLVOXAI_DTYPE_I32: return ".i32";
-        case VOLVOXAI_DTYPE_F16: return ".f16";
-        default: return NULL;
-    }
-}
-
-static char* read_file_bytes(const char* path, long* out_size) {
-    FILE* f = fopen(path, "rb");
-    if (!f) return NULL;
-    if (fseek(f, 0, SEEK_END) != 0) { fclose(f); return NULL; }
-    long sz = ftell(f);
-    if (sz < 0 || fseek(f, 0, SEEK_SET) != 0 ||
-        (unsigned long)sz > SIZE_MAX - 1) {
-        fclose(f);
+static const char* discover_file(const char* model, const char* explicit_path,
+                                 const char* leaf, char* buffer, size_t capacity) {
+    if (explicit_path) return explicit_path;
+    if (!is_directory(model) || join_path(buffer, capacity, model, leaf) != 0)
         return NULL;
-    }
-    char* buf = (char*)malloc(sz > 0 ? (size_t)sz + 1 : 1);
-    if (!buf) { fclose(f); return NULL; }
-    if (sz > 0 && fread(buf, 1, (size_t)sz, f) != (size_t)sz) {
-        free(buf);
-        fclose(f);
-        return NULL;
-    }
-    buf[sz] = 0;
-    fclose(f);
-    if (out_size) *out_size = sz;
-    return buf;
+    return file_exists(buffer) ? buffer : NULL;
 }
 
-static int load_tensor_binding(const Binding* b) {
-    long numel = 0;
-    int shape[8] = {0};
-    int ndim = 0;
-    int dtype = -1;
-    size_t element_size = 0;
-    if (volvoxai_engine_tensor_info_ex(b->name, &numel, shape, &ndim, &dtype,
-            &element_size) != 0 || volvoxai_engine_is_graph_input(b->name) != 1 ||
-        numel < 0 || element_size == 0 || (size_t)numel > SIZE_MAX / element_size) {
-        fprintf(stderr, "Unknown input tensor: %s\n", b->name);
-        return -1;
+static int parse_binding(const char* argument, Binding* binding, int require_name) {
+    const char* equals;
+    size_t name_length;
+    if (!argument || !binding) return -1;
+    memset(binding, 0, sizeof(*binding));
+    equals = strchr(argument, '=');
+    if (!equals) {
+        if (require_name || copy_string(binding->path, sizeof(binding->path), argument) != 0)
+            return -1;
+        return binding->path[0] ? 0 : -1;
     }
+    name_length = (size_t)(equals - argument);
+    if (!name_length || name_length >= sizeof(binding->name) || !equals[1]) return -1;
+    memcpy(binding->name, argument, name_length);
+    binding->name[name_length] = 0;
+    return copy_string(binding->path, sizeof(binding->path), equals + 1);
+}
 
-    const char* suffix = dtype_file_suffix(dtype);
-    if (!suffix || !has_suffix(b->path, suffix)) {
-        fprintf(stderr, "Input %s has dtype %s and requires a %s file: %s\n",
-                b->name, dtype_name(dtype), suffix ? suffix : "supported raw", b->path);
+static int parse_int(const char* text, int minimum, int* result) {
+    char* end = NULL;
+    long value;
+    if (!text || !text[0] || !result) return -1;
+    errno = 0;
+    value = strtol(text, &end, 10);
+    if (errno == ERANGE || !end || *end || value < minimum || value > INT_MAX)
         return -1;
-    }
-
-    long sz = 0;
-    char* data = read_file_bytes(b->path, &sz);
-    if (!data) {
-        fprintf(stderr, "Cannot read input file: %s\n", b->path);
-        return -1;
-    }
-
-    size_t expected = (size_t)numel * element_size;
-    if (sz < 0 || (size_t)sz != expected) {
-        fprintf(stderr, "Input %s expects %zu raw bytes, got %ld from %s\n",
-                b->name, expected, sz, b->path);
-        free(data);
-        return -1;
-    }
-    int rc = volvoxai_engine_set_input_raw(b->name, dtype, data, expected);
-    free(data);
-    if (rc != 0) {
-        fprintf(stderr, "Cannot set input tensor: %s\n", b->name);
-        return -1;
-    }
+    *result = (int)value;
     return 0;
 }
 
-static int load_image_binding(const Binding* b, int normalize) {
-    long numel = 0;
-    int shape[8] = {0};
-    int ndim = 0;
-    int dtype = -1;
-    size_t element_size = 0;
-    if (volvoxai_engine_tensor_info_ex(b->name, &numel, shape, &ndim, &dtype,
-            &element_size) != 0 || volvoxai_engine_is_graph_input(b->name) != 1 ||
-        numel <= 0) {
-        fprintf(stderr, "Unknown image input tensor: %s\n", b->name);
-        return -1;
-    }
-
-    if (!((dtype == VOLVOXAI_DTYPE_F32 && element_size == sizeof(float)) ||
-          ((dtype == VOLVOXAI_DTYPE_U8 || dtype == VOLVOXAI_DTYPE_I8) &&
-           element_size == 1))) {
-        fprintf(stderr, "Image input %s has unsupported dtype %s; expected F32, U8, or I8.\n",
-                b->name, dtype_name(dtype));
-        return -1;
-    }
-    if ((size_t)numel > SIZE_MAX / sizeof(float)) {
-        fprintf(stderr, "Image input tensor is too large: %s\n", b->name);
-        return -1;
-    }
-
-    float* decoded = (float*)malloc((size_t)numel * sizeof(float));
-    if (!decoded) {
-        fprintf(stderr, "Cannot allocate image input tensor: %s\n", b->name);
-        return -1;
-    }
-    char err[256] = {0};
-    if (volvox_load_image_to_tensor(b->path, decoded, shape, ndim,
-            normalize, err, sizeof(err)) != 0) {
-        fprintf(stderr, "Image load failed for %s: %s\n", b->path,
-                err[0] ? err : "unknown error");
-        free(decoded);
-        return -1;
-    }
-
-    int rc = -1;
-    if (normalize == VOLVOX_IMAGE_RAW_255 &&
-        (dtype == VOLVOXAI_DTYPE_U8 || dtype == VOLVOXAI_DTYPE_I8)) {
-        void* raw = malloc((size_t)numel);
-        if (!raw) {
-            fprintf(stderr, "Cannot allocate image input tensor: %s\n", b->name);
-            free(decoded);
-            return -1;
-        }
-        for (long i = 0; i < numel; i++) {
-            int pixel = (int)lroundf(decoded[i]);
-            if (pixel < 0) pixel = 0;
-            if (pixel > 255) pixel = 255;
-            if (dtype == VOLVOXAI_DTYPE_U8) {
-                ((uint8_t*)raw)[i] = (uint8_t)pixel;
-            } else {
-                ((int8_t*)raw)[i] = (int8_t)(pixel - 128);
-            }
-        }
-        rc = volvoxai_engine_set_input_raw(b->name, dtype, raw, (size_t)numel);
-        free(raw);
-    } else {
-        rc = volvoxai_engine_set_input_f32(b->name, decoded, numel);
-    }
-    free(decoded);
-    if (rc != 0) {
-        if (dtype != VOLVOXAI_DTYPE_F32 && normalize != VOLVOX_IMAGE_RAW_255) {
-            fprintf(stderr,
-                    "Cannot set image input tensor %s; normalized I8/U8 inputs require "
-                    "valid per-tensor quantization metadata.\n",
-                    b->name);
-        } else {
-            fprintf(stderr, "Cannot set image input tensor: %s\n", b->name);
-        }
-        return -1;
-    }
+static int parse_normalization(const char* value, int* mode) {
+    if (!strcmp(value, "zero-one")) *mode = VOLVOX_IMAGE_ZERO_ONE;
+    else if (!strcmp(value, "minus-one-one")) *mode = VOLVOX_IMAGE_MINUS_ONE_ONE;
+    else if (!strcmp(value, "raw-255")) *mode = VOLVOX_IMAGE_RAW_255;
+    else return -1;
     return 0;
 }
 
-static int write_output_binding(const Binding* b) {
-    const void* src = NULL;
-    void* owned = NULL;
-    size_t nbytes = 0;
-    int shape[8] = {0};
-    int ndim = 0;
-    int dtype = -1;
-    size_t element_size = 0;
-    long numel = 0;
-    const char* name = b->name[0] ? b->name : volvoxai_engine_graph_output_name(0);
-    if (!name || !name[0] ||
-        volvoxai_engine_tensor_info_ex(name, &numel, shape, &ndim, &dtype,
-            &element_size) != 0 || numel <= 0 || element_size == 0 ||
-        (size_t)numel > SIZE_MAX / element_size) {
-        fprintf(stderr, "Unknown output tensor: %s\n", b->name[0] ? b->name : "<primary>");
-        return -1;
-    }
-
-    const char* suffix = dtype_file_suffix(dtype);
-    if (!suffix || !has_suffix(b->path, suffix)) {
-        fprintf(stderr, "Output %s has dtype %s and requires a %s file: %s\n",
-                name, dtype_name(dtype), suffix ? suffix : "supported raw", b->path);
-        return -1;
-    }
-
-    int row = volvoxai_engine_execution_row();
-    if (row >= 0 && ndim >= 2) {
-        if (dtype != VOLVOXAI_DTYPE_F32 || element_size != sizeof(float)) {
-            fprintf(stderr, "--last-token output currently requires an F32 tensor: %s\n", name);
-            return -1;
-        }
-        int count = 0;
-        src = volvoxai_engine_tensor_row_f32(name, row, &count);
-        if (!src || count <= 0 || (size_t)count > SIZE_MAX / sizeof(float)) {
-            fprintf(stderr, "No output row available for %s\n", name);
-            return -1;
-        }
-        nbytes = (size_t)count * sizeof(float);
-    } else {
-        nbytes = (size_t)numel * element_size;
-        owned = malloc(nbytes);
-        if (!owned || volvoxai_engine_copy_tensor_raw(name, owned, nbytes) != 0) {
-            free(owned);
-            fprintf(stderr, "Cannot snapshot output tensor: %s\n", name);
-            return -1;
-        }
-        src = owned;
-    }
-    FILE* f = fopen(b->path, "wb");
-    if (!f) {
-        fprintf(stderr, "Cannot open output file: %s\n", b->path);
-        free(owned);
-        return -1;
-    }
-    int write_failed = fwrite(src, 1, nbytes, f) != nbytes;
-    int close_failed = fclose(f) != 0;
-    free(owned);
-    if (write_failed || close_failed) {
-        fprintf(stderr, "Cannot write output file: %s\n", b->path);
-        return -1;
-    }
-    return 0;
-}
-
-static void print_root_help(const char* argv0) {
-    print_release_info();
-    printf("Usage: %s <command> [args]\n\n", argv0);
-    printf("Commands:\n");
-    printf("  run <model-dir|config.json>       Run one generic tensor graph forward pass.\n");
-    printf("  generate <model-dir|config.json>  Generate text with a causal LM package.\n");
-    printf("  classify <model-dir|config.json>  Run classification and print top-k scores.\n");
-    printf("  detect <model-dir|config.json>    Run detection and print/write raw tensors.\n");
-    printf("  ctc <model-dir|config.json>       Run CTC logits and greedy-decode text.\n");
-    printf("  seq2seq <model-dir|config.json>   Run an encoder-decoder text loop.\n");
-    printf("  chat <model-dir|config.json>      User-facing alias for multimodal seq2seq.\n");
-#if VOLVOXAI_ENABLE_TRAINING
-    printf("  train <model-dir|config.json>     Train selected model weights with cross-entropy.\n");
-#endif
-    printf("  version                           Print release info.\n\n");
-    printf("Common backend flags: --vulkan --opengl --metal --nnapi --debug\n");
-    printf("Run '%s <command> --help' for command-specific options.\n", argv0);
-}
-
-static void print_run_help(const char* argv0) {
-    printf("Usage: %s run <model-dir|config.json> [options]\n\n", argv0);
-    printf("Options:\n");
-    printf("  --weights <file>              Override model.safetensors path.\n");
-    printf("  --input <name=file>           Load exact typed raw data (.f32/.f16/.i32/.i8/.u8).\n");
-    printf("  --image <name=file>           Decode PNG/JPEG into a [1,H,W,C] or [H,W,C] input.\n");
-    printf("  --image-normalize <mode>      zero-one | minus-one-one | raw-255; required if package omits it.\n");
-    printf("  --output <name=file|file>     Write exact typed raw data; suffix must match dtype.\n");
-    printf("  --last-token <index>          Write one logits row from sequence outputs.\n");
-    printf("  --vulkan | --opengl | --metal | --nnapi\n");
-    printf("  --debug\n");
-}
-
-#if VOLVOXAI_ENABLE_TRAINING
-static void print_train_help(const char* argv0) {
-    printf("Usage: %s train <model-dir|config.json> [options]\n\n", argv0);
-    printf("Required:\n");
-    printf("  --targets <file.i32>          Raw int32 cross-entropy targets.\n");
-    printf("  --logits <tensor>             Logits tensor used by cross-entropy.\n");
-    printf("  --trainable <tensor>          F32 model weight to update. Repeatable.\n\n");
-    printf("Model inputs:\n");
-    printf("  --weights <file>              Override model.safetensors path.\n");
-    printf("  --input <name=file>           Load exact typed raw data (.f32/.f16/.i32/.i8/.u8).\n");
-    printf("  --image <name=file>           Decode PNG/JPEG into an image input.\n");
-    printf("  --image-normalize <mode>      zero-one | minus-one-one | raw-255; required if package omits it.\n");
-    printf("  --last-token <index>          Train one sequence position for one target.\n\n");
-    printf("Optimizer:\n");
-    printf("  --steps <n>                   Number of Adam/AdamW steps (default 1).\n");
-    printf("  --learning-rate <value>       Learning rate (default 0.001).\n");
-    printf("  --beta1 <value>               Adam beta1 (default 0.9).\n");
-    printf("  --beta2 <value>               Adam beta2 (default 0.999).\n");
-    printf("  --epsilon <value>             Adam epsilon (default 1e-8).\n");
-    printf("  --weight-decay <value>        0 selects Adam; positive selects AdamW.\n");
-    printf("  --max-grad-norm <value>       Global gradient clipping; 0 disables it.\n");
-    printf("  --ignore-index <id>           Target value ignored by the loss (default -100).\n");
-    printf("  --input-optimizer <file>      Resume Adam/AdamW state and its training step.\n\n");
-    printf("Outputs:\n");
-    printf("  --output-weights <file>       Save final model weights.\n");
-    printf("  --output-optimizer <file>     Save final Adam/AdamW state.\n");
-    printf("  --output <name=file|file>     Write exact typed raw data; suffix must match dtype.\n");
-    printf("  --vulkan | --opengl | --metal | --nnapi\n");
-    printf("  --debug\n");
-}
-#endif
-
-static void print_generate_help(const char* argv0) {
-    printf("Usage: %s generate <model-dir|config.json> --prompt <text> [options]\n\n", argv0);
-    printf("Options:\n");
-    printf("  --weights <file>              Override model.safetensors path.\n");
-    printf("  --vocab <file>                Native vocab.bin path (defaults to model dir).\n");
-    printf("  --merges <file>               Optional merges.txt path (defaults to model dir).\n");
-    printf("  --prompt <text>               Text prompt.\n");
-    printf("  --max-new <n>                 New tokens to generate (default 50).\n");
-    printf("  --pad-token <id>              Token used to pad unused context slots (default 50256).\n");
-    printf("  --eos-token <id>              Stop after this token id (default disabled).\n");
-    printf("  --vulkan | --opengl | --metal | --nnapi\n");
-    printf("  --debug\n");
-}
-
-static void print_classify_help(const char* argv0) {
-    printf("Usage: %s classify <model-dir|config.json> [options]\n\n", argv0);
-    printf("Options:\n");
-    printf("  --weights <file>              Override model.safetensors path.\n");
-    printf("  --input <name=file>           Load exact typed raw data (.f32/.f16/.i32/.i8/.u8).\n");
-    printf("  --image <name=file>           Decode PNG/JPEG into a [1,H,W,C] or [H,W,C] input.\n");
-    printf("  --image-normalize <mode>      zero-one | minus-one-one | raw-255; required if package omits it.\n");
-    printf("  --logits <tensor>             Tensor to rank (defaults to final output).\n");
-    printf("  --labels <file>               Optional one-label-per-line class names.\n");
-    printf("  --top-k <n>                   Number of classes to print (default 5).\n");
-    printf("  --output <name=file|file>     Write exact typed raw data; suffix must match dtype.\n");
-    printf("  --vulkan | --opengl | --metal | --nnapi\n");
-    printf("  --debug\n");
-}
-
-static void print_detect_help(const char* argv0) {
-    printf("Usage: %s detect <model-dir|config.json> [options]\n\n", argv0);
-    printf("Options:\n");
-    printf("  --weights <file>              Override model.safetensors path.\n");
-    printf("  --input <name=file>           Load exact typed raw data (.f32/.f16/.i32/.i8/.u8).\n");
-    printf("  --image <name=file>           Decode PNG/JPEG into a [1,H,W,C] or [H,W,C] input.\n");
-    printf("  --image-normalize <mode>      zero-one | minus-one-one | raw-255; required if package omits it.\n");
-    printf("  --boxes <tensor>              Box tensor, usually [...,4] (default boxes).\n");
-    printf("  --scores <tensor>             Score tensor, [N] or [N,C] (default scores).\n");
-    printf("  --classes <tensor>            Optional class-id tensor [N].\n");
-    printf("  --labels <file>               Class names (defaults to <model-dir>/labels.txt).\n");
-    printf("  --max-det <n>                 Number of detections to print (default 20).\n");
-    printf("  --output <name=file|file>     Write exact typed raw data; suffix must match dtype.\n");
-    printf("  --num_threads <n>             CPU worker threads (default: auto).\n");
-    printf("  --warmup_runs <n>             Discarded forwards before timing (default 0).\n");
-    printf("  --num_runs <n>                Timed forwards; reports first/avg/min/max (default 1).\n");
-    printf("  --vulkan | --opengl | --metal | --nnapi\n");
-    printf("  --debug\n");
-}
-
-static void print_ctc_help(const char* argv0) {
-    printf("Usage: %s ctc <model-dir|config.json> [options]\n\n", argv0);
-    printf("Options:\n");
-    printf("  --weights <file>              Override model.safetensors path.\n");
-    printf("  --input <name=file>           Load exact typed raw data (.f32/.f16/.i32/.i8/.u8).\n");
-    printf("  --image <name=file>           Decode PNG/JPEG into a [1,H,W,C] or [H,W,C] input.\n");
-    printf("  --image-normalize <mode>      zero-one | minus-one-one | raw-255; required if package omits it.\n");
-    printf("  --logits <tensor>             CTC logits tensor, shape [...,T,C].\n");
-    printf("  --labels <file>               Optional one-token-per-line labels.\n");
-    printf("  --blank <id>                  Blank token id (default 0).\n");
-    printf("  --output <name=file|file>     Write exact typed raw data; suffix must match dtype.\n");
-    printf("  --vulkan | --opengl | --metal | --nnapi\n");
-    printf("  --debug\n");
-}
-
-static void print_seq2seq_help(const char* argv0, int is_chat) {
-    printf("Usage: %s %s <model-dir|config.json> [options]\n\n", argv0, is_chat ? "chat" : "seq2seq");
-    printf("Options:\n");
-    printf("  --weights <file>              Override model.safetensors path.\n");
-    printf("  --input <name=file>           Load exact typed raw data (.f32/.f16/.i32/.i8/.u8).\n");
-    printf("  --image <name=file>           Decode PNG/JPEG into a [1,H,W,C] or [H,W,C] input.\n");
-    printf("  --image-normalize <mode>      zero-one | minus-one-one | raw-255; required if package omits it.\n");
-    printf("  --prompt <text>               Text prompt to tokenize into the prompt input.\n");
-    printf("  --text-file <file>            Append a UTF-8 text file to the prompt.\n");
-    printf("  --vocab <file>                Native vocab.bin path (defaults to model dir).\n");
-    printf("  --merges <file>               Optional merges.txt path (defaults to model dir).\n");
-    printf("  --prompt-input <name>         Prompt token input name (default prompt_tokens/q_tokens/tokens).\n");
-    printf("  --decoder-input <name>        Decoder token input name (default decoder_tokens/y_tokens/tokens).\n");
-    printf("  --logits <tensor>             Logits tensor name (defaults to final output).\n");
-    printf("  --max-new <n>                 New tokens to generate (default 192).\n");
-    printf("  --bos-token <id>              Decoder BOS token id (default 1).\n");
-    printf("  --eos-token <id>              Stop after this token id (default 2).\n");
-    printf("  --pad-token <id>              Token used to pad unused slots (default 0).\n");
-    printf("  --output <name=file|file>     Write exact typed raw data; suffix must match dtype.\n");
-    printf("  --vulkan | --opengl | --metal | --nnapi\n");
-    printf("  --debug\n");
-}
-
-static void engine_options_init(VolvoxAIEngineOptions* options) {
-    memset(options, 0, sizeof(*options));
-    options->backend = VOLVOXAI_BACKEND_CPU;
-}
-
-static const char* requested_backend_name(VolvoxAIEngineBackend backend) {
-    switch (backend) {
-        case VOLVOXAI_BACKEND_VULKAN: return "Vulkan";
-        case VOLVOXAI_BACKEND_OPENGL: return "OpenGL";
-        case VOLVOXAI_BACKEND_METAL: return "Metal";
-        case VOLVOXAI_BACKEND_NNAPI: return "NNAPI";
-        default: return "CPU";
-    }
-}
-
-static int select_backend(VolvoxAIEngineOptions* options,
-                          VolvoxAIEngineBackend backend) {
-    if (options->backend != VOLVOXAI_BACKEND_CPU && options->backend != backend) {
+static int select_backend(TaskOptions* options, const char* backend) {
+    if (options->backend && strcmp(options->backend, backend)) {
         fprintf(stderr, "Pass at most one accelerator backend flag.\n");
         return -1;
     }
     options->backend = backend;
-    return 1;
-}
-
-static int parse_backend_flag(const char* arg, VolvoxAIEngineOptions* options) {
-    if (!strcmp(arg, "--vulkan")) return select_backend(options, VOLVOXAI_BACKEND_VULKAN);
-    if (!strcmp(arg, "--nnapi")) return select_backend(options, VOLVOXAI_BACKEND_NNAPI);
-    if (!strcmp(arg, "--opengl")) return select_backend(options, VOLVOXAI_BACKEND_OPENGL);
-    if (!strcmp(arg, "--metal")) return select_backend(options, VOLVOXAI_BACKEND_METAL);
-    if (!strcmp(arg, "--debug")) { options->debug = 1; return 1; }
     return 0;
 }
 
-static int configure_engine(const VolvoxAIEngineOptions* options) {
-    printf("VolvoxAI Native Engine\n");
-    if (volvoxai_engine_configure(options) != 0) {
-        fprintf(stderr, "Cannot configure requested backend: %s\n",
-                requested_backend_name(options->backend));
+static void task_options_init(TaskOptions* options) {
+    memset(options, 0, sizeof(*options));
+    options->image_normalization = -1;
+    options->timed_runs = 1;
+}
+
+static int parse_common_option(int argc, char** argv, int* index,
+                               TaskOptions* options) {
+    const char* argument = argv[*index];
+    const char* backend = NULL;
+    if (!strcmp(argument, "--vulkan")) backend = "vulkan";
+    else if (!strcmp(argument, "--opengl")) backend = "opengl";
+    else if (!strcmp(argument, "--metal")) backend = "metal";
+    else if (!strcmp(argument, "--nnapi")) backend = "nnapi";
+    else if (!strcmp(argument, "--cuda")) backend = "cuda";
+    if (backend) return select_backend(options, backend) == 0 ? 1 : -1;
+    if (!strcmp(argument, "--debug")) {
+        options->debug = 1;
+        return 1;
+    }
+    if (!strcmp(argument, "--include_transfers")) {
+        options->include_transfers = 1;
+        return 1;
+    }
+    if (!strcmp(argument, "--threads")) {
+        if (*index + 1 >= argc || parse_int(argv[++(*index)], 1,
+                                            &options->cpu_threads) != 0) {
+            fprintf(stderr, "--threads must be a positive 32-bit integer.\n");
+            return -1;
+        }
+        return 1;
+    }
+    if (!strcmp(argument, "--warmup_runs")) {
+        if (*index + 1 >= argc || parse_int(argv[++(*index)], 0,
+                                            &options->warmup_runs) != 0) {
+            fprintf(stderr, "--warmup_runs must be a non-negative integer.\n");
+            return -1;
+        }
+        return 1;
+    }
+    if (!strcmp(argument, "--num_runs")) {
+        if (*index + 1 >= argc || parse_int(argv[++(*index)], 1,
+                                            &options->timed_runs) != 0) {
+            fprintf(stderr, "--num_runs must be a positive integer.\n");
+            return -1;
+        }
+        return 1;
+    }
+    if (!strcmp(argument, "--weights")) {
+        if (*index + 1 >= argc || options->weight_path_count == MAX_WEIGHT_PATHS) {
+            fprintf(stderr, "--weights expects a file and may be repeated at most %d times.\n",
+                    MAX_WEIGHT_PATHS);
+            return -1;
+        }
+        options->weight_paths[options->weight_path_count++] = argv[++(*index)];
+        return 1;
+    }
+    if (!strcmp(argument, "--input")) {
+        if (*index + 1 >= argc || options->input_count == MAX_BINDINGS ||
+            parse_binding(argv[++(*index)], &options->inputs[options->input_count], 1) != 0) {
+            fprintf(stderr, "--input expects name=file.\n");
+            return -1;
+        }
+        options->input_count++;
+        return 1;
+    }
+    if (!strcmp(argument, "--image")) {
+        if (*index + 1 >= argc || options->image_count == MAX_BINDINGS ||
+            parse_binding(argv[++(*index)], &options->images[options->image_count], 1) != 0) {
+            fprintf(stderr, "--image expects name=file.\n");
+            return -1;
+        }
+        options->image_count++;
+        return 1;
+    }
+    if (!strcmp(argument, "--output")) {
+        if (*index + 1 >= argc || options->output_count == MAX_BINDINGS ||
+            parse_binding(argv[++(*index)], &options->outputs[options->output_count], 0) != 0) {
+            fprintf(stderr, "--output expects name=file or file.\n");
+            return -1;
+        }
+        options->output_count++;
+        return 1;
+    }
+    if (!strcmp(argument, "--image-normalize")) {
+        if (*index + 1 >= argc ||
+            parse_normalization(argv[++(*index)], &options->image_normalization) != 0) {
+            fprintf(stderr,
+                    "--image-normalize expects zero-one, minus-one-one, or raw-255.\n");
+            return -1;
+        }
+        options->image_normalization_explicit = 1;
+        return 1;
+    }
+    return 0;
+}
+
+static const char* dtype_name(VxDataType dtype) {
+    switch (dtype) {
+        case VX_DTYPE_F32: return "F32";
+        case VX_DTYPE_I8: return "I8";
+        case VX_DTYPE_U8: return "U8";
+        case VX_DTYPE_I32: return "I32";
+        default: return "unknown";
+    }
+}
+
+static const char* dtype_suffix(VxDataType dtype) {
+    switch (dtype) {
+        case VX_DTYPE_F32: return ".f32";
+        case VX_DTYPE_I8: return ".i8";
+        case VX_DTYPE_U8: return ".u8";
+        case VX_DTYPE_I32: return ".i32";
+        default: return NULL;
+    }
+}
+
+static int has_suffix(const char* path, const char* suffix) {
+    size_t path_length;
+    size_t suffix_length;
+    if (!path || !suffix) return 0;
+    path_length = strlen(path);
+    suffix_length = strlen(suffix);
+    return path_length >= suffix_length &&
+           !strcmp(path + path_length - suffix_length, suffix);
+}
+
+static void print_failure(const char* operation, VxStatus status,
+                          const VxReport* report) {
+    fprintf(stderr, "%s failed: %s", operation, vx_status_string(status));
+    if (report && report->reason[0]) fprintf(stderr, " [%s]", report->reason);
+    if (report && report->message[0]) fprintf(stderr, ": %s", report->message);
+    fputc('\n', stderr);
+}
+
+static int read_file(const char* path, void** bytes, size_t* size) {
+    FILE* file;
+    long length;
+    void* data;
+    if (!path || !bytes || !size) return -1;
+    *bytes = NULL;
+    *size = 0;
+    file = fopen(path, "rb");
+    if (!file) return -1;
+    if (fseek(file, 0, SEEK_END) != 0 || (length = ftell(file)) < 0 ||
+        fseek(file, 0, SEEK_SET) != 0) {
+        fclose(file);
         return -1;
     }
-    printf("Backend: %s\n", volvoxai_engine_backend_name());
+    data = malloc(length ? (size_t)length : 1);
+    if (!data) {
+        fclose(file);
+        return -1;
+    }
+    if (length && fread(data, 1, (size_t)length, file) != (size_t)length) {
+        free(data);
+        fclose(file);
+        return -1;
+    }
+    if (fclose(file) != 0) {
+        free(data);
+        return -1;
+    }
+    *bytes = data;
+    *size = (size_t)length;
     return 0;
 }
 
-static int image_normalize_mode(const char* value) {
-    if (!strcmp(value, "zero-one")) return VOLVOX_IMAGE_ZERO_ONE;
-    if (!strcmp(value, "minus-one-one")) return VOLVOX_IMAGE_MINUS_ONE_ONE;
-    if (!strcmp(value, "raw-255")) return VOLVOX_IMAGE_RAW_255;
+static int find_input(TaskSession* session, const char* name, VxTensorInfo* found) {
+    size_t count = vx_execution_context_input_count(session->context);
+    for (size_t index = 0; index < count; index++) {
+        VxTensorInfo info = VX_TENSOR_INFO_INIT;
+        if (vx_execution_context_input_info(session->context, index, &info,
+                                            &session->report) == VX_STATUS_OK &&
+            info.name && !strcmp(info.name, name)) {
+            *found = info;
+            return 0;
+        }
+    }
+    fprintf(stderr, "Unknown input tensor: %s\n", name);
     return -1;
 }
 
-static int resolve_package_image_normalization(const char* config_path,
-                                               const char* input_name,
-                                               int* out) {
-    long size = 0;
-    char* bytes = read_file_bytes(config_path, &size);
-    if (!bytes) {
-        fprintf(stderr, "Cannot read config.json image metadata: %s\n", config_path);
+static int set_raw_input(TaskSession* session, const Binding* binding) {
+    VxTensorInfo info = VX_TENSOR_INFO_INIT;
+    const char* suffix;
+    void* bytes = NULL;
+    size_t size = 0;
+    VxStatus status;
+    if (find_input(session, binding->name, &info) != 0) return -1;
+    suffix = dtype_suffix(info.dtype);
+    if (!suffix || !has_suffix(binding->path, suffix)) {
+        fprintf(stderr, "Input %s has dtype %s and requires a %s file: %s\n",
+                binding->name, dtype_name(info.dtype), suffix ? suffix : "supported raw",
+                binding->path);
         return -1;
     }
-    cJSON* root = cJSON_Parse(bytes);
+    if (read_file(binding->path, &bytes, &size) != 0) {
+        fprintf(stderr, "Cannot read input file: %s\n", binding->path);
+        return -1;
+    }
+    if (size != info.byte_size) {
+        fprintf(stderr, "Input %s expects %zu raw bytes, got %zu from %s\n",
+                binding->name, info.byte_size, size, binding->path);
+        free(bytes);
+        return -1;
+    }
+    status = vx_execution_context_set_input(session->context, binding->name,
+                                            info.dtype, bytes, size,
+                                            &session->report);
     free(bytes);
-    if (!root) {
-        fprintf(stderr, "Cannot parse config.json image metadata: %s\n", config_path);
+    if (status != VX_STATUS_OK) {
+        print_failure("Setting input", status, &session->report);
         return -1;
     }
+    return 0;
+}
 
-    cJSON* inputs = cJSON_GetObjectItemCaseSensitive(root, "inputs");
-    cJSON* input = cJSON_IsObject(inputs)
+static int read_graph_root(const char* path, cJSON** root) {
+    void* bytes = NULL;
+    size_t size = 0;
+    char* text;
+    if (!root || read_file(path, &bytes, &size) != 0 || size == SIZE_MAX) {
+        free(bytes);
+        return -1;
+    }
+    text = (char*)realloc(bytes, size + 1);
+    if (!text) {
+        free(bytes);
+        return -1;
+    }
+    text[size] = 0;
+    *root = cJSON_Parse(text);
+    free(text);
+    return *root ? 0 : -1;
+}
+
+static int image_metadata(const char* graph_path, const char* input_name,
+                          int* normalization) {
+    cJSON* root = NULL;
+    cJSON* inputs;
+    cJSON* input;
+    cJSON* normalization_json;
+    const char* value = NULL;
+    int result = -1;
+    if (read_graph_root(graph_path, &root) != 0) return -1;
+    inputs = cJSON_GetObjectItemCaseSensitive(root, "inputs");
+    input = cJSON_IsObject(inputs)
         ? cJSON_GetObjectItemCaseSensitive(inputs, input_name) : NULL;
-    cJSON* normalization = cJSON_IsObject(input)
-        ? cJSON_GetObjectItemCaseSensitive(input, "image_normalization") : NULL;
-    if (!normalization) {
-        fprintf(stderr,
-                "Input %s does not declare image_normalization; add package metadata "
-                "or pass --image-normalize explicitly.\n",
-                input_name);
-        cJSON_Delete(root);
-        return -1;
+    if (!cJSON_IsObject(input)) goto cleanup;
+    normalization_json = cJSON_GetObjectItemCaseSensitive(input, "image_normalization");
+    if (cJSON_IsString(normalization_json) && normalization_json->valuestring)
+        value = normalization_json->valuestring;
+    if (!value) {
+        *normalization = -1;
+    } else if (parse_normalization(value, normalization) != 0) {
+        fprintf(stderr, "Input %s has unsupported image_normalization '%s'.\n",
+                input_name, value);
+        goto cleanup;
     }
-    if (!cJSON_IsString(normalization) || !normalization->valuestring) {
-        fprintf(stderr,
-                "Input %s has invalid image_normalization metadata; expected "
-                "zero-one, minus-one-one, or raw-255.\n",
-                input_name);
-        cJSON_Delete(root);
-        return -1;
-    }
-    int mode = image_normalize_mode(normalization->valuestring);
-    if (mode < 0) {
-        fprintf(stderr,
-                "Input %s has unsupported image_normalization '%s'; expected "
-                "zero-one, minus-one-one, or raw-255.\n",
-                input_name, normalization->valuestring);
-        cJSON_Delete(root);
-        return -1;
-    }
-    *out = mode;
+    result = 0;
+cleanup:
     cJSON_Delete(root);
-    return 0;
+    return result;
 }
 
-static const char* cpu_arch_name(void) {
-#if defined(__x86_64__) || defined(_M_X64)
-    return "x86_64";
-#elif defined(__i386__) || defined(_M_IX86)
-    return "x86";
-#elif defined(__aarch64__) || defined(_M_ARM64)
-    return "arm64";
-#elif defined(__arm__) || defined(_M_ARM)
-    return "arm";
-#elif defined(__riscv)
-    return "riscv";
-#else
-    return "unknown";
-#endif
+static int clamp_rounded(float value, int minimum, int maximum) {
+    long rounded = lroundf(value);
+    if (rounded < minimum) return minimum;
+    if (rounded > maximum) return maximum;
+    return (int)rounded;
 }
 
-static const char* cpu_feature_string(void) {
-#if defined(__AVX2__) && defined(__FMA__)
-    return "avx2,fma";
-#elif defined(__AVX2__)
-    return "avx2";
-#elif defined(__ARM_NEON) || defined(__ARM_NEON__)
-    return "neon";
-#else
-    return "scalar";
-#endif
-}
-
-static void print_release_info(void) {
-    printf("VolvoxAI Native Engine %s (commit %s, built %s)\n",
-           VOLVOXAI_VERSION, VOLVOXAI_GIT_COMMIT, VOLVOXAI_BUILD_DATE);
-}
-
-static void debug_fprint_shape(FILE* f, const int* shape, int ndim) {
-    fprintf(f, "[");
-    for (int i = 0; i < ndim; i++) fprintf(f, "%s%d", i ? "," : "", shape[i]);
-    fprintf(f, "]");
-}
-
-static void debug_print_runtime(const VolvoxAIEngineOptions* options) {
-    if (options->cpu_threads > 0) {
-        fprintf(stderr, "[debug] cpu_arch=%s cpu_features=%s threads=%d backend=%s\n",
-                cpu_arch_name(), cpu_feature_string(), options->cpu_threads,
-                volvoxai_engine_backend_name());
+static int set_image_input(TaskSession* session, const Binding* binding,
+                           const TaskOptions* options) {
+    VxTensorInfo info = VX_TENSOR_INFO_INIT;
+    VxAffineQuantization quantization = VX_AFFINE_QUANTIZATION_INIT;
+    int shape[VX_MAX_TENSOR_RANK] = {0};
+    size_t element_count;
+    float* decoded = NULL;
+    void* storage = NULL;
+    int normalization = -1;
+    char error[256] = {0};
+    VxStatus status;
+    if (find_input(session, binding->name, &info) != 0) return -1;
+    if (info.dtype != VX_DTYPE_F32 && info.dtype != VX_DTYPE_I8 &&
+        info.dtype != VX_DTYPE_U8) {
+        fprintf(stderr, "Image input %s requires F32, I8, or U8, got %s.\n",
+                binding->name, dtype_name(info.dtype));
+        return -1;
+    }
+    for (uint32_t axis = 0; axis < info.rank; axis++) {
+        if (info.shape[axis] <= 0 || info.shape[axis] > INT_MAX) {
+            fprintf(stderr, "Image input %s has an unsupported shape.\n", binding->name);
+            return -1;
+        }
+        shape[axis] = (int)info.shape[axis];
+    }
+    if (image_metadata(session->graph_path, binding->name, &normalization) != 0)
+        return -1;
+    if (options->image_normalization_explicit)
+        normalization = options->image_normalization;
+    if (normalization < 0) {
+        fprintf(stderr,
+                "Input %s does not declare image_normalization; add package metadata or pass --image-normalize explicitly.\n",
+                binding->name);
+        return -1;
+    }
+    element_count = info.dtype == VX_DTYPE_F32
+        ? info.byte_size / sizeof(float) : info.byte_size;
+    decoded = (float*)malloc(element_count * sizeof(float));
+    storage = malloc(info.byte_size ? info.byte_size : 1);
+    if (!decoded || !storage) {
+        fprintf(stderr, "Cannot allocate image input %s.\n", binding->name);
+        free(decoded);
+        free(storage);
+        return -1;
+    }
+    if (volvox_load_image_to_tensor(binding->path, decoded, shape, (int)info.rank,
+                                    normalization, error, sizeof(error)) != 0) {
+        fprintf(stderr, "Cannot decode image %s: %s\n", binding->path, error);
+        free(decoded);
+        free(storage);
+        return -1;
+    }
+    if (info.dtype == VX_DTYPE_F32) {
+        memcpy(storage, decoded, info.byte_size);
+    } else if (normalization == VOLVOX_IMAGE_RAW_255) {
+        for (size_t index = 0; index < element_count; index++) {
+            if (info.dtype == VX_DTYPE_U8)
+                ((uint8_t*)storage)[index] = (uint8_t)clamp_rounded(decoded[index], 0, 255);
+            else
+                ((int8_t*)storage)[index] = (int8_t)clamp_rounded(decoded[index] - 128.0f,
+                                                                 -128, 127);
+        }
     } else {
-        fprintf(stderr, "[debug] cpu_arch=%s cpu_features=%s threads=auto backend=%s\n",
-                cpu_arch_name(), cpu_feature_string(), volvoxai_engine_backend_name());
-    }
-}
-
-static void debug_print_model_summary(const char* config_path) {
-    long sz = 0;
-    char* cfg = read_file_bytes(config_path, &sz);
-    if (!cfg) return;
-    cJSON* root = cJSON_Parse(cfg);
-    free(cfg);
-    if (!root) return;
-
-    cJSON* inputs = cJSON_GetObjectItem(root, "inputs");
-    if (inputs) {
-        for (cJSON* it = inputs->child; it; it = it->next) {
-            cJSON* shape = cJSON_GetObjectItem(it, "shape");
-            cJSON* dtype = cJSON_GetObjectItem(it, "dtype");
-            int sh[8] = {0};
-            int ndim = shape ? cJSON_GetArraySize(shape) : 0;
-            if (ndim > 8) ndim = 8;
-            for (int i = 0; i < ndim; i++) sh[i] = cJSON_GetArrayItem(shape, i)->valueint;
-            fprintf(stderr, "[debug] model_input name=%s shape=", it->string ? it->string : "<unnamed>");
-            debug_fprint_shape(stderr, sh, ndim);
-            fprintf(stderr, " dtype=%s\n", cJSON_IsString(dtype) ? dtype->valuestring : "float32");
-        }
-    }
-
-    cJSON* outputs = cJSON_GetObjectItem(root, "outputs");
-    if (outputs) {
-        for (cJSON* it = outputs->child; it; it = it->next) {
-            const char* tensor_name = cJSON_IsString(it) ? it->valuestring : NULL;
-            long n = 0;
-            int sh[8] = {0};
-            int ndim = 0;
-            fprintf(stderr, "[debug] model_output");
-            if (it->string) fprintf(stderr, " source=%s", it->string);
-            if (tensor_name) fprintf(stderr, " name=%s", tensor_name);
-            if (tensor_name && volvoxai_engine_tensor_info(tensor_name, &n, sh, &ndim) == 0) {
-                fprintf(stderr, " shape=");
-                debug_fprint_shape(stderr, sh, ndim);
-                fprintf(stderr, " numel=%ld", n);
-            }
-            fprintf(stderr, "\n");
-        }
-    }
-    cJSON_Delete(root);
-}
-
-static void graph_options_init(GraphOptions* opt) {
-    memset(opt, 0, sizeof(*opt));
-    engine_options_init(&opt->engine);
-    opt->image_norm = -1;
-    opt->execution_row = -1;
-}
-
-static int parse_graph_option(int argc, char** argv, int* i, GraphOptions* opt) {
-    int backend_flag = parse_backend_flag(argv[*i], &opt->engine);
-    if (backend_flag != 0) return backend_flag;
-    if (!strcmp(argv[*i], "--weights") && *i + 1 < argc) {
-        opt->weights = argv[++(*i)];
-        return 1;
-    }
-    if (!strcmp(argv[*i], "--input") && *i + 1 < argc) {
-        if (opt->n_inputs >= MAX_BINDINGS || parse_binding(argv[++(*i)], &opt->inputs[opt->n_inputs++], 1) != 0) {
-            fprintf(stderr, "--input expects name=file\n");
+        status = vx_execution_context_input_affine_quantization(
+            session->context, binding->name, &quantization, &session->report);
+        if (status != VX_STATUS_OK) {
+            print_failure("Reading image input quantization", status,
+                          &session->report);
+            free(decoded);
+            free(storage);
             return -1;
         }
-        return 1;
-    }
-    if (!strcmp(argv[*i], "--image") && *i + 1 < argc) {
-        if (opt->n_images >= MAX_BINDINGS || parse_binding(argv[++(*i)], &opt->images[opt->n_images++], 1) != 0) {
-            fprintf(stderr, "--image expects name=file\n");
+        if (!quantization.defined) {
+            fprintf(stderr,
+                    "Normalized byte image input %s requires per-tensor quantization metadata.\n",
+                    binding->name);
+            free(decoded);
+            free(storage);
             return -1;
         }
-        return 1;
-    }
-    if (!strcmp(argv[*i], "--image-normalize") && *i + 1 < argc) {
-        opt->image_norm = image_normalize_mode(argv[++(*i)]);
-        if (opt->image_norm < 0) {
-            fprintf(stderr, "Invalid --image-normalize value.\n");
-            return -1;
+        for (size_t index = 0; index < element_count; index++) {
+            float quantized = decoded[index] / quantization.scale +
+                              (float)quantization.zero_point;
+            if (info.dtype == VX_DTYPE_U8)
+                ((uint8_t*)storage)[index] = (uint8_t)clamp_rounded(quantized, 0, 255);
+            else
+                ((int8_t*)storage)[index] = (int8_t)clamp_rounded(quantized, -128, 127);
         }
-        opt->image_norm_explicit = 1;
-        return 1;
     }
-    if (!strcmp(argv[*i], "--output") && *i + 1 < argc) {
-        if (opt->n_outputs >= MAX_BINDINGS || parse_binding(argv[++(*i)], &opt->outputs[opt->n_outputs++], 0) != 0) {
-            fprintf(stderr, "--output expects name=file or file\n");
-            return -1;
-        }
-        return 1;
-    }
-    if (!strcmp(argv[*i], "--last-token") && *i + 1 < argc) {
-        opt->execution_row = atoi(argv[++(*i)]);
-        return 1;
+    status = vx_execution_context_set_input(session->context, binding->name,
+                                            info.dtype, storage, info.byte_size,
+                                            &session->report);
+    free(decoded);
+    free(storage);
+    if (status != VX_STATUS_OK) {
+        print_failure("Setting image input", status, &session->report);
+        return -1;
     }
     return 0;
 }
 
-static int init_graph_with_options(const char* model, const GraphOptions* opt) {
+static void session_close(TaskSession* session) {
+    if (!session) return;
+    vx_result_release(session->result);
+    session->result = NULL;
+    if (session->context) (void)vx_execution_context_close(session->context, NULL);
+    vx_execution_context_release(session->context);
+    vx_compiled_model_release(session->compiled);
+    vx_model_release(session->model);
+    if (session->runtime) (void)vx_runtime_close(session->runtime, NULL);
+    vx_runtime_release(session->runtime);
+    memset(session, 0, sizeof(*session));
+}
+
+static int session_open(TaskSession* session, const char* model_path,
+                        TaskOptions* options, int decode) {
     ModelPaths paths;
-    if (resolve_model_paths(model, opt->weights, NULL, NULL, &paths) != 0) return -1;
-
-    if (configure_engine(&opt->engine) != 0) return -1;
-    printf("Loading graph: %s\n", paths.config);
-    double t0 = now_ms();
-    if (volvoxai_engine_init(paths.config, paths.weights[0] ? paths.weights : NULL) != 0) {
-        fprintf(stderr, "Native init failed.\n");
-        volvoxai_engine_shutdown();
+    VxRuntimeOptions runtime_options = VX_RUNTIME_OPTIONS_INIT;
+    VxModelSource source = VX_MODEL_SOURCE_INIT;
+    VxBackendPolicy policy = VX_BACKEND_POLICY_INIT;
+    VxContextOptions context_options = VX_CONTEXT_OPTIONS_INIT;
+    const char* selected_backends[1];
+    VxStatus status;
+    memset(session, 0, sizeof(*session));
+    session->report = (VxReport)VX_REPORT_INIT;
+    if (resolve_model_paths(model_path, &paths) != 0) return -1;
+    if (copy_string(session->graph_path, sizeof(session->graph_path), paths.graph) != 0)
+        return -1;
+    if (!options->weight_path_count && paths.default_weights[0])
+        options->weight_paths[options->weight_path_count++] = paths.default_weights;
+    runtime_options.debug = options->debug;
+    runtime_options.cpu_threads = options->cpu_threads;
+    source.graph_path = paths.graph;
+    source.weight_paths = options->weight_paths;
+    source.weight_path_count = options->weight_path_count;
+    if (options->backend) {
+        selected_backends[0] = options->backend;
+        policy.mode = VX_BACKEND_REQUIRE;
+        policy.operator_fallback = VX_OPERATOR_FALLBACK_FORBID;
+        policy.backends = selected_backends;
+        policy.backend_count = 1;
+    }
+    if (decode) context_options.decode_row_mode = VX_DECODE_ROW_AUTO;
+    status = vx_runtime_create(&runtime_options, &session->runtime, &session->report);
+    if (status == VX_STATUS_OK)
+        status = vx_runtime_load_model(session->runtime, &source, &session->model,
+                                       &session->report);
+    if (status == VX_STATUS_OK)
+        status = vx_model_compile(session->model, &policy, &session->compiled,
+                                  &session->report);
+    if (status == VX_STATUS_OK)
+        status = vx_compiled_model_create_context(session->compiled, &context_options,
+                                                  &session->context, &session->report);
+    if (status != VX_STATUS_OK) {
+        print_failure("Native init", status, &session->report);
+        session_close(session);
         return -1;
     }
-    if (volvoxai_engine_set_execution_row(opt->execution_row) != 0) {
-        fprintf(stderr, "Invalid --last-token row: %d\n", opt->execution_row);
-        volvoxai_engine_shutdown();
-        return -1;
-    }
-    if (opt->engine.debug) {
-        fprintf(stderr, "[debug] volvoxai_engine_init %.3f ms\n", now_ms() - t0);
-        debug_print_runtime(&opt->engine);
-        debug_print_model_summary(paths.config);
-    }
+    printf("Backend: %s\n", session->report.backend[0]
+           ? session->report.backend : "unknown");
+    for (size_t index = 0; index < options->input_count; index++)
+        if (set_raw_input(session, &options->inputs[index]) != 0) {
+            session_close(session);
+            return -1;
+        }
+    for (size_t index = 0; index < options->image_count; index++)
+        if (set_image_input(session, &options->images[index], options) != 0) {
+            session_close(session);
+            return -1;
+        }
+    return 0;
+}
 
-    for (int i = 0; i < opt->n_inputs; i++) {
-        if (load_tensor_binding(&opt->inputs[i]) != 0) {
-            volvoxai_engine_shutdown();
-            return -1;
-        }
-    }
-    for (int i = 0; i < opt->n_images; i++) {
-        int normalization = opt->image_norm;
-        if (!opt->image_norm_explicit &&
-            resolve_package_image_normalization(paths.config, opt->images[i].name,
-                                                &normalization) != 0) {
-            volvoxai_engine_shutdown();
-            return -1;
-        }
-        if (load_image_binding(&opt->images[i], normalization) != 0) {
-            volvoxai_engine_shutdown();
-            return -1;
-        }
+static int execute_once(TaskSession* session) {
+    VxStatus status;
+    vx_result_release(session->result);
+    session->result = NULL;
+    status = vx_execution_context_execute(session->context, &session->result,
+                                          &session->report);
+    if (status != VX_STATUS_OK) {
+        print_failure("Native inference", status, &session->report);
+        return -1;
     }
     return 0;
 }
 
-static int run_forward_once(const char* label, int debug) {
-    int warm = g_warmup_runs < 0 ? 0 : g_warmup_runs;
-    int runs = g_num_runs < 1 ? 1 : g_num_runs;
-    for (int r = 0; r < warm; r++) {
-        if (volvoxai_engine_forward() != 0) { fprintf(stderr, "Native inference failed.\n"); return -1; }
+static int execute_timed(TaskSession* session, const TaskOptions* options,
+                         const char* label) {
+    double first = 0.0;
+    double minimum = 0.0;
+    double maximum = 0.0;
+    double total = 0.0;
+    for (int index = 0; index < options->warmup_runs; index++)
+        if (execute_once(session) != 0) return -1;
+    for (int index = 0; index < options->timed_runs; index++) {
+        double start = now_ms();
+        double elapsed;
+        if (execute_once(session) != 0) return -1;
+        elapsed = now_ms() - start;
+        if (!index) first = minimum = maximum = elapsed;
+        if (elapsed < minimum) minimum = elapsed;
+        if (elapsed > maximum) maximum = elapsed;
+        total += elapsed;
     }
-    double first = 0, sum = 0, best = 1e30, worst = 0;
-    for (int r = 0; r < runs; r++) {
-        double t0 = now_ms();
-        if (volvoxai_engine_forward() != 0) { fprintf(stderr, "Native inference failed.\n"); return -1; }
-        double dt = now_ms() - t0;
-        if (r == 0) first = dt;
-        sum += dt;
-        if (dt < best) best = dt;
-        if (dt > worst) worst = dt;
-    }
-    if (warm > 0 || runs > 1) {
-        // TFLite-style profile line (printed regardless of --debug, like benchmark_model)
-        fprintf(stderr, "[bench] %s: first=%.3f avg=%.3f min=%.3f max=%.3f ms  (warmup=%d, runs=%d)\n",
-                label, first, sum / runs, best, worst, warm, runs);
-    } else if (debug) {
-        fprintf(stderr, "[debug] %s forward %.3f ms\n", label, best);
+    if (options->warmup_runs || options->timed_runs != 1 || options->include_transfers) {
+        fprintf(stderr,
+                "[bench] %s: first=%.3f avg=%.3f min=%.3f max=%.3f ms "
+                "(warmup=%d, runs=%d, transfers=%s)\n",
+                label, first, total / options->timed_runs, minimum, maximum,
+                options->warmup_runs, options->timed_runs,
+                options->include_transfers ? "on" : "off");
     }
     return 0;
 }
 
-static const float* read_output_tensor(const char* name, long* count, int* shape, int* ndim) {
-    static float* snapshot;
-    static size_t snapshot_capacity;
-    const float* src = NULL;
-    long n = 0;
-    int local_shape[8] = {0};
-    int local_ndim = 0;
-
-    const char* resolved_name = name && name[0]
-        ? name : volvoxai_engine_graph_output_name(0);
-    if (!resolved_name || !resolved_name[0] ||
-        volvoxai_engine_tensor_info(resolved_name, &n, local_shape, &local_ndim) != 0 ||
-        n <= 0 || (size_t)n > SIZE_MAX / sizeof(float)) {
-        fprintf(stderr, "Unknown output tensor: %s\n",
-                name && name[0] ? name : "<primary>");
-        return NULL;
-    }
-
-    int row = volvoxai_engine_execution_row();
-    if (row >= 0 && local_ndim >= 2) {
-        int row_count = 0;
-        src = volvoxai_engine_tensor_row_f32(resolved_name, row, &row_count);
-        if (!src || row_count <= 0) {
-            fprintf(stderr, "Cannot read row %d from output tensor: %s\n",
-                    row, resolved_name);
-            return NULL;
+static int find_output(TaskSession* session, const char* name, VxTensorInfo* found) {
+    size_t count = session->result ? vx_result_output_count(session->result) : 0;
+    for (size_t index = 0; index < count; index++) {
+        VxTensorInfo info = VX_TENSOR_INFO_INIT;
+        if (vx_result_output_info(session->result, index, &info, &session->report) ==
+                VX_STATUS_OK &&
+            ((!name && index == 0) || (name && info.name && !strcmp(info.name, name)))) {
+            *found = info;
+            return 0;
         }
-        n = row_count;
-        local_shape[0] = row_count;
-        local_ndim = 1;
-    } else {
-        if (snapshot_capacity < (size_t)n) {
-            float* next = (float*)realloc(snapshot, (size_t)n * sizeof(float));
-            if (!next) return NULL;
-            snapshot = next;
-            snapshot_capacity = (size_t)n;
-        }
-        if (volvoxai_engine_copy_tensor_f32(resolved_name, snapshot, n) != 0) return NULL;
-        src = snapshot;
     }
-    if (!src || n <= 0) return NULL;
-    if (count) *count = n;
-    if (shape) for (int i = 0; i < local_ndim; i++) shape[i] = local_shape[i];
-    if (ndim) *ndim = local_ndim;
-    return src;
+    fprintf(stderr, "Unknown output tensor: %s\n", name ? name : "<first>");
+    return -1;
 }
 
-static float* copy_output_tensor(const char* name, long* count, int* shape, int* ndim) {
-    const float* source = read_output_tensor(name, count, shape, ndim);
-    if (!source || !count || *count <= 0 || (size_t)*count > SIZE_MAX / sizeof(float)) return NULL;
-    float* copy = (float*)malloc((size_t)*count * sizeof(float));
-    if (!copy) {
-        fprintf(stderr, "Cannot allocate output snapshot: %s\n",
-                name && name[0] ? name : "<primary>");
-        return NULL;
+static int copy_output(TaskSession* session, const char* name,
+                       VxTensorInfo* info, void** bytes) {
+    VxStatus status;
+    if (!bytes || find_output(session, name, info) != 0) return -1;
+    *bytes = malloc(info->byte_size ? info->byte_size : 1);
+    if (!*bytes) return -1;
+    status = vx_result_read(session->result, info->name, *bytes, info->byte_size,
+                            NULL, &session->report);
+    if (status != VX_STATUS_OK) {
+        print_failure("Reading output", status, &session->report);
+        free(*bytes);
+        *bytes = NULL;
+        return -1;
     }
-    memcpy(copy, source, (size_t)*count * sizeof(float));
-    return copy;
+    return 0;
 }
 
-static char* dup_slice(const char* s, int n) {
-    char* out = (char*)malloc((size_t)n + 1);
-    if (!out) return NULL;
-    if (n > 0) memcpy(out, s, (size_t)n);
-    out[n] = 0;
-    return out;
+static int write_file(const char* path, const void* bytes, size_t size) {
+    FILE* file = fopen(path, "wb");
+    int failed = 0;
+    if (!file) {
+        fprintf(stderr, "Cannot write output file: %s\n", path);
+        return -1;
+    }
+    if (size && fwrite(bytes, 1, size, file) != size) failed = 1;
+    if (fclose(file) != 0) failed = 1;
+    if (failed) {
+        fprintf(stderr, "Cannot write output file: %s\n", path);
+        return -1;
+    }
+    return 0;
+}
+
+static int write_selected_outputs(TaskSession* session, const TaskOptions* options) {
+    for (size_t index = 0; index < options->output_count; index++) {
+        const Binding* binding = &options->outputs[index];
+        VxTensorInfo info = VX_TENSOR_INFO_INIT;
+        void* bytes = NULL;
+        const char* suffix;
+        if (copy_output(session, binding->name[0] ? binding->name : NULL,
+                        &info, &bytes) != 0) return -1;
+        suffix = dtype_suffix(info.dtype);
+        if (!suffix || !has_suffix(binding->path, suffix)) {
+            fprintf(stderr, "Output %s has dtype %s and requires a %s file: %s\n",
+                    info.name, dtype_name(info.dtype), suffix ? suffix : "supported raw",
+                    binding->path);
+            free(bytes);
+            return -1;
+        }
+        if (write_file(binding->path, bytes, info.byte_size) != 0) {
+            free(bytes);
+            return -1;
+        }
+        free(bytes);
+    }
+    return 0;
 }
 
 static int load_labels(const char* path, LabelList* labels) {
+    void* bytes = NULL;
+    size_t size = 0;
+    char* cursor;
+    size_t capacity = 0;
     memset(labels, 0, sizeof(*labels));
     if (!path) return 0;
-    long sz = 0;
-    char* data = read_file_bytes(path, &sz);
-    if (!data) {
+    if (read_file(path, &bytes, &size) != 0 || size == SIZE_MAX) {
         fprintf(stderr, "Cannot read labels file: %s\n", path);
+        free(bytes);
         return -1;
     }
-    int cap = 16;
-    labels->items = (char**)calloc((size_t)cap, sizeof(char*));
-    if (!labels->items) { free(data); return -1; }
-    long start = 0;
-    for (long i = 0; i <= sz; i++) {
-        if (i == sz || data[i] == '\n') {
-            if (i == sz && start == sz) break;
-            int len = (int)(i - start);
-            if (len > 0 && data[start + len - 1] == '\r') len--;
-            if (labels->count >= cap) {
-                cap *= 2;
-                char** next = (char**)realloc(labels->items, (size_t)cap * sizeof(char*));
-                if (!next) { free(data); return -1; }
-                labels->items = next;
-            }
-            labels->items[labels->count++] = dup_slice(data + start, len);
-            start = i + 1;
-        }
+    labels->storage = (char*)realloc(bytes, size + 1);
+    if (!labels->storage) {
+        free(bytes);
+        return -1;
     }
-    free(data);
+    labels->storage[size] = 0;
+    cursor = labels->storage;
+    while (*cursor) {
+        char* line = cursor;
+        char* end = strchr(cursor, '\n');
+        if (end) {
+            *end = 0;
+            cursor = end + 1;
+        } else {
+            cursor += strlen(cursor);
+        }
+        end = line + strlen(line);
+        while (end > line && (end[-1] == '\r' || end[-1] == ' ' || end[-1] == '\t'))
+            *--end = 0;
+        if (!line[0]) continue;
+        if (labels->count == capacity) {
+            size_t next = capacity ? capacity * 2 : 16;
+            char** grown = (char**)realloc(labels->items, next * sizeof(char*));
+            if (!grown) return -1;
+            labels->items = grown;
+            capacity = next;
+        }
+        labels->items[labels->count++] = line;
+    }
     return 0;
 }
 
 static void free_labels(LabelList* labels) {
-    for (int i = 0; i < labels->count; i++) free(labels->items[i]);
+    if (!labels) return;
     free(labels->items);
-    labels->items = NULL;
-    labels->count = 0;
+    free(labels->storage);
+    memset(labels, 0, sizeof(*labels));
 }
 
-static const char* label_at(const LabelList* labels, int idx) {
-    if (!labels || idx < 0 || idx >= labels->count || !labels->items[idx]) return "";
-    return labels->items[idx];
+static const char* label_at(const LabelList* labels, int class_id) {
+    return labels && class_id >= 0 && (size_t)class_id < labels->count
+        ? labels->items[class_id] : NULL;
 }
 
-static int argmax_f32(const float* values, int count, float* out_value) {
-    int best = 0;
-    float best_v = values[0];
-    for (int i = 1; i < count; i++) {
-        if (values[i] > best_v) { best_v = values[i]; best = i; }
-    }
-    if (out_value) *out_value = best_v;
-    return best;
+static int compare_ranked_value(const void* left, const void* right) {
+    const RankedValue* a = (const RankedValue*)left;
+    const RankedValue* b = (const RankedValue*)right;
+    if (a->score > b->score) return -1;
+    if (a->score < b->score) return 1;
+    return a->index < b->index ? -1 : a->index > b->index;
 }
 
-static void print_topk(const float* values, int count, int top_k, const LabelList* labels) {
-    if (top_k < 1) top_k = 1;
-    if (top_k > count) top_k = count;
-    if (top_k > 64) top_k = 64;
-    int selected[64];
-    for (int r = 0; r < top_k; r++) selected[r] = -1;
-    for (int r = 0; r < top_k; r++) {
-        int best = -1;
-        float best_v = -1e30f;
-        for (int i = 0; i < count; i++) {
-            int used = 0;
-            for (int j = 0; j < r; j++) if (selected[j] == i) { used = 1; break; }
-            if (!used && values[i] > best_v) { best_v = values[i]; best = i; }
-        }
-        selected[r] = best;
-        const char* label = label_at(labels, best);
-        if (label[0]) printf("%d\t%d\t%.6g\t%s\n", r + 1, best, best_v, label);
-        else printf("%d\t%d\t%.6g\n", r + 1, best, best_v);
-    }
+static void print_root_help(const char* argv0) {
+    printf("VolvoxAI Native Task Example\n\n");
+    printf("Usage: %s <command> [options]\n\n", argv0);
+    printf("Commands:\n");
+    printf("  run <model>       Execute typed raw/image inputs and write raw outputs.\n");
+    printf("  classify <model>  Rank a declared F32 logits output.\n");
+    printf("  detect <model>    Rank declared F32 boxes and scores outputs.\n");
+    printf("  decode <model>    Run public decode seed/step operations.\n");
+    printf("  version           Print release information.\n\n");
+    printf("All commands use only volvoxai.h opaque handles.\n");
 }
 
-static void print_shape(const int* shape, int ndim) {
-    printf("[");
-    for (int i = 0; i < ndim; i++) printf("%s%d", i ? "," : "", shape[i]);
-    printf("]");
+static void print_common_help(void) {
+    printf("  --weights <file>             Add a safetensors shard (repeatable).\n");
+    printf("  --input <name=file>          Load exact typed raw input data.\n");
+    printf("  --image <name=file>          Decode a PNG/JPEG into an image input.\n");
+    printf("  --image-normalize <mode>     zero-one, minus-one-one, or raw-255.\n");
+    printf("  --output <name=file|file>    Write exact typed raw output data.\n");
+    printf("  --vulkan | --opengl | --metal | --nnapi | --cuda\n");
+    printf("  --debug\n");
 }
 
-static void print_tensor_summary(const char* name, const float* data, long count,
-                                 const int* shape, int ndim, int max_values) {
-    printf("%s shape=", name && name[0] ? name : "output");
-    print_shape(shape, ndim);
-    printf(" values=");
-    long n = count < max_values ? count : max_values;
-    for (long i = 0; i < n; i++) printf("%s%.6g", i ? "," : "", data[i]);
-    if (count > n) printf(",...");
-    printf("\n");
+static void print_run_help(const char* argv0) {
+    printf("Usage: %s run <model-dir|graph.json> [options]\n\n", argv0);
+    print_common_help();
 }
 
-static const char* find_graph_input(const char* explicit_name, const char** defaults,
-                                    int n_defaults) {
-    if (explicit_name && explicit_name[0]) {
-        return volvoxai_engine_is_graph_input(explicit_name) == 1 ? explicit_name : NULL;
-    }
-    for (int i = 0; i < n_defaults; i++) {
-        if (volvoxai_engine_is_graph_input(defaults[i]) == 1) return defaults[i];
-    }
-    return NULL;
+static void print_classify_help(const char* argv0) {
+    printf("Usage: %s classify <model-dir|graph.json> [options]\n\n", argv0);
+    printf("  --logits <name>              Declared F32 logits output (default logits).\n");
+    printf("  --labels <file>              Optional class labels (discovers labels.txt).\n");
+    printf("  --top-k <n>                  Number of rows to print (default 5).\n");
+    print_common_help();
 }
 
-static int token_input_info(const char* name, long* numel, int* dtype) {
-    int shape[8] = {0};
-    int ndim = 0;
-    size_t element_size = 0;
-    if (!name || volvoxai_engine_tensor_info_ex(name, numel, shape, &ndim, dtype,
-            &element_size) != 0 || volvoxai_engine_is_graph_input(name) != 1 ||
-        *numel <= 0 || (size_t)*numel > SIZE_MAX / sizeof(int32_t)) {
-        return -1;
-    }
-    if ((*dtype == VOLVOXAI_DTYPE_I32 && element_size == sizeof(int32_t)) ||
-        (*dtype == VOLVOXAI_DTYPE_F32 && element_size == sizeof(float))) {
-        return 0;
-    }
-    fprintf(stderr, "Token input %s must use I32 or F32 storage, got %s.\n",
-            name, dtype_name(*dtype));
-    return -1;
+static void print_detect_help(const char* argv0) {
+    printf("Usage: %s detect <model-dir|graph.json> [options]\n\n", argv0);
+    printf("  --boxes <name>               Declared F32 boxes output (default boxes).\n");
+    printf("  --scores <name>              Declared F32 scores output (default scores).\n");
+    printf("  --labels <file>              Optional class labels (discovers labels.txt).\n");
+    printf("  --max-det <n>                Maximum detections to print (default 20).\n");
+    printf("  --warmup_runs <n>            Discarded executions before timing.\n");
+    printf("  --num_runs <n>               Timed executions (default 1).\n");
+    printf("  --include_transfers          Attest stable-result readback in timing scope.\n");
+    print_common_help();
 }
 
-static int set_token_input(const char* name, int dtype, const int32_t* values, long numel) {
-    if (!name || !values || numel <= 0 || (size_t)numel > SIZE_MAX / sizeof(int32_t)) {
-        return -1;
-    }
-    if (dtype == VOLVOXAI_DTYPE_I32) {
-        return volvoxai_engine_set_input_raw(
-            name, dtype, values, (size_t)numel * sizeof(int32_t));
-    }
-    if (dtype == VOLVOXAI_DTYPE_F32) {
-        float* converted = (float*)malloc((size_t)numel * sizeof(float));
-        if (!converted) return -1;
-        for (long i = 0; i < numel; i++) converted[i] = (float)values[i];
-        int rc = volvoxai_engine_set_input_raw(
-            name, dtype, converted, (size_t)numel * sizeof(float));
-        free(converted);
-        return rc;
-    }
-    return -1;
+static void print_decode_help(const char* argv0) {
+    printf("Usage: %s decode <model-dir|graph.json> [options]\n\n", argv0);
+    printf("  --steps <n>                  Decode steps after seed (default 1).\n");
+    printf("  --start-position <n>         Position of the first step (default 0).\n");
+    print_common_help();
 }
-
-#if VOLVOXAI_ENABLE_TRAINING
-typedef struct {
-    GraphOptions graph;
-    const char* targets_path;
-    const char* logits_name;
-    const char* trainable_names[MAX_BINDINGS];
-    int trainable_count;
-    long steps;
-    int ignore_index;
-    float learning_rate;
-    float beta1;
-    float beta2;
-    float epsilon;
-    float weight_decay;
-    float max_grad_norm;
-    const char* input_optimizer_path;
-    const char* output_weights_path;
-    const char* output_optimizer_path;
-} TrainOptions;
-
-static int parse_train_long(const char* text, long* out) {
-    if (!text || !text[0] || !out) return -1;
-    errno = 0;
-    char* end = NULL;
-    long value = strtol(text, &end, 10);
-    if (errno == ERANGE || !end || *end != '\0') return -1;
-    *out = value;
-    return 0;
-}
-
-static int parse_train_float(const char* text, float* out) {
-    if (!text || !text[0] || !out) return -1;
-    errno = 0;
-    char* end = NULL;
-    float value = strtof(text, &end);
-    if (errno == ERANGE || !end || *end != '\0' || !isfinite(value)) return -1;
-    *out = value;
-    return 0;
-}
-
-static int trainable_name_is_duplicate(const TrainOptions* opt, const char* name) {
-    for (int i = 0; i < opt->trainable_count; i++) {
-        if (!strcmp(opt->trainable_names[i], name)) return 1;
-    }
-    return 0;
-}
-
-static const char* training_backend_name(int backend) {
-    switch (backend) {
-        case 1: return "Vulkan";
-        case 2: return "OpenGL";
-        case 3: return "Metal";
-        default: return "CPU";
-    }
-}
-
-static int validate_training_tensors(const TrainOptions* opt, const int32_t* targets,
-                                     int target_count) {
-    long logits_numel = 0;
-    int logits_shape[8] = {0};
-    int logits_ndim = 0;
-    int logits_dtype = -1;
-    size_t logits_element_size = 0;
-    if (volvoxai_engine_tensor_info_ex(opt->logits_name, &logits_numel, logits_shape,
-            &logits_ndim, &logits_dtype, &logits_element_size) != 0 ||
-        logits_dtype != 0 || logits_element_size != sizeof(float) || logits_numel <= 0 ||
-        logits_ndim <= 0 || logits_ndim > 8) {
-        fprintf(stderr, "--logits must name a nonempty F32 tensor: %s\n", opt->logits_name);
-        return -1;
-    }
-
-    int classes = logits_shape[logits_ndim - 1];
-    if (classes <= 0 || logits_numel % classes != 0 ||
-        logits_numel / classes > INT_MAX) {
-        fprintf(stderr, "Logits tensor has an invalid cross-entropy shape: %s\n",
-                opt->logits_name);
-        return -1;
-    }
-    int rows = (int)(logits_numel / classes);
-    if (target_count <= 0 || target_count > rows) {
-        fprintf(stderr, "Target count %d exceeds logits row count %d.\n", target_count, rows);
-        return -1;
-    }
-    for (int i = 0; i < target_count; i++) {
-        if (targets[i] != opt->ignore_index && (targets[i] < 0 || targets[i] >= classes)) {
-            fprintf(stderr, "Target %d at index %d is outside [0, %d).\n",
-                    targets[i], i, classes);
-            return -1;
-        }
-    }
-
-    int execution_row = volvoxai_engine_execution_row();
-    if (execution_row >= 0) {
-        int batch = logits_ndim >= 3 ? logits_shape[0] : 1;
-        int per_batch = batch > 1 && target_count == batch && rows % batch == 0;
-        int limit = target_count == 1 ? rows : (per_batch ? rows / batch : 0);
-        if (limit <= 0) {
-            fprintf(stderr,
-                    "--last-token requires one target, or one target per logits batch.\n");
-            return -1;
-        }
-        if (execution_row >= limit) {
-            fprintf(stderr, "--last-token %d is outside [0, %d).\n",
-                    execution_row, limit);
-            return -1;
-        }
-    }
-
-    for (int i = 0; i < opt->trainable_count; i++) {
-        const char* name = opt->trainable_names[i];
-        long numel = 0;
-        int shape[8] = {0};
-        int ndim = 0;
-        int dtype = -1;
-        size_t element_size = 0;
-        if (volvoxai_engine_tensor_info_ex(name, &numel, shape, &ndim, &dtype,
-                &element_size) != 0 || dtype != 0 || element_size != sizeof(float) ||
-            numel <= 0 || volvoxai_engine_is_model_weight(name) != 1) {
-            fprintf(stderr, "--trainable must name a nonempty F32 model weight: %s\n", name);
-            return -1;
-        }
-    }
-    return 0;
-}
-
-static int command_train(int argc, char** argv) {
-    if (argc < 3 || !strcmp(argv[2], "--help") || !strcmp(argv[2], "-h")) {
-        print_train_help(argv[0]);
-        return argc < 3 ? 1 : 0;
-    }
-
-    const char* model = argv[2];
-    TrainOptions opt;
-    memset(&opt, 0, sizeof(opt));
-    graph_options_init(&opt.graph);
-    opt.steps = 1;
-    opt.ignore_index = -100;
-    opt.learning_rate = 1.0e-3f;
-    opt.beta1 = 0.9f;
-    opt.beta2 = 0.999f;
-    opt.epsilon = 1.0e-8f;
-    for (int i = 3; i < argc; i++) {
-        const char* arg = argv[i];
-        if (!strcmp(arg, "--targets")) {
-            if (i + 1 >= argc || opt.targets_path) {
-                fprintf(stderr, "--targets requires exactly one file.\n");
-                return 2;
-            }
-            opt.targets_path = argv[++i];
-        } else if (!strcmp(arg, "--logits")) {
-            if (i + 1 >= argc || opt.logits_name) {
-                fprintf(stderr, "--logits requires exactly one tensor name.\n");
-                return 2;
-            }
-            opt.logits_name = argv[++i];
-        } else if (!strcmp(arg, "--trainable")) {
-            if (i + 1 >= argc || opt.trainable_count >= MAX_BINDINGS) {
-                fprintf(stderr, "--trainable requires a tensor name (maximum %d).\n",
-                        MAX_BINDINGS);
-                return 2;
-            }
-            const char* name = argv[++i];
-            if (!name[0] || trainable_name_is_duplicate(&opt, name)) {
-                fprintf(stderr, "Duplicate or empty --trainable tensor: %s\n", name);
-                return 2;
-            }
-            opt.trainable_names[opt.trainable_count++] = name;
-        } else if (!strcmp(arg, "--steps")) {
-            if (i + 1 >= argc || parse_train_long(argv[++i], &opt.steps) != 0 ||
-                opt.steps <= 0) {
-                fprintf(stderr, "--steps must be a positive integer.\n");
-                return 2;
-            }
-        } else if (!strcmp(arg, "--learning-rate")) {
-            if (i + 1 >= argc || parse_train_float(argv[++i], &opt.learning_rate) != 0) {
-                fprintf(stderr, "--learning-rate must be finite.\n");
-                return 2;
-            }
-        } else if (!strcmp(arg, "--beta1")) {
-            if (i + 1 >= argc || parse_train_float(argv[++i], &opt.beta1) != 0) {
-                fprintf(stderr, "--beta1 must be finite.\n");
-                return 2;
-            }
-        } else if (!strcmp(arg, "--beta2")) {
-            if (i + 1 >= argc || parse_train_float(argv[++i], &opt.beta2) != 0) {
-                fprintf(stderr, "--beta2 must be finite.\n");
-                return 2;
-            }
-        } else if (!strcmp(arg, "--epsilon")) {
-            if (i + 1 >= argc || parse_train_float(argv[++i], &opt.epsilon) != 0) {
-                fprintf(stderr, "--epsilon must be finite.\n");
-                return 2;
-            }
-        } else if (!strcmp(arg, "--weight-decay")) {
-            if (i + 1 >= argc || parse_train_float(argv[++i], &opt.weight_decay) != 0) {
-                fprintf(stderr, "--weight-decay must be finite.\n");
-                return 2;
-            }
-        } else if (!strcmp(arg, "--max-grad-norm")) {
-            if (i + 1 >= argc || parse_train_float(argv[++i], &opt.max_grad_norm) != 0) {
-                fprintf(stderr, "--max-grad-norm must be finite.\n");
-                return 2;
-            }
-        } else if (!strcmp(arg, "--ignore-index")) {
-            long value = 0;
-            if (i + 1 >= argc || parse_train_long(argv[++i], &value) != 0 ||
-                value < INT_MIN || value > INT_MAX) {
-                fprintf(stderr, "--ignore-index must be a 32-bit integer.\n");
-                return 2;
-            }
-            opt.ignore_index = (int)value;
-        } else if (!strcmp(arg, "--last-token")) {
-            long value = 0;
-            if (i + 1 >= argc || parse_train_long(argv[++i], &value) != 0 ||
-                value < -1 || value > INT_MAX) {
-                fprintf(stderr, "--last-token must be -1 or a non-negative 32-bit integer.\n");
-                return 2;
-            }
-            opt.graph.execution_row = (int)value;
-        } else if (!strcmp(arg, "--output-weights")) {
-            if (i + 1 >= argc || opt.output_weights_path) {
-                fprintf(stderr, "--output-weights requires exactly one file.\n");
-                return 2;
-            }
-            opt.output_weights_path = argv[++i];
-        } else if (!strcmp(arg, "--input-optimizer")) {
-            if (i + 1 >= argc || opt.input_optimizer_path) {
-                fprintf(stderr, "--input-optimizer requires exactly one file.\n");
-                return 2;
-            }
-            opt.input_optimizer_path = argv[++i];
-        } else if (!strcmp(arg, "--output-optimizer")) {
-            if (i + 1 >= argc || opt.output_optimizer_path) {
-                fprintf(stderr, "--output-optimizer requires exactly one file.\n");
-                return 2;
-            }
-            opt.output_optimizer_path = argv[++i];
-        } else {
-            int parsed = parse_graph_option(argc, argv, &i, &opt.graph);
-            if (parsed < 0) return 2;
-            if (!parsed) {
-                fprintf(stderr, "Unknown train option: %s\n", argv[i]);
-                return 2;
-            }
-        }
-    }
-
-    if (!opt.targets_path || !opt.targets_path[0] || !opt.logits_name ||
-        !opt.logits_name[0] || opt.trainable_count <= 0) {
-        fprintf(stderr,
-                "train requires --targets, --logits, and at least one --trainable.\n");
-        return 2;
-    }
-    if ((opt.input_optimizer_path && !opt.input_optimizer_path[0]) ||
-        (opt.output_weights_path && !opt.output_weights_path[0]) ||
-        (opt.output_optimizer_path && !opt.output_optimizer_path[0])) {
-        fprintf(stderr, "Optimizer and weight paths must not be empty.\n");
-        return 2;
-    }
-    if (opt.learning_rate < 0.0f || opt.beta1 < 0.0f || opt.beta1 >= 1.0f ||
-        opt.beta2 < 0.0f || opt.beta2 >= 1.0f || opt.epsilon <= 0.0f ||
-        opt.weight_decay < 0.0f || opt.max_grad_norm < 0.0f) {
-        fprintf(stderr,
-                "Invalid optimizer values: lr/decay/clip must be non-negative, "
-                "betas in [0,1), and epsilon positive.\n");
-        return 2;
-    }
-    if (opt.output_weights_path && opt.output_optimizer_path &&
-        !strcmp(opt.output_weights_path, opt.output_optimizer_path)) {
-        fprintf(stderr, "Weight and optimizer outputs must use different files.\n");
-        return 2;
-    }
-    if (opt.output_weights_path && opt.input_optimizer_path &&
-        !strcmp(opt.output_weights_path, opt.input_optimizer_path)) {
-        fprintf(stderr, "Weight output must not overwrite the input optimizer file.\n");
-        return 2;
-    }
-
-    long target_bytes = 0;
-    char* target_storage = read_file_bytes(opt.targets_path, &target_bytes);
-    if (!target_storage || target_bytes <= 0 ||
-        target_bytes % (long)sizeof(int32_t) != 0 ||
-        target_bytes / (long)sizeof(int32_t) > INT_MAX) {
-        fprintf(stderr, "--targets must be a nonempty raw int32 file: %s\n",
-                opt.targets_path);
-        free(target_storage);
-        return 1;
-    }
-    int target_count = (int)(target_bytes / (long)sizeof(int32_t));
-    const int32_t* targets = (const int32_t*)target_storage;
-
-    int result = 1;
-    if (init_graph_with_options(model, &opt.graph) != 0) goto done;
-    if (validate_training_tensors(&opt, targets, target_count) != 0) goto done;
-
-    long loaded_step = 0;
-    if (opt.input_optimizer_path &&
-        (volvoxai_engine_load_optimizer_state(opt.input_optimizer_path, &loaded_step) != 0 ||
-         loaded_step < 0)) {
-        fprintf(stderr, "Failed to load optimizer state: %s\n", opt.input_optimizer_path);
-        goto done;
-    }
-    if (loaded_step > LONG_MAX - opt.steps) {
-        fprintf(stderr, "Loaded optimizer step plus --steps exceeds LONG_MAX.\n");
-        goto done;
-    }
-    long completed_step = loaded_step + opt.steps;
-
-    printf("Training optimizer=%s steps=%ld start_step=%ld trainables=%d targets=%d\n",
-           opt.weight_decay > 0.0f ? "AdamW" : "Adam", opt.steps,
-           loaded_step + 1, opt.trainable_count, target_count);
-    for (long index = 0; index < opt.steps; index++) {
-        long step = loaded_step + index + 1;
-        float loss = 0.0f;
-        int correct = 0;
-        int examples = 0;
-        double started = now_ms();
-        int update_mode = opt.weight_decay > 0.0f ? 3 : 2;
-        if (volvoxai_engine_train_step(opt.logits_name, targets, target_count,
-                opt.ignore_index, opt.trainable_names, opt.trainable_count, update_mode,
-                opt.learning_rate, opt.beta1, opt.beta2, opt.epsilon,
-                opt.weight_decay, opt.max_grad_norm, step, &loss, &correct,
-                &examples) != 0 || !isfinite(loss) || correct < 0 ||
-            examples < 0 || correct > examples) {
-            fprintf(stderr, "Training step %ld failed.\n", step);
-            goto done;
-        }
-        int backend = volvoxai_engine_last_training_backend();
-        if (examples > 0) {
-            printf("step=%ld loss=%.8g accuracy=%.2f%% (%d/%d) backend=%s time=%.3fms\n",
-                   step, loss, 100.0 * (double)correct / examples, correct, examples,
-                   training_backend_name(backend), now_ms() - started);
-        } else {
-            printf("step=%ld loss=%.8g accuracy=n/a (0/0) backend=%s time=%.3fms\n",
-                   step, loss, training_backend_name(backend), now_ms() - started);
-        }
-    }
-
-    for (int i = 0; i < opt.graph.n_outputs; i++) {
-        if (write_output_binding(&opt.graph.outputs[i]) != 0) goto done;
-    }
-    if (opt.output_weights_path &&
-        volvoxai_engine_save_weight_file(0, opt.output_weights_path) != 0) {
-        fprintf(stderr, "Failed to save trained weights: %s\n", opt.output_weights_path);
-        goto done;
-    }
-    if (opt.output_optimizer_path &&
-        volvoxai_engine_save_optimizer_state(opt.output_optimizer_path, completed_step) != 0) {
-        fprintf(stderr, "Failed to save optimizer state: %s\n",
-                opt.output_optimizer_path);
-        goto done;
-    }
-    result = 0;
-
-done:
-    volvoxai_engine_shutdown();
-    free(target_storage);
-    return result;
-}
-#endif
 
 static int command_run(int argc, char** argv) {
+    TaskOptions options;
+    TaskSession session;
+    int result = 1;
     if (argc < 3 || !strcmp(argv[2], "--help") || !strcmp(argv[2], "-h")) {
         print_run_help(argv[0]);
         return argc < 3 ? 1 : 0;
     }
-
-    const char* model = argv[2];
-    GraphOptions opt;
-    graph_options_init(&opt);
-
-    for (int i = 3; i < argc; i++) {
-        int parsed = parse_graph_option(argc, argv, &i, &opt);
+    task_options_init(&options);
+    for (int index = 3; index < argc; index++) {
+        int parsed = parse_common_option(argc, argv, &index, &options);
         if (parsed < 0) return 2;
         if (!parsed) {
-            fprintf(stderr, "Unknown run option: %s\n", argv[i]);
+            fprintf(stderr, "Unknown run option: %s\n", argv[index]);
             return 2;
         }
     }
-
-    if (init_graph_with_options(model, &opt) != 0) return 1;
-    if (run_forward_once("run", opt.engine.debug) != 0) {
-        volvoxai_engine_shutdown();
-        return 1;
-    }
-
-    const char* vd = getenv("VDUMP");
-    if (vd) fprintf(stderr, "[debug] VDUMP is handled by volvoxai_engine_run only; use --output for subcommand run.\n");
-
-    for (int i = 0; i < opt.n_outputs; i++) {
-        if (write_output_binding(&opt.outputs[i]) != 0) { volvoxai_engine_shutdown(); return 1; }
-    }
-    volvoxai_engine_shutdown();
-    return 0;
+    if (session_open(&session, argv[2], &options, 0) != 0) return 1;
+    if (execute_timed(&session, &options, "run") == 0 &&
+        write_selected_outputs(&session, &options) == 0)
+        result = 0;
+    session_close(&session);
+    return result;
 }
 
 static int command_classify(int argc, char** argv) {
+    TaskOptions options;
+    TaskSession session;
+    LabelList labels;
+    const char* logits_name = "logits";
+    const char* labels_path = NULL;
+    char discovered_labels[PATH_MAX];
+    int top_k = 5;
+    int result = 1;
+    VxTensorInfo info = VX_TENSOR_INFO_INIT;
+    void* bytes = NULL;
+    RankedValue* ranked = NULL;
+    size_t count;
+    memset(&labels, 0, sizeof(labels));
     if (argc < 3 || !strcmp(argv[2], "--help") || !strcmp(argv[2], "-h")) {
         print_classify_help(argv[0]);
         return argc < 3 ? 1 : 0;
     }
-
-    const char* model = argv[2];
-    const char* logits_name = NULL;
-    const char* labels_path = NULL;
-    int top_k = 5;
-    GraphOptions opt;
-    LabelList labels;
-    graph_options_init(&opt);
-    memset(&labels, 0, sizeof(labels));
-
-    for (int i = 3; i < argc; i++) {
-        int parsed = parse_graph_option(argc, argv, &i, &opt);
-        if (parsed < 0) return 2;
-        if (parsed) continue;
-        if (!strcmp(argv[i], "--logits") && i + 1 < argc) logits_name = argv[++i];
-        else if (!strcmp(argv[i], "--labels") && i + 1 < argc) labels_path = argv[++i];
-        else if (!strcmp(argv[i], "--top-k") && i + 1 < argc) top_k = atoi(argv[++i]);
-        else { fprintf(stderr, "Unknown classify option: %s\n", argv[i]); return 2; }
-    }
-
-    if (load_labels(labels_path, &labels) != 0) return 1;
-    if (init_graph_with_options(model, &opt) != 0) { free_labels(&labels); return 1; }
-    if (run_forward_once("classify", opt.engine.debug) != 0) {
-        volvoxai_engine_shutdown();
-        free_labels(&labels);
-        return 1;
-    }
-
-    long count = 0;
-    int shape[8] = {0};
-    int ndim = 0;
-    const float* logits = read_output_tensor(logits_name, &count, shape, &ndim);
-    if (!logits || count <= 0) {
-        fprintf(stderr, "No classification output available.\n");
-        volvoxai_engine_shutdown();
-        free_labels(&labels);
-        return 1;
-    }
-    print_topk(logits, (int)count, top_k, &labels);
-
-    for (int i = 0; i < opt.n_outputs; i++) {
-        if (write_output_binding(&opt.outputs[i]) != 0) { volvoxai_engine_shutdown(); free_labels(&labels); return 1; }
-    }
-    volvoxai_engine_shutdown();
-    free_labels(&labels);
-    return 0;
-}
-
-static int detection_score_at(const float* scores, const int* score_shape, int score_ndim,
-                              long score_count, int det, int* cls, float* score) {
-    if (!scores || score_count <= 0) return -1;
-    if (score_ndim >= 2) {
-        int c = score_shape[score_ndim - 1];
-        long base = (long)det * c;
-        if (base + c > score_count) return -1;
-        float best_v = 0.0f;
-        int best = argmax_f32(scores + base, c, &best_v);
-        if (cls) *cls = best;
-        if (score) *score = best_v;
-        return 0;
-    }
-    if (det >= score_count) return -1;
-    if (cls) *cls = -1;
-    if (score) *score = scores[det];
-    return 0;
-}
-
-static void print_detections(const float* boxes, long box_count, const int* box_shape, int box_ndim,
-                             const float* scores, long score_count, const int* score_shape, int score_ndim,
-                             const float* classes, long class_count, const LabelList* labels, int max_det) {
-    if (!boxes || box_count < 4 || box_ndim < 1 || box_shape[box_ndim - 1] != 4 || !scores) return;
-    int dets = (int)(box_count / 4);
-    if (score_ndim >= 2) {
-        int c = score_shape[score_ndim - 1];
-        int score_dets = (int)(score_count / c);
-        if (score_dets < dets) dets = score_dets;
-    } else if (score_count < dets) {
-        dets = (int)score_count;
-    }
-    if (max_det < 1) max_det = 1;
-    if (max_det > dets) max_det = dets;
-    if (max_det > 256) max_det = 256;
-
-    int selected[256];
-    for (int i = 0; i < max_det; i++) selected[i] = -1;
-    int print_labels = labels && labels->count > 0;
-    if (print_labels) {
-        printf("rank\tindex\tscore\tscore_pct\tclass\tlabel\tx0\ty0\tx1\ty1\n");
-    } else {
-        printf("rank\tindex\tscore\tscore_pct\tclass\tx0\ty0\tx1\ty1\n");
-    }
-    for (int r = 0; r < max_det; r++) {
-        int best_det = -1;
-        int best_cls = -1;
-        float best_score = -1e30f;
-        for (int d = 0; d < dets; d++) {
-            int used = 0;
-            for (int j = 0; j < r; j++) if (selected[j] == d) { used = 1; break; }
-            if (used) continue;
-            int cls = -1;
-            float score = 0.0f;
-            if (detection_score_at(scores, score_shape, score_ndim, score_count, d, &cls, &score) != 0) continue;
-            if (score > best_score) { best_score = score; best_det = d; best_cls = cls; }
-        }
-        if (best_det < 0) break;
-        selected[r] = best_det;
-        if (classes && best_det < class_count) best_cls = (int)classes[best_det];
-        const float* b = boxes + (long)best_det * 4;
-        if (print_labels) {
-            const char* label = label_at(labels, best_cls);
-            printf("%d\t%d\t%.6g\t%.2f%%\t%d\t%s\t%.6g\t%.6g\t%.6g\t%.6g\n",
-                   r + 1, best_det, best_score, best_score * 100.0f,
-                   best_cls, label[0] ? label : "-",
-                   b[0], b[1], b[2], b[3]);
+    task_options_init(&options);
+    for (int index = 3; index < argc; index++) {
+        if (!strcmp(argv[index], "--logits") && index + 1 < argc) {
+            logits_name = argv[++index];
+        } else if (!strcmp(argv[index], "--labels") && index + 1 < argc) {
+            labels_path = argv[++index];
+        } else if (!strcmp(argv[index], "--top-k") && index + 1 < argc) {
+            if (parse_int(argv[++index], 1, &top_k) != 0) return 2;
         } else {
-            printf("%d\t%d\t%.6g\t%.2f%%\t%d\t%.6g\t%.6g\t%.6g\t%.6g\n",
-                   r + 1, best_det, best_score, best_score * 100.0f,
-                   best_cls, b[0], b[1], b[2], b[3]);
+            int parsed = parse_common_option(argc, argv, &index, &options);
+            if (parsed < 0) return 2;
+            if (!parsed) {
+                fprintf(stderr, "Unknown classify option: %s\n", argv[index]);
+                return 2;
+            }
         }
     }
+    labels_path = discover_file(argv[2], labels_path, "labels.txt",
+                                discovered_labels, sizeof(discovered_labels));
+    if (labels_path && load_labels(labels_path, &labels) != 0) return 1;
+    if (session_open(&session, argv[2], &options, 0) != 0) goto cleanup_labels;
+    if (execute_timed(&session, &options, "classify") != 0 ||
+        copy_output(&session, logits_name, &info, &bytes) != 0)
+        goto cleanup_session;
+    if (info.dtype != VX_DTYPE_F32 || info.byte_size % sizeof(float)) {
+        fprintf(stderr, "Classification output %s must be F32.\n", logits_name);
+        goto cleanup_session;
+    }
+    count = info.byte_size / sizeof(float);
+    ranked = (RankedValue*)calloc(count ? count : 1, sizeof(*ranked));
+    if (!ranked) goto cleanup_session;
+    for (size_t index = 0; index < count; index++) {
+        ranked[index].index = index;
+        ranked[index].class_id = (int)index;
+        ranked[index].score = ((float*)bytes)[index];
+    }
+    qsort(ranked, count, sizeof(*ranked), compare_ranked_value);
+    printf(labels.count ? "rank\tclass\tlabel\tscore\n" : "rank\tclass\tscore\n");
+    for (size_t rank = 0; rank < count && rank < (size_t)top_k; rank++) {
+        const char* label = label_at(&labels, ranked[rank].class_id);
+        if (labels.count)
+            printf("%zu\t%d\t%s\t%g\n", rank + 1, ranked[rank].class_id,
+                   label ? label : "<unknown>", ranked[rank].score);
+        else
+            printf("%zu\t%d\t%g\n", rank + 1, ranked[rank].class_id,
+                   ranked[rank].score);
+    }
+    if (write_selected_outputs(&session, &options) == 0) result = 0;
+cleanup_session:
+    free(ranked);
+    free(bytes);
+    session_close(&session);
+cleanup_labels:
+    free_labels(&labels);
+    return result;
 }
 
 static int command_detect(int argc, char** argv) {
+    TaskOptions options;
+    TaskSession session;
+    LabelList labels;
+    const char* boxes_name = "boxes";
+    const char* scores_name = "scores";
+    const char* labels_path = NULL;
+    char discovered_labels[PATH_MAX];
+    int maximum_detections = 20;
+    int result = 1;
+    VxTensorInfo boxes_info = VX_TENSOR_INFO_INIT;
+    VxTensorInfo scores_info = VX_TENSOR_INFO_INIT;
+    void* boxes_bytes = NULL;
+    void* scores_bytes = NULL;
+    RankedValue* detections = NULL;
+    size_t box_count;
+    size_t score_count;
+    size_t detection_count;
+    size_t class_count;
+    memset(&labels, 0, sizeof(labels));
     if (argc < 3 || !strcmp(argv[2], "--help") || !strcmp(argv[2], "-h")) {
         print_detect_help(argv[0]);
         return argc < 3 ? 1 : 0;
     }
-
-    const char* model = argv[2];
-    const char* boxes_name = "boxes";
-    const char* scores_name = "scores";
-    const char* classes_name = NULL;
-    const char* labels_path = NULL;
-    char discovered_labels[PATH_MAX] = {0};
-    int max_det = 20;
-    GraphOptions opt;
-    LabelList labels;
-    graph_options_init(&opt);
-    memset(&labels, 0, sizeof(labels));
-
-    for (int i = 3; i < argc; i++) {
-        int parsed = parse_graph_option(argc, argv, &i, &opt);
-        if (parsed < 0) return 2;
-        if (parsed) continue;
-        if (!strcmp(argv[i], "--boxes") && i + 1 < argc) boxes_name = argv[++i];
-        else if (!strcmp(argv[i], "--scores") && i + 1 < argc) scores_name = argv[++i];
-        else if (!strcmp(argv[i], "--classes") && i + 1 < argc) classes_name = argv[++i];
-        else if (!strcmp(argv[i], "--labels") && i + 1 < argc) labels_path = argv[++i];
-        else if (!strcmp(argv[i], "--max-det") && i + 1 < argc) max_det = atoi(argv[++i]);
-        else if ((!strcmp(argv[i], "--num_threads") || !strcmp(argv[i], "--num-threads")) && i + 1 < argc) {
-            opt.engine.cpu_threads = atoi(argv[++i]);
-            if (opt.engine.cpu_threads <= 0) {
-                fprintf(stderr, "--num_threads must be a positive integer.\n");
+    task_options_init(&options);
+    for (int index = 3; index < argc; index++) {
+        if (!strcmp(argv[index], "--boxes") && index + 1 < argc) {
+            boxes_name = argv[++index];
+        } else if (!strcmp(argv[index], "--scores") && index + 1 < argc) {
+            scores_name = argv[++index];
+        } else if (!strcmp(argv[index], "--labels") && index + 1 < argc) {
+            labels_path = argv[++index];
+        } else if (!strcmp(argv[index], "--max-det") && index + 1 < argc) {
+            if (parse_int(argv[++index], 1, &maximum_detections) != 0) return 2;
+        } else {
+            int parsed = parse_common_option(argc, argv, &index, &options);
+            if (parsed < 0) return 2;
+            if (!parsed) {
+                fprintf(stderr, "Unknown detect option: %s\n", argv[index]);
                 return 2;
             }
         }
-        else if ((!strcmp(argv[i], "--warmup_runs") || !strcmp(argv[i], "--warmup-runs")) && i + 1 < argc)
-            g_warmup_runs = atoi(argv[++i]);
-        else if ((!strcmp(argv[i], "--num_runs") || !strcmp(argv[i], "--num-runs")) && i + 1 < argc)
-            g_num_runs = atoi(argv[++i]);
-        else { fprintf(stderr, "Unknown detect option: %s\n", argv[i]); return 2; }
     }
-
-    labels_path = resolve_labels_path(model, labels_path, discovered_labels, sizeof(discovered_labels));
-    if (load_labels(labels_path, &labels) != 0) return 1;
-    if (init_graph_with_options(model, &opt) != 0) { free_labels(&labels); return 1; }
-    if (run_forward_once("detect", opt.engine.debug) != 0) {
-        volvoxai_engine_shutdown();
-        free_labels(&labels);
-        return 1;
+    labels_path = discover_file(argv[2], labels_path, "labels.txt",
+                                discovered_labels, sizeof(discovered_labels));
+    if (labels_path && load_labels(labels_path, &labels) != 0) return 1;
+    if (session_open(&session, argv[2], &options, 0) != 0) goto cleanup_labels;
+    if (execute_timed(&session, &options, "detect") != 0 ||
+        copy_output(&session, boxes_name, &boxes_info, &boxes_bytes) != 0 ||
+        copy_output(&session, scores_name, &scores_info, &scores_bytes) != 0)
+        goto cleanup_session;
+    if (boxes_info.dtype != VX_DTYPE_F32 || scores_info.dtype != VX_DTYPE_F32 ||
+        boxes_info.byte_size % sizeof(float) || scores_info.byte_size % sizeof(float)) {
+        fprintf(stderr, "Detection boxes and scores must be F32.\n");
+        goto cleanup_session;
     }
-
-    long box_count = 0, score_count = 0, class_count = 0, fallback_count = 0;
-    int box_shape[8] = {0}, score_shape[8] = {0}, class_shape[8] = {0}, fallback_shape[8] = {0};
-    int box_ndim = 0, score_ndim = 0, class_ndim = 0, fallback_ndim = 0;
-    float* boxes = boxes_name ? copy_output_tensor(boxes_name, &box_count, box_shape, &box_ndim) : NULL;
-    float* scores = scores_name ? copy_output_tensor(scores_name, &score_count, score_shape, &score_ndim) : NULL;
-    float* classes = classes_name ? copy_output_tensor(classes_name, &class_count, class_shape, &class_ndim) : NULL;
-    if ((boxes_name && !boxes) || (scores_name && !scores) || (classes_name && !classes)) {
-        free(boxes);
-        free(scores);
-        free(classes);
-        volvoxai_engine_shutdown();
-        free_labels(&labels);
-        return 1;
+    box_count = boxes_info.byte_size / sizeof(float);
+    score_count = scores_info.byte_size / sizeof(float);
+    if (!box_count || box_count % 4) {
+        fprintf(stderr, "Detection boxes must contain N rows of four coordinates.\n");
+        goto cleanup_session;
     }
-
-    if (boxes && scores) {
-        print_detections(boxes, box_count, box_shape, box_ndim, scores, score_count, score_shape, score_ndim,
-                         classes, class_count, &labels, max_det);
-    } else {
-        if (boxes) print_tensor_summary(boxes_name, boxes, box_count, box_shape, box_ndim, 12);
-        if (scores) print_tensor_summary(scores_name, scores, score_count, score_shape, score_ndim, 12);
-        if (classes) print_tensor_summary(classes_name, classes, class_count, class_shape, class_ndim, 12);
-        if (!boxes && !scores && !classes) {
-            const float* out = read_output_tensor(NULL, &fallback_count, fallback_shape, &fallback_ndim);
-            if (out) print_tensor_summary("output", out, fallback_count, fallback_shape, fallback_ndim, 12);
-        }
+    detection_count = box_count / 4;
+    if (!score_count || score_count % detection_count) {
+        fprintf(stderr, "Detection scores must contain one class row per box.\n");
+        goto cleanup_session;
     }
-
-    for (int i = 0; i < opt.n_outputs; i++) {
-        if (write_output_binding(&opt.outputs[i]) != 0) {
-            free(boxes);
-            free(scores);
-            free(classes);
-            volvoxai_engine_shutdown();
-            free_labels(&labels);
-            return 1;
-        }
+    class_count = score_count / detection_count;
+    detections = (RankedValue*)calloc(detection_count, sizeof(*detections));
+    if (!detections) goto cleanup_session;
+    for (size_t index = 0; index < detection_count; index++) {
+        const float* row = (const float*)scores_bytes + index * class_count;
+        size_t best = 0;
+        for (size_t class_id = 1; class_id < class_count; class_id++)
+            if (row[class_id] > row[best]) best = class_id;
+        detections[index].index = index;
+        detections[index].class_id = (int)best;
+        detections[index].score = row[best];
     }
-    free(boxes);
-    free(scores);
-    free(classes);
-    volvoxai_engine_shutdown();
+    qsort(detections, detection_count, sizeof(*detections), compare_ranked_value);
+    printf(labels.count
+           ? "rank\tindex\tscore\tscore_pct\tclass\tlabel\tx0\ty0\tx1\ty1\n"
+           : "rank\tindex\tscore\tscore_pct\tclass\tx0\ty0\tx1\ty1\n");
+    for (size_t rank = 0; rank < detection_count &&
+                          rank < (size_t)maximum_detections; rank++) {
+        const RankedValue* detection = &detections[rank];
+        const float* box = (const float*)boxes_bytes + detection->index * 4;
+        const char* label = label_at(&labels, detection->class_id);
+        if (labels.count)
+            printf("%zu\t%zu\t%g\t%.2f%%\t%d\t%s\t%g\t%g\t%g\t%g\n",
+                   rank + 1, detection->index, detection->score,
+                   detection->score * 100.0f, detection->class_id,
+                   label ? label : "<unknown>", box[0], box[1], box[2], box[3]);
+        else
+            printf("%zu\t%zu\t%g\t%.2f%%\t%d\t%g\t%g\t%g\t%g\n",
+                   rank + 1, detection->index, detection->score,
+                   detection->score * 100.0f, detection->class_id,
+                   box[0], box[1], box[2], box[3]);
+    }
+    if (write_selected_outputs(&session, &options) == 0) result = 0;
+cleanup_session:
+    free(detections);
+    free(boxes_bytes);
+    free(scores_bytes);
+    session_close(&session);
+cleanup_labels:
     free_labels(&labels);
-    return 0;
+    return result;
 }
 
-static int command_ctc(int argc, char** argv) {
+static int command_decode(int argc, char** argv) {
+    TaskOptions options;
+    TaskSession session;
+    int steps = 1;
+    int start_position = 0;
+    int result = 1;
+    VxStatus status;
     if (argc < 3 || !strcmp(argv[2], "--help") || !strcmp(argv[2], "-h")) {
-        print_ctc_help(argv[0]);
+        print_decode_help(argv[0]);
         return argc < 3 ? 1 : 0;
     }
-
-    const char* model = argv[2];
-    const char* logits_name = NULL;
-    const char* labels_path = NULL;
-    int blank = 0;
-    GraphOptions opt;
-    LabelList labels;
-    graph_options_init(&opt);
-    memset(&labels, 0, sizeof(labels));
-
-    for (int i = 3; i < argc; i++) {
-        int parsed = parse_graph_option(argc, argv, &i, &opt);
-        if (parsed < 0) return 2;
-        if (parsed) continue;
-        if (!strcmp(argv[i], "--logits") && i + 1 < argc) logits_name = argv[++i];
-        else if (!strcmp(argv[i], "--labels") && i + 1 < argc) labels_path = argv[++i];
-        else if (!strcmp(argv[i], "--blank") && i + 1 < argc) blank = atoi(argv[++i]);
-        else { fprintf(stderr, "Unknown ctc option: %s\n", argv[i]); return 2; }
-    }
-
-    if (load_labels(labels_path, &labels) != 0) return 1;
-    if (init_graph_with_options(model, &opt) != 0) { free_labels(&labels); return 1; }
-    if (run_forward_once("ctc", opt.engine.debug) != 0) {
-        volvoxai_engine_shutdown();
-        free_labels(&labels);
-        return 1;
-    }
-
-    long count = 0;
-    int shape[8] = {0};
-    int ndim = 0;
-    const float* logits = read_output_tensor(logits_name, &count, shape, &ndim);
-    if (!logits || ndim < 2) {
-        fprintf(stderr, "CTC requires a logits tensor with shape [...,T,C].\n");
-        volvoxai_engine_shutdown();
-        free_labels(&labels);
-        return 1;
-    }
-    int t_steps = shape[ndim - 2];
-    int classes = shape[ndim - 1];
-    int prev = -1;
-    int printed = 0;
-    for (int t = 0; t < t_steps; t++) {
-        float best_v = 0.0f;
-        int id = argmax_f32(logits + (long)t * classes, classes, &best_v);
-        if (id != blank && id != prev) {
-            const char* label = label_at(&labels, id);
-            if (label[0]) printf("%s", label);
-            else printf("%s%d", printed ? " " : "", id);
-            printed = 1;
-        }
-        prev = id;
-    }
-    printf("\n");
-
-    for (int i = 0; i < opt.n_outputs; i++) {
-        if (write_output_binding(&opt.outputs[i]) != 0) { volvoxai_engine_shutdown(); free_labels(&labels); return 1; }
-    }
-    volvoxai_engine_shutdown();
-    free_labels(&labels);
-    return 0;
-}
-
-static char* build_prompt_text(const char* prompt, const char* text_file) {
-    if (!text_file) return prompt ? dup_slice(prompt, (int)strlen(prompt)) : NULL;
-    long sz = 0;
-    char* text = read_file_bytes(text_file, &sz);
-    if (!text) {
-        fprintf(stderr, "Cannot read text file: %s\n", text_file);
-        return NULL;
-    }
-    if (!prompt || !prompt[0]) return text;
-    size_t lp = strlen(prompt);
-    size_t lt = strlen(text);
-    char* out = (char*)malloc(lp + lt + 3);
-    if (!out) { free(text); return NULL; }
-    memcpy(out, prompt, lp);
-    out[lp] = '\n';
-    out[lp + 1] = '\n';
-    memcpy(out + lp + 2, text, lt + 1);
-    free(text);
-    return out;
-}
-
-static int fill_prompt_input(VolvoxAITokenizer* tok, const char* prompt, const char* explicit_name,
-                             int pad_token, int eos_token, int debug) {
-    if (!prompt || !prompt[0]) return 0;
-    if (!tok) {
-        fprintf(stderr, "--prompt/--text-file requires --vocab or a model-dir vocab.bin for now.\n");
-        return -1;
-    }
-    const char* defaults[] = {"prompt_tokens", "q_tokens", "question_tokens", "tokens"};
-    const char* found = find_graph_input(explicit_name, defaults, 4);
-    long n = 0;
-    int dtype = -1;
-    if (!found || token_input_info(found, &n, &dtype) != 0) {
-        fprintf(stderr, "No prompt input found. Use --prompt-input <name> or --input <name=file>.\n");
-        return -1;
-    }
-    int32_t* dst = (int32_t*)malloc((size_t)n * sizeof(int32_t));
-    if (!dst) return -1;
-    for (long i = 0; i < n; i++) dst[i] = pad_token;
-    int cap = n < 4096 ? (int)n : 4096;
-    int tokens[4096];
-    double t0 = now_ms();
-    int num = volvoxai_tokenizer_encode(tok, prompt, tokens, cap);
-    if (num < 0) num = 0;
-    for (int i = 0; i < num && i < cap; i++) dst[i] = tokens[i];
-    if (eos_token >= 0 && num < cap) dst[num++] = eos_token;
-    if (set_token_input(found, dtype, dst, n) != 0) {
-        fprintf(stderr, "Cannot set prompt input: %s\n", found);
-        free(dst);
-        return -1;
-    }
-    free(dst);
-    if (debug) {
-        fprintf(stderr, "[debug] prompt_input=%s tokens=%d %.3f ms\n", found, num, now_ms() - t0);
-    }
-    return 0;
-}
-
-static int command_seq2seq_like(int argc, char** argv, int is_chat) {
-    if (argc < 3 || !strcmp(argv[2], "--help") || !strcmp(argv[2], "-h")) {
-        print_seq2seq_help(argv[0], is_chat);
-        return argc < 3 ? 1 : 0;
-    }
-
-    const char* model = argv[2];
-    const char* vocab = NULL;
-    const char* merges = NULL;
-    const char* prompt = NULL;
-    const char* text_file = NULL;
-    const char* prompt_input = NULL;
-    const char* decoder_input = NULL;
-    const char* logits_name = NULL;
-    int max_new = 192;
-    int bos_token = 1;
-    int eos_token = 2;
-    int pad_token = 0;
-    GraphOptions opt;
-    graph_options_init(&opt);
-
-    for (int i = 3; i < argc; i++) {
-        int parsed = parse_graph_option(argc, argv, &i, &opt);
-        if (parsed < 0) return 2;
-        if (parsed) continue;
-        if (!strcmp(argv[i], "--vocab") && i + 1 < argc) vocab = argv[++i];
-        else if (!strcmp(argv[i], "--merges") && i + 1 < argc) merges = argv[++i];
-        else if (!strcmp(argv[i], "--prompt") && i + 1 < argc) prompt = argv[++i];
-        else if (!strcmp(argv[i], "--text-file") && i + 1 < argc) text_file = argv[++i];
-        else if (!strcmp(argv[i], "--prompt-input") && i + 1 < argc) prompt_input = argv[++i];
-        else if (!strcmp(argv[i], "--decoder-input") && i + 1 < argc) decoder_input = argv[++i];
-        else if (!strcmp(argv[i], "--logits") && i + 1 < argc) logits_name = argv[++i];
-        else if (!strcmp(argv[i], "--max-new") && i + 1 < argc) max_new = atoi(argv[++i]);
-        else if (!strcmp(argv[i], "--bos-token") && i + 1 < argc) bos_token = atoi(argv[++i]);
-        else if (!strcmp(argv[i], "--eos-token") && i + 1 < argc) eos_token = atoi(argv[++i]);
-        else if (!strcmp(argv[i], "--pad-token") && i + 1 < argc) pad_token = atoi(argv[++i]);
-        else {
-            fprintf(stderr, "Unknown %s option: %s\n", is_chat ? "chat" : "seq2seq", argv[i]);
-            return 2;
-        }
-    }
-    if (max_new < 1) max_new = 1;
-
-    ModelPaths token_paths;
-    if (resolve_model_paths(model, opt.weights, vocab, merges, &token_paths) != 0) return 1;
-    const char* vocab_path = file_exists(token_paths.vocab) ? token_paths.vocab : NULL;
-    const char* merges_path = file_exists(token_paths.merges) ? token_paths.merges : NULL;
-    char* prompt_text = build_prompt_text(prompt, text_file);
-    if (text_file && !prompt_text) return 1;
-
-    VolvoxAITokenizer* tok = NULL;
-    if (vocab_path) {
-        double t0 = now_ms();
-        tok = volvoxai_tokenizer_init(vocab_path, merges_path);
-        if (!tok) { free(prompt_text); fprintf(stderr, "Tokenizer init failed.\n"); return 1; }
-        if (opt.engine.debug) {
-            fprintf(stderr, "[debug] tokenizer_init %.3f ms\n", now_ms() - t0);
-        }
-    }
-
-    if (init_graph_with_options(model, &opt) != 0) {
-        volvoxai_tokenizer_free(tok);
-        free(prompt_text);
-        return 1;
-    }
-    if (fill_prompt_input(tok, prompt_text, prompt_input, pad_token, eos_token,
-                          opt.engine.debug) != 0) {
-        volvoxai_engine_shutdown();
-        volvoxai_tokenizer_free(tok);
-        free(prompt_text);
-        return 1;
-    }
-
-    const char* decoder_defaults[] = {"decoder_tokens", "y_tokens", "output_tokens", "tokens"};
-    const char* decoder_found = find_graph_input(decoder_input, decoder_defaults, 4);
-    long dec_n = 0;
-    int dec_dtype = -1;
-    if (!decoder_found || token_input_info(decoder_found, &dec_n, &dec_dtype) != 0) {
-        fprintf(stderr, "No decoder input found. Use --decoder-input <name> or bind it with --input.\n");
-        volvoxai_engine_shutdown();
-        volvoxai_tokenizer_free(tok);
-        free(prompt_text);
-        return 1;
-    }
-    int32_t* dec = (int32_t*)malloc((size_t)dec_n * sizeof(int32_t));
-    if (!dec) {
-        volvoxai_engine_shutdown();
-        volvoxai_tokenizer_free(tok);
-        free(prompt_text);
-        return 1;
-    }
-    for (long i = 0; i < dec_n; i++) dec[i] = pad_token;
-    dec[0] = bos_token;
-    if (set_token_input(decoder_found, dec_dtype, dec, dec_n) != 0) {
-        fprintf(stderr, "Cannot set decoder input: %s\n", decoder_found);
-        free(dec);
-        volvoxai_engine_shutdown();
-        volvoxai_tokenizer_free(tok);
-        free(prompt_text);
-        return 1;
-    }
-    int dec_cap = dec_n < 4096 ? (int)dec_n : 4096;
-    if (max_new > dec_cap - 1) max_new = dec_cap - 1;
-
-    if (opt.engine.debug) {
-        fprintf(stderr, "[debug] decoder_input=%s max_new=%d bos=%d eos=%d pad=%d\n",
-                decoder_found, max_new, bos_token, eos_token, pad_token);
-    }
-
-    int generated = 0;
-    double gen_t0 = now_ms();
-    for (int step = 0; step < max_new; step++) {
-        if (volvoxai_engine_set_execution_row(step) != 0) {
-            fprintf(stderr, "Cannot select decoder row %d.\n", step);
-            free(dec);
-            volvoxai_engine_shutdown();
-            volvoxai_tokenizer_free(tok);
-            free(prompt_text);
-            return 1;
-        }
-        if (run_forward_once(is_chat ? "chat" : "seq2seq", opt.engine.debug) != 0) {
-            free(dec);
-            volvoxai_engine_shutdown();
-            volvoxai_tokenizer_free(tok);
-            free(prompt_text);
-            return 1;
-        }
-        long count = 0;
-        int shape[8] = {0};
-        int ndim = 0;
-        const float* logits = read_output_tensor(logits_name, &count, shape, &ndim);
-        if (!logits || count <= 0) {
-            fprintf(stderr, "No logits output available.\n");
-            free(dec);
-            volvoxai_engine_shutdown();
-            volvoxai_tokenizer_free(tok);
-            free(prompt_text);
-            return 1;
-        }
-        float best_v = 0.0f;
-        int best_id = argmax_f32(logits, (int)count, &best_v);
-        if (opt.engine.debug) {
-            fprintf(stderr, "[debug] decode step=%d token=%d logit=%.5f\n", step, best_id, best_v);
-        }
-        if (best_id == eos_token) break;
-        if (tok) printf("%s", volvoxai_tokenizer_decode(tok, best_id));
-        else printf("%s%d", generated ? " " : "", best_id);
-        fflush(stdout);
-        generated++;
-        if (step + 1 < dec_cap) {
-            dec[step + 1] = best_id;
-            if (set_token_input(decoder_found, dec_dtype, dec, dec_n) != 0) {
-                fprintf(stderr, "Cannot update decoder input: %s\n", decoder_found);
-                free(dec);
-                volvoxai_engine_shutdown();
-                volvoxai_tokenizer_free(tok);
-                free(prompt_text);
-                return 1;
+    task_options_init(&options);
+    for (int index = 3; index < argc; index++) {
+        if (!strcmp(argv[index], "--steps") && index + 1 < argc) {
+            if (parse_int(argv[++index], 0, &steps) != 0) return 2;
+        } else if (!strcmp(argv[index], "--start-position") && index + 1 < argc) {
+            if (parse_int(argv[++index], 0, &start_position) != 0) return 2;
+        } else {
+            int parsed = parse_common_option(argc, argv, &index, &options);
+            if (parsed < 0) return 2;
+            if (!parsed) {
+                fprintf(stderr, "Unknown decode option: %s\n", argv[index]);
+                return 2;
             }
         }
     }
-    if (opt.engine.debug) {
-        double gen_ms = now_ms() - gen_t0;
-        double tps = generated > 0 && gen_ms > 0.0 ? (double)generated * 1000.0 / gen_ms : 0.0;
-        fprintf(stderr, "[debug] %s tokens=%d total=%.3f ms tok/s=%.2f\n",
-                is_chat ? "chat" : "seq2seq", generated, gen_ms, tps);
+    if (session_open(&session, argv[2], &options, 1) != 0) return 1;
+    status = vx_execution_context_decode_seed(session.context, &session.result,
+                                              &session.report);
+    if (status != VX_STATUS_OK) {
+        print_failure("Decode seed", status, &session.report);
+        goto cleanup;
     }
-    printf("\n");
-
-    for (int i = 0; i < opt.n_outputs; i++) {
-        if (write_output_binding(&opt.outputs[i]) != 0) {
-            free(dec);
-            volvoxai_engine_shutdown();
-            volvoxai_tokenizer_free(tok);
-            free(prompt_text);
-            return 1;
+    for (int index = 0; index < steps; index++) {
+        VxResult* next = NULL;
+        status = vx_execution_context_decode_step(session.context,
+                                                  start_position + index,
+                                                  &next, &session.report);
+        if (status != VX_STATUS_OK) {
+            print_failure("Decode step", status, &session.report);
+            vx_result_release(next);
+            goto cleanup;
         }
+        vx_result_release(session.result);
+        session.result = next;
     }
-    free(dec);
-    volvoxai_engine_shutdown();
-    volvoxai_tokenizer_free(tok);
-    free(prompt_text);
-    return 0;
-}
-
-static int command_generate(int argc, char** argv) {
-    if (argc < 3 || !strcmp(argv[2], "--help") || !strcmp(argv[2], "-h")) {
-        print_generate_help(argv[0]);
-        return argc < 3 ? 1 : 0;
-    }
-
-    const char* model = argv[2];
-    const char* weights = NULL;
-    const char* vocab = NULL;
-    const char* merges = NULL;
-    const char* prompt = NULL;
-    int max_new = 50;
-    int pad_token = 50256;
-    int eos_token = -1;
-    VolvoxAIEngineOptions engine;
-    engine_options_init(&engine);
-
-    for (int i = 3; i < argc; i++) {
-        int backend_flag = parse_backend_flag(argv[i], &engine);
-        if (backend_flag < 0) return 2;
-        if (backend_flag > 0) continue;
-        if (!strcmp(argv[i], "--weights") && i + 1 < argc) weights = argv[++i];
-        else if (!strcmp(argv[i], "--vocab") && i + 1 < argc) vocab = argv[++i];
-        else if (!strcmp(argv[i], "--merges") && i + 1 < argc) merges = argv[++i];
-        else if (!strcmp(argv[i], "--prompt") && i + 1 < argc) prompt = argv[++i];
-        else if (!strcmp(argv[i], "--max-new") && i + 1 < argc) max_new = atoi(argv[++i]);
-        else if (!strcmp(argv[i], "--pad-token") && i + 1 < argc) pad_token = atoi(argv[++i]);
-        else if (!strcmp(argv[i], "--eos-token") && i + 1 < argc) eos_token = atoi(argv[++i]);
-        else { fprintf(stderr, "Unknown generate option: %s\n", argv[i]); return 2; }
-    }
-    if (!prompt) { fprintf(stderr, "generate requires --prompt.\n"); return 2; }
-    if (max_new < 1) max_new = 1;
-
-    ModelPaths paths;
-    if (resolve_model_paths(model, weights, vocab, merges, &paths) != 0) return 1;
-    if (!file_exists(paths.weights)) { fprintf(stderr, "Missing weights: %s\n", paths.weights); return 1; }
-    if (!file_exists(paths.vocab)) { fprintf(stderr, "Missing vocab: %s\n", paths.vocab); return 1; }
-    const char* merges_path = file_exists(paths.merges) ? paths.merges : NULL;
-
-    if (configure_engine(&engine) != 0) return 1;
-    printf("Loading graph: %s\n", paths.config);
-
-    double t0 = now_ms();
-    VolvoxAITokenizer* tok = volvoxai_tokenizer_init(paths.vocab, merges_path);
-    if (!tok) {
-        volvoxai_engine_shutdown();
-        fprintf(stderr, "Tokenizer init failed.\n");
-        return 1;
-    }
-    if (engine.debug) fprintf(stderr, "[debug] tokenizer_init %.3f ms\n", now_ms() - t0);
-
-    t0 = now_ms();
-    if (volvoxai_engine_init(paths.config, paths.weights) != 0) {
-        volvoxai_engine_shutdown();
-        volvoxai_tokenizer_free(tok);
-        fprintf(stderr, "Native init failed.\n");
-        return 1;
-    }
-    if (engine.debug) {
-        fprintf(stderr, "[debug] volvoxai_engine_init %.3f ms\n", now_ms() - t0);
-        debug_print_runtime(&engine);
-    }
-
-    const char* output_name = volvoxai_engine_graph_output_name(0);
-    if (!output_name || !output_name[0]) {
-        volvoxai_engine_shutdown();
-        volvoxai_tokenizer_free(tok);
-        fprintf(stderr, "Model has no primary graph output.\n");
-        return 1;
-    }
-
-    const char* token_defaults[] = {"tokens", "input_ids"};
-    const char* token_name = find_graph_input(NULL, token_defaults, 2);
-    long n = 0;
-    int token_dtype = -1;
-    if (!token_name || token_input_info(token_name, &n, &token_dtype) != 0) {
-        volvoxai_engine_shutdown();
-        volvoxai_tokenizer_free(tok);
-        fprintf(stderr, "Model has no I32/F32 token input named 'tokens' or 'input_ids'.\n");
-        return 1;
-    }
-    int32_t* tok_in = (int32_t*)malloc((size_t)n * sizeof(int32_t));
-    if (!tok_in) {
-        volvoxai_engine_shutdown();
-        volvoxai_tokenizer_free(tok);
-        return 1;
-    }
-    int cap = n < 4096 ? (int)n : 4096;
-    int tokens[4096];
-    t0 = now_ms();
-    int num_tokens = volvoxai_tokenizer_encode(tok, prompt, tokens, cap);
-    if (num_tokens <= 0) {
-        tokens[0] = pad_token;
-        num_tokens = 1;
-    }
-    if (num_tokens > cap) num_tokens = cap;
-    if (engine.debug) {
-        fprintf(stderr, "[debug] tokenizer_encode tokens=%d %.3f ms\n",
-                num_tokens, now_ms() - t0);
-    }
-    for (long i = 0; i < n; i++) tok_in[i] = pad_token;
-    for (int i = 0; i < num_tokens; i++) tok_in[i] = tokens[i];
-    if (set_token_input(token_name, token_dtype, tok_in, n) != 0) {
-        free(tok_in);
-        volvoxai_engine_shutdown();
-        volvoxai_tokenizer_free(tok);
-        fprintf(stderr, "Cannot set token input: %s\n", token_name);
-        return 1;
-    }
-
-    const char* position_defaults[] = {"positions", "position_ids"};
-    const char* position_name = find_graph_input(NULL, position_defaults, 2);
-    if (position_name) {
-        long position_n = 0;
-        int position_dtype = -1;
-        if (token_input_info(position_name, &position_n, &position_dtype) != 0) {
-            free(tok_in);
-            volvoxai_engine_shutdown();
-            volvoxai_tokenizer_free(tok);
-            return 1;
-        }
-        int32_t* positions = (int32_t*)malloc((size_t)position_n * sizeof(int32_t));
-        if (!positions) {
-            free(tok_in);
-            volvoxai_engine_shutdown();
-            volvoxai_tokenizer_free(tok);
-            return 1;
-        }
-        for (long i = 0; i < position_n; i++) positions[i] = (int32_t)i;
-        int position_rc = set_token_input(position_name, position_dtype, positions, position_n);
-        free(positions);
-        if (position_rc != 0) {
-            free(tok_in);
-            volvoxai_engine_shutdown();
-            volvoxai_tokenizer_free(tok);
-            fprintf(stderr, "Cannot set position input: %s\n", position_name);
-            return 1;
-        }
-    }
-
-    printf("Encoded prompt into %d tokens.\n\n%s", num_tokens, prompt);
-    fflush(stdout);
-
-    if (engine.debug) volvoxai_engine_profile_reset();
-    t0 = now_ms();
-    if (volvoxai_engine_forward_prefix(num_tokens) != 0) {
-        free(tok_in);
-        volvoxai_engine_shutdown();
-        volvoxai_tokenizer_free(tok);
-        fprintf(stderr, "\nNative prefill failed.\n");
-        return 1;
-    }
-    if (engine.debug) {
-        fprintf(stderr, "[debug] prefill tokens=%d %.3f ms\n",
-                num_tokens, now_ms() - t0);
-    }
-
-    int pos = num_tokens - 1;
-    int generated = 0;
-    int result = 0;
-    double gen_t0 = now_ms();
-    for (int step = 0; step < max_new && pos < cap - 1; step++) {
-        int vocab_count = 0;
-        const float* logits = volvoxai_engine_tensor_row_f32(
-            output_name, pos, &vocab_count);
-        if (!logits || vocab_count <= 0) {
-            fprintf(stderr, "\nCannot read logits row %d from %s.\n", pos, output_name);
-            result = 1;
-            break;
-        }
-        int best_id = 0;
-        float best_val = -1e30f;
-        for (int i = 0; i < vocab_count; i++) {
-            if (logits[i] > best_val) { best_val = logits[i]; best_id = i; }
-        }
-        printf("%s", volvoxai_tokenizer_decode(tok, best_id));
-        fflush(stdout);
-        generated++;
-        if (best_id == eos_token) break;
-        pos++;
-        tok_in[pos] = best_id;
-        if (set_token_input(token_name, token_dtype, tok_in, n) != 0) {
-            fprintf(stderr, "\nCannot update token input: %s\n", token_name);
-            result = 1;
-            break;
-        }
-        double dec_t0 = now_ms();
-        if (volvoxai_engine_forward_row(pos) != 0) {
-            fprintf(stderr, "\nNative decode failed.\n");
-            result = 1;
-            break;
-        }
-        if (engine.debug) {
-            fprintf(stderr, "[debug] decode step=%d pos=%d token=%d logit=%.5f %.3f ms\n",
-                    step, pos, best_id, best_val, now_ms() - dec_t0);
-        }
-    }
-    if (engine.debug) {
-        double gen_ms = now_ms() - gen_t0;
-        double tps = generated > 0 && gen_ms > 0.0 ? (double)generated * 1000.0 / gen_ms : 0.0;
-        fprintf(stderr, "[debug] generate tokens=%d total=%.3f ms tok/s=%.2f\n", generated, gen_ms, tps);
-        volvoxai_engine_profile_report();
-    }
-    printf("\n");
-
-    free(tok_in);
-    volvoxai_engine_shutdown();
-    volvoxai_tokenizer_free(tok);
+    if (write_selected_outputs(&session, &options) == 0) result = 0;
+cleanup:
+    session_close(&session);
     return result;
 }
 
@@ -2212,26 +1144,15 @@ int main(int argc, char** argv) {
     }
     if (!strcmp(argv[1], "--version") || !strcmp(argv[1], "-V") ||
         !strcmp(argv[1], "version")) {
-        print_release_info();
+        printf("VolvoxAI Native Task Example %s (commit %s, built %s)\n",
+               VOLVOXAI_VERSION, VOLVOXAI_GIT_COMMIT, VOLVOXAI_BUILD_DATE);
         return 0;
     }
-
-    int rc = 0;
-    if (!strcmp(argv[1], "run")) rc = command_run(argc, argv);
-    else if (!strcmp(argv[1], "generate")) rc = command_generate(argc, argv);
-    else if (!strcmp(argv[1], "classify")) rc = command_classify(argc, argv);
-    else if (!strcmp(argv[1], "detect")) rc = command_detect(argc, argv);
-    else if (!strcmp(argv[1], "ctc")) rc = command_ctc(argc, argv);
-    else if (!strcmp(argv[1], "seq2seq")) rc = command_seq2seq_like(argc, argv, 0);
-    else if (!strcmp(argv[1], "chat")) rc = command_seq2seq_like(argc, argv, 1);
-#if VOLVOXAI_ENABLE_TRAINING
-    else if (!strcmp(argv[1], "train")) rc = command_train(argc, argv);
-#endif
-    else {
-        fprintf(stderr, "Unknown command: %s\n\n", argv[1]);
-        print_root_help(argv[0]);
-        rc = 2;
-    }
-
-    return rc;
+    if (!strcmp(argv[1], "run")) return command_run(argc, argv);
+    if (!strcmp(argv[1], "classify")) return command_classify(argc, argv);
+    if (!strcmp(argv[1], "detect")) return command_detect(argc, argv);
+    if (!strcmp(argv[1], "decode")) return command_decode(argc, argv);
+    fprintf(stderr, "Unknown command: %s\n\n", argv[1]);
+    print_root_help(argv[0]);
+    return 2;
 }

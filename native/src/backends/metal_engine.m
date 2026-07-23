@@ -1,7 +1,12 @@
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
 #import "metal_engine.h"
+#include "runtime_state.h"
 #include "shader_store.h"
+#include "expand_f32_plan.h"
+#include "qbatch_matmul_plan.h"
+#include "qlinear_multiplier.h"
+#include "typed_control_plan.h"
 
 #include <math.h>
 #include <stdint.h>
@@ -40,9 +45,6 @@
 } while (0)
 #endif
 
-static id<MTLDevice> device = nil;
-static id<MTLCommandQueue> commandQueue = nil;
-
 typedef struct {
     const char* name;
     const char* path;
@@ -51,9 +53,6 @@ typedef struct {
     int wg_x;
     int wg_y;
     int wg_z;
-    id<MTLComputePipelineState> pipeline;
-    int ready;
-    int failed;
 } MetalKernel;
 
 typedef struct {
@@ -99,35 +98,6 @@ typedef struct {
 } MetalTrainingTensorSlot;
 #endif
 
-static MetalTensorSlot graph_slots[METAL_GRAPH_MAX_TENSORS];
-static int graph_slot_count = 0;
-
-/* Inference dispatches are encoded into one command buffer per graph forward.
- * Keep every bound resource alive until completion: most operator wrappers own
- * a short-lived params buffer, and a few own temporary scale/bias buffers that
- * used to be safe only because dispatch_kernel() waited synchronously. */
-static id<MTLCommandBuffer> graph_command = nil;
-static id<MTLBuffer> graph_retained_bindings[METAL_GRAPH_MAX_RETAINED_BINDINGS];
-static int graph_retained_binding_count = 0;
-static int graph_forward_active = 0;
-static int graph_forward_error = 0;
-
-#ifdef VOLVOX_METAL_TESTING
-static uint64_t graph_debug_dispatch_count = 0;
-static uint64_t graph_debug_commit_count = 0;
-static uint64_t graph_debug_wait_count = 0;
-#endif
-
-/* QGroupNorm statistics are backend-only F32 scratch, retained and grown
- * across forwards without becoming a graph-visible activation tensor. */
-static id<MTLBuffer> qgroupnorm_stats_buffer = nil;
-static size_t qgroupnorm_stats_capacity = 0;
-
-/* QLayerNorm keeps a separate grow-on-demand F32 row-statistics buffer. It
- * is backend-owned scratch rather than graph-visible activation storage. */
-static id<MTLBuffer> qlayernorm_stats_buffer = nil;
-static size_t qlayernorm_stats_capacity = 0;
-
 /* A QConv2D without I32 bias must bind durable zero storage sized for its
  * output channels. Blocks remain valid through graph residency and release at
  * backend cleanup. */
@@ -137,25 +107,13 @@ typedef struct QConvZeroBiasBacking {
     struct QConvZeroBiasBacking* next;
 } QConvZeroBiasBacking;
 
-static QConvZeroBiasBacking* qconv_zero_bias_backings = NULL;
 static const int32_t* qconv_zero_bias_get(uint32_t output_channels);
-static void qconv_zero_bias_release(void);
+static void qconv_zero_bias_release_state(void* opaque_state);
 
 /* qSDPAInt8 always needs a conventional I32 storage binding for its mask. */
 static const int32_t qsdpa_dummy_mask[1] = {0};
 
 #if VOLVOXAI_ENABLE_TRAINING
-/* All of this state stays zero/nil until metal_training_begin/dispatch. */
-static int training_active = 0;
-static MetalTrainingKernel training_kernels[METAL_TRAINING_MAX_KERNELS];
-static int training_kernel_count = 0;
-static MetalTrainingTensorSlot training_slots[METAL_GRAPH_MAX_TENSORS];
-static int training_slot_count = 0;
-static id<MTLCommandBuffer> training_command = nil;
-static id<MTLComputeCommandEncoder> training_encoder = nil;
-static id<MTLBuffer> training_transients[METAL_TRAINING_MAX_TRANSIENTS];
-static int training_transient_count = 0;
-
 static const MetalTrainingShaderDesc training_shader_descs[] = {
     {"activationBackward", 5, 64, 1, 1, 0x008u, {"main", NULL}},
     {"basicBackward", 6, 64, 1, 1, 0x018u, {"a_main", "b_main", NULL}},
@@ -188,93 +146,215 @@ static const MetalTrainingShaderDesc training_shader_descs[] = {
 };
 #endif
 
-static MetalKernel k_mul = {"mul", METAL_SHADER_DIR "/mul.metal", 4, 3, 64, 1, 1, nil, 0, 0};
-static MetalKernel k_sub = {"sub", METAL_SHADER_DIR "/sub.metal", 4, 3, 64, 1, 1, nil, 0, 0};
-static MetalKernel k_div = {"div", METAL_SHADER_DIR "/div.metal", 4, 3, 64, 1, 1, nil, 0, 0};
-static MetalKernel k_broadcast_binary = {"broadcastBinaryNative", METAL_SHADER_DIR "/broadcastBinaryNative.metal", 4, -1, 64, 1, 1, nil, 0, 0};
-static MetalKernel k_split = {"split", METAL_SHADER_DIR "/split.metal", 3, 2, 64, 1, 1, nil, 0, 0};
-static MetalKernel k_conv1d = {"conv1D", METAL_SHADER_DIR "/conv1D.metal", 5, 4, 64, 1, 1, nil, 0, 0};
-static MetalKernel k_embedding = {"embedding", METAL_SHADER_DIR "/embedding.metal", 4, 3, 64, 1, 1, nil, 0, 0};
-static MetalKernel k_sdpa = {"sDPA", METAL_SHADER_DIR "/sDPA.metal", 4, 3, 64, 1, 1, nil, 0, 0};
-static MetalKernel k_cross_sdpa = {"crossSDPA", METAL_SHADER_DIR "/crossSDPA.metal", 6, 5, 64, 1, 1, nil, 0, 0};
-#if VOLVOXAI_ENABLE_TRAINING
-static MetalKernel k_sdpa_training = {"sdpaTraining", METAL_SHADER_DIR "/sdpaTraining.metal", 4, 3, 64, 1, 1, nil, 0, 0};
-static MetalKernel k_cross_sdpa_training = {"crossSdpaTraining", METAL_SHADER_DIR "/crossSdpaTraining.metal", 6, 5, 64, 1, 1, nil, 0, 0};
-#endif
-static MetalKernel k_cross_attention = {"crossAttentionF32", METAL_SHADER_DIR "/crossAttentionF32.metal", 7, 6, 64, 1, 1, nil, 0, 0};
-static MetalKernel k_quantize = {"quantizeLinear", METAL_SHADER_DIR "/quantizeLinear.metal", 3, 2, 64, 1, 1, nil, 0, 0};
-static MetalKernel k_dequantize = {"dequantizeLinear", METAL_SHADER_DIR "/dequantizeLinear.metal", 5, 4, 64, 1, 1, nil, 0, 0};
-static MetalKernel k_qlinear_int8 = {"qLinearInt8", METAL_SHADER_DIR "/qLinearInt8.metal", 7, 6, 64, 1, 1, nil, 0, 0};
-static MetalKernel k_qlinear_int8_tiled = {"qLinearInt8Tiled", METAL_SHADER_DIR "/qLinearInt8Tiled.metal", 7, 6, 8, 8, 1, nil, 0, 0};
-static MetalKernel k_qembedding_int8 = {"qEmbeddingInt8", METAL_SHADER_DIR "/qEmbeddingInt8.metal", 6, 5, 64, 1, 1, nil, 0, 0};
-static MetalKernel k_qconv2d_int8 = {"qConv2DInt8", METAL_SHADER_DIR "/qConv2DInt8.metal", 7, 6, 64, 1, 1, nil, 0, 0};
-static MetalKernel k_quantize_typed_i8u8 = {"quantizeLinearTyped", METAL_SHADER_DIR "/quantizeLinearTyped.metal", 5, 4, 64, 1, 1, nil, 0, 0};
-static MetalKernel k_dequantize_typed_i8u8 = {"dequantizeLinearTyped", METAL_SHADER_DIR "/dequantizeLinearTyped.metal", 5, 4, 64, 1, 1, nil, 0, 0};
-static MetalKernel k_qadd_i8u8 = {"qAdd", METAL_SHADER_DIR "/qAdd.metal", 4, 3, 64, 1, 1, nil, 0, 0};
-static MetalKernel k_qsilu_i8u8 = {"qSiLUInt8", METAL_SHADER_DIR "/qSiLUInt8.metal", 3, 2, 64, 1, 1, nil, 0, 0};
-static MetalKernel k_qgelu_i8u8 = {"qGELUInt8", METAL_SHADER_DIR "/qGELUInt8.metal", 3, 2, 64, 1, 1, nil, 0, 0};
-static MetalKernel k_qgroupnorm_stats = {"qGroupNormStats", METAL_SHADER_DIR "/qGroupNormStats.metal", 3, 2, 64, 1, 1, nil, 0, 0};
-static MetalKernel k_qgroupnorm_apply = {"qGroupNormApply", METAL_SHADER_DIR "/qGroupNormApply.metal", 6, 5, 64, 1, 1, nil, 0, 0};
-static MetalKernel k_qlayernorm_stats = {"qLayerNormStats", METAL_SHADER_DIR "/qLayerNormStats.metal", 3, 2, 64, 1, 1, nil, 0, 0};
-static MetalKernel k_qlayernorm_apply = {"qLayerNormApply", METAL_SHADER_DIR "/qLayerNormApply.metal", 6, 5, 64, 1, 1, nil, 0, 0};
-static MetalKernel k_qsdpa_int8 = {"qSDPAInt8", METAL_SHADER_DIR "/qSDPAInt8.metal", 6, 5, 32, 1, 1, nil, 0, 0};
-static MetalKernel k_qargmax_int8 = {"qArgMaxInt8", METAL_SHADER_DIR "/qArgMaxInt8.metal", 3, 2, 64, 1, 1, nil, 0, 0};
-static MetalKernel k_qmaskedmean_int8 = {"qMaskedMeanInt8", METAL_SHADER_DIR "/qMaskedMeanInt8.metal", 4, 3, 64, 1, 1, nil, 0, 0};
-static MetalKernel k_requantize_linear_i8u8 = {"requantizeLinearTyped", METAL_SHADER_DIR "/requantizeLinearTyped.metal", 3, 2, 64, 1, 1, nil, 0, 0};
-static MetalKernel k_copy_typed_i8u8 = {"copyTyped", METAL_SHADER_DIR "/copyTyped.metal", 3, 2, 64, 1, 1, nil, 0, 0};
-static MetalKernel k_concat_typed_i8u8 = {"concatCopyTyped", METAL_SHADER_DIR "/concatCopyTyped.metal", 3, 2, 64, 1, 1, nil, 0, 0};
-static MetalKernel k_maxpool_typed_i8u8 = {"maxPool2DTyped", METAL_SHADER_DIR "/maxPool2DTyped.metal", 3, 2, 64, 1, 1, nil, 0, 0};
-static MetalKernel k_resize_nearest_typed_i8u8 = {"resizeNearestTyped", METAL_SHADER_DIR "/resizeNearestTyped.metal", 3, 2, 64, 1, 1, nil, 0, 0};
-static MetalKernel k_spatial_softargmax_y = {"spatialSoftargmaxY", METAL_SHADER_DIR "/spatialSoftargmaxY.metal", 3, 2, 64, 1, 1, nil, 0, 0};
-static MetalKernel k_profile_x = {"profileX", METAL_SHADER_DIR "/profileX.metal", 3, 2, 64, 1, 1, nil, 0, 0};
-static MetalKernel k_profile_y = {"profileY", METAL_SHADER_DIR "/profileY.metal", 3, 2, 64, 1, 1, nil, 0, 0};
-static MetalKernel k_mean_height = {"meanHeight", METAL_SHADER_DIR "/meanHeight.metal", 3, 2, 64, 1, 1, nil, 0, 0};
-static MetalKernel k_nms = {"nonMaxSuppression", METAL_SHADER_DIR "/nonMaxSuppression.metal", 4, 3, 1, 1, 1, nil, 0, 0};
-static MetalKernel k_copy = {"copy", METAL_SHADER_DIR "/copy.metal", 3, 2, 64, 1, 1, nil, 0, 0};
-static MetalKernel k_add = {"add", METAL_SHADER_DIR "/add.metal", 4, 3, 64, 1, 1, nil, 0, 0};
-static MetalKernel k_gelu = {"gELU", METAL_SHADER_DIR "/gELU.metal", 3, 2, 64, 1, 1, nil, 0, 0};
-static MetalKernel k_silu = {"siLU", METAL_SHADER_DIR "/siLU.metal", 3, 2, 64, 1, 1, nil, 0, 0};
-static MetalKernel k_layernorm = {"layerNorm", METAL_SHADER_DIR "/layerNorm.metal", 5, 4, 64, 1, 1, nil, 0, 0};
-static MetalKernel k_groupnorm = {"groupNorm", METAL_SHADER_DIR "/groupNorm.metal", 5, 4, 64, 1, 1, nil, 0, 0};
-#if VOLVOXAI_ENABLE_TRAINING
-static MetalKernel k_dropout = {"dropout", METAL_SHADER_DIR "/dropout.metal", 3, 2, 64, 1, 1, nil, 0, 0};
-#endif
-static MetalKernel k_reduce = {"reduce", METAL_SHADER_DIR "/reduce.metal", 3, 2, 64, 1, 1, nil, 0, 0};
-static MetalKernel k_transpose = {"generalTranspose", METAL_SHADER_DIR "/generalTranspose.metal", 3, -1, 64, 1, 1, nil, 0, 0};
-static MetalKernel k_concat = {"concatCopy", METAL_SHADER_DIR "/concatCopy.metal", 3, 2, 64, 1, 1, nil, 0, 0};
-static MetalKernel k_linear_in_out = {"linearF32RowMajor", METAL_SHADER_DIR "/linearF32RowMajor.metal", 5, 4, 64, 1, 1, nil, 0, 0};
-static MetalKernel k_linear_in_out_tiled = {"linearF32RowMajorTiled", METAL_SHADER_DIR "/linearF32RowMajorTiled.metal", 5, 4, 8, 8, 1, nil, 0, 0};
-static MetalKernel k_linear_out_in = {"linearF32", METAL_SHADER_DIR "/linearF32.metal", 6, 5, 64, 1, 1, nil, 0, 0};
-static MetalKernel k_linear_out_in_tiled = {"linearF32Tiled", METAL_SHADER_DIR "/linearF32Tiled.metal", 6, 5, 8, 8, 1, nil, 0, 0};
-static MetalKernel k_conv2d = {"conv2D", METAL_SHADER_DIR "/conv2D.metal", 5, 4, 8, 8, 1, nil, 0, 0};
+#define METAL_MAX_PIPELINES 128
 
-static MetalKernel* all_kernels[] = {
-    &k_mul, &k_sub, &k_div, &k_broadcast_binary, &k_split, &k_conv1d, &k_embedding, &k_sdpa, &k_cross_sdpa,
-#if VOLVOXAI_ENABLE_TRAINING
-    &k_sdpa_training, &k_cross_sdpa_training,
-#endif
-    &k_cross_attention, &k_quantize, &k_dequantize, &k_qlinear_int8,
-    &k_qlinear_int8_tiled, &k_qembedding_int8, &k_qconv2d_int8,
-    &k_quantize_typed_i8u8, &k_dequantize_typed_i8u8,
-    &k_qadd_i8u8, &k_qsilu_i8u8, &k_qgelu_i8u8,
-    &k_qgroupnorm_stats, &k_qgroupnorm_apply,
-    &k_qlayernorm_stats, &k_qlayernorm_apply, &k_qsdpa_int8, &k_qargmax_int8,
-    &k_qmaskedmean_int8,
-    &k_requantize_linear_i8u8,
-    &k_copy_typed_i8u8, &k_concat_typed_i8u8, &k_maxpool_typed_i8u8,
-    &k_resize_nearest_typed_i8u8, &k_spatial_softargmax_y,
-    &k_profile_x, &k_profile_y, &k_mean_height, &k_nms, &k_copy, &k_add,
-    &k_gelu, &k_silu, &k_layernorm, &k_groupnorm,
-#if VOLVOXAI_ENABLE_TRAINING
-    &k_dropout,
-#endif
-    &k_reduce, &k_transpose,
-    &k_concat, &k_linear_in_out, &k_linear_in_out_tiled,
-    &k_linear_out_in, &k_linear_out_in_tiled, &k_conv2d
+typedef struct {
+    const MetalKernel* descriptor;
+    id<MTLComputePipelineState> pipeline;
+    int failed;
+} MetalPipelineCacheEntry;
+
+/* The default Metal device, command queue, and model-independent inference
+ * pipeline cache form one physical submission domain. References are held by
+ * engine contexts; initialization, compilation, and final teardown are
+ * serialized by the named mutex. */
+typedef struct {
+    pthread_mutex_t mutex;
+    unsigned reference_count;
+    id<MTLDevice> device;
+    id<MTLCommandQueue> command_queue;
+    MetalPipelineCacheEntry pipelines[METAL_MAX_PIPELINES];
+    size_t pipeline_count;
+} MetalDeviceState;
+
+static MetalDeviceState g_metal_device_state = {
+    .mutex = PTHREAD_MUTEX_INITIALIZER,
 };
 
+typedef struct {
+    MetalTensorSlot graph_slot_storage[METAL_GRAPH_MAX_TENSORS];
+    int graph_slots_count;
+    /* Inference dispatches are encoded into one command buffer per graph
+     * forward. Every bound resource remains owned by this context until that
+     * command completes. */
+    id<MTLCommandBuffer> graph_command_buffer;
+    id<MTLBuffer>
+        graph_retained_binding_storage[METAL_GRAPH_MAX_RETAINED_BINDINGS];
+    int graph_retained_bindings_count;
+    int graph_is_forward_active;
+    int graph_forward_failed;
+#ifdef VOLVOX_METAL_TESTING
+    uint64_t graph_dispatch_count;
+    uint64_t graph_commit_count;
+    uint64_t graph_wait_count;
+#endif
+    id<MTLBuffer> qgroupnorm_scratch_buffer;
+    size_t qgroupnorm_scratch_capacity;
+    id<MTLBuffer> qlayernorm_scratch_buffer;
+    size_t qlayernorm_scratch_capacity;
+    QConvZeroBiasBacking* qconv_zero_bias_storage;
+#if VOLVOXAI_ENABLE_TRAINING
+    int training_is_active;
+    MetalTrainingKernel training_kernel_storage[METAL_TRAINING_MAX_KERNELS];
+    int training_kernels_count;
+    MetalTrainingTensorSlot training_slot_storage[METAL_GRAPH_MAX_TENSORS];
+    int training_slots_count;
+    id<MTLCommandBuffer> training_command_buffer;
+    id<MTLComputeCommandEncoder> training_command_encoder;
+    id<MTLBuffer> training_transient_storage[METAL_TRAINING_MAX_TRANSIENTS];
+    int training_transients_count;
+#endif
+    int device_acquired;
+} MetalContextState;
+
+static MetalContextState* metal_context_state_get(int create);
+static void metal_context_state_destroy(void* opaque_state);
+
+#define device (g_metal_device_state.device)
+#define commandQueue (g_metal_device_state.command_queue)
+#define graph_slots (metal_context_state_get(0)->graph_slot_storage)
+#define graph_slot_count (metal_context_state_get(0)->graph_slots_count)
+#define graph_command (metal_context_state_get(0)->graph_command_buffer)
+#define graph_retained_bindings \
+    (metal_context_state_get(0)->graph_retained_binding_storage)
+#define graph_retained_binding_count \
+    (metal_context_state_get(0)->graph_retained_bindings_count)
+#define graph_forward_active \
+    (metal_context_state_get(0)->graph_is_forward_active)
+#define graph_forward_error (metal_context_state_get(0)->graph_forward_failed)
+#ifdef VOLVOX_METAL_TESTING
+#define graph_debug_dispatch_count \
+    (metal_context_state_get(0)->graph_dispatch_count)
+#define graph_debug_commit_count (metal_context_state_get(0)->graph_commit_count)
+#define graph_debug_wait_count (metal_context_state_get(0)->graph_wait_count)
+#endif
+#define qgroupnorm_stats_buffer \
+    (metal_context_state_get(0)->qgroupnorm_scratch_buffer)
+#define qgroupnorm_stats_capacity \
+    (metal_context_state_get(0)->qgroupnorm_scratch_capacity)
+#define qlayernorm_stats_buffer \
+    (metal_context_state_get(0)->qlayernorm_scratch_buffer)
+#define qlayernorm_stats_capacity \
+    (metal_context_state_get(0)->qlayernorm_scratch_capacity)
+#define qconv_zero_bias_backings \
+    (metal_context_state_get(0)->qconv_zero_bias_storage)
+#if VOLVOXAI_ENABLE_TRAINING
+#define training_active (metal_context_state_get(0)->training_is_active)
+#define training_kernels \
+    (metal_context_state_get(0)->training_kernel_storage)
+#define training_kernel_count \
+    (metal_context_state_get(0)->training_kernels_count)
+#define training_slots (metal_context_state_get(0)->training_slot_storage)
+#define training_slot_count (metal_context_state_get(0)->training_slots_count)
+#define training_command \
+    (metal_context_state_get(0)->training_command_buffer)
+#define training_encoder \
+    (metal_context_state_get(0)->training_command_encoder)
+#define training_transients \
+    (metal_context_state_get(0)->training_transient_storage)
+#define training_transient_count \
+    (metal_context_state_get(0)->training_transients_count)
+#endif
+
+static const MetalKernel k_mul = {"mul", METAL_SHADER_DIR "/mul.metal", 4, 3, 64, 1, 1};
+static const MetalKernel k_sub = {"sub", METAL_SHADER_DIR "/sub.metal", 4, 3, 64, 1, 1};
+static const MetalKernel k_div = {"div", METAL_SHADER_DIR "/div.metal", 4, 3, 64, 1, 1};
+static const MetalKernel k_broadcast_binary = {"broadcastBinaryNative", METAL_SHADER_DIR "/broadcastBinaryNative.metal", 4, -1, 64, 1, 1};
+static const MetalKernel k_split = {"split", METAL_SHADER_DIR "/split.metal", 3, 2, 64, 1, 1};
+static const MetalKernel k_conv1d = {"conv1D", METAL_SHADER_DIR "/conv1D.metal", 5, 4, 64, 1, 1};
+static const MetalKernel k_embedding = {"embedding", METAL_SHADER_DIR "/embedding.metal", 4, 3, 64, 1, 1};
+static const MetalKernel k_sdpa = {"sDPA", METAL_SHADER_DIR "/sDPA.metal", 4, 3, 64, 1, 1};
+static const MetalKernel k_cross_sdpa = {"crossSDPA", METAL_SHADER_DIR "/crossSDPA.metal", 6, 5, 64, 1, 1};
+#if VOLVOXAI_ENABLE_TRAINING
+static const MetalKernel k_sdpa_training = {"sdpaTraining", METAL_SHADER_DIR "/sdpaTraining.metal", 4, 3, 64, 1, 1};
+static const MetalKernel k_cross_sdpa_training = {"crossSdpaTraining", METAL_SHADER_DIR "/crossSdpaTraining.metal", 6, 5, 64, 1, 1};
+#endif
+static const MetalKernel k_cross_attention = {"crossAttentionF32", METAL_SHADER_DIR "/crossAttentionF32.metal", 7, 6, 64, 1, 1};
+static const MetalKernel k_quantize = {"quantizeLinear", METAL_SHADER_DIR "/quantizeLinear.metal", 3, 2, 64, 1, 1};
+static const MetalKernel k_dequantize = {"dequantizeLinear", METAL_SHADER_DIR "/dequantizeLinear.metal", 5, 4, 64, 1, 1};
+static const MetalKernel k_qlinear_int8 = {"qLinearInt8", METAL_SHADER_DIR "/qLinearInt8.metal", 7, 6, 64, 1, 1};
+static const MetalKernel k_qlinear_int8_tiled = {"qLinearInt8Tiled", METAL_SHADER_DIR "/qLinearInt8Tiled.metal", 7, 6, 8, 8, 1};
+static const MetalKernel k_qembedding_int8 = {"qEmbeddingInt8", METAL_SHADER_DIR "/qEmbeddingInt8.metal", 6, 5, 64, 1, 1};
+static const MetalKernel k_qconv2d_int8 = {"qConv2DInt8", METAL_SHADER_DIR "/qConv2DInt8.metal", 7, 6, 64, 1, 1};
+static const MetalKernel k_quantize_typed_i8u8 = {"quantizeLinearTyped", METAL_SHADER_DIR "/quantizeLinearTyped.metal", 5, 4, 64, 1, 1};
+static const MetalKernel k_dequantize_typed_i8u8 = {"dequantizeLinearTyped", METAL_SHADER_DIR "/dequantizeLinearTyped.metal", 5, 4, 64, 1, 1};
+static const MetalKernel k_qadd_i8u8 = {"qAdd", METAL_SHADER_DIR "/qAdd.metal", 4, 3, 64, 1, 1};
+static const MetalKernel k_qbatch_matmul_i8u8 = {
+    "qBatchMatMul", METAL_SHADER_DIR "/qBatchMatMul.metal", 5, 4, 64, 1, 1
+};
+static const MetalKernel k_qsilu_i8u8 = {"qSiLUInt8", METAL_SHADER_DIR "/qSiLUInt8.metal", 3, 2, 64, 1, 1};
+static const MetalKernel k_qgelu_i8u8 = {"qGELUInt8", METAL_SHADER_DIR "/qGELUInt8.metal", 3, 2, 64, 1, 1};
+static const MetalKernel k_qgroupnorm_stats = {"qGroupNormStats", METAL_SHADER_DIR "/qGroupNormStats.metal", 3, 2, 64, 1, 1};
+static const MetalKernel k_qgroupnorm_apply = {"qGroupNormApply", METAL_SHADER_DIR "/qGroupNormApply.metal", 6, 5, 64, 1, 1};
+static const MetalKernel k_qlayernorm_stats = {"qLayerNormStats", METAL_SHADER_DIR "/qLayerNormStats.metal", 3, 2, 64, 1, 1};
+static const MetalKernel k_qlayernorm_apply = {"qLayerNormApply", METAL_SHADER_DIR "/qLayerNormApply.metal", 6, 5, 64, 1, 1};
+static const MetalKernel k_qsdpa_int8 = {"qSDPAInt8", METAL_SHADER_DIR "/qSDPAInt8.metal", 6, 5, 32, 1, 1};
+static const MetalKernel k_qargmax_int8 = {"qArgMaxInt8", METAL_SHADER_DIR "/qArgMaxInt8.metal", 3, 2, 64, 1, 1};
+static const MetalKernel k_qmaskedmean_int8 = {"qMaskedMeanInt8", METAL_SHADER_DIR "/qMaskedMeanInt8.metal", 4, 3, 64, 1, 1};
+static const MetalKernel k_requantize_linear_i8u8 = {"requantizeLinearTyped", METAL_SHADER_DIR "/requantizeLinearTyped.metal", 3, 2, 64, 1, 1};
+static const MetalKernel k_copy_typed_i8u8 = {"copyTyped", METAL_SHADER_DIR "/copyTyped.metal", 3, 2, 64, 1, 1};
+static const MetalKernel k_concat_typed_i8u8 = {"concatCopyTyped", METAL_SHADER_DIR "/concatCopyTyped.metal", 3, 2, 64, 1, 1};
+static const MetalKernel k_maxpool_typed_i8u8 = {"maxPool2DTyped", METAL_SHADER_DIR "/maxPool2DTyped.metal", 3, 2, 64, 1, 1};
+static const MetalKernel k_resize_nearest_typed_i8u8 = {"resizeNearestTyped", METAL_SHADER_DIR "/resizeNearestTyped.metal", 3, 2, 64, 1, 1};
+static const MetalKernel k_transpose_typed_i8u8 = {"transposeTyped", METAL_SHADER_DIR "/transposeTyped.metal", 3, -1, 64, 1, 1};
+static const MetalKernel k_spatial_softargmax_y = {"spatialSoftargmaxY", METAL_SHADER_DIR "/spatialSoftargmaxY.metal", 3, 2, 64, 1, 1};
+static const MetalKernel k_profile_x = {"profileX", METAL_SHADER_DIR "/profileX.metal", 3, 2, 64, 1, 1};
+static const MetalKernel k_profile_y = {"profileY", METAL_SHADER_DIR "/profileY.metal", 3, 2, 64, 1, 1};
+static const MetalKernel k_mean_height = {"meanHeight", METAL_SHADER_DIR "/meanHeight.metal", 3, 2, 64, 1, 1};
+static const MetalKernel k_nms = {"nonMaxSuppression", METAL_SHADER_DIR "/nonMaxSuppression.metal", 4, 3, 1, 1, 1};
+static const MetalKernel k_copy = {"copy", METAL_SHADER_DIR "/copy.metal", 3, 2, 64, 1, 1};
+static const MetalKernel k_add = {"add", METAL_SHADER_DIR "/add.metal", 4, 3, 64, 1, 1};
+static const MetalKernel k_sigmoid = {"sigmoid", METAL_SHADER_DIR "/sigmoid.metal", 3, 2, 64, 1, 1};
+static const MetalKernel k_gelu = {"gELU", METAL_SHADER_DIR "/gELU.metal", 3, 2, 64, 1, 1};
+static const MetalKernel k_silu = {"siLU", METAL_SHADER_DIR "/siLU.metal", 3, 2, 64, 1, 1};
+static const MetalKernel k_layernorm = {"layerNorm", METAL_SHADER_DIR "/layerNorm.metal", 5, 4, 64, 1, 1};
+static const MetalKernel k_groupnorm = {"groupNorm", METAL_SHADER_DIR "/groupNorm.metal", 5, 4, 64, 1, 1};
+#if VOLVOXAI_ENABLE_TRAINING
+static const MetalKernel k_dropout = {"dropout", METAL_SHADER_DIR "/dropout.metal", 3, 2, 64, 1, 1};
+#endif
+static const MetalKernel k_softmax = {"softmax", METAL_SHADER_DIR "/softmax.metal", 3, 2, 64, 1, 1};
+static const MetalKernel k_reduce = {"reduce", METAL_SHADER_DIR "/reduce.metal", 3, 2, 64, 1, 1};
+static const MetalKernel k_transpose = {"generalTranspose", METAL_SHADER_DIR "/generalTranspose.metal", 3, -1, 64, 1, 1};
+static const MetalKernel k_expand = {"expand", METAL_SHADER_DIR "/expand.metal", 3, 2, 64, 1, 1};
+static const MetalKernel k_gather = {"gather", METAL_SHADER_DIR "/gather.metal", 4, 3, 64, 1, 1};
+static const MetalKernel k_slice = {"slice", METAL_SHADER_DIR "/slice.metal", 3, 2, 64, 1, 1};
+static const MetalKernel k_concat = {"concatCopy", METAL_SHADER_DIR "/concatCopy.metal", 3, 2, 64, 1, 1};
+static const MetalKernel k_typed_control_32 = {"typedControl32Native", METAL_SHADER_DIR "/typedControl32Native.metal", 4, -1, 64, 1, 1};
+static const MetalKernel k_where_32 = {"where32Native", METAL_SHADER_DIR "/where32Native.metal", 5, 4, 64, 1, 1};
+static const MetalKernel k_argmax_f32_i32 = {"argMaxF32I32Native", METAL_SHADER_DIR "/argMaxF32I32Native.metal", 3, 2, 64, 1, 1};
+static const MetalKernel k_concat_32 = {"concatCopy32Native", METAL_SHADER_DIR "/concatCopy32Native.metal", 3, 2, 64, 1, 1};
+static const MetalKernel k_linear_in_out = {"linearF32RowMajor", METAL_SHADER_DIR "/linearF32RowMajor.metal", 5, 4, 64, 1, 1};
+static const MetalKernel k_linear_in_out_tiled = {"linearF32RowMajorTiled", METAL_SHADER_DIR "/linearF32RowMajorTiled.metal", 5, 4, 8, 8, 1};
+static const MetalKernel k_linear_out_in = {"linearF32", METAL_SHADER_DIR "/linearF32.metal", 6, 5, 64, 1, 1};
+static const MetalKernel k_linear_out_in_tiled = {"linearF32Tiled", METAL_SHADER_DIR "/linearF32Tiled.metal", 6, 5, 8, 8, 1};
+static const MetalKernel k_conv2d = {"conv2D", METAL_SHADER_DIR "/conv2D.metal", 5, 4, 8, 8, 1};
+
+static MetalContextState* metal_context_state_get(int create) {
+    VxEngineState* owner = vx_engine_state_current();
+    if (!owner) return NULL;
+    MetalContextState* state =
+        (MetalContextState*)owner->metal_context_state;
+    if (!state && create) {
+        state = (MetalContextState*)calloc(1, sizeof(*state));
+        if (!state) return NULL;
+        owner->metal_context_state = state;
+        owner->metal_context_state_destroy = metal_context_state_destroy;
+    }
+    return state;
+}
+
+static void metal_device_lock(void) {
+    pthread_mutex_lock(&g_metal_device_state.mutex);
+}
+
+static void metal_device_unlock(void) {
+    pthread_mutex_unlock(&g_metal_device_state.mutex);
+}
+
 static int metal_ready(void) {
-    return device != nil && commandQueue != nil;
+    MetalContextState* state = metal_context_state_get(0);
+    return state && state->device_acquired && device != nil &&
+        commandQueue != nil;
 }
 
 void metal_set_shader_root(const char* root) {
@@ -309,51 +389,85 @@ static void clear_slot(MetalTensorSlot* s) {
     s->is_weight = 0;
 }
 
-static int compile_kernel(MetalKernel* k) {
-    if (!metal_ready() || !k) return 0;
-    if (k->ready) return k->pipeline != nil;
-    if (k->failed) return 0;
+static MetalPipelineCacheEntry* metal_pipeline_cache_entry(
+    const MetalKernel* descriptor, int create) {
+    if (!descriptor) return NULL;
+    for (size_t index = 0; index < g_metal_device_state.pipeline_count;
+         index++) {
+        MetalPipelineCacheEntry* entry =
+            &g_metal_device_state.pipelines[index];
+        if (entry->descriptor == descriptor) return entry;
+    }
+    if (!create ||
+        g_metal_device_state.pipeline_count >= METAL_MAX_PIPELINES) return NULL;
+    MetalPipelineCacheEntry* entry = &g_metal_device_state.pipelines[
+        g_metal_device_state.pipeline_count++];
+    memset(entry, 0, sizeof(*entry));
+    entry->descriptor = descriptor;
+    return entry;
+}
+
+static id<MTLComputePipelineState> compile_kernel(const MetalKernel* k) {
+    if (!metal_ready() || !k) return nil;
+    metal_device_lock();
+    MetalPipelineCacheEntry* entry = metal_pipeline_cache_entry(k, 1);
+    if (!entry || entry->failed) {
+        metal_device_unlock();
+        return nil;
+    }
+    if (entry->pipeline) {
+        id<MTLComputePipelineState> cached = entry->pipeline;
+        metal_device_unlock();
+        return cached;
+    }
     @autoreleasepool {
         NSError* error = nil;
         NSString* source = metal_shader_source(k->path);
         if (!source) {
             fprintf(stderr, "[Metal] failed to load generated shader %s\n", k->path);
-            k->failed = 1;
-            return 0;
+            entry->failed = 1;
+            metal_device_unlock();
+            return nil;
         }
 
         if ([source rangeOfString:@"[[user(fake"].location != NSNotFound) {
             fprintf(stderr, "[Metal] shader %s has unresolved Naga bindings\n", k->name);
-            k->failed = 1;
-            return 0;
+            entry->failed = 1;
+            metal_device_unlock();
+            return nil;
         }
         id<MTLLibrary> library = [device newLibraryWithSource:source options:nil error:&error];
         if (!library) {
             fprintf(stderr, "[Metal] shader compile failed (%s): %s\n",
                     k->name, error ? [[error localizedDescription] UTF8String] : "unknown error");
-            k->failed = 1;
-            return 0;
+            entry->failed = 1;
+            metal_device_unlock();
+            return nil;
         }
 
         id<MTLFunction> fn = [library newFunctionWithName:@"main_"];
         if (!fn) {
             fprintf(stderr, "[Metal] shader entry main_ not found (%s)\n", k->name);
             VX_METAL_RELEASE(library);
-            k->failed = 1;
-            return 0;
+            entry->failed = 1;
+            metal_device_unlock();
+            return nil;
         }
 
-        k->pipeline = [device newComputePipelineStateWithFunction:fn error:&error];
+        entry->pipeline =
+            [device newComputePipelineStateWithFunction:fn error:&error];
         VX_METAL_RELEASE(fn);
         VX_METAL_RELEASE(library);
-        if (!k->pipeline) {
+        if (!entry->pipeline) {
             fprintf(stderr, "[Metal] pipeline creation failed (%s): %s\n",
                     k->name, error ? [[error localizedDescription] UTF8String] : "unknown error");
-            k->failed = 1;
-            return 0;
+            entry->failed = 1;
+            metal_device_unlock();
+            return nil;
         }
-        k->ready = 1;
-        return 1;
+        id<MTLComputePipelineState> pipeline = entry->pipeline;
+        metal_device_unlock();
+        return pipeline;
     }
 }
 
@@ -766,13 +880,15 @@ static int graph_ensure_command(void) {
     return 0;
 }
 
-static int dispatch_kernel(MetalKernel* k, const MetalBinding* binds,
+static int dispatch_kernel(const MetalKernel* k, const MetalBinding* binds,
                            uint32_t gx, uint32_t gy, uint32_t gz) {
-    if (!compile_kernel(k) || !binds || gx == 0 || gy == 0 || gz == 0) return 0;
+    id<MTLComputePipelineState> pipeline = compile_kernel(k);
+    if (!pipeline || !binds || gx == 0 || gy == 0 || gz == 0) return 0;
     if (k->binding_count <= 0 || k->binding_count >= METAL_MAX_BINDINGS) return 0;
     uint64_t threads_per_group = (uint64_t)k->wg_x * (uint64_t)k->wg_y * (uint64_t)k->wg_z;
     if (threads_per_group == 0 ||
-        threads_per_group > (uint64_t)[k->pipeline maxTotalThreadsPerThreadgroup]) return 0;
+        threads_per_group >
+            (uint64_t)[pipeline maxTotalThreadsPerThreadgroup]) return 0;
     uint32_t sizes[METAL_MAX_BINDINGS] = {0};
     for (int i = 0; i < k->binding_count; i++) {
         if (!binds[i].buffer || binds[i].bytes == 0) return 0;
@@ -799,7 +915,7 @@ static int dispatch_kernel(MetalKernel* k, const MetalBinding* binds,
             if (graph_flush_commands() != 0) graph_forward_error = 1;
             return 0;
         }
-        [enc setComputePipelineState:k->pipeline];
+        [enc setComputePipelineState:pipeline];
 
         for (int i = 0; i < k->binding_count; i++) {
             [enc setBuffer:binds[i].buffer offset:0 atIndex:(NSUInteger)i];
@@ -827,22 +943,39 @@ static int dispatch_kernel(MetalKernel* k, const MetalBinding* binds,
 }
 
 int metal_init(void) {
+    MetalContextState* state = metal_context_state_get(1);
+    if (!state) return -1;
+    metal_device_lock();
+    if (state->device_acquired) {
+        metal_device_unlock();
+        return 0;
+    }
+    if (g_metal_device_state.reference_count != 0) {
+        g_metal_device_state.reference_count++;
+        state->device_acquired = 1;
+        metal_device_unlock();
+        return 0;
+    }
     @autoreleasepool {
-        if (metal_ready()) return 0;
         device = MTLCreateSystemDefaultDevice();
         if (!device) {
             printf("[VolvoxAI GPU] Metal is not supported on this device.\n");
+            metal_device_unlock();
             return -1;
         }
         commandQueue = [device newCommandQueue];
         if (!commandQueue) {
             printf("[VolvoxAI GPU] Failed to create Metal command queue.\n");
             VX_METAL_RELEASE(device);
+            metal_device_unlock();
             return -1;
         }
         const char* name = [[device name] UTF8String];
         printf("[VolvoxAI GPU] Metal initialized successfully on: %s\n", name ? name : "unknown");
     }
+    g_metal_device_state.reference_count = 1;
+    state->device_acquired = 1;
+    metal_device_unlock();
     return 0;
 }
 
@@ -1074,31 +1207,94 @@ void metal_graph_debug_counters(uint64_t* dispatches, uint64_t* commits,
 }
 #endif
 
-void metal_cleanup(void) {
+static void metal_context_resources_release(MetalContextState* state) {
+    if (!state) return;
     @autoreleasepool {
 #if VOLVOXAI_ENABLE_TRAINING
-        metal_training_end();
-        for (int i = 0; i < training_kernel_count; i++) {
-            VX_METAL_RELEASE(training_kernels[i].pipeline);
-            training_kernels[i].shader[0] = 0;
-            training_kernels[i].entry[0] = 0;
+        if (state->training_command_encoder) {
+            [state->training_command_encoder endEncoding];
+            VX_METAL_RELEASE(state->training_command_encoder);
         }
-        training_kernel_count = 0;
+        if (state->training_command_buffer) {
+            [state->training_command_buffer commit];
+            [state->training_command_buffer waitUntilCompleted];
+            VX_METAL_RELEASE(state->training_command_buffer);
+        }
+        for (int index = 0; index < state->training_transients_count; index++)
+            VX_METAL_RELEASE(state->training_transient_storage[index]);
+        state->training_transients_count = 0;
+        for (int index = 0; index < state->training_slots_count; index++)
+            training_clear_slot(&state->training_slot_storage[index]);
+        state->training_slots_count = 0;
+        state->training_is_active = 0;
+        for (int index = 0; index < state->training_kernels_count; index++) {
+            VX_METAL_RELEASE(state->training_kernel_storage[index].pipeline);
+            state->training_kernel_storage[index].shader[0] = 0;
+            state->training_kernel_storage[index].entry[0] = 0;
+        }
+        state->training_kernels_count = 0;
 #endif
-        metal_graph_reset();
-        VX_METAL_RELEASE(qgroupnorm_stats_buffer);
-        qgroupnorm_stats_capacity = 0;
-        VX_METAL_RELEASE(qlayernorm_stats_buffer);
-        qlayernorm_stats_capacity = 0;
-        qconv_zero_bias_release();
-        for (size_t i = 0; i < sizeof(all_kernels) / sizeof(all_kernels[0]); i++) {
-            VX_METAL_RELEASE(all_kernels[i]->pipeline);
-            all_kernels[i]->ready = 0;
-            all_kernels[i]->failed = 0;
+        if (state->graph_command_buffer) {
+            [state->graph_command_buffer commit];
+            [state->graph_command_buffer waitUntilCompleted];
+            VX_METAL_RELEASE(state->graph_command_buffer);
         }
+        for (int index = 0;
+             index < state->graph_retained_bindings_count; index++)
+            VX_METAL_RELEASE(state->graph_retained_binding_storage[index]);
+        state->graph_retained_bindings_count = 0;
+        state->graph_is_forward_active = 0;
+        state->graph_forward_failed = 0;
+        for (int index = 0; index < state->graph_slots_count; index++)
+            clear_slot(&state->graph_slot_storage[index]);
+        state->graph_slots_count = 0;
+        VX_METAL_RELEASE(state->qgroupnorm_scratch_buffer);
+        state->qgroupnorm_scratch_capacity = 0;
+        VX_METAL_RELEASE(state->qlayernorm_scratch_buffer);
+        state->qlayernorm_scratch_capacity = 0;
+        qconv_zero_bias_release_state(state);
+    }
+}
+
+static void metal_device_shutdown_locked(void) {
+    @autoreleasepool {
+        for (size_t index = 0;
+             index < g_metal_device_state.pipeline_count; index++) {
+            VX_METAL_RELEASE(g_metal_device_state.pipelines[index].pipeline);
+            g_metal_device_state.pipelines[index].descriptor = NULL;
+            g_metal_device_state.pipelines[index].failed = 0;
+        }
+        g_metal_device_state.pipeline_count = 0;
         VX_METAL_RELEASE(commandQueue);
         VX_METAL_RELEASE(device);
     }
+    g_metal_device_state.reference_count = 0;
+}
+
+static void metal_context_state_destroy(void* opaque_state) {
+    MetalContextState* state = (MetalContextState*)opaque_state;
+    if (!state) return;
+    metal_context_resources_release(state);
+    metal_device_lock();
+    if (state->device_acquired &&
+        g_metal_device_state.reference_count != 0) {
+        state->device_acquired = 0;
+        g_metal_device_state.reference_count--;
+        if (g_metal_device_state.reference_count == 0)
+            metal_device_shutdown_locked();
+    }
+    metal_device_unlock();
+    free(state);
+}
+
+void metal_cleanup(void) {
+    VxEngineState* owner = vx_engine_state_current();
+    if (!owner || !owner->metal_context_state) return;
+    MetalContextState* state =
+        (MetalContextState*)owner->metal_context_state;
+    owner->metal_context_state = NULL;
+    owner->metal_context_state_destroy = NULL;
+    metal_context_state_destroy(state);
 }
 
 int metal_graph_alias_f32(const float* in, float* out, long n) {
@@ -1155,7 +1351,202 @@ int metal_graph_add_f32(const float* a, const float* b, float* out, long n) {
     return 1;
 }
 
-static int metal_graph_unary_f32(MetalKernel* kernel, const float* in, float* out, long n) {
+static int metal_graph_typed_control_32(
+        const void* a, size_t a_bytes, const void* b, size_t b_bytes,
+        void* output, size_t output_bytes,
+        const VxTypedControlMetadata* metadata) {
+    if (!metadata) return 0;
+    MetalTensorSlot* a_slot = graph_ensure_device(a, a_bytes, 0);
+    MetalTensorSlot* b_slot = graph_ensure_device(b, b_bytes, 0);
+    MetalTensorSlot* output_slot =
+        graph_output_slot(output, output_bytes);
+    if (!a_slot || !b_slot || !output_slot) return 0;
+    id<MTLBuffer> metadata_buffer =
+        create_buffer(sizeof(*metadata), metadata);
+    if (!metadata_buffer) return 0;
+    MetalBinding bindings[4] = {
+        {a_slot->buffer, a_bytes},
+        {b_slot->buffer, b_bytes},
+        {output_slot->buffer, output_bytes},
+        {metadata_buffer, sizeof(*metadata)},
+    };
+    uint32_t elements = metadata->values[0];
+    int ok = dispatch_kernel(
+        &k_typed_control_32, bindings,
+        (elements + 63u) / 64u, 1u, 1u);
+    VX_METAL_RELEASE(metadata_buffer);
+    if (!ok) return 0;
+    graph_mark_device(output_slot);
+    return 1;
+}
+
+int metal_graph_compare_i32(
+        const int32_t* a, long a_elements,
+        const int32_t* b, long b_elements,
+        int32_t* output, long output_elements,
+        const uint32_t* output_strides,
+        const uint32_t* a_strides,
+        const uint32_t* b_strides,
+        int rank, int operation) {
+    VxTypedControlMetadata metadata;
+    size_t a_bytes;
+    size_t b_bytes;
+    size_t output_bytes;
+    if (!vx_typed_control_compare_plan(
+            a, a_elements, b, b_elements, output, output_elements,
+            output_strides, a_strides, b_strides, rank, operation,
+            &metadata, &a_bytes, &b_bytes, &output_bytes))
+        return 0;
+    return metal_graph_typed_control_32(
+        a, a_bytes, b, b_bytes, output, output_bytes, &metadata);
+}
+
+static int metal_graph_unary_i32(
+        const int32_t* input, int32_t* output, long elements,
+        int operation, int32_t minimum, int32_t maximum) {
+    VxTypedControlMetadata metadata;
+    size_t bytes;
+    if (!vx_typed_control_unary_plan(
+            input, output, elements, operation, minimum, maximum,
+            &metadata, &bytes))
+        return 0;
+    return metal_graph_typed_control_32(
+        input, bytes, input, bytes, output, bytes, &metadata);
+}
+
+int metal_graph_not_i32(
+        const int32_t* input, int32_t* output, long elements) {
+    return metal_graph_unary_i32(
+        input, output, elements, VX_TYPED_CONTROL_NOT_I32, 0, 0);
+}
+
+int metal_graph_clip_i32(
+        const int32_t* input, int32_t* output, long elements,
+        int32_t minimum, int32_t maximum) {
+    return metal_graph_unary_i32(
+        input, output, elements, VX_TYPED_CONTROL_CLIP_I32,
+        minimum, maximum);
+}
+
+int metal_graph_copy_32(
+        const void* input, void* output, long elements) {
+    VxTypedControlMetadata metadata;
+    size_t bytes;
+    if (!vx_typed_control_copy_plan(
+            input, output, elements, &metadata, &bytes))
+        return 0;
+    return metal_graph_typed_control_32(
+        input, bytes, input, bytes, output, bytes, &metadata);
+}
+
+int metal_graph_cast_typed(
+        const void* input, int input_dtype,
+        void* output, int output_dtype, long elements) {
+    VxTypedControlMetadata metadata;
+    size_t bytes;
+    if (!vx_typed_control_cast_plan(
+            input, input_dtype, output, output_dtype, elements,
+            &metadata, &bytes))
+        return 0;
+    return metal_graph_typed_control_32(
+        input, bytes, input, bytes, output, bytes, &metadata);
+}
+
+int metal_graph_where_32(
+        const int32_t* condition, const void* a,
+        const void* b, void* output, long elements) {
+    uint32_t count;
+    size_t bytes;
+    if (!vx_typed_control_where_plan(
+            condition, a, b, output, elements, &count, &bytes))
+        return 0;
+    MetalTensorSlot* condition_slot =
+        graph_ensure_device(condition, bytes, 0);
+    MetalTensorSlot* a_slot = graph_ensure_device(a, bytes, 0);
+    MetalTensorSlot* b_slot = graph_ensure_device(b, bytes, 0);
+    MetalTensorSlot* output_slot =
+        graph_output_slot(output, bytes);
+    if (!condition_slot || !a_slot || !b_slot || !output_slot) return 0;
+    uint32_t params[4] = {count, 0u, 0u, 0u};
+    id<MTLBuffer> params_buffer_handle =
+        create_buffer(sizeof(params), params);
+    if (!params_buffer_handle) return 0;
+    MetalBinding bindings[5] = {
+        {condition_slot->buffer, bytes},
+        {a_slot->buffer, bytes},
+        {b_slot->buffer, bytes},
+        {output_slot->buffer, bytes},
+        {params_buffer_handle, sizeof(params)},
+    };
+    int ok = dispatch_kernel(
+        &k_where_32, bindings, (count + 63u) / 64u, 1u, 1u);
+    VX_METAL_RELEASE(params_buffer_handle);
+    if (!ok) return 0;
+    graph_mark_device(output_slot);
+    return 1;
+}
+
+int metal_graph_argmax_f32(
+        const float* input, int32_t* output,
+        uint32_t outer, uint32_t axis_size, uint32_t inner) {
+    uint32_t input_elements;
+    uint32_t output_elements;
+    size_t input_bytes;
+    size_t output_bytes;
+    if (!vx_typed_control_argmax_plan(
+            input, output, outer, axis_size, inner,
+            &input_elements, &output_elements,
+            &input_bytes, &output_bytes))
+        return 0;
+    MetalTensorSlot* input_slot =
+        graph_ensure_device(input, input_bytes, 0);
+    MetalTensorSlot* output_slot =
+        graph_output_slot(output, output_bytes);
+    if (!input_slot || !output_slot) return 0;
+    uint32_t params[4] = {outer, axis_size, inner, 0u};
+    id<MTLBuffer> params_buffer_handle =
+        create_buffer(sizeof(params), params);
+    if (!params_buffer_handle) return 0;
+    MetalBinding bindings[3] = {
+        {input_slot->buffer, input_bytes},
+        {output_slot->buffer, output_bytes},
+        {params_buffer_handle, sizeof(params)},
+    };
+    int ok = dispatch_kernel(
+        &k_argmax_f32_i32, bindings,
+        (output_elements + 63u) / 64u, 1u, 1u);
+    VX_METAL_RELEASE(params_buffer_handle);
+    if (!ok) return 0;
+    graph_mark_device(output_slot);
+    (void)input_elements;
+    return 1;
+}
+
+static uint32_t metal_groups_64(uint32_t elements) {
+    return elements / 64u + (elements % 64u != 0u);
+}
+
+static int metal_f32_shape_size(const int* shape, int rank, int max_rank,
+                                uint32_t* elements, size_t* bytes) {
+    uint64_t product = 1u;
+    uint64_t max_elements = (uint64_t)UINT32_MAX / sizeof(float);
+    if (!shape || !elements || !bytes || rank <= 0 || rank > max_rank)
+        return 0;
+    if ((uint64_t)SIZE_MAX / sizeof(float) < max_elements)
+        max_elements = (uint64_t)SIZE_MAX / sizeof(float);
+    for (int dimension = 0; dimension < rank; dimension++) {
+        uint32_t extent;
+        if (shape[dimension] <= 0) return 0;
+        extent = (uint32_t)shape[dimension];
+        if (product > max_elements / extent) return 0;
+        product *= extent;
+    }
+    *elements = (uint32_t)product;
+    *bytes = (size_t)product * sizeof(float);
+    return 1;
+}
+
+static int metal_graph_unary_f32(const MetalKernel* kernel, const float* in, float* out, long n) {
     if (!kernel || !in || !out || n <= 0 || (uint64_t)n > UINT32_MAX) return 0;
     size_t bytes = (size_t)n * sizeof(float);
     MetalTensorSlot* src = graph_ensure_device(in, bytes, 0);
@@ -1170,6 +1561,14 @@ static int metal_graph_unary_f32(MetalKernel* kernel, const float* in, float* ou
     if (!ok) return 0;
     graph_mark_device(dst);
     return 1;
+}
+
+int metal_graph_sigmoid_f32(const float* in, float* out, long n) {
+    if (n <= 0 ||
+        (uint64_t)n > (uint64_t)UINT32_MAX / sizeof(float) ||
+        (uint64_t)n > (uint64_t)SIZE_MAX / sizeof(float))
+        return 0;
+    return metal_graph_unary_f32(&k_sigmoid, in, out, n);
 }
 
 int metal_graph_gelu_f32(const float* in, float* out, long n, int approximate_tanh) {
@@ -1276,6 +1675,32 @@ int metal_graph_dropout_f32(const float* in, float* out, long n, uint32_t thresh
 }
 #endif
 
+int metal_graph_softmax_f32(const float* in, float* out, int rows, int d) {
+    uint64_t elements;
+    uint64_t max_elements = (uint64_t)UINT32_MAX / sizeof(float);
+    if (!in || !out || rows <= 0 || d <= 0) return 0;
+    if ((uint64_t)SIZE_MAX / sizeof(float) < max_elements)
+        max_elements = (uint64_t)SIZE_MAX / sizeof(float);
+    if ((uint64_t)rows > max_elements / (uint32_t)d) return 0;
+    elements = (uint64_t)(uint32_t)rows * (uint32_t)d;
+    size_t bytes = (size_t)elements * sizeof(float);
+    MetalTensorSlot* src = graph_ensure_device(in, bytes, 0);
+    MetalTensorSlot* dst = graph_output_slot(out, bytes);
+    if (!src || !dst) return 0;
+    uint32_t params[2] = {(uint32_t)rows, (uint32_t)d};
+    id<MTLBuffer> pb = create_buffer(sizeof(params), params);
+    if (!pb) return 0;
+    MetalBinding binds[3] = {
+        {src->buffer, bytes}, {dst->buffer, bytes}, {pb, sizeof(params)}
+    };
+    int ok = dispatch_kernel(&k_softmax, binds,
+                             metal_groups_64((uint32_t)rows), 1u, 1u);
+    VX_METAL_RELEASE(pb);
+    if (!ok) return 0;
+    graph_mark_device(dst);
+    return 1;
+}
+
 int metal_graph_reduce_f32(const float* in, float* out, int rows, int width, float scale) {
     if (!in || !out || rows <= 0 || width <= 0 || !isfinite(scale)) return 0;
     size_t input_bytes = (size_t)rows * width * sizeof(float);
@@ -1339,6 +1764,156 @@ int metal_graph_transpose_f32(const float* in, float* out, const int* in_shape,
     return 1;
 }
 
+int metal_graph_expand_f32(const float* in, float* out, const int* in_shape,
+                           int in_rank, const int* out_shape, int out_rank) {
+    VxExpandF32Plan plan;
+    if (!vx_expand_f32_plan(
+            in, out, in_shape, in_rank, out_shape, out_rank, &plan))
+        return 0;
+    MetalTensorSlot* src = graph_ensure_device(in, plan.input_bytes, 0);
+    MetalTensorSlot* dst = graph_output_slot(out, plan.output_bytes);
+    if (!src || !dst) return 0;
+    id<MTLBuffer> pb = create_buffer(sizeof(plan.params), plan.params);
+    if (!pb) return 0;
+    MetalBinding binds[3] = {
+        {src->buffer, plan.input_bytes},
+        {dst->buffer, plan.output_bytes},
+        {pb, sizeof(plan.params)},
+    };
+    int ok = dispatch_kernel(&k_expand, binds,
+                             metal_groups_64(plan.output_elements), 1u, 1u);
+    VX_METAL_RELEASE(pb);
+    if (!ok) return 0;
+    graph_mark_device(dst);
+    return 1;
+}
+
+int metal_graph_gather_i32_f32(const float* input, const int32_t* indices,
+                               float* output, int outer, int axis_size,
+                               int inner, int indices_elements,
+                               int output_elements) {
+    uint64_t input_count;
+    uint64_t expected_output;
+    uint64_t max_f32_elements = (uint64_t)UINT32_MAX / sizeof(float);
+    uint64_t max_i32_elements = (uint64_t)UINT32_MAX / sizeof(int32_t);
+    if (!input || !indices || !output || input == output ||
+        (const void*)indices == (const void*)output ||
+        outer <= 0 || axis_size <= 0 || inner <= 0 ||
+        indices_elements <= 0 || output_elements <= 0)
+        return 0;
+    if ((uint64_t)SIZE_MAX / sizeof(float) < max_f32_elements)
+        max_f32_elements = (uint64_t)SIZE_MAX / sizeof(float);
+    if ((uint64_t)SIZE_MAX / sizeof(int32_t) < max_i32_elements)
+        max_i32_elements = (uint64_t)SIZE_MAX / sizeof(int32_t);
+    if ((uint64_t)(uint32_t)outer >
+        max_f32_elements / (uint32_t)axis_size)
+        return 0;
+    input_count = (uint64_t)(uint32_t)outer * (uint32_t)axis_size;
+    if (input_count > max_f32_elements / (uint32_t)inner)
+        return 0;
+    input_count *= (uint32_t)inner;
+    if ((uint64_t)(uint32_t)outer >
+        max_f32_elements / (uint32_t)indices_elements)
+        return 0;
+    expected_output =
+        (uint64_t)(uint32_t)outer * (uint32_t)indices_elements;
+    if (expected_output > max_f32_elements / (uint32_t)inner)
+        return 0;
+    expected_output *= (uint32_t)inner;
+    if (expected_output != (uint32_t)output_elements ||
+        (uint32_t)indices_elements > max_i32_elements)
+        return 0;
+    size_t input_bytes = (size_t)input_count * sizeof(float);
+    size_t index_bytes =
+        (size_t)(uint32_t)indices_elements * sizeof(int32_t);
+    size_t output_bytes = (size_t)expected_output * sizeof(float);
+    MetalTensorSlot* src = graph_ensure_device(input, input_bytes, 0);
+    MetalTensorSlot* idx = graph_ensure_device(indices, index_bytes, 0);
+    MetalTensorSlot* dst = graph_output_slot(output, output_bytes);
+    if (!src || !idx || !dst) return 0;
+    uint32_t params[5] = {
+        (uint32_t)outer, (uint32_t)axis_size, (uint32_t)inner,
+        (uint32_t)indices_elements, (uint32_t)output_elements,
+    };
+    id<MTLBuffer> pb = create_buffer(sizeof(params), params);
+    if (!pb) return 0;
+    MetalBinding binds[4] = {
+        {src->buffer, input_bytes},
+        {idx->buffer, index_bytes},
+        {dst->buffer, output_bytes},
+        {pb, sizeof(params)},
+    };
+    int ok = dispatch_kernel(&k_gather, binds,
+                             metal_groups_64((uint32_t)output_elements),
+                             1u, 1u);
+    VX_METAL_RELEASE(pb);
+    if (!ok) return 0;
+    graph_mark_device(dst);
+    return 1;
+}
+
+int metal_graph_slice4d_f32(const float* in, float* out, const int* in_shape,
+                            int in_rank, const int* out_shape, int out_rank,
+                            const int* starts, const int* steps) {
+    uint32_t input_elements;
+    uint32_t output_elements;
+    size_t input_bytes;
+    size_t output_bytes;
+    uint32_t input4[4] = {1u, 1u, 1u, 1u};
+    uint32_t output4[4] = {1u, 1u, 1u, 1u};
+    if (!in || !out || in == out || !in_shape || !out_shape ||
+        !starts || !steps || in_rank <= 0 || in_rank > 4 ||
+        out_rank != in_rank ||
+        !metal_f32_shape_size(in_shape, in_rank, 4,
+                              &input_elements, &input_bytes) ||
+        !metal_f32_shape_size(out_shape, out_rank, 4,
+                              &output_elements, &output_bytes))
+        return 0;
+    int base = 4 - in_rank;
+    for (int dimension = 0; dimension < in_rank; dimension++) {
+        input4[base + dimension] = (uint32_t)in_shape[dimension];
+        output4[base + dimension] = (uint32_t)out_shape[dimension];
+    }
+    for (int dimension = 0; dimension < 4; dimension++) {
+        uint64_t start;
+        uint64_t last;
+        if (starts[dimension] < 0 || steps[dimension] <= 0)
+            return 0;
+        start = (uint32_t)starts[dimension];
+        last = start +
+            (uint64_t)(output4[dimension] - 1u) *
+                (uint32_t)steps[dimension];
+        if (start >= input4[dimension] || last >= input4[dimension])
+            return 0;
+    }
+    MetalTensorSlot* src = graph_ensure_device(in, input_bytes, 0);
+    MetalTensorSlot* dst = graph_output_slot(out, output_bytes);
+    if (!src || !dst) return 0;
+    uint32_t params[16] = {
+        output4[0], output4[1], output4[2], output4[3],
+        input4[1], input4[2], input4[3],
+        (uint32_t)starts[0], (uint32_t)starts[1],
+        (uint32_t)starts[2], (uint32_t)starts[3],
+        (uint32_t)steps[0], (uint32_t)steps[1],
+        (uint32_t)steps[2], (uint32_t)steps[3],
+        output_elements,
+    };
+    id<MTLBuffer> pb = create_buffer(sizeof(params), params);
+    if (!pb) return 0;
+    MetalBinding binds[3] = {
+        {src->buffer, input_bytes},
+        {dst->buffer, output_bytes},
+        {pb, sizeof(params)},
+    };
+    int ok = dispatch_kernel(&k_slice, binds,
+                             metal_groups_64(output_elements), 1u, 1u);
+    VX_METAL_RELEASE(pb);
+    if (!ok) return 0;
+    graph_mark_device(dst);
+    (void)input_elements;
+    return 1;
+}
+
 int metal_graph_concat_f32(const float** inputs, const long* sizes, const int* input_axes,
                            int count, float* out, int output_axis, int inner) {
     if (!inputs || !sizes || !input_axes || !out || count <= 0 || output_axis <= 0 || inner <= 0) return 0;
@@ -1371,6 +1946,52 @@ int metal_graph_concat_f32(const float** inputs, const long* sizes, const int* i
     }
     if (axis_offset != (uint32_t)output_axis) return 0;
     graph_mark_device(dst);
+    return 1;
+}
+
+int metal_graph_concat_32(
+        const void* const* inputs, const long* sizes,
+        const int* input_axes, int count, void* output,
+        int output_axis, int inner) {
+    uint32_t output_elements;
+    size_t output_bytes;
+    if (!vx_typed_control_concat_plan(
+            inputs, sizes, input_axes, count, output,
+            output_axis, inner, &output_elements, &output_bytes))
+        return 0;
+    MetalTensorSlot* output_slot =
+        graph_output_slot(output, output_bytes);
+    if (!output_slot) return 0;
+    uint32_t axis_offset = 0u;
+    for (int index = 0; index < count; index++) {
+        uint32_t input_elements = (uint32_t)sizes[index];
+        size_t input_bytes =
+            (size_t)input_elements * sizeof(uint32_t);
+        MetalTensorSlot* input_slot =
+            graph_ensure_device(inputs[index], input_bytes, 0);
+        if (!input_slot) return 0;
+        uint32_t params[8] = {
+            input_elements, axis_offset,
+            (uint32_t)input_axes[index], (uint32_t)output_axis,
+            (uint32_t)inner, 0u, 0u, 0u,
+        };
+        id<MTLBuffer> params_buffer_handle =
+            create_buffer(sizeof(params), params);
+        if (!params_buffer_handle) return 0;
+        MetalBinding bindings[3] = {
+            {input_slot->buffer, input_bytes},
+            {output_slot->buffer, output_bytes},
+            {params_buffer_handle, sizeof(params)},
+        };
+        int ok = dispatch_kernel(
+            &k_concat_32, bindings,
+            (input_elements + 63u) / 64u, 1u, 1u);
+        VX_METAL_RELEASE(params_buffer_handle);
+        if (!ok) return 0;
+        axis_offset += (uint32_t)input_axes[index];
+    }
+    graph_mark_device(output_slot);
+    (void)output_elements;
     return 1;
 }
 
@@ -1418,7 +2039,8 @@ int metal_graph_linear_f32(const float* in, const float* weight, const float* bi
         MetalBinding binds[6] = {{src->buffer, input_bytes}, {sw->buffer, weight_bytes},
                                  {scale_buffer, sizeof(dummy_scale)}, {bias_buffer, bias_bytes},
                                  {dst->buffer, output_bytes}, {pb, sizeof(params)}};
-        MetalKernel* kernel = tiled ? &k_linear_out_in_tiled : &k_linear_out_in;
+        const MetalKernel* kernel =
+            tiled ? &k_linear_out_in_tiled : &k_linear_out_in;
         uint32_t groups_x = tiled ? ((uint32_t)d_out + 15u) / 16u
                                    : ((uint32_t)d_out + 63u) / 64u;
         uint32_t groups_y = tiled ? ((uint32_t)rows + 15u) / 16u : (uint32_t)rows;
@@ -1428,7 +2050,8 @@ int metal_graph_linear_f32(const float* in, const float* weight, const float* bi
         MetalBinding binds[5] = {{src->buffer, input_bytes}, {sw->buffer, weight_bytes},
                                  {bias_buffer, bias_bytes}, {dst->buffer, output_bytes},
                                  {pb, sizeof(params)}};
-        MetalKernel* kernel = tiled ? &k_linear_in_out_tiled : &k_linear_in_out;
+        const MetalKernel* kernel =
+            tiled ? &k_linear_in_out_tiled : &k_linear_in_out;
         uint32_t groups_x = tiled ? ((uint32_t)d_out + 15u) / 16u
                                    : ((uint32_t)d_out + 63u) / 64u;
         uint32_t groups_y = tiled ? ((uint32_t)rows + 15u) / 16u : (uint32_t)rows;
@@ -1884,10 +2507,10 @@ static int qlinear_dtype_bounds(uint32_t dtype, int32_t zero_point,
                                 int64_t* maximum_distance) {
     int32_t minimum;
     int32_t maximum;
-    if (dtype == 2u) {
+    if (dtype == VX_DTYPE_I8) {
         minimum = -128;
         maximum = 127;
-    } else if (dtype == 3u) {
+    } else if (dtype == VX_DTYPE_U8) {
         minimum = 0;
         maximum = 255;
     } else {
@@ -1919,7 +2542,7 @@ static int qlinear_gpu_args_valid(const void* input, const void* weight,
     if (!qlinear_dtype_bounds(input_dtype, input_zero_point, &input_distance) ||
         !qlinear_dtype_bounds(output_dtype, output_zero_point, &output_distance)) return 0;
     (void)output_distance;
-    if (weight_dtype != 2u && weight_dtype != 3u) return 0;
+    if (weight_dtype != VX_DTYPE_I8 && weight_dtype != VX_DTYPE_U8) return 0;
     if (rows > UINT32_MAX / d_in || rows > UINT32_MAX / d_out ||
         d_out > UINT32_MAX / d_in) return 0;
     uint64_t input_elements = (uint64_t)rows * d_in;
@@ -1957,31 +2580,53 @@ int metal_graph_qlinear_i8u8(const void* input, const void* weight,
                              uint32_t input_dtype, uint32_t weight_dtype,
                              uint32_t output_dtype) {
     size_t input_bytes, weight_bytes, output_bytes;
+    size_t multiplier_bytes;
+    float* multipliers;
     if (!qlinear_gpu_args_valid(input, weight, weight_scales, weight_zero_points, bias, output,
                                 rows, d_in, d_out, input_scale, input_zero_point,
                                 output_scale, output_zero_point, input_dtype, weight_dtype,
                                 output_dtype, &input_bytes, &weight_bytes, &output_bytes)) return 0;
     size_t packed_output_bytes;
     if (!graph_packed_bytes(output_bytes, &packed_output_bytes)) return 0;
+    multiplier_bytes = (size_t)d_out * sizeof(*multipliers);
+    multipliers = (float*)malloc(multiplier_bytes);
+    if (!multipliers ||
+        !vx_qlinear_build_multipliers(
+            input_scale, weight_scales, output_scale, d_out, multipliers)) {
+        free(multipliers);
+        return 0;
+    }
     MetalTensorSlot* src = graph_ensure_packed_bytes(input, input_bytes, 0);
     MetalTensorSlot* wt = graph_ensure_packed_bytes(weight, weight_bytes, 1);
-    MetalTensorSlot* scales = graph_ensure_device(weight_scales,
-                                                   (size_t)d_out * sizeof(*weight_scales), 1);
     MetalTensorSlot* zero_points = graph_ensure_device(weight_zero_points,
                                                         (size_t)d_out * sizeof(*weight_zero_points), 1);
     MetalTensorSlot* biases = graph_ensure_device(bias, (size_t)d_out * sizeof(*bias), 1);
     MetalTensorSlot* dst = graph_output_packed_bytes(output, output_bytes);
-    if (!src || !wt || !scales || !zero_points || !biases || !dst) return 0;
+    if (!src || !wt || !zero_points || !biases || !dst) {
+        free(multipliers);
+        return 0;
+    }
+    id<MTLBuffer> multiplier_buffer =
+        create_buffer(multiplier_bytes, multipliers);
+    free(multipliers);
+    if (!multiplier_buffer) return 0;
     MetalQLinearParams params = {
-        rows, d_in, d_out, input_dtype, weight_dtype, output_dtype, 0u, 0u,
+        rows, d_in, d_out,
+        input_dtype,
+        weight_dtype,
+        output_dtype, 0u, 0u,
         input_zero_point, output_zero_point, 0, 0,
         input_scale, output_scale, 0.0f, 0.0f
     };
     id<MTLBuffer> pb = create_buffer(sizeof(params), &params);
-    if (!pb) return 0;
+    if (!pb) {
+        VX_METAL_RELEASE(multiplier_buffer);
+        return 0;
+    }
     MetalBinding binds[7] = {
         {src->buffer, src->bytes}, {wt->buffer, wt->bytes},
-        {scales->buffer, scales->bytes}, {zero_points->buffer, zero_points->bytes},
+        {multiplier_buffer, multiplier_bytes},
+        {zero_points->buffer, zero_points->bytes},
         {biases->buffer, biases->bytes}, {dst->buffer, packed_output_bytes},
         {pb, sizeof(params)}
     };
@@ -1989,9 +2634,11 @@ int metal_graph_qlinear_i8u8(const void* input, const void* weight,
     int tiled = rows > 1u && d_in >= 16u && d_out >= 32u && (d_out & 3u) == 0u;
     uint32_t groups_x = tiled ? ((d_out / 4u + 7u) / 8u) : ((packed_words + 63u) / 64u);
     uint32_t groups_y = tiled ? ((rows + 7u) / 8u) : 1u;
-    MetalKernel* kernel = tiled ? &k_qlinear_int8_tiled : &k_qlinear_int8;
+    const MetalKernel* kernel =
+        tiled ? &k_qlinear_int8_tiled : &k_qlinear_int8;
     int ok = dispatch_kernel(kernel, binds, groups_x, groups_y, 1u);
     VX_METAL_RELEASE(pb);
+    VX_METAL_RELEASE(multiplier_buffer);
     if (!ok) return 0;
     graph_mark_device(dst);
     return 1;
@@ -2025,7 +2672,7 @@ static int qembedding_gpu_args_valid(const int32_t* tokens, const void* weight,
         !token_count || !vocab || !hidden || !isfinite(output_scale) ||
         output_scale <= 0.0f || !qlinear_dtype_bounds(output_dtype, output_zero_point,
                                                         &distance) ||
-        (weight_dtype != 2u && weight_dtype != 3u) ||
+        (weight_dtype != VX_DTYPE_I8 && weight_dtype != VX_DTYPE_U8) ||
         token_count > UINT32_MAX / hidden || vocab > UINT32_MAX / hidden) return 0;
     weight_elements = (uint64_t)vocab * hidden;
     output_elements = (uint64_t)token_count * hidden;
@@ -2070,7 +2717,9 @@ int metal_graph_qembedding_i8u8(const int32_t* tokens, const void* weight,
     MetalTensorSlot* dst = graph_output_packed_bytes(output, output_bytes);
     if (!ids || !table || !scales || !zero_points || !dst) return 0;
     MetalQEmbeddingParams params = {
-        token_count, vocab, hidden, weight_dtype, output_dtype, output_zero_point,
+        token_count, vocab, hidden,
+        weight_dtype,
+        output_dtype, output_zero_point,
         output_scale, 0u
     };
     id<MTLBuffer> pb = create_buffer(sizeof(params), &params);
@@ -2105,6 +2754,28 @@ typedef struct {
 } MetalQAddParams;
 
 _Static_assert(sizeof(MetalQAddParams) == 48, "qAdd uniform ABI");
+
+typedef struct {
+    uint32_t batch_rank;
+    uint32_t m;
+    uint32_t k;
+    uint32_t n;
+    uint32_t output_elements;
+    uint32_t a_type;
+    uint32_t b_type;
+    uint32_t output_type;
+    int32_t a_zero_point;
+    int32_t b_zero_point;
+    int32_t output_zero_point;
+    int32_t pad0;
+    float a_scale;
+    float b_scale;
+    float output_scale;
+    float pad1;
+} MetalQBatchMatMulParams;
+
+_Static_assert(sizeof(MetalQBatchMatMulParams) == 64,
+               "qBatchMatMul uniform ABI");
 
 typedef struct {
     uint32_t elements;
@@ -2235,8 +2906,8 @@ _Static_assert(sizeof(MetalRequantizeLinearParams) == 48,
                "requantizeLinearTyped uniform ABI");
 
 static int qbyte_dtype_zero_point_valid(uint32_t dtype, int32_t zero_point) {
-    if (dtype == 2u) return zero_point >= -128 && zero_point <= 127;
-    if (dtype == 3u) return zero_point >= 0 && zero_point <= 255;
+    if (dtype == VX_DTYPE_I8) return zero_point >= -128 && zero_point <= 127;
+    if (dtype == VX_DTYPE_U8) return zero_point >= 0 && zero_point <= 255;
     return 0;
 }
 
@@ -2375,10 +3046,10 @@ static int qsdpa_centered_magnitude(uint32_t dtype, int32_t zero_point,
     int64_t high;
     uint64_t magnitude;
     if (!magnitude_out) return 0;
-    if (dtype == 2u) {
+    if (dtype == VX_DTYPE_I8) {
         low = -128 - (int64_t)zero_point;
         high = 127 - (int64_t)zero_point;
-    } else if (dtype == 3u) {
+    } else if (dtype == VX_DTYPE_U8) {
         low = -(int64_t)zero_point;
         high = 255 - (int64_t)zero_point;
     } else {
@@ -2493,7 +3164,7 @@ static int qargmax_gpu_args_valid(const void* input, int32_t* output,
     uint64_t output_elements = outer;
     if (!input || !output || !outer || !axis_size || !inner ||
         axis_size > (uint32_t)INT32_MAX ||
-        (input_dtype != 2u && input_dtype != 3u) ||
+        (input_dtype != VX_DTYPE_I8 && input_dtype != VX_DTYPE_U8) ||
         !input_bytes || !output_bytes || !output_elements_out ||
         input_elements > UINT32_MAX / axis_size) return 0;
     input_elements *= axis_size;
@@ -2542,7 +3213,7 @@ static int qmaskedmean_gpu_args_valid(const void* input, const int32_t* mask,
     if (!input_elements || !mask_elements || !output_elements ||
         input_elements > SIZE_MAX || mask_elements > SIZE_MAX / sizeof(*mask) ||
         output_elements > SIZE_MAX) return 0;
-    if (input_dtype == 2u) {
+    if (input_dtype == VX_DTYPE_I8) {
         low = -128 - (int64_t)input_zero_point;
         high = 127 - (int64_t)input_zero_point;
     } else {
@@ -2580,6 +3251,80 @@ static int requantize_gpu_args_valid(const void* input, uint32_t input_elements,
     return 1;
 }
 
+int metal_graph_qbatch_matmul_i8u8(
+        const void* a, const int* a_shape, int a_rank,
+        float a_scale, int32_t a_zero_point, uint32_t a_dtype,
+        const void* b, const int* b_shape, int b_rank,
+        float b_scale, int32_t b_zero_point, uint32_t b_dtype,
+        void* output, const int* output_shape, int output_rank,
+        float output_scale, int32_t output_zero_point,
+        uint32_t output_dtype) {
+    VxQBatchMatMulDevicePlan plan;
+    uint32_t metadata[24] = {0};
+    uint32_t metadata_words;
+    size_t metadata_bytes;
+    size_t a_packed_bytes;
+    size_t b_packed_bytes;
+    size_t output_packed_bytes;
+    if (!metal_ready() ||
+        !vx_qbatch_matmul_device_plan(
+            a, a_shape, a_rank, a_scale, a_zero_point, a_dtype,
+            b, b_shape, b_rank, b_scale, b_zero_point, b_dtype,
+            output, output_shape, output_rank, output_scale,
+            output_zero_point, output_dtype, &plan) ||
+        !graph_packed_bytes(plan.a_bytes, &a_packed_bytes) ||
+        !graph_packed_bytes(plan.b_bytes, &b_packed_bytes) ||
+        !graph_packed_bytes(plan.output_bytes, &output_packed_bytes))
+        return 0;
+    MetalTensorSlot* a_slot =
+        graph_ensure_packed_bytes(a, plan.a_bytes, 0);
+    MetalTensorSlot* b_slot =
+        graph_ensure_packed_bytes(b, plan.b_bytes, 0);
+    MetalTensorSlot* output_slot =
+        graph_output_packed_bytes(output, plan.output_bytes);
+    if (!a_slot || !b_slot || !output_slot) return 0;
+    memcpy(metadata, plan.output_batch_strides,
+           plan.batch_rank * sizeof(uint32_t));
+    memcpy(metadata + plan.batch_rank, plan.a_batch_strides,
+           plan.batch_rank * sizeof(uint32_t));
+    memcpy(metadata + 2u * plan.batch_rank, plan.b_batch_strides,
+           plan.batch_rank * sizeof(uint32_t));
+    metadata_words = plan.batch_rank ? 3u * plan.batch_rank : 1u;
+    metadata_bytes = (size_t)metadata_words * sizeof(uint32_t);
+    MetalQBatchMatMulParams params = {
+        plan.batch_rank, plan.m, plan.k, plan.n,
+        plan.output_elements, a_dtype, b_dtype, output_dtype,
+        a_zero_point, b_zero_point, output_zero_point, 0,
+        a_scale, b_scale, output_scale, 0.0f,
+    };
+    id<MTLBuffer> metadata_buffer =
+        create_buffer(metadata_bytes, metadata);
+    id<MTLBuffer> params_buffer_handle =
+        create_buffer(sizeof(params), &params);
+    if (!metadata_buffer || !params_buffer_handle) {
+        VX_METAL_RELEASE(metadata_buffer);
+        VX_METAL_RELEASE(params_buffer_handle);
+        return 0;
+    }
+    MetalBinding binds[5] = {
+        {a_slot->buffer, a_packed_bytes},
+        {b_slot->buffer, b_packed_bytes},
+        {output_slot->buffer, output_packed_bytes},
+        {metadata_buffer, metadata_bytes},
+        {params_buffer_handle, sizeof(params)},
+    };
+    uint32_t packed_words =
+        (uint32_t)(output_packed_bytes / sizeof(uint32_t));
+    int ok = dispatch_kernel(
+        &k_qbatch_matmul_i8u8, binds,
+        (packed_words + 63u) / 64u, 1u, 1u);
+    VX_METAL_RELEASE(metadata_buffer);
+    VX_METAL_RELEASE(params_buffer_handle);
+    if (!ok) return 0;
+    graph_mark_device(output_slot);
+    return 1;
+}
+
 int metal_graph_qadd_i8u8(const void* a, uint32_t a_elements,
                           const void* b, uint32_t b_elements,
                           void* output, uint32_t output_elements,
@@ -2601,7 +3346,9 @@ int metal_graph_qadd_i8u8(const void* a, uint32_t a_elements,
     MetalTensorSlot* output_slot = graph_output_packed_bytes(output, logical_bytes);
     if (!a_slot || !b_slot || !output_slot) return 0;
     MetalQAddParams params = {
-        a_elements, a_dtype, b_dtype, output_dtype,
+        a_elements, a_dtype,
+        b_dtype,
+        output_dtype,
         a_zero_point, b_zero_point, output_zero_point, 0,
         a_scale, b_scale, output_scale, relu
     };
@@ -2635,7 +3382,8 @@ int metal_graph_qsilu_i8u8(const void* input, void* output, uint32_t elements,
     MetalTensorSlot* output_slot = graph_output_packed_bytes(output, logical_bytes);
     if (!input_slot || !output_slot) return 0;
     MetalQByteUnaryParams params = {
-        elements, input_dtype, output_dtype, 0u,
+        elements, input_dtype,
+        output_dtype, 0u,
         input_zero_point, output_zero_point, 0, 0,
         input_scale, output_scale, 0.0f, 0.0f
     };
@@ -2669,7 +3417,8 @@ int metal_graph_qgelu_i8u8(const void* input, void* output, uint32_t elements,
     MetalTensorSlot* output_slot = graph_output_packed_bytes(output, logical_bytes);
     if (!input_slot || !output_slot) return 0;
     MetalQByteUnaryParams params = {
-        elements, input_dtype, output_dtype, 0u,
+        elements, input_dtype,
+        output_dtype, 0u,
         input_zero_point, output_zero_point, 0, 0,
         input_scale, output_scale, 0.0f, 0.0f
     };
@@ -2717,7 +3466,9 @@ int metal_graph_qgroupnorm_i8u8(const void* input, const float* weight,
     if (!input_slot || !weight_slot || !bias_slot || !output_slot) return 0;
     id<MTLBuffer> stats_buffer = qgroupnorm_stats_ensure(stats_bytes);
     MetalQGroupNormParams params = {
-        batch, height, width, channels, groups, input_dtype, output_dtype, 0u,
+        batch, height, width, channels, groups,
+        input_dtype,
+        output_dtype, 0u,
         input_zero_point, output_zero_point, 0, 0,
         input_scale, output_scale, epsilon, 0.0f
     };
@@ -2773,7 +3524,8 @@ int metal_graph_qlayernorm_i8u8(const void* input, const float* weight,
     if (!input_slot || !weight_slot || !bias_slot || !output_slot) return 0;
     id<MTLBuffer> stats_buffer = qlayernorm_stats_ensure(stats_bytes);
     MetalQLayerNormParams params = {
-        rows, d_model, input_dtype, output_dtype,
+        rows, d_model, input_dtype,
+        output_dtype,
         input_zero_point, output_zero_point, 0, 0,
         input_scale, output_scale, epsilon, 0.0f
     };
@@ -2834,7 +3586,10 @@ int metal_graph_qsdpa_i8u8(const void* q, const void* k, const void* v,
     MetalQSDPAParams params = {
         seq_q, seq_kv, d_model, heads,
         batch, mask_mode, causal,
-        q_dtype | (k_dtype << 8u) | (v_dtype << 16u) | (output_dtype << 24u),
+        q_dtype |
+            (k_dtype << 8u) |
+            (v_dtype << 16u) |
+            (output_dtype << 24u),
         q_zero_point, k_zero_point, v_zero_point, output_zero_point,
         q_scale, k_scale, v_scale, output_scale,
         attention_scale, 0.0f, 0.0f, 0.0f
@@ -2869,7 +3624,9 @@ int metal_graph_qargmax_i8u8(const void* input, int32_t* output,
     MetalTensorSlot* input_slot = graph_ensure_packed_bytes(input, input_bytes, 0);
     MetalTensorSlot* output_slot = graph_output_slot(output, output_bytes);
     if (!input_slot || !output_slot) return 0;
-    MetalQArgMaxParams params = {outer, axis_size, inner, input_dtype};
+    MetalQArgMaxParams params = {
+        outer, axis_size, inner, input_dtype
+    };
     id<MTLBuffer> params_buffer = create_buffer(sizeof(params), &params);
     if (!params_buffer) return 0;
     MetalBinding binds[3] = {
@@ -2947,7 +3704,8 @@ int metal_graph_requantize_linear_i8u8(const void* input, uint32_t input_element
     MetalTensorSlot* output_slot = graph_output_packed_bytes(output, logical_bytes);
     if (!input_slot || !output_slot) return 0;
     MetalRequantizeLinearParams params = {
-        input_elements, input_dtype, output_dtype, 0u,
+        input_elements, input_dtype,
+        output_dtype, 0u,
         input_zero_point, output_zero_point, 0, 0,
         multiplier, 0.0f, 0.0f, 0.0f
     };
@@ -2986,10 +3744,12 @@ static const int32_t* qconv_zero_bias_get(uint32_t output_channels) {
     return block->values;
 }
 
-static void qconv_zero_bias_release(void) {
-    while (qconv_zero_bias_backings) {
-        QConvZeroBiasBacking* block = qconv_zero_bias_backings;
-        qconv_zero_bias_backings = block->next;
+static void qconv_zero_bias_release_state(void* opaque_state) {
+    MetalContextState* state = (MetalContextState*)opaque_state;
+    if (!state) return;
+    while (state->qconv_zero_bias_storage) {
+        QConvZeroBiasBacking* block = state->qconv_zero_bias_storage;
+        state->qconv_zero_bias_storage = block->next;
         free(block->values);
         free(block);
     }
@@ -3082,7 +3842,7 @@ static int qconv_gpu_args_valid(const void* input, const void* weight,
         !isfinite(output_scale) || output_scale <= 0.0f ||
         !qbyte_dtype_zero_point_valid(input_dtype, input_zero_point) ||
         !qbyte_dtype_zero_point_valid(output_dtype, output_zero_point) ||
-        (weight_dtype != 2u && weight_dtype != 3u) ||
+        (weight_dtype != VX_DTYPE_I8 && weight_dtype != VX_DTYPE_U8) ||
         input_channels % groups || output_channels % groups ||
         (uint64_t)input_per_group * groups != input_channels) return 0;
     if (!qconv_mul_u64(input_elements, batch, &input_elements) ||
@@ -3116,8 +3876,10 @@ static int qconv_gpu_args_valid(const void* input, const void* weight,
     expected_width = (padded_width - effective_width) / stride_x + 1u;
     if (expected_height != output_height || expected_width != output_width) return 0;
     {
-        int64_t low = (int64_t)(input_dtype == 2u ? -128 : 0) - input_zero_point;
-        int64_t high = (int64_t)(input_dtype == 2u ? 127 : 255) - input_zero_point;
+        int64_t low = (int64_t)(input_dtype == VX_DTYPE_I8 ? -128 : 0) -
+            input_zero_point;
+        int64_t high = (int64_t)(input_dtype == VX_DTYPE_I8 ? 127 : 255) -
+            input_zero_point;
         uint64_t low_magnitude = (uint64_t)(low < 0 ? -low : low);
         uint64_t high_magnitude = (uint64_t)(high < 0 ? -high : high);
         input_magnitude = low_magnitude > high_magnitude ? low_magnitude : high_magnitude;
@@ -3130,8 +3892,10 @@ static int qconv_gpu_args_valid(const void* input, const void* weight,
         uint64_t weight_magnitude, accumulator_bound, bias_magnitude = 0;
         if (!isfinite(weight_scale) || weight_scale <= 0.0f ||
             !qbyte_dtype_zero_point_valid(weight_dtype, weight_zero_point)) return 0;
-        low = (int64_t)(weight_dtype == 2u ? -128 : 0) - weight_zero_point;
-        high = (int64_t)(weight_dtype == 2u ? 127 : 255) - weight_zero_point;
+        low = (int64_t)(weight_dtype == VX_DTYPE_I8 ? -128 : 0) -
+            weight_zero_point;
+        high = (int64_t)(weight_dtype == VX_DTYPE_I8 ? 127 : 255) -
+            weight_zero_point;
         weight_magnitude = (uint64_t)(low < 0 ? -low : low);
         {
             uint64_t high_magnitude = (uint64_t)(high < 0 ? -high : high);
@@ -3203,7 +3967,9 @@ int metal_graph_qconv2d_i8u8(const void* input, const void* weight,
         output_height, output_width, output_channels, kernel_height,
         kernel_width, stride_y, stride_x, dilation_y,
         dilation_x, padding_top, padding_left, groups,
-        input_dtype, weight_dtype, output_dtype, relu,
+        input_dtype,
+        weight_dtype,
+        output_dtype, relu,
         input_zero_point, output_zero_point, 0, 0,
         input_scale, output_scale, 0.0f, 0.0f
     };
@@ -3263,7 +4029,8 @@ static int typed_shape_nhwc_elements(uint32_t n, uint32_t h, uint32_t w, uint32_
 static uint32_t typed_shape_groups(uint32_t elements) { return elements / 64u + (elements % 64u != 0u); }
 static uint32_t typed_shape_packed_groups(size_t bytes) { return typed_shape_groups((uint32_t)(bytes / sizeof(uint32_t))); }
 static uint32_t typed_shape_zero_word(int32_t zero_point, uint32_t dtype) {
-    return dtype == 2u ? (uint32_t)(uint8_t)(int8_t)zero_point : (uint32_t)(uint8_t)zero_point;
+    return dtype == VX_DTYPE_I8 ? (uint32_t)(uint8_t)(int8_t)zero_point :
+        (uint32_t)(uint8_t)zero_point;
 }
 
 static int graph_zero_packed_output(MetalTensorSlot* slot, size_t bytes) {
@@ -3286,7 +4053,9 @@ int metal_graph_quantize_typed_f32_i8u8(const float* input, uint32_t elements,
     MetalTensorSlot* output_slot = graph_output_packed_bytes(output, elements);
     if (!input_slot || !output_slot) return 0;
     uint32_t zero_word = typed_shape_zero_word(output_zero_point, output_dtype);
-    MetalTypedQuantizeParams params = {elements, output_dtype, output_dtype, 1u};
+    MetalTypedQuantizeParams params = {
+        elements, output_dtype, output_dtype, 1u
+    };
     id<MTLBuffer> scale_buffer = create_buffer(sizeof(output_scale), &output_scale);
     id<MTLBuffer> zero_buffer = create_buffer(sizeof(zero_word), &zero_word);
     id<MTLBuffer> pb = create_buffer(sizeof(params), &params);
@@ -3315,7 +4084,10 @@ int metal_graph_dequantize_typed_i8u8_f32(const void* input, uint32_t elements,
     MetalTensorSlot* output_slot = graph_output_slot(output, (size_t)elements * sizeof(float));
     if (!input_slot || !output_slot) return 0;
     uint32_t zero_word = typed_shape_zero_word(input_zero_point, input_dtype);
-    MetalTypedDequantizeParams params = {elements, input_dtype, 0u, input_dtype, 0u, 1u, 0u, 0u};
+    MetalTypedDequantizeParams params = {
+        elements, input_dtype, VX_DTYPE_F32, input_dtype,
+        VX_DTYPE_F32, 1u, 0u, 0u
+    };
     id<MTLBuffer> scale_buffer = create_buffer(sizeof(input_scale), &input_scale);
     id<MTLBuffer> zero_buffer = create_buffer(sizeof(zero_word), &zero_word);
     id<MTLBuffer> pb = create_buffer(sizeof(params), &params);
@@ -3349,6 +4121,77 @@ int metal_graph_copy_i8u8(const void* input, uint32_t input_elements, void* outp
     MetalBinding binds[3] = {{input_slot->buffer, input_slot->bytes}, {output_slot->buffer, packed_bytes}, {pb, sizeof(params)}};
     int ok = dispatch_kernel(&k_copy_typed_i8u8, binds, typed_shape_packed_groups(packed_bytes), 1u, 1u);
     VX_METAL_RELEASE(pb);
+    if (!ok) return 0;
+    graph_mark_device(output_slot);
+    return 1;
+}
+
+int metal_graph_transpose_i8u8(
+        const void* input, void* output, const uint32_t* input_shape,
+        const uint32_t* permutation, uint32_t rank, uint32_t elements,
+        float input_scale, int32_t input_zero_point, float output_scale,
+        int32_t output_zero_point, uint32_t input_dtype,
+        uint32_t output_dtype) {
+    uint32_t input_strides[8] = {0};
+    uint32_t output_shape[8] = {0};
+    uint32_t output_strides[8] = {0};
+    uint32_t metadata[18] = {0};
+    uint32_t seen = 0;
+    uint64_t product = 1;
+    uint64_t stride = 1;
+    size_t packed_bytes;
+    if (!metal_ready() || !input || !output || !input_shape || !permutation ||
+        rank == 0 || rank > 8 || elements == 0 ||
+        !typed_shape_qdesc_same(input_scale, input_zero_point, input_dtype,
+                                output_scale, output_zero_point, output_dtype) ||
+        qsdpa_ranges_overlap(output, elements, input, elements)) return 0;
+    for (uint32_t reverse = rank; reverse-- > 0;) {
+        if (!input_shape[reverse] || stride > UINT32_MAX) return 0;
+        input_strides[reverse] = (uint32_t)stride;
+        stride *= input_shape[reverse];
+        if (stride > UINT32_MAX) return 0;
+    }
+    if (stride != elements) return 0;
+    for (uint32_t dimension = 0; dimension < rank; dimension++) {
+        uint32_t source = permutation[dimension];
+        if (source >= rank || (seen & (1u << source))) return 0;
+        seen |= 1u << source;
+        output_shape[dimension] = input_shape[source];
+        if (product > UINT32_MAX / output_shape[dimension]) return 0;
+        product *= output_shape[dimension];
+    }
+    if (product != elements) return 0;
+    stride = 1;
+    for (uint32_t reverse = rank; reverse-- > 0;) {
+        output_strides[reverse] = (uint32_t)stride;
+        stride *= output_shape[reverse];
+    }
+    if (!graph_packed_bytes(elements, &packed_bytes)) return 0;
+    MetalTensorSlot* input_slot =
+        graph_ensure_packed_bytes(input, elements, 0);
+    MetalTensorSlot* output_slot =
+        graph_output_packed_bytes(output, elements);
+    if (!input_slot || !output_slot) return 0;
+    metadata[0] = elements;
+    metadata[1] = rank;
+    for (uint32_t dimension = 0; dimension < rank; dimension++) {
+        metadata[2 + dimension] = output_strides[dimension];
+        metadata[2 + rank + dimension] =
+            input_strides[permutation[dimension]];
+    }
+    size_t metadata_bytes = (size_t)(2 + 2 * rank) * sizeof(uint32_t);
+    id<MTLBuffer> metadata_buffer =
+        create_buffer(metadata_bytes, metadata);
+    if (!metadata_buffer) return 0;
+    MetalBinding binds[3] = {
+        {input_slot->buffer, packed_bytes},
+        {output_slot->buffer, packed_bytes},
+        {metadata_buffer, metadata_bytes},
+    };
+    int ok = dispatch_kernel(
+        &k_transpose_typed_i8u8, binds,
+        typed_shape_packed_groups(packed_bytes), 1u, 1u);
+    VX_METAL_RELEASE(metadata_buffer);
     if (!ok) return 0;
     graph_mark_device(output_slot);
     return 1;
@@ -3424,8 +4267,11 @@ int metal_graph_maxpool2d_i8u8(const void* input, void* output, uint32_t batch,
     MetalTensorSlot* input_slot = graph_ensure_packed_bytes(input, input_elements, 0);
     MetalTensorSlot* output_slot = graph_output_packed_bytes(output, output_elements);
     if (!input_slot || !output_slot) return 0;
-    MetalTypedMaxPoolParams params = {batch, input_height, input_width, channels, output_height, output_width, kernel_y, kernel_x,
-                                      stride_y, stride_x, padding_top, padding_left, input_dtype, 0u, 0u, 0u};
+    MetalTypedMaxPoolParams params = {
+        batch, input_height, input_width, channels, output_height, output_width,
+        kernel_y, kernel_x, stride_y, stride_x, padding_top, padding_left,
+        input_dtype, 0u, 0u, 0u
+    };
     id<MTLBuffer> pb = create_buffer(sizeof(params), &params);
     if (!pb) return 0;
     MetalBinding binds[3] = {{input_slot->buffer, input_slot->bytes}, {output_slot->buffer, packed_output_bytes}, {pb, sizeof(params)}};
@@ -3495,7 +4341,7 @@ int metal_graph_quantize_linear_i8(const float* in, signed char* out, long n,
     return metal_graph_sync_host(out, (size_t)n, 0);
 }
 
-static int metal_graph_profile_common(MetalKernel* kernel, const float* in, float* out,
+static int metal_graph_profile_common(const MetalKernel* kernel, const float* in, float* out,
                                       int n, int h, int w, int c, long out_elems_per_batch,
                                       uint32_t gx, uint32_t gy) {
     if (!kernel || !in || !out || n <= 0 || h <= 0 || w <= 0 || c <= 0 || out_elems_per_batch <= 0) return 0;

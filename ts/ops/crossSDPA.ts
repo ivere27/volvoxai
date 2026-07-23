@@ -1,9 +1,7 @@
 import { _cpuAttentionMask } from './sDPA.js';
-import { attentionDropout, attentionProbabilityIndex } from './attentionDropout.js';
 
 export function _cpuCrossSDPA(node, execution: {
-  training?: { dropout?: any };
-  nodeIndex?: number;
+  probabilityMultiplier?: (index: number) => number;
 } = {}) {
   const qShape = node.inputs.q.shape;
   const kShape = node.inputs.k.shape;
@@ -34,7 +32,7 @@ export function _cpuCrossSDPA(node, execution: {
   const scale = node.params.scale ?? 1 / Math.sqrt(head_dim);
   const causal = node.params.causal === true;
   const keeps = _cpuAttentionMask(node, batch, seqQ, seqKV);
-  const probabilityDropout = attentionDropout(node, execution.training?.dropout, execution.nodeIndex ?? 0);
+  const probabilityMultiplier = execution.probabilityMultiplier || (() => 1);
   for (let batchIndex = 0; batchIndex < batch; batchIndex++) {
     const qBase = batchIndex * seqQ * d_model;
     const kvBase = batchIndex * seqKV * d_model;
@@ -74,10 +72,8 @@ export function _cpuCrossSDPA(node, execution: {
           let o = 0;
           for (let ki = 0; ki < seqKV; ki++) {
             if ((causal && ki > qi) || !keeps(batchIndex, qi, ki)) continue;
-            const probabilityIndex = attentionProbabilityIndex(
-              batchIndex, h, qi, ki, heads, seqQ, seqKV,
-            );
-            o += (probabilities[ki] / sum) * probabilityDropout(probabilityIndex) *
+            const probabilityIndex = (((batchIndex * heads + h) * seqQ + qi) * seqKV + ki);
+            o += (probabilities[ki] / sum) * probabilityMultiplier(probabilityIndex) *
               v[kvBase + ki * d_model + h * head_dim + d];
           }
           outBuf[outputBase + qi * d_model + h * head_dim + d] = o;

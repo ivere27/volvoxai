@@ -6,5 +6,5 @@
   "generator": "protoc-gen-synurang-ffi",
   "generator_version": "0.7.2",
   "mode": "c-lite",
-  "proto_sha256": "2999dda2e4525fefb3864474b9d6481393a8745ede7126711de88caa979ad452"
+  "proto_sha256": "ba20b3358b8a2819d7f23ac4e778550541a0eb83ced5c8087f8f483fcec632b6"
 }

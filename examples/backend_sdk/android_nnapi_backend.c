@@ -1,121 +1,225 @@
-/*
- * Conservative Android NNAPI backend SDK example.
- *
- * The only VolvoxAI headers used here are public headers.  The backend handles
- * exact-shape F32 Add and declines broadcasting and every other operation so
- * the built-in CPU backend remains the correctness fallback.
- */
+/* Conservative Android NNAPI provider built only against the public ABI.
+ * It accepts the exact two-element F32 Add graph documented by the host
+ * example and keeps all inputs and NNAPI execution objects context-local. */
 
 #include "android_nnapi_backend.h"
 
 #include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #ifdef __ANDROID__
 #include <android/NeuralNetworks.h>
 #endif
 
-enum { EXAMPLE_NNAPI_MAX_RANK = 4 };
+#define EXAMPLE_NNAPI_GRAPH \
+    "{\"format\":\"volvox-graph/v1\",\"inputs\":{" \
+    "\"a\":{\"shape\":[2],\"dtype\":\"float32\"}," \
+    "\"b\":{\"shape\":[2],\"dtype\":\"float32\"}}," \
+    "\"nodes\":[{\"opType\":\"Add\",\"inputs\":{" \
+    "\"a\":\"a\",\"b\":\"b\"},\"outputs\":{\"out\":\"sum\"}," \
+    "\"outputs_shape\":{\"out\":[2]}}],\"outputs\":[\"sum\"]}"
 
-typedef struct {
+typedef struct ExampleNnapiRuntime {
     int ready;
-} ExampleNnapiBackend;
+} ExampleNnapiRuntime;
 
-static ExampleNnapiBackend g_example_nnapi;
+typedef struct ExampleNnapiCompiled {
+    ExampleNnapiRuntime* runtime;
+} ExampleNnapiCompiled;
 
-static int tensor_is_exact_f32(const VxTensor* tensor) {
-    return tensor && vx_tensor_dtype(tensor) == VX_DTYPE_F32 &&
-           vx_tensor_element_size(tensor) == sizeof(float) &&
-           vx_tensor_numel(tensor) > 0 &&
-           (uint64_t)vx_tensor_numel(tensor) <= SIZE_MAX / sizeof(float) &&
-           vx_tensor_shape(tensor);
+typedef struct ExampleNnapiContext {
+    ExampleNnapiCompiled* compiled;
+    float a[2];
+    float b[2];
+    int has_a;
+    int has_b;
+    int closed;
+} ExampleNnapiContext;
+
+static void example_report(VxReport* report, VxStatus status, VxStage stage,
+                           const char* reason, const char* message) {
+    size_t struct_size;
+    if (!report || report->struct_size < sizeof(*report)) return;
+    struct_size = report->struct_size;
+    memset(report, 0, sizeof(*report));
+    report->struct_size = struct_size;
+    report->status = status;
+    report->stage = stage;
+    snprintf(report->backend, sizeof(report->backend), "%s",
+             "android-nnapi-add");
+    snprintf(report->device, sizeof(report->device), "%s", "android-nnapi");
+    snprintf(report->reason, sizeof(report->reason), "%s", reason);
+    snprintf(report->message, sizeof(report->message), "%s", message);
 }
 
-int volvoxai_example_nnapi_add_supports(const VxNode* node) {
-    const VxTensor* left;
-    const VxTensor* right;
-    const VxTensor* output;
-    const int32_t* left_shape;
-    const int32_t* right_shape;
-    const int32_t* output_shape;
-    int32_t rank;
-
-    if (!node || !vx_node_op(node) || strcmp(vx_node_op(node), "Add") ||
-        vx_node_attr_bool(node, "relu", 0) ||
-        vx_node_input_count(node) != 2 || vx_node_output_count(node) != 1)
-        return VX_DECLINED;
-    left = vx_node_input_by_key(node, "a");
-    right = vx_node_input_by_key(node, "b");
-    output = vx_node_output_by_key(node, "out");
-    if (!tensor_is_exact_f32(left) || !tensor_is_exact_f32(right) ||
-        !tensor_is_exact_f32(output)) return VX_DECLINED;
-    rank = vx_tensor_ndim(left);
-    if (rank < 1 || rank > EXAMPLE_NNAPI_MAX_RANK ||
-        vx_tensor_ndim(right) != rank || vx_tensor_ndim(output) != rank ||
-        vx_tensor_numel(right) != vx_tensor_numel(left) ||
-        vx_tensor_numel(output) != vx_tensor_numel(left)) return VX_DECLINED;
-    left_shape = vx_tensor_shape(left);
-    right_shape = vx_tensor_shape(right);
-    output_shape = vx_tensor_shape(output);
-    for (int32_t axis = 0; axis < rank; axis++) {
-        if (left_shape[axis] <= 0 || right_shape[axis] != left_shape[axis] ||
-            output_shape[axis] != left_shape[axis]) return VX_DECLINED;
+static int example_graph_matches(const char* path) {
+    FILE* file;
+    char* bytes;
+    long length;
+    size_t read_count;
+    int matches;
+    if (!path) return 0;
+    file = fopen(path, "rb");
+    if (!file) return 0;
+    if (fseek(file, 0, SEEK_END) != 0 || (length = ftell(file)) < 0 ||
+        fseek(file, 0, SEEK_SET) != 0) {
+        fclose(file);
+        return 0;
     }
-    return VX_HANDLED;
+    bytes = (char*)malloc((size_t)length + 1u);
+    if (!bytes) {
+        fclose(file);
+        return 0;
+    }
+    read_count = fread(bytes, 1, (size_t)length, file);
+    matches = read_count == (size_t)length && fclose(file) == 0;
+    bytes[read_count] = '\0';
+    matches = matches && !strcmp(bytes, EXAMPLE_NNAPI_GRAPH);
+    free(bytes);
+    return matches;
+}
+
+static int policy_contains(const VxBackendPolicy* policy, const char* name) {
+    if (!policy || !policy->backends) return 0;
+    for (size_t index = 0; index < policy->backend_count; index++)
+        if (policy->backends[index] && !strcmp(policy->backends[index], name))
+            return 1;
+    return 0;
+}
+
+static VxStatus example_runtime_create(void* user_data,
+                                       const VxRuntimeOptions* options,
+                                       void** out_runtime,
+                                       VxReport* report) {
+    ExampleNnapiRuntime* runtime;
+    (void)user_data;
+    (void)options;
+    if (!out_runtime) return VX_STATUS_INVALID_ARGUMENT;
+    *out_runtime = NULL;
+#ifdef __ANDROID__
+    {
+        uint32_t device_count = 0;
+        if (ANeuralNetworks_getDeviceCount(&device_count) !=
+                ANEURALNETWORKS_NO_ERROR || !device_count) {
+            example_report(report, VX_STATUS_BACKEND_UNAVAILABLE,
+                           VX_STAGE_RUNTIME_CREATE, "BACKEND_UNAVAILABLE",
+                           "Android NNAPI device is unavailable");
+            return VX_STATUS_BACKEND_UNAVAILABLE;
+        }
+    }
+#else
+    example_report(report, VX_STATUS_BACKEND_UNAVAILABLE,
+                   VX_STAGE_RUNTIME_CREATE, "BACKEND_UNAVAILABLE",
+                   "Android NNAPI is unavailable on this platform");
+    return VX_STATUS_BACKEND_UNAVAILABLE;
+#endif
+    runtime = (ExampleNnapiRuntime*)calloc(1, sizeof(*runtime));
+    if (!runtime) return VX_STATUS_OUT_OF_MEMORY;
+    runtime->ready = 1;
+    *out_runtime = runtime;
+    example_report(report, VX_STATUS_OK, VX_STAGE_RUNTIME_CREATE, "OK",
+                   "Android NNAPI provider runtime created");
+    return VX_STATUS_OK;
+}
+
+static void example_runtime_destroy(void* runtime_instance) {
+    free(runtime_instance);
+}
+
+static VxStatus example_compile(void* runtime_instance,
+                                const VxModelSource* source,
+                                const VxBackendPolicy* policy,
+                                void** out_compiled,
+                                VxReport* report) {
+    ExampleNnapiCompiled* compiled;
+    ExampleNnapiRuntime* runtime = (ExampleNnapiRuntime*)runtime_instance;
+    if (!runtime || !runtime->ready || !source || !out_compiled ||
+        !policy_contains(policy, "android-nnapi-add"))
+        return VX_STATUS_INVALID_ARGUMENT;
+    *out_compiled = NULL;
+    if (!example_graph_matches(source->graph_path)) {
+        example_report(report, VX_STATUS_BACKEND_UNSUPPORTED, VX_STAGE_COMPILE,
+                       "BACKEND_UNSUPPORTED",
+                       "NNAPI example accepts only its documented Add graph");
+        return VX_STATUS_BACKEND_UNSUPPORTED;
+    }
+    compiled = (ExampleNnapiCompiled*)calloc(1, sizeof(*compiled));
+    if (!compiled) return VX_STATUS_OUT_OF_MEMORY;
+    compiled->runtime = runtime;
+    *out_compiled = compiled;
+    example_report(report, VX_STATUS_OK, VX_STAGE_COMPILE, "OK",
+                   "NNAPI Add graph compiled");
+    if (report && report->struct_size >= sizeof(*report)) {
+        report->route_attested = 1;
+        snprintf(report->route_evidence, sizeof(report->route_evidence), "%s",
+                 "provider=android-nnapi-add;nodes=1;route=nnapi-all");
+        snprintf(report->fallback_evidence,
+                 sizeof(report->fallback_evidence), "%s", "operator=none");
+    }
+    return VX_STATUS_OK;
+}
+
+static void example_compiled_destroy(void* compiled_instance) {
+    free(compiled_instance);
+}
+
+static VxStatus example_context_create(void* compiled_instance,
+                                       const VxContextOptions* options,
+                                       void** out_context,
+                                       VxReport* report) {
+    ExampleNnapiContext* context;
+    (void)report;
+    if (!compiled_instance || !options || !out_context ||
+        options->decode_row_mode != VX_DECODE_ROW_DISABLED)
+        return VX_STATUS_BACKEND_UNSUPPORTED;
+    *out_context = NULL;
+    context = (ExampleNnapiContext*)calloc(1, sizeof(*context));
+    if (!context) return VX_STATUS_OUT_OF_MEMORY;
+    context->compiled = (ExampleNnapiCompiled*)compiled_instance;
+    *out_context = context;
+    return VX_STATUS_OK;
+}
+
+static VxStatus example_context_set_input(void* context_instance,
+                                          const char* name,
+                                          VxDataType dtype,
+                                          const void* data,
+                                          size_t byte_size,
+                                          VxReport* report) {
+    ExampleNnapiContext* context = (ExampleNnapiContext*)context_instance;
+    (void)report;
+    if (!context || context->closed || !name || dtype != VX_DTYPE_F32 ||
+        !data || byte_size != sizeof(context->a))
+        return VX_STATUS_INVALID_ARGUMENT;
+    if (!strcmp(name, "a")) {
+        memcpy(context->a, data, sizeof(context->a));
+        context->has_a = 1;
+    } else if (!strcmp(name, "b")) {
+        memcpy(context->b, data, sizeof(context->b));
+        context->has_b = 1;
+    } else {
+        return VX_STATUS_NOT_FOUND;
+    }
+    return VX_STATUS_OK;
 }
 
 #ifdef __ANDROID__
-
-static int example_init(void* user_data) {
-    ExampleNnapiBackend* backend = (ExampleNnapiBackend*)user_data;
-    uint32_t device_count = 0;
-    int status = ANeuralNetworks_getDeviceCount(&device_count);
-    backend->ready = 0;
-    if (status != ANEURALNETWORKS_NO_ERROR) return VX_INIT_ERROR;
-    if (!device_count) return VX_INIT_UNAVAILABLE;
-    backend->ready = 1;
-    return VX_INIT_READY;
-}
-
-static int example_supports(void* user_data, const VxNode* node) {
-    const ExampleNnapiBackend* backend = (const ExampleNnapiBackend*)user_data;
-    return backend->ready ? volvoxai_example_nnapi_add_supports(node) : VX_DECLINED;
-}
-
-static int example_run(void* user_data, const VxNode* node) {
-    ExampleNnapiBackend* backend = (ExampleNnapiBackend*)user_data;
-    const VxTensor* left;
-    const VxTensor* right;
-    VxTensor* output;
-    const int32_t* shape;
-    uint32_t dimensions[EXAMPLE_NNAPI_MAX_RANK];
+static VxStatus example_nnapi_add(const float a[2], const float b[2],
+                                  float output[2]) {
+    const uint32_t dimensions[1] = {2};
+    const uint32_t add_inputs[3] = {0, 1, 2};
+    const uint32_t add_outputs[1] = {3};
+    const uint32_t model_inputs[2] = {0, 1};
     ANeuralNetworksModel* model = NULL;
     ANeuralNetworksCompilation* compilation = NULL;
     ANeuralNetworksExecution* execution = NULL;
-    size_t bytes;
-    int result = VX_ERROR;
-
-    if (!backend->ready) return VX_ERROR;
-    if (volvoxai_example_nnapi_add_supports(node) != VX_HANDLED) return VX_DECLINED;
-    left = vx_node_input_by_key(node, "a");
-    right = vx_node_input_by_key(node, "b");
-    output = vx_node_output_by_key(node, "out");
-    if (vx_tensor_sync_host(left) != 0 || vx_tensor_sync_host(right) != 0)
-        return VX_ERROR;
-    shape = vx_tensor_shape(left);
-    for (int32_t axis = 0; axis < vx_tensor_ndim(left); axis++)
-        dimensions[axis] = (uint32_t)shape[axis];
-    bytes = (size_t)vx_tensor_numel(left) * sizeof(float);
-    if (!vx_tensor_cdata(left) || !vx_tensor_cdata(right) || !vx_tensor_data(output))
-        return VX_ERROR;
-
-#define EXAMPLE_NNAPI_TRY(call) \
-    do { if ((call) != ANEURALNETWORKS_NO_ERROR) goto done; } while (0)
-
-    EXAMPLE_NNAPI_TRY(ANeuralNetworksModel_create(&model));
+    int32_t activation = ANEURALNETWORKS_FUSED_NONE;
+    VxStatus result = VX_STATUS_EXECUTION_FAILED;
     ANeuralNetworksOperandType tensor_type = {
         .type = ANEURALNETWORKS_TENSOR_FLOAT32,
-        .dimensionCount = (uint32_t)vx_tensor_ndim(left),
+        .dimensionCount = 1,
         .dimensions = dimensions,
         .scale = 0.0f,
         .zeroPoint = 0,
@@ -127,18 +231,17 @@ static int example_run(void* user_data, const VxNode* node) {
         .scale = 0.0f,
         .zeroPoint = 0,
     };
-    EXAMPLE_NNAPI_TRY(ANeuralNetworksModel_addOperand(model, &tensor_type)); /* a */
-    EXAMPLE_NNAPI_TRY(ANeuralNetworksModel_addOperand(model, &tensor_type)); /* b */
+#define EXAMPLE_NNAPI_TRY(call) \
+    do { if ((call) != ANEURALNETWORKS_NO_ERROR) goto done; } while (0)
+    EXAMPLE_NNAPI_TRY(ANeuralNetworksModel_create(&model));
+    EXAMPLE_NNAPI_TRY(ANeuralNetworksModel_addOperand(model, &tensor_type));
+    EXAMPLE_NNAPI_TRY(ANeuralNetworksModel_addOperand(model, &tensor_type));
     EXAMPLE_NNAPI_TRY(ANeuralNetworksModel_addOperand(model, &activation_type));
-    EXAMPLE_NNAPI_TRY(ANeuralNetworksModel_addOperand(model, &tensor_type)); /* out */
-    int32_t activation = ANEURALNETWORKS_FUSED_NONE;
+    EXAMPLE_NNAPI_TRY(ANeuralNetworksModel_addOperand(model, &tensor_type));
     EXAMPLE_NNAPI_TRY(ANeuralNetworksModel_setOperandValue(
         model, 2, &activation, sizeof(activation)));
-    const uint32_t add_inputs[] = {0, 1, 2};
-    const uint32_t add_outputs[] = {3};
     EXAMPLE_NNAPI_TRY(ANeuralNetworksModel_addOperation(
         model, ANEURALNETWORKS_ADD, 3, add_inputs, 1, add_outputs));
-    const uint32_t model_inputs[] = {0, 1};
     EXAMPLE_NNAPI_TRY(ANeuralNetworksModel_identifyInputsAndOutputs(
         model, 2, model_inputs, 1, add_outputs));
     EXAMPLE_NNAPI_TRY(ANeuralNetworksModel_finish(model));
@@ -146,14 +249,13 @@ static int example_run(void* user_data, const VxNode* node) {
     EXAMPLE_NNAPI_TRY(ANeuralNetworksCompilation_finish(compilation));
     EXAMPLE_NNAPI_TRY(ANeuralNetworksExecution_create(compilation, &execution));
     EXAMPLE_NNAPI_TRY(ANeuralNetworksExecution_setInput(
-        execution, 0, NULL, vx_tensor_cdata(left), bytes));
+        execution, 0, NULL, a, 2u * sizeof(float)));
     EXAMPLE_NNAPI_TRY(ANeuralNetworksExecution_setInput(
-        execution, 1, NULL, vx_tensor_cdata(right), bytes));
+        execution, 1, NULL, b, 2u * sizeof(float)));
     EXAMPLE_NNAPI_TRY(ANeuralNetworksExecution_setOutput(
-        execution, 0, NULL, vx_tensor_data(output), bytes));
+        execution, 0, NULL, output, 2u * sizeof(float)));
     EXAMPLE_NNAPI_TRY(ANeuralNetworksExecution_compute(execution));
-    result = VX_HANDLED;
-
+    result = VX_STATUS_OK;
 done:
     ANeuralNetworksExecution_free(execution);
     ANeuralNetworksCompilation_free(compilation);
@@ -161,42 +263,67 @@ done:
 #undef EXAMPLE_NNAPI_TRY
     return result;
 }
-
-#else
-
-static int example_init(void* user_data) {
-    ((ExampleNnapiBackend*)user_data)->ready = 0;
-    return VX_INIT_UNAVAILABLE;
-}
-
-static int example_supports(void* user_data, const VxNode* node) {
-    (void)user_data;
-    (void)node;
-    return VX_DECLINED;
-}
-
-static int example_run(void* user_data, const VxNode* node) {
-    (void)user_data;
-    (void)node;
-    return VX_ERROR;
-}
-
 #endif
 
-static void example_teardown(void* user_data) {
-    ((ExampleNnapiBackend*)user_data)->ready = 0;
+static VxStatus example_context_execute(void* context_instance,
+                                        const VxBackendOutputSink* sink,
+                                        VxReport* report) {
+    ExampleNnapiContext* context = (ExampleNnapiContext*)context_instance;
+    const int64_t shape[1] = {2};
+    float output[2];
+    VxStatus status;
+    if (!context || context->closed || !context->has_a || !context->has_b ||
+        !sink || sink->struct_size < sizeof(*sink) || !sink->write)
+        return VX_STATUS_INVALID_ARGUMENT;
+#ifdef __ANDROID__
+    status = example_nnapi_add(context->a, context->b, output);
+    if (status != VX_STATUS_OK) return status;
+#else
+    (void)output;
+    return VX_STATUS_BACKEND_UNAVAILABLE;
+#endif
+    status = sink->write(sink->user_data, "sum", VX_DTYPE_F32, shape, 1,
+                         output, sizeof(output));
+    if (status != VX_STATUS_OK) return status;
+    example_report(report, VX_STATUS_OK, VX_STAGE_EXECUTE, "OK",
+                   "NNAPI Add executed");
+    if (report && report->struct_size >= sizeof(*report)) {
+        report->route_attested = 1;
+        snprintf(report->route_evidence, sizeof(report->route_evidence), "%s",
+                 "provider=android-nnapi-add;nodes=1;route=nnapi-all");
+    }
+    return VX_STATUS_OK;
 }
 
-int volvoxai_example_nnapi_backend_register(void) {
-    const VxBackendV1 backend = {
-        .struct_size = sizeof(VxBackendV1),
-        .abi_version = VX_BACKEND_ABI_V1,
+static VxStatus example_context_close(void* context_instance,
+                                      VxReport* report) {
+    ExampleNnapiContext* context = (ExampleNnapiContext*)context_instance;
+    (void)report;
+    if (!context) return VX_STATUS_INVALID_ARGUMENT;
+    context->closed = 1;
+    return VX_STATUS_OK;
+}
+
+static void example_context_destroy(void* context_instance) {
+    free(context_instance);
+}
+
+VxStatus volvoxai_example_nnapi_backend_register(VxRuntime* runtime,
+                                                 VxReport* report) {
+    const VxBackendProvider provider = {
+        .struct_size = sizeof(VxBackendProvider),
+        .abi_version = VX_BACKEND_ABI_VERSION,
         .name = "android-nnapi-add",
-        .user_data = &g_example_nnapi,
-        .init = example_init,
-        .supports = example_supports,
-        .run = example_run,
-        .teardown = example_teardown,
+        .runtime_create = example_runtime_create,
+        .runtime_destroy = example_runtime_destroy,
+        .compile = example_compile,
+        .compiled_destroy = example_compiled_destroy,
+        .context_create = example_context_create,
+        .context_set_input = example_context_set_input,
+        .context_execute = example_context_execute,
+        .context_select_adapter = NULL,
+        .context_close = example_context_close,
+        .context_destroy = example_context_destroy,
     };
-    return volvoxai_register_backend(&backend);
+    return vx_runtime_register_provider(runtime, &provider, report);
 }

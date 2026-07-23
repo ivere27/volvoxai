@@ -10,7 +10,7 @@
 <div id="story"></div>
 <pre id="out" style="position:absolute;left:-9999px"></pre>
     <script type="module">
-    import { Tokenizer, VolvoxAI } from '../dist/0.2.0/volvoxai.js';
+    import { Graph, GraphLoader, Tokenizer, VolvoxAI } from '../dist/0.3.0/volvoxai.js';
 
 const q = new URLSearchParams(location.search);
     const backend = q.get('backend') || 'wasm';          // webgpu | wasm | cpu
@@ -29,18 +29,28 @@ const fail = (e) => { setStatus('ERROR ' + e.message); outEl.textContent = 'FATA
 
     async function main() {
       setStatus(`init(${backend})…`);
-      const engine = await VolvoxAI.init(backend, '../dist/0.2.0/volvoxai.wasm');
+      const runtime = await VolvoxAI.createRuntime({
+        backends: [backend],
+        wasmUrl: '../dist/0.3.0/volvoxai.wasm',
+      });
+      let model;
+      let compiled;
+      let context;
+      try {
 
       setStatus('loading tokenizer…');
       const tokenizer = new Tokenizer();
       await tokenizer.load(VOCAB, MERGES);
 
   setStatus('loading model…');
-  const graph = await engine.loadGraph(MODEL);
-  const exec = await engine.compile(graph);
-  const cn = exec.constructor.name;   // WebGPUEngine | GraphExecutor | WasmEngine | CPUEngine (bundler may prefix '_')
-  const usedBackend = exec.backendName ||
-    (/GraphExecutor|WebGPU/.test(cn) ? 'webgpu' : /WebNN/.test(cn) ? 'webnn' : /Wasm/.test(cn) ? 'wasm' : 'cpu');
+  const graph = new Graph();
+  await GraphLoader.load(graph, MODEL);
+  model = runtime.createModel(graph);
+  compiled = await model.compile({
+    backend: { mode: 'require', backend, operatorFallback: 'forbid' },
+  });
+  context = await compiled.createContext();
+  const usedBackend = compiled.backend;
   document.getElementById('backend').textContent = usedBackend;
   const outName = graph.outputNames[graph.outputNames.length - 1];
 
@@ -55,26 +65,18 @@ const fail = (e) => { setStatus('ERROR ' + e.message); outEl.textContent = 'FATA
   const outIds = [];
   const argmaxRow = (logits, row) => { let b = 0, bv = -1e30; const o = row * VOCAB_SIZE; for (let i = 0; i < VOCAB_SIZE; i++) if (logits[o + i] > bv) { bv = logits[o + i]; b = i; } return b; };
 
-  // WebGPU: read back only the needed logits row (avoids a 51MB readback per step).
-  async function gpuRowLogits(gpuBuffer, row) {
-    const dev = exec.device, bytes = VOCAB_SIZE * 4;
-    const staging = dev.createBuffer({ size: bytes, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST });
-    const enc = dev.createCommandEncoder();
-    enc.copyBufferToBuffer(gpuBuffer, row * bytes, staging, 0, bytes);
-    dev.queue.submit([enc.finish()]);
-    await staging.mapAsync(GPUMapMode.READ);
-    const arr = new Float32Array(staging.getMappedRange().slice(0)); staging.unmap(); staging.destroy();
-    return arr;
-  }
-
       setStatus('generating…');
       storyEl.textContent = prompt;
       const t0 = performance.now();
       for (let step = 0; step < nNew && last < SEQ - 1; step++) {
-        const res = await exec.execute({ tokens, positions });
-        let best;
-        if (usedBackend === 'webgpu') { const row = await gpuRowLogits(res, last); best = argmaxRow(row, 0); }
-        else { best = argmaxRow(res[outName], last); }
+        const result = await context.execute({ tokens, positions });
+        let logits;
+        try {
+          logits = await result.output(outName).read();
+        } finally {
+          await result.close();
+        }
+        const best = argmaxRow(logits, last);
         outIds.push(best);
         last++; tokens[last] = best;
         storyEl.textContent = prompt + tokenizer.decode(outIds);
@@ -84,6 +86,12 @@ const fail = (e) => { setStatus('ERROR ' + e.message); outEl.textContent = 'FATA
   const text = storyEl.textContent;
   setStatus(`done (${usedBackend}, ${dt.toFixed(1)}s)`);
   outEl.textContent = `DONE backend=${usedBackend} tps=${(nNew / dt).toFixed(2)}\n` + text;
+      } finally {
+        await context?.close();
+        await compiled?.close();
+        await model?.close();
+        await runtime.close();
+      }
 }
 main().catch(fail);
 </script>

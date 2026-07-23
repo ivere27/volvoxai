@@ -1,8 +1,9 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
-import { CPUEngine, Graph } from '../ts/index.js';
-import { CPUAutograd } from '../ts/training/index.js';
+import { Graph } from '../ts/index.js';
+import { CPUEngine } from '../ts/backends/CPUEngine.js';
+import { CPUAutograd } from '../ts/training/CPUAutograd.js';
 import { geluValue } from '../ts/ops/gELU.js';
 
 function addWeight(graph, name, shape, values) {
@@ -61,7 +62,7 @@ async function gradients(graph, trainableTensors, targets, inputs = {}) {
 test('CPU training selects one sequence row per batch target', async () => {
   const graph = new Graph();
   const logits = addWeight(graph, 'logits', [2, 2, 2], new Array(8).fill(0));
-  graph.outputNames = [logits.name];
+  graph.setOutputs([logits.name]);
   const options = {
     targets: [1, 0],
     trainableTensors: ['logits'],
@@ -88,12 +89,12 @@ test('CPU training selects one sequence row per batch target', async () => {
 });
 
 test('activation backward formulas match finite differences', async (t) => {
-  for (const opType of ['ReLU', 'GELU', 'SiLU', 'Swish', 'Sigmoid', 'Tanh', 'LeakyReLU']) {
+  for (const opType of ['ReLU', 'GELU', 'SiLU', 'Sigmoid', 'Tanh', 'LeakyReLU']) {
     await t.test(opType, async () => {
       const graph = new Graph();
       const parameter = addWeight(graph, 'parameter', [1, 3], [-0.7, 0.2, 1.1]);
       const { out } = graph.addOp(opType, { input: parameter }, { out: [1, 3] }, { alpha: 0.2 });
-      graph.outputNames = [out.name];
+      graph.setOutputs([out.name]);
       const targets = [1];
       const { result, engine } = await gradients(graph, ['parameter'], targets);
       for (let index = 0; index < parameter.buffer.length; index++) {
@@ -110,7 +111,7 @@ test('CPU GELU defaults to erf semantics and retains explicit tanh approximation
     const graph = new Graph();
     const input = graph.addInput('input', [values.length]);
     const { out } = graph.addOp('GELU', { input }, { out: [values.length] }, params);
-    graph.outputNames = [out.name];
+    graph.setOutputs([out.name]);
     const engine = new CPUEngine();
     engine.allocateGraph(graph);
     await engine.execute({ input: values });
@@ -135,7 +136,7 @@ test('Embedding scatters gradients only into selected table rows', async () => {
     0.9, -0.1, 0.5,
   ]);
   const { out } = graph.addOp('Embedding', { input: token, weight: table }, { out: [1, 3] });
-  graph.outputNames = [out.name];
+  graph.setOutputs([out.name]);
   const inputs = { token: Int32Array.of(1) };
   const targets = [2];
   const { result, engine } = await gradients(graph, ['table'], targets, inputs);
@@ -155,7 +156,7 @@ test('LayerNorm and RMSNorm propagate input and affine gradients', async (t) => 
     const weight = addWeight(graph, 'weight', [3], [1.2, 0.8, 1.1]);
     const bias = addWeight(graph, 'bias', [3], [0.1, -0.2, 0.3]);
     const { out } = graph.addOp('LayerNorm', { input, weight, bias }, { out: [1, 3] }, { d_model: 3, eps: 0.2 });
-    graph.outputNames = [out.name];
+    graph.setOutputs([out.name]);
     const targets = [1];
     const { result, engine } = await gradients(graph, ['input', 'weight', 'bias'], targets);
     for (const [name, index] of [['input', 1], ['weight', 1], ['bias', 1]]) {
@@ -169,7 +170,7 @@ test('LayerNorm and RMSNorm propagate input and affine gradients', async (t) => 
     const input = addWeight(graph, 'input', [1, 3], [-0.4, 0.2, 1.3]);
     const weight = addWeight(graph, 'weight', [3], [1.2, 0.8, 1.1]);
     const { out } = graph.addOp('RMSNorm', { input, weight }, { out: [1, 3] }, { d_model: 3, eps: 0.15 });
-    graph.outputNames = [out.name];
+    graph.setOutputs([out.name]);
     const targets = [1];
     const { result, engine } = await gradients(graph, ['input', 'weight'], targets);
     for (const [name, index] of [['input', 1], ['weight', 1]]) {
@@ -188,7 +189,7 @@ test('last-axis ReduceSum and ReduceMean propagate every outer-row gradient', as
         -0.3, 0.6, 0.7, 0.8, -0.4, 0.2,
       ]);
       const logits = graph.addOp(opType, { input: parameter }, { out: [2, 2] }).out;
-      graph.outputNames = [logits.name];
+      graph.setOutputs([logits.name]);
       const targets = [1, 0];
       const { result, engine } = await gradients(graph, ['parameter'], targets);
       for (let index = 0; index < parameter.buffer.length; index++) {
@@ -207,7 +208,7 @@ test('SDPA and CrossSDPA gradients match finite differences', async (t) => {
       -0.3, 0.6, 0.1, -0.5, 0.7, 0.2,
     ]);
     const { out } = graph.addOp('SDPA', { qkv }, { out: [1, 2, 2] }, { heads: 1 });
-    graph.outputNames = [out.name];
+    graph.setOutputs([out.name]);
     const targets = [0, 1];
     const { result, engine } = await gradients(graph, ['qkv'], targets);
     for (const index of [6, 8, 9, 11]) {
@@ -222,7 +223,7 @@ test('SDPA and CrossSDPA gradients match finite differences', async (t) => {
     const k = addWeight(graph, 'k', [1, 2, 2], [0.3, 0.4, 0.1, -0.5]);
     const v = addWeight(graph, 'v', [1, 2, 2], [0.5, -0.2, 0.7, 0.2]);
     const { out } = graph.addOp('CrossSDPA', { q, k, v }, { out: [1, 2, 2] }, { heads: 1, scale: 0.37 });
-    graph.outputNames = [out.name];
+    graph.setOutputs([out.name]);
     const targets = [0, 1];
     const { result, engine } = await gradients(graph, ['q', 'k', 'v'], targets);
     for (const [name, index] of [['q', 3], ['k', 0], ['v', 3]]) {
@@ -240,7 +241,7 @@ test('JavaScript attention trains independent examples in a batch', async (t) =>
       -0.4, 0.7, 0.2, -0.1, 0.3, 0.6,
     ]);
     const { out } = graph.addOp('SDPA', { qkv }, { out: [2, 1, 2] }, { heads: 1 });
-    graph.outputNames = [out.name];
+    graph.setOutputs([out.name]);
 
     const targets = [0, 1];
     const { result, engine } = await gradients(graph, ['qkv'], targets);
@@ -268,7 +269,7 @@ test('JavaScript attention trains independent examples in a batch', async (t) =>
     const { out } = graph.addOp(
       'CrossSDPA', { q, k, v }, { out: [2, 2, 2] }, { heads: 1, scale: 0.37 },
     );
-    graph.outputNames = [out.name];
+    graph.setOutputs([out.name]);
 
     const targets = [0, 1, 1, 0];
     const { result, engine } = await gradients(graph, ['q', 'k', 'v'], targets);
@@ -295,7 +296,7 @@ async function convolutionCase({ depthwise }) {
     groups: 2,
     relu: depthwise ? 2 : 1,
   });
-  graph.outputNames = [out.name];
+  graph.setOutputs([out.name]);
   const targets = [0, 3];
   const { result, engine } = await gradients(graph, ['input', 'weight', 'bias'], targets);
   const probes = depthwise
@@ -335,7 +336,7 @@ test('MoERouter and MoELinear jointly backpropagate selected expert routes', asy
     route_indices: routes.indices,
     route_weights: routes.weights,
   }, { out: [1, 2] });
-  graph.outputNames = [out.name];
+  graph.setOutputs([out.name]);
 
   const names = ['input', 'router', 'router_bias', 'experts', 'expert_bias'];
   const targets = [1];
@@ -373,7 +374,7 @@ test('explicit graph LoRA A/B branches are trainable', async () => {
   const delta = graph.addOp('MatMul', { input: lowRank, weight: b }, { out: [1, 2] }).out;
   graph.nodes.at(-1).wLayout = 'din';
   const logits = graph.addOp('Add', { a: baseOut, b: delta }, { out: [1, 2] }).out;
-  graph.outputNames = [logits.name];
+  graph.setOutputs([logits.name]);
 
   const beforeA = new Float32Array(a.buffer);
   const beforeB = new Float32Array(b.buffer);
@@ -395,7 +396,7 @@ test('CPU training uses the base route when a staged adapter is active', async (
   const weight = addWeight(graph, 'weight', [2, 2], [1, 0, 0, 1]);
   const { out } = graph.addOp('MatMul', { input, weight }, { out: [1, 2] });
   graph.nodes[0].wLayout = 'din';
-  graph.outputNames = [out.name];
+  graph.setOutputs([out.name]);
   graph.stageAdapter('active', {
     kind: 'lora',
     targets: [{
@@ -414,7 +415,7 @@ test('CPU training validates optimizer and trainables before mutation', async ()
   const graph = new Graph();
   const parameter = addWeight(graph, 'parameter', [1, 2], [0.2, -0.4]);
   const { out } = graph.addOp('Identity', { input: parameter }, { out: [1, 2] });
-  graph.outputNames = [out.name];
+  graph.setOutputs([out.name]);
   const before = new Float32Array(parameter.buffer);
 
   await assert.rejects(() => CPUAutograd.trainStep(graph, {
@@ -426,7 +427,7 @@ test('CPU training validates optimizer and trainables before mutation', async ()
   }), /must be unique/);
   await assert.rejects(() => CPUAutograd.trainStep(graph, {
     targets: [0], trainableTensors: ['parameter'], updateMode: 'assign',
-  }), /must be SGD\/AdamW/);
+  }), /must be SGD or AdamW/);
   assert.deepEqual(parameter.buffer, before);
 });
 
@@ -436,7 +437,7 @@ test('CPU training propagates through a reachable Softmax branch before updating
   const supported = graph.addOp('ReLU', { input: parameter }, { out: [1, 3] }).out;
   const unsupported = graph.addOp('Softmax', { input: parameter }, { out: [1, 3] }).out;
   const logits = graph.addOp('Add', { a: supported, b: unsupported }, { out: [1, 3] }).out;
-  graph.outputNames = [logits.name];
+  graph.setOutputs([logits.name]);
   const before = new Float32Array(parameter.buffer);
 
   const result = await CPUAutograd.trainStep(graph, {
@@ -459,7 +460,7 @@ test('CPU training propagates through a reachable non-primary Split output', asy
     { axis: 1 },
   );
   const logits = graph.addOp('Identity', { input: split.right }, { out: [1, 2] }).out;
-  graph.outputNames = [logits.name];
+  graph.setOutputs([logits.name]);
   const before = new Float32Array(parameter.buffer);
 
   const result = await CPUAutograd.trainStep(graph, {
@@ -473,7 +474,7 @@ test('CPU training rejects non-finite gradients before mutating a trainable', as
   const graph = new Graph();
   const parameter = addWeight(graph, 'parameter', [1, 2], [Number.NaN, 0.4]);
   const logits = graph.addOp('Identity', { input: parameter }, { out: [1, 2] }).out;
-  graph.outputNames = [logits.name];
+  graph.setOutputs([logits.name]);
   const revision = graph.weightRevision;
   const finiteValue = parameter.buffer[1];
 

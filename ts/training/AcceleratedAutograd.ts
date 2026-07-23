@@ -41,9 +41,8 @@ interface TrainingLossMetric {
 /**
  * Required numerical hooks for a strict accelerated training backend.
  *
- * Unlike CPUAutograd's compatibility driver, this contract has no JavaScript
- * numerical fallbacks. A backend either implements the entire accepted graph
- * or rejects it during preflight.
+ * This contract has no JavaScript numerical fallbacks. A backend either
+ * implements the entire accepted graph or rejects it during preflight.
  */
 export interface AcceleratedTrainingExecution {
   readonly backend: string;

@@ -32,7 +32,7 @@ fn signed_byte(value : u32) -> i32 {
 
 fn input_value(index : u32) -> i32 {
   let byte = word_byte(input_words[index / 4u], index);
-  if (params.input_type == 2u) { return signed_byte(byte); }
+  if (params.input_type == 6u) { return signed_byte(byte); }
   return i32(byte);
 }
 
@@ -71,8 +71,8 @@ fn erf_approx_f32(value : f32) -> f32 {
 
 fn qgelu_one(index : u32) -> u32 {
   if (index >= params.elements) { return 0u; }
-  let minimum = select(0, -128, params.output_type == 2u);
-  let maximum = select(255, 127, params.output_type == 2u);
+  let minimum = select(0, -128, params.output_type == 6u);
+  let maximum = select(255, 127, params.output_type == 6u);
   let centered = input_value(index) - params.input_zero_point;
   let x = f32(centered) * params.input_scale;
   let erf_input = x * 0.7071067811865476;

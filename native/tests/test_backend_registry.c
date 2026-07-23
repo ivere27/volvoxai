@@ -1,4 +1,5 @@
 #include "backend.h"
+#include "generated/kernel_registry.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -177,6 +178,25 @@ static int check_trace(const char* expected) {
 static int initialize_registry(VxBackendRegistry* registry) {
     const VxBackend* const entries[] = { &k_backend_a, &k_backend_b, &k_backend_cpu };
     return vx_backend_registry_init(registry, entries, 3u, &k_backend_cpu);
+}
+
+static int test_generated_kernel_inventory(void) {
+    const VxKernelRegistration* wasm_qlinear =
+        vx_kernel_registry_find("wasm", "QLinear");
+    const VxKernelRegistration* webnn_qlinear =
+        vx_kernel_registry_find("webnn", "QLinear");
+    const VxKernelRegistration* cuda_qlinear =
+        vx_kernel_registry_find("cuda", "QLinear");
+    CHECK(wasm_qlinear != NULL);
+    CHECK(!strcmp(wasm_qlinear->route, "qlinear"));
+    CHECK(wasm_qlinear->exporter_qualified == 1);
+    CHECK(webnn_qlinear == NULL);
+    CHECK(cuda_qlinear != NULL);
+    CHECK(cuda_qlinear->dynamic == 1);
+    CHECK(cuda_qlinear->exporter_qualified == 0);
+    CHECK(vx_kernel_registry_find("native-cpu", "DefinitelyUnknown") == NULL);
+    CHECK(vx_kernel_registry_find("unknown", "QLinear") == NULL);
+    return 0;
 }
 
 static int test_ordered_selection(void) {
@@ -428,6 +448,7 @@ static int test_required_backend_may_not_be_unavailable(void) {
 }
 
 int main(void) {
+    CHECK(test_generated_kernel_inventory() == 0);
     CHECK(test_ordered_selection() == 0);
     CHECK(test_declines_and_cpu_fallback() == 0);
     CHECK(test_run_decline_and_errors() == 0);

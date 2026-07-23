@@ -37,7 +37,11 @@ test('WASM attention treats rank-2 as implicit batch one and loops rank-3 batche
     }, [qkv, out], { qkv: 64, out: 512 }, {
       sdpa_f32(...args) { calls.push(args); },
     });
+    assert.equal(engine.preparedGraph, undefined);
     await engine.execute({});
+    const lazilyPrepared = engine.preparedGraph;
+    assert.equal(Object.isFrozen(lazilyPrepared), true);
+    assert.equal(lazilyPrepared.schedule[0].kernelRoute, 'sdpa');
     assert.deepEqual(calls.map((args) => args.slice(0, 2)), [
       [64, 512],
       [64 + 3 * 6 * 4, 512 + 3 * 2 * 4],
@@ -48,6 +52,8 @@ test('WASM attention treats rank-2 as implicit batch one and loops rank-3 batche
     out.shape = [3, 2]; out.sizeBytes = 3 * 2 * 4;
     calls.length = 0;
     await engine.execute({});
+    assert.equal(engine.preparedGraph, lazilyPrepared,
+      'direct execution resolves its schedule once and reuses it');
     assert.equal(calls.length, 1);
     assert.deepEqual(calls[0].slice(0, 6), [64, 512, 3, 2, 1, 2]);
   });

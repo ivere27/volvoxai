@@ -22,7 +22,7 @@ function qLayerNormGraph() {
       quantization: { scheme: 'per_tensor', scale: 0.125, zero_point: -3 },
     },
   }, {});
-  graph.outputNames = [out.name];
+  graph.setOutputs([out.name]);
   return { graph, node: graph.nodes[0], input, out };
 }
 

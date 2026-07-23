@@ -1,8 +1,11 @@
 #include "opengl_engine.h"
+#include "runtime_state.h"
 
 #include <math.h>
+#include <pthread.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 double volvoxai_engine_now_ms(void) { return 0.0; }
@@ -97,10 +100,52 @@ static int check_tiled_qlinear_i8u8_tails(void) {
     opengl_graph_begin_forward();
     CHECK(opengl_graph_qlinear_i8u8(input, weight, scales, zero_points, bias, output,
                                     ROWS, D_IN, D_OUT, 1.0f, 0, 1.0f, 0,
-                                    2u, 2u, 2u) == 1);
+                                    VX_DTYPE_I8, VX_DTYPE_I8,
+                                    VX_DTYPE_I8) == 1);
     CHECK(opengl_graph_end_forward() == 0);
     CHECK(opengl_graph_sync_host(output, sizeof(output), 0) == 1);
     CHECK(memcmp(output, expected, sizeof(output)) == 0);
+    opengl_graph_reset();
+    return 0;
+}
+
+static int check_tiled_qlinear_staged_rounding(void) {
+    enum { ROWS = 2, D_IN = 16, D_OUT = 32 };
+    const uint8_t input[ROWS * D_IN] = {0};
+    const int8_t weight[D_OUT * D_IN] = {0};
+    float weight_scales[D_OUT];
+    const int32_t weight_zero_points[D_OUT] = {0};
+    int32_t bias[D_OUT];
+    uint8_t output[ROWS * D_OUT] = {0};
+    const float input_scale = 0.028062894940376282f;
+    const float weight_scale = 0.0006811817875131965f;
+    const float output_scale = 0.02981325425207615f;
+    const int32_t output_zero_point = 127;
+
+    for (int column = 0; column < D_OUT; column++) {
+        weight_scales[column] = weight_scale;
+        bias[column] = -3899;
+    }
+
+    /* The staged f32 schedule lands on an even tie. Contracting the final
+       multiply and add instead rounds to the adjacent integer 125. */
+    volatile float scale_product = input_scale * weight_scale;
+    volatile float multiplier = scale_product / output_scale;
+    volatile float scaled = (float)bias[0] * multiplier;
+    volatile float shifted = scaled + (float)output_zero_point;
+    CHECK(shifted == 124.5f);
+    CHECK(((int)floorf(shifted) & 1) == 0);
+
+    opengl_graph_reset();
+    opengl_graph_begin_forward();
+    CHECK(opengl_graph_qlinear_i8u8(
+        input, weight, weight_scales, weight_zero_points, bias, output,
+        ROWS, D_IN, D_OUT, input_scale, 0, output_scale,
+        output_zero_point, VX_DTYPE_U8, VX_DTYPE_I8, VX_DTYPE_U8) == 1);
+    CHECK(opengl_graph_end_forward() == 0);
+    CHECK(opengl_graph_sync_host(output, sizeof(output), 0) == 1);
+    for (int index = 0; index < ROWS * D_OUT; index++)
+        CHECK(output[index] == 124u);
     opengl_graph_reset();
     return 0;
 }
@@ -181,6 +226,57 @@ static int check_gelu_modes(void) {
     return 0;
 }
 
+static float layernorm_expected(const float* input, const float* weight,
+                                const float* bias, int index, int d_model,
+                                float epsilon) {
+    int offset = (index / d_model) * d_model;
+    float sum = 0.0f, square_sum = 0.0f;
+    for (int i = 0; i < d_model; i++) {
+        float value = input[offset + i];
+        sum += value;
+        square_sum += value * value;
+    }
+    float mean = sum / (float)d_model;
+    float variance = square_sum / (float)d_model - mean * mean;
+    int channel = index % d_model;
+    return (input[index] - mean) / sqrtf(variance + epsilon) * weight[channel] +
+        bias[channel];
+}
+
+static int check_layernorm_epsilon(void) {
+    enum { ROWS = 2, D_MODEL = 4, ELEMENTS = ROWS * D_MODEL };
+    const float input[ELEMENTS] = {
+        -0.03f, 0.01f, 0.02f, 0.0f,
+        1.0f, 1.002f, 0.998f, 1.001f
+    };
+    const float weight[D_MODEL] = {1.0f, 0.5f, 1.5f, 0.75f};
+    const float bias[D_MODEL] = {0.1f, -0.2f, 0.3f, -0.4f};
+    const float epsilons[2] = {0.25f, 1.0e-4f};
+    float output[2][ELEMENTS] = {{0}};
+
+    for (int pass = 0; pass < 2; pass++) {
+        opengl_graph_reset();
+        opengl_graph_begin_forward();
+        CHECK(opengl_graph_layernorm_f32(input, weight, bias, output[pass],
+                                         ROWS, D_MODEL, epsilons[pass]) == 1);
+        CHECK(opengl_graph_end_forward() == 0);
+        CHECK(opengl_graph_sync_host(output[pass], sizeof(output[pass]), 0) == 1);
+        for (int i = 0; i < ELEMENTS; i++) {
+            float expected = layernorm_expected(input, weight, bias, i, D_MODEL,
+                                                epsilons[pass]);
+            CHECK(isfinite(output[pass][i]));
+            CHECK(fabsf(output[pass][i] - expected) < 5.0e-4f);
+        }
+    }
+    CHECK(fabsf(output[0][0] - output[1][0]) > 0.5f);
+    CHECK(opengl_graph_layernorm_f32(input, weight, bias, output[0],
+                                     ROWS, D_MODEL, 0.0f) == 0);
+    CHECK(opengl_graph_layernorm_f32(input, weight, bias, output[0],
+                                     ROWS, D_MODEL, NAN) == 0);
+    opengl_graph_reset();
+    return 0;
+}
+
 static int check_qlinear_i8u8_packed_chain(void) {
     /* Logical byte tails exercise the packed u32 shader view.  `hidden` stays
        on the OpenGL device between the two explicit W8A8 dispatches. */
@@ -201,11 +297,13 @@ static int check_qlinear_i8u8_packed_chain(void) {
     CHECK(opengl_graph_qlinear_i8u8(input, first_weight, first_scales,
                                     first_zero_points, first_bias, hidden,
                                     1u, 3u, 2u, 0.5f, 0, 0.25f, 128,
-                                    2u, 2u, 3u) == 1);
+                                    VX_DTYPE_I8, VX_DTYPE_I8,
+                                    VX_DTYPE_U8) == 1);
     CHECK(opengl_graph_qlinear_i8u8(hidden, second_weight, second_scales,
                                     second_zero_points, second_bias, output,
                                     1u, 2u, 1u, 0.25f, 128, 0.25f, -3,
-                                    3u, 2u, 2u) == 1);
+                                    VX_DTYPE_U8, VX_DTYPE_I8,
+                                    VX_DTYPE_I8) == 1);
     CHECK(opengl_graph_end_forward() == 0);
     CHECK(opengl_graph_sync_host(hidden, sizeof(hidden), 0) == 1);
     CHECK(opengl_graph_sync_host(output, sizeof(output), 0) == 1);
@@ -231,21 +329,24 @@ static int check_qembedding_i8u8_packed_gather(void) {
     opengl_graph_reset();
     opengl_graph_begin_forward();
     CHECK(opengl_graph_qembedding_i8u8(ids, i8_table, scales, i8_zero_points, output_u8,
-                                       3u, 3u, 3u, 0.25f, 128, 2u, 3u) == 1);
+                                       3u, 3u, 3u, 0.25f, 128,
+                                       VX_DTYPE_I8, VX_DTYPE_U8) == 1);
     CHECK(opengl_graph_end_forward() == 0);
     CHECK(opengl_graph_sync_host(output_u8, sizeof(output_u8), 0) == 1);
     for (int index = 0; index < 9; index++) CHECK(output_u8[index] == expected_u8[index]);
 
     opengl_graph_begin_forward();
     CHECK(opengl_graph_qembedding_i8u8(ids, u8_table, scales, u8_zero_points, output_i8,
-                                       3u, 3u, 3u, 0.25f, -3, 3u, 2u) == 1);
+                                       3u, 3u, 3u, 0.25f, -3,
+                                       VX_DTYPE_U8, VX_DTYPE_I8) == 1);
     CHECK(opengl_graph_end_forward() == 0);
     CHECK(opengl_graph_sync_host(output_i8, sizeof(output_i8), 0) == 1);
     for (int index = 0; index < 9; index++) CHECK(output_i8[index] == expected_i8[index]);
 
     memset(output_u8, 0x5a, sizeof(output_u8));
     CHECK(opengl_graph_qembedding_i8u8(invalid_ids, i8_table, scales, i8_zero_points,
-                                       output_u8, 3u, 3u, 3u, 0.25f, 128, 2u, 3u) == 0);
+                                       output_u8, 3u, 3u, 3u, 0.25f, 128,
+                                       VX_DTYPE_I8, VX_DTYPE_U8) == 0);
     for (int index = 0; index < 9; index++) CHECK(output_u8[index] == 0x5a);
     opengl_graph_reset();
     return 0;
@@ -263,10 +364,11 @@ static int check_qadd_requantize_i8u8_packed_chain(void) {
     opengl_graph_begin_forward();
     CHECK(opengl_graph_qadd_i8u8(a, 5u, b, 5u, sum, 5u,
                                   0.5f, 0, 0.25f, 128,
-                                  0.5f, -2, 2u, 3u, 2u, 2u) == 1);
+                                  0.5f, -2, VX_DTYPE_I8, VX_DTYPE_U8,
+                                  VX_DTYPE_I8, 2u) == 1);
     CHECK(opengl_graph_requantize_linear_i8u8(sum, 5u, output, 5u,
                                               0.5f, -2, 1.0f, 100,
-                                              2u, 3u) == 1);
+                                              VX_DTYPE_I8, VX_DTYPE_U8) == 1);
     CHECK(opengl_graph_end_forward() == 0);
     CHECK(opengl_graph_sync_host(sum, sizeof(sum), 0) == 1);
     CHECK(opengl_graph_sync_host(output, sizeof(output), 0) == 1);
@@ -278,13 +380,15 @@ static int check_qadd_requantize_i8u8_packed_chain(void) {
     }
     CHECK(opengl_graph_qadd_i8u8(a, 5u, b, 4u, sum, 5u,
                                   0.5f, 0, 0.25f, 128,
-                                  0.5f, -2, 2u, 3u, 2u, 2u) == 0);
+                                  0.5f, -2, VX_DTYPE_I8, VX_DTYPE_U8,
+                                  VX_DTYPE_I8, 2u) == 0);
     CHECK(opengl_graph_qadd_i8u8(a, 5u, b, 5u, sum, 5u,
                                   0.5f, 0, 0.25f, 128,
-                                  0.5f, -2, 2u, 3u, 2u, 3u) == 0);
+                                  0.5f, -2, VX_DTYPE_I8, VX_DTYPE_U8,
+                                  VX_DTYPE_I8, 3u) == 0);
     CHECK(opengl_graph_requantize_linear_i8u8(sum, 5u, output, 4u,
                                               0.5f, -2, 1.0f, 100,
-                                              2u, 3u) == 0);
+                                              VX_DTYPE_I8, VX_DTYPE_U8) == 0);
     opengl_graph_reset();
     return 0;
 }
@@ -304,15 +408,20 @@ static int check_qsilu_i8u8_packed_chain(void) {
     opengl_graph_reset();
     opengl_graph_begin_forward();
     CHECK(opengl_graph_qsilu_i8u8(input_i8, from_i8_i8, 5u,
-                                   0.5f, 0, 0.25f, -3, 2u, 2u) == 1);
+                                   0.5f, 0, 0.25f, -3,
+                                   VX_DTYPE_I8, VX_DTYPE_I8) == 1);
     CHECK(opengl_graph_qsilu_i8u8(input_i8, from_i8_u8, 5u,
-                                   0.5f, 0, 0.25f, 128, 2u, 3u) == 1);
+                                   0.5f, 0, 0.25f, 128,
+                                   VX_DTYPE_I8, VX_DTYPE_U8) == 1);
     CHECK(opengl_graph_qsilu_i8u8(input_u8, from_u8_i8, 5u,
-                                   0.5f, 128, 0.25f, -3, 3u, 2u) == 1);
+                                   0.5f, 128, 0.25f, -3,
+                                   VX_DTYPE_U8, VX_DTYPE_I8) == 1);
     CHECK(opengl_graph_qsilu_i8u8(input_u8, from_u8_u8, 5u,
-                                   0.5f, 128, 0.25f, 128, 3u, 3u) == 1);
+                                   0.5f, 128, 0.25f, 128,
+                                   VX_DTYPE_U8, VX_DTYPE_U8) == 1);
     CHECK(opengl_graph_qsilu_i8u8(from_i8_u8, chained, 5u,
-                                   0.25f, 128, 0.125f, -4, 3u, 2u) == 1);
+                                   0.25f, 128, 0.125f, -4,
+                                   VX_DTYPE_U8, VX_DTYPE_I8) == 1);
     CHECK(opengl_graph_end_forward() == 0);
     CHECK(opengl_graph_sync_host(from_i8_i8, sizeof(from_i8_i8), 0) == 1);
     CHECK(opengl_graph_sync_host(from_i8_u8, sizeof(from_i8_u8), 0) == 1);
@@ -328,9 +437,11 @@ static int check_qsilu_i8u8_packed_chain(void) {
         CHECK(memcmp(chained, expected_chained, sizeof(expected_chained)) == 0);
     }
     CHECK(opengl_graph_qsilu_i8u8(input_i8, from_i8_i8, 0u,
-                                   0.5f, 0, 0.25f, -3, 2u, 2u) == 0);
+                                   0.5f, 0, 0.25f, -3,
+                                   VX_DTYPE_I8, VX_DTYPE_I8) == 0);
     CHECK(opengl_graph_qsilu_i8u8(alias, alias, 5u,
-                                   0.5f, 0, 0.25f, -3, 2u, 2u) == 0);
+                                   0.5f, 0, 0.25f, -3,
+                                   VX_DTYPE_I8, VX_DTYPE_I8) == 0);
     opengl_graph_reset();
     return 0;
 }
@@ -352,15 +463,20 @@ static int check_qgelu_i8u8_packed_chain(void) {
     opengl_graph_reset();
     opengl_graph_begin_forward();
     CHECK(opengl_graph_qgelu_i8u8(input_i8, from_i8_i8, 5u,
-                                   0.5f, 0, 0.125f, -3, 2u, 2u) == 1);
+                                   0.5f, 0, 0.125f, -3,
+                                   VX_DTYPE_I8, VX_DTYPE_I8) == 1);
     CHECK(opengl_graph_qgelu_i8u8(input_i8, from_i8_u8, 5u,
-                                   0.5f, 0, 0.125f, 128, 2u, 3u) == 1);
+                                   0.5f, 0, 0.125f, 128,
+                                   VX_DTYPE_I8, VX_DTYPE_U8) == 1);
     CHECK(opengl_graph_qgelu_i8u8(input_u8, from_u8_i8, 5u,
-                                   0.5f, 128, 0.125f, -3, 3u, 2u) == 1);
+                                   0.5f, 128, 0.125f, -3,
+                                   VX_DTYPE_U8, VX_DTYPE_I8) == 1);
     CHECK(opengl_graph_qgelu_i8u8(input_u8, from_u8_u8, 5u,
-                                   0.5f, 128, 0.125f, 128, 3u, 3u) == 1);
+                                   0.5f, 128, 0.125f, 128,
+                                   VX_DTYPE_U8, VX_DTYPE_U8) == 1);
     CHECK(opengl_graph_qgelu_i8u8(from_i8_u8, chained, 5u,
-                                   0.125f, 128, 0.125f, -4, 3u, 2u) == 1);
+                                   0.125f, 128, 0.125f, -4,
+                                   VX_DTYPE_U8, VX_DTYPE_I8) == 1);
     CHECK(opengl_graph_end_forward() == 0);
     CHECK(opengl_graph_sync_host(from_i8_i8, sizeof(from_i8_i8), 0) == 1);
     CHECK(opengl_graph_sync_host(from_i8_u8, sizeof(from_i8_u8), 0) == 1);
@@ -376,9 +492,11 @@ static int check_qgelu_i8u8_packed_chain(void) {
         CHECK(memcmp(chained, expected_chained, sizeof(expected_chained)) == 0);
     }
     CHECK(opengl_graph_qgelu_i8u8(input_i8, from_i8_i8, 0u,
-                                   0.5f, 0, 0.125f, -3, 2u, 2u) == 0);
+                                   0.5f, 0, 0.125f, -3,
+                                   VX_DTYPE_I8, VX_DTYPE_I8) == 0);
     CHECK(opengl_graph_qgelu_i8u8(alias, alias, 5u,
-                                   0.5f, 0, 0.125f, -3, 2u, 2u) == 0);
+                                   0.5f, 0, 0.125f, -3,
+                                   VX_DTYPE_I8, VX_DTYPE_I8) == 0);
     opengl_graph_reset();
     return 0;
 }
@@ -421,26 +539,33 @@ static int check_qgroupnorm_i8u8_packed_chain(void) {
     opengl_graph_begin_forward();
     CHECK(opengl_graph_qgroupnorm_i8u8(input_i8, gamma, beta, from_i8_i8,
                                         1u, 1u, 1u, 3u, 1u, 0.5f, -1,
-                                        0.125f, -3, 1.0e-5f, 2u, 2u) == 1);
+                                        0.125f, -3, 1.0e-5f,
+                                        VX_DTYPE_I8, VX_DTYPE_I8) == 1);
     CHECK(opengl_graph_qgroupnorm_i8u8(input_i8, gamma, beta, from_i8_u8,
                                         1u, 1u, 1u, 3u, 1u, 0.5f, -1,
-                                        0.125f, 128, 1.0e-5f, 2u, 3u) == 1);
+                                        0.125f, 128, 1.0e-5f,
+                                        VX_DTYPE_I8, VX_DTYPE_U8) == 1);
     CHECK(opengl_graph_qgroupnorm_i8u8(input_u8, gamma, beta, from_u8_i8,
                                         1u, 1u, 1u, 3u, 1u, 0.5f, 127,
-                                        0.125f, -3, 1.0e-5f, 3u, 2u) == 1);
+                                        0.125f, -3, 1.0e-5f,
+                                        VX_DTYPE_U8, VX_DTYPE_I8) == 1);
     CHECK(opengl_graph_qgroupnorm_i8u8(input_u8, gamma, beta, from_u8_u8,
                                         1u, 1u, 1u, 3u, 1u, 0.5f, 127,
-                                        0.125f, 128, 1.0e-5f, 3u, 3u) == 1);
+                                        0.125f, 128, 1.0e-5f,
+                                        VX_DTYPE_U8, VX_DTYPE_U8) == 1);
     /* The second stats/apply pair consumes a still-device-resident U8 tensor. */
     CHECK(opengl_graph_qgroupnorm_i8u8(from_i8_u8, zero_gamma, beta, chained,
                                         1u, 1u, 1u, 3u, 1u, 0.125f, 128,
-                                        0.125f, -4, 1.0e-5f, 3u, 2u) == 1);
+                                        0.125f, -4, 1.0e-5f,
+                                        VX_DTYPE_U8, VX_DTYPE_I8) == 1);
     CHECK(opengl_graph_qgroupnorm_i8u8(boundary_input, boundary_gamma, boundary_beta,
                                         boundary_output, 3u, 1u, 1u, 6u, 2u,
-                                        0.25f, -1, 0.125f, -3, 1.0e-5f, 2u, 2u) == 1);
+                                        0.25f, -1, 0.125f, -3, 1.0e-5f,
+                                        VX_DTYPE_I8, VX_DTYPE_I8) == 1);
     CHECK(opengl_graph_qgroupnorm_i8u8(high_input, high_gamma, high_beta, high_output,
                                         3u, 57u, 1u, 6u, 2u, 0.5f, 17,
-                                        0.25f, 128, 1.0e-5f, 3u, 3u) == 1);
+                                        0.25f, 128, 1.0e-5f,
+                                        VX_DTYPE_U8, VX_DTYPE_U8) == 1);
     CHECK(opengl_graph_end_forward() == 0);
     CHECK(opengl_graph_sync_host(from_i8_i8, sizeof(from_i8_i8), 0) == 1);
     CHECK(opengl_graph_sync_host(from_i8_u8, sizeof(from_i8_u8), 0) == 1);
@@ -464,10 +589,12 @@ static int check_qgroupnorm_i8u8_packed_chain(void) {
     }
     CHECK(opengl_graph_qgroupnorm_i8u8(input_i8, gamma, beta, from_i8_i8,
                                         1u, 1u, 1u, 3u, 0u, 0.5f, -1,
-                                        0.125f, -3, 1.0e-5f, 2u, 2u) == 0);
+                                        0.125f, -3, 1.0e-5f,
+                                        VX_DTYPE_I8, VX_DTYPE_I8) == 0);
     CHECK(opengl_graph_qgroupnorm_i8u8(alias, gamma, beta, alias,
                                         1u, 1u, 1u, 3u, 1u, 0.5f, -1,
-                                        0.125f, -3, 1.0e-5f, 2u, 2u) == 0);
+                                        0.125f, -3, 1.0e-5f,
+                                        VX_DTYPE_I8, VX_DTYPE_I8) == 0);
     opengl_graph_reset();
     return 0;
 }
@@ -504,22 +631,28 @@ static int check_qlayernorm_i8u8_packed_chain(void) {
     opengl_graph_begin_forward();
     CHECK(opengl_graph_qlayernorm_i8u8(input_i8, gamma, beta, from_i8_i8,
                                         2u, 3u, 0.5f, -1, 0.125f, -3,
-                                        1.0e-5f, 2u, 2u) == 1);
+                                        1.0e-5f, VX_DTYPE_I8,
+                                        VX_DTYPE_I8) == 1);
     CHECK(opengl_graph_qlayernorm_i8u8(input_i8, gamma, beta, from_i8_u8,
                                         2u, 3u, 0.5f, -1, 0.125f, 128,
-                                        1.0e-5f, 2u, 3u) == 1);
+                                        1.0e-5f, VX_DTYPE_I8,
+                                        VX_DTYPE_U8) == 1);
     CHECK(opengl_graph_qlayernorm_i8u8(input_u8, gamma, beta, from_u8_i8,
                                         2u, 3u, 0.5f, 127, 0.125f, -3,
-                                        1.0e-5f, 3u, 2u) == 1);
+                                        1.0e-5f, VX_DTYPE_U8,
+                                        VX_DTYPE_I8) == 1);
     CHECK(opengl_graph_qlayernorm_i8u8(input_u8, gamma, beta, from_u8_u8,
                                         2u, 3u, 0.5f, 127, 0.125f, 128,
-                                        1.0e-5f, 3u, 3u) == 1);
+                                        1.0e-5f, VX_DTYPE_U8,
+                                        VX_DTYPE_U8) == 1);
     CHECK(opengl_graph_qlayernorm_i8u8(from_i8_u8, zero_gamma, beta, chained,
                                         2u, 3u, 0.125f, 128, 0.125f, -4,
-                                        1.0e-5f, 3u, 2u) == 1);
+                                        1.0e-5f, VX_DTYPE_U8,
+                                        VX_DTYPE_I8) == 1);
     CHECK(opengl_graph_qlayernorm_i8u8(high_input, high_gamma, high_beta, high_output,
                                         2u, high_d_model, 0.5f, 17, 0.25f, 128,
-                                        1.0e-5f, 3u, 3u) == 1);
+                                        1.0e-5f, VX_DTYPE_U8,
+                                        VX_DTYPE_U8) == 1);
     CHECK(opengl_graph_end_forward() == 0);
     CHECK(opengl_graph_sync_host(from_i8_i8, sizeof(from_i8_i8), 0) == 1);
     CHECK(opengl_graph_sync_host(from_i8_u8, sizeof(from_i8_u8), 0) == 1);
@@ -539,10 +672,12 @@ static int check_qlayernorm_i8u8_packed_chain(void) {
         CHECK(high_output[index] == (uint8_t)(index & 1 ? 132 : 124));
     CHECK(opengl_graph_qlayernorm_i8u8(input_i8, gamma, beta, from_i8_i8,
                                         2u, 0u, 0.5f, -1, 0.125f, -3,
-                                        1.0e-5f, 2u, 2u) == 0);
+                                        1.0e-5f, VX_DTYPE_I8,
+                                        VX_DTYPE_I8) == 0);
     CHECK(opengl_graph_qlayernorm_i8u8(alias, gamma, beta, alias,
                                         2u, 3u, 0.5f, -1, 0.125f, -3,
-                                        1.0e-5f, 2u, 2u) == 0);
+                                        1.0e-5f, VX_DTYPE_I8,
+                                        VX_DTYPE_I8) == 0);
     opengl_graph_reset();
     return 0;
 }
@@ -576,17 +711,24 @@ static int check_qsdpa_i8u8_packed_chain(void) {
     opengl_graph_begin_forward();
     CHECK(opengl_graph_qsdpa_i8u8(q_i8, k_i8, v_i8, NULL, first, 1u, 2u, 2u,
                                    4u, 1u, 0.25f, -1, 0.25f, -1, 0.25f, -1,
-                                   0.25f, 128, 0.5f, 2u, 2u, 2u, 3u, 0u, 0u) == 1);
+                                   0.25f, 128, 0.5f, VX_DTYPE_I8,
+                                   VX_DTYPE_I8, VX_DTYPE_I8, VX_DTYPE_U8,
+                                   0u, 0u) == 1);
     CHECK(opengl_graph_qsdpa_i8u8(first, k_i8, v_i8, NULL, second, 1u, 2u, 2u,
                                    4u, 1u, 0.25f, 128, 0.25f, -1, 0.25f, -1,
-                                   0.25f, 0, 0.5f, 3u, 2u, 2u, 2u, 0u, 0u) == 1);
+                                   0.25f, 0, 0.5f, VX_DTYPE_U8,
+                                   VX_DTYPE_I8, VX_DTYPE_I8, VX_DTYPE_I8,
+                                   0u, 0u) == 1);
     CHECK(opengl_graph_qsdpa_i8u8(q_u8, k_u8, v_u8, mask_none, all_masked,
                                    1u, 1u, 2u, 4u, 1u, 0.25f, 128, 0.5f, 120,
-                                   0.25f, 130, 0.25f, 127, 0.5f, 3u, 3u, 3u,
-                                   3u, 0u, 1u) == 1);
+                                   0.25f, 130, 0.25f, 127, 0.5f,
+                                   VX_DTYPE_U8, VX_DTYPE_U8, VX_DTYPE_U8,
+                                   VX_DTYPE_U8, 0u, 1u) == 1);
     CHECK(opengl_graph_qsdpa_i8u8(q64, k64, v64, NULL, out64, 1u, 1u, 1u,
                                    head_dim, 1u, 0.25f, 0, 0.25f, 0, 0.25f, 0,
-                                   0.25f, 0, 1.0f, 2u, 2u, 2u, 2u, 0u, 0u) == 1);
+                                   0.25f, 0, 1.0f, VX_DTYPE_I8,
+                                   VX_DTYPE_I8, VX_DTYPE_I8, VX_DTYPE_I8,
+                                   0u, 0u) == 1);
     CHECK(opengl_graph_end_forward() == 0);
     CHECK(opengl_graph_sync_host(first, sizeof(first), 0) == 1);
     CHECK(opengl_graph_sync_host(second, sizeof(second), 0) == 1);
@@ -598,7 +740,9 @@ static int check_qsdpa_i8u8_packed_chain(void) {
     CHECK(memcmp(out64, v64, sizeof(out64)) == 0);
     CHECK(opengl_graph_qsdpa_i8u8(alias, k_i8, v_i8, NULL, alias, 1u, 2u, 2u,
                                    4u, 1u, 0.25f, -1, 0.25f, -1, 0.25f, -1,
-                                   0.25f, 0, 0.5f, 2u, 2u, 2u, 2u, 0u, 0u) == 0);
+                                   0.25f, 0, 0.5f, VX_DTYPE_I8,
+                                   VX_DTYPE_I8, VX_DTYPE_I8, VX_DTYPE_I8,
+                                   0u, 0u) == 0);
     CHECK(memcmp(alias, alias_before, sizeof(alias)) == 0);
     opengl_graph_reset();
     return 0;
@@ -630,16 +774,20 @@ static int check_qargmax_i8u8_raw(void) {
     memcpy(alias_before, alias.bytes, sizeof(alias_before));
     opengl_graph_reset();
     opengl_graph_begin_forward();
-    CHECK(opengl_graph_qargmax_i8u8(input_i8, output_i8, 2u, 3u, 2u, 2u) == 1);
-    CHECK(opengl_graph_qargmax_i8u8(input_u8, output_u8, 1u, 3u, 2u, 3u) == 1);
+    CHECK(opengl_graph_qargmax_i8u8(input_i8, output_i8, 2u, 3u, 2u,
+                                    VX_DTYPE_I8) == 1);
+    CHECK(opengl_graph_qargmax_i8u8(input_u8, output_u8, 1u, 3u, 2u,
+                                    VX_DTYPE_U8) == 1);
     CHECK(opengl_graph_end_forward() == 0);
     CHECK(opengl_graph_sync_host(output_i8, sizeof(output_i8), 0) == 1);
     CHECK(opengl_graph_sync_host(output_u8, sizeof(output_u8), 0) == 1);
     CHECK(memcmp(output_i8, expected_i8, sizeof(output_i8)) == 0);
     CHECK(memcmp(output_u8, expected_u8, sizeof(output_u8)) == 0);
-    CHECK(opengl_graph_qargmax_i8u8(alias.bytes, alias.i32, 1u, 3u, 2u, 2u) == 0);
+    CHECK(opengl_graph_qargmax_i8u8(alias.bytes, alias.i32, 1u, 3u, 2u,
+                                    VX_DTYPE_I8) == 0);
     CHECK(memcmp(alias.bytes, alias_before, sizeof(alias.bytes)) == 0);
-    CHECK(opengl_graph_qargmax_i8u8(input_i8, sentinel, 1u, 0u, 2u, 2u) == 0);
+    CHECK(opengl_graph_qargmax_i8u8(input_i8, sentinel, 1u, 0u, 2u,
+                                    VX_DTYPE_I8) == 0);
     CHECK(memcmp(sentinel, sentinel_before, sizeof(sentinel)) == 0);
     opengl_graph_reset();
     return 0;
@@ -680,10 +828,10 @@ static int check_qmaskedmean_i8u8_packed(void) {
     opengl_graph_begin_forward();
     CHECK(opengl_graph_qmaskedmean_i8u8(input_i8, mask_i8, output_i8,
                                          2u, 3u, 4u, 0.25f, -3, 0.5f, 5,
-                                         2u, 2u) == 1);
+                                         VX_DTYPE_I8, VX_DTYPE_I8) == 1);
     CHECK(opengl_graph_qmaskedmean_i8u8(input_u8, mask_u8, output_u8,
                                          1u, 3u, 2u, 0.25f, 128, 0.25f, 130,
-                                         3u, 3u) == 1);
+                                         VX_DTYPE_U8, VX_DTYPE_U8) == 1);
     CHECK(opengl_graph_end_forward() == 0);
     CHECK(opengl_graph_sync_host(output_i8, sizeof(output_i8), 0) == 1);
     CHECK(opengl_graph_sync_host(output_u8, sizeof(output_u8), 0) == 1);
@@ -691,11 +839,12 @@ static int check_qmaskedmean_i8u8_packed(void) {
     CHECK(memcmp(output_u8, expected_u8, sizeof(output_u8)) == 0);
     CHECK(opengl_graph_qmaskedmean_i8u8(alias.input, mask_i8, alias.bytes,
                                          2u, 3u, 4u, 0.25f, -3, 0.5f, 5,
-                                         2u, 2u) == 0);
+                                         VX_DTYPE_I8, VX_DTYPE_I8) == 0);
     CHECK(memcmp(alias.bytes, alias_before, sizeof(alias.bytes)) == 0);
     CHECK(opengl_graph_qmaskedmean_i8u8(input_i8, mask_alias.mask,
                                          mask_alias.bytes, 2u, 3u, 4u,
-                                         0.25f, -3, 0.5f, 5, 2u, 2u) == 0);
+                                         0.25f, -3, 0.5f, 5,
+                                         VX_DTYPE_I8, VX_DTYPE_I8) == 0);
     CHECK(memcmp(mask_alias.bytes, mask_before, sizeof(mask_alias.bytes)) == 0);
     opengl_graph_reset();
     return 0;
@@ -731,9 +880,11 @@ static int check_qconv2d_i8u8_packed_chain(void) {
     CHECK(opengl_graph_qconv2d_i8u8(input, weight, scales, zero_points, NULL, hidden,
                                      1u, 3u, 4u, 3u, 3u, 3u, 3u, 2u, 2u, 1u,
                                      1u, 2u, 2u, 1u, 1u, 1u, 1u, 1u, 3u, 2u,
-                                     1.0f, 0, 1.0f, 0, 3u, 2u, 3u) == 1);
+                                     1.0f, 0, 1.0f, 0, VX_DTYPE_U8,
+                                     VX_DTYPE_I8, VX_DTYPE_U8) == 1);
     CHECK(opengl_graph_requantize_linear_i8u8(hidden, 27u, output, 27u,
-                                              1.0f, 0, 0.5f, -2, 3u, 2u) == 1);
+                                              1.0f, 0, 0.5f, -2,
+                                              VX_DTYPE_U8, VX_DTYPE_I8) == 1);
     CHECK(opengl_graph_end_forward() == 0);
     CHECK(opengl_graph_sync_host(hidden, sizeof(hidden), 0) == 1);
     CHECK(opengl_graph_sync_host(output, sizeof(output), 0) == 1);
@@ -754,14 +905,16 @@ static int check_qconv2d_i8u8_packed_chain(void) {
                                      bias_zero_point, bias, bias_output,
                                      1u, 1u, 1u, 1u, 1u, 1u, 1u, 1u, 1u, 1u,
                                      1u, 1u, 1u, 1u, 0u, 0u, 0u, 0u, 1u, 1u,
-                                     0.5f, 0, 0.25f, -3, 2u, 2u, 2u) == 1);
+                                     0.5f, 0, 0.25f, -3, VX_DTYPE_I8,
+                                     VX_DTYPE_I8, VX_DTYPE_I8) == 1);
     CHECK(opengl_graph_end_forward() == 0);
     CHECK(opengl_graph_sync_host(bias_output, sizeof(bias_output), 0) == 1);
     CHECK(bias_output[0] == -3);
     CHECK(opengl_graph_qconv2d_i8u8(input, weight, scales, zero_points, NULL, hidden,
                                      1u, 3u, 4u, 3u, 2u, 3u, 3u, 2u, 2u, 1u,
                                      1u, 2u, 2u, 1u, 1u, 1u, 1u, 1u, 3u, 2u,
-                                     1.0f, 0, 1.0f, 0, 3u, 2u, 3u) == 0);
+                                     1.0f, 0, 1.0f, 0, VX_DTYPE_U8,
+                                     VX_DTYPE_I8, VX_DTYPE_U8) == 0);
     opengl_graph_reset();
 
     /* Exercise packed three-byte reduction tails and unaligned per-channel
@@ -786,7 +939,8 @@ static int check_qconv2d_i8u8_packed_chain(void) {
               tiled_input, tiled_weight, tiled_scales, tiled_zero_points,
               tiled_bias, tiled_output, 1u, 2u, 3u, 3u, 2u, 3u, 4u,
               1u, 1u, 3u, 1u, 1u, 1u, 1u, 0u, 0u, 0u, 0u, 1u, 0u,
-              1.0f, 0, 1.0f, 0, 3u, 2u, 2u) == 1);
+              1.0f, 0, 1.0f, 0, VX_DTYPE_U8, VX_DTYPE_I8,
+              VX_DTYPE_I8) == 1);
     CHECK(opengl_graph_end_forward() == 0);
     CHECK(opengl_graph_sync_host(tiled_output, sizeof(tiled_output), 0) == 1);
     CHECK(memcmp(tiled_output, tiled_expected, sizeof(tiled_output)) == 0);
@@ -806,7 +960,8 @@ static int check_qconv2d_i8u8_packed_chain(void) {
               mixed_input, mixed_weight, mixed_scales, mixed_zero_points,
               mixed_bias, mixed_output, 1u, 1u, 2u, 3u, 1u, 2u, 4u,
               1u, 1u, 3u, 1u, 1u, 1u, 1u, 0u, 0u, 0u, 0u, 1u, 0u,
-              0.5f, -1, 0.125f, 128, 2u, 3u, 3u) == 1);
+              0.5f, -1, 0.125f, 128, VX_DTYPE_I8, VX_DTYPE_U8,
+              VX_DTYPE_U8) == 1);
     CHECK(opengl_graph_end_forward() == 0);
     CHECK(opengl_graph_sync_host(mixed_output, sizeof(mixed_output), 0) == 1);
     CHECK(memcmp(mixed_output, mixed_expected, sizeof(mixed_output)) == 0);
@@ -853,7 +1008,8 @@ static int check_qconv2d_i8u8_packed_chain(void) {
               forced_bias, forced_output, 1u, 1u, TILED_PIXELS, TILED_IN_C,
               1u, TILED_PIXELS, TILED_OUT_C, 1u, 1u, TILED_IN_C,
               1u, 1u, 1u, 1u, 0u, 0u, 0u, 0u, 1u, 0u,
-              0.5f, -1, 0.125f, 128, 2u, 3u, 3u) == 1);
+              0.5f, -1, 0.125f, 128, VX_DTYPE_I8, VX_DTYPE_U8,
+              VX_DTYPE_U8) == 1);
     CHECK(opengl_graph_end_forward() == 0);
     CHECK(opengl_graph_sync_host(forced_output, sizeof(forced_output), 0) == 1);
     CHECK(memcmp(forced_output, forced_expected, sizeof(forced_output)) == 0);
@@ -876,7 +1032,7 @@ static int check_typed_i8u8_shape_qdq_chain(void) {
     const uint32_t input_axes[2] = {1u, 1u};
     const float input_scales[2] = {1.0f, 1.0f};
     const int32_t input_zero_points[2] = {0, 0};
-    const uint32_t input_dtypes[2] = {2u, 2u};
+    const uint32_t input_dtypes[2] = {VX_DTYPE_I8, VX_DTYPE_I8};
     const int8_t expected[18] = {
         4, 6, 4, 6, 4, 5,
         4, 6, 4, 6, 4, 5,
@@ -886,24 +1042,28 @@ static int check_typed_i8u8_shape_qdq_chain(void) {
     opengl_graph_reset();
     opengl_graph_begin_forward();
     CHECK(opengl_graph_quantize_typed_f32_i8u8(source_a, 4u, quantized_a,
-                                                1.0f, 0, 2u) == 1);
+                                                1.0f, 0, VX_DTYPE_I8) == 1);
     CHECK(opengl_graph_copy_i8u8(quantized_a, 4u, copied_a, 4u,
-                                 1.0f, 0, 1.0f, 0, 2u, 2u) == 1);
+                                 1.0f, 0, 1.0f, 0,
+                                 VX_DTYPE_I8, VX_DTYPE_I8) == 1);
     CHECK(opengl_graph_quantize_typed_f32_i8u8(source_b, 4u, quantized_b,
-                                                1.0f, 0, 2u) == 1);
+                                                1.0f, 0, VX_DTYPE_I8) == 1);
     CHECK(opengl_graph_concat_i8u8(inputs, input_elements, input_axes,
                                    input_scales, input_zero_points, input_dtypes,
                                    2u, concatenated, 8u, 2u, 1u,
-                                   1.0f, 0, 2u) == 1);
+                                   1.0f, 0, VX_DTYPE_I8) == 1);
     CHECK(opengl_graph_maxpool2d_i8u8(concatenated, pooled,
                                       1u, 2u, 2u, 2u, 2u, 2u,
                                       2u, 2u, 1u, 1u, 0u, 0u, 1u, 1u,
-                                      1.0f, 0, 1.0f, 0, 2u, 2u) == 1);
+                                      1.0f, 0, 1.0f, 0,
+                                      VX_DTYPE_I8, VX_DTYPE_I8) == 1);
     CHECK(opengl_graph_resize_nearest_i8u8(pooled, resized,
                                            1u, 2u, 2u, 2u, 3u, 3u,
-                                           1.0f, 0, 1.0f, 0, 2u, 2u) == 1);
+                                           1.0f, 0, 1.0f, 0,
+                                           VX_DTYPE_I8, VX_DTYPE_I8) == 1);
     CHECK(opengl_graph_dequantize_typed_i8u8_f32(resized, 18u,
-                                                  1.0f, 0, 2u, output) == 1);
+                                                  1.0f, 0, VX_DTYPE_I8,
+                                                  output) == 1);
     CHECK(opengl_graph_end_forward() == 0);
     CHECK(opengl_graph_sync_host(output, sizeof(output), 0) == 1);
     for (int index = 0; index < 18; index++) {
@@ -915,9 +1075,11 @@ static int check_typed_i8u8_shape_qdq_chain(void) {
     opengl_graph_reset();
     opengl_graph_begin_forward();
     CHECK(opengl_graph_quantize_typed_f32_i8u8(unsigned_source, 3u,
-                                                unsigned_quantized, 1.0f, 128, 3u) == 1);
+                                                unsigned_quantized, 1.0f, 128,
+                                                VX_DTYPE_U8) == 1);
     CHECK(opengl_graph_dequantize_typed_i8u8_f32(unsigned_quantized, 3u,
-                                                  1.0f, 128, 3u, unsigned_output) == 1);
+                                                  1.0f, 128, VX_DTYPE_U8,
+                                                  unsigned_output) == 1);
     CHECK(opengl_graph_end_forward() == 0);
     CHECK(opengl_graph_sync_host(unsigned_quantized, sizeof(unsigned_quantized), 0) == 1);
     CHECK(opengl_graph_sync_host(unsigned_output, sizeof(unsigned_output), 0) == 1);
@@ -927,7 +1089,8 @@ static int check_typed_i8u8_shape_qdq_chain(void) {
     CHECK(fabsf(unsigned_output[1]) < 1.0e-4f);
     CHECK(fabsf(unsigned_output[2] - 5.0f) < 1.0e-4f);
     CHECK(opengl_graph_copy_i8u8(quantized_a, 4u, copied_a, 4u,
-                                 1.0f, 0, 0.5f, 0, 2u, 2u) == 0);
+                                 1.0f, 0, 0.5f, 0,
+                                 VX_DTYPE_I8, VX_DTYPE_I8) == 0);
     opengl_graph_reset();
     return 0;
 }
@@ -1390,7 +1553,447 @@ static int check_inference_training_alias(void) {
     return 0;
 }
 
+static int check_general_gather_i32(void) {
+    const float input[12] = {
+        1, 2, 3, 4, 5, 6,
+        7, 8, 9, 10, 11, 12,
+    };
+    const int32_t indices[5] = {2, 0, -1, -4, 3};
+    const float expected[20] = {
+        5, 6, 1, 2, 5, 6, -1, -1, -1, -1,
+        11, 12, 7, 8, 11, 12, -1, -1, -1, -1,
+    };
+    float output[20] = {0};
+    opengl_graph_begin_forward();
+    CHECK(opengl_graph_gather_i32_f32(input, indices, output,
+                                      2, 3, 2, 5, 20) == 1);
+    CHECK(opengl_graph_end_forward() == 0);
+    CHECK(opengl_graph_sync_host(output, sizeof(output), 0) == 1);
+    for (int index = 0; index < 20; index++)
+        CHECK(fabsf(output[index] - expected[index]) < 1e-6f);
+    opengl_graph_reset();
+    return 0;
+}
+
+typedef struct {
+    VxEngineState* state;
+    float base;
+    int ok;
+} OpenGLIsolationThread;
+
+static void* run_opengl_isolation_thread(void* opaque) {
+    OpenGLIsolationThread* probe = (OpenGLIsolationThread*)opaque;
+    VxEngineStateScope scope = vx_engine_state_scope_enter(probe->state);
+    float input[4] = {0};
+    float output[4] = {0};
+    probe->ok = 1;
+    for (int iteration = 0; iteration < 32; iteration++) {
+        for (int i = 0; i < 4; i++) {
+            input[i] = probe->base + (float)(iteration * 4 + i);
+            output[i] = -1.0f;
+        }
+        opengl_graph_mark_host(input, sizeof(input), 0);
+        opengl_graph_begin_forward();
+        int copied = opengl_graph_copy_f32(input, output, 4);
+        int ended = opengl_graph_end_forward();
+        int synced = opengl_graph_sync_host(output, sizeof(output), 0);
+        if (!copied || ended != 0 || !synced) {
+            probe->ok = 0;
+            break;
+        }
+        for (int i = 0; i < 4; i++) {
+            if (fabsf(output[i] - input[i]) > 1.0e-6f) {
+                probe->ok = 0;
+                break;
+            }
+        }
+        if (!probe->ok) break;
+    }
+    opengl_graph_reset();
+    vx_engine_state_scope_leave(scope);
+    return NULL;
+}
+
+static int check_engine_state_isolation(VxEngineState* first) {
+    VxEngineState* second = (VxEngineState*)calloc(1, sizeof(*second));
+    CHECK(second != NULL);
+    CHECK(vx_engine_state_init(second) == 0);
+
+    float shared_input[4] = {1.0f, 2.0f, 3.0f, 4.0f};
+    float shared_output[4] = {0};
+    opengl_graph_reset();
+    opengl_graph_begin_forward();
+    CHECK(opengl_graph_copy_f32(shared_input, shared_output, 4) == 1);
+    CHECK(opengl_graph_end_forward() == 0);
+
+    VxEngineStateScope second_scope = vx_engine_state_scope_enter(second);
+    CHECK(opengl_init() == 0);
+    shared_input[0] = 9.0f;
+    shared_input[1] = 8.0f;
+    shared_input[2] = 7.0f;
+    shared_input[3] = 6.0f;
+    opengl_graph_begin_forward();
+    CHECK(opengl_graph_copy_f32(shared_input, shared_output, 4) == 1);
+    CHECK(opengl_graph_end_forward() == 0);
+    int programs = 0, buffers = 0, inference_buffers = 0;
+    opengl_training_debug_resource_counts(&programs, &buffers,
+                                           &inference_buffers);
+    CHECK(buffers == 0 && inference_buffers == 2);
+    vx_engine_state_scope_leave(second_scope);
+
+    CHECK(opengl_graph_sync_host(shared_output, sizeof(shared_output), 0) == 1);
+    const float first_expected[4] = {1.0f, 2.0f, 3.0f, 4.0f};
+    CHECK(memcmp(shared_output, first_expected, sizeof(shared_output)) == 0);
+    opengl_graph_reset();
+    opengl_training_debug_resource_counts(&programs, &buffers,
+                                           &inference_buffers);
+    CHECK(buffers == 0 && inference_buffers == 0);
+
+    second_scope = vx_engine_state_scope_enter(second);
+    CHECK(opengl_graph_sync_host(shared_output, sizeof(shared_output), 0) == 1);
+    const float second_expected[4] = {9.0f, 8.0f, 7.0f, 6.0f};
+    CHECK(memcmp(shared_output, second_expected, sizeof(shared_output)) == 0);
+    opengl_training_debug_resource_counts(&programs, &buffers,
+                                           &inference_buffers);
+    CHECK(buffers == 0 && inference_buffers == 2);
+    opengl_graph_reset();
+    vx_engine_state_scope_leave(second_scope);
+
+    OpenGLIsolationThread first_probe = {first, 1000.0f, 0};
+    OpenGLIsolationThread second_probe = {second, -1000.0f, 0};
+    pthread_t first_thread;
+    pthread_t second_thread;
+    CHECK(pthread_create(&first_thread, NULL, run_opengl_isolation_thread,
+                         &first_probe) == 0);
+    CHECK(pthread_create(&second_thread, NULL, run_opengl_isolation_thread,
+                         &second_probe) == 0);
+    CHECK(pthread_join(first_thread, NULL) == 0);
+    CHECK(pthread_join(second_thread, NULL) == 0);
+    CHECK(first_probe.ok && second_probe.ok);
+
+    second_scope = vx_engine_state_scope_enter(second);
+    opengl_cleanup();
+    CHECK(opengl_training_available() == 0);
+    vx_engine_state_scope_leave(second_scope);
+    vx_engine_state_deinit(second);
+    free(second);
+
+    CHECK(opengl_training_available() == 1);
+    float survivor_input[2] = {4.0f, 5.0f};
+    float survivor_output[2] = {0};
+    opengl_graph_begin_forward();
+    CHECK(opengl_graph_copy_f32(survivor_input, survivor_output, 2) == 1);
+    CHECK(opengl_graph_end_forward() == 0);
+    CHECK(opengl_graph_sync_host(survivor_output, sizeof(survivor_output), 0) == 1);
+    CHECK(memcmp(survivor_input, survivor_output, sizeof(survivor_input)) == 0);
+    opengl_graph_reset();
+    return 0;
+}
+
+static int check_typed_control_graph_ops(void) {
+    const int32_t compare_a[2] = {1, 4};
+    const int32_t compare_b[3] = {1, 3, 4};
+    const uint32_t output_strides[2] = {3u, 1u};
+    const uint32_t a_strides[2] = {1u, 0u};
+    const uint32_t b_strides[2] = {0u, 1u};
+    const int32_t expected_equal[6] = {1, 0, 0, 0, 0, 1};
+    const int32_t expected_ge[6] = {1, 0, 0, 1, 1, 1};
+    const int32_t expected_not[6] = {0, 1, 1, 1, 1, 0};
+    int32_t equal_output[6] = {0};
+    int32_t ge_output[6] = {0};
+    int32_t not_output[6] = {0};
+    const int32_t clip_input[4] = {-4, 0, 3, 9};
+    const int32_t expected_clip[4] = {0, 0, 3, 7};
+    int32_t clip_output[4] = {0};
+    const int32_t cast_i32[4] = {-2, 0, 7, 10};
+    const float expected_cast_f32[4] = {-2.0f, 0.0f, 7.0f, 10.0f};
+    float cast_f32[4] = {0};
+    const float cast_float_input[13] = {
+        -2.9f, 0.0f, 7.75f,
+        2147483648.0f, 2147483904.0f,
+        4294967296.0f, 4294967808.0f, 6442450944.0f,
+        -2147483904.0f, -4294967808.0f,
+        NAN, INFINITY, -INFINITY,
+    };
+    const int32_t expected_cast_i32[13] = {
+        -2, 0, 7,
+        INT32_MIN, INT32_MIN + 256,
+        0, 512, INT32_MIN,
+        INT32_MAX - 255, -512,
+        0, 0, 0,
+    };
+    int32_t cast_i32_output[13] = {0};
+    const uint32_t copy_input[4] = {
+        0x7fc01234u, 0x80000000u, 0xffffffffu, 0x12345678u,
+    };
+    uint32_t copy_output[4] = {0};
+    const int32_t where_condition[4] = {0, 1, -1, 0};
+    const uint32_t where_a[4] = {
+        0x7fc01234u, 0x80000000u, 0x11111111u, 0x22222222u,
+    };
+    const uint32_t where_b[4] = {
+        0x33333333u, 0x44444444u, 0xffffffffu, 0x7fa00001u,
+    };
+    const uint32_t expected_where[4] = {
+        0x33333333u, 0x80000000u, 0x11111111u, 0x7fa00001u,
+    };
+    uint32_t where_output[4] = {0};
+    const float argmax_input[12] = {
+        1.0f, 5.0f, 3.0f, 5.0f, 3.0f, 4.0f,
+        -1.0f, -2.0f, -1.0f, 7.0f, -3.0f, 7.0f,
+    };
+    const int32_t expected_argmax[4] = {1, 0, 0, 1};
+    int32_t argmax_output[4] = {0};
+    const uint32_t concat_a[4] = {
+        0x7fc00011u, 0x80000000u, 0x11111111u, 0x22222222u,
+    };
+    const uint32_t concat_b[2] = {0xffffffffu, 0x33333333u};
+    const void* concat_inputs[2] = {concat_a, concat_b};
+    const long concat_sizes[2] = {4, 2};
+    const int concat_axes[2] = {2, 1};
+    const uint32_t expected_concat[6] = {
+        0x7fc00011u, 0x80000000u, 0x11111111u,
+        0x22222222u, 0xffffffffu, 0x33333333u,
+    };
+    uint32_t concat_output[6] = {0};
+
+    opengl_graph_reset();
+    opengl_graph_begin_forward();
+    CHECK(opengl_graph_compare_i32(
+        compare_a, 2, compare_b, 3, equal_output, 6,
+        output_strides, a_strides, b_strides, 2, 0) == 1);
+    CHECK(opengl_graph_compare_i32(
+        compare_a, 2, compare_b, 3, ge_output, 6,
+        output_strides, a_strides, b_strides, 2, 1) == 1);
+    CHECK(opengl_graph_not_i32(equal_output, not_output, 6) == 1);
+    CHECK(opengl_graph_clip_i32(
+        clip_input, clip_output, 4, 0, 7) == 1);
+    CHECK(opengl_graph_cast_typed(
+        cast_i32, VX_DTYPE_I32, cast_f32, VX_DTYPE_F32, 4) == 1);
+    CHECK(opengl_graph_cast_typed(
+        cast_float_input, VX_DTYPE_F32,
+        cast_i32_output, VX_DTYPE_I32, 13) == 1);
+    CHECK(opengl_graph_copy_32(copy_input, copy_output, 4) == 1);
+    CHECK(opengl_graph_where_32(
+        where_condition, where_a, where_b, where_output, 4) == 1);
+    CHECK(opengl_graph_argmax_f32(
+        argmax_input, argmax_output, 2u, 3u, 2u) == 1);
+    CHECK(opengl_graph_concat_32(
+        concat_inputs, concat_sizes, concat_axes, 2,
+        concat_output, 3, 2) == 1);
+    CHECK(opengl_graph_end_forward() == 0);
+
+    CHECK(opengl_graph_sync_host(
+        equal_output, sizeof(equal_output), 0) == 1);
+    CHECK(opengl_graph_sync_host(ge_output, sizeof(ge_output), 0) == 1);
+    CHECK(opengl_graph_sync_host(not_output, sizeof(not_output), 0) == 1);
+    CHECK(opengl_graph_sync_host(clip_output, sizeof(clip_output), 0) == 1);
+    CHECK(opengl_graph_sync_host(cast_f32, sizeof(cast_f32), 0) == 1);
+    CHECK(opengl_graph_sync_host(
+        cast_i32_output, sizeof(cast_i32_output), 0) == 1);
+    CHECK(opengl_graph_sync_host(copy_output, sizeof(copy_output), 0) == 1);
+    CHECK(opengl_graph_sync_host(
+        where_output, sizeof(where_output), 0) == 1);
+    CHECK(opengl_graph_sync_host(
+        argmax_output, sizeof(argmax_output), 0) == 1);
+    CHECK(opengl_graph_sync_host(
+        concat_output, sizeof(concat_output), 0) == 1);
+    CHECK(memcmp(equal_output, expected_equal, sizeof(equal_output)) == 0);
+    CHECK(memcmp(ge_output, expected_ge, sizeof(ge_output)) == 0);
+    CHECK(memcmp(not_output, expected_not, sizeof(not_output)) == 0);
+    CHECK(memcmp(clip_output, expected_clip, sizeof(clip_output)) == 0);
+    CHECK(memcmp(cast_f32, expected_cast_f32, sizeof(cast_f32)) == 0);
+    CHECK(memcmp(
+        cast_i32_output, expected_cast_i32,
+        sizeof(cast_i32_output)) == 0);
+    CHECK(memcmp(copy_output, copy_input, sizeof(copy_output)) == 0);
+    CHECK(memcmp(
+        where_output, expected_where, sizeof(where_output)) == 0);
+    CHECK(memcmp(
+        argmax_output, expected_argmax, sizeof(argmax_output)) == 0);
+    CHECK(memcmp(
+        concat_output, expected_concat, sizeof(concat_output)) == 0);
+
+    CHECK(opengl_graph_not_i32(equal_output, equal_output, 6) == 0);
+    CHECK(opengl_graph_clip_i32(
+        clip_input, clip_output, 4, 8, 7) == 0);
+    CHECK(opengl_graph_cast_typed(
+        cast_i32, VX_DTYPE_I32,
+        cast_i32_output, VX_DTYPE_U8, 4) == 0);
+    CHECK(opengl_graph_argmax_f32(
+        argmax_input, argmax_output, 2u, 0u, 2u) == 0);
+    opengl_graph_reset();
+    return 0;
+}
+
+static int check_expand_f32_uniform_abi(void) {
+    union {
+        uint32_t bits[4];
+        float values[4];
+    } input = {
+        .bits = {0xff800000u, 0x7fc12345u, 0x80000000u, 0x3f800000u},
+    };
+    union {
+        uint32_t bits[48];
+        float values[48];
+    } output;
+    const int input_shape[5] = {1, 2, 1, 1, 2};
+    const int output_shape[6] = {3, 1, 2, 1, 4, 2};
+    const int incompatible_output_shape[6] = {3, 1, 3, 1, 4, 2};
+    const int smaller_output_shape[4] = {1, 2, 1, 2};
+    const int invalid_input_shape[5] = {1, 2, 0, 1, 2};
+    const int scalar_shape[1] = {1};
+    const int overflow_shape[2] = {INT32_MAX, 2};
+    float overlap_storage[49] = {0};
+    uint32_t expected[48];
+    size_t index = 0;
+
+    for (size_t leading = 0; leading < 3; leading++) {
+        for (size_t row = 0; row < 2; row++) {
+            for (size_t broadcast = 0; broadcast < 4; broadcast++) {
+                for (size_t lane = 0; lane < 2; lane++) {
+                    expected[index++] = input.bits[row * 2 + lane];
+                }
+            }
+        }
+    }
+    for (index = 0; index < 48; index++) output.bits[index] = 0xdeadbeefu;
+
+    opengl_graph_reset();
+    opengl_graph_begin_forward();
+    CHECK(opengl_graph_expand_f32(
+        input.values, output.values, input_shape, 5, output_shape, 6) == 1);
+    CHECK(opengl_graph_end_forward() == 0);
+    CHECK(opengl_graph_sync_host(
+        output.values, sizeof(output.values), 0) == 1);
+    CHECK(memcmp(output.bits, expected, sizeof(expected)) == 0);
+    opengl_graph_reset();
+
+    CHECK(opengl_graph_expand_f32(
+        input.values, output.values, input_shape, 5,
+        incompatible_output_shape, 6) == 0);
+    CHECK(opengl_graph_expand_f32(
+        input.values, output.values, input_shape, 5,
+        smaller_output_shape, 4) == 0);
+    CHECK(opengl_graph_expand_f32(
+        input.values, output.values, invalid_input_shape, 5,
+        output_shape, 6) == 0);
+    CHECK(opengl_graph_expand_f32(
+        input.values, output.values, scalar_shape, 1,
+        overflow_shape, 2) == 0);
+    CHECK(opengl_graph_expand_f32(
+        overlap_storage, overlap_storage, input_shape, 5,
+        output_shape, 6) == 0);
+    CHECK(opengl_graph_expand_f32(
+        overlap_storage, overlap_storage + 1, input_shape, 5,
+        output_shape, 6) == 0);
+    return 0;
+}
+
+static int check_qbatch_and_typed_transpose(void) {
+    const int a_shape[4] = {2, 1, 2, 2};
+    const int b_shape[3] = {3, 2, 2};
+    const int output_shape[4] = {2, 3, 2, 2};
+    const int invalid_output_shape[4] = {2, 2, 2, 2};
+    const uint8_t a[8] = {
+        129, 130, 131, 132,
+        127, 128, 130, 126,
+    };
+    const int8_t b[12] = {
+        0, -1, -1, 0,
+        1, 0, -2, 1,
+        -1, -2, 2, 0,
+    };
+    const int8_t expected_qbatch[24] = {
+        4, 4, 4, 5,
+        3, 6, 4, 8,
+        6, 4, 9, 4,
+        2, 3, 4, 2,
+        2, 2, 6, 2,
+        3, 4, 0, 1,
+    };
+    int8_t qbatch_output[24] = {0};
+    const uint32_t transpose_shape[4] = {1u, 2u, 2u, 3u};
+    const uint32_t transpose_permutation[4] = {0u, 2u, 3u, 1u};
+    const uint32_t transpose_duplicate[4] = {0u, 2u, 2u, 1u};
+    const uint8_t transpose_u8_input[12] = {
+        117, 118, 119, 120, 121, 122,
+        123, 124, 125, 126, 127, 128,
+    };
+    const uint8_t transpose_u8_expected[12] = {
+        117, 123, 118, 124, 119, 125,
+        120, 126, 121, 127, 122, 128,
+    };
+    const int8_t transpose_i8_input[12] = {
+        -6, -5, -4, -3, -2, -1,
+        0, 1, 2, 3, 4, 5,
+    };
+    const int8_t transpose_i8_expected[12] = {
+        -6, 0, -5, 1, -4, 2,
+        -3, 3, -2, 4, -1, 5,
+    };
+    uint8_t transpose_u8_output[12] = {0};
+    int8_t transpose_i8_output[12] = {0};
+
+    opengl_graph_reset();
+    opengl_graph_begin_forward();
+    CHECK(opengl_graph_qbatch_matmul_i8u8(
+        a, a_shape, 4, 0.5f, 128, VX_DTYPE_U8,
+        b, b_shape, 3, 0.25f, -1, VX_DTYPE_I8,
+        qbatch_output, invalid_output_shape, 4,
+        0.25f, 3, VX_DTYPE_I8) == 0);
+    CHECK(opengl_graph_transpose_i8u8(
+        transpose_u8_input, transpose_u8_output, transpose_shape,
+        transpose_duplicate, 4u, 12u, 0.125f, 123,
+        0.125f, 123, VX_DTYPE_U8, VX_DTYPE_U8) == 0);
+    CHECK(opengl_graph_transpose_i8u8(
+        transpose_u8_input, transpose_u8_output, transpose_shape,
+        transpose_permutation, 4u, 12u, 0.125f, 123,
+        0.25f, 123, VX_DTYPE_U8, VX_DTYPE_U8) == 0);
+    CHECK(opengl_graph_transpose_i8u8(
+        transpose_u8_output, transpose_u8_output, transpose_shape,
+        transpose_permutation, 4u, 12u, 0.125f, 123,
+        0.125f, 123, VX_DTYPE_U8, VX_DTYPE_U8) == 0);
+    CHECK(opengl_graph_qbatch_matmul_i8u8(
+        a, a_shape, 4, 0.5f, 128, VX_DTYPE_U8,
+        b, b_shape, 3, 0.25f, -1, VX_DTYPE_I8,
+        qbatch_output, output_shape, 4,
+        0.25f, 3, VX_DTYPE_I8) == 1);
+    CHECK(opengl_graph_transpose_i8u8(
+        transpose_u8_input, transpose_u8_output, transpose_shape,
+        transpose_permutation, 4u, 12u, 0.125f, 123,
+        0.125f, 123, VX_DTYPE_U8, VX_DTYPE_U8) == 1);
+    CHECK(opengl_graph_transpose_i8u8(
+        transpose_i8_input, transpose_i8_output, transpose_shape,
+        transpose_permutation, 4u, 12u, 0.25f, -3,
+        0.25f, -3, VX_DTYPE_I8, VX_DTYPE_I8) == 1);
+    CHECK(opengl_graph_end_forward() == 0);
+
+    CHECK(opengl_graph_sync_host(
+        qbatch_output, sizeof(qbatch_output), 0) == 1);
+    CHECK(opengl_graph_sync_host(
+        transpose_u8_output, sizeof(transpose_u8_output), 0) == 1);
+    CHECK(opengl_graph_sync_host(
+        transpose_i8_output, sizeof(transpose_i8_output), 0) == 1);
+    CHECK(memcmp(
+        qbatch_output, expected_qbatch, sizeof(qbatch_output)) == 0);
+    CHECK(memcmp(
+        transpose_u8_output, transpose_u8_expected,
+        sizeof(transpose_u8_output)) == 0);
+    CHECK(memcmp(
+        transpose_i8_output, transpose_i8_expected,
+        sizeof(transpose_i8_output)) == 0);
+    opengl_graph_reset();
+    return 0;
+}
+
 int main(void) {
+    VxEngineState* engine_state =
+        (VxEngineState*)calloc(1, sizeof(*engine_state));
+    CHECK(engine_state != NULL);
+    CHECK(vx_engine_state_init(engine_state) == 0);
+    VxEngineStateScope engine_scope =
+        vx_engine_state_scope_enter(engine_state);
     CHECK(check_capability_rules() == 0);
     OpenGLComputeCapability capability;
     CHECK(opengl_get_compute_capability(&capability) == 0);
@@ -1410,27 +2013,32 @@ int main(void) {
     const uint32_t unavailable_axes[1] = {1u};
     const float unavailable_scales[1] = {1.0f};
     const int32_t unavailable_zero_points_typed[1] = {0};
-    const uint32_t unavailable_dtypes[1] = {2u};
+    const uint32_t unavailable_dtypes[1] = {VX_DTYPE_I8};
     CHECK(opengl_graph_qadd_i8u8(unavailable_a, 1u, unavailable_b, 1u,
                                   unavailable_sum, 1u,
                                   1.0f, 0, 1.0f, 0, 1.0f, 0,
-                                  2u, 3u, 2u, 0u) == 0);
+                                  VX_DTYPE_I8, VX_DTYPE_U8, VX_DTYPE_I8,
+                                  0u) == 0);
     CHECK(opengl_graph_qsilu_i8u8(unavailable_a, unavailable_sum, 1u,
-                                   1.0f, 0, 1.0f, 0, 2u, 2u) == 0);
+                                   1.0f, 0, 1.0f, 0,
+                                   VX_DTYPE_I8, VX_DTYPE_I8) == 0);
     CHECK(opengl_graph_qgelu_i8u8(unavailable_a, unavailable_sum, 1u,
-                                   1.0f, 0, 1.0f, 0, 2u, 2u) == 0);
+                                   1.0f, 0, 1.0f, 0,
+                                   VX_DTYPE_I8, VX_DTYPE_I8) == 0);
     CHECK(opengl_graph_qgroupnorm_i8u8(unavailable_a, unavailable_gamma,
                                        unavailable_beta, unavailable_sum,
                                        1u, 1u, 1u, 1u, 1u, 1.0f, 0,
-                                       1.0f, 0, 1.0e-5f, 2u, 2u) == 0);
+                                       1.0f, 0, 1.0e-5f,
+                                       VX_DTYPE_I8, VX_DTYPE_I8) == 0);
     CHECK(opengl_graph_qlayernorm_i8u8(unavailable_a, unavailable_gamma,
                                        unavailable_beta, unavailable_sum,
                                        1u, 1u, 1.0f, 0, 1.0f, 0,
-                                       1.0e-5f, 2u, 2u) == 0);
+                                       1.0e-5f, VX_DTYPE_I8,
+                                       VX_DTYPE_I8) == 0);
     CHECK(opengl_graph_requantize_linear_i8u8(unavailable_sum, 1u,
                                               unavailable_output, 1u,
                                               1.0f, 0, 1.0f, 0,
-                                              2u, 3u) == 0);
+                                              VX_DTYPE_I8, VX_DTYPE_U8) == 0);
     const int8_t unavailable_weight[1] = {1};
     const float unavailable_scale[1] = {1.0f};
     const int32_t unavailable_zero_point[1] = {0};
@@ -1439,30 +2047,39 @@ int main(void) {
                                      unavailable_sum,
                                      1u, 1u, 1u, 1u, 1u, 1u, 1u, 1u, 1u, 1u,
                                      1u, 1u, 1u, 1u, 0u, 0u, 0u, 0u, 1u, 0u,
-                                     1.0f, 0, 1.0f, 0, 2u, 2u, 2u) == 0);
+                                     1.0f, 0, 1.0f, 0, VX_DTYPE_I8,
+                                     VX_DTYPE_I8, VX_DTYPE_I8) == 0);
     CHECK(opengl_graph_quantize_typed_f32_i8u8(unavailable_f32, 1u,
-                                                unavailable_a, 1.0f, 0, 2u) == 0);
+                                                unavailable_a, 1.0f, 0,
+                                                VX_DTYPE_I8) == 0);
     CHECK(opengl_graph_dequantize_typed_i8u8_f32(unavailable_a, 1u,
-                                                  1.0f, 0, 2u, unavailable_f32) == 0);
+                                                  1.0f, 0, VX_DTYPE_I8,
+                                                  unavailable_f32) == 0);
     CHECK(opengl_graph_copy_i8u8(unavailable_a, 1u, unavailable_sum, 1u,
-                                 1.0f, 0, 1.0f, 0, 2u, 2u) == 0);
+                                 1.0f, 0, 1.0f, 0,
+                                 VX_DTYPE_I8, VX_DTYPE_I8) == 0);
     CHECK(opengl_graph_concat_i8u8(unavailable_inputs, unavailable_elements,
                                    unavailable_axes, unavailable_scales,
                                    unavailable_zero_points_typed, unavailable_dtypes,
                                    1u, unavailable_sum, 1u, 1u, 1u,
-                                   1.0f, 0, 2u) == 0);
+                                   1.0f, 0, VX_DTYPE_I8) == 0);
     CHECK(opengl_graph_maxpool2d_i8u8(unavailable_a, unavailable_sum,
                                       1u, 1u, 1u, 1u, 1u, 1u,
                                       1u, 1u, 1u, 1u, 0u, 0u, 0u, 0u,
-                                      1.0f, 0, 1.0f, 0, 2u, 2u) == 0);
+                                      1.0f, 0, 1.0f, 0,
+                                      VX_DTYPE_I8, VX_DTYPE_I8) == 0);
     CHECK(opengl_graph_resize_nearest_i8u8(unavailable_a, unavailable_sum,
                                            1u, 1u, 1u, 1u, 1u, 1u,
-                                           1.0f, 0, 1.0f, 0, 2u, 2u) == 0);
+                                           1.0f, 0, 1.0f, 0,
+                                           VX_DTYPE_I8, VX_DTYPE_I8) == 0);
 
     if (opengl_init() != 0) {
         /* A machine without a compute context must reject cleanly for CPU fallback. */
         CHECK(opengl_training_available() == 0);
         opengl_cleanup();
+        vx_engine_state_scope_leave(engine_scope);
+        vx_engine_state_deinit(engine_state);
+        free(engine_state);
         puts("OpenGL compute context unavailable; rejection/fallback checks passed");
         return 0;
     }
@@ -1489,10 +2106,12 @@ int main(void) {
                                    1, 1, 1) == 0);
     CHECK(check_one_shot_matmul_tails_and_fallback() == 0);
     CHECK(check_tiled_qlinear_i8u8_tails() == 0);
+    CHECK(check_tiled_qlinear_staged_rounding() == 0);
     CHECK(check_lazy_training_dispatch() == 0);
     CHECK(check_prelu_logsoftmax_split_backward() == 0);
     CHECK(check_groupnorm_dropout_reduce_and_broadcast() == 0);
     CHECK(check_gelu_modes() == 0);
+    CHECK(check_layernorm_epsilon() == 0);
     CHECK(check_qlinear_i8u8_packed_chain() == 0);
     CHECK(check_qembedding_i8u8_packed_gather() == 0);
     CHECK(check_qadd_requantize_i8u8_packed_chain() == 0);
@@ -1505,14 +2124,34 @@ int main(void) {
     CHECK(check_qmaskedmean_i8u8_packed() == 0);
     CHECK(check_qconv2d_i8u8_packed_chain() == 0);
     CHECK(check_typed_i8u8_shape_qdq_chain() == 0);
+    CHECK(check_general_gather_i32() == 0);
+    CHECK(check_typed_control_graph_ops() == 0);
+    CHECK(check_expand_f32_uniform_abi() == 0);
+    CHECK(check_qbatch_and_typed_transpose() == 0);
     CHECK(opengl_training_debug_compile_all() == 0);
     int programs = 0, buffers = -1, inference_buffers = -1;
     opengl_training_debug_resource_counts(&programs, &buffers, &inference_buffers);
     CHECK(programs > 1 && buffers == 0 && inference_buffers == 0);
     CHECK(check_inference_training_alias() == 0);
     CHECK(check_batched_attention() == 0);
+    CHECK(check_engine_state_isolation(engine_state) == 0);
     opengl_cleanup();
     CHECK(opengl_training_available() == 0);
+    CHECK(opengl_init() == 0);
+    float reinitialized_input[2] = {12.0f, -3.0f};
+    float reinitialized_output[2] = {0};
+    opengl_graph_begin_forward();
+    CHECK(opengl_graph_copy_f32(reinitialized_input, reinitialized_output, 2) == 1);
+    CHECK(opengl_graph_end_forward() == 0);
+    CHECK(opengl_graph_sync_host(reinitialized_output,
+                                 sizeof(reinitialized_output), 0) == 1);
+    CHECK(memcmp(reinitialized_input, reinitialized_output,
+                 sizeof(reinitialized_input)) == 0);
+    opengl_cleanup();
+    CHECK(opengl_training_available() == 0);
+    vx_engine_state_scope_leave(engine_scope);
+    vx_engine_state_deinit(engine_state);
+    free(engine_state);
     puts("OpenGL lazy compute training checks passed");
     return 0;
 }

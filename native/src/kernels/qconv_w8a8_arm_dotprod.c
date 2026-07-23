@@ -12,6 +12,8 @@
 #endif
 
 #include "qconv_w8a8_arm.h"
+#include "w8a8_affine.h"
+#include "../../include/volvoxai_enums.h"
 
 #include <math.h>
 #include <stddef.h>
@@ -20,8 +22,8 @@
 #include <arm_neon.h>
 
 enum {
-    VX_W8A8_QCONV_DOTPROD_I8 = 2u,
-    VX_W8A8_QCONV_DOTPROD_U8 = 3u,
+    VX_W8A8_QCONV_DOTPROD_I8 = VX_DTYPE_I8,
+    VX_W8A8_QCONV_DOTPROD_U8 = VX_DTYPE_U8,
 };
 
 static int8x16_t vx_w8a8_qconv_dotprod_load_signed(const uint8_t* source,
@@ -51,35 +53,6 @@ static int64_t vx_w8a8_qconv_dotprod_sum_i32x4(int32x4_t values) {
     return total;
 }
 
-static int32_t vx_w8a8_qconv_dotprod_byte_value(const void* data,
-        uint32_t dtype, size_t index) {
-    return dtype == VX_W8A8_QCONV_DOTPROD_I8
-        ? (int32_t)((const int8_t*)data)[index]
-        : (int32_t)((const uint8_t*)data)[index];
-}
-
-static int32_t vx_w8a8_qconv_dotprod_round_ties_even(float value) {
-    int32_t lower = (int32_t)floorf(value);
-    float fraction = value - (float)lower;
-    if (fraction < 0.5f) return lower;
-    if (fraction > 0.5f) return lower + 1;
-    return lower % 2 == 0 ? lower : lower + 1;
-}
-
-static int32_t vx_w8a8_qconv_dotprod_quantize_transformed(float transformed,
-        int32_t minimum, int32_t maximum, int32_t nan_value) {
-    if (transformed != transformed) return nan_value;
-    if (transformed <= (float)minimum) return minimum;
-    if (transformed >= (float)maximum) return maximum;
-    return vx_w8a8_qconv_dotprod_round_ties_even(transformed);
-}
-
-static void vx_w8a8_qconv_dotprod_store_byte(void* output, uint32_t dtype,
-        size_t index, int32_t value) {
-    if (dtype == VX_W8A8_QCONV_DOTPROD_I8) ((int8_t*)output)[index] = (int8_t)value;
-    else ((uint8_t*)output)[index] = (uint8_t)value;
-}
-
 int vx_qconv2d_i8u8_arm_dotprod_try(const void* input, const void* weight,
         const int32_t* bias, const float* weight_scales,
         const int32_t* weight_zero_points, void* output,
@@ -106,7 +79,7 @@ int vx_qconv2d_i8u8_arm_dotprod_try(const void* input, const void* weight,
     if (relu >= 2u) {
         const float relu6_scaled = 6.0f / output_scale;
         const float relu6_transformed = relu6_scaled + (float)output_zero_point;
-        relu6_upper = vx_w8a8_qconv_dotprod_quantize_transformed(relu6_transformed,
+        relu6_upper = vx_w8a8_requantize(relu6_transformed,
             output_minimum, output_maximum, 0);
     }
     for (uint32_t batch_index = 0; batch_index < batch; batch_index++) {
@@ -157,9 +130,9 @@ int vx_qconv2d_i8u8_arm_dotprod_try(const void* input, const void* weight,
                                 vector_terms += 16u;
                             }
                             for (; local_channel < input_per_group; local_channel++) {
-                                const int32_t input_value = vx_w8a8_qconv_dotprod_byte_value(input,
+                                const int32_t input_value = vx_w8a8_byte_value(input,
                                     input_dtype, input_index + local_channel);
-                                const int32_t weight_value = vx_w8a8_qconv_dotprod_byte_value(weight,
+                                const int32_t weight_value = vx_w8a8_byte_value(weight,
                                     weight_dtype, weight_index + local_channel);
                                 accumulator += (int64_t)(input_value - input_zero_point) *
                                     (int64_t)(weight_value - weight_zero_points[output_channel]);
@@ -177,13 +150,13 @@ int vx_qconv2d_i8u8_arm_dotprod_try(const void* input, const void* weight,
                         const float scaled = (float)accumulator * multiplier;
                         const float transformed = scaled + (float)output_zero_point;
                         const int transformed_nan = transformed != transformed;
-                        int32_t quantized = vx_w8a8_qconv_dotprod_quantize_transformed(transformed,
+                        int32_t quantized = vx_w8a8_requantize(transformed,
                             output_minimum, output_maximum, output_zero_point);
                         if (!transformed_nan && relu) {
                             if (quantized < output_zero_point) quantized = output_zero_point;
                             if (relu >= 2u && quantized > relu6_upper) quantized = relu6_upper;
                         }
-                        vx_w8a8_qconv_dotprod_store_byte(output, output_dtype, output_index,
+                        vx_w8a8_store_byte(output, output_dtype, output_index,
                             quantized);
                     }
                 }

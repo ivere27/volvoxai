@@ -44,7 +44,7 @@ export_one() {
   local tflite="$directory/$tflite_name"
 
   download "$MEDIAPIPE_BASE/$precision/latest/efficientdet_lite0.tflite" "$tflite"
-  log "export ($precision) -> $directory/config.json + model.safetensors"
+  log "export ($precision) -> $directory/graph.json + model.safetensors"
   "$PY" "$EXPORTER" \
     --model "$tflite" \
     --out "$directory/model.safetensors" \

@@ -91,6 +91,27 @@ int slice_nd_f32(const float *input, float *output, const uint32_t *input_shape,
     return 1;
 }
 
+WASM_EXPORT("slice_nd_u32")
+int slice_nd_u32(const uint32_t *input, uint32_t *output,
+        const uint32_t *input_shape, const uint32_t *output_shape,
+        const uint32_t *starts, const uint32_t *steps, uint32_t rank,
+        uint32_t output_elements) {
+    size_t input_strides[8];
+    if (!input || !output || !vx_slice_nd_validate(input_shape, output_shape,
+        starts, steps, rank, output_elements, input_strides)) return 0;
+    for (uint32_t output_index = 0; output_index < output_elements; output_index++) {
+        size_t remaining = output_index, input_index = 0;
+        for (uint32_t reverse = rank; reverse-- > 0;) {
+            uint32_t coordinate = (uint32_t)(remaining % output_shape[reverse]);
+            remaining /= output_shape[reverse];
+            input_index += (size_t)(starts[reverse] + coordinate * steps[reverse]) *
+                input_strides[reverse];
+        }
+        output[output_index] = input[input_index];
+    }
+    return 1;
+}
+
 static int vx_gather_i32_validate(uint32_t outer, uint32_t axis_size,
         uint32_t inner, uint32_t indices_elements, uint32_t output_elements) {
     if (!outer || !axis_size || !inner || !indices_elements) return 0;
@@ -100,8 +121,9 @@ static int vx_gather_i32_validate(uint32_t outer, uint32_t axis_size,
     return product * inner == output_elements;
 }
 
-/* Canonical I32 Gather. Invalid selected values use the portable inference
-   sentinel -1 rather than risking an out-of-bounds read. */
+/* Canonical ONNX I32 Gather. Negative indices wrap once by the selected axis
+   size. Values still outside the axis use the portable inference sentinel -1
+   rather than risking an out-of-bounds read. */
 int gather_i32_f32(const float *input, const int32_t *indices, float *output,
         uint32_t outer, uint32_t axis_size, uint32_t inner,
         uint32_t indices_elements, uint32_t output_elements) {
@@ -109,15 +131,16 @@ int gather_i32_f32(const float *input, const int32_t *indices, float *output,
         inner, indices_elements, output_elements)) return 0;
     for (uint32_t outer_index = 0; outer_index < outer; outer_index++) {
         for (uint32_t index_position = 0; index_position < indices_elements; index_position++) {
-            int32_t selected = indices[index_position];
+            int64_t selected = indices[index_position];
             size_t output_base = ((size_t)outer_index * indices_elements + index_position) * inner;
-            if (selected < 0 || (uint32_t)selected >= axis_size) {
+            if (selected < 0) selected += (int64_t)axis_size;
+            if (selected < 0 || selected >= (int64_t)axis_size) {
                 for (uint32_t inner_index = 0; inner_index < inner; inner_index++) {
                     output[output_base + inner_index] = -1.0f;
                 }
                 continue;
             }
-            size_t input_base = ((size_t)outer_index * axis_size + (uint32_t)selected) * inner;
+            size_t input_base = ((size_t)outer_index * axis_size + (size_t)selected) * inner;
             for (uint32_t inner_index = 0; inner_index < inner; inner_index++) {
                 output[output_base + inner_index] = input[input_base + inner_index];
             }

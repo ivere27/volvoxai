@@ -5,7 +5,8 @@
 //
 // Fixed 16-byte ABI shared with native GPU backends:
 //   u32 outer, axis_size, inner, input_dtype
-// input_dtype is I8=2 or U8=3.  One 64-lane invocation owns one output index.
+// input_dtype uses canonical protobuf values I8=6 or U8=5. One 64-lane
+// invocation owns one output index.
 struct Params {
   outer : u32,
   axis_size : u32,
@@ -20,7 +21,7 @@ struct Params {
 fn input_value(index : u32) -> i32 {
   let word = input_words[index / 4u];
   let byte = (word >> ((index % 4u) * 8u)) & 255u;
-  if (params.input_dtype == 2u && byte >= 128u) {
+  if (params.input_dtype == 6u && byte >= 128u) {
     return i32(byte) - 256;
   }
   return i32(byte);

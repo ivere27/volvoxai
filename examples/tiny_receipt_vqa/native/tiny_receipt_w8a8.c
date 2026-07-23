@@ -24,6 +24,7 @@
 #define TINY_RECEIPT_PACKAGE_FORMAT "volvoxai-tiny-receipt-vqa-w8a8-materialized-package-v1"
 #define TINY_RECEIPT_FAMILY_COUNT 8
 #define TINY_RECEIPT_MAX_TENSORS 8
+#define TINY_RECEIPT_MAX_WEIGHT_FILES 2
 
 static const char* const k_family_names[TINY_RECEIPT_FAMILY_COUNT] = {
     "phone", "address", "store", "item_row", "item_math", "item_lookup", "math", "other",
@@ -39,14 +40,21 @@ typedef struct {
 } TinyReceiptVocab;
 
 typedef struct {
-    char config[PATH_MAX];
+    char paths[TINY_RECEIPT_MAX_WEIGHT_FILES][PATH_MAX];
+    int count;
+} TinyReceiptWeightFiles;
+
+typedef struct {
+    char graph[PATH_MAX];
+    TinyReceiptWeightFiles weights;
     char output_name[128];
     char q_ids[128];
     char router_keep[128];
 } TinyReceiptRouter;
 
 typedef struct {
-    char config[PATH_MAX];
+    char graph[PATH_MAX];
+    TinyReceiptWeightFiles weights;
     char output_name[128];
     char image[128];
     char q_ids[128];
@@ -77,8 +85,16 @@ typedef struct {
     const char* family;
     int max_new;
     int incremental;
-    VolvoxAIEngineOptions engine;
+    VxRuntimeOptions runtime_options;
+    VxBackendPolicy backend_policy;
+    const char* backend_candidates[1];
 } TinyReceiptCommand;
+
+typedef struct {
+    VxModel* model;
+    VxCompiledModel* compiled;
+    VxExecutionContext* context;
+} TinyReceiptGraph;
 
 static double tiny_receipt_now_ms(void) {
     struct timespec ts;
@@ -92,13 +108,13 @@ static void tiny_receipt_help(const char* argv0) {
     printf("The command always runs the hard router first, then an explicit family graph.\n\n");
     printf("Options:\n");
     printf("  --image <file>               Receipt PNG/JPEG (required).\n");
-    printf("  --prompt <text>              Question encoded by the packaged CharVocab (required).\n");
+    printf("  --prompt <text>              Valid UTF-8 question already normalized to NFC (required).\n");
     printf("  --family <name|auto>         Explicit family override; auto uses the router (default auto).\n");
     printf("  --max-new <n>                Maximum generated character tokens (default 192).\n");
-    printf("  --incremental                Cache input-independent branches; CPU also reuses decoder rows/KV.\n");
-    printf("  --vulkan | --opengl | --metal | --nnapi\n");
+    printf("  --incremental                Cache static branches and reuse decoder rows/KV.\n");
+    printf("  --vulkan | --opengl | --metal | --nnapi | --cuda\n");
     printf("  --debug\n");
-    printf("\nOrdinary full-graph forward remains the default; --incremental enables backward-compatible cached decoding.\n");
+    printf("\nOrdinary full-graph forward remains the default.\n");
 }
 
 static int tiny_receipt_is_dir(const char* path) {
@@ -189,19 +205,37 @@ static const char* tiny_receipt_string(const cJSON* object, const char* key, con
     return value->valuestring;
 }
 
-/* The materializer records an input's dtype/shape inline under its canonical
- * input name.  Accept a string alias too, but never infer a name from an
- * arbitrary field: the object key remains the ABI name unless it explicitly
- * provides a non-empty `name`. */
+static void tiny_receipt_warn_unqualified_activation_profile(const cJSON* root) {
+    const cJSON* profile = root
+        ? cJSON_GetObjectItemCaseSensitive((cJSON*)root, "activation_scale_profile")
+        : NULL;
+    const cJSON* qualified = cJSON_IsObject(profile)
+        ? cJSON_GetObjectItemCaseSensitive((cJSON*)profile,
+                                           "qualified_per_edge_calibration")
+        : NULL;
+    const cJSON* profile_id;
+    const cJSON* source;
+    const char* profile_name = "unspecified";
+    const char* source_name = "unspecified";
+    if (!cJSON_IsFalse(qualified)) return;
+    profile_id = cJSON_GetObjectItemCaseSensitive((cJSON*)profile, "profile_id");
+    source = cJSON_GetObjectItemCaseSensitive((cJSON*)profile, "source");
+    if (cJSON_IsString(profile_id) && profile_id->valuestring &&
+        profile_id->valuestring[0]) profile_name = profile_id->valuestring;
+    if (cJSON_IsString(source) && source->valuestring &&
+        source->valuestring[0]) source_name = source->valuestring;
+    fprintf(stderr,
+            "[tinyreceipt] WARNING: output accuracy is unqualified; "
+            "activation calibration profile='%s' source='%s' explicitly "
+            "sets qualified_per_edge_calibration=false\n",
+            profile_name, source_name);
+}
+
+/* Package interfaces map each logical input to one exact graph input name. */
 static const char* tiny_receipt_input_name(const cJSON* inputs, const char* key, const char* label) {
     const cJSON* value = inputs ? cJSON_GetObjectItemCaseSensitive((cJSON*)inputs, key) : NULL;
     if (cJSON_IsString(value) && value->valuestring && value->valuestring[0]) return value->valuestring;
-    if (cJSON_IsObject(value)) {
-        const cJSON* name = cJSON_GetObjectItemCaseSensitive((cJSON*)value, "name");
-        if (cJSON_IsString(name) && name->valuestring && name->valuestring[0]) return name->valuestring;
-        return key;
-    }
-    fprintf(stderr, "[tinyreceipt] manifest requires input declaration %s\n", label);
+    fprintf(stderr, "[tinyreceipt] manifest requires string input name %s\n", label);
     return NULL;
 }
 
@@ -242,6 +276,51 @@ static int tiny_receipt_parse_input_names(const cJSON* interface, TinyReceiptFam
            tiny_receipt_copy_string(family->y_keep, sizeof(family->y_keep), y_keep, "family y_keep input");
 }
 
+/* New materializations scope persisted tensors to the graph that consumes
+ * them.  Older v1 packages omit weight_files and continue to use the shared
+ * top-level weights.file. */
+static int tiny_receipt_parse_weight_files(const cJSON* graph_record,
+                                           const char* package_dir,
+                                           const char* fallback,
+                                           TinyReceiptWeightFiles* out,
+                                           const char* label) {
+    const cJSON* files = graph_record
+        ? cJSON_GetObjectItemCaseSensitive((cJSON*)graph_record, "weight_files")
+        : NULL;
+    int count;
+    if (!package_dir || !fallback || !out || !label) return -1;
+    memset(out, 0, sizeof(*out));
+    if (!files) {
+        if (tiny_receipt_copy_string(out->paths[0], sizeof(out->paths[0]),
+                                     fallback, label) != 0) return -1;
+        out->count = 1;
+        return 0;
+    }
+    if (!cJSON_IsArray(files) ||
+        (count = cJSON_GetArraySize(files)) < 1 ||
+        count > TINY_RECEIPT_MAX_WEIGHT_FILES) {
+        fprintf(stderr,
+                "[tinyreceipt] %s must be an array of one or two package-relative files\n",
+                label);
+        return -1;
+    }
+    for (int index = 0; index < count; index++) {
+        const cJSON* item = cJSON_GetArrayItem((cJSON*)files, index);
+        if (!cJSON_IsString(item) || !item->valuestring || !item->valuestring[0] ||
+            tiny_receipt_resolve_package_file(
+                package_dir, item->valuestring, out->paths[index],
+                sizeof(out->paths[index]), label) != 0) return -1;
+        for (int previous = 0; previous < index; previous++) {
+            if (!strcmp(out->paths[previous], out->paths[index])) {
+                fprintf(stderr, "[tinyreceipt] %s contains a duplicate file\n", label);
+                return -1;
+            }
+        }
+    }
+    out->count = count;
+    return 0;
+}
+
 static int tiny_receipt_load_package(const char* package_arg, TinyReceiptPackage* package) {
     char manifest_path[PATH_MAX];
     char manifest_real[PATH_MAX];
@@ -257,7 +336,7 @@ static int tiny_receipt_load_package(const char* package_arg, TinyReceiptPackage
     const cJSON* resize;
     const char* format;
     const char* weights_file;
-    const char* router_config;
+    const char* router_graph;
     const char* router_output;
     const char* q_ids;
     const char* router_keep;
@@ -309,7 +388,7 @@ static int tiny_receipt_load_package(const char* package_arg, TinyReceiptPackage
     preprocess = tiny_receipt_object(root, "preprocessing", "preprocessing");
     if (!weights || !router || !families || !vocab || !preprocess) goto cleanup;
     weights_file = tiny_receipt_string(weights, "file", "weights.file");
-    router_config = tiny_receipt_string(router, "config", "router.config");
+    router_graph = tiny_receipt_string(router, "graph", "router.graph");
     router_output = tiny_receipt_string(router, "output_name", "router.output_name");
     router_inputs = tiny_receipt_object(router, "inputs", "router.inputs");
     vocab_file = tiny_receipt_string(vocab, "file", "vocab.file");
@@ -317,7 +396,7 @@ static int tiny_receipt_load_package(const char* package_arg, TinyReceiptPackage
     color_space = tiny_receipt_string(preprocess, "color_space", "preprocessing.color_space");
     resize = tiny_receipt_object(preprocess, "resize", "preprocessing.resize");
     normalization = tiny_receipt_string(preprocess, "normalization", "preprocessing.normalization");
-    if (!weights_file || !router_config || !router_output || !router_inputs || !vocab_file || !token_ids || !color_space ||
+    if (!weights_file || !router_graph || !router_output || !router_inputs || !vocab_file || !token_ids || !color_space ||
         !resize || !normalization) goto cleanup;
     q_ids = tiny_receipt_input_name(router_inputs, "q_ids", "router.inputs.q_ids");
     router_keep = tiny_receipt_input_name(router_inputs, "router_keep", "router.inputs.router_keep");
@@ -330,39 +409,48 @@ static int tiny_receipt_load_package(const char* package_arg, TinyReceiptPackage
         tiny_receipt_number(token_ids, "eos", "vocab.token_ids.eos", &package->token_eos) != 0 ||
         tiny_receipt_number(token_ids, "unk", "vocab.token_ids.unk", &package->token_unk) != 0) goto cleanup;
     if (strcmp(color_space, "grayscale") != 0 || strcmp(resample, "bilinear") != 0 ||
-        (strcmp(normalization, "minus-one-one") != 0 && strcmp(normalization, "minus_one_one") != 0)) {
+        strcmp(normalization, "minus-one-one") != 0) {
         fprintf(stderr, "[tinyreceipt] package preprocessing must be grayscale + bilinear + minus-one-one\n");
         goto cleanup;
     }
     if (package->resize_width <= 0 || package->resize_height <= 0 ||
         tiny_receipt_resolve_package_file(package->package_dir, weights_file, package->weights,
                                           sizeof(package->weights), "weights.file") != 0 ||
-        tiny_receipt_resolve_package_file(package->package_dir, router_config, package->router.config,
-                                          sizeof(package->router.config), "router.config") != 0 ||
+        tiny_receipt_resolve_package_file(package->package_dir, router_graph, package->router.graph,
+                                          sizeof(package->router.graph), "router.graph") != 0 ||
         tiny_receipt_resolve_package_file(package->package_dir, vocab_file, package->vocab_path,
                                           sizeof(package->vocab_path), "vocab.file") != 0 ||
         tiny_receipt_copy_string(package->router.output_name, sizeof(package->router.output_name), router_output,
                                  "router output name") != 0 ||
         tiny_receipt_copy_string(package->router.q_ids, sizeof(package->router.q_ids), q_ids, "router q_ids input") != 0 ||
         tiny_receipt_copy_string(package->router.router_keep, sizeof(package->router.router_keep), router_keep,
-                                 "router router_keep input") != 0) goto cleanup;
+                                 "router router_keep input") != 0 ||
+        tiny_receipt_parse_weight_files(router, package->package_dir,
+                                        package->weights,
+                                        &package->router.weights,
+                                        "router.weight_files") != 0) goto cleanup;
 
     for (int index = 0; index < TINY_RECEIPT_FAMILY_COUNT; index++) {
         const char* family_name = k_family_names[index];
         const cJSON* family = cJSON_GetObjectItemCaseSensitive((cJSON*)families, family_name);
         const cJSON* interface;
-        const char* config;
+        const char* graph;
         if (!cJSON_IsObject(family)) {
             fprintf(stderr, "[tinyreceipt] manifest requires explicit family %s\n", family_name);
             goto cleanup;
         }
-        config = tiny_receipt_string(family, "config", "explicit_families.<name>.config");
+        graph = tiny_receipt_string(family, "graph", "explicit_families.<name>.graph");
         interface = tiny_receipt_object(family, "interface", "explicit_families.<name>.interface");
-        if (!config || !interface ||
-            tiny_receipt_resolve_package_file(package->package_dir, config, package->families[index].config,
-                                              sizeof(package->families[index].config), "family config") != 0 ||
+        if (!graph || !interface ||
+            tiny_receipt_resolve_package_file(package->package_dir, graph, package->families[index].graph,
+                                              sizeof(package->families[index].graph), "family graph") != 0 ||
+            tiny_receipt_parse_weight_files(family, package->package_dir,
+                                            package->weights,
+                                            &package->families[index].weights,
+                                            "explicit_families.<name>.weight_files") != 0 ||
             tiny_receipt_parse_input_names(interface, &package->families[index]) != 0) goto cleanup;
     }
+    tiny_receipt_warn_unqualified_activation_profile(root);
     rc = 0;
 
 cleanup:
@@ -524,196 +612,314 @@ static int tiny_receipt_find_family(const char* value) {
     return -2;
 }
 
-static void tiny_receipt_engine_options_init(VolvoxAIEngineOptions* options) {
-    memset(options, 0, sizeof(*options));
-    options->backend = VOLVOXAI_BACKEND_CPU;
+static void tiny_receipt_runtime_options_init(TinyReceiptCommand* command) {
+    command->runtime_options = (VxRuntimeOptions)VX_RUNTIME_OPTIONS_INIT;
+    command->backend_policy = (VxBackendPolicy)VX_BACKEND_POLICY_INIT;
 }
 
-static const char* tiny_receipt_requested_backend_name(VolvoxAIEngineBackend backend) {
-    switch (backend) {
-        case VOLVOXAI_BACKEND_VULKAN: return "Vulkan";
-        case VOLVOXAI_BACKEND_OPENGL: return "OpenGL";
-        case VOLVOXAI_BACKEND_METAL: return "Metal";
-        case VOLVOXAI_BACKEND_NNAPI: return "NNAPI";
-        case VOLVOXAI_BACKEND_CPU:
-        default: return "CPU";
-    }
+static void tiny_receipt_report_failure(const char* action, VxStatus status,
+                                        const VxReport* report) {
+    fprintf(stderr, "[tinyreceipt] %s failed: %s", action, vx_status_string(status));
+    if (report && report->reason[0]) fprintf(stderr, " (%s)", report->reason);
+    if (report && report->message[0]) fprintf(stderr, ": %s", report->message);
+    fputc('\n', stderr);
 }
 
-static int tiny_receipt_select_backend(VolvoxAIEngineOptions* options,
-                                       VolvoxAIEngineBackend backend) {
-    if (options->backend != VOLVOXAI_BACKEND_CPU && options->backend != backend) {
+static int tiny_receipt_select_backend(TinyReceiptCommand* command,
+                                       const char* backend) {
+    VxBackendPolicy* policy = &command->backend_policy;
+    if (policy->backend_count != 0 &&
+        strcmp(policy->backends[0], backend) != 0) {
         fprintf(stderr, "[tinyreceipt] pass at most one accelerator backend flag\n");
         return -1;
     }
-    options->backend = backend;
+    policy->mode = VX_BACKEND_REQUIRE;
+    policy->operator_fallback = VX_OPERATOR_FALLBACK_FORBID;
+    command->backend_candidates[0] = backend;
+    policy->backends = command->backend_candidates;
+    policy->backend_count = 1;
     return 1;
 }
 
 static int tiny_receipt_parse_engine_flag(const char* arg,
-                                          VolvoxAIEngineOptions* options) {
+                                          TinyReceiptCommand* command) {
     if (!strcmp(arg, "--vulkan")) {
-        return tiny_receipt_select_backend(options, VOLVOXAI_BACKEND_VULKAN);
+        return tiny_receipt_select_backend(command, "vulkan");
     }
     if (!strcmp(arg, "--opengl")) {
-        return tiny_receipt_select_backend(options, VOLVOXAI_BACKEND_OPENGL);
+        return tiny_receipt_select_backend(command, "opengl");
     }
     if (!strcmp(arg, "--metal")) {
-        return tiny_receipt_select_backend(options, VOLVOXAI_BACKEND_METAL);
+        return tiny_receipt_select_backend(command, "metal");
     }
     if (!strcmp(arg, "--nnapi")) {
-        return tiny_receipt_select_backend(options, VOLVOXAI_BACKEND_NNAPI);
+        return tiny_receipt_select_backend(command, "nnapi");
+    }
+    if (!strcmp(arg, "--cuda")) {
+        return tiny_receipt_select_backend(command, "cuda");
     }
     if (!strcmp(arg, "--debug")) {
-        options->debug = 1;
+        command->runtime_options.debug = 1;
         return 1;
     }
     return 0;
 }
 
-static int tiny_receipt_configure_engine(const VolvoxAIEngineOptions* options) {
-    printf("VolvoxAI Native Engine\n");
-    if (volvoxai_engine_configure(options) != 0) {
-        fprintf(stderr, "[tinyreceipt] cannot configure requested backend: %s\n",
-                tiny_receipt_requested_backend_name(options->backend));
-        return -1;
-    }
-    printf("Backend: %s\n", volvoxai_engine_backend_name());
-    return 0;
+static void tiny_receipt_graph_close(TinyReceiptGraph* graph) {
+    if (!graph) return;
+    vx_execution_context_release(graph->context);
+    vx_compiled_model_release(graph->compiled);
+    vx_model_release(graph->model);
+    memset(graph, 0, sizeof(*graph));
 }
 
-static int tiny_receipt_info_i32_2d(const char* name, int* sequence) {
-    long numel = 0;
-    int shape[TINY_RECEIPT_MAX_TENSORS] = {0};
-    int ndim = 0;
-    int dtype = -1;
-    size_t element_size = 0;
-    if (volvoxai_engine_tensor_info_ex(name, &numel, shape, &ndim, &dtype, &element_size) != 0 ||
-        !volvoxai_engine_is_graph_input(name) || dtype != VOLVOXAI_DTYPE_I32 || element_size != sizeof(int32_t) ||
-        ndim != 2 || shape[0] != 1 || shape[1] <= 0 || numel != shape[1]) {
+static int tiny_receipt_graph_open(VxRuntime* runtime, const char* graph_path,
+                                   const TinyReceiptWeightFiles* weights,
+                                   const VxBackendPolicy* policy,
+                                   const VxContextOptions* context_options,
+                                   TinyReceiptGraph* graph) {
+    const char* weight_paths[TINY_RECEIPT_MAX_WEIGHT_FILES] = {0};
+    VxModelSource source = VX_MODEL_SOURCE_INIT;
+    VxReport report = VX_REPORT_INIT;
+    VxStatus status;
+    if (!weights || weights->count < 1 ||
+        weights->count > TINY_RECEIPT_MAX_WEIGHT_FILES) return -1;
+    for (int index = 0; index < weights->count; index++)
+        weight_paths[index] = weights->paths[index];
+    memset(graph, 0, sizeof(*graph));
+    source.graph_path = graph_path;
+    source.weight_paths = weight_paths;
+    source.weight_path_count = (size_t)weights->count;
+    status = vx_runtime_load_model(runtime, &source, &graph->model, &report);
+    if (status != VX_STATUS_OK) {
+        tiny_receipt_report_failure("model load", status, &report);
+        goto fail;
+    }
+    report = (VxReport)VX_REPORT_INIT;
+    status = vx_model_compile(graph->model, policy, &graph->compiled, &report);
+    if (status != VX_STATUS_OK) {
+        tiny_receipt_report_failure("model compile", status, &report);
+        goto fail;
+    }
+    report = (VxReport)VX_REPORT_INIT;
+    status = vx_compiled_model_create_context(graph->compiled, context_options,
+                                              &graph->context, &report);
+    if (status != VX_STATUS_OK) {
+        tiny_receipt_report_failure("context creation", status, &report);
+        goto fail;
+    }
+    return 0;
+fail:
+    tiny_receipt_graph_close(graph);
+    return -1;
+}
+
+static int tiny_receipt_find_input(VxExecutionContext* context, const char* name,
+                                   VxTensorInfo* found) {
+    size_t count = vx_execution_context_input_count(context);
+    for (size_t index = 0; index < count; index++) {
+        VxTensorInfo info = VX_TENSOR_INFO_INIT;
+        if (vx_execution_context_input_info(context, index, &info, NULL) == VX_STATUS_OK &&
+            info.name && strcmp(info.name, name) == 0) {
+            *found = info;
+            return 0;
+        }
+    }
+    return -1;
+}
+
+static int tiny_receipt_info_i32_2d(VxExecutionContext* context,
+                                    const char* name, int* sequence) {
+    VxTensorInfo info = VX_TENSOR_INFO_INIT;
+    if (tiny_receipt_find_input(context, name, &info) != 0 ||
+        info.dtype != VX_DTYPE_I32 || info.rank != 2 || info.shape[0] != 1 ||
+        info.shape[1] <= 0 || info.shape[1] > INT_MAX ||
+        info.byte_size != (size_t)info.shape[1] * sizeof(int32_t)) {
         fprintf(stderr, "[tinyreceipt] required graph input %s must be I32 [1,S]\n", name);
         return -1;
     }
-    *sequence = shape[1];
+    *sequence = (int)info.shape[1];
     return 0;
 }
 
-static int tiny_receipt_info_image(const char* name, int expected_width, int expected_height, long* numel,
-                                   int* shape_out) {
-    int shape[TINY_RECEIPT_MAX_TENSORS] = {0};
-    int ndim = 0;
-    int dtype = -1;
-    size_t element_size = 0;
-    if (volvoxai_engine_tensor_info_ex(name, numel, shape, &ndim, &dtype, &element_size) != 0 ||
-        !volvoxai_engine_is_graph_input(name) || dtype != VOLVOXAI_DTYPE_F32 || element_size != sizeof(float) ||
-        ndim != 4 || shape[0] != 1 || shape[1] != expected_height || shape[2] != expected_width || shape[3] != 1 ||
-        *numel != (long)shape[1] * shape[2]) {
+static int tiny_receipt_info_image(VxExecutionContext* context, const char* name,
+                                   int expected_width, int expected_height,
+                                   size_t* numel, int* shape_out) {
+    VxTensorInfo info = VX_TENSOR_INFO_INIT;
+    if (tiny_receipt_find_input(context, name, &info) != 0 ||
+        info.dtype != VX_DTYPE_F32 || info.rank != 4 || info.shape[0] != 1 ||
+        info.shape[1] != expected_height || info.shape[2] != expected_width ||
+        info.shape[3] != 1 || info.shape[1] > INT_MAX || info.shape[2] > INT_MAX ||
+        info.byte_size != (size_t)info.shape[1] * (size_t)info.shape[2] * sizeof(float)) {
         fprintf(stderr, "[tinyreceipt] required image input %s must be F32 [1,%d,%d,1]\n",
                 name, expected_height, expected_width);
         return -1;
     }
-    memcpy(shape_out, shape, sizeof(shape));
+    *numel = (size_t)info.shape[1] * (size_t)info.shape[2];
+    for (uint32_t axis = 0; axis < info.rank; axis++) shape_out[axis] = (int)info.shape[axis];
     return 0;
 }
 
-static int tiny_receipt_set_i32(const char* name, const int32_t* data, int count) {
+static int tiny_receipt_set_input(VxExecutionContext* context, const char* name,
+                                  VxDataType dtype, const void* data,
+                                  size_t byte_size) {
+    VxReport report = VX_REPORT_INIT;
+    VxStatus status = vx_execution_context_set_input(context, name, dtype, data,
+                                                     byte_size, &report);
+    if (status == VX_STATUS_OK) return 0;
+    tiny_receipt_report_failure("input upload", status, &report);
+    return -1;
+}
+
+static int tiny_receipt_set_i32(VxExecutionContext* context, const char* name,
+                                const int32_t* data, int count) {
     if (count < 0 || (size_t)count > SIZE_MAX / sizeof(*data) ||
-        volvoxai_engine_set_input_raw(name, VOLVOXAI_DTYPE_I32, data, (size_t)count * sizeof(*data)) != 0) {
+        tiny_receipt_set_input(context, name, VX_DTYPE_I32, data,
+                               (size_t)count * sizeof(*data)) != 0) {
         fprintf(stderr, "[tinyreceipt] could not set typed I32 input %s\n", name);
         return -1;
     }
     return 0;
 }
 
-static int tiny_receipt_run_router(const TinyReceiptPackage* package, const TinyReceiptVocab* vocab,
-                                   const char* prompt, int32_t** ids_out, int32_t** keep_out, int* q_length,
+static int tiny_receipt_find_output(const VxResult* result, const char* name,
+                                    VxTensorInfo* found) {
+    size_t count = vx_result_output_count(result);
+    for (size_t index = 0; index < count; index++) {
+        VxTensorInfo info = VX_TENSOR_INFO_INIT;
+        if (vx_result_output_info(result, index, &info, NULL) == VX_STATUS_OK &&
+            info.name && strcmp(info.name, name) == 0) {
+            *found = info;
+            return 0;
+        }
+    }
+    return -1;
+}
+
+static int tiny_receipt_run_router(VxRuntime* runtime,
+                                   const VxBackendPolicy* backend_policy,
+                                   const TinyReceiptPackage* package,
+                                   const TinyReceiptVocab* vocab,
+                                   const char* prompt, int32_t** ids_out,
+                                   int32_t** keep_out, int* q_length,
                                    int* router_family, int debug) {
+    TinyReceiptGraph graph = {0};
+    VxResult* result = NULL;
+    VxReport report = VX_REPORT_INIT;
+    VxTensorInfo output_info = VX_TENSOR_INFO_INIT;
     int query_length = 0;
     int keep_length = 0;
     int32_t* ids = NULL;
     int32_t* keep = NULL;
     int32_t route = -1;
-    long output_numel = 0;
-    int output_shape[TINY_RECEIPT_MAX_TENSORS] = {0};
-    int output_ndim = 0;
-    int output_dtype = -1;
-    size_t output_element_size = 0;
-    if (volvoxai_engine_init(package->router.config, package->weights) != 0 ||
-        tiny_receipt_info_i32_2d(package->router.q_ids, &query_length) != 0 ||
-        tiny_receipt_info_i32_2d(package->router.router_keep, &keep_length) != 0 || query_length != keep_length) {
+    size_t required = 0;
+    int rc = -1;
+    if (tiny_receipt_graph_open(runtime, package->router.graph,
+                                &package->router.weights,
+                                backend_policy, NULL, &graph) != 0 ||
+        tiny_receipt_info_i32_2d(graph.context, package->router.q_ids,
+                                 &query_length) != 0 ||
+        tiny_receipt_info_i32_2d(graph.context, package->router.router_keep,
+                                 &keep_length) != 0 ||
+        query_length != keep_length) {
         fprintf(stderr, "[tinyreceipt] router graph does not expose its declared typed ABI\n");
-        goto fail;
+        goto cleanup;
     }
     if (!(ids = (int32_t*)malloc((size_t)query_length * sizeof(*ids))) ||
-        !(keep = (int32_t*)calloc((size_t)query_length, sizeof(*keep)))) goto fail;
+        !(keep = (int32_t*)calloc((size_t)query_length, sizeof(*keep)))) goto cleanup;
     for (int index = 0; index < query_length; index++) ids[index] = vocab->pad;
     {
         int count = tiny_receipt_encode_question(vocab, prompt, ids, query_length);
-        if (count < 0) goto fail;
+        if (count < 0) goto cleanup;
         for (int index = 0; index < query_length; index++) keep[index] = ids[index] != vocab->pad;
         if (debug) fprintf(stderr, "[debug] tinyreceipt question_tokens=%d\n", count);
     }
-    if (tiny_receipt_set_i32(package->router.q_ids, ids, query_length) != 0 ||
-        tiny_receipt_set_i32(package->router.router_keep, keep, query_length) != 0 ||
-        volvoxai_engine_forward() != 0 ||
-        volvoxai_engine_tensor_info_ex(package->router.output_name, &output_numel, output_shape, &output_ndim,
-                                       &output_dtype, &output_element_size) != 0 ||
-        output_dtype != VOLVOXAI_DTYPE_I32 || output_element_size != sizeof(route) || output_numel != 1 ||
-        volvoxai_engine_copy_tensor_raw(package->router.output_name, &route, sizeof(route)) != 0 ||
+    if (tiny_receipt_set_i32(graph.context, package->router.q_ids, ids,
+                             query_length) != 0 ||
+        tiny_receipt_set_i32(graph.context, package->router.router_keep, keep,
+                             query_length) != 0) goto cleanup;
+    if (vx_execution_context_execute(graph.context, &result, &report) != VX_STATUS_OK) {
+        tiny_receipt_report_failure("router execution", report.status, &report);
+        goto cleanup;
+    }
+    if (tiny_receipt_find_output(result, package->router.output_name,
+                                 &output_info) != 0 ||
+        output_info.dtype != VX_DTYPE_I32 || output_info.byte_size != sizeof(route) ||
+        vx_result_read(result, package->router.output_name, &route, sizeof(route),
+                       &required, &report) != VX_STATUS_OK || required != sizeof(route) ||
         route < 0 || route >= TINY_RECEIPT_FAMILY_COUNT) {
         fprintf(stderr, "[tinyreceipt] router output %s must be one valid I32 family ID\n", package->router.output_name);
-        goto fail;
+        goto cleanup;
     }
     *ids_out = ids;
     *keep_out = keep;
     *q_length = query_length;
     *router_family = route;
-    return 0;
+    ids = NULL;
+    keep = NULL;
+    rc = 0;
 
-fail:
+cleanup:
+    vx_result_release(result);
+    tiny_receipt_graph_close(&graph);
     free(ids);
     free(keep);
-    return -1;
+    return rc;
 }
 
-static int tiny_receipt_run_family(const TinyReceiptPackage* package, const TinyReceiptVocab* vocab,
-                                   const TinyReceiptFamily* family, int family_id, const char* image_path,
-                                   int max_new, int incremental, const int32_t* q_ids,
-                                   const int32_t* router_keep, int q_length, int debug) {
+static int tiny_receipt_run_family(VxRuntime* runtime,
+                                   const VxBackendPolicy* backend_policy,
+                                   const TinyReceiptPackage* package,
+                                   const TinyReceiptVocab* vocab,
+                                   const TinyReceiptFamily* family, int family_id,
+                                   const char* image_path, int max_new,
+                                   int incremental,
+                                   const int32_t* q_ids,
+                                   const int32_t* router_keep, int q_length,
+                                   int debug) {
+    TinyReceiptGraph graph = {0};
+    VxContextOptions context_options = VX_CONTEXT_OPTIONS_INIT;
+    VxResult* result = NULL;
+    VxReport report = VX_REPORT_INIT;
     int full_q_length = 0;
     int full_router_keep_length = 0;
     int memory_length = 0;
     int decoder_length = 0;
     int decoder_keep_length = 0;
     int image_shape[TINY_RECEIPT_MAX_TENSORS] = {0};
-    long image_numel = 0;
+    size_t image_numel = 0;
     float* image = NULL;
     int32_t* memory_keep = NULL;
     int32_t* y_ids = NULL;
     int32_t* y_keep = NULL;
     int32_t* token_ids = NULL;
     char image_error[256] = {0};
-    long output_numel = 0;
-    int output_shape[TINY_RECEIPT_MAX_TENSORS] = {0};
-    int output_ndim = 0;
-    int output_dtype = -1;
-    size_t output_element_size = 0;
     int generated = 0;
-    int row_decode = 0;
     int steady_steps = 0;
-    VolvoxAIDecodeSession* decode_session = NULL;
     double start_ms;
     double seed_ms = 0.0;
     double steady_ms = 0.0;
     int rc = -1;
 
-    if (volvoxai_engine_init(family->config, package->weights) != 0 ||
-        tiny_receipt_info_i32_2d(family->q_ids, &full_q_length) != 0 ||
-        tiny_receipt_info_i32_2d(family->router_keep, &full_router_keep_length) != 0 ||
-        tiny_receipt_info_i32_2d(family->memory_keep, &memory_length) != 0 ||
-        tiny_receipt_info_i32_2d(family->y_ids, &decoder_length) != 0 ||
-        tiny_receipt_info_i32_2d(family->y_keep, &decoder_keep_length) != 0 ||
-        tiny_receipt_info_image(family->image, package->resize_width, package->resize_height, &image_numel, image_shape) != 0 ||
+    if (incremental) {
+        context_options.decode_row_mode = VX_DECODE_ROW_AUTO;
+        context_options.require_incremental = 1;
+    }
+    if (tiny_receipt_graph_open(runtime, family->graph, &family->weights,
+                                backend_policy, &context_options, &graph) != 0 ||
+        tiny_receipt_info_i32_2d(graph.context, family->q_ids,
+                                 &full_q_length) != 0 ||
+        tiny_receipt_info_i32_2d(graph.context, family->router_keep,
+                                 &full_router_keep_length) != 0 ||
+        tiny_receipt_info_i32_2d(graph.context, family->memory_keep,
+                                 &memory_length) != 0 ||
+        tiny_receipt_info_i32_2d(graph.context, family->y_ids,
+                                 &decoder_length) != 0 ||
+        tiny_receipt_info_i32_2d(graph.context, family->y_keep,
+                                 &decoder_keep_length) != 0 ||
+        tiny_receipt_info_image(graph.context, family->image,
+                                package->resize_width, package->resize_height,
+                                &image_numel, image_shape) != 0 ||
         full_q_length != q_length || full_router_keep_length != q_length || decoder_length != decoder_keep_length ||
         memory_length < q_length) {
         fprintf(stderr, "[tinyreceipt] family graph does not match the router or typed sequence ABI\n");
@@ -722,7 +928,8 @@ static int tiny_receipt_run_family(const TinyReceiptPackage* package, const Tiny
     if (!(image = (float*)malloc((size_t)image_numel * sizeof(*image))) ||
         !(memory_keep = (int32_t*)malloc((size_t)memory_length * sizeof(*memory_keep))) ||
         !(y_ids = (int32_t*)malloc((size_t)decoder_length * sizeof(*y_ids))) ||
-        !(y_keep = (int32_t*)calloc((size_t)decoder_length, sizeof(*y_keep)))) goto cleanup;
+        !(y_keep = (int32_t*)calloc((size_t)decoder_length, sizeof(*y_keep))) ||
+        !(token_ids = (int32_t*)malloc((size_t)decoder_length * sizeof(*token_ids)))) goto cleanup;
     if (tiny_receipt_load_image_to_tensor(image_path, image, image_shape, 4,
                                           image_error, sizeof(image_error)) != 0) {
         fprintf(stderr, "[tinyreceipt] image load failed: %s\n", image_error[0] ? image_error : image_path);
@@ -734,47 +941,83 @@ static int tiny_receipt_run_family(const TinyReceiptPackage* package, const Tiny
     y_ids[0] = vocab->bos;
     y_keep[0] = 1;
 
-    if (volvoxai_engine_set_input_raw(family->image, VOLVOXAI_DTYPE_F32, image,
-                                      (size_t)image_numel * sizeof(*image)) != 0 ||
-        tiny_receipt_set_i32(family->q_ids, q_ids, q_length) != 0 ||
-        tiny_receipt_set_i32(family->router_keep, router_keep, q_length) != 0 ||
-        tiny_receipt_set_i32(family->memory_keep, memory_keep, memory_length) != 0) goto cleanup;
-    if (volvoxai_engine_tensor_info_ex(family->output_name, &output_numel, output_shape, &output_ndim,
-                                       &output_dtype, &output_element_size) != 0 ||
-        output_dtype != VOLVOXAI_DTYPE_I32 || output_element_size != sizeof(*token_ids) || output_ndim != 2 ||
-        output_shape[0] != 1 || output_shape[1] != decoder_length || output_numel != decoder_length ||
-        !(token_ids = (int32_t*)malloc((size_t)decoder_length * sizeof(*token_ids)))) {
-        fprintf(stderr, "[tinyreceipt] family output %s must be I32 [1,max_out_len] QArgMax token IDs\n",
-                family->output_name);
-        goto cleanup;
-    }
-    if (max_new > decoder_length) max_new = decoder_length;
+    if (tiny_receipt_set_input(graph.context, family->image, VX_DTYPE_F32, image,
+                               image_numel * sizeof(*image)) != 0 ||
+        tiny_receipt_set_i32(graph.context, family->q_ids, q_ids, q_length) != 0 ||
+        tiny_receipt_set_i32(graph.context, family->router_keep, router_keep,
+                             q_length) != 0 ||
+        tiny_receipt_set_i32(graph.context, family->memory_keep, memory_keep,
+                             memory_length) != 0) goto cleanup;
     if (incremental) {
-        VolvoxAIDecodeSessionOptions decode_options = VOLVOXAI_DECODE_SESSION_OPTIONS_INIT;
-        decode_session = volvoxai_engine_decode_session_create(&decode_options);
-        if (!decode_session) {
-            fprintf(stderr, "[tinyreceipt] could not create the incremental decode session\n");
+        VxStatus status;
+        if (tiny_receipt_set_i32(graph.context, family->y_ids, y_ids,
+                                 decoder_length) != 0 ||
+            tiny_receipt_set_i32(graph.context, family->y_keep, y_keep,
+                                 decoder_length) != 0) {
+            fprintf(stderr, "[tinyreceipt] could not initialize incremental decoder inputs\n");
             goto cleanup;
         }
-        row_decode = volvoxai_engine_decode_session_mode(decode_session) ==
-            VOLVOXAI_DECODE_MODE_INCREMENTAL_ROW;
+        report = (VxReport)VX_REPORT_INIT;
+        status = vx_execution_context_decode_reset(graph.context, &report);
+        if (status != VX_STATUS_OK) {
+            tiny_receipt_report_failure("family decode reset", status, &report);
+            goto cleanup;
+        }
+        if (debug) {
+            fprintf(stderr, "[debug] tinyreceipt family=%s decode reset %s\n",
+                    k_family_names[family_id],
+                    report.decode_state[0] ? report.decode_state : "complete");
+        }
     }
+    if (max_new > decoder_length) max_new = decoder_length;
     start_ms = tiny_receipt_now_ms();
     for (int step = 0; step < max_new; step++) {
+        VxTensorInfo output_info = VX_TENSOR_INFO_INIT;
+        VxStatus status;
+        size_t required = 0;
         int32_t next;
         double step_start_ms = debug ? tiny_receipt_now_ms() : 0.0;
-        if (tiny_receipt_set_i32(family->y_ids, y_ids, decoder_length) != 0 ||
-            tiny_receipt_set_i32(family->y_keep, y_keep, decoder_length) != 0 ||
-            (incremental
-                ? (step == 0
-                    ? volvoxai_engine_decode_session_seed(decode_session)
-                    : volvoxai_engine_decode_session_step(decode_session, step))
-                : volvoxai_engine_forward()) != 0 ||
-            volvoxai_engine_copy_tensor_raw(family->output_name, token_ids,
-                                            (size_t)decoder_length * sizeof(*token_ids)) != 0) {
+        if ((!incremental || step > 0) &&
+            (tiny_receipt_set_i32(graph.context, family->y_ids, y_ids,
+                                  decoder_length) != 0 ||
+             tiny_receipt_set_i32(graph.context, family->y_keep, y_keep,
+                                  decoder_length) != 0)) {
             fprintf(stderr, "[tinyreceipt] typed family forward failed at token %d\n", step);
             goto cleanup;
         }
+        report = (VxReport)VX_REPORT_INIT;
+        status = incremental
+            ? (step == 0
+                ? vx_execution_context_decode_seed(graph.context, &result, &report)
+                : vx_execution_context_decode_step(graph.context, step,
+                                                   &result, &report))
+            : vx_execution_context_execute(graph.context, &result, &report);
+        if (status != VX_STATUS_OK) {
+            tiny_receipt_report_failure(
+                !incremental ? "family execution" :
+                (step == 0 ? "family decode seed" : "family decode step"),
+                status, &report);
+            goto cleanup;
+        }
+        if (debug && incremental) {
+            fprintf(stderr, "[debug] tinyreceipt family=%s step=%d decode=%s\n",
+                    k_family_names[family_id], step,
+                    report.decode_state[0] ? report.decode_state : "complete");
+        }
+        if (tiny_receipt_find_output(result, family->output_name, &output_info) != 0 ||
+            output_info.dtype != VX_DTYPE_I32 || output_info.rank != 2 ||
+            output_info.shape[0] != 1 || output_info.shape[1] != decoder_length ||
+            output_info.byte_size != (size_t)decoder_length * sizeof(*token_ids) ||
+            vx_result_read(result, family->output_name, token_ids,
+                           (size_t)decoder_length * sizeof(*token_ids),
+                           &required, &report) != VX_STATUS_OK ||
+            required != (size_t)decoder_length * sizeof(*token_ids)) {
+            fprintf(stderr, "[tinyreceipt] family output %s must be I32 [1,max_out_len] QArgMax token IDs\n",
+                    family->output_name);
+            goto cleanup;
+        }
+        vx_result_release(result);
+        result = NULL;
         if (debug) {
             double step_ms = tiny_receipt_now_ms() - step_start_ms;
             if (step == 0) seed_ms = step_ms;
@@ -803,28 +1046,26 @@ static int tiny_receipt_run_family(const TinyReceiptPackage* package, const Tiny
     if (debug) {
         double elapsed = tiny_receipt_now_ms() - start_ms;
         double tokens_per_second = generated > 0 && elapsed > 0.0 ? (double)generated * 1000.0 / elapsed : 0.0;
-        fprintf(stderr, "[debug] tinyreceipt family=%s tokens=%d total=%.3f ms tok/s=%.2f (%s)\n",
+        double steady_mean_ms = steady_steps > 0
+            ? steady_ms / (double)steady_steps : 0.0;
+        double steady_tokens_per_second = steady_ms > 0.0
+            ? (double)steady_steps * 1000.0 / steady_ms : 0.0;
+        fprintf(stderr,
+                "[debug] tinyreceipt family=%s tokens=%d total=%.3f ms "
+                "tok/s=%.2f (%s)\n",
                 k_family_names[family_id], generated, elapsed, tokens_per_second,
-                incremental
-                    ? (row_decode ? "incremental dependency + CPU row KV cache"
-                                  : "incremental dependency cache")
-                    : "ordinary forward only");
-        if (incremental) {
-            double steady_mean_ms = steady_steps > 0
-                ? steady_ms / (double)steady_steps : 0.0;
-            double steady_tokens_per_second = steady_ms > 0.0
-                ? (double)steady_steps * 1000.0 / steady_ms : 0.0;
-            fprintf(stderr,
-                    "[debug] tinyreceipt timing seed=%.3f ms steady_steps=%d "
-                    "steady_mean=%.3f ms steady_tok/s=%.2f\n",
-                    seed_ms, steady_steps, steady_mean_ms,
-                    steady_tokens_per_second);
-        }
+                incremental ? "incremental context decode" : "ordinary forward");
+        fprintf(stderr,
+                "[debug] tinyreceipt timing %s=%.3f ms steady_steps=%d "
+                "steady_mean=%.3f ms steady_tok/s=%.2f\n",
+                incremental ? "seed" : "first", seed_ms, steady_steps, steady_mean_ms,
+                steady_tokens_per_second);
     }
     rc = 0;
 
 cleanup:
-    volvoxai_engine_decode_session_destroy(decode_session);
+    vx_result_release(result);
+    tiny_receipt_graph_close(&graph);
     free(image);
     free(memory_keep);
     free(y_ids);
@@ -837,6 +1078,8 @@ int tiny_receipt_w8a8_run(int argc, char** argv) {
     TinyReceiptCommand command;
     TinyReceiptPackage package;
     TinyReceiptVocab vocab;
+    VxRuntime* runtime = NULL;
+    VxReport report = VX_REPORT_INIT;
     int32_t* q_ids = NULL;
     int32_t* router_keep = NULL;
     int q_length = 0;
@@ -848,7 +1091,7 @@ int tiny_receipt_w8a8_run(int argc, char** argv) {
     memset(&vocab, 0, sizeof(vocab));
     command.family = "auto";
     command.max_new = 192;
-    tiny_receipt_engine_options_init(&command.engine);
+    tiny_receipt_runtime_options_init(&command);
     if (argc < 2 || !strcmp(argv[1], "--help") || !strcmp(argv[1], "-h")) {
         tiny_receipt_help(argv[0]);
         return argc < 2 ? 1 : 0;
@@ -856,7 +1099,7 @@ int tiny_receipt_w8a8_run(int argc, char** argv) {
     command.package_arg = argv[1];
     for (int index = 2; index < argc; index++) {
         const char* arg = argv[index];
-        int engine_flag = tiny_receipt_parse_engine_flag(arg, &command.engine);
+        int engine_flag = tiny_receipt_parse_engine_flag(arg, &command);
         if (engine_flag < 0) return 2;
         if (engine_flag > 0) continue;
         if (!strcmp(arg, "--image") && index + 1 < argc) command.image_path = argv[++index];
@@ -875,26 +1118,40 @@ int tiny_receipt_w8a8_run(int argc, char** argv) {
         fprintf(stderr, "[tinyreceipt] unknown family: %s\n", command.family);
         return 2;
     }
-    if (tiny_receipt_configure_engine(&command.engine) != 0) goto cleanup;
+    printf("VolvoxAI Native Runtime\n");
+    {
+        VxStatus status = vx_runtime_create(&command.runtime_options, &runtime, &report);
+        if (status != VX_STATUS_OK) {
+            tiny_receipt_report_failure("runtime creation", status, &report);
+            goto cleanup;
+        }
+    }
+    printf("Backend policy: %s\n",
+           command.backend_policy.backend_count ?
+               command.backend_policy.backends[0] : "cpu");
     if (tiny_receipt_load_package(command.package_arg, &package) != 0 ||
         tiny_receipt_load_vocab(&package, &vocab) != 0) goto cleanup;
-    if (tiny_receipt_run_router(&package, &vocab, command.prompt, &q_ids, &router_keep, &q_length,
-                                &predicted_family, command.engine.debug) != 0) goto cleanup;
+    if (tiny_receipt_run_router(runtime, &command.backend_policy, &package, &vocab,
+                                command.prompt, &q_ids, &router_keep, &q_length,
+                                &predicted_family, command.runtime_options.debug) != 0) goto cleanup;
     if (selected_family < 0) selected_family = predicted_family;
-    if (command.engine.debug) {
+    if (command.runtime_options.debug) {
         fprintf(stderr, "[debug] tinyreceipt router=%s selected=%s%s\n",
                 k_family_names[predicted_family], k_family_names[selected_family],
                 command.family && strcmp(command.family, "auto") != 0
                     ? " (manual override)" : "");
     }
-    rc = tiny_receipt_run_family(&package, &vocab, &package.families[selected_family], selected_family,
+    rc = tiny_receipt_run_family(runtime, &command.backend_policy, &package, &vocab,
+                                 &package.families[selected_family], selected_family,
                                  command.image_path, command.max_new, command.incremental,
-                                 q_ids, router_keep, q_length, command.engine.debug) == 0 ? 0 : 1;
+                                 q_ids, router_keep,
+                                 q_length, command.runtime_options.debug) == 0 ? 0 : 1;
 
 cleanup:
     free(q_ids);
     free(router_keep);
     tiny_receipt_vocab_free(&vocab);
-    volvoxai_engine_shutdown();
+    if (runtime) (void)vx_runtime_close(runtime, NULL);
+    vx_runtime_release(runtime);
     return rc;
 }

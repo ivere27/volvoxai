@@ -69,7 +69,7 @@ which rungs that chapter carries.
 ### Part I — Forward: what a model is and how it runs
 
 1. **[Foundations](01-foundations.md)** 🌱🔧🔬 — What a forward pass is. Tensors, graphs,
-   operations. The VolvoxAI mental model and its four "tiers." How a model is stored as a *blueprint*.
+   operations. The VolvoxAI mental model and its four "tiers." How a model is stored as `graph.json` plus weights.
 2. **[A Language Model, op by op (TinyStories)](02-tinystories-language-model.md)** 🌱🔧🔬 — Follow
    the sentence *"Once upon a time, Lily"* through a GPT-style transformer. Tokenize → embed →
    attention → feed-forward → logits → sample → repeat.
@@ -100,8 +100,14 @@ which rungs that chapter carries.
 8. **[Inside the Browser Engine](08-inside-the-engine.md)** 🌱🔧🔬 — The four hardware tiers, the
    leap from a *naive* kernel to a *fast* one, and operator fusion.
 9. **[The Native Engine](09-native-engine-architecture.md)** 🌱🔧🔬 — A freestanding C binary
-   running the same blueprint on a desktop, a phone, or a **robot** — CPU + Vulkan/OpenGL/Metal/NNAPI,
-   forward **and** backward, with GPU drivers loaded at runtime. This is the *on-device / edge AI* chapter.
+   running the same graph package on a desktop, a phone, or a **robot** — CPU +
+   Vulkan/OpenGL/CUDA/Metal/NNAPI, with GPU drivers loaded at runtime. This is the
+   *on-device / edge AI* chapter.
+   - **9C. [Inside the CUDA Backend](09c-cuda-backend.md)** 🌱🔧🔬 — A front-to-back companion that
+     zooms all the way into the **NVIDIA GPU** path: borrowing only the driver, baking PTX kernels,
+     keeping numbers resident on the card, recording graphs for replay, strict FP32, and — in the
+     full build — training and W8 authoring. Deep, but readable straight through the
+     🌱 thread.
 
 ### Part V — Synthesis
 

@@ -22,7 +22,7 @@ function qSDPAGraph() {
       quantization: { scheme: 'per_tensor', scale: 0.25, zero_point: 0 },
     },
   }, { heads: 1, causal: false, scale: 0.5 });
-  graph.outputNames = [out.name];
+  graph.setOutputs([out.name]);
   return { graph, node: graph.nodes[0], q, k, v, out };
 }
 

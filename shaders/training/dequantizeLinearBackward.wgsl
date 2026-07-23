@@ -27,7 +27,7 @@ struct DifferenceResult {
   valid : u32,
 }
 
-// Runtime dtype IDs are F32=0, I32=1, I8=2, U8=3.
+// Canonical protobuf dtype IDs are U8=5, I8=6, I32=16, F32=18.
 fn signed_byte(value : u32) -> i32 {
   if (value >= 128u) { return i32(value) - 256; }
   return i32(value);
@@ -38,32 +38,32 @@ fn word_byte(word : u32, index : u32) -> u32 {
 }
 
 fn input_value(index : u32) -> f32 {
-  if (params.input_type == 0u) { return bitcast<f32>(input_words[index]); }
-  if (params.input_type == 1u) { return f32(bitcast<i32>(input_words[index])); }
+  if (params.input_type == 18u) { return bitcast<f32>(input_words[index]); }
+  if (params.input_type == 16u) { return f32(bitcast<i32>(input_words[index])); }
   let byte = word_byte(input_words[index / 4u], index);
-  if (params.input_type == 2u) { return f32(signed_byte(byte)); }
+  if (params.input_type == 6u) { return f32(signed_byte(byte)); }
   return f32(byte);
 }
 
 fn input_integer_value(index : u32) -> i32 {
-  if (params.input_type == 1u) { return bitcast<i32>(input_words[index]); }
+  if (params.input_type == 16u) { return bitcast<i32>(input_words[index]); }
   let byte = word_byte(input_words[index / 4u], index);
-  if (params.input_type == 2u) { return signed_byte(byte); }
+  if (params.input_type == 6u) { return signed_byte(byte); }
   return i32(byte);
 }
 
 fn zero_point_value() -> f32 {
-  if (params.zero_point_type == 0u) { return bitcast<f32>(zero_point_words[0]); }
-  if (params.zero_point_type == 1u) { return f32(bitcast<i32>(zero_point_words[0])); }
+  if (params.zero_point_type == 18u) { return bitcast<f32>(zero_point_words[0]); }
+  if (params.zero_point_type == 16u) { return f32(bitcast<i32>(zero_point_words[0])); }
   let byte = word_byte(zero_point_words[0], 0u);
-  if (params.zero_point_type == 2u) { return f32(signed_byte(byte)); }
+  if (params.zero_point_type == 6u) { return f32(signed_byte(byte)); }
   return f32(byte);
 }
 
 fn zero_point_integer_value() -> i32 {
-  if (params.zero_point_type == 1u) { return bitcast<i32>(zero_point_words[0]); }
+  if (params.zero_point_type == 16u) { return bitcast<i32>(zero_point_words[0]); }
   let byte = word_byte(zero_point_words[0], 0u);
-  if (params.zero_point_type == 2u) { return signed_byte(byte); }
+  if (params.zero_point_type == 6u) { return signed_byte(byte); }
   return i32(byte);
 }
 
@@ -98,12 +98,12 @@ fn f32_integral_signed_magnitude(bits : u32) -> SignedMagnitude {
 }
 
 fn input_signed_magnitude(index : u32) -> SignedMagnitude {
-  if (params.input_type == 0u) { return f32_integral_signed_magnitude(input_words[index]); }
+  if (params.input_type == 18u) { return f32_integral_signed_magnitude(input_words[index]); }
   return signed_magnitude_i32(input_integer_value(index));
 }
 
 fn zero_point_signed_magnitude() -> SignedMagnitude {
-  if (params.zero_point_type == 0u) { return f32_integral_signed_magnitude(zero_point_words[0]); }
+  if (params.zero_point_type == 18u) { return f32_integral_signed_magnitude(zero_point_words[0]); }
   return signed_magnitude_i32(zero_point_integer_value());
 }
 
@@ -145,7 +145,7 @@ fn input_minus_zero_point(index : u32) -> f32 {
 @compute @workgroup_size(64)
 fn input_main(@builtin(global_invocation_id) gid : vec3<u32>) {
   let index = gid.x;
-  if (index >= params.size || params.input_type != 0u) { return; }
+  if (index >= params.size || params.input_type != 18u) { return; }
   grad_input[index] = grad_input[index] + grad_output[index] * scale[0];
 }
 

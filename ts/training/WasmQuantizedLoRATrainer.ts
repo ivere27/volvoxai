@@ -12,7 +12,11 @@ import type {
 } from './WasmTrainingKernels.js';
 
 const QUANTIZED_LINEAR_OPS = new Set(['QLinear', 'QMatMul', 'QGemm']);
-const RESERVED_ENGINES = new WeakSet<WasmEngine>();
+const QUANTIZED_LORA_OWNER: unique symbol = Symbol('volvoxai.quantizedLoRAOwner');
+
+type ReservableWasmEngine = WasmEngine & {
+  [QUANTIZED_LORA_OWNER]?: boolean;
+};
 
 export interface WasmQuantizedLoRABinding {
   /** Persistent initialized F32 weight in the training graph. */
@@ -212,10 +216,11 @@ export class WasmQuantizedLoRATrainer {
     // Stage and validate every binding before either graph or backend state is
     // mutated. WasmAutograd owns a separate scratch WASM instance.
     const bindings = stageBindings(trainingGraph, inferenceGraph, options?.bindings);
-    if (RESERVED_ENGINES.has(engine)) {
+    const reservableEngine = engine as ReservableWasmEngine;
+    if (reservableEngine[QUANTIZED_LORA_OWNER]) {
       throw new Error('This WasmEngine already belongs to a live quantized LoRA trainer.');
     }
-    RESERVED_ENGINES.add(engine);
+    reservableEngine[QUANTIZED_LORA_OWNER] = true;
     let trainer: WasmAutograd | null = null;
     try {
       trainer = await WasmAutograd.create(engine, trainingGraph);
@@ -230,7 +235,7 @@ export class WasmQuantizedLoRATrainer {
       );
     } catch (error) {
       trainer?.dispose();
-      RESERVED_ENGINES.delete(engine);
+      delete reservableEngine[QUANTIZED_LORA_OWNER];
       throw error;
     }
   }
@@ -495,7 +500,7 @@ export class WasmQuantizedLoRATrainer {
     try {
       this.trainer.dispose();
     } finally {
-      RESERVED_ENGINES.delete(this.engine);
+      delete (this.engine as ReservableWasmEngine)[QUANTIZED_LORA_OWNER];
     }
   }
 }

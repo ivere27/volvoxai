@@ -37,8 +37,33 @@ function qEmbeddingGraph({
       quantization: outputQuantization,
     },
   });
-  graph.outputNames = [out.name];
+  graph.setOutputs([out.name]);
   return { graph, node: graph.nodes[0], input, weight, out };
+}
+
+function clippedQEmbeddingGraph({ maximum = 2 } = {}) {
+  const graph = new Graph();
+  const raw = graph.addInput('raw_ids', [2], 'int32', {
+    buffer: Int32Array.of(-9, 17),
+  });
+  const { out: ids } = graph.addOp('Clip', { input: raw }, {
+    out: { name: 'ids', shape: [2], dtype: 'int32' },
+  }, { min: 0, max: maximum });
+  const weight = graph.addWeight('table', [3, 3], 'int8', {
+    buffer: Int8Array.of(-1, 0, 1, 2, 0, -2, 5, 1, -3),
+    quantization: {
+      scheme: 'per_axis', axis: 0,
+      scales: [0.5, 0.25, 0.125], zero_points: [0, 0, 1],
+    },
+  });
+  const { out } = graph.addOp('QEmbedding', { input: ids, weight }, {
+    out: {
+      name: 'out', shape: [2, 3], dtype: 'int8',
+      quantization: { scheme: 'per_tensor', scale: 0.25, zero_point: -1 },
+    },
+  });
+  graph.setOutputs([out.name]);
+  return { graph, raw, ids, out, node: graph.nodes[1] };
 }
 
 function reference(ids, weight, hidden, rowScales, rowZeroPoints, outputDtype, outputScale, outputZeroPoint) {
@@ -136,12 +161,30 @@ test('CPU engine dispatches QEmbedding without entering F32 Embedding', async ()
   assert.deepEqual([...result.out], [1, -1, -3, -3, -1, 1]);
 });
 
-test('GraphLoader admits only the preflightable canonical QEmbedding input boundary', () => {
+test('GraphLoader admits public or vocabulary-bounded internal QEmbedding IDs', () => {
   const { graph, node, input } = qEmbeddingGraph({ idsShape: [1, 2], ids: [2, 0] });
   assert.doesNotThrow(() => GraphLoader._assertBrowserQuantizationSupported(graph));
   input.isInput = false;
   assert.throws(
     () => GraphLoader._assertBrowserQuantizationSupported(graph),
-    new RegExp(`QEmbedding node ${node.id} .*graph-input I32 token tensor`),
+    new RegExp(`QEmbedding node ${node.id} .*preflight-complete I32 IDs`),
   );
+
+  const bounded = clippedQEmbeddingGraph();
+  assert.doesNotThrow(
+    () => GraphLoader._assertBrowserQuantizationSupported(bounded.graph),
+  );
+  const outOfRange = clippedQEmbeddingGraph({ maximum: 3 });
+  assert.throws(
+    () => GraphLoader._assertBrowserQuantizationSupported(outOfRange.graph),
+    /preflight-complete I32 IDs/,
+  );
+});
+
+test('CPU QEmbedding executes vocabulary-bounded internal Clip IDs', async () => {
+  const { graph, raw } = clippedQEmbeddingGraph();
+  const engine = new CPUEngine();
+  engine.allocateGraph(graph);
+  const result = await engine.execute({ [raw.name]: Int32Array.of(-9, 17) });
+  assert.deepEqual([...result.out], [-3, -1, 1, 1, -1, -3]);
 });

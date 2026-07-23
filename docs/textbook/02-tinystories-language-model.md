@@ -20,13 +20,21 @@ stories. "Tiny" is real: its internal vector width is **64**, it has **8** layer
 writes coherent little stories. Studying it teaches you the *exact* architecture behind
 GPT-2/3/4, LLaMA, and Mistral — those are this graph, scaled up.
 
-## 2.1 The model's dimensions (read them off the blueprint)
+> **🌱 Where this model comes from.** We didn't train these weights here — TinyStories-1M is a
+> *real, publicly released* model (`roneneldan/TinyStories-1M` on Hugging Face, a GPT-Neo). VolvoxAI's
+> exporter **converts** that checkpoint into the two-file graph package from Chapter 1 (`graph.json` +
+> `model.safetensors` + the tokenizer files); `make models_tinystories` regenerates it from the public
+> source (the `models/` folder is git-ignored, not shipped). So everything below reads a model
+> *someone else* trained — Part II is where VolvoxAI trains its own. (Details: `docs/models.md`,
+> `examples/tinystories/`.)
+
+## 2.1 The model's dimensions (read them from `graph.json`)
 
 > 🌱 **Idea.** Every model has a few "size knobs" — how wide its thoughts are, how many thinking
 > stages it has, how many words it knows. Below are this little model's knobs. You don't need the
 > numbers; just know that big models like ChatGPT are *this same list of knobs turned way up*.
 
-🔧 From `config.json`, one number at a time:
+🔧 From `graph.json`, one number at a time:
 
 | Symbol | Value | Meaning |
 |---|---|---|
@@ -48,6 +56,13 @@ GPT-2/3/4, LLaMA, and Mistral — those are this graph, scaled up.
 33 MatMul   17 LayerNorm   17 Add   8 SDPA   8 GELU   2 Embedding
 = 2 embeddings + 8 blocks × (2 LayerNorm + 4 MatMul + 1 SDPA + 1 GELU + 2 Add) + final LayerNorm + 1 lm_head
 ```
+
+> 🔬 **Under the hood: where the parameters actually live.** The "1M" in the folder name counts
+> transformer weights loosely; the 27 MB file is dominated by **embeddings**. Per block the weight
+> matrices are `qkv_proj 64×192`, `out_proj 64×64`, `c_fc 64×256`, `c_proj 256×64` ≈ 49k numbers, so
+> all 8 blocks together are only ~0.4M — dwarfed by the two `50257×64 ≈ 3.2M` embedding tables. At 4
+> bytes each that's ~26 MB of embeddings versus ~1.6 MB of everything else. The lesson from Chapter 1
+> holds here numerically: in a small LM the *vocabulary*, not the depth, is the model.
 
 ## 2.2 The pipeline at a glance
 
@@ -109,6 +124,14 @@ Two integer tensors go into the graph: **`tokens`** (what the words are) and **`
 (their order, `0,1,2,…`). Both are shape `[1, 256]` — the sequence is padded to the 256-token
 context window.
 
+> 🔬 **Under the hood: byte-level BPE.** BPE starts from the 256 raw **bytes** as base tokens, so no
+> input is ever "unknown" — worst case, a rare character is spelled out one byte at a time. A
+> GPT-2-style regex first splits text into word-ish chunks (keeping the leading space, which is why
+> tokens print as `" upon"` not `"upon"`), then **merge rules** are applied in **rank order**, greedily
+> gluing the most frequent byte-pair again and again until none apply. `native/src/tokenization/tokenizer.c`
+> re-implements this from scratch and reads the *same* `vocab.bin` + `merges.txt` as the browser, so a
+> prompt tokenizes to identical ids on every backend — a prerequisite for the parity checks in Chapter 1.
+
 > **Why positions?** 🌱 The next step (attention) is like everyone in a room talking at once — by
 > itself it can't tell who spoke *first*. So we staple a seat number to each word. 🔬 The attention
 > math is order-blind by itself — it would treat "dog bites man" and "man bites dog" identically.
@@ -123,6 +146,11 @@ context window.
 > captures its *meaning* (words with similar meanings get similar lists). This "meaning list" is
 > called an **embedding**. Now every word is a small cloud of numbers the machine can actually
 > reason with.
+>
+> *What "similar words get similar lists" buys you.* If "dog" is `[0.8, -0.2, …]` and "puppy" is
+> `[0.79, -0.18, …]`, they sit close together, so whatever the model learns about one partly transfers
+> to the other for free. Nobody writes this table by hand — training *discovers* these 64-number
+> meanings (Part II).
 
 🔧 An ID like `20037` ("Lily") is meaningless as a *number* (it isn't 20037× anything). We replace
 it with a learned **vector** of 64 numbers — its **embedding** — that encodes meaning. The
@@ -146,6 +174,13 @@ vector. It runs **twice**:
 Then `Add` fuses them: `hidden_0 = emb_tok + emb_pos`. Now every one of the 256 slots holds a
 64-number vector that mixes *word identity* and *position*. This tensor, `hidden_0 [1,256,64]`,
 is the **residual stream** — the "conveyor belt" that every block reads from and writes back to.
+
+> 🔬 **Under the hood: gather now, scatter later.** `Embedding` is a pure **gather** — copy row
+> `token_id` out of the table — so it does zero arithmetic. Its training twin is the reverse, a
+> **scatter-add**: wherever a token appeared, its gradient is added back into that one row (Chapter 4).
+> Note `wte` (input) and `lm_head` (output) are two *separate* `50257×64` tables here; many
+> GPT-2-family models **tie** them (share one) to halve the embedding cost, but this export keeps them
+> distinct — which, from the note above, is most of the 27 MB.
 
 ```
 hidden_0:  256 rows (one per token position), each a 64-number vector
@@ -186,6 +221,15 @@ const inv_std = 1 / Math.sqrt(variance + 1e-5);          // eps guards ÷0
 out[j] = (in[j] - mean) * inv_std * weight[j] + bias[j]; // normalize, then re-scale/shift
 ```
 
+> 🔬 **Under the hood: what LayerNorm normalizes, and why "pre-norm".** It normalizes across the **64
+> feature dims of one token**, independently per token — never across tokens or the batch (that's
+> BatchNorm, Chapter 3). The variance is the **biased** estimate (÷ `d_model`, not ÷ `d_model−1`), and
+> `eps = 1e-5` inside the √ guards divide-by-zero on a flat vector. This model puts LayerNorm **before**
+> each sub-layer (**pre-norm**), not after (post-norm); pre-norm leaves a clean, unnormalized residual
+> highway running straight from input to output, which is what lets 8 (or 96) blocks train without the
+> signal exploding. LLaMA-style models swap in **RMSNorm**, a cheaper cousin that drops the
+> mean-centering entirely.
+
 ### 2.5b Attention — "which earlier words matter to me?"
 
 > 🌱 **Idea.** This is the clever part. Imagine each word asking a question out loud — *"who here is
@@ -194,6 +238,11 @@ out[j] = (in[j] - mean) * inv_std * weight[j] + bias[j]; // normalize, then re-s
 > can look back and notice "time" and "Lily" matter most right now, and use them to guess what
 > comes next. That "look back and weight the earlier words" move is **attention**, and it's the
 > heart of every large language model.
+>
+> *How "listen more or less" becomes numbers:* **softmax** takes the raw match scores — say
+> `[2, 1, 0]` — exponentiates them and divides by the total, turning them into positive weights that
+> sum to 1 — here about `[0.67, 0.24, 0.09]`. A higher score simply gets a bigger share of the
+> listening. That softmax is the *only* step in attention that isn't a plain multiply-and-add.
 
 🔧 This is the heart of a transformer. First a single `MatMul` projects each 64-vector up to **192**
 numbers (`qkv_proj`, shape `[1,256,192]`). Those 192 are three 64-vectors glued together: the
@@ -244,6 +293,15 @@ A final `MatMul` (`out_proj`, with bias) mixes the 16 heads' outputs back into a
 means we *add* the new insight on top of what we already had instead of overwriting it — so nothing
 gets lost. 🔬 It also keeps gradients flowing cleanly during training.
 
+> 🔬 **Under the hood: the scale, the mask, and the cost.** The `scale` is `1/√head_dim` (here
+> `1/√4 = 0.5`): without it, dot products grow with `head_dim` and shove softmax into a near one-hot
+> spike that learns badly. **Causal masking** is implemented by setting every `k > q` score to `−∞`,
+> so its softmax weight comes out *exactly* 0 — the future isn't "skipped," it's masked. The softmax
+> also subtracts each row's **max** before exponentiating so a large score can't overflow `exp` (the
+> very trick the CUDA kernel uses in [Chapter 9C §9C.1](09c-cuda-backend.md)). And the price is
+> **O(seq² · d)** per layer — every query inspects every key — the quadratic that the KV-cache (§2.8)
+> and flash-attention exist to attack.
+
 ### 2.5c Feed-forward MLP — each token thinks
 
 > 🌱 **Idea.** After the words have compared notes, each one takes a quiet moment to think on its
@@ -268,6 +326,14 @@ MatMul and the network could only learn straight-line relationships:
 out[i] = 0.5 * x * (1 + tanh(0.7978845608 * (x + 0.044715 * x*x*x)));   // the GELU curve
 ```
 
+> 🔬 **Under the hood: the magic constant and the 4× width.** `0.7978845608` is `√(2/π)` — this is the
+> **tanh approximation** of GELU, whose exact form uses the error function `erf`; the approximation is
+> far cheaper and agrees to a few decimals, and every backend uses the *same* one so answers match.
+> The hidden width is `d_mlp = 4 × d_model`, a near-universal transformer ratio: expand into 4× the
+> room, make one nonlinear decision, project back. And the reason a nonlinearity is *required*: a stack
+> of linear maps is still one linear map — `A(Bx) = (AB)x` — so without a GELU-like bend the entire
+> 8-block tower would collapse into a single matrix and could only draw straight lines.
+
 The block's output `hidden_next [1,256,64]` has the same shape as its input — which is exactly
 why we can stack **8** of them. Each block reads the stream and writes a slightly smarter version
 back.
@@ -291,6 +357,13 @@ final_norm [1,256,64]  ──MatMul lm_head──▶  logits [1,256,50257]
 These raw scores are called **logits**. `logits[0, p, w]` = "how strongly the model, having read
 tokens `0..p`, expects word `w` to come next." We only care about the row for the **last real
 token** — that's the prediction for what comes after the prompt.
+
+> 🔬 **Under the hood: 256 rows computed, one row used.** The head produces `logits [1, 256, 50257]`,
+> but generation reads only the row of the **last real token** — so at decode time 255 of those 256
+> rows are wasted work. That is exactly why the native row APIs (§2.8) compute the head for just the
+> new row. `lm_head` is a bias-free `MatMul` by a `[50257, 64]` matrix; multiplying one 64-vector
+> against 50257 rows is the single biggest matmul in the forward pass, so the vocabulary size drives
+> both the file size *and* the per-token compute.
 
 ---
 
@@ -348,11 +421,12 @@ back in as input.
 
 > 🔬 **KV-cache (an optimization you'll hear about).** Naively, step *N* recomputes attention over
 > all *N* tokens from scratch — wasteful. Production engines *cache* each token's Key and Value
-> so each step only computes the new token's. VolvoxAI's native runtime exposes this split through
-> the generic sequence APIs: `volvoxai_engine_forward_prefix()` processes the prompt rows once,
-> `volvoxai_engine_forward_row()` advances one row, and `volvoxai_engine_tensor_row_f32()` reads
-> that row from the graph's declared output. The math is identical; the cache just avoids
-> repeating work.
+> so each step only computes the new token's. VolvoxAI gives each decode stream its own
+> `ExecutionContext`: `context.decode.seed()` processes the prompt and
+> `context.decode.step()` advances one position. Each call returns a stable named
+> `ExecutionResult`. The math is identical; the cache just avoids repeating work. The trade is
+> memory: the cache holds `2 × n_layers × seq × d_model` floats (a Key and a Value for every past
+> token in every layer), so long contexts cost RAM.
 
 ---
 

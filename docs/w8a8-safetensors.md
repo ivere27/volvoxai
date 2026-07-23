@@ -1,347 +1,173 @@
-# W8A8 Safetensors Companion Scales
+# Affine quantization in safetensors
 
-This document defines the VolvoxAI F32 companion-scale interoperability
-profile for symmetric I8 model weights stored in safetensors. It is an
-application-level VolvoxAI contract, not an official safetensors quantization
-schema.
+VolvoxAI has one graph format, `volvox-graph/v1`, and one packaged affine
+quantization representation, `volvox-affine-safetensors/v1`. Graph JSON owns
+topology and immutable tensor references. Every numeric scale and zero point is
+a tensor in safetensors.
 
-The key words **MUST**, **MUST NOT**, **REQUIRED**, **SHOULD**, **SHOULD NOT**,
-and **MAY** in this document describe requirements for conforming producers and
-loaders.
+The words **MUST**, **MUST NOT**, **REQUIRED**, **SHOULD**, and **MAY** describe
+requirements for conforming producers and loaders.
 
-## Format identifier
+## Graph contract
 
-The exact v1 identifier is:
-
-```text
-volvoxai-f32-companion-scales-v1
-```
-
-The package `config.json` MUST select this profile with an object containing
-exactly the `format` field:
+A quantized graph has one central reference table:
 
 ```json
 {
-  "weights_quantization_storage": {
-    "format": "volvoxai-f32-companion-scales-v1"
+  "format": "volvox-graph/v1",
+  "quantization": {
+    "format": "volvox-affine-safetensors/v1",
+    "tensors": {
+      "hidden_q": {
+        "scheme": "per_tensor",
+        "scale_tensor": "__quant__.hidden.scale",
+        "zero_point_tensor": "__quant__.hidden.zero_point"
+      },
+      "projection.weight": {
+        "scheme": "per_axis",
+        "axis": 0,
+        "scale_tensor": "__quant__.projection.weight.scale",
+        "zero_point_tensor": "__quant__.projection.weight.zero_point"
+      }
+    }
   }
 }
 ```
 
-Under this marker, `config.json` MUST NOT contain a `weights_quantization`
-descriptor table. Safetensors metadata is the sole authority for weight
-descriptors. A loader MUST reject an unknown marker, malformed marker object,
-config-level descriptor table, or malformed v1 metadata instead of falling
-back to inline scales or an older representation.
+The `quantization` object MUST contain exactly `format` and `tensors`. Its
+`tensors` value MUST be a non-empty object. Each key is the exact name of a
+declared I8 or U8 graph tensor. A descriptor has exactly one of these forms:
 
-Any incompatible extension requires a new format identifier.
-Duplicate object keys at any nesting depth of the raw config JSON are invalid;
-a loader MUST NOT resolve an ambiguous config by choosing the first or last
-value.
+```json
+{"scheme":"per_tensor","scale_tensor":"S","zero_point_tensor":"Z"}
+{"scheme":"per_axis","axis":0,"scale_tensor":"S","zero_point_tensor":"Z"}
+```
 
-An embedding API MAY accept a trusted, already-decoded config object instead
-of raw JSON. In that case the object provider, not the loader, is responsible
-for enforcing the raw duplicate-key rule before decoding. This exception does
-not apply when the loader receives config-file bytes or text.
+`axis` MAY name any valid axis, including a negative axis spelling, but it is
+normalized against the target rank during validation. Operator contracts can
+be stricter; for example, canonical `QLinear` weights are I8 `[d_out,d_in]`
+with per-axis quantization on axis 0.
 
-## Safetensors metadata
+No numeric quantization value is legal in graph JSON. Parameter tensor names
+are references, not a second descriptor namespace.
 
-Each shard that stores at least one companion-quantized weight MUST contain
-both of these string-valued entries in its safetensors `__metadata__` map:
+This prohibition is specific to affine quantization. A numeric operator
+parameter with different semantics—for example the attention score multiplier
+in `QSDPA.params.scale`—remains part of graph topology and is not an affine
+activation or weight scale.
+
+## Safetensors contract
+
+For a target tensor `Q`:
+
+- `Q` MUST have execution dtype I8 or U8.
+- `scale_tensor` MUST resolve to an immutable F32 safetensors tensor of rank 1.
+- `zero_point_tensor` MUST resolve to an immutable rank-1 safetensors tensor
+  whose dtype exactly matches `Q`.
+- The scale and zero-point names MUST be distinct.
+- For `per_tensor`, both parameter tensors MUST have shape `[1]`.
+- For `per_axis`, both parameter tensors MUST have shape `[Q.shape[axis]]`.
+- Every scale MUST be finite and strictly greater than zero.
+- A quantization parameter MUST NOT itself have an affine descriptor.
+
+Zero points are explicit even for symmetric I8. A symmetric descriptor stores
+an I8 zero vector; loaders do not infer an omitted zero point.
+
+Safetensors `__metadata__` MAY contain unrelated application strings, but it is
+not quantization authority. The retired `weights_quantization` and
+`weights_quantization_storage` metadata keys are invalid.
+
+For sharded packages, references resolve within the weight set assigned to one
+graph. Tensor names MUST be unique in that set. A base tensor and its scale and
+zero-point tensors MAY occupy different shards when the package manifest binds
+all shards atomically; streaming implementations SHOULD keep them together.
+
+## Numeric meaning
+
+Let `q` be a stored element, `s` its selected F32 scale, and `z` its selected
+typed zero point. Dequantization is:
+
+```text
+real = s * (integer(q) - integer(z))
+```
+
+For `per_tensor`, index `s[0]` and `z[0]`. For `per_axis`, select both values by
+the target coordinate on `axis`.
+
+This storage contract does not choose a calibration method. VolvoxAI PTQ uses
+explicit F32 arithmetic, ties-to-even rounding, saturation to the destination
+byte range, per-output-row narrow-range I8 weights where required, and an I32
+accumulator-bound proof before publishing a fused integer operator. Those are
+optimizer/operator requirements, not alternate storage encodings.
+
+## Q/DQ identity
+
+`QuantizeLinear` and `DequantizeLinear` make boundaries explicit. Their operand
+names MUST be identical to the central descriptor references:
 
 ```json
 {
-  "__metadata__": {
-    "weights_quantization_storage": "volvoxai-f32-companion-scales-v1",
-    "weights_quantization": "{\"decoder.proj.weight\":{\"scheme\":\"per_axis\",\"axis\":0},\"decoder.position\":{\"scheme\":\"per_tensor\"}}"
-  }
+  "opType": "QuantizeLinear",
+  "inputs": {
+    "input": "hidden",
+    "scale": "__quant__.hidden.scale",
+    "zero_point": "__quant__.hidden.zero_point"
+  },
+  "outputs": {"out": "hidden_q"},
+  "outputs_shape": {"out": [1, 320]},
+  "outputs_dtype": {"out": "int8"},
+  "params": {}
 }
 ```
 
-The metadata marker is the direct format string, not the config object form.
-Safetensors metadata values are strings, so `weights_quantization` is a JSON
-string whose decoded value is an object mapping base tensor names to
-descriptors.
+A `QuantizeLinear` output descriptor must reference its `scale` and
+`zero_point` operands. A `DequantizeLinear` input descriptor must do the same.
+Loaders MUST reject a mismatch rather than silently choosing either source.
 
-Each shard's mapping MUST describe only base tensors physically stored in that
-shard. An unquantized-only shard MAY omit both companion metadata entries. It
-MAY instead carry the marker and an empty mapping (`"{}"`). Supplying only one
-of the two entries is invalid. Unrelated string-valued safetensors metadata MAY
-coexist with these entries. JSON and tensor names are case-sensitive; a
-different spelling or case is an unrelated name, not an alias for a profile
-field or tensor.
+Fused quantized operators consume the same central descriptors through their
+named byte tensors. Backend-private packed weights or precomputed multipliers
+are derived caches and MUST NOT change the logical graph or become an alternate
+source of affine values.
 
-Producers MUST emit the descriptor map as compact JSON and SHOULD sort base
-tensor names lexicographically for reproducible output. Object order and JSON
-whitespace have no semantic meaning; loaders MUST parse the JSON rather than
-compare its serialized bytes. Duplicate object keys at any nesting depth of
-the encoded descriptor JSON are invalid, including escaped spellings that
-decode to the same key.
+## Required validation
 
-## Tensor naming and storage
+Before execution or publication, a loader/exporter MUST validate:
 
-For every descriptor key `W`, the same shard MUST contain exactly one base
-tensor and one inferred companion:
+1. The graph format is exactly `volvox-graph/v1`.
+2. The central table and every descriptor have exactly the supported fields.
+3. Every target, scale, and zero-point reference resolves uniquely.
+4. Target and parameter dtypes, ranks, axis, and counts match.
+5. All scales are finite and positive.
+6. Quantization parameters are immutable and are not themselves quantized.
+7. Q/DQ operands exactly match central references.
+8. Every fused operator satisfies its stricter dtype, shape, layout,
+   quantization, multiplier, and accumulator-range contract.
 
-```text
-W          I8
-W_scale    F32
-```
+Any failure aborts loading. A conforming loader does not coerce dtypes, invent
+parameters, guess a scheme, select an arbitrary duplicate, or repair a stale
+reference.
 
-The companion name is formed by appending the literal ASCII suffix `_scale` to
-the complete base tensor name. For example:
+## Rejected non-v1 representations
 
-```text
-decoder.proj.weight        I8
-decoder.proj.weight_scale  F32
-```
+There is no compatibility mode. `volvox-graph/v1` readers MUST reject:
 
-V1 has no companion-name override. A producer MUST reject a collision between
-an inferred companion name and any other tensor. A companion MUST NOT itself
-be declared as a quantized base tensor.
+- graph-level `weights_quantization` or `weights_quantization_storage`;
+- input-level inline `quantization` values;
+- node-level `outputs_quantization` values;
+- safetensors quantization descriptor metadata;
+- implicit `<weight>_scale` naming as authority;
+- numeric scale or zero-point arrays embedded in JSON.
 
-Only an authoritative descriptor establishes this relationship. A loader MUST
-NOT infer quantization merely because an otherwise unclaimed tensor name ends
-in `_scale`.
-
-## Descriptor forms
-
-### Per-axis
-
-The only valid per-axis descriptor is:
-
-```json
-{"scheme":"per_axis","axis":0}
-```
-
-It MUST contain exactly those two fields. `axis` MUST be the integer `0`;
-negative aliases and other axes are not valid in v1.
-
-For a base tensor with shape `[O, D1, D2, ...]`, its rank MUST be at least one,
-`O` MUST be positive, and its companion MUST have dtype `F32` and shape `[O]`.
-Axis 0 is normally the output-row or output-channel dimension.
-
-### Per-tensor
-
-The only valid per-tensor descriptor is:
-
-```json
-{"scheme":"per_tensor"}
-```
-
-It MUST contain exactly that field. Its companion MUST have dtype `F32`, rank
-one, and shape `[1]`.
-
-Descriptors MUST NOT contain inline scales, zero points, offsets, counts,
-companion references, or unknown fields. In particular, the following fields
-are not part of v1:
-
-```text
-scale, scales, zero_point, zero_points, companion,
-scale_tensor, scales_offset, scales_count
-```
-
-## Numeric interpretation
-
-Let `Q` be the stored I8 tensor and `S` its F32 companion. For per-tensor
-quantization:
-
-```text
-Wreal[i0, i1, ...] = float(Q[i0, i1, ...]) * S[0]
-```
-
-For per-axis quantization:
-
-```text
-Wreal[o, i1, ...] = float(Q[o, i1, ...]) * S[o]
-```
-
-Equivalently, the mapping is `Wreal = S * (Q - 0)`. The weight zero point is
-always exactly zero and is not stored.
-
-Every scale MUST be a finite F32 value strictly greater than zero. NaN,
-positive or negative infinity, positive or negative zero, and negative values
-are invalid. All I8 values from -128 through 127 are valid.
-
-This profile defines decoding, not how a producer chooses scales or performs
-rounding, clipping, calibration, or accuracy evaluation. A runtime MAY
-dequantize to floating point or preserve the same mapping in a fused integer
-kernel.
-
-## Validation requirements
-
-Before execution, a conforming loader MUST validate all of the following:
-
-1. The raw config JSON has no duplicate object keys, the config marker object
-   contains exactly the supported `format` value, and config has no
-   `weights_quantization` table.
-2. Each shard supplies either both companion metadata entries or neither, and
-   every supplied shard marker exactly matches the config marker.
-3. The raw safetensors header contains no duplicate object key at any nesting
-   depth, including tensor names, `__metadata__` fields, and tensor-record
-   fields; when present, `__metadata__` is an object whose values are all
-   strings as required by safetensors.
-4. Each metadata descriptor map is valid JSON with a JSON object at its root
-   and contains no duplicate object key at any nesting depth.
-5. Tensor names are globally unique across the loaded shard set.
-6. Descriptor base names are globally unique across all shard-local maps.
-7. Each descriptor has exactly one of the two supported forms.
-8. Every declared base occurs exactly once, is local to its declaring shard,
-   and has safetensors dtype `I8`.
-9. Every inferred companion occurs exactly once in the same shard and has
-   safetensors dtype `F32`, rank one, and the required shape.
-10. Every companion value is finite and strictly positive.
-11. No companion is also a declared base tensor.
-12. Claimed companions remain internal storage records and are not exposed as
-    graph inputs, outputs, mutable patch targets, or ordinary graph weights.
-13. The union of shard-local descriptor maps contains at least one weight.
-
-Any failure MUST abort loading. A loader MUST NOT choose the first or last of
-duplicate tensors, coerce another scale dtype to F32, normalize another axis to
-axis 0, infer missing metadata, or try a legacy representation.
-
-Only tensors named in the union of the authoritative shard-local maps are
-governed by this profile. Other I8 and F32 tensors retain their ordinary model
-meaning unless a separate graph contract describes them.
-
-## Sharded checkpoints
-
-A sharded checkpoint is the disjoint union of its shard-local declarations.
-The base tensor, companion tensor, and descriptor MUST move together when a
-checkpoint is repartitioned. Across all loaded shards, every base and companion
-name MUST remain unique.
-
-A shard index SHOULD list companion tensors like any other safetensors tensor.
-The syntax of a package manifest or shard index is outside this profile.
-
-Keeping each declaration local allows streaming and model-parallel loaders to
-validate a shard without consulting another shard's descriptor table.
-
-## Loader outline
-
-```text
-MARKER = "volvoxai-f32-companion-scales-v1"
-
-require config.weights_quantization_storage == { format: MARKER }
-require config has no weights_quantization
-
-descriptors = empty map
-companions = empty set
-seenTensorNames = empty set
-
-for each shard:
-    header = read_and_validate_safetensors_header_rejecting_duplicate_keys(shard)
-    metadata = header.__metadata__ or {}
-
-    for each tensor name in header:
-        require name not in seenTensorNames
-        add name to seenTensorNames
-
-    hasMarker = metadata contains weights_quantization_storage
-    hasMap = metadata contains weights_quantization
-    require hasMarker == hasMap
-    if not hasMarker:
-        continue
-
-    require metadata.weights_quantization_storage == MARKER
-    local = parse_json_rejecting_duplicate_keys(
-        metadata.weights_quantization
-    )
-    require local is an object
-
-    for each (baseName, descriptor) in local:
-        require baseName not in descriptors
-        require header contains baseName
-        require header[baseName].dtype == I8
-
-        scaleName = baseName + "_scale"
-        require header contains scaleName
-        require header[scaleName].dtype == F32
-        require header[scaleName].rank == 1
-
-        if descriptor is exactly { scheme: "per_axis", axis: 0 }:
-            require header[baseName].rank >= 1
-            require header[baseName].shape[0] > 0
-            require header[scaleName].shape == [header[baseName].shape[0]]
-        else if descriptor is exactly { scheme: "per_tensor" }:
-            require header[scaleName].shape == [1]
-        else:
-            fail
-
-        descriptors[baseName] = descriptor
-        add scaleName to companions
-
-for each claimed companion:
-    require every decoded F32 value is finite and greater than zero
-
-require descriptors is not empty
-require no claimed companion is also a descriptor base
-require graph does not expose any claimed companion
-```
-
-Implementations SHOULD bound descriptor counts by the number of tensor records
-and validate shape and offset arithmetic for overflow before allocation.
-
-## Minimal independent reader
-
-No VolvoxAI API is required to decode these weights. This illustrative Python
-reader uses only the standard `safetensors` package and NumPy; a production
-loader must still perform every validation above:
-
-```python
-import json
-import numpy as np
-from safetensors import safe_open
-
-MARKER = "volvoxai-f32-companion-scales-v1"
-
-with safe_open("model.safetensors", framework="numpy") as file:
-    metadata = file.metadata() or {}
-    if metadata.get("weights_quantization_storage") != MARKER:
-        raise ValueError("unsupported weight quantization storage")
-    descriptors = json.loads(metadata["weights_quantization"])
-
-    name = "decoder.proj.weight"
-    quantized = file.get_tensor(name)
-    scales = file.get_tensor(f"{name}_scale")
-    descriptor = descriptors[name]
-
-    if descriptor == {"scheme": "per_tensor"}:
-        dequantized = quantized.astype(np.float32) * scales[0]
-    elif descriptor == {"scheme": "per_axis", "axis": 0}:
-        broadcast = (scales.size,) + (1,) * (quantized.ndim - 1)
-        dequantized = quantized.astype(np.float32) * scales.reshape(broadcast)
-    else:
-        raise ValueError("unsupported companion-scale descriptor")
-```
-
-An engine may use the I8 tensor and F32 scales directly in a dot-product
-kernel instead of materializing `dequantized`. The separate model config is
-still required to define graph topology and operator semantics.
+An artifact containing any of these fields is not a `volvox-graph/v1` package
+and must be regenerated from its source model. Runtime readers and the general
+optimizer do not migrate or reinterpret it.
 
 ## Runtime repacking
 
-A loader MAY repack weights for native VNNI, ARM SDOT, WASM SIMD, Relaxed SIMD,
-or WebGPU kernels. Repacking MUST preserve the association between every
-logical axis-0 slice and its scale. If output rows are permuted, their scales
-MUST undergo the same permutation.
+A backend MAY repack immutable data for VNNI, ARM dot-product, WASM SIMD,
+WebGPU, or another target. Repacking MUST preserve the association between each
+logical slice and its central scale/zero-point references. Backend caches are
+invalidated when any referenced tensor identity changes.
 
-A layout whose quantization dimension is not logical axis 0 is not directly
-representable by v1 and requires conversion or a future format identifier.
-
-## Scope
-
-This profile defines only symmetric I8 weight storage and binary F32 companion
-scales. It does not define:
-
-- model topology or operator semantics;
-- activation quantization or dynamic activation scales;
-- bias storage;
-- calibration, rounding, clipping, or accuracy policy;
-- asymmetric weights or nonzero zero points;
-- per-group quantization or axes other than zero;
-- packed INT4/INT2 or kernel-specific packed layouts;
-- package manifests or shard-index syntax.
-
-The `W_scale` spelling is a VolvoxAI convention. Safetensors itself does not
-define a universal quantization naming or scale-association schema.
+Safetensors itself defines tensor storage, not a universal quantization schema.
+`volvox-affine-safetensors/v1` is VolvoxAI's strict association contract.

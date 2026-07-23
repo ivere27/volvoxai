@@ -10,7 +10,7 @@ export function _cpuInterp1D(node) {
     // WebGPU shader (PyTorch F.interpolate default).
     const scale = in_l / out_l;
     if (output.shape.length !== 3 || output.shape[0] !== batch || output.shape[1] !== c || output.shape[2] !== out_l) {
-      throw new Error('Interp1D requires matching rank-3 NCL input/output tensors.');
+      throw new Error('Interpolate1D requires matching rank-3 NCL input/output tensors.');
     }
     for (let b = 0; b < batch; b++) for (let ch = 0; ch < c; ch++) {
       for (let x = 0; x < out_l; x++) {

@@ -1,10 +1,8 @@
-#include "volvoxai.h"
-#include "volvoxai_backend.h"
+#include "engine_core.h"
 #include "engine_internal.h"
-#include "backend_sdk.h"
 #include "incremental_runtime.h"
 #if VOLVOXAI_ENABLE_TRAINING
-#include "volvoxai_training.h"
+#include "training/training_core.h"
 #endif
 #include "shader_store.h"
 #include "adapter_runtime_internal.h"
@@ -22,6 +20,12 @@
 #if VOLVOXAI_ENABLE_METAL
 #include "metal_engine.h"
 #endif
+#if VOLVOXAI_ENABLE_NNAPI
+#include "nnapi_engine.h"
+#endif
+#if VOLVOXAI_ENABLE_CUDA
+#include "cuda_engine.h"
+#endif
 #include <math.h>
 #include <limits.h>
 #include <pthread.h>
@@ -29,56 +33,27 @@
 #include <stdlib.h>
 #include <string.h>
 
-T g_t[MAXT];
-int g_nt = 0;
-Node g_n[MAXN];
-int g_nn = 0;
-QTensor g_qt[MAXT];
-QLinearMetadata g_qlinear_meta[MAXN];
-QConv2DMetadata g_qconv_meta[MAXN];
-QEmbeddingMetadata g_qembedding_meta[MAXN];
-char* g_blob = NULL;
-SafetensorsFile g_weight_files[MAX_WEIGHT_FILES];
-char g_weight_paths[MAX_WEIGHT_FILES][4096];
-int g_weight_file_count = 0;
-cJSON* g_cfg_root = NULL;
-char g_first_input[128] = {0};
-int g_loaded = 0;
-int g_weight_caches_dirty = 0;
-int g_active_row = -1;
-int g_prefix_rows = 0;
-int g_debug = 0;
-int g_execution_row = -1;
-float* g_kcache[MAXN];
-float* g_vcache[MAXN];
-float* g_qwcache[MAXN];
-float* g_f16wcache[MAXN];
-float* g_f16bcache[MAXN];
-float* g_conv_wcache[MAXN];
-void* g_q8wcache[MAXN];
-uint32_t g_q8wcache_bytes[MAXN];
-int g_concat_sigmoid_fuse[MAXN];
-
 static float volvoxai_engine_adapter_f16_at(const void* data, size_t index);
 static float volvoxai_engine_adapter_f32_at(const void* data, size_t index);
 
-typedef struct {
-    T* tensor;
-    unsigned char* backup;
-    unsigned char* merged;
-    size_t nbytes;
-} EngineMergedAdapterWeight;
-
-static EngineMergedAdapterWeight* g_merged_adapter_weights;
-static int g_merged_adapter_count;
-static char g_merged_adapter_version[128];
-static char g_pre_merge_active_version[128];
-static pthread_mutex_t g_adapter_admin_mutex = PTHREAD_MUTEX_INITIALIZER;
-static pthread_mutex_t g_engine_model_mutex = PTHREAD_MUTEX_INITIALIZER;
-static pthread_mutex_t g_engine_metadata_mutex = PTHREAD_MUTEX_INITIALIZER;
-static _Thread_local int g_engine_route_lease;
-static int g_cpu_threads;
-static uint64_t g_engine_model_generation = 1;
+#define g_merged_adapter_weights \
+    (vx_engine_state_current()->merged_adapter_weights)
+#define g_merged_adapter_count \
+    (vx_engine_state_current()->merged_adapter_count)
+#define g_merged_adapter_version \
+    (vx_engine_state_current()->merged_adapter_version)
+#define g_pre_merge_active_version \
+    (vx_engine_state_current()->pre_merge_active_version)
+#define g_adapter_admin_mutex \
+    (vx_engine_state_current()->adapter_admin_mutex)
+#define g_engine_model_mutex \
+    (vx_engine_state_current()->model_mutex)
+#define g_engine_metadata_mutex \
+    (vx_engine_state_current()->metadata_mutex)
+#define g_engine_route_lease (vx_engine_state_route_lease_active())
+#define g_cpu_threads (vx_engine_state_current()->cpu_threads)
+#define g_engine_model_generation \
+    (vx_engine_state_current()->model_generation)
 
 void volvoxai_engine_model_lock(void) { pthread_mutex_lock(&g_engine_model_mutex); }
 void volvoxai_engine_model_unlock(void) { pthread_mutex_unlock(&g_engine_model_mutex); }
@@ -132,13 +107,14 @@ static size_t engine_dtype_size_local(int dtype) {
     }
 }
 
-static SafetensorsDType safetensors_dtype_from_engine(int dtype) {
+static VxDataType safetensors_dtype_from_engine(int dtype) {
     switch (dtype) {
-        case T_F32: return SAFETENSORS_DTYPE_F32;
-        case T_I8: return SAFETENSORS_DTYPE_I8;
-        case T_U8: return SAFETENSORS_DTYPE_U8;
-        case T_I32: return SAFETENSORS_DTYPE_I32;
-        case T_F16: return SAFETENSORS_DTYPE_F16;
+        case VX_DTYPE_F32:
+        case VX_DTYPE_I8:
+        case VX_DTYPE_U8:
+        case VX_DTYPE_I32:
+        case VX_DTYPE_F16:
+            return dtype;
         default: return SAFETENSORS_DTYPE_UNKNOWN;
     }
 }
@@ -152,26 +128,18 @@ int volvoxai_engine_configure(const VolvoxAIEngineOptions* options) {
     if (!options) return -1;
     if (g_engine_route_lease) return -1;
     volvoxai_engine_model_lock();
-    if (g_loaded) {
+    if (g_loaded || vx_dynamic_autograd_active_locked()) {
         volvoxai_engine_model_unlock();
         return -1;
     }
     if (options->backend < VOLVOXAI_BACKEND_CPU ||
-        options->backend > VOLVOXAI_BACKEND_NNAPI || options->cpu_threads < 0) {
+        options->backend > VOLVOXAI_BACKEND_CUDA || options->cpu_threads < 0) {
         volvoxai_engine_model_unlock();
         return -1;
     }
     if (vx_backend_manager_activate(options->backend) != 0) {
         volvoxai_engine_model_unlock();
         return -1;
-    }
-    if (vx_sdk_selected_backend()) {
-        if (vx_runtime_backend_stage(NULL) != 0) {
-            (void)vx_backend_manager_activate(VOLVOXAI_BACKEND_CPU);
-            volvoxai_engine_model_unlock();
-            return -1;
-        }
-        vx_sdk_clear_backend();
     }
     vx_set_num_threads(options->cpu_threads);
     g_cpu_threads = options->cpu_threads;
@@ -185,8 +153,7 @@ int volvoxai_engine_get_options(VolvoxAIEngineOptions* options) {
     if (!options) return -1;
     int took_model_lock = !g_engine_route_lease;
     if (took_model_lock) volvoxai_engine_model_lock();
-    options->backend = vx_sdk_selected_backend()
-        ? VOLVOXAI_BACKEND_CUSTOM : vx_backend_manager_current();
+    options->backend = vx_backend_manager_current();
     options->debug = g_debug;
     options->cpu_threads = g_cpu_threads;
     if (took_model_lock) volvoxai_engine_model_unlock();
@@ -194,8 +161,7 @@ int volvoxai_engine_get_options(VolvoxAIEngineOptions* options) {
 }
 
 const char* volvoxai_engine_backend_name(void) {
-    const char* name = vx_sdk_selected_name();
-    return name ? name : vx_backend_manager_name();
+    return vx_backend_manager_name();
 }
 
 static int volvoxai_builtin_backend_by_name(const char* name,
@@ -206,43 +172,32 @@ static int volvoxai_builtin_backend_by_name(const char* name,
     else if (!strcmp(name, "opengl")) *backend = VOLVOXAI_BACKEND_OPENGL;
     else if (!strcmp(name, "metal")) *backend = VOLVOXAI_BACKEND_METAL;
     else if (!strcmp(name, "nnapi")) *backend = VOLVOXAI_BACKEND_NNAPI;
+    else if (!strcmp(name, "cuda")) *backend = VOLVOXAI_BACKEND_CUDA;
     else return 0;
     return 1;
 }
 
 int volvoxai_engine_configure_backend(const char* name) {
-    const char* previous_custom;
-    const VxBackend* candidate;
     VolvoxAIEngineBackend previous_builtin;
     VolvoxAIEngineBackend builtin;
     int result = -1;
     if (!name || !name[0] || g_engine_route_lease) return -1;
     volvoxai_engine_model_lock();
+    if (vx_dynamic_autograd_active_locked()) {
+        volvoxai_engine_model_unlock();
+        return -1;
+    }
     if (g_loaded) goto done;
-    previous_custom = vx_sdk_selected_name();
     previous_builtin = vx_backend_manager_current();
     if (volvoxai_builtin_backend_by_name(name, &builtin)) {
         if (vx_backend_manager_activate(builtin) != 0) goto done;
-        if (vx_runtime_backend_stage(NULL) != 0) {
+        if (vx_runtime_backend_stage() != 0) {
             (void)vx_backend_manager_activate(previous_builtin);
             goto done;
         }
-        vx_sdk_clear_backend();
         result = 0;
         goto done;
     }
-    candidate = vx_sdk_find_backend(name);
-    if (!candidate) goto done;
-    if (vx_sdk_select_backend(name) != 0) goto done;
-    if (vx_runtime_backend_stage(candidate) != 0) {
-        if (previous_custom) (void)vx_sdk_select_backend(previous_custom);
-        else vx_sdk_clear_backend();
-        goto done;
-    }
-    /* CPU activation cannot fail; it only releases a previously selected
-     * built-in device after the replacement SDK registry is ready. */
-    (void)vx_backend_manager_activate(VOLVOXAI_BACKEND_CPU);
-    result = 0;
 done:
     volvoxai_engine_model_unlock();
     return result;
@@ -312,7 +267,7 @@ static int volvoxai_engine_execution_row_valid_locked(int row) {
 int volvoxai_engine_set_execution_row(int row) {
     int took_model_lock = !g_engine_route_lease;
     if (took_model_lock) volvoxai_engine_model_lock();
-    if (vx_decode_session_active_locked() ||
+    if (vx_dynamic_autograd_active_locked() || vx_decode_session_active_locked() ||
         !volvoxai_engine_execution_row_valid_locked(row)) {
         if (took_model_lock) volvoxai_engine_model_unlock();
         return -1;
@@ -331,7 +286,7 @@ int volvoxai_engine_execution_row(void) {
 }
 
 static cJSON* volvoxai_engine_graph_interface(const char* key) {
-    return g_cfg_root ? cJSON_GetObjectItem(g_cfg_root, key) : NULL;
+    return g_graph_root ? cJSON_GetObjectItem(g_graph_root, key) : NULL;
 }
 
 int volvoxai_engine_graph_input_count(void) {
@@ -358,8 +313,7 @@ int volvoxai_engine_graph_output_count(void) {
     int took_model_lock = !g_engine_route_lease;
     if (took_model_lock) volvoxai_engine_model_lock();
     cJSON* outputs = volvoxai_engine_graph_interface("outputs");
-    int count = (cJSON_IsObject(outputs) || cJSON_IsArray(outputs))
-        ? cJSON_GetArraySize(outputs) : 0;
+    int count = cJSON_IsArray(outputs) ? cJSON_GetArraySize(outputs) : 0;
     if (took_model_lock) volvoxai_engine_model_unlock();
     return count;
 }
@@ -369,19 +323,19 @@ const char* volvoxai_engine_graph_output_name(int index) {
     int took_model_lock = !g_engine_route_lease;
     if (took_model_lock) volvoxai_engine_model_lock();
     cJSON* outputs = volvoxai_engine_graph_interface("outputs");
-    cJSON* output = (cJSON_IsObject(outputs) || cJSON_IsArray(outputs))
+    cJSON* output = cJSON_IsArray(outputs)
         ? cJSON_GetArrayItem(outputs, index) : NULL;
     const char* name = cJSON_IsString(output) ? output->valuestring : NULL;
     if (took_model_lock) volvoxai_engine_model_unlock();
     return name;
 }
 
-int volvoxai_engine_init(const char* config_path, const char* weights_path) {
+int volvoxai_engine_init(const char* graph_path, const char* weights_path) {
     const char* paths[1] = { weights_path };
-    return volvoxai_engine_init_with_weight_files(config_path, paths, weights_path ? 1 : 0);
+    return volvoxai_engine_init_with_weight_files(graph_path, paths, weights_path ? 1 : 0);
 }
 
-static int volvoxai_engine_init_with_weight_files_impl(const char* config_path,
+static int volvoxai_engine_init_with_weight_files_impl(const char* graph_path,
                                                        const char* const* weight_file_paths,
                                                        int weight_file_count) {
     if (g_loaded) volvoxai_engine_shutdown_impl();
@@ -394,11 +348,12 @@ static int volvoxai_engine_init_with_weight_files_impl(const char* config_path,
     g_first_input[0] = 0;
     g_active_row = -1;
     g_prefix_rows = 0;
+    g_prefix_row_capacity = 0;
     g_execution_row = -1;
     vx_incremental_invalidate_locked();
     vx_runtime_backend_reset();
     if (volvoxai_engine_load_weight_files(weight_file_paths, weight_file_count) != 0) goto fail;
-    if (build_graph(config_path) != 0) goto fail;
+    if (build_graph(graph_path) != 0) goto fail;
     if (prepack_conv_weights() != 0) goto fail;
     g_weight_caches_dirty = 0;
     g_loaded = 1;
@@ -409,10 +364,10 @@ fail:
     return -1;
 }
 
-int volvoxai_engine_init_with_weight_files(const char* config_path,
+int volvoxai_engine_init_with_weight_files(const char* graph_path,
                                            const char* const* weight_file_paths,
                                            int weight_file_count) {
-    if (!config_path || !config_path[0] || weight_file_count < 0 ||
+    if (!graph_path || !graph_path[0] || weight_file_count < 0 ||
         weight_file_count > MAX_WEIGHT_FILES ||
         (weight_file_count > 0 && !weight_file_paths)) return -1;
     for (int index = 0; index < weight_file_count; index++) {
@@ -420,9 +375,13 @@ int volvoxai_engine_init_with_weight_files(const char* config_path,
     }
     if (g_engine_route_lease) return -1;
     volvoxai_engine_model_lock();
+    if (vx_dynamic_autograd_active_locked()) {
+        volvoxai_engine_model_unlock();
+        return -1;
+    }
     volvoxai_engine_metadata_lock();
     int rc = volvoxai_engine_init_with_weight_files_impl(
-        config_path, weight_file_paths, weight_file_count);
+        graph_path, weight_file_paths, weight_file_count);
     volvoxai_engine_metadata_unlock();
     volvoxai_engine_model_unlock();
     return rc;
@@ -437,6 +396,10 @@ float* volvoxai_engine_input_ptr(const char* name, long* numel) {
         /* The returned pointer is mutable, so a later incremental call cannot
          * know which bytes changed. Force one complete refresh. */
         vx_incremental_invalidate_locked();
+        if (vx_runtime_backend_has_graph() && t->numel > 0 && t->elem_size &&
+            (size_t)t->numel <= SIZE_MAX / t->elem_size)
+            vx_runtime_backend_mark_host(
+                t->data, (size_t)t->numel * t->elem_size, 0);
         if (numel) *numel = t->numel;
         data = t->data;
     }
@@ -489,11 +452,9 @@ int volvoxai_engine_set_input_f32(const char* name, const float* data, long nume
             uint8_t zero_u8 = (uint8_t)tensor->quantization.zero_point;
             const void* zero = tensor->dtype == T_I8
                 ? (const void*)&zero_i8 : (const void*)&zero_u8;
-            /* quantize_linear_typed uses the portable typed-kernel ABI:
-             * 2=I8 and 3=U8. */
-            uint32_t portable_dtype = tensor->dtype == T_I8 ? 2u : 3u;
+            uint32_t dtype = (uint32_t)tensor->dtype;
             if (quantize_linear_typed(data, &tensor->quantization.scale, zero,
-                    portable_dtype, tensor->data, portable_dtype,
+                    dtype, tensor->data, dtype,
                     (uint32_t)numel) == 1) rc = 0;
         }
         if (rc == 0) {
@@ -506,6 +467,23 @@ int volvoxai_engine_set_input_f32(const char* name, const float* data, long nume
     volvoxai_engine_metadata_unlock();
     if (took_model_lock) volvoxai_engine_model_unlock();
     return rc;
+}
+
+int volvoxai_engine_input_affine_quantization(const char* name,
+                                              float* scale,
+                                              int* zero_point) {
+    int result = -1;
+    if (!name || !name[0] || !scale || !zero_point) return -1;
+    volvoxai_engine_metadata_lock();
+    T* tensor = t_find(name);
+    if (tensor && tensor->is_graph_input) {
+        result = tensor->quantization.valid ? 1 : 0;
+        *scale = tensor->quantization.valid ? tensor->quantization.scale : 0.0f;
+        *zero_point = tensor->quantization.valid
+            ? tensor->quantization.zero_point : 0;
+    }
+    volvoxai_engine_metadata_unlock();
+    return result;
 }
 
 int volvoxai_engine_is_graph_input(const char* name) {
@@ -539,9 +517,18 @@ int volvoxai_engine_tensor_is_model_weight_locked(const char* name) {
     return 1;
 }
 
+int volvoxai_engine_sync_model_weights_locked(void) {
+    for (int index = 0; index < g_nt; index++) {
+        T* tensor = &g_t[index];
+        if (volvoxai_engine_tensor_is_model_weight_locked(tensor->name) &&
+            vk_sync_host_tensor(tensor) != 0) return -1;
+    }
+    return 0;
+}
+
 int volvoxai_engine_is_model_weight(const char* name) {
     volvoxai_engine_metadata_lock();
-    int result = !volvoxai_engine_tensor_is_internal_companion_locked(name) &&
+    int result = !volvoxai_engine_tensor_is_quantization_parameter_locked(name) &&
         volvoxai_engine_tensor_is_model_weight_locked(name);
     volvoxai_engine_metadata_unlock();
     return result;
@@ -553,15 +540,13 @@ int volvoxai_engine_copy_tensor_f32(const char* name, float* out, long numel) {
     if (took_model_lock) volvoxai_engine_model_lock();
     const char* tensor_name = name && name[0] ? name : g_first_input;
     T* t = (volvoxai_engine_tensor_is_removed_output(tensor_name) ||
-            volvoxai_engine_tensor_is_internal_companion_locked(tensor_name))
+            volvoxai_engine_tensor_is_quantization_parameter_locked(tensor_name))
         ? NULL : t_find(tensor_name);
     if (!t || t->numel != numel) { if (took_model_lock) volvoxai_engine_model_unlock(); return -1; }
     if (vk_sync_host_tensor(t) != 0) {
         if (took_model_lock) volvoxai_engine_model_unlock();
         return -1;
     }
-    /* QTensor is an internal I8 sidecar for F32 graph tensors. Public F32
-       reads must observe its latest requantized values, not stale backing data. */
     if (t->dtype == T_F32) materialize_tensor_f32(t);
     if (t->dtype == T_F32) memcpy(out, t->data, (size_t)numel * sizeof(float));
     else for (long i = 0; i < numel; i++) {
@@ -583,7 +568,7 @@ int volvoxai_engine_copy_tensor_raw(const char* name, void* out, size_t nbytes) 
     if (took_model_lock) volvoxai_engine_model_lock();
     const char* tensor_name = name && name[0] ? name : g_first_input;
     T* t = (volvoxai_engine_tensor_is_removed_output(tensor_name) ||
-            volvoxai_engine_tensor_is_internal_companion_locked(tensor_name))
+            volvoxai_engine_tensor_is_quantization_parameter_locked(tensor_name))
         ? NULL : t_find(tensor_name);
     size_t expected = t ? (size_t)t->numel * t->elem_size : 0;
     if (!t || expected != nbytes) { if (took_model_lock) volvoxai_engine_model_unlock(); return -1; }
@@ -591,8 +576,6 @@ int volvoxai_engine_copy_tensor_raw(const char* name, void* out, size_t nbytes) 
         if (took_model_lock) volvoxai_engine_model_unlock();
         return -1;
     }
-    /* A logical F32 tensor may be authoritative in its internal I8 sidecar.
-       Exact raw reads still promise the current public F32 representation. */
     if (t->dtype == T_F32) materialize_tensor_f32(t);
     if (nbytes > 0) memcpy(out, t->data, nbytes);
     if (took_model_lock) volvoxai_engine_model_unlock();
@@ -603,7 +586,7 @@ int volvoxai_engine_tensor_info(const char* name, long* numel, int* shape, int* 
     volvoxai_engine_metadata_lock();
     const char* tensor_name = name && name[0] ? name : g_first_input;
     T* t = (volvoxai_engine_tensor_is_removed_output(tensor_name) ||
-            volvoxai_engine_tensor_is_internal_companion_locked(tensor_name))
+            volvoxai_engine_tensor_is_quantization_parameter_locked(tensor_name))
         ? NULL : t_find(tensor_name);
     if (!t) { volvoxai_engine_metadata_unlock(); return -1; }
     if (numel) *numel = t->numel;
@@ -619,7 +602,7 @@ int volvoxai_engine_tensor_info_ex(const char* name, long* numel, int* shape, in
     volvoxai_engine_metadata_lock();
     const char* tensor_name = name && name[0] ? name : g_first_input;
     T* t = (volvoxai_engine_tensor_is_removed_output(tensor_name) ||
-            volvoxai_engine_tensor_is_internal_companion_locked(tensor_name))
+            volvoxai_engine_tensor_is_quantization_parameter_locked(tensor_name))
         ? NULL : t_find(tensor_name);
     if (!t) { volvoxai_engine_metadata_unlock(); return -1; }
     if (numel) *numel = t->numel;
@@ -634,14 +617,14 @@ int volvoxai_engine_tensor_info_ex(const char* name, long* numel, int* shape, in
 }
 
 int volvoxai_engine_tensor_weight_file_index(const char* name) {
-    if (volvoxai_engine_tensor_is_internal_companion_locked(name)) return -1;
+    if (volvoxai_engine_tensor_is_quantization_parameter_locked(name)) return -1;
     return volvoxai_engine_tensor_weight_file_index_raw(name);
 }
 
 static int volvoxai_engine_set_tensor_raw_impl(const char* name, int dtype, const void* data, size_t nbytes) {
     if (!name || (!data && nbytes > 0)) return -1;
     if (volvoxai_engine_tensor_is_removed_output(name)) return -1;
-    if (volvoxai_engine_tensor_is_internal_companion_locked(name)) return -1;
+    if (volvoxai_engine_tensor_is_quantization_parameter_locked(name)) return -1;
     if (volvoxai_engine_merged_contains_tensor(name)) return -1;
     T* t = t_find(name);
     if (!t || t->is_graph_input || t->dtype != dtype) return -1;
@@ -649,16 +632,17 @@ static int volvoxai_engine_set_tensor_raw_impl(const char* name, int dtype, cons
     if (nbytes != want) return -1;
     if (vk_sync_host_tensor(t) != 0) return -1;
     if (nbytes > 0) memcpy(t->data, data, nbytes);
+    if (vx_runtime_backend_has_graph() && nbytes > 0)
+        vx_runtime_backend_mark_host(t->data, nbytes, 1);
 
     int file_index = volvoxai_engine_tensor_weight_file_index_raw(name);
     if (file_index >= 0) {
-        SafetensorsDType st_dtype = safetensors_dtype_from_engine(dtype);
+        VxDataType st_dtype = safetensors_dtype_from_engine(dtype);
         SafetensorsTensor* st = safetensors_find_tensor_mutable(&g_weight_files[file_index], name);
         if (st && st->dtype == st_dtype && st->nbytes == nbytes) {
             safetensors_set_tensor_data(&g_weight_files[file_index], name, data, nbytes);
         }
     }
-    qt_invalidate_all();
     vk_mark_owned_tensors_host_dirty();
     g_weight_caches_dirty = 1;
     volvoxai_engine_model_generation_advance_locked();
@@ -685,7 +669,7 @@ int volvoxai_engine_add_model_tensor_raw_locked(const char* name, const int* sha
     if (!name || !name[0] || strlen(name) >= sizeof(g_t[0].name) ||
         !shape || ndim < 0 || ndim > 8 || (!data && nbytes > 0)) return -1;
     size_t elem_size = engine_dtype_size_local(dtype);
-    SafetensorsDType st_dtype = safetensors_dtype_from_engine(dtype);
+    VxDataType st_dtype = safetensors_dtype_from_engine(dtype);
     if (!elem_size || st_dtype == SAFETENSORS_DTYPE_UNKNOWN) return -1;
     long numel = 1;
     for (int i = 0; i < ndim; i++) {
@@ -718,7 +702,6 @@ int volvoxai_engine_add_model_tensor_raw_locked(const char* name, const int* sha
     tensor->elem_size = elem_size;
     g_nt++;
     volvoxai_engine_tensor_name_index_add(g_nt - 1);
-    qt_invalidate_all();
     g_weight_caches_dirty = 1;
     volvoxai_engine_model_generation_advance_locked();
     rc = 0;
@@ -748,7 +731,7 @@ int volvoxai_engine_remove_model_tensor_locked(const char* name) {
     int rc = -1;
     int mutation_prepared = 0;
     if (!g_loaded || g_merged_adapter_count ||
-        volvoxai_engine_tensor_is_internal_companion_locked(name)) goto done;
+        volvoxai_engine_tensor_is_quantization_parameter_locked(name)) goto done;
     T* tensor = t_find(name);
     if (!tensor || tensor->is_graph_input) goto done;
     for (int i = 0; i < g_nn; i++) {
@@ -766,22 +749,21 @@ int volvoxai_engine_remove_model_tensor_locked(const char* name) {
     if (file_index < 0) goto done;
     int tensor_index = (int)(tensor - g_t);
     if (tensor_index < 0 || tensor_index >= g_nt) goto done;
+    /* The reset below discards every backend slot, not only the tensor being
+     * removed. Preserve other device-authoritative trained weights first. */
+    if (volvoxai_engine_sync_model_weights_locked() != 0) goto done;
     if (volvoxai_engine_prepare_tensor_table_mutation() != 0) goto done;
     mutation_prepared = 1;
+    vx_runtime_backend_reset();
     if (safetensors_remove_tensor(&g_weight_files[file_index], name) != 0) goto done;
     optimizer_state_remove(name);
-    free(g_qt[tensor_index].data);
     if (tensor_index + 1 < g_nt) {
         memmove(&g_t[tensor_index], &g_t[tensor_index + 1],
                 (size_t)(g_nt - tensor_index - 1) * sizeof(g_t[0]));
-        memmove(&g_qt[tensor_index], &g_qt[tensor_index + 1],
-                (size_t)(g_nt - tensor_index - 1) * sizeof(g_qt[0]));
     }
     g_nt--;
     volvoxai_engine_tensor_name_index_invalidate();
     memset(&g_t[g_nt], 0, sizeof(g_t[0]));
-    memset(&g_qt[g_nt], 0, sizeof(g_qt[0]));
-    qt_invalidate_all();
     g_weight_caches_dirty = 1;
     volvoxai_engine_model_generation_advance_locked();
     rc = 0;
@@ -820,6 +802,17 @@ int volvoxai_engine_save_weight_file(int weight_file_index, const char* path) {
         return -1;
     }
     const char* out = (path && path[0]) ? path : g_weight_paths[weight_file_index];
+    if (out && out[0]) {
+        for (int tensor_index = 0; tensor_index < g_nt; tensor_index++) {
+            T* tensor = &g_t[tensor_index];
+            if (volvoxai_engine_tensor_weight_file_index_raw(tensor->name) ==
+                    weight_file_index &&
+                vk_sync_host_tensor(tensor) != 0) {
+                out = NULL;
+                break;
+            }
+        }
+    }
     if (out && out[0]) {
         rc = safetensors_save(out, &g_weight_files[weight_file_index]);
     }
@@ -1228,6 +1221,10 @@ char* volvoxai_engine_adapter_list_json(void) {
 int volvoxai_engine_adapter_activate(const char* version_id) {
     if (g_engine_route_lease) return -1;
     volvoxai_engine_model_lock();
+    if (vx_dynamic_autograd_active_locked()) {
+        volvoxai_engine_model_unlock();
+        return -1;
+    }
     pthread_mutex_lock(&g_adapter_admin_mutex);
     int rc = g_merged_adapter_count ? -1 : vx_adapter_activate(version_id);
     pthread_mutex_unlock(&g_adapter_admin_mutex);
@@ -1237,14 +1234,31 @@ int volvoxai_engine_adapter_activate(const char* version_id) {
 }
 
 int volvoxai_engine_adapter_remove(const char* version_id) {
+    if (g_engine_route_lease) return -1;
+    volvoxai_engine_model_lock();
+    if (vx_dynamic_autograd_active_locked()) {
+        volvoxai_engine_model_unlock();
+        return -1;
+    }
     pthread_mutex_lock(&g_adapter_admin_mutex);
     char active_version[128];
     int active = version_id && vx_adapter_get_active(active_version, sizeof(active_version)) == 0 &&
                  active_version[0] && !strcmp(version_id, active_version);
     int protected_version = g_merged_adapter_count && version_id &&
         (!strcmp(version_id, g_merged_adapter_version) || !strcmp(version_id, g_pre_merge_active_version));
-    int rc = (active || protected_version) ? -1 : vx_adapter_remove(version_id);
+    int rc = -1;
+    if (!active && !protected_version &&
+        volvoxai_engine_sync_model_weights_locked() == 0)
+        rc = vx_adapter_remove(version_id);
     pthread_mutex_unlock(&g_adapter_admin_mutex);
+    if (rc == 0) {
+        /* Adapter A/B buffers are stable CUDA weight identities while loaded.
+         * Removal frees them, so use the full lifetime reset, not transient
+         * training cleanup. */
+        vx_runtime_backend_reset();
+        volvoxai_engine_model_generation_advance_locked();
+    }
+    volvoxai_engine_model_unlock();
     return rc;
 }
 
@@ -1277,7 +1291,7 @@ static int volvoxai_engine_adapter_merge_impl(const char* version_id) {
             d_in != info.d_in || d_out != info.d_out) { ok = 0; break; }
         int file_index = volvoxai_engine_tensor_weight_file_index(info.weight_name);
         const SafetensorsTensor* backing = file_index >= 0 ? safetensors_find_tensor(&g_weight_files[file_index], info.weight_name) : NULL;
-        SafetensorsDType expected_dtype = tensor->dtype == T_F32 ? SAFETENSORS_DTYPE_F32 : SAFETENSORS_DTYPE_F16;
+        VxDataType expected_dtype = tensor->dtype == T_F32 ? SAFETENSORS_DTYPE_F32 : SAFETENSORS_DTYPE_F16;
         if (backing && backing->dtype != expected_dtype) { ok = 0; break; }
         if (vk_sync_host_tensor(tensor) != 0) { ok = 0; break; }
         size_t bytes = (size_t)tensor->numel * tensor->elem_size;
@@ -1311,13 +1325,16 @@ static int volvoxai_engine_adapter_merge_impl(const char* version_id) {
     vx_adapter_get_active(g_pre_merge_active_version, sizeof(g_pre_merge_active_version));
     for (int i = 0; i < count; i++) {
         memcpy(entries[i].tensor->data, entries[i].merged, entries[i].nbytes);
+        if (vx_runtime_backend_has_graph() && entries[i].nbytes > 0)
+            vx_runtime_backend_mark_host(entries[i].tensor->data,
+                                         entries[i].nbytes, 1);
     }
     g_merged_adapter_weights = entries;
     g_merged_adapter_count = count;
     strncpy(g_merged_adapter_version, version_id, sizeof(g_merged_adapter_version) - 1);
     g_merged_adapter_version[sizeof(g_merged_adapter_version) - 1] = 0;
     vx_adapter_activate("");
-    qt_invalidate_all(); vk_mark_owned_tensors_host_dirty(); g_weight_caches_dirty = 1;
+    vk_mark_owned_tensors_host_dirty(); g_weight_caches_dirty = 1;
     volvoxai_engine_model_generation_advance_locked();
     return 0;
 }
@@ -1349,10 +1366,14 @@ static int volvoxai_engine_adapter_unmerge_impl(void) {
     for (int i = 0; i < g_merged_adapter_count; i++) {
         T* tensor = g_merged_adapter_weights[i].tensor;
         memcpy(tensor->data, g_merged_adapter_weights[i].backup, g_merged_adapter_weights[i].nbytes);
+        if (vx_runtime_backend_has_graph() &&
+            g_merged_adapter_weights[i].nbytes > 0)
+            vx_runtime_backend_mark_host(
+                tensor->data, g_merged_adapter_weights[i].nbytes, 1);
     }
     volvoxai_engine_adapter_free_merge_state();
     if (vx_adapter_activate(restore) != 0) vx_adapter_activate("");
-    qt_invalidate_all(); vk_mark_owned_tensors_host_dirty(); g_weight_caches_dirty = 1;
+    vk_mark_owned_tensors_host_dirty(); g_weight_caches_dirty = 1;
     volvoxai_engine_model_generation_advance_locked();
     return 0;
 }
@@ -1374,17 +1395,28 @@ int volvoxai_engine_adapter_unmerge(void) {
 int volvoxai_engine_adapter_route_begin(const char* version_id) {
     if (g_engine_route_lease) return -1;
     volvoxai_engine_model_lock();
+    if (vx_dynamic_autograd_active_locked()) {
+        volvoxai_engine_model_unlock();
+        return -1;
+    }
     pthread_mutex_lock(&g_adapter_admin_mutex);
     int rc = g_merged_adapter_count && version_id && version_id[0] ? -1 : vx_adapter_request_begin(version_id);
     pthread_mutex_unlock(&g_adapter_admin_mutex);
-    if (rc == 0) g_engine_route_lease = 1;
-    else volvoxai_engine_model_unlock();
+    if (rc == 0 && vx_engine_state_route_lease_begin() != 0) {
+        vx_adapter_request_end();
+        rc = -1;
+    }
+    if (rc != 0) volvoxai_engine_model_unlock();
     return rc;
 }
 
 int volvoxai_engine_adapter_route_begin_many(const char* const* version_ids, const float* scales, int count) {
     if (g_engine_route_lease) return -1;
     volvoxai_engine_model_lock();
+    if (vx_dynamic_autograd_active_locked()) {
+        volvoxai_engine_model_unlock();
+        return -1;
+    }
     pthread_mutex_lock(&g_adapter_admin_mutex);
     if (g_merged_adapter_count) {
         for (int i = 0; i < count; i++) {
@@ -1397,21 +1429,30 @@ int volvoxai_engine_adapter_route_begin_many(const char* const* version_ids, con
     }
     int rc = vx_adapter_request_begin_many(version_ids, scales, count);
     pthread_mutex_unlock(&g_adapter_admin_mutex);
-    if (rc == 0) g_engine_route_lease = 1;
-    else volvoxai_engine_model_unlock();
+    if (rc == 0 && vx_engine_state_route_lease_begin() != 0) {
+        vx_adapter_request_end();
+        rc = -1;
+    }
+    if (rc != 0) volvoxai_engine_model_unlock();
     return rc;
 }
 
 void volvoxai_engine_adapter_route_end(void) {
     vx_adapter_request_end();
     if (g_engine_route_lease) {
-        g_engine_route_lease = 0;
+        vx_engine_state_route_lease_end();
         volvoxai_engine_model_unlock();
     }
 }
 
 int volvoxai_engine_forward_locked(void) {
-    if (!g_loaded || g_nn == 0) return -1;
+    if (!g_loaded) return -1;
+    if (g_nn == 0) {
+        vx_engine_state_current()->last_failure_node_index = -1;
+        memset(vx_engine_state_current()->runtime_route_backend, 0,
+               sizeof(vx_engine_state_current()->runtime_route_backend));
+        return 0;
+    }
     vx_incremental_prepare_ordinary_locked();
     if (volvoxai_engine_refresh_weight_caches_if_dirty() != 0) return -1;
     if (vx_adapter_run_begin() != 0) return -1;
@@ -1419,22 +1460,32 @@ int volvoxai_engine_forward_locked(void) {
     int backend_forward_started = 0;
     g_active_row = -1;
     g_prefix_rows = 0;
-    qt_invalidate_all();
+    g_prefix_row_capacity = 0;
     if (vx_runtime_backend_has_graph()) {
-        vx_runtime_backend_begin_forward();
+        vx_runtime_backend_begin_forward(
+            vx_runtime_backend_cuda_replay_eligible(),
+            volvoxai_engine_model_generation_locked());
         backend_forward_started = 1;
     }
     vk_mark_owned_tensors_host_dirty();
+    if (backend_forward_started && vx_runtime_backend_prepare_forward() != 0)
+        goto done;
     if (g_debug) prof_reset();
     double t0 = g_debug ? volvoxai_engine_now_ms() : 0.0;
+    vx_engine_state_current()->last_failure_node_index = -1;
+    memset(vx_engine_state_current()->runtime_route_backend, 0,
+           sizeof(vx_engine_state_current()->runtime_route_backend));
     for (int i = 0; i < g_nn; i++) {
-        if (run_node(&g_n[i], i, i == g_nn - 1) != 0) goto done;
+        if (run_node(&g_n[i], i, i == g_nn - 1) != 0) {
+            vx_engine_state_current()->last_failure_node_index = i;
+            goto done;
+        }
     }
     rc = 0;
 done:
     if (backend_forward_started) {
         double wait_t0 = g_debug ? volvoxai_engine_now_ms() : 0.0;
-        if (vx_runtime_backend_end_forward() != 0) rc = -1;
+        if (vx_runtime_backend_end_forward(rc == 0) != 0) rc = -1;
         if (g_debug) prof_add_entry("GPUWait", volvoxai_engine_now_ms() - wait_t0);
     }
     if (rc == 0 && g_debug) {
@@ -1491,7 +1542,8 @@ int volvoxai_engine_incremental_row_supported(void) {
 void volvoxai_engine_incremental_reset(void) {
     int took_model_lock = !g_engine_route_lease;
     if (took_model_lock) volvoxai_engine_model_lock();
-    vx_incremental_prepare_ordinary_locked();
+    if (!vx_dynamic_autograd_active_locked())
+        vx_incremental_prepare_ordinary_locked();
     if (took_model_lock) volvoxai_engine_model_unlock();
 }
 
@@ -1504,9 +1556,12 @@ void volvoxai_engine_profile_report(void) {
 }
 
 int volvoxai_engine_forward_prefix(int row_count) {
+    long row_capacity;
     int took_model_lock = !g_engine_route_lease;
     if (took_model_lock) volvoxai_engine_model_lock();
-    if (!g_loaded || g_nn == 0 || row_count <= 0 ||
+    row_capacity = volvoxai_engine_execution_row_capacity_locked();
+    if (!g_loaded || g_nn == 0 || row_count <= 0 || row_capacity <= 0 ||
+        (long)row_count > row_capacity ||
         !volvoxai_engine_execution_row_valid_locked(row_count - 1)) {
         if (took_model_lock) volvoxai_engine_model_unlock();
         return -1;
@@ -1515,22 +1570,35 @@ int volvoxai_engine_forward_prefix(int row_count) {
     if (volvoxai_engine_refresh_weight_caches_if_dirty() != 0) { if (took_model_lock) volvoxai_engine_model_unlock(); return -1; }
     if (vx_adapter_run_begin() != 0) { if (took_model_lock) volvoxai_engine_model_unlock(); return -1; }
     int result = -1;
+    int backend_forward_started = 0;
     g_active_row = -1;
     g_prefix_rows = row_count;
+    g_prefix_row_capacity = row_capacity;
     g_execution_row = row_count - 1;
-    qt_invalidate_all();
+    if (vx_runtime_backend_has_graph()) {
+        vx_runtime_backend_begin_forward(
+            0, volvoxai_engine_model_generation_locked());
+        backend_forward_started = 1;
+    }
+    /* Prefix execution may be the first device pass after model load.  Create
+     * full-tensor graph slots before row-sliced CUDA kernels request interior
+     * views; later row calls deliberately retain those resident allocations. */
+    vk_mark_owned_tensors_host_dirty();
     double t0 = g_debug ? volvoxai_engine_now_ms() : 0.0;
     for (int i = 0; i < g_nn; i++) {
         if (run_node(&g_n[i], i, i == g_nn - 1) != 0) goto done;
     }
+    result = 0;
+done:
+    if (backend_forward_started &&
+        vx_runtime_backend_end_forward(result == 0) != 0)
+        result = -1;
     g_prefix_rows = 0;
-    if (g_debug) {
+    g_prefix_row_capacity = 0;
+    if (result == 0 && g_debug) {
         fprintf(stderr, "[debug] volvoxai_engine_forward_prefix rows=%d nodes=%d %.3f ms\n",
                 row_count, g_nn, volvoxai_engine_now_ms() - t0);
     }
-    result = 0;
-done:
-    g_prefix_rows = 0;
     vx_adapter_run_end();
     if (took_model_lock) volvoxai_engine_model_unlock();
     return result;
@@ -1548,21 +1616,30 @@ int volvoxai_engine_forward_row(int row) {
     if (volvoxai_engine_refresh_weight_caches_if_dirty() != 0) { if (took_model_lock) volvoxai_engine_model_unlock(); return -1; }
     if (vx_adapter_run_begin() != 0) { if (took_model_lock) volvoxai_engine_model_unlock(); return -1; }
     int result = -1;
+    int backend_forward_started = 0;
     g_active_row = row;
     g_execution_row = row;
-    qt_invalidate_all();
+    g_prefix_rows = 0;
+    g_prefix_row_capacity = 0;
+    if (vx_runtime_backend_has_graph()) {
+        vx_runtime_backend_begin_forward(
+            0, volvoxai_engine_model_generation_locked());
+        backend_forward_started = 1;
+    }
     double t0 = g_debug ? volvoxai_engine_now_ms() : 0.0;
     for (int i = 0; i < g_nn; i++) {
         if (run_node(&g_n[i], i, i == g_nn - 1) != 0) goto done;
     }
+    result = 0;
+done:
+    if (backend_forward_started &&
+        vx_runtime_backend_end_forward(result == 0) != 0)
+        result = -1;
     g_active_row = -1;
-    if (g_debug) {
+    if (result == 0 && g_debug) {
         fprintf(stderr, "[debug] volvoxai_engine_forward_row row=%d nodes=%d %.3f ms\n",
                 row, g_nn, volvoxai_engine_now_ms() - t0);
     }
-    result = 0;
-done:
-    g_active_row = -1;
     vx_adapter_run_end();
     if (took_model_lock) volvoxai_engine_model_unlock();
     return result;
@@ -1573,11 +1650,27 @@ const float* volvoxai_engine_tensor_row_f32(const char* name, int row, int* coun
     if (!name || !name[0] || row < -1) return NULL;
     int took_model_lock = !g_engine_route_lease;
     if (took_model_lock) volvoxai_engine_model_lock();
-    T* tensor = volvoxai_engine_tensor_is_internal_companion_locked(name)
+    T* tensor = volvoxai_engine_tensor_is_quantization_parameter_locked(name)
         ? NULL : t_find(name);
     const float* result = NULL;
+    int row_synced = 0;
     if (!tensor || !tensor->data || tensor->numel <= 0) goto done;
-    if (vk_sync_host_tensor(tensor) != 0) goto done;
+#if VOLVOXAI_ENABLE_CUDA
+    if (g_use_cuda && row >= 0 && tensor->dtype == T_F32 &&
+        tensor->ndim > 0 && tensor->shape[tensor->ndim - 1] > 0) {
+        int row_width = tensor->shape[tensor->ndim - 1];
+        long row_total = tensor->numel / row_width;
+        if (tensor->numel != row_total * row_width || row >= row_total ||
+            (size_t)row_width > SIZE_MAX / sizeof(float) ||
+            vx_runtime_backend_sync_host(
+                tensor->data + (long)row * row_width,
+                (size_t)row_width * sizeof(float),
+                volvoxai_engine_tensor_is_model_weight_locked(tensor->name)) != 0)
+            goto done;
+        row_synced = 1;
+    }
+#endif
+    if (!row_synced && vk_sync_host_tensor(tensor) != 0) goto done;
     materialize_tensor_f32(tensor);
     if (tensor->dtype != T_F32 || !tensor->data || tensor->numel > INT_MAX) goto done;
     if (row < 0) {
@@ -1612,10 +1705,15 @@ static void volvoxai_engine_shutdown_impl(void) {
 #if VOLVOXAI_ENABLE_OPENGL
     opengl_free_weight_cache();
 #endif
+#if VOLVOXAI_ENABLE_NNAPI
+    /* NNAPI models retain pointers to constant operands. Destroy those models
+     * before the graph-owned safetensors/tensor storage below is released. */
+    nnapi_free_weight_cache();
+#endif
     vx_runtime_backend_teardown();
     volvoxai_shader_store_shutdown();
     vx_conv_f32_opt_free_all();
-    vx_gemm_f32_cache_free_all();
+    vx_gemm_f32_cache_free_all(&vx_engine_state_current()->gemm_f32_cache);
     volvoxai_engine_free_arena();
     volvoxai_engine_clear_qlinear_metadata();
     volvoxai_engine_clear_qconv_metadata();
@@ -1643,18 +1741,14 @@ static void volvoxai_engine_shutdown_impl(void) {
         g_q8wcache_bytes[i] = 0;
     }
     for (int i = 0; i < g_nt; i++) {
-        free(g_qt[i].data);
-        memset(&g_qt[i], 0, sizeof(g_qt[i]));
-    }
-    for (int i = 0; i < g_nt; i++) {
         if (g_t[i].owns && g_t[i].data) {
             free(g_t[i].data);
             g_t[i].data = NULL;
         }
     }
-    if (g_cfg_root) {
-        cJSON_Delete(g_cfg_root);
-        g_cfg_root = NULL;
+    if (g_graph_root) {
+        cJSON_Delete(g_graph_root);
+        g_graph_root = NULL;
     }
     for (int i = 0; i < g_weight_file_count; i++) {
         safetensors_free(&g_weight_files[i]);
@@ -1670,6 +1764,7 @@ static void volvoxai_engine_shutdown_impl(void) {
     g_first_input[0] = 0;
     g_active_row = -1;
     g_prefix_rows = 0;
+    g_prefix_row_capacity = 0;
     g_execution_row = -1;
     vx_incremental_shutdown_locked();
 }
@@ -1677,9 +1772,12 @@ static void volvoxai_engine_shutdown_impl(void) {
 void volvoxai_engine_shutdown(void) {
     if (g_engine_route_lease) volvoxai_engine_adapter_route_end();
     volvoxai_engine_model_lock();
+    if (vx_dynamic_autograd_active_locked()) {
+        volvoxai_engine_model_unlock();
+        return;
+    }
     volvoxai_engine_metadata_lock();
     volvoxai_engine_shutdown_impl();
-    vx_sdk_clear_backend();
     vx_backend_manager_deactivate();
     vx_set_num_threads(0);
     g_cpu_threads = 0;
@@ -1688,10 +1786,10 @@ void volvoxai_engine_shutdown(void) {
     volvoxai_engine_model_unlock();
 }
 
-int volvoxai_engine_run(const char* config_path, const char* weights_path,
+int volvoxai_engine_run(const char* graph_path, const char* weights_path,
                const char* input_path, const char* output_path) {
     int result = -1;
-    if (volvoxai_engine_init(config_path, weights_path) != 0) return -1;
+    if (volvoxai_engine_init(graph_path, weights_path) != 0) return -1;
 
     if (input_path) {
         long n;

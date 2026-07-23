@@ -20,6 +20,7 @@ struct Params {
 }
 @group(0) @binding(2) var<uniform> params : Params;
 
+// Dtype IDs are canonical protobuf values: I8=6, U8=5.
 fn word_byte(word : u32, index : u32) -> u32 {
   return (word >> ((index % 4u) * 8u)) & 255u;
 }
@@ -31,7 +32,7 @@ fn signed_byte(value : u32) -> i32 {
 
 fn input_value(index : u32) -> i32 {
   let value = word_byte(input_words[index / 4u], index);
-  if (params.input_type == 2u) { return signed_byte(value); }
+  if (params.input_type == 6u) { return signed_byte(value); }
   return i32(value);
 }
 
@@ -51,8 +52,8 @@ fn output_byte(value : i32) -> u32 {
 
 fn requantize_one(index : u32) -> u32 {
   if (index >= params.elements) { return 0u; }
-  let minimum = select(0, -128, params.output_type == 2u);
-  let maximum = select(255, 127, params.output_type == 2u);
+  let minimum = select(0, -128, params.output_type == 6u);
+  let maximum = select(255, 127, params.output_type == 6u);
   let centered = input_value(index) - params.input_zero_point;
   let transformed = f32(f32(centered) * params.multiplier) + f32(params.output_zero_point);
   if (transformed != transformed) { return output_byte(params.output_zero_point); }

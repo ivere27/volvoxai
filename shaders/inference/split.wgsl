@@ -1,5 +1,5 @@
-@group(0) @binding(0) var<storage, read> input : array<f32>;
-        @group(0) @binding(1) var<storage, read_write> output : array<f32>;
+@group(0) @binding(0) var<storage, read> input : array<u32>;
+        @group(0) @binding(1) var<storage, read_write> output : array<u32>;
         struct Params { total : u32, inner : u32, split_size : u32, axis_in : u32, offset : u32 }
         @group(0) @binding(2) var<uniform> params : Params;
         @compute @workgroup_size(64)
