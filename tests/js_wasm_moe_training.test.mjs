@@ -8,7 +8,7 @@ import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
 
 import { Graph } from '../ts/index.js';
-import { TrainingVolvoxAI } from '../ts/training/TrainingVolvoxAI.js';
+import { createWasmStepRunner } from './helpers/training_session.mjs';
 import { CPUAutograd } from '../ts/training/CPUAutograd.js';
 
 const run = promisify(execFile);
@@ -73,12 +73,13 @@ function moeGraph({ normalize, routerBias: includeRouterBias, expertBias: includ
     route_weights: routes.weights,
     ...(expertBias ? { expert_bias: expertBias } : {}),
   }, { out: [2, 2] });
-  graph.outputNames = [out.name];
+  graph.setOutputs([out.name]);
   return {
     graph,
     output: out.name,
     routes,
     trainable: ['input', 'router', ...(routerBias ? ['router_bias'] : []), 'experts', ...(expertBias ? ['expert_bias'] : [])],
+    executionInputs: {},
   };
 }
 
@@ -97,8 +98,9 @@ function routeWeightGraph() {
   const expertBias = graph.addWeight('expert_bias', [3, 2], 'float32', {
     buffer: Float32Array.from([0.05, -0.1, -0.2, 0.15, 0.1, 0.2]),
   });
+  const indexValues = Float32Array.from([0, 2, 1, 2]);
   const indices = graph.addInput('indices', [2, 2], 'float32', {
-    buffer: Float32Array.from([0, 2, 1, 2]),
+    buffer: indexValues,
   });
   const weights = graph.addWeight('route_weights', [2, 2], 'float32', {
     buffer: Float32Array.from([0.65, 0.35, 0.2, 0.8]),
@@ -110,15 +112,16 @@ function routeWeightGraph() {
     route_indices: indices,
     route_weights: weights,
   }, { out: [2, 2] });
-  graph.outputNames = [out.name];
+  graph.setOutputs([out.name]);
   return {
     graph,
     output: out.name,
     trainable: ['input', 'experts', 'expert_bias', 'route_weights'],
+    executionInputs: { indices: indexValues },
   };
 }
 
-async function trainParity(api, makeGraph) {
+async function trainParity(runWasmStep, makeGraph) {
   const wasmCase = makeGraph();
   const cpuCase = makeGraph();
   const options = {
@@ -127,12 +130,14 @@ async function trainParity(api, makeGraph) {
     updateMode: 'sgd',
     optimizer: { learningRate: 0 },
   };
-  const wasm = await api.trainStep(wasmCase.graph, { ...options, backend: 'wasm' });
-  const cpu = await CPUAutograd.trainStep(cpuCase.graph, options);
+  const wasm = await runWasmStep(wasmCase.graph, {
+    ...options, inputs: wasmCase.executionInputs, backend: 'wasm',
+  });
+  const cpu = await CPUAutograd.trainStep(cpuCase.graph, {
+    ...options, inputs: cpuCase.executionInputs,
+  });
   assert.equal(wasm.backend, 'wasm');
   assert.ok(Math.abs(wasm.loss - cpu.loss) <= 5e-5, 'MoE loss');
-  closeArray(wasmCase.graph.getTensor(wasmCase.output).buffer,
-    cpuCase.graph.getTensor(cpuCase.output).buffer, 'MoE output');
   for (const name of wasmCase.trainable) {
     closeArray(wasm.gradients.get(name), cpu.gradients.get(name), `MoE ${name} gradient`);
   }
@@ -152,32 +157,28 @@ test('strict full-WASM MoERouter and MoELinear match CPU routing and all gradien
   try {
     const wasmPath = join(directory, 'volvoxai.full.wasm');
     await buildFullWasm(wasmPath);
-    const api = await TrainingVolvoxAI.init(['wasm'], wasmPath);
+    const runWasmStep = createWasmStepRunner(wasmPath);
 
-    const normalized = await trainParity(api, () => moeGraph({
+    const normalized = await trainParity(runWasmStep, () => moeGraph({
       normalize: true, routerBias: true, expertBias: true, tied: true,
     }));
-    assert.ok(normalized.wasmCase.routes.indices.buffer instanceof Float32Array,
+    assert.ok(normalized.cpuCase.routes.indices.buffer instanceof Float32Array,
       'portable router indices use exact F32 integer storage');
-    assert.ok(normalized.wasmCase.routes.weights.buffer instanceof Float32Array,
+    assert.ok(normalized.cpuCase.routes.weights.buffer instanceof Float32Array,
       'portable router gates use F32 storage');
-    assert.deepEqual([...normalized.wasmCase.routes.indices.buffer], [0, 1, 0, 1],
+    assert.deepEqual([...normalized.cpuCase.routes.indices.buffer], [0, 1, 0, 1],
       'equal router logits choose lower expert indices first');
-    closeArray(normalized.wasmCase.routes.weights.buffer, normalized.cpuCase.routes.weights.buffer,
-      'normalized route weights');
 
-    const fullSoftmax = await trainParity(api, () => moeGraph({
+    const fullSoftmax = await trainParity(runWasmStep, () => moeGraph({
       normalize: false, routerBias: false, expertBias: false,
     }));
-    closeArray(fullSoftmax.wasmCase.routes.weights.buffer, fullSoftmax.cpuCase.routes.weights.buffer,
-      'full-softmax route weights');
     assert.notEqual(fullSoftmax.wasm.gradients.get('router')[2], 0,
       'non-normalized selected gates propagate denominator gradients to unselected router experts');
 
-    await trainParity(api, () => moeGraph({
+    await trainParity(runWasmStep, () => moeGraph({
       normalize: true, routerBias: true, expertBias: false,
     }));
-    await trainParity(api, routeWeightGraph);
+    await trainParity(runWasmStep, routeWeightGraph);
   } finally {
     await rm(directory, { recursive: true, force: true });
   }

@@ -1,8 +1,4 @@
 // ---- per-op timing aggregation (--debug) ----------------------------------
-typedef struct { char op[40]; double ms; int count; } ProfEntry;
-static ProfEntry g_prof[128];
-static int g_nprof;
-
 void prof_reset(void) { g_nprof = 0; }
 
 static void prof_add(const char* op, double ms) {

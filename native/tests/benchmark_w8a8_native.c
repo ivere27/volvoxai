@@ -99,6 +99,7 @@ static const char* raw_w8a8_path(uint32_t d_in) {
 #if defined(__i386__) || defined(__x86_64__)
     if (d_in >= 64u && vx_cpu_has_avx512_vnni()) return "avx512-vnni-zmm";
     if (d_in >= 32u && vx_cpu_has_avx_vnni()) return "avx-vnni";
+    if (d_in >= 32u && vx_cpu_has_avx2()) return "avx2-maddubs-exact";
     if (d_in >= 16u && vx_cpu_has_avx2()) return "avx2";
 #elif defined(__aarch64__) || defined(__arm__)
 #if defined(VOLVOXAI_ARM_DOTPROD_OBJECT)
@@ -111,13 +112,17 @@ static const char* raw_w8a8_path(uint32_t d_in) {
     return "portable";
 }
 
-static const char* qconv_w8a8_path(uint32_t input_per_group) {
+static const char* qconv_w8a8_path(uint32_t input_per_group,
+                                    int dense_3x3_qlinear) {
 #if defined(__i386__) || defined(__x86_64__)
     if (input_per_group >= 64u && vx_cpu_has_avx512_vnni())
         return "avx512-vnni-zmm";
     if (input_per_group >= 32u && vx_cpu_has_avx_vnni()) return "avx-vnni";
-    if (vx_cpu_has_avx2())
+    if (vx_cpu_has_avx2()) {
+        if (dense_3x3_qlinear && input_per_group >= 64u)
+            return "im2col+avx2-maddubs-exact";
         return input_per_group < 16u ? "avx2-oc8-small-c" : "avx2-oc4";
+    }
 #elif defined(__aarch64__) || defined(__arm__)
 #if defined(VOLVOXAI_ARM_DOTPROD_OBJECT)
     if (input_per_group >= 16u && vx_cpu_has_arm_dotprod()) return "arm-sdot";
@@ -126,12 +131,13 @@ static const char* qconv_w8a8_path(uint32_t input_per_group) {
 #else
     (void)input_per_group;
 #endif
+    (void)dense_3x3_qlinear;
     return "portable";
 }
 
 static const char* packed_w8a8_path(void) {
 #if defined(__i386__) || defined(__x86_64__)
-    if (vx_cpu_has_avx2()) return "avx2-n8";
+    if (vx_cpu_has_avx2()) return "avx2-k4-n16-exact";
 #endif
     return "portable-packed";
 }
@@ -146,12 +152,14 @@ static double time_w8a8(QLinearW8A8Fn function, const void* input,
     for (int iteration = 0; iteration < warmup; iteration++)
         if (!function(input, weight, bias, scales, zero_points, output,
                 1u, d_in, d_out, input_scale, input_zero_point,
-                output_scale, 0, 2u, 2u, 2u)) return -1.0;
+                output_scale, 0, VX_DTYPE_I8, VX_DTYPE_I8,
+                VX_DTYPE_I8)) return -1.0;
     clock_gettime(CLOCK_MONOTONIC, &start);
     for (int iteration = 0; iteration < iterations; iteration++)
         if (!function(input, weight, bias, scales, zero_points, output,
                 1u, d_in, d_out, input_scale, input_zero_point,
-                output_scale, 0, 2u, 2u, 2u)) return -1.0;
+                output_scale, 0, VX_DTYPE_I8, VX_DTYPE_I8,
+                VX_DTYPE_I8)) return -1.0;
     clock_gettime(CLOCK_MONOTONIC, &end);
     return elapsed_ms(&start, &end) / iterations;
 }
@@ -168,12 +176,14 @@ static double time_w8a8_rows(QLinearW8A8Fn function, const void* input,
     for (int iteration = 0; iteration < warmup; iteration++)
         if (!function(input, weight, bias, scales, zero_points, output,
                 rows, d_in, d_out, input_scale, input_zero_point,
-                output_scale, 0, 2u, 2u, 2u)) return -1.0;
+                output_scale, 0, VX_DTYPE_I8, VX_DTYPE_I8,
+                VX_DTYPE_I8)) return -1.0;
     clock_gettime(CLOCK_MONOTONIC, &start);
     for (int iteration = 0; iteration < iterations; iteration++)
         if (!function(input, weight, bias, scales, zero_points, output,
                 rows, d_in, d_out, input_scale, input_zero_point,
-                output_scale, 0, 2u, 2u, 2u)) return -1.0;
+                output_scale, 0, VX_DTYPE_I8, VX_DTYPE_I8,
+                VX_DTYPE_I8)) return -1.0;
     clock_gettime(CLOCK_MONOTONIC, &end);
     return elapsed_ms(&start, &end) / iterations;
 }
@@ -186,11 +196,13 @@ static double time_w8a32(LinearW8A32Fn function, const float* input,
     struct timespec start, end;
     for (int iteration = 0; iteration < warmup; iteration++)
         if (!function(input, weight, scales, zero_points, bias, output,
-                1u, d_in, d_out, 2u, d_out, 1u, d_out)) return -1.0;
+                1u, d_in, d_out, VX_DTYPE_I8, d_out, VX_DTYPE_I32,
+                d_out)) return -1.0;
     clock_gettime(CLOCK_MONOTONIC, &start);
     for (int iteration = 0; iteration < iterations; iteration++)
         if (!function(input, weight, scales, zero_points, bias, output,
-                1u, d_in, d_out, 2u, d_out, 1u, d_out)) return -1.0;
+                1u, d_in, d_out, VX_DTYPE_I8, d_out, VX_DTYPE_I32,
+                d_out)) return -1.0;
     clock_gettime(CLOCK_MONOTONIC, &end);
     return elapsed_ms(&start, &end) / iterations;
 }
@@ -242,13 +254,14 @@ static int run_decoder_linear_case(const DecoderLinearCase* test,
         bias_f32[index] = (float)bias_i32[index] * input_scale * scales[index];
     }
     if (!vx_pack_q8_weight(packed_weight, packed_bytes, weight, test->d_in,
-            test->d_out, 2u, 1u) ||
+            test->d_out, VX_DTYPE_I8, 1u) ||
         !matmul_quantized_f32(input_f32, weight, scales, zero_points, bias_f32,
-            w8a32_reference, 1u, test->d_in, test->d_out, 2u,
-            test->d_out, 1u, test->d_out) ||
+            w8a32_reference, 1u, test->d_in, test->d_out, VX_DTYPE_I8,
+            test->d_out, VX_DTYPE_I32, test->d_out) ||
         !vx_matmul_quantized_f32_packed(input_f32, packed_weight, scales,
             zero_points, bias_f32, w8a32_packed, 1u, test->d_in,
-            test->d_out, 2u, test->d_out, 1u, test->d_out)) goto cleanup;
+            test->d_out, VX_DTYPE_I8, test->d_out, VX_DTYPE_I32,
+            test->d_out)) goto cleanup;
     for (size_t index = 0; index < output_count; index++) {
         float value_abs = fabsf(w8a32_reference[index]);
         float delta = fabsf(w8a32_reference[index] - w8a32_packed[index]);
@@ -260,13 +273,16 @@ static int run_decoder_linear_case(const DecoderLinearCase* test,
     output_scale = fmaxf(max_abs / 120.0f, 1.0e-6f);
     if (!qlinear_i8u8(input_i8, weight, bias_i32, scales, zero_points,
             w8a8_reference, 1u, test->d_in, test->d_out, input_scale,
-            input_zero_point, output_scale, 0, 2u, 2u, 2u) ||
+            input_zero_point, output_scale, 0, VX_DTYPE_I8, VX_DTYPE_I8,
+            VX_DTYPE_I8) ||
         !vx_qlinear_i8u8_native(input_i8, weight, bias_i32, scales, zero_points,
             w8a8_raw, 1u, test->d_in, test->d_out, input_scale,
-            input_zero_point, output_scale, 0, 2u, 2u, 2u) ||
+            input_zero_point, output_scale, 0, VX_DTYPE_I8, VX_DTYPE_I8,
+            VX_DTYPE_I8) ||
         !vx_qlinear_i8u8_packed(input_i8, packed_weight, bias_i32, scales,
             zero_points, w8a8_packed, 1u, test->d_in, test->d_out,
-            input_scale, input_zero_point, output_scale, 0, 2u, 2u, 2u) ||
+            input_scale, input_zero_point, output_scale, 0, VX_DTYPE_I8,
+            VX_DTYPE_I8, VX_DTYPE_I8) ||
         memcmp(w8a8_reference, w8a8_raw, output_count) != 0 ||
         memcmp(w8a8_reference, w8a8_packed, output_count) != 0) goto cleanup;
     for (size_t index = 0; index < output_count; index++) {
@@ -397,25 +413,27 @@ static int run_seed_linear_case(const SeedLinearCase* test,
     for (uint32_t column = 0; column < test->d_out; column++) {
         bias[column] = (int32_t)(column * 41u) - 503;
         scales[column] = 1.0f / (float)(48u + column % 7u * 8u);
-        zero_points[column] = (int32_t)(column % 13u) - 6;
+        zero_points[column] = 0;
     }
     if (!vx_pack_q8_weight(packed_weight, packed_bytes, weight, test->d_in,
-            test->d_out, 2u, 1u) ||
+            test->d_out, VX_DTYPE_I8, 1u) ||
         !qlinear_i8u8(input, weight, bias, scales, zero_points, reference,
             test->rows, test->d_in, test->d_out, input_scale, input_zero_point,
-            output_scale, 0, 2u, 2u, 2u) ||
+            output_scale, 0, VX_DTYPE_I8, VX_DTYPE_I8, VX_DTYPE_I8) ||
         !vx_qlinear_i8u8_packed(input, packed_weight, bias, scales,
             zero_points, packed_output, test->rows, test->d_in, test->d_out,
-            input_scale, input_zero_point, output_scale, 0, 2u, 2u, 2u) ||
+            input_scale, input_zero_point, output_scale, 0, VX_DTYPE_I8,
+            VX_DTYPE_I8, VX_DTYPE_I8) ||
         !vx_qlinear_i8u8_native(input, weight, bias, scales, zero_points,
             single, test->rows, test->d_in, test->d_out, input_scale,
-            input_zero_point, output_scale, 0, 2u, 2u, 2u) ||
+            input_zero_point, output_scale, 0, VX_DTYPE_I8, VX_DTYPE_I8,
+            VX_DTYPE_I8) ||
         memcmp(reference, packed_output, output_count) != 0 ||
         memcmp(reference, single, output_count) != 0) goto cleanup;
     *packed_ms = time_w8a8_rows(vx_qlinear_i8u8_packed, input, packed_weight,
         bias, scales, zero_points, packed_output, test->rows, test->d_in,
         test->d_out, input_scale, input_zero_point, output_scale,
-        test->iterations, 1);
+        test->iterations, 4);
     *single_ms = time_w8a8_rows(vx_qlinear_i8u8_native, input, weight, bias,
         scales, zero_points, single, test->rows, test->d_in, test->d_out,
         input_scale, input_zero_point, output_scale, test->iterations, 1);
@@ -426,7 +444,7 @@ static int run_seed_linear_case(const SeedLinearCase* test,
         memcmp(reference, packed_output, output_count) != 0 ||
         memcmp(reference, single, output_count) != 0 ||
         memcmp(reference, threaded, output_count) != 0) goto cleanup;
-    printf("  %-21s calls=%2u M=%3u K=%4u N=%4u packed[%s]=%.3f ms "
+    printf("  %-21s calls=%2u M=%3u K=%4u N=%4u packed[%s,4t]=%.3f ms "
            "raw[%s,1t]=%.3f ms raw[%s,4t]=%.3f ms "
            "packed/raw4=%.2fx checksum=0x%08x\n",
            test->label, test->calls, test->rows, test->d_in, test->d_out,
@@ -464,7 +482,8 @@ static int run_tiny_vqa_decoder_seed_linears(void) {
     double packed_total = 0.0;
     double single_total = 0.0;
     double threaded_total = 0.0;
-    puts("TinyReceipt full-seed base-dense subset (exact M=402/M=192):");
+    puts("TinyReceipt full-seed symmetric-I8 base-dense subset "
+         "(exact M=402/M=192):");
     for (size_t index = 0; index < sizeof(cases) / sizeof(cases[0]); index++) {
         double packed_ms, single_ms, threaded_ms;
         if (!run_seed_linear_case(&cases[index], &packed_ms, &single_ms,
@@ -524,7 +543,7 @@ static int benchmark_qsilu_scalar(const void* input, void* output,
         uint32_t input_dtype, uint32_t output_dtype) {
     const int8_t* input_i8 = (const int8_t*)input;
     int8_t* output_i8 = (int8_t*)output;
-    if (input_dtype != 2u || output_dtype != 2u) return 0;
+    if (input_dtype != VX_DTYPE_I8 || output_dtype != VX_DTYPE_I8) return 0;
     for (uint32_t index = 0; index < elements; index++) {
         const float value = (float)((int32_t)input_i8[index] - input_zero_point) *
             input_scale;
@@ -542,7 +561,7 @@ static int benchmark_qgelu_scalar(const void* input, void* output,
         uint32_t input_dtype, uint32_t output_dtype) {
     const int8_t* input_i8 = (const int8_t*)input;
     int8_t* output_i8 = (int8_t*)output;
-    if (input_dtype != 2u || output_dtype != 2u) return 0;
+    if (input_dtype != VX_DTYPE_I8 || output_dtype != VX_DTYPE_I8) return 0;
     for (uint32_t index = 0; index < elements; index++) {
         const float value = (float)((int32_t)input_i8[index] - input_zero_point) *
             input_scale;
@@ -580,34 +599,34 @@ static int run_activation_case(const ActivationCase* test) {
         input[index] = (int8_t)((int)(index * 37u % 255u) - 127);
     if (!test->scalar(input, scalar_output, test->elements,
             test->input_scale, input_zero_point, test->output_scale,
-            output_zero_point, 2u, 2u) ||
+            output_zero_point, VX_DTYPE_I8, VX_DTYPE_I8) ||
         !test->cached(input, cached_output, test->elements,
             test->input_scale, input_zero_point, test->output_scale,
-            output_zero_point, 2u, 2u) ||
+            output_zero_point, VX_DTYPE_I8, VX_DTYPE_I8) ||
         memcmp(scalar_output, cached_output, test->elements) != 0) goto cleanup;
     for (int iteration = 0; iteration < warmup; iteration++) {
         if (!test->scalar(input, scalar_output, test->elements,
                 test->input_scale, input_zero_point, test->output_scale,
-                output_zero_point, 2u, 2u)) goto cleanup;
+                output_zero_point, VX_DTYPE_I8, VX_DTYPE_I8)) goto cleanup;
     }
     clock_gettime(CLOCK_MONOTONIC, &start);
     for (int iteration = 0; iteration < test->iterations; iteration++) {
         if (!test->scalar(input, scalar_output, test->elements,
                 test->input_scale, input_zero_point, test->output_scale,
-                output_zero_point, 2u, 2u)) goto cleanup;
+                output_zero_point, VX_DTYPE_I8, VX_DTYPE_I8)) goto cleanup;
     }
     clock_gettime(CLOCK_MONOTONIC, &end);
     scalar_ms = elapsed_ms(&start, &end) / test->iterations;
     for (int iteration = 0; iteration < warmup; iteration++) {
         if (!test->cached(input, cached_output, test->elements,
                 test->input_scale, input_zero_point, test->output_scale,
-                output_zero_point, 2u, 2u)) goto cleanup;
+                output_zero_point, VX_DTYPE_I8, VX_DTYPE_I8)) goto cleanup;
     }
     clock_gettime(CLOCK_MONOTONIC, &start);
     for (int iteration = 0; iteration < test->iterations; iteration++) {
         if (!test->cached(input, cached_output, test->elements,
                 test->input_scale, input_zero_point, test->output_scale,
-                output_zero_point, 2u, 2u)) goto cleanup;
+                output_zero_point, VX_DTYPE_I8, VX_DTYPE_I8)) goto cleanup;
     }
     clock_gettime(CLOCK_MONOTONIC, &end);
     cached_ms = elapsed_ms(&start, &end) / test->iterations;
@@ -660,12 +679,16 @@ static int run_tiny_vqa_grayscale_stem_qconv(void) {
     int8_t *portable = (int8_t *)malloc(output_elements);
     int8_t *native_single = (int8_t *)malloc(output_elements);
     int8_t *native = (int8_t *)malloc(output_elements);
+    const uint32_t packed_bytes = vx_packed_q8_weight_size(
+        kernel * kernel * channels, output_channels);
+    void* packed_weight = malloc(packed_bytes);
     int32_t bias[output_channels];
     float scales[output_channels];
     int32_t zero_points[output_channels];
     struct timespec start, end;
     double portable_ms, native_single_ms, native_ms;
-    int ok = input && weight && portable && native_single && native;
+    int ok = input && weight && portable && native_single && native &&
+        packed_weight && packed_bytes;
     if (!ok) goto cleanup;
     for (int index = 0; index < elements; index++)
         input[index] = (int8_t)((index * 23) % 255 - 127);
@@ -676,23 +699,28 @@ static int run_tiny_vqa_grayscale_stem_qconv(void) {
         scales[index] = 1.0f / (float)(64 + index % 5 * 8);
         zero_points[index] = 0;
     }
-    ok = qconv2d_i8u8(input, weight, bias, scales, zero_points, portable,
+    ok = vx_pack_q8_weight(packed_weight, packed_bytes, weight,
+        kernel * kernel * channels, output_channels, VX_DTYPE_I8, 1u) == 1;
+    ok = ok && qconv2d_i8u8(input, weight, bias, scales, zero_points, portable,
             batch, input_height, input_width, channels, output_height,
             output_width, output_channels, kernel, kernel, channels,
             2, 2, 1, 1, 1, 1, 1, 1, 1, 0,
-            1.0f / 32.0f, 0, 1.0f / 16.0f, 0, 2u, 2u, 2u) == 1;
+            1.0f / 32.0f, 0, 1.0f / 16.0f, 0,
+            VX_DTYPE_I8, VX_DTYPE_I8, VX_DTYPE_I8) == 1;
     vx_set_num_threads(1);
-    ok = ok && vx_qconv2d_i8u8_native(input, weight, bias, scales,
+    ok = ok && vx_qconv2d_i8u8_native_prepacked(input, weight, bias, scales,
             zero_points, native_single, batch, input_height, input_width,
             channels, output_height, output_width, output_channels, kernel,
             kernel, channels, 2, 2, 1, 1, 1, 1, 1, 1, 1, 0,
-            1.0f / 32.0f, 0, 1.0f / 16.0f, 0, 2u, 2u, 2u) == 1;
+            1.0f / 32.0f, 0, 1.0f / 16.0f, 0,
+            VX_DTYPE_I8, VX_DTYPE_I8, VX_DTYPE_I8, packed_weight) == 1;
     vx_set_num_threads(4);
-    ok = ok && vx_qconv2d_i8u8_native(input, weight, bias, scales,
+    ok = ok && vx_qconv2d_i8u8_native_prepacked(input, weight, bias, scales,
             zero_points, native, batch, input_height, input_width, channels,
             output_height, output_width, output_channels, kernel, kernel,
             channels, 2, 2, 1, 1, 1, 1, 1, 1, 1, 0,
-            1.0f / 32.0f, 0, 1.0f / 16.0f, 0, 2u, 2u, 2u) == 1;
+            1.0f / 32.0f, 0, 1.0f / 16.0f, 0,
+            VX_DTYPE_I8, VX_DTYPE_I8, VX_DTYPE_I8, packed_weight) == 1;
     ok = ok && memcmp(portable, native_single, output_elements) == 0 &&
         memcmp(portable, native, output_elements) == 0;
     if (!ok) goto cleanup;
@@ -703,7 +731,7 @@ static int run_tiny_vqa_grayscale_stem_qconv(void) {
                 output_width, output_channels, kernel, kernel, channels,
                 2, 2, 1, 1, 1, 1, 1, 1, 1, 0,
                 1.0f / 32.0f, 0, 1.0f / 16.0f, 0,
-                2u, 2u, 2u) != 1) {
+                VX_DTYPE_I8, VX_DTYPE_I8, VX_DTYPE_I8) != 1) {
             ok = 0;
             goto cleanup;
         }
@@ -713,12 +741,13 @@ static int run_tiny_vqa_grayscale_stem_qconv(void) {
     vx_set_num_threads(1);
     clock_gettime(CLOCK_MONOTONIC, &start);
     for (int iteration = 0; iteration < native_iterations; iteration++) {
-        if (vx_qconv2d_i8u8_native(input, weight, bias, scales, zero_points,
+        if (vx_qconv2d_i8u8_native_prepacked(input, weight, bias, scales, zero_points,
                 native_single, batch, input_height, input_width, channels,
                 output_height, output_width, output_channels, kernel, kernel,
                 channels, 2, 2, 1, 1, 1, 1, 1, 1, 1, 0,
                 1.0f / 32.0f, 0, 1.0f / 16.0f, 0,
-                2u, 2u, 2u) != 1) {
+                VX_DTYPE_I8, VX_DTYPE_I8, VX_DTYPE_I8,
+                packed_weight) != 1) {
             ok = 0;
             goto cleanup;
         }
@@ -728,12 +757,13 @@ static int run_tiny_vqa_grayscale_stem_qconv(void) {
     vx_set_num_threads(4);
     clock_gettime(CLOCK_MONOTONIC, &start);
     for (int iteration = 0; iteration < native_iterations; iteration++) {
-        if (vx_qconv2d_i8u8_native(input, weight, bias, scales, zero_points,
+        if (vx_qconv2d_i8u8_native_prepacked(input, weight, bias, scales, zero_points,
                 native, batch, input_height, input_width, channels,
                 output_height, output_width, output_channels, kernel, kernel,
                 channels, 2, 2, 1, 1, 1, 1, 1, 1, 1, 0,
                 1.0f / 32.0f, 0, 1.0f / 16.0f, 0,
-                2u, 2u, 2u) != 1) {
+                VX_DTYPE_I8, VX_DTYPE_I8, VX_DTYPE_I8,
+                packed_weight) != 1) {
             ok = 0;
             goto cleanup;
         }
@@ -743,8 +773,8 @@ static int run_tiny_vqa_grayscale_stem_qconv(void) {
     printf("TinyReceipt grayscale stem QConv2D [1,320,672,1] -> [1,160,336,48]: "
            "portable=%.3f ms single[%s]=%.3f ms tiled[%s,4t]=%.3f ms "
            "thread-speedup=%.2fx portable-speedup=%.2fx checksum=0x%08x\n",
-           portable_ms, qconv_w8a8_path(channels), native_single_ms,
-           qconv_w8a8_path(channels), native_ms, native_single_ms / native_ms,
+           portable_ms, "im2col+avx2-k4-n16-exact", native_single_ms,
+           "im2col+avx2-k4-n16-exact", native_ms, native_single_ms / native_ms,
            portable_ms / native_ms, checksum_i8(native, output_elements));
 cleanup:
     vx_set_num_threads(0);
@@ -753,6 +783,7 @@ cleanup:
     free(portable);
     free(native_single);
     free(native);
+    free(packed_weight);
     return ok;
 }
 
@@ -784,32 +815,36 @@ static int run_qconv(void) {
     if (qconv2d_i8u8(input, weight, bias, scales, zero_points, portable,
             batch, height, width, channels, height, width, output_channels,
             kernel, kernel, channels, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0,
-            1.0f / 32.0f, -3, 1.0f / 16.0f, -2, 2u, 2u, 2u) != 1) return 0;
+            1.0f / 32.0f, -3, 1.0f / 16.0f, -2,
+            VX_DTYPE_I8, VX_DTYPE_I8, VX_DTYPE_I8) != 1) return 0;
     vx_set_num_threads(1);
     if (vx_qconv2d_i8u8_native(input, weight, bias, scales, zero_points,
             native_single, batch, height, width, channels, height, width,
             output_channels, kernel, kernel, channels, 1, 1, 1, 1, 1, 1, 1, 1,
             1, 0, 1.0f / 32.0f, -3, 1.0f / 16.0f, -2,
-            2u, 2u, 2u) != 1) return 0;
+            VX_DTYPE_I8, VX_DTYPE_I8, VX_DTYPE_I8) != 1) return 0;
     vx_set_num_threads(4);
     if (vx_qconv2d_i8u8_native(input, weight, bias, scales, zero_points, native,
             batch, height, width, channels, height, width, output_channels,
             kernel, kernel, channels, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0,
-            1.0f / 32.0f, -3, 1.0f / 16.0f, -2, 2u, 2u, 2u) != 1 ||
+            1.0f / 32.0f, -3, 1.0f / 16.0f, -2,
+            VX_DTYPE_I8, VX_DTYPE_I8, VX_DTYPE_I8) != 1 ||
         memcmp(portable, native_single, sizeof(portable)) != 0 ||
         memcmp(portable, native, sizeof(portable)) != 0) return 0;
     for (int iteration = 0; iteration < warmup; iteration++) {
         if (qconv2d_i8u8(input, weight, bias, scales, zero_points, portable,
                 batch, height, width, channels, height, width, output_channels,
                 kernel, kernel, channels, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0,
-                1.0f / 32.0f, -3, 1.0f / 16.0f, -2, 2u, 2u, 2u) != 1) return 0;
+                1.0f / 32.0f, -3, 1.0f / 16.0f, -2,
+                VX_DTYPE_I8, VX_DTYPE_I8, VX_DTYPE_I8) != 1) return 0;
     }
     clock_gettime(CLOCK_MONOTONIC, &start);
     for (int iteration = 0; iteration < iterations; iteration++) {
         if (qconv2d_i8u8(input, weight, bias, scales, zero_points, portable,
                 batch, height, width, channels, height, width, output_channels,
                 kernel, kernel, channels, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0,
-                1.0f / 32.0f, -3, 1.0f / 16.0f, -2, 2u, 2u, 2u) != 1) return 0;
+                1.0f / 32.0f, -3, 1.0f / 16.0f, -2,
+                VX_DTYPE_I8, VX_DTYPE_I8, VX_DTYPE_I8) != 1) return 0;
     }
     clock_gettime(CLOCK_MONOTONIC, &end);
     portable_ms = elapsed_ms(&start, &end) / iterations;
@@ -819,7 +854,7 @@ static int run_qconv(void) {
                 native_single, batch, height, width, channels, height, width,
                 output_channels, kernel, kernel, channels, 1, 1, 1, 1, 1, 1,
                 1, 1, 1, 0, 1.0f / 32.0f, -3, 1.0f / 16.0f, -2,
-                2u, 2u, 2u) != 1) return 0;
+                VX_DTYPE_I8, VX_DTYPE_I8, VX_DTYPE_I8) != 1) return 0;
     }
     clock_gettime(CLOCK_MONOTONIC, &start);
     for (int iteration = 0; iteration < iterations; iteration++) {
@@ -827,7 +862,7 @@ static int run_qconv(void) {
                 native_single, batch, height, width, channels, height, width,
                 output_channels, kernel, kernel, channels, 1, 1, 1, 1, 1, 1,
                 1, 1, 1, 0, 1.0f / 32.0f, -3, 1.0f / 16.0f, -2,
-                2u, 2u, 2u) != 1) return 0;
+                VX_DTYPE_I8, VX_DTYPE_I8, VX_DTYPE_I8) != 1) return 0;
     }
     clock_gettime(CLOCK_MONOTONIC, &end);
     native_single_ms = elapsed_ms(&start, &end) / iterations;
@@ -836,14 +871,16 @@ static int run_qconv(void) {
         if (vx_qconv2d_i8u8_native(input, weight, bias, scales, zero_points, native,
                 batch, height, width, channels, height, width, output_channels,
                 kernel, kernel, channels, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0,
-                1.0f / 32.0f, -3, 1.0f / 16.0f, -2, 2u, 2u, 2u) != 1) return 0;
+                1.0f / 32.0f, -3, 1.0f / 16.0f, -2,
+                VX_DTYPE_I8, VX_DTYPE_I8, VX_DTYPE_I8) != 1) return 0;
     }
     clock_gettime(CLOCK_MONOTONIC, &start);
     for (int iteration = 0; iteration < iterations; iteration++) {
         if (vx_qconv2d_i8u8_native(input, weight, bias, scales, zero_points, native,
                 batch, height, width, channels, height, width, output_channels,
                 kernel, kernel, channels, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0,
-                1.0f / 32.0f, -3, 1.0f / 16.0f, -2, 2u, 2u, 2u) != 1) return 0;
+                1.0f / 32.0f, -3, 1.0f / 16.0f, -2,
+                VX_DTYPE_I8, VX_DTYPE_I8, VX_DTYPE_I8) != 1) return 0;
     }
     clock_gettime(CLOCK_MONOTONIC, &end);
     native_ms = elapsed_ms(&start, &end) / iterations;
@@ -851,20 +888,28 @@ static int run_qconv(void) {
     printf("QConv2D W8A8: portable=%.3f ms single[%s]=%.3f ms "
            "tiled[%s,4t]=%.3f ms thread-speedup=%.2fx portable-speedup=%.2fx "
            "checksum=0x%08x\n",
-           portable_ms, qconv_w8a8_path(channels), native_single_ms,
-           qconv_w8a8_path(channels), native_ms, native_single_ms / native_ms,
+           portable_ms, qconv_w8a8_path(channels, 1), native_single_ms,
+           qconv_w8a8_path(channels, 1), native_ms, native_single_ms / native_ms,
            portable_ms / native_ms, checksum_i8(native, sizeof(native)));
     return 1;
 }
 
 int main(void) {
-    if (!run_tiny_vqa_decoder_linear_mix() ||
+    VxKernelThreadPool* pool = vx_kernel_thread_pool_create(0);
+    VxKernelThreadPoolScope scope;
+    int result;
+    if (!pool) return 1;
+    scope = vx_kernel_thread_pool_scope_enter(pool);
+    result = !run_tiny_vqa_decoder_linear_mix() ||
         !run_tiny_vqa_decoder_seed_linears() ||
         !run_tiny_vqa_quantized_activations() ||
         !run_tiny_vqa_grayscale_stem_qconv() ||
-        !run_qconv()) {
+        !run_qconv();
+    if (result) {
         fputs("native W8A8/W8A32 benchmark correctness preflight failed\n", stderr);
-        return 1;
     }
-    return 0;
+    vx_kernels_shutdown();
+    vx_kernel_thread_pool_scope_leave(scope);
+    vx_kernel_thread_pool_destroy(pool);
+    return result ? 1 : 0;
 }

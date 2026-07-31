@@ -20,7 +20,7 @@ test('CPU QConv2D executes canonical NHWC/OHWI W8A8 with per-output weight scale
       quantization: { scheme: 'per_tensor', scale: 0.25, zero_point: 0 },
     },
   }, { weight_layout: 'OHWI', data_layout: 'NHWC' });
-  graph.outputNames = [out.name];
+  graph.setOutputs([out.name]);
   const engine = new CPUEngine();
   engine.allocateGraph(graph);
   const result = await engine.execute({ input: Int8Array.of(2, 4, 6, 8, 10, 12, 14, 16) });
@@ -43,7 +43,7 @@ test('CPU QConv2D applies quantized ReLU at the output descriptor zero point', a
       quantization: { scheme: 'per_tensor', scale: 0.25, zero_point: 0 },
     },
   }, { weight_layout: 'OHWI', data_layout: 'NHWC', relu: 1 });
-  graph.outputNames = [out.name];
+  graph.setOutputs([out.name]);
   const engine = new CPUEngine();
   engine.allocateGraph(graph);
   const result = await engine.execute({ input: Int8Array.of(-4, 4) });
@@ -87,7 +87,7 @@ test('CPU QConv2D maps an overflowing zero accumulator to its output zero point'
       quantization: { scheme: 'per_tensor', scale: 1, zero_point: -7 },
     },
   }, { weight_layout: 'OHWI', data_layout: 'NHWC' });
-  graph.outputNames = [out.name];
+  graph.setOutputs([out.name]);
 
   const engine = new CPUEngine();
   engine.allocateGraph(graph);

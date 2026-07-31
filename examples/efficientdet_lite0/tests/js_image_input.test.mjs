@@ -56,5 +56,8 @@ test('EfficientDet image input rejects malformed typed image contracts', () => {
 test('EfficientDet browser demo exposes WebGPU through public backend selection', async () => {
   const html = await readFile(new URL('../../efficientdet_lite0.html', import.meta.url), 'utf8');
   assert.match(html, /<option value="webgpu">WebGPU<\/option>/);
-  assert.match(html, /VolvoxAI\.init\(backend, '\.\.\/dist\/0\.2\.0\/volvoxai\.wasm'\)/);
+  assert.match(html, /VolvoxAI\.createRuntime\(\{/);
+  assert.match(html, /model\.compile\(\{/);
+  assert.match(html, /compiled\.createContext\(\)/);
+  assert.match(html, /result\.output\('scores'\)\.read\(\)/);
 });

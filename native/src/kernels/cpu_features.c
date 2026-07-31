@@ -36,8 +36,16 @@ static uint64_t vx_cpu_xgetbv0(void) {
 }
 #endif
 
+/* CPUID is serializing and, under a hypervisor, traps to the VMM.  Kernels ask
+ * these questions on every dispatch, so each answer is decided once and then
+ * read from memory.  The probes are pure functions of the CPU, so a benign race
+ * between first callers computes the same value twice and stores it twice. */
+#define VX_CPU_FEATURE_UNKNOWN (-1)
+
 int vx_cpu_has_avx2(void) {
 #if VX_CPU_X86_RUNTIME_QUERY
+    /* __builtin_cpu_supports already reads a resolved global, so this only
+     * needs the one-time __builtin_cpu_init. */
     __builtin_cpu_init();
     return __builtin_cpu_supports("avx2");
 #else
@@ -45,7 +53,7 @@ int vx_cpu_has_avx2(void) {
 #endif
 }
 
-int vx_cpu_has_avx_vnni(void) {
+static int vx_cpu_probe_avx_vnni(void) {
 #if VX_CPU_X86_RUNTIME_QUERY
     unsigned int eax, ebx, ecx, edx;
     if (!vx_cpu_has_avx2() || (unsigned int)__get_cpuid_max(0, 0) < 7u) return 0;
@@ -58,7 +66,17 @@ int vx_cpu_has_avx_vnni(void) {
 #endif
 }
 
-int vx_cpu_has_avx512_vnni(void) {
+int vx_cpu_has_avx_vnni(void) {
+    static int cached = VX_CPU_FEATURE_UNKNOWN;
+    int value = cached;
+    if (value == VX_CPU_FEATURE_UNKNOWN) {
+        value = vx_cpu_probe_avx_vnni();
+        cached = value;
+    }
+    return value;
+}
+
+static int vx_cpu_probe_avx512_vnni(void) {
 #if VX_CPU_X86_RUNTIME_QUERY
     unsigned int eax, ebx, ecx, edx;
     const unsigned int required_ebx = (1u << 5u) |  /* AVX2 */
@@ -83,7 +101,17 @@ int vx_cpu_has_avx512_vnni(void) {
 #endif
 }
 
-int vx_cpu_has_neon(void) {
+int vx_cpu_has_avx512_vnni(void) {
+    static int cached = VX_CPU_FEATURE_UNKNOWN;
+    int value = cached;
+    if (value == VX_CPU_FEATURE_UNKNOWN) {
+        value = vx_cpu_probe_avx512_vnni();
+        cached = value;
+    }
+    return value;
+}
+
+static int vx_cpu_probe_neon(void) {
 #if VX_CPU_ARM_RUNTIME_QUERY
     return (getauxval(AT_HWCAP) & HWCAP_ASIMD) != 0;
 #elif defined(__ARM_NEON) || defined(__ARM_NEON__)
@@ -93,7 +121,17 @@ int vx_cpu_has_neon(void) {
 #endif
 }
 
-int vx_cpu_has_arm_dotprod(void) {
+int vx_cpu_has_neon(void) {
+    static int cached = VX_CPU_FEATURE_UNKNOWN;
+    int value = cached;
+    if (value == VX_CPU_FEATURE_UNKNOWN) {
+        value = vx_cpu_probe_neon();
+        cached = value;
+    }
+    return value;
+}
+
+static int vx_cpu_probe_arm_dotprod(void) {
 #if VX_CPU_ARM_RUNTIME_QUERY
     return (getauxval(AT_HWCAP) & HWCAP_ASIMDDP) != 0;
 #elif defined(__ARM_FEATURE_DOTPROD)
@@ -101,4 +139,14 @@ int vx_cpu_has_arm_dotprod(void) {
 #else
     return 0;
 #endif
+}
+
+int vx_cpu_has_arm_dotprod(void) {
+    static int cached = VX_CPU_FEATURE_UNKNOWN;
+    int value = cached;
+    if (value == VX_CPU_FEATURE_UNKNOWN) {
+        value = vx_cpu_probe_arm_dotprod();
+        cached = value;
+    }
+    return value;
 }

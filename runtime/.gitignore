@@ -1,2 +1,7 @@
 # Cargo build output
 /target
+
+# Stray nested target dirs from a build launched while cwd was already inside
+# runtime/ (produces runtime/runtime/target/ instead of runtime/target/).
+target/
+/runtime/

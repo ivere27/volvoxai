@@ -146,7 +146,7 @@ label(48, ny+26, "Key structural features", fs=13.5, color="#0f172a", anchor="st
 notes = [
     "•  Every Linear is LoRA-split in the graph:  y = base(x) + B(A(x))  (rank 8)  —  base + lora_a + lora_b + Add.  This is why there are 121 QLinear / 55 QAdd nodes.",
     "•  A hard router picks one of 8 family graphs (phone / address / store / item_row / item_math / item_lookup / math / other); each bakes in its own task adapter.",
-    "•  All compute is W8A8: int8 weights (symmetric per-output-channel) + int8 activations; each edge carries its own scale (outputs_quantization).",
+    "•  All compute is W8A8: int8 weights (symmetric per-output-channel) + int8 activations; central refs bind every edge to safetensors scale/zero-point tensors.",
     "•  Stages ①② (image+question → memory, 156 nodes) depend only on inputs; the autoregressive loop currently re-runs the whole graph per token → caching target.",
 ]
 yy = ny+46

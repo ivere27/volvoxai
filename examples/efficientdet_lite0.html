@@ -218,7 +218,7 @@
   <pre id="out"></pre>
 
   <script type="module">
-    import { VolvoxAI } from '../dist/0.2.0/volvoxai.js';
+    import { Graph, GraphLoader, VolvoxAI } from '../dist/0.3.0/volvoxai.js';
     import { efficientDetInputFromRgba } from './efficientdet_lite0/image_input.js';
 
     const MODEL = '../models/efficientdet_lite0_int8/model.safetensors';
@@ -250,8 +250,10 @@
     inputCanvas.height = H;
     const inputCtx = inputCanvas.getContext('2d', { willReadFrequently: true });
 
-    let app = null;
-    let exec = null;
+    let runtime = null;
+    let model = null;
+    let compiled = null;
+    let context = null;
     let graph = null;
     let inputTensor = null;
     let labels = [];
@@ -318,16 +320,28 @@
       const backend = backendEl.value;
       runEl.disabled = true;
       setStatus(`Loading ${backend} backend...`);
-      app = await VolvoxAI.init(backend, '../dist/0.2.0/volvoxai.wasm');
+      await context?.close();
+      await compiled?.close();
+      await model?.close();
+      await runtime?.close();
+      context = null;
+      compiled = null;
+      model = null;
+      runtime = await VolvoxAI.createRuntime({
+        backends: [backend],
+        wasmUrl: '../dist/0.3.0/volvoxai.wasm',
+      });
       setStatus('Loading graph...');
-      graph = await app.loadGraph(MODEL);
+      graph = new Graph();
+      await GraphLoader.load(graph, MODEL);
       inputTensor = graph.getTensor('input0');
       if (!inputTensor?.isInput) throw new Error('model is missing image input tensor input0');
-      exec = await app.compile(graph);
-      const cn = exec.constructor.name;
-      const used = exec.backendName ||
-        (/Wasm/.test(cn) ? 'wasm' : /GraphExecutor|WebGPU/.test(cn) ? 'webgpu' : /WebNN/.test(cn) ? 'webnn' : 'cpu');
-      metricBackend.textContent = used;
+      model = runtime.createModel(graph);
+      compiled = await model.compile({
+        backend: { mode: 'require', backend, operatorFallback: 'forbid' },
+      });
+      context = await compiled.createContext();
+      metricBackend.textContent = compiled.backend;
       runEl.disabled = !hasFrame;
       setStatus('Ready');
     }
@@ -484,14 +498,21 @@
     }
 
     async function runOnce() {
-      if (!exec || !hasFrame) return [];
+      if (!context || !hasFrame) return [];
       const input0 = tensorFromSource();
       const t0 = performance.now();
-      const result = await exec.execute({ input0 });
+      const result = await context.execute({ input0 });
+      let scores;
+      let boxes;
+      try {
+        [scores, boxes] = await Promise.all([
+          result.output('scores').read(),
+          result.output('boxes').read(),
+        ]);
+      } finally {
+        await result.close();
+      }
       lastForwardMs = performance.now() - t0;
-      const scores = result.scores;
-      const boxes = result.boxes;
-      if (!scores || !boxes) throw new Error(`missing output tensors: ${Object.keys(result).join(', ')}`);
       lastDetections = decodeDetections(scores, boxes);
       renderRows(lastDetections);
       metricTime.textContent = `${lastForwardMs.toFixed(0)} ms`;
@@ -502,7 +523,7 @@
     }
 
     async function runStatic() {
-      if (!exec || !hasFrame) return;
+      if (!context || !hasFrame) return;
       runEl.disabled = true;
       setStatus('Running...');
       await runOnce();
@@ -513,7 +534,7 @@
 
     async function inferenceLoop() {
       while (live) {
-        if (exec && video.readyState >= 2) {
+        if (context && video.readyState >= 2) {
           try {
             await runOnce();
             setStatus(`Live ${lastForwardMs.toFixed(0)} ms`);
@@ -565,7 +586,7 @@
         hasFrame = true;
         lastDetections = [];
         drawSource();
-        runEl.disabled = !exec;
+        runEl.disabled = !context;
         setStatus('Ready');
       };
       img.onerror = () => fail(new Error('image decode failed'));
@@ -583,7 +604,7 @@
           hasFrame = true;
           lastDetections = [];
           drawSource();
-          runEl.disabled = !exec;
+          runEl.disabled = !context;
           setStatus('Ready');
           resolve();
         };
@@ -618,6 +639,14 @@
 
     runEl.addEventListener('click', () => runStatic().catch(fail));
     backendEl.addEventListener('change', () => loadBackend().catch(fail));
+    window.addEventListener('pagehide', () => {
+      void (async () => {
+        await context?.close();
+        await compiled?.close();
+        await model?.close();
+        await runtime?.close();
+      })();
+    }, { once: true });
 
     async function main() {
       clearCanvas();

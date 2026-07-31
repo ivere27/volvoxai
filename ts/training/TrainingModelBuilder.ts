@@ -60,7 +60,7 @@ export class TrainingModelBuilder extends ModelBuilder {
     const options: TrainableWeightOptions = ArrayBuffer.isView(dataOrOptions) || dataOrOptions instanceof ArrayBuffer
       ? { buffer: dataOrOptions }
       : { ...(dataOrOptions || {}) };
-    if (options.buffer == null && options.data == null && options.initializer != null) {
+    if (options.buffer == null && options.initializer != null) {
       options.buffer = initializeTensor(shape, dtype, options.initializer);
     }
     delete options.initializer;

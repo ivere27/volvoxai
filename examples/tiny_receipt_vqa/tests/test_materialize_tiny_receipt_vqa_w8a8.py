@@ -7,6 +7,11 @@ from pathlib import Path
 
 import numpy as np
 
+from tools.exporter.quantization_storage import (
+    QUANTIZATION_FORMAT,
+    validate_external_quantization,
+)
+
 
 EXAMPLE_ROOT = Path(__file__).resolve().parents[1]
 TOOLS = EXAMPLE_ROOT / "tools"
@@ -98,12 +103,47 @@ class TinyReleaseFixture:
         return self
 
 
-def assert_no_implicit_inputs(test: unittest.TestCase, config: dict, weight_names: set[str]):
-    available = set(config["inputs"]) | set(weight_names)
-    for node in config["nodes"]:
+def assert_no_implicit_inputs(test: unittest.TestCase, graph: dict, weight_names: set[str]):
+    available = set(graph["inputs"]) | set(weight_names)
+    for node in graph["nodes"]:
         for input_name in node["inputs"].values():
             test.assertIn(input_name, available, f"{node['id']} references implicit input {input_name}")
         available.update(node["outputs"].values())
+
+
+def referenced_i8_weights(graph: dict, weights: dict[str, np.ndarray]) -> set[str]:
+    table = graph.get("quantization", {}).get("tensors", {})
+    parameters = {
+        descriptor[key]
+        for descriptor in table.values()
+        for key in ("scale_tensor", "zero_point_tensor")
+    }
+    return {
+        name
+        for node in graph["nodes"]
+        for name in node["inputs"].values()
+        if (
+            name not in parameters
+            and name in weights
+            and weights[name].dtype == np.dtype(np.int8)
+        )
+    }
+
+
+def load_scoped_weights(root: Path, record: dict) -> dict[str, np.ndarray]:
+    paths = record.get("weight_files")
+    if not isinstance(paths, list) or not paths:
+        raise AssertionError("graph record requires non-empty weight_files")
+    merged: dict[str, np.ndarray] = {}
+    for relative in paths:
+        if not isinstance(relative, str) or not relative:
+            raise AssertionError("weight_files entries must be non-empty strings")
+        shard = load_file(str(root / relative))
+        duplicates = set(merged).intersection(shard)
+        if duplicates:
+            raise AssertionError(f"scoped weight files overlap: {sorted(duplicates)!r}")
+        merged.update(shard)
+    return merged
 
 
 class TinyReceiptMaterializerTests(unittest.TestCase):
@@ -149,7 +189,14 @@ class TinyReceiptMaterializerTests(unittest.TestCase):
         manifest = json.loads(alternate.manifest_path.read_text(encoding="utf-8"))
         manifest["format"] = materializer.VOLVOX_TRAINED_SOURCE_FORMAT
         manifest["runtime"] = materializer.VOLVOX_TRAINED_SOURCE_RUNTIME
+        manifest["safetensors"]["layout"] = materializer.VOLVOX_TRAINED_SOURCE_LAYOUT
+        for key, (dtype, shape) in alternate.expected.items():
+            if dtype == np.dtype(np.int8):
+                alternate.named[f"quantized.{key}.zero_point"] = np.zeros(
+                    (shape[0],), dtype=np.int8
+                )
         alternate.manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+        save_file(alternate.named, str(alternate.weights_path))
 
         release = materializer.load_release(alternate.manifest_path)
         self.assertEqual(release.dimensions.stem_channels, (2, 3, 4, 4, 4))
@@ -162,12 +209,12 @@ class TinyReceiptMaterializerTests(unittest.TestCase):
         weights = load_file(str(result.weights_path))
         self.assertEqual(weights["w.stem.0.net.0.weight"].shape, (2, 3, 3, 1))
 
-    def test_rejects_scale_companion_name_collisions(self):
+    def test_rejects_quantization_parameter_name_collisions(self):
         release = materializer.load_release(self.fixture.manifest_path)
         occupied = materializer.WeightBuilder(release)
         occupied._insert("collision_scale", np.ones((2,), dtype=np.float32))
         occupied._insert("collision", np.ones((2, 2), dtype=np.int8))
-        with self.assertRaisesRegex(materializer.MaterializationError, "scale companion.*collides"):
+        with self.assertRaisesRegex(materializer.MaterializationError, "quantization parameter.*collides"):
             occupied._register_per_axis_quantization(
                 "collision", np.asarray([0.25, 0.5], dtype=np.float32)
             )
@@ -177,7 +224,7 @@ class TinyReceiptMaterializerTests(unittest.TestCase):
         reserved._register_per_axis_quantization(
             "collision", np.asarray([0.25, 0.5], dtype=np.float32)
         )
-        with self.assertRaisesRegex(materializer.MaterializationError, "collides with the scale companion"):
+        with self.assertRaisesRegex(materializer.MaterializationError, "collides with a quantization parameter"):
             reserved._insert("collision_scale", np.ones((2,), dtype=np.float32))
 
     def test_materializes_complete_typed_router_and_eight_family_graphs(self):
@@ -189,10 +236,22 @@ class TinyReceiptMaterializerTests(unittest.TestCase):
         package = json.loads(result.package_manifest_path.read_text(encoding="utf-8"))
         self.assertEqual(package["format"], materializer.PACKAGE_FORMAT)
         self.assertEqual(package["weights"]["file"], "model.safetensors")
+        self.assertEqual(
+            package["router"]["weight_files"],
+            [f"{materializer.SCOPED_WEIGHTS_DIR}/router.safetensors"],
+        )
         self.assertEqual(package["router"]["inputs"], {"q_ids": "q_ids", "router_keep": "router_keep"})
         self.assertEqual(package["vocab"]["token_ids"], {"pad": 0, "bos": 1, "eos": 2, "unk": 3})
         self.assertEqual(package["family_order"], list(materializer.FAMILY_ORDER))
         self.assertEqual(set(package["explicit_families"]), set(materializer.FAMILY_ORDER))
+        for family in materializer.FAMILY_ORDER:
+            self.assertEqual(
+                package["explicit_families"][family]["weight_files"],
+                [
+                    f"{materializer.SCOPED_WEIGHTS_DIR}/common.safetensors",
+                    f"{materializer.SCOPED_WEIGHTS_DIR}/explicit_family_{family}.safetensors",
+                ],
+            )
         self.assertEqual(
             package["explicit_families"]["phone"]["interface"]["inputs"],
             {"image": "image", "q_ids": "q_ids", "router_keep": "router_keep", "memory_keep": "memory_keep", "y_ids": "y_ids", "y_keep": "y_keep"},
@@ -203,16 +262,34 @@ class TinyReceiptMaterializerTests(unittest.TestCase):
         with safe_open(str(result.weights_path), framework="numpy") as handle:
             weights_metadata = handle.metadata() or {}
         self.assertEqual(weights_metadata["format"], materializer.WEIGHTS_FORMAT)
-        self.assertEqual(
-            weights_metadata["weights_quantization_storage"],
-            materializer.WEIGHT_SCALE_STORAGE_FORMAT,
-        )
-        serialized_descriptors = weights_metadata["weights_quantization"]
-        descriptors = json.loads(serialized_descriptors)
-        self.assertEqual(
-            serialized_descriptors,
-            json.dumps(descriptors, sort_keys=True, separators=(",", ":")),
-        )
+        self.assertNotIn("weights_quantization_storage", weights_metadata)
+        self.assertNotIn("weights_quantization", weights_metadata)
+        scoped_metadata = {
+            f"{materializer.SCOPED_WEIGHTS_DIR}/router.safetensors": "router",
+            f"{materializer.SCOPED_WEIGHTS_DIR}/common.safetensors":
+                "explicit-family-common",
+            **{
+                f"{materializer.SCOPED_WEIGHTS_DIR}/explicit_family_{family}.safetensors":
+                    f"explicit-family:{family}"
+                for family in materializer.FAMILY_ORDER
+            },
+        }
+        for relative_path, scope in scoped_metadata.items():
+            with safe_open(str(out_dir / relative_path), framework="numpy") as handle:
+                self.assertEqual(
+                    handle.metadata() or {},
+                    {**weights_metadata, "scope": scope},
+                )
+        common_names = set(load_file(
+            str(out_dir / materializer.SCOPED_WEIGHTS_DIR / "common.safetensors")
+        ))
+        for family in materializer.FAMILY_ORDER:
+            family_only_names = set(load_file(str(
+                out_dir
+                / materializer.SCOPED_WEIGHTS_DIR
+                / f"explicit_family_{family}.safetensors"
+            )))
+            self.assertTrue(common_names.isdisjoint(family_only_names), family)
         source_conv = self.fixture.named["quantized.stem.0.net.0.weight"]
         self.assertTrue(np.array_equal(weights["w.stem.0.net.0.weight"], np.transpose(source_conv, (0, 2, 3, 1))))
         source_mha = self.fixture.named["quantized.encoder.layers.0.self_attn.in_proj_weight"]
@@ -226,51 +303,53 @@ class TinyReceiptMaterializerTests(unittest.TestCase):
         self.assertEqual(weights["b.family_phone.decoder.head.i32"].tolist(), [2] * 7)
         self.assertEqual(weights["c.img_pos"].dtype, np.dtype(np.int8))
 
-        router = json.loads(result.router_config_path.read_text(encoding="utf-8"))
-        phone_path = out_dir / package["explicit_families"]["phone"]["config"]
+        router = json.loads(result.router_graph_path.read_text(encoding="utf-8"))
+        phone_path = out_dir / package["explicit_families"]["phone"]["graph"]
         phone = json.loads(phone_path.read_text(encoding="utf-8"))
-        for config, terminal in ((router, "router_family"), (phone, "token_ids")):
-            self.assertEqual(config["format"], materializer.W8A8_BLUEPRINT_FORMAT)
-            self.assertEqual(config["outputs"], [terminal])
-            self.assertEqual(config["output_contract"]["name"], terminal)
-            self.assertTrue(config["activation_edge_bindings"])
-            self.assertEqual(config["weights_quantization_storage"], {
-                "format": weights_metadata["weights_quantization_storage"],
-            })
-            self.assertNotIn("weights_quantization", config)
-            referenced_i8_weights = {
-                name
-                for node in config["nodes"]
-                for name in node["inputs"].values()
-                if name in weights and weights[name].dtype == np.dtype(np.int8)
-            }
-            self.assertLessEqual(referenced_i8_weights, set(descriptors))
-            for node in config["nodes"]:
+        router_scoped = load_scoped_weights(out_dir, package["router"])
+        phone_scoped = load_scoped_weights(
+            out_dir, package["explicit_families"]["phone"]
+        )
+        self.assertEqual(
+            set(router_scoped), materializer._graph_weight_names(router, weights)
+        )
+        self.assertEqual(
+            set(phone_scoped), materializer._graph_weight_names(phone, weights)
+        )
+        validate_external_quantization(router, router_scoped)
+        validate_external_quantization(phone, phone_scoped)
+        assert_no_implicit_inputs(self, router, set(router_scoped))
+        assert_no_implicit_inputs(self, phone, set(phone_scoped))
+        for graph, terminal in ((router, "router_family"), (phone, "token_ids")):
+            self.assertEqual(graph["format"], materializer.GRAPH_FORMAT)
+            self.assertEqual(graph["graph_profile"], materializer.W8A8_GRAPH_PROFILE)
+            self.assertEqual(graph["outputs"], [terminal])
+            self.assertEqual(graph["output_contract"]["name"], terminal)
+            self.assertTrue(graph["activation_edge_bindings"])
+            self.assertEqual(graph["quantization"]["format"], QUANTIZATION_FORMAT)
+            self.assertNotIn("weights_quantization", graph)
+            self.assertNotIn("weights_quantization_storage", graph)
+            resolved = validate_external_quantization(graph, weights)
+            referenced_weights = referenced_i8_weights(graph, weights)
+            self.assertLessEqual(referenced_weights, set(resolved))
+            for node in graph["nodes"]:
                 if node["opType"] == "QArgMax":
                     self.assertEqual(node["outputs_dtype"]["out"], "int32")
                 else:
                     self.assertEqual(node["outputs_dtype"]["out"], "int8")
-                    self.assertEqual(node["outputs_quantization"]["out"]["scheme"], "per_tensor")
-                    self.assertEqual(node["outputs_quantization"]["out"]["zero_point"], 0)
-            assert_no_implicit_inputs(self, config, set(weights))
+                    descriptor = resolved[node["outputs"]["out"]]
+                    self.assertEqual(descriptor.scheme, "per_tensor")
+                    self.assertEqual(descriptor.zero_points.tolist(), [0])
+                    self.assertNotIn("outputs_quantization", node)
+            assert_no_implicit_inputs(self, graph, set(weights))
         self.assertEqual(phone["inputs"]["image"]["dtype"], "float32")
         self.assertEqual(phone["nodes"][0]["opType"], "QuantizeLinear")
         self.assertEqual(phone["nodes"][-1]["opType"], "QArgMax")
         self.assertEqual(phone["nodes"][-1]["outputs"]["out"], "token_ids")
         self.assertEqual(phone["nodes"][-2]["inputs"]["weight"], "w.tok.weight")
 
-        router_i8_weights = {
-            name
-            for node in router["nodes"]
-            for name in node["inputs"].values()
-            if name in weights and weights[name].dtype == np.dtype(np.int8)
-        }
-        phone_i8_weights = {
-            name
-            for node in phone["nodes"]
-            for name in node["inputs"].values()
-            if name in weights and weights[name].dtype == np.dtype(np.int8)
-        }
+        router_i8_weights = referenced_i8_weights(router, weights)
+        phone_i8_weights = referenced_i8_weights(phone, weights)
         self.assertEqual(router_i8_weights, {
             "c.q_pos",
             "c.q_type",
@@ -281,49 +360,47 @@ class TinyReceiptMaterializerTests(unittest.TestCase):
         self.assertIn("w.memory_adapters.0.down.weight", phone_i8_weights)
         self.assertNotIn("w.memory_adapters.1.down.weight", phone_i8_weights)
 
-        all_configs = [router] + [
+        all_graphs = [router] + [
             json.loads(path.read_text(encoding="utf-8"))
-            for path in result.explicit_config_paths
+            for path in result.explicit_graph_paths
         ]
-        all_referenced_i8_weights = {
+        all_scoped_names = set(router_scoped)
+        for family, graph in zip(materializer.FAMILY_ORDER, all_graphs[1:]):
+            scoped = load_scoped_weights(
+                out_dir, package["explicit_families"][family]
+            )
+            self.assertEqual(
+                set(scoped), materializer._graph_weight_names(graph, weights)
+            )
+            validate_external_quantization(graph, scoped)
+            assert_no_implicit_inputs(self, graph, set(scoped))
+            all_scoped_names.update(scoped)
+        self.assertEqual(all_scoped_names, set(weights))
+        all_referenced_i8_weights = set().union(
+            *(referenced_i8_weights(graph, weights) for graph in all_graphs)
+        )
+        graph_tables = [graph["quantization"]["tensors"] for graph in all_graphs]
+        declared_i8_weights = {
             name
-            for config in all_configs
-            for node in config["nodes"]
-            for name in node["inputs"].values()
+            for table in graph_tables
+            for name in table
             if name in weights and weights[name].dtype == np.dtype(np.int8)
         }
-        self.assertEqual(set(descriptors), all_referenced_i8_weights)
-        for descriptor in descriptors.values():
-            self.assertNotIn("zero_point", descriptor)
-            self.assertNotIn("zero_points", descriptor)
-            self.assertNotIn("scales", descriptor)
-            if descriptor["scheme"] == "per_axis":
-                self.assertEqual(set(descriptor), {"scheme", "axis"})
-            else:
-                self.assertEqual(descriptor["scheme"], "per_tensor")
-                self.assertEqual(set(descriptor), {"scheme"})
-        per_axis = {
-            name: descriptor
-            for name, descriptor in descriptors.items()
-            if descriptor["scheme"] == "per_axis"
-        }
-        quantized_weights = {
-            name for name, values in weights.items()
-            if values.dtype == np.dtype(np.int8)
-        }
-        self.assertEqual(set(descriptors), quantized_weights)
-        for name, descriptor in descriptors.items():
-            companion = weights[f"{name}_scale"]
-            self.assertEqual(companion.dtype, np.dtype(np.float32), name)
-            expected_count = (
-                weights[name].shape[descriptor["axis"]]
-                if descriptor["scheme"] == "per_axis" else 1
-            )
-            self.assertEqual(companion.shape, (expected_count,), name)
-            self.assertTrue(np.all(np.isfinite(companion)), name)
-            self.assertTrue(np.all(companion > 0), name)
+        self.assertEqual(declared_i8_weights, all_referenced_i8_weights)
+        for graph in all_graphs:
+            table = graph["quantization"]["tensors"]
+            resolved = validate_external_quantization(graph, weights)
+            for name, descriptor in table.items():
+                allowed = {"scheme", "scale_tensor", "zero_point_tensor"}
+                if descriptor["scheme"] == "per_axis":
+                    allowed.add("axis")
+                self.assertEqual(set(descriptor), allowed)
+                self.assertIn(name, resolved)
+                self.assertEqual(weights[descriptor["scale_tensor"]].dtype, np.dtype(np.float32))
+                target_dtype = weights[name].dtype if name in weights else np.dtype(np.int8)
+                self.assertEqual(weights[descriptor["zero_point_tensor"]].dtype, target_dtype)
 
-        expected_scale_companions = {
+        expected_scale_tensors = {
             "w.tok.weight": self.fixture.named["scale.tok.weight"],
             "w.stem.0.net.0.weight": self.fixture.named["scale.stem.0.net.0.weight"],
             "w.encoder.layers.0.self_attn.q.weight":
@@ -334,13 +411,14 @@ class TinyReceiptMaterializerTests(unittest.TestCase):
                 dtype=np.float32,
             ),
         }
-        for name, expected_scales in expected_scale_companions.items():
-            self.assertIn(name, per_axis)
+        for name, expected_scales in expected_scale_tensors.items():
+            self.assertIn(name, declared_i8_weights)
             self.assertTrue(np.array_equal(weights[f"{name}_scale"], expected_scales), name)
         q_pos_scale, _ = materializer.derive_static_constant_i8_scale(
             self.fixture.named["float32.q_pos"]
         )
-        self.assertEqual(descriptors["c.q_pos"], {"scheme": "per_tensor"})
+        q_pos_descriptor = router["quantization"]["tensors"]["c.q_pos"]
+        self.assertEqual(q_pos_descriptor["scheme"], "per_tensor")
         self.assertTrue(np.array_equal(
             weights["c.q_pos_scale"], np.asarray([q_pos_scale], dtype=np.float32)
         ))
@@ -363,25 +441,24 @@ class TinyReceiptMaterializerTests(unittest.TestCase):
             "selection_time": "package_materialization",
         })
         self.assertEqual(package["activation_scale_profile"]["scope"], "router_only")
+        self.assertEqual(
+            package["router"]["weight_files"],
+            [f"{materializer.SCOPED_WEIGHTS_DIR}/router.safetensors"],
+        )
+        self.assertEqual(
+            package["explicit_families"]["phone"]["weight_files"],
+            [
+                f"{materializer.SCOPED_WEIGHTS_DIR}/common.safetensors",
+                f"{materializer.SCOPED_WEIGHTS_DIR}/explicit_family_phone.safetensors",
+            ],
+        )
 
         weights = load_file(str(result.weights_path))
         with safe_open(str(result.weights_path), framework="numpy") as handle:
             weights_metadata = handle.metadata() or {}
         self.assertEqual(weights_metadata["format"], materializer.W8A32_WEIGHTS_FORMAT)
-        self.assertEqual(
-            weights_metadata["weights_quantization_storage"],
-            materializer.WEIGHT_SCALE_STORAGE_FORMAT,
-        )
-        serialized_descriptors = weights_metadata["weights_quantization"]
-        descriptors = json.loads(serialized_descriptors)
-        self.assertEqual(
-            serialized_descriptors,
-            json.dumps(descriptors, sort_keys=True, separators=(",", ":")),
-        )
-        self.assertEqual(
-            set(descriptors),
-            {name for name, values in weights.items() if values.dtype == np.dtype(np.int8)},
-        )
+        self.assertNotIn("weights_quantization_storage", weights_metadata)
+        self.assertNotIn("weights_quantization", weights_metadata)
         self.assertEqual(weights["f.tok.embedding"].dtype, np.dtype(np.float32))
         expected_embedding = (
             self.fixture.named["quantized.tok.weight"].astype(np.float32)
@@ -397,17 +474,30 @@ class TinyReceiptMaterializerTests(unittest.TestCase):
         # source value at the deliberately chosen 1.5-accumulator boundary.
         self.assertEqual(weights["b.f32.tok.weight"].tolist(), [0.046875] * 7)
 
-        router = json.loads(result.router_config_path.read_text(encoding="utf-8"))
-        phone = json.loads((out_dir / "explicit_family_phone_config.json").read_text(encoding="utf-8"))
-        self.assertEqual(router["format"], materializer.W8A8_BLUEPRINT_FORMAT)
-        self.assertEqual(router["weights_quantization_storage"], {
-            "format": weights_metadata["weights_quantization_storage"],
-        })
+        router = json.loads(result.router_graph_path.read_text(encoding="utf-8"))
+        phone = json.loads((out_dir / "explicit_family_phone.graph.json").read_text(encoding="utf-8"))
+        self.assertEqual(router["format"], materializer.GRAPH_FORMAT)
+        self.assertEqual(router["graph_profile"], materializer.W8A8_GRAPH_PROFILE)
+        self.assertEqual(router["quantization"]["format"], QUANTIZATION_FORMAT)
         self.assertNotIn("weights_quantization", router)
+        self.assertNotIn("weights_quantization_storage", router)
+        validate_external_quantization(router, weights)
+        validate_external_quantization(
+            router, load_scoped_weights(out_dir, package["router"])
+        )
         self.assertTrue(any(node["opType"] == "QLinear" for node in router["nodes"]))
-        self.assertEqual(phone["format"], materializer.W8A32_BLUEPRINT_FORMAT)
+        self.assertEqual(phone["format"], materializer.GRAPH_FORMAT)
+        self.assertEqual(phone["graph_profile"], materializer.W8A32_GRAPH_PROFILE)
         self.assertNotIn("weights_quantization_storage", phone)
         self.assertNotIn("weights_quantization", phone)
+        self.assertEqual(phone["quantization"]["format"], QUANTIZATION_FORMAT)
+        validate_external_quantization(phone, weights)
+        validate_external_quantization(
+            phone,
+            load_scoped_weights(
+                out_dir, package["explicit_families"]["phone"]
+            ),
+        )
         self.assertEqual(phone["activation_edge_bindings"], [])
         self.assertFalse(any(node["opType"] == "QuantizeLinear" for node in phone["nodes"]))
         self.assertFalse(any(node["opType"] in {

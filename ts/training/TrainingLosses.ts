@@ -50,7 +50,7 @@ function finiteNonNegative(value: unknown, label: string, fallback: number | nul
   return resolved;
 }
 
-/** Normalize the legacy single-CE fields and the generic weighted loss list. */
+/** Normalize the single-loss shorthand and the generic weighted loss list. */
 export function normalizeCrossEntropyLosses(
   options: CrossEntropyTrainingOptions = {},
   defaultLogitsTensor: string | null = null,
@@ -63,7 +63,7 @@ export function normalizeCrossEntropyLosses(
     throw new Error("trainStep losses must not be empty.");
   }
   if (explicit?.length && options.targets != null) {
-    throw new Error("trainStep accepts either losses or the legacy targets fields, not both.");
+    throw new Error("trainStep accepts either losses or the single-loss target fields, not both.");
   }
   const source = explicit != null
     ? explicit

@@ -1,7 +1,7 @@
 #ifndef VOLVOXAI_BACKEND_MANAGER_H
 #define VOLVOXAI_BACKEND_MANAGER_H
 
-#include "volvoxai.h"
+#include "engine_core.h"
 
 int vx_backend_manager_activate(VolvoxAIEngineBackend backend);
 void vx_backend_manager_deactivate(void);

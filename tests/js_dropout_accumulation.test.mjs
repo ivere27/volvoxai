@@ -1,8 +1,9 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
-import { CPUEngine, Graph } from '../ts/index.js';
-import { CPUAutograd } from '../ts/training/index.js';
+import { Graph } from '../ts/index.js';
+import { CPUEngine } from '../ts/backends/CPUEngine.js';
+import { CPUAutograd } from '../ts/training/CPUAutograd.js';
 import { exportModelCheckpoint } from '../ts/training/ModelCheckpoint.js';
 import { dropoutContext, dropoutMultiplier } from '../ts/ops/dropout.js';
 import {
@@ -22,8 +23,8 @@ function close(actual, expected, tolerance = 1e-6) {
   assert.ok(Math.abs(actual - expected) <= tolerance, `${actual} != ${expected}`);
 }
 
-async function trainingCrossEntropy(graph, engine, targets, context) {
-  await engine.execute({}, { training: { dropout: context } });
+async function trainingCrossEntropy(graph, targets, context) {
+  await CPUAutograd._forward(graph, {}, context);
   const logits = graph.getTensor(graph.outputNames[0]);
   const classes = logits.shape.at(-1);
   let loss = 0;
@@ -37,14 +38,14 @@ async function trainingCrossEntropy(graph, engine, targets, context) {
   return loss / targets.length;
 }
 
-async function numericTrainingGradient(graph, engine, tensorName, index, targets, context) {
+async function numericTrainingGradient(graph, tensorName, index, targets, context) {
   const tensor = graph.getTensor(tensorName);
   const value = tensor.buffer[index];
   const epsilon = 1e-3;
   tensor.buffer[index] = value + epsilon;
-  const positive = await trainingCrossEntropy(graph, engine, targets, context);
+  const positive = await trainingCrossEntropy(graph, targets, context);
   tensor.buffer[index] = value - epsilon;
-  const negative = await trainingCrossEntropy(graph, engine, targets, context);
+  const negative = await trainingCrossEntropy(graph, targets, context);
   tensor.buffer[index] = value;
   return (positive - negative) / (2 * epsilon);
 }
@@ -63,7 +64,7 @@ test('CPU Dropout is an inference identity and uses one deterministic inverted m
     params: { p: 0.5, seed: 9 },
   });
   const logits = dropoutNode.outputs.out;
-  graph.outputNames = [logits.name];
+  graph.setOutputs([logits.name]);
   const targets = [0, 1, 0, 1, 1, 0, 1, 0];
   const context = { seed: 17, counter: 23 };
   const before = new Float32Array(parameter.buffer);
@@ -104,6 +105,10 @@ test('CPU Dropout is an inference identity and uses one deterministic inverted m
 
   const engine = new CPUEngine();
   engine.allocateGraph(graph);
+  await assert.rejects(
+    engine.execute({}, { training: { dropout: context } }),
+    /does not accept training or Dropout RNG options/,
+  );
   await engine.execute({});
   assert.equal(logits.buffer, parameter.buffer, 'inference Dropout must be a zero-copy alias');
   assert.deepEqual([...logits.buffer], [...before]);
@@ -125,7 +130,7 @@ test('CPU trainStep clips one global norm over all trainables', async () => {
   const left = weight(graph, 'left', [1, 2], [0, 0]);
   const right = weight(graph, 'right', [1, 2], [0, 0]);
   const logits = graph.addOp('Add', { a: left, b: right }, { out: [1, 2] }).out;
-  graph.outputNames = [logits.name];
+  graph.setOutputs([logits.name]);
 
   const result = await CPUAutograd.trainStep(graph, {
     targets: [0],
@@ -154,16 +159,14 @@ test('CPU SDPA and CrossSDPA reuse deterministic attention-probability dropout m
     const logits = graph.addOp('SDPA', { qkv }, { out: [2, 2] }, {
       heads: 1, causal: false, dropout: 0.5, dropout_seed: 13,
     }).out;
-    graph.outputNames = [logits.name];
+    graph.setOutputs([logits.name]);
     const targets = [0, 1];
     const result = await CPUAutograd.trainStep(graph, {
       targets, trainableTensors: ['qkv'], updateMode: 'sgd',
       optimizer: { learningRate: 0 }, dropout: rng,
     });
-    const engine = new CPUEngine();
-    engine.allocateGraph(graph);
     for (let index = 0; index < qkv.buffer.length; index++) {
-      const numeric = await numericTrainingGradient(graph, engine, 'qkv', index, targets, executionContext);
+      const numeric = await numericTrainingGradient(graph, 'qkv', index, targets, executionContext);
       close(result.gradients.get('qkv')[index], numeric, 4e-4);
     }
   });
@@ -176,18 +179,16 @@ test('CPU SDPA and CrossSDPA reuse deterministic attention-probability dropout m
     const logits = graph.addOp('CrossSDPA', { q, k, v }, { out: [2, 2] }, {
       heads: 1, dropout: 0.5, dropout_seed: 13,
     }).out;
-    graph.outputNames = [logits.name];
+    graph.setOutputs([logits.name]);
     const targets = [0, 1];
     const result = await CPUAutograd.trainStep(graph, {
       targets, trainableTensors: ['q', 'k', 'v'], updateMode: 'sgd',
       optimizer: { learningRate: 0 }, dropout: rng,
     });
-    const engine = new CPUEngine();
-    engine.allocateGraph(graph);
     for (const name of ['q', 'k', 'v']) {
       const tensor = graph.getTensor(name);
       for (let index = 0; index < tensor.buffer.length; index++) {
-        const numeric = await numericTrainingGradient(graph, engine, name, index, targets, executionContext);
+        const numeric = await numericTrainingGradient(graph, name, index, targets, executionContext);
         close(result.gradients.get(name)[index], numeric, 4e-4);
       }
     }
@@ -197,7 +198,7 @@ test('CPU SDPA and CrossSDPA reuse deterministic attention-probability dropout m
 test('CPU trainStep accumulates microbatch gradients and advances the optimizer step only on apply', async () => {
   const graph = new Graph();
   const logits = weight(graph, 'logits', [1, 2], [0, 0]);
-  graph.outputNames = [logits.name];
+  graph.setOutputs([logits.name]);
   const revision = graph.weightRevision;
   const common = {
     trainableTensors: ['logits'],
@@ -229,7 +230,7 @@ test('CPU trainStep accumulates microbatch gradients and advances the optimizer 
 test('empty microbatches count toward a window without applying an empty optimizer step', async () => {
   const graph = new Graph();
   const logits = weight(graph, 'logits', [1, 2], [0, 0]);
-  graph.outputNames = [logits.name];
+  graph.setOutputs([logits.name]);
   const common = {
     trainableTensors: ['logits'],
     updateMode: 'sgd',
@@ -251,7 +252,7 @@ test('empty microbatches count toward a window without applying an empty optimiz
 
   const allEmpty = new Graph();
   const allEmptyLogits = weight(allEmpty, 'all-empty.logits', [1, 2], [0, 0]);
-  allEmpty.outputNames = [allEmptyLogits.name];
+  allEmpty.setOutputs([allEmptyLogits.name]);
   const emptyCommon = { ...common, trainableTensors: ['all-empty.logits'] };
   await CPUAutograd.trainStep(allEmpty, { ...emptyCommon, targets: [-100] });
   const completed = await CPUAutograd.trainStep(allEmpty, { ...emptyCommon, targets: [-100] });

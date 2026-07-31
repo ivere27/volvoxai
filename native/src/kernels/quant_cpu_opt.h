@@ -47,6 +47,23 @@ int vx_qconv2d_i8u8_native(const void* input, const void* weight,
                             int32_t input_zero_point, float output_scale,
                             int32_t output_zero_point, uint32_t input_dtype,
                             uint32_t weight_dtype, uint32_t output_dtype);
+int vx_qconv2d_i8u8_native_prepacked(const void* input, const void* weight,
+                            const int32_t* bias, const float* weight_scales,
+                            const int32_t* weight_zero_points, void* output,
+                            uint32_t batch, uint32_t input_height,
+                            uint32_t input_width, uint32_t input_channels,
+                            uint32_t output_height, uint32_t output_width,
+                            uint32_t output_channels, uint32_t kernel_height,
+                            uint32_t kernel_width, uint32_t input_per_group,
+                            uint32_t stride_y, uint32_t stride_x,
+                            uint32_t dilation_y, uint32_t dilation_x,
+                            uint32_t padding_top, uint32_t padding_left,
+                            uint32_t padding_bottom, uint32_t padding_right,
+                            uint32_t groups, uint32_t relu, float input_scale,
+                            int32_t input_zero_point, float output_scale,
+                            int32_t output_zero_point, uint32_t input_dtype,
+                            uint32_t weight_dtype, uint32_t output_dtype,
+                            const void* packed_qlinear_weight);
 
 /* Native-only parallel route for a QSDPA call that the runtime has already
  * validated against the canonical physical-byte ABI.  Large whole-tensor
@@ -66,6 +83,100 @@ int vx_qsdpa_i8u8_native_validated(const void* q, const void* k, const void* v,
                                    uint32_t k_dtype, uint32_t v_dtype,
                                    uint32_t output_dtype, uint32_t causal,
                                    uint32_t mask_mode);
+
+/* Native query-window route over full resident Q/K/V storage.  Query and mask
+ * strides remain the declared full sequence sizes while only the requested
+ * output rows are refreshed. */
+int vx_qsdpa_i8u8_native_range_validated(
+                                   const void* q, const void* k, const void* v,
+                                   const int32_t* mask, void* output,
+                                   uint32_t batch, uint32_t seq_q,
+                                   uint32_t seq_kv, uint32_t d_model,
+                                   uint32_t heads, float q_scale,
+                                   int32_t q_zero_point, float k_scale,
+                                   int32_t k_zero_point, float v_scale,
+                                   int32_t v_zero_point, float output_scale,
+                                   int32_t output_zero_point,
+                                   float attention_scale, uint32_t q_dtype,
+                                   uint32_t k_dtype, uint32_t v_dtype,
+                                   uint32_t output_dtype, uint32_t causal,
+                                   uint32_t mask_mode, uint32_t query_start,
+                                   uint32_t query_count);
+
+/* Native-only parallel route for a QGroupNorm call that has already passed
+ * the physical runtime descriptor validation.  Independent [batch, group]
+ * reductions retain the portable kernel's scalar arithmetic order. */
+int vx_qgroupnorm_i8u8_native_validated(
+                                   const void* input, const float* weight,
+                                   const float* bias, void* output,
+                                   uint32_t batch, uint32_t height,
+                                   uint32_t width, uint32_t channels,
+                                   uint32_t groups, float input_scale,
+                                   int32_t input_zero_point,
+                                   float output_scale,
+                                   int32_t output_zero_point, float epsilon,
+                                   uint32_t input_dtype,
+                                   uint32_t output_dtype);
+
+/* Native-only work partitioning for validated canonical QSiLU ranges and
+ * independent QLayerNorm rows.  Workers retain the portable byte kernel's
+ * exact arithmetic and requantization order. */
+int vx_qsilu_i8u8_native_validated(
+                                   const void* input, void* output,
+                                   uint32_t elements, float input_scale,
+                                   int32_t input_zero_point,
+                                   float output_scale,
+                                   int32_t output_zero_point,
+                                   uint32_t input_dtype,
+                                   uint32_t output_dtype);
+int vx_qlayernorm_i8u8_native_validated(
+                                   const void* input, const float* weight,
+                                   const float* bias, void* output,
+                                   uint32_t rows, uint32_t d_model,
+                                   float input_scale,
+                                   int32_t input_zero_point,
+                                   float output_scale,
+                                   int32_t output_zero_point, float epsilon,
+                                   uint32_t input_dtype,
+                                   uint32_t output_dtype);
+
+/* Native-only layout route for a byte Transpose call that has already passed
+ * physical descriptor validation.  Hot NHWC/NCHW and batched matrix
+ * transposes avoid the portable kernel's per-element division/modulo loop. */
+int vx_transpose_nd_i8u8_native_validated(
+                                   const uint8_t* input, uint8_t* output,
+                                   const uint32_t* input_shape,
+                                   const uint32_t* permutation,
+                                   uint32_t rank, uint32_t elements,
+                                   uint32_t dtype);
+
+/* Runtime-gated native prefixes for portable quantization primitives.  A
+ * zero return means the caller must execute its scalar implementation from
+ * that element onward. */
+uint32_t vx_quantize_linear_typed_native_prefix(
+                                   const float* input, float scale,
+                                   int zero_point, void* output,
+                                   uint32_t output_dtype, uint32_t elements,
+                                   int minimum, int maximum);
+
+/* Byte-input dequantization prefix.  Restricted to I8/U8 sources, where the
+ * vector F32 product is provably bit-identical to the portable double-precision
+ * expression; wider integer sources keep the scalar loop. */
+uint32_t vx_dequantize_linear_typed_native_prefix(
+                                   const void* input, uint32_t input_dtype,
+                                   float scale, int zero_point,
+                                   float* output, uint32_t elements);
+
+/* Returns one only when the complete exact-shape QAdd call was handled by a
+ * runtime-selected native kernel. */
+int vx_qadd_i8u8_native_try(
+                                   const void* a, const void* b, void* output,
+                                   uint32_t elements, float a_scale,
+                                   int32_t a_zero_point, float b_scale,
+                                   int32_t b_zero_point, float output_scale,
+                                   int32_t output_zero_point,
+                                   uint32_t a_dtype, uint32_t b_dtype,
+                                   uint32_t output_dtype, uint32_t relu);
 
 void vx_quantize_f32_to_i8(const float* src, signed char* dst, long n,
                            float input_scale, int input_zp, float output_scale, int output_zp);

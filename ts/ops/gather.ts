@@ -33,7 +33,8 @@ export function _cpuGather(node) {
         }
         
         let gatherIdx = indices.buffer[idxOffset];
-        if (gatherIdx < 0) {
+        if (gatherIdx < 0) gatherIdx += inShape[axis];
+        if (gatherIdx < 0 || gatherIdx >= inShape[axis]) {
             out.buffer[i] = -1;
             continue;
         }

@@ -13,6 +13,3 @@ export interface TrainingStepOptions extends CrossEntropyTrainingOptions {
   flushGradientAccumulation?: boolean;
   resetGradientAccumulation?: boolean;
 }
-
-/** Backward-compatible name retained for callers of CPUAutograd. */
-export type CPUTrainStepOptions = TrainingStepOptions;

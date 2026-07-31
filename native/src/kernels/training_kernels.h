@@ -2,6 +2,7 @@
 #define VOLVOXAI_TRAINING_KERNELS_H
 
 #include <stdint.h>
+#include "../../include/volvoxai_enums.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -44,14 +45,14 @@ enum {
     VOLVOXAI_TRAINING_WEIGHT_SCALES_PRESERVE = 1
 };
 
-/* Portable typed-storage codes. These intentionally match the forward WASM
-   ABI: F32, I32, I8, and U8. Cast and DequantizeLinear keep raw integer
-   storage through their forward path; only their gradients are F32. */
+/* Typed storage uses canonical VxDataType protobuf values. Cast and
+   DequantizeLinear keep raw integer storage through their forward path; only
+   their gradients are F32. */
 enum {
-    VOLVOXAI_TRAINING_TYPED_F32 = 0,
-    VOLVOXAI_TRAINING_TYPED_I32 = 1,
-    VOLVOXAI_TRAINING_TYPED_I8 = 2,
-    VOLVOXAI_TRAINING_TYPED_U8 = 3
+    VOLVOXAI_TRAINING_TYPED_F32 = VX_DTYPE_F32,
+    VOLVOXAI_TRAINING_TYPED_I32 = VX_DTYPE_I32,
+    VOLVOXAI_TRAINING_TYPED_I8 = VX_DTYPE_I8,
+    VOLVOXAI_TRAINING_TYPED_U8 = VX_DTYPE_U8
 };
 
 uint32_t volvoxai_training_abi_version(void);
@@ -326,8 +327,9 @@ uint32_t volvoxai_training_binary_broadcast_backward_f32(
     const uint32_t *a_shape, const uint32_t *b_shape, const uint32_t *out_shape,
     uint32_t a_rank, uint32_t b_rank, uint32_t out_rank, uint32_t elements,
     uint32_t kind);
-/* condition_type: 0=float32, 1=int32. Where is intentionally exact-shape in
-   the portable training ABI; the condition is non-differentiable. */
+/* condition_type uses the canonical protobuf DataType values VX_DTYPE_F32 and
+   VX_DTYPE_I32. Where is intentionally exact-shape in the portable training
+   ABI; the condition is non-differentiable. */
 uint32_t volvoxai_training_where_f32(
     const void *condition, const float *a, const float *b, float *output,
     uint32_t condition_type, uint32_t elements);

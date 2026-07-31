@@ -46,7 +46,7 @@ fn signed_byte(value : u32) -> i32 {
 
 fn input_value(index : u32) -> i32 {
   let byte = word_byte(input_words[index / 4u], index);
-  if (params.input_type == 2u) { return signed_byte(byte); }
+  if (params.input_type == 6u) { return signed_byte(byte); }
   return i32(byte);
 }
 

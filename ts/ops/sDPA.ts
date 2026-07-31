@@ -1,5 +1,3 @@
-import { attentionDropout, attentionProbabilityIndex } from './attentionDropout.js';
-
 function maskElementCount(shape) {
   return shape.reduce((count, dimension) => count * dimension, 1);
 }
@@ -56,8 +54,7 @@ export function _cpuAttentionMask(node, batch, queries, keys) {
 }
 
 export function _cpuSDPA(node, execution: {
-  training?: { dropout?: any };
-  nodeIndex?: number;
+  probabilityMultiplier?: (index: number) => number;
 } = {}) {
   const qkvShape = node.inputs.qkv.shape;
   const outputShape = node.outputs.out.shape;
@@ -81,7 +78,7 @@ export function _cpuSDPA(node, execution: {
   const scale = node.params.scale !== undefined ? node.params.scale : 1 / Math.sqrt(head_dim);
   const causal = node.params.causal !== false;
   const keeps = _cpuAttentionMask(node, batch, seq_len, seq_len);
-  const probabilityDropout = attentionDropout(node, execution.training?.dropout, execution.nodeIndex ?? 0);
+  const probabilityMultiplier = execution.probabilityMultiplier || (() => 1);
   for (let batchIndex = 0; batchIndex < batch; batchIndex++) {
     const qkvBase = batchIndex * seq_len * d_model * 3;
     const outputBase = batchIndex * seq_len * d_model;
@@ -122,10 +119,8 @@ export function _cpuSDPA(node, execution: {
           for (let k = 0; k < seq_len; k++) {
             if ((causal && k > q) || !keeps(batchIndex, q, k)) continue;
             const v_val = qkv[qkvBase + k * (d_model * 3) + d_model * 2 + h * head_dim + d];
-            const probabilityIndex = attentionProbabilityIndex(
-              batchIndex, h, q, k, num_heads, seq_len, seq_len,
-            );
-            out_val += (probabilities[k] / sum_exp) * probabilityDropout(probabilityIndex) * v_val;
+            const probabilityIndex = (((batchIndex * num_heads + h) * seq_len + q) * seq_len + k);
+            out_val += (probabilities[k] / sum_exp) * probabilityMultiplier(probabilityIndex) * v_val;
           }
           outBuf[outputBase + q * d_model + h * head_dim + d] = out_val;
         }

@@ -1,6 +1,7 @@
 #include "adapter_runtime_internal.h"
 #include "cJSON.h"
 #include "lora_linear.h"
+#include "runtime_state.h"
 #include "safetensors.h"
 
 #include <math.h>
@@ -61,17 +62,57 @@ typedef struct {
     int rank_workspace_count;
 } AdapterTls;
 
-static pthread_mutex_t g_registry_mutex = PTHREAD_MUTEX_INITIALIZER;
-static AdapterVersion* g_versions;
-static AdapterVersion* g_active;
-static _Atomic int g_active_present;
-static _Atomic unsigned long g_run_registry_lock_count;
 typedef struct AdapterTombstone {
     char version_id[128];
     struct AdapterTombstone* next;
 } AdapterTombstone;
-static AdapterTombstone* g_tombstones;
-static _Thread_local AdapterTls g_tls;
+
+typedef struct AdapterRegistryState {
+    pthread_mutex_t mutex;
+    AdapterVersion* versions;
+    AdapterVersion* active;
+    _Atomic int active_present;
+    _Atomic unsigned long run_registry_lock_count;
+    AdapterTombstone* tombstones;
+    AdapterTls tls;
+} AdapterRegistryState;
+
+static pthread_mutex_t g_adapter_state_init_mutex = PTHREAD_MUTEX_INITIALIZER;
+static void adapter_registry_state_destroy(void* opaque);
+
+static AdapterRegistryState* adapter_registry_state(void) {
+    VxEngineState* owner = vx_engine_state_current();
+    AdapterRegistryState* state;
+    if (!owner) return NULL;
+    state = (AdapterRegistryState*)owner->adapter_registry_state;
+    if (state) return state;
+    pthread_mutex_lock(&g_adapter_state_init_mutex);
+    state = (AdapterRegistryState*)owner->adapter_registry_state;
+    if (!state) {
+        state = (AdapterRegistryState*)calloc(1, sizeof(*state));
+        if (state && pthread_mutex_init(&state->mutex, NULL) != 0) {
+            free(state);
+            state = NULL;
+        }
+        if (state) {
+            atomic_init(&state->active_present, 0);
+            atomic_init(&state->run_registry_lock_count, 0);
+            owner->adapter_registry_state = state;
+            owner->adapter_registry_state_destroy = adapter_registry_state_destroy;
+        }
+    }
+    pthread_mutex_unlock(&g_adapter_state_init_mutex);
+    return state;
+}
+
+#define g_registry_mutex (adapter_registry_state()->mutex)
+#define g_versions (adapter_registry_state()->versions)
+#define g_active (adapter_registry_state()->active)
+#define g_active_present (adapter_registry_state()->active_present)
+#define g_run_registry_lock_count \
+    (adapter_registry_state()->run_registry_lock_count)
+#define g_tombstones (adapter_registry_state()->tombstones)
+#define g_tls (adapter_registry_state()->tls)
 
 static int copy_name(char out[128], const char* src) {
     if (!src || !src[0] || strlen(src) >= 128) return -1;
@@ -173,6 +214,32 @@ static void version_free(AdapterVersion* version) {
     free(version->targets);
     free(version->manifest_json);
     free(version);
+}
+
+static void adapter_registry_state_destroy(void* opaque) {
+    AdapterRegistryState* state = (AdapterRegistryState*)opaque;
+    AdapterVersion* version;
+    AdapterTombstone* tombstone;
+    if (!state) return;
+    version = state->versions;
+    while (version) {
+        AdapterVersion* next = version->next;
+        version_free(version);
+        version = next;
+    }
+    tombstone = state->tombstones;
+    while (tombstone) {
+        AdapterTombstone* next = tombstone->next;
+        free(tombstone);
+        tombstone = next;
+    }
+    if (state->tls.request_count > 1) {
+        free(state->tls.request_versions);
+        free(state->tls.request_scales);
+    }
+    free(state->tls.rank_workspace);
+    pthread_mutex_destroy(&state->mutex);
+    free(state);
 }
 
 static AdapterVersion* find_version_locked(const char* version_id) {
@@ -803,8 +870,60 @@ static AdapterVersion* route_for_row(long global_row, long total_rows, float* sc
     return g_tls.run_versions[route];
 }
 
+int vx_adapter_run_linear_segments(
+        const char* weight_name, int batch_size, long row_offset, int rows,
+        long total_rows, int d_in, int d_out,
+        VxAdapterLinearSegment* segments, int capacity) {
+    int count = 0;
+    AdapterTarget* previous_target = NULL;
+    float previous_scale = 0.0f;
+    if (!weight_name || !weight_name[0] || batch_size <= 0 ||
+        row_offset < 0 || rows < 0 || total_rows <= 0 ||
+        row_offset > total_rows || rows > total_rows - row_offset ||
+        total_rows % batch_size != 0 || d_in <= 0 || d_out <= 0 ||
+        g_tls.run_depth <= 0 ||
+        (g_tls.run_count != 1 && g_tls.run_count != batch_size) ||
+        capacity < 0 || (!segments && capacity != 0)) return -1;
+    for (int row = 0; row < rows; row++) {
+        float route_scale = 1.0f;
+        AdapterVersion* version = route_for_row(
+            row_offset + row, total_rows, &route_scale);
+        AdapterTarget* target = target_find(version, weight_name);
+        float combined_scale = 0.0f;
+        if (target) {
+            if (target->kind != VX_ADAPTER_LORA || target->d_in != d_in ||
+                target->d_out != d_out || target->rank <= 0 ||
+                !target->a.data || !target->b.data ||
+                target->a.rows != d_in || target->a.cols != target->rank ||
+                target->b.rows != target->rank || target->b.cols != d_out ||
+                !isfinite(target->scale) || !isfinite(route_scale) ||
+                !isfinite(target->scale * route_scale)) return -1;
+            combined_scale = target->scale * route_scale;
+        }
+        if (target && previous_target == target &&
+            previous_scale == combined_scale) {
+            if (segments && count > 0) segments[count - 1].row_count++;
+            continue;
+        }
+        previous_target = target;
+        previous_scale = combined_scale;
+        if (!target) continue;
+        if (segments) {
+            if (count >= capacity) return -1;
+            segments[count].a = target->a.data;
+            segments[count].b = target->b.data;
+            segments[count].row_start = row;
+            segments[count].row_count = 1;
+            segments[count].rank = target->rank;
+            segments[count].scale = combined_scale;
+        }
+        count++;
+    }
+    return count;
+}
+
 int vx_adapter_apply_linear(const char* weight_name, const float* input,
-                            const void* base_weight, int base_dtype, const float* bias,
+                            const void* base_weight, VxDataType base_dtype, const float* bias,
                             float* output, int rows, int d_in, int d_out,
                             int base_out_in, int batch_size, long row_offset, long total_rows) {
     (void)base_weight;
@@ -853,7 +972,7 @@ int vx_adapter_apply_linear(const char* weight_name, const float* input,
 }
 
 int vx_adapter_materialize_weight(const char* version_id, const char* weight_name,
-                                  const void* base_weight, int base_dtype,
+                                  const void* base_weight, VxDataType base_dtype,
                                   int d_in, int d_out, int base_out_in, float* out_weight) {
     if (!base_weight || !out_weight || (base_dtype != VX_ADAPTER_DTYPE_F32 && base_dtype != VX_ADAPTER_DTYPE_F16)) return -1;
     AdapterVersion* version = acquire_version(version_id);

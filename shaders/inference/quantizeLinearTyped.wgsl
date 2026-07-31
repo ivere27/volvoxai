@@ -15,7 +15,7 @@ struct Params {
 }
 @group(0) @binding(4) var<uniform> params : Params;
 
-// Runtime dtype IDs are F32=0, I32=1, I8=2, U8=3. QuantizeLinear accepts
+// Dtype IDs are canonical protobuf values: I8=6, U8=5. QuantizeLinear accepts
 // only typed byte outputs, but retaining the ID makes the ABI self-describing.
 fn signed_byte(value : u32) -> i32 {
   if (value >= 128u) { return i32(value) - 256; }
@@ -29,7 +29,7 @@ fn word_byte(word : u32, index : u32) -> u32 {
 fn zero_point_value() -> i32 {
   if (params.has_zero_point == 0u) { return 0; }
   let byte = word_byte(zero_point_words[0], 0u);
-  if (params.zero_point_type == 2u) { return signed_byte(byte); }
+  if (params.zero_point_type == 6u) { return signed_byte(byte); }
   return i32(byte);
 }
 
@@ -53,8 +53,8 @@ fn quantize_one(index : u32) -> u32 {
   let input = bitcast<f32>(input_words[index]);
   if (input != input) { return output_byte(zero); }
   let scale = bitcast<f32>(scale_words[0]);
-  let minimum = select(0, -128, params.output_type == 2u);
-  let maximum = select(255, 127, params.output_type == 2u);
+  let minimum = select(0, -128, params.output_type == 6u);
+  let maximum = select(255, 127, params.output_type == 6u);
   // Invalid dynamic scales are rejected by the CPU/WASM validators. Keep the
   // shader defined as well, so an accidental runtime mutation cannot produce
   // an undefined integer conversion.

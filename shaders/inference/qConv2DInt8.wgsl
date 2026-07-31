@@ -50,7 +50,7 @@ fn signed_byte(value : u32) -> i32 {
 }
 
 fn typed_byte(byte : u32, dtype : u32) -> i32 {
-  if (dtype == 2u) { return signed_byte(byte); }
+  if (dtype == 6u) { return signed_byte(byte); }
   return i32(byte);
 }
 
@@ -109,8 +109,8 @@ fn qconv_one(index : u32) -> u32 {
   }
   let multiplier = (params.input_scale * weight_scales[output_channel]) / params.output_scale;
   let transformed = f32(accumulator) * multiplier + f32(params.output_zero_point);
-  let minimum = select(0, -128, params.output_type == 2u);
-  let maximum = select(255, 127, params.output_type == 2u);
+  let minimum = select(0, -128, params.output_type == 6u);
+  let maximum = select(255, 127, params.output_type == 6u);
   var quantized : i32;
   if (transformed != transformed) { quantized = params.output_zero_point; }
   else if (transformed <= f32(minimum)) { quantized = minimum; }

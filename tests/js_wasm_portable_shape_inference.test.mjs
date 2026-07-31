@@ -46,7 +46,7 @@ function whereGraph({ opType, conditionName, conditionDtype }) {
     [conditionName]: condition,
     ...(opType === 'Where' ? { x: a, y: b } : { a, b }),
   }, { out: { name: 'out', shape: [2, 2] } });
-  graph.outputNames = [out.name];
+  graph.setOutputs([out.name]);
   return graph;
 }
 
@@ -56,7 +56,7 @@ function rankFiveSliceGraph() {
   const { out } = graph.addOp('Slice', { input }, { out: { name: 'out', shape: [1, 2, 1, 2, 2] } }, {
     axes: [-3], starts: [1], steps: [2],
   });
-  graph.outputNames = [out.name];
+  graph.setOutputs([out.name]);
   return graph;
 }
 
@@ -65,7 +65,7 @@ function gatherGraph() {
   const input = graph.addInput('input', [2, 3, 4], 'float32');
   const indices = graph.addInput('indices', [2, 2], 'int32');
   const { out } = graph.addOp('Gather', { input, indices }, { out: { name: 'out', shape: [2, 2, 2, 4] } }, { axis: -2 });
-  graph.outputNames = [out.name];
+  graph.setOutputs([out.name]);
   return graph;
 }
 
@@ -74,7 +74,7 @@ function gatherElementsGraph(indicesDtype = 'int32') {
   const input = graph.addInput('input', [2, 3, 4], 'float32');
   const indices = graph.addInput('indices', [2, 2, 4], indicesDtype);
   const { out } = graph.addOp('GatherElements', { input, indices }, { out: { name: 'out', shape: [2, 2, 4] } }, { axis: -2 });
-  graph.outputNames = [out.name];
+  graph.setOutputs([out.name]);
   return graph;
 }
 
@@ -130,10 +130,10 @@ test('forward WASM dispatches canonical Where/Mask, Slice, Gather, and GatherEle
       assert.equal(result.out.length, 8);
     });
 
-    await t.test('Gather handles an I32 index tensor on a nonzero normalized axis', async () => {
+    await t.test('Gather normalizes ONNX negative indices and keeps invalid selections fail-closed', async () => {
       const inputs = {
         input: values(24),
-        indices: Int32Array.of(2, 0, 1, 2),
+        indices: Int32Array.of(-1, -3, -4, 3),
       };
       const cpu = await cpuResult(gatherGraph(), inputs);
       const graph = gatherGraph();
@@ -141,6 +141,12 @@ test('forward WASM dispatches canonical Where/Mask, Slice, Gather, and GatherEle
       const result = await wasm.execute(inputs);
       assert.deepEqual([...result.out], [...cpu.out]);
       assert.equal(result.out.length, 32);
+      assert.deepEqual([...result.out], [
+        1, 2, 3, 4, -7, -6, -5, -4,
+        -1, -1, -1, -1, -1, -1, -1, -1,
+        13, 14, 15, 16, 5, 6, 7, 8,
+        -1, -1, -1, -1, -1, -1, -1, -1,
+      ]);
     });
 
     await t.test('GatherElements handles non-axis dimensions and negative I32 selections', async () => {
@@ -162,7 +168,7 @@ test('forward WASM dispatches canonical Where/Mask, Slice, Gather, and GatherEle
       assert.equal(result.out[1], 2);
     });
 
-    await t.test('canonical Gather paths reject legacy F32 indices instead of falling back', async () => {
+    await t.test('Gather rejects F32 indices instead of falling back', async () => {
       assert.throws(() => wasm.compile(gatherElementsGraph('float32')), /I32 index/);
     });
   } finally {

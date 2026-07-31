@@ -54,7 +54,7 @@ test('loss descriptors reject ambiguous and malformed requests', () => {
   assert.throws(() => normalizeCrossEntropyLosses({
     targets: [0],
     losses: [{ logitsTensor: 'x', targets: [0] }],
-  }), /either losses or the legacy targets/);
+  }), /either losses or the single-loss target fields/);
   assert.throws(() => normalizeCrossEntropyLosses({ losses: [] }), /must not be empty/);
   assert.throws(() => normalizeCrossEntropyLosses({
     losses: [{ name: 'x', logitsTensor: 'a', targets: [0] }, { name: 'x', logitsTensor: 'b', targets: [0] }],

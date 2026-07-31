@@ -1685,7 +1685,8 @@ uint32_t volvoxai_training_cross_attention_backward_f32(
 }
 
 static uint32_t vx_training_typed_valid(uint32_t type) {
-    return type <= VOLVOXAI_TRAINING_TYPED_U8;
+    return type == VX_DTYPE_F32 || type == VX_DTYPE_I32 ||
+        type == VX_DTYPE_I8 || type == VX_DTYPE_U8;
 }
 
 static double vx_training_typed_number(const void *values, uint32_t type,
@@ -1914,7 +1915,9 @@ uint32_t volvoxai_training_binary_broadcast_f32(
 
 static uint32_t vx_where_condition(const void *condition, uint32_t condition_type,
         uint32_t index) {
-    if (condition_type == 0) return ((const float *)condition)[index] != 0.0f;
+    if (condition_type == VX_DTYPE_F32) {
+        return ((const float *)condition)[index] != 0.0f;
+    }
     return ((const int32_t *)condition)[index] != 0;
 }
 
@@ -1922,7 +1925,8 @@ VX_TRAINING_EXPORT("volvoxai_training_where_f32")
 uint32_t volvoxai_training_where_f32(
         const void *condition, const float *a, const float *b, float *output,
         uint32_t condition_type, uint32_t elements) {
-    if (!condition || !a || !b || !output || condition_type > 1) return 0;
+    if (!condition || !a || !b || !output ||
+        (condition_type != VX_DTYPE_F32 && condition_type != VX_DTYPE_I32)) return 0;
     for (uint32_t index = 0; index < elements; index++) {
         output[index] = vx_where_condition(condition, condition_type, index)
             ? a[index] : b[index];
@@ -1934,7 +1938,8 @@ VX_TRAINING_EXPORT("volvoxai_training_where_backward_f32")
 uint32_t volvoxai_training_where_backward_f32(
         const void *condition, const float *dy, float *da, float *db,
         uint32_t condition_type, uint32_t elements) {
-    if (!condition || !dy || !da || !db || condition_type > 1) return 0;
+    if (!condition || !dy || !da || !db ||
+        (condition_type != VX_DTYPE_F32 && condition_type != VX_DTYPE_I32)) return 0;
     for (uint32_t index = 0; index < elements; index++) {
         if (vx_where_condition(condition, condition_type, index)) da[index] += dy[index];
         else db[index] += dy[index];
@@ -2009,6 +2014,16 @@ static uint32_t vx_gather_validate(uint32_t outer, uint32_t axis_size, uint32_t 
     return total == output_elements;
 }
 
+static uint32_t vx_gather_normalize_index(
+        int32_t index, uint32_t axis_size, uint32_t *selected) {
+    int64_t normalized = index;
+    if (!selected) return 0;
+    if (normalized < 0) normalized += (int64_t)axis_size;
+    if (normalized < 0 || normalized >= (int64_t)axis_size) return 0;
+    *selected = (uint32_t)normalized;
+    return 1;
+}
+
 VX_TRAINING_EXPORT("volvoxai_training_gather_f32")
 uint32_t volvoxai_training_gather_f32(
         const float *input, const int32_t *indices, float *output,
@@ -2018,11 +2033,12 @@ uint32_t volvoxai_training_gather_f32(
         indices_elements, output_elements)) return 0;
     for (uint32_t outer_index = 0; outer_index < outer; outer_index++) {
         for (uint32_t index_position = 0; index_position < indices_elements; index_position++) {
-            int32_t selected = indices[index_position];
-            if (selected < 0 || (uint32_t)selected >= axis_size) return 0;
+            uint32_t selected;
+            if (!vx_gather_normalize_index(
+                    indices[index_position], axis_size, &selected)) return 0;
             for (uint32_t inner_index = 0; inner_index < inner; inner_index++) {
                 size_t output_index = ((size_t)outer_index * indices_elements + index_position) * inner + inner_index;
-                size_t input_index = ((size_t)outer_index * axis_size + (uint32_t)selected) * inner + inner_index;
+                size_t input_index = ((size_t)outer_index * axis_size + selected) * inner + inner_index;
                 output[output_index] = input[input_index];
             }
         }
@@ -2039,11 +2055,12 @@ uint32_t volvoxai_training_gather_backward_f32(
         indices_elements, output_elements)) return 0;
     for (uint32_t outer_index = 0; outer_index < outer; outer_index++) {
         for (uint32_t index_position = 0; index_position < indices_elements; index_position++) {
-            int32_t selected = indices[index_position];
-            if (selected < 0 || (uint32_t)selected >= axis_size) return 0;
+            uint32_t selected;
+            if (!vx_gather_normalize_index(
+                    indices[index_position], axis_size, &selected)) return 0;
             for (uint32_t inner_index = 0; inner_index < inner; inner_index++) {
                 size_t output_index = ((size_t)outer_index * indices_elements + index_position) * inner + inner_index;
-                size_t input_index = ((size_t)outer_index * axis_size + (uint32_t)selected) * inner + inner_index;
+                size_t input_index = ((size_t)outer_index * axis_size + selected) * inner + inner_index;
                 dx[input_index] += dy[output_index];
             }
         }

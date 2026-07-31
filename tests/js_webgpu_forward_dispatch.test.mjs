@@ -1,8 +1,11 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { readFile } from 'node:fs/promises';
 
 import { GraphExecutor as RuntimeGraphExecutor } from '../ts/backends/GraphExecutor.js';
+import { compileWebGPUGraphPlan } from '../ts/backends/WebGPUGraphCompiler.js';
 import { Graph } from '../ts/core/Graph.js';
+import { DataType } from '../ts/generated/volvoxaiEnums.js';
 
 // Node does not expose these WebGPU constants. The mock only needs distinct
 // bit values while it records the browser-side dispatch contract.
@@ -155,6 +158,48 @@ function mockDevice() {
                   output[outerIndex * inner + innerIndex] = best;
                 }
               }
+            } else if (dispatch.pipeline?.code === 'incremental-byte-copy') {
+              const source = entries.get(0).bytes;
+              const destination = entries.get(1).bytes;
+              const params = new Uint32Array(entries.get(2).bytes.buffer);
+              const [sourceOffset, destinationOffset, size] = params;
+              destination.set(source.subarray(sourceOffset, sourceOffset + size), destinationOffset);
+            } else if (dispatch.pipeline?.code === 'unaligned-qlinear') {
+              const input = entries.get(0).bytes;
+              const output = entries.get(5).bytes;
+              const params = new Uint32Array(entries.get(6).bytes.buffer);
+              const [rows, dIn, dOut] = params;
+              for (let row = 0; row < rows; row++) {
+                for (let column = 0; column < dOut; column++) {
+                  output[row * dOut + column] = input[row * dIn + (column % dIn)] + column;
+                }
+              }
+            } else if (dispatch.pipeline?.code?.includes(
+              'struct Params { b : u32, d : u32 }',
+            )) {
+              const source = dispatch.pipeline.code;
+              const input = new Float32Array(entries.get(0).bytes.buffer);
+              const output = new Float32Array(entries.get(1).bytes.buffer);
+              const [rows, width] = new Uint32Array(entries.get(2).bytes.buffer);
+              const rowSeededMaximum = source.includes('var max_val = input[offset];');
+              const logOutput = source.includes('let logSum = log(sum);');
+              for (let row = 0; row < rows; row++) {
+                const offset = row * width;
+                let maximum = rowSeededMaximum ? input[offset] : -100000;
+                for (let column = rowSeededMaximum ? 1 : 0; column < width; column++) {
+                  maximum = Math.max(maximum, input[offset + column]);
+                }
+                let sum = 0;
+                for (let column = 0; column < width; column++) {
+                  sum += Math.exp(input[offset + column] - maximum);
+                }
+                const logSum = Math.log(sum);
+                for (let column = 0; column < width; column++) {
+                  output[offset + column] = logOutput
+                    ? input[offset + column] - maximum - logSum
+                    : Math.exp(input[offset + column] - maximum) / sum;
+                }
+              }
             }
             state.dispatches.push(dispatch);
           }
@@ -167,6 +212,29 @@ function mockDevice() {
 function paramsFrom(device, binding) {
   return device.state.bindGroups.at(-1).entries.find((entry) => entry.binding === binding).resource.buffer;
 }
+
+test('WebGPU PReLU accepts the canonical slope input and binds channel parameters', async () => {
+  const device = mockDevice();
+  const input = tensor('input', [4, 8]);
+  const slope = tensor('slope', [8]);
+  const out = tensor('out', [4, 8]);
+  const executor = new GraphExecutor(device, { nodes: [] }, {
+    shaderLibrary: { getPReLUShader: () => 'prelu' },
+  });
+
+  await executor._buildNodePipeline({
+    id: 'prelu_slope', opType: 'PReLU', inputs: { input, slope }, outputs: { out }, params: {},
+  });
+
+  assert.deepEqual(device.state.shaderCodes, ['prelu']);
+  assert.deepEqual(executor.pipelines[0].workgroupCount, [1, 1, 1]);
+  const entries = device.state.bindGroups.at(-1).entries;
+  assert.deepEqual(entries.slice(0, 3).map(({ resource }) => resource.buffer.tensor), [
+    'input', 'slope', 'out',
+  ]);
+  assert.deepEqual([...new Uint32Array(paramsFrom(device, 3).bytes.buffer)], [32, 8, 8, 0]);
+  executor.dispose();
+});
 
 test('WebGPU typed readback copies padded storage and returns the logical requested dtype', async () => {
   const device = mockDevice();
@@ -220,7 +288,7 @@ test('WebGPU W8A8 incremental rows retain device K/V prefixes and update only th
     },
   });
   await executor.compile();
-  assert.equal(executor.supportsIncrementalRows, true);
+  assert.equal(executor.capabilities.incrementalRows, true);
   assert.deepEqual([...executor.incrementalRowCandidates.keys()], [0, 1]);
   assert.equal(executor.incrementalRowPlans.size, 0,
     'row bind groups are compiled lazily for the selected decode closure');
@@ -271,6 +339,146 @@ test('WebGPU W8A8 incremental rows retain device K/V prefixes and update only th
   assert.equal(device.state.dispatches.length, 2);
   assert.equal(device.state.submissions.length, 1,
     'all row copies and kernels must share one GPU submission');
+  executor.dispose();
+});
+
+test('WebGPU row candidates reject a dirty noncausal QSDPA mask before upload', async () => {
+  const graph = new Graph();
+  const quantization = { scheme: 'per_tensor', scale: 0.125, zero_point: 0 };
+  const q = graph.addInput('q', [1, 3, 4], 'int8', { quantization });
+  const k = graph.addInput('k', [1, 2, 4], 'int8', { quantization });
+  const v = graph.addInput('v', [1, 2, 4], 'int8', { quantization });
+  const mask = graph.addInput('mask', [1, 2], 'int32');
+  const attended = graph.addOp('QSDPA', { q, k, v, mask }, {
+    out: { name: 'attended', shape: [1, 3, 4], dtype: 'int8', quantization },
+  }, { heads: 1, causal: false, scale: 0.5 }).out;
+  graph.addOp('QArgMax', { input: attended }, {
+    out: { name: 'tokens', shape: [1, 3], dtype: 'int32' },
+  }, { axis: -1 });
+
+  const device = mockDevice();
+  const executor = new RuntimeGraphExecutor(device, graph, {
+    shaderLibrary: {
+      getQSDPAShader: () => 'typed-cross-qsdpa',
+      getQArgMaxShader: () => 'typed-qargmax',
+    },
+  });
+  await executor.compile();
+  assert.deepEqual([...executor.incrementalRowCandidates.keys()], [0, 1],
+    'candidate discovery must defer changed-input invariance proof until execution');
+  assert.deepEqual(
+    [...executor.incrementalRowCandidates.get(0).invariantInputs],
+    ['k', 'v', 'mask'],
+  );
+
+  const inputs = {
+    q: new Int8Array(12),
+    k: new Int8Array(8),
+    v: new Int8Array(8),
+    mask: Int32Array.of(1, 1),
+  };
+  await executor.execute(inputs, {
+    incremental: true,
+    incrementalReset: true,
+    changedInputs: Object.keys(inputs),
+  });
+  device.state.writes.length = 0;
+  device.state.copies.length = 0;
+  device.state.dispatches.length = 0;
+  device.state.submissions.length = 0;
+
+  await assert.rejects(
+    executor.execute(inputs, {
+      incremental: true,
+      incrementalRowPosition: 1,
+      changedInputs: ['mask'],
+    }),
+    /input 'mask' must remain invariant/,
+  );
+  assert.equal(device.state.writes.length, 0,
+    'dirty invariant K/V/mask must fail before any GPU upload');
+  assert.equal(device.state.copies.length, 0);
+  assert.equal(device.state.dispatches.length, 0);
+  assert.equal(device.state.submissions.length, 0);
+  executor.dispose();
+});
+
+test('WebGPU W8A8 incremental rows preserve adjacent bytes for unaligned packed rows', async () => {
+  const graph = new Graph();
+  const activationQuantization = { scheme: 'per_tensor', scale: 0.125, zero_point: 0 };
+  const input = graph.addInput('input', [1, 3, 5], 'int8', {
+    quantization: activationQuantization,
+  });
+  const weight = graph.addWeight('weight', [7, 5], 'int8', {
+    buffer: new Int8Array(35),
+    quantization: {
+      scheme: 'per_axis', axis: 0,
+      scales: new Array(7).fill(0.125), zero_points: new Array(7).fill(0),
+    },
+  });
+  const bias = graph.addWeight('bias', [7], 'int32', {
+    buffer: new Int32Array(7),
+  });
+  graph.addOp('QLinear', { input, weight, bias }, {
+    out: {
+      name: 'logits', shape: [1, 3, 7], dtype: 'int8',
+      quantization: activationQuantization,
+    },
+  });
+
+  const executor = new RuntimeGraphExecutor(mockDevice(), graph, {
+    shaderLibrary: {
+      getQLinearShader: () => 'unaligned-qlinear',
+      getIncrementalRowByteCopyShader: () => 'incremental-byte-copy',
+    },
+  });
+  await executor.compile();
+  assert.equal(executor.capabilities.incrementalRows, true);
+  assert.equal(executor.incrementalRowCandidates.has(0), true);
+
+  const values = Int8Array.of(
+    10, 11, 12, 13, 14,
+    20, 21, 22, 23, 24,
+    30, 31, 32, 33, 34,
+  );
+  await executor.execute({ input: values }, {
+    incremental: true,
+    incrementalReset: true,
+    changedInputs: ['input'],
+  });
+  const logits = executor.gpuBuffers.get('logits');
+  const before = logits.bytes.slice(0, 21);
+  values.set([40, 41, 42, 43, 44], 5);
+  const device = executor.device;
+  device.state.dispatches.length = 0;
+  device.state.copies.length = 0;
+  device.state.writes.length = 0;
+  device.state.submissions.length = 0;
+  await executor.execute({ input: values }, {
+    incremental: true,
+    changedInputs: ['input'],
+    incrementalRowPosition: 1,
+  });
+
+  assert.equal(executor.incrementalRowPlans.has(0), true);
+  assert.deepEqual(device.state.writes.filter(({ destination }) =>
+    destination === executor.gpuBuffers.get('input')).map(({ offset, byteLength }) =>
+    [offset, byteLength]), [[4, 8]],
+    'the host upload covers only the minimally aligned span around the five-byte row');
+  assert.deepEqual(
+    [...executor.gpuBuffers.get('input').bytes.subarray(0, values.length)], [...values],
+    'the aligned upload span retains both neighboring input rows',
+  );
+  assert.deepEqual(device.state.copies, [], 'unaligned device ranges use shader copies');
+  assert.deepEqual(device.state.dispatches.map(({ pipeline }) => pipeline.code), [
+    'incremental-byte-copy', 'unaligned-qlinear', 'incremental-byte-copy',
+  ]);
+  assert.equal(device.state.submissions.length, 1);
+  assert.deepEqual([...logits.bytes.subarray(0, 7)], [...before.subarray(0, 7)],
+    'scatter preserves the preceding packed row');
+  assert.deepEqual([...logits.bytes.subarray(7, 14)], [40, 42, 44, 46, 48, 45, 47]);
+  assert.deepEqual([...logits.bytes.subarray(14, 21)], [...before.subarray(14, 21)],
+    'scatter preserves the following packed row');
   executor.dispose();
 });
 
@@ -402,7 +610,7 @@ test('WebGPU W8A32 Linear accepts aliases, typed zero points, and an odd feature
   assert.deepEqual(executor.pipelines[0].workgroupCount, [1, 1, 1]);
   assert.deepEqual(device.state.bindGroups.at(-1).entries.map(({ binding }) => binding), [0, 1, 2, 3, 4, 5, 6]);
   assert.deepEqual([...new Uint32Array(paramsFrom(device, 6).bytes.buffer).slice(0, 8)], [
-    1, 3, 2, 3, 2, 3, 1, 0,
+    1, 3, 2, DataType.U8, 2, DataType.U8, 1, 0,
   ]);
   executor.dispose();
 });
@@ -435,7 +643,50 @@ test('WebGPU W8A32 keeps weight_scale graphs in their canonical output-major lay
       'WebGPU allocation must remain executor-owned');
     assert.ok(executor.gpuBuffers.has(value.name));
   }
+  assert.deepEqual(
+    [...new Uint32Array(paramsFrom(device, 6).bytes.buffer).slice(0, 8)],
+    [1, 2, 3, DataType.I8, 3, DataType.Unspecified, 0, 0],
+  );
   executor.dispose();
+});
+
+test('WebGPU graph compilation plans expose recursively immutable records', () => {
+  const input = tensor('input', [1, 2]);
+  const weight = tensor('weight', [2, 3], { buffer: new Float32Array(6) });
+  const linearOut = tensor('linear_out', [1, 3]);
+  const dropped = tensor('dropped', [1, 3]);
+  input.isInput = true;
+  weight.isWeight = true;
+  const plan = compileWebGPUGraphPlan({
+    nodes: [{
+      id: 'linear', opType: 'Linear', wLayout: 'din',
+      inputs: { input, weight }, outputs: { out: linearOut }, params: {},
+    }, {
+      id: 'dropout', opType: 'Dropout',
+      inputs: { input: linearOut }, outputs: { out: dropped }, params: {},
+    }],
+    outputNames: ['dropped'],
+  });
+
+  assert.equal(Object.isFrozen(plan), true);
+  assert.equal(Object.isFrozen(plan.dinWeights), true);
+  assert.equal(Object.isFrozen(plan.dinWeights[0]), true);
+  assert.equal(Object.isFrozen(plan.dinWeights[0][1]), true);
+  assert.equal(Object.isFrozen(plan.resultCopyTensorNames), true);
+  assert.deepEqual(plan.dinWeights, [['weight', { din: 2, dout: 3 }]]);
+  assert.deepEqual(plan.resultCopyTensorNames, ['dropped', 'linear_out']);
+  assert.equal(plan.dinWeights.set, undefined);
+  assert.equal(plan.resultCopyTensorNames.add, undefined);
+  assert.throws(() => plan.dinWeights.push(['other', { din: 1, dout: 1 }]), TypeError);
+  assert.throws(() => { plan.dinWeights[0][1].din = 9; }, TypeError);
+  assert.throws(() => plan.resultCopyTensorNames.push('other'), TypeError);
+  assert.throws(() => compileWebGPUGraphPlan({
+    nodes: [{
+      id: 'noncanonical_resize', opType: 'Resize', inputs: { input }, outputs: { out: dropped },
+      params: { mode: 'nearest', coordinate_transform_mode: 'asymmetric' },
+    }],
+    outputNames: ['dropped'],
+  }), /unsupported 'coordinate_transform_mode'.*coordinate_transformation_mode/);
 });
 
 test('WebGPU Linear routes odd tiled shapes and preserves every row on the scalar fallback', async () => {
@@ -553,12 +804,17 @@ test('WebGPU QLinear binds packed W8A8 metadata and I32 bias without W8A32 fallb
   const words = new Uint32Array(params.bytes.buffer);
   const signed = new Int32Array(params.bytes.buffer);
   const floats = new Float32Array(params.bytes.buffer);
-  assert.deepEqual([...words.slice(0, 6)], [1, 3, 2, 2, 2, 2]);
+  assert.deepEqual([...words.slice(0, 6)], [
+    1, 3, 2, DataType.I8, DataType.I8, DataType.I8,
+  ]);
   assert.deepEqual([...signed.slice(8, 10)], [-1, 0]);
   assert.deepEqual([...floats.slice(12, 14)], [0.25, 0.125]);
-  const scaleBuffer = entries.find((entry) => entry.binding === 2).resource.buffer;
+  const multiplierBuffer = entries.find((entry) => entry.binding === 2).resource.buffer;
   const zeroBuffer = entries.find((entry) => entry.binding === 3).resource.buffer;
-  assert.deepEqual([...new Float32Array(scaleBuffer.bytes.buffer).slice(0, 2)], [0.5, 0.25]);
+  assert.deepEqual(
+    [...new Float32Array(multiplierBuffer.bytes.buffer).slice(0, 2)],
+    [1, 0.5],
+  );
   assert.deepEqual([...new Int32Array(zeroBuffer.bytes.buffer).slice(0, 2)], [1, -2]);
   executor.dispose();
 });
@@ -675,12 +931,59 @@ test('WebGPU QEmbedding binds row quantization metadata and packed byte output',
   const words = new Uint32Array(params.bytes.buffer);
   const signed = new Int32Array(params.bytes.buffer);
   const floats = new Float32Array(params.bytes.buffer);
-  assert.deepEqual([...words.slice(0, 5)], [4, 3, 3, 2, 3]);
+  assert.deepEqual([...words.slice(0, 5)], [
+    4, 3, 3, DataType.I8, DataType.U8,
+  ]);
   assert.equal(signed[5], 100);
   assert.equal(floats[6], 0.5);
   assert.deepEqual([...new Float32Array(entries.find((entry) => entry.binding === 2).resource.buffer.bytes.buffer).slice(0, 3)], [0.5, 0.25, 0.125]);
   assert.deepEqual([...new Int32Array(entries.find((entry) => entry.binding === 3).resource.buffer.bytes.buffer).slice(0, 3)], [0, 0, 1]);
   executor.dispose();
+});
+
+test('WebGPU QEmbedding accepts only vocabulary-bounded internal Clip IDs', async () => {
+  const makeGraph = (maximum) => {
+    const graph = new Graph();
+    const raw = graph.addInput('raw_ids', [2], 'int32');
+    const ids = graph.addOp('Clip', { input: raw }, {
+      out: { name: 'ids', shape: [2], dtype: 'int32' },
+    }, { min: 0, max: maximum }).out;
+    const weight = graph.addWeight('table', [3, 2], 'int8', {
+      buffer: Int8Array.of(1, -1, 2, -2, 3, -3),
+      quantization: {
+        scheme: 'per_axis', axis: 0,
+        scales: [0.5, 0.25, 0.125], zero_points: [0, 0, 0],
+      },
+    });
+    const out = graph.addOp('QEmbedding', { input: ids, weight }, {
+      out: {
+        name: 'out', shape: [2, 2], dtype: 'int8',
+        quantization: { scheme: 'per_tensor', scale: 0.25, zero_point: 0 },
+      },
+    }).out;
+    graph.setOutputs([out.name]);
+    return graph;
+  };
+
+  const graph = makeGraph(2);
+  const device = mockDevice();
+  const executor = new GraphExecutor(device, graph, {
+    shaderLibrary: { getQEmbeddingShader: () => 'bounded-qembedding' },
+  });
+  await executor._buildNodePipeline(graph.nodes[1]);
+  assert.deepEqual(device.state.shaderCodes, ['bounded-qembedding']);
+  assert.doesNotThrow(() => executor._preflightQEmbeddingIds({}));
+  executor.dispose();
+
+  const invalid = makeGraph(3);
+  const rejected = new GraphExecutor(mockDevice(), invalid, {
+    shaderLibrary: { getQEmbeddingShader: () => 'unbounded-qembedding' },
+  });
+  await assert.rejects(
+    rejected._buildNodePipeline(invalid.nodes[1]),
+    /preflight-complete I32 IDs/,
+  );
+  rejected.dispose();
 });
 
 test('WebGPU QEmbedding preflights graph-input IDs before any output dispatch', async () => {
@@ -731,7 +1034,8 @@ test('WebGPU QConv2D binds canonical NHWC/OHWI W8A8 metadata', async () => {
   const signed = new Int32Array(params.bytes.buffer);
   const floats = new Float32Array(params.bytes.buffer);
   assert.deepEqual([...words.slice(0, 20)], [
-    1, 2, 2, 2, 2, 2, 2, 1, 1, 1, 1, 1, 1, 0, 0, 1, 2, 2, 2, 0,
+    1, 2, 2, 2, 2, 2, 2, 1, 1, 1, 1, 1, 1, 0, 0, 1,
+    DataType.I8, DataType.I8, DataType.I8, 0,
   ]);
   assert.deepEqual([...signed.slice(20, 22)], [0, 0]);
   assert.deepEqual([...floats.slice(24, 26)], [0.5, 0.25]);
@@ -1044,7 +1348,6 @@ test('WebGPU Gather uses the rank-aware I32 kernel beyond axis zero', async () =
   const executor = new GraphExecutor(device, { nodes: [] }, {
     shaderLibrary: {
       getGatherInt32Shader: () => 'gather-i32',
-      getGatherShader: () => { throw new Error('I32 indices must use the general Gather shader'); },
     },
   });
 
@@ -1063,33 +1366,21 @@ test('WebGPU Gather uses the rank-aware I32 kernel beyond axis zero', async () =
   executor.dispose();
 });
 
-test('WebGPU Gather preserves legacy F32 axis-zero dispatch but rejects it on other axes', async () => {
-  const device = mockDevice();
+test('WebGPU Gather rejects F32 indices for every axis', async () => {
   const input = tensor('input', [4, 3]);
   const indices = tensor('indices', [2]);
   const out = tensor('out', [2, 3]);
-  const executor = new GraphExecutor(device, { nodes: [] }, {
-    shaderLibrary: {
-      getGatherInt32Shader: () => { throw new Error('legacy F32 axis-zero must retain its existing shader'); },
-      getGatherShader: () => 'gather-axis0-f32',
-    },
-  });
-  await executor._buildNodePipeline({
-    id: 'gather_legacy', opType: 'Gather', inputs: { input, indices }, outputs: { out }, params: { axis: 0 },
-  });
-  assert.deepEqual(device.state.shaderCodes, ['gather-axis0-f32']);
-  assert.deepEqual([...new Uint32Array(paramsFrom(device, 3).bytes.buffer).slice(0, 3)], [3, 2, 6]);
-  executor.dispose();
-
   const nonAxisOutput = tensor('non_axis_out', [4, 2]);
-  const nonAxisExecutor = new GraphExecutor(mockDevice(), { nodes: [] }, { shaderLibrary: {} });
-  await assert.rejects(
-    () => nonAxisExecutor._buildNodePipeline({
-      id: 'gather_f32_axis_one', opType: 'Gather', inputs: { input, indices }, outputs: { out: nonAxisOutput }, params: { axis: 1 },
-    }),
-    /requires I32 indices/,
-  );
-  nonAxisExecutor.dispose();
+  for (const [axis, output] of [[0, out], [1, nonAxisOutput]]) {
+    const executor = new GraphExecutor(mockDevice(), { nodes: [] }, { shaderLibrary: {} });
+    await assert.rejects(
+      () => executor._buildNodePipeline({
+        id: `gather_f32_axis_${axis}`, opType: 'Gather', inputs: { input, indices }, outputs: { out: output }, params: { axis },
+      }),
+      /requires I32 indices/,
+    );
+    executor.dispose();
+  }
 });
 
 test('WebGPU GatherElements binds I32 index metadata and validates matching shapes', async () => {
@@ -1229,7 +1520,10 @@ test('WebGPU Cast dispatches raw typed storage and packs byte outputs', async ()
   assert.deepEqual(device.state.shaderCodes, ['typed-cast']);
   assert.deepEqual(executor.pipelines[0].workgroupCount, [2, 1, 1]);
   assert.deepEqual(device.state.bindGroups.at(-1).entries.map(({ binding }) => binding), [0, 1, 2]);
-  assert.deepEqual([...new Uint32Array(paramsFrom(device, 2).bytes.buffer).slice(0, 4)], [300, 0, 2, 0]);
+  assert.deepEqual(
+    [...new Uint32Array(paramsFrom(device, 2).bytes.buffer).slice(0, 4)],
+    [300, DataType.F32, DataType.I8, 0],
+  );
   executor.dispose();
 
   const intDevice = mockDevice();
@@ -1241,7 +1535,10 @@ test('WebGPU Cast dispatches raw typed storage and packs byte outputs', async ()
   await intExecutor._buildNodePipeline({
     id: 'cast_i8_i32', opType: 'Cast', inputs: { input: intInput }, outputs: { out: intOut }, params: { to: 'int32' },
   });
-  assert.deepEqual([...new Uint32Array(paramsFrom(intDevice, 2).bytes.buffer).slice(0, 4)], [5, 2, 1, 0]);
+  assert.deepEqual(
+    [...new Uint32Array(paramsFrom(intDevice, 2).bytes.buffer).slice(0, 4)],
+    [5, DataType.I8, DataType.I32, 0],
+  );
   intExecutor.dispose();
 });
 
@@ -1264,7 +1561,9 @@ test('WebGPU DequantizeLinear binds typed scalar scale and zero-point metadata',
   assert.deepEqual(executor.pipelines[0].workgroupCount, [1, 1, 1]);
   assert.deepEqual(device.state.bindGroups.at(-1).entries.map(({ binding }) => binding), [0, 1, 2, 3, 4]);
   const words = new Uint32Array(paramsFrom(device, 4).bytes.buffer);
-  assert.deepEqual([...words.slice(0, 8)], [5, 2, 0, 3, 0, 1, 0, 0]);
+  assert.deepEqual([...words.slice(0, 8)], [
+    5, DataType.I8, DataType.F32, DataType.U8, DataType.F32, 1, 0, 0,
+  ]);
   executor.dispose();
 });
 
@@ -1287,7 +1586,10 @@ test('WebGPU QuantizeLinear binds typed byte output and packed-word dispatch met
   assert.deepEqual(device.state.shaderCodes, ['typed-quantize']);
   assert.deepEqual(executor.pipelines[0].workgroupCount, [1, 1, 1]);
   assert.deepEqual(device.state.bindGroups.at(-1).entries.map(({ binding }) => binding), [0, 1, 2, 3, 4]);
-  assert.deepEqual([...new Uint32Array(paramsFrom(device, 4).bytes.buffer).slice(0, 4)], [5, 2, 2, 1]);
+  assert.deepEqual(
+    [...new Uint32Array(paramsFrom(device, 4).bytes.buffer).slice(0, 4)],
+    [5, DataType.I8, DataType.I8, 1],
+  );
   executor.dispose();
 });
 
@@ -1310,7 +1612,10 @@ test('WebGPU RequantizeLinear uses immutable typed metadata without a scale buff
   const entries = device.state.bindGroups.at(-1).entries;
   assert.deepEqual(entries.map(({ binding }) => binding), [0, 1, 2]);
   const params = entries.find((entry) => entry.binding === 2).resource.buffer;
-  assert.deepEqual([...new Uint32Array(params.bytes.buffer).slice(0, 4)], [5, 2, 3, 0]);
+  assert.deepEqual(
+    [...new Uint32Array(params.bytes.buffer).slice(0, 4)],
+    [5, DataType.I8, DataType.U8, 0],
+  );
   assert.deepEqual([...new Int32Array(params.bytes.buffer).slice(4, 6)], [-1, 128]);
   assert.deepEqual([...new Float32Array(params.bytes.buffer).slice(8, 9)], [2]);
   executor.dispose();
@@ -1348,7 +1653,9 @@ test('WebGPU QAdd binds mixed byte descriptors and packed-word output metadata',
   const words = new Uint32Array(paramsFrom(device, 3).bytes.buffer);
   const signed = new Int32Array(paramsFrom(device, 3).bytes.buffer);
   const floats = new Float32Array(paramsFrom(device, 3).bytes.buffer);
-  assert.deepEqual([...words.slice(0, 4)], [5, 2, 3, 2]);
+  assert.deepEqual([...words.slice(0, 4)], [
+    5, DataType.I8, DataType.U8, DataType.I8,
+  ]);
   assert.deepEqual([...signed.slice(4, 7)], [-2, 128, 3]);
   assert.deepEqual([...floats.slice(8, 11)], [0.5, 0.25, 0.5]);
   assert.equal(words[11], 2);
@@ -1377,7 +1684,10 @@ test('WebGPU QSiLU binds one packed byte input/output pair and immutable descrip
   const entries = device.state.bindGroups.at(-1).entries;
   assert.deepEqual(entries.map(({ binding }) => binding), [0, 1, 2]);
   const params = entries.find((entry) => entry.binding === 2).resource.buffer;
-  assert.deepEqual([...new Uint32Array(params.bytes.buffer).slice(0, 3)], [5, 3, 2]);
+  assert.deepEqual(
+    [...new Uint32Array(params.bytes.buffer).slice(0, 3)],
+    [5, DataType.U8, DataType.I8],
+  );
   assert.deepEqual([...new Int32Array(params.bytes.buffer).slice(4, 6)], [127, -3]);
   assert.deepEqual([...new Float32Array(params.bytes.buffer).slice(8, 10)], [0.25, 0.125]);
   executor.dispose();
@@ -1414,7 +1724,10 @@ test('WebGPU QGELU binds one packed byte input/output pair with fixed portable-e
   const entries = device.state.bindGroups.at(-1).entries;
   assert.deepEqual(entries.map(({ binding }) => binding), [0, 1, 2]);
   const params = entries.find((entry) => entry.binding === 2).resource.buffer;
-  assert.deepEqual([...new Uint32Array(params.bytes.buffer).slice(0, 3)], [5, 3, 2]);
+  assert.deepEqual(
+    [...new Uint32Array(params.bytes.buffer).slice(0, 3)],
+    [5, DataType.U8, DataType.I8],
+  );
   assert.deepEqual([...new Int32Array(params.bytes.buffer).slice(4, 6)], [127, -3]);
   assert.deepEqual([...new Float32Array(params.bytes.buffer).slice(8, 10)], [0.25, 0.125]);
   executor.dispose();
@@ -1481,7 +1794,10 @@ test('WebGPU QGroupNorm dispatches byte-resident stats then apply with one graph
   assert.equal(statsBuffer.descriptor.size, 48, 'two F32 statistics for each of six [batch,group] entries');
   assert.equal(applyEntries.find((entry) => entry.binding === 3).resource.buffer, statsBuffer);
   assert.equal(applyEntries.find((entry) => entry.binding === 5).resource.buffer, statsParams);
-  assert.deepEqual([...new Uint32Array(statsParams.bytes.buffer).slice(0, 8)], [3, 1, 1, 6, 2, 2, 2, 0]);
+  assert.deepEqual(
+    [...new Uint32Array(statsParams.bytes.buffer).slice(0, 8)],
+    [3, 1, 1, 6, 2, DataType.I8, DataType.I8, 0],
+  );
   assert.deepEqual([...new Int32Array(statsParams.bytes.buffer).slice(8, 10)], [-1, -3]);
   assert.deepEqual([...new Float32Array(statsParams.bytes.buffer).slice(12, 15)], [0.25, 0.125, Math.fround(1e-5)]);
   assert.ok(executor.auxiliaryBuffers.has(statsBuffer));
@@ -1600,7 +1916,10 @@ test('WebGPU QLayerNorm dispatches byte-resident row stats then packed apply wit
   assert.equal(statsBuffer.descriptor.size, 24, 'two F32 statistics for each of three rows');
   assert.equal(applyEntries.find((entry) => entry.binding === 3).resource.buffer, statsBuffer);
   assert.equal(applyEntries.find((entry) => entry.binding === 5).resource.buffer, statsParams);
-  assert.deepEqual([...new Uint32Array(statsParams.bytes.buffer).slice(0, 4)], [3, 5, 2, 3]);
+  assert.deepEqual(
+    [...new Uint32Array(statsParams.bytes.buffer).slice(0, 4)],
+    [3, 5, DataType.I8, DataType.U8],
+  );
   assert.deepEqual([...new Int32Array(statsParams.bytes.buffer).slice(4, 6)], [-1, 123]);
   assert.deepEqual([...new Float32Array(statsParams.bytes.buffer).slice(8, 11)], [0.25, 0.125, Math.fround(1e-5)]);
   assert.ok(executor.auxiliaryBuffers.has(statsBuffer));
@@ -1710,7 +2029,8 @@ test('WebGPU QSDPA binds packed byte Q/K/V, a dummy mask, and the 80-byte canoni
   const params = entries.find((entry) => entry.binding === 5).resource.buffer;
   assert.equal(dummyMask.descriptor.size, 4);
   assert.deepEqual([...new Uint32Array(params.bytes.buffer).slice(0, 8)], [
-    2, 2, 4, 1, 1, 0, 0, 0x02020202,
+    2, 2, 4, 1, 1, 0, 0,
+    DataType.I8 | (DataType.I8 << 8) | (DataType.I8 << 16) | (DataType.I8 << 24),
   ]);
   assert.deepEqual([...new Int32Array(params.bytes.buffer).slice(8, 12)], [-1, -1, -1, 0]);
   assert.deepEqual([...new Float32Array(params.bytes.buffer).slice(12, 17)], [0.25, 0.25, 0.25, 0.25, 0.5]);
@@ -1806,7 +2126,10 @@ test('WebGPU QMaskedMean binds packed bytes, I32 keep mask, and the 48-byte rout
   assert.deepEqual(device.state.bindGroups.at(-1).entries.map(({ binding }) => binding), [0, 1, 2, 3]);
   const params = paramsFrom(device, 3);
   assert.equal(params.descriptor.size, 48);
-  assert.deepEqual([...new Uint32Array(params.bytes.buffer).slice(0, 8)], [1, 3, 5, 2, 3, 0, 0, 0]);
+  assert.deepEqual(
+    [...new Uint32Array(params.bytes.buffer).slice(0, 8)],
+    [1, 3, 5, DataType.I8, DataType.U8, 0, 0, 0],
+  );
   assert.deepEqual([...new Int32Array(params.bytes.buffer).slice(8, 10)], [-1, 2]);
   assert.deepEqual([...new Float32Array(params.bytes.buffer).slice(10, 12)], [0.5, 0.25]);
   executor.dispose();
@@ -1885,7 +2208,10 @@ test('WebGPU QArgMax binds packed I8/U8 logits to an unquantized I32 index ABI',
   assert.deepEqual(device.state.bindGroups.at(-1).entries.map(({ binding }) => binding), [0, 1, 2]);
   const params = paramsFrom(device, 2);
   assert.equal(params.descriptor.size, 16);
-  assert.deepEqual([...new Uint32Array(params.bytes.buffer)], [2, 3, 2, 3]);
+  assert.deepEqual(
+    [...new Uint32Array(params.bytes.buffer)],
+    [2, 3, 2, DataType.U8],
+  );
   executor.dispose();
   assert.equal(params.destroyed, true);
 });
@@ -1978,7 +2304,10 @@ test('WebGPU Mask uses the browser-only typed shader for I32 mask aliases', asyn
 
   assert.deepEqual(device.state.shaderCodes, ['where-typed']);
   assert.deepEqual(device.state.bindGroups.at(-1).entries.map(({ binding }) => binding), [0, 1, 2, 3, 4]);
-  assert.deepEqual([...new Uint32Array(paramsFrom(device, 4).bytes.buffer).slice(0, 4)], [4, 1, 0, 0]);
+  assert.deepEqual(
+    [...new Uint32Array(paramsFrom(device, 4).bytes.buffer).slice(0, 4)],
+    [4, DataType.I32, 0, 0],
+  );
   assert.deepEqual(executor.pipelines[0].workgroupCount, [1, 1, 1]);
   executor.dispose();
 });
@@ -1996,7 +2325,10 @@ test('WebGPU Where accepts F32 conditions and rejects non-exact canonical tensor
     id: 'where_f32', opType: 'Where', inputs: { condition, x, y }, outputs: { out }, params: {},
   });
   assert.deepEqual(device.state.shaderCodes, ['where-typed']);
-  assert.deepEqual([...new Uint32Array(paramsFrom(device, 4).bytes.buffer).slice(0, 4)], [4, 0, 0, 0]);
+  assert.deepEqual(
+    [...new Uint32Array(paramsFrom(device, 4).bytes.buffer).slice(0, 4)],
+    [4, DataType.F32, 0, 0],
+  );
   executor.dispose();
 
   const invalidExecutor = new GraphExecutor(mockDevice(), { nodes: [] }, { shaderLibrary: {} });
@@ -2006,7 +2338,7 @@ test('WebGPU Where accepts F32 conditions and rejects non-exact canonical tensor
       inputs: { condition: tensor('bad_condition', [1, 4], { dtype: 'int32' }), x, y },
       outputs: { out }, params: {},
     }),
-    /exact-shape F32 operands\/output and an F32 or I32 condition/,
+    /exact-shape same-dtype F32\/I32 operands\/output and an F32 or I32 condition/,
   );
   invalidExecutor.dispose();
 });
@@ -2059,6 +2391,417 @@ test('WebGPU Slice accepts the rank-eight upper bound', async () => {
   assert.deepEqual([...words.slice(20, 28)], [1, 1, 1, 1, 1, 1, 1, 2]);
   assert.deepEqual([...words.slice(28, 36)], [6, 6, 6, 6, 6, 6, 3, 1]);
   executor.dispose();
+});
+
+test('WebGPU dispatches canonical BatchMatMul and I32 logical kernels with typed metadata', async () => {
+  const device = mockDevice();
+  const executor = new GraphExecutor(device, { nodes: [] }, {
+    shaderLibrary: {
+      getBatchMatMulShader: () => 'batch-matmul',
+      getCompareI32Shader: () => 'compare-i32',
+      getNotI32Shader: () => 'not-i32',
+      getTypedClipShader: () => 'clip-typed',
+      getWhereTypedShader: () => 'where-typed',
+    },
+  });
+
+  const a = tensor('a', [2, 1, 2, 3]);
+  const b = tensor('b', [1, 2, 3, 2]);
+  const product = tensor('product', [2, 2, 2, 2]);
+  await executor._buildNodePipeline({
+    id: 'batch_matmul', opType: 'BatchMatMul',
+    inputs: { a, b }, outputs: { out: product }, params: {},
+  });
+  assert.equal(device.state.shaderCodes.at(-1), 'batch-matmul');
+  assert.deepEqual(executor.pipelines.at(-1).workgroupCount, [1, 1, 4]);
+  const batchMetadata = new Uint32Array(
+    device.state.bindGroups.at(-1).entries.find(({ binding }) => binding === 3)
+      .resource.buffer.bytes.buffer,
+  );
+  assert.deepEqual([...batchMetadata], [
+    2, 2, 3, 2, 4,
+    2, 1,
+    6, 0,
+    0, 6,
+  ]);
+
+  const logicalA = tensor('logicalA', [2, 1, 3], { dtype: 'int32' });
+  const logicalB = tensor('logicalB', [1, 2, 1], { dtype: 'int32' });
+  const equal = tensor('equal', [2, 2, 3], { dtype: 'int32' });
+  await executor._buildNodePipeline({
+    id: 'equal', opType: 'Equal',
+    inputs: { a: logicalA, b: logicalB }, outputs: { out: equal }, params: {},
+  });
+  assert.equal(device.state.shaderCodes.at(-1), 'compare-i32');
+  const compareMetadata = new Uint32Array(
+    device.state.bindGroups.at(-1).entries.find(({ binding }) => binding === 3)
+      .resource.buffer.bytes.buffer,
+  );
+  assert.deepEqual([...compareMetadata], [
+    12, 3,
+    6, 3, 1,
+    3, 0, 1,
+    0, 1, 0,
+    0,
+  ]);
+
+  const inverted = tensor('inverted', [2, 2, 3], { dtype: 'int32' });
+  await executor._buildNodePipeline({
+    id: 'not', opType: 'Not',
+    inputs: { input: equal }, outputs: { out: inverted }, params: {},
+  });
+  assert.equal(device.state.shaderCodes.at(-1), 'not-i32');
+  assert.deepEqual(
+    [...new Uint32Array(paramsFrom(device, 2).bytes.buffer)],
+    [12, 0, 0, 0],
+  );
+
+  const clipped = tensor('clipped', [2, 1, 3], { dtype: 'int32' });
+  await executor._buildNodePipeline({
+    id: 'clip', opType: 'Clip',
+    inputs: { input: logicalA }, outputs: { out: clipped },
+    params: { min: -2, max: 5 },
+  });
+  assert.equal(device.state.shaderCodes.at(-1), 'clip-typed');
+  const clipParams = paramsFrom(device, 2).bytes.buffer;
+  assert.deepEqual(
+    [...new Uint32Array(clipParams).slice(0, 2)],
+    [6, DataType.I32],
+  );
+  assert.deepEqual([...new Int32Array(clipParams).slice(8, 10)], [-2, 5]);
+
+  const condition = tensor('condition', [2, 1, 3], { dtype: 'int32' });
+  const selected = tensor('selected', [2, 1, 3], { dtype: 'int32' });
+  await executor._buildNodePipeline({
+    id: 'where_i32', opType: 'Where',
+    inputs: { condition, x: clipped, y: logicalA },
+    outputs: { out: selected }, params: {},
+  });
+  assert.equal(device.state.shaderCodes.at(-1), 'where-typed');
+  assert.deepEqual(
+    [...new Uint32Array(paramsFrom(device, 4).bytes.buffer)],
+    [6, DataType.I32, 0, 0],
+  );
+  executor.dispose();
+});
+
+test('WebGPU QBatchMatMul accepts device-only tensors and binds canonical U8S8 metadata', async () => {
+  const device = mockDevice();
+  const executor = new GraphExecutor(device, { nodes: [] }, {
+    shaderLibrary: { getQBatchMatMulShader: () => 'qbatch-matmul' },
+  });
+  const a = quantizedTensor('qa', [2, 1, 2, 3], {
+    dtype: 'uint8',
+    scale: 0.5,
+    zeroPoint: 10,
+  });
+  const b = quantizedTensor('qb', [1, 2, 3, 2], {
+    dtype: 'int8',
+    scale: 0.25,
+    zeroPoint: -1,
+  });
+  const out = quantizedTensor('qout', [2, 2, 2, 2], {
+    dtype: 'uint8',
+    scale: 0.125,
+    zeroPoint: 100,
+  });
+  await executor._buildNodePipeline({
+    id: 'qbatch_matmul',
+    opType: 'QBatchMatMul',
+    inputs: { a, b },
+    outputs: { out },
+    params: {},
+  });
+
+  assert.equal(device.state.shaderCodes.at(-1), 'qbatch-matmul');
+  assert.deepEqual(executor.pipelines.at(-1).workgroupCount, [1, 1, 1]);
+  const entries = device.state.bindGroups.at(-1).entries;
+  const metadata = new Uint32Array(
+    entries.find(({ binding }) => binding === 3).resource.buffer.bytes.buffer,
+  );
+  assert.deepEqual([...metadata], [2, 1, 6, 0, 0, 6]);
+  const params = entries.find(({ binding }) => binding === 4).resource.buffer.bytes.buffer;
+  assert.deepEqual(
+    [...new Uint32Array(params).slice(0, 8)],
+    [2, 2, 3, 2, 16, DataType.U8, DataType.I8, DataType.U8],
+  );
+  assert.deepEqual([...new Int32Array(params).slice(8, 11)], [10, -1, 100]);
+  assert.deepEqual([...new Float32Array(params).slice(12, 15)], [0.5, 0.25, 0.125]);
+  executor.dispose();
+});
+
+test('WebGPU storage-only dispatch preserves I32 through concat/shape/slice/expand/split', async () => {
+  const device = mockDevice();
+  const executor = new GraphExecutor(device, { nodes: [] }, {
+    shaderLibrary: {
+      getConcatCopy32Shader: () => 'concat-copy-32',
+      getCopy32Shader: () => 'copy-32',
+      getGeneralTransposeShader: () => 'transpose-32',
+      getSliceNdShader: () => 'slice-32',
+      getExpandShader: () => 'expand-32',
+      getSplitShader: () => 'split-32',
+    },
+  });
+  const a = tensor('a', [2, 2], { dtype: 'int32' });
+  const b = tensor('b', [2, 1], { dtype: 'int32' });
+  const joined = tensor('joined', [2, 3], { dtype: 'int32' });
+  await executor._buildNodePipeline({
+    id: 'concat_i32', opType: 'Concat2',
+    inputs: { input0: a, input1: b }, outputs: { out: joined },
+    params: { axis: 1 },
+  });
+  assert.deepEqual(device.state.shaderCodes, ['concat-copy-32']);
+  assert.equal(executor.pipelines.length, 2);
+
+  const reshaped = tensor('reshaped', [3, 2], { dtype: 'int32' });
+  await executor._buildNodePipeline({
+    id: 'reshape_i32', opType: 'Reshape',
+    inputs: { input: joined }, outputs: { out: reshaped }, params: {},
+  });
+  assert.equal(device.state.shaderCodes.at(-1), 'copy-32');
+
+  const transposed = tensor('transposed', [2, 3], { dtype: 'int32' });
+  await executor._buildNodePipeline({
+    id: 'transpose_i32', opType: 'Transpose',
+    inputs: { input: reshaped }, outputs: { out: transposed },
+    params: { perm: [1, 0] },
+  });
+  assert.equal(device.state.shaderCodes.at(-1), 'transpose-32');
+
+  const sliced = tensor('sliced', [2, 2], { dtype: 'int32' });
+  await executor._buildNodePipeline({
+    id: 'slice_i32', opType: 'Slice',
+    inputs: { input: transposed }, outputs: { out: sliced },
+    params: { axes: [1], starts: [1], steps: [1] },
+  });
+  assert.equal(device.state.shaderCodes.at(-1), 'slice-32');
+
+  const shaped = tensor('shaped', [2, 1, 2], { dtype: 'int32' });
+  await executor._buildNodePipeline({
+    id: 'shape_i32', opType: 'Reshape',
+    inputs: { input: sliced }, outputs: { out: shaped }, params: {},
+  });
+  const expanded = tensor('expanded', [2, 2, 2], { dtype: 'int32' });
+  await executor._buildNodePipeline({
+    id: 'expand_i32', opType: 'Expand',
+    inputs: { input: shaped }, outputs: { out: expanded }, params: {},
+  });
+  assert.equal(device.state.shaderCodes.at(-1), 'expand-32');
+
+  const part0 = tensor('part0', [2, 1, 2], { dtype: 'int32' });
+  const part1 = tensor('part1', [2, 1, 2], { dtype: 'int32' });
+  await executor._buildNodePipeline({
+    id: 'split_i32', opType: 'Split',
+    inputs: { input: expanded }, outputs: { part0, part1 },
+    params: { axis: 1 },
+  });
+  assert.equal(device.state.shaderCodes.at(-1), 'split-32');
+  assert.equal(executor.pipelines.filter(({ nodeName }) =>
+    String(nodeName).startsWith('split_i32_split')).length, 2);
+  executor.dispose();
+});
+
+test('WebGPU Expand uses packed descriptor-preserving I8/U8 dispatch', async () => {
+  const device = mockDevice();
+  const executor = new GraphExecutor(device, { nodes: [] }, {
+    shaderLibrary: { getTypedExpandShader: () => 'expand-typed' },
+  });
+  const input = quantizedTensor('expand_input', [1, 1, 64], {
+    dtype: 'uint8', scale: 0.125, zeroPoint: 127,
+  });
+  const out = quantizedTensor('expand_out', [1, 402, 64], {
+    dtype: 'uint8', scale: 0.125, zeroPoint: 127,
+  });
+  await executor._buildNodePipeline({
+    id: 'expand_u8', opType: 'Expand',
+    inputs: { input }, outputs: { out }, params: {},
+  });
+  assert.equal(device.state.shaderCodes.at(-1), 'expand-typed');
+  assert.deepEqual(executor.pipelines.at(-1).workgroupCount, [101, 1, 1]);
+  const entries = device.state.bindGroups.at(-1).entries;
+  const metadata = new Uint32Array(
+    entries.find(({ binding }) => binding === 2).resource.buffer.bytes.buffer,
+  );
+  assert.deepEqual([...metadata.slice(0, 7)], [3, 3, 0, 25728, 1, 1, 64]);
+
+  const mismatch = quantizedTensor('expand_mismatch', [1, 402, 64], {
+    dtype: 'uint8', scale: 0.25, zeroPoint: 127,
+  });
+  await assert.rejects(
+    () => executor._buildNodePipeline({
+      id: 'expand_bad_affine', opType: 'Expand',
+      inputs: { input }, outputs: { out: mismatch }, params: {},
+    }),
+    /must preserve its I8\/U8 affine descriptor/,
+  );
+  executor.dispose();
+});
+
+test('WebGPU Transpose uses packed descriptor-preserving I8/U8 dispatch', async () => {
+  const device = mockDevice();
+  const executor = new GraphExecutor(device, { nodes: [] }, {
+    shaderLibrary: { getTypedTransposeShader: () => 'transpose-typed' },
+  });
+  const input = quantizedTensor('nchw', [1, 2, 7, 19], {
+    dtype: 'uint8', scale: 0.125, zeroPoint: 123,
+  });
+  const out = quantizedTensor('nhwc', [1, 7, 19, 2], {
+    dtype: 'uint8', scale: 0.125, zeroPoint: 123,
+  });
+  await executor._buildNodePipeline({
+    id: 'transpose_u8',
+    opType: 'Transpose',
+    inputs: { input },
+    outputs: { out },
+    params: { perm: [0, 2, 3, 1] },
+  });
+  assert.equal(device.state.shaderCodes.at(-1), 'transpose-typed');
+  assert.deepEqual(executor.pipelines.at(-1).workgroupCount, [2, 1, 1]);
+  const entries = device.state.bindGroups.at(-1).entries;
+  const metadata = new Uint32Array(
+    entries.find(({ binding }) => binding === 2).resource.buffer.bytes.buffer,
+  );
+  assert.deepEqual(
+    [...metadata],
+    [266, 4, 266, 38, 2, 1, 266, 19, 1, 133],
+  );
+
+  const mismatch = quantizedTensor('mismatch', [1, 7, 19, 2], {
+    dtype: 'uint8', scale: 0.25, zeroPoint: 123,
+  });
+  await assert.rejects(
+    executor._buildNodePipeline({
+      id: 'transpose_bad_descriptor',
+      opType: 'Transpose',
+      inputs: { input },
+      outputs: { out: mismatch },
+      params: { perm: [0, 2, 3, 1] },
+    }),
+    /identical per-tensor metadata/,
+  );
+  executor.dispose();
+});
+
+test('WebGPU Split preserves declared order with twelve outputs', async () => {
+  const device = mockDevice();
+  const executor = new GraphExecutor(device, { nodes: [] }, {
+    shaderLibrary: { getSplitShader: () => 'split-declared-order' },
+  });
+  const input = tensor('input', [2, 12]);
+  const outputs = {};
+  for (let index = 0; index < 12; index++) {
+    outputs[`out${index}`] = tensor(`slice${index}`, [2, 1]);
+  }
+  const firstBindGroup = device.state.bindGroups.length;
+  await executor._buildNodePipeline({
+    id: 'split_many', opType: 'Split',
+    inputs: { input }, outputs, params: { axis: 1 },
+  });
+
+  const groups = device.state.bindGroups.slice(firstBindGroup);
+  assert.equal(groups.length, 12);
+  assert.deepEqual(
+    groups.map(({ entries }) =>
+      entries.find(({ binding }) => binding === 1).resource.buffer.tensor),
+    Array.from({ length: 12 }, (_, index) => `slice${index}`),
+  );
+  assert.deepEqual(
+    groups.map(({ entries }) =>
+      new Uint32Array(entries.find(({ binding }) => binding === 2)
+        .resource.buffer.bytes.buffer)[4]),
+    Array.from({ length: 12 }, (_, index) => index),
+  );
+  executor.dispose();
+});
+
+test('WebGPU Softmax shaders seed maxima from finite row data below the old sentinel', async () => {
+  const softmaxSource = await readFile(
+    new URL('../shaders/inference/softmax.wgsl', import.meta.url),
+    'utf8',
+  );
+  const logSoftmaxSource = await readFile(
+    new URL('../shaders/inference/logSoftmax.wgsl', import.meta.url),
+    'utf8',
+  );
+  for (const [opType, source] of [
+    ['Softmax', softmaxSource],
+    ['LogSoftmax', logSoftmaxSource],
+  ]) {
+    assert.match(source, /var max_val = input\[offset\];/);
+    assert.match(source, /for \(var j = 1u;/);
+    assert.doesNotMatch(source, /-100000\.0/);
+
+    const device = mockDevice();
+    const executor = new GraphExecutor(device, { nodes: [] }, {
+      shaderLibrary: {
+        getSoftmaxShader: () => softmaxSource,
+        getLogSoftmaxShader: () => logSoftmaxSource,
+      },
+    });
+    const input = tensor(`${opType}_input`, [1, 3], {
+      buffer: Float32Array.of(-200003, -200002, -200001),
+    });
+    const out = tensor(`${opType}_out`, [1, 3]);
+    const inputBuffer = device.createBuffer({
+      size: input.sizeBytes,
+      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+    });
+    const outputBuffer = device.createBuffer({
+      size: out.sizeBytes,
+      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC,
+    });
+    new Float32Array(inputBuffer.bytes.buffer).set(input.buffer);
+    executor.gpuBuffers.set(input.name, inputBuffer);
+    executor.gpuBuffers.set(out.name, outputBuffer);
+    await executor._buildNodePipeline({
+      id: `${opType}_extreme_negative`,
+      opType,
+      inputs: { input },
+      outputs: { out },
+      params: { axis: -1 },
+    });
+    assert.equal(device.state.shaderCodes.at(-1), source);
+    assert.deepEqual(
+      [...new Uint32Array(paramsFrom(device, 2).bytes.buffer)],
+      [1, 3, 0, 0],
+    );
+    const commandEncoder = device.createCommandEncoder();
+    const pass = commandEncoder.beginComputePass();
+    const compiled = executor.pipelines.at(-1);
+    pass.setPipeline(compiled.pipeline);
+    pass.setBindGroup(0, compiled.bindGroup);
+    pass.dispatchWorkgroups(...compiled.workgroupCount);
+    pass.end();
+    device.queue.submit([commandEncoder.finish()]);
+
+    const actual = [...new Float32Array(outputBuffer.bytes.buffer)];
+    assert.ok(actual.every(Number.isFinite), `${opType} output must stay finite`);
+    const exponentials = [Math.exp(-2), Math.exp(-1), 1];
+    const sum = exponentials.reduce((left, right) => left + right, 0);
+    const expected = opType === 'Softmax'
+      ? exponentials.map((value) => value / sum)
+      : [-2 - Math.log(sum), -1 - Math.log(sum), -Math.log(sum)];
+    for (let index = 0; index < expected.length; index++) {
+      assert.ok(
+        Math.abs(actual[index] - expected[index]) <= 1e-6,
+        `${opType}[${index}] got ${actual[index]}, expected ${expected[index]}`,
+      );
+    }
+    executor.dispose();
+  }
+});
+
+test('WebGPU LayerNorm computes variance from centered values in a second pass', async () => {
+  const source = await readFile(
+    new URL('../shaders/inference/layerNorm.wgsl', import.meta.url),
+    'utf8',
+  );
+  assert.match(source, /let mean = sum \/ f32\(d_model\);/);
+  assert.match(source, /var variance_sum : f32 = 0\.0;/);
+  assert.match(source, /let centered = input\[offset \+ i\] - mean;/);
+  assert.match(source, /variance_sum = variance_sum \+ \(centered \* centered\);/);
+  assert.match(source, /let variance = variance_sum \/ f32\(d_model\);/);
+  assert.doesNotMatch(source, /sq_sum|mean \* mean/);
 });
 
 test('WebGPU Slice rejects non-positive steps and output selections beyond the input', async () => {
@@ -2215,7 +2958,7 @@ test('WebGPU typed MaxPool2D dispatches signed packed-byte pooling', async () =>
   assert.deepEqual(device.state.shaderCodes, ['typed-maxpool']);
   assert.deepEqual(executor.pipelines[0].workgroupCount, [1, 1, 1]);
   assert.deepEqual([...new Uint32Array(paramsFrom(device, 2).bytes.buffer).slice(0, 13)], [
-    1, 3, 3, 1, 2, 2, 2, 2, 2, 2, 0, 0, 2,
+    1, 3, 3, 1, 2, 2, 2, 2, 2, 2, 0, 0, DataType.I8,
   ]);
   executor.dispose();
 
@@ -2249,7 +2992,8 @@ test('WebGPU typed Resize uses nearest-neighbor packed-byte forwarding only', as
   });
 
   await executor._buildNodePipeline({
-    id: 'resize_u8', opType: 'Resize', inputs: { input }, outputs: { out }, params: { mode: 'nearest' },
+    id: 'resize_u8', opType: 'Resize', inputs: { input }, outputs: { out },
+    params: { mode: 'nearest', coordinate_transformation_mode: 'asymmetric' },
   });
 
   assert.deepEqual(device.state.shaderCodes, ['typed-resize-nearest']);
@@ -2273,10 +3017,57 @@ test('WebGPU typed Resize uses nearest-neighbor packed-byte forwarding only', as
   );
   await assert.rejects(
     () => rejectingExecutor._buildNodePipeline({
+      id: 'resize_i8_noncanonical', opType: 'Resize', inputs: { input }, outputs: { out },
+      params: { mode: 'nearest', coordinate_transform_mode: 'asymmetric' },
+    }),
+    /unsupported 'coordinate_transform_mode'.*coordinate_transformation_mode/,
+  );
+  await assert.rejects(
+    () => rejectingExecutor._buildNodePipeline({
       id: 'resize_i8_rounding', opType: 'Resize', inputs: { input }, outputs: { out },
       params: { mode: 'nearest', nearest_mode: 'round_prefer_floor' },
     }),
     /nearest_mode "floor"/,
   );
   rejectingExecutor.dispose();
+});
+
+test('WebGPU snapshots every declared output, including input, weight, and Dropout aliases', async () => {
+  const device = mockDevice();
+  const graph = new Graph();
+  const input = graph.addInput('input', [1], 'float32');
+  const weight = graph.addWeight('weight', [1], 'float32', Float32Array.of(2));
+  const { out: dropout } = graph.addOp('Dropout', { input }, { out: [1] });
+  graph.setOutputs(input, weight, dropout);
+
+  const executor = new GraphExecutor(device, graph, { shaderLibrary: {} });
+  await executor.compile();
+
+  const inputBuffer = executor.gpuBuffers.get(input.name);
+  const weightBuffer = executor.gpuBuffers.get(weight.name);
+  const dropoutBuffer = executor.gpuBuffers.get(dropout.name);
+  assert.ok(inputBuffer.descriptor.usage & GPUBufferUsage.COPY_SRC);
+  assert.ok(weightBuffer.descriptor.usage & GPUBufferUsage.COPY_SRC);
+  assert.equal(dropoutBuffer, inputBuffer, 'inference Dropout should alias its input');
+
+  device.queue.writeBuffer(inputBuffer, 0, Float32Array.of(3));
+  const snapshots = executor.snapshotOutputs();
+  assert.deepEqual([...snapshots.keys()], ['input', 'weight', dropout.name]);
+  assert.notEqual(snapshots.get('input').deviceBuffer, inputBuffer);
+  assert.notEqual(snapshots.get('weight').deviceBuffer, weightBuffer);
+  assert.notEqual(snapshots.get(dropout.name).deviceBuffer, dropoutBuffer);
+
+  device.queue.writeBuffer(inputBuffer, 0, Float32Array.of(9));
+  device.queue.writeBuffer(weightBuffer, 0, Float32Array.of(8));
+  assert.equal(new Float32Array(snapshots.get('input').deviceBuffer.bytes.buffer)[0], 3);
+  assert.equal(new Float32Array(snapshots.get('weight').deviceBuffer.bytes.buffer)[0], 2);
+  assert.equal(new Float32Array(snapshots.get(dropout.name).deviceBuffer.bytes.buffer)[0], 3);
+
+  executor.dispose();
+  for (const snapshot of snapshots.values()) {
+    assert.equal(snapshot.deviceBuffer.destroyed, undefined,
+      'executor disposal must not invalidate result-owned buffers');
+    snapshot.deviceBuffer.destroy();
+    assert.equal(snapshot.deviceBuffer.destroyed, true);
+  }
 });

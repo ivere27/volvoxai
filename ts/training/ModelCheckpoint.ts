@@ -7,7 +7,7 @@ import {
   synchronizeTrainingGraphState,
   TrainingGraph,
 } from './TrainingGraph.js';
-import type { RuntimeDType, RuntimeTypedArray, TensorQuantization } from '../types.js';
+import type { RuntimeDType, RuntimeTypedArray } from '../types.js';
 import type { StatefulTrainingGraph } from './TrainingGraph.js';
 import {
   canonicalOptimizerDescriptor,
@@ -27,15 +27,14 @@ export interface StandaloneTensorConfig {
   shape: number[];
   dtype: RuntimeDType;
   hasBuffer: boolean;
-  quantization?: TensorQuantization;
 }
 
-export interface CheckpointConfig {
+export interface CheckpointGraph {
+  format: 'volvox-graph/v1';
   inputs: Record<string, any>;
   nodes: any[];
   outputs: string[];
   outputsExplicit: boolean;
-  weights_quantization?: Record<string, any>;
   standaloneTensors: Record<string, StandaloneTensorConfig>;
   [name: string]: unknown;
 }
@@ -56,7 +55,7 @@ export interface ModelCheckpointExportOptions {
 
 export interface ModelCheckpoint {
   format: typeof VOLVOX_CHECKPOINT_FORMAT;
-  config: CheckpointConfig;
+  graph: CheckpointGraph;
   weights: ArrayBuffer;
   optimizer: ArrayBuffer | null;
   optimizerEntries: CheckpointOptimizerEntry[];
@@ -141,7 +140,7 @@ function storedOptimizerDescriptor(value: any): TrainingOptimizerDescriptor {
   return canonical;
 }
 
-/** Export a self-contained JS checkpoint object with blueprint, weights and optimizer state. */
+/** Export a self-contained JS checkpoint object with graph document, weights and optimizer state. */
 export function exportModelCheckpoint(
   graph: CoreGraph,
   options: ModelCheckpointExportOptions = {},
@@ -153,7 +152,7 @@ export function exportModelCheckpoint(
     throw new Error("Cannot checkpoint while gradient accumulation is pending; flush or reset it first.");
   }
   trainingGraph.assertValid();
-  for (const name of ["config", "trainingStep", "optimizerDescriptor", "trainingMetadata"]) {
+  for (const name of ["graph", "trainingStep", "optimizerDescriptor", "trainingMetadata"]) {
     if (Object.prototype.hasOwnProperty.call(options, name)) {
       throw new Error(`Checkpoint ${name} is generated from graph state and cannot be overridden.`);
     }
@@ -162,22 +161,28 @@ export function exportModelCheckpoint(
   if (!Number.isSafeInteger(trainingStep) || trainingStep < 0) {
     throw new Error("Checkpoint trainingStep must be a non-negative safe integer.");
   }
-  const config = cloneValue(new TrainingModelBuilder(trainingGraph as TrainingGraph).toConfig()) as CheckpointConfig;
-  config.outputsExplicit = trainingGraph._outputsExplicit === true ||
+  const graphPackage = new TrainingModelBuilder(
+    trainingGraph as TrainingGraph,
+  ).toGraphPackage();
+  const graphDocument = cloneValue(graphPackage.graph) as CheckpointGraph;
+  graphDocument.outputsExplicit = trainingGraph._outputsExplicit === true ||
     !sameShape(trainingGraph.outputNames, trainingGraph._autoOutputNames || []);
-  for (let index = 0; index < (config.nodes || []).length; index++) {
+  for (let index = 0; index < (graphDocument.nodes || []).length; index++) {
     const graphNode = trainingGraph.nodes[index];
-    if (!graphNode) throw new Error(`Checkpoint config contains unexpected node ${index}.`);
-    config.nodes[index].outputs_dtype = Object.fromEntries(
+    if (!graphNode) throw new Error(`Checkpoint graph contains unexpected node ${index}.`);
+    graphDocument.nodes[index].outputs_dtype = Object.fromEntries(
       Object.entries(graphNode.outputs || {}).map(([key, tensor]) => [key, tensor.dtype]),
     );
   }
   const weightsFile = SafetensorsFile.empty({
     metadata: { format: VOLVOX_CHECKPOINT_FORMAT, kind: "weights" },
   });
+  const quantizationParameterNames = new Set(
+    graphPackage.quantizationParameters.listTensorNames(),
+  );
   const produced = new Set(trainingGraph.nodes.flatMap((node) =>
     Object.values(node.outputs || {}).map((tensor) => tensor.name)));
-  config.standaloneTensors = {};
+  graphDocument.standaloneTensors = {};
   for (const tensor of trainingGraph.tensors.values()) {
     const standalone = !tensor.isWeight && !tensor.isInput && !produced.has(tensor.name);
     if (!tensor.isWeight && !standalone) continue;
@@ -185,16 +190,18 @@ export function exportModelCheckpoint(
       throw new Error(`Cannot checkpoint weight '${tensor.name}' without CPU storage.`);
     }
     if (standalone) {
-      config.standaloneTensors[tensor.name] = {
+      graphDocument.standaloneTensors[tensor.name] = {
         shape: [...tensor.shape],
         dtype: tensor.dtype,
         hasBuffer: tensor.buffer != null,
-        ...(tensor.quantization ? { quantization: cloneValue(tensor.quantization) } : {}),
       };
     }
-    if (tensor.buffer) {
+    if (tensor.buffer && !quantizationParameterNames.has(tensor.name)) {
       weightsFile.addTensor(tensor.name, safetensorsDType(tensor.dtype), tensor.shape, bytesOf(tensor.buffer));
     }
+  }
+  for (const [name, tensor] of graphPackage.quantizationParameters.tensorEntries()) {
+    weightsFile.addTensor(name, tensor.dtype, tensor.shape, tensor.getBytes());
   }
 
   let optimizer: ArrayBuffer | null = null;
@@ -238,7 +245,7 @@ export function exportModelCheckpoint(
 
   return {
     format: VOLVOX_CHECKPOINT_FORMAT,
-    config,
+    graph: graphDocument,
     weights: weightsFile.toArrayBuffer(),
     optimizer,
     optimizerEntries,
@@ -256,15 +263,15 @@ export function importModelCheckpoint(checkpoint: any): ImportedModelCheckpoint 
     throw new Error(`Unsupported checkpoint format '${checkpoint?.format}'.`);
   }
   for (const name of [
-    "config", "weights", "optimizer", "optimizerEntries", "optimizerDescriptor",
+    "graph", "weights", "optimizer", "optimizerEntries", "optimizerDescriptor",
     "trainingStep", "tokenizerMetadata", "trainingMetadata", "metadata",
   ]) {
     if (!Object.prototype.hasOwnProperty.call(checkpoint, name)) {
       throw new Error(`Checkpoint v1 is missing required field '${name}'.`);
     }
   }
-  if (!checkpoint.config || !(checkpoint.weights instanceof ArrayBuffer)) {
-    throw new Error("Checkpoint requires a blueprint config and safetensors weight bytes.");
+  if (!checkpoint.graph || !(checkpoint.weights instanceof ArrayBuffer)) {
+    throw new Error("Checkpoint requires a canonical graph document and safetensors weight bytes.");
   }
   const trainingStep = checkpoint.trainingStep;
   if (!Number.isSafeInteger(trainingStep) || trainingStep < 0) {
@@ -279,26 +286,30 @@ export function importModelCheckpoint(checkpoint: any): ImportedModelCheckpoint 
   if (trainingStep > 0 && optimizerDescriptor == null) {
     throw new Error("A trained checkpoint requires an optimizerDescriptor for self-contained resume.");
   }
-  const config = cloneValue(checkpoint.config) as CheckpointConfig;
-  if (!config || typeof config !== "object" || Array.isArray(config)) {
-    throw new Error("Checkpoint config must be an object.");
+  const graphDocument = cloneValue(checkpoint.graph) as CheckpointGraph;
+  if (!graphDocument || typeof graphDocument !== "object" || Array.isArray(graphDocument) ||
+      graphDocument.format !== 'volvox-graph/v1') {
+    throw new Error("Checkpoint graph must be a canonical volvox-graph/v1 document.");
   }
-  const standaloneTensors = config.standaloneTensors;
-  if (!isRecord(config.inputs) || !Array.isArray(config.nodes) || !isRecord(standaloneTensors)) {
-    throw new Error("Checkpoint config inputs, nodes, and standaloneTensors are invalid.");
+  const standaloneTensors = graphDocument.standaloneTensors;
+  if (!isRecord(graphDocument.inputs) || !Array.isArray(graphDocument.nodes) ||
+      !isRecord(standaloneTensors)) {
+    throw new Error("Checkpoint graph inputs, nodes, and standaloneTensors are invalid.");
   }
-  if (!Array.isArray(config.outputs) || typeof config.outputsExplicit !== "boolean") {
-    throw new Error("Checkpoint config outputs and outputsExplicit are invalid.");
-  }
-  const weightsQuantization = config.weights_quantization ?? {};
-  if (!isRecord(weightsQuantization)) {
-    throw new Error("Checkpoint weights_quantization must be an object when present.");
+  if (!Array.isArray(graphDocument.outputs) ||
+      typeof graphDocument.outputsExplicit !== "boolean") {
+    throw new Error("Checkpoint graph outputs and outputsExplicit are invalid.");
   }
   const graph = new TrainingGraph() as CheckpointTrainingGraph & TrainingGraph;
   const builder = new TrainingModelBuilder(graph);
   const tensors = new Map<string, any>();
   const weightsFile = SafetensorsFile.fromArrayBuffer(checkpoint.weights);
   assertCheckpointFile(weightsFile, "weights");
+  const affine = GraphLoader._parseSafetensorsAffineQuantization(
+    graphDocument,
+    [weightsFile],
+    ["checkpoint.weights"],
+  );
   for (const [name, entry] of weightsFile.tensorEntries()) {
     const stored = weightsFile.toRuntimeTypedArray(entry);
     const runtimeBuffer = stored.slice() as RuntimeTypedArray;
@@ -311,17 +322,13 @@ export function importModelCheckpoint(checkpoint: any): ImportedModelCheckpoint 
     const tensor = standalone
       ? graph.addTensor(name, entry.shape, dtype, {
         buffer: runtimeBuffer,
-        quantization: standalone.quantization,
+        quantization: affine.hydrated[name],
       })
       : graph.addWeight(name, entry.shape, dtype, {
         buffer: runtimeBuffer,
-        quantization: weightsQuantization[name],
+        quantization: affine.hydrated[name],
       });
     tensors.set(name, tensor);
-  }
-  for (const name of Object.keys(weightsQuantization)) {
-    const tensor = graph.getTensor(name);
-    if (!tensor?.isWeight) throw new Error(`Checkpoint weights_quantization declares unknown weight '${name}'.`);
   }
   for (const [name, info] of Object.entries(standaloneTensors)) {
     if (!info || typeof info !== "object" || Array.isArray(info) || !Array.isArray(info.shape) ||
@@ -330,21 +337,23 @@ export function importModelCheckpoint(checkpoint: any): ImportedModelCheckpoint 
     }
     if (tensors.has(name)) continue;
     if (info.hasBuffer) throw new Error(`Checkpoint standalone tensor '${name}' is missing its payload.`);
-    const tensor = graph.addTensor(name, info.shape, info.dtype, { quantization: info.quantization });
+    const tensor = graph.addTensor(name, info.shape, info.dtype, {
+      quantization: affine.hydrated[name],
+    });
     tensors.set(name, tensor);
   }
   graph.weightFiles.push(weightsFile);
 
-  for (const [name, info] of Object.entries(config.inputs)) {
+  for (const [name, info] of Object.entries(graphDocument.inputs)) {
     if (!isRecord(info) || !Array.isArray(info.shape) || typeof info.dtype !== "string" || !info.dtype) {
       throw new Error(`Checkpoint input '${name}' requires explicit shape and dtype.`);
     }
     const tensor = builder.input(name, info.shape, info.dtype as RuntimeDType, {
-      quantization: info.quantization,
+      quantization: affine.hydrated[name],
     });
     tensors.set(name, tensor);
   }
-  for (const node of config.nodes) {
+  for (const node of graphDocument.nodes) {
     if (!isRecord(node) || !isRecord(node.inputs) || !isRecord(node.outputs) ||
         !isRecord(node.outputs_shape) || !isRecord(node.outputs_dtype) || !isRecord(node.params)) {
       throw new Error("Checkpoint nodes require input/output/shape/dtype/params objects.");
@@ -352,14 +361,6 @@ export function importModelCheckpoint(checkpoint: any): ImportedModelCheckpoint 
     if ((typeof node.id !== "string" && typeof node.id !== "number") || String(node.id).length === 0 ||
         typeof node.opType !== "string" || !node.opType) {
       throw new Error("Checkpoint nodes require explicit id and opType fields.");
-    }
-    if (node.outputs_quantization != null && !isRecord(node.outputs_quantization)) {
-      throw new Error(`Checkpoint node '${node.id}' outputs_quantization must be an object.`);
-    }
-    for (const key of Object.keys(node.outputs_quantization || {})) {
-      if (!Object.prototype.hasOwnProperty.call(node.outputs, key)) {
-        throw new Error(`Checkpoint node '${node.id}' outputs_quantization declares unknown output '${key}'.`);
-      }
     }
     const inputs: Record<string, any> = {};
     for (const [key, name] of Object.entries(node.inputs || {})) {
@@ -378,8 +379,8 @@ export function importModelCheckpoint(checkpoint: any): ImportedModelCheckpoint 
         name,
         shape,
         dtype,
-        ...(node.outputs_quantization?.[key] != null
-          ? { quantization: cloneValue(node.outputs_quantization[key]) }
+        ...(affine.hydrated[name] != null
+          ? { quantization: affine.hydrated[name] }
           : {}),
       };
     }
@@ -392,11 +393,11 @@ export function importModelCheckpoint(checkpoint: any): ImportedModelCheckpoint 
     });
     for (const tensor of Object.values(created.outputs)) tensors.set(tensor.name, tensor);
   }
-  if (config.outputsExplicit) {
-    builder.outputs(...config.outputs);
+  if (graphDocument.outputsExplicit) {
+    builder.outputs(...graphDocument.outputs);
   } else {
     builder.autoOutputs();
-    if (!sameShape(graph.outputNames, config.outputs)) {
+    if (!sameShape(graph.outputNames, graphDocument.outputs)) {
       throw new Error("Checkpoint auto-selected outputs do not match its graph topology.");
     }
   }

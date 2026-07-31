@@ -25,7 +25,7 @@ test('CPU keeps raw W8A8 bytes through MaxPool, nearest resize, reshape, and con
   const { out } = graph.addOp('Concat', { input0: flat, input1: flat }, {
     out: output('out', [1, 4]),
   }, { axis: 1, count: 2 });
-  graph.outputNames = [out.name];
+  graph.setOutputs([out.name]);
   const engine = new CPUEngine();
   engine.allocateGraph(graph);
   const result = await engine.execute({ input: Int8Array.of(-10, 2, 5, -2) });
@@ -104,4 +104,16 @@ test('CPU typed pool and nearest resize reject non-canonical semantics', () => {
     /coordinate_transformation_mode "asymmetric"/,
   );
   assert.equal(resized.dtype, 'int8');
+
+  const misspelledGraph = new Graph();
+  const misspelledInput = misspelledGraph.addInput('input', [1, 2, 2, 1], 'int8', {
+    quantization: q,
+  });
+  misspelledGraph.addOp('Resize', { input: misspelledInput }, {
+    out: output('resized', [1, 4, 4, 1]),
+  }, { mode: 'nearest', coordinate_transform_mode: 'asymmetric' });
+  assert.throws(
+    () => new CPUEngine().allocateGraph(misspelledGraph),
+    /does not define coordinate_transform_mode; use coordinate_transformation_mode/,
+  );
 });

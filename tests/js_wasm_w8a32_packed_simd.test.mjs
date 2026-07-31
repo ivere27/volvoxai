@@ -10,8 +10,12 @@ import { promisify } from 'node:util';
 const run = promisify(execFile);
 const repositoryRoot = fileURLToPath(new URL('../', import.meta.url));
 const clang = process.env.CLANG || 'clang';
-const I8 = 2;
-const U8 = 3;
+// Canonical protobuf DataType values used by the public native/WASM ABI.
+const VX_DTYPE_UNSPECIFIED = 0;
+const VX_DTYPE_U8 = 5;
+const VX_DTYPE_I8 = 6;
+const VX_DTYPE_I32 = 16;
+const VX_DTYPE_F32 = 18;
 
 async function buildInstrumentedWasm(directory) {
   const output = join(directory, 'volvoxai-w8a32-simd.wasm');
@@ -164,88 +168,88 @@ test('actual WASM SIMD128 packed W8A32 M=1 is correct and preserves fallbacks', 
 
     executeCase(api, memory, {
       name: 'I8 asymmetric per-channel F32 zero point scalar fallback',
-      rows: 1, dIn: 31, dOut: 11, weightDtype: I8,
+      rows: 1, dIn: 31, dOut: 11, weightDtype: VX_DTYPE_I8,
       weights: signedWeights(31, 11),
       scales: Float32Array.from({ length: 11 }, (_, column) => (column % 4 + 1) / 256),
       scaleElements: 11,
       zeroPoints: Float32Array.from({ length: 11 }, (_, column) =>
         ((column * 3) % 11) - 5.5),
-      zeroPointDtype: 0, zeroPointElements: 11,
+      zeroPointDtype: VX_DTYPE_F32, zeroPointElements: 11,
       bias: Float32Array.from({ length: 11 }, (_, column) => (column * 3 - 12) / 4),
       expectedSimdCalls: 0,
     });
 
     executeCase(api, memory, {
       name: 'U8 asymmetric scalar zero point fallback without bias',
-      rows: 1, dIn: 17, dOut: 9, weightDtype: U8,
+      rows: 1, dIn: 17, dOut: 9, weightDtype: VX_DTYPE_U8,
       weights: unsignedWeights(17, 9), scales: Float32Array.of(0.125),
       scaleElements: 1, zeroPoints: Uint8Array.of(127),
-      zeroPointDtype: U8, zeroPointElements: 1, bias: null,
+      zeroPointDtype: VX_DTYPE_U8, zeroPointElements: 1, bias: null,
       expectedSimdCalls: 0,
     });
 
     executeCase(api, memory, {
       name: 'I8 odd-K/odd-N SIMD with per-channel scales and symmetric metadata',
-      rows: 1, dIn: 963, dOut: 11, weightDtype: I8,
+      rows: 1, dIn: 963, dOut: 11, weightDtype: VX_DTYPE_I8,
       weights: signedWeights(963, 11),
       scales: Float32Array.from({ length: 11 }, (_, column) => (column % 4 + 1) / 256),
       scaleElements: 11,
       zeroPoints: Float32Array.from({ length: 11 }, () => 0),
-      zeroPointDtype: 0, zeroPointElements: 11,
+      zeroPointDtype: VX_DTYPE_F32, zeroPointElements: 11,
       bias: Float32Array.from({ length: 11 }, (_, column) => (column * 3 - 12) / 4),
       expectedSimdCalls: 1,
     });
 
     executeCase(api, memory, {
       name: 'U8 symmetric descriptor stays on the scalar fallback',
-      rows: 1, dIn: 17, dOut: 9, weightDtype: U8,
+      rows: 1, dIn: 17, dOut: 9, weightDtype: VX_DTYPE_U8,
       weights: unsignedWeights(17, 9), scales: Float32Array.of(0.125),
       scaleElements: 1, zeroPoints: Uint8Array.of(0),
-      zeroPointDtype: U8, zeroPointElements: 1, bias: null,
+      zeroPointDtype: VX_DTYPE_U8, zeroPointElements: 1, bias: null,
       expectedSimdCalls: 0,
     });
 
     executeCase(api, memory, {
       name: 'I8 full SIMD panel with no zero point and no bias',
-      rows: 1, dIn: 7, dOut: 8, weightDtype: I8,
+      rows: 1, dIn: 7, dOut: 8, weightDtype: VX_DTYPE_I8,
       weights: signedWeights(7, 8), scales: Float32Array.of(0.015625),
       scaleElements: 1, zeroPoints: null,
-      zeroPointDtype: 0, zeroPointElements: 0, bias: null,
+      zeroPointDtype: VX_DTYPE_UNSPECIFIED, zeroPointElements: 0, bias: null,
       expectedSimdCalls: 1,
     });
 
     executeCase(api, memory, {
       name: 'M=1 N<8 scalar fallback with I8 zero point and bias',
-      rows: 1, dIn: 15, dOut: 7, weightDtype: I8,
+      rows: 1, dIn: 15, dOut: 7, weightDtype: VX_DTYPE_I8,
       weights: signedWeights(15, 7), scales: Float32Array.of(0.0625),
       scaleElements: 1, zeroPoints: Int8Array.of(-3),
-      zeroPointDtype: I8, zeroPointElements: 1,
+      zeroPointDtype: VX_DTYPE_I8, zeroPointElements: 1,
       bias: Float32Array.from({ length: 7 }, (_, column) => column / 4),
       expectedSimdCalls: 0,
     });
 
     executeCase(api, memory, {
       name: 'M>1 scalar fallback with U8 per-channel I32 zero points',
-      rows: 2, dIn: 19, dOut: 9, weightDtype: U8,
+      rows: 2, dIn: 19, dOut: 9, weightDtype: VX_DTYPE_U8,
       weights: unsignedWeights(19, 9),
       scales: Float32Array.from({ length: 9 }, (_, column) => (column % 3 + 1) / 32),
       scaleElements: 9,
       zeroPoints: Int32Array.from({ length: 9 }, (_, column) => 120 + column),
-      zeroPointDtype: 1, zeroPointElements: 9,
+      zeroPointDtype: VX_DTYPE_I32, zeroPointElements: 9,
       bias: Float32Array.from({ length: 9 }, (_, column) => (column - 4) / 8),
       expectedSimdCalls: 0,
     });
 
     const nonDyadicError = executeCase(api, memory, {
       name: 'non-dyadic symmetric I8 SIMD tolerance',
-      rows: 1, dIn: 257, dOut: 11, weightDtype: I8,
+      rows: 1, dIn: 257, dOut: 11, weightDtype: VX_DTYPE_I8,
       inputs: Float32Array.from({ length: 257 }, (_, index) =>
         Math.sin(index * 0.17) * 1.137 + 0.0031),
       weights: signedWeights(257, 11),
       scales: Float32Array.from({ length: 11 }, (_, column) =>
         0.0037 + column * 0.00091),
       scaleElements: 11, zeroPoints: null,
-      zeroPointDtype: 0, zeroPointElements: 0,
+      zeroPointDtype: VX_DTYPE_UNSPECIFIED, zeroPointElements: 0,
       bias: Float32Array.from({ length: 11 }, (_, column) =>
         Math.cos(column * 0.11) * 0.37),
       expectedSimdCalls: 1,
@@ -261,10 +265,11 @@ test('actual WASM SIMD128 packed W8A32 M=1 is correct and preserves fallbacks', 
     cancellationInputs.fill(Math.fround(-9.133296013), 160);
     const cancellationError = executeCase(api, memory, {
       name: 'bounded cancellation remains inside the documented F32 tolerance',
-      rows: 1, dIn: 320, dOut: 8, weightDtype: I8,
+      rows: 1, dIn: 320, dOut: 8, weightDtype: VX_DTYPE_I8,
       inputs: cancellationInputs, weights: new Int8Array(320 * 8).fill(127),
       scales: Float32Array.of(0.00798), scaleElements: 1,
-      zeroPoints: null, zeroPointDtype: 0, zeroPointElements: 0,
+      zeroPoints: null, zeroPointDtype: VX_DTYPE_UNSPECIFIED,
+      zeroPointElements: 0,
       bias: null, expectedSimdCalls: 1,
       tolerance: { absolute: 2e-4, relative: 0 },
     });
@@ -277,11 +282,12 @@ test('actual WASM SIMD128 packed W8A32 M=1 is correct and preserves fallbacks', 
     extremeCancellationInputs.fill(Math.fround(-34.235813), 640);
     const extremeCancellationError = executeCase(api, memory, {
       name: 'audited maximum-K cancellation uses compensated SIMD accumulation',
-      rows: 1, dIn: 1280, dOut: 8, weightDtype: I8,
+      rows: 1, dIn: 1280, dOut: 8, weightDtype: VX_DTYPE_I8,
       inputs: extremeCancellationInputs,
       weights: new Int8Array(1280 * 8).fill(127),
       scales: Float32Array.of(0.024), scaleElements: 1,
-      zeroPoints: null, zeroPointDtype: 0, zeroPointElements: 0,
+      zeroPoints: null, zeroPointDtype: VX_DTYPE_UNSPECIFIED,
+      zeroPointElements: 0,
       bias: null, expectedSimdCalls: 1,
       tolerance: { absolute: 2e-4, relative: 0 },
     });
@@ -291,37 +297,39 @@ test('actual WASM SIMD128 packed W8A32 M=1 is correct and preserves fallbacks', 
 
     executeCase(api, memory, {
       name: 'K above the audited Tiny envelope stays scalar',
-      rows: 1, dIn: 1281, dOut: 8, weightDtype: I8,
+      rows: 1, dIn: 1281, dOut: 8, weightDtype: VX_DTYPE_I8,
       weights: signedWeights(1281, 8), scales: Float32Array.of(0.015625),
       scaleElements: 1, zeroPoints: null,
-      zeroPointDtype: 0, zeroPointElements: 0, bias: null,
+      zeroPointDtype: VX_DTYPE_UNSPECIFIED, zeroPointElements: 0, bias: null,
       expectedSimdCalls: 0,
     });
 
     executeCase(api, memory, {
       name: 'activation outside the audited Tiny envelope stays scalar',
-      rows: 1, dIn: 1, dOut: 8, weightDtype: I8,
+      rows: 1, dIn: 1, dOut: 8, weightDtype: VX_DTYPE_I8,
       inputs: Float32Array.of(35.25), weights: new Int8Array(8).fill(1),
       scales: Float32Array.of(0.015625), scaleElements: 1,
-      zeroPoints: null, zeroPointDtype: 0, zeroPointElements: 0,
+      zeroPoints: null, zeroPointDtype: VX_DTYPE_UNSPECIFIED,
+      zeroPointElements: 0,
       bias: null, expectedSimdCalls: 0,
     });
 
     executeCase(api, memory, {
       name: 'weight scale above the audited Tiny envelope stays scalar',
-      rows: 1, dIn: 320, dOut: 8, weightDtype: I8,
+      rows: 1, dIn: 320, dOut: 8, weightDtype: VX_DTYPE_I8,
       weights: signedWeights(320, 8), scales: Float32Array.of(0.0251),
       scaleElements: 1, zeroPoints: null,
-      zeroPointDtype: 0, zeroPointElements: 0,
+      zeroPointDtype: VX_DTYPE_UNSPECIFIED, zeroPointElements: 0,
       bias: null, expectedSimdCalls: 0,
     });
 
     executeCase(api, memory, {
       name: 'non-finite activation stays scalar',
-      rows: 1, dIn: 1, dOut: 8, weightDtype: I8,
+      rows: 1, dIn: 1, dOut: 8, weightDtype: VX_DTYPE_I8,
       inputs: Float32Array.of(Infinity), weights: new Int8Array(8).fill(1),
       scales: Float32Array.of(0.015625), scaleElements: 1,
-      zeroPoints: null, zeroPointDtype: 0, zeroPointElements: 0,
+      zeroPoints: null, zeroPointDtype: VX_DTYPE_UNSPECIFIED,
+      zeroPointElements: 0,
       bias: null, expectedSimdCalls: 0,
     });
 
@@ -338,11 +346,12 @@ test('actual WASM SIMD128 packed W8A32 M=1 is correct and preserves fallbacks', 
     const malformedOutput = allocate(8 * 4);
     new Uint8Array(memory.buffer, malformedOutput, 8 * 4).fill(0xa5);
     assert.equal(api.pack_q8_weight(
-      malformedPacked, malformedPackedBytes, malformedWeight, 3, 8, I8, 1,
+      malformedPacked, malformedPackedBytes, malformedWeight, 3, 8,
+      VX_DTYPE_I8, 1,
     ), 1);
     assert.equal(api.matmul_quantized_f32_packed(
       malformedInput, malformedPacked, malformedScale, malformedZeroPoint, 0,
-      malformedOutput, 1, 3, 8, I8, 1, I8, 0,
+      malformedOutput, 1, 3, 8, VX_DTYPE_I8, 1, VX_DTYPE_I8, 0,
     ), 0, 'non-null zero-point data with zero elements must be rejected');
     assert.equal(api.w8a32_wasm_simd_calls(), 0);
     assert.deepEqual(

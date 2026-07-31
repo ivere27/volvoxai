@@ -4,10 +4,17 @@ This document describes the VolvoxAI operation list, what each operation means, 
 its logic lives in the repository, and the current implementation status across browser,
 Node, and native backends.
 
+The machine-readable inventory and exporter qualification matrix is generated
+from `proto/kernel_registry.proto` at
+[`generated/kernel-registry.md`](generated/kernel-registry.md). That generated
+matrix is authoritative for membership and route IDs; this page supplies the
+operator semantics, limits, and implementation notes that do not fit in the
+registry.
+
 ## What the Operation List Is
 
-The operation list is the set of `opType` names that can appear in a Volvox blueprint
-graph. A graph node uses one of these names, references input and output tensors, and
+The operation list is the set of `opType` names that can appear in a
+`volvox-graph/v1` document. A graph node uses one of these names, references input and output tensors, and
 passes op-specific parameters through `params`.
 
 The list is used by three parts of the system:
@@ -18,8 +25,8 @@ The list is used by three parts of the system:
    aliases before execution.
 3. **Runtime backends** dispatch each node to the best available implementation.
 
-The operation list is not a full ONNX or TFLite compatibility promise. It is the smaller
-runtime contract that VolvoxAI currently implements for inference and its
+The operation list is smaller than the complete ONNX or TFLite operator sets.
+It is the runtime contract that VolvoxAI implements for inference and its
 opt-in training paths. Forward support does not automatically imply backward
 support; see the training section below.
 
@@ -39,12 +46,13 @@ support; see the training section below.
 | Backend | Runtime role | Main files |
 | --- | --- | --- |
 | CPU(JS) | Pure JavaScript reference backend used by the browser/Node ES module runtime. | [CPUEngine.ts](../ts/backends/CPUEngine.ts), [ts/ops](../ts/ops) |
-| WASM | Browser/Node WebAssembly tier. Direct C kernels cover every documented portable inference contract; operations outside those contracts may use a CPU(JS) helper or reject the input. The full-WASM training sidecar has a separate strict C ABI. | [WasmEngine.ts](../ts/backends/WasmEngine.ts), [native kernels](../native/src/kernels) |
+| WASM | Browser/Node WebAssembly tier. Direct C kernels cover every documented portable inference contract; unsupported inputs reject instead of changing backend tier. The full-WASM training sidecar has a separate strict C ABI. | [WasmEngine.ts](../ts/backends/WasmEngine.ts), [native kernels](../native/src/kernels) |
 | WebGPU | Browser WebGPU compute-shader backend. | [GraphExecutor.ts](../ts/backends/GraphExecutor.ts), [shaders](../shaders) |
 | WebNN | Opportunistic browser accelerator through `navigator.ml`. Unsupported ops throw during build so lower tiers can run. | [WebNNEngine.ts](../ts/backends/WebNNEngine.ts) |
 | CPU(Native) | Freestanding native runtime CPU path. This is separate from CPU(JS). | [engine_runtime.c](../native/src/runtime/engine_runtime.c), [native kernels](../native/src/kernels), [conv_f32_opt.c](../native/src/kernels/conv_f32_opt.c), [quant_cpu_opt.c](../native/src/kernels/quant_cpu_opt.c) |
 | Vulkan(Native) | Native Vulkan compute path. It is called from the native dispatcher and is separate from browser WebGPU. | [engine_runtime.c](../native/src/runtime/engine_runtime.c), [vulkan_engine.c](../native/src/backends/vulkan_engine.c) |
 | OpenGL(Native) | Native desktop OpenGL/OpenGL ES compute path. It is called from the native dispatcher and is separate from browser WebGPU. | [engine_runtime.c](../native/src/runtime/engine_runtime.c), [opengl_engine.c](../native/src/backends/opengl_engine.c) |
+| CUDA(Native) | Opt-in manual-PTX path. Inference is forward-only; the full profile adds the current native F32 backward/loss/optimizer and W8-authoring contracts. Explicit/required selection is strict. | [cuda.md](cuda.md), [cuda_engine.c](../native/src/backends/cuda_engine.c), [cuda_kernels.cu](../native/src/backends/cuda_kernels.cu), [cuda_training_kernels.cu](../native/src/backends/cuda_training_kernels.cu) |
 | Metal(Native) | Native Metal compute path on Apple platforms. It loads Naga-generated MSL and is called from the native dispatcher for selected F32 and canonical packed-byte W8A8 graph ops. | [engine_runtime.c](../native/src/runtime/engine_runtime.c), [metal_engine.m](../native/src/backends/metal_engine.m) |
 
 ## Browser and Node Status
@@ -65,16 +73,17 @@ path rather than a CPU(JS) data loop.
 | `ConvTranspose2D` | Transposed convolution / deconvolution. | [Full](../ts/ops/convTranspose2D.ts) | [Full](../ts/backends/WasmEngine.ts) | [Full](../shaders/inference/convTranspose2D.wgsl) | [Missing](../ts/backends/WebNNEngine.ts) |
 | `QConv2D` | Canonical W8A8 Conv2D: NHWC I8/U8 activation, OHWI I8/U8 weight with axis-0 per-channel metadata, optional I32 accumulator bias, groups/stride/padding/dilation, and fused ReLU/ReLU6. | [Full reference](../ts/ops/qConv2D.ts) | [Full, im2col plus packed SIMD128 for eligible groups=1 calls; portable C fallback](../ts/backends/WasmEngine.ts) | [Full, packed-byte baseline plus portable cooperative tile and feature-gated DP4a tile](../shaders/inference/qConv2DInt8Tiled.wgsl) | [Missing](../ts/backends/WebNNEngine.ts) |
 | `QLinear`, `QMatMul`, `QGemm` | Canonical W8A8 dense layer: `[...,d_in]` bytes, `[d_out,d_in]` per-axis weight, I32 bias, and typed output. | [Full reference](../ts/ops/qLinear.ts) | [Full, packed/raw baseline plus optional Relaxed-SIMD M=1 dot child](../ts/backends/WasmEngine.ts) | [Full, packed-byte baseline plus feature-gated scalar/tiled DP4a](../shaders/inference/qLinearInt8Dot.wgsl) | [Missing](../ts/backends/WebNNEngine.ts) |
+| `QBatchMatMul` | Canonical physical-byte ONNX MatMul: rank-2–8 `[...,M,K] @ [...,K,N]` with right-aligned batch broadcasting, independent per-tensor I8/U8 operands and output, and preflighted I32-safe centered accumulation. | [Full reference](../ts/ops/qBatchMatMul.ts) | [Full, standard SIMD128 across N with exact scalar fallback/tails](../ts/backends/WasmEngine.ts) | [Full implementation, packed-byte WGSL within portable dispatch bounds; physical execution requires a WebGPU adapter](../shaders/inference/qBatchMatMul.wgsl) | [Missing](../ts/backends/WebNNEngine.ts) |
 | `LayerNorm` | Layer normalization over the last feature axis. | [Full](../ts/ops/layerNorm.ts) | [Full](../ts/backends/WasmEngine.ts) | [Full](../shaders/inference/layerNorm.wgsl) | [Full](../ts/backends/WebNNEngine.ts) |
 | `QLayerNorm` | Canonical W8A8 last-axis LayerNorm: same-shape rank-at-least-1 per-tensor I8/U8 input/output, F32 `[D]` gamma/beta, optional positive `eps` (default `1e-5`), and optional `d_model` matching D; row statistics are F32 scratch, not an F32 activation tensor. | [Full reference](../ts/ops/qLayerNorm.ts) | [Full, portable C](../ts/backends/WasmEngine.ts) | [Full, two-pass packed-byte stats/apply](../ts/backends/GraphExecutor.ts) | [Missing](../ts/backends/WebNNEngine.ts) |
 | `RMSNorm` | RMS normalization over the last feature axis. | [Full](../ts/ops/rMSNorm.ts) | [Full, F32 rows](../ts/backends/WasmEngine.ts) | [Full](../shaders/inference/rMSNorm.wgsl) | [Missing](../ts/backends/WebNNEngine.ts) |
-| `RoPE`, `RotaryEmbedding` | Rotary position embedding with GPT-NeoX half-split or GPT-J interleaved pairs. | [Full, canonical F32](../ts/ops/roPE.ts) | [Full, portable C](../native/src/kernels/sequence_ops.c) | [Missing](../ts/backends/GraphExecutor.ts) | [Missing](../ts/backends/WebNNEngine.ts) |
+| `RoPE` | Rotary position embedding with GPT-NeoX half-split or GPT-J interleaved pairs. | [Full, canonical F32](../ts/ops/roPE.ts) | [Full, portable C](../native/src/kernels/sequence_ops.c) | [Missing](../ts/backends/GraphExecutor.ts) | [Missing](../ts/backends/WebNNEngine.ts) |
 | `SSMScan`, `SelectiveScan` | Mamba-style selective state-space recurrence with optional initial/final state, skip, and gate. | [Full, canonical F32](../ts/ops/ssmScan.ts) | [Full, portable C](../native/src/kernels/sequence_ops.c) | [Missing](../ts/backends/GraphExecutor.ts) | [Missing](../ts/backends/WebNNEngine.ts) |
 | `BatchNorm2D` | Per-channel image batch normalization. | [Full](../ts/ops/batchNorm2D.ts) | [Full](../ts/backends/WasmEngine.ts) | [Full](../shaders/inference/batchNorm2D.wgsl) | [Missing](../ts/backends/WebNNEngine.ts) |
 | `GroupNorm` | NHWC group normalization with per-channel affine scale and bias. | [Full](../ts/ops/groupNorm.ts) | [Full, F32 NHWC](../ts/backends/WasmEngine.ts) | [Full](../shaders/inference/groupNorm.wgsl) | [Missing](../ts/backends/WebNNEngine.ts) |
 | `QGroupNorm` | Canonical W8A8 GroupNorm: rank-4 NHWC per-tensor I8/U8 input/output, F32 `[C]` gamma/beta, required `num_groups` dividing C, optional positive `eps` (default `1e-5`), and optional `data_layout: "NHWC"`; group statistics are F32 scratch, not an F32 activation tensor. | [Full reference](../ts/ops/qGroupNorm.ts) | [Full, portable C](../ts/backends/WasmEngine.ts) | [Full, two-pass packed-byte stats/apply](../ts/backends/GraphExecutor.ts) | [Missing](../ts/backends/WebNNEngine.ts) |
 | `Embedding` | I32 row lookup into an F32 embedding table. | [Full](../ts/ops/embedding.ts) | [Full](../ts/backends/WasmEngine.ts) | [Full](../shaders/inference/embedding.wgsl) | [Full](../ts/backends/WebNNEngine.ts) |
-| `QEmbedding` | Canonical W8A8 lookup: graph-input I32 IDs `[S...]`, I8/U8 `[vocab,hidden]` table with axis-0 row metadata, and caller-supplied per-tensor I8/U8 output descriptor `[S...,hidden]`; all IDs are preflighted before writes. | [Full reference](../ts/ops/qEmbedding.ts) | [Full, portable C](../ts/backends/WasmEngine.ts) | [Full, packed-byte baseline](../shaders/inference/qEmbeddingInt8.wgsl) | [Missing](../ts/backends/WebNNEngine.ts) |
+| `QEmbedding` | Canonical W8A8 lookup: I32 IDs `[S...]` proven either by full public-input preflight or a canonical internal `Clip` bounded to `[0,vocab)`, I8/U8 `[vocab,hidden]` table with axis-0 row metadata, and caller-supplied per-tensor I8/U8 output descriptor `[S...,hidden]`. | [Full reference](../ts/ops/qEmbedding.ts) | [Full, portable C](../ts/backends/WasmEngine.ts) | [Full, packed-byte baseline](../shaders/inference/qEmbeddingInt8.wgsl) | [Missing](../ts/backends/WebNNEngine.ts) |
 | `QMaskedMean` | Canonical TaskRouter reduction: I8/U8 per-tensor `[B,S,D]` input, unquantized I32 `[B,S]` nonzero-keep mask, and I8/U8 per-tensor `[B,D]` output. It accumulates centered bytes in I32, then performs one private scalar requantization; an all-masked row emits the output zero point. | [Full reference](../ts/ops/qMaskedMean.ts) | [Full, portable C](../ts/backends/WasmEngine.ts) | [Full, packed-byte word-owner kernel](../shaders/inference/qMaskedMeanInt8.wgsl) | [Missing](../ts/backends/WebNNEngine.ts) |
 | `SDPA` | Self-attention over F32 rank-2/3 packed QKV with full/causal attention, optional keep mask, and train-only probability dropout. | [Full](../ts/ops/sDPA.ts) | [Full, F32 rank-2/3 and documented keep-mask layouts](../ts/backends/WasmEngine.ts) | [Partial, F32 rank-2/3 and `head_dim <= 64`](../shaders/inference/sDPA.wgsl) | [Partial](../ts/backends/WebNNEngine.ts) |
 | `CrossSDPA` | Cross-attention over separate F32 rank-2/3 Q, K, and V tensors, optional keep mask, and train-only probability dropout. | [Full](../ts/ops/crossSDPA.ts) | [Full, F32 rank-2/3 and documented keep-mask layouts](../ts/backends/WasmEngine.ts) | [Partial, F32 rank-2/3 and `head_dim <= 64`](../shaders/inference/crossSDPA.wgsl) | [Missing](../ts/backends/WebNNEngine.ts) |
@@ -83,18 +92,18 @@ path rather than a CPU(JS) data loop.
 | `MoERouter` | Temperature-scaled top-k expert routing. | [Full](../ts/ops/moeRouter.ts) | [Full, canonical F32 routes](../ts/backends/WasmEngine.ts) | [Partial, F32 routes and `top_k <= 8`](../shaders/inference/moeRouter.wgsl) | [Missing](../ts/backends/WebNNEngine.ts) |
 | `MoELinear` | Execute and mix selected expert matrices. | [Full](../ts/ops/moeLinear.ts) | [Full, canonical F32 expert and route tensors](../ts/backends/WasmEngine.ts) | [Full, F32 expert and route tensors](../shaders/inference/moeLinear.wgsl) | [Missing](../ts/backends/WebNNEngine.ts) |
 | `MaxPool2D` | 2D max pooling. | [Full, including descriptor-preserving I8/U8](../ts/ops/maxPool2D.ts) | [Full, typed C path](../ts/backends/WasmEngine.ts) | [Full, packed-byte I8/U8 and F32 paths](../shaders/inference/maxPool2DTyped.wgsl) | [Missing](../ts/backends/WebNNEngine.ts) |
-| `AveragePool`, `AveragePool2D` | 2D average pooling. | [Full](../ts/ops/averagePool2D.ts) | [Full](../ts/backends/WasmEngine.ts) | [Full](../shaders/inference/averagePool2D.wgsl) | [Missing](../ts/backends/WebNNEngine.ts) |
+| `AveragePool2D` | 2D average pooling. | [Full](../ts/ops/averagePool2D.ts) | [Full](../ts/backends/WasmEngine.ts) | [Full](../shaders/inference/averagePool2D.wgsl) | [Missing](../ts/backends/WebNNEngine.ts) |
 | `GlobalAveragePool` | Global spatial average pooling. | [Full](../ts/ops/globalAveragePool.ts) | [Full](../ts/backends/WasmEngine.ts) | [Full](../shaders/inference/globalAveragePool.wgsl) | [Missing](../ts/backends/WebNNEngine.ts) |
 | `Resize` | Image resize. Bilinear is the normal path; typed byte activation storage is nearest-only. | [Full](../ts/ops/resize.ts) | [Full, typed path is nearest-only](../ts/backends/WasmEngine.ts) | [Full, typed path is nearest-only](../shaders/inference/resizeNearestTyped.wgsl) | [Missing](../ts/backends/WebNNEngine.ts) |
 | `ResizeNearest2D` | Nearest-neighbor image resize. | [Full, descriptor-preserving I8/U8](../ts/ops/resize.ts) | [Full, typed NHWC C path](../ts/backends/WasmEngine.ts) | [Full, packed-byte I8/U8 and F32 paths](../shaders/inference/resizeNearestTyped.wgsl) | [Missing](../ts/backends/WebNNEngine.ts) |
-| `UpsampleNearest2D`, `Upsample2x` | Nearest-neighbor 2x upsampling aliases. | [Full](../ts/ops/upsample2x.ts) | [Full, F32 NHWC](../ts/backends/WasmEngine.ts) | [Full for `UpsampleNearest2D`](../shaders/inference/upsample2x.wgsl) | [Missing](../ts/backends/WebNNEngine.ts) |
-| `InterpLinear1D`, `Interp1D` | Linear 1D interpolation aliases. | [Full](../ts/ops/interp1D.ts) | [Full, F32 batched channel-length](../ts/backends/WasmEngine.ts) | [Full for `InterpLinear1D`](../shaders/inference/interp1D.wgsl) | [Missing](../ts/backends/WebNNEngine.ts) |
+| `UpsampleNearest2D` | Nearest-neighbor 2x upsampling. | [Full](../ts/ops/upsample2x.ts) | [Full, F32 NHWC](../ts/backends/WasmEngine.ts) | [Full](../shaders/inference/upsample2x.wgsl) | [Missing](../ts/backends/WebNNEngine.ts) |
+| `Interpolate1D` | Linear 1D interpolation. | [Full](../ts/ops/interp1D.ts) | [Full, F32 batched channel-length](../ts/backends/WasmEngine.ts) | [Full](../shaders/inference/interp1D.wgsl) | [Missing](../ts/backends/WebNNEngine.ts) |
 | `ReLU` | Rectified linear activation. | [Full](../ts/ops/reLU.ts) | [Full](../ts/backends/WasmEngine.ts) | [Full](../shaders/inference/reLU.wgsl) | [Full](../ts/backends/WebNNEngine.ts) |
 | `LeakyReLU` | Leaky ReLU activation with `alpha`. | [Full](../ts/ops/leakyReLU.ts) | [Full, F32](../ts/backends/WasmEngine.ts) | [Full](../shaders/inference/leakyReLU.wgsl) | [Missing](../ts/backends/WebNNEngine.ts) |
 | `PReLU` | Per-channel parametric ReLU. | [Full](../ts/ops/pReLU.ts) | [Full, F32 generic slope repetition](../ts/backends/WasmEngine.ts) | [Full](../shaders/inference/pReLU.wgsl) | [Missing](../ts/backends/WebNNEngine.ts) |
 | `GELU` | Erf GELU by default; optional `approximate: "tanh"`. | [Full](../ts/ops/gELU.ts) | [Full](../ts/backends/WasmEngine.ts) | [Full](../shaders/inference/gELU.wgsl) | [Exact mode](../ts/backends/WebNNEngine.ts) |
 | `QGELU` | Canonical W8A8 GELU: a distinct same-shape per-tensor I8/U8 input/output pair; only omitted parameters or `approximate: "none"`; uses the fixed Abramowitz–Stegun 7.1.26 erf polynomial and ties-to-even saturating requantization. | [Full reference](../ts/ops/qGELU.ts) | [Full, portable C](../ts/backends/WasmEngine.ts) | [Full, packed-byte fixed-erf baseline](../shaders/inference/qGELUInt8.wgsl) | [Missing](../ts/backends/WebNNEngine.ts) |
-| `SiLU`, `Swish` | `x * sigmoid(x)` activation aliases. | [Full](../ts/ops/siLU.ts) | [Full, F32](../ts/backends/WasmEngine.ts) | [Full](../shaders/inference/siLU.wgsl) | [Full](../ts/backends/WebNNEngine.ts) |
+| `SiLU` | `x * sigmoid(x)` activation. | [Full](../ts/ops/siLU.ts) | [Full, F32](../ts/backends/WasmEngine.ts) | [Full](../shaders/inference/siLU.wgsl) | [Full](../ts/backends/WebNNEngine.ts) |
 | `QSiLU` | Canonical W8A8 SiLU: one distinct same-shape per-tensor I8/U8 input/output pair, no auxiliary inputs or parameters; dequantize, apply `x / (1 + exp(-x))`, and ties-to-even saturating requantize directly into output bytes. | [Full reference](../ts/ops/qSiLU.ts) | [Full, portable C](../ts/backends/WasmEngine.ts) | [Full, packed-byte baseline](../shaders/inference/qSiLUInt8.wgsl) | [Missing](../ts/backends/WebNNEngine.ts) |
 | `Sigmoid` | Logistic activation. | [Full](../ts/ops/sigmoid.ts) | [Full](../ts/backends/WasmEngine.ts) | [Full](../shaders/inference/sigmoid.wgsl) | [Full](../ts/backends/WebNNEngine.ts) |
 | `HardSwish` | MobileNet-style hard swish activation. | [Full](../ts/ops/hardSwish.ts) | [Full](../ts/backends/WasmEngine.ts) | [Full](../shaders/inference/hardSwish.wgsl) | [Missing](../ts/backends/WebNNEngine.ts) |
@@ -114,18 +123,18 @@ path rather than a CPU(JS) data loop.
 | `ArgMax` | Inference-only index of the maximum value; the axis may be removed or retained as size 1. | [Full](../ts/ops/argMax.ts) | [Full, typed F32/I32/I8/U8 input and output](../ts/backends/WasmEngine.ts) | [Partial, F32 input; F32/I32/I8/U8 output](../ts/backends/GraphExecutor.ts) | [Missing](../ts/backends/WebNNEngine.ts) |
 | `QArgMax` | Canonical terminal byte-domain ArgMax: rank-2–8 per-tensor I8/U8 input, exact integer axis, first-tie semantics, and unquantized I32 output with that axis removed. Positive affine quantization preserves raw-byte order, so logits stay byte-typed. | [Full reference](../ts/ops/qArgMax.ts) | [Full, portable C](../ts/backends/WasmEngine.ts) | [Full, packed-byte I32-index kernel](../shaders/inference/qArgMaxInt8.wgsl) | [Missing](../ts/backends/WebNNEngine.ts) |
 | `Transpose` | General N-D tensor permutation. | [Full](../ts/ops/transpose.ts) | [Full, F32 rank-1–8](../ts/backends/WasmEngine.ts) | [Full](../shaders/inference/generalTranspose.wgsl) | [Missing](../ts/backends/WebNNEngine.ts) |
-| `Concat`, `Concat2` | Tensor concatenation. Raw byte concat requires identical dtype and immutable descriptor; fused sigmoid requires an explicit F32 boundary. | [Full](../ts/ops/concat2.ts) | [Full, typed raw concat and F32 rank-1–8](../ts/backends/WasmEngine.ts) | [Full for canonical typed `Concat`; `Concat2` remains F32-only](../shaders/inference/concatCopyTyped.wgsl) | [Missing](../ts/backends/WebNNEngine.ts) |
+| `Concat`, `Concat2` | Tensor concatenation. Raw byte concat requires identical dtype and immutable descriptor; fused sigmoid requires an explicit F32 boundary. | [Full](../ts/ops/concat2.ts) | [Full, typed raw concat and F32 rank-1–8](../ts/backends/WasmEngine.ts) | [Full, typed and F32/I32](../shaders/inference/concatCopyTyped.wgsl) | [Missing](../ts/backends/WebNNEngine.ts) |
 | `Split` | Split a tensor into multiple outputs. | [Full](../ts/ops/split.ts) | [Full, F32 equal-sized output slices](../ts/backends/WasmEngine.ts) | [Partial, equal-sized output slices](../shaders/inference/split.wgsl) | [Missing](../ts/backends/WebNNEngine.ts) |
 | `Slice` | Canonical F32 rank-1–8 strided slice with normalized axes/starts, positive integer steps, and an in-bounds selection. | [Full](../ts/ops/slice.ts) | [Full](../ts/backends/WasmEngine.ts) | [Full, canonical F32 rank-1–8 positive-step contract](../shaders/inference/sliceNd.wgsl) | [Missing](../ts/backends/WebNNEngine.ts) |
 | `Pad` | Constant padding. | [Full](../ts/ops/pad.ts) | [Full](../ts/backends/WasmEngine.ts) | [Partial, image/4D-oriented metadata](../shaders/inference/pad.wgsl) | [Missing](../ts/backends/WebNNEngine.ts) |
-| `Expand`, `Broadcast` | Canonical F32 right-aligned broadcast to a compatible rank-1–8 target shape. | [Full](../ts/ops/expand.ts) | [Full, F32 rank-1–8](../ts/backends/WasmEngine.ts) | [Full, F32 rank-1–8](../shaders/inference/expand.wgsl) | [Missing](../ts/backends/WebNNEngine.ts) |
-| `Gather` | Canonical F32 gather with I32 indices, rank at most 8, and any valid axis. | [Full](../ts/ops/gather.ts) | [Full](../ts/backends/WasmEngine.ts) | [Full, F32 data/output and I32 indices](../shaders/inference/gatherInt32.wgsl) | [Missing](../ts/backends/WebNNEngine.ts) |
+| `Expand`, `Broadcast` | Canonical F32/I32 right-aligned broadcast plus descriptor-preserving per-tensor I8/U8 `Expand`, to a valid rank-1–8 target shape. | [Full](../ts/ops/expand.ts) | [Full, F32/I32/I8/U8 rank-1–8](../ts/backends/WasmEngine.ts) | [Full, F32/I32 plus packed descriptor-preserving I8/U8](../shaders/inference/expandTyped.wgsl) | [Missing](../ts/backends/WebNNEngine.ts) |
+| `Gather` | Canonical F32 gather with I32 indices, rank at most 8, any valid axis, and ONNX negative-index normalization. | [Full](../ts/ops/gather.ts) | [Full](../ts/backends/WasmEngine.ts) | [Full, F32 data/output and I32 indices](../shaders/inference/gatherInt32.wgsl) | [Missing](../ts/backends/WebNNEngine.ts) |
 | `GatherElements` | Canonical F32 elementwise indexed gather with I32 indices, rank at most 8, and normalized negative indices. | [Full](../ts/ops/gatherElements.ts) | [Full, F32 data/output and I32 indices](../ts/backends/WasmEngine.ts) | [Full, F32 data/output and I32 indices](../shaders/inference/gatherElements.wgsl) | [Missing](../ts/backends/WebNNEngine.ts) |
 | `Where`, `Mask` | Exact-shape F32 selection with an F32 or I32 condition; `mask`, `cond`, and `condition` are aliases. | [Full](../ts/ops/where.ts) | [Full, exact-shape portable contract](../ts/backends/WasmEngine.ts) | [Full, exact-shape F32 operands/output and F32 or I32 condition](../shaders/inference/whereTyped.wgsl) | [Missing](../ts/backends/WebNNEngine.ts) |
-| `Cast` | Dtype conversion among F32/I32/I8/U8; only F32-to-F32 has a backward. | [Full](../ts/ops/cast.ts) | [Full, F32/I32/I8/U8](../ts/backends/WasmEngine.ts) | [Full, F32/I32/I8/U8](../shaders/inference/cast.wgsl) | [Missing](../ts/backends/WebNNEngine.ts) |
+| `Cast` | Dtype conversion among F32/I32/I8/U8; F32-to-I32 truncates toward zero, wraps modulo 2^32, and maps NaN/infinities to zero; only F32-to-F32 has a backward. | [Full](../ts/ops/cast.ts) | [Full, F32/I32/I8/U8](../ts/backends/WasmEngine.ts) | [Full, F32/I32/I8/U8](../shaders/inference/cast.wgsl) | [Missing](../ts/backends/WebNNEngine.ts) |
 | `DequantizeLinear` | Convert F32/I32/I8/U8 values to F32 with scalar F32 scale and an optional scalar typed zero point. | [Full](../ts/ops/dequantizeLinear.ts) | [Full, scalar typed contract](../ts/backends/WasmEngine.ts) | [Full, scalar typed contract](../shaders/inference/dequantizeLinearTyped.wgsl) | [Missing](../ts/backends/WebNNEngine.ts) |
-| `QuantizeLinear` | Canonical F32-to-I8/U8 boundary with scalar F32 scale, optional matching typed zero point, nearest-even rounding, saturation, and required per-tensor output metadata. | [Full](../ts/ops/quantizeLinear.ts) | [Full, typed portable C kernel](../ts/backends/WasmEngine.ts) | [Full, packed-byte typed dispatch](../shaders/inference/quantizeLinearTyped.wgsl) | [Missing](../ts/backends/WebNNEngine.ts) |
-| `RequantizeLinear` | Metadata-only I8/U8-to-I8/U8 conversion between per-tensor descriptors, with nearest-even rounding and saturation. | [Full](../ts/ops/requantizeLinear.ts) | [Full, typed portable C kernel](../ts/backends/WasmEngine.ts) | [Full, packed-byte typed dispatch](../shaders/inference/requantizeLinearTyped.wgsl) | [Missing](../ts/backends/WebNNEngine.ts) |
+| `QuantizeLinear` | Canonical F32-to-I8/U8 boundary with scalar F32 scale, matching typed zero point, nearest-even rounding, saturation, and a required central per-tensor output descriptor whose numeric parameters live in safetensors. | [Full](../ts/ops/quantizeLinear.ts) | [Full, typed portable C kernel](../ts/backends/WasmEngine.ts) | [Full, packed-byte typed dispatch](../shaders/inference/quantizeLinearTyped.wgsl) | [Missing](../ts/backends/WebNNEngine.ts) |
+| `RequantizeLinear` | I8/U8-to-I8/U8 conversion between central per-tensor descriptors, with nearest-even rounding and saturation. | [Full](../ts/ops/requantizeLinear.ts) | [Full, typed portable C kernel](../ts/backends/WasmEngine.ts) | [Full, packed-byte typed dispatch](../shaders/inference/requantizeLinearTyped.wgsl) | [Missing](../ts/backends/WebNNEngine.ts) |
 | `NonMaxSuppression` | Inference-only greedy NMS for object-detection boxes. | [Full](../ts/ops/nonMaxSuppression.ts) | [Full, typed boxes/scores/output](../ts/backends/WasmEngine.ts) | [Partial, F32 boxes/scores/`[rows,3]` output and host-resident scalar thresholds](../shaders/inference/nonMaxSuppression.wgsl) | [Missing](../ts/backends/WebNNEngine.ts) |
 | `Reshape` | Shape-only tensor view/copy. Typed storage requires an unchanged descriptor. | [Alias](../ts/ops/reshape.ts) | [Alias, typed C copy](../ts/backends/WasmEngine.ts) | [Alias, packed-byte copy](../shaders/inference/copyTyped.wgsl) | [Full](../ts/backends/WebNNEngine.ts) |
 | `Flatten` | Shape-only flatten. Typed storage requires an unchanged descriptor. | [Alias](../ts/ops/reshape.ts) | [Alias, typed C copy](../ts/backends/WasmEngine.ts) | [Alias, packed-byte copy](../shaders/inference/copyTyped.wgsl) | [Full](../ts/backends/WebNNEngine.ts) |
@@ -137,13 +146,10 @@ path rather than a CPU(JS) data loop.
 | `ProfileX` | F32 NHWC horizontal profile/reduction; output `[N,2C,W]`. | [Full, F32 NHWC](../ts/ops/profileX.ts) | [Full, F32 NHWC](../ts/backends/WasmEngine.ts) | [Full, F32 NHWC](../shaders/inference/profileX.wgsl) | [Missing](../ts/backends/WebNNEngine.ts) |
 | `ProfileY` | F32 NHWC vertical profile/reduction; output `[N,2C,H]`. | [Full, F32 NHWC](../ts/ops/profileY.ts) | [Full, F32 NHWC](../ts/backends/WasmEngine.ts) | [Full, F32 NHWC](../shaders/inference/profileY.wgsl) | [Missing](../ts/backends/WebNNEngine.ts) |
 | `MeanHeight` | F32 NHWC height mean; output `[N,C,W]`. | [Full, F32 NHWC](../ts/ops/meanHeight.ts) | [Full, F32 NHWC](../ts/backends/WasmEngine.ts) | [Full, F32 NHWC](../shaders/inference/meanHeight.wgsl) | [Missing](../ts/backends/WebNNEngine.ts) |
-| `Shape` | Emit tensor shape. | [Missing](../ts/backends/CPUEngine.ts) | [Missing](../ts/backends/WasmEngine.ts) | [Missing](../ts/backends/GraphExecutor.ts) | [Missing](../ts/backends/WebNNEngine.ts) |
-| `Size` | Emit tensor element count. | [Missing](../ts/backends/CPUEngine.ts) | [Missing](../ts/backends/WasmEngine.ts) | [Missing](../ts/backends/GraphExecutor.ts) | [Missing](../ts/backends/WebNNEngine.ts) |
-| `TopK` | Top-k values/indices. | [Missing](../ts/backends/CPUEngine.ts) | [Missing](../ts/backends/WasmEngine.ts) | [Missing](../ts/backends/GraphExecutor.ts) | [Missing](../ts/backends/WebNNEngine.ts) |
 
 ### Sequence-model operator contracts
 
-`RoPE` and its exact alias `RotaryEmbedding` accept an F32 `input` (or `x`)
+`RoPE` accepts an F32 `input` (or `x`)
 with shape `[S,D]` or `[B,S,D]` and produce a same-shape F32 `out`. The
 optional I32 `position_ids` input is `[S]` or `[B,S]`; without it, position is
 `position_offset + sequence_index`. `rotary_dim` defaults to `D` and must be a
@@ -187,16 +193,14 @@ and output are FP32. That is the browser/Node `MatMul`/`Linear` path today: it
 can reduce weight storage and bandwidth, but it is not a full integer graph.
 
 A canonical W8A8 edge is explicit: its tensor has physical `int8` or `uint8`
-storage, an immutable `per_tensor` activation descriptor (`scale`,
-`zero_point`), and a blueprint declares both `outputs_dtype` and
-`outputs_quantization`. Quantized weights may instead use `per_axis` metadata
-along their output-channel axis. New materialized packages store each scale
-vector as a binary F32 safetensors companion named `<weight>_scale`; the
-safetensors metadata owns the scheme/axis descriptors and graph configs keep
-only the storage marker; see
-[the model format](model-format.md#binary-w8a8-companion-scales). `QuantizeLinear` checks that its scalar inputs
-match the output descriptor; shape-preserving operators may carry an unchanged
-descriptor, while an operation that changes it must explicitly requantize.
+storage and a central `volvox-affine-safetensors/v1` descriptor. The descriptor
+contains only immutable scale/zero-point tensor names; all numeric values live
+in safetensors. Activations normally use `per_tensor`; weights may use
+`per_axis` along the operator's required output dimension. See
+[the model format](model-format.md#safetensors-backed-affine-quantization).
+`QuantizeLinear` and `DequantizeLinear` operands must exactly match the central
+references. Shape-preserving operators may carry an unchanged descriptor,
+while an operation that changes it must explicitly requantize.
 
 “W8A8” here means physical byte storage for quantized activation/weight edges,
 not integer-only arithmetic. `QEmbedding` starts from I32 IDs;
@@ -207,14 +211,28 @@ scratch, without materializing an F32 activation tensor.
 
 The browser/Node CPU, WASM, WebGPU, and native CPU execute the canonical W8A8
 typed activation island directly: `QuantizeLinear`, `RequantizeLinear`, `QConv2D`,
-`QLinear`/`QMatMul`/`QGemm`, `QEmbedding`, `QAdd`, `QSiLU`, `QGELU`, `QGroupNorm`, `QLayerNorm`, `QMaskedMean`, `QSDPA`, max pool, nearest resize,
+`QLinear`/`QMatMul`/`QGemm`, `QBatchMatMul`, `QEmbedding`, `QAdd`, `QSiLU`, `QGELU`, `QGroupNorm`, `QLayerNorm`, `QMaskedMean`, `QSDPA`, max pool, nearest resize,
 descriptor-preserving shape copies/concat, `QArgMax`, and `DequantizeLinear`. `QConv2D`
 is NHWC/OHWI; `QLinear` is `[d_out,d_in]`; both use I32 bias and I32
-accumulation. `QEmbedding` has no byte activation input: its IDs must be a
-graph input, its table is `[vocab,hidden]` with axis-0 metadata, and the graph
-must supply the output's per-tensor descriptor; every backend preflights the
-complete ID tensor before writes. `QAdd` deliberately has no broadcast form—an exporter
-must lower broadcast explicitly before it reaches the typed island. `QSiLU`
+accumulation. `QBatchMatMul` accepts rank-2–8 matrix operands, applies
+right-aligned ONNX broadcasting only to their batch axes, and requires
+independent per-tensor I8/U8 descriptors for both operands and the output. Its
+worst-case centered dot product is rejected unless it fits I32.
+The fixed WASM parent selects a standard SIMD128 kernel that accumulates four
+adjacent N columns in I32 lanes. N tails and matrices narrower than four
+columns use the same scalar implementation; both paths share staged-F32
+requantization, ties-to-even rounding, and I8/U8 saturation.
+`QEmbedding` has no byte activation input. Its IDs are I32 and must satisfy one
+of two fail-closed proofs: a public graph input is fully range-preflighted by
+the runtime before any output write, while an internal value is accepted only
+when it is produced by a canonical I32 `Clip` whose inclusive integer bounds
+statically prove `0 <= min <= max < vocab`. The latter proof avoids a host
+readback of the internal tensor; arbitrary integer producers and application
+metadata are not accepted as substitutes. The table is `[vocab,hidden]` with
+axis-0 metadata, and the graph must supply the output's per-tensor descriptor.
+`QAdd` deliberately has no broadcast form—an exporter
+must lower broadcast to descriptor-preserving byte `Expand` plus exact-shape
+`QAdd` before it reaches the typed island. `QSiLU`
 has one typed activation input and no scale/zero-point tensor inputs: both
 immutable descriptors are carried by its input and output tensors. `QGELU`
 has the same byte-edge rule but accepts only omitted parameters or
@@ -272,8 +290,8 @@ native `QConv2D` must declare physical I8/U8 input and output descriptors. The
 loader rejects an untyped activation graph instead of inferring quantization
 parameters from neighboring nodes.
 
-CPU(Native) stores canonical W8A8 activations in physical I8/U8 buffers and
-does not route them through the older `QTensor` sidecar or FP32 materialization.
+CPU(Native) stores canonical W8A8 activations directly in physical I8/U8
+buffers, without a sidecar or FP32 materialization.
 For C `QSiLU` and `QGELU`, a call of at least 512 elements builds a thread-local
 256-entry table keyed by the exact input/output descriptors; subsequent calls,
 including smaller decoder rows, map raw bytes through that table. Small cold
@@ -303,9 +321,14 @@ Vulkan(Native), OpenGL(Native), and Metal(Native) now dispatch the same
 canonical subset as packed-byte graph kernels, keeping consecutive typed nodes
 device-resident. The GPU route is intentionally limited to ordinary forward
 execution (not native prefill/decode); a dynamic scale or zero point produced
-by an earlier node is an explicit CPU synchronization boundary. The historic
-native `QTensor` paths remain compatibility paths, not the canonical W8A8
-contract.
+by an earlier node is an explicit CPU synchronization boundary. Canonical W8A8
+uses explicitly typed graph tensors and Q operators.
+
+CUDA(Native) dispatches a broader manual-kernel F32/W8A8 forward allowlist and
+also supports an eligible device-resident incremental row closure. Unlike the
+ordered Vulkan/OpenGL/Metal registry route, an explicitly selected CUDA node
+does not fall back to CPU. Its exact operation and shape restrictions are
+maintained in [cuda.md](cuda.md#status).
 
 The direct TFLite exporter emits this subset for its supported operators. Its
 Logistic lowering is deliberately `DequantizeLinear → Sigmoid → QuantizeLinear`,
@@ -313,8 +336,7 @@ so that graph is hybrid W8A8/F32 rather than all-integer arithmetic.
 
 ### TinyReceipt INT8 materialization
 
-`examples/tiny_receipt_vqa/tools/import_tiny_receipt_vqa_int8.py` remains the narrow weight normalizer
-for the published named SafeTensors layout. For a runnable W8A8 package, use
+For a runnable W8A8 package from the published named safetensors layout, use
 `examples/tiny_receipt_vqa/tools/calibrate_tiny_receipt_vqa_w8a8.py` followed by
 `examples/tiny_receipt_vqa/tools/materialize_tiny_receipt_vqa_w8a8.py`. The latter validates the source
 release, preserves its raw per-output I8 weights, transposes Conv OIHW weights
@@ -331,20 +353,20 @@ set and Volvox's portable QGELU approximation are not a production accuracy
 claim.
 
 ```bash
-export NAVERCAP_ROOT=/path/to/navercap
+export RECEIPT_VQA_DATA_ROOT=/path/to/receipt-vqa-data
 python3 examples/tiny_receipt_vqa/tools/calibrate_tiny_receipt_vqa_w8a8.py \
-  --out /tmp/tinyreceipt-calibration.json \
+  --out build/tinyreceipt-calibration.json \
   --include-explicit-families
 python3 examples/tiny_receipt_vqa/tools/materialize_tiny_receipt_vqa_w8a8.py \
-  --manifest /path/to/int8/manifest.json \
-  --out-dir /tmp/tinyreceipt-w8a8 \
-  --development-calibration /tmp/tinyreceipt-calibration.json
+  --manifest artifacts/int8/manifest.json \
+  --out-dir build/tinyreceipt-w8a8 \
+  --development-calibration build/tinyreceipt-calibration.json
 ```
 
 The package declares grayscale, bilinear `672x320`, `[-1,1]` F32 NHWC input;
 its first graph node is `QuantizeLinear`. The bundled source's standalone
 helper uses `[0,1]`, while its evaluator/training path uses `[-1,1]`; the
-materializer intentionally follows and records the evaluator-compatible path.
+materializer intentionally follows and records the evaluator-matching path.
 The [native example session](../examples/tiny_receipt_vqa/native/tiny_receipt_w8a8.c) and the
 [browser/Node example session](../examples/tiny_receipt_vqa/TinyReceiptW8A8Session.js)
 convert RGB to rounded 8-bit grayscale before bilinear resize, matching the
@@ -357,16 +379,33 @@ and `y_keep` is nonzero exactly for supplied decoder IDs. Both example sessions
 run the router once, select an explicit family
 graph, and consume the terminal I32 `QArgMax` IDs directly.
 
-Ordinary per-token forward remains the compatibility default. With
+The native commands expose the mode explicitly when desired:
+
+```bash
+examples/target/bin/tiny_receipt_w8a8 build/tinyreceipt-w8a8 \
+  --image receipt.png --prompt "What is the phone number?" \
+  --family phone --incremental
+
+examples/target/bin/tiny_receipt_split_w8a8 build/tiny-receipt-runtime-int8 \
+  --image receipt.png --prompt "What is the phone number?" \
+  --family phone --incremental --require-row
+```
+
+Ordinary per-token forward is the default for `tiny_receipt_w8a8`. With
 `--incremental`, the first family step seeds every tensor and later steps keep
 the image/encoder and cross-attention K/V branches cached. Native CPU also
 executes only the current B=1 decoder row and reuses prior physical
-self-attention K/V rows. Browser/Node CPU, WASM, and WebGPU use the same fixed-B=1
-row contract for the canonical decoder chain. WebGPU retains the physical K/V
-prefixes in canonical device buffers and dispatches the complete 101-node
-TinyReceipt decoder closure for one row. The example session additionally
-feeds terminal QArgMax IDs into later rows on-device and maps only one
-configurable token chunk per EOS check. Native GPU kernels retain their
+self-attention K/V rows. `tiny_receipt_split_w8a8` instead uses incremental
+decoding by default and accepts `--incremental` to make that mode explicit.
+Its `--no-kv` mode recomputes the growing prefix without retained state, while
+`--ordinary` forces a full fixed-capacity decoder forward for every generated
+token; all three selections are mutually exclusive. Browser/Node CPU, WASM,
+and WebGPU use the
+same fixed-B=1 row contract for the canonical decoder chain. WebGPU retains
+the physical K/V prefixes in canonical device buffers and dispatches the
+complete 101-node TinyReceipt decoder closure for one row. The example session
+additionally feeds terminal QArgMax IDs into later rows on-device and maps only
+one configurable token chunk per EOS check. Native GPU kernels retain their
 ordinary full-tensor contract, but built-in Vulkan/OpenGL/Metal decode sessions
 can now run the seed on-device, synchronize a validated prefix and clean
 cross-attention boundary once, and execute later rows through the native CPU
@@ -408,7 +447,7 @@ row. The result is kernel-only and must not be read as whole-model latency.
 The symmetric signed-I8 W8A32 row now uses compensated baseline-SIMD `f32x4`
 accumulation when `K<=1280`, weight scales are at most `0.025`, and every
 finite activation is in `[-35,35]`. Nonzero zero points, U8 weights, larger K,
-larger scales, and out-of-envelope inputs retain the previous scalar/double
+larger scales, and out-of-envelope inputs use the scalar/double reference
 fallback. Because F32 is not bit-exact to double, the fast path has direct
 non-dyadic and maximum-envelope cancellation tests.
 
@@ -419,16 +458,24 @@ packed SIMD128 GEMM, with canonical portable QConv and an independent
 JavaScript implementation as parity oracles. This benchmark does not use the
 Relaxed-SIMD child because every measured seed matrix has `M>1`.
 
+Run `make benchmark_wasm_qbatch_matmul` for deterministic mixed-I8/U8
+QBatchMatMul proxies covering a `320`-wide decoder row, a multi-row encoder
+matrix, and odd K/N tails. The harness first requires byte equality between
+the exported scalar and standard-SIMD128 kernels, then reports their separate
+times. It is a kernel benchmark, not an end-to-end model latency claim.
+
 The browser/Node reference and WASM measurements below were taken on an AMD
 Ryzen 5 5600U (AVX2; no AVX-VNNI). CPU(JS) QLinear measured 2.069 ms W8A8,
 0.962 ms W8A32, and 1.067 ms FP32, with raw live-buffer footprints of 70,656,
 84,992, and 279,552 bytes. CPU(JS) QConv2D measured 3.811 ms W8A8 versus
 6.871 ms FP32 (17,024 versus 67,712 live bytes; no CPU(JS) W8A32 Conv
 reference exists). In the fixed Clang-17 release artifact, the symmetric-I8
-`320x320` row measured 0.0122 ms with packed SIMD128 versus 0.0230 ms with the
-Relaxed-SIMD child, so runtime dispatch retains the faster packed path for that
-shape. A multi-row Relaxed-SIMD prototype was about 2x slower than packed
-SIMD128 and was not enabled. On the seed harness, the exact
+`320x320` row measured 0.0130 ms with packed SIMD128 versus 0.0228 ms with the
+Relaxed-SIMD child. Runtime dispatch therefore tries the faster packed SIMD128
+path first and keeps the ABI-compatible child as a fail-closed row fallback.
+A five-pair real-model child-first/baseline ablation showed no separable
+application-level difference. A multi-row Relaxed-SIMD prototype was about 2x
+slower than packed SIMD128 and was not enabled. On the seed harness, the exact
 grayscale stem measured 152.244 ms canonical versus 4.877 ms im2col+packed
 (31.21x). The zero-point-zero symmetric fast path reduced the exact six-shape
 weighted packed proxy from about 303.0 to 236.4 ms (22%); all compared output
@@ -438,22 +485,23 @@ Current native kernel measurements are host-specific:
 
 | Host and command | Workload | Established result |
 | --- | --- | --- |
-| AMD Ryzen 5 5600U, `make benchmark_native` | 51-call incremental `M=1` dense proxy | W8A8 current policy 0.714 ms; packed W8A32 3.568 ms (5.00x) |
-| AMD Ryzen 5 5600U, `make benchmark_native` | Weighted `M=402`/`M=192` base-dense seed subset | packed W8A8 359.697 ms; raw SIMD 1-thread 219.324 ms; four-row tiled/4-thread 67.953 ms (3.23x vs 1-thread) |
-| AMD Ryzen 5 5600U, `make benchmark_native` | Exact grayscale stem `[1,320,672,1] -> [1,160,336,48]` | portable 99.035 ms; AVX2 output-channel tile 1-thread 19.564 ms; 4-thread 5.806 ms (17.06x vs portable) |
-| AMD Ryzen 5 5600U, `make benchmark_native` | `16x16`, 64-channel, 3x3 QConv proxy | portable 2.600 ms; AVX2 1-thread 0.711 ms; AVX2 4-thread 0.223 ms (11.67x vs portable) |
-| AMD Ryzen 5 5600U, `make benchmark_native` | Exact activation shapes | QSiLU stem 23.50x; QGELU encoder 32.55x; decoder seed 29.68x; warm decoder row 32.46x; cold 160-element router 0.97x |
-| AMD Ryzen 5 5600U, `make benchmark_native` | Encoder self / decoder self / decoder cross | 44.432→12.803 ms (3.47x) / 6.180→1.626 ms (3.80x) / 22.270→6.295 ms (3.54x), portable→4-thread |
-| AMD Ryzen 5 5600U, `make benchmark_native` | Incremental cross `Q=1` | 0.113→0.111 ms (1.01x); deliberately no pool dispatch |
+| AMD Ryzen 5 5600U, `make benchmark_native` | 51-call incremental `M=1` dense proxy | W8A8 selected raw/packed policy 0.696 ms; all-packed W8A8 0.777 ms; packed W8A32 3.581 ms (5.14x vs selected W8A8) |
+| AMD Ryzen 5 5600U, Clang 17 native benchmark | Weighted `M=402`/`M=192` base-dense seed subset | exact signed-absolute K4/N16 W8A8 23.043 ms; raw SIMD 1-thread 230.136 ms; raw SIMD 4-thread 69.218 ms (3.00x vs raw 4-thread) |
+| AMD Ryzen 5 5600U, Clang 17 native benchmark | Exact grayscale stem `[1,320,672,1] -> [1,160,336,48]` | portable 106.539 ms; persistent-pack im2col 1-thread 3.126 ms; output-row/strip-copy im2col 4-thread 1.084 ms (98.28x vs portable) |
+| AMD Ryzen 5 5600U, `make benchmark_native` | `16x16`, 64-channel, 3x3 QConv proxy | portable 2.571 ms; native 1-thread 0.455 ms; native 4-thread 0.153 ms (16.84x vs portable) |
+| AMD Ryzen 5 5600U, `make benchmark_native` | Exact activation shapes | QSiLU stem 23.31x; QGELU encoder 32.80x; decoder seed 29.74x; warm decoder row 31.28x; cold 160-element router 0.98x |
+| AMD Ryzen 5 5600U, `make benchmark_native` | Encoder self / decoder self / decoder cross | 46.731→6.432 ms (7.27x) / 6.308→0.770 ms (8.19x) / 22.667→3.019 ms (7.51x), portable→4-thread |
+| AMD Ryzen 5 5600U, `make benchmark_native` | Incremental cross `Q=1` | 0.119→0.053 ms (2.23x); no pool dispatch |
 | Intel Core i3-1115G4, 2 cores/4 threads, AVX-512 VNNI | 51-call incremental `M=1` dense proxy | W8A8 0.547 ms; packed W8A32 2.896 ms (5.30x) |
-| Intel Core i3-1115G4, 2 cores/4 threads, AVX-512 VNNI | Weighted seed dense subset | previous row-at-a-time 112.921 ms; four-row tiled 62.051 ms (1.82x) |
+| Intel Core i3-1115G4, 2 cores/4 threads, AVX-512 VNNI | Weighted seed dense subset | row-at-a-time 112.921 ms; four-row tiled 62.051 ms (1.82x) |
 | Intel Core i3-1115G4, 2 cores/4 threads, AVX-512 VNNI | Exact grayscale stem | portable 97.235 ms; native 1-thread 23.431 ms; 4-thread 9.839 ms |
 
 For one 99-token heldout TinyReceipt image/prompt run using the incremental
-native example, the Ryzen 5 5600U measured 726.476 ms total (136.27 token/s),
-with a 553.269 ms seed and 1.742 ms/steady token (573.91 token/s). The exact
+native example compiled with Clang 17, the Ryzen 5 5600U measured 118.539 ms
+generation time (835.17 token/s), with a 24.651 ms seed and 0.943 ms/steady
+token (1,060.07 token/s). The encoder took 128.915 ms. The exact
 stdout SHA-256 remained
-`257d55fd04a2e673423459d13f0d951aba28ef9597a5f8c174f17b41931756b2`.
+`6e5992d96addf3caa76cf2b339589955adb3f94b4a93292d7b6f3bdb972c641b`.
 This is an individual heldout-sample latency check, not the 2,000-record
 accuracy evaluation or a cross-platform performance guarantee.
 
@@ -466,14 +514,14 @@ This is a 7.64x end-to-end and 22.27x steady-token improvement over ordinary
 OpenGL dependency decode, although native CPU remains fastest on this host.
 
 For the separate Pillow-RGB-to-JavaScript preprocessed `00002.jpg` input, the
-fixed-artifact same-session benchmark now measures 2,168.763 ms cold and
+fixed-artifact same-context benchmark measures 2,168.763 ms cold and
 1,596.581 ms hot. The hot seed is 1,356.306 ms and later rows take 2.996
 ms/token. Against the immediately preceding packed kernel, the symmetric-I8
 fast path reduced hot total by 21.5%, hot seed by 24.5%, and cold total by
 20.1%. Atomic graph assembly reduced the cold family load from 1,611 ms to
-about 169 ms, and the session's read-only SafeTensors cache fetches the
-23,891,120-byte model exactly once. This replaces the earlier 4.293–4.350 s
-generation measurement; the 80-token output remains unchanged.
+about 169 ms, and the example's read-only SafeTensors cache fetches the
+23,891,120-byte model exactly once. The 80-token output is identical between
+cold and hot runs.
 Native stb JPEG decoding is not byte-identical to Pillow decoding on this
 sample; when both backends receive the same preprocessed tensor, native, WASM,
 and CPU(JS) agree. These timings therefore measure execution speed, not answer
@@ -492,53 +540,91 @@ U8 × I8 domain and apply exact zero-point compensation, so asymmetric mappings
 remain correct. `QConv2D` uses the corresponding ZMM path for contiguous
 NHWC/OHWI input groups of at least 64 channels and the YMM path for groups of
 at least 32, counting only valid padded taps in its dot, sums, and correction.
-Otherwise, eligible `QLinear` uses target-attributed AVX2 widening and
-`VPMADDWD` for `d_in >= 16`. Seed-sized QLinear calls reuse each weight vector
-across four activation rows on the AVX2, AVX-VNNI, and AVX-512 VNNI paths.
-For QConv2D input groups of at least 16 channels, the AVX2 path traverses an
-activation block once for four output channels. Narrow inputs use a transient
-term/output-channel weight pack and evaluate eight outputs together, which is
-the grayscale-stem path. Allocation or alias failures return to the portable
-kernel. All paths retain scalar tails, grouped/padded convolution geometry,
-and a conservative I32-prefix-overflow proof before changing reduction order.
+Otherwise, eligible `QLinear` with `d_in >= 32` uses an exact AVX2
+`VPMADDUBSW` path. Because that instruction saturates each adjacent pair to
+I16, the kernel splits every unsigned activation byte into `min(a,127)` and
+`a-min(a,127)`, evaluates the two non-saturating products separately, and
+combines them only after widening to I32. This preserves arbitrary I8/U8 zero
+points without the usual PMADDUBSW saturation error. Smaller eligible inputs
+use target-attributed AVX2 widening and `VPMADDWD`. Seed-sized PMADDUBSW and
+VNNI calls reuse each weight vector across four activation rows.
 
-Canonical ARM `QLinear` and `QConv2D` have NEON widening paths. Native Linux
-AArch64 and Android AArch64 builds also add separately compiled `SDOT`
-specializations, each gated by `HWCAP_ASIMDDP`: `QLinear` for eligible 16-byte
+The persistent symmetric-I8 K4/N16 pack additionally records whether the
+weight contains -128. If it does not, the AVX2 microkernel maps activations to
+signed bytes and evaluates `abs(input) * sign(weight,input)`. The pair bound is
+`2*128*127 = 32512`, so `VPMADDUBSW` remains exact with one product instead of
+the two-part unsigned decomposition. Affine zero-point compensation is folded
+into the initial I32 accumulator. A pack containing any -128 weight retains
+the general split path, including its exact signed endpoint behavior.
+
+Native `QBatchMatMul` uses a separate target-attributed AVX2 kernel for its
+`[M,K] @ [K,N]` layout. It interleaves two K rows over sixteen N columns, then
+uses the same split `VPMADDUBSW` proof and affine zero-point compensation as
+QLinear. Scalar N tails and ineligible calls retain the canonical kernel.
+
+For QConv2D input groups of at least 16 channels, the direct AVX2 path
+traverses an activation block once for four output channels. Dense groups=1
+3x3 calls with at least 16 output channels can instead expand zero-point-padded
+NHWC patches and reuse the same exact QLinear PMADDUBSW hierarchy. The native
+model prepares a persistent flattened K4/N8 companion pack for symmetric I8
+weights, including narrow-input layers such as the grayscale stem; asymmetric
+weights retain the raw/direct hierarchy. Dilation-one im2col partitions
+batch/output rows and copies each fully in-bounds 3*C strip contiguously,
+without changing zero-point padding at borders. Allocation, alias, or
+shape-policy failures return to the direct or portable kernel. All paths retain
+scalar tails, grouped/padded convolution geometry, and a conservative
+I32-prefix-overflow proof before changing reduction order.
+
+Canonical ARM `QLinear`, `QConv2D`, and `QBatchMatMul` have NEON widening
+paths. Native Linux AArch64 and Android AArch64 builds also add separately
+compiled `SDOT` specializations, each gated by `HWCAP_ASIMDDP`: `QLinear` for eligible 16-byte
 reductions and `QConv2D` for eligible contiguous input groups of at least 16
 channels. These kernels operate directly on the declared physical-byte tensors.
 
-On eligible x86 calls above roughly one million products, native `QLinear`
-partitions independent rows and `QConv2D` partitions independent output
-locations through the shared pool. Alias-sensitive calls remain ordered and
-serial. Whole-tensor native `QSDPA` similarly partitions independent
+On eligible x86 calls above roughly one million products, native `QLinear` and
+`QBatchMatMul` partition independent rows and `QConv2D` partitions independent
+output locations through the shared pool. Alias-sensitive calls remain
+ordered and serial. Whole-tensor native `QSDPA` similarly partitions independent
 batch/query rows once `B*Q*K*D` reaches 524,288 products and there are enough
-rows for the configured workers; each task invokes the authoritative portable
-kernel with the original key order. `QLinear M=1`, `QSDPA Q=1`, and other small
+rows for the configured workers. On AVX2, each row also vectorizes the exact
+centered-byte QK dot and the F32 value accumulation while retaining the
+portable online-softmax key order. `QLinear M=1`, `QSDPA Q=1`, and other small
 calls remain on the caller, so the steady incremental path does not wake the
 pool.
 
-Native releases now default to a baseline CPU target rather than global
+Native `QSiLU` partitions only large contiguous byte ranges. `QLayerNorm`
+partitions large row sets, while its runtime-gated AVX2 path preserves scalar
+mean/variance order and vectorizes the independent affine/requantization pass.
+`QGroupNorm` partitions independent groups and, on AVX2, evaluates four groups
+in parallel SIMD lanes without changing the reduction order inside any group.
+The thresholds keep decoder-sized prefixes serial; portable scalar execution
+remains the fallback on other CPUs.
+
+Native releases default to a baseline CPU target rather than global
 `-mavx2 -mfma`. The canonical x86 dispatcher keeps AVX2, AVX-VNNI, and AVX-512
-VNNI in target-attributed functions behind runtime capability checks; Linux
-AArch64 does the same compositionally by linking its `+dotprod` objects only
-on that architecture and entering them only after the HWCAP check. Run
-`make verify_native_isa` to verify that
-the baseline-compiled translation units contain ZMM `VPDPBUSD`, and
-`make verify_native_isa` to verify their public dispatchers do
-not contain YMM/ZMM instructions. Older
-compile-time AVX2 kernels remain available through `NATIVE_CPU_TARGET=avx2`
-for deployments that guarantee that ISA.
+VNNI in target-attributed functions behind runtime capability checks. Linux
+and Android AArch64 do the same compositionally: baseline NEON code and
+separately compiled `+dotprod` objects coexist in one binary, and the SDOT
+objects are entered only after the HWCAP check. `make verify_native_isa`
+verifies both that the optimized x86 instructions are present and that public
+baseline dispatchers contain no unguarded YMM/ZMM instructions. Build-time
+AVX2 kernels remain available through `NATIVE_CPU_TARGET=avx2` for deployments
+that guarantee that ISA.
 
 ## Native Backend Status
 
-This table separates CPU(Native), Vulkan(Native), OpenGL(Native), and Metal(Native).
+This table separates CPU(Native), Vulkan(Native), OpenGL(Native), and
+Metal(Native). CUDA is deliberately not duplicated as a fifth fast-changing
+column: [cuda.md](cuda.md#status) is its canonical forward and
+full-profile training matrix and restrictions record.
 Vulkan and OpenGL graph ops are attempted before CPU(Native) for selected F32 and
 canonical packed-byte W8A8 nodes during ordinary full-graph execution, including
-the seed of a compatible decode session. After a validated GPU-seed/CPU-row handoff,
-later decoder rows use CPU(Native). If a route is not accepted, the native dispatcher continues to CPU(Native); rows with
-CPU(Native) `Missing` still require the GPU path to accept the node. Large native
-`MatMul` can also use one-shot Vulkan/OpenGL offload when enabled.
+the seed of an eligible decode context. After a validated GPU-seed/CPU-row handoff,
+later decoder rows use CPU(Native). An allow-fallback policy records a rejected
+accelerator node as an explicit CPU operator route. A require-tier,
+forbid-operator-fallback policy rejects that graph before execution; native GPU
+parity always uses this strict policy and accepts only an attested all-device
+route. Large native `MatMul` can also use one-shot Vulkan/OpenGL offload when enabled.
 
 Native shader generation is separate from native runtime support. The tracked
 `shaders/{inference,training}/*.wgsl` files are translated by `make compile_shaders` / Naga into ignored
@@ -552,21 +638,22 @@ the MSL may be generated for many ops, but a row is marked supported only when
 
 | Operation | CPU(Native) | Vulkan(Native) | OpenGL(Native) | Metal(Native) |
 | --- | --- | --- | --- | --- |
-| `MatMul` | [Full FP32/W8A32; legacy QTensor W8A8](../native/src/runtime/engine_runtime.c) | [Partial, F32 `[d_in,d_out]` only; one-shot ≥ 1,048,576 MACs, no `OUT_IN` layout/adapters](../native/src/backends/vulkan_engine.c) | [Partial, F32 `[d_in,d_out]` only; one-shot ≥ 1,048,576 MACs, no `OUT_IN` layout/adapters](../native/src/backends/opengl_engine.c) | [Partial, Apple-only batched F32 graph path](../native/src/backends/metal_engine.m) |
-| `Linear`, `Gemm` | [Full FP32/W8A32; legacy QTensor W8A8](../native/src/runtime/engine_runtime.c) | [Partial, F32 `[d_in,d_out]` only; one-shot ≥ 1,048,576 MACs, no `OUT_IN` layout/adapters](../native/src/backends/vulkan_engine.c) | [Partial, F32 `[d_in,d_out]` only; one-shot ≥ 1,048,576 MACs, no `OUT_IN` layout/adapters](../native/src/backends/opengl_engine.c) | [Partial, Apple-only batched F32 graph path](../native/src/backends/metal_engine.m) |
+| `MatMul` | [Full FP32/W8A32; physical W8A8 uses QMatMul](../native/src/runtime/engine_runtime.c) | [Partial, F32 `[d_in,d_out]` only; one-shot ≥ 1,048,576 MACs, no `OUT_IN` layout/adapters](../native/src/backends/vulkan_engine.c) | [Partial, F32 `[d_in,d_out]` only; one-shot ≥ 1,048,576 MACs, no `OUT_IN` layout/adapters](../native/src/backends/opengl_engine.c) | [Partial, Apple-only batched F32 graph path](../native/src/backends/metal_engine.m) |
+| `Linear`, `Gemm` | [Full FP32/W8A32; physical W8A8 uses QLinear/QGemm](../native/src/runtime/engine_runtime.c) | [Partial, F32 `[d_in,d_out]` only; one-shot ≥ 1,048,576 MACs, no `OUT_IN` layout/adapters](../native/src/backends/vulkan_engine.c) | [Partial, F32 `[d_in,d_out]` only; one-shot ≥ 1,048,576 MACs, no `OUT_IN` layout/adapters](../native/src/backends/opengl_engine.c) | [Partial, Apple-only batched F32 graph path](../native/src/backends/metal_engine.m) |
 | `QLinear`, `QMatMul`, `QGemm` | [Full, canonical physical-byte W8A8; large multi-row x86 pool path; B=1 decoder row stays serial](../native/src/runtime/engine_runtime.c) | [Partial, packed-byte ordinary-forward path; no row decode](../native/src/backends/vulkan_engine.c) | [Partial, packed-byte ordinary-forward path; no row decode](../native/src/backends/opengl_engine.c) | [Partial, Apple-only packed-byte ordinary-forward path; runtime unverified on Linux](../native/src/backends/metal_engine.m) |
+| `QBatchMatMul` | [Full, canonical rank-2–8 physical-byte W8A8 with right-aligned ONNX batch broadcasting, I32 overflow preflight, runtime-gated AVX2/NEON N-column kernels, and large-M row pooling](../native/src/runtime/engine_runtime.c) | [Partial, packed-byte ordinary-forward path; requires an available Vulkan device; no row decode](../native/src/backends/vulkan_engine.c) | [Partial, packed-byte ordinary-forward path; requires an available OpenGL compute device; no row decode](../native/src/backends/opengl_engine.c) | [Partial, Apple-only packed-byte ordinary-forward path; runtime unverified on Linux](../native/src/backends/metal_engine.m) |
 | `Conv2D` | [Full](../native/src/kernels/conv_f32_opt.c) | [Partial, selected batched F32 NHWC graph path](../native/src/backends/vulkan_engine.c) | [Partial, selected batched F32 NHWC graph path](../native/src/backends/opengl_engine.c) | [Partial, selected Apple-only batched F32 NHWC graph path](../native/src/backends/metal_engine.m) |
 | `QConv2D` | [Full, canonical physical-byte NHWC/OHWI W8A8 with large-call x86 output-location pool path; CPU-only fail-closed F32-activation weight-only path via `params.weight_only: true`; all other untyped forms rejected](../native/src/runtime/engine_runtime.c) | [Partial, packed-byte ordinary-forward path](../native/src/backends/vulkan_engine.c) | [Partial, packed-byte ordinary-forward path](../native/src/backends/opengl_engine.c) | [Partial, Apple-only packed-byte ordinary-forward path; runtime unverified on Linux](../native/src/backends/metal_engine.m) |
 | `Conv1D` | [Missing](../native/src/runtime/engine_runtime.c) | [Partial, batched F32 channel-length graph path](../native/src/backends/vulkan_engine.c) | [Partial, batched F32 channel-length graph path](../native/src/backends/opengl_engine.c) | [Partial, Apple-only batched F32 channel-length graph path](../native/src/backends/metal_engine.m) |
 | `ConvTranspose2D` | [Missing](../native/src/runtime/engine_runtime.c) | [Partial, F32 NHWC graph path](../native/src/backends/vulkan_engine.c) | [Partial, F32 NHWC graph path](../native/src/backends/opengl_engine.c) | [Init only](../native/src/backends/metal_engine.m) |
 | `LayerNorm` | [Full](../native/src/kernels/layernorm.c) | [Partial, F32 with weight+bias graph path](../native/src/backends/vulkan_engine.c) | [Partial, F32 with weight+bias graph path](../native/src/backends/opengl_engine.c) | [Partial, Apple-only F32 with weight+bias graph path](../native/src/backends/metal_engine.m) |
-| `QLayerNorm` | [Full, canonical final-axis physical-byte W8A8 with F32 `[D]` affine; B=1 CPU decoder-row path](../native/src/runtime/engine_runtime.c) | [Partial, two-pass packed-byte ordinary-forward path; no row decode](../native/src/backends/vulkan_engine.c) | [Partial, two-pass packed-byte ordinary-forward path; no row decode](../native/src/backends/opengl_engine.c) | [Partial, Apple-only two-pass packed-byte ordinary-forward path; runtime unverified on Linux](../native/src/backends/metal_engine.m) |
+| `QLayerNorm` | [Full, canonical final-axis physical-byte W8A8 with F32 `[D]` affine; pooled large-row execution and runtime-gated AVX2 affine/requantization; serial decoder-row path](../native/src/runtime/engine_runtime.c) | [Partial, two-pass packed-byte ordinary-forward path; no row decode](../native/src/backends/vulkan_engine.c) | [Partial, two-pass packed-byte ordinary-forward path; no row decode](../native/src/backends/opengl_engine.c) | [Partial, Apple-only two-pass packed-byte ordinary-forward path; runtime unverified on Linux](../native/src/backends/metal_engine.m) |
 | `RMSNorm` | [Full](../native/src/kernels/math_nlp.c) | [Partial, F32 graph path](../native/src/backends/vulkan_engine.c) | [Partial, F32 graph path](../native/src/backends/opengl_engine.c) | [Init only](../native/src/backends/metal_engine.m) |
-| `RoPE`, `RotaryEmbedding` | [Full, canonical F32 runtime](../native/src/runtime/sequence_runtime.c), [portable kernel](../native/src/kernels/sequence_ops.c) | [Missing](../native/src/backends/vulkan_engine.c) | [Missing](../native/src/backends/opengl_engine.c) | [Missing](../native/src/backends/metal_engine.m) |
+| `RoPE` | [Full, canonical F32 runtime](../native/src/runtime/sequence_runtime.c), [portable kernel](../native/src/kernels/sequence_ops.c) | [Missing](../native/src/backends/vulkan_engine.c) | [Missing](../native/src/backends/opengl_engine.c) | [Missing](../native/src/backends/metal_engine.m) |
 | `SSMScan`, `SelectiveScan` | [Full, canonical F32 runtime](../native/src/runtime/sequence_runtime.c), [portable kernel](../native/src/kernels/sequence_ops.c) | [Missing](../native/src/backends/vulkan_engine.c) | [Missing](../native/src/backends/opengl_engine.c) | [Missing](../native/src/backends/metal_engine.m) |
 | `BatchNorm2D` | [Full](../native/src/kernels/edge_primitives.c) | [Partial, F32 NHWC graph path](../native/src/backends/vulkan_engine.c) | [Partial, F32 NHWC graph path](../native/src/backends/opengl_engine.c) | [Init only](../native/src/backends/metal_engine.m) |
 | `GroupNorm` | [Partial, F32 NHWC](../native/src/runtime/engine_runtime.c) | [Partial, F32 NHWC graph path](../native/src/backends/vulkan_engine.c) | [Partial, F32 NHWC graph path](../native/src/backends/opengl_engine.c) | [Partial, Apple-only F32 NHWC graph path](../native/src/backends/metal_engine.m) |
-| `QGroupNorm` | [Full, canonical NHWC physical-byte W8A8 with F32 `[C]` affine](../native/src/runtime/engine_runtime.c) | [Partial, two-pass packed-byte ordinary-forward path; no prefill/decode](../native/src/backends/vulkan_engine.c) | [Partial, two-pass packed-byte ordinary-forward path; no prefill/decode](../native/src/backends/opengl_engine.c) | [Partial, Apple-only two-pass packed-byte ordinary-forward path; runtime unverified on Linux](../native/src/backends/metal_engine.m) |
+| `QGroupNorm` | [Full, canonical NHWC physical-byte W8A8 with F32 `[C]` affine; pooled groups and runtime-gated AVX2 four-group SIMD](../native/src/runtime/engine_runtime.c) | [Partial, two-pass packed-byte ordinary-forward path; no prefill/decode](../native/src/backends/vulkan_engine.c) | [Partial, two-pass packed-byte ordinary-forward path; no prefill/decode](../native/src/backends/opengl_engine.c) | [Partial, Apple-only two-pass packed-byte ordinary-forward path; runtime unverified on Linux](../native/src/backends/metal_engine.m) |
 | `Embedding` | [Full, I32 token IDs](../native/src/kernels/embedding.c) | [Partial, I32 IDs/F32 table graph path](../native/src/backends/vulkan_engine.c) | [Partial, I32 IDs/F32 table graph path](../native/src/backends/opengl_engine.c) | [Partial, Apple-only I32 IDs/F32 table graph path](../native/src/backends/metal_engine.m) |
 | `QEmbedding` | [Full, canonical physical-byte W8A8; B=1 CPU decoder-row path](../native/src/runtime/engine_runtime.c) | [Partial, packed-byte ordinary-forward path; no row decode](../native/src/backends/vulkan_engine.c) | [Partial, packed-byte ordinary-forward path; no row decode](../native/src/backends/opengl_engine.c) | [Partial, Apple-only packed-byte ordinary-forward path; runtime unverified on Linux](../native/src/backends/metal_engine.m) |
 | `QMaskedMean` | [Full, canonical I32 centered-byte reduction to physical-byte output](../native/src/runtime/engine_runtime.c) | [Partial, packed-byte ordinary-forward path; no prefill/decode](../native/src/backends/vulkan_engine.c) | [Partial, packed-byte ordinary-forward path; no prefill/decode](../native/src/backends/opengl_engine.c) | [Partial, Apple-only packed-byte ordinary-forward path; runtime unverified on Linux](../native/src/backends/metal_engine.m) |
@@ -577,18 +664,18 @@ the MSL may be generated for many ops, but a row is marked supported only when
 | `MoERouter` | [Full, F32/I32 route indices](../native/src/runtime/engine_runtime.c) | [Missing](../native/src/backends/vulkan_engine.c) | [Missing](../native/src/backends/opengl_engine.c) | [Missing](../native/src/backends/metal_engine.m) |
 | `MoELinear` | [Full](../native/src/runtime/engine_runtime.c) | [Missing](../native/src/backends/vulkan_engine.c) | [Missing](../native/src/backends/opengl_engine.c) | [Missing](../native/src/backends/metal_engine.m) |
 | `MaxPool2D` | [Full, F32 plus canonical typed NHWC I8/U8 with unit dilation/no ceil mode](../native/src/runtime/engine_runtime.c) | [Partial, F32 plus packed-byte typed ordinary-forward path](../native/src/backends/vulkan_engine.c) | [Partial, F32 plus packed-byte typed ordinary-forward path](../native/src/backends/opengl_engine.c) | [Partial, Apple-only packed-byte typed ordinary-forward path; runtime unverified on Linux](../native/src/backends/metal_engine.m) |
-| `AveragePool`, `AveragePool2D` | [Missing](../native/src/runtime/engine_runtime.c) | [Partial, F32 NHWC graph path](../native/src/backends/vulkan_engine.c) | [Partial, F32 NHWC graph path](../native/src/backends/opengl_engine.c) | [Init only](../native/src/backends/metal_engine.m) |
+| `AveragePool2D` | [Missing](../native/src/runtime/engine_runtime.c) | [Partial, F32 NHWC graph path](../native/src/backends/vulkan_engine.c) | [Partial, F32 NHWC graph path](../native/src/backends/opengl_engine.c) | [Init only](../native/src/backends/metal_engine.m) |
 | `GlobalAveragePool` | [Full](../native/src/kernels/edge_primitives.c) | [Partial, F32 NHWC graph path](../native/src/backends/vulkan_engine.c) | [Partial, F32 NHWC graph path](../native/src/backends/opengl_engine.c) | [Init only](../native/src/backends/metal_engine.m) |
 | `Resize` | [Partial, canonical typed nearest/asymmetric/floor path; generic F32 Resize remains unavailable](../native/src/runtime/engine_runtime.c) | [Partial, F32 plus packed-byte typed nearest ordinary-forward path](../native/src/backends/vulkan_engine.c) | [Partial, F32 plus packed-byte typed nearest ordinary-forward path](../native/src/backends/opengl_engine.c) | [Partial, Apple-only packed-byte typed nearest ordinary-forward path; runtime unverified on Linux](../native/src/backends/metal_engine.m) |
 | `ResizeNearest2D` | [Full, F32 plus canonical typed nearest NHWC path](../native/src/runtime/engine_runtime.c) | [Partial, F32 plus packed-byte typed ordinary-forward path](../native/src/backends/vulkan_engine.c) | [Partial, F32 plus packed-byte typed ordinary-forward path](../native/src/backends/opengl_engine.c) | [Partial, Apple-only packed-byte typed ordinary-forward path; runtime unverified on Linux](../native/src/backends/metal_engine.m) |
 | `UpsampleNearest2D` | [Full](../native/src/kernels/vision_ops.c) | [Partial, batched F32 NHWC graph path](../native/src/backends/vulkan_engine.c) | [Partial, batched F32 NHWC graph path](../native/src/backends/opengl_engine.c) | [Init only](../native/src/backends/metal_engine.m) |
-| `InterpLinear1D`, `Interp1D` | [Missing](../native/src/runtime/engine_runtime.c) | [Partial, F32 2D channels-by-length graph path](../native/src/backends/vulkan_engine.c) | [Partial, F32 2D channels-by-length graph path](../native/src/backends/opengl_engine.c) | [Init only](../native/src/backends/metal_engine.m) |
+| `Interpolate1D` | [Missing](../native/src/runtime/engine_runtime.c) | [Partial, F32 2D channels-by-length graph path](../native/src/backends/vulkan_engine.c) | [Partial, F32 2D channels-by-length graph path](../native/src/backends/opengl_engine.c) | [Init only](../native/src/backends/metal_engine.m) |
 | `ReLU` | [Full](../native/src/kernels/activations.c) | [Partial, same-size F32 graph path](../native/src/backends/vulkan_engine.c) | [Partial, same-size F32 graph path](../native/src/backends/opengl_engine.c) | [Init only](../native/src/backends/metal_engine.m) |
 | `LeakyReLU` | [Full](../native/src/kernels/math_nlp.c) | [Partial, same-size F32 graph path](../native/src/backends/vulkan_engine.c) | [Partial, same-size F32 graph path](../native/src/backends/opengl_engine.c) | [Init only](../native/src/backends/metal_engine.m) |
 | `PReLU` | [Full, scalar or last-channel slope](../native/src/runtime/engine_runtime.c) | [Partial, F32 last-channel graph path](../native/src/backends/vulkan_engine.c) | [Partial, F32 last-channel graph path](../native/src/backends/opengl_engine.c) | [Init only](../native/src/backends/metal_engine.m) |
 | `GELU` | [Full, erf default and optional tanh](../native/src/kernels/activations.c) | [Partial, same-size F32 erf/tanh graph path](../native/src/backends/vulkan_engine.c) | [Partial, same-size F32 erf/tanh graph path](../native/src/backends/opengl_engine.c) | [Partial, Apple-only same-size F32 erf/tanh graph path](../native/src/backends/metal_engine.m) |
-| `SiLU`, `Swish` | [Full](../native/src/kernels/math_nlp.c) | [Partial, same-size F32 graph path](../native/src/backends/vulkan_engine.c) | [Partial, same-size F32 graph path](../native/src/backends/opengl_engine.c) | [Partial, Apple-only same-size F32 graph path](../native/src/backends/metal_engine.m) |
-| `QSiLU` | [Full, canonical same-shape parameter-free physical-byte W8A8; exact 256-byte portable-C LUT with warm row reuse](../native/src/runtime/engine_runtime.c) | [Partial, packed-byte ordinary-forward path; no prefill/decode](../native/src/backends/vulkan_engine.c) | [Partial, packed-byte ordinary-forward path; no prefill/decode](../native/src/backends/opengl_engine.c) | [Partial, Apple-only packed-byte ordinary-forward path; runtime unverified on Linux](../native/src/backends/metal_engine.m) |
+| `SiLU` | [Full](../native/src/kernels/math_nlp.c) | [Partial, same-size F32 graph path](../native/src/backends/vulkan_engine.c) | [Partial, same-size F32 graph path](../native/src/backends/opengl_engine.c) | [Partial, Apple-only same-size F32 graph path](../native/src/backends/metal_engine.m) |
+| `QSiLU` | [Full, canonical same-shape parameter-free physical-byte W8A8; exact 256-byte portable-C LUT with warm reuse and large-range CPU pooling](../native/src/runtime/engine_runtime.c) | [Partial, packed-byte ordinary-forward path; no prefill/decode](../native/src/backends/vulkan_engine.c) | [Partial, packed-byte ordinary-forward path; no prefill/decode](../native/src/backends/opengl_engine.c) | [Partial, Apple-only packed-byte ordinary-forward path; runtime unverified on Linux](../native/src/backends/metal_engine.m) |
 | `QGELU` | [Full, canonical same-shape physical-byte W8A8; fixed A–S 7.1.26 erf polynomial, `approximate: "none"` only; exact 256-byte portable-C LUT with warm row reuse](../native/src/runtime/engine_runtime.c) | [Partial, packed-byte ordinary-forward path; no row decode](../native/src/backends/vulkan_engine.c) | [Partial, packed-byte ordinary-forward path; no row decode](../native/src/backends/opengl_engine.c) | [Partial, Apple-only packed-byte ordinary-forward path; runtime unverified on Linux](../native/src/backends/metal_engine.m) |
 | `Sigmoid` | [Full](../native/src/kernels/edge_primitives.c) | [Partial, same-size F32 graph path](../native/src/backends/vulkan_engine.c) | [Partial, same-size F32 graph path](../native/src/backends/opengl_engine.c) | [Init only](../native/src/backends/metal_engine.m) |
 | `HardSwish` | [Full](../native/src/kernels/edge_primitives.c) | [Partial, same-size F32 graph path](../native/src/backends/vulkan_engine.c) | [Partial, same-size F32 graph path](../native/src/backends/opengl_engine.c) | [Init only](../native/src/backends/metal_engine.m) |
@@ -613,7 +700,7 @@ the MSL may be generated for many ops, but a row is marked supported only when
 | `Split` | [Full, multi-output axis slices](../native/src/runtime/engine_runtime.c) | [Partial, F32 multi-output axis slices](../native/src/backends/vulkan_engine.c) | [Partial, F32 multi-output axis slices](../native/src/backends/opengl_engine.c) | [Partial, Apple-only F32 multi-output axis slices](../native/src/backends/metal_engine.m) |
 | `Slice` | [Missing](../native/src/runtime/engine_runtime.c) | [Partial, F32 up to 4D with positive steps](../native/src/backends/vulkan_engine.c) | [Partial, F32 up to 4D with positive steps](../native/src/backends/opengl_engine.c) | [Init only](../native/src/backends/metal_engine.m) |
 | `Pad` | [Missing](../native/src/runtime/engine_runtime.c) | [Partial, F32 up to 4D top/left constant pad](../native/src/backends/vulkan_engine.c) | [Partial, F32 up to 4D top/left constant pad](../native/src/backends/opengl_engine.c) | [Init only](../native/src/backends/metal_engine.m) |
-| `Expand`, `Broadcast` | [Missing](../native/src/runtime/engine_runtime.c) | [Partial, F32 up to 4D graph path](../native/src/backends/vulkan_engine.c) | [Partial, F32 up to 4D graph path](../native/src/backends/opengl_engine.c) | [Init only](../native/src/backends/metal_engine.m) |
+| `Expand`, `Broadcast` | [Full, F32/I32 plus descriptor-preserving rank-1–8 I8/U8 `Expand`](../native/src/runtime/engine_runtime.c) | [Partial, F32 up to 4D graph path; byte `Expand` falls back to native CPU](../native/src/backends/vulkan_engine.c) | [Partial, F32 up to 4D graph path; byte `Expand` falls back to native CPU](../native/src/backends/opengl_engine.c) | [Init only; byte `Expand` falls back to native CPU](../native/src/backends/metal_engine.m) |
 | `Gather` | [Missing](../native/src/runtime/engine_runtime.c) | [Partial, F32 axis-0 graph path with F32 indices](../native/src/backends/vulkan_engine.c) | [Partial, F32 axis-0 graph path with F32 indices](../native/src/backends/opengl_engine.c) | [Init only](../native/src/backends/metal_engine.m) |
 | `GatherElements` | [Missing](../native/src/runtime/engine_runtime.c) | [Missing](../native/src/backends/vulkan_engine.c) | [Missing](../native/src/backends/opengl_engine.c) | [Init only](../native/src/backends/metal_engine.m) |
 | `Where`, `Mask` | [Missing](../native/src/runtime/engine_runtime.c) | [Partial, same-size F32 graph path](../native/src/backends/vulkan_engine.c) | [Partial, same-size F32 graph path](../native/src/backends/opengl_engine.c) | [Init only](../native/src/backends/metal_engine.m) |
@@ -632,23 +719,27 @@ the MSL may be generated for many ops, but a row is marked supported only when
 | `ProfileX` | [Missing](../native/src/runtime/engine_runtime.c) | [Partial, batched F32 NHWC graph path](../native/src/backends/vulkan_engine.c) | [Partial, batched F32 NHWC graph path](../native/src/backends/opengl_engine.c) | [Partial, Apple-only batched F32 NHWC graph path](../native/src/backends/metal_engine.m) |
 | `ProfileY` | [Missing](../native/src/runtime/engine_runtime.c) | [Partial, batched F32 NHWC graph path](../native/src/backends/vulkan_engine.c) | [Partial, batched F32 NHWC graph path](../native/src/backends/opengl_engine.c) | [Partial, Apple-only batched F32 NHWC graph path](../native/src/backends/metal_engine.m) |
 | `MeanHeight` | [Missing](../native/src/runtime/engine_runtime.c) | [Partial, batched F32 NHWC graph path](../native/src/backends/vulkan_engine.c) | [Partial, batched F32 NHWC graph path](../native/src/backends/opengl_engine.c) | [Partial, Apple-only batched F32 NHWC graph path](../native/src/backends/metal_engine.m) |
-| `Shape` | [Missing](../native/src/runtime/engine_runtime.c) | [Missing](../native/src/backends/vulkan_engine.c) | [Missing](../native/src/backends/opengl_engine.c) | [Init only](../native/src/backends/metal_engine.m) |
-| `Size` | [Missing](../native/src/runtime/engine_runtime.c) | [Missing](../native/src/backends/vulkan_engine.c) | [Missing](../native/src/backends/opengl_engine.c) | [Init only](../native/src/backends/metal_engine.m) |
-| `TopK` | [Missing](../native/src/runtime/engine_runtime.c) | [Missing](../native/src/backends/vulkan_engine.c) | [Missing](../native/src/backends/opengl_engine.c) | [Init only](../native/src/backends/metal_engine.m) |
 
 ## Training and backward status
 
-Training is a separate, lazy execution path. Normal inference does not allocate
-gradient buffers, optimizer state, random masks, or backward pipelines.
+Training is a separate full-profile path. Normal inference does not allocate
+gradient buffers, optimizer state, random masks, or backward pipelines. The
+public inference header exposes inference Vx* handles only. The full-only
+`volvoxai_full.h` exposes an opaque `VxTrainer`, and the model-neutral
+`native/volvoxai-full train` command is a client of that lifecycle. JavaScript
+training is likewise owned by a retained Trainer created from a Model.
 
 Strict `backend: "wasm"` training in `volvoxai.full.wasm` accepts the
 differentiable complete contracts documented here and rejects partial or
 non-canonical contracts before model state changes. JavaScript CPU and browser
 WebGPU implement the same portable contracts. `ArgMax` and
-`NonMaxSuppression`, `RoPE`/`RotaryEmbedding`, `SSMScan`/`SelectiveScan`,
-`Sin`, and `Cos` are intentionally forward-only. This browser/Node
-portability gate does not change CPU(Native), Vulkan, OpenGL, or Metal coverage
-below.
+`NonMaxSuppression`, `RoPE`, `SSMScan`/`SelectiveScan`,
+`Sin`, and `Cos` are intentionally forward-only. This browser/Node portability
+gate does not change native coverage below. CUDA is intentionally kept out of
+this four-column summary because its fast-changing full-profile F32 backward,
+loss, optimizer, and W8-authoring contract is maintained in
+[cuda.md](cuda.md#backward-operator-coverage). Its inference profile
+remains free of all training code and PTX.
 
 | Capability | JavaScript CPU | Browser WebGPU | Native CPU | Vulkan / OpenGL / Metal training |
 | --- | --- | --- | --- | --- |
@@ -657,18 +748,20 @@ below.
 | `SDPA` / `CrossSDPA` probability dropout | Exact training-only mask | Exact training-only mask | Deterministic after-softmax training mask | Dropout-aware forward and backward, with CPU fallback if GPU dispatch is unavailable |
 | `Add` / `Mul` broadcasting | Right-aligned N-D forward and reduced backward | Right-aligned N-D forward and reduced WGSL backward | Right-aligned N-D forward and reduced backward | Right-aligned F32 forward and reduced GPU backward, up to rank 8 |
 | `ReduceSum` / `ReduceMean` | Last-axis forward/backward | Last-axis WGSL forward/backward | Last-axis forward/backward | Last-axis F32 GPU forward/backward |
-| Weighted CE losses and accumulation | `losses`, per-loss metrics, explicit normalizers, reset/flush | Same contract | Native multi-loss C API | Same native training API; loss seeding and the optimizer remain coordinated by the native runtime |
+| Weighted CE losses and accumulation | `losses`, per-loss metrics, explicit normalizers, reset/flush | Same contract | Full-only opaque `VxTrainer` | Same Trainer contract; loss seeding and the optimizer remain coordinated by its private owner |
 
 For JavaScript CPU, strict full-WASM, and WebGPU, attention probability `dropout` (or
 `attention_dropout`) is applied after softmax with inverted scaling and no
 renormalization. Forward and backward regenerate the same deterministic
 `[B,H,Q,K]` mask. Inference remains ordinary deterministic attention. Native
-CPU, Vulkan, OpenGL compute, and Metal implement the same after-softmax
-training semantics and regenerate their mask during backward. Native GPU
-dispatch falls back to the matching CPU forward/backward path when its training
-shader or layout is unavailable. Standalone `Dropout` is fully separate and
-supported on all of them. Determinism is per backend and training state; the JS
-and native seed APIs are not a promise of bit-identical masks to each other.
+CPU, Vulkan, OpenGL compute, Metal, and full-profile CUDA implement the same
+after-softmax training semantics and regenerate their mask during backward.
+Vulkan/OpenGL/Metal dispatch may fall back to the matching CPU forward/backward
+path when its training shader or layout is unavailable; required-CUDA training
+instead preflights the complete plan and fails closed. Standalone `Dropout` is
+fully separate and supported on all of them. Determinism is per backend and
+training state; the JS and native seed APIs are not a promise of bit-identical
+masks to each other.
 
 Multiple loss entries can target different or repeated logits tensors and are
 summed after their independent weights and normalizers are applied. Explicit
@@ -697,23 +790,18 @@ preflight. Metal runtime validation requires macOS and an Apple GPU.
 
 ## Known Gaps
 
-1. **WebGPU output contract:** [GraphExecutor.execute()](../ts/backends/GraphExecutor.ts)
-   returns the first output buffer of the last node, not a map of all
-   `graph.outputNames`. `readBuffer()` is dtype-aware for F32/I32/I8/U8 and
-   handles padded byte buffers, but multi-output read-back remains an API gap.
-2. **WebGPU contract limits:** Canonical `Gather` uses Int32 indices and
-   supports arbitrary valid axes through rank 8; the retained legacy F32-index
-   path is axis-0 only. `Softmax` and `LogSoftmax` remain last-axis operations,
-   `Split` uses equal-sized output slices, and `Pad` remains constant
-   NHWC/4D-oriented. See the Browser and Node Status table above for rank,
-   dtype, and shape contracts.
-3. **WebGPU unsupported op behavior:** Missing shaders log a warning and skip
-   the node during pipeline build, leaving that output buffer unwritten. Product code
-   should prefer compile-time validation for strict GPU-only deployments.
-4. **WebNN coverage:** WebNN is intentionally narrow. It can run common dense,
+1. **WebGPU contract limits:** Canonical `Gather` uses I32 indices and
+   supports arbitrary valid axes through rank eight. `Softmax` and
+   `LogSoftmax` remain last-axis operations, `Split` uses equal-sized output
+   slices, and `Pad` remains constant NHWC/4D-oriented. See the Browser and
+   Node Status table above for rank, dtype, and shape contracts.
+2. **WebGPU compilation:** Unsupported nodes reject compilation with a typed
+   error. Every successful ExecutionResult contains a stable snapshot for all
+   declared outputs, including input, weight, and transitive alias outputs.
+3. **WebNN coverage:** WebNN is intentionally narrow. It can run common dense,
    activation, embedding, conv, reshape, layer norm, and decomposed SDPA graphs, but
    most vision postprocessing and shape ops are not mapped yet.
-5. **Canonical W8A8 scope:** Browser/Node CPU, WASM, WebGPU, native CPU, and
+4. **Canonical W8A8 scope:** Browser/Node CPU, WASM, WebGPU, native CPU, and
    the native GPU graph routes accept the documented canonical subset. It is
    not a universal INT8-op set: unsupported raw I8/U8 activations fail closed
    until an explicit typed kernel is added. The direct TFLite exporter also
@@ -723,13 +811,14 @@ preflight. Metal runtime validation requires macOS and an Apple GPU.
    remains fixed B=1; ordinary per-token forward is the default, while opt-in
    incremental execution seeds once, caches image/encoder dependencies, and
    uses decoder-row/self-attention-KV reuse on native CPU, browser/Node CPU,
-   WASM, and WebGPU. Built-in native GPU sessions may hand a strictly validated
+   WASM, and WebGPU. Vulkan/OpenGL/Metal sessions may hand a strictly validated
    seed prefix to the CPU row implementation once; unsupported closures remain
-   on ordinary GPU dependency execution. Production-wide accuracy
+   on ordinary GPU dependency execution. CUDA instead keeps an eligible
+   changed closure device-resident and launches row kernels. Production-wide accuracy
    qualification remains open work.
-6. **Native GPU coverage:** Vulkan(Native), OpenGL(Native), and Metal(Native)
+5. **Native GPU coverage:** Vulkan(Native), OpenGL(Native), and Metal(Native)
    dispatch the canonical packed-byte subset during ordinary graph forward
-   execution. For a compatible incremental TinyReceipt session the seed stays
+   execution. For an eligible incremental TinyReceipt session the seed stays
    on that device and later rows move once to the native CPU row/KV path. The
    calibrated TinyReceipt package has been exercised on Vulkan (RADV Renoir)
    and OpenGL (Mesa Renoir) here. Metal is Apple-only and remains
@@ -737,10 +826,12 @@ preflight. Metal runtime validation requires macOS and an Apple GPU.
    selects the portable cooperative QConv tile for eligible layers, while
    Vulkan can select packed integer-dot SPIR-V only when the device reports an
    accelerated signed 4x8-bit dot product; all other descriptors retain their
-   portable packed-byte kernels.
-7. **Training coverage:** JavaScript CPU, strict full-WASM, and browser WebGPU
+   portable packed-byte kernels. CUDA has separate broad, strict forward
+   coverage and RTX 3090 validation documented in [cuda.md](cuda.md); it does
+   not use the CPU-row handoff or per-node CPU fallback.
+6. **Training coverage:** JavaScript CPU, strict full-WASM, and browser WebGPU
    implement the portable matrix's differentiable complete rows. Native CPU and
-   native GPU backends retain separate explicit backward allowlists; an
+   Vulkan/OpenGL/Metal retain separate explicit backward allowlists; an
    unsupported native GPU operation either selects the complete native CPU
    backward path during preflight or fails, never silently stops a gradient.
    Batched SDPA/CrossSDPA are not restricted to batch one. WebGPU portable
@@ -748,6 +839,12 @@ preflight. Metal runtime validation requires macOS and an Apple GPU.
    `d_model <= 64`), and WebGPU MoE routing requires `top_k <= 8`. Exact
    after-softmax attention-probability dropout is supported by JavaScript CPU,
    strict full-WASM, browser WebGPU, native CPU, Vulkan, OpenGL compute, and
-   Metal training. Metal is Apple-only and cannot be runtime-tested on Linux.
+   Metal training. Full-profile CUDA implements the current native F32
+   backward contract plus device loss, accumulation, clipping, SGD, and AdamW;
+   its staged-attention implementation, split-axis checks, combined batch-one
+   query/output-length-192 accumulation-24 TinyVQA update/checkpoint/resume
+   evidence, and remaining residency/performance work are tracked in
+   [cuda.md](cuda.md). Metal is Apple-only and cannot be
+   runtime-tested on Linux.
    See [model construction, routing, and training](model_builder_training.md) for
    the API and current constraints.

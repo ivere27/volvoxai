@@ -153,6 +153,7 @@ typedef struct {
     int use_nnapi;
     int use_opengl;
     int use_metal;
+    int use_cuda;
     NativeGpuTrainingBackend gpu_training_backend;
     int backends_saved;
     int base_route_set;
@@ -166,6 +167,18 @@ static void training_graph_release_base_route(TrainingGraphState* state) {
         vx_adapter_request_end();
         state->base_route_set = 0;
     }
+}
+
+static void training_graph_restore_backends(TrainingGraphState* state) {
+    if (!state || !state->backends_saved) return;
+    g_use_vulkan = state->use_vulkan;
+    g_use_nnapi = state->use_nnapi;
+    g_use_opengl = state->use_opengl;
+    g_use_metal = state->use_metal;
+#if VOLVOXAI_ENABLE_CUDA
+    g_use_cuda = state->use_cuda;
+#endif
+    state->backends_saved = 0;
 }
 
 static void training_graph_restore_aliases(TrainingGraphState* state) {
@@ -186,7 +199,8 @@ static int training_graph_detach_inference_aliases(TrainingGraphState* state) {
     if (!state || !state->aliases) return -1;
     /* Collect the complete canonical-output alias group first so passthrough
        chains are recognized before any pointer is changed. Arena aliases were
-       already expanded by free_node_caches(), leaving optimizer aliases here. */
+       already expanded by free_node_caches_for_training(), leaving optimizer
+       aliases here. */
     for (int i = 0; i < g_nn; i++) {
         Node* node = &g_n[i];
         T* output = t_find(node->out);
@@ -273,12 +287,34 @@ static int training_graph_prepare(TrainingGraphState* state, uint32_t training_c
     }
     state->base_route_set = 1;
 
-    if (free_node_caches() != 0) {
+    /* Select the training route before cache teardown. The teardown decision
+     * must know whether CUDA weights can remain resident or whether a CPU/
+     * other-backend handoff must first materialize them. */
+    state->use_vulkan = g_use_vulkan;
+    state->use_nnapi = g_use_nnapi;
+    state->use_opengl = g_use_opengl;
+    state->use_metal = g_use_metal;
+#if VOLVOXAI_ENABLE_CUDA
+    state->use_cuda = g_use_cuda;
+#endif
+    state->backends_saved = 1;
+    state->gpu_training_backend = gpu_training_select_backend();
+    g_use_vulkan = state->gpu_training_backend == NATIVE_GPU_TRAINING_VULKAN;
+    g_use_nnapi = 0;
+    g_use_opengl = state->gpu_training_backend == NATIVE_GPU_TRAINING_OPENGL;
+    g_use_metal = state->gpu_training_backend == NATIVE_GPU_TRAINING_METAL;
+#if VOLVOXAI_ENABLE_CUDA
+    g_use_cuda = state->gpu_training_backend == NATIVE_GPU_TRAINING_CUDA;
+#endif
+
+    if (free_node_caches_for_training() != 0) {
+        training_graph_restore_backends(state);
         training_graph_release_base_route(state);
         training_graph_state_free(state);
         return -1;
     }
     if (training_graph_detach_inference_aliases(state) != 0) {
+        training_graph_restore_backends(state);
         training_graph_release_base_route(state);
         training_graph_state_free(state);
         return -1;
@@ -321,20 +357,13 @@ static int training_graph_prepare(TrainingGraphState* state, uint32_t training_c
         g_n[i].skip = g_n[i].disabled ? 1 : 0;
         g_n[i].fuse_relu6 = 0;
     }
-    /* Preserve the user's inference selection, then keep at most one backend
-       active for the training tape. Unsupported hardware still gets the
-       existing CPU forward/backward path. */
-    state->use_vulkan = g_use_vulkan;
-    state->use_nnapi = g_use_nnapi;
-    state->use_opengl = g_use_opengl;
-    state->use_metal = g_use_metal;
-    state->backends_saved = 1;
-    state->gpu_training_backend = gpu_training_select_backend();
-    g_use_vulkan = state->gpu_training_backend == NATIVE_GPU_TRAINING_VULKAN;
-    g_use_nnapi = 0;
-    g_use_opengl = state->gpu_training_backend == NATIVE_GPU_TRAINING_OPENGL;
-    g_use_metal = state->gpu_training_backend == NATIVE_GPU_TRAINING_METAL;
-    g_weight_caches_dirty = 1;
+    /* CUDA training consumes canonical graph weights directly and the
+     * training-specific teardown above already removed host CPU packs. Do not
+     * enter the generic lazy refresh: it performs a full backend reset and
+     * would discard persistent CUDA weight slots before every microbatch.
+     * Non-CUDA training retains the established host-cache rebuild path. */
+    g_weight_caches_dirty =
+        state->gpu_training_backend == NATIVE_GPU_TRAINING_CUDA ? 0 : 1;
     state->saved_training_mode = g_native_training_mode;
     state->saved_training_counter = g_native_training_counter;
     state->training_context_saved = 1;
@@ -344,6 +373,7 @@ static int training_graph_prepare(TrainingGraphState* state, uint32_t training_c
 }
 
 static int training_graph_restore(TrainingGraphState* state) {
+    int restored_cuda = 0;
     if (!state) return -1;
     if (state->training_context_saved) {
         g_native_training_mode = state->saved_training_mode;
@@ -351,17 +381,15 @@ static int training_graph_restore(TrainingGraphState* state) {
         state->training_context_saved = 0;
     }
     training_graph_release_base_route(state);
-    if (state->backends_saved) {
-        g_use_vulkan = state->use_vulkan;
-        g_use_nnapi = state->use_nnapi;
-        g_use_opengl = state->use_opengl;
-        g_use_metal = state->use_metal;
-    }
+#if VOLVOXAI_ENABLE_CUDA
+    if (state->backends_saved) restored_cuda = state->use_cuda;
+#endif
+    training_graph_restore_backends(state);
     if (!state->nodes || state->node_count != g_nn) {
         training_graph_state_free(state);
         return -1;
     }
-    int rc = free_node_caches();
+    int rc = free_node_caches_for_training();
     for (int i = 0; i < g_nn; i++) {
         strncpy(g_n[i].out, state->nodes[i].out, sizeof(g_n[i].out) - 1);
         g_n[i].out[sizeof(g_n[i].out) - 1] = 0;
@@ -373,46 +401,14 @@ static int training_graph_restore(TrainingGraphState* state) {
     training_graph_restore_aliases(state);
     if (rc == 0 && build_quant_params_pass() != 0) rc = -1;
     volvoxai_engine_finish_tensor_table_mutation();
-    if (rc == 0 && prepack_conv_weights() != 0) rc = -1;
+    /* A restored CUDA inference route has no use for host Conv/F16 packs.
+     * Leaving them absent also avoids rebuilding host caches at a
+     * device-resident training boundary. */
+    if (rc == 0 && !restored_cuda && prepack_conv_weights() != 0) rc = -1;
     if (rc == 0) g_weight_caches_dirty = 0;
     training_graph_state_free(state);
     return rc;
 }
-
-typedef struct {
-    char* name;
-    char* logits_name;
-    float weight;
-    float normalizer;
-    volvoxai_cross_entropy_metric_t metric;
-} TrainingAccumulationLoss;
-
-typedef struct {
-    int active;
-    int microbatches;
-    int accumulation_steps;
-    int has_contribution;
-    int trainable_count;
-    int loss_count;
-    int tensor_count;
-    int node_count;
-    uint64_t topology_hash;
-    int update_mode;
-    float learning_rate;
-    float beta1;
-    float beta2;
-    float epsilon;
-    float weight_decay;
-    float max_grad_norm;
-    long step;
-    float loss;
-    char** trainable_names;
-    long* trainable_numel;
-    float** gradients;
-    TrainingAccumulationLoss* losses;
-} TrainingAccumulationState;
-
-static TrainingAccumulationState g_training_accumulation;
 
 static char* training_string_copy(const char* value) {
     if (!value) return NULL;
@@ -424,6 +420,9 @@ static char* training_string_copy(const char* value) {
 
 void volvoxai_engine_reset_training_accumulation(void) {
     TrainingAccumulationState* state = &g_training_accumulation;
+#if VOLVOXAI_ENABLE_CUDA
+    cuda_training_window_destroy(state->cuda_window);
+#endif
     if (state->gradients) {
         for (int i = 0; i < state->trainable_count; i++) free(state->gradients[i]);
     }
@@ -492,10 +491,12 @@ static int training_accumulation_signature_matches(
         const char* const* trainable_names, int trainable_count,
         int update_mode, float learning_rate, float beta1, float beta2,
         float epsilon, float weight_decay, float max_grad_norm, long step,
-        int accumulation_steps, uint64_t topology_hash) {
+        int accumulation_steps, uint64_t topology_hash,
+        NativeGpuTrainingBackend backend) {
     TrainingAccumulationState* state = &g_training_accumulation;
     if (!state->active) return 1;
-    if (state->loss_count != loss_count || state->trainable_count != trainable_count ||
+    if (state->backend != backend || state->loss_count != loss_count ||
+        state->trainable_count != trainable_count ||
         state->accumulation_steps != accumulation_steps || state->tensor_count != g_nt ||
         state->node_count != g_nn || state->topology_hash != topology_hash ||
         state->update_mode != update_mode || state->learning_rate != learning_rate ||
@@ -521,7 +522,8 @@ static int training_accumulation_begin(
         const char* const* trainable_names, int trainable_count,
         int update_mode, float learning_rate, float beta1, float beta2,
         float epsilon, float weight_decay, float max_grad_norm, long step,
-        int accumulation_steps, uint64_t topology_hash) {
+        int accumulation_steps, uint64_t topology_hash,
+        NativeGpuTrainingBackend backend) {
     TrainingAccumulationState* state = &g_training_accumulation;
     if (state->active) return 0;
     memset(state, 0, sizeof(*state));
@@ -538,8 +540,12 @@ static int training_accumulation_begin(
         if (!tensor || tensor->numel <= 0) goto fail;
         state->trainable_names[i] = training_string_copy(trainable_names[i]);
         state->trainable_numel[i] = tensor->numel;
-        state->gradients[i] = (float*)calloc((size_t)tensor->numel, sizeof(float));
-        if (!state->trainable_names[i] || !state->gradients[i]) goto fail;
+        if (backend != NATIVE_GPU_TRAINING_CUDA)
+            state->gradients[i] = (float*)calloc(
+                (size_t)tensor->numel, sizeof(float));
+        if (!state->trainable_names[i] ||
+            (backend != NATIVE_GPU_TRAINING_CUDA && !state->gradients[i]))
+            goto fail;
     }
     for (int i = 0; i < loss_count; i++) {
         state->losses[i].name = training_string_copy(losses[i].name);
@@ -560,6 +566,33 @@ static int training_accumulation_begin(
     state->weight_decay = weight_decay;
     state->max_grad_norm = max_grad_norm;
     state->step = step;
+    state->backend = backend;
+#if VOLVOXAI_ENABLE_CUDA
+    if (backend == NATIVE_GPU_TRAINING_CUDA) {
+        void** hosts = (void**)calloc((size_t)trainable_count, sizeof(void*));
+        size_t* bytes = (size_t*)calloc((size_t)trainable_count,
+                                       sizeof(size_t));
+        if (!hosts || !bytes) {
+            free(hosts); free(bytes);
+            goto fail;
+        }
+        for (int i = 0; i < trainable_count; i++) {
+            T* tensor = t_find(trainable_names[i]);
+            hosts[i] = tensor ? tensor->data : NULL;
+            if (!tensor || (size_t)tensor->numel > SIZE_MAX / sizeof(float)) {
+                free(hosts); free(bytes);
+                goto fail;
+            }
+            bytes[i] = (size_t)tensor->numel * sizeof(float);
+        }
+        state->cuda_window = cuda_training_window_create(
+            hosts, bytes, trainable_count);
+        free(hosts); free(bytes);
+        if (!state->cuda_window) goto fail;
+    }
+#else
+    if (backend == NATIVE_GPU_TRAINING_CUDA) goto fail;
+#endif
     state->active = 1;
     return 0;
 fail:
@@ -578,6 +611,8 @@ static void training_accumulation_outputs(float* out_loss,
     if (out_accumulated_microbatches) *out_accumulated_microbatches = state->microbatches;
     if (out_update_applied) *out_update_applied = applied;
 }
+
+#include "training_cuda_trainstep.inc"
 
 static int volvoxai_engine_train_step_multi_locked_impl(
         const volvoxai_cross_entropy_loss_t* losses, int loss_count,
@@ -623,13 +658,19 @@ static int volvoxai_engine_train_step_multi_locked_impl(
     }
 
     uint64_t topology_hash = training_topology_hash();
+    NativeGpuTrainingBackend accumulation_backend =
+        g_training_accumulation.active
+        ? g_training_accumulation.backend
+        : gpu_training_select_backend();
     if (!training_accumulation_signature_matches(losses, loss_count, trainable_names, trainable_count,
             update_mode, learning_rate, beta1, beta2, epsilon, weight_decay, max_grad_norm,
-            step, accumulation_steps, topology_hash)) return -1;
+            step, accumulation_steps, topology_hash,
+            accumulation_backend)) return -1;
 
     uint32_t training_counter = (uint32_t)(
         (uint64_t)(step - 1) * (uint64_t)accumulation_steps +
         (uint64_t)(g_training_accumulation.active ? g_training_accumulation.microbatches : 0) + 1u);
+    training_counter ^= vx_engine_state_current()->native_training_rng_seed;
     TrainingGraphState training_graph;
     if (training_graph_prepare(&training_graph, training_counter) != 0) return -1;
     if (g_required_training_backend != NATIVE_GPU_TRAINING_NONE &&
@@ -637,6 +678,8 @@ static int volvoxai_engine_train_step_multi_locked_impl(
         training_graph_restore(&training_graph);
         return -1;
     }
+    NativeGpuTrainingBackend step_backend =
+        training_graph.gpu_training_backend;
     int saved_execution_row = g_execution_row;
     g_execution_row = loss_count == 1 && losses[0].target_count == 1 ? losses[0].row_index : -1;
     int forward_rc = volvoxai_engine_forward_locked();
@@ -645,6 +688,25 @@ static int volvoxai_engine_train_step_multi_locked_impl(
         training_graph_restore(&training_graph);
         return -1;
     }
+#if VOLVOXAI_ENABLE_CUDA
+    if (step_backend == NATIVE_GPU_TRAINING_CUDA) {
+        /* Generic elementwise graph APIs do not carry tensor-role metadata.
+         * Promote every model-backed tensor actually touched by the forward
+         * so constants such as residual offsets survive transient tape
+         * cleanup alongside Linear/Conv/Norm parameters. The CUDA helper is
+         * classification-only and does not allocate unused weights. */
+        for (int tensor_index = 0; tensor_index < g_nt; tensor_index++) {
+            T* tensor = &g_t[tensor_index];
+            if (!volvoxai_engine_tensor_is_model_weight_locked(
+                    tensor->name) || !tensor->data || tensor->numel <= 0 ||
+                !tensor->elem_size ||
+                (size_t)tensor->numel > SIZE_MAX / tensor->elem_size)
+                continue;
+            cuda_graph_retain_weight(
+                tensor->data, (size_t)tensor->numel * tensor->elem_size);
+        }
+    }
+#endif
 
     float** grads = (float**)calloc((size_t)g_nt, sizeof(float*));
     volvoxai_cross_entropy_metric_t* current_metrics =
@@ -654,6 +716,30 @@ static int volvoxai_engine_train_step_multi_locked_impl(
         training_graph_restore(&training_graph);
         return -1;
     }
+#if VOLVOXAI_ENABLE_CUDA
+    if (step_backend == NATIVE_GPU_TRAINING_CUDA &&
+        (!g_training_accumulation.active ||
+         g_training_accumulation.backend == NATIVE_GPU_TRAINING_CUDA)) {
+        int cuda_rc = cuda_training_run_microbatch(
+            &training_graph, losses, loss_count, trainable_names,
+            trainable_count, update_mode, learning_rate, beta1, beta2,
+            epsilon, weight_decay, max_grad_norm, step, accumulation_steps,
+            flush_accumulation, topology_hash, grads, current_metrics,
+            out_loss, out_metrics, out_accumulated_microbatches,
+            out_update_applied);
+        if (cuda_rc <= 0) {
+            int restore_rc = training_graph_restore(&training_graph);
+            for (int tensor_index = 0; tensor_index < g_nt; tensor_index++)
+                free(grads[tensor_index]);
+            free(grads);
+            free(current_metrics);
+            return cuda_rc == 0 && restore_rc == 0 ? 0 : -1;
+        }
+        /* A non-required CUDA plan may still use the established CPU
+           fallback below. The helper returns 1 only before opening a CUDA
+           scope or mutating the accumulation window. */
+    }
+#endif
     int rc = 0;
     int current_has_contribution = 0;
     float current_loss = 0.0f;
@@ -718,7 +804,8 @@ static int volvoxai_engine_train_step_multi_locked_impl(
 
     if (training_accumulation_begin(losses, loss_count, trainable_names, trainable_count,
             update_mode, learning_rate, beta1, beta2, epsilon, weight_decay, max_grad_norm,
-            step, accumulation_steps, topology_hash) != 0) { rc = -1; goto done; }
+            step, accumulation_steps, topology_hash,
+            NATIVE_GPU_TRAINING_NONE) != 0) { rc = -1; goto done; }
     TrainingAccumulationState* accumulation = &g_training_accumulation;
     for (int i = 0; i < trainable_count; i++) {
         if (!current_has_contribution) continue;

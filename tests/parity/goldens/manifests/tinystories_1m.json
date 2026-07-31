@@ -1,0 +1,183 @@
+{
+  "schema": "volvoxai.parity-run-manifest",
+  "version": 1,
+  "runId": "85e8d561-fce6-468b-ab47-d36ef95b8f00",
+  "command": "golden",
+  "fingerprint": {
+    "schema": "volvoxai.parity-fingerprint",
+    "version": 1,
+    "algorithm": "sha256",
+    "components": {
+      "policy": [
+        {
+          "path": "tests/parity/policy.json",
+          "sha256": "fb27224d2996e5bafd56a063526ce34d9d4fdcee165950bf663a48b7f15adab3",
+          "size": 3885
+        }
+      ],
+      "models": [
+        {
+          "path": "models/tinystories_1m/graph.json",
+          "sha256": "ad7990cc83e83eb98d9533d2d8ad880793db5e33c1969d1ebfc93f052804b442",
+          "size": 23520
+        },
+        {
+          "path": "models/tinystories_1m/model.safetensors",
+          "sha256": "e5a2a0b073e3767ec469a6c7bc1afc749f12850d81ec6c1a3063b8b92c974343",
+          "size": 27857472
+        }
+      ],
+      "inputs": [
+        {
+          "path": "models/tinystories_1m/positions.i32",
+          "sha256": "8808405eec6fbe306fe3369f88daed79dd5613ddbb5e801f632b01d6218c5f08",
+          "size": 1024
+        },
+        {
+          "path": "models/tinystories_1m/tokens.i32",
+          "sha256": "35e448054ff57e3146b503fdcc666ae371f8540e4262fe9b7b1cc4d18fcbdfef",
+          "size": 1024
+        }
+      ],
+      "builds": [
+        {
+          "path": "dist/0.3.0/volvoxai.js",
+          "sha256": "3303b6d03596642c716579e7f878330efa0a7799e585080af96eef768b0f4323",
+          "size": 1222890
+        }
+      ],
+      "sources": [],
+      "source": {
+        "revision": "e84b57c0d614364212d9186df986af82a942cf72",
+        "state": "dirty",
+        "statusSha256": "9081ba13db4966ec378e28b7a2b319592e10d71a5949e20093b977195dbadf39"
+      }
+    },
+    "digest": "64415da6a8cf3cb07ac93b4d210ed63d25b27d7098a8aa61a386918f2ab78805"
+  },
+  "selection": {
+    "cases": [
+      "tinystories_1m"
+    ],
+    "tiers": [
+      "cpu-reference"
+    ],
+    "jobs": [
+      {
+        "case": "tinystories_1m",
+        "tier": "cpu-reference",
+        "expectation": "required"
+      }
+    ]
+  },
+  "producer": {
+    "backend": "cpu",
+    "kind": "node",
+    "runtimeEvidenceRequired": true,
+    "strictBackend": true
+  },
+  "startedAt": "2026-07-21T09:21:44.571Z",
+  "completedAt": "2026-07-21T09:22:03.828Z",
+  "outcome": "success",
+  "results": [
+    {
+      "case": "tinystories_1m",
+      "tier": "cpu-reference",
+      "status": "success",
+      "artifact": {
+        "path": "tinystories_1m.json",
+        "sha256": "311924173b07ea12446829d9bb0cf974a37f50a1788cd7dc51ff03a7b308c386",
+        "size": 26776
+      },
+      "durationMs": 9284.24,
+      "metadata": {
+        "runtimeEvidence": {
+          "compilation": {
+            "compilationId": "compilation-52017e08-d60e-4d2b-85aa-082eef401742",
+            "definitionId": "model-definition-839450a4-90e8-42d6-b9d2-1daa2d67b9e6",
+            "policy": {
+              "backend": "cpu",
+              "mode": "require",
+              "operatorFallback": "forbid"
+            },
+            "revisions": {
+              "adapterRevisionId": null,
+              "adapterRevisionIds": [],
+              "topologyRevision": 1,
+              "weightRevision": 0,
+              "weightRevisionId": "model-definition-839450a4-90e8-42d6-b9d2-1daa2d67b9e6:weight-revision-3660f16e-607b-4e7e-bdaf-4ac2f4a0ec7b"
+            },
+            "route": {
+              "operator": {
+                "attestation": "none",
+                "offendingNode": null,
+                "used": false
+              },
+              "tierFallback": false
+            },
+            "selectedBackend": "cpu",
+            "selectedDevice": {
+              "backend": "cpu",
+              "device": "host"
+            }
+          },
+          "execution": {
+            "backend": "cpu",
+            "contextId": "context-76fdd1ca-a9da-4f93-9379-24ac2817a123",
+            "decodeState": {
+              "cacheGeneration": 3,
+              "cacheState": "not-applicable",
+              "mode": null,
+              "operation": "execute",
+              "position": null
+            },
+            "device": {
+              "backend": "cpu",
+              "device": "host"
+            },
+            "executionId": "execution-7d222218-44de-4a39-ab53-3ff95fec1c22",
+            "outcome": "success",
+            "revisions": {
+              "adapterRevisionId": null,
+              "adapterRevisionIds": [
+                null
+              ],
+              "topologyRevision": 1,
+              "weightRevision": 0,
+              "weightRevisionId": "model-definition-839450a4-90e8-42d6-b9d2-1daa2d67b9e6:weight-revision-3660f16e-607b-4e7e-bdaf-4ac2f4a0ec7b"
+            },
+            "route": {
+              "operator": {
+                "attestation": "none",
+                "offendingNode": null,
+                "used": false
+              },
+              "tierFallback": false
+            }
+          },
+          "schema": "volvoxai.runtime-evidence",
+          "stableResult": {
+            "contextClosedBeforeResult": true,
+            "freshCallerOwnedReads": true,
+            "outputs": [
+              {
+                "byteLength": 51463168,
+                "dtype": "float32",
+                "location": "host",
+                "name": "logits",
+                "shape": [
+                  1,
+                  256,
+                  50257
+                ]
+              }
+            ],
+            "readableAfterContextClose": true,
+            "resultClosedAfterVerification": true
+          },
+          "version": 1
+        }
+      }
+    }
+  ]
+}

@@ -29,7 +29,7 @@ fn word_byte(word : u32, index : u32) -> u32 {
 }
 
 fn typed_value(value : u32) -> i32 {
-  if (params.dtype == 2u && value >= 128u) { return i32(value) - 256; }
+  if (params.dtype == 6u && value >= 128u) { return i32(value) - 256; }
   return i32(value);
 }
 
@@ -42,7 +42,7 @@ fn pool_one(index : u32) -> u32 {
   let output_row = output_spatial / params.out_w;
   let oy = output_row % params.out_h;
   let batch = output_row / params.out_h;
-  var best = select(0u, 128u, params.dtype == 2u);
+  var best = select(0u, 128u, params.dtype == 6u);
   for (var yy = 0u; yy < params.ky; yy = yy + 1u) {
     let iy = i32(oy * params.sy + yy) - i32(params.py);
     if (iy < 0 || iy >= i32(params.h)) { continue; }

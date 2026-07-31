@@ -7,11 +7,11 @@
 #
 # Reproducible builds still run inside the pinned Docker toolchain image; CMake
 # runs *inside* that image, it does not replace it. Native compilation uses
-# clang to match the historical Makefile, so configure with:
+# clang, so configure with:
 #   cmake -S . -B build/cmake -DCMAKE_C_COMPILER=clang
 cmake_minimum_required(VERSION 3.20)
 
-# --- Version / provenance (mirrors NATIVE_BUILD_DEFS in the old Makefile) -----
+# --- Version / provenance ----------------------------------------------------
 file(READ "${CMAKE_CURRENT_SOURCE_DIR}/package.json" _volvox_pkg_json)
 string(JSON VOLVOXAI_VERSION GET "${_volvox_pkg_json}" version)
 
@@ -40,9 +40,8 @@ endif()
 
 project(volvoxai VERSION ${VOLVOXAI_VERSION} LANGUAGES C)
 
-# Do NOT default to a Release config: the historical build never passed
-# -DNDEBUG, and several tests rely on asserts. Optimisation levels are set
-# per target to match the old per-recipe -O2/-O3 choices exactly.
+# Do not default to a Release config because several tests rely on asserts.
+# Optimisation levels are set per target.
 if(NOT CMAKE_BUILD_TYPE)
   set(CMAKE_BUILD_TYPE "" CACHE STRING "" FORCE)
 endif()

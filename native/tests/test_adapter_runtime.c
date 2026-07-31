@@ -1,7 +1,8 @@
 #include "adapter_runtime_internal.h"
 #include "cJSON.h"
-#include "volvoxai.h"
-#include "volvoxai_training.h"
+#include "engine_core.h"
+#include "runtime_state.h"
+#include "training/training_core.h"
 #include "engine_internal.h"
 #include "safetensors.h"
 
@@ -12,6 +13,10 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+
+_Static_assert(VX_ADAPTER_DTYPE_F32 == VX_DTYPE_F32 &&
+               VX_ADAPTER_DTYPE_F16 == VX_DTYPE_F16,
+               "adapter uses protobuf dtype contract");
 
 #define CHECK(x) do { if (!(x)) { fprintf(stderr, "FAIL %s:%d: %s\n", __FILE__, __LINE__, #x); return -1; } } while (0)
 
@@ -237,8 +242,17 @@ static int test_misaligned_f16_payload(void) {
     return 0;
 }
 
-static void* activate_thread(void* arg) {
-    return (void*)(intptr_t)vx_adapter_activate((const char*)arg);
+typedef struct {
+    VxEngineState* engine_state;
+    const char* version;
+} ActivateThreadArgs;
+
+static void* activate_thread(void* opaque) {
+    ActivateThreadArgs* args = (ActivateThreadArgs*)opaque;
+    VxEngineStateScope scope = vx_engine_state_scope_enter(args->engine_state);
+    int result = vx_adapter_activate(args->version);
+    vx_engine_state_scope_leave(scope);
+    return (void*)(intptr_t)result;
 }
 
 static int test_hot_swap_and_batch(void) {
@@ -252,8 +266,9 @@ static int test_hot_swap_and_batch(void) {
     CHECK(stage_one("new", "w", 2, 2, 1, a, b2, 1, 1) == 0);
     CHECK(vx_adapter_activate("old") == 0);
     CHECK(vx_adapter_request_begin(NULL) == 0);
+    ActivateThreadArgs activate = {vx_engine_state_current(), "new"};
     pthread_t thread;
-    CHECK(pthread_create(&thread, NULL, activate_thread, "new") == 0);
+    CHECK(pthread_create(&thread, NULL, activate_thread, &activate) == 0);
     void* result = NULL;
     CHECK(pthread_join(thread, &result) == 0 && (intptr_t)result == 0);
     CHECK(vx_adapter_remove("old") == 0);
@@ -295,11 +310,14 @@ typedef struct {
     const char* version;
     atomic_int done;
     int rc;
+    VxEngineState* engine_state;
 } MergeThreadArgs;
 
 static void* merge_thread(void* opaque) {
     MergeThreadArgs* args = (MergeThreadArgs*)opaque;
+    VxEngineStateScope scope = vx_engine_state_scope_enter(args->engine_state);
     args->rc = volvoxai_engine_adapter_merge(args->version);
+    vx_engine_state_scope_leave(scope);
     atomic_store_explicit(&args->done, 1, memory_order_release);
     return NULL;
 }
@@ -386,7 +404,7 @@ static int test_engine_merge_exact(void) {
     CHECK(volvoxai_engine_adapter_remove("merge") == -1);
     CHECK(volvoxai_engine_forward() == 0);
     float routed_output[2]; memcpy(routed_output, output, sizeof(routed_output));
-    MergeThreadArgs args = {"merge", 0, -1};
+    MergeThreadArgs args = {"merge", 0, -1, vx_engine_state_current()};
     atomic_init(&args.done, 0);
     pthread_t thread;
     CHECK(volvoxai_engine_adapter_route_begin("merge") == 0);
@@ -454,19 +472,19 @@ static int test_out_in_lora_merge_exact(void) {
 }
 
 static int test_flush_and_patch_lifetimes(void) {
-    const char* config_path = "/tmp/volvox-adapter-graph.json";
+    const char* graph_path = "/tmp/volvox-adapter-graph.json";
     const char* weights_path = "/tmp/volvox-adapter-weights.safetensors";
     const char* flushed_path = "/tmp/volvox-adapter-weights-flushed.safetensors";
-    const char* config =
-        "{\"inputs\":{\"x\":{\"shape\":[2,2]}},\"nodes\":["
+    const char* graph =
+        "{\"format\":\"volvox-graph/v1\",\"inputs\":{\"x\":{\"shape\":[2,2],\"dtype\":\"float32\"}},\"nodes\":["
         "{\"opType\":\"Linear\",\"inputs\":{\"input\":\"x\",\"weight\":\"w\"},"
         "\"outputs\":{\"output\":\"h\"},\"outputs_shape\":{\"output\":[2,2]}},"
         "{\"opType\":\"GELU\",\"inputs\":{\"input\":\"h\"},"
-        "\"outputs\":{\"output\":\"y\"},\"outputs_shape\":{\"output\":[2,2]}}]}";
-    FILE* config_file = fopen(config_path, "wb");
-    CHECK(config_file != NULL);
-    CHECK(fwrite(config, 1, strlen(config), config_file) == strlen(config));
-    CHECK(fclose(config_file) == 0);
+        "\"outputs\":{\"output\":\"y\"},\"outputs_shape\":{\"output\":[2,2]}}],\"outputs\":[\"y\"]}";
+    FILE* graph_file = fopen(graph_path, "wb");
+    CHECK(graph_file != NULL);
+    CHECK(fwrite(graph, 1, strlen(graph), graph_file) == strlen(graph));
+    CHECK(fclose(graph_file) == 0);
     const uint16_t weight[4] = {0x2e66, 0x3266, 0x34cd, 0x3666};
     const int shape[2] = {2, 2};
     SafetensorsFile file;
@@ -474,7 +492,7 @@ static int test_flush_and_patch_lifetimes(void) {
     CHECK(safetensors_add_tensor(&file, "w", SAFETENSORS_DTYPE_F16, shape, 2, weight, sizeof(weight)) == 0);
     CHECK(safetensors_save(weights_path, &file) == 0);
     safetensors_free(&file);
-    CHECK(volvoxai_engine_init(config_path, weights_path) == 0);
+    CHECK(volvoxai_engine_init(graph_path, weights_path) == 0);
     CHECK(volvoxai_engine_is_graph_input("x") == 1 && volvoxai_engine_is_graph_input(NULL) == 1);
     CHECK(volvoxai_engine_is_graph_input("w") == 0 && volvoxai_engine_is_graph_input("y") == 0);
     long rejected_numel = -1;
@@ -567,21 +585,21 @@ static int test_flush_and_patch_lifetimes(void) {
                                           VOLVOXAI_ENGINE_NODE_PATCH_MODE_MERGE, 1) == 0);
     CHECK(volvoxai_engine_forward() == 0);
     volvoxai_engine_shutdown();
-    remove(config_path); remove(weights_path); remove(flushed_path);
+    remove(graph_path); remove(weights_path); remove(flushed_path);
     return 0;
 }
 
 static int test_quantized_base_rejected(void) {
-    const char* config_path = "/tmp/volvox-quantized-graph.json";
+    const char* graph_path = "/tmp/volvox-quantized-graph.json";
     const char* weights_path = "/tmp/volvox-quantized-weights.safetensors";
-    const char* config =
-        "{\"inputs\":{\"x\":{\"shape\":[1,2]}},\"nodes\":[{"
+    const char* graph =
+        "{\"format\":\"volvox-graph/v1\",\"inputs\":{\"x\":{\"shape\":[1,2],\"dtype\":\"float32\"}},\"nodes\":[{"
         "\"opType\":\"Linear\",\"inputs\":{\"input\":\"x\",\"weight\":\"wq\","
         "\"weight_scale\":\"wq.scale\"},\"outputs\":{\"output\":\"y\"},"
-        "\"outputs_shape\":{\"output\":[1,2]}}]}";
-    FILE* config_file = fopen(config_path, "wb");
-    CHECK(config_file != NULL && fwrite(config, 1, strlen(config), config_file) == strlen(config));
-    CHECK(fclose(config_file) == 0);
+        "\"outputs_shape\":{\"output\":[1,2]}}],\"outputs\":[\"y\"]}";
+    FILE* graph_file = fopen(graph_path, "wb");
+    CHECK(graph_file != NULL && fwrite(graph, 1, strlen(graph), graph_file) == strlen(graph));
+    CHECK(fclose(graph_file) == 0);
     const int8_t weight[4] = {1, 2, 3, 4};
     const float weight_scale[2] = {0.5f, 0.25f};
     const int matrix_shape[2] = {2, 2};
@@ -593,7 +611,7 @@ static int test_quantized_base_rejected(void) {
                                  weight_scale, sizeof(weight_scale)) == 0);
     CHECK(safetensors_save(weights_path, &file) == 0);
     safetensors_free(&file);
-    CHECK(volvoxai_engine_init(config_path, weights_path) == 0);
+    CHECK(volvoxai_engine_init(graph_path, weights_path) == 0);
     int8_t raw_weight[4] = {0};
     CHECK(volvoxai_engine_copy_tensor_raw("wq", raw_weight, sizeof(raw_weight)) == 0 &&
           memcmp(raw_weight, weight, sizeof(weight)) == 0);
@@ -608,11 +626,18 @@ static int test_quantized_base_rejected(void) {
         "\"kind\":\"lora\",\"targets\":[{\"weight\":\"wq\",\"a\":\"qa\",\"b\":\"qb\","
         "\"layout\":\"din_r_r_dout\",\"rank\":1,\"alpha\":1,\"scale\":1}]}";
     CHECK(volvoxai_engine_adapter_stage_json(manifest, names, data, dtypes, nbytes, 2) == -1);
-    volvoxai_engine_shutdown(); remove(config_path); remove(weights_path);
+    volvoxai_engine_shutdown(); remove(graph_path); remove(weights_path);
     return 0;
 }
 
 int main(void) {
+    VxEngineState* state = (VxEngineState*)calloc(1, sizeof(*state));
+    VxEngineStateScope scope;
+    if (!state || vx_engine_state_init(state) != 0) {
+        free(state);
+        return 1;
+    }
+    scope = vx_engine_state_scope_enter(state);
     CHECK(test_lora_routes() == 0);
     CHECK(test_inline_tls_routes() == 0);
     CHECK(test_scaling_and_clone() == 0);
@@ -623,6 +648,10 @@ int main(void) {
     CHECK(test_out_in_lora_merge_exact() == 0);
     CHECK(test_flush_and_patch_lifetimes() == 0);
     CHECK(test_quantized_base_rejected() == 0);
+    volvoxai_engine_shutdown();
+    vx_engine_state_scope_leave(scope);
+    vx_engine_state_deinit(state);
+    free(state);
     puts("adapter runtime tests passed");
     return 0;
 }

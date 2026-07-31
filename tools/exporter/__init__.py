@@ -1,0 +1,91 @@
+"""Target-aware ONNX/TFLite export support for VolvoxAI.
+
+This package is development tooling.  It deliberately has no imports from the
+runtime inference entries and it is not included in release artifacts.
+"""
+
+from .capabilities import (
+    TARGETS,
+    classify_package,
+    expand_targets,
+    refresh_package_class,
+    validate_graph,
+    validate_runtime_descriptors,
+)
+from .errors import Diagnostic, ExporterError, UsageError
+from .ir import (
+    AffineQuantization,
+    GraphIR,
+    IRDialect,
+    OpAttribute,
+    OpNode,
+    Provenance,
+    TensorDataRef,
+    TensorValue,
+    ValuePort,
+)
+from .report import ExportReport
+from .typed_ptq import (
+    ActivationQuantizationPlan,
+    BroadcastActivationPTQPlan,
+    ByteNodePTQPlan,
+    CalibrationProfile,
+    CalibrationTable,
+    ConstantActivationPTQPlan,
+    ConvNodePTQPlan,
+    DenseNodePTQPlan,
+    EmbeddingNodePTQPlan,
+    PTQConfig,
+    PTQMaterializationReport,
+    PTQPlan,
+    PTQ_PLAN_FORMAT,
+    TensorObservation,
+    WeightQuantizationPlan,
+    calibration_profile_from_ranges,
+    materialize_runtime_ptq,
+    plan_runtime_ptq,
+    quantize_runtime_ptq,
+    required_ptq_observations,
+)
+
+__all__ = [
+    "AffineQuantization",
+    "ActivationQuantizationPlan",
+    "BroadcastActivationPTQPlan",
+    "ByteNodePTQPlan",
+    "CalibrationProfile",
+    "CalibrationTable",
+    "ConstantActivationPTQPlan",
+    "ConvNodePTQPlan",
+    "DenseNodePTQPlan",
+    "Diagnostic",
+    "ExporterError",
+    "EmbeddingNodePTQPlan",
+    "ExportReport",
+    "GraphIR",
+    "IRDialect",
+    "OpAttribute",
+    "OpNode",
+    "PTQConfig",
+    "PTQMaterializationReport",
+    "PTQPlan",
+    "PTQ_PLAN_FORMAT",
+    "Provenance",
+    "TARGETS",
+    "TensorValue",
+    "TensorDataRef",
+    "TensorObservation",
+    "UsageError",
+    "ValuePort",
+    "WeightQuantizationPlan",
+    "calibration_profile_from_ranges",
+    "classify_package",
+    "expand_targets",
+    "refresh_package_class",
+    "materialize_runtime_ptq",
+    "plan_runtime_ptq",
+    "quantize_runtime_ptq",
+    "required_ptq_observations",
+    "validate_graph",
+    "validate_runtime_descriptors",
+]

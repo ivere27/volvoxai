@@ -15,7 +15,8 @@ void layernorm_f32(const float* input, const float* weight, const float* bias, f
         float inv_std = 1.0f / sqrtf(var + eps);
         
         for (int d = 0; d < d_model; d++) {
-            output[s*d_model + d] = (input[s*d_model + d] - mean) * inv_std * weight[d] + bias[d];
+            output[s*d_model + d] = (input[s*d_model + d] - mean) *
+                inv_std * weight[d] + (bias ? bias[d] : 0.0f);
         }
     }
 }

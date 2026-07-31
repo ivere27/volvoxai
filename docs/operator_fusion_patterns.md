@@ -1,5 +1,11 @@
 # 30 Core Operator Fusion Patterns for High-Performance Inference Engines
 
+Status: this page is a design catalogue, not VolvoxAI optimizer or backend
+coverage. A pattern is implemented only when it appears in the verified typed
+pass inventory and has matching legality, differential-correctness, target
+route, and kernel tests. See [graph-optimizer-design.md](graph-optimizer-design.md)
+and [operation_list.md](operation_list.md) for current behavior.
+
 ## Introduction
 In edge AI and highly optimized inference engines (like XNNPACK, TFLite, and VolvoxAI), memory bandwidth is the primary bottleneck, not CPU compute limits. Operator Fusion addresses this "Memory Wall" by combining multiple computational nodes into a single microkernel. This keeps intermediate activations resident in L1 cache or CPU registers, drastically reducing slow DRAM read/write round-trips.
 
@@ -27,7 +33,7 @@ These patterns account for 80%+ of the execution time in Object Detection and Im
 Critical for avoiding massive memory bottlenecks in Large Language Models and Attention mechanisms.
 
 11. **MatMul + Bias (Fully Connected/Linear):** Standard linear transformation.
-12. **MatMul + Bias + GELU / Swish:** The core of Transformer MLP blocks.
+12. **MatMul + Bias + GELU / SiLU:** The core of Transformer MLP blocks.
 13. **MatMul + Add:** Residual connections within Transformers.
 14. **MatMul + Softmax:** The fundamental backbone of the Attention mechanism.
 15. **BatchMatMul + Scale + Mask + Softmax:** The "FlashAttention" pattern, computing the entire attention block in-register.
@@ -38,7 +44,7 @@ Though computationally light, these must be fused to prevent catastrophic memory
 
 17. **Add + ReLU:** Post-residual activation.
 18. **Mul + Add (FMA):** Fused Multiply-Add (often hardware-accelerated via single SIMD instruction).
-19. **Mul + Sigmoid:** Equivalent to SiLU/Swish activation (`x * sigmoid(x)`).
+19. **Mul + Sigmoid:** Equivalent to the SiLU activation (`x * sigmoid(x)`).
 20. **Add + Add / Mul + Mul:** Consecutive identical operations folded together.
 21. **Add + Clamp (Min/Max):** Value clipping/bounding (e.g., ReLU6 is just `Clamp(0, 6)`).
 22. **Exp + Sum + Div:** Granular operations of a Softmax fused back together.

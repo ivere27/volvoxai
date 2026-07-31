@@ -31,16 +31,18 @@ Start with the root [README](../README.md) for the product overview and
 | --- | --- |
 | [browser-runtime.md](browser-runtime.md) | Browser and Node runtime tiers: WebNN, WebGPU, WASM SIMD, and CPU. |
 | [native-runtime.md](native-runtime.md) | Native C engine, fixed raw-tensor CLI, opt-in task example, GPU/NPU backends, Android cross-build notes. |
+| [cuda.md](cuda.md) | Canonical native CUDA architecture, operator coverage, numeric modes, model validation, RTX 3090 benchmarks, and remaining work. |
 | [backend-sdk.md](backend-sdk.md) | Versioned native and browser contracts for custom GPUs, NPUs, and other devices. |
 
 **Model format & data**
 
 | Doc | What it covers |
 | --- | --- |
-| [model-format.md](model-format.md) | Volvox blueprint format, safetensors loading, tensor layout, precision policy. |
-| [w8a8-safetensors.md](w8a8-safetensors.md) | Normative symmetric-I8/F32 companion-scale safetensors metadata and sharding contract. |
+| [model-format.md](model-format.md) | `volvox-graph/v1`, safetensors loading, tensor layout, and precision policy. |
+| [w8a8-safetensors.md](w8a8-safetensors.md) | Normative central-reference affine quantization and safetensors contract. |
 | [models.md](models.md) | Regenerating EfficientDet and TinyStories model packages. |
 | [operation_list.md](operation_list.md) | Per-op backend support matrix for browser and native runtimes. |
+| [generated/kernel-registry.md](generated/kernel-registry.md) | Generated backend inventories, exporter qualification, routes, and physical kernel variants sourced from `proto/kernel_registry.proto`. |
 
 **Training & quantization**
 
@@ -50,12 +52,19 @@ Start with the root [README](../README.md) for the product overview and
 | [model_builder_training.md](model_builder_training.md) | Building and training models through the API. |
 | [training-ptq-runtime-matrix.md](training-ptq-runtime-matrix.md) | Training and PTQ ownership/support across JavaScript, native C, and browser WASM. |
 
+**Exporter & graph optimizer**
+
+| Doc | What it covers |
+| --- | --- |
+| [graph-optimizer-design.md](graph-optimizer-design.md) | The v1-only ONNX/TensorFlow Lite import, verified RuntimeIR optimizer, specialization, mixed-precision PTQ, differential qualification, and publication architecture. |
+| [typed-ptq.md](typed-ptq.md) | Exact typed PTQ contracts, transactional materialization, supported dense topology, and deliberate gaps. |
+
 **Performance & optimization**
 
 | Doc | What it covers |
 | --- | --- |
 | [microkernel_optimization_guide.md](microkernel_optimization_guide.md) | CPU Conv/GEMM microkernel notes. |
-| [operator_fusion_patterns.md](operator_fusion_patterns.md) | Graph fusion patterns applied by the native optimizer. |
+| [operator_fusion_patterns.md](operator_fusion_patterns.md) | A design catalogue of valuable fusion candidates; it is not an implementation or coverage list. |
 | [xnnpack_optimization_guide.md](xnnpack_optimization_guide.md) | XNNPACK-style packing and indirection reference notes. |
 | [efficientdet_tflite_vs_volvoxai.md](efficientdet_tflite_vs_volvoxai.md) | EfficientDet Lite0 CPU/GPU benchmark methodology and results. |
 

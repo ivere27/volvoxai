@@ -1,7 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
-import { CPUEngine, Graph, ModelBuilder } from '../ts/index.js';
+import { Graph, ModelBuilder } from '../ts/index.js';
+import { CPUEngine } from '../ts/backends/CPUEngine.js';
 
 test('MoERouter selects deterministic top-k experts and MoELinear mixes them', async () => {
   const graph = new Graph();
@@ -28,7 +29,7 @@ test('MoERouter selects deterministic top-k experts and MoELinear mixes them', a
     route_indices: routes.indices,
     route_weights: routes.weights,
   }, { out: [1, 1] });
-  graph.outputNames = [mixed.out.name];
+  graph.setOutputs([mixed.out.name]);
 
   const engine = new CPUEngine();
   engine.allocateGraph(graph);

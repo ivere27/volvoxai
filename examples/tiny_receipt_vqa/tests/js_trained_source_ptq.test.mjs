@@ -35,7 +35,7 @@ async function trainedFixture() {
   const file = SafetensorsFile.empty({
     metadata: {
       format: 'tiny_receipt_vqa.volvox.v2',
-      'volvox.model_format': 'volvox.api.v1',
+      'volvox.model_format': 'volvox-graph/v1',
       'volvox.model_origin': 'api',
     },
   });
@@ -120,8 +120,8 @@ async function trainedFixture() {
   add('vqa.norm.weight', [d]);
   add('vqa.norm.bias', [d]);
 
-  const config = {
-    format: 'volvox.api.v1',
+  const graph = {
+    format: 'volvox-graph/v1',
     inputs: {
       'calibration.q': { shape: [1, 1, d], dtype: 'float32' },
       'calibration.k': { shape: [1, 1, d], dtype: 'float32' },
@@ -150,7 +150,7 @@ async function trainedFixture() {
     }],
   };
   await Promise.all([
-    writeFile(join(source, 'config.json'), `${JSON.stringify(config)}\n`),
+    writeFile(join(source, 'graph.json'), `${JSON.stringify(graph)}\n`),
     writeFile(join(source, 'model.safetensors'), new Uint8Array(file.toArrayBuffer())),
     writeFile(join(source, 'vocab.json'), `${JSON.stringify(vocab)}\n`),
   ]);
@@ -189,6 +189,7 @@ test('trained full-model weights map through JS PTQ into the distinct named sour
   assert.equal(result.manifest.format, NORMALIZED_TRAINED_SOURCE_FORMAT);
   assert.equal(result.manifest.runtime, NORMALIZED_TRAINED_SOURCE_RUNTIME);
   assert.deepEqual(result.manifest.safetensors.layout, NAMED_SOURCE_LAYOUT);
+  assert.match(result.manifest.source.graph_sha256, /^[0-9a-f]{64}$/);
   assert.deepEqual(result.dimensions.stem_channels, fixture.channels);
   assert.equal(result.dimensions.max_out_len, 2);
   assert.equal(result.dimensions.lora_alpha, 2);
@@ -274,7 +275,7 @@ test('trained full-model weights map through JS PTQ into the distinct named sour
     ));
     assert.equal(packageManifest.source.format, NORMALIZED_TRAINED_SOURCE_FORMAT);
     assert.equal(packageManifest.source.runtime, NORMALIZED_TRAINED_SOURCE_RUNTIME);
-    assert.equal(packageManifest.explicit_families.phone.config,
-      'explicit_family_phone_config.json');
+    assert.equal(packageManifest.explicit_families.phone.graph,
+      'explicit_family_phone.graph.json');
   }
 });

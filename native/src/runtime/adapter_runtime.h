@@ -1,6 +1,8 @@
 #ifndef VOLVOX_ADAPTER_RUNTIME_H
 #define VOLVOX_ADAPTER_RUNTIME_H
 
+#include "volvoxai_enums.h"
+
 #include <stddef.h>
 
 #ifdef __cplusplus
@@ -11,10 +13,10 @@ typedef enum {
     VX_ADAPTER_LORA = 0
 } VxAdapterKind;
 
-typedef enum {
-    VX_ADAPTER_DTYPE_F32 = 0,
-    VX_ADAPTER_DTYPE_F16 = 4
-} VxAdapterDType;
+enum {
+    VX_ADAPTER_DTYPE_F32 = VX_DTYPE_F32,
+    VX_ADAPTER_DTYPE_F16 = VX_DTYPE_F16
+};
 
 typedef enum {
     VX_ADAPTER_UPDATE_ASSIGN = 0,
@@ -24,7 +26,7 @@ typedef enum {
 typedef struct {
     const void* data;
     size_t nbytes;
-    int dtype;
+    VxDataType dtype;
     int rows;
     int cols;
 } VxAdapterTensorSpec;
@@ -55,7 +57,7 @@ typedef struct {
     const char* tensor_name;
     const void* data;
     size_t nbytes;
-    int dtype;
+    VxDataType dtype;
     VxAdapterUpdateMode mode;
 } VxAdapterTensorUpdate;
 

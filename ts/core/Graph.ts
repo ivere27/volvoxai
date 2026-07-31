@@ -29,6 +29,12 @@ type ConcreteNodeSpec = GraphNodeSpec<Tensor>;
 type ConcreteNodePatch = GraphNodePatch<Tensor>;
 type ConcreteTensorReference = TensorReference<Tensor>;
 
+const REPLACE_EXISTING_OUTPUT: unique symbol = Symbol('replaceExistingOutput');
+type PreparedOutputDescriptor = Exclude<
+  NodeOutputSpec<Tensor>,
+  readonly number[] | ConcreteTensorReference
+> & { [REPLACE_EXISTING_OUTPUT]?: boolean };
+
 interface TopologySnapshot {
   nodes: ConcreteNode[];
   tensors: Map<string, Tensor>;
@@ -64,10 +70,14 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return !!value && typeof value === "object" && !Array.isArray(value);
 }
 
-function validName(value: unknown): value is string {
+export function isValidGraphName(value: unknown): value is string {
   return typeof value === "string" && value.trim().length > 0 &&
     value !== "__metadata__" &&
     !Object.prototype.hasOwnProperty.call(Object.prototype, value);
+}
+
+function sameNames<T>(a: readonly T[], b: readonly T[]): boolean {
+  return a.length === b.length && a.every((name, index) => name === b[index]);
 }
 
 function validateShape(shape: unknown, label: string): number[] {
@@ -78,10 +88,6 @@ function validateShape(shape: unknown, label: string): number[] {
     }
   }
   return [...shape];
-}
-
-function sameNames<T>(a: readonly T[], b: readonly T[]): boolean {
-  return a.length === b.length && a.every((name, index) => name === b[index]);
 }
 
 function nodeLabel(node: Partial<ConcreteNode> | null | undefined, index: number): string {
@@ -100,7 +106,7 @@ export class Graph {
   nodes: ConcreteNode[];
   tensors: Map<string, Tensor>;
   weightFiles: SafetensorsFile[];
-  outputNames: string[];
+  private _outputNames: readonly string[];
   topologyRevision: number;
   weightRevision: number;
   _nextTopologyRevision: number;
@@ -115,7 +121,7 @@ export class Graph {
     this.nodes = [];
     this.tensors = /* @__PURE__ */ new Map();
     this.weightFiles = [];
-    this.outputNames = [];
+    this._outputNames = Object.freeze([]);
     this.topologyRevision = 0;
     this.weightRevision = 0;
     this._nextTopologyRevision = 1;
@@ -125,6 +131,14 @@ export class Graph {
     this._outputsExplicit = false;
     this._lastTopologyMutation = null;
     this.adapters = new AdapterManager(this);
+  }
+
+  get outputNames(): readonly string[] {
+    return this._outputNames;
+  }
+
+  _setOutputNames(names: readonly string[]): void {
+    this._outputNames = Object.freeze([...names]);
   }
 
   _assertTopologyMutationAllowed(): void {
@@ -137,7 +151,7 @@ export class Graph {
     tensors: Map<string, Tensor> = this.tensors,
   ): Tensor {
     const name = typeof value === "string" ? value : value?.name;
-    if (!validName(name)) throw new Error(`${label} must reference a named tensor.`);
+    if (!isValidGraphName(name)) throw new Error(`${label} must reference a named tensor.`);
     const tensor = tensors.get(name);
     if (!tensor) throw new Error(`${label} references missing tensor '${name}'.`);
     if (typeof value !== "string" && value !== tensor) {
@@ -156,15 +170,9 @@ export class Graph {
     return this.topologyRevision;
   }
 
-  _refreshOutputNames(): string[] {
-    // Detect callers that used the historical public outputNames property
-    // directly. Once outputs are explicitly selected, preserve that selection
-    // across edits while dropping names that no longer exist.
-    if (!this._outputsExplicit && !sameNames(this.outputNames || [], this._autoOutputNames)) {
-      this._outputsExplicit = true;
-    }
+  _refreshOutputNames(): readonly string[] {
     if (this._outputsExplicit) {
-      this.outputNames = [...new Set((this.outputNames || []).filter((name) => this.tensors.has(name)))];
+      this._setOutputNames([...new Set(this.outputNames.filter((name) => this.tensors.has(name)))]);
       return this.outputNames;
     }
     const consumed = new Set<string>();
@@ -177,7 +185,7 @@ export class Graph {
         if (tensor?.name && !consumed.has(tensor.name) && !inferred.includes(tensor.name)) inferred.push(tensor.name);
       }
     }
-    this.outputNames = inferred;
+    this._setOutputNames(inferred);
     this._autoOutputNames = [...inferred];
     return this.outputNames;
   }
@@ -216,7 +224,7 @@ export class Graph {
     this.nodes.splice(0, this.nodes.length, ...snapshot.nodes);
     this.tensors.clear();
     for (const [name, tensor] of snapshot.tensors) this.tensors.set(name, tensor);
-    this.outputNames = [...snapshot.outputNames];
+    this._setOutputNames(snapshot.outputNames);
     this._autoOutputNames = [...snapshot.autoOutputNames];
     this._outputsExplicit = snapshot.outputsExplicit;
     this.topologyRevision = snapshot.topologyRevision;
@@ -254,8 +262,8 @@ export class Graph {
       quantization,
     }: AddTensorOptions = {},
   ): Tensor {
-    if (!validName(name)) throw new Error("Tensor name must be a non-empty string.");
-    if (!validName(dtype)) throw new Error(`Tensor '${name}' dtype must be a non-empty string.`);
+    if (!isValidGraphName(name)) throw new Error("Tensor name must be a non-empty string.");
+    if (!isValidGraphName(dtype)) throw new Error(`Tensor '${name}' dtype must be a non-empty string.`);
     if (isWeight && isInput) throw new Error(`Tensor '${name}' cannot be both an input and a weight.`);
     const tensor = new Tensor(name, validateShape(shape, `Tensor '${name}'`), dtype, isWeight, { isInput, quantization });
     if (buffer != null) {
@@ -273,6 +281,9 @@ export class Graph {
     options: AddTensorOptions = {},
   ): Tensor {
     this._assertTopologyMutationAllowed();
+    if (Object.prototype.hasOwnProperty.call(options, 'data')) {
+      throw new Error(`Tensor '${name}' options contain unsupported field 'data'; use 'buffer'.`);
+    }
     if (this.tensors.has(name)) throw new Error(`Tensor '${name}' already exists.`);
     const role = options.role || "value";
     if (!new Set(["value", "input", "weight"]).has(role)) {
@@ -281,7 +292,7 @@ export class Graph {
     const tensor = this._createTensor(name, shape, dtype, {
       isInput: role === "input" || options.isInput === true,
       isWeight: role === "weight" || options.isWeight === true,
-      buffer: options.buffer ?? options.data,
+      buffer: options.buffer,
       quantization: options.quantization,
     });
     const tensors = new Map(this.tensors);
@@ -343,8 +354,11 @@ export class Graph {
     nodes: readonly ConcreteNode[],
   ): ConcreteNode {
     if (!isRecord(spec)) throw new Error("Node specification must be an object.");
-    const opType = spec.opType || spec.op;
-    if (!validName(opType)) throw new Error("Node opType must be a non-empty string.");
+    if (Object.prototype.hasOwnProperty.call(spec, 'op')) {
+      throw new Error("Node specification contains unsupported field 'op'; use 'opType'.");
+    }
+    const opType = spec.opType;
+    if (!isValidGraphName(opType)) throw new Error("Node opType must be a non-empty string.");
     if (!isRecord(spec.inputs)) throw new Error(`Node '${opType}' inputs must be an object.`);
     if (!isRecord(spec.outputs) || Object.keys(spec.outputs).length === 0) {
       throw new Error(`Node '${opType}' requires at least one output.`);
@@ -352,48 +366,47 @@ export class Graph {
     const id = this._nextAvailableNodeId(spec.id, nodes);
     const inputs: Record<string, Tensor> = {};
     for (const [key, value] of Object.entries(spec.inputs)) {
-      if (!validName(key)) throw new Error(`Node '${opType}' has an invalid input key.`);
+      if (!isValidGraphName(key)) throw new Error(`Node '${opType}' has an invalid input key.`);
       inputs[key] = this._resolveTensorRef(value, `Node '${opType}' input '${key}'`, tensors);
     }
     const outputs: Record<string, Tensor> = {};
     for (const [key, value] of Object.entries(spec.outputs)) {
-      if (!validName(key)) throw new Error(`Node '${opType}' has an invalid output key.`);
+      if (!isValidGraphName(key)) throw new Error(`Node '${opType}' has an invalid output key.`);
       if (typeof value === "string" || value instanceof Tensor) {
         outputs[key] = this._resolveTensorRef(value, `Node '${opType}' output '${key}'`, tensors);
         continue;
       }
       const descriptor = (Array.isArray(value) ? { shape: value } : value) as
-        Exclude<NodeOutputSpec<Tensor>, readonly number[] | ConcreteTensorReference>;
+        PreparedOutputDescriptor;
       if (!isRecord(descriptor)) {
         throw new Error(`Node '${opType}' output '${key}' must be a shape, tensor name, Tensor, or descriptor.`);
       }
+      for (const unsupportedField of ['data', 'replace', 'reuse']) {
+        if (Object.prototype.hasOwnProperty.call(descriptor, unsupportedField)) {
+          throw new Error(
+            `Node '${opType}' output '${key}' contains unsupported field '${unsupportedField}'.`,
+          );
+        }
+      }
       const outName = descriptor.name || `${opType}_${String(id)}_out_${key}`;
       if (tensors.has(outName)) {
-        if (descriptor.replace === true) {
+        if (descriptor[REPLACE_EXISTING_OUTPUT] === true) {
           const existing = tensors.get(outName)!;
           if (existing.isInput || existing.isWeight) {
             throw new Error(`Node '${opType}' cannot replace source tensor '${outName}'.`);
           }
           const tensor = this._createTensor(outName, descriptor.shape, descriptor.dtype || existing.dtype, {
-            buffer: descriptor.buffer ?? descriptor.data,
+            buffer: descriptor.buffer,
             quantization: descriptor.quantization,
           });
           tensors.set(outName, tensor);
           outputs[key] = tensor;
           continue;
         }
-        if (descriptor.reuse === true) {
-          const existing = tensors.get(outName)!;
-          if (descriptor.shape && !sameNames(existing.shape, descriptor.shape)) {
-            throw new Error(`Node '${opType}' output '${key}' shape does not match existing tensor '${outName}'.`);
-          }
-          outputs[key] = existing;
-          continue;
-        }
         throw new Error(`Tensor '${outName}' already exists.`);
       }
       const tensor = this._createTensor(outName, descriptor.shape, descriptor.dtype || "float32", {
-        buffer: descriptor.buffer ?? descriptor.data,
+        buffer: descriptor.buffer,
         quantization: descriptor.quantization,
       });
       tensors.set(outName, tensor);
@@ -410,7 +423,6 @@ export class Graph {
     if (["MatMul", "Linear", "Gemm"].includes(opType) && node.wLayout == null) {
       node.wLayout = explicitLinearLayout(node.params, id) || undefined;
     }
-    delete node.op;
     return node;
   }
 
@@ -429,9 +441,9 @@ export class Graph {
     const nodes = [...this.nodes];
     const node = this._prepareNode(spec, tensors, nodes);
     nodes.splice(index, 0, node);
-    // Outputs are refreshed atomically at commit time. This deliberately does
-    // not validate the pre-commit output list because legacy loaders rename a
-    // newly-created output tensor before appending the next node.
+    // Outputs are refreshed atomically at commit time. The pre-commit output
+    // list is intentionally excluded because staged builders may rename a new
+    // output before appending the next node.
     this._assertValidState(nodes, tensors, []);
     this._commitTopology(nodes, tensors, `insert node '${String(node.id)}'`);
     if (typeof node.id === "number" && node.id >= this._nextNodeId) this._nextNodeId = node.id + 1;
@@ -515,13 +527,13 @@ export class Graph {
     const consumed = new Set<string>();
 
     for (const [name, tensor] of tensors) {
-      if (!validName(name)) errors.push("Tensor map contains an invalid name.");
+      if (!isValidGraphName(name)) errors.push("Tensor map contains an invalid name.");
       if (!(tensor instanceof Tensor)) errors.push(`Tensor '${name}' is not a Tensor instance.`);
       if (tensor?.name !== name) errors.push(`Tensor map key '${name}' does not match tensor name '${tensor?.name}'.`);
       if (!Array.isArray(tensor?.shape) || tensor.shape.some((dim) => !Number.isInteger(dim) || dim <= 0)) {
         errors.push(`Tensor '${name}' has an invalid shape.`);
       }
-      if (!validName(tensor?.dtype)) errors.push(`Tensor '${name}' has an invalid dtype.`);
+      if (!isValidGraphName(tensor?.dtype)) errors.push(`Tensor '${name}' has an invalid dtype.`);
       else {
         try {
           const expected = tensor._calculateByteSize();
@@ -542,7 +554,7 @@ export class Graph {
       if (!id.length) errors.push(`${label} has no id.`);
       else if (ids.has(id)) errors.push(`Duplicate node id '${id}'.`);
       else ids.add(id);
-      if (!validName(node?.opType)) errors.push(`${label} has an invalid opType.`);
+      if (!isValidGraphName(node?.opType)) errors.push(`${label} has an invalid opType.`);
       if (!isRecord(node?.inputs)) errors.push(`${label} inputs must be an object.`);
       if (!isRecord(node?.outputs) || Object.keys(node.outputs).length === 0) {
         errors.push(`${label} requires at least one output.`);
@@ -550,7 +562,7 @@ export class Graph {
       const localOutputs = new Set<string>();
       for (const [key, tensor] of Object.entries(node?.outputs || {})) {
         const canonical = tensor?.name ? tensors.get(tensor.name) : undefined;
-        if (!validName(key)) errors.push(`${label} has an invalid output key.`);
+        if (!isValidGraphName(key)) errors.push(`${label} has an invalid output key.`);
         if (!canonical) errors.push(`${label} output '${key}' references a missing tensor.`);
         else if (canonical !== tensor) errors.push(`${label} output '${key}' is not the canonical tensor '${tensor.name}'.`);
         if (canonical?.isInput || canonical?.isWeight) {
@@ -575,7 +587,7 @@ export class Graph {
       const label = nodeLabel(node, index);
       for (const [key, tensor] of Object.entries(node?.inputs || {})) {
         const canonical = tensor?.name ? tensors.get(tensor.name) : undefined;
-        if (!validName(key)) errors.push(`${label} has an invalid input key.`);
+        if (!isValidGraphName(key)) errors.push(`${label} has an invalid input key.`);
         if (!canonical) {
           errors.push(`${label} input '${key}' references a missing tensor.`);
           continue;
@@ -595,7 +607,7 @@ export class Graph {
 
     const seenOutputs = new Set();
     for (const name of outputNames || []) {
-      if (!validName(name) || !tensors.has(name)) errors.push(`Graph output '${String(name)}' does not exist.`);
+      if (!isValidGraphName(name) || !tensors.has(name)) errors.push(`Graph output '${String(name)}' does not exist.`);
       else if (seenOutputs.has(name)) errors.push(`Graph output '${name}' is listed more than once.`);
       seenOutputs.add(name);
     }
@@ -651,7 +663,7 @@ export class Graph {
       : references as ConcreteTensorReference[];
     const names = values.map((value, index) => this._resolveTensorRef(value, `Graph output ${index}`).name);
     if (new Set(names).size !== names.length) throw new Error("Graph outputs must be unique.");
-    this.outputNames = names;
+    this._setOutputNames(names);
     this._outputsExplicit = true;
     this._commitTopology([...this.nodes], new Map(this.tensors), "select graph outputs");
     return this;
@@ -660,7 +672,7 @@ export class Graph {
   inferOutputs(): string[] {
     this._assertTopologyMutationAllowed();
     this._outputsExplicit = false;
-    this.outputNames = [...this._autoOutputNames];
+    this._setOutputNames(this._autoOutputNames);
     this._commitTopology([...this.nodes], new Map(this.tensors), "infer graph outputs");
     return [...this.outputNames];
   }
@@ -669,7 +681,7 @@ export class Graph {
     this._assertTopologyMutationAllowed();
     const tensor = this.getTensor(name);
     if (!tensor) throw new Error(`Tensor '${name}' not found.`);
-    if (!validName(nextName)) throw new Error("Tensor name must be a non-empty string.");
+    if (!isValidGraphName(nextName)) throw new Error("Tensor name must be a non-empty string.");
     if (this.tensors.has(nextName)) throw new Error(`Tensor '${nextName}' already exists.`);
     const replacement = Object.assign(Object.create(Object.getPrototypeOf(tensor)), tensor, { name: nextName });
     const tensors = new Map();
@@ -690,7 +702,7 @@ export class Graph {
       outputs: Object.fromEntries(Object.entries(node.outputs || {}).map(([key, value]) => [key, value === replacement ? tensor : value])),
       params: { ...(node.params || {}) },
     }));
-    this.outputNames = mappedOutputs;
+    this._setOutputNames(mappedOutputs);
     if (!this._outputsExplicit) this._autoOutputNames = [...mappedOutputs];
     this._commitTopology(committedNodes, tensors, `rename tensor '${name}' to '${nextName}'`);
     return tensor;
@@ -701,11 +713,14 @@ export class Graph {
     const tensor = this.getTensor(name);
     if (!tensor) throw new Error(`Tensor '${name}' not found.`);
     if (!isRecord(patch as unknown)) throw new Error("Tensor patch must be an object.");
+    if (Object.prototype.hasOwnProperty.call(patch, 'data')) {
+      throw new Error(`Tensor '${name}' patch contains unsupported field 'data'; use 'buffer'.`);
+    }
     if (patch.name != null && patch.name !== name) return this.renameTensor(name, patch.name);
     const next = Object.assign(Object.create(Object.getPrototypeOf(tensor)), tensor);
     if (patch.shape != null) next.shape = validateShape(patch.shape, `Tensor '${name}'`);
     if (patch.dtype != null) {
-      if (!validName(patch.dtype)) throw new Error(`Tensor '${name}' dtype must be a non-empty string.`);
+      if (!isValidGraphName(patch.dtype)) throw new Error(`Tensor '${name}' dtype must be a non-empty string.`);
       next.dtype = patch.dtype;
     }
     if (Object.prototype.hasOwnProperty.call(patch, "quantization")) {
@@ -722,7 +737,7 @@ export class Graph {
       next.isWeight = patch.role === "weight";
       next.isInput = patch.role === "input";
     }
-    const buffer = patch.buffer ?? patch.data;
+    const buffer = patch.buffer;
     if (buffer != null) {
       const expected = next._calculateByteSize();
       Tensor.assertCompatibleBuffer(next.dtype, buffer, expected, `Tensor '${name}' buffer`);
@@ -795,7 +810,7 @@ export class Graph {
       ...previous,
       ...replacement,
       id: replacement.id ?? previous.id,
-      opType: replacement.opType || replacement.op || previous.opType,
+      opType: replacement.opType || previous.opType,
       inputs: replacement.inputs ?? previous.inputs,
       outputs: replacement.outputs ?? previous.outputs,
       params: replacement.params ?? previous.params,
@@ -804,11 +819,20 @@ export class Graph {
       spec.outputs = Object.fromEntries(Object.entries(replacement.outputs).map(([key, value]) => {
         const oldTensor = previous.outputs?.[key];
         if (Array.isArray(value) && oldTensor) {
-          return [key, { name: oldTensor.name, shape: value, dtype: oldTensor.dtype, replace: true }];
+          return [key, {
+            name: oldTensor.name,
+            shape: value,
+            dtype: oldTensor.dtype,
+            [REPLACE_EXISTING_OUTPUT]: true,
+          }];
         }
         if (isRecord(value) && !(value instanceof Tensor) && oldTensor && !value.name) {
           const descriptor = value as Record<string, unknown>;
-          return [key, { ...descriptor, name: oldTensor.name, replace: descriptor.reuse !== true }];
+          return [key, {
+            ...descriptor,
+            name: oldTensor.name,
+            [REPLACE_EXISTING_OUTPUT]: true,
+          }];
         }
         return [key, value];
       }));
@@ -844,7 +868,7 @@ export class Graph {
       return oldTensor && rewrites.has(oldTensor) ? rewrites.get(oldTensor).name : name;
     }).filter((name) => tensors.has(name));
     this._assertValidState(nodes, tensors, nextOutputNames);
-    if (this._outputsExplicit) this.outputNames = nextOutputNames;
+    if (this._outputsExplicit) this._setOutputNames(nextOutputNames);
     this._commitTopology(nodes, tensors, `replace node '${String(previous.id)}'`);
     if (typeof next.id === "number" && next.id >= this._nextNodeId) this._nextNodeId = next.id + 1;
     return next;
@@ -917,7 +941,7 @@ export class Graph {
       return oldTensor && rewrites.has(oldTensor) ? rewrites.get(oldTensor).name : name;
     }).filter((name) => tensors.has(name));
     this._assertValidState(nodes, tensors, nextOutputNames);
-    if (this._outputsExplicit) this.outputNames = nextOutputNames;
+    if (this._outputsExplicit) this._setOutputNames(nextOutputNames);
     this._commitTopology(nodes, tensors, `remove node '${String(start.id)}'`);
     return removedNodes;
   }
@@ -1086,9 +1110,8 @@ export class Graph {
         ? (patch.replaceParams ? { ...patch.params } : { ...(node.params || {}), ...patch.params })
         : node.params,
     });
-    // patchNodeAt historically mutated and returned the existing node object.
-    // Preserve that handle while still using replaceNodeAt's transactional
-    // validation and downstream tensor rewrites.
+    // patchNodeAt keeps its node handle stable while using replaceNodeAt's
+    // transactional validation and downstream tensor rewrites.
     Object.assign(node, replacement);
     this.nodes[index] = node;
     return node;

@@ -2,13 +2,13 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 
 import {
-  CPUEngine,
   Graph,
-  GraphExecutor,
   SafetensorsFile,
   VOLVOX_ADAPTER_FORMAT,
   VOLVOX_ADAPTER_MANIFEST_KEY,
 } from '../ts/index.js';
+import { CPUEngine } from '../ts/backends/CPUEngine.js';
+import { GraphExecutor } from '../ts/backends/GraphExecutor.js';
 
 function close(actual, expected, epsilon = 1e-5) {
   assert.equal(actual.length, expected.length);
@@ -120,7 +120,7 @@ function linearGraph({ inputShape = [1, 2], weight = [1, 0, 0, 1], bias = [0.5, 
   const outShape = [...inputShape.slice(0, -1), 2];
   const { out } = graph.addOp('MatMul', inputs, { out: outShape });
   graph.nodes[0].wLayout = (dtype === 'int8' || dtype === 'uint8') ? 'dout' : layout;
-  graph.outputNames = [out.name];
+  graph.setOutputs([out.name]);
   const engine = new CPUEngine();
   engine.allocateGraph(graph);
   return { graph, engine, out };
@@ -129,6 +129,61 @@ function linearGraph({ inputShape = [1, 2], weight = [1, 0, 0, 1], bias = [0.5, 
 function loraTarget({ A = [1, 2], B = [3, 4], rank = 1, alpha = 1, ...extra } = {}) {
   return { weight: 'w', A: Float32Array.from(A), B: Float32Array.from(B), rank, alpha, ...extra };
 }
+
+test('adapter authoring rejects undeclared fields and duplicate control', () => {
+  const { graph } = linearGraph();
+  const rejectedTargetFields = [
+    ['baseTensor', 'w'],
+    ['target', 'w'],
+    ['kind', 'lora'],
+    ['a', Float32Array.of(1, 2)],
+    ['b', Float32Array.of(3, 4)],
+    ['adapterB', Float32Array.of(3, 4)],
+  ];
+  for (const [field, value] of rejectedTargetFields) {
+    assert.throws(
+      () => graph.stageAdapter(`unsupported-${field}`, {
+        kind: 'lora',
+        targets: [{ ...loraTarget(), [field]: value }],
+      }),
+      new RegExp(`unsupported field '${field}'`),
+    );
+  }
+  for (const [field, value] of [['type', 'lora'], ['activate', true]]) {
+    assert.throws(
+      () => graph.stageAdapter(`unsupported-${field}`, {
+        kind: 'lora', targets: [loraTarget()], [field]: value,
+      }),
+      new RegExp(`unsupported field '${field}'`),
+    );
+  }
+  assert.throws(
+    () => graph.stageAdapter('missing-kind', { targets: [loraTarget()] }),
+    /requires kind 'lora'/,
+  );
+  assert.throws(
+    () => graph.stageAdapter('record-targets', { kind: 'lora', targets: { w: loraTarget() } }),
+    /targets must be an array/,
+  );
+  for (const field of ['values', 'buffer']) {
+    assert.throws(
+      () => graph.stageAdapter(`unsupported-storage-${field}`, {
+        kind: 'lora',
+        targets: [{
+          ...loraTarget(),
+          A: { data: Float32Array.of(1, 2), [field]: Float32Array.of(1, 2) },
+        }],
+      }),
+      new RegExp(`unsupported field '${field}'`),
+    );
+  }
+
+  graph.stageAdapter('canonical', { kind: 'lora', targets: [loraTarget()] });
+  assert.throws(
+    () => graph.updateAdapter('canonical', { w: { a: Float32Array.of(1, 2) } }),
+    /Unsupported adapter tensor role 'a'/,
+  );
+});
 
 test('immutable versions hot-swap atomically and execution pins before input copy', async () => {
   const { graph, engine, out } = linearGraph();
@@ -199,7 +254,7 @@ test('LoRA merge matches unmerged output and unmerge restores exact base', async
   assert.throws(() => graph.applyTensorUpdate('w', new Float32Array(4), { mode: 'add' }), /Unmerge/);
   assert.throws(() => graph.stageAdapter('late', { kind: 'lora', targets: [loraTarget()] }, { activate: true }), /Unmerge/);
   assert.equal(graph.listAdapters().some((adapter) => adapter.name === 'late'), false);
-  await assert.rejects(() => engine.execute({ x: new Float32Array([2, 1]) }, { adapter: 'merge' }), /merged/);
+  await assert.rejects(() => engine.execute({ x: new Float32Array([2, 1]) }, { adapter: { name: 'merge' } }), /merged/);
   assert.throws(() => graph.mergeAdapter('merge'), /already merged/);
 
   const mergedFirst = graph.getTensor('w').buffer[0];
@@ -263,11 +318,15 @@ test('batch routes apply distinct LoRA adapters per request', async () => {
     adapters: [{ name: 'a' }, { name: 'b', scale: 0.5 }],
   });
   close(result[out.name], [4, 3, 7, 12]);
-  close((await engine.execute({ x: new Float32Array([2, 1, 3, 4]) }, { adapters: ['a'] }))[out.name], [4, 3, 6, 7]);
+  await assert.rejects(
+    () => engine.execute({ x: new Float32Array([2, 1, 3, 4]) }, { adapter: 'a' }),
+    /selector must be an object or null/,
+  );
+  close((await engine.execute({ x: new Float32Array([2, 1, 3, 4]) }, { adapters: [{ name: 'a' }] }))[out.name], [4, 3, 6, 7]);
   close((await engine.execute({ x: new Float32Array([2, 1, 3, 4]) }, { adapters: [] }))[out.name], [2, 1, 3, 4]);
   close((await engine.execute({ x: new Float32Array([2, 1, 3, 4]) }, { adapters: [null, null] }))[out.name], [2, 1, 3, 4]);
   await assert.rejects(
-    () => engine.execute({ x: new Float32Array([2, 1, 3, 4]) }, { adapters: ['a', 'b', 'a'] }),
+    () => engine.execute({ x: new Float32Array([2, 1, 3, 4]) }, { adapters: [{ name: 'a' }, { name: 'b' }, { name: 'a' }] }),
     /requires one adapter route or 2 routes.*received 3/,
   );
   await assert.rejects(
@@ -279,11 +338,11 @@ test('batch routes apply distinct LoRA adapters per request', async () => {
   folded.graph.stageAdapter('a', { kind: 'lora', targets: [loraTarget({ A: [1, 0], B: [1, 1] })] });
   folded.graph.stageAdapter('b', { kind: 'lora', targets: [loraTarget({ A: [0, 1], B: [2, 4] })] });
   const foldedResult = await folded.engine.execute({ x: new Float32Array([2, 1, 3, 4, 5, 6, 7, 8]) }, {
-    adapters: ['a', 'b'],
+    adapters: [{ name: 'a' }, { name: 'b' }],
   });
   close(foldedResult[folded.out.name], [4, 3, 6, 7, 17, 30, 23, 40]);
   await assert.rejects(
-    () => folded.engine.execute({ x: new Float32Array(8) }, { adapters: ['a', 'b', 'a', 'b'] }),
+    () => folded.engine.execute({ x: new Float32Array(8) }, { adapters: [{ name: 'a' }, { name: 'b' }, { name: 'a' }, { name: 'b' }] }),
     /requires one adapter route or 2 routes.*received 4/,
   );
 });

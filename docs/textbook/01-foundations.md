@@ -12,7 +12,7 @@ tensors**, and you understand the pieces VolvoxAI uses to run one.*
 > of little sums, and numbers come out the other end (a label, a word, a box around a cat). This
 > whole chapter is just naming the four LEGO pieces that machine is built from: **numbers in a grid
 > (a tensor)**, **one small math step (an operation)**, **a list of those steps wired together (a
-> graph)**, and **the saved recipe (the blueprint)**. That's the entire vocabulary. Everything else
+> graph)**, and **the saved graph document**. That's the entire vocabulary. Everything else
 > in the book is detail.
 
 ---
@@ -24,6 +24,11 @@ tensors**, and you understand the pieces VolvoxAI uses to run one.*
 > step also reaches into a giant pantry of pre-measured numbers (the **weights**) that someone
 > figured out ahead of time. Follow the whole recipe once and you get a dish: the answer. Running
 > the recipe once is called a **forward pass**. That's all "running an AI" is.
+>
+> *What does "turned into numbers" mean?* A letter becomes a number by its position in a list (the
+> word "cat" might become `[3, 1, 20]`); a photo becomes numbers by reading each pixel's brightness
+> (a gray dot → `0.5`, pure white → `1.0`). Boring — but that's the trick: once everything is
+> numbers, the machine only ever has to do arithmetic.
 
 🔧 When you use an AI model, three things happen:
 
@@ -35,6 +40,12 @@ tensors**, and you understand the pieces VolvoxAI uses to run one.*
 Step 2 is the model. Running it once is called a **forward pass**, or **inference**. That is
 all inference is: a pipeline of multiply-and-add, arranged in a specific order that someone
 *trained* to be useful.
+
+> 🔬 **Under the hood.** Ordinary execution is a **pure function**: same pinned weights + same input →
+> same output. Decode/KV state is explicit and belongs to one `ExecutionContext`; it is never hidden
+> process state. A provider's execution plan walks the graph and dispatches each node, so "how long
+> does inference take" is mostly "the sum of each op's time" — which is exactly why Chapters 6–8
+> focus on making individual ops cheaper.
 
 > **Training vs. inference.** 🌱 *Inference* is **cooking** with a finished recipe (Part I).
 > *Training* is **writing** that recipe in the first place (Part II): you cook a dish, taste how
@@ -54,6 +65,11 @@ all inference is: a pipeline of multiply-and-add, arranged in a specific order t
 > shaped (say, 2 rows × 3 cups). A photo, a sentence, a sound — the computer turns all of them into
 > cartons of numbers. That's the only kind of "stuff" that flows through the machine. Once you can
 > picture "a labeled grid of numbers," you've got it.
+>
+> *Why the label matters.* The six numbers `1 2 3 4 5 6` could be two rows of three (`2×3`), three
+> rows of two (`3×2`), or one flat line of six — same numbers, completely different meaning. The
+> **shape** is the label on the carton that tells every step how to read the cups. Get the shape wrong
+> and the math is nonsense, so a tensor *always* carries its shape with it.
 
 🔧 Every number moving through a network lives in a **tensor**. A tensor is just a
 multi-dimensional array (a grid of numbers) plus a **shape** that says how big each dimension is.
@@ -103,11 +119,19 @@ You will see this exact pattern — `((b * H + y) * W + x) * C + c` — all over
 how a 4-D image tensor is addressed inside a 1-D array. Memorize the shape, and the index math
 follows.
 
+> 🔬 **Under the hood: strides and dtype.** The packed formula above is the common case; the general
+> rule gives each dimension a **stride** — how many numbers to skip to move one step along that axis —
+> and the flat index is `Σ coord[d] × stride[d]`. A contiguous `[2, 3]` tensor has strides `[3, 1]`; a
+> **transpose** can leave every number exactly where it is and just swap the strides to `[1, 3]`,
+> which is why reshape/transpose are often nearly free. The **dtype** fixes how many bytes each cup
+> takes — `float32` = 4, `int8` = 1, `int32` = 4 — so a tensor's memory footprint is
+> `product(shape) × bytes(dtype)`. Chapter 6 is entirely about shrinking that second factor by 4×.
+
 > 🔬 **NHWC vs NCHW.** The *order* of the dimensions matters. VolvoxAI's vision models use
 > **NHWC** (batch, height, width, channels) — the color channels of one pixel sit next to each
 > other in memory. PyTorch usually uses **NCHW**. Same data, different memory layout; kernels
 > must agree on which one they're reading. (This repo's converter records `"internal_layout":
-> "NHWC"` in every vision `config.json`.)
+> "NHWC"` in every vision `graph.json`.)
 
 ---
 
@@ -118,6 +142,11 @@ follows.
 > intelligence doesn't live in any one step; it comes from doing *thousands* of these tiny steps in
 > the right order. The punchline of this whole book: **there is no step where something magical or
 > unexplainable happens.** It's all little sums.
+>
+> *A whole op, worked by hand.* "Add" of `[1, 2, 3]` and `[10, 20, 30]` is just `[11, 22, 33]`, cup
+> by cup. "ReLU" of `[-2, 5, -1, 3]` means "replace negatives with zero" → `[0, 5, 0, 3]`. That is the
+> actual difficulty level of one op. A model feels intelligent only because it stacks thousands of
+> these in an order that was carefully trained.
 
 🔧 An **operation** (or **op**, or **layer**) takes one or more input tensors, does a fixed piece
 of math, and writes one or more output tensors. Examples you will meet:
@@ -133,10 +162,10 @@ of math, and writes one or more output tensors. Examples you will meet:
 | `MaxPool2D` | Shrink an image by keeping the biggest value in each patch | the detector |
 
 Every op in VolvoxAI has a plain-English **reference implementation** in `ts/ops/`, one small
-file each. Here is the *entire* `Add` op — this is not a simplification, it is the real code:
+file each. Here is the *essence* of the `Add` op — one output cup per pair of input cups:
 
 ```javascript
-// ts/ops/add.ts — element-wise addition with broadcasting
+// the essence of ts/ops/add.ts — element-wise addition with broadcasting
 for (let i = 0; i < out.length; i++) {
   out[i] = a[i] + b[i % b.length];   // b.length may be smaller ("broadcast")
 }
@@ -144,6 +173,15 @@ for (let i = 0; i < out.length; i++) {
 
 That is the whole secret: a model is thousands of operations like this, each trivial, chained
 together. **There is no step where something inexplicable happens.**
+
+> 🔬 **Under the hood: the shipped op is a little richer than that one-liner.** The real
+> `ts/ops/add.ts` doesn't hard-code `b[i % b.length]`; it calls a shared `cpuBroadcastBinary` helper
+> (`ts/ops/broadcast.js`) that does true N-dimensional **broadcasting** by strides — stretching a
+> `[64]` bias across a `[1, 256, 64]` activation, say — and it accepts a fused `relu` parameter (`0`
+> none, `1` ReLU, `2` ReLU6) so an `Add` immediately followed by a clamp becomes **one pass instead of
+> two** (that fusion is Chapter 8). The *math* is still just "add, maybe clamp"; the extra code only
+> covers arbitrary shapes and saves a pass. Every file like this is the **correctness oracle** that the
+> WASM, WebGPU, and native versions of the same op are tested against.
 
 ---
 
@@ -182,29 +220,43 @@ kernel, …). That's it. **A neural network engine is a `for` loop over a list o
 Everything else is making those functions fast (Chapter 8), numerically small (Chapters 6–7), and —
 in Part II — running them *backward* to discover the weights in the first place.
 
+> 🔬 **Under the hood: why the plain loop is enough.** The executor never sorts the graph at run
+> time — the exporter writes nodes in a valid **dependency order**, so "top to bottom" already means
+> "inputs before outputs." Tensors are found by name in a table, so wiring is pure string bookkeeping,
+> and the `Graph` keeps a `topologyRevision` counter (`ts/core/Graph.ts`) that bumps whenever the node
+> list changes so caches and compiled backends know to rebuild. Two consequences to hold onto: the run
+> is **O(number of nodes)** with no graph analysis on the hot path, and a "model" versus a "sub-model"
+> differ only by *where you stop the loop* — which is precisely what makes the prefill/decode split and
+> incremental execution in Chapter 9 possible.
+
 ---
 
-## 1.5 The blueprint: how a model is stored
+## 1.5 The graph package: how a model is stored
 
 > 🌱 **Idea.** A saved model is just **two files**: the **recipe card** (the list of steps, in
 > order) and the **pantry** (all the pre-measured numbers the steps use). Hand those two files to
 > the engine and it can cook. Nothing else is hidden — no secret brain, no cloud magic. Two files.
+>
+> *Why split into two?* The recipe card is small text you can open and read; the pantry is a big block
+> of raw numbers you can't (and shouldn't) read by eye. Keeping them apart lets you inspect or edit the
+> *plan* without disturbing the millions of learned numbers — and swap in different numbers (a
+> fine-tuned pantry) without rewriting the plan.
 
 🔧 A VolvoxAI model on disk is two files:
 
 ```
 model/
-  config.json          # the GRAPH: a list of op nodes (topology + params + shapes)
+  graph.json          # the GRAPH: a list of op nodes (topology + params + shapes)
   model.safetensors    # the WEIGHTS: the learned numbers, in a standard binary format
 ```
 
-- **`config.json`** is the *blueprint*: an ordered list of nodes. Each node names its op, its
+- **`graph.json`** is the graph document: an ordered list of nodes. Each node names its op, its
   input/output tensors, its parameters, and the exact output shape (pre-computed by the
   exporter so the engine never has to guess). Here is one real node from TinyStories:
 
   ```json
   {
-    "op": "LayerNorm",
+    "opType": "LayerNorm",
     "inputs":  { "input": "hidden_0", "weight": "h.0.ln_1.weight", "bias": "h.0.ln_1.bias" },
     "outputs": { "out": "ln1_0" },
     "outputs_shape": { "out": [1, 256, 64] },
@@ -218,8 +270,18 @@ model/
 
 🔬 `ts/core/GraphLoader.ts` reads both, builds the `Graph`, and hands it to the engine — with no
 PyTorch, no ONNX Runtime, no dependencies at inference time. You can **export a model trained
-elsewhere** into this blueprint, or — as Part II shows — let VolvoxAI **train and write the
-blueprint itself**.
+elsewhere** into this graph package, or — as Part II shows — let VolvoxAI **train and write the
+package itself**.
+
+> 🔬 **Under the hood: the `.safetensors` byte layout.** The format is deliberately trivial to parse:
+> an **8-byte little-endian length**, then a **JSON header** mapping each tensor name to its
+> `{ dtype, shape, data_offsets }`, then the **raw tensor bytes** back to back. Nothing executes while
+> loading — the header is data, not code (that safety is the whole point of the format versus Python
+> pickles). The native engine **`mmap`s** the file and points each tensor's buffer straight at the
+> mapped bytes (`native/src/runtime/safetensors.c`), so a weight isn't copied into RAM until it's
+> touched; the browser reads it via `ts/core/Safetensors.ts`. And because `graph.json` already records
+> every `outputs_shape`, loading is one linear pass with **no shape inference** — the engine never has
+> to reason about shapes at run time.
 
 ---
 
@@ -236,12 +298,13 @@ blueprint itself**.
 
 ```mermaid
 flowchart TD
-    G[Graph + weights] --> SEL{VolvoxAI.init<br/>picks best available}
+    G[Graph + weights] --> R[VolvoxAI.createRuntime]
+    R --> SEL{Model.compile<br/>applies backend policy}
     SEL -->|browser NPU/GPU| T1[Tier 1 · WebNN]
     SEL -->|browser GPU| T2[Tier 2 · WebGPU<br/>WGSL compute shaders]
     SEL -->|any CPU, fast| T3[Tier 3 · WASM SIMD<br/>compiled C kernels]
     SEL -->|any CPU, always works| T4[Tier 4 · Pure JS<br/>reference kernels]
-    N[Native binary · C<br/>Vulkan/OpenGL/Metal/CPU] -.same blueprint.-> G
+    N[Native binary · C<br/>Vulkan/OpenGL/CUDA/Metal/CPU] -.same graph package.-> G
 ```
 
 - **Tier 4 (Pure JS, `ts/ops/*.ts`)** is the *reference*: slow but obviously-correct, and the
@@ -250,9 +313,18 @@ flowchart TD
 - **Tier 3 (WASM)** runs the same math as compiled C for a big speedup.
 - **Tier 2 (WebGPU)** re-expresses each op as a GPU compute shader (`shaders/{inference,training}/*.wgsl`).
 - **Tier 1 (WebNN)** hands the graph to the browser's own neural-network API (can hit an NPU).
-- **Native** (`native/`) is a standalone C program that runs the *same* blueprint on a desktop,
-  phone, or robot, optionally on Vulkan/OpenGL/Metal. This is the path to **on-device / edge AI**,
-  and it's the subject of Chapter 9.
+- **Native** (`native/`) is a standalone C program that runs the *same* graph package on a desktop,
+  phone, or robot, optionally on Vulkan/OpenGL/CUDA/Metal. CUDA is an opt-in manual-kernel backend
+  (forward inference, plus training in the full build; see Chapter 9C). This is the path to
+  **on-device / edge AI**, and it's the subject of Chapter 9.
+
+> 🔬 **Under the hood: how a tier gets picked, and why answers still match.**
+> `VolvoxAI.createRuntime({ backends })` initializes the selected providers. `Model.compile()`
+> applies a preferred or required policy and records every candidate outcome before execution.
+> Execution failure never switches provider. Every tier is free to differ in *speed* but not in
+> *answer* because the pure-JS CPU implementation is the **reference**, and parity checks every other
+> tier — and the native providers of Chapter 9 — against it within a tight tolerance. "Same
+> graph package, same answer, many kitchens" is a tested contract, not a hope.
 
 For the rest of the book, when we "trace an op," we read the pure-JS or portable-C version,
 because they say most directly *what the math is*.
@@ -283,8 +355,15 @@ because they say most directly *what the math is*.
 
 Two questions define any model:
 
-1. **What are the ops, and in what order?** (the graph / `config.json`)
+1. **What are the ops, and in what order?** (the graph / `graph.json`)
 2. **What do the weights make each op do?** (the `.safetensors`)
+
+> 🔬 **Under the hood: three axes, one object.** Everything the rest of the book does is an operation
+> *on this one graph object*. **Forward** (Part I) walks it. **Backward** (Part II) walks a mirror of
+> it in reverse to get gradients, then an optimizer edits the weight tensors in place. **Quantization**
+> (Part III) rewrites those weight tensors as int8 plus `scale`/`zero_point` and swaps in integer ops.
+> Same graph, same tensors — three different things you *do* to them. Hold that picture and no later
+> chapter can surprise you.
 
 In the next two chapters we answer both questions for two real models — and you'll see that a
 "language model" and an "image detector" are the *same idea* with different ops in the list.

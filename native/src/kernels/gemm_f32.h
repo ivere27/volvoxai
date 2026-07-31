@@ -47,13 +47,26 @@ int vx_gemm_f32_run_packed_add(const float* a, const float* packed_b,
                                const float* bias, float* c,
                                uint32_t m, uint32_t k, uint32_t n);
 
-#ifndef __wasm__
-/* Native model-runtime cache.  Entries are keyed by graph-node index and must
- * be cleared when an in-place weight update makes source contents mutable. */
-const float* vx_gemm_f32_pack_cache(int node_index, const float* weight,
+enum { VX_GEMM_F32_CACHE_CAPACITY = 1024 };
+
+typedef struct VxGemmF32CacheEntry {
+    const float* source;
+    float* packed;
+    uint32_t k;
+    uint32_t n;
+    int out_in;
+} VxGemmF32CacheEntry;
+
+typedef struct VxGemmF32Cache {
+    VxGemmF32CacheEntry entries[VX_GEMM_F32_CACHE_CAPACITY];
+} VxGemmF32Cache;
+
+/* Owner-scoped native model cache. Entries are keyed by graph-node index and
+ * cleared when in-place weight updates make source contents mutable. */
+const float* vx_gemm_f32_pack_cache(VxGemmF32Cache* cache, int node_index,
+                                    const float* weight,
                                     uint32_t k, uint32_t n, int out_in);
-void vx_gemm_f32_cache_free_all(void);
-#endif
+void vx_gemm_f32_cache_free_all(VxGemmF32Cache* cache);
 
 #ifdef __cplusplus
 }

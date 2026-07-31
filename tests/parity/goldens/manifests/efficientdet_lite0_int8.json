@@ -1,0 +1,189 @@
+{
+  "schema": "volvoxai.parity-run-manifest",
+  "version": 1,
+  "runId": "9b70fc09-0804-425a-b885-7d52362c587e",
+  "command": "golden",
+  "fingerprint": {
+    "schema": "volvoxai.parity-fingerprint",
+    "version": 1,
+    "algorithm": "sha256",
+    "components": {
+      "policy": [
+        {
+          "path": "tests/parity/policy.json",
+          "sha256": "fb27224d2996e5bafd56a063526ce34d9d4fdcee165950bf663a48b7f15adab3",
+          "size": 3885
+        }
+      ],
+      "models": [
+        {
+          "path": "models/efficientdet_lite0_int8/graph.json",
+          "sha256": "a52955143989525d697c69e6ba4d77d3778a8d28561910569c743cbb0d672b37",
+          "size": 864601
+        },
+        {
+          "path": "models/efficientdet_lite0_int8/model.safetensors",
+          "sha256": "473bf7f2638e9488d7ec58facdf3c06d3233b25bd7873e3f078cd9f52ea23032",
+          "size": 3441599
+        }
+      ],
+      "inputs": [
+        {
+          "path": "tests/parity/out/fixtures/efficientdet_lite0_int8/input0.u8",
+          "sha256": "7bbf5b80bb7fa735ce8a8038f8dad5413d4c162e4f79a6a895cdce9c44892c86",
+          "size": 307200
+        }
+      ],
+      "builds": [
+        {
+          "path": "dist/0.3.0/volvoxai.js",
+          "sha256": "3303b6d03596642c716579e7f878330efa0a7799e585080af96eef768b0f4323",
+          "size": 1222890
+        }
+      ],
+      "sources": [],
+      "source": {
+        "revision": "e84b57c0d614364212d9186df986af82a942cf72",
+        "state": "dirty",
+        "statusSha256": "9081ba13db4966ec378e28b7a2b319592e10d71a5949e20093b977195dbadf39"
+      }
+    },
+    "digest": "d90833c1d7e097f2751950e23055a6d1c9a86a818d68cba46cdfb356dfd016b7"
+  },
+  "selection": {
+    "cases": [
+      "efficientdet_lite0_int8"
+    ],
+    "tiers": [
+      "cpu-reference"
+    ],
+    "jobs": [
+      {
+        "case": "efficientdet_lite0_int8",
+        "tier": "cpu-reference",
+        "expectation": "required"
+      }
+    ]
+  },
+  "producer": {
+    "backend": "cpu",
+    "kind": "node",
+    "runtimeEvidenceRequired": true,
+    "strictBackend": true
+  },
+  "startedAt": "2026-07-21T09:22:04.285Z",
+  "completedAt": "2026-07-21T09:22:15.300Z",
+  "outcome": "success",
+  "results": [
+    {
+      "case": "efficientdet_lite0_int8",
+      "tier": "cpu-reference",
+      "status": "success",
+      "artifact": {
+        "path": "efficientdet_lite0_int8.json",
+        "sha256": "2acf317a5a09517a5535947c98f2af4d3dd8355c6c6a646e0bef5f550b000bc5",
+        "size": 46042
+      },
+      "durationMs": 4726.6,
+      "metadata": {
+        "runtimeEvidence": {
+          "compilation": {
+            "compilationId": "compilation-11e0e838-d47e-4e7e-a5a6-32b3b75f3f0e",
+            "definitionId": "model-definition-d3d4bcf6-be77-4d23-9fcb-60d276132013",
+            "policy": {
+              "backend": "cpu",
+              "mode": "require",
+              "operatorFallback": "forbid"
+            },
+            "revisions": {
+              "adapterRevisionId": null,
+              "adapterRevisionIds": [],
+              "topologyRevision": 1,
+              "weightRevision": 0,
+              "weightRevisionId": "model-definition-d3d4bcf6-be77-4d23-9fcb-60d276132013:weight-revision-11ca3866-4d41-4442-8f00-2bf0c0029ab7"
+            },
+            "route": {
+              "operator": {
+                "attestation": "none",
+                "offendingNode": null,
+                "used": false
+              },
+              "tierFallback": false
+            },
+            "selectedBackend": "cpu",
+            "selectedDevice": {
+              "backend": "cpu",
+              "device": "host"
+            }
+          },
+          "execution": {
+            "backend": "cpu",
+            "contextId": "context-6e6c9740-9ff7-40c8-b45c-5c296d1897e7",
+            "decodeState": {
+              "cacheGeneration": 3,
+              "cacheState": "not-applicable",
+              "mode": null,
+              "operation": "execute",
+              "position": null
+            },
+            "device": {
+              "backend": "cpu",
+              "device": "host"
+            },
+            "executionId": "execution-6cce5a67-3d82-46a2-b939-7156bd603fda",
+            "outcome": "success",
+            "revisions": {
+              "adapterRevisionId": null,
+              "adapterRevisionIds": [
+                null
+              ],
+              "topologyRevision": 1,
+              "weightRevision": 0,
+              "weightRevisionId": "model-definition-d3d4bcf6-be77-4d23-9fcb-60d276132013:weight-revision-11ca3866-4d41-4442-8f00-2bf0c0029ab7"
+            },
+            "route": {
+              "operator": {
+                "attestation": "none",
+                "offendingNode": null,
+                "used": false
+              },
+              "tierFallback": false
+            }
+          },
+          "schema": "volvoxai.runtime-evidence",
+          "stableResult": {
+            "contextClosedBeforeResult": true,
+            "freshCallerOwnedReads": true,
+            "outputs": [
+              {
+                "byteLength": 6914160,
+                "dtype": "float32",
+                "location": "host",
+                "name": "scores",
+                "shape": [
+                  1,
+                  19206,
+                  90
+                ]
+              },
+              {
+                "byteLength": 307296,
+                "dtype": "float32",
+                "location": "host",
+                "name": "boxes",
+                "shape": [
+                  1,
+                  19206,
+                  4
+                ]
+              }
+            ],
+            "readableAfterContextClose": true,
+            "resultClosedAfterVerification": true
+          },
+          "version": 1
+        }
+      }
+    }
+  ]
+}

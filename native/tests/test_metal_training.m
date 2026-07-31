@@ -1,9 +1,12 @@
 #include <math.h>
+#include <pthread.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "metal_engine.h"
+#include "runtime_state.h"
 
 /* macOS: cmake -B build/mac -DVOLVOXAI_ENABLE_METAL=ON && ctest --test-dir build/mac -L gpu */
 
@@ -76,6 +79,345 @@ static int test_graph_linear_tails_and_fallback(void) {
                                   tiled_bias, tiled_output) == 0);
     CHECK(check_graph_linear_case(3, 7, 5, 0, scalar_input, scalar_weight,
                                   scalar_bias, scalar_output) == 0);
+    return 0;
+}
+
+static int test_graph_f32_shape_and_activation_closure(void) {
+    const float sigmoid_input[5] = {-4.0f, -1.0f, 0.0f, 1.0f, 4.0f};
+    float sigmoid_output[5] = {0};
+    const float softmax_input[6] = {1.0f, 2.0f, 3.0f, -1.0f, 0.0f, 1.0f};
+    float softmax_output[6] = {0};
+    const float expand_input[2] = {2.0f, -3.0f};
+    const int expand_input_shape[5] = {1, 1, 1, 2, 1};
+    const int expand_output_shape[5] = {1, 2, 1, 2, 3};
+    const float expected_expand[12] = {
+        2.0f, 2.0f, 2.0f, -3.0f, -3.0f, -3.0f,
+        2.0f, 2.0f, 2.0f, -3.0f, -3.0f, -3.0f,
+    };
+    float expand_output[12] = {0};
+    const float gather_input[12] = {
+        0.0f, 1.0f, 2.0f, 3.0f, 4.0f, 5.0f,
+        6.0f, 7.0f, 8.0f, 9.0f, 10.0f, 11.0f,
+    };
+    const int32_t gather_indices[2] = {2, -1};
+    const float expected_gather[8] = {
+        4.0f, 5.0f, 4.0f, 5.0f, 10.0f, 11.0f, 10.0f, 11.0f,
+    };
+    float gather_output[8] = {0};
+    float slice_input[24];
+    const int slice_input_shape[4] = {1, 2, 3, 4};
+    const int slice_output_shape[4] = {1, 2, 2, 2};
+    const int slice_starts[4] = {0, 0, 0, 1};
+    const int slice_steps[4] = {1, 1, 2, 2};
+    const float expected_slice[8] = {
+        1.0f, 3.0f, 9.0f, 11.0f, 13.0f, 15.0f, 21.0f, 23.0f,
+    };
+    float slice_output[8] = {0};
+    for (int index = 0; index < 24; index++)
+        slice_input[index] = (float)index;
+
+    metal_graph_reset();
+    metal_graph_begin_forward();
+    CHECK(metal_graph_sigmoid_f32(
+              sigmoid_input, sigmoid_output, 5) == 1);
+    CHECK(metal_graph_softmax_f32(
+              softmax_input, softmax_output, 2, 3) == 1);
+    CHECK(metal_graph_expand_f32(
+              expand_input, expand_output, expand_input_shape, 5,
+              expand_output_shape, 5) == 1);
+    CHECK(metal_graph_gather_i32_f32(
+              gather_input, gather_indices, gather_output,
+              2, 3, 2, 2, 8) == 1);
+    CHECK(metal_graph_slice4d_f32(
+              slice_input, slice_output, slice_input_shape, 4,
+              slice_output_shape, 4, slice_starts, slice_steps) == 1);
+    CHECK(metal_graph_end_forward() == 0);
+    CHECK(metal_graph_sync_host(
+              sigmoid_output, sizeof(sigmoid_output), 0) == 1);
+    CHECK(metal_graph_sync_host(
+              softmax_output, sizeof(softmax_output), 0) == 1);
+    CHECK(metal_graph_sync_host(
+              expand_output, sizeof(expand_output), 0) == 1);
+    CHECK(metal_graph_sync_host(
+              gather_output, sizeof(gather_output), 0) == 1);
+    CHECK(metal_graph_sync_host(
+              slice_output, sizeof(slice_output), 0) == 1);
+    for (int index = 0; index < 5; index++) {
+        float expected = 1.0f / (1.0f + expf(-sigmoid_input[index]));
+        CHECK(fabsf(sigmoid_output[index] - expected) < 2.0e-4f);
+    }
+    for (int row = 0; row < 2; row++) {
+        float denominator = 0.0f;
+        for (int column = 0; column < 3; column++)
+            denominator += expf(softmax_input[row * 3 + column] -
+                                softmax_input[row * 3 + 2]);
+        for (int column = 0; column < 3; column++) {
+            float expected =
+                expf(softmax_input[row * 3 + column] -
+                     softmax_input[row * 3 + 2]) / denominator;
+            CHECK(fabsf(softmax_output[row * 3 + column] - expected) <
+                  2.0e-4f);
+        }
+    }
+    for (int index = 0; index < 12; index++)
+        CHECK(close_enough(expand_output[index], expected_expand[index]));
+    for (int index = 0; index < 8; index++) {
+        CHECK(close_enough(gather_output[index], expected_gather[index]));
+        CHECK(close_enough(slice_output[index], expected_slice[index]));
+    }
+
+    const int incompatible_expand_shape[5] = {1, 2, 1, 3, 3};
+    const int overflow_shape[2] = {INT32_MAX, 2};
+    const int invalid_slice_steps[4] = {1, 1, 0, 1};
+    CHECK(metal_graph_expand_f32(
+              expand_input, expand_output, expand_input_shape, 5,
+              incompatible_expand_shape, 5) == 0);
+    CHECK(metal_graph_expand_f32(
+              expand_input, expand_output, overflow_shape, 2,
+              overflow_shape, 2) == 0);
+    CHECK(metal_graph_gather_i32_f32(
+              gather_input, gather_indices, gather_output,
+              2, 3, 2, 2, 7) == 0);
+    CHECK(metal_graph_slice4d_f32(
+              slice_input, slice_output, slice_input_shape, 4,
+              slice_output_shape, 4, slice_starts,
+              invalid_slice_steps) == 0);
+    CHECK(metal_graph_softmax_f32(
+              softmax_input, softmax_output, INT32_MAX, 2) == 0);
+    CHECK(metal_graph_sigmoid_f32(
+              sigmoid_input, sigmoid_output, (long)UINT32_MAX) == 0);
+    metal_graph_reset();
+    return 0;
+}
+
+static int test_typed_control_graph_ops(void) {
+    const int32_t compare_a[2] = {1, 4};
+    const int32_t compare_b[3] = {1, 3, 4};
+    const uint32_t output_strides[2] = {3u, 1u};
+    const uint32_t a_strides[2] = {1u, 0u};
+    const uint32_t b_strides[2] = {0u, 1u};
+    const int32_t expected_equal[6] = {1, 0, 0, 0, 0, 1};
+    const int32_t expected_ge[6] = {1, 0, 0, 1, 1, 1};
+    const int32_t expected_not[6] = {0, 1, 1, 1, 1, 0};
+    int32_t equal_output[6] = {0};
+    int32_t ge_output[6] = {0};
+    int32_t not_output[6] = {0};
+    const int32_t clip_input[4] = {-4, 0, 3, 9};
+    const int32_t expected_clip[4] = {0, 0, 3, 7};
+    int32_t clip_output[4] = {0};
+    const int32_t cast_i32[4] = {-2, 0, 7, 10};
+    const float expected_cast_f32[4] = {-2.0f, 0.0f, 7.0f, 10.0f};
+    float cast_f32[4] = {0};
+    const float cast_float_input[13] = {
+        -2.9f, 0.0f, 7.75f,
+        2147483648.0f, 2147483904.0f,
+        4294967296.0f, 4294967808.0f, 6442450944.0f,
+        -2147483904.0f, -4294967808.0f,
+        NAN, INFINITY, -INFINITY,
+    };
+    const int32_t expected_cast_i32[13] = {
+        -2, 0, 7,
+        INT32_MIN, INT32_MIN + 256,
+        0, 512, INT32_MIN,
+        INT32_MAX - 255, -512,
+        0, 0, 0,
+    };
+    int32_t cast_i32_output[13] = {0};
+    const uint32_t copy_input[4] = {
+        0x7fc01234u, 0x80000000u, 0xffffffffu, 0x12345678u,
+    };
+    uint32_t copy_output[4] = {0};
+    const int32_t where_condition[4] = {0, 1, -1, 0};
+    const uint32_t where_a[4] = {
+        0x7fc01234u, 0x80000000u, 0x11111111u, 0x22222222u,
+    };
+    const uint32_t where_b[4] = {
+        0x33333333u, 0x44444444u, 0xffffffffu, 0x7fa00001u,
+    };
+    const uint32_t expected_where[4] = {
+        0x33333333u, 0x80000000u, 0x11111111u, 0x7fa00001u,
+    };
+    uint32_t where_output[4] = {0};
+    const float argmax_input[12] = {
+        1.0f, 5.0f, 3.0f, 5.0f, 3.0f, 4.0f,
+        -1.0f, -2.0f, -1.0f, 7.0f, -3.0f, 7.0f,
+    };
+    const int32_t expected_argmax[4] = {1, 0, 0, 1};
+    int32_t argmax_output[4] = {0};
+    const uint32_t concat_a[4] = {
+        0x7fc00011u, 0x80000000u, 0x11111111u, 0x22222222u,
+    };
+    const uint32_t concat_b[2] = {0xffffffffu, 0x33333333u};
+    const void* concat_inputs[2] = {concat_a, concat_b};
+    const long concat_sizes[2] = {4, 2};
+    const int concat_axes[2] = {2, 1};
+    const uint32_t expected_concat[6] = {
+        0x7fc00011u, 0x80000000u, 0x11111111u,
+        0x22222222u, 0xffffffffu, 0x33333333u,
+    };
+    uint32_t concat_output[6] = {0};
+
+    metal_graph_reset();
+    metal_graph_begin_forward();
+    CHECK(metal_graph_compare_i32(
+        compare_a, 2, compare_b, 3, equal_output, 6,
+        output_strides, a_strides, b_strides, 2, 0) == 1);
+    CHECK(metal_graph_compare_i32(
+        compare_a, 2, compare_b, 3, ge_output, 6,
+        output_strides, a_strides, b_strides, 2, 1) == 1);
+    CHECK(metal_graph_not_i32(equal_output, not_output, 6) == 1);
+    CHECK(metal_graph_clip_i32(
+        clip_input, clip_output, 4, 0, 7) == 1);
+    CHECK(metal_graph_cast_typed(
+        cast_i32, VX_DTYPE_I32, cast_f32, VX_DTYPE_F32, 4) == 1);
+    CHECK(metal_graph_cast_typed(
+        cast_float_input, VX_DTYPE_F32,
+        cast_i32_output, VX_DTYPE_I32, 13) == 1);
+    CHECK(metal_graph_copy_32(copy_input, copy_output, 4) == 1);
+    CHECK(metal_graph_where_32(
+        where_condition, where_a, where_b, where_output, 4) == 1);
+    CHECK(metal_graph_argmax_f32(
+        argmax_input, argmax_output, 2u, 3u, 2u) == 1);
+    CHECK(metal_graph_concat_32(
+        concat_inputs, concat_sizes, concat_axes, 2,
+        concat_output, 3, 2) == 1);
+    CHECK(metal_graph_end_forward() == 0);
+
+    CHECK(metal_graph_sync_host(
+        equal_output, sizeof(equal_output), 0) == 1);
+    CHECK(metal_graph_sync_host(ge_output, sizeof(ge_output), 0) == 1);
+    CHECK(metal_graph_sync_host(not_output, sizeof(not_output), 0) == 1);
+    CHECK(metal_graph_sync_host(clip_output, sizeof(clip_output), 0) == 1);
+    CHECK(metal_graph_sync_host(cast_f32, sizeof(cast_f32), 0) == 1);
+    CHECK(metal_graph_sync_host(
+        cast_i32_output, sizeof(cast_i32_output), 0) == 1);
+    CHECK(metal_graph_sync_host(copy_output, sizeof(copy_output), 0) == 1);
+    CHECK(metal_graph_sync_host(where_output, sizeof(where_output), 0) == 1);
+    CHECK(metal_graph_sync_host(
+        argmax_output, sizeof(argmax_output), 0) == 1);
+    CHECK(metal_graph_sync_host(
+        concat_output, sizeof(concat_output), 0) == 1);
+    CHECK(memcmp(equal_output, expected_equal, sizeof(equal_output)) == 0);
+    CHECK(memcmp(ge_output, expected_ge, sizeof(ge_output)) == 0);
+    CHECK(memcmp(not_output, expected_not, sizeof(not_output)) == 0);
+    CHECK(memcmp(clip_output, expected_clip, sizeof(clip_output)) == 0);
+    CHECK(memcmp(cast_f32, expected_cast_f32, sizeof(cast_f32)) == 0);
+    CHECK(memcmp(
+        cast_i32_output, expected_cast_i32,
+        sizeof(cast_i32_output)) == 0);
+    CHECK(memcmp(copy_output, copy_input, sizeof(copy_output)) == 0);
+    CHECK(memcmp(where_output, expected_where, sizeof(where_output)) == 0);
+    CHECK(memcmp(
+        argmax_output, expected_argmax, sizeof(argmax_output)) == 0);
+    CHECK(memcmp(
+        concat_output, expected_concat, sizeof(concat_output)) == 0);
+
+    CHECK(metal_graph_not_i32(equal_output, equal_output, 6) == 0);
+    CHECK(metal_graph_clip_i32(
+        clip_input, clip_output, 4, 8, 7) == 0);
+    CHECK(metal_graph_cast_typed(
+        cast_i32, VX_DTYPE_I32,
+        cast_i32_output, VX_DTYPE_U8, 4) == 0);
+    CHECK(metal_graph_argmax_f32(
+        argmax_input, argmax_output, 2u, 0u, 2u) == 0);
+    metal_graph_reset();
+    return 0;
+}
+
+static int test_qbatch_and_typed_transpose(void) {
+    const int a_shape[4] = {2, 1, 2, 2};
+    const int b_shape[3] = {3, 2, 2};
+    const int output_shape[4] = {2, 3, 2, 2};
+    const int invalid_output_shape[4] = {2, 2, 2, 2};
+    const uint8_t a[8] = {
+        129, 130, 131, 132,
+        127, 128, 130, 126,
+    };
+    const int8_t b[12] = {
+        0, -1, -1, 0,
+        1, 0, -2, 1,
+        -1, -2, 2, 0,
+    };
+    const int8_t expected_qbatch[24] = {
+        4, 4, 4, 5,
+        3, 6, 4, 8,
+        6, 4, 9, 4,
+        2, 3, 4, 2,
+        2, 2, 6, 2,
+        3, 4, 0, 1,
+    };
+    int8_t qbatch_output[24] = {0};
+    const uint32_t transpose_shape[4] = {1u, 2u, 2u, 3u};
+    const uint32_t transpose_permutation[4] = {0u, 2u, 3u, 1u};
+    const uint32_t transpose_duplicate[4] = {0u, 2u, 2u, 1u};
+    const uint8_t transpose_u8_input[12] = {
+        117, 118, 119, 120, 121, 122,
+        123, 124, 125, 126, 127, 128,
+    };
+    const uint8_t transpose_u8_expected[12] = {
+        117, 123, 118, 124, 119, 125,
+        120, 126, 121, 127, 122, 128,
+    };
+    const int8_t transpose_i8_input[12] = {
+        -6, -5, -4, -3, -2, -1,
+        0, 1, 2, 3, 4, 5,
+    };
+    const int8_t transpose_i8_expected[12] = {
+        -6, 0, -5, 1, -4, 2,
+        -3, 3, -2, 4, -1, 5,
+    };
+    uint8_t transpose_u8_output[12] = {0};
+    int8_t transpose_i8_output[12] = {0};
+
+    metal_graph_reset();
+    metal_graph_begin_forward();
+    CHECK(metal_graph_qbatch_matmul_i8u8(
+        a, a_shape, 4, 0.5f, 128, VX_DTYPE_U8,
+        b, b_shape, 3, 0.25f, -1, VX_DTYPE_I8,
+        qbatch_output, invalid_output_shape, 4,
+        0.25f, 3, VX_DTYPE_I8) == 0);
+    CHECK(metal_graph_transpose_i8u8(
+        transpose_u8_input, transpose_u8_output, transpose_shape,
+        transpose_duplicate, 4u, 12u, 0.125f, 123,
+        0.125f, 123, VX_DTYPE_U8, VX_DTYPE_U8) == 0);
+    CHECK(metal_graph_transpose_i8u8(
+        transpose_u8_input, transpose_u8_output, transpose_shape,
+        transpose_permutation, 4u, 12u, 0.125f, 123,
+        0.25f, 123, VX_DTYPE_U8, VX_DTYPE_U8) == 0);
+    CHECK(metal_graph_transpose_i8u8(
+        transpose_u8_output, transpose_u8_output, transpose_shape,
+        transpose_permutation, 4u, 12u, 0.125f, 123,
+        0.125f, 123, VX_DTYPE_U8, VX_DTYPE_U8) == 0);
+    CHECK(metal_graph_qbatch_matmul_i8u8(
+        a, a_shape, 4, 0.5f, 128, VX_DTYPE_U8,
+        b, b_shape, 3, 0.25f, -1, VX_DTYPE_I8,
+        qbatch_output, output_shape, 4,
+        0.25f, 3, VX_DTYPE_I8) == 1);
+    CHECK(metal_graph_transpose_i8u8(
+        transpose_u8_input, transpose_u8_output, transpose_shape,
+        transpose_permutation, 4u, 12u, 0.125f, 123,
+        0.125f, 123, VX_DTYPE_U8, VX_DTYPE_U8) == 1);
+    CHECK(metal_graph_transpose_i8u8(
+        transpose_i8_input, transpose_i8_output, transpose_shape,
+        transpose_permutation, 4u, 12u, 0.25f, -3,
+        0.25f, -3, VX_DTYPE_I8, VX_DTYPE_I8) == 1);
+    CHECK(metal_graph_end_forward() == 0);
+
+    CHECK(metal_graph_sync_host(
+        qbatch_output, sizeof(qbatch_output), 0) == 1);
+    CHECK(metal_graph_sync_host(
+        transpose_u8_output, sizeof(transpose_u8_output), 0) == 1);
+    CHECK(metal_graph_sync_host(
+        transpose_i8_output, sizeof(transpose_i8_output), 0) == 1);
+    CHECK(memcmp(
+        qbatch_output, expected_qbatch, sizeof(qbatch_output)) == 0);
+    CHECK(memcmp(
+        transpose_u8_output, transpose_u8_expected,
+        sizeof(transpose_u8_output)) == 0);
+    CHECK(memcmp(
+        transpose_i8_output, transpose_i8_expected,
+        sizeof(transpose_i8_output)) == 0);
+    metal_graph_reset();
     return 0;
 }
 
@@ -169,7 +511,8 @@ static int test_tiled_qlinear_i8u8_tails(void) {
     metal_graph_begin_forward();
     CHECK(metal_graph_qlinear_i8u8(input, weight, scales, zero_points, bias, output,
                                    ROWS, D_IN, D_OUT, 1.0f, 0, 1.0f, 0,
-                                   2u, 2u, 2u) == 1);
+                                   VX_DTYPE_I8, VX_DTYPE_I8,
+                                   VX_DTYPE_I8) == 1);
     CHECK(metal_graph_end_forward() == 0);
     CHECK(metal_graph_sync_host(output, sizeof(output), 0) == 1);
     CHECK(memcmp(output, expected, sizeof(output)) == 0);
@@ -260,21 +603,24 @@ static int test_qembedding_i8u8_packed_gather(void) {
     metal_graph_reset();
     metal_graph_begin_forward();
     CHECK(metal_graph_qembedding_i8u8(ids, i8_table, scales, i8_zero_points, output_u8,
-                                      3u, 3u, 3u, 0.25f, 128, 2u, 3u) == 1);
+                                      3u, 3u, 3u, 0.25f, 128,
+                                      VX_DTYPE_I8, VX_DTYPE_U8) == 1);
     CHECK(metal_graph_end_forward() == 0);
     CHECK(metal_graph_sync_host(output_u8, sizeof(output_u8), 0) == 1);
     for (int index = 0; index < 9; index++) CHECK(output_u8[index] == expected_u8[index]);
 
     metal_graph_begin_forward();
     CHECK(metal_graph_qembedding_i8u8(ids, u8_table, scales, u8_zero_points, output_i8,
-                                      3u, 3u, 3u, 0.25f, -3, 3u, 2u) == 1);
+                                      3u, 3u, 3u, 0.25f, -3,
+                                      VX_DTYPE_U8, VX_DTYPE_I8) == 1);
     CHECK(metal_graph_end_forward() == 0);
     CHECK(metal_graph_sync_host(output_i8, sizeof(output_i8), 0) == 1);
     for (int index = 0; index < 9; index++) CHECK(output_i8[index] == expected_i8[index]);
 
     memset(output_u8, 0x5a, sizeof(output_u8));
     CHECK(metal_graph_qembedding_i8u8(invalid_ids, i8_table, scales, i8_zero_points,
-                                      output_u8, 3u, 3u, 3u, 0.25f, 128, 2u, 3u) == 0);
+                                      output_u8, 3u, 3u, 3u, 0.25f, 128,
+                                      VX_DTYPE_I8, VX_DTYPE_U8) == 0);
     for (int index = 0; index < 9; index++) CHECK(output_u8[index] == 0x5a);
     metal_graph_reset();
     return 0;
@@ -295,15 +641,20 @@ static int test_qsilu_i8u8_packed_chain(void) {
     metal_graph_reset();
     metal_graph_begin_forward();
     CHECK(metal_graph_qsilu_i8u8(input_i8, from_i8_i8, 5u,
-                                  0.5f, 0, 0.25f, -3, 2u, 2u) == 1);
+                                  0.5f, 0, 0.25f, -3,
+                                  VX_DTYPE_I8, VX_DTYPE_I8) == 1);
     CHECK(metal_graph_qsilu_i8u8(input_i8, from_i8_u8, 5u,
-                                  0.5f, 0, 0.25f, 128, 2u, 3u) == 1);
+                                  0.5f, 0, 0.25f, 128,
+                                  VX_DTYPE_I8, VX_DTYPE_U8) == 1);
     CHECK(metal_graph_qsilu_i8u8(input_u8, from_u8_i8, 5u,
-                                  0.5f, 128, 0.25f, -3, 3u, 2u) == 1);
+                                  0.5f, 128, 0.25f, -3,
+                                  VX_DTYPE_U8, VX_DTYPE_I8) == 1);
     CHECK(metal_graph_qsilu_i8u8(input_u8, from_u8_u8, 5u,
-                                  0.5f, 128, 0.25f, 128, 3u, 3u) == 1);
+                                  0.5f, 128, 0.25f, 128,
+                                  VX_DTYPE_U8, VX_DTYPE_U8) == 1);
     CHECK(metal_graph_qsilu_i8u8(from_i8_u8, chained, 5u,
-                                  0.25f, 128, 0.125f, -4, 3u, 2u) == 1);
+                                  0.25f, 128, 0.125f, -4,
+                                  VX_DTYPE_U8, VX_DTYPE_I8) == 1);
     CHECK(metal_graph_end_forward() == 0);
     CHECK(metal_graph_sync_host(from_i8_i8, sizeof(from_i8_i8), 0) == 1);
     CHECK(metal_graph_sync_host(from_i8_u8, sizeof(from_i8_u8), 0) == 1);
@@ -319,9 +670,11 @@ static int test_qsilu_i8u8_packed_chain(void) {
         CHECK(memcmp(chained, expected_chained, sizeof(expected_chained)) == 0);
     }
     CHECK(metal_graph_qsilu_i8u8(input_i8, from_i8_i8, 0u,
-                                  0.5f, 0, 0.25f, -3, 2u, 2u) == 0);
+                                  0.5f, 0, 0.25f, -3,
+                                  VX_DTYPE_I8, VX_DTYPE_I8) == 0);
     CHECK(metal_graph_qsilu_i8u8(alias, alias, 5u,
-                                  0.5f, 0, 0.25f, -3, 2u, 2u) == 0);
+                                  0.5f, 0, 0.25f, -3,
+                                  VX_DTYPE_I8, VX_DTYPE_I8) == 0);
     metal_graph_reset();
     return 0;
 }
@@ -344,15 +697,20 @@ static int test_qgelu_i8u8_packed_chain(void) {
     metal_graph_reset();
     metal_graph_begin_forward();
     CHECK(metal_graph_qgelu_i8u8(input_i8, from_i8_i8, 5u,
-                                  0.5f, 0, 0.125f, -3, 2u, 2u) == 1);
+                                  0.5f, 0, 0.125f, -3,
+                                  VX_DTYPE_I8, VX_DTYPE_I8) == 1);
     CHECK(metal_graph_qgelu_i8u8(input_i8, from_i8_u8, 5u,
-                                  0.5f, 0, 0.125f, 128, 2u, 3u) == 1);
+                                  0.5f, 0, 0.125f, 128,
+                                  VX_DTYPE_I8, VX_DTYPE_U8) == 1);
     CHECK(metal_graph_qgelu_i8u8(input_u8, from_u8_i8, 5u,
-                                  0.5f, 128, 0.125f, -3, 3u, 2u) == 1);
+                                  0.5f, 128, 0.125f, -3,
+                                  VX_DTYPE_U8, VX_DTYPE_I8) == 1);
     CHECK(metal_graph_qgelu_i8u8(input_u8, from_u8_u8, 5u,
-                                  0.5f, 128, 0.125f, 128, 3u, 3u) == 1);
+                                  0.5f, 128, 0.125f, 128,
+                                  VX_DTYPE_U8, VX_DTYPE_U8) == 1);
     CHECK(metal_graph_qgelu_i8u8(from_i8_u8, chained, 5u,
-                                  0.125f, 128, 0.125f, -4, 3u, 2u) == 1);
+                                  0.125f, 128, 0.125f, -4,
+                                  VX_DTYPE_U8, VX_DTYPE_I8) == 1);
     CHECK(metal_graph_end_forward() == 0);
     CHECK(metal_graph_sync_host(from_i8_i8, sizeof(from_i8_i8), 0) == 1);
     CHECK(metal_graph_sync_host(from_i8_u8, sizeof(from_i8_u8), 0) == 1);
@@ -368,9 +726,11 @@ static int test_qgelu_i8u8_packed_chain(void) {
         CHECK(memcmp(chained, expected_chained, sizeof(expected_chained)) == 0);
     }
     CHECK(metal_graph_qgelu_i8u8(input_i8, from_i8_i8, 0u,
-                                  0.5f, 0, 0.125f, -3, 2u, 2u) == 0);
+                                  0.5f, 0, 0.125f, -3,
+                                  VX_DTYPE_I8, VX_DTYPE_I8) == 0);
     CHECK(metal_graph_qgelu_i8u8(alias, alias, 5u,
-                                  0.5f, 0, 0.125f, -3, 2u, 2u) == 0);
+                                  0.5f, 0, 0.125f, -3,
+                                  VX_DTYPE_I8, VX_DTYPE_I8) == 0);
     metal_graph_reset();
     return 0;
 }
@@ -413,25 +773,32 @@ static int test_qgroupnorm_i8u8_packed_chain(void) {
     metal_graph_begin_forward();
     CHECK(metal_graph_qgroupnorm_i8u8(input_i8, gamma, beta, from_i8_i8,
                                        1u, 1u, 1u, 3u, 1u, 0.5f, -1,
-                                       0.125f, -3, 1.0e-5f, 2u, 2u) == 1);
+                                       0.125f, -3, 1.0e-5f,
+                                       VX_DTYPE_I8, VX_DTYPE_I8) == 1);
     CHECK(metal_graph_qgroupnorm_i8u8(input_i8, gamma, beta, from_i8_u8,
                                        1u, 1u, 1u, 3u, 1u, 0.5f, -1,
-                                       0.125f, 128, 1.0e-5f, 2u, 3u) == 1);
+                                       0.125f, 128, 1.0e-5f,
+                                       VX_DTYPE_I8, VX_DTYPE_U8) == 1);
     CHECK(metal_graph_qgroupnorm_i8u8(input_u8, gamma, beta, from_u8_i8,
                                        1u, 1u, 1u, 3u, 1u, 0.5f, 127,
-                                       0.125f, -3, 1.0e-5f, 3u, 2u) == 1);
+                                       0.125f, -3, 1.0e-5f,
+                                       VX_DTYPE_U8, VX_DTYPE_I8) == 1);
     CHECK(metal_graph_qgroupnorm_i8u8(input_u8, gamma, beta, from_u8_u8,
                                        1u, 1u, 1u, 3u, 1u, 0.5f, 127,
-                                       0.125f, 128, 1.0e-5f, 3u, 3u) == 1);
+                                       0.125f, 128, 1.0e-5f,
+                                       VX_DTYPE_U8, VX_DTYPE_U8) == 1);
     CHECK(metal_graph_qgroupnorm_i8u8(from_i8_u8, zero_gamma, beta, chained,
                                        1u, 1u, 1u, 3u, 1u, 0.125f, 128,
-                                       0.125f, -4, 1.0e-5f, 3u, 2u) == 1);
+                                       0.125f, -4, 1.0e-5f,
+                                       VX_DTYPE_U8, VX_DTYPE_I8) == 1);
     CHECK(metal_graph_qgroupnorm_i8u8(boundary_input, boundary_gamma, boundary_beta,
                                        boundary_output, 3u, 1u, 1u, 6u, 2u,
-                                       0.25f, -1, 0.125f, -3, 1.0e-5f, 2u, 2u) == 1);
+                                       0.25f, -1, 0.125f, -3, 1.0e-5f,
+                                       VX_DTYPE_I8, VX_DTYPE_I8) == 1);
     CHECK(metal_graph_qgroupnorm_i8u8(high_input, high_gamma, high_beta, high_output,
                                        3u, 57u, 1u, 6u, 2u, 0.5f, 17,
-                                       0.25f, 128, 1.0e-5f, 3u, 3u) == 1);
+                                       0.25f, 128, 1.0e-5f,
+                                       VX_DTYPE_U8, VX_DTYPE_U8) == 1);
     CHECK(metal_graph_end_forward() == 0);
     CHECK(metal_graph_sync_host(from_i8_i8, sizeof(from_i8_i8), 0) == 1);
     CHECK(metal_graph_sync_host(from_i8_u8, sizeof(from_i8_u8), 0) == 1);
@@ -455,10 +822,12 @@ static int test_qgroupnorm_i8u8_packed_chain(void) {
     }
     CHECK(metal_graph_qgroupnorm_i8u8(input_i8, gamma, beta, from_i8_i8,
                                        1u, 1u, 1u, 3u, 0u, 0.5f, -1,
-                                       0.125f, -3, 1.0e-5f, 2u, 2u) == 0);
+                                       0.125f, -3, 1.0e-5f,
+                                       VX_DTYPE_I8, VX_DTYPE_I8) == 0);
     CHECK(metal_graph_qgroupnorm_i8u8(alias, gamma, beta, alias,
                                        1u, 1u, 1u, 3u, 1u, 0.5f, -1,
-                                       0.125f, -3, 1.0e-5f, 2u, 2u) == 0);
+                                       0.125f, -3, 1.0e-5f,
+                                       VX_DTYPE_I8, VX_DTYPE_I8) == 0);
     metal_graph_reset();
     return 0;
 }
@@ -496,22 +865,22 @@ static int test_qlayernorm_i8u8_packed_chain(void) {
     metal_graph_begin_forward();
     CHECK(metal_graph_qlayernorm_i8u8(input_i8, gamma, beta, from_i8_i8,
                                        2u, 3u, 0.5f, -1, 0.125f, -3,
-                                       1.0e-5f, 2u, 2u) == 1);
+                                       1.0e-5f, VX_DTYPE_I8, VX_DTYPE_I8) == 1);
     CHECK(metal_graph_qlayernorm_i8u8(input_i8, gamma, beta, from_i8_u8,
                                        2u, 3u, 0.5f, -1, 0.125f, 128,
-                                       1.0e-5f, 2u, 3u) == 1);
+                                       1.0e-5f, VX_DTYPE_I8, VX_DTYPE_U8) == 1);
     CHECK(metal_graph_qlayernorm_i8u8(input_u8, gamma, beta, from_u8_i8,
                                        2u, 3u, 0.5f, 127, 0.125f, -3,
-                                       1.0e-5f, 3u, 2u) == 1);
+                                       1.0e-5f, VX_DTYPE_U8, VX_DTYPE_I8) == 1);
     CHECK(metal_graph_qlayernorm_i8u8(input_u8, gamma, beta, from_u8_u8,
                                        2u, 3u, 0.5f, 127, 0.125f, 128,
-                                       1.0e-5f, 3u, 3u) == 1);
+                                       1.0e-5f, VX_DTYPE_U8, VX_DTYPE_U8) == 1);
     CHECK(metal_graph_qlayernorm_i8u8(from_i8_u8, zero_gamma, beta, chained,
                                        2u, 3u, 0.125f, 128, 0.125f, -4,
-                                       1.0e-5f, 3u, 2u) == 1);
+                                       1.0e-5f, VX_DTYPE_U8, VX_DTYPE_I8) == 1);
     CHECK(metal_graph_qlayernorm_i8u8(high_input, high_gamma, high_beta, high_output,
                                        2u, high_d_model, 0.5f, 17, 0.25f, 128,
-                                       1.0e-5f, 3u, 3u) == 1);
+                                       1.0e-5f, VX_DTYPE_U8, VX_DTYPE_U8) == 1);
     CHECK(metal_graph_end_forward() == 0);
     CHECK(metal_graph_sync_host(from_i8_i8, sizeof(from_i8_i8), 0) == 1);
     CHECK(metal_graph_sync_host(from_i8_u8, sizeof(from_i8_u8), 0) == 1);
@@ -531,10 +900,10 @@ static int test_qlayernorm_i8u8_packed_chain(void) {
         CHECK(high_output[index] == (uint8_t)(index & 1 ? 132 : 124));
     CHECK(metal_graph_qlayernorm_i8u8(input_i8, gamma, beta, from_i8_i8,
                                        2u, 0u, 0.5f, -1, 0.125f, -3,
-                                       1.0e-5f, 2u, 2u) == 0);
+                                       1.0e-5f, VX_DTYPE_I8, VX_DTYPE_I8) == 0);
     CHECK(metal_graph_qlayernorm_i8u8(alias, gamma, beta, alias,
                                        2u, 3u, 0.5f, -1, 0.125f, -3,
-                                       1.0e-5f, 2u, 2u) == 0);
+                                       1.0e-5f, VX_DTYPE_I8, VX_DTYPE_I8) == 0);
     metal_graph_reset();
     return 0;
 }
@@ -571,17 +940,24 @@ static int test_qsdpa_i8u8_packed_chain(void) {
     metal_graph_begin_forward();
     CHECK(metal_graph_qsdpa_i8u8(q_i8, k_i8, v_i8, NULL, first, 1u, 2u, 2u,
                                   4u, 1u, 0.25f, -1, 0.25f, -1, 0.25f, -1,
-                                  0.25f, 128, 0.5f, 2u, 2u, 2u, 3u, 0u, 0u) == 1);
+                                  0.25f, 128, 0.5f,
+                                  VX_DTYPE_I8, VX_DTYPE_I8, VX_DTYPE_I8,
+                                  VX_DTYPE_U8, 0u, 0u) == 1);
     CHECK(metal_graph_qsdpa_i8u8(first, k_i8, v_i8, NULL, second, 1u, 2u, 2u,
                                   4u, 1u, 0.25f, 128, 0.25f, -1, 0.25f, -1,
-                                  0.25f, 0, 0.5f, 3u, 2u, 2u, 2u, 0u, 0u) == 1);
+                                  0.25f, 0, 0.5f,
+                                  VX_DTYPE_U8, VX_DTYPE_I8, VX_DTYPE_I8,
+                                  VX_DTYPE_I8, 0u, 0u) == 1);
     CHECK(metal_graph_qsdpa_i8u8(q_u8, k_u8, v_u8, mask_none, all_masked,
                                   1u, 1u, 2u, 4u, 1u, 0.25f, 128, 0.5f, 120,
-                                  0.25f, 130, 0.25f, 127, 0.5f, 3u, 3u, 3u,
-                                  3u, 0u, 1u) == 1);
+                                  0.25f, 130, 0.25f, 127, 0.5f,
+                                  VX_DTYPE_U8, VX_DTYPE_U8, VX_DTYPE_U8,
+                                  VX_DTYPE_U8, 0u, 1u) == 1);
     CHECK(metal_graph_qsdpa_i8u8(q64, k64, v64, NULL, out64, 1u, 1u, 1u,
                                   head_dim, 1u, 0.25f, 0, 0.25f, 0, 0.25f, 0,
-                                  0.25f, 0, 1.0f, 2u, 2u, 2u, 2u, 0u, 0u) == 1);
+                                  0.25f, 0, 1.0f,
+                                  VX_DTYPE_I8, VX_DTYPE_I8, VX_DTYPE_I8,
+                                  VX_DTYPE_I8, 0u, 0u) == 1);
     CHECK(metal_graph_end_forward() == 0);
     CHECK(metal_graph_sync_host(first, sizeof(first), 0) == 1);
     CHECK(metal_graph_sync_host(second, sizeof(second), 0) == 1);
@@ -593,7 +969,9 @@ static int test_qsdpa_i8u8_packed_chain(void) {
     CHECK(memcmp(out64, v64, sizeof(out64)) == 0);
     CHECK(metal_graph_qsdpa_i8u8(alias, k_i8, v_i8, NULL, alias, 1u, 2u, 2u,
                                   4u, 1u, 0.25f, -1, 0.25f, -1, 0.25f, -1,
-                                  0.25f, 0, 0.5f, 2u, 2u, 2u, 2u, 0u, 0u) == 0);
+                                  0.25f, 0, 0.5f,
+                                  VX_DTYPE_I8, VX_DTYPE_I8, VX_DTYPE_I8,
+                                  VX_DTYPE_I8, 0u, 0u) == 0);
     CHECK(memcmp(alias, alias_before, sizeof(alias)) == 0);
     metal_graph_reset();
     return 0;
@@ -625,16 +1003,20 @@ static int test_qargmax_i8u8_raw(void) {
     memcpy(alias_before, alias.bytes, sizeof(alias_before));
     metal_graph_reset();
     metal_graph_begin_forward();
-    CHECK(metal_graph_qargmax_i8u8(input_i8, output_i8, 2u, 3u, 2u, 2u) == 1);
-    CHECK(metal_graph_qargmax_i8u8(input_u8, output_u8, 1u, 3u, 2u, 3u) == 1);
+    CHECK(metal_graph_qargmax_i8u8(input_i8, output_i8, 2u, 3u, 2u,
+                                   VX_DTYPE_I8) == 1);
+    CHECK(metal_graph_qargmax_i8u8(input_u8, output_u8, 1u, 3u, 2u,
+                                   VX_DTYPE_U8) == 1);
     CHECK(metal_graph_end_forward() == 0);
     CHECK(metal_graph_sync_host(output_i8, sizeof(output_i8), 0) == 1);
     CHECK(metal_graph_sync_host(output_u8, sizeof(output_u8), 0) == 1);
     CHECK(memcmp(output_i8, expected_i8, sizeof(output_i8)) == 0);
     CHECK(memcmp(output_u8, expected_u8, sizeof(output_u8)) == 0);
-    CHECK(metal_graph_qargmax_i8u8(alias.bytes, alias.i32, 1u, 3u, 2u, 2u) == 0);
+    CHECK(metal_graph_qargmax_i8u8(alias.bytes, alias.i32, 1u, 3u, 2u,
+                                   VX_DTYPE_I8) == 0);
     CHECK(memcmp(alias.bytes, alias_before, sizeof(alias.bytes)) == 0);
-    CHECK(metal_graph_qargmax_i8u8(input_i8, sentinel, 1u, 0u, 2u, 2u) == 0);
+    CHECK(metal_graph_qargmax_i8u8(input_i8, sentinel, 1u, 0u, 2u,
+                                   VX_DTYPE_I8) == 0);
     CHECK(memcmp(sentinel, sentinel_before, sizeof(sentinel)) == 0);
     metal_graph_reset();
     return 0;
@@ -675,10 +1057,10 @@ static int test_qmaskedmean_i8u8_packed(void) {
     metal_graph_begin_forward();
     CHECK(metal_graph_qmaskedmean_i8u8(input_i8, mask_i8, output_i8,
                                         2u, 3u, 4u, 0.25f, -3, 0.5f, 5,
-                                        2u, 2u) == 1);
+                                        VX_DTYPE_I8, VX_DTYPE_I8) == 1);
     CHECK(metal_graph_qmaskedmean_i8u8(input_u8, mask_u8, output_u8,
                                         1u, 3u, 2u, 0.25f, 128, 0.25f, 130,
-                                        3u, 3u) == 1);
+                                        VX_DTYPE_U8, VX_DTYPE_U8) == 1);
     CHECK(metal_graph_end_forward() == 0);
     CHECK(metal_graph_sync_host(output_i8, sizeof(output_i8), 0) == 1);
     CHECK(metal_graph_sync_host(output_u8, sizeof(output_u8), 0) == 1);
@@ -686,11 +1068,12 @@ static int test_qmaskedmean_i8u8_packed(void) {
     CHECK(memcmp(output_u8, expected_u8, sizeof(output_u8)) == 0);
     CHECK(metal_graph_qmaskedmean_i8u8(alias.input, mask_i8, alias.bytes,
                                         2u, 3u, 4u, 0.25f, -3, 0.5f, 5,
-                                        2u, 2u) == 0);
+                                        VX_DTYPE_I8, VX_DTYPE_I8) == 0);
     CHECK(memcmp(alias.bytes, alias_before, sizeof(alias.bytes)) == 0);
     CHECK(metal_graph_qmaskedmean_i8u8(input_i8, mask_alias.mask,
                                         mask_alias.bytes, 2u, 3u, 4u,
-                                        0.25f, -3, 0.5f, 5, 2u, 2u) == 0);
+                                        0.25f, -3, 0.5f, 5,
+                                        VX_DTYPE_I8, VX_DTYPE_I8) == 0);
     CHECK(memcmp(mask_alias.bytes, mask_before, sizeof(mask_alias.bytes)) == 0);
     metal_graph_reset();
     return 0;
@@ -993,9 +1376,129 @@ static int test_device_resident_activation_tape(void) {
     return 0;
 }
 
+typedef struct {
+    VxEngineState* state;
+    float base;
+    int ok;
+} MetalIsolationThread;
+
+static void* run_metal_isolation_thread(void* opaque) {
+    MetalIsolationThread* probe = (MetalIsolationThread*)opaque;
+    VxEngineStateScope scope = vx_engine_state_scope_enter(probe->state);
+    probe->ok = 1;
+    for (int iteration = 0; iteration < 32; iteration++) {
+        float input[4];
+        float output[4] = {-1.0f, -1.0f, -1.0f, -1.0f};
+        for (int index = 0; index < 4; index++)
+            input[index] = probe->base + (float)(iteration * 4 + index);
+        metal_graph_begin_forward();
+        int copied = metal_graph_copy_f32(input, output, 4);
+        int ended = metal_graph_end_forward();
+        int synced = metal_graph_sync_host(output, sizeof(output), 0);
+        if (!copied || ended != 0 || !synced ||
+            memcmp(input, output, sizeof(input)) != 0) {
+            probe->ok = 0;
+            break;
+        }
+        metal_graph_reset();
+    }
+    vx_engine_state_scope_leave(scope);
+    return NULL;
+}
+
+static int test_engine_state_isolation(VxEngineState* first) {
+    VxEngineState* second =
+        (VxEngineState*)calloc(1, sizeof(*second));
+    CHECK(second != NULL);
+    CHECK(vx_engine_state_init(second) == 0);
+
+    float shared_input[4] = {1.0f, 2.0f, 3.0f, 4.0f};
+    float shared_output[4] = {0};
+    metal_graph_begin_forward();
+    CHECK(metal_graph_copy_f32(shared_input, shared_output, 4) == 1);
+    CHECK(metal_graph_end_forward() == 0);
+
+    VxEngineStateScope second_scope = vx_engine_state_scope_enter(second);
+    CHECK(metal_init() == 0);
+    shared_input[0] = 9.0f;
+    shared_input[1] = 8.0f;
+    shared_input[2] = 7.0f;
+    shared_input[3] = 6.0f;
+    metal_graph_begin_forward();
+    CHECK(metal_graph_copy_f32(shared_input, shared_output, 4) == 1);
+    CHECK(metal_graph_end_forward() == 0);
+    vx_engine_state_scope_leave(second_scope);
+
+    CHECK(metal_graph_sync_host(shared_output, sizeof(shared_output), 0) == 1);
+    const float first_expected[4] = {1.0f, 2.0f, 3.0f, 4.0f};
+    CHECK(memcmp(shared_output, first_expected, sizeof(shared_output)) == 0);
+    metal_graph_reset();
+
+    second_scope = vx_engine_state_scope_enter(second);
+    CHECK(metal_graph_sync_host(shared_output, sizeof(shared_output), 0) == 1);
+    const float second_expected[4] = {9.0f, 8.0f, 7.0f, 6.0f};
+    CHECK(memcmp(shared_output, second_expected, sizeof(shared_output)) == 0);
+    metal_graph_reset();
+    vx_engine_state_scope_leave(second_scope);
+
+    MetalIsolationThread first_probe = {first, 1000.0f, 0};
+    MetalIsolationThread second_probe = {second, -1000.0f, 0};
+    pthread_t first_thread;
+    pthread_t second_thread;
+    CHECK(pthread_create(&first_thread, NULL, run_metal_isolation_thread,
+                         &first_probe) == 0);
+    CHECK(pthread_create(&second_thread, NULL, run_metal_isolation_thread,
+                         &second_probe) == 0);
+    CHECK(pthread_join(first_thread, NULL) == 0);
+    CHECK(pthread_join(second_thread, NULL) == 0);
+    CHECK(first_probe.ok && second_probe.ok);
+
+    second_scope = vx_engine_state_scope_enter(second);
+    metal_cleanup();
+    CHECK(metal_training_available() == 0);
+    vx_engine_state_scope_leave(second_scope);
+    vx_engine_state_deinit(second);
+    free(second);
+
+    VxEngineState* implicit =
+        (VxEngineState*)calloc(1, sizeof(*implicit));
+    CHECK(implicit != NULL);
+    CHECK(vx_engine_state_init(implicit) == 0);
+    VxEngineStateScope implicit_scope = vx_engine_state_scope_enter(implicit);
+    CHECK(metal_init() == 0);
+    vx_engine_state_scope_leave(implicit_scope);
+    /* The generic engine capsule teardown must release this device reference
+     * even when backend cleanup was not called explicitly. */
+    vx_engine_state_deinit(implicit);
+    free(implicit);
+
+    CHECK(metal_training_available() == 1);
+    float survivor_input[2] = {4.0f, 5.0f};
+    float survivor_output[2] = {0};
+    metal_graph_begin_forward();
+    CHECK(metal_graph_copy_f32(survivor_input, survivor_output, 2) == 1);
+    CHECK(metal_graph_end_forward() == 0);
+    CHECK(metal_graph_sync_host(survivor_output,
+                                sizeof(survivor_output), 0) == 1);
+    CHECK(memcmp(survivor_input, survivor_output,
+                 sizeof(survivor_input)) == 0);
+    metal_graph_reset();
+    return 0;
+}
+
 int main(void) {
+    VxEngineState* engine_state =
+        (VxEngineState*)calloc(1, sizeof(*engine_state));
+    CHECK(engine_state != NULL);
+    CHECK(vx_engine_state_init(engine_state) == 0);
+    VxEngineStateScope engine_scope =
+        vx_engine_state_scope_enter(engine_state);
     if (metal_init() != 0) {
         fprintf(stderr, "Metal unavailable; skipping native Metal training test\n");
+        metal_cleanup();
+        vx_engine_state_scope_leave(engine_scope);
+        vx_engine_state_deinit(engine_state);
+        free(engine_state);
         return 0;
     }
     CHECK(metal_training_available() == 1);
@@ -1018,6 +1521,9 @@ int main(void) {
 #ifdef VOLVOX_METAL_TESTING
     CHECK(test_graph_forward_command_batch() == 0);
 #endif
+    CHECK(test_graph_f32_shape_and_activation_closure() == 0);
+    CHECK(test_typed_control_graph_ops() == 0);
+    CHECK(test_qbatch_and_typed_transpose() == 0);
     CHECK(test_graph_linear_tails_and_fallback() == 0);
     CHECK(test_tiled_qlinear_i8u8_tails() == 0);
     CHECK(test_batched_attention_forward() == 0);
@@ -1034,7 +1540,12 @@ int main(void) {
     CHECK(test_activation_backward() == 0);
     CHECK(test_multi_entry_matmul_backward() == 0);
     CHECK(test_prelu_logsoftmax_split_backward() == 0);
+    CHECK(test_engine_state_isolation(engine_state) == 0);
     metal_cleanup();
+    CHECK(metal_training_available() == 0);
+    vx_engine_state_scope_leave(engine_scope);
+    vx_engine_state_deinit(engine_state);
+    free(engine_state);
     puts("metal training tests passed");
     return 0;
 }

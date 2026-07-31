@@ -44,6 +44,23 @@ export class GraphOperatorNormalizer {
     }
   }
 
+  /**
+   * Idempotent guard: ensure every MatMul/Linear/Gemm node carries a `wLayout`.
+   * The loader runs resolveMatMulLayouts, but graphs built programmatically via
+   * `Graph.addOp` (e.g. training graphs) skip that pass, leaving `wLayout` null.
+   * CPU/WASM matmul infer the layout from the weight shape when it is null, but the
+   * GPU path (GraphExecutor) checks `wLayout === 'din'` exactly — so an untagged node
+   * runs the wrong matmul on WebGPU. Called at the execution chokepoints (inference
+   * compile, training trainStep) so any graph is normalized once before it runs; the
+   * cheap `some(...)` guard makes it a no-op on already-tagged (loaded) graphs.
+   */
+  static ensureMatMulLayouts(graph) {
+    const isMM = (n) => n.opType === "MatMul" || n.opType === "Linear" || n.opType === "Gemm";
+    if (graph.nodes.some((n) => isMM(n) && n.wLayout == null)) {
+      this.resolveMatMulLayouts(graph);
+    }
+  }
+
 
   /**
    * Ordinary Conv kernels require float32 weights. QConv2D is deliberately

@@ -59,7 +59,7 @@ function qLayerNormGraph({
       name: 'out', shape: inputShape, dtype: outputDtype, quantization: outputQuantization,
     },
   }, params);
-  graph.outputNames = [out.name];
+  graph.setOutputs([out.name]);
   return { graph, inputValues: bytes(inputDtype, inputValues), input, weight, bias, out };
 }
 
@@ -83,7 +83,7 @@ function qLayerNormDynamicAffineGraph() {
       quantization: { scheme: 'per_tensor', scale: 0.125, zero_point: -3 },
     },
   }, {});
-  graph.outputNames = [out.name];
+  graph.setOutputs([out.name]);
   return { graph, inputValues, out };
 }
 

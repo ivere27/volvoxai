@@ -1,8 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
+import { Graph, Trainer, VolvoxAI } from '../ts/full.js';
 import { WebGPUAutograd } from '../ts/training/WebGPUAutograd.js';
-import { TrainingVolvoxAI } from '../ts/training/TrainingVolvoxAI.js';
 import { GraphExecutor } from '../ts/backends/GraphExecutor.js';
 import { _cpuDropout, dropoutContext, dropoutHash } from '../ts/ops/dropout.js';
 import { attentionProbabilityIndex } from '../ts/ops/attentionDropout.js';
@@ -121,24 +121,37 @@ test('Linear backward dispatches odd 16x16 gradient tiles and a 64-wide bias row
   trainer.dispose();
 });
 
-test('TrainingVolvoxAI prepares a WebGPUEngine wrapper before sharing its executor', async () => {
+test('full-profile Trainer owns WebGPU training and retains its Model handle', async () => {
   const device = mockDevice();
-  const inner = { gpuBuffers: new Map() };
-  let preparations = 0;
-  const wrapper = {
-    backendName: 'webgpu',
+  const graph = new Graph();
+  const input = graph.addInput('x', [1]);
+  const output = graph.addOp('Identity', { input }, {
+    out: { name: 'y', shape: [1] },
+  }).out;
+  graph.setOutputs(output);
+
+  const runtime = await VolvoxAI.createRuntime({ backends: ['cpu'] });
+  const model = runtime.createModel(graph);
+  const trainer = await VolvoxAI.createTrainer(model, {
+    backend: 'webgpu',
     device,
-    executor: inner,
-    async prepareForTraining() { preparations++; },
-  };
-  const runtime = new TrainingVolvoxAI();
-  const trainer = await runtime.createWebGPUTrainer({ nodes: [] }, { executor: wrapper });
-  assert.equal(preparations, 1);
-  assert.equal(trainer.executor, inner);
-  trainer.dispose();
+  });
+  assert.ok(trainer instanceof Trainer);
+  assert.equal(trainer.backend, 'webgpu');
+  assert.equal(Object.hasOwn(trainer, 'graph'), false);
+
+  let modelClosed = false;
+  const modelClose = model.close().then(() => { modelClosed = true; });
+  await Promise.resolve();
+  assert.equal(modelClosed, false, 'Trainer must retain its Model until Trainer.close()');
+  await trainer.close();
+  await modelClose;
+  assert.equal(modelClosed, true);
+  await trainer.close();
+  await runtime.close();
 });
 
-test('WebGPU inference compiles Dropout away and detaches it only when training starts', async () => {
+test('WebGPU inference compiles Dropout away while the Trainer owns its forward pipeline', async () => {
   const device = mockDevice();
   const input = tensor('dropout_input', [16], { isInput: true });
   const output = tensor('dropout_output', [16]);
@@ -151,16 +164,28 @@ test('WebGPU inference compiles Dropout away and detaches it only when training 
     adapters: null,
   };
   const executor = new GraphExecutor(device, graph, {
-    shaderLibrary: { getCopyShader() { return '@compute @workgroup_size(1) fn main() {}'; } },
+    shaderLibrary: {
+      getCopyShader() { return '@compute @workgroup_size(1) fn main() {}'; },
+      getCopy32Shader() { return '@compute @workgroup_size(1) fn main() {}'; },
+    },
   });
 
   await executor.compile();
   assert.equal(executor.pipelines.length, 0, 'inference must add no Dropout dispatch');
   assert.equal(executor.gpuBuffers.get(output.name), executor.gpuBuffers.get(input.name));
 
-  await executor.prepareForTraining();
-  assert.equal(executor.pipelines.length, 1, 'training needs one replaceable forward dispatch');
-  assert.notEqual(executor.gpuBuffers.get(output.name), executor.gpuBuffers.get(input.name));
+  assert.equal(executor.prepareForTraining, undefined,
+    'the inference executor exposes no training preparation');
+
+  const trainer = new WebGPUAutograd(device, graph);
+  await trainer._ensureForwardCompiled();
+  assert.equal(trainer.executor.pipelines.length, 1,
+    'the Trainer-owned executor compiles one replaceable Dropout dispatch');
+  assert.notEqual(
+    trainer.executor.gpuBuffers.get(output.name),
+    trainer.executor.gpuBuffers.get(input.name),
+  );
+  trainer.dispose();
   executor.dispose();
 });
 
@@ -615,8 +640,8 @@ test('trainStep rejects non-optimizer tensor update modes before GPU work', asyn
   };
   const trainer = new WebGPUAutograd(device, { nodes: [] }, executor);
   await assert.rejects(
-    () => trainer.trainStep({ targets: [0], trainableTensors: ['weight'], updateMode: 1 }),
-    /SGD\/AdamW/,
+    () => trainer.trainStep({ targets: [0], trainableTensors: ['weight'], updateMode: 2 }),
+    /SGD or AdamW/,
   );
   assert.equal(compiled, false);
   assert.equal(device.state.buffers.length, 0);

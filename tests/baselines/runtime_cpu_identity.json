@@ -1,0 +1,30 @@
+{
+  "schema": "volvoxai.runtime-latency-reference/v1",
+  "recordedAt": "2026-07-21T07:05:56Z",
+  "environment": {
+    "nodeMajor": 20,
+    "nodeVersion": "v20.11.1",
+    "platform": "linux",
+    "architecture": "x64",
+    "processor": "AMD Ryzen 5 5600U with Radeon Graphics"
+  },
+  "workload": {
+    "operation": "Identity",
+    "dtype": "float32",
+    "width": 65536,
+    "warmupExecutions": 10,
+    "measuredExecutions": 51
+  },
+  "latency": {
+    "medianMs": 0.25305800000001,
+    "maximumRegressionPercent": 5,
+    "recordingRuns": 5,
+    "runMediansMs": [
+      0.25381999999996196,
+      0.25305800000001,
+      0.2560240000000249,
+      0.2506040000000098,
+      0.24962199999998802
+    ]
+  }
+}

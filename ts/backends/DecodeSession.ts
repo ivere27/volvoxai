@@ -2,20 +2,26 @@ import type {
   BackendEngineLike,
   BackendExecutionOptions,
 } from './BackendEngine.js';
+import { decodeRowModes } from '../generated/volvoxaiEnums.js';
+import type { DecodeRowModeValue } from '../generated/volvoxaiEnums.js';
 
 /**
  * Backend-neutral stateful decode orchestration.
  *
  * A session owns one backend's retained intermediate cache between `seed()`
  * and `step()` calls. The execution result is intentionally passed through
- * unchanged: host backends return output typed arrays while WebGPU retains its
- * historical GPUBuffer result and `readBuffer()` API.
+ * unchanged: host backends return output typed arrays while WebGPU returns
+ * device-resident buffers with an explicit `readBuffer()` operation.
  */
 
-const ROW_MODES = new Set(['auto', 'required', 'disabled']);
-const ENGINE_DECODE_TAILS = new WeakMap<BackendEngineLike, Promise<unknown>>();
+const ROW_MODES = new Set<DecodeRowModeValue>(decodeRowModes);
+const ENGINE_DECODE_TAIL: unique symbol = Symbol('volvoxai.decodeOperationTail');
 
-export type DecodeRowMode = 'auto' | 'required' | 'disabled';
+type DecodeOperationOwner = BackendEngineLike & {
+  [ENGINE_DECODE_TAIL]?: Promise<unknown>;
+};
+
+export type DecodeRowMode = DecodeRowModeValue;
 export type DecodeExecutionMode =
   | 'incremental-row'
   | 'incremental-dependency'
@@ -91,16 +97,8 @@ export class DecodeSession {
       changedInputs = changedInputNames(changedInputs, [], 'default');
     }
 
-    /* API-v1 capabilities are authoritative. Compatibility aliases are only
-     * consulted for legacy engines that do not expose the capability object;
-     * otherwise a stale alias could opt an ordinary structural backend into a
-     * cache lifecycle it was never required to implement. */
-    const incremental = engine.capabilities == null
-      ? engine.supportsIncrementalExecution === true
-      : engine.capabilities.incrementalExecution === true;
-    const incrementalRows = engine.capabilities == null
-      ? engine.supportsIncrementalRows === true
-      : engine.capabilities.incrementalRows === true;
+    const incremental = engine.capabilities.incrementalExecution === true;
+    const incrementalRows = engine.capabilities.incrementalRows === true;
     if (requireIncremental && !incremental) {
       throw new Error(`Backend '${engine.backendName || engine.constructor?.name || 'unknown'}' does not support incremental execution.`);
     }
@@ -137,10 +135,11 @@ export class DecodeSession {
     /* One engine owns one retained-intermediate cache. Serialize every
      * session's state transition on that engine so async device submissions
      * cannot overlap and both claim the same cache generation. */
-    const engineTail = ENGINE_DECODE_TAILS.get(this.engine) ?? Promise.resolve();
+    const owner = this.engine as DecodeOperationOwner;
+    const engineTail = owner[ENGINE_DECODE_TAIL] ?? Promise.resolve();
     const pending = engineTail.then(operation, operation);
     const settled = pending.catch(() => undefined);
-    ENGINE_DECODE_TAILS.set(this.engine, settled);
+    owner[ENGINE_DECODE_TAIL] = settled;
     this._tail = settled;
     return pending;
   }

@@ -31,7 +31,7 @@ fn signed_byte(value : u32) -> i32 {
 
 fn typed_byte_value(word : u32, dtype : u32) -> i32 {
   let byte = word & 255u;
-  if (dtype == 2u) { return signed_byte(byte); }
+  if (dtype == 6u) { return signed_byte(byte); }
   return i32(byte);
 }
 
@@ -61,8 +61,8 @@ fn qadd_one(index : u32) -> u32 {
   if (index >= params.elements) { return 0u; }
   let av = f32(a_value(index) - params.a_zero_point) * params.a_scale;
   let bv = f32(b_value(index) - params.b_zero_point) * params.b_scale;
-  let minimum = select(0, -128, params.output_type == 2u);
-  let maximum = select(255, 127, params.output_type == 2u);
+  let minimum = select(0, -128, params.output_type == 6u);
+  let maximum = select(255, 127, params.output_type == 6u);
   let transformed = (av + bv) / params.output_scale + f32(params.output_zero_point);
   var quantized : i32;
   if (transformed != transformed) { quantized = params.output_zero_point; }

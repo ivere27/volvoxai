@@ -22,7 +22,7 @@ function qGroupNormGraph() {
       quantization: { scheme: 'per_tensor', scale: 0.125, zero_point: -3 },
     },
   }, { num_groups: 2, eps: 1e-5, data_layout: 'NHWC' });
-  graph.outputNames = [out.name];
+  graph.setOutputs([out.name]);
   return { graph, node: graph.nodes[0], input, out };
 }
 

@@ -29,8 +29,11 @@ interface AccumulationState {
   sums: GradientMap;
 }
 
+const ACCUMULATION_STATE: unique symbol = Symbol('volvoxai.gradientAccumulationState');
+
 interface AccumulationGraph {
   _pendingGradientAccumulation?: boolean;
+  [ACCUMULATION_STATE]?: AccumulationState;
 }
 
 export interface GradientAccumulationOptions {
@@ -48,7 +51,22 @@ export interface GradientAccumulationOptions {
   metrics?: AccumulatedLossMetric[];
 }
 
-const accumulationStates = new WeakMap<object, AccumulationState>();
+function accumulatedState(graph: object): AccumulationState | undefined {
+  return (graph as AccumulationGraph)[ACCUMULATION_STATE];
+}
+
+function retainAccumulatedState(graph: object, state: AccumulationState): void {
+  Object.defineProperty(graph, ACCUMULATION_STATE, {
+    configurable: true,
+    writable: true,
+    enumerable: false,
+    value: state,
+  });
+}
+
+function releaseAccumulatedState(graph: object): void {
+  delete (graph as AccumulationGraph)[ACCUMULATION_STATE];
+}
 
 function positiveInteger(name: string, value: number): number {
   if (!Number.isSafeInteger(value) || value <= 0) {
@@ -110,15 +128,15 @@ function accumulateLossMetrics(
 
 /** Number of already accumulated microbatches for the graph. */
 export function gradientAccumulationIndex(graph: object) {
-  return accumulationStates.get(graph)?.microbatches ?? 0;
+  return accumulatedState(graph)?.microbatches ?? 0;
 }
 
 export function hasPendingGradientAccumulation(graph: object) {
-  return accumulationStates.has(graph);
+  return accumulatedState(graph) != null;
 }
 
 export function getGradientAccumulationState(graph: object) {
-  const state = accumulationStates.get(graph);
+  const state = accumulatedState(graph);
   return state ? Object.freeze({
     pending: true,
     microbatches: state.microbatches,
@@ -128,7 +146,7 @@ export function getGradientAccumulationState(graph: object) {
 }
 
 export function resetGradientAccumulation(graph: object) {
-  accumulationStates.delete(graph);
+  releaseAccumulatedState(graph);
   if (graph && typeof graph === "object") (graph as AccumulationGraph)._pendingGradientAccumulation = false;
 }
 
@@ -171,7 +189,7 @@ export function accumulateGradients(graph: object, {
   const lossValue = loss as number;
   const correctCount = correct as number;
 
-  let state = accumulationStates.get(graph);
+  let state = accumulatedState(graph);
   if (!state && accumulationSteps === 1) {
     return {
       apply: hasContribution,
@@ -201,7 +219,7 @@ export function accumulateGradients(graph: object, {
       lossMetrics: null,
       sums: new Map(),
     };
-    accumulationStates.set(graph, state);
+    retainAccumulatedState(graph, state);
     Object.defineProperty(graph, "_pendingGradientAccumulation", {
       configurable: true,
       writable: true,
@@ -274,7 +292,7 @@ export function accumulateGradients(graph: object, {
     gradients: averaged,
     metrics: accumulatedMetrics,
   };
-  accumulationStates.delete(graph);
+  releaseAccumulatedState(graph);
   (graph as AccumulationGraph)._pendingGradientAccumulation = false;
   return result;
 }

@@ -3,6 +3,7 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include "../../include/volvoxai_enums.h"
 
 #ifndef VOLVOXAI_ENABLE_TRAINING
 #define VOLVOXAI_ENABLE_TRAINING 0
@@ -15,6 +16,19 @@ void vk_free_weight_cache(void);
 int vk_matmul(const float* in, const float* w, const float* b, float* out,
               int seq, int d_in, int d_out);
 
+#if defined(VOLVOXAI_VULKAN_TESTING)
+typedef struct {
+    int slot_count;
+    size_t arena_cursor;
+    int dispatch_cursor;
+    int touched_count;
+    int is_training;
+} VkContextStateProbe;
+
+int vk_test_context_state_write(const VkContextStateProbe* probe);
+int vk_test_context_state_read(VkContextStateProbe* probe);
+#endif
+
 void vk_graph_reset(void);
 void vk_graph_begin_forward(void);
 int vk_graph_end_forward(void);
@@ -25,6 +39,19 @@ int vk_graph_copy_f32(const float* in, float* out, long n);
 int vk_graph_add_f32(const float* a, const float* b, float* out, long n);
 int vk_graph_add_relu_f32(const float* a, const float* b, float* out, long n, int relu);
 int vk_graph_clip_f32(const float* in, float* out, long n, float min_v, float max_v);
+/* Canonical 32-bit typed control ABI. Compare operation is 0=Equal,
+ * 1=GreaterOrEqual; strides describe a validated right-aligned broadcast. */
+int vk_graph_compare_i32(
+    const int32_t* a, long a_elements,
+    const int32_t* b, long b_elements,
+    int32_t* output, long output_elements,
+    const uint32_t* output_strides,
+    const uint32_t* a_strides,
+    const uint32_t* b_strides,
+    int rank, int operation);
+int vk_graph_not_i32(const int32_t* input, int32_t* output, long elements);
+int vk_graph_clip_i32(const int32_t* input, int32_t* output, long elements,
+                      int32_t minimum, int32_t maximum);
 int vk_graph_sigmoid_f32(const float* in, float* out, long n);
 int vk_graph_relu_f32(const float* in, float* out, long n);
 int vk_graph_gelu_f32(const float* in, float* out, long n, int approximate_tanh);
@@ -35,7 +62,7 @@ int vk_graph_hardsigmoid_f32(const float* in, float* out, long n);
 int vk_graph_leaky_relu_f32(const float* in, float* out, long n, float alpha);
 int vk_graph_prelu_f32(const float* in, const float* weight, float* out, long n, int channels);
 int vk_graph_layernorm_f32(const float* in, const float* weight, const float* bias,
-                           float* out, int rows, int d_model);
+                           float* out, int rows, int d_model, float eps);
 int vk_graph_rmsnorm_f32(const float* in, const float* weight, float* out,
                          int rows, int d_model, float eps);
 int vk_graph_softmax_f32(const float* in, float* out, int rows, int d);
@@ -61,6 +88,14 @@ int vk_graph_transpose_f32(const float* in, float* out, const int* in_shape,
                            const int* perm, int rank);
 int vk_graph_where_f32(const float* cond, const float* a, const float* b, float* out, long n);
 int vk_graph_cast_copy_f32(const float* in, float* out, long n);
+int vk_graph_where_32(const int32_t* condition, const void* a,
+                      const void* b, void* output, long elements);
+/* Dtypes use canonical VxDataType values; only F32 and I32 are accepted. */
+int vk_graph_cast_typed(const void* input, int input_dtype,
+                        void* output, int output_dtype, long elements);
+int vk_graph_copy_32(const void* input, void* output, long elements);
+int vk_graph_argmax_f32(const float* input, int32_t* output,
+                        uint32_t outer, uint32_t axis_size, uint32_t inner);
 int vk_graph_upsample2x_f32(const float* in, float* out, int n, int h, int w, int c);
 int vk_graph_resize_nearest_f32(const float* in, float* out, int n, int h, int w, int c,
                                 int out_h, int out_w);
@@ -68,6 +103,9 @@ int vk_graph_resize_f32(const float* in, float* out, int n, int h, int w, int c,
                         int out_h, int out_w, int mode);
 int vk_graph_concat_f32(const float** inputs, const long* sizes, const int* input_axes,
                         int count, float* out, int output_axis, int inner, int sigmoid);
+int vk_graph_concat_32(const void* const* inputs, const long* sizes,
+                       const int* input_axes, int count, void* output,
+                       int output_axis, int inner);
 int vk_graph_concat_flat_f32(const float** inputs, const long* sizes, int count, float* out);
 int vk_graph_concat_sigmoid_flat_f32(const float** inputs, const long* sizes, int count, float* out);
 int vk_graph_maxpool2d_f32(const float* in, float* out, int n, int h, int width, int c,
@@ -75,8 +113,9 @@ int vk_graph_maxpool2d_f32(const float* in, float* out, int n, int h, int width,
                            int py, int px);
 int vk_graph_expand_f32(const float* in, float* out, const int* in_shape, int in_rank,
                         const int* out_shape, int out_rank);
-int vk_graph_gather_axis0_f32(const float* in, const float* indices, float* out,
-                              int row_size, int input_rows, int num_idx);
+int vk_graph_gather_i32_f32(const float* input, const int32_t* indices,
+                            float* output, int outer, int axis_size, int inner,
+                            int indices_elements, int output_elements);
 int vk_graph_pad4d_f32(const float* in, float* out, const int* in_shape, int in_rank,
                        const int* out_shape, int out_rank, int pad_top, int pad_left, float value);
 int vk_graph_slice4d_f32(const float* in, float* out, const int* in_shape, int in_rank,
@@ -140,7 +179,7 @@ int vk_graph_qlinear_i8u8(const void* input, const void* weight,
                           uint32_t output_dtype);
 /* Canonical W8A8 embedding gather. IDs are conventional I32 values; the
  * [vocab, hidden] table has per-row F32/I32 metadata and output is packed
- * I8/U8 bytes. Dtype codes are 2=I8 and 3=U8. */
+ * I8/U8 bytes. Dtypes use canonical VX_DTYPE_I8/VX_DTYPE_U8 values. */
 int vk_graph_qembedding_i8u8(const int32_t* tokens, const void* weight,
                              const float* weight_scales,
                              const int32_t* weight_zero_points, void* output,
@@ -149,7 +188,7 @@ int vk_graph_qembedding_i8u8(const int32_t* tokens, const void* weight,
                              uint32_t weight_dtype, uint32_t output_dtype);
 /* Canonical physical-byte W8A8 Conv2D.  Activations use NHWC and weights use
  * [O,H,W,I/group] OHWI.  `bias` may be NULL; the backend binds persistent
- * zero I32 storage in that case.  Dtype codes are 2=I8 and 3=U8. */
+ * zero I32 storage in that case. Dtypes use canonical VxDataType values. */
 int vk_graph_qconv2d_i8u8(const void* input, const void* weight,
                            const float* weight_scales, const int32_t* weight_zero_points,
                            const int32_t* bias, void* output,
@@ -180,6 +219,13 @@ int vk_graph_copy_i8u8(const void* input, uint32_t input_elements,
                        float input_scale, int32_t input_zero_point,
                        float output_scale, int32_t output_zero_point,
                        uint32_t input_dtype, uint32_t output_dtype);
+int vk_graph_transpose_i8u8(const void* input, void* output,
+                            const uint32_t* input_shape,
+                            const uint32_t* permutation, uint32_t rank,
+                            uint32_t elements, float input_scale,
+                            int32_t input_zero_point, float output_scale,
+                            int32_t output_zero_point, uint32_t input_dtype,
+                            uint32_t output_dtype);
 int vk_graph_concat_i8u8(const void* const* inputs, const uint32_t* input_elements,
                          const uint32_t* input_axes, const float* input_scales,
                          const int32_t* input_zero_points, const uint32_t* input_dtypes,
@@ -207,7 +253,7 @@ int vk_graph_resize_nearest_i8u8(const void* input, void* output,
                                  uint32_t input_dtype, uint32_t output_dtype);
 /* Canonical physical-byte W8A8 elementwise add.  The three logical element
  * counts must be identical; raw device storage is internally rounded only for
- * the packed-u32 shader ABI.  Dtype codes are 2=I8 and 3=U8. */
+ * the packed-u32 shader ABI. Dtypes use canonical VxDataType values. */
 int vk_graph_qadd_i8u8(const void* a, uint32_t a_elements,
                        const void* b, uint32_t b_elements,
                        void* output, uint32_t output_elements,
@@ -216,6 +262,13 @@ int vk_graph_qadd_i8u8(const void* a, uint32_t a_elements,
                        float output_scale, int32_t output_zero_point,
                        uint32_t a_dtype, uint32_t b_dtype,
                        uint32_t output_dtype, uint32_t relu);
+int vk_graph_qbatch_matmul_i8u8(
+    const void* a, const int* a_shape, int a_rank,
+    float a_scale, int32_t a_zero_point, uint32_t a_dtype,
+    const void* b, const int* b_shape, int b_rank,
+    float b_scale, int32_t b_zero_point, uint32_t b_dtype,
+    void* output, const int* output_shape, int output_rank,
+    float output_scale, int32_t output_zero_point, uint32_t output_dtype);
 /* Canonical byte-domain SiLU. Input/output logical element counts are equal;
  * device storage is padded only for the packed-u32 shader ABI. */
 int vk_graph_qsilu_i8u8(const void* input, void* output, uint32_t elements,

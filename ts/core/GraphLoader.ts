@@ -1,5 +1,6 @@
-import { Graph } from './Graph.js';
+import { Graph, isValidGraphName } from './Graph.js';
 import {
+  assertLosslessJSONValue,
   parseStrictJSON,
   SAFETENSORS_OPEN_READ_WRITE,
   SafetensorsFile,
@@ -11,19 +12,20 @@ import type {
 import { Tensor } from './Tensor.js';
 import { validatePortableQuantizedGraph } from '../ops/quantizedGraphValidation.js';
 import { GraphOperatorNormalizer } from '../ops/graphOperatorNormalization.js';
+import { runtimeDTypes, runtimeOperatorNames } from '../generated/volvoxaiEnums.js';
 import type {
   GraphNode,
   NodeOutputSpec,
   NodeParameters,
   RuntimeDType,
-  TensorQuantization,
   TensorQuantizationInput,
 } from '../types.js';
 
 type UnknownRecord = Record<string, unknown>;
-type QuantizationValue = TensorQuantizationInput | TensorQuantization | null | undefined;
-type WeightQuantizationRecord = Record<string, unknown>;
 type ConcreteNode = GraphNode<Tensor>;
+
+const RUNTIME_DTYPES = new Set<unknown>(runtimeDTypes);
+const RUNTIME_OPERATOR_NAMES = new Set<unknown>(runtimeOperatorNames);
 
 interface GraphFetchResponse {
   ok: boolean;
@@ -36,36 +38,106 @@ interface GraphFetchResponse {
 export type GraphFetch = (source: string) => Promise<GraphFetchResponse>;
 
 export interface GraphLoaderOptions {
-  configUrl?: string;
+  graphUrl?: string;
   fetch?: GraphFetch;
   safetensors?: SafetensorsOpenOptions;
   safetensorsCache?: ReadOnlySafetensorsCache;
 }
 
-interface BlueprintBuildOptions {
+function isCanonicalGraphDocumentUrl(value: string): boolean {
+  const suffix = value.search(/[?#]/);
+  const path = suffix === -1 ? value : value.slice(0, suffix);
+  const basename = path.slice(Math.max(path.lastIndexOf('/'), path.lastIndexOf('\\')) + 1);
+  return basename === 'graph.json' ||
+    (basename.length > '.graph.json'.length && basename.endsWith('.graph.json'));
+}
+
+interface GraphBuildOptions {
   baseTensors?: Map<string, Tensor>;
   reservedNames?: ReadonlySet<string>;
+  quantizationByTensor?: Readonly<Record<string, TensorQuantizationInput>>;
 }
-
-interface CompanionScaleState {
-  hydrated: Record<string, TensorQuantizationInput>;
-  companionNames: Set<string>;
-}
-
-type ModelBuilder = (
-  graph: Graph,
-  config: UnknownRecord,
-  tensors: Map<string, Tensor>,
-) => unknown;
 
 function isRecord(value: unknown): value is UnknownRecord {
   return !!value && typeof value === 'object' && !Array.isArray(value);
 }
 
-const F32_COMPANION_SCALES_FORMAT = 'volvoxai-f32-companion-scales-v1';
+const SAFETENSORS_AFFINE_QUANTIZATION_FORMAT = 'volvox-affine-safetensors/v1';
+export const VOLVOX_GRAPH_FORMAT = 'volvox-graph/v1';
+const RETIRED_AFFINE_PARAM_FIELDS = [
+  'quantization',
+  'zero_point',
+  'input_scale', 'input_zero_point',
+  'output_scale', 'output_zero_point',
+  'weight_scale', 'weight_zero_point',
+  'scales', 'zero_points',
+  'scale_tensor', 'zero_point_tensor',
+] as const;
 
 function hasOwn(record: object, key: PropertyKey): boolean {
   return Object.prototype.hasOwnProperty.call(record, key);
+}
+
+function findRetiredAffineParamPath(value: unknown): string | null {
+  const seen = new WeakSet<object>();
+  const visit = (item: unknown, path: string): string | null => {
+    if (Array.isArray(item)) {
+      if (seen.has(item)) return null;
+      seen.add(item);
+      for (let index = 0; index < item.length; index++) {
+        const found = visit(item[index], `${path}[${index}]`);
+        if (found != null) return found;
+      }
+      return null;
+    }
+    if (!isRecord(item)) return null;
+    if (seen.has(item)) return null;
+    seen.add(item);
+    for (const field of RETIRED_AFFINE_PARAM_FIELDS) {
+      if (hasOwn(item, field)) return `${path}.${field}`;
+    }
+    for (const key of Object.keys(item).sort()) {
+      const found = visit(item[key], `${path}.${key}`);
+      if (found != null) return found;
+    }
+    return null;
+  };
+  return visit(value, 'params');
+}
+
+function declaredOutputNames(graphDocument: UnknownRecord): string[] {
+  if (!Array.isArray(graphDocument.outputs) ||
+      graphDocument.outputs.length === 0 ||
+      new Set(graphDocument.outputs).size !== graphDocument.outputs.length) {
+    throw new Error(
+      '[GraphLoader] graph outputs must be a non-empty array of unique, non-empty graph tensor names.',
+    );
+  }
+  if (graphDocument.outputs.some((name) => !isValidGraphName(name))) {
+    throw new Error('[GraphLoader] graph outputs contain a tensor name that is not a valid current-v1 name.');
+  }
+  return [...graphDocument.outputs] as string[];
+}
+
+function validateRuntimeShape(
+  shape: readonly unknown[],
+  dtype: RuntimeDType,
+  label: string,
+): void {
+  let elements = 1;
+  for (const [index, dimension] of shape.entries()) {
+    if (!Number.isSafeInteger(dimension) || (dimension as number) <= 0) {
+      throw new Error(`${label} shape dimension ${index} must be a positive safe integer.`);
+    }
+    elements *= dimension as number;
+    if (!Number.isSafeInteger(elements)) {
+      throw new Error(`${label} element count exceeds JSON's safe integer range.`);
+    }
+  }
+  const bytes = dtype === 'float32' || dtype === 'int32' ? 4 : 1;
+  if (!Number.isSafeInteger(elements * bytes)) {
+    throw new Error(`${label} byte size exceeds JSON's safe integer range.`);
+  }
 }
 
 function assertOnlyFields(
@@ -82,229 +154,349 @@ function assertOnlyFields(
   }
 }
 
-function parseWeightQuantizationStorage(config: UnknownRecord): boolean {
-  const hasStorage = hasOwn(config, 'weights_quantization_storage');
-  if (!hasStorage) {
-    const weightsQuantization = config.weights_quantization;
-    if (weightsQuantization != null && !isRecord(weightsQuantization)) {
-      throw new Error('[GraphLoader] weights_quantization must be an object when present.');
+interface SafetensorsAffineState {
+  hydrated: Record<string, TensorQuantizationInput>;
+  parameterNames: Set<string>;
+}
+
+interface DeclaredTensorMetadata {
+  dtype: RuntimeDType;
+  shape: readonly number[];
+}
+
+function rejectLegacyQuantizationFields(graphDocument: UnknownRecord): void {
+  for (const forbidden of ['weights_quantization', 'weights_quantization_storage']) {
+    if (hasOwn(graphDocument, forbidden)) {
+      throw new Error(`[GraphLoader] ${VOLVOX_GRAPH_FORMAT} forbids legacy field '${forbidden}'.`);
     }
-    for (const [name, descriptor] of Object.entries(weightsQuantization || {})) {
-      if (isRecord(descriptor) && (hasOwn(descriptor, 'scales_offset') || hasOwn(descriptor, 'scales_count'))) {
-        throw new Error(
-          `[GraphLoader] Weight '${name}' uses unsupported binary scale offset fields.`,
-        );
+  }
+  const inputs = graphDocument.inputs;
+  if (isRecord(inputs)) {
+    for (const [name, descriptor] of Object.entries(inputs)) {
+      if (isRecord(descriptor) && hasOwn(descriptor, 'quantization')) {
+        throw new Error(`[GraphLoader] Input '${name}' contains forbidden inline quantization.`);
       }
     }
-    return false;
   }
-
-  const storage = config.weights_quantization_storage;
-  if (!isRecord(storage)) {
-    throw new Error('[GraphLoader] weights_quantization_storage must be an object.');
+  const nodes = graphDocument.nodes;
+  if (Array.isArray(nodes)) {
+    for (const [index, node] of nodes.entries()) {
+      if (isRecord(node)) {
+        const label = String(node.id ?? node.opType ?? index);
+        if (hasOwn(node, 'outputs_quantization')) {
+          throw new Error(`[GraphLoader] Node ${label} contains forbidden inline quantization.`);
+        }
+        const retiredPath = findRetiredAffineParamPath(node.params);
+        if (retiredPath != null) {
+          throw new Error(
+            `[GraphLoader] Node ${label} contains retired affine payload at ${retiredPath}.`,
+          );
+        }
+      }
+    }
   }
-  assertOnlyFields(
-    storage,
-    ['format'],
-    'weights_quantization_storage',
-  );
-  if (storage.format !== F32_COMPANION_SCALES_FORMAT) {
-    throw new Error(`[GraphLoader] Unsupported weights_quantization_storage format '${String(storage.format)}'.`);
+  const standaloneTensors = graphDocument.standaloneTensors;
+  if (isRecord(standaloneTensors)) {
+    for (const [name, descriptor] of Object.entries(standaloneTensors)) {
+      if (isRecord(descriptor) && hasOwn(descriptor, 'quantization')) {
+        throw new Error(`[GraphLoader] Standalone tensor '${name}' contains forbidden inline quantization.`);
+      }
+    }
   }
-  if (hasOwn(config, 'weights_quantization')) {
-    throw new Error(
-      '[GraphLoader] companion-scale storage requires config.json to omit weights_quantization; ' +
-      'the safetensors metadata is authoritative.',
-    );
-  }
-  return true;
 }
 
-function parseCompanionScaleMetadata(
-  file: SafetensorsFile,
-  source: string,
-): WeightQuantizationRecord | null {
-  const label = `Safetensors source '${source}'`;
-  const metadata = file.metadata;
-  if (!isRecord(metadata)) {
-    throw new Error(`[GraphLoader] ${label} __metadata__ must be an object.`);
-  }
-  const hasStorage = hasOwn(metadata, 'weights_quantization_storage');
-  const hasQuantization = hasOwn(metadata, 'weights_quantization');
-  if (!hasStorage && !hasQuantization) return null;
-  if (!hasStorage || !hasQuantization) {
-    throw new Error(
-      `[GraphLoader] ${label} companion-scale metadata must contain both ` +
-      'weights_quantization_storage and weights_quantization.',
-    );
-  }
-  if (metadata.weights_quantization_storage !== F32_COMPANION_SCALES_FORMAT) {
-    throw new Error(
-      `[GraphLoader] ${label} weights_quantization_storage must equal ` +
-      `'${F32_COMPANION_SCALES_FORMAT}'.`,
-    );
-  }
-  const encoded = metadata.weights_quantization;
-  if (typeof encoded !== 'string') {
-    throw new Error(`[GraphLoader] ${label} weights_quantization metadata must be a JSON string.`);
-  }
-  let parsed: unknown;
-  try {
-    parsed = parseStrictJSON(encoded, `${label} weights_quantization metadata`);
-  } catch (error) {
-    if (isRecord(error) && error.code === 'ERR_STRICT_JSON_DUPLICATE_KEY') throw error;
-    throw new Error(`[GraphLoader] ${label} weights_quantization metadata is not valid JSON.`);
-  }
-  if (!isRecord(parsed)) {
-    throw new Error(`[GraphLoader] ${label} weights_quantization metadata must decode to an object.`);
-  }
-  return parsed;
+function sameFields(record: UnknownRecord, expected: readonly string[]): boolean {
+  const actual = Object.keys(record).sort();
+  const wanted = [...expected].sort();
+  return actual.length === wanted.length &&
+    actual.every((field, index) => field === wanted[index]);
 }
 
-function mergeCompanionScaleQuantization(
+/** Validate the persisted v1 shape before fetching immutable tensor payloads. */
+function validatePersistedGraphDocument(graphDocument: UnknownRecord): void {
+  if (!isRecord(graphDocument.inputs)) {
+    throw new Error('[GraphLoader] graph.json must contain an inputs object.');
+  }
+  for (const [name, descriptor] of Object.entries(graphDocument.inputs)) {
+    if (!isValidGraphName(name)) {
+      throw new Error(`[GraphLoader] Input tensor name '${name}' is not a valid current-v1 name.`);
+    }
+    if (!isRecord(descriptor) || !Array.isArray(descriptor.shape)) {
+      throw new Error(`[GraphLoader] Input '${name}' requires an explicit shape array.`);
+    }
+    if (typeof descriptor.dtype !== 'string' || !RUNTIME_DTYPES.has(descriptor.dtype)) {
+      throw new Error(
+        `[GraphLoader] Input '${name}' requires an explicit canonical dtype ` +
+        "('float32', 'int32', 'int8', or 'uint8').",
+      );
+    }
+    validateRuntimeShape(
+      descriptor.shape,
+      descriptor.dtype as RuntimeDType,
+      `[GraphLoader] Input '${name}'`,
+    );
+  }
+  if (!Array.isArray(graphDocument.nodes)) {
+    throw new Error('[GraphLoader] graph.json must contain a nodes array.');
+  }
+  for (const [index, node] of graphDocument.nodes.entries()) {
+    if (!isRecord(node)) {
+      throw new Error(`[GraphLoader] Node at index ${index} must be an object.`);
+    }
+    const label = String(node.id ?? node.opType ?? index);
+    if (hasOwn(node, 'op')) {
+      throw new Error(`[GraphLoader] Node ${label} contains unsupported field 'op'; use 'opType'.`);
+    }
+    if (typeof node.opType !== 'string' || node.opType.trim().length === 0) {
+      throw new Error(`[GraphLoader] Node ${label} opType must be a non-empty string.`);
+    }
+    if (!RUNTIME_OPERATOR_NAMES.has(node.opType)) {
+      throw new Error(
+        `[GraphLoader] Node ${label} uses unknown or offline-only current-v1 ` +
+        `opType '${node.opType}'.`,
+      );
+    }
+    if (!isRecord(node.inputs)) {
+      throw new Error(`[GraphLoader] Node ${label} inputs must be an object.`);
+    }
+    if (!isRecord(node.outputs) || Object.keys(node.outputs).length === 0) {
+      throw new Error(`[GraphLoader] Node ${label} requires at least one output.`);
+    }
+    for (const [port, tensorName] of Object.entries(node.inputs)) {
+      if (!isValidGraphName(port) || !isValidGraphName(tensorName)) {
+        throw new Error(`[GraphLoader] Node ${label} has an invalid input port or tensor name.`);
+      }
+    }
+    const outputPorts = Object.keys(node.outputs);
+    for (const [port, tensorName] of Object.entries(node.outputs)) {
+      if (!isValidGraphName(port) || !isValidGraphName(tensorName)) {
+        throw new Error(`[GraphLoader] Node ${label} has an invalid output port or tensor name.`);
+      }
+    }
+    if (!isRecord(node.outputs_shape) || !sameFields(node.outputs_shape, outputPorts)) {
+      throw new Error(
+        `[GraphLoader] Node ${label} outputs_shape must exactly describe every output port.`,
+      );
+    }
+    if (!isRecord(node.outputs_dtype) || !sameFields(node.outputs_dtype, outputPorts)) {
+      throw new Error(
+        `[GraphLoader] Node ${label} outputs_dtype must exactly describe every output port.`,
+      );
+    }
+    for (const port of outputPorts) {
+      if (!Array.isArray(node.outputs_shape[port])) {
+        throw new Error(`[GraphLoader] Node ${label} output '${port}' requires a shape array.`);
+      }
+      const dtype = node.outputs_dtype[port];
+      if (typeof dtype !== 'string' || !RUNTIME_DTYPES.has(dtype)) {
+        throw new Error(
+          `[GraphLoader] Node ${label} output '${port}' has unsupported dtype '${String(dtype)}'.`,
+        );
+      }
+      validateRuntimeShape(
+        node.outputs_shape[port] as readonly unknown[],
+        dtype as RuntimeDType,
+        `[GraphLoader] Node ${label} output '${port}'`,
+      );
+    }
+    if (hasOwn(node, 'params') && !isRecord(node.params)) {
+      throw new Error(`[GraphLoader] Node ${label} params must be an object.`);
+    }
+  }
+}
+
+function parseSafetensorsAffineQuantization(
+  graphDocument: UnknownRecord,
   weightFiles: readonly SafetensorsFile[],
   sourceList: readonly string[],
-): WeightQuantizationRecord {
-  const merged: WeightQuantizationRecord = Object.create(null) as WeightQuantizationRecord;
-  const owners = new Map<string, string>();
-  const tensorOwners = new Map<string, string>();
-  for (let index = 0; index < weightFiles.length; index++) {
-    const file = weightFiles[index];
-    const source = sourceList[index];
-    const local = parseCompanionScaleMetadata(file, source);
-    if (local != null) {
-      for (const [name, descriptor] of Object.entries(local)) {
-        const previousSource = owners.get(name);
-        if (previousSource != null) {
-          throw new Error(
-            `[GraphLoader] weights_quantization declares weight '${name}' in both ` +
-            `'${previousSource}' and '${source}'.`,
-          );
-        }
-        const companionName = `${name}_scale`;
-        if (!file.getTensor(name) || !file.getTensor(companionName)) {
-          throw new Error(
-            `[GraphLoader] ${source} must store declared weight '${name}' and its companion ` +
-            `'${companionName}' in the same safetensors file.`,
-          );
-        }
-        merged[name] = descriptor;
-        owners.set(name, source);
-      }
-    }
-    for (const [name] of file.tensorEntries()) {
-      const previousSource = tensorOwners.get(name);
-      if (previousSource != null) {
+): SafetensorsAffineState {
+  const inputs = graphDocument.inputs;
+  const nodes = graphDocument.nodes;
+  const entries = new Map<string, { file: SafetensorsFile; entry: SafetensorsTensor }>();
+  const declared = new Map<string, DeclaredTensorMetadata>();
+  for (let fileIndex = 0; fileIndex < weightFiles.length; fileIndex++) {
+    const file = weightFiles[fileIndex];
+    const source = sourceList[fileIndex];
+    for (const forbidden of ['weights_quantization_storage', 'weights_quantization']) {
+      if (hasOwn(file.metadata, forbidden)) {
         throw new Error(
-          `[GraphLoader] Tensor '${name}' occurs in both '${previousSource}' and '${source}'.`,
+          `[GraphLoader] Safetensors source '${source}' contains forbidden legacy metadata '${forbidden}'.`,
         );
       }
-      tensorOwners.set(name, source);
     }
-  }
-  if (owners.size === 0) {
-    throw new Error(
-      '[GraphLoader] companion-scale storage requires safetensors metadata to declare at least one weight.',
-    );
-  }
-  return merged;
-}
-
-function hydrateCompanionScaleQuantization(
-  weightsQuantization: WeightQuantizationRecord,
-  weightFiles: readonly SafetensorsFile[],
-): CompanionScaleState {
-  const loadedEntries = new Map<string, Array<{
-    file: SafetensorsFile;
-    entry: SafetensorsTensor;
-  }>>();
-  for (const file of weightFiles) {
     for (const [name, entry] of file.tensorEntries()) {
-      const entries = loadedEntries.get(name) || [];
-      entries.push({ file, entry });
-      loadedEntries.set(name, entries);
+      if (entries.has(name)) {
+        throw new Error(`[GraphLoader] Tensor '${name}' occurs in more than one safetensors source.`);
+      }
+      entries.set(name, { file, entry });
+      declared.set(name, {
+        dtype: SafetensorsFile.toGraphDType(entry.dtype),
+        shape: entry.shape,
+      });
     }
   }
+  if (isRecord(inputs)) {
+    for (const [name, descriptor] of Object.entries(inputs)) {
+      if (!isRecord(descriptor) || typeof descriptor.dtype !== 'string' ||
+          !RUNTIME_DTYPES.has(descriptor.dtype) || !Array.isArray(descriptor.shape)) continue;
+      declared.set(name, {
+        dtype: descriptor.dtype as RuntimeDType,
+        shape: descriptor.shape as number[],
+      });
+    }
+  }
+  if (Array.isArray(nodes)) {
+    for (const node of nodes) {
+      if (!isRecord(node) || !isRecord(node.outputs)) continue;
+      const outputDtypes = isRecord(node.outputs_dtype) ? node.outputs_dtype : {};
+      const outputShapes = isRecord(node.outputs_shape) ? node.outputs_shape : {};
+      for (const [port, name] of Object.entries(node.outputs)) {
+        if (typeof name !== 'string' || !Array.isArray(outputShapes[port])) continue;
+        const dtype = outputDtypes[port];
+        if (typeof dtype !== 'string' || !RUNTIME_DTYPES.has(dtype)) continue;
+        declared.set(name, {
+          dtype: dtype as RuntimeDType,
+          shape: outputShapes[port] as number[],
+        });
+      }
+    }
+  }
+  const standaloneTensors = graphDocument.standaloneTensors;
+  if (isRecord(standaloneTensors)) {
+    for (const [name, descriptor] of Object.entries(standaloneTensors)) {
+      if (!isRecord(descriptor) || typeof descriptor.dtype !== 'string' ||
+          !RUNTIME_DTYPES.has(descriptor.dtype) || !Array.isArray(descriptor.shape)) continue;
+      declared.set(name, {
+        dtype: descriptor.dtype as RuntimeDType,
+        shape: descriptor.shape as number[],
+      });
+    }
+  }
+
+  if (!hasOwn(graphDocument, 'quantization')) return {
+    hydrated: Object.create(null) as Record<string, TensorQuantizationInput>,
+    parameterNames: new Set<string>(),
+  };
+  const root = graphDocument.quantization;
+  if (!isRecord(root)) throw new Error('[GraphLoader] quantization must be an object.');
+  assertOnlyFields(root, ['format', 'tensors'], 'quantization');
+  if (root.format !== SAFETENSORS_AFFINE_QUANTIZATION_FORMAT) {
+    throw new Error(`[GraphLoader] Unsupported quantization format '${String(root.format)}'.`);
+  }
+  if (!isRecord(root.tensors) || Object.keys(root.tensors).length === 0) {
+    throw new Error('[GraphLoader] quantization.tensors must be a non-empty object.');
+  }
+
   const hydrated: Record<string, TensorQuantizationInput> = Object.create(null) as
     Record<string, TensorQuantizationInput>;
-  const companionNames = new Set<string>();
-
-  for (const [name, descriptor] of Object.entries(weightsQuantization)) {
-    const weightEntries = loadedEntries.get(name) || [];
-    if (weightEntries.length !== 1) {
-      throw new Error(
-        `[GraphLoader] Declared weight '${name}' must occur exactly once across the loaded safetensors files.`,
-      );
+  const parameterNames = new Set<string>();
+  for (const [name, rawDescriptor] of Object.entries(root.tensors)) {
+    const target = declared.get(name);
+    if (!target) throw new Error(`[GraphLoader] Quantization declares unknown tensor '${name}'.`);
+    if (target.dtype !== 'int8' && target.dtype !== 'uint8') {
+      throw new Error(`[GraphLoader] Quantization target '${name}' must have int8 or uint8 storage.`);
     }
-    const weight = weightEntries[0].entry;
-    if (weight.dtype !== 'I8') {
-      throw new Error(`[GraphLoader] Declared weight '${name}' must have safetensors dtype I8.`);
+    if (!isRecord(rawDescriptor)) {
+      throw new Error(`[GraphLoader] Quantization descriptor for '${name}' must be an object.`);
     }
-    const companionName = `${name}_scale`;
-    const companions = loadedEntries.get(companionName) || [];
-    if (companions.length !== 1) {
-      throw new Error(
-        `[GraphLoader] Companion scale '${companionName}' for weight '${name}' must occur exactly once ` +
-        'across the loaded safetensors files.',
-      );
+    const perAxis = rawDescriptor.scheme === 'per_axis';
+    assertOnlyFields(
+      rawDescriptor,
+      perAxis
+        ? ['scheme', 'axis', 'scale_tensor', 'zero_point_tensor']
+        : ['scheme', 'scale_tensor', 'zero_point_tensor'],
+      `Quantization descriptor for '${name}'`,
+    );
+    if (rawDescriptor.scheme !== 'per_tensor' && !perAxis) {
+      throw new Error(`[GraphLoader] Quantization descriptor for '${name}' has unsupported scheme '${String(rawDescriptor.scheme)}'.`);
     }
-    const { file, entry: companion } = companions[0];
-    if (companion.dtype !== 'F32') {
-      throw new Error(`[GraphLoader] Companion scale '${companionName}' for weight '${name}' must have safetensors dtype F32.`);
+    if (typeof rawDescriptor.scale_tensor !== 'string' || rawDescriptor.scale_tensor.length === 0 ||
+        typeof rawDescriptor.zero_point_tensor !== 'string' || rawDescriptor.zero_point_tensor.length === 0 ||
+        rawDescriptor.scale_tensor === rawDescriptor.zero_point_tensor) {
+      throw new Error(`[GraphLoader] Quantization descriptor for '${name}' requires distinct parameter tensor names.`);
     }
-    if (!isRecord(descriptor)) {
-      throw new Error(`[GraphLoader] Weight '${name}' companion-scale quantization descriptor must be an object.`);
+    const scaleName = rawDescriptor.scale_tensor;
+    const zeroName = rawDescriptor.zero_point_tensor;
+    const scaleRecord = entries.get(scaleName);
+    const zeroRecord = entries.get(zeroName);
+    if (!scaleRecord || !zeroRecord) {
+      throw new Error(`[GraphLoader] Quantization parameters for '${name}' must exist in safetensors.`);
     }
-    let expectedCount: number;
-    let axis: 0 | undefined;
-    if (descriptor.scheme === 'per_axis') {
-      assertOnlyFields(
-        descriptor,
-        ['scheme', 'axis'],
-        `Weight '${name}' companion-scale per_axis descriptor`,
-      );
-      if (descriptor.axis !== 0) {
-        throw new Error(`[GraphLoader] Weight '${name}' companion-scale axis must be 0.`);
+    if (scaleRecord.entry.dtype !== 'F32' || scaleRecord.entry.shape.length !== 1) {
+      throw new Error(`[GraphLoader] Scale tensor '${scaleName}' for '${name}' must be rank-1 F32.`);
+    }
+    const expectedZeroDtype = target.dtype === 'int8' ? 'I8' : 'U8';
+    if (zeroRecord.entry.dtype !== expectedZeroDtype || zeroRecord.entry.shape.length !== 1) {
+      throw new Error(`[GraphLoader] Zero-point tensor '${zeroName}' for '${name}' must be rank-1 ${expectedZeroDtype}.`);
+    }
+    let count = 1;
+    let axis: number | undefined;
+    if (perAxis) {
+      if (!Number.isInteger(rawDescriptor.axis) || target.shape.length === 0) {
+        throw new Error(`[GraphLoader] Per-axis quantization for '${name}' requires an integer axis.`);
       }
-      axis = descriptor.axis;
-      if (weight.shape.length === 0) {
-        throw new Error(`[GraphLoader] Weight '${name}' companion-scale axis 0 is outside tensor rank 0.`);
+      const rawAxis = rawDescriptor.axis as number;
+      axis = rawAxis < 0 ? rawAxis + target.shape.length : rawAxis;
+      if (axis < 0 || axis >= target.shape.length ||
+          !Number.isInteger(target.shape[axis]) || target.shape[axis] <= 0) {
+        throw new Error(`[GraphLoader] Per-axis quantization axis for '${name}' is outside its concrete rank.`);
       }
-      if (weight.shape[0] <= 0) {
-        throw new Error(`[GraphLoader] Weight '${name}' companion-scale axis-0 dimension must be positive.`);
-      }
-      expectedCount = weight.shape[axis];
-    } else if (descriptor.scheme === 'per_tensor') {
-      assertOnlyFields(
-        descriptor,
-        ['scheme'],
-        `Weight '${name}' companion-scale per_tensor descriptor`,
-      );
-      expectedCount = 1;
-    } else {
-      throw new Error(
-        `[GraphLoader] Weight '${name}' companion-scale quantization has unsupported scheme '${String(descriptor.scheme)}'.`,
-      );
+      count = target.shape[axis];
     }
-    if (companion.shape.length !== 1 || companion.shape[0] !== expectedCount) {
-      throw new Error(
-        `[GraphLoader] Companion scale '${companionName}' for weight '${name}' must have shape [${expectedCount}].`,
-      );
+    if (scaleRecord.entry.shape[0] !== count || zeroRecord.entry.shape[0] !== count) {
+      throw new Error(`[GraphLoader] Quantization parameters for '${name}' must have shape [${count}].`);
     }
-    const values: number[] = Array.from(file.toRuntimeTypedArray(companion));
-    for (const [index, value] of values.entries()) {
-      if (!Number.isFinite(value) || value <= 0) {
-        throw new Error(
-          `[GraphLoader] Companion scale '${companionName}' value ${index} must be finite and positive.`,
-        );
-      }
+    const scales = Array.from(scaleRecord.file.toRuntimeTypedArray(scaleRecord.entry));
+    const zeroPoints = Array.from(zeroRecord.file.toRuntimeTypedArray(zeroRecord.entry));
+    if (scales.some((value) => !Number.isFinite(value) || value <= 0)) {
+      throw new Error(`[GraphLoader] Quantization scales for '${name}' must be finite and positive.`);
     }
-    hydrated[name] = descriptor.scheme === 'per_axis'
-      ? { scheme: 'per_axis', axis: axis as 0, scales: values }
-      : { scheme: 'per_tensor', scale: values[0] };
-    companionNames.add(companionName);
+    const minimum = target.dtype === 'int8' ? -128 : 0;
+    const maximum = target.dtype === 'int8' ? 127 : 255;
+    if (zeroPoints.some((value) => !Number.isInteger(value) || value < minimum || value > maximum)) {
+      throw new Error(`[GraphLoader] Quantization zero points for '${name}' are outside ${target.dtype} range.`);
+    }
+    hydrated[name] = perAxis
+      ? { scheme: 'per_axis', axis: axis!, scales, zero_points: zeroPoints }
+      : { scheme: 'per_tensor', scale: scales[0], zero_point: zeroPoints[0] };
+    parameterNames.add(scaleName);
+    parameterNames.add(zeroName);
   }
-  return { hydrated, companionNames };
+  for (const parameterName of parameterNames) {
+    if (hasOwn(root.tensors, parameterName)) {
+      throw new Error(`[GraphLoader] Quantization parameter '${parameterName}' cannot itself be quantized.`);
+    }
+  }
+  if (Array.isArray(nodes)) {
+    for (const [index, node] of nodes.entries()) {
+      if (!isRecord(node) || !isRecord(node.inputs) || !isRecord(node.outputs)) continue;
+      const label = String(node.id ?? node.opType ?? index);
+      if (node.opType === 'QuantizeLinear') {
+        for (const outputName of Object.values(node.outputs)) {
+          if (typeof outputName !== 'string') continue;
+          const descriptor = root.tensors[outputName];
+          if (!isRecord(descriptor) || descriptor.scale_tensor !== node.inputs.scale ||
+              descriptor.zero_point_tensor !== node.inputs.zero_point) {
+            throw new Error(
+              `[GraphLoader] QuantizeLinear node ${label} parameter inputs must match ` +
+              `the output tensor '${outputName}' quantization references.`,
+            );
+          }
+        }
+      } else if (node.opType === 'DequantizeLinear') {
+        const inputName = node.inputs.input;
+        const descriptor = typeof inputName === 'string' ? root.tensors[inputName] : undefined;
+        if (!isRecord(descriptor) || descriptor.scale_tensor !== node.inputs.scale ||
+            descriptor.zero_point_tensor !== node.inputs.zero_point) {
+          throw new Error(
+            `[GraphLoader] DequantizeLinear node ${label} parameter inputs must match ` +
+            `the input tensor '${String(inputName)}' quantization references.`,
+          );
+        }
+      }
+    }
+  }
+  return { hydrated, parameterNames };
 }
 
 /**
@@ -361,12 +553,11 @@ export class ReadOnlySafetensorsCache {
 
 export class GraphLoader {
   /**
-   * Loads a graph from one or more Safetensors files.
-   * The Safetensors __metadata__ field must contain a 'volvox_nodes' JSON string.
-   * @param {Graph} graph - An empty Graph instance from VolvoxAI.createGraph()
+   * Loads a canonical graph.json document and one or more Safetensors files.
+   * @param {Graph} graph - An empty Graph instance
    * @param {string|string[]} sources - URL(s) to .safetensors files
    * @param {Object} options - Loader and safetensors options. A custom fetch
-   *   response exposing only json() supplies a trusted, already-decoded config;
+   *   response exposing only json() supplies a trusted, already-decoded graph;
    *   its provider owns raw JSON duplicate-key validation.
    * @returns {Promise<Graph>} Populated graph
    */
@@ -383,42 +574,46 @@ export class GraphLoader {
       throw new Error("[VolvoxAI] At least one safetensors source is required.");
     }
     const primarySource = sourceList[0];
-    let configUrl = options.configUrl;
-    if (!configUrl && primarySource.endsWith('_weights.safetensors')) {
-      configUrl = primarySource.replace('_weights.safetensors', '_config.json');
-    } else {
-      configUrl = configUrl || primarySource.replace(/\/[^\/]+$/, '/config.json');
+    const sourceSuffix = primarySource.search(/[?#]/);
+    const sourcePath = sourceSuffix === -1 ? primarySource : primarySource.slice(0, sourceSuffix);
+    const sourceDirectoryEnd = sourcePath.lastIndexOf('/') + 1;
+    const graphUrl = options.graphUrl ?? `${sourcePath.slice(0, sourceDirectoryEnd)}graph.json`;
+    if (typeof graphUrl !== 'string' || !isCanonicalGraphDocumentUrl(graphUrl)) {
+      throw new Error(
+        "[GraphLoader] graphUrl must name graph.json or a named *.graph.json document.",
+      );
     }
-    if (!configUrl) throw new Error('[GraphLoader] Could not resolve config.json URL.');
     const fetchImpl: GraphFetch | undefined = options.fetch ||
       (typeof globalThis.fetch === 'function'
         ? async (source: string): Promise<GraphFetchResponse> => globalThis.fetch(source)
         : undefined);
     if (typeof fetchImpl !== 'function') throw new Error('[GraphLoader] No fetch implementation is available.');
-    console.log(`[VolvoxAI] Loading config from ${configUrl}...`);
-    const configResponse = await fetchImpl(configUrl);
-    if (!configResponse.ok) throw new Error(`Failed to load config.json: ${configResponse.statusText}`);
-    let config: unknown;
-    if (typeof configResponse.text === 'function') {
-      const configText = await configResponse.text();
-      config = parseStrictJSON(configText, `Config '${configUrl}'`);
-    } else if (typeof configResponse.json === 'function') {
+    console.log(`[VolvoxAI] Loading graph from ${graphUrl}...`);
+    const graphResponse = await fetchImpl(graphUrl);
+    if (!graphResponse.ok) throw new Error(`Failed to load graph.json: ${graphResponse.statusText}`);
+    let graphDocument: unknown;
+    if (typeof graphResponse.text === 'function') {
+      const graphText = await graphResponse.text();
+      graphDocument = parseStrictJSON(graphText, `Graph '${graphUrl}'`);
+    } else if (typeof graphResponse.json === 'function') {
       // json()-only injected responses are already-parsed trusted objects; only
       // a standard response exposing text() can retain duplicate-key evidence.
-      config = await configResponse.json();
+      graphDocument = await graphResponse.json();
     } else {
-      throw new Error('[GraphLoader] Config response must provide text() or json().');
+      throw new Error('[GraphLoader] Graph response must provide text() or json().');
     }
-    if (!isRecord(config)) {
-      throw new Error('[GraphLoader] config.json must contain a JSON object.');
+    if (!isRecord(graphDocument)) {
+      throw new Error('[GraphLoader] graph.json must contain a JSON object.');
     }
-
-    const usesCompanionScales = parseWeightQuantizationStorage(config);
-    const inlineWeightsQuantization: WeightQuantizationRecord | null = usesCompanionScales
-      ? null
-      : isRecord(config.weights_quantization)
-        ? config.weights_quantization
-        : null;
+    assertLosslessJSONValue(graphDocument, `[GraphLoader] graph '${graphUrl}'`);
+    if (graphDocument.format !== VOLVOX_GRAPH_FORMAT) {
+      throw new Error(
+        `[GraphLoader] graph.json format must be '${VOLVOX_GRAPH_FORMAT}', got '${String(graphDocument.format)}'.`,
+      );
+    }
+    declaredOutputNames(graphDocument);
+    rejectLegacyQuantizationFields(graphDocument);
+    validatePersistedGraphDocument(graphDocument);
 
     const safetensorsOptions = options.safetensors || {};
     const safetensorsFlags = safetensorsOptions.flags ??
@@ -448,21 +643,17 @@ export class GraphLoader {
         : await loadSafetensors();
       weightFiles.push(safetensors);
     }
-    const companionWeightsQuantization = usesCompanionScales
-      ? mergeCompanionScaleQuantization(weightFiles, sourceList)
-      : null;
-    const companionScaleState = usesCompanionScales
-      ? hydrateCompanionScaleQuantization(companionWeightsQuantization!, weightFiles)
-      : null;
-    const resolvedWeightsQuantization = companionScaleState?.hydrated ?? inlineWeightsQuantization;
+    const safetensorsAffineState = parseSafetensorsAffineQuantization(
+      graphDocument,
+      weightFiles,
+      sourceList,
+    );
 
     const tensorsMap = /* @__PURE__ */ new Map<string, Tensor>();
     const stagedSourceTensors = /* @__PURE__ */ new Map<string, Tensor>();
-    const loadedWeightNames = new Set<string>();
     graph._assertTopologyMutationAllowed();
     for (const safetensors of weightFiles) {
       for (const [name, entry] of safetensors.tensorEntries()) {
-        if (companionScaleState?.companionNames.has(name)) continue;
         const dtype = SafetensorsFile.toGraphDType(entry.dtype);
         if (stagedSourceTensors.has(name)) {
           throw new Error(`[GraphLoader] Tensor '${name}' occurs more than once in the loaded sources.`);
@@ -470,40 +661,41 @@ export class GraphLoader {
         const tensor = graph._createTensor(name, entry.shape, dtype, {
           isWeight: true,
           buffer: safetensors.toRuntimeTypedArray(entry),
-          quantization: resolvedWeightsQuantization?.[name] as QuantizationValue,
+          quantization: safetensorsAffineState.hydrated[name],
         });
         stagedSourceTensors.set(name, tensor);
         tensorsMap.set(name, tensor);
-        loadedWeightNames.add(name);
       }
     }
-    for (const name of Object.keys(resolvedWeightsQuantization || {})) {
-      if (!loadedWeightNames.has(name)) {
-        throw new Error(`[GraphLoader] weights_quantization declares unknown loaded weight '${name}'.`);
-      }
-    }
-    if (config.inputs) {
-      const inputsDef = config.inputs;
+    if (graphDocument.inputs) {
+      const inputsDef = graphDocument.inputs;
       if (!isRecord(inputsDef)) {
-        throw new Error('[GraphLoader] config.inputs must be an object.');
+        throw new Error('[GraphLoader] graph inputs must be an object.');
       }
       for (const [name, info] of Object.entries(inputsDef)) {
-        if (companionScaleState?.companionNames.has(name)) {
+        if (safetensorsAffineState.parameterNames.has(name)) {
           throw new Error(
-            `[GraphLoader] Companion scale '${name}' is reserved storage and cannot be exposed as a graph tensor.`,
+            `[GraphLoader] Quantization parameter '${name}' is reserved storage and cannot be exposed as a graph input.`,
           );
         }
         if (stagedSourceTensors.has(name)) throw new Error(`Tensor '${name}' already exists.`);
         if (!isRecord(info)) {
           throw new Error(`[GraphLoader] Input '${name}' must be an object.`);
         }
+        if (typeof info.dtype !== 'string' ||
+            !RUNTIME_DTYPES.has(info.dtype)) {
+          throw new Error(
+            `[GraphLoader] Input '${name}' requires an explicit canonical dtype ` +
+            "('float32', 'int32', 'int8', or 'uint8').",
+          );
+        }
         const tensor = graph._createTensor(
           name,
           info.shape as readonly number[],
-          (info.dtype || "float32") as RuntimeDType,
+          info.dtype as RuntimeDType,
           {
-          isInput: true,
-          quantization: info.quantization as QuantizationValue,
+            isInput: true,
+            quantization: safetensorsAffineState.hydrated[name],
           },
         );
         stagedSourceTensors.set(name, tensor);
@@ -511,31 +703,14 @@ export class GraphLoader {
       }
     }
 
-    if (config.nodes) {
-      GraphLoader._buildFromBlueprint(graph, config, tensorsMap, {
-        baseTensors: stagedSourceTensors,
-        reservedNames: companionScaleState?.companionNames,
-      });
-    } else if (config.model_type) {
-      const modelType = config.model_type;
-      if (typeof modelType !== 'string' || !GraphLoader.ModelBuilders[modelType]) {
-        throw new Error(`[VolvoxAI] Unsupported Hugging Face model_type: '${String(modelType)}'. No builder registered.`);
-      }
-      graph._assertValidState([], stagedSourceTensors, []);
-      graph._commitTopology([], stagedSourceTensors, 'load graph sources');
-      console.log(`[VolvoxAI] Building graph on the fly using model builder for '${modelType}'...`);
-      GraphLoader.ModelBuilders[modelType](graph, config, tensorsMap);
-    } else {
-      throw new Error("[VolvoxAI] config.json must contain either 'nodes' (Volvox blueprint) or 'model_type' (Hugging Face).");
+    if (!Array.isArray(graphDocument.nodes)) {
+      throw new Error("[GraphLoader] graph.json must contain a nodes array.");
     }
-
-    for (const name of companionScaleState?.companionNames || []) {
-      if (graph.tensors.has(name)) {
-        throw new Error(
-          `[GraphLoader] Companion scale '${name}' is reserved storage and cannot be exposed as a graph tensor.`,
-        );
-      }
-    }
+    GraphLoader._buildFromGraphDocument(graph, graphDocument, tensorsMap, {
+      baseTensors: stagedSourceTensors,
+      reservedNames: safetensorsAffineState.parameterNames,
+      quantizationByTensor: safetensorsAffineState.hydrated,
+    });
 
     graph.weightFiles = weightFiles;
 
@@ -543,10 +718,9 @@ export class GraphLoader {
     GraphLoader._dequantizeConvWeights(graph);
     GraphLoader._normalizeConvWeightsForImageLayout(graph);
     
-    // `_buildFromBlueprint` refreshes inferred leaves and, when present,
-    // applies the blueprint's explicit `outputs` selection.  Do not recompute
-    // the leaves here: doing so would silently discard a package author's
-    // requested public outputs.
+    // `_buildFromGraphDocument` applies the package's required explicit
+    // `outputs` selection. Do not recompute leaves here: doing so would
+    // silently discard the package author's public result contract.
     const outputNames = [...graph.outputNames];
     GraphLoader._resolveMatMulLayouts(graph);
     graph.assertValid();
@@ -558,30 +732,40 @@ export class GraphLoader {
     return GraphOperatorNormalizer.resolveMatMulLayouts(graph);
   }
 
+  static _parseSafetensorsAffineQuantization(
+    graphDocument: UnknownRecord,
+    weightFiles: readonly SafetensorsFile[],
+    sourceList: readonly string[],
+  ): SafetensorsAffineState {
+    rejectLegacyQuantizationFields(graphDocument);
+    return parseSafetensorsAffineQuantization(graphDocument, weightFiles, sourceList);
+  }
+
   static _assertBrowserQuantizationSupported(
     graph: Graph | { nodes: ConcreteNode[] },
   ): unknown {
     return validatePortableQuantizedGraph(graph);
   }
 
-  static _buildFromBlueprint(
+  static _buildFromGraphDocument(
     graph: Graph,
-    config: UnknownRecord,
+    graphDocument: UnknownRecord,
     tensorsMap: Map<string, Tensor>,
-    options: BlueprintBuildOptions = {},
+    options: GraphBuildOptions = {},
   ): void {
-    const nodesDef = config.nodes;
+    rejectLegacyQuantizationFields(graphDocument);
+    const nodesDef = graphDocument.nodes;
     if (!Array.isArray(nodesDef)) {
-      throw new Error('[GraphLoader] config.nodes must be an array.');
+      throw new Error('[GraphLoader] graph nodes must be an array.');
     }
 
-    // Validate the complete name topology before mutating the graph. Blueprint
+    // Validate the complete name topology before mutating the graph. Document
     // outputs are definitions, never aliases: they cannot overwrite an input,
     // weight, or earlier node output, and inputs may only reference sources or
     // values produced by an earlier node.
     const baseTensors = options.baseTensors || graph.tensors;
     if (!(baseTensors instanceof Map)) {
-      throw new Error('[GraphLoader] Blueprint baseTensors must be a Map.');
+      throw new Error('[GraphLoader] Graph document baseTensors must be a Map.');
     }
     const reservedNames = options.reservedNames || new Set();
     const availableNames = new Set(baseTensors.keys());
@@ -589,7 +773,19 @@ export class GraphLoader {
       if (!isRecord(nodeDef)) {
         throw new Error(`[GraphLoader] Node at index ${nodeIndex} must be an object.`);
       }
-      const nodeLabel = String(nodeDef.id ?? nodeDef.opType ?? nodeDef.op ?? '<unnamed>');
+      const nodeLabel = String(nodeDef.id ?? nodeDef.opType ?? '<unnamed>');
+      if (hasOwn(nodeDef, 'op')) {
+        throw new Error(`[GraphLoader] Node ${nodeLabel} contains unsupported field 'op'; use 'opType'.`);
+      }
+      if (typeof nodeDef.opType !== 'string' || nodeDef.opType.trim().length === 0) {
+        throw new Error(`[GraphLoader] Node ${nodeLabel} opType must be a non-empty string.`);
+      }
+      if (!RUNTIME_OPERATOR_NAMES.has(nodeDef.opType)) {
+        throw new Error(
+          `[GraphLoader] Node ${nodeLabel} uses unknown or offline-only current-v1 ` +
+          `opType '${nodeDef.opType}'.`,
+        );
+      }
       if (!isRecord(nodeDef.inputs)) {
         throw new Error(`[GraphLoader] Node ${nodeLabel} inputs must be an object.`);
       }
@@ -607,40 +803,33 @@ export class GraphLoader {
         if (typeof tensorName !== 'string' || tensorName.trim().length === 0) {
           throw new Error(`[GraphLoader] Node ${nodeLabel} output '${key}' requires a tensor name.`);
         }
-        if (availableNames.has(tensorName)) {
-          throw new Error(`[GraphLoader] Node ${nodeLabel} output '${key}' collides with existing tensor '${tensorName}'.`);
-        }
         if (reservedNames.has(tensorName)) {
           throw new Error(
-            `[GraphLoader] Companion scale '${tensorName}' is reserved storage and cannot be exposed as a graph tensor.`,
+            `[GraphLoader] Quantization parameter '${tensorName}' is reserved storage and cannot be produced by a graph node.`,
           );
+        }
+        if (availableNames.has(tensorName)) {
+          throw new Error(`[GraphLoader] Node ${nodeLabel} output '${key}' collides with existing tensor '${tensorName}'.`);
         }
         availableNames.add(tensorName);
       }
     }
 
-    let explicitOutputNames: string[] | null = null;
-    if (Object.prototype.hasOwnProperty.call(config, 'outputs')) {
-      const outputCandidates = Array.isArray(config.outputs)
-        ? [...config.outputs]
-        : isRecord(config.outputs)
-          ? Object.values(config.outputs)
-          : null;
-      if (!outputCandidates ||
-          outputCandidates.some((name) => typeof name !== 'string' || !availableNames.has(name)) ||
-          new Set(outputCandidates).size !== outputCandidates.length) {
-        throw new Error(
-          '[GraphLoader] config.outputs must be an array of unique graph tensor names ' +
-          'or a legacy alias object with unique graph tensor-name values.',
-        );
-      }
-      explicitOutputNames = outputCandidates as string[];
+    const explicitOutputNames = declaredOutputNames(graphDocument);
+    if (explicitOutputNames.some((name) => !availableNames.has(name))) {
+      throw new Error(
+        '[GraphLoader] graph outputs must name declared graph tensors.',
+      );
+    }
+    if (explicitOutputNames.some((name) => reservedNames.has(name))) {
+      throw new Error(
+        '[GraphLoader] quantization parameter tensors cannot be public graph outputs.',
+      );
     }
 
     // Stage every node against local collections, validate the complete graph
-    // once, then commit once. Calling graph.addOp() here used to validate every
-    // previously loaded weight and node after each insertion, turning a model
-    // import into O(nodes * tensors) quantization validation.
+    // once, then commit once. Per-node graph mutation would repeatedly validate
+    // loaded weights and nodes, making package import O(nodes * tensors).
     graph._assertTopologyMutationAllowed();
     const stagedNodes = [...graph.nodes];
     const stagedTensors = new Map<string, Tensor>(baseTensors);
@@ -649,9 +838,9 @@ export class GraphLoader {
     for (const nodeDef of nodesDef) {
       // The first validation pass above establishes these object shapes.
       if (!isRecord(nodeDef) || !isRecord(nodeDef.inputs) || !isRecord(nodeDef.outputs)) {
-        throw new Error('[GraphLoader] Blueprint node shape changed during validation.');
+        throw new Error('[GraphLoader] Graph document node shape changed during validation.');
       }
-      const nodeLabel = String(nodeDef.id ?? nodeDef.opType ?? nodeDef.op ?? '<unnamed>');
+      const nodeLabel = String(nodeDef.id ?? nodeDef.opType ?? '<unnamed>');
       const nodeInputs = nodeDef.inputs;
       const nodeOutputs = nodeDef.outputs;
       const inputs: Record<string, Tensor> = {};
@@ -665,36 +854,19 @@ export class GraphLoader {
         }
         inputs[key] = t;
       }
-      const outputsShape = isRecord(nodeDef.outputs_shape) ? nodeDef.outputs_shape : {};
+      const outputsShape = nodeDef.outputs_shape;
       const outputsDtype = nodeDef.outputs_dtype;
-      const outputsQuantization = nodeDef.outputs_quantization;
-      const hasOutputsDtype = Object.prototype.hasOwnProperty.call(nodeDef, 'outputs_dtype');
-      const hasOutputsQuantization = Object.prototype.hasOwnProperty.call(nodeDef, 'outputs_quantization');
-      if (hasOutputsDtype && !isRecord(outputsDtype)) {
-        throw new Error(`[GraphLoader] Node ${nodeLabel} outputs_dtype must be an object.`);
+      const quantizationByTensor = options.quantizationByTensor;
+      const outputPorts = Object.keys(nodeOutputs);
+      if (!isRecord(outputsShape) || !sameFields(outputsShape, outputPorts)) {
+        throw new Error(
+          `[GraphLoader] Node ${nodeLabel} outputs_shape must exactly describe every output port.`,
+        );
       }
-      if (hasOutputsDtype) {
-        if (!isRecord(outputsDtype)) {
-          throw new Error(`[GraphLoader] Node ${nodeLabel} outputs_dtype must be an object.`);
-        }
-        for (const key of Object.keys(outputsDtype)) {
-          if (!Object.prototype.hasOwnProperty.call(nodeOutputs, key)) {
-            throw new Error(`[GraphLoader] Node ${nodeLabel} outputs_dtype declares unknown output '${key}'.`);
-          }
-        }
-      }
-      if (hasOutputsQuantization && !isRecord(outputsQuantization)) {
-        throw new Error(`[GraphLoader] Node ${nodeLabel} outputs_quantization must be an object.`);
-      }
-      if (hasOutputsQuantization) {
-        if (!isRecord(outputsQuantization)) {
-          throw new Error(`[GraphLoader] Node ${nodeLabel} outputs_quantization must be an object.`);
-        }
-        for (const key of Object.keys(outputsQuantization)) {
-          if (!Object.prototype.hasOwnProperty.call(nodeOutputs, key)) {
-            throw new Error(`[GraphLoader] Node ${nodeLabel} outputs_quantization declares unknown output '${key}'.`);
-          }
-        }
+      if (!isRecord(outputsDtype) || !sameFields(outputsDtype, outputPorts)) {
+        throw new Error(
+          `[GraphLoader] Node ${nodeLabel} outputs_dtype must exactly describe every output port.`,
+        );
       }
       const outputDescriptors: Record<string, NodeOutputSpec<Tensor>> = {};
       for (const [key, tensorNameValue] of Object.entries(nodeOutputs)) {
@@ -703,25 +875,10 @@ export class GraphLoader {
         }
         const tensorName = tensorNameValue;
         const shape = outputsShape[key];
-        if (!hasOutputsDtype) {
-          if (isRecord(outputsQuantization) && outputsQuantization[key] != null) {
-            throw new Error(`[GraphLoader] Node ${nodeLabel} output '${key}' quantization requires an explicit outputs_dtype.`);
-          }
-          // Existing blueprints only declare shapes. Preserve their historic F32
-          // default while still allowing the descriptor form Graph already accepts.
-          if (Array.isArray(shape)) {
-            outputDescriptors[key] = { name: tensorName, shape: shape as number[] };
-          } else if (isRecord(shape)) {
-            if (shape.name != null && shape.name !== tensorName) {
-              throw new Error(`[GraphLoader] Node ${nodeLabel} output '${key}' has conflicting tensor names.`);
-            }
-            outputDescriptors[key] = { ...shape, name: tensorName } as NodeOutputSpec<Tensor>;
-          } else {
-            throw new Error(`[GraphLoader] Node ${nodeLabel} output '${key}' requires a shape.`);
-          }
-          continue;
+        if (!Array.isArray(shape)) {
+          throw new Error(`[GraphLoader] Node ${nodeLabel} output '${key}' requires a shape array.`);
         }
-        const dtype = isRecord(outputsDtype) ? outputsDtype[key] : undefined;
+        const dtype = outputsDtype[key];
         if (typeof dtype !== 'string' || !dtype) {
           throw new Error(`[GraphLoader] Node ${nodeLabel} output '${key}' requires a declared dtype.`);
         }
@@ -730,41 +887,17 @@ export class GraphLoader {
         } catch {
           throw new Error(`[GraphLoader] Node ${nodeLabel} output '${key}' has unsupported dtype '${dtype}'.`);
         }
-        if (Array.isArray(shape)) {
-          outputDescriptors[key] = {
-            name: tensorName,
-            shape: shape as number[],
-            dtype: dtype as RuntimeDType,
-            ...(isRecord(outputsQuantization) && outputsQuantization[key] != null
-              ? { quantization: outputsQuantization[key] as QuantizationValue }
-              : {}),
-          } as NodeOutputSpec<Tensor>;
-        } else if (isRecord(shape)) {
-          if (shape.name != null && shape.name !== tensorName) {
-            throw new Error(`[GraphLoader] Node ${nodeLabel} output '${key}' has conflicting tensor names.`);
-          }
-          if (shape.dtype != null && shape.dtype !== dtype) {
-            throw new Error(`[GraphLoader] Node ${nodeLabel} output '${key}' has conflicting shape and outputs_dtype dtypes.`);
-          }
-          if (shape.quantization != null &&
-              isRecord(outputsQuantization) && outputsQuantization[key] != null) {
-            throw new Error(`[GraphLoader] Node ${nodeLabel} output '${key}' cannot declare quantization in both its shape descriptor and outputs_quantization.`);
-          }
-          outputDescriptors[key] = {
-            ...shape,
-            name: tensorName,
-            dtype: dtype as RuntimeDType,
-            ...(isRecord(outputsQuantization) && outputsQuantization[key] != null
-              ? { quantization: outputsQuantization[key] as QuantizationValue }
-              : {}),
-          } as NodeOutputSpec<Tensor>;
-        } else {
-          throw new Error(`[GraphLoader] Node ${nodeLabel} output '${key}' requires a shape.`);
-        }
+        outputDescriptors[key] = {
+          name: tensorName,
+          shape: shape as number[],
+          dtype: dtype as RuntimeDType,
+          ...(quantizationByTensor?.[tensorName] != null
+            ? { quantization: quantizationByTensor[tensorName] }
+            : {}),
+        } as NodeOutputSpec<Tensor>;
       }
-      const opName = nodeDef.opType || nodeDef.op;
       const node = graph._prepareNode({
-        opType: opName as string,
+        opType: nodeDef.opType as string,
         inputs,
         outputs: outputDescriptors,
         params: (isRecord(nodeDef.params) ? nodeDef.params : {}) as NodeParameters,
@@ -784,10 +917,10 @@ export class GraphLoader {
       // Install an explicit public-output selection before the only commit so
       // _refreshOutputNames preserves it without a second topology revision.
       if (explicitOutputNames) {
-        graph.outputNames = [...explicitOutputNames];
+        graph._setOutputNames(explicitOutputNames);
         graph._outputsExplicit = true;
       }
-      graph._commitTopology(stagedNodes, stagedTensors, 'load graph blueprint');
+      graph._commitTopology(stagedNodes, stagedTensors, 'load graph document');
       for (const node of stagedNodes) {
         if (typeof node.id === 'number' && node.id >= graph._nextNodeId) {
           graph._nextNodeId = node.id + 1;
@@ -796,9 +929,6 @@ export class GraphLoader {
     });
     for (const [name, value] of stagedOutputs) tensorsMap.set(name, value);
   }
-
-  // Registry for Hugging Face model builders
-  static ModelBuilders: Record<string, ModelBuilder> = {};
 
   static _dequantizeConvWeights(graph: Graph): unknown {
     return GraphOperatorNormalizer.dequantizeConvWeights(graph);

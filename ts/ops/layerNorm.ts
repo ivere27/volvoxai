@@ -12,14 +12,17 @@ export function _cpuLayerNorm(node) {
     const seq_len = node.inputs.input.shape.slice(0, -1).reduce((a, b) => a * b, 1);
     for (let i = 0; i < seq_len; i++) {
       const offset = i * d_model;
-      let sum = 0, sq_sum = 0;
+      let sum = 0;
       for (let j = 0; j < d_model; j++) {
-        const val = inBuf[offset + j];
-        sum += val;
-        sq_sum += val * val;
+        sum += inBuf[offset + j];
       }
       const mean = sum / d_model;
-      const variance = sq_sum / d_model - mean * mean;
+      let varianceSum = 0;
+      for (let j = 0; j < d_model; j++) {
+        const centered = inBuf[offset + j] - mean;
+        varianceSum += centered * centered;
+      }
+      const variance = varianceSum / d_model;
       const inv_std = 1 / Math.sqrt(variance + eps);
       for (let j = 0; j < d_model; j++) {
         const norm_val = (inBuf[offset + j] - mean) * inv_std;

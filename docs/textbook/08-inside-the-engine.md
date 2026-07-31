@@ -21,7 +21,7 @@ systems work lives.
 
 ---
 
-## 8.1 One graph, four engines (the tiers)
+## 8.1 One graph, four providers (the tiers)
 
 > 🌱 **Idea.** The same model can be run four ways in a browser, from "fanciest hardware" down to
 > "always works everywhere," and VolvoxAI picks the best one your device offers. They all compute
@@ -33,32 +33,31 @@ binary). They differ only in **who does the arithmetic** and **where the tensors
 
 ```mermaid
 flowchart TD
-    G["Graph + weights"] --> I["VolvoxAI.init(backend)"]
-    I --> T1["Tier 1 · WebNN<br/>hand graph to browser ML API → NPU/GPU/CPU"]
-    I --> T2["Tier 2 · WebGPU<br/>one compute pipeline per node, all on GPU"]
-    I --> T3["Tier 3 · WASM SIMD<br/>compiled C kernels over linear memory"]
-    I --> T4["Tier 4 · Pure JS<br/>reference kernels — slow, always correct"]
-    T1 -.fallback.-> T3
-    T3 -.fallback.-> T4
+    G["graph.json + safetensors"] --> R["VolvoxAI.createRuntime()"]
+    R --> M["Runtime.loadModel() / createModel()"]
+    M --> C["Model.compile({ backend: policy })"]
+    C --> T1["WebNN provider<br/>browser ML API → NPU/GPU/CPU"]
+    C --> T2["WebGPU provider<br/>compiled GPU route"]
+    C --> T3["WASM provider<br/>compiled C kernels over linear memory"]
+    C --> T4["CPU provider<br/>reference kernels"]
 ```
 
 - **Tier 4 — Pure JS** (`ts/ops/*.ts`): the naive kernels we read all book. Slow but simple and
   dependency-free. **It is the ground truth**: every faster tier is checked against it.
-- **Tier 3 — WASM** (`ts/backends/WasmEngine.ts` + `native/src/kernels/*.c`): the *same* ops compiled to
-  WebAssembly with SIMD. A bump allocator drops every tensor into one flat block of linear
-  memory; `execute()` calls a compiled C kernel per node. Often 5–50× faster than pure JS.
-- **Tier 2 — WebGPU** (`ts/backends/GraphExecutor.ts` + `shaders/inference/*.wgsl`): each op becomes a GPU **compute
-  shader**. At compile time it uploads all weights to VRAM and builds *one pipeline per node*;
-  `execute()` replays them in a single command stream, **with no CPU round-trip between nodes**,
-  so the whole model stays resident on the GPU. If a needed shader is missing, the current
-  executor warns and skips that node; use WASM/CPU for models that require unsupported ops.
-- **Tier 1 — WebNN** (`ts/backends/WebNNEngine.ts`): hands the graph to the browser's own neural-network
-  API, which may dispatch to a dedicated **NPU**. Falls through to a lower tier for any op it
-  doesn't support.
+- **Tier 3 — WASM**: the *same* ops compiled to WebAssembly with SIMD. A bump allocator drops every
+  tensor into one flat block of linear memory; context execution calls compiled C kernels. Often
+  5–50× faster than pure JS.
+- **Tier 2 — WebGPU**: supported ops become GPU **compute shaders**. Compilation uploads weights to
+  VRAM and builds the selected route; execution replays it with no host readback between adjacent
+  GPU nodes. A required unsupported route makes compilation fail unless the caller's compile policy
+  explicitly allows operator fallback. Execution never silently skips a node.
+- **Tier 1 — WebNN**: hands supported graph regions to the browser's own neural-network API, which
+  may dispatch to a dedicated **NPU**.
 
-🔬 The design principle: **choose a viable backend up front.** WebNN can fall through when graph
-compilation fails, and WASM can fall back to pure JS helpers. WebGPU should be used for graphs
-whose ops are covered by shaders.
+🔬 The design principle: **choose and prove a viable route at compile time.** The compile report
+records the selected provider, route evidence, and provider-reported device identity when available.
+That route stays fixed for the compiled model; an execution error is reported instead of silently
+trying another backend.
 
 ---
 
@@ -81,6 +80,15 @@ whose ops are covered by shaders.
 The result: the naive kernel might use **2–5%** of the chip's real throughput. Optimization is
 about feeding the SIMD units and respecting the cache.
 
+> 🔬 **Under the hood: compute-bound vs memory-bound (the roofline).** Every kernel is capped by one of
+> two ceilings — how many multiply-adds the chip can do per second, or how fast it can move bytes from
+> RAM. Which one bites is decided by **arithmetic intensity**: FLOPs per byte loaded. A 1×1 conv reuses
+> each loaded weight across many pixels (high intensity → compute-bound, so SIMD helps), while an
+> elementwise `Add` touches each byte once (low intensity → memory-bound, where more SIMD does
+> *nothing*). That's why fusion (§8.4) and buffer reuse (§8.5) matter as much as a fast matmul: they
+> attack the memory ceiling, not the compute one. The cache hierarchy is the same story in miniature —
+> an L1 hit is a few cycles, a trip to RAM is a couple hundred.
+
 ---
 
 ## 8.3 From naive to fast: the same math, rearranged
@@ -90,6 +98,10 @@ about feeding the SIMD units and respecting the cache.
 > neatly, hand it to a matrix-multiply the chip is superb at, do many multiplies per instruction,
 > and split the work across cores. Correctness lives in the simple version; *speed lives in the
 > layout.*
+>
+> *Same total, faster path:* adding up a column of numbers gives the same sum whether you go
+> top-to-bottom or group them in pairs — but one order might let you use both hands at once. Fast
+> kernels only change the *order and grouping* of the adds, never the total.
 
 🔧 Optimized kernels never change *what* is computed (the output is identical to Tier 4) — they
 change *the order and layout* of the work. VolvoxAI's hot paths include
@@ -124,6 +136,13 @@ naive conv                      optimized conv (im2col + GEMM)
 The lesson: **correctness lives in the naive kernel; performance lives in memory layout.**
 Read `ts/ops/conv2D.ts`, then diff it against `native/src/kernels/conv_f32_opt.c` to see the two
 halves of the craft.
+
+> 🔬 **Under the hood: im2col isn't free — so the fast path often skips it.** Materializing the unfolded
+> patch matrix inflates the input by roughly `k_h · k_w ×` (a 3×3 conv → ~9× the memory, briefly).
+> That's fine for one big conv, but for the *many* 1×1 convs here there's nothing to unfold — a 1×1 conv
+> already *is* a matrix multiply — which is why "pointwise GEMM" is the single biggest win. Production
+> kernels also use **implicit im2col**: index straight into the original tensor from inside the GEMM
+> loop, getting the matmul's speed without ever building the big matrix.
 
 ### 🔬 Anatomy of the dense matrix multiply
 
@@ -188,6 +207,13 @@ buffers can share memory, because their lifetimes don't overlap — the **arena 
 planner** mentioned above. This is why VolvoxAI can run a model whose tensors *sum* to hundreds of
 MB in a fraction of that peak RAM: the same physical bytes are recycled node after node.
 
+> 🔬 **Under the hood: buffer reuse is graph-coloring.** The planner computes each tensor's **live
+> interval** — from the node that writes it to the last node that reads it — then hands two tensors the
+> same buffer only when their intervals don't overlap. It's the *exact* problem a compiler solves when
+> it packs many variables into few CPU registers (register allocation / interval coloring). That's how
+> peak memory for the detector fell from **88.8 MB → 18.8 MB**: not fewer tensors, just fewer
+> *simultaneously live* ones sharing the same physical bytes.
+
 ```
 node lifetimes (─ = alive):     buffer reuse:
   A: ───                          A and C never overlap → give them the SAME buffer
@@ -214,7 +240,7 @@ That's the entire system. Everything else is one more op, one more backend, or o
 optimization on this skeleton.
 
 > **This chapter covered the four *browser* tiers.** VolvoxAI also ships a full **native** engine
-> (a freestanding C binary spanning CPU + Vulkan / OpenGL / Metal / Android NNAPI) that runs the
-> *same blueprint* on a desktop, a phone, or a robot. That's the whole next chapter.
+> (a freestanding C binary spanning CPU + Vulkan / OpenGL / opt-in CUDA / Metal / Android NNAPI) that runs the
+> *same graph package* on a desktop, a phone, or a robot. That's the whole next chapter.
 
 **Next:** [Chapter 9 — The Native Engine →](09-native-engine-architecture.md)

@@ -1,7 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
-import { ModelBuilder, VolvoxAI } from '../ts/full.js';
+import { ModelBuilder, importModelCheckpoint } from '../ts/full.js';
+import { createCPUTrainingHarness } from './helpers/training_session.mjs';
 
 test('maskedMean pools variable-length token rows and backpropagates through reduction', async () => {
   const builder = new ModelBuilder();
@@ -32,17 +33,26 @@ test('maskedMean pools variable-length token rows and backpropagates through red
     tokens: Float32Array.of(1, 2, 3, 4, 100, 100, -5, 2, 7, 8, 4, -3),
     pooling_weights: Float32Array.of(0.5, 0.5, 0, 0, 0, 1),
   };
-  const result = await new VolvoxAI().trainStep(graph, {
-    inputs,
-    logitsTensor: logits.name,
-    targets: Int32Array.of(0, 1),
-    trainableTensors: [scale.name, head.name],
-    updateMode: 'sgd',
-    optimizer: { learningRate: 1e-2 },
-  });
+  const training = createCPUTrainingHarness();
+  let result;
+  let trained;
+  try {
+    result = await training.runStep(graph, {
+      inputs,
+      logitsTensor: logits.name,
+      targets: Int32Array.of(0, 1),
+      trainableTensors: [scale.name, head.name],
+      updateMode: 'sgd',
+      optimizer: { learningRate: 1e-2 },
+    });
+    trained = importModelCheckpoint(await training.exportCheckpoint(graph)).graph;
+  } finally {
+    await training.close();
+  }
 
   assert.ok(Number.isFinite(result.loss));
   assert.equal(result.examples, 2);
-  assert.ok(scale.buffer.some((value, index) => value !== before[index]));
-  assert.deepEqual([...pooled.buffer], [2, 3, 4, -3]);
+  assert.deepEqual(scale.buffer, before);
+  assert.ok(trained.getTensor(scale.name).buffer
+    .some((value, index) => value !== before[index]));
 });

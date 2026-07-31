@@ -5,9 +5,8 @@
 
 *Goal: Chapter 6 explained the int8 **math** — the `scale` + `zero_point` recipe and how `QConv2D`
 runs in integers. This chapter answers the question it left open: **where do those numbers come
-from?** We follow VolvoxAI's quantization subsystem (`volvoxai_ptq_*` in `volvoxai_training.h`,
-`native/src/training/quantization*.c`) as it turns a trained FP32 model into a shippable int8 one —
-first with post-training quantization (PTQ), then with quantization-aware training (QAT).*
+from?** We use the full profile's PTQ authoring tools to turn a trained FP32 Graph into a shippable
+int8 package, then explain when quantization-aware training (QAT) is useful.*
 
 > 🌱 **The big idea.** Rounding a model onto the coarse ruler from Chapter 6 sounds automatic, but
 > there's a catch: **how wide should the ruler be?** For the model's fixed knobs (weights) that's
@@ -54,24 +53,37 @@ immediately; activations must be **observed**.
 
 > 🌱 **Idea.** The knobs are easy: each group of them gets its *own* ruler sized to its own biggest
 > value, so no group loses precision to a neighbor's outlier. No data needed — it's pure arithmetic.
+>
+> *Per-channel, by hand.* Say channel A's largest-magnitude weight is `0.8` and channel B's is `0.05`.
+> One shared ruler sized to `0.8` would round every one of B's tiny weights onto almost the same few
+> ticks — B loses all its detail. Give B its *own* ruler (`scale = 0.05/127`) and its small values
+> spread back across the full 256 ticks. One ruler per channel, and nobody is crushed by a loud
+> neighbor.
 
-🔬 Weight quantization is deterministic. VolvoxAI packs a weight tensor to int8 with **one symmetric
-scale per output channel** (`volvoxai_ptq_pack_weight_i8`):
+🔬 Weight quantization is deterministic. `packPTQWeight()` packs a weight tensor to int8 with
+**one symmetric scale per output channel**:
 
-```c
-// pack row-major weights, one I8 scale per `axis` element (axis 0 = output channel)
-int volvoxai_ptq_pack_weight_i8(const float *values, const int32_t *shape,
-                                int32_t ndim, int32_t axis, int8_t *output,
-                                float *scales, int32_t scale_count,
-                                uint64_t *saturation_count);
+```javascript
+const packed = packPTQWeight(values, [outputChannels, inputChannels], {
+  axis: 0,
+  name: 'projection.weight.i8',
+});
 ```
 
 Why **per-channel** and not one scale for the whole tensor? Because one unusually large channel would
 stretch the ruler and crush everyone else's precision (Chapter 6 §6.2). Giving each output channel
 its own `scale = max(|channel|)/127` keeps every channel's precision independent — the trick that
-holds int8 accuracy near FP32. Biases get their own companion step (`volvoxai_ptq_pack_bias_i32`),
-quantized into int32 using the product of the input and weight scales. `saturation_count` reports how
+holds int8 accuracy near FP32. `packPTQBias()` quantizes biases into int32 using the product of the
+input and weight scales. `saturationCount` reports how
 many values hit the ±127 rail, so you can catch a badly-scaled tensor.
+
+> 🔬 **Under the hood: the narrow range and the int32 bias.** Symmetric weight packing uses
+> `scale = max(|channel|) / 127` — dividing by **127, not 128** — so the range stays balanced
+> `[−127, 127]` and no legal weight ever maps to the lone extra code `−128`. Biases are packed to
+> **int32** as `round(bias / (input_scale · weight_scale))`, i.e. into the *same units* as the int32
+> accumulator from Chapter 6 §6.4, so a bias can be added straight into the accumulate with no separate
+> rescale. `saturation_count` counts values that slammed into the ±127 rail; a large count is your
+> signal that the ruler is mis-sized and precision is leaking.
 
 ## 7.3 Activations: calibration by observation
 
@@ -80,30 +92,37 @@ many values hit the ±127 rail, so you can catch a badly-scaled tensor.
 > highs and lows set each ruler's width. Garbage in, garbage out — if your examples aren't typical,
 > your rulers will be wrong.
 
-🔧 For activations, VolvoxAI runs the FP32 model on a small **calibration set** (a few hundred
-representative inputs) and *watches* each tensor go by. An **observer** just tracks the running range
-(`volvoxai_training.h`):
+🔧 For activations, run the FP32 model on a small **calibration set** and declare every calibration
+tensor as a Graph output. `ExecutionResult` exposes those stable output snapshots; `PTQObserver`
+tracks their copied F32 ranges:
 
-```c
-typedef struct volvoxai_ptq_observer {
-    float minimum;
-    float maximum;
-    uint64_t sample_count;
-} volvoxai_ptq_observer_t;
-
-// after each forward pass, fold a named F32 tensor's values into its observer:
-int volvoxai_engine_ptq_observe_tensor(const char *tensor_name,
-                                       volvoxai_ptq_observer_t *observer);
+```javascript
+const observer = new PTQObserver();
+for (const inputs of calibrationSamples) {
+  const result = await context.execute(inputs);
+  try {
+    observer.observe(await result.output('encoder.out').read());
+  } finally {
+    await result.close();
+  }
+}
 ```
 
-🔬 After enough samples, the observed `[minimum, maximum]` becomes a `scale` + `zero_point`
-(`volvoxai_ptq_calculate_params`), choosing between two schemes:
+🔬 After enough samples, `derivePTQParameters(observer, options)` turns the observed
+`[minimum, maximum]` into a `scale` + `zero_point`, choosing between two schemes:
 
-- **Symmetric** (`VOLVOXAI_PTQ_SYMMETRIC`) — range centered on zero, `zero_point = 0`. Best for
+- **Symmetric** — range centered on zero, `zero_point = 0`. Best for
   weights and for activations that swing both ways.
-- **Asymmetric** (`VOLVOXAI_PTQ_ASYMMETRIC`) — an arbitrary `[min,max]` mapped onto the ruler with a
+- **Asymmetric** — an arbitrary `[min,max]` mapped onto the ruler with a
   nonzero `zero_point`. Best for one-sided activations (e.g. post-ReLU, always ≥ 0), where it doesn't
   waste half the ticks on negatives that never occur.
+
+> 🔬 **Under the hood: min/max is the simplest observer, not the only one.** Tracking the running
+> `[min, max]` is easy but fragile — one freak outlier stretches the ruler and coarsens everything else.
+> Production calibrators often use **percentiles**, or a **histogram + KL-divergence** ("entropy"
+> calibration) to clip rare outliers and keep the bulk of the distribution sharp, or an EMA across
+> batches. VolvoxAI's `PTQObserver` deliberately uses transparent min/max state and a sample count,
+> so you can see exactly what set each scale.
 
 > **Calibration data matters.** 🌱 The rulers are only as good as the examples you show — feed it
 > blank inputs and you get meaningless rulers. 🔬 The `tiny_receipt` tooling makes this explicit: a
@@ -114,36 +133,41 @@ int volvoxai_engine_ptq_observe_tensor(const char *tensor_name,
 ## 7.4 Post-training quantization, end to end
 
 > 🌱 **Idea.** Put it together: measure the knobs, watch the flowing numbers on real examples, pick
-> all the rulers, and write out a new — much smaller — model in the *same two-file format* from
-> Chapter 1. No re-training needed. The engine even lets you *measure* how much accuracy you lost, so
+> all the rulers, and write out a new — much smaller — model in the package format from
+> Chapter 1. No re-training needed. You can *measure* how much accuracy you lost, so
 > you decide honestly whether the small version is good enough.
 
-🔧 VolvoxAI ties weight packing and activation calibration together in an explicit **PTQ plan**. The
-plan observes a loaded FP32 graph but never rewrites it — *you* author which nodes become quantized
-(the engine stays explicit; it never guesses how to cross a precision boundary):
+🔧 The graph author chooses the boundaries; the tools never guess how an unsupported operation
+should cross a precision boundary. `materializePTQWeights()` packs selected F32 weights and biases
+and returns new safetensors bytes plus `artifact.quantization`, a reference-only table for the new
+Graph:
 
-```c
-VolvoxAIPTQPlan *plan = volvoxai_ptq_plan_create();      // bound to the loaded FP32 model
-volvoxai_ptq_plan_add_tensor(plan, &tensor_spec);        // an activation to calibrate (dtype, scheme)
-volvoxai_ptq_plan_add_layer(plan, &layer_spec);          // a node → QLinear / QConv2D, its weights
-// ... stream calibration inputs:
-volvoxai_engine_ptq_plan_calibrate_sample(plan, "sample-0", bindings, n);
-// ... inspect what it found, then emit the package:
-volvoxai_ptq_plan_tensor_params(plan, "vqa.enc.0.out", &params);   // scale, zero_point, saturation
-volvoxai_ptq_plan_write_package(plan, &options);         // two files: config + safetensors
+```javascript
+const artifact = materializePTQWeights(trainingGraph, [{
+  name: 'decoder.proj.weight',
+  outputName: 'decoder.proj.weight.i8',
+  scaleName: 'decoder.proj.weight.scale',
+  zeroPointName: 'decoder.proj.weight.zero_point',
+  bias: 'decoder.proj.bias',
+  biasOutputName: 'decoder.proj.bias.i32',
+  inputScale: activationParameters['decoder.proj.input'].scale,
+  axis: 0,
+}]);
 ```
 
-The output is the same **two-file blueprint** you met in Chapter 1 — a `config.json` whose quantized
-nodes are now `QLinear`/`QConv2D` with `weight_scale` descriptors, plus a `model.safetensors`
-carrying the packed int8 weights and their scales. It loads and runs on the ordinary inference engine
+The output is the same **package** you met in Chapter 1 — a `graph.json` with the exact root
+discriminator `"format": "volvox-graph/v1"`, whose quantized nodes are now
+`QLinear`/`QConv2D` and whose sole central table refers to scale and zero-point tensors, plus a
+`model.safetensors` carrying the packed int8 weights and every numeric affine parameter. No numeric
+scale or zero point is stored in JSON or safetensors metadata. It loads and runs through the ordinary
+`Runtime → Model → CompiledModel → ExecutionContext → ExecutionResult` lifecycle
 (Chapters 8–9) with no quantization code involved at run time. This is the "train → PTQ → W8A8" path
 the `tiny_receipt` example ships.
 
 🔬 Two safety properties worth calling out, because they're baked into the API:
 
-- **A plan is pinned to one model generation.** Reloading, editing the graph, training a step, or
-  activating an adapter *invalidates* the plan — its scales would no longer describe the live weights.
-  Stale operations fail rather than emit a corrupt package.
+- **Calibration records identify one Graph revision.** Editing the graph, training another step, or
+  selecting another adapter means collecting new ranges; old scales no longer describe those weights.
 - **Error vs FP32 is measurable.** Because the FP32 graph is right there, you can compare the
   quantized output against it and get a concrete accuracy delta per tensor — the honest way to decide
   whether int8 is acceptable for a given layer.
@@ -164,19 +188,18 @@ The trick is **fake quantization**: during the *training* forward pass, insert a
 The numbers the network sees are now the *actual* int8-rounded values, so the loss reflects the real
 deployed error, and Chapters 4–5 do the rest — the weights learn to be robust to rounding.
 
+> 🔬 **Under the hood: the "straight-through" gradient, precisely.** Forward, fake-quant rounds to the
+> int8 grid; backward, the straight-through estimator treats that round as the **identity** — gradient
+> `1` for values *inside* the representable range and **`0`** for values that saturated past the rails
+> (a "clipped" STE, so a pinned value stops shoving further out). Crucially the fake-quant lives **only
+> in the training forward pass**; the shipped model is plain int8 with no dequant in the middle. And
+> because the scale's gradient `dscale` also flows, the ruler width itself becomes *learnable*, not just
+> observed.
+
 🔬 The catch is the backward pass: the hard round-to-integer step has zero gradient almost everywhere,
-which would kill training. VolvoxAI resolves this exactly where Chapter 4 §4.6 hinted:
-
-```c
-// the integer cast STOPS the gradient (round() has no useful slope) ...
-volvoxai_training_cast_backward_f32(...);              // → dx stopped for integer casts
-// ... but DequantizeLinear passes gradient straight THROUGH the fake-quant:
-volvoxai_training_dequantize_linear_backward_f32(
-    input, input_type, scale, zero_point, zero_point_type,
-    dy, dx, dscale, elements);                          // dx (and even dscale) flow
-```
-
-That is the **straight-through estimator**: pretend the rounding was the identity for gradient
+which would kill training. The QAT Graph therefore stops gradients at a real integer cast but uses a
+fake-quant boundary whose backward rule is a **straight-through estimator**: pretend the rounding was
+the identity for gradient
 purposes, so learning continues while the forward pass still feels the real int8 grid. Because
 `dscale` can also flow, the quantization scales themselves can be *learned* rather than only observed.
 QAT costs a full training run, so it's the tool you reach for only after PTQ's measured error
@@ -216,19 +239,19 @@ here means **int8**, done well, end to end.
 
 - Quantization is a **process**, not a cast: an int8 model is only as good as its `scale`/`zero_point`
   numbers, and producing them is data-driven.
-- **Weights** quantize immediately — deterministic **per-channel symmetric** packing
-  (`pack_weight_i8`), one scale per output channel to protect precision.
+- **Weights** quantize immediately — deterministic **per-channel symmetric** packing with
+  `packPTQWeight()`, one scale per output channel to protect precision.
 - **Activations** must be **observed**: run the FP32 model on a representative **calibration set**,
   track each tensor's range with an **observer**, and turn it into a scale (symmetric or asymmetric).
-- **PTQ** ties these together in an explicit, model-pinned **plan** that packs weights, calibrates
-  activations, measures error vs FP32, and writes the ordinary two-file blueprint — no retraining.
+- **PTQ** ties these together in an explicit authoring flow that packs weights, calibrates
+  activations, measures error vs FP32, and writes a canonical package — no retraining.
 - **QAT** goes further when PTQ's accuracy drop is too big: **fake-quantize** in the training forward
-  pass and let the **straight-through estimator** (`dequantize_linear_backward`) keep gradients
+  pass and let the **straight-through estimator** keep gradients
   flowing, so the weights *learn* to tolerate int8.
 - VolvoxAI's quantization ceiling is a well-executed **int8**; int4 is future work, not a format.
 
 That completes Part III: we can now *find* weights (Part II) and *shrink* them (Part III). Part IV
-returns to the question the whole book started with — how does the engine actually **run** any of
+returns to the question the whole book started with — how does the runtime actually **run** any of
 these graphs, fast, on real hardware?
 
 **Next:** [Chapter 8 — Inside the Browser Engine →](08-inside-the-engine.md)

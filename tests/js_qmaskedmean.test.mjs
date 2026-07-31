@@ -102,21 +102,56 @@ test('QMaskedMean validates complete descriptors before output writes', () => {
 test('GraphLoader and CPUEngine retain QMaskedMean as a typed byte-domain router edge', async () => {
   const graph = new Graph();
   const tensors = new Map();
+  const inputQuantization = { scheme: 'per_tensor', scale: 0.5, zero_point: -1 };
+  const outputQuantization = { scheme: 'per_tensor', scale: 0.5, zero_point: 128 };
   const input = graph.addInput('router_tokens', [1, 3, 2], 'int8', {
-    quantization: { scheme: 'per_tensor', scale: 0.5, zero_point: -1 },
+    quantization: inputQuantization,
   });
   const mask = graph.addInput('router_keep', [1, 3], 'int32');
   tensors.set(input.name, input);
   tensors.set(mask.name, mask);
-  GraphLoader._buildFromBlueprint(graph, {
+  for (const [name, shape, dtype, buffer] of [
+    ['router_tokens.scale', [1], 'float32', Float32Array.of(0.5)],
+    ['router_tokens.zero_point', [1], 'int8', Int8Array.of(-1)],
+    ['router_mean.scale', [1], 'float32', Float32Array.of(0.5)],
+    ['router_mean.zero_point', [1], 'uint8', Uint8Array.of(128)],
+  ]) {
+    tensors.set(name, graph.addWeight(name, shape, dtype, { buffer }));
+  }
+  GraphLoader._buildFromGraphDocument(graph, {
+    format: 'volvox-graph/v1',
+    quantization: {
+      format: 'volvox-affine-safetensors/v1',
+      tensors: {
+        router_tokens: {
+          scheme: 'per_tensor',
+          scale_tensor: 'router_tokens.scale',
+          zero_point_tensor: 'router_tokens.zero_point',
+        },
+        router_mean: {
+          scheme: 'per_tensor',
+          scale_tensor: 'router_mean.scale',
+          zero_point_tensor: 'router_mean.zero_point',
+        },
+      },
+    },
     nodes: [{
       opType: 'QMaskedMean', inputs: { input: 'router_tokens', mask: 'router_keep' },
       outputs: { out: 'router_mean' }, outputs_shape: { out: [1, 2] },
       outputs_dtype: { out: 'uint8' },
-      outputs_quantization: { out: { scheme: 'per_tensor', scale: 0.5, zero_point: 128 } },
       params: {},
     }],
-  }, tensors);
+    outputs: ['router_mean'],
+  }, tensors, {
+    quantizationByTensor: {
+      router_tokens: inputQuantization,
+      router_mean: outputQuantization,
+    },
+    reservedNames: new Set([
+      'router_tokens.scale', 'router_tokens.zero_point',
+      'router_mean.scale', 'router_mean.zero_point',
+    ]),
+  });
   graph.assertValid();
   assert.equal(graph.getTensor('router_mean').dtype, 'uint8');
   assert.ok(graph.getTensor('router_mean').quantization);

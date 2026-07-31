@@ -27,9 +27,14 @@ fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
   var sum = 0.0;
   for (var index_position = 0u; index_position < params.indices_elements;
        index_position = index_position + 1u) {
-    // Gather does not normalize negative indices. Invalid values cannot match
-    // a valid data-axis coordinate, so they make no contribution here.
-    if (indices[index_position] == i32(axis_index)) {
+    var selected = indices[index_position];
+    if (selected < 0) {
+      selected = selected + i32(params.axis_size);
+    }
+    // Truly invalid indices cannot match a valid data-axis coordinate, so
+    // their sentinel-valued forward elements make no gradient contribution.
+    if (selected >= 0 && selected < i32(params.axis_size) &&
+        selected == i32(axis_index)) {
       let output_index = (outer_index * params.indices_elements + index_position) *
         params.inner + inner_index;
       sum = sum + grad_output[output_index];

@@ -13,7 +13,7 @@ function qArgMaxGraph() {
   const { out } = graph.addOp('QArgMax', { input }, {
     out: { name: 'out', shape: [2, 2], dtype: 'int32' },
   }, { axis: 1 });
-  graph.outputNames = [out.name];
+  graph.setOutputs([out.name]);
   return { graph, node: graph.nodes[0], input, out };
 }
 

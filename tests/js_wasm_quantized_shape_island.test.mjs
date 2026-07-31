@@ -36,11 +36,29 @@ function output(name, shape, dtype, scale, zeroPoint) {
 }
 
 function forbidCpuFallbacks(engine) {
-  for (const helper of ['_cpuReshape', '_cpuResize', '_cpuConcat2', '_cpuMaxPool2D']) {
+  for (const helper of [
+    '_cpuReshape', '_cpuResize', '_cpuConcat2', '_cpuMaxPool2D', '_cpuTranspose',
+  ]) {
     engine[helper] = () => {
       throw new Error(`quantized WASM shape-island dispatch must not call ${helper}`);
     };
   }
+}
+
+function byteTransposeGraph(dtype) {
+  const graph = new Graph();
+  const zeroPoint = dtype === 'int8' ? -3 : 123;
+  const input = graph.addInput('input', [1, 2, 2, 3], dtype, {
+    quantization: quantization(0.125, zeroPoint),
+  });
+  const { out: nhwc } = graph.addOp('Transpose', { input }, {
+    out: output('nhwc', [1, 2, 3, 2], dtype, 0.125, zeroPoint),
+  }, { perm: [0, 2, 3, 1] });
+  const { out } = graph.addOp('Transpose', { input: nhwc }, {
+    out: output('out', [1, 2, 2, 3], dtype, 0.125, zeroPoint),
+  }, { perm: [0, 3, 1, 2] });
+  graph.setOutputs([nhwc.name, out.name]);
+  return graph;
 }
 
 function signedShapeIslandGraph() {
@@ -75,7 +93,7 @@ function signedShapeIslandGraph() {
   const concatenated = graph.addOp('Concat', { input: identity.out, b: side }, {
     out: output('out', [1, 24], 'int8', 0.25, 0),
   }, { axis: 1 });
-  graph.outputNames = [concatenated.out.name];
+  graph.setOutputs([concatenated.out.name]);
   return graph;
 }
 
@@ -90,7 +108,7 @@ function unsignedMaxPoolResizeGraph() {
   const resized = graph.addOp('Resize', { input: max.out }, {
     out: output('out', [1, 2, 2, 1], 'uint8', 0.125, 128),
   }, { mode: 'nearest' });
-  graph.outputNames = [resized.out.name];
+  graph.setOutputs([resized.out.name]);
   return graph;
 }
 
@@ -102,7 +120,7 @@ function asymmetricPadMaxPoolGraph() {
   const { out } = graph.addOp('MaxPool2D', { input }, {
     out: output('out', [1, 2, 2, 1], 'int8', 0.25, 0),
   }, { kernel: [2, 2], stride: [2, 2], padding: [0, 0], pads: [0, 0, 1, 1] });
-  graph.outputNames = [out.name];
+  graph.setOutputs([out.name]);
   return graph;
 }
 
@@ -117,7 +135,7 @@ function mismatchedConcatGraph() {
   const { out } = graph.addOp('Concat', { input, b: other }, {
     out: output('out', [1, 2], 'int8', 0.25, 0),
   }, { axis: 1 });
-  graph.outputNames = [out.name];
+  graph.setOutputs([out.name]);
   return graph;
 }
 
@@ -157,6 +175,27 @@ test('portable WASM preserves quantized shape-island bytes without CPU fallback'
       assert.deepEqual([...result.out], [250, 250, 250, 250]);
     });
 
+    await t.test('I8/U8 NCHW↔NHWC Transpose preserves exact physical bytes', async () => {
+      for (const dtype of ['int8', 'uint8']) {
+        const graph = byteTransposeGraph(dtype);
+        wasm.compile(graph);
+        const Storage = dtype === 'int8' ? Int8Array : Uint8Array;
+        const values = Storage.from(
+          { length: 12 },
+          (_, index) => dtype === 'int8' ? index - 6 : index + 117,
+        );
+        const result = await wasm.execute({ input: values });
+        assert.ok(result.nhwc instanceof Storage);
+        assert.ok(result.out instanceof Storage);
+        assert.deepEqual(
+          [...result.nhwc],
+          [values[0], values[6], values[1], values[7], values[2], values[8],
+            values[3], values[9], values[4], values[10], values[5], values[11]],
+        );
+        assert.deepEqual([...result.out], [...values]);
+      }
+    });
+
     await t.test('I8 MaxPool validates asymmetric bottom/right pads while reading raw bytes', async () => {
       const graph = asymmetricPadMaxPoolGraph();
       wasm.compile(graph);
@@ -186,6 +225,13 @@ test('portable WASM preserves quantized shape-island bytes without CPU fallback'
       const transformedResize = unsignedMaxPoolResizeGraph();
       transformedResize.nodes[1].params.coordinate_transformation_mode = 'half_pixel';
       assert.throws(() => wasm.compile(transformedResize), /coordinate_transformation_mode "asymmetric"/);
+
+      const misspelledResize = unsignedMaxPoolResizeGraph();
+      misspelledResize.nodes[1].params.coordinate_transform_mode = 'asymmetric';
+      assert.throws(
+        () => wasm.compile(misspelledResize),
+        /does not define coordinate_transform_mode; use coordinate_transformation_mode/,
+      );
     });
   } finally {
     await rm(directory, { recursive: true, force: true });

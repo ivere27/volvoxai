@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 
 import { WebGPUAutograd } from '../ts/training/WebGPUAutograd.js';
+import { DataType } from '../ts/generated/volvoxaiEnums.js';
 
 globalThis.GPUBufferUsage ??= Object.freeze({
   MAP_READ: 1,
@@ -111,7 +112,10 @@ test('WebGPU DequantizeLinear backward dispatches F32 input and scalar-scale gra
   assert.equal(entry(dispatches[1], 1).tensor, zeroPoint.name);
   assert.equal(entry(dispatches[1], 5), trainer.gradientBuffers.get(scale.name));
   assert.equal(trainer.gradientBuffers.has(zeroPoint.name), false);
-  assert.deepEqual([...new Uint32Array(entry(dispatches[0], 6).bytes.buffer).slice(0, 4)], [4, 0, 0, 1]);
+  assert.deepEqual(
+    [...new Uint32Array(entry(dispatches[0], 6).bytes.buffer).slice(0, 4)],
+    [4, DataType.F32, DataType.F32, 1],
+  );
 });
 
 test('WebGPU DequantizeLinear keeps quantized inputs non-differentiable while training F32 scale', async () => {
@@ -133,7 +137,10 @@ test('WebGPU DequantizeLinear keeps quantized inputs non-differentiable while tr
   assert.equal(trainer.gradientBuffers.has(input.name), false);
   assert.equal(trainer.gradientBuffers.has(zeroPoint.name), false);
   assert.equal(entry(dispatch, 5), trainer.gradientBuffers.get(scale.name));
-  assert.deepEqual([...new Uint32Array(entry(dispatch, 6).bytes.buffer).slice(0, 4)], [5, 3, 2, 1]);
+  assert.deepEqual(
+    [...new Uint32Array(entry(dispatch, 6).bytes.buffer).slice(0, 4)],
+    [5, DataType.U8, DataType.I8, 1],
+  );
 
   const noZeroNode = {
     id: 'dequant_i32_no_zero', opType: 'DequantizeLinear',
@@ -145,7 +152,10 @@ test('WebGPU DequantizeLinear keeps quantized inputs non-differentiable while tr
   noZeroTrainer.gradientBuffers.set(noZeroNode.outputs.out.name, { tensor: 'grad_out' });
   const [noZeroDispatch] = await noZeroTrainer._buildBackwardDispatches();
   assert.match(entry(noZeroDispatch, 1).descriptor.label, /TrainingDummy/);
-  assert.deepEqual([...new Uint32Array(entry(noZeroDispatch, 6).bytes.buffer).slice(0, 4)], [2, 1, 0, 0]);
+  assert.deepEqual(
+    [...new Uint32Array(entry(noZeroDispatch, 6).bytes.buffer).slice(0, 4)],
+    [2, DataType.I32, DataType.F32, 0],
+  );
 });
 
 test('WebGPU DequantizeLinear scale gradient retains raw I32 zero-point metadata', async () => {
@@ -165,7 +175,10 @@ test('WebGPU DequantizeLinear scale gradient retains raw I32 zero-point metadata
   assert.equal(dispatch.entryPoint, 'scale_main');
   // [size, input dtype, zero-point dtype, has zero-point]. The raw integer
   // decoder uses these flags before it performs the high-range subtraction.
-  assert.deepEqual([...new Uint32Array(entry(dispatch, 6).bytes.buffer).slice(0, 4)], [2, 1, 1, 1]);
+  assert.deepEqual(
+    [...new Uint32Array(entry(dispatch, 6).bytes.buffer).slice(0, 4)],
+    [2, DataType.I32, DataType.I32, 1],
+  );
 
   const floatZeroPoint = tensor('float_zero', [1]);
   const floatZeroNode = {
@@ -175,7 +188,10 @@ test('WebGPU DequantizeLinear scale gradient retains raw I32 zero-point metadata
   const floatZeroTrainer = makeTrainer(floatZeroNode, [input, scale, floatZeroPoint, output]);
   floatZeroTrainer.gradientBuffers.set(output.name, { tensor: 'grad_out' });
   const [floatZeroDispatch] = await floatZeroTrainer._buildBackwardDispatches();
-  assert.deepEqual([...new Uint32Array(entry(floatZeroDispatch, 6).bytes.buffer).slice(0, 4)], [2, 1, 0, 1]);
+  assert.deepEqual(
+    [...new Uint32Array(entry(floatZeroDispatch, 6).bytes.buffer).slice(0, 4)],
+    [2, DataType.I32, DataType.F32, 1],
+  );
 });
 
 test('WebGPU Cast and DequantizeLinear backward reject invalid typed storage contracts', async () => {

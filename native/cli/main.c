@@ -1,3 +1,9 @@
+#include "volvoxai.h"
+#include "cJSON.h"
+#if VOLVOXAI_ENABLE_TRAINING
+#include "volvoxai_full.h"
+#endif
+
 #include <errno.h>
 #include <limits.h>
 #include <math.h>
@@ -6,19 +12,6 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
-#include <time.h>
-#ifdef _WIN32
-#include <windows.h>
-#endif
-
-#ifndef VOLVOXAI_ENABLE_TRAINING
-#define VOLVOXAI_ENABLE_TRAINING 0
-#endif
-
-#include "volvoxai.h"
-#if VOLVOXAI_ENABLE_TRAINING
-#include "volvoxai_training.h"
-#endif
 
 #ifndef PATH_MAX
 #define PATH_MAX 4096
@@ -34,390 +27,842 @@
 #define VOLVOXAI_BUILD_DATE "unknown"
 #endif
 
-static int g_warmup_runs = 0;
-static int g_num_runs = 1;
-
 #define MAX_BINDINGS 32
+#define MAX_WEIGHT_PATHS 32
 
-typedef struct {
+typedef struct Binding {
     char name[128];
     char path[PATH_MAX];
 } Binding;
 
-typedef struct {
-    char config[PATH_MAX];
-    char weights[PATH_MAX];
+typedef struct ModelPaths {
+    char graph[PATH_MAX];
+    char default_weights[PATH_MAX];
 } ModelPaths;
 
-typedef struct {
-    const char* weights;
-    VolvoxAIEngineOptions engine;
+typedef struct RunOptions {
+    const char* weight_paths[MAX_WEIGHT_PATHS];
+    size_t weight_path_count;
     Binding inputs[MAX_BINDINGS];
     Binding outputs[MAX_BINDINGS];
-    int n_inputs;
-    int n_outputs;
-    int execution_row;
-} GraphOptions;
+    size_t input_count;
+    size_t output_count;
+    const char* backend;
+    const char* report_json;
+    int debug;
+    int cpu_threads;
+    int output_row;
+} RunOptions;
 
-static void print_release_info(void);
-
-static double now_ms(void) {
-#ifdef _WIN32
-    LARGE_INTEGER freq, counter;
-    QueryPerformanceFrequency(&freq);
-    QueryPerformanceCounter(&counter);
-    return (double)counter.QuadPart * 1000.0 / (double)freq.QuadPart;
-#else
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (double)ts.tv_sec * 1000.0 + (double)ts.tv_nsec / 1000000.0;
+#if VOLVOXAI_ENABLE_TRAINING
+typedef struct TrainOptions {
+    RunOptions run;
+    const char* targets_path;
+    const char* logits_name;
+    const char* trainable_names[MAX_BINDINGS];
+    size_t trainable_count;
+    const char* output_weight_paths[MAX_WEIGHT_PATHS];
+    size_t output_weight_path_count;
+    long microbatches;
+    uint32_t accumulation_steps;
+    VxOptimizerOptions optimizer;
+    int32_t ignore_index;
+    int32_t loss_row;
+} TrainOptions;
 #endif
-}
 
 static int file_exists(const char* path) {
     struct stat st;
     return path && path[0] && stat(path, &st) == 0 && S_ISREG(st.st_mode);
 }
 
-static int is_dir(const char* path) {
+static int is_directory(const char* path) {
     struct stat st;
     return path && path[0] && stat(path, &st) == 0 && S_ISDIR(st.st_mode);
 }
 
-static void join_path(char* out, size_t out_size, const char* a, const char* b) {
-    size_t n = strlen(a);
-    snprintf(out, out_size, "%s%s%s", a, (n && a[n - 1] == '/') ? "" : "/", b);
+static int copy_path(char* destination, size_t capacity, const char* value) {
+    int written;
+    if (!destination || !capacity || !value) return -1;
+    written = snprintf(destination, capacity, "%s", value);
+    return written >= 0 && (size_t)written < capacity ? 0 : -1;
 }
 
-static int resolve_model_paths(const char* model, const char* weights,
-                               ModelPaths* out) {
-    memset(out, 0, sizeof(*out));
-    if (is_dir(model)) {
-        join_path(out->config, sizeof(out->config), model, "config.json");
-        join_path(out->weights, sizeof(out->weights), model, "model.safetensors");
-        if (!file_exists(out->weights)) out->weights[0] = '\0';
-    } else {
-        snprintf(out->config, sizeof(out->config), "%s", model);
+static int join_path(char* destination, size_t capacity,
+                     const char* directory, const char* leaf) {
+    size_t length;
+    int written;
+    if (!destination || !capacity || !directory || !leaf) return -1;
+    length = strlen(directory);
+    written = snprintf(destination, capacity, "%s%s%s", directory,
+                       length && directory[length - 1] == '/' ? "" : "/", leaf);
+    return written >= 0 && (size_t)written < capacity ? 0 : -1;
+}
+
+static int resolve_model_paths(const char* model, ModelPaths* paths) {
+    if (!model || !model[0] || !paths) return -1;
+    memset(paths, 0, sizeof(*paths));
+    if (is_directory(model)) {
+        if (join_path(paths->graph, sizeof(paths->graph), model, "graph.json") != 0 ||
+            join_path(paths->default_weights, sizeof(paths->default_weights), model,
+                      "model.safetensors") != 0) {
+            fprintf(stderr, "Model path is too long: %s\n", model);
+            return -1;
+        }
+        if (!file_exists(paths->default_weights)) paths->default_weights[0] = 0;
+    } else if (copy_path(paths->graph, sizeof(paths->graph), model) != 0) {
+        fprintf(stderr, "Graph path is too long: %s\n", model);
+        return -1;
     }
-    if (weights) snprintf(out->weights, sizeof(out->weights), "%s", weights);
-    if (!file_exists(out->config)) {
-        fprintf(stderr, "Missing config.json: %s\n", out->config);
+    if (!file_exists(paths->graph)) {
+        fprintf(stderr, "Missing graph.json: %s\n", paths->graph);
         return -1;
     }
     return 0;
 }
 
-static int parse_binding(const char* arg, Binding* b, int require_name) {
-    const char* eq = strchr(arg, '=');
-    memset(b, 0, sizeof(*b));
-    if (eq) {
-        size_t n = (size_t)(eq - arg);
-        if (n == 0 || n >= sizeof(b->name)) return -1;
-        memcpy(b->name, arg, n);
-        b->name[n] = 0;
-        snprintf(b->path, sizeof(b->path), "%s", eq + 1);
-        return b->path[0] ? 0 : -1;
+static int parse_binding(const char* argument, Binding* binding,
+                         int require_name) {
+    const char* equals;
+    size_t name_length;
+    if (!argument || !binding) return -1;
+    memset(binding, 0, sizeof(*binding));
+    equals = strchr(argument, '=');
+    if (!equals) {
+        if (require_name || copy_path(binding->path, sizeof(binding->path), argument) != 0)
+            return -1;
+        return binding->path[0] ? 0 : -1;
     }
-    if (require_name) return -1;
-    snprintf(b->path, sizeof(b->path), "%s", arg);
-    return b->path[0] ? 0 : -1;
+    name_length = (size_t)(equals - argument);
+    if (!name_length || name_length >= sizeof(binding->name) || !equals[1]) return -1;
+    memcpy(binding->name, argument, name_length);
+    binding->name[name_length] = 0;
+    return copy_path(binding->path, sizeof(binding->path), equals + 1);
 }
 
-static int has_suffix(const char* path, const char* suffix) {
-    size_t lp = strlen(path), ls = strlen(suffix);
-    if (lp < ls) return 0;
-    return strcmp(path + lp - ls, suffix) == 0;
-}
-
-static const char* dtype_name(int dtype) {
-    switch (dtype) {
-        case VOLVOXAI_DTYPE_F32: return "F32";
-        case VOLVOXAI_DTYPE_I8: return "I8";
-        case VOLVOXAI_DTYPE_U8: return "U8";
-        case VOLVOXAI_DTYPE_I32: return "I32";
-        case VOLVOXAI_DTYPE_F16: return "F16";
-        default: return "unknown";
-    }
-}
-
-static const char* dtype_file_suffix(int dtype) {
-    switch (dtype) {
-        case VOLVOXAI_DTYPE_F32: return ".f32";
-        case VOLVOXAI_DTYPE_I8: return ".i8";
-        case VOLVOXAI_DTYPE_U8: return ".u8";
-        case VOLVOXAI_DTYPE_I32: return ".i32";
-        case VOLVOXAI_DTYPE_F16: return ".f16";
-        default: return NULL;
-    }
-}
-
-static int parse_row_index(const char* text, int* out) {
-    if (!text || !text[0] || !out) return -1;
-    errno = 0;
+static int parse_nonnegative_int(const char* value, int allow_minus_one,
+                                 int* parsed) {
     char* end = NULL;
-    long value = strtol(text, &end, 10);
-    if (errno == ERANGE || !end || *end != '\0' || value < -1 || value > INT_MAX) {
-        return -1;
-    }
-    *out = (int)value;
+    long number;
+    if (!value || !value[0] || !parsed) return -1;
+    errno = 0;
+    number = strtol(value, &end, 10);
+    if (errno == ERANGE || !end || *end || number > INT_MAX ||
+        number < (allow_minus_one ? -1 : 0)) return -1;
+    *parsed = (int)number;
     return 0;
 }
 
-static char* read_file_bytes(const char* path, long* out_size) {
-    FILE* f = fopen(path, "rb");
-    if (!f) return NULL;
-    if (fseek(f, 0, SEEK_END) != 0) { fclose(f); return NULL; }
-    long sz = ftell(f);
-    if (sz < 0 || fseek(f, 0, SEEK_SET) != 0 ||
-        (unsigned long)sz > SIZE_MAX - 1) {
-        fclose(f);
-        return NULL;
-    }
-    char* buf = (char*)malloc(sz > 0 ? (size_t)sz + 1 : 1);
-    if (!buf) { fclose(f); return NULL; }
-    if (sz > 0 && fread(buf, 1, (size_t)sz, f) != (size_t)sz) {
-        free(buf);
-        fclose(f);
-        return NULL;
-    }
-    buf[sz] = 0;
-    fclose(f);
-    if (out_size) *out_size = sz;
-    return buf;
-}
-
-static int load_tensor_binding(const Binding* b) {
-    long numel = 0;
-    int shape[8] = {0};
-    int ndim = 0;
-    int dtype = -1;
-    size_t element_size = 0;
-    if (volvoxai_engine_tensor_info_ex(b->name, &numel, shape, &ndim, &dtype,
-            &element_size) != 0 || volvoxai_engine_is_graph_input(b->name) != 1 ||
-        numel < 0 || element_size == 0 || (size_t)numel > SIZE_MAX / element_size) {
-        fprintf(stderr, "Unknown input tensor: %s\n", b->name);
-        return -1;
-    }
-
-    const char* suffix = dtype_file_suffix(dtype);
-    if (!suffix || !has_suffix(b->path, suffix)) {
-        fprintf(stderr, "Input %s has dtype %s and requires a %s file: %s\n",
-                b->name, dtype_name(dtype), suffix ? suffix : "supported raw", b->path);
-        return -1;
-    }
-
-    long sz = 0;
-    char* data = read_file_bytes(b->path, &sz);
-    if (!data) {
-        fprintf(stderr, "Cannot read input file: %s\n", b->path);
-        return -1;
-    }
-
-    size_t expected = (size_t)numel * element_size;
-    if (sz < 0 || (size_t)sz != expected) {
-        fprintf(stderr, "Input %s expects %zu raw bytes, got %ld from %s\n",
-                b->name, expected, sz, b->path);
-        free(data);
-        return -1;
-    }
-    int rc = volvoxai_engine_set_input_raw(b->name, dtype, data, expected);
-    free(data);
-    if (rc != 0) {
-        fprintf(stderr, "Cannot set input tensor: %s\n", b->name);
-        return -1;
-    }
-    return 0;
-}
-
-static int write_output_binding(const Binding* b) {
-    const void* src = NULL;
-    void* owned = NULL;
-    size_t nbytes = 0;
-    int shape[8] = {0};
-    int ndim = 0;
-    int dtype = -1;
-    size_t element_size = 0;
-    long numel = 0;
-    const char* name = b->name[0] ? b->name : volvoxai_engine_graph_output_name(0);
-    if (!name || !name[0] ||
-        volvoxai_engine_tensor_info_ex(name, &numel, shape, &ndim, &dtype,
-            &element_size) != 0 || numel <= 0 || element_size == 0 ||
-        (size_t)numel > SIZE_MAX / element_size) {
-        fprintf(stderr, "Unknown output tensor: %s\n", b->name[0] ? b->name : "<primary>");
-        return -1;
-    }
-
-    const char* suffix = dtype_file_suffix(dtype);
-    if (!suffix || !has_suffix(b->path, suffix)) {
-        fprintf(stderr, "Output %s has dtype %s and requires a %s file: %s\n",
-                name, dtype_name(dtype), suffix ? suffix : "supported raw", b->path);
-        return -1;
-    }
-
-    int row = volvoxai_engine_execution_row();
-    if (row >= 0 && ndim >= 2) {
-        if (dtype != VOLVOXAI_DTYPE_F32 || element_size != sizeof(float)) {
-            fprintf(stderr, "--row output currently requires an F32 tensor: %s\n", name);
-            return -1;
-        }
-        int count = 0;
-        src = volvoxai_engine_tensor_row_f32(name, row, &count);
-        if (!src || count <= 0 || (size_t)count > SIZE_MAX / sizeof(float)) {
-            fprintf(stderr, "No output row available for %s\n", name);
-            return -1;
-        }
-        nbytes = (size_t)count * sizeof(float);
-    } else {
-        nbytes = (size_t)numel * element_size;
-        owned = malloc(nbytes);
-        if (!owned || volvoxai_engine_copy_tensor_raw(name, owned, nbytes) != 0) {
-            free(owned);
-            fprintf(stderr, "Cannot snapshot output tensor: %s\n", name);
-            return -1;
-        }
-        src = owned;
-    }
-    FILE* f = fopen(b->path, "wb");
-    if (!f) {
-        fprintf(stderr, "Cannot open output file: %s\n", b->path);
-        free(owned);
-        return -1;
-    }
-    int write_failed = fwrite(src, 1, nbytes, f) != nbytes;
-    int close_failed = fclose(f) != 0;
-    free(owned);
-    if (write_failed || close_failed) {
-        fprintf(stderr, "Cannot write output file: %s\n", b->path);
-        return -1;
-    }
-    return 0;
-}
-
-static void print_root_help(const char* argv0) {
-    print_release_info();
-    printf("Usage: %s <command> [args]\n\n", argv0);
-    printf("Commands:\n");
-    printf("  run <model-dir|config.json>       Run one generic tensor graph forward pass.\n");
-#if VOLVOXAI_ENABLE_TRAINING
-    printf("  train <model-dir|config.json>     Train selected weights with cross-entropy.\n");
-#endif
-    printf("  version                           Print release info.\n\n");
-    printf("Common backend flags: --vulkan --opengl --metal --nnapi --debug\n");
-    printf("Run '%s <command> --help' for command-specific options.\n", argv0);
-}
-
-static void print_run_help(const char* argv0) {
-    printf("Usage: %s run <model-dir|config.json> [options]\n\n", argv0);
-    printf("Options:\n");
-    printf("  --weights <file>              Override model.safetensors path.\n");
-    printf("  --input <name=file>           Load exact typed raw data (.f32/.f16/.i32/.i8/.u8).\n");
-    printf("  --output <name=file|file>     Write exact typed raw data; suffix must match dtype.\n");
-    printf("  --row <index>                 Write one F32 row from rank-2-or-higher outputs.\n");
-    printf("  --vulkan | --opengl | --metal | --nnapi\n");
-    printf("  --debug\n");
-}
-
-#if VOLVOXAI_ENABLE_TRAINING
-static void print_train_help(const char* argv0) {
-    printf("Usage: %s train <model-dir|config.json> [options]\n\n", argv0);
-    printf("Required:\n");
-    printf("  --targets <file.i32>          Raw int32 cross-entropy targets.\n");
-    printf("  --logits <tensor>             Logits tensor used by cross-entropy.\n");
-    printf("  --trainable <tensor>          F32 model weight to update. Repeatable.\n\n");
-    printf("Model inputs:\n");
-    printf("  --weights <file>              Override model.safetensors path.\n");
-    printf("  --input <name=file>           Load exact typed raw data (.f32/.f16/.i32/.i8/.u8).\n");
-    printf("  --row <index>                 Train one selected logits row.\n\n");
-    printf("Optimizer:\n");
-    printf("  --steps <n>                   Number of SGD/AdamW steps (default 1).\n");
-    printf("  --learning-rate <value>       Learning rate (default 0.001).\n");
-    printf("  --beta1 <value>               Adam beta1 (default 0.9).\n");
-    printf("  --beta2 <value>               Adam beta2 (default 0.999).\n");
-    printf("  --epsilon <value>             Adam epsilon (default 1e-8).\n");
-    printf("  --weight-decay <value>        0 selects SGD; positive selects AdamW.\n");
-    printf("  --max-grad-norm <value>       Global gradient clipping; 0 disables it.\n");
-    printf("  --ignore-index <id>           Target value ignored by the loss (default -100).\n");
-    printf("  --input-optimizer <file>      Resume optimizer state and its training step.\n\n");
-    printf("Outputs:\n");
-    printf("  --output-weights <file>       Save final model weights.\n");
-    printf("  --output-optimizer <file>     Save final optimizer state.\n");
-    printf("  --output <name=file|file>     Write final exact typed raw tensor data.\n");
-    printf("  --vulkan | --opengl | --metal | --nnapi\n");
-    printf("  --debug\n");
-}
-#endif
-
-static void engine_options_init(VolvoxAIEngineOptions* options) {
-    memset(options, 0, sizeof(*options));
-    options->backend = VOLVOXAI_BACKEND_CPU;
-}
-
-static const char* requested_backend_name(VolvoxAIEngineBackend backend) {
-    switch (backend) {
-        case VOLVOXAI_BACKEND_VULKAN: return "Vulkan";
-        case VOLVOXAI_BACKEND_OPENGL: return "OpenGL";
-        case VOLVOXAI_BACKEND_METAL: return "Metal";
-        case VOLVOXAI_BACKEND_NNAPI: return "NNAPI";
-        default: return "CPU";
-    }
-}
-
-static int select_backend(VolvoxAIEngineOptions* options,
-                          VolvoxAIEngineBackend backend) {
-    if (options->backend != VOLVOXAI_BACKEND_CPU && options->backend != backend) {
+static int select_backend(RunOptions* options, const char* backend) {
+    if (options->backend && strcmp(options->backend, backend)) {
         fprintf(stderr, "Pass at most one accelerator backend flag.\n");
         return -1;
     }
     options->backend = backend;
-    return 1;
-}
-
-static int parse_backend_flag(const char* arg, VolvoxAIEngineOptions* options) {
-    if (!strcmp(arg, "--vulkan")) return select_backend(options, VOLVOXAI_BACKEND_VULKAN);
-    if (!strcmp(arg, "--nnapi")) return select_backend(options, VOLVOXAI_BACKEND_NNAPI);
-    if (!strcmp(arg, "--opengl")) return select_backend(options, VOLVOXAI_BACKEND_OPENGL);
-    if (!strcmp(arg, "--metal")) return select_backend(options, VOLVOXAI_BACKEND_METAL);
-    if (!strcmp(arg, "--debug")) { options->debug = 1; return 1; }
     return 0;
 }
 
-static int configure_engine(const VolvoxAIEngineOptions* options) {
-    printf("VolvoxAI Native Engine\n");
-    if (volvoxai_engine_configure(options) != 0) {
-        fprintf(stderr, "Cannot configure requested backend: %s\n",
-                requested_backend_name(options->backend));
+static int parse_run_option(int argc, char** argv, int* index,
+                            RunOptions* options) {
+    const char* argument = argv[*index];
+    const char* backend = NULL;
+    if (!strcmp(argument, "--cpu")) backend = "cpu";
+    else if (!strcmp(argument, "--vulkan")) backend = "vulkan";
+    else if (!strcmp(argument, "--opengl")) backend = "opengl";
+    else if (!strcmp(argument, "--metal")) backend = "metal";
+    else if (!strcmp(argument, "--nnapi")) backend = "nnapi";
+    else if (!strcmp(argument, "--cuda")) backend = "cuda";
+    if (backend) return select_backend(options, backend) == 0 ? 1 : -1;
+    if (!strcmp(argument, "--debug")) {
+        options->debug = 1;
+        return 1;
+    }
+    if (!strcmp(argument, "--report-json")) {
+        if (*index + 1 >= argc || options->report_json) {
+            fprintf(stderr, "--report-json expects exactly one output file.\n");
+            return -1;
+        }
+        options->report_json = argv[++(*index)];
+        return options->report_json[0] ? 1 : -1;
+    }
+    if (!strcmp(argument, "--threads")) {
+        if (*index + 1 >= argc ||
+            parse_nonnegative_int(argv[++(*index)], 0, &options->cpu_threads) != 0 ||
+            options->cpu_threads == 0) {
+            fprintf(stderr, "--threads must be a positive 32-bit integer.\n");
+            return -1;
+        }
+        return 1;
+    }
+    if (!strcmp(argument, "--row")) {
+        if (*index + 1 >= argc ||
+            parse_nonnegative_int(argv[++(*index)], 1, &options->output_row) != 0) {
+            fprintf(stderr, "--row must be -1 or a non-negative 32-bit integer.\n");
+            return -1;
+        }
+        return 1;
+    }
+    if (!strcmp(argument, "--weights")) {
+        if (*index + 1 >= argc ||
+            options->weight_path_count == MAX_WEIGHT_PATHS) {
+            fprintf(stderr, "--weights expects a file and may be repeated at most %d times.\n",
+                    MAX_WEIGHT_PATHS);
+            return -1;
+        }
+        options->weight_paths[options->weight_path_count++] = argv[++(*index)];
+        return 1;
+    }
+    if (!strcmp(argument, "--input")) {
+        if (*index + 1 >= argc || options->input_count == MAX_BINDINGS ||
+            parse_binding(argv[++(*index)], &options->inputs[options->input_count], 1) != 0) {
+            fprintf(stderr, "--input expects name=file.\n");
+            return -1;
+        }
+        options->input_count++;
+        return 1;
+    }
+    if (!strcmp(argument, "--output")) {
+        if (*index + 1 >= argc || options->output_count == MAX_BINDINGS ||
+            parse_binding(argv[++(*index)], &options->outputs[options->output_count], 0) != 0) {
+            fprintf(stderr, "--output expects name=file or file.\n");
+            return -1;
+        }
+        options->output_count++;
+        return 1;
+    }
+    return 0;
+}
+
+static const char* dtype_name(VxDataType dtype) {
+    switch (dtype) {
+        case VX_DTYPE_F32: return "F32";
+        case VX_DTYPE_I8: return "I8";
+        case VX_DTYPE_U8: return "U8";
+        case VX_DTYPE_I32: return "I32";
+        default: return "unknown";
+    }
+}
+
+static const char* dtype_suffix(VxDataType dtype) {
+    switch (dtype) {
+        case VX_DTYPE_F32: return ".f32";
+        case VX_DTYPE_I8: return ".i8";
+        case VX_DTYPE_U8: return ".u8";
+        case VX_DTYPE_I32: return ".i32";
+        default: return NULL;
+    }
+}
+
+static int has_suffix(const char* path, const char* suffix) {
+    size_t path_length;
+    size_t suffix_length;
+    if (!path || !suffix) return 0;
+    path_length = strlen(path);
+    suffix_length = strlen(suffix);
+    return path_length >= suffix_length &&
+           !strcmp(path + path_length - suffix_length, suffix);
+}
+
+static void print_failure(const char* operation, VxStatus status,
+                          const VxReport* report) {
+    fprintf(stderr, "%s failed: %s", operation, vx_status_string(status));
+    if (report && report->reason[0]) fprintf(stderr, " [%s]", report->reason);
+    if (report && report->message[0]) fprintf(stderr, ": %s", report->message);
+    fputc('\n', stderr);
+}
+
+static int read_exact_file(const char* path, size_t expected, void** data) {
+    FILE* file;
+    long size;
+    void* bytes;
+    if (!path || !data) return -1;
+    *data = NULL;
+    file = fopen(path, "rb");
+    if (!file) {
+        fprintf(stderr, "Cannot read input file: %s\n", path);
         return -1;
     }
-    printf("Backend: %s\n", volvoxai_engine_backend_name());
+    if (fseek(file, 0, SEEK_END) != 0 || (size = ftell(file)) < 0 ||
+        fseek(file, 0, SEEK_SET) != 0) {
+        fprintf(stderr, "Cannot inspect input file: %s\n", path);
+        fclose(file);
+        return -1;
+    }
+    if ((unsigned long)size > SIZE_MAX || (size_t)size != expected) {
+        fprintf(stderr, "Input expects %zu raw bytes, got %ld from %s\n",
+                expected, size, path);
+        fclose(file);
+        return -1;
+    }
+    bytes = malloc(expected ? expected : 1);
+    if (!bytes) {
+        fprintf(stderr, "Cannot allocate %zu input bytes.\n", expected);
+        fclose(file);
+        return -1;
+    }
+    if (expected && fread(bytes, 1, expected, file) != expected) {
+        fprintf(stderr, "Cannot read input file: %s\n", path);
+        free(bytes);
+        fclose(file);
+        return -1;
+    }
+    if (fclose(file) != 0) {
+        fprintf(stderr, "Cannot finish reading input file: %s\n", path);
+        free(bytes);
+        return -1;
+    }
+    *data = bytes;
     return 0;
 }
 
-static const char* cpu_arch_name(void) {
-#if defined(__x86_64__) || defined(_M_X64)
-    return "x86_64";
-#elif defined(__i386__) || defined(_M_IX86)
-    return "x86";
-#elif defined(__aarch64__) || defined(_M_ARM64)
-    return "arm64";
-#elif defined(__arm__) || defined(_M_ARM)
-    return "arm";
-#elif defined(__riscv)
-    return "riscv";
-#else
-    return "unknown";
-#endif
+static int find_input(VxExecutionContext* context, const char* name,
+                      VxTensorInfo* found, VxReport* report) {
+    size_t count = vx_execution_context_input_count(context);
+    for (size_t index = 0; index < count; index++) {
+        VxTensorInfo info = VX_TENSOR_INFO_INIT;
+        if (vx_execution_context_input_info(context, index, &info, report) == VX_STATUS_OK &&
+            info.name && !strcmp(info.name, name)) {
+            *found = info;
+            return 0;
+        }
+    }
+    fprintf(stderr, "Unknown input tensor: %s\n", name);
+    return -1;
 }
 
-static const char* cpu_feature_string(void) {
-#if defined(__AVX2__) && defined(__FMA__)
-    return "avx2,fma";
-#elif defined(__AVX2__)
-    return "avx2";
-#elif defined(__ARM_NEON) || defined(__ARM_NEON__)
-    return "neon";
-#else
-    return "scalar";
-#endif
+static int set_input_binding(VxExecutionContext* context, const Binding* binding,
+                             VxReport* report) {
+    VxTensorInfo info = VX_TENSOR_INFO_INIT;
+    const char* suffix;
+    void* bytes = NULL;
+    VxStatus status;
+    if (find_input(context, binding->name, &info, report) != 0) return -1;
+    suffix = dtype_suffix(info.dtype);
+    if (!suffix || !has_suffix(binding->path, suffix)) {
+        fprintf(stderr, "Input %s has dtype %s and requires a %s file: %s\n",
+                binding->name, dtype_name(info.dtype), suffix ? suffix : "supported raw",
+                binding->path);
+        return -1;
+    }
+    if (read_exact_file(binding->path, info.byte_size, &bytes) != 0) {
+        if (file_exists(binding->path)) {
+            fprintf(stderr, "Input %s expects %zu raw bytes.\n",
+                    binding->name, info.byte_size);
+        }
+        return -1;
+    }
+    status = vx_execution_context_set_input(context, binding->name, info.dtype,
+                                            bytes, info.byte_size, report);
+    free(bytes);
+    if (status != VX_STATUS_OK) {
+        print_failure("Setting input", status, report);
+        return -1;
+    }
+    return 0;
+}
+
+static int find_output(const VxResult* result, const char* name,
+                       VxTensorInfo* found, VxReport* report) {
+    size_t count = vx_result_output_count(result);
+    for (size_t index = 0; index < count; index++) {
+        VxTensorInfo info = VX_TENSOR_INFO_INIT;
+        if (vx_result_output_info(result, index, &info, report) == VX_STATUS_OK &&
+            ((!name && index == 0) || (name && info.name && !strcmp(info.name, name)))) {
+            *found = info;
+            return 0;
+        }
+    }
+    fprintf(stderr, "Unknown output tensor: %s\n", name ? name : "<first>");
+    return -1;
+}
+
+static int write_bytes(const char* path, const void* bytes, size_t size) {
+    FILE* file = fopen(path, "wb");
+    int failed = 0;
+    if (!file) {
+        fprintf(stderr, "Cannot write output file: %s\n", path);
+        return -1;
+    }
+    if (size && fwrite(bytes, 1, size, file) != size) failed = 1;
+    if (fclose(file) != 0) failed = 1;
+    if (failed) {
+        fprintf(stderr, "Cannot write output file: %s\n", path);
+        return -1;
+    }
+    return 0;
+}
+
+static int write_output_binding(const VxResult* result, const Binding* binding,
+                                int row, VxReport* report) {
+    VxTensorInfo info = VX_TENSOR_INFO_INIT;
+    const char* suffix;
+    void* bytes;
+    VxStatus status;
+    size_t offset = 0;
+    size_t byte_size;
+    if (find_output(result, binding->name[0] ? binding->name : NULL,
+                    &info, report) != 0) return -1;
+    suffix = dtype_suffix(info.dtype);
+    if (!suffix || !has_suffix(binding->path, suffix)) {
+        fprintf(stderr, "Output %s has dtype %s and requires a %s file: %s\n",
+                info.name, dtype_name(info.dtype), suffix ? suffix : "supported raw",
+                binding->path);
+        return -1;
+    }
+    byte_size = info.byte_size;
+    if (row >= 0) {
+        if (info.dtype != VX_DTYPE_F32 || info.rank < 2 || info.shape[0] <= 0 ||
+            (uint64_t)row >= (uint64_t)info.shape[0] ||
+            info.byte_size % (size_t)info.shape[0] != 0) {
+            fprintf(stderr, "--row %d is invalid for output %s.\n", row, info.name);
+            return -1;
+        }
+        byte_size = info.byte_size / (size_t)info.shape[0];
+        offset = (size_t)row * byte_size;
+    }
+    bytes = malloc(info.byte_size ? info.byte_size : 1);
+    if (!bytes) {
+        fprintf(stderr, "Cannot allocate %zu output bytes.\n", info.byte_size);
+        return -1;
+    }
+    status = vx_result_read(result, info.name, bytes, info.byte_size, NULL, report);
+    if (status != VX_STATUS_OK) {
+        print_failure("Reading output", status, report);
+        free(bytes);
+        return -1;
+    }
+    status = write_bytes(binding->path, (const unsigned char*)bytes + offset, byte_size);
+    free(bytes);
+    return status;
+}
+
+typedef struct StableReadEvidence {
+    VxTensorInfo info;
+    void* first_read;
+} StableReadEvidence;
+
+static const char* runtime_dtype_name(VxDataType dtype) {
+    switch (dtype) {
+        case VX_DTYPE_F32: return "float32";
+        case VX_DTYPE_I32: return "int32";
+        case VX_DTYPE_I8: return "int8";
+        case VX_DTYPE_U8: return "uint8";
+        default: return NULL;
+    }
+}
+
+static int json_add_uint64_string(cJSON* object, const char* key,
+                                  uint64_t value) {
+    char text[32];
+    if (snprintf(text, sizeof(text), "%llu",
+                 (unsigned long long)value) < 0)
+        return -1;
+    return cJSON_AddStringToObject(object, key, text) ? 0 : -1;
+}
+
+static int json_add_identity(cJSON* object, const char* key,
+                             const char* kind, uint64_t identity) {
+    char text[80];
+    int written = snprintf(text, sizeof(text), "native-%s-%llu", kind,
+                           (unsigned long long)identity);
+    if (written < 0 || (size_t)written >= sizeof(text)) return -1;
+    return cJSON_AddStringToObject(object, key, text) ? 0 : -1;
+}
+
+static int json_add_adapter_identity(cJSON* object, const char* key,
+                                     uint64_t identity, uint64_t revision) {
+    char text[96];
+    int written = snprintf(text, sizeof(text), "native-adapter-%llu:%llu",
+                           (unsigned long long)identity,
+                           (unsigned long long)revision);
+    if (written < 0 || (size_t)written >= sizeof(text)) return -1;
+    return cJSON_AddStringToObject(object, key, text) ? 0 : -1;
+}
+
+static cJSON* report_device_json(const VxReport* report) {
+    cJSON* device;
+    if (!report->device[0]) return cJSON_CreateNull();
+    device = cJSON_CreateObject();
+    if (!device ||
+        !cJSON_AddStringToObject(device, "backend", report->backend) ||
+        !cJSON_AddStringToObject(device, "device", report->device)) {
+        cJSON_Delete(device);
+        return NULL;
+    }
+    return device;
+}
+
+static cJSON* report_route_json(const VxReport* report) {
+    cJSON* route = cJSON_CreateObject();
+    cJSON* operator = cJSON_CreateObject();
+    if (!route || !operator ||
+        !cJSON_AddBoolToObject(route, "tierFallback",
+                              report->tier_fallback_used != 0) ||
+        !cJSON_AddStringToObject(operator, "attestation",
+                                 report->route_attested ? "reported" : "unknown"))
+        goto fail;
+    if (report->route_attested) {
+        if (!cJSON_AddBoolToObject(operator, "used",
+                                  report->operator_fallback_used != 0))
+            goto fail;
+    } else if (!cJSON_AddNullToObject(operator, "used")) {
+        goto fail;
+    }
+    if (report->offending_node[0]) {
+        if (!cJSON_AddStringToObject(operator, "offendingNode",
+                                     report->offending_node))
+            goto fail;
+    } else if (!cJSON_AddNullToObject(operator, "offendingNode")) {
+        goto fail;
+    }
+    if (!cJSON_AddItemToObject(route, "operator", operator)) goto fail;
+    return route;
+fail:
+    cJSON_Delete(operator);
+    cJSON_Delete(route);
+    return NULL;
+}
+
+static cJSON* report_revisions_json(const VxReport* report, int execution) {
+    cJSON* revisions = cJSON_CreateObject();
+    cJSON* adapters = cJSON_CreateArray();
+    cJSON* adapter = NULL;
+    if (!revisions || !adapters ||
+        json_add_uint64_string(revisions, "topologyRevision",
+                               report->graph_revision) != 0 ||
+        json_add_uint64_string(revisions, "weightRevision",
+                               report->weight_revision) != 0 ||
+        json_add_identity(revisions, "weightRevisionId", "weight",
+                          report->weight_id) != 0)
+        goto fail;
+    if (report->adapter_id && report->adapter_revision) {
+        if (json_add_adapter_identity(revisions, "adapterRevisionId",
+                                      report->adapter_id,
+                                      report->adapter_revision) != 0)
+            goto fail;
+        adapter = cJSON_CreateObject();
+        if (!adapter || json_add_adapter_identity(
+                adapter, "value", report->adapter_id,
+                report->adapter_revision) != 0)
+            goto fail;
+        {
+            cJSON* value = cJSON_DetachItemFromObject(adapter, "value");
+            cJSON_Delete(adapter);
+            adapter = value;
+        }
+        if (!adapter || !cJSON_AddItemToArray(adapters, adapter)) goto fail;
+        adapter = NULL;
+    } else {
+        if (!cJSON_AddNullToObject(revisions, "adapterRevisionId")) goto fail;
+        if (execution) {
+            adapter = cJSON_CreateNull();
+            if (!adapter || !cJSON_AddItemToArray(adapters, adapter)) goto fail;
+            adapter = NULL;
+        }
+    }
+    if (!cJSON_AddItemToObject(revisions, "adapterRevisionIds", adapters))
+        goto fail;
+    return revisions;
+fail:
+    cJSON_Delete(adapter);
+    cJSON_Delete(adapters);
+    cJSON_Delete(revisions);
+    return NULL;
+}
+
+static cJSON* compilation_evidence_json(const VxReport* report) {
+    cJSON* compilation = cJSON_CreateObject();
+    cJSON* policy = cJSON_CreateObject();
+    cJSON* order = NULL;
+    cJSON* device = NULL;
+    cJSON* revisions = NULL;
+    cJSON* route = NULL;
+    if (!compilation || !policy ||
+        json_add_identity(compilation, "compilationId", "compiled",
+                          report->compiled_model_id) != 0)
+        goto fail;
+    if (report->policy_mode == VX_BACKEND_REQUIRE) {
+        if (!cJSON_AddStringToObject(policy, "mode", "require") ||
+            !cJSON_AddStringToObject(policy, "backend", report->backend))
+            goto fail;
+    } else {
+        order = cJSON_CreateArray();
+        if (!order || !cJSON_AddStringToObject(policy, "mode", "prefer") ||
+            !cJSON_AddItemToArray(order, cJSON_CreateString(report->backend)) ||
+            !cJSON_AddItemToObject(policy, "order", order))
+            goto fail;
+        order = NULL;
+    }
+    if (!cJSON_AddStringToObject(
+            policy, "operatorFallback",
+            report->operator_fallback == VX_OPERATOR_FALLBACK_FORBID
+                ? "forbid" : "allow") ||
+        !cJSON_AddItemToObject(compilation, "policy", policy))
+        goto fail;
+    policy = NULL;
+    if (!cJSON_AddStringToObject(compilation, "selectedBackend",
+                                 report->backend))
+        goto fail;
+    device = report_device_json(report);
+    if (!device || !cJSON_AddItemToObject(compilation, "selectedDevice", device))
+        goto fail;
+    device = NULL;
+    if (json_add_identity(compilation, "definitionId", "graph",
+                          report->graph_id) != 0)
+        goto fail;
+    revisions = report_revisions_json(report, 0);
+    route = report_route_json(report);
+    if (!revisions || !route ||
+        !cJSON_AddItemToObject(compilation, "revisions", revisions))
+        goto fail;
+    revisions = NULL;
+    if (!cJSON_AddItemToObject(compilation, "route", route)) goto fail;
+    route = NULL;
+    return compilation;
+fail:
+    cJSON_Delete(route);
+    cJSON_Delete(revisions);
+    cJSON_Delete(device);
+    cJSON_Delete(order);
+    cJSON_Delete(policy);
+    cJSON_Delete(compilation);
+    return NULL;
+}
+
+static cJSON* execution_evidence_json(const VxReport* report) {
+    cJSON* execution = cJSON_CreateObject();
+    cJSON* device = NULL;
+    cJSON* revisions = NULL;
+    cJSON* route = NULL;
+    cJSON* decode = NULL;
+    if (!execution ||
+        json_add_identity(execution, "executionId", "execution",
+                          report->execution_id) != 0 ||
+        json_add_identity(execution, "contextId", "context",
+                          report->context_id) != 0 ||
+        !cJSON_AddStringToObject(execution, "backend", report->backend))
+        goto fail;
+    device = report_device_json(report);
+    if (!device || !cJSON_AddItemToObject(execution, "device", device))
+        goto fail;
+    device = NULL;
+    if (!cJSON_AddStringToObject(execution, "outcome", "success"))
+        goto fail;
+    revisions = report_revisions_json(report, 1);
+    route = report_route_json(report);
+    decode = cJSON_CreateObject();
+    if (!revisions || !route || !decode ||
+        !cJSON_AddStringToObject(decode, "operation", "execute") ||
+        !cJSON_AddNullToObject(decode, "mode") ||
+        !cJSON_AddStringToObject(decode, "cacheState", "not-applicable") ||
+        !cJSON_AddNullToObject(decode, "cacheGeneration") ||
+        !cJSON_AddNullToObject(decode, "position") ||
+        !cJSON_AddItemToObject(execution, "revisions", revisions))
+        goto fail;
+    revisions = NULL;
+    if (!cJSON_AddItemToObject(execution, "route", route)) goto fail;
+    route = NULL;
+    if (!cJSON_AddItemToObject(execution, "decodeState", decode)) goto fail;
+    decode = NULL;
+    return execution;
+fail:
+    cJSON_Delete(decode);
+    cJSON_Delete(route);
+    cJSON_Delete(revisions);
+    cJSON_Delete(device);
+    cJSON_Delete(execution);
+    return NULL;
+}
+
+static void stable_read_evidence_free(StableReadEvidence* records,
+                                      size_t count) {
+    if (!records) return;
+    for (size_t index = 0; index < count; index++)
+        free(records[index].first_read);
+    free(records);
+}
+
+static cJSON* verify_stable_result(VxResult* result,
+                                   VxExecutionContext* context,
+                                   VxReport* report) {
+    const uint64_t json_safe_integer = UINT64_C(9007199254740991);
+    const size_t count = vx_result_output_count(result);
+    StableReadEvidence* records = NULL;
+    void* scratch = NULL;
+    size_t scratch_size = 0;
+    cJSON* stable = NULL;
+    cJSON* outputs = NULL;
+    VxStatus status;
+    if (!count) {
+        fprintf(stderr, "Lifecycle evidence requires at least one result output.\n");
+        return NULL;
+    }
+    records = (StableReadEvidence*)calloc(count, sizeof(*records));
+    stable = cJSON_CreateObject();
+    outputs = cJSON_CreateArray();
+    if (!records || !stable || !outputs) goto fail;
+    for (size_t index = 0; index < count; index++) {
+        cJSON* output = NULL;
+        cJSON* shape = NULL;
+        const char* dtype;
+        records[index].info = (VxTensorInfo)VX_TENSOR_INFO_INIT;
+        status = vx_result_output_info(result, index, &records[index].info,
+                                       report);
+        if (status != VX_STATUS_OK) {
+            print_failure("Inspecting stable output", status, report);
+            goto fail;
+        }
+        dtype = runtime_dtype_name(records[index].info.dtype);
+        if (!dtype || !records[index].info.name ||
+            records[index].info.byte_size > json_safe_integer) {
+            fprintf(stderr, "Stable output descriptor is not JSON-safe.\n");
+            goto fail;
+        }
+        output = cJSON_CreateObject();
+        shape = cJSON_CreateArray();
+        if (!output || !shape ||
+            !cJSON_AddStringToObject(output, "name", records[index].info.name)) {
+            cJSON_Delete(shape);
+            cJSON_Delete(output);
+            goto fail;
+        }
+        for (uint32_t axis = 0; axis < records[index].info.rank; axis++) {
+            int64_t dimension = records[index].info.shape[axis];
+            cJSON* value;
+            if (dimension <= 0 || (uint64_t)dimension > json_safe_integer) {
+                cJSON_Delete(shape);
+                cJSON_Delete(output);
+                goto fail;
+            }
+            value = cJSON_CreateNumber((double)dimension);
+            if (!value || !cJSON_AddItemToArray(shape, value)) {
+                cJSON_Delete(value);
+                cJSON_Delete(shape);
+                cJSON_Delete(output);
+                goto fail;
+            }
+        }
+        if (!cJSON_AddItemToObject(output, "shape", shape) ||
+            !cJSON_AddStringToObject(output, "dtype", dtype) ||
+            !cJSON_AddStringToObject(
+                output, "location",
+                records[index].info.location == VX_MEMORY_DEVICE
+                    ? "device" : "host") ||
+            !cJSON_AddNumberToObject(output, "byteLength",
+                                     (double)records[index].info.byte_size) ||
+            !cJSON_AddItemToArray(outputs, output)) {
+            cJSON_Delete(output);
+            goto fail;
+        }
+        records[index].first_read = malloc(
+            records[index].info.byte_size ? records[index].info.byte_size : 1u);
+        if (!records[index].first_read) goto fail;
+        if (records[index].info.byte_size > scratch_size)
+            scratch_size = records[index].info.byte_size;
+    }
+    scratch = malloc(scratch_size ? scratch_size : 1u);
+    if (!scratch) goto fail;
+    for (size_t index = 0; index < count; index++) {
+        const VxTensorInfo* info = &records[index].info;
+        status = vx_result_read(result, info->name, records[index].first_read,
+                                info->byte_size, NULL, report);
+        if (status == VX_STATUS_OK)
+            status = vx_result_read(result, info->name, scratch,
+                                    info->byte_size, NULL, report);
+        if (status != VX_STATUS_OK) {
+            print_failure("Verifying fresh result reads", status, report);
+            goto fail;
+        }
+        if (info->byte_size &&
+            memcmp(records[index].first_read, scratch, info->byte_size)) {
+            fprintf(stderr, "Repeated result reads differ for output %s.\n",
+                    info->name);
+            goto fail;
+        }
+    }
+    status = vx_execution_context_close(context, report);
+    if (status != VX_STATUS_OK) {
+        print_failure("Closing context before stable result verification",
+                      status, report);
+        goto fail;
+    }
+    for (size_t index = 0; index < count; index++) {
+        const VxTensorInfo* info = &records[index].info;
+        status = vx_result_read(result, info->name, scratch, info->byte_size,
+                                NULL, report);
+        if (status != VX_STATUS_OK) {
+            print_failure("Reading result after context close", status, report);
+            goto fail;
+        }
+        if (info->byte_size &&
+            memcmp(records[index].first_read, scratch, info->byte_size)) {
+            fprintf(stderr,
+                    "Result changed after context close for output %s.\n",
+                    info->name);
+            goto fail;
+        }
+    }
+    if (!cJSON_AddItemToObject(stable, "outputs", outputs)) goto fail;
+    outputs = NULL;
+    if (!cJSON_AddBoolToObject(stable, "freshCallerOwnedReads", 1) ||
+        !cJSON_AddBoolToObject(stable, "readableAfterContextClose", 1) ||
+        !cJSON_AddBoolToObject(stable, "contextClosedBeforeResult", 1))
+        goto fail;
+    free(scratch);
+    stable_read_evidence_free(records, count);
+    return stable;
+fail:
+    free(scratch);
+    stable_read_evidence_free(records, count);
+    cJSON_Delete(outputs);
+    cJSON_Delete(stable);
+    return NULL;
+}
+
+static cJSON* runtime_evidence_json(const VxReport* compilation_report,
+                                    const VxReport* execution_report,
+                                    cJSON* stable_result) {
+    cJSON* root = cJSON_CreateObject();
+    cJSON* compilation = compilation_evidence_json(compilation_report);
+    cJSON* execution = execution_evidence_json(execution_report);
+    if (!root || !compilation || !execution || !stable_result ||
+        !cJSON_AddStringToObject(root, "schema", "volvoxai.runtime-evidence") ||
+        !cJSON_AddNumberToObject(root, "version", 1) ||
+        !cJSON_AddItemToObject(root, "compilation", compilation)) {
+        cJSON_Delete(execution);
+        cJSON_Delete(compilation);
+        cJSON_Delete(stable_result);
+        cJSON_Delete(root);
+        return NULL;
+    }
+    compilation = NULL;
+    if (!cJSON_AddItemToObject(root, "execution", execution)) goto fail;
+    execution = NULL;
+    if (!cJSON_AddBoolToObject(stable_result,
+                               "resultClosedAfterVerification", 1) ||
+        !cJSON_AddItemToObject(root, "stableResult", stable_result))
+        goto fail;
+    return root;
+fail:
+    cJSON_Delete(execution);
+    cJSON_Delete(compilation);
+    cJSON_Delete(stable_result);
+    cJSON_Delete(root);
+    return NULL;
+}
+
+static int write_runtime_evidence(const char* path, cJSON* evidence) {
+    char* serialized;
+    int result;
+    if (!path || !evidence) return -1;
+    serialized = cJSON_PrintUnformatted(evidence);
+    if (!serialized) {
+        fprintf(stderr, "Cannot serialize lifecycle evidence.\n");
+        return -1;
+    }
+    result = write_bytes(path, serialized, strlen(serialized));
+    free(serialized);
+    return result;
 }
 
 static void print_release_info(void) {
@@ -425,542 +870,522 @@ static void print_release_info(void) {
            VOLVOXAI_VERSION, VOLVOXAI_GIT_COMMIT, VOLVOXAI_BUILD_DATE);
 }
 
-static void debug_fprint_shape(FILE* f, const int* shape, int ndim) {
-    fprintf(f, "[");
-    for (int i = 0; i < ndim; i++) fprintf(f, "%s%d", i ? "," : "", shape[i]);
-    fprintf(f, "]");
+static void print_root_help(const char* argv0) {
+    printf("VolvoxAI Native Engine\n\n");
+    printf("Usage: %s <command> [options]\n\n", argv0);
+    printf("Commands:\n");
+    printf("  run <model-dir|graph.json>   Execute one generic tensor graph.\n");
+#if VOLVOXAI_ENABLE_TRAINING
+    printf("  train <model-dir|graph.json> Train selected weights privately, then commit.\n");
+#endif
+    printf("  version                      Print release information.\n\n");
+    printf("The fixed CLI uses only the public opaque-handle runtime API.\n");
 }
 
-static void debug_print_runtime(const VolvoxAIEngineOptions* options) {
-    if (options->cpu_threads > 0) {
-        fprintf(stderr, "[debug] cpu_arch=%s cpu_features=%s threads=%d backend=%s\n",
-                cpu_arch_name(), cpu_feature_string(), options->cpu_threads,
-                volvoxai_engine_backend_name());
-    } else {
-        fprintf(stderr, "[debug] cpu_arch=%s cpu_features=%s threads=auto backend=%s\n",
-                cpu_arch_name(), cpu_feature_string(), volvoxai_engine_backend_name());
-    }
-}
-
-static void debug_print_tensor(const char* kind, const char* name) {
-    long numel = 0;
-    int shape[8] = {0};
-    int ndim = 0;
-    int dtype = -1;
-    size_t element_size = 0;
-    fprintf(stderr, "[debug] model_%s name=%s", kind, name ? name : "<unnamed>");
-    if (name && volvoxai_engine_tensor_info_ex(name, &numel, shape, &ndim, &dtype,
-            &element_size) == 0) {
-        fprintf(stderr, " shape=");
-        debug_fprint_shape(stderr, shape, ndim);
-        fprintf(stderr, " dtype=%s element_size=%zu numel=%ld",
-                dtype_name(dtype), element_size, numel);
-    }
-    fprintf(stderr, "\n");
-}
-
-static void debug_print_model_summary(void) {
-    int input_count = volvoxai_engine_graph_input_count();
-    for (int i = 0; i < input_count; i++) {
-        debug_print_tensor("input", volvoxai_engine_graph_input_name(i));
-    }
-    int output_count = volvoxai_engine_graph_output_count();
-    for (int i = 0; i < output_count; i++) {
-        debug_print_tensor("output", volvoxai_engine_graph_output_name(i));
-    }
-}
-
-static void graph_options_init(GraphOptions* opt) {
-    memset(opt, 0, sizeof(*opt));
-    engine_options_init(&opt->engine);
-    opt->execution_row = -1;
-}
-
-static int parse_graph_option(int argc, char** argv, int* i, GraphOptions* opt) {
-    int backend_flag = parse_backend_flag(argv[*i], &opt->engine);
-    if (backend_flag != 0) return backend_flag;
-    if (!strcmp(argv[*i], "--weights") && *i + 1 < argc) {
-        opt->weights = argv[++(*i)];
-        return 1;
-    }
-    if (!strcmp(argv[*i], "--input") && *i + 1 < argc) {
-        if (opt->n_inputs >= MAX_BINDINGS || parse_binding(argv[++(*i)], &opt->inputs[opt->n_inputs++], 1) != 0) {
-            fprintf(stderr, "--input expects name=file\n");
-            return -1;
-        }
-        return 1;
-    }
-    if (!strcmp(argv[*i], "--output") && *i + 1 < argc) {
-        if (opt->n_outputs >= MAX_BINDINGS || parse_binding(argv[++(*i)], &opt->outputs[opt->n_outputs++], 0) != 0) {
-            fprintf(stderr, "--output expects name=file or file\n");
-            return -1;
-        }
-        return 1;
-    }
-    if (!strcmp(argv[*i], "--row")) {
-        if (*i + 1 >= argc || parse_row_index(argv[++(*i)], &opt->execution_row) != 0) {
-            fprintf(stderr, "--row must be -1 or a non-negative 32-bit integer.\n");
-            return -1;
-        }
-        return 1;
-    }
-    return 0;
-}
-
-static int init_graph_with_options(const char* model, const GraphOptions* opt) {
-    ModelPaths paths;
-    if (resolve_model_paths(model, opt->weights, &paths) != 0) return -1;
-
-    if (configure_engine(&opt->engine) != 0) return -1;
-    printf("Loading graph: %s\n", paths.config);
-    double t0 = now_ms();
-    if (volvoxai_engine_init(paths.config, paths.weights[0] ? paths.weights : NULL) != 0) {
-        fprintf(stderr, "Native init failed.\n");
-        volvoxai_engine_shutdown();
-        return -1;
-    }
-    if (volvoxai_engine_set_execution_row(opt->execution_row) != 0) {
-        fprintf(stderr, "Invalid --row index: %d\n", opt->execution_row);
-        volvoxai_engine_shutdown();
-        return -1;
-    }
-    if (opt->engine.debug) {
-        fprintf(stderr, "[debug] volvoxai_engine_init %.3f ms\n", now_ms() - t0);
-        debug_print_runtime(&opt->engine);
-        debug_print_model_summary();
-    }
-
-    for (int i = 0; i < opt->n_inputs; i++) {
-        if (load_tensor_binding(&opt->inputs[i]) != 0) {
-            volvoxai_engine_shutdown();
-            return -1;
-        }
-    }
-    return 0;
-}
-
-static int run_forward_once(const char* label, int debug) {
-    int warm = g_warmup_runs < 0 ? 0 : g_warmup_runs;
-    int runs = g_num_runs < 1 ? 1 : g_num_runs;
-    for (int r = 0; r < warm; r++) {
-        if (volvoxai_engine_forward() != 0) { fprintf(stderr, "Native inference failed.\n"); return -1; }
-    }
-    double first = 0, sum = 0, best = 1e30, worst = 0;
-    for (int r = 0; r < runs; r++) {
-        double t0 = now_ms();
-        if (volvoxai_engine_forward() != 0) { fprintf(stderr, "Native inference failed.\n"); return -1; }
-        double dt = now_ms() - t0;
-        if (r == 0) first = dt;
-        sum += dt;
-        if (dt < best) best = dt;
-        if (dt > worst) worst = dt;
-    }
-    if (warm > 0 || runs > 1) {
-        // TFLite-style profile line (printed regardless of --debug, like benchmark_model)
-        fprintf(stderr, "[bench] %s: first=%.3f avg=%.3f min=%.3f max=%.3f ms  (warmup=%d, runs=%d)\n",
-                label, first, sum / runs, best, worst, warm, runs);
-    } else if (debug) {
-        fprintf(stderr, "[debug] %s forward %.3f ms\n", label, best);
-    }
-    return 0;
+static void print_run_help(const char* argv0) {
+    printf("Usage: %s run <model-dir|graph.json> [options]\n\n", argv0);
+    printf("Options:\n");
+    printf("  --weights <file>             Add a safetensors weight shard (repeatable).\n");
+    printf("  --input <name=file>          Load exact typed raw input data.\n");
+    printf("  --output <name=file|file>    Write exact typed raw output data.\n");
+    printf("  --row <index>                Write one row from each selected F32 output.\n");
+    printf("  --report-json <file>         Verify and write machine-readable lifecycle evidence.\n");
+    printf("  --threads <n>                Set the CPU worker count.\n");
+    printf("  --cpu | --vulkan | --opengl | --metal | --nnapi | --cuda\n");
+    printf("  --debug\n");
 }
 
 #if VOLVOXAI_ENABLE_TRAINING
-typedef struct {
-    GraphOptions graph;
-    const char* targets_path;
-    const char* logits_name;
-    const char* trainable_names[MAX_BINDINGS];
-    int trainable_count;
-    long steps;
-    int ignore_index;
-    float learning_rate;
-    float beta1;
-    float beta2;
-    float epsilon;
-    float weight_decay;
-    float max_grad_norm;
-    const char* input_optimizer_path;
-    const char* output_weights_path;
-    const char* output_optimizer_path;
-} TrainOptions;
-
-static int parse_train_long(const char* text, long* out) {
-    if (!text || !text[0] || !out) return -1;
-    errno = 0;
-    char* end = NULL;
-    long value = strtol(text, &end, 10);
-    if (errno == ERANGE || !end || *end != '\0') return -1;
-    *out = value;
-    return 0;
-}
-
-static int parse_train_float(const char* text, float* out) {
-    if (!text || !text[0] || !out) return -1;
-    errno = 0;
-    char* end = NULL;
-    float value = strtof(text, &end);
-    if (errno == ERANGE || !end || *end != '\0' || !isfinite(value)) return -1;
-    *out = value;
-    return 0;
-}
-
-static int trainable_name_is_duplicate(const TrainOptions* opt, const char* name) {
-    for (int i = 0; i < opt->trainable_count; i++) {
-        if (!strcmp(opt->trainable_names[i], name)) return 1;
-    }
-    return 0;
-}
-
-static const char* training_backend_name(int backend) {
-    switch (backend) {
-        case VOLVOXAI_TRAINING_BACKEND_VULKAN: return "Vulkan";
-        case VOLVOXAI_TRAINING_BACKEND_OPENGL: return "OpenGL";
-        case VOLVOXAI_TRAINING_BACKEND_METAL: return "Metal";
-        default: return "CPU";
-    }
-}
-
-static int validate_training_tensors(const TrainOptions* opt, const int32_t* targets,
-                                     int target_count) {
-    long logits_numel = 0;
-    int logits_shape[8] = {0};
-    int logits_ndim = 0;
-    int logits_dtype = -1;
-    size_t logits_element_size = 0;
-    if (volvoxai_engine_tensor_info_ex(opt->logits_name, &logits_numel, logits_shape,
-            &logits_ndim, &logits_dtype, &logits_element_size) != 0 ||
-        logits_dtype != VOLVOXAI_DTYPE_F32 || logits_element_size != sizeof(float) ||
-        logits_numel <= 0 ||
-        logits_ndim <= 0 || logits_ndim > 8) {
-        fprintf(stderr, "--logits must name a nonempty F32 tensor: %s\n", opt->logits_name);
-        return -1;
-    }
-
-    int classes = logits_shape[logits_ndim - 1];
-    if (classes <= 0 || logits_numel % classes != 0 ||
-        logits_numel / classes > INT_MAX) {
-        fprintf(stderr, "Logits tensor has an invalid cross-entropy shape: %s\n",
-                opt->logits_name);
-        return -1;
-    }
-    int rows = (int)(logits_numel / classes);
-    if (target_count <= 0 || target_count > rows) {
-        fprintf(stderr, "Target count %d exceeds logits row count %d.\n", target_count, rows);
-        return -1;
-    }
-    for (int i = 0; i < target_count; i++) {
-        if (targets[i] != opt->ignore_index && (targets[i] < 0 || targets[i] >= classes)) {
-            fprintf(stderr, "Target %d at index %d is outside [0, %d).\n",
-                    targets[i], i, classes);
-            return -1;
-        }
-    }
-
-    int execution_row = volvoxai_engine_execution_row();
-    if (execution_row >= 0) {
-        int batch = logits_ndim >= 3 ? logits_shape[0] : 1;
-        int per_batch = batch > 1 && target_count == batch && rows % batch == 0;
-        int limit = target_count == 1 ? rows : (per_batch ? rows / batch : 0);
-        if (limit <= 0) {
-            fprintf(stderr,
-                    "--row requires one target, or one target per logits batch.\n");
-            return -1;
-        }
-        if (execution_row >= limit) {
-            fprintf(stderr, "--row %d is outside [0, %d).\n",
-                    execution_row, limit);
-            return -1;
-        }
-    }
-
-    for (int i = 0; i < opt->trainable_count; i++) {
-        const char* name = opt->trainable_names[i];
-        long numel = 0;
-        int shape[8] = {0};
-        int ndim = 0;
-        int dtype = -1;
-        size_t element_size = 0;
-        if (volvoxai_engine_tensor_info_ex(name, &numel, shape, &ndim, &dtype,
-                &element_size) != 0 || dtype != VOLVOXAI_DTYPE_F32 ||
-            element_size != sizeof(float) ||
-            numel <= 0 || volvoxai_engine_is_model_weight(name) != 1) {
-            fprintf(stderr, "--trainable must name a nonempty F32 model weight: %s\n", name);
-            return -1;
-        }
-    }
-    return 0;
-}
-
-static int command_train(int argc, char** argv) {
-    if (argc < 3 || !strcmp(argv[2], "--help") || !strcmp(argv[2], "-h")) {
-        print_train_help(argv[0]);
-        return argc < 3 ? 1 : 0;
-    }
-
-    const char* model = argv[2];
-    TrainOptions opt;
-    memset(&opt, 0, sizeof(opt));
-    graph_options_init(&opt.graph);
-    opt.steps = 1;
-    opt.ignore_index = -100;
-    opt.learning_rate = 1.0e-3f;
-    opt.beta1 = 0.9f;
-    opt.beta2 = 0.999f;
-    opt.epsilon = 1.0e-8f;
-    for (int i = 3; i < argc; i++) {
-        const char* arg = argv[i];
-        if (!strcmp(arg, "--targets")) {
-            if (i + 1 >= argc || opt.targets_path) {
-                fprintf(stderr, "--targets requires exactly one file.\n");
-                return 2;
-            }
-            opt.targets_path = argv[++i];
-        } else if (!strcmp(arg, "--logits")) {
-            if (i + 1 >= argc || opt.logits_name) {
-                fprintf(stderr, "--logits requires exactly one tensor name.\n");
-                return 2;
-            }
-            opt.logits_name = argv[++i];
-        } else if (!strcmp(arg, "--trainable")) {
-            if (i + 1 >= argc || opt.trainable_count >= MAX_BINDINGS) {
-                fprintf(stderr, "--trainable requires a tensor name (maximum %d).\n",
-                        MAX_BINDINGS);
-                return 2;
-            }
-            const char* name = argv[++i];
-            if (!name[0] || trainable_name_is_duplicate(&opt, name)) {
-                fprintf(stderr, "Duplicate or empty --trainable tensor: %s\n", name);
-                return 2;
-            }
-            opt.trainable_names[opt.trainable_count++] = name;
-        } else if (!strcmp(arg, "--steps")) {
-            if (i + 1 >= argc || parse_train_long(argv[++i], &opt.steps) != 0 ||
-                opt.steps <= 0) {
-                fprintf(stderr, "--steps must be a positive integer.\n");
-                return 2;
-            }
-        } else if (!strcmp(arg, "--learning-rate")) {
-            if (i + 1 >= argc || parse_train_float(argv[++i], &opt.learning_rate) != 0) {
-                fprintf(stderr, "--learning-rate must be finite.\n");
-                return 2;
-            }
-        } else if (!strcmp(arg, "--beta1")) {
-            if (i + 1 >= argc || parse_train_float(argv[++i], &opt.beta1) != 0) {
-                fprintf(stderr, "--beta1 must be finite.\n");
-                return 2;
-            }
-        } else if (!strcmp(arg, "--beta2")) {
-            if (i + 1 >= argc || parse_train_float(argv[++i], &opt.beta2) != 0) {
-                fprintf(stderr, "--beta2 must be finite.\n");
-                return 2;
-            }
-        } else if (!strcmp(arg, "--epsilon")) {
-            if (i + 1 >= argc || parse_train_float(argv[++i], &opt.epsilon) != 0) {
-                fprintf(stderr, "--epsilon must be finite.\n");
-                return 2;
-            }
-        } else if (!strcmp(arg, "--weight-decay")) {
-            if (i + 1 >= argc || parse_train_float(argv[++i], &opt.weight_decay) != 0) {
-                fprintf(stderr, "--weight-decay must be finite.\n");
-                return 2;
-            }
-        } else if (!strcmp(arg, "--max-grad-norm")) {
-            if (i + 1 >= argc || parse_train_float(argv[++i], &opt.max_grad_norm) != 0) {
-                fprintf(stderr, "--max-grad-norm must be finite.\n");
-                return 2;
-            }
-        } else if (!strcmp(arg, "--ignore-index")) {
-            long value = 0;
-            if (i + 1 >= argc || parse_train_long(argv[++i], &value) != 0 ||
-                value < INT_MIN || value > INT_MAX) {
-                fprintf(stderr, "--ignore-index must be a 32-bit integer.\n");
-                return 2;
-            }
-            opt.ignore_index = (int)value;
-        } else if (!strcmp(arg, "--row")) {
-            if (i + 1 >= argc || parse_row_index(argv[++i],
-                    &opt.graph.execution_row) != 0) {
-                fprintf(stderr, "--row must be -1 or a non-negative 32-bit integer.\n");
-                return 2;
-            }
-        } else if (!strcmp(arg, "--output-weights")) {
-            if (i + 1 >= argc || opt.output_weights_path) {
-                fprintf(stderr, "--output-weights requires exactly one file.\n");
-                return 2;
-            }
-            opt.output_weights_path = argv[++i];
-        } else if (!strcmp(arg, "--input-optimizer")) {
-            if (i + 1 >= argc || opt.input_optimizer_path) {
-                fprintf(stderr, "--input-optimizer requires exactly one file.\n");
-                return 2;
-            }
-            opt.input_optimizer_path = argv[++i];
-        } else if (!strcmp(arg, "--output-optimizer")) {
-            if (i + 1 >= argc || opt.output_optimizer_path) {
-                fprintf(stderr, "--output-optimizer requires exactly one file.\n");
-                return 2;
-            }
-            opt.output_optimizer_path = argv[++i];
-        } else {
-            int parsed = parse_graph_option(argc, argv, &i, &opt.graph);
-            if (parsed < 0) return 2;
-            if (!parsed) {
-                fprintf(stderr, "Unknown train option: %s\n", argv[i]);
-                return 2;
-            }
-        }
-    }
-
-    if (!opt.targets_path || !opt.targets_path[0] || !opt.logits_name ||
-        !opt.logits_name[0] || opt.trainable_count <= 0) {
-        fprintf(stderr,
-                "train requires --targets, --logits, and at least one --trainable.\n");
-        return 2;
-    }
-    if ((opt.input_optimizer_path && !opt.input_optimizer_path[0]) ||
-        (opt.output_weights_path && !opt.output_weights_path[0]) ||
-        (opt.output_optimizer_path && !opt.output_optimizer_path[0])) {
-        fprintf(stderr, "Optimizer and weight paths must not be empty.\n");
-        return 2;
-    }
-    if (opt.learning_rate < 0.0f || opt.beta1 < 0.0f || opt.beta1 >= 1.0f ||
-        opt.beta2 < 0.0f || opt.beta2 >= 1.0f || opt.epsilon <= 0.0f ||
-        opt.weight_decay < 0.0f || opt.max_grad_norm < 0.0f) {
-        fprintf(stderr,
-                "Invalid optimizer values: lr/decay/clip must be non-negative, "
-                "betas in [0,1), and epsilon positive.\n");
-        return 2;
-    }
-    if (opt.output_weights_path && opt.output_optimizer_path &&
-        !strcmp(opt.output_weights_path, opt.output_optimizer_path)) {
-        fprintf(stderr, "Weight and optimizer outputs must use different files.\n");
-        return 2;
-    }
-    if (opt.output_weights_path && opt.input_optimizer_path &&
-        !strcmp(opt.output_weights_path, opt.input_optimizer_path)) {
-        fprintf(stderr, "Weight output must not overwrite the input optimizer file.\n");
-        return 2;
-    }
-
-    long target_bytes = 0;
-    char* target_storage = read_file_bytes(opt.targets_path, &target_bytes);
-    if (!target_storage || target_bytes <= 0 ||
-        target_bytes % (long)sizeof(int32_t) != 0 ||
-        target_bytes / (long)sizeof(int32_t) > INT_MAX) {
-        fprintf(stderr, "--targets must be a nonempty raw int32 file: %s\n",
-                opt.targets_path);
-        free(target_storage);
-        return 1;
-    }
-    int target_count = (int)(target_bytes / (long)sizeof(int32_t));
-    const int32_t* targets = (const int32_t*)target_storage;
-
-    int result = 1;
-    if (init_graph_with_options(model, &opt.graph) != 0) goto done;
-    if (validate_training_tensors(&opt, targets, target_count) != 0) goto done;
-
-    long loaded_step = 0;
-    if (opt.input_optimizer_path &&
-        (volvoxai_engine_load_optimizer_state(opt.input_optimizer_path, &loaded_step) != 0 ||
-         loaded_step < 0)) {
-        fprintf(stderr, "Failed to load optimizer state: %s\n", opt.input_optimizer_path);
-        goto done;
-    }
-    if (loaded_step > LONG_MAX - opt.steps) {
-        fprintf(stderr, "Loaded optimizer step plus --steps exceeds LONG_MAX.\n");
-        goto done;
-    }
-    long completed_step = loaded_step + opt.steps;
-
-    printf("Training optimizer=%s steps=%ld start_step=%ld trainables=%d targets=%d\n",
-           opt.weight_decay > 0.0f ? "AdamW" : "SGD", opt.steps,
-           loaded_step + 1, opt.trainable_count, target_count);
-    for (long index = 0; index < opt.steps; index++) {
-        long step = loaded_step + index + 1;
-        float loss = 0.0f;
-        int correct = 0;
-        int examples = 0;
-        double started = now_ms();
-        int update_mode = opt.weight_decay > 0.0f
-            ? VOLVOXAI_TENSOR_UPDATE_ADAMW : VOLVOXAI_TENSOR_UPDATE_SGD;
-        if (volvoxai_engine_train_step(opt.logits_name, targets, target_count,
-                opt.ignore_index, opt.trainable_names, opt.trainable_count, update_mode,
-                opt.learning_rate, opt.beta1, opt.beta2, opt.epsilon,
-                opt.weight_decay, opt.max_grad_norm, step, &loss, &correct,
-                &examples) != 0 || !isfinite(loss) || correct < 0 ||
-            examples < 0 || correct > examples) {
-            fprintf(stderr, "Training step %ld failed.\n", step);
-            goto done;
-        }
-        int backend = volvoxai_engine_last_training_backend();
-        if (examples > 0) {
-            printf("step=%ld loss=%.8g accuracy=%.2f%% (%d/%d) backend=%s time=%.3fms\n",
-                   step, loss, 100.0 * (double)correct / examples, correct, examples,
-                   training_backend_name(backend), now_ms() - started);
-        } else {
-            printf("step=%ld loss=%.8g accuracy=n/a (0/0) backend=%s time=%.3fms\n",
-                   step, loss, training_backend_name(backend), now_ms() - started);
-        }
-    }
-
-    for (int i = 0; i < opt.graph.n_outputs; i++) {
-        if (write_output_binding(&opt.graph.outputs[i]) != 0) goto done;
-    }
-    if (opt.output_weights_path &&
-        volvoxai_engine_save_weight_file(0, opt.output_weights_path) != 0) {
-        fprintf(stderr, "Failed to save trained weights: %s\n", opt.output_weights_path);
-        goto done;
-    }
-    if (opt.output_optimizer_path &&
-        volvoxai_engine_save_optimizer_state(opt.output_optimizer_path, completed_step) != 0) {
-        fprintf(stderr, "Failed to save optimizer state: %s\n",
-                opt.output_optimizer_path);
-        goto done;
-    }
-    result = 0;
-
-done:
-    volvoxai_engine_shutdown();
-    free(target_storage);
-    return result;
+static void print_train_help(const char* argv0) {
+    printf("Usage: %s train <model-dir|graph.json> [options]\n\n", argv0);
+    printf("Required options:\n");
+    printf("  --targets <file.i32>         Raw cross-entropy target indices.\n");
+    printf("  --logits <tensor>            F32 logits tensor name.\n");
+    printf("  --trainable <tensor>         F32 model weight (repeatable).\n");
+    printf("  --output-weights <file>      Export committed shard (repeatable).\n\n");
+    printf("Other options:\n");
+    printf("  --weights <file>             Add an input weight shard (repeatable).\n");
+    printf("  --input <name=file>          Load exact typed raw graph input.\n");
+    printf("  --microbatches <n>           Number of microbatches (default 1).\n");
+    printf("  --accumulation-steps <n>     Private gradient window (default 1).\n");
+    printf("  --optimizer <sgd|adamw>      Optimizer kind (default sgd).\n");
+    printf("  --learning-rate <value>      Non-negative learning rate.\n");
+    printf("  --beta1 <value> --beta2 <value> --epsilon <value>\n");
+    printf("  --weight-decay <value> --max-gradient-norm <value>\n");
+    printf("  --ignore-index <i> --row <i> --threads <n> --debug\n");
+    printf("  --vulkan | --opengl | --metal | --cuda\n");
 }
 #endif
 
 static int command_run(int argc, char** argv) {
+    RunOptions options;
+    ModelPaths paths;
+    VxRuntimeOptions runtime_options = VX_RUNTIME_OPTIONS_INIT;
+    VxModelSource source = VX_MODEL_SOURCE_INIT;
+    VxBackendPolicy policy = VX_BACKEND_POLICY_INIT;
+    VxContextOptions context_options = VX_CONTEXT_OPTIONS_INIT;
+    VxReport report = VX_REPORT_INIT;
+    VxReport compilation_report = VX_REPORT_INIT;
+    VxReport execution_report = VX_REPORT_INIT;
+    VxRuntime* runtime = NULL;
+    VxModel* model = NULL;
+    VxCompiledModel* compiled = NULL;
+    VxExecutionContext* context = NULL;
+    VxResult* result = NULL;
+    cJSON* stable_result = NULL;
+    cJSON* runtime_evidence = NULL;
+    const char* selected_backends[1];
+    VxStatus status;
+    int return_code = 1;
+
     if (argc < 3 || !strcmp(argv[2], "--help") || !strcmp(argv[2], "-h")) {
         print_run_help(argv[0]);
         return argc < 3 ? 1 : 0;
     }
-
-    const char* model = argv[2];
-    GraphOptions opt;
-    graph_options_init(&opt);
-
-    for (int i = 3; i < argc; i++) {
-        int parsed = parse_graph_option(argc, argv, &i, &opt);
+    memset(&options, 0, sizeof(options));
+    options.output_row = -1;
+    for (int index = 3; index < argc; index++) {
+        int parsed = parse_run_option(argc, argv, &index, &options);
         if (parsed < 0) return 2;
         if (!parsed) {
-            fprintf(stderr, "Unknown run option: %s\n", argv[i]);
+            fprintf(stderr, "Unknown run option: %s\n", argv[index]);
             return 2;
         }
     }
-
-    if (init_graph_with_options(model, &opt) != 0) return 1;
-    if (run_forward_once("run", opt.engine.debug) != 0) {
-        volvoxai_engine_shutdown();
-        return 1;
+    if (resolve_model_paths(argv[2], &paths) != 0) return 1;
+    if (!options.weight_path_count && paths.default_weights[0]) {
+        options.weight_paths[options.weight_path_count++] = paths.default_weights;
     }
 
-    const char* vd = getenv("VDUMP");
-    if (vd) fprintf(stderr, "[debug] VDUMP is handled by volvoxai_engine_run only; use --output for subcommand run.\n");
-
-    for (int i = 0; i < opt.n_outputs; i++) {
-        if (write_output_binding(&opt.outputs[i]) != 0) { volvoxai_engine_shutdown(); return 1; }
+    runtime_options.debug = options.debug;
+    runtime_options.cpu_threads = options.cpu_threads;
+    source.graph_path = paths.graph;
+    source.weight_paths = options.weight_paths;
+    source.weight_path_count = options.weight_path_count;
+    if (options.backend) {
+        selected_backends[0] = options.backend;
+        policy.mode = VX_BACKEND_REQUIRE;
+        policy.operator_fallback = VX_OPERATOR_FALLBACK_FORBID;
+        policy.backends = selected_backends;
+        policy.backend_count = 1;
     }
-    volvoxai_engine_shutdown();
+
+    status = vx_runtime_create(&runtime_options, &runtime, &report);
+    if (status != VX_STATUS_OK) {
+        print_failure("Native init", status, &report);
+        goto cleanup;
+    }
+    status = vx_runtime_load_model(runtime, &source, &model, &report);
+    if (status != VX_STATUS_OK) {
+        print_failure("Native init", status, &report);
+        goto cleanup;
+    }
+    status = vx_model_compile(model, &policy, &compiled, &report);
+    if (status != VX_STATUS_OK) {
+        print_failure("Native init", status, &report);
+        goto cleanup;
+    }
+    compilation_report = report;
+    printf("VolvoxAI Native Engine\nBackend: %s\n",
+           report.backend[0] ? report.backend : "unknown");
+    status = vx_compiled_model_create_context(compiled, &context_options,
+                                              &context, &report);
+    if (status != VX_STATUS_OK) {
+        print_failure("Native init", status, &report);
+        goto cleanup;
+    }
+    for (size_t index = 0; index < options.input_count; index++) {
+        if (set_input_binding(context, &options.inputs[index], &report) != 0)
+            goto cleanup;
+    }
+    status = vx_execution_context_execute(context, &result, &report);
+    if (status != VX_STATUS_OK) {
+        print_failure("Native inference", status, &report);
+        goto cleanup;
+    }
+    execution_report = report;
+    if (options.debug) {
+        fprintf(stderr,
+                "[debug] execution=%llu backend=%s device=%s time_ms=%.3f outputs=%zu\n",
+                (unsigned long long)vx_result_execution_id(result), report.backend,
+                report.device, report.execution_time_ms,
+                vx_result_output_count(result));
+    }
+    if (options.report_json) {
+        stable_result = verify_stable_result(result, context, &report);
+        if (!stable_result) goto cleanup;
+    }
+    for (size_t index = 0; index < options.output_count; index++) {
+        if (write_output_binding(result, &options.outputs[index],
+                                 options.output_row, &report) != 0)
+            goto cleanup;
+    }
+    if (options.report_json) {
+        vx_result_release(result);
+        result = NULL;
+        runtime_evidence = runtime_evidence_json(
+            &compilation_report, &execution_report, stable_result);
+        stable_result = NULL;
+        if (!runtime_evidence ||
+            write_runtime_evidence(options.report_json, runtime_evidence) != 0)
+            goto cleanup;
+    }
+    return_code = 0;
+
+cleanup:
+    cJSON_Delete(runtime_evidence);
+    cJSON_Delete(stable_result);
+    vx_result_release(result);
+    if (context) (void)vx_execution_context_close(context, NULL);
+    vx_execution_context_release(context);
+    vx_compiled_model_release(compiled);
+    vx_model_release(model);
+    if (runtime) (void)vx_runtime_close(runtime, NULL);
+    vx_runtime_release(runtime);
+    return return_code;
+}
+
+#if VOLVOXAI_ENABLE_TRAINING
+static int parse_train_float(const char* value, float* parsed) {
+    char* end = NULL;
+    float number;
+    if (!value || !value[0] || !parsed) return -1;
+    errno = 0;
+    number = strtof(value, &end);
+    if (errno == ERANGE || !end || *end || !isfinite(number)) return -1;
+    *parsed = number;
     return 0;
 }
+
+static int parse_train_i32(const char* value, int32_t* parsed) {
+    char* end = NULL;
+    long number;
+    if (!value || !value[0] || !parsed) return -1;
+    errno = 0;
+    number = strtol(value, &end, 10);
+    if (errno == ERANGE || !end || *end || number < INT32_MIN ||
+        number > INT32_MAX) return -1;
+    *parsed = (int32_t)number;
+    return 0;
+}
+
+static int read_whole_file(const char* path, void** data, size_t* byte_size) {
+    FILE* file;
+    long size;
+    void* bytes;
+    int failed = 0;
+    if (!path || !data || !byte_size) return -1;
+    *data = NULL;
+    *byte_size = 0;
+    file = fopen(path, "rb");
+    if (!file || fseek(file, 0, SEEK_END) != 0 ||
+        (size = ftell(file)) < 0 || fseek(file, 0, SEEK_SET) != 0) {
+        if (file) fclose(file);
+        return -1;
+    }
+    if ((unsigned long)size > SIZE_MAX) {
+        fclose(file);
+        return -1;
+    }
+    bytes = malloc(size > 0 ? (size_t)size : 1u);
+    if (!bytes) {
+        fclose(file);
+        return -1;
+    }
+    if (size > 0 && fread(bytes, 1, (size_t)size, file) != (size_t)size)
+        failed = 1;
+    if (fclose(file) != 0) failed = 1;
+    if (failed) {
+        free(bytes);
+        return -1;
+    }
+    *data = bytes;
+    *byte_size = (size_t)size;
+    return 0;
+}
+
+static int find_trainer_input(VxTrainer* trainer, const char* name,
+                              VxTensorInfo* found, VxReport* report) {
+    size_t count = vx_trainer_input_count(trainer);
+    for (size_t index = 0; index < count; index++) {
+        VxTensorInfo info = VX_TENSOR_INFO_INIT;
+        if (vx_trainer_input_info(trainer, index, &info, report) == VX_STATUS_OK &&
+            info.name && !strcmp(info.name, name)) {
+            *found = info;
+            return 0;
+        }
+    }
+    fprintf(stderr, "Unknown training input tensor: %s\n", name);
+    return -1;
+}
+
+static int set_trainer_input_binding(VxTrainer* trainer,
+                                     const Binding* binding,
+                                     VxReport* report) {
+    VxTensorInfo info = VX_TENSOR_INFO_INIT;
+    const char* suffix;
+    void* bytes = NULL;
+    VxStatus status;
+    if (find_trainer_input(trainer, binding->name, &info, report) != 0)
+        return -1;
+    suffix = dtype_suffix(info.dtype);
+    if (!suffix || !has_suffix(binding->path, suffix)) {
+        fprintf(stderr, "Training input %s has dtype %s and requires a %s file: %s\n",
+                binding->name, dtype_name(info.dtype),
+                suffix ? suffix : "supported raw", binding->path);
+        return -1;
+    }
+    if (read_exact_file(binding->path, info.byte_size, &bytes) != 0)
+        return -1;
+    status = vx_trainer_set_input(trainer, binding->name, info.dtype,
+                                  bytes, info.byte_size, report);
+    free(bytes);
+    if (status != VX_STATUS_OK) {
+        print_failure("Setting training input", status, report);
+        return -1;
+    }
+    return 0;
+}
+
+static int trainable_duplicate(const TrainOptions* options, const char* name) {
+    for (size_t index = 0; index < options->trainable_count; index++)
+        if (!strcmp(options->trainable_names[index], name)) return 1;
+    return 0;
+}
+
+static int command_train(int argc, char** argv) {
+    TrainOptions options;
+    ModelPaths paths;
+    VxRuntimeOptions runtime_options = VX_RUNTIME_OPTIONS_INIT;
+    VxModelSource source = VX_MODEL_SOURCE_INIT;
+    VxTrainerOptions trainer_options = VX_TRAINER_OPTIONS_INIT;
+    VxCrossEntropyLoss loss = VX_CROSS_ENTROPY_LOSS_INIT;
+    VxTrainStepOptions step_options = VX_TRAIN_STEP_OPTIONS_INIT;
+    VxTrainStepResult step_result = VX_TRAIN_STEP_RESULT_INIT;
+    VxRevisionInfo published = VX_REVISION_INFO_INIT;
+    VxReport report = VX_REPORT_INIT;
+    VxRuntime* runtime = NULL;
+    VxModel* model = NULL;
+    VxTrainer* trainer = NULL;
+    void* targets_storage = NULL;
+    size_t targets_bytes = 0;
+    const char* selected_backend;
+    int return_code = 1;
+    VxStatus status;
+
+    if (argc < 3 || !strcmp(argv[2], "--help") || !strcmp(argv[2], "-h")) {
+        print_train_help(argv[0]);
+        return argc < 3 ? 1 : 0;
+    }
+    memset(&options, 0, sizeof(options));
+    options.run.output_row = -1;
+    options.microbatches = 1;
+    options.accumulation_steps = 1;
+    options.optimizer = (VxOptimizerOptions)VX_OPTIMIZER_OPTIONS_INIT;
+    options.ignore_index = -100;
+    options.loss_row = -1;
+    for (int index = 3; index < argc; index++) {
+        const char* argument = argv[index];
+        if (!strcmp(argument, "--targets")) {
+            if (++index >= argc || options.targets_path) goto usage_error;
+            options.targets_path = argv[index];
+        } else if (!strcmp(argument, "--logits")) {
+            if (++index >= argc || options.logits_name) goto usage_error;
+            options.logits_name = argv[index];
+        } else if (!strcmp(argument, "--trainable")) {
+            const char* name;
+            if (++index >= argc || options.trainable_count == MAX_BINDINGS)
+                goto usage_error;
+            name = argv[index];
+            if (!name[0] || trainable_duplicate(&options, name)) goto usage_error;
+            options.trainable_names[options.trainable_count++] = name;
+        } else if (!strcmp(argument, "--output-weights")) {
+            if (++index >= argc ||
+                options.output_weight_path_count == MAX_WEIGHT_PATHS)
+                goto usage_error;
+            options.output_weight_paths[options.output_weight_path_count++] =
+                argv[index];
+        } else if (!strcmp(argument, "--microbatches")) {
+            int parsed;
+            if (++index >= argc ||
+                parse_nonnegative_int(argv[index], 0, &parsed) != 0 || !parsed)
+                goto usage_error;
+            options.microbatches = parsed;
+        } else if (!strcmp(argument, "--accumulation-steps")) {
+            int parsed;
+            if (++index >= argc ||
+                parse_nonnegative_int(argv[index], 0, &parsed) != 0 || !parsed)
+                goto usage_error;
+            options.accumulation_steps = (uint32_t)parsed;
+        } else if (!strcmp(argument, "--optimizer")) {
+            if (++index >= argc) goto usage_error;
+            if (!strcmp(argv[index], "sgd"))
+                options.optimizer.kind = VX_OPTIMIZER_SGD;
+            else if (!strcmp(argv[index], "adamw"))
+                options.optimizer.kind = VX_OPTIMIZER_ADAMW;
+            else goto usage_error;
+        } else if (!strcmp(argument, "--learning-rate")) {
+            if (++index >= argc || parse_train_float(
+                    argv[index], &options.optimizer.learning_rate) != 0)
+                goto usage_error;
+        } else if (!strcmp(argument, "--beta1")) {
+            if (++index >= argc || parse_train_float(
+                    argv[index], &options.optimizer.beta1) != 0)
+                goto usage_error;
+        } else if (!strcmp(argument, "--beta2")) {
+            if (++index >= argc || parse_train_float(
+                    argv[index], &options.optimizer.beta2) != 0)
+                goto usage_error;
+        } else if (!strcmp(argument, "--epsilon")) {
+            if (++index >= argc || parse_train_float(
+                    argv[index], &options.optimizer.epsilon) != 0)
+                goto usage_error;
+        } else if (!strcmp(argument, "--weight-decay")) {
+            if (++index >= argc || parse_train_float(
+                    argv[index], &options.optimizer.weight_decay) != 0)
+                goto usage_error;
+        } else if (!strcmp(argument, "--max-gradient-norm")) {
+            if (++index >= argc || parse_train_float(
+                    argv[index], &options.optimizer.max_gradient_norm) != 0)
+                goto usage_error;
+        } else if (!strcmp(argument, "--ignore-index")) {
+            if (++index >= argc || parse_train_i32(
+                    argv[index], &options.ignore_index) != 0)
+                goto usage_error;
+        } else if (!strcmp(argument, "--row")) {
+            if (++index >= argc || parse_train_i32(
+                    argv[index], &options.loss_row) != 0 || options.loss_row < -1)
+                goto usage_error;
+        } else {
+            int parsed = parse_run_option(argc, argv, &index, &options.run);
+            if (parsed <= 0) goto usage_error;
+        }
+    }
+    if (!options.targets_path || !options.logits_name ||
+        !options.trainable_count || !options.output_weight_path_count ||
+        options.run.output_count || options.run.output_row != -1 ||
+        options.run.report_json ||
+        options.optimizer.learning_rate < 0.0f ||
+        options.optimizer.beta1 < 0.0f || options.optimizer.beta1 >= 1.0f ||
+        options.optimizer.beta2 < 0.0f || options.optimizer.beta2 >= 1.0f ||
+        options.optimizer.epsilon <= 0.0f ||
+        options.optimizer.weight_decay < 0.0f ||
+        options.optimizer.max_gradient_norm < 0.0f) goto usage_error;
+    if (!has_suffix(options.targets_path, ".i32") ||
+        read_whole_file(options.targets_path, &targets_storage,
+                        &targets_bytes) != 0 || !targets_bytes ||
+        targets_bytes % sizeof(int32_t) != 0 ||
+        targets_bytes / sizeof(int32_t) > INT_MAX) {
+        fprintf(stderr, "--targets must be a nonempty raw .i32 file.\n");
+        goto cleanup;
+    }
+    if (resolve_model_paths(argv[2], &paths) != 0) goto cleanup;
+    if (!options.run.weight_path_count && paths.default_weights[0])
+        options.run.weight_paths[options.run.weight_path_count++] =
+            paths.default_weights;
+    if (options.output_weight_path_count != options.run.weight_path_count) {
+        fprintf(stderr,
+                "--output-weights count must match the %zu input weight shard(s).\n",
+                options.run.weight_path_count);
+        return_code = 2;
+        goto cleanup;
+    }
+    runtime_options.debug = options.run.debug;
+    runtime_options.cpu_threads = options.run.cpu_threads;
+    source.graph_path = paths.graph;
+    source.weight_paths = options.run.weight_paths;
+    source.weight_path_count = options.run.weight_path_count;
+    selected_backend = options.run.backend ? options.run.backend : "cpu";
+    trainer_options.backend = selected_backend;
+
+    status = vx_runtime_create(&runtime_options, &runtime, &report);
+    if (status != VX_STATUS_OK) {
+        print_failure("Training runtime creation", status, &report);
+        goto cleanup;
+    }
+    status = vx_runtime_load_model(runtime, &source, &model, &report);
+    if (status != VX_STATUS_OK) {
+        print_failure("Training model load", status, &report);
+        goto cleanup;
+    }
+    status = vx_model_create_trainer(model, &trainer_options, &trainer, &report);
+    if (status != VX_STATUS_OK) {
+        print_failure("Trainer creation", status, &report);
+        goto cleanup;
+    }
+    for (size_t index = 0; index < options.run.input_count; index++)
+        if (set_trainer_input_binding(
+                trainer, &options.run.inputs[index], &report) != 0)
+            goto cleanup;
+
+    loss.logits_name = options.logits_name;
+    loss.targets = (const int32_t*)targets_storage;
+    loss.target_count = targets_bytes / sizeof(int32_t);
+    loss.ignore_index = options.ignore_index;
+    loss.row_index = options.loss_row;
+    if (options.accumulation_steps > 1u)
+        loss.normalizer = (float)loss.target_count *
+                          (float)options.accumulation_steps;
+    step_options.losses = &loss;
+    step_options.loss_count = 1;
+    step_options.trainable_names = options.trainable_names;
+    step_options.trainable_count = options.trainable_count;
+    step_options.optimizer = options.optimizer;
+    step_options.accumulation_steps = options.accumulation_steps;
+    printf("Training backend=%s optimizer=%s microbatches=%ld accumulation=%u\n",
+           selected_backend,
+           options.optimizer.kind == VX_OPTIMIZER_ADAMW ? "adamw" : "sgd",
+           options.microbatches, options.accumulation_steps);
+    for (long index = 0; index < options.microbatches; index++) {
+        step_result = (VxTrainStepResult)VX_TRAIN_STEP_RESULT_INIT;
+        step_options.flush_accumulation =
+            index + 1 == options.microbatches ? 1 : 0;
+        status = vx_trainer_train_step(
+            trainer, &step_options, &step_result, &report);
+        if (status != VX_STATUS_OK) {
+            print_failure("Training step", status, &report);
+            goto cleanup;
+        }
+        printf("microbatch=%llu optimizer_step=%llu loss=%.8g "
+               "accumulated=%u update=%s backend=%s\n",
+               (unsigned long long)step_result.microbatch_id,
+               (unsigned long long)step_result.optimizer_step,
+               step_result.loss, step_result.accumulated_microbatches,
+               step_result.update_applied ? "yes" : "no",
+               step_result.backend);
+    }
+    status = vx_trainer_commit(trainer, &published, &report);
+    if (status != VX_STATUS_OK) {
+        print_failure("Training commit", status, &report);
+        goto cleanup;
+    }
+    status = vx_trainer_export_weights(
+        trainer, options.output_weight_paths,
+        options.output_weight_path_count, &report);
+    if (status != VX_STATUS_OK) {
+        print_failure("Training export", status, &report);
+        goto cleanup;
+    }
+    printf("Published weight revision %llu and exported %zu shard(s).\n",
+           (unsigned long long)published.weight_revision,
+           options.output_weight_path_count);
+    return_code = 0;
+    goto cleanup;
+
+usage_error:
+    fprintf(stderr, "Invalid train options. Use '%s train --help'.\n", argv[0]);
+    return_code = 2;
+
+cleanup:
+    free(targets_storage);
+    if (trainer) (void)vx_trainer_close(trainer, NULL);
+    vx_trainer_release(trainer);
+    vx_model_release(model);
+    if (runtime) (void)vx_runtime_close(runtime, NULL);
+    vx_runtime_release(runtime);
+    return return_code;
+}
+#endif
 
 int main(int argc, char** argv) {
     if (argc < 2 || !strcmp(argv[1], "--help") || !strcmp(argv[1], "-h")) {
@@ -972,16 +1397,11 @@ int main(int argc, char** argv) {
         print_release_info();
         return 0;
     }
-
-    int rc = 0;
-    if (!strcmp(argv[1], "run")) rc = command_run(argc, argv);
+    if (!strcmp(argv[1], "run")) return command_run(argc, argv);
 #if VOLVOXAI_ENABLE_TRAINING
-    else if (!strcmp(argv[1], "train")) rc = command_train(argc, argv);
+    if (!strcmp(argv[1], "train")) return command_train(argc, argv);
 #endif
-    else {
-        fprintf(stderr, "Unknown command: %s\n\n", argv[1]);
-        print_root_help(argv[0]);
-        rc = 2;
-    }
-    return rc;
+    fprintf(stderr, "Unknown command: %s\n\n", argv[1]);
+    print_root_help(argv[0]);
+    return 2;
 }

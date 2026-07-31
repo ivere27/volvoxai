@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""Materialize a TinyReceiptVQA INT8 release as Volvox inference blueprints.
+"""Materialize a TinyReceiptVQA INT8 release as Volvox inference graph documents.
 
 This is a *development-only* converter for either the published
 ``tiny_receipt_vqa_int8_safetensors_v1`` release or the separately identified
 ``tiny_receipt_vqa_volvox_trained_int8_safetensors_v1`` output of the example's
 JS PTQ mapper. Unlike the adjacent weight-only normalizer, it deliberately
-writes runnable Volvox graph blueprints:
+writes runnable Volvox graph documents:
 
 * one B=1 hard-router graph, and
 * one B=1 complete encoder/decoder graph for each of the eight explicit task
@@ -26,16 +26,15 @@ The optional W8A32 family mode keeps the learned router in W8A8 so AUTO remains
 comparable, while explicit-family activations, biases, embeddings, and constants
 are F32.  It reuses the source I8 weights and exact per-output scale tensors.
 
-The materialized package stores every quantized tensor's finite positive F32 scale in the
-same SafeTensors file under the conventional ``<tensor>_scale`` companion name.
-SafeTensors metadata owns the model-wide scheme/axis descriptor map; graph
-configs retain only the storage-format marker. Symmetric zero points are
-implicit and no numeric scales are repeated in JSON.
+Each graph owns one central reference-only affine table.  Its finite positive
+F32 scales and typed symmetric zero points live in the shared SafeTensors file;
+neither numeric values nor a second descriptor map are stored in JSON or
+SafeTensors metadata.
 
 The tool intentionally does not implement a host autoregressive session,
 preprocessing, calibration, golden-output verification, or automatic router
 to adapter-graph dispatch.  The router graph emits a family ID; its caller
-must select the corresponding explicit-family B=1 blueprint for the complete
+must select the corresponding explicit-family B=1 graph document for the complete
 generation run.
 """
 
@@ -54,25 +53,42 @@ from typing import Any, Callable, Iterable, Mapping, Sequence
 import numpy as np
 from safetensors.numpy import load_file, save_file
 
+_REPOSITORY_ROOT = Path(__file__).resolve().parents[3]
+if str(_REPOSITORY_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPOSITORY_ROOT))
+
+from tools.exporter.errors import ExporterError
+from tools.exporter.quantization_storage import (
+    QUANTIZATION_FORMAT,
+    validate_external_quantization,
+)
+
 
 SOURCE_FORMAT = "tiny_receipt_vqa_int8_safetensors_v1"
 SOURCE_RUNTIME = "pytorch-reference-dequantized-safetensors-v1"
 VOLVOX_TRAINED_SOURCE_FORMAT = "tiny_receipt_vqa_volvox_trained_int8_safetensors_v1"
-VOLVOX_TRAINED_SOURCE_RUNTIME = "volvoxai-js-ptq-native-trained-f32-v1"
+VOLVOX_TRAINED_SOURCE_RUNTIME = "volvoxai-js-ptq-trained-f32-v1"
 SOURCE_QUANTIZATION = "symmetric per-output-channel INT8"
 SOURCE_LAYOUT = {
     "int8_per_out": "quantized.<state_dict_key>",
     "scale_fp32": "scale.<state_dict_key>",
     "float32": "float32.<state_dict_key>",
 }
+VOLVOX_TRAINED_SOURCE_LAYOUT = {
+    "int8_per_out": "quantized.<state_dict_key>",
+    "scale_fp32": "scale.<state_dict_key>",
+    "zero_point_i8": "quantized.<state_dict_key>.zero_point",
+    "float32": "float32.<state_dict_key>",
+}
 
 PACKAGE_FORMAT = "volvoxai-tiny-receipt-vqa-w8a8-materialized-package-v1"
 WEIGHTS_FORMAT = "volvoxai-tiny-receipt-vqa-w8a8-materialized-weights-v2"
 W8A32_WEIGHTS_FORMAT = "volvoxai-tiny-receipt-vqa-w8a32-family-weights-v2"
-W8A8_BLUEPRINT_FORMAT = "volvoxai-blueprint-w8a8-v2"
-W8A32_BLUEPRINT_FORMAT = "volvoxai-blueprint-w8a32-v2"
-WEIGHT_SCALE_STORAGE_FORMAT = "volvoxai-f32-companion-scales-v1"
+GRAPH_FORMAT = "volvox-graph/v1"
+W8A8_GRAPH_PROFILE = "volvoxai-graph-w8a8-v2"
+W8A32_GRAPH_PROFILE = "volvoxai-graph-w8a32-v2"
 CALIBRATION_FORMAT = "volvoxai-tiny-receipt-vqa-w8a8-activation-scales-v1"
+SCOPED_WEIGHTS_DIR = "scoped_weights"
 FAMILY_ORDER = (
     "phone",
     "address",
@@ -147,8 +163,8 @@ class QuantizedWeight:
 class MaterializationResult:
     output_dir: Path
     weights_path: Path
-    router_config_path: Path
-    explicit_config_paths: tuple[Path, ...]
+    router_graph_path: Path
+    explicit_graph_paths: tuple[Path, ...]
     package_manifest_path: Path
     constant_saturation_count: int
     family_execution: str
@@ -615,7 +631,9 @@ def load_release(manifest_path: Path) -> SourceRelease:
             f"manifest.runtime must be {source_contracts[source_format]!r} for {source_format!r}"
         )
     safetensors = manifest.get("safetensors")
-    if not isinstance(safetensors, dict) or safetensors.get("layout") != SOURCE_LAYOUT or \
+    expected_layout = (VOLVOX_TRAINED_SOURCE_LAYOUT
+                       if source_format == VOLVOX_TRAINED_SOURCE_FORMAT else SOURCE_LAYOUT)
+    if not isinstance(safetensors, dict) or safetensors.get("layout") != expected_layout or \
             safetensors.get("quantization") != SOURCE_QUANTIZATION:
         raise MaterializationError("manifest.safetensors is not the supported named INT8 layout")
     files = manifest.get("files")
@@ -640,6 +658,8 @@ def load_release(manifest_path: Path) -> SourceRelease:
         if dtype == np.dtype(np.int8):
             expected_entries.add(f"quantized.{key}")
             expected_entries.add(f"scale.{key}")
+            if source_format == VOLVOX_TRAINED_SOURCE_FORMAT:
+                expected_entries.add(f"quantized.{key}.zero_point")
         else:
             expected_entries.add(f"float32.{key}")
     actual_entries = set(tensors)
@@ -659,6 +679,17 @@ def load_release(manifest_path: Path) -> SourceRelease:
             scale = _array(tensors[f"scale.{key}"], name=f"scale.{key}", dtype=np.dtype(np.float32), shape=(shape[0],))
             if not np.all(np.isfinite(scale)) or not np.all(scale > 0):
                 raise MaterializationError(f"SafeTensors entry scale.{key!r} must be finite and positive")
+            if source_format == VOLVOX_TRAINED_SOURCE_FORMAT:
+                zero_point = _array(
+                    tensors[f"quantized.{key}.zero_point"],
+                    name=f"quantized.{key}.zero_point",
+                    dtype=np.dtype(np.int8),
+                    shape=(shape[0],),
+                )
+                if np.any(zero_point != 0):
+                    raise MaterializationError(
+                        f"SafeTensors entry quantized.{key!r}.zero_point must be exactly zero"
+                    )
         else:
             value = _array(tensors[f"float32.{key}"], name=f"float32.{key}", dtype=np.dtype(np.float32), shape=shape)
             if not np.all(np.isfinite(value)):
@@ -671,6 +702,12 @@ def load_release(manifest_path: Path) -> SourceRelease:
     if not np.array_equal(token_values, head_values) or not np.array_equal(token_scales, head_scales):
         raise MaterializationError(
             "source tied tok.weight/head.weight tensors or per-row scales do not match exactly"
+        )
+    if source_format == VOLVOX_TRAINED_SOURCE_FORMAT and not np.array_equal(
+            tensors["quantized.tok.weight.zero_point"],
+            tensors["quantized.head.weight.zero_point"]):
+        raise MaterializationError(
+            "source tied tok.weight/head.weight zero points do not match exactly"
         )
     return SourceRelease(
         manifest_path=manifest_path,
@@ -759,27 +796,29 @@ class WeightBuilder:
         self.quantization: dict[str, dict[str, Any]] = {}
         self.constant_saturation: dict[str, int] = {}
         self.constant_quantization: dict[str, dict[str, Any]] = {}
-        self._scale_companions: dict[str, str] = {}
+        self._quantization_parameters: dict[str, str] = {}
 
     def _insert(self, name: str, value: np.ndarray) -> None:
         if name in self.values:
-            companion_owner = self._scale_companions.get(name)
-            if companion_owner is not None:
+            parameter_owner = self._quantization_parameters.get(name)
+            if parameter_owner is not None:
                 raise MaterializationError(
-                    f"materialized tensor {name!r} collides with the scale companion for {companion_owner!r}"
+                    f"materialized tensor {name!r} collides with a quantization parameter for {parameter_owner!r}"
                 )
             raise AssertionError(f"duplicate materialized weight {name!r}")
         self.values[name] = np.ascontiguousarray(value)
 
-    def _insert_scale_companion(self, name: str, scales: np.ndarray) -> str:
-        companion = f"{name}_scale"
-        if companion in self.values:
+    def _insert_quantization_parameter(
+        self, name: str, kind: str, values: np.ndarray
+    ) -> str:
+        parameter = f"{name}_{kind}"
+        if parameter in self.values:
             raise MaterializationError(
-                f"scale companion {companion!r} for {name!r} collides with a materialized tensor"
+                f"quantization parameter {parameter!r} for {name!r} collides with a materialized tensor"
             )
-        self.values[companion] = np.ascontiguousarray(scales, dtype=np.float32)
-        self._scale_companions[companion] = name
-        return companion
+        self.values[parameter] = np.ascontiguousarray(values)
+        self._quantization_parameters[parameter] = name
+        return parameter
 
     def _register_per_axis_quantization(self, name: str, scales: np.ndarray) -> None:
         if name in self.quantization:
@@ -795,10 +834,15 @@ class WeightBuilder:
             raise MaterializationError(
                 f"materialized scales for {name!r} do not match an I8 tensor's axis-0 size"
             )
-        self._insert_scale_companion(name, array)
+        scale_tensor = self._insert_quantization_parameter(name, "scale", array)
+        zero_point_tensor = self._insert_quantization_parameter(
+            name, "zero_point", np.zeros(array.shape, dtype=np.int8)
+        )
         self.quantization[name] = {
             "scheme": "per_axis",
             "axis": 0,
+            "scale_tensor": scale_tensor,
+            "zero_point_tensor": zero_point_tensor,
         }
 
     def _register_per_tensor_quantization(self, name: str, scale: np.float32 | float) -> None:
@@ -808,17 +852,62 @@ class WeightBuilder:
         if weight is None or weight.dtype != np.dtype(np.int8):
             raise MaterializationError(f"materialized per-tensor scale for {name!r} requires an I8 tensor")
         value = _require_finite_positive_f32(scale, f"materialized scale for {name}")
-        self._insert_scale_companion(name, np.asarray([value], dtype=np.float32))
-        self.quantization[name] = {"scheme": "per_tensor"}
+        scale_tensor = self._insert_quantization_parameter(
+            name, "scale", np.asarray([value], dtype=np.float32)
+        )
+        zero_point_tensor = self._insert_quantization_parameter(
+            name, "zero_point", np.zeros((1,), dtype=np.int8)
+        )
+        self.quantization[name] = {
+            "scheme": "per_tensor",
+            "scale_tensor": scale_tensor,
+            "zero_point_tensor": zero_point_tensor,
+        }
 
-    def weight_scale_storage(self) -> dict[str, Any]:
-        return {"format": WEIGHT_SCALE_STORAGE_FORMAT}
+    def weight_scale_tensor(self, name: str) -> str:
+        descriptor = self.quantization.get(name)
+        scale_tensor = descriptor.get("scale_tensor") if descriptor else None
+        if not isinstance(scale_tensor, str):
+            raise AssertionError(f"quantized tensor {name!r} has no registered scale tensor")
+        return scale_tensor
 
-    def weight_scale_companion(self, name: str) -> str:
-        companion = f"{name}_scale"
-        if self._scale_companions.get(companion) != name:
-            raise AssertionError(f"quantized tensor {name!r} has no registered scale companion")
-        return companion
+    def add_activation_quantization(
+        self,
+        namespace: str,
+        name: str,
+        scale: np.float32 | float,
+        *,
+        scale_tensor: str | None = None,
+    ) -> dict[str, Any]:
+        value = _require_finite_positive_f32(
+            scale, f"activation scale for {namespace}:{name}"
+        )
+        expected = np.asarray([value], dtype=np.float32)
+        if scale_tensor is not None:
+            stored = self.values.get(scale_tensor)
+            if stored is None or not np.array_equal(stored, expected):
+                raise MaterializationError(
+                    f"explicit scale tensor {scale_tensor!r} disagrees with {name!r}"
+                )
+        else:
+            digest = hashlib.sha256(
+                f"{namespace}\0{name}".encode("utf-8")
+            ).hexdigest()[:24]
+            base = f"__quant__.{digest}"
+            scale_tensor = self._insert_quantization_parameter(
+                base, "scale", expected
+            )
+        digest = hashlib.sha256(
+            f"{namespace}\0{name}\0zero_point".encode("utf-8")
+        ).hexdigest()[:24]
+        zero_point_tensor = self._insert_quantization_parameter(
+            f"__quant__.{digest}", "zero_point", np.zeros((1,), dtype=np.int8)
+        )
+        return {
+            "scheme": "per_tensor",
+            "scale_tensor": scale_tensor,
+            "zero_point_tensor": zero_point_tensor,
+        }
 
     def source_q(self, key: str) -> tuple[np.ndarray, np.ndarray]:
         values = self.release.tensors[f"quantized.{key}"]
@@ -854,10 +943,10 @@ class WeightBuilder:
 
     def add_weight_scale(self, weight: QuantizedWeight) -> str:
         """Publish the source per-output scale as an explicit W8A32 input."""
-        companion = self.weight_scale_companion(weight.name)
-        if not np.array_equal(self.values[companion], np.asarray(weight.scales, dtype=np.float32)):
-            raise MaterializationError(f"scale companion for {weight.name!r} disagrees with its W8A32 scales")
-        return companion
+        scale_tensor = self.weight_scale_tensor(weight.name)
+        if not np.array_equal(self.values[scale_tensor], np.asarray(weight.scales, dtype=np.float32)):
+            raise MaterializationError(f"scale tensor for {weight.name!r} disagrees with its W8A32 scales")
+        return scale_tensor
 
     def add_dequantized_embedding(self, name: str, weight: QuantizedWeight) -> str:
         """Materialize the tied token table for the F32 Embedding operator."""
@@ -995,8 +1084,8 @@ def _activation_quantization(scale: np.float32) -> dict[str, Any]:
     return {"scheme": "per_tensor", "scale": float(scale), "zero_point": ACTIVATION_ZERO_POINT}
 
 
-class BlueprintBuilder:
-    """Small declarative helper for strict typed Volvox blueprint nodes."""
+class GraphDocumentBuilder:
+    """Small declarative helper for strict typed Volvox graph document nodes."""
 
     def __init__(self, activation_profile: ActivationProfile, *, bias_scope: str):
         self.activation_profile = activation_profile
@@ -1045,7 +1134,6 @@ class BlueprintBuilder:
             "outputs": {"out": output},
             "outputs_shape": {"out": list(shape)},
             "outputs_dtype": {"out": ACTIVATION_DTYPE},
-            "outputs_quantization": {"out": _activation_quantization(output_scale)},
             "params": dict(params or {}),
         })
         return output
@@ -1132,7 +1220,6 @@ class BlueprintBuilder:
             "outputs": {"out": output},
             "outputs_shape": {"out": list(shape)},
             "outputs_dtype": {"out": ACTIVATION_DTYPE},
-            "outputs_quantization": {"out": _activation_quantization(scale)},
             "params": {},
         })
         return output
@@ -1171,7 +1258,6 @@ class BlueprintBuilder:
             "outputs": {"out": output},
             "outputs_shape": {"out": list(shape)},
             "outputs_dtype": {"out": ACTIVATION_DTYPE},
-            "outputs_quantization": {"out": _activation_quantization(scale)},
             "params": {"axis": axis},
         })
         return output
@@ -1294,7 +1380,7 @@ class BlueprintBuilder:
         )
 
 
-class W8A32BlueprintBuilder:
+class W8A32GraphDocumentBuilder:
     """Emit F32-activation family graphs backed by shared I8 weights.
 
     The router deliberately remains a calibrated W8A8 graph.  This builder is
@@ -1501,7 +1587,7 @@ def _write_json(path: Path, value: Mapping[str, Any]) -> None:
 
 
 class TinyReceiptMaterializer:
-    """Translate the fixed source architecture into reusable typed blueprints."""
+    """Translate the fixed source architecture into reusable typed graph documents."""
 
     def __init__(self, release: SourceRelease, activation_profile: ActivationProfile):
         self.release = release
@@ -1652,7 +1738,7 @@ class TinyReceiptMaterializer:
 
     def _linear(
         self,
-        graph: BlueprintBuilder,
+        graph: GraphDocumentBuilder,
         prefix: str,
         input_name: str,
         input_shape: Sequence[int],
@@ -1663,7 +1749,7 @@ class TinyReceiptMaterializer:
         source_probe: str | None = None,
         source_multiplier: float = 1.0,
     ) -> str:
-        if isinstance(graph, W8A32BlueprintBuilder):
+        if isinstance(graph, W8A32GraphDocumentBuilder):
             bias_name = self.weights.add_exact_f32_bias(
                 f"b.f32.{weight.name.removeprefix('w.')}", source_bias, weight
             )
@@ -1678,7 +1764,7 @@ class TinyReceiptMaterializer:
 
     def _mha_linear(
         self,
-        graph: BlueprintBuilder,
+        graph: GraphDocumentBuilder,
         prefix: str,
         source_root: str,
         projection: str,
@@ -1695,7 +1781,7 @@ class TinyReceiptMaterializer:
 
     def _conv(
         self,
-        graph: BlueprintBuilder,
+        graph: GraphDocumentBuilder,
         prefix: str,
         input_name: str,
         input_shape: Sequence[int],
@@ -1713,7 +1799,7 @@ class TinyReceiptMaterializer:
         out_h = (height + 2 - kernel_h) // stride + 1
         out_w = (width + 2 - kernel_w) // stride + 1
         output_shape = [batch, out_h, out_w, out_channels]
-        if isinstance(graph, W8A32BlueprintBuilder):
+        if isinstance(graph, W8A32GraphDocumentBuilder):
             bias = self.weights.add_exact_f32_bias(
                 f"b.f32.{weight.name.removeprefix('w.')}", None, weight
             )
@@ -1755,7 +1841,7 @@ class TinyReceiptMaterializer:
 
     def _group_norm(
         self,
-        graph: BlueprintBuilder,
+        graph: GraphDocumentBuilder,
         prefix: str,
         input_name: str,
         shape: Sequence[int],
@@ -1779,7 +1865,7 @@ class TinyReceiptMaterializer:
 
     def _qsilu(
         self,
-        graph: BlueprintBuilder,
+        graph: GraphDocumentBuilder,
         prefix: str,
         input_name: str,
         shape: Sequence[int],
@@ -1794,7 +1880,7 @@ class TinyReceiptMaterializer:
 
     def _ffn(
         self,
-        graph: BlueprintBuilder,
+        graph: GraphDocumentBuilder,
         prefix: str,
         input_name: str,
         shape: Sequence[int],
@@ -1860,7 +1946,7 @@ class TinyReceiptMaterializer:
 
     def _self_attention(
         self,
-        graph: BlueprintBuilder,
+        graph: GraphDocumentBuilder,
         prefix: str,
         input_name: str,
         shape: Sequence[int],
@@ -1897,7 +1983,7 @@ class TinyReceiptMaterializer:
 
     def _cross_attention(
         self,
-        graph: BlueprintBuilder,
+        graph: GraphDocumentBuilder,
         prefix: str,
         input_name: str,
         input_shape: Sequence[int],
@@ -1932,7 +2018,7 @@ class TinyReceiptMaterializer:
 
     def _adapter(
         self,
-        graph: BlueprintBuilder,
+        graph: GraphDocumentBuilder,
         prefix: str,
         input_name: str,
         shape: Sequence[int],
@@ -1971,17 +2057,27 @@ class TinyReceiptMaterializer:
             source_probe=output_probe or f"{source_root}.residual_output",
         )
 
-    def _register_static(self, graph: BlueprintBuilder, name: str, logical_edge: str) -> None:
-        if isinstance(graph, W8A32BlueprintBuilder):
+    def _register_static(self, graph: GraphDocumentBuilder, name: str, logical_edge: str) -> None:
+        if isinstance(graph, W8A32GraphDocumentBuilder):
             graph.alias_weight(name, f"{name}.f32")
             return
         descriptor = self.weights.quantization.get(name)
-        if descriptor is None or descriptor.get("scheme") != "per_tensor" or descriptor.get("zero_point", 0) != 0:
+        if descriptor is None or descriptor.get("scheme") != "per_tensor":
             raise AssertionError(f"static typed constant {name!r} has invalid descriptor")
-        companion = self.weights.weight_scale_companion(name)
-        stored_scale = self.weights.values[companion]
+        scale_tensor = descriptor.get("scale_tensor")
+        zero_point_tensor = descriptor.get("zero_point_tensor")
+        if not isinstance(scale_tensor, str) or not isinstance(zero_point_tensor, str):
+            raise AssertionError(f"static typed constant {name!r} has incomplete references")
+        stored_scale = self.weights.values[scale_tensor]
+        stored_zero_point = self.weights.values[zero_point_tensor]
         if stored_scale.dtype != np.dtype(np.float32) or stored_scale.shape != (1,):
-            raise AssertionError(f"static typed constant {name!r} has an invalid scale companion")
+            raise AssertionError(f"static typed constant {name!r} has an invalid scale tensor")
+        if (
+            stored_zero_point.dtype != np.dtype(np.int8)
+            or stored_zero_point.shape != (1,)
+            or int(stored_zero_point[0]) != 0
+        ):
+            raise AssertionError(f"static typed constant {name!r} has an invalid zero point")
         scale = graph.register_derived_static(name, logical_edge, stored_scale[0])
         if stored_scale[0] != scale:
             raise AssertionError(f"static typed constant {name!r} has mismatched graph descriptor")
@@ -1993,7 +2089,7 @@ class TinyReceiptMaterializer:
             "router_keep": {"shape": [1, d.max_q_len], "dtype": "int32"},
         }
 
-    def _explicit_inputs(self, graph: BlueprintBuilder) -> dict[str, dict[str, Any]]:
+    def _explicit_inputs(self, graph: GraphDocumentBuilder) -> dict[str, dict[str, Any]]:
         d = self.dimensions
         return {
             "image": {
@@ -2011,15 +2107,54 @@ class TinyReceiptMaterializer:
         self,
         *,
         kind: str,
-        graph: BlueprintBuilder,
+        graph: GraphDocumentBuilder,
         inputs: Mapping[str, Any],
         output_name: str,
         family: str | None = None,
     ) -> dict[str, Any]:
         d = self.dimensions
-        w8a32 = isinstance(graph, W8A32BlueprintBuilder)
+        w8a32 = isinstance(graph, W8A32GraphDocumentBuilder)
+        namespace = f"{kind}:{family or graph.bias_scope}"
+        referenced = {
+            name
+            for node in graph.nodes
+            for name in (node.get("inputs") or {}).values()
+            if isinstance(name, str)
+        }
+        quantization_table = {
+            name: dict(self.weights.quantization[name])
+            for name in sorted(referenced.intersection(self.weights.quantization))
+        }
+        if not w8a32:
+            explicit_scales = {
+                target: inputs_map.get("scale")
+                for node in graph.nodes
+                if node.get("opType") == "QuantizeLinear"
+                for inputs_map in [node.get("inputs") or {}]
+                for target in (node.get("outputs") or {}).values()
+                if isinstance(target, str) and isinstance(inputs_map.get("scale"), str)
+            }
+            for name, scale in sorted(graph.tensor_scales.items()):
+                if name in self.weights.quantization:
+                    quantization_table[name] = dict(self.weights.quantization[name])
+                else:
+                    quantization_table[name] = self.weights.add_activation_quantization(
+                        namespace,
+                        name,
+                        scale,
+                        scale_tensor=explicit_scales.get(name),
+                    )
+            for node in graph.nodes:
+                if node.get("opType") != "QuantizeLinear":
+                    continue
+                output = next(iter((node.get("outputs") or {}).values()), None)
+                descriptor = quantization_table.get(output)
+                if descriptor is not None:
+                    node["inputs"]["scale"] = descriptor["scale_tensor"]
+                    node["inputs"]["zero_point"] = descriptor["zero_point_tensor"]
         result: dict[str, Any] = {
-            "format": W8A32_BLUEPRINT_FORMAT if w8a32 else W8A8_BLUEPRINT_FORMAT,
+            "format": GRAPH_FORMAT,
+            "graph_profile": W8A32_GRAPH_PROFILE if w8a32 else W8A8_GRAPH_PROFILE,
             "model_type": (
                 "tiny_receipt_vqa_w8a32_weight_only_materialized"
                 if w8a32 else "tiny_receipt_vqa_w8a8_materialized"
@@ -2053,10 +2188,14 @@ class TinyReceiptMaterializer:
                 "stem_channels": list(d.stem_channels),
             },
         }
+        if quantization_table:
+            result["quantization"] = {
+                "format": QUANTIZATION_FORMAT,
+                "tensors": quantization_table,
+            }
         if w8a32:
             result["activation_edge_bindings"] = []
         else:
-            result["weights_quantization_storage"] = self.weights.weight_scale_storage()
             result["activation_edge_bindings"] = graph.edge_bindings
             result["activation_scale_profile"] = {
                 "format": CALIBRATION_FORMAT,
@@ -2071,11 +2210,17 @@ class TinyReceiptMaterializer:
                 "route_scope": "whole_execution",
                 "batch_policy": "homogeneous_fixed_b1",
             }
+        try:
+            validate_external_quantization(result, self.weights.values)
+        except ExporterError as error:
+            raise MaterializationError(
+                f"invalid materialized quantization contract: {error.diagnostic.message}"
+            ) from error
         return result
 
-    def build_router_config(self) -> dict[str, Any]:
+    def build_router_graph(self) -> dict[str, Any]:
         d = self.dimensions
-        graph = BlueprintBuilder(self.profile, bias_scope="router")
+        graph = GraphDocumentBuilder(self.profile, bias_scope="router")
         self._register_static(graph, "c.q_pos", "constant.q_pos")
         self._register_static(graph, "c.q_type", "constant.q_type")
         inputs = self._router_inputs()
@@ -2115,12 +2260,12 @@ class TinyReceiptMaterializer:
             raise MaterializationError("family_execution must be 'w8a8' or 'w8a32'")
         family_id = FAMILY_ORDER.index(family)
         d = self.dimensions
-        graph: BlueprintBuilder | W8A32BlueprintBuilder
+        graph: GraphDocumentBuilder | W8A32GraphDocumentBuilder
         if family_execution == "w8a32":
-            graph = W8A32BlueprintBuilder(self.weights, bias_scope=f"family_{family}")
+            graph = W8A32GraphDocumentBuilder(self.weights, bias_scope=f"family_{family}")
             graph.alias_embedding(self._q("tok.weight").name, "f.tok.embedding")
         else:
-            graph = BlueprintBuilder(self.profile, bias_scope=f"family_{family}")
+            graph = GraphDocumentBuilder(self.profile, bias_scope=f"family_{family}")
         for name, key in (
             ("c.img_pos", "constant.img_pos"),
             ("c.img_type", "constant.img_type"),
@@ -2286,6 +2431,65 @@ def _validated_vocab(manifest: Mapping[str, Any], dimensions: ModelDimensions) -
     return {"itos": list(itos)}, {"pad": 0, "bos": 1, "eos": 2, "unk": 3}
 
 
+def _graph_weight_names(
+    graph: Mapping[str, Any], weights: Mapping[str, np.ndarray]
+) -> frozenset[str]:
+    """Return the exact persisted-tensor closure named by one graph.
+
+    Runtime tensor references live in node inputs, direct graph outputs, and
+    the central affine descriptor table.  Intersecting those names with the
+    already-validated materialized inventory keeps graph inputs and node
+    outputs out of the shard without inferring meaning from tensor names.
+    """
+    referenced: set[str] = set()
+
+    def include(value: Any) -> None:
+        if isinstance(value, str) and value in weights:
+            referenced.add(value)
+
+    for output in graph.get("outputs", ()):  # A graph output may be a weight.
+        include(output)
+    for node in graph.get("nodes", ()):
+        if not isinstance(node, Mapping):
+            continue
+        inputs = node.get("inputs")
+        if isinstance(inputs, Mapping):
+            for value in inputs.values():
+                include(value)
+    quantization = graph.get("quantization")
+    descriptors = quantization.get("tensors") if isinstance(quantization, Mapping) else None
+    if isinstance(descriptors, Mapping):
+        for target, descriptor in descriptors.items():
+            include(target)
+            if isinstance(descriptor, Mapping):
+                include(descriptor.get("scale_tensor"))
+                include(descriptor.get("zero_point_tensor"))
+    return frozenset(referenced)
+
+
+def _save_scoped_weight_file(
+    destination: Path,
+    relative_path: str,
+    names: Iterable[str],
+    weights: Mapping[str, np.ndarray],
+    metadata: Mapping[str, str],
+) -> str:
+    selected_names = sorted(set(names))
+    if not selected_names:
+        raise MaterializationError(f"scoped weight file {relative_path} would be empty")
+    path = destination / relative_path
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        save_file(
+            {name: weights[name] for name in selected_names},
+            str(path),
+            metadata=dict(metadata),
+        )
+    except (KeyError, OSError, ValueError) as error:
+        raise MaterializationError(f"could not write scoped weights {path}: {error}") from error
+    return relative_path
+
+
 def _ensure_new_or_empty_output_dir(output_dir: Path, source_dir: Path) -> None:
     output_dir = Path(output_dir)
     if output_dir.resolve() == source_dir.resolve():
@@ -2339,8 +2543,8 @@ def materialize_release(
         converter.prepare_weights()
         if family_execution == "w8a32":
             converter.prepare_w8a32_family_weights()
-        router_config = converter.build_router_config()
-        explicit_configs = {
+        router_graph = converter.build_router_graph()
+        explicit_graphs = {
             family: converter.build_explicit_family_config(
                 family, family_execution=family_execution
             )
@@ -2348,32 +2552,81 @@ def materialize_release(
         }
         vocab, token_ids = _validated_vocab(release.manifest, release.dimensions)
 
+        weights_format = W8A32_WEIGHTS_FORMAT if family_execution == "w8a32" else WEIGHTS_FORMAT
+        weights_metadata = {
+            "format": weights_format,
+            "source_format": str(release.manifest["format"]),
+            "source_manifest_sha256": _sha256(release.manifest_path),
+        }
         weights_path = destination / "model.safetensors"
         try:
             save_file(
                 converter.weights.values,
                 str(weights_path),
-                metadata={
-                    "format": W8A32_WEIGHTS_FORMAT if family_execution == "w8a32" else WEIGHTS_FORMAT,
-                    "source_format": str(release.manifest["format"]),
-                    "source_manifest_sha256": _sha256(release.manifest_path),
-                    "weights_quantization_storage": WEIGHT_SCALE_STORAGE_FORMAT,
-                    "weights_quantization": json.dumps(
-                        converter.weights.quantization,
-                        sort_keys=True,
-                        separators=(",", ":"),
-                    ),
-                },
+                metadata=weights_metadata,
             )
         except (OSError, ValueError) as error:
             raise MaterializationError(f"could not write materialized weights {weights_path}: {error}") from error
 
-        router_path = destination / "router_config.json"
-        _write_json(router_path, router_config)
+        router_weight_names = _graph_weight_names(
+            router_graph, converter.weights.values
+        )
+        family_weight_names = {
+            family: _graph_weight_names(graph, converter.weights.values)
+            for family, graph in explicit_graphs.items()
+        }
+        if not router_weight_names or any(
+            not names for names in family_weight_names.values()
+        ):
+            raise MaterializationError(
+                "every materialized graph must reference persisted weights"
+            )
+        common_family_weights = set.intersection(
+            *(set(family_weight_names[family]) for family in FAMILY_ORDER)
+        )
+        router_weight_files = [
+            _save_scoped_weight_file(
+                destination,
+                f"{SCOPED_WEIGHTS_DIR}/router.safetensors",
+                router_weight_names,
+                converter.weights.values,
+                {**weights_metadata, "scope": "router"},
+            )
+        ]
+        common_weight_file = (
+            _save_scoped_weight_file(
+                destination,
+                f"{SCOPED_WEIGHTS_DIR}/common.safetensors",
+                common_family_weights,
+                converter.weights.values,
+                {**weights_metadata, "scope": "explicit-family-common"},
+            )
+            if common_family_weights else None
+        )
+        family_weight_files: dict[str, list[str]] = {}
+        for family in FAMILY_ORDER:
+            paths = [common_weight_file] if common_weight_file is not None else []
+            family_only = set(family_weight_names[family]) - common_family_weights
+            if family_only:
+                paths.append(_save_scoped_weight_file(
+                    destination,
+                    f"{SCOPED_WEIGHTS_DIR}/explicit_family_{family}.safetensors",
+                    family_only,
+                    converter.weights.values,
+                    {**weights_metadata, "scope": f"explicit-family:{family}"},
+                ))
+            if not paths:
+                raise MaterializationError(
+                    f"explicit family {family!r} has no scoped weight files"
+                )
+            family_weight_files[family] = paths
+
+        router_path = destination / "router.graph.json"
+        _write_json(router_path, router_graph)
         family_paths: dict[str, Path] = {}
-        for family, config in explicit_configs.items():
-            path = destination / f"explicit_family_{family}_config.json"
-            _write_json(path, config)
+        for family, graph in explicit_graphs.items():
+            path = destination / f"explicit_family_{family}.graph.json"
+            _write_json(path, graph)
             family_paths[family] = path
         vocab_path = destination / "vocab.json"
         _write_json(vocab_path, vocab)
@@ -2397,7 +2650,8 @@ def materialize_release(
         }
         explicit_interfaces = {
             family: {
-                "config": path.name,
+                "graph": path.name,
+                "weight_files": family_weight_files[family],
                 "interface": {
                     "inputs": dict(explicit_input_aliases),
                     "output_name": "token_ids",
@@ -2427,7 +2681,8 @@ def materialize_release(
             },
             "weights": {"file": weights_path.name, "sha256": _sha256(weights_path)},
             "router": {
-                "config": router_path.name,
+                "graph": router_path.name,
+                "weight_files": router_weight_files,
                 "output_name": "router_family",
                 "inputs": router_input_aliases,
             },
@@ -2451,7 +2706,7 @@ def materialize_release(
             "generation_contract": {
                 "batch_size": 1,
                 "decoder": "host supplies fixed max_out_len y_ids/y_keep on each autoregressive step",
-                "router": "run router_config.json, then select the returned explicit family config for the whole execution",
+                "router": "run router.graph.json, then select the returned explicit family graph for the whole execution",
                 "execution_variant": (
                     "hybrid W8A8 router plus W8A32 explicit family"
                     if family_execution == "w8a32" else "W8A8 router and explicit family"
@@ -2474,7 +2729,7 @@ def materialize_release(
                     if release.manifest["format"] == VOLVOX_TRAINED_SOURCE_FORMAT else
                     "QGELU uses Volvox's portable F32 erf approximation, while the source PyTorch Transformer requested GELU; output fidelity needs goldens."
                 ),
-                "The source model is evaluated with dropout disabled; this blueprint contains no dropout operator.",
+                "The source model is evaluated with dropout disabled; this graph document contains no dropout operator.",
                 "A fallback activation profile or any listed unqualified fallback edge is not a claim of production-quality per-edge calibration.",
             ],
         }
@@ -2498,8 +2753,8 @@ def materialize_release(
     return MaterializationResult(
         output_dir=destination,
         weights_path=weights_path,
-        router_config_path=router_path,
-        explicit_config_paths=tuple(family_paths[family] for family in FAMILY_ORDER),
+        router_graph_path=router_path,
+        explicit_graph_paths=tuple(family_paths[family] for family in FAMILY_ORDER),
         package_manifest_path=package_path,
         constant_saturation_count=sum(converter.weights.constant_saturation.values()),
         family_execution=family_execution,
@@ -2552,8 +2807,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     print(json.dumps({
         "output_dir": str(result.output_dir),
         "weights": str(result.weights_path),
-        "router_config": str(result.router_config_path),
-        "explicit_family_configs": [str(path) for path in result.explicit_config_paths],
+        "router_graph": str(result.router_graph_path),
+        "explicit_family_graphs": [str(path) for path in result.explicit_graph_paths],
         "package_manifest": str(result.package_manifest_path),
         "constant_saturation_count": result.constant_saturation_count,
         "family_execution": result.family_execution,

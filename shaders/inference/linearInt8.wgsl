@@ -11,9 +11,9 @@ struct Params {
   seq_len : u32,
   d_in : u32,
   d_out : u32,
-  weight_dtype : u32, // 2 = I8, 3 = U8 (shared typed-storage codes)
+  weight_dtype : u32, // canonical protobuf dtype: 6=I8, 5=U8
   scale_elements : u32,
-  zero_point_dtype : u32, // 0 = absent, 1 = I32, 2 = I8, 3 = U8
+  zero_point_dtype : u32, // 0=UNSPECIFIED, 16=I32, 6=I8, 5=U8
   zero_point_elements : u32,
   _reserved : u32,
 }
@@ -30,7 +30,7 @@ fn raw_u8(word : u32, byte_index : u32) -> i32 {
 fn weight_value(byte_offset : u32) -> i32 {
   let word = weight_packed[byte_offset / 4u];
   let byte_index = byte_offset % 4u;
-  if (params.weight_dtype == 2u) {
+  if (params.weight_dtype == 6u) {
     return raw_i8(word, byte_index);
   }
   return raw_u8(word, byte_index);
@@ -41,11 +41,11 @@ fn weight_zero_point(column : u32) -> i32 {
     return 0;
   }
   let index = select(0u, column, params.zero_point_elements != 1u);
-  if (params.zero_point_dtype == 2u) {
+  if (params.zero_point_dtype == 6u) {
     let word = weight_zero_points[index / 4u];
     return raw_i8(word, index % 4u);
   }
-  if (params.zero_point_dtype == 3u) {
+  if (params.zero_point_dtype == 5u) {
     let word = weight_zero_points[index / 4u];
     return raw_u8(word, index % 4u);
   }

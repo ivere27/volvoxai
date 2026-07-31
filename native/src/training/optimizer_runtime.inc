@@ -7,17 +7,13 @@
  * broader internal ABI.
  */
 
-typedef struct {
-    char name[128];
-    long numel;
-    float* m;
-    float* v;
-} EngineOptimizerState;
-
-static EngineOptimizerState g_opt_states[MAXT];
-
 static void volvoxai_engine_free_optimizer_states(void) {
     for (int i = 0; i < MAXT; i++) {
+#if VOLVOXAI_ENABLE_CUDA
+        if (g_opt_states[i].m && g_opt_states[i].v)
+            cuda_training_optimizer_forget(g_opt_states[i].m,
+                                           g_opt_states[i].v);
+#endif
         free(g_opt_states[i].m);
         free(g_opt_states[i].v);
         memset(&g_opt_states[i], 0, sizeof(g_opt_states[i]));
@@ -30,6 +26,10 @@ static EngineOptimizerState* optimizer_state_for(const char* name, long numel) {
         if (g_opt_states[i].name[0] && strcmp(g_opt_states[i].name, name) == 0) {
             EngineOptimizerState* state = &g_opt_states[i];
             if (state->numel != numel) {
+#if VOLVOXAI_ENABLE_CUDA
+                if (state->m && state->v)
+                    cuda_training_optimizer_forget(state->m, state->v);
+#endif
                 free(state->m);
                 free(state->v);
                 state->m = NULL;
@@ -62,6 +62,11 @@ static void optimizer_state_remove(const char* name) {
     if (!name) return;
     for (int i = 0; i < MAXT; i++) {
         if (g_opt_states[i].name[0] && !strcmp(g_opt_states[i].name, name)) {
+#if VOLVOXAI_ENABLE_CUDA
+            if (g_opt_states[i].m && g_opt_states[i].v)
+                cuda_training_optimizer_forget(g_opt_states[i].m,
+                                               g_opt_states[i].v);
+#endif
             free(g_opt_states[i].m);
             free(g_opt_states[i].v);
             memset(&g_opt_states[i], 0, sizeof(g_opt_states[i]));
@@ -70,13 +75,61 @@ static void optimizer_state_remove(const char* name) {
     }
 }
 
+int volvoxai_engine_optimizer_state_buffers_f32(
+        const char* name, long numel, float** first_moment,
+        float** second_moment) {
+    EngineOptimizerState* state;
+    if (!name || !name[0] || numel <= 0 || !first_moment || !second_moment)
+        return -1;
+    state = optimizer_state_for(name, numel);
+    if (!state) return -1;
+    *first_moment = state->m;
+    *second_moment = state->v;
+    return 0;
+}
+
+static int optimizer_publish_updated_weight(const char* name, T* tensor,
+                                             long numel,
+                                             int host_authoritative) {
+    int file_index;
+    if (!name || !tensor || tensor->dtype != T_F32 ||
+        tensor->numel != numel || !tensor->data) return -1;
+    file_index = volvoxai_engine_tensor_weight_file_index(name);
+    if (host_authoritative && file_index >= 0) {
+        SafetensorsTensor* stored =
+            safetensors_find_tensor_mutable(&g_weight_files[file_index], name);
+        if (stored && stored->dtype == SAFETENSORS_DTYPE_F32 &&
+            stored->nbytes == (size_t)numel * sizeof(float)) {
+            if (safetensors_set_tensor_data(
+                    &g_weight_files[file_index], name, tensor->data,
+                    stored->nbytes) != 0) return -1;
+        }
+    }
+    if (host_authoritative && vx_runtime_backend_has_graph())
+        vx_runtime_backend_mark_host(
+            tensor->data, (size_t)numel * sizeof(float), 1);
+    vk_mark_owned_tensors_host_dirty();
+    g_weight_caches_dirty = 1;
+    volvoxai_engine_model_generation_advance_locked();
+    return 0;
+}
+
+int volvoxai_engine_finalize_device_tensor_update_f32(const char* name,
+                                                       long numel) {
+    T* tensor;
+    if (!name || !name[0] || numel <= 0 ||
+        !volvoxai_engine_tensor_is_model_weight_locked(name)) return -1;
+    tensor = t_find(name);
+    return optimizer_publish_updated_weight(name, tensor, numel, 0);
+}
+
 static int volvoxai_engine_apply_tensor_update_f32_impl(
         const char* name, const float* update, long numel, int mode,
         float learning_rate, float beta1, float beta2, float epsilon,
         float weight_decay, float max_grad_norm, long step) {
     if (!name || !update || numel < 0) return -1;
     if (volvoxai_engine_tensor_is_removed_output(name)) return -1;
-    if (volvoxai_engine_tensor_is_internal_companion_locked(name)) return -1;
+    if (volvoxai_engine_tensor_is_quantization_parameter_locked(name)) return -1;
     if (volvoxai_engine_merged_contains_tensor(name)) return -1;
     T* tensor = t_find(name);
     if (!tensor || tensor->dtype != T_F32 || tensor->numel != numel) return -1;
@@ -119,6 +172,15 @@ static int volvoxai_engine_apply_tensor_update_f32_impl(
     } else if (mode == VOLVOXAI_TENSOR_UPDATE_ADAMW) {
         EngineOptimizerState* state = optimizer_state_for(name, numel);
         if (!state) return -1;
+#if VOLVOXAI_ENABLE_CUDA
+        if (cuda_training_optimizer_materialize(
+                state->m, state->v, (size_t)numel * sizeof(float)) != 0)
+            return -1;
+        /* The CPU update below makes the host moments authoritative again.
+           Drop the old device mirror so a later CUDA step seeds from these
+           newly updated values instead of reusing stale device state. */
+        cuda_training_optimizer_forget(state->m, state->v);
+#endif
         float bias_correction1 = 1.0f - powf(beta1, (float)step);
         float bias_correction2 = 1.0f - powf(beta2, (float)step);
         if (bias_correction1 <= 0.0f) bias_correction1 = 1.0f;
@@ -139,21 +201,7 @@ static int volvoxai_engine_apply_tensor_update_f32_impl(
         return -1;
     }
 
-    int file_index = volvoxai_engine_tensor_weight_file_index(name);
-    if (file_index >= 0) {
-        SafetensorsTensor* stored =
-            safetensors_find_tensor_mutable(&g_weight_files[file_index], name);
-        if (stored && stored->dtype == SAFETENSORS_DTYPE_F32 &&
-            stored->nbytes == (size_t)numel * sizeof(float)) {
-            safetensors_set_tensor_data(
-                &g_weight_files[file_index], name, weight, stored->nbytes);
-        }
-    }
-    qt_invalidate_all();
-    vk_mark_owned_tensors_host_dirty();
-    g_weight_caches_dirty = 1;
-    volvoxai_engine_model_generation_advance_locked();
-    return 0;
+    return optimizer_publish_updated_weight(name, tensor, numel, 1);
 }
 
 int volvoxai_engine_apply_tensor_update_f32_locked(
@@ -168,7 +216,7 @@ int volvoxai_engine_apply_tensor_update_f32_locked(
 int volvoxai_engine_prepare_tensor_update_f32(const char* name, long numel, int mode) {
     if (!name || !name[0] || numel <= 0 || (mode != 2 && mode != 3)) return -1;
     if (volvoxai_engine_tensor_is_removed_output(name)) return -1;
-    if (volvoxai_engine_tensor_is_internal_companion_locked(name)) return -1;
+    if (volvoxai_engine_tensor_is_quantization_parameter_locked(name)) return -1;
     if (volvoxai_engine_merged_contains_tensor(name)) return -1;
     T* tensor = t_find(name);
     if (!tensor || tensor->dtype != T_F32 || tensor->numel != numel || !tensor->data) {
@@ -230,6 +278,11 @@ int volvoxai_engine_save_optimizer_state(const char* path, long training_step) {
         EngineOptimizerState* state = &g_opt_states[i];
         if (!state->name[0] || state->numel <= 0 || !state->m || !state->v ||
             state->numel > INT_MAX) continue;
+#if VOLVOXAI_ENABLE_CUDA
+        if (cuda_training_optimizer_materialize(
+                state->m, state->v,
+                (size_t)state->numel * sizeof(float)) != 0) goto done;
+#endif
         char m_name[64], v_name[64], key[64];
         snprintf(m_name, sizeof(m_name), "state.%d.m", state_count);
         snprintf(v_name, sizeof(v_name), "state.%d.v", state_count);

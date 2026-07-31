@@ -1,17 +1,17 @@
 // --- The Final N-Dimensional "No Stubs" Primitives (Batch 5) ---
+#include "../../include/volvoxai_enums.h"
+#include "kernel_platform.h"
 #include <stdint.h>
 
-enum {
-    VX_CAST_F32 = 0,
-    VX_CAST_I32 = 1,
-    VX_CAST_I8 = 2,
-    VX_CAST_U8 = 3,
-};
-
 static int32_t vx_cast_integer_read(const void *input, int dtype, int index) {
-    if (dtype == VX_CAST_I32) return ((const int32_t *)input)[index];
-    if (dtype == VX_CAST_I8) return (int32_t)((const int8_t *)input)[index];
+    if (dtype == VX_DTYPE_I32) return ((const int32_t *)input)[index];
+    if (dtype == VX_DTYPE_I8) return (int32_t)((const int8_t *)input)[index];
     return (int32_t)((const uint8_t *)input)[index];
+}
+
+static int vx_cast_dtype_supported(int dtype) {
+    return dtype == VX_DTYPE_F32 || dtype == VX_DTYPE_I32 ||
+        dtype == VX_DTYPE_I8 || dtype == VX_DTYPE_U8;
 }
 
 /* Match ECMAScript TypedArray ToInt32 exactly for an F32 source: non-finite
@@ -46,25 +46,29 @@ static int8_t vx_cast_i8_from_u8(uint8_t value) {
 
 static void vx_cast_integer_store(void *output, int dtype, int index,
         int32_t integer) {
-    if (dtype == VX_CAST_I32) ((int32_t *)output)[index] = integer;
-    else if (dtype == VX_CAST_I8) {
+    if (dtype == VX_DTYPE_I32) ((int32_t *)output)[index] = integer;
+    else if (dtype == VX_DTYPE_I8) {
         ((int8_t *)output)[index] = vx_cast_i8_from_u8((uint8_t)integer);
     }
     else ((uint8_t *)output)[index] = (uint8_t)integer;
 }
 
-/* dtype: 0=F32, 1=I32, 2=I8, 3=U8. Integer writes retain typed-array wrapping. */
+/* Dtypes use canonical VxDataType protobuf values. Integer writes retain
+ * TypedArray wrapping. */
 int cast_typed(const void *input, int input_dtype, void *output, int output_dtype, int n) {
-    if (!input || !output || n < 0 || input_dtype < VX_CAST_F32 || input_dtype > VX_CAST_U8 ||
-        output_dtype < VX_CAST_F32 || output_dtype > VX_CAST_U8) return 0;
+    if (!input || !output || n < 0 ||
+        !vx_cast_dtype_supported(input_dtype) ||
+        !vx_cast_dtype_supported(output_dtype)) return 0;
     for (int index = 0; index < n; index++) {
-        if (input_dtype == VX_CAST_F32) {
+        if (input_dtype == VX_DTYPE_F32) {
             float value = ((const float *)input)[index];
-            if (output_dtype == VX_CAST_F32) ((float *)output)[index] = value;
+            if (output_dtype == VX_DTYPE_F32)
+                ((float *)output)[index] = value;
             else vx_cast_integer_store(output, output_dtype, index, vx_cast_f32_to_i32(value));
         } else {
             int32_t value = vx_cast_integer_read(input, input_dtype, index);
-            if (output_dtype == VX_CAST_F32) ((float *)output)[index] = (float)value;
+            if (output_dtype == VX_DTYPE_F32)
+                ((float *)output)[index] = (float)value;
             else vx_cast_integer_store(output, output_dtype, index, value);
         }
     }
@@ -131,17 +135,182 @@ void gather_4d_f32(const float* input, const float* indices, float* output,
     }
 }
 
-WASM_EXPORT("matmul_f32")
-void matmul_f32(const float* input, const float* weight, const float* bias, float* output, int seq_len, int d_in, int d_out) {
+/*
+ * Dense F32 matrix multiply for the paths that cannot use a packed weight.
+ *
+ * The Linear/Gemm node prefers vx_gemm_f32_run_packed, but that needs an
+ * immutable model weight it can pack once and cache.  BatchMatMul's B operand is
+ * a graph value, and Linear falls back here when its weight is not a model
+ * tensor, so these two kernels stay on the hot path.  Both were scalar triple
+ * loops, and neither auto-vectorizes even under -mavx2: the reduction is an FP
+ * accumulation the compiler may not reorder without -ffast-math, which this
+ * build deliberately does not set.
+ *
+ * No packing happens here — it would cost O(K*N) writes against a single
+ * O(M*K*N) call, which does not amortize for the small M these paths see.
+ * Instead each kernel is written against the layout it is given, so every load
+ * is contiguous in the dimension that matters:
+ *
+ *   matmul_f32        B is [K,N]: contiguous along N, so broadcast one A value
+ *                     and FMA whole B rows into column accumulators.
+ *   matmul_f32_out_in B is [N,K]: contiguous along K, so it is a dot product,
+ *                     reduced with several independent accumulators.
+ *
+ * Both use four-row by sixteen-column blocking to hold eight ymm accumulators.
+ * Four was measured too few: an FMA has ~4 cycles of latency against two per
+ * cycle of throughput, so fewer than eight independent chains cannot keep the
+ * unit busy regardless of how the loads are arranged.
+ */
+#if !defined(__wasm__) && (defined(__i386__) || defined(__x86_64__)) && \
+    (defined(__clang__) || defined(__GNUC__))
+#include <immintrin.h>
+#define VX_MATMUL_X86_AVX2 1
+#define VX_MATMUL_TARGET_AVX2 __attribute__((target("avx2,fma")))
+#else
+#define VX_MATMUL_X86_AVX2 0
+#define VX_MATMUL_TARGET_AVX2
+#endif
+
+enum { VX_MATMUL_MR = 4, VX_MATMUL_NR = 16 };
+
+static void matmul_f32_k_major_scalar(const float* input, const float* weight,
+                                      const float* bias, float* output,
+                                      int seq_len, int d_in, int d_out) {
     for (int i = 0; i < seq_len; i++) {
         for (int j = 0; j < d_out; j++) {
             float sum = bias ? bias[j] : 0.0f;
             for (int k = 0; k < d_in; k++) {
-                sum += input[i * d_in + k] * weight[k * d_out + j];
+                sum += input[(size_t)i * d_in + k] * weight[(size_t)k * d_out + j];
             }
-            output[i * d_out + j] = sum;
+            output[(size_t)i * d_out + j] = sum;
         }
     }
+}
+
+static void matmul_f32_out_in_scalar(const float* input, const float* weight,
+                                     const float* bias, float* output,
+                                     int rows, int d_in, int d_out) {
+    for (int row = 0; row < rows; row++) {
+        for (int j = 0; j < d_out; j++) {
+            float sum = bias ? bias[j] : 0.0f;
+            for (int k = 0; k < d_in; k++)
+                sum += input[(size_t)row * d_in + k] * weight[(size_t)j * d_in + k];
+            output[(size_t)row * d_out + j] = sum;
+        }
+    }
+}
+
+#if VX_MATMUL_X86_AVX2
+
+/* B is [K,N].  One A element broadcasts across sixteen B columns, so the inner
+ * step is two contiguous B loads and eight FMAs against register-resident
+ * accumulators; B is walked with a d_out stride the prefetcher handles as two
+ * sequential streams. */
+static VX_MATMUL_TARGET_AVX2 void matmul_f32_k_major_avx2(
+        const float* input, const float* weight, const float* bias,
+        float* output, int seq_len, int d_in, int d_out) {
+    int row = 0;
+    for (; row < seq_len; row += VX_MATMUL_MR) {
+        const int rows = seq_len - row < VX_MATMUL_MR ? seq_len - row : VX_MATMUL_MR;
+        int column = 0;
+        for (; column + VX_MATMUL_NR <= d_out; column += VX_MATMUL_NR) {
+            __m256 low[VX_MATMUL_MR], high[VX_MATMUL_MR];
+            int r;
+            for (r = 0; r < rows; r++) {
+                low[r] = bias ? _mm256_loadu_ps(bias + column) : _mm256_setzero_ps();
+                high[r] = bias ? _mm256_loadu_ps(bias + column + 8)
+                               : _mm256_setzero_ps();
+            }
+            for (int k = 0; k < d_in; k++) {
+                const float* weight_row = weight + (size_t)k * d_out + column;
+                const __m256 weight_low = _mm256_loadu_ps(weight_row);
+                const __m256 weight_high = _mm256_loadu_ps(weight_row + 8);
+                for (r = 0; r < rows; r++) {
+                    const __m256 value =
+                        _mm256_set1_ps(input[(size_t)(row + r) * d_in + k]);
+                    low[r] = _mm256_fmadd_ps(value, weight_low, low[r]);
+                    high[r] = _mm256_fmadd_ps(value, weight_high, high[r]);
+                }
+            }
+            for (r = 0; r < rows; r++) {
+                float* out_row = output + (size_t)(row + r) * d_out + column;
+                _mm256_storeu_ps(out_row, low[r]);
+                _mm256_storeu_ps(out_row + 8, high[r]);
+            }
+        }
+        if (column < d_out)
+            matmul_f32_k_major_scalar(input + (size_t)row * d_in,
+                                      weight + column, bias ? bias + column : NULL,
+                                      output + (size_t)row * d_out + column,
+                                      rows, d_in, d_out - column);
+    }
+}
+
+/* B is [N,K], so each output is a dot product over contiguous memory.  Four
+ * accumulators per column pair keep the reduction chains independent; the A row
+ * is reused across the four columns of a block. */
+static inline VX_MATMUL_TARGET_AVX2 float matmul_f32_dot_avx2(
+        const float* a, const float* b, int n) {
+    __m256 acc0 = _mm256_setzero_ps();
+    __m256 acc1 = _mm256_setzero_ps();
+    __m128 folded;
+    float sum;
+    int k = 0;
+    for (; k + 16 <= n; k += 16) {
+        acc0 = _mm256_fmadd_ps(_mm256_loadu_ps(a + k),
+                               _mm256_loadu_ps(b + k), acc0);
+        acc1 = _mm256_fmadd_ps(_mm256_loadu_ps(a + k + 8),
+                               _mm256_loadu_ps(b + k + 8), acc1);
+    }
+    for (; k + 8 <= n; k += 8)
+        acc0 = _mm256_fmadd_ps(_mm256_loadu_ps(a + k),
+                               _mm256_loadu_ps(b + k), acc0);
+    acc0 = _mm256_add_ps(acc0, acc1);
+    folded = _mm_add_ps(_mm256_castps256_ps128(acc0),
+                        _mm256_extractf128_ps(acc0, 1));
+    folded = _mm_add_ps(folded, _mm_movehl_ps(folded, folded));
+    folded = _mm_add_ss(folded, _mm_shuffle_ps(folded, folded, 1));
+    sum = _mm_cvtss_f32(folded);
+    for (; k < n; k++) sum += a[k] * b[k];
+    return sum;
+}
+
+static VX_MATMUL_TARGET_AVX2 void matmul_f32_out_in_avx2(
+        const float* input, const float* weight, const float* bias,
+        float* output, int rows, int d_in, int d_out) {
+    for (int row = 0; row < rows; row++) {
+        const float* input_row = input + (size_t)row * d_in;
+        float* output_row = output + (size_t)row * d_out;
+        for (int j = 0; j < d_out; j++)
+            output_row[j] = (bias ? bias[j] : 0.0f) +
+                matmul_f32_dot_avx2(input_row, weight + (size_t)j * d_in, d_in);
+    }
+}
+
+#endif /* VX_MATMUL_X86_AVX2 */
+
+WASM_EXPORT("matmul_f32")
+void matmul_f32(const float* input, const float* weight, const float* bias, float* output, int seq_len, int d_in, int d_out) {
+#if VX_MATMUL_X86_AVX2
+    if (vx_kernel_platform()->has_avx2) {
+        matmul_f32_k_major_avx2(input, weight, bias, output, seq_len, d_in, d_out);
+        return;
+    }
+#endif
+    matmul_f32_k_major_scalar(input, weight, bias, output, seq_len, d_in, d_out);
+}
+
+/* Shares matmul_f32's dispatch so the Linear node's OUT_IN fallback is not the
+ * one shape left running scalar. */
+void matmul_f32_out_in(const float* input, const float* weight, const float* bias,
+                       float* output, int rows, int d_in, int d_out) {
+#if VX_MATMUL_X86_AVX2
+    if (vx_kernel_platform()->has_avx2) {
+        matmul_f32_out_in_avx2(input, weight, bias, output, rows, d_in, d_out);
+        return;
+    }
+#endif
+    matmul_f32_out_in_scalar(input, weight, bias, output, rows, d_in, d_out);
 }
 
 

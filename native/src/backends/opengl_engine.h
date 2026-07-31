@@ -7,6 +7,7 @@ extern "C" {
 
 #include <stddef.h>
 #include <stdint.h>
+#include "../../include/volvoxai_enums.h"
 
 #ifndef VOLVOXAI_ENABLE_TRAINING
 #define VOLVOXAI_ENABLE_TRAINING 0
@@ -36,8 +37,6 @@ enum {
 int opengl_init(void);
 void opengl_cleanup(void);
 void opengl_set_shader_root(const char* root);
-int opengl_make_current(void);
-void opengl_release_current(void);
 void opengl_free_weight_cache(void);
 int opengl_matmul(const float* in, const float* w, const float* b, float* out,
                   int seq, int d_in, int d_out);
@@ -84,6 +83,19 @@ int opengl_graph_add_f32(const float* a, const float* b, float* out, long n);
 int opengl_graph_add_relu_f32(const float* a, const float* b, float* out, long n, int relu);
 int opengl_graph_add3_relu_f32(const float* a, const float* b, const float* c, float* out, long n, int relu);
 int opengl_graph_clip_f32(const float* in, float* out, long n, float min_v, float max_v);
+/* Canonical 32-bit typed control ABI. Compare operation is 0=Equal,
+ * 1=GreaterOrEqual; strides describe a validated right-aligned broadcast. */
+int opengl_graph_compare_i32(
+    const int32_t* a, long a_elements,
+    const int32_t* b, long b_elements,
+    int32_t* output, long output_elements,
+    const uint32_t* output_strides,
+    const uint32_t* a_strides,
+    const uint32_t* b_strides,
+    int rank, int operation);
+int opengl_graph_not_i32(const int32_t* input, int32_t* output, long elements);
+int opengl_graph_clip_i32(const int32_t* input, int32_t* output, long elements,
+                          int32_t minimum, int32_t maximum);
 int opengl_graph_sigmoid_f32(const float* in, float* out, long n);
 int opengl_graph_relu_f32(const float* in, float* out, long n);
 int opengl_graph_gelu_f32(const float* in, float* out, long n, int approximate_tanh);
@@ -94,7 +106,7 @@ int opengl_graph_hardsigmoid_f32(const float* in, float* out, long n);
 int opengl_graph_leaky_relu_f32(const float* in, float* out, long n, float alpha);
 int opengl_graph_prelu_f32(const float* in, const float* weight, float* out, long n, int channels);
 int opengl_graph_layernorm_f32(const float* in, const float* weight, const float* bias,
-                               float* out, int rows, int d_model);
+                               float* out, int rows, int d_model, float eps);
 int opengl_graph_rmsnorm_f32(const float* in, const float* weight, float* out,
                              int rows, int d_model, float eps);
 int opengl_graph_softmax_f32(const float* in, float* out, int rows, int d);
@@ -120,6 +132,14 @@ int opengl_graph_transpose_f32(const float* in, float* out, const int* in_shape,
                                const int* perm, int rank);
 int opengl_graph_where_f32(const float* cond, const float* a, const float* b, float* out, long n);
 int opengl_graph_cast_copy_f32(const float* in, float* out, long n);
+int opengl_graph_where_32(const int32_t* condition, const void* a,
+                          const void* b, void* output, long elements);
+/* Dtypes use canonical VxDataType values; only F32 and I32 are accepted. */
+int opengl_graph_cast_typed(const void* input, int input_dtype,
+                            void* output, int output_dtype, long elements);
+int opengl_graph_copy_32(const void* input, void* output, long elements);
+int opengl_graph_argmax_f32(const float* input, int32_t* output,
+                            uint32_t outer, uint32_t axis_size, uint32_t inner);
 int opengl_graph_upsample2x_f32(const float* in, float* out, int n, int h, int w, int c);
 int opengl_graph_resize_nearest_f32(const float* in, float* out, int n, int h, int w, int c,
                                     int out_h, int out_w);
@@ -127,6 +147,9 @@ int opengl_graph_resize_f32(const float* in, float* out, int n, int h, int w, in
                             int out_h, int out_w, int mode);
 int opengl_graph_concat_f32(const float** inputs, const long* sizes, const int* input_axes,
                             int count, float* out, int output_axis, int inner, int sigmoid);
+int opengl_graph_concat_32(const void* const* inputs, const long* sizes,
+                           const int* input_axes, int count, void* output,
+                           int output_axis, int inner);
 int opengl_graph_concat_flat_f32(const float** inputs, const long* sizes, int count, float* out);
 int opengl_graph_concat_sigmoid_flat_f32(const float** inputs, const long* sizes, int count, float* out);
 int opengl_graph_maxpool2d_f32(const float* in, float* out, int n, int h, int width, int c,
@@ -134,8 +157,10 @@ int opengl_graph_maxpool2d_f32(const float* in, float* out, int n, int h, int wi
                                int py, int px);
 int opengl_graph_expand_f32(const float* in, float* out, const int* in_shape, int in_rank,
                             const int* out_shape, int out_rank);
-int opengl_graph_gather_axis0_f32(const float* in, const float* indices, float* out,
-                                  int row_size, int input_rows, int num_idx);
+int opengl_graph_gather_i32_f32(const float* input, const int32_t* indices,
+                                float* output, int outer, int axis_size,
+                                int inner, int indices_elements,
+                                int output_elements);
 int opengl_graph_pad4d_f32(const float* in, float* out, const int* in_shape, int in_rank,
                            const int* out_shape, int out_rank, int pad_top, int pad_left, float value);
 int opengl_graph_slice4d_f32(const float* in, float* out, const int* in_shape, int in_rank,
@@ -186,8 +211,8 @@ int opengl_graph_quantize_linear_i8(const float* in, signed char* out, long n,
                                     float output_scale, int output_zp);
 int opengl_graph_dequantize_linear_f32(const float* in, const float* scale, const float* zero_point,
                                        float* out, long n, int has_zero_point);
-/* Canonical physical-byte W8A8 dense dispatch.  Dtype codes are 2=I8 and
- * 3=U8, matching the portable quantized shader ABI. */
+/* Canonical physical-byte W8A8 dense dispatch. Dtypes use canonical
+ * VX_DTYPE_I8/VX_DTYPE_U8 values. */
 int opengl_graph_qlinear_i8u8(const void* input, const void* weight,
                               const float* weight_scales, const int32_t* weight_zero_points,
                               const int32_t* bias, void* output,
@@ -236,6 +261,13 @@ int opengl_graph_copy_i8u8(const void* input, uint32_t input_elements,
                            float input_scale, int32_t input_zero_point,
                            float output_scale, int32_t output_zero_point,
                            uint32_t input_dtype, uint32_t output_dtype);
+int opengl_graph_transpose_i8u8(const void* input, void* output,
+                                const uint32_t* input_shape,
+                                const uint32_t* permutation, uint32_t rank,
+                                uint32_t elements, float input_scale,
+                                int32_t input_zero_point, float output_scale,
+                                int32_t output_zero_point, uint32_t input_dtype,
+                                uint32_t output_dtype);
 int opengl_graph_concat_i8u8(const void* const* inputs, const uint32_t* input_elements,
                              const uint32_t* input_axes, const float* input_scales,
                              const int32_t* input_zero_points, const uint32_t* input_dtypes,
@@ -271,8 +303,15 @@ int opengl_graph_qadd_i8u8(const void* a, uint32_t a_elements,
                            float output_scale, int32_t output_zero_point,
                            uint32_t a_dtype, uint32_t b_dtype,
                            uint32_t output_dtype, uint32_t relu);
+int opengl_graph_qbatch_matmul_i8u8(
+    const void* a, const int* a_shape, int a_rank,
+    float a_scale, int32_t a_zero_point, uint32_t a_dtype,
+    const void* b, const int* b_shape, int b_rank,
+    float b_scale, int32_t b_zero_point, uint32_t b_dtype,
+    void* output, const int* output_shape, int output_rank,
+    float output_scale, int32_t output_zero_point, uint32_t output_dtype);
 /* Canonical byte-domain SiLU with immutable per-tensor input/output
- * descriptors. Dtype codes are 2=I8 and 3=U8. */
+ * descriptors. Dtypes use canonical VxDataType values. */
 int opengl_graph_qsilu_i8u8(const void* input, void* output, uint32_t elements,
                             float input_scale, int32_t input_zero_point,
                             float output_scale, int32_t output_zero_point,
@@ -323,7 +362,7 @@ int opengl_graph_qmaskedmean_i8u8(const void* input, const int32_t* mask,
                                    float output_scale, int32_t output_zero_point,
                                    uint32_t input_dtype, uint32_t output_dtype);
 /* Canonical metadata-only W8A8 domain change with equal logical element
- * counts.  Dtype codes are 2=I8 and 3=U8. */
+ * counts. Dtypes use canonical VxDataType values. */
 int opengl_graph_requantize_linear_i8u8(const void* input, uint32_t input_elements,
                                         void* output, uint32_t output_elements,
                                         float input_scale, int32_t input_zero_point,

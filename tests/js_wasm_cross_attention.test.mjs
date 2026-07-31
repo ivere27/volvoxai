@@ -45,7 +45,7 @@ function crossAttentionGraph({ batch, useAffine }) {
   const { out } = graph.addOp('CrossAttention', inputs, {
     out: { name: 'out', shape: outputShape },
   }, { heads: 2 });
-  graph.outputNames = [out.name];
+  graph.setOutputs([out.name]);
   return graph;
 }
 

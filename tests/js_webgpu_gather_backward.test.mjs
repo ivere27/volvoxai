@@ -78,7 +78,7 @@ test('WebGPU Gather backward dispatches canonical I32 arbitrary-axis scatter-add
   assert.deepEqual([...new Uint32Array(entry(dispatch, 3).bytes.buffer).slice(0, 4)], [2, 3, 4, 4]);
 });
 
-test('WebGPU Gather backward supports data rank eight and excludes legacy float indices', async () => {
+test('WebGPU Gather backward supports data rank eight and rejects float indices', async () => {
   const data = tensor('rank_eight', [2, 1, 1, 1, 1, 1, 1, 3]);
   const indices = tensor('rank_eight_indices', [2], 'int32');
   const output = tensor('rank_eight_out', [2, 1, 1, 1, 1, 1, 1, 2]);
@@ -91,16 +91,16 @@ test('WebGPU Gather backward supports data rank eight and excludes legacy float 
   const [dispatch] = await trainer._buildBackwardDispatches();
   assert.deepEqual([...new Uint32Array(entry(dispatch, 3).bytes.buffer).slice(0, 4)], [2, 3, 1, 2]);
 
-  const legacyIndices = tensor('legacy_indices', [2], 'float32');
-  const legacyOutput = tensor('legacy_out', [2, 3]);
-  const legacyNode = {
-    id: 'gather_legacy', opType: 'Gather',
-    inputs: { input: tensor('legacy_data', [4, 3]), indices: legacyIndices },
-    outputs: { out: legacyOutput }, params: { axis: 0 },
+  const floatIndices = tensor('float_indices', [2], 'float32');
+  const rejectedOutput = tensor('rejected_out', [2, 3]);
+  const rejectedNode = {
+    id: 'gather_float_indices', opType: 'Gather',
+    inputs: { input: tensor('rejected_data', [4, 3]), indices: floatIndices },
+    outputs: { out: rejectedOutput }, params: { axis: 0 },
   };
-  const legacyTrainer = makeTrainer(legacyNode, [legacyNode.inputs.input, legacyIndices, legacyOutput]);
-  legacyTrainer.gradientBuffers.set(legacyOutput.name, { tensor: 'grad_out' });
-  await assert.rejects(() => legacyTrainer._buildBackwardDispatches(), /I32 indices/);
+  const rejectedTrainer = makeTrainer(rejectedNode, [rejectedNode.inputs.input, floatIndices, rejectedOutput]);
+  rejectedTrainer.gradientBuffers.set(rejectedOutput.name, { tensor: 'grad_out' });
+  await assert.rejects(() => rejectedTrainer._buildBackwardDispatches(), /I32 indices/);
 });
 
 test('WebGPU GatherElements backward encodes negative-index-compatible metadata', async () => {
@@ -134,13 +134,13 @@ test('WebGPU GatherElements backward encodes negative-index-compatible metadata'
   assert.deepEqual([...params.slice(4, 7)], [2, 3, 4]);
   assert.deepEqual([...params.slice(12, 15)], [2, 2, 4]);
 
-  const legacyIndices = tensor('legacy_indices', [2, 2, 4]);
-  const legacyOutput = tensor('legacy_out', [2, 2, 4]);
-  const legacyNode = {
-    id: 'gather_elements_legacy', opType: 'GatherElements',
-    inputs: { input: data, indices: legacyIndices }, outputs: { out: legacyOutput }, params: { axis: 1 },
+  const floatIndices = tensor('float_indices', [2, 2, 4]);
+  const rejectedOutput = tensor('rejected_out', [2, 2, 4]);
+  const rejectedNode = {
+    id: 'gather_elements_float_indices', opType: 'GatherElements',
+    inputs: { input: data, indices: floatIndices }, outputs: { out: rejectedOutput }, params: { axis: 1 },
   };
-  const legacyTrainer = makeTrainer(legacyNode, [data, legacyIndices, legacyOutput]);
-  legacyTrainer.gradientBuffers.set(legacyOutput.name, { tensor: 'grad_out' });
-  await assert.rejects(() => legacyTrainer._buildBackwardDispatches(), /I32 indices/);
+  const rejectedTrainer = makeTrainer(rejectedNode, [data, floatIndices, rejectedOutput]);
+  rejectedTrainer.gradientBuffers.set(rejectedOutput.name, { tensor: 'grad_out' });
+  await assert.rejects(() => rejectedTrainer._buildBackwardDispatches(), /I32 indices/);
 });

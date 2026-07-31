@@ -1,60 +1,84 @@
-# Native training boundary
+# Native full-profile training
 
-`training_forward_dropout.inc` owns the private training-mode state and the CPU
-Dropout/attention-dropout forward helpers. `training_runtime.inc` is a thin
-umbrella that composes the native training runtime from three cohesive
-fragments, in dependency order:
+This directory is compiled only into the full native profile. The inference
+profile does not compile these sources, include `volvoxai_full.h`, expose a
+`train` command, or export any Trainer, optimizer, backward, or PTQ symbol.
 
-- `training_backward_cpu.inc` — CPU reference backward kernels (`grad_*`
-  helpers and the per-operator `backward_*` passes the accelerated kernels are
-  validated against).
-- `training_gpu_plan.inc` — GPU backward-plan construction, dispatch, and
-  execution/synchronization, falling back to the CPU kernels when unsupported.
-- `training_step.inc` — the backward driver that walks the graph, training
-  graph preparation/restoration, gradient accumulation, and the train-step
-  public API implementations.
+## Trainer ownership
 
-`optimizer_runtime.inc` owns optimizer storage, tensor-update implementations,
-and optimizer checkpoint APIs.
+The full-profile public lifecycle is:
 
-`quantization.c` owns stateless full-profile PTQ range/parameter and packing
-math. The same allocation-free translation unit is linked into
-`volvoxai.full.wasm`, which exposes its generic observer, affine quantization,
-weight-packing, and bias-packing primitives through a typed scratch-backed
-JavaScript API. Transpose-aware conversion helpers additionally support the
-quantized-LoRA convenience workflow; `volvoxai.wasm` remains free of all PTQ
-exports. `quantization_runtime.c` is the narrow internal bridge that
-observes a named loaded F32 tensor and materializes new I8/F32 weight entries
-while holding the model and metadata locks. `quantization_package.c` owns the
-opaque explicit PTQ plan, generation checks, transactional named-sample
-observation, validation against the loaded private graph, and
-config+safetensors package emission.
-These files compile as ordinary full-profile translation units and reach only
-the small private runtime surface declared in `engine_internal.h`; the
-inference target compiles none of them.
+~~~text
+VxModel
+  VxTrainer
+    exact retained base weight revision
+    private VxEngineState
+    private graph inputs and activations
+    private gradients and accumulation window
+    private SGD/AdamW slots and step
+    private deterministic RNG stream
+    private working weights
+~~~
 
-The three backward/train fragments listed first are included only from
-`training_runtime.inc`, never on their own.
+`vx_model_create_trainer()` loads the exact base revision into a new engine
+capsule. CPU is the default. A requested Vulkan, OpenGL, Metal, or CUDA backend
+is an exact requirement: device initialization and the differentiable graph
+plan must succeed, and training never retries another backend after work
+starts. NNAPI and external inference providers are not differentiable through
+this API.
 
-They are intentionally C includes rather than separately compiled translation
-units. These implementations operate on private `static` runtime helpers and
-state; compiling them separately would either expose that state as a broad
-internal API or duplicate it. `engine_runtime.c` reaches the forward/backward
-fragments once, and `engine.c` reaches the optimizer fragment once, all behind
-`VOLVOXAI_ENABLE_TRAINING`. The full build preserves the existing encapsulation
-while the inference build does not compile the training implementation or
-export its public symbols.
+Inputs are copied through `vx_trainer_set_input()`. A
+`VxTrainStepOptions` value names one or more cross-entropy losses, the F32 model
+weights to train, SGD or AdamW parameters, and accumulation/reset/flush policy.
+`VxTrainStepResult` returns stable numeric metrics, accumulation state, whether
+an optimizer update was applied, the private optimizer step, and the exact
+backend route.
 
-Small forward helpers used by both profiles remain in `engine_runtime.c`, such
-as shape/broadcast validation and GroupNorm forward execution. The inference-
-side lifecycle hooks for accumulation and optimizer cleanup are private
-compile-time no-ops.
+One applied step is:
 
-Backend-local backward schedulers remain in each backend source because they
-own that device's descriptor pools, buffers, pipelines, and synchronization.
-Their tables, APIs, and training-only forward shaders use the same profile
-guard, so inference objects contain neither scheduler code nor training shader
-paths.
+~~~text
+strict preflight → forward → loss → backward → finite check
+                 → global gradient clip → private optimizer update
+~~~
 
-`VOLVOXAI_ENABLE_TRAINING` defaults to `0`. Full builds must opt in explicitly
-with `VOLVOXAI_ENABLE_TRAINING=1`.
+An unfinished accumulation window changes no weight. A failed step publishes
+nothing and restores or discards private work back to the Trainer's committed
+baseline. The Model is never mutated by input binding, forward/backward,
+accumulation, export, or rollback.
+
+`vx_trainer_commit()` is the only weight-publication operation. It rejects an
+unfinished accumulation window and a Trainer with no applied update. It
+serializes and validates a private successor, then compare-and-publishes it
+against the exact retained base revision. Concurrent Trainers therefore have
+independent workspaces, and at most one can publish from the same base;
+another receives `VX_STATUS_REVISION_CONFLICT`.
+
+Successful commit also records the Trainer's optimizer baseline. A later
+rollback restores the last committed weights, optimizer slots, step, RNG
+position, and empty accumulation state. Existing CompiledModels remain pinned
+to their prior immutable revision.
+
+## Fixed command
+
+`native/volvoxai-full train` is a model-agnostic client of only
+`volvoxai.h` and `volvoxai_full.h`. It binds raw typed inputs and targets,
+runs private microbatches, commits once, and exports the requested safetensors
+shards. Task preprocessing, tokenization, sampling, and postprocessing remain
+outside the fixed binary.
+
+## Internal composition
+
+The full implementation contains CPU reference backward kernels, strict GPU
+backward-plan construction, deterministic training Dropout, cross-entropy loss
+seeding, accumulation, SGD/AdamW, global clipping, optimizer checkpointing,
+and PTQ package authoring. All mutable graph/training state resolves through
+the current Trainer-owned `VxEngineState` scope. Only synchronized physical
+device state and model-independent module/pipeline caches may be shared.
+
+PTQ is also full-profile-only. It observes declared F32 values, derives
+explicit quantization parameters, packs weights and biases, and writes a new
+`graph.json` plus safetensors package carrying `volvox-graph/v1`. Inference can
+execute an authored quantized graph but contains no authoring implementation.
+
+Generated training shaders, shader packs, embedded arrays, and PTX arrays are
+build products and are never edited by hand.

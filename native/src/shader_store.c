@@ -40,9 +40,7 @@ static size_t g_block_cache_count;
 static ShaderOverrideCache* g_override_cache;
 static size_t g_override_cache_bytes;
 static char* g_configured_override_root;
-static int g_env_override_used_logged;
-static int g_env_override_fallback_logged;
-static int g_configured_override_fallback_logged;
+static int g_external_override_used_logged;
 static int g_crc32_initialized;
 
 static size_t bounded_strlen(const char* value, size_t maximum) {
@@ -315,31 +313,25 @@ VolvoxAIShaderStoreResult volvoxai_shader_store_get(
     const char* env_override_root = getenv("VOLVOXAI_SHADER_DIR");
     if (env_override_root && env_override_root[0] != '\0') {
         if (try_override_locked(env_override_root, path, out_view)) {
-            if (!g_env_override_used_logged) {
+            if (!g_external_override_used_logged) {
                 fprintf(stderr,
                         "[VolvoxAI] Using shader override: VOLVOXAI_SHADER_DIR=%s\n",
                         env_override_root);
-                g_env_override_used_logged = 1;
+                g_external_override_used_logged = 1;
             }
             pthread_mutex_unlock(&g_shader_store_mutex);
             return VOLVOXAI_SHADER_STORE_OK;
         }
-        if (!g_env_override_fallback_logged) {
-            fprintf(stderr,
-                    "[VolvoxAI] Shader override '%s' is unavailable; using embedded shaders\n",
-                    env_override_root);
-            g_env_override_fallback_logged = 1;
-        }
     } else if (g_configured_override_root) {
         if (try_override_locked(g_configured_override_root, path, out_view)) {
+            if (!g_external_override_used_logged) {
+                fprintf(stderr,
+                        "[VolvoxAI] Using configured shader override: %s\n",
+                        g_configured_override_root);
+                g_external_override_used_logged = 1;
+            }
             pthread_mutex_unlock(&g_shader_store_mutex);
             return VOLVOXAI_SHADER_STORE_OK;
-        }
-        if (!g_configured_override_fallback_logged) {
-            fprintf(stderr,
-                    "[VolvoxAI] Configured shader root '%s' is unavailable; using embedded shaders\n",
-                    g_configured_override_root);
-            g_configured_override_fallback_logged = 1;
         }
     }
 
@@ -365,8 +357,5 @@ void volvoxai_shader_store_shutdown(void) {
     g_override_cache_bytes = 0;
     free(g_configured_override_root);
     g_configured_override_root = NULL;
-    g_env_override_used_logged = 0;
-    g_env_override_fallback_logged = 0;
-    g_configured_override_fallback_logged = 0;
     pthread_mutex_unlock(&g_shader_store_mutex);
 }

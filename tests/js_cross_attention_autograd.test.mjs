@@ -1,8 +1,9 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
-import { CPUEngine, Graph } from '../ts/index.js';
-import { CPUAutograd } from '../ts/training/index.js';
+import { Graph } from '../ts/index.js';
+import { CPUEngine } from '../ts/backends/CPUEngine.js';
+import { CPUAutograd } from '../ts/training/CPUAutograd.js';
 
 function crossAttentionGraph() {
   const graph = new Graph();
@@ -28,7 +29,7 @@ function crossAttentionGraph() {
   const { out } = graph.addOp('CrossAttention', { q, kv, weight, scale, bias }, { out: [1, 2, 2] }, {
     heads: 1,
   });
-  graph.outputNames = [out.name];
+  graph.setOutputs([out.name]);
   return graph;
 }
 

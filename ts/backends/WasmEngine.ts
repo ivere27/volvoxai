@@ -1,17 +1,23 @@
 import { Tensor } from '../core/Tensor.js';
+import { DataType } from '../generated/volvoxaiEnums.js';
+import { kernelRoute } from '../generated/kernelRegistry.js';
 import { normalizeSpatialPair } from '../ops/spatialParameters.js';
-import { Graph } from '../core/Graph.js';
-import { BackendEngine } from './BackendEngine.js';
+import type { Graph } from '../core/Graph.js';
+import { assertInferenceExecutionOptions, BackendEngine } from './BackendEngine.js';
 import { geluApproximation } from '../ops/gELU.js';
 import { ropeDescriptor } from '../ops/roPE.js';
 import { ssmScanDescriptor } from '../ops/ssmScan.js';
+import { batchMatMulDescriptor } from '../ops/batchMatMul.js';
+import { qBatchMatMulDescriptor } from '../ops/qBatchMatMul.js';
+import { comparisonDescriptor, logicalNotDescriptor } from '../ops/comparison.js';
 import { incrementalExecutionEnabled, incrementalNodeSelection } from './incrementalExecution.js';
 import {
   incrementalRowPosition,
   prepareQuantizedRows,
+  quantizedRowNode,
 } from './quantizedRowExecution.js';
 import type { BackendExecutionOptions } from './BackendEngine.js';
-import type { AdapterVersion, GraphNode, RuntimeTypedArray } from '../types.js';
+import type { GraphNode, RuntimeTypedArray } from '../types.js';
 
 declare const __VOLVOXAI_BROWSER_ONLY__: boolean | undefined;
 
@@ -25,9 +31,13 @@ interface WasmKernelExports extends WebAssembly.Exports {
   averagepool2d_f32: WasmNumericExport;
   batch_norm2d_f32: WasmNumericExport;
   binary_broadcast_f32: WasmNumericExport;
+  compare_broadcast_i32: WasmNumericExport;
+  not_i32: WasmNumericExport;
   cast_typed: WasmNumericExport;
   clip_f32: WasmNumericExport;
+  clip_i32: WasmNumericExport;
   concat_slice_f32: WasmNumericExport;
+  concat_slice_u32: WasmNumericExport;
   concat_slice_i8u8: WasmNumericExport;
   conv1d_f32: WasmNumericExport;
   conv2d_f32: WasmNumericExport;
@@ -40,6 +50,8 @@ interface WasmKernelExports extends WebAssembly.Exports {
   dequantize_linear_typed: WasmNumericExport;
   embedding_f32: WasmNumericExport;
   expand_nd_f32: WasmNumericExport;
+  expand_nd_i8u8: WasmNumericExport;
+  expand_nd_u32: WasmNumericExport;
   gather_elements_i32_f32: WasmNumericExport;
   gather_i32_f32: WasmNumericExport;
   gelu_f32: WasmNumericExport;
@@ -80,6 +92,8 @@ interface WasmKernelExports extends WebAssembly.Exports {
   qgroupnorm_i8u8: WasmNumericExport;
   qlayernorm_i8u8: WasmNumericExport;
   qlinear_i8u8: WasmNumericExport;
+  qbatch_matmul_i8u8: WasmNumericExport;
+  qbatch_matmul_i8u8_simd128: WasmNumericExport;
   qlinear_i8u8_packed: WasmNumericExport;
   qmaskedmean_i8u8: WasmNumericExport;
   qsdpa_i8u8: WasmNumericExport;
@@ -100,14 +114,19 @@ interface WasmKernelExports extends WebAssembly.Exports {
   silu_f32: WasmNumericExport;
   sin_f32: WasmNumericExport;
   slice_nd_f32: WasmNumericExport;
+  slice_nd_u32: WasmNumericExport;
   softmax_f32: WasmNumericExport;
   spatial_softargmax_y_f32: WasmNumericExport;
   split_slice_f32: WasmNumericExport;
+  split_slice_u32: WasmNumericExport;
   ssm_scan_f32: WasmNumericExport;
   tanh_f32: WasmNumericExport;
   transpose_nd_f32: WasmNumericExport;
+  transpose_nd_i8u8: WasmNumericExport;
+  transpose_nd_u32: WasmNumericExport;
   upsample_nearest2x_f32: WasmNumericExport;
   where_typed_f32: WasmNumericExport;
+  where_typed_32: WasmNumericExport;
 }
 
 interface RelaxedSimdExports extends WebAssembly.Exports {
@@ -130,6 +149,32 @@ interface RelaxedSimdInstantiation {
 type WasmNode = GraphNode<Tensor> & { params: Record<string, any> };
 type WasmGraph = Graph & { nodes: WasmNode[] };
 
+const WASM_PREPARED_GRAPH = Symbol('WasmPreparedGraph');
+
+interface WasmPreparedStep {
+  readonly nodeIndex: number;
+  readonly nodeId: string | number;
+  readonly opType: string;
+  readonly kernelRoute: string;
+}
+
+interface WasmPreparedInputPreflights {
+  readonly qGroupNorm: readonly number[];
+  readonly qLayerNorm: readonly number[];
+  readonly qSDPA: readonly number[];
+  readonly qMaskedMean: readonly number[];
+}
+
+interface WasmPreparedGraph extends Readonly<object> {
+  readonly [WASM_PREPARED_GRAPH]: true;
+  readonly topologyRevision: number;
+  readonly weightRevision: number;
+  readonly tensorCount: number;
+  readonly outputNames: readonly string[];
+  readonly schedule: readonly WasmPreparedStep[];
+  readonly inputPreflights: WasmPreparedInputPreflights;
+}
+
 interface PackedF32WeightDescriptor {
   readonly pointer: number;
   readonly dIn: number;
@@ -141,18 +186,14 @@ interface PackedF32WeightDescriptor {
 type WasmNodeMetadata = { kind: string } & Record<string, any>;
 
 interface WasmAdapterSelector {
-  name?: string;
-  adapterId?: string;
-  adapter_id?: string;
-  version?: AdapterVersion;
-  versionId?: AdapterVersion;
-  version_id?: AdapterVersion;
+  name: string;
+  version?: number;
   scale?: number;
 }
 
 interface WasmExecutionOptions extends BackendExecutionOptions {
-  adapter?: string | WasmAdapterSelector | null;
-  adapters?: Array<string | WasmAdapterSelector | null>;
+  adapter?: WasmAdapterSelector | null;
+  adapters?: Array<WasmAdapterSelector | null>;
 }
 
 const WASM_RELAXED_SIMD_SECTION = 'volvoxai.relaxed_simd.v1';
@@ -211,19 +252,19 @@ function wasmTensorPointer(tensor, memory, label) {
 }
 
 function wasmDtypeCode(dtype) {
-  if (dtype === 'float32') return 0;
-  if (dtype === 'int32') return 1;
-  if (dtype === 'int8') return 2;
-  if (dtype === 'uint8') return 3;
+  if (dtype === 'float32') return DataType.F32;
+  if (dtype === 'int32') return DataType.I32;
+  if (dtype === 'int8') return DataType.I8;
+  if (dtype === 'uint8') return DataType.U8;
   throw new Error(`Unsupported WASM kernel dtype '${dtype}'.`);
 }
 
 function wasmKernelDtype(tensor, label) {
   switch (tensor?.dtype) {
-    case 'float32': return 0;
-    case 'int32': return 1;
-    case 'int8': return 2;
-    case 'uint8': return 3;
+    case 'float32': return DataType.F32;
+    case 'int32': return DataType.I32;
+    case 'int8': return DataType.I8;
+    case 'uint8': return DataType.U8;
     default: throw new Error(`WASM ${label} has unsupported dtype '${tensor?.dtype}'.`);
   }
 }
@@ -248,9 +289,14 @@ function attentionMaskMode(mask, batch, seqQ, seqKV, nodeId) {
   throw new Error(`WASM attention mask at node ${nodeId} has an incompatible shape.`);
 }
 
-function localMaskBinding(pointers, mask, mode, batchIndex, seqQ, seqKV) {
+function localMaskBinding(
+  pointers, mask, mode, batchIndex, seqQ, seqKV, baseOverride: number | null = null,
+) {
   if (!mask || mode === 0) return [0, 0];
-  const base = pointers.get(mask.name);
+  const base = baseOverride ?? pointers.get(mask.name);
+  if (!Number.isSafeInteger(base) || base < 0) {
+    throw new Error(`WASM attention mask '${String(mask.name)}' has no valid heap pointer.`);
+  }
   if (mode === 1) return [base, 1];
   if (mode === 2) return [base + batchIndex * seqKV * 4, 1];
   if (mode === 3) return [base, 2];
@@ -289,6 +335,11 @@ function portableTensorElements(tensor) {
   return tensor.sizeBytes === elements * bytes ? elements : null;
 }
 
+function portable32BitTensor(tensor) {
+  return !!tensor && (tensor.dtype === 'float32' || tensor.dtype === 'int32') &&
+    portableTensorElements(tensor) != null;
+}
+
 function portablePositiveSliceDescriptor(node, input, output) {
   const rank = input?.shape?.length;
   const inputElements = portableTensorElements(input);
@@ -298,12 +349,13 @@ function portablePositiveSliceDescriptor(node, input, output) {
     (Array.isArray(startsInput) ? startsInput.map(() => 1) : null);
   const axesInput = node.params?.axes ??
     (Array.isArray(startsInput) ? startsInput.map((_, index) => index) : null);
-  if (!input || !output || input.dtype !== 'float32' || output.dtype !== 'float32' ||
+  if (!input || !output || !portable32BitTensor(input) ||
+      output.dtype !== input.dtype || !portable32BitTensor(output) ||
       inputElements == null || outputElements == null || !Number.isInteger(rank) ||
       rank < 1 || rank > WASM_PORTABLE_MAX_RANK || output.shape.length !== rank ||
       !Array.isArray(startsInput) || !Array.isArray(stepsInput) || !Array.isArray(axesInput) ||
       startsInput.length !== stepsInput.length || startsInput.length !== axesInput.length) {
-    throw new Error(`WASM Slice node ${node.id} requires rank-1..8 F32 input/output tensors and matching parameter arrays.`);
+    throw new Error(`WASM Slice node ${node.id} requires rank-1..8 same-dtype F32/I32 input/output tensors and matching parameter arrays.`);
   }
   const starts = new Array(rank).fill(0);
   const steps = new Array(rank).fill(1);
@@ -332,7 +384,7 @@ function portablePositiveSliceDescriptor(node, input, output) {
       throw new Error(`WASM Slice node ${node.id} output shape exceeds its input selection.`);
     }
   }
-  return { rank, elements: outputElements, starts, steps };
+  return { rank, elements: outputElements, starts, steps, dtype: input.dtype };
 }
 
 function portableGatherDescriptor(node) {
@@ -399,13 +451,18 @@ function portableWhereDescriptor(node) {
   const output = node.outputs.out || Object.values(node.outputs || {})[0];
   const elements = portableTensorElements(output);
   if (!condition || !a || !b || !output || !['float32', 'int32'].includes(condition.dtype) ||
-      a.dtype !== 'float32' || b.dtype !== 'float32' || output.dtype !== 'float32' ||
+      !portable32BitTensor(a) || b.dtype !== a.dtype || output.dtype !== a.dtype ||
+      !portable32BitTensor(b) || !portable32BitTensor(output) ||
       portableTensorElements(condition) !== elements || portableTensorElements(a) !== elements ||
       portableTensorElements(b) !== elements || elements == null || !sameShape(condition.shape, output.shape) ||
       !sameShape(a.shape, output.shape) || !sameShape(b.shape, output.shape)) {
-    throw new Error(`WASM ${node.opType} node ${node.id} requires exact-shape F32 operands/output and an F32 or I32 condition.`);
+    throw new Error(`WASM ${node.opType} node ${node.id} requires exact-shape same-dtype F32/I32 operands/output and an F32 or I32 condition.`);
   }
-  return { condition, a, b, output, elements, conditionType: condition.dtype === 'int32' ? 1 : 0 };
+  return {
+    condition, a, b, output, elements,
+    conditionType: wasmDtypeCode(condition.dtype),
+    dataType: wasmDtypeCode(a.dtype),
+  };
 }
 
 function portableOutput(node) {
@@ -414,6 +471,14 @@ function portableOutput(node) {
 
 function portableF32Tensor(tensor) {
   return !!tensor && tensor.dtype === 'float32' && portableTensorElements(tensor) != null;
+}
+
+function portableDenseBias(tensor, dOut) {
+  if (!tensor) return true;
+  return portableF32Tensor(tensor) && tensor.shape.length >= 1 &&
+    tensor.shape.at(-1) === dOut &&
+    tensor.shape.slice(0, -1).every((dimension) => dimension === 1) &&
+    portableTensorElements(tensor) === dOut;
 }
 
 function portableUnaryF32Descriptor(node) {
@@ -503,6 +568,14 @@ function portableQLinearDescriptor(node) {
       outputScale <= 0 || !weightScales.every((scale) => Number.isFinite(scale) && scale > 0)) {
     throw new Error(`WASM ${node.opType} node ${node.id} requires scales representable as positive F32.`);
   }
+  if (!weightScales.every((scale) => {
+    const multiplier = Math.fround(Math.fround(inputScale * scale) / outputScale);
+    return Number.isFinite(multiplier) && multiplier > 0;
+  })) {
+    throw new Error(
+      `WASM ${node.opType} node ${node.id} requantization multiplier is not representable as positive F32.`,
+    );
+  }
   return {
     kind: 'qlinear', input, weight, bias, output, rows, dIn, dOut,
     inputDtype: wasmDtypeCode(input.dtype), weightDtype: wasmDtypeCode(weight.dtype),
@@ -522,10 +595,10 @@ function portableQEmbeddingDescriptor(node) {
   const outputElements = portableTensorElements(output);
   const outputCount = Object.values(node.outputs || {}).filter(Boolean).length;
   if (Object.keys(node.inputs || {}).length !== 2 || !input || !weight || outputCount !== 1 ||
-      input.isInput !== true || input.dtype !== 'int32' || inputElements == null || input.shape.length < 1 ||
+      input.dtype !== 'int32' || inputElements == null || input.shape.length < 1 ||
       !portableByteQuantizedTensor(weight) || !portableByteQuantizedTensor(output) ||
       weightElements == null || outputElements == null || weight.shape.length !== 2) {
-    throw new Error(`WASM QEmbedding node ${node.id} requires a graph-input I32 [...token] ID tensor, rank-2 I8/U8 [vocab,hidden] weights, and an I8/U8 output.`);
+    throw new Error(`WASM QEmbedding node ${node.id} requires preflight-complete I32 [...token] IDs, rank-2 I8/U8 [vocab,hidden] weights, and an I8/U8 output.`);
   }
   const [vocab, hidden] = weight.shape;
   const expectedOutputShape = [...input.shape, hidden];
@@ -1410,10 +1483,12 @@ function portableQuantizedNearestParameters(node) {
   } else if (params.mode != null && params.mode !== 'nearest') {
     throw new Error(`WASM ResizeNearest2D node ${node.id} only supports mode "nearest" for I8/U8 resize.`);
   }
-  for (const key of ['coordinate_transformation_mode', 'coordinate_transform_mode']) {
-    if (params[key] != null && params[key] !== 'asymmetric') {
-      throw new Error(`WASM ${node.opType} node ${node.id} only supports ${key} "asymmetric" for I8/U8 resize.`);
-    }
+  if (params.coordinate_transform_mode != null) {
+    throw new Error(`WASM ${node.opType} node ${node.id} does not define coordinate_transform_mode; use coordinate_transformation_mode.`);
+  }
+  if (params.coordinate_transformation_mode != null &&
+      params.coordinate_transformation_mode !== 'asymmetric') {
+    throw new Error(`WASM ${node.opType} node ${node.id} only supports coordinate_transformation_mode "asymmetric" for I8/U8 resize.`);
   }
   if (params.nearest_mode != null && params.nearest_mode !== 'floor') {
     throw new Error(`WASM ${node.opType} node ${node.id} only supports nearest_mode "floor" for I8/U8 resize.`);
@@ -1562,10 +1637,15 @@ function portableExpandDescriptor(node) {
   const inputRank = input?.shape?.length;
   const outputRank = output?.shape?.length;
   const elements = portableTensorElements(output);
-  if (!portableF32Tensor(input) || !portableF32Tensor(output) || !Number.isInteger(inputRank) ||
+  const byteDescriptor = portableQuantizedCommonDescriptor(node, [input, output]);
+  const byteStorage = byteDescriptor?.quantization?.scheme === 'per_tensor';
+  const plainStorage = portable32BitTensor(input) && output?.dtype === input?.dtype &&
+    portable32BitTensor(output);
+  if ((!plainStorage && !byteStorage) || !Number.isInteger(inputRank) ||
       !Number.isInteger(outputRank) || inputRank < 1 || outputRank < inputRank ||
-      outputRank > WASM_PORTABLE_MAX_RANK) {
-    throw new Error(`WASM ${node.opType} node ${node.id} requires rank-1..8 F32 input/output tensors.`);
+      outputRank > WASM_PORTABLE_MAX_RANK || elements == null || input === output ||
+      Object.keys(node.params || {}).length !== 0) {
+    throw new Error(`WASM ${node.opType} node ${node.id} requires distinct rank-1..8 same-dtype F32/I32 or descriptor-preserving per-tensor I8/U8 tensors.`);
   }
   const offset = outputRank - inputRank;
   for (let dimension = 0; dimension < outputRank; dimension++) {
@@ -1574,7 +1654,10 @@ function portableExpandDescriptor(node) {
       throw new Error(`WASM ${node.opType} node ${node.id} has incompatible broadcast shapes.`);
     }
   }
-  return { input, output, inputRank, outputRank, elements };
+  return {
+    input, output, inputRank, outputRank, elements, dtype: input.dtype,
+    byteStorage,
+  };
 }
 
 function portableTransposeDescriptor(node) {
@@ -1583,13 +1666,18 @@ function portableTransposeDescriptor(node) {
   const rank = input?.shape?.length;
   const elements = portableTensorElements(input);
   const outputElements = portableTensorElements(output);
+  const byteDescriptor = portableQuantizedCommonDescriptor(node, [input, output]);
   const permInput = node.params?.perm || (Array.isArray(input?.shape)
     ? Array.from({ length: input.shape.length }, (_, index) => input.shape.length - 1 - index)
     : null);
-  if (!portableF32Tensor(input) || !portableF32Tensor(output) || !Number.isInteger(rank) ||
+  const validStorage = byteDescriptor
+    ? byteDescriptor.quantization.scheme === 'per_tensor'
+    : portable32BitTensor(input) && output?.dtype === input?.dtype &&
+      portable32BitTensor(output);
+  if (!validStorage || !Number.isInteger(rank) ||
       rank < 1 || rank > WASM_PORTABLE_MAX_RANK || !Array.isArray(permInput) ||
       permInput.length !== rank || elements == null || outputElements !== elements) {
-    throw new Error(`WASM Transpose node ${node.id} requires equal-size rank-1..8 F32 tensors.`);
+    throw new Error(`WASM Transpose node ${node.id} requires equal-size rank-1..8 same-dtype F32/I32/I8/U8 tensors.`);
   }
   const seen = new Set();
   const perm = permInput.map((axis) => {
@@ -1602,7 +1690,10 @@ function portableTransposeDescriptor(node) {
   if (!sameShape(output.shape, perm.map((axis) => input.shape[axis]))) {
     throw new Error(`WASM Transpose node ${node.id} output shape does not match its permutation.`);
   }
-  return { input, output, rank, elements, perm };
+  return {
+    input, output, rank, elements, perm, dtype: input.dtype,
+    byteDtype: byteDescriptor?.dtype ?? null,
+  };
 }
 
 function portableConcatEntries(node): Array<[string, Tensor]> {
@@ -1632,10 +1723,12 @@ function portableConcatDescriptor(node) {
   let axis = node.params?.axis ?? 0;
   const entries = portableConcatEntries(node);
   if (axis < 0) axis += rank;
-  if (!portableF32Tensor(output) || !Number.isInteger(rank) || rank < 1 ||
+  if (!portable32BitTensor(output) || !Number.isInteger(rank) || rank < 1 ||
       rank > WASM_PORTABLE_MAX_RANK || !Number.isInteger(axis) || axis < 0 || axis >= rank ||
-      entries.length === 0 || entries.some(([, tensor]) => !portableF32Tensor(tensor))) {
-    throw new Error(`WASM Concat node ${node.id} requires rank-1..8 F32 tensors and a valid axis.`);
+      entries.length === 0 || entries.some(([, tensor]) =>
+        !portable32BitTensor(tensor) || tensor.dtype !== output.dtype) ||
+      (output.dtype === 'int32' && node.params?.sigmoid)) {
+    throw new Error(`WASM Concat node ${node.id} requires rank-1..8 same-dtype F32/I32 tensors and a valid axis.`);
   }
   const inner = portableElementCount(output.shape.slice(axis + 1));
   const outer = portableElementCount(output.shape.slice(0, axis));
@@ -1651,20 +1744,25 @@ function portableConcatDescriptor(node) {
   if (summedAxis !== outputAxis || inner == null || outer == null) {
     throw new Error(`WASM Concat node ${node.id} input axes do not match its output.`);
   }
-  return { output, entries, axis, inner, outer, outputAxis, sigmoid: !!node.params?.sigmoid };
+  return {
+    output, entries, axis, inner, outer, outputAxis,
+    sigmoid: !!node.params?.sigmoid, dtype: output.dtype,
+  };
 }
 
 function portableSplitDescriptor(node) {
   const input = node.inputs.input || node.inputs.x || node.inputs.data;
-  const outputEntries = (Object.entries(node.outputs || {}) as Array<[string, Tensor]>).sort(([left], [right]) =>
-    left < right ? -1 : left > right ? 1 : 0);
+  // Object insertion order is the persisted Split output order (out10 must not
+  // be moved ahead of out2).
+  const outputEntries = Object.entries(node.outputs || {}) as Array<[string, Tensor]>;
   const rank = input?.shape?.length;
   let axis = node.params?.axis ?? 0;
   if (axis < 0) axis += rank;
-  if (!portableF32Tensor(input) || !Number.isInteger(rank) || rank < 1 || rank > WASM_PORTABLE_MAX_RANK ||
+  if (!portable32BitTensor(input) || !Number.isInteger(rank) || rank < 1 || rank > WASM_PORTABLE_MAX_RANK ||
       !Number.isInteger(axis) || axis < 0 || axis >= rank || outputEntries.length === 0 ||
-      outputEntries.some(([, tensor]) => !portableF32Tensor(tensor))) {
-    throw new Error(`WASM Split node ${node.id} requires rank-1..8 F32 tensors and a valid axis.`);
+      outputEntries.some(([, tensor]) =>
+        !portable32BitTensor(tensor) || tensor.dtype !== input.dtype)) {
+    throw new Error(`WASM Split node ${node.id} requires rank-1..8 same-dtype F32/I32 tensors and a valid axis.`);
   }
   const inputAxis = input.shape[axis];
   if (inputAxis % outputEntries.length !== 0) {
@@ -1680,7 +1778,7 @@ function portableSplitDescriptor(node) {
       throw new Error(`WASM Split node ${node.id} output shape is incompatible with equal-sized slices.`);
     }
   }
-  return { input, outputEntries, inputAxis, outputAxis, outer, inner };
+  return { input, outputEntries, inputAxis, outputAxis, outer, inner, dtype: input.dtype };
 }
 
 function portableGroupNormDescriptor(node) {
@@ -1755,12 +1853,14 @@ function portableMoELinearDescriptor(node) {
 
 export class WasmEngine extends BackendEngine {
   declare graph: WasmGraph;
+  preparedGraph!: WasmPreparedGraph;
   compiledTopologyRevision = 0;
   readonly wasmModule: WasmInstantiation;
   readonly api: WasmKernelExports;
   readonly mem: WebAssembly.Memory;
   readonly relaxedApi: RelaxedSimdExports | null;
   relaxedSimdEnabled: boolean;
+  qbatchMatMulSimdEnabled: boolean;
   readonly pointers: Map<string, number>;
   readonly f32PackedWeights: Map<string, PackedF32WeightDescriptor>;
   readonly f32PackedNodes: Map<WasmNode, PackedF32WeightDescriptor>;
@@ -1784,6 +1884,8 @@ export class WasmEngine extends BackendEngine {
     this.relaxedApi = relaxedSimdModule?.instance?.exports || null;
     this.relaxedSimdEnabled =
       typeof this.relaxedApi?.[WASM_RELAXED_QLINEAR_EXPORT] === 'function';
+    this.qbatchMatMulSimdEnabled =
+      typeof this.api.qbatch_matmul_i8u8_simd128 === 'function';
     this.pointers = new Map();
     this.f32PackedWeights = new Map();
     this.f32PackedNodes = new Map();
@@ -1865,9 +1967,6 @@ export class WasmEngine extends BackendEngine {
       ? await instantiateRelaxedSimdChild(compiledModule, instance.exports.memory)
       : null;
     return new WasmEngine(wasmModule, relaxedSimdModule);
-  }
-  createGraph() {
-    return new Graph();
   }
   _alloc(tensor) {
     if (!this.pointers.has(tensor.name)) {
@@ -2125,31 +2224,116 @@ export class WasmEngine extends BackendEngine {
     }
     const quantizedDescriptor = portableQuantizedNodeDescriptor(node);
     if (quantizedDescriptor) return quantizedDescriptor;
-    if (['Add', 'Mul', 'Sub', 'Div'].includes(node.opType)) {
-      const descriptor = portableF32ElementwiseDescriptor(node);
-      const words = new Uint32Array(descriptor.aRank + descriptor.bRank + descriptor.outputRank);
-      words.set(descriptor.a.shape, 0);
-      words.set(descriptor.b.shape, descriptor.aRank);
-      words.set(descriptor.output.shape, descriptor.aRank + descriptor.bRank);
+    if (node.opType === 'BatchMatMul') {
+      const descriptor = batchMatMulDescriptor(node);
+      let incrementalRow: any = null;
+      try {
+        incrementalRow = batchMatMulDescriptor(quantizedRowNode(
+          node, 1, { allowUnprovenInvariantInputs: true },
+        ));
+      } catch {
+        // The ordinary descriptor remains valid. Dependency-aware row
+        // preflight reports a precise error only when row mode is requested.
+      }
+      return { kind: 'batchMatMul', ...descriptor, incrementalRow };
+    }
+    if (node.opType === 'QBatchMatMul') {
+      const descriptor = qBatchMatMulDescriptor(node);
+      let incrementalRow: any = null;
+      try {
+        incrementalRow = qBatchMatMulDescriptor(quantizedRowNode(
+          node, 1, { allowUnprovenInvariantInputs: true },
+        ));
+      } catch {
+        // Preserve full-sequence compilation for descriptors outside the
+        // strict logical-row layouts.
+      }
+      return { kind: 'qBatchMatMul', ...descriptor, incrementalRow };
+    }
+    if (node.opType === 'Equal' || node.opType === 'GreaterOrEqual') {
+      const descriptor = comparisonDescriptor(node);
+      // The C broadcast ABI represents a scalar as rank-one [1], while the
+      // graph retains the ONNX rank-zero shape.
+      const aShape = descriptor.a.shape.length ? descriptor.a.shape : [1];
+      const bShape = descriptor.b.shape.length ? descriptor.b.shape : [1];
+      const outputShape = descriptor.outputShape.length ? descriptor.outputShape : [1];
+      const words = new Uint32Array(aShape.length + bShape.length + outputShape.length);
+      words.set(aShape, 0);
+      words.set(bShape, aShape.length);
+      words.set(outputShape, aShape.length + bShape.length);
       const pointer = this._allocMetadata(words);
       return {
-        kind: 'binary', ...descriptor,
+        kind: 'comparison', ...descriptor,
+        aRank: aShape.length,
+        bRank: bShape.length,
+        kernelRank: outputShape.length,
         aShapePointer: pointer,
-        bShapePointer: pointer + descriptor.aRank * Uint32Array.BYTES_PER_ELEMENT,
-        outputShapePointer: pointer + (descriptor.aRank + descriptor.bRank) * Uint32Array.BYTES_PER_ELEMENT,
+        bShapePointer: pointer + aShape.length * Uint32Array.BYTES_PER_ELEMENT,
+        outputShapePointer: pointer +
+          (aShape.length + bShape.length) * Uint32Array.BYTES_PER_ELEMENT,
       };
     }
-    if (node.opType === 'Expand' || node.opType === 'Broadcast') {
-      const descriptor = portableExpandDescriptor(node);
-      const words = new Uint32Array(descriptor.inputRank + descriptor.outputRank);
-      words.set(descriptor.input.shape, 0);
-      words.set(descriptor.output.shape, descriptor.inputRank);
-      const pointer = this._allocMetadata(words);
-      return {
-        kind: 'expand', ...descriptor,
-        inputShapePointer: pointer,
-        outputShapePointer: pointer + descriptor.inputRank * Uint32Array.BYTES_PER_ELEMENT,
+    if (node.opType === 'Not') {
+      return { kind: 'not', ...logicalNotDescriptor(node) };
+    }
+    if (['Add', 'Mul', 'Sub', 'Div'].includes(node.opType)) {
+      const compileBinaryDescriptor = (binaryNode) => {
+        const descriptor = portableF32ElementwiseDescriptor(binaryNode);
+        const words = new Uint32Array(descriptor.aRank + descriptor.bRank + descriptor.outputRank);
+        words.set(descriptor.a.shape, 0);
+        words.set(descriptor.b.shape, descriptor.aRank);
+        words.set(descriptor.output.shape, descriptor.aRank + descriptor.bRank);
+        const pointer = this._allocMetadata(words);
+        return {
+          ...descriptor,
+          aShapePointer: pointer,
+          bShapePointer: pointer + descriptor.aRank * Uint32Array.BYTES_PER_ELEMENT,
+          outputShapePointer: pointer +
+            (descriptor.aRank + descriptor.bRank) * Uint32Array.BYTES_PER_ELEMENT,
+        };
       };
+      const descriptor = compileBinaryDescriptor(node);
+      let incrementalRow: any = null;
+      if (node.opType === 'Add' || node.opType === 'Mul') {
+        try {
+          incrementalRow = compileBinaryDescriptor(quantizedRowNode(
+            node, 1, { allowUnprovenInvariantInputs: true },
+          ));
+        } catch {
+          // Row execution is opt-in. The full graph remains valid even when an
+          // operand cannot be represented by the strict logical-row contract;
+          // prepareQuantizedRows will report that exact incompatibility if the
+          // caller later requests row mode.
+        }
+      }
+      return { kind: 'binary', ...descriptor, incrementalRow };
+    }
+    if (node.opType === 'Expand' || node.opType === 'Broadcast') {
+      const compileExpandDescriptor = (expandNode) => {
+        const descriptor = portableExpandDescriptor(expandNode);
+        const words = new Uint32Array(descriptor.inputRank + descriptor.outputRank);
+        words.set(descriptor.input.shape, 0);
+        words.set(descriptor.output.shape, descriptor.inputRank);
+        const pointer = this._allocMetadata(words);
+        return {
+          ...descriptor,
+          inputShapePointer: pointer,
+          outputShapePointer: pointer + descriptor.inputRank * Uint32Array.BYTES_PER_ELEMENT,
+        };
+      };
+      const descriptor = compileExpandDescriptor(node);
+      let incrementalRow: any = null;
+      if (node.opType === 'Expand') {
+        try {
+          incrementalRow = compileExpandDescriptor(quantizedRowNode(
+            node, 1, { allowUnprovenInvariantInputs: true },
+          ));
+        } catch {
+          // Fixed-shape row execution is optional; its preflight reports the
+          // exact incompatible descriptor when requested.
+        }
+      }
+      return { kind: 'expand', ...descriptor, incrementalRow };
     }
     if (node.opType === 'Transpose') {
       const descriptor = portableTransposeDescriptor(node);
@@ -2203,7 +2387,7 @@ export class WasmEngine extends BackendEngine {
     if (node.opType === 'Sin' || node.opType === 'Cos') {
       return portableUnaryF32Descriptor(node);
     }
-    if (node.opType === 'RoPE' || node.opType === 'RotaryEmbedding') {
+    if (node.opType === 'RoPE') {
       return { kind: 'rope', ...ropeDescriptor(node) };
     }
     if (node.opType === 'SSMScan' || node.opType === 'SelectiveScan') {
@@ -2216,12 +2400,81 @@ export class WasmEngine extends BackendEngine {
     }
     return null;
   }
-  allocateGraph(graph: WasmGraph) {
-    return this.compile(graph);
+  prepareGraph(graph: WasmGraph): WasmPreparedGraph {
+    this._assertPortableQuantizedGraph(graph);
+    if (graph.activeAdapter?.()) {
+      throw new Error("WASM adapter execution is unsupported; compile this graph with the CPU backend.");
+    }
+    const qGroupNorm: number[] = [];
+    const qLayerNorm: number[] = [];
+    const qSDPA: number[] = [];
+    const qMaskedMean: number[] = [];
+    const schedule = graph.nodes.map((node, nodeIndex): WasmPreparedStep => {
+      const route = kernelRoute('wasm', node.opType);
+      if (!route) throw new Error(`WASM operator '${node.opType}' is unsupported.`);
+      if (node.opType === 'QGroupNorm') qGroupNorm.push(nodeIndex);
+      if (node.opType === 'QLayerNorm') qLayerNorm.push(nodeIndex);
+      if (node.opType === 'QSDPA') qSDPA.push(nodeIndex);
+      if (node.opType === 'QMaskedMean') qMaskedMean.push(nodeIndex);
+      return Object.freeze({ nodeIndex, nodeId: node.id, opType: node.opType, kernelRoute: route });
+    });
+    return Object.freeze({
+      [WASM_PREPARED_GRAPH]: true as const,
+      topologyRevision: graph.topologyRevision || 0,
+      weightRevision: graph.weightRevision || 0,
+      tensorCount: graph.tensors.size,
+      outputNames: Object.freeze([...graph.outputNames]),
+      schedule: Object.freeze(schedule),
+      inputPreflights: Object.freeze({
+        qGroupNorm: Object.freeze(qGroupNorm),
+        qLayerNorm: Object.freeze(qLayerNorm),
+        qSDPA: Object.freeze(qSDPA),
+        qMaskedMean: Object.freeze(qMaskedMean),
+      }),
+    });
+  }
+  _assertPreparedGraph(graph: WasmGraph, value: Readonly<object>): WasmPreparedGraph {
+    const prepared = value as Partial<WasmPreparedGraph>;
+    const preflights = prepared?.inputPreflights as Partial<WasmPreparedInputPreflights> | undefined;
+    const invalid = !prepared || prepared[WASM_PREPARED_GRAPH] !== true ||
+      !Object.isFrozen(prepared) || !Array.isArray(prepared.schedule) ||
+      !Object.isFrozen(prepared.schedule) || !Array.isArray(prepared.outputNames) ||
+      !Object.isFrozen(prepared.outputNames) || !preflights || !Object.isFrozen(preflights) ||
+      !Array.isArray(preflights.qGroupNorm) || !Object.isFrozen(preflights.qGroupNorm) ||
+      !Array.isArray(preflights.qLayerNorm) || !Object.isFrozen(preflights.qLayerNorm) ||
+      !Array.isArray(preflights.qSDPA) || !Object.isFrozen(preflights.qSDPA) ||
+      !Array.isArray(preflights.qMaskedMean) || !Object.isFrozen(preflights.qMaskedMean) ||
+      prepared.topologyRevision !== (graph.topologyRevision || 0) ||
+      prepared.weightRevision !== (graph.weightRevision || 0) ||
+      prepared.tensorCount !== graph.tensors.size || prepared.schedule.length !== graph.nodes.length ||
+      prepared.outputNames.length !== graph.outputNames.length ||
+      prepared.outputNames.some((name, index) => name !== graph.outputNames[index]) ||
+      prepared.schedule.some((step, index) => {
+        const node = graph.nodes[index];
+        return !Object.isFrozen(step) || step.nodeIndex !== index || step.nodeId !== node?.id ||
+          step.opType !== node?.opType || typeof step.kernelRoute !== 'string' || !step.kernelRoute;
+      });
+    if (invalid) {
+      throw new Error('WASM prepared graph does not match this graph revision; recompile the model.');
+    }
+    return prepared as WasmPreparedGraph;
+  }
+  _preparedGraphForExecution(): WasmPreparedGraph {
+    if (this.preparedGraph) return this.preparedGraph;
+    // Direct WasmEngine users historically may install an already-allocated
+    // graph and pointer table without calling compile(). Preserve that
+    // low-level contract while keeping provider/CompiledModel execution on the
+    // eagerly prepared, shared plan path.
+    const prepared = this.prepareGraph(this.graph);
+    this.preparedGraph = prepared;
+    return prepared;
+  }
+  allocateGraph(graph: WasmGraph, preparedGraph?: Readonly<object>) {
+    return preparedGraph ? this.compile(graph, preparedGraph) : this.compile(graph);
   }
   _preflightQGroupNormDynamicAffines(inputs: Record<string, RuntimeTypedArray>) {
-    for (const node of this.graph.nodes) {
-      if (node.opType !== 'QGroupNorm') continue;
+    for (const nodeIndex of this.preparedGraph.inputPreflights.qGroupNorm) {
+      const node = this.graph.nodes[nodeIndex];
       for (const [label, tensor] of [
         ['weight', node.inputs.weight],
         ['bias', node.inputs.bias],
@@ -2242,8 +2495,8 @@ export class WasmEngine extends BackendEngine {
     }
   }
   _preflightQLayerNormDynamicAffines(inputs: Record<string, RuntimeTypedArray>) {
-    for (const node of this.graph.nodes) {
-      if (node.opType !== 'QLayerNorm') continue;
+    for (const nodeIndex of this.preparedGraph.inputPreflights.qLayerNorm) {
+      const node = this.graph.nodes[nodeIndex];
       for (const [label, tensor] of [
         ['weight', node.inputs.weight],
         ['bias', node.inputs.bias],
@@ -2264,8 +2517,8 @@ export class WasmEngine extends BackendEngine {
     }
   }
   _preflightQSDPAMasks(inputs: Record<string, RuntimeTypedArray>) {
-    for (const node of this.graph.nodes) {
-      if (node.opType !== 'QSDPA') continue;
+    for (const nodeIndex of this.preparedGraph.inputPreflights.qSDPA) {
+      const node = this.graph.nodes[nodeIndex];
       const mask = node.inputs.mask;
       if (!mask?.isInput) continue;
       const supplied = Object.prototype.hasOwnProperty.call(inputs, mask.name)
@@ -2279,8 +2532,8 @@ export class WasmEngine extends BackendEngine {
     }
   }
   _preflightQMaskedMeanMasks(inputs: Record<string, RuntimeTypedArray>) {
-    for (const node of this.graph.nodes) {
-      if (node.opType !== 'QMaskedMean') continue;
+    for (const nodeIndex of this.preparedGraph.inputPreflights.qMaskedMean) {
+      const node = this.graph.nodes[nodeIndex];
       const mask = node.inputs.mask;
       if (!mask?.isInput) continue;
       const supplied = Object.prototype.hasOwnProperty.call(inputs, mask.name)
@@ -2293,8 +2546,8 @@ export class WasmEngine extends BackendEngine {
         `QMaskedMean node ${node.id} mask`);
     }
   }
-  compile(graph: WasmGraph) {
-    this._assertPortableQuantizedGraph(graph);
+  compile(graph: WasmGraph, preparedGraph: Readonly<object> = this.prepareGraph(graph)) {
+    const prepared = this._assertPreparedGraph(graph, preparedGraph);
     this.resetDecodeCache();
     if (graph.activeAdapter?.()) {
       throw new Error("WASM adapter execution is unsupported; compile this graph with the CPU backend.");
@@ -2311,7 +2564,8 @@ export class WasmEngine extends BackendEngine {
     // allocation so it consumes neither a separate activation nor a runtime
     // call. Chained Dropout aliases are resolved after ordinary tensors.
     const dropoutAliases = new Map();
-    for (const node of graph.nodes) {
+    for (const step of prepared.schedule) {
+      const node = graph.nodes[step.nodeIndex];
       if (node.opType !== "Dropout") continue;
       const input = node.inputs.input || node.inputs.x || node.inputs.data;
       const output = node.outputs.out || Object.values(node.outputs || {})[0];
@@ -2321,7 +2575,8 @@ export class WasmEngine extends BackendEngine {
       }
       dropoutAliases.set(output.name, input.name);
     }
-    for (const node of graph.nodes) {
+    for (const step of prepared.schedule) {
+      const node = graph.nodes[step.nodeIndex];
       preflightPortableQGroupNormStorage(node);
       preflightPortableQLayerNormStorage(node);
       preflightPortableQSDPAStorage(node);
@@ -2360,7 +2615,8 @@ export class WasmEngine extends BackendEngine {
       }
       viewedMemory = this.mem.buffer;
     };
-    for (const node of graph.nodes) {
+    for (const step of prepared.schedule) {
+      const node = graph.nodes[step.nodeIndex];
       refreshTensorViews();
       const metadata = this._compilePortableMetadata(node);
       if (metadata) this.nodeMetadata.set(node, metadata);
@@ -2382,6 +2638,7 @@ export class WasmEngine extends BackendEngine {
     // descriptor was built, so publish one final coherent set of views.
     refreshTensorViews();
     this.graph = graph;
+    this.preparedGraph = prepared;
     this.compiledWeightRevision = graph.weightRevision || 0;
     this.compiledTopologyRevision = graph.topologyRevision || 0;
     graph.adapters?._markAcceleratedBackend("wasm");
@@ -2391,6 +2648,7 @@ export class WasmEngine extends BackendEngine {
     inputs: Record<string, RuntimeTypedArray>,
     options: WasmExecutionOptions = {},
   ): Promise<Record<string, RuntimeTypedArray>> {
+    assertInferenceExecutionOptions(options, 'WASM inference');
     this.graph.assertTopologyRevision?.(this.compiledTopologyRevision, "WASM");
     this._beginDecodeExecution(options);
     const adapterPlan = this.graph.adapters?._pinExecution(options) || null;
@@ -2400,6 +2658,7 @@ export class WasmEngine extends BackendEngine {
     if ((this.graph.weightRevision || 0) !== this.compiledWeightRevision) {
       throw new Error("WASM weights changed after compilation; recompile the graph before execution.");
     }
+    const preparedGraph = this._preparedGraphForExecution();
     const incremental = incrementalExecutionEnabled(options, adapterPlan);
     const cacheWasValid = this._incrementalCacheValid;
     const selectedNodes = incremental
@@ -2409,7 +2668,9 @@ export class WasmEngine extends BackendEngine {
     const rowPosition = incrementalRowPosition(options, selectedNodes, cacheWasValid);
     const incrementalRows = rowPosition == null
       ? null
-      : prepareQuantizedRows(this.graph, selectedNodes, rowPosition);
+      : prepareQuantizedRows(this.graph, selectedNodes, rowPosition, {
+          changedInputs: options.changedInputs ?? Object.keys(inputs),
+        });
     for (const [name, data] of Object.entries(inputs)) {
       const tensor = this.graph.tensors.get(name);
       if (!tensor?.isInput) throw new Error(`Unknown graph input '${name}'.`);
@@ -2422,17 +2683,29 @@ export class WasmEngine extends BackendEngine {
     this._preflightQSDPAMasks(inputs);
     this._preflightQMaskedMeanMasks(inputs);
     
-    for (let nodeIndex = 0; nodeIndex < this.graph.nodes.length; nodeIndex++) {
+    for (const step of preparedGraph.schedule) {
+      const nodeIndex = step.nodeIndex;
       if (selectedNodes && !selectedNodes.has(nodeIndex)) continue;
       const node = this.graph.nodes[nodeIndex];
+      const kernelRoute = step.kernelRoute;
       const decodeNode = incrementalRows?.get(nodeIndex) || null;
+      // Opt-in per-operator profiling. Set `globalThis.__VOLVOX_WASM_PROFILE`
+      // to a Map before execute() and each node's elapsed time accumulates
+      // under its opType; leave it unset and this costs one truthiness check.
+      // It exists because operator *choice* and operator *cost* diverge here:
+      // a graph can carry strictly fewer, better-fused nodes and still lose if
+      // one of them silently misses a fast kernel path, which is invisible to
+      // any static inspection of the graph.
+      const profile = (globalThis as any).__VOLVOX_WASM_PROFILE as
+        Map<string, { ms: number; count: number }> | undefined;
+      const profileStart = profile ? performance.now() : 0;
       try {
        const inPtr = this.pointers.get(node.inputs.input?.name)!;
        const outPtr = this.pointers.get(node.outputs.out?.name)!;
        const wPtr = this.pointers.get(node.inputs.weight?.name);
        const bPtr = this.pointers.get(node.inputs.bias?.name);
 
-        if (node.opType === "QConv2D") {
+        if (kernelRoute === "qconv2d") {
           const descriptor = this.nodeMetadata.get(node);
           if (descriptor?.kind !== 'qconv2d') {
             throw new Error(`WASM QConv2D node ${node.id} has no canonical W8A8 descriptor.`);
@@ -2492,7 +2765,7 @@ export class WasmEngine extends BackendEngine {
           if (result !== 1) {
             throw new Error(`WASM QConv2D node ${node.id} rejected its canonical W8A8 descriptor.`);
           }
-        } else if (node.opType === "Conv2D") {
+        } else if (kernelRoute === "conv2d") {
           const wPtr = this.pointers.get(node.inputs.weight.name);
           const bPtr = node.inputs.bias ? this.pointers.get(node.inputs.bias.name) : 0;
           const inShape = node.inputs.input.shape;
@@ -2511,7 +2784,7 @@ export class WasmEngine extends BackendEngine {
               outShape[1], outShape[2], sy, sx, pads[0], pads[1],
               groups, relu, dy, dx
           );
-       } else if (node.opType === "ConvTranspose2D") {
+       } else if (kernelRoute === "conv-transpose2d") {
           const wPtr = this.pointers.get(node.inputs.weight.name);
           const bPtr = node.inputs.bias ? this.pointers.get(node.inputs.bias.name) : 0;
           const [b, in_h, in_w, in_c] = node.inputs.input.shape;
@@ -2526,7 +2799,7 @@ export class WasmEngine extends BackendEngine {
               b, in_h, in_w, in_c, out_h, out_w, out_c,
               kh, kw, sh, sw, ph, pw
           );
-       } else if (node.opType === "ReduceSum") {
+       } else if (kernelRoute === "reduce-sum") {
           const input = node.inputs.input || node.inputs.data;
           const output = portableOutput(node);
           const inputPtr = this.pointers.get(input.name);
@@ -2542,7 +2815,7 @@ export class WasmEngine extends BackendEngine {
             throw new Error(`WASM ReduceSum node ${node.id} must reduce the last axis of an F32 tensor.`);
           }
           this.api.reduce_sum_f32(inputPtr, outputPtr, rows, width);
-       } else if (node.opType === "ReduceMean") {
+       } else if (kernelRoute === "reduce-mean") {
           const input = node.inputs.input || node.inputs.data;
           const output = portableOutput(node);
           const inputPtr = this.pointers.get(input.name);
@@ -2558,7 +2831,7 @@ export class WasmEngine extends BackendEngine {
             throw new Error(`WASM ReduceMean node ${node.id} must reduce the last axis of an F32 tensor.`);
           }
           this.api.reduce_mean_f32(inputPtr, outputPtr, rows, width);
-       } else if (node.opType === "Softmax" || node.opType === "LogSoftmax") {
+       } else if (kernelRoute === "softmax") {
           const input = node.inputs.input || node.inputs.x;
           const output = portableOutput(node);
           const elements = portableTensorElements(input);
@@ -2566,8 +2839,13 @@ export class WasmEngine extends BackendEngine {
               portableTensorElements(output) !== elements) {
             throw new Error(`WASM ${node.opType} node ${node.id} requires equal-size F32 tensors.`);
           }
-          const rows = input.shape.length === 2 ? input.shape[0] : 1;
-          const width = elements / rows;
+          let axis = node.params.axis ?? -1;
+          if (axis < 0) axis += input.shape.length;
+          if (input.shape.length === 0 || axis !== input.shape.length - 1) {
+            throw new Error(`WASM ${node.opType} node ${node.id} requires the last axis.`);
+          }
+          const width = input.shape[input.shape.length - 1];
+          const rows = elements / width;
           if (!Number.isInteger(rows) || rows <= 0 || !Number.isInteger(width) || width <= 0) {
             throw new Error(`WASM ${node.opType} node ${node.id} has invalid reduction dimensions.`);
           }
@@ -2575,7 +2853,7 @@ export class WasmEngine extends BackendEngine {
           const outputPtr = this.pointers.get(output.name);
           if (node.opType === "Softmax") this.api.softmax_f32(inputPtr, outputPtr, rows, width);
           else this.api.logsoftmax_f32(inputPtr, outputPtr, rows, width);
-       } else if (node.opType === "ArgMax") {
+       } else if (kernelRoute === "argmax") {
           const input = node.inputs.input || node.inputs.data;
           const output = node.outputs.out;
           let axis = node.params.axis !== undefined ? node.params.axis : 0;
@@ -2599,7 +2877,7 @@ export class WasmEngine extends BackendEngine {
           this.api.argmax_axis_typed(this.pointers.get(input.name), outPtr, outer, axisSize, inner,
               wasmKernelDtype(input, `ArgMax input at node ${node.id}`),
               wasmKernelDtype(output, `ArgMax output at node ${node.id}`));
-       } else if (["QLinear", "QMatMul", "QGemm"].includes(node.opType)) {
+       } else if (kernelRoute === "qlinear") {
           const descriptor = this.nodeMetadata.get(node);
           if (descriptor?.kind !== 'qlinear') {
             throw new Error(`WASM ${node.opType} node ${node.id} has no canonical W8A8 descriptor.`);
@@ -2613,9 +2891,25 @@ export class WasmEngine extends BackendEngine {
           const outputPointer = decodeNode
             ? wasmTensorPointer(decodeOutput, this.mem, `${node.opType} row output`)
             : this.pointers.get(descriptor.output.name);
-          let result = 0;
+          // The baseline packed SIMD128 kernel reuses each activation block
+          // across eight outputs and is faster than the one-output Relaxed
+          // child on the measured decoder shapes. Prefer it for every packed
+          // descriptor; the optional child remains a fail-closed fallback.
+          let result = typeof this.api.qlinear_i8u8_packed === 'function' &&
+            descriptor.packedWeightPointer ? this.api.qlinear_i8u8_packed(
+            inputPointer,
+            descriptor.packedWeightPointer,
+            this.pointers.get(descriptor.bias.name), descriptor.weightScalesPointer,
+            descriptor.weightZeroPointsPointer,
+            outputPointer,
+            decodeNode ? 1 : descriptor.rows, descriptor.dIn, descriptor.dOut,
+            descriptor.inputScale, descriptor.inputZeroPoint,
+            descriptor.outputScale, descriptor.outputZeroPoint,
+            descriptor.inputDtype, descriptor.weightDtype, descriptor.outputDtype,
+          ) : 0;
           const relaxedApi = this.relaxedApi;
-          if (decodeNode && descriptor.packedWeightPointer && this.relaxedSimdEnabled && relaxedApi) {
+          if (result !== 1 && decodeNode && descriptor.packedWeightPointer &&
+              this.relaxedSimdEnabled && relaxedApi) {
             try {
               result = relaxedApi[WASM_RELAXED_QLINEAR_EXPORT](
                 inputPointer, this.pointers.get(descriptor.weight.name),
@@ -2635,18 +2929,6 @@ export class WasmEngine extends BackendEngine {
               result = 0;
             }
           }
-          if (result !== 1) result = typeof this.api.qlinear_i8u8_packed === 'function' &&
-            descriptor.packedWeightPointer ? this.api.qlinear_i8u8_packed(
-            inputPointer,
-            descriptor.packedWeightPointer,
-            this.pointers.get(descriptor.bias.name), descriptor.weightScalesPointer,
-            descriptor.weightZeroPointsPointer,
-            outputPointer,
-            decodeNode ? 1 : descriptor.rows, descriptor.dIn, descriptor.dOut,
-            descriptor.inputScale, descriptor.inputZeroPoint,
-            descriptor.outputScale, descriptor.outputZeroPoint,
-            descriptor.inputDtype, descriptor.weightDtype, descriptor.outputDtype,
-          ) : 0;
           if (result !== 1) result = this.api.qlinear_i8u8(
             inputPointer,
             this.pointers.get(descriptor.weight.name),
@@ -2661,13 +2943,129 @@ export class WasmEngine extends BackendEngine {
           if (result !== 1) {
             throw new Error(`WASM ${node.opType} node ${node.id} rejected its canonical W8A8 descriptor.`);
           }
-       } else if (node.opType === "MatMul" || node.opType === "Linear" || node.opType === "Gemm") {
-          const input = node.inputs.input || node.inputs.x || node.inputs.a;
-          const weight = node.inputs.weight;
-          const output = portableOutput(node);
-          const inputPtr = this.pointers.get(input?.name);
+       } else if (kernelRoute === "batch-matmul") {
+          const descriptor = this.nodeMetadata.get(node);
+          if (!descriptor || descriptor.kind !== 'batchMatMul') {
+            throw new Error(`WASM BatchMatMul node ${node.id} has no compiled portable descriptor.`);
+          }
+          const executionDescriptor = decodeNode ? descriptor.incrementalRow : descriptor;
+          if (!executionDescriptor) {
+            throw new Error(
+              `WASM BatchMatMul node ${node.id} has no correctness-safe incremental row descriptor.`,
+            );
+          }
+          const executionNode = decodeNode || node;
+          const a = executionNode.inputs.a;
+          const b = executionNode.inputs.b;
+          const output = portableOutput(executionNode);
+          const aPointer = decodeNode
+            ? wasmTensorPointer(a, this.mem, 'BatchMatMul row input a')
+            : this.pointers.get(a.name)!;
+          const bPointer = decodeNode
+            ? wasmTensorPointer(b, this.mem, 'BatchMatMul invariant input b')
+            : this.pointers.get(b.name)!;
+          const outputPointer = decodeNode
+            ? wasmTensorPointer(output, this.mem, 'BatchMatMul row output')
+            : this.pointers.get(output.name)!;
+          for (let batch = 0; batch < executionDescriptor.outputBatchCount; batch++) {
+            let remaining = batch;
+            let aBase = 0;
+            let bBase = 0;
+            for (let axis = 0; axis < executionDescriptor.batchRank; axis++) {
+              const coordinate = Math.floor(
+                remaining / executionDescriptor.outputBatchStrides[axis],
+              );
+              remaining %= executionDescriptor.outputBatchStrides[axis];
+              aBase += coordinate * executionDescriptor.aBatchStrides[axis];
+              bBase += coordinate * executionDescriptor.bBatchStrides[axis];
+            }
+            this.api.matmul_f32(
+              aPointer + aBase * Float32Array.BYTES_PER_ELEMENT,
+              bPointer + bBase * Float32Array.BYTES_PER_ELEMENT,
+              0,
+              outputPointer + batch * executionDescriptor.m * executionDescriptor.n *
+                Float32Array.BYTES_PER_ELEMENT,
+              executionDescriptor.m, executionDescriptor.k, executionDescriptor.n,
+            );
+          }
+       } else if (kernelRoute === "qbatch-matmul") {
+          const descriptor = this.nodeMetadata.get(node);
+          if (!descriptor || descriptor.kind !== 'qBatchMatMul') {
+            throw new Error(`WASM QBatchMatMul node ${node.id} has no compiled portable descriptor.`);
+          }
+          const executionDescriptor = decodeNode ? descriptor.incrementalRow : descriptor;
+          if (!executionDescriptor) {
+            throw new Error(
+              `WASM QBatchMatMul node ${node.id} has no correctness-safe incremental row descriptor.`,
+            );
+          }
+          const executionNode = decodeNode || node;
+          const a = executionNode.inputs.a;
+          const b = executionNode.inputs.b;
+          const output = portableOutput(executionNode);
+          const aPointer = decodeNode
+            ? wasmTensorPointer(a, this.mem, 'QBatchMatMul row input a')
+            : this.pointers.get(a.name)!;
+          const bPointer = decodeNode
+            ? wasmTensorPointer(b, this.mem, 'QBatchMatMul invariant input b')
+            : this.pointers.get(b.name)!;
+          const outputPointer = decodeNode
+            ? wasmTensorPointer(output, this.mem, 'QBatchMatMul row output')
+            : this.pointers.get(output.name)!;
+          for (let batch = 0; batch < executionDescriptor.outputBatchCount; batch++) {
+            let remaining = batch;
+            let aBase = 0;
+            let bBase = 0;
+            for (let axis = 0; axis < executionDescriptor.batchRank; axis++) {
+              const coordinate = Math.floor(
+                remaining / executionDescriptor.outputBatchStrides[axis],
+              );
+              remaining %= executionDescriptor.outputBatchStrides[axis];
+              aBase += coordinate * executionDescriptor.aBatchStrides[axis];
+              bBase += coordinate * executionDescriptor.bBatchStrides[axis];
+            }
+            // Standard SIMD128 is part of the shipped parent module, not the
+            // optional Relaxed-SIMD child.  Keep the scalar ABI selectable for
+            // older/custom parents and tests; a selected kernel rejection is
+            // fail-closed and never retries through JS or dequantized F32.
+            const kernel = this.qbatchMatMulSimdEnabled &&
+              typeof this.api.qbatch_matmul_i8u8_simd128 === 'function'
+              ? this.api.qbatch_matmul_i8u8_simd128
+              : this.api.qbatch_matmul_i8u8;
+            const result = kernel(
+              aPointer + aBase,
+              bPointer + bBase,
+              outputPointer + batch * executionDescriptor.m * executionDescriptor.n,
+              executionDescriptor.m,
+              executionDescriptor.k,
+              executionDescriptor.n,
+              executionDescriptor.aScale,
+              executionDescriptor.aQuantization.zero_point,
+              executionDescriptor.bScale,
+              executionDescriptor.bQuantization.zero_point,
+              executionDescriptor.outputScale,
+              executionDescriptor.outputQuantization.zero_point,
+              wasmDtypeCode(a.dtype),
+              wasmDtypeCode(b.dtype),
+              wasmDtypeCode(output.dtype),
+            );
+            if (result !== 1) {
+              throw new Error(
+                `WASM QBatchMatMul node ${node.id} rejected its canonical descriptor.`,
+              );
+            }
+          }
+       } else if (kernelRoute === "dense") {
+          const executionNode = decodeNode || node;
+          const input = executionNode.inputs.input || executionNode.inputs.x || executionNode.inputs.a;
+          const weight = executionNode.inputs.weight;
+          const output = portableOutput(executionNode);
+          const inputPtr = decodeNode
+            ? wasmTensorPointer(input, this.mem, `${node.opType} row input`)
+            : this.pointers.get(input?.name);
           const weightPtr = this.pointers.get(weight?.name);
-          const biasPtr = node.inputs.bias ? this.pointers.get(node.inputs.bias.name) : 0;
+          const biasPtr = executionNode.inputs.bias
+            ? this.pointers.get(executionNode.inputs.bias.name) : 0;
           if (!portableF32Tensor(input) || !weight || !portableF32Tensor(output) ||
               input.shape.length < 1 || output.shape.length < 1) {
             throw new Error(`WASM ${node.opType} node ${node.id} requires F32 input and output tensors.`);
@@ -2681,10 +3079,13 @@ export class WasmEngine extends BackendEngine {
               portableTensorElements(output) !== rows * dOut) {
             throw new Error(`WASM ${node.opType} node ${node.id} has incompatible matrix dimensions.`);
           }
-          const scale = node.inputs.scale || node.inputs.weight_scale;
-          const zeroPoint = node.inputs.zero_point || node.inputs.weight_zero_point || null;
-          const bias = node.inputs.bias || null;
-          const outputPtr = this.pointers.get(output.name);
+          const scale = executionNode.inputs.scale || executionNode.inputs.weight_scale;
+          const zeroPoint = executionNode.inputs.zero_point ||
+            executionNode.inputs.weight_zero_point || null;
+          const bias = executionNode.inputs.bias || null;
+          const outputPtr = decodeNode
+            ? wasmTensorPointer(output, this.mem, `${node.opType} row output`)
+            : this.pointers.get(output.name);
           if (scale) {
              const scaleElements = portableTensorElements(scale);
              const zeroPointElements = zeroPoint ? portableTensorElements(zeroPoint) : 0;
@@ -2718,7 +3119,7 @@ export class WasmEngine extends BackendEngine {
                (weight.shape[0] === dOut && weight.shape[1] === dIn);
              const expectedWeightShape = doutFirst ? [dOut, dIn] : [dIn, dOut];
              if (!portableF32Tensor(weight) || !sameShape(weight.shape, expectedWeightShape) ||
-                 (bias && (!portableF32Tensor(bias) || !sameShape(bias.shape, [dOut])))) {
+                 !portableDenseBias(bias, dOut)) {
                throw new Error(`WASM ${node.opType} node ${node.id} requires a canonical F32 weight and optional bias.`);
              }
              const packedF32 = this.f32PackedNodes.get(node);
@@ -2735,11 +3136,30 @@ export class WasmEngine extends BackendEngine {
                this.api.matmul_f32(inputPtr, weightPtr, biasPtr, outputPtr, rows, dIn, dOut);
              }
           }
-       } else if (node.opType === "LayerNorm") {
-          const flatSeq = node.inputs.input.shape.slice(0, -1).reduce((a,b)=>a*b,1);
-          const d_model = node.params.d_model;
-          this.api.layernorm_f32(inPtr, wPtr, bPtr, outPtr, flatSeq, d_model, node.params.eps ?? 1e-6);
-       } else if (node.opType === "RMSNorm") {
+       } else if (kernelRoute === "layernorm") {
+          const executionNode = decodeNode || node;
+          const input = executionNode.inputs.input;
+          const output = portableOutput(executionNode);
+          const weight = executionNode.inputs.weight;
+          const bias = executionNode.inputs.bias || null;
+          const flatSeq = input.shape.slice(0, -1).reduce((a, b) => a * b, 1);
+          const dModel = executionNode.params?.d_model ?? input.shape.at(-1);
+          if (!portableF32Tensor(input) || !portableF32Tensor(weight) ||
+              !portableF32Tensor(output) || (bias && !portableF32Tensor(bias)) ||
+              !Number.isInteger(dModel) || dModel <= 0 || input.shape.at(-1) !== dModel ||
+              !sameShape(weight.shape, [dModel]) || (bias && !sameShape(bias.shape, [dModel])) ||
+              !sameShape(input.shape, output.shape)) {
+            throw new Error(`WASM LayerNorm node ${node.id} requires matching F32 rows and affine tensors.`);
+          }
+          this.api.layernorm_f32(
+            decodeNode ? wasmTensorPointer(input, this.mem, 'LayerNorm row input') :
+              this.pointers.get(input.name),
+            this.pointers.get(weight.name), bias ? this.pointers.get(bias.name) : 0,
+            decodeNode ? wasmTensorPointer(output, this.mem, 'LayerNorm row output') :
+              this.pointers.get(output.name),
+            flatSeq, dModel, executionNode.params?.eps ?? 1e-6,
+          );
+       } else if (kernelRoute === "rmsnorm") {
           const input = node.inputs.input || node.inputs.x;
           const weight = node.inputs.weight;
           const output = portableOutput(node);
@@ -2752,7 +3172,7 @@ export class WasmEngine extends BackendEngine {
           }
           this.api.rmsnorm_f32(this.pointers.get(input.name), this.pointers.get(weight.name),
             this.pointers.get(output.name), elements / dModel, dModel, node.params?.eps ?? 1e-6);
-       } else if (node.opType === "GroupNorm") {
+       } else if (kernelRoute === "groupnorm") {
           const descriptor = portableGroupNormDescriptor(node);
           const result = this.api.groupnorm_f32(
             this.pointers.get(descriptor.input.name), this.pointers.get(descriptor.weight.name),
@@ -2761,7 +3181,7 @@ export class WasmEngine extends BackendEngine {
             descriptor.groups, descriptor.eps,
           );
           if (result !== 1) throw new Error(`WASM GroupNorm node ${node.id} rejected its canonical descriptor.`);
-       } else if (node.opType === "MoERouter") {
+       } else if (kernelRoute === "moe-router") {
           const descriptor = portableMoERouterDescriptor(node);
           const result = this.api.moe_router_f32(
             this.pointers.get(descriptor.input.name), this.pointers.get(descriptor.weight.name),
@@ -2771,7 +3191,7 @@ export class WasmEngine extends BackendEngine {
             descriptor.temperature, descriptor.normalize,
           );
           if (result !== 1) throw new Error(`WASM MoERouter node ${node.id} rejected its canonical descriptor.`);
-       } else if (node.opType === "MoELinear") {
+       } else if (kernelRoute === "moe-linear") {
           const descriptor = portableMoELinearDescriptor(node);
           const result = this.api.moe_linear_f32(
             this.pointers.get(descriptor.input.name), this.pointers.get(descriptor.expertWeight.name),
@@ -2781,7 +3201,7 @@ export class WasmEngine extends BackendEngine {
             descriptor.experts, descriptor.topK,
           );
           if (result !== 1) throw new Error(`WASM MoELinear node ${node.id} rejected its canonical descriptor.`);
-       } else if (node.opType === "SDPA") {
+       } else if (kernelRoute === "sdpa") {
           const qkvPtr = this.pointers.get(node.inputs.qkv.name)!;
           const qkvShape = node.inputs.qkv.shape;
           const outputShape = node.outputs.out.shape;
@@ -2810,22 +3230,37 @@ export class WasmEngine extends BackendEngine {
                 outPtr + batchIndex * outputBatchBytes,
                 seqLen, d_model, heads, head_dim, scale, maskPtr, localMaskMode, causal);
           }
-       } else if (node.opType === "CrossSDPA") {
-          const qPtr = this.pointers.get(node.inputs.q.name)!;
-          const kPtr = this.pointers.get(node.inputs.k.name)!;
-          const vPtr = this.pointers.get(node.inputs.v.name)!;
-          const qShape = node.inputs.q.shape;
-          const kShape = node.inputs.k.shape;
-          const vShape = node.inputs.v.shape;
-          const outputShape = node.outputs.out.shape;
+       } else if (kernelRoute === "cross-sdpa") {
+          const executionNode = decodeNode || node;
+          const q = executionNode.inputs.q;
+          const k = executionNode.inputs.k;
+          const v = executionNode.inputs.v;
+          const output = portableOutput(executionNode);
+          const pointer = (tensor, label): number => {
+            const value = decodeNode
+              ? wasmTensorPointer(tensor, this.mem, label)
+              : this.pointers.get(tensor.name);
+            if (typeof value !== 'number' || !Number.isSafeInteger(value) || value < 0) {
+              throw new Error(`WASM ${label} has no valid heap pointer.`);
+            }
+            return value;
+          };
+          const qPtr = pointer(q, 'CrossSDPA row q');
+          const kPtr = pointer(k, 'CrossSDPA row k');
+          const vPtr = pointer(v, 'CrossSDPA row v');
+          const outputPtr = pointer(output, 'CrossSDPA row output');
+          const qShape = q.shape;
+          const kShape = k.shape;
+          const vShape = v.shape;
+          const outputShape = output.shape;
           const rank = qShape.length;
           const batch = rank === 2 ? 1 : qShape[0];
           const batchOf = (shape) => shape.length === 2 ? 1 : shape[0];
           const seqQ = qShape[rank - 2];
           const seqKV = kShape[rank - 2];
-          const d_model = node.outputs.out.shape[node.outputs.out.shape.length - 1];
-          const heads = node.params.heads || node.params.num_heads || 8;
-          const head_dim = node.params.head_dim || d_model / heads;
+          const d_model = outputShape[outputShape.length - 1];
+          const heads = executionNode.params.heads || executionNode.params.num_heads || 8;
+          const head_dim = executionNode.params.head_dim || d_model / heads;
           if ((rank !== 2 && rank !== 3) ||
               [kShape, vShape, outputShape].some((shape) => shape.length !== rank || batchOf(shape) !== batch) ||
               qShape[rank - 1] !== d_model || kShape[rank - 1] !== d_model ||
@@ -2835,19 +3270,21 @@ export class WasmEngine extends BackendEngine {
           }
           const qBatchBytes = seqQ * d_model * 4;
           const kvBatchBytes = seqKV * d_model * 4;
-          const scale = node.params.scale ?? 1.0 / Math.sqrt(head_dim);
-          const mask = node.inputs.mask;
+          const scale = executionNode.params.scale ?? 1.0 / Math.sqrt(head_dim);
+          const mask = executionNode.inputs.mask;
           const maskMode = attentionMaskMode(mask, batch, seqQ, seqKV, node.id);
-          const causal = node.params.causal === true ? 1 : 0;
+          const causal = executionNode.params.causal === true ? 1 : 0;
           for (let batchIndex = 0; batchIndex < batch; batchIndex++) {
             const [maskPtr, localMaskMode] = localMaskBinding(
-              this.pointers, mask, maskMode, batchIndex, seqQ, seqKV);
+              this.pointers, mask, maskMode, batchIndex, seqQ, seqKV,
+              decodeNode && mask ? wasmTensorPointer(mask, this.mem, 'CrossSDPA row mask') : null,
+            );
             this.api.cross_sdpa_f32(qPtr + batchIndex * qBatchBytes,
                 kPtr + batchIndex * kvBatchBytes, vPtr + batchIndex * kvBatchBytes,
-                outPtr + batchIndex * qBatchBytes,
+                outputPtr + batchIndex * qBatchBytes,
                 seqQ, seqKV, d_model, heads, head_dim, scale, maskPtr, localMaskMode, causal);
           }
-       } else if (node.opType === "CrossAttention") {
+       } else if (kernelRoute === "cross-attention") {
           const q = node.inputs.q;
           const kv = node.inputs.kv;
           const weight = node.inputs.weight;
@@ -2884,7 +3321,7 @@ export class WasmEngine extends BackendEngine {
             scale ? this.pointers.get(scale.name) : 0, bias ? this.pointers.get(bias.name) : 0, outPtr,
             batch, seqQ, seqKV, dModel, heads, headDim,
           );
-       } else if (node.opType === "QEmbedding") {
+       } else if (kernelRoute === "qembedding") {
           const descriptor = this.nodeMetadata.get(node);
           if (descriptor?.kind !== 'qembedding') {
             throw new Error(`WASM QEmbedding node ${node.id} has no canonical W8A8 descriptor.`);
@@ -2905,44 +3342,76 @@ export class WasmEngine extends BackendEngine {
           if (result !== 1) {
             throw new Error(`WASM QEmbedding node ${node.id} rejected its canonical W8A8 descriptor or token IDs.`);
           }
-       } else if (node.opType === "Embedding") {
-          if (node.inputs.input.dtype !== 'int32' || node.inputs.weight.dtype !== 'float32' ||
-              node.outputs.out.dtype !== 'float32' || node.inputs.weight.shape.length !== 2) {
+       } else if (kernelRoute === "embedding") {
+          const executionNode = decodeNode || node;
+          const input = executionNode.inputs.input;
+          const weight = executionNode.inputs.weight;
+          const output = portableOutput(executionNode);
+          if (input.dtype !== 'int32' || weight.dtype !== 'float32' ||
+              output.dtype !== 'float32' || weight.shape.length !== 2) {
             throw new Error(`WASM Embedding node ${node.id} requires int32 IDs and a rank-2 float32 table.`);
           }
-          const seqLen = node.inputs.input.shape.reduce((a, b) => a * b, 1);
-          const d_model = node.outputs.out.shape[node.outputs.out.shape.length - 1];
-          const vocabularySize = node.inputs.weight.shape[0];
-          if (node.inputs.weight.shape[1] !== d_model ||
-              node.outputs.out.sizeBytes !== seqLen * d_model * 4) {
+          const seqLen = input.shape.reduce((a, b) => a * b, 1);
+          const d_model = output.shape[output.shape.length - 1];
+          const vocabularySize = weight.shape[0];
+          if (weight.shape[1] !== d_model || output.sizeBytes !== seqLen * d_model * 4) {
             throw new Error(`WASM Embedding node ${node.id} shapes are incompatible.`);
           }
-          const ids = new Int32Array(this.mem.buffer, inPtr, seqLen);
+          const inputPtr = decodeNode
+            ? wasmTensorPointer(input, this.mem, 'Embedding row IDs')
+            : this.pointers.get(input.name);
+          const outputPtr = decodeNode
+            ? wasmTensorPointer(output, this.mem, 'Embedding row output')
+            : this.pointers.get(output.name);
+          const ids = new Int32Array(this.mem.buffer, inputPtr, seqLen);
           for (const id of ids) {
             if (id < 0 || id >= vocabularySize) {
               throw new Error(`WASM Embedding node ${node.id} token id ${id} is outside vocabulary size ${vocabularySize}.`);
             }
           }
-          this.api.embedding_f32(inPtr, wPtr, outPtr, seqLen, d_model);
-       } else if (node.opType === "ReLU") {
+          this.api.embedding_f32(
+            inputPtr, this.pointers.get(weight.name), outputPtr, seqLen, d_model,
+          );
+       } else if (kernelRoute === "relu") {
           const inShape = node.inputs.input.shape;
           const elements = inShape.reduce((a, b) => a * b, 1);
           this.api.relu_f32(inPtr, outPtr, elements);
-       } else if (node.opType === "GELU") {
-          const elements = node.inputs.input.sizeBytes / 4;
-          const fn = geluApproximation(node) === 'tanh' ? this.api.gelu_tanh_f32 : this.api.gelu_f32;
+       } else if (kernelRoute === "gelu") {
+          const executionNode = decodeNode || node;
+          const input = executionNode.inputs.input;
+          const output = portableOutput(executionNode);
+          const elements = portableTensorElements(input);
+          if (!portableF32Tensor(input) || !portableF32Tensor(output) || elements == null ||
+              portableTensorElements(output) !== elements || !sameShape(input.shape, output.shape)) {
+            throw new Error(`WASM GELU node ${node.id} requires equal-shape F32 tensors.`);
+          }
+          const fn = geluApproximation(executionNode) === 'tanh'
+            ? this.api.gelu_tanh_f32 : this.api.gelu_f32;
           if (typeof fn !== 'function') throw new Error(`WASM GELU ${node.params?.approximate ?? 'none'} kernel is unavailable.`);
-          fn(inPtr, outPtr, elements);
-       } else if (node.opType === "SiLU" || node.opType === "Swish") {
-          const input = node.inputs.input || node.inputs.x;
-          const output = portableOutput(node);
+          fn(
+            decodeNode ? wasmTensorPointer(input, this.mem, 'GELU row input') :
+              this.pointers.get(input.name),
+            decodeNode ? wasmTensorPointer(output, this.mem, 'GELU row output') :
+              this.pointers.get(output.name),
+            elements,
+          );
+       } else if (kernelRoute === "silu") {
+          const executionNode = decodeNode || node;
+          const input = executionNode.inputs.input || executionNode.inputs.x;
+          const output = portableOutput(executionNode);
           const elements = portableTensorElements(input);
           if (!portableF32Tensor(input) || !portableF32Tensor(output) ||
               elements == null || portableTensorElements(output) !== elements) {
             throw new Error(`WASM ${node.opType} node ${node.id} requires equal-size F32 tensors.`);
           }
-          this.api.silu_f32(this.pointers.get(input.name), this.pointers.get(output.name), elements);
-       } else if (node.opType === "QSiLU") {
+          this.api.silu_f32(
+            decodeNode ? wasmTensorPointer(input, this.mem, `${node.opType} row input`) :
+              this.pointers.get(input.name),
+            decodeNode ? wasmTensorPointer(output, this.mem, `${node.opType} row output`) :
+              this.pointers.get(output.name),
+            elements,
+          );
+       } else if (kernelRoute === "qsilu") {
           const descriptor = this.nodeMetadata.get(node);
           if (descriptor?.kind !== 'qsilu') {
             throw new Error(`WASM QSiLU node ${node.id} has no canonical W8A8 descriptor.`);
@@ -2961,7 +3430,7 @@ export class WasmEngine extends BackendEngine {
             descriptor.inputDtype, descriptor.outputDtype,
           );
           if (result !== 1) throw new Error(`WASM QSiLU node ${node.id} rejected its canonical descriptor.`);
-       } else if (node.opType === "QGELU") {
+       } else if (kernelRoute === "qgelu") {
           const descriptor = this.nodeMetadata.get(node);
           if (descriptor?.kind !== 'qgelu') {
             throw new Error(`WASM QGELU node ${node.id} has no canonical W8A8 descriptor.`);
@@ -2980,7 +3449,7 @@ export class WasmEngine extends BackendEngine {
             descriptor.inputDtype, descriptor.outputDtype,
           );
           if (result !== 1) throw new Error(`WASM QGELU node ${node.id} rejected its canonical descriptor.`);
-       } else if (node.opType === "QGroupNorm") {
+       } else if (kernelRoute === "qgroupnorm") {
           const descriptor = this.nodeMetadata.get(node);
           if (descriptor?.kind !== 'qgroupnorm') {
             throw new Error(`WASM QGroupNorm node ${node.id} has no canonical W8A8 descriptor.`);
@@ -2994,7 +3463,7 @@ export class WasmEngine extends BackendEngine {
             descriptor.inputDtype, descriptor.outputDtype,
           );
           if (result !== 1) throw new Error(`WASM QGroupNorm node ${node.id} rejected its canonical descriptor.`);
-       } else if (node.opType === "QLayerNorm") {
+       } else if (kernelRoute === "qlayernorm") {
           const descriptor = this.nodeMetadata.get(node);
           if (descriptor?.kind !== 'qlayernorm') {
             throw new Error(`WASM QLayerNorm node ${node.id} has no canonical W8A8 descriptor.`);
@@ -3013,7 +3482,7 @@ export class WasmEngine extends BackendEngine {
             descriptor.inputDtype, descriptor.outputDtype,
           );
           if (result !== 1) throw new Error(`WASM QLayerNorm node ${node.id} rejected its canonical descriptor.`);
-       } else if (node.opType === "QSDPA") {
+       } else if (kernelRoute === "qsdpa") {
           const descriptor = this.nodeMetadata.get(node);
           if (descriptor?.kind !== 'qsdpa' || typeof this.api.qsdpa_i8u8 !== 'function') {
             throw new Error(`WASM QSDPA node ${node.id} has no canonical W8A8 kernel descriptor.`);
@@ -3039,7 +3508,7 @@ export class WasmEngine extends BackendEngine {
             executionDescriptor.outputDtype, executionDescriptor.causal, executionDescriptor.maskMode,
           );
           if (result !== 1) throw new Error(`WASM QSDPA node ${node.id} rejected its canonical descriptor.`);
-       } else if (node.opType === "QArgMax") {
+       } else if (kernelRoute === "qargmax") {
           const descriptor = this.nodeMetadata.get(node);
           if (descriptor?.kind !== 'qargmax' || typeof this.api.qargmax_i8u8 !== 'function') {
             throw new Error(`WASM QArgMax node ${node.id} has no canonical I8/U8 kernel descriptor.`);
@@ -3054,7 +3523,7 @@ export class WasmEngine extends BackendEngine {
             executionDescriptor.inputDtype,
           );
           if (result !== 1) throw new Error(`WASM QArgMax node ${node.id} rejected its canonical descriptor.`);
-       } else if (node.opType === "QMaskedMean") {
+       } else if (kernelRoute === "qmaskedmean") {
           const descriptor = this.nodeMetadata.get(node);
           if (descriptor?.kind !== 'qmaskedmean' || typeof this.api.qmaskedmean_i8u8 !== 'function') {
             throw new Error(`WASM QMaskedMean node ${node.id} has no canonical W8A8 kernel descriptor.`);
@@ -3067,7 +3536,7 @@ export class WasmEngine extends BackendEngine {
             descriptor.inputDtype, descriptor.outputDtype,
           );
           if (result !== 1) throw new Error(`WASM QMaskedMean node ${node.id} rejected its canonical descriptor.`);
-       } else if (node.opType === "Tanh") {
+       } else if (kernelRoute === "tanh") {
           const input = node.inputs.input || node.inputs.x;
           const output = portableOutput(node);
           const elements = portableTensorElements(input);
@@ -3076,7 +3545,7 @@ export class WasmEngine extends BackendEngine {
             throw new Error(`WASM Tanh node ${node.id} requires equal-size F32 tensors.`);
           }
           this.api.tanh_f32(this.pointers.get(input.name), this.pointers.get(output.name), elements);
-       } else if (node.opType === "Sin" || node.opType === "Cos") {
+       } else if (kernelRoute === "trigonometric") {
           const descriptor = this.nodeMetadata.get(node);
           if (descriptor?.kind !== 'unaryF32') {
             throw new Error(`WASM ${node.opType} node ${node.id} has no portable descriptor.`);
@@ -3084,7 +3553,7 @@ export class WasmEngine extends BackendEngine {
           const fn = node.opType === 'Sin' ? this.api.sin_f32 : this.api.cos_f32;
           fn(this.pointers.get(descriptor.input.name), this.pointers.get(descriptor.output.name),
             descriptor.elements);
-       } else if (node.opType === "RoPE" || node.opType === "RotaryEmbedding") {
+       } else if (kernelRoute === "rope") {
           const descriptor = this.nodeMetadata.get(node);
           if (descriptor?.kind !== 'rope' || typeof this.api.rope_f32 !== 'function') {
             throw new Error(`WASM RoPE node ${node.id} has no portable descriptor.`);
@@ -3097,7 +3566,7 @@ export class WasmEngine extends BackendEngine {
             descriptor.positionOffset, descriptor.interleaved ? 1 : 0, descriptor.positionMode,
           );
           if (result !== 1) throw new Error(`WASM RoPE node ${node.id} rejected its descriptor.`);
-       } else if (node.opType === "SSMScan" || node.opType === "SelectiveScan") {
+       } else if (kernelRoute === "ssm-scan") {
           const descriptor = this.nodeMetadata.get(node);
           if (descriptor?.kind !== 'ssmScan' || typeof this.api.ssm_scan_f32 !== 'function') {
             throw new Error(`WASM SSMScan node ${node.id} has no portable descriptor.`);
@@ -3116,7 +3585,7 @@ export class WasmEngine extends BackendEngine {
             descriptor.deltaSoftplus ? 1 : 0,
           );
           if (result !== 1) throw new Error(`WASM SSMScan node ${node.id} rejected its descriptor.`);
-       } else if (node.opType === "QAdd") {
+       } else if (kernelRoute === "qadd") {
           const descriptor = this.nodeMetadata.get(node);
           if (descriptor?.kind !== 'qadd') {
             throw new Error(`WASM QAdd node ${node.id} has no canonical W8A8 descriptor.`);
@@ -3138,30 +3607,69 @@ export class WasmEngine extends BackendEngine {
             descriptor.aDtype, descriptor.bDtype, descriptor.outputDtype, descriptor.relu,
           );
           if (result !== 1) throw new Error(`WASM QAdd node ${node.id} rejected its canonical descriptor.`);
-       } else if (node.opType === "Add" || node.opType === "Mul" || node.opType === "Sub" || node.opType === "Div") {
+       } else if (kernelRoute === "binary") {
           const descriptor = this.nodeMetadata.get(node);
           if (!descriptor || descriptor.kind !== 'binary') {
             throw new Error(`WASM ${node.opType} node ${node.id} has no compiled portable descriptor.`);
           }
+          const executionDescriptor = decodeNode ? descriptor.incrementalRow : descriptor;
+          if (!executionDescriptor) {
+            throw new Error(
+              `WASM ${node.opType} node ${node.id} has no correctness-safe incremental row descriptor.`,
+            );
+          }
+          const executionNode = decodeNode || node;
+          const a = executionNode.inputs.a;
+          const b = executionNode.inputs.b;
+          const output = portableOutput(executionNode);
+          const pointer = (tensor, label) => decodeNode
+            ? wasmTensorPointer(tensor, this.mem, label)
+            : this.pointers.get(tensor.name);
           const relu = node.opType === 'Add' ? (node.params.relu ?? 0) : 0;
           if (!Number.isInteger(relu) || relu < 0 || relu > 2) {
             throw new Error(`WASM Add node ${node.id} supports relu values 0 (none), 1 (ReLU), or 2 (ReLU6).`);
           }
           const result = this.api.binary_broadcast_f32(
-            this.pointers.get(descriptor.a.name), this.pointers.get(descriptor.b.name),
-            this.pointers.get(descriptor.output.name), descriptor.aShapePointer,
-            descriptor.bShapePointer, descriptor.outputShapePointer, descriptor.aRank,
-            descriptor.bRank, descriptor.outputRank, descriptor.elements, descriptor.operation,
+            pointer(a, `${node.opType} row input a`), pointer(b, `${node.opType} row input b`),
+            pointer(output, `${node.opType} row output`), executionDescriptor.aShapePointer,
+            executionDescriptor.bShapePointer, executionDescriptor.outputShapePointer,
+            executionDescriptor.aRank, executionDescriptor.bRank, executionDescriptor.outputRank,
+            executionDescriptor.elements, executionDescriptor.operation,
           );
           if (result !== 1) throw new Error(`WASM ${node.opType} node ${node.id} rejected its canonical descriptor.`);
           if (relu) {
-            const outputPointer = this.pointers.get(descriptor.output.name);
+            const outputPointer = pointer(output, `${node.opType} row output`);
             this.api.clip_f32(
-              outputPointer, outputPointer, descriptor.elements, 0,
+              outputPointer, outputPointer, executionDescriptor.elements, 0,
               relu === 2 ? 6 : Number.POSITIVE_INFINITY,
             );
           }
-       } else if (node.opType === "Conv1D") {
+       } else if (kernelRoute === "comparison") {
+          const descriptor = this.nodeMetadata.get(node);
+          if (!descriptor || descriptor.kind !== 'comparison') {
+            throw new Error(`WASM ${node.opType} node ${node.id} has no compiled portable descriptor.`);
+          }
+          const result = this.api.compare_broadcast_i32(
+            this.pointers.get(descriptor.a.name), this.pointers.get(descriptor.b.name),
+            this.pointers.get(descriptor.output.name), descriptor.aShapePointer,
+            descriptor.bShapePointer, descriptor.outputShapePointer,
+            descriptor.aRank, descriptor.bRank, descriptor.kernelRank,
+            descriptor.elements, descriptor.operation,
+          );
+          if (result !== 1) {
+            throw new Error(`WASM ${node.opType} node ${node.id} rejected its canonical descriptor.`);
+          }
+       } else if (kernelRoute === "not") {
+          const descriptor = this.nodeMetadata.get(node);
+          if (!descriptor || descriptor.kind !== 'not') {
+            throw new Error(`WASM Not node ${node.id} has no compiled portable descriptor.`);
+          }
+          const result = this.api.not_i32(
+            this.pointers.get(descriptor.input.name),
+            this.pointers.get(descriptor.output.name), descriptor.elements,
+          );
+          if (result !== 1) throw new Error(`WASM Not node ${node.id} rejected its canonical descriptor.`);
+       } else if (kernelRoute === "conv1d") {
           const inShape = node.inputs.input.shape;
           const wShape = node.inputs.weight.shape;
           const [st] = normalizeSpatialPair(node.params.stride, 1);
@@ -3177,7 +3685,7 @@ export class WasmEngine extends BackendEngine {
                 inShape[1], inShape[2], wShape[0], wShape[1], wShape[2], st, pd, groups, relu
             );
           }
-       } else if (node.opType === "UpsampleNearest2D" || node.opType === "Upsample2x") {
+       } else if (kernelRoute === "upsample-nearest2d") {
           const input = node.inputs.input || node.inputs.x;
           const output = portableOutput(node);
           if (!portableF32Tensor(input) || !portableF32Tensor(output) || input.shape.length !== 4 ||
@@ -3195,7 +3703,7 @@ export class WasmEngine extends BackendEngine {
             this.api.upsample_nearest2x_f32(inputPtr + batchIndex * inputBatchBytes,
               outputPtr + batchIndex * outputBatchBytes, channels, height, width);
           }
-       } else if (node.opType === "Concat" || node.opType === "Concat2") {
+       } else if (kernelRoute === "concat") {
           const quantizedDescriptor = this.nodeMetadata.get(node);
           if (quantizedDescriptor?.kind === 'quantizedConcat') {
             let axisOffset = 0;
@@ -3213,16 +3721,22 @@ export class WasmEngine extends BackendEngine {
             const descriptor = portableConcatDescriptor(node);
             let axisOffset = 0;
             for (const [, input] of descriptor.entries) {
-              const result = this.api.concat_slice_f32(
-                this.pointers.get(input.name), this.pointers.get(descriptor.output.name),
-                descriptor.outer, input.shape[descriptor.axis], descriptor.outputAxis,
-                descriptor.inner, axisOffset, descriptor.sigmoid ? 1 : 0,
-              );
+              const result = descriptor.dtype === 'int32'
+                ? this.api.concat_slice_u32(
+                  this.pointers.get(input.name), this.pointers.get(descriptor.output.name),
+                  descriptor.outer, input.shape[descriptor.axis], descriptor.outputAxis,
+                  descriptor.inner, axisOffset,
+                )
+                : this.api.concat_slice_f32(
+                  this.pointers.get(input.name), this.pointers.get(descriptor.output.name),
+                  descriptor.outer, input.shape[descriptor.axis], descriptor.outputAxis,
+                  descriptor.inner, axisOffset, descriptor.sigmoid ? 1 : 0,
+                );
               if (result !== 1) throw new Error(`WASM Concat node ${node.id} rejected its canonical descriptor.`);
               axisOffset += input.shape[descriptor.axis];
             }
           }
-       } else if (node.opType === "ProfileY") {
+       } else if (kernelRoute === "profile-y") {
           const inShape = node.inputs.input.shape;
           const inputBatchBytes = inShape[1] * inShape[2] * inShape[3] * 4;
           const outputBatchBytes = 2 * inShape[3] * inShape[1] * 4;
@@ -3230,7 +3744,7 @@ export class WasmEngine extends BackendEngine {
             this.api.profile_y_f32(inPtr + batch * inputBatchBytes, outPtr + batch * outputBatchBytes,
                                    inShape[3], inShape[1], inShape[2]);
           }
-       } else if (node.opType === "ProfileX") {
+       } else if (kernelRoute === "profile-x") {
           const inShape = node.inputs.input.shape;
           const inputBatchBytes = inShape[1] * inShape[2] * inShape[3] * 4;
           const outputBatchBytes = 2 * inShape[3] * inShape[2] * 4;
@@ -3238,7 +3752,7 @@ export class WasmEngine extends BackendEngine {
             this.api.profile_x_f32(inPtr + batch * inputBatchBytes, outPtr + batch * outputBatchBytes,
                                    inShape[3], inShape[1], inShape[2]);
           }
-       } else if (node.opType === "InterpLinear1D" || node.opType === "Interp1D") {
+       } else if (kernelRoute === "interpolate1d") {
           const input = node.inputs.input || node.inputs.x;
           const output = portableOutput(node);
           if (!portableF32Tensor(input) || !portableF32Tensor(output) || input.shape.length !== 3 ||
@@ -3255,7 +3769,7 @@ export class WasmEngine extends BackendEngine {
             this.api.interp1d_f32(inputPtr + batchIndex * inputBatchBytes,
               outputPtr + batchIndex * outputBatchBytes, channels, inputLength, outputLength);
           }
-       } else if (node.opType === "SpatialSoftargmaxY") {
+       } else if (kernelRoute === "spatial-softargmax-y") {
            const inShape = node.inputs.input.shape;
            const inputBatchBytes = inShape[1] * inShape[2] * inShape[3] * 4;
            const outputBatchBytes = inShape[3] * inShape[2] * 4;
@@ -3264,29 +3778,63 @@ export class WasmEngine extends BackendEngine {
                                                outPtr + batch * outputBatchBytes,
                                                inShape[3], inShape[1], inShape[2]);
            }
-        } else if (node.opType === "Sigmoid") {
+        } else if (kernelRoute === "sigmoid") {
            const inS = node.inputs.input.shape;
            const elements = inS.reduce((a,b)=>a*b, 1);
            this.api.sigmoid_f32(inPtr, outPtr, elements);
-        } else if (node.opType === "Clip") {
-           let minVal = node.params.min !== undefined ? node.params.min : -1e9;
-           let maxVal = node.params.max !== undefined ? node.params.max : 1e9;
+        } else if (kernelRoute === "clip") {
+           const input = node.inputs.input || node.inputs.x || node.inputs.data;
+           const output = portableOutput(node);
+           const elements = portableTensorElements(input);
+           if (!portable32BitTensor(input) || output?.dtype !== input?.dtype ||
+               !portable32BitTensor(output) || portableTensorElements(output) !== elements) {
+             throw new Error(`WASM Clip node ${node.id} requires equal-size same-dtype F32/I32 tensors.`);
+           }
+           if (elements == null) {
+             throw new Error(`WASM Clip node ${node.id} has invalid tensor storage.`);
+           }
+           let minVal = node.params?.min ?? (input.dtype === 'int32' ? -2147483648 : -Infinity);
+           let maxVal = node.params?.max ?? (input.dtype === 'int32' ? 2147483647 : Infinity);
            if (node.inputs.min) {
               const p = this.pointers.get(node.inputs.min.name);
-              minVal = new Float32Array(this.mem.buffer, p, 1)[0];
+              if (node.inputs.min.dtype !== input.dtype || portableTensorElements(node.inputs.min) !== 1) {
+                throw new Error(`WASM Clip node ${node.id} min must be a scalar with the input dtype.`);
+              }
+              minVal = input.dtype === 'int32'
+                ? new Int32Array(this.mem.buffer, p, 1)[0]
+                : new Float32Array(this.mem.buffer, p, 1)[0];
            }
            if (node.inputs.max) {
               const p = this.pointers.get(node.inputs.max.name);
-              maxVal = new Float32Array(this.mem.buffer, p, 1)[0];
+              if (node.inputs.max.dtype !== input.dtype || portableTensorElements(node.inputs.max) !== 1) {
+                throw new Error(`WASM Clip node ${node.id} max must be a scalar with the input dtype.`);
+              }
+              maxVal = input.dtype === 'int32'
+                ? new Int32Array(this.mem.buffer, p, 1)[0]
+                : new Float32Array(this.mem.buffer, p, 1)[0];
            }
-           const inS = node.inputs.input.shape;
-           const elements = inS.reduce((a,b)=>a*b, 1);
-           this.api.clip_f32(inPtr, outPtr, elements, minVal, maxVal);
-        } else if (node.opType === "HardSwish") {
+           if (typeof minVal !== 'number' || typeof maxVal !== 'number' ||
+               Number.isNaN(minVal) || Number.isNaN(maxVal) || minVal > maxVal ||
+               (input.dtype === 'int32' &&
+                (!Number.isInteger(minVal) || !Number.isInteger(maxVal) ||
+                 minVal < -2147483648 || maxVal > 2147483647))) {
+             throw new Error(`WASM Clip node ${node.id} has invalid bounds.`);
+           }
+           const result = input.dtype === 'int32'
+             ? this.api.clip_i32(
+               this.pointers.get(input.name), this.pointers.get(output.name),
+               elements, minVal, maxVal,
+             )
+             : (this.api.clip_f32(
+               this.pointers.get(input.name), this.pointers.get(output.name),
+               elements, minVal, maxVal,
+             ), 1);
+           if (result !== 1) throw new Error(`WASM Clip node ${node.id} rejected its typed descriptor.`);
+        } else if (kernelRoute === "hard-swish") {
            const inS = node.inputs.input.shape;
            const elements = inS.reduce((a,b)=>a*b, 1);
            this.api.hardswish_f32(inPtr, outPtr, elements);
-       } else if (node.opType === "LeakyReLU") {
+       } else if (kernelRoute === "leaky-relu") {
            const input = node.inputs.input || node.inputs.x;
            const output = portableOutput(node);
            const elements = portableTensorElements(input);
@@ -3296,7 +3844,7 @@ export class WasmEngine extends BackendEngine {
            }
            const alpha = node.params?.alpha ?? 0.01;
            this.api.leakyrelu_f32(this.pointers.get(input.name), this.pointers.get(output.name), elements, alpha);
-       } else if (node.opType === "PReLU") {
+       } else if (kernelRoute === "prelu") {
            const input = node.inputs.input || node.inputs.x;
            const slope = node.inputs.slope || node.inputs.weight;
            const output = portableOutput(node);
@@ -3314,24 +3862,34 @@ export class WasmEngine extends BackendEngine {
              elements, slopeElements, channels,
            );
            if (result !== 1) throw new Error(`WASM PReLU node ${node.id} rejected its canonical descriptor.`);
-        } else if (node.opType === "HardSigmoid") {
+        } else if (kernelRoute === "hard-sigmoid") {
            const inS = node.inputs.input.shape;
            const elements = inS.reduce((a,b)=>a*b, 1);
            this.api.hardsigmoid_f32(inPtr, outPtr, elements);
-        } else if (node.opType === "Transpose") {
+        } else if (kernelRoute === "transpose") {
            const descriptor = this.nodeMetadata.get(node);
            if (!descriptor || descriptor.kind !== 'transpose') {
              throw new Error(`WASM Transpose node ${node.id} has no compiled portable descriptor.`);
            }
-           const result = this.api.transpose_nd_f32(
-             this.pointers.get(descriptor.input.name), this.pointers.get(descriptor.output.name),
-             descriptor.shapePointer, descriptor.permPointer, descriptor.rank, descriptor.elements,
-           );
+           const inputPointer = this.pointers.get(descriptor.input.name);
+           const outputPointer = this.pointers.get(descriptor.output.name);
+           const result = descriptor.byteDtype != null
+             ? this.api.transpose_nd_i8u8(
+               inputPointer, outputPointer, descriptor.shapePointer,
+               descriptor.permPointer, descriptor.rank, descriptor.elements,
+               descriptor.byteDtype,
+             )
+             : (descriptor.dtype === 'int32'
+               ? this.api.transpose_nd_u32
+               : this.api.transpose_nd_f32)(
+               inputPointer, outputPointer, descriptor.shapePointer,
+               descriptor.permPointer, descriptor.rank, descriptor.elements,
+             );
            if (result !== 1) throw new Error(`WASM Transpose node ${node.id} rejected its canonical descriptor.`);
-        } else if (node.opType === "GlobalAveragePool") {
+        } else if (kernelRoute === "global-average-pool") {
            const inShape = node.inputs.input.shape;
            this.api.global_average_pool_f32(inPtr, outPtr, inShape[0], inShape[1], inShape[2], inShape[3]);
-        } else if (node.opType === "BatchNorm2D") {
+        } else if (kernelRoute === "batchnorm2d") {
            const wPtr = this.pointers.get(node.inputs.weight.name);
            const bPtr = this.pointers.get(node.inputs.bias.name);
            const rmPtr = this.pointers.get(node.inputs.running_mean.name);
@@ -3339,7 +3897,7 @@ export class WasmEngine extends BackendEngine {
            const [b, h, w, c] = node.inputs.input.shape;
            const eps = node.params.eps || 1e-5;
            this.api.batch_norm2d_f32(inPtr, wPtr, bPtr, rmPtr, rvPtr, outPtr, b, h, w, c, eps);
-        } else if (node.opType === "ResizeNearest2D" || node.opType === "Resize") {
+        } else if (kernelRoute === "resize") {
            const input = node.inputs.input || node.inputs.x;
            const output = portableOutput(node);
            const quantizedDescriptor = this.nodeMetadata.get(node);
@@ -3372,7 +3930,7 @@ export class WasmEngine extends BackendEngine {
                  inputHeight, inputWidth, channels, outputHeight, outputWidth);
              }
            }
-       } else if (node.opType === "Cast") {
+       } else if (kernelRoute === "cast") {
            const input = node.inputs.input || node.inputs.x || node.inputs.data;
            const output = node.outputs.out || Object.values(node.outputs || {})[0];
            if (!input || !output || input.shape.reduce((a, b) => a * b, 1) !== output.shape.reduce((a, b) => a * b, 1)) {
@@ -3383,23 +3941,30 @@ export class WasmEngine extends BackendEngine {
            const result = this.api.cast_typed(inputPtr, wasmDtypeCode(input.dtype), outputPtr,
              wasmDtypeCode(output.dtype), output.shape.reduce((a, b) => a * b, 1));
            if (result !== 1) throw new Error(`WASM Cast node ${node.id} rejected its dtype or shape.`);
-        } else if (node.opType === "DequantizeLinear") {
-           const input = node.inputs.input || node.inputs.x;
-           const scale = node.inputs.scale;
-           const zeroPoint = node.inputs.zero_point || null;
-           const output = node.outputs.out || Object.values(node.outputs || {})[0];
+        } else if (kernelRoute === "dequantize-linear") {
+           const executionNode = decodeNode || node;
+           const input = executionNode.inputs.input || executionNode.inputs.x;
+           const scale = executionNode.inputs.scale;
+           const zeroPoint = executionNode.inputs.zero_point || null;
+           const output = portableOutput(executionNode);
+           const elements = portableTensorElements(output);
            if (!input || !scale || !output || scale.dtype !== 'float32' || scale.sizeBytes !== 4 ||
-               output.dtype !== 'float32' || input.shape.reduce((a, b) => a * b, 1) !== output.shape.reduce((a, b) => a * b, 1) ||
+               output.dtype !== 'float32' || elements == null ||
+               portableTensorElements(input) !== elements ||
                (zeroPoint && zeroPoint.sizeBytes !== Tensor.dtypeBytes(zeroPoint.dtype))) {
              throw new Error(`WASM DequantizeLinear node ${node.id} requires scalar scale/zero-point and matching output.`);
            }
            const result = this.api.dequantize_linear_typed(
-             this.pointers.get(input.name), wasmDtypeCode(input.dtype), this.pointers.get(scale.name),
+             decodeNode ? wasmTensorPointer(input, this.mem, 'DequantizeLinear row input') :
+               this.pointers.get(input.name),
+             wasmDtypeCode(input.dtype), this.pointers.get(scale.name),
              zeroPoint ? this.pointers.get(zeroPoint.name) : 0, zeroPoint ? wasmDtypeCode(zeroPoint.dtype) : 0,
-             this.pointers.get(output.name), output.shape.reduce((a, b) => a * b, 1),
+             decodeNode ? wasmTensorPointer(output, this.mem, 'DequantizeLinear row output') :
+               this.pointers.get(output.name),
+             elements,
            );
            if (result !== 1) throw new Error(`WASM DequantizeLinear node ${node.id} rejected its dtype or shape.`);
-        } else if (node.opType === "RequantizeLinear") {
+        } else if (kernelRoute === "requantize-linear") {
            const descriptor = this.nodeMetadata.get(node);
            if (descriptor?.kind !== 'requantizeLinear') {
              throw new Error(`WASM RequantizeLinear node ${node.id} has no canonical typed descriptor.`);
@@ -3411,11 +3976,12 @@ export class WasmEngine extends BackendEngine {
              descriptor.inputDtype, descriptor.outputDtype,
            );
            if (result !== 1) throw new Error(`WASM RequantizeLinear node ${node.id} rejected its typed descriptor.`);
-        } else if (node.opType === "QuantizeLinear") {
-           const input = node.inputs.input || node.inputs.x || node.inputs.data;
-           const scale = node.inputs.scale;
-           const zeroPoint = node.inputs.zero_point || null;
-           const output = node.outputs.out || Object.values(node.outputs || {})[0];
+        } else if (kernelRoute === "quantize-linear") {
+           const executionNode = decodeNode || node;
+           const input = executionNode.inputs.input || executionNode.inputs.x || executionNode.inputs.data;
+           const scale = executionNode.inputs.scale;
+           const zeroPoint = executionNode.inputs.zero_point || null;
+           const output = portableOutput(executionNode);
            const inputElements = portableTensorElements(input);
            const outputElements = portableTensorElements(output);
            const scaleElements = portableTensorElements(scale);
@@ -3437,48 +4003,77 @@ export class WasmEngine extends BackendEngine {
              throw new Error(`WASM QuantizeLinear node ${node.id} scale/zero_point inputs do not match its output quantization metadata.`);
            }
            const result = this.api.quantize_linear_typed(
-             this.pointers.get(input.name), this.pointers.get(scale.name),
+             decodeNode ? wasmTensorPointer(input, this.mem, 'QuantizeLinear row input') :
+               this.pointers.get(input.name),
+             this.pointers.get(scale.name),
              zeroPoint ? this.pointers.get(zeroPoint.name) : 0,
              zeroPoint ? wasmDtypeCode(zeroPoint.dtype) : 0,
-             this.pointers.get(output.name), wasmDtypeCode(output.dtype), inputElements,
+             decodeNode ? wasmTensorPointer(output, this.mem, 'QuantizeLinear row output') :
+               this.pointers.get(output.name),
+             wasmDtypeCode(output.dtype), inputElements,
            );
            if (result !== 1) throw new Error(`WASM QuantizeLinear node ${node.id} rejected its scalar quantization descriptor.`);
-        } else if (node.opType === "Slice") {
+        } else if (kernelRoute === "slice") {
            const descriptor = this.nodeMetadata.get(node);
            if (!descriptor || descriptor.kind !== 'slice') {
              throw new Error(`WASM Slice node ${node.id} has no compiled portable descriptor.`);
            }
-           const result = this.api.slice_nd_f32(
+           const kernel = descriptor.dtype === 'int32'
+             ? this.api.slice_nd_u32
+             : this.api.slice_nd_f32;
+           const result = kernel(
              this.pointers.get(descriptor.input.name), this.pointers.get(descriptor.output.name),
              descriptor.inputShapePointer, descriptor.outputShapePointer,
              descriptor.startsPointer, descriptor.stepsPointer,
              descriptor.rank, descriptor.elements,
            );
            if (result !== 1) throw new Error(`WASM Slice node ${node.id} rejected its canonical descriptor.`);
-        } else if (node.opType === "Expand" || node.opType === "Broadcast") {
+        } else if (kernelRoute === "expand") {
            const descriptor = this.nodeMetadata.get(node);
            if (!descriptor || descriptor.kind !== 'expand') {
              throw new Error(`WASM ${node.opType} node ${node.id} has no compiled portable descriptor.`);
            }
-           const result = this.api.expand_nd_f32(
-             this.pointers.get(descriptor.input.name), this.pointers.get(descriptor.output.name),
-             descriptor.inputShapePointer, descriptor.outputShapePointer, descriptor.inputRank,
-             descriptor.outputRank, descriptor.elements,
+           const executionDescriptor = decodeNode ? descriptor.incrementalRow : descriptor;
+           if (!executionDescriptor) {
+             throw new Error(`WASM Expand node ${node.id} has no correctness-safe incremental row descriptor.`);
+           }
+           const executionNode = decodeNode || node;
+           const input = executionNode.inputs.input || executionNode.inputs.x || executionNode.inputs.data;
+           const output = portableOutput(executionNode);
+           const pointer = (tensor, label) => decodeNode
+             ? wasmTensorPointer(tensor, this.mem, label)
+             : this.pointers.get(tensor.name);
+           const kernel = executionDescriptor.byteStorage
+             ? this.api.expand_nd_i8u8
+             : executionDescriptor.dtype === 'int32'
+               ? this.api.expand_nd_u32
+               : this.api.expand_nd_f32;
+           const result = kernel(
+             pointer(input, 'Expand row input'), pointer(output, 'Expand row output'),
+             executionDescriptor.inputShapePointer, executionDescriptor.outputShapePointer,
+             executionDescriptor.inputRank, executionDescriptor.outputRank,
+             executionDescriptor.elements,
            );
            if (result !== 1) throw new Error(`WASM ${node.opType} node ${node.id} rejected its canonical descriptor.`);
-        } else if (node.opType === "Split") {
+        } else if (kernelRoute === "split") {
            const descriptor = portableSplitDescriptor(node);
            let axisOffset = 0;
            for (const [, output] of descriptor.outputEntries) {
-             const result = this.api.split_slice_f32(
-               this.pointers.get(descriptor.input.name), this.pointers.get(output.name),
-               descriptor.outer!, descriptor.inputAxis, descriptor.outputAxis,
-               descriptor.inner!, axisOffset,
-             );
+             const result = descriptor.dtype === 'int32'
+               ? this.api.split_slice_u32(
+                 this.pointers.get(descriptor.input.name), this.pointers.get(output.name),
+                 descriptor.outer!, descriptor.inputAxis, descriptor.outputAxis,
+                 descriptor.inner!, axisOffset,
+               )
+               : this.api.split_slice_f32(
+                 this.pointers.get(descriptor.input.name), this.pointers.get(output.name),
+                 descriptor.outer!, descriptor.inputAxis, descriptor.outputAxis,
+                 descriptor.inner!, axisOffset,
+               );
              if (result !== 1) throw new Error(`WASM Split node ${node.id} rejected its canonical descriptor.`);
              axisOffset += descriptor.outputAxis;
            }
-        } else if (node.opType === "Gather") {
+        } else if (kernelRoute === "gather") {
            const descriptor = this.nodeMetadata.get(node);
            if (!descriptor || descriptor.kind !== 'gather') {
              throw new Error(`WASM Gather node ${node.id} has no compiled portable descriptor.`);
@@ -3489,7 +4084,7 @@ export class WasmEngine extends BackendEngine {
              descriptor.inner, descriptor.indicesElements, descriptor.outputElements,
            );
            if (result !== 1) throw new Error(`WASM Gather node ${node.id} rejected its canonical descriptor.`);
-        } else if (node.opType === "GatherElements") {
+        } else if (kernelRoute === "gather-elements") {
            const descriptor = this.nodeMetadata.get(node);
            if (!descriptor || descriptor.kind !== 'gatherElements') {
              throw new Error(`WASM GatherElements node ${node.id} has no compiled portable descriptor.`);
@@ -3500,7 +4095,7 @@ export class WasmEngine extends BackendEngine {
              descriptor.indicesShapePointer, descriptor.rank, descriptor.axis, descriptor.elements,
            );
            if (result !== 1) throw new Error(`WASM GatherElements node ${node.id} rejected its canonical descriptor.`);
-        } else if (node.opType === "NonMaxSuppression") {
+        } else if (kernelRoute === "non-max-suppression") {
            const boxes = node.inputs.boxes;
            const scores = node.inputs.scores;
            const output = node.outputs.out;
@@ -3526,18 +4121,18 @@ export class WasmEngine extends BackendEngine {
              scalar('max_output_boxes_per_class', 0), scalar('iou_threshold', 0.5),
              scalar('score_threshold', 0),
            );
-         } else if (node.opType === "Where" || node.opType === "Mask") {
+         } else if (kernelRoute === "where") {
            const descriptor = this.nodeMetadata.get(node);
            if (!descriptor || descriptor.kind !== 'where') {
              throw new Error(`WASM ${node.opType} node ${node.id} has no compiled portable descriptor.`);
            }
-           const result = this.api.where_typed_f32(
+           const result = this.api.where_typed_32(
              this.pointers.get(descriptor.condition.name), descriptor.conditionType,
              this.pointers.get(descriptor.a.name), this.pointers.get(descriptor.b.name),
-             this.pointers.get(descriptor.output.name), descriptor.elements,
+             this.pointers.get(descriptor.output.name), descriptor.elements, descriptor.dataType,
            );
            if (result !== 1) throw new Error(`WASM ${node.opType} node ${node.id} rejected its canonical descriptor.`);
-         } else if (node.opType === "Pad") {
+         } else if (kernelRoute === "pad") {
            const input = node.inputs.input || node.inputs.data;
            const output = node.outputs.out;
            const inputPtr = this.pointers.get(input.name);
@@ -3554,7 +4149,7 @@ export class WasmEngine extends BackendEngine {
            const inShape = input.shape;
            const s = inShape.length === 4 ? inShape : [1, inShape[0] || 1, inShape[1] || 1, 1];
            this.api.pad_2d_f32(inputPtr, outputPtr, val, s[0], s[1], s[2], s[3], pt, pb, pl, pr);
-         } else if (node.opType === "AveragePool2D" || node.opType === "AveragePool") {
+         } else if (kernelRoute === "average-pool2d") {
            const input = node.inputs.input || node.inputs.x;
            const output = node.outputs.out;
            const inputPtr = this.pointers.get(input.name);
@@ -3570,7 +4165,7 @@ export class WasmEngine extends BackendEngine {
            const py = node.params.padding ? node.params.padding[0] : 0;
            const px = node.params.padding ? node.params.padding[1] : 0;
            this.api.averagepool2d_f32(inputPtr, outputPtr, b, in_h, in_w, c, ky, kx, sy, sx, py, px, out_h, out_w);
-        } else if (node.opType === "MaxPool2D") {
+        } else if (kernelRoute === "max-pool2d") {
            const quantizedDescriptor = this.nodeMetadata.get(node);
            if (quantizedDescriptor?.kind === 'quantizedMaxPool') {
              const result = this.api.maxpool2d_i8u8(
@@ -3593,7 +4188,7 @@ export class WasmEngine extends BackendEngine {
              const px = node.params.padding ? node.params.padding[1] : 0;
              this.api.maxpool2d_f32(inPtr, outPtr, inShape[1], inShape[2], inShape[3], outShape[1], outShape[2], ky, kx, sy, sx, py, px);
            }
-        } else if (node.opType === "MeanHeight") {
+        } else if (kernelRoute === "mean-height") {
            const inShape = node.inputs.input.shape;
            const inputBatchBytes = inShape[1] * inShape[2] * inShape[3] * 4;
            const outputBatchBytes = inShape[3] * inShape[2] * 4;
@@ -3602,11 +4197,41 @@ export class WasmEngine extends BackendEngine {
                                       outPtr + batch * outputBatchBytes,
                                       inShape[3], inShape[1], inShape[2]);
            }
-        } else if (node.opType === "Dropout") {
+        } else if (kernelRoute === "dropout") {
             // compile() aliases the output heap pointer to the input.
-        } else if (node.opType === "Flatten" || node.opType === "Squeeze" || node.opType === "Unsqueeze" || node.opType === "Reshape" || node.opType === "Identity") {
+        } else if (kernelRoute === "shape-copy") {
             const quantizedDescriptor = this.nodeMetadata.get(node);
-            if (quantizedDescriptor?.kind === 'quantizedShapeCopy') {
+            if (decodeNode) {
+              const input = decodeNode.inputs.input || decodeNode.inputs.x ||
+                decodeNode.inputs.data;
+              const output = portableOutput(decodeNode);
+              const elements = portableTensorElements(input);
+              if (!input || !output ||
+                  !['float32', 'int32', 'int8', 'uint8'].includes(input.dtype) ||
+                  output.dtype !== input.dtype || elements == null ||
+                  portableTensorElements(output) !== elements) {
+                throw new Error(
+                  `WASM ${node.opType} node ${node.id} requires an equal-size same-dtype incremental row.`,
+                );
+              }
+              const inputPointer = wasmTensorPointer(
+                input, this.mem, `${node.opType} row input`,
+              );
+              const outputPointer = wasmTensorPointer(
+                output, this.mem, `${node.opType} row output`,
+              );
+              const dtype = wasmDtypeCode(input.dtype);
+              const result = input.dtype === 'int8' || input.dtype === 'uint8'
+                ? this.api.copy_i8u8(inputPointer, outputPointer, elements, dtype)
+                : this.api.cast_typed(
+                    inputPointer, dtype, outputPointer, dtype, elements,
+                  );
+              if (result !== 1) {
+                throw new Error(
+                  `WASM ${node.opType} node ${node.id} rejected its incremental row copy.`,
+                );
+              }
+            } else if (quantizedDescriptor?.kind === 'quantizedShapeCopy') {
               const result = this.api.copy_i8u8(
                 this.pointers.get(quantizedDescriptor.input.name),
                 this.pointers.get(quantizedDescriptor.output.name),
@@ -3637,6 +4262,20 @@ export class WasmEngine extends BackendEngine {
       } catch (e) {
           console.error("[WasmEngine] Execution failed at node:", node, e);
           throw e;
+      } finally {
+        if (profile) {
+          // Setting __VOLVOX_WASM_PROFILE_SHAPES keys by shape as well as
+          // opType. Aggregating by opType alone hides the question that
+          // usually matters — cost *per node* on identical work — because two
+          // packages rarely run the same operator the same number of times.
+          const shape = node.inputs?.q?.shape ?? node.outputs?.out?.shape;
+          const key = (globalThis as any).__VOLVOX_WASM_PROFILE_SHAPES && shape
+            ? `${node.opType}[${shape.join(',')}]` : node.opType;
+          const entry = profile.get(key) || { ms: 0, count: 0 };
+          entry.ms += performance.now() - profileStart;
+          entry.count += 1;
+          profile.set(key, entry);
+        }
       }
     }
 
@@ -3645,7 +4284,11 @@ export class WasmEngine extends BackendEngine {
     for (const name of this.graph.outputNames) {
         const tensor = this.graph.tensors.get(name);
         const ptr = this.pointers.get(name);
-        results[name] = wasmTensorView(tensor, this.mem.buffer, ptr).slice();
+        // Built-in provider contexts capture host outputs into result-owned
+        // storage before another execution can reuse this arena. Publishing the
+        // arena view here avoids first making an identical transient copy; the
+        // public ExecutionResult remains a stable snapshot.
+        results[name] = wasmTensorView(tensor, this.mem.buffer, ptr);
     }
     return results;
   }

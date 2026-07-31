@@ -1,7 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
-import { ModelBuilder, VolvoxAI } from '../../../ts/full.js';
+import { ModelBuilder, importModelCheckpoint } from '../../../ts/full.js';
+import { createCPUTrainingHarness } from '../../../tests/helpers/training_session.mjs';
 import { buildEncoderDecoderTransformer } from '../Seq2SeqBuilder.js';
 
 test('NHWC Conv2D + GroupNorm image features train through a multimodal encoder-decoder', async () => {
@@ -76,15 +77,26 @@ test('NHWC Conv2D + GroupNorm image features train through a multimodal encoder-
   );
   teacher.inputs[image.name] = Float32Array.from({ length: batchSize * 4 * 4 }, (_, index) =>
     ((index * 7) % 19 - 9) / 10);
-  const result = await new VolvoxAI().trainStep(graph, {
-    ...teacher,
-    updateMode: 'adamw',
-    optimizer: { learningRate: 2e-3, maxGradNorm: 1 },
-  });
+  const training = createCPUTrainingHarness();
+  let result;
+  let trained;
+  try {
+    result = await training.runStep(graph, {
+      ...teacher,
+      updateMode: 'adamw',
+      optimizer: { learningRate: 2e-3, maxGradNorm: 1 },
+    });
+    trained = importModelCheckpoint(await training.exportCheckpoint(graph)).graph;
+  } finally {
+    await training.close();
+  }
 
   assert.ok(Number.isFinite(result.loss));
   assert.equal(result.examples, 3);
-  assert.equal(graph.trainingStep, 1);
-  assert.ok(convolution.buffer.some((value, index) => value !== before[index]));
-  assert.equal(result.updatedTensors.length, model.trainableTensors.length);
+  assert.equal(graph.trainingStep, 0, 'Trainer must not mutate caller-owned graph state');
+  assert.deepEqual(convolution.buffer, before);
+  assert.equal(trained.trainingStep, 1);
+  assert.ok(trained.getTensor(convolution.name).buffer
+    .some((value, index) => value !== before[index]));
+  assert.equal(result.updatedTensorNames.length, model.trainableTensors.length);
 });

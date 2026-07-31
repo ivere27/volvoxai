@@ -54,6 +54,14 @@ fp16  (2 bytes)  [S][ 5-bit exp ][   10-bit mantissa   ]              ~3 decimal
   smaller (big/small values can overflow/underflow), and — crucially — a GPU must *support*
   fp16 math to get a speedup. (See §6.5 for why Volvox is cautious with it in browsers.)
 
+> 🔬 **Under the hood: floats bend the ruler; ints don't.** A float's value is
+> `sign × 1.mantissa × 2^(exp − bias)`, so its ticks are **not** evenly spaced — they're dense near
+> zero and spread out for large magnitudes (about 7 significant digits *wherever* you are). That suits
+> weights, which cluster near 0 but occasionally spike. `int8` is the opposite: **256 evenly-spaced**
+> ticks, so you must place the ruler carefully (§6.2). fp16 also trades range for size — its exponent
+> tops out near **±65504**, so a value that's fine in fp32 can overflow to infinity in fp16, which is
+> why mixing fp16 in needs care.
+
 ### Integer (int8): "a ruler with 256 evenly-spaced ticks"
 
 > 🌱 **Idea.** An **int8** can only be a whole number from −128 to 127 — just 256 choices. That's way
@@ -110,6 +118,13 @@ nearly free.
 > Each output channel gets its own `weight_scale` (you saw `weight_scale: "w1"` as a *tensor* input
 > to `QConv2D`). This "per-channel quantization" is what keeps int8 accuracy within ~1% of fp32.
 
+> 🔬 **Under the hood: symmetric vs asymmetric.** When `zero_point = 0` the map is **symmetric** — real
+> 0 lands exactly on integer 0 — the usual choice for **weights** (they're roughly centered on 0),
+> often over the *narrow* range `[−127, 127]` so it stays balanced. **Activations** are frequently
+> one-sided (a ReLU output is ≥ 0), so they use an **asymmetric** map with a non-zero `zero_point` to
+> spend all 256 ticks on the range actually used. VolvoxAI's authoring path offers both — the symmetric
+> and asymmetric schemes you met in [Chapter 9C §9C.12](09c-cuda-backend.md).
+
 ---
 
 ## 6.3 A worked example (real numbers from the model)
@@ -134,6 +149,12 @@ Later, recover it:
 The 0.003 error is **quantization noise**. Spread across a big dot product, these tiny rounding
 errors mostly cancel — which is why an 8-bit model still detects dogs correctly.
 
+> 🔬 **Under the hood: round-half-to-even.** The `round()` here is **banker's rounding**
+> (round-half-to-even): `12.5 → 12`, `13.5 → 14`. Using it — rather than always rounding halves up —
+> keeps the quantization error **unbiased**, so the 0.003-sized noises really do cancel over a long sum
+> instead of all leaning the same way. Every backend rounds identically on purpose (the CUDA authoring
+> kernel uses `cvt.rni`, round-to-nearest-even, for exactly this — Chapter 9C §9C.12).
+
 ---
 
 ## 6.4 How int8 convolution actually runs (`QConv2D`)
@@ -142,6 +163,10 @@ errors mostly cancel — which is why an 8-bit model still detects dogs correctl
 > mountain of multiply-and-add in fast *integer* arithmetic, and only convert back to a real number
 > once at the very end. The whole picture stays in "ticket" form from layer to layer — a "quantized
 > island" — which is what makes int8 both small *and* fast.
+>
+> *Why integers are faster:* a chip can pack many int8 multiply-adds into a single instruction (8, 16,
+> even 32 at once) where only a few floats would fit — so int8 isn't merely smaller on disk, it lets
+> the same hardware do more multiply-adds per clock tick.
 
 🔬 A quantized conv does its heavy multiply-accumulate loop in **cheap integer arithmetic**, and
 only converts back to a real number once at the very end. The pipeline for one output value
@@ -173,6 +198,13 @@ whole backbone runs in bytes. Only at the very end does `DequantizeLinear` turn 
 `scores`/`boxes` back into floats you can read. This is exactly what VolvoxAI's native CPU path
 does (`native/src/kernels/quant_cpu_opt.c`); the browser tiers instead fold int8 conv weights back to fp32 at
 load time (simpler, still small on disk).
+
+> 🔬 **Under the hood: why int32, and the requantize multiplier.** The accumulator is **int32** because
+> a dot product of int8s can grow large — up to `K · 127 · 255` for a `K`-tap conv — which overflows
+> int8/int16 but sits comfortably in int32. The rescale factor `M = in_scale · w_scale / out_scale` is a
+> real number in `(0, 1)`; VolvoxAI applies it in **float** for simplicity, but integer-only
+> accelerators implement the *same* `M` as a **fixed-point multiply-plus-shift** so the layer never
+> touches a float. Either way the zero-points are subtracted *inside* the integer accumulate, not after.
 
 ---
 
@@ -210,9 +242,16 @@ load time (simpler, still small on disk).
   CPU/GPU — the sweet spot for portable inference. Volvox skips **int4** because 4-bit needs
   fiddly bit-unpacking that hurts low-end mobile GPUs.
 
+> 🔬 **Under the hood: "smaller" is guaranteed, "faster" isn't automatic.** The 4× is a **storage** win
+> you get everywhere. The *speed* win needs hardware that multiplies bytes wide — `DP4A` on NVIDIA,
+> dot-product instructions on ARM, `VNNI` on x86 — otherwise int8 is unpacked to wider ints and you
+> keep the size win but not the throughput win. And that 4× is about **weights on disk**; activation
+> memory at run time depends on whether the path stays int8 (native CPU) or widens to fp32 (the browser
+> tiers, §6.4).
+
 ---
 
-## 6.6 The three configs, side by side
+## 6.6 The three graphs, side by side
 
 🔬 Because precision is a *storage* choice, the graphs are nearly identical — only the conv op and a
 little quant bookkeeping differ:
@@ -229,7 +268,7 @@ fp32 / fp16 graph:            int8 graph:
   scores, boxes (float)         scores, boxes (float)
 ```
 
-That's why the int8 config has **3 extra nodes** (1 `QuantizeLinear` + 2 `DequantizeLinear`) and
+That's why the int8 graph has **3 extra nodes** (1 `QuantizeLinear` + 2 `DequantizeLinear`) and
 its 182 convs are `QConv2D` instead of `Conv2D`. Same detector, three sizes — you pick the point
 on the curve your device needs.
 

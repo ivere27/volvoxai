@@ -1,7 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
-import { ModelBuilder, VolvoxAI } from '../ts/full.js';
+import { ModelBuilder, importModelCheckpoint } from '../ts/full.js';
+import { createCPUTrainingHarness } from './helpers/training_session.mjs';
 
 function buildTwoHeadGraph() {
   const builder = new ModelBuilder();
@@ -54,13 +55,19 @@ function assertArrayClose(actual, expected, tolerance = 1e-6) {
 
 test('one train step combines independently normalized weighted CE objectives', async () => {
   const model = buildTwoHeadGraph();
-  const result = await new VolvoxAI().trainStep(model.graph, {
-    inputs: { x: Float32Array.of(1, -0.5) },
-    losses: objectives(model.lm, model.router, 2, 1),
-    trainableTensors: model.trainableTensors,
-    updateMode: 'sgd',
-    optimizer: { learningRate: 0 },
-  });
+  const training = createCPUTrainingHarness();
+  let result;
+  try {
+    result = await training.runStep(model.graph, {
+      inputs: { x: Float32Array.of(1, -0.5) },
+      losses: objectives(model.lm, model.router, 2, 1),
+      trainableTensors: model.trainableTensors,
+      updateMode: 'sgd',
+      optimizer: { learningRate: 0 },
+    });
+  } finally {
+    await training.close();
+  }
 
   assert.equal(result.losses.length, 2);
   assert.ok(Math.abs(result.loss - result.losses[0].loss - result.losses[1].loss) < 1e-7);
@@ -70,9 +77,9 @@ test('one train step combines independently normalized weighted CE objectives', 
 });
 
 test('full-window normalizers make heterogeneous multi-loss accumulation exact', async () => {
-  const api = new VolvoxAI();
+  const training = createCPUTrainingHarness();
   const accumulated = buildTwoHeadGraph();
-  const first = await api.trainStep(accumulated.graph, {
+  const first = await training.runStep(accumulated.graph, {
     inputs: { x: Float32Array.of(1, -1) },
     losses: objectives(accumulated.lm, accumulated.router, 2, 1, 2),
     trainableTensors: accumulated.trainableTensors,
@@ -82,9 +89,12 @@ test('full-window normalizers make heterogeneous multi-loss accumulation exact',
   });
   assert.equal(first.accumulating, true);
   assert.equal(accumulated.graph.trainingStep, 0);
-  assert.throws(() => api.exportCheckpoint(accumulated.graph), /gradient accumulation is pending/);
+  await assert.rejects(
+    () => training.exportCheckpoint(accumulated.graph),
+    /gradient accumulation is pending/,
+  );
 
-  const second = await api.trainStep(accumulated.graph, {
+  const second = await training.runStep(accumulated.graph, {
     inputs: { x: Float32Array.of(-0.5, 0.25) },
     losses: objectives(accumulated.lm, accumulated.router, 0, 0, 2),
     trainableTensors: accumulated.trainableTensors,
@@ -93,20 +103,22 @@ test('full-window normalizers make heterogeneous multi-loss accumulation exact',
     gradientAccumulationSteps: 2,
   });
   assert.equal(second.accumulating, false);
-  assert.equal(accumulated.graph.trainingStep, 1);
+  const accumulatedCheckpoint = await training.exportCheckpoint(accumulated.graph);
+  assert.equal(importModelCheckpoint(accumulatedCheckpoint).graph.trainingStep, 1);
+  assert.equal(accumulated.graph.trainingStep, 0, 'Trainer must not mutate caller-owned graph state');
   assert.equal(second.losses[0].examples, 2);
   assert.equal(second.losses[1].examples, 2);
   assert.ok(Math.abs(second.loss - second.losses[0].loss - second.losses[1].loss) < 1e-7);
 
   const microA = buildTwoHeadGraph();
-  const resultA = await api.trainStep(microA.graph, {
+  const resultA = await training.runStep(microA.graph, {
     inputs: { x: Float32Array.of(1, -1) },
     losses: objectives(microA.lm, microA.router, 2, 1, 2),
     trainableTensors: microA.trainableTensors,
     updateMode: 'sgd', optimizer: { learningRate: 0 },
   });
   const microB = buildTwoHeadGraph();
-  const resultB = await api.trainStep(microB.graph, {
+  const resultB = await training.runStep(microB.graph, {
     inputs: { x: Float32Array.of(-0.5, 0.25) },
     losses: objectives(microB.lm, microB.router, 0, 0, 2),
     trainableTensors: microB.trainableTensors,
@@ -119,10 +131,11 @@ test('full-window normalizers make heterogeneous multi-loss accumulation exact',
   }
 
   const invalid = buildTwoHeadGraph();
-  await assert.rejects(() => api.trainStep(invalid.graph, {
+  await assert.rejects(() => training.runStep(invalid.graph, {
     inputs: { x: Float32Array.of(1, 1) },
     losses: objectives(invalid.lm, invalid.router, 1, 0),
     trainableTensors: invalid.trainableTensors,
     gradientAccumulationSteps: 2,
   }), /full-window normalizer/);
+  await training.close();
 });

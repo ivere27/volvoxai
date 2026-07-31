@@ -4,7 +4,7 @@ import type { Tensor } from '../core/Tensor.js';
 import { normalizeSpatialPair } from '../ops/spatialParameters.js';
 import { geluApproximation, geluDerivative } from '../ops/gELU.js';
 import { _cpuAttentionMask } from '../ops/sDPA.js';
-import { dropoutContext, dropoutMultiplier } from '../ops/dropout.js';
+import { _cpuDropout, dropoutContext, dropoutMultiplier } from '../ops/dropout.js';
 import { attentionDropout, attentionProbabilityIndex } from '../ops/attentionDropout.js';
 import {
   canonicalOptimizerDescriptor,
@@ -29,9 +29,7 @@ import {
   resetGradientAccumulation as resetPendingGradients,
 } from './GradientAccumulation.js';
 import type { RuntimeTypedArray } from '../types.js';
-import type { CPUTrainStepOptions } from './TrainingStep.js';
-
-export type { CPUTrainStepOptions } from './TrainingStep.js';
+import type { TrainingStepOptions } from './TrainingStep.js';
 
 type TrainingDropoutContext = ReturnType<typeof dropoutContext>;
 type CrossEntropyGradientResult = ReturnType<typeof crossEntropyGradient>;
@@ -39,7 +37,7 @@ type GradientMap = Map<string, Float32Array>;
 
 interface AcceleratedTrainingExecution {
   backend?: string;
-  preflight?(graph: StatefulTrainingGraph, options: CPUTrainStepOptions): void | Promise<void>;
+  preflight?(graph: StatefulTrainingGraph, options: TrainingStepOptions): void | Promise<void>;
   forward?(
     graph: StatefulTrainingGraph,
     inputs: Record<string, RuntimeTypedArray>,
@@ -1087,15 +1085,57 @@ function backwardMoERouter(node, gateGrad, grads) {
   }
 }
 
+/** Trainer-owned CPU forward engine. Inference CPUEngine never sees RNG state. */
+class CPUTrainingForwardEngine extends CPUEngine {
+  readonly #dropout: TrainingDropoutContext;
+
+  constructor(dropout: TrainingDropoutContext) {
+    super();
+    this.#dropout = dropout;
+  }
+
+  override _runNode(node: any, execution: any = {}) {
+    const nodeIndex = execution.nodeIndex ?? 0;
+    if (node.opType === 'Dropout') {
+      return _cpuDropout(node, {
+        training: { dropout: this.#dropout },
+        nodeIndex,
+      });
+    }
+    if (node.opType === 'SDPA') {
+      return this._cpuSDPA(node, {
+        probabilityMultiplier: attentionDropout(node, this.#dropout, nodeIndex),
+      });
+    }
+    if (node.opType === 'CrossSDPA') {
+      return this._cpuCrossSDPA(node, {
+        probabilityMultiplier: attentionDropout(node, this.#dropout, nodeIndex),
+      });
+    }
+    return super._runNode(node, execution);
+  }
+}
+
 export class CPUAutograd {
-  static async trainStep(graph: Graph, options: CPUTrainStepOptions = {}) {
+  /** @internal Trainer-owned forward entry used by gradient verification tests. */
+  static async _forward(
+    graph: Graph,
+    inputs: Record<string, RuntimeTypedArray>,
+    dropout: TrainingDropoutContext,
+  ): Promise<void> {
+    const engine = new CPUTrainingForwardEngine(dropout);
+    engine.allocateGraph(graph);
+    await engine.execute(graph, inputs, { adapter: null });
+  }
+
+  static async trainStep(graph: Graph, options: TrainingStepOptions = {}) {
     return this._trainStepWithExecution(ensureTrainingGraphState(graph), options, null);
   }
 
   /** Internal execution hook used by strict accelerated training backends. */
   static async _trainStepWithExecution(
     graph: any,
-    options: CPUTrainStepOptions = {},
+    options: TrainingStepOptions = {},
     execution: AcceleratedTrainingExecution | null = null,
   ) {
     const {
@@ -1180,9 +1220,7 @@ export class CPUAutograd {
     if (execution?.forward) {
       await execution.forward(graph, inputs, { dropout: trainingDropout });
     } else {
-      const engine = new CPUEngine();
-      engine.allocateGraph(graph);
-      await engine.execute(graph, inputs, { adapter: null, training: { dropout: trainingDropout } });
+      await this._forward(graph, inputs, trainingDropout);
     }
     const backendName = execution?.backend || "cpu";
     const backendResult = execution?.backend ? { backend: backendName } : {};
@@ -1244,7 +1282,7 @@ export class CPUAutograd {
           continue;
         }
         let axis=node.params?.axis ?? 0; if(axis<0)axis+=input.shape.length;
-        const outputs=(Object.entries(node.outputs||{}) as Array<[string, Tensor]>).sort(([a],[b])=>a.localeCompare(b)).map(([,tensor])=>tensor);
+        const outputs=(Object.values(node.outputs||{}) as Tensor[]);
         if(!Number.isInteger(axis)||axis<0||axis>=input.shape.length||input.shape[axis]%outputs.length) backwardFailure(node,"Split has invalid axis or output sizes");
         const split=input.shape[axis]/outputs.length, inner=input.shape.slice(axis+1).reduce((a,b)=>a*b,1), outer=input.shape.slice(0,axis).reduce((a,b)=>a*b,1), gi=gradFor(grads,input);
         for(let oi=0;oi<outputs.length;oi++){const dy=grads.get(outputs[oi].name);if(!dy)continue;for(let group=0;group<outer;group++)for(let index=0;index<split*inner;index++)gi[(group*input.shape[axis]+oi*split)*inner+index]+=dy[group*split*inner+index];}
@@ -1565,8 +1603,12 @@ export class CPUAutograd {
         const gi = gradFor(grads, input);
         for (let outerIndex = 0; outerIndex < outer; outerIndex++) {
           for (let indexPosition = 0; indexPosition < indexCount; indexPosition++) {
-            const selected = indices.buffer[indexPosition];
-            if (!Number.isInteger(selected) || selected < 0 || selected >= input.shape[axis]) {
+            let selected = indices.buffer[indexPosition];
+            if (!Number.isInteger(selected)) {
+              backwardFailure(node, "Gather index is outside the selected axis");
+            }
+            if (selected < 0) selected += input.shape[axis];
+            if (selected < 0 || selected >= input.shape[axis]) {
               backwardFailure(node, "Gather index is outside the selected axis");
             }
             for (let innerIndex = 0; innerIndex < inner; innerIndex++) {
@@ -1769,8 +1811,8 @@ export class CPUAutograd {
         for (let b = 0; b < batch; b++) for (let y = 0; y < height; y++) for (let x = 0; x < width; x++) for (let c = 0; c < channels; c++) {
           gi[((b * height + y) * width + x) * channels + c] += go[((b * outHeight + y + padTop) * outWidth + x + padLeft) * channels + c];
         }
-      } else if(node.opType==='Interp1D'||node.opType==='InterpLinear1D'){
-        const input=nodeInput(node);if(input?.dtype!=='float32'||input.shape.length!==3||out?.shape?.length!==3)backwardFailure(node,'Interp1D backward requires rank-3 NCL F32 tensors');
+      } else if(node.opType==='Interpolate1D'||node.opType==='Interp1D'||node.opType==='InterpLinear1D'){
+        const input=nodeInput(node);if(input?.dtype!=='float32'||input.shape.length!==3||out?.shape?.length!==3)backwardFailure(node,'Interpolate1D backward requires rank-3 NCL F32 tensors');
         const [batch,channels,inputLength]=input.shape,outputLength=out.shape[2],gi=gradFor(grads,input),scale=inputLength/outputLength;
         for(let b=0;b<batch;b++)for(let c=0;c<channels;c++)for(let x=0;x<outputLength;x++){let position=(x+.5)*scale-.5;position=Math.max(0,Math.min(inputLength-1,position));const x0=Math.floor(position),x1=Math.min(inputLength-1,x0+1),fraction=position-x0,g=go[(b*channels+c)*outputLength+x],base=(b*channels+c)*inputLength;gi[base+x0]+=g*(1-fraction);gi[base+x1]+=g*fraction;}
       } else if (node.opType === "Concat" || node.opType === "Concat2") {

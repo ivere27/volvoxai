@@ -7,8 +7,8 @@
             let i = global_id.x;
             if (i >= params.b) { return; }
             let offset = i * params.d;
-            var max_val = -100000.0;
-            for (var j = 0u; j < params.d; j = j + 1u) {
+            var max_val = input[offset];
+            for (var j = 1u; j < params.d; j = j + 1u) {
                 if (input[offset + j] > max_val) { max_val = input[offset + j]; }
             }
             var sum = 0.0;

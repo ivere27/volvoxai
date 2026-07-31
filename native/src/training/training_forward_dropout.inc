@@ -7,10 +7,6 @@
  * exposing private graph state through an internal ABI.
  */
 
-/* Set only around the forward/backward portion of TrainStep. */
-static int g_native_training_mode;
-static uint32_t g_native_training_counter;
-
 typedef struct {
     uint32_t threshold;
     uint32_t seed;

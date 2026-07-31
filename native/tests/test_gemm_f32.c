@@ -120,23 +120,24 @@ static int run_case(uint32_t m, uint32_t k, uint32_t n,
 static int test_cache_lifetime(void) {
 #ifndef __wasm__
     enum { K = 17, N = 9 };
+    VxGemmF32Cache cache = {0};
     float weight[K * N];
     float input[K];
     float expected[N];
     float actual[N];
     for (uint32_t index = 0; index < K * N; index++) weight[index] = test_value(index + 31u);
     for (uint32_t index = 0; index < K; index++) input[index] = test_value(index + 331u);
-    const float* first = vx_gemm_f32_pack_cache(7, weight, K, N, 0);
-    const float* second = vx_gemm_f32_pack_cache(7, weight, K, N, 0);
+    const float* first = vx_gemm_f32_pack_cache(&cache, 7, weight, K, N, 0);
+    const float* second = vx_gemm_f32_pack_cache(&cache, 7, weight, K, N, 0);
     CHECK(first && second == first);
     weight[0] += 2.0f;
-    vx_gemm_f32_cache_free_all();
-    const float* refreshed = vx_gemm_f32_pack_cache(7, weight, K, N, 0);
+    vx_gemm_f32_cache_free_all(&cache);
+    const float* refreshed = vx_gemm_f32_pack_cache(&cache, 7, weight, K, N, 0);
     CHECK(refreshed);
     reference_gemm(input, weight, NULL, expected, 1, K, N, 0, 0);
     CHECK(vx_gemm_f32_run_packed(input, refreshed, NULL, actual, 1, K, N) == 1);
     CHECK(close_array(actual, expected, N));
-    vx_gemm_f32_cache_free_all();
+    vx_gemm_f32_cache_free_all(&cache);
 #endif
     return 1;
 }
@@ -146,7 +147,13 @@ int main(void) {
     if (!test_concurrent_tile_initialization()) return 1;
 #endif
     VxGemmF32TileConfig tile = vx_gemm_f32_tile_config();
-    if (tile.mr != 4u || tile.nr != 8u || tile.kc < 64u ||
+    /* NR is pinned because it is the packed panel width: vx_gemm_f32_pack_b and
+     * vx_gemm_f32_packed_elements both lay out memory around it, so a change
+     * there is a layout change every microkernel has to agree with.  MR is only
+     * how many C rows one call blocks over, which gemm_f32.h documents as a
+     * tunable internal policy, so assert the invariant it has to satisfy — the
+     * tile still fits the cache budget — rather than one tuned value. */
+    if (tile.nr != 8u || tile.mr < 1u || tile.kc < 64u ||
         tile.working_set_bytes > tile.cache_budget_bytes ||
         vx_gemm_f32_packed_elements(0, 8) != 0u ||
         vx_gemm_f32_packed_elements(8, 0) != 0u) {

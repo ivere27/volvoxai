@@ -1,6 +1,9 @@
 #include "backend_manager.h"
+#include "runtime_state.h"
 
 #include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
 
 #define CHECK(expression) do { \
     if (!(expression)) { \
@@ -9,15 +12,15 @@
     } \
 } while (0)
 
-extern int g_use_vulkan;
-extern int g_use_opengl;
-
 static int g_init_result;
 static int g_init_calls;
 static int g_cleanup_calls;
 static int g_opengl_init_result;
 static int g_opengl_init_calls;
 static int g_opengl_cleanup_calls;
+static int g_cuda_init_result;
+static int g_cuda_init_calls;
+static int g_cuda_cleanup_calls;
 
 int vk_init(void) {
     g_init_calls++;
@@ -37,21 +40,61 @@ void opengl_cleanup(void) {
     g_opengl_cleanup_calls++;
 }
 
+int cuda_init(void) {
+    g_cuda_init_calls++;
+    return g_cuda_init_result;
+}
+
+void cuda_cleanup(void) {
+    g_cuda_cleanup_calls++;
+}
+
 int main(void) {
+    VxEngineState* state = (VxEngineState*)calloc(1, sizeof(*state));
+    VxEngineStateScope scope;
+    if (!state || vx_engine_state_init(state) != 0) {
+        free(state);
+        return 1;
+    }
+    scope = vx_engine_state_scope_enter(state);
+    CHECK(VOLVOXAI_BACKEND_CUDA == 6);
     CHECK(vx_backend_manager_current() == VOLVOXAI_BACKEND_CPU);
+    CHECK(vx_backend_manager_activate((VolvoxAIEngineBackend)5) == -1);
 
     g_init_result = -1;
     CHECK(vx_backend_manager_activate(VOLVOXAI_BACKEND_VULKAN) == -1);
     CHECK(g_init_calls == 1);
     CHECK(g_cleanup_calls == 1);
-    CHECK(g_use_vulkan == 0);
+    CHECK(state->use_vulkan == 0);
+    CHECK(vx_backend_manager_current() == VOLVOXAI_BACKEND_CPU);
+
+    g_cuda_init_result = -1;
+    CHECK(vx_backend_manager_activate(VOLVOXAI_BACKEND_CUDA) == -1);
+    CHECK(g_cuda_init_calls == 1);
+    CHECK(g_cuda_cleanup_calls == 1);
+    CHECK(state->use_cuda == 0);
+    CHECK(vx_backend_manager_current() == VOLVOXAI_BACKEND_CPU);
+
+    g_cuda_init_result = 0;
+    CHECK(vx_backend_manager_activate(VOLVOXAI_BACKEND_CUDA) == 0);
+    CHECK(g_cuda_init_calls == 2);
+    CHECK(g_cuda_cleanup_calls == 1);
+    CHECK(state->use_cuda == 1);
+    CHECK(vx_backend_manager_current() == VOLVOXAI_BACKEND_CUDA);
+    CHECK(!strcmp(vx_backend_manager_name(), "CUDA"));
+    CHECK(vx_backend_manager_activate(VOLVOXAI_BACKEND_CUDA) == 0);
+    CHECK(g_cuda_init_calls == 2);
+
+    vx_backend_manager_deactivate();
+    CHECK(g_cuda_cleanup_calls == 2);
+    CHECK(state->use_cuda == 0);
     CHECK(vx_backend_manager_current() == VOLVOXAI_BACKEND_CPU);
 
     g_init_result = 0;
     CHECK(vx_backend_manager_activate(VOLVOXAI_BACKEND_VULKAN) == 0);
     CHECK(g_init_calls == 2);
     CHECK(g_cleanup_calls == 1);
-    CHECK(g_use_vulkan == 1);
+    CHECK(state->use_vulkan == 1);
     CHECK(vx_backend_manager_current() == VOLVOXAI_BACKEND_VULKAN);
     CHECK(vx_backend_manager_activate(VOLVOXAI_BACKEND_VULKAN) == 0);
     CHECK(g_init_calls == 2);
@@ -61,14 +104,17 @@ int main(void) {
     CHECK(g_opengl_init_calls == 1);
     CHECK(g_opengl_cleanup_calls == 1);
     CHECK(g_cleanup_calls == 1);
-    CHECK(g_use_vulkan == 1 && g_use_opengl == 0);
+    CHECK(state->use_vulkan == 1 && state->use_opengl == 0);
     CHECK(vx_backend_manager_current() == VOLVOXAI_BACKEND_VULKAN);
 
     vx_backend_manager_deactivate();
     CHECK(g_cleanup_calls == 2);
-    CHECK(g_use_vulkan == 0);
+    CHECK(state->use_vulkan == 0);
     CHECK(vx_backend_manager_current() == VOLVOXAI_BACKEND_CPU);
 
+    vx_engine_state_scope_leave(scope);
+    vx_engine_state_deinit(state);
+    free(state);
     puts("native backend manager tests passed");
     return 0;
 }

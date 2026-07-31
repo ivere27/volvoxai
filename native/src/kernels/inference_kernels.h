@@ -2,6 +2,7 @@
 #define VOLVOXAI_INFERENCE_KERNELS_H
 
 #include <stdint.h>
+#include "../../include/volvoxai_enums.h"
 #include "gemm_f32.h"
 
 #ifdef __cplusplus
@@ -16,6 +17,8 @@ enum {
 };
 
 void matmul_f32(const float*, const float*, const float*, float*, int, int, int);
+/* Same product with the weight stored [N,K] instead of [K,N]. */
+void matmul_f32_out_in(const float*, const float*, const float*, float*, int, int, int);
 void add_f32(const float*, const float*, float*, int);
 void add_broadcast_f32(const float*, const float*, float*, int, int, int);
 void mul_f32(const float*, const float*, float*, int);
@@ -50,14 +53,33 @@ void embedding_f32(uintptr_t, uintptr_t, uintptr_t, int, int);
 int binary_broadcast_f32(const float*, const float*, float*, const uint32_t*,
                          const uint32_t*, const uint32_t*, uint32_t, uint32_t,
                          uint32_t, uint32_t, uint32_t);
+int compare_broadcast_i32(const int32_t*, const int32_t*, int32_t*,
+                         const uint32_t*, const uint32_t*, const uint32_t*,
+                         uint32_t, uint32_t, uint32_t, uint32_t, uint32_t);
+int not_i32(const int32_t*, int32_t*, uint32_t);
 int matmul_quantized_f32(const float*, const void*, const float*, const void*,
                          const float*, float*, uint32_t, uint32_t, uint32_t,
                          uint32_t, uint32_t, uint32_t, uint32_t);
 int transpose_nd_f32(const float*, float*, const uint32_t*, const uint32_t*,
                      uint32_t, uint32_t);
+int transpose_nd_u32(const uint32_t*, uint32_t*, const uint32_t*,
+                     const uint32_t*, uint32_t, uint32_t);
+int transpose_nd_i8u8(const uint8_t*, uint8_t*, const uint32_t*,
+                      const uint32_t*, uint32_t, uint32_t, uint32_t);
+int expand_nd_i8u8(const uint8_t*, uint8_t*, const uint32_t*,
+                   const uint32_t*, uint32_t, uint32_t, uint32_t);
+int gather_i32_f32(const float*, const int32_t*, float*, uint32_t, uint32_t,
+                   uint32_t, uint32_t, uint32_t);
+int gather_elements_i32_f32(const float*, const int32_t*, float*,
+                            const uint32_t*, const uint32_t*, uint32_t,
+                            uint32_t, uint32_t);
 int concat_slice_f32(const float*, float*, uint32_t, uint32_t, uint32_t,
                      uint32_t, uint32_t, uint32_t);
+int concat_slice_u32(const uint32_t*, uint32_t*, uint32_t, uint32_t, uint32_t,
+                     uint32_t, uint32_t);
 int split_slice_f32(const float*, float*, uint32_t, uint32_t, uint32_t,
+                    uint32_t, uint32_t);
+int split_slice_u32(const uint32_t*, uint32_t*, uint32_t, uint32_t, uint32_t,
                     uint32_t, uint32_t);
 int groupnorm_f32(const float*, const float*, const float*, float*, uint32_t,
                   uint32_t, uint32_t, uint32_t, uint32_t, double);
@@ -72,6 +94,13 @@ int moe_linear_f32(const float*, const float*, const float*, const float*,
 int qlinear_i8u8(const void*, const void*, const int32_t*, const float*,
                  const int32_t*, void*, uint32_t, uint32_t, uint32_t, float,
                  int32_t, float, int32_t, uint32_t, uint32_t, uint32_t);
+int qbatch_matmul_i8u8(const void*, const void*, void*, uint32_t, uint32_t,
+                      uint32_t, float, int32_t, float, int32_t, float,
+                      int32_t, uint32_t, uint32_t, uint32_t);
+int vx_qbatch_matmul_i8u8_native(const void*, const void*, void*, uint32_t,
+                                uint32_t, uint32_t, float, int32_t, float,
+                                int32_t, float, int32_t, uint32_t, uint32_t,
+                                uint32_t);
 uint32_t vx_packed_q8_weight_size(uint32_t, uint32_t);
 int vx_pack_q8_weight(void*, uint32_t, const void*, uint32_t, uint32_t,
                       uint32_t, uint32_t);
@@ -83,7 +112,8 @@ int vx_qlinear_i8u8_packed(const void*, const void*, const int32_t*,
                            const float*, const int32_t*, void*, uint32_t,
                            uint32_t, uint32_t, float, int32_t, float, int32_t,
                            uint32_t, uint32_t, uint32_t);
-int vx_packed_q8_preferred_for_native_w8a8(uint32_t);
+int vx_packed_q8_preferred_for_native_w8a8(uint32_t, uint32_t, uint32_t,
+                                           uint32_t, int);
 int qconv2d_i8u8(const void*, const void*, const int32_t*, const float*,
                  const int32_t*, void*, uint32_t, uint32_t, uint32_t, uint32_t,
                  uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t,

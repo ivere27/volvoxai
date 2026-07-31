@@ -20,6 +20,7 @@ struct Params {
 }
 @group(0) @binding(6) var<uniform> params : Params;
 
+// Dtype IDs are canonical protobuf values: I32=16, I8=6, U8=5.
 var<workgroup> input_tile : array<f32, 256>;
 var<workgroup> weight_tile : array<i32, 256>;
 
@@ -34,17 +35,17 @@ fn raw_u8(word : u32, byte_index : u32) -> i32 {
 fn weight_value(byte_offset : u32) -> i32 {
   let word = weight_packed[byte_offset / 4u];
   let byte_index = byte_offset % 4u;
-  if (params.weight_dtype == 2u) { return raw_i8(word, byte_index); }
+  if (params.weight_dtype == 6u) { return raw_i8(word, byte_index); }
   return raw_u8(word, byte_index);
 }
 
 fn weight_zero_point(column : u32) -> i32 {
   if (params.zero_point_elements == 0u) { return 0; }
   let index = select(0u, column, params.zero_point_elements != 1u);
-  if (params.zero_point_dtype == 2u) {
+  if (params.zero_point_dtype == 6u) {
     return raw_i8(weight_zero_points[index / 4u], index % 4u);
   }
-  if (params.zero_point_dtype == 3u) {
+  if (params.zero_point_dtype == 5u) {
     return raw_u8(weight_zero_points[index / 4u], index % 4u);
   }
   return bitcast<i32>(weight_zero_points[index]);

@@ -89,7 +89,23 @@ function linearGraph(opType) {
   const { out } = graph.addOp(opType, { input, weight, bias }, {
     out: { name: 'out', shape: [2, 2] },
   }, { weight_layout: 'IN_OUT' });
-  graph.outputNames = [out.name];
+  graph.setOutputs([out.name]);
+  return graph;
+}
+
+function broadcastBiasLinearGraph() {
+  const graph = new Graph();
+  const input = graph.addInput('input', [1, 2, 3]);
+  const weight = graph.addWeight('weight', [3, 2], 'float32', {
+    buffer: Float32Array.of(0.25, -0.5, 1.5, 0.75, -1, 0.5),
+  });
+  const bias = graph.addWeight('bias', [1, 1, 2], 'float32', {
+    buffer: Float32Array.of(0.125, -0.25),
+  });
+  const { out } = graph.addOp('Linear', { input, weight, bias }, {
+    out: { name: 'out', shape: [1, 2, 2] },
+  }, { weight_layout: 'IN_OUT' });
+  graph.setOutputs([out.name]);
   return graph;
 }
 
@@ -105,7 +121,7 @@ function relu6Conv2DGraph() {
   const { out } = graph.addOp('Conv2D', { input, weight, bias }, {
     out: { name: 'out', shape: [1, 1, 2, 1] },
   }, { relu: 2 });
-  graph.outputNames = [out.name];
+  graph.setOutputs([out.name]);
   return graph;
 }
 
@@ -116,7 +132,7 @@ function dynamicDoutLinearGraph(opType) {
   const { out } = graph.addOp(opType, { input, weight }, {
     out: { name: 'out', shape: [1, 2] },
   }, { weight_layout: 'OUT_IN' });
-  graph.outputNames = [out.name];
+  graph.setOutputs([out.name]);
   return graph;
 }
 
@@ -139,7 +155,7 @@ function sharedPackedLinearGraph(opType, rows = 7) {
   const second = graph.addOp(opType, { input: inputB, weight, bias }, {
     out: { name: 'packedOutB', shape: [rows, dOut] },
   }, { weight_layout: 'OUT_IN' }).out;
-  graph.outputNames = [first.name, second.name];
+  graph.setOutputs([first.name, second.name]);
   return graph;
 }
 
@@ -155,7 +171,7 @@ function quantizedOddWidthLinearGraph(opType) {
   const { out } = graph.addOp(opType, { input, weight, scale, zero_point: zeroPoint, bias }, {
     out: { name: 'out', shape: [1, 2] },
   }, { weight_layout: 'OUT_IN' });
-  graph.outputNames = [out.name];
+  graph.setOutputs([out.name]);
   return graph;
 }
 
@@ -170,7 +186,7 @@ function quantizedUint8LinearGraph(opType) {
   const { out } = graph.addOp(opType, { input, weight, scale, zero_point: zeroPoint }, {
     out: { name: 'out', shape: [1, 2] },
   }, { weight_layout: 'OUT_IN' });
-  graph.outputNames = [out.name];
+  graph.setOutputs([out.name]);
   return graph;
 }
 
@@ -181,7 +197,7 @@ function rmsNormGraph() {
   const { out } = graph.addOp('RMSNorm', { input, weight }, {
     out: { name: 'out', shape: [2, 2, 3] },
   }, { d_model: 3, eps: 0.125 });
-  graph.outputNames = [out.name];
+  graph.setOutputs([out.name]);
   return graph;
 }
 
@@ -192,7 +208,7 @@ function rmsNormExtremeGraph() {
   const { out } = graph.addOp('RMSNorm', { input, weight }, {
     out: { name: 'out', shape: [1, 2] },
   }, { d_model: 2, eps: 1e-6 });
-  graph.outputNames = [out.name];
+  graph.setOutputs([out.name]);
   return graph;
 }
 
@@ -204,7 +220,7 @@ function groupNormGraph() {
   const { out } = graph.addOp('GroupNorm', { input, weight, bias }, {
     out: { name: 'out', shape: [2, 2, 2, 4] },
   }, { num_groups: 2, eps: 0.05 });
-  graph.outputNames = [out.name];
+  graph.setOutputs([out.name]);
   return graph;
 }
 
@@ -216,7 +232,7 @@ function groupNormPrecisionGraph() {
   const { out } = graph.addOp('GroupNorm', { input, weight, bias }, {
     out: { name: 'out', shape: [1, 1, 1, 2] },
   }, { num_groups: 1, eps: 1e-50 });
-  graph.outputNames = [out.name];
+  graph.setOutputs([out.name]);
   return graph;
 }
 
@@ -248,7 +264,7 @@ function moeGraph(temperature = 1.25) {
     route_indices: routes.indices,
     route_weights: routes.weights,
   }, { out: { name: 'out', shape: [2, 2] } });
-  graph.outputNames = [routes.indices.name, routes.weights.name, out.name];
+  graph.setOutputs([routes.indices.name, routes.weights.name, out.name]);
   return graph;
 }
 
@@ -258,7 +274,7 @@ function resizeNearestGraph() {
   const { out } = graph.addOp('ResizeNearest2D', { input }, {
     out: { name: 'out', shape: [2, 3, 5, 2] },
   }, { mode: 'nearest' });
-  graph.outputNames = [out.name];
+  graph.setOutputs([out.name]);
   return graph;
 }
 
@@ -268,7 +284,7 @@ function resizeModeNearestGraph() {
   const { out } = graph.addOp('Resize', { input }, {
     out: { name: 'out', shape: [2, 3, 5, 2] },
   }, { mode: 'nearest' });
-  graph.outputNames = [out.name];
+  graph.setOutputs([out.name]);
   return graph;
 }
 
@@ -278,7 +294,7 @@ function upsampleGraph(opType) {
   const { out } = graph.addOp(opType, { input }, {
     out: { name: 'out', shape: [2, 4, 4, 1] },
   });
-  graph.outputNames = [out.name];
+  graph.setOutputs([out.name]);
   return graph;
 }
 
@@ -288,7 +304,7 @@ function interpGraph(opType) {
   const { out } = graph.addOp(opType, { input }, {
     out: { name: 'out', shape: [2, 1, 5] },
   }, { size: 5 });
-  graph.outputNames = [out.name];
+  graph.setOutputs([out.name]);
   return graph;
 }
 
@@ -298,7 +314,7 @@ function leakyGraph() {
   const { out } = graph.addOp('LeakyReLU', { input }, {
     out: { name: 'out', shape: [1, 5] },
   }, { alpha: 0 });
-  graph.outputNames = [out.name];
+  graph.setOutputs([out.name]);
   return graph;
 }
 
@@ -309,7 +325,7 @@ function preluGraph() {
   const { out } = graph.addOp('PReLU', { input, slope }, {
     out: { name: 'out', shape: [1, 5] },
   });
-  graph.outputNames = [out.name];
+  graph.setOutputs([out.name]);
   return graph;
 }
 
@@ -317,7 +333,7 @@ function unaryGraph(opType) {
   const graph = new Graph();
   const input = graph.addInput('input', [2, 3]);
   const { out } = graph.addOp(opType, { input }, { out: { name: 'out', shape: [2, 3] } });
-  graph.outputNames = [out.name];
+  graph.setOutputs([out.name]);
   return graph;
 }
 
@@ -328,15 +344,17 @@ function binaryBroadcastGraph(opType, params = {}) {
   const { out } = graph.addOp(opType, { a, b }, {
     out: { name: 'out', shape: [2, 4, 3] },
   }, params);
-  graph.outputNames = [out.name];
+  graph.setOutputs([out.name]);
   return graph;
 }
 
 function softmaxGraph(opType) {
   const graph = new Graph();
-  const input = graph.addInput('input', [2, 4]);
-  const { out } = graph.addOp(opType, { input }, { out: { name: 'out', shape: [2, 4] } });
-  graph.outputNames = [out.name];
+  const input = graph.addInput('input', [2, 1, 2, 2]);
+  const { out } = graph.addOp(opType, { input }, {
+    out: { name: 'out', shape: [2, 1, 2, 2] },
+  }, { axis: -1 });
+  graph.setOutputs([out.name]);
   return graph;
 }
 
@@ -354,7 +372,7 @@ function typedShapeCopyGraph(dtype) {
       out: { name: `shape_${index}`, shape, dtype },
     }, params).out;
   }
-  graph.outputNames = [value.name];
+  graph.setOutputs([value.name]);
   return graph;
 }
 
@@ -364,7 +382,7 @@ function reductionGraph(opType, inputKey) {
   const { out } = graph.addOp(opType, { [inputKey]: values }, {
     out: { name: 'out', shape: [2, 2] },
   });
-  graph.outputNames = [out.name];
+  graph.setOutputs([out.name]);
   return graph;
 }
 
@@ -374,7 +392,7 @@ function padGraph(inputKey) {
   const { out } = graph.addOp('Pad', { [inputKey]: values }, {
     out: { name: 'out', shape: [1, 3, 4, 1] },
   }, { pads: [1, 1, 0, 1], value: -0.25 });
-  graph.outputNames = [out.name];
+  graph.setOutputs([out.name]);
   return graph;
 }
 
@@ -384,7 +402,7 @@ function averagePoolGraph(opType, inputKey) {
   const { out } = graph.addOp(opType, { [inputKey]: values }, {
     out: { name: 'out', shape: [1, 2, 2, 1] },
   }, { kernel: [2, 2], stride: [1, 1], padding: [0, 0] });
-  graph.outputNames = [out.name];
+  graph.setOutputs([out.name]);
   return graph;
 }
 
@@ -394,7 +412,7 @@ function transposeGraph() {
   const { out } = graph.addOp('Transpose', { input }, {
     out: { name: 'out', shape: [2, 2, 3] },
   }, { perm: [2, 0, 1] });
-  graph.outputNames = [out.name];
+  graph.setOutputs([out.name]);
   return graph;
 }
 
@@ -411,7 +429,7 @@ function concatGraph(opType, params = {}) {
   const { out } = graph.addOp(opType, inputs, {
     out: { name: 'out', shape: [2, axis, 2] },
   }, { axis: 1, ...params });
-  graph.outputNames = [out.name];
+  graph.setOutputs([out.name]);
   return graph;
 }
 
@@ -428,7 +446,7 @@ function splitGraph() {
     },
     params: { axis: -2 },
   }).outputs;
-  graph.outputNames = [outputs.out0.name, outputs.out1.name, outputs.out2.name];
+  graph.setOutputs([outputs.out0.name, outputs.out1.name, outputs.out2.name]);
   return graph;
 }
 
@@ -444,8 +462,38 @@ function splitMixedCaseGraph() {
     },
     params: { axis: 1 },
   }).outputs;
-  graph.outputNames = [outputs.a.name, outputs.B.name];
+  graph.setOutputs([outputs.a.name, outputs.B.name]);
   return graph;
+}
+
+function splitManyOutputsGraph() {
+  const graph = new Graph();
+  const input = graph.addInput('input', [2, 12]);
+  const outputSpecs = {};
+  for (let index = 0; index < 12; index++) {
+    outputSpecs[`out${index}`] = {
+      name: `slice${index}`,
+      shape: [2, 1],
+    };
+  }
+  const outputs = graph.addNode({
+    opType: 'Split',
+    inputs: { input },
+    outputs: outputSpecs,
+    params: { axis: 1 },
+  }).outputs;
+  graph.setOutputs(Object.values(outputs).map(({ name }) => name));
+  return graph;
+}
+
+function assertManySplitOutputs(results, label) {
+  for (let index = 0; index < 12; index++) {
+    assert.deepEqual(
+      [...results[`slice${index}`]],
+      [index, index + 12],
+      `${label}/slice${index}`,
+    );
+  }
 }
 
 function expandGraph(opType) {
@@ -454,11 +502,11 @@ function expandGraph(opType) {
   const { out } = graph.addOp(opType, { input }, {
     out: { name: 'out', shape: [2, 4, 3] },
   });
-  graph.outputNames = [out.name];
+  graph.setOutputs([out.name]);
   return graph;
 }
 
-test('ordinary forward WASM replaces every former CPU fallback row with direct kernels', {
+test('ordinary forward WASM implements every supported row with direct kernels', {
   timeout: 120_000,
 }, async (t) => {
   try {
@@ -489,6 +537,9 @@ test('ordinary forward WASM replaces every former CPU fallback row with direct k
       const inputs = { input: Float32Array.of(1, -2, 3, -4, 5, -6) };
       await assertWasmParity(wasm, 'Linear', () => linearGraph('Linear'), inputs);
       await assertWasmParity(wasm, 'Gemm', () => linearGraph('Gemm'), inputs);
+      await assertWasmParity(
+        wasm, 'Linear broadcast bias', broadcastBiasLinearGraph, inputs,
+      );
       const dynamicDoutInputs = {
         input: Float32Array.of(2, 3),
         weight: Float32Array.of(1, 4, 2, 5),
@@ -553,21 +604,18 @@ test('ordinary forward WASM replaces every former CPU fallback row with direct k
       });
     });
 
-    await t.test('nearest Resize, 2x aliases, and Interp1D aliases avoid CPU loops', async () => {
+    await t.test('nearest Resize, UpsampleNearest2D, and Interpolate1D avoid CPU loops', async () => {
       const imageInput = { input: Float32Array.from({ length: 24 }, (_, index) => index - 9) };
       await assertWasmParity(wasm, 'Resize mode nearest', resizeModeNearestGraph, imageInput);
       const upsampleInput = { input: Float32Array.from({ length: 8 }, (_, index) => index - 3) };
       await assertWasmParity(wasm, 'UpsampleNearest2D', () => upsampleGraph('UpsampleNearest2D'), upsampleInput);
-      await assertWasmParity(wasm, 'Upsample2x', () => upsampleGraph('Upsample2x'), upsampleInput);
       const interpInput = { input: Float32Array.from({ length: 6 }, (_, index) => index * 0.5 - 1) };
-      await assertWasmParity(wasm, 'InterpLinear1D', () => interpGraph('InterpLinear1D'), interpInput);
-      await assertWasmParity(wasm, 'Interp1D', () => interpGraph('Interp1D'), interpInput);
+      await assertWasmParity(wasm, 'Interpolate1D', () => interpGraph('Interpolate1D'), interpInput);
     });
 
-    await t.test('SiLU, Swish, and accurate Tanh use direct C kernels', async () => {
+    await t.test('SiLU and accurate Tanh use direct C kernels', async () => {
       const inputs = { input: Float32Array.of(-3, -1, 0, 0.5, 1, 3) };
       await assertWasmParity(wasm, 'SiLU', () => unaryGraph('SiLU'), inputs);
-      await assertWasmParity(wasm, 'Swish', () => unaryGraph('Swish'), inputs);
       await assertWasmParity(wasm, 'Tanh', () => unaryGraph('Tanh'), inputs, 1e-5);
     });
 
@@ -657,15 +705,13 @@ test('ordinary forward WASM replaces every former CPU fallback row with direct k
       const poolInputs = {
         values: Float32Array.of(5, -2, 3, 1, 4, -6, 8, 2, 7),
       };
-      for (const opType of ['AveragePool2D', 'AveragePool']) {
-        for (const inputKey of ['input', 'x']) {
-          await assertWasmParity(
-            wasm,
-            `${opType} ${inputKey} alias`,
-            () => averagePoolGraph(opType, inputKey),
-            poolInputs,
-          );
-        }
+      for (const inputKey of ['input', 'x']) {
+        await assertWasmParity(
+          wasm,
+          `AveragePool2D ${inputKey} input`,
+          () => averagePoolGraph('AveragePool2D', inputKey),
+          poolInputs,
+        );
       }
     });
 
@@ -689,9 +735,25 @@ test('ordinary forward WASM replaces every former CPU fallback row with direct k
       await assertWasmParity(wasm, 'Split', splitGraph, {
         input: Float32Array.from({ length: 24 }, (_, index) => index - 12),
       });
-      await assertWasmParity(wasm, 'Split code-unit output order', splitMixedCaseGraph, {
-        input: Float32Array.of(1, 2, 3, 4),
-      });
+      const mixedCaseInput = { input: Float32Array.of(1, 2, 3, 4) };
+      const mixedCaseCPU = await cpuResult(splitMixedCaseGraph(), mixedCaseInput);
+      assert.deepEqual([...mixedCaseCPU.a], [1, 2]);
+      assert.deepEqual([...mixedCaseCPU.B], [3, 4]);
+      const mixedCaseWasmGraph = splitMixedCaseGraph();
+      wasm.compile(mixedCaseWasmGraph);
+      const mixedCaseWasm = await wasm.execute(mixedCaseInput);
+      assert.deepEqual([...mixedCaseWasm.a], [1, 2]);
+      assert.deepEqual([...mixedCaseWasm.B], [3, 4]);
+
+      const manyInput = {
+        input: Float32Array.from({ length: 24 }, (_, index) => index),
+      };
+      const manyCPU = await cpuResult(splitManyOutputsGraph(), manyInput);
+      assertManySplitOutputs(manyCPU, 'CPU declared Split order');
+      const manyWasmGraph = splitManyOutputsGraph();
+      wasm.compile(manyWasmGraph);
+      const manyWasm = await wasm.execute(manyInput);
+      assertManySplitOutputs(manyWasm, 'WASM declared Split order');
     });
 
     await t.test('Expand and Broadcast use direct right-aligned rank-N C kernels', async () => {

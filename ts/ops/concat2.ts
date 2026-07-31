@@ -3,6 +3,10 @@ import { assertRawQuantizedShapeTensors } from './quantizedShape.js';
 export function _cpuConcat2(node) {
 
     const output = node.outputs.out;
+    if (!output || !['float32', 'int32', 'int8', 'uint8'].includes(output.dtype) ||
+        !output.buffer) {
+      throw new Error(`Concat node ${node.id || "<unnamed>"} requires typed output storage.`);
+    }
     const outBuf = output.buffer;
     const rank = output.shape.length;
     let axis = node.params?.axis ?? 0;
@@ -34,9 +38,10 @@ export function _cpuConcat2(node) {
     const outputAxis = output.shape[axis];
     let summedAxis = 0;
     for (const [, tensor] of entries) {
-      if (tensor.shape.length !== rank ||
+      if (tensor.dtype !== output.dtype || !tensor.buffer ||
+          tensor.shape.length !== rank ||
           tensor.shape.some((dim, index) => index !== axis && dim !== output.shape[index])) {
-        throw new Error(`Concat node ${node.id || "<unnamed>"} has incompatible input shapes.`);
+        throw new Error(`Concat node ${node.id || "<unnamed>"} has incompatible input shapes or dtypes.`);
       }
       summedAxis += tensor.shape[axis];
     }
@@ -47,6 +52,9 @@ export function _cpuConcat2(node) {
       [...entries.map(([, tensor]) => tensor), output], 'Concat');
     if (quantized && node.params?.sigmoid) {
       throw new Error(`Concat node ${node.id || '<unnamed>'} cannot fuse sigmoid into quantized byte storage; insert an explicit F32 boundary.`);
+    }
+    if (output.dtype === 'int32' && node.params?.sigmoid) {
+      throw new Error(`Concat node ${node.id || '<unnamed>'} cannot fuse sigmoid into I32 storage.`);
     }
 
     for (let outerIndex = 0; outerIndex < outer; outerIndex++) {

@@ -1,4 +1,4 @@
-#include "volvoxai_training.h"
+#include "training_core.h"
 #include "../kernels/training_kernels.h"
 
 #include <float.h>
@@ -146,14 +146,14 @@ int volvoxai_ptq_calculate_params(const volvoxai_ptq_observer_t* observer,
         ptq_domain(dtype, &qmin, &qmax) != 0) return -1;
     float scale = 0.0f;
     int32_t zero_point = 0;
-    if (scheme == VOLVOXAI_PTQ_SYMMETRIC) {
+    if (scheme == VX_PTQ_SCHEME_SYMMETRIC) {
         double minimum_magnitude = ptq_abs_f64((double)observer->minimum);
         double maximum_magnitude = ptq_abs_f64((double)observer->maximum);
         double magnitude = minimum_magnitude > maximum_magnitude
             ? minimum_magnitude : maximum_magnitude;
         if (ptq_positive_f32(magnitude == 0.0 ? 1.0 : magnitude / 127.0, &scale) != 0) return -1;
         zero_point = dtype == VOLVOXAI_DTYPE_I8 ? 0 : 128;
-    } else if (scheme == VOLVOXAI_PTQ_ASYMMETRIC) {
+    } else if (scheme == VX_PTQ_SCHEME_ASYMMETRIC) {
         double minimum = observer->minimum < 0.0f ? (double)observer->minimum : 0.0;
         double maximum = observer->maximum > 0.0f ? (double)observer->maximum : 0.0;
         if (minimum == maximum) {

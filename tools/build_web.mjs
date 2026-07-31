@@ -15,8 +15,8 @@ const retainedWasm = new Set(['volvoxai.wasm', 'volvoxai.full.wasm']);
 async function cleanDist() {
   await fs.mkdir(outputDirectory, { recursive: true });
   for (const entry of await fs.readdir(distRoot, { withFileTypes: true })) {
-    // Keep older version directories as local release snapshots, but remove
-    // obsolete flat artifacts from the pre-versioned layout.
+    // Version directories are independent release snapshots; only files at
+    // the dist root are outside the fixed release layout.
     if (!entry.isDirectory()) {
       await fs.rm(path.join(distRoot, entry.name), { force: true });
     }

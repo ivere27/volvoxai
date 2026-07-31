@@ -4,6 +4,7 @@ import type { GraphInspection, GraphInspectionOptions } from '../types.js';
 import type {
   TrainingOptimizerDescriptor,
   TrainingOptimizerOptions,
+  TrainingUpdateMode,
 } from './TrainingOptimizer.js';
 
 interface OptimizerMoments {
@@ -11,6 +12,13 @@ interface OptimizerMoments {
   v: Float32Array;
   step: number;
 }
+
+const OPTIMIZER_TENSOR_REFERENCES: unique symbol =
+  Symbol('volvoxai.optimizerTensorReferences');
+
+type OptimizerReferenceOwner = Graph & {
+  [OPTIMIZER_TENSOR_REFERENCES]?: Map<string, Tensor>;
+};
 
 export interface TrainingGraphState {
   optimizerState: Map<string, OptimizerMoments> | null;
@@ -22,12 +30,24 @@ export interface TrainingGraphState {
 export type StatefulTrainingGraph = Graph & TrainingGraphState;
 
 export interface TrainingTensorUpdateOptions extends TrainingOptimizerOptions {
-  mode?: 'assign' | 'add' | 'sgd' | 'adamw';
+  mode?: 'assign' | 'add' | TrainingUpdateMode;
 }
 
 type TrainingTensorUpdate = Float32Array | ArrayBuffer | ArrayBufferView | ArrayLike<number>;
 
-const optimizerTensorReferences = new WeakMap<Graph, Map<string, Tensor>>();
+function optimizerTensorReferences(graph: Graph): Map<string, Tensor> {
+  const owner = graph as OptimizerReferenceOwner;
+  let references = owner[OPTIMIZER_TENSOR_REFERENCES];
+  if (!references) {
+    references = new Map();
+    Object.defineProperty(owner, OPTIMIZER_TENSOR_REFERENCES, {
+      configurable: true,
+      enumerable: false,
+      value: references,
+    });
+  }
+  return references;
+}
 
 function defineState(graph: object, name: keyof TrainingGraphState, value: unknown) {
   if (name in graph) return;
@@ -97,11 +117,7 @@ export function ensureTrainingGraphState<TGraph extends Graph>(graph: TGraph): T
 export function synchronizeTrainingGraphState(graph: Graph): StatefulTrainingGraph {
   const trainingGraph = ensureTrainingGraphState(graph);
   if (!(trainingGraph.optimizerState instanceof Map)) return trainingGraph;
-  let references = optimizerTensorReferences.get(trainingGraph);
-  if (!references) {
-    references = new Map();
-    optimizerTensorReferences.set(trainingGraph, references);
-  }
+  const references = optimizerTensorReferences(trainingGraph);
   for (const [name, state] of trainingGraph.optimizerState) {
     const tensor = trainingGraph.getTensor?.(name);
     const previous = references.get(name);
@@ -189,11 +205,7 @@ export function applyTrainingTensorUpdate(
   if (nextState) {
     trainingGraph.optimizerState ||= new Map();
     trainingGraph.optimizerState.set(name, nextState);
-    let references = optimizerTensorReferences.get(trainingGraph);
-    if (!references) {
-      references = new Map();
-      optimizerTensorReferences.set(trainingGraph, references);
-    }
+    const references = optimizerTensorReferences(trainingGraph);
     references.set(name, tensor);
   }
   return result;

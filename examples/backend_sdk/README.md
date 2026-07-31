@@ -1,63 +1,95 @@
-# Native backend SDK example
+# Native backend-provider examples
 
-`host_backend.c` is a minimal backend that includes only the public
-`volvoxai_backend.h` contract. It handles exact-shape F32 `Add` and declines
-broadcasting, fused activation, and every other node, leaving CPU as the
-correctness fallback. `Add` is deliberately non-elided by the default graph
-optimizer, so the example callback is exercised in a normal configuration.
+These examples include only the public headers volvoxai.h and
+volvoxai_backend.h. They demonstrate the instance-oriented
+VxBackendProvider contract.
 
-Compile it into an embedding application together with VolvoxAI, then select
-it before loading a model:
+A provider descriptor creates three explicit ownership levels:
 
-```c
-int volvoxai_example_host_backend_register(void);
+~~~text
+provider runtime instance
+  compiled-model instance
+    execution-context instance
+~~~
 
-if (volvoxai_example_host_backend_register() != 0 ||
-    volvoxai_engine_configure_backend("example-host") != 0) {
-    /* registration error or device unavailable */
+The runtime calls compile once for a VxModelSource and VxBackendPolicy.
+context_create then makes isolated mutable state for each request stream.
+context_set_input copies or imports a named input. context_execute writes
+every declared output exactly once through VxBackendOutputSink.
+
+Create a Runtime, then register the descriptor before loading or compiling a
+model that may select it:
+
+~~~c
+VxBackendProvider provider = {
+    .struct_size = sizeof(VxBackendProvider),
+    .abi_version = VX_BACKEND_ABI_VERSION,
+    .name = "example-host",
+    .user_data = &driver,
+    .runtime_create = example_runtime_create,
+    .runtime_destroy = example_runtime_destroy,
+    .compile = example_compile,
+    .compiled_destroy = example_compiled_destroy,
+    .context_create = example_context_create,
+    .context_set_input = example_context_set_input,
+    .context_execute = example_context_execute,
+    .context_select_adapter = NULL,
+    .context_close = example_context_close,
+    .context_destroy = example_context_destroy,
+};
+
+VxRuntimeOptions runtime_options = VX_RUNTIME_OPTIONS_INIT;
+VxReport report = VX_REPORT_INIT;
+VxRuntime* runtime = NULL;
+VxStatus status = vx_runtime_create(&runtime_options, &runtime, &report);
+if (status == VX_STATUS_OK) {
+    status = vx_runtime_register_provider(runtime, &provider, &report);
 }
-```
+~~~
 
-A vendor backend normally keeps the opaque node/tensor discovery code and
-replaces the host `memcpy` with driver compilation/submission. If outputs stay
-on the device, set `VX_BACKEND_FLAG_DEVICE_RESIDENT_OUTPUTS` and implement the
-paired `mark_host`/`sync_host` callbacks. The full ABI and lifecycle contract
-are documented in [Backend SDK](../../docs/backend-sdk.md).
+Select it through ordinary model compilation:
 
-## Android NNAPI compatibility example
+~~~c
+VxBackendPolicy policy = VX_BACKEND_POLICY_INIT;
+policy.mode = VX_BACKEND_REQUIRE;
+policy.operator_fallback = VX_OPERATOR_FALLBACK_FORBID;
+const char* required_backends[] = { "example-host" };
+policy.backends = required_backends;
+policy.backend_count = 1;
 
-`android_nnapi_backend.c` is a public-header-only Android example. It registers
-as `android-nnapi-add`, leaving the built-in `VOLVOXAI_BACKEND_NNAPI` enum and
-the existing `--nnapi` command-line option unchanged:
+VxCompiledModel* compiled = NULL;
+status = vx_model_compile(model, &policy, &compiled, &report);
+~~~
 
-```c
-#include "android_nnapi_backend.h"
+VX_BACKEND_REQUIRE uses exactly one backend entry. VX_BACKEND_PREFER tries the
+listed entries in order.
 
-if (volvoxai_example_nnapi_backend_register() != 0 ||
-    volvoxai_engine_configure_backend("android-nnapi-add") != 0) {
-    /* registration error or no NNAPI device */
-}
-```
+The descriptor and name are copied. Callback code and user_data must remain
+valid until every handle created from the provider has been released.
 
-The `test_backend_sdk` CTest case compiles this example
-(`android_nnapi_backend.c`) into the native backend-SDK test on any host, so a
-plain `make test_native` exercises it. On a non-Android host, the source still
-compiles and its backend reports `VX_INIT_UNAVAILABLE`; the native SDK test uses
-that path to verify explicit-selection policy. For an Android build, cross-compile
-with the NDK CMake toolchain (see `native/CMakeLists.txt`).
+The output sink copies each output before write returns. A provider therefore
+cannot lend a mutable scratch buffer or device pointer to VxResult. If a
+provider needs asynchronous device work, it completes or snapshots that work
+before publishing the output.
 
-The example intentionally handles only rank 1–4, exact-shape, contiguous F32
-`Add` with no fused activation. Broadcasting, scalar tensors, quantized types,
-fused ReLU, and every other operator are declined to the CPU fallback. It
-creates and compiles a small NNAPI model for every handled node invocation and
-writes the result to host storage, making it readable rather than a performance
-backend. A production delegate should cache validated compilations and add
-device-resident coherence hooks.
+Providers that support adapter revisions implement context_select_adapter.
+The callback receives the exact adapter identity/revision pinned by the
+context; leaving it NULL makes non-base adapter selection fail explicitly.
 
-Backend ABI v1 is also whole-node only. VolvoxAI does not offer this example to
-the SDK registry during training, adapter-modified Linear, legacy QTensor, or
-prefix/row-windowed execution; built-in routes and CPU keep those semantics.
+The Android example shows where an NNAPI-backed implementation fits. Android
+15 deprecates NNAPI, so new deployments should expose QNN, LiteRT delegates,
+or another vendor runtime through the same provider seam.
 
-NNAPI itself is deprecated in Android 15. This file demonstrates how a legacy
-Android accelerator can live outside core dispatch; new devices should use the
-same named SDK seam with their vendor runtime or delegate.
+A production provider should:
+
+- validate the whole Graph during compile;
+- fail unsupported required routes before context creation;
+- keep device/runtime state in the matching provider instance;
+- keep mutable bindings and queues in each context instance;
+- write all declared outputs with exact names, dtypes, shapes, and byte sizes;
+- make close idempotent and destroy each instance exactly once;
+- report a device identity through VxReport when the provider can identify it,
+  together with the failure stage.
+
+The complete contract is in
+[Backend SDK](../../docs/backend-sdk.md).

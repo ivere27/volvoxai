@@ -18,7 +18,7 @@ test('CPU Mask accepts the mask alias and preserves I32 nonzero semantics', () =
   assert.deepEqual([...out.buffer], [-1, 20, 30, 40]);
 });
 
-test('CPU Where requires canonical exact-shape F32 operands and F32/I32 conditions', () => {
+test('CPU Where requires canonical exact-shape same-dtype operands and F32/I32 conditions', () => {
   const condition = tensor([1, 4], 'int32', Int32Array.of(1, 0, 1, 0));
   const a = tensor([2, 2], 'float32', Float32Array.of(1, 2, 3, 4));
   const b = tensor([2, 2], 'float32', Float32Array.of(5, 6, 7, 8));
@@ -26,6 +26,6 @@ test('CPU Where requires canonical exact-shape F32 operands and F32/I32 conditio
 
   assert.throws(
     () => _cpuWhere({ id: 'where_bad_shape', opType: 'Where', inputs: { condition, a, b }, outputs: { out } }),
-    /exact-shape F32 operands\/output and an F32 or I32 condition/,
+    /exact-shape same-dtype F32\/I32 operands\/output and an F32 or I32 condition/,
   );
 });

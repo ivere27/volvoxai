@@ -5,12 +5,17 @@
 <pre id="out">RUNNING…</pre>
 <script type="module">
 // End-to-end per-op correctness test for the WebGPU (Tier 2) executor. Each op is
-// run through the REAL GraphExecutor on WebGPU and compared against the pure-JS
-// CPUEngine reference. Prints one PASS/FAIL line per op plus a final summary.
-import { VolvoxAI, CPUEngine, Graph } from '../dist/0.2.0/volvoxai.js';
+// run through the public WebGPU provider and compared against the CPU provider.
+// Prints one PASS/FAIL line per op plus a final summary.
+import { VolvoxAI, Graph } from '../dist/0.3.0/volvoxai.js';
 
 const out = document.getElementById('out');
 const log = (s) => { out.textContent += s + '\n'; };
+const failureMessage = (error) => {
+  const candidate = error?.report?.candidates?.at?.(-1);
+  const details = [candidate?.message, error?.cause?.message].filter(Boolean);
+  return `${error?.message || error}${details.length ? ` (${details.join('; ')})` : ''}`;
+};
 
 function buildGraph(spec) {
   if (spec.buildGraph) return spec.buildGraph();
@@ -21,7 +26,7 @@ function buildGraph(spec) {
   for (const [k, v] of Object.entries(spec.opInputs)) inMap[k] = g.tensors.get(v);
   const out = spec.outDtype ? { shape: spec.outShape, dtype: spec.outDtype } : spec.outShape;
   const outs = g.addOp(spec.opType, inMap, { out }, spec.params || {});
-  g.outputNames = [outs.out.name];
+  g.setOutputs(outs.out);
   return g;
 }
 
@@ -32,36 +37,36 @@ function maxAbsDiff(a, b) {
   return m;
 }
 
-async function readTypedOutput(exec, gpuBuffer, tensor) {
-  // GraphExecutor.readBuffer currently exposes an F32 view for validation.
-  // Read an aligned GPU range, then reinterpret its copied bytes according to
-  // the graph-declared output dtype so integer parity cases are meaningful.
-  const alignedBytes = Math.ceil(tensor.sizeBytes / 4) * 4;
-  const raw = await exec.readBuffer(gpuBuffer, alignedBytes);
-  const bytes = raw.buffer.slice(raw.byteOffset, raw.byteOffset + tensor.sizeBytes);
-  switch (tensor.dtype) {
-    case 'float32': return new Float32Array(bytes);
-    case 'int32': return new Int32Array(bytes);
-    case 'int8': return new Int8Array(bytes);
-    case 'uint8': return new Uint8Array(bytes);
-    default: throw new Error(`unsupported output dtype '${tensor.dtype}'`);
+async function executeGraph(runtime, graph, backend, inputs) {
+  const model = runtime.createModel(graph);
+  let compiled;
+  let context;
+  let result;
+  try {
+    compiled = await model.compile({
+      backend: { mode: 'require', backend, operatorFallback: 'forbid' },
+    });
+    context = await compiled.createContext();
+    result = await context.execute(inputs);
+    return await result.output(graph.outputNames[0]).read();
+  } finally {
+    await result?.close();
+    await context?.close();
+    await compiled?.close();
+    await model.close();
   }
 }
 
-async function runCase(engine, spec) {
+async function runCase(cpuRuntime, gpuRuntime, spec) {
   // Reference on CPU
-  const cpu = new CPUEngine();
   const gc = buildGraph(spec);
-  cpu.allocateGraph(gc);
-  const rc = await cpu.execute(gc, spec.inputData || {});
-  const expected = spec.expected || Array.from(rc[gc.outputNames[0]]);
+  const expected = spec.expected || Array.from(
+    await executeGraph(cpuRuntime, gc, 'cpu', spec.inputData || {}),
+  );
 
   // WebGPU
   const gg = buildGraph(spec);
-  const exec = await engine.compile(gg);
-  const outBuf = await exec.execute(spec.inputData || {});
-  const outputTensor = gg.getTensor(gg.outputNames[0]);
-  const got = Array.from(await readTypedOutput(exec, outBuf, outputTensor));
+  const got = Array.from(await executeGraph(gpuRuntime, gg, 'webgpu', spec.inputData || {}));
 
   const diff = maxAbsDiff(expected, got);
   const ok = diff < 1e-3;
@@ -135,7 +140,7 @@ async function runI32DequantScaleBackwardCase(device, zeroPointValues, zeroPoint
 }
 
 const ramp = (n, f = 1) => Float32Array.from({ length: n }, (_, i) => (i % 9 - 4) * f);
-// These are finite F32 values below the former WGSL -1e38 maximum sentinel.
+// These are finite F32 values below the WGSL-safe maximum-search sentinel.
 // Keeping both values equal also makes the profile mean exactly representable.
 const extremeNegativePair = Float32Array.of(-1.1e38, -1.1e38);
 
@@ -165,7 +170,7 @@ function buildMoEGraph() {
     route_indices: routes.indices,
     route_weights: routes.weights,
   }, { out: { name: 'moe_out', shape: [2, 2] } });
-  g.outputNames = [out.name];
+  g.setOutputs(out);
   return g;
 }
 
@@ -192,7 +197,7 @@ function buildW8A8LinearGraph() {
       quantization: { scheme: 'per_tensor', scale: 0.05, zero_point: -3 },
     },
   });
-  g.outputNames = [out.name];
+  g.setOutputs(out);
   return g;
 }
 
@@ -221,7 +226,7 @@ function buildW8A8ConvGraph() {
     data_layout: 'NHWC', weight_layout: 'OHWI', stride: [1, 1],
     padding: [1, 1], dilation: [1, 1], groups: 1, relu: 0,
   });
-  g.outputNames = [out.name];
+  g.setOutputs(out);
   return g;
 }
 
@@ -254,7 +259,7 @@ function buildW8A8ConvTailGraph(inputChannels) {
     data_layout: 'NHWC', weight_layout: 'OHWI', stride: [1, 1],
     padding: [0, 0], dilation: [1, 1], groups: 1, relu: 0,
   });
-  g.outputNames = [out.name];
+  g.setOutputs(out);
   return g;
 }
 
@@ -362,7 +367,7 @@ const specs = [
     weights: [{ name: 'w', shape: [2, 1, 3], data: Float32Array.from([.1,.2,-.1, -.2,.1,.3]) }, { name: 'b', shape: [2], data: Float32Array.from([.05,-.1]) }],
     opInputs: { input: 'x', weight: 'w', bias: 'b' }, outShape: [1, 2, 4],
     params: { stride: 1, padding: 1, groups: 2 }, inputData: { x: Float32Array.from([.2,-.1,.4,.3,.5,.1,-.2,.6]) } },
-  { name: 'Interp1D(batch)', opType: 'Interp1D', inputs: [{ name: 'x', shape: [2, 1, 2] }], opInputs: { input: 'x' },
+  { name: 'Interpolate1D(batch)', opType: 'Interpolate1D', inputs: [{ name: 'x', shape: [2, 1, 2] }], opInputs: { input: 'x' },
     outShape: [2, 1, 4], params: { size: 4 }, inputData: { x: Float32Array.from([0, 2, 10, 14]) } },
   { name: 'Where', opType: 'Where',
     inputs: [{ name: 'c', shape: [8] }, { name: 'a', shape: [8] }, { name: 'b', shape: [8] }],
@@ -377,7 +382,8 @@ const specs = [
       a: Float32Array.of(10, 20, 30, 40), b: Float32Array.of(-1, -2, -3, -4),
     } },
   { name: 'Gather', opType: 'Gather',
-    weights: [{ name: 't', shape: [4, 3], data: ramp(12) }, { name: 'idx', shape: [2], data: Float32Array.from([0, 2]) }],
+    weights: [{ name: 't', shape: [4, 3], data: ramp(12) },
+      { name: 'idx', shape: [2], dtype: 'int32', data: Int32Array.of(0, 2) }],
     opInputs: { input: 't', indices: 'idx' }, outShape: [2, 3], params: { axis: 0 }, inputData: {} },
   { name: 'Gather(I32 axis=-1)', opType: 'Gather',
     inputs: [{ name: 'data', shape: [2, 3, 4] }, { name: 'indices', shape: [2], dtype: 'int32' }],
@@ -397,7 +403,7 @@ const specs = [
     outShape: [2], params: {}, inputData: { x: Float32Array.from([1, 2, 3, 4, 5, 6]) } },
   { name: 'ReduceMean', opType: 'ReduceMean', inputs: [{ name: 'x', shape: [2, 3] }], opInputs: { input: 'x' },
     outShape: [2], params: {}, inputData: { x: Float32Array.from([1, 2, 3, 4, 5, 6]) } },
-  { name: 'AveragePool', opType: 'AveragePool', inputs: [{ name: 'x', shape: [1, 4, 4, 1] }], opInputs: { input: 'x' },
+  { name: 'AveragePool2D', opType: 'AveragePool2D', inputs: [{ name: 'x', shape: [1, 4, 4, 1] }], opInputs: { input: 'x' },
     outShape: [1, 2, 2, 1], params: { kernel: [2, 2], stride: [2, 2] }, inputData: { x: ramp(16) } },
   { name: 'DequantizeLinear', opType: 'DequantizeLinear',
     inputs: [{ name: 'x', shape: [4] }], weights: [{ name: 's', shape: [1], data: Float32Array.from([0.5]) }],
@@ -440,29 +446,38 @@ const specs = [
 ];
 
 (async () => {
+  let cpuRuntime;
+  let gpuRuntime;
+  let validationDevice;
   try {
     if (!navigator.gpu) { out.textContent = 'FATAL no navigator.gpu'; return; }
-    const engine = await VolvoxAI.init('webgpu');
+    cpuRuntime = await VolvoxAI.createRuntime({ backends: ['cpu'] });
+    gpuRuntime = await VolvoxAI.createRuntime({ backends: ['webgpu'] });
     const adapter = await navigator.gpu.requestAdapter();
     const info = adapter.info || {};
-    const validationDevice = await adapter.requestDevice();
+    validationDevice = await adapter.requestDevice();
     const packedDot = navigator.gpu.wgslLanguageFeatures?.has('packed_4x8_integer_dot_product') === true;
     out.textContent = `adapter: ${info.vendor || '?'} / ${info.architecture || '?'} ${info.description || ''}` +
       ` packed-dot=${packedDot}\n`;
     let pass = 0, fail = 0;
     for (const spec of specs) {
-      try { (await runCase(engine, spec)) ? pass++ : fail++; }
-      catch (e) { fail++; log(`FAIL  ${spec.name.padEnd(18)} threw: ${e.message}`); }
+      try { (await runCase(cpuRuntime, gpuRuntime, spec)) ? pass++ : fail++; }
+      catch (e) { fail++; log(`FAIL  ${spec.name.padEnd(18)} threw: ${failureMessage(e)}`); }
     }
     for (const [zeroPoint, zeroPointType, label] of [
       [Int32Array.of(16_777_216), 1, 'Dequant dScale(I32)'],
       [Float32Array.of(16_777_216), 0, 'Dequant dScale(F32 zp)'],
     ]) {
       try { (await runI32DequantScaleBackwardCase(validationDevice, zeroPoint, zeroPointType, label)) ? pass++ : fail++; }
-      catch (e) { fail++; log(`FAIL  ${label.padEnd(18)} threw: ${e.message}`); }
+      catch (e) { fail++; log(`FAIL  ${label.padEnd(18)} threw: ${failureMessage(e)}`); }
     }
     log(`\nSUMMARY ${pass}/${pass + fail} passed` + (fail === 0 ? '  ALL_PASS' : `  ${fail}_FAILED`));
   } catch (e) { out.textContent += '\nFATAL ' + e.message + '\n' + e.stack; }
+  finally {
+    validationDevice?.destroy?.();
+    await gpuRuntime?.close();
+    await cpuRuntime?.close();
+  }
 })();
 </script>
 </body>

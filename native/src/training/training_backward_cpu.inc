@@ -878,7 +878,8 @@ static int backward_resize_nearest2d(float** grads, Node* n, T* out, const float
 }
 
 static int backward_concat(float** grads, Node* n, T* out, const float* go) {
-    if (!n || !out || !go || out->dtype != T_F32 || out->ndim <= 0) return -1;
+    if (!n || !out || !go || out->dtype != T_F32 || out->ndim <= 0 ||
+        p_int(n->params, "sigmoid", 0) != 0) return -1;
     int axis = p_int(n->params, "axis", 1);
     if (axis < 0) axis += out->ndim;
     if (axis < 0 || axis >= out->ndim) return -1;
@@ -919,21 +920,11 @@ static int backward_split(float** grads, Node* n) {
     long outer = in->numel / ((long)in->shape[axis] * inner);
     if (inner <= 0 || outer <= 0 || in->numel != outer * in->shape[axis] * inner) return -1;
 
-    int order[MAXIN];
-    for (int i = 0; i < n->nout; i++) order[i] = i;
-    for (int i = 0; i < n->nout; i++) {
-        for (int j = i + 1; j < n->nout; j++) {
-            if (strcmp(n->outs[order[j]].key, n->outs[order[i]].key) < 0) {
-                int tmp = order[i]; order[i] = order[j]; order[j] = tmp;
-            }
-        }
-    }
-
     float* gi = grad_for(grads, in);
     if (!gi) return -1;
     int axis_offset = 0;
     for (int oi = 0; oi < n->nout; oi++) {
-        T* out = t_find(n->outs[order[oi]].name);
+        T* out = t_find(n->outs[oi].name);
         if (!out || out->dtype != T_F32 || out->ndim != in->ndim || out->shape[axis] <= 0) return -1;
         for (int d = 0; d < in->ndim; d++) {
             if (d != axis && out->shape[d] != in->shape[d]) return -1;

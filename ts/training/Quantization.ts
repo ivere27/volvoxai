@@ -1,6 +1,11 @@
 import { SafetensorsFile } from '../core/Safetensors.js';
 import type { Graph } from '../core/Graph.js';
-import type { RuntimeDType, RuntimeTypedArray, TensorQuantization } from '../types.js';
+import type {
+  RuntimeDType,
+  RuntimeTypedArray,
+  SerializedAffineQuantizationReference,
+} from '../types.js';
+import type { PtqSchemeValue } from '../generated/volvoxaiFullEnums.js';
 
 export const VOLVOX_PTQ_FORMAT = 'volvox.ptq.v1';
 
@@ -8,8 +13,8 @@ const F32_MIN_NORMAL = 1.1754943508222875e-38;
 const I32_MIN = -2147483648;
 const I32_MAX = 2147483647;
 
-export type PTQDType = 'int8' | 'uint8';
-export type PTQScheme = 'symmetric' | 'asymmetric';
+export type PTQDType = Extract<RuntimeDType, 'int8' | 'uint8'>;
+export type PTQScheme = PtqSchemeValue;
 type NumericArray = ArrayLike<number>;
 type QuantizedArray = Int8Array | Uint8Array;
 type QuantizedArrayConstructor = Int8ArrayConstructor | Uint8ArrayConstructor;
@@ -40,6 +45,7 @@ export interface PTQWeightRequest {
   axis?: number;
   outputName?: string;
   scaleName?: string;
+  zeroPointName?: string;
   bias?: string;
   biasOutputName?: string;
   inputScale?: number;
@@ -48,35 +54,6 @@ export interface PTQWeightRequest {
 export interface PTQMaterializeOptions {
   metadata?: Record<string, string>;
   includeUnselected?: boolean;
-}
-
-export interface PTQExecutor {
-  execute(inputs: Record<string, unknown>, options?: Record<string, unknown>): Promise<any> | any;
-  graph?: Graph;
-  _graph?: Graph;
-  capabilities?: { outputLocation?: 'host' | 'device' };
-  gpuBuffers?: Map<unknown, unknown>;
-}
-
-export interface PTQReadbackContext {
-  executor: PTQExecutor;
-  graph: Graph;
-  result: any;
-  sample: Record<string, unknown>;
-  sampleIndex: number;
-}
-
-export type PTQReadback = (
-  name: string,
-  context: PTQReadbackContext,
-) => Float32Array | Promise<Float32Array>;
-
-export interface PTQCalibrationOptions {
-  graph?: Graph;
-  tensorNames?: string[];
-  readback?: PTQReadback | Record<string, PTQReadback>;
-  calibrator?: PTQCalibrator;
-  executeOptions?: Record<string, unknown>;
 }
 
 function quantizedDomain(dtype: PTQDType): {
@@ -378,7 +355,7 @@ export function packPTQBias(
   return output;
 }
 
-/** Named observer set for collecting CPU-visible graph tensors after forwards. */
+/** Named observer set for caller-owned F32 result snapshots. */
 export class PTQCalibrator {
   observers: Map<string, PTQObserver>;
 
@@ -403,116 +380,11 @@ export class PTQCalibrator {
     return this;
   }
 
-  observeGraph(graph: Graph, names: string[] | null = null) {
-    if (!graph?.tensors || !(graph.tensors instanceof Map)) {
-      throw new Error('PTQ observeGraph expects a VolvoxAI Graph.');
-    }
-    const selected = names == null
-      ? [...graph.tensors.values()].filter((tensor) => !tensor.isWeight && tensor.dtype === 'float32' && tensor.buffer)
-      : names.map((name) => {
-        const tensor = graph.tensors.get(name);
-        if (!tensor) throw new Error(`PTQ tensor '${name}' was not found.`);
-        return tensor;
-      });
-    const prepared = selected.map((tensor) => {
-      if (tensor.dtype !== 'float32' || !(tensor.buffer instanceof Float32Array)) {
-        throw new Error(`PTQ tensor '${tensor.name}' requires CPU-visible F32 storage.`);
-      }
-      finiteRange(tensor.buffer, `PTQ tensor '${tensor.name}'`);
-      return tensor;
-    });
-    for (const tensor of prepared) this.observe(tensor.name, tensor.buffer as Float32Array);
-    return this;
-  }
-
   parameters(options: PTQParameterOptions = {}) {
     return Object.freeze(Object.fromEntries(
       [...this.observers].map(([name, observer]) => [name, derivePTQParameters(observer, options)]),
     ));
   }
-}
-
-/**
- * Run named calibration samples through an allocated backend and observe F32
- * tensors after every forward. Device-output backends require an explicit
- * `readback(name, context)` callback so stale host mirrors are never sampled.
- */
-export async function calibratePTQ(
-  executor: PTQExecutor,
-  samples: Iterable<Record<string, unknown>> | AsyncIterable<Record<string, unknown>>,
-  options: PTQCalibrationOptions = {},
-): Promise<PTQCalibrator> {
-  if (!executor || typeof executor.execute !== 'function') {
-    throw new Error('calibratePTQ expects an allocated backend executor.');
-  }
-  if (!samples || (typeof samples[Symbol.iterator] !== 'function' &&
-      typeof samples[Symbol.asyncIterator] !== 'function')) {
-    throw new Error('calibratePTQ samples must be an iterable or async iterable of named inputs.');
-  }
-  const graph = options.graph ?? executor.graph ?? executor._graph;
-  if (!graph?.tensors || !(graph.tensors instanceof Map)) {
-    throw new Error('calibratePTQ requires the allocated graph in options.graph or executor.graph.');
-  }
-  if (options.tensorNames != null && !Array.isArray(options.tensorNames)) {
-    throw new Error('calibratePTQ options.tensorNames must be an array.');
-  }
-  const tensorNames = options.tensorNames == null
-    ? [...graph.tensors.values()]
-      .filter((tensor) => !tensor.isWeight && tensor.dtype === 'float32')
-      .map((tensor) => tensor.name)
-    : [...options.tensorNames];
-  if (tensorNames.length === 0 || tensorNames.some((name) => typeof name !== 'string' || !name)) {
-    throw new Error('calibratePTQ requires at least one valid tensor name.');
-  }
-  for (const name of tensorNames) {
-    const tensor = graph.tensors.get(name);
-    if (!tensor || tensor.dtype !== 'float32') {
-      throw new Error(`PTQ tensor '${name}' must be a graph F32 tensor.`);
-    }
-  }
-  const deviceOutput = executor.capabilities?.outputLocation === 'device' ||
-    (!executor.capabilities && executor.gpuBuffers instanceof Map);
-  const readback = options.readback;
-  if (deviceOutput && readback == null) {
-    throw new Error('calibratePTQ requires a readback mapping for a device-output backend.');
-  }
-  if (readback != null && typeof readback !== 'function' &&
-      (typeof readback !== 'object' || Array.isArray(readback))) {
-    throw new Error('calibratePTQ readback must be a function or name-to-function mapping.');
-  }
-  const calibrator = options.calibrator ?? new PTQCalibrator();
-  if (!(calibrator instanceof PTQCalibrator)) {
-    throw new Error('calibratePTQ options.calibrator must be a PTQCalibrator.');
-  }
-  let sampleIndex = 0;
-  for await (const sample of samples) {
-    if (!sample || typeof sample !== 'object' || Array.isArray(sample)) {
-      throw new Error(`PTQ calibration sample ${sampleIndex} must be a named input object.`);
-    }
-    const result = await executor.execute(sample, options.executeOptions || {});
-    const observations: Array<[string, Float32Array]> = [];
-    for (const name of tensorNames) {
-      let values;
-      if (readback != null) {
-        const reader = typeof readback === 'function' ? readback : readback[name];
-        if (typeof reader !== 'function') {
-          throw new Error(`PTQ readback mapping is missing tensor '${name}'.`);
-        }
-        values = await reader(name, { executor, graph, result, sample, sampleIndex });
-      } else {
-        values = result?.[name] ?? graph.tensors.get(name)?.buffer;
-      }
-      if (!(values instanceof Float32Array)) {
-        throw new Error(`PTQ tensor '${name}' has no CPU-visible F32 values after sample ${sampleIndex}.`);
-      }
-      finiteRange(values, `PTQ tensor '${name}' at sample ${sampleIndex}`);
-      observations.push([name, values]);
-    }
-    for (const [name, values] of observations) calibrator.observe(name, values);
-    sampleIndex++;
-  }
-  if (sampleIndex === 0) throw new Error('calibratePTQ received no calibration samples.');
-  return calibrator;
 }
 
 type PackedPTQWeight = ReturnType<typeof packPTQWeight>;
@@ -521,6 +393,7 @@ interface PTQMaterializedRecord {
   sourceName: string;
   outputName: string;
   scaleName: string;
+  zeroPointName: string;
   packed: PackedPTQWeight;
   bias?: {
     sourceName: string;
@@ -539,10 +412,11 @@ interface PTQReplacement {
 /**
  * Export selected F32 graph weights as a zero-dependency I8 safetensors file.
  *
- * Each request is `{ name, axis?, outputName?, scaleName?, bias?,
+ * Each request is `{ name, axis?, outputName?, scaleName?, zeroPointName?, bias?,
  * biasOutputName?, inputScale? }`. Unselected weights are copied by default.
- * The returned `weightsQuantization` object can be merged directly into a
- * Volvox blueprint's `weights_quantization` field.
+ * The returned `quantization` table can be installed directly as the sole
+ * `volvox-graph/v1` graph.quantization object. Scale and zero-point values live
+ * only in the returned Safetensors file.
  */
 export function materializePTQWeights(
   graph: Graph,
@@ -558,7 +432,7 @@ export function materializePTQWeights(
   const materialized: Readonly<PTQMaterializedRecord>[] = [];
   const replacements = new Map<string, PTQReplacement>();
   const consumedSources = new Set<string>();
-  const weightsQuantization: Record<string, TensorQuantization> = {};
+  const quantizationTensors: Record<string, SerializedAffineQuantizationReference> = {};
   const claimedNames = new Set<string>();
   const claim = (name: string, label: string): void => {
     if (typeof name !== 'string' || !name || name === '__metadata__' ||
@@ -582,8 +456,10 @@ export function materializePTQWeights(
     consumedSources.add(source.name);
     const outputName = request.outputName ?? source.name;
     const scaleName = request.scaleName ?? `${outputName}.scale`;
+    const zeroPointName = request.zeroPointName ?? `${outputName}.zero_point`;
     claim(outputName, 'PTQ outputName');
     claim(scaleName, 'PTQ scaleName');
+    claim(zeroPointName, 'PTQ zeroPointName');
     const existingOutput = graph.tensors.get(outputName);
     if (existingOutput && existingOutput !== source) {
       throw new Error(`PTQ output '${outputName}' collides with graph tensor '${outputName}'.`);
@@ -591,18 +467,34 @@ export function materializePTQWeights(
     if (graph.tensors.has(scaleName)) {
       throw new Error(`PTQ scale '${scaleName}' collides with graph tensor '${scaleName}'.`);
     }
+    if (graph.tensors.has(zeroPointName)) {
+      throw new Error(`PTQ zero point '${zeroPointName}' collides with graph tensor '${zeroPointName}'.`);
+    }
     const packed = packPTQWeight(source.buffer, source.shape, {
       axis: request.axis ?? 0,
       name: outputName,
     });
-    const record: PTQMaterializedRecord = { sourceName: source.name, outputName, scaleName, packed };
+    const record: PTQMaterializedRecord = {
+      sourceName: source.name, outputName, scaleName, zeroPointName, packed,
+    };
     replacements.set(outputName, {
       name: outputName, dtype: 'int8', shape: [...packed.shape], buffer: packed.data,
     });
     replacements.set(scaleName, {
       name: scaleName, dtype: 'float32', shape: [packed.scales.length], buffer: packed.scales,
     });
-    weightsQuantization[outputName] = packed.quantization;
+    replacements.set(zeroPointName, {
+      name: zeroPointName,
+      dtype: 'int8',
+      shape: [packed.scales.length],
+      buffer: new Int8Array(packed.scales.length),
+    });
+    quantizationTensors[outputName] = Object.freeze({
+      scheme: 'per_axis',
+      axis: packed.quantization.axis,
+      scale_tensor: scaleName,
+      zero_point_tensor: zeroPointName,
+    });
 
     if (request.bias != null) {
       if (request.inputScale == null) {
@@ -643,7 +535,6 @@ export function materializePTQWeights(
   const metadata = {
     ...(options.metadata || {}),
     format: VOLVOX_PTQ_FORMAT,
-    weights_quantization: JSON.stringify(weightsQuantization),
   };
   const file = SafetensorsFile.empty({ metadata });
   if (options.includeUnselected !== false) {
@@ -663,7 +554,10 @@ export function materializePTQWeights(
   return Object.freeze({
     format: VOLVOX_PTQ_FORMAT,
     weights: file,
-    weightsQuantization: Object.freeze(weightsQuantization),
+    quantization: Object.freeze({
+      format: 'volvox-affine-safetensors/v1' as const,
+      tensors: Object.freeze(quantizationTensors),
+    }),
     materialized: Object.freeze(materialized),
   });
 }

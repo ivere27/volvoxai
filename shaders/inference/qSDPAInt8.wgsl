@@ -10,8 +10,8 @@
 //   i32 q_zero_point, k_zero_point, v_zero_point, output_zero_point
 //   f32 q_scale, k_scale, v_scale, output_scale
 //   f32 attention_scale, pad, pad, pad
-// dtypes packs byte dtype codes q | k<<8 | v<<16 | output<<24, where I8=2
-// and U8=3. mask_mode is 0 none, 1 [K], 2 [B,K], 3 [Q,K], 4 [B,Q,K].
+// dtypes packs canonical protobuf values q | k<<8 | v<<16 | output<<24,
+// where I8=6 and U8=5. mask_mode is 0 none, 1 [K], 2 [B,K], 3 [Q,K], 4 [B,Q,K].
 struct Params {
   seq_q : u32,
   seq_kv : u32,
@@ -65,19 +65,19 @@ fn dtype_code(shift : u32) -> u32 {
 
 fn q_value(index : u32, dtype : u32) -> i32 {
   let byte = word_byte(q_words[index / 4u], index);
-  if (dtype == 2u) { return signed_byte(byte); }
+  if (dtype == 6u) { return signed_byte(byte); }
   return i32(byte);
 }
 
 fn k_value(index : u32, dtype : u32) -> i32 {
   let byte = word_byte(k_words[index / 4u], index);
-  if (dtype == 2u) { return signed_byte(byte); }
+  if (dtype == 6u) { return signed_byte(byte); }
   return i32(byte);
 }
 
 fn v_value(index : u32, dtype : u32) -> i32 {
   let byte = word_byte(v_words[index / 4u], index);
-  if (dtype == 2u) { return signed_byte(byte); }
+  if (dtype == 6u) { return signed_byte(byte); }
   return i32(byte);
 }
 
@@ -116,8 +116,8 @@ fn requantized_output(channel : u32) -> u32 {
   let value = partial_out[channel] / partial_sum[0];
   let transformed = value / params.output_scale + f32(params.output_zero_point);
   let output_type = dtype_code(24u);
-  let minimum : i32 = select(0, -128, output_type == 2u);
-  let maximum : i32 = select(255, 127, output_type == 2u);
+  let minimum : i32 = select(0, -128, output_type == 6u);
+  let maximum : i32 = select(255, 127, output_type == 6u);
   if (transformed != transformed) { return output_byte(params.output_zero_point); }
   if (transformed <= f32(minimum)) { return output_byte(minimum); }
   if (transformed >= f32(maximum)) { return output_byte(maximum); }

@@ -9,6 +9,7 @@
 #include "qlinear_w8a8_arm.h"
 #include "qlinear_w8a8_arm_internal.h"
 #include "cpu_features.h"
+#include "kernel_platform.h"
 
 #if defined(__aarch64__) || defined(__ARM_NEON) || defined(__ARM_NEON__)
 #define VX_W8A8_ARM_NEON 1
@@ -104,7 +105,7 @@ int vx_qlinear_i8u8_arm_try(const void* input, const void* weight,
 #if VX_W8A8_ARM_NEON
     if (!vx_w8a8_arm_eligible(&args, 8u)) return 0;
 #if VX_W8A8_ARM_HAS_DOTPROD_OBJECT && (defined(__linux__) || defined(__ANDROID__))
-    if (vx_cpu_has_arm_dotprod() && vx_qlinear_i8u8_arm_dotprod_try(&args)) return 1;
+    if (vx_kernel_platform()->has_arm_dotprod && vx_qlinear_i8u8_arm_dotprod_try(&args)) return 1;
 #endif
     return vx_qlinear_i8u8_arm_neon_try(&args);
 #else

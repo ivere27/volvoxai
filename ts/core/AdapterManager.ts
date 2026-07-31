@@ -17,6 +17,12 @@ import type {
 type ConcreteNode = GraphNode<Tensor>;
 type AdapterKind = 'lora';
 
+interface AdapterSelectorInput {
+  name: string;
+  version?: number;
+  scale?: number;
+}
+
 interface NormalizedAdapterTarget {
   readonly weight: string;
   readonly kind: AdapterKind;
@@ -58,24 +64,14 @@ interface AdapterResourceOwner {
   releaseAdapterTargets?(targets: readonly NormalizedAdapterTarget[]): void;
 }
 
-interface AdapterSelector {
-  name?: string;
-  adapterId?: string;
-  adapter_id?: string;
-  version?: AdapterVersion;
-  versionId?: AdapterVersion;
-  version_id?: AdapterVersion;
-  scale?: number;
-}
-
 interface PinnedAdapterRoute {
   readonly snapshot: AdapterSnapshot;
   readonly scale: number;
 }
 
 interface AdapterExecutionOptions {
-  adapter?: string | AdapterSelector | null;
-  adapters?: Array<string | AdapterSelector | null>;
+  adapter?: AdapterSelectorInput | null;
+  adapters?: Array<AdapterSelectorInput | null>;
 }
 
 interface AdapterManifestTensorSpec {
@@ -116,6 +112,14 @@ const PEFT_LAYOUT = "peft";
 const MANIFEST_FIELDS = new Set(["format", "name", "adapter_id", "version_id", "kind", "targets", "metadata"]);
 const TARGET_FIELDS = new Set(["id", "op", "weight", "kind", "a", "b", "layout", "rank", "alpha", "scale", "tensors"]);
 const TENSOR_SPEC_FIELDS = new Set(["role", "name", "shape", "dtype"]);
+const SELECTOR_FIELDS = new Set(["name", "version", "scale"]);
+const AUTHORING_SPEC_FIELDS = new Set([
+  "kind", "layout", "rank", "alpha", "scale", "sourceVersion", "metadata", "targets",
+]);
+const AUTHORING_TARGET_FIELDS = new Set([
+  "weight", "layout", "rank", "alpha", "scale", "A", "B",
+]);
+const AUTHORING_TENSOR_FIELDS = new Set(["data", "shape"]);
 
 function last(values: readonly number[] | null | undefined): number | undefined {
   return values?.[values.length - 1];
@@ -130,10 +134,12 @@ function linearInput(node: ConcreteNode): Tensor | undefined {
 }
 
 function asF32(value: unknown, label: string): Float32Array {
-  const record = value && typeof value === 'object' ? value as Record<string, unknown> : null;
-  const source = ArrayBuffer.isView(value) || Array.isArray(value)
-    ? value
-    : record?.data ?? record?.values ?? record?.buffer ?? value;
+  const descriptor = value && typeof value === 'object' &&
+    !ArrayBuffer.isView(value) && !(value instanceof ArrayBuffer) && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : null;
+  if (descriptor) assertOnlyFields(descriptor, AUTHORING_TENSOR_FIELDS, label);
+  const source = descriptor ? descriptor.data : value;
   let result: Float32Array;
   if (source instanceof Float32Array) {
     result = new Float32Array(source);
@@ -181,11 +187,11 @@ function normalizeKind(value: unknown): AdapterKind {
 function normalizeTargets(
   targets: AdapterSpec['targets'] | undefined,
 ): AdapterTargetSpec[] {
-  if (Array.isArray(targets)) return targets.map((target) => ({ ...target }));
-  if (targets && typeof targets === "object") {
-    return Object.entries(targets).map(([weight, target]) => ({ ...target, weight: target.weight || weight }));
-  }
-  throw new Error("Adapter spec requires at least one target.");
+  if (!Array.isArray(targets)) throw new Error("Adapter spec targets must be an array.");
+  return targets.map((target, index) => {
+    assertOnlyFields(target, AUTHORING_TARGET_FIELDS, `Adapter target ${index}`);
+    return { ...target } as unknown as AdapterTargetSpec;
+  });
 }
 
 function f32Bytes(array: Float32Array): Uint8Array {
@@ -248,10 +254,12 @@ export class AdapterManager {
   stage(name: string, spec: AdapterSpec, options: AdapterStageOptions = {}): AdapterDescription {
     if (typeof name !== "string" || !name.trim()) throw new Error("Adapter name must be a non-empty string.");
     const adapterName = name.trim();
-    const kind = normalizeKind(spec?.kind || spec?.type);
-    const targets = normalizeTargets(spec?.targets);
+    assertOnlyFields(spec, AUTHORING_SPEC_FIELDS, "Adapter spec");
+    if (spec.kind == null) throw new Error("Adapter spec requires kind 'lora'.");
+    const kind = normalizeKind(spec.kind);
+    const targets = normalizeTargets(spec.targets);
     if (targets.length === 0) throw new Error("Adapter spec requires at least one target.");
-    const activate = options.activate === true || spec?.activate === true;
+    const activate = options.activate === true;
     if (activate && this._merged) {
       throw new Error(`Unmerge '${this._merged.snapshot.id}' before activating an adapter.`);
     }
@@ -310,14 +318,13 @@ export class AdapterManager {
       const target = byWeight.get(weight);
       if (!target) throw new Error(`Adapter '${source.id}' does not target '${weight}'.`);
       for (const [field, value] of Object.entries(patch || {})) {
-        const canonical = field === "a" ? "A" : field === "b" ? "B" : field;
-        if (!["A", "B"].includes(canonical)) {
+        if (!["A", "B"].includes(field)) {
           throw new Error(`Unsupported adapter tensor role '${field}'.`);
         }
-        const next = asF32(value, `${weight}.${canonical}`);
-        const tensor = target[canonical as 'A' | 'B'] as Float32Array | undefined;
+        const next = asF32(value, `${weight}.${field}`);
+        const tensor = target[field as 'A' | 'B'] as Float32Array | undefined;
         if (!tensor || next.length !== tensor.length) {
-          throw new Error(`Adapter tensor '${weight}.${canonical}' has an invalid length.`);
+          throw new Error(`Adapter tensor '${weight}.${field}' has an invalid length.`);
         }
         if (mode === "assign") tensor.set(next);
         else for (let i = 0; i < next.length; i++) tensor[i] += next[i];
@@ -408,15 +415,17 @@ export class AdapterManager {
           }
         }
       }
+      const A = read(target.a, "A");
+      const B = read(target.b, "B");
+      if (!A || !B) throw new Error(`Adapter manifest target ${index} requires A and B tensors.`);
       return {
         weight: target.weight,
         layout: target.layout,
         rank: target.rank,
         alpha: target.alpha,
         scale: target.scale,
-        A: read(target.a, "A"),
-        B: read(target.b, "B"),
-        kind: target.kind,
+        A,
+        B,
       };
     });
     return this.stage(manifest.adapter_id, {
@@ -589,9 +598,8 @@ export class AdapterManager {
     input: AdapterTargetSpec,
     index: number,
   ): NormalizedAdapterTarget {
-    const kind = input.kind ? normalizeKind(input.kind) : defaultKind;
-    if (kind !== defaultKind) throw new Error("One adapter version cannot mix adapter kinds.");
-    const weightName = input.weight || input.baseTensor || input.target;
+    const kind = defaultKind;
+    const weightName = input.weight;
     if (typeof weightName !== 'string' || !weightName) {
       throw new Error(`Adapter target ${index} requires a base tensor name.`);
     }
@@ -617,10 +625,10 @@ export class AdapterManager {
         throw new Error(`Shared adapter target '${weightName}' has inconsistent weight layouts.`);
       }
     }
-    let A = asF32(input.A ?? input.a, `${weightName}.A`);
-    let B = asF32(input.B ?? input.adapterB, `${weightName}.B`);
-    const aShape = valueShape(input.A ?? input.a);
-    const bShape = valueShape(input.B ?? input.adapterB);
+    let A = asF32(input.A, `${weightName}.A`);
+    let B = asF32(input.B, `${weightName}.B`);
+    const aShape = valueShape(input.A);
+    const bShape = valueShape(input.B);
     const layout = String(input.layout || spec.layout || CANONICAL_LAYOUT);
     if (layout !== CANONICAL_LAYOUT && layout !== PEFT_LAYOUT) {
       throw new Error(`Adapter target '${weightName}' has unsupported matrix layout '${layout}'.`);
@@ -721,10 +729,15 @@ export class AdapterManager {
     }
   }
 
-  _resolve(name: string | AdapterSelector, version?: AdapterVersion): AdapterSnapshot {
+  _resolve(name: string | AdapterSelectorInput, version?: AdapterVersion): AdapterSnapshot {
     if (typeof name === "object" && name) {
-      version = name.version ?? name.versionId ?? name.version_id;
-      name = name.name ?? name.adapterId ?? name.adapter_id ?? '';
+      for (const field of Object.keys(name)) {
+        if (!SELECTOR_FIELDS.has(field)) {
+          throw new Error(`Adapter selector contains unsupported field '${field}'.`);
+        }
+      }
+      version = name.version;
+      name = name.name ?? '';
     }
     const versions = this._versions.get(name);
     if (!versions || versions.size === 0) throw new Error(`Adapter '${name}' is not staged.`);
@@ -770,9 +783,19 @@ export class AdapterManager {
   }
 
   _pinSelector(
-    selector: string | AdapterSelector | null | undefined,
+    selector: AdapterSelectorInput | null | undefined,
     useActive = false,
   ): PinnedAdapterRoute | null {
+    if (selector != null && (typeof selector !== "object" || Array.isArray(selector))) {
+      throw new Error("Execution adapter selector must be an object or null.");
+    }
+    if (selector && (typeof selector.name !== "string" || !selector.name)) {
+      throw new Error("Execution adapter selector requires a name.");
+    }
+    if (selector?.version != null &&
+        (!Number.isSafeInteger(selector.version) || selector.version <= 0)) {
+      throw new Error("Execution adapter selector version must be a positive integer.");
+    }
     const snapshot = selector === undefined && useActive ? this._active : (selector == null ? null : this._resolve(selector));
     if (!snapshot) return null;
     const scale = typeof selector === "object" && selector ? selector.scale ?? 1 : 1;

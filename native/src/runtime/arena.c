@@ -8,21 +8,18 @@
 // Similar to planned tensor arenas in optimized inference runtimes. Transient F32 and
 // physical I8/U8 activations are pooled: owned (calloc'd by us -> NOT weights, which
 // point into the blob), with a non-skipped producer node (excludes graph
-// inputs/constants) and at least one consumer (excludes graph outputs and dead tensors),
-// and not aliased by another tensor (excludes Reshape/Flatten passthroughs).
+// inputs/constants), at least one consumer (excludes dead tensors), not declared as a
+// graph output, and not aliased by another tensor (excludes Reshape/Flatten
+// passthroughs). A declared output remains live until the runtime snapshots it after the
+// whole graph, even when an in-graph consumer such as ArgMax has already read it.
 // last-use scans ALL nodes INCLUDING skipped ones, so conv+add residuals and other
 // fused-away consumers keep their buffer live conservatively. Cuts peak activation memory
 // (~88 -> ~10 MB here) which removes most cold-start first-touch page faults.
-/* Arena blocks are raw byte allocations.  T.data is historically typed as a
- * float pointer, but canonical W8A8 intermediates really own one byte per
+/* Arena blocks are raw byte allocations. T.data uses the common float-pointer
+ * field, but canonical W8A8 intermediates really own one byte per
  * element.  Keeping capacities in elements would reserve four times as much
  * memory and, more importantly, would make a mixed F32/I8 reuse plan reason
  * about the wrong unit. */
-static void** g_arena_bufs = NULL;
-static int g_arena_nbufs = 0;
-static int* g_arena_tensor_indices = NULL;
-static int g_arena_tensor_count = 0;
-
 void volvoxai_engine_free_arena(void) {
     for (int i = 0; i < g_arena_nbufs; i++) free(g_arena_bufs[i]);
     free(g_arena_bufs);
@@ -75,10 +72,26 @@ static int t_index_by_name(const char* name) {
     return t ? (int)(t - g_t) : -1;
 }
 
+static int tensor_is_declared_graph_output(const char* name) {
+    cJSON* outputs = g_graph_root
+        ? cJSON_GetObjectItemCaseSensitive(g_graph_root, "outputs") : NULL;
+    if (!name || !cJSON_IsArray(outputs)) return 0;
+    for (cJSON* output = outputs->child; output; output = output->next) {
+        if (cJSON_IsString(output) && output->valuestring &&
+            !strcmp(output->valuestring, name))
+            return 1;
+    }
+    return 0;
+}
+
 static void plan_memory_arena(void) {
     const char* en = getenv("VOLVOX_ARENA");
     if (en && en[0] && !strcmp(en, "0")) return;   // default-on; VOLVOX_ARENA=0 disables
-    if (g_use_vulkan || g_use_opengl || g_use_metal || g_use_nnapi) return;
+    if (g_use_vulkan || g_use_opengl || g_use_metal || g_use_nnapi
+#if VOLVOXAI_ENABLE_CUDA
+        || g_use_cuda
+#endif
+    ) return;
     int nt = g_nt, nn = g_nn;
     if (nt <= 0 || nn <= 0) return;
 
@@ -111,7 +124,9 @@ static void plan_memory_arena(void) {
         if (!(t->owns && (t->dtype == T_F32 || t->dtype == T_I8 || t->dtype == T_U8) &&
               t->numel > 0 && t->elem_size > 0 &&
               (size_t)t->numel <= SIZE_MAX / t->elem_size)) continue;
-        if (prod[i] < 0 || last[i] < 0) continue;          // graph input/const or output/dead
+        if (prod[i] < 0 || last[i] < 0 ||
+            tensor_is_declared_graph_output(t->name))
+            continue;                                      // graph input/const, output, or dead
         int aliased = 0;
         for (int u = 0; u < nt; u++) if (u != i && g_t[u].data == t->data) { aliased = 1; break; }
         if (aliased) continue;

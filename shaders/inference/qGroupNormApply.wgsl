@@ -42,7 +42,7 @@ fn signed_byte(value : u32) -> i32 {
 
 fn input_value(index : u32) -> i32 {
   let byte = word_byte(input_words[index / 4u], index);
-  if (params.input_type == 2u) { return signed_byte(byte); }
+  if (params.input_type == 6u) { return signed_byte(byte); }
   return i32(byte);
 }
 
@@ -76,8 +76,8 @@ fn qgroupnorm_one(index : u32) -> u32 {
     group_stats[stats_offset + 1u];
   let value = normalized * gamma[channel] + beta[channel];
   let transformed = value / params.output_scale + f32(params.output_zero_point);
-  let minimum = select(0, -128, params.output_type == 2u);
-  let maximum = select(255, 127, params.output_type == 2u);
+  let minimum = select(0, -128, params.output_type == 6u);
+  let maximum = select(255, 127, params.output_type == 6u);
   if (transformed != transformed) { return output_byte(params.output_zero_point); }
   if (transformed <= f32(minimum)) { return output_byte(minimum); }
   if (transformed >= f32(maximum)) { return output_byte(maximum); }

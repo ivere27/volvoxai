@@ -12,7 +12,7 @@
 
 /* `supports` and `run` return one of these values. A declined `run` must not
  * write an output tensor or claim device ownership; validation caches may be
- * populated while deciding whether a legacy kernel can run. */
+ * populated while deciding whether a specialized kernel can run. */
 enum {
     VX_BACKEND_ERROR = -1,
     VX_BACKEND_DECLINED = 0,
@@ -53,21 +53,11 @@ typedef struct VxBackend {
     void (*begin_forward)(void* user_data);
     int (*end_forward)(void* user_data);       /* zero is success */
     void (*mark_host)(void* user_data, const void* host, size_t bytes, int is_weight);
-    /* Private device hooks retain the historic nonzero-success result. */
+    /* Private device hooks return nonzero after a successful synchronization. */
     int (*sync_host)(void* user_data, const void* host, size_t bytes, int is_weight);
 
     void (*teardown)(void* user_data);
 } VxBackend;
-
-enum { VX_BACKEND_MAX = 16 };
-
-typedef struct {
-    const VxBackend* backends[VX_BACKEND_MAX];
-    unsigned char initialized[VX_BACKEND_MAX];
-    size_t count;
-    size_t cpu_index;
-    int ready;
-} VxBackendRegistry;
 
 /* The supplied CPU backend must be the last entry.  The registry copies only
  * backend pointers; each VxBackend object must outlive the registry.  Create

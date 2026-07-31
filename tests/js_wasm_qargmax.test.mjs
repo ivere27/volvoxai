@@ -14,6 +14,8 @@ import { WasmEngine } from '../ts/backends/WasmEngine.js';
 const run = promisify(execFile);
 const repositoryRoot = fileURLToPath(new URL('../', import.meta.url));
 const clang = process.env.CLANG || 'clang';
+// Canonical protobuf DataType value used by the public native/WASM ABI.
+const VX_DTYPE_I8 = 6;
 
 async function buildForwardWasm(directory) {
   const output = join(directory, 'volvoxai.wasm');
@@ -45,7 +47,7 @@ function qArgMaxGraph({
   const { out } = graph.addOp('QArgMax', { input }, {
     out: { name: 'out', shape: outputShape, dtype: 'int32' },
   }, { axis });
-  graph.outputNames = [out.name];
+  graph.setOutputs([out.name]);
   return { graph, input, out, values: byteValues(dtype, values) };
 }
 
@@ -125,7 +127,13 @@ test('portable WASM QArgMax preserves canonical raw I8/U8 ordering', {
       );
       const sentinel = new Int32Array(wasm.mem.buffer, outputPointer, 4);
       sentinel.set([17, 23, 31, 47]);
-      assert.equal(wasm.api.qargmax_i8u8(inputPointer, outputPointer, 2, 0, 2, 2), 0);
+      assert.equal(wasm.api.qargmax_i8u8(
+        inputPointer, outputPointer, 2, 0, 2, VX_DTYPE_I8,
+      ), 0);
+      assert.deepEqual([...sentinel], [17, 23, 31, 47]);
+      assert.equal(wasm.api.qargmax_i8u8(
+        inputPointer, outputPointer, 2, 3, 2, 2,
+      ), 0, 'legacy compact I8 code is canonical F4 and must be rejected');
       assert.deepEqual([...sentinel], [17, 23, 31, 47]);
 
       const aliased = qArgMaxGraph({ shape: [2, 4], axis: 1, values: [1, 2, 3, 4, 4, 3, 2, 1] });

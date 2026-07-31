@@ -8,7 +8,11 @@ void div_f32(const float* a, const float* b, float* output, int n) {
     for (int i = 0; i < n; i++) output[i] = a[i] / (b[i] + 1e-9f);
 }
 void silu_f32(const float* input, float* output, int n) {
-    for (int i = 0; i < n; i++) output[i] = input[i] * (1.0f / (1.0f + accurate_expf(-input[i])));
+    int i = 0;
+#if VX_FASTMATH_X86_AVX2
+    if (vx_kernel_platform()->has_avx2) i = vx_silu_f32_avx2(input, output, n);
+#endif
+    for (; i < n; i++) output[i] = input[i] * (1.0f / (1.0f + accurate_expf(-input[i])));
 }
 void leakyrelu_f32(const float* input, float* output, int n, float alpha) {
     for (int i = 0; i < n; i++) output[i] = input[i] > 0.0f ? input[i] : input[i] * alpha;

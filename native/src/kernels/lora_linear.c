@@ -83,7 +83,7 @@ int vx_lora_apply_row_f32(const float* input, const float* a, const float* b,
     return 1;
 }
 
-int vx_lora_materialize_weight_f32(const void* base_weight, int base_dtype,
+int vx_lora_materialize_weight_f32(const void* base_weight, VxDataType base_dtype,
                                    int base_out_in, const float* a,
                                    const float* b, float adapter_scale,
                                    float* output, int d_in, int rank,

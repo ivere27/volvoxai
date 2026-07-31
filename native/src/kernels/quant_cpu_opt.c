@@ -1,13 +1,231 @@
 #include "quant_cpu_opt.h"
+#include "cpu_features.h"
+#include "kernel_platform.h"
 #include "thread_pool.h"
+#include "volvoxai_enums.h"
 
 #include <math.h>
 #include <stdint.h>
 #include <string.h>
 
-#if defined(__AVX2__)
+#if (defined(__i386__) || defined(__x86_64__)) && \
+    (defined(__clang__) || defined(__GNUC__))
 #include <immintrin.h>
+#define VX_QUANT_X86_AVX2 1
+#define VX_QUANT_TARGET_AVX2 __attribute__((target("avx2")))
+#else
+#define VX_QUANT_X86_AVX2 0
+#define VX_QUANT_TARGET_AVX2
 #endif
+
+#if VX_QUANT_X86_AVX2
+static VX_QUANT_TARGET_AVX2 __m256i vx_quantize_transformed8_avx2(
+        __m256 transformed, int zero_point, int minimum, int maximum) {
+    const __m256 nan_mask = _mm256_cmp_ps(
+        transformed, transformed, _CMP_UNORD_Q);
+    const __m256 clamped = _mm256_min_ps(
+        _mm256_max_ps(transformed, _mm256_set1_ps((float)minimum)),
+        _mm256_set1_ps((float)maximum));
+    const __m256 rounded = _mm256_round_ps(
+        clamped, _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC);
+    const __m256i quantized = _mm256_cvttps_epi32(rounded);
+    return _mm256_blendv_epi8(
+        quantized, _mm256_set1_epi32(zero_point),
+        _mm256_castps_si256(nan_mask));
+}
+
+static VX_QUANT_TARGET_AVX2 void vx_store_quantized8_avx2(
+        void* output, uint32_t output_dtype, uint32_t index,
+        __m256i quantized) {
+    const __m128i low = _mm256_castsi256_si128(quantized);
+    const __m128i high = _mm256_extracti128_si256(quantized, 1);
+    __m128i bytes;
+    if (output_dtype == VX_DTYPE_I8) {
+        const __m128i values16 = _mm_packs_epi32(low, high);
+        bytes = _mm_packs_epi16(values16, values16);
+    } else {
+        const __m128i values16 = _mm_packus_epi32(low, high);
+        bytes = _mm_packus_epi16(values16, values16);
+    }
+    {
+        const uint64_t packed = (uint64_t)_mm_cvtsi128_si64(bytes);
+        memcpy((uint8_t*)output + index, &packed, sizeof(packed));
+    }
+}
+
+static VX_QUANT_TARGET_AVX2 __m256i vx_load_quantized8_i32_avx2(
+        const void* input, uint32_t input_dtype, uint32_t index) {
+    const __m128i bytes = _mm_loadl_epi64(
+        (const __m128i*)((const uint8_t*)input + index));
+    return input_dtype == VX_DTYPE_I8
+        ? _mm256_cvtepi8_epi32(bytes) : _mm256_cvtepu8_epi32(bytes);
+}
+
+static VX_QUANT_TARGET_AVX2 uint32_t vx_quantize_linear_typed_avx2(
+        const float* input, float scale, int zero_point, void* output,
+        uint32_t output_dtype, uint32_t elements, int minimum, int maximum) {
+    const __m256 scales = _mm256_set1_ps(scale);
+    const __m256 zeros = _mm256_set1_ps((float)zero_point);
+    uint32_t index = 0;
+    for (; index + 8u <= elements; index += 8u) {
+        const __m256 values = _mm256_loadu_ps(input + index);
+        const __m256 transformed = _mm256_add_ps(
+            _mm256_div_ps(values, scales), zeros);
+        vx_store_quantized8_avx2(output, output_dtype, index,
+            vx_quantize_transformed8_avx2(
+                transformed, zero_point, minimum, maximum));
+    }
+    return index;
+}
+
+static VX_QUANT_TARGET_AVX2 int vx_qadd_i8u8_avx2(
+        const void* a, const void* b, void* output, uint32_t elements,
+        float a_scale, int32_t a_zero_point,
+        float b_scale, int32_t b_zero_point,
+        float output_scale, int32_t output_zero_point,
+        uint32_t a_dtype, uint32_t b_dtype, uint32_t output_dtype,
+        uint32_t relu) {
+    const int minimum = output_dtype == VX_DTYPE_I8 ? -128 : 0;
+    const int maximum = output_dtype == VX_DTYPE_I8 ? 127 : 255;
+    const __m256 a_scales = _mm256_set1_ps(a_scale);
+    const __m256 b_scales = _mm256_set1_ps(b_scale);
+    const __m256 output_scales = _mm256_set1_ps(output_scale);
+    const __m256 output_zeros = _mm256_set1_ps((float)output_zero_point);
+    const __m256i a_zeros = _mm256_set1_epi32(a_zero_point);
+    const __m256i b_zeros = _mm256_set1_epi32(b_zero_point);
+    const __m256i relu_minimum = _mm256_set1_epi32(output_zero_point);
+    __m256i relu_maximum = _mm256_set1_epi32(maximum);
+    uint32_t index = 0;
+    if (relu >= 2u) {
+        const __m256 relu6 = _mm256_set1_ps(
+            6.0f / output_scale + (float)output_zero_point);
+        relu_maximum = vx_quantize_transformed8_avx2(
+            relu6, 0, minimum, maximum);
+    }
+    for (; index + 8u <= elements; index += 8u) {
+        const __m256i a_values = _mm256_sub_epi32(
+            vx_load_quantized8_i32_avx2(a, a_dtype, index), a_zeros);
+        const __m256i b_values = _mm256_sub_epi32(
+            vx_load_quantized8_i32_avx2(b, b_dtype, index), b_zeros);
+        const __m256 a_real = _mm256_mul_ps(
+            _mm256_cvtepi32_ps(a_values), a_scales);
+        const __m256 b_real = _mm256_mul_ps(
+            _mm256_cvtepi32_ps(b_values), b_scales);
+        const __m256 sum = _mm256_add_ps(a_real, b_real);
+        const __m256 transformed = _mm256_add_ps(
+            _mm256_div_ps(sum, output_scales), output_zeros);
+        __m256i quantized = vx_quantize_transformed8_avx2(
+            transformed, output_zero_point, minimum, maximum);
+        if (relu) {
+            quantized = _mm256_max_epi32(quantized, relu_minimum);
+            if (relu >= 2u)
+                quantized = _mm256_min_epi32(quantized, relu_maximum);
+        }
+        vx_store_quantized8_avx2(output, output_dtype, index, quantized);
+    }
+    return index == elements;
+}
+#endif
+
+#if VX_QUANT_X86_AVX2
+/* Byte dequantization is exactly reproducible in single precision.  The
+ * portable kernel computes ((double)x - (double)zp) * (double)scale and then
+ * rounds once to F32.  For a byte input |x - zp| < 2^9, so the exact product
+ * needs at most 9 + 24 = 33 significant bits and is therefore held exactly in
+ * double; rounding it to F32 yields the correctly rounded product.  An F32
+ * multiply rounds the same exact product the same way, so the vector result is
+ * bit-identical rather than merely close. */
+static VX_QUANT_TARGET_AVX2 uint32_t vx_dequantize_linear_typed_avx2(
+        const void* input, uint32_t input_dtype, float scale, int zero_point,
+        float* output, uint32_t elements) {
+    const __m256 scales = _mm256_set1_ps(scale);
+    const __m256i zeros = _mm256_set1_epi32(zero_point);
+    uint32_t index = 0;
+    for (; index + 8u <= elements; index += 8u) {
+        const __m256i values = _mm256_sub_epi32(
+            vx_load_quantized8_i32_avx2(input, input_dtype, index), zeros);
+        _mm256_storeu_ps(output + index,
+            _mm256_mul_ps(_mm256_cvtepi32_ps(values), scales));
+    }
+    return index;
+}
+#endif
+
+uint32_t vx_dequantize_linear_typed_native_prefix(
+        const void* input, uint32_t input_dtype, float scale, int zero_point,
+        float* output, uint32_t elements) {
+#if VX_QUANT_X86_AVX2
+    if (input && output && elements >= 8u &&
+        (input_dtype == VX_DTYPE_I8 || input_dtype == VX_DTYPE_U8) &&
+        vx_kernel_platform()->has_avx2) {
+        return vx_dequantize_linear_typed_avx2(input, input_dtype, scale,
+                                               zero_point, output, elements);
+    }
+#else
+    (void)input;
+    (void)input_dtype;
+    (void)scale;
+    (void)zero_point;
+    (void)output;
+    (void)elements;
+#endif
+    return 0;
+}
+
+uint32_t vx_quantize_linear_typed_native_prefix(
+        const float* input, float scale, int zero_point, void* output,
+        uint32_t output_dtype, uint32_t elements, int minimum, int maximum) {
+#if VX_QUANT_X86_AVX2
+    if (input && output && elements >= 8u && vx_kernel_platform()->has_avx2)
+        return vx_quantize_linear_typed_avx2(
+            input, scale, zero_point, output, output_dtype, elements,
+            minimum, maximum);
+#else
+    (void)input;
+    (void)scale;
+    (void)zero_point;
+    (void)output;
+    (void)output_dtype;
+    (void)elements;
+    (void)minimum;
+    (void)maximum;
+#endif
+    return 0;
+}
+
+int vx_qadd_i8u8_native_try(
+        const void* a, const void* b, void* output, uint32_t elements,
+        float a_scale, int32_t a_zero_point,
+        float b_scale, int32_t b_zero_point,
+        float output_scale, int32_t output_zero_point,
+        uint32_t a_dtype, uint32_t b_dtype, uint32_t output_dtype,
+        uint32_t relu) {
+#if VX_QUANT_X86_AVX2
+    if (a && b && output && elements >= 8u &&
+        elements % 8u == 0u && vx_kernel_platform()->has_avx2) {
+        return vx_qadd_i8u8_avx2(
+            a, b, output, elements, a_scale, a_zero_point,
+            b_scale, b_zero_point, output_scale, output_zero_point,
+            a_dtype, b_dtype, output_dtype, relu);
+    }
+#else
+    (void)a;
+    (void)b;
+    (void)output;
+    (void)elements;
+    (void)a_scale;
+    (void)a_zero_point;
+    (void)b_scale;
+    (void)b_zero_point;
+    (void)output_scale;
+    (void)output_zero_point;
+    (void)a_dtype;
+    (void)b_dtype;
+    (void)output_dtype;
+    (void)relu;
+#endif
+    return 0;
+}
 
 typedef struct {
     const float* data;
@@ -1011,11 +1229,11 @@ int vx_qconv2d_stem3s2(const signed char* xq, signed char* yq, float* yf,
 }
 
 enum {
-    VX_T_F32 = 0,
-    VX_T_I8 = 1,
-    VX_T_U8 = 2,
-    VX_T_I32 = 3,
-    VX_T_I16 = 4
+    VX_T_F32 = VX_DTYPE_F32,
+    VX_T_I8 = VX_DTYPE_I8,
+    VX_T_U8 = VX_DTYPE_U8,
+    VX_T_I32 = VX_DTYPE_I32,
+    VX_T_I16 = VX_DTYPE_I16
 };
 
 static int vx_quantized_value_i32(const void* data, int dtype, long idx) {

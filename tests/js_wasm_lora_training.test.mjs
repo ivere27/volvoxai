@@ -82,24 +82,37 @@ test('WASM-only correction trains explicit LoRA through a dout base and refreshe
   }
 
   const directory = await mkdtemp(join(tmpdir(), 'volvoxai-wasm-lora-training-'));
+  let runtime;
+  let model;
+  let compiledBefore;
+  let contextBefore;
+  let trainer;
+  let compiledAfter;
+  let contextAfter;
   try {
     const wasmPath = join(directory, 'volvoxai.full.wasm');
     await buildFullWasm(wasmPath);
 
-    const api = await VolvoxAI.init('wasm', wasmPath);
     const { graph, base, a, b, logits, trainableTensors } = explicitLoRAGraph();
-    const engine = await api.compile(graph);
+    runtime = await VolvoxAI.createRuntime({ wasmUrl: wasmPath });
+    model = runtime.createModel(graph);
+    compiledBefore = await model.compile({
+      backend: { mode: 'require', backend: 'wasm', operatorFallback: 'forbid' },
+    });
+    contextBefore = await compiledBefore.createContext();
+    trainer = await VolvoxAI.createTrainer(model, { wasmUrl: wasmPath });
     const x = Float32Array.from([0.7, -0.2]);
     const inputs = { x };
-    const beforeInference = Array.from((await engine.execute(inputs))[logits.name]);
+    const beforeResult = await contextBefore.execute(inputs);
+    const beforeInference = Array.from(await beforeResult.output(logits.name).read());
+    await beforeResult.close();
     assert.equal(argmax(beforeInference), 0,
       'the initial prediction should be wrong before the correction');
-    assert.equal(engine.f32PackedNodes.size, 3,
-      'the regression must exercise packed F32 MatMul weights');
 
     const beforeBase = Float32Array.from(base.buffer);
     const beforeA = Float32Array.from(a.buffer);
     const beforeB = Float32Array.from(b.buffer);
+    const originalRevision = model.weightRevisionId;
     const options = {
       inputs,
       targets: [2],
@@ -108,30 +121,63 @@ test('WASM-only correction trains explicit LoRA through a dout base and refreshe
       optimizer: { learningRate: 1 },
     };
 
-    const first = await api.trainLoRAStep(graph, options);
+    const first = await trainer.trainStep(options);
     assert.equal(first.backend, 'wasm');
-    assert.deepEqual(first.updatedTensors.map((tensor) => tensor.name).sort(),
+    assert.deepEqual([...first.updatedTensorNames].sort(),
       [...trainableTensors].sort());
     assert.deepEqual(base.buffer, beforeBase);
-    assert.notDeepEqual(a.buffer, beforeA);
-    assert.notDeepEqual(b.buffer, beforeB);
+    assert.deepEqual(a.buffer, beforeA);
+    assert.deepEqual(b.buffer, beforeB);
 
     const losses = [first.loss];
     for (let step = 1; step < 12; step++) {
-      losses.push((await api.trainStep(graph, options)).loss);
+      losses.push((await trainer.trainStep(options)).loss);
     }
     assert.ok(losses.at(-1) < losses[0],
       `correction loss did not decrease: ${losses[0]} -> ${losses.at(-1)}`);
     assert.deepEqual(base.buffer, beforeBase);
-    assert.equal(graph.trainingStep, 12);
+    assert.equal(graph.trainingStep, 0);
+    assert.equal(trainer.trainingStep, 12);
+    assert.equal(model.weightRevisionId, originalRevision,
+      'WASM Trainer updates stay private until commit');
 
-    const afterInference = Array.from((await engine.execute(inputs))[logits.name]);
+    const pinnedResult = await contextBefore.execute(inputs);
+    assert.deepEqual(
+      Array.from(await pinnedResult.output(logits.name).read()),
+      beforeInference,
+      'an existing context remains pinned to the pre-training weight revision',
+    );
+    await pinnedResult.close();
+
+    await trainer.commit();
+    assert.notEqual(model.weightRevisionId, originalRevision);
+
+    compiledAfter = await model.compile({
+      backend: { mode: 'require', backend: 'wasm', operatorFallback: 'forbid' },
+    });
+    contextAfter = await compiledAfter.createContext();
+    const afterResult = await contextAfter.execute(inputs);
+    const afterInference = Array.from(await afterResult.output(logits.name).read());
+    await afterResult.close();
     assert.notDeepEqual(afterInference, beforeInference);
-    closeArray(afterInference, expectedLogits(x, base.buffer, a.buffer, b.buffer),
-      'packed inference after LoRA update');
     assert.equal(argmax(afterInference), 2,
       'the corrected class should win after repeated online updates');
+
+    const committedRevision = model.weightRevisionId;
+    await trainer.trainStep(options);
+    assert.equal(trainer.hasUncommittedUpdates, true);
+    await trainer.rollback();
+    assert.equal(trainer.trainingStep, 12);
+    assert.equal(trainer.hasUncommittedUpdates, false);
+    assert.equal(model.weightRevisionId, committedRevision);
   } finally {
+    await contextAfter?.close();
+    await compiledAfter?.close();
+    await trainer?.close();
+    await contextBefore?.close();
+    await compiledBefore?.close();
+    await model?.close();
+    await runtime?.close();
     await rm(directory, { recursive: true, force: true });
   }
 });

@@ -4,6 +4,10 @@ This document compares MediaPipe EfficientDet Lite0 int8, float16-source, and
 float32-source packages on the Linux CPU path, and records the Android
 OpenGL GPU result for the float32 package.
 
+This page covers the CPU/Vulkan/OpenGL comparison. CUDA build, numerical, and
+hardware validation requirements are maintained in
+[cuda.md](cuda.md#validation).
+
 Machine/runtime:
 
 - CPU: AMD Ryzen 5 5600U with Radeon Graphics, single-thread runs
@@ -35,16 +39,16 @@ Important caveats:
   CPU. It is not an FP16 CPU-kernel speed test.
 - Direct TFLite export keeps VolvoxAI tensors in NHWC and stores Conv weights in
   TFLite-native layouts: regular Conv2D as `OHWI`, depthwise Conv2D as `1HWO`. The
-  native CPU path prepares a per-node HWIO/HWCM compute cache at engine init, so the
+  native CPU path prepares a per-node HWIO/HWCM compute cache during model compilation, so the
   artifact stays TFLite-shaped without making the hot Conv loops stride through OHWI.
 - The float16-source package stores floating weights as safetensors `F16`. Native CPU
-  keeps the artifact half-sized and prepares a widened Conv weight cache at engine init
+  keeps the artifact half-sized and prepares a widened Conv weight cache during model compilation
   for the default `cpu-f16w-pack` path. On this AVX2 CPU this is not native FP16
   arithmetic; it is half-size storage plus one-time FP32 widening.
 
 ## Artifacts
 
-| Package | Source TFLite | Optional ONNX | Volvox weights | Volvox config | Volvox graph contract |
+| Package | Source TFLite | Optional ONNX | Volvox weights | graph.json | Volvox Graph contract |
 | --- | ---: | ---: | ---: | ---: | --- |
 | `models/efficientdet_lite0_int8` | `4.4M` | `4.0M` | `3.4M` | `148K` | direct TFLite NHWC, quantized `QConv2D`, `I8` OHWI/1HWO weights |
 | `models/efficientdet_lite0_fp16` | `7.0M` | `13M` | `6.4M` | `108K` | direct TFLite NHWC, `F16` OHWI/1HWO weights |
@@ -81,11 +85,11 @@ Conv2D backend=cpu-f16w-pack
 The int8 package preserves quantized Conv nodes and quantization metadata:
 
 ```text
-models/efficientdet_lite0_int8/config.json  QConv2D 182
-models/efficientdet_lite0_fp16/config.json  Conv2D  182
-models/efficientdet_lite0_fp32/config.json  Conv2D  182
-models/efficientdet_lite0_fp16/config.json  Transpose 0
-models/efficientdet_lite0_fp32/config.json  Transpose 0
+models/efficientdet_lite0_int8/graph.json  QConv2D 182
+models/efficientdet_lite0_fp16/graph.json  Conv2D  182
+models/efficientdet_lite0_fp32/graph.json  Conv2D  182
+models/efficientdet_lite0_fp16/graph.json  Transpose 0
+models/efficientdet_lite0_fp32/graph.json  Transpose 0
 ```
 
 The direct TFLite configs report:
@@ -311,15 +315,15 @@ These average the 20 timed `--debug` forwards; the two warmup forwards are exclu
 | DequantizeLinear | aliased after Concat | n/a | n/a |
 | Total profiled op avg | `37.08 ms` | `30.77 ms` | `30.99 ms` |
 
-VolvoxAI load/init timings from representative debug runs:
+VolvoxAI load/compile timings from representative debug runs:
 
-| Package | load weights | build graph | engine init |
+| Package | load weights | validate Graph | compile Model |
 | --- | ---: | ---: | ---: |
 | int8 | `3.523 ms` | `8.906 ms` | `14.800 ms` |
 | float16-source | `7.216 ms` | `7.503 ms` | `36.135 ms` |
 | float32-source | `12.595 ms` | `6.758 ms` | `40.580 ms` |
 
-The float-source engine init includes layout/precision preparation:
+Float-source compilation includes layout/precision preparation:
 
 ```text
 fp16: prepack_conv weights=182 biases=182 pointwise_packs=101 igemm_indirs=1 19.720 ms
@@ -349,7 +353,10 @@ One-thread blockers:
 
 ## Native GPU Status
 
-OpenGL waits at the end of `volvoxai_engine_forward`, so reported forward time includes real
+The figures below cover AMD Vulkan/OpenGL. For the CUDA backend and NVIDIA comparison, see
+[Native CUDA Backend](cuda.md).
+
+OpenGL waits before context execution completes, so reported execution time includes real
 queued GPU work rather than only CPU-side dispatch/enqueue time.
 
 Linux fp32 EfficientDet Lite0 timings on the Ryzen 5 5600U machine:
@@ -364,8 +371,8 @@ Representative corrected debug summaries show that most elapsed time is in the f
 wait, not in CPU enqueue:
 
 ```text
-OpenGL: volvoxai_engine_forward 46.823 ms, GPUWait 40.46 ms, Conv2D enqueue 3.42 ms
-Vulkan: volvoxai_engine_forward 43.100 ms, GPUWait 39.41 ms, Conv2D enqueue 1.67 ms
+OpenGL: context execute 46.823 ms, GPUWait 40.46 ms, Conv2D enqueue 3.42 ms
+Vulkan: context execute 43.100 ms, GPUWait 39.41 ms, Conv2D enqueue 1.67 ms
 ```
 
 ## Android OpenGL GPU Result
@@ -404,7 +411,7 @@ Qualcomm / Adreno (TM) 642L / OpenGL ES 3.2
 The `--debug` run is not the benchmark average, but it identifies where the time goes:
 
 ```text
-[debug] volvoxai_engine_forward nodes=262 159.649 ms
+[debug] context execute nodes=262 159.649 ms
 [debug] --- op time summary (by total) ---
 [debug]   GPUWait            114.84 ms  (n=1)
 [debug]   Conv2D              11.90 ms  (n=182)

@@ -6,7 +6,7 @@
 
 struct Params {
     // Raw layout (all u32):
-    // [rank, output_length, a_length, b_length, kind, pad x3,
+    // [rank, output_length, a_length, b_length, kind, relu, pad x2,
     //  output_strides[8], a_broadcast_strides[8], b_broadcast_strides[8]]
     values : array<u32>,
 }
@@ -43,6 +43,15 @@ fn b_derivative(output_index : u32) -> f32 {
     return 1.0; // Add
 }
 
+fn activation_derivative(output_index : u32) -> f32 {
+    let relu = params.values[5];
+    if (params.values[4] != 0u || relu == 0u) { return 1.0; }
+    let value = a[operand_index(output_index, 16u)] +
+        b[operand_index(output_index, 24u)];
+    if (value <= 0.0 || (relu == 2u && value >= 6.0)) { return 0.0; }
+    return 1.0;
+}
+
 @compute @workgroup_size(64)
 fn a_main(@builtin(global_invocation_id) gid : vec3<u32>) {
     let index = gid.x;
@@ -52,7 +61,8 @@ fn a_main(@builtin(global_invocation_id) gid : vec3<u32>) {
     // while correctly reducing arbitrary NumPy-style broadcast dimensions.
     for (var out_index = 0u; out_index < params.values[1]; out_index = out_index + 1u) {
         if (operand_index(out_index, 16u) == index) {
-            sum = sum + grad_output[out_index] * a_derivative(out_index);
+            sum = sum + grad_output[out_index] *
+                activation_derivative(out_index) * a_derivative(out_index);
         }
     }
     grad_a[index] = grad_a[index] + sum;
@@ -65,7 +75,8 @@ fn b_main(@builtin(global_invocation_id) gid : vec3<u32>) {
     var sum = 0.0;
     for (var out_index = 0u; out_index < params.values[1]; out_index = out_index + 1u) {
         if (operand_index(out_index, 24u) == index) {
-            sum = sum + grad_output[out_index] * b_derivative(out_index);
+            sum = sum + grad_output[out_index] *
+                activation_derivative(out_index) * b_derivative(out_index);
         }
     }
     grad_b[index] = grad_b[index] + sum;

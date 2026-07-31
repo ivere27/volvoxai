@@ -1,0 +1,1253 @@
+// Internal VolvoxAI optimizer-pass inventory.
+//
+// This registry is the authored source of truth for typed optimizer pass
+// metadata and deterministic pipeline recipes.  It is not part of the public
+// Synurang FFI in volvoxai.proto, and it does not encode executable matchers.
+// Stable implementation IDs bind pass declarations to executable IRPass code.
+// tools/generate_optimizer_registry.py validates declarations against
+// OperatorKind and the kernel registry, then emits dependency-free Python and
+// Markdown views.
+
+syntax = "proto3";
+
+package volvoxai.optimizer_registry;
+
+import "google/protobuf/descriptor.proto";
+import "kernel_registry.proto";
+import "volvoxai.proto";
+
+enum OptimizerPassScope {
+  OPTIMIZER_PASS_SCOPE_UNSPECIFIED = 0;
+
+  // Rewrites the portable graph.json + safetensors package transactionally.
+  OPTIMIZER_PASS_SCOPE_PORTABLE_PACKAGE = 1;
+
+  // Derives backend-owned CompiledModel state without changing the package.
+  // No current v1 typed RuntimeIR pass uses this scope yet.
+  OPTIMIZER_PASS_SCOPE_COMPILED_PREPARATION = 2;
+}
+
+enum OptimizerDialect {
+  OPTIMIZER_DIALECT_UNSPECIFIED = 0;
+  OPTIMIZER_DIALECT_SOURCE = 1;
+  OPTIMIZER_DIALECT_SEMANTIC = 2;
+  OPTIMIZER_DIALECT_CANONICAL = 3;
+  OPTIMIZER_DIALECT_QUANTIZED_CANONICAL = 4;
+  OPTIMIZER_DIALECT_RUNTIME = 5;
+}
+
+enum OptimizerPassStage {
+  OPTIMIZER_PASS_STAGE_UNSPECIFIED = 0;
+  OPTIMIZER_PASS_STAGE_LOWERING = 1;
+  OPTIMIZER_PASS_STAGE_CANONICALIZATION = 2;
+  OPTIMIZER_PASS_STAGE_SEMANTIC_FUSION = 3;
+  OPTIMIZER_PASS_STAGE_PRECISION_AUTHORING = 4;
+  OPTIMIZER_PASS_STAGE_QUANTIZED_REGION = 5;
+  OPTIMIZER_PASS_STAGE_ABI_SPECIALIZATION = 6;
+  OPTIMIZER_PASS_STAGE_CLEANUP = 7;
+  OPTIMIZER_PASS_STAGE_TARGET_PREPARATION = 8;
+}
+
+enum RewriteSemantics {
+  REWRITE_SEMANTICS_UNSPECIFIED = 0;
+
+  // The pass proves the represented graph result or storage transform exact.
+  REWRITE_SEMANTICS_EXACT = 1;
+
+  // The pass intentionally changes a rounding/evaluation boundary and needs
+  // explicit caller opt-in plus independent qualification.
+  REWRITE_SEMANTICS_NUMERICAL_MIGRATION = 2;
+
+  // The pass authors a new calibrated precision contract and serialized
+  // quantization payloads.  This is never implied by exact optimization or
+  // by an already-quantized import.
+  REWRITE_SEMANTICS_QUANTIZATION_AUTHORING = 3;
+}
+
+message OptimizerFeatureDescriptor {
+  string id = 1;
+  string summary = 2;
+}
+
+// Empty target rules mean that a portable pass has no additional backend
+// eligibility constraint. A rule declares the operators and kernel variants
+// required on each named backend; the resolver evaluates these facts directly.
+message OptimizerTargetRule {
+  reserved 2, 3;
+  reserved "applicability_predicate_id", "cost_model_id";
+
+  repeated volvoxai.kernel_registry.BackendKind backend = 1;
+  repeated volvoxai.runtime.OperatorKind required_operator = 4;
+  repeated string required_kernel_variant_id = 5;
+}
+
+message OptimizerPassDescriptor {
+  reserved 16, 17, 18, 19;
+  reserved "required_analysis", "preserved_analysis", "invalidated_analysis",
+      "legality_predicate_id";
+
+  string id = 1;
+  uint32 version = 2;
+  string implementation_id = 3;
+  string summary = 4;
+
+  OptimizerPassScope scope = 5;
+  OptimizerPassStage stage = 6;
+  repeated OptimizerDialect input_dialect = 7;
+  OptimizerDialect output_dialect = 8;
+  bool repeatable = 9;
+
+  RewriteSemantics semantics = 10;
+  bool requires_calibration = 11;
+  bool changes_public_abi = 12;
+  bool changes_precision = 13;
+
+  repeated volvoxai.runtime.OperatorKind matched_operator = 14;
+  repeated volvoxai.runtime.OperatorKind emitted_operator = 15;
+
+  // These are relative ordering constraints when both passes are selected;
+  // they do not implicitly select another pass.
+  repeated string must_run_after = 20;
+  repeated string must_run_before = 21;
+  repeated string conflicts_with = 22;
+
+  repeated OptimizerTargetRule target = 23;
+}
+
+message OptimizerPassGroup {
+  string id = 1;
+  string summary = 2;
+  repeated string pass_id = 3;
+  bool fixed_point = 4;
+  uint32 max_iterations = 5;
+}
+
+message OptimizerPipelineGroupOverlay {
+  string group_id = 1;
+
+  // An overlay is selected in declaration order when every required feature
+  // is requested and no forbidden feature is requested. Empty gates make an
+  // unconditional base group. This keeps independent optimizer features
+  // composable without materializing their Cartesian product as recipes.
+  repeated string required_feature = 2;
+  repeated string forbidden_feature = 3;
+}
+
+message OptimizerPipelineRecipe {
+  string id = 1;
+  uint32 version = 2;
+  string summary = 3;
+  reserved 4, 9, 10;
+  reserved "group_id", "applicability_predicate_id", "selection_feature";
+
+  // Empty means target-neutral.  A non-empty list is an allowlist, not proof
+  // that every graph descriptor is legal on the backend.
+  repeated volvoxai.kernel_registry.BackendKind target = 5;
+  repeated RewriteSemantics allowed_semantics = 6;
+  bool allow_calibration = 7;
+  bool allow_public_abi_change = 8;
+  // A recipe matches when every required feature is requested and every
+  // requested feature belongs to required_feature or supported_feature.
+  // Matching recipe domains must be unambiguous.
+  repeated OptimizerPipelineGroupOverlay group_overlay = 11;
+  repeated string required_feature = 12;
+  repeated string supported_feature = 13;
+}
+
+message OptimizerRegistry {
+  reserved 2;
+  reserved "analysis";
+
+  uint32 schema_version = 1;
+  repeated OptimizerPassDescriptor pass = 3;
+  repeated OptimizerPassGroup group = 4;
+  repeated OptimizerPipelineRecipe pipeline = 5;
+  repeated OptimizerFeatureDescriptor feature = 6;
+}
+
+extend google.protobuf.FileOptions {
+  OptimizerRegistry registry = 52001;
+}
+
+// Keep schema and inventory in one reviewable source, matching the kernel
+// registry's authored-file-option pattern.
+option (volvoxai.optimizer_registry.registry) = {
+  schema_version: 1
+
+  feature: {
+    id: "output-qargmax"
+    summary: "Specialize explicitly named affine outputs to byte-domain ArgMax."
+  }
+  feature: {
+    id: "input-specialization"
+    summary: "Freeze explicitly bound public inputs into immutable package payloads."
+  }
+  feature: {
+    id: "input-hoisting"
+    summary: "Promote explicitly contracted source or rewrite-derived values to public inputs."
+  }
+  feature: {
+    id: "static-qdq-compute-migration"
+    summary: "Migrate qualified static-QDQ float islands to byte-domain compute kernels."
+  }
+  feature: {
+    id: "defer-static-qdq-layout"
+    summary: "Defer exact static-QDQ layout movement for a later optimization stage."
+  }
+  feature: {
+    id: "float-attention-fusion"
+    summary: "Fuse proved decomposed F32 attention into runnable CrossSDPA."
+  }
+  feature: {
+    id: "quantized-attention-fusion"
+    summary: "Fuse proved producer-quantized attention into runnable QSDPA."
+  }
+  feature: {
+    id: "fp32-pre-ptq"
+    summary: "Run generic F32 graph preparation before calibration and typed PTQ."
+  }
+  feature: {
+    id: "ptq-authoring"
+    summary: "Author a calibrated W8A8 graph from an exact observed graph revision."
+  }
+
+  pass: {
+    id: "runtime-vocabulary"
+    version: 1
+    implementation_id: "tools.exporter.optimizer.typed_passes:RuntimeVocabularyPass"
+    summary: "Reject runtime operators outside the generated OperatorKind vocabulary."
+    scope: OPTIMIZER_PASS_SCOPE_PORTABLE_PACKAGE
+    stage: OPTIMIZER_PASS_STAGE_CANONICALIZATION
+    input_dialect: OPTIMIZER_DIALECT_RUNTIME
+    output_dialect: OPTIMIZER_DIALECT_RUNTIME
+    semantics: REWRITE_SEMANTICS_EXACT
+    must_run_before: "runtime-output-qargmax"
+    must_run_before: "runtime-packed-qlinear-split"
+  }
+
+  pass: {
+    id: "runtime-input-specialization"
+    version: 1
+    implementation_id: "tools.exporter.optimizer.typed_specialization:RuntimeInputSpecializationPass"
+    summary: "Freeze caller-bound public inputs into immutable package payloads."
+    scope: OPTIMIZER_PASS_SCOPE_PORTABLE_PACKAGE
+    stage: OPTIMIZER_PASS_STAGE_ABI_SPECIALIZATION
+    input_dialect: OPTIMIZER_DIALECT_RUNTIME
+    output_dialect: OPTIMIZER_DIALECT_RUNTIME
+    semantics: REWRITE_SEMANTICS_EXACT
+    changes_public_abi: true
+    must_run_after: "runtime-vocabulary"
+    must_run_before: "runtime-constant-folding"
+  }
+
+  pass: {
+    id: "runtime-input-hoisting"
+    version: 1
+    implementation_id: "tools.exporter.optimizer.typed_specialization:RuntimeInputHoistingPass"
+    summary: "Promote explicitly selected source or rewrite-derived values to public inputs after value-producing rewrites."
+    scope: OPTIMIZER_PASS_SCOPE_PORTABLE_PACKAGE
+    stage: OPTIMIZER_PASS_STAGE_ABI_SPECIALIZATION
+    input_dialect: OPTIMIZER_DIALECT_RUNTIME
+    output_dialect: OPTIMIZER_DIALECT_RUNTIME
+    semantics: REWRITE_SEMANTICS_EXACT
+    changes_public_abi: true
+    must_run_after: "runtime-vocabulary"
+    must_run_after: "runtime-output-qargmax"
+    must_run_after: "runtime-input-specialization"
+    must_run_after: "runtime-constant-folding"
+    must_run_after: "runtime-quantized-bias-folding"
+    must_run_after: "runtime-float-attention-fusion"
+    must_run_after: "runtime-quantized-attention-fusion"
+    must_run_after: "runtime-packed-qlinear-split"
+    must_run_after: "runtime-affine-reference-canonicalization"
+    must_run_after: "runtime-quantized-attention-layout"
+    must_run_after: "runtime-attention-layout"
+    must_run_after: "runtime-keep-mask"
+    must_run_before: "runtime-ptq-authoring"
+    must_run_before: "runtime-canonicalize"
+    must_run_before: "runtime-dead-code"
+  }
+
+  pass: {
+    id: "runtime-constant-folding"
+    version: 1
+    implementation_id: "tools.exporter.optimizer.typed_constant_folding:RuntimeConstantFoldingPass"
+    summary: "Fold immutable storage/value-selection subgraphs and canonicalize constant-right MatMul."
+    scope: OPTIMIZER_PASS_SCOPE_PORTABLE_PACKAGE
+    stage: OPTIMIZER_PASS_STAGE_CANONICALIZATION
+    input_dialect: OPTIMIZER_DIALECT_RUNTIME
+    output_dialect: OPTIMIZER_DIALECT_RUNTIME
+    repeatable: true
+    semantics: REWRITE_SEMANTICS_EXACT
+    matched_operator: OPERATOR_KIND_CLIP
+    matched_operator: OPERATOR_KIND_RESHAPE
+    matched_operator: OPERATOR_KIND_SQUEEZE
+    matched_operator: OPERATOR_KIND_UNSQUEEZE
+    matched_operator: OPERATOR_KIND_FLATTEN
+    matched_operator: OPERATOR_KIND_IDENTITY
+    matched_operator: OPERATOR_KIND_TRANSPOSE
+    matched_operator: OPERATOR_KIND_GATHER
+    matched_operator: OPERATOR_KIND_EMBEDDING
+    matched_operator: OPERATOR_KIND_BATCH_MATMUL
+    matched_operator: OPERATOR_KIND_MATMUL
+    emitted_operator: OPERATOR_KIND_LINEAR
+    must_run_after: "runtime-vocabulary"
+    must_run_after: "runtime-input-specialization"
+    must_run_before: "runtime-packed-qlinear-split"
+    must_run_before: "runtime-silu-fusion"
+    must_run_before: "runtime-bias-folding"
+    must_run_before: "runtime-grouped-projection-split"
+  }
+
+  pass: {
+    id: "runtime-output-qargmax"
+    version: 1
+    implementation_id: "tools.exporter.optimizer.typed_passes:RuntimeOutputArgMaxPass"
+    summary: "Explicitly specialize a terminal affine output to byte-domain ArgMax."
+    scope: OPTIMIZER_PASS_SCOPE_PORTABLE_PACKAGE
+    stage: OPTIMIZER_PASS_STAGE_ABI_SPECIALIZATION
+    input_dialect: OPTIMIZER_DIALECT_RUNTIME
+    output_dialect: OPTIMIZER_DIALECT_RUNTIME
+    semantics: REWRITE_SEMANTICS_EXACT
+    changes_public_abi: true
+    changes_precision: true
+    matched_operator: OPERATOR_KIND_DEQUANTIZE_LINEAR
+    emitted_operator: OPERATOR_KIND_Q_ARG_MAX
+    must_run_after: "runtime-vocabulary"
+    must_run_before: "runtime-packed-qlinear-split"
+    target: {
+      backend: BACKEND_KIND_CPU_JS
+      backend: BACKEND_KIND_WASM
+      backend: BACKEND_KIND_WEBGPU
+      backend: BACKEND_KIND_NATIVE_CPU
+      required_operator: OPERATOR_KIND_Q_ARG_MAX
+    }
+  }
+
+  pass: {
+    id: "runtime-packed-qlinear-split"
+    version: 1
+    implementation_id: "tools.exporter.optimizer.typed_passes:RuntimePackedQLinearSplitPass"
+    summary: "Split exact packed QLinear projections and their immutable payloads."
+    scope: OPTIMIZER_PASS_SCOPE_PORTABLE_PACKAGE
+    stage: OPTIMIZER_PASS_STAGE_QUANTIZED_REGION
+    input_dialect: OPTIMIZER_DIALECT_RUNTIME
+    output_dialect: OPTIMIZER_DIALECT_RUNTIME
+    semantics: REWRITE_SEMANTICS_EXACT
+    matched_operator: OPERATOR_KIND_Q_LINEAR
+    matched_operator: OPERATOR_KIND_DEQUANTIZE_LINEAR
+    matched_operator: OPERATOR_KIND_ADD
+    matched_operator: OPERATOR_KIND_SLICE
+    emitted_operator: OPERATOR_KIND_Q_LINEAR
+    must_run_after: "runtime-vocabulary"
+    must_run_after: "runtime-output-qargmax"
+    must_run_before: "runtime-affine-reference-canonicalization"
+  }
+
+  pass: {
+    id: "runtime-quantized-bias-folding"
+    version: 1
+    implementation_id: "tools.exporter.optimizer.typed_quantized_bias_folding:RuntimeQuantizedBiasFoldingPass"
+    summary: "Fold a trailing immutable F32 bias Add into an existing quantized dense accumulator."
+    scope: OPTIMIZER_PASS_SCOPE_PORTABLE_PACKAGE
+    stage: OPTIMIZER_PASS_STAGE_QUANTIZED_REGION
+    input_dialect: OPTIMIZER_DIALECT_RUNTIME
+    output_dialect: OPTIMIZER_DIALECT_RUNTIME
+    repeatable: true
+    semantics: REWRITE_SEMANTICS_NUMERICAL_MIGRATION
+    changes_precision: true
+    matched_operator: OPERATOR_KIND_Q_LINEAR
+    matched_operator: OPERATOR_KIND_Q_MATMUL
+    matched_operator: OPERATOR_KIND_Q_GEMM
+    matched_operator: OPERATOR_KIND_DEQUANTIZE_LINEAR
+    matched_operator: OPERATOR_KIND_ADD
+    emitted_operator: OPERATOR_KIND_Q_LINEAR
+    emitted_operator: OPERATOR_KIND_Q_MATMUL
+    emitted_operator: OPERATOR_KIND_Q_GEMM
+    emitted_operator: OPERATOR_KIND_DEQUANTIZE_LINEAR
+    must_run_after: "runtime-vocabulary"
+    must_run_before: "runtime-packed-qlinear-split"
+    must_run_before: "runtime-static-qdq-compute-fusion"
+    must_run_before: "runtime-canonicalize"
+    must_run_before: "runtime-dead-code"
+  }
+
+  pass: {
+    id: "runtime-affine-reference-canonicalization"
+    version: 1
+    implementation_id: "tools.exporter.optimizer.typed_affine_canonicalization:RuntimeAffineReferenceCanonicalizationPass"
+    summary: "Intern byte-identical affine initializer references without changing values."
+    scope: OPTIMIZER_PASS_SCOPE_PORTABLE_PACKAGE
+    stage: OPTIMIZER_PASS_STAGE_QUANTIZED_REGION
+    input_dialect: OPTIMIZER_DIALECT_RUNTIME
+    output_dialect: OPTIMIZER_DIALECT_RUNTIME
+    semantics: REWRITE_SEMANTICS_EXACT
+    must_run_after: "runtime-packed-qlinear-split"
+    must_run_before: "runtime-singleton-transpose"
+  }
+
+  pass: {
+    id: "runtime-float-attention-fusion"
+    version: 1
+    implementation_id: "tools.exporter.optimizer.typed_attention:RuntimeFloatAttentionFusionPass"
+    summary: "Atomically lower a proved decomposed F32 attention region to runnable CrossSDPA."
+    scope: OPTIMIZER_PASS_SCOPE_PORTABLE_PACKAGE
+    stage: OPTIMIZER_PASS_STAGE_SEMANTIC_FUSION
+    input_dialect: OPTIMIZER_DIALECT_RUNTIME
+    output_dialect: OPTIMIZER_DIALECT_RUNTIME
+    repeatable: true
+    semantics: REWRITE_SEMANTICS_NUMERICAL_MIGRATION
+    matched_operator: OPERATOR_KIND_RESHAPE
+    matched_operator: OPERATOR_KIND_TRANSPOSE
+    matched_operator: OPERATOR_KIND_SQUEEZE
+    matched_operator: OPERATOR_KIND_UNSQUEEZE
+    matched_operator: OPERATOR_KIND_IDENTITY
+    matched_operator: OPERATOR_KIND_MUL
+    matched_operator: OPERATOR_KIND_BATCH_MATMUL
+    matched_operator: OPERATOR_KIND_ADD
+    matched_operator: OPERATOR_KIND_SOFTMAX
+    matched_operator: OPERATOR_KIND_WHERE
+    matched_operator: OPERATOR_KIND_EXPAND
+    emitted_operator: OPERATOR_KIND_RESHAPE
+    emitted_operator: OPERATOR_KIND_WHERE
+    emitted_operator: OPERATOR_KIND_CROSS_SDPA
+    must_run_after: "runtime-constant-folding"
+    must_run_before: "runtime-attention-layout"
+    must_run_before: "runtime-keep-mask"
+    must_run_before: "runtime-ptq-authoring"
+    must_run_before: "runtime-canonicalize"
+    must_run_before: "runtime-dead-code"
+  }
+
+  pass: {
+    id: "runtime-quantized-attention-fusion"
+    version: 1
+    implementation_id: "tools.exporter.optimizer.typed_quantized_attention:RuntimeQuantizedAttentionFusionPass"
+    summary: "Atomically lower proved producer-quantized attention to runnable QSDPA while preserving affine references."
+    scope: OPTIMIZER_PASS_SCOPE_PORTABLE_PACKAGE
+    stage: OPTIMIZER_PASS_STAGE_QUANTIZED_REGION
+    input_dialect: OPTIMIZER_DIALECT_RUNTIME
+    output_dialect: OPTIMIZER_DIALECT_RUNTIME
+    repeatable: true
+    semantics: REWRITE_SEMANTICS_NUMERICAL_MIGRATION
+    changes_precision: true
+    matched_operator: OPERATOR_KIND_RESHAPE
+    matched_operator: OPERATOR_KIND_TRANSPOSE
+    matched_operator: OPERATOR_KIND_SQUEEZE
+    matched_operator: OPERATOR_KIND_UNSQUEEZE
+    matched_operator: OPERATOR_KIND_IDENTITY
+    matched_operator: OPERATOR_KIND_MUL
+    matched_operator: OPERATOR_KIND_QUANTIZE_LINEAR
+    matched_operator: OPERATOR_KIND_Q_BATCH_MATMUL
+    matched_operator: OPERATOR_KIND_DEQUANTIZE_LINEAR
+    matched_operator: OPERATOR_KIND_ADD
+    matched_operator: OPERATOR_KIND_SOFTMAX
+    matched_operator: OPERATOR_KIND_WHERE
+    matched_operator: OPERATOR_KIND_EXPAND
+    emitted_operator: OPERATOR_KIND_RESHAPE
+    emitted_operator: OPERATOR_KIND_MUL
+    emitted_operator: OPERATOR_KIND_QUANTIZE_LINEAR
+    emitted_operator: OPERATOR_KIND_Q_SDPA
+    emitted_operator: OPERATOR_KIND_DEQUANTIZE_LINEAR
+    emitted_operator: OPERATOR_KIND_WHERE
+    must_run_after: "runtime-constant-folding"
+    must_run_before: "runtime-quantized-attention-layout"
+    must_run_before: "runtime-attention-layout"
+    must_run_before: "runtime-keep-mask"
+    must_run_before: "runtime-static-qdq-compute-fusion"
+    must_run_before: "runtime-canonicalize"
+    must_run_before: "runtime-dead-code"
+  }
+
+  pass: {
+    id: "runtime-quantized-attention-layout"
+    version: 1
+    implementation_id: "tools.exporter.optimizer.typed_quantized_attention:RuntimeQuantizedAttentionLayoutPass"
+    summary: "Move scalar Q/DQ boundaries across proved singleton attention layout without changing affine references."
+    scope: OPTIMIZER_PASS_SCOPE_PORTABLE_PACKAGE
+    stage: OPTIMIZER_PASS_STAGE_QUANTIZED_REGION
+    input_dialect: OPTIMIZER_DIALECT_RUNTIME
+    output_dialect: OPTIMIZER_DIALECT_RUNTIME
+    repeatable: true
+    semantics: REWRITE_SEMANTICS_EXACT
+    matched_operator: OPERATOR_KIND_RESHAPE
+    matched_operator: OPERATOR_KIND_SQUEEZE
+    matched_operator: OPERATOR_KIND_UNSQUEEZE
+    matched_operator: OPERATOR_KIND_IDENTITY
+    matched_operator: OPERATOR_KIND_MUL
+    matched_operator: OPERATOR_KIND_QUANTIZE_LINEAR
+    matched_operator: OPERATOR_KIND_Q_SDPA
+    matched_operator: OPERATOR_KIND_DEQUANTIZE_LINEAR
+    emitted_operator: OPERATOR_KIND_MUL
+    emitted_operator: OPERATOR_KIND_QUANTIZE_LINEAR
+    emitted_operator: OPERATOR_KIND_Q_SDPA
+    emitted_operator: OPERATOR_KIND_DEQUANTIZE_LINEAR
+    must_run_after: "runtime-quantized-attention-fusion"
+    must_run_after: "runtime-affine-reference-canonicalization"
+    must_run_before: "runtime-attention-layout"
+    must_run_before: "runtime-keep-mask"
+    must_run_before: "runtime-singleton-transpose"
+    must_run_before: "runtime-shape-chain"
+    must_run_before: "runtime-canonicalize"
+    must_run_before: "runtime-dead-code"
+  }
+
+  pass: {
+    id: "runtime-attention-layout"
+    version: 1
+    implementation_id: "tools.exporter.optimizer.typed_attention:RuntimeAttentionLayoutPass"
+    summary: "Remove proved singleton-batch wrappers around already-runnable CrossSDPA or QSDPA."
+    scope: OPTIMIZER_PASS_SCOPE_PORTABLE_PACKAGE
+    stage: OPTIMIZER_PASS_STAGE_CANONICALIZATION
+    input_dialect: OPTIMIZER_DIALECT_RUNTIME
+    output_dialect: OPTIMIZER_DIALECT_RUNTIME
+    repeatable: true
+    semantics: REWRITE_SEMANTICS_EXACT
+    matched_operator: OPERATOR_KIND_RESHAPE
+    matched_operator: OPERATOR_KIND_SQUEEZE
+    matched_operator: OPERATOR_KIND_UNSQUEEZE
+    matched_operator: OPERATOR_KIND_IDENTITY
+    matched_operator: OPERATOR_KIND_CROSS_SDPA
+    matched_operator: OPERATOR_KIND_Q_SDPA
+    emitted_operator: OPERATOR_KIND_CROSS_SDPA
+    emitted_operator: OPERATOR_KIND_Q_SDPA
+    must_run_after: "runtime-float-attention-fusion"
+    must_run_after: "runtime-quantized-attention-fusion"
+    must_run_after: "runtime-quantized-attention-layout"
+    must_run_before: "runtime-keep-mask"
+    must_run_before: "runtime-singleton-transpose"
+    must_run_before: "runtime-shape-chain"
+    must_run_before: "runtime-canonicalize"
+    must_run_before: "runtime-dead-code"
+  }
+
+  pass: {
+    id: "runtime-keep-mask"
+    version: 1
+    implementation_id: "tools.exporter.optimizer.typed_attention:RuntimeKeepMaskPass"
+    summary: "Canonicalize proved I32 attention keep masks and exact causal constants."
+    scope: OPTIMIZER_PASS_SCOPE_PORTABLE_PACKAGE
+    stage: OPTIMIZER_PASS_STAGE_CANONICALIZATION
+    input_dialect: OPTIMIZER_DIALECT_RUNTIME
+    output_dialect: OPTIMIZER_DIALECT_RUNTIME
+    repeatable: true
+    semantics: REWRITE_SEMANTICS_EXACT
+    matched_operator: OPERATOR_KIND_SDPA
+    matched_operator: OPERATOR_KIND_CROSS_SDPA
+    matched_operator: OPERATOR_KIND_Q_SDPA
+    matched_operator: OPERATOR_KIND_RESHAPE
+    matched_operator: OPERATOR_KIND_EXPAND
+    matched_operator: OPERATOR_KIND_SQUEEZE
+    matched_operator: OPERATOR_KIND_UNSQUEEZE
+    matched_operator: OPERATOR_KIND_IDENTITY
+    emitted_operator: OPERATOR_KIND_SDPA
+    emitted_operator: OPERATOR_KIND_CROSS_SDPA
+    emitted_operator: OPERATOR_KIND_Q_SDPA
+    must_run_after: "runtime-float-attention-fusion"
+    must_run_after: "runtime-quantized-attention-fusion"
+    must_run_after: "runtime-quantized-attention-layout"
+    must_run_after: "runtime-attention-layout"
+    must_run_before: "runtime-singleton-transpose"
+    must_run_before: "runtime-shape-chain"
+    must_run_before: "runtime-canonicalize"
+    must_run_before: "runtime-dead-code"
+  }
+
+  pass: {
+    id: "runtime-singleton-transpose"
+    version: 1
+    implementation_id: "tools.exporter.optimizer.typed_singleton_transpose:RuntimeSingletonTransposePass"
+    summary: "Replace singleton-axis Transpose with an exact storage-only Reshape."
+    scope: OPTIMIZER_PASS_SCOPE_PORTABLE_PACKAGE
+    stage: OPTIMIZER_PASS_STAGE_CANONICALIZATION
+    input_dialect: OPTIMIZER_DIALECT_RUNTIME
+    output_dialect: OPTIMIZER_DIALECT_RUNTIME
+    repeatable: true
+    semantics: REWRITE_SEMANTICS_EXACT
+    matched_operator: OPERATOR_KIND_TRANSPOSE
+    emitted_operator: OPERATOR_KIND_RESHAPE
+    must_run_after: "runtime-affine-reference-canonicalization"
+    must_run_before: "runtime-qdq-transpose-cancellation"
+  }
+
+  pass: {
+    id: "runtime-qdq-transpose-cancellation"
+    version: 1
+    implementation_id: "tools.exporter.optimizer.typed_qdq_layout:RuntimeQDQTransposeCancellationPass"
+    summary: "Cancel proven inverse Transpose operations across one Q/DQ boundary."
+    scope: OPTIMIZER_PASS_SCOPE_PORTABLE_PACKAGE
+    stage: OPTIMIZER_PASS_STAGE_QUANTIZED_REGION
+    input_dialect: OPTIMIZER_DIALECT_RUNTIME
+    output_dialect: OPTIMIZER_DIALECT_RUNTIME
+    repeatable: true
+    semantics: REWRITE_SEMANTICS_EXACT
+    matched_operator: OPERATOR_KIND_TRANSPOSE
+    matched_operator: OPERATOR_KIND_DEQUANTIZE_LINEAR
+    must_run_after: "runtime-singleton-transpose"
+    must_run_before: "runtime-pointwise-transpose-hoist"
+  }
+
+  pass: {
+    id: "runtime-pointwise-transpose-hoist"
+    version: 1
+    implementation_id: "tools.exporter.optimizer.typed_qdq_layout:RuntimePointwiseTransposeHoistPass"
+    summary: "Hoist a closed pointwise Sigmoid/Mul island across inverse Transpose."
+    scope: OPTIMIZER_PASS_SCOPE_PORTABLE_PACKAGE
+    stage: OPTIMIZER_PASS_STAGE_QUANTIZED_REGION
+    input_dialect: OPTIMIZER_DIALECT_RUNTIME
+    output_dialect: OPTIMIZER_DIALECT_RUNTIME
+    repeatable: true
+    semantics: REWRITE_SEMANTICS_EXACT
+    matched_operator: OPERATOR_KIND_TRANSPOSE
+    matched_operator: OPERATOR_KIND_SIGMOID
+    matched_operator: OPERATOR_KIND_MUL
+    matched_operator: OPERATOR_KIND_QUANTIZE_LINEAR
+    must_run_after: "runtime-qdq-transpose-cancellation"
+    must_run_before: "runtime-qdq-movement"
+  }
+
+  pass: {
+    id: "runtime-qdq-movement"
+    version: 1
+    implementation_id: "tools.exporter.optimizer.typed_qdq_layout:RuntimeQDQMovementPass"
+    summary: "Move a closed same-affine Q/DQ layout chain into the byte domain."
+    scope: OPTIMIZER_PASS_SCOPE_PORTABLE_PACKAGE
+    stage: OPTIMIZER_PASS_STAGE_QUANTIZED_REGION
+    input_dialect: OPTIMIZER_DIALECT_RUNTIME
+    output_dialect: OPTIMIZER_DIALECT_RUNTIME
+    repeatable: true
+    semantics: REWRITE_SEMANTICS_EXACT
+    matched_operator: OPERATOR_KIND_QUANTIZE_LINEAR
+    matched_operator: OPERATOR_KIND_DEQUANTIZE_LINEAR
+    matched_operator: OPERATOR_KIND_RESHAPE
+    matched_operator: OPERATOR_KIND_TRANSPOSE
+    matched_operator: OPERATOR_KIND_SQUEEZE
+    matched_operator: OPERATOR_KIND_UNSQUEEZE
+    matched_operator: OPERATOR_KIND_IDENTITY
+    must_run_after: "runtime-pointwise-transpose-hoist"
+    must_run_before: "runtime-shape-chain"
+  }
+
+  pass: {
+    id: "runtime-elementwise-transpose"
+    version: 1
+    implementation_id: "tools.exporter.optimizer.typed_elementwise_transpose:RuntimeElementwiseTransposePass"
+    summary: "Move exact F32 elementwise work across proven Transpose boundaries."
+    scope: OPTIMIZER_PASS_SCOPE_PORTABLE_PACKAGE
+    stage: OPTIMIZER_PASS_STAGE_CANONICALIZATION
+    input_dialect: OPTIMIZER_DIALECT_RUNTIME
+    output_dialect: OPTIMIZER_DIALECT_RUNTIME
+    repeatable: true
+    semantics: REWRITE_SEMANTICS_EXACT
+    matched_operator: OPERATOR_KIND_TRANSPOSE
+    matched_operator: OPERATOR_KIND_SILU
+    matched_operator: OPERATOR_KIND_GELU
+    matched_operator: OPERATOR_KIND_SIGMOID
+    matched_operator: OPERATOR_KIND_TANH
+    matched_operator: OPERATOR_KIND_RELU
+    matched_operator: OPERATOR_KIND_LEAKY_RELU
+    matched_operator: OPERATOR_KIND_CLIP
+    matched_operator: OPERATOR_KIND_IDENTITY
+    matched_operator: OPERATOR_KIND_SIN
+    matched_operator: OPERATOR_KIND_COS
+    matched_operator: OPERATOR_KIND_ADD
+    matched_operator: OPERATOR_KIND_SUB
+    matched_operator: OPERATOR_KIND_MUL
+    matched_operator: OPERATOR_KIND_DIV
+    emitted_operator: OPERATOR_KIND_TRANSPOSE
+    emitted_operator: OPERATOR_KIND_SILU
+    emitted_operator: OPERATOR_KIND_GELU
+    emitted_operator: OPERATOR_KIND_SIGMOID
+    emitted_operator: OPERATOR_KIND_TANH
+    emitted_operator: OPERATOR_KIND_RELU
+    emitted_operator: OPERATOR_KIND_LEAKY_RELU
+    emitted_operator: OPERATOR_KIND_CLIP
+    emitted_operator: OPERATOR_KIND_IDENTITY
+    emitted_operator: OPERATOR_KIND_SIN
+    emitted_operator: OPERATOR_KIND_COS
+    emitted_operator: OPERATOR_KIND_ADD
+    emitted_operator: OPERATOR_KIND_SUB
+    emitted_operator: OPERATOR_KIND_MUL
+    emitted_operator: OPERATOR_KIND_DIV
+    must_run_after: "runtime-qdq-movement"
+    must_run_before: "runtime-shape-chain"
+  }
+
+  pass: {
+    id: "runtime-shape-chain"
+    version: 1
+    implementation_id: "tools.exporter.optimizer.typed_passes:RuntimeShapeChainPass"
+    summary: "Compose locally safe shape-only and transpose chains."
+    scope: OPTIMIZER_PASS_SCOPE_PORTABLE_PACKAGE
+    stage: OPTIMIZER_PASS_STAGE_CANONICALIZATION
+    input_dialect: OPTIMIZER_DIALECT_RUNTIME
+    output_dialect: OPTIMIZER_DIALECT_RUNTIME
+    repeatable: true
+    semantics: REWRITE_SEMANTICS_EXACT
+    matched_operator: OPERATOR_KIND_RESHAPE
+    matched_operator: OPERATOR_KIND_FLATTEN
+    matched_operator: OPERATOR_KIND_SQUEEZE
+    matched_operator: OPERATOR_KIND_UNSQUEEZE
+    matched_operator: OPERATOR_KIND_TRANSPOSE
+    emitted_operator: OPERATOR_KIND_RESHAPE
+    emitted_operator: OPERATOR_KIND_IDENTITY
+    must_run_after: "runtime-qdq-movement"
+    must_run_before: "runtime-static-qdq-compute-fusion"
+    must_run_before: "runtime-canonicalize"
+  }
+
+  pass: {
+    id: "runtime-static-qdq-compute-fusion"
+    version: 1
+    implementation_id: "tools.exporter.optimizer.static_qdq_fusion:RuntimeStaticQDQComputeFusionPass"
+    summary: "Fuse closed static-QDQ float islands into Q* compute operators."
+    scope: OPTIMIZER_PASS_SCOPE_PORTABLE_PACKAGE
+    stage: OPTIMIZER_PASS_STAGE_QUANTIZED_REGION
+    input_dialect: OPTIMIZER_DIALECT_RUNTIME
+    output_dialect: OPTIMIZER_DIALECT_RUNTIME
+    repeatable: true
+    semantics: REWRITE_SEMANTICS_NUMERICAL_MIGRATION
+    changes_precision: true
+    matched_operator: OPERATOR_KIND_QUANTIZE_LINEAR
+    matched_operator: OPERATOR_KIND_DEQUANTIZE_LINEAR
+    matched_operator: OPERATOR_KIND_ADD
+    matched_operator: OPERATOR_KIND_LAYER_NORM
+    matched_operator: OPERATOR_KIND_GELU
+    matched_operator: OPERATOR_KIND_SILU
+    matched_operator: OPERATOR_KIND_GROUP_NORM
+    emitted_operator: OPERATOR_KIND_Q_ADD
+    emitted_operator: OPERATOR_KIND_Q_LAYER_NORM
+    emitted_operator: OPERATOR_KIND_Q_GELU
+    emitted_operator: OPERATOR_KIND_Q_SILU
+    emitted_operator: OPERATOR_KIND_Q_GROUP_NORM
+    emitted_operator: OPERATOR_KIND_EXPAND
+    must_run_after: "runtime-shape-chain"
+    must_run_before: "runtime-canonicalize"
+    target: {
+      backend: BACKEND_KIND_CPU_JS
+      backend: BACKEND_KIND_WASM
+      backend: BACKEND_KIND_WEBGPU
+      backend: BACKEND_KIND_NATIVE_CPU
+      required_operator: OPERATOR_KIND_Q_ADD
+      required_operator: OPERATOR_KIND_Q_LAYER_NORM
+      required_operator: OPERATOR_KIND_Q_GELU
+      required_operator: OPERATOR_KIND_Q_SILU
+      required_operator: OPERATOR_KIND_Q_GROUP_NORM
+      required_operator: OPERATOR_KIND_EXPAND
+    }
+  }
+
+  pass: {
+    id: "runtime-canonicalize"
+    version: 1
+    implementation_id: "tools.exporter.optimizer.typed_passes:RuntimeCanonicalizePass"
+    summary: "Remove locally provable no-op storage transformations."
+    scope: OPTIMIZER_PASS_SCOPE_PORTABLE_PACKAGE
+    stage: OPTIMIZER_PASS_STAGE_CANONICALIZATION
+    input_dialect: OPTIMIZER_DIALECT_RUNTIME
+    output_dialect: OPTIMIZER_DIALECT_RUNTIME
+    repeatable: true
+    semantics: REWRITE_SEMANTICS_EXACT
+    matched_operator: OPERATOR_KIND_IDENTITY
+    matched_operator: OPERATOR_KIND_RESHAPE
+    matched_operator: OPERATOR_KIND_FLATTEN
+    matched_operator: OPERATOR_KIND_SQUEEZE
+    matched_operator: OPERATOR_KIND_UNSQUEEZE
+    matched_operator: OPERATOR_KIND_TRANSPOSE
+    matched_operator: OPERATOR_KIND_REQUANTIZE_LINEAR
+    must_run_after: "runtime-shape-chain"
+    must_run_after: "runtime-static-qdq-compute-fusion"
+    must_run_before: "redundant-qdq"
+  }
+
+  pass: {
+    id: "redundant-qdq"
+    version: 1
+    implementation_id: "tools.exporter.optimizer.typed_passes:RedundantQDQPass"
+    summary: "Replace an identical-affine DQ to Q pair with byte Identity."
+    scope: OPTIMIZER_PASS_SCOPE_PORTABLE_PACKAGE
+    stage: OPTIMIZER_PASS_STAGE_QUANTIZED_REGION
+    input_dialect: OPTIMIZER_DIALECT_RUNTIME
+    output_dialect: OPTIMIZER_DIALECT_RUNTIME
+    repeatable: true
+    semantics: REWRITE_SEMANTICS_EXACT
+    matched_operator: OPERATOR_KIND_DEQUANTIZE_LINEAR
+    matched_operator: OPERATOR_KIND_QUANTIZE_LINEAR
+    emitted_operator: OPERATOR_KIND_IDENTITY
+    must_run_after: "runtime-canonicalize"
+    must_run_before: "runtime-dead-code"
+  }
+
+  pass: {
+    id: "runtime-dead-code"
+    version: 1
+    implementation_id: "tools.exporter.optimizer.typed_passes:RuntimeDeadCodePass"
+    summary: "Prune unreachable pure nodes and unreferenced initializer descriptors."
+    scope: OPTIMIZER_PASS_SCOPE_PORTABLE_PACKAGE
+    stage: OPTIMIZER_PASS_STAGE_CLEANUP
+    input_dialect: OPTIMIZER_DIALECT_RUNTIME
+    output_dialect: OPTIMIZER_DIALECT_RUNTIME
+    repeatable: true
+    semantics: REWRITE_SEMANTICS_EXACT
+    must_run_after: "redundant-qdq"
+  }
+
+  pass: {
+    id: "runtime-bias-folding"
+    version: 1
+    implementation_id: "tools.exporter.optimizer.typed_bias_folding:RuntimeBiasFoldingPass"
+    summary: "Fold a trailing immutable F32 bias Add into a dense operator before PTQ."
+    scope: OPTIMIZER_PASS_SCOPE_PORTABLE_PACKAGE
+    stage: OPTIMIZER_PASS_STAGE_SEMANTIC_FUSION
+    input_dialect: OPTIMIZER_DIALECT_RUNTIME
+    output_dialect: OPTIMIZER_DIALECT_RUNTIME
+    repeatable: true
+    semantics: REWRITE_SEMANTICS_NUMERICAL_MIGRATION
+    matched_operator: OPERATOR_KIND_LINEAR
+    matched_operator: OPERATOR_KIND_MATMUL
+    matched_operator: OPERATOR_KIND_GEMM
+    matched_operator: OPERATOR_KIND_ADD
+    emitted_operator: OPERATOR_KIND_LINEAR
+    emitted_operator: OPERATOR_KIND_MATMUL
+    emitted_operator: OPERATOR_KIND_GEMM
+    must_run_before: "runtime-canonicalize"
+    must_run_before: "runtime-dead-code"
+  }
+
+  pass: {
+    id: "runtime-silu-fusion"
+    version: 1
+    implementation_id: "tools.exporter.optimizer.typed_silu_fusion:RuntimeSiluFusionPass"
+    summary: "Fuse algebraically exact F32 x*sigmoid(x) into a SiLU kernel boundary."
+    scope: OPTIMIZER_PASS_SCOPE_PORTABLE_PACKAGE
+    stage: OPTIMIZER_PASS_STAGE_SEMANTIC_FUSION
+    input_dialect: OPTIMIZER_DIALECT_RUNTIME
+    output_dialect: OPTIMIZER_DIALECT_RUNTIME
+    repeatable: true
+    semantics: REWRITE_SEMANTICS_NUMERICAL_MIGRATION
+    matched_operator: OPERATOR_KIND_SIGMOID
+    matched_operator: OPERATOR_KIND_MUL
+    emitted_operator: OPERATOR_KIND_SILU
+    must_run_after: "runtime-constant-folding"
+    must_run_before: "runtime-elementwise-transpose"
+    must_run_before: "runtime-shape-chain"
+  }
+
+  pass: {
+    id: "runtime-grouped-projection-split"
+    version: 1
+    implementation_id: "tools.exporter.optimizer.typed_grouped_projection:RuntimeGroupedProjectionSplitPass"
+    summary: "Split a proven packed F32 dense projection into contiguous groups before PTQ."
+    scope: OPTIMIZER_PASS_SCOPE_PORTABLE_PACKAGE
+    stage: OPTIMIZER_PASS_STAGE_SEMANTIC_FUSION
+    input_dialect: OPTIMIZER_DIALECT_RUNTIME
+    output_dialect: OPTIMIZER_DIALECT_RUNTIME
+    repeatable: true
+    semantics: REWRITE_SEMANTICS_NUMERICAL_MIGRATION
+    matched_operator: OPERATOR_KIND_LINEAR
+    matched_operator: OPERATOR_KIND_MATMUL
+    matched_operator: OPERATOR_KIND_GEMM
+    matched_operator: OPERATOR_KIND_RESHAPE
+    matched_operator: OPERATOR_KIND_TRANSPOSE
+    matched_operator: OPERATOR_KIND_SQUEEZE
+    matched_operator: OPERATOR_KIND_UNSQUEEZE
+    matched_operator: OPERATOR_KIND_IDENTITY
+    matched_operator: OPERATOR_KIND_FLATTEN
+    matched_operator: OPERATOR_KIND_SLICE
+    emitted_operator: OPERATOR_KIND_LINEAR
+    emitted_operator: OPERATOR_KIND_MATMUL
+    emitted_operator: OPERATOR_KIND_GEMM
+    emitted_operator: OPERATOR_KIND_RESHAPE
+    must_run_after: "runtime-bias-folding"
+    must_run_before: "runtime-canonicalize"
+    must_run_before: "runtime-dead-code"
+  }
+
+  pass: {
+    id: "runtime-sequence-layout"
+    version: 1
+    implementation_id: "tools.exporter.optimizer.typed_sequence_layout:RuntimeSequenceLayoutPass"
+    summary: "Canonicalize proven internal sequence aliases to batch-first storage-equivalent views."
+    scope: OPTIMIZER_PASS_SCOPE_PORTABLE_PACKAGE
+    stage: OPTIMIZER_PASS_STAGE_CANONICALIZATION
+    input_dialect: OPTIMIZER_DIALECT_RUNTIME
+    output_dialect: OPTIMIZER_DIALECT_RUNTIME
+    repeatable: true
+    semantics: REWRITE_SEMANTICS_EXACT
+    matched_operator: OPERATOR_KIND_LINEAR
+    matched_operator: OPERATOR_KIND_MATMUL
+    matched_operator: OPERATOR_KIND_GEMM
+    matched_operator: OPERATOR_KIND_Q_LINEAR
+    matched_operator: OPERATOR_KIND_Q_MATMUL
+    matched_operator: OPERATOR_KIND_Q_GEMM
+    matched_operator: OPERATOR_KIND_LAYER_NORM
+    matched_operator: OPERATOR_KIND_Q_LAYER_NORM
+    matched_operator: OPERATOR_KIND_GROUP_NORM
+    matched_operator: OPERATOR_KIND_Q_GROUP_NORM
+    matched_operator: OPERATOR_KIND_GELU
+    matched_operator: OPERATOR_KIND_Q_GELU
+    matched_operator: OPERATOR_KIND_SILU
+    matched_operator: OPERATOR_KIND_Q_SILU
+    matched_operator: OPERATOR_KIND_RELU
+    matched_operator: OPERATOR_KIND_SIGMOID
+    matched_operator: OPERATOR_KIND_TANH
+    matched_operator: OPERATOR_KIND_ADD
+    matched_operator: OPERATOR_KIND_Q_ADD
+    matched_operator: OPERATOR_KIND_SUB
+    matched_operator: OPERATOR_KIND_MUL
+    matched_operator: OPERATOR_KIND_DIV
+    matched_operator: OPERATOR_KIND_SDPA
+    matched_operator: OPERATOR_KIND_Q_SDPA
+    matched_operator: OPERATOR_KIND_CROSS_SDPA
+    matched_operator: OPERATOR_KIND_RESHAPE
+    matched_operator: OPERATOR_KIND_SQUEEZE
+    matched_operator: OPERATOR_KIND_UNSQUEEZE
+    matched_operator: OPERATOR_KIND_FLATTEN
+    matched_operator: OPERATOR_KIND_IDENTITY
+    matched_operator: OPERATOR_KIND_TRANSPOSE
+    must_run_after: "runtime-grouped-projection-split"
+    must_run_before: "runtime-canonicalize"
+    must_run_before: "runtime-dead-code"
+  }
+
+  pass: {
+    id: "runtime-ptq-authoring"
+    version: 1
+    implementation_id: "tools.exporter.optimizer.typed_ptq_authoring:RuntimePTQAuthoringPass"
+    summary: "Author calibrated W8A8 compute, affine boundaries, and immutable quantized payloads."
+    scope: OPTIMIZER_PASS_SCOPE_PORTABLE_PACKAGE
+    stage: OPTIMIZER_PASS_STAGE_PRECISION_AUTHORING
+    input_dialect: OPTIMIZER_DIALECT_RUNTIME
+    output_dialect: OPTIMIZER_DIALECT_RUNTIME
+    semantics: REWRITE_SEMANTICS_QUANTIZATION_AUTHORING
+    requires_calibration: true
+    changes_precision: true
+    matched_operator: OPERATOR_KIND_LINEAR
+    matched_operator: OPERATOR_KIND_MATMUL
+    matched_operator: OPERATOR_KIND_CONV_2D
+    matched_operator: OPERATOR_KIND_EMBEDDING
+    matched_operator: OPERATOR_KIND_ADD
+    matched_operator: OPERATOR_KIND_GELU
+    matched_operator: OPERATOR_KIND_SILU
+    matched_operator: OPERATOR_KIND_LAYER_NORM
+    matched_operator: OPERATOR_KIND_GROUP_NORM
+    matched_operator: OPERATOR_KIND_BATCH_MATMUL
+    matched_operator: OPERATOR_KIND_SDPA
+    matched_operator: OPERATOR_KIND_CROSS_SDPA
+    emitted_operator: OPERATOR_KIND_Q_LINEAR
+    emitted_operator: OPERATOR_KIND_Q_CONV_2D
+    emitted_operator: OPERATOR_KIND_Q_EMBEDDING
+    emitted_operator: OPERATOR_KIND_Q_ADD
+    emitted_operator: OPERATOR_KIND_EXPAND
+    emitted_operator: OPERATOR_KIND_Q_GELU
+    emitted_operator: OPERATOR_KIND_Q_SILU
+    emitted_operator: OPERATOR_KIND_Q_LAYER_NORM
+    emitted_operator: OPERATOR_KIND_Q_GROUP_NORM
+    emitted_operator: OPERATOR_KIND_Q_BATCH_MATMUL
+    emitted_operator: OPERATOR_KIND_Q_SDPA
+    emitted_operator: OPERATOR_KIND_QUANTIZE_LINEAR
+    emitted_operator: OPERATOR_KIND_DEQUANTIZE_LINEAR
+    emitted_operator: OPERATOR_KIND_CROSS_SDPA
+    must_run_after: "runtime-vocabulary"
+    must_run_before: "runtime-canonicalize"
+    target: {
+      backend: BACKEND_KIND_CPU_JS
+      backend: BACKEND_KIND_WASM
+      backend: BACKEND_KIND_WEBGPU
+      backend: BACKEND_KIND_NATIVE_CPU
+      required_operator: OPERATOR_KIND_Q_LINEAR
+      required_operator: OPERATOR_KIND_Q_CONV_2D
+      required_operator: OPERATOR_KIND_Q_EMBEDDING
+      required_operator: OPERATOR_KIND_Q_ADD
+      required_operator: OPERATOR_KIND_EXPAND
+      required_operator: OPERATOR_KIND_Q_GELU
+      required_operator: OPERATOR_KIND_Q_SILU
+      required_operator: OPERATOR_KIND_Q_LAYER_NORM
+      required_operator: OPERATOR_KIND_Q_GROUP_NORM
+      required_operator: OPERATOR_KIND_Q_BATCH_MATMUL
+      required_operator: OPERATOR_KIND_Q_SDPA
+      required_operator: OPERATOR_KIND_QUANTIZE_LINEAR
+      required_operator: OPERATOR_KIND_DEQUANTIZE_LINEAR
+      required_operator: OPERATOR_KIND_CROSS_SDPA
+    }
+  }
+
+  group: {
+    id: "runtime-validation"
+    summary: "Fail-closed RuntimeIR vocabulary validation."
+    pass_id: "runtime-vocabulary"
+    max_iterations: 1
+  }
+  group: {
+    id: "runtime-output-specialization"
+    summary: "Caller-configured output ABI specialization."
+    pass_id: "runtime-output-qargmax"
+    max_iterations: 1
+  }
+  group: {
+    id: "runtime-input-specialization"
+    summary: "Caller-configured public-input specialization."
+    pass_id: "runtime-input-specialization"
+    max_iterations: 1
+  }
+  group: {
+    id: "runtime-input-hoisting"
+    summary: "Caller-configured post-rewrite promotion of source or semantically selected derived values to public inputs."
+    pass_id: "runtime-input-hoisting"
+    max_iterations: 1
+  }
+  group: {
+    id: "runtime-exact-prelude"
+    summary: "Exact initializer folding and dense canonicalization."
+    pass_id: "runtime-constant-folding"
+    max_iterations: 1
+  }
+  group: {
+    id: "runtime-quantized-migration-prelude"
+    summary: "Opt-in quantized dense accumulator preparation before packed projection splitting."
+    pass_id: "runtime-quantized-bias-folding"
+    max_iterations: 1
+  }
+  group: {
+    id: "runtime-packed-projection-prelude"
+    summary: "Exact packed-projection tensor-payload preparation."
+    pass_id: "runtime-packed-qlinear-split"
+    max_iterations: 1
+  }
+  group: {
+    id: "runtime-affine-layout-prelude"
+    summary: "Exact affine-reference preparation for Q/DQ layout rewrites."
+    pass_id: "runtime-affine-reference-canonicalization"
+    max_iterations: 1
+  }
+  group: {
+    id: "runtime-fp32-attention-migration-prelude"
+    summary: "Opt-in runnable CrossSDPA lowering for proved decomposed F32 attention."
+    pass_id: "runtime-float-attention-fusion"
+    max_iterations: 1
+  }
+  group: {
+    id: "runtime-quantized-attention-migration-prelude"
+    summary: "Opt-in runnable QSDPA lowering for proved producer-quantized attention."
+    pass_id: "runtime-quantized-attention-fusion"
+    max_iterations: 1
+  }
+  group: {
+    id: "runtime-quantized-attention-layout-prelude"
+    summary: "Exact scalar Q/DQ movement across proved singleton attention layout."
+    pass_id: "runtime-quantized-attention-layout"
+    max_iterations: 1
+  }
+  group: {
+    id: "runtime-attention-exact-fixed-point"
+    summary: "Exact runnable-attention layout and keep-mask canonicalization."
+    pass_id: "runtime-attention-layout"
+    pass_id: "runtime-keep-mask"
+    fixed_point: true
+    max_iterations: 8
+  }
+  group: {
+    id: "runtime-safe-fixed-point"
+    summary: "Semantics-preserving RuntimeIR layout and cleanup fixed point."
+    pass_id: "runtime-singleton-transpose"
+    pass_id: "runtime-qdq-transpose-cancellation"
+    pass_id: "runtime-pointwise-transpose-hoist"
+    pass_id: "runtime-qdq-movement"
+    pass_id: "runtime-elementwise-transpose"
+    pass_id: "runtime-shape-chain"
+    pass_id: "runtime-canonicalize"
+    pass_id: "redundant-qdq"
+    pass_id: "runtime-dead-code"
+    fixed_point: true
+    max_iterations: 8
+  }
+  group: {
+    id: "runtime-deferred-layout-fixed-point"
+    summary: "Safe cleanup with static-QDQ layout rewrites explicitly deferred."
+    pass_id: "runtime-elementwise-transpose"
+    pass_id: "runtime-shape-chain"
+    pass_id: "runtime-canonicalize"
+    pass_id: "redundant-qdq"
+    pass_id: "runtime-dead-code"
+    fixed_point: true
+    max_iterations: 8
+  }
+  group: {
+    id: "runtime-static-qdq-migration-fixed-point"
+    summary: "Opt-in static-QDQ compute migration followed by exact cleanup."
+    pass_id: "runtime-singleton-transpose"
+    pass_id: "runtime-qdq-transpose-cancellation"
+    pass_id: "runtime-pointwise-transpose-hoist"
+    pass_id: "runtime-qdq-movement"
+    pass_id: "runtime-elementwise-transpose"
+    pass_id: "runtime-shape-chain"
+    pass_id: "runtime-static-qdq-compute-fusion"
+    pass_id: "runtime-canonicalize"
+    pass_id: "redundant-qdq"
+    pass_id: "runtime-dead-code"
+    fixed_point: true
+    max_iterations: 8
+  }
+  group: {
+    id: "runtime-static-qdq-deferred-migration-fixed-point"
+    summary: "Static-QDQ compute migration with layout rewrites explicitly deferred."
+    pass_id: "runtime-elementwise-transpose"
+    pass_id: "runtime-shape-chain"
+    pass_id: "runtime-static-qdq-compute-fusion"
+    pass_id: "runtime-canonicalize"
+    pass_id: "redundant-qdq"
+    pass_id: "runtime-dead-code"
+    fixed_point: true
+    max_iterations: 8
+  }
+  group: {
+    id: "runtime-fp32-pre-ptq-fixed-point"
+    summary: "Opt-in model-neutral FP32 preparation before PTQ plus exact cleanup."
+    pass_id: "runtime-silu-fusion"
+    pass_id: "runtime-elementwise-transpose"
+    pass_id: "runtime-shape-chain"
+    pass_id: "runtime-bias-folding"
+    pass_id: "runtime-grouped-projection-split"
+    pass_id: "runtime-sequence-layout"
+    pass_id: "runtime-canonicalize"
+    pass_id: "runtime-dead-code"
+    fixed_point: true
+    max_iterations: 8
+  }
+  group: {
+    id: "runtime-ptq-authoring-stage"
+    summary: "One calibrated precision-authoring transaction over the exact observed graph."
+    pass_id: "runtime-ptq-authoring"
+    max_iterations: 1
+  }
+  group: {
+    id: "runtime-ptq-post-cleanup-fixed-point"
+    summary: "Exact cleanup after calibrated precision authoring."
+    pass_id: "runtime-canonicalize"
+    pass_id: "redundant-qdq"
+    pass_id: "runtime-dead-code"
+    fixed_point: true
+    max_iterations: 8
+  }
+
+  pipeline: {
+    id: "runtime-package"
+    version: 1
+    summary: "Composable RuntimeIR optimization for imported runnable packages."
+    group_overlay: { group_id: "runtime-validation" }
+    group_overlay: {
+      group_id: "runtime-output-specialization"
+      required_feature: "output-qargmax"
+    }
+    group_overlay: {
+      group_id: "runtime-input-specialization"
+      required_feature: "input-specialization"
+    }
+    group_overlay: { group_id: "runtime-exact-prelude" }
+    group_overlay: {
+      group_id: "runtime-fp32-attention-migration-prelude"
+      required_feature: "float-attention-fusion"
+    }
+    group_overlay: {
+      group_id: "runtime-quantized-attention-migration-prelude"
+      required_feature: "quantized-attention-fusion"
+    }
+    group_overlay: {
+      group_id: "runtime-quantized-migration-prelude"
+      required_feature: "static-qdq-compute-migration"
+    }
+    group_overlay: { group_id: "runtime-packed-projection-prelude" }
+    group_overlay: {
+      group_id: "runtime-affine-layout-prelude"
+      forbidden_feature: "defer-static-qdq-layout"
+    }
+    group_overlay: {
+      group_id: "runtime-quantized-attention-layout-prelude"
+      forbidden_feature: "defer-static-qdq-layout"
+    }
+    group_overlay: { group_id: "runtime-attention-exact-fixed-point" }
+    group_overlay: {
+      group_id: "runtime-input-hoisting"
+      required_feature: "input-hoisting"
+    }
+    group_overlay: {
+      group_id: "runtime-safe-fixed-point"
+      forbidden_feature: "static-qdq-compute-migration"
+      forbidden_feature: "defer-static-qdq-layout"
+    }
+    group_overlay: {
+      group_id: "runtime-deferred-layout-fixed-point"
+      required_feature: "defer-static-qdq-layout"
+      forbidden_feature: "static-qdq-compute-migration"
+    }
+    group_overlay: {
+      group_id: "runtime-static-qdq-migration-fixed-point"
+      required_feature: "static-qdq-compute-migration"
+      forbidden_feature: "defer-static-qdq-layout"
+    }
+    group_overlay: {
+      group_id: "runtime-static-qdq-deferred-migration-fixed-point"
+      required_feature: "static-qdq-compute-migration"
+      required_feature: "defer-static-qdq-layout"
+    }
+    allowed_semantics: REWRITE_SEMANTICS_EXACT
+    allowed_semantics: REWRITE_SEMANTICS_NUMERICAL_MIGRATION
+    allow_public_abi_change: true
+    supported_feature: "output-qargmax"
+    supported_feature: "input-specialization"
+    supported_feature: "input-hoisting"
+    supported_feature: "static-qdq-compute-migration"
+    supported_feature: "defer-static-qdq-layout"
+    supported_feature: "float-attention-fusion"
+    supported_feature: "quantized-attention-fusion"
+  }
+  pipeline: {
+    id: "runtime-fp32-pre-ptq"
+    version: 1
+    summary: "Composable model-neutral FP32 preparation before typed PTQ calibration."
+    group_overlay: { group_id: "runtime-validation" }
+    group_overlay: {
+      group_id: "runtime-output-specialization"
+      required_feature: "output-qargmax"
+    }
+    group_overlay: {
+      group_id: "runtime-input-specialization"
+      required_feature: "input-specialization"
+    }
+    group_overlay: { group_id: "runtime-exact-prelude" }
+    group_overlay: {
+      group_id: "runtime-fp32-attention-migration-prelude"
+      required_feature: "float-attention-fusion"
+    }
+    group_overlay: { group_id: "runtime-attention-exact-fixed-point" }
+    group_overlay: {
+      group_id: "runtime-input-hoisting"
+      required_feature: "input-hoisting"
+    }
+    group_overlay: { group_id: "runtime-fp32-pre-ptq-fixed-point" }
+    allowed_semantics: REWRITE_SEMANTICS_EXACT
+    allowed_semantics: REWRITE_SEMANTICS_NUMERICAL_MIGRATION
+    allow_public_abi_change: true
+    required_feature: "fp32-pre-ptq"
+    supported_feature: "output-qargmax"
+    supported_feature: "input-specialization"
+    supported_feature: "input-hoisting"
+    supported_feature: "float-attention-fusion"
+  }
+  pipeline: {
+    id: "runtime-ptq-authoring"
+    version: 1
+    summary: "Explicit calibrated W8A8 authoring followed only by exact cleanup."
+    group_overlay: { group_id: "runtime-validation" }
+    group_overlay: { group_id: "runtime-ptq-authoring-stage" }
+    group_overlay: { group_id: "runtime-ptq-post-cleanup-fixed-point" }
+    target: BACKEND_KIND_CPU_JS
+    target: BACKEND_KIND_WASM
+    target: BACKEND_KIND_WEBGPU
+    target: BACKEND_KIND_NATIVE_CPU
+    allowed_semantics: REWRITE_SEMANTICS_EXACT
+    allowed_semantics: REWRITE_SEMANTICS_QUANTIZATION_AUTHORING
+    allow_calibration: true
+    required_feature: "ptq-authoring"
+  }
+};

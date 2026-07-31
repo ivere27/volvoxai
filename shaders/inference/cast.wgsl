@@ -12,7 +12,7 @@ struct Params {
 }
 @group(0) @binding(2) var<uniform> params : Params;
 
-// Runtime dtype IDs are F32=0, I32=1, I8=2, U8=3.
+// Dtype IDs are canonical protobuf values: F32=18, I32=16, I8=6, U8=5.
 fn input_byte(index : u32) -> u32 {
   let word = input_words[index / 4u];
   return (word >> ((index % 4u) * 8u)) & 255u;
@@ -46,39 +46,39 @@ fn f32_integer_bits(bits : u32) -> u32 {
 }
 
 fn cast_f32(bits : u32) -> u32 {
-  if (params.output_type == 0u) { return bits; }
+  if (params.output_type == 18u) { return bits; }
   return f32_integer_bits(bits);
 }
 
 fn cast_i32(bits : u32) -> u32 {
-  if (params.output_type == 0u) { return bitcast<u32>(f32(bitcast<i32>(bits))); }
+  if (params.output_type == 18u) { return bitcast<u32>(f32(bitcast<i32>(bits))); }
   return bits;
 }
 
 fn cast_i8(byte : u32) -> u32 {
-  if (params.output_type == 0u) { return bitcast<u32>(f32(signed_byte(byte))); }
-  if (params.output_type == 1u) { return bitcast<u32>(signed_byte(byte)); }
+  if (params.output_type == 18u) { return bitcast<u32>(f32(signed_byte(byte))); }
+  if (params.output_type == 16u) { return bitcast<u32>(signed_byte(byte)); }
   return byte;
 }
 
 fn cast_u8(byte : u32) -> u32 {
-  if (params.output_type == 0u) { return bitcast<u32>(f32(byte)); }
-  if (params.output_type == 1u) { return byte; }
+  if (params.output_type == 18u) { return bitcast<u32>(f32(byte)); }
+  if (params.output_type == 16u) { return byte; }
   return byte;
 }
 
 fn cast_one(index : u32) -> u32 {
-  if (params.input_type == 0u) { return cast_f32(input_words[index]); }
-  if (params.input_type == 1u) { return cast_i32(input_words[index]); }
+  if (params.input_type == 18u) { return cast_f32(input_words[index]); }
+  if (params.input_type == 16u) { return cast_i32(input_words[index]); }
   let byte = input_byte(index);
-  if (params.input_type == 2u) { return cast_i8(byte); }
+  if (params.input_type == 6u) { return cast_i8(byte); }
   return cast_u8(byte);
 }
 
 @compute @workgroup_size(64)
 fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
   let output_word = gid.x;
-  if (params.output_type < 2u) {
+  if (params.output_type == 18u || params.output_type == 16u) {
     if (output_word >= params.size) { return; }
     output_words[output_word] = cast_one(output_word);
     return;

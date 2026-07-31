@@ -1,6 +1,8 @@
 import { GraphExecutor } from '../backends/GraphExecutor.js';
+import { compileWebGPUGraphPlan } from '../backends/WebGPUGraphCompiler.js';
 import type { Graph } from '../core/Graph.js';
 import type { Tensor } from '../core/Tensor.js';
+import { DataType } from '../generated/volvoxaiEnums.js';
 import type { RuntimeTypedArray } from '../types.js';
 import { normalizeSpatialPair } from '../ops/spatialParameters.js';
 import {
@@ -10,7 +12,7 @@ import {
 } from './TrainingOptimizer.js';
 import { ensureTrainingGraphState, synchronizeTrainingGraphState } from './TrainingGraph.js';
 import type { TrainingGraph } from './TrainingGraph.js';
-import type { CPUTrainStepOptions } from './CPUAutograd.js';
+import type { TrainingStepOptions } from './TrainingStep.js';
 import {
   addGradient,
   crossEntropyGradient,
@@ -39,6 +41,13 @@ interface WebGPUTrainingDispatch {
   resources: GPUBuffer[];
 }
 
+type WebGPUTrainingForwardExecutor = GraphExecutor & {
+  executeTraining?(
+    inputs: Record<string, RuntimeTypedArray>,
+    pipelines: ReadonlyMap<number, WebGPUTrainingDispatch>,
+  ): Promise<GPUBuffer | undefined>;
+};
+
 interface WebGPULossMetric {
   name: string;
   logitsTensor: string;
@@ -49,7 +58,7 @@ interface WebGPULossMetric {
   weight: number;
 }
 
-export interface WebGPUTrainStepOptions extends CPUTrainStepOptions {}
+export interface WebGPUTrainStepOptions extends TrainingStepOptions {}
 
 let TrainingShaders: TrainingShaderMap | undefined;
 
@@ -64,10 +73,10 @@ const WEBGPU_SLICE_MAX_RANK = 8;
 const WEBGPU_GATHER_MAX_RANK = 8;
 const MAX_U32 = 0xffffffff;
 const WEBGPU_TYPED_DTYPE_CODES = Object.freeze({
-  float32: 0,
-  int32: 1,
-  int8: 2,
-  uint8: 3,
+  float32: DataType.F32,
+  int32: DataType.I32,
+  int8: DataType.I8,
+  uint8: DataType.U8,
 });
 const WEBGPU_TYPED_DTYPE_BYTES = Object.freeze({
   float32: 4,
@@ -222,7 +231,7 @@ function dequantizeLinearBackwardDescriptor(node, output) {
   const raw = new Uint32Array([
     inputElements,
     typedDtypeCode(input.dtype),
-    zeroPoint ? typedDtypeCode(zeroPoint.dtype) : 0,
+    zeroPoint ? typedDtypeCode(zeroPoint.dtype) : WEBGPU_TYPED_DTYPE_CODES.float32,
     zeroPoint ? 1 : 0,
   ]);
   return { raw, input, scale, zeroPoint, inputElements };
@@ -495,11 +504,43 @@ function crossAttentionBackwardDescriptor(node) {
  * Opt-in WebGPU reverse-mode trainer. Forward-only users never import the WGSL
  * training library and never allocate gradient buffers or backward pipelines.
  */
+/** Full-profile forward owner. The inference executor never enters this mode. */
+class TrainerOwnedGraphExecutor extends GraphExecutor {
+  override async compile(): Promise<void> {
+    this._assertPortableQuantizedGraph(this.graph as Graph);
+    this.resetDecodeCache();
+    await this.graphCompiler.ensureShaderLibrary();
+    this.resources.resetCompilationResources();
+    this.pipelines = [];
+    this.decodeState.resetCompilation();
+    this.compiledGraphPlan = compileWebGPUGraphPlan(this.graph as Graph);
+    this._dinWeights = new Map(this.compiledGraphPlan.dinWeights);
+    this._allocateBuffers();
+    for (let nodeIndex = 0; nodeIndex < this.graph.nodes.length; nodeIndex++) {
+      const start = this.pipelines.length;
+      await this._buildNodePipeline(this.graph.nodes[nodeIndex]);
+      for (let index = start; index < this.pipelines.length; index++) {
+        this.pipelines[index].graphNodeIndex = nodeIndex;
+      }
+    }
+    this.compiledWeightRevision = this.graph.weightRevision || 0;
+    this.compiledTopologyRevision = this.graph.topologyRevision || 0;
+    this.graph.adapters?._markAcceleratedBackend('webgpu');
+  }
+
+  executeTraining(
+    inputs: Record<string, RuntimeTypedArray>,
+    pipelines: ReadonlyMap<number, WebGPUTrainingDispatch>,
+  ): Promise<GPUBuffer | undefined> {
+    return this.dispatch.execute(inputs, { adapter: null }, pipelines);
+  }
+}
+
 export class WebGPUAutograd {
   declare device: GPUDevice;
   declare graph: TrainingGraph;
   declare ownsExecutor: boolean;
-  declare executor: GraphExecutor;
+  declare executor: WebGPUTrainingForwardExecutor;
   declare gradientBuffers: Map<string, GPUBuffer>;
   declare pipelineCache: Map<string, GPUComputePipeline>;
   declare moduleCache: Map<string, GPUShaderModule>;
@@ -508,14 +549,14 @@ export class WebGPUAutograd {
   declare _activeResources: Set<GPUBuffer> | null;
   declare _training: boolean;
 
-  constructor(device: GPUDevice, graph: Graph, executor: GraphExecutor | null = null) {
+  constructor(device: GPUDevice, graph: Graph, executor: WebGPUTrainingForwardExecutor | null = null) {
     if (!device) throw new Error('WebGPUAutograd requires a GPUDevice.');
     if (!graph) throw new Error('WebGPUAutograd requires a Graph.');
     ensureTrainingGraphState(graph);
     this.device = device;
     this.graph = graph as TrainingGraph;
     this.ownsExecutor = executor == null;
-    this.executor = executor || new GraphExecutor(device, graph);
+    this.executor = executor || new TrainerOwnedGraphExecutor(device, graph);
     this.gradientBuffers = new Map();
     this.pipelineCache = new Map();
     this.moduleCache = new Map();
@@ -768,7 +809,7 @@ export class WebGPUAutograd {
       const node: any = this.graph.nodes[ni];
       if (node.opType === 'Split') {
         const input = nodeInput(node);
-        const outputKeys = Object.keys(node.outputs || {}).sort();
+        const outputKeys = Object.keys(node.outputs || {});
         const activeOutputs = outputKeys.filter((key) => this.gradientBuffers.has(node.outputs[key].name));
         if (!activeOutputs.length) continue;
         if (!input || input.dtype !== 'float32' || !outputKeys.length) {
@@ -995,7 +1036,7 @@ export class WebGPUAutograd {
         if(![pt,pl,pb,pr].every(v=>Number.isInteger(v)&&v>=0)||output.shape[0]!==batch||output.shape[1]!==height+pt+pb||output.shape[2]!==width+pl+pr||output.shape[3]!==channels) throw new Error(`Pad node ${node.id} has incompatible dimensions.`);
         const params=this._parameterBuffer(new Uint32Array([batch,height,width,channels,output.shape[1],output.shape[2],channels,0,pt,pl,pb,pr]));
         await add('padBackward','main',[[0,go],[1,this._floatGradient(input,node,'Pad input')],[2,params]],[Math.ceil(product(input.shape)/64),1,1],[params]);
-      } else if(node.opType==='Interp1D'||node.opType==='InterpLinear1D'){
+      } else if(node.opType==='Interpolate1D'||node.opType==='Interp1D'||node.opType==='InterpLinear1D'){
         const input=nodeInput(node);if(!input||input.dtype!=='float32'||input.shape.length!==3||output.shape.length!==3||output.shape[0]!==input.shape[0]||output.shape[1]!==input.shape[1])throw new Error(`${node.opType} backward requires matching rank-3 NCL tensors.`);
         const params=this._parameterBuffer(new Uint32Array([input.shape[0],input.shape[1],input.shape[2],output.shape[2]]));await add('interp1DBackward','main',[[0,go],[1,this._floatGradient(input,node,`${node.opType} input`)],[2,params]],[Math.ceil(product(input.shape)/64),1,1],[params]);
       } else if (node.opType === 'Dropout') {
@@ -1591,10 +1632,6 @@ export class WebGPUAutograd {
   }
 
   async _ensureForwardCompiled() {
-    if (this.graph.nodes.some((node) => node.opType === 'Dropout') &&
-        typeof this.executor.prepareForTraining === 'function') {
-      await this.executor.prepareForTraining();
-    }
     if (this.executor.compiledTopologyRevision == null) await this.executor.compile();
   }
 
@@ -1720,7 +1757,14 @@ export class WebGPUAutograd {
       counter: dropout.counter ?? defaultDropoutCounter,
     });
     const pipelineOverrides = await this._buildDropoutForwardOverrides(trainingDropout);
-    await this.executor.execute(inputs, { adapter: null, training: { pipelineOverrides } });
+    if (typeof this.executor.executeTraining === 'function') {
+      await this.executor.executeTraining(inputs, pipelineOverrides);
+    } else {
+      if (pipelineOverrides.size > 0) {
+        throw new Error('WebGPU Trainer requires a Trainer-owned forward executor for Dropout.');
+      }
+      await this.executor.execute(inputs, { adapter: null });
+    }
     this._assertStepState(topologyRevision, expectedWeightRevision);
 
     for (const [name, buffer] of this.gradientBuffers) {

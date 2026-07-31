@@ -83,6 +83,34 @@ test('QLinear supports asymmetric U8 tensors and saturates its quantized output'
   assert.deepEqual([...node.outputs.out.buffer], [0, 255]);
 });
 
+test('QLinear rejects underflowing and overflowing F32 requantization multipliers', () => {
+  const minimumF32 = 1.401298464324817e-45;
+  for (const [label, inputScale, weightScale] of [
+    ['underflowing', minimumF32, minimumF32],
+    ['overflowing', 1e30, 1e30],
+  ]) {
+    const graph = new Graph();
+    const node = addQLinear(graph, {
+      inputValues: [1],
+      inputShape: [1, 1],
+      inputQuantization: { scheme: 'per_tensor', scale: inputScale, zero_point: 0 },
+      weightValues: [1],
+      weightShape: [1, 1],
+      weightQuantization: {
+        scheme: 'per_axis', axis: 0, scales: [weightScale], zero_points: [0],
+      },
+      biasValues: [0],
+      outputShape: [1, 1],
+      outputQuantization: { scheme: 'per_tensor', scale: 1, zero_point: 0 },
+    });
+    assert.throws(
+      () => _cpuQLinear(node),
+      /requantization multiplier is not representable as positive F32/,
+      label,
+    );
+  }
+});
+
 test('CPU engine dispatches explicit QLinear without entering the W8A32 MatMul path', async () => {
   const graph = new Graph();
   const node = addQLinear(graph, {
@@ -93,7 +121,7 @@ test('CPU engine dispatches explicit QLinear without entering the W8A32 MatMul p
     biasValues: [2, -4], outputShape: [1, 2],
     outputQuantization: { scheme: 'per_tensor', scale: 0.125, zero_point: 0 },
   });
-  graph.outputNames = [node.outputs.out.name];
+  graph.setOutputs([node.outputs.out.name]);
   const engine = new CPUEngine();
   engine.allocateGraph(graph);
   const result = await engine.execute({ input: Int8Array.of(1, -2, 3) });

@@ -4,10 +4,9 @@
 **심화**(엔진 개발자). 처음이신가요? 🌱 부분만 따라가세요.*
 
 *목표: 6장은 int8 **수학** — `scale` + `zero_point` 레시피와 `QConv2D` 가 정수로 도는 방식 — 을
-설명했습니다. 이 장은 그것이 남긴 질문에 답합니다: **그 숫자들은 어디서 오는가?** VolvoxAI의 양자화
-서브시스템(`volvoxai_training.h` 의 `volvoxai_ptq_*`, `native/src/training/quantization*.c`)이
-학습된 FP32 모델을 배포 가능한 int8로 바꾸는 과정을 따라갑니다 — 먼저 사후 학습 양자화(PTQ), 그다음
-양자화 인지 학습(QAT).*
+설명했습니다. 이 장은 그것이 남긴 질문에 답합니다: **그 숫자들은 어디서 오는가?** full 프로필의 PTQ
+저작 도구로 학습된 FP32 Graph를 배포 가능한 int8 패키지로 바꾸고, 언제 양자화 인지 학습(QAT)이
+필요한지 설명합니다.*
 
 > 🌱 **핵심 아이디어.** 6장의 거친 자에 모델을 반올림하는 게 자동처럼 들리지만, 함정이 있습니다:
 > **자를 얼마나 넓게 해야 하나?** 모델의 고정된 손잡이(가중치)는 쉽습니다 — 가장 큰 값과 작은 값만
@@ -51,23 +50,34 @@
 
 > 🌱 **아이디어.** 손잡이는 쉽습니다: 각 손잡이 묶음이 자기 최댓값에 맞춘 *자기만의* 자를 받아, 어떤
 > 묶음도 이웃의 이상치 때문에 정밀도를 잃지 않습니다. 데이터 불필요 — 순수 산술입니다.
+>
+> *채널별, 손으로.* 채널 A의 최대 크기 가중치가 `0.8`, 채널 B가 `0.05` 라 합시다. `0.8` 에 맞춘 공유
+> 자 하나면 B의 작은 가중치들이 거의 같은 몇 눈금으로 반올림돼 — B는 디테일을 다 잃습니다. B에 자기
+> 자(`scale = 0.05/127`)를 주면 그 작은 값들이 다시 256눈금에 퍼집니다. 채널당 자 하나, 시끄러운
+> 이웃에 뭉개지는 이가 없습니다.
 
-🔬 가중치 양자화는 결정론적입니다. VolvoxAI는 가중치 텐서를 **출력 채널마다 하나의 대칭 스케일** 로
-int8 패킹합니다(`volvoxai_ptq_pack_weight_i8`):
+🔬 가중치 양자화는 결정론적입니다. `packPTQWeight()` 는 가중치 텐서를 **출력 채널마다 하나의 대칭
+스케일** 로 int8 패킹합니다:
 
-```c
-// 행 우선 가중치를 패킹, `axis` 원소마다 I8 스케일 하나 (axis 0 = 출력 채널)
-int volvoxai_ptq_pack_weight_i8(const float *values, const int32_t *shape,
-                                int32_t ndim, int32_t axis, int8_t *output,
-                                float *scales, int32_t scale_count,
-                                uint64_t *saturation_count);
+```javascript
+const packed = packPTQWeight(values, [outputChannels, inputChannels], {
+  axis: 0,
+  name: 'projection.weight.i8',
+});
 ```
 
 왜 텐서 전체 스케일 하나가 아니라 **채널별** 인가? 유독 큰 채널 하나가 자를 늘려 나머지 모두의
 정밀도를 뭉갤 것이기 때문입니다(6장 §6.2). 각 출력 채널에 자기 `scale = max(|channel|)/127` 을 주면
-모든 채널의 정밀도가 독립적으로 유지됩니다 — int8 정확도를 FP32 가까이 붙드는 비결. 바이어스는 자기
-동반 단계(`volvoxai_ptq_pack_bias_i32`)를 거쳐 입력·가중치 스케일의 곱으로 int32로 양자화됩니다.
-`saturation_count` 는 몇 개 값이 ±127 난간에 부딪혔는지 보고해, 잘못 스케일된 텐서를 잡게 합니다.
+모든 채널의 정밀도가 독립적으로 유지됩니다 — int8 정확도를 FP32 가까이 붙드는 비결.
+`packPTQBias()` 는 입력·가중치 스케일의 곱으로 바이어스를 int32로 양자화합니다.
+`saturationCount` 는 몇 개 값이 ±127 난간에 부딪혔는지 보고해, 잘못 스케일된 텐서를 잡게 합니다.
+
+> 🔬 **뜯어보기: 좁은 범위와 int32 바이어스.** 대칭 가중치 패킹은 `scale = max(|channel|) / 127` 을
+> 쓰는데 — **127로, 128이 아니라** — 그래서 범위가 `[−127, 127]` 로 균형지고 어떤 정당한 가중치도 홀로
+> 남는 코드 `−128` 에 매핑되지 않습니다. 바이어스는 `round(bias / (input_scale · weight_scale))` 로
+> **int32** 에 패킹됩니다 — 6장 §6.4 int32 누산기와 *같은 단위* 라, 바이어스를 별도 재스케일 없이 누적에
+> 바로 더할 수 있습니다. `saturation_count` 는 ±127 난간에 부딪힌 값을 세며, 큰 값은 자가 잘못 맞춰져
+> 정밀도가 새고 있다는 신호입니다.
 
 ## 7.3 활성화: 관찰에 의한 캘리브레이션
 
@@ -75,30 +85,36 @@ int volvoxai_ptq_pack_weight_i8(const float *values, const int32_t *shape,
 > 지점에서 숫자가 얼마나 커지는지 그냥 *지켜봅니다*. 그 관찰한 고점·저점이 각 자의 폭을 정합니다.
 > 쓰레기가 들어가면 쓰레기가 나옵니다 — 예제가 대표적이지 않으면 자가 틀립니다.
 
-🔧 활성화의 경우, VolvoxAI는 작은 **캘리브레이션 셋**(대표 입력 몇백 개)으로 FP32 모델을 돌리며 각
-텐서가 지나가는 것을 *지켜봅니다*. **관찰자(observer)** 는 그저 도는 범위를 추적합니다
-(`volvoxai_training.h`):
+🔧 활성화의 경우, 작은 **캘리브레이션 셋** 으로 FP32 모델을 돌리고 관찰할 텐서를 Graph 출력으로
+선언합니다. `ExecutionResult` 가 안정된 출력 스냅샷을 노출하고, `PTQObserver` 가 복사된 F32 범위를
+추적합니다:
 
-```c
-typedef struct volvoxai_ptq_observer {
-    float minimum;
-    float maximum;
-    uint64_t sample_count;
-} volvoxai_ptq_observer_t;
-
-// 각 순전파 뒤, 이름 붙은 F32 텐서의 값들을 그 관찰자에 접어 넣음:
-int volvoxai_engine_ptq_observe_tensor(const char *tensor_name,
-                                       volvoxai_ptq_observer_t *observer);
+```javascript
+const observer = new PTQObserver();
+for (const inputs of calibrationSamples) {
+  const result = await context.execute(inputs);
+  try {
+    observer.observe(await result.output('encoder.out').read());
+  } finally {
+    await result.close();
+  }
+}
 ```
 
-🔬 충분한 샘플 뒤, 관찰된 `[minimum, maximum]` 이 `scale` + `zero_point` 가 됩니다
-(`volvoxai_ptq_calculate_params`), 두 방식 중 하나를 골라:
+🔬 충분한 샘플 뒤, `derivePTQParameters(observer, options)` 가 관찰된 `[minimum, maximum]` 을
+`scale` + `zero_point` 로 바꿉니다. 두 방식 중 하나를 고릅니다:
 
-- **대칭**(`VOLVOXAI_PTQ_SYMMETRIC`) — 0을 중심으로 한 범위, `zero_point = 0`. 가중치와 양쪽으로
+- **대칭** — 0을 중심으로 한 범위, `zero_point = 0`. 가중치와 양쪽으로
   흔들리는 활성화에 최적.
-- **비대칭**(`VOLVOXAI_PTQ_ASYMMETRIC`) — 임의의 `[min,max]` 를 0이 아닌 `zero_point` 로 자에 매핑.
+- **비대칭** — 임의의 `[min,max]` 를 0이 아닌 `zero_point` 로 자에 매핑.
   한쪽으로 치우친 활성화(예: ReLU 후, 항상 ≥ 0)에 최적 — 결코 나오지 않는 음수에 눈금 절반을
   낭비하지 않습니다.
+
+> 🔬 **뜯어보기: min/max는 가장 단순한 관찰자일 뿐, 유일한 건 아니다.** 도는 `[min, max]` 를 추적하는
+> 건 쉽지만 취약합니다 — 이상치 하나가 자를 늘려 나머지 전부를 거칠게 만듭니다. 프로덕션 캘리브레이터는
+> 흔히 **백분위수** 나 **히스토그램 + KL 발산**("엔트로피" 캘리브레이션)으로 드문 이상치를 잘라 분포의
+> 몸통을 날카롭게 유지하거나, 배치 간 EMA를 씁니다. VolvoxAI의 `PTQObserver` 는 투명한 min/max 상태와
+> 샘플 수를 사용하므로 무엇이 각 스케일을 정했는지 정확히 볼 수 있습니다.
 
 > **캘리브레이션 데이터가 중요합니다.** 🌱 자는 보여준 예제만큼만 좋습니다 — 빈 입력을 주면 의미 없는
 > 자가 나옵니다. 🔬 `tiny_receipt` 도구는 이를 명시적으로 만듭니다: 0으로 채운 입력의 `--structural-smoke`
@@ -108,34 +124,38 @@ int volvoxai_engine_ptq_observe_tensor(const char *tensor_name,
 ## 7.4 사후 학습 양자화, 처음부터 끝까지
 
 > 🌱 **아이디어.** 종합: 손잡이를 재고, 실제 예제로 흐르는 숫자를 지켜보고, 모든 자를 고르고, 새 —
-> 훨씬 작은 — 모델을 1장의 *같은 두 파일 형식* 으로 써냅니다. 재학습 불필요. 엔진은 정확도를 얼마나
-> 잃었는지 *측정* 까지 해줘, 작은 버전이 충분히 좋은지 정직하게 판단하게 합니다.
+> 훨씬 작은 — 모델을 1장의 패키지 형식으로 써냅니다. 재학습 불필요. 정확도를 얼마나 잃었는지
+> *측정* 해, 작은 버전이 충분히 좋은지 정직하게 판단할 수 있습니다.
 
-🔧 VolvoxAI는 가중치 패킹과 활성화 캘리브레이션을 명시적 **PTQ 계획(plan)** 으로 엮습니다. 계획은
-로드된 FP32 그래프를 관찰하되 절대 다시 쓰지 않습니다 — 어떤 노드를 양자화할지 *당신* 이
-저작합니다(엔진은 명시적으로 남고, 정밀도 경계를 넘는 법을 추측하지 않습니다):
+🔧 Graph 저자가 경계를 고릅니다. 도구는 지원하지 않는 연산이 정밀도 경계를 넘는 방법을 추측하지
+않습니다. `materializePTQWeights()` 는 선택한 F32 가중치와 바이어스를 패킹하고, 새 Graph에 쓸
+참조 전용 테이블 `artifact.quantization` 과 새 safetensors 바이트를 반환합니다:
 
-```c
-VolvoxAIPTQPlan *plan = volvoxai_ptq_plan_create();      // 로드된 FP32 모델에 묶임
-volvoxai_ptq_plan_add_tensor(plan, &tensor_spec);        // 캘리브레이션할 활성화 (dtype, scheme)
-volvoxai_ptq_plan_add_layer(plan, &layer_spec);          // 노드 → QLinear / QConv2D, 그 가중치
-// ... 캘리브레이션 입력을 스트림:
-volvoxai_engine_ptq_plan_calibrate_sample(plan, "sample-0", bindings, n);
-// ... 찾은 것을 살핀 뒤 패키지를 방출:
-volvoxai_ptq_plan_tensor_params(plan, "vqa.enc.0.out", &params);   // scale, zero_point, saturation
-volvoxai_ptq_plan_write_package(plan, &options);         // 두 파일: config + safetensors
+```javascript
+const artifact = materializePTQWeights(trainingGraph, [{
+  name: 'decoder.proj.weight',
+  outputName: 'decoder.proj.weight.i8',
+  scaleName: 'decoder.proj.weight.scale',
+  zeroPointName: 'decoder.proj.weight.zero_point',
+  bias: 'decoder.proj.bias',
+  biasOutputName: 'decoder.proj.bias.i32',
+  inputScale: activationParameters['decoder.proj.input'].scale,
+  axis: 0,
+}]);
 ```
 
-출력은 1장에서 만난 **같은 두 파일 설계도** 입니다 — 양자화된 노드가 이제 `weight_scale` 서술자를
-지닌 `QLinear`/`QConv2D` 인 `config.json`, 그리고 패킹된 int8 가중치와 그 스케일을 담은
-`model.safetensors`. 이것은 실행 시점에 양자화 코드 없이 보통의 추론 엔진(8–9장)에서 로드되고
-돕니다. 이것이 `tiny_receipt` 예제가 제공하는 "학습 → PTQ → W8A8" 경로입니다.
+출력은 1장에서 만난 **패키지** 입니다 — 정확한 루트 판별자 `"format": "volvox-graph/v1"`,
+`QLinear`/`QConv2D` 노드, 스케일/제로 포인트 텐서를 가리키는 단 하나의 중앙 테이블이 있는
+`graph.json`, 그리고 패킹된 int8 가중치와 모든 수치 affine 파라미터를 담은
+`model.safetensors`. 수치 스케일이나 제로 포인트는 JSON 또는 safetensors 메타데이터에 저장하지
+않습니다. 이것은 실행 시점에 양자화 코드 없이 일반
+`Runtime → Model → CompiledModel → ExecutionContext → ExecutionResult` 수명 주기(8–9장)로 로드하고 실행합니다.
+이것이 `tiny_receipt` 예제가 제공하는 "학습 → PTQ → W8A8" 경로입니다.
 
 🔬 API에 새겨진, 짚어볼 두 안전 속성:
 
-- **계획은 하나의 모델 세대에 고정됩니다.** 다시 로드하거나, 그래프를 편집하거나, 한 스텝 학습하거나,
-  어댑터를 활성화하면 계획이 *무효화* 됩니다 — 그 스케일이 더는 살아있는 가중치를 서술하지 않으니까요.
-  오래된 연산은 손상된 패키지를 방출하는 대신 실패합니다.
+- **캘리브레이션 기록은 하나의 Graph 리비전을 식별합니다.** Graph를 편집하거나, 한 스텝 더 학습하거나,
+  다른 어댑터를 고르면 범위를 다시 모아야 합니다. 이전 스케일은 그 가중치를 더는 설명하지 않습니다.
 - **FP32 대비 오차를 측정할 수 있습니다.** FP32 그래프가 바로 옆에 있어, 양자화 출력을 그것과 비교해
   텐서별 구체적 정확도 차이를 얻습니다 — 주어진 층에 int8이 허용 가능한지 판단하는 정직한 방법.
 
@@ -154,19 +174,15 @@ DequantizeLinear` 쌍을 넣어, 각 값이 자기 int8 격자로 반올림됐�
 보는 숫자는 *실제* int8 반올림 값이라, 손실이 실제 배포 오차를 반영하고, 4–5장이 나머지를 합니다 —
 가중치가 반올림에 강인해지도록 배웁니다.
 
+> 🔬 **뜯어보기: "스트레이트-스루" 기울기, 정확히.** 순방향으로 가짜 양자화는 int8 격자로 반올림하고,
+> 역방향으로 스트레이트-스루 추정기는 그 반올림을 **항등** 으로 취급합니다 — 표현 가능 범위 *안* 의
+> 값엔 기울기 `1`, 난간을 넘어 포화된 값엔 **`0`**("클립된" STE라, 고정된 값은 더 밖으로 밀길 멈춥니다).
+> 결정적으로 가짜 양자화는 **학습 순전파에만** 삽니다; 배포 모델은 중간에 역양자화 없는 순수 int8입니다.
+> 그리고 스케일의 기울기 `dscale` 도 흐르므로, 자의 폭 자체가 관찰이 아니라 *학습* 됩니다.
+
 🔬 함정은 역전파입니다: 정수로의 강한 반올림은 거의 모든 곳에서 기울기가 0이라, 학습을 죽일 것입니다.
-VolvoxAI는 4장 §4.6이 암시한 바로 그곳에서 이를 해결합니다:
-
-```c
-// 정수 캐스트는 기울기를 멈춤 (round()는 쓸모 있는 기울기가 없음) ...
-volvoxai_training_cast_backward_f32(...);              // → 정수 캐스트에 dx 멈춤
-// ... 하지만 DequantizeLinear는 가짜 양자화를 통해 기울기를 곧장 통과:
-volvoxai_training_dequantize_linear_backward_f32(
-    input, input_type, scale, zero_point, zero_point_type,
-    dy, dx, dscale, elements);                          // dx (그리고 dscale까지) 흐름
-```
-
-그것이 **스트레이트-스루 추정기(straight-through estimator)** 입니다: 기울기 목적상 반올림이
+따라서 QAT Graph는 실제 정수 캐스트에서 기울기를 멈추되, 가짜 양자화 경계에는
+**스트레이트-스루 추정기(straight-through estimator)** 역방향 규칙을 둡니다: 기울기 목적상 반올림이
 항등함수였던 척해, 순전파는 여전히 실제 int8 격자를 느끼는 동안 학습이 계속됩니다. `dscale` 도 흐를 수
 있어, 양자화 스케일 자체를 관찰만이 아니라 *학습* 할 수 있습니다. QAT는 전체 학습 실행 비용이라, PTQ의
 측정된 오차(§7.4)가 필요하다고 말할 때만 꺼내는 도구입니다.
@@ -204,18 +220,18 @@ volvoxai_training_dequantize_linear_backward_f32(
 
 - 양자화는 캐스트가 아니라 **과정** 입니다: int8 모델은 그 `scale`/`zero_point` 숫자만큼만 좋고, 그것을
   만드는 건 데이터 기반입니다.
-- **가중치** 는 즉시 양자화됩니다 — 결정론적 **채널별 대칭** 패킹(`pack_weight_i8`), 정밀도를 지키려
+- **가중치** 는 즉시 양자화됩니다 — `packPTQWeight()` 의 결정론적 **채널별 대칭** 패킹, 정밀도를 지키려
   출력 채널마다 스케일 하나.
 - **활성화** 는 **관찰** 되어야 합니다: 대표 **캘리브레이션 셋** 으로 FP32 모델을 돌리며, **관찰자**
   로 각 텐서 범위를 추적하고, 스케일(대칭 또는 비대칭)로 바꿉니다.
-- **PTQ** 는 이것들을 명시적·모델-고정 **계획** 으로 엮어 가중치를 패킹하고, 활성화를 캘리브레이션하고,
-  FP32 대비 오차를 측정하고, 보통의 두 파일 설계도를 써냅니다 — 재학습 없음.
+- **PTQ** 는 이것들을 명시적 저작 흐름으로 엮어 가중치를 패킹하고, 활성화를 캘리브레이션하고,
+  FP32 대비 오차를 측정하고, 정규 패키지를 써냅니다 — 재학습 없음.
 - **QAT** 는 PTQ의 정확도 하락이 너무 클 때 더 나아갑니다: 학습 순전파에서 **가짜 양자화** 하고
-  **스트레이트-스루 추정기**(`dequantize_linear_backward`)로 기울기를 계속 흐르게 해, 가중치가 int8을
+  **스트레이트-스루 추정기**로 기울기를 계속 흐르게 해, 가중치가 int8을
   견디도록 *배웁니다*.
 - VolvoxAI의 양자화 천장은 잘 실행된 **int8** 입니다. int4는 미래 작업이지, 형식이 아닙니다.
 
 이로써 3부가 완성됩니다: 이제 가중치를 *찾고*(2부) *줄일*(3부) 수 있습니다. 4부는 이 책이 시작한
-질문으로 돌아갑니다 — 엔진은 실제로 이 그래프들을 실제 하드웨어에서 어떻게 **빠르게** 실행하나?
+질문으로 돌아갑니다 — 런타임은 실제로 이 그래프들을 실제 하드웨어에서 어떻게 **빠르게** 실행하나?
 
 **다음:** [8장 — 브라우저 엔진 내부 →](08-inside-the-engine.md)

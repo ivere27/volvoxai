@@ -23,19 +23,20 @@ dependencies from `examples/tinystories/requirements-export.txt`.
 | `make models` | Download and export EfficientDet Lite0 fp32/fp16/int8 plus TinyStories-1M. |
 | `make models_efficientdet` | Export EfficientDet Lite0 packages from MediaPipe TFLite models. |
 | `make models_tinystories` | Export `roneneldan/TinyStories-1M` plus tokenizer assets. |
+| `make validate_model_packages` | Reject stale graph filenames and require exact `volvox-graph/v1` roots. |
 | `make models_clean` | Remove regenerated example model directories. |
 
 Each model family owns its acquisition policy under `examples/`.
-`tools/fetch_models.sh` remains only as a compatibility dispatcher for
-`efficientdet`, `tinystories`, or `all`. For EfficientDet, set `ONLY=int8`,
-`ONLY=float16`, or `ONLY=float32` to fetch one precision.
+`tools/fetch_models.sh` dispatches `efficientdet`, `tinystories`, or `all`. For
+EfficientDet, set `ONLY=int8`, `ONLY=float16`, or `ONLY=float32` to fetch one
+precision.
 
 ## EfficientDet Lite0
 
 EfficientDet packages contain:
 
 ```text
-config.json
+graph.json
 model.safetensors
 labels.txt
 ```
@@ -72,7 +73,7 @@ for direct exporter commands and offline tests.
 TinyStories exports:
 
 ```text
-config.json
+graph.json
 model.safetensors
 vocab.bin
 merges.txt
@@ -80,15 +81,15 @@ tokens.i32
 positions.i32
 ```
 
-The opt-in native task example can use the package directly:
+The fixed native runner can execute the package through named raw tensors:
 
 ```bash
-make -C examples native_task_cli
-
-examples/target/bin/volvoxai-tasks generate models/tinystories_1m \
-  --prompt "Once upon a time, Lily" \
-  --max-new 50
+./native/volvoxai run models/tinystories_1m \
+  --input tokens=models/tinystories_1m/tokens.i32 \
+  --input positions=models/tinystories_1m/positions.i32 \
+  --output logits=out.f32
 ```
 
-The fixed `native/volvoxai` executable remains vocabulary-agnostic and can run
-the same graph only through named raw tensor inputs and outputs.
+The output is the complete declared logits tensor. The runner remains
+vocabulary-agnostic; row selection, tokenization, and sampling belong to the
+calling application.

@@ -49,7 +49,11 @@ export class Tensor {
     const elements = this.shape.reduce((a, b) => a * b, 1);
     if (!Number.isSafeInteger(elements)) throw new Error(`Tensor '${this.name}' is too large.`);
     const bytes = Tensor.dtypeBytes(this.dtype);
-    return elements * bytes;
+    const sizeBytes = elements * bytes;
+    if (!Number.isSafeInteger(sizeBytes)) {
+      throw new Error(`Tensor '${this.name}' byte size is too large.`);
+    }
+    return sizeBytes;
   }
   static dtypeBytes(dtype: RuntimeDType): number {
     if (dtype === "float32" || dtype === "int32") return 4;

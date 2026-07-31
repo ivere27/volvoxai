@@ -1,0 +1,1439 @@
+// Internal VolvoxAI kernel inventory.
+//
+// This is an implementation-composition contract, not part of the public
+// Synurang FFI declared by volvoxai.proto.  The file option at the bottom is
+// the single authored inventory.  tools/generate_kernel_registry.py validates
+// it and emits dependency-free TypeScript, Python, native C, and Markdown
+// views.  Runtime registration and exporter qualification are intentionally
+// independent: a dynamically checked/fallback-capable runtime route is not
+// evidence for a strict exporter target.
+
+syntax = "proto3";
+
+package volvoxai.kernel_registry;
+
+import "google/protobuf/descriptor.proto";
+import "volvoxai.proto";
+
+enum BackendKind {
+  BACKEND_KIND_UNSPECIFIED = 0;
+  BACKEND_KIND_CPU_JS = 1;
+  BACKEND_KIND_WASM = 2;
+  BACKEND_KIND_WEBGPU = 3;
+  BACKEND_KIND_NATIVE_CPU = 4;
+  BACKEND_KIND_WEBNN = 5;
+  BACKEND_KIND_VULKAN = 6;
+  BACKEND_KIND_OPENGL = 7;
+  BACKEND_KIND_METAL = 8;
+  BACKEND_KIND_CUDA = 9;
+  BACKEND_KIND_NNAPI = 10;
+}
+
+enum KernelProfile {
+  KERNEL_PROFILE_UNSPECIFIED = 0;
+  KERNEL_PROFILE_INFERENCE = 1;
+  KERNEL_PROFILE_FULL = 2;
+}
+
+enum KernelPhase {
+  KERNEL_PHASE_UNSPECIFIED = 0;
+  KERNEL_PHASE_FORWARD = 1;
+  KERNEL_PHASE_BACKWARD = 2;
+  KERNEL_PHASE_OPTIMIZER = 3;
+  KERNEL_PHASE_PTQ = 4;
+}
+
+// DIRECT means the backend owns a route for the operator, subject to the
+// route's predicate. DYNAMIC means an imperative backend dispatcher must make
+// the final choice and may decline so runtime fallback can continue.
+enum RuntimeSupportMode {
+  RUNTIME_SUPPORT_MODE_UNSPECIFIED = 0;
+  RUNTIME_SUPPORT_MODE_DIRECT = 1;
+  RUNTIME_SUPPORT_MODE_DYNAMIC = 2;
+}
+
+message OperatorRoute {
+  volvoxai.runtime.OperatorKind operator = 1;
+  string route = 2;
+  string predicate_id = 3;
+}
+
+message OperatorSet {
+  string name = 1;
+  repeated volvoxai.runtime.OperatorKind operator = 2;
+}
+
+message BackendInventory {
+  BackendKind kind = 1;
+  string runtime_id = 2;
+  string exporter_target = 3;
+  RuntimeSupportMode support_mode = 4;
+  string default_route = 5;
+  string default_predicate_id = 6;
+
+  // Named sets keep the authored inventory normalized. The generator expands
+  // them and rejects unknown set names or duplicate expanded operators.
+  repeated string runtime_operator_set = 10;
+  repeated string exporter_qualified_operator_set = 11;
+
+  // Runtime registration says that the backend recognizes this operator and
+  // has a route candidate. It does not waive dtype/shape/device predicates.
+  repeated volvoxai.runtime.OperatorKind runtime_operator = 7;
+  repeated OperatorRoute route = 8;
+
+  // Strict, correctness-tested, no-fallback exporter qualification. Empty is
+  // meaningful and must remain distinct from runtime_operator.
+  repeated volvoxai.runtime.OperatorKind exporter_qualified_operator = 9;
+}
+
+message TargetProfile {
+  string name = 1;
+  repeated string member_target = 2;
+}
+
+// A logical route may select multiple physical variants. Variants name actual
+// symbols/shaders/exports and the device or descriptor predicates guarding
+// them. The runtime may keep the selection code imperative while migrating,
+// but every variant documented as canonical belongs here.
+message KernelVariant {
+  string id = 1;
+  BackendKind backend = 2;
+  repeated volvoxai.runtime.OperatorKind operator = 3;
+  KernelProfile profile = 4;
+  KernelPhase phase = 5;
+  string entrypoint_id = 6;
+  string predicate_id = 7;
+  repeated string required_feature = 8;
+  int32 priority = 9;
+}
+
+message KernelRegistry {
+  uint32 schema_version = 1;
+  repeated BackendInventory backend = 2;
+  repeated TargetProfile target_profile = 3;
+  repeated KernelVariant variant = 4;
+  repeated OperatorSet operator_set = 5;
+}
+
+extend google.protobuf.FileOptions {
+  KernelRegistry registry = 51001;
+}
+
+// The registry option is populated below. Keep it in this file so schema and
+// inventory changes are reviewed atomically.
+option (volvoxai.kernel_registry.registry) = {
+  schema_version: 1
+  backend: {
+    kind: BACKEND_KIND_CPU_JS
+    runtime_id: "cpu-js"
+    exporter_target: "cpu-js"
+    support_mode: RUNTIME_SUPPORT_MODE_DIRECT
+    default_route: "cpu-js-dispatch"
+    default_predicate_id: "cpu-js.operator"
+    runtime_operator_set: "runtime-all"
+    exporter_qualified_operator_set: "qualified-common"
+  }
+  backend: {
+    kind: BACKEND_KIND_WASM
+    runtime_id: "wasm"
+    exporter_target: "wasm"
+    support_mode: RUNTIME_SUPPORT_MODE_DIRECT
+    runtime_operator_set: "runtime-all"
+    exporter_qualified_operator_set: "qualified-common"
+    route: {
+      operator: OPERATOR_KIND_Q_CONV_2D
+      route: "qconv2d"
+      predicate_id: "wasm.descriptor-predicate"
+    }
+    route: {
+      operator: OPERATOR_KIND_CONV_2D
+      route: "conv2d"
+      predicate_id: "wasm.descriptor-predicate"
+    }
+    route: {
+      operator: OPERATOR_KIND_CONV_TRANSPOSE_2D
+      route: "conv-transpose2d"
+      predicate_id: "wasm.descriptor-predicate"
+    }
+    route: {
+      operator: OPERATOR_KIND_REDUCE_SUM
+      route: "reduce-sum"
+      predicate_id: "wasm.descriptor-predicate"
+    }
+    route: {
+      operator: OPERATOR_KIND_REDUCE_MEAN
+      route: "reduce-mean"
+      predicate_id: "wasm.descriptor-predicate"
+    }
+    route: {
+      operator: OPERATOR_KIND_SOFTMAX
+      route: "softmax"
+      predicate_id: "wasm.descriptor-predicate"
+    }
+    route: {
+      operator: OPERATOR_KIND_LOG_SOFTMAX
+      route: "softmax"
+      predicate_id: "wasm.descriptor-predicate"
+    }
+    route: {
+      operator: OPERATOR_KIND_ARG_MAX
+      route: "argmax"
+      predicate_id: "wasm.descriptor-predicate"
+    }
+    route: {
+      operator: OPERATOR_KIND_Q_LINEAR
+      route: "qlinear"
+      predicate_id: "wasm.descriptor-predicate"
+    }
+    route: {
+      operator: OPERATOR_KIND_Q_MATMUL
+      route: "qlinear"
+      predicate_id: "wasm.descriptor-predicate"
+    }
+    route: {
+      operator: OPERATOR_KIND_Q_GEMM
+      route: "qlinear"
+      predicate_id: "wasm.descriptor-predicate"
+    }
+    route: {
+      operator: OPERATOR_KIND_BATCH_MATMUL
+      route: "batch-matmul"
+      predicate_id: "wasm.descriptor-predicate"
+    }
+    route: {
+      operator: OPERATOR_KIND_Q_BATCH_MATMUL
+      route: "qbatch-matmul"
+      predicate_id: "wasm.descriptor-predicate"
+    }
+    route: {
+      operator: OPERATOR_KIND_MATMUL
+      route: "dense"
+      predicate_id: "wasm.descriptor-predicate"
+    }
+    route: {
+      operator: OPERATOR_KIND_LINEAR
+      route: "dense"
+      predicate_id: "wasm.descriptor-predicate"
+    }
+    route: {
+      operator: OPERATOR_KIND_GEMM
+      route: "dense"
+      predicate_id: "wasm.descriptor-predicate"
+    }
+    route: {
+      operator: OPERATOR_KIND_LAYER_NORM
+      route: "layernorm"
+      predicate_id: "wasm.descriptor-predicate"
+    }
+    route: {
+      operator: OPERATOR_KIND_RMS_NORM
+      route: "rmsnorm"
+      predicate_id: "wasm.descriptor-predicate"
+    }
+    route: {
+      operator: OPERATOR_KIND_GROUP_NORM
+      route: "groupnorm"
+      predicate_id: "wasm.descriptor-predicate"
+    }
+    route: {
+      operator: OPERATOR_KIND_MOE_ROUTER
+      route: "moe-router"
+      predicate_id: "wasm.descriptor-predicate"
+    }
+    route: {
+      operator: OPERATOR_KIND_MOE_LINEAR
+      route: "moe-linear"
+      predicate_id: "wasm.descriptor-predicate"
+    }
+    route: {
+      operator: OPERATOR_KIND_SDPA
+      route: "sdpa"
+      predicate_id: "wasm.descriptor-predicate"
+    }
+    route: {
+      operator: OPERATOR_KIND_CROSS_SDPA
+      route: "cross-sdpa"
+      predicate_id: "wasm.descriptor-predicate"
+    }
+    route: {
+      operator: OPERATOR_KIND_CROSS_ATTENTION
+      route: "cross-attention"
+      predicate_id: "wasm.descriptor-predicate"
+    }
+    route: {
+      operator: OPERATOR_KIND_Q_EMBEDDING
+      route: "qembedding"
+      predicate_id: "wasm.descriptor-predicate"
+    }
+    route: {
+      operator: OPERATOR_KIND_EMBEDDING
+      route: "embedding"
+      predicate_id: "wasm.descriptor-predicate"
+    }
+    route: {
+      operator: OPERATOR_KIND_RELU
+      route: "relu"
+      predicate_id: "wasm.descriptor-predicate"
+    }
+    route: {
+      operator: OPERATOR_KIND_GELU
+      route: "gelu"
+      predicate_id: "wasm.descriptor-predicate"
+    }
+    route: {
+      operator: OPERATOR_KIND_SILU
+      route: "silu"
+      predicate_id: "wasm.descriptor-predicate"
+    }
+    route: {
+      operator: OPERATOR_KIND_Q_SILU
+      route: "qsilu"
+      predicate_id: "wasm.descriptor-predicate"
+    }
+    route: {
+      operator: OPERATOR_KIND_Q_GELU
+      route: "qgelu"
+      predicate_id: "wasm.descriptor-predicate"
+    }
+    route: {
+      operator: OPERATOR_KIND_Q_GROUP_NORM
+      route: "qgroupnorm"
+      predicate_id: "wasm.descriptor-predicate"
+    }
+    route: {
+      operator: OPERATOR_KIND_Q_LAYER_NORM
+      route: "qlayernorm"
+      predicate_id: "wasm.descriptor-predicate"
+    }
+    route: {
+      operator: OPERATOR_KIND_Q_SDPA
+      route: "qsdpa"
+      predicate_id: "wasm.descriptor-predicate"
+    }
+    route: {
+      operator: OPERATOR_KIND_Q_ARG_MAX
+      route: "qargmax"
+      predicate_id: "wasm.descriptor-predicate"
+    }
+    route: {
+      operator: OPERATOR_KIND_Q_MASKED_MEAN
+      route: "qmaskedmean"
+      predicate_id: "wasm.descriptor-predicate"
+    }
+    route: {
+      operator: OPERATOR_KIND_TANH
+      route: "tanh"
+      predicate_id: "wasm.descriptor-predicate"
+    }
+    route: {
+      operator: OPERATOR_KIND_SIN
+      route: "trigonometric"
+      predicate_id: "wasm.descriptor-predicate"
+    }
+    route: {
+      operator: OPERATOR_KIND_COS
+      route: "trigonometric"
+      predicate_id: "wasm.descriptor-predicate"
+    }
+    route: {
+      operator: OPERATOR_KIND_ROPE
+      route: "rope"
+      predicate_id: "wasm.descriptor-predicate"
+    }
+    route: {
+      operator: OPERATOR_KIND_SSM_SCAN
+      route: "ssm-scan"
+      predicate_id: "wasm.descriptor-predicate"
+    }
+    route: {
+      operator: OPERATOR_KIND_SELECTIVE_SCAN
+      route: "ssm-scan"
+      predicate_id: "wasm.descriptor-predicate"
+    }
+    route: {
+      operator: OPERATOR_KIND_Q_ADD
+      route: "qadd"
+      predicate_id: "wasm.descriptor-predicate"
+    }
+    route: {
+      operator: OPERATOR_KIND_ADD
+      route: "binary"
+      predicate_id: "wasm.descriptor-predicate"
+    }
+    route: {
+      operator: OPERATOR_KIND_MUL
+      route: "binary"
+      predicate_id: "wasm.descriptor-predicate"
+    }
+    route: {
+      operator: OPERATOR_KIND_SUB
+      route: "binary"
+      predicate_id: "wasm.descriptor-predicate"
+    }
+    route: {
+      operator: OPERATOR_KIND_DIV
+      route: "binary"
+      predicate_id: "wasm.descriptor-predicate"
+    }
+    route: {
+      operator: OPERATOR_KIND_EQUAL
+      route: "comparison"
+      predicate_id: "wasm.descriptor-predicate"
+    }
+    route: {
+      operator: OPERATOR_KIND_GREATER_OR_EQUAL
+      route: "comparison"
+      predicate_id: "wasm.descriptor-predicate"
+    }
+    route: {
+      operator: OPERATOR_KIND_NOT
+      route: "not"
+      predicate_id: "wasm.descriptor-predicate"
+    }
+    route: {
+      operator: OPERATOR_KIND_CONV_1D
+      route: "conv1d"
+      predicate_id: "wasm.descriptor-predicate"
+    }
+    route: {
+      operator: OPERATOR_KIND_UPSAMPLE_NEAREST_2D
+      route: "upsample-nearest2d"
+      predicate_id: "wasm.descriptor-predicate"
+    }
+    route: {
+      operator: OPERATOR_KIND_CONCAT
+      route: "concat"
+      predicate_id: "wasm.descriptor-predicate"
+    }
+    route: {
+      operator: OPERATOR_KIND_CONCAT2
+      route: "concat"
+      predicate_id: "wasm.descriptor-predicate"
+    }
+    route: {
+      operator: OPERATOR_KIND_PROFILE_Y
+      route: "profile-y"
+      predicate_id: "wasm.descriptor-predicate"
+    }
+    route: {
+      operator: OPERATOR_KIND_PROFILE_X
+      route: "profile-x"
+      predicate_id: "wasm.descriptor-predicate"
+    }
+    route: {
+      operator: OPERATOR_KIND_INTERPOLATE_1D
+      route: "interpolate1d"
+      predicate_id: "wasm.descriptor-predicate"
+    }
+    route: {
+      operator: OPERATOR_KIND_SPATIAL_SOFTARGMAX_Y
+      route: "spatial-softargmax-y"
+      predicate_id: "wasm.descriptor-predicate"
+    }
+    route: {
+      operator: OPERATOR_KIND_SIGMOID
+      route: "sigmoid"
+      predicate_id: "wasm.descriptor-predicate"
+    }
+    route: {
+      operator: OPERATOR_KIND_CLIP
+      route: "clip"
+      predicate_id: "wasm.descriptor-predicate"
+    }
+    route: {
+      operator: OPERATOR_KIND_HARD_SWISH
+      route: "hard-swish"
+      predicate_id: "wasm.descriptor-predicate"
+    }
+    route: {
+      operator: OPERATOR_KIND_LEAKY_RELU
+      route: "leaky-relu"
+      predicate_id: "wasm.descriptor-predicate"
+    }
+    route: {
+      operator: OPERATOR_KIND_PRELU
+      route: "prelu"
+      predicate_id: "wasm.descriptor-predicate"
+    }
+    route: {
+      operator: OPERATOR_KIND_HARD_SIGMOID
+      route: "hard-sigmoid"
+      predicate_id: "wasm.descriptor-predicate"
+    }
+    route: {
+      operator: OPERATOR_KIND_TRANSPOSE
+      route: "transpose"
+      predicate_id: "wasm.descriptor-predicate"
+    }
+    route: {
+      operator: OPERATOR_KIND_GLOBAL_AVERAGE_POOL
+      route: "global-average-pool"
+      predicate_id: "wasm.descriptor-predicate"
+    }
+    route: {
+      operator: OPERATOR_KIND_BATCH_NORM_2D
+      route: "batchnorm2d"
+      predicate_id: "wasm.descriptor-predicate"
+    }
+    route: {
+      operator: OPERATOR_KIND_RESIZE_NEAREST_2D
+      route: "resize"
+      predicate_id: "wasm.descriptor-predicate"
+    }
+    route: {
+      operator: OPERATOR_KIND_RESIZE
+      route: "resize"
+      predicate_id: "wasm.descriptor-predicate"
+    }
+    route: {
+      operator: OPERATOR_KIND_CAST
+      route: "cast"
+      predicate_id: "wasm.descriptor-predicate"
+    }
+    route: {
+      operator: OPERATOR_KIND_DEQUANTIZE_LINEAR
+      route: "dequantize-linear"
+      predicate_id: "wasm.descriptor-predicate"
+    }
+    route: {
+      operator: OPERATOR_KIND_REQUANTIZE_LINEAR
+      route: "requantize-linear"
+      predicate_id: "wasm.descriptor-predicate"
+    }
+    route: {
+      operator: OPERATOR_KIND_QUANTIZE_LINEAR
+      route: "quantize-linear"
+      predicate_id: "wasm.descriptor-predicate"
+    }
+    route: {
+      operator: OPERATOR_KIND_SLICE
+      route: "slice"
+      predicate_id: "wasm.descriptor-predicate"
+    }
+    route: {
+      operator: OPERATOR_KIND_EXPAND
+      route: "expand"
+      predicate_id: "wasm.descriptor-predicate"
+    }
+    route: {
+      operator: OPERATOR_KIND_BROADCAST
+      route: "expand"
+      predicate_id: "wasm.descriptor-predicate"
+    }
+    route: {
+      operator: OPERATOR_KIND_SPLIT
+      route: "split"
+      predicate_id: "wasm.descriptor-predicate"
+    }
+    route: {
+      operator: OPERATOR_KIND_GATHER
+      route: "gather"
+      predicate_id: "wasm.descriptor-predicate"
+    }
+    route: {
+      operator: OPERATOR_KIND_GATHER_ELEMENTS
+      route: "gather-elements"
+      predicate_id: "wasm.descriptor-predicate"
+    }
+    route: {
+      operator: OPERATOR_KIND_NON_MAX_SUPPRESSION
+      route: "non-max-suppression"
+      predicate_id: "wasm.descriptor-predicate"
+    }
+    route: {
+      operator: OPERATOR_KIND_WHERE
+      route: "where"
+      predicate_id: "wasm.descriptor-predicate"
+    }
+    route: {
+      operator: OPERATOR_KIND_MASK
+      route: "where"
+      predicate_id: "wasm.descriptor-predicate"
+    }
+    route: {
+      operator: OPERATOR_KIND_PAD
+      route: "pad"
+      predicate_id: "wasm.descriptor-predicate"
+    }
+    route: {
+      operator: OPERATOR_KIND_AVERAGE_POOL_2D
+      route: "average-pool2d"
+      predicate_id: "wasm.descriptor-predicate"
+    }
+    route: {
+      operator: OPERATOR_KIND_MAX_POOL_2D
+      route: "max-pool2d"
+      predicate_id: "wasm.descriptor-predicate"
+    }
+    route: {
+      operator: OPERATOR_KIND_MEAN_HEIGHT
+      route: "mean-height"
+      predicate_id: "wasm.descriptor-predicate"
+    }
+    route: {
+      operator: OPERATOR_KIND_DROPOUT
+      route: "dropout"
+      predicate_id: "wasm.descriptor-predicate"
+    }
+    route: {
+      operator: OPERATOR_KIND_FLATTEN
+      route: "shape-copy"
+      predicate_id: "wasm.descriptor-predicate"
+    }
+    route: {
+      operator: OPERATOR_KIND_SQUEEZE
+      route: "shape-copy"
+      predicate_id: "wasm.descriptor-predicate"
+    }
+    route: {
+      operator: OPERATOR_KIND_UNSQUEEZE
+      route: "shape-copy"
+      predicate_id: "wasm.descriptor-predicate"
+    }
+    route: {
+      operator: OPERATOR_KIND_RESHAPE
+      route: "shape-copy"
+      predicate_id: "wasm.descriptor-predicate"
+    }
+    route: {
+      operator: OPERATOR_KIND_IDENTITY
+      route: "shape-copy"
+      predicate_id: "wasm.descriptor-predicate"
+    }
+  }
+  backend: {
+    kind: BACKEND_KIND_WEBGPU
+    runtime_id: "webgpu"
+    exporter_target: "webgpu"
+    support_mode: RUNTIME_SUPPORT_MODE_DIRECT
+    default_route: "webgpu-graph-compiler"
+    default_predicate_id: "webgpu.compile-predicate"
+    runtime_operator_set: "runtime-webgpu"
+    exporter_qualified_operator_set: "qualified-common"
+  }
+  backend: {
+    kind: BACKEND_KIND_WEBNN
+    runtime_id: "webnn"
+    exporter_target: "backend:webnn"
+    support_mode: RUNTIME_SUPPORT_MODE_DIRECT
+    default_route: "webnn-builder"
+    default_predicate_id: "webnn.builder-predicate"
+    runtime_operator_set: "runtime-webnn"
+    exporter_qualified_operator_set: "qualified-webnn"
+  }
+  backend: {
+    kind: BACKEND_KIND_NATIVE_CPU
+    runtime_id: "native-cpu"
+    exporter_target: "native-cpu"
+    support_mode: RUNTIME_SUPPORT_MODE_DIRECT
+    default_route: "native-run-node"
+    default_predicate_id: "native.descriptor-predicate"
+    runtime_operator_set: "runtime-native-cpu"
+    exporter_qualified_operator_set: "qualified-native-cpu"
+  }
+  backend: {
+    kind: BACKEND_KIND_VULKAN
+    runtime_id: "vulkan"
+    exporter_target: "backend:vulkan"
+    support_mode: RUNTIME_SUPPORT_MODE_DYNAMIC
+    default_route: "native-vulkan-device-route"
+    default_predicate_id: "vulkan.device-route-predicate"
+    runtime_operator_set: "runtime-all"
+  }
+  backend: {
+    kind: BACKEND_KIND_OPENGL
+    runtime_id: "opengl"
+    exporter_target: "backend:opengl"
+    support_mode: RUNTIME_SUPPORT_MODE_DYNAMIC
+    default_route: "native-opengl-device-route"
+    default_predicate_id: "opengl.device-route-predicate"
+    runtime_operator_set: "runtime-all"
+  }
+  backend: {
+    kind: BACKEND_KIND_METAL
+    runtime_id: "metal"
+    exporter_target: "backend:metal"
+    support_mode: RUNTIME_SUPPORT_MODE_DYNAMIC
+    default_route: "native-metal-device-route"
+    default_predicate_id: "metal.device-route-predicate"
+    runtime_operator_set: "runtime-all"
+  }
+  backend: {
+    kind: BACKEND_KIND_CUDA
+    runtime_id: "cuda"
+    exporter_target: "backend:cuda"
+    support_mode: RUNTIME_SUPPORT_MODE_DYNAMIC
+    default_route: "native-cuda-device-route"
+    default_predicate_id: "cuda.device-route-predicate"
+    runtime_operator_set: "runtime-all"
+  }
+  backend: {
+    kind: BACKEND_KIND_NNAPI
+    runtime_id: "nnapi"
+    support_mode: RUNTIME_SUPPORT_MODE_DYNAMIC
+    default_route: "nnapi-matmul"
+    default_predicate_id: "nnapi.one-shot-linear-predicate"
+    runtime_operator_set: "runtime-linear"
+  }
+  target_profile: {
+    name: "portable"
+    member_target: "cpu-js"
+    member_target: "wasm"
+    member_target: "webgpu"
+    member_target: "native-cpu"
+  }
+  target_profile: {
+    name: "browser"
+    member_target: "cpu-js"
+    member_target: "wasm"
+    member_target: "webgpu"
+  }
+  variant: {
+    id: "cpu-js.qlinear.reference"
+    backend: BACKEND_KIND_CPU_JS
+    operator: OPERATOR_KIND_Q_LINEAR
+    operator: OPERATOR_KIND_Q_MATMUL
+    operator: OPERATOR_KIND_Q_GEMM
+    profile: KERNEL_PROFILE_INFERENCE
+    phase: KERNEL_PHASE_FORWARD
+    entrypoint_id: "ts/ops/qLinear.ts::_cpuQLinear"
+    predicate_id: "qlinear.canonical-w8a8-v1"
+    priority: 100
+  }
+  variant: {
+    id: "wasm.qlinear.relaxed-simd"
+    backend: BACKEND_KIND_WASM
+    operator: OPERATOR_KIND_Q_LINEAR
+    operator: OPERATOR_KIND_Q_MATMUL
+    operator: OPERATOR_KIND_Q_GEMM
+    profile: KERNEL_PROFILE_INFERENCE
+    phase: KERNEL_PHASE_FORWARD
+    entrypoint_id: "qlinear_i8u8_relaxed"
+    predicate_id: "wasm.qlinear.relaxed-packed-decode-row"
+    required_feature: "wasm.simd128"
+    required_feature: "wasm.relaxed-simd"
+    priority: 300
+  }
+  variant: {
+    id: "wasm.qlinear.packed-simd128"
+    backend: BACKEND_KIND_WASM
+    operator: OPERATOR_KIND_Q_LINEAR
+    operator: OPERATOR_KIND_Q_MATMUL
+    operator: OPERATOR_KIND_Q_GEMM
+    operator: OPERATOR_KIND_Q_CONV_2D
+    profile: KERNEL_PROFILE_INFERENCE
+    phase: KERNEL_PHASE_FORWARD
+    entrypoint_id: "qlinear_i8u8_packed"
+    predicate_id: "wasm.qlinear.immutable-packed-weight"
+    required_feature: "wasm.simd128"
+    priority: 200
+  }
+  variant: {
+    id: "wasm.qlinear.baseline"
+    backend: BACKEND_KIND_WASM
+    operator: OPERATOR_KIND_Q_LINEAR
+    operator: OPERATOR_KIND_Q_MATMUL
+    operator: OPERATOR_KIND_Q_GEMM
+    profile: KERNEL_PROFILE_INFERENCE
+    phase: KERNEL_PHASE_FORWARD
+    entrypoint_id: "qlinear_i8u8"
+    predicate_id: "qlinear.canonical-w8a8-v1"
+    priority: 100
+  }
+  variant: {
+    id: "webgpu.qlinear.dot-tiled"
+    backend: BACKEND_KIND_WEBGPU
+    operator: OPERATOR_KIND_Q_LINEAR
+    operator: OPERATOR_KIND_Q_MATMUL
+    operator: OPERATOR_KIND_Q_GEMM
+    profile: KERNEL_PROFILE_INFERENCE
+    phase: KERNEL_PHASE_FORWARD
+    entrypoint_id: "qLinearInt8DotTiled.wgsl"
+    predicate_id: "qlinear.tiled-shape-and-packed-dot"
+    required_feature: "webgpu.packed-4x8-integer-dot-product"
+    priority: 400
+  }
+  variant: {
+    id: "webgpu.qlinear.dot"
+    backend: BACKEND_KIND_WEBGPU
+    operator: OPERATOR_KIND_Q_LINEAR
+    operator: OPERATOR_KIND_Q_MATMUL
+    operator: OPERATOR_KIND_Q_GEMM
+    profile: KERNEL_PROFILE_INFERENCE
+    phase: KERNEL_PHASE_FORWARD
+    entrypoint_id: "qLinearInt8Dot.wgsl"
+    predicate_id: "qlinear.canonical-w8a8-v1"
+    required_feature: "webgpu.packed-4x8-integer-dot-product"
+    priority: 300
+  }
+  variant: {
+    id: "webgpu.qlinear.tiled"
+    backend: BACKEND_KIND_WEBGPU
+    operator: OPERATOR_KIND_Q_LINEAR
+    operator: OPERATOR_KIND_Q_MATMUL
+    operator: OPERATOR_KIND_Q_GEMM
+    profile: KERNEL_PROFILE_INFERENCE
+    phase: KERNEL_PHASE_FORWARD
+    entrypoint_id: "qLinearInt8Tiled.wgsl"
+    predicate_id: "qlinear.tiled-shape"
+    priority: 200
+  }
+  variant: {
+    id: "webgpu.qlinear.scalar"
+    backend: BACKEND_KIND_WEBGPU
+    operator: OPERATOR_KIND_Q_LINEAR
+    operator: OPERATOR_KIND_Q_MATMUL
+    operator: OPERATOR_KIND_Q_GEMM
+    profile: KERNEL_PROFILE_INFERENCE
+    phase: KERNEL_PHASE_FORWARD
+    entrypoint_id: "qLinearInt8.wgsl"
+    predicate_id: "qlinear.canonical-w8a8-v1"
+    priority: 100
+  }
+  variant: {
+    id: "native-cpu.qlinear.packed"
+    backend: BACKEND_KIND_NATIVE_CPU
+    operator: OPERATOR_KIND_Q_LINEAR
+    operator: OPERATOR_KIND_Q_MATMUL
+    operator: OPERATOR_KIND_Q_GEMM
+    profile: KERNEL_PROFILE_INFERENCE
+    phase: KERNEL_PHASE_FORWARD
+    entrypoint_id: "vx_qlinear_i8u8_packed"
+    predicate_id: "native.qlinear.packed-preferred-nonparallel"
+    priority: 600
+  }
+  variant: {
+    id: "native-cpu.qlinear.arm-dotprod"
+    backend: BACKEND_KIND_NATIVE_CPU
+    operator: OPERATOR_KIND_Q_LINEAR
+    operator: OPERATOR_KIND_Q_MATMUL
+    operator: OPERATOR_KIND_Q_GEMM
+    profile: KERNEL_PROFILE_INFERENCE
+    phase: KERNEL_PHASE_FORWARD
+    entrypoint_id: "vx_qlinear_i8u8_arm_dotprod_try"
+    predicate_id: "native.qlinear.arm-eligible"
+    required_feature: "arm.dotprod"
+    priority: 500
+  }
+  variant: {
+    id: "native-cpu.qlinear.arm-neon"
+    backend: BACKEND_KIND_NATIVE_CPU
+    operator: OPERATOR_KIND_Q_LINEAR
+    operator: OPERATOR_KIND_Q_MATMUL
+    operator: OPERATOR_KIND_Q_GEMM
+    profile: KERNEL_PROFILE_INFERENCE
+    phase: KERNEL_PHASE_FORWARD
+    entrypoint_id: "vx_qlinear_i8u8_arm_neon_try"
+    predicate_id: "native.qlinear.arm-eligible"
+    required_feature: "arm.neon"
+    priority: 450
+  }
+  variant: {
+    id: "native-cpu.qlinear.avx512-vnni"
+    backend: BACKEND_KIND_NATIVE_CPU
+    operator: OPERATOR_KIND_Q_LINEAR
+    operator: OPERATOR_KIND_Q_MATMUL
+    operator: OPERATOR_KIND_Q_GEMM
+    profile: KERNEL_PROFILE_INFERENCE
+    phase: KERNEL_PHASE_FORWARD
+    entrypoint_id: "vx_w8a8_qlinear_avx512vnni_tiled_range"
+    predicate_id: "native.qlinear.x86-eligible-din64"
+    required_feature: "x86.avx512-vnni"
+    priority: 500
+  }
+  variant: {
+    id: "native-cpu.qlinear.avx-vnni"
+    backend: BACKEND_KIND_NATIVE_CPU
+    operator: OPERATOR_KIND_Q_LINEAR
+    operator: OPERATOR_KIND_Q_MATMUL
+    operator: OPERATOR_KIND_Q_GEMM
+    profile: KERNEL_PROFILE_INFERENCE
+    phase: KERNEL_PHASE_FORWARD
+    entrypoint_id: "vx_w8a8_qlinear_avxvnni_tiled_range"
+    predicate_id: "native.qlinear.x86-eligible-din32"
+    required_feature: "x86.avx-vnni"
+    priority: 400
+  }
+  variant: {
+    id: "native-cpu.qlinear.avx2"
+    backend: BACKEND_KIND_NATIVE_CPU
+    operator: OPERATOR_KIND_Q_LINEAR
+    operator: OPERATOR_KIND_Q_MATMUL
+    operator: OPERATOR_KIND_Q_GEMM
+    profile: KERNEL_PROFILE_INFERENCE
+    phase: KERNEL_PHASE_FORWARD
+    entrypoint_id: "vx_w8a8_qlinear_avx2_tiled_range"
+    predicate_id: "native.qlinear.x86-eligible"
+    required_feature: "x86.avx2"
+    priority: 300
+  }
+  variant: {
+    id: "native-cpu.qlinear.portable"
+    backend: BACKEND_KIND_NATIVE_CPU
+    operator: OPERATOR_KIND_Q_LINEAR
+    operator: OPERATOR_KIND_Q_MATMUL
+    operator: OPERATOR_KIND_Q_GEMM
+    profile: KERNEL_PROFILE_INFERENCE
+    phase: KERNEL_PHASE_FORWARD
+    entrypoint_id: "qlinear_i8u8"
+    predicate_id: "qlinear.canonical-w8a8-v1"
+    priority: 100
+  }
+  variant: {
+    id: "vulkan.qlinear.dot-tiled"
+    backend: BACKEND_KIND_VULKAN
+    operator: OPERATOR_KIND_Q_LINEAR
+    operator: OPERATOR_KIND_Q_MATMUL
+    operator: OPERATOR_KIND_Q_GEMM
+    profile: KERNEL_PROFILE_INFERENCE
+    phase: KERNEL_PHASE_FORWARD
+    entrypoint_id: "qLinearInt8DotTiled"
+    predicate_id: "qlinear.tiled-shape-and-packed-dot"
+    required_feature: "vulkan.packed-4x8-integer-dot-product"
+    priority: 400
+  }
+  variant: {
+    id: "vulkan.qlinear.dot"
+    backend: BACKEND_KIND_VULKAN
+    operator: OPERATOR_KIND_Q_LINEAR
+    operator: OPERATOR_KIND_Q_MATMUL
+    operator: OPERATOR_KIND_Q_GEMM
+    profile: KERNEL_PROFILE_INFERENCE
+    phase: KERNEL_PHASE_FORWARD
+    entrypoint_id: "qLinearInt8Dot"
+    predicate_id: "qlinear.canonical-w8a8-v1"
+    required_feature: "vulkan.packed-4x8-integer-dot-product"
+    priority: 300
+  }
+  variant: {
+    id: "vulkan.qlinear.tiled"
+    backend: BACKEND_KIND_VULKAN
+    operator: OPERATOR_KIND_Q_LINEAR
+    operator: OPERATOR_KIND_Q_MATMUL
+    operator: OPERATOR_KIND_Q_GEMM
+    profile: KERNEL_PROFILE_INFERENCE
+    phase: KERNEL_PHASE_FORWARD
+    entrypoint_id: "qLinearInt8Tiled"
+    predicate_id: "qlinear.tiled-shape"
+    priority: 200
+  }
+  variant: {
+    id: "vulkan.qlinear.scalar"
+    backend: BACKEND_KIND_VULKAN
+    operator: OPERATOR_KIND_Q_LINEAR
+    operator: OPERATOR_KIND_Q_MATMUL
+    operator: OPERATOR_KIND_Q_GEMM
+    profile: KERNEL_PROFILE_INFERENCE
+    phase: KERNEL_PHASE_FORWARD
+    entrypoint_id: "qLinearInt8"
+    predicate_id: "qlinear.canonical-w8a8-v1"
+    priority: 100
+  }
+  variant: {
+    id: "opengl.qlinear.tiled"
+    backend: BACKEND_KIND_OPENGL
+    operator: OPERATOR_KIND_Q_LINEAR
+    operator: OPERATOR_KIND_Q_MATMUL
+    operator: OPERATOR_KIND_Q_GEMM
+    profile: KERNEL_PROFILE_INFERENCE
+    phase: KERNEL_PHASE_FORWARD
+    entrypoint_id: "qLinearInt8Tiled"
+    predicate_id: "opengl.qlinear.tiled-shape-workgroup-8x8"
+    priority: 200
+  }
+  variant: {
+    id: "opengl.qlinear.scalar"
+    backend: BACKEND_KIND_OPENGL
+    operator: OPERATOR_KIND_Q_LINEAR
+    operator: OPERATOR_KIND_Q_MATMUL
+    operator: OPERATOR_KIND_Q_GEMM
+    profile: KERNEL_PROFILE_INFERENCE
+    phase: KERNEL_PHASE_FORWARD
+    entrypoint_id: "qLinearInt8"
+    predicate_id: "qlinear.canonical-w8a8-v1"
+    priority: 100
+  }
+  variant: {
+    id: "metal.qlinear.tiled"
+    backend: BACKEND_KIND_METAL
+    operator: OPERATOR_KIND_Q_LINEAR
+    operator: OPERATOR_KIND_Q_MATMUL
+    operator: OPERATOR_KIND_Q_GEMM
+    profile: KERNEL_PROFILE_INFERENCE
+    phase: KERNEL_PHASE_FORWARD
+    entrypoint_id: "qLinearInt8Tiled"
+    predicate_id: "qlinear.tiled-shape"
+    priority: 200
+  }
+  variant: {
+    id: "metal.qlinear.scalar"
+    backend: BACKEND_KIND_METAL
+    operator: OPERATOR_KIND_Q_LINEAR
+    operator: OPERATOR_KIND_Q_MATMUL
+    operator: OPERATOR_KIND_Q_GEMM
+    profile: KERNEL_PROFILE_INFERENCE
+    phase: KERNEL_PHASE_FORWARD
+    entrypoint_id: "qLinearInt8"
+    predicate_id: "qlinear.canonical-w8a8-v1"
+    priority: 100
+  }
+  variant: {
+    id: "cuda.qlinear.w8a8"
+    backend: BACKEND_KIND_CUDA
+    operator: OPERATOR_KIND_Q_LINEAR
+    operator: OPERATOR_KIND_Q_MATMUL
+    operator: OPERATOR_KIND_Q_GEMM
+    profile: KERNEL_PROFILE_INFERENCE
+    phase: KERNEL_PHASE_FORWARD
+    entrypoint_id: "vx_cuda_qlinear_i8u8"
+    predicate_id: "cuda.qlinear.canonical-resident-nonoverlap-int32-bound"
+    required_feature: "cuda.device-residency"
+    priority: 100
+  }
+  variant: {
+    id: "nnapi.linear.one-shot"
+    backend: BACKEND_KIND_NNAPI
+    operator: OPERATOR_KIND_MATMUL
+    operator: OPERATOR_KIND_LINEAR
+    operator: OPERATOR_KIND_GEMM
+    profile: KERNEL_PROFILE_INFERENCE
+    phase: KERNEL_PHASE_FORWARD
+    entrypoint_id: "nnapi_matmul"
+    predicate_id: "nnapi.one-shot-f32-linear-cost-threshold"
+    required_feature: "android.nnapi"
+    priority: 100
+  }
+  operator_set: {
+    name: "runtime-all"
+    operator: OPERATOR_KIND_MATMUL
+    operator: OPERATOR_KIND_LINEAR
+    operator: OPERATOR_KIND_Q_LINEAR
+    operator: OPERATOR_KIND_BATCH_MATMUL
+    operator: OPERATOR_KIND_Q_BATCH_MATMUL
+    operator: OPERATOR_KIND_Q_GEMM
+    operator: OPERATOR_KIND_GEMM
+    operator: OPERATOR_KIND_Q_MATMUL
+    operator: OPERATOR_KIND_MOE_ROUTER
+    operator: OPERATOR_KIND_MOE_LINEAR
+    operator: OPERATOR_KIND_SDPA
+    operator: OPERATOR_KIND_Q_SDPA
+    operator: OPERATOR_KIND_CROSS_SDPA
+    operator: OPERATOR_KIND_CROSS_ATTENTION
+    operator: OPERATOR_KIND_LAYER_NORM
+    operator: OPERATOR_KIND_Q_LAYER_NORM
+    operator: OPERATOR_KIND_GROUP_NORM
+    operator: OPERATOR_KIND_Q_GROUP_NORM
+    operator: OPERATOR_KIND_RMS_NORM
+    operator: OPERATOR_KIND_BATCH_NORM_2D
+    operator: OPERATOR_KIND_CONV_2D
+    operator: OPERATOR_KIND_Q_CONV_2D
+    operator: OPERATOR_KIND_CONV_1D
+    operator: OPERATOR_KIND_CONV_TRANSPOSE_2D
+    operator: OPERATOR_KIND_MAX_POOL_2D
+    operator: OPERATOR_KIND_AVERAGE_POOL_2D
+    operator: OPERATOR_KIND_GLOBAL_AVERAGE_POOL
+    operator: OPERATOR_KIND_RESIZE
+    operator: OPERATOR_KIND_INTERPOLATE_1D
+    operator: OPERATOR_KIND_RESIZE_NEAREST_2D
+    operator: OPERATOR_KIND_UPSAMPLE_NEAREST_2D
+    operator: OPERATOR_KIND_RELU
+    operator: OPERATOR_KIND_LEAKY_RELU
+    operator: OPERATOR_KIND_PRELU
+    operator: OPERATOR_KIND_GELU
+    operator: OPERATOR_KIND_Q_GELU
+    operator: OPERATOR_KIND_SILU
+    operator: OPERATOR_KIND_Q_SILU
+    operator: OPERATOR_KIND_SIGMOID
+    operator: OPERATOR_KIND_HARD_SWISH
+    operator: OPERATOR_KIND_HARD_SIGMOID
+    operator: OPERATOR_KIND_TANH
+    operator: OPERATOR_KIND_SIN
+    operator: OPERATOR_KIND_COS
+    operator: OPERATOR_KIND_CLIP
+    operator: OPERATOR_KIND_ADD
+    operator: OPERATOR_KIND_Q_ADD
+    operator: OPERATOR_KIND_SUB
+    operator: OPERATOR_KIND_MUL
+    operator: OPERATOR_KIND_DIV
+    operator: OPERATOR_KIND_SOFTMAX
+    operator: OPERATOR_KIND_LOG_SOFTMAX
+    operator: OPERATOR_KIND_REDUCE_SUM
+    operator: OPERATOR_KIND_REDUCE_MEAN
+    operator: OPERATOR_KIND_Q_MASKED_MEAN
+    operator: OPERATOR_KIND_ARG_MAX
+    operator: OPERATOR_KIND_Q_ARG_MAX
+    operator: OPERATOR_KIND_EQUAL
+    operator: OPERATOR_KIND_GREATER_OR_EQUAL
+    operator: OPERATOR_KIND_NOT
+    operator: OPERATOR_KIND_WHERE
+    operator: OPERATOR_KIND_MASK
+    operator: OPERATOR_KIND_RESHAPE
+    operator: OPERATOR_KIND_FLATTEN
+    operator: OPERATOR_KIND_SQUEEZE
+    operator: OPERATOR_KIND_UNSQUEEZE
+    operator: OPERATOR_KIND_TRANSPOSE
+    operator: OPERATOR_KIND_CONCAT
+    operator: OPERATOR_KIND_SPLIT
+    operator: OPERATOR_KIND_SLICE
+    operator: OPERATOR_KIND_PAD
+    operator: OPERATOR_KIND_EXPAND
+    operator: OPERATOR_KIND_GATHER
+    operator: OPERATOR_KIND_GATHER_ELEMENTS
+    operator: OPERATOR_KIND_IDENTITY
+    operator: OPERATOR_KIND_BROADCAST
+    operator: OPERATOR_KIND_CONCAT2
+    operator: OPERATOR_KIND_QUANTIZE_LINEAR
+    operator: OPERATOR_KIND_DEQUANTIZE_LINEAR
+    operator: OPERATOR_KIND_REQUANTIZE_LINEAR
+    operator: OPERATOR_KIND_CAST
+    operator: OPERATOR_KIND_EMBEDDING
+    operator: OPERATOR_KIND_Q_EMBEDDING
+    operator: OPERATOR_KIND_ROPE
+    operator: OPERATOR_KIND_SSM_SCAN
+    operator: OPERATOR_KIND_SELECTIVE_SCAN
+    operator: OPERATOR_KIND_NON_MAX_SUPPRESSION
+    operator: OPERATOR_KIND_SPATIAL_SOFTARGMAX_Y
+    operator: OPERATOR_KIND_MEAN_HEIGHT
+    operator: OPERATOR_KIND_PROFILE_X
+    operator: OPERATOR_KIND_PROFILE_Y
+    operator: OPERATOR_KIND_DROPOUT
+  }
+  operator_set: {
+    name: "runtime-native-cpu"
+    operator: OPERATOR_KIND_MATMUL
+    operator: OPERATOR_KIND_LINEAR
+    operator: OPERATOR_KIND_Q_LINEAR
+    operator: OPERATOR_KIND_BATCH_MATMUL
+    operator: OPERATOR_KIND_Q_BATCH_MATMUL
+    operator: OPERATOR_KIND_Q_GEMM
+    operator: OPERATOR_KIND_GEMM
+    operator: OPERATOR_KIND_Q_MATMUL
+    operator: OPERATOR_KIND_MOE_ROUTER
+    operator: OPERATOR_KIND_MOE_LINEAR
+    operator: OPERATOR_KIND_SDPA
+    operator: OPERATOR_KIND_Q_SDPA
+    operator: OPERATOR_KIND_CROSS_SDPA
+    operator: OPERATOR_KIND_LAYER_NORM
+    operator: OPERATOR_KIND_Q_LAYER_NORM
+    operator: OPERATOR_KIND_GROUP_NORM
+    operator: OPERATOR_KIND_Q_GROUP_NORM
+    operator: OPERATOR_KIND_RMS_NORM
+    operator: OPERATOR_KIND_BATCH_NORM_2D
+    operator: OPERATOR_KIND_CONV_2D
+    operator: OPERATOR_KIND_Q_CONV_2D
+    operator: OPERATOR_KIND_MAX_POOL_2D
+    operator: OPERATOR_KIND_GLOBAL_AVERAGE_POOL
+    operator: OPERATOR_KIND_RESIZE
+    operator: OPERATOR_KIND_RESIZE_NEAREST_2D
+    operator: OPERATOR_KIND_UPSAMPLE_NEAREST_2D
+    operator: OPERATOR_KIND_RELU
+    operator: OPERATOR_KIND_LEAKY_RELU
+    operator: OPERATOR_KIND_PRELU
+    operator: OPERATOR_KIND_GELU
+    operator: OPERATOR_KIND_Q_GELU
+    operator: OPERATOR_KIND_SILU
+    operator: OPERATOR_KIND_Q_SILU
+    operator: OPERATOR_KIND_SIGMOID
+    operator: OPERATOR_KIND_HARD_SWISH
+    operator: OPERATOR_KIND_HARD_SIGMOID
+    operator: OPERATOR_KIND_TANH
+    operator: OPERATOR_KIND_SIN
+    operator: OPERATOR_KIND_COS
+    operator: OPERATOR_KIND_CLIP
+    operator: OPERATOR_KIND_ADD
+    operator: OPERATOR_KIND_Q_ADD
+    operator: OPERATOR_KIND_SUB
+    operator: OPERATOR_KIND_MUL
+    operator: OPERATOR_KIND_DIV
+    operator: OPERATOR_KIND_SOFTMAX
+    operator: OPERATOR_KIND_LOG_SOFTMAX
+    operator: OPERATOR_KIND_REDUCE_SUM
+    operator: OPERATOR_KIND_REDUCE_MEAN
+    operator: OPERATOR_KIND_Q_MASKED_MEAN
+    operator: OPERATOR_KIND_ARG_MAX
+    operator: OPERATOR_KIND_Q_ARG_MAX
+    operator: OPERATOR_KIND_EQUAL
+    operator: OPERATOR_KIND_GREATER_OR_EQUAL
+    operator: OPERATOR_KIND_NOT
+    operator: OPERATOR_KIND_WHERE
+    operator: OPERATOR_KIND_RESHAPE
+    operator: OPERATOR_KIND_FLATTEN
+    operator: OPERATOR_KIND_SQUEEZE
+    operator: OPERATOR_KIND_UNSQUEEZE
+    operator: OPERATOR_KIND_TRANSPOSE
+    operator: OPERATOR_KIND_CONCAT
+    operator: OPERATOR_KIND_SPLIT
+    operator: OPERATOR_KIND_SLICE
+    operator: OPERATOR_KIND_EXPAND
+    operator: OPERATOR_KIND_GATHER
+    operator: OPERATOR_KIND_IDENTITY
+    operator: OPERATOR_KIND_QUANTIZE_LINEAR
+    operator: OPERATOR_KIND_DEQUANTIZE_LINEAR
+    operator: OPERATOR_KIND_REQUANTIZE_LINEAR
+    operator: OPERATOR_KIND_CAST
+    operator: OPERATOR_KIND_EMBEDDING
+    operator: OPERATOR_KIND_Q_EMBEDDING
+    operator: OPERATOR_KIND_ROPE
+    operator: OPERATOR_KIND_SSM_SCAN
+    operator: OPERATOR_KIND_SELECTIVE_SCAN
+    operator: OPERATOR_KIND_DROPOUT
+  }
+  operator_set: {
+    name: "runtime-webgpu"
+    operator: OPERATOR_KIND_MATMUL
+    operator: OPERATOR_KIND_LINEAR
+    operator: OPERATOR_KIND_Q_LINEAR
+    operator: OPERATOR_KIND_BATCH_MATMUL
+    operator: OPERATOR_KIND_Q_BATCH_MATMUL
+    operator: OPERATOR_KIND_Q_GEMM
+    operator: OPERATOR_KIND_GEMM
+    operator: OPERATOR_KIND_Q_MATMUL
+    operator: OPERATOR_KIND_MOE_ROUTER
+    operator: OPERATOR_KIND_MOE_LINEAR
+    operator: OPERATOR_KIND_SDPA
+    operator: OPERATOR_KIND_Q_SDPA
+    operator: OPERATOR_KIND_CROSS_SDPA
+    operator: OPERATOR_KIND_CROSS_ATTENTION
+    operator: OPERATOR_KIND_LAYER_NORM
+    operator: OPERATOR_KIND_Q_LAYER_NORM
+    operator: OPERATOR_KIND_GROUP_NORM
+    operator: OPERATOR_KIND_Q_GROUP_NORM
+    operator: OPERATOR_KIND_RMS_NORM
+    operator: OPERATOR_KIND_BATCH_NORM_2D
+    operator: OPERATOR_KIND_CONV_2D
+    operator: OPERATOR_KIND_Q_CONV_2D
+    operator: OPERATOR_KIND_CONV_1D
+    operator: OPERATOR_KIND_CONV_TRANSPOSE_2D
+    operator: OPERATOR_KIND_MAX_POOL_2D
+    operator: OPERATOR_KIND_AVERAGE_POOL_2D
+    operator: OPERATOR_KIND_GLOBAL_AVERAGE_POOL
+    operator: OPERATOR_KIND_RESIZE
+    operator: OPERATOR_KIND_INTERPOLATE_1D
+    operator: OPERATOR_KIND_RESIZE_NEAREST_2D
+    operator: OPERATOR_KIND_UPSAMPLE_NEAREST_2D
+    operator: OPERATOR_KIND_RELU
+    operator: OPERATOR_KIND_LEAKY_RELU
+    operator: OPERATOR_KIND_PRELU
+    operator: OPERATOR_KIND_GELU
+    operator: OPERATOR_KIND_Q_GELU
+    operator: OPERATOR_KIND_SILU
+    operator: OPERATOR_KIND_Q_SILU
+    operator: OPERATOR_KIND_SIGMOID
+    operator: OPERATOR_KIND_HARD_SWISH
+    operator: OPERATOR_KIND_HARD_SIGMOID
+    operator: OPERATOR_KIND_TANH
+    operator: OPERATOR_KIND_CLIP
+    operator: OPERATOR_KIND_ADD
+    operator: OPERATOR_KIND_Q_ADD
+    operator: OPERATOR_KIND_SUB
+    operator: OPERATOR_KIND_MUL
+    operator: OPERATOR_KIND_DIV
+    operator: OPERATOR_KIND_SOFTMAX
+    operator: OPERATOR_KIND_LOG_SOFTMAX
+    operator: OPERATOR_KIND_REDUCE_SUM
+    operator: OPERATOR_KIND_REDUCE_MEAN
+    operator: OPERATOR_KIND_Q_MASKED_MEAN
+    operator: OPERATOR_KIND_ARG_MAX
+    operator: OPERATOR_KIND_Q_ARG_MAX
+    operator: OPERATOR_KIND_EQUAL
+    operator: OPERATOR_KIND_GREATER_OR_EQUAL
+    operator: OPERATOR_KIND_NOT
+    operator: OPERATOR_KIND_WHERE
+    operator: OPERATOR_KIND_MASK
+    operator: OPERATOR_KIND_RESHAPE
+    operator: OPERATOR_KIND_FLATTEN
+    operator: OPERATOR_KIND_SQUEEZE
+    operator: OPERATOR_KIND_UNSQUEEZE
+    operator: OPERATOR_KIND_TRANSPOSE
+    operator: OPERATOR_KIND_CONCAT
+    operator: OPERATOR_KIND_SPLIT
+    operator: OPERATOR_KIND_SLICE
+    operator: OPERATOR_KIND_PAD
+    operator: OPERATOR_KIND_EXPAND
+    operator: OPERATOR_KIND_GATHER
+    operator: OPERATOR_KIND_GATHER_ELEMENTS
+    operator: OPERATOR_KIND_IDENTITY
+    operator: OPERATOR_KIND_BROADCAST
+    operator: OPERATOR_KIND_CONCAT2
+    operator: OPERATOR_KIND_QUANTIZE_LINEAR
+    operator: OPERATOR_KIND_DEQUANTIZE_LINEAR
+    operator: OPERATOR_KIND_REQUANTIZE_LINEAR
+    operator: OPERATOR_KIND_CAST
+    operator: OPERATOR_KIND_EMBEDDING
+    operator: OPERATOR_KIND_Q_EMBEDDING
+    operator: OPERATOR_KIND_NON_MAX_SUPPRESSION
+    operator: OPERATOR_KIND_SPATIAL_SOFTARGMAX_Y
+    operator: OPERATOR_KIND_MEAN_HEIGHT
+    operator: OPERATOR_KIND_PROFILE_X
+    operator: OPERATOR_KIND_PROFILE_Y
+    operator: OPERATOR_KIND_DROPOUT
+  }
+  operator_set: {
+    name: "runtime-webnn"
+    operator: OPERATOR_KIND_MATMUL
+    operator: OPERATOR_KIND_LINEAR
+    operator: OPERATOR_KIND_GEMM
+    operator: OPERATOR_KIND_SDPA
+    operator: OPERATOR_KIND_LAYER_NORM
+    operator: OPERATOR_KIND_CONV_2D
+    operator: OPERATOR_KIND_RELU
+    operator: OPERATOR_KIND_GELU
+    operator: OPERATOR_KIND_SILU
+    operator: OPERATOR_KIND_SIGMOID
+    operator: OPERATOR_KIND_ADD
+    operator: OPERATOR_KIND_MUL
+    operator: OPERATOR_KIND_SOFTMAX
+    operator: OPERATOR_KIND_RESHAPE
+    operator: OPERATOR_KIND_FLATTEN
+    operator: OPERATOR_KIND_EMBEDDING
+  }
+  operator_set: {
+    name: "runtime-linear"
+    operator: OPERATOR_KIND_MATMUL
+    operator: OPERATOR_KIND_LINEAR
+    operator: OPERATOR_KIND_GEMM
+  }
+  operator_set: {
+    name: "qualified-common"
+    operator: OPERATOR_KIND_ADD
+    operator: OPERATOR_KIND_ARG_MAX
+    operator: OPERATOR_KIND_AVERAGE_POOL_2D
+    operator: OPERATOR_KIND_BATCH_MATMUL
+    operator: OPERATOR_KIND_CAST
+    operator: OPERATOR_KIND_CLIP
+    operator: OPERATOR_KIND_CONCAT
+    operator: OPERATOR_KIND_CONV_2D
+    operator: OPERATOR_KIND_CROSS_SDPA
+    operator: OPERATOR_KIND_DEQUANTIZE_LINEAR
+    operator: OPERATOR_KIND_DIV
+    operator: OPERATOR_KIND_DROPOUT
+    operator: OPERATOR_KIND_EMBEDDING
+    operator: OPERATOR_KIND_EQUAL
+    operator: OPERATOR_KIND_EXPAND
+    operator: OPERATOR_KIND_FLATTEN
+    operator: OPERATOR_KIND_GELU
+    operator: OPERATOR_KIND_GATHER
+    operator: OPERATOR_KIND_GATHER_ELEMENTS
+    operator: OPERATOR_KIND_GEMM
+    operator: OPERATOR_KIND_GLOBAL_AVERAGE_POOL
+    operator: OPERATOR_KIND_GREATER_OR_EQUAL
+    operator: OPERATOR_KIND_GROUP_NORM
+    operator: OPERATOR_KIND_IDENTITY
+    operator: OPERATOR_KIND_LAYER_NORM
+    operator: OPERATOR_KIND_LINEAR
+    operator: OPERATOR_KIND_LOG_SOFTMAX
+    operator: OPERATOR_KIND_MATMUL
+    operator: OPERATOR_KIND_MAX_POOL_2D
+    operator: OPERATOR_KIND_MUL
+    operator: OPERATOR_KIND_NOT
+    operator: OPERATOR_KIND_Q_ADD
+    operator: OPERATOR_KIND_Q_ARG_MAX
+    operator: OPERATOR_KIND_Q_BATCH_MATMUL
+    operator: OPERATOR_KIND_Q_CONV_2D
+    operator: OPERATOR_KIND_Q_EMBEDDING
+    operator: OPERATOR_KIND_Q_GELU
+    operator: OPERATOR_KIND_Q_GEMM
+    operator: OPERATOR_KIND_Q_GROUP_NORM
+    operator: OPERATOR_KIND_Q_LAYER_NORM
+    operator: OPERATOR_KIND_Q_LINEAR
+    operator: OPERATOR_KIND_Q_MASKED_MEAN
+    operator: OPERATOR_KIND_Q_MATMUL
+    operator: OPERATOR_KIND_Q_SDPA
+    operator: OPERATOR_KIND_Q_SILU
+    operator: OPERATOR_KIND_QUANTIZE_LINEAR
+    operator: OPERATOR_KIND_RELU
+    operator: OPERATOR_KIND_REDUCE_MEAN
+    operator: OPERATOR_KIND_REDUCE_SUM
+    operator: OPERATOR_KIND_REQUANTIZE_LINEAR
+    operator: OPERATOR_KIND_RESHAPE
+    operator: OPERATOR_KIND_RESIZE
+    operator: OPERATOR_KIND_RESIZE_NEAREST_2D
+    operator: OPERATOR_KIND_SDPA
+    operator: OPERATOR_KIND_SILU
+    operator: OPERATOR_KIND_SIGMOID
+    operator: OPERATOR_KIND_SLICE
+    operator: OPERATOR_KIND_SOFTMAX
+    operator: OPERATOR_KIND_SPLIT
+    operator: OPERATOR_KIND_SQUEEZE
+    operator: OPERATOR_KIND_SUB
+    operator: OPERATOR_KIND_TRANSPOSE
+    operator: OPERATOR_KIND_UNSQUEEZE
+    operator: OPERATOR_KIND_WHERE
+  }
+  operator_set: {
+    name: "qualified-native-cpu"
+    operator: OPERATOR_KIND_ADD
+    operator: OPERATOR_KIND_ARG_MAX
+    operator: OPERATOR_KIND_BATCH_MATMUL
+    operator: OPERATOR_KIND_CAST
+    operator: OPERATOR_KIND_CLIP
+    operator: OPERATOR_KIND_CONCAT
+    operator: OPERATOR_KIND_CONV_2D
+    operator: OPERATOR_KIND_CROSS_SDPA
+    operator: OPERATOR_KIND_DEQUANTIZE_LINEAR
+    operator: OPERATOR_KIND_DIV
+    operator: OPERATOR_KIND_DROPOUT
+    operator: OPERATOR_KIND_EMBEDDING
+    operator: OPERATOR_KIND_EQUAL
+    operator: OPERATOR_KIND_EXPAND
+    operator: OPERATOR_KIND_FLATTEN
+    operator: OPERATOR_KIND_GELU
+    operator: OPERATOR_KIND_GATHER
+    operator: OPERATOR_KIND_GEMM
+    operator: OPERATOR_KIND_GLOBAL_AVERAGE_POOL
+    operator: OPERATOR_KIND_GREATER_OR_EQUAL
+    operator: OPERATOR_KIND_GROUP_NORM
+    operator: OPERATOR_KIND_IDENTITY
+    operator: OPERATOR_KIND_LAYER_NORM
+    operator: OPERATOR_KIND_LINEAR
+    operator: OPERATOR_KIND_LOG_SOFTMAX
+    operator: OPERATOR_KIND_MATMUL
+    operator: OPERATOR_KIND_MAX_POOL_2D
+    operator: OPERATOR_KIND_MUL
+    operator: OPERATOR_KIND_NOT
+    operator: OPERATOR_KIND_Q_ADD
+    operator: OPERATOR_KIND_Q_ARG_MAX
+    operator: OPERATOR_KIND_Q_BATCH_MATMUL
+    operator: OPERATOR_KIND_Q_CONV_2D
+    operator: OPERATOR_KIND_Q_EMBEDDING
+    operator: OPERATOR_KIND_Q_GELU
+    operator: OPERATOR_KIND_Q_GEMM
+    operator: OPERATOR_KIND_Q_GROUP_NORM
+    operator: OPERATOR_KIND_Q_LAYER_NORM
+    operator: OPERATOR_KIND_Q_LINEAR
+    operator: OPERATOR_KIND_Q_MASKED_MEAN
+    operator: OPERATOR_KIND_Q_MATMUL
+    operator: OPERATOR_KIND_Q_SDPA
+    operator: OPERATOR_KIND_Q_SILU
+    operator: OPERATOR_KIND_QUANTIZE_LINEAR
+    operator: OPERATOR_KIND_RELU
+    operator: OPERATOR_KIND_REDUCE_MEAN
+    operator: OPERATOR_KIND_REDUCE_SUM
+    operator: OPERATOR_KIND_REQUANTIZE_LINEAR
+    operator: OPERATOR_KIND_RESHAPE
+    operator: OPERATOR_KIND_RESIZE
+    operator: OPERATOR_KIND_RESIZE_NEAREST_2D
+    operator: OPERATOR_KIND_SDPA
+    operator: OPERATOR_KIND_SILU
+    operator: OPERATOR_KIND_SIGMOID
+    operator: OPERATOR_KIND_SLICE
+    operator: OPERATOR_KIND_SOFTMAX
+    operator: OPERATOR_KIND_SPLIT
+    operator: OPERATOR_KIND_SQUEEZE
+    operator: OPERATOR_KIND_SUB
+    operator: OPERATOR_KIND_TRANSPOSE
+    operator: OPERATOR_KIND_UNSQUEEZE
+    operator: OPERATOR_KIND_WHERE
+  }
+  operator_set: {
+    name: "qualified-webnn"
+    operator: OPERATOR_KIND_ADD
+    operator: OPERATOR_KIND_CONV_2D
+    operator: OPERATOR_KIND_GEMM
+    operator: OPERATOR_KIND_LINEAR
+    operator: OPERATOR_KIND_MATMUL
+    operator: OPERATOR_KIND_MUL
+    operator: OPERATOR_KIND_RELU
+    operator: OPERATOR_KIND_RESHAPE
+  }
+};

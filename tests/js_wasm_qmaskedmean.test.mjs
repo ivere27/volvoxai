@@ -53,7 +53,7 @@ function qMaskedMeanGraph({
       quantization: outputQuantization,
     },
   }, params);
-  graph.outputNames = [out.name];
+  graph.setOutputs([out.name]);
   return {
     graph, input, mask, out, inputValues: bytes(inputDtype, inputValues),
     maskValues: Int32Array.from(maskValues),

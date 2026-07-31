@@ -29,6 +29,10 @@
 **앵커(Anchor)** — 탐지기가 처음부터 박스를 예측하는 대신 조정하는 고정 참조 박스(사전값). EfficientDet-Lite0
 은 격자 셀당 9개 → 총 19,206.
 
+**산술 강도(arithmetic intensity, 루프라인)** — 메모리에서 옮긴 바이트당 수행하는 FLOP. 강도가
+높으면(1×1 conv, matmul) *계산 병목* 이라 SIMD가 돕고, 낮으면(원소별 `Add`) *메모리 병목* 이라 대신
+융합과 버퍼 재사용이 돕습니다(8장).
+
 **어텐션(SDPA)** — 각 토큰이 자기 **Query** 를 모든 토큰의 **Key** 와 비교해 그 **Value** 를 유사도로
 혼합하는 트랜스포머 메커니즘. "앞선 어떤 단어가 나에게 중요한가?"
 
@@ -65,11 +69,20 @@ Vulkan, OpenGL/GLES, Metal, NNAPI. VolvoxAI가 노드마다 하나를 고름.
 **교차 엔트로피(Cross-entropy)** — 언어 모델 학습 손실: 예측한 다음 토큰 분포가 정답 토큰 대비 얼마나 틀렸나.
 그 기울기가 역전파의 씨앗(4장).
 
+**CUDA** — NVIDIA GPU에서 자기 프로그램(**커널**)을 돌리는 NVIDIA 시스템. VolvoxAI의 CUDA 백엔드는
+NVIDIA **Driver API** 와 자기 **PTX** 커널만 씀 — cuBLAS/cuDNN/cudart 없음(9C장).
+
+**CUDA 그래프(캡처/리플레이)** — 고정된 GPU 런치 순서를 한 번 녹화한 뒤, 런치별 부대비용을 크게 줄여 전체를
+다시 재생. VolvoxAI는 답을 절대 바꾸지 않는 보수적 추론 속도 향상으로 씀(9C장 §9C.7).
+
 **역양자화(Dequantize)** — int8을 실수로 변환: `r = (q − zero_point) × scale`.
 
 **dlopen / dlsym** — 공유 라이브러리를 로드하고 그 함수를 *실행 시점* 에 찾음(링크 시점 아님). VolvoxAI
 네이티브 바이너리가 GPU 드라이버(`libvulkan`, `libGL`)를 어떤 GPU SDK 링크 없이 쓰는 방법 — "정적 GPU
 의존성 없음" 설계.
+
+**Driver API** — 늘 있는 GPU 드라이버에 든 작고 안정적인 저수준 NVIDIA 함수 집합(디바이스 메모리 만들기,
+복사, 커널 런치). VolvoxAI는 `dlopen` 으로 실행 시점에 해석하니 CUDA 툴킷을 링크하지 않음(9C장 §9C.2).
 
 **Dropout** — *학습 중* 활성화의 일부를 무작위로 0으로(추론 땐 꺼짐), 모델이 단일 유닛에 과의존하지 못하게
 함(5장).
@@ -94,7 +107,10 @@ Vulkan, OpenGL/GLES, Metal, NNAPI. VolvoxAI가 노드마다 하나를 고름.
 **기울기 누적(Gradient accumulation)** — 한 번의 최적화기 스텝 전에 여러 작은 마이크로배치에 걸쳐 기울기를
 합산, 메모리에 안 맞는 큰 배치를 흉내(5장).
 
-**그래프(Graph)** — 모델의 연산 목록: 이름 붙은 텐서로 연결된 노드(연산). `config.json` 으로 저장.
+**그래디언트 체크포인팅(Gradient checkpointing)** — 순방향 활성화 일부만 저장하고 나머지는 역전파 중에
+*재계산* 해, 추가 계산과 훨씬 낮은 메모리를 맞바꾸는 것(4장).
+
+**그래프(Graph)** — 모델의 연산 목록: 이름 붙은 텐서로 연결된 노드(연산). `graph.json` 으로 저장.
 
 **헤드(Head)** — 마지막 과제별 층: LM 헤드(→ 어휘 로짓) 또는 탐지기의 클래스/박스 헤드.
 
@@ -102,8 +118,8 @@ Vulkan, OpenGL/GLES, Metal, NNAPI. VolvoxAI가 노드마다 하나를 고름.
 
 **int8 / fp16 / fp32** — 8비트 정수 / 16비트 실수 / 32비트 실수 형식(1 / 2 / 4바이트). 6장 참고.
 
-**KV 캐시** — 과거 토큰의 Key와 Value를 캐시해 각 생성 스텝이 새 토큰 것만 계산하게 함. 이 저장소에선:
-`volvoxai_engine_forward_prefix` + `volvoxai_engine_forward_row`.
+**KV 캐시** — 과거 토큰의 Key와 Value를 캐시해 각 생성 스텝이 새 토큰 것만 계산하게 함. JavaScript에서는
+ExecutionContext가 소유하고 context.decode.seed(), step(), reset() 으로 제어함.
 
 **LayerNorm / RMSNorm** — 벡터를 정규화(평균 0, 분산 1, 그다음 학습된 스케일/이동)해 깊은 신경망 숫자를
 안정 유지.
@@ -145,8 +161,15 @@ NHWC를 씀.
 
 **PTQ(사후 학습 양자화)** — 이미 학습된 모델을 범위 캘리브레이션과 가중치 패킹으로 양자화, 재학습 없음(7장).
 
+**PTX** — NVIDIA의 이식 가능한 GPU 명령 형식 — "GPU 자신의 손글씨로 적은 레시피." VolvoxAI는 `.cu` 커널을
+PTX로 컴파일해 바이너리에 임베드하고, 드라이버가 실행 시점에 그 카드용으로 JIT 컴파일함(9C장 §9C.3).
+
 **QAT(양자화 인지 학습)** — 순전파에 모의 int8 반올림을 넣어 *학습* 해 가중치가 그것을 견디도록; 기울기는
 스트레이트-스루 추정기로 흐름(7장).
+
+**레지던시(디바이스 상주)** — 매번 CPU로 다시 복사하는 대신 텐서 데이터를 단계 사이에 GPU에 두는 것.
+VolvoxAI의 CUDA 백엔드는 각 호스트 포인터를 디바이스 슬롯에 매핑하고 가중치를 상주시켜, CPU가 정말 데이터를
+필요로 할 때만 복사함(9C장 §9C.6).
 
 **잔차(스킵 연결)(Residual)** — 블록의 입력을 출력에 더함(`out = x + f(x)`)으로 깊은 스택에서 정보와 기울기가
 살아남게 함. 두 모델 모두.
@@ -162,17 +185,19 @@ NHWC를 씀.
 
 **SPIR-V** — Vulkan이 소비하는 바이너리 셰이더 형식; `naga` 가 VolvoxAI의 WGSL을 이것으로 컴파일.
 
-**프리필 / 디코드(Prefill / Decode)** — 네이티브 텍스트 생성의 두 단계: *프리필* 은 프롬프트를 한 번 돌려
-KV 캐시를 채우고, *디코드* 는 캐시를 써 한 번에 새 토큰 하나를 돎. 일반 공개 API는 이 연산을
-`volvoxai_engine_forward_prefix` / `volvoxai_engine_forward_row` 로 이름 붙이고, 호출자는
-`volvoxai_engine_tensor_row_f32` 로 선언된 출력 행을 읽음.
+**프리필 / 디코드(Prefill / Decode)** — 텍스트 생성의 두 단계: *프리필* 은 프롬프트를 한 번 돌려 KV
+캐시를 채우고, *디코드* 는 캐시를 써 한 번에 새 토큰 하나를 돎. JavaScript 호출자는
+ExecutionContext.decode.seed() 와 step() 을 사용하고, 각 안정된 ExecutionResult를 출력 이름으로 읽음.
+네이티브 애플리케이션은 VxExecutionContext와 선언된 VxResult 출력을 사용하며, 공개 C API는 별도
+prefix/row 함수를 노출하지 않음.
 
 **스트레이트-스루 추정기(Straight-through estimator)** — 미분 불가한 정수 반올림 단계를 역전파에서 항등함수로
 취급해 기울기가 계속 흐르게 하는 QAT 비결(7장).
 
 **텐서(Tensor)** — 형태를 지닌 다차원 숫자 배열; 엔진의 유일한 자료형.
 
-**계층(Tier)** — VolvoxAI의 네 브라우저 백엔드(WebNN / WebGPU / WASM / 순수 JS) 중 하나, 능력에 따라 선택.
+**계층(Tier)** — VolvoxAI의 브라우저 프로바이더(WebNN / WebGPU / WASM / CPU) 중 하나로,
+Model.compile() 정책에서 선택하고 고정함.
 
 **토큰(Token)** — 정수 id에 매핑된 텍스트 조각(단어/서브워드/바이트).
 
@@ -190,8 +215,8 @@ KV 캐시를 채우고, *디코드* 는 캐시를 써 한 번에 새 토큰 하�
 
 - **🌱 갈래를 하나의 이야기로 다시 읽기.** "핵심 아이디어" 상자만 1장 → 9장으로 연달아 훑으세요. AI가
   어떻게 동작하는지의 완결된 쉬운 말 설명이며 — 두 번째 읽을 때 더 강하게 다가옵니다.
-- **모델이 실제로 도는 것 보기.** 저장소를 가진 사람에게 당신의 사진이나 프롬프트로 `detect` 나
-  `generate` 명령(§11.3)을 돌려 달라 하고, 일어나는 일을 2–3장의 단계와 맞춰 보세요.
+- **모델이 실제로 도는 것 보기.** 저장소를 가진 사람에게 당신의 사진으로 `detect` 명령(§11.3)을
+  돌려 달라 하고, 일어나는 일을 3장의 단계와 맞춰 보세요.
 - **남에게 설명하기.** "어텐션이 하는 일" 이나 "양자화가 왜 모델을 줄이는지" 를 자신의 말로 설명해
   보세요. 가르치는 것이 이해의 진짜 시험입니다.
 - **§11.4의 🌱 실습 하기** — 펜, 종이, 그리고 이미 가진 아이디어만 필요합니다.
@@ -214,8 +239,8 @@ KV 캐시를 채우고, *디코드* 는 캐시를 써 한 번에 새 토큰 하�
 1. **자료 모델** — `ts/core/Tensor.ts`, `ts/core/Graph.ts`. 작음; 전부 읽기.
 2. **실행기** — `ts/backends/CPUEngine.ts`(루프 + 디스패치).
 3. **소박한 커널 넷** — `ts/ops/add.ts`, `embedding.ts`, `layerNorm.ts`, `matMul.ts`.
-4. **두 모델의 설계도** — `models/tinystories_1m/config.json` 과
-   `models/efficientdet_lite0_fp32/config.json` 을 훑고 2–3장의 노드와 맞추기.
+4. **두 모델의 설계도** — `models/tinystories_1m/graph.json` 과
+   `models/efficientdet_lite0_fp32/graph.json` 을 훑고 2–3장의 노드와 맞추기.
 5. **어텐션 + conv 커널** — `ts/ops/sDPA.ts`, `ts/ops/conv2D.ts`.
 6. **양자화** — `ts/ops/dequantizeLinear.ts`, 그다음 `native/src/kernels/quant_cpu_opt.c`.
 7. **최적화** — `ts/ops/conv2D.ts` 를 `native/src/kernels/conv_f32_opt.c` 와 diff하며
@@ -227,7 +252,7 @@ KV 캐시를 채우고, *디코드* 는 캐시를 써 한 번에 새 토큰 하�
    래퍼.
 
 `docs/operation_list.md` 는 연산별 × 백엔드별 지원 행렬 — 당신의 참조 지도이며,
-[ARCHITECTURE.md](../../ARCHITECTURE.md) 는 소스 지도이자 의존성 규칙입니다.
+[ARCHITECTURE.md](../../../ARCHITECTURE.md) 는 소스 지도이자 의존성 규칙입니다.
 
 ---
 
@@ -237,16 +262,12 @@ KV 캐시를 채우고, *디코드* 는 캐시를 써 한 번에 새 토큰 하�
 # 옵트인 이미지/어휘/과제 프런트엔드 빌드.
 make -C examples native_task_cli
 
-# 언어 모델 — 텍스트 생성(탐욕).
-examples/target/bin/volvoxai-tasks generate models/tinystories_1m \
-  --prompt "Once upon a time, Lily" --max-new 50 [--debug]
-
 # 원시 그래프 러너 — 고정 토큰 집합에 대한 로짓 텐서 덤프.
 make build_native
 ./native/volvoxai run models/tinystories_1m \
   --input tokens=models/tinystories_1m/tokens.i32 \
   --input positions=models/tinystories_1m/positions.i32 \
-  --output logits=out.f32 --row 4
+  --output logits=out.f32
 
 # 객체 탐지기 — 이미지를 순위 박스로 디코드.
 examples/target/bin/volvoxai-tasks detect models/efficientdet_lite0_int8 \
@@ -257,8 +278,8 @@ examples/target/bin/volvoxai-tasks detect models/efficientdet_lite0_int8 \
 node bin/volvox.js run --model models/tinystories_1m/model.safetensors --backend wasm
 ```
 
-과제 예제의 `generate` 명령에 `--debug` 를 더하면 노드별 타이밍과 tokens/sec를 볼 수 있습니다 —
-시간이 어디로 가는지 *느끼는*(그리고 8장의 최적화가 값을 하는 것을 지켜보는) 좋은 방법입니다.
+과제 예제 명령에 `--debug` 를 더하면 노드별 타이밍을 볼 수 있습니다. 시간이 어디로 가는지 직접
+확인하고 8장의 최적화 효과를 관찰할 수 있습니다.
 
 ---
 
@@ -276,7 +297,7 @@ node bin/volvox.js run --model models/tinystories_1m/model.safetensors --backend
 🔧🔬 **코드 실습:**
 
 1. **손으로 추적.** 시퀀스 `[5, 5]`(같은 토큰 둘)와 지어낸 2차원 임베딩을 잡으세요. `Embedding →
-   Add(위치) → LayerNorm` 을 펜과 종이로 걸으세요. 형태가 `config.json` 과 맞는지 확인.
+   Add(위치) → LayerNorm` 을 펜과 종이로 걸으세요. 형태가 `graph.json` 과 맞는지 확인.
 2. **인과성 깨기.** `ts/ops/sDPA.ts` 에서 `k <= q` 를 `k < seq_len` 으로 바꾸세요. 생성 텍스트에 무슨
    일이 왜 일어날지 예측하세요. (그다음 되돌리기.)
 3. **가중치 양자화.** `scale = 0.02`, `zero_point = -5` 를 고르세요. `r = 0.31` 을 양자화한 뒤 역양자화.
@@ -285,7 +306,7 @@ node bin/volvox.js run --model models/tinystories_1m/model.safetensors --backend
    출력 크기의 1×1 포인트와이즈 conv와 비교. 왜 뎁스와이즈-분리가 더 싼가?
 5. **연산 추가.** `ts/ops/` 에 원소별 `Abs` 커널을 구현하고, `CPUEngine.ts` 의 `switch` 에 연결해
    디스패치되는지 확인. (`ts/ops/reLU.ts` 를 템플릿으로.)
-6. **융합 찾기.** `models/efficientdet_lite0_fp32/config.json` 에서 `relu` 파라미터가 설정된 `Conv2D`
+6. **융합 찾기.** `models/efficientdet_lite0_fp32/graph.json` 에서 `relu` 파라미터가 설정된 `Conv2D`
    를 찾으세요 — 이미 구운 Conv+ReLU 융합입니다. 그것이 어떤 두 연산을 나타내는지 설명.
 
 ---
@@ -306,13 +327,17 @@ node bin/volvox.js run --model models/tinystories_1m/model.safetensors --backend
 | **데이터 & 파이프라인** | 데이터셋 매니페스트, 스트리밍/입력 파이프라인, 증강, 정제, 토크나이저 학습, 누출 검사가 있는 train/val/test 분할. | 모델 품질은 대개 데이터 품질과 실험 위생에 묶임. |
 | **평가 & 실험** | 표준 과제 지표, 베이스라인, 절제 실험, 하이퍼파라미터 스윕, 편향-분산 분석 — 예제가 보고하는 과제별 정확 일치 너머. | 모델이 정말 나아졌는지, 그냥 다른지 아는 방법. |
 | **수학 기초** | 선형대수 유도, 연쇄 법칙과 기울기의 미적분, 확률, 엔트로피 / KL / 가능도. | 학습과 평가가 *왜* 그렇게 행동하는지 설명하는 도구. |
-| **프런티어 LLM 스택** | 대규모 사전학습, RLHF/DPO 선호 학습, 분산 데이터/모델 병렬, FlashAttention, 그룹 쿼리 어텐션 / SwiGLU 블록. | 엔진엔 이미 RoPE, RMSNorm, MoE, LoRA, int8이 있지만 — 최대 규모 레시피나 융합 어텐션 커널은 없음. |
+| **프런티어 LLM 스택** | 대규모 사전학습, RLHF/DPO 선호 학습, 분산 데이터/모델 병렬, FlashAttention, 그리고 *미리 만들어진* 그룹 쿼리 어텐션 / SwiGLU 블록. | 엔진엔 이미 RoPE, RMSNorm, MoE, LoRA, int8이 있지만 — 최대 규모 레시피나 융합 어텐션 커널은 없음. (SwiGLU는 오늘날 `SiLU`+`Mul`+`Linear` 로 조합 가능하며, 한 번에 호출하는 블록만 없음.) |
 | **8비트 미만 양자화** | int4 / 그룹 양자화 가중치 형식과 레지스터 내 언패킹 커널. | 큰 LLM 가중치의 추가 메모리 대역폭 이득; 배포 형식이 아니라 미래 마이크로커널 방향으로 문서화됨. |
 | **아키텍처 폭** | Diffusion, 그래프 신경망, RNN/LSTM, 강화학습, VAE/GAN, 검색/임베딩, 상태공간 모델. | 이 안내서는 트랜스포머 LM, CNN 탐지기, (10장) 멀티모달 VQA 종합을 다룸; 다른 영역은 다른 귀납 편향을 씀. |
 | **연구 실천** | 논문 재현, 통제된 실험, 스케일링 법칙 / 오차 분석. | 모델을 실행·학습하는 것과 믿을 만한 새 지식을 생산하는 것의 차이. |
 
 이것들을 나열하는 것은 범위를 정직하게 유지합니다: 강한 추론 **과** 학습/최적화 기초이지, 완전한
 학습-연구 커리큘럼이 아닙니다.
+
+> 🔬 **엔진 빈틈 vs. 이 목록.** 위 표는 *능력 수준* 입니다. 이미 할 일 목록에 있는 구체적이고 단기적인
+> **엔진** 빈틈 — 빠진 GPU/WebNN 연산 커버리지, INT4 가중치, 브라우저 스트리밍 헬퍼, 패리티/벤치마크
+> 하니스 — 은 살아있는 [`docs/roadmap.md`](../../roadmap.md) 를 보세요.
 
 ---
 
@@ -325,7 +350,7 @@ node bin/volvox.js run --model models/tinystories_1m/model.safetensors --backend
   `shaders/{inference,training}/*.wgsl` 과 네이티브 GPU 백엔드를 살피세요.
 - **트랜스포머 키우기.** GPT-2/3, LLaMA, Mistral, Qwen은 2장의 그래프를 넓고/깊게 한 것에 변형을 더한
   것: LayerNorm 대신 **RMSNorm**, 학습된 `wpe` 대신 **RoPE** 회전 위치, **그룹 쿼리 어텐션**, **SwiGLU**
-  MLP. 각각 아는 연산의 작은 변주입니다.
+  MLP(`SiLU` + `Mul` + `Linear` 로 조합 — 이 연산들은 이미 있음). 각각 아는 연산의 작은 변주입니다.
 - **아키텍처 넓히기.** 분류, 분할, 자세, diffusion, 검색, 멀티모달, MoE, SSM 시스템 모두 텐서/그래프
   멘탈 모델을 재사용하되, 다른 블록과 학습 목표를 더합니다.
 - **학습 경로 확장.** autograd, 교차 엔트로피, AdamW, LoRA, PTQ/QAT가 이미 여기 있습니다(2–3부). 다음

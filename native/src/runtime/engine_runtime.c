@@ -1,17 +1,17 @@
-#include "volvoxai.h"
+#include "engine_core.h"
 #include "engine_internal.h"
 #include "backend.h"
-#include "backend_sdk.h"
 #include "w8a8_device_ops.h"
 #include "attention_mask.h"
 #include "sequence_runtime.h"
 #if VOLVOXAI_ENABLE_TRAINING
-#include "volvoxai_training.h"
+#include "training/training_core.h"
 #endif
 #include "adapter_runtime_internal.h"
 #include "cJSON.h"
 #include "fusion_ops.h"
 #include "inference_kernels.h"
+#include "generated/kernel_registry.h"
 #include "json_validation.h"
 #include "quant_cpu_opt.h"
 #include "safetensors.h"
@@ -24,6 +24,9 @@
 #endif
 #if VOLVOXAI_ENABLE_METAL
 #include "metal_engine.h"
+#endif
+#if VOLVOXAI_ENABLE_CUDA
+#include "cuda_engine.h"
 #endif
 #include "conv_f32_opt.h"
 #include "tensor_f32_opt.h"
@@ -38,12 +41,6 @@
 #ifdef _WIN32
 #include <windows.h>
 #endif
-
-static char g_removed_graph_outputs[MAXT][128];
-static int g_removed_graph_output_count;
-static T g_graph_patch_reused_old_tensors[MAXT];
-static int g_graph_patch_reused_indices[MAXT];
-static int g_graph_patch_reused_count;
 
 #if VOLVOXAI_ENABLE_NNAPI
 extern void nnapi_matmul(const float*, const float*, const float*, float*, int, int, int);
@@ -75,6 +72,7 @@ static int layout_is(const char* layout, const char* want);
 static int linear_node_weight_layout(Node* node, const T* input, const T* output,
                                      const T* weight, int* out_in);
 static int route_index_read(const T* indices, long index, int* value);
+static int physical_shape_model_validate(Node* node, T* output);
 
 /* These private fragments stay in one translation unit to preserve static
  * runtime state and the inference/full compilation boundary. */

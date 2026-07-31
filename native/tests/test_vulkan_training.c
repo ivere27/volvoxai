@@ -1,8 +1,10 @@
 #include <math.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
+#include "runtime_state.h"
 #include "vulkan_engine.h"
 
 #define CHECK(condition) do { \
@@ -15,6 +17,125 @@
 
 static int close_enough(float a, float b) {
     return fabsf(a - b) <= 1.0e-4f;
+}
+
+static int probe_equal(const VkContextStateProbe* left,
+                       const VkContextStateProbe* right) {
+    return left->slot_count == right->slot_count &&
+        left->arena_cursor == right->arena_cursor &&
+        left->dispatch_cursor == right->dispatch_cursor &&
+        left->touched_count == right->touched_count &&
+        left->is_training == right->is_training;
+}
+
+static int test_context_capsule_isolation(void) {
+    VxEngineState* first = (VxEngineState*)calloc(1, sizeof(*first));
+    VxEngineState* second = (VxEngineState*)calloc(1, sizeof(*second));
+    VkContextStateProbe first_value = {7, 1441792u, 23, 11, 1};
+    VkContextStateProbe second_value = {3, 1703936u, 5, 2, 0};
+    VkContextStateProbe observed = {0};
+    CHECK(first && second);
+    CHECK(vx_engine_state_init(first) == 0);
+    CHECK(vx_engine_state_init(second) == 0);
+
+    VxEngineStateScope first_scope = vx_engine_state_scope_enter(first);
+    CHECK(vk_test_context_state_write(&first_value) == 0);
+    CHECK(vk_test_context_state_read(&observed) == 0);
+    CHECK(probe_equal(&observed, &first_value));
+    vx_engine_state_scope_leave(first_scope);
+
+    VxEngineStateScope second_scope = vx_engine_state_scope_enter(second);
+    CHECK(vk_test_context_state_read(&observed) == -1);
+    CHECK(vk_test_context_state_write(&second_value) == 0);
+    CHECK(vk_test_context_state_read(&observed) == 0);
+    CHECK(probe_equal(&observed, &second_value));
+    vx_engine_state_scope_leave(second_scope);
+
+    first_scope = vx_engine_state_scope_enter(first);
+    CHECK(vk_test_context_state_read(&observed) == 0);
+    CHECK(probe_equal(&observed, &first_value));
+    vx_engine_state_scope_leave(first_scope);
+
+    second_scope = vx_engine_state_scope_enter(second);
+    CHECK(vk_test_context_state_read(&observed) == 0);
+    CHECK(probe_equal(&observed, &second_value));
+    vx_engine_state_scope_leave(second_scope);
+
+    vx_engine_state_deinit(second);
+    vx_engine_state_deinit(first);
+    free(second);
+    free(first);
+    return 0;
+}
+
+static int test_physical_context_isolation(VxEngineState* first) {
+    VxEngineState* second = (VxEngineState*)calloc(1, sizeof(*second));
+    VxEngineStateScope second_scope;
+    VkContextStateProbe first_after = {0};
+    VkContextStateProbe first_observed = {0};
+    VkContextStateProbe second_before = {0};
+    float first_input[2] = {2.0f, -3.0f};
+    float first_output[2] = {0.0f, 0.0f};
+    float second_input[2] = {7.0f, 11.0f};
+    float second_output[2] = {0.0f, 0.0f};
+    if (!first || !second || vx_engine_state_init(second) != 0) goto fail;
+
+    vk_graph_reset();
+    vk_graph_begin_forward();
+    if (!vk_graph_copy_f32(first_input, first_output, 2) ||
+        vk_graph_end_forward() != 0 ||
+        vk_test_context_state_read(&first_after) != 0 ||
+        vk_training_begin() != 0) goto fail;
+
+    second_scope = vx_engine_state_scope_enter(second);
+    if (vk_init() != 0 ||
+        vk_test_context_state_read(&second_before) != 0 ||
+        second_before.slot_count != 0 || second_before.dispatch_cursor != 0 ||
+        second_before.is_training != 0 ||
+        vk_training_begin() != 0) {
+        vx_engine_state_scope_leave(second_scope);
+        goto fail_first_training;
+    }
+    vk_training_end();
+    vk_graph_reset();
+    vk_graph_begin_forward();
+    if (!vk_graph_copy_f32(second_input, second_output, 2) ||
+        vk_graph_end_forward() != 0 ||
+        !vk_graph_sync_host(second_output, sizeof(second_output), 0) ||
+        !close_enough(second_output[0], second_input[0]) ||
+        !close_enough(second_output[1], second_input[1])) {
+        vk_cleanup();
+        vx_engine_state_scope_leave(second_scope);
+        goto fail_first_training;
+    }
+    vk_cleanup();
+    vx_engine_state_scope_leave(second_scope);
+
+    if (vk_test_context_state_read(&first_observed) != 0 ||
+        first_observed.slot_count != first_after.slot_count ||
+        first_observed.dispatch_cursor != first_after.dispatch_cursor ||
+        first_observed.is_training != 1 ||
+        !vk_graph_sync_host(first_output, sizeof(first_output), 0) ||
+        !close_enough(first_output[0], first_input[0]) ||
+        !close_enough(first_output[1], first_input[1])) goto fail_first_training;
+    vk_training_end();
+    vx_engine_state_deinit(second);
+    free(second);
+    return 0;
+
+fail_first_training:
+    vk_training_end();
+fail:
+    if (second) {
+        if (second->vulkan_context_state) {
+            second_scope = vx_engine_state_scope_enter(second);
+            vk_cleanup();
+            vx_engine_state_scope_leave(second_scope);
+        }
+        if (second->kernel_thread_pool) vx_engine_state_deinit(second);
+        free(second);
+    }
+    return 1;
 }
 
 static void fill_f32_matrix(float* values, size_t count, int multiplier, int modulus,
@@ -117,10 +238,54 @@ static int test_tiled_qlinear_i8u8_tails(void) {
     vk_graph_begin_forward();
     CHECK(vk_graph_qlinear_i8u8(input, weight, scales, zero_points, bias, output,
                                 ROWS, D_IN, D_OUT, 1.0f, 0, 1.0f, 0,
-                                2u, 2u, 2u) == 1);
+                                VX_DTYPE_I8, VX_DTYPE_I8,
+                                VX_DTYPE_I8) == 1);
     CHECK(vk_graph_end_forward() == 0);
     CHECK(vk_graph_sync_host(output, sizeof(output), 0) == 1);
     CHECK(memcmp(output, expected, sizeof(output)) == 0);
+    vk_graph_reset();
+    return 0;
+}
+
+static int test_tiled_qlinear_staged_rounding(void) {
+    enum { ROWS = 2, D_IN = 16, D_OUT = 32 };
+    const uint8_t input[ROWS * D_IN] = {0};
+    const int8_t weight[D_OUT * D_IN] = {0};
+    float weight_scales[D_OUT];
+    const int32_t weight_zero_points[D_OUT] = {0};
+    int32_t bias[D_OUT];
+    uint8_t output[ROWS * D_OUT] = {0};
+    const float input_scale = 0.028062894940376282f;
+    const float weight_scale = 0.0006811817875131965f;
+    const float output_scale = 0.02981325425207615f;
+    const int32_t output_zero_point = 127;
+
+    for (int column = 0; column < D_OUT; column++) {
+        weight_scales[column] = weight_scale;
+        bias[column] = -3899;
+    }
+
+    /* Force the canonical f32 schedule on the host as an independent oracle:
+       round scale multiplication, division, accumulator multiplication, and
+       zero-point addition separately. A contracted multiply-add produces the
+       adjacent value 125 for this vector. */
+    volatile float scale_product = input_scale * weight_scale;
+    volatile float multiplier = scale_product / output_scale;
+    volatile float scaled = (float)bias[0] * multiplier;
+    volatile float shifted = scaled + (float)output_zero_point;
+    CHECK(shifted == 124.5f);
+    CHECK(((int)floorf(shifted) & 1) == 0);
+
+    vk_graph_reset();
+    vk_graph_begin_forward();
+    CHECK(vk_graph_qlinear_i8u8(
+        input, weight, weight_scales, weight_zero_points, bias, output,
+        ROWS, D_IN, D_OUT, input_scale, 0, output_scale,
+        output_zero_point, VX_DTYPE_U8, VX_DTYPE_I8, VX_DTYPE_U8) == 1);
+    CHECK(vk_graph_end_forward() == 0);
+    CHECK(vk_graph_sync_host(output, sizeof(output), 0) == 1);
+    for (int index = 0; index < ROWS * D_OUT; index++)
+        CHECK(output[index] == 124u);
     vk_graph_reset();
     return 0;
 }
@@ -142,6 +307,57 @@ static float gelu_derivative_reference(float x, int approximate_tanh) {
     float t = tanhf(u);
     return 0.5f * (1.0f + t) + 0.5f * x * (1.0f - t * t) *
         0.7978845608028654f * (1.0f + 0.134145f * x2);
+}
+
+static float layernorm_expected(const float* input, const float* weight,
+                                const float* bias, int index, int d_model,
+                                float epsilon) {
+    int offset = (index / d_model) * d_model;
+    float sum = 0.0f, square_sum = 0.0f;
+    for (int i = 0; i < d_model; i++) {
+        float value = input[offset + i];
+        sum += value;
+        square_sum += value * value;
+    }
+    float mean = sum / (float)d_model;
+    float variance = square_sum / (float)d_model - mean * mean;
+    int channel = index % d_model;
+    return (input[index] - mean) / sqrtf(variance + epsilon) * weight[channel] +
+        bias[channel];
+}
+
+static int test_layernorm_epsilon(void) {
+    enum { ROWS = 2, D_MODEL = 4, ELEMENTS = ROWS * D_MODEL };
+    const float input[ELEMENTS] = {
+        -0.03f, 0.01f, 0.02f, 0.0f,
+        1.0f, 1.002f, 0.998f, 1.001f
+    };
+    const float weight[D_MODEL] = {1.0f, 0.5f, 1.5f, 0.75f};
+    const float bias[D_MODEL] = {0.1f, -0.2f, 0.3f, -0.4f};
+    const float epsilons[2] = {0.25f, 1.0e-4f};
+    float output[2][ELEMENTS] = {{0}};
+
+    for (int pass = 0; pass < 2; pass++) {
+        vk_graph_reset();
+        vk_graph_begin_forward();
+        CHECK(vk_graph_layernorm_f32(input, weight, bias, output[pass],
+                                     ROWS, D_MODEL, epsilons[pass]) == 1);
+        CHECK(vk_graph_end_forward() == 0);
+        CHECK(vk_graph_sync_host(output[pass], sizeof(output[pass]), 0) == 1);
+        for (int i = 0; i < ELEMENTS; i++) {
+            float expected = layernorm_expected(input, weight, bias, i, D_MODEL,
+                                                epsilons[pass]);
+            CHECK(isfinite(output[pass][i]));
+            CHECK(fabsf(output[pass][i] - expected) < 5.0e-4f);
+        }
+    }
+    CHECK(fabsf(output[0][0] - output[1][0]) > 0.5f);
+    CHECK(vk_graph_layernorm_f32(input, weight, bias, output[0],
+                                 ROWS, D_MODEL, 0.0f) == 0);
+    CHECK(vk_graph_layernorm_f32(input, weight, bias, output[0],
+                                 ROWS, D_MODEL, NAN) == 0);
+    vk_graph_reset();
+    return 0;
 }
 
 static uint32_t dropout_bits(uint32_t seed, uint32_t counter, uint32_t index) {
@@ -253,11 +469,13 @@ static int test_qlinear_i8u8_packed_chain(void) {
     CHECK(vk_graph_qlinear_i8u8(input, first_weight, first_scales,
                                 first_zero_points, first_bias, hidden,
                                 1u, 3u, 2u, 0.5f, 0, 0.25f, 128,
-                                2u, 2u, 3u) == 1);
+                                VX_DTYPE_I8, VX_DTYPE_I8,
+                                VX_DTYPE_U8) == 1);
     CHECK(vk_graph_qlinear_i8u8(hidden, second_weight, second_scales,
                                 second_zero_points, second_bias, output,
                                 1u, 2u, 1u, 0.25f, 128, 0.25f, -3,
-                                3u, 2u, 2u) == 1);
+                                VX_DTYPE_U8, VX_DTYPE_I8,
+                                VX_DTYPE_I8) == 1);
     CHECK(vk_graph_end_forward() == 0);
     CHECK(vk_graph_sync_host(hidden, sizeof(hidden), 0) == 1);
     CHECK(vk_graph_sync_host(output, sizeof(output), 0) == 1);
@@ -285,21 +503,24 @@ static int test_qembedding_i8u8_packed_gather(void) {
     vk_graph_reset();
     vk_graph_begin_forward();
     CHECK(vk_graph_qembedding_i8u8(ids, i8_table, scales, i8_zero_points, output_u8,
-                                   3u, 3u, 3u, 0.25f, 128, 2u, 3u) == 1);
+                                   3u, 3u, 3u, 0.25f, 128,
+                                   VX_DTYPE_I8, VX_DTYPE_U8) == 1);
     CHECK(vk_graph_end_forward() == 0);
     CHECK(vk_graph_sync_host(output_u8, sizeof(output_u8), 0) == 1);
     for (int index = 0; index < 9; index++) CHECK(output_u8[index] == expected_u8[index]);
 
     vk_graph_begin_forward();
     CHECK(vk_graph_qembedding_i8u8(ids, u8_table, scales, u8_zero_points, output_i8,
-                                   3u, 3u, 3u, 0.25f, -3, 3u, 2u) == 1);
+                                   3u, 3u, 3u, 0.25f, -3,
+                                   VX_DTYPE_U8, VX_DTYPE_I8) == 1);
     CHECK(vk_graph_end_forward() == 0);
     CHECK(vk_graph_sync_host(output_i8, sizeof(output_i8), 0) == 1);
     for (int index = 0; index < 9; index++) CHECK(output_i8[index] == expected_i8[index]);
 
     memset(output_u8, 0x5a, sizeof(output_u8));
     CHECK(vk_graph_qembedding_i8u8(invalid_ids, i8_table, scales, i8_zero_points,
-                                   output_u8, 3u, 3u, 3u, 0.25f, 128, 2u, 3u) == 0);
+                                   output_u8, 3u, 3u, 3u, 0.25f, 128,
+                                   VX_DTYPE_I8, VX_DTYPE_U8) == 0);
     for (int index = 0; index < 9; index++) CHECK(output_u8[index] == 0x5a);
     vk_graph_reset();
     return 0;
@@ -317,10 +538,11 @@ static int test_qadd_requantize_i8u8_packed_chain(void) {
     vk_graph_begin_forward();
     CHECK(vk_graph_qadd_i8u8(a, 5u, b, 5u, sum, 5u,
                               0.5f, 0, 0.25f, 128,
-                              0.5f, -2, 2u, 3u, 2u, 2u) == 1);
+                              0.5f, -2, VX_DTYPE_I8, VX_DTYPE_U8,
+                              VX_DTYPE_I8, 2u) == 1);
     CHECK(vk_graph_requantize_linear_i8u8(sum, 5u, output, 5u,
                                           0.5f, -2, 1.0f, 100,
-                                          2u, 3u) == 1);
+                                          VX_DTYPE_I8, VX_DTYPE_U8) == 1);
     CHECK(vk_graph_end_forward() == 0);
     CHECK(vk_graph_sync_host(sum, sizeof(sum), 0) == 1);
     CHECK(vk_graph_sync_host(output, sizeof(output), 0) == 1);
@@ -333,13 +555,15 @@ static int test_qadd_requantize_i8u8_packed_chain(void) {
     /* Exact-shape and relu ABI validation must fail before a dispatch. */
     CHECK(vk_graph_qadd_i8u8(a, 5u, b, 4u, sum, 5u,
                               0.5f, 0, 0.25f, 128,
-                              0.5f, -2, 2u, 3u, 2u, 2u) == 0);
+                              0.5f, -2, VX_DTYPE_I8, VX_DTYPE_U8,
+                              VX_DTYPE_I8, 2u) == 0);
     CHECK(vk_graph_qadd_i8u8(a, 5u, b, 5u, sum, 5u,
                               0.5f, 0, 0.25f, 128,
-                              0.5f, -2, 2u, 3u, 2u, 3u) == 0);
+                              0.5f, -2, VX_DTYPE_I8, VX_DTYPE_U8,
+                              VX_DTYPE_I8, 3u) == 0);
     CHECK(vk_graph_requantize_linear_i8u8(sum, 5u, output, 4u,
                                           0.5f, -2, 1.0f, 100,
-                                          2u, 3u) == 0);
+                                          VX_DTYPE_I8, VX_DTYPE_U8) == 0);
     vk_graph_reset();
     return 0;
 }
@@ -362,15 +586,20 @@ static int test_qsilu_i8u8_packed_chain(void) {
     vk_graph_reset();
     vk_graph_begin_forward();
     CHECK(vk_graph_qsilu_i8u8(input_i8, from_i8_i8, 5u,
-                               0.5f, 0, 0.25f, -3, 2u, 2u) == 1);
+                               0.5f, 0, 0.25f, -3,
+                               VX_DTYPE_I8, VX_DTYPE_I8) == 1);
     CHECK(vk_graph_qsilu_i8u8(input_i8, from_i8_u8, 5u,
-                               0.5f, 0, 0.25f, 128, 2u, 3u) == 1);
+                               0.5f, 0, 0.25f, 128,
+                               VX_DTYPE_I8, VX_DTYPE_U8) == 1);
     CHECK(vk_graph_qsilu_i8u8(input_u8, from_u8_i8, 5u,
-                               0.5f, 128, 0.25f, -3, 3u, 2u) == 1);
+                               0.5f, 128, 0.25f, -3,
+                               VX_DTYPE_U8, VX_DTYPE_I8) == 1);
     CHECK(vk_graph_qsilu_i8u8(input_u8, from_u8_u8, 5u,
-                               0.5f, 128, 0.25f, 128, 3u, 3u) == 1);
+                               0.5f, 128, 0.25f, 128,
+                               VX_DTYPE_U8, VX_DTYPE_U8) == 1);
     CHECK(vk_graph_qsilu_i8u8(from_i8_u8, chained, 5u,
-                               0.25f, 128, 0.125f, -4, 3u, 2u) == 1);
+                               0.25f, 128, 0.125f, -4,
+                               VX_DTYPE_U8, VX_DTYPE_I8) == 1);
     CHECK(vk_graph_end_forward() == 0);
     CHECK(vk_graph_sync_host(from_i8_i8, sizeof(from_i8_i8), 0) == 1);
     CHECK(vk_graph_sync_host(from_i8_u8, sizeof(from_i8_u8), 0) == 1);
@@ -386,9 +615,11 @@ static int test_qsilu_i8u8_packed_chain(void) {
         CHECK(memcmp(chained, expected_chained, sizeof(expected_chained)) == 0);
     }
     CHECK(vk_graph_qsilu_i8u8(input_i8, from_i8_i8, 0u,
-                               0.5f, 0, 0.25f, -3, 2u, 2u) == 0);
+                               0.5f, 0, 0.25f, -3,
+                               VX_DTYPE_I8, VX_DTYPE_I8) == 0);
     CHECK(vk_graph_qsilu_i8u8(alias, alias, 5u,
-                               0.5f, 0, 0.25f, -3, 2u, 2u) == 0);
+                               0.5f, 0, 0.25f, -3,
+                               VX_DTYPE_I8, VX_DTYPE_I8) == 0);
     vk_graph_reset();
     return 0;
 }
@@ -411,15 +642,20 @@ static int test_qgelu_i8u8_packed_chain(void) {
     vk_graph_reset();
     vk_graph_begin_forward();
     CHECK(vk_graph_qgelu_i8u8(input_i8, from_i8_i8, 5u,
-                               0.5f, 0, 0.125f, -3, 2u, 2u) == 1);
+                               0.5f, 0, 0.125f, -3,
+                               VX_DTYPE_I8, VX_DTYPE_I8) == 1);
     CHECK(vk_graph_qgelu_i8u8(input_i8, from_i8_u8, 5u,
-                               0.5f, 0, 0.125f, 128, 2u, 3u) == 1);
+                               0.5f, 0, 0.125f, 128,
+                               VX_DTYPE_I8, VX_DTYPE_U8) == 1);
     CHECK(vk_graph_qgelu_i8u8(input_u8, from_u8_i8, 5u,
-                               0.5f, 128, 0.125f, -3, 3u, 2u) == 1);
+                               0.5f, 128, 0.125f, -3,
+                               VX_DTYPE_U8, VX_DTYPE_I8) == 1);
     CHECK(vk_graph_qgelu_i8u8(input_u8, from_u8_u8, 5u,
-                               0.5f, 128, 0.125f, 128, 3u, 3u) == 1);
+                               0.5f, 128, 0.125f, 128,
+                               VX_DTYPE_U8, VX_DTYPE_U8) == 1);
     CHECK(vk_graph_qgelu_i8u8(from_i8_u8, chained, 5u,
-                               0.125f, 128, 0.125f, -4, 3u, 2u) == 1);
+                               0.125f, 128, 0.125f, -4,
+                               VX_DTYPE_U8, VX_DTYPE_I8) == 1);
     CHECK(vk_graph_end_forward() == 0);
     CHECK(vk_graph_sync_host(from_i8_i8, sizeof(from_i8_i8), 0) == 1);
     CHECK(vk_graph_sync_host(from_i8_u8, sizeof(from_i8_u8), 0) == 1);
@@ -435,9 +671,11 @@ static int test_qgelu_i8u8_packed_chain(void) {
         CHECK(memcmp(chained, expected_chained, sizeof(expected_chained)) == 0);
     }
     CHECK(vk_graph_qgelu_i8u8(input_i8, from_i8_i8, 0u,
-                               0.5f, 0, 0.125f, -3, 2u, 2u) == 0);
+                               0.5f, 0, 0.125f, -3,
+                               VX_DTYPE_I8, VX_DTYPE_I8) == 0);
     CHECK(vk_graph_qgelu_i8u8(alias, alias, 5u,
-                               0.5f, 0, 0.125f, -3, 2u, 2u) == 0);
+                               0.5f, 0, 0.125f, -3,
+                               VX_DTYPE_I8, VX_DTYPE_I8) == 0);
     vk_graph_reset();
     return 0;
 }
@@ -479,26 +717,33 @@ static int test_qgroupnorm_i8u8_packed_chain(void) {
     vk_graph_begin_forward();
     CHECK(vk_graph_qgroupnorm_i8u8(input_i8, gamma, beta, from_i8_i8,
                                     1u, 1u, 1u, 3u, 1u, 0.5f, -1,
-                                    0.125f, -3, 1.0e-5f, 2u, 2u) == 1);
+                                    0.125f, -3, 1.0e-5f,
+                                    VX_DTYPE_I8, VX_DTYPE_I8) == 1);
     CHECK(vk_graph_qgroupnorm_i8u8(input_i8, gamma, beta, from_i8_u8,
                                     1u, 1u, 1u, 3u, 1u, 0.5f, -1,
-                                    0.125f, 128, 1.0e-5f, 2u, 3u) == 1);
+                                    0.125f, 128, 1.0e-5f,
+                                    VX_DTYPE_I8, VX_DTYPE_U8) == 1);
     CHECK(vk_graph_qgroupnorm_i8u8(input_u8, gamma, beta, from_u8_i8,
                                     1u, 1u, 1u, 3u, 1u, 0.5f, 127,
-                                    0.125f, -3, 1.0e-5f, 3u, 2u) == 1);
+                                    0.125f, -3, 1.0e-5f,
+                                    VX_DTYPE_U8, VX_DTYPE_I8) == 1);
     CHECK(vk_graph_qgroupnorm_i8u8(input_u8, gamma, beta, from_u8_u8,
                                     1u, 1u, 1u, 3u, 1u, 0.5f, 127,
-                                    0.125f, 128, 1.0e-5f, 3u, 3u) == 1);
+                                    0.125f, 128, 1.0e-5f,
+                                    VX_DTYPE_U8, VX_DTYPE_U8) == 1);
     /* The second pass consumes packed U8 output without a host sync. */
     CHECK(vk_graph_qgroupnorm_i8u8(from_i8_u8, zero_gamma, beta, chained,
                                     1u, 1u, 1u, 3u, 1u, 0.125f, 128,
-                                    0.125f, -4, 1.0e-5f, 3u, 2u) == 1);
+                                    0.125f, -4, 1.0e-5f,
+                                    VX_DTYPE_U8, VX_DTYPE_I8) == 1);
     CHECK(vk_graph_qgroupnorm_i8u8(boundary_input, boundary_gamma, boundary_beta,
                                     boundary_output, 3u, 1u, 1u, 6u, 2u,
-                                    0.25f, -1, 0.125f, -3, 1.0e-5f, 2u, 2u) == 1);
+                                    0.25f, -1, 0.125f, -3, 1.0e-5f,
+                                    VX_DTYPE_I8, VX_DTYPE_I8) == 1);
     CHECK(vk_graph_qgroupnorm_i8u8(high_input, high_gamma, high_beta, high_output,
                                     3u, 57u, 1u, 6u, 2u, 0.5f, 17,
-                                    0.25f, 128, 1.0e-5f, 3u, 3u) == 1);
+                                    0.25f, 128, 1.0e-5f,
+                                    VX_DTYPE_U8, VX_DTYPE_U8) == 1);
     CHECK(vk_graph_end_forward() == 0);
     CHECK(vk_graph_sync_host(from_i8_i8, sizeof(from_i8_i8), 0) == 1);
     CHECK(vk_graph_sync_host(from_i8_u8, sizeof(from_i8_u8), 0) == 1);
@@ -522,10 +767,12 @@ static int test_qgroupnorm_i8u8_packed_chain(void) {
     }
     CHECK(vk_graph_qgroupnorm_i8u8(input_i8, gamma, beta, from_i8_i8,
                                     1u, 1u, 1u, 3u, 0u, 0.5f, -1,
-                                    0.125f, -3, 1.0e-5f, 2u, 2u) == 0);
+                                    0.125f, -3, 1.0e-5f,
+                                    VX_DTYPE_I8, VX_DTYPE_I8) == 0);
     CHECK(vk_graph_qgroupnorm_i8u8(alias, gamma, beta, alias,
                                     1u, 1u, 1u, 3u, 1u, 0.5f, -1,
-                                    0.125f, -3, 1.0e-5f, 2u, 2u) == 0);
+                                    0.125f, -3, 1.0e-5f,
+                                    VX_DTYPE_I8, VX_DTYPE_I8) == 0);
     vk_graph_reset();
     return 0;
 }
@@ -562,22 +809,22 @@ static int test_qlayernorm_i8u8_packed_chain(void) {
     vk_graph_begin_forward();
     CHECK(vk_graph_qlayernorm_i8u8(input_i8, gamma, beta, from_i8_i8,
                                     2u, 3u, 0.5f, -1, 0.125f, -3,
-                                    1.0e-5f, 2u, 2u) == 1);
+                                    1.0e-5f, VX_DTYPE_I8, VX_DTYPE_I8) == 1);
     CHECK(vk_graph_qlayernorm_i8u8(input_i8, gamma, beta, from_i8_u8,
                                     2u, 3u, 0.5f, -1, 0.125f, 128,
-                                    1.0e-5f, 2u, 3u) == 1);
+                                    1.0e-5f, VX_DTYPE_I8, VX_DTYPE_U8) == 1);
     CHECK(vk_graph_qlayernorm_i8u8(input_u8, gamma, beta, from_u8_i8,
                                     2u, 3u, 0.5f, 127, 0.125f, -3,
-                                    1.0e-5f, 3u, 2u) == 1);
+                                    1.0e-5f, VX_DTYPE_U8, VX_DTYPE_I8) == 1);
     CHECK(vk_graph_qlayernorm_i8u8(input_u8, gamma, beta, from_u8_u8,
                                     2u, 3u, 0.5f, 127, 0.125f, 128,
-                                    1.0e-5f, 3u, 3u) == 1);
+                                    1.0e-5f, VX_DTYPE_U8, VX_DTYPE_U8) == 1);
     CHECK(vk_graph_qlayernorm_i8u8(from_i8_u8, zero_gamma, beta, chained,
                                     2u, 3u, 0.125f, 128, 0.125f, -4,
-                                    1.0e-5f, 3u, 2u) == 1);
+                                    1.0e-5f, VX_DTYPE_U8, VX_DTYPE_I8) == 1);
     CHECK(vk_graph_qlayernorm_i8u8(high_input, high_gamma, high_beta, high_output,
                                     2u, high_d_model, 0.5f, 17, 0.25f, 128,
-                                    1.0e-5f, 3u, 3u) == 1);
+                                    1.0e-5f, VX_DTYPE_U8, VX_DTYPE_U8) == 1);
     CHECK(vk_graph_end_forward() == 0);
     CHECK(vk_graph_sync_host(from_i8_i8, sizeof(from_i8_i8), 0) == 1);
     CHECK(vk_graph_sync_host(from_i8_u8, sizeof(from_i8_u8), 0) == 1);
@@ -597,10 +844,10 @@ static int test_qlayernorm_i8u8_packed_chain(void) {
         CHECK(high_output[index] == (uint8_t)(index & 1 ? 132 : 124));
     CHECK(vk_graph_qlayernorm_i8u8(input_i8, gamma, beta, from_i8_i8,
                                     2u, 0u, 0.5f, -1, 0.125f, -3,
-                                    1.0e-5f, 2u, 2u) == 0);
+                                    1.0e-5f, VX_DTYPE_I8, VX_DTYPE_I8) == 0);
     CHECK(vk_graph_qlayernorm_i8u8(alias, gamma, beta, alias,
                                     2u, 3u, 0.5f, -1, 0.125f, -3,
-                                    1.0e-5f, 2u, 2u) == 0);
+                                    1.0e-5f, VX_DTYPE_I8, VX_DTYPE_I8) == 0);
     vk_graph_reset();
     return 0;
 }
@@ -637,17 +884,24 @@ static int test_qsdpa_i8u8_packed_chain(void) {
     vk_graph_begin_forward();
     CHECK(vk_graph_qsdpa_i8u8(q_i8, k_i8, v_i8, NULL, first, 1u, 2u, 2u,
                                4u, 1u, 0.25f, -1, 0.25f, -1, 0.25f, -1,
-                               0.25f, 128, 0.5f, 2u, 2u, 2u, 3u, 0u, 0u) == 1);
+                               0.25f, 128, 0.5f,
+                               VX_DTYPE_I8, VX_DTYPE_I8, VX_DTYPE_I8,
+                               VX_DTYPE_U8, 0u, 0u) == 1);
     CHECK(vk_graph_qsdpa_i8u8(first, k_i8, v_i8, NULL, second, 1u, 2u, 2u,
                                4u, 1u, 0.25f, 128, 0.25f, -1, 0.25f, -1,
-                               0.25f, 0, 0.5f, 3u, 2u, 2u, 2u, 0u, 0u) == 1);
+                               0.25f, 0, 0.5f,
+                               VX_DTYPE_U8, VX_DTYPE_I8, VX_DTYPE_I8,
+                               VX_DTYPE_I8, 0u, 0u) == 1);
     CHECK(vk_graph_qsdpa_i8u8(q_u8, k_u8, v_u8, mask_none, all_masked, 1u,
                                1u, 2u, 4u, 1u, 0.25f, 128, 0.5f, 120,
-                               0.25f, 130, 0.25f, 127, 0.5f, 3u, 3u, 3u,
-                               3u, 0u, 1u) == 1);
+                               0.25f, 130, 0.25f, 127, 0.5f,
+                               VX_DTYPE_U8, VX_DTYPE_U8, VX_DTYPE_U8,
+                               VX_DTYPE_U8, 0u, 1u) == 1);
     CHECK(vk_graph_qsdpa_i8u8(q64, k64, v64, NULL, out64, 1u, 1u, 1u,
                                head_dim, 1u, 0.25f, 0, 0.25f, 0, 0.25f, 0,
-                               0.25f, 0, 1.0f, 2u, 2u, 2u, 2u, 0u, 0u) == 1);
+                               0.25f, 0, 1.0f,
+                               VX_DTYPE_I8, VX_DTYPE_I8, VX_DTYPE_I8,
+                               VX_DTYPE_I8, 0u, 0u) == 1);
     CHECK(vk_graph_end_forward() == 0);
     CHECK(vk_graph_sync_host(first, sizeof(first), 0) == 1);
     CHECK(vk_graph_sync_host(second, sizeof(second), 0) == 1);
@@ -659,7 +913,9 @@ static int test_qsdpa_i8u8_packed_chain(void) {
     CHECK(memcmp(out64, v64, sizeof(out64)) == 0);
     CHECK(vk_graph_qsdpa_i8u8(alias, k_i8, v_i8, NULL, alias, 1u, 2u, 2u,
                                4u, 1u, 0.25f, -1, 0.25f, -1, 0.25f, -1,
-                               0.25f, 0, 0.5f, 2u, 2u, 2u, 2u, 0u, 0u) == 0);
+                               0.25f, 0, 0.5f,
+                               VX_DTYPE_I8, VX_DTYPE_I8, VX_DTYPE_I8,
+                               VX_DTYPE_I8, 0u, 0u) == 0);
     CHECK(memcmp(alias, alias_before, sizeof(alias)) == 0);
     vk_graph_reset();
     return 0;
@@ -691,16 +947,20 @@ static int test_qargmax_i8u8_raw(void) {
     memcpy(alias_before, alias.bytes, sizeof(alias_before));
     vk_graph_reset();
     vk_graph_begin_forward();
-    CHECK(vk_graph_qargmax_i8u8(input_i8, output_i8, 2u, 3u, 2u, 2u) == 1);
-    CHECK(vk_graph_qargmax_i8u8(input_u8, output_u8, 1u, 3u, 2u, 3u) == 1);
+    CHECK(vk_graph_qargmax_i8u8(input_i8, output_i8, 2u, 3u, 2u,
+                                VX_DTYPE_I8) == 1);
+    CHECK(vk_graph_qargmax_i8u8(input_u8, output_u8, 1u, 3u, 2u,
+                                VX_DTYPE_U8) == 1);
     CHECK(vk_graph_end_forward() == 0);
     CHECK(vk_graph_sync_host(output_i8, sizeof(output_i8), 0) == 1);
     CHECK(vk_graph_sync_host(output_u8, sizeof(output_u8), 0) == 1);
     CHECK(memcmp(output_i8, expected_i8, sizeof(output_i8)) == 0);
     CHECK(memcmp(output_u8, expected_u8, sizeof(output_u8)) == 0);
-    CHECK(vk_graph_qargmax_i8u8(alias.bytes, alias.i32, 1u, 3u, 2u, 2u) == 0);
+    CHECK(vk_graph_qargmax_i8u8(alias.bytes, alias.i32, 1u, 3u, 2u,
+                                VX_DTYPE_I8) == 0);
     CHECK(memcmp(alias.bytes, alias_before, sizeof(alias.bytes)) == 0);
-    CHECK(vk_graph_qargmax_i8u8(input_i8, sentinel, 1u, 0u, 2u, 2u) == 0);
+    CHECK(vk_graph_qargmax_i8u8(input_i8, sentinel, 1u, 0u, 2u,
+                                VX_DTYPE_I8) == 0);
     CHECK(memcmp(sentinel, sentinel_before, sizeof(sentinel)) == 0);
     vk_graph_reset();
     return 0;
@@ -751,13 +1011,13 @@ static int test_qmaskedmean_i8u8_packed(void) {
     vk_graph_begin_forward();
     CHECK(vk_graph_qmaskedmean_i8u8(input_i8, mask_i8, output_i8,
                                      2u, 3u, 4u, 0.25f, -3, 0.5f, 5,
-                                     2u, 2u) == 1);
+                                     VX_DTYPE_I8, VX_DTYPE_I8) == 1);
     CHECK(vk_graph_qmaskedmean_i8u8(input_u8, mask_u8, output_u8,
                                      1u, 3u, 2u, 0.25f, 128, 0.25f, 130,
-                                     3u, 3u) == 1);
+                                     VX_DTYPE_U8, VX_DTYPE_U8) == 1);
     CHECK(vk_graph_qmaskedmean_i8u8(staged_input, staged_mask, &staged_output,
                                      1u, 127u, 1u, 0.001f, 127, 0.01f, -37,
-                                     2u, 2u) == 1);
+                                     VX_DTYPE_I8, VX_DTYPE_I8) == 1);
     CHECK(vk_graph_end_forward() == 0);
     CHECK(vk_graph_sync_host(output_i8, sizeof(output_i8), 0) == 1);
     CHECK(vk_graph_sync_host(output_u8, sizeof(output_u8), 0) == 1);
@@ -767,11 +1027,11 @@ static int test_qmaskedmean_i8u8_packed(void) {
     CHECK(staged_output == -62);
     CHECK(vk_graph_qmaskedmean_i8u8(alias.input, mask_i8, alias.bytes,
                                      2u, 3u, 4u, 0.25f, -3, 0.5f, 5,
-                                     2u, 2u) == 0);
+                                     VX_DTYPE_I8, VX_DTYPE_I8) == 0);
     CHECK(memcmp(alias.bytes, alias_before, sizeof(alias.bytes)) == 0);
     CHECK(vk_graph_qmaskedmean_i8u8(input_i8, mask_alias.mask, mask_alias.bytes,
                                      2u, 3u, 4u, 0.25f, -3, 0.5f, 5,
-                                     2u, 2u) == 0);
+                                     VX_DTYPE_I8, VX_DTYPE_I8) == 0);
     CHECK(memcmp(mask_alias.bytes, mask_before, sizeof(mask_alias.bytes)) == 0);
     vk_graph_reset();
     return 0;
@@ -809,10 +1069,13 @@ static int test_qconv2d_i8u8_packed_chain(void) {
     CHECK(vk_graph_qconv2d_i8u8(input, weight, scales, zero_points, NULL, hidden,
                                  1u, 3u, 4u, 3u, 3u, 3u, 3u, 2u, 2u, 1u,
                                  1u, 2u, 2u, 1u, 1u, 1u, 1u, 1u, 3u, 2u,
-                                 1.0f, 0, 1.0f, 0, 3u, 2u, 3u) == 1);
+                                 1.0f, 0, 1.0f, 0,
+                                 VX_DTYPE_U8, VX_DTYPE_I8,
+                                 VX_DTYPE_U8) == 1);
     /* `hidden` is deliberately not synced before this byte-domain bridge. */
     CHECK(vk_graph_requantize_linear_i8u8(hidden, 27u, output, 27u,
-                                          1.0f, 0, 0.5f, -2, 3u, 2u) == 1);
+                                          1.0f, 0, 0.5f, -2,
+                                          VX_DTYPE_U8, VX_DTYPE_I8) == 1);
     CHECK(vk_graph_end_forward() == 0);
     CHECK(vk_graph_sync_host(hidden, sizeof(hidden), 0) == 1);
     CHECK(vk_graph_sync_host(output, sizeof(output), 0) == 1);
@@ -834,14 +1097,18 @@ static int test_qconv2d_i8u8_packed_chain(void) {
                                  bias_zero_point, bias, bias_output,
                                  1u, 1u, 1u, 1u, 1u, 1u, 1u, 1u, 1u, 1u,
                                  1u, 1u, 1u, 1u, 0u, 0u, 0u, 0u, 1u, 1u,
-                                 0.5f, 0, 0.25f, -3, 2u, 2u, 2u) == 1);
+                                 0.5f, 0, 0.25f, -3,
+                                 VX_DTYPE_I8, VX_DTYPE_I8,
+                                 VX_DTYPE_I8) == 1);
     CHECK(vk_graph_end_forward() == 0);
     CHECK(vk_graph_sync_host(bias_output, sizeof(bias_output), 0) == 1);
     CHECK(bias_output[0] == -3);
     CHECK(vk_graph_qconv2d_i8u8(input, weight, scales, zero_points, NULL, hidden,
                                  1u, 3u, 4u, 3u, 2u, 3u, 3u, 2u, 2u, 1u,
                                  1u, 2u, 2u, 1u, 1u, 1u, 1u, 1u, 3u, 2u,
-                                 1.0f, 0, 1.0f, 0, 3u, 2u, 3u) == 0);
+                                 1.0f, 0, 1.0f, 0,
+                                 VX_DTYPE_U8, VX_DTYPE_I8,
+                                 VX_DTYPE_U8) == 0);
     vk_graph_reset();
     return 0;
 }
@@ -864,7 +1131,7 @@ static int test_typed_i8u8_shape_qdq_chain(void) {
     const uint32_t input_axes[2] = {1u, 1u};
     const float input_scales[2] = {1.0f, 1.0f};
     const int32_t input_zero_points[2] = {0, 0};
-    const uint32_t input_dtypes[2] = {2u, 2u};
+    const uint32_t input_dtypes[2] = {VX_DTYPE_I8, VX_DTYPE_I8};
     const int8_t expected[18] = {
         4, 6, 4, 6, 4, 5,
         4, 6, 4, 6, 4, 5,
@@ -874,24 +1141,28 @@ static int test_typed_i8u8_shape_qdq_chain(void) {
     vk_graph_reset();
     vk_graph_begin_forward();
     CHECK(vk_graph_quantize_typed_f32_i8u8(source_a, 4u, quantized_a,
-                                            1.0f, 0, 2u) == 1);
+                                            1.0f, 0, VX_DTYPE_I8) == 1);
     CHECK(vk_graph_copy_i8u8(quantized_a, 4u, copied_a, 4u,
-                             1.0f, 0, 1.0f, 0, 2u, 2u) == 1);
+                             1.0f, 0, 1.0f, 0,
+                             VX_DTYPE_I8, VX_DTYPE_I8) == 1);
     CHECK(vk_graph_quantize_typed_f32_i8u8(source_b, 4u, quantized_b,
-                                            1.0f, 0, 2u) == 1);
+                                            1.0f, 0, VX_DTYPE_I8) == 1);
     CHECK(vk_graph_concat_i8u8(inputs, input_elements, input_axes,
                                input_scales, input_zero_points, input_dtypes,
                                2u, concatenated, 8u, 2u, 1u,
-                               1.0f, 0, 2u) == 1);
+                               1.0f, 0, VX_DTYPE_I8) == 1);
     CHECK(vk_graph_maxpool2d_i8u8(concatenated, pooled,
                                   1u, 2u, 2u, 2u, 2u, 2u,
                                   2u, 2u, 1u, 1u, 0u, 0u, 1u, 1u,
-                                  1.0f, 0, 1.0f, 0, 2u, 2u) == 1);
+                                  1.0f, 0, 1.0f, 0,
+                                  VX_DTYPE_I8, VX_DTYPE_I8) == 1);
     CHECK(vk_graph_resize_nearest_i8u8(pooled, resized,
                                        1u, 2u, 2u, 2u, 3u, 3u,
-                                       1.0f, 0, 1.0f, 0, 2u, 2u) == 1);
+                                       1.0f, 0, 1.0f, 0,
+                                       VX_DTYPE_I8, VX_DTYPE_I8) == 1);
     CHECK(vk_graph_dequantize_typed_i8u8_f32(resized, 18u,
-                                              1.0f, 0, 2u, output) == 1);
+                                              1.0f, 0, VX_DTYPE_I8,
+                                              output) == 1);
     CHECK(vk_graph_end_forward() == 0);
     CHECK(vk_graph_sync_host(output, sizeof(output), 0) == 1);
     for (int index = 0; index < 18; index++) {
@@ -905,9 +1176,11 @@ static int test_typed_i8u8_shape_qdq_chain(void) {
     vk_graph_reset();
     vk_graph_begin_forward();
     CHECK(vk_graph_quantize_typed_f32_i8u8(unsigned_source, 3u,
-                                            unsigned_quantized, 1.0f, 128, 3u) == 1);
+                                            unsigned_quantized, 1.0f, 128,
+                                            VX_DTYPE_U8) == 1);
     CHECK(vk_graph_dequantize_typed_i8u8_f32(unsigned_quantized, 3u,
-                                              1.0f, 128, 3u, unsigned_output) == 1);
+                                              1.0f, 128, VX_DTYPE_U8,
+                                              unsigned_output) == 1);
     CHECK(vk_graph_end_forward() == 0);
     CHECK(vk_graph_sync_host(unsigned_quantized, sizeof(unsigned_quantized), 0) == 1);
     CHECK(vk_graph_sync_host(unsigned_output, sizeof(unsigned_output), 0) == 1);
@@ -919,7 +1192,8 @@ static int test_typed_i8u8_shape_qdq_chain(void) {
 
     /* The byte-preserving shape path cannot silently change quantization. */
     CHECK(vk_graph_copy_i8u8(quantized_a, 4u, copied_a, 4u,
-                             1.0f, 0, 0.5f, 0, 2u, 2u) == 0);
+                             1.0f, 0, 0.5f, 0,
+                             VX_DTYPE_I8, VX_DTYPE_I8) == 0);
     vk_graph_reset();
     return 0;
 }
@@ -1132,6 +1406,28 @@ static int test_batched_attention_forward(void) {
     for (int i = 0; i < 6; i++) {
         CHECK(close_enough(concat_output[i], 1.0f / (1.0f + expf(-expected_concat[i]))));
     }
+    return 0;
+}
+
+static int test_general_gather_i32(void) {
+    const float input[12] = {
+        1, 2, 3, 4, 5, 6,
+        7, 8, 9, 10, 11, 12,
+    };
+    const int32_t indices[5] = {2, 0, -1, -4, 3};
+    const float expected[20] = {
+        5, 6, 1, 2, 5, 6, -1, -1, -1, -1,
+        11, 12, 7, 8, 11, 12, -1, -1, -1, -1,
+    };
+    float output[20] = {0};
+    vk_graph_begin_forward();
+    CHECK(vk_graph_gather_i32_f32(input, indices, output,
+                                  2, 3, 2, 5, 20) == 1);
+    CHECK(vk_graph_end_forward() == 0);
+    CHECK(vk_graph_sync_host(output, sizeof(output), 0) == 1);
+    for (int index = 0; index < 20; index++)
+        CHECK(close_enough(output[index], expected[index]));
+    vk_graph_reset();
     return 0;
 }
 
@@ -1540,12 +1836,219 @@ static int test_groupnorm_dropout_reduce_broadcast_forward(void) {
     return 0;
 }
 
+static int test_typed_control_graph_ops(void) {
+    const int32_t compare_a[2] = {1, 4};
+    const int32_t compare_b[3] = {1, 3, 4};
+    const uint32_t output_strides[2] = {3u, 1u};
+    const uint32_t a_strides[2] = {1u, 0u};
+    const uint32_t b_strides[2] = {0u, 1u};
+    const int32_t expected_equal[6] = {1, 0, 0, 0, 0, 1};
+    const int32_t expected_ge[6] = {1, 0, 0, 1, 1, 1};
+    const int32_t expected_not[6] = {0, 1, 1, 1, 1, 0};
+    int32_t equal_output[6] = {0};
+    int32_t ge_output[6] = {0};
+    int32_t not_output[6] = {0};
+    const int32_t clip_input[4] = {-4, 0, 3, 9};
+    const int32_t expected_clip[4] = {0, 0, 3, 7};
+    int32_t clip_output[4] = {0};
+    const int32_t cast_i32[4] = {-2, 0, 7, 10};
+    const float expected_cast_f32[4] = {-2.0f, 0.0f, 7.0f, 10.0f};
+    float cast_f32[4] = {0};
+    const float cast_float_input[13] = {
+        -2.9f, 0.0f, 7.75f,
+        2147483648.0f, 2147483904.0f,
+        4294967296.0f, 4294967808.0f, 6442450944.0f,
+        -2147483904.0f, -4294967808.0f,
+        NAN, INFINITY, -INFINITY,
+    };
+    const int32_t expected_cast_i32[13] = {
+        -2, 0, 7,
+        INT32_MIN, INT32_MIN + 256,
+        0, 512, INT32_MIN,
+        INT32_MAX - 255, -512,
+        0, 0, 0,
+    };
+    int32_t cast_i32_output[13] = {0};
+    const uint32_t copy_input[4] = {
+        0x7fc01234u, 0x80000000u, 0xffffffffu, 0x12345678u,
+    };
+    uint32_t copy_output[4] = {0};
+    const int32_t where_condition[4] = {0, 1, -1, 0};
+    const uint32_t where_a[4] = {
+        0x7fc01234u, 0x80000000u, 0x11111111u, 0x22222222u,
+    };
+    const uint32_t where_b[4] = {
+        0x33333333u, 0x44444444u, 0xffffffffu, 0x7fa00001u,
+    };
+    const uint32_t expected_where[4] = {
+        0x33333333u, 0x80000000u, 0x11111111u, 0x7fa00001u,
+    };
+    uint32_t where_output[4] = {0};
+    const float argmax_input[12] = {
+        1.0f, 5.0f, 3.0f, 5.0f, 3.0f, 4.0f,
+        -1.0f, -2.0f, -1.0f, 7.0f, -3.0f, 7.0f,
+    };
+    const int32_t expected_argmax[4] = {1, 0, 0, 1};
+    int32_t argmax_output[4] = {0};
+    const uint32_t concat_a[4] = {
+        0x7fc00011u, 0x80000000u, 0x11111111u, 0x22222222u,
+    };
+    const uint32_t concat_b[2] = {0xffffffffu, 0x33333333u};
+    const void* concat_inputs[2] = {concat_a, concat_b};
+    const long concat_sizes[2] = {4, 2};
+    const int concat_axes[2] = {2, 1};
+    const uint32_t expected_concat[6] = {
+        0x7fc00011u, 0x80000000u, 0x11111111u,
+        0x22222222u, 0xffffffffu, 0x33333333u,
+    };
+    uint32_t concat_output[6] = {0};
+
+    vk_graph_reset();
+    vk_graph_begin_forward();
+    CHECK(vk_graph_compare_i32(
+        compare_a, 2, compare_b, 3, equal_output, 6,
+        output_strides, a_strides, b_strides, 2, 0) == 1);
+    CHECK(vk_graph_compare_i32(
+        compare_a, 2, compare_b, 3, ge_output, 6,
+        output_strides, a_strides, b_strides, 2, 1) == 1);
+    CHECK(vk_graph_not_i32(equal_output, not_output, 6) == 1);
+    CHECK(vk_graph_clip_i32(
+        clip_input, clip_output, 4, 0, 7) == 1);
+    CHECK(vk_graph_cast_typed(
+        cast_i32, VX_DTYPE_I32, cast_f32, VX_DTYPE_F32, 4) == 1);
+    CHECK(vk_graph_cast_typed(
+        cast_float_input, VX_DTYPE_F32,
+        cast_i32_output, VX_DTYPE_I32, 13) == 1);
+    CHECK(vk_graph_copy_32(copy_input, copy_output, 4) == 1);
+    CHECK(vk_graph_where_32(
+        where_condition, where_a, where_b, where_output, 4) == 1);
+    CHECK(vk_graph_argmax_f32(
+        argmax_input, argmax_output, 2u, 3u, 2u) == 1);
+    CHECK(vk_graph_concat_32(
+        concat_inputs, concat_sizes, concat_axes, 2,
+        concat_output, 3, 2) == 1);
+    CHECK(vk_graph_end_forward() == 0);
+
+    CHECK(vk_graph_sync_host(
+        equal_output, sizeof(equal_output), 0) == 1);
+    CHECK(vk_graph_sync_host(ge_output, sizeof(ge_output), 0) == 1);
+    CHECK(vk_graph_sync_host(not_output, sizeof(not_output), 0) == 1);
+    CHECK(vk_graph_sync_host(clip_output, sizeof(clip_output), 0) == 1);
+    CHECK(vk_graph_sync_host(cast_f32, sizeof(cast_f32), 0) == 1);
+    CHECK(vk_graph_sync_host(
+        cast_i32_output, sizeof(cast_i32_output), 0) == 1);
+    CHECK(vk_graph_sync_host(copy_output, sizeof(copy_output), 0) == 1);
+    CHECK(vk_graph_sync_host(where_output, sizeof(where_output), 0) == 1);
+    CHECK(vk_graph_sync_host(
+        argmax_output, sizeof(argmax_output), 0) == 1);
+    CHECK(vk_graph_sync_host(
+        concat_output, sizeof(concat_output), 0) == 1);
+    CHECK(memcmp(equal_output, expected_equal, sizeof(equal_output)) == 0);
+    CHECK(memcmp(ge_output, expected_ge, sizeof(ge_output)) == 0);
+    CHECK(memcmp(not_output, expected_not, sizeof(not_output)) == 0);
+    CHECK(memcmp(clip_output, expected_clip, sizeof(clip_output)) == 0);
+    CHECK(memcmp(cast_f32, expected_cast_f32, sizeof(cast_f32)) == 0);
+    CHECK(memcmp(
+        cast_i32_output, expected_cast_i32,
+        sizeof(cast_i32_output)) == 0);
+    CHECK(memcmp(copy_output, copy_input, sizeof(copy_output)) == 0);
+    CHECK(memcmp(where_output, expected_where, sizeof(where_output)) == 0);
+    CHECK(memcmp(
+        argmax_output, expected_argmax, sizeof(argmax_output)) == 0);
+    CHECK(memcmp(
+        concat_output, expected_concat, sizeof(concat_output)) == 0);
+
+    CHECK(vk_graph_not_i32(equal_output, equal_output, 6) == 0);
+    CHECK(vk_graph_clip_i32(
+        clip_input, clip_output, 4, 8, 7) == 0);
+    CHECK(vk_graph_cast_typed(
+        cast_i32, VX_DTYPE_I32,
+        cast_i32_output, VX_DTYPE_U8, 4) == 0);
+    CHECK(vk_graph_argmax_f32(
+        argmax_input, argmax_output, 2u, 0u, 2u) == 0);
+    vk_graph_reset();
+    return 0;
+}
+
+static int test_expand_f32_uniform_abi(void) {
+    union {
+        uint32_t bits[4];
+        float values[4];
+    } input = {
+        .bits = {0xff800000u, 0x7fc12345u, 0x80000000u, 0x3f800000u},
+    };
+    union {
+        uint32_t bits[48];
+        float values[48];
+    } output;
+    const int input_shape[5] = {1, 2, 1, 1, 2};
+    const int output_shape[6] = {3, 1, 2, 1, 4, 2};
+    const int incompatible_output_shape[6] = {3, 1, 3, 1, 4, 2};
+    const int smaller_output_shape[4] = {1, 2, 1, 2};
+    const int invalid_input_shape[5] = {1, 2, 0, 1, 2};
+    const int scalar_shape[1] = {1};
+    const int overflow_shape[2] = {INT32_MAX, 2};
+    float overlap_storage[49] = {0};
+    uint32_t expected[48];
+    size_t index = 0;
+
+    for (size_t leading = 0; leading < 3; leading++) {
+        for (size_t row = 0; row < 2; row++) {
+            for (size_t broadcast = 0; broadcast < 4; broadcast++) {
+                for (size_t lane = 0; lane < 2; lane++) {
+                    expected[index++] = input.bits[row * 2 + lane];
+                }
+            }
+        }
+    }
+    for (index = 0; index < 48; index++) output.bits[index] = 0xdeadbeefu;
+
+    vk_graph_reset();
+    vk_graph_begin_forward();
+    CHECK(vk_graph_expand_f32(
+        input.values, output.values, input_shape, 5, output_shape, 6) == 1);
+    CHECK(vk_graph_end_forward() == 0);
+    CHECK(vk_graph_sync_host(output.values, sizeof(output.values), 0) == 1);
+    CHECK(memcmp(output.bits, expected, sizeof(expected)) == 0);
+    vk_graph_reset();
+
+    CHECK(vk_graph_expand_f32(
+        input.values, output.values, input_shape, 5,
+        incompatible_output_shape, 6) == 0);
+    CHECK(vk_graph_expand_f32(
+        input.values, output.values, input_shape, 5,
+        smaller_output_shape, 4) == 0);
+    CHECK(vk_graph_expand_f32(
+        input.values, output.values, invalid_input_shape, 5,
+        output_shape, 6) == 0);
+    CHECK(vk_graph_expand_f32(
+        input.values, output.values, scalar_shape, 1,
+        overflow_shape, 2) == 0);
+    CHECK(vk_graph_expand_f32(
+        overlap_storage, overlap_storage, input_shape, 5,
+        output_shape, 6) == 0);
+    CHECK(vk_graph_expand_f32(
+        overlap_storage, overlap_storage + 1, input_shape, 5,
+        output_shape, 6) == 0);
+    return 0;
+}
+
 int main(void) {
+    VxEngineState* state;
+    VxEngineStateScope state_scope;
+    CHECK(test_context_capsule_isolation() == 0);
+    state = (VxEngineState*)calloc(1, sizeof(*state));
+    CHECK(state && vx_engine_state_init(state) == 0);
+    state_scope = vx_engine_state_scope_enter(state);
     if (vk_init() != 0) {
+        vx_engine_state_scope_leave(state_scope);
+        vx_engine_state_deinit(state);
+        free(state);
         puts("vulkan training tests skipped: no Vulkan compute device");
-        return 0;
+        return 77;
     }
     CHECK(vk_training_available() == 1);
+    CHECK(test_physical_context_isolation(state) == 0);
     float host_current = 1.0f;
     vk_graph_reset();
     CHECK(vk_graph_sync_host(&host_current, sizeof(host_current), 1) == 1);
@@ -1571,6 +2074,8 @@ int main(void) {
     CHECK(vk_training_plan_supported(4097, NULL, NULL, 0) == 0);
     CHECK(test_one_shot_matmul_tails_and_fallback() == 0);
     CHECK(test_tiled_qlinear_i8u8_tails() == 0);
+    CHECK(test_tiled_qlinear_staged_rounding() == 0);
+    CHECK(test_layernorm_epsilon() == 0);
     CHECK(test_qlinear_i8u8_packed_chain() == 0);
     CHECK(test_qembedding_i8u8_packed_gather() == 0);
     CHECK(test_qadd_requantize_i8u8_packed_chain() == 0);
@@ -1583,6 +2088,9 @@ int main(void) {
     CHECK(test_qmaskedmean_i8u8_packed() == 0);
     CHECK(test_qconv2d_i8u8_packed_chain() == 0);
     CHECK(test_typed_i8u8_shape_qdq_chain() == 0);
+    CHECK(test_general_gather_i32() == 0);
+    CHECK(test_typed_control_graph_ops() == 0);
+    CHECK(test_expand_f32_uniform_abi() == 0);
     CHECK(vk_training_begin() == 0);
 
     float dummy = 0.0f;
@@ -1620,6 +2128,9 @@ int main(void) {
     CHECK(vk_init() == 0);
     CHECK(vk_training_available() == 1);
     vk_cleanup();
+    vx_engine_state_scope_leave(state_scope);
+    vx_engine_state_deinit(state);
+    free(state);
     puts("vulkan training tests passed");
     return 0;
 }

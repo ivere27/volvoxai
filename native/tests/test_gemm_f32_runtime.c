@@ -1,7 +1,8 @@
 #include "engine_internal.h"
 #include "gemm_f32.h"
 #include "safetensors.h"
-#include "volvoxai.h"
+#include "engine_core.h"
+#include "runtime_state.h"
 
 #include <math.h>
 #include <stdint.h>
@@ -98,7 +99,7 @@ static int test_tensor_name_index(void) {
     CHECK(t_find("tensor.renamed") == &g_t[712]);
     volvoxai_engine_tensor_name_index_rebuild();
 
-    /* The weight/config load path extends an already-current table in O(1). */
+    /* The weight/graph load path extends an already-current table in O(1). */
     memset(g_t, 0, sizeof(g_t));
     g_nt = 0;
     volvoxai_engine_tensor_name_index_invalidate();
@@ -120,11 +121,18 @@ static int test_tensor_name_index(void) {
 }
 
 int main(void) {
+    VxEngineState* state = (VxEngineState*)calloc(1, sizeof(*state));
+    VxEngineStateScope scope;
+    if (!state || vx_engine_state_init(state) != 0) {
+        free(state);
+        return 1;
+    }
+    scope = vx_engine_state_scope_enter(state);
     enum { ROWS = 7, K = 17, N = 13 };
-    const char* config_path = "/tmp/volvox-gemm-f32-runtime.json";
+    const char* graph_path = "/tmp/volvox-gemm-f32-runtime.json";
     const char* weights_path = "/tmp/volvox-gemm-f32-runtime.safetensors";
-    const char* config =
-        "{\"inputs\":{\"x\":{\"shape\":[7,17],\"dtype\":\"float32\"}},"
+    const char* graph =
+        "{\"format\":\"volvox-graph/v1\",\"inputs\":{\"x\":{\"shape\":[7,17],\"dtype\":\"float32\"}},"
         "\"nodes\":[{\"opType\":\"Linear\","
         "\"inputs\":{\"input\":\"x\",\"weight\":\"w\",\"bias\":\"b\"},"
         "\"outputs\":{\"out\":\"y\"},\"outputs_shape\":{\"out\":[7,13]},"
@@ -151,7 +159,7 @@ int main(void) {
     }
     for (size_t index = 0; index < N; index++) bias[index] = value_at(index + 901u);
 
-    CHECK(write_text(config_path, config) == 0);
+    CHECK(write_text(graph_path, graph) == 0);
     CHECK(safetensors_init_empty(&file, SAFETENSORS_OPEN_READ_WRITE) == 0);
     CHECK(safetensors_add_tensor(&file, "w", SAFETENSORS_DTYPE_F32,
                                  weight_shape, 2, weight, sizeof(weight)) == 0);
@@ -161,7 +169,7 @@ int main(void) {
     safetensors_free(&file);
 
     CHECK(volvoxai_engine_configure(&options) == 0);
-    CHECK(volvoxai_engine_init(config_path, weights_path) == 0);
+    CHECK(volvoxai_engine_init(graph_path, weights_path) == 0);
     CHECK(volvoxai_engine_set_input_raw("x", VOLVOXAI_DTYPE_F32,
                                         input, sizeof(input)) == 0);
     reference(input, weight, bias, expected, ROWS, K, N);
@@ -171,11 +179,12 @@ int main(void) {
     T* runtime_weight = t_find("w");
     CHECK(runtime_weight && runtime_weight->dtype == T_F32);
     const float* first_pack = vx_gemm_f32_pack_cache(
-        0, runtime_weight->data, K, N, 1);
+        &state->gemm_f32_cache, 0, runtime_weight->data, K, N, 1);
     CHECK(first_pack != NULL);
 
     CHECK(volvoxai_engine_forward() == 0);
-    CHECK(vx_gemm_f32_pack_cache(0, runtime_weight->data, K, N, 1) == first_pack);
+    CHECK(vx_gemm_f32_pack_cache(&state->gemm_f32_cache, 0,
+                                 runtime_weight->data, K, N, 1) == first_pack);
     CHECK(volvoxai_engine_set_tensor_f32("w", updated_weight, N * K) == 0);
     CHECK(g_weight_caches_dirty == 1);
     reference(input, updated_weight, bias, expected, ROWS, K, N);
@@ -185,7 +194,10 @@ int main(void) {
     CHECK(close_array(output, expected, ROWS * N));
 
     volvoxai_engine_shutdown();
-    remove(config_path);
+    vx_engine_state_scope_leave(scope);
+    vx_engine_state_deinit(state);
+    free(state);
+    remove(graph_path);
     remove(weights_path);
     puts("gemm_f32 runtime cache and tensor-name index tests passed");
     return 0;

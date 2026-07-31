@@ -22,8 +22,21 @@ const seq2seq = buildEncoderDecoderTransformer(model, {
 });
 const graph = model.build();
 const batch = seq2seq.teacherForcing(sourceIds, targetIds);
-await new VolvoxAI().trainStep(graph, batch);
+const runtime = await VolvoxAI.createRuntime({ backends: ['cpu'] });
+const runtimeModel = runtime.createModel(graph);
+const trainer = await VolvoxAI.createTrainer(runtimeModel, { backend: 'cpu' });
+
+await trainer.trainStep(batch);
+await trainer.commit();
 
 // After a generic checkpoint import:
 const resumed = createTeacherForcingBatchForGraph(graph, sourceIds, targetIds);
+
+await trainer.close();
+await runtimeModel.close();
+await runtime.close();
 ```
+
+`trainStep()` changes only the Trainer's private working revision. Call
+`commit()` before compiling inference against the update. Call `rollback()` to
+discard uncommitted work and restore the last committed baseline.

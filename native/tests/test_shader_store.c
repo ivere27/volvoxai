@@ -6,6 +6,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 #define CHECK(condition) do { \
     if (!(condition)) { \
@@ -67,6 +68,16 @@ static int read_expected_shader(
         return 0;
     }
     return 1;
+}
+
+static size_t count_substring(const char* text, const char* needle) {
+    size_t count = 0;
+    size_t needle_size = strlen(needle);
+    for (const char* match = strstr(text, needle); match;
+         match = strstr(match + needle_size, needle)) {
+        count++;
+    }
+    return count;
 }
 
 static void* lookup_thread(void* opaque) {
@@ -149,36 +160,89 @@ int main(int argc, char** argv) {
         CHECK(!thread_args[i].failed);
     }
 
+    FILE* captured_stderr = tmpfile();
+    CHECK(captured_stderr != NULL);
+    CHECK(fflush(stderr) == 0);
+    int saved_stderr = dup(STDERR_FILENO);
+    CHECK(saved_stderr >= 0);
+    CHECK(dup2(fileno(captured_stderr), STDERR_FILENO) >= 0);
+    int capture_failed = 0;
+
+    /* Embedded fallback is silent for both configured and environment roots. */
+    if (volvoxai_shader_store_set_override_root(missing_override_root) !=
+        VOLVOXAI_SHADER_STORE_OK) {
+        capture_failed = 1;
+    }
+    if (volvoxai_shader_store_get(paths[0], &second) != VOLVOXAI_SHADER_STORE_OK ||
+        second.data != first.data) {
+        capture_failed = 1;
+    }
+
     char* copied_root = strdup(valid_override_root);
     CHECK(copied_root != NULL);
-    CHECK(volvoxai_shader_store_set_override_root(copied_root) ==
-          VOLVOXAI_SHADER_STORE_OK);
+    if (volvoxai_shader_store_set_override_root(copied_root) !=
+        VOLVOXAI_SHADER_STORE_OK) {
+        capture_failed = 1;
+    }
     memset(copied_root, 'x', strlen(copied_root));
     free(copied_root);
 
     /* A nonempty environment root takes precedence, even when it misses. */
-    CHECK(setenv("VOLVOXAI_SHADER_DIR", missing_override_root, 1) == 0);
-    CHECK(volvoxai_shader_store_get(paths[0], &second) == VOLVOXAI_SHADER_STORE_OK);
-    CHECK(second.data == first.data);
+    if (setenv("VOLVOXAI_SHADER_DIR", missing_override_root, 1) != 0 ||
+        volvoxai_shader_store_get(paths[0], &second) != VOLVOXAI_SHADER_STORE_OK ||
+        second.data != first.data) {
+        capture_failed = 1;
+    }
     /* A repeated miss must neither fail nor invalidate the embedded cache. */
-    CHECK(volvoxai_shader_store_get(paths[0], &second) == VOLVOXAI_SHADER_STORE_OK);
+    if (volvoxai_shader_store_get(paths[0], &second) != VOLVOXAI_SHADER_STORE_OK) {
+        capture_failed = 1;
+    }
 
-    CHECK(unsetenv("VOLVOXAI_SHADER_DIR") == 0);
-    CHECK(volvoxai_shader_store_get(paths[0], &second) == VOLVOXAI_SHADER_STORE_OK);
-    CHECK(view_equals(&second, expected[0].data, expected[0].size));
-    CHECK(second.data != first.data);
+    if (unsetenv("VOLVOXAI_SHADER_DIR") != 0 ||
+        volvoxai_shader_store_get(paths[0], &second) != VOLVOXAI_SHADER_STORE_OK ||
+        !view_equals(&second, expected[0].data, expected[0].size) ||
+        second.data == first.data) {
+        capture_failed = 1;
+    }
 
-    CHECK(setenv("VOLVOXAI_SHADER_DIR", valid_override_root, 1) == 0);
-    CHECK(volvoxai_shader_store_get(paths[0], &second) == VOLVOXAI_SHADER_STORE_OK);
-    CHECK(view_equals(&second, expected[0].data, expected[0].size));
-    CHECK(second.data != first.data);
-    CHECK(volvoxai_shader_store_get(paths[0], &second) == VOLVOXAI_SHADER_STORE_OK);
+    if (setenv("VOLVOXAI_SHADER_DIR", valid_override_root, 1) != 0 ||
+        volvoxai_shader_store_get(paths[0], &second) != VOLVOXAI_SHADER_STORE_OK ||
+        !view_equals(&second, expected[0].data, expected[0].size) ||
+        second.data == first.data ||
+        volvoxai_shader_store_get(paths[0], &second) != VOLVOXAI_SHADER_STORE_OK) {
+        capture_failed = 1;
+    }
 
     volvoxai_shader_store_shutdown();
-    CHECK(unsetenv("VOLVOXAI_SHADER_DIR") == 0);
-    CHECK(volvoxai_shader_store_get(paths[0], &second) == VOLVOXAI_SHADER_STORE_OK);
-    CHECK(view_equals(&second, expected[0].data, expected[0].size));
+    if (unsetenv("VOLVOXAI_SHADER_DIR") != 0 ||
+        volvoxai_shader_store_get(paths[0], &second) != VOLVOXAI_SHADER_STORE_OK ||
+        !view_equals(&second, expected[0].data, expected[0].size)) {
+        capture_failed = 1;
+    }
+    /* Shutdown releases resources, but the process-wide log state remains. */
+    if (setenv("VOLVOXAI_SHADER_DIR", valid_override_root, 1) != 0 ||
+        volvoxai_shader_store_get(paths[0], &second) != VOLVOXAI_SHADER_STORE_OK ||
+        !view_equals(&second, expected[0].data, expected[0].size)) {
+        capture_failed = 1;
+    }
     volvoxai_shader_store_shutdown();
+    if (unsetenv("VOLVOXAI_SHADER_DIR") != 0 || fflush(stderr) != 0 ||
+        dup2(saved_stderr, STDERR_FILENO) < 0 || close(saved_stderr) != 0) {
+        capture_failed = 1;
+    }
+
+    char log_text[8192];
+    CHECK(fseek(captured_stderr, 0, SEEK_END) == 0);
+    long log_size = ftell(captured_stderr);
+    CHECK(log_size >= 0 && (size_t)log_size < sizeof(log_text));
+    CHECK(fseek(captured_stderr, 0, SEEK_SET) == 0);
+    CHECK(fread(log_text, 1, (size_t)log_size, captured_stderr) == (size_t)log_size);
+    log_text[log_size] = '\0';
+    CHECK(fclose(captured_stderr) == 0);
+    CHECK(!capture_failed);
+    CHECK(count_substring(log_text, "[VolvoxAI] Using ") == 1);
+    CHECK(strstr(log_text, "unavailable") == NULL);
+    CHECK(strstr(log_text, "embedded shaders") == NULL);
 
     for (size_t i = 0; i < sizeof(expected) / sizeof(expected[0]); i++) {
         free(expected[i].data);

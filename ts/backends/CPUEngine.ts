@@ -63,10 +63,12 @@ import { _cpuLeakyReLU } from '../ops/leakyReLU.js';
 import { _cpuGELU } from '../ops/gELU.js';
 import { _cpuLayerNorm } from '../ops/layerNorm.js';
 import { _cpuGroupNorm } from '../ops/groupNorm.js';
-import { _cpuDropout } from '../ops/dropout.js';
 import { _cpuConv2D } from '../ops/conv2D.js';
 import { _cpuConv1D } from '../ops/conv1D.js';
 import { _cpuMatMul } from '../ops/matMul.js';
+import { _cpuBatchMatMul } from '../ops/batchMatMul.js';
+import { _cpuQBatchMatMul } from '../ops/qBatchMatMul.js';
+import { _cpuComparison, _cpuNot } from '../ops/comparison.js';
 import { _cpuLoRALinear } from '../ops/loraLinear.js';
 import { _cpuCast } from '../ops/cast.js';
 import { _cpuArgMax } from '../ops/argMax.js';
@@ -74,7 +76,7 @@ import { _cpuQArgMax } from '../ops/qArgMax.js';
 import { _cpuMoERouter } from '../ops/moeRouter.js';
 import { _cpuMoELinear } from '../ops/moeLinear.js';
 import { Tensor } from '../core/Tensor.js';
-import { BackendEngine } from './BackendEngine.js';
+import { assertInferenceExecutionOptions, BackendEngine } from './BackendEngine.js';
 import { incrementalExecutionEnabled, incrementalNodeSelection } from './incrementalExecution.js';
 import {
   incrementalRowPosition,
@@ -86,9 +88,19 @@ import type { GraphNode, TensorLike } from '../types.js';
 interface CpuNodeExecution {
   graph?: Graph;
   adapterPlan?: any;
-  training?: { dropout?: any };
   nodeIndex?: number;
   rowPosition?: number | null;
+}
+
+function aliasInferenceDropout(node: GraphNode): void {
+  const input = node.inputs.input || node.inputs.x;
+  const output = node.outputs.out || Object.values(node.outputs || {})[0];
+  if (input?.dtype !== 'float32' || output?.dtype !== 'float32' ||
+      !(input.buffer instanceof Float32Array) || !(output.buffer instanceof Float32Array) ||
+      input.buffer.length !== output.buffer.length) {
+    throw new Error(`Dropout node ${node.id ?? '<unnamed>'} requires equal-size F32 input/output tensors.`);
+  }
+  output.buffer = input.buffer;
 }
 
 export class CPUEngine extends BackendEngine {
@@ -111,7 +123,6 @@ export class CPUEngine extends BackendEngine {
   declare _cpuCrossSDPA: typeof _cpuCrossSDPA;
   declare _cpuDequantizeLinear: typeof _cpuDequantizeLinear;
   declare _cpuDiv: typeof _cpuDiv;
-  declare _cpuDropout: typeof _cpuDropout;
   declare _cpuEmbedding: typeof _cpuEmbedding;
   declare _cpuExpand: typeof _cpuExpand;
   declare _cpuGELU: typeof _cpuGELU;
@@ -127,6 +138,10 @@ export class CPUEngine extends BackendEngine {
   declare _cpuLoRALinear: typeof _cpuLoRALinear;
   declare _cpuLogSoftmax: typeof _cpuLogSoftmax;
   declare _cpuMatMul: typeof _cpuMatMul;
+  declare _cpuBatchMatMul: typeof _cpuBatchMatMul;
+  declare _cpuQBatchMatMul: typeof _cpuQBatchMatMul;
+  declare _cpuComparison: typeof _cpuComparison;
+  declare _cpuNot: typeof _cpuNot;
   declare _cpuMaxPool2D: typeof _cpuMaxPool2D;
   declare _cpuMeanHeight: typeof _cpuMeanHeight;
   declare _cpuMoELinear: typeof _cpuMoELinear;
@@ -187,6 +202,14 @@ export class CPUEngine extends BackendEngine {
   fork(): CPUEngine | Promise<CPUEngine> {
     return new CPUEngine();
   }
+
+  /** Release graph-owned request storage when its execution context closes. */
+  dispose(): void {
+    this.resetDecodeCache();
+    this.graph = undefined;
+    this.tensors.clear();
+  }
+
   /**
    * Allocates CPU memory (ArrayBuffers) for the graph's tensors.
    */
@@ -219,6 +242,7 @@ export class CPUEngine extends BackendEngine {
     const inputs = explicitGraph ? (maybeInputs || {}) : (inputsOrGraph || {});
     const options = explicitGraph ? maybeOptions : (maybeInputs || {});
     if (!graph) throw new Error("CPUEngine.execute requires an allocated graph.");
+    assertInferenceExecutionOptions(options, 'CPU inference');
     if (!explicitGraph) graph.assertTopologyRevision?.(this.compiledTopologyRevision, "CPU");
     this._beginDecodeExecution(options);
     const hasAdapterSelector = Object.prototype.hasOwnProperty.call(options, "adapter") ||
@@ -237,7 +261,9 @@ export class CPUEngine extends BackendEngine {
     const rowPosition = incrementalRowPosition(options, selectedNodes, cacheWasValid);
     const incrementalRows = rowPosition == null
       ? null
-      : prepareQuantizedRows(graph, selectedNodes, rowPosition);
+      : prepareQuantizedRows(graph, selectedNodes, rowPosition, {
+          changedInputs: options.changedInputs ?? Object.keys(inputs),
+        });
     for (const [name, data] of Object.entries(inputs)) {
       const tensor = graph.tensors.get(name);
       if (!tensor?.isInput || !tensor.buffer) throw new Error(`Unknown graph input '${name}'.`);
@@ -247,7 +273,7 @@ export class CPUEngine extends BackendEngine {
     for (let nodeIndex = 0; nodeIndex < graph.nodes.length; nodeIndex++) {
       if (selectedNodes && !selectedNodes.has(nodeIndex)) continue;
       this._runNode(incrementalRows?.get(nodeIndex) || graph.nodes[nodeIndex], {
-        graph, adapterPlan, training: options.training, nodeIndex, rowPosition,
+        graph, adapterPlan, nodeIndex, rowPosition,
       });
     }
     const result: Record<string, any> = {};
@@ -282,6 +308,8 @@ export class CPUEngine extends BackendEngine {
         if (execution.adapterPlan) this._cpuLoRALinear(node, execution.adapterPlan);
         return result;
       }
+      case "BatchMatMul": return this._cpuBatchMatMul(node);
+      case "QBatchMatMul": return this._cpuQBatchMatMul(node);
       case "QLinear":
       case "QMatMul":
       case "QGemm": {
@@ -300,8 +328,8 @@ export class CPUEngine extends BackendEngine {
       case "QEmbedding": return this._cpuQEmbedding(node);
       case "MoERouter": return this._cpuMoERouter(node);
       case "MoELinear": return this._cpuMoELinear(node);
-      case "SDPA": return this._cpuSDPA(node, execution);
-      case "CrossSDPA": return this._cpuCrossSDPA(node, execution);
+      case "SDPA": return this._cpuSDPA(node);
+      case "CrossSDPA": return this._cpuCrossSDPA(node);
       case "CrossAttention": return this._cpuCrossAttention(node);
 
       // --- Convolution / pooling ---
@@ -310,24 +338,20 @@ export class CPUEngine extends BackendEngine {
       case "Conv1D": return this._cpuConv1D(node);
       case "ConvTranspose2D": return this._cpuConvTranspose2D(node);
       case "MaxPool2D": return this._cpuMaxPool2D(node);
-      case "AveragePool":
       case "AveragePool2D": return this._cpuAveragePool2D(node);
       case "GlobalAveragePool": return this._cpuGlobalAveragePool(node);
       case "BatchNorm2D": return this._cpuBatchNorm2D(node);
       case "ResizeNearest2D":
       case "Resize": return this._cpuResize(node);
-      case "Upsample2x":
       case "UpsampleNearest2D": return this._cpuUpsample2x(node);
-      case "Interp1D":
-      case "InterpLinear1D": return this._cpuInterp1D(node);
+      case "Interpolate1D": return this._cpuInterp1D(node);
 
       // --- Activations ---
       case "ReLU": return this._cpuReLU(node);
       case "LeakyReLU": return this._cpuLeakyReLU(node);
       case "PReLU": return this._cpuPReLU(node);
       case "GELU": return this._cpuGELU(node);
-      case "SiLU":
-      case "Swish": return this._cpuSiLU(node);
+      case "SiLU": return this._cpuSiLU(node);
       case "QGELU": return this._cpuQGELU(node);
       case "QSiLU": return this._cpuQSiLU(node);
       case "Sigmoid": return this._cpuSigmoid(node);
@@ -336,8 +360,7 @@ export class CPUEngine extends BackendEngine {
       case "Tanh": return this._cpuTanh(node);
       case "Sin": return this._cpuSin(node);
       case "Cos": return this._cpuCos(node);
-      case "RoPE":
-      case "RotaryEmbedding": return this._cpuRoPE(node);
+      case "RoPE": return this._cpuRoPE(node);
       case "SSMScan":
       case "SelectiveScan": return this._cpuSSMScan(node);
       case "Clip": return this._cpuClip(node);
@@ -348,6 +371,9 @@ export class CPUEngine extends BackendEngine {
       case "Mul": return this._cpuMul(node);
       case "Sub": return this._cpuSub(node);
       case "Div": return this._cpuDiv(node);
+      case "Equal":
+      case "GreaterOrEqual": return this._cpuComparison(node);
+      case "Not": return this._cpuNot(node);
       case "Softmax": return this._cpuSoftmax(node);
       case "LogSoftmax": return this._cpuLogSoftmax(node);
       case "ReduceSum": return this._cpuReduceSum(node);
@@ -378,9 +404,7 @@ export class CPUEngine extends BackendEngine {
       case "ProfileY": return this._cpuProfileY(node);
       case "MeanHeight": return this._cpuMeanHeight(node);
 
-      // Dropout is an inference identity. Autograd supplies a deterministic
-      // per-step training context without changing the inference code path.
-      case "Dropout": return this._cpuDropout(node, execution);
+      case "Dropout": return aliasInferenceDropout(node);
 
       // Shape-only ops just copy their data through to the output buffer.
       case "Reshape":
@@ -390,7 +414,9 @@ export class CPUEngine extends BackendEngine {
       case "Identity": return this._cpuReshape(node);
 
       default:
-        console.warn(`[VolvoxAI CPU] Executing ${node.opType} is not implemented; node ${node.id} skipped.`);
+        throw new Error(
+          `[VolvoxAI CPU] Operator ${node.opType} at node ${node.id} is not implemented.`,
+        );
     }
   }
 };
@@ -459,10 +485,13 @@ CPUEngine.prototype._cpuLeakyReLU = _cpuLeakyReLU;
 CPUEngine.prototype._cpuGELU = _cpuGELU;
 CPUEngine.prototype._cpuLayerNorm = _cpuLayerNorm;
 CPUEngine.prototype._cpuGroupNorm = _cpuGroupNorm;
-CPUEngine.prototype._cpuDropout = _cpuDropout;
 CPUEngine.prototype._cpuConv2D = _cpuConv2D;
 CPUEngine.prototype._cpuConv1D = _cpuConv1D;
 CPUEngine.prototype._cpuMatMul = _cpuMatMul;
+CPUEngine.prototype._cpuBatchMatMul = _cpuBatchMatMul;
+CPUEngine.prototype._cpuQBatchMatMul = _cpuQBatchMatMul;
+CPUEngine.prototype._cpuComparison = _cpuComparison;
+CPUEngine.prototype._cpuNot = _cpuNot;
 CPUEngine.prototype._cpuLoRALinear = _cpuLoRALinear;
 CPUEngine.prototype._cpuCast = _cpuCast;
 CPUEngine.prototype._cpuArgMax = _cpuArgMax;

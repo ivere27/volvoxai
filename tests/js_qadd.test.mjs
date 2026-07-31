@@ -18,7 +18,7 @@ test('CPU QAdd requantizes differing I8/U8 activation descriptors', async () => 
       quantization: { scheme: 'per_tensor', scale: 0.5, zero_point: 3 },
     },
   });
-  graph.outputNames = [out.name];
+  graph.setOutputs([out.name]);
   const engine = new CPUEngine();
   engine.allocateGraph(graph);
   const result = await engine.execute({
@@ -53,7 +53,7 @@ test('CPU QAdd clamps fused ReLU and ReLU6 in the output quantization domain', a
   const { out } = graph.addOp('QAdd', { a: relu, b: relu }, {
     out: { name: 'out', shape: [3], dtype: 'int8', quantization: { scheme: 'per_tensor', scale: 0.5, zero_point: -2 } },
   }, { relu: 2 });
-  graph.outputNames = [out.name];
+  graph.setOutputs([out.name]);
   const engine = new CPUEngine();
   engine.allocateGraph(graph);
   const result = await engine.execute({ a: Int8Array.of(-10, 2, 20), b: Int8Array.of(-10, 2, 20) });
@@ -68,9 +68,56 @@ test('CPU QAdd maps extreme non-finite real sums to the output zero point', asyn
   const { out } = graph.addOp('QAdd', { a, b }, {
     out: { name: 'out', shape: [1], dtype: 'int8', quantization: { scheme: 'per_tensor', scale: 1, zero_point: 7 } },
   });
-  graph.outputNames = [out.name];
+  graph.setOutputs([out.name]);
   const engine = new CPUEngine();
   engine.allocateGraph(graph);
   const result = await engine.execute({ a: Int8Array.of(127), b: Int8Array.of(-128) });
   assert.deepEqual([...result.out], [7]);
+});
+
+test('CPU byte Expand makes a broadcast explicit before exact-shape QAdd', async () => {
+  const graph = new Graph();
+  const left = graph.addInput('left', [2, 4], 'int8', {
+    quantization: { scheme: 'per_tensor', scale: 0.5, zero_point: -2 },
+  });
+  const right = graph.addInput('right', [1, 4], 'uint8', {
+    quantization: { scheme: 'per_tensor', scale: 0.25, zero_point: 128 },
+  });
+  const { out: expanded } = graph.addOp('Expand', { input: right }, {
+    out: {
+      name: 'expanded', shape: [2, 4], dtype: 'uint8',
+      quantization: { scheme: 'per_tensor', scale: 0.25, zero_point: 128 },
+    },
+  });
+  const { out } = graph.addOp('QAdd', { a: left, b: expanded }, {
+    out: {
+      name: 'out', shape: [2, 4], dtype: 'int8',
+      quantization: { scheme: 'per_tensor', scale: 0.5, zero_point: 3 },
+    },
+  });
+  graph.setOutputs([out.name]);
+  const engine = new CPUEngine();
+  engine.allocateGraph(graph);
+  const result = await engine.execute({
+    left: Int8Array.of(-2, 0, 2, 10, -128, 5, 7, 9),
+    right: Uint8Array.of(128, 132, 120, 255),
+  });
+  assert.deepEqual([...result.out], [3, 7, 3, 78, -123, 12, 8, 78]);
+});
+
+test('CPU byte Expand rejects a changed affine descriptor', () => {
+  const graph = new Graph();
+  const input = graph.addInput('input', [1, 4], 'int8', {
+    quantization: { scheme: 'per_tensor', scale: 0.25, zero_point: -3 },
+  });
+  graph.addOp('Expand', { input }, {
+    out: {
+      name: 'out', shape: [2, 4], dtype: 'int8',
+      quantization: { scheme: 'per_tensor', scale: 0.5, zero_point: -3 },
+    },
+  });
+  assert.throws(
+    () => new CPUEngine().allocateGraph(graph),
+    /descriptor-preserving.*exact broadcast/,
+  );
 });

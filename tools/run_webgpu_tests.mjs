@@ -2,7 +2,8 @@
 // Works against local headless Chrome (SwiftShader) or a remote Chrome DevTools
 // endpoint (e.g. an Android device via `adb forward`).
 //
-//   node --experimental-websocket tools/run_webgpu_tests.mjs [--cdp=host:port] [--url=URL]
+//   node --experimental-websocket tools/run_webgpu_tests.mjs [--adapter=swiftshader|hardware]
+//     [--cdp=host:port] [--url=URL]
 //
 // With no --cdp it launches local headless Chrome with SwiftShader WebGPU and
 // serves the repo over http. Requires: google-chrome on PATH (local mode).
@@ -14,6 +15,10 @@ import { extname, join } from 'node:path';
 const args = Object.fromEntries(process.argv.slice(2).map((a) => {
   const m = a.match(/^--([^=]+)=?(.*)$/); return [m[1], m[2]];
 }));
+const adapterMode = args.adapter || 'swiftshader';
+if (!['swiftshader', 'hardware'].includes(adapterMode)) {
+  throw new Error(`--adapter must be swiftshader or hardware, got '${adapterMode}'`);
+}
 
 const MIME = { '.html': 'text/html', '.js': 'text/javascript', '.mjs': 'text/javascript', '.wasm': 'application/wasm', '.json': 'application/json' };
 
@@ -69,16 +74,23 @@ async function main() {
     process.exit(/ALL_PASS/.test(text) ? 0 : 1);
   }
 
-  // Local headless Chrome + SwiftShader.
+  // Local headless Chrome with an explicit software or surfaceless Vulkan adapter.
   const port = 8091;
   const srv = await serve(process.cwd(), port);
   const url = args.url || `http://localhost:${port}/tools/webgpu_op_tests.html`;
   const dbgPort = 9333;
   const profile = `/tmp/volvox-chrome-${process.pid}`;
-  const chrome = spawn('google-chrome', [
-    '--headless=new', '--enable-unsafe-webgpu', '--enable-features=Vulkan', '--use-webgpu-adapter=swiftshader',
+  const chromeArguments = [
+    '--headless=new', '--enable-unsafe-webgpu', '--enable-features=Vulkan',
     '--no-sandbox', '--disable-gpu-sandbox', `--user-data-dir=${profile}`, `--remote-debugging-port=${dbgPort}`, url,
-  ], { stdio: 'ignore' });
+  ];
+  if (adapterMode === 'hardware') {
+    chromeArguments.splice(-1, 0, '--use-angle=vulkan', '--disable-vulkan-surface');
+  } else {
+    chromeArguments.splice(-1, 0, '--use-webgpu-adapter=swiftshader');
+  }
+  console.log(`Adapter mode: ${adapterMode}`);
+  const chrome = spawn('google-chrome', chromeArguments, { stdio: 'ignore' });
   try {
     // Wait for the debugging endpoint, then find our page target.
     let targets = [];

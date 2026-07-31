@@ -41,7 +41,7 @@ function qaddGraph({
   const { out } = graph.addOp('QAdd', { a, b }, {
     out: { name: 'out', shape: outputShape, dtype: outputDtype, quantization: outputQuantization },
   }, params);
-  graph.outputNames = [out.name];
+  graph.setOutputs([out.name]);
   return {
     graph,
     inputs: { a: byteStorage(aDtype, aValues), b: byteStorage(bDtype, bValues) },
@@ -69,7 +69,7 @@ function qconvGraph({
   const { out } = graph.addOp('QConv2D', inputs, {
     out: { name: 'out', shape: outputShape, dtype: outputDtype, quantization: outputQuantization },
   }, { data_layout: 'NHWC', weight_layout: 'OHWI', ...params });
-  graph.outputNames = [out.name];
+  graph.setOutputs([out.name]);
   return { graph, inputs: { input: byteStorage(inputDtype, inputValues) } };
 }
 
@@ -101,8 +101,38 @@ function typedW8A8IslandGraph() {
       quantization: { scheme: 'per_tensor', scale: 0.25, zero_point: 0 },
     },
   });
-  graph.outputNames = [out.name];
+  graph.setOutputs([out.name]);
   return graph;
+}
+
+function expandedQAddGraph() {
+  const graph = new Graph();
+  const left = graph.addInput('left', [2, 4], 'int8', {
+    quantization: { scheme: 'per_tensor', scale: 0.5, zero_point: -2 },
+  });
+  const right = graph.addInput('right', [1, 4], 'uint8', {
+    quantization: { scheme: 'per_tensor', scale: 0.25, zero_point: 128 },
+  });
+  const { out: expanded } = graph.addOp('Expand', { input: right }, {
+    out: {
+      name: 'expanded', shape: [2, 4], dtype: 'uint8',
+      quantization: { scheme: 'per_tensor', scale: 0.25, zero_point: 128 },
+    },
+  });
+  const { out } = graph.addOp('QAdd', { a: left, b: expanded }, {
+    out: {
+      name: 'out', shape: [2, 4], dtype: 'int8',
+      quantization: { scheme: 'per_tensor', scale: 0.5, zero_point: 3 },
+    },
+  });
+  graph.setOutputs([out.name]);
+  return {
+    graph,
+    inputs: {
+      left: Int8Array.of(-2, 0, 2, 10, -128, 5, 7, 9),
+      right: Uint8Array.of(128, 132, 120, 255),
+    },
+  };
 }
 
 async function cpuResult(factory) {
@@ -129,7 +159,7 @@ test('WASM QConv scratch allocation fails closed outside wasm32', () => {
 });
 
 function forbidCpuQuantizedFallbacks(engine) {
-  for (const helper of ['_cpuQAdd', '_cpuQConv2D', '_cpuRequantizeLinear']) {
+  for (const helper of ['_cpuQAdd', '_cpuQConv2D', '_cpuRequantizeLinear', '_cpuExpand']) {
     engine[helper] = () => {
       throw new Error(`portable W8A8 WASM dispatch must not call ${helper}`);
     };
@@ -150,6 +180,7 @@ test('portable WASM QAdd and QConv2D preserve physical byte storage', {
     const wasm = await WasmEngine.init(await buildForwardWasm(directory));
     assert.ok(wasm, 'compiled forward WASM module initializes');
     assert.equal(typeof wasm.api.qadd_i8u8, 'function', 'forward WASM exports qadd_i8u8');
+    assert.equal(typeof wasm.api.expand_nd_i8u8, 'function', 'forward WASM exports expand_nd_i8u8');
     assert.equal(typeof wasm.api.qconv2d_i8u8, 'function', 'forward WASM exports qconv2d_i8u8');
     forbidCpuQuantizedFallbacks(wasm);
 
@@ -200,6 +231,16 @@ test('portable WASM QAdd and QConv2D preserve physical byte storage', {
         assert.deepEqual([...result.out], [...cpu.out]);
         assert.deepEqual([...result.out], expected);
       }
+    });
+
+    await t.test('descriptor-preserving byte Expand feeds canonical exact-shape QAdd', async () => {
+      const cpu = await cpuResult(expandedQAddGraph);
+      const { graph, inputs } = expandedQAddGraph();
+      wasm.compile(graph);
+      const result = await wasm.execute(inputs);
+      assert.ok(result.out instanceof Int8Array);
+      assert.deepEqual([...result.out], [...cpu.out]);
+      assert.deepEqual([...result.out], [3, 7, 3, 78, -123, 12, 8, 78]);
     });
 
     await t.test('QConv2D matches per-axis OHWI I8 reference with I32 bias', async () => {

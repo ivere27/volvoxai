@@ -19,14 +19,14 @@ async function fixture({ layout = 'IN_OUT', metadata = {}, intermediate = false 
   const source = join(root, 'full_model');
   const output = join(root, 'linear_island');
   await import('node:fs/promises').then(({ mkdir }) => mkdir(source));
-  const config = {
-    format: 'volvox.api.v1',
+  const graph = {
+    format: 'volvox-graph/v1',
     inputs: {
       'vqa.fixture.input': { shape: [1, 2], dtype: 'float32' },
     },
-    outputs: { logits: 'vqa.fixture.output' },
+    outputs: ['vqa.fixture.output'],
     nodes: [...(intermediate ? [{
-      op: 'ReLU',
+      opType: 'ReLU',
       inputs: { input: 'vqa.fixture.input' },
       outputs: { out: 'vqa.fixture.hidden' },
       outputs_shape: { out: [1, 2] },
@@ -48,7 +48,7 @@ async function fixture({ layout = 'IN_OUT', metadata = {}, intermediate = false 
   const weights = SafetensorsFile.empty({
     metadata: {
       format: 'tiny_receipt_vqa.volvox.v2',
-      'volvox.model_format': 'volvox.api.v1',
+      'volvox.model_format': 'volvox-graph/v1',
       'volvox.model_origin': 'api',
       ...metadata,
     },
@@ -66,10 +66,10 @@ async function fixture({ layout = 'IN_OUT', metadata = {}, intermediate = false 
     new Uint8Array(Float32Array.of(0.25, -0.5, 0.75).buffer),
   );
   await Promise.all([
-    writeFile(join(source, 'config.json'), `${JSON.stringify(config, null, 2)}\n`),
+    writeFile(join(source, 'graph.json'), `${JSON.stringify(graph, null, 2)}\n`),
     writeFile(join(source, 'model.safetensors'), new Uint8Array(weights.toArrayBuffer())),
   ]);
-  return { root, source, output, config };
+  return { root, source, output, graph };
 }
 
 const sampleDocument = {
@@ -124,16 +124,22 @@ test('VolvoxAI PTQ calibrates and materializes a runnable trained Linear island'
   assert.equal(result.calibration.representative, true);
   assert.equal(result.manifest.mapping.weight_layout.transform, 'transpose_2d');
   assert.equal(result.manifest.mapping.weight_layout.quantized_axis, 0);
-  assert.equal(result.config.nodes[0].opType, 'QLinear');
-  assert.equal(result.config.nodes[0].inputs.weight, 'w8a8.vqa.fixture.weight');
-  assert.equal(result.config.nodes[0].inputs.bias, 'w8a8.vqa.fixture.bias_i32');
+  assert.equal(result.graphDocument.format, 'volvox-graph/v1');
+  assert.equal(result.graphDocument.nodes[0].opType, 'QLinear');
+  assert.equal(result.graphDocument.nodes[0].inputs.weight, 'w8a8.vqa.fixture.weight');
+  assert.equal(result.graphDocument.nodes[0].inputs.bias, 'w8a8.vqa.fixture.bias_i32');
   assert.ok(Number.isFinite(result.manifest.validation.max_abs_error_against_f32_island));
 
   const weights = SafetensorsFile.fromArrayBuffer(result.weightsBuffer);
   assert.deepEqual(weights.listTensorNames(), [
     'w8a8.vqa.fixture.weight',
     'w8a8.vqa.fixture.weight_scale',
+    'w8a8.vqa.fixture.weight.zero_point',
     'w8a8.vqa.fixture.bias_i32',
+    'island.input.scale',
+    'island.input.zero_point',
+    'island.output.scale',
+    'island.output.zero_point',
   ]);
   assert.deepEqual(weights.getTensor('w8a8.vqa.fixture.weight').shape, [3, 2]);
   assert.deepEqual(
@@ -141,6 +147,11 @@ test('VolvoxAI PTQ calibrates and materializes a runnable trained Linear island'
     [32, 127, 51, 127, 64, 127],
   );
   assert.equal(weights.getTensor('w8a8.vqa.fixture.bias_i32').dtype, 'I32');
+  assert.equal(weights.getTensor('w8a8.vqa.fixture.weight.zero_point').dtype, 'I8');
+  assert.equal(weights.getTensor('island.input.scale').dtype, 'F32');
+  assert.equal(weights.getTensor('island.input.zero_point').dtype, 'I8');
+  assert.equal(weights.getTensor('island.output.scale').dtype, 'F32');
+  assert.equal(weights.getTensor('island.output.zero_point').dtype, 'I8');
 
   const diskManifest = JSON.parse(await readFile(
     join(files.output, 'island_manifest.json'), 'utf8',

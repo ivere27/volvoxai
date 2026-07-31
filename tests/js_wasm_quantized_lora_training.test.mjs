@@ -7,7 +7,9 @@ import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
 
-import { Graph, ModelBuilder, VolvoxAI } from '../ts/wasm.js';
+import { Graph, ModelBuilder } from '../ts/wasm.js';
+import { WasmEngine } from '../ts/backends/WasmEngine.js';
+import { WasmQuantizedLoRATrainer } from '../ts/training/WasmQuantizedLoRATrainer.js';
 
 const run = promisify(execFile);
 const repositoryRoot = fileURLToPath(new URL('../', import.meta.url));
@@ -125,14 +127,14 @@ test('WASM quantized LoRA keeps F32 masters and refreshes one unchanged W8 graph
   try {
     const wasmPath = join(directory, 'volvoxai.full.wasm');
     await buildFullWasm(wasmPath);
-    const api = await VolvoxAI.init('wasm', wasmPath);
+    const engine = await WasmEngine.init(wasmPath);
+    assert.ok(engine);
 
     await t.test('explicit dequantization initializes transposed F32 masters once', async () => {
       const training = trainingGraph();
       const inference = inferenceGraph();
-      const engine = await api.compile(inference.graph);
-      const session = await api.createQuantizedLoRATrainer(
-        training.graph, inference.graph, { executor: engine, bindings: bindings() },
+      const session = await WasmQuantizedLoRATrainer.create(
+        engine, training.graph, inference.graph, { bindings: bindings() },
       );
       try {
         const initialized = await session.initializeMastersFromQuantized();
@@ -153,9 +155,8 @@ test('WASM quantized LoRA keeps F32 masters and refreshes one unchanged W8 graph
     await t.test('an applied train step stages both factors, advances once, and compiles once', async () => {
       const training = trainingGraph();
       const inference = inferenceGraph();
-      const engine = await api.compile(inference.graph);
-      const session = await api.createQuantizedLoRATrainer(
-        training.graph, inference.graph, { executor: engine, bindings: bindings() },
+      const session = await WasmQuantizedLoRATrainer.create(
+        engine, training.graph, inference.graph, { bindings: bindings() },
       );
       let originalAllocate = null;
       try {
@@ -223,9 +224,8 @@ test('WASM quantized LoRA keeps F32 masters and refreshes one unchanged W8 graph
     await t.test('accumulation without an optimizer update performs no W8 compile', async () => {
       const training = trainingGraph();
       const inference = inferenceGraph();
-      const engine = await api.compile(inference.graph);
-      const session = await api.createQuantizedLoRATrainer(
-        training.graph, inference.graph, { executor: engine, bindings: bindings() },
+      const session = await WasmQuantizedLoRATrainer.create(
+        engine, training.graph, inference.graph, { bindings: bindings() },
       );
       let originalAllocate = null;
       try {
@@ -257,9 +257,8 @@ test('WASM quantized LoRA keeps F32 masters and refreshes one unchanged W8 graph
     await t.test('a later invalid master leaves every staged W8 target unchanged', async () => {
       const training = trainingGraph();
       const inference = inferenceGraph();
-      const engine = await api.compile(inference.graph);
-      const session = await api.createQuantizedLoRATrainer(
-        training.graph, inference.graph, { executor: engine, bindings: bindings() },
+      const session = await WasmQuantizedLoRATrainer.create(
+        engine, training.graph, inference.graph, { bindings: bindings() },
       );
       try {
         await session.sync();
@@ -284,9 +283,8 @@ test('WASM quantized LoRA keeps F32 masters and refreshes one unchanged W8 graph
     await t.test('a failed inference compile restores the prior W8 snapshot and revision', async () => {
       const training = trainingGraph();
       const inference = inferenceGraph();
-      const engine = await api.compile(inference.graph);
-      const session = await api.createQuantizedLoRATrainer(
-        training.graph, inference.graph, { executor: engine, bindings: bindings() },
+      const session = await WasmQuantizedLoRATrainer.create(
+        engine, training.graph, inference.graph, { bindings: bindings() },
       );
       let originalAllocate = null;
       try {
@@ -330,9 +328,8 @@ test('WASM quantized LoRA keeps F32 masters and refreshes one unchanged W8 graph
           maxGradNorm: 0.75,
         },
       };
-      const engine = await api.compile(inference.graph);
-      const session = await api.createQuantizedLoRATrainer(
-        training.graph, inference.graph, { executor: engine, bindings: bindings() },
+      const session = await WasmQuantizedLoRATrainer.create(
+        engine, training.graph, inference.graph, { bindings: bindings() },
       );
       try {
         const result = await session.trainStep({
@@ -359,7 +356,9 @@ test('WASM quantized LoRA keeps F32 masters and refreshes one unchanged W8 graph
       const inference = inferenceGraph({ nonzeroBias: true });
       const trainingRevision = training.graph.weightRevision;
       await assert.rejects(
-        api.createQuantizedLoRATrainer(training.graph, inference.graph, { bindings: bindings() }),
+        WasmQuantizedLoRATrainer.create(
+          engine, training.graph, inference.graph, { bindings: bindings() },
+        ),
         /all-zero I32 bias/,
       );
       assert.equal(training.graph.weightRevision, trainingRevision);
@@ -374,7 +373,9 @@ test('WASM quantized LoRA keeps F32 masters and refreshes one unchanged W8 graph
         const training = trainingGraph();
         const inference = inferenceGraph({ targetVariant });
         await assert.rejects(
-          api.createQuantizedLoRATrainer(training.graph, inference.graph, { bindings: bindings() }),
+          WasmQuantizedLoRATrainer.create(
+            engine, training.graph, inference.graph, { bindings: bindings() },
+          ),
           pattern,
           targetVariant,
         );
@@ -384,7 +385,9 @@ test('WASM quantized LoRA keeps F32 masters and refreshes one unchanged W8 graph
       const mismatched = bindings();
       mismatched[0] = { ...mismatched[0], transpose: false };
       await assert.rejects(
-        api.createQuantizedLoRATrainer(training.graph, inference.graph, { bindings: mismatched }),
+        WasmQuantizedLoRATrainer.create(
+          engine, training.graph, inference.graph, { bindings: mismatched },
+        ),
         /does not match.*with transpose|does not match target/,
       );
     });
@@ -392,17 +395,16 @@ test('WASM quantized LoRA keeps F32 masters and refreshes one unchanged W8 graph
     await t.test('a stale full sidecar is rejected before graph or optimizer mutation', async () => {
       const stalePath = join(directory, 'volvoxai.stale-full.wasm');
       await buildFullWasm(stalePath, { weightSync: false });
-      const staleApi = await VolvoxAI.init('wasm', stalePath);
+      const staleEngine = await WasmEngine.init(stalePath);
+      assert.ok(staleEngine);
       const training = trainingGraph();
       const inference = inferenceGraph();
       const trainingRevision = training.graph.weightRevision;
       const inferenceRevision = inference.graph.weightRevision;
 
       await assert.rejects(
-        staleApi.createQuantizedLoRATrainer(
-          training.graph,
-          inference.graph,
-          { bindings: bindings() },
+        WasmQuantizedLoRATrainer.create(
+          staleEngine, training.graph, inference.graph, { bindings: bindings() },
         ),
         /volvoxai_training_quantize_weight_f32_to_i8.*unavailable/,
       );

@@ -1,4 +1,5 @@
 #include "gemm_f32.h"
+#include "kernel_platform.h"
 #include "thread_pool.h"
 
 #include <limits.h>
@@ -53,14 +54,27 @@
 #endif
 
 enum {
-    VX_GEMM_F32_MR = 4,
+    /* MR is the number of C rows one microkernel call accumulates, so with
+     * NR=8 it is also the number of live ymm accumulators.  It was 4, which
+     * cannot saturate the FMA unit: an FMA retires two per cycle with about
+     * four cycles of latency, so fewer than eight independent chains leaves the
+     * pipeline waiting on its own results no matter how the loads are arranged.
+     * Measured with benchmark_kernel_unit on a Ryzen 5 5600U at one thread, the
+     * packed kernel sat at 8.7 GMAC/s while the unpacked MR4xNR16 kernel in
+     * broadcast_ops.c reached 26.2 on the same 402x320x320 shape.  Eight rows
+     * against NR=8 needs 8 accumulators plus a weight and a broadcast, which
+     * still fits the 16 architectural ymm registers.
+     *
+     * NR stays 8 because it is the packed panel width and the WASM, NEON and
+     * scalar microkernels are all written against it; MR is private to the
+     * blocking loop, so widening it changes no layout. */
+    VX_GEMM_F32_MR = 8,
     VX_GEMM_F32_NR = 8,
     VX_GEMM_F32_FALLBACK_L1_BYTES = 32 * 1024,
     VX_GEMM_F32_MAX_KC = 512,
     VX_GEMM_F32_MIN_KC = 64,
     VX_GEMM_F32_K_ALIGNMENT = 16,
     VX_GEMM_F32_PARALLEL_FLOPS = 256 * 1024,
-    VX_GEMM_F32_MAX_CACHE_NODES = 1024,
 };
 
 #if !defined(__wasm__)
@@ -121,9 +135,16 @@ static void vx_gemm_f32_init_runtime_config(void) {
     g_vx_gemm_f32_tile_config =
         vx_gemm_f32_make_tile_config(vx_gemm_f32_detect_l1_bytes());
 #if VX_GEMM_F32_X86_AVX2
+    /* Ask the resolved platform rather than the CPU directly.  Querying
+     * __builtin_cpu_supports here meant this kernel was the one place that
+     * ignored VOLVOXAI_CPU_ISA, so clamping to baseline still ran the AVX2
+     * microkernel and benchmark_kernel_unit reported both tiers as identical —
+     * which hid the microkernel's throughput from tier comparison entirely.
+     * FMA stays a separate question because the platform record does not
+     * distinguish it. */
     __builtin_cpu_init();
     g_vx_gemm_f32_has_avx2_fma =
-        __builtin_cpu_supports("avx2") && __builtin_cpu_supports("fma");
+        vx_kernel_platform()->has_avx2 && __builtin_cpu_supports("fma");
 #endif
 }
 #endif
@@ -584,26 +605,21 @@ int vx_gemm_f32_run_packed_add(const float* a, const float* packed_b,
 }
 
 #ifndef __wasm__
-typedef struct {
-    const float* source;
-    float* packed;
-    uint32_t k;
-    uint32_t n;
-    int out_in;
-} VxGemmF32CacheEntry;
-
-static VxGemmF32CacheEntry g_vx_gemm_f32_cache[VX_GEMM_F32_MAX_CACHE_NODES];
-
-const float* vx_gemm_f32_pack_cache(int node_index, const float* weight,
+const float* vx_gemm_f32_pack_cache(VxGemmF32Cache* cache, int node_index,
+                                    const float* weight,
                                     uint32_t k, uint32_t n, int out_in) {
     VxGemmF32CacheEntry* entry;
     uint32_t elements;
     float* packed;
-    if (node_index < 0 || node_index >= VX_GEMM_F32_MAX_CACHE_NODES || !weight ||
+    if (!cache || node_index < 0 ||
+        node_index >= VX_GEMM_F32_CACHE_CAPACITY || !weight ||
         (out_in != 0 && out_in != 1)) return NULL;
     elements = vx_gemm_f32_packed_elements(k, n);
-    if (!elements || (size_t)elements > SIZE_MAX / sizeof(float)) return NULL;
-    entry = &g_vx_gemm_f32_cache[node_index];
+    if (!elements) return NULL;
+#if SIZE_MAX <= UINT32_MAX
+    if (elements > SIZE_MAX / sizeof(float)) return NULL;
+#endif
+    entry = &cache->entries[node_index];
     if (entry->packed && entry->source == weight && entry->k == k &&
         entry->n == n && entry->out_in == out_in) return entry->packed;
     free(entry->packed);
@@ -624,14 +640,29 @@ const float* vx_gemm_f32_pack_cache(int node_index, const float* weight,
     return packed;
 }
 
-void vx_gemm_f32_cache_free_all(void) {
-    for (int index = 0; index < VX_GEMM_F32_MAX_CACHE_NODES; index++) {
-        free(g_vx_gemm_f32_cache[index].packed);
-        g_vx_gemm_f32_cache[index].source = NULL;
-        g_vx_gemm_f32_cache[index].packed = NULL;
-        g_vx_gemm_f32_cache[index].k = 0;
-        g_vx_gemm_f32_cache[index].n = 0;
-        g_vx_gemm_f32_cache[index].out_in = 0;
+void vx_gemm_f32_cache_free_all(VxGemmF32Cache* cache) {
+    if (!cache) return;
+    for (int index = 0; index < VX_GEMM_F32_CACHE_CAPACITY; index++) {
+        free(cache->entries[index].packed);
+        cache->entries[index].source = NULL;
+        cache->entries[index].packed = NULL;
+        cache->entries[index].k = 0;
+        cache->entries[index].n = 0;
+        cache->entries[index].out_in = 0;
     }
 }
+#else
+const float* vx_gemm_f32_pack_cache(VxGemmF32Cache* cache, int node_index,
+                                    const float* weight,
+                                    uint32_t k, uint32_t n, int out_in) {
+    (void)cache;
+    (void)node_index;
+    (void)weight;
+    (void)k;
+    (void)n;
+    (void)out_in;
+    return NULL;
+}
+
+void vx_gemm_f32_cache_free_all(VxGemmF32Cache* cache) { (void)cache; }
 #endif

@@ -3,6 +3,7 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include "../../include/volvoxai_enums.h"
 
 #ifndef VOLVOXAI_ENABLE_TRAINING
 #define VOLVOXAI_ENABLE_TRAINING 0
@@ -28,6 +29,28 @@ void metal_graph_debug_counters(uint64_t* dispatches, uint64_t* commits,
 int metal_graph_alias_f32(const float* in, float* out, long n);
 int metal_graph_copy_f32(const float* in, float* out, long n);
 int metal_graph_add_f32(const float* a, const float* b, float* out, long n);
+/* Canonical 32-bit typed control ABI. Compare operation is 0=Equal,
+ * 1=GreaterOrEqual; strides describe a validated right-aligned broadcast. */
+int metal_graph_compare_i32(
+    const int32_t* a, long a_elements,
+    const int32_t* b, long b_elements,
+    int32_t* output, long output_elements,
+    const uint32_t* output_strides,
+    const uint32_t* a_strides,
+    const uint32_t* b_strides,
+    int rank, int operation);
+int metal_graph_not_i32(const int32_t* input, int32_t* output, long elements);
+int metal_graph_clip_i32(const int32_t* input, int32_t* output, long elements,
+                         int32_t minimum, int32_t maximum);
+int metal_graph_where_32(const int32_t* condition, const void* a,
+                         const void* b, void* output, long elements);
+/* Dtypes use canonical VxDataType values; only F32 and I32 are accepted. */
+int metal_graph_cast_typed(const void* input, int input_dtype,
+                           void* output, int output_dtype, long elements);
+int metal_graph_copy_32(const void* input, void* output, long elements);
+int metal_graph_argmax_f32(const float* input, int32_t* output,
+                           uint32_t outer, uint32_t axis_size, uint32_t inner);
+int metal_graph_sigmoid_f32(const float* in, float* out, long n);
 int metal_graph_gelu_f32(const float* in, float* out, long n, int approximate_tanh);
 int metal_graph_silu_f32(const float* in, float* out, long n);
 int metal_graph_layernorm_f32(const float* in, const float* weight, const float* bias,
@@ -39,11 +62,24 @@ int metal_graph_groupnorm_f32(const float* in, const float* weight, const float*
 int metal_graph_dropout_f32(const float* in, float* out, long n, uint32_t threshold,
                             uint32_t seed, uint32_t counter, float scale);
 #endif
+int metal_graph_softmax_f32(const float* in, float* out, int rows, int d);
 int metal_graph_reduce_f32(const float* in, float* out, int rows, int width, float scale);
 int metal_graph_transpose_f32(const float* in, float* out, const int* in_shape,
                               const int* perm, int rank);
+int metal_graph_expand_f32(const float* in, float* out, const int* in_shape,
+                           int in_rank, const int* out_shape, int out_rank);
+int metal_graph_gather_i32_f32(const float* input, const int32_t* indices,
+                               float* output, int outer, int axis_size,
+                               int inner, int indices_elements,
+                               int output_elements);
+int metal_graph_slice4d_f32(const float* in, float* out, const int* in_shape,
+                            int in_rank, const int* out_shape, int out_rank,
+                            const int* starts, const int* steps);
 int metal_graph_concat_f32(const float** inputs, const long* sizes, const int* input_axes,
                            int count, float* out, int output_axis, int inner);
+int metal_graph_concat_32(const void* const* inputs, const long* sizes,
+                          const int* input_axes, int count, void* output,
+                          int output_axis, int inner);
 int metal_graph_linear_f32(const float* in, const float* weight, const float* bias,
                            float* out, int rows, int d_in, int d_out, int out_in_layout);
 int metal_graph_conv2d_f32(const float* in, float* out, const float* weight,
@@ -93,8 +129,8 @@ int metal_graph_quantize_linear_i8(const float* in, signed char* out, long n,
                                    float output_scale, int output_zp);
 int metal_graph_dequantize_linear_f32(const float* in, const float* scale, const float* zero_point,
                                       float* out, long n, int has_zero_point);
-/* Canonical physical-byte W8A8 dense dispatch.  Dtype codes are 2=I8 and
- * 3=U8, matching the portable quantized shader ABI. */
+/* Canonical physical-byte W8A8 dense dispatch. Dtypes use canonical
+ * VX_DTYPE_I8/VX_DTYPE_U8 values. */
 int metal_graph_qlinear_i8u8(const void* input, const void* weight,
                              const float* weight_scales, const int32_t* weight_zero_points,
                              const int32_t* bias, void* output,
@@ -143,6 +179,13 @@ int metal_graph_copy_i8u8(const void* input, uint32_t input_elements,
                           float input_scale, int32_t input_zero_point,
                           float output_scale, int32_t output_zero_point,
                           uint32_t input_dtype, uint32_t output_dtype);
+int metal_graph_transpose_i8u8(const void* input, void* output,
+                               const uint32_t* input_shape,
+                               const uint32_t* permutation, uint32_t rank,
+                               uint32_t elements, float input_scale,
+                               int32_t input_zero_point, float output_scale,
+                               int32_t output_zero_point, uint32_t input_dtype,
+                               uint32_t output_dtype);
 int metal_graph_concat_i8u8(const void* const* inputs, const uint32_t* input_elements,
                             const uint32_t* input_axes, const float* input_scales,
                             const int32_t* input_zero_points, const uint32_t* input_dtypes,
@@ -178,6 +221,13 @@ int metal_graph_qadd_i8u8(const void* a, uint32_t a_elements,
                           float output_scale, int32_t output_zero_point,
                           uint32_t a_dtype, uint32_t b_dtype,
                           uint32_t output_dtype, uint32_t relu);
+int metal_graph_qbatch_matmul_i8u8(
+    const void* a, const int* a_shape, int a_rank,
+    float a_scale, int32_t a_zero_point, uint32_t a_dtype,
+    const void* b, const int* b_shape, int b_rank,
+    float b_scale, int32_t b_zero_point, uint32_t b_dtype,
+    void* output, const int* output_shape, int output_rank,
+    float output_scale, int32_t output_zero_point, uint32_t output_dtype);
 /* Canonical byte-domain SiLU. Input and output stay raw I8/U8 bytes across
  * this route; their descriptors carry the real-value mapping. */
 int metal_graph_qsilu_i8u8(const void* input, void* output, uint32_t elements,

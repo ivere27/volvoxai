@@ -1,4 +1,4 @@
-#include "volvoxai.h"
+#include "engine_core.h"
 #include "engine_internal.h"
 #include "incremental_runtime.h"
 
@@ -16,11 +16,6 @@ struct VolvoxAIDecodeSession {
     int seeded;
     int attached;
 };
-
-/* The native engine owns one global graph and one incremental cache. Keep that
- * ownership explicit: two live sessions could otherwise mistake each other's
- * retained intermediates for their own. */
-static VolvoxAIDecodeSession* g_active_decode_session;
 
 int vx_decode_session_active_locked(void) {
     return g_active_decode_session != NULL;

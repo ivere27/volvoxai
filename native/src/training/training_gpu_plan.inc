@@ -7,21 +7,16 @@
  * executes/synchronizes them. Falls back to the CPU kernels when unsupported.
  */
 
-typedef enum {
-    NATIVE_GPU_TRAINING_NONE = 0,
-    NATIVE_GPU_TRAINING_VULKAN = 1,
-    NATIVE_GPU_TRAINING_OPENGL = 2,
-    NATIVE_GPU_TRAINING_METAL = 3
-} NativeGpuTrainingBackend;
-
-static NativeGpuTrainingBackend g_required_training_backend = NATIVE_GPU_TRAINING_NONE;
-static NativeGpuTrainingBackend g_last_training_backend = NATIVE_GPU_TRAINING_NONE;
-
 int volvoxai_engine_require_training_backend(int backend) {
-    if (backend < NATIVE_GPU_TRAINING_NONE || backend > NATIVE_GPU_TRAINING_METAL) return -1;
+    if (backend != NATIVE_GPU_TRAINING_NONE &&
+        backend != NATIVE_GPU_TRAINING_VULKAN &&
+        backend != NATIVE_GPU_TRAINING_OPENGL &&
+        backend != NATIVE_GPU_TRAINING_METAL &&
+        backend != NATIVE_GPU_TRAINING_CUDA) return -1;
     if ((backend == NATIVE_GPU_TRAINING_VULKAN && !VOLVOXAI_ENABLE_VULKAN) ||
         (backend == NATIVE_GPU_TRAINING_OPENGL && !VOLVOXAI_ENABLE_OPENGL) ||
-        (backend == NATIVE_GPU_TRAINING_METAL && !VOLVOXAI_ENABLE_METAL)) return -1;
+        (backend == NATIVE_GPU_TRAINING_METAL && !VOLVOXAI_ENABLE_METAL) ||
+        (backend == NATIVE_GPU_TRAINING_CUDA && !VOLVOXAI_ENABLE_CUDA)) return -1;
     volvoxai_engine_model_lock();
     g_required_training_backend = (NativeGpuTrainingBackend)backend;
     volvoxai_engine_model_unlock();
@@ -38,7 +33,8 @@ int volvoxai_engine_last_training_backend(void) {
 enum {
     GPU_TRAINING_READ = 1,
     GPU_TRAINING_READ_WRITE = 3,
-    GPU_TRAINING_MAX_BINDINGS = 11
+    GPU_TRAINING_MAX_BINDINGS = 11,
+    GPU_TRAINING_CUDA_BASIC_SCALAR_ITEMS_PER_PARTIAL = 4096
 };
 
 typedef struct {
@@ -61,6 +57,17 @@ typedef struct {
     int owned_capacity;
 } GpuTrainingPlan;
 
+typedef enum {
+    /* Preserve the original executor contract: copy every trainable gradient
+       written by the plan back to its host allocation, then close the backend
+       training scope. */
+    GPU_BACKWARD_EXECUTION_SYNC_TRAINABLES_AND_END = 0,
+    /* CUDA-only train-step plumbing may keep graph slots device-authoritative
+       after dispatch.  A successful call in this mode deliberately leaves the
+       CUDA training scope open until gpu_complete_backward_plan_execution(). */
+    GPU_BACKWARD_EXECUTION_CUDA_DEVICE_RESIDENT = 1
+} GpuBackwardExecutionMode;
+
 #if VOLVOXAI_ENABLE_VULKAN
 static int gpu_vulkan_tensor_requirement_cmp(const void* lhs, const void* rhs) {
     uintptr_t a = (uintptr_t)((const VkTrainingTensorRequirement*)lhs)->host;
@@ -68,8 +75,6 @@ static int gpu_vulkan_tensor_requirement_cmp(const void* lhs, const void* rhs) {
     return a < b ? -1 : (a > b ? 1 : 0);
 }
 #endif
-
-static uint32_t g_gpu_training_dummy[4];
 
 static NativeGpuTrainingBackend gpu_training_select_backend(void) {
 #if VOLVOXAI_ENABLE_VULKAN
@@ -80,6 +85,9 @@ static NativeGpuTrainingBackend gpu_training_select_backend(void) {
 #endif
 #if VOLVOXAI_ENABLE_METAL
     if (g_use_metal && metal_training_available()) return NATIVE_GPU_TRAINING_METAL;
+#endif
+#if VOLVOXAI_ENABLE_CUDA
+    if (g_use_cuda && cuda_training_available()) return NATIVE_GPU_TRAINING_CUDA;
 #endif
     return NATIVE_GPU_TRAINING_NONE;
 }
@@ -93,6 +101,9 @@ static int gpu_training_begin(NativeGpuTrainingBackend backend) {
 #endif
 #if VOLVOXAI_ENABLE_METAL
     if (backend == NATIVE_GPU_TRAINING_METAL) return metal_training_begin();
+#endif
+#if VOLVOXAI_ENABLE_CUDA
+    if (backend == NATIVE_GPU_TRAINING_CUDA) return cuda_training_begin();
 #endif
     return -1;
 }
@@ -118,6 +129,13 @@ static int gpu_training_dispatch(NativeGpuTrainingBackend backend, const GpuTrai
         return metal_training_dispatch(command->shader, command->entry, command->hosts, command->bytes,
                                        command->access, command->is_weight, command->binding_count,
                                        command->groups[0], command->groups[1], command->groups[2]);
+    }
+#endif
+#if VOLVOXAI_ENABLE_CUDA
+    if (backend == NATIVE_GPU_TRAINING_CUDA) {
+        return cuda_training_dispatch(command->shader, command->entry, command->hosts, command->bytes,
+                                      command->access, command->is_weight, command->binding_count,
+                                      command->groups[0], command->groups[1], command->groups[2]);
     }
 #endif
     return -1;
@@ -147,6 +165,15 @@ static int gpu_training_command_supported(NativeGpuTrainingBackend backend,
                                        command->groups[1], command->groups[2]);
     }
 #endif
+#if VOLVOXAI_ENABLE_CUDA
+    if (backend == NATIVE_GPU_TRAINING_CUDA) {
+        return cuda_training_preflight(command->shader, command->entry,
+                                       command->bytes,
+                                       command->binding_count,
+                                       command->groups[0], command->groups[1],
+                                       command->groups[2]);
+    }
+#endif
     return 0;
 }
 
@@ -160,6 +187,9 @@ static int gpu_training_sync(NativeGpuTrainingBackend backend, void* host, size_
 #if VOLVOXAI_ENABLE_METAL
     if (backend == NATIVE_GPU_TRAINING_METAL) return metal_training_sync(host, bytes);
 #endif
+#if VOLVOXAI_ENABLE_CUDA
+    if (backend == NATIVE_GPU_TRAINING_CUDA) return cuda_training_sync(host, bytes);
+#endif
     return -1;
 }
 
@@ -172,6 +202,9 @@ static void gpu_training_end(NativeGpuTrainingBackend backend) {
 #endif
 #if VOLVOXAI_ENABLE_METAL
     if (backend == NATIVE_GPU_TRAINING_METAL) metal_training_end();
+#endif
+#if VOLVOXAI_ENABLE_CUDA
+    if (backend == NATIVE_GPU_TRAINING_CUDA) cuda_training_end();
 #endif
     (void)backend;
 }
@@ -202,7 +235,13 @@ static void* gpu_training_plan_alloc(GpuTrainingPlan* plan, size_t bytes) {
 static int gpu_training_host_is_weight(void* host) {
     if (!host || host == g_gpu_training_dummy) return 0;
     for (int i = 0; i < g_nt; i++) {
-        if (g_t[i].data == host) return !g_t[i].owns;
+        /* owns describes allocation lifetime, not model semantics: graph
+           inputs can borrow storage and dynamically added model weights can
+           own it.  Identify persistent weights by the authoritative model
+           tensor name/storage relationship instead.  Keep scanning aliases so
+           a non-weight tensor sharing the allocation cannot hide the weight. */
+        if (g_t[i].data == host &&
+            volvoxai_engine_tensor_is_model_weight_locked(g_t[i].name)) return 1;
     }
     return 0;
 }
@@ -343,9 +382,10 @@ static int gpu_plan_binary(GpuTrainingPlan* plan, float** grads, Node* n, T* out
     T* a_tensor = nin(n, "a");
     if (!a_tensor) a_tensor = node_input_default(n);
     T* b_tensor = nin(n, "b");
+    int relu = kind == 0 ? p_int(n->params, "relu", 0) : 0;
     if (!a_tensor || !b_tensor || !out || !go || a_tensor->dtype != T_F32 ||
         b_tensor->dtype != T_F32 || out->dtype != T_F32 || out->ndim < 0 || out->ndim > 8 ||
-        (kind == 0 && p_int(n->params, "relu", 0) != 0)) return -1;
+        relu < 0 || relu > 2) return -1;
     uint32_t a_strides[8], b_strides[8], output_strides[8] = {0};
     if (gpu_broadcast_strides(a_tensor, out, a_strides) != 0 ||
         gpu_broadcast_strides(b_tensor, out, b_strides) != 0) return -1;
@@ -360,6 +400,7 @@ static int gpu_plan_binary(GpuTrainingPlan* plan, float** grads, Node* n, T* out
     if (!params) return -1;
     params[0] = (uint32_t)out->ndim; params[1] = (uint32_t)out->numel;
     params[2] = (uint32_t)a_tensor->numel; params[3] = (uint32_t)b_tensor->numel; params[4] = kind;
+    params[5] = (uint32_t)relu;
     memcpy(params + 8, output_strides, sizeof(output_strides));
     memcpy(params + 16, a_strides, sizeof(a_strides));
     memcpy(params + 24, b_strides, sizeof(b_strides));
@@ -377,10 +418,40 @@ static int gpu_plan_binary(GpuTrainingPlan* plan, float** grads, Node* n, T* out
     access[3] = access[4] = GPU_TRAINING_READ_WRITE;
     uint32_t ga_groups = gpu_groups_64(a_tensor->numel);
     uint32_t gb_groups = gpu_groups_64(b_tensor->numel);
+    const char* ga_entry = "a_main";
+    const char* gb_entry = "b_main";
+    if (gpu_training_select_backend() == NATIVE_GPU_TRAINING_CUDA) {
+        /* Explicit CUDA tactics: large scalar broadcasts use a deterministic
+           staged reduction; small genuine broadcasts use one cooperative
+           block per destination. Identity and larger general broadcasts
+           retain their established entry points/contracts. */
+        if (a_tensor->numel == 1 && out->numel >
+                GPU_TRAINING_CUDA_BASIC_SCALAR_ITEMS_PER_PARTIAL) {
+            ga_entry = "a_scalar_staged";
+            ga_groups = gpu_groups_n(
+                out->numel,
+                GPU_TRAINING_CUDA_BASIC_SCALAR_ITEMS_PER_PARTIAL);
+        } else if (a_tensor->numel > 1 && a_tensor->numel <= 1024 &&
+            a_tensor->numel < out->numel) {
+            ga_entry = "a_cooperative";
+            ga_groups = (uint32_t)a_tensor->numel;
+        }
+        if (b_tensor->numel == 1 && out->numel >
+                GPU_TRAINING_CUDA_BASIC_SCALAR_ITEMS_PER_PARTIAL) {
+            gb_entry = "b_scalar_staged";
+            gb_groups = gpu_groups_n(
+                out->numel,
+                GPU_TRAINING_CUDA_BASIC_SCALAR_ITEMS_PER_PARTIAL);
+        } else if (b_tensor->numel > 1 && b_tensor->numel <= 1024 &&
+            b_tensor->numel < out->numel) {
+            gb_entry = "b_cooperative";
+            gb_groups = (uint32_t)b_tensor->numel;
+        }
+    }
     if (!ga_groups || !gb_groups ||
-        gpu_training_plan_add(plan, "basicBackward", "a_main", hosts, bytes, access, 6,
+        gpu_training_plan_add(plan, "basicBackward", ga_entry, hosts, bytes, access, 6,
                               ga_groups, 1, 1) != 0 ||
-        gpu_training_plan_add(plan, "basicBackward", "b_main", hosts, bytes, access, 6,
+        gpu_training_plan_add(plan, "basicBackward", gb_entry, hosts, bytes, access, 6,
                               gb_groups, 1, 1) != 0) return -1;
     return 0;
 }
@@ -639,17 +710,26 @@ static int gpu_plan_layernorm(GpuTrainingPlan* plan, float** grads, Node* n, T* 
     int d_model = in->shape[in->ndim - 1];
     long rows = d_model > 0 ? in->numel / d_model : 0;
     int requested_d_model = p_int(n->params, "d_model", d_model);
+    float epsilon = p_flt(n->params, "eps", 1.0e-6f);
     if (d_model <= 0 || requested_d_model != d_model || rows <= 0 || rows > UINT32_MAX ||
-        weight->numel != d_model || (bias && bias->numel != d_model) || out->numel != in->numel) return -1;
+        in->numel > UINT32_MAX || in->numel != rows * (long)d_model ||
+        !(epsilon > 0.0f) || !isfinite(epsilon) ||
+        weight->numel < d_model || (bias && bias->numel < d_model) ||
+        out->numel != in->numel) return -1;
+    NativeGpuTrainingBackend backend = gpu_training_select_backend();
+    int cooperative_param = backend == NATIVE_GPU_TRAINING_CUDA && rows > 64;
     uint32_t* params = (uint32_t*)gpu_training_plan_alloc(plan, 4 * sizeof(uint32_t));
     float* gi = grad_for(grads, in);
     float* gw = grad_for(grads, weight);
     float* gb = bias ? grad_for(grads, bias) : NULL;
     uint32_t input_groups = gpu_groups_64(in->numel);
-    uint32_t param_groups = gpu_groups_64(d_model);
+    uint32_t param_groups = cooperative_param
+        ? (uint32_t)d_model : gpu_groups_64(d_model);
+    const char* param_entry = cooperative_param
+        ? "param_cooperative" : "param_main";
     if (!params || !gi || !gw || (bias && !gb) || !input_groups || !param_groups) return -1;
     params[0] = (uint32_t)rows; params[1] = (uint32_t)d_model;
-    params[2] = f32_bits(p_flt(n->params, "eps", 1.0e-6f)); params[3] = bias ? 1u : 0u;
+    params[2] = f32_bits(epsilon); params[3] = bias ? 1u : 0u;
     void* hosts[7]; size_t bytes[7]; unsigned char access[7];
     gpu_bindings_init(hosts, bytes, access, 7);
     gpu_binding_tensor(hosts, bytes, 0, in);
@@ -662,7 +742,7 @@ static int gpu_plan_layernorm(GpuTrainingPlan* plan, float** grads, Node* n, T* 
     access[3] = access[4] = access[5] = GPU_TRAINING_READ_WRITE;
     if (gpu_training_plan_add(plan, "layerNormBackward", "input_main", hosts, bytes, access, 7,
                               input_groups, 1, 1) != 0 ||
-        gpu_training_plan_add(plan, "layerNormBackward", "param_main", hosts, bytes, access, 7,
+        gpu_training_plan_add(plan, "layerNormBackward", param_entry, hosts, bytes, access, 7,
                               param_groups, 1, 1) != 0) return -1;
     return 0;
 }
@@ -678,14 +758,24 @@ static int gpu_plan_groupnorm(GpuTrainingPlan* plan, float** grads, Node* n, T* 
     if (!go || !(epsilon > 0.0f) || !isfinite(epsilon) ||
         groupnorm_dimensions(in, out, weight, bias, groups, &batch, &height,
                              &width, &channels) != 0) return -1;
+    NativeGpuTrainingBackend backend = gpu_training_select_backend();
     uint64_t total_groups = (uint64_t)(uint32_t)batch * (uint32_t)groups;
-    if (total_groups == 0 || total_groups > UINT32_MAX) return -1;
+    if (total_groups == 0 || total_groups > UINT32_MAX ||
+        (backend == NATIVE_GPU_TRAINING_CUDA && total_groups > INT_MAX))
+        return -1;
     uint32_t* params = (uint32_t*)gpu_training_plan_alloc(plan, 8 * sizeof(uint32_t));
     float* gi = grad_for(grads, in);
     float* gw = grad_for(grads, weight);
     float* gb = bias ? grad_for(grads, bias) : NULL;
-    uint32_t input_groups = gpu_groups_64((long)total_groups);
-    uint32_t parameter_groups = gpu_groups_64(channels);
+    /* CUDA assigns one cooperative 64-lane block to each sample/group.
+       Its parameter kernel likewise assigns one block to each channel.
+       Shader backends retain their one-invocation-per-output contract. */
+    uint32_t input_groups = backend == NATIVE_GPU_TRAINING_CUDA
+        ? (uint32_t)total_groups : gpu_groups_64((long)total_groups);
+    uint32_t parameter_groups = backend == NATIVE_GPU_TRAINING_CUDA
+        ? (uint32_t)channels : gpu_groups_64(channels);
+    const char* parameter_entry = backend == NATIVE_GPU_TRAINING_CUDA
+        ? "param_cooperative" : "param_main";
     if (!params || !gi || !gw || (bias && !gb) || !input_groups || !parameter_groups)
         return -1;
     params[0] = (uint32_t)batch;
@@ -707,7 +797,7 @@ static int gpu_plan_groupnorm(GpuTrainingPlan* plan, float** grads, Node* n, T* 
     access[3] = access[4] = access[5] = GPU_TRAINING_READ_WRITE;
     if (gpu_training_plan_add(plan, "groupNormBackward", "input_main", hosts, bytes,
                               access, 7, input_groups, 1, 1) != 0 ||
-        gpu_training_plan_add(plan, "groupNormBackward", "param_main", hosts, bytes,
+        gpu_training_plan_add(plan, "groupNormBackward", parameter_entry, hosts, bytes,
                               access, 7, parameter_groups, 1, 1) != 0) return -1;
     return 0;
 }
@@ -720,7 +810,7 @@ static int gpu_plan_rmsnorm(GpuTrainingPlan* plan, float** grads, Node* n, T* ou
     int d_model = p_int(n->params, "d_model", in->shape[in->ndim - 1]);
     long rows = d_model > 0 ? in->numel / d_model : 0;
     if (d_model <= 0 || rows <= 0 || in->numel != rows * d_model || rows > UINT32_MAX ||
-        weight->numel != d_model || out->numel != in->numel) return -1;
+        weight->numel < d_model || out->numel != in->numel) return -1;
     uint32_t* params = (uint32_t*)gpu_training_plan_alloc(plan, 4 * sizeof(uint32_t));
     float* gi = grad_for(grads, in);
     float* gw = grad_for(grads, weight);
@@ -848,7 +938,8 @@ static int gpu_plan_resize(GpuTrainingPlan* plan, float** grads, Node* n, T* out
 }
 
 static int gpu_plan_concat(GpuTrainingPlan* plan, float** grads, Node* n, T* out, float* go) {
-    if (!n || !out || !go || out->dtype != T_F32 || out->ndim <= 0 || n->nin <= 0) return -1;
+    if (!n || !out || !go || out->dtype != T_F32 || out->ndim <= 0 ||
+        n->nin <= 0 || p_int(n->params, "sigmoid", 0) != 0) return -1;
     int axis = p_int(n->params, "axis", 1);
     if (axis < 0) axis += out->ndim;
     if (axis < 0 || axis >= out->ndim) return -1;
@@ -898,22 +989,12 @@ static int gpu_plan_split(GpuTrainingPlan* plan, float** grads, Node* n) {
     long outer = in->numel / ((long)in->shape[axis] * inner);
     if (outer <= 0 || in->numel != outer * in->shape[axis] * inner) return -1;
 
-    int order[MAXIN];
-    for (int i = 0; i < n->nout; i++) order[i] = i;
-    for (int i = 0; i < n->nout; i++) {
-        for (int j = i + 1; j < n->nout; j++) {
-            if (strcmp(n->outs[order[j]].key, n->outs[order[i]].key) < 0) {
-                int tmp = order[i]; order[i] = order[j]; order[j] = tmp;
-            }
-        }
-    }
-
     float* gi = grad_for(grads, in);
     if (!gi) return -1;
     int axis_offset = 0;
     int live_outputs = 0;
     for (int oi = 0; oi < n->nout; oi++) {
-        T* out = t_find(n->outs[order[oi]].name);
+        T* out = t_find(n->outs[oi].name);
         if (!out || out->dtype != T_F32 || out->ndim != in->ndim ||
             out->shape[axis] <= 0 || out->numel > UINT32_MAX) return -1;
         for (int d = 0; d < in->ndim; d++) {
@@ -963,22 +1044,37 @@ static int gpu_plan_conv2d(GpuTrainingPlan* plan, float** grads, Node* n, T* out
     int pads[4] = {py, px, py, px};
     if (n->params && cJSON_GetObjectItem(n->params, "pads")) p_iarr(n->params, "pads", pads, 4, 0);
     int groups = p_int(n->params, "groups", 1);
-    const char* layout = p_str(n->params, "weight_layout", "");
+    int relu = n->fuse_relu6 ? 2 : p_int(n->params, "relu", 0);
+    const char* layout = p_str(n->params, "weight_layout",
+                               groups == in_c ? "1HWO" : "OHWI");
     int kh = 0, kw = 0;
+    uint32_t layout_kind = 0u;
     if (batch <= 0 || in_h <= 0 || in_w <= 0 || in_c <= 0 || out_h <= 0 || out_w <= 0 ||
         out_c <= 0 || out->shape[0] != batch || sy <= 0 || sx <= 0 || dy <= 0 || dx <= 0 ||
         pads[0] < 0 || pads[1] < 0 || groups <= 0 || in_c % groups || out_c % groups ||
+        relu < 0 || relu > 2 ||
         (bias && bias->numel != out_c)) return -1;
     if (groups == in_c && layout_is(layout, "HWCM")) {
         int multiplier = out_c / in_c;
         if (out_c % in_c || weight->shape[2] != in_c || weight->shape[3] != multiplier) return -1;
         kh = weight->shape[0]; kw = weight->shape[1];
+        layout_kind = 1u;
+    } else if (groups == in_c &&
+               (layout_is(layout, "1HWO") || layout_is(layout, "1HWM"))) {
+        if (out_c % in_c || weight->shape[0] != 1 ||
+            weight->shape[3] != out_c) return -1;
+        kh = weight->shape[1]; kw = weight->shape[2];
+        layout_kind = 3u;
     } else if (layout_is(layout, "HWIO")) {
         kh = weight->shape[0]; kw = weight->shape[1];
         if (weight->shape[2] != in_c / groups || weight->shape[3] != out_c) return -1;
+        layout_kind = 0u;
+    } else if (layout_is(layout, "OHWI")) {
+        if (weight->shape[0] != out_c ||
+            weight->shape[3] != in_c / groups) return -1;
+        kh = weight->shape[1]; kw = weight->shape[2];
+        layout_kind = 2u;
     } else {
-        /* The portable backward shader consumes HWIO/HWCM directly. Native
-           OHWI/1HWO weights remain supported by the CPU fallback. */
         return -1;
     }
     if (kh <= 0 || kw <= 0 || weight->numel > UINT32_MAX) return -1;
@@ -995,8 +1091,9 @@ static int gpu_plan_conv2d(GpuTrainingPlan* plan, float** grads, Node* n, T* out
     params[6] = (uint32_t)out_c; params[7] = (uint32_t)kh; params[8] = (uint32_t)kw;
     params[9] = (uint32_t)sy; params[10] = (uint32_t)sx; params[11] = (uint32_t)pads[0];
     params[12] = (uint32_t)pads[1]; params[13] = (uint32_t)groups; params[14] = (uint32_t)dy;
-    params[15] = (uint32_t)dx; params[16] = (uint32_t)(n->fuse_relu6 ? 2 : p_int(n->params, "relu", 0));
+    params[15] = (uint32_t)dx; params[16] = (uint32_t)relu;
     params[17] = bias ? 1u : 0u; params[18] = (uint32_t)weight->numel;
+    params[19] = layout_kind;
     void* hosts[8]; size_t bytes[8]; unsigned char access[8];
     gpu_bindings_init(hosts, bytes, access, 8);
     gpu_binding_tensor(hosts, bytes, 0, in);
@@ -1298,11 +1395,12 @@ static int gpu_build_backward_plan(GpuTrainingPlan* plan, float** grads) {
     return 0;
 }
 
-static int gpu_execute_backward_plan(NativeGpuTrainingBackend backend, const GpuTrainingPlan* plan,
-                                     float** grads, const char* const* trainable_names,
-                                     int trainable_count) {
-    if (backend == NATIVE_GPU_TRAINING_NONE || !plan || !grads || !trainable_names ||
-        trainable_count <= 0) return -1;
+/* Validate an entire plan before gpu_training_begin() can mutate backend
+   state.  Return 0 when every command is supported, 1 when the selected
+   backend cannot execute the plan, and -1 for an internal/allocation error. */
+static int gpu_preflight_backward_plan(NativeGpuTrainingBackend backend,
+                                       const GpuTrainingPlan* plan) {
+    if (backend == NATIVE_GPU_TRAINING_NONE || !plan) return -1;
 #if VOLVOXAI_ENABLE_VULKAN
     if (backend == NATIVE_GPU_TRAINING_VULKAN) {
         if (plan->command_count <= 0) return 1;
@@ -1365,47 +1463,107 @@ static int gpu_execute_backward_plan(NativeGpuTrainingBackend backend, const Gpu
             return 1;
         }
     }
-    if (gpu_training_begin(backend) != 0) {
-        if (g_debug) fprintf(stderr, "[debug] GPU backward begin failed backend=%d\n", backend);
-        return -1;
+    return 0;
+}
+
+/* Close the scope opened by gpu_execute_preflighted_backward_plan().  For the
+   CUDA resident mode this is intentionally a separate caller-controlled step:
+   cuda_training_end() synchronizes the stream and releases transient
+   activation/gradient slots, so accumulation/optimizer work must be enqueued
+   before that boundary. Stable model-weight slots remain resident. */
+static void gpu_complete_backward_plan_execution(NativeGpuTrainingBackend backend) {
+    gpu_training_end(backend);
+}
+
+static int gpu_sync_backward_plan_trainable_gradients(
+        NativeGpuTrainingBackend backend, const GpuTrainingPlan* plan,
+        float** grads, const char* const* trainable_names, int trainable_count) {
+    if (backend == NATIVE_GPU_TRAINING_NONE || !plan || !grads || !trainable_names ||
+        trainable_count <= 0) return -1;
+    for (int i = 0; i < trainable_count; i++) {
+        T* tensor = t_find(trainable_names[i]);
+        float* gradient = grad_existing(grads, tensor);
+        if (!tensor || !gradient) return -1;
+        int written_on_gpu = 0;
+        for (int command_index = 0; command_index < plan->command_count && !written_on_gpu;
+             command_index++) {
+            const GpuTrainingCommand* command = &plan->commands[command_index];
+            for (int binding = 0; binding < command->binding_count; binding++) {
+                if (command->hosts[binding] == gradient &&
+                    command->access[binding] == GPU_TRAINING_READ_WRITE) {
+                    written_on_gpu = 1;
+                    break;
+                }
+            }
+        }
+        if (written_on_gpu && gpu_training_sync(backend, gradient,
+                (size_t)tensor->numel * sizeof(float)) != 0) return -1;
     }
-    int rc = 0;
+    return 0;
+}
+
+/* Dispatch only. The caller owns an already-open backend training scope and
+   is responsible for closing it on every outcome. This seam lets CUDA seed
+   loss gradients and zero tape buffers on the same stream before backward. */
+static int gpu_dispatch_preflighted_backward_plan(
+        NativeGpuTrainingBackend backend, const GpuTrainingPlan* plan) {
+    if (backend == NATIVE_GPU_TRAINING_NONE || !plan) return -1;
     for (int i = 0; i < plan->command_count; i++) {
         if (gpu_training_dispatch(backend, &plan->commands[i]) != 0) {
             if (g_debug) fprintf(stderr,
                 "[debug] GPU backward dispatch failed index=%d shader='%s' entry='%s'\n",
                 i, plan->commands[i].shader, plan->commands[i].entry);
-            rc = -1;
-            break;
+            return -1;
         }
     }
-    if (rc == 0) {
-        for (int i = 0; i < trainable_count; i++) {
-            T* tensor = t_find(trainable_names[i]);
-            float* gradient = grad_existing(grads, tensor);
-            if (!tensor || !gradient) {
-                rc = -1;
-                break;
-            }
-            int written_on_gpu = 0;
-            for (int command_index = 0; command_index < plan->command_count && !written_on_gpu;
-                 command_index++) {
-                const GpuTrainingCommand* command = &plan->commands[command_index];
-                for (int binding = 0; binding < command->binding_count; binding++) {
-                    if (command->hosts[binding] == gradient &&
-                        command->access[binding] == GPU_TRAINING_READ_WRITE) {
-                        written_on_gpu = 1;
-                        break;
-                    }
-                }
-            }
-            if (written_on_gpu && gpu_training_sync(backend, gradient,
-                    (size_t)tensor->numel * sizeof(float)) != 0) {
-                rc = -1;
-                break;
-            }
-        }
+    return 0;
+}
+
+/* Dispatch a plan whose full command set has already passed
+   gpu_preflight_backward_plan(). The host-synchronized mode copies trainable
+   gradients and ends the scope. The CUDA resident mode performs no trainable-gradient
+   D2H copies and, on success, leaves the CUDA training scope open; its caller
+   must eventually call gpu_complete_backward_plan_execution().  Dispatch
+   failure always closes the scope because no further device work is safe. */
+static int gpu_execute_preflighted_backward_plan(
+        NativeGpuTrainingBackend backend, const GpuTrainingPlan* plan,
+        float** grads, const char* const* trainable_names, int trainable_count,
+        GpuBackwardExecutionMode mode) {
+    if (backend == NATIVE_GPU_TRAINING_NONE || !plan ||
+        (mode != GPU_BACKWARD_EXECUTION_SYNC_TRAINABLES_AND_END &&
+         mode != GPU_BACKWARD_EXECUTION_CUDA_DEVICE_RESIDENT) ||
+        (mode == GPU_BACKWARD_EXECUTION_CUDA_DEVICE_RESIDENT &&
+         backend != NATIVE_GPU_TRAINING_CUDA) ||
+        (mode == GPU_BACKWARD_EXECUTION_SYNC_TRAINABLES_AND_END &&
+         (!grads || !trainable_names || trainable_count <= 0))) return -1;
+    if (gpu_training_begin(backend) != 0) {
+        if (g_debug) fprintf(stderr, "[debug] GPU backward begin failed backend=%d\n", backend);
+        return -1;
     }
-    gpu_training_end(backend);
+    int rc = gpu_dispatch_preflighted_backward_plan(backend, plan);
+    if (rc != 0) {
+        gpu_complete_backward_plan_execution(backend);
+        return -1;
+    }
+    if (mode == GPU_BACKWARD_EXECUTION_CUDA_DEVICE_RESIDENT) return 0;
+    rc = gpu_sync_backward_plan_trainable_gradients(
+        backend, plan, grads, trainable_names, trainable_count);
+    gpu_complete_backward_plan_execution(backend);
     return rc;
+}
+
+/* Compatibility executor used by every existing training path.  Its return
+   contract and lifecycle remain unchanged: 1 means unsupported/preflight
+   rejection, 0 means gradients are host-visible and the backend is closed,
+   and -1 means execution failed with the backend closed when it had begun. */
+static int gpu_execute_backward_plan(NativeGpuTrainingBackend backend, const GpuTrainingPlan* plan,
+                                     float** grads, const char* const* trainable_names,
+                                     int trainable_count) {
+    if (backend == NATIVE_GPU_TRAINING_NONE || !plan || !grads || !trainable_names ||
+        trainable_count <= 0) return -1;
+    int preflight = gpu_preflight_backward_plan(backend, plan);
+    if (preflight != 0) return preflight;
+    return gpu_execute_preflighted_backward_plan(
+        backend, plan, grads, trainable_names, trainable_count,
+        GPU_BACKWARD_EXECUTION_SYNC_TRAINABLES_AND_END);
 }

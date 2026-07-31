@@ -2,38 +2,15 @@
 
 #include "adapter_runtime_internal.h"
 #include "backend_manager.h"
-#include "backend_sdk.h"
 
 #include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
-/* The ordinary forward path remains stateless. These tensors and flags belong
- * only to the opt-in dependency scheduler. */
-static unsigned char g_dirty[MAXT];
-static int g_cache_valid;
-static int g_arena_detached;
-static int g_hybrid_row_active;
-static unsigned char g_hybrid_row_nodes[MAXN];
-static int g_hybrid_prepared_row = -1;
-
 /* Resolve graph references once per model generation.  The persisted graph
  * spelling remains name based, but dependency scheduling is a hot execution
  * path and must not linearly scan the tensor table for every edge/token. */
-typedef struct {
-    uint64_t generation;
-    int tensor_count;
-    int node_count;
-    int input_indices[MAXN][MAXIN];
-    int output_indices[MAXN][MAXIN + 1];
-    unsigned char input_counts[MAXN];
-    unsigned char output_counts[MAXN];
-    int valid;
-} VxIncrementalPlan;
-
-static VxIncrementalPlan g_incremental_plan;
-
 static int incremental_plan_build_locked(void) {
     const uint64_t generation = volvoxai_engine_model_generation_locked();
     if (g_incremental_plan.valid &&
@@ -91,8 +68,8 @@ void vx_incremental_invalidate_locked(void) {
     g_cache_valid = 0;
     g_hybrid_row_active = 0;
     g_hybrid_prepared_row = -1;
-    /* DecodeSession is a stateful view of this single global cache. Any
-     * legacy execution, model mutation, or failed incremental run that drops
+    /* DecodeSession is a stateful view of this context's cache. Any
+     * execution, model mutation, or failed incremental run that drops
      * the cache must also make the view require a fresh seed. */
     vx_decode_session_invalidate_cache_locked();
 }
@@ -103,7 +80,7 @@ static void restore_arena_locked(void) {
     g_arena_detached = 0;
     /* Arena planning changes activation host addresses. Device slot tables
      * are keyed by those addresses and must be rebuilt with the new plan. */
-    vx_runtime_backend_reset();
+    vx_runtime_backend_reset_transients();
 }
 
 void vx_incremental_prepare_ordinary_locked(void) {
@@ -117,7 +94,6 @@ void vx_incremental_mark_tensor_locked(T* tensor) {
     index = tensor - g_t;
     if (index >= 0 && index < g_nt) {
         g_dirty[index] = 1;
-        g_qt[index].valid = 0;
         g_hybrid_prepared_row = -1;
     }
 }
@@ -134,7 +110,6 @@ static void prepare_dirty_outputs(int node) {
     for (int output = 0; output < g_incremental_plan.output_counts[node]; output++) {
         int index = g_incremental_plan.output_indices[node][output];
         g_dirty[index] = 1;
-        g_qt[index].valid = 0;
     }
 }
 
@@ -167,12 +142,20 @@ static int hybrid_row_disabled(void) {
 
 static int hybrid_device_backend_selected(void) {
     VolvoxAIEngineBackend backend;
-    if (vx_sdk_selected_backend() || !vx_runtime_backend_has_graph() ||
-        hybrid_row_disabled()) return 0;
+    if (!vx_runtime_backend_has_graph() || hybrid_row_disabled()) return 0;
     backend = vx_backend_manager_current();
     return backend == VOLVOXAI_BACKEND_VULKAN ||
         backend == VOLVOXAI_BACKEND_OPENGL ||
         backend == VOLVOXAI_BACKEND_METAL;
+}
+
+static int cuda_resident_backend_selected(void) {
+#if VOLVOXAI_ENABLE_CUDA
+    return vx_runtime_backend_has_graph() &&
+        vx_backend_manager_current() == VOLVOXAI_BACKEND_CUDA;
+#else
+    return 0;
+#endif
 }
 
 static int hybrid_tensor_prefix_bytes(const T* tensor, int row, size_t* bytes_out) {
@@ -380,14 +363,15 @@ int vx_incremental_forward_locked(int row) {
         return -1;
     }
     /* A row update is valid only after a complete dependency-cache seed. A
-     * changed weight invalidates every retained operator-cache row. Built-in
-     * device graphs may relinquish a validated prefix to the CPU exactly
-     * once; public backends remain outside that private ownership contract. */
+     * changed weight invalidates every retained operator-cache row. Vulkan,
+     * OpenGL, and Metal may relinquish a validated prefix to the CPU exactly
+     * once; CUDA keeps the changed closure resident and launches row kernels. */
     if (row_execution && (!g_cache_valid || weights_changed)) {
         vx_incremental_invalidate_locked();
         return -1;
     }
     if (row_execution && vx_runtime_backend_has_graph() &&
+        !cuda_resident_backend_selected() &&
         g_hybrid_prepared_row != row) {
         if (vx_incremental_prepare_hybrid_row_locked(row) != 1) {
             vx_incremental_invalidate_locked();
@@ -415,23 +399,25 @@ int vx_incremental_forward_locked(int row) {
     g_active_row = row;
     if (row_execution) g_execution_row = row;
     g_prefix_rows = 0;
+    g_prefix_row_capacity = 0;
     if (force_full) {
         /* The ordinary arena aliases buffers after their last use in one full
          * pass. Cached branches outlive that schedule, so give every planned
          * activation independent storage before producing the cache. */
         if (volvoxai_engine_prepare_tensor_table_mutation() != 0) goto done;
         g_arena_detached = 1;
-        vx_runtime_backend_reset();
-        qt_invalidate_all();
+        vx_runtime_backend_reset_transients();
         if (vx_runtime_backend_has_graph()) {
-            vx_runtime_backend_begin_forward();
+            vx_runtime_backend_begin_forward(
+                0, volvoxai_engine_model_generation_locked());
             backend_forward_started = 1;
         }
         vk_mark_owned_tensors_host_dirty();
     } else if (vx_runtime_backend_has_graph() && !g_hybrid_row_active) {
         /* Preserve skipped device-resident tensors. Changed graph inputs were
          * individually marked host-dirty by set_input_raw(). */
-        vx_runtime_backend_begin_forward();
+        vx_runtime_backend_begin_forward(
+            0, volvoxai_engine_model_generation_locked());
         backend_forward_started = 1;
     }
     if (g_debug) prof_reset();
@@ -456,7 +442,7 @@ int vx_incremental_forward_locked(int row) {
 done:
     if (backend_forward_started) {
         double wait_t0 = g_debug ? volvoxai_engine_now_ms() : 0.0;
-        if (vx_runtime_backend_end_forward() != 0) rc = -1;
+        if (vx_runtime_backend_end_forward(rc == 0) != 0) rc = -1;
         if (g_debug) prof_add_entry("GPUWait", volvoxai_engine_now_ms() - wait_t0);
     }
     if (rc == 0 && g_debug) {
@@ -474,8 +460,10 @@ done:
 }
 
 int vx_incremental_row_supported_locked(void) {
-    if (!g_loaded || vx_sdk_selected_backend()) return 0;
+    if (!g_loaded) return 0;
     if (!vx_runtime_backend_has_graph()) return 1;
+    if (cuda_resident_backend_selected())
+        return hybrid_model_has_row_closure_locked();
     return hybrid_device_backend_selected() && hybrid_model_has_row_closure_locked();
 }
 

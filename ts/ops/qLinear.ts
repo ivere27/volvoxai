@@ -134,11 +134,19 @@ export function _cpuQLinear(node) {
 
   const inputScale = f32Scale(inputQuantization.scale, 'input', node);
   const outputScale = f32Scale(outputQuantization.scale, 'output', node);
+  const multipliers = Float32Array.from(weightQuantization.scales, (scale, outputChannel) => {
+    const weightScale = f32Scale(scale, `weight[${outputChannel}]`, node);
+    return Math.fround(Math.fround(inputScale * weightScale) / outputScale);
+  });
+  if (!multipliers.every((multiplier) => Number.isFinite(multiplier) && multiplier > 0)) {
+    throw new Error(
+      `QLinear node ${nodeLabel(node)} requantization multiplier is not representable as positive F32.`,
+    );
+  }
   const outputMinimum = output.dtype === 'int8' ? -128 : 0;
   const outputMaximum = output.dtype === 'int8' ? 127 : 255;
   for (let outputChannel = 0; outputChannel < dOut; outputChannel++) {
-    const weightScale = f32Scale(weightQuantization.scales[outputChannel], `weight[${outputChannel}]`, node);
-    const multiplier = Math.fround(Math.fround(inputScale * weightScale) / outputScale);
+    const multiplier = multipliers[outputChannel];
     const weightZeroPoint = weightQuantization.zero_points[outputChannel];
     for (let row = 0; row < rows; row++) {
       let accumulator = bias.buffer[outputChannel];

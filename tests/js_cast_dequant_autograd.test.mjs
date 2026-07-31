@@ -1,8 +1,9 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
-import { CPUEngine, Graph } from '../ts/index.js';
-import { CPUAutograd } from '../ts/training/index.js';
+import { Graph } from '../ts/index.js';
+import { CPUEngine } from '../ts/backends/CPUEngine.js';
+import { CPUAutograd } from '../ts/training/CPUAutograd.js';
 
 async function loss(graph, engine, targets) {
   await engine.execute({});
@@ -38,7 +39,7 @@ test('floating Cast propagates its identity gradient', async () => {
   const graph = new Graph();
   const input = graph.addWeight('input', [1, 2], 'float32', { buffer: Float32Array.of(0.2, -0.4) });
   const { out } = graph.addOp('Cast', { input }, { out: [1, 2] }, { to: 'float32' });
-  graph.outputNames = [out.name];
+  graph.setOutputs([out.name]);
   const result = await CPUAutograd.trainStep(graph, {
     targets: [1], trainableTensors: ['input'], updateMode: 'sgd', optimizer: { learningRate: 0 },
   });
@@ -53,7 +54,7 @@ test('DequantizeLinear propagates F32 input and scalar-scale gradients', async (
   const scale = graph.addWeight('scale', [1], 'float32', { buffer: Float32Array.of(0.8) });
   const zeroPoint = graph.addWeight('zero', [1], 'float32', { buffer: Float32Array.of(0.1) });
   const { out } = graph.addOp('DequantizeLinear', { input, scale, zero_point: zeroPoint }, { out: [1, 2] });
-  graph.outputNames = [out.name];
+  graph.setOutputs([out.name]);
   const result = await CPUAutograd.trainStep(graph, {
     targets: [0], trainableTensors: ['input', 'scale'], updateMode: 'sgd', optimizer: { learningRate: 0 },
   });

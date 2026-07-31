@@ -8,6 +8,8 @@ import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
 
 import { Graph } from '../ts/core/Graph.js';
+import { ModelSnapshot } from '../ts/core/ModelSnapshot.js';
+import { BuiltInBackendProvider } from '../ts/backends/BackendProvider.js';
 import { CPUEngine } from '../ts/backends/CPUEngine.js';
 import { WasmEngine } from '../ts/backends/WasmEngine.js';
 
@@ -56,7 +58,7 @@ function qlinearGraph({
       quantization: outputQuantization,
     },
   });
-  graph.outputNames = [out.name];
+  graph.setOutputs([out.name]);
   return {
     graph,
     inputValues: byteStorage(inputDtype, inputValues),
@@ -133,6 +135,50 @@ test('portable WASM QLinear keeps W8A8 storage and matches the CPU reference', {
     assert.equal(typeof wasm.api.qlinear_i8u8, 'function', 'forward WASM exports qlinear_i8u8');
     forbidCpuDenseFallback(wasm);
 
+    await t.test('provider captures stable snapshots from transient WASM arena views', async () => {
+      const spec = {
+        inputValues: [3, -2, 5], inputShape: [1, 3],
+        inputQuantization: { scheme: 'per_tensor', scale: 0.25, zero_point: -1 },
+        weightValues: [2, 0, -1, -2, 1, 3], weightShape: [2, 3],
+        weightQuantization: {
+          scheme: 'per_axis', axis: 0, scales: [0.5, 0.25], zero_points: [1, -2],
+        },
+        biasValues: [2, -4], outputShape: [1, 2],
+        outputQuantization: { scheme: 'per_tensor', scale: 0.125, zero_point: 0 },
+      };
+      const { graph, inputValues } = qlinearGraph(spec);
+      wasm.compile(graph);
+      const direct = await wasm.execute({ input: inputValues });
+      assert.equal(direct.out.buffer, wasm.mem.buffer,
+        'internal WASM execution should publish its arena view without a transient copy');
+
+      const provider = new BuiltInBackendProvider(await wasm.fork());
+      let compiled;
+      let context;
+      try {
+        compiled = await provider.compile(ModelSnapshot.capture(graph), {
+          operatorFallback: 'forbid',
+        });
+        context = await compiled.createContext();
+        const first = await context.execute({ input: inputValues });
+        const firstData = first.outputs.find(({ name }) => name === 'out')?.data;
+        assert.ok(firstData instanceof Int8Array);
+        const firstValues = [...firstData];
+
+        const replacement = Int8Array.of(-3, 4, -5);
+        const second = await context.execute({ input: replacement });
+        const secondData = second.outputs.find(({ name }) => name === 'out')?.data;
+        assert.ok(secondData instanceof Int8Array);
+        assert.notDeepEqual([...secondData], firstValues);
+        assert.deepEqual([...firstData], firstValues,
+          'a later arena reuse must not mutate an earlier provider snapshot');
+      } finally {
+        await context?.close();
+        await compiled?.close();
+        await provider.close();
+      }
+    });
+
     const signed = {
       inputValues: [1, -2, 3, 4, 0, -1],
       inputShape: [2, 3],
@@ -146,6 +192,32 @@ test('portable WASM QLinear keeps W8A8 storage and matches the CPU reference', {
       outputShape: [2, 2],
       outputQuantization: { scheme: 'per_tensor', scale: 0.125, zero_point: 0 },
     };
+    await t.test('non-representable F32 multiplier fails before WASM dispatch', () => {
+      const minimumF32 = 1.401298464324817e-45;
+      const { graph } = qlinearGraph({
+        ...signed,
+        inputValues: [1],
+        inputShape: [1, 1],
+        inputQuantization: {
+          scheme: 'per_tensor', scale: minimumF32, zero_point: 0,
+        },
+        weightValues: [1],
+        weightShape: [1, 1],
+        weightQuantization: {
+          scheme: 'per_axis', axis: 0,
+          scales: [minimumF32], zero_points: [0],
+        },
+        biasValues: [0],
+        outputShape: [1, 1],
+        outputQuantization: {
+          scheme: 'per_tensor', scale: 1, zero_point: 0,
+        },
+      });
+      assert.throws(
+        () => wasm.compile(graph),
+        /requantization multiplier/,
+      );
+    });
     for (const opType of ['QLinear', 'QMatMul', 'QGemm']) {
       await t.test(`${opType} uses I8 activation, I32 accumulation, and per-axis W8 requantization`, async () => {
         const cpu = await cpuResult({ ...signed, opType });
@@ -219,11 +291,12 @@ test('portable WASM QLinear keeps W8A8 storage and matches the CPU reference', {
       const firstValues = [...first.out];
       const replacement = Int8Array.of(-7, 4, 6, 8, -3, 1);
       const second = await wasm.execute({ input: inputValues, weight: replacement });
-      assert.notDeepEqual(firstValues, [...second.out]);
+      const secondValues = [...second.out];
+      assert.notDeepEqual(firstValues, secondValues);
       const cpu = new CPUEngine();
       cpu.allocateGraph(graph);
       const expected = await cpu.execute({ input: inputValues, weight: replacement });
-      assert.deepEqual([...second.out], [...expected.out]);
+      assert.deepEqual(secondValues, [...expected.out]);
     });
 
     await t.test('SIMD NR=8 panels preserve odd K/N tails and asymmetric metadata', async () => {

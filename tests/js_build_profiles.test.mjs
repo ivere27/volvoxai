@@ -45,6 +45,16 @@ test('browser profiles stay monolithic and preserve their dependency boundaries'
   assert.equal(full.outputFiles.length, 1);
   assert.equal(wasm.outputFiles.length, 1);
   assert.deepEqual(trainingInputs(inference), []);
+  for (const forbiddenInput of [
+    'ts/ops/dropout.ts',
+    'ts/ops/attentionDropout.ts',
+  ]) {
+    assert.equal(
+      Object.keys(inference.metafile.inputs).includes(forbiddenInput),
+      false,
+      `inference bundle unexpectedly contains training RNG module ${forbiddenInput}`,
+    );
+  }
   assert.equal(
     Object.keys(inference.metafile.inputs).some((path) => path.startsWith('examples/')),
     false,
@@ -53,7 +63,7 @@ test('browser profiles stay monolithic and preserve their dependency boundaries'
     Object.keys(full.metafile.inputs).some((path) => path.startsWith('examples/')),
     false,
   );
-  assert.ok(trainingInputs(full).includes('ts/training/TrainingVolvoxAI.ts'));
+  assert.ok(trainingInputs(full).includes('ts/training/Trainer.ts'));
   assert.ok(trainingInputs(full).includes('ts/training/Initializers.ts'));
   assert.ok(trainingInputs(full).includes('shaders/training/matMulBackward.wgsl'));
 
@@ -63,8 +73,8 @@ test('browser profiles stay monolithic and preserve their dependency boundaries'
     'ts/training/AcceleratedAutograd.ts',
     'ts/training/TrainingGraph.ts',
     'ts/training/WasmAutograd.ts',
+    'ts/training/WasmTrainer.ts',
     'ts/training/WasmPTQ.ts',
-    'ts/training/WasmQuantizedLoRATrainer.ts',
     'ts/training/WasmTrainingKernels.ts',
   ]) {
     assert.ok(
@@ -79,9 +89,10 @@ test('browser profiles stay monolithic and preserve their dependency boundaries'
     'ts/backends/WebNNEngine.ts',
     'ts/training/CPUAutograd.ts',
     'ts/training/Quantization.ts',
+    'ts/training/Trainer.ts',
     'ts/training/TrainingShaderLibrary.ts',
-    'ts/training/TrainingVolvoxAI.ts',
     'ts/training/WebGPUAutograd.ts',
+    'ts/training/WasmQuantizedLoRATrainer.ts',
   ]) {
     assert.equal(
       wasmInputs.includes(forbiddenInput),
@@ -103,6 +114,13 @@ test('browser profiles stay monolithic and preserve their dependency boundaries'
   const inferenceSource = inference.outputFiles[0].text;
   const fullSource = full.outputFiles[0].text;
   const wasmSource = wasm.outputFiles[0].text;
+  for (const trainingHook of ['prepareForTraining', 'pipelineOverrides', 'dropoutMultiplier']) {
+    assert.equal(
+      inferenceSource.includes(trainingHook),
+      false,
+      `inference bundle unexpectedly contains training hook ${trainingHook}`,
+    );
+  }
   assert.equal(
     /\bimport\s*\(/.test(wasmSource),
     false,
@@ -162,8 +180,18 @@ test('the bundled inference entry resolves its adjacent WASM sidecar', async () 
     await writeFile(join(directory, 'volvoxai.wasm'), minimalMemoryWasm);
 
     const module = await import(`${pathToFileURL(bundlePath).href}?test=${Date.now()}`);
-    const runtime = await module.VolvoxAI.init(['wasm']);
-    assert.deepEqual(runtime.engines.map(({ type }) => type), ['wasm']);
+    for (const hidden of [
+      'TrainingGraph', 'TrainingModelBuilder', 'WasmTrainer',
+      'CPUAutograd', 'WebGPUAutograd', 'WasmAutograd',
+      'WasmQuantizedLoRATrainer', 'accumulateGradients', 'resolveTrainingOptimizer',
+      'WasmPTQ', 'WasmPTQObserver', 'createWasmPTQ',
+      'normalizeCrossEntropyLosses', 'crossEntropyGradient', 'addGradient',
+      'AdapterManager', 'ModelSnapshot', 'runtimeError', 'parseStrictJSON',
+    ]) assert.equal(module[hidden], undefined);
+    assert.equal(module.Trainer, undefined);
+    const runtime = await module.VolvoxAI.createRuntime({ backends: ['wasm'] });
+    assert.deepEqual(runtime.listBackends(), ['wasm']);
+    await runtime.close();
   } finally {
     await rm(directory, { recursive: true, force: true });
   }
@@ -184,8 +212,18 @@ test('the bundled full entry resolves its adjacent full WASM sidecar', async () 
     await writeFile(join(directory, 'volvoxai.full.wasm'), minimalMemoryWasm);
 
     const module = await import(`${pathToFileURL(bundlePath).href}?test=${Date.now()}`);
-    const runtime = await module.VolvoxAI.init(['wasm']);
-    assert.deepEqual(runtime.engines.map(({ type }) => type), ['wasm']);
+    for (const hidden of [
+      'TrainingGraph', 'TrainingModelBuilder', 'WasmTrainer',
+      'CPUAutograd', 'WebGPUAutograd', 'WasmAutograd',
+      'WasmQuantizedLoRATrainer', 'accumulateGradients', 'resolveTrainingOptimizer',
+      'WasmPTQ', 'WasmPTQObserver', 'createWasmPTQ',
+      'normalizeCrossEntropyLosses', 'crossEntropyGradient', 'addGradient',
+      'AdapterManager', 'ModelSnapshot', 'runtimeError', 'parseStrictJSON',
+    ]) assert.equal(module[hidden], undefined);
+    assert.equal(typeof module.Trainer.create, 'function');
+    const runtime = await module.VolvoxAI.createRuntime({ backends: ['wasm'] });
+    assert.deepEqual(runtime.listBackends(), ['wasm']);
+    await runtime.close();
   } finally {
     await rm(directory, { recursive: true, force: true });
   }
@@ -218,8 +256,22 @@ test('the browser-only WASM entry resolves its adjacent full WASM sidecar', asyn
     };
 
     const module = await import(`${pathToFileURL(bundlePath).href}?test=${Date.now()}`);
-    const runtime = await module.VolvoxAI.init();
-    assert.deepEqual(runtime.engines.map(({ type }) => type), ['wasm']);
+    for (const hidden of [
+      'TrainingGraph', 'TrainingModelBuilder', 'WasmTrainer',
+      'CPUAutograd', 'WebGPUAutograd', 'WasmAutograd',
+      'WasmQuantizedLoRATrainer', 'accumulateGradients', 'resolveTrainingOptimizer',
+      'WasmPTQ', 'WasmPTQObserver', 'createWasmPTQ',
+      'normalizeCrossEntropyLosses', 'crossEntropyGradient', 'addGradient',
+      'executionIdentity', 'normalizeBackendReport', 'releaseBackendExecutionSnapshot',
+      'cloneRuntimeArray', 'AdapterManager', 'ModelSnapshot', 'runtimeError',
+      'parseStrictJSON',
+    ]) assert.equal(module[hidden], undefined);
+    assert.equal(typeof module.Trainer.create, 'function');
+    assert.equal(typeof module.PTQ.create, 'function');
+    assert.equal(typeof module.createPTQ, 'function');
+    const runtime = await module.VolvoxAI.createRuntime();
+    assert.deepEqual(runtime.listBackends(), ['wasm']);
+    await runtime.close();
     assert.equal(
       fetchedUrl?.href,
       new URL('./volvoxai.full.wasm', pathToFileURL(bundlePath)).href,

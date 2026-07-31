@@ -1,4 +1,4 @@
-#include "volvoxai_training.h"
+#include "training/training_core.h"
 
 #include <math.h>
 #include <stdint.h>
@@ -34,7 +34,7 @@ static int test_observer_and_parameters(void) {
 
     volvoxai_ptq_params_t params;
     CHECK(volvoxai_ptq_calculate_params(&observer, VOLVOXAI_DTYPE_I8,
-                                        VOLVOXAI_PTQ_SYMMETRIC, &params) == 0);
+                                        VX_PTQ_SCHEME_SYMMETRIC, &params) == 0);
     CHECK(params.zero_point == 0);
     CHECK(closef32(params.scale, 3.0f / 127.0f));
     const float values[3] = {-3.0f, 0.0f, 3.0f};
@@ -45,7 +45,7 @@ static int test_observer_and_parameters(void) {
 
     volvoxai_ptq_observer_t unit_range = {-127.0f, 127.0f, 2};
     CHECK(volvoxai_ptq_calculate_params(&unit_range, VOLVOXAI_DTYPE_I8,
-                                        VOLVOXAI_PTQ_SYMMETRIC, &params) == 0);
+                                        VX_PTQ_SCHEME_SYMMETRIC, &params) == 0);
     CHECK(params.scale == 1.0f);
     const float full_range_input[4] = {-129.0f, -128.0f, 127.0f, 128.0f};
     int8_t full_range_output[4] = {0};
@@ -60,7 +60,7 @@ static int test_observer_and_parameters(void) {
     const float asymmetric_values[2] = {-1.0f, 3.0f};
     CHECK(volvoxai_ptq_observer_observe_f32(&observer, asymmetric_values, 2) == 0);
     CHECK(volvoxai_ptq_calculate_params(&observer, VOLVOXAI_DTYPE_U8,
-                                        VOLVOXAI_PTQ_ASYMMETRIC, &params) == 0);
+                                        VX_PTQ_SCHEME_ASYMMETRIC, &params) == 0);
     CHECK(params.zero_point == 64);
     CHECK(closef32(params.scale, 4.0f / 255.0f));
     uint8_t asymmetric_output[3] = {0};

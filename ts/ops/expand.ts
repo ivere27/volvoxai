@@ -1,12 +1,19 @@
+import { assertRawQuantizedShapeTensors } from './quantizedShape.js';
+
 export function _cpuExpand(node) {
   const input = node.inputs.input || node.inputs.x || node.inputs.data;
   const output = node.outputs.out || Object.values(node.outputs || {})[0];
   if (!input || !output || !Array.isArray(input.shape) || !Array.isArray(output.shape) ||
+      !['float32', 'int32', 'int8', 'uint8'].includes(input.dtype) ||
+      output.dtype !== input.dtype ||
       input.shape.some((dimension) => !Number.isSafeInteger(dimension) || dimension <= 0) ||
       output.shape.some((dimension) => !Number.isSafeInteger(dimension) || dimension <= 0) ||
       input.shape.length > output.shape.length) {
-    throw new Error('Expand requires positive input/output shapes with output rank >= input rank.');
+    throw new Error('Expand requires same-dtype F32/I32/I8/U8 tensors and positive shapes with output rank >= input rank.');
   }
+  // Broadcasting replicates elements verbatim, so quantized storage travels
+  // through unchanged.
+  assertRawQuantizedShapeTensors(node, [input, output], 'Expand');
   const inputElements = input.shape.reduce((count, dimension) => count * dimension, 1);
   const outputElements = output.shape.reduce((count, dimension) => count * dimension, 1);
   if (!input.buffer || !output.buffer || input.buffer.length !== inputElements || output.buffer.length !== outputElements) {

@@ -7,7 +7,7 @@
 //       output_type, pad0, pad1, pad2;
 //   i32 input_zero_point, output_zero_point;
 //   f32 input_scale, output_scale.
-// input_type/output_type are I8=2 and U8=3.
+// input_type/output_type use canonical protobuf values I8=6 and U8=5.
 
 @group(0) @binding(0) var<storage, read> input_words : array<u32>;
 @group(0) @binding(1) var<storage, read> keep_mask : array<i32>;
@@ -35,7 +35,7 @@ fn word_byte(word : u32, index : u32) -> u32 {
 
 fn input_value(index : u32) -> i32 {
   let byte = word_byte(input_words[index / 4u], index);
-  if (params.input_type == 2u && byte >= 128u) { return i32(byte) - 256; }
+  if (params.input_type == 6u && byte >= 128u) { return i32(byte) - 256; }
   return i32(byte);
 }
 
@@ -70,8 +70,8 @@ fn qmaskedmean_one(output_index : u32) -> u32 {
     }
   }
   if (keep_count == 0) { return output_byte(params.output_zero_point); }
-  let minimum = select(0, -128, params.output_type == 2u);
-  let maximum = select(255, 127, params.output_type == 2u);
+  let minimum = select(0, -128, params.output_type == 6u);
+  let maximum = select(255, 127, params.output_type == 6u);
   let mean = f32(centered_sum) / f32(keep_count);
   let multiplier = params.input_scale / params.output_scale;
   // The bitcast round-trip makes the product's F32 bits observable before the
