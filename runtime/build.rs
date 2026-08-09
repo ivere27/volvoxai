@@ -353,6 +353,9 @@ fn cuda_architecture() -> String {
     if architecture.is_empty() || !architecture.bytes().all(|byte| byte.is_ascii_digit()) {
         panic!("VOLVOXAI_CUDA_ARCH must be a numeric compute capability such as 75 or 86");
     }
+    if architecture.parse::<u32>().expect("validated numeric CUDA architecture") < 61 {
+        panic!("VOLVOXAI_CUDA_ARCH must be at least 61 for the exact DP4A W8A8 kernels");
+    }
     architecture
 }
 
@@ -480,6 +483,7 @@ fn main() {
         "src/runtime/backend_sdk.c",
         "src/runtime/runtime_state.c",
         "src/runtime/public_api.c",
+        "src/runtime/shape_contract.c",
         "src/runtime/incremental_runtime.c",
         "src/runtime/decode_session.c",
         "src/backends/w8a8_device_ops.c",
@@ -490,7 +494,11 @@ fn main() {
         "src/kernels/qlinear_w8a8_arm.c",
         "src/kernels/qconv_w8a8_x86.c",
         "src/kernels/qconv_w8a8_arm.c",
+        "src/kernels/qbatch_matmul_w8a8_native.c",
         "src/kernels/qsdpa_w8a8_native.c",
+        "src/kernels/qgroupnorm_w8a8_native.c",
+        "src/kernels/qnorm_activation_w8a8_native.c",
+        "src/kernels/transpose_w8a8_native.c",
         "src/kernels/conv_f32_opt.c",
         "src/kernels/tensor_f32_opt.c",
         "src/runtime/engine_runtime.c",

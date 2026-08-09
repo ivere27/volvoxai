@@ -1,13 +1,19 @@
 """Conservative constant evaluation for typed RuntimeIR.
 
 Only operators whose result is an immutable value selection or storage
-movement are evaluated: structural reshape operations, Transpose, Gather,
-Embedding, Identity, and bounded Clip.  General arithmetic is intentionally
-excluded because an offline NumPy evaluation must not silently replace a
-backend's observable F32 rounding contract.
+movement are evaluated: structural reshape operations, Transpose, Concat,
+Gather, Embedding, Identity, and bounded Clip.  General arithmetic is
+intentionally excluded because an offline NumPy evaluation must not silently
+replace a backend's observable F32 rounding contract.
+
+Folding Concat matters for banked parameters.  A router-selected LoRA or MoE
+export emits ``Unsqueeze(weight_k) -> Concat(all k) -> Gather(selector)``; with
+Concat foldable the stack collapses into one initializer instead of being
+rebuilt on every execution, and a selector pinned by input specialization then
+folds the Gather down to the single selected slice.
 
 The pass also canonicalizes ``MatMul/BatchMatMul(dynamic, immutable)`` to a
-``Linear`` with explicit ``IN_OUT`` layout when all leading weight batch axes
+``Linear`` with explicit ``din_dout`` layout when all leading weight batch axes
 are singleton and the output geometry proves that dropping them is exact.
 This is a representation change, not quantization.
 
@@ -39,6 +45,7 @@ from ..pipeline import IRPass, PassContract, PassResult
 
 _FOLDABLE_OPS = frozenset({
     "Clip",
+    "Concat",
     "Reshape",
     "Squeeze",
     "Unsqueeze",
@@ -302,13 +309,13 @@ class RuntimeConstantFoldingPass(IRPass):
         )
         node.attributes = (
             OpAttribute(
-                "params", "volvox.params", {"weight_layout": "IN_OUT"},
+                "params", "volvox.params", {"weight_layout": "din_dout"},
             ),
         )
         metadata = copy.deepcopy(node.metadata)
         metadata["optimizer_canonicalization"] = {
             "from": "constant-right-matmul",
-            "weight_layout": "IN_OUT",
+            "weight_layout": "din_dout",
             "source_weight": plan.weight_name,
         }
         node.metadata = metadata
@@ -380,6 +387,38 @@ def _evaluate(
         ):
             return None
         result = np.transpose(source, tuple(permutation))
+        return result if tuple(result.shape) == output.shape else None
+
+    if op == "Concat":
+        params = _runtime_params(node, frozenset({"axis"}))
+        if params is None or len(values) < 2:
+            return None
+        # Variadic ports are input0..inputN-1 and must be complete and ordered.
+        try:
+            ordered = sorted(values, key=lambda port: int(port.removeprefix("input")))
+        except ValueError:
+            return None
+        if ordered != [f"input{index}" for index in range(len(values))]:
+            return None
+        sources = [values[port] for port in ordered]
+        rank = sources[0].ndim
+        axis = params.get("axis", 0)
+        if (
+            isinstance(axis, bool)
+            or not isinstance(axis, int)
+            or not -rank <= axis < rank
+            or any(item.ndim != rank for item in sources)
+            or any(item.dtype != sources[0].dtype for item in sources)
+        ):
+            return None
+        # Folding erases each input's own affine metadata, so only fold when
+        # every input already agrees with the output.
+        input_map = node.input_map()
+        for port in ordered:
+            source = graph.tensors[input_map[port]]
+            if source.dtype != output.dtype or source.quantization != output.quantization:
+                return None
+        result = np.concatenate(sources, axis=axis + rank if axis < 0 else axis)
         return result if tuple(result.shape) == output.shape else None
 
     if op == "Gather":

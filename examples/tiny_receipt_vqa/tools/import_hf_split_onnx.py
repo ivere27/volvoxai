@@ -1,15 +1,17 @@
 #!/usr/bin/env python3
 """Import the typed TinyReceipt split-ONNX release into a VolvoxAI package.
 
-The importer is deliberately local and model-specific.  It verifies the
-producer contract, proves the fixed-padding export against ONNX Runtime, and
-then delegates both graphs to the repository's generic ONNX exporter.  It
-never loads a PyTorch checkpoint and never downloads model data.
+The importer is deliberately local and model-specific. It accepts only the
+explicit-KV producer contract, proves its positive-length cache sentinel
+against ONNX Runtime, and then delegates both graphs to the repository's
+generic ONNX exporter. It never loads a PyTorch checkpoint and never downloads
+model data.
 """
 
 from __future__ import annotations
 
 import argparse
+import ast
 import ctypes
 import errno
 import hashlib
@@ -21,6 +23,8 @@ import stat
 import subprocess
 import sys
 import tempfile
+from dataclasses import dataclass
+from fractions import Fraction
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
 
@@ -28,9 +32,17 @@ REPOSITORY_ROOT = Path(__file__).resolve().parents[3]
 if str(REPOSITORY_ROOT) not in sys.path:
     sys.path.insert(0, str(REPOSITORY_ROOT))
 
-SOURCE_FORMAT = "tiny_receipt_vqa_split_onnx_v1"
-PACKAGE_FORMAT = "volvoxai-tiny-receipt-vqa-split-onnx-package-v1"
-CHAR_VOCAB_SIZE = 760
+from tools.exporter.capabilities import (  # noqa: E402
+    classify_package,
+    expand_targets,
+    normalize_targets,
+)
+from tools.exporter.generated.kernel_registry import (  # noqa: E402
+    TARGETS as GENERIC_EXPORT_TARGETS,
+)
+
+SOURCE_FORMAT = "tiny_receipt_vqa_split_kv_onnx_v1"
+PACKAGE_FORMAT = "volvoxai-tiny-receipt-vqa-split-kv-onnx-package-v1"
 BPE_VOCAB_SIZE = 1536
 SPECIAL_TOKENS = ("<pad>", "<bos>", "<eos>", "<unk>")
 BPE_ATOMIC_TOKENS = (
@@ -96,6 +108,12 @@ FAMILY_ORDER = (
     "math",
     "other",
 )
+IMAGE_HEIGHT = 320
+IMAGE_WIDTH = 672
+IMAGE_CHANNELS = 1
+IMAGE_TOKENS = 210
+MAX_Q = 192
+MAX_T = 192
 SOURCE_FILES = {
     "manifest": "manifest.json",
     "encoder": "encoder_model.onnx",
@@ -141,6 +159,37 @@ INT8_W8A8_SOURCE_FILE_KEYS = frozenset({
     "decoder_int8_w8a8_bytes",
 })
 GENERIC_EXPORTER = REPOSITORY_ROOT / "tools" / "export_safetensors.py"
+GRAPH_FORMAT = "volvox-graph/v1"
+CANONICAL_DIMENSIONS = ("B", "Q", "T", "M")
+KV_CANONICAL_DIMENSIONS = ("B", "Q", "M", "P", "R")
+KV_LAYERS = 4
+KV_HEADS = 8
+KV_HEAD_WIDTH = 40
+KV_CROSS_NAMES = tuple(
+    name
+    for layer in range(KV_LAYERS)
+    for name in (f"cross_k_{layer}", f"cross_v_{layer}")
+)
+KV_PAST_NAMES = tuple(
+    name
+    for layer in range(KV_LAYERS)
+    for name in (f"past_k_{layer}", f"past_v_{layer}")
+)
+KV_PRESENT_NAMES = tuple(
+    name
+    for layer in range(KV_LAYERS)
+    for name in (f"present_k_{layer}", f"present_v_{layer}")
+)
+SHAPE_PROFILES = {
+    "short": {"B": 1, "Q": 16, "T": 16, "M": 226},
+    "representative": {"B": 1, "Q": 64, "T": 64, "M": 274},
+    "maximum": {"B": 1, "Q": 192, "T": 192, "M": 402},
+}
+POSITION_INPUTS = {
+    "encoder": ("question_position_ids", "Q"),
+    "decoder": ("decoder_position_ids", "T"),
+}
+CAUSAL_MASK_INPUT = "decoder_causal_mask"
 
 
 class ImportFailure(RuntimeError):
@@ -237,31 +286,6 @@ def _tokenizer_fingerprint(vocab: Mapping[str, Any]) -> str:
         separators=(",", ":"),
     ).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
-
-
-def _validate_char_vocabulary(
-    vocab: Mapping[str, Any],
-    *,
-    vocab_size: int,
-) -> dict[str, Any]:
-    itos = vocab.get("itos")
-    if (
-        vocab_size != CHAR_VOCAB_SIZE
-        or set(vocab) != {"itos"}
-        or not isinstance(itos, list)
-        or len(itos) != vocab_size
-        or any(not isinstance(item, str) for item in itos)
-        or itos[: len(SPECIAL_TOKENS)] != list(SPECIAL_TOKENS)
-    ):
-        raise ImportFailure(
-            "source vocab must be the exact 760-entry CharVocab contract"
-        )
-    return {
-        "type": "char-vocab",
-        "version": 1,
-        "itos_key": "itos",
-        "token_ids": {"pad": 0, "bos": 1, "eos": 2, "unk": 3},
-    }
 
 
 def _validate_bpe_vocabulary(
@@ -396,16 +420,10 @@ def _validate_vocabulary(
     manifest: Mapping[str, Any],
 ) -> tuple[int, dict[str, Any]]:
     vocab_size = _positive_int(config.get("vocab_size"), "source config.vocab_size")
-    if set(vocab) == {"itos"}:
-        return vocab_size, _validate_char_vocabulary(vocab, vocab_size=vocab_size)
-    if vocab.get("type") == "byte_fallback_bpe":
-        return vocab_size, _validate_bpe_vocabulary(
-            vocab,
-            manifest.get("tokenizer"),
-            vocab_size=vocab_size,
-        )
-    raise ImportFailure(
-        "source vocab must be the legacy CharVocab or byte_fallback_bpe v1 contract"
+    return vocab_size, _validate_bpe_vocabulary(
+        vocab,
+        manifest.get("tokenizer"),
+        vocab_size=vocab_size,
     )
 
 
@@ -710,6 +728,1695 @@ def _validate_onnx(
     if require_u8s8_qdq:
         return _validate_u8s8_static_qdq(model, label=label, onnx=onnx)
     return frozenset()
+
+
+_MONOMIAL_ONE = (0, 0, 0)
+
+
+def _poly(items: Mapping[tuple[int, int, int], Fraction | int]):
+    return tuple(sorted(
+        (powers, Fraction(coefficient))
+        for powers, coefficient in items.items()
+        if coefficient
+    ))
+
+
+def _poly_add(left, right, *, scale: int = 1):
+    result = dict(left)
+    for powers, coefficient in right:
+        result[powers] = result.get(powers, Fraction(0)) + scale * coefficient
+    return _poly(result)
+
+
+def _poly_multiply(left, right):
+    result: dict[tuple[int, int, int], Fraction] = {}
+    for left_powers, left_coefficient in left:
+        for right_powers, right_coefficient in right:
+            powers = tuple(
+                left_powers[index] + right_powers[index]
+                for index in range(3)
+            )
+            result[powers] = (
+                result.get(powers, Fraction(0))
+                + left_coefficient * right_coefficient
+            )
+    return _poly(result)
+
+
+@dataclass(frozen=True, eq=False)
+class _SymbolicExtent:
+    """Small exact rational-polynomial domain for ONNX shape expressions."""
+
+    numerator: tuple[tuple[tuple[int, int, int], Fraction], ...]
+    denominator: tuple[tuple[tuple[int, int, int], Fraction], ...]
+    preferred_symbol: str | None = None
+
+    @staticmethod
+    def constant(value: int, preferred_symbol: str | None = None) -> "_SymbolicExtent":
+        return _SymbolicExtent(
+            _poly({_MONOMIAL_ONE: Fraction(value)}),
+            _poly({_MONOMIAL_ONE: Fraction(1)}),
+            preferred_symbol,
+        )
+
+    @staticmethod
+    def symbol(index: int) -> "_SymbolicExtent":
+        powers = [0, 0, 0]
+        powers[index] = 1
+        return _SymbolicExtent(
+            _poly({tuple(powers): Fraction(1)}),
+            _poly({_MONOMIAL_ONE: Fraction(1)}),
+        )
+
+    def __add__(self, other: Any) -> "_SymbolicExtent":
+        right = _as_symbolic_extent(other)
+        return _SymbolicExtent(
+            _poly_add(
+                _poly_multiply(self.numerator, right.denominator),
+                _poly_multiply(right.numerator, self.denominator),
+            ),
+            _poly_multiply(self.denominator, right.denominator),
+        )
+
+    def __radd__(self, other: Any) -> "_SymbolicExtent":
+        return self + other
+
+    def __sub__(self, other: Any) -> "_SymbolicExtent":
+        right = _as_symbolic_extent(other)
+        return _SymbolicExtent(
+            _poly_add(
+                _poly_multiply(self.numerator, right.denominator),
+                _poly_multiply(right.numerator, self.denominator),
+                scale=-1,
+            ),
+            _poly_multiply(self.denominator, right.denominator),
+        )
+
+    def __rsub__(self, other: Any) -> "_SymbolicExtent":
+        return _as_symbolic_extent(other) - self
+
+    def __mul__(self, other: Any) -> "_SymbolicExtent":
+        right = _as_symbolic_extent(other)
+        return _SymbolicExtent(
+            _poly_multiply(self.numerator, right.numerator),
+            _poly_multiply(self.denominator, right.denominator),
+        )
+
+    def __rmul__(self, other: Any) -> "_SymbolicExtent":
+        return self * other
+
+    def __truediv__(self, other: Any) -> "_SymbolicExtent":
+        right = _as_symbolic_extent(other)
+        if not right.numerator:
+            raise ImportFailure("ONNX shape expression divides by zero")
+        return _SymbolicExtent(
+            _poly_multiply(self.numerator, right.denominator),
+            _poly_multiply(self.denominator, right.numerator),
+        )
+
+    def __floordiv__(self, other: Any) -> "_SymbolicExtent":
+        # Every producer shape division in this model is exact.  Retaining it
+        # as a rational expression lets equality prove exactness below.
+        return self / other
+
+    def __pow__(self, exponent: int) -> "_SymbolicExtent":
+        if not isinstance(exponent, int) or exponent < 0:
+            raise ImportFailure("ONNX shape powers must be non-negative integers")
+        result = _SymbolicExtent.constant(1)
+        for _ in range(exponent):
+            result *= self
+        return result
+
+    def equivalent(self, other: Any) -> bool:
+        right = _as_symbolic_extent(other)
+        return _poly_multiply(self.numerator, right.denominator) == _poly_multiply(
+            right.numerator,
+            self.denominator,
+        )
+
+    def integer(self) -> int | None:
+        if not self.numerator:
+            return 0
+        numerator = dict(self.numerator)
+        denominator = dict(self.denominator)
+        if set(numerator) != set(denominator):
+            return None
+        ratio: Fraction | None = None
+        for powers, denominator_coefficient in denominator.items():
+            if denominator_coefficient == 0:
+                return None
+            current = numerator[powers] / denominator_coefficient
+            if ratio is None:
+                ratio = current
+            elif current != ratio:
+                return None
+        if ratio is None or ratio.denominator != 1:
+            return None
+        return int(ratio.numerator)
+
+
+def _as_symbolic_extent(value: Any) -> _SymbolicExtent:
+    if isinstance(value, _SymbolicExtent):
+        return value
+    # NumPy object ufuncs preserve zero-rank arrays around Python objects.
+    # Treat that representation as the scalar it contains so symbolic shape
+    # arithmetic is independent of the producer/NumPy scalar convention.
+    if getattr(value, "shape", None) == () and callable(getattr(value, "item", None)):
+        return _as_symbolic_extent(value.item())
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ImportFailure(f"unsupported ONNX symbolic extent value {value!r}")
+    return _SymbolicExtent.constant(value)
+
+
+def _parse_symbolic_extent(value: str, *, role: str) -> _SymbolicExtent | None:
+    symbols = {
+        "batch": _SymbolicExtent.constant(1, "B"),
+        "B": _SymbolicExtent.constant(1, "B"),
+        "question_length": _SymbolicExtent.symbol(0),
+        "Q": _SymbolicExtent.symbol(0),
+        "target_length": _SymbolicExtent.symbol(1),
+        "T": _SymbolicExtent.symbol(1),
+        "memory_length": (
+            _SymbolicExtent.symbol(0) + 210
+            if role == "encoder"
+            else _SymbolicExtent.symbol(2)
+        ),
+        "M": (
+            _SymbolicExtent.symbol(0) + 210
+            if role == "encoder"
+            else _SymbolicExtent.symbol(2)
+        ),
+    }
+
+    def lower(node: ast.AST) -> _SymbolicExtent:
+        if isinstance(node, ast.Expression):
+            return lower(node.body)
+        if isinstance(node, ast.Constant) and isinstance(node.value, int):
+            return _SymbolicExtent.constant(node.value)
+        if isinstance(node, ast.Name) and node.id in symbols:
+            return symbols[node.id]
+        if isinstance(node, ast.BinOp):
+            left = lower(node.left)
+            right = lower(node.right)
+            if isinstance(node.op, ast.Add):
+                return left + right
+            if isinstance(node.op, ast.Sub):
+                return left - right
+            if isinstance(node.op, ast.Mult):
+                return left * right
+            if isinstance(node.op, (ast.Div, ast.FloorDiv)):
+                return left / right
+            if isinstance(node.op, ast.Pow):
+                exponent = right.integer()
+                if exponent is not None:
+                    return left ** exponent
+        raise ValueError("unsupported shape expression")
+
+    try:
+        return lower(ast.parse(value, mode="eval"))
+    except (SyntaxError, ValueError, ImportFailure):
+        return None
+
+
+def _value_symbolic_shape(value: Any, *, role: str) -> list[_SymbolicExtent | None] | None:
+    tensor_type = value.type.tensor_type
+    if not tensor_type.HasField("shape"):
+        return None
+    result: list[_SymbolicExtent | None] = []
+    for dimension in tensor_type.shape.dim:
+        if dimension.HasField("dim_value"):
+            result.append(_SymbolicExtent.constant(int(dimension.dim_value)))
+        elif dimension.HasField("dim_param"):
+            result.append(_parse_symbolic_extent(str(dimension.dim_param), role=role))
+        else:
+            result.append(None)
+    return result
+
+
+def _onnx_int_attribute(node: Any, name: str, default: int) -> int:
+    for attribute in node.attribute:
+        if attribute.name == name:
+            return int(attribute.i)
+    return default
+
+
+def _symbolic_integer(value: Any, label: str) -> int:
+    extent = _as_symbolic_extent(value)
+    result = extent.integer()
+    if result is None:
+        raise ImportFailure(f"{label} must be an immutable integer")
+    return result
+
+
+def _symbolic_array(value: Any, np: Any) -> Any:
+    source = np.asarray(value)
+    result = np.empty(source.shape, dtype=object)
+    for index in np.ndindex(source.shape):
+        item = source[index].item()
+        if isinstance(item, bool) or not isinstance(item, int):
+            raise ImportFailure("ONNX shape tensor must contain integers")
+        result[index] = _SymbolicExtent.constant(item)
+    if source.shape == ():
+        return np.asarray(_SymbolicExtent.constant(int(source.item())), dtype=object)
+    return result
+
+
+def _symbolic_product(values: Sequence[_SymbolicExtent]) -> _SymbolicExtent:
+    result = _SymbolicExtent.constant(1)
+    for value in values:
+        result *= value
+    return result
+
+
+def _symbolic_broadcast_shape(
+    left: Sequence[_SymbolicExtent | None] | None,
+    right: Sequence[_SymbolicExtent | None] | None,
+    *,
+    label: str,
+) -> list[_SymbolicExtent] | None:
+    if left is None or right is None or any(value is None for value in [*left, *right]):
+        return None
+    result: list[_SymbolicExtent] = []
+    padded_left = [_SymbolicExtent.constant(1)] * (max(len(left), len(right)) - len(left)) + [
+        value for value in left if value is not None
+    ]
+    padded_right = [_SymbolicExtent.constant(1)] * (max(len(left), len(right)) - len(right)) + [
+        value for value in right if value is not None
+    ]
+    for left_extent, right_extent in zip(padded_left, padded_right):
+        if left_extent.equivalent(1):
+            result.append(right_extent)
+        elif right_extent.equivalent(1) or left_extent.equivalent(right_extent):
+            result.append(left_extent)
+        else:
+            raise ImportFailure(f"{label} has incompatible symbolic broadcast extents")
+    return result
+
+
+def _resolved_reshape_target(
+    input_shape: Sequence[_SymbolicExtent | None] | None,
+    raw_target: Sequence[_SymbolicExtent],
+    *,
+    allowzero: bool,
+    label: str,
+) -> list[_SymbolicExtent]:
+    if input_shape is None or any(value is None for value in input_shape):
+        raise ImportFailure(f"{label} input shape is not symbolically complete")
+    concrete_input = [value for value in input_shape if value is not None]
+    result: list[_SymbolicExtent | None] = []
+    inferred_index: int | None = None
+    for index, value in enumerate(raw_target):
+        integer = value.integer()
+        if integer == 0 and not allowzero:
+            if index >= len(concrete_input):
+                raise ImportFailure(f"{label} zero-copy axis is outside the input rank")
+            result.append(concrete_input[index])
+        elif integer == -1:
+            if inferred_index is not None:
+                raise ImportFailure(f"{label} contains multiple inferred dimensions")
+            inferred_index = index
+            result.append(None)
+        elif integer is not None and integer <= 0:
+            raise ImportFailure(f"{label} contains non-positive reshape extent {integer}")
+        else:
+            result.append(value)
+    if inferred_index is not None:
+        known = [value for value in result if value is not None]
+        result[inferred_index] = _symbolic_product(concrete_input) / _symbolic_product(known)
+    resolved = [value for value in result if value is not None]
+    if len(resolved) != len(result) or not _symbolic_product(resolved).equivalent(
+        _symbolic_product(concrete_input)
+    ):
+        raise ImportFailure(f"{label} does not preserve the symbolic element count")
+    return resolved
+
+
+def _canonical_reshape_initializer(
+    input_shape: Sequence[_SymbolicExtent | None] | None,
+    output_shape: Sequence[_SymbolicExtent],
+    *,
+    label: str,
+) -> list[int]:
+    if input_shape is None or any(value is None for value in input_shape):
+        raise ImportFailure(f"{label} input shape is not symbolically complete")
+    concrete_input = [value for value in input_shape if value is not None]
+    if not _symbolic_product(concrete_input).equivalent(_symbolic_product(output_shape)):
+        raise ImportFailure(f"{label} does not preserve the symbolic element count")
+    result: list[int | None] = []
+    inferred: list[int] = []
+    for index, extent in enumerate(output_shape):
+        if (
+            extent.preferred_symbol is not None
+            and index < len(concrete_input)
+            and extent.equivalent(concrete_input[index])
+        ):
+            result.append(0)
+            continue
+        integer = extent.integer()
+        if integer is not None:
+            if integer <= 0:
+                raise ImportFailure(f"{label} resolved to non-positive extent {integer}")
+            result.append(integer)
+        elif index < len(concrete_input) and extent.equivalent(concrete_input[index]):
+            result.append(0)
+        else:
+            inferred.append(index)
+            result.append(None)
+    if len(inferred) > 1:
+        raise ImportFailure(
+            f"{label} needs {len(inferred)} independent inferred dimensions; "
+            "ONNX Reshape permits at most one"
+        )
+    if inferred:
+        result[inferred[0]] = -1
+    return [int(value) for value in result if value is not None]
+
+
+def _canonical_symbolic_dimension(
+    value: _SymbolicExtent,
+    *,
+    role: str,
+) -> int | str:
+    if value.preferred_symbol == "B":
+        return "B"
+    integer = value.integer()
+    if integer is not None:
+        if integer <= 0:
+            raise ImportFailure(f"canonical symbolic dimension resolved to {integer}")
+        return integer
+    if role == "encoder":
+        if value.equivalent(_SymbolicExtent.symbol(0)):
+            return "Q"
+        if value.equivalent(_SymbolicExtent.symbol(0) + IMAGE_TOKENS):
+            return "M"
+    else:
+        if value.equivalent(_SymbolicExtent.symbol(1)):
+            return "T"
+        if value.equivalent(_SymbolicExtent.symbol(2)):
+            return "M"
+    raise ImportFailure("rewritten Reshape produced a non-canonical symbolic dimension")
+
+
+def _set_existing_value_shape(
+    model: Any,
+    name: str,
+    shape: Sequence[_SymbolicExtent],
+    *,
+    role: str,
+) -> None:
+    value = next(
+        (
+            item
+            for item in [*model.graph.input, *model.graph.value_info, *model.graph.output]
+            if item.name == name
+        ),
+        None,
+    )
+    if value is None:
+        raise ImportFailure(f"{role} rewritten Reshape output {name!r} has no ValueInfo")
+    tensor_shape = value.type.tensor_type.shape
+    del tensor_shape.dim[:]
+    for extent in shape:
+        dimension = tensor_shape.dim.add()
+        canonical = _canonical_symbolic_dimension(extent, role=role)
+        if isinstance(canonical, int):
+            dimension.dim_value = canonical
+        else:
+            dimension.dim_param = canonical
+
+
+def _canonicalize_derived_dimension_expressions(
+    model: Any,
+    *,
+    role: str,
+    onnx: Any,
+) -> int:
+    rewritten = 0
+    for value in _nested_value_infos(model, onnx.ValueInfoProto):
+        tensor_type = value.type.tensor_type
+        if not tensor_type.HasField("shape"):
+            continue
+        for dimension in tensor_type.shape.dim:
+            if not dimension.HasField("dim_param"):
+                continue
+            spelling = str(dimension.dim_param)
+            if spelling in CANONICAL_DIMENSIONS:
+                continue
+            symbolic = _parse_symbolic_extent(spelling, role=role)
+            if symbolic is None:
+                continue
+            canonical = _canonical_symbolic_dimension(symbolic, role=role)
+            dimension.Clear()
+            if isinstance(canonical, int):
+                dimension.dim_value = canonical
+            else:
+                dimension.dim_param = canonical
+            rewritten += 1
+    return rewritten
+
+
+def _refresh_inference_unknown_value_infos(model: Any, *, role: str, onnx: Any) -> int:
+    """Re-infer only producer-generated ``unk__*`` intermediates after rewrites."""
+
+    def has_unknown(value: Any) -> bool:
+        tensor_type = value.type.tensor_type
+        return tensor_type.HasField("shape") and any(
+            dimension.HasField("dim_param")
+            and str(dimension.dim_param).startswith("unk__")
+            for dimension in tensor_type.shape.dim
+        )
+
+    public_unknown = [
+        value.name
+        for value in [*model.graph.input, *model.graph.output]
+        if has_unknown(value)
+    ]
+    if public_unknown:
+        raise ImportFailure(
+            f"{role} public tensors retained inference-only symbols {public_unknown}"
+        )
+    unknown_names = {
+        value.name for value in model.graph.value_info if has_unknown(value)
+    }
+    if not unknown_names:
+        return 0
+    retained = [
+        value for value in model.graph.value_info if value.name not in unknown_names
+    ]
+    del model.graph.value_info[:]
+    model.graph.value_info.extend(retained)
+    inferred = onnx.shape_inference.infer_shapes(
+        model,
+        strict_mode=True,
+        data_prop=True,
+    )
+    inferred_by_name = {
+        value.name: value for value in inferred.graph.value_info
+    }
+    missing = sorted(unknown_names - set(inferred_by_name))
+    if missing:
+        raise ImportFailure(
+            f"{role} could not re-infer rewritten intermediate shapes {missing}"
+        )
+    refreshed = [inferred_by_name[name] for name in sorted(unknown_names)]
+    still_unknown = sorted(
+        value.name for value in refreshed if has_unknown(value)
+    )
+    if still_unknown:
+        raise ImportFailure(
+            f"{role} retained unresolved rewritten shapes {still_unknown}"
+        )
+    model.graph.value_info.extend(refreshed)
+    return len(refreshed)
+
+
+def _rewrite_dynamic_reshape_targets(model: Any, *, role: str, onnx: Any) -> dict[str, Any]:
+    """Replace runtime shape-value programs with exact ONNX Reshape constants."""
+
+    import numpy as np
+
+    nodes = list(model.graph.node)
+    shapes: dict[str, list[_SymbolicExtent | None] | None] = {
+        value.name: _value_symbolic_shape(value, role=role)
+        for value in [*model.graph.input, *model.graph.value_info, *model.graph.output]
+    }
+    values: dict[str, Any] = {}
+    dynamic_values: set[str] = set()
+    shape_program_outputs: set[str] = set()
+    initializer_names = {value.name for value in model.graph.initializer}
+    for initializer in model.graph.initializer:
+        array = onnx.numpy_helper.to_array(initializer)
+        if array.dtype.kind in "iu" and array.size <= 64:
+            values[initializer.name] = _symbolic_array(array, np)
+
+    new_initializers = []
+    rewritten = 0
+    for index, node in enumerate(nodes):
+        op = node.op_type
+        produced_symbolic = False
+        if op == "Constant" and node.output:
+            attribute = next(
+                (item for item in node.attribute if item.name == "value"),
+                None,
+            )
+            if attribute is not None:
+                array = onnx.numpy_helper.to_array(attribute.t)
+                if array.dtype.kind in "iu" and array.size <= 64:
+                    values[node.output[0]] = _symbolic_array(array, np)
+        elif op == "Shape" and node.input and node.output:
+            input_shape = shapes.get(node.input[0])
+            if input_shape is None or any(value is None for value in input_shape):
+                raise ImportFailure(
+                    f"{role} {node.name or f'Shape[{index}]'} input shape is not symbolic"
+                )
+            start = _onnx_int_attribute(node, "start", 0)
+            end = _onnx_int_attribute(node, "end", len(input_shape))
+            values[node.output[0]] = np.asarray(input_shape[start:end], dtype=object)
+            produced_symbolic = True
+        elif op in {"Squeeze", "Unsqueeze"} and node.input[0] in values:
+            array = values[node.input[0]]
+            axes_value = values.get(node.input[1]) if len(node.input) > 1 else None
+            axes = (
+                [_symbolic_integer(value, f"{role} {op} axis") for value in np.asarray(
+                    axes_value,
+                    dtype=object,
+                ).reshape(-1)]
+                if axes_value is not None
+                else []
+            )
+            if op == "Squeeze":
+                values[node.output[0]] = (
+                    np.squeeze(array)
+                    if not axes
+                    else np.squeeze(array, axis=tuple(axes))
+                )
+            else:
+                result = array
+                for axis in sorted(axes):
+                    result = np.expand_dims(result, axis=axis)
+                values[node.output[0]] = result
+            produced_symbolic = node.input[0] in dynamic_values
+        elif op == "Gather" and all(name in values for name in node.input[:2]):
+            indices = np.asarray([
+                _symbolic_integer(value, f"{role} Gather index")
+                for value in np.asarray(values[node.input[1]], dtype=object).reshape(-1)
+            ], dtype=np.int64).reshape(np.asarray(values[node.input[1]]).shape)
+            values[node.output[0]] = np.take(
+                values[node.input[0]],
+                indices,
+                axis=_onnx_int_attribute(node, "axis", 0),
+            )
+            produced_symbolic = any(name in dynamic_values for name in node.input[:2])
+        elif op == "Slice" and all(name in values for name in node.input[1:3]) and node.input[0] in values:
+            starts = [
+                _symbolic_integer(value, f"{role} Slice start")
+                for value in np.asarray(values[node.input[1]], dtype=object).reshape(-1)
+            ]
+            ends = [
+                _symbolic_integer(value, f"{role} Slice end")
+                for value in np.asarray(values[node.input[2]], dtype=object).reshape(-1)
+            ]
+            axes = (
+                [
+                    _symbolic_integer(value, f"{role} Slice axis")
+                    for value in np.asarray(values[node.input[3]], dtype=object).reshape(-1)
+                ]
+                if len(node.input) > 3 and node.input[3] in values
+                else list(range(len(starts)))
+            )
+            steps = (
+                [
+                    _symbolic_integer(value, f"{role} Slice step")
+                    for value in np.asarray(values[node.input[4]], dtype=object).reshape(-1)
+                ]
+                if len(node.input) > 4 and node.input[4] in values
+                else [1] * len(starts)
+            )
+            slices = [slice(None)] * np.asarray(values[node.input[0]]).ndim
+            for start, end, axis, step in zip(starts, ends, axes, steps):
+                slices[axis] = slice(start, end, step)
+            values[node.output[0]] = values[node.input[0]][tuple(slices)]
+            produced_symbolic = any(name in dynamic_values for name in node.input)
+        elif op == "Concat" and all(name in values for name in node.input):
+            values[node.output[0]] = np.concatenate(
+                [np.atleast_1d(values[name]) for name in node.input],
+                axis=_onnx_int_attribute(node, "axis", 0),
+            )
+            produced_symbolic = any(name in dynamic_values for name in node.input)
+        elif op in {"Add", "Sub", "Mul", "Div"} and all(
+            name in values for name in node.input[:2]
+        ):
+            left = values[node.input[0]]
+            right = values[node.input[1]]
+            values[node.output[0]] = {
+                "Add": lambda: left + right,
+                "Sub": lambda: left - right,
+                "Mul": lambda: left * right,
+                "Div": lambda: left / right,
+            }[op]()
+            produced_symbolic = any(name in dynamic_values for name in node.input[:2])
+        elif op == "Cast" and node.input[0] in values:
+            values[node.output[0]] = values[node.input[0]]
+            produced_symbolic = node.input[0] in dynamic_values
+
+        if op == "Reshape" and len(node.input) > 1 and node.input[1] in values:
+            raw_target = [
+                _as_symbolic_extent(value)
+                for value in np.asarray(values[node.input[1]], dtype=object).reshape(-1)
+            ]
+            input_shape = shapes.get(node.input[0])
+            output_shape = _resolved_reshape_target(
+                input_shape,
+                raw_target,
+                allowzero=bool(_onnx_int_attribute(node, "allowzero", 0)),
+                label=f"{role} {node.name or f'Reshape[{index}]'}",
+            )
+            shapes[node.output[0]] = output_shape
+            _set_existing_value_shape(
+                model,
+                node.output[0],
+                output_shape,
+                role=role,
+            )
+            if node.input[1] in dynamic_values:
+                replacement = _canonical_reshape_initializer(
+                    input_shape,
+                    output_shape,
+                    label=f"{role} {node.name or f'Reshape[{index}]'}",
+                )
+                name = f"__volvox_{role}_reshape_shape_{index}"
+                if name in initializer_names:
+                    raise ImportFailure(f"{role} canonical initializer collision {name!r}")
+                initializer_names.add(name)
+                new_initializers.append(
+                    onnx.numpy_helper.from_array(np.asarray(replacement, dtype=np.int64), name)
+                )
+                node.input[1] = name
+                allowzero = next(
+                    (item for item in node.attribute if item.name == "allowzero"),
+                    None,
+                )
+                if allowzero is None:
+                    node.attribute.extend([onnx.helper.make_attribute("allowzero", 0)])
+                else:
+                    allowzero.i = 0
+                rewritten += 1
+            if node.input[0] in values:
+                target = [
+                    _symbolic_integer(value, f"{role} shape-value Reshape target")
+                    for value in raw_target
+                ]
+                values[node.output[0]] = np.asarray(
+                    values[node.input[0]],
+                    dtype=object,
+                ).reshape(tuple(target))
+                produced_symbolic = node.input[0] in dynamic_values
+        elif op == "Transpose" and node.input and shapes.get(node.input[0]) is not None:
+            input_shape = shapes[node.input[0]]
+            permutation = [
+                int(value)
+                for value in next(
+                    (
+                        attribute.ints
+                        for attribute in node.attribute
+                        if attribute.name == "perm"
+                    ),
+                    reversed(range(len(input_shape))),
+                )
+            ]
+            shapes[node.output[0]] = [input_shape[axis] for axis in permutation]
+        elif op in {"Identity", "Cast"} and node.input:
+            shapes[node.output[0]] = shapes.get(node.input[0])
+        elif op == "Expand" and len(node.input) > 1 and node.input[1] in values:
+            target_shape = [
+                _as_symbolic_extent(value)
+                for value in np.asarray(values[node.input[1]], dtype=object).reshape(-1)
+            ]
+            shapes[node.output[0]] = _symbolic_broadcast_shape(
+                shapes.get(node.input[0]),
+                target_shape,
+                label=f"{role} {node.name or f'Expand[{index}]'}",
+            )
+
+        if produced_symbolic:
+            dynamic_values.update(node.output)
+            shape_program_outputs.update(node.output)
+
+    if new_initializers:
+        model.graph.initializer.extend(new_initializers)
+    return {
+        "reshape_targets_rewritten": rewritten,
+        "values": values,
+        "dynamic_values": dynamic_values,
+        "shape_program_outputs": shape_program_outputs,
+    }
+
+
+def _small_constant_arrays(model: Any, *, onnx: Any) -> dict[str, Any]:
+    arrays = {
+        initializer.name: onnx.numpy_helper.to_array(initializer)
+        for initializer in model.graph.initializer
+        if math.prod(initializer.dims) <= 512
+    }
+    for node in model.graph.node:
+        if node.op_type != "Constant" or not node.output:
+            continue
+        attribute = next(
+            (item for item in node.attribute if item.name == "value"),
+            None,
+        )
+        if attribute is None:
+            continue
+        array = onnx.numpy_helper.to_array(attribute.t)
+        if array.size <= 512:
+            arrays[node.output[0]] = array
+    return arrays
+
+
+def _add_semantic_input(
+    model: Any,
+    *,
+    name: str,
+    dtype: int,
+    shape: Sequence[int | str],
+    onnx: Any,
+) -> None:
+    tensor_names = {
+        value.name
+        for value in [*model.graph.input, *model.graph.output, *model.graph.value_info]
+    } | {initializer.name for initializer in model.graph.initializer}
+    tensor_names.update(
+        output
+        for node in model.graph.node
+        for output in node.output
+        if output
+    )
+    if name in tensor_names:
+        raise ImportFailure(f"canonical semantic input name {name!r} already exists")
+    model.graph.input.extend([
+        onnx.helper.make_tensor_value_info(name, dtype, list(shape))
+    ])
+
+
+def _constant_vector(
+    values: Mapping[str, Any],
+    name: str,
+    *,
+    label: str,
+) -> list[int] | None:
+    value = values.get(name)
+    if value is None:
+        return None
+    import numpy as np
+
+    return [
+        _symbolic_integer(item, label)
+        for item in np.asarray(value, dtype=object).reshape(-1)
+    ]
+
+
+def _rewrite_position_slice(
+    model: Any,
+    *,
+    role: str,
+    analysis: Mapping[str, Any],
+    onnx: Any,
+) -> tuple[dict[int, list[Any]], set[int], int]:
+    import numpy as np
+
+    position_input, dimension_name = POSITION_INPUTS[role]
+    source_ids = "question_ids" if role == "encoder" else "decoder_input_ids"
+    position_weight = "model.q_pos" if role == "encoder" else "model.y_pos"
+    _add_semantic_input(
+        model,
+        name=position_input,
+        dtype=onnx.TensorProto.INT64,
+        shape=["B", dimension_name],
+        onnx=onnx,
+    )
+    initializer = next(
+        (value for value in model.graph.initializer if value.name == position_weight),
+        None,
+    )
+    if initializer is None:
+        return {}, set(), 0
+    weight = onnx.numpy_helper.to_array(initializer)
+    if list(weight.shape) != [1, MAX_Q if role == "encoder" else MAX_T, 320]:
+        raise ImportFailure(
+            f"{role} learned position table {position_weight!r} has the wrong shape"
+        )
+    values = analysis["values"]
+    expected_extent = (
+        _SymbolicExtent.symbol(0)
+        if role == "encoder"
+        else _SymbolicExtent.symbol(1)
+    )
+    candidates: list[int] = []
+    for index, node in enumerate(model.graph.node):
+        if node.op_type != "Slice" or not node.input or node.input[0] != position_weight:
+            continue
+        starts = _constant_vector(values, node.input[1], label=f"{role} position Slice starts")
+        axes = (
+            _constant_vector(values, node.input[3], label=f"{role} position Slice axes")
+            if len(node.input) > 3 and node.input[3]
+            else [0]
+        )
+        steps = (
+            _constant_vector(values, node.input[4], label=f"{role} position Slice steps")
+            if len(node.input) > 4 and node.input[4]
+            else [1]
+        )
+        end_value = values.get(node.input[2]) if len(node.input) > 2 else None
+        ends = (
+            list(np.asarray(end_value, dtype=object).reshape(-1))
+            if end_value is not None
+            else []
+        )
+        if (
+            starts == [0]
+            and axes == [1]
+            and steps == [1]
+            and len(ends) == 1
+            and _as_symbolic_extent(ends[0]).equivalent(expected_extent)
+            and len(node.output) == 1
+        ):
+            candidates.append(index)
+    if len(candidates) != 1:
+        raise ImportFailure(
+            f"{role} must contain exactly one learned-position Slice over {dimension_name}"
+        )
+    index = candidates[0]
+    node = model.graph.node[index]
+    _set_existing_value_shape(
+        model,
+        node.output[0],
+        [
+            _SymbolicExtent.constant(1, preferred_symbol="B"),
+            expected_extent,
+            _SymbolicExtent.constant(320),
+        ],
+        role=role,
+    )
+    axes_name = f"__volvox_{role}_position_squeeze_axes"
+    squeezed_name = f"__volvox_{role}_position_table"
+    model.graph.initializer.extend([
+        onnx.numpy_helper.from_array(np.asarray([0], dtype=np.int64), axes_name)
+    ])
+    replacements = {
+        index: [
+            onnx.helper.make_node(
+                "Squeeze",
+                [position_weight, axes_name],
+                [squeezed_name],
+                name=f"volvox_{role}_position_table",
+            ),
+            onnx.helper.make_node(
+                "Gather",
+                [squeezed_name, position_input],
+                [node.output[0]],
+                axis=0,
+                name=f"volvox_{role}_active_positions",
+            ),
+        ]
+    }
+    return replacements, {index}, 1
+
+
+def _node_consumers(nodes: Sequence[Any]) -> dict[str, list[tuple[int, int]]]:
+    consumers: dict[str, list[tuple[int, int]]] = {}
+    for node_index, node in enumerate(nodes):
+        for input_index, name in enumerate(node.input):
+            if name:
+                consumers.setdefault(name, []).append((node_index, input_index))
+    return consumers
+
+
+def _rewire_tensor(nodes: Sequence[Any], source: str, replacement: str) -> None:
+    for node in nodes:
+        for index, name in enumerate(node.input):
+            if name == source:
+                node.input[index] = replacement
+
+
+def _rewrite_mask_shape_programs(
+    model: Any,
+    *,
+    role: str,
+    analysis: Mapping[str, Any],
+    onnx: Any,
+) -> tuple[dict[int, list[Any]], set[int]]:
+    import numpy as np
+
+    nodes = list(model.graph.node)
+    arrays = _small_constant_arrays(model, onnx=onnx)
+    producer = {
+        output: index
+        for index, node in enumerate(nodes)
+        for output in node.output
+        if output
+    }
+    consumers = _node_consumers(nodes)
+    replacements: dict[int, list[Any]] = {}
+    removed: set[int] = set()
+    if role == "decoder":
+        _add_semantic_input(
+            model,
+            name=CAUSAL_MASK_INPUT,
+            dtype=onnx.TensorProto.FLOAT,
+            shape=["T", "T"],
+            onnx=onnx,
+        )
+        trilu_nodes = [
+            index for index, node in enumerate(nodes) if node.op_type == "Trilu"
+        ]
+        if trilu_nodes:
+            if len(trilu_nodes) != 1:
+                raise ImportFailure("decoder must contain at most one causal Trilu")
+            trilu_index = trilu_nodes[0]
+            trilu = nodes[trilu_index]
+            if (
+                _onnx_int_attribute(trilu, "upper", 1) != 1
+                or len(trilu.input) < 2
+                or trilu.input[1] not in arrays
+                or np.asarray(arrays[trilu.input[1]]).shape != ()
+                or int(np.asarray(arrays[trilu.input[1]]).item()) != 1
+            ):
+                raise ImportFailure("decoder causal Trilu must be strict upper-triangular")
+            ones_index = producer.get(trilu.input[0])
+            if ones_index is None or nodes[ones_index].op_type != "Expand":
+                raise ImportFailure("decoder causal Trilu must expand an immutable true scalar")
+            ones = nodes[ones_index]
+            if (
+                ones.input[0] not in arrays
+                or np.asarray(arrays[ones.input[0]]).shape != ()
+                or bool(np.asarray(arrays[ones.input[0]]).item()) is not True
+            ):
+                raise ImportFailure("decoder causal Trilu source must be true")
+            target = analysis["values"].get(ones.input[1])
+            expected_t = _SymbolicExtent.symbol(1)
+            if target is None:
+                raise ImportFailure("decoder causal mask target is not symbolic")
+            target_values = list(np.asarray(target, dtype=object).reshape(-1))
+            if len(target_values) != 2 or any(
+                not _as_symbolic_extent(value).equivalent(expected_t)
+                for value in target_values
+            ):
+                raise ImportFailure("decoder causal mask target must be exactly [T,T]")
+            where_uses = consumers.get(trilu.output[0], [])
+            causal_where_uses = [
+                (consumer, port)
+                for consumer, port in where_uses
+                if nodes[consumer].op_type == "Where" and port == 0
+            ]
+            if (
+                len(causal_where_uses) != 1
+                or any(nodes[consumer].op_type not in {"Where", "Shape"} for consumer, _ in where_uses)
+            ):
+                raise ImportFailure("decoder causal Trilu must feed one Where condition")
+            where_index = causal_where_uses[0][0]
+            where = nodes[where_index]
+            if where.op_type != "Where" or len(where.input) != 3:
+                raise ImportFailure("decoder causal Trilu consumer must be Where")
+            true_value = arrays.get(where.input[1])
+            zeros_index = producer.get(where.input[2])
+            if (
+                true_value is None
+                or np.asarray(true_value).shape != ()
+                or not np.isneginf(float(np.asarray(true_value).item()))
+                or zeros_index is None
+                or nodes[zeros_index].op_type != "Expand"
+            ):
+                raise ImportFailure(
+                    "decoder causal Where must select -Infinity or expanded zero"
+                )
+            zero_source = arrays.get(nodes[zeros_index].input[0])
+            if (
+                zero_source is None
+                or np.asarray(zero_source).shape != ()
+                or float(np.asarray(zero_source).item()) != 0.0
+            ):
+                raise ImportFailure("decoder causal Where false branch must be zero")
+            _rewire_tensor(nodes, where.output[0], CAUSAL_MASK_INPUT)
+            removed.update({ones_index, trilu_index, zeros_index, where_index})
+
+    consumers = _node_consumers(nodes)
+    for index, node in enumerate(nodes):
+        if index in removed or node.op_type != "Expand" or len(node.input) < 2:
+            continue
+        source = arrays.get(node.input[0])
+        if source is None or np.asarray(source).shape != ():
+            continue
+        uses = consumers.get(node.output[0], [])
+        if (
+            float(np.asarray(source).item()) == 0.0
+            and node.input[1] in analysis["dynamic_values"]
+            and uses
+            and all(nodes[consumer].op_type == "Where" and port == 2 for consumer, port in uses)
+        ):
+            _rewire_tensor(nodes, node.output[0], node.input[0])
+            removed.add(index)
+
+    if role == "encoder":
+        for index, node in enumerate(nodes):
+            if index in removed or node.op_type != "Expand" or len(node.input) < 2:
+                continue
+            source = arrays.get(node.input[0])
+            target = analysis["values"].get(node.input[1])
+            if (
+                source is None
+                or np.asarray(source).shape != ()
+                or bool(np.asarray(source).item()) is not False
+                or target is None
+            ):
+                continue
+            target_values = list(np.asarray(target, dtype=object).reshape(-1))
+            if (
+                len(target_values) == 2
+                and target_values[0].equivalent(1)
+                and target_values[1].equivalent(IMAGE_TOKENS)
+            ):
+                axes_name = "__volvox_encoder_image_padding_axes"
+                ones_name = "__volvox_encoder_image_padding_ones"
+                column_name = "__volvox_encoder_family_column"
+                float_column_name = "__volvox_encoder_family_column_f32"
+                zero_name = "__volvox_encoder_family_zero"
+                int_zero_name = "__volvox_encoder_family_zero_i32"
+                model.graph.initializer.extend([
+                    onnx.numpy_helper.from_array(
+                        np.asarray([1], dtype=np.int64), axes_name,
+                    ),
+                    onnx.numpy_helper.from_array(
+                        np.ones((1, IMAGE_TOKENS), dtype=np.int32), ones_name,
+                    ),
+                ])
+                replacements[index] = [
+                    onnx.helper.make_node(
+                        "Unsqueeze",
+                        ["family_ids", axes_name],
+                        [column_name],
+                        name="volvox_encoder_family_column",
+                    ),
+                    onnx.helper.make_node(
+                        "Cast",
+                        [column_name],
+                        [float_column_name],
+                        to=onnx.TensorProto.FLOAT,
+                        name="volvox_encoder_family_column_f32",
+                    ),
+                    onnx.helper.make_node(
+                        "Sub",
+                        [float_column_name, float_column_name],
+                        [zero_name],
+                        name="volvox_encoder_family_zero",
+                    ),
+                    onnx.helper.make_node(
+                        "Cast",
+                        [zero_name],
+                        [int_zero_name],
+                        to=onnx.TensorProto.INT32,
+                        name="volvox_encoder_family_zero_i32",
+                    ),
+                    onnx.helper.make_node(
+                        "Equal",
+                        [int_zero_name, ones_name],
+                        [node.output[0]],
+                        name="volvox_encoder_image_padding_mask",
+                    ),
+                ]
+    return replacements, removed
+
+
+def _apply_node_rewrites(
+    model: Any,
+    *,
+    replacements: Mapping[int, Sequence[Any]],
+    removed: set[int],
+    shape_program_outputs: set[str],
+) -> None:
+    source_nodes = list(model.graph.node)
+    rewritten: list[Any] = []
+    for index, node in enumerate(source_nodes):
+        if index in replacements:
+            rewritten.extend(replacements[index])
+        elif index not in removed:
+            rewritten.append(node)
+
+    graph_outputs = {value.name for value in model.graph.output}
+    changed = True
+    while changed:
+        changed = False
+        consumed = {
+            name
+            for node in rewritten
+            for name in node.input
+            if name
+        } | graph_outputs
+        kept = []
+        for node in rewritten:
+            if (
+                node.output
+                and (
+                    all(output in shape_program_outputs for output in node.output)
+                    or node.op_type == "Constant"
+                )
+                and not any(output in consumed for output in node.output)
+            ):
+                changed = True
+                continue
+            kept.append(node)
+        rewritten = kept
+    del model.graph.node[:]
+    model.graph.node.extend(rewritten)
+    if any(node.op_type == "Shape" for node in model.graph.node):
+        names = [node.name or "<unnamed>" for node in model.graph.node if node.op_type == "Shape"]
+        raise ImportFailure(f"normalized ONNX retained runtime Shape nodes {names}")
+    used_initializers = {
+        name
+        for node in model.graph.node
+        for name in node.input
+        if name
+    } | {value.name for value in model.graph.output}
+    retained_initializers = [
+        value for value in model.graph.initializer if value.name in used_initializers
+    ]
+    del model.graph.initializer[:]
+    model.graph.initializer.extend(retained_initializers)
+
+
+def _rewrite_dynamic_authoring_graph(
+    model: Any,
+    *,
+    role: str,
+    onnx: Any,
+) -> dict[str, int]:
+    analysis = _rewrite_dynamic_reshape_targets(model, role=role, onnx=onnx)
+    replacements, removed, position_count = _rewrite_position_slice(
+        model,
+        role=role,
+        analysis=analysis,
+        onnx=onnx,
+    )
+    mask_replacements, mask_removed = _rewrite_mask_shape_programs(
+        model,
+        role=role,
+        analysis=analysis,
+        onnx=onnx,
+    )
+    overlap = sorted(set(replacements) & set(mask_replacements))
+    if overlap:
+        raise ImportFailure(f"{role} dynamic rewrite collision at nodes {overlap}")
+    replacements.update(mask_replacements)
+    removed.update(mask_removed)
+    _apply_node_rewrites(
+        model,
+        replacements=replacements,
+        removed=removed,
+        shape_program_outputs=analysis["shape_program_outputs"],
+    )
+    expression_count = _canonicalize_derived_dimension_expressions(
+        model,
+        role=role,
+        onnx=onnx,
+    )
+    return {
+        "reshape_targets_rewritten": int(analysis["reshape_targets_rewritten"]),
+        "position_slice_rewritten": position_count,
+        "causal_mask_hoisted": int(role == "decoder" and bool(removed)),
+        "derived_dimension_expressions_rewritten": expression_count,
+    }
+
+
+def _normalized_onnx_symbols(
+    source: Path,
+    destination: Path,
+    *,
+    role: str,
+) -> dict[str, int]:
+    """Author a temporary canonical-symbol ONNX input for the generic exporter.
+
+    The producer's encoder publishes the expression ``question_length + 210``.
+    It is deliberately replaced with the plain output symbol ``M``
+    before export.  That spelling is only an import-format cue: staged package
+    qualification separately requires a canonical Concat proof for
+    ``M = Q + 210``.
+    """
+
+    try:
+        import onnx
+    except ImportError as error:  # pragma: no cover - production dependency.
+        raise ImportFailure(
+            "the local ONNX package is required to author canonical shape symbols"
+        ) from error
+    if role == "encoder":
+        replacements = {
+            "batch": "B",
+            "question_length": "Q",
+            "question_length + 210": "M",
+        }
+        required = frozenset(replacements)
+    elif role == "decoder":
+        replacements = {
+            "batch": "B",
+            "target_length": "T",
+            "memory_length": "M",
+        }
+        required = frozenset(replacements)
+    else:  # Defensive internal API boundary.
+        raise ImportFailure(f"unsupported normalized ONNX role {role!r}")
+    try:
+        model = onnx.load_model(str(source), load_external_data=False)
+    except Exception as error:
+        raise ImportFailure(f"{role} canonical ONNX loading failed: {error}") from error
+
+    seen: set[str] = set()
+    for value_info in _nested_value_infos(model, onnx.ValueInfoProto):
+        tensor_type = value_info.type.tensor_type
+        if not tensor_type.HasField("shape"):
+            continue
+        for dimension in tensor_type.shape.dim:
+            if not dimension.HasField("dim_param"):
+                continue
+            source_name = str(dimension.dim_param)
+            replacement = replacements.get(source_name)
+            if replacement is not None:
+                seen.add(source_name)
+                dimension.dim_param = replacement
+    missing = sorted(required - seen)
+    if missing:
+        raise ImportFailure(
+            f"{role} ONNX is missing canonicalization source symbols {missing}"
+        )
+    remaining = sorted({
+        str(dimension.dim_param)
+        for value_info in _nested_value_infos(model, onnx.ValueInfoProto)
+        for dimension in value_info.type.tensor_type.shape.dim
+        if dimension.HasField("dim_param")
+        and str(dimension.dim_param) in replacements
+    })
+    if remaining:
+        raise ImportFailure(
+            f"{role} ONNX retained non-canonical shape symbols {remaining}"
+        )
+    try:
+        inferred_source = onnx.shape_inference.infer_shapes(
+            model,
+            strict_mode=True,
+            data_prop=True,
+        )
+        declared_names = {
+            value.name
+            for value in [
+                *model.graph.input,
+                *model.graph.value_info,
+                *model.graph.output,
+            ]
+        }
+        model.graph.value_info.extend([
+            value
+            for value in inferred_source.graph.value_info
+            if value.name not in declared_names
+        ])
+        rewrite_report = _rewrite_dynamic_authoring_graph(
+            model,
+            role=role,
+            onnx=onnx,
+        )
+        refreshed_unknowns = _refresh_inference_unknown_value_infos(
+            model,
+            role=role,
+            onnx=onnx,
+        )
+        rewrite_report["inference_unknowns_refreshed"] = refreshed_unknowns
+        rewrite_report["derived_dimension_expressions_rewritten"] += (
+            _canonicalize_derived_dimension_expressions(
+                model,
+                role=role,
+                onnx=onnx,
+            )
+        )
+        onnx.checker.check_model(model)
+        inferred_model = onnx.shape_inference.infer_shapes(
+            model,
+            strict_mode=True,
+            data_prop=True,
+        )
+        onnx.checker.check_model(inferred_model)
+        onnx.save_model(model, str(destination), save_as_external_data=False)
+    except Exception as error:
+        if isinstance(error, ImportFailure):
+            raise
+        raise ImportFailure(f"{role} canonical ONNX authoring failed: {error}") from error
+    return rewrite_report
+
+
+def _normalized_kv_onnx_symbols(
+    source: Path,
+    destination: Path,
+    *,
+    role: str,
+) -> dict[str, int]:
+    """Normalize the producer-specific v1 ValueInfo spelling.
+
+    The one-token decoder already carries semantic position and mask inputs
+    and therefore needs no graph rewrite.
+    Only symbolic metadata is canonicalized; the executable node list and
+    initializers remain byte-for-byte semantically equivalent.
+    """
+
+    try:
+        import onnx
+    except ImportError as error:  # pragma: no cover
+        raise ImportFailure(
+            "the local ONNX package is required to author KV shape symbols"
+        ) from error
+    if role == "encoder":
+        replacements: dict[str, int | str] = {
+            "batch": "B",
+            "question_length": "Q",
+            "question_length + 210": "M",
+            "memory_length": "M",
+            "8*batch": KV_HEADS,
+            "batch*(question_length + 210)": "M",
+        }
+        required = {"batch", "question_length", "question_length + 210"}
+    elif role == "decoder":
+        replacements = {
+            "batch": "B",
+            "memory_length": "M",
+            "past_length": "P",
+            "present_length": "R",
+        }
+        required = set(replacements)
+    else:
+        raise ImportFailure(f"unsupported KV normalized ONNX role {role!r}")
+    try:
+        model = onnx.load_model(str(source), load_external_data=False)
+        if role == "decoder":
+            model = onnx.shape_inference.infer_shapes(
+                model, strict_mode=True, data_prop=True
+            )
+    except Exception as error:
+        raise ImportFailure(f"{role} KV canonical ONNX loading failed: {error}") from error
+
+    seen: set[str] = set()
+    rewritten = 0
+    for value_info in _nested_value_infos(model, onnx.ValueInfoProto):
+        tensor_type = value_info.type.tensor_type
+        if not tensor_type.HasField("shape"):
+            continue
+        for dimension in tensor_type.shape.dim:
+            if not dimension.HasField("dim_param"):
+                continue
+            spelling = str(dimension.dim_param)
+            replacement = replacements.get(spelling)
+            if replacement is None:
+                continue
+            seen.add(spelling)
+            dimension.Clear()
+            if isinstance(replacement, int):
+                dimension.dim_value = replacement
+            else:
+                dimension.dim_param = replacement
+            rewritten += 1
+    missing = sorted(required - seen)
+    if missing:
+        raise ImportFailure(f"{role} KV ONNX is missing source symbols {missing}")
+
+    if role == "decoder":
+        # Torch/ONNX shape inference leaves head width (and, after QDQ
+        # insertion, some batch axes) as producer-local ``unk__*`` symbols.
+        # The one-token public ABI fixes those extents unambiguously.
+        for value_info in _nested_value_infos(model, onnx.ValueInfoProto):
+            dimensions = value_info.type.tensor_type.shape.dim
+            if len(dimensions) >= 2 and (
+                dimensions[0].HasField("dim_param")
+                and str(dimensions[0].dim_param).startswith("unk__")
+            ):
+                dimensions[0].Clear()
+                dimensions[0].dim_param = "B"
+                rewritten += 1
+            if len(dimensions) == 4 and (
+                dimensions[3].HasField("dim_param")
+                and str(dimensions[3].dim_param).startswith("unk__")
+            ):
+                dimensions[3].Clear()
+                dimensions[3].dim_value = KV_HEAD_WIDTH
+                rewritten += 1
+            if (
+                len(dimensions) == 4
+                and value_info.name.startswith("present_v_")
+                and dimensions[2].HasField("dim_param")
+                and str(dimensions[2].dim_param).startswith("unk__")
+            ):
+                dimensions[2].Clear()
+                dimensions[2].dim_param = "R"
+                rewritten += 1
+
+    if role == "encoder":
+        outputs = {value.name: value for value in model.graph.output}
+        for name in KV_CROSS_NAMES:
+            value = outputs.get(name)
+            if value is None:
+                raise ImportFailure(f"encoder KV ONNX is missing {name}")
+            dimensions = value.type.tensor_type.shape.dim
+            if len(dimensions) != 4:
+                raise ImportFailure(f"encoder KV output {name} must have rank four")
+            dimensions[0].Clear()
+            dimensions[0].dim_param = "B"
+            dimensions[1].Clear()
+            dimensions[1].dim_value = KV_HEADS
+            dimensions[2].Clear()
+            dimensions[2].dim_param = "M"
+            dimensions[3].Clear()
+            dimensions[3].dim_value = KV_HEAD_WIDTH
+            rewritten += 4
+
+    semantic_rewrite: dict[str, int] = {}
+    executable_nodes_rewritten = 0
+    if role == "encoder":
+        # The producer derives attention reshape targets and the learned
+        # question-position slice from runtime Shape tensors.  Those programs
+        # mix data and shape consumers, so make the position sequence semantic
+        # and rewrite only the proven shape-only subgraphs.
+        inferred_source = onnx.shape_inference.infer_shapes(
+            model, strict_mode=True, data_prop=True
+        )
+        declared_names = {
+            value.name
+            for value in [
+                *model.graph.input, *model.graph.value_info, *model.graph.output
+            ]
+        }
+        model.graph.value_info.extend([
+            value for value in inferred_source.graph.value_info
+            if value.name not in declared_names
+        ])
+        nodes_before = len(model.graph.node)
+        semantic_rewrite = _rewrite_dynamic_authoring_graph(
+            model, role=role, onnx=onnx
+        )
+        executable_nodes_rewritten = nodes_before - len(model.graph.node)
+        semantic_rewrite["inference_unknowns_refreshed"] = (
+            _refresh_inference_unknown_value_infos(model, role=role, onnx=onnx)
+        )
+        semantic_rewrite["derived_dimension_expressions_rewritten"] += (
+            _canonicalize_derived_dimension_expressions(
+                model, role=role, onnx=onnx
+            )
+        )
+    public_expected: dict[str, list[int | str]]
+    if role == "encoder":
+        public_expected = {
+            "image": ["B", 1, IMAGE_HEIGHT, IMAGE_WIDTH],
+            "question_ids": ["B", "Q"],
+            "family_ids": ["B"],
+            "question_position_ids": ["B", "Q"],
+            "memory": ["B", "M", 320],
+            "memory_padding_mask": ["B", "M"],
+            "router_logits": ["B", len(FAMILY_ORDER)],
+            "selected_family_ids": ["B"],
+            **{
+                name: ["B", KV_HEADS, "M", KV_HEAD_WIDTH]
+                for name in KV_CROSS_NAMES
+            },
+        }
+    else:
+        public_expected = {
+            "decoder_input_ids": ["B", 1],
+            "position_ids": ["B"],
+            "family_ids": ["B"],
+            "memory_padding_mask": ["B", "M"],
+            "past_padding_mask": ["B", "P"],
+            **{
+                name: ["B", KV_HEADS, "M", KV_HEAD_WIDTH]
+                for name in KV_CROSS_NAMES
+            },
+            **{
+                name: ["B", KV_HEADS, "P", KV_HEAD_WIDTH]
+                for name in KV_PAST_NAMES
+            },
+            "logits": ["B", 1, BPE_VOCAB_SIZE],
+            "present_padding_mask": ["B", "R"],
+            **{
+                name: ["B", KV_HEADS, "R", KV_HEAD_WIDTH]
+                for name in KV_PRESENT_NAMES
+            },
+        }
+    public = {
+        value.name: value for value in [*model.graph.input, *model.graph.output]
+    }
+    for name, expected_shape in public_expected.items():
+        value = public.get(name)
+        if value is None or _tensor_signature(value)[1] != expected_shape:
+            raise ImportFailure(
+                f"{role} KV canonical public tensor {name!r} has the wrong shape"
+            )
+    try:
+        onnx.checker.check_model(model)
+        onnx.save_model(model, str(destination), save_as_external_data=False)
+    except Exception as error:
+        raise ImportFailure(f"{role} KV canonical ONNX authoring failed: {error}") from error
+    return {
+        "value_info_dimensions_rewritten": rewritten,
+        "executable_nodes_rewritten": executable_nodes_rewritten,
+        **semantic_rewrite,
+    }
+
+
+def _verify_dynamic_authoring_parity(
+    source: Path,
+    normalized: Path,
+    *,
+    role: str,
+) -> dict[str, Any]:
+    """Compare the semantic-input rewrite with the producer at active extents."""
+
+    try:
+        import numpy as np
+        import onnxruntime as ort
+    except ImportError as error:  # pragma: no cover - production dependency.
+        raise ImportFailure(
+            "NumPy and ONNX Runtime are required for dynamic authoring parity"
+        ) from error
+
+    cases = [
+        ("short", SHAPE_PROFILES["short"]),
+        ("representative", SHAPE_PROFILES["representative"]),
+        ("maximum", SHAPE_PROFILES["maximum"]),
+        ("short_after_maximum", SHAPE_PROFILES["short"]),
+        ("representative_after_short", SHAPE_PROFILES["representative"]),
+    ]
+    try:
+        original_session = ort.InferenceSession(
+            str(source),
+            providers=["CPUExecutionProvider"],
+        )
+        normalized_session = ort.InferenceSession(
+            str(normalized),
+            providers=["CPUExecutionProvider"],
+        )
+    except Exception as error:
+        raise ImportFailure(f"{role} dynamic authoring parity setup failed: {error}") from error
+
+    maximum_difference = 0.0
+    reports = []
+    for case_name, profile in cases:
+        if role == "encoder":
+            active = profile["Q"]
+            question_ids = (
+                np.arange(active, dtype=np.int64).reshape(1, active) % 64
+            ) + 4
+            original_inputs = {
+                "image": np.zeros(
+                    (1, IMAGE_CHANNELS, IMAGE_HEIGHT, IMAGE_WIDTH),
+                    dtype=np.float32,
+                ),
+                "question_ids": question_ids,
+                "family_ids": np.asarray([-1], dtype=np.int64),
+            }
+            normalized_inputs = {
+                **original_inputs,
+                POSITION_INPUTS[role][0]: np.arange(
+                    active,
+                    dtype=np.int64,
+                ).reshape(1, active),
+            }
+        else:
+            active = profile["T"]
+            memory_length = profile["M"]
+            causal_mask = np.zeros((active, active), dtype=np.float32)
+            causal_mask[np.triu_indices(active, 1)] = -np.inf
+            original_inputs = {
+                "decoder_input_ids": (
+                    np.arange(active, dtype=np.int64).reshape(1, active) % 64
+                ) + 1,
+                "memory": np.zeros((1, memory_length, 320), dtype=np.float32),
+                "memory_padding_mask": np.zeros(
+                    (1, memory_length),
+                    dtype=np.bool_,
+                ),
+                "family_ids": np.asarray([0], dtype=np.int64),
+            }
+            normalized_inputs = {
+                **original_inputs,
+                POSITION_INPUTS[role][0]: np.arange(
+                    active,
+                    dtype=np.int64,
+                ).reshape(1, active),
+                CAUSAL_MASK_INPUT: causal_mask,
+            }
+        try:
+            original_outputs = original_session.run(None, original_inputs)
+            normalized_outputs = normalized_session.run(None, normalized_inputs)
+        except Exception as error:
+            raise ImportFailure(
+                f"{role} dynamic authoring parity case {case_name!r} failed: {error}"
+            ) from error
+        if len(original_outputs) != len(normalized_outputs):
+            raise ImportFailure(f"{role} dynamic authoring parity output count changed")
+        case_difference = 0.0
+        for output_index, (original, authored) in enumerate(
+            zip(original_outputs, normalized_outputs)
+        ):
+            if original.shape != authored.shape or original.dtype != authored.dtype:
+                raise ImportFailure(
+                    f"{role} dynamic authoring parity output {output_index} ABI changed"
+                )
+            if original.dtype.kind == "f":
+                difference = float(np.max(np.abs(original - authored), initial=0.0))
+                if not np.array_equal(original, authored):
+                    raise ImportFailure(
+                        f"{role} dynamic authoring parity case {case_name!r} "
+                        f"changed output {output_index} by {difference}"
+                    )
+                case_difference = max(case_difference, difference)
+            elif not np.array_equal(original, authored):
+                raise ImportFailure(
+                    f"{role} dynamic authoring parity case {case_name!r} "
+                    f"changed output {output_index}"
+                )
+        if role == "decoder":
+            original_greedy = np.argmax(original_outputs[0], axis=-1)
+            normalized_greedy = np.argmax(normalized_outputs[0], axis=-1)
+            if not np.array_equal(original_greedy, normalized_greedy):
+                raise ImportFailure(
+                    f"decoder dynamic authoring parity case {case_name!r} changed greedy IDs"
+                )
+        maximum_difference = max(maximum_difference, case_difference)
+        reports.append({
+            "case": case_name,
+            "B": profile["B"],
+            "Q": profile["Q"],
+            "T": profile["T"],
+            "M": profile["M"],
+            "max_abs_difference": case_difference,
+        })
+    return {
+        "status": "passed",
+        "provider": "CPUExecutionProvider",
+        "cases": reports,
+        "maximum_absolute_difference": maximum_difference,
+        "greedy_argmax": "matched" if role == "decoder" else "not_applicable",
+    }
+
+
+def _nested_value_infos(message: Any, value_info_proto_type: type[Any]):
+    """Yield public/intermediate ValueInfoProto records, including subgraphs."""
+
+    if isinstance(message, value_info_proto_type):
+        yield message
+        return
+    list_fields = getattr(message, "ListFields", None)
+    if not callable(list_fields):
+        return
+    for field, value in list_fields():
+        if field.cpp_type != field.CPPTYPE_MESSAGE:
+            continue
+        if field.is_repeated:
+            for item in value:
+                yield from _nested_value_infos(item, value_info_proto_type)
+        else:
+            yield from _nested_value_infos(value, value_info_proto_type)
 
 
 def _require_exact_keys(
@@ -1284,8 +2991,265 @@ def _validate_producer_variants(
         )
 
 
+def _validate_kv_variant_manifest(
+    manifest: Mapping[str, Any],
+    files: Mapping[str, Any],
+    *,
+    has_int8_w8a8: bool,
+) -> None:
+    """Validate the v1 variant records without importing producer eval files.
+
+    The release carries useful benchmark and heldout provenance, but those
+    referenced reports are intentionally outside the four-file import trust
+    boundary.  The importer closes over the graph identity, public numeric
+    ABI, and quantization contract that affect the resulting package.
+    """
+
+    variants = manifest.get("variants")
+    if not isinstance(variants, Mapping):
+        raise ImportFailure("KV source manifest variants must be an object")
+    expected = {"fp32"}
+    if has_int8_w8a8:
+        expected.add("int8_w8a8")
+    if set(variants) != expected:
+        raise ImportFailure("KV source manifest variants do not match its model files")
+    fp32 = variants.get("fp32")
+    if not isinstance(fp32, Mapping) or {
+        "activation_dtype": fp32.get("activation_dtype"),
+        "compute_dtype": fp32.get("compute_dtype"),
+        "weight_dtype": fp32.get("weight_dtype"),
+    } != {
+        "activation_dtype": "float32",
+        "compute_dtype": "float32",
+        "weight_dtype": "float32",
+    }:
+        raise ImportFailure("KV source variants.fp32 has the wrong dtype contract")
+    for role in ("encoder", "decoder"):
+        _validate_variant_file_reference(
+            fp32, files, role=role, file_key=role,
+            label="KV source manifest variants.fp32",
+        )
+    if not has_int8_w8a8:
+        return
+    int8_variant = variants.get("int8_w8a8")
+    if not isinstance(int8_variant, Mapping):
+        raise ImportFailure("KV source variants.int8_w8a8 must be an object")
+    contract = {
+        "format": "tiny_receipt_vqa_onnx_w8a8_u8s8_qdq_v1",
+        "mode": "static_w8a8_qdq",
+        "quant_format": "QDQ",
+        "scheme": "U8S8",
+        "activation_dtype": "uint8",
+        "activation_granularity": "per_tensor",
+        "weight_dtype": "int8",
+        "weight_granularity": "per_output_channel",
+        "accumulation_dtype": "int32",
+        "operators": ["Conv", "MatMul", "Gemm"],
+    }
+    if {key: int8_variant.get(key) for key in contract} != contract:
+        raise ImportFailure("KV source INT8 variant is not the static U8S8 QDQ contract")
+    for role in ("encoder", "decoder"):
+        _validate_variant_file_reference(
+            int8_variant, files, role=role, file_key=f"{role}_int8_w8a8",
+            label="KV source manifest variants.int8_w8a8",
+        )
+
+
+def _validate_kv_source(
+    source: Path,
+    paths: dict[str, Path],
+    manifest: Mapping[str, Any],
+    config: Mapping[str, Any],
+    vocab: Mapping[str, Any],
+    *,
+    variant: str,
+) -> dict[str, Any]:
+    if manifest.get("source_format") != "safetensors" or manifest.get("opset") != 18:
+        raise ImportFailure("KV source must declare safetensors provenance and opset 18")
+    files = manifest.get("files")
+    if not isinstance(files, Mapping):
+        raise ImportFailure("KV source manifest requires a files object")
+    actual_file_keys = set(files)
+    missing_base_keys = BASE_SOURCE_FILE_KEYS - actual_file_keys
+    unknown_file_keys = actual_file_keys - (
+        BASE_SOURCE_FILE_KEYS | INT8_W8A8_SOURCE_FILE_KEYS
+    )
+    if missing_base_keys or unknown_file_keys:
+        raise ImportFailure(
+            "KV source manifest files has the wrong key set; "
+            f"missing={sorted(missing_base_keys)}, unsupported={sorted(unknown_file_keys)}"
+        )
+    present_int8_keys = actual_file_keys & INT8_W8A8_SOURCE_FILE_KEYS
+    if present_int8_keys and present_int8_keys != INT8_W8A8_SOURCE_FILE_KEYS:
+        raise ImportFailure("KV source INT8 files must use the complete six-key set")
+    for key in ("encoder", "decoder", "config", "vocab"):
+        if files.get(key) != SOURCE_FILES[key]:
+            raise ImportFailure(f"KV source files.{key} must be {SOURCE_FILES[key]!r}")
+    validated_model_keys = ["encoder", "decoder"]
+    for key, filename in INT8_W8A8_SOURCE_FILES.items():
+        if key in present_int8_keys:
+            if files.get(key) != filename:
+                raise ImportFailure(f"KV source files.{key} must be {filename!r}")
+            paths[key] = _regular_file(source, filename)
+            validated_model_keys.append(key)
+    if variant == "int8-w8a8" and not present_int8_keys:
+        raise ImportFailure("requested int8-w8a8 variant is absent from the KV source")
+    for key in validated_model_keys:
+        if files.get(f"{key}_bytes") != paths[key].stat().st_size:
+            raise ImportFailure(f"KV source {key} byte size does not match its manifest")
+        if files.get(f"{key}_sha256") != _sha256(paths[key]):
+            raise ImportFailure(f"KV source {key} SHA-256 does not match its manifest")
+    _validate_kv_variant_manifest(
+        manifest, files, has_int8_w8a8=bool(present_int8_keys)
+    )
+
+    required_config = {
+        "vocab_size": BPE_VOCAB_SIZE,
+        "d_model": 320,
+        "heads": KV_HEADS,
+        "enc_layers": 6,
+        "dec_layers": KV_LAYERS,
+        "max_q_len": MAX_Q,
+        "max_out_len": MAX_T,
+        "img_tokens": IMAGE_TOKENS,
+        "adapter_families": len(FAMILY_ORDER),
+    }
+    for key, expected in required_config.items():
+        if config.get(key) != expected:
+            raise ImportFailure(f"KV source config {key!r} must equal {expected}")
+    if config.get("use_adapters") is not True or config.get("use_router") is not True:
+        raise ImportFailure("KV source must enable adapters and the learned router")
+    vocab_size, tokenizer = _validate_vocabulary(config, vocab, manifest)
+    for label, document in (("config", config), ("vocab", vocab)):
+        if _contains_private_absolute_path(document):
+            raise ImportFailure(f"KV source {label} contains a private absolute path")
+
+    families = manifest.get("adapter_families")
+    if not isinstance(families, Mapping) or families.get("ordered_names") != list(FAMILY_ORDER):
+        raise ImportFailure("KV source adapter family order is not canonical")
+    if families.get("name_to_id") != {
+        name: index for index, name in enumerate(FAMILY_ORDER)
+    }:
+        raise ImportFailure("KV source adapter family IDs are not canonical")
+    generation = manifest.get("generation")
+    if not isinstance(generation, Mapping) or {
+        "bos_token_id": generation.get("bos_token_id"),
+        "eos_token_id": generation.get("eos_token_id"),
+        "pad_token_id": generation.get("pad_token_id"),
+        "max_length": generation.get("max_length"),
+    } != {
+        "bos_token_id": 1, "eos_token_id": 2, "pad_token_id": 0,
+        "max_length": MAX_T,
+    } or "KV cache" not in str(generation.get("strategy")):
+        raise ImportFailure("KV source generation contract is invalid")
+    cache = manifest.get("kv_cache")
+    if not isinstance(cache, Mapping) or (
+        cache.get("format") != "tiny_receipt_vqa_default_kv_cache_v1"
+        or cache.get("default_for") != ["fp32", "int8_w8a8"]
+    ):
+        raise ImportFailure("KV source cache declaration is invalid")
+    if manifest.get("outputs") != {
+        "encoder": [
+            "memory", "memory_padding_mask", "router_logits",
+            "selected_family_ids", *KV_CROSS_NAMES,
+        ],
+        "decoder": ["logits", "present_padding_mask", *KV_PRESENT_NAMES],
+    }:
+        raise ImportFailure("KV source output names are not the explicit-cache contract")
+
+    try:
+        from onnx import TensorProto
+    except ImportError as error:  # pragma: no cover
+        raise ImportFailure("the local ONNX package is required to validate this source") from error
+    selected_keys = SELECTED_MODEL_KEYS[variant]
+    require_u8s8_qdq = variant == "int8-w8a8"
+    cross_output_shapes = {
+        name: [
+            "batch",
+            KV_HEADS if require_u8s8_qdq else f"Transpose{name}_dim_1",
+            "memory_length",
+            KV_HEAD_WIDTH if require_u8s8_qdq else f"Transpose{name}_dim_3",
+        ]
+        for name in KV_CROSS_NAMES
+    }
+    encoder_quantized_ops = _validate_onnx(
+        paths[selected_keys["encoder"]],
+        label=f"{variant} KV encoder",
+        expected_opset=18,
+        expected_inputs={
+            "image": (TensorProto.FLOAT, ["batch", 1, IMAGE_HEIGHT, IMAGE_WIDTH]),
+            "question_ids": (TensorProto.INT64, ["batch", "question_length"]),
+            "family_ids": (TensorProto.INT64, ["batch"]),
+        },
+        expected_outputs={
+            "memory": (TensorProto.FLOAT, ["batch", "question_length + 210", 320]),
+            "memory_padding_mask": (
+                TensorProto.BOOL, ["batch", "question_length + 210"]
+            ),
+            "router_logits": (TensorProto.FLOAT, ["batch", len(FAMILY_ORDER)]),
+            "selected_family_ids": (TensorProto.INT64, ["batch"]),
+            **{
+                name: (TensorProto.FLOAT, shape)
+                for name, shape in cross_output_shapes.items()
+            },
+        },
+        require_u8s8_qdq=require_u8s8_qdq,
+    )
+    decoder_inputs: dict[str, tuple[int, list[int | str]]] = {
+        "decoder_input_ids": (TensorProto.INT64, ["batch", 1]),
+        "position_ids": (TensorProto.INT64, ["batch"]),
+        "family_ids": (TensorProto.INT64, ["batch"]),
+        "memory_padding_mask": (TensorProto.BOOL, ["batch", "memory_length"]),
+        "past_padding_mask": (TensorProto.BOOL, ["batch", "past_length"]),
+    }
+    decoder_inputs.update({
+        name: (TensorProto.FLOAT, ["batch", KV_HEADS, "memory_length", KV_HEAD_WIDTH])
+        for name in KV_CROSS_NAMES
+    })
+    decoder_inputs.update({
+        name: (TensorProto.FLOAT, ["batch", KV_HEADS, "past_length", KV_HEAD_WIDTH])
+        for name in KV_PAST_NAMES
+    })
+    decoder_outputs: dict[str, tuple[int, list[int | str]]] = {
+        "logits": (TensorProto.FLOAT, ["batch", 1, vocab_size]),
+        "present_padding_mask": (TensorProto.BOOL, ["batch", "present_length"]),
+    }
+    decoder_outputs.update({
+        name: (TensorProto.FLOAT, ["batch", KV_HEADS, "present_length", KV_HEAD_WIDTH])
+        for name in KV_PRESENT_NAMES
+    })
+    decoder_quantized_ops = _validate_onnx(
+        paths[selected_keys["decoder"]],
+        label=f"{variant} KV decoder",
+        expected_opset=18,
+        expected_inputs=decoder_inputs,
+        expected_outputs=decoder_outputs,
+        require_u8s8_qdq=require_u8s8_qdq,
+    )
+    if require_u8s8_qdq and (
+        encoder_quantized_ops | decoder_quantized_ops
+    ) != frozenset({"Conv", "MatMul", "Gemm"}):
+        raise ImportFailure("KV INT8 graphs do not implement the declared operator set")
+    hashes = {key: _sha256(path) for key, path in paths.items()}
+    return {
+        "paths": paths,
+        "selected_paths": {role: paths[key] for role, key in selected_keys.items()},
+        "selected_file_keys": dict(selected_keys),
+        "variant": variant,
+        "source_format": SOURCE_FORMAT,
+        "cache_mode": "explicit-kv",
+        "manifest": manifest,
+        "config": config,
+        "vocab": vocab,
+        "vocab_size": vocab_size,
+        "tokenizer": tokenizer,
+        "hashes": hashes,
+        "memory_length": IMAGE_TOKENS + MAX_Q,
+    }
+
+
 def validate_source(source: Path, *, variant: str = "fp32") -> dict[str, Any]:
-    """Validate a producer directory and return immutable import metadata."""
+    """Validate the sole explicit-KV producer contract."""
 
     if variant not in CLI_VARIANTS:
         raise ImportFailure(f"unsupported TinyReceipt source variant {variant!r}")
@@ -1300,323 +3264,126 @@ def validate_source(source: Path, *, variant: str = "fp32") -> dict[str, Any]:
     manifest = _read_json(paths["manifest"], "source manifest")
     config = _read_json(paths["config"], "source config")
     vocab = _read_json(paths["vocab"], "source vocabulary")
-
     if manifest.get("format") != SOURCE_FORMAT:
         raise ImportFailure(f"source manifest format must be {SOURCE_FORMAT!r}")
-    if manifest.get("source_format") != "safetensors" or manifest.get("opset") != 18:
-        raise ImportFailure("source manifest must declare safetensors provenance and opset 18")
-    files = manifest.get("files")
-    if not isinstance(files, Mapping):
-        raise ImportFailure("source manifest requires a files object")
-    actual_file_keys = set(files)
-    missing_base_keys = BASE_SOURCE_FILE_KEYS - actual_file_keys
-    if missing_base_keys:
-        raise ImportFailure(
-            "source manifest files is missing required base keys "
-            f"{sorted(missing_base_keys)}"
-        )
-    unknown_file_keys = actual_file_keys - (
-        BASE_SOURCE_FILE_KEYS | INT8_W8A8_SOURCE_FILE_KEYS
-    )
-    if unknown_file_keys:
-        raise ImportFailure(
-            "source manifest files contains unsupported keys "
-            f"{sorted(unknown_file_keys)}"
-        )
-    present_int8_keys = actual_file_keys & INT8_W8A8_SOURCE_FILE_KEYS
-    if present_int8_keys and present_int8_keys != INT8_W8A8_SOURCE_FILE_KEYS:
-        missing_int8_keys = INT8_W8A8_SOURCE_FILE_KEYS - present_int8_keys
-        raise ImportFailure(
-            "source manifest INT8 W8A8 files must use the complete six-key set; "
-            f"missing {sorted(missing_int8_keys)}"
-        )
-    for key in ("encoder", "decoder", "config", "vocab"):
-        if files.get(key) != SOURCE_FILES[key]:
-            raise ImportFailure(f"source manifest files.{key} must be {SOURCE_FILES[key]!r}")
-    validated_model_keys = ["encoder", "decoder"]
-    if present_int8_keys:
-        for key, filename in INT8_W8A8_SOURCE_FILES.items():
-            if files.get(key) != filename:
-                raise ImportFailure(
-                    f"source manifest files.{key} must be {filename!r}"
-                )
-            paths[key] = _regular_file(source, filename)
-            validated_model_keys.append(key)
-    if variant == "int8-w8a8" and not present_int8_keys:
-        raise ImportFailure(
-            "requested int8-w8a8 variant is absent from the source manifest"
-        )
-    for key in validated_model_keys:
-        actual_bytes = paths[key].stat().st_size
-        actual_hash = _sha256(paths[key])
-        if files.get(f"{key}_bytes") != actual_bytes:
-            raise ImportFailure(f"source {key} byte size does not match its manifest")
-        if files.get(f"{key}_sha256") != actual_hash:
-            raise ImportFailure(f"source {key} SHA-256 does not match its manifest")
-    _validate_producer_variants(
-        manifest,
-        files,
-        has_int8_w8a8=bool(present_int8_keys),
-        maximum_prefix_length=_positive_int(
-            config.get("max_out_len"),
-            "source config.max_out_len",
-        ),
+    return _validate_kv_source(
+        source, paths, manifest, config, vocab, variant=variant
     )
 
-    required_config = {
-        "d_model": 320,
-        "heads": 8,
-        "enc_layers": 6,
-        "dec_layers": 4,
-        "max_q_len": 192,
-        "max_out_len": 192,
-        "img_tokens": 210,
-        "adapter_families": 8,
-    }
-    for key, expected in required_config.items():
-        if config.get(key) != expected:
-            raise ImportFailure(f"source config {key!r} must equal {expected}")
-    if config.get("use_adapters") is not True or config.get("use_router") is not True:
-        raise ImportFailure("source config must enable adapters and the learned router")
+def verify_explicit_kv_sentinel(source: Mapping[str, Any]) -> dict[str, Any]:
+    """Prove the positive P=1 seed is equivalent to the producer's P=0 seed.
 
-    vocab_size, tokenizer = _validate_vocabulary(config, vocab, manifest)
-    for label, document in (("config", config), ("vocab", vocab)):
-        if _contains_private_absolute_path(document):
-            raise ImportFailure(
-                f"source {label} contains a private absolute path"
-            )
-
-    families = manifest.get("adapter_families")
-    if not isinstance(families, Mapping):
-        raise ImportFailure("source manifest requires adapter_families")
-    if families.get("ordered_names") != list(FAMILY_ORDER):
-        raise ImportFailure("source adapter family order is not canonical")
-    if families.get("name_to_id") != {
-        name: index for index, name in enumerate(FAMILY_ORDER)
-    }:
-        raise ImportFailure("source adapter family IDs do not match the declared order")
-
-    generation = manifest.get("generation")
-    if not isinstance(generation, Mapping) or {
-        "bos_token_id": generation.get("bos_token_id"),
-        "eos_token_id": generation.get("eos_token_id"),
-        "pad_token_id": generation.get("pad_token_id"),
-        "max_length": generation.get("max_length"),
-    } != {
-        "bos_token_id": 1,
-        "eos_token_id": 2,
-        "pad_token_id": 0,
-        "max_length": 192,
-    }:
-        raise ImportFailure("source generation IDs/length do not match config and vocabulary")
-    if manifest.get("outputs") != {
-        "encoder": [
-            "memory",
-            "memory_padding_mask",
-            "router_logits",
-            "selected_family_ids",
-        ],
-        "decoder": ["logits"],
-    }:
-        raise ImportFailure("source output names are not the split-ONNX contract")
-
-    try:
-        from onnx import TensorProto
-    except ImportError as error:  # pragma: no cover - handled in _validate_onnx.
-        raise ImportFailure("the local ONNX package is required to validate this source") from error
-    selected_keys = SELECTED_MODEL_KEYS[variant]
-    require_u8s8_qdq = variant == "int8-w8a8"
-    encoder_quantized_ops = _validate_onnx(
-        paths[selected_keys["encoder"]],
-        label=f"{variant} encoder",
-        expected_opset=18,
-        expected_inputs={
-            "image": (TensorProto.FLOAT, ["batch", 1, 320, 672]),
-            "question_ids": (TensorProto.INT64, ["batch", "question_length"]),
-            "family_ids": (TensorProto.INT64, ["batch"]),
-        },
-        expected_outputs={
-            "memory": (TensorProto.FLOAT, ["batch", "question_length + 210", 320]),
-            "memory_padding_mask": (
-                TensorProto.BOOL,
-                ["batch", "question_length + 210"],
-            ),
-            "router_logits": (TensorProto.FLOAT, ["batch", 8]),
-            "selected_family_ids": (TensorProto.INT64, ["batch"]),
-        },
-        require_u8s8_qdq=require_u8s8_qdq,
-    )
-    decoder_quantized_ops = _validate_onnx(
-        paths[selected_keys["decoder"]],
-        label=f"{variant} decoder",
-        expected_opset=18,
-        expected_inputs={
-            "decoder_input_ids": (
-                TensorProto.INT64,
-                ["batch", "target_length"],
-            ),
-            "memory": (TensorProto.FLOAT, ["batch", "memory_length", 320]),
-            "memory_padding_mask": (
-                TensorProto.BOOL,
-                ["batch", "memory_length"],
-            ),
-            "family_ids": (TensorProto.INT64, ["batch"]),
-        },
-        expected_outputs={
-            "logits": (
-                TensorProto.FLOAT,
-                ["batch", "target_length", vocab_size],
-            ),
-        },
-        require_u8s8_qdq=require_u8s8_qdq,
-    )
-    if require_u8s8_qdq and (
-        encoder_quantized_ops | decoder_quantized_ops
-    ) != frozenset({"Conv", "MatMul", "Gemm"}):
-        raise ImportFailure(
-            "int8-w8a8 encoder/decoder do not implement the declared quantized operator set"
-        )
-    hashes = {key: _sha256(path) for key, path in paths.items()}
-    return {
-        "paths": paths,
-        "selected_paths": {
-            role: paths[key] for role, key in selected_keys.items()
-        },
-        "selected_file_keys": dict(selected_keys),
-        "variant": variant,
-        "manifest": manifest,
-        "config": config,
-        "vocab": vocab,
-        "vocab_size": vocab_size,
-        "tokenizer": tokenizer,
-        "hashes": hashes,
-        "memory_length": _positive_int(config["img_tokens"], "config.img_tokens")
-        + _positive_int(config["max_q_len"], "config.max_q_len"),
-    }
-
-
-def verify_static_padding(source: Mapping[str, Any]) -> dict[str, Any]:
-    """Prove the fixed Q/T=192 lowering against the dynamic source graphs."""
+    Volvox bounded dimensions intentionally reject zero extents.  The v1
+    package therefore carries one all-zero self-cache slot whose padding-mask
+    bit is true.  This qualification executes every adapter family and proves
+    that the visible token and newly appended cache are unchanged.
+    """
 
     try:
         import numpy as np
         import onnxruntime as ort
     except ImportError as error:  # pragma: no cover - production dependency.
         raise ImportFailure(
-            "NumPy and ONNX Runtime are required for fixed-padding parity"
+            "NumPy and ONNX Runtime are required for KV sentinel parity"
         ) from error
 
-    paths = source.get("selected_paths", source["paths"])
-    config = source["config"]
-    q_length = int(config["max_q_len"])
-    target_length = int(config["max_out_len"])
-    image = np.zeros((1, 1, 320, 672), dtype=np.float32)
-    question = np.asarray([[4, 5, 2]], dtype=np.int64)
-    padded_question = np.zeros((1, q_length), dtype=np.int64)
-    padded_question[:, : question.shape[1]] = question
-    automatic_family = np.asarray([-1], dtype=np.int64)
-
-    try:
-        encoder = ort.InferenceSession(
-            str(paths["encoder"]),
-            providers=["CPUExecutionProvider"],
-        )
-        dynamic_encoder = encoder.run(
-            None,
-            {
-                "image": image,
-                "question_ids": question,
-                "family_ids": automatic_family,
-            },
-        )
-        fixed_encoder = encoder.run(
-            None,
-            {
-                "image": image,
-                "question_ids": padded_question,
-                "family_ids": automatic_family,
-            },
-        )
-    except Exception as error:
-        raise ImportFailure(f"encoder fixed-padding parity execution failed: {error}") from error
-
-    dynamic_memory, dynamic_mask, dynamic_router, dynamic_selected = dynamic_encoder
-    fixed_memory, fixed_mask, fixed_router, fixed_selected = fixed_encoder
-    if dynamic_mask.dtype != np.bool_ or fixed_mask.dtype != np.bool_:
-        raise ImportFailure("source memory_padding_mask must be BOOL")
-    if np.any(dynamic_mask) or int(np.count_nonzero(~fixed_mask)) != dynamic_memory.shape[1]:
-        raise ImportFailure("source memory_padding_mask does not mark padded positions as true")
-    fixed_valid_memory = fixed_memory[~fixed_mask].reshape(dynamic_memory.shape)
-    memory_difference = float(np.max(np.abs(dynamic_memory - fixed_valid_memory)))
-    router_difference = float(np.max(np.abs(dynamic_router - fixed_router)))
-    if not np.array_equal(dynamic_selected, fixed_selected):
-        raise ImportFailure("fixed question padding changes the selected family")
-
-    decoder_ids = np.asarray([[1, 4, 5]], dtype=np.int64)
-    padded_decoder_ids = np.zeros((1, target_length), dtype=np.int64)
-    padded_decoder_ids[:, : decoder_ids.shape[1]] = decoder_ids
-    try:
-        del encoder
-        decoder = ort.InferenceSession(
-            str(paths["decoder"]),
-            providers=["CPUExecutionProvider"],
-        )
-        dynamic_logits = decoder.run(
-            None,
-            {
-                "decoder_input_ids": decoder_ids,
-                "memory": dynamic_memory,
-                "memory_padding_mask": dynamic_mask,
-                "family_ids": dynamic_selected.astype(np.int64, copy=False),
-            },
-        )[0]
-        fixed_logits = decoder.run(
-            None,
-            {
-                "decoder_input_ids": padded_decoder_ids,
-                "memory": fixed_memory,
-                "memory_padding_mask": fixed_mask,
-                "family_ids": fixed_selected.astype(np.int64, copy=False),
-            },
-        )[0]
-    except Exception as error:
-        raise ImportFailure(f"decoder fixed-padding parity execution failed: {error}") from error
-    logits_difference = float(
-        np.max(np.abs(dynamic_logits - fixed_logits[:, : decoder_ids.shape[1], :]))
+    options = ort.SessionOptions()
+    options.intra_op_num_threads = 1
+    options.inter_op_num_threads = 1
+    session = ort.InferenceSession(
+        str(source["selected_paths"]["decoder"]),
+        sess_options=options,
+        providers=["CPUExecutionProvider"],
     )
-    float_outputs = (
-        dynamic_memory,
-        fixed_memory,
-        dynamic_router,
-        fixed_router,
-        dynamic_logits,
-        fixed_logits,
-    )
-    if any(not bool(np.all(np.isfinite(value))) for value in float_outputs) or any(
-        not bool(np.isfinite(value))
-        for value in (memory_difference, router_difference, logits_difference)
-    ):
-        raise ImportFailure("fixed-padding parity produced non-finite outputs or differences")
-    tolerance = 1.0e-4
-    if max(memory_difference, router_difference, logits_difference) > tolerance:
-        raise ImportFailure(
-            "fixed-padding parity exceeded tolerance "
-            f"{tolerance}: memory={memory_difference}, router={router_difference}, "
-            f"logits={logits_difference}"
-        )
-    if int(np.argmax(dynamic_logits[0, -1])) != int(
-        np.argmax(fixed_logits[0, decoder_ids.shape[1] - 1])
-    ):
-        raise ImportFailure("fixed-padding parity changes greedy first-index ArgMax")
+    rng = np.random.default_rng(955740)
+    memory_length = IMAGE_TOKENS + 1
+    common: dict[str, Any] = {
+        "decoder_input_ids": np.asarray([[1]], dtype=np.int64),
+        "position_ids": np.asarray([0], dtype=np.int64),
+        "memory_padding_mask": np.zeros((1, memory_length), dtype=np.bool_),
+    }
+    for name in KV_CROSS_NAMES:
+        common[name] = rng.standard_normal(
+            (1, KV_HEADS, memory_length, KV_HEAD_WIDTH), dtype=np.float32
+        ) * np.float32(0.01)
+    output_names = ["logits", "present_padding_mask", *KV_PRESENT_NAMES]
+    maximum_logits_difference = 0.0
+    maximum_cache_difference = 0.0
+    for family_id in range(len(FAMILY_ORDER)):
+        empty = dict(common)
+        empty["family_ids"] = np.asarray([family_id], dtype=np.int64)
+        empty["past_padding_mask"] = np.zeros((1, 0), dtype=np.bool_)
+        sentinel = dict(common)
+        sentinel["family_ids"] = np.asarray([family_id], dtype=np.int64)
+        sentinel["past_padding_mask"] = np.ones((1, 1), dtype=np.bool_)
+        for name in KV_PAST_NAMES:
+            empty[name] = np.zeros(
+                (1, KV_HEADS, 0, KV_HEAD_WIDTH), dtype=np.float32
+            )
+            sentinel[name] = np.zeros(
+                (1, KV_HEADS, 1, KV_HEAD_WIDTH), dtype=np.float32
+            )
+        empty_outputs = session.run(output_names, empty)
+        sentinel_outputs = session.run(output_names, sentinel)
+        empty_logits = empty_outputs[0]
+        sentinel_logits = sentinel_outputs[0]
+        if (
+            empty_logits.shape != (1, 1, BPE_VOCAB_SIZE)
+            or sentinel_logits.shape != (1, 1, BPE_VOCAB_SIZE)
+            or not np.all(np.isfinite(empty_logits))
+            or not np.all(np.isfinite(sentinel_logits))
+        ):
+            raise ImportFailure(
+                f"KV sentinel produced invalid logits for family {family_id}"
+            )
+        logits_difference = float(np.max(np.abs(
+            empty_logits.astype(np.float64)
+            - sentinel_logits.astype(np.float64)
+        )))
+        maximum_logits_difference = max(maximum_logits_difference, logits_difference)
+        if not math.isfinite(logits_difference) or logits_difference > 1.0e-6 or int(
+            np.argmax(empty_logits)
+        ) != int(
+            np.argmax(sentinel_logits)
+        ):
+            raise ImportFailure(
+                f"KV sentinel changed family {family_id} decoder logits"
+            )
+        empty_mask = empty_outputs[1]
+        sentinel_mask = sentinel_outputs[1]
+        if (
+            empty_mask.shape != (1, 1)
+            or sentinel_mask.shape != (1, 2)
+            or bool(sentinel_mask[0, 0]) is not True
+            or not np.array_equal(empty_mask, sentinel_mask[:, 1:])
+        ):
+            raise ImportFailure("KV sentinel did not remain blocked in the present mask")
+        for index, name in enumerate(KV_PRESENT_NAMES, start=2):
+            empty_cache = empty_outputs[index]
+            sentinel_cache = sentinel_outputs[index]
+            if empty_cache.shape != (1, KV_HEADS, 1, KV_HEAD_WIDTH) or (
+                sentinel_cache.shape != (1, KV_HEADS, 2, KV_HEAD_WIDTH)
+            ) or not np.all(np.isfinite(empty_cache)) or not np.all(
+                np.isfinite(sentinel_cache)
+            ) or np.any(sentinel_cache[:, :, 0, :] != 0.0):
+                raise ImportFailure(f"KV sentinel layout is invalid for {name}")
+            difference = float(np.max(np.abs(
+                empty_cache.astype(np.float64)
+                - sentinel_cache[:, :, 1:, :].astype(np.float64)
+            )))
+            maximum_cache_difference = max(maximum_cache_difference, difference)
+            if not math.isfinite(difference) or difference > 1.0e-6:
+                raise ImportFailure(f"KV sentinel changed newly appended {name}")
     return {
         "provider": "CPUExecutionProvider",
-        "question_length": int(question.shape[1]),
-        "target_length": int(decoder_ids.shape[1]),
-        "memory_max_abs_difference": memory_difference,
-        "router_max_abs_difference": router_difference,
-        "decoder_valid_logits_max_abs_difference": logits_difference,
+        "families_verified": list(FAMILY_ORDER),
+        "producer_initial_past_length": 0,
+        "package_initial_past_length": 1,
+        "sentinel_mask_value": 1,
+        "logits_max_abs_difference": maximum_logits_difference,
+        "present_cache_suffix_max_abs_difference": maximum_cache_difference,
         "greedy_argmax": "matched",
-        "tolerance": tolerance,
+        "tolerance": 1.0e-6,
     }
 
 
@@ -1637,11 +3404,32 @@ def _run_exporter(command: Sequence[str]) -> None:
         raise ImportFailure(f"generic ONNX exporter failed: {detail}")
 
 
-def _sanitize_export_report(path: Path, source_name: str) -> None:
+def _sanitize_export_report(
+    path: Path,
+    source_name: str,
+    targets: Sequence[str],
+) -> None:
     report = dict(_read_json(path, "staged exporter report"))
     source = report.get("source")
-    if report.get("format") != "volvox-export-report/v1" or not isinstance(source, Mapping):
+    if (
+        report.get("format") != "volvox-export-report/v1"
+        or not isinstance(source, Mapping)
+    ):
         raise ImportFailure("staged exporter report has the wrong format")
+    if (
+        report.get("supported") is not True
+        or report.get("published") is not True
+    ):
+        raise ImportFailure("staged exporter report does not attest publication")
+    target_evidence = report.get("targets")
+    if (
+        not isinstance(target_evidence, Mapping)
+        or target_evidence.get("requested") != list(targets)
+        or target_evidence.get("resolved") != list(expand_targets(targets))
+    ):
+        raise ImportFailure(
+            "staged exporter report does not attest the requested targets"
+        )
     sanitized_source = dict(source)
     sanitized_source["path"] = source_name
     report["source"] = sanitized_source
@@ -1686,15 +3474,19 @@ def _export_command(
     model: Path,
     output: Path,
     report: Path,
-    target: str,
+    targets: Sequence[str],
     weight_dtype: str,
     quant_mode: str,
-    input_shapes: Mapping[str, str],
+    input_shapes: Mapping[str, str] | None,
+    dimension_bounds: Mapping[str, Mapping[str, int]] | None,
     input_dtypes: Mapping[str, str],
     output_dtypes: Mapping[str, str],
     output_names: Sequence[str],
-    image_input: str | None = None,
-    defer_static_qdq_layout_optimization: bool = False,
+    allow_silu_numerical_migration: bool = False,
+    allow_quantized_bias_folding_numerical_migration: bool = False,
+    allow_static_qdq_qbatch_matmul_numerical_migration: bool = False,
+    allow_static_qdq_groupnorm_silu_numerical_migration: bool = False,
+    enable_exact_common_subexpression_elimination: bool = False,
 ) -> list[str]:
     command = [
         sys.executable,
@@ -1703,8 +3495,6 @@ def _export_command(
         str(model),
         "--out",
         str(output),
-        "--target",
-        target,
         "--weight-dtype",
         weight_dtype,
         "--quant-mode",
@@ -1714,54 +3504,332 @@ def _export_command(
         "--report-format",
         "json",
     ]
-    if defer_static_qdq_layout_optimization:
-        command.append("--defer-static-qdq-layout-optimization")
-    for name, shape in input_shapes.items():
+    for target in targets:
+        command.extend(["--target", target])
+    if allow_silu_numerical_migration:
+        command.append("--allow-silu-numerical-migration")
+    if allow_quantized_bias_folding_numerical_migration:
+        command.append("--allow-quantized-bias-folding-migration")
+    if allow_static_qdq_qbatch_matmul_numerical_migration:
+        command.append("--allow-static-qdq-qbatch-matmul-migration")
+    if allow_static_qdq_groupnorm_silu_numerical_migration:
+        command.append("--allow-static-qdq-groupnorm-silu-migration")
+    if enable_exact_common_subexpression_elimination:
+        command.append("--enable-exact-common-subexpression-elimination")
+    for name, shape in (input_shapes or {}).items():
         command.extend(["--input-shape", f"{name}={shape}"])
+    for name, descriptor in (dimension_bounds or {}).items():
+        minimum = descriptor.get("min")
+        maximum = descriptor.get("max")
+        multiple = descriptor.get("multiple_of")
+        bound = f"{minimum}:{maximum}"
+        if multiple is not None:
+            bound += f":{multiple}"
+        command.extend(["--dimension-bound", f"{name}={bound}"])
     for name, dtype in input_dtypes.items():
         command.extend(["--input-dtype", f"{name}={dtype}"])
     for name, dtype in output_dtypes.items():
         command.extend(["--output-dtype", f"{name}={dtype}"])
     for name in output_names:
         command.extend(["--output-name", name])
-    if image_input is not None:
-        command.extend(["--image-normalization", f"{image_input}=minus-one-one"])
     return command
 
 
 def _semantic_input_map(
     graph: Mapping[str, Any],
-    expected: Mapping[str, tuple[list[int], str]],
+    expected: Mapping[str, tuple[list[int | str], str]],
     label: str,
 ) -> dict[str, str]:
     raw_inputs = graph.get("inputs")
     if not isinstance(raw_inputs, Mapping):
         raise ImportFailure(f"staged {label} graph has no inputs object")
+    if len(raw_inputs) != len(expected):
+        raise ImportFailure(f"staged {label} graph input set is incomplete")
     result: dict[str, str] = {}
-    for canonical, descriptor in raw_inputs.items():
+    for index, ((canonical, descriptor), (source_name, expected_descriptor)) in enumerate(
+        zip(raw_inputs.items(), expected.items())
+    ):
         if not isinstance(descriptor, Mapping):
             raise ImportFailure(f"staged {label} input {canonical!r} is malformed")
-        source_name = descriptor.get("source_name")
-        if not isinstance(source_name, str) or source_name in result:
-            raise ImportFailure(f"staged {label} graph has invalid source input names")
+        if canonical != f"input{index}":
+            raise ImportFailure(
+                f"staged {label} graph input order is not the canonical input0..N ABI"
+            )
         result[source_name] = str(canonical)
-        expected_descriptor = expected.get(source_name)
-        if expected_descriptor is None or (
+        if (
             descriptor.get("shape"),
             descriptor.get("dtype"),
         ) != expected_descriptor:
             raise ImportFailure(f"staged {label} input {source_name!r} has the wrong ABI")
-    if set(result) != set(expected):
-        raise ImportFailure(f"staged {label} graph input set is incomplete")
     return result
+
+
+def _graph_tensor_descriptors(
+    graph: Mapping[str, Any],
+    label: str,
+) -> dict[str, Mapping[str, Any]]:
+    descriptors: dict[str, Mapping[str, Any]] = {}
+    raw_inputs = graph.get("inputs")
+    if not isinstance(raw_inputs, Mapping):
+        raise ImportFailure(f"staged {label} graph has no inputs object")
+    for name, descriptor in raw_inputs.items():
+        if isinstance(name, str) and isinstance(descriptor, Mapping):
+            descriptors[name] = descriptor
+    nodes = graph.get("nodes")
+    if not isinstance(nodes, list):
+        raise ImportFailure(f"staged {label} graph has no node list")
+    for node in nodes:
+        outputs = node.get("outputs") if isinstance(node, Mapping) else None
+        if not isinstance(outputs, Mapping):
+            continue
+        for descriptor in outputs.values():
+            if isinstance(descriptor, Mapping) and isinstance(
+                descriptor.get("tensor"), str
+            ):
+                descriptors[descriptor["tensor"]] = descriptor
+    return descriptors
+
+
+def _tensor_reaches_output(
+    graph: Mapping[str, Any],
+    source: str,
+    target: str,
+) -> bool:
+    if source == target:
+        return True
+    edges: dict[str, set[str]] = {}
+    for node in graph.get("nodes", []):
+        if not isinstance(node, Mapping):
+            continue
+        inputs = node.get("inputs")
+        outputs = node.get("outputs")
+        if not isinstance(inputs, Mapping) or not isinstance(outputs, Mapping):
+            continue
+        output_names = {
+            descriptor.get("tensor")
+            for descriptor in outputs.values()
+            if isinstance(descriptor, Mapping)
+            and isinstance(descriptor.get("tensor"), str)
+        }
+        for input_name in inputs.values():
+            if isinstance(input_name, str):
+                edges.setdefault(input_name, set()).update(output_names)
+    pending = [source]
+    visited = {source}
+    while pending:
+        current = pending.pop()
+        for output in edges.get(current, ()):
+            if output == target:
+                return True
+            if output not in visited:
+                visited.add(output)
+                pending.append(output)
+    return False
+
+
+def _qualify_encoder_memory_relation(
+    graph: Mapping[str, Any],
+    *,
+    memory_output: str,
+) -> dict[str, Any]:
+    """Require a live canonical Concat witness and verify M for all profiles."""
+
+    try:
+        from tools.exporter.operator_shape_contracts import (
+            infer_concrete_operator_shapes,
+        )
+    except ImportError as error:  # pragma: no cover - repository invariant.
+        raise ImportFailure(
+            "canonical operator shape inference is unavailable"
+        ) from error
+    descriptors = _graph_tensor_descriptors(graph, "encoder")
+    candidates: list[tuple[Mapping[str, Any], str]] = []
+    for node in graph.get("nodes", []):
+        if not isinstance(node, Mapping) or node.get("opType") != "Concat":
+            continue
+        params = node.get("params")
+        inputs = node.get("inputs")
+        outputs = node.get("outputs")
+        if (
+            not isinstance(params, Mapping)
+            or params.get("axis") != 1
+            or not isinstance(inputs, Mapping)
+            or len(inputs) != 2
+            or not isinstance(outputs, Mapping)
+            or len(outputs) != 1
+        ):
+            continue
+        input_descriptors = [descriptors.get(name) for name in inputs.values()]
+        output_descriptor = next(iter(outputs.values()))
+        if (
+            any(not isinstance(item, Mapping) for item in input_descriptors)
+            or not isinstance(output_descriptor, Mapping)
+            or output_descriptor.get("shape") != ["B", "M", 320]
+            or output_descriptor.get("dtype") != "float32"
+        ):
+            continue
+        input_shapes = [item.get("shape") for item in input_descriptors]
+        if input_shapes != [["B", 210, 320], ["B", "Q", 320]]:
+            continue
+        output_name = output_descriptor.get("tensor")
+        if not isinstance(output_name, str) or not _tensor_reaches_output(
+            graph, output_name, memory_output
+        ):
+            continue
+        candidates.append((node, output_name))
+    if len(candidates) != 1:
+        raise ImportFailure(
+            "staged encoder must contain exactly one canonical [B,210,320] + "
+            "[B,Q,320] Concat witness that reaches memory [B,M,320]"
+        )
+
+    for profile_name, profile in SHAPE_PROFILES.items():
+        inferred = infer_concrete_operator_shapes(
+            "Concat",
+            {
+                "inputs": {
+                    "input0": {
+                        "shape": [profile["B"], 210, 320],
+                        "dtype": "float32",
+                    },
+                    "input1": {
+                        "shape": [profile["B"], profile["Q"], 320],
+                        "dtype": "float32",
+                    },
+                },
+                "params": {"axis": 1},
+            },
+        )
+        expected = (profile["B"], profile["M"], 320)
+        if tuple(inferred["out"].shape) != expected:
+            raise ImportFailure(
+                "canonical Concat inference did not prove M=Q+210 for "
+                f"profile {profile_name!r}"
+            )
+    witness, output_name = candidates[0]
+    return {
+        "operator": "Concat",
+        "node_id": witness.get("id"),
+        "concat_axis": 1,
+        "fixed_image_tokens": 210,
+        "dynamic_question_dimension": "Q",
+        "derived_memory_dimension": "M",
+        "witness_tensor": output_name,
+        "profiles_verified": list(SHAPE_PROFILES),
+    }
+
+
+def _qualify_present_cache_relation(
+    graph: Mapping[str, Any],
+    *,
+    present_outputs: Sequence[str],
+) -> dict[str, Any]:
+    """Require every exported self-cache to witness R=P+1 via Concat."""
+
+    try:
+        from tools.exporter.operator_shape_contracts import (
+            infer_concrete_operator_shapes,
+        )
+    except ImportError as error:  # pragma: no cover
+        raise ImportFailure("canonical operator shape inference is unavailable") from error
+    descriptors = _graph_tensor_descriptors(graph, "decoder")
+    producers = {
+        descriptor.get("tensor"): node
+        for node in graph.get("nodes", [])
+        if isinstance(node, Mapping)
+        for descriptor in (
+            node.get("outputs", {}).values()
+            if isinstance(node.get("outputs"), Mapping) else ()
+        )
+        if isinstance(descriptor, Mapping)
+        and isinstance(descriptor.get("tensor"), str)
+    }
+    witnesses: list[str] = []
+    for target in present_outputs:
+        source = target
+        node = producers.get(source)
+        while isinstance(node, Mapping) and node.get("opType") in {
+            "Identity", "QuantizeLinear", "DequantizeLinear", "Cast",
+        }:
+            inputs = node.get("inputs")
+            data_input = inputs.get("input") if isinstance(inputs, Mapping) else None
+            if not isinstance(data_input, str):
+                break
+            source = data_input
+            node = producers.get(source)
+        params = node.get("params") if isinstance(node, Mapping) else None
+        inputs = node.get("inputs") if isinstance(node, Mapping) else None
+        outputs = node.get("outputs") if isinstance(node, Mapping) else None
+        input_descriptors = (
+            [descriptors.get(name) for name in inputs.values()]
+            if isinstance(inputs, Mapping) else []
+        )
+        output_descriptor = (
+            next(iter(outputs.values()))
+            if isinstance(outputs, Mapping) and len(outputs) == 1 else None
+        )
+        input_shapes = [
+            item.get("shape") if isinstance(item, Mapping) else None
+            for item in input_descriptors
+        ]
+        if (
+            not isinstance(node, Mapping)
+            or node.get("opType") != "Concat"
+            or not isinstance(params, Mapping)
+            or params.get("axis") != 2
+            or input_shapes
+            != [
+                ["B", KV_HEADS, "P", KV_HEAD_WIDTH],
+                ["B", KV_HEADS, 1, KV_HEAD_WIDTH],
+            ]
+            or not isinstance(output_descriptor, Mapping)
+            or output_descriptor.get("shape")
+            != ["B", KV_HEADS, "R", KV_HEAD_WIDTH]
+            or output_descriptor.get("dtype") != "float32"
+        ):
+            raise ImportFailure(
+                f"staged decoder output {target!r} must have one P+1 Concat witness"
+            )
+        witnesses.append(str(node.get("id")))
+    for past_length in (1, 63, MAX_T - 1):
+        inferred = infer_concrete_operator_shapes(
+            "Concat",
+            {
+                "inputs": {
+                    "input0": {
+                        "shape": [1, KV_HEADS, past_length, KV_HEAD_WIDTH],
+                        "dtype": "float32",
+                    },
+                    "input1": {
+                        "shape": [1, KV_HEADS, 1, KV_HEAD_WIDTH],
+                        "dtype": "float32",
+                    },
+                },
+                "params": {"axis": 2},
+            },
+        )
+        if tuple(inferred["out"].shape) != (
+            1, KV_HEADS, past_length + 1, KV_HEAD_WIDTH
+        ):
+            raise ImportFailure("canonical Concat inference did not prove R=P+1")
+    return {
+        "operator": "Concat",
+        "axis": 2,
+        "past_dimension": "P",
+        "fixed_current_tokens": 1,
+        "derived_present_dimension": "R",
+        "witness_count": len(witnesses),
+        "witness_nodes": witnesses,
+    }
 
 
 def _validate_staged_graph(
     directory: Path,
     *,
     label: str,
-    expected_inputs: Mapping[str, tuple[list[int], str]],
-    expected_outputs: Mapping[str, tuple[list[int], str]],
+    expected_dimensions: Mapping[str, Mapping[str, int]],
+    expected_inputs: Mapping[str, tuple[list[int | str], str]],
+    expected_outputs: Mapping[str, tuple[list[int | str], str]],
 ) -> tuple[Mapping[str, Any], dict[str, str]]:
     graph_path = directory / "graph.json"
     weights_path = directory / "model.safetensors"
@@ -1770,8 +3838,26 @@ def _validate_staged_graph(
         if not path.is_file() or path.is_symlink():
             raise ImportFailure(f"staged {label} asset {path.name!r} is missing")
     graph = _read_json(graph_path, f"staged {label} graph")
-    if graph.get("format") != "volvox-graph/v1":
+    allowed_root = {
+        "format", "dimensions", "inputs", "nodes", "outputs",
+        "banks", "quantization",
+    }
+    if set(graph) - allowed_root or not {
+        "format", "dimensions", "inputs", "nodes", "outputs",
+    }.issubset(graph):
+        raise ImportFailure(f"staged {label} graph does not use the closed v1 root schema")
+    if graph.get("format") != GRAPH_FORMAT:
         raise ImportFailure(f"staged {label} graph has the wrong format")
+    # Bank slot-count dimensions are synthesized per weight bank by the
+    # exporter; they are additive and never part of this model's input contract.
+    staged_dimensions = {
+        name: value for name, value in (graph.get("dimensions") or {}).items()
+        if not name.startswith("bank_")
+    }
+    if staged_dimensions != dict(expected_dimensions):
+        raise ImportFailure(
+            f"staged {label} graph has the wrong canonical dimension contract"
+        )
     semantic_inputs = _semantic_input_map(graph, expected_inputs, label)
     nodes = graph.get("nodes")
     if not isinstance(nodes, list):
@@ -1785,12 +3871,21 @@ def _validate_staged_graph(
         if not isinstance(node, Mapping):
             raise ImportFailure(f"staged {label} graph contains a malformed node")
         outputs = node.get("outputs")
-        shapes = node.get("outputs_shape")
-        dtypes = node.get("outputs_dtype")
-        if not all(isinstance(item, Mapping) for item in (outputs, shapes, dtypes)):
+        if not isinstance(outputs, Mapping) or not outputs:
             raise ImportFailure(f"staged {label} graph contains an untyped node")
-        for port, tensor_name in outputs.items():
-            tensor_descriptors[str(tensor_name)] = (shapes.get(port), dtypes.get(port))
+        for port, output_descriptor in outputs.items():
+            if (
+                not isinstance(port, str)
+                or not isinstance(output_descriptor, Mapping)
+                or set(output_descriptor) != {"tensor", "shape", "dtype"}
+                or not isinstance(output_descriptor.get("tensor"), str)
+            ):
+                raise ImportFailure(
+                    f"staged {label} graph contains an invalid output descriptor"
+                )
+            tensor_descriptors[output_descriptor["tensor"]] = (
+                output_descriptor.get("shape"), output_descriptor.get("dtype")
+            )
     if graph.get("outputs") != list(expected_outputs):
         raise ImportFailure(f"staged {label} graph outputs are not semantic/stable")
     for name, descriptor in expected_outputs.items():
@@ -1799,89 +3894,6 @@ def _validate_staged_graph(
     if weights_path.stat().st_size <= 0:
         raise ImportFailure(f"staged {label} weights are empty")
     return graph, semantic_inputs
-
-
-_CANONICAL_BYTE_OPS = frozenset({
-    "QConv2D",
-    "QAdd",
-    "QLinear",
-    "QMatMul",
-    "QGemm",
-    "QBatchMatMul",
-    "QEmbedding",
-    "QLayerNorm",
-    "QGroupNorm",
-    "QMaskedMean",
-    "QSDPA",
-    "QGELU",
-    "QSiLU",
-    "QArgMax",
-})
-_BYTE_STRUCTURAL_OPS = frozenset({
-    "Identity",
-    "Reshape",
-    "Flatten",
-    "Squeeze",
-    "Unsqueeze",
-    "Transpose",
-    "Concat",
-    "MaxPool2D",
-    "ResizeNearest2D",
-    "RequantizeLinear",
-})
-_PACKAGE_CLASSES = frozenset({"fp32", "w8a32", "w8a8-v1", "hybrid"})
-
-
-def _descriptor_package_class(graph: Mapping[str, Any]) -> str:
-    """Mirror the generic exporter's descriptor-derived package classifier."""
-
-    raw_nodes = graph.get("nodes")
-    nodes = raw_nodes if isinstance(raw_nodes, list) else []
-    node_ops = {
-        str(node.get("opType"))
-        for node in nodes
-        if isinstance(node, Mapping) and isinstance(node.get("opType"), str)
-    }
-    execution_dtypes = {
-        descriptor.get("dtype")
-        for descriptor in (
-            graph.get("inputs").values()
-            if isinstance(graph.get("inputs"), Mapping)
-            else ()
-        )
-        if isinstance(descriptor, Mapping)
-    }
-    for node in nodes:
-        if isinstance(node, Mapping) and isinstance(
-            node.get("outputs_dtype"), Mapping
-        ):
-            execution_dtypes.update(node["outputs_dtype"].values())
-
-    byte_execution = bool(execution_dtypes & {"int8", "uint8"})
-    float_execution = "float32" in execution_dtypes
-    all_byte_graph_ops = bool(node_ops & _CANONICAL_BYTE_OPS) and node_ops <= (
-        _CANONICAL_BYTE_OPS | _BYTE_STRUCTURAL_OPS
-    )
-    if byte_execution and all_byte_graph_ops and not float_execution:
-        return "w8a8-v1"
-    if byte_execution or bool(node_ops & _CANONICAL_BYTE_OPS):
-        return "hybrid"
-    return "fp32"
-
-
-def _staged_package_class(graph: Mapping[str, Any], label: str) -> str:
-    actual = _descriptor_package_class(graph)
-    source = graph.get("source")
-    declared = source.get("package_class") if isinstance(source, Mapping) else None
-    if declared is not None and declared not in _PACKAGE_CLASSES:
-        raise ImportFailure(
-            f"staged {label} graph declares an unknown package class"
-        )
-    if declared is not None and declared != actual:
-        raise ImportFailure(
-            f"staged {label} graph package class does not match its live descriptors"
-        )
-    return actual
 
 
 def _normalize_distribution_modes(root: Path) -> None:
@@ -1980,179 +3992,247 @@ def _publish_directory_no_replace(stage: Path, destination: Path) -> None:
     _publish_with_exclusive_reservation(stage, destination)
 
 
-def import_package(
-    source_directory: Path,
+def _import_kv_package(
+    source: Mapping[str, Any],
     output_directory: Path,
     *,
-    variant: str = "fp32",
-    target: str = "portable",
-    weight_dtype: str = "auto",
-    exporter: Callable[[Sequence[str]], None] = _run_exporter,
-    parity_verifier: Callable[[Mapping[str, Any]], Mapping[str, Any]] = verify_static_padding,
+    variant: str,
+    targets: tuple[str, ...],
+    weight_dtype: str,
+    exporter: Callable[[Sequence[str]], None],
+    parity: Mapping[str, Any],
 ) -> Path:
-    source_directory = source_directory.resolve(strict=True)
-    output_parent = output_directory.parent.resolve(strict=True)
-    output_directory = output_parent / output_directory.name
-    if os.path.lexists(output_directory):
-        raise ImportFailure("output directory already exists; refusing to overwrite it")
-    if source_directory == output_directory or source_directory in output_directory.parents:
-        raise ImportFailure("output directory must not be inside the immutable source")
-    source = validate_source(source_directory, variant=variant)
-    source_hashes_before = dict(source["hashes"])
-    parity = dict(parity_verifier(source))
-    original_selected_paths = source["selected_paths"]
-    selected_paths = dict(original_selected_paths)
-    quant_mode = "preserve"
+    """Compile and publish the v1 one-token explicit-cache package."""
 
-    stage = Path(
-        tempfile.mkdtemp(
-            prefix=f".{output_directory.name}.stage-",
-            dir=output_parent,
-        )
-    )
+    output_parent = output_directory.parent
+    source_config = source["config"]
+    d_model = _positive_int(source_config["d_model"], "source config.d_model")
+    source_hashes_before = dict(source["hashes"])
+    original_selected_paths = source["selected_paths"]
+    encoder_dimensions = {
+        "B": {"min": 1, "max": 1},
+        "Q": {"min": 1, "max": MAX_Q},
+        "M": {"min": IMAGE_TOKENS + 1, "max": IMAGE_TOKENS + MAX_Q},
+    }
+    decoder_dimensions = {
+        "B": {"min": 1, "max": 1},
+        "M": {"min": IMAGE_TOKENS + 1, "max": IMAGE_TOKENS + MAX_Q},
+        "P": {"min": 1, "max": MAX_T - 1},
+        "R": {"min": 2, "max": MAX_T},
+    }
+    stage = Path(tempfile.mkdtemp(
+        prefix=f".{output_directory.name}.stage-", dir=output_parent
+    ))
     try:
         encoder_directory = stage / "encoder"
         decoder_directory = stage / "decoder"
+        authoring_directory = stage / ".authoring"
         encoder_directory.mkdir()
         decoder_directory.mkdir()
+        authoring_directory.mkdir()
         shutil.copyfile(source["paths"]["config"], stage / "config.json")
         shutil.copyfile(source["paths"]["vocab"], stage / "vocab.json")
-
+        selected_paths = {
+            role: authoring_directory / original_selected_paths[role].name
+            for role in ("encoder", "decoder")
+        }
+        authoring_reports = {
+            role: _normalized_kv_onnx_symbols(
+                original_selected_paths[role], selected_paths[role], role=role
+            )
+            for role in ("encoder", "decoder")
+        }
+        authoring_parity = {
+            "encoder": _verify_dynamic_authoring_parity(
+                original_selected_paths["encoder"],
+                selected_paths["encoder"],
+                role="encoder",
+            ),
+            "decoder": {
+                "status": "not_applicable",
+                "reason": "decoder executable nodes were not rewritten",
+            },
+        }
+        encoder_outputs = (
+            "memory", "memory_padding_mask", "router_logits",
+            "selected_family_ids", *KV_CROSS_NAMES,
+        )
+        decoder_outputs = (
+            "logits", "present_padding_mask", *KV_PRESENT_NAMES,
+        )
         exporter(_export_command(
             model=selected_paths["encoder"],
             output=encoder_directory / "model.safetensors",
             report=encoder_directory / "export_report.json",
-            target=target,
+            targets=targets,
             weight_dtype=weight_dtype,
-            quant_mode=quant_mode,
-            input_shapes={
-                "image": "1x1x320x672",
-                "question_ids": "1x192",
-                "family_ids": "1",
-            },
+            quant_mode="preserve",
+            input_shapes=None,
+            dimension_bounds=encoder_dimensions,
             input_dtypes={
                 "question_ids": "int32",
                 "family_ids": "int32",
+                "question_position_ids": "int32",
             },
             output_dtypes={
                 "memory_padding_mask": "int32",
                 "selected_family_ids": "int32",
             },
-            output_names=(
-                "memory",
-                "memory_padding_mask",
-                "router_logits",
-                "selected_family_ids",
+            output_names=encoder_outputs,
+            allow_silu_numerical_migration=True,
+            allow_quantized_bias_folding_numerical_migration=(
+                variant == "int8-w8a8"
             ),
-            image_input="input0",
-            defer_static_qdq_layout_optimization=(variant == "int8-w8a8"),
+            allow_static_qdq_qbatch_matmul_numerical_migration=(
+                variant == "int8-w8a8"
+            ),
+            enable_exact_common_subexpression_elimination=True,
         ))
         exporter(_export_command(
             model=selected_paths["decoder"],
             output=decoder_directory / "model.safetensors",
             report=decoder_directory / "export_report.json",
-            target=target,
+            targets=targets,
             weight_dtype=weight_dtype,
-            quant_mode=quant_mode,
-            input_shapes={
-                "decoder_input_ids": "1x192",
-                "memory": "1x402x320",
-                "memory_padding_mask": "1x402",
-                "family_ids": "1",
-            },
+            quant_mode="preserve",
+            input_shapes=None,
+            dimension_bounds=decoder_dimensions,
             input_dtypes={
                 "decoder_input_ids": "int32",
-                "memory_padding_mask": "int32",
+                "position_ids": "int32",
                 "family_ids": "int32",
+                "memory_padding_mask": "int32",
+                "past_padding_mask": "int32",
             },
-            output_dtypes={},
-            output_names=("logits",),
-            defer_static_qdq_layout_optimization=(variant == "int8-w8a8"),
+            output_dtypes={"present_padding_mask": "int32"},
+            output_names=decoder_outputs,
+            allow_silu_numerical_migration=True,
+            allow_quantized_bias_folding_numerical_migration=(
+                variant == "int8-w8a8"
+            ),
+            allow_static_qdq_qbatch_matmul_numerical_migration=(
+                variant == "int8-w8a8"
+            ),
+            enable_exact_common_subexpression_elimination=True,
         ))
-        _sanitize_export_report(
-            encoder_directory / "export_report.json",
-            original_selected_paths["encoder"].name,
-        )
-        _sanitize_export_report(
-            decoder_directory / "export_report.json",
-            original_selected_paths["decoder"].name,
-        )
+        for role in ("encoder", "decoder"):
+            _sanitize_export_report(
+                stage / role / "export_report.json",
+                original_selected_paths[role].name,
+                targets,
+            )
+        shutil.rmtree(authoring_directory)
 
+        encoder_expected_inputs = {
+            "image": (["B", IMAGE_CHANNELS, IMAGE_HEIGHT, IMAGE_WIDTH], "float32"),
+            "question_ids": (["B", "Q"], "int32"),
+            "family_ids": (["B"], "int32"),
+            "question_position_ids": (["B", "Q"], "int32"),
+        }
+        encoder_expected_outputs = {
+            "memory": (["B", "M", d_model], "float32"),
+            "memory_padding_mask": (["B", "M"], "int32"),
+            "router_logits": (["B", len(FAMILY_ORDER)], "float32"),
+            "selected_family_ids": (["B"], "int32"),
+            **{
+                name: (["B", KV_HEADS, "M", KV_HEAD_WIDTH], "float32")
+                for name in KV_CROSS_NAMES
+            },
+        }
+        decoder_expected_inputs = {
+            "decoder_input_ids": (["B", 1], "int32"),
+            "position_ids": (["B"], "int32"),
+            "family_ids": (["B"], "int32"),
+            "memory_padding_mask": (["B", "M"], "int32"),
+            "past_padding_mask": (["B", "P"], "int32"),
+            **{
+                name: (["B", KV_HEADS, "M", KV_HEAD_WIDTH], "float32")
+                for name in KV_CROSS_NAMES
+            },
+            **{
+                name: (["B", KV_HEADS, "P", KV_HEAD_WIDTH], "float32")
+                for name in KV_PAST_NAMES
+            },
+        }
+        decoder_expected_outputs = {
+            "logits": (["B", 1, source["vocab_size"]], "float32"),
+            "present_padding_mask": (["B", "R"], "int32"),
+            **{
+                name: (["B", KV_HEADS, "R", KV_HEAD_WIDTH], "float32")
+                for name in KV_PRESENT_NAMES
+            },
+        }
         encoder_graph, encoder_inputs = _validate_staged_graph(
             encoder_directory,
             label="encoder",
-            expected_inputs={
-                "image": ([1, 1, 320, 672], "float32"),
-                "question_ids": ([1, 192], "int32"),
-                "family_ids": ([1], "int32"),
-            },
-            expected_outputs={
-                "memory": ([1, 402, 320], "float32"),
-                "memory_padding_mask": ([1, 402], "int32"),
-                "router_logits": ([1, 8], "float32"),
-                "selected_family_ids": ([1], "int32"),
-            },
+            expected_dimensions=encoder_dimensions,
+            expected_inputs=encoder_expected_inputs,
+            expected_outputs=encoder_expected_outputs,
         )
         decoder_graph, decoder_inputs = _validate_staged_graph(
             decoder_directory,
             label="decoder",
-            expected_inputs={
-                "decoder_input_ids": ([1, 192], "int32"),
-                "memory": ([1, 402, 320], "float32"),
-                "memory_padding_mask": ([1, 402], "int32"),
-                "family_ids": ([1], "int32"),
-            },
-            expected_outputs={
-                "logits": ([1, 192, source["vocab_size"]], "float32")
-            },
+            expected_dimensions=decoder_dimensions,
+            expected_inputs=decoder_expected_inputs,
+            expected_outputs=decoder_expected_outputs,
+        )
+        memory_qualification = _qualify_encoder_memory_relation(
+            encoder_graph, memory_output="memory"
+        )
+        present_qualification = _qualify_present_cache_relation(
+            decoder_graph, present_outputs=KV_PRESENT_NAMES
         )
         staged_package_classes = {
-            "encoder": _staged_package_class(encoder_graph, "encoder"),
-            "decoder": _staged_package_class(decoder_graph, "decoder"),
+            "encoder": classify_package(encoder_graph),
+            "decoder": classify_package(decoder_graph),
         }
         if variant == "int8-w8a8" and any(
-            package_class not in {"hybrid", "w8a8-v1"}
+            package_class != "hybrid"
             for package_class in staged_package_classes.values()
         ):
             raise ImportFailure(
-                "generic exporter did not preserve the selected INT8 QDQ graph"
+                "generic exporter must classify both KV INT8 graphs as hybrid"
             )
-        complete_w8a8_fusion = all(
-            package_class == "w8a8-v1"
-            for package_class in staged_package_classes.values()
-        )
         for label, document in (
             ("encoder graph", encoder_graph),
             ("decoder graph", decoder_graph),
-            (
-                "encoder export report",
-                _read_json(
-                    encoder_directory / "export_report.json",
-                    "encoder export report",
-                ),
-            ),
-            (
-                "decoder export report",
-                _read_json(
-                    decoder_directory / "export_report.json",
-                    "decoder export report",
-                ),
-            ),
+            ("encoder export report", _read_json(
+                encoder_directory / "export_report.json", "encoder export report"
+            )),
+            ("decoder export report", _read_json(
+                decoder_directory / "export_report.json", "decoder export report"
+            )),
         ):
             if _contains_private_absolute_path(document):
                 raise ImportFailure(f"staged {label} contains a private absolute path")
         if {
             key: _sha256(path) for key, path in source["paths"].items()
         } != source_hashes_before:
-            raise ImportFailure("source files changed while the package was being imported")
+            raise ImportFailure("source files changed while the KV package was imported")
 
-        variant_manifest: dict[str, Any] = {
-            "requested": variant,
-            "producer_key": MANIFEST_VARIANT_KEYS[variant],
-            "export_quant_mode": quant_mode,
-            "compiled_graph_package_class": staged_package_classes,
-            "complete_w8a8_fusion": complete_w8a8_fusion,
-        }
+        graph_assets: dict[str, Any] = {}
+        for role, directory in (
+            ("encoder", encoder_directory), ("decoder", decoder_directory)
+        ):
+            graph_assets[role] = {
+                "graph": _asset_record(directory / "graph.json", f"{role}/graph.json"),
+                "weights": _asset_record(
+                    directory / "model.safetensors", f"{role}/model.safetensors"
+                ),
+                "export_report": _asset_record(
+                    directory / "export_report.json", f"{role}/export_report.json"
+                ),
+            }
+        offline_target_evidence = (
+            {"offline_target": targets[0]}
+            if len(targets) == 1
+            else {
+                "offline_target_attestation": {
+                    "requested": list(targets),
+                    "resolved": list(expand_targets(targets)),
+                }
+            }
+        )
         manifest = {
             "format": PACKAGE_FORMAT,
             "source": {
@@ -2178,7 +4258,13 @@ def import_package(
                     ],
                 },
             },
-            "variant": variant_manifest,
+            "variant": {
+                "requested": variant,
+                "producer_key": MANIFEST_VARIANT_KEYS[variant],
+                "export_quant_mode": "preserve",
+                "compiled_graph_package_class": staged_package_classes,
+                "complete_w8a8_fusion": False,
+            },
             "assets": {
                 "config": _asset_record(stage / "config.json", "config.json"),
                 "vocab": _asset_record(stage / "vocab.json", "vocab.json"),
@@ -2186,9 +4272,12 @@ def import_package(
             "tokenizer": dict(source["tokenizer"]),
             "preprocessing": {
                 "layout": "NCHW",
-                "shape": [1, 1, 320, 672],
+                "shape": [1, IMAGE_CHANNELS, IMAGE_HEIGHT, IMAGE_WIDTH],
                 "color": "grayscale",
-                "resize": {"width": 672, "height": 320, "method": "bilinear"},
+                "resize": {
+                    "width": IMAGE_WIDTH, "height": IMAGE_HEIGHT,
+                    "method": "bilinear",
+                },
                 "normalization": "(x / 255 - 0.5) / 0.5",
             },
             "families": {
@@ -2206,76 +4295,102 @@ def import_package(
                 },
             },
             "generation": {
-                "strategy": "greedy-autoregressive",
-                "decoder_input_length": 192,
-                "maximum_new_tokens": 191,
+                "strategy": "greedy-autoregressive-explicit-kv",
+                "maximum_target_length": MAX_T,
+                "maximum_new_tokens": MAX_T - 1,
                 "bos_token_id": 1,
                 "eos_token_id": 2,
                 "pad_token_id": 0,
-                "logits_row": "prefix_length_minus_one",
+                "logits_row": "current_token",
                 "tie_policy": "first-index",
+            },
+            "shape_contract": {
+                "graph_shape_mode": "bounded-explicit-kv-v1",
+                "dimensions": {
+                    "B": {"min": 1, "max": 1},
+                    "Q": {"min": 1, "max": MAX_Q},
+                    "M": {"min": IMAGE_TOKENS + 1, "max": IMAGE_TOKENS + MAX_Q},
+                    "P": {"min": 1, "max": MAX_T - 1},
+                    "R": {"min": 2, "max": MAX_T},
+                },
+                "fixed_geometry": {
+                    "image": [1, IMAGE_CHANNELS, IMAGE_HEIGHT, IMAGE_WIDTH],
+                    "image_tokens": IMAGE_TOKENS,
+                    "feature_width": d_model,
+                    "attention_heads": KV_HEADS,
+                    "attention_head_width": KV_HEAD_WIDTH,
+                    "decoder_layers": KV_LAYERS,
+                    "adapter_families": len(FAMILY_ORDER),
+                },
+                "relations": {
+                    "encoder_memory": {
+                        "operator": "Concat",
+                        "axis": 1,
+                        "fixed_image_tokens": IMAGE_TOKENS,
+                        "dynamic_question_dimension": "Q",
+                        "derived_memory_dimension": "M",
+                    },
+                    "present_cache": {
+                        "operator": "Concat",
+                        "axis": 2,
+                        "past_dimension": "P",
+                        "fixed_current_tokens": 1,
+                        "derived_present_dimension": "R",
+                    },
+                },
+                "semantic_inputs": {
+                    "question_position_ids": {
+                        "shape": ["B", "Q"],
+                        "values": "zero_based_contiguous",
+                    },
+                },
+            },
+            "cache_contract": {
+                "format": "masked-zero-sentinel-v1",
+                "layers": KV_LAYERS,
+                "heads": KV_HEADS,
+                "head_width": KV_HEAD_WIDTH,
+                "past_dimension": "P",
+                "present_dimension": "R",
+                "initial_past_length": 1,
+                "sentinel_mask_value": 1,
+                "cache_dtype": "float32",
             },
             "graphs": {
                 "encoder": {
-                    "graph": _asset_record(
-                        encoder_directory / "graph.json",
-                        "encoder/graph.json",
-                    ),
-                    "weights": _asset_record(
-                        encoder_directory / "model.safetensors",
-                        "encoder/model.safetensors",
-                    ),
-                    "export_report": _asset_record(
-                        encoder_directory / "export_report.json",
-                        "encoder/export_report.json",
-                    ),
+                    **graph_assets["encoder"],
                     "inputs": encoder_inputs,
-                    "outputs": {
-                        "memory": "memory",
-                        "memory_padding_mask": "memory_padding_mask",
-                        "router_logits": "router_logits",
-                        "selected_family_ids": "selected_family_ids",
-                    },
+                    "outputs": {name: name for name in encoder_outputs},
                 },
                 "decoder": {
-                    "graph": _asset_record(
-                        decoder_directory / "graph.json",
-                        "decoder/graph.json",
-                    ),
-                    "weights": _asset_record(
-                        decoder_directory / "model.safetensors",
-                        "decoder/model.safetensors",
-                    ),
-                    "export_report": _asset_record(
-                        decoder_directory / "export_report.json",
-                        "decoder/export_report.json",
-                    ),
+                    **graph_assets["decoder"],
                     "inputs": decoder_inputs,
-                    "outputs": {"logits": "logits"},
+                    "outputs": {name: name for name in decoder_outputs},
                 },
             },
             "mask_semantics": {
                 "memory_padding_mask": "nonzero_means_blocked",
+                "past_padding_mask": "nonzero_means_blocked",
             },
             "validation": {
                 "onnx_checker": "passed",
-                "fixed_padding_parity": parity,
-                "offline_target": target,
+                "kv_authoring_normalization": authoring_reports,
+                "kv_authoring_parity": authoring_parity,
+                "empty_vs_masked_sentinel_parity": dict(parity),
+                "canonical_memory_relation": memory_qualification,
+                "canonical_present_relation": present_qualification,
+                **offline_target_evidence,
                 "source_variant": variant,
                 "strict_runtime_execution": "not-run",
             },
         }
         if _contains_private_absolute_path(manifest):
-            raise ImportFailure("package manifest contains a private absolute path")
+            raise ImportFailure("KV package manifest contains a private absolute path")
         (stage / "package_manifest.json").write_text(
             json.dumps(
-                manifest,
-                allow_nan=False,
-                ensure_ascii=False,
-                indent=2,
-                sort_keys=True,
-            )
-            + "\n",
+                manifest, allow_nan=False, ensure_ascii=False,
+                indent=2, sort_keys=True,
+            ) + "\n",
             encoding="utf-8",
         )
         _normalize_distribution_modes(stage)
@@ -2288,6 +4403,38 @@ def import_package(
         raise
     return output_directory
 
+
+def import_package(
+    source_directory: Path,
+    output_directory: Path,
+    *,
+    variant: str = "fp32",
+    targets: Sequence[str] | None = None,
+    weight_dtype: str = "auto",
+    exporter: Callable[[Sequence[str]], None] = _run_exporter,
+    parity_verifier: Callable[[Mapping[str, Any]], Mapping[str, Any]] | None = None,
+) -> Path:
+    requested_targets = normalize_targets(targets)
+    source_directory = source_directory.resolve(strict=True)
+    output_parent = output_directory.parent.resolve(strict=True)
+    output_directory = output_parent / output_directory.name
+    if os.path.lexists(output_directory):
+        raise ImportFailure("output directory already exists; refusing to overwrite it")
+    if source_directory == output_directory or source_directory in output_directory.parents:
+        raise ImportFailure("output directory must not be inside the immutable source")
+
+    source = validate_source(source_directory, variant=variant)
+    verifier = parity_verifier or verify_explicit_kv_sentinel
+    parity = dict(verifier(source))
+    return _import_kv_package(
+        source,
+        output_directory,
+        variant=variant,
+        targets=requested_targets,
+        weight_dtype=weight_dtype,
+        exporter=exporter,
+        parity=parity,
+    )
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
@@ -2303,8 +4450,14 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--target",
-        default="portable",
-        choices=("portable", "browser", "cpu-js", "wasm", "webgpu", "native-cpu"),
+        action="append",
+        dest="targets",
+        choices=GENERIC_EXPORT_TARGETS,
+        metavar="TARGET",
+        help=(
+            "Required generic-exporter target; repeat to require their "
+            "intersection (default: portable)."
+        ),
     )
     parser.add_argument(
         "--weight-dtype",
@@ -2321,7 +4474,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             args.source,
             args.out_dir,
             variant=args.variant,
-            target=args.target,
+            targets=args.targets,
             weight_dtype=args.weight_dtype,
         )
     except (ImportFailure, OSError, ValueError) as error:

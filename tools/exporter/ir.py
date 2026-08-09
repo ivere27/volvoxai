@@ -22,6 +22,13 @@ from typing import Any, Iterable, Mapping, Optional, Sequence
 from .errors import Diagnostic, ExporterError
 from .runtime_names import is_runtime_graph_name
 from .runtime_tensors import runtime_tensor_allocation
+from .shape_system import (
+    DimensionConstraint,
+    ShapeContractError,
+    ShapeEnvironment,
+    TensorShapeSpec,
+    create_tensor_shape_spec,
+)
 
 
 RUNTIME_DTYPES = frozenset({"float32", "float16", "int32", "int8", "uint8"})
@@ -35,6 +42,14 @@ RETIRED_AFFINE_PARAM_FIELDS = (
     "scales", "zero_points",
     "scale_tensor", "zero_point_tensor",
 )
+
+# These are the only RuntimeIR parameter fields whose values are logical shape
+# specifications.  Profile binding must not recursively replace matching
+# strings in semantic labels, provenance, or arbitrary JSON parameters.
+_RUNTIME_SHAPE_PARAM_FIELDS = {
+    "Reshape": frozenset({"shape"}),
+    "Expand": frozenset({"shape"}),
+}
 
 
 def find_retired_affine_param_path(value: Any) -> Optional[str]:
@@ -274,6 +289,9 @@ class GraphIR:
     source_format: str
     source_name: str
     dialect: IRDialect = IRDialect.SOURCE
+    shape_environment: ShapeEnvironment = field(
+        default_factory=lambda: ShapeEnvironment(())
+    )
     tensors: dict[str, TensorValue] = field(default_factory=dict)
     nodes: list[OpNode] = field(default_factory=list)
     inputs: list[str] = field(default_factory=list)
@@ -355,6 +373,175 @@ class GraphIR:
             self._verify_affine_quantization(runtime_storage=True)
             self._verify_runtime_operator_contracts()
 
+    def verify_logical_polymorphic(self) -> None:
+        """Verify one bounded, fixed-rank logical RuntimeIR graph.
+
+        This stage proves that every symbolic tensor axis names a declared,
+        finite dimension constraint.  It deliberately does not choose a
+        concrete request shape or allocate a tensor.
+        """
+
+        self.verify(IRDialect.RUNTIME)
+
+    def bind_shape_profile(self, profile: Mapping[str, int]) -> "GraphIR":
+        """Return a private constant-only clone for one explicit symbol profile.
+
+        Profile binding is all-or-nothing: this graph is never mutated, every
+        declared symbol must be supplied exactly once, and the returned graph
+        is reverified as a concrete RuntimeIR before it can be published.
+        """
+
+        if not isinstance(profile, Mapping):
+            self._fail(
+                "VXIR050",
+                "shape profile must be a symbol-to-integer object",
+                stage="bind-shapes",
+            )
+        expected = tuple(item.name for item in self.shape_environment.dimensions)
+        if any(not isinstance(name, str) for name in profile):
+            self._fail(
+                "VXIR050",
+                "shape profile keys must be symbol names",
+                stage="bind-shapes",
+            )
+        missing = tuple(name for name in expected if name not in profile)
+        unexpected = tuple(sorted(set(profile) - set(expected)))
+        if missing or unexpected:
+            details = []
+            if missing:
+                details.append(f"missing {list(missing)!r}")
+            if unexpected:
+                details.append(f"unexpected {list(unexpected)!r}")
+            self._fail(
+                "VXIR050",
+                "shape profile must bind exactly the declared symbols; "
+                + "; ".join(details),
+                stage="bind-shapes",
+            )
+
+        normalized: dict[str, int] = {}
+        for constraint in self.shape_environment.dimensions:
+            value = profile[constraint.name]
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, int)
+                or value < constraint.min
+                or value > constraint.max
+                or (
+                    constraint.multiple_of is not None
+                    and value % constraint.multiple_of != 0
+                )
+            ):
+                suffix = (
+                    f" and a multiple of {constraint.multiple_of}"
+                    if constraint.multiple_of is not None
+                    else ""
+                )
+                self._fail(
+                    "VXIR051",
+                    f"shape profile binds {constraint.name!r} to {value!r}; "
+                    f"expected an integer in [{constraint.min}, {constraint.max}]"
+                    f"{suffix}",
+                    stage="bind-shapes",
+                    constraint=constraint.name,
+                )
+            normalized[constraint.name] = value
+
+        bound = self.clone()
+        for tensor in bound.tensors.values():
+            tensor.shape = tuple(
+                normalized[dimension]
+                if isinstance(dimension, str)
+                else dimension
+                for dimension in tensor.shape
+            )
+        for node in bound.nodes:
+            shape_fields = _RUNTIME_SHAPE_PARAM_FIELDS.get(node.op_type)
+            if not shape_fields:
+                continue
+            rewritten_attributes: list[OpAttribute] = []
+            for attribute in node.attributes:
+                if not (
+                    attribute.name == "params"
+                    and attribute.kind == "volvox.params"
+                    and isinstance(attribute.value, Mapping)
+                ):
+                    rewritten_attributes.append(attribute)
+                    continue
+                params = copy.deepcopy(dict(attribute.value))
+                for field_name in shape_fields:
+                    if field_name not in params:
+                        continue
+                    source_shape = params[field_name]
+                    if not isinstance(source_shape, (list, tuple)):
+                        self._fail(
+                            "VXIR056",
+                            f"node {node.name!r} {node.op_type} params."
+                            f"{field_name} must be a fixed-rank shape array",
+                            node.name,
+                            stage="bind-shapes",
+                            constraint="schema-defined shape parameters",
+                        )
+                    concrete_shape: list[int] = []
+                    for axis, dimension in enumerate(source_shape):
+                        if isinstance(dimension, str):
+                            if dimension not in normalized:
+                                self._fail(
+                                    "VXIR056",
+                                    f"node {node.name!r} {node.op_type} params."
+                                    f"{field_name}[{axis}] references undeclared "
+                                    f"symbol {dimension!r}",
+                                    node.name,
+                                    stage="bind-shapes",
+                                    constraint="schema-defined shape parameters",
+                                )
+                            concrete_shape.append(normalized[dimension])
+                        elif (
+                            isinstance(dimension, int)
+                            and not isinstance(dimension, bool)
+                            and 0 < dimension <= (1 << 53) - 1
+                        ):
+                            concrete_shape.append(dimension)
+                        else:
+                            self._fail(
+                                "VXIR056",
+                                f"node {node.name!r} {node.op_type} params."
+                                f"{field_name}[{axis}] is not a positive "
+                                "JSON-safe integer or declared symbol",
+                                node.name,
+                                stage="bind-shapes",
+                                constraint="schema-defined shape parameters",
+                            )
+                    params[field_name] = concrete_shape
+                rewritten_attributes.append(OpAttribute(
+                    attribute.name,
+                    attribute.kind,
+                    params,
+                    attribute.raw,
+                ))
+            node.attributes = tuple(rewritten_attributes)
+        bound.shape_environment = ShapeEnvironment(())
+        bound.metadata["bound_shape_profile"] = dict(
+            sorted(normalized.items(), key=lambda item: item[0].encode("utf-8"))
+        )
+        bound.invalidate_analyses()
+        bound.verify(IRDialect.RUNTIME)
+        bound.verify_concrete_bound()
+        return bound
+
+    def verify_concrete_bound(self) -> None:
+        """Verify the kernel-facing concrete stage without binding implicitly."""
+
+        self.verify(IRDialect.RUNTIME)
+        if self.shape_environment.dimensions:
+            self._fail(
+                "VXIR052",
+                "concrete RuntimeIR retains named dimension constraints",
+                stage="bind-shapes",
+            )
+        for tensor in self.tensors.values():
+            self._require_concrete_runtime_tensor(tensor)
+
     def require_fixed_static_dag(self) -> None:
         """Verify the historical runtime boundary without changing dialect."""
 
@@ -362,6 +549,12 @@ class GraphIR:
         self._verify_canonical()
         self._verify_affine_quantization(runtime_storage=True)
         self._verify_runtime_operator_contracts()
+        if self.shape_environment.dimensions:
+            self._fail(
+                "VXIR052",
+                "fixed-static verification cannot retain named dimensions",
+                stage="staticize",
+            )
 
     def _verify_structure(self) -> None:
         if len(self.inputs) != len(set(self.inputs)):
@@ -447,8 +640,9 @@ class GraphIR:
         self.use_def()
 
     def _verify_canonical(self) -> None:
-        for name in self.inputs:
-            self._require_concrete_runtime_tensor(self.tensors[name])
+        for tensor in self.tensors.values():
+            self._require_logical_runtime_tensor(tensor)
+            self._require_declared_shape_spec(tensor)
         if self.captures:
             self._fail("VXIR030", "runtime graph retains region captures")
         for node in self.nodes:
@@ -467,9 +661,6 @@ class GraphIR:
                            f"node {node.name!r} retains omitted source ports", node.name)
             for port in node.outputs:
                 assert port.value is not None
-                self._require_concrete_runtime_tensor(self.tensors[port.value])
-        for name in self.outputs:
-            self._require_concrete_runtime_tensor(self.tensors[name])
 
     def _verify_runtime_tensor_contracts(self) -> None:
         """Enforce contracts imposed by the current JavaScript ``Graph``.
@@ -500,7 +691,16 @@ class GraphIR:
                     constraint="F16 is initializer storage; execution tensors are canonical",
                 )
             try:
-                runtime_tensor_allocation(tensor.shape, tensor.dtype)
+                maximum_shape = tuple(
+                    (
+                        self.shape_environment.get(dimension).max
+                        if isinstance(dimension, str)
+                        and self.shape_environment.get(dimension) is not None
+                        else dimension
+                    )
+                    for dimension in tensor.shape
+                )
+                runtime_tensor_allocation(maximum_shape, tensor.dtype)
             except ValueError as error:
                 self._fail(
                     "VXIR044",
@@ -718,9 +918,7 @@ class GraphIR:
                 node.name,
             )
         if (
-            not input_tensor.concrete
-            or not output.concrete
-            or not weight.concrete
+            not weight.concrete
             or not bias.concrete
             or input_tensor.rank < 1
             or output.rank != input_tensor.rank
@@ -743,6 +941,43 @@ class GraphIR:
             GraphIR._fail("VXIR027",
                           f"node {node.name!r} has invalid ordered {kind} ports",
                           node.name)
+
+    @staticmethod
+    def _require_logical_runtime_tensor(tensor: TensorValue) -> None:
+        if tensor.dtype not in RUNTIME_DTYPES:
+            GraphIR._fail(
+                "VXIR008",
+                f"tensor {tensor.name!r} has unsupported execution dtype {tensor.dtype!r}",
+                tensor.name,
+                stage="dtype-legalize",
+                constraint="float32|float16|int32|int8|uint8 execution dtype",
+            )
+        # Initializers and affine parameter tensors are immutable payloads;
+        # their storage descriptors cannot depend on a request binding.
+        if tensor.initializer and not tensor.concrete:
+            GraphIR._fail(
+                "VXIR009",
+                f"initializer tensor {tensor.name!r} must have a concrete shape",
+                tensor.name,
+                stage="logical-shapes",
+                constraint="immutable weight shapes are static",
+            )
+
+    def _require_declared_shape_spec(self, tensor: TensorValue) -> TensorShapeSpec:
+        try:
+            return create_tensor_shape_spec(
+                tensor.shape,
+                self.shape_environment,
+                f"tensor {tensor.name!r} shape",
+            )
+        except ShapeContractError as error:
+            self._fail(
+                "VXIR009",
+                f"tensor {tensor.name!r} has invalid logical shape: {error}",
+                tensor.name,
+                stage="logical-shapes",
+                constraint="fixed rank and declared bounded symbols",
+            )
 
     @staticmethod
     def _require_concrete_runtime_tensor(tensor: TensorValue) -> None:
@@ -829,3 +1064,152 @@ class GraphIR:
             allow_nan=False,
         ).encode("utf-8")
         return hashlib.sha256(payload).hexdigest()
+
+
+def attach_public_dimension_bounds(
+    graph: GraphIR,
+    bounds: Mapping[str, DimensionConstraint | Mapping[str, object]],
+    *,
+    anonymous: Mapping[
+        tuple[str, int], DimensionConstraint | Mapping[str, object]
+    ] | None = None,
+) -> GraphIR:
+    """Return a source-faithful clone with an explicit bounded shape environment.
+
+    Named ONNX ``dim_param`` values remain their original symbol names.  An
+    anonymous public axis is normalized only when the caller explicitly maps
+    ``(input_name, axis)`` to a named constraint.  No maximum is synthesized
+    from a sample input or an inferred tensor byte count.
+    """
+
+    if not isinstance(graph, GraphIR):
+        raise TypeError("dimension bounds require a GraphIR")
+    anonymous_bounds = {} if anonymous is None else anonymous
+    if not isinstance(bounds, Mapping) or not isinstance(anonymous_bounds, Mapping):
+        raise TypeError("dimension bounds must be mappings")
+
+    def normalized_constraint(
+        declared_name: str | None,
+        value: DimensionConstraint | Mapping[str, object],
+        path: str,
+    ) -> dict[str, object]:
+        if isinstance(value, DimensionConstraint):
+            descriptor: dict[str, object] = {
+                "name": value.name,
+                "min": value.min,
+                "max": value.max,
+            }
+            if value.multiple_of is not None:
+                descriptor["multiple_of"] = value.multiple_of
+        elif isinstance(value, Mapping):
+            descriptor = dict(value)
+        else:
+            GraphIR._fail(
+                "VXIR053",
+                f"{path} must be a dimension-constraint object",
+                stage="logical-shapes",
+            )
+        if declared_name is not None:
+            existing_name = descriptor.get("name", declared_name)
+            if existing_name != declared_name:
+                GraphIR._fail(
+                    "VXIR053",
+                    f"{path} names {existing_name!r}, expected preserved symbol "
+                    f"{declared_name!r}",
+                    stage="logical-shapes",
+                )
+            descriptor["name"] = declared_name
+        return descriptor
+
+    descriptors: dict[str, dict[str, object]] = {}
+    for name, value in bounds.items():
+        if not isinstance(name, str):
+            GraphIR._fail(
+                "VXIR053",
+                "dimension-bound keys must be symbol names",
+                stage="logical-shapes",
+            )
+        descriptor = normalized_constraint(name, value, f"bound for {name!r}")
+        descriptors[name] = descriptor
+
+    result = graph.clone()
+    used_anonymous: set[tuple[str, int]] = set()
+    for input_name in result.inputs:
+        tensor = result.tensors[input_name]
+        rewritten: list[int | str | None] = []
+        for axis, dimension in enumerate(tensor.shape):
+            if isinstance(dimension, str):
+                if dimension not in descriptors:
+                    GraphIR._fail(
+                        "VXIR054",
+                        f"public input {input_name!r} axis {axis} preserves dynamic "
+                        f"symbol {dimension!r}, but no caller-supplied bound exists",
+                        input_name,
+                        stage="logical-shapes",
+                        constraint="every dynamic public dimension is bounded",
+                    )
+                rewritten.append(dimension)
+                continue
+            if dimension is not None:
+                rewritten.append(dimension)
+                continue
+            key = (input_name, axis)
+            source = anonymous_bounds.get(key)
+            if source is None:
+                GraphIR._fail(
+                    "VXIR055",
+                    f"public input {input_name!r} axis {axis} is anonymous; provide "
+                    "an explicit named bound for this axis",
+                    input_name,
+                    stage="logical-shapes",
+                    constraint="anonymous dimensions are never assigned unsafe maxima",
+                )
+            descriptor = normalized_constraint(
+                None, source, f"anonymous bound for {input_name!r} axis {axis}"
+            )
+            symbol = descriptor.get("name")
+            if not isinstance(symbol, str):
+                GraphIR._fail(
+                    "VXIR055",
+                    f"anonymous bound for {input_name!r} axis {axis} requires a name",
+                    input_name,
+                    stage="logical-shapes",
+                )
+            previous = descriptors.get(symbol)
+            if previous is not None and previous != descriptor:
+                GraphIR._fail(
+                    "VXIR053",
+                    f"symbol {symbol!r} has conflicting caller-supplied bounds",
+                    stage="logical-shapes",
+                )
+            descriptors[symbol] = descriptor
+            used_anonymous.add(key)
+            rewritten.append(symbol)
+        tensor.shape = tuple(rewritten)
+
+    unexpected_anonymous = tuple(sorted(set(anonymous_bounds) - used_anonymous))
+    if unexpected_anonymous:
+        GraphIR._fail(
+            "VXIR055",
+            f"anonymous dimension bindings reference unknown/non-anonymous axes "
+            f"{unexpected_anonymous!r}",
+            stage="logical-shapes",
+        )
+
+    try:
+        environment = ShapeEnvironment(tuple(descriptors.values()))
+    except ShapeContractError as error:
+        GraphIR._fail(
+            "VXIR053",
+            f"invalid caller-supplied dimension bounds: {error}",
+            stage="logical-shapes",
+        )
+    result.shape_environment = environment
+    result.invalidate_analyses()
+
+    # Source IR may legitimately retain anonymous intermediate metadata.  The
+    # bounded environment is nevertheless complete for every public request
+    # axis; canonical/runtime verification will reject unresolved internals at
+    # its stricter boundary.
+    result.verify(result.dialect)
+    return result

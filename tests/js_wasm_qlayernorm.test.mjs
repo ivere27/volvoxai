@@ -7,7 +7,7 @@ import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
 
-import { Graph } from '../ts/core/Graph.js';
+import { RuntimeGraph } from '../ts/core/RuntimeGraph.js';
 import { CPUEngine } from '../ts/backends/CPUEngine.js';
 import { WasmEngine } from '../ts/backends/WasmEngine.js';
 
@@ -45,7 +45,7 @@ function qLayerNormGraph({
   eps = 1e-5,
   dModel,
 } = {}) {
-  const graph = new Graph();
+  const graph = new RuntimeGraph();
   const input = graph.addInput('input', inputShape, inputDtype, {
     buffer: bytes(inputDtype, inputValues), quantization: inputQuantization,
   });
@@ -64,7 +64,7 @@ function qLayerNormGraph({
 }
 
 function qLayerNormDynamicAffineGraph() {
-  const graph = new Graph();
+  const graph = new RuntimeGraph();
   const inputValues = Int8Array.of(-8, -3, 4, 7, 5, -1, 2, -6);
   const input = graph.addInput('input', [2, 4], 'int8', {
     buffer: inputValues, quantization: { scheme: 'per_tensor', scale: 0.25, zero_point: -1 },

@@ -1,3 +1,10 @@
+import {
+  assertShapeKernelOutput,
+  assertShapeKernelParams,
+  assertShapeKernelTensor,
+} from './shapeKernelValidation.js';
+import { assertDistinctOutputStorage } from './spatialKernelValidation.js';
+
 const MAX_BATCH_MATMUL_RANK = 8;
 const MAX_U32 = 0xffffffff;
 
@@ -44,18 +51,19 @@ export function batchMatMulDescriptor(node) {
   const aRank = a?.shape?.length;
   const bRank = b?.shape?.length;
   const outputRank = output?.shape?.length;
+  const params = node.params ?? {};
   const aElements = tensorElements(a);
   const bElements = tensorElements(b);
   const outputElements = tensorElements(output);
   if (inputNames.length !== 2 || inputNames[0] !== 'a' || inputNames[1] !== 'b' ||
-      outputNames.length !== 1 || !a || !b || !output ||
+      outputNames.length !== 1 || outputNames[0] !== 'out' || !a || !b || !output ||
       a.dtype !== 'float32' || b.dtype !== 'float32' || output.dtype !== 'float32' ||
       aElements == null || bElements == null || outputElements == null ||
       !Number.isInteger(aRank) || !Number.isInteger(bRank) ||
       aRank < 2 || bRank < 2 || aRank > MAX_BATCH_MATMUL_RANK ||
-      bRank > MAX_BATCH_MATMUL_RANK || node.params == null ||
-      typeof node.params !== 'object' || Array.isArray(node.params) ||
-      Object.keys(node.params).length !== 0) {
+      bRank > MAX_BATCH_MATMUL_RANK || params == null ||
+      typeof params !== 'object' || Array.isArray(params) ||
+      Reflect.ownKeys(params).length !== 0) {
     throw new Error(
       `BatchMatMul node ${node.id ?? '<unnamed>'} requires exactly F32 { a, b } -> { out }, rank-2..8 operands, and no parameters.`,
     );
@@ -119,11 +127,25 @@ export function batchMatMulDescriptor(node) {
 
 export function _cpuBatchMatMul(node) {
   const descriptor = batchMatMulDescriptor(node);
-  if (!(descriptor.a.buffer instanceof Float32Array) ||
-      !(descriptor.b.buffer instanceof Float32Array) ||
-      !(descriptor.output.buffer instanceof Float32Array)) {
-    throw new Error(`BatchMatMul node ${node.id ?? '<unnamed>'} requires physical F32 storage.`);
-  }
+  assertShapeKernelParams(node, [], 'BatchMatMul');
+  assertShapeKernelTensor(descriptor.a, 'BatchMatMul input a', {
+    dtypes: ['float32'], minimumRank: 2, maximumRank: MAX_BATCH_MATMUL_RANK,
+  });
+  assertShapeKernelTensor(descriptor.b, 'BatchMatMul input b', {
+    dtypes: ['float32'], minimumRank: 2, maximumRank: MAX_BATCH_MATMUL_RANK,
+  });
+  assertShapeKernelOutput(
+    descriptor.output,
+    [...descriptor.outputBatch, descriptor.m, descriptor.n],
+    'float32',
+    undefined,
+    'BatchMatMul',
+  );
+  assertDistinctOutputStorage(
+    descriptor.output,
+    [descriptor.a, descriptor.b],
+    'BatchMatMul',
+  );
 
   for (let batch = 0; batch < descriptor.outputBatchCount; batch++) {
     let remaining = batch;

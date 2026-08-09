@@ -3,12 +3,16 @@
 import { Command } from 'commander';
 import fs from 'fs';
 import path from 'path';
-import { fileURLToPath } from 'url';
+import { fileURLToPath, pathToFileURL } from 'url';
 
 const packageVersion = JSON.parse(
   fs.readFileSync(new URL('../package.json', import.meta.url), 'utf8'),
 ).version;
-const { VolvoxAI } = await import(
+const {
+  ModelLoader,
+  Model,
+  VolvoxAI,
+} = await import(
   new URL(`../dist/${packageVersion}/volvoxai.js`, import.meta.url)
 );
 
@@ -25,27 +29,30 @@ program
   .requiredOption('-m, --model <path>', 'Path to the safetensors model file')
   .option('-b, --backend <type>', 'Backend to use (wasm, cpu)', 'wasm')
   .action(async (options) => {
+    let runtime = null;
+    let compiled = null;
     try {
       installFileFetchShim();
       console.log(`[Volvox CLI] Initializing runtime (backend: ${options.backend})...`);
       const cliDir = path.dirname(fileURLToPath(import.meta.url));
       const wasmPath = path.resolve(cliDir, '..', 'dist', packageVersion, 'volvoxai.wasm');
-      const runtime = await VolvoxAI.createRuntime({
+      runtime = await VolvoxAI.createRuntime({
         backends: [options.backend],
-        wasmUrl: wasmPath,
+        wasmUrl: pathToFileURL(wasmPath),
       });
 
-      console.log(`[Volvox CLI] Loading Model: ${options.model}`);
+      console.log(`[Volvox CLI] Loading logical model snapshot: ${options.model}`);
       if (!fs.existsSync(options.model)) {
-        console.error(`Error: Model file not found at ${options.model}`);
-        process.exit(1);
+        throw new Error(`Model file not found at ${options.model}`);
       }
-      
-      const modelUrl = 'file://' + path.resolve(options.model);
-      const model = await runtime.loadModel(modelUrl);
+
+      const modelUrl = pathToFileURL(path.resolve(options.model));
+      const snapshot = Model.capture(
+        await ModelLoader.load(modelUrl.href),
+      );
 
       console.log('[Volvox CLI] Compiling model...');
-      const compiled = await model.compile({
+      compiled = await runtime.compile(snapshot, {
         backend: {
           mode: 'require',
           backend: options.backend,
@@ -53,13 +60,18 @@ program
         },
       });
       console.log(`[Volvox CLI] Model ready on ${compiled.backend}.`);
-      await compiled.close();
-      await model.close();
-      await runtime.close();
-      
     } catch (err) {
       console.error('[Volvox CLI] Error during execution:', err);
-      process.exit(1);
+      process.exitCode = 1;
+    } finally {
+      await compiled?.close().catch((error) => {
+        console.error('[Volvox CLI] Failed to close compiled model:', error);
+        process.exitCode = 1;
+      });
+      await runtime?.close().catch((error) => {
+        console.error('[Volvox CLI] Failed to close runtime:', error);
+        process.exitCode = 1;
+      });
     }
   });
 
@@ -72,7 +84,7 @@ program
     console.log('Available backends: wasm, cpu');
   });
 
-program.parse();
+await program.parseAsync();
 
 function installFileFetchShim() {
   const nativeFetch = globalThis.fetch;

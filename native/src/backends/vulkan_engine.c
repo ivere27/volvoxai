@@ -2,6 +2,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
+#include <inttypes.h>
 #include <limits.h>
 #include <math.h>
 #include <dlfcn.h>
@@ -11,6 +12,7 @@
 #include "shader_store.h"
 #include "vulkan_engine.h"
 #include "runtime_state.h"
+#include "batch_matmul_f32_plan.h"
 #include "expand_f32_plan.h"
 #include "qbatch_matmul_plan.h"
 #include "qlinear_multiplier.h"
@@ -108,6 +110,7 @@ typedef struct {
 
 static VkKernel k_conv2d    = {"conv2D",      "spv/conv2D.spv",      5, 4, VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE, 0};
 static VkKernel k_conv2d_c3out16 = {"conv2DRegularC3Out16", "spv/conv2DRegularC3Out16.spv", 5, 4, VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE, 0};
+static VkKernel k_conv2d_out16 = {"conv2DRegularOut16", "spv/conv2DRegularOut16.spv", 5, 4, VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE, 0};
 static VkKernel k_conv2d_dw4 = {"conv2DDepthwise4", "spv/conv2DDepthwise4.spv", 5, 4, VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE, 0};
 static VkKernel k_conv2d_dw8 = {"conv2DDepthwise8", "spv/conv2DDepthwise8.spv", 5, 4, VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE, 0};
 static VkKernel k_conv2d_pw8 = {"conv2DPointwise8", "spv/conv2DPointwise8.spv", 5, 4, VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE, 0};
@@ -139,6 +142,10 @@ static VkKernel k_groupnorm = {"groupNorm", "spv/groupNorm.spv", 5, 4, VK_NULL_H
 static VkKernel k_dropout = {"dropout", "spv/dropout.spv", 3, 2, VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE, 0};
 #endif
 static VkKernel k_embedding = {"embedding",   "spv/embedding.spv",   4, 3, VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE, 0};
+/* Bindings 0-5 storage, 6 uniform params, 7 the resident-slot table. */
+static VkKernel k_moe_linear = {"moeLinear", "spv/moeLinear.spv", 8, 6, VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE, 0};
+/* Bindings 0-4 storage, 5 uniform params. */
+static VkKernel k_moe_router = {"moeRouter", "spv/moeRouter.spv", 6, 5, VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE, 0};
 static VkKernel k_transpose = {"generalTranspose", "spv/generalTranspose.spv", 3, -1, VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE, 0};
 static VkKernel k_where     = {"where",       "spv/where.spv",       5, 4, VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE, 0};
 static VkKernel k_typed_control_32 = {"typedControl32Native", "spv/typedControl32Native.spv", 4, -1, VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE, 0};
@@ -146,6 +153,11 @@ static VkKernel k_where_32 = {"where32Native", "spv/where32Native.spv", 5, 4, VK
 static VkKernel k_argmax_f32_i32 = {"argMaxF32I32Native", "spv/argMaxF32I32Native.spv", 3, 2, VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE, 0};
 static VkKernel k_concat_32 = {"concatCopy32Native", "spv/concatCopy32Native.spv", 3, 2, VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE, 0};
 static VkKernel k_expand    = {"expand",      "spv/expand.spv",      3, 2, VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE, 0};
+static VkKernel k_batch_matmul = {"batchMatMul", "spv/batchMatMul.spv", 4, -1, VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE, 0};
+static VkKernel k_linear_in_out = {"linearF32RowMajor", "spv/linearF32RowMajor.spv", 5, 4, VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE, 0};
+static VkKernel k_linear_in_out_tiled = {"linearF32RowMajorTiled", "spv/linearF32RowMajorTiled.spv", 5, 4, VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE, 0};
+static VkKernel k_linear_out_in = {"linearF32", "spv/linearF32.spv", 6, 5, VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE, 0};
+static VkKernel k_linear_out_in_tiled = {"linearF32Tiled", "spv/linearF32Tiled.spv", 6, 5, VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE, 0};
 static VkKernel k_pad       = {"pad",         "spv/pad.spv",         3, 2, VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE, 0};
 static VkKernel k_slice     = {"slice",       "spv/slice.spv",       3, 2, VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE, 0};
 static VkKernel k_gather    = {"gather",      "spv/gather.spv",      4, 3, VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE, 0};
@@ -172,11 +184,13 @@ static VkKernel k_qlinear_int8_dot = {"qLinearInt8Dot", "spv/qLinearInt8Dot.spv"
 static VkKernel k_qlinear_int8_dot_tiled = {"qLinearInt8DotTiled", "spv/qLinearInt8DotTiled.spv", 7, 6, VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE, 0};
 static VkKernel k_qembedding_int8 = {"qEmbeddingInt8", "spv/qEmbeddingInt8.spv", 6, 5, VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE, 0};
 static VkKernel k_qconv2d_int8 = {"qConv2DInt8", "spv/qConv2DInt8.spv", 7, 6, VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE, 0};
+static VkKernel k_qconv2d_int8_tiled = {"qConv2DInt8Tiled", "spv/qConv2DInt8Tiled.spv", 7, 6, VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE, 0};
 static VkKernel k_qconv2d_int8_dot_tiled = {"qConv2DInt8DotTiled", "spv/qConv2DInt8DotTiled.spv", 7, 6, VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE, 0};
 static VkKernel k_quantize_typed_i8u8 = {"quantizeLinearTyped", "spv/quantizeLinearTyped.spv", 5, 4, VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE, 0};
 static VkKernel k_dequantize_typed_i8u8 = {"dequantizeLinearTyped", "spv/dequantizeLinearTyped.spv", 5, 4, VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE, 0};
 static VkKernel k_qadd_i8u8 = {"qAdd", "spv/qAdd.spv", 4, 3, VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE, 0};
 static VkKernel k_qbatch_matmul_i8u8 = {"qBatchMatMul", "spv/qBatchMatMul.spv", 5, 4, VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE, 0};
+static VkKernel k_qbatch_matmul_i8u8_dot = {"qBatchMatMulDot", "spv/qBatchMatMulDot.spv", 5, 4, VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE, 0};
 static VkKernel k_qsilu_i8u8 = {"qSiLUInt8", "spv/qSiLUInt8.spv", 3, 2, VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE, 0};
 static VkKernel k_qgelu_i8u8 = {"qGELUInt8", "spv/qGELUInt8.spv", 3, 2, VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE, 0};
 static VkKernel k_qgroupnorm_stats = {"qGroupNormStats", "spv/qGroupNormStats.spv", 3, 2, VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE, 0};
@@ -206,6 +220,7 @@ static VkKernel k_maxpool   = {"maxPool2D",   "spv/maxPool2D.spv",   3, 2, VK_NU
 static VkKernel k_resize    = {"resize",      "spv/resize.spv",      3, 2, VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE, 0};
 
 #define VK_GRAPH_MAX_TENSORS 8192
+#define VK_GRAPH_MAX_FREE_RANGES (VK_GRAPH_MAX_TENSORS + 1)
 #define VK_GRAPH_MAX_DISPATCH_SETS 4096
 #define VK_GRAPH_SCRATCH_BYTES ((size_t)1024 * 1024)
 #define VK_GRAPH_BASE ((size_t)128 * 1024 * 1024)
@@ -217,11 +232,22 @@ static VkKernel k_resize    = {"resize",      "spv/resize.spv",      3, 2, VK_NU
 typedef struct {
     const void* host;
     size_t bytes;
+    size_t capacity;
+    size_t domain_capacity;
     size_t offset;
+    uint64_t shape_generation;
+    uint64_t capacity_generation;
     int host_dirty;
     int device_dirty;
     int is_weight;
+    int owns_range;
+    int domain_span;
 } VkTensorSlot;
+
+typedef struct {
+    size_t offset;
+    size_t bytes;
+} VkGraphFreeRange;
 
 /* A NULL canonical QConv2D bias still needs an output-channel-sized storage
  * binding. Keep every allocation alive until backend cleanup so graph slots
@@ -238,6 +264,7 @@ static const int32_t* qconv_zero_bias_get(uint32_t output_channels);
  * bind durable conventional I32 storage rather than retyping an activation
  * buffer as a mask descriptor. */
 static const int32_t qsdpa_dummy_mask[1] = {0};
+static const float linear_dummy_scale[1] = {1.0f};
 
 typedef struct {
     VkKernel* kernel;
@@ -276,6 +303,12 @@ typedef struct {
     uint32_t queue_family_index;
     VkPhysicalDeviceMemoryProperties memory_properties;
     uint32_t max_workgroups[3];
+    uint32_t max_workgroup_size[3];
+    uint32_t max_workgroup_invocations;
+    uint32_t max_storage_bindings;
+    uint32_t max_uniform_bindings;
+    VkDeviceSize max_storage_range;
+    VkDeviceSize max_uniform_range;
     size_t graph_alignment;
     int packed_dot;
     int packed_dot_warned;
@@ -293,6 +326,9 @@ typedef struct {
     VkPipeline matmul_tiled_pipeline;
     unsigned context_count;
     int initialized;
+    /* The device is shared across engine states and released at process exit,
+     * so the teardown hook is registered exactly once. */
+    int exit_hook_registered;
 } VulkanDeviceState;
 
 /* Every field below is owned by exactly one VxEngineState. It may be used by
@@ -310,8 +346,11 @@ typedef struct {
     VkFence fence;
     VkTensorSlot* tensor_slots;
     int tensor_slot_count;
+    VkGraphFreeRange* free_ranges;
+    int free_range_count;
     size_t arena_bump;
     size_t scratch_cursor;
+    size_t scratch_high_water;
     QConvZeroBiasBacking* zero_bias_backings;
     VkGraphDispatchSet* dispatch_sets;
     int dispatch_set_count;
@@ -319,11 +358,35 @@ typedef struct {
     int command_recording;
     int command_pending;
     int packed_dot_disabled;
+    uint64_t qlinear_dot_dispatches;
+    uint64_t qlinear_tiled_dispatches;
+    uint64_t qlinear_scalar_dispatches;
+    uint64_t qbatch_dot_dispatches;
+    uint64_t qbatch_scalar_dispatches;
+    uint64_t qconv_dot_tiled_dispatches;
+    uint64_t qconv_tiled_dispatches;
+    uint64_t qconv_scalar_dispatches;
+    uint64_t conv_out16_dispatches;
+    uint64_t conv_scalar_dispatches;
     VkPreparedKernel prepared_kernels[VK_PREPARED_KERNEL_MAX];
     int prepared_kernel_count;
     VkWeightCacheEntry weight_cache[WT_CACHE_MAX];
     int weight_cache_count;
     size_t weight_bump;
+    char* shape_signature;
+    uint64_t shape_generation;
+    uint64_t capacity_generation;
+    size_t domain_span_count;
+    size_t domain_qgroupnorm_stats_bytes;
+    size_t domain_qlayernorm_stats_bytes;
+    size_t domain_qgroupnorm_stats_offset;
+    size_t domain_qlayernorm_stats_offset;
+    size_t domain_params_offset;
+    int domain_enforced;
+#if defined(VOLVOXAI_VULKAN_TESTING)
+    int test_domain_allocation_failure_after;
+    uint64_t test_conv_pointwise_selections;
+#endif
 #if VOLVOXAI_ENABLE_TRAINING
     VkTrainingKernelSlot* training_kernel_slots;
     int training_kernel_slot_count;
@@ -407,6 +470,8 @@ static VulkanContextState* vk_context_current(void) {
 #define queue_family_index (g_vulkan_device.queue_family_index)
 #define mem_props (g_vulkan_device.memory_properties)
 #define max_compute_workgroups (g_vulkan_device.max_workgroups)
+#define max_storage_buffer_range (g_vulkan_device.max_storage_range)
+#define max_uniform_buffer_range (g_vulkan_device.max_uniform_range)
 #define graph_alignment (g_vulkan_device.graph_alignment)
 #define vulkan_packed_dot (g_vulkan_device.packed_dot)
 #define vulkan_packed_dot_warned (g_vulkan_device.packed_dot_warned)
@@ -435,8 +500,11 @@ static VulkanContextState* vk_context_current(void) {
 #define compute_fence (VX_VK_CONTEXT.fence)
 #define graph_slots (VX_VK_CONTEXT.tensor_slots)
 #define graph_slot_count (VX_VK_CONTEXT.tensor_slot_count)
+#define graph_free_ranges (VX_VK_CONTEXT.free_ranges)
+#define graph_free_range_count (VX_VK_CONTEXT.free_range_count)
 #define graph_bump (VX_VK_CONTEXT.arena_bump)
 #define scratch_bump (VX_VK_CONTEXT.scratch_cursor)
+#define scratch_high_water (VX_VK_CONTEXT.scratch_high_water)
 #define qconv_zero_bias_backings (VX_VK_CONTEXT.zero_bias_backings)
 #define graph_dispatch_sets (VX_VK_CONTEXT.dispatch_sets)
 #define graph_dispatch_set_count (VX_VK_CONTEXT.dispatch_set_count)
@@ -446,6 +514,11 @@ static VulkanContextState* vk_context_current(void) {
 #define wt_cache (VX_VK_CONTEXT.weight_cache)
 #define wt_cache_n (VX_VK_CONTEXT.weight_cache_count)
 #define wt_bump (VX_VK_CONTEXT.weight_bump)
+#define graph_shape_signature (VX_VK_CONTEXT.shape_signature)
+#define graph_shape_generation (VX_VK_CONTEXT.shape_generation)
+#define graph_capacity_generation (VX_VK_CONTEXT.capacity_generation)
+#define graph_domain_span_count (VX_VK_CONTEXT.domain_span_count)
+#define graph_domain_enforced (VX_VK_CONTEXT.domain_enforced)
 #if VOLVOXAI_ENABLE_TRAINING
 #define training_kernels (VX_VK_CONTEXT.training_kernel_slots)
 #define training_kernel_count (VX_VK_CONTEXT.training_kernel_slot_count)
@@ -461,6 +534,8 @@ static VulkanContextState* vk_context_current(void) {
 static int vk_graph_flush_wait(void);
 static int vk_is_ready(void);
 static void vk_context_destroy(void* opaque);
+static int vk_graph_allocator_reset(void);
+void vk_device_release(void);
 static const char* vk_kernel_entry_point(VkKernel* kernel);
 
 static uint32_t find_preferred_memory_type(uint32_t type_filter,
@@ -693,7 +768,23 @@ static int vk_device_initialize_locked(void) {
     vkGetPhysicalDeviceMemoryProperties(physical_device, &mem_props);
     for (int axis = 0; axis < 3; axis++) {
         max_compute_workgroups[axis] = best_props.limits.maxComputeWorkGroupCount[axis];
+        g_vulkan_device.max_workgroup_size[axis] =
+            best_props.limits.maxComputeWorkGroupSize[axis];
     }
+    g_vulkan_device.max_workgroup_invocations =
+        best_props.limits.maxComputeWorkGroupInvocations;
+    max_storage_buffer_range = best_props.limits.maxStorageBufferRange;
+    max_uniform_buffer_range = best_props.limits.maxUniformBufferRange;
+    g_vulkan_device.max_storage_bindings =
+        best_props.limits.maxPerStageDescriptorStorageBuffers <
+                best_props.limits.maxDescriptorSetStorageBuffers
+            ? best_props.limits.maxPerStageDescriptorStorageBuffers
+            : best_props.limits.maxDescriptorSetStorageBuffers;
+    g_vulkan_device.max_uniform_bindings =
+        best_props.limits.maxPerStageDescriptorUniformBuffers <
+                best_props.limits.maxDescriptorSetUniformBuffers
+            ? best_props.limits.maxPerStageDescriptorUniformBuffers
+            : best_props.limits.maxDescriptorSetUniformBuffers;
 #if VOLVOXAI_ENABLE_TRAINING
     training_max_storage_bindings =
         best_props.limits.maxPerStageDescriptorStorageBuffers <
@@ -775,6 +866,10 @@ static int vk_device_initialize_locked(void) {
         !create_matmul_pipeline("spv/linearF32Tiled.spv", &matmul_tiled_pipeline)) return -1;
 
     g_vulkan_device.initialized = 1;
+    if (!g_vulkan_device.exit_hook_registered) {
+        g_vulkan_device.exit_hook_registered = 1;
+        atexit(vk_device_release);
+    }
     printf("[VolvoxAI GPU] Vulkan Compute initialized successfully! Device: %s; packed INT8 dot: %s\n",
            best_props.deviceName, vulkan_packed_dot ? "enabled" : "unavailable");
     return 0;
@@ -813,6 +908,13 @@ static void vk_device_destroy_locked(void) {
     queue_family_index = 0;
     memset(&mem_props, 0, sizeof(mem_props));
     memset(max_compute_workgroups, 0, sizeof(g_vulkan_device.max_workgroups));
+    memset(g_vulkan_device.max_workgroup_size, 0,
+           sizeof(g_vulkan_device.max_workgroup_size));
+    g_vulkan_device.max_workgroup_invocations = 0;
+    g_vulkan_device.max_storage_bindings = 0;
+    g_vulkan_device.max_uniform_bindings = 0;
+    max_storage_buffer_range = 0;
+    max_uniform_buffer_range = 0;
     graph_alignment = VK_GRAPH_ALIGN;
     vulkan_packed_dot = 0;
     vulkan_packed_dot_warned = 0;
@@ -840,16 +942,25 @@ static VulkanContextState* vk_context_allocate(VxEngineState* owner) {
     if (!context) return NULL;
     context->tensor_slots = (VkTensorSlot*)calloc(
         VK_GRAPH_MAX_TENSORS, sizeof(*context->tensor_slots));
+    context->free_ranges = (VkGraphFreeRange*)calloc(
+        VK_GRAPH_MAX_FREE_RANGES, sizeof(*context->free_ranges));
     context->dispatch_sets = (VkGraphDispatchSet*)calloc(
         VK_GRAPH_MAX_DISPATCH_SETS, sizeof(*context->dispatch_sets));
-    if (!context->tensor_slots || !context->dispatch_sets) {
+    if (!context->tensor_slots || !context->free_ranges ||
+        !context->dispatch_sets) {
         free(context->dispatch_sets);
+        free(context->free_ranges);
         free(context->tensor_slots);
         free(context);
         return NULL;
     }
     context->arena_size = (size_t)512 * 1024 * 1024;
     context->arena_bump = VK_GRAPH_BASE;
+    context->shape_generation = 1;
+    context->capacity_generation = 1;
+#if defined(VOLVOXAI_VULKAN_TESTING)
+    context->test_domain_allocation_failure_after = -1;
+#endif
     owner->vulkan_context_state = context;
     return context;
 }
@@ -892,6 +1003,78 @@ int vk_test_context_state_read(VkContextStateProbe* probe) {
     probe->touched_count = 0;
     probe->is_training = 0;
 #endif
+    return 0;
+}
+
+int vk_test_graph_dynamic_state(VkGraphDynamicStateProbe* probe) {
+    VulkanContextState* context = vk_context_current();
+    if (!context || !probe) return -1;
+    memset(probe, 0, sizeof(*probe));
+    probe->shape_generation = context->shape_generation;
+    probe->capacity_generation = context->capacity_generation;
+    probe->domain_span_count = context->domain_span_count;
+    probe->domain_scratch_capacity_bytes =
+        context->domain_qgroupnorm_stats_bytes +
+        context->domain_qlayernorm_stats_bytes;
+    probe->domain_enforced = context->domain_enforced;
+    probe->slot_count = context->tensor_slot_count;
+    for (int index = 0; index < context->tensor_slot_count; index++) {
+        VkTensorSlot* slot = &context->tensor_slots[index];
+        if (!slot->owns_range) continue;
+        if (slot->host) probe->active_capacity_bytes += slot->capacity;
+        else probe->pooled_capacity_bytes += slot->capacity;
+    }
+    return 0;
+}
+
+int vk_test_fail_domain_allocation_after(size_t successful_allocations) {
+    VulkanContextState* context = vk_context_current();
+    if (!context || successful_allocations > (size_t)INT_MAX) return -1;
+    context->test_domain_allocation_failure_after =
+        (int)successful_allocations;
+    return 0;
+}
+
+int vk_test_set_packed_dot_disabled(int disabled) {
+    VulkanContextState* context = vk_context_current();
+    int previous;
+    if (!context || (disabled != 0 && disabled != 1)) return -1;
+    previous = context->packed_dot_disabled;
+    context->packed_dot_disabled = disabled;
+    return previous;
+}
+
+void vk_test_qconv_tactic_reset(void) {
+    VulkanContextState* context = vk_context_current();
+    if (!context) return;
+    context->qconv_dot_tiled_dispatches = 0u;
+    context->qconv_tiled_dispatches = 0u;
+    context->qconv_scalar_dispatches = 0u;
+}
+
+int vk_test_qconv_tactic_read(VkQConvTacticProbe* probe) {
+    VulkanContextState* context = vk_context_current();
+    if (!context || !probe) return -1;
+    probe->dot_tiled_dispatches = context->qconv_dot_tiled_dispatches;
+    probe->tiled_dispatches = context->qconv_tiled_dispatches;
+    probe->scalar_dispatches = context->qconv_scalar_dispatches;
+    return 0;
+}
+
+void vk_test_conv_tactic_reset(void) {
+    VulkanContextState* context = vk_context_current();
+    if (!context) return;
+    context->test_conv_pointwise_selections = 0u;
+    context->conv_out16_dispatches = 0u;
+    context->conv_scalar_dispatches = 0u;
+}
+
+int vk_test_conv_tactic_read(VkConvTacticProbe* probe) {
+    VulkanContextState* context = vk_context_current();
+    if (!context || !probe) return -1;
+    probe->pointwise_selections = context->test_conv_pointwise_selections;
+    probe->out16_dispatches = context->conv_out16_dispatches;
+    probe->scalar_dispatches = context->conv_scalar_dispatches;
     return 0;
 }
 #endif
@@ -981,6 +1164,7 @@ static int vk_context_create_resources_locked(VulkanContextState* context) {
     fence_info.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
     if (vkCreateFence(device, &fence_info, NULL,
                       &context->fence) != VK_SUCCESS) return -1;
+    if (!vk_graph_allocator_reset()) return -1;
     return 0;
 }
 
@@ -1016,8 +1200,13 @@ static void vk_context_destroy(void* opaque) {
         context->device_acquired = 0;
         if (g_vulkan_device.context_count > 0)
             g_vulkan_device.context_count--;
-        if (g_vulkan_device.context_count == 0)
-            vk_device_destroy_locked();
+        /* The per-context resources above are gone, but the device and instance
+         * stay. Compiling a model and creating its execution context run under
+         * different engine-state scopes, so the count legitimately returns to
+         * zero between them; destroying the device there made every native run
+         * build and tear down a full VkDevice twice. vk_device_initialize_locked
+         * is idempotent, so the next scope reuses this one. Released explicitly
+         * by vk_device_release(). */
         pthread_mutex_unlock(&g_vulkan_device.mutex);
     }
     while (context->zero_bias_backings) {
@@ -1032,6 +1221,8 @@ static void vk_context_destroy(void* opaque) {
     free(context->training_touched);
 #endif
     free(context->dispatch_sets);
+    free(context->shape_signature);
+    free(context->free_ranges);
     free(context->tensor_slots);
     free(context);
 }
@@ -1075,6 +1266,16 @@ void vk_cleanup(void) {
     vk_context_destroy(context);
 }
 
+/* Drop the shared device once nothing holds it. Separate from vk_cleanup so the
+ * device survives the engine-state scope churn between compile and execute, and
+ * is released only when the backend itself is deactivated. */
+void vk_device_release(void) {
+    pthread_mutex_lock(&g_vulkan_device.mutex);
+    if (g_vulkan_device.context_count == 0 && g_vulkan_device.initialized)
+        vk_device_destroy_locked();
+    pthread_mutex_unlock(&g_vulkan_device.mutex);
+}
+
 static int vk_is_ready(void) {
     VulkanContextState* context = vk_context_current();
     return context && context->device_acquired &&
@@ -1085,39 +1286,325 @@ static int vk_is_ready(void) {
 static int graph_find_slot(const void* host) {
     if (!host) return -1;
     for (int i = 0; i < graph_slot_count; i++) {
-        if (graph_slots[i].host == host) return i;
+        if (graph_slots[i].host == host &&
+            (graph_slots[i].is_weight ||
+             graph_slots[i].shape_generation == graph_shape_generation))
+            return i;
     }
     return -1;
 }
 
+static uint64_t vk_graph_generation_next(uint64_t generation) {
+    generation++;
+    return generation ? generation : 1u;
+}
+
+static int vk_graph_align_up(size_t value, size_t alignment, size_t* out) {
+    size_t remainder;
+    if (!out || !alignment) return 0;
+    remainder = value % alignment;
+    if (remainder && value > SIZE_MAX - (alignment - remainder)) return 0;
+    *out = remainder ? value + (alignment - remainder) : value;
+    return 1;
+}
+
+static size_t vk_graph_arena_limit(void) {
+    size_t limit = io_size > VK_GRAPH_SCRATCH_BYTES
+        ? io_size - VK_GRAPH_SCRATCH_BYTES : 0;
+    return graph_alignment ? limit - (limit % graph_alignment) : 0;
+}
+
+int vk_query_domain_limits(VulkanDomainLimits* limits) {
+    VulkanContextState* context = vk_context_current();
+    size_t arena_start = 0;
+    size_t arena_limit = 0;
+    size_t scratch_start = 0;
+    int ready = 0;
+    if (!limits) return -1;
+    memset(limits, 0, sizeof(*limits));
+    if (!context || !context->device_acquired) return -1;
+    if (pthread_mutex_lock(&g_vulkan_device.mutex) != 0) return -1;
+    if (g_vulkan_device.initialized && vk_is_ready() &&
+        vk_graph_align_up(VK_GRAPH_BASE, graph_alignment, &arena_start) &&
+        io_size >= VK_GRAPH_SCRATCH_BYTES &&
+        vk_graph_align_up(io_size - VK_GRAPH_SCRATCH_BYTES,
+                          graph_alignment, &scratch_start) &&
+        scratch_start <= io_size &&
+        (!scratch_high_water ||
+         (scratch_high_water >= scratch_start &&
+          scratch_high_water <= io_size))) {
+        arena_limit = vk_graph_arena_limit();
+        limits->maximum_storage_buffer_bytes =
+            (uint64_t)max_storage_buffer_range;
+        limits->maximum_uniform_buffer_bytes =
+            (uint64_t)max_uniform_buffer_range;
+        limits->maximum_total_span_bytes = arena_limit > arena_start
+            ? (uint64_t)(arena_limit - arena_start) : 0u;
+        limits->maximum_scratch_bytes = (uint64_t)(io_size - scratch_start);
+        limits->current_graph_scratch_bytes = scratch_high_water
+            ? (uint64_t)(scratch_high_water - scratch_start) : 0u;
+        limits->storage_alignment = (uint64_t)graph_alignment;
+        for (size_t axis = 0; axis < 3u; axis++) {
+            limits->maximum_workgroups[axis] =
+                g_vulkan_device.max_workgroups[axis];
+            limits->maximum_workgroup_size[axis] =
+                g_vulkan_device.max_workgroup_size[axis];
+        }
+        limits->maximum_workgroup_invocations =
+            g_vulkan_device.max_workgroup_invocations;
+        limits->maximum_storage_bindings =
+            g_vulkan_device.max_storage_bindings;
+        limits->maximum_uniform_bindings =
+            g_vulkan_device.max_uniform_bindings;
+        limits->maximum_tensor_slots = VK_GRAPH_MAX_TENSORS;
+        limits->maximum_dispatches = VK_GRAPH_MAX_DISPATCH_SETS;
+        ready = limits->maximum_storage_buffer_bytes > 0u &&
+            limits->maximum_uniform_buffer_bytes > 0u &&
+            limits->maximum_total_span_bytes > 0u &&
+            limits->maximum_scratch_bytes > 0u &&
+            limits->current_graph_scratch_bytes <=
+                limits->maximum_scratch_bytes &&
+            limits->storage_alignment > 0u &&
+            limits->maximum_workgroups[0] > 0u &&
+            limits->maximum_workgroups[1] > 0u &&
+            limits->maximum_workgroups[2] > 0u &&
+            limits->maximum_workgroup_size[0] > 0u &&
+            limits->maximum_workgroup_size[1] > 0u &&
+            limits->maximum_workgroup_size[2] > 0u &&
+            limits->maximum_workgroup_invocations > 0u &&
+            limits->maximum_storage_bindings > 0u &&
+            limits->maximum_uniform_bindings > 0u;
+    }
+    (void)pthread_mutex_unlock(&g_vulkan_device.mutex);
+    return ready ? 0 : -1;
+}
+
+static int vk_graph_allocator_reset(void) {
+    size_t start;
+    size_t limit;
+    if (!vk_context_current() || !graph_free_ranges ||
+        !vk_graph_align_up(VK_GRAPH_BASE, graph_alignment, &start)) return 0;
+    limit = vk_graph_arena_limit();
+    if (start >= limit) return 0;
+    memset(graph_free_ranges, 0,
+           VK_GRAPH_MAX_FREE_RANGES * sizeof(*graph_free_ranges));
+    graph_free_ranges[0] = (VkGraphFreeRange){start, limit - start};
+    graph_free_range_count = 1;
+    graph_bump = start;
+    return 1;
+}
+
+static int vk_graph_range_free(size_t offset, size_t capacity) {
+    size_t limit = vk_graph_arena_limit();
+    int at = 0;
+    if (!capacity || offset < VK_GRAPH_BASE || offset > limit ||
+        capacity > limit - offset) return 0;
+    while (at < graph_free_range_count &&
+           graph_free_ranges[at].offset < offset) at++;
+    if (at > 0) {
+        VkGraphFreeRange* previous = &graph_free_ranges[at - 1];
+        if (previous->offset > offset ||
+            previous->bytes > offset - previous->offset) return 0;
+        if (previous->offset + previous->bytes == offset) {
+            if (capacity > SIZE_MAX - previous->bytes) return 0;
+            previous->bytes += capacity;
+            if (at < graph_free_range_count &&
+                previous->offset + previous->bytes ==
+                    graph_free_ranges[at].offset) {
+                previous->bytes += graph_free_ranges[at].bytes;
+                memmove(&graph_free_ranges[at], &graph_free_ranges[at + 1],
+                        (size_t)(graph_free_range_count - at - 1) *
+                            sizeof(*graph_free_ranges));
+                graph_free_range_count--;
+            }
+            return 1;
+        }
+    }
+    if (at < graph_free_range_count) {
+        VkGraphFreeRange* next = &graph_free_ranges[at];
+        if (capacity > next->offset - offset) return 0;
+        if (offset + capacity == next->offset) {
+            next->offset = offset;
+            next->bytes += capacity;
+            return 1;
+        }
+    }
+    if (graph_free_range_count >= VK_GRAPH_MAX_FREE_RANGES) return 0;
+    memmove(&graph_free_ranges[at + 1], &graph_free_ranges[at],
+            (size_t)(graph_free_range_count - at) *
+                sizeof(*graph_free_ranges));
+    graph_free_ranges[at] = (VkGraphFreeRange){offset, capacity};
+    graph_free_range_count++;
+    return 1;
+}
+
+static int vk_graph_range_alloc(size_t bytes, size_t* offset,
+                                size_t* capacity) {
+    size_t aligned;
+    int best = -1;
+    if (!offset || !capacity || !bytes ||
+        !vk_graph_align_up(bytes, graph_alignment, &aligned)) return 0;
+    for (int index = 0; index < graph_free_range_count; index++) {
+        if (graph_free_ranges[index].bytes < aligned) continue;
+        if (best < 0 || graph_free_ranges[index].bytes <
+                          graph_free_ranges[best].bytes) best = index;
+    }
+    if (best < 0) return 0;
+    *offset = graph_free_ranges[best].offset;
+    *capacity = aligned;
+    graph_free_ranges[best].offset += aligned;
+    graph_free_ranges[best].bytes -= aligned;
+    if (!graph_free_ranges[best].bytes) {
+        memmove(&graph_free_ranges[best], &graph_free_ranges[best + 1],
+                (size_t)(graph_free_range_count - best - 1) *
+                    sizeof(*graph_free_ranges));
+        graph_free_range_count--;
+    }
+    if (*offset + aligned > graph_bump) graph_bump = *offset + aligned;
+    return 1;
+}
+
+static int vk_graph_reclaim_pooled_ranges(int skip_index) {
+    int reclaimed = 0;
+    for (int index = 0; index < graph_slot_count; index++) {
+        VkTensorSlot* slot = &graph_slots[index];
+        if (index == skip_index || slot->host || slot->is_weight ||
+            !slot->capacity || !slot->owns_range) continue;
+        if (!vk_graph_range_free(slot->offset, slot->capacity)) continue;
+        slot->offset = 0;
+        slot->capacity = 0;
+        slot->capacity_generation = 0;
+        reclaimed = 1;
+    }
+    if (reclaimed)
+        graph_capacity_generation =
+            vk_graph_generation_next(graph_capacity_generation);
+    return reclaimed;
+}
+
+static int vk_graph_reusable_slot(size_t bytes) {
+    int best = -1;
+    int empty = -1;
+    int grow = -1;
+    for (int index = 0; index < graph_slot_count; index++) {
+        VkTensorSlot* slot = &graph_slots[index];
+        if (slot->host || slot->is_weight ||
+            (slot->capacity && !slot->owns_range)) continue;
+        if (!slot->capacity) {
+            if (empty < 0) empty = index;
+            continue;
+        }
+        if (slot->capacity >= bytes &&
+            (best < 0 || slot->capacity < graph_slots[best].capacity))
+            best = index;
+        else if (slot->capacity < bytes &&
+                 (grow < 0 || slot->capacity > graph_slots[grow].capacity))
+            grow = index;
+    }
+    /* Reuse an undersized pooled metadata slot before appending another one.
+     * Its range remains live until a replacement range is secured, so growth
+     * is still transactional while alternating/increasing shapes keep the
+     * slot table bounded by the graph's peak simultaneous tensor count. */
+    return best >= 0 ? best : (empty >= 0 ? empty : grow);
+}
+
 static VkTensorSlot* graph_get_slot(const void* host, size_t bytes, int is_weight) {
-    if (!vk_is_ready() || !host || bytes == 0) return NULL;
+    VkTensorSlot staged;
+    size_t new_offset = 0;
+    size_t new_capacity = 0;
+    size_t requested_capacity = bytes;
+    int is_new = 0;
+    if (!vk_is_ready() || !host || bytes == 0 ||
+        !max_storage_buffer_range ||
+        bytes > (size_t)max_storage_buffer_range) return NULL;
     int idx = graph_find_slot(host);
+    if (graph_domain_enforced) {
+        VkTensorSlot* slot = idx >= 0 ? &graph_slots[idx] : NULL;
+        if (!slot || !slot->owns_range || !slot->capacity ||
+            bytes > slot->capacity) return NULL;
+        if (slot->domain_span) {
+            /* `is_weight` describes this use, not the lifetime of a public
+             * tensor. Keep a reserved public span mutable even when a kernel
+             * binds it as a weight or affine operand. */
+            if (bytes > slot->domain_capacity) return NULL;
+            if (bytes > slot->bytes) {
+                slot->bytes = bytes;
+                slot->host_dirty = 1;
+                slot->device_dirty = 0;
+            }
+            return slot;
+        }
+        if (!slot->is_weight || !slot->host || !slot->bytes ||
+            bytes > slot->bytes) return NULL;
+        return slot;
+    }
     if (idx >= 0) {
         VkTensorSlot* s = &graph_slots[idx];
-        if (bytes <= s->bytes) return s;
-        s->bytes = bytes;
-        s->host_dirty = 1;
-        s->device_dirty = 0;
+        if (bytes <= s->capacity) {
+            if (bytes > s->bytes) {
+                s->host_dirty = 1;
+                s->device_dirty = 0;
+            }
+            s->bytes = bytes;
+            if (is_weight) s->is_weight = 1;
+            return s;
+        }
     } else {
-        if (graph_slot_count >= VK_GRAPH_MAX_TENSORS) return NULL;
-        idx = graph_slot_count++;
-        graph_slots[idx] = (VkTensorSlot){0};
-        graph_slots[idx].host = host;
-        graph_slots[idx].bytes = bytes;
-        graph_slots[idx].host_dirty = 1;
-        graph_slots[idx].is_weight = is_weight;
+        idx = vk_graph_reusable_slot(bytes);
+        if (idx < 0) {
+            if (graph_slot_count >= VK_GRAPH_MAX_TENSORS) return NULL;
+            idx = graph_slot_count;
+            is_new = 1;
+        } else if (graph_slots[idx].capacity >= bytes) {
+            VkTensorSlot* reused = &graph_slots[idx];
+            reused->host = host;
+            reused->bytes = bytes;
+            reused->shape_generation = is_weight ? 0 : graph_shape_generation;
+            reused->host_dirty = 1;
+            reused->device_dirty = 0;
+            reused->is_weight = is_weight;
+            return reused;
+        }
     }
 
-    size_t limit = io_size > VK_GRAPH_SCRATCH_BYTES ? io_size - VK_GRAPH_SCRATCH_BYTES : 0;
-    graph_bump = ALIGN_UP(graph_bump, graph_alignment);
-    if (graph_bump + bytes > limit) {
-        printf("[VolvoxAI GPU] Vulkan graph arena exhausted (%zu / %zu bytes). Set VOLVOX_VULKAN_MB higher.\n",
-               graph_bump + bytes, io_size);
+    staged = is_new ? (VkTensorSlot){0} : graph_slots[idx];
+    if (staged.capacity && staged.capacity <= SIZE_MAX / 2u &&
+        staged.capacity * 2u > requested_capacity)
+        requested_capacity = staged.capacity * 2u;
+    if (!vk_graph_range_alloc(requested_capacity, &new_offset,
+                              &new_capacity) &&
+        (requested_capacity == bytes ||
+         !vk_graph_range_alloc(bytes, &new_offset, &new_capacity))) {
+        (void)vk_graph_reclaim_pooled_ranges(idx);
+        if (!vk_graph_range_alloc(bytes, &new_offset, &new_capacity)) {
+            printf("[VolvoxAI GPU] Vulkan graph arena exhausted (%zu-byte request / %zu-byte arena). Set VOLVOX_VULKAN_MB higher.\n",
+                   bytes, io_size);
+            return NULL;
+        }
+    }
+    if (staged.owns_range && staged.capacity && !vk_graph_flush_wait()) {
+        (void)vk_graph_range_free(new_offset, new_capacity);
         return NULL;
     }
-    graph_slots[idx].offset = graph_bump;
-    graph_bump = ALIGN_UP(graph_bump + bytes, graph_alignment);
+    graph_capacity_generation =
+        vk_graph_generation_next(graph_capacity_generation);
+    if (staged.owns_range && staged.capacity &&
+        !vk_graph_range_free(staged.offset, staged.capacity)) {
+        (void)vk_graph_range_free(new_offset, new_capacity);
+        return NULL;
+    }
+    staged.host = host;
+    staged.bytes = bytes;
+    staged.capacity = new_capacity;
+    staged.offset = new_offset;
+    staged.shape_generation = is_weight ? 0 : graph_shape_generation;
+    staged.capacity_generation = graph_capacity_generation;
+    staged.host_dirty = 1;
+    staged.device_dirty = 0;
+    staged.is_weight = is_weight || staged.is_weight;
+    staged.owns_range = 1;
+    graph_slots[idx] = staged;
+    if (is_new) graph_slot_count++;
     return &graph_slots[idx];
 }
 
@@ -1177,15 +1664,25 @@ static void graph_mark_device(VkTensorSlot* s) {
 
 static void graph_scratch_begin(void) {
     if (scratch_bump == 0) {
-        scratch_bump = ALIGN_UP(io_size - VK_GRAPH_SCRATCH_BYTES, graph_alignment);
+        VulkanContextState* context = vk_context_current();
+        scratch_bump = context && context->domain_enforced
+            ? context->domain_params_offset
+            : ALIGN_UP(io_size - VK_GRAPH_SCRATCH_BYTES, graph_alignment);
     }
+    if (scratch_bump > scratch_high_water)
+        scratch_high_water = scratch_bump;
 }
 
 static size_t graph_scratch_alloc(size_t bytes) {
-    scratch_bump = ALIGN_UP(scratch_bump, graph_alignment);
-    if (scratch_bump + bytes > io_size) return SIZE_MAX;
+    size_t aligned;
+    if (!bytes || !vk_graph_align_up(scratch_bump, graph_alignment, &aligned) ||
+        aligned > io_size || bytes > io_size - aligned) return SIZE_MAX;
+    scratch_bump = aligned;
     size_t off = scratch_bump;
-    scratch_bump = ALIGN_UP(scratch_bump + bytes, graph_alignment);
+    if (!vk_graph_align_up(scratch_bump + bytes, graph_alignment,
+                           &scratch_bump)) return SIZE_MAX;
+    if (scratch_bump > scratch_high_water)
+        scratch_high_water = scratch_bump;
     return off;
 }
 
@@ -1196,20 +1693,400 @@ static size_t graph_scratch_upload(const void* data, size_t bytes) {
     return off;
 }
 
+/* Zero-filled scratch for an optional binding the shader always declares. */
+static size_t graph_scratch_zero(size_t bytes) {
+    size_t off = graph_scratch_alloc(bytes);
+    if (off == SIZE_MAX) return SIZE_MAX;
+    memset((char*)io_mapped + off, 0, bytes);
+    return off;
+}
+
 void vk_graph_reset(void) {
     if (!vk_context_current()) return;
     vk_graph_flush_wait();
+    free(graph_shape_signature);
+    graph_shape_signature = NULL;
+    graph_shape_generation =
+        vk_graph_generation_next(graph_shape_generation);
+    graph_capacity_generation =
+        vk_graph_generation_next(graph_capacity_generation);
+    graph_domain_span_count = 0;
+    graph_domain_enforced = 0;
+    vk_context_current()->domain_qgroupnorm_stats_bytes = 0;
+    vk_context_current()->domain_qlayernorm_stats_bytes = 0;
+    vk_context_current()->domain_qgroupnorm_stats_offset = 0;
+    vk_context_current()->domain_qlayernorm_stats_offset = 0;
+    vk_context_current()->domain_params_offset = 0;
+#if defined(VOLVOXAI_VULKAN_TESTING)
+    vk_context_current()->test_domain_allocation_failure_after = -1;
+#endif
+    memset(graph_slots, 0,
+           VK_GRAPH_MAX_TENSORS * sizeof(*graph_slots));
     graph_slot_count = 0;
-    graph_bump = VK_GRAPH_BASE;
+    (void)vk_graph_allocator_reset();
     scratch_bump = 0;
+    scratch_high_water = 0;
     graph_dispatch_set_cursor = 0;
+}
+
+int vk_graph_bind_shape(const char* signature) {
+    VulkanContextState* context = vk_context_current();
+    char* candidate;
+    size_t length;
+    uint64_t next_generation;
+    if (!context || !vk_is_ready() || !signature || !signature[0] ||
+        graph_domain_enforced) return -1;
+    if (graph_shape_signature && !strcmp(graph_shape_signature, signature))
+        return 0;
+    length = strlen(signature);
+    if (length > 1024u * 1024u) return -1;
+    candidate = (char*)malloc(length + 1u);
+    if (!candidate) return -1;
+    memcpy(candidate, signature, length + 1u);
+    if (!vk_graph_flush_wait()) {
+        free(candidate);
+        return -1;
+    }
+    next_generation = vk_graph_generation_next(graph_shape_generation);
+    for (int index = 0; index < graph_slot_count; index++) {
+        VkTensorSlot* slot = &graph_slots[index];
+        if (slot->is_weight) continue;
+        slot->host = NULL;
+        slot->bytes = 0;
+        slot->shape_generation = next_generation;
+        slot->host_dirty = 0;
+        slot->device_dirty = 0;
+        if (!slot->owns_range) {
+            slot->offset = 0;
+            slot->capacity = 0;
+            slot->capacity_generation = 0;
+        }
+    }
+    free(graph_shape_signature);
+    graph_shape_signature = candidate;
+    graph_shape_generation = next_generation;
+    scratch_bump = 0;
+    scratch_high_water = 0;
+    graph_dispatch_set_cursor = 0;
+    return 0;
+}
+
+static int vk_graph_domain_spans_match(
+        const VolvoxAIEnginePhysicalSpan* spans,
+        size_t span_count) {
+    if (!spans || span_count != graph_domain_span_count) return 0;
+    for (size_t index = 0; index < span_count; index++) {
+        int slot_index = graph_find_slot(spans[index].host);
+        VkTensorSlot* slot;
+        if (slot_index < 0) return 0;
+        slot = &graph_slots[slot_index];
+        if (!slot->domain_span || slot->is_weight || !slot->owns_range ||
+            !slot->capacity ||
+            slot->domain_capacity != spans[index].capacity_bytes ||
+            slot->bytes > slot->domain_capacity)
+            return 0;
+    }
+    return 1;
+}
+
+static int vk_graph_domain_scratch_layout(
+        VulkanContextState* context,
+        size_t qgroupnorm_stats_bytes,
+        size_t qlayernorm_stats_bytes,
+        size_t* qgroupnorm_offset,
+        size_t* qlayernorm_offset,
+        size_t* params_offset) {
+    size_t base;
+    size_t cursor;
+    size_t bootstrap_bytes = 0;
+    if (!context || !qgroupnorm_offset || !qlayernorm_offset ||
+        !params_offset || io_size < VK_GRAPH_SCRATCH_BYTES ||
+        (qgroupnorm_stats_bytes &&
+         qgroupnorm_stats_bytes > (size_t)max_storage_buffer_range) ||
+        (qlayernorm_stats_bytes &&
+         qlayernorm_stats_bytes > (size_t)max_storage_buffer_range) ||
+        !vk_graph_align_up(io_size - VK_GRAPH_SCRATCH_BYTES,
+                           graph_alignment, &base) ||
+        base > io_size)
+        return 0;
+    if (scratch_high_water) {
+        if (scratch_high_water < base || scratch_high_water > io_size)
+            return 0;
+        bootstrap_bytes = scratch_high_water - base;
+    }
+    cursor = base;
+    *qgroupnorm_offset = 0;
+    *qlayernorm_offset = 0;
+    if (qgroupnorm_stats_bytes) {
+        *qgroupnorm_offset = cursor;
+        if (qgroupnorm_stats_bytes > io_size - cursor ||
+            !vk_graph_align_up(cursor + qgroupnorm_stats_bytes,
+                               graph_alignment, &cursor) ||
+            cursor > io_size)
+            return 0;
+    }
+    if (qlayernorm_stats_bytes) {
+        *qlayernorm_offset = cursor;
+        if (qlayernorm_stats_bytes > io_size - cursor ||
+            !vk_graph_align_up(cursor + qlayernorm_stats_bytes,
+                               graph_alignment, &cursor) ||
+            cursor > io_size)
+            return 0;
+    }
+    /* Bootstrap usage is a conservative bound for all shape-invariant
+     * params and optional-bias scratch. It also contains the minimum-shape
+     * norm stats, so adding it here deliberately overcounts rather than
+     * permitting a maximum-shape forward to exhaust the fixed 1 MiB tail. */
+    if (bootstrap_bytes > io_size - cursor) return 0;
+    *params_offset = cursor;
+    return 1;
+}
+
+int vk_graph_bind_shape_domain(
+        const char* signature,
+        const VolvoxAIEnginePhysicalSpan* spans,
+        size_t span_count,
+        size_t qgroupnorm_stats_bytes,
+        size_t qlayernorm_stats_bytes) {
+    VulkanContextState* context = vk_context_current();
+    char* candidate_signature = NULL;
+    VkGraphFreeRange* free_snapshot = NULL;
+    size_t* candidate_offsets = NULL;
+    size_t* candidate_capacities = NULL;
+    size_t signature_length;
+    size_t old_bump = 0;
+    int old_free_count = 0;
+    int weight_count = 0;
+    int allocator_mutated = 0;
+    int result = -1;
+    size_t qgroupnorm_stats_offset = 0;
+    size_t qlayernorm_stats_offset = 0;
+    size_t params_offset = 0;
+    uint64_t next_shape_generation;
+    uint64_t next_capacity_generation;
+    if (!context || !vk_is_ready() || !signature || !signature[0] ||
+        !spans || !span_count || span_count > VK_GRAPH_MAX_TENSORS)
+        return -1;
+#if VOLVOXAI_ENABLE_TRAINING
+    if (training_active) return -1;
+#endif
+    signature_length = strlen(signature);
+    if (signature_length > 1024u * 1024u) return -1;
+    for (size_t index = 0; index < span_count; index++) {
+        uintptr_t start = (uintptr_t)spans[index].host;
+        size_t capacity = spans[index].capacity_bytes;
+        if (!start || !capacity || start > UINTPTR_MAX - capacity ||
+            !max_storage_buffer_range ||
+            capacity > (size_t)max_storage_buffer_range ||
+            (index && (uintptr_t)spans[index - 1u].host +
+                spans[index - 1u].capacity_bytes > start))
+            return -1;
+    }
+    if (graph_domain_enforced) {
+        if (!vk_graph_domain_spans_match(spans, span_count) ||
+            qgroupnorm_stats_bytes !=
+                context->domain_qgroupnorm_stats_bytes ||
+            qlayernorm_stats_bytes !=
+                context->domain_qlayernorm_stats_bytes)
+            return -1;
+        if (graph_shape_signature &&
+            !strcmp(graph_shape_signature, signature)) {
+            for (int index = 0; index < graph_slot_count; index++) {
+                VkTensorSlot* slot = &graph_slots[index];
+                if (!slot->domain_span) continue;
+                slot->bytes = 0;
+                slot->host_dirty = 0;
+                slot->device_dirty = 0;
+            }
+            scratch_bump = 0;
+            scratch_high_water = 0;
+            graph_dispatch_set_cursor = 0;
+            return 0;
+        }
+        candidate_signature = (char*)malloc(signature_length + 1u);
+        if (!candidate_signature) return -2;
+        memcpy(candidate_signature, signature, signature_length + 1u);
+        if (!vk_graph_flush_wait()) goto done;
+        next_shape_generation =
+            vk_graph_generation_next(graph_shape_generation);
+        for (int index = 0; index < graph_slot_count; index++) {
+            VkTensorSlot* slot = &graph_slots[index];
+            if (!slot->domain_span) continue;
+            slot->shape_generation = next_shape_generation;
+            slot->bytes = 0;
+            slot->host_dirty = 0;
+            slot->device_dirty = 0;
+        }
+        free(graph_shape_signature);
+        graph_shape_signature = candidate_signature;
+        candidate_signature = NULL;
+        graph_shape_generation = next_shape_generation;
+        scratch_bump = 0;
+        scratch_high_water = 0;
+        graph_dispatch_set_cursor = 0;
+        result = 0;
+        goto done;
+    }
+
+    if (!vk_graph_domain_scratch_layout(
+            context, qgroupnorm_stats_bytes, qlayernorm_stats_bytes,
+            &qgroupnorm_stats_offset, &qlayernorm_stats_offset,
+            &params_offset))
+        return -1;
+
+    for (int index = 0; index < graph_slot_count; index++) {
+        VkTensorSlot* slot = &graph_slots[index];
+        if (!slot->is_weight) continue;
+        uintptr_t weight_start = (uintptr_t)slot->host;
+        if (!weight_start || !slot->owns_range || !slot->capacity ||
+            !slot->bytes || slot->bytes > slot->capacity ||
+            weight_start > UINTPTR_MAX - slot->bytes)
+            return -1;
+        weight_count++;
+        for (size_t span_index = 0; span_index < span_count; span_index++) {
+            uintptr_t span_start = (uintptr_t)spans[span_index].host;
+            uintptr_t span_end = span_start + spans[span_index].capacity_bytes;
+            uintptr_t weight_end = weight_start + slot->bytes;
+            if (span_start < weight_end && weight_start < span_end)
+                return -1;
+        }
+    }
+    if (span_count > (size_t)(VK_GRAPH_MAX_TENSORS - weight_count))
+        return -1;
+    candidate_signature = (char*)malloc(signature_length + 1u);
+    candidate_offsets = (size_t*)calloc(span_count, sizeof(*candidate_offsets));
+    candidate_capacities =
+        (size_t*)calloc(span_count, sizeof(*candidate_capacities));
+    free_snapshot = (VkGraphFreeRange*)malloc(
+        VK_GRAPH_MAX_FREE_RANGES * sizeof(*free_snapshot));
+    if (!candidate_signature || !candidate_offsets ||
+        !candidate_capacities || !free_snapshot) {
+        result = -2;
+        goto done;
+    }
+    memcpy(candidate_signature, signature, signature_length + 1u);
+    if (!vk_graph_flush_wait()) goto done;
+    memcpy(free_snapshot, graph_free_ranges,
+           VK_GRAPH_MAX_FREE_RANGES * sizeof(*free_snapshot));
+    old_free_count = graph_free_range_count;
+    old_bump = graph_bump;
+    allocator_mutated = 1;
+
+    /* The arena allocation itself survives rollback. Returning old transient
+     * ranges changes metadata only, so failed candidate placement can restore
+     * the exact allocator snapshot and leave all published slots usable. */
+    for (int index = 0; index < graph_slot_count; index++) {
+        VkTensorSlot* slot = &graph_slots[index];
+        if (slot->is_weight || !slot->owns_range || !slot->capacity) continue;
+        if (!vk_graph_range_free(slot->offset, slot->capacity)) goto rollback;
+    }
+    for (size_t index = 0; index < span_count; index++) {
+#if defined(VOLVOXAI_VULKAN_TESTING)
+        if (context->test_domain_allocation_failure_after == 0) {
+            context->test_domain_allocation_failure_after = -1;
+            result = -2;
+            goto rollback;
+        }
+        if (context->test_domain_allocation_failure_after > 0)
+            context->test_domain_allocation_failure_after--;
+#endif
+        if (!vk_graph_range_alloc(spans[index].capacity_bytes,
+                                  &candidate_offsets[index],
+                                  &candidate_capacities[index])) {
+            result = -2;
+            goto rollback;
+        }
+    }
+
+    next_shape_generation =
+        vk_graph_generation_next(graph_shape_generation);
+    next_capacity_generation =
+        vk_graph_generation_next(graph_capacity_generation);
+    {
+        int kept = 0;
+        int old_slot_count = graph_slot_count;
+        for (int index = 0; index < old_slot_count; index++) {
+            if (!graph_slots[index].is_weight) continue;
+            if (kept != index) graph_slots[kept] = graph_slots[index];
+            kept++;
+        }
+        if (kept < old_slot_count) {
+            memset(&graph_slots[kept], 0,
+                   (size_t)(old_slot_count - kept) * sizeof(graph_slots[0]));
+        }
+        graph_slot_count = kept;
+    }
+    for (size_t index = 0; index < span_count; index++) {
+        VkTensorSlot* slot = &graph_slots[graph_slot_count++];
+        memset(slot, 0, sizeof(*slot));
+        slot->host = spans[index].host;
+        slot->capacity = candidate_capacities[index];
+        slot->domain_capacity = spans[index].capacity_bytes;
+        slot->offset = candidate_offsets[index];
+        slot->shape_generation = next_shape_generation;
+        slot->capacity_generation = next_capacity_generation;
+        slot->owns_range = 1;
+        slot->domain_span = 1;
+    }
+    free(graph_shape_signature);
+    graph_shape_signature = candidate_signature;
+    candidate_signature = NULL;
+    graph_shape_generation = next_shape_generation;
+    graph_capacity_generation = next_capacity_generation;
+    graph_domain_span_count = span_count;
+    context->domain_qgroupnorm_stats_bytes = qgroupnorm_stats_bytes;
+    context->domain_qlayernorm_stats_bytes = qlayernorm_stats_bytes;
+    context->domain_qgroupnorm_stats_offset = qgroupnorm_stats_offset;
+    context->domain_qlayernorm_stats_offset = qlayernorm_stats_offset;
+    context->domain_params_offset = params_offset;
+    graph_domain_enforced = 1;
+    scratch_bump = 0;
+    scratch_high_water = 0;
+    graph_dispatch_set_cursor = 0;
+    allocator_mutated = 0;
+    result = 0;
+    goto done;
+
+rollback:
+    memcpy(graph_free_ranges, free_snapshot,
+           VK_GRAPH_MAX_FREE_RANGES * sizeof(*free_snapshot));
+    graph_free_range_count = old_free_count;
+    graph_bump = old_bump;
+    allocator_mutated = 0;
+done:
+    if (allocator_mutated) {
+        memcpy(graph_free_ranges, free_snapshot,
+               VK_GRAPH_MAX_FREE_RANGES * sizeof(*free_snapshot));
+        graph_free_range_count = old_free_count;
+        graph_bump = old_bump;
+    }
+    free(free_snapshot);
+    free(candidate_capacities);
+    free(candidate_offsets);
+    free(candidate_signature);
+    return result;
 }
 
 void vk_graph_begin_forward(void) {
     if (!vk_context_current()) return;
     vk_graph_flush_wait();
     scratch_bump = 0;
+    scratch_high_water = 0;
     graph_dispatch_set_cursor = 0;
+    VulkanContextState* context = vk_context_current();
+    context->qlinear_dot_dispatches = 0u;
+    context->qlinear_tiled_dispatches = 0u;
+    context->qlinear_scalar_dispatches = 0u;
+    context->qbatch_dot_dispatches = 0u;
+    context->qbatch_scalar_dispatches = 0u;
+    context->qconv_dot_tiled_dispatches = 0u;
+    context->qconv_tiled_dispatches = 0u;
+    context->qconv_scalar_dispatches = 0u;
+    context->conv_out16_dispatches = 0u;
+    context->conv_scalar_dispatches = 0u;
+#if defined(VOLVOXAI_VULKAN_TESTING)
+    context->test_conv_pointwise_selections = 0u;
+#endif
 }
 
 int vk_graph_end_forward(void) {
@@ -1217,7 +2094,57 @@ int vk_graph_end_forward(void) {
     return vk_graph_flush_wait() ? 0 : -1;
 }
 
+static void vk_graph_append_counter(char* output, size_t output_capacity,
+                                    size_t* offset, const char* name,
+                                    uint64_t value) {
+    int written;
+    if (!output || !offset || !name || !value || *offset >= output_capacity)
+        return;
+    written = snprintf(output + *offset, output_capacity - *offset,
+                       ";%s=%" PRIu64, name, value);
+    if (written <= 0) return;
+    if ((size_t)written >= output_capacity - *offset)
+        *offset = output_capacity;
+    else
+        *offset += (size_t)written;
+}
+
+int vk_graph_append_dynamic_telemetry(char* output,
+                                      size_t output_capacity) {
+    VulkanContextState* context = vk_context_current();
+    if (!output || !output_capacity || !context) return -1;
+    size_t offset = 0u;
+    output[0] = '\0';
+    vk_graph_append_counter(output, output_capacity, &offset, "vk_c16",
+                            context->conv_out16_dispatches);
+    vk_graph_append_counter(output, output_capacity, &offset, "vk_cs",
+                            context->conv_scalar_dispatches);
+    vk_graph_append_counter(output, output_capacity, &offset, "vk_qld",
+                            context->qlinear_dot_dispatches);
+    vk_graph_append_counter(output, output_capacity, &offset, "vk_qlt",
+                            context->qlinear_tiled_dispatches);
+    vk_graph_append_counter(output, output_capacity, &offset, "vk_qls",
+                            context->qlinear_scalar_dispatches);
+    vk_graph_append_counter(output, output_capacity, &offset, "vk_qbd",
+                            context->qbatch_dot_dispatches);
+    vk_graph_append_counter(output, output_capacity, &offset, "vk_qbs",
+                            context->qbatch_scalar_dispatches);
+    vk_graph_append_counter(output, output_capacity, &offset, "vk_qcd",
+                            context->qconv_dot_tiled_dispatches);
+    vk_graph_append_counter(output, output_capacity, &offset, "vk_qct",
+                            context->qconv_tiled_dispatches);
+    vk_graph_append_counter(output, output_capacity, &offset, "vk_qcs",
+                            context->qconv_scalar_dispatches);
+    return 0;
+}
+
 void vk_graph_mark_host(const void* host, size_t bytes, int is_weight) {
+    int index = graph_find_slot(host);
+    if (index >= 0 && !graph_slots[index].owns_range) {
+        graph_slots[index].offset = 0;
+        graph_slots[index].capacity = 0;
+        graph_slots[index].capacity_generation = 0;
+    }
     VkTensorSlot* s = graph_get_slot(host, bytes, is_weight);
     if (!s) return;
     s->host_dirty = 1;
@@ -1393,13 +2320,30 @@ static int vk_dispatch_dimensions_valid(uint32_t gx, uint32_t gy, uint32_t gz) {
         gz <= max_compute_workgroups[2];
 }
 
+static int vk_workgroup_shape_supported(
+        uint32_t x, uint32_t y, uint32_t z) {
+    uint64_t invocations = (uint64_t)x * (uint64_t)y * (uint64_t)z;
+    return x > 0u && y > 0u && z > 0u &&
+        x <= g_vulkan_device.max_workgroup_size[0] &&
+        y <= g_vulkan_device.max_workgroup_size[1] &&
+        z <= g_vulkan_device.max_workgroup_size[2] &&
+        invocations <= g_vulkan_device.max_workgroup_invocations;
+}
+
 static int vk_dispatch_kernel(VkKernel* k, const VkGraphBinding* binds,
                               uint32_t gx, uint32_t gy, uint32_t gz) {
     VkPreparedKernel* prepared;
-    if (!vk_dispatch_dimensions_valid(gx, gy, gz)) return 0;
+    if (!vk_dispatch_dimensions_valid(gx, gy, gz) || !k || !binds ||
+        k->binding_count <= 0 || k->binding_count > 16) return 0;
+    for (int i = 0; i < k->binding_count; i++) {
+        VkDeviceSize range_limit = i == k->uniform_binding
+            ? max_uniform_buffer_range : max_storage_buffer_range;
+        if (!binds[i].bytes || binds[i].offset > io_size ||
+            binds[i].bytes > io_size - binds[i].offset ||
+            (VkDeviceSize)binds[i].bytes > range_limit) return 0;
+    }
     prepared = vk_prepare_kernel(k);
     if (!prepared) return 0;
-    if (!binds || k->binding_count <= 0 || k->binding_count > 16) return 0;
     VkDescriptorSet dispatch_set = vk_graph_dispatch_set(k, prepared);
     if (dispatch_set == VK_NULL_HANDLE) return 0;
 
@@ -1438,6 +2382,31 @@ static int vk_dispatch_kernel(VkKernel* k, const VkGraphBinding* binds,
                              0, 1, &barrier, 0, NULL, 0, NULL);
     }
     return 1;
+}
+
+void vk_graph_retain_weight(const void* host, size_t bytes) {
+    if (!vk_context_current() || !host || !bytes) return;
+    int index = graph_find_slot(host);
+    if (index < 0) return;
+    VkTensorSlot* slot = &graph_slots[index];
+    if (slot->domain_span || !slot->owns_range || !slot->capacity ||
+        !slot->bytes || bytes > slot->bytes || bytes > slot->capacity)
+        return;
+    slot->is_weight = 1;
+    slot->shape_generation = 0;
+}
+
+void vk_graph_demote_weight(const void* host, size_t bytes) {
+    int index;
+    VkTensorSlot* slot;
+    if (!vk_context_current() || !host || !bytes) return;
+    index = graph_find_slot(host);
+    if (index < 0) return;
+    slot = &graph_slots[index];
+    if (slot->domain_span || !slot->bytes || bytes > slot->bytes)
+        return;
+    slot->is_weight = 0;
+    slot->shape_generation = graph_shape_generation;
 }
 
 #if VOLVOXAI_ENABLE_TRAINING
@@ -1774,6 +2743,7 @@ int vk_training_begin(void) {
         training_dispatch_set_count = 0;
     }
     scratch_bump = 0;
+    scratch_high_water = 0;
     training_dispatch_set_cursor = 0;
     training_touched_count = 0;
     training_active = 1;
@@ -1862,6 +2832,7 @@ void vk_training_end(void) {
     }
     training_touched_count = 0;
     scratch_bump = 0;
+    scratch_high_water = 0;
     training_dispatch_set_cursor = 0;
     training_active = 0;
 }
@@ -1869,13 +2840,24 @@ void vk_training_end(void) {
 
 int vk_graph_alias_f32(const float* in, float* out, long n) {
     if (n <= 0 || !in || !out) return 0;
+    if (graph_domain_enforced && in != out)
+        return vk_graph_copy_f32(in, out, n);
     size_t bytes = (size_t)n * sizeof(float);
     VkTensorSlot* src = graph_ensure_device(in, bytes, 0);
     if (!src) return 0;
     VkTensorSlot* dst = graph_output_slot(out, bytes);
     if (!dst) return 0;
+    if (dst == src) {
+        graph_mark_device(dst);
+        return 1;
+    }
+    if (dst->owns_range && dst->capacity &&
+        !vk_graph_range_free(dst->offset, dst->capacity)) return 0;
     dst->offset = src->offset;
     dst->bytes = bytes;
+    dst->capacity = src->capacity;
+    dst->capacity_generation = src->capacity_generation;
+    dst->owns_range = 0;
     graph_mark_device(dst);
     return 1;
 }
@@ -2383,6 +3365,116 @@ int vk_graph_embedding_f32(const int32_t* tokens, const float* weight, float* ou
     return 1;
 }
 
+/* Routed expert linear. `experts` counts the staged rows of a possibly
+ * partially resident bank; route indices stay in global slot space and the
+ * shader maps them through slot_rows when slot_domain is non-zero. */
+int vk_graph_moe_linear_f32(const float* input, const float* expert_weight,
+                            const float* expert_bias, const float* route_indices,
+                            const float* route_weights, float* out, int rows,
+                            int d_in, int d_out, int experts, int top_k,
+                            const uint32_t* slot_rows, uint32_t slot_domain) {
+    if (rows <= 0 || d_in <= 0 || d_out <= 0 || experts <= 0 || top_k <= 0 ||
+        !input || !expert_weight || !route_indices || !route_weights || !out) return 0;
+    if (slot_rows ? (slot_domain < (uint32_t)experts ||
+                     (uint32_t)top_k > slot_domain)
+                  : top_k > experts) return 0;
+    size_t in_bytes = (size_t)rows * (size_t)d_in * sizeof(float);
+    size_t w_bytes = (size_t)experts * (size_t)d_in * (size_t)d_out * sizeof(float);
+    size_t bias_bytes = (size_t)experts * (size_t)d_out * sizeof(float);
+    size_t route_bytes = (size_t)rows * (size_t)top_k * sizeof(float);
+    size_t out_bytes = (size_t)rows * (size_t)d_out * sizeof(float);
+    size_t slot_bytes = (size_t)(slot_domain ? slot_domain : 1u) * sizeof(uint32_t);
+    graph_scratch_begin();
+    VkTensorSlot* si = graph_ensure_device(input, in_bytes, 0);
+    VkTensorSlot* sw = graph_ensure_device(expert_weight, w_bytes, 1);
+    VkTensorSlot* sri = graph_ensure_device(route_indices, route_bytes, 0);
+    VkTensorSlot* srw = graph_ensure_device(route_weights, route_bytes, 0);
+    VkTensorSlot* so = graph_output_slot(out, out_bytes);
+    if (!si || !sw || !sri || !srw || !so) return 0;
+    /* The shader always binds a bias and a slot table; absent ones become
+     * scratch zeros so the descriptor set stays complete. */
+    size_t bias_off;
+    if (expert_bias) {
+        VkTensorSlot* sb = graph_ensure_device(expert_bias, bias_bytes, 1);
+        if (!sb) return 0;
+        bias_off = sb->offset;
+    } else {
+        bias_off = graph_scratch_zero(bias_bytes);
+        if (bias_off == SIZE_MAX) return 0;
+    }
+    size_t slot_off = slot_domain
+        ? graph_scratch_upload(slot_rows, slot_bytes)
+        : graph_scratch_zero(slot_bytes);
+    if (slot_off == SIZE_MAX) return 0;
+    uint32_t params[8] = {
+        (uint32_t)rows, (uint32_t)d_in, (uint32_t)d_out, (uint32_t)experts,
+        (uint32_t)top_k, expert_bias ? 1u : 0u, slot_domain, 0u,
+    };
+    size_t p_off = graph_scratch_upload(params, sizeof(params));
+    if (p_off == SIZE_MAX) return 0;
+    VkGraphBinding binds[8] = {
+        {si->offset, in_bytes}, {sw->offset, w_bytes}, {bias_off, bias_bytes},
+        {sri->offset, route_bytes}, {srw->offset, route_bytes},
+        {so->offset, out_bytes}, {p_off, sizeof(params)}, {slot_off, slot_bytes},
+    };
+    if (!vk_dispatch_kernel(&k_moe_linear, binds,
+                            ((uint32_t)d_out + 63u) / 64u, (uint32_t)rows, 1)) return 0;
+    graph_mark_device(so);
+    return 1;
+}
+
+/* Top-k expert routing. The router weight is [d_model, experts], so its expert
+ * axis is 1 and it is never a slot-indexed bank. */
+int vk_graph_moe_router_f32(const float* input, const float* weight,
+                            const float* bias, float* route_indices,
+                            float* route_weights, int rows, int d_model,
+                            int experts, int top_k, float temperature,
+                            int normalize) {
+    if (rows <= 0 || d_model <= 0 || experts <= 0 || top_k <= 0 ||
+        top_k > experts || top_k > 8 || !(temperature > 0.0f) ||
+        !input || !weight || !route_indices || !route_weights) return 0;
+    size_t in_bytes = (size_t)rows * (size_t)d_model * sizeof(float);
+    size_t w_bytes = (size_t)d_model * (size_t)experts * sizeof(float);
+    size_t bias_bytes = (size_t)experts * sizeof(float);
+    size_t route_bytes = (size_t)rows * (size_t)top_k * sizeof(float);
+    graph_scratch_begin();
+    VkTensorSlot* si = graph_ensure_device(input, in_bytes, 0);
+    VkTensorSlot* sw = graph_ensure_device(weight, w_bytes, 1);
+    VkTensorSlot* sidx = graph_output_slot(route_indices, route_bytes);
+    VkTensorSlot* srw = graph_output_slot(route_weights, route_bytes);
+    if (!si || !sw || !sidx || !srw) return 0;
+    size_t bias_off;
+    if (bias) {
+        VkTensorSlot* sb = graph_ensure_device(bias, bias_bytes, 1);
+        if (!sb) return 0;
+        bias_off = sb->offset;
+    } else {
+        bias_off = graph_scratch_zero(bias_bytes);
+        if (bias_off == SIZE_MAX) return 0;
+    }
+    uint32_t params[8];
+    params[0] = (uint32_t)rows;
+    params[1] = (uint32_t)d_model;
+    params[2] = (uint32_t)experts;
+    params[3] = (uint32_t)top_k;
+    params[4] = normalize ? 1u : 0u;
+    params[5] = bias ? 1u : 0u;
+    memcpy(&params[6], &temperature, sizeof(float));
+    params[7] = 0u;
+    size_t p_off = graph_scratch_upload(params, sizeof(params));
+    if (p_off == SIZE_MAX) return 0;
+    VkGraphBinding binds[6] = {
+        {si->offset, in_bytes}, {sw->offset, w_bytes}, {bias_off, bias_bytes},
+        {sidx->offset, route_bytes}, {srw->offset, route_bytes},
+        {p_off, sizeof(params)},
+    };
+    if (!vk_dispatch_kernel(&k_moe_router, binds,
+                            ((uint32_t)rows + 63u) / 64u, 1, 1)) return 0;
+    graph_mark_device(sidx);
+    graph_mark_device(srw);
+    return 1;
+}
+
 int vk_graph_transpose_f32(const float* in, float* out, const int* in_shape,
                            const int* perm, int rank) {
     if (rank <= 0 || rank > 8 || !in || !out || !in_shape || !perm) return 0;
@@ -2586,6 +3678,50 @@ int vk_graph_expand_f32(const float* in, float* out, const int* in_shape, int in
             &k_expand, binds, (plan.output_elements + 63u) / 64u, 1u, 1u))
         return 0;
     graph_mark_device(dst);
+    return 1;
+}
+
+int vk_graph_expand_32(const void* in, void* out, const int* in_shape,
+                       int in_rank, const int* out_shape, int out_rank) {
+    /* expand.wgsl copies u32 words, so the F32 host path is also the exact
+     * bit-preserving I32 implementation. */
+    return vk_graph_expand_f32(
+        (const float*)in, (float*)out,
+        in_shape, in_rank, out_shape, out_rank);
+}
+
+int vk_graph_batch_matmul_f32(
+        const float* a, const int* a_shape, int a_rank,
+        const float* b, const int* b_shape, int b_rank,
+        float* output, const int* output_shape, int output_rank) {
+    VxBatchMatMulF32Plan plan;
+    size_t metadata_bytes;
+    size_t metadata_offset;
+    if (!vx_batch_matmul_f32_plan(
+            a, a_shape, a_rank, b, b_shape, b_rank,
+            output, output_shape, output_rank, &plan))
+        return 0;
+    metadata_bytes = (size_t)plan.metadata_words * sizeof(uint32_t);
+    graph_scratch_begin();
+    VkTensorSlot* a_slot = graph_ensure_device(a, plan.a_bytes, 0);
+    VkTensorSlot* b_slot = graph_ensure_device(b, plan.b_bytes, 0);
+    VkTensorSlot* output_slot =
+        graph_output_slot(output, plan.output_bytes);
+    if (!a_slot || !b_slot || !output_slot) return 0;
+    metadata_offset = graph_scratch_upload(plan.metadata, metadata_bytes);
+    if (metadata_offset == SIZE_MAX) return 0;
+    VkGraphBinding bindings[4] = {
+        {a_slot->offset, plan.a_bytes},
+        {b_slot->offset, plan.b_bytes},
+        {output_slot->offset, plan.output_bytes},
+        {metadata_offset, metadata_bytes},
+    };
+    if (!vk_dispatch_kernel(
+            &k_batch_matmul, bindings,
+            (plan.n + 7u) / 8u, (plan.m + 7u) / 8u,
+            plan.output_batches))
+        return 0;
+    graph_mark_device(output_slot);
     return 1;
 }
 
@@ -3240,10 +4376,13 @@ int vk_graph_qlinear_i8u8(const void* input, const void* weight,
         dispatched = vk_dispatch_kernel(dot_kernel, binds,
                                         groups_x, groups_y, 1u);
         if (!dispatched) vk_disable_packed_dot_after_failure(dot_kernel->name);
+        else vk_context_current()->qlinear_dot_dispatches++;
     }
     if (!dispatched) {
         VkKernel* kernel = tiled ? &k_qlinear_int8_tiled : &k_qlinear_int8;
         if (!vk_dispatch_kernel(kernel, binds, groups_x, groups_y, 1u)) return 0;
+        if (tiled) vk_context_current()->qlinear_tiled_dispatches++;
+        else vk_context_current()->qlinear_scalar_dispatches++;
     }
     graph_mark_device(dst);
     return 1;
@@ -3927,10 +5066,21 @@ int vk_graph_qbatch_matmul_i8u8(
     };
     uint32_t packed_words =
         (uint32_t)(output_packed_bytes / sizeof(uint32_t));
-    if (!vk_dispatch_kernel(
-            &k_qbatch_matmul_i8u8, binds,
-            (packed_words + 63u) / 64u, 1u, 1u))
+    int dispatched = 0;
+    uint32_t groups = (packed_words + 63u) / 64u;
+    if (vk_packed_dot_enabled()) {
+        dispatched = vk_dispatch_kernel(
+            &k_qbatch_matmul_i8u8_dot, binds, groups, 1u, 1u);
+        if (!dispatched) {
+            vk_disable_packed_dot_after_failure(
+                k_qbatch_matmul_i8u8_dot.name);
+        }
+        else vk_context_current()->qbatch_dot_dispatches++;
+    }
+    if (!dispatched && !vk_dispatch_kernel(
+            &k_qbatch_matmul_i8u8, binds, groups, 1u, 1u))
         return 0;
+    if (!dispatched) vk_context_current()->qbatch_scalar_dispatches++;
     graph_mark_device(output_slot);
     return 1;
 }
@@ -4068,8 +5218,17 @@ int vk_graph_qgroupnorm_i8u8(const void* input, const float* weight,
     VkTensorSlot* bias_slot = graph_ensure_device(bias, affine_bytes, 1);
     VkTensorSlot* output_slot = graph_output_packed_bytes(output, logical_bytes);
     if (!input_slot || !weight_slot || !bias_slot || !output_slot) return 0;
-    size_t stats_offset = graph_scratch_alloc(stats_bytes);
-    if (stats_offset == SIZE_MAX) return 0;
+    VulkanContextState* context = vk_context_current();
+    size_t stats_offset;
+    if (context && context->domain_enforced) {
+        if (!context->domain_qgroupnorm_stats_bytes ||
+            stats_bytes > context->domain_qgroupnorm_stats_bytes)
+            return 0;
+        stats_offset = context->domain_qgroupnorm_stats_offset;
+    } else {
+        stats_offset = graph_scratch_alloc(stats_bytes);
+        if (stats_offset == SIZE_MAX) return 0;
+    }
     VkQGroupNormParams params = {
         batch, height, width, channels, groups,
         input_dtype,
@@ -4122,8 +5281,17 @@ int vk_graph_qlayernorm_i8u8(const void* input, const float* weight,
     VkTensorSlot* bias_slot = graph_ensure_device(bias, affine_bytes, 1);
     VkTensorSlot* output_slot = graph_output_packed_bytes(output, logical_bytes);
     if (!input_slot || !weight_slot || !bias_slot || !output_slot) return 0;
-    size_t stats_offset = graph_scratch_alloc(stats_bytes);
-    if (stats_offset == SIZE_MAX) return 0;
+    VulkanContextState* context = vk_context_current();
+    size_t stats_offset;
+    if (context && context->domain_enforced) {
+        if (!context->domain_qlayernorm_stats_bytes ||
+            stats_bytes > context->domain_qlayernorm_stats_bytes)
+            return 0;
+        stats_offset = context->domain_qlayernorm_stats_offset;
+    } else {
+        stats_offset = graph_scratch_alloc(stats_bytes);
+        if (stats_offset == SIZE_MAX) return 0;
+    }
     VkQLayerNormParams params = {
         rows, d_model, input_dtype,
         output_dtype,
@@ -4356,7 +5524,11 @@ static const int32_t* qconv_zero_bias_get(uint32_t output_channels) {
         (size_t)output_channels > SIZE_MAX / sizeof(int32_t)) return NULL;
     for (QConvZeroBiasBacking* block = qconv_zero_bias_backings; block;
          block = block->next) {
-        if (block->elements >= output_channels) return block->values;
+        /* A graph weight slot records the exact readable byte range retained
+         * at domain bind. Distinct channel widths therefore need distinct
+         * durable keys; reusing a larger block for a later smaller node would
+         * shrink that slot and make the earlier node invalid after bind. */
+        if (block->elements == output_channels) return block->values;
     }
     QConvZeroBiasBacking* block = (QConvZeroBiasBacking*)calloc(1, sizeof(*block));
     if (!block) return NULL;
@@ -4565,9 +5737,16 @@ int vk_graph_qconv2d_i8u8(const void* input, const void* weight,
         {params_offset, sizeof(params)}
     };
     uint32_t packed_words = (uint32_t)(packed_output_bytes / sizeof(uint32_t));
+    const uint64_t reduction_size =
+        (uint64_t)kernel_height * kernel_width * input_per_group;
+    const int dot_tiled = groups == 1u &&
+        (output_channels & 3u) == 0u &&
+        vk_workgroup_shape_supported(8u, 4u, 1u);
+    const int tiled = groups == 1u && output_channels >= 32u &&
+        reduction_size >= 16u && (output_channels & 3u) == 0u &&
+        vk_workgroup_shape_supported(8u, 4u, 1u);
     int dispatched = 0;
-    if (vk_packed_dot_enabled() && groups == 1u &&
-        (output_channels & 3u) == 0u) {
+    if (vk_packed_dot_enabled() && dot_tiled) {
         const uint32_t spatial = batch * output_height * output_width;
         const uint32_t output_words_per_spatial = output_channels / 4u;
         const uint32_t groups_x = (output_words_per_spatial + 7u) / 8u;
@@ -4577,10 +5756,25 @@ int vk_graph_qconv2d_i8u8(const void* input, const void* weight,
         if (!dispatched) {
             vk_disable_packed_dot_after_failure(k_qconv2d_int8_dot_tiled.name);
         }
+        else {
+            vk_context_current()->qconv_dot_tiled_dispatches++;
+        }
+    }
+    if (!dispatched && tiled) {
+        const uint32_t spatial = batch * output_height * output_width;
+        const uint32_t output_words_per_spatial = output_channels / 4u;
+        dispatched = vk_dispatch_kernel(
+            &k_qconv2d_int8_tiled, binds,
+            (output_words_per_spatial + 7u) / 8u,
+            (spatial + 3u) / 4u, 1u);
+        if (dispatched)
+            vk_context_current()->qconv_tiled_dispatches++;
     }
     if (!dispatched && !vk_dispatch_kernel(&k_qconv2d_int8, binds,
                                             (packed_words + 63u) / 64u,
                                             1u, 1u)) return 0;
+    if (!dispatched)
+        vk_context_current()->qconv_scalar_dispatches++;
     graph_mark_device(output_slot);
     return 1;
 }
@@ -5249,18 +6443,7 @@ int vk_graph_conv2d_f32(const float* in, float* out, const float* w, const float
     };
     VkKernel* kernel = &k_conv2d;
     uint32_t gz = (uint32_t)(n * out_c);
-    if (groups == 1 && c == 3 && (out_c & 15) == 0) {
-        kernel = &k_conv2d_c3out16;
-        gz = (uint32_t)(n * (out_c / 16));
-    } else if (groups == c && out_c == c) {
-        if ((out_c & 7) == 0) {
-            kernel = &k_conv2d_dw8;
-            gz = (uint32_t)(n * ((out_c + 7) / 8));
-        } else if ((out_c & 3) == 0) {
-            kernel = &k_conv2d_dw4;
-            gz = (uint32_t)(n * ((out_c + 3) / 4));
-        }
-    } else if (groups == 1 && kh == 1 && kw == 1 && sy == 1 && sx == 1 &&
+    if (groups == 1 && kh == 1 && kw == 1 && sy == 1 && sx == 1 &&
         pt == 0 && pl == 0 && dy == 1 && dx == 1 && out_h == h && out_w == width) {
         if ((out_c & 15) == 0) {
             kernel = &k_conv2d_pw16tile;
@@ -5275,27 +6458,51 @@ int vk_graph_conv2d_f32(const float* in, float* out, const float* w, const float
             kernel = &k_conv2d_pw8;
             gz = (uint32_t)(n * ((out_c + 7) / 8));
         }
+    } else if (groups == 1 && (out_c & 15) == 0 &&
+        vk_workgroup_shape_supported(8u, 8u, 1u)) {
+        kernel = c == 3 ? &k_conv2d_c3out16 : &k_conv2d_out16;
+        gz = (uint32_t)(n * (out_c / 16));
+    } else if (groups == c && out_c == c) {
+        if ((out_c & 7) == 0) {
+            kernel = &k_conv2d_dw8;
+            gz = (uint32_t)(n * ((out_c + 7) / 8));
+        } else if ((out_c & 3) == 0) {
+            kernel = &k_conv2d_dw4;
+            gz = (uint32_t)(n * ((out_c + 3) / 4));
+        }
     }
+#if defined(VOLVOXAI_VULKAN_TESTING)
+    if (kernel == &k_conv2d_pw16tile || kernel == &k_conv2d_pw16 ||
+        kernel == &k_conv2d_pw8v4 || kernel == &k_conv2d_pw8v2 ||
+        kernel == &k_conv2d_pw8) {
+        vk_context_current()->test_conv_pointwise_selections++;
+    }
+#endif
     uint32_t gx = ((uint32_t)out_w + 7u) / 8u;
     uint32_t gy = ((uint32_t)out_h + 7u) / 8u;
     int ok = vk_dispatch_kernel(kernel, binds, gx, gy, gz);
+    if (ok && (kernel == &k_conv2d_out16 || kernel == &k_conv2d_c3out16))
+        vk_context_current()->conv_out16_dispatches++;
+    else if (ok && kernel == &k_conv2d)
+        vk_context_current()->conv_scalar_dispatches++;
     if (!ok && kernel != &k_conv2d) {
+        if (kernel == &k_conv2d_out16 || kernel == &k_conv2d_c3out16)
+            ok = vk_dispatch_kernel(&k_conv2d, binds, gx, gy,
+                                    (uint32_t)(n * out_c));
         if (kernel == &k_conv2d_pw16tile) ok = vk_dispatch_kernel(&k_conv2d_pw16, binds, gx, gy, (uint32_t)(n * (out_c / 16)));
         if (!ok && kernel == &k_conv2d_dw8 && (out_c & 3) == 0) ok = vk_dispatch_kernel(&k_conv2d_dw4, binds, gx, gy, (uint32_t)(n * ((out_c + 3) / 4)));
         if (!ok && (kernel == &k_conv2d_pw8v4 || kernel == &k_conv2d_pw8v2)) {
             ok = vk_dispatch_kernel(&k_conv2d_pw8, binds, gx, gy, (uint32_t)(n * ((out_c + 7) / 8)));
         }
         if (!ok) ok = vk_dispatch_kernel(&k_conv2d, binds, gx, gy, (uint32_t)(n * out_c));
+        if (ok && kernel != &k_conv2d)
+            vk_context_current()->conv_scalar_dispatches++;
     }
     if (!ok) return 0;
     graph_mark_device(dst);
     return 1;
 }
 
-// Weights are constant across rows, so each transposed matrix is uploaded into a
-// RESIDENT region exactly once instead of being copied per dispatch.
-// linearF32.wgsl reads weight[col*d_in + k] (layout [d_out,d_in]);
-// the exported weight is [d_in, d_out], so we transpose straight into GPU memory.
 static int checked_float_matrix_bytes(int rows, int columns, size_t* bytes) {
     size_t elements;
     if (!bytes || rows <= 0 || columns <= 0 ||
@@ -5320,6 +6527,96 @@ static int checked_align_size(size_t value, size_t alignment, size_t* output) {
     return 1;
 }
 
+int vk_graph_linear_f32(const float* input, const float* weight,
+                        const float* bias, float* output, int rows,
+                        int d_in, int d_out, int output_major_weight) {
+    size_t input_bytes;
+    size_t weight_bytes;
+    size_t bias_bytes;
+    size_t output_bytes;
+    const float* bound_bias;
+    VkTensorSlot* input_slot;
+    VkTensorSlot* weight_slot;
+    VkTensorSlot* bias_slot;
+    VkTensorSlot* output_slot;
+    VkTensorSlot* scale_slot = NULL;
+    size_t params_offset;
+    uint32_t params[3];
+    uint32_t groups_x;
+    uint32_t groups_y;
+    int tiled;
+    int ok;
+    if (!input || !weight || !output || rows <= 0 || d_in <= 0 ||
+        d_out <= 0 || (output_major_weight != 0 &&
+                       output_major_weight != 1) ||
+        !checked_float_matrix_bytes(rows, d_in, &input_bytes) ||
+        !checked_float_matrix_bytes(d_in, d_out, &weight_bytes) ||
+        !checked_float_matrix_bytes(1, d_out, &bias_bytes) ||
+        !checked_float_matrix_bytes(rows, d_out, &output_bytes) ||
+        qsdpa_ranges_overlap(output, output_bytes, input, input_bytes) ||
+        qsdpa_ranges_overlap(output, output_bytes, weight, weight_bytes) ||
+        (bias && qsdpa_ranges_overlap(
+            output, output_bytes, bias, bias_bytes)))
+        return 0;
+    bound_bias = bias ? bias :
+        (const float*)qconv_zero_bias_get((uint32_t)d_out);
+    if (!bound_bias) return 0;
+
+    graph_scratch_begin();
+    input_slot = graph_ensure_device(input, input_bytes, 0);
+    weight_slot = graph_ensure_device(weight, weight_bytes, 1);
+    bias_slot = graph_ensure_device(bound_bias, bias_bytes, 1);
+    output_slot = graph_output_slot(output, output_bytes);
+    if (!input_slot || !weight_slot || !bias_slot || !output_slot)
+        return 0;
+    if (output_major_weight) {
+        scale_slot = graph_ensure_device(
+            linear_dummy_scale, sizeof(linear_dummy_scale), 1);
+        if (!scale_slot) return 0;
+    }
+    params[0] = (uint32_t)rows;
+    params[1] = (uint32_t)d_in;
+    params[2] = (uint32_t)d_out;
+    params_offset = graph_scratch_upload(params, sizeof(params));
+    if (params_offset == SIZE_MAX) return 0;
+
+    tiled = rows > 1 && d_in >= 16 && d_out >= 16;
+    groups_x = tiled ? ((uint32_t)d_out + 15u) / 16u
+                     : ((uint32_t)d_out + 63u) / 64u;
+    groups_y = tiled ? ((uint32_t)rows + 15u) / 16u
+                     : (uint32_t)rows;
+    if (output_major_weight) {
+        VkGraphBinding bindings[6] = {
+            {input_slot->offset, input_bytes},
+            {weight_slot->offset, weight_bytes},
+            {scale_slot->offset, sizeof(linear_dummy_scale)},
+            {bias_slot->offset, bias_bytes},
+            {output_slot->offset, output_bytes},
+            {params_offset, sizeof(params)},
+        };
+        ok = vk_dispatch_kernel(
+            tiled ? &k_linear_out_in_tiled : &k_linear_out_in,
+            bindings, groups_x, groups_y, 1u);
+    } else {
+        VkGraphBinding bindings[5] = {
+            {input_slot->offset, input_bytes},
+            {weight_slot->offset, weight_bytes},
+            {bias_slot->offset, bias_bytes},
+            {output_slot->offset, output_bytes},
+            {params_offset, sizeof(params)},
+        };
+        ok = vk_dispatch_kernel(
+            tiled ? &k_linear_in_out_tiled : &k_linear_in_out,
+            bindings, groups_x, groups_y, 1u);
+    }
+    if (!ok) return 0;
+    graph_mark_device(output_slot);
+    return 1;
+}
+
+/* Legacy one-shot Linear transposes each constant exported [d_in,d_out]
+ * matrix into a resident [d_out,d_in] region once.  The graph route above
+ * preserves the declared layout and selects the matching shader instead. */
 static int upload_weight(const float* w, int d_in, int d_out, size_t weight_bytes,
                          size_t* output_offset) {
     size_t off;

@@ -46,7 +46,7 @@ function makeTrainer(node, tensors) {
   const device = mockDevice();
   const gpuBuffers = new Map(tensors.map((value) => [value.name, { tensor: value.name }]));
   const graph = { nodes: [node] };
-  return new DispatchRecorder(device, graph, { gpuBuffers, _dinWeights: new Map() });
+  return new DispatchRecorder(device, graph, { gpuBuffers });
 }
 
 function entry(dispatch, binding) {

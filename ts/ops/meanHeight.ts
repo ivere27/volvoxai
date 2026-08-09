@@ -1,8 +1,9 @@
-export function _cpuMeanHeight(node) {
+import { visionProfileKernelDescriptor } from './visionProfileKernel.js';
 
-    const input = node.inputs.input;
-    const output = node.outputs.out;
-    const [n, h, w, c] = input.shape;
+export function _cpuMeanHeight(node) {
+    const { input, output, n, h, w, c } = visionProfileKernelDescriptor(
+      node, 'MeanHeight', 'mean-height',
+    );
     const inBuf = input.buffer;
     const outBuf = output.buffer;
     for (let batch = 0; batch < n; batch++) {

@@ -26,7 +26,8 @@ The Graph root has the exact discriminator:
 
 ~~~json
 {
-  "format": "volvox-graph/v1"
+  "format": "volvox-graph/v1",
+  "dimensions": {}
 }
 ~~~
 
@@ -146,28 +147,29 @@ in-flight work never alias.
 ~~~c
 VxContextOptions context_options = VX_CONTEXT_OPTIONS_INIT;
 VxExecutionContext* context = NULL;
+VxTensorBinding input = VX_TENSOR_BINDING_INIT;
 
 status = vx_compiled_model_create_context(
     compiled, &context_options, &context, &report);
 
-if (status == VX_STATUS_OK) {
-    status = vx_execution_context_set_input(
-        context,
-        "input",
-        VX_DTYPE_F32,
-        input_values,
-        input_bytes,
-        &report);
-}
+input.name = "input";
+input.dtype = VX_DTYPE_F32;
+input.rank = 2;
+input.shape[0] = batch;
+input.shape[1] = sequence;
+input.data = input_values;
+input.byte_size = input_bytes;
+input.location = VX_MEMORY_HOST;
 
 VxResult* result = NULL;
 if (status == VX_STATUS_OK) {
-    status = vx_execution_context_execute(context, &result, &report);
+    status = vx_execution_context_execute(
+        context, &input, 1, &result, &report);
 }
 ~~~
 
-Use vx_execution_context_input_count and vx_execution_context_input_info to inspect declared inputs.
-set_input rejects a name, dtype, or byte count that disagrees with the Graph.
+Use vx_execution_context_input_count and vx_execution_context_input_spec to inspect declared inputs.
+Execution rejects a binding name, dtype, shape, or byte count that disagrees with the Graph.
 
 Execution publishes every declared output exactly once. It does not expose mutable intermediate
 tensors or a borrowed workspace pointer.
@@ -225,16 +227,18 @@ VxBackendProvider provider = {
     .abi_version = VX_BACKEND_ABI_VERSION,
     .name = "my-npu",
     .user_data = &driver,
+    .shape_domain = VX_BACKEND_SHAPE_DOMAIN_CAPABILITY_INIT,
     .runtime_create = provider_runtime_create,
     .runtime_destroy = provider_runtime_destroy,
     .compile = provider_compile,
     .compiled_destroy = provider_compiled_destroy,
     .context_create = provider_context_create,
-    .context_set_input = provider_context_set_input,
     .context_execute = provider_context_execute,
     .context_close = provider_context_close,
     .context_destroy = provider_context_destroy,
 };
+
+provider.shape_domain.support = VX_BACKEND_SHAPE_DOMAIN_FULL;
 
 VxStatus registration =
     vx_runtime_register_provider(runtime, &provider, &report);

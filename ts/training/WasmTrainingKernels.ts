@@ -1,5 +1,5 @@
 import { Tensor } from '../core/Tensor.js';
-import type { Graph } from '../core/Graph.js';
+import type { RuntimeGraph } from '../core/RuntimeGraph.js';
 import type { RuntimeTypedArray } from '../types.js';
 import type { CrossEntropyLossDescriptor } from './TrainingLosses.js';
 import type {
@@ -13,6 +13,19 @@ import {
   attentionDropoutProbability,
 } from '../ops/attentionDropout.js';
 import { DataType, runtimeDTypes } from '../generated/volvoxaiEnums.js';
+import {
+  checkedWindowOutput,
+  fullSpatialPads,
+  spatialPair,
+} from '../ops/spatialKernelValidation.js';
+import {
+  BackendPlanCache,
+  backendPlanCacheKey,
+  concreteTrainingSignatures,
+  trainingGraphTopologyIdentity,
+  type BackendPlanCacheInspection,
+  type BackendPlanCacheOptions,
+} from './BackendPlanCache.js';
 
 const ABI_VERSION = 1;
 const CAPABILITIES = Object.freeze({
@@ -60,7 +73,7 @@ export type WasmTrainingApi = Record<string, any> & {
 export interface WasmTrainingSourceEngine {
   wasmModule?: { module?: WebAssembly.Module };
   api: WasmTrainingApi;
-  graph?: Graph | null;
+  graph?: RuntimeGraph | null;
   compiledWeightRevision?: number;
 }
 
@@ -76,6 +89,29 @@ interface WasmKernelPlan {
   kind: string;
   node: any;
   [name: string]: any;
+}
+
+interface DetachedWasmPlanRecord {
+  readonly [name: string]: DetachedWasmPlanValue;
+}
+
+type DetachedWasmPlanValue = undefined | null | boolean | number | string |
+  readonly DetachedWasmPlanValue[] | DetachedWasmPlanRecord;
+
+interface DetachedWasmKernelPlan {
+  readonly nodeIndex: number;
+  readonly nodeId: string | number;
+  readonly opType: string;
+  readonly properties: Readonly<Record<string, DetachedWasmPlanValue>>;
+}
+
+interface WasmKernelPlanRecipe {
+  readonly shapeSignature: string;
+  readonly tacticSignature: string;
+  readonly topologyIdentity: string;
+  readonly concreteDescriptorIdentity: string;
+  readonly plans: readonly DetachedWasmKernelPlan[];
+  readonly metadataBytes: number;
 }
 
 const ACTIVATION_KIND = Object.freeze({
@@ -151,6 +187,8 @@ const TRAINING_EXPORTS = Object.freeze([
   'volvoxai_training_moe_router_backward_f32',
   'volvoxai_training_moe_linear_f32',
   'volvoxai_training_moe_linear_backward_f32',
+  'volvoxai_training_moe_linear_banked_f32',
+  'volvoxai_training_moe_linear_backward_banked_f32',
   'volvoxai_training_binary_broadcast_f32',
   'volvoxai_training_binary_broadcast_backward_f32',
   'volvoxai_training_where_f32',
@@ -399,6 +437,149 @@ function apiResult(value, label) {
   if (Number(value) !== 1) throw new Error(`WASM training ${label} rejected its arguments.`);
 }
 
+const PLAN_UTF8_ENCODER = new TextEncoder();
+const TENSOR_REFERENCE_KEY = '$volvoxTrainingTensor';
+
+function wasmConcreteDescriptorIdentity(graph: RuntimeGraph): string {
+  return JSON.stringify([...graph.tensors.values()]
+    .sort((left, right) => left.name.localeCompare(right.name))
+    .map((tensor) => ({
+      name: tensor.name,
+      dtype: tensor.dtype,
+      shape: tensor.shape,
+      sizeBytes: tensor.sizeBytes,
+      kind: tensor.isWeight ? 'weight' : tensor.isInput ? 'input' : 'activation',
+    })));
+}
+
+function validateWasmConcreteStorage(graph: RuntimeGraph): void {
+  const staticTypedWeights: any[] = [];
+  for (const tensor of graph.tensors.values()) {
+    if (!RUNTIME_DTYPES.has(tensor.dtype)) {
+      throw new Error(`WASM training tensor '${tensor.name}' has unsupported dtype '${tensor.dtype}'.`);
+    }
+    if (tensor.sizeBytes <= 0 || tensor.sizeBytes > MAX_ALLOCATION_BYTES) {
+      throw new Error(`WASM training tensor '${tensor.name}' has an unsupported allocation size.`);
+    }
+    if (tensor.isWeight) {
+      if (tensor.dtype === 'float32') requireFloatStorage(tensor, `weight '${tensor.name}'`);
+      else {
+        requireTypedStorage(tensor, `static typed weight '${tensor.name}'`);
+        staticTypedWeights.push(tensor);
+      }
+    }
+  }
+  for (const tensor of staticTypedWeights) {
+    const uses = graph.nodes.filter((node) => Object.values(node.inputs || {}).includes(tensor));
+    if (!uses.length || !uses.every((node) => allowsStaticTypedWeight(node, tensor))) {
+      throw new Error(
+        `WASM training non-F32 weight '${tensor.name}' is only allowed as a static Cast or DequantizeLinear input/zero point.`,
+      );
+    }
+  }
+}
+
+function detachWasmPlanValue(
+  value: any,
+  tensorNames: ReadonlyMap<object, string>,
+): DetachedWasmPlanValue {
+  if (value == null || typeof value === 'boolean' || typeof value === 'number' ||
+      typeof value === 'string' || typeof value === 'undefined') return value;
+  const tensorName = tensorNames.get(value);
+  if (tensorName !== undefined) return Object.freeze({ [TENSOR_REFERENCE_KEY]: tensorName });
+  if (Array.isArray(value)) return Object.freeze(value.map((entry) =>
+    detachWasmPlanValue(entry, tensorNames)));
+  if (typeof value === 'object' && Object.getPrototypeOf(value) === Object.prototype) {
+    return Object.freeze(Object.fromEntries(Object.entries(value)
+      .sort(([left], [right]) => left.localeCompare(right))
+      .map(([name, entry]) => [name, detachWasmPlanValue(entry, tensorNames)])));
+  }
+  throw new Error('WASM training plan contains a non-detachable backend value.');
+}
+
+function attachWasmPlanValue(value: DetachedWasmPlanValue, graph: RuntimeGraph): any {
+  if (Array.isArray(value)) return value.map((entry) => attachWasmPlanValue(entry, graph));
+  if (value && typeof value === 'object') {
+    const record = value as Readonly<Record<string, DetachedWasmPlanValue>>;
+    if (Object.keys(record).length === 1 && typeof record[TENSOR_REFERENCE_KEY] === 'string') {
+      const tensor = graph.tensors.get(record[TENSOR_REFERENCE_KEY] as string);
+      if (!tensor) {
+        throw new Error(
+          `WASM cached plan references missing tensor '${String(record[TENSOR_REFERENCE_KEY])}'.`,
+        );
+      }
+      return tensor;
+    }
+    return Object.fromEntries(Object.entries(record).map(([name, entry]) =>
+      [name, attachWasmPlanValue(entry, graph)]));
+  }
+  return value;
+}
+
+function detachWasmKernelPlan(
+  graph: RuntimeGraph,
+  plans: readonly WasmKernelPlan[],
+  shapeSignature: string,
+  tacticSignature: string,
+  topologyIdentity: string,
+): WasmKernelPlanRecipe {
+  const tensorNames = new Map<object, string>([...graph.tensors]
+    .map(([name, tensor]) => [tensor as object, name]));
+  const detached = plans.map((plan, nodeIndex) => {
+    const node = graph.nodes[nodeIndex];
+    if (plan.node !== node) {
+      throw new Error(`WASM training plan node ${nodeIndex} is not owned by its concrete graph.`);
+    }
+    const properties = Object.freeze(Object.fromEntries(Object.entries(plan)
+      .filter(([name]) => name !== 'node')
+      .sort(([left], [right]) => left.localeCompare(right))
+      .map(([name, value]) => [name, detachWasmPlanValue(value, tensorNames)])));
+    return Object.freeze({ nodeIndex, nodeId: node.id, opType: node.opType, properties });
+  });
+  const document = {
+    shapeSignature,
+    tacticSignature,
+    topologyIdentity,
+    concreteDescriptorIdentity: wasmConcreteDescriptorIdentity(graph),
+    plans: detached,
+  };
+  const metadataBytes = PLAN_UTF8_ENCODER.encode(JSON.stringify(document)).byteLength;
+  return Object.freeze({ ...document, plans: Object.freeze(detached), metadataBytes });
+}
+
+function attachWasmKernelPlan(
+  graph: RuntimeGraph,
+  recipe: WasmKernelPlanRecipe,
+): { readonly plan: WasmKernelPlan[]; readonly planByNode: Map<any, WasmKernelPlan> } {
+  if (recipe.topologyIdentity !== trainingGraphTopologyIdentity(graph)) {
+    throw new Error('WASM cached plan belongs to a different logical topology.');
+  }
+  if (recipe.concreteDescriptorIdentity !== wasmConcreteDescriptorIdentity(graph)) {
+    throw new Error(
+      'WASM cached plan concrete tensor descriptors do not match the supplied shape/tactic key.',
+    );
+  }
+  if (recipe.plans.length !== graph.nodes.length) {
+    throw new Error('WASM cached plan node count does not match its concrete graph.');
+  }
+  const plan: WasmKernelPlan[] = [];
+  const planByNode = new Map<any, WasmKernelPlan>();
+  for (const descriptor of recipe.plans) {
+    const node = graph.nodes[descriptor.nodeIndex];
+    if (!node || node.id !== descriptor.nodeId || node.opType !== descriptor.opType) {
+      throw new Error(`WASM cached plan node ${descriptor.nodeIndex} changed identity or operator.`);
+    }
+    const item = {
+      ...Object.fromEntries(Object.entries(descriptor.properties).map(([name, value]) =>
+        [name, attachWasmPlanValue(value, graph)])),
+      node,
+    } as WasmKernelPlan;
+    plan.push(item);
+    planByNode.set(node, item);
+  }
+  return { plan, planByNode };
+}
+
 /**
  * Strict JS orchestration around the freestanding full-profile WASM kernels.
  * The scratch instance never owns canonical graph state; values are copied in
@@ -409,12 +590,19 @@ export class WasmTrainingKernels {
   declare sourceEngine: WasmTrainingSourceEngine;
   declare api: WasmTrainingApi;
   declare memory: WebAssembly.Memory;
-  declare graph: Graph | null;
+  declare graph: RuntimeGraph | null;
   declare topologyRevision: number | null;
   declare plan: WasmKernelPlan[];
   declare planByNode: Map<any, WasmKernelPlan>;
+  readonly planCache: BackendPlanCache<WasmKernelPlanRecipe>;
+  declare topologyIdentity: string | null;
+  declare currentPlanKey: string | null;
+  declare currentConcreteDescriptorIdentity: string | null;
 
-  static async create(wasmEngine: WasmTrainingSourceEngine): Promise<WasmTrainingKernels> {
+  static async create(
+    wasmEngine: WasmTrainingSourceEngine,
+    cacheOptions: BackendPlanCacheOptions = {},
+  ): Promise<WasmTrainingKernels> {
     const module = wasmEngine?.wasmModule?.module;
     if (!(module instanceof WebAssembly.Module)) {
       throw new Error('WASM training requires an initialized WasmEngine backed by a WebAssembly.Module.');
@@ -423,7 +611,7 @@ export class WasmTrainingKernels {
     const instantiated: any = await WebAssembly.instantiate(module, wasmImports());
     const instance = instantiated?.instance || instantiated;
     this._validateApi(instance?.exports, 'scratch');
-    return new WasmTrainingKernels(wasmEngine, instance.exports);
+    return new WasmTrainingKernels(wasmEngine, instance.exports, cacheOptions);
   }
 
   static _validateApi(api: any, label: string): void {
@@ -447,7 +635,11 @@ export class WasmTrainingKernels {
     }
   }
 
-  constructor(sourceEngine: WasmTrainingSourceEngine, api: WasmTrainingApi) {
+  constructor(
+    sourceEngine: WasmTrainingSourceEngine,
+    api: WasmTrainingApi,
+    cacheOptions: BackendPlanCacheOptions = {},
+  ) {
     this.backend = 'wasm';
     this.sourceEngine = sourceEngine;
     this.api = api;
@@ -456,6 +648,10 @@ export class WasmTrainingKernels {
     this.topologyRevision = null;
     this.plan = [];
     this.planByNode = new Map();
+    this.planCache = new BackendPlanCache('wasm', cacheOptions);
+    this.topologyIdentity = null;
+    this.currentPlanKey = null;
+    this.currentConcreteDescriptorIdentity = null;
   }
 
   _requireExport(name: string): WasmTrainingFunction {
@@ -516,6 +712,28 @@ export class WasmTrainingKernels {
       throw new Error(`WASM training buffer '${name}' must be a non-empty Float32Array.`);
     }
     return { name, value, bytes: value.byteLength, ctor: Float32Array, read };
+  }
+
+  /** Global-slot -> staged-row table for a partially resident expert bank. */
+  _slotTableEntry(name: string, residentSlots: readonly number[]): WasmArenaEntry {
+    const domain = residentSlots[residentSlots.length - 1] + 1;
+    const rows = new Uint32Array(domain).fill(0xffffffff);
+    for (let row = 0; row < residentSlots.length; row++) rows[residentSlots[row]] = row;
+    return { name, value: rows, bytes: rows.byteLength, ctor: Uint32Array, read: false };
+  }
+
+  /** Upload a slot table onto the forward heap and return its pointer. */
+  _uploadSlotTable(residentSlots: readonly number[]): { pointer: number; domain: number } {
+    const domain = residentSlots[residentSlots.length - 1] + 1;
+    const rows = new Uint32Array(domain).fill(0xffffffff);
+    for (let row = 0; row < residentSlots.length; row++) rows[residentSlots[row]] = row;
+    const pointer = Number(this.api.alloc_bytes(rows.byteLength));
+    if (!Number.isSafeInteger(pointer) || pointer < 0) {
+      throw new Error('WASM training allocator returned an invalid slot-table pointer.');
+    }
+    this._ensureMemory(pointer + rows.byteLength);
+    new Uint32Array(this.memory.buffer, pointer, domain).set(rows);
+    return { pointer, domain };
   }
 
   _floatScratchEntry(name: string, elements: number): WasmArenaEntry {
@@ -649,44 +867,74 @@ export class WasmTrainingKernels {
     return outputs.output as Float32Array;
   }
 
-  async preflight(graph: Graph): Promise<void> {
+  async preflight(
+    graph: RuntimeGraph,
+    binding: { readonly shapeSignature?: string; readonly tacticSignature?: string } = {},
+  ): Promise<void> {
     if (!graph?.tensors || !Array.isArray(graph.nodes)) {
       throw new Error('WASM training requires a valid graph.');
     }
-    if (this.graph === graph && this.topologyRevision === graph.topologyRevision) return;
+    const signatures = concreteTrainingSignatures(graph, binding);
+    const key = backendPlanCacheKey(signatures.shapeSignature, signatures.tacticSignature);
+    validateWasmConcreteStorage(graph);
+    const concreteDescriptorIdentity = wasmConcreteDescriptorIdentity(graph);
+    if (this.graph === graph && this.topologyRevision === graph.topologyRevision &&
+        this.currentPlanKey === key &&
+        this.currentConcreteDescriptorIdentity === concreteDescriptorIdentity) return;
+    const topologyIdentity = trainingGraphTopologyIdentity(graph);
+    const topologyChanged = this.topologyIdentity !== null &&
+      this.topologyIdentity !== topologyIdentity;
+    const cached = topologyChanged ? null : this.planCache.peek(key);
+    let recipe = cached;
+    let builtPlan: WasmKernelPlan[] | null = null;
     const plan: WasmKernelPlan[] = [];
-    const byNode = new Map<any, WasmKernelPlan>();
-    const staticTypedWeights: any[] = [];
-    for (const tensor of graph.tensors.values()) {
-      if (!RUNTIME_DTYPES.has(tensor.dtype)) {
-        throw new Error(`WASM training tensor '${tensor.name}' has unsupported dtype '${tensor.dtype}'.`);
-      }
-      if (tensor.sizeBytes <= 0 || tensor.sizeBytes > MAX_ALLOCATION_BYTES) {
-        throw new Error(`WASM training tensor '${tensor.name}' has an unsupported allocation size.`);
-      }
-      if (tensor.isWeight) {
-        if (tensor.dtype === 'float32') requireFloatStorage(tensor, `weight '${tensor.name}'`);
-        else {
-          requireTypedStorage(tensor, `static typed weight '${tensor.name}'`);
-          staticTypedWeights.push(tensor);
-        }
-      }
+    if (!recipe) {
+      for (const node of graph.nodes) plan.push(this._planNode(node));
+      recipe = detachWasmKernelPlan(
+        graph,
+        plan,
+        signatures.shapeSignature,
+        signatures.tacticSignature,
+        topologyIdentity,
+      );
+      builtPlan = plan;
     }
-    for (const node of graph.nodes) {
-      const item = this._planNode(node);
-      plan.push(item);
-      byNode.set(node, item);
+
+    const materialized = builtPlan
+      ? { plan: builtPlan, planByNode: new Map(builtPlan.map((item) => [item.node, item])) }
+      : attachWasmKernelPlan(graph, recipe);
+    if (topologyChanged) this.planCache.invalidateTopology();
+    if (cached) {
+      this.planCache.recordHit(key);
+    } else {
+      this.planCache.recordMiss();
+      this.planCache.recordBuild();
+      this.planCache.publish(key, recipe, recipe.metadataBytes);
     }
-    for (const tensor of staticTypedWeights) {
-      const uses = graph.nodes.filter((node) => Object.values(node.inputs || {}).includes(tensor));
-      if (!uses.length || !uses.every((node) => allowsStaticTypedWeight(node, tensor))) {
-        throw new Error(`WASM training non-F32 weight '${tensor.name}' is only allowed as a static Cast or DequantizeLinear input/zero point.`);
-      }
-    }
+    this.planCache.recordMaterialization();
     this.graph = graph;
     this.topologyRevision = graph.topologyRevision;
-    this.plan = plan;
-    this.planByNode = byNode;
+    this.topologyIdentity = topologyIdentity;
+    this.currentPlanKey = key;
+    this.currentConcreteDescriptorIdentity = concreteDescriptorIdentity;
+    this.plan = materialized.plan;
+    this.planByNode = materialized.planByNode;
+  }
+
+  inspectPlanCache(): Readonly<BackendPlanCacheInspection> {
+    return this.planCache.inspect();
+  }
+
+  dispose(): void {
+    this.api.reset_heap();
+    this.graph = null;
+    this.topologyRevision = null;
+    this.topologyIdentity = null;
+    this.currentPlanKey = null;
+    this.currentConcreteDescriptorIdentity = null;
+    this.plan = [];
+    this.planByNode.clear();
+    this.planCache.clear();
   }
 
   _planNode(node: any): WasmKernelPlan {
@@ -800,11 +1048,24 @@ export class WasmTrainingKernels {
           (bias && elementCount(bias.shape) !== experts * dOut)) {
         throw new Error(`WASM training MoELinear node '${node.id}' has incompatible F32 expert or routing tensors.`);
       }
-      this._requireExport('volvoxai_training_moe_linear_f32');
-      this._requireExport('volvoxai_training_moe_linear_backward_f32');
+      // Routes stay global for a partially resident bank, so the banked
+      // entries are required whenever the node carries a slot table.
+      const residentSlots: readonly number[] | null = node.residentSlots || null;
+      if (residentSlots && residentSlots.length !== experts) {
+        throw new Error(
+          `WASM training MoELinear node '${node.id}' lists ${residentSlots.length} ` +
+          `resident slots but stages ${experts} experts.`);
+      }
+      if (residentSlots) {
+        this._requireExport('volvoxai_training_moe_linear_banked_f32');
+        this._requireExport('volvoxai_training_moe_linear_backward_banked_f32');
+      } else {
+        this._requireExport('volvoxai_training_moe_linear_f32');
+        this._requireExport('volvoxai_training_moe_linear_backward_f32');
+      }
       return {
         kind: 'moeLinear', node, x, expertWeight, bias, indices, gates, output: out,
-        rows, dIn, dOut, experts, topK,
+        rows, dIn, dOut, experts, topK, residentSlots,
       };
     }
 
@@ -1052,8 +1313,9 @@ export class WasmTrainingKernels {
       const out = requireTensor(output, 'float32', `Conv1D output at node '${node.id}'`);
       const bias = node.inputs.bias ? requireTensor(node.inputs.bias, 'float32', `Conv1D bias at node '${node.id}'`) : null;
       if (x.shape.length !== 3 || weight.shape.length !== 3 || out.shape.length !== 3) throw new Error(`WASM training Conv1D node '${node.id}' requires NCL rank-3 tensors.`);
-      const [batch, inChannels, inputLength] = x.shape, [outChannels, inputPerGroup, kernel] = weight.shape;
-      const [, outputChannels, outputLength] = out.shape;
+      // NLC activations [batch, l, c]; WIO weights [k, in_per_group, out_c].
+      const [batch, inputLength, inChannels] = x.shape, [kernel, inputPerGroup, outChannels] = weight.shape;
+      const [, outputLength, outputChannels] = out.shape;
       const groups = node.params?.groups ?? 1, stride = pair(node.params?.stride, 1)[0], padding = pair(node.params?.padding, 0)[0], relu = node.params?.relu ?? 0;
       if (out.shape[0] !== batch || outputChannels !== outChannels || !Number.isInteger(groups) || groups <= 0 ||
           inChannels % groups || outChannels % groups || inputPerGroup !== inChannels / groups ||
@@ -1067,7 +1329,8 @@ export class WasmTrainingKernels {
     if (op === 'ConvTranspose2D') {
       const x=requireTensor(input,'float32',`ConvTranspose2D input at node '${node.id}'`), weight=requireTensor(node.inputs.weight,'float32',`ConvTranspose2D weight at node '${node.id}'`), out=requireTensor(output,'float32',`ConvTranspose2D output at node '${node.id}'`), bias=node.inputs.bias?requireTensor(node.inputs.bias,'float32',`ConvTranspose2D bias at node '${node.id}'`):null;
       if(x.shape.length!==4||weight.shape.length!==4||out.shape.length!==4) throw new Error(`WASM training ConvTranspose2D node '${node.id}' requires rank-4 NHWC tensors.`);
-      const [batch,inHeight,inWidth,inChannels]=x.shape,[weightIn,outChannels,kernelY,kernelX]=weight.shape,[,outHeight,outWidth,outputChannels]=out.shape,[strideY,strideX]=pair(node.params?.stride,1),[padY,padX]=pair(node.params?.padding,0);
+      // HWIO weights [kh, kw, in_c, out_c].
+      const [batch,inHeight,inWidth,inChannels]=x.shape,[kernelY,kernelX,weightIn,outChannels]=weight.shape,[,outHeight,outWidth,outputChannels]=out.shape,[strideY,strideX]=pair(node.params?.stride,1),[padY,padX]=pair(node.params?.padding,0);
       if(weightIn!==inChannels||outputChannels!==outChannels||out.shape[0]!==batch||!Number.isInteger(strideY)||!Number.isInteger(strideX)||strideY<=0||strideX<=0||!Number.isInteger(padY)||!Number.isInteger(padX)||padY<0||padX<0||outHeight!==(inHeight-1)*strideY+kernelY-2*padY||outWidth!==(inWidth-1)*strideX+kernelX-2*padX||(bias&&elementCount(bias.shape)!==outChannels)) throw new Error(`WASM training ConvTranspose2D node '${node.id}' has incompatible dimensions or parameters.`);
       this._requireExport('volvoxai_training_conv_transpose2d_f32'); return {kind:'convtranspose2d',node,x,weight,bias,output:out,batch,inHeight,inWidth,inChannels,outHeight,outWidth,outChannels,kernelY,kernelX,strideY,strideX,padY,padX};
     }
@@ -1123,16 +1386,30 @@ export class WasmTrainingKernels {
     if (op === 'MaxPool2D' || op === 'AveragePool' || op === 'AveragePool2D') {
       const x = requireTensor(input, 'float32', `${op} input at node '${node.id}'`);
       const out = requireTensor(output, 'float32', `${op} output at node '${node.id}'`);
-      const [kernelY, kernelX] = pair(node.params?.kernel, 0);
-      const [strideY, strideX] = pair(node.params?.stride, 1);
-      const [padY, padX] = pair(node.params?.padding, 0);
-      if (x.shape.length !== 4 || out.shape.length !== 4 || x.shape[0] !== out.shape[0] || x.shape[3] !== out.shape[3] ||
-          ![kernelY, kernelX, strideY, strideX, padY, padX].every(Number.isInteger) || kernelY <= 0 || kernelX <= 0 || strideY <= 0 || strideX <= 0 || padY < 0 || padX < 0) {
+      if (x.shape.length !== 4 || out.shape.length !== 4 ||
+          x.shape[0] !== out.shape[0] || x.shape[3] !== out.shape[3]) {
         throw new Error(`WASM training ${op} node '${node.id}' requires valid NHWC pooling parameters.`);
+      }
+      const params = node.params || {};
+      const [kernelY, kernelX] = spatialPair(params.kernel, 1, op, 'kernel', false, true);
+      const [strideY, strideX] = spatialPair(params.stride, 1, op, 'stride', false);
+      const pads = fullSpatialPads(params, op, op !== 'MaxPool2D');
+      const outHeight = checkedWindowOutput(
+        x.shape[1], kernelY, strideY, pads[0], pads[2], 1,
+        `WASM training ${op} output height at node '${node.id}'`,
+      );
+      const outWidth = checkedWindowOutput(
+        x.shape[2], kernelX, strideX, pads[1], pads[3], 1,
+        `WASM training ${op} output width at node '${node.id}'`,
+      );
+      if (out.shape[1] !== outHeight || out.shape[2] !== outWidth) {
+        throw new Error(
+          `WASM training ${op} node '${node.id}' output shape is incompatible with its canonical pooling parameters.`,
+        );
       }
       if (op === 'MaxPool2D') this._requireExport('volvoxai_training_maxpool2d_f32');
       else this._requireExport('averagepool2d_f32');
-      return { kind: op === 'MaxPool2D' ? 'maxpool2d' : 'averagepool2d', node, x, output: out, batch: x.shape[0], height: x.shape[1], width: x.shape[2], channels: x.shape[3], outHeight: out.shape[1], outWidth: out.shape[2], kernelY, kernelX, strideY, strideX, padY, padX };
+      return { kind: op === 'MaxPool2D' ? 'maxpool2d' : 'averagepool2d', node, x, output: out, batch: x.shape[0], height: x.shape[1], width: x.shape[2], channels: x.shape[3], outHeight, outWidth, kernelY, kernelX, strideY, strideX, padY: pads[0], padX: pads[1] };
     }
 
     if (op === 'Resize' || op === 'ResizeNearest2D' || op === 'UpsampleNearest2D' || op === 'Upsample2x') {
@@ -1144,7 +1421,11 @@ export class WasmTrainingKernels {
           (out.shape[1] !== x.shape[1] * 2 || out.shape[2] !== x.shape[2] * 2)) {
         throw new Error(`WASM training ${op} node '${node.id}' requires exactly 2x spatial output.`);
       }
-      if (node.params?.mode && node.params.mode !== 'nearest' && node.params.mode !== 'bilinear') throw new Error(`WASM training ${op} node '${node.id}' only supports nearest or bilinear mode.`);
+      if (node.params?.mode && node.params.mode !== 'nearest' && node.params.mode !== 'linear') {
+        throw new Error(
+          `WASM training ${op} node '${node.id}' only supports nearest or linear mode.`,
+        );
+      }
       this._requireExport('volvoxai_training_resize2d_f32');
       return { kind: 'resize2d', node, x, output: out, batch: x.shape[0], inHeight: x.shape[1], inWidth: x.shape[2], channels: x.shape[3], outHeight: out.shape[1], outWidth: out.shape[2], nearest: mode };
     }
@@ -1375,7 +1656,7 @@ export class WasmTrainingKernels {
   }
 
   async forward(
-    graph: Graph,
+    graph: RuntimeGraph,
     inputs: Record<string, RuntimeTypedArray> = {},
     training: { dropout?: any } = {},
   ): Promise<void> {
@@ -1461,11 +1742,21 @@ export class WasmTrainingKernels {
             item.experts, item.topK, item.temperature, item.normalize ? 1 : 0,
           ), `MoERouter forward at node '${item.node.id}'`);
         } else if (item.kind === 'moeLinear') {
-          apiResult(this.api.volvoxai_training_moe_linear_f32(
-            pointer(item.x), pointer(item.expertWeight), item.bias ? pointer(item.bias) : 0,
-            pointer(item.indices), pointer(item.gates), pointer(item.output), item.rows,
-            item.dIn, item.dOut, item.experts, item.topK,
-          ), `MoELinear forward at node '${item.node.id}'`);
+          const slots = item.residentSlots;
+          if (!slots) {
+            apiResult(this.api.volvoxai_training_moe_linear_f32(
+              pointer(item.x), pointer(item.expertWeight), item.bias ? pointer(item.bias) : 0,
+              pointer(item.indices), pointer(item.gates), pointer(item.output), item.rows,
+              item.dIn, item.dOut, item.experts, item.topK,
+            ), `MoELinear forward at node '${item.node.id}'`);
+          } else {
+            const table = this._uploadSlotTable(slots);
+            apiResult(this.api.volvoxai_training_moe_linear_banked_f32(
+              pointer(item.x), pointer(item.expertWeight), item.bias ? pointer(item.bias) : 0,
+              pointer(item.indices), pointer(item.gates), pointer(item.output), item.rows,
+              item.dIn, item.dOut, item.experts, item.topK, table.pointer, table.domain,
+            ), `MoELinear forward at node '${item.node.id}'`);
+          }
         } else if (item.kind === 'sdpa') {
           const dropout = attentionDropoutDescriptor(item.node, item.probability, training?.dropout, index);
           apiResult(this.api.volvoxai_training_sdpa_f32(
@@ -1906,11 +2197,18 @@ export class WasmTrainingKernels {
         this._floatEntry('bias', requireFloatStorage(item.bias, `MoELinear expert bias at node '${node.id}'`)),
         this._floatEntry('db', db, true),
       );
-      const { value, outputs } = this._runArena(entries, (p) => this.api.volvoxai_training_moe_linear_backward_f32(
-        p.input, p.expertWeight, item.bias ? p.bias : 0, p.indices, p.gates, p.dy,
-        p.dx, p.dw, db ? p.db : 0, p.dr, item.rows, item.dIn, item.dOut,
-        item.experts, item.topK,
-      ));
+      const slots = item.residentSlots;
+      if (slots) entries.push(this._slotTableEntry('slotRows', slots));
+      const slotDomain = slots ? slots[slots.length - 1] + 1 : 0;
+      const { value, outputs } = this._runArena(entries, (p) => (slots
+        ? this.api.volvoxai_training_moe_linear_backward_banked_f32(
+          p.input, p.expertWeight, item.bias ? p.bias : 0, p.indices, p.gates, p.dy,
+          p.dx, p.dw, db ? p.db : 0, p.dr, item.rows, item.dIn, item.dOut,
+          item.experts, item.topK, p.slotRows, slotDomain)
+        : this.api.volvoxai_training_moe_linear_backward_f32(
+          p.input, p.expertWeight, item.bias ? p.bias : 0, p.indices, p.gates, p.dy,
+          p.dx, p.dw, db ? p.db : 0, p.dr, item.rows, item.dIn, item.dOut,
+          item.experts, item.topK)));
       apiResult(value, `MoELinear backward at node '${node.id}'`);
       dx.set(outputs.dx);
       dw.set(outputs.dw);

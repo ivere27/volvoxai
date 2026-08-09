@@ -30,9 +30,10 @@
 
 ```mermaid
 flowchart TD
-    G["graph.json + safetensors"] --> R["VolvoxAI.createRuntime()"]
-    R --> M["Runtime.loadModel() / createModel()"]
-    M --> C["Model.compile({ backend: policy })"]
+    G["graph.json + safetensors"] --> L["ModelLoader.load()"]
+    L --> S["Model.capture()"]
+    R["VolvoxAI.createRuntime()"] --> C["Runtime.compile(snapshot, { backend: policy })"]
+    S --> C
     C --> T1["WebNN 프로바이더<br/>브라우저 ML API → NPU/GPU/CPU"]
     C --> T2["WebGPU 프로바이더<br/>컴파일된 GPU 경로"]
     C --> T3["WASM 프로바이더<br/>선형 메모리 위 컴파일된 C 커널"]

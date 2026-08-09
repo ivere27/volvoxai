@@ -10,9 +10,13 @@ import {
   kernelRoute,
   kernelRoutesByBackend,
   kernelVariants,
+  operatorShapeContract,
+  operatorShapeContracts,
+  operatorShapeFunctionIds,
   runtimeOperatorsByBackend,
   runtimeSupportModeByBackend,
   runtimeSupportsOperator,
+  shapeContractClassifications,
   targetProfiles,
 } from '../ts/generated/kernelRegistry.js';
 import { fullKernelVariants } from '../ts/generated/kernelRegistryFull.js';
@@ -69,16 +73,54 @@ test('generated exporter profiles remain distinct from runtime registration', ()
   assert.equal(exporterTargetSupports('backend:webnn', 'QLinear'), false);
   assert.equal(exporterTargetSupports('unknown-target', 'Conv2D'), false);
 
+  const nativeGpuOperators = new Set([
+    'Add', 'ArgMax', 'BatchMatMul', 'Cast', 'Clip', 'Concat', 'Conv2D',
+    'DequantizeLinear', 'Div', 'Embedding', 'Equal', 'Expand', 'GELU', 'Gather',
+    'GreaterOrEqual', 'GroupNorm', 'LayerNorm', 'Linear', 'Mul', 'Not',
+    'QAdd', 'QArgMax', 'QBatchMatMul', 'QConv2D', 'QEmbedding', 'QGELU',
+    'QGemm', 'QGroupNorm', 'QLayerNorm', 'QLinear', 'QMaskedMean', 'QMatMul',
+    'QSDPA', 'QSiLU', 'QuantizeLinear', 'ReduceSum', 'RequantizeLinear',
+    'Reshape', 'SiLU', 'Slice', 'Softmax', 'Squeeze', 'Sub', 'Transpose',
+    'Unsqueeze', 'Where',
+  ]);
   for (const target of [
     'backend:vulkan', 'backend:opengl', 'backend:metal', 'backend:cuda',
   ]) {
-    assert.deepEqual(exporterQualifiedOperators[target], [], target);
-    assert.equal(exporterTargetSupports(target, 'QLinear'), false, target);
+    assert.deepEqual(new Set(exporterQualifiedOperators[target]), nativeGpuOperators, target);
+    assert.equal(exporterTargetSupports(target, 'QLinear'), true, target);
+    assert.equal(exporterTargetSupports(target, 'QSDPA'), true, target);
   }
+});
+
+test('generated shape-contract routes cover the runtime vocabulary exactly once', () => {
+  const runtimeOperators = runtimeOperatorsByBackend['cpu-js'];
+  assert.deepEqual(new Set(Object.keys(operatorShapeContracts)), new Set(runtimeOperators));
+  assert.deepEqual(new Set(Object.keys(operatorShapeFunctionIds)), new Set(runtimeOperators));
+  assert.deepEqual(shapeContractClassifications, [
+    'canonical', 'deferred', 'bounded-value-dependent',
+  ]);
+
+  for (const operator of runtimeOperators) {
+    const contract = operatorShapeContract(operator);
+    assert.ok(contract, operator);
+    assert.equal(contract.shapeFunctionId, operatorShapeFunctionIds[operator], operator);
+    assert.match(contract.shapeFunctionId,
+      /^volvox\.shape\.[a-z][a-z0-9]*(?:-[a-z0-9]+)*\.v[1-9][0-9]*$/u);
+    assert.ok(shapeContractClassifications.includes(contract.classification), operator);
+  }
+  assert.equal(operatorShapeContract('DefinitelyUnknown'), null);
+  assert.equal(operatorShapeContracts.Identity.shapeFunctionId, 'volvox.shape.identity.v1');
+  assert.equal(operatorShapeContracts.Linear.shapeFunctionId,
+    'volvox.shape.dense-last-axis.v1');
+  assert.equal(operatorShapeContracts.NonMaxSuppression.classification,
+    'bounded-value-dependent');
 });
 
 test('generated registry views are deeply immutable', () => {
   assertFrozenTree(kernelBackends, 'kernelBackends');
+  assertFrozenTree(shapeContractClassifications, 'shapeContractClassifications');
+  assertFrozenTree(operatorShapeContracts, 'operatorShapeContracts');
+  assertFrozenTree(operatorShapeFunctionIds, 'operatorShapeFunctionIds');
   assertFrozenTree(runtimeOperatorsByBackend, 'runtimeOperatorsByBackend');
   assertFrozenTree(kernelRoutesByBackend, 'kernelRoutesByBackend');
   assertFrozenTree(runtimeSupportModeByBackend, 'runtimeSupportModeByBackend');
@@ -124,5 +166,105 @@ test('inference kernel variants are valid registry registrations and exclude ful
     new Set(cpuReference?.operators),
     new Set(['QLinear', 'QMatMul', 'QGemm']),
   );
+  const cudaQBatch = kernelVariants.find(
+    (variant) => variant.id === 'cuda.qbatch-matmul.dp4a',
+  );
+  assert.equal(cudaQBatch?.entrypointId, 'vx_cuda_qbatch_matmul_i8u8');
+  assert.deepEqual(cudaQBatch?.operators, ['QBatchMatMul']);
+  assert.deepEqual(cudaQBatch?.requiredFeatures,
+    ['cuda.device-residency', 'cuda.sm61-dp4a']);
+  assert.match(cudaQBatch?.predicateId ?? '', /arbitrary-k-tail/u);
+  for (const [id, operators, entrypoint, predicate] of [
+    [
+      'cuda.qlinear.warp-dp4a',
+      ['QLinear', 'QGemm', 'QMatMul'],
+      'vx_cuda_qlinear_warp_dp4a_i8u8',
+      /k-ge32-warp-launch-capacity.*arbitrary-k-tail/u,
+    ],
+    [
+      'cuda.qlinear.thread-dp4a',
+      ['QLinear', 'QGemm', 'QMatMul'],
+      'vx_cuda_qlinear_i8u8',
+      /small-k-or-warp-launch-capacity.*arbitrary-k-tail/u,
+    ],
+    [
+      'cuda.qconv2d.warp-dp4a',
+      ['QConv2D'],
+      'vx_cuda_qconv2d_warp_dp4a_i8u8',
+      /input-per-group-ge4-terms-ge64.*per-spatial-tail/u,
+    ],
+    [
+      'cuda.qconv2d.thread-dp4a',
+      ['QConv2D'],
+      'vx_cuda_qconv2d_i8u8',
+      /small-reduction-or-warp-launch-capacity.*per-spatial-tail/u,
+    ],
+  ]) {
+    const variant = kernelVariants.find((item) => item.id === id);
+    assert.equal(variant?.entrypointId, entrypoint);
+    assert.deepEqual(variant?.operators, operators);
+    assert.deepEqual(variant?.requiredFeatures,
+      ['cuda.device-residency', 'cuda.sm61-dp4a']);
+    assert.match(variant?.predicateId ?? '', predicate);
+  }
+  for (const [backend, entrypoint, feature] of [
+    ['webgpu', 'qBatchMatMulDot.wgsl', 'webgpu.packed-4x8-integer-dot-product'],
+    ['vulkan', 'qBatchMatMulDot', 'vulkan.packed-4x8-integer-dot-product'],
+  ]) {
+    const dot = kernelVariants.find(
+      (variant) => variant.id === `${backend}.qbatch-matmul.dot`,
+    );
+    const scalar = kernelVariants.find(
+      (variant) => variant.id === `${backend}.qbatch-matmul.scalar`,
+    );
+    assert.equal(dot?.entrypointId, entrypoint);
+    assert.deepEqual(dot?.operators, ['QBatchMatMul']);
+    assert.deepEqual(dot?.requiredFeatures, [feature]);
+    assert.match(dot?.predicateId ?? '', /i32-safe/u);
+    assert.equal(scalar?.requiredFeatures.length, 0);
+    assert.deepEqual(scalar?.operators, ['QBatchMatMul']);
+  }
+  const vulkanQConvDot = kernelVariants.find(
+    (variant) => variant.id === 'vulkan.qconv2d.dot-tiled',
+  );
+  const vulkanQConvTiled = kernelVariants.find(
+    (variant) => variant.id === 'vulkan.qconv2d.tiled',
+  );
+  const vulkanQConvScalar = kernelVariants.find(
+    (variant) => variant.id === 'vulkan.qconv2d.scalar',
+  );
+  assert.equal(vulkanQConvDot?.priority, 300);
+  assert.deepEqual(vulkanQConvDot?.requiredFeatures,
+    ['vulkan.packed-4x8-integer-dot-product']);
+  assert.equal(vulkanQConvTiled?.entrypointId, 'qConv2DInt8Tiled');
+  assert.equal(vulkanQConvTiled?.priority, 200);
+  assert.deepEqual(vulkanQConvTiled?.requiredFeatures, []);
+  assert.match(vulkanQConvTiled?.predicateId ?? '', /workgroup-8x4/u);
+  assert.equal(vulkanQConvScalar?.priority, 100);
+  const vulkanConv = kernelVariants.find(
+    (variant) => variant.id === 'vulkan.conv2d.regular-out16',
+  );
+  assert.equal(vulkanConv?.entrypointId, 'conv2DRegularOut16');
+  assert.deepEqual(vulkanConv?.operators, ['Conv2D']);
+  assert.deepEqual(vulkanConv?.requiredFeatures, []);
+  assert.equal(vulkanConv?.priority, 250);
+  assert.match(vulkanConv?.predicateId ?? '', /output-channels16/u);
+  const vulkanConvC3 = kernelVariants.find(
+    (variant) => variant.id === 'vulkan.conv2d.c3-out16',
+  );
+  assert.equal(vulkanConvC3?.entrypointId, 'conv2DRegularC3Out16');
+  assert.equal(vulkanConvC3?.priority, 260);
+  assert.match(vulkanConvC3?.predicateId ?? '', /input-channels3/u);
+  const webgpuConv = kernelVariants.find(
+    (variant) => variant.id === 'webgpu.conv2d.regular-out16',
+  );
+  assert.equal(webgpuConv?.entrypointId, 'conv2DRegularOut16.wgsl');
+  assert.deepEqual(webgpuConv?.operators, ['Conv2D']);
+  assert.deepEqual(webgpuConv?.requiredFeatures, []);
+  assert.equal(webgpuConv?.priority, 250);
+  assert.match(webgpuConv?.predicateId ?? '', /output-channels16/u);
+  assert.equal(kernelVariants.find(
+    (variant) => variant.id === 'webgpu.conv2d.scalar',
+  )?.entrypointId, 'conv2D.wgsl');
   assert.deepEqual(fullKernelVariants, []);
 });

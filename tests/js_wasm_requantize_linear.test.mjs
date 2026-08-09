@@ -7,7 +7,7 @@ import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
 
-import { Graph } from '../ts/core/Graph.js';
+import { RuntimeGraph } from '../ts/core/RuntimeGraph.js';
 import { CPUEngine } from '../ts/backends/CPUEngine.js';
 import { WasmEngine } from '../ts/backends/WasmEngine.js';
 
@@ -30,7 +30,7 @@ function storage(dtype, values) {
 }
 
 function requantizeGraph({ inputDtype, inputQuantization, outputDtype, outputQuantization } = {}) {
-  const graph = new Graph();
+  const graph = new RuntimeGraph();
   const input = graph.addInput('input', [7], inputDtype, { quantization: inputQuantization });
   const { out } = graph.addOp('RequantizeLinear', { input }, {
     out: { name: 'out', shape: [7], dtype: outputDtype, quantization: outputQuantization },
@@ -95,7 +95,7 @@ test('portable WASM RequantizeLinear uses only typed tensor metadata', {
     });
 
     await t.test('compile rejects absent immutable output metadata', () => {
-      const graph = new Graph();
+      const graph = new RuntimeGraph();
       const input = graph.addInput('input', [1], 'int8', {
         quantization: { scheme: 'per_tensor', scale: 0.25, zero_point: 0 },
       });
@@ -104,7 +104,7 @@ test('portable WASM RequantizeLinear uses only typed tensor metadata', {
       });
       assert.throws(() => wasm.compile(graph), /equal-shape canonical per-tensor I8\/U8 edges/);
 
-      const mutableScale = new Graph();
+      const mutableScale = new RuntimeGraph();
       const typedInput = mutableScale.addInput('input', [1], 'int8', {
         quantization: { scheme: 'per_tensor', scale: 0.25, zero_point: 0 },
       });

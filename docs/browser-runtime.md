@@ -10,10 +10,12 @@ Runtime
         ExecutionResult
 ~~~
 
-Runtime owns initialized backend providers. Model owns an immutable definition
-and the currently published weight revision. CompiledModel pins one exact
-definition and revision. Each ExecutionContext owns request, scratch, adapter,
-and decode state. ExecutionResult owns stable named output snapshots.
+Runtime owns initialized backend providers. Model owns an
+immutable logical graph, the complete bounded shape domain, and one exact
+fixed-weight revision. CompiledModel pins that snapshot and proves one provider
+for its whole domain. Each ExecutionContext owns concrete shape bindings,
+specializations, request/scratch capacity, and decode state. ExecutionResult
+owns stable named output snapshots.
 
 ## Profiles
 
@@ -29,14 +31,13 @@ The standard inference entry imports and exports no training code. The
 WASM-only entry contains no CPU, WebNN, WebGPU, WGSL, or Node filesystem
 implementation.
 
-The runtime exports are the five retained inference handles (`Runtime`,
-`Model`, `CompiledModel`, `ExecutionContext`, and `ExecutionResult`), their
-result tensors and reports, `VolvoxAIError`, and the context-aware provider
-contract. Programmatic package authoring remains explicit through `Graph`,
-`Tensor`, `ModelBuilder`, `GraphLoader`, `SafetensorsFile`,
-`ReadOnlySafetensorsCache`, and `Tokenizer`. Backend engines, mutable adapter
-managers, model-snapshot constructors, JSON parser helpers, and error-wrapping
-helpers are internal and are not package exports.
+The inference entry exports `Runtime`, `ModelLoader`,
+`Model`, `CompiledModel`, `ExecutionContext`, and
+`ExecutionResult`, their reports, the bounded-shape contracts,
+`VolvoxAIError`, and the context-aware provider contract. Programmatic package
+authoring uses `ModelBuilder`; package loading never constructs a
+kernel-facing `Graph` or `Tensor`. Backend engines, mutable training state, and
+the retired concrete package loader are not inference exports.
 
 ## Create a runtime
 
@@ -65,7 +66,9 @@ whose initialization outcome is retained for diagnostics.
 ## Load a model
 
 ~~~javascript
-const model = await runtime.loadModel(
+import { Model } from 'volvoxai';
+
+const snapshot = await Model.load(
   './models/detector/model.safetensors',
 );
 ~~~
@@ -74,7 +77,7 @@ The first safetensors URL resolves a sibling graph.json by default. Multiple
 weight shards are accepted:
 
 ~~~javascript
-const model = await runtime.loadModel(
+const snapshot = await Model.load(
   [
     './models/large/model-00001-of-00002.safetensors',
     './models/large/model-00002-of-00002.safetensors',
@@ -87,26 +90,27 @@ Every graph document must contain the exact root discriminator:
 
 ~~~json
 {
-  "format": "volvox-graph/v1"
+  "format": "volvox-graph/v1",
+  "dimensions": {}
 }
 ~~~
 
-The loader rejects any other value before allocating weights or backend
-resources. The URL basename must be `graph.json` or a named `*.graph.json`
-document, and the loader does not search alternate filenames. Every node input
-must resolve to a declared graph input, a named weight, or an earlier node
-output.
+Dynamic shape is intrinsic to this format, and the closed root schema rejects
+secondary shape-system discriminators. The URL basename must be `graph.json` or
+a named `*.graph.json` document, and the loader does not search alternate
+filenames. Every dynamic dimension is declared with finite bounds. Every node output is a
+unified `{ tensor, dtype, shape }` descriptor and every node input resolves to a
+declared graph input, a named weight, or an earlier output.
 
-Applications can also construct a Graph and call runtime.createModel(graph).
-The model captures the graph; later execution never mutates caller-owned Graph
-or Tensor storage.
+Applications can instead author a logical graph with `ModelBuilder` and
+capture its graph plus owned fixed weights in a `Model`.
 
 ## Compile with explicit policy
 
 Preferred selection tries candidates in order until one compiles:
 
 ~~~javascript
-const compiled = await model.compile({
+const compiled = await runtime.compile(snapshot, {
   backend: {
     mode: 'prefer',
     order: ['webgpu', 'wasm', 'cpu'],
@@ -118,7 +122,7 @@ const compiled = await model.compile({
 Required selection accepts exactly one provider:
 
 ~~~javascript
-const compiled = await model.compile({
+const compiled = await runtime.compile(snapshot, {
   backend: {
     mode: 'require',
     backend: 'webgpu',
@@ -150,10 +154,15 @@ const first = await compiled.createContext();
 const second = await compiled.createContext();
 
 const [firstResult, secondResult] = await Promise.all([
-  first.execute({ input: firstValues }),
-  second.execute({ input: secondValues }),
+  first.execute({ input: { data: firstValues, shape: [2, 128] } }),
+  second.execute({ input: { data: secondValues, shape: [5, 64] } }),
 ]);
 ~~~
+
+Every input carries explicit concrete shape. The runtime validates the exact
+input set, storage dtype, rank, symbol equality, bounds, `multiple_of`, and byte
+length before it resolves any kernel or allocation plan. Raw typed-array
+shorthand is intentionally not supported, including for constant-only models.
 
 One context serializes execute, decode, adapter selection, and close through a
 FIFO queue. Different contexts may progress concurrently because each has
@@ -166,7 +175,9 @@ already accepted. close() and dispose() are idempotent.
 ## Stable named results
 
 ~~~javascript
-const result = await first.execute({ input: values });
+const result = await first.execute({
+  input: { data: values, shape: [2, 128] },
+});
 
 for (const [name, tensor] of result.outputs) {
   console.log(name, tensor.shape, tensor.dtype, tensor.location);
@@ -184,8 +195,12 @@ A result remains stable across later executions and context closure. Its
 storage stays valid until result.close():
 
 ~~~javascript
-const resultA = await first.execute({ input: valuesA });
-const resultB = await first.execute({ input: valuesB });
+const resultA = await first.execute({
+  input: { data: valuesA, shape: [2, 128] },
+});
+const resultB = await first.execute({
+  input: { data: valuesB, shape: [5, 64] },
+});
 await first.close();
 
 const a = await resultA.output('logits').read();
@@ -226,19 +241,13 @@ with BACKEND_UNSUPPORTED.
 Fixed-shape B=1 W8A8 decode has dependency, row, and K/V-cache implementations
 on CPU, WASM, and WebGPU. WebNN provides ordinary forward execution.
 
-## Adapter selection
+## Weight revisions and adapters
 
-An adapter route can be pinned when the context is created or changed through
-the context FIFO:
-
-~~~javascript
-const context = await compiled.createContext({ adapter: { name: 'tenant-a' } });
-await context.selectAdapter({ name: 'tenant-b', version: 2 });
-const result = await context.execute(inputs);
-~~~
-
-Compiled models pin weight and adapter revisions. Publishing a model successor
-does not silently change an existing context.
+A logical snapshot owns one immutable fixed-weight revision. Create and compile
+a successor snapshot to publish new weights; existing compiled models and
+contexts remain pinned to the previous revision. Adapter mutation is not part
+of the inference logical-snapshot contract. Full-profile training/PTQ must
+publish a new logical snapshot before inference compilation.
 
 ## Diagnostics and errors
 
@@ -278,7 +287,7 @@ const runtime = await VolvoxAI.createRuntime({
 });
 ~~~
 
-Providers compile an immutable ModelSnapshot, create independently owned
+Providers compile an immutable Model, create independently owned
 contexts, and return stable host or device output snapshots. See
 [Backend SDK](backend-sdk.md) for the complete contract.
 
@@ -304,20 +313,19 @@ the model weights. All executable JavaScript and WASM must be extension-owned.
 
 ~~~javascript
 import {
-  Graph,
-  GraphLoader,
+  Model,
   VolvoxAI,
 } from './vendor/volvoxai.wasm.min.js';
 
 const wasmUrl = chrome.runtime.getURL('vendor/volvoxai.full.wasm');
 const runtime = await VolvoxAI.createRuntime({ wasmUrl });
-const graph = new Graph();
-await GraphLoader.load(
-  graph,
+const snapshot = await Model.load(
   chrome.runtime.getURL('model/model.safetensors'),
   { graphUrl: chrome.runtime.getURL('model/graph.json') },
 );
-const model = runtime.createModel(graph);
+const compiled = await runtime.compile(snapshot, {
+  backend: { mode: 'require', backend: 'wasm', operatorFallback: 'forbid' },
+});
 ~~~
 
 The WASM-only build contains no dynamic import, which keeps it suitable for an
@@ -325,20 +333,28 @@ ES-module extension service worker. Extension pages require wasm-unsafe-eval.
 Declare web-accessible resources only when a normal web page or another
 extension must fetch them.
 
-Training uses the same retained Trainer API:
+The full profile may train and author a successor weight revision, but it must
+publish that revision as a new logical snapshot before inference compilation:
 
 ~~~javascript
-const trainer = await VolvoxAI.createTrainer(model, { wasmUrl });
+const trainer = await VolvoxAI.createTrainer(sourceSnapshot, {
+  backend: 'wasm',
+  wasmUrl,
+});
 const step = await trainer.trainStep(options);
-await trainer.commit();
+const successorSnapshot = await trainer.commit();
 await trainer.close();
+
+const compiledSuccessor = await runtime.compile(successorSnapshot, {
+  backend: { mode: 'require', backend: 'wasm', operatorFallback: 'forbid' },
+});
 ~~~
 
-Trainer privately clones the Model's current revision and owns that mutable
-working state. `trainStep()` never publishes implicitly: call `commit()` before
-compiling inference against the update, or `rollback()` to restore the last
-committed baseline. Strict WASM training preflights the supported portable
-subset before forward execution or optimizer mutation.
+Trainer privately clones the immutable source snapshot and owns the mutable
+working state. `trainStep()` never mutates the source. `commit()` returns a new
+immutable weight revision; compile that successor, or call `rollback()` to
+restore the last committed baseline. Strict WASM training preflights the
+supported portable subset before forward execution or optimizer mutation.
 
 ## Backend characteristics
 
@@ -360,6 +376,25 @@ WebGPU owns device buffers outside the portable Tensor model, compiles an
 immutable graph plan, and shares only device-level module and pipeline caches.
 Each context owns its input, activation, scratch, output, adapter, and decode
 state.
+
+Compilation proves the complete declared bounded-shape domain before it
+publishes a context. The proof covers output extents, physical allocation
+maxima, dispatch grids, uniforms, bind groups, auxiliary buffers, and device
+limits for every qualified route. A concrete shape change specializes those
+resources transactionally, and even equal-byte shapes receive their own
+semantic signature. A rejection before the mutation boundary leaves the prior
+signature, cache, decode state, and resource counters unchanged. If a queue
+write fails after that boundary, retained decode state is cleared and the
+physical signature is invalidated; the next request rewrites the complete
+binding instead of dispatching through possibly partial uniforms.
+
+Index-bearing public and invariant values are checked before any GPU or cache
+mutation. Banked Gather translates global rows through the selected data-bank
+table. A residency change stages a fresh weight-buffer generation and publishes
+its payload and slot table together only after specialization succeeds; the
+previous generation remains valid until submitted work retires. Unsupported
+bank mappings or an unprovable device-produced value domain fail closed at
+compilation.
 
 Every declared output receives a stable result snapshot, including outputs
 that alias graph inputs, weights, or transitive identity/Dropout values.

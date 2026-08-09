@@ -16,22 +16,31 @@
   <pre id="out">Starting…</pre>
 
 <script type="module">
+// `ReadOnlySafetensorsCache` is not part of the published entrypoint, so the
+// shared-weight fast path is unavailable here; each graph loads its own store.
 import {
-  Graph,
-  GraphLoader,
-  ReadOnlySafetensorsCache,
+  Model,
   VolvoxAI,
-} from '/dist/0.3.0/volvoxai.js';
+} from '/dist/0.4.0/volvoxai.js';
 import {
   TinyReceiptSplitSession,
 } from '/examples/tiny_receipt_vqa/TinyReceiptSplitSession.js';
-import { preprocessTinyReceiptImage } from '/examples/tiny_receipt_vqa/TinyReceiptW8A8Session.js';
+import { preprocessTinyReceiptImage } from '/examples/tiny_receipt_vqa/TinyReceiptInput.js';
+import {
+  executionPhaseBreakdown,
+  summarizeDecoderSteps,
+  validateExplicitKVAnswer,
+} from '/examples/tiny_receipt_vqa/tools/benchmark_explicit_kv_contract.mjs';
+import {
+  qualifyDynamicRebind,
+} from '/examples/tiny_receipt_vqa/tools/qualify_dynamic_rebind.mjs';
 
 const out = document.getElementById('out');
 const query = new URLSearchParams(location.search);
 const prompt = query.get('prompt') || 'phone number last one';
-const modelUrl = query.get('model') || '/__tinyreceipt_model__/package_manifest.json';
-const imageUrl = query.get('image') || '/__tinyreceipt_image__';
+const modelUrl = query.get('model') || '/__benchmark_model__/package_manifest.json';
+const imageUrl = query.get('image') || '/__benchmark_image__';
+const qualificationMode = query.get('qualification') === 'dynamic-rebind';
 
 function boundedInteger(name, fallback, minimum, maximum) {
   const raw = query.get(name);
@@ -51,24 +60,93 @@ function show(value) {
   out.textContent = JSON.stringify(value, (_key, item) => rounded(item), 2);
 }
 
+function bytesToHex(bytes) {
+  return [...bytes].map((value) => value.toString(16).padStart(2, '0')).join('');
+}
+
+async function sha256Float32LE(values) {
+  const bytes = new Uint8Array(values.length * 4);
+  const view = new DataView(bytes.buffer);
+  values.forEach((value, index) => view.setFloat32(index * 4, value, true));
+  return bytesToHex(new Uint8Array(await crypto.subtle.digest('SHA-256', bytes)));
+}
+
+function strictRoute(route, label) {
+  if (route?.tierFallback !== false || route?.operator?.attestation !== 'none' ||
+      route.operator.used !== false || route.operator.offendingNode != null) {
+    throw new Error(`${label} does not attest strict backend execution with fallback 0.`);
+  }
+}
+
+function validateCompilation(report, label) {
+  if (report?.requestedPolicy?.mode !== 'require' ||
+      report.requestedPolicy.backend !== 'webgpu' ||
+      report.requestedPolicy.operatorFallback !== 'forbid' ||
+      report.selectedBackend !== 'webgpu' || !Array.isArray(report.candidates) ||
+      report.candidates.length !== 1 || report.candidates[0]?.backend !== 'webgpu' ||
+      report.candidates[0]?.outcome !== 'selected') {
+    throw new Error(`${label} compilation did not strictly select WebGPU.`);
+  }
+  strictRoute(report.routeEvidence, `${label} compilation`);
+  strictRoute(report.candidates[0].routeEvidence, `${label} compilation candidate`);
+}
+
+function validateExecution(report, label) {
+  if (report?.backend !== 'webgpu' || report.outcome !== 'success' ||
+      report.operatorFallback !== 'none') {
+    throw new Error(`${label} did not complete on strict WebGPU.`);
+  }
+  strictRoute(report.routeEvidence, label);
+}
+
+function executionAttestation(report) {
+  return {
+    backend: report.backend,
+    outcome: report.outcome,
+    operatorFallback: report.operatorFallback,
+    routeEvidence: report.routeEvidence,
+  };
+}
+
 window.__webgpuW8A8BenchmarkResult = { status: 'running' };
 
 let benchmarkRuntime;
 let benchmarkSession;
 try {
   const maxNewTokens = boundedInteger('maxNewTokens', 191, 1, 191);
+  const warmup = boundedInteger('warmup', 1, 0, 20);
+  const iterations = boundedInteger('iterations', 5, 1, 50);
+  const family = query.get('family') || 'phone';
   const fetchCounts = new Map();
+  let packagePrecision = null;
   const benchmarkFetch = async (input, init) => {
     const url = new URL(input instanceof Request ? input.url : String(input), location.href).href;
     fetchCounts.set(url, (fetchCounts.get(url) || 0) + 1);
-    return fetch(input, init);
+    let response;
+    try {
+      response = await fetch(input, init);
+    } catch (error) {
+      throw new TypeError(
+        `benchmark fetch failed for '${url}': ${error?.message || error}`,
+        { cause: error },
+      );
+    }
+    if (url === new URL(modelUrl, location.href).href && response.ok) {
+      const variant = (await response.clone().json())?.source?.variant;
+      packagePrecision = variant === 'fp32' ? 'fp32' :
+        (variant === 'int8-w8a8' ? 'int8' : null);
+      if (packagePrecision == null) {
+        throw new Error('package source.variant is not FP32 or W8A8');
+      }
+    }
+    return response;
   };
 
   const initStarted = performance.now();
   let activeRun = null;
   const compiles = [];
   const contextLabels = new Map();
-  const executions = { encoder: [[], []], decoder: [[], []] };
+  const executions = [];
   const runtime = benchmarkRuntime = await VolvoxAI.createRuntime({
     backends: ['webgpu'],
     onDiagnostic(event) {
@@ -86,11 +164,10 @@ try {
           contextLabels.size === 0 ? 'encoder' : 'decoder',
         );
       }
-      executions[contextLabels.get(event.report.contextId)][activeRun].push(event.report);
+      executions[activeRun][contextLabels.get(event.report.contextId)].push(event.report);
     },
   });
   const runtimeInitMs = performance.now() - initStarted;
-  const cache = new ReadOnlySafetensorsCache();
   const graphLoads = [];
 
   const sessionStarted = performance.now();
@@ -98,23 +175,28 @@ try {
     runtime,
     packageUrl: modelUrl,
     fetch: benchmarkFetch,
-    safetensorsCache: cache,
     compileOptions: {
       backend: { mode: 'require', backend: 'webgpu', operatorFallback: 'forbid' },
     },
-    graphLoader: async ({ weightsUrl, graphUrl, kind }) => {
+    snapshotLoader: async ({ weightsUrl, graphUrl, kind }) => {
       const started = performance.now();
       try {
-        return await GraphLoader.load(new Graph(), weightsUrl, {
+        return await Model.load(weightsUrl, {
           graphUrl,
           fetch: benchmarkFetch,
-          safetensorsCache: cache,
-        });
+              });
       } finally {
         graphLoads.push({ kind, ms: performance.now() - started });
       }
     },
   });
+  // Materialize both graphs and contexts before the first encoder execution.
+  // TinyReceipt normally loads the decoder lazily after encoding; that makes a
+  // large localhost fetch contend with an already-live GPU working set and has
+  // produced transient browser `Failed to fetch` failures under resource pressure.
+  // Preload remains untimed setup and does not change the measured same-context
+  // warmup/request lifecycle.
+  await session.preload();
   const sessionLoadMs = performance.now() - sessionStarted;
 
   const imageResponse = await benchmarkFetch(imageUrl);
@@ -124,41 +206,308 @@ try {
   const image = await preprocessTinyReceiptImage(bitmap, session.package.preprocessing);
   const preprocessMs = performance.now() - preprocessStarted;
   bitmap.close();
+  const inputTensorSha256 = await sha256Float32LE(image);
 
+  if (qualificationMode) {
+    const qualification = await qualifyDynamicRebind({
+      session,
+      image,
+      prompt,
+      family,
+      maximumNewTokens: maxNewTokens,
+      generationOptions: { kvTransferMode: 'device-qualified' },
+      beforeRun({ index }) {
+        executions.push({ encoder: [], decoder: [] });
+        activeRun = index;
+      },
+      afterRun() {
+        activeRun = null;
+      },
+    });
+    const executionAttestations = qualification.runs.map((run, index) => {
+      const resident = run.gpuResidentKv;
+      if (resident?.mode !== 'device-qualified' ||
+          resident.encoderCrossCacheHandoffs !== run.tokenIds.length * 8 ||
+          resident.decoderCacheHandoffs !== Math.max(0, run.tokenIds.length - 1) * 8 ||
+          resident.encoderMemoryReadback !== true ||
+          resident.encoderMemoryReadbackValidated !== true ||
+          resident.encoderCrossCacheReadbackValidated !== true ||
+          resident.cachePrefixReadbackValidated !== true ||
+          resident.appendedCacheReadbackValidated !== true ||
+          resident.cacheReadbackFree !== false) {
+        throw new Error(`qualification run ${index} lacks device-cache correctness evidence.`);
+      }
+      const encoderReports = executions[index]?.encoder || [];
+      const decoderReports = executions[index]?.decoder || [];
+      if (encoderReports.length !== 1 || decoderReports.length !== run.tokenIds.length) {
+        throw new Error(`qualification run ${index} lacks exact encoder/decoder executions.`);
+      }
+      validateExecution(encoderReports[0], `qualification run ${index} encoder`);
+      decoderReports.forEach((report, step) =>
+        validateExecution(report, `qualification run ${index} decoder step ${step}`));
+      return {
+        encoder: executionAttestation(encoderReports[0]),
+        decoder: decoderReports.map(executionAttestation),
+      };
+    });
+    compiles.forEach(({ report }, index) =>
+      validateCompilation(report, index === 0 ? 'encoder' : 'decoder'));
+    if (compiles.length !== 2) {
+      throw new Error(`qualification expected two compilations, got ${compiles.length}.`);
+    }
+    if (contextLabels.size !== 2 ||
+        [...contextLabels.values()].filter((label) => label === 'encoder').length !== 1 ||
+        [...contextLabels.values()].filter((label) => label === 'decoder').length !== 1) {
+      throw new Error('qualification did not reuse exactly one encoder and decoder context.');
+    }
+    const selectedDevice = compiles.find(({ label }) => label === 'decoder')
+      ?.report.selectedDevice ?? compiles[0]?.report.selectedDevice ?? null;
+    const result = {
+      status: 'pass',
+      mode: 'dynamic-rebind-qualification',
+      timed: false,
+      adapter: selectedDevice,
+      packedDot4: navigator.gpu.wgslLanguageFeatures
+        ?.has('packed_4x8_integer_dot_product') === true,
+      prompt,
+      family,
+      precision: packagePrecision,
+      maxNewTokens,
+      inputTensorSha256,
+      runtimeInitMs,
+      sessionLoadMs,
+      preprocessMs,
+      graphLoads,
+      compiles,
+      fetchCounts: [...fetchCounts.entries()].map(([url, requests]) => ({ url, requests })),
+      qualification: {
+        ...qualification,
+        sameRuntime: true,
+        sameEncoderContext: true,
+        sameDecoderContext: true,
+        strictNoFallback: true,
+        deviceResidentKVQualified: true,
+        executionAttestations,
+      },
+    };
+    window.__webgpuW8A8BenchmarkResult = result;
+    show(result);
+  } else {
   const runs = [];
-  for (let index = 0; index < 2; index++) {
+  const totalRuns = warmup + iterations;
+  let cacheQualification = null;
+  for (let index = 0; index < totalRuns; index++) {
+    executions.push({ encoder: [], decoder: [] });
     activeRun = index;
+    const qualifiedRun = index === 0 && warmup > 0;
     const started = performance.now();
     let answer;
     try {
       answer = await session.generate({
         image,
         prompt,
-        family: 'auto',
+        family,
         preprocessed: true,
         maxNewTokens,
+        shapeMode: 'active',
+        kvTransferMode: qualifiedRun
+          ? 'device-qualified' : 'device-resident',
       });
     } finally {
       activeRun = null;
     }
+    const generationMs = performance.now() - started;
+    const tokenIds = validateExplicitKVAnswer(answer, maxNewTokens);
+    const encoderReports = executions[index].encoder;
+    const decoderReports = executions[index].decoder;
+    if (encoderReports.length !== 1 || decoderReports.length !== tokenIds.length) {
+      throw new Error(`run ${index} lacks one encoder and one decoder report per token.`);
+    }
+    validateExecution(encoderReports[0], `run ${index} encoder`);
+    decoderReports.forEach((report, step) =>
+      validateExecution(report, `run ${index} decoder step ${step}`));
+    const decoderTiming = summarizeDecoderSteps(answer.synchronizedTiming.decoderStepMs);
+    if (answer.synchronizedTiming.completion !== 'required-small-output-readback' ||
+        answer.synchronizedTiming.applicationValidationIncluded !== false ||
+        answer.synchronizedTiming.cacheQualificationReadbackIncluded !== false) {
+      throw new Error(`run ${index} timing did not synchronize WebGPU completion.`);
+    }
+    const resident = answer.gpuResidentKv;
+    const expectedResidentHandoffs = Math.max(0, tokenIds.length - 1) * 8;
+    if (resident?.enabled !== true || resident.crossCacheOutputs !== 8 ||
+        resident.presentCacheOutputsPerStep !== 8 ||
+        resident.encoderCrossCacheHandoffs !== tokenIds.length * 8 ||
+        resident.decoderCacheHandoffs !== expectedResidentHandoffs ||
+        resident.runtimeValidatedDeviceInputs !== true ||
+        resident.encoderResultRetainedThroughDecode !== true ||
+        resident.decoderResultRetainedUntilSuccessorExecution !== true ||
+        resident.encoderMemoryReadback !== qualifiedRun ||
+        resident.encoderMemoryReadbackValidated !== qualifiedRun) {
+      throw new Error(`run ${index} lacks exact device-resident KV handoff evidence.`);
+    }
+    if (qualifiedRun) {
+      if (resident.mode !== 'device-qualified' ||
+          resident.encoderMemoryReadback !== true ||
+          resident.encoderMemoryReadbackValidated !== true ||
+          resident.encoderCrossCacheReadbackValidated !== true ||
+          resident.cachePrefixReadbackValidated !== true ||
+          resident.appendedCacheReadbackValidated !== true ||
+          resident.cacheReadbackFree !== false) {
+        throw new Error('first same-session request did not qualify device-resident KV caches.');
+      }
+      cacheQualification = {
+        source: 'warmup-0',
+        encoderMemoryReadbackValidated: true,
+        encoderCrossCacheReadbackValidated: true,
+        cachePrefixReadbackValidated: true,
+        appendedCacheReadbackValidated: true,
+        tokenCacheTransitionParity: true,
+      };
+    } else if (resident.mode !== 'device-resident' ||
+               resident.encoderMemoryReadback !== false ||
+               resident.encoderMemoryReadbackValidated !== false ||
+               resident.encoderCrossCacheReadbackValidated !== false ||
+               resident.cachePrefixReadbackValidated !== false ||
+               resident.appendedCacheReadbackValidated !== false ||
+               resident.cacheReadbackFree !== true) {
+      throw new Error(`run ${index} performed a measured KV cache readback.`);
+    }
     runs.push({
-      name: index === 0 ? 'cold-graphs' : 'hot-graphs',
-      generationMs: performance.now() - started,
+      name: index < warmup ? `warmup-${index}` : `measured-${index - warmup}`,
+      measured: index >= warmup,
+      generationMs,
       family: answer.family,
+      familyId: answer.familyId,
+      requestedFamily: answer.requestedFamily,
       execution: answer.execution,
-      tokens: answer.tokenIds.length,
+      questionTokenIds: [...answer.questionTokenIds],
+      tokenIds: [...tokenIds],
       stoppedAtEos: answer.stoppedAtEos,
       text: answer.text,
+      shape: {
+        mode: answer.shapeMode,
+        B: answer.activeShape.B,
+        Q: answer.activeShape.Q,
+        M: answer.activeShape.M,
+        T: answer.activeShape.T,
+      },
+      cache: {
+        initialPastLength: 1,
+        finalPastLength: tokenIds.length + 1,
+        sentinelMaskValue: 1,
+        transitions: answer.decodeReports.map(
+          ({ position, pastLength, presentLength }) => ({
+            position, pastLength, presentLength,
+          }),
+        ),
+      },
+      gpuResidentKv: resident,
+      timing: {
+        synchronization: answer.synchronizedTiming.completion,
+        applicationValidationIncluded:
+          answer.synchronizedTiming.applicationValidationIncluded,
+        cacheQualificationReadbackIncluded:
+          answer.synchronizedTiming.cacheQualificationReadbackIncluded,
+        encoderExecutionMs: answer.synchronizedTiming.encoderExecutionMs,
+        decoderSeedMs: decoderTiming.seedMs,
+        decoderSteadySteps: decoderTiming.steadySteps,
+        decoderSteadyTotalMs: decoderTiming.steadyTotalMs,
+        decoderSteadyMeanMs: decoderTiming.steadyMeanMs,
+        decoderSteadyTokensPerSecond: decoderTiming.steadyTokensPerSecond,
+        decoderExecutionTotalMs: decoderTiming.totalMs,
+        decoderStepMs: [...decoderTiming.steps],
+      },
+      executionPhases: {
+        encoder: executionPhaseBreakdown(encoderReports[0], `run ${index} encoder`),
+        decoder: decoderReports.map((report, step) =>
+          executionPhaseBreakdown(report, `run ${index} decoder step ${step}`)),
+      },
+      executionAttestations: {
+        encoder: executionAttestation(encoderReports[0]),
+        decoder: decoderReports.map(executionAttestation),
+      },
+      tactics: {
+        encoder: encoderReports[0].backendReport?.selectedTactics || [],
+        decoder: decoderReports.map(
+          (report) => report.backendReport?.selectedTactics || [],
+        ),
+      },
     });
   }
-  if (runs[0].family !== runs[1].family || runs[0].text !== runs[1].text ||
-      runs[0].tokens !== runs[1].tokens) {
-    throw new Error('cold and hot WebGPU generations produced different answers');
+  if (warmup === 0) {
+    executions.push({ encoder: [], decoder: [] });
+    const executionIndex = executions.length - 1;
+    activeRun = executionIndex;
+    let qualified;
+    try {
+      qualified = await session.generate({
+        image,
+        prompt,
+        family,
+        preprocessed: true,
+        maxNewTokens,
+        shapeMode: 'active',
+        kvTransferMode: 'device-qualified',
+      });
+    } finally {
+      activeRun = null;
+    }
+    const qualifiedTokens = validateExplicitKVAnswer(qualified, maxNewTokens);
+    if (JSON.stringify({ family: qualified.family, tokenIds: qualifiedTokens }) !==
+        JSON.stringify({ family: runs[0].family, tokenIds: runs[0].tokenIds })) {
+      throw new Error('untimed cache qualification changed family/token output.');
+    }
+    const qualifiedEncoderReports = executions[executionIndex].encoder;
+    const qualifiedDecoderReports = executions[executionIndex].decoder;
+    if (qualifiedEncoderReports.length !== 1 ||
+        qualifiedDecoderReports.length !== qualifiedTokens.length) {
+      throw new Error('untimed cache qualification lacks exact execution reports.');
+    }
+    validateExecution(qualifiedEncoderReports[0], 'untimed qualification encoder');
+    qualifiedDecoderReports.forEach((report, step) =>
+      validateExecution(report, `untimed qualification decoder step ${step}`));
+    const resident = qualified.gpuResidentKv;
+    if (resident?.mode !== 'device-qualified' ||
+        resident.encoderMemoryReadback !== true ||
+        resident.encoderMemoryReadbackValidated !== true ||
+        resident.encoderCrossCacheReadbackValidated !== true ||
+        resident.cachePrefixReadbackValidated !== true ||
+        resident.appendedCacheReadbackValidated !== true ||
+        resident.cacheReadbackFree !== false) {
+      throw new Error('untimed request did not qualify device-resident KV caches.');
+    }
+    cacheQualification = {
+      source: 'untimed-correctness-request',
+      encoderMemoryReadbackValidated: true,
+      encoderCrossCacheReadbackValidated: true,
+      cachePrefixReadbackValidated: true,
+      appendedCacheReadbackValidated: true,
+      tokenCacheTransitionParity: true,
+    };
+  }
+  const signature = JSON.stringify({ family: runs[0].family, tokenIds: runs[0].tokenIds });
+  if (runs.some((run) => JSON.stringify({ family: run.family, tokenIds: run.tokenIds }) !== signature)) {
+    throw new Error('WebGPU generations produced different family/token outputs');
   }
 
-  for (let index = 0; index < runs.length; index++) {
-    runs[index].encoderExecutions = executions.encoder[index];
-    runs[index].decoderExecutions = executions.decoder[index];
+  compiles.forEach(({ report }, index) =>
+    validateCompilation(report, index === 0 ? 'encoder' : 'decoder'));
+  if (compiles.length !== 2) throw new Error(`expected two compilations, got ${compiles.length}.`);
+  const encoderContextCount = [...contextLabels.values()]
+    .filter((label) => label === 'encoder').length;
+  const decoderContextCount = [...contextLabels.values()]
+    .filter((label) => label === 'decoder').length;
+  if (contextLabels.size !== 2 || encoderContextCount !== 1 || decoderContextCount !== 1) {
+    throw new Error('benchmark did not reuse exactly one encoder and decoder context.');
+  }
+  if (warmup > 0) {
+    const measuredRuns = runs.filter((run) => run.measured);
+    for (const run of measuredRuns) {
+      if (run.executionPhases.encoder.specializationCacheHit !== true ||
+          run.executionPhases.decoder.some((phase) => phase.specializationCacheHit !== true)) {
+        throw new Error('measured WebGPU request missed a warmed shape specialization.');
+      }
+    }
   }
 
   const selectedDevice = compiles.find(({ label }) => label === 'decoder')
@@ -169,17 +518,31 @@ try {
     adapter: selectedDevice,
     packedDot4: navigator.gpu.wgslLanguageFeatures?.has('packed_4x8_integer_dot_product') === true,
     prompt,
+    family,
+    precision: packagePrecision,
     maxNewTokens,
+    warmup,
+    iterations,
+    inputTensorSha256,
     runtimeInitMs,
     sessionLoadMs,
     preprocessMs,
     graphLoads,
     compiles,
+    contextReuse: {
+      sameRuntime: true,
+      sameSession: true,
+      encoderContextCount,
+      decoderContextCount,
+    },
+    cacheQualification,
     fetchCounts: [...fetchCounts.entries()].map(([url, requests]) => ({ url, requests })),
-    runs,
+    runs: runs.filter((run) => run.measured),
+    warmupRuns: runs.filter((run) => !run.measured),
   };
   window.__webgpuW8A8BenchmarkResult = result;
   show(result);
+  }
 } catch (error) {
   const result = {
     status: 'fail',

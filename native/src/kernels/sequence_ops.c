@@ -6,6 +6,7 @@
  * wrap the same contracts without changing graph semantics.
  */
 #include "mathcompat.h"
+#include "fast_exp.h"
 #include "sequence_ops.h"
 #include <stddef.h>
 #include <stdint.h>
@@ -73,6 +74,17 @@ int rope_f32(const float *input, const void *position_ids, float *output,
         (position_mode && !position_ids) ||
         !vx_sequence_product(&elements, sequence) ||
         !vx_sequence_product(&elements, width)) return 0;
+
+    /* Value validation is a pre-write phase: a rejected position list must not
+     * leave a partially rotated output behind. */
+    if (position_mode) {
+        size_t position_count = position_mode == 1u
+            ? (size_t)sequence
+            : (size_t)batch * sequence;
+        for (size_t index = 0; index < position_count; index++) {
+            if (vx_sequence_i32_at(position_ids, index) < 0) return 0;
+        }
+    }
 
     for (uint32_t batch_index = 0; batch_index < batch; batch_index++) {
         for (uint32_t sequence_index = 0; sequence_index < sequence; sequence_index++) {
@@ -175,12 +187,17 @@ int ssm_scan_f32(const float *input, const float *delta, const float *a,
                 float dt = delta[input_index];
                 float result = d ? d[channel] * input_value : 0.0f;
                 if (delta_softplus) dt = vx_sequence_softplus(dt);
+                /* accurate_expf, not expf: on wasm32 expf is a host import, and
+                 * this is the innermost loop of the scan -- batch * sequence *
+                 * channels * state_width calls across the JavaScript boundary
+                 * for one Mamba block. The polynomial is ~1e-6 relative, an
+                 * order inside the 2e-5 this kernel is tested to. */
                 for (uint32_t state_index = 0; state_index < state_width; state_index++) {
                     size_t b_index = vx_sequence_bc_index(b_mode, batch_index,
                         sequence_index, state_index, sequence, state_width);
                     size_t c_index = vx_sequence_bc_index(c_mode, batch_index,
                         sequence_index, state_index, sequence, state_width);
-                    float state = expf(dt * a[a_base + state_index]) *
+                    float state = accurate_expf(dt * a[a_base + state_index]) *
                         state_scratch[state_base + state_index] +
                         dt * b[b_index] * input_value;
                     state_scratch[state_base + state_index] = state;
@@ -188,7 +205,7 @@ int ssm_scan_f32(const float *input, const float *delta, const float *a,
                 }
                 if (z) {
                     float gate = z[input_index];
-                    gate = gate / (1.0f + expf(-gate));
+                    gate = gate / (1.0f + accurate_expf(-gate));
                     result *= gate;
                 }
                 output[input_index] = result;

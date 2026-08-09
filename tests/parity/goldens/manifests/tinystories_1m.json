@@ -1,7 +1,7 @@
 {
   "schema": "volvoxai.parity-run-manifest",
   "version": 1,
-  "runId": "85e8d561-fce6-468b-ab47-d36ef95b8f00",
+  "runId": "7679f801-fad6-4d21-ab54-fa4b2ef06aea",
   "command": "golden",
   "fingerprint": {
     "schema": "volvoxai.parity-fingerprint",
@@ -11,15 +11,15 @@
       "policy": [
         {
           "path": "tests/parity/policy.json",
-          "sha256": "fb27224d2996e5bafd56a063526ce34d9d4fdcee165950bf663a48b7f15adab3",
-          "size": 3885
+          "sha256": "2909cc971c77e27149f51ea3337368615d9e2c285bc7bb8605bbd387d0b5782c",
+          "size": 6621
         }
       ],
       "models": [
         {
           "path": "models/tinystories_1m/graph.json",
-          "sha256": "ad7990cc83e83eb98d9533d2d8ad880793db5e33c1969d1ebfc93f052804b442",
-          "size": 23520
+          "sha256": "f7657197c5fb4658fec97e20f62066a82f405deb03d784f9d5105d0ffdc4e5e3",
+          "size": 31487
         },
         {
           "path": "models/tinystories_1m/model.safetensors",
@@ -42,18 +42,18 @@
       "builds": [
         {
           "path": "dist/0.3.0/volvoxai.js",
-          "sha256": "3303b6d03596642c716579e7f878330efa0a7799e585080af96eef768b0f4323",
-          "size": 1222890
+          "sha256": "a1e492cb98aa12674689ad5928bd861b1fa55d660dbc27a4280d65c9fbb96020",
+          "size": 2170365
         }
       ],
       "sources": [],
       "source": {
-        "revision": "e84b57c0d614364212d9186df986af82a942cf72",
+        "revision": "e9696b57c4f74122de7c9d84e36be2c9bcf81871",
         "state": "dirty",
-        "statusSha256": "9081ba13db4966ec378e28b7a2b319592e10d71a5949e20093b977195dbadf39"
+        "statusSha256": "4fd334773bfd51ddd70d95ebfb4c9d688038f97f750f39921d253d113f569304"
       }
     },
-    "digest": "64415da6a8cf3cb07ac93b4d210ed63d25b27d7098a8aa61a386918f2ab78805"
+    "digest": "911764bd458efbc194938d1d130ce7aa490c9a7ae6020c63e451dac316bea6f4"
   },
   "selection": {
     "cases": [
@@ -76,8 +76,8 @@
     "runtimeEvidenceRequired": true,
     "strictBackend": true
   },
-  "startedAt": "2026-07-21T09:21:44.571Z",
-  "completedAt": "2026-07-21T09:22:03.828Z",
+  "startedAt": "2026-08-02T16:56:19.627Z",
+  "completedAt": "2026-08-02T16:56:27.802Z",
   "outcome": "success",
   "results": [
     {
@@ -86,15 +86,15 @@
       "status": "success",
       "artifact": {
         "path": "tinystories_1m.json",
-        "sha256": "311924173b07ea12446829d9bb0cf974a37f50a1788cd7dc51ff03a7b308c386",
-        "size": 26776
+        "sha256": "1892908db5801ab3a2a5d3bb7ab4f83d7914b3b79d8043fffe6c94a68dc2fbe5",
+        "size": 26770
       },
-      "durationMs": 9284.24,
+      "durationMs": 3528.69,
       "metadata": {
         "runtimeEvidence": {
           "compilation": {
-            "compilationId": "compilation-52017e08-d60e-4d2b-85aa-082eef401742",
-            "definitionId": "model-definition-839450a4-90e8-42d6-b9d2-1daa2d67b9e6",
+            "compilationId": "compilation-5e182852-3173-4cc5-84f9-0d5bf04b13d4",
+            "definitionId": "model-definition-1d6b7fd4-b7b0-46f2-b686-3ea70c3da265",
             "policy": {
               "backend": "cpu",
               "mode": "require",
@@ -104,8 +104,8 @@
               "adapterRevisionId": null,
               "adapterRevisionIds": [],
               "topologyRevision": 1,
-              "weightRevision": 0,
-              "weightRevisionId": "model-definition-839450a4-90e8-42d6-b9d2-1daa2d67b9e6:weight-revision-3660f16e-607b-4e7e-bdaf-4ac2f4a0ec7b"
+              "weightRevision": 1,
+              "weightRevisionId": "model-definition-1d6b7fd4-b7b0-46f2-b686-3ea70c3da265:weight:1:weight-revision-bccc8e53-34d5-4264-aa47-cd95119c643a"
             },
             "route": {
               "operator": {
@@ -123,9 +123,9 @@
           },
           "execution": {
             "backend": "cpu",
-            "contextId": "context-76fdd1ca-a9da-4f93-9379-24ac2817a123",
+            "contextId": "context-dc3e775b-f041-4d34-8dd0-ea67ba6376bb",
             "decodeState": {
-              "cacheGeneration": 3,
+              "cacheGeneration": null,
               "cacheState": "not-applicable",
               "mode": null,
               "operation": "execute",
@@ -135,16 +135,14 @@
               "backend": "cpu",
               "device": "host"
             },
-            "executionId": "execution-7d222218-44de-4a39-ab53-3ff95fec1c22",
+            "executionId": "execution-1794a805-b10e-4220-9470-7968ae7be495",
             "outcome": "success",
             "revisions": {
               "adapterRevisionId": null,
-              "adapterRevisionIds": [
-                null
-              ],
+              "adapterRevisionIds": [],
               "topologyRevision": 1,
-              "weightRevision": 0,
-              "weightRevisionId": "model-definition-839450a4-90e8-42d6-b9d2-1daa2d67b9e6:weight-revision-3660f16e-607b-4e7e-bdaf-4ac2f4a0ec7b"
+              "weightRevision": 1,
+              "weightRevisionId": "model-definition-1d6b7fd4-b7b0-46f2-b686-3ea70c3da265:weight:1:weight-revision-bccc8e53-34d5-4264-aa47-cd95119c643a"
             },
             "route": {
               "operator": {

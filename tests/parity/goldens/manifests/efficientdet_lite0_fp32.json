@@ -1,7 +1,7 @@
 {
   "schema": "volvoxai.parity-run-manifest",
   "version": 1,
-  "runId": "3423da74-99ae-4f50-bf1a-5fb75d6d2ec2",
+  "runId": "d05f287b-41a6-4708-81db-758b9f8d04ef",
   "command": "golden",
   "fingerprint": {
     "schema": "volvoxai.parity-fingerprint",
@@ -11,19 +11,19 @@
       "policy": [
         {
           "path": "tests/parity/policy.json",
-          "sha256": "fb27224d2996e5bafd56a063526ce34d9d4fdcee165950bf663a48b7f15adab3",
-          "size": 3885
+          "sha256": "2909cc971c77e27149f51ea3337368615d9e2c285bc7bb8605bbd387d0b5782c",
+          "size": 6621
         }
       ],
       "models": [
         {
           "path": "models/efficientdet_lite0_fp32/graph.json",
-          "sha256": "de96819a7f9f3ae82f604f5d1ee4b25b68e8afb07f294b42f869c1515d239b22",
-          "size": 126345
+          "sha256": "a9a6c3af0c1b4efcfbeae69ecb70c079eb1b84279f4c97249023e906b23da092",
+          "size": 120879
         },
         {
           "path": "models/efficientdet_lite0_fp32/model.safetensors",
-          "sha256": "4b5888a5eb7f3ed894c285c21ef9fa4dc3fbae0ea64efcf604bd182679b941c0",
+          "sha256": "b430e29a79c18e313e2423da0901423f925176df13199e8dadd8872361371cff",
           "size": 13282056
         }
       ],
@@ -37,18 +37,18 @@
       "builds": [
         {
           "path": "dist/0.3.0/volvoxai.js",
-          "sha256": "3303b6d03596642c716579e7f878330efa0a7799e585080af96eef768b0f4323",
-          "size": 1222890
+          "sha256": "a1e492cb98aa12674689ad5928bd861b1fa55d660dbc27a4280d65c9fbb96020",
+          "size": 2170365
         }
       ],
       "sources": [],
       "source": {
-        "revision": "e84b57c0d614364212d9186df986af82a942cf72",
+        "revision": "e9696b57c4f74122de7c9d84e36be2c9bcf81871",
         "state": "dirty",
-        "statusSha256": "9081ba13db4966ec378e28b7a2b319592e10d71a5949e20093b977195dbadf39"
+        "statusSha256": "4fd334773bfd51ddd70d95ebfb4c9d688038f97f750f39921d253d113f569304"
       }
     },
-    "digest": "506f30d21fb827e3fb207ecdaf38f454538a0664ffbc6379b8d3e93b7df4a18b"
+    "digest": "202cf5ea427b9b6809789b094bb4c7a64202fa297164dfb03c1108d5bcacc0d7"
   },
   "selection": {
     "cases": [
@@ -71,8 +71,8 @@
     "runtimeEvidenceRequired": true,
     "strictBackend": true
   },
-  "startedAt": "2026-07-21T09:22:15.487Z",
-  "completedAt": "2026-07-21T09:22:32.003Z",
+  "startedAt": "2026-08-02T16:56:39.331Z",
+  "completedAt": "2026-08-02T16:57:14.675Z",
   "outcome": "success",
   "results": [
     {
@@ -81,15 +81,15 @@
       "status": "success",
       "artifact": {
         "path": "efficientdet_lite0_fp32.json",
-        "sha256": "0f0559aeba5b237768f2526943d83e588573b6f511d9ef1b598ae7bcb62595bf",
-        "size": 51294
+        "sha256": "d8b82308202e1cfec682ab838b6e873f440849a8aba7bc5044bae88ff6b0d9bb",
+        "size": 51287
       },
-      "durationMs": 7572.04,
+      "durationMs": 16929.74,
       "metadata": {
         "runtimeEvidence": {
           "compilation": {
-            "compilationId": "compilation-2737f2ac-4954-4144-aba4-e6b5d851c30f",
-            "definitionId": "model-definition-8aa4c2f1-7233-4915-8617-1217c087d044",
+            "compilationId": "compilation-78141939-cadb-44e5-ae5e-f8904f832dde",
+            "definitionId": "model-definition-696c1751-a246-4bef-b888-b284308a56f1",
             "policy": {
               "backend": "cpu",
               "mode": "require",
@@ -99,8 +99,8 @@
               "adapterRevisionId": null,
               "adapterRevisionIds": [],
               "topologyRevision": 1,
-              "weightRevision": 0,
-              "weightRevisionId": "model-definition-8aa4c2f1-7233-4915-8617-1217c087d044:weight-revision-da337fcd-c12d-4041-8990-4c7bf06f5495"
+              "weightRevision": 1,
+              "weightRevisionId": "model-definition-696c1751-a246-4bef-b888-b284308a56f1:weight:1:weight-revision-2d373176-a7b9-4ca9-8c88-f8584d56ab63"
             },
             "route": {
               "operator": {
@@ -118,9 +118,9 @@
           },
           "execution": {
             "backend": "cpu",
-            "contextId": "context-f8fa735d-1517-4e64-bf31-91608ed5987e",
+            "contextId": "context-1df1e3f6-c80b-4209-95af-16b01caf4ec5",
             "decodeState": {
-              "cacheGeneration": 3,
+              "cacheGeneration": null,
               "cacheState": "not-applicable",
               "mode": null,
               "operation": "execute",
@@ -130,16 +130,14 @@
               "backend": "cpu",
               "device": "host"
             },
-            "executionId": "execution-dd4b17dc-8e7a-47d3-9408-f5503ccee341",
+            "executionId": "execution-254f8a0e-c03b-4bb4-9f58-39cc3e23d8e3",
             "outcome": "success",
             "revisions": {
               "adapterRevisionId": null,
-              "adapterRevisionIds": [
-                null
-              ],
+              "adapterRevisionIds": [],
               "topologyRevision": 1,
-              "weightRevision": 0,
-              "weightRevisionId": "model-definition-8aa4c2f1-7233-4915-8617-1217c087d044:weight-revision-da337fcd-c12d-4041-8990-4c7bf06f5495"
+              "weightRevision": 1,
+              "weightRevisionId": "model-definition-696c1751-a246-4bef-b888-b284308a56f1:weight:1:weight-revision-2d373176-a7b9-4ca9-8c88-f8584d56ab63"
             },
             "route": {
               "operator": {

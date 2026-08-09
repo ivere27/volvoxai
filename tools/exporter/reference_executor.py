@@ -23,6 +23,13 @@ import numpy as np
 from .errors import Diagnostic, ExporterError
 from .ir import AffineQuantization, GraphIR, IRDialect, OpNode, TensorValue
 from .quantized_embedding import embedding_ids_preflight_proof
+from .shape_system import (
+    PublicInputShapeContract,
+    ShapeBinding,
+    ShapeContractError,
+    ShapedRuntimeTensorView,
+    bind_public_input_shapes,
+)
 
 
 _NUMPY_DTYPES = {
@@ -31,6 +38,10 @@ _NUMPY_DTYPES = {
     "int32": np.dtype(np.int32),
     "int8": np.dtype(np.int8),
     "uint8": np.dtype(np.uint8),
+}
+_RUNTIME_DTYPES_BY_NUMPY = {
+    value: key for key, value in _NUMPY_DTYPES.items()
+    if key != "float16"
 }
 _BYTE_DTYPES = frozenset({"int8", "uint8"})
 _SUPPORTED_OPS = frozenset({
@@ -75,6 +86,7 @@ class ReferenceExecution:
     outputs: Mapping[str, np.ndarray]
     intermediates: Mapping[str, np.ndarray]
     tensors: Mapping[str, np.ndarray]
+    binding: ShapeBinding
 
     def tensor(self, name: str) -> np.ndarray:
         return self.tensors[name]
@@ -88,26 +100,117 @@ class ReferenceExecutor:
             raise TypeError("graph must be a GraphIR")
         graph.verify(IRDialect.RUNTIME)
         self.graph = graph
+        self._input_contract = PublicInputShapeContract(
+            graph.shape_environment,
+            tuple({
+                "name": name,
+                "dtype": graph.tensors[name].dtype,
+                "shape": graph.tensors[name].shape,
+            } for name in graph.inputs),
+        )
         self._initializers = self._load_initializers(initializers)
 
-    def run(self, inputs: Mapping[str, Any]) -> ReferenceExecution:
+    def bind(self, inputs: Mapping[str, Any]) -> ShapeBinding:
+        """Validate one complete concrete public-input set atomically."""
+
         if not isinstance(inputs, Mapping):
             _fail("VXREF001", "reference inputs must be a tensor mapping")
-        expected_inputs = set(self.graph.inputs)
-        supplied_inputs = set(inputs)
-        if supplied_inputs != expected_inputs:
-            missing = sorted(expected_inputs - supplied_inputs, key=repr)
-            unexpected = sorted(supplied_inputs - expected_inputs, key=repr)
-            _fail(
-                "VXREF002",
-                f"public input inventory differs (missing={missing}, unexpected={unexpected})",
+        views: dict[str, ShapedRuntimeTensorView] = {}
+        for name, value in inputs.items():
+            if not isinstance(name, str):
+                _fail("VXREF002", "public input names must be strings")
+            array = np.asarray(value)
+            dtype = _RUNTIME_DTYPES_BY_NUMPY.get(array.dtype)
+            if dtype is None:
+                _fail(
+                    "VXREF007",
+                    f"input {name!r} has unsupported dtype {array.dtype!r}",
+                )
+            views[name] = ShapedRuntimeTensorView(
+                data=array,
+                shape=tuple(int(value) for value in array.shape),
+                dtype=dtype,
+                byte_length=int(array.nbytes),
             )
+        try:
+            return bind_public_input_shapes(self._input_contract, views)
+        except ShapeContractError as error:
+            _fail(
+                "VXREF008",
+                "concrete public-input binding failed "
+                f"({error.code} at {error.path}): {error.detail}",
+            )
+
+    def run(self, binding: ShapeBinding) -> ReferenceExecution:
+        """Execute one already validated concrete binding."""
+
+        if not isinstance(binding, ShapeBinding):
+            _fail(
+                "VXREF001",
+                "reference execution requires a ShapeBinding; call bind(inputs) first",
+            )
+        binding = self._revalidate_binding(binding)
+        bound_graph = self.graph.bind_shape_profile(dict(binding.symbols))
+        bound_executor = ReferenceExecutor(bound_graph, self._initializers)
+        return bound_executor._run_bound(binding)
+
+    def _revalidate_binding(self, binding: ShapeBinding) -> ShapeBinding:
+        """Reject fabricated, stale, or mutated binding data before execution."""
+
+        views: dict[str, ShapedRuntimeTensorView] = {}
+        for value in binding.inputs:
+            array = np.asarray(value.data)
+            dtype = _RUNTIME_DTYPES_BY_NUMPY.get(array.dtype)
+            if dtype is None:
+                _fail(
+                    "VXREF007",
+                    f"bound input {value.name!r} has unsupported dtype {array.dtype!r}",
+                )
+            views[value.name] = ShapedRuntimeTensorView(
+                data=value.data,
+                shape=tuple(int(axis) for axis in array.shape),
+                dtype=dtype,
+                byte_length=int(array.nbytes),
+            )
+        try:
+            checked = bind_public_input_shapes(self._input_contract, views)
+        except ShapeContractError as error:
+            _fail(
+                "VXREF008",
+                "concrete public-input rebinding failed "
+                f"({error.code} at {error.path}): {error.detail}",
+            )
+        supplied_metadata = tuple(
+            (value.name, value.dtype, value.shape, value.element_count, value.size_bytes)
+            for value in binding.inputs
+        )
+        checked_metadata = tuple(
+            (value.name, value.dtype, value.shape, value.element_count, value.size_bytes)
+            for value in checked.inputs
+        )
+        if (
+            binding.signature != checked.signature
+            or binding.symbols != checked.symbols
+            or supplied_metadata != checked_metadata
+            or any(
+                supplied.data is not validated.data
+                for supplied, validated in zip(binding.inputs, checked.inputs)
+            )
+        ):
+            _fail("VXREF008", "concrete public-input binding is stale or fabricated")
+        return checked
+
+    def _run_bound(self, binding: ShapeBinding) -> ReferenceExecution:
+        """Execute against this executor's fully concrete graph."""
 
         values: dict[str, np.ndarray] = {
             name: _readonly_copy(value) for name, value in self._initializers.items()
         }
         for name in self.graph.inputs:
-            values[name] = self._validate_array(name, inputs[name], role="input")
+            bound = binding.input(name)
+            if bound is None:
+                _fail("VXREF002", f"binding omits public input {name!r}")
+            values[name] = self._validate_array(name, bound.data, role="input")
 
         captures: dict[str, np.ndarray] = {}
         for node in self.graph.nodes:
@@ -135,6 +238,7 @@ class ReferenceExecutor:
             outputs=MappingProxyType(outputs),
             intermediates=MappingProxyType(dict(captures)),
             tensors=MappingProxyType(dict(values)),
+            binding=binding,
         )
 
     def _load_initializers(self, initializers: Mapping[str, Any]) -> dict[str, np.ndarray]:
@@ -449,13 +553,13 @@ class ReferenceExecutor:
         else:
             _fail("VXREF018", "Linear transB must be boolean or 0/1", node)
         if trans_b:
-            if layout not in {None, "OUT_IN"}:
+            if layout not in {None, "dout_din"}:
                 _fail("VXREF018", "Linear transB conflicts with weight_layout", node)
-            layout = "OUT_IN"
-        if layout not in {"IN_OUT", "OUT_IN"}:
+            layout = "dout_din"
+        if layout not in {"din_dout", "dout_din"}:
             _fail(
                 "VXREF018",
-                "Linear-style MatMul requires explicit weight_layout IN_OUT or OUT_IN",
+                "Linear-style MatMul requires explicit weight_layout din_dout or dout_din",
                 node,
             )
         input_name = node.input_map()["input"]
@@ -483,7 +587,7 @@ class ReferenceExecutor:
                     "Linear weight operands must match its central descriptor",
                     node,
                 )
-            axis = 0 if layout == "OUT_IN" else 1
+            axis = 0 if layout == "dout_din" else 1
             if descriptor.scheme == "per_axis" and self._normalized_axis(
                 descriptor.axis, inputs["weight"].ndim, node,
             ) != axis:
@@ -492,7 +596,7 @@ class ReferenceExecutor:
         else:
             _fail("VXREF024", f"unsupported Linear weight dtype {weight_desc.dtype}", node)
 
-        matrix = weight.T if layout == "OUT_IN" else weight
+        matrix = weight.T if layout == "dout_din" else weight
         result = np.asarray(np.matmul(inputs["input"], matrix), dtype=np.float32)
         if "bias" in inputs:
             bias_name = node.input_map()["bias"]
@@ -665,8 +769,8 @@ class ReferenceExecutor:
             _NUMPY_DTYPES[descriptors[2].dtype]
         )
 
-    def _conv_parameters(self, node: OpNode) -> tuple[
-        tuple[int, int], tuple[int, int], tuple[int, int, int, int], int, int,
+    def _conv_parameters(self, node: OpNode, *, weight_layouts: tuple[str, ...] = ("OHWI",)) -> tuple[
+        tuple[int, int], tuple[int, int], tuple[int, int, int, int], int, int, str,
     ]:
         params = self._params(node, (
             "stride", "dilation", "groups", "pads", "padding",
@@ -686,11 +790,17 @@ class ReferenceExecutor:
                 _fail("VXREF071", "Conv2D has invalid integer geometry", node)
             return tuple(int(item) for item in value)
 
+        weight_layout = params.get("weight_layout", "OHWI")
         if (
             params.get("data_layout", "NHWC") != "NHWC"
-            or params.get("weight_layout", "OHWI") != "OHWI"
+            or weight_layout not in weight_layouts
         ):
-            _fail("VXREF071", "Conv2D oracle supports canonical NHWC/OHWI", node)
+            _fail(
+                "VXREF071",
+                "Conv2D oracle supports NHWC activations with "
+                f"{'/'.join(weight_layouts)} weights",
+                node,
+            )
         stride = pair(params.get("stride", [1, 1]), 2, positive=True)
         dilation = pair(params.get("dilation", [1, 1]), 2, positive=True)
         padding = pair(params.get("padding", [0, 0]), 2, positive=False)
@@ -707,11 +817,13 @@ class ReferenceExecutor:
             or relu not in {0, 1, 2}
         ):
             _fail("VXREF071", "Conv2D groups/relu are invalid", node)
-        return stride, dilation, pads, groups, relu
+        return stride, dilation, pads, groups, relu, weight_layout
 
     def _conv2d(self, node: OpNode, inputs: Mapping[str, np.ndarray]) -> np.ndarray:
         self._require_ports(node, inputs, ("input", "weight"), ("bias",))
-        stride, dilation, pads, groups, relu = self._conv_parameters(node)
+        stride, dilation, pads, groups, relu, weight_layout = self._conv_parameters(
+            node, weight_layouts=("OHWI", "HWIO", "HWCM"),
+        )
         names = node.input_map()
         output = self.graph.tensors[self._single_output_name(node)]
         source = self.graph.tensors[names["input"]]
@@ -723,6 +835,15 @@ class ReferenceExecutor:
         ):
             _fail("VXREF072", "Conv2D requires canonical rank-4 F32 storage", node)
         weight = np.asarray(inputs["weight"], dtype=np.float32)
+        # The oracle indexes OHWI. HWIO/HWCM are the image-layout compute forms the
+        # runtimes consume directly; fold them back so one loop covers every layout.
+        if weight_layout == "HWIO":
+            weight = np.ascontiguousarray(np.transpose(weight, (3, 0, 1, 2)))
+        elif weight_layout == "HWCM":
+            kernel_h, kernel_w, channels, multiplier = weight.shape
+            weight = np.ascontiguousarray(
+                np.transpose(weight, (2, 3, 0, 1))
+            ).reshape(channels * multiplier, kernel_h, kernel_w, 1)
         values = np.asarray(inputs["input"], dtype=np.float32)
         batch, input_h, input_w, input_channels = values.shape
         out_channels, kernel_h, kernel_w, input_per_group = weight.shape
@@ -770,7 +891,7 @@ class ReferenceExecutor:
 
     def _qconv2d(self, node: OpNode, inputs: Mapping[str, np.ndarray]) -> np.ndarray:
         self._require_ports(node, inputs, ("input", "weight"), ("bias",))
-        stride, dilation, pads, groups, relu = self._conv_parameters(node)
+        stride, dilation, pads, groups, relu, _ = self._conv_parameters(node)
         names = node.input_map()
         output_name = self._single_output_name(node)
         source_desc = self.graph.tensors[names["input"]]
@@ -1657,7 +1778,7 @@ class ReferenceExecutor:
         )
 
     def _reshape(self, node: OpNode, inputs: Mapping[str, np.ndarray]) -> np.ndarray:
-        self._params(node, ())
+        params = self._params(node, ("shape",))
         self._require_ports(node, inputs, ("input",))
         source = self.graph.tensors[node.input_map()["input"]]
         output = self.graph.tensors[self._single_output_name(node)]
@@ -1666,10 +1787,12 @@ class ReferenceExecutor:
         if source.dtype not in {"float32", "int32", "int8", "uint8"}:
             _fail("VXREF027", f"Reshape does not support {source.dtype} storage", node)
         self._require_byte_mapping_preserved(node, (source, output))
+        if "shape" in params and tuple(params["shape"]) != output.shape:
+            _fail("VXREF027", "Reshape params.shape must match its output descriptor", node)
         return np.reshape(inputs["input"], tuple(int(d) for d in output.shape)).copy()
 
     def _expand(self, node: OpNode, inputs: Mapping[str, np.ndarray]) -> np.ndarray:
-        self._params(node, ())
+        params = self._params(node, ("shape",))
         self._require_ports(node, inputs, ("input",))
         source = self.graph.tensors[node.input_map()["input"]]
         output = self.graph.tensors[self._single_output_name(node)]
@@ -1682,6 +1805,8 @@ class ReferenceExecutor:
             _fail("VXREF071", "Expand requires rank-1..8 input/output tensors", node)
         offset = output.rank - source.rank
         target = tuple(int(value) for value in output.shape)
+        if "shape" in params and tuple(params["shape"]) != output.shape:
+            _fail("VXREF071", "Expand params.shape must match its output descriptor", node)
         for output_axis, output_dimension in enumerate(target):
             source_dimension = (
                 1 if output_axis < offset
@@ -1911,7 +2036,8 @@ def execute_reference(
 ) -> ReferenceExecution:
     """Convenience wrapper for a one-shot reference execution."""
 
-    return ReferenceExecutor(graph, initializers).run(inputs)
+    executor = ReferenceExecutor(graph, initializers)
+    return executor.run(executor.bind(inputs))
 
 
 __all__ = [

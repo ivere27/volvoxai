@@ -1486,6 +1486,219 @@ static int test_engine_state_isolation(VxEngineState* first) {
     return 0;
 }
 
+static int test_dynamic_shape_capacity_lifecycle(void) {
+    float small_input_a[4] = {1.0f, 2.0f, 3.0f, 4.0f};
+    float small_output_a[4] = {0};
+    float small_input_b[4] = {5.0f, 6.0f, 7.0f, 8.0f};
+    float small_output_b[4] = {0};
+    float large_input[128];
+    float large_output[128] = {0};
+    MetalGraphDynamicStateProbe bound = {0};
+    MetalGraphDynamicStateProbe active = {0};
+    MetalGraphDynamicStateProbe pooled = {0};
+    MetalGraphDynamicStateProbe reused = {0};
+    MetalGraphDynamicStateProbe grown = {0};
+    for (int index = 0; index < 128; index++)
+        large_input[index] = (float)(index - 17);
+
+    metal_graph_reset();
+    CHECK(metal_graph_bind_shape("copy:f32:[4]->[4]") == 0);
+    CHECK(metal_graph_debug_dynamic_state(&bound) == 0);
+    CHECK(bound.shape_generation != 0);
+    CHECK(metal_graph_bind_shape("copy:f32:[4]->[4]") == 0);
+    CHECK(metal_graph_debug_dynamic_state(&active) == 0);
+    CHECK(active.shape_generation == bound.shape_generation);
+    CHECK(metal_graph_bind_shape("") == -1);
+    CHECK(metal_graph_debug_dynamic_state(&active) == 0);
+    CHECK(active.shape_generation == bound.shape_generation);
+
+    metal_graph_begin_forward();
+    CHECK(metal_graph_copy_f32(small_input_a, small_output_a, 4) == 1);
+    CHECK(metal_graph_end_forward() == 0);
+    CHECK(metal_graph_sync_host(small_output_a, sizeof(small_output_a), 0) == 1);
+    CHECK(memcmp(small_input_a, small_output_a, sizeof(small_input_a)) == 0);
+    CHECK(metal_graph_debug_dynamic_state(&active) == 0);
+    CHECK(active.active_capacity_bytes > 0 && active.pooled_capacity_bytes == 0 &&
+          active.slot_count == 2);
+
+    CHECK(metal_graph_bind_shape("copy:f32:[1,4]->[1,4]") == 0);
+    CHECK(metal_graph_debug_dynamic_state(&pooled) == 0);
+    CHECK(pooled.shape_generation != active.shape_generation &&
+          pooled.capacity_generation == active.capacity_generation &&
+          pooled.active_capacity_bytes == 0 &&
+          pooled.pooled_capacity_bytes == active.active_capacity_bytes &&
+          pooled.slot_count == active.slot_count);
+    metal_graph_begin_forward();
+    CHECK(metal_graph_copy_f32(small_input_b, small_output_b, 4) == 1);
+    CHECK(metal_graph_end_forward() == 0);
+    CHECK(metal_graph_sync_host(small_output_b, sizeof(small_output_b), 0) == 1);
+    CHECK(memcmp(small_input_b, small_output_b, sizeof(small_input_b)) == 0);
+    CHECK(metal_graph_debug_dynamic_state(&reused) == 0);
+    CHECK(reused.capacity_generation == pooled.capacity_generation &&
+          reused.slot_count == pooled.slot_count &&
+          reused.active_capacity_bytes == active.active_capacity_bytes);
+
+    CHECK(metal_graph_bind_shape("copy:f32:[128]->[128]") == 0);
+    metal_graph_begin_forward();
+    CHECK(metal_graph_copy_f32(large_input, large_output, 128) == 1);
+    CHECK(metal_graph_end_forward() == 0);
+    CHECK(metal_graph_sync_host(large_output, sizeof(large_output), 0) == 1);
+    CHECK(memcmp(large_input, large_output, sizeof(large_input)) == 0);
+    CHECK(metal_graph_debug_dynamic_state(&grown) == 0);
+    CHECK(grown.capacity_generation > reused.capacity_generation &&
+          grown.active_capacity_bytes >= sizeof(large_input) * 2u &&
+          grown.slot_count == reused.slot_count);
+    metal_graph_reset();
+    return 0;
+}
+
+static int test_dynamic_domain_reservation(void) {
+    const size_t qgroupnorm_stats_bytes = 64u;
+    const size_t qlayernorm_stats_bytes = 80u;
+    float arena[64] = {0};
+    float bootstrap_input[4] = {1.0f, 2.0f, 3.0f, 4.0f};
+    const float invariant[4] = {0.5f, 1.5f, 2.5f, 3.5f};
+    float bootstrap_output[4] = {0};
+    float missing_input[4] = {0};
+    float missing_output[4] = {0};
+    const VolvoxAIEnginePhysicalSpan spans[2] = {
+        {arena, 32u * sizeof(float)},
+        {arena + 32, 32u * sizeof(float)},
+    };
+    const VolvoxAIEnginePhysicalSpan mismatch[2] = {
+        {arena, 31u * sizeof(float)},
+        {arena + 32, 32u * sizeof(float)},
+    };
+    MetalDomainLimits limits = {0};
+    MetalGraphDynamicStateProbe before = {0};
+    MetalGraphDynamicStateProbe rolled_back = {0};
+    MetalGraphDynamicStateProbe reserved = {0};
+    MetalGraphDynamicStateProbe same = {0};
+    MetalGraphDynamicStateProbe rebound = {0};
+    MetalGraphDynamicStateProbe executed = {0};
+
+    CHECK(metal_query_domain_limits(&limits) == 0);
+    CHECK(limits.maximum_buffer_bytes >= spans[0].capacity_bytes &&
+          limits.maximum_workgroups[0] > 0u &&
+          limits.maximum_workgroup_size[0] > 0u &&
+          limits.maximum_threads_per_workgroup > 0u &&
+          limits.maximum_tensor_slots >= 2u &&
+          limits.maximum_bindings > 0u);
+
+    metal_graph_reset();
+    CHECK(metal_graph_bind_shape("domain:published") == 0);
+    metal_graph_begin_forward();
+    CHECK(metal_graph_add_f32(
+              bootstrap_input, invariant, bootstrap_output, 4) == 1);
+    CHECK(metal_graph_end_forward() == 0);
+    CHECK(metal_graph_sync_host(
+              bootstrap_output, sizeof(bootstrap_output), 0) == 1);
+    metal_graph_retain_weight(bootstrap_input, sizeof(bootstrap_input));
+    metal_graph_demote_weight(bootstrap_input, sizeof(bootstrap_input));
+    metal_graph_retain_weight(invariant, sizeof(invariant));
+    CHECK(metal_graph_debug_dynamic_state(&before) == 0);
+    CHECK(metal_test_fail_domain_allocation_after(1u) == 0);
+    CHECK(metal_graph_bind_shape_domain(
+              "domain:q4", spans, 2u, qgroupnorm_stats_bytes,
+              qlayernorm_stats_bytes) == -2);
+    CHECK(metal_graph_debug_dynamic_state(&rolled_back) == 0);
+    CHECK(rolled_back.shape_generation == before.shape_generation &&
+          rolled_back.capacity_generation == before.capacity_generation &&
+          rolled_back.active_capacity_bytes == before.active_capacity_bytes &&
+          rolled_back.pooled_capacity_bytes == before.pooled_capacity_bytes &&
+          rolled_back.domain_scratch_capacity_bytes ==
+              before.domain_scratch_capacity_bytes &&
+          rolled_back.domain_span_count == 0u &&
+          rolled_back.slot_count == before.slot_count &&
+          !rolled_back.domain_enforced);
+    CHECK(metal_test_fail_domain_allocation_after(3u) == 0);
+    CHECK(metal_graph_bind_shape_domain(
+              "domain:q4", spans, 2u, qgroupnorm_stats_bytes,
+              qlayernorm_stats_bytes) == -2);
+    CHECK(metal_graph_debug_dynamic_state(&rolled_back) == 0);
+    CHECK(rolled_back.shape_generation == before.shape_generation &&
+          rolled_back.capacity_generation == before.capacity_generation &&
+          rolled_back.active_capacity_bytes == before.active_capacity_bytes &&
+          rolled_back.pooled_capacity_bytes == before.pooled_capacity_bytes &&
+          rolled_back.domain_scratch_capacity_bytes ==
+              before.domain_scratch_capacity_bytes &&
+          rolled_back.domain_span_count == 0u &&
+          rolled_back.slot_count == before.slot_count &&
+          !rolled_back.domain_enforced);
+
+    CHECK(metal_graph_bind_shape_domain(
+              "domain:q4", spans, 2u, qgroupnorm_stats_bytes,
+              qlayernorm_stats_bytes) == 0);
+    CHECK(metal_graph_debug_dynamic_state(&reserved) == 0);
+    CHECK(reserved.shape_generation != before.shape_generation &&
+          reserved.capacity_generation != before.capacity_generation &&
+          reserved.active_capacity_bytes ==
+              spans[0].capacity_bytes * 2u + sizeof(invariant) &&
+          reserved.pooled_capacity_bytes == 0u &&
+          reserved.domain_scratch_capacity_bytes ==
+              qgroupnorm_stats_bytes + qlayernorm_stats_bytes &&
+          reserved.domain_span_count == 2u && reserved.slot_count == 3 &&
+          reserved.domain_enforced);
+
+    CHECK(metal_graph_bind_shape_domain(
+              "domain:q4", spans, 2u, qgroupnorm_stats_bytes,
+              qlayernorm_stats_bytes) == 0);
+    CHECK(metal_graph_debug_dynamic_state(&same) == 0);
+    CHECK(same.shape_generation == reserved.shape_generation &&
+          same.capacity_generation == reserved.capacity_generation &&
+          same.active_capacity_bytes == reserved.active_capacity_bytes &&
+          same.domain_scratch_capacity_bytes ==
+              reserved.domain_scratch_capacity_bytes &&
+          same.slot_count == reserved.slot_count);
+
+    CHECK(metal_graph_bind_shape_domain(
+              "domain:q8", spans, 2u, qgroupnorm_stats_bytes,
+              qlayernorm_stats_bytes) == 0);
+    CHECK(metal_graph_debug_dynamic_state(&rebound) == 0);
+    CHECK(rebound.shape_generation != same.shape_generation &&
+          rebound.capacity_generation == same.capacity_generation &&
+          rebound.active_capacity_bytes == same.active_capacity_bytes &&
+          rebound.domain_scratch_capacity_bytes ==
+              same.domain_scratch_capacity_bytes &&
+          rebound.slot_count == same.slot_count);
+    CHECK(metal_graph_bind_shape_domain(
+              "domain:q8", spans, 2u, qgroupnorm_stats_bytes + 1u,
+              qlayernorm_stats_bytes) == -1);
+    CHECK(metal_graph_bind_shape_domain(
+              "domain:q8", mismatch, 2u, qgroupnorm_stats_bytes,
+              qlayernorm_stats_bytes) == -1);
+    CHECK(metal_graph_debug_dynamic_state(&executed) == 0);
+    CHECK(executed.shape_generation == rebound.shape_generation &&
+          executed.capacity_generation == rebound.capacity_generation &&
+          executed.active_capacity_bytes == rebound.active_capacity_bytes &&
+          executed.domain_scratch_capacity_bytes ==
+              rebound.domain_scratch_capacity_bytes &&
+          executed.slot_count == rebound.slot_count);
+    CHECK(metal_graph_bind_shape("domain:legacy") == -1);
+
+    for (int index = 0; index < 4; index++) arena[index] = (float)(index + 3);
+    metal_graph_begin_forward();
+    CHECK(metal_graph_add_f32(arena, invariant, arena + 32, 4) == 1);
+    CHECK(metal_graph_end_forward() == 0);
+    CHECK(metal_graph_sync_host(arena + 32, 4u * sizeof(float), 0) == 1);
+    for (int index = 0; index < 4; index++)
+        CHECK(arena[32 + index] == arena[index] + invariant[index]);
+    metal_graph_begin_forward();
+    CHECK(metal_graph_alias_f32(arena, arena + 32, 4) == 1);
+    CHECK(metal_graph_end_forward() == 0);
+    CHECK(metal_graph_sync_host(arena + 32, 4u * sizeof(float), 0) == 1);
+    CHECK(memcmp(arena, arena + 32, 4u * sizeof(float)) == 0);
+    metal_graph_begin_forward();
+    CHECK(metal_graph_copy_f32(missing_input, missing_output, 4) == 0);
+    CHECK(metal_graph_end_forward() == 0);
+    CHECK(metal_graph_debug_dynamic_state(&executed) == 0);
+    CHECK(executed.capacity_generation == rebound.capacity_generation &&
+          executed.active_capacity_bytes == rebound.active_capacity_bytes &&
+          executed.slot_count == rebound.slot_count);
+    metal_graph_reset();
+    return 0;
+}
+
 int main(void) {
     VxEngineState* engine_state =
         (VxEngineState*)calloc(1, sizeof(*engine_state));
@@ -1537,6 +1750,8 @@ int main(void) {
     CHECK(test_qargmax_i8u8_raw() == 0);
     CHECK(test_qmaskedmean_i8u8_packed() == 0);
     CHECK(test_device_resident_activation_tape() == 0);
+    CHECK(test_dynamic_shape_capacity_lifecycle() == 0);
+    CHECK(test_dynamic_domain_reservation() == 0);
     CHECK(test_activation_backward() == 0);
     CHECK(test_multi_entry_matmul_backward() == 0);
     CHECK(test_prelu_logsoftmax_split_backward() == 0);

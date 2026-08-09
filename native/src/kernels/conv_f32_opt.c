@@ -1,5 +1,6 @@
 #include "conv_f32_opt.h"
 #include "runtime_state.h"
+#include "thread_pool.h"
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
@@ -905,6 +906,57 @@ static uint64_t f32_igemm_indirection_key(const float* input,
     return k ? k : 1;
 }
 
+#define g_f32_igemm_pack (vx_engine_state_current()->conv_f32_igemm_pack)
+#define g_f32_igemm_pack_cap (vx_engine_state_current()->conv_f32_igemm_pack_cap)
+#define g_f32_igemm_pack_src (vx_engine_state_current()->conv_f32_igemm_pack_src)
+
+/* Repack HWIO spatial weights to [oc/16][tap][ic][16].
+ *
+ * This is the same transform `vx_pwf32_pack_plain_cache` does for pointwise
+ * convolutions, with the kernel taps added: at a fixed output-channel block the
+ * igemm walks `tap` then `ic`, and in that order the packed buffer is one
+ * unbroken sequential stream of full cache lines. HWIO instead strides
+ * `out_c * 4` bytes per input channel, which measured 90 GFLOP/s at 320
+ * channels against 115 packed, with the shortfall tracking cache lines per page
+ * rather than working-set size.
+ *
+ * The weight is immutable, so this is paid once per node — 1.77 ms for the whole
+ * encoder — and costs one extra copy of the convolution weights. Lane order
+ * within a block is preserved, so the reduction is unchanged and results stay
+ * bit-identical.
+ */
+const float* vx_f32_igemm_pack_cache(int node_idx, const float* wgt,
+                                     int c, int out_c, int ks) {
+    if (node_idx < 0 || node_idx >= VX_CONV_OPT_MAX_NODES || !wgt) return NULL;
+    if (c < 1 || out_c < 16 || ks < 1) return NULL;
+    int blocks = out_c / 16;
+    if (blocks < 1) return NULL;
+    long need = (long)blocks * ks * c * 16;
+    if (need <= 0) return NULL;
+    /* Keyed on the source buffer as well as the extent. Conv weights are model
+     * constants, but the weight-only INT8 path feeds this a per-node dequant
+     * cache, so the node alone does not identify the bytes. */
+    if (g_f32_igemm_pack[node_idx] && g_f32_igemm_pack_cap[node_idx] == need &&
+        g_f32_igemm_pack_src[node_idx] == wgt)
+        return g_f32_igemm_pack[node_idx];
+    float* pk = (float*)malloc((size_t)need * sizeof(float));
+    if (!pk) return NULL;
+    for (int b = 0; b < blocks; b++) {
+        for (int t = 0; t < ks; t++) {
+            for (int ic = 0; ic < c; ic++) {
+                float* dst = pk + (((long)b * ks + t) * c + ic) * 16;
+                const float* src = wgt + ((long)t * c + ic) * out_c + b * 16;
+                for (int lane = 0; lane < 16; lane++) dst[lane] = src[lane];
+            }
+        }
+    }
+    free(g_f32_igemm_pack[node_idx]);
+    g_f32_igemm_pack[node_idx] = pk;
+    g_f32_igemm_pack_cap[node_idx] = need;
+    g_f32_igemm_pack_src[node_idx] = wgt;
+    return pk;
+}
+
 const float** vx_f32_igemm_indirection_cache(int node_idx, const float* input,
                                              int n, int h, int w, int c,
                                              int oh, int ow, int kh, int kw,
@@ -963,6 +1015,185 @@ const float** vx_f32_igemm_indirection_cache(int node_idx, const float* input,
     return table;
 }
 
+#if defined(__AVX2__)
+typedef struct {
+    float* output;
+    const float* weights;
+    const float* packed_weights;
+    const float* bias;
+    const float* const* indirection;
+    int input_channels;
+    int output_channels;
+    int kernel_size;
+    long weight_step;
+    long weight_tap;
+    long block_offset;
+    int relu;
+} VxF32IgemmSixPixelContext;
+
+/* Each task owns six complete output pixels.  The immutable indirection and
+ * packed-weight caches are finalized by the owner thread before dispatch, so
+ * workers touch no engine state and write disjoint output ranges.  Keeping the
+ * existing six-pixel microkernel intact preserves its per-output accumulation
+ * order while allowing large image convolutions to use the context thread
+ * pool. */
+static void vx_f32_igemm_six_pixel_worker(void* opaque, int begin, int end) {
+    const VxF32IgemmSixPixelContext* context =
+        (const VxF32IgemmSixPixelContext*)opaque;
+    const int out_c = context->output_channels;
+    const int c = context->input_channels;
+    const int ks = context->kernel_size;
+    const long wstep = context->weight_step;
+    const long wtap = context->weight_tap;
+    const int relu = context->relu;
+    const __m256 zero = _mm256_setzero_ps();
+    const __m256 six = _mm256_set1_ps(6.0f);
+#define VX_IGEMM_WORKER_RELU(v) do { \
+    if (relu) { \
+        (v) = _mm256_max_ps((v), zero); \
+        if (relu >= 2) (v) = _mm256_min_ps((v), six); \
+    } \
+} while (0)
+    for (int block = begin; block < end; block++) {
+        const long p = (context->block_offset + (long)block) * 6;
+        float* d0 = context->output + (p + 0) * out_c;
+        float* d1 = context->output + (p + 1) * out_c;
+        float* d2 = context->output + (p + 2) * out_c;
+        float* d3 = context->output + (p + 3) * out_c;
+        float* d4 = context->output + (p + 4) * out_c;
+        float* d5 = context->output + (p + 5) * out_c;
+        const float* const* r0 = context->indirection + (p + 0) * ks;
+        const float* const* r1 = context->indirection + (p + 1) * ks;
+        const float* const* r2 = context->indirection + (p + 2) * ks;
+        const float* const* r3 = context->indirection + (p + 3) * ks;
+        const float* const* r4 = context->indirection + (p + 4) * ks;
+        const float* const* r5 = context->indirection + (p + 5) * ks;
+        int oc = 0;
+        for (; oc + 16 <= out_c; oc += 16) {
+            const float* wbase = context->packed_weights
+                ? context->packed_weights + ((long)(oc >> 4) * ks) * c * 16
+                : context->weights + oc;
+            __m256 bl = context->bias
+                ? _mm256_loadu_ps(context->bias + oc) : zero;
+            __m256 bh = context->bias
+                ? _mm256_loadu_ps(context->bias + oc + 8) : zero;
+            __m256 a0l = bl, a0h = bh, a1l = bl, a1h = bh;
+            __m256 a2l = bl, a2h = bh, a3l = bl, a3h = bh;
+            __m256 a4l = bl, a4h = bh, a5l = bl, a5h = bh;
+            for (int t = 0; t < ks; t++) {
+                const float* s0 = r0[t];
+                const float* s1 = r1[t];
+                const float* s2 = r2[t];
+                const float* s3 = r3[t];
+                const float* s4 = r4[t];
+                const float* s5 = r5[t];
+                const float* ww = wbase + (long)t * wtap;
+                for (int ic = 0; ic < c; ic++, ww += wstep) {
+                    __m256 wl = _mm256_loadu_ps(ww);
+                    __m256 wh = _mm256_loadu_ps(ww + 8);
+                    __m256 x;
+                    x = _mm256_set1_ps(s0[ic]);
+                    a0l = _mm256_fmadd_ps(x, wl, a0l);
+                    a0h = _mm256_fmadd_ps(x, wh, a0h);
+                    x = _mm256_set1_ps(s1[ic]);
+                    a1l = _mm256_fmadd_ps(x, wl, a1l);
+                    a1h = _mm256_fmadd_ps(x, wh, a1h);
+                    x = _mm256_set1_ps(s2[ic]);
+                    a2l = _mm256_fmadd_ps(x, wl, a2l);
+                    a2h = _mm256_fmadd_ps(x, wh, a2h);
+                    x = _mm256_set1_ps(s3[ic]);
+                    a3l = _mm256_fmadd_ps(x, wl, a3l);
+                    a3h = _mm256_fmadd_ps(x, wh, a3h);
+                    x = _mm256_set1_ps(s4[ic]);
+                    a4l = _mm256_fmadd_ps(x, wl, a4l);
+                    a4h = _mm256_fmadd_ps(x, wh, a4h);
+                    x = _mm256_set1_ps(s5[ic]);
+                    a5l = _mm256_fmadd_ps(x, wl, a5l);
+                    a5h = _mm256_fmadd_ps(x, wh, a5h);
+                }
+            }
+            VX_IGEMM_WORKER_RELU(a0l); VX_IGEMM_WORKER_RELU(a0h);
+            VX_IGEMM_WORKER_RELU(a1l); VX_IGEMM_WORKER_RELU(a1h);
+            VX_IGEMM_WORKER_RELU(a2l); VX_IGEMM_WORKER_RELU(a2h);
+            VX_IGEMM_WORKER_RELU(a3l); VX_IGEMM_WORKER_RELU(a3h);
+            VX_IGEMM_WORKER_RELU(a4l); VX_IGEMM_WORKER_RELU(a4h);
+            VX_IGEMM_WORKER_RELU(a5l); VX_IGEMM_WORKER_RELU(a5h);
+            _mm256_storeu_ps(d0 + oc, a0l);
+            _mm256_storeu_ps(d0 + oc + 8, a0h);
+            _mm256_storeu_ps(d1 + oc, a1l);
+            _mm256_storeu_ps(d1 + oc + 8, a1h);
+            _mm256_storeu_ps(d2 + oc, a2l);
+            _mm256_storeu_ps(d2 + oc + 8, a2h);
+            _mm256_storeu_ps(d3 + oc, a3l);
+            _mm256_storeu_ps(d3 + oc + 8, a3h);
+            _mm256_storeu_ps(d4 + oc, a4l);
+            _mm256_storeu_ps(d4 + oc + 8, a4h);
+            _mm256_storeu_ps(d5 + oc, a5l);
+            _mm256_storeu_ps(d5 + oc + 8, a5h);
+        }
+        for (; oc + 8 <= out_c; oc += 8) {
+            __m256 a0 = context->bias
+                ? _mm256_loadu_ps(context->bias + oc) : zero;
+            __m256 a1 = a0, a2 = a0, a3 = a0, a4 = a0, a5 = a0;
+            for (int t = 0; t < ks; t++) {
+                const float* s0 = r0[t];
+                const float* s1 = r1[t];
+                const float* s2 = r2[t];
+                const float* s3 = r3[t];
+                const float* s4 = r4[t];
+                const float* s5 = r5[t];
+                const float* ww = context->weights +
+                    ((long)t * c) * out_c + oc;
+                for (int ic = 0; ic < c; ic++) {
+                    __m256 wv = _mm256_loadu_ps(ww + (long)ic * out_c);
+                    a0 = _mm256_fmadd_ps(_mm256_set1_ps(s0[ic]), wv, a0);
+                    a1 = _mm256_fmadd_ps(_mm256_set1_ps(s1[ic]), wv, a1);
+                    a2 = _mm256_fmadd_ps(_mm256_set1_ps(s2[ic]), wv, a2);
+                    a3 = _mm256_fmadd_ps(_mm256_set1_ps(s3[ic]), wv, a3);
+                    a4 = _mm256_fmadd_ps(_mm256_set1_ps(s4[ic]), wv, a4);
+                    a5 = _mm256_fmadd_ps(_mm256_set1_ps(s5[ic]), wv, a5);
+                }
+            }
+            VX_IGEMM_WORKER_RELU(a0); VX_IGEMM_WORKER_RELU(a1);
+            VX_IGEMM_WORKER_RELU(a2); VX_IGEMM_WORKER_RELU(a3);
+            VX_IGEMM_WORKER_RELU(a4); VX_IGEMM_WORKER_RELU(a5);
+            _mm256_storeu_ps(d0 + oc, a0);
+            _mm256_storeu_ps(d1 + oc, a1);
+            _mm256_storeu_ps(d2 + oc, a2);
+            _mm256_storeu_ps(d3 + oc, a3);
+            _mm256_storeu_ps(d4 + oc, a4);
+            _mm256_storeu_ps(d5 + oc, a5);
+        }
+        for (; oc < out_c; oc++) {
+            float acc[6];
+            for (int index = 0; index < 6; index++) {
+                acc[index] = context->bias ? context->bias[oc] : 0.0f;
+            }
+            for (int t = 0; t < ks; t++) {
+                const float* source[6] = {
+                    r0[t], r1[t], r2[t], r3[t], r4[t], r5[t],
+                };
+                const float* ww = context->weights +
+                    ((long)t * c) * out_c + oc;
+                for (int ic = 0; ic < c; ic++) {
+                    const float weight = ww[(long)ic * out_c];
+                    for (int index = 0; index < 6; index++) {
+                        acc[index] += source[index][ic] * weight;
+                    }
+                }
+            }
+            d0[oc] = vx_relu6_apply(acc[0], relu);
+            d1[oc] = vx_relu6_apply(acc[1], relu);
+            d2[oc] = vx_relu6_apply(acc[2], relu);
+            d3[oc] = vx_relu6_apply(acc[3], relu);
+            d4[oc] = vx_relu6_apply(acc[4], relu);
+            d5[oc] = vx_relu6_apply(acc[5], relu);
+        }
+    }
+#undef VX_IGEMM_WORKER_RELU
+}
+#endif
+
 int vx_conv2d_spatial_igemm_f32(int node_idx,
                                      const float* input, float* output,
                                      const float* wgt, const float* bias,
@@ -980,8 +1211,76 @@ int vx_conv2d_spatial_igemm_f32(int node_idx,
     const __m256 six = _mm256_set1_ps(6.0f);
     long pixels = (long)n * oh * ow;
     int ks = kh * kw;
+    /* Packed weights stream one cache line per input channel; HWIO strides
+     * out_c floats and stalls on every load past ~192 channels. Both forms feed
+     * the same loop through `wstep`, so a failed pack just costs speed. Only the
+     * sixteen-channel tiers are packed; the 8- and 1-channel remainders run at
+     * out_c % 16 and stay on HWIO. */
+    const float* packed = vx_f32_igemm_pack_cache(node_idx, wgt, c, out_c, ks);
+    const long wstep = packed ? 16 : out_c;
+    const long wtap = (long)c * wstep;
 #define VX_IGEMM_RELU(v) do { if (relu) { (v) = _mm256_max_ps((v), zero); if (relu >= 2) (v) = _mm256_min_ps((v), six); } } while (0)
-    long p = 0;
+    /* Six pixels against sixteen channels is twelve accumulator chains, which
+     * is what keeps both FMA pipes busy across their ~4-cycle latency; the
+     * four-pixel tier below runs exactly eight and stalls. Twelve accumulators
+     * plus two weight vectors and one broadcast is fifteen of the sixteen YMM
+     * registers, so this is the widest tier that still avoids spilling — four
+     * pixels by twenty-four channels has the same twelve chains but needs all
+     * sixteen and measures slower. `vx_conv2d_pointwise_gemm_f32` already
+     * blocks six pixels for the same reason. The cache-producing owner thread
+     * completes all mutable setup before these independent blocks dispatch. */
+    const long six_pixel_block_count = pixels / 6;
+    VxF32IgemmSixPixelContext six_pixel_context = {
+        .output = output,
+        .weights = wgt,
+        .packed_weights = packed,
+        .bias = bias,
+        .indirection = indir,
+        .input_channels = c,
+        .output_channels = out_c,
+        .kernel_size = ks,
+        .weight_step = wstep,
+        .weight_tap = wtap,
+        .block_offset = 0,
+        .relu = relu,
+    };
+    if (six_pixel_block_count <= INT32_MAX) {
+        const int six_pixel_blocks = (int)six_pixel_block_count;
+        const int threads = vx_kernels_thread_count();
+        const uint64_t target_chunks = threads > 0
+            ? (uint64_t)(uint32_t)threads * 4u : 1u;
+        int grain = threads > 0
+            ? (int)((uint64_t)(uint32_t)six_pixel_blocks / target_chunks)
+            : six_pixel_blocks;
+        if (grain < 1) grain = 1;
+        const uint64_t six_pixel_macs = (uint64_t)six_pixel_blocks * 6u *
+            (uint64_t)ks * (uint64_t)c * (uint64_t)out_c;
+        if (threads > 1 && six_pixel_macs >= 1000000u) {
+            vx_kernels_parallel_for(six_pixel_blocks, grain,
+                                    vx_f32_igemm_six_pixel_worker,
+                                    &six_pixel_context);
+        } else {
+            vx_f32_igemm_six_pixel_worker(&six_pixel_context, 0,
+                                          six_pixel_blocks);
+        }
+    } else {
+        /* The pool ABI uses int task indices. Preserve correctness for a
+         * representable long-sized tensor by running bounded serial chunks
+         * instead of narrowing the block count and sending tail writes before
+         * the output base. Such tensors are impractically large today, but the
+         * generic kernel contract must still avoid implementation-defined
+         * narrowing and out-of-bounds access. */
+        long offset = 0;
+        while (offset < six_pixel_block_count) {
+            const long remaining = six_pixel_block_count - offset;
+            const int chunk = remaining > INT32_MAX
+                ? INT32_MAX : (int)remaining;
+            six_pixel_context.block_offset = offset;
+            vx_f32_igemm_six_pixel_worker(&six_pixel_context, 0, chunk);
+            offset += chunk;
+        }
+    }
+    long p = six_pixel_block_count * 6;
     for (; p + 4 <= pixels; p += 4) {
         float* d0 = output + (p + 0) * out_c;
         float* d1 = output + (p + 1) * out_c;
@@ -993,6 +1292,8 @@ int vx_conv2d_spatial_igemm_f32(int node_idx,
         const float** r3 = indir + (p + 3) * ks;
         int oc = 0;
         for (; oc + 16 <= out_c; oc += 16) {
+            const float* wbase = packed ? packed + ((long)(oc >> 4) * ks) * c * 16
+                                        : wgt + oc;
             __m256 bl = bias ? _mm256_loadu_ps(bias + oc) : zero;
             __m256 bh = bias ? _mm256_loadu_ps(bias + oc + 8) : zero;
             __m256 a0l = bl, a0h = bh, a1l = bl, a1h = bh;
@@ -1002,10 +1303,10 @@ int vx_conv2d_spatial_igemm_f32(int node_idx,
                 const float* s1 = r1[t];
                 const float* s2 = r2[t];
                 const float* s3 = r3[t];
-                const float* ww = wgt + ((long)t * c) * out_c + oc;
-                for (int ic = 0; ic < c; ic++) {
-                    __m256 wl = _mm256_loadu_ps(ww + (long)ic * out_c);
-                    __m256 wh = _mm256_loadu_ps(ww + (long)ic * out_c + 8);
+                const float* ww = wbase + (long)t * wtap;
+                for (int ic = 0; ic < c; ic++, ww += wstep) {
+                    __m256 wl = _mm256_loadu_ps(ww);
+                    __m256 wh = _mm256_loadu_ps(ww + 8);
                     __m256 x;
                     x = _mm256_set1_ps(s0[ic]); a0l = _mm256_fmadd_ps(x, wl, a0l); a0h = _mm256_fmadd_ps(x, wh, a0h);
                     x = _mm256_set1_ps(s1[ic]); a1l = _mm256_fmadd_ps(x, wl, a1l); a1h = _mm256_fmadd_ps(x, wh, a1h);
@@ -1106,6 +1407,10 @@ void vx_conv_f32_opt_free_all(void) {
         free(g_dw_pw_tmp[i]);
         free((void*)g_f32_igemm_indir[i]);
         free(g_f32_igemm_zero[i]);
+        free(g_f32_igemm_pack[i]);
+        g_f32_igemm_pack[i] = NULL;
+        g_f32_igemm_pack_cap[i] = 0;
+        g_f32_igemm_pack_src[i] = NULL;
         g_pwf32_pack[i] = NULL;
         g_dw_pw_tmp[i] = NULL;
         g_dw_pw_tmp_cap[i] = 0;

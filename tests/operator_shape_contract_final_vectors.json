@@ -1,0 +1,553 @@
+{
+  "format": "volvox-operator-shape-vectors/v1",
+  "families": [
+    { "id": "moe", "operators": ["MoERouter", "MoELinear"] },
+    { "id": "attention-norm-resample", "operators": ["CrossAttention", "BatchNorm2D", "Interpolate1D"] },
+    { "id": "logic", "operators": ["Not", "Mask"] },
+    { "id": "shape-affine", "operators": ["Broadcast", "Concat2"] },
+    { "id": "requant-dropout", "operators": ["RequantizeLinear", "Dropout"] },
+    { "id": "scan", "operators": ["SSMScan", "SelectiveScan"] },
+    { "id": "vision-profile", "operators": ["SpatialSoftargmaxY", "MeanHeight", "ProfileX", "ProfileY"] }
+  ],
+  "success_cases": [
+    {
+      "id": "moe-router-batched-top2",
+      "family": "moe",
+      "operators": ["MoERouter"],
+      "request": {
+        "inputs": {
+          "input": { "shape": [2, 4], "dtype": "float32" },
+          "weight": { "shape": [4, 3], "dtype": "float32" },
+          "bias": { "shape": [3], "dtype": "float32" }
+        },
+        "params": { "num_experts": 3, "top_k": 2, "temperature": 0.5, "normalize": true }
+      },
+      "expected_shape_function_id": "volvox.shape.moe-router.v1",
+      "expected": {
+        "indices": { "shape": [2, 2], "dtype": "float32" },
+        "weights": { "shape": [2, 2], "dtype": "float32" }
+      }
+    },
+    {
+      "id": "moe-linear-batched-top2",
+      "family": "moe",
+      "operators": ["MoELinear"],
+      "request": {
+        "inputs": {
+          "input": { "shape": [2, 4], "dtype": "float32" },
+          "expert_weight": { "shape": [3, 4, 5], "dtype": "float32" },
+          "expert_bias": { "shape": [3, 5], "dtype": "float32" },
+          "route_indices": { "shape": [2, 2], "dtype": "float32" },
+          "route_weights": { "shape": [2, 2], "dtype": "float32" }
+        },
+        "params": {}
+      },
+      "expected_shape_function_id": "volvox.shape.moe-linear.v1",
+      "expected": { "out": { "shape": [2, 5], "dtype": "float32" } }
+    },
+    {
+      "id": "cross-attention-batched-affine",
+      "family": "attention-norm-resample",
+      "operators": ["CrossAttention"],
+      "request": {
+        "inputs": {
+          "q": { "shape": [2, 3, 4], "dtype": "float32" },
+          "kv": { "shape": [2, 5, 4], "dtype": "float32" },
+          "weight": { "shape": [12, 4], "dtype": "float32" },
+          "scale": { "shape": [12], "dtype": "float32" },
+          "bias": { "shape": [12], "dtype": "float32" }
+        },
+        "params": { "heads": 2 }
+      },
+      "expected_shape_function_id": "volvox.shape.cross-attention.v1",
+      "expected": { "out": { "shape": [2, 3, 4], "dtype": "float32" } }
+    },
+    {
+      "id": "batch-norm-nhwc",
+      "family": "attention-norm-resample",
+      "operators": ["BatchNorm2D"],
+      "request": {
+        "inputs": {
+          "input": { "shape": [2, 3, 4, 5], "dtype": "float32" },
+          "weight": { "shape": [5], "dtype": "float32" },
+          "bias": { "shape": [5], "dtype": "float32" },
+          "running_mean": { "shape": [5], "dtype": "float32" },
+          "running_var": { "shape": [5], "dtype": "float32" }
+        },
+        "params": { "eps": 0.00001 }
+      },
+      "expected_shape_function_id": "volvox.shape.batch-norm-2d.v1",
+      "expected": { "out": { "shape": [2, 3, 4, 5], "dtype": "float32" } }
+    },
+    {
+      "id": "interpolate-ncl-fixed-output",
+      "family": "attention-norm-resample",
+      "operators": ["Interpolate1D"],
+      "request": {
+        "inputs": { "input": { "shape": [2, 3, 4], "dtype": "float32" } },
+        "params": { "size": 7 }
+      },
+      "expected_shape_function_id": "volvox.shape.interpolate-1d.v1",
+      "expected": { "out": { "shape": [2, 3, 7], "dtype": "float32" } }
+    },
+    {
+      "id": "logical-not-i32",
+      "family": "logic",
+      "operators": ["Not"],
+      "request": {
+        "inputs": { "input": { "shape": [2, 3], "dtype": "int32" } },
+        "params": {}
+      },
+      "expected_shape_function_id": "volvox.shape.logical-not.v1",
+      "expected": { "out": { "shape": [2, 3], "dtype": "int32" } }
+    },
+    {
+      "id": "mask-exact-f32-data",
+      "family": "logic",
+      "operators": ["Mask"],
+      "request": {
+        "inputs": {
+          "mask": { "shape": [2, 3], "dtype": "int32" },
+          "a": { "shape": [2, 3], "dtype": "float32" },
+          "b": { "shape": [2, 3], "dtype": "float32" }
+        },
+        "params": {}
+      },
+      "expected_shape_function_id": "volvox.shape.mask.v1",
+      "expected": { "out": { "shape": [2, 3], "dtype": "float32" } }
+    },
+    {
+      "id": "broadcast-per-axis-leading-rank",
+      "family": "shape-affine",
+      "operators": ["Broadcast"],
+      "request": {
+        "inputs": {
+          "input": {
+            "shape": [2, 1],
+            "dtype": "int8",
+            "quantization": {
+              "scheme": "per_axis", "axis": 1,
+              "scales": [0.5], "zero_points": [0]
+            }
+          }
+        },
+        "params": { "shape": [4, 2, 1] }
+      },
+      "expected_shape_function_id": "volvox.shape.broadcast-static-target.v1",
+      "expected": {
+        "out": {
+          "shape": [4, 2, 1],
+          "dtype": "int8",
+          "quantization": {
+            "scheme": "per_axis", "axis": 2,
+            "scales": [0.5], "zero_points": [0]
+          }
+        }
+      }
+    },
+    {
+      "id": "concat2-per-axis-merge",
+      "family": "shape-affine",
+      "operators": ["Concat2"],
+      "request": {
+        "inputs": {
+          "a": {
+            "shape": [1, 2], "dtype": "int8",
+            "quantization": {
+              "scheme": "per_axis", "axis": 1,
+              "scales": [0.5, 0.25], "zero_points": [0, 0]
+            }
+          },
+          "b": {
+            "shape": [1, 1], "dtype": "int8",
+            "quantization": {
+              "scheme": "per_axis", "axis": 1,
+              "scales": [0.125], "zero_points": [0]
+            }
+          }
+        },
+        "params": { "axis": 1, "sigmoid": false }
+      },
+      "expected_shape_function_id": "volvox.shape.concat-2.v1",
+      "expected": {
+        "out": {
+          "shape": [1, 3], "dtype": "int8",
+          "quantization": {
+            "scheme": "per_axis", "axis": 1,
+            "scales": [0.5, 0.25, 0.125], "zero_points": [0, 0, 0]
+          }
+        }
+      }
+    },
+    {
+      "id": "requantize-i8-to-u8",
+      "family": "requant-dropout",
+      "operators": ["RequantizeLinear"],
+      "request": {
+        "inputs": {
+          "input": {
+            "shape": [2, 3], "dtype": "int8",
+            "quantization": { "scheme": "per_tensor", "scale": 0.5, "zero_point": 0 }
+          }
+        },
+        "params": {},
+        "declaredOutputs": {
+          "out": {
+            "shape": [2, 3], "dtype": "uint8",
+            "quantization": { "scheme": "per_tensor", "scale": 0.25, "zero_point": 128 }
+          }
+        }
+      },
+      "expected_shape_function_id": "volvox.shape.requantize-linear.v1",
+      "expected": {
+        "out": {
+          "shape": [2, 3], "dtype": "uint8",
+          "quantization": { "scheme": "per_tensor", "scale": 0.25, "zero_point": 128 }
+        }
+      }
+    },
+    {
+      "id": "dropout-shape-preserve",
+      "family": "requant-dropout",
+      "operators": ["Dropout"],
+      "request": {
+        "inputs": { "input": { "shape": [2, 3], "dtype": "float32" } },
+        "params": { "ratio": 0.25, "seed": 17 }
+      },
+      "expected_shape_function_id": "volvox.shape.dropout-preserve.v1",
+      "expected": { "out": { "shape": [2, 3], "dtype": "float32" } }
+    },
+    {
+      "id": "ssm-scan-static-b-variable-c",
+      "family": "scan",
+      "operators": ["SSMScan"],
+      "request": {
+        "inputs": {
+          "input": { "shape": [2, 3, 4], "dtype": "float32" },
+          "delta": { "shape": [2, 3, 4], "dtype": "float32" },
+          "A": { "shape": [4, 5], "dtype": "float32" },
+          "B": { "shape": [5], "dtype": "float32" },
+          "C": { "shape": [3, 5], "dtype": "float32" },
+          "D": { "shape": [4], "dtype": "float32" },
+          "z": { "shape": [2, 3, 4], "dtype": "float32" },
+          "initial_state": { "shape": [2, 4, 5], "dtype": "float32" }
+        },
+        "params": { "delta_softplus": true }
+      },
+      "expected_shape_function_id": "volvox.shape.ssm-scan.v1",
+      "expected": {
+        "out": { "shape": [2, 3, 4], "dtype": "float32" },
+        "state": { "shape": [2, 4, 5], "dtype": "float32" }
+      }
+    },
+    {
+      "id": "selective-scan-variable-b-static-c",
+      "family": "scan",
+      "operators": ["SelectiveScan"],
+      "request": {
+        "inputs": {
+          "input": { "shape": [3, 2], "dtype": "float32" },
+          "delta": { "shape": [3, 2], "dtype": "float32" },
+          "A": { "shape": [2, 4], "dtype": "float32" },
+          "B": { "shape": [3, 4], "dtype": "float32" },
+          "C": { "shape": [4], "dtype": "float32" }
+        },
+        "params": { "delta_softplus": false }
+      },
+      "expected_shape_function_id": "volvox.shape.selective-scan.v1",
+      "expected": {
+        "out": { "shape": [3, 2], "dtype": "float32" },
+        "state": { "shape": [1, 2, 4], "dtype": "float32" }
+      }
+    },
+    {
+      "id": "spatial-softargmax-y-nhwc",
+      "family": "vision-profile",
+      "operators": ["SpatialSoftargmaxY"],
+      "request": {
+        "inputs": { "input": { "shape": [2, 3, 4, 5], "dtype": "float32" } },
+        "params": {}
+      },
+      "expected_shape_function_id": "volvox.shape.spatial-softargmax-y.v1",
+      "expected": { "out": { "shape": [2, 5, 4], "dtype": "float32" } }
+    },
+    {
+      "id": "mean-height-nhwc",
+      "family": "vision-profile",
+      "operators": ["MeanHeight"],
+      "request": {
+        "inputs": { "input": { "shape": [2, 3, 4, 5], "dtype": "float32" } },
+        "params": {}
+      },
+      "expected_shape_function_id": "volvox.shape.mean-height.v1",
+      "expected": { "out": { "shape": [2, 5, 4], "dtype": "float32" } }
+    },
+    {
+      "id": "profile-x-nhwc",
+      "family": "vision-profile",
+      "operators": ["ProfileX"],
+      "request": {
+        "inputs": { "input": { "shape": [2, 3, 4, 5], "dtype": "float32" } },
+        "params": {}
+      },
+      "expected_shape_function_id": "volvox.shape.profile-x.v1",
+      "expected": { "out": { "shape": [2, 10, 4], "dtype": "float32" } }
+    },
+    {
+      "id": "profile-y-nhwc",
+      "family": "vision-profile",
+      "operators": ["ProfileY"],
+      "request": {
+        "inputs": { "input": { "shape": [2, 3, 4, 5], "dtype": "float32" } },
+        "params": {}
+      },
+      "expected_shape_function_id": "volvox.shape.profile-y.v1",
+      "expected": { "out": { "shape": [2, 10, 3], "dtype": "float32" } }
+    }
+  ],
+  "failure_cases": [
+    {
+      "id": "moe-router-top-k-too-large",
+      "family": "moe",
+      "operators": ["MoERouter"],
+      "request": {
+        "inputs": {
+          "input": { "shape": [2, 4], "dtype": "float32" },
+          "weight": { "shape": [4, 3], "dtype": "float32" }
+        },
+        "params": { "top_k": 4 }
+      },
+      "expected_shape_function_id": "volvox.shape.moe-router.v1",
+      "expected_error": { "code": "INVALID_PARAMS", "path": "operator params.top_k" }
+    },
+    {
+      "id": "moe-linear-route-prefix-mismatch",
+      "family": "moe",
+      "operators": ["MoELinear"],
+      "request": {
+        "inputs": {
+          "input": { "shape": [2, 4], "dtype": "float32" },
+          "expert_weight": { "shape": [3, 4, 5], "dtype": "float32" },
+          "route_indices": { "shape": [2, 2], "dtype": "float32" },
+          "route_weights": { "shape": [2, 1], "dtype": "float32" }
+        },
+        "params": {}
+      },
+      "expected_shape_function_id": "volvox.shape.moe-linear.v1",
+      "expected_error": { "code": "SHAPE_MISMATCH", "path": "operator route inputs" }
+    },
+    {
+      "id": "cross-attention-heads-not-divisor",
+      "family": "attention-norm-resample",
+      "operators": ["CrossAttention"],
+      "request": {
+        "inputs": {
+          "q": { "shape": [3, 4], "dtype": "float32" },
+          "kv": { "shape": [5, 4], "dtype": "float32" },
+          "weight": { "shape": [12, 4], "dtype": "float32" }
+        },
+        "params": { "heads": 3 }
+      },
+      "expected_shape_function_id": "volvox.shape.cross-attention.v1",
+      "expected_error": { "code": "INVALID_PARAMS", "path": "operator params.heads" }
+    },
+    {
+      "id": "batch-norm-running-var-channel-mismatch",
+      "family": "attention-norm-resample",
+      "operators": ["BatchNorm2D"],
+      "request": {
+        "inputs": {
+          "input": { "shape": [2, 3, 4, 5], "dtype": "float32" },
+          "weight": { "shape": [5], "dtype": "float32" },
+          "bias": { "shape": [5], "dtype": "float32" },
+          "running_mean": { "shape": [5], "dtype": "float32" },
+          "running_var": { "shape": [4], "dtype": "float32" }
+        },
+        "params": {}
+      },
+      "expected_shape_function_id": "volvox.shape.batch-norm-2d.v1",
+      "expected_error": { "code": "SHAPE_MISMATCH", "path": "operator input 'running_var'.shape" }
+    },
+    {
+      "id": "interpolate-size-zero",
+      "family": "attention-norm-resample",
+      "operators": ["Interpolate1D"],
+      "request": {
+        "inputs": { "input": { "shape": [2, 3, 4], "dtype": "float32" } },
+        "params": { "size": 0 }
+      },
+      "expected_shape_function_id": "volvox.shape.interpolate-1d.v1",
+      "expected_error": { "code": "INVALID_PARAMS", "path": "operator params.size" }
+    },
+    {
+      "id": "logical-not-f32",
+      "family": "logic",
+      "operators": ["Not"],
+      "request": {
+        "inputs": { "input": { "shape": [2, 3], "dtype": "float32" } },
+        "params": {}
+      },
+      "expected_shape_function_id": "volvox.shape.logical-not.v1",
+      "expected_error": { "code": "INVALID_DTYPE", "path": "operator input 'input'.dtype" }
+    },
+    {
+      "id": "mask-rejects-broadcast",
+      "family": "logic",
+      "operators": ["Mask"],
+      "request": {
+        "inputs": {
+          "mask": { "shape": [2, 1], "dtype": "int32" },
+          "a": { "shape": [2, 3], "dtype": "float32" },
+          "b": { "shape": [2, 3], "dtype": "float32" }
+        },
+        "params": {}
+      },
+      "expected_shape_function_id": "volvox.shape.mask.v1",
+      "expected_error": { "code": "SHAPE_MISMATCH", "path": "operator inputs" }
+    },
+    {
+      "id": "broadcast-rejects-per-axis-expansion",
+      "family": "shape-affine",
+      "operators": ["Broadcast"],
+      "request": {
+        "inputs": {
+          "input": {
+            "shape": [2, 1], "dtype": "int8",
+            "quantization": {
+              "scheme": "per_axis", "axis": 1,
+              "scales": [0.5], "zero_points": [0]
+            }
+          }
+        },
+        "params": { "shape": [2, 3] }
+      },
+      "expected_shape_function_id": "volvox.shape.broadcast-static-target.v1",
+      "expected_error": { "code": "UNSAFE_QUANTIZATION_TRANSFORM", "path": "operator params.shape[1]" }
+    },
+    {
+      "id": "concat2-sigmoid-rejects-i32",
+      "family": "shape-affine",
+      "operators": ["Concat2"],
+      "request": {
+        "inputs": {
+          "a": { "shape": [1, 2], "dtype": "int32" },
+          "b": { "shape": [1, 1], "dtype": "int32" }
+        },
+        "params": { "axis": 1, "sigmoid": true }
+      },
+      "expected_shape_function_id": "volvox.shape.concat-2.v1",
+      "expected_error": { "code": "INVALID_DTYPE", "path": "operator input 'a'.dtype" }
+    },
+    {
+      "id": "requantize-output-shape-mismatch",
+      "family": "requant-dropout",
+      "operators": ["RequantizeLinear"],
+      "request": {
+        "inputs": {
+          "input": {
+            "shape": [2, 3], "dtype": "int8",
+            "quantization": { "scheme": "per_tensor", "scale": 0.5, "zero_point": 0 }
+          }
+        },
+        "params": {},
+        "declaredOutputs": {
+          "out": {
+            "shape": [2, 4], "dtype": "uint8",
+            "quantization": { "scheme": "per_tensor", "scale": 0.25, "zero_point": 128 }
+          }
+        }
+      },
+      "expected_shape_function_id": "volvox.shape.requantize-linear.v1",
+      "expected_error": { "code": "SHAPE_MISMATCH", "path": "declared output 'out'.shape" }
+    },
+    {
+      "id": "dropout-probability-alias-conflict",
+      "family": "requant-dropout",
+      "operators": ["Dropout"],
+      "request": {
+        "inputs": { "input": { "shape": [2, 3], "dtype": "float32" } },
+        "params": { "ratio": 0.25, "p": 0.25 }
+      },
+      "expected_shape_function_id": "volvox.shape.dropout-preserve.v1",
+      "expected_error": { "code": "INVALID_PARAMS", "path": "operator params" }
+    },
+    {
+      "id": "ssm-scan-invalid-b-layout",
+      "family": "scan",
+      "operators": ["SSMScan"],
+      "request": {
+        "inputs": {
+          "input": { "shape": [2, 3, 4], "dtype": "float32" },
+          "delta": { "shape": [2, 3, 4], "dtype": "float32" },
+          "A": { "shape": [4, 5], "dtype": "float32" },
+          "B": { "shape": [2, 5], "dtype": "float32" },
+          "C": { "shape": [5], "dtype": "float32" }
+        },
+        "params": {}
+      },
+      "expected_shape_function_id": "volvox.shape.ssm-scan.v1",
+      "expected_error": { "code": "SHAPE_MISMATCH", "path": "operator B/C inputs" }
+    },
+    {
+      "id": "selective-scan-invalid-c-layout",
+      "family": "scan",
+      "operators": ["SelectiveScan"],
+      "request": {
+        "inputs": {
+          "input": { "shape": [2, 3, 4], "dtype": "float32" },
+          "delta": { "shape": [2, 3, 4], "dtype": "float32" },
+          "A": { "shape": [4, 5], "dtype": "float32" },
+          "B": { "shape": [5], "dtype": "float32" },
+          "C": { "shape": [2, 5], "dtype": "float32" }
+        },
+        "params": {}
+      },
+      "expected_shape_function_id": "volvox.shape.selective-scan.v1",
+      "expected_error": { "code": "SHAPE_MISMATCH", "path": "operator B/C inputs" }
+    },
+    {
+      "id": "spatial-softargmax-rejects-rank3",
+      "family": "vision-profile",
+      "operators": ["SpatialSoftargmaxY"],
+      "request": {
+        "inputs": { "input": { "shape": [2, 3, 4], "dtype": "float32" } },
+        "params": {}
+      },
+      "expected_shape_function_id": "volvox.shape.spatial-softargmax-y.v1",
+      "expected_error": { "code": "INVALID_RANK", "path": "operator input 'input'.shape" }
+    },
+    {
+      "id": "mean-height-rejects-rank3",
+      "family": "vision-profile",
+      "operators": ["MeanHeight"],
+      "request": {
+        "inputs": { "input": { "shape": [2, 3, 4], "dtype": "float32" } },
+        "params": {}
+      },
+      "expected_shape_function_id": "volvox.shape.mean-height.v1",
+      "expected_error": { "code": "INVALID_RANK", "path": "operator input 'input'.shape" }
+    },
+    {
+      "id": "profile-x-rejects-rank3",
+      "family": "vision-profile",
+      "operators": ["ProfileX"],
+      "request": {
+        "inputs": { "input": { "shape": [2, 3, 4], "dtype": "float32" } },
+        "params": {}
+      },
+      "expected_shape_function_id": "volvox.shape.profile-x.v1",
+      "expected_error": { "code": "INVALID_RANK", "path": "operator input 'input'.shape" }
+    },
+    {
+      "id": "profile-y-rejects-rank3",
+      "family": "vision-profile",
+      "operators": ["ProfileY"],
+      "request": {
+        "inputs": { "input": { "shape": [2, 3, 4], "dtype": "float32" } },
+        "params": {}
+      },
+      "expected_shape_function_id": "volvox.shape.profile-y.v1",
+      "expected_error": { "code": "INVALID_RANK", "path": "operator input 'input'.shape" }
+    }
+  ]
+}

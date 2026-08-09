@@ -404,7 +404,7 @@ static int training_graph_restore(TrainingGraphState* state) {
     /* A restored CUDA inference route has no use for host Conv/F16 packs.
      * Leaving them absent also avoids rebuilding host caches at a
      * device-resident training boundary. */
-    if (rc == 0 && !restored_cuda && prepack_conv_weights() != 0) rc = -1;
+    if (rc == 0 && !restored_cuda && prepack_cpu_weights() != 0) rc = -1;
     if (rc == 0) g_weight_caches_dirty = 0;
     training_graph_state_free(state);
     return rc;
@@ -671,6 +671,7 @@ static int volvoxai_engine_train_step_multi_locked_impl(
         (uint64_t)(step - 1) * (uint64_t)accumulation_steps +
         (uint64_t)(g_training_accumulation.active ? g_training_accumulation.microbatches : 0) + 1u);
     training_counter ^= vx_engine_state_current()->native_training_rng_seed;
+    training_counter ^= vx_engine_state_current()->native_training_shape_hash;
     TrainingGraphState training_graph;
     if (training_graph_prepare(&training_graph, training_counter) != 0) return -1;
     if (g_required_training_backend != NATIVE_GPU_TRAINING_NONE &&

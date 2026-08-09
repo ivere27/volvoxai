@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
-import { Graph } from '../ts/core/Graph.js';
+import { RuntimeGraph } from '../ts/core/RuntimeGraph.js';
 import { _cpuQGroupNorm } from '../ts/ops/qGroupNorm.js';
 
 function byteStorage(dtype, values) {
@@ -25,7 +25,7 @@ function qGroupNormGraph({
   eps = 1e-5,
   dataLayout,
 } = {}) {
-  const graph = new Graph();
+  const graph = new RuntimeGraph();
   const input = graph.addInput('input', inputShape, inputDtype, {
     buffer: byteStorage(inputDtype, inputValues), quantization: inputQuantization,
   });

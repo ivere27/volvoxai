@@ -176,7 +176,7 @@ class RuntimeInputSpecializationTests(unittest.TestCase):
 
         report = VerifiedPipeline((RuntimeInputSpecializationPass(
             {"authored_bias": bias}, tensors,
-        ),)).run(graph)
+        ),), shape_profile={}).run(graph)
 
         self.assertEqual(report.total_changes, 1)
         self.assertEqual(graph.inputs, ["x"])
@@ -201,10 +201,8 @@ class RuntimeInputSpecializationTests(unittest.TestCase):
         np.testing.assert_array_equal(actual, expected)
         document, published_tensors = export_runtime_package(graph, tensors)
         self.assertEqual(list(document["inputs"]), ["x"])
-        self.assertEqual(
-            document["source"]["abi_changes"][-1]["kind"],
-            "input-specialization",
-        )
+        self.assertNotIn("source", document)
+        self.assertEqual(graph.abi_changes[-1]["kind"], "input-specialization")
         self.assertIn("input1", published_tensors)
 
     def test_unknown_request_rolls_back_all_valid_bindings(self):
@@ -220,7 +218,7 @@ class RuntimeInputSpecializationTests(unittest.TestCase):
         )
 
         with self.assertRaises(ExporterError) as raised:
-            VerifiedPipeline((pass_,)).run(graph)
+            VerifiedPipeline((pass_,), shape_profile={}).run(graph)
 
         self.assertEqual(raised.exception.diagnostic.code, "VXTYPESPEC001")
         self.assertEqual(graph.fingerprint(), before)
@@ -253,7 +251,7 @@ class RuntimeInputHoistingTests(unittest.TestCase):
 
         report = VerifiedPipeline((RuntimeInputHoistingPass(
             (InputHoistingSpec("derived", "float32", tensor_name="derived"),),
-        ),)).run(graph)
+        ),), shape_profile={}).run(graph)
 
         self.assertEqual(report.total_changes, 1)
         self.assertEqual(graph.inputs, ["x", "derived"])
@@ -274,10 +272,8 @@ class RuntimeInputHoistingTests(unittest.TestCase):
         np.testing.assert_array_equal(actual, expected)
         document, _ = export_runtime_package(graph, {})
         self.assertEqual(list(document["inputs"]), ["x", "derived"])
-        self.assertEqual(
-            document["source"]["abi_changes"][-1]["kind"],
-            "input-hoisting",
-        )
+        self.assertNotIn("source", document)
+        self.assertEqual(graph.abi_changes[-1]["kind"], "input-hoisting")
 
     def test_dtype_refusal_is_transactional(self):
         graph = _hoisting_graph()
@@ -286,7 +282,7 @@ class RuntimeInputHoistingTests(unittest.TestCase):
         with self.assertRaises(ExporterError) as raised:
             VerifiedPipeline((RuntimeInputHoistingPass(
                 (InputHoistingSpec("derived", "int32", tensor_name="derived"),),
-            ),)).run(graph)
+            ),), shape_profile={}).run(graph)
 
         self.assertEqual(raised.exception.diagnostic.code, "VXTYPEHOIST002")
         self.assertEqual(graph.fingerprint(), before)
@@ -327,7 +323,121 @@ def _constant_matmul_graph() -> tuple[GraphIR, dict[str, np.ndarray]]:
     return graph, tensors
 
 
+def _lora_bank_graph(
+    families: int = 4, rank: int = 2, width: int = 3,
+    *, pinned: int | None = None, lift: str = "Reshape", select: bool = True,
+) -> tuple[GraphIR, dict[str, np.ndarray]]:
+    """Mirror the router-selected LoRA export: lift -> Concat -> Gather.
+
+    ``pinned`` makes the family selector an initializer, standing in for a
+    package already specialized by RuntimeInputSpecializationPass. ``lift`` and
+    ``select`` let a caller restrict the graph to reference-executable
+    operators when the test also checks values.
+    """
+    graph = GraphIR("volvoxai", "bank.json", dialect=IRDialect.RUNTIME)
+    if select:
+        graph.add_tensor(_tensor("family", (1,), dtype="int32",
+                                 initializer=pinned is not None,
+                                 public_input=pinned is None))
+    for family in range(families):
+        graph.add_tensor(_tensor(f"adapter.{family}.down", (rank, width), initializer=True))
+        graph.add_tensor(_tensor(f"adapter.{family}.lifted", (1, rank, width)))
+    graph.add_tensor(_tensor("stack", (families, rank, width)))
+    if not select:
+        # Keep the Concat output internal so it stays foldable; a public output
+        # is deliberately never folded away.
+        graph.add_tensor(_tensor(
+            "stack_out", (families, rank, width), public_output=True,
+        ))
+    if select:
+        graph.add_tensor(_tensor("selected", (1, rank, width)))
+        graph.add_tensor(_tensor(
+            "selected_out", (1, rank, width), public_output=True,
+        ))
+        if pinned is None:
+            graph.inputs.append("family")
+    for family in range(families):
+        _add_node(
+            graph, f"lift-{family}", lift,
+            {"input": f"adapter.{family}.down"},
+            {"out": f"adapter.{family}.lifted"},
+            params={"shape": [1, rank, width]} if lift == "Reshape" else {"axes": [0]},
+        )
+    _add_node(
+        graph, "stack-adapters", "Concat",
+        {f"input{family}": f"adapter.{family}.lifted" for family in range(families)},
+        {"out": "stack"}, params={"axis": 0},
+    )
+    if not select:
+        _add_node(
+            graph, "publish-stack", "Identity",
+            {"input": "stack"}, {"out": "stack_out"},
+        )
+    if select:
+        _add_node(
+            graph, "select-family", "Gather",
+            {"input": "stack", "indices": "family"},
+            {"out": "selected"}, params={"axis": 0},
+        )
+        _add_node(
+            graph, "consume-selected", "Identity",
+            {"input": "selected"}, {"out": "selected_out"},
+        )
+    graph.outputs.append("selected_out" if select else "stack_out")
+    graph.verify(IRDialect.RUNTIME)
+    tensors = {
+        f"adapter.{family}.down": np.arange(
+            family * rank * width, (family + 1) * rank * width, dtype=np.float32,
+        ).reshape(rank, width)
+        for family in range(families)
+    }
+    if pinned is not None:
+        tensors["family"] = np.asarray([pinned], dtype=np.int32)
+    return graph, tensors
+
+
 class RuntimeConstantFoldingTests(unittest.TestCase):
+    def test_folds_lora_bank_stack_into_one_initializer(self):
+        graph, tensors = _lora_bank_graph(select=False)
+        expected = execute_reference(graph, tensors, {}).outputs["stack_out"]
+
+        folding = RuntimeConstantFoldingPass(tensors)
+        VerifiedPipeline((folding,), shape_profile={}).run(graph)
+
+        # Every lift and the Concat fold; only the public publication remains.
+        self.assertEqual([node.op_type for node in graph.nodes], ["Identity"])
+        self.assertTrue(graph.tensors["stack"].initializer)
+        np.testing.assert_array_equal(tensors["stack"], expected)
+        actual = execute_reference(graph, tensors, {}).outputs["stack_out"]
+        np.testing.assert_array_equal(actual, expected)
+
+    def test_runtime_selector_keeps_gather_over_a_folded_bank(self):
+        graph, tensors = _lora_bank_graph(lift="Unsqueeze")
+
+        folding = RuntimeConstantFoldingPass(tensors)
+        VerifiedPipeline((folding,), shape_profile={}).run(graph)
+
+        # A router-selected package still chooses at run time, but the stack is
+        # now one initializer instead of being rebuilt on every execution.
+        self.assertEqual(
+            [node.op_type for node in graph.nodes], ["Gather", "Identity"],
+        )
+        self.assertTrue(graph.tensors["stack"].initializer)
+
+    def test_pinned_family_folds_the_whole_bank_to_one_slice(self):
+        graph, tensors = _lora_bank_graph(lift="Unsqueeze", pinned=2)
+
+        folding = RuntimeConstantFoldingPass(tensors)
+        VerifiedPipeline((folding,), shape_profile={}).run(graph)
+
+        # A specialized package keeps no bank node: the Gather folds too, so
+        # the unselected families are dropped from the payload entirely.
+        self.assertEqual([node.op_type for node in graph.nodes], ["Identity"])
+        self.assertTrue(graph.tensors["selected"].initializer)
+        np.testing.assert_array_equal(
+            tensors["selected"], tensors["adapter.2.down"].reshape(1, 2, 3),
+        )
+
     def test_folds_storage_movement_demotes_matmul_and_preserves_values(self):
         graph, tensors = _constant_matmul_graph()
         sample = np.asarray([
@@ -336,7 +446,7 @@ class RuntimeConstantFoldingTests(unittest.TestCase):
         expected = execute_reference(graph, tensors, {"x": sample}).outputs["y"]
 
         folding = RuntimeConstantFoldingPass(tensors)
-        report = VerifiedPipeline((folding,)).run(graph)
+        report = VerifiedPipeline((folding,), shape_profile={}).run(graph)
 
         self.assertEqual(report.total_changes, 2)
         self.assertEqual((folding.folded, folding.demoted), (1, 1))
@@ -345,7 +455,7 @@ class RuntimeConstantFoldingTests(unittest.TestCase):
         self.assertEqual(linear.name, "project")
         self.assertEqual(linear.input_map()["weight"], "weight.dense.2")
         self.assertEqual(
-            linear.attributes[0].value, {"weight_layout": "IN_OUT"},
+            linear.attributes[0].value, {"weight_layout": "din_dout"},
         )
         self.assertTrue(graph.tensors["weight"].initializer)
         self.assertEqual(
@@ -361,7 +471,9 @@ class RuntimeConstantFoldingTests(unittest.TestCase):
         np.testing.assert_array_equal(actual, expected)
 
         second_graph, second_tensors = _constant_matmul_graph()
-        VerifiedPipeline((RuntimeConstantFoldingPass(second_tensors),)).run(
+        VerifiedPipeline(
+            (RuntimeConstantFoldingPass(second_tensors),), shape_profile={},
+        ).run(
             second_graph,
         )
         self.assertEqual(
@@ -407,7 +519,7 @@ class RuntimeConstantFoldingTests(unittest.TestCase):
 
                 report = VerifiedPipeline((
                     RuntimeConstantFoldingPass(tensors),
-                )).run(graph)
+                ), shape_profile={}).run(graph)
 
                 self.assertEqual(report.total_changes, expected_changes)
                 if expected_changes:
@@ -462,7 +574,9 @@ class RuntimeConstantFoldingTests(unittest.TestCase):
         before_keys = tuple(tensors)
 
         with self.assertRaises(ExporterError) as raised:
-            VerifiedPipeline((RuntimeConstantFoldingPass(tensors),)).run(graph)
+            VerifiedPipeline(
+                (RuntimeConstantFoldingPass(tensors),), shape_profile={},
+            ).run(graph)
 
         self.assertEqual(raised.exception.diagnostic.code, "VXOPT005")
         self.assertEqual(graph.fingerprint(), before_graph)

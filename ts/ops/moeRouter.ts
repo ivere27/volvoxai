@@ -1,3 +1,8 @@
+import {
+  assertShapeKernelOutput,
+  assertShapeKernelTensor,
+} from './shapeKernelValidation.js';
+
 function product(values) {
   return values.reduce((a, b) => a * b, 1);
 }
@@ -15,21 +20,30 @@ function product(values) {
 export function _cpuMoERouter(node) {
   const input = node.inputs.input || node.inputs.x;
   const weight = node.inputs.weight || node.inputs.router_weight;
-  const bias = node.inputs.bias?.buffer || null;
+  const biasTensor = node.inputs.bias || null;
+  const bias = biasTensor?.buffer || null;
   const indices = node.outputs.indices || node.outputs.expert_indices;
   const gates = node.outputs.weights || node.outputs.expert_weights;
-  if (!input?.buffer || !weight?.buffer || !indices?.buffer || !gates?.buffer) {
-    throw new Error("MoERouter requires input, weight, indices, and weights tensors.");
+  assertShapeKernelTensor(input, 'MoERouter input', {
+    dtypes: ['float32'], minimumRank: 1, maximumRank: 8,
+  });
+  assertShapeKernelTensor(weight, 'MoERouter weight', {
+    dtypes: ['float32'], minimumRank: 2, maximumRank: 2,
+  });
+  if (biasTensor) {
+    assertShapeKernelTensor(biasTensor, 'MoERouter bias', {
+      dtypes: ['float32'], minimumRank: 1, maximumRank: 1,
+    });
   }
 
   const dModel = input.shape[input.shape.length - 1];
   const rows = product(input.shape.slice(0, -1));
-  const numExperts = node.params.num_experts ?? weight.shape[weight.shape.length - 1];
-  const topK = node.params.top_k ?? indices.shape[indices.shape.length - 1] ?? 2;
-  const temperature = node.params.temperature ?? 1;
-  const normalize = node.params.normalize !== false;
-  if (weight.shape.length !== 2 || weight.shape[0] !== dModel ||
-      indices.buffer.length !== rows * topK || gates.buffer.length !== rows * topK ||
+  const params = node.params ?? {};
+  const numExperts = params.num_experts ?? weight.shape[weight.shape.length - 1];
+  const topK = params.top_k ?? 2;
+  const temperature = params.temperature ?? 1;
+  const normalizeValue = params.normalize ?? true;
+  if (weight.shape[0] !== dModel ||
       (bias && bias.length !== numExperts)) {
     throw new Error("MoERouter has incompatible router or output dimensions.");
   }
@@ -42,6 +56,17 @@ export function _cpuMoERouter(node) {
   if (!(temperature > 0) || !Number.isFinite(temperature)) {
     throw new Error("MoERouter temperature must be positive and finite.");
   }
+  if (typeof normalizeValue !== 'boolean') {
+    throw new Error('MoERouter normalize must be boolean.');
+  }
+  const normalize = normalizeValue;
+  const routeShape = [...input.shape.slice(0, -1), topK];
+  assertShapeKernelOutput(
+    indices, routeShape, 'float32', undefined, 'MoERouter indices',
+  );
+  assertShapeKernelOutput(
+    gates, routeShape, 'float32', undefined, 'MoERouter weights',
+  );
 
   const logits = new Float32Array(numExperts);
   const selected = new Int32Array(topK);

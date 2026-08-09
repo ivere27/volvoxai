@@ -45,6 +45,8 @@ fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
   var gathered = indices[output_index];
   if (gathered < 0) { gathered = gathered + i32(data_dim(axis)); }
   if (gathered < 0 || gathered >= i32(data_dim(axis))) {
+    // Canonical graphs preflight this domain before dispatch; this is an OOB
+    // guard for malformed direct shader use only.
     output[output_index] = -1.0;
     return;
   }

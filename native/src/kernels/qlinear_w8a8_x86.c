@@ -187,10 +187,9 @@ static VX_W8A8_TARGET_AVX2 void vx_w8a8_qlinear_avx2_range(
             {
                 const float product_scale = input_scale * weight_scales[column];
                 const float multiplier = product_scale / output_scale;
-                const float scaled = (float)accumulator * multiplier;
-                const float transformed = scaled + (float)output_zero_point;
-                int32_t quantized = vx_w8a8_requantize(transformed,
-                    output_minimum, output_maximum, output_zero_point);
+                int32_t quantized = vx_w8a8_requantize_accumulator(
+                    accumulator, multiplier, output_zero_point,
+                    output_minimum, output_maximum);
                 vx_w8a8_store_byte(output, output_dtype,
                     output_offset + column, quantized);
             }
@@ -325,12 +324,11 @@ static VX_W8A8_TARGET_AVX2 void vx_w8a8_qlinear_avx2_tiled_range(
                     call->input_scale * call->weight_scales[column];
                 const float multiplier = product_scale / call->output_scale;
                 for (uint32_t tile_row = 0; tile_row < 8u; tile_row++) {
-                    const float scaled = (float)accumulators[tile_row] * multiplier;
-                    const float transformed =
-                        scaled + (float)call->output_zero_point;
-                    const int32_t quantized = vx_w8a8_requantize(
-                        transformed, output_minimum, output_maximum,
-                        call->output_zero_point);
+                    const int32_t quantized =
+                        vx_w8a8_requantize_accumulator(
+                            accumulators[tile_row], multiplier,
+                            call->output_zero_point, output_minimum,
+                            output_maximum);
                     vx_w8a8_store_byte(call->output, call->output_dtype,
                         output_offsets[tile_row] + column, quantized);
                 }
@@ -462,12 +460,9 @@ static VX_W8A8_TARGET_AVX2 void vx_w8a8_qlinear_avx2_maddubs_range(
                 const float product_scale =
                     call->input_scale * call->weight_scales[column];
                 const float multiplier = product_scale / call->output_scale;
-                const float scaled = (float)accumulator * multiplier;
-                const float transformed =
-                    scaled + (float)call->output_zero_point;
-                const int32_t quantized = vx_w8a8_requantize(
-                    transformed, output_minimum, output_maximum,
-                    call->output_zero_point);
+                const int32_t quantized = vx_w8a8_requantize_accumulator(
+                    accumulator, multiplier, call->output_zero_point,
+                    output_minimum, output_maximum);
                 vx_w8a8_store_byte(call->output, call->output_dtype,
                     output_offset + column, quantized);
             }
@@ -606,12 +601,11 @@ static VX_W8A8_TARGET_AVX2 void vx_w8a8_qlinear_avx2_maddubs_tiled_range(
                         (int64_t)input_zero_unsigned * weight_sum +
                         (int64_t)call->d_in * input_zero_unsigned *
                             weight_zero_signed;
-                    const float scaled = (float)accumulator * multiplier;
-                    const float transformed =
-                        scaled + (float)call->output_zero_point;
-                    const int32_t quantized = vx_w8a8_requantize(
-                        transformed, output_minimum, output_maximum,
-                        call->output_zero_point);
+                    const int32_t quantized =
+                        vx_w8a8_requantize_accumulator(
+                            accumulator, multiplier,
+                            call->output_zero_point, output_minimum,
+                            output_maximum);
                     vx_w8a8_store_byte(call->output, call->output_dtype,
                         output_offsets[tile_row] + column, quantized);
                 }

@@ -25,15 +25,16 @@ from tools.exporter.runtime_tensors import runtime_tensor_allocation
 def _identity_document() -> dict:
     return {
         "format": "volvox-graph/v1",
+        "dimensions": {},
         "inputs": {"x": {"shape": [1, 4], "dtype": "float32"}},
         "outputs": ["y"],
         "nodes": [{
             "id": "identity",
             "opType": "Identity",
             "inputs": {"input": "x"},
-            "outputs": {"out": "y"},
-            "outputs_shape": {"out": [1, 4]},
-            "outputs_dtype": {"out": "float32"},
+            "outputs": {
+                "out": {"tensor": "y", "shape": [1, 4], "dtype": "float32"},
+            },
             "params": {},
         }],
     }
@@ -114,9 +115,13 @@ class RuntimeNameContractTests(unittest.TestCase):
             (
                 "output-port",
                 lambda document: document["nodes"][0].update(
-                    outputs={"constructor": "y"},
-                    outputs_shape={"constructor": [1, 4]},
-                    outputs_dtype={"constructor": "float32"},
+                    outputs={
+                        "constructor": {
+                            "tensor": "y",
+                            "shape": [1, 4],
+                            "dtype": "float32",
+                        },
+                    },
                 ),
             ),
             (
@@ -191,12 +196,12 @@ class RuntimeTensorAllocationTests(unittest.TestCase):
                 if location == "input":
                     document["inputs"]["x"]["shape"] = [1 << 27, 1 << 27]
                 else:
-                    document["nodes"][0]["outputs_shape"]["out"] = [
+                    document["nodes"][0]["outputs"]["out"]["shape"] = [
                         1 << 27, 1 << 27,
                     ]
                 with self.assertRaises(ExporterError) as caught:
                     import_runtime_package(document, {})
-                self.assertEqual(caught.exception.diagnostic.code, "VXRTIR027")
+                self.assertEqual(caught.exception.diagnostic.code, "VXRTIR003")
 
     def test_typed_import_rejects_unsafe_safetensors_runtime_allocations(self):
         cases = {
@@ -217,6 +222,7 @@ class RuntimeTensorAllocationTests(unittest.TestCase):
             with self.subTest(label=label):
                 document = {
                     "format": "volvox-graph/v1",
+                    "dimensions": {},
                     "inputs": {},
                     "outputs": ["huge"],
                     "nodes": [],
@@ -228,17 +234,23 @@ class RuntimeTensorAllocationTests(unittest.TestCase):
     def test_f16_safetensors_initializer_storage_remains_legal(self):
         document = {
             "format": "volvox-graph/v1",
+            "dimensions": {},
             "inputs": {
                 "x": {"shape": [1, 1, 1, 1], "dtype": "float32"},
             },
             "outputs": ["y"],
             "nodes": [{
+                "id": "conv",
                 "opType": "Conv2D",
                 "inputs": {"input": "x", "weight": "half_weight"},
-                "outputs": {"out": "y"},
-                "outputs_shape": {"out": [1, 1, 1, 1]},
-                "outputs_dtype": {"out": "float32"},
-                "params": {"weight_layout": "OHWI"},
+                "outputs": {
+                    "out": {
+                        "tensor": "y",
+                        "shape": [1, 1, 1, 1],
+                        "dtype": "float32",
+                    },
+                },
+                "params": {"weight_layout": "HWIO"},
             }],
         }
         weights = {
@@ -255,13 +267,13 @@ class RuntimeTensorAllocationTests(unittest.TestCase):
                 if location == "input":
                     document["inputs"]["x"]["shape"] = [1 << 27, 1 << 27]
                 else:
-                    document["nodes"][0]["outputs_shape"]["out"] = [
+                    document["nodes"][0]["outputs"]["out"]["shape"] = [
                         1 << 27, 1 << 27,
                     ]
                 with self.assertRaises(ExporterError) as caught:
                     _import_persisted(document, {})
-                self.assertEqual(caught.exception.diagnostic.code, "VXRTIR027")
-                self.assertIn("element count", caught.exception.diagnostic.message)
+                self.assertEqual(caught.exception.diagnostic.code, "VXRTIR003")
+                self.assertIn("invalid bounded shape", caught.exception.diagnostic.message)
 
 if __name__ == "__main__":
     unittest.main()

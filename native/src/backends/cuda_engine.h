@@ -4,6 +4,7 @@
 #include <stddef.h>
 #include <stdint.h>
 #include "../../include/volvoxai_enums.h"
+#include "../runtime/engine_core.h"
 
 #ifndef VOLVOXAI_ENABLE_TRAINING
 #define VOLVOXAI_ENABLE_TRAINING 0
@@ -21,6 +22,21 @@ int cuda_init(void);
 int cuda_init_failure_is_unavailable(void);
 void cuda_cleanup(void);
 
+/* Immutable limits used by the public bounded-shape compiler.  The query is
+ * intentionally model-neutral: it reports only physical-device and CUDA
+ * graph-slot capabilities for the engine state attached to the calling
+ * thread. */
+typedef struct CudaDomainLimits {
+    uint64_t total_memory_bytes;
+    uint32_t maximum_grid[3];
+    uint32_t maximum_block[3];
+    uint32_t maximum_threads_per_block;
+    uint32_t maximum_shared_memory_per_block;
+    uint32_t maximum_tensor_slots;
+} CudaDomainLimits;
+
+int cuda_query_domain_limits(CudaDomainLimits* limits);
+
 int cuda_matmul(const float* input, const float* weight, const float* bias,
                 float* output, int rows, int d_in, int d_out);
 int cuda_graph_matmul_f32(const float* input, const float* weight,
@@ -37,6 +53,19 @@ int cuda_graph_lora_apply_f32(const float* input, const float* a,
                               float scale);
 
 void cuda_graph_reset(void);
+/* Commit an exact semantic shape key after synchronizing the CUDA stream.
+ * Immutable weights stay bound; transient allocations return to a safe
+ * anonymous capacity pool and lose all host/coherence identity. */
+int cuda_graph_bind_shape(const char* signature);
+int cuda_graph_bind_shape_domain(
+        const char* signature,
+        const VolvoxAIEnginePhysicalSpan* spans,
+        size_t span_count);
+/* Finish an unpublished bootstrap forward by retaining invariant slots and
+ * synchronously releasing every transient slot. */
+int cuda_graph_complete_invariant_preload(void);
+void cuda_graph_clear_allocation_failure(void);
+int cuda_graph_last_allocation_failed(void);
 /* Synchronize and discard activation/gradient slots while retaining stable
  * model-weight allocations and their coherence state. Full graph/model
  * lifecycle changes must continue to use cuda_graph_reset(). */
@@ -79,6 +108,10 @@ int cuda_graph_qbatch_matmul_i8u8(
     float b_scale, int32_t b_zero_point, uint32_t b_dtype,
     void* output, const int* output_shape, int output_rank,
     float output_scale, int32_t output_zero_point, uint32_t output_dtype);
+/* Append context-local physical QBatchMatMul tactic counters to route
+ * evidence. Counts are packed groups of four and scalar K-tail values. */
+int cuda_graph_append_dynamic_telemetry(char* output,
+                                        size_t output_capacity);
 /* F32 ArgMax emits the first matching I32 index for every [outer,inner]
  * coordinate in a flattened [outer,axis,inner] view. */
 int cuda_graph_argmax_f32(const float* input, int32_t* output,
@@ -163,10 +196,14 @@ int cuda_graph_moe_router_f32(
     const float* input, const float* weight, const float* bias,
     float* route_indices, float* route_weights, int rows, int d_model,
     int experts, int top_k, float temperature, int normalize);
+/* `experts` counts staged rows; route indices stay in global slot space and are
+ * mapped through slot_rows[slot_domain]. NULL/0 means the bank is fully
+ * resident. */
 int cuda_graph_moe_linear_f32(
     const float* input, const float* expert_weight, const float* expert_bias,
     const float* route_indices, const float* route_weights, float* output,
-    int rows, int d_in, int d_out, int experts, int top_k);
+    int rows, int d_in, int d_out, int experts, int top_k,
+    const unsigned int* slot_rows, unsigned int slot_domain);
 int cuda_graph_transpose_f32(const float* input, float* output,
                              const int* input_shape, const int* permutation,
                              int rank);
@@ -484,6 +521,13 @@ int cuda_graph_resize_nearest_i8u8(const void* input, void* output,
                                    uint32_t input_dtype,
                                    uint32_t output_dtype);
 
+/* Promote an already-used graph slot to the stable model-weight lifetime
+ * without allocating or uploading an otherwise unused tensor. Inference
+ * prewarm uses this for generic operators whose binding API carries no tensor
+ * role metadata. */
+void cuda_graph_retain_weight(const void* host, size_t bytes);
+void cuda_graph_demote_weight(const void* host, size_t bytes);
+
 #if VOLVOXAI_ENABLE_TRAINING
 /* Backend-local lazy training scheduler. Logical bindings use the shared
  * training-plan order, including the final params binding. The generic plan
@@ -568,10 +612,6 @@ int cuda_training_optimizer_materialize(float* first_moment,
 void cuda_training_optimizer_forget(float* first_moment,
                                     float* second_moment);
 void cuda_training_optimizer_forget_all(void);
-/* Promote an already-used graph slot to the stable model-weight lifetime
- * without allocating or uploading an otherwise unused tensor. */
-void cuda_graph_retain_weight(const void* host, size_t bytes);
-
 /* Full-profile PTQ authoring on the manual Driver-API/PTX backend. The
  * destination is canonical row-major W8 [rows, columns]; transpose_source
  * reads an IN_OUT [columns, rows] master without a host transpose. Scheme 0
@@ -590,6 +630,18 @@ int cuda_training_quantize_w8_f32(
 #endif
 
 #if defined(VOLVOXAI_CUDA_TESTING)
+typedef struct {
+    uint64_t shape_generation;
+    uint64_t capacity_generation;
+    uint64_t slot_epoch;
+    uint64_t replay_shape_generation;
+    uint64_t replay_capacity_generation;
+    size_t active_capacity_bytes;
+    size_t pooled_capacity_bytes;
+    int slot_count;
+    int replay_plan;
+    int exact_signature_match;
+} CudaGraphDynamicStateProbe;
 uintptr_t cuda_test_context_state_identity(void);
 void cuda_test_context_state_set_probe(uint64_t value);
 uint64_t cuda_test_context_state_probe(void);
@@ -627,14 +679,31 @@ uint64_t cuda_test_graph_invalidation_count(void);
 uint64_t cuda_test_slot_exact_lookup_count(void);
 uint64_t cuda_test_slot_hash_probe_count(void);
 uint64_t cuda_test_slot_containing_scan_count(void);
+uint64_t cuda_test_graph_allocation_count(void);
+int cuda_test_graph_domain_reservation(size_t* span_count,
+                                       int* preload_complete,
+                                       int* enforced,
+                                       int* replay_plan);
 uint64_t cuda_test_graph_slot_count(void);
 uint64_t cuda_test_graph_resident_weight_slot_count(void);
+uint64_t cuda_test_qlinear_warp_dp4a_launch_count(void);
+uint64_t cuda_test_qlinear_thread_dp4a_launch_count(void);
+uint64_t cuda_test_qlinear_dp4a_group_count(void);
+uint64_t cuda_test_qlinear_scalar_tail_count(void);
+uint64_t cuda_test_qconv2d_warp_dp4a_launch_count(void);
+uint64_t cuda_test_qconv2d_thread_dp4a_launch_count(void);
+uint64_t cuda_test_qbatch_matmul_dp4a_group_count(void);
+uint64_t cuda_test_qbatch_matmul_scalar_tail_count(void);
 size_t cuda_test_training_basic_workspace_bytes(void);
+void cuda_test_fail_next_graph_allocation(void);
+void cuda_test_fail_next_graph_growth_rollback(void);
 void cuda_test_fail_next_transient_release_context(void);
 void cuda_test_fail_next_transient_release_sync(void);
 uint64_t cuda_test_quarantined_transient_slot_count(void);
 int cuda_test_graph_api_available(void);
 int cuda_test_caller_context_is_clear(void);
+int cuda_test_graph_dynamic_state(const char* expected_signature,
+                                  CudaGraphDynamicStateProbe* probe);
 #endif
 
 #endif

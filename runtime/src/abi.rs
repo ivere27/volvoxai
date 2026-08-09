@@ -68,6 +68,8 @@ pub(crate) const VX_DECODE_ROW_DISABLED: c_int = DecodeRowMode::Disabled as c_in
 pub(crate) const VX_DECODE_ROW_AUTO: c_int = DecodeRowMode::Auto as c_int;
 pub(crate) const VX_DECODE_ROW_REQUIRED: c_int = DecodeRowMode::Required as c_int;
 pub(crate) const VX_MAX_TENSOR_RANK: usize = 8;
+pub(crate) const VX_DIMENSION_FIXED: c_int = 1;
+pub(crate) const VX_DIMENSION_SYMBOLIC: c_int = 2;
 pub(crate) const VX_MAX_TRAINING_LOSSES: usize = 8;
 pub(crate) const VX_TRAINING_NAME_CAPACITY: usize = 128;
 pub(crate) const VX_PTQ_NAME_CAPACITY: usize = 128;
@@ -197,6 +199,8 @@ pub(crate) struct VxModelSource {
     pub graph_path: *const c_char,
     pub weight_paths: *const *const c_char,
     pub weight_path_count: usize,
+    pub bank_residency: *const c_void,
+    pub bank_residency_count: usize,
 }
 
 #[repr(C)]
@@ -315,6 +319,8 @@ impl VxOptimizerOptions {
 #[repr(C)]
 pub(crate) struct VxTrainStepOptions {
     pub struct_size: usize,
+    pub inputs: *const VxTensorBinding,
+    pub input_count: usize,
     pub losses: *const VxCrossEntropyLoss,
     pub loss_count: usize,
     pub trainable_names: *const *const c_char,
@@ -403,6 +409,8 @@ pub(crate) struct VxPTQLayerSpec {
 pub(crate) struct VxPTQPlanOptions {
     pub struct_size: usize,
     pub template_graph_path: *const c_char,
+    pub profile_names: *const *const c_char,
+    pub profile_count: usize,
     pub observers: *const VxPTQObserverSpec,
     pub observer_count: usize,
     pub layers: *const VxPTQLayerSpec,
@@ -410,19 +418,24 @@ pub(crate) struct VxPTQPlanOptions {
 }
 
 #[repr(C)]
-pub(crate) struct VxPTQInput {
+pub(crate) struct VxPTQCalibrationBatch {
     pub struct_size: usize,
-    pub name: *const c_char,
-    pub dtype: c_int,
-    pub data: *const c_void,
-    pub byte_size: usize,
+    pub profile_name: *const c_char,
+    pub sample_name: *const c_char,
+    pub sample_count: u64,
+    pub inputs: *const VxTensorBinding,
+    pub input_count: usize,
 }
 
 #[repr(C)]
 pub(crate) struct VxPTQPlanInfo {
     pub struct_size: usize,
+    pub calibration_batches: u64,
     pub calibration_samples: u64,
     pub tensor_count: usize,
+    pub profile_count: usize,
+    pub covered_profile_count: usize,
+    pub coverage_complete: c_int,
     pub revision: VxRevisionInfo,
 }
 
@@ -430,8 +443,12 @@ impl VxPTQPlanInfo {
     pub(crate) fn new() -> Self {
         Self {
             struct_size: std::mem::size_of::<Self>(),
+            calibration_batches: 0,
             calibration_samples: 0,
             tensor_count: 0,
+            profile_count: 0,
+            covered_profile_count: 0,
+            coverage_complete: 0,
             revision: VxRevisionInfo::new(),
         }
     }
@@ -498,6 +515,65 @@ impl VxTensorInfo {
     }
 }
 
+#[derive(Clone, Copy)]
+#[repr(C)]
+pub(crate) struct VxDimensionConstraint {
+    pub struct_size: usize,
+    pub kind: c_int,
+    pub symbol: *const c_char,
+    pub min: i64,
+    pub max: i64,
+    pub multiple_of: i64,
+}
+
+impl VxDimensionConstraint {
+    fn new() -> Self {
+        Self {
+            struct_size: std::mem::size_of::<Self>(),
+            kind: VX_DIMENSION_FIXED,
+            symbol: std::ptr::null(),
+            min: 1,
+            max: 1,
+            multiple_of: 1,
+        }
+    }
+}
+
+#[repr(C)]
+pub(crate) struct VxTensorSpec {
+    pub struct_size: usize,
+    pub name: *const c_char,
+    pub dtype: c_int,
+    pub rank: u32,
+    pub dimensions: [VxDimensionConstraint; VX_MAX_TENSOR_RANK],
+    pub location: c_int,
+}
+
+impl VxTensorSpec {
+    pub(crate) fn new() -> Self {
+        Self {
+            struct_size: std::mem::size_of::<Self>(),
+            name: std::ptr::null(),
+            dtype: VX_DTYPE_F32,
+            rank: 0,
+            dimensions: [VxDimensionConstraint::new(); VX_MAX_TENSOR_RANK],
+            location: VX_MEMORY_HOST,
+        }
+    }
+}
+
+#[repr(C)]
+pub(crate) struct VxTensorBinding {
+    pub struct_size: usize,
+    pub name: *const c_char,
+    pub dtype: c_int,
+    pub rank: u32,
+    pub shape: [i64; VX_MAX_TENSOR_RANK],
+    pub data: *const c_void,
+    pub byte_size: usize,
+    pub location: c_int,
+}
+
 extern "C" {
     pub(crate) fn vx_status_string(status: c_int) -> *const c_char;
 
@@ -539,18 +615,10 @@ extern "C" {
     pub(crate) fn vx_trainer_release(trainer: *mut VxTrainer);
     pub(crate) fn vx_trainer_close(trainer: *mut VxTrainer, report: *mut VxReport) -> c_int;
     pub(crate) fn vx_trainer_input_count(trainer: *mut VxTrainer) -> usize;
-    pub(crate) fn vx_trainer_input_info(
+    pub(crate) fn vx_trainer_input_spec(
         trainer: *mut VxTrainer,
         index: usize,
-        info: *mut VxTensorInfo,
-        report: *mut VxReport,
-    ) -> c_int;
-    pub(crate) fn vx_trainer_set_input(
-        trainer: *mut VxTrainer,
-        name: *const c_char,
-        dtype: c_int,
-        data: *const c_void,
-        byte_size: usize,
+        spec: *mut VxTensorSpec,
         report: *mut VxReport,
     ) -> c_int;
     pub(crate) fn vx_trainer_train_step(
@@ -582,23 +650,28 @@ extern "C" {
     pub(crate) fn vx_ptq_plan_release(plan: *mut VxPTQPlan);
     pub(crate) fn vx_ptq_plan_close(plan: *mut VxPTQPlan, report: *mut VxReport) -> c_int;
     pub(crate) fn vx_ptq_plan_input_count(plan: *mut VxPTQPlan) -> usize;
-    pub(crate) fn vx_ptq_plan_input_info(
+    pub(crate) fn vx_ptq_plan_input_spec(
         plan: *mut VxPTQPlan,
         index: usize,
-        info: *mut VxTensorInfo,
+        spec: *mut VxTensorSpec,
         report: *mut VxReport,
     ) -> c_int;
     pub(crate) fn vx_ptq_plan_calibrate(
         plan: *mut VxPTQPlan,
-        sample_name: *const c_char,
-        inputs: *const VxPTQInput,
-        input_count: usize,
-        calibration_samples: *mut u64,
+        batch: *const VxPTQCalibrationBatch,
+        info: *mut VxPTQPlanInfo,
         report: *mut VxReport,
     ) -> c_int;
     pub(crate) fn vx_ptq_plan_info(
         plan: *mut VxPTQPlan,
         info: *mut VxPTQPlanInfo,
+        report: *mut VxReport,
+    ) -> c_int;
+    pub(crate) fn vx_ptq_plan_coverage_json(
+        plan: *mut VxPTQPlan,
+        output: *mut c_char,
+        output_capacity: usize,
+        required_size: *mut usize,
         report: *mut VxReport,
     ) -> c_int;
     pub(crate) fn vx_ptq_plan_tensor_parameters(
@@ -639,33 +712,31 @@ extern "C" {
         report: *mut VxReport,
     ) -> c_int;
     pub(crate) fn vx_execution_context_input_count(context: *mut VxExecutionContext) -> usize;
-    pub(crate) fn vx_execution_context_input_info(
+    pub(crate) fn vx_execution_context_input_spec(
         context: *mut VxExecutionContext,
         index: usize,
-        info: *mut VxTensorInfo,
-        report: *mut VxReport,
-    ) -> c_int;
-    pub(crate) fn vx_execution_context_set_input(
-        context: *mut VxExecutionContext,
-        name: *const c_char,
-        dtype: c_int,
-        data: *const c_void,
-        byte_size: usize,
+        spec: *mut VxTensorSpec,
         report: *mut VxReport,
     ) -> c_int;
     pub(crate) fn vx_execution_context_execute(
         context: *mut VxExecutionContext,
+        inputs: *const VxTensorBinding,
+        input_count: usize,
         out_result: *mut *mut VxResult,
         report: *mut VxReport,
     ) -> c_int;
     pub(crate) fn vx_execution_context_decode_seed(
         context: *mut VxExecutionContext,
+        inputs: *const VxTensorBinding,
+        input_count: usize,
         out_result: *mut *mut VxResult,
         report: *mut VxReport,
     ) -> c_int;
     pub(crate) fn vx_execution_context_decode_step(
         context: *mut VxExecutionContext,
         position: c_int,
+        inputs: *const VxTensorBinding,
+        input_count: usize,
         out_result: *mut *mut VxResult,
         report: *mut VxReport,
     ) -> c_int;

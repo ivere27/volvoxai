@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
-import { Graph } from '../ts/index.js';
+import { TrainingGraph as Graph } from '../ts/training/TrainingGraph.js';
 import { CPUEngine } from '../ts/backends/CPUEngine.js';
 import { CPUAutograd } from '../ts/training/CPUAutograd.js';
 import { geluValue } from '../ts/ops/gELU.js';
@@ -100,6 +100,33 @@ test('activation backward formulas match finite differences', async (t) => {
       for (let index = 0; index < parameter.buffer.length; index++) {
         const numeric = await numericGradient(graph, engine, 'parameter', index, targets);
         close(result.gradients.get('parameter')[index], numeric, `${opType}[${index}]`);
+      }
+    });
+  }
+});
+
+test('pooling backward matches finite differences with canonical four-sided pads', async (t) => {
+  for (const opType of ['MaxPool2D', 'AveragePool2D']) {
+    await t.test(opType, async () => {
+      const graph = new Graph();
+      const input = addWeight(graph, 'input', [1, 3, 3, 2], [
+        .1, .7, .3, .2, .5, .4, .9, .6, .8, .2, .1, .5, .4, .3, .7, .55, .2, .8,
+      ]);
+      const pads = opType === 'MaxPool2D' ? [1, 0, 0, 1] : [1, 1, 1, 1];
+      const { out } = graph.addOp(opType, { input }, { out: [1, 2, 2, 2] }, {
+        kernel: [2, 2], stride: [2, 2], pads,
+      });
+      graph.setOutputs([out.name]);
+      const targets = [0, 1, 0, 1];
+      const { result, engine } = await gradients(graph, ['input'], targets);
+      for (let index = 0; index < input.buffer.length; index++) {
+        close(
+          result.gradients.get('input')[index],
+          await numericGradient(graph, engine, 'input', index, targets),
+          `${opType} canonical pads input[${index}]`,
+          4e-4,
+          4e-3,
+        );
       }
     });
   }
@@ -295,6 +322,7 @@ async function convolutionCase({ depthwise }) {
   const { out } = graph.addOp('Conv2D', { input, weight, bias }, { out: [1, 1, 2, 4] }, {
     groups: 2,
     relu: depthwise ? 2 : 1,
+    weight_layout: depthwise ? 'HWCM' : 'HWIO',
   });
   graph.setOutputs([out.name]);
   const targets = [0, 3];
@@ -388,27 +416,6 @@ test('explicit graph LoRA A/B branches are trainable', async () => {
   assert.equal(result.updatedTensors.length, 2);
   assert.notDeepEqual(a.buffer, beforeA);
   assert.notDeepEqual(b.buffer, beforeB);
-});
-
-test('CPU training uses the base route when a staged adapter is active', async () => {
-  const graph = new Graph();
-  const input = addWeight(graph, 'input', [1, 2], [0.7, -0.2]);
-  const weight = addWeight(graph, 'weight', [2, 2], [1, 0, 0, 1]);
-  const { out } = graph.addOp('MatMul', { input, weight }, { out: [1, 2] });
-  graph.nodes[0].wLayout = 'din';
-  graph.setOutputs([out.name]);
-  graph.stageAdapter('active', {
-    kind: 'lora',
-    targets: [{
-      weight: 'weight', rank: 1, alpha: 1,
-      A: Float32Array.from([8, -6]), B: Float32Array.from([5, -7]),
-    }],
-  }, { activate: true });
-
-  const trained = await gradients(graph, ['input'], [1]);
-  graph.activateAdapter(null);
-  const numeric = await numericGradient(graph, trained.engine, 'input', 0, [1]);
-  close(trained.result.gradients.get('input')[0], numeric, 'base-only active-adapter gradient');
 });
 
 test('CPU training validates optimizer and trainables before mutation', async () => {

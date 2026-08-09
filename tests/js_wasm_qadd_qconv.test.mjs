@@ -7,7 +7,7 @@ import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
 
-import { Graph } from '../ts/core/Graph.js';
+import { RuntimeGraph } from '../ts/core/RuntimeGraph.js';
 import { CPUEngine } from '../ts/backends/CPUEngine.js';
 import { WasmEngine } from '../ts/backends/WasmEngine.js';
 
@@ -35,7 +35,7 @@ function qaddGraph({
   outputDtype = 'int8', outputShape, outputQuantization,
   params = {},
 } = {}) {
-  const graph = new Graph();
+  const graph = new RuntimeGraph();
   const a = graph.addInput('a', aShape, aDtype, { quantization: aQuantization });
   const b = graph.addInput('b', bShape, bDtype, { quantization: bQuantization });
   const { out } = graph.addOp('QAdd', { a, b }, {
@@ -55,7 +55,7 @@ function qconvGraph({
   outputDtype = 'int8', outputShape, outputQuantization,
   params = {},
 } = {}) {
-  const graph = new Graph();
+  const graph = new RuntimeGraph();
   const input = graph.addInput('input', inputShape, inputDtype, { quantization: inputQuantization });
   const weight = graph.addWeight('weight', weightShape, weightDtype, {
     buffer: byteStorage(weightDtype, weightValues), quantization: weightQuantization,
@@ -74,7 +74,7 @@ function qconvGraph({
 }
 
 function typedW8A8IslandGraph() {
-  const graph = new Graph();
+  const graph = new RuntimeGraph();
   const input = graph.addInput('input', [1, 2, 2, 1], 'uint8', {
     quantization: { scheme: 'per_tensor', scale: 0.25, zero_point: 128 },
   });
@@ -106,7 +106,7 @@ function typedW8A8IslandGraph() {
 }
 
 function expandedQAddGraph() {
-  const graph = new Graph();
+  const graph = new RuntimeGraph();
   const left = graph.addInput('left', [2, 4], 'int8', {
     quantization: { scheme: 'per_tensor', scale: 0.5, zero_point: -2 },
   });
@@ -185,7 +185,7 @@ test('portable WASM QAdd and QConv2D preserve physical byte storage', {
     forbidCpuQuantizedFallbacks(wasm);
 
     await t.test('generic Add cannot bypass the canonical byte-domain operator contract', () => {
-      const graph = new Graph();
+      const graph = new RuntimeGraph();
       const quantization = { scheme: 'per_tensor', scale: 0.25, zero_point: 0 };
       const a = graph.addInput('a', [4], 'int8', { quantization });
       const b = graph.addInput('b', [4], 'int8', { quantization });
@@ -317,6 +317,37 @@ test('portable WASM QAdd and QConv2D preserve physical byte storage', {
       assert.deepEqual([...smallerResult.out], [...smallerCpu.out]);
     });
 
+    await t.test('packed 3x3 QConv2D preserves padded-row parity', async () => {
+      const channels = 19;
+      const inputValues = Uint8Array.from(
+        { length: 4 * 5 * channels }, (_, index) => (index * 29 + 17) % 251,
+      );
+      const weightValues = Int8Array.from(
+        { length: 8 * 3 * 3 * channels }, (_, index) => ((index * 19 + 7) % 127) - 63,
+      );
+      const spec = {
+        inputDtype: 'uint8', inputValues, inputShape: [1, 4, 5, channels],
+        inputQuantization: { scheme: 'per_tensor', scale: 0.03125, zero_point: 137 },
+        weightValues, weightShape: [8, 3, 3, channels],
+        weightQuantization: {
+          scheme: 'per_axis', axis: 0, scales: new Array(8).fill(0.015625),
+          zero_points: new Array(8).fill(0),
+        },
+        biasValues: [31, -47, 59, -71, 83, -97, 101, -103],
+        outputDtype: 'uint8', outputShape: [1, 4, 5, 8],
+        outputQuantization: { scheme: 'per_tensor', scale: 0.125, zero_point: 113 },
+        params: { stride: [1, 1], dilation: [1, 1], pads: [1, 1, 1, 1] },
+      };
+      const cpu = await cpuResult(() => qconvGraph(spec));
+      const { graph, inputs } = qconvGraph(spec);
+      wasm.compile(graph);
+      const descriptor = wasm.nodeMetadata.get(graph.nodes[0]);
+      assert.ok(descriptor.packedWeightPointer > 0);
+      assert.equal(descriptor.im2colBytes, 4 * 5 * 3 * 3 * channels);
+      const result = await wasm.execute(inputs);
+      assert.deepEqual([...result.out], [...cpu.out]);
+    });
+
     await t.test('accelerated QConv2D preserves U8 asymmetric padding, dilation, and N-tail parity', async () => {
       const inputValues = Uint8Array.from(
         { length: 5 * 6 * 3 }, (_, index) => (index * 29 + 17) % 251,
@@ -436,7 +467,7 @@ test('portable WASM QAdd and QConv2D preserve physical byte storage', {
     });
 
     await t.test('whole-output QConv2D im2col scratch is capped at 64 MiB', () => {
-      const graph = new Graph();
+      const graph = new RuntimeGraph();
       const width = 64 * 1024 * 1024 + 1;
       const input = graph.addInput('oversized_input', [1, 1, width, 1], 'int8', {
         quantization: { scheme: 'per_tensor', scale: 1, zero_point: 0 },

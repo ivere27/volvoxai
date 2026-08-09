@@ -4,6 +4,7 @@ testdata/
 node_modules/
 dist/
 build/
+build-*/
 native/*.o
 native/volvoxai
 native/volvoxai-full

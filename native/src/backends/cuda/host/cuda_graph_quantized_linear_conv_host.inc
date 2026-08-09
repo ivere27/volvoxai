@@ -1,3 +1,21 @@
+enum {
+    CUDA_W8A8_WARP_WIDTH = 32u,
+    CUDA_QLINEAR_WARP_MIN_K = 32u,
+    CUDA_QCONV2D_WARP_MIN_TERMS = 64u,
+};
+
+static int cuda_w8a8_warp_work_items(uint32_t output_elements,
+                                     uint32_t* work_items) {
+    const uint64_t threads =
+        (uint64_t)output_elements * CUDA_W8A8_WARP_WIDTH;
+    const uint64_t grid = (threads + 255u) / 256u;
+    if (!output_elements || !work_items || threads > UINT32_MAX ||
+        !cuda_max_grid[0] || grid > cuda_max_grid[0])
+        return 0;
+    *work_items = (uint32_t)threads;
+    return 1;
+}
+
 int cuda_graph_qlinear_i8u8(const void* input, const void* weight,
                             const float* weight_scales,
                             const int32_t* weight_zero_points,
@@ -11,6 +29,8 @@ int cuda_graph_qlinear_i8u8(const void* input, const void* weight,
     CudaTensorSlot *weight_slot, *scale_slot, *zero_slot, *bias_slot;
     size_t input_bytes, weight_bytes, output_bytes, metadata_bytes;
     uint32_t elements;
+    uint32_t warp_work_items = 0u;
+    int use_warp;
     void* args[16];
     if (!input || !weight || !weight_scales || !weight_zero_points || !bias || !output ||
         !byte_dtype_valid(input_dtype) || !byte_dtype_valid(weight_dtype) ||
@@ -73,7 +93,22 @@ int cuda_graph_qlinear_i8u8(const void* input, const void* weight,
     args[13] = &input_dtype;
     args[14] = &weight_dtype;
     args[15] = &output_dtype;
-    if (!cuda_launch_1d(CUDA_FORWARD_FUNCTION(k_qlinear), elements, args)) return 0;
+    use_warp = d_in >= CUDA_QLINEAR_WARP_MIN_K &&
+        cuda_w8a8_warp_work_items(elements, &warp_work_items);
+    if (!cuda_launch_1d(
+            use_warp
+                ? CUDA_FORWARD_FUNCTION(k_qlinear_warp_dp4a)
+                : CUDA_FORWARD_FUNCTION(k_qlinear),
+            use_warp ? warp_work_items : elements, args))
+        return 0;
+#if defined(VOLVOXAI_CUDA_TESTING)
+    if (use_warp) cuda_qlinear_warp_dp4a_launch_count++;
+    else cuda_qlinear_thread_dp4a_launch_count++;
+    cuda_qlinear_dp4a_group_count +=
+        (uint64_t)elements * (uint64_t)(d_in / 4u);
+    cuda_qlinear_scalar_tail_count +=
+        (uint64_t)elements * (uint64_t)(d_in % 4u);
+#endif
     graph_mark_device(output_view.slot);
     return 1;
 }
@@ -159,6 +194,8 @@ int cuda_graph_qconv2d_i8u8(const void* input, const void* weight,
     size_t input_bytes, weight_bytes, output_bytes, metadata_bytes;
     uint64_t padded_height, padded_width, effective_height, effective_width;
     uint64_t expected_height, expected_width, terms, input_magnitude;
+    uint32_t warp_work_items = 0u;
+    int use_warp;
     CUdeviceptr no_bias = 0;
     CUdeviceptr bias_device;
     void* args[33];
@@ -263,7 +300,19 @@ int cuda_graph_qconv2d_i8u8(const void* input, const void* weight,
     args[30] = &input_dtype;
     args[31] = &weight_dtype;
     args[32] = &output_dtype;
-    if (!cuda_launch_1d(CUDA_FORWARD_FUNCTION(k_qconv2d), output_elements, args)) return 0;
+    use_warp = input_per_group >= 4u &&
+        terms >= CUDA_QCONV2D_WARP_MIN_TERMS &&
+        cuda_w8a8_warp_work_items(output_elements, &warp_work_items);
+    if (!cuda_launch_1d(
+            use_warp
+                ? CUDA_FORWARD_FUNCTION(k_qconv2d_warp_dp4a)
+                : CUDA_FORWARD_FUNCTION(k_qconv2d),
+            use_warp ? warp_work_items : output_elements, args))
+        return 0;
+#if defined(VOLVOXAI_CUDA_TESTING)
+    if (use_warp) cuda_qconv2d_warp_dp4a_launch_count++;
+    else cuda_qconv2d_thread_dp4a_launch_count++;
+#endif
     graph_mark_device(output_slot);
     return 1;
 }

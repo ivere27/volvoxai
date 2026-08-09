@@ -1,56 +1,59 @@
+import { Trainer } from '../../ts/training/Trainer.js';
+import { exportModelCheckpoint, importModelCheckpoint } from '../../ts/training/ModelCheckpoint.js';
 import {
-  VolvoxAI,
-  exportModelCheckpoint,
-  importModelCheckpoint,
-} from '../../ts/full.js';
+  logicalSnapshotFromTrainingGraph,
+  checkpointForTrainingGraph,
+  shapedFixtureInputs,
+  trainingGraphFromCheckpoint,
+} from './training_fixture.mjs';
 
 /**
- * Test harness that exercises the public Runtime -> Model -> Trainer ownership
- * chain while allowing parity suites to create many independent graphs.
+ * Internal numerical-test harness. It converts each legacy fixed concrete
+ * kernel fixture once at the boundary; the Trainer itself sees only an
+ * immutable Model and complete shaped inputs.
  */
 export class TrainingSessionHarness {
   #backend;
   #wasmUrl;
-  #runtimePromise;
   #records = new Map();
   #closed = false;
 
   constructor({ backend = 'cpu', wasmUrl } = {}) {
     this.#backend = backend;
     this.#wasmUrl = wasmUrl;
-    this.#runtimePromise = VolvoxAI.createRuntime({
-      backends: [backend],
-      ...(wasmUrl == null ? {} : { wasmUrl }),
-    });
   }
 
   async #record(graph) {
     if (this.#closed) throw new Error('TrainingSessionHarness is closed.');
     let record = this.#records.get(graph);
     if (record) return record;
-    const runtime = await this.#runtimePromise;
-    const initialCheckpoint = exportModelCheckpoint(graph);
-    const model = runtime.createModel(importModelCheckpoint(initialCheckpoint).graph);
-    let trainer;
-    try {
-      trainer = await VolvoxAI.createTrainer(model, {
-        backend: this.#backend,
-        checkpoint: initialCheckpoint,
-        ...(this.#wasmUrl == null ? {} : { wasmUrl: this.#wasmUrl }),
+    const checkpoint = checkpointForTrainingGraph(graph);
+    const snapshot = checkpoint === null
+      ? logicalSnapshotFromTrainingGraph(graph)
+      : importModelCheckpoint(checkpoint).snapshot;
+    const initialCheckpoint = checkpoint ?? (graph.trainingMetadata == null
+      ? null
+      : {
+        ...exportModelCheckpoint(snapshot),
+        trainingMetadata: structuredClone(graph.trainingMetadata),
       });
-    } catch (error) {
-      await model.close();
-      throw error;
-    }
-    record = { model, trainer };
+    const trainer = await Trainer.create(snapshot, {
+      backend: this.#backend,
+      ...(initialCheckpoint === null ? {} : { checkpoint: initialCheckpoint }),
+      ...(this.#wasmUrl == null ? {} : { wasmUrl: this.#wasmUrl }),
+    });
+    record = { snapshot, trainer };
     this.#records.set(graph, record);
     return record;
   }
 
   async runStep(graph, options = {}) {
-    const { backend: _ignoredBackend, ...stepOptions } = options;
-    const { trainer } = await this.#record(graph);
-    return trainer.trainStep(stepOptions);
+    const { backend: _ignoredBackend, inputs, ...stepOptions } = options;
+    const { snapshot, trainer } = await this.#record(graph);
+    return trainer.trainStep({
+      ...stepOptions,
+      inputs: shapedFixtureInputs(snapshot, inputs),
+    });
   }
 
   async exportCheckpoint(graph, options = {}) {
@@ -61,11 +64,7 @@ export class TrainingSessionHarness {
   async close() {
     if (this.#closed) return;
     this.#closed = true;
-    const records = [...this.#records.values()];
-    await Promise.allSettled(records.map(({ trainer }) => trainer.close()));
-    await Promise.allSettled(records.map(({ model }) => model.close()));
-    const runtime = await this.#runtimePromise;
-    await runtime.close();
+    await Promise.allSettled([...this.#records.values()].map(({ trainer }) => trainer.close()));
     this.#records.clear();
   }
 }
@@ -78,7 +77,7 @@ export function createWasmTrainingHarness(wasmUrl) {
   return new TrainingSessionHarness({ backend: 'wasm', wasmUrl });
 }
 
-/** Create a one-step runner that deterministically closes every public handle. */
+/** Create a one-step runner that deterministically closes every Trainer. */
 export function createWasmStepRunner(wasmUrl) {
   return async (graph, options = {}) => {
     const training = createWasmTrainingHarness(wasmUrl);
@@ -87,10 +86,12 @@ export function createWasmStepRunner(wasmUrl) {
       const checkpoint = await training.exportCheckpoint(graph);
       return {
         ...result,
-        publishedGraph: importModelCheckpoint(checkpoint).graph,
+        publishedGraph: trainingGraphFromCheckpoint(checkpoint),
       };
     } finally {
       await training.close();
     }
   };
 }
+
+export { trainingGraphFromCheckpoint } from './training_fixture.mjs';

@@ -39,7 +39,7 @@ download() {
 }
 
 export_one() {
-  local precision="$1" directory_suffix="$2" tflite_name="$3" weight_dtype="$4" normalization="$5"
+  local precision="$1" directory_suffix="$2" tflite_name="$3" weight_dtype="$4"
   local directory="$MODELS/efficientdet_lite0_${directory_suffix}"
   local tflite="$directory/$tflite_name"
 
@@ -49,7 +49,6 @@ export_one() {
     --model "$tflite" \
     --out "$directory/model.safetensors" \
     --weight-dtype "$weight_dtype" \
-    --image-normalization "input0=$normalization" \
     --output-name scores \
     --output-name boxes
   cp "$LABELS" "$directory/labels.txt"
@@ -68,13 +67,13 @@ main() {
   esac
 
   if [ -z "$only" ] || [ "$only" = "int8" ]; then
-    export_one int8 int8 efficientdet_lite0.tflite auto raw-255
+    export_one int8 int8 efficientdet_lite0.tflite auto
   fi
   if [ -z "$only" ] || [ "$only" = "float16" ]; then
-    export_one float16 fp16 efficientdet_lite0_float16.tflite float16 zero-one
+    export_one float16 fp16 efficientdet_lite0_float16.tflite float16
   fi
   if [ -z "$only" ] || [ "$only" = "float32" ]; then
-    export_one float32 fp32 efficientdet_lite0_float32.tflite float32 zero-one
+    export_one float32 fp32 efficientdet_lite0_float32.tflite float32
   fi
   log "ready under $MODELS/efficientdet_lite0_*"
 }

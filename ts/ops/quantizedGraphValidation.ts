@@ -25,9 +25,9 @@ function sameTensor(left: ValidationTensor | undefined, right: ValidationTensor 
 
 /** Prove that every QEmbedding ID is checked before any output write.
  *
- * Public I32 inputs are host-preflighted. Internal IDs are accepted only when
- * a canonical I32 Clip proves an inclusive range inside the immutable table.
- * This deliberately does not infer ranges through arbitrary integer graphs.
+ * Public I32 inputs are host-preflighted, invariant IDs are inspected exactly,
+ * and internal IDs require one conservative integer-range proof through a
+ * closed set of canonical producers. Arbitrary integer graphs fail closed.
  */
 export function qEmbeddingIdsArePreflightComplete(
   graph: PortableQuantizedGraph,
@@ -40,27 +40,66 @@ export function qEmbeddingIdsArePreflightComplete(
     return false;
   }
   if (ids.isInput === true) return true;
+  if (ids.isWeight === true) {
+    return ids.buffer instanceof Int32Array &&
+      ids.buffer.every((value) => value >= 0 && value < vocabulary);
+  }
 
-  const consumerIndex = graph.nodes.indexOf(node);
-  const producers = graph.nodes.filter((candidate, index) =>
-    index < consumerIndex && Object.values(candidate.outputs || {}).some((output) =>
-      sameTensor(output, ids)));
-  if (producers.length !== 1) return false;
-  const producer = producers[0];
-  const source = producer.inputs?.input;
-  const outputs = Object.values(producer.outputs || {}).filter(Boolean);
-  const params = producer.params || {};
-  const minimum = params.min;
-  const maximum = params.max;
-  return producer.opType === 'Clip' && Object.keys(producer.inputs || {}).length === 1 &&
-    Object.prototype.hasOwnProperty.call(producer.inputs || {}, 'input') &&
-    outputs.length === 1 && sameTensor(outputs[0], ids) &&
-    source?.dtype === 'int32' && sameShapeForProof(source.shape, ids.shape) &&
-    Object.keys(params).length === 2 &&
-    Object.prototype.hasOwnProperty.call(params, 'min') &&
-    Object.prototype.hasOwnProperty.call(params, 'max') &&
-    Number.isInteger(minimum) && Number.isInteger(maximum) &&
-    minimum >= 0 && maximum >= minimum && maximum < vocabulary;
+  const preserving = new Set([
+    'Identity', 'Reshape', 'Flatten', 'Squeeze', 'Unsqueeze', 'Transpose',
+    'Slice', 'Expand', 'Broadcast', 'Dropout',
+  ]);
+  const range = (
+    tensor: ValidationTensor,
+    beforeIndex: number,
+    visiting = new Set<ValidationTensor>(),
+  ): readonly [number, number] | null => {
+    if (visiting.has(tensor)) return null;
+    visiting.add(tensor);
+    try {
+      const producers = graph.nodes
+        .map((candidate, index) => [candidate, index] as const)
+        .filter(([candidate, index]) => index < beforeIndex &&
+          Object.values(candidate.outputs || {}).some((output) => sameTensor(output, tensor)));
+      if (producers.length !== 1) return null;
+      const [producer, producerIndex] = producers[0];
+      const source = producer.inputs?.input;
+      if (producer.opType === 'Clip' && tensor.dtype === 'int32') {
+        const minimum = producer.params?.min ?? -2147483648;
+        const maximum = producer.params?.max ?? 2147483647;
+        return Number.isInteger(minimum) && Number.isInteger(maximum) && minimum <= maximum
+          ? [minimum, maximum]
+          : null;
+      }
+      if ((producer.opType === 'ArgMax' || producer.opType === 'QArgMax') &&
+          tensor.dtype === 'int32' && source?.shape) {
+        let axis = producer.params?.axis ?? (producer.opType === 'QArgMax' ? -1 : 0);
+        if (!Number.isInteger(axis)) return null;
+        if (axis < 0) axis += source.shape.length;
+        const extent = source.shape[axis];
+        return Number.isSafeInteger(extent) && extent > 0 ? [0, extent - 1] : null;
+      }
+      if (tensor.dtype === 'int32' &&
+          (producer.opType === 'Equal' || producer.opType === 'GreaterOrEqual' ||
+           producer.opType === 'Not')) {
+        return [0, 1];
+      }
+      if (producer.opType === 'Cast' && tensor.dtype === 'int32' && source) {
+        if (source.dtype === 'uint8') return [0, 255];
+        if (source.dtype === 'int8') return [-128, 127];
+        if (source.dtype === 'int32') return range(source, producerIndex, visiting);
+        return null;
+      }
+      if (tensor.dtype === 'int32' && preserving.has(producer.opType) && source) {
+        return range(source, producerIndex, visiting);
+      }
+      return null;
+    } finally {
+      visiting.delete(tensor);
+    }
+  };
+  const domain = range(ids, graph.nodes.indexOf(node));
+  return domain !== null && domain[0] >= 0 && domain[1] < vocabulary;
 }
 
 function sameShapeForProof(left: unknown, right: unknown): boolean {

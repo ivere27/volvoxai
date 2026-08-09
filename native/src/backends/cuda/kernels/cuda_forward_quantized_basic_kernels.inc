@@ -13,7 +13,22 @@ extern "C" VX_CUDA_GLOBAL void vx_cuda_qlinear_i8u8(
     vx_i32 accumulator = bias[output_channel];
     vx_u32 input_base = row * d_in;
     vx_u32 weight_base = output_channel * d_in;
-    for (vx_u32 channel = 0; channel < d_in; channel++) {
+    vx_i32 input_center = input_zero_point -
+        (input_dtype == VX_DTYPE_U8 ? 128 : 0);
+    vx_i32 weight_center = weight_zero_points[output_channel] -
+        (weight_dtype == VX_DTYPE_U8 ? 128 : 0);
+    vx_u32 packed_end = d_in & ~3u;
+    vx_u32 aligned = (d_in & 3u) == 0u &&
+        (((vx_u64)input | (vx_u64)weight) & 3u) == 0u ? 1u : 0u;
+    for (vx_u32 channel = 0; channel < packed_end; channel += 4u) {
+        vx_u32 input_packed = vx_cuda_pack4_s8(
+            input, input_base + channel, 1u, input_dtype, aligned);
+        vx_u32 weight_packed = vx_cuda_pack4_s8(
+            weight, weight_base + channel, 1u, weight_dtype, aligned);
+        accumulator += vx_cuda_centered_dot4_s8(
+            input_packed, weight_packed, input_center, weight_center);
+    }
+    for (vx_u32 channel = packed_end; channel < d_in; channel++) {
         vx_i32 av = vx_typed_byte(input, input_base + channel, input_dtype);
         vx_i32 wv = vx_typed_byte(weight, weight_base + channel, weight_dtype);
         accumulator += (av - input_zero_point) *
@@ -25,6 +40,67 @@ extern "C" VX_CUDA_GLOBAL void vx_cuda_qlinear_i8u8(
     float transformed = vx_add_rn(scaled, (float)output_zero_point);
     output[index] = vx_quantize_transformed(transformed, output_zero_point,
                                             output_dtype);
+}
+
+/* Large row-major physical QLinear/QGemm/QMatMul uses one warp per output.
+ * Lanes walk disjoint groups of four contiguous K values, making weight loads
+ * coalesced and exposing the reduction's DP4A parallelism. The host retains
+ * the thread-local kernel above as an exact small-K and launch-capacity tier. */
+extern "C" VX_CUDA_GLOBAL void vx_cuda_qlinear_warp_dp4a_i8u8(
+        const vx_u8* input, const vx_u8* weight,
+        const float* weight_scales, const vx_i32* weight_zero_points,
+        const vx_i32* bias, vx_u8* output, vx_u32 elements,
+        vx_u32 d_in, vx_u32 d_out, float input_scale,
+        vx_i32 input_zero_point, float output_scale,
+        vx_i32 output_zero_point, vx_u32 input_dtype,
+        vx_u32 weight_dtype, vx_u32 output_dtype) {
+    vx_u32 thread = vx_global_x();
+    vx_u32 index = thread >> 5u;
+    vx_u32 lane = thread & 31u;
+    if (index >= elements) return;
+    vx_u32 row = index / d_out;
+    vx_u32 output_channel = index - row * d_out;
+    vx_u32 input_base = row * d_in;
+    vx_u32 weight_base = output_channel * d_in;
+    vx_i32 input_center = input_zero_point -
+        (input_dtype == VX_DTYPE_U8 ? 128 : 0);
+    vx_i32 weight_center = weight_zero_points[output_channel] -
+        (weight_dtype == VX_DTYPE_U8 ? 128 : 0);
+    vx_u32 packed_end = d_in & ~3u;
+    vx_u32 aligned = (d_in & 3u) == 0u &&
+        (((vx_u64)input | (vx_u64)weight) & 3u) == 0u ? 1u : 0u;
+    vx_i32 accumulator = 0;
+    for (vx_u32 channel = lane * 4u; channel < packed_end;
+         channel += 128u) {
+        vx_u32 input_packed = vx_cuda_pack4_s8(
+            input, input_base + channel, 1u, input_dtype, aligned);
+        vx_u32 weight_packed = vx_cuda_pack4_s8(
+            weight, weight_base + channel, 1u, weight_dtype, aligned);
+        accumulator += vx_cuda_centered_dot4_s8(
+            input_packed, weight_packed, input_center, weight_center);
+    }
+    if (lane == 0u) {
+        accumulator += bias[output_channel];
+        for (vx_u32 channel = packed_end; channel < d_in; channel++) {
+            vx_i32 av = vx_typed_byte(
+                input, input_base + channel, input_dtype);
+            vx_i32 wv = vx_typed_byte(
+                weight, weight_base + channel, weight_dtype);
+            accumulator += (av - input_zero_point) *
+                (wv - weight_zero_points[output_channel]);
+        }
+    }
+    accumulator = vx_cuda_warp_sum_i32(accumulator);
+    if (lane == 0u) {
+        float product_scale = vx_mul_rn(
+            input_scale, weight_scales[output_channel]);
+        float multiplier = product_scale / output_scale;
+        float scaled = vx_mul_rn((float)accumulator, multiplier);
+        float transformed = vx_add_rn(
+            scaled, (float)output_zero_point);
+        output[index] = vx_quantize_transformed(
+            transformed, output_zero_point, output_dtype);
+    }
 }
 
 extern "C" VX_CUDA_GLOBAL void vx_cuda_qembedding_i8u8(

@@ -77,6 +77,61 @@ void volvoxai_engine_metadata_lock(void) { pthread_mutex_lock(&g_engine_metadata
 void volvoxai_engine_metadata_unlock(void) { pthread_mutex_unlock(&g_engine_metadata_mutex); }
 static void volvoxai_engine_shutdown_impl(void);
 
+static void volvoxai_engine_free_cpu_typed_workspace_locked(void) {
+    VxEngineState* state = vx_engine_state_current();
+    if (!state) return;
+    free(state->cpu_typed_workspace);
+    state->cpu_typed_workspace = NULL;
+    state->cpu_typed_workspace_bound_bytes = 0u;
+    state->cpu_typed_workspace_capacity_bytes = 0u;
+    state->cpu_typed_workspace_configured = 0;
+}
+
+int volvoxai_engine_configure_cpu_typed_workspace(size_t bounded_bytes) {
+    VxEngineState* state = vx_engine_state_current();
+    void* candidate = NULL;
+    int took_model_lock;
+    int result = -1;
+    if (!state) return -1;
+    took_model_lock = !g_engine_route_lease;
+    if (took_model_lock) volvoxai_engine_model_lock();
+    if (bounded_bytes && !g_loaded) goto done;
+    /* The compiled proof fixes this bound for the context lifetime. Refusing
+     * replacement also guarantees there is never an uncharged old+candidate
+     * workspace allocation phase. Shutdown uses the private release helper. */
+    if (state->cpu_typed_workspace_configured) {
+        if (bounded_bytes == state->cpu_typed_workspace_bound_bytes &&
+            bounded_bytes == state->cpu_typed_workspace_capacity_bytes &&
+            (!bounded_bytes || state->cpu_typed_workspace))
+            result = 0;
+        goto done;
+    }
+    if (bounded_bytes) {
+        candidate = malloc(bounded_bytes);
+        if (!candidate) goto done;
+    }
+    free(state->cpu_typed_workspace);
+    state->cpu_typed_workspace = candidate;
+    state->cpu_typed_workspace_bound_bytes = bounded_bytes;
+    state->cpu_typed_workspace_capacity_bytes = bounded_bytes;
+    state->cpu_typed_workspace_configured = 1;
+    candidate = NULL;
+    result = 0;
+done:
+    free(candidate);
+    if (took_model_lock) volvoxai_engine_model_unlock();
+    return result;
+}
+
+void* volvoxai_engine_cpu_typed_workspace(size_t* capacity_bytes) {
+    VxEngineState* state = vx_engine_state_current();
+    if (capacity_bytes)
+        *capacity_bytes = state ? state->cpu_typed_workspace_capacity_bytes : 0u;
+    return state ? state->cpu_typed_workspace : NULL;
+}
+
+#include "engine_bank_residency.inc"
+
 static int volvoxai_engine_merged_contains_tensor(const char* name) {
     if (!name) return 0;
     pthread_mutex_lock(&g_adapter_admin_mutex);
@@ -353,8 +408,12 @@ static int volvoxai_engine_init_with_weight_files_impl(const char* graph_path,
     vx_incremental_invalidate_locked();
     vx_runtime_backend_reset();
     if (volvoxai_engine_load_weight_files(weight_file_paths, weight_file_count) != 0) goto fail;
+    /* Slice requested banks before the graph is built so every downstream shape
+     * check sees the staged extent rather than the bank's full one. */
+    if (vx_bank_residency_apply() != 0) goto fail;
     if (build_graph(graph_path) != 0) goto fail;
-    if (prepack_conv_weights() != 0) goto fail;
+    vx_bank_residency_bind_nodes();
+    if (prepack_cpu_weights() != 0) goto fail;
     g_weight_caches_dirty = 0;
     g_loaded = 1;
     volvoxai_engine_model_generation_advance_locked();
@@ -517,11 +576,83 @@ int volvoxai_engine_tensor_is_model_weight_locked(const char* name) {
     return 1;
 }
 
+/* A generic F32 operator may widen a safetensors F16 constant in place. The
+ * execution tensor then intentionally no longer aliases the stored source,
+ * so the strict mutable-weight predicate above becomes false even though the
+ * widened copy is still immutable for this context. Keep that narrower
+ * provenance rule separate from public mutable-weight identity. */
+static int volvoxai_engine_tensor_has_immutable_weight_origin_locked(
+        const T* tensor) {
+    int file_index;
+    const SafetensorsTensor* stored;
+    if (!tensor || !tensor->name[0] || tensor->is_graph_input ||
+        !tensor->data || tensor->numel <= 0)
+        return 0;
+    if (volvoxai_engine_tensor_is_model_weight_locked(tensor->name))
+        return 1;
+    file_index = volvoxai_engine_tensor_weight_file_index_raw(tensor->name);
+    if (file_index < 0 || tensor->dtype != T_F32 ||
+        tensor->elem_size != sizeof(float) || !tensor->owns)
+        return 0;
+    stored = safetensors_find_tensor(&g_weight_files[file_index],
+                                     tensor->name);
+    if (!stored || stored->dtype != SAFETENSORS_DTYPE_F16 ||
+        stored->ndim != tensor->ndim)
+        return 0;
+    for (int axis = 0; axis < tensor->ndim; axis++)
+        if (stored->shape[axis] != tensor->shape[axis]) return 0;
+    return 1;
+}
+
 int volvoxai_engine_sync_model_weights_locked(void) {
     for (int index = 0; index < g_nt; index++) {
         T* tensor = &g_t[index];
         if (volvoxai_engine_tensor_is_model_weight_locked(tensor->name) &&
             vk_sync_host_tensor(tensor) != 0) return -1;
+    }
+    return 0;
+}
+
+int volvoxai_engine_demote_preloaded_logical_tensors_locked(void) {
+    VxEngineState* state = vx_engine_state_current();
+    const VxDynamicShapeMaximumLayout* maximum;
+    if (!state) return -1;
+    maximum = &state->dynamic_shape_maximum_layout;
+    if (!maximum->configured || maximum->tensor_count <= 0 ||
+        !maximum->tensor_indices)
+        return -1;
+    for (int logical_index = 0; logical_index < maximum->tensor_count;
+         logical_index++) {
+        int tensor_index = maximum->tensor_indices[logical_index];
+        T* tensor;
+        size_t bytes;
+        if (tensor_index < 0 || tensor_index >= g_nt) return -1;
+        tensor = &g_t[tensor_index];
+        if (!tensor->data || tensor->numel <= 0 || !tensor->elem_size ||
+            (size_t)tensor->numel > SIZE_MAX / tensor->elem_size)
+            return -1;
+        bytes = (size_t)tensor->numel * tensor->elem_size;
+        /* Exact bootstrap identity only. Parsed affine arrays, conversion
+         * caches, LUTs, and backend synthetic constants are not logical T
+         * buffers and therefore retain their invariant lifetime. */
+        vx_runtime_backend_demote_weight(tensor->data, bytes);
+    }
+    return 0;
+}
+
+int volvoxai_engine_retain_preloaded_model_weights_locked(void) {
+    for (int index = 0; index < g_nt; index++) {
+        T* tensor = &g_t[index];
+        size_t bytes;
+        if (!volvoxai_engine_tensor_has_immutable_weight_origin_locked(tensor) ||
+            !tensor->data || tensor->numel <= 0 || !tensor->elem_size ||
+            (size_t)tensor->numel > SIZE_MAX / tensor->elem_size)
+            continue;
+        bytes = (size_t)tensor->numel * tensor->elem_size;
+        /* Classification-only: the backend promotes a slot only when the
+         * bootstrap forward actually materialized it. Unused weights are not
+         * allocated or uploaded as a side effect of the domain proof. */
+        vx_runtime_backend_retain_weight(tensor->data, bytes);
     }
     return 0;
 }
@@ -1022,8 +1153,8 @@ static int volvoxai_engine_linear_weight_layout_impl(const char* weight_name, in
         cJSON* layout_json = node->params ? cJSON_GetObjectItem(node->params, "weight_layout") : NULL;
         if (cJSON_IsString(layout_json) && layout_json->valuestring) {
             const char* value = layout_json->valuestring;
-            if (!strcmp(value, "OUT_IN") || !strcmp(value, "out_in") || !strcmp(value, "OI") || !strcmp(value, "peft")) layout = 1;
-            else if (!strcmp(value, "IN_OUT") || !strcmp(value, "in_out") || !strcmp(value, "IO") || !strcmp(value, "din_dout")) layout = 0;
+            if (!strcmp(value, "dout_din")) layout = 1;
+            else if (!strcmp(value, "din_dout")) layout = 0;
             else return -1;
         }
         cJSON* trans_b = node->params ? cJSON_GetObjectItem(node->params, "transB") : NULL;
@@ -1690,6 +1821,7 @@ done:
 }
 
 static void volvoxai_engine_shutdown_impl(void) {
+    vx_bank_residency_clear();
     volvoxai_engine_model_generation_advance_locked();
     vx_decode_session_invalidate_model_locked();
     volvoxai_engine_reset_training_accumulation();
@@ -1715,6 +1847,7 @@ static void volvoxai_engine_shutdown_impl(void) {
     vx_conv_f32_opt_free_all();
     vx_gemm_f32_cache_free_all(&vx_engine_state_current()->gemm_f32_cache);
     volvoxai_engine_free_arena();
+    volvoxai_engine_free_cpu_typed_workspace_locked();
     volvoxai_engine_clear_qlinear_metadata();
     volvoxai_engine_clear_qconv_metadata();
     volvoxai_engine_clear_qembedding_metadata();

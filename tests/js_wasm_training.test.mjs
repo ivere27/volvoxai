@@ -7,13 +7,79 @@ import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
 
-import { Graph } from '../ts/index.js';
+import { TrainingGraph as Graph } from '../ts/training/TrainingGraph.js';
+import { ModelBuilder } from '../ts/core/ModelBuilder.js';
+import { Model } from '../ts/core/Model.js';
+import { WasmEngine } from '../ts/backends/WasmEngine.js';
+import { Trainer as WasmTrainer } from '../ts/training/WasmTrainer.js';
 import { createWasmStepRunner } from './helpers/training_session.mjs';
 import { CPUAutograd } from '../ts/training/CPUAutograd.js';
+import { WasmTrainingKernels } from '../ts/training/WasmTrainingKernels.js';
 
 const run = promisify(execFile);
 const repositoryRoot = fileURLToPath(new URL('../', import.meta.url));
 const clang = process.env.CLANG || 'clang';
+
+function identityTrainingGraph(shape, opType = 'Identity') {
+  const graph = new Graph();
+  const input = graph.addInput('x', shape);
+  const { out } = graph.addOp(opType, { input }, { out: { name: 'y', shape } });
+  graph.setOutputs([out.name]);
+  return graph;
+}
+
+test('WASM detached plans reject false keys, hit across new graphs, and invalidate topology', async () => {
+  const api = new Proxy({
+    memory: new WebAssembly.Memory({ initial: 1 }),
+    alloc_bytes() { return 16; },
+    reset_heap() {},
+  }, {
+    get(target, property) {
+      if (property in target) return target[property];
+      return () => 1;
+    },
+  });
+  const source = { api, wasmModule: {} };
+  const kernels = new WasmTrainingKernels(source, api, {
+    planCacheEntries: 2,
+    planCacheMetadataBytes: 64 * 1024,
+  });
+  const b4 = identityTrainingGraph([4, 2]);
+  await kernels.preflight(b4, { shapeSignature: 'B=4', tacticSignature: 'identity' });
+  const committed = kernels.inspectPlanCache();
+
+  await assert.rejects(
+    kernels.preflight(identityTrainingGraph([1, 2]), {
+      shapeSignature: 'B=4',
+      tacticSignature: 'identity',
+    }),
+    /concrete tensor descriptors do not match/i,
+  );
+  assert.deepEqual(kernels.inspectPlanCache(), committed,
+    'failed detached-plan attachment must preserve cache telemetry and LRU state');
+
+  await kernels.preflight(identityTrainingGraph([1, 2]), {
+    shapeSignature: 'B=1',
+    tacticSignature: 'identity',
+  });
+  const buildsBeforeReturn = kernels.inspectPlanCache().recipeBuilds;
+  await kernels.preflight(identityTrainingGraph([4, 2]), {
+    shapeSignature: 'B=4',
+    tacticSignature: 'identity',
+  });
+  let inspection = kernels.inspectPlanCache();
+  assert.equal(inspection.hits, 1);
+  assert.equal(inspection.recipeBuilds, buildsBeforeReturn);
+
+  await kernels.preflight(identityTrainingGraph([4, 2], 'Reshape'), {
+    shapeSignature: 'B=4',
+    tacticSignature: 'reshape',
+  });
+  inspection = kernels.inspectPlanCache();
+  assert.equal(inspection.entries, 1);
+  assert.equal(inspection.evictions, 2);
+  kernels.dispose();
+});
 
 function linearGraph() {
   const graph = new Graph();
@@ -108,10 +174,12 @@ function conv2dGraph() {
 
 function conv1dGraph() {
   const graph = new Graph();
-  const input = graph.addWeight('input', [1, 2, 4], 'float32', { buffer: Float32Array.from([.2,-.1,.4,.3, .5,.1,-.2,.6]) });
-  const weight = graph.addWeight('weight', [2, 2, 3], 'float32', { buffer: Float32Array.from([.1,.2,-.1, .3,-.2,.4, -.2,.1,.3, .4,.2,-.3]) });
+  // NLC [batch, l, c] activations and WIO [k, in_per_group, out_c] weights --
+  // the same tensors the NCL [1,2,4] / OIW [2,2,3] form held.
+  const input = graph.addWeight('input', [1, 4, 2], 'float32', { buffer: Float32Array.from([.2,.5, -.1,.1, .4,-.2, .3,.6]) });
+  const weight = graph.addWeight('weight', [3, 2, 2], 'float32', { buffer: Float32Array.from([.1,-.2, .3,.4, .2,.1, -.2,.2, -.1,.3, .4,-.3]) });
   const bias = graph.addWeight('bias', [2], 'float32', { buffer: Float32Array.from([.05,-.1]) });
-  const { out } = graph.addOp('Conv1D', { input, weight, bias }, { out: [1, 2, 4] }, { stride: 1, padding: 1 });
+  const { out } = graph.addOp('Conv1D', { input, weight, bias }, { out: [1, 4, 2] }, { stride: 1, padding: 1 });
   graph.setOutputs([out.name]);
   return graph;
 }
@@ -119,7 +187,8 @@ function conv1dGraph() {
 function convTranspose2dGraph() {
   const graph = new Graph();
   const input = graph.addWeight('input', [1, 2, 2, 1], 'float32', { buffer: Float32Array.from([.2,-.1,.4,.3]) });
-  const weight = graph.addWeight('weight', [1, 2, 2, 2], 'float32', { buffer: Float32Array.from([.1,.2,-.1,.3, .2,-.2,.4,.1]) });
+  // HWIO [kh, kw, in_c, out_c] -- the same filter the IOHW [1,2,2,2] form held.
+  const weight = graph.addWeight('weight', [2, 2, 1, 2], 'float32', { buffer: Float32Array.from([.1,.2, .2,-.2, -.1,.4, .3,.1]) });
   const bias = graph.addWeight('bias', [2], 'float32', { buffer: Float32Array.from([.05,-.03]) });
   const { out } = graph.addOp('ConvTranspose2D', { input, weight, bias }, { out: [1, 3, 3, 2] }, { kernel: [2, 2], stride: [1, 1], padding: [0, 0] });
   graph.setOutputs([out.name]);
@@ -141,7 +210,9 @@ function depthwiseConv2dGraph() {
   const input = graph.addInput('input', [1, 3, 3, 2]);
   const weight = graph.addWeight('weight', [2, 2, 2, 1], 'float32', { buffer: Float32Array.from([0.2, 0.1, -0.1, 0.3, 0.4, -0.2, 0.1, 0.2]) });
   const bias = graph.addWeight('bias', [2], 'float32', { buffer: Float32Array.from([0.1, -0.1]) });
-  const { out } = graph.addOp('Conv2D', { input, weight, bias }, { out: [1, 2, 2, 2] }, { groups: 2 });
+  const { out } = graph.addOp('Conv2D', { input, weight, bias }, { out: [1, 2, 2, 2] }, {
+    groups: 2, weight_layout: 'HWCM',
+  });
   graph.setOutputs([out.name]);
   return graph;
 }
@@ -158,21 +229,60 @@ function batchNorm2dGraph() {
   return graph;
 }
 
-function pool2dGraph(opType) {
+function pool2dGraph(opType, outputShape = [1, 2, 2, 2]) {
   const graph = new Graph();
   const input = graph.addWeight('input', [1, 3, 3, 2], 'float32', {
     buffer: Float32Array.from([.1,.7,.3,.2,.5,.4,.9,.6,.8,.2,.1,.5,.4,.3,.7,.6,.2,.8]),
   });
-  const { out } = graph.addOp(opType, { input }, { out: [1, 2, 2, 2] }, { kernel: [2, 2], stride: [1, 1], padding: [0, 0] });
+  const pads = opType === 'MaxPool2D' ? [1, 0, 0, 1] : [1, 1, 1, 1];
+  const { out } = graph.addOp(opType, { input }, { out: outputShape }, {
+    kernel: [2, 2], stride: [2, 2], pads,
+  });
   graph.setOutputs([out.name]);
   return graph;
 }
+
+test('WASM training pooling plans bind canonical pads and reject incompatible output shapes', async () => {
+  const api = new Proxy({
+    memory: new WebAssembly.Memory({ initial: 1 }),
+    alloc_bytes() { return 16; },
+    reset_heap() {},
+  }, {
+    get(target, property) {
+      if (property in target) return target[property];
+      return () => 1;
+    },
+  });
+  const kernels = new WasmTrainingKernels({ api, wasmModule: {} }, api);
+
+  await kernels.preflight(pool2dGraph('MaxPool2D'));
+  assert.deepEqual({
+    padY: kernels.plan[0].padY,
+    padX: kernels.plan[0].padX,
+    outHeight: kernels.plan[0].outHeight,
+    outWidth: kernels.plan[0].outWidth,
+  }, { padY: 1, padX: 0, outHeight: 2, outWidth: 2 });
+
+  await kernels.preflight(pool2dGraph('AveragePool2D'));
+  assert.deepEqual({
+    padY: kernels.plan[0].padY,
+    padX: kernels.plan[0].padX,
+    outHeight: kernels.plan[0].outHeight,
+    outWidth: kernels.plan[0].outWidth,
+  }, { padY: 1, padX: 1, outHeight: 2, outWidth: 2 });
+
+  await assert.rejects(
+    kernels.preflight(pool2dGraph('MaxPool2D', [1, 1, 2, 2])),
+    /output shape is incompatible with its canonical pooling parameters/i,
+  );
+  kernels.dispose();
+});
 
 function resize2dGraph(opType) {
   const graph = new Graph();
   const input = graph.addWeight('input', [1, 2, 2, 2], 'float32', { buffer: Float32Array.from([.1,.7,.3,.2,.5,.4,.9,.6]) });
   const outShape = ['UpsampleNearest2D', 'Upsample2x'].includes(opType) ? [1, 4, 4, 2] : [1, 3, 3, 2];
-  const { out } = graph.addOp(opType, { input }, { out: outShape }, opType === 'Resize' ? { mode: 'bilinear' } : {});
+  const { out } = graph.addOp(opType, { input }, { out: outShape }, opType === 'Resize' ? { mode: 'linear' } : {});
   graph.setOutputs([out.name]);
   return graph;
 }
@@ -621,4 +731,138 @@ test('WASM training matches CPU for HardSigmoid and HardSwish', { timeout: 120_0
       closeArray(wasm.gradients.get('input'), cpu.gradients.get('input'), `${opType} input gradient`);
     }
   } finally { await rm(directory, { recursive: true, force: true }); }
+});
+
+test('dynamic WASM training reuses one kernel instance and bounded plan metadata across shapes', {
+  timeout: 120_000,
+}, async (t) => {
+  try { await run(clang, ['--version']); } catch (error) { if (error?.code === 'ENOENT') return t.skip(`${clang} is unavailable`); throw error; }
+  const directory = await mkdtemp(join(tmpdir(), 'volvoxai-wasm-dynamic-training-'));
+  const originalInstantiate = WebAssembly.instantiate;
+  const originalDispose = WasmEngine.prototype.dispose;
+  const originalPlanNode = WasmTrainingKernels.prototype._planNode;
+  let instantiateCalls = 0;
+  let disposeCalls = 0;
+  let planNodeCalls = 0;
+  WebAssembly.instantiate = async (...args) => {
+    instantiateCalls++;
+    return originalInstantiate(...args);
+  };
+  WasmEngine.prototype.dispose = function disposeWasmTrainingEngine() {
+    disposeCalls++;
+    return originalDispose.call(this);
+  };
+  WasmTrainingKernels.prototype._planNode = function countedWasmTrainingPlanNode(...args) {
+    planNodeCalls++;
+    return originalPlanNode.apply(this, args);
+  };
+  let trainer;
+  let oracleTrainer;
+  try {
+    const wasmPath = join(directory, 'volvoxai.full.wasm');
+    await buildFullWasm(wasmPath);
+    const builder = new ModelBuilder({
+      dimensions: { B: { min: 1, max: 4 } },
+      inputs: { x: { dtype: 'float32', shape: ['B', 2] } },
+      weights: [{ name: 'weight', dtype: 'float32', shape: [2, 2] }],
+      nodes: [{
+        id: 'linear', opType: 'Linear',
+        inputs: { input: 'x', weight: 'weight' },
+        outputs: { out: { tensor: 'logits', dtype: 'float32', shape: ['B', 2] } },
+        params: { weight_layout: 'din_dout' },
+      }],
+      outputs: ['logits'],
+    });
+    const snapshot = Model.capture({
+      graph: builder.snapshot(),
+      weights: {
+        weight: {
+          name: 'weight', dtype: 'float32', shape: [2, 2],
+          data: Float32Array.of(0.2, -0.1, 0.3, 0.4),
+        },
+      },
+    });
+    trainer = await WasmTrainer.create(snapshot, { wasmUrl: wasmPath });
+    const stepOptions = (batch) => ({
+      inputs: {
+        x: {
+          data: Float32Array.from({ length: batch * 2 }, (_, index) => (index - batch) / 5),
+          shape: [batch, 2],
+        },
+      },
+      targets: Array.from({ length: batch }, (_, index) => index & 1),
+      trainableTensors: ['weight'],
+      updateMode: 'sgd',
+      optimizer: { learningRate: 0 },
+    });
+    const step = async (batch) => trainer.trainStep(stepOptions(batch));
+
+    const firstLargestResult = await step(4);
+    const afterLargest = trainer.inspectShapeState();
+    const instancesAfterFirstStep = instantiateCalls;
+    await step(1);
+    const afterSmall = trainer.inspectShapeState();
+    const planBuildsAfterSmall = planNodeCalls;
+    const returnedLargestResult = await step(4);
+    const afterReturn = trainer.inspectShapeState();
+
+    assert.equal(instantiateCalls, instancesAfterFirstStep,
+      'shape switches must not instantiate or recompile another WASM training module');
+    assert.equal(afterReturn.planCacheEntries, 2);
+    assert.equal(afterReturn.planCacheHits, 1);
+    assert.equal(afterReturn.planCacheMisses, 2);
+    assert.equal(planNodeCalls, planBuildsAfterSmall,
+      'returning to B=4 must rebind a detached recipe without rebuilding WASM node plans');
+    assert.deepEqual({
+      entries: afterReturn.backendPlanCache.entries,
+      hits: afterReturn.backendPlanCache.hits,
+      misses: afterReturn.backendPlanCache.misses,
+      recipeBuilds: afterReturn.backendPlanCache.recipeBuilds,
+      forwardPlanBuilds: afterReturn.backendPlanCache.forwardPlanBuilds,
+      backwardPlanBuilds: afterReturn.backendPlanCache.backwardPlanBuilds,
+    }, {
+      entries: 2,
+      hits: 1,
+      misses: 2,
+      recipeBuilds: 2,
+      forwardPlanBuilds: 2,
+      backwardPlanBuilds: 2,
+    });
+    assert.ok(afterReturn.backendPlanCache.metadataBytes <=
+      afterReturn.backendPlanCache.metadataLimitBytes);
+    assert.equal(afterSmall.activationCapacityBytes, afterLargest.activationCapacityBytes);
+    assert.equal(afterReturn.activationCapacityBytes, afterLargest.activationCapacityBytes);
+    assert.equal(afterReturn.activationGrowCount, afterLargest.activationGrowCount,
+      'the largest-first sequence must retain one growable activation pool');
+
+    oracleTrainer = await WasmTrainer.create(snapshot, {
+      wasmUrl: wasmPath,
+      planCacheEntries: 1,
+    });
+    const uncachedLargestResult = await oracleTrainer.trainStep(stepOptions(4));
+    assert.equal(returnedLargestResult.loss, firstLargestResult.loss);
+    assert.equal(returnedLargestResult.loss, uncachedLargestResult.loss);
+    assert.equal(returnedLargestResult.correct, uncachedLargestResult.correct);
+    assert.equal(returnedLargestResult.examples, uncachedLargestResult.examples);
+    assert.deepEqual(
+      [...returnedLargestResult.gradients.get('weight')],
+      [...uncachedLargestResult.gradients.get('weight')],
+      'cached B=4 reattachment must reproduce a fresh B=4 gradient exactly',
+    );
+    const cachedSuccessor = await trainer.commit();
+    const uncachedSuccessor = await oracleTrainer.commit();
+    assert.deepEqual(
+      [...cachedSuccessor.copyWeightData('weight')],
+      [...uncachedSuccessor.copyWeightData('weight')],
+      'cached B=4 reattachment must preserve the exact fixed parameter state',
+    );
+  } finally {
+    await trainer?.close();
+    await oracleTrainer?.close();
+    WebAssembly.instantiate = originalInstantiate;
+    WasmEngine.prototype.dispose = originalDispose;
+    WasmTrainingKernels.prototype._planNode = originalPlanNode;
+    await rm(directory, { recursive: true, force: true });
+  }
+  assert.equal(disposeCalls, 2, 'each Trainer.close must dispose its owned WASM engine exactly once');
 });

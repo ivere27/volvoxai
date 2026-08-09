@@ -29,6 +29,7 @@ typedef unsigned char vx_u8;
 typedef signed char vx_i8;
 typedef unsigned int vx_u32;
 typedef int vx_i32;
+typedef unsigned long long vx_u64;
 
 struct VX_CUDA_ALIGN(16) VxCudaFloat4 {
     float x;
@@ -136,6 +137,71 @@ static VX_CUDA_DEVICE vx_i32 vx_typed_byte(const vx_u8* values, vx_u32 index,
                                             vx_u32 dtype) {
     vx_u8 byte = values[index];
     return dtype == VX_DTYPE_I8 ? (vx_i32)(vx_i8)byte : (vx_i32)byte;
+}
+
+/* Canonical physical W8A8 dot primitive shared by QLinear/QGemm/QMatMul,
+ * QConv2D, and QBatchMatMul. U8 bytes are XOR-shifted into the signed domain;
+ * shifting their zero point by the same 128 keeps every I8/U8 combination
+ * exact. Centered values can span [-255,255], so they must not be narrowed to
+ * packed bytes. Instead, two optional lane-sum DP4As apply asymmetric-zero-
+ * point correction around the raw signed-byte dot product.
+ *
+ * The aligned load tier is used only when the host allocation and every row
+ * stride are four-byte aligned. The byte-gather tier is alignment agnostic
+ * and is also required for strided BatchMatMul operands. Both consume exactly
+ * four reduction values; callers retain an explicit scalar K tail. */
+static VX_CUDA_DEVICE VX_CUDA_FORCEINLINE vx_u32 vx_cuda_pack4_s8(
+        const vx_u8* values, vx_u32 base, vx_u32 stride, vx_u32 dtype,
+        vx_u32 aligned_contiguous) {
+    vx_u32 packed;
+    if (aligned_contiguous != 0u) {
+        packed = *(const vx_u32*)(values + base);
+    } else {
+        packed =
+            (vx_u32)values[base] |
+            ((vx_u32)values[base + stride] << 8u) |
+            ((vx_u32)values[base + 2u * stride] << 16u) |
+            ((vx_u32)values[base + 3u * stride] << 24u);
+    }
+    return dtype == VX_DTYPE_U8 ? packed ^ 0x80808080u : packed;
+}
+
+static VX_CUDA_DEVICE VX_CUDA_FORCEINLINE vx_i32 vx_cuda_dp4a_s8(
+        vx_u32 a, vx_u32 b, vx_i32 accumulator) {
+    vx_i32 result;
+    asm("dp4a.s32.s32 %0, %1, %2, %3;"
+        : "=r"(result) : "r"(a), "r"(b), "r"(accumulator));
+    return result;
+}
+
+static VX_CUDA_DEVICE VX_CUDA_FORCEINLINE vx_i32 vx_cuda_centered_dot4_s8(
+        vx_u32 a, vx_u32 b, vx_i32 a_center, vx_i32 b_center) {
+    vx_i32 dot = vx_cuda_dp4a_s8(a, b, 0);
+    if (b_center != 0)
+        dot -= b_center * vx_cuda_dp4a_s8(a, 0x01010101u, 0);
+    if (a_center != 0)
+        dot -= a_center * vx_cuda_dp4a_s8(b, 0x01010101u, 0);
+    return dot + 4 * a_center * b_center;
+}
+
+static VX_CUDA_DEVICE VX_CUDA_FORCEINLINE vx_i32 vx_cuda_warp_sum_i32(
+        vx_i32 value) {
+    vx_i32 shuffled;
+    asm("shfl.sync.down.b32 %0, %1, 16, 0x1f, 0xffffffff;"
+        : "=r"(shuffled) : "r"(value));
+    value += shuffled;
+    asm("shfl.sync.down.b32 %0, %1, 8, 0x1f, 0xffffffff;"
+        : "=r"(shuffled) : "r"(value));
+    value += shuffled;
+    asm("shfl.sync.down.b32 %0, %1, 4, 0x1f, 0xffffffff;"
+        : "=r"(shuffled) : "r"(value));
+    value += shuffled;
+    asm("shfl.sync.down.b32 %0, %1, 2, 0x1f, 0xffffffff;"
+        : "=r"(shuffled) : "r"(value));
+    value += shuffled;
+    asm("shfl.sync.down.b32 %0, %1, 1, 0x1f, 0xffffffff;"
+        : "=r"(shuffled) : "r"(value));
+    return value + shuffled;
 }
 
 static VX_CUDA_DEVICE vx_u8 vx_quantize(float value, float scale,

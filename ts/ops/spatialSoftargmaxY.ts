@@ -1,13 +1,11 @@
-export function _cpuSpatialSoftargmaxY(node) {
+import { visionProfileKernelDescriptor } from './visionProfileKernel.js';
 
-    const input = node.inputs.input;
-    const output = node.outputs.out;
+export function _cpuSpatialSoftargmaxY(node) {
+    const { input, output, n, h, w, c } = visionProfileKernelDescriptor(
+      node, 'SpatialSoftargmaxY', 'softargmax-y',
+    );
     const inBuf = input.buffer;
     const outBuf = output.buffer;
-    const h = input.shape[1];
-    const w = input.shape[2];
-    const c = input.shape[3];
-    const n = input.shape[0];
     for (let batch = 0; batch < n; batch++) {
       const inBase = batch * h * w * c;
       const outBatchBase = batch * c * w;

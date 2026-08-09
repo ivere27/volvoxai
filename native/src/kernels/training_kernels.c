@@ -1257,23 +1257,59 @@ uint32_t volvoxai_training_moe_router_backward_f32(
     return 1;
 }
 
+/* Resolve a global bank slot id to its staged row.  Mirrors the inference
+ * resolver: a NULL table means the bank is fully resident. */
+static uint32_t vx_moe_training_resident_row(const uint32_t *slot_rows,
+        uint32_t slot_domain, uint32_t staged_rows, uint32_t slot,
+        uint32_t *row) {
+    uint32_t mapped;
+    if (!slot_rows) {
+        if (slot >= staged_rows) return 0;
+        *row = slot;
+        return 1;
+    }
+    if (slot >= slot_domain) return 0;
+    mapped = slot_rows[slot];
+    if (mapped >= staged_rows) return 0;
+    *row = mapped;
+    return 1;
+}
+
 VX_TRAINING_EXPORT("volvoxai_training_moe_linear_f32")
 uint32_t volvoxai_training_moe_linear_f32(
         const float *input, const float *expert_weight, const float *expert_bias,
         const float *route_indices, const float *route_weights, float *output,
         uint32_t rows, uint32_t d_in, uint32_t d_out,
         uint32_t experts, uint32_t top_k) {
+    return volvoxai_training_moe_linear_banked_f32(
+        input, expert_weight, expert_bias, route_indices, route_weights, output,
+        rows, d_in, d_out, experts, top_k, NULL, 0);
+}
+
+VX_TRAINING_EXPORT("volvoxai_training_moe_linear_banked_f32")
+uint32_t volvoxai_training_moe_linear_banked_f32(
+        const float *input, const float *expert_weight, const float *expert_bias,
+        const float *route_indices, const float *route_weights, float *output,
+        uint32_t rows, uint32_t d_in, uint32_t d_out,
+        uint32_t experts, uint32_t top_k,
+        const uint32_t *slot_rows, uint32_t slot_domain) {
+    const uint32_t route_domain = slot_rows ? slot_domain : experts;
     if (!input || !expert_weight || !route_indices || !route_weights || !output ||
         !vx_moe_linear_dimensions_valid(rows, d_in, d_out, experts, top_k)) return 0;
+    if (slot_rows && (slot_domain < experts || top_k > slot_domain)) return 0;
     for (uint32_t row = 0; row < rows; row++) {
         for (uint32_t column = 0; column < d_out; column++) {
             double sum = 0.0;
             for (uint32_t slot = 0; slot < top_k; slot++) {
                 uint32_t route_offset = row * top_k + slot;
                 uint32_t expert;
+                uint32_t staged;
                 float gate = route_weights[route_offset];
-                if (!vx_moe_route_index(route_indices, route_offset, experts, &expert) ||
+                if (!vx_moe_route_index(route_indices, route_offset, route_domain, &expert) ||
                     !vx_finite_f32(gate)) return 0;
+                if (!vx_moe_training_resident_row(slot_rows, slot_domain, experts,
+                        expert, &staged)) return 0;
+                expert = staged;
                 size_t expert_offset = (size_t)expert * d_in * d_out;
                 double value = expert_bias ? expert_bias[(size_t)expert * d_out + column] : 0.0;
                 for (uint32_t dimension = 0; dimension < d_in; dimension++) {
@@ -1295,16 +1331,38 @@ uint32_t volvoxai_training_moe_linear_backward_f32(
         float *dinput, float *dweight, float *dbias, float *droute_weights,
         uint32_t rows, uint32_t d_in, uint32_t d_out,
         uint32_t experts, uint32_t top_k) {
+    return volvoxai_training_moe_linear_backward_banked_f32(
+        input, expert_weight, expert_bias, route_indices, route_weights, dy,
+        dinput, dweight, dbias, droute_weights, rows, d_in, d_out, experts,
+        top_k, NULL, 0);
+}
+
+/* Gradients accumulate into the staged rows, so a partially resident bank
+ * trains exactly the families the context materialized. */
+VX_TRAINING_EXPORT("volvoxai_training_moe_linear_backward_banked_f32")
+uint32_t volvoxai_training_moe_linear_backward_banked_f32(
+        const float *input, const float *expert_weight, const float *expert_bias,
+        const float *route_indices, const float *route_weights, const float *dy,
+        float *dinput, float *dweight, float *dbias, float *droute_weights,
+        uint32_t rows, uint32_t d_in, uint32_t d_out,
+        uint32_t experts, uint32_t top_k,
+        const uint32_t *slot_rows, uint32_t slot_domain) {
+    const uint32_t route_domain = slot_rows ? slot_domain : experts;
     if (!input || !expert_weight || !route_indices || !route_weights || !dy ||
         !dinput || !dweight || !droute_weights || (expert_bias && !dbias) ||
         !vx_moe_linear_dimensions_valid(rows, d_in, d_out, experts, top_k)) return 0;
+    if (slot_rows && (slot_domain < experts || top_k > slot_domain)) return 0;
     for (uint32_t row = 0; row < rows; row++) {
         for (uint32_t slot = 0; slot < top_k; slot++) {
             uint32_t route_offset = row * top_k + slot;
             uint32_t expert;
+            uint32_t staged;
             float gate = route_weights[route_offset];
-            if (!vx_moe_route_index(route_indices, route_offset, experts, &expert) ||
+            if (!vx_moe_route_index(route_indices, route_offset, route_domain, &expert) ||
                 !vx_finite_f32(gate)) return 0;
+            if (!vx_moe_training_resident_row(slot_rows, slot_domain, experts,
+                    expert, &staged)) return 0;
+            expert = staged;
             size_t expert_offset = (size_t)expert * d_in * d_out;
             double route_gradient = 0.0;
             for (uint32_t column = 0; column < d_out; column++) {
@@ -2385,19 +2443,28 @@ uint32_t volvoxai_training_conv1d_f32(const float *input, const float *weight, c
         uint32_t padding, uint32_t groups, uint32_t relu) {
     if (!input || !weight || !output || !vx_conv1d_valid(batch, in_channels, input_length, out_channels,
         input_per_group, kernel, output_length, stride, padding, groups)) return 0;
+    /* NLC activations [batch, l, c]; WIO weights [k, in_per_group, out_c]. */
     uint32_t group_out = out_channels / groups;
-    for (uint32_t b = 0; b < batch; b++) for (uint32_t oc = 0; oc < out_channels; oc++)
-      for (uint32_t ox = 0; ox < output_length; ox++) {
-        float sum = bias ? bias[oc] : 0.0f; uint32_t group = oc / group_out;
-        for (uint32_t local_ic = 0; local_ic < input_per_group; local_ic++) for (uint32_t kk = 0; kk < kernel; kk++) {
+    for (uint32_t b = 0; b < batch; b++) for (uint32_t ox = 0; ox < output_length; ox++) {
+        float *out_row = output + ((size_t)b * output_length + ox) * out_channels;
+        for (uint32_t oc = 0; oc < out_channels; oc++) out_row[oc] = bias ? bias[oc] : 0.0f;
+        for (uint32_t kk = 0; kk < kernel; kk++) {
           int32_t ix = (int32_t)(ox * stride + kk) - (int32_t)padding;
-          if (ix >= 0 && (uint32_t)ix < input_length) {
-            uint32_t ic = group * input_per_group + local_ic;
-            sum += input[((b * in_channels + ic) * input_length) + (uint32_t)ix] *
-                   weight[((oc * input_per_group + local_ic) * kernel) + kk];
+          if (ix < 0 || (uint32_t)ix >= input_length) continue;
+          const float *in_row = input + ((size_t)b * input_length + (uint32_t)ix) * in_channels;
+          const float *w_tap = weight + (size_t)kk * input_per_group * out_channels;
+          for (uint32_t g = 0; g < groups; g++) {
+            const float *in_g = in_row + (size_t)g * input_per_group;
+            float *out_g = out_row + (size_t)g * group_out;
+            for (uint32_t local_ic = 0; local_ic < input_per_group; local_ic++) {
+              float value = in_g[local_ic];
+              const float *w_row = w_tap + (size_t)local_ic * out_channels + (size_t)g * group_out;
+              for (uint32_t oc = 0; oc < group_out; oc++) out_g[oc] += value * w_row[oc];
+            }
           }
         }
-        output[((b * out_channels + oc) * output_length) + ox] = relu && sum < 0.0f ? 0.0f : sum;
+        if (relu) for (uint32_t oc = 0; oc < out_channels; oc++)
+          if (out_row[oc] < 0.0f) out_row[oc] = 0.0f;
       }
     return 1;
 }
@@ -2409,21 +2476,30 @@ uint32_t volvoxai_training_conv1d_backward_f32(const float *input, const float *
         uint32_t output_length, uint32_t stride, uint32_t padding, uint32_t groups, uint32_t relu) {
     if (!input || !weight || !output || !dy || !dx || !dw || !vx_conv1d_valid(batch, in_channels, input_length,
         out_channels, input_per_group, kernel, output_length, stride, padding, groups)) return 0;
+    /* NLC activations [batch, l, c]; WIO weights [k, in_per_group, out_c]. */
     uint32_t group_out = out_channels / groups;
-    for (uint32_t b = 0; b < batch; b++) for (uint32_t oc = 0; oc < out_channels; oc++)
-      for (uint32_t ox = 0; ox < output_length; ox++) {
-        uint32_t out_index = ((b * out_channels + oc) * output_length) + ox;
-        float gradient = relu && output[out_index] <= 0.0f ? 0.0f : dy[out_index];
-        if (db) db[oc] += gradient;
-        uint32_t group = oc / group_out;
-        for (uint32_t local_ic = 0; local_ic < input_per_group; local_ic++) for (uint32_t kk = 0; kk < kernel; kk++) {
+    for (uint32_t b = 0; b < batch; b++) for (uint32_t ox = 0; ox < output_length; ox++) {
+        size_t out_row = ((size_t)b * output_length + ox) * out_channels;
+        if (db) for (uint32_t oc = 0; oc < out_channels; oc++)
+          db[oc] += relu && output[out_row + oc] <= 0.0f ? 0.0f : dy[out_row + oc];
+        for (uint32_t kk = 0; kk < kernel; kk++) {
           int32_t ix = (int32_t)(ox * stride + kk) - (int32_t)padding;
-          if (ix >= 0 && (uint32_t)ix < input_length) {
-            uint32_t ic = group * input_per_group + local_ic;
-            uint32_t input_index = ((b * in_channels + ic) * input_length) + (uint32_t)ix;
-            uint32_t weight_index = ((oc * input_per_group + local_ic) * kernel) + kk;
-            dx[input_index] += gradient * weight[weight_index];
-            dw[weight_index] += gradient * input[input_index];
+          if (ix < 0 || (uint32_t)ix >= input_length) continue;
+          size_t in_row = ((size_t)b * input_length + (uint32_t)ix) * in_channels;
+          size_t w_tap = (size_t)kk * input_per_group * out_channels;
+          for (uint32_t g = 0; g < groups; g++) {
+            for (uint32_t local_ic = 0; local_ic < input_per_group; local_ic++) {
+              size_t input_index = in_row + (size_t)g * input_per_group + local_ic;
+              size_t w_row = w_tap + (size_t)local_ic * out_channels + (size_t)g * group_out;
+              float value = input[input_index], acc = 0.0f;
+              for (uint32_t oc = 0; oc < group_out; oc++) {
+                size_t index = out_row + (size_t)g * group_out + oc;
+                float gradient = relu && output[index] <= 0.0f ? 0.0f : dy[index];
+                acc += gradient * weight[w_row + oc];
+                dw[w_row + oc] += gradient * value;
+              }
+              dx[input_index] += acc;
+            }
           }
         }
       }
@@ -2442,10 +2518,17 @@ uint32_t volvoxai_training_conv_transpose2d_f32(const float *input, const float 
     uint32_t batch, uint32_t in_height, uint32_t in_width, uint32_t in_channels, uint32_t out_height, uint32_t out_width,
     uint32_t out_channels, uint32_t kernel_y, uint32_t kernel_x, uint32_t stride_y, uint32_t stride_x, uint32_t pad_y, uint32_t pad_x) {
   if (!input || !weight || !output || !vx_conv_transpose2d_valid(batch,in_height,in_width,in_channels,out_height,out_width,out_channels,kernel_y,kernel_x,stride_y,stride_x,pad_y,pad_x)) return 0;
+  /* HWIO weights [ky, kx, in_c, out_c]: out_c is contiguous, so the innermost
+   * loop walks the weight row and the output row together. */
   uint32_t count=batch*out_height*out_width*out_channels; for(uint32_t i=0;i<count;i++) output[i]=bias?bias[i%out_channels]:0.0f;
-  for(uint32_t b=0;b<batch;b++) for(uint32_t iy=0;iy<in_height;iy++) for(uint32_t ix=0;ix<in_width;ix++) for(uint32_t ic=0;ic<in_channels;ic++) for(uint32_t oc=0;oc<out_channels;oc++) for(uint32_t ky=0;ky<kernel_y;ky++) for(uint32_t kx=0;kx<kernel_x;kx++) {
+  for(uint32_t b=0;b<batch;b++) for(uint32_t iy=0;iy<in_height;iy++) for(uint32_t ix=0;ix<in_width;ix++) for(uint32_t ky=0;ky<kernel_y;ky++) for(uint32_t kx=0;kx<kernel_x;kx++) {
     int32_t oy=(int32_t)(iy*stride_y+ky)-(int32_t)pad_y, ox=(int32_t)(ix*stride_x+kx)-(int32_t)pad_x;
-    if(oy>=0 && ox>=0 && (uint32_t)oy<out_height && (uint32_t)ox<out_width) output[((b*out_height+(uint32_t)oy)*out_width+(uint32_t)ox)*out_channels+oc]+=input[((b*in_height+iy)*in_width+ix)*in_channels+ic]*weight[((ic*out_channels+oc)*kernel_y+ky)*kernel_x+kx];
+    if(oy<0||ox<0||(uint32_t)oy>=out_height||(uint32_t)ox>=out_width) continue;
+    const float *in_row=input+((b*in_height+iy)*in_width+ix)*in_channels;
+    const float *w_tap=weight+((ky*kernel_x+kx)*in_channels)*out_channels;
+    float *out_row=output+((b*out_height+(uint32_t)oy)*out_width+(uint32_t)ox)*out_channels;
+    for(uint32_t ic=0;ic<in_channels;ic++){ float v=in_row[ic]; const float *w_row=w_tap+ic*out_channels;
+      for(uint32_t oc=0;oc<out_channels;oc++) out_row[oc]+=v*w_row[oc]; }
   }
   return 1;
 }
@@ -2455,10 +2538,20 @@ uint32_t volvoxai_training_conv_transpose2d_backward_f32(const float *input, con
     uint32_t batch, uint32_t in_height, uint32_t in_width, uint32_t in_channels, uint32_t out_height, uint32_t out_width,
     uint32_t out_channels, uint32_t kernel_y, uint32_t kernel_x, uint32_t stride_y, uint32_t stride_x, uint32_t pad_y, uint32_t pad_x) {
   if(!input||!weight||!dy||!dx||!dw||!vx_conv_transpose2d_valid(batch,in_height,in_width,in_channels,out_height,out_width,out_channels,kernel_y,kernel_x,stride_y,stride_x,pad_y,pad_x)) return 0;
-  for(uint32_t b=0;b<batch;b++) for(uint32_t iy=0;iy<in_height;iy++) for(uint32_t ix=0;ix<in_width;ix++) for(uint32_t ic=0;ic<in_channels;ic++) for(uint32_t oc=0;oc<out_channels;oc++) for(uint32_t ky=0;ky<kernel_y;ky++) for(uint32_t kx=0;kx<kernel_x;kx++) {
+  /* HWIO weights [ky, kx, in_c, out_c]; dw shares that order so both gradient
+   * accumulations stay contiguous over out_c. */
+  for(uint32_t b=0;b<batch;b++) for(uint32_t iy=0;iy<in_height;iy++) for(uint32_t ix=0;ix<in_width;ix++) for(uint32_t ky=0;ky<kernel_y;ky++) for(uint32_t kx=0;kx<kernel_x;kx++) {
     int32_t oy=(int32_t)(iy*stride_y+ky)-(int32_t)pad_y, ox=(int32_t)(ix*stride_x+kx)-(int32_t)pad_x; if(oy<0||ox<0||(uint32_t)oy>=out_height||(uint32_t)ox>=out_width) continue;
-    uint32_t ii=((b*in_height+iy)*in_width+ix)*in_channels+ic, wi=((ic*out_channels+oc)*kernel_y+ky)*kernel_x+kx, oi=((b*out_height+(uint32_t)oy)*out_width+(uint32_t)ox)*out_channels+oc; dx[ii]+=dy[oi]*weight[wi]; dw[wi]+=dy[oi]*input[ii]; if(db) db[oc]+=dy[oi];
+    uint32_t in_base=((b*in_height+iy)*in_width+ix)*in_channels;
+    uint32_t w_tap=((ky*kernel_x+kx)*in_channels)*out_channels;
+    const float *dy_row=dy+((b*out_height+(uint32_t)oy)*out_width+(uint32_t)ox)*out_channels;
+    for(uint32_t ic=0;ic<in_channels;ic++){ uint32_t ii=in_base+ic, w_row=w_tap+ic*out_channels; float acc=0.0f;
+      for(uint32_t oc=0;oc<out_channels;oc++){ float upstream=dy_row[oc]; acc+=upstream*weight[w_row+oc]; dw[w_row+oc]+=upstream*input[ii]; }
+      dx[ii]+=acc; }
   }
+  if(db) for(uint32_t b=0;b<batch;b++) for(uint32_t oy=0;oy<out_height;oy++) for(uint32_t ox=0;ox<out_width;ox++){
+    const float *dy_row=dy+((b*out_height+oy)*out_width+ox)*out_channels;
+    for(uint32_t oc=0;oc<out_channels;oc++) db[oc]+=dy_row[oc]; }
   return 1;
 }
 

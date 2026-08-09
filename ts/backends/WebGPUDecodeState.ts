@@ -1,5 +1,5 @@
 import { Tensor } from '../core/Tensor.js';
-import type { Graph } from '../core/Graph.js';
+import type { RuntimeGraph } from '../core/RuntimeGraph.js';
 import type { RuntimeTypedArray } from '../types.js';
 import { incrementalNodeSelection } from './incrementalExecution.js';
 import { quantizedRowNode } from './quantizedRowExecution.js';
@@ -28,6 +28,12 @@ export class WebGPUDecodeState {
   constructor(readonly host: GraphExecutor) {}
 
   resetExecution(): void {
+    this.feedback = null;
+  }
+
+  /** Drop shape/seed-specific row pipelines and replay progress, not immutable candidates. */
+  resetBinding(): void {
+    this.rowPlans.clear();
     this.feedback = null;
   }
 
@@ -245,19 +251,43 @@ export class WebGPUDecodeState {
       }
     }
 
-    _analyzeIncrementalRows(): void {
-      this.host.incrementalRowPlans.clear();
-      this.host.incrementalRowCandidates.clear();
-      this.host.incrementalRowCopyTensorNames.clear();
-      if (!(this.host.graph?.tensors instanceof Map)) return;
+    _collectIncrementalRows(): {
+      candidates: Map<number, IncrementalRowCandidate>;
+      copyTensorNames: Set<string>;
+    } {
+      const candidates = new Map<number, IncrementalRowCandidate>();
+      const copyTensorNames = new Set<string>();
+      if (!(this.host.graph?.tensors instanceof Map)) {
+        return { candidates, copyTensorNames };
+      }
       for (let nodeIndex = 0; nodeIndex < this.host.graph.nodes.length; nodeIndex++) {
         const candidate = this.host._incrementalRowCandidate(this.host.graph.nodes[nodeIndex], nodeIndex);
         if (!candidate) continue;
-        this.host.incrementalRowCandidates.set(nodeIndex, candidate);
+        candidates.set(nodeIndex, candidate);
         for (const name of candidate.scratchCapacities.keys()) {
-          this.host.incrementalRowCopyTensorNames.add(name);
+          copyTensorNames.add(name);
         }
       }
+      return { candidates, copyTensorNames };
+    }
+
+    _publishIncrementalRows(analysis: {
+      candidates: ReadonlyMap<number, IncrementalRowCandidate>;
+      copyTensorNames: ReadonlySet<string>;
+    }): void {
+      this.host.incrementalRowPlans.clear();
+      this.host.incrementalRowCandidates.clear();
+      this.host.incrementalRowCopyTensorNames.clear();
+      for (const [nodeIndex, candidate] of analysis.candidates) {
+        this.host.incrementalRowCandidates.set(nodeIndex, candidate);
+      }
+      for (const name of analysis.copyTensorNames) {
+        this.host.incrementalRowCopyTensorNames.add(name);
+      }
+    }
+
+    _analyzeIncrementalRows(): void {
+      this._publishIncrementalRows(this._collectIncrementalRows());
     }
 
     _incrementalRowRange(
@@ -506,7 +536,7 @@ export class WebGPUDecodeState {
 
       const changedInputs = [tokenInputName, keepInputName];
       const selectedNodesValue = incrementalNodeSelection(
-        this.host.graph as Graph, inputs, { incremental: true, changedInputs }, true,
+        this.host.graph as RuntimeGraph, inputs, { incremental: true, changedInputs }, true,
       );
       if (!(selectedNodesValue instanceof Set) || selectedNodesValue.size === 0 ||
           !selectedNodesValue.has(producerIndex)) {
@@ -559,13 +589,21 @@ export class WebGPUDecodeState {
         return this.host.deviceFeedbackControlBuffer;
       }
       const values = Uint32Array.from({ length: sequenceLength }, (_, index) => index + 1);
-      const buffer = this.host.device.createBuffer({
+      const resources = this.host._activeSpecializationResources || this.host.auxiliaryBuffers;
+      const previousBufferCreateCount = this.host.specializationBufferCreateCount;
+      const buffer = this.host._createSpecializationBuffer({
         label: 'DeviceFeedback_control',
         size: values.byteLength,
         usage: GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST,
       });
-      this.host.device.queue.writeBuffer(buffer, 0, values);
-      this.host.auxiliaryBuffers.add(buffer);
+      try {
+        this.host.device.queue.writeBuffer(buffer, 0, values);
+      } catch (error) {
+        resources.delete(buffer);
+        buffer.destroy?.();
+        this.host.specializationBufferCreateCount = previousBufferCreateCount;
+        throw error;
+      }
       this.host.deviceFeedbackControlBuffer = buffer;
       this.host.deviceFeedbackSequenceLength = sequenceLength;
       return buffer;
@@ -584,9 +622,6 @@ export class WebGPUDecodeState {
       this.host.graph.assertTopologyRevision?.(this.host.compiledTopologyRevision as number, 'WebGPU');
       if ((this.host.graph.weightRevision || 0) !== this.host.compiledWeightRevision) {
         throw new Error('WebGPU weights changed after compilation; recompile before device-feedback decode.');
-      }
-      if (this.host.graph.adapters?.hasActive()) {
-        throw new Error('WebGPU device-feedback decode is unavailable while an adapter is active.');
       }
       const descriptor = this.host._deviceFeedbackDescriptor(inputs, options);
       const resume = descriptor.startPosition > 0;

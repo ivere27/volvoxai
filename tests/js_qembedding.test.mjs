@@ -1,8 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
-import { Graph } from '../ts/core/Graph.js';
-import { GraphLoader } from '../ts/core/GraphLoader.js';
+import { RuntimeGraph } from '../ts/core/RuntimeGraph.js';
+import { RuntimeGraphLoader } from '../ts/core/RuntimeGraphLoader.js';
 import { CPUEngine } from '../ts/backends/CPUEngine.js';
 import { _cpuQEmbedding } from '../ts/ops/qEmbedding.js';
 
@@ -22,7 +22,7 @@ function qEmbeddingGraph({
   outputDtype = 'int8',
   outputQuantization = { scheme: 'per_tensor', scale: 0.25, zero_point: -1 },
 } = {}) {
-  const graph = new Graph();
+  const graph = new RuntimeGraph();
   const input = graph.addInput('ids', idsShape, 'int32', { buffer: Int32Array.from(ids) });
   const weight = graph.addWeight('table', weightShape, weightDtype, {
     buffer: byteStorage(weightDtype, weightValues),
@@ -42,7 +42,7 @@ function qEmbeddingGraph({
 }
 
 function clippedQEmbeddingGraph({ maximum = 2 } = {}) {
-  const graph = new Graph();
+  const graph = new RuntimeGraph();
   const raw = graph.addInput('raw_ids', [2], 'int32', {
     buffer: Int32Array.of(-9, 17),
   });
@@ -161,22 +161,22 @@ test('CPU engine dispatches QEmbedding without entering F32 Embedding', async ()
   assert.deepEqual([...result.out], [1, -1, -3, -3, -1, 1]);
 });
 
-test('GraphLoader admits public or vocabulary-bounded internal QEmbedding IDs', () => {
+test('RuntimeGraphLoader admits public or vocabulary-bounded internal QEmbedding IDs', () => {
   const { graph, node, input } = qEmbeddingGraph({ idsShape: [1, 2], ids: [2, 0] });
-  assert.doesNotThrow(() => GraphLoader._assertBrowserQuantizationSupported(graph));
+  assert.doesNotThrow(() => RuntimeGraphLoader._assertBrowserQuantizationSupported(graph));
   input.isInput = false;
   assert.throws(
-    () => GraphLoader._assertBrowserQuantizationSupported(graph),
+    () => RuntimeGraphLoader._assertBrowserQuantizationSupported(graph),
     new RegExp(`QEmbedding node ${node.id} .*preflight-complete I32 IDs`),
   );
 
   const bounded = clippedQEmbeddingGraph();
   assert.doesNotThrow(
-    () => GraphLoader._assertBrowserQuantizationSupported(bounded.graph),
+    () => RuntimeGraphLoader._assertBrowserQuantizationSupported(bounded.graph),
   );
   const outOfRange = clippedQEmbeddingGraph({ maximum: 3 });
   assert.throws(
-    () => GraphLoader._assertBrowserQuantizationSupported(outOfRange.graph),
+    () => RuntimeGraphLoader._assertBrowserQuantizationSupported(outOfRange.graph),
     /preflight-complete I32 IDs/,
   );
 });

@@ -4,6 +4,11 @@
 // permitted to silently change graph semantics at execution time.
 
 import { roundTiesToEven } from './quantizeLinear.js';
+import {
+  assertShapeKernelOutput,
+  assertShapeKernelTensor,
+  sameShape,
+} from './shapeKernelValidation.js';
 
 function elements(tensor) {
   return tensor?.shape?.reduce((product, dimension) => product * dimension, 1);
@@ -27,15 +32,25 @@ function range(dtype) {
 export function _cpuRequantizeLinear(node) {
   const input = node.inputs.input || node.inputs.x || node.inputs.data;
   const output = node.outputs.out || Object.values(node.outputs || {})[0];
+  assertShapeKernelTensor(input, `RequantizeLinear node ${node.id} input`, {
+    dtypes: ['int8', 'uint8'], maximumRank: 8,
+  });
+  assertShapeKernelTensor(output, `RequantizeLinear node ${node.id} output`, {
+    dtypes: ['int8', 'uint8'], maximumRank: 8,
+  });
   const inputElements = elements(input);
   const outputElements = elements(output);
-  if (!input || !output || !Number.isSafeInteger(inputElements) || inputElements <= 0 ||
+  if (!Number.isSafeInteger(inputElements) || inputElements <= 0 ||
       inputElements !== outputElements || input.buffer?.length !== inputElements ||
-      output.buffer?.length !== outputElements) {
-    throw new Error(`RequantizeLinear node ${node.id} requires equal-size typed input and output tensors.`);
+      output.buffer?.length !== outputElements || !sameShape(input.shape, output.shape)) {
+    throw new Error(`RequantizeLinear node ${node.id} requires equal-shape typed input and output tensors.`);
   }
   const inputQuantization = perTensorQuantization(input, `RequantizeLinear node ${node.id} input`);
   const outputQuantization = perTensorQuantization(output, `RequantizeLinear node ${node.id} output`);
+  assertShapeKernelOutput(
+    output, input.shape, output.dtype, outputQuantization,
+    `RequantizeLinear node ${node.id}`,
+  );
   const [minimum, maximum] = range(output.dtype);
   const multiplier = Math.fround(inputQuantization.scale / outputQuantization.scale);
   if (!Number.isFinite(multiplier) || multiplier <= 0) {

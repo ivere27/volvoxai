@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
-import { Graph } from '../ts/index.js';
+import { TrainingGraph as Graph } from '../ts/training/TrainingGraph.js';
 import { CPUEngine } from '../ts/backends/CPUEngine.js';
 import { CPUAutograd } from '../ts/training/CPUAutograd.js';
 

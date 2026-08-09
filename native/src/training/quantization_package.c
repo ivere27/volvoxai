@@ -130,7 +130,7 @@ void volvoxai_ptq_plan_destroy(VolvoxAIPTQPlan* plan) {
 
 int volvoxai_ptq_plan_add_tensor(VolvoxAIPTQPlan* plan,
                                  const volvoxai_ptq_tensor_spec_t* spec) {
-    if (!plan || !spec || spec->struct_size < sizeof(*spec) ||
+    if (!plan || !spec || spec->struct_size != sizeof(*spec) ||
         !ptq_valid_name(spec->tensor_name) ||
         !ptq_supported_activation(spec->dtype, spec->scheme) ||
         volvoxai_engine_model_route_lease_active()) return -1;
@@ -174,7 +174,7 @@ static int ptq_layer_target_name_used(const VolvoxAIPTQPlan* plan,
 
 int volvoxai_ptq_plan_add_layer(VolvoxAIPTQPlan* plan,
                                 const volvoxai_ptq_layer_spec_t* spec) {
-    if (!plan || !spec || spec->struct_size < sizeof(*spec) ||
+    if (!plan || !spec || spec->struct_size != sizeof(*spec) ||
         spec->node_index < 0 ||
         spec->weight_axis != 0 ||
         (spec->kind != VX_PTQ_LAYER_QLINEAR &&
@@ -323,7 +323,7 @@ static int ptq_plan_calibrate_sample(
         const volvoxai_ptq_input_binding_t* binding = &bindings[index];
         int32_t dtype = -1;
         size_t expected = 0;
-        if (binding->struct_size < sizeof(*binding) ||
+        if (binding->struct_size != sizeof(*binding) ||
             !ptq_valid_name(binding->tensor_name) ||
             binding->nbytes > SIZE_MAX ||
             (binding->nbytes && !binding->data) ||
@@ -494,6 +494,40 @@ static int ptq_json_add_owned(cJSON* object, const char* key, cJSON* item) {
     return 0;
 }
 
+static int ptq_json_exact_object(cJSON* object,
+                                 const char* const* keys, int key_count) {
+    if (!cJSON_IsObject(object) || cJSON_GetArraySize(object) != key_count)
+        return 0;
+    for (int index = 0; index < key_count; index++) {
+        if (!cJSON_GetObjectItemCaseSensitive(object, keys[index])) return 0;
+    }
+    return 1;
+}
+
+/* Dynamic-v1 node outputs are descriptor envelopes.  Keep every PTQ graph
+ * rewrite on that sole schema; legacy string-valued outputs and parallel
+ * outputs_shape/outputs_dtype maps are intentionally not accepted. */
+static cJSON* ptq_node_output_descriptor(cJSON* output) {
+    static const char* const keys[] = {"tensor", "dtype", "shape"};
+    cJSON* tensor = cJSON_IsObject(output)
+        ? cJSON_GetObjectItemCaseSensitive(output, "tensor") : NULL;
+    cJSON* dtype = cJSON_IsObject(output)
+        ? cJSON_GetObjectItemCaseSensitive(output, "dtype") : NULL;
+    cJSON* shape = cJSON_IsObject(output)
+        ? cJSON_GetObjectItemCaseSensitive(output, "shape") : NULL;
+    return ptq_json_exact_object(output, keys, 3) &&
+           cJSON_IsString(tensor) && tensor->valuestring && tensor->valuestring[0] &&
+           cJSON_IsString(dtype) && dtype->valuestring && dtype->valuestring[0] &&
+           cJSON_IsArray(shape) ? output : NULL;
+}
+
+static const char* ptq_node_output_tensor(cJSON* output) {
+    cJSON* descriptor = ptq_node_output_descriptor(output);
+    cJSON* tensor = descriptor
+        ? cJSON_GetObjectItemCaseSensitive(descriptor, "tensor") : NULL;
+    return tensor ? tensor->valuestring : NULL;
+}
+
 static int ptq_graph_declares_tensor(cJSON* root, const char* name) {
     cJSON* inputs = root ? cJSON_GetObjectItemCaseSensitive(root, "inputs") : NULL;
     cJSON* nodes = root ? cJSON_GetObjectItemCaseSensitive(root, "nodes") : NULL;
@@ -516,8 +550,8 @@ static int ptq_graph_declares_tensor(cJSON* root, const char* name) {
         for (cJSON* output = cJSON_IsObject(node_outputs)
                  ? node_outputs->child : NULL;
              output; output = output->next) {
-            if (cJSON_IsString(output) && output->valuestring &&
-                !strcmp(output->valuestring, name)) return 1;
+            const char* tensor_name = ptq_node_output_tensor(output);
+            if (tensor_name && !strcmp(tensor_name, name)) return 1;
         }
     }
     for (cJSON* output = cJSON_IsArray(outputs) ? outputs->child : NULL;
@@ -649,9 +683,9 @@ static int ptq_json_output_key(cJSON* node, const char* tensor_name,
                                const char** output_key) {
     cJSON* outputs = node ? cJSON_GetObjectItemCaseSensitive(node, "outputs") : NULL;
     if (!cJSON_IsObject(outputs) || !outputs->child || outputs->child->next ||
-        !outputs->child->string || !cJSON_IsString(outputs->child) ||
-        !outputs->child->valuestring ||
-        strcmp(outputs->child->valuestring, tensor_name)) return -1;
+        !outputs->child->string ||
+        !ptq_node_output_descriptor(outputs->child) ||
+        strcmp(ptq_node_output_tensor(outputs->child), tensor_name)) return -1;
     *output_key = outputs->child->string;
     return 0;
 }
@@ -687,9 +721,11 @@ static cJSON* ptq_json_tensor_shape(cJSON* root, const char* tensor_name) {
         cJSON* node = cJSON_GetArrayItem(nodes, index);
         const char* output_key = NULL;
         if (ptq_json_output_key(node, tensor_name, &output_key) != 0) continue;
-        cJSON* shapes = cJSON_GetObjectItemCaseSensitive(node, "outputs_shape");
-        shape = cJSON_IsObject(shapes)
-            ? cJSON_GetObjectItemCaseSensitive(shapes, output_key) : NULL;
+        cJSON* outputs = cJSON_GetObjectItemCaseSensitive(node, "outputs");
+        cJSON* descriptor = cJSON_IsObject(outputs)
+            ? cJSON_GetObjectItemCaseSensitive(outputs, output_key) : NULL;
+        shape = ptq_node_output_descriptor(descriptor)
+            ? cJSON_GetObjectItemCaseSensitive(descriptor, "shape") : NULL;
         return cJSON_IsArray(shape) ? shape : NULL;
     }
     return NULL;
@@ -704,6 +740,27 @@ static int ptq_json_shape_dim(cJSON* shape, int index, int* output) {
         return -1;
     *output = value->valueint;
     return 0;
+}
+
+static int ptq_json_shape_axis_equal(cJSON* left, cJSON* right, int index) {
+    cJSON* left_value;
+    cJSON* right_value;
+    int left_count = cJSON_IsArray(left) ? cJSON_GetArraySize(left) : -1;
+    int right_count = cJSON_IsArray(right) ? cJSON_GetArraySize(right) : -1;
+    if (left_count < 0 || right_count != left_count ||
+        index < 0 || index >= left_count) return 0;
+    left_value = cJSON_GetArrayItem(left, index);
+    right_value = cJSON_GetArrayItem(right, index);
+    if (cJSON_IsString(left_value) && cJSON_IsString(right_value))
+        return left_value->valuestring && right_value->valuestring &&
+               !strcmp(left_value->valuestring, right_value->valuestring);
+    return cJSON_IsNumber(left_value) && cJSON_IsNumber(right_value) &&
+           isfinite(left_value->valuedouble) &&
+           isfinite(right_value->valuedouble) &&
+           left_value->valuedouble == (double)left_value->valueint &&
+           right_value->valuedouble == (double)right_value->valueint &&
+           left_value->valueint > 0 &&
+           left_value->valueint == right_value->valueint;
 }
 
 static int ptq_layer_produces_before(const VolvoxAIPTQPlan* plan,
@@ -752,8 +809,9 @@ static int ptq_template_producer(cJSON* nodes, const char* tensor_name) {
             ? cJSON_GetObjectItemCaseSensitive(node, "outputs") : NULL;
         if (!cJSON_IsObject(outputs)) return -2;
         for (cJSON* output = outputs->child; output; output = output->next) {
-            if (!cJSON_IsString(output) || !output->valuestring) return -2;
-            if (!strcmp(output->valuestring, tensor_name)) {
+            const char* produced = ptq_node_output_tensor(output);
+            if (!produced) return -2;
+            if (!strcmp(produced, tensor_name)) {
                 if (producer >= 0) return -2;
                 producer = index;
             }
@@ -767,11 +825,10 @@ static int ptq_template_declares_graph_io(cJSON* root, const char* name) {
     if (cJSON_IsObject(inputs) && cJSON_GetObjectItemCaseSensitive(inputs, name))
         return 1;
     cJSON* outputs = cJSON_GetObjectItemCaseSensitive(root, "outputs");
-    if (cJSON_IsArray(outputs) || cJSON_IsObject(outputs)) {
+    if (cJSON_IsArray(outputs)) {
         for (cJSON* item = outputs->child; item; item = item->next) {
-            if ((item->string && !strcmp(item->string, name)) ||
-                (cJSON_IsString(item) && item->valuestring &&
-                 !strcmp(item->valuestring, name))) return 1;
+            if (cJSON_IsString(item) && item->valuestring &&
+                !strcmp(item->valuestring, name)) return 1;
         }
     }
     return 0;
@@ -807,6 +864,85 @@ static int ptq_loaded_weight_matches(const SafetensorsFile* source_file,
         if (stored->shape[index] != tensor->shape[index]) return 0;
     }
     return !memcmp(stored->data, tensor->data, stored->nbytes);
+}
+
+static int ptq_template_is_closed_v1(cJSON* root) {
+    static const char* const root_keys[] = {
+        "format", "dimensions", "inputs", "outputs", "nodes",
+    };
+    static const char* const input_keys[] = {"shape", "dtype"};
+    static const char* const node_keys[] = {
+        "id", "opType", "inputs", "outputs", "params",
+    };
+    static const char* const dimension_keys[] = {"min", "max"};
+    static const char* const divisible_dimension_keys[] = {
+        "min", "max", "multiple_of",
+    };
+    if (!ptq_json_exact_object(root, root_keys, 5) ||
+        !ptq_json_string_is(root, "format", VX_PTQ_GRAPH_FORMAT))
+        return 0;
+    cJSON* dimensions = cJSON_GetObjectItemCaseSensitive(root, "dimensions");
+    cJSON* inputs = cJSON_GetObjectItemCaseSensitive(root, "inputs");
+    cJSON* outputs = cJSON_GetObjectItemCaseSensitive(root, "outputs");
+    cJSON* nodes = cJSON_GetObjectItemCaseSensitive(root, "nodes");
+    if (!cJSON_IsObject(dimensions) || !cJSON_IsObject(inputs) ||
+        !cJSON_IsArray(outputs) || !outputs->child || !cJSON_IsArray(nodes))
+        return 0;
+    for (cJSON* dimension = dimensions->child; dimension;
+         dimension = dimension->next) {
+        cJSON* minimum = cJSON_GetObjectItemCaseSensitive(dimension, "min");
+        cJSON* maximum = cJSON_GetObjectItemCaseSensitive(dimension, "max");
+        cJSON* multiple = cJSON_GetObjectItemCaseSensitive(
+            dimension, "multiple_of");
+        const char* const* keys = multiple
+            ? divisible_dimension_keys : dimension_keys;
+        int count = multiple ? 3 : 2;
+        if (!dimension->string || !dimension->string[0] ||
+            !ptq_json_exact_object(dimension, keys, count) ||
+            !cJSON_IsNumber(minimum) || !cJSON_IsNumber(maximum) ||
+            minimum->valuedouble != (double)minimum->valueint ||
+            maximum->valuedouble != (double)maximum->valueint ||
+            minimum->valueint <= 0 || maximum->valueint < minimum->valueint ||
+            (multiple && (!cJSON_IsNumber(multiple) ||
+                multiple->valuedouble != (double)multiple->valueint ||
+                multiple->valueint <= 0))) return 0;
+    }
+    for (cJSON* input = inputs->child; input; input = input->next) {
+        cJSON* shape = cJSON_GetObjectItemCaseSensitive(input, "shape");
+        cJSON* dtype = cJSON_GetObjectItemCaseSensitive(input, "dtype");
+        if (!input->string || !input->string[0] ||
+            !ptq_json_exact_object(input, input_keys, 2) ||
+            !cJSON_IsArray(shape) || !shape->child ||
+            !cJSON_IsString(dtype) || !dtype->valuestring ||
+            !dtype->valuestring[0]) return 0;
+    }
+    for (cJSON* output = outputs->child; output; output = output->next) {
+        if (!cJSON_IsString(output) || !output->valuestring ||
+            !output->valuestring[0]) return 0;
+    }
+    for (cJSON* node = nodes->child; node; node = node->next) {
+        cJSON* id = cJSON_GetObjectItemCaseSensitive(node, "id");
+        cJSON* op = cJSON_GetObjectItemCaseSensitive(node, "opType");
+        cJSON* node_inputs = cJSON_GetObjectItemCaseSensitive(node, "inputs");
+        cJSON* node_outputs = cJSON_GetObjectItemCaseSensitive(node, "outputs");
+        cJSON* params = cJSON_GetObjectItemCaseSensitive(node, "params");
+        if (!ptq_json_exact_object(node, node_keys, 5) ||
+            !cJSON_IsString(id) || !id->valuestring || !id->valuestring[0] ||
+            !cJSON_IsString(op) || !op->valuestring || !op->valuestring[0] ||
+            !cJSON_IsObject(node_inputs) || !cJSON_IsObject(node_outputs) ||
+            !node_outputs->child || !cJSON_IsObject(params)) return 0;
+        for (cJSON* input = node_inputs->child; input; input = input->next) {
+            if (!input->string || !input->string[0] ||
+                !cJSON_IsString(input) || !input->valuestring ||
+                !input->valuestring[0]) return 0;
+        }
+        for (cJSON* output = node_outputs->child; output;
+             output = output->next) {
+            if (!output->string || !output->string[0] ||
+                !ptq_node_output_descriptor(output)) return 0;
+        }
+    }
+    return 1;
 }
 
 static int ptq_template_dependency_preflight(const VolvoxAIPTQPlan* plan,
@@ -860,7 +996,8 @@ static int ptq_template_prepare_quantization(cJSON* root,
     cJSON* descriptors = NULL;
     cJSON* storage_format = NULL;
     cJSON* metadata = NULL;
-    if (!cJSON_IsObject(root) || !weights || !descriptors_out) return -1;
+    if (!ptq_template_is_closed_v1(root) || !weights || !descriptors_out)
+        return -1;
     *descriptors_out = NULL;
     format = cJSON_GetObjectItemCaseSensitive(root, "format");
     inputs = cJSON_GetObjectItemCaseSensitive(root, "inputs");
@@ -943,12 +1080,14 @@ static int ptq_template_set_output(cJSON* root, cJSON* node,
                                    cJSON* descriptors,
                                    SafetensorsFile* weights,
                                    const VxPTQPlanTensor* tensor) {
-    cJSON* dtypes = cJSON_GetObjectItemCaseSensitive(node, "outputs_dtype");
+    cJSON* outputs = cJSON_GetObjectItemCaseSensitive(node, "outputs");
+    cJSON* output = cJSON_IsObject(outputs)
+        ? cJSON_GetObjectItemCaseSensitive(outputs, output_key) : NULL;
     const char* dtype_name = ptq_dtype_name(tensor->dtype);
     volvoxai_ptq_params_t params;
     int32_t zero_point;
-    if (!cJSON_IsObject(dtypes) || !dtype_name ||
-        !ptq_json_string_is(dtypes, output_key, dtype_name) ||
+    if (!ptq_node_output_descriptor(output) || !dtype_name ||
+        !ptq_json_string_is(output, "dtype", dtype_name) ||
         cJSON_GetObjectItemCaseSensitive(node, "outputs_quantization") ||
         volvoxai_ptq_calculate_params(&tensor->observer, tensor->dtype,
                                       tensor->scheme, &params) != 0)
@@ -957,6 +1096,49 @@ static int ptq_template_set_output(cJSON* root, cJSON* node,
     return ptq_add_quantization_entry(
         root, descriptors, weights, tensor->name, tensor->dtype,
         0, 0, &params.scale, &zero_point, 1);
+}
+
+static int ptq_set_authoring_metadata(
+        SafetensorsFile* weights,
+        const volvoxai_ptq_package_options_t* options) {
+    cJSON* metadata = NULL;
+    cJSON* coverage = NULL;
+    char* encoded = NULL;
+    int result = -1;
+    if (!weights || !options) return -1;
+    if (!options->logical_fingerprint && !options->profile_coverage_json)
+        return 0;
+    if (!options->logical_fingerprint || !options->logical_fingerprint[0] ||
+        !options->profile_coverage_json || !options->profile_coverage_json[0])
+        return -1;
+    coverage = cJSON_Parse(options->profile_coverage_json);
+    if (!cJSON_IsObject(coverage) ||
+        !ptq_json_string_is(coverage, "format", "volvox.ptq-coverage/v1") ||
+        !ptq_json_string_is(coverage, "logicalFingerprint",
+                            options->logical_fingerprint) ||
+        !cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(coverage, "complete")))
+        goto done;
+    metadata = weights->metadata_json
+        ? cJSON_Parse(weights->metadata_json) : cJSON_CreateObject();
+    if (!cJSON_IsObject(metadata) ||
+        cJSON_GetObjectItemCaseSensitive(metadata, "format") ||
+        cJSON_GetObjectItemCaseSensitive(metadata, "logical_fingerprint") ||
+        cJSON_GetObjectItemCaseSensitive(metadata, "profile_coverage") ||
+        !cJSON_AddStringToObject(metadata, "format", "volvox.ptq.v1") ||
+        !cJSON_AddStringToObject(metadata, "logical_fingerprint",
+                                 options->logical_fingerprint) ||
+        !cJSON_AddStringToObject(metadata, "profile_coverage",
+                                 options->profile_coverage_json))
+        goto done;
+    encoded = cJSON_PrintUnformatted(metadata);
+    if (!encoded || safetensors_set_metadata_json(weights, encoded) != 0)
+        goto done;
+    result = 0;
+done:
+    free(encoded);
+    cJSON_Delete(metadata);
+    cJSON_Delete(coverage);
+    return result;
 }
 
 static int ptq_template_validate_layer(const VolvoxAIPTQPlan* plan,
@@ -972,14 +1154,15 @@ static int ptq_template_validate_layer(const VolvoxAIPTQPlan* plan,
     int expected_inputs = layer->has_bias ? 3 : 2;
     const char* output_key = NULL;
     cJSON* params = node ? cJSON_GetObjectItemCaseSensitive(node, "params") : NULL;
-    const char* layout = layer->kind == VX_PTQ_LAYER_QLINEAR
-        ? "OUT_IN" : "OHWI";
     cJSON* layout_json = cJSON_IsObject(params)
         ? cJSON_GetObjectItemCaseSensitive(params, "weight_layout") : NULL;
+    int params_valid = layer->kind == VX_PTQ_LAYER_QLINEAR
+        ? cJSON_IsObject(params) && cJSON_GetArraySize(params) == 0
+        : cJSON_IsString(layout_json) && layout_json->valuestring &&
+          !strcmp(layout_json->valuestring, "OHWI");
     if (!cJSON_IsObject(node) || !ptq_json_string_is(node, "opType", op) ||
         !cJSON_IsObject(inputs) || cJSON_GetArraySize(inputs) != expected_inputs ||
-        !cJSON_IsString(layout_json) || !layout_json->valuestring ||
-        strcmp(layout_json->valuestring, layout) ||
+        !params_valid ||
         ptq_json_activation_input(node, layer->kind, layer->input_name) != 0 ||
         !ptq_json_string_is(inputs, "weight", layer->packed_weight) ||
         (layer->has_bias && !ptq_json_string_is(inputs, "bias", layer->packed_bias)) ||
@@ -1031,60 +1214,6 @@ static int ptq_engine_source_f32(const SafetensorsFile* source_file,
     *ndim_out = tensor->ndim;
     *count_out = tensor->numel;
     return 0;
-}
-
-static int ptq_add_authoring_metadata(cJSON* root,
-                                      const VolvoxAIPTQPlan* plan) {
-    if (cJSON_GetObjectItemCaseSensitive(root, "ptq_authoring")) return -1;
-    cJSON* metadata = cJSON_CreateObject();
-    cJSON* tensors = cJSON_CreateObject();
-    cJSON* samples = cJSON_CreateArray();
-    if (!metadata || !tensors || !samples ||
-        ptq_json_add_owned(metadata, "format",
-                           cJSON_CreateString("volvoxai-native-ptq-plan-v1")) != 0 ||
-        ptq_json_add_owned(metadata, "calibration_samples",
-                           cJSON_CreateNumber((double)plan->calibration_samples)) != 0)
-        goto fail;
-    for (int32_t index = 0; index < plan->sample_name_count; index++) {
-        cJSON* name = cJSON_CreateString(plan->sample_names[index]);
-        if (!name || !cJSON_AddItemToArray(samples, name)) {
-            cJSON_Delete(name);
-            goto fail;
-        }
-    }
-    if (ptq_json_add_owned(metadata, "samples", samples) != 0) {
-        samples = NULL; /* ptq_json_add_owned deleted it. */
-        goto fail;
-    }
-    samples = NULL;
-    for (int32_t index = 0; index < plan->tensor_count; index++) {
-        const VxPTQPlanTensor* tensor = &plan->tensors[index];
-        cJSON* entry = cJSON_CreateObject();
-        if (!entry ||
-            ptq_json_add_owned(entry, "observed_min",
-                               cJSON_CreateNumber(tensor->observer.minimum)) != 0 ||
-            ptq_json_add_owned(entry, "observed_max",
-                               cJSON_CreateNumber(tensor->observer.maximum)) != 0 ||
-            ptq_json_add_owned(entry, "sample_count",
-                               cJSON_CreateNumber((double)tensor->observer.sample_count)) != 0) {
-            cJSON_Delete(entry);
-            goto fail;
-        }
-        if (ptq_json_add_owned(tensors, tensor->name, entry) != 0) goto fail;
-    }
-    if (ptq_json_add_owned(metadata, "tensors", tensors) != 0) {
-        tensors = NULL; /* ptq_json_add_owned deleted it. */
-        goto fail_no_tensors;
-    }
-    tensors = NULL;
-    if (ptq_json_add_owned(root, "ptq_authoring", metadata) != 0) return -1;
-    return 0;
-fail:
-    cJSON_Delete(samples);
-    cJSON_Delete(tensors);
-fail_no_tensors:
-    cJSON_Delete(metadata);
-    return -1;
 }
 
 static int ptq_output_path_available(const char* path) {
@@ -1351,7 +1480,7 @@ static int ptq_validate_loaded_layer_locked(const VxPTQPlanLayer* layer) {
           !volvoxai_engine_tensor_is_model_weight_locked(layer->source_bias))))
         return -1;
     if (layer->kind == VX_PTQ_LAYER_QLINEAR) {
-        if (!ptq_explicit_layout(node->params, "weight_layout", "OUT_IN") ||
+        if (!ptq_explicit_layout(node->params, "weight_layout", "dout_din") ||
             weight->ndim != 2 || input->ndim <= 0 ||
             !ptq_tensor_prefix_matches(input, output) ||
             input->shape[input->ndim - 1] != weight->shape[1] ||
@@ -1382,11 +1511,8 @@ static int ptq_layer_basic_shapes(cJSON* root, cJSON* node,
         if (weight_ndim != 2 || input_rank <= 0 || output_rank != input_rank ||
             input_channels != weight_shape[1]) return -1;
         for (int index = 0; index < input_rank - 1; index++) {
-            int input_dim = 0;
-            int output_dim = 0;
-            if (ptq_json_shape_dim(input_shape, index, &input_dim) != 0 ||
-                ptq_json_shape_dim(output_shape, index, &output_dim) != 0 ||
-                input_dim != output_dim) return -1;
+            if (!ptq_json_shape_axis_equal(input_shape, output_shape, index))
+                return -1;
         }
         return 0;
     }
@@ -1408,7 +1534,9 @@ static int ptq_layer_basic_shapes(cJSON* root, cJSON* node,
         input_channels % groups || output_channels % groups) return -1;
     int input_dimensions[4] = {0};
     int output_dimensions[4] = {0};
-    for (int index = 0; index < 4; index++) {
+    if (!ptq_json_shape_axis_equal(input_shape, output_shape, 0)) return -1;
+    input_dimensions[0] = output_dimensions[0] = 1;
+    for (int index = 1; index < 4; index++) {
         if (ptq_json_shape_dim(input_shape, index, &input_dimensions[index]) != 0 ||
             ptq_json_shape_dim(output_shape, index, &output_dimensions[index]) != 0)
             return -1;
@@ -1450,7 +1578,7 @@ static int ptq_layer_basic_shapes(cJSON* root, cJSON* node,
 static int ptq_plan_write_package_locked(
     const VolvoxAIPTQPlan* plan,
     const volvoxai_ptq_package_options_t* options) {
-    if (!plan || !options || options->struct_size < sizeof(*options) ||
+    if (!plan || !options || options->struct_size != sizeof(*options) ||
         !ptq_plan_is_current_locked(plan) ||
         volvoxai_engine_adapter_effect_active_locked() ||
         !plan->calibration_samples || !plan->tensor_count || !plan->layer_count ||
@@ -1668,8 +1796,7 @@ static int ptq_plan_write_package_locked(
             safetensors_find_tensor(&weights, layer->source_bias) &&
             safetensors_remove_tensor(&weights, layer->source_bias) != 0) goto done;
     }
-    if (ptq_add_authoring_metadata(root, plan) != 0) goto done;
-
+    if (ptq_set_authoring_metadata(&weights, options) != 0) goto done;
     char* graph_text = cJSON_PrintUnformatted(root);
     char staged_graph[PATH_MAX];
     char staged_weights[PATH_MAX];

@@ -12,6 +12,7 @@ import argparse
 import contextlib
 import json
 import os
+import re
 import sys
 from pathlib import Path
 from typing import Any, Callable, Mapping, Optional, Sequence
@@ -87,16 +88,6 @@ def _parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
-        "--image-normalization",
-        action="append",
-        dest="image_normalizations",
-        metavar="INPUT=MODE",
-        help=(
-            "Declare image preprocessing for one canonical exported input; MODE "
-            "is zero-one, minus-one-one, or raw-255. Repeat for multiple inputs."
-        ),
-    )
-    parser.add_argument(
         "--target",
         action="append",
         dest="targets",
@@ -109,6 +100,23 @@ def _parser() -> argparse.ArgumentParser:
         action="append",
         metavar="NAME=DIMxDIM...",
         help="Bind one unresolved public input shape; repeat for multiple inputs.",
+    )
+    parser.add_argument(
+        "--dimension-bound",
+        action="append",
+        metavar="SYMBOL=MIN:MAX[:MULTIPLE]",
+        help=(
+            "Preserve one ONNX dim_param with explicit positive bounds; repeat "
+            "for every symbolic public dimension."
+        ),
+    )
+    parser.add_argument(
+        "--anonymous-dimension-bound",
+        action="append",
+        metavar="INPUT:AXIS=SYMBOL:MIN:MAX[:MULTIPLE]",
+        help=(
+            "Name and bound one anonymous ONNX public-input axis."
+        ),
     )
     parser.add_argument(
         "--input-dtype",
@@ -140,6 +148,51 @@ def _parser() -> argparse.ArgumentParser:
         help=(
             "Keep imported static-QDQ layout structure intact so a later "
             "explicit graph-optimizer stage can run structural fusion first."
+        ),
+    )
+    parser.add_argument(
+        "--allow-silu-numerical-migration",
+        action="store_true",
+        help=(
+            "Explicitly fuse only canonical F32 x*sigmoid(x) regions into "
+            "SiLU kernel boundaries. This changes an evaluation boundary and "
+            "is disabled by default."
+        ),
+    )
+    parser.add_argument(
+        "--allow-quantized-bias-folding-migration",
+        action="store_true",
+        help=(
+            "Explicitly fold only immutable F32 post-biases into existing "
+            "QLinear/QMatMul/QGemm accumulators. This changes a rounding "
+            "boundary and is disabled by default."
+        ),
+    )
+    parser.add_argument(
+        "--allow-static-qdq-qbatch-matmul-migration",
+        action="store_true",
+        help=(
+            "Explicitly fuse only closed no-broadcast QDQ BatchMatMul "
+            "islands into QBatchMatMul after proving scalar affines and "
+            "the complete integer domain. Disabled by default."
+        ),
+    )
+    parser.add_argument(
+        "--allow-static-qdq-groupnorm-silu-migration",
+        action="store_true",
+        help=(
+            "Explicitly fuse only closed DQ/GroupNorm/layout/SiLU/Q "
+            "islands into QGroupNorm/layout/QSiLU using existing scalar "
+            "endpoint affines. Disabled by default."
+        ),
+    )
+    parser.add_argument(
+        "--enable-exact-common-subexpression-elimination",
+        action="store_true",
+        help=(
+            "Share repeated Reshape/Expand computations only after proving "
+            "identical inputs, parameters, and output descriptors. Disabled "
+            "by default."
         ),
     )
     parser.add_argument("--report", metavar="PATH|-", help="Write a deterministic exporter report.")
@@ -211,6 +264,65 @@ def _shape_binding(value: str) -> list[int]:
     if not dimensions or any(not token.isdigit() or int(token) <= 0 for token in dimensions):
         raise ValueError("shape dimensions must be positive integers separated by 'x'")
     return [int(token) for token in dimensions]
+
+
+def _dimension_bound(value: str) -> dict[str, int]:
+    fields = value.split(":")
+    if len(fields) not in {2, 3} or any(
+        not field.isdigit() or int(field) <= 0 for field in fields
+    ):
+        raise ValueError("dimension bounds must be MIN:MAX[:MULTIPLE] positive integers")
+    minimum, maximum = (int(fields[0]), int(fields[1]))
+    if minimum > maximum:
+        raise ValueError("dimension bound minimum must not exceed maximum")
+    result = {"min": minimum, "max": maximum}
+    if len(fields) == 3:
+        multiple = int(fields[2])
+        if ((minimum + multiple - 1) // multiple) * multiple > maximum:
+            raise ValueError("dimension bound contains no value satisfying MULTIPLE")
+        result["multiple_of"] = multiple
+    return result
+
+
+def _anonymous_dimension_bound(value: str) -> dict[str, Any]:
+    fields = value.split(":", 1)
+    if (
+        len(fields) != 2
+        or re.fullmatch(r"[A-Za-z][A-Za-z0-9_]{0,63}", fields[0]) is None
+    ):
+        raise ValueError(
+            "anonymous dimension bounds must be SYMBOL:MIN:MAX[:MULTIPLE]"
+        )
+    return {"name": fields[0], **_dimension_bound(fields[1])}
+
+
+def _anonymous_axis_bindings(
+    values: Mapping[str, Any],
+) -> dict[tuple[str, int], Any]:
+    result: dict[tuple[str, int], Any] = {}
+    for key, descriptor in values.items():
+        if ":" not in key:
+            raise UsageError(Diagnostic(
+                "VXCLI004",
+                "--anonymous-dimension-bound key must be INPUT:AXIS",
+                "cli",
+            ))
+        input_name, axis_token = key.rsplit(":", 1)
+        if not input_name or not axis_token.isdigit():
+            raise UsageError(Diagnostic(
+                "VXCLI004",
+                "--anonymous-dimension-bound key must be INPUT:AXIS with a nonnegative axis",
+                "cli",
+            ))
+        normalized = (input_name, int(axis_token))
+        if normalized in result and result[normalized] != descriptor:
+            raise UsageError(Diagnostic(
+                "VXCLI005",
+                f"conflicting anonymous dimension bound for {normalized!r}",
+                "cli",
+            ))
+        result[normalized] = descriptor
+    return result
 
 
 def _dtype_binding(value: str) -> str:
@@ -289,6 +401,97 @@ def _node_summary(graph: Mapping[str, Any]) -> list[dict[str, Any]]:
     return result
 
 
+def _merge_source_report(
+    report: ExportReport, source_report: Mapping[str, Any],
+) -> None:
+    """Project frontend/typed-pass evidence into the stable v1 report fields."""
+
+    def source_identifier(value: str) -> str:
+        # ONNX commonly names graph nodes with a leading slash. Make the
+        # namespace explicit so package privacy audits cannot mistake a source
+        # identifier for a host absolute path.
+        return f"source-node:{value}"
+
+    node_sources = source_report.get("node_sources")
+    if isinstance(node_sources, list):
+        preliminary: list[dict[str, Any]] = []
+        for item in node_sources:
+            if not isinstance(item, Mapping):
+                continue
+            source_node = item.get("source_node")
+            source_op = item.get("source_op")
+            if isinstance(source_node, str) and isinstance(source_op, str):
+                preliminary.append({
+                    "name": source_identifier(source_node),
+                    "op": source_op,
+                    "classification": "lowered",
+                })
+        report.preliminary_nodes = preliminary
+
+    features = source_report.get("features")
+    if isinstance(features, Mapping):
+        for name, entries in features.items():
+            if not isinstance(name, str) or not isinstance(entries, list):
+                continue
+            evidence: list[str] = []
+            for entry in entries:
+                if isinstance(entry, str):
+                    evidence.append(source_identifier(entry))
+                elif isinstance(entry, Mapping):
+                    source_node = entry.get("source_node")
+                    if isinstance(source_node, str):
+                        evidence.append(source_identifier(source_node))
+            report.features[name] = evidence
+
+    abi_changes = source_report.get("abi_changes")
+    if isinstance(abi_changes, list) and all(
+        isinstance(item, Mapping) for item in abi_changes
+    ):
+        report.abi_changes = [dict(item) for item in abi_changes]
+
+    optimizer = source_report.get("typed_optimizer")
+    if not isinstance(optimizer, Mapping):
+        return
+    pipeline = optimizer.get("pipeline")
+    if isinstance(pipeline, Mapping):
+        recipe = pipeline.get("recipe")
+        selected = (
+            recipe.get("selection_features")
+            if isinstance(recipe, Mapping)
+            else pipeline.get("selection_features")
+        )
+        if isinstance(selected, list) and all(
+            isinstance(item, str) for item in selected
+        ):
+            report.features["optimizer_selection"] = list(selected)
+    runs = optimizer.get("runs")
+    if not isinstance(runs, list):
+        return
+    for run in runs:
+        if not isinstance(run, Mapping):
+            continue
+        name = run.get("pass")
+        changes = run.get("changes")
+        if (
+            not isinstance(name, str)
+            or isinstance(changes, bool)
+            or not isinstance(changes, int)
+            or changes <= 0
+        ):
+            continue
+        evidence = [f"changes={changes}"]
+        metrics = run.get("metrics")
+        if isinstance(metrics, Mapping):
+            evidence.extend(
+                f"{key}={metrics[key]}"
+                for key in sorted(metrics)
+                if isinstance(key, str)
+                and isinstance(metrics[key], (int, float, str))
+                and not isinstance(metrics[key], bool)
+            )
+        report.features.setdefault(f"optimizer_pass:{name}", []).extend(evidence)
+
+
 def _report_destination(args: argparse.Namespace) -> Optional[str]:
     if args.report is not None:
         return args.report
@@ -365,6 +568,18 @@ def main(export_callback: ExportCallback, argv: Optional[Sequence[str]] = None) 
         input_shapes = _key_value_bindings(
             args.input_shape, option="--input-shape", parse=_shape_binding
         )
+        dimension_bounds = _key_value_bindings(
+            args.dimension_bound,
+            option="--dimension-bound",
+            parse=_dimension_bound,
+        )
+        anonymous_dimension_bounds = _anonymous_axis_bindings(
+            _key_value_bindings(
+                args.anonymous_dimension_bound,
+                option="--anonymous-dimension-bound",
+                parse=_anonymous_dimension_bound,
+            )
+        )
         input_dtypes = _key_value_bindings(
             args.input_dtype, option="--input-dtype", parse=_dtype_binding
         )
@@ -382,6 +597,14 @@ def main(export_callback: ExportCallback, argv: Optional[Sequence[str]] = None) 
             requested_targets=requested_targets,
             resolved_targets=resolved_targets,
         )
+        source_report: dict[str, Any] = {}
+
+        def capture_source_report(value: Mapping[str, Any]) -> None:
+            if not isinstance(value, Mapping):
+                raise TypeError("source report callback requires a mapping")
+            detached = json.loads(json.dumps(value, sort_keys=True, allow_nan=False))
+            source_report.clear()
+            source_report.update(detached)
 
         with PackageStage(Path(args.out)) as stage:
             try:
@@ -394,15 +617,32 @@ def main(export_callback: ExportCallback, argv: Optional[Sequence[str]] = None) 
                         str(stage.staged_output),
                         weight_dtype=args.weight_dtype,
                         output_names=args.output_names,
-                        image_normalizations=args.image_normalizations,
                         input_shapes=input_shapes,
+                        dimension_bounds=dimension_bounds,
+                        anonymous_dimension_bounds=anonymous_dimension_bounds,
                         input_dtypes=input_dtypes,
                         output_dtypes=output_dtypes,
                         specialize_inputs=specialize_inputs,
                         quant_mode=args.quant_mode,
+                        allow_silu_numerical_migration=(
+                            args.allow_silu_numerical_migration
+                        ),
+                        allow_quantized_bias_folding_numerical_migration=(
+                            args.allow_quantized_bias_folding_migration
+                        ),
+                        allow_static_qdq_qbatch_matmul_numerical_migration=(
+                            args.allow_static_qdq_qbatch_matmul_migration
+                        ),
+                        allow_static_qdq_groupnorm_silu_numerical_migration=(
+                            args.allow_static_qdq_groupnorm_silu_migration
+                        ),
                         enable_static_qdq_layout_optimization=not (
                             args.defer_static_qdq_layout_optimization
                         ),
+                        enable_exact_common_subexpression_elimination=(
+                            args.enable_exact_common_subexpression_elimination
+                        ),
+                        report_callback=capture_source_report,
                     )
             except ExporterError:
                 raise
@@ -416,23 +656,9 @@ def main(export_callback: ExportCallback, argv: Optional[Sequence[str]] = None) 
             graph = _load_staged_graph(stage.directory / "graph.json")
             weights, metadata = _load_staged_weights(stage.staged_output)
             reject_legacy_safetensors_metadata(metadata)
+            _merge_source_report(report, source_report)
             report.final_nodes = _node_summary(graph)
             report.package_class = classify_package(graph, weights)
-            source = graph.get("source")
-            if isinstance(source, Mapping):
-                features = source.get("features")
-                if isinstance(features, Mapping):
-                    report.features = {
-                        str(name): [
-                            str(item.get("source_node", item)) if isinstance(item, Mapping) else str(item)
-                            for item in items
-                        ]
-                        for name, items in features.items()
-                        if isinstance(items, list)
-                    }
-                abi_changes = source.get("abi_changes")
-                if isinstance(abi_changes, list):
-                    report.abi_changes = [dict(item) for item in abi_changes if isinstance(item, Mapping)]
             validation = validate_graph(graph, requested_targets, weights=weights)
             report.extend(validation.diagnostics)
 

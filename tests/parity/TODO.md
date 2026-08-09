@@ -15,15 +15,12 @@ Trainer created from a Model.
 
 ## Operator and graph coverage
 
-- [ ] Add isolated Gather, GatherElements, Where, Split, TopK, and Cast cases.
-      Fixtures must include real integer indices, both condition branches, and
-      every declared output.
-- [ ] Add NonMaxSuppression, RoPE, CrossSDPA, and CrossAttention.
+- [ ] Add isolated GatherElements and TopK cases. Fixtures must include real
+      integer indices and every declared output.
+- [ ] Add NonMaxSuppression, RoPE, and CrossAttention.
 - [ ] Add Conv1D, ConvTranspose2D, Resize, and Interpolate1D.
 - [ ] Add MoELinear, MoERouter, and SSMScan.
-- [ ] Add one isolated case for each shipping Q operation:
-      QLinear, QGemm, QConv2D, QSDPA, QLayerNorm, QGroupNorm, QGELU, QSiLU,
-      QEmbedding, QArgMax, QMaskedMean, QAdd, and RequantizeLinear.
+- [ ] Add isolated QConv2D, QAdd, and RequantizeLinear cases.
 - [ ] Give every added case an independent reference implementation and
       explicit tolerances.
 
@@ -33,10 +30,10 @@ unsupported result.
 
 ## Training parity
 
-Training cases must create a Model, then call:
+Training cases must create an immutable bounded snapshot, then call:
 
 ~~~javascript
-const trainer = await VolvoxAI.createTrainer(model, {
+const trainer = await VolvoxAI.createTrainer(sourceSnapshot, {
   backend: 'cpu', // or 'wasm' / 'webgpu'
 });
 ~~~
@@ -47,7 +44,7 @@ const trainer = await VolvoxAI.createTrainer(model, {
       remain unchanged after another step.
 - [ ] Verify every step remains private, including completed, accumulation-only,
       and failed steps.
-- [ ] Verify `commit()` publishes exactly one successor revision and
+- [ ] Verify `commit()` returns exactly one immutable successor revision and
       `rollback()` restores the last committed baseline without publication.
 - [ ] Compile before and after a commit and prove each CompiledModel remains
       pinned to its own revision.
@@ -100,14 +97,35 @@ provider/device, revision, route, and per-output comparison.
 
 ## Physical GPU campaign
 
-- [ ] Run WebGPU, native Vulkan, and native OpenGL L1/L2 matrices.
-- [ ] Run TinyStories and EfficientDet F32/W8A8 model cases.
-- [ ] Byte-compare true-integer GPU outputs where exact arithmetic is required.
-- [ ] Run decode/KV-cache and WebGPU training subsets.
-- [ ] Seal all required job results into one campaign summary.
+- [x] Run the final-source physical WebGPU whole-model, L1/L2, portable-closure,
+      and KV-cache campaign and seal every required execution result.
+- [ ] Byte-compare true-integer WebGPU outputs where exact arithmetic is
+      required.
+- [ ] Run the physical WebGPU training subset.
+- [x] Seal native Vulkan/OpenGL whole-model capability probes separately from
+      executed parity, with exact policy, registry, adapter, package, source,
+      campaign, and compile-rejection evidence.
 
 The persistent GPU runner must execute trusted repository revisions only. A
-required hardware job never accepts a software adapter or CPU route.
+required execution job never accepts a software adapter or CPU route. A native
+capability skip is accepted only when the generated registry still declares
+the route unqualified and strict compilation returns the exact declared
+`BACKEND_UNSUPPORTED` reason; it never counts as numerical parity.
+
+## Native GPU execution qualification
+
+- [ ] Complete public bounded-domain proof for native Vulkan and OpenGL.
+- [ ] Qualify their exporter routes in the authoritative kernel registry and
+      regenerate its projections.
+- [ ] Replace capability skips with required whole-model execution when the
+      registry and runtime both attest support.
+- [ ] Run native Vulkan/OpenGL L1/L2 matrices and harden EfficientDet GPU
+      consensus to seal strict no-fallback lifecycle evidence.
+
+`parity_native_gpu_matrix` remains a future/manual qualification command.
+`parity_gpu_consensus` is a future/manual diagnostic until these criteria and
+its lifecycle-evidence hardening are satisfied; both are intentionally outside
+the dynamic-v1 required execution campaign.
 
 ## Commands
 
@@ -119,6 +137,9 @@ make parity_backward
 make parity_decode
 make parity_kvcache
 make parity_webgpu_matrix
+make parity_portable_webgpu
+make parity_native_gpu
 make parity_native_gpu_matrix
+make parity_gpu_consensus
 make parity_gpu_required
 ~~~

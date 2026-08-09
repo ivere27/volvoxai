@@ -7,7 +7,7 @@ import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
 
-import { Graph } from '../ts/core/Graph.js';
+import { RuntimeGraph } from '../ts/core/RuntimeGraph.js';
 import { CPUEngine } from '../ts/backends/CPUEngine.js';
 import { WasmEngine } from '../ts/backends/WasmEngine.js';
 
@@ -26,7 +26,7 @@ async function buildForwardWasm(directory) {
 }
 
 function castGraph(inputDtype, outputDtype, to) {
-  const graph = new Graph();
+  const graph = new RuntimeGraph();
   const input = graph.addInput('input', [4], inputDtype);
   const { out } = graph.addOp('Cast', { input }, {
     out: { name: 'out', shape: [4], dtype: outputDtype },
@@ -36,7 +36,7 @@ function castGraph(inputDtype, outputDtype, to) {
 }
 
 function dequantGraph(inputDtype, zeroDtype) {
-  const graph = new Graph();
+  const graph = new RuntimeGraph();
   const input = graph.addInput('input', [4], inputDtype);
   const zeroPoint = graph.addInput('zero', [1], zeroDtype);
   const scale = graph.addWeight('scale', [1], 'float32', { buffer: Float32Array.of(0.25) });
@@ -48,7 +48,7 @@ function dequantGraph(inputDtype, zeroDtype) {
 }
 
 function quantizeGraph(outputDtype, zeroDtype, zeroValue) {
-  const graph = new Graph();
+  const graph = new RuntimeGraph();
   const input = graph.addInput('input', [10], 'float32');
   const zeroPoint = graph.addInput('zero', [1], zeroDtype);
   const scale = graph.addWeight('scale', [1], 'float32', { buffer: Float32Array.of(0.25) });

@@ -7,17 +7,14 @@
  */
 
 import {
-  TinyReceiptCharVocab,
-} from './TinyReceiptW8A8Session.js';
-import {
   TinyReceiptSplitSession,
-  TINY_RECEIPT_SPLIT_PACKAGE_FORMAT,
+  TINY_RECEIPT_SPLIT_KV_PACKAGE_FORMAT,
 } from './TinyReceiptSplitSession.js';
 
 const RESULT_SCHEMA = 'volvoxai.tiny-receipt-split-e2e-result/v1';
 const REFERENCE_SCHEMA = 'volvoxai.tiny-receipt-split-e2e-reference/v1';
 const FIXTURE_SCHEMA = 'volvoxai.tiny-receipt-split-e2e-fixture/v1';
-const WORKLOAD_ID = 'synthetic-exact-f32-v1';
+const WORKLOAD_ID = 'synthetic-exact-f32-kv-v1';
 const BACKENDS = Object.freeze(['cpu', 'wasm', 'webgpu']);
 const FAMILY_ORDER = Object.freeze([
   'phone', 'address', 'store', 'item_row', 'item_math', 'item_lookup', 'math', 'other',
@@ -25,8 +22,14 @@ const FAMILY_ORDER = Object.freeze([
 const IMAGE_WIDTH = 672;
 const IMAGE_HEIGHT = 320;
 const QUESTION_LENGTH = 192;
-const DECODER_LENGTH = 192;
+const VOCABULARY_SIZE = 1536;
+const CACHE_HEADS = 8;
+const CACHE_HEAD_WIDTH = 40;
+const PAST_CACHE_NAMES = Object.freeze(
+  [...Array(4).keys()].flatMap((layer) => [`past_k_${layer}`, `past_v_${layer}`]),
+);
 const IMAGE_SHA256 = '028acedd12b13cfcd706b8c364f41e82dd80fd34218e61612e31c0c9ad5474fa';
+const SOURCE_FORMAT = 'tiny_receipt_vqa_split_kv_onnx_v1';
 
 export const TINY_RECEIPT_SPLIT_E2E_WORKLOAD = Object.freeze({
   id: WORKLOAD_ID,
@@ -200,18 +203,12 @@ export function requireTinyReceiptPhysicalAdapterIdentity(
   return Object.freeze(identity);
 }
 
-function checkedTokenIds(
-  values,
-  label,
-  maximumLength = DECODER_LENGTH,
-  vocabularySize = null,
-) {
+function checkedTokenIds(values, label, maximumLength, vocabularySize) {
   if (!Array.isArray(values) || values.length > maximumLength ||
       values.some((value) => !Number.isSafeInteger(value) || value < 0 ||
-        (vocabularySize != null && value >= vocabularySize))) {
-    const suffix = vocabularySize == null ? 'non-negative token IDs'
-      : `token IDs from 0 through ${vocabularySize - 1}`;
-    fail(`${label} must contain ${suffix}.`);
+        value >= vocabularySize)) {
+    fail(`${label} must contain at most ${maximumLength} token IDs from 0 through ${
+      vocabularySize - 1}.`);
   }
   return values;
 }
@@ -224,39 +221,47 @@ function familyId(value) {
 }
 
 export function createTinyReceiptSplitE2EBindings({
-  vocab: suppliedVocab = null,
-  itos,
-  tokenIds = { pad: 0, bos: 1, eos: 2, unk: 3 },
+  vocab,
   workload = TINY_RECEIPT_SPLIT_E2E_WORKLOAD,
-  decoderPrefix = [],
 } = {}) {
   const normalized = normalizedWorkload(workload);
-  const vocab = suppliedVocab ?? new TinyReceiptCharVocab(itos, tokenIds);
-  if (!Array.isArray(vocab?.itos) || vocab.itos.length === 0 ||
+  if (!Array.isArray(vocab?.itos) || vocab.itos.length !== VOCABULARY_SIZE ||
       typeof vocab.encodeQuestion !== 'function' ||
-      !Number.isInteger(vocab.pad) || !Number.isInteger(vocab.bos)) {
-    fail('vocab must expose itos, PAD/BOS IDs, and encodeQuestion().');
+      vocab.pad !== 0 || vocab.bos !== 1 || vocab.eos !== 2 || vocab.unk !== 3 ||
+      vocab.type !== 'byte_fallback_bpe' || vocab.version !== 1 ||
+      !/^[0-9a-f]{64}$/.test(vocab.tokenizerHash || '')) {
+    fail('vocab must expose the canonical 1536-token byte_fallback_bpe v1 contract.');
   }
-  const question = vocab.encodeQuestion(normalized.prompt, QUESTION_LENGTH);
+  const question = checkedTokenIds(
+    [...vocab.encodeQuestion(normalized.prompt, QUESTION_LENGTH)],
+    'encoded question',
+    QUESTION_LENGTH,
+    VOCABULARY_SIZE,
+  );
+  if (question.length === 0 || question.at(-1) !== vocab.eos) {
+    fail('encoded question must be non-empty and terminate with EOS.');
+  }
   const questionIds = new Int32Array(QUESTION_LENGTH);
   questionIds.fill(vocab.pad);
   questionIds.set(question);
-  const prefix = checkedTokenIds(
-    [...decoderPrefix],
-    'decoderPrefix',
-    DECODER_LENGTH - 1,
-    vocab.itos.length,
+  const questionPositionIds = Int32Array.from(
+    { length: QUESTION_LENGTH },
+    (_unused, index) => index,
   );
-  const decoderInputIds = new Int32Array(DECODER_LENGTH);
-  decoderInputIds.fill(vocab.pad);
-  decoderInputIds[0] = vocab.bos;
-  decoderInputIds.set(prefix, 1);
+  const pastCaches = Object.freeze(Object.fromEntries(PAST_CACHE_NAMES.map((name) => [
+    name,
+    new Float32Array(CACHE_HEADS * CACHE_HEAD_WIDTH),
+  ])));
   return Object.freeze({
     image: createTinyReceiptSplitE2EImage(),
     questionTokenIds: Object.freeze([...question]),
     questionIds,
+    questionPositionIds,
     familyIds: new Int32Array([familyId(normalized.family)]),
-    decoderInputIds,
+    decoderInputIds: Int32Array.of(vocab.bos),
+    positionIds: Int32Array.of(0),
+    pastPaddingMask: Int32Array.of(1),
+    pastCaches,
   });
 }
 
@@ -301,17 +306,18 @@ async function packageIdentity(session, fetchImpl, verifyAssets) {
     entries.push([name, digest]);
   }
   const assets = Object.freeze(Object.fromEntries(entries));
-  const vocabularyBytes = new TextEncoder().encode(canonicalJson(session.vocab.itos));
-  const semanticTokenizerHash = session.vocab.tokenizerHash == null
-    ? null
-    : sha256String(session.vocab.tokenizerHash, 'BPE tokenizer hash');
+  const semanticTokenizerHash = sha256String(
+    session.vocab.tokenizerHash,
+    'BPE tokenizer hash',
+  );
+  const format = nonEmptyString(packageInfo.format, 'package format');
+  if (format !== TINY_RECEIPT_SPLIT_KV_PACKAGE_FORMAT) {
+    fail('package format is not the qualified explicit-KV ABI.');
+  }
   return Object.freeze({
-    format: TINY_RECEIPT_SPLIT_PACKAGE_FORMAT,
+    format,
     assets,
-    // BPE's release fingerprint covers itos, ranked merges, boundaries, and
-    // byte/unused declarations. Legacy char-vocab references retain their
-    // historical canonical-itos digest.
-    vocabularySha256: semanticTokenizerHash || await sha256(vocabularyBytes),
+    vocabularySha256: semanticTokenizerHash,
   });
 }
 
@@ -352,11 +358,16 @@ function strictProviderSummary(diagnostics, backend, decoderSteps, minimumDecode
   if (execution.length !== decoderSteps + 1) {
     fail(`expected one encoder plus ${decoderSteps} decoder executions, received ${execution.length}.`);
   }
+  // The encoder and every one-token explicit-cache decoder call are ordinary
+  // executions and must stay on the same strict context and backend.
   for (const [index, report] of execution.entries()) {
     if (report?.outcome !== 'success' || report.backend !== backend ||
         report.operatorFallback !== 'none' ||
         report.decodeState?.operation !== 'execute') {
-      fail(`execution ${index} did not remain on strict '${backend}'.`);
+      fail(`execution ${index} did not remain on strict '${backend}': ` +
+        JSON.stringify({ outcome: report?.outcome, backend: report?.backend,
+          operatorFallback: report?.operatorFallback,
+          decodeState: report?.decodeState }));
     }
     strictRoute(report.routeEvidence, `execution ${index}`);
   }
@@ -444,14 +455,14 @@ function validateReferenceShape(reference) {
     'kind', 'sourceFormat', 'sourceVariant', 'provider', 'description',
   ], 'reference.provenance');
   if (reference.provenance.kind !== 'onnx-runtime-oracle' ||
-      reference.provenance.sourceFormat !== 'tiny_receipt_vqa_split_onnx_v1' ||
+      reference.provenance.sourceFormat !== SOURCE_FORMAT ||
       reference.provenance.sourceVariant !== 'int8-w8a8') {
     fail('reference provenance must identify the split INT8 ONNX Runtime oracle.');
   }
   nonEmptyString(reference.provenance.provider, 'reference.provenance.provider');
   nonEmptyString(reference.provenance.description, 'reference.provenance.description');
   exactKeys(reference.package, ['format', 'assets', 'vocabularySha256'], 'reference.package');
-  if (reference.package.format !== TINY_RECEIPT_SPLIT_PACKAGE_FORMAT) {
+  if (reference.package.format !== TINY_RECEIPT_SPLIT_KV_PACKAGE_FORMAT) {
     fail('reference package format is invalid.');
   }
   exactKeys(reference.package.assets, [
@@ -485,8 +496,18 @@ function validateReferenceShape(reference) {
     'questionTokenIds', 'questionTokenIdsSha256', 'tokenIds', 'tokenIdsSha256',
     'textUtf8Sha256', 'stoppedAtEos', 'routerLogits',
   ], 'reference.expected');
-  checkedTokenIds(reference.expected.questionTokenIds, 'reference expected questionTokenIds');
-  checkedTokenIds(reference.expected.tokenIds, 'reference expected tokenIds', 4);
+  checkedTokenIds(
+    reference.expected.questionTokenIds,
+    'reference expected questionTokenIds',
+    QUESTION_LENGTH,
+    VOCABULARY_SIZE,
+  );
+  checkedTokenIds(
+    reference.expected.tokenIds,
+    'reference expected tokenIds',
+    TINY_RECEIPT_SPLIT_E2E_WORKLOAD.maxNewTokens,
+    VOCABULARY_SIZE,
+  );
   if (reference.expected.questionTokenIds.length === 0 ||
       reference.expected.tokenIds.length < reference.workload.minimumDecoderSteps ||
       FAMILY_ORDER[reference.expected.familyId] !== reference.expected.family ||
@@ -589,16 +610,26 @@ function compareReference(report, reference) {
 
 function apiContracts(api) {
   if (!api?.VolvoxAI || typeof api.VolvoxAI.createRuntime !== 'function' ||
-      typeof api.Graph !== 'function' || typeof api.GraphLoader?.load !== 'function' ||
-      typeof api.ReadOnlySafetensorsCache !== 'function') {
-    fail('api must expose VolvoxAI, Graph, GraphLoader, and ReadOnlySafetensorsCache.');
+      typeof api.ModelLoader?.load !== 'function' ||
+      typeof api.Model?.capture !== 'function') {
+    fail('api must expose VolvoxAI, ModelLoader, and Model.');
   }
 }
 
+class SafetensorsCache {
+  constructor() { this._entries = new Map(); }
+  get size() { return this._entries.size; }
+  async load(source, loader) {
+    if (!this._entries.has(source)) this._entries.set(source, Promise.resolve().then(loader));
+    return this._entries.get(source);
+  }
+  clear() { this._entries.clear(); }
+}
+
 /**
- * Own the complete Runtime -> two Models -> two Contexts lifecycle, execute the
- * fixed workload, validate strict provider evidence, and compare with an
- * independently produced ONNX Runtime oracle.
+ * Own the complete Runtime -> two Models -> two CompiledModels
+ * -> two ExecutionContexts lifecycle, execute the fixed workload, validate
+ * strict provider evidence, and compare with an independent ONNX Runtime oracle.
  */
 export async function runTinyReceiptSplitE2E({
   api,
@@ -638,17 +669,18 @@ export async function runTinyReceiptSplitE2E({
         diagnostics.push(event);
       },
     });
-    cache = new api.ReadOnlySafetensorsCache();
+    const Cache = api.SafetensorsCache ?? SafetensorsCache;
+    cache = new Cache();
     session = await sessionClass.load({
       runtime,
       packageUrl,
       fetch: fetchImpl,
-      safetensorsCache: cache,
       compileOptions: {
         backend: { mode: 'require', backend, operatorFallback: 'forbid' },
       },
-      graphLoader: ({ graphUrl, weightsUrl, fetch, safetensorsCache }) =>
-        api.GraphLoader.load(new api.Graph(), weightsUrl, {
+      safetensorsCache: cache,
+      snapshotLoader: async ({ graphUrl, weightsUrl, fetch, safetensorsCache }) =>
+        await api.Model.load(weightsUrl, {
           graphUrl,
           fetch,
           safetensorsCache,
@@ -802,15 +834,53 @@ export function createTinyReceiptSplitE2EReference(report, {
 export async function createTinyReceiptSplitE2EFixtureManifest(bindings, fileRecords) {
   if (!(bindings?.image instanceof Float32Array) ||
       !(bindings?.questionIds instanceof Int32Array) ||
+      !(bindings?.questionPositionIds instanceof Int32Array) ||
       !(bindings?.familyIds instanceof Int32Array) ||
-      !(bindings?.decoderInputIds instanceof Int32Array)) {
+      !(bindings?.decoderInputIds instanceof Int32Array) ||
+      !(bindings?.positionIds instanceof Int32Array) ||
+      !(bindings?.pastPaddingMask instanceof Int32Array) ||
+      !isRecord(bindings?.pastCaches) ||
+      PAST_CACHE_NAMES.some((name) => !(bindings.pastCaches[name] instanceof Float32Array)) ||
+      bindings.image.length !== IMAGE_HEIGHT * IMAGE_WIDTH ||
+      bindings.questionIds.length !== QUESTION_LENGTH ||
+      bindings.questionPositionIds.length !== QUESTION_LENGTH ||
+      bindings.familyIds.length !== 1 || bindings.decoderInputIds.length !== 1 ||
+      bindings.positionIds.length !== 1 || bindings.pastPaddingMask.length !== 1 ||
+      bindings.familyIds[0] !== -1 || bindings.decoderInputIds[0] !== 1 ||
+      bindings.positionIds[0] !== 0 || bindings.pastPaddingMask[0] !== 1 ||
+      !Array.isArray(bindings.questionTokenIds) || bindings.questionTokenIds.length < 1 ||
+      bindings.questionTokenIds.length > QUESTION_LENGTH ||
+      bindings.questionTokenIds.at(-1) !== 2 ||
+      bindings.questionTokenIds.some((value) =>
+        !Number.isSafeInteger(value) || value < 0 || value >= VOCABULARY_SIZE) ||
+      bindings.questionIds.some((value, index) =>
+        value !== (index < bindings.questionTokenIds.length
+          ? bindings.questionTokenIds[index] : 0)) ||
+      bindings.questionPositionIds.some((value, index) => value !== index) ||
+      bindings.image.some((value) => !Number.isFinite(value)) ||
+      PAST_CACHE_NAMES.some((name) =>
+        bindings.pastCaches[name].length !== CACHE_HEADS * CACHE_HEAD_WIDTH ||
+        bindings.pastCaches[name].some((value) => value !== 0))) {
     fail('fixture bindings are invalid.');
   }
   const definitions = [
     ['image', bindings.image, 'float32', [1, 1, IMAGE_HEIGHT, IMAGE_WIDTH], float32Bytes],
     ['question_ids', bindings.questionIds, 'int32', [1, QUESTION_LENGTH], int32Bytes],
+    [
+      'question_position_ids', bindings.questionPositionIds,
+      'int32', [1, QUESTION_LENGTH], int32Bytes,
+    ],
     ['family_ids', bindings.familyIds, 'int32', [1], int32Bytes],
-    ['decoder_input_ids', bindings.decoderInputIds, 'int32', [1, DECODER_LENGTH], int32Bytes],
+    ['decoder_input_ids', bindings.decoderInputIds, 'int32', [1, 1], int32Bytes],
+    ['position_ids', bindings.positionIds, 'int32', [1], int32Bytes],
+    ['past_padding_mask', bindings.pastPaddingMask, 'int32', [1, 1], int32Bytes],
+    ...PAST_CACHE_NAMES.map((name) => [
+      name,
+      bindings.pastCaches[name],
+      'float32',
+      [1, CACHE_HEADS, 1, CACHE_HEAD_WIDTH],
+      float32Bytes,
+    ]),
   ];
   const tensors = {};
   for (const [name, value, dtype, shape, encoder] of definitions) {
@@ -850,8 +920,15 @@ export function tinyReceiptSplitE2ERawBytes(bindings) {
   return Object.freeze({
     image: float32Bytes(bindings.image),
     question_ids: int32Bytes(bindings.questionIds),
+    question_position_ids: int32Bytes(bindings.questionPositionIds),
     family_ids: int32Bytes(bindings.familyIds),
     decoder_input_ids: int32Bytes(bindings.decoderInputIds),
+    position_ids: int32Bytes(bindings.positionIds),
+    past_padding_mask: int32Bytes(bindings.pastPaddingMask),
+    ...Object.fromEntries(PAST_CACHE_NAMES.map((name) => [
+      name,
+      float32Bytes(bindings.pastCaches[name]),
+    ])),
   });
 }
 

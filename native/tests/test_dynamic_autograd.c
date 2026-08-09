@@ -452,7 +452,7 @@ static int test_linear_and_embedding(void) {
     };
     VolvoxAIAutogradTensor* y = apply_op(
         context, "Linear", linear_inputs, 3, y_shape, 2,
-        "{\"weight_layout\":\"IN_OUT\"}");
+        "{\"weight_layout\":\"din_dout\"}");
     CHECK(y != NULL);
     CHECK(copy_f32(y, values, 6) == 0);
     const float expected_y[6] = {9.5f, 11.5f, 16, 19.5f, 25.5f, 34};
@@ -540,6 +540,86 @@ static int test_transpose_default(void) {
         CHECK(near_f32(gradient[i], expected_gradient[i]));
     volvoxai_autograd_context_destroy(context);
     return 0;
+}
+
+static int run_maxpool_canonical_pads(int backend) {
+    const int32_t input_shape[4] = {1, 2, 3, 1};
+    const int32_t output_shape[4] = {1, 2, 2, 1};
+    const int32_t wrong_output_shape[4] = {1, 2, 1, 1};
+    const float input_data[6] = {1, 5, 2, 4, 3, 6};
+    const float seed[4] = {1, 2, 3, 4};
+    const float expected_output[4] = {5, 2, 5, 6};
+    const float expected_gradient[6] = {0, 4, 2, 0, 0, 4};
+    static const char* const invalid_pads[] = {
+        "{\"kernel\":[2,2],\"stride\":[1,2],\"pads\":[-1,0,0,1]}",
+        "{\"kernel\":[2,2],\"stride\":[1,2],\"pads\":[1,-1,0,1]}",
+        "{\"kernel\":[2,2],\"stride\":[1,2],\"pads\":[1,0,-1,1]}",
+        "{\"kernel\":[2,2],\"stride\":[1,2],\"pads\":[1,0,0,-1]}",
+        "{\"kernel\":[2,2],\"stride\":[1,2],\"pads\":[1,0,1]}",
+    };
+    const char* params =
+        "{\"kernel\":[2,2],\"stride\":[1,2],\"pads\":[1,0,0,1],"
+        "\"dilation\":[1,1],\"ceil_mode\":false,\"data_layout\":\"NHWC\"}";
+    float output_data[4] = {0};
+    float gradient[6] = {0};
+    VolvoxAIAutogradContext* context = make_context(backend);
+    CHECK(context != NULL);
+    VolvoxAIAutogradTensor* input = make_f32(
+        context, input_data, input_shape, 4, 1);
+    CHECK(input != NULL);
+    const volvoxai_autograd_input_t inputs[1] = {{"input", input}};
+#if defined(VOLVOXAI_CUDA_TESTING)
+    uint64_t launches_before = backend == VOLVOXAI_BACKEND_CUDA
+        ? cuda_test_launch_count() : 0u;
+#endif
+
+    /* Candidate validation uses the shared GPU-plan geometry checker even on
+       CPU. Every malformed four-sided pad and a bottom/right-dependent output
+       mismatch must roll back without publishing a tensor or leaf gradient. */
+    for (size_t index = 0;
+         index < sizeof(invalid_pads) / sizeof(invalid_pads[0]); index++) {
+        CHECK(apply_op(context, "MaxPool2D", inputs, 1, output_shape, 4,
+                       invalid_pads[index]) == NULL);
+        CHECK(volvoxai_autograd_tensor_copy_grad(input, gradient, 6) != 0);
+#if defined(VOLVOXAI_CUDA_TESTING)
+        if (backend == VOLVOXAI_BACKEND_CUDA)
+            CHECK(cuda_test_launch_count() == launches_before);
+#endif
+    }
+    CHECK(apply_op(context, "MaxPool2D", inputs, 1, wrong_output_shape, 4,
+                   params) == NULL);
+    CHECK(volvoxai_autograd_tensor_copy_grad(input, gradient, 6) != 0);
+#if defined(VOLVOXAI_CUDA_TESTING)
+    if (backend == VOLVOXAI_BACKEND_CUDA)
+        CHECK(cuda_test_launch_count() == launches_before);
+#endif
+
+    VolvoxAIAutogradTensor* output = apply_op(
+        context, "MaxPool2D", inputs, 1, output_shape, 4, params);
+    CHECK(output != NULL);
+#if defined(VOLVOXAI_CUDA_TESTING)
+    uint64_t launches_after_forward = backend == VOLVOXAI_BACKEND_CUDA
+        ? cuda_test_launch_count() : 0u;
+    if (backend == VOLVOXAI_BACKEND_CUDA)
+        CHECK(launches_after_forward > launches_before);
+#endif
+    CHECK(copy_f32(output, output_data, 4) == 0);
+    for (int index = 0; index < 4; index++)
+        CHECK(near_f32(output_data[index], expected_output[index]));
+    CHECK(volvoxai_autograd_backward(context, output, seed, 4, 0) == 0);
+#if defined(VOLVOXAI_CUDA_TESTING)
+    if (backend == VOLVOXAI_BACKEND_CUDA)
+        CHECK(cuda_test_launch_count() > launches_after_forward);
+#endif
+    CHECK(volvoxai_autograd_tensor_copy_grad(input, gradient, 6) == 0);
+    for (int index = 0; index < 6; index++)
+        CHECK(near_f32(gradient[index], expected_gradient[index]));
+    volvoxai_autograd_context_destroy(context);
+    return 0;
+}
+
+static int test_maxpool_canonical_pads(void) {
+    return run_maxpool_canonical_pads(VOLVOXAI_BACKEND_CPU);
 }
 
 static int test_nondifferentiable_input_roles(void) {
@@ -872,7 +952,7 @@ static int test_cuda_eager_weight_slot_lifetime(void) {
     };
     VolvoxAIAutogradTensor* y = apply_op(
         context, "Linear", linear_inputs, 3, y_shape, 2,
-        "{\"weight_layout\":\"IN_OUT\"}");
+        "{\"weight_layout\":\"din_dout\"}");
     CHECK(y != NULL);
 #if defined(VOLVOXAI_CUDA_TESTING)
     CHECK(cuda_test_graph_slot_count() > 0u);
@@ -903,7 +983,7 @@ static int test_cuda_eager_weight_slot_lifetime(void) {
         {"input", x}, {"weight", weight}, {"bias", bias},
     };
     y = apply_op(context, "Linear", reused_inputs, 3, y_shape, 2,
-                 "{\"weight_layout\":\"IN_OUT\"}");
+                 "{\"weight_layout\":\"din_dout\"}");
     CHECK(y != NULL);
 #if defined(VOLVOXAI_CUDA_TESTING)
     CHECK(cuda_test_graph_resident_weight_slot_count() ==
@@ -931,7 +1011,7 @@ static int test_cuda_eager_weight_slot_lifetime(void) {
         cuda_test_graph_resident_weight_slot_count();
 #endif
     y = apply_op(context, "Linear", unrecorded_inputs, 3, y_shape, 2,
-                 "{\"weight_layout\":\"IN_OUT\"}");
+                 "{\"weight_layout\":\"din_dout\"}");
     CHECK(y != NULL);
 #if defined(VOLVOXAI_CUDA_TESTING)
     CHECK(cuda_test_graph_slot_count() > 0u);
@@ -961,6 +1041,10 @@ static int test_cuda_parity_optional(void) {
         puts("CUDA device unavailable; skipping dynamic-autograd CUDA parity");
         return 0;
     }
+    CHECK(run_maxpool_canonical_pads(VOLVOXAI_BACKEND_CUDA) == 0);
+#if defined(VOLVOXAI_CUDA_TESTING)
+    CHECK(cuda_test_caller_context_is_clear());
+#endif
     CHECK(test_cuda_eager_weight_slot_lifetime() == 0);
     VolvoxAIAutogradContext* context = make_context(VOLVOXAI_BACKEND_CUDA);
     CHECK(context != NULL);
@@ -1116,7 +1200,7 @@ static int test_cuda_parity_optional(void) {
 #endif
     VolvoxAIAutogradTensor* linear_y = apply_op(
         context, "Linear", linear_inputs, 3, linear_y_shape, 2,
-        "{\"weight_layout\":\"IN_OUT\"}");
+        "{\"weight_layout\":\"din_dout\"}");
     CHECK(linear_y != NULL);
 #if defined(VOLVOXAI_CUDA_TESTING)
     uint64_t linear_launches_after_forward = cuda_test_launch_count();
@@ -1168,6 +1252,7 @@ int main(void) {
     CHECK(test_context_lifecycle_exclusion() == 0);
     CHECK(test_linear_and_embedding() == 0);
     CHECK(test_transpose_default() == 0);
+    CHECK(test_maxpool_canonical_pads() == 0);
     CHECK(test_nondifferentiable_input_roles() == 0);
     CHECK(test_moe_linear_i32_cpu() == 0);
     CHECK(test_schema_shape_preflight() == 0);

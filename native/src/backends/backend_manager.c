@@ -37,6 +37,10 @@ static void cleanup_backend(VolvoxAIEngineBackend backend) {
     switch (backend) {
         case VOLVOXAI_BACKEND_VULKAN:
 #if VOLVOXAI_ENABLE_VULKAN
+            /* Drops this engine state's context only. The shared device is not
+             * released here: vx_model_compile unloads its scratch engine state
+             * through this path, so releasing would rebuild the whole device
+             * before execute. It is torn down at process exit instead. */
             vk_cleanup();
 #endif
             break;

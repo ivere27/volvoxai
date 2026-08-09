@@ -1,6 +1,7 @@
 #include "opengl_engine.h"
 #include "engine_internal.h"
 #include "shader_store.h"
+#include "batch_matmul_f32_plan.h"
 #include "expand_f32_plan.h"
 #include "qbatch_matmul_plan.h"
 #include "qlinear_multiplier.h"
@@ -39,6 +40,7 @@ typedef struct {
 } OglProgramCacheEntry;
 
 #define OGL_MAX_PROGRAM_CACHE 256
+#define OGL_GRAPH_MAX_TENSORS 4096
 
 #define GL_VENDOR 0x1F00
 #define GL_RENDERER 0x1F01
@@ -62,6 +64,7 @@ typedef struct {
 #define GL_MAX_COMPUTE_WORK_GROUP_COUNT 0x91BE
 #define GL_MAX_COMPUTE_WORK_GROUP_SIZE 0x91BF
 #define GL_MAX_COMPUTE_WORK_GROUP_INVOCATIONS 0x90EB
+#define GL_NO_ERROR 0
 
 typedef void* EGLDisplay;
 typedef void* EGLContext;
@@ -102,6 +105,9 @@ typedef unsigned int EGLBoolean;
 typedef struct {
     pthread_mutex_t mutex;
     unsigned reference_count;
+    /* The EGL context is shared across engine states and released at process
+     * exit, so the teardown hook is registered exactly once. */
+    int exit_hook_registered;
     void* gl_lib;
     void* egl_lib;
     EGLDisplay egl_display;
@@ -113,13 +119,13 @@ typedef struct {
     GLint max_compute_groups[3];
     GLint max_compute_group_size[3];
     GLint max_compute_invocations;
+    GLint64 max_ssbo_block_size;
+    GLint64 max_uniform_block_size;
     int qconv_tiled_enabled;
     int profile_sync;
 #if VOLVOXAI_ENABLE_TRAINING
     GLint max_compute_ssbo_blocks;
     GLint max_compute_uniform_blocks;
-    GLint64 max_ssbo_block_size;
-    GLint64 max_uniform_block_size;
 #endif
     EGLDisplay (*p_eglGetDisplay)(void*);
     EGLDisplay (*p_eglGetPlatformDisplayEXT)(EGLint, void*, const EGLint*);
@@ -136,9 +142,8 @@ typedef struct {
     const GLubyte* (*p_glGetString)(GLenum);
     void (*p_glGetIntegerv)(GLenum, GLint*);
     void (*p_glGetIntegeri_v)(GLenum, GLuint, GLint*);
-#if VOLVOXAI_ENABLE_TRAINING
     void (*p_glGetInteger64v)(GLenum, GLint64*);
-#endif
+    GLenum (*p_glGetError)(void);
     GLuint (*p_glCreateShader)(GLenum);
     void (*p_glShaderSource)(GLuint, GLsizei, const GLchar* const*, const GLint*);
     void (*p_glCompileShader)(GLuint);
@@ -155,6 +160,7 @@ typedef struct {
     void (*p_glGenBuffers)(GLsizei, GLuint*);
     void (*p_glBindBuffer)(GLenum, GLuint);
     void (*p_glBufferData)(GLenum, GLsizeiptr, const void*, GLenum);
+    void (*p_glBufferSubData)(GLenum, GLintptr, GLsizeiptr, const void*);
     void (*p_glBindBufferBase)(GLenum, GLuint, GLuint);
     void (*p_glDeleteBuffers)(GLsizei, const GLuint*);
     void (*p_glDispatchCompute)(GLuint, GLuint, GLuint);
@@ -189,13 +195,13 @@ static OpenGLDeviceState g_opengl_device_state = {
 #define max_compute_groups OGL_DEVICE_FIELD(max_compute_groups)
 #define max_compute_group_size OGL_DEVICE_FIELD(max_compute_group_size)
 #define max_compute_invocations OGL_DEVICE_FIELD(max_compute_invocations)
+#define max_ssbo_block_size OGL_DEVICE_FIELD(max_ssbo_block_size)
+#define max_uniform_block_size OGL_DEVICE_FIELD(max_uniform_block_size)
 #define qconv_tiled_enabled OGL_DEVICE_FIELD(qconv_tiled_enabled)
 #define profile_sync OGL_DEVICE_FIELD(profile_sync)
 #if VOLVOXAI_ENABLE_TRAINING
 #define max_compute_ssbo_blocks OGL_DEVICE_FIELD(max_compute_ssbo_blocks)
 #define max_compute_uniform_blocks OGL_DEVICE_FIELD(max_compute_uniform_blocks)
-#define max_ssbo_block_size OGL_DEVICE_FIELD(max_ssbo_block_size)
-#define max_uniform_block_size OGL_DEVICE_FIELD(max_uniform_block_size)
 #endif
 #define p_eglGetDisplay OGL_DEVICE_FIELD(p_eglGetDisplay)
 #define p_eglGetPlatformDisplayEXT OGL_DEVICE_FIELD(p_eglGetPlatformDisplayEXT)
@@ -212,9 +218,8 @@ static OpenGLDeviceState g_opengl_device_state = {
 #define p_glGetString OGL_DEVICE_FIELD(p_glGetString)
 #define p_glGetIntegerv OGL_DEVICE_FIELD(p_glGetIntegerv)
 #define p_glGetIntegeri_v OGL_DEVICE_FIELD(p_glGetIntegeri_v)
-#if VOLVOXAI_ENABLE_TRAINING
 #define p_glGetInteger64v OGL_DEVICE_FIELD(p_glGetInteger64v)
-#endif
+#define p_glGetError OGL_DEVICE_FIELD(p_glGetError)
 #define p_glCreateShader OGL_DEVICE_FIELD(p_glCreateShader)
 #define p_glShaderSource OGL_DEVICE_FIELD(p_glShaderSource)
 #define p_glCompileShader OGL_DEVICE_FIELD(p_glCompileShader)
@@ -231,6 +236,7 @@ static OpenGLDeviceState g_opengl_device_state = {
 #define p_glGenBuffers OGL_DEVICE_FIELD(p_glGenBuffers)
 #define p_glBindBuffer OGL_DEVICE_FIELD(p_glBindBuffer)
 #define p_glBufferData OGL_DEVICE_FIELD(p_glBufferData)
+#define p_glBufferSubData OGL_DEVICE_FIELD(p_glBufferSubData)
 #define p_glBindBufferBase OGL_DEVICE_FIELD(p_glBindBufferBase)
 #define p_glDeleteBuffers OGL_DEVICE_FIELD(p_glDeleteBuffers)
 #define p_glDispatchCompute OGL_DEVICE_FIELD(p_glDispatchCompute)
@@ -259,17 +265,19 @@ void opengl_set_shader_root(const char* root) {
     }
 }
 
-#define OGL_GRAPH_MAX_TENSORS 4096
-
 typedef struct {
     const void* host;
     size_t bytes;
     size_t cap;
+    size_t domain_capacity;
     GLuint buffer;
+    uint64_t shape_generation;
+    uint64_t capacity_generation;
     int host_dirty;
     int device_dirty;
     int is_weight;
     int owns_buffer;
+    int domain_span;
 } OglTensorSlot;
 
 /* NULL canonical QConv2D biases use an output-channel-sized, zero-filled host
@@ -291,6 +299,16 @@ typedef struct {
     GLuint qlayernorm_scratch_buffer;
     size_t qlayernorm_scratch_capacity;
     QConvZeroBiasBacking* qconv_zero_bias_storage;
+    char* shape_signature;
+    uint64_t shape_generation;
+    uint64_t capacity_generation;
+    size_t domain_span_count;
+    size_t domain_qgroupnorm_stats_bytes;
+    size_t domain_qlayernorm_stats_bytes;
+    int domain_enforced;
+#ifdef VOLVOX_OPENGL_TESTING
+    int test_domain_allocation_failure_after;
+#endif
 #if VOLVOXAI_ENABLE_TRAINING
     OglTensorSlot training_slot_storage[OGL_GRAPH_MAX_TENSORS];
     int training_slots_count;
@@ -304,6 +322,7 @@ typedef struct {
 
 static OpenGLContextState* opengl_context_state_get(int create);
 static void opengl_context_state_destroy(void* opaque_state);
+static uint64_t opengl_generation_next(uint64_t generation);
 
 #define graph_slots (opengl_context_state_get(0)->graph_slot_storage)
 #define graph_slot_count (opengl_context_state_get(0)->graph_slots_count)
@@ -322,6 +341,7 @@ static void qconv_zero_bias_release_state(OpenGLContextState* state);
 
 /* Binding 3 of qSDPAInt8 is always an I32 keep-mask buffer. */
 static const int32_t qsdpa_dummy_mask[1] = {0};
+static const float linear_dummy_scale[1] = {1.0f};
 
 static const OglKernel k_copy = {"copy", OGL_SHADER_DIR "/copy.comp", 3, 2};
 static const OglKernel k_add = {"addRelu", OGL_SHADER_DIR "/addRelu.comp", 4, 3};
@@ -345,6 +365,10 @@ static const OglKernel k_globalavg = {"globalAveragePool", OGL_SHADER_DIR "/glob
 static const OglKernel k_avgpool = {"averagePool2D", OGL_SHADER_DIR "/averagePool2D.comp", 3, 2};
 static const OglKernel k_batchnorm = {"batchNorm2D", OGL_SHADER_DIR "/batchNorm2D.comp", 7, 6};
 static const OglKernel k_embedding = {"embedding", OGL_SHADER_DIR "/embedding.comp", 4, 3};
+/* Bindings 0-5 storage, 6 uniform params, 7 the resident-slot table. */
+static const OglKernel k_moe_linear = {"moeLinear", OGL_SHADER_DIR "/moeLinear.comp", 8, 6};
+/* Bindings 0-4 storage, 5 uniform params. */
+static const OglKernel k_moe_router = {"moeRouter", OGL_SHADER_DIR "/moeRouter.comp", 6, 5};
 static const OglKernel k_transpose = {"generalTranspose", OGL_SHADER_DIR "/generalTranspose.comp", 3, -1};
 static const OglKernel k_where = {"where", OGL_SHADER_DIR "/where.comp", 5, 4};
 static const OglKernel k_typed_control_32 = {"typedControl32Native", OGL_SHADER_DIR "/typedControl32Native.comp", 4, -1};
@@ -352,6 +376,7 @@ static const OglKernel k_where_32 = {"where32Native", OGL_SHADER_DIR "/where32Na
 static const OglKernel k_argmax_f32_i32 = {"argMaxF32I32Native", OGL_SHADER_DIR "/argMaxF32I32Native.comp", 3, 2};
 static const OglKernel k_concat_32 = {"concatCopy32Native", OGL_SHADER_DIR "/concatCopy32Native.comp", 3, 2};
 static const OglKernel k_expand = {"expand", OGL_SHADER_DIR "/expand.comp", 3, 2};
+static const OglKernel k_batch_matmul = {"batchMatMul", OGL_SHADER_DIR "/batchMatMul.comp", 4, -1};
 static const OglKernel k_pad = {"pad", OGL_SHADER_DIR "/pad.comp", 3, 2};
 static const OglKernel k_slice = {"slice", OGL_SHADER_DIR "/slice.comp", 3, 2};
 static const OglKernel k_gather = {"gather", OGL_SHADER_DIR "/gather.comp", 4, 3};
@@ -423,6 +448,8 @@ static const OglKernel k_conv2d_pw16 = {"conv2DPointwise16", OGL_SHADER_DIR "/co
 static const OglKernel k_conv2d_pw16tile = {"conv2DPointwise16Tile", OGL_SHADER_DIR "/conv2DPointwise16Tile.comp", 5, 4};
 static const OglKernel k_matmul = {"linearF32RowMajor", OGL_SHADER_DIR "/linearF32RowMajor.comp", 5, 4};
 static const OglKernel k_matmul_tiled = {"linearF32RowMajorTiled", OGL_SHADER_DIR "/linearF32RowMajorTiled.comp", 5, 4};
+static const OglKernel k_matmul_out_in = {"linearF32", OGL_SHADER_DIR "/linearF32.comp", 6, 5};
+static const OglKernel k_matmul_out_in_tiled = {"linearF32Tiled", OGL_SHADER_DIR "/linearF32Tiled.comp", 6, 5};
 
 #if VOLVOXAI_ENABLE_TRAINING
 #define OGL_TRAINING_MAX_BINDINGS 16
@@ -499,6 +526,11 @@ static OpenGLContextState* opengl_context_state_get(int create) {
     if (!state && create) {
         state = (OpenGLContextState*)calloc(1, sizeof(*state));
         if (!state) return NULL;
+        state->shape_generation = 1;
+        state->capacity_generation = 1;
+#ifdef VOLVOX_OPENGL_TESTING
+        state->test_domain_allocation_failure_after = -1;
+#endif
         owner->opengl_context_state = state;
         owner->opengl_context_state_destroy = opengl_context_state_destroy;
     }
@@ -565,6 +597,50 @@ int opengl_get_compute_capability(OpenGLComputeCapability* out) {
         : (OpenGLComputeCapability){OPENGL_COMPUTE_API_NONE, 0, 0, 0};
     if (!owns_lock) opengl_device_unlock();
     return 0;
+}
+
+int opengl_query_domain_limits(OpenGLDomainLimits* limits) {
+    OpenGLContextState* state = opengl_context_state_get(0);
+    int owns_lock;
+    int ready = 0;
+    if (!limits) return -1;
+    memset(limits, 0, sizeof(*limits));
+    if (!state || !state->device_acquired) return -1;
+    owns_lock = state->forward_active || state->transient_active
+#if VOLVOXAI_ENABLE_TRAINING
+        || state->training_is_active
+#endif
+        ;
+    if (!owns_lock) opengl_device_lock();
+    if (compute_capability.compute_supported && max_ssbo_block_size > 0 &&
+        max_uniform_block_size > 0) {
+        limits->maximum_storage_buffer_bytes =
+            (uint64_t)max_ssbo_block_size;
+        limits->maximum_uniform_buffer_bytes =
+            (uint64_t)max_uniform_block_size;
+        for (size_t axis = 0; axis < 3u; axis++) {
+            limits->maximum_workgroups[axis] =
+                (uint32_t)max_compute_groups[axis];
+            limits->maximum_workgroup_size[axis] =
+                (uint32_t)max_compute_group_size[axis];
+        }
+        limits->maximum_workgroup_invocations =
+            (uint32_t)max_compute_invocations;
+        limits->maximum_storage_bindings = (uint32_t)max_ssbo_bindings;
+        limits->maximum_uniform_bindings = (uint32_t)max_uniform_bindings;
+        limits->maximum_tensor_slots = OGL_GRAPH_MAX_TENSORS;
+        ready = limits->maximum_workgroups[0] > 0u &&
+            limits->maximum_workgroups[1] > 0u &&
+            limits->maximum_workgroups[2] > 0u &&
+            limits->maximum_workgroup_size[0] > 0u &&
+            limits->maximum_workgroup_size[1] > 0u &&
+            limits->maximum_workgroup_size[2] > 0u &&
+            limits->maximum_workgroup_invocations > 0u &&
+            limits->maximum_storage_bindings > 0u &&
+            limits->maximum_uniform_bindings > 0u;
+    }
+    if (!owns_lock) opengl_device_unlock();
+    return ready ? 0 : -1;
 }
 
 static int parse_gl_version(const char* version, OpenGLComputeApi* api, int* major, int* minor) {
@@ -642,9 +718,8 @@ static int load_gl(void) {
     compute_capability.compute_supported = 0;
     LOAD_GL(glGetIntegerv);
     LOAD_GL(glGetIntegeri_v);
-#if VOLVOXAI_ENABLE_TRAINING
     LOAD_GL(glGetInteger64v);
-#endif
+    LOAD_GL(glGetError);
     LOAD_GL(glCreateShader);
     LOAD_GL(glShaderSource);
     LOAD_GL(glCompileShader);
@@ -661,6 +736,7 @@ static int load_gl(void) {
     LOAD_GL(glGenBuffers);
     LOAD_GL(glBindBuffer);
     LOAD_GL(glBufferData);
+    LOAD_GL(glBufferSubData);
     LOAD_GL(glBindBufferBase);
     LOAD_GL(glDeleteBuffers);
     LOAD_GL(glDispatchCompute);
@@ -677,11 +753,11 @@ static int load_gl(void) {
     p_glGetIntegerv(GL_MAX_SHADER_STORAGE_BUFFER_BINDINGS, &max_ssbo_bindings);
     p_glGetIntegerv(GL_MAX_UNIFORM_BUFFER_BINDINGS, &max_uniform_bindings);
     p_glGetIntegerv(GL_MAX_COMPUTE_WORK_GROUP_INVOCATIONS, &max_compute_invocations);
+    p_glGetInteger64v(GL_MAX_SHADER_STORAGE_BLOCK_SIZE, &max_ssbo_block_size);
+    p_glGetInteger64v(GL_MAX_UNIFORM_BLOCK_SIZE, &max_uniform_block_size);
 #if VOLVOXAI_ENABLE_TRAINING
     p_glGetIntegerv(GL_MAX_COMPUTE_SHADER_STORAGE_BLOCKS, &max_compute_ssbo_blocks);
     p_glGetIntegerv(GL_MAX_COMPUTE_UNIFORM_BLOCKS, &max_compute_uniform_blocks);
-    p_glGetInteger64v(GL_MAX_SHADER_STORAGE_BLOCK_SIZE, &max_ssbo_block_size);
-    p_glGetInteger64v(GL_MAX_UNIFORM_BLOCK_SIZE, &max_uniform_block_size);
 #endif
     for (GLuint axis = 0; axis < 3; axis++) {
         p_glGetIntegeri_v(GL_MAX_COMPUTE_WORK_GROUP_COUNT, axis, &max_compute_groups[axis]);
@@ -689,9 +765,9 @@ static int load_gl(void) {
     }
     if (max_ssbo_bindings <= 0 || max_uniform_bindings <= 0 || max_compute_invocations <= 0 ||
 #if VOLVOXAI_ENABLE_TRAINING
-        max_ssbo_block_size <= 0 || max_uniform_block_size <= 0 ||
         max_compute_ssbo_blocks <= 0 || max_compute_uniform_blocks <= 0 ||
 #endif
+        max_ssbo_block_size <= 0 || max_uniform_block_size <= 0 ||
         max_compute_groups[0] <= 0 ||
         max_compute_groups[1] <= 0 || max_compute_groups[2] <= 0 ||
         max_compute_group_size[0] <= 0 || max_compute_group_size[1] <= 0 ||
@@ -769,7 +845,11 @@ int opengl_init(void) {
         opengl_device_unlock();
         return 0;
     }
-    if (g_opengl_device_state.reference_count != 0) {
+    /* Key on the context itself, not the reference count. The context now
+     * outlives its last holder (compile and execute run under different engine
+     * states), so a zero count with a live context must reattach rather than
+     * build a second one. */
+    if (egl_context != EGL_NO_CONTEXT) {
         g_opengl_device_state.reference_count++;
         state->device_acquired = 1;
         opengl_device_unlock();
@@ -789,6 +869,10 @@ int opengl_init(void) {
     const GLubyte* vendor = p_glGetString(GL_VENDOR);
     const GLubyte* renderer = p_glGetString(GL_RENDERER);
     const GLubyte* version = p_glGetString(GL_VERSION);
+    if (!g_opengl_device_state.exit_hook_registered) {
+        g_opengl_device_state.exit_hook_registered = 1;
+        atexit(opengl_device_release);
+    }
     printf("[VolvoxAI GPU] OpenGL Compute initialized: %s / %s / %s\n",
            vendor ? (const char*)vendor : "unknown",
            renderer ? (const char*)renderer : "unknown",
@@ -882,20 +966,35 @@ static GLuint compile_kernel(const OglKernel* k) {
     return prog;
 }
 
+static void opengl_clear_errors(void) {
+    if (!p_glGetError) return;
+    for (int attempt = 0; attempt < 16; attempt++)
+        if (p_glGetError() == GL_NO_ERROR) break;
+}
+
 static GLuint create_buffer_target(GLenum target, size_t bytes, const void* data) {
     OpenGLContextState* state = opengl_context_state_get(0);
+    GLint64 limit = target == GL_UNIFORM_BUFFER
+        ? max_uniform_block_size : max_ssbo_block_size;
     if (!ogl_ready() || !state ||
         (!state->forward_active && !state->transient_active
 #if VOLVOXAI_ENABLE_TRAINING
          && !state->training_is_active
 #endif
-        ) || bytes == 0) return 0;
+        ) || bytes == 0 || bytes > (size_t)INTPTR_MAX || limit <= 0 ||
+        (uint64_t)bytes > (uint64_t)limit) return 0;
     GLuint b = 0;
+    opengl_clear_errors();
     p_glGenBuffers(1, &b);
     if (!b) return 0;
     p_glBindBuffer(target, b);
     p_glBufferData(target, (GLsizeiptr)bytes, data, GL_DYNAMIC_DRAW);
+    GLenum error = p_glGetError();
     p_glBindBuffer(target, 0);
+    if (error != GL_NO_ERROR) {
+        p_glDeleteBuffers(1, &b);
+        return 0;
+    }
     return b;
 }
 
@@ -904,39 +1003,76 @@ static GLuint create_buffer(size_t bytes, const void* data) {
 }
 
 static GLuint qgroupnorm_stats_ensure(size_t bytes) {
+    OpenGLContextState* state = opengl_context_state_get(0);
     GLuint next;
-    if (!ogl_ready() || bytes == 0 || bytes > (size_t)INTPTR_MAX) return 0;
+    if (!ogl_ready() || !state || bytes == 0 ||
+        bytes > (size_t)INTPTR_MAX) return 0;
     if (qgroupnorm_stats_buffer && qgroupnorm_stats_capacity >= bytes)
         return qgroupnorm_stats_buffer;
+    if (state->domain_enforced) return 0;
     next = create_buffer(bytes, NULL);
     if (!next) return 0;
     if (qgroupnorm_stats_buffer && p_glDeleteBuffers)
         p_glDeleteBuffers(1, &qgroupnorm_stats_buffer);
     qgroupnorm_stats_buffer = next;
     qgroupnorm_stats_capacity = bytes;
+    state->capacity_generation =
+        opengl_generation_next(state->capacity_generation);
     return qgroupnorm_stats_buffer;
 }
 
 static GLuint qlayernorm_stats_ensure(size_t bytes) {
+    OpenGLContextState* state = opengl_context_state_get(0);
     GLuint next;
-    if (!ogl_ready() || bytes == 0 || bytes > (size_t)INTPTR_MAX) return 0;
+    if (!ogl_ready() || !state || bytes == 0 ||
+        bytes > (size_t)INTPTR_MAX) return 0;
     if (qlayernorm_stats_buffer && qlayernorm_stats_capacity >= bytes)
         return qlayernorm_stats_buffer;
+    if (state->domain_enforced) return 0;
     next = create_buffer(bytes, NULL);
     if (!next) return 0;
     if (qlayernorm_stats_buffer && p_glDeleteBuffers)
         p_glDeleteBuffers(1, &qlayernorm_stats_buffer);
     qlayernorm_stats_buffer = next;
     qlayernorm_stats_capacity = bytes;
+    state->capacity_generation =
+        opengl_generation_next(state->capacity_generation);
     return qlayernorm_stats_buffer;
 }
 
 static int graph_find_slot(const void* host) {
+    OpenGLContextState* state = opengl_context_state_get(0);
     if (!host) return -1;
     for (int i = 0; i < graph_slot_count; i++) {
-        if (graph_slots[i].host == host) return i;
+        if (graph_slots[i].host == host &&
+            (graph_slots[i].is_weight ||
+             (state && graph_slots[i].shape_generation ==
+                           state->shape_generation))) return i;
     }
     return -1;
+}
+
+static uint64_t opengl_generation_next(uint64_t generation) {
+    generation++;
+    return generation ? generation : 1u;
+}
+
+static int graph_find_reusable_slot(size_t bytes) {
+    int best = -1;
+    int empty = -1;
+    int grow = -1;
+    for (int index = 0; index < graph_slot_count; index++) {
+        OglTensorSlot* slot = &graph_slots[index];
+        if (slot->host || slot->is_weight) continue;
+        if (!slot->owns_buffer || !slot->buffer) {
+            if (empty < 0) empty = index;
+            continue;
+        }
+        if (slot->cap >= bytes &&
+            (best < 0 || slot->cap < graph_slots[best].cap)) best = index;
+        else if (grow < 0 || slot->cap > graph_slots[grow].cap) grow = index;
+    }
+    return best >= 0 ? best : (empty >= 0 ? empty : grow);
 }
 
 static int opengl_graph_access_ensure(void) {
@@ -960,15 +1096,43 @@ static int opengl_graph_access_ensure(void) {
 static OglTensorSlot* graph_get_slot_metadata(const void* host, size_t bytes,
                                                int is_weight) {
     OpenGLContextState* state = opengl_context_state_get(0);
-    if (!state || !state->device_acquired || !host || bytes == 0) return NULL;
+    if (!state || !state->device_acquired || !host || bytes == 0 ||
+        bytes > (size_t)INTPTR_MAX || max_ssbo_block_size <= 0 ||
+        (uint64_t)bytes > (uint64_t)max_ssbo_block_size) return NULL;
     int idx = graph_find_slot(host);
+    if (state->domain_enforced) {
+        OglTensorSlot* slot = idx >= 0 ? &graph_slots[idx] : NULL;
+        if (!slot || !slot->owns_buffer || !slot->buffer ||
+            bytes > slot->cap) return NULL;
+        if (slot->domain_span) {
+            /* A public graph input may be consumed through an operator's
+             * weight/affine binding without becoming an immutable model
+             * weight.  Its pre-reserved domain slot remains mutable and is
+             * dirtied by the public binding commit before every execution. */
+            if (bytes > slot->domain_capacity) return NULL;
+            if (bytes > slot->bytes) {
+                slot->bytes = bytes;
+                slot->host_dirty = 1;
+                slot->device_dirty = 0;
+            }
+            return slot;
+        }
+        if (!slot->is_weight || !slot->host || !slot->bytes ||
+            bytes > slot->bytes) return NULL;
+        return slot;
+    }
     if (idx < 0) {
-        if (graph_slot_count >= OGL_GRAPH_MAX_TENSORS) return NULL;
-        idx = graph_slot_count++;
-        memset(&graph_slots[idx], 0, sizeof(graph_slots[idx]));
+        idx = graph_find_reusable_slot(bytes);
+        if (idx < 0) {
+            if (graph_slot_count >= OGL_GRAPH_MAX_TENSORS) return NULL;
+            idx = graph_slot_count++;
+            memset(&graph_slots[idx], 0, sizeof(graph_slots[idx]));
+        }
         graph_slots[idx].host = host;
         graph_slots[idx].host_dirty = 1;
         graph_slots[idx].is_weight = is_weight;
+        graph_slots[idx].shape_generation = is_weight ? 0 :
+            state->shape_generation;
     }
     OglTensorSlot* s = &graph_slots[idx];
     s->bytes = bytes;
@@ -983,18 +1147,51 @@ static OglTensorSlot* graph_get_slot(const void* host, size_t bytes,
 }
 
 static int slot_ensure_owned_buffer(OglTensorSlot* s, size_t bytes, const void* data) {
-    if (!s || bytes == 0) return 0;
+    OpenGLContextState* state = opengl_context_state_get(0);
+    if (!state || !s || bytes == 0 || bytes > (size_t)INTPTR_MAX ||
+        max_ssbo_block_size <= 0 ||
+        (uint64_t)bytes > (uint64_t)max_ssbo_block_size) return 0;
+    if (state->domain_enforced &&
+        (!s->owns_buffer || !s->buffer || s->cap < bytes)) return 0;
     if (!s->owns_buffer || s->buffer == 0 || s->cap < bytes) {
-        if (s->owns_buffer && s->buffer) p_glDeleteBuffers(1, &s->buffer);
-        s->buffer = create_buffer(bytes, data);
-        s->cap = bytes;
+        size_t capacity = bytes;
+        GLuint candidate;
+        if (s->owns_buffer && s->cap && s->cap <= SIZE_MAX / 2u &&
+            s->cap * 2u > capacity &&
+            (uint64_t)(s->cap * 2u) <= (uint64_t)max_ssbo_block_size)
+            capacity = s->cap * 2u;
+        candidate = create_buffer(capacity, NULL);
+        if (!candidate) return 0;
+        if (data) {
+            opengl_clear_errors();
+            p_glBindBuffer(GL_SHADER_STORAGE_BUFFER, candidate);
+            p_glBufferSubData(GL_SHADER_STORAGE_BUFFER, 0,
+                              (GLsizeiptr)bytes, data);
+            GLenum error = p_glGetError();
+            p_glBindBuffer(GL_SHADER_STORAGE_BUFFER, 0);
+            if (error != GL_NO_ERROR) {
+                p_glDeleteBuffers(1, &candidate);
+                return 0;
+            }
+        }
+        GLuint previous = s->owns_buffer ? s->buffer : 0;
+        s->buffer = candidate;
+        s->cap = capacity;
         s->owns_buffer = 1;
-        return s->buffer != 0;
+        state->capacity_generation++;
+        if (!state->capacity_generation) state->capacity_generation = 1;
+        s->capacity_generation = state->capacity_generation;
+        if (previous) p_glDeleteBuffers(1, &previous);
+        return 1;
     }
     if (data) {
+        opengl_clear_errors();
         p_glBindBuffer(GL_SHADER_STORAGE_BUFFER, s->buffer);
-        p_glBufferData(GL_SHADER_STORAGE_BUFFER, (GLsizeiptr)bytes, data, GL_DYNAMIC_DRAW);
+        p_glBufferSubData(GL_SHADER_STORAGE_BUFFER, 0,
+                          (GLsizeiptr)bytes, data);
+        GLenum error = p_glGetError();
         p_glBindBuffer(GL_SHADER_STORAGE_BUFFER, 0);
+        if (error != GL_NO_ERROR) return 0;
     }
     return 1;
 }
@@ -1020,18 +1217,26 @@ static int graph_packed_bytes(size_t logical_bytes, size_t* storage_bytes) {
 
 static OglTensorSlot* graph_ensure_packed_bytes(const void* host, size_t logical_bytes,
                                                  int is_weight) {
+    static const unsigned char zero_tail[3] = {0u, 0u, 0u};
     size_t storage_bytes;
     if (!host || !graph_packed_bytes(logical_bytes, &storage_bytes) ||
         storage_bytes > (size_t)INTPTR_MAX) return NULL;
     OglTensorSlot* s = graph_get_slot(host, storage_bytes, is_weight);
     if (!s) return NULL;
     if (s->host_dirty || s->buffer == 0 || s->cap < storage_bytes) {
-        unsigned char* packed = (unsigned char*)calloc(storage_bytes, 1);
-        if (!packed) return NULL;
-        memcpy(packed, host, logical_bytes);
-        int ok = slot_ensure_owned_buffer(s, storage_bytes, packed);
-        free(packed);
-        if (!ok) return NULL;
+        size_t tail_bytes = storage_bytes - logical_bytes;
+        if (!slot_ensure_owned_buffer(s, storage_bytes, NULL)) return NULL;
+        opengl_clear_errors();
+        p_glBindBuffer(GL_SHADER_STORAGE_BUFFER, s->buffer);
+        p_glBufferSubData(GL_SHADER_STORAGE_BUFFER, 0,
+                          (GLsizeiptr)logical_bytes, host);
+        if (tail_bytes)
+            p_glBufferSubData(GL_SHADER_STORAGE_BUFFER,
+                              (GLintptr)logical_bytes,
+                              (GLsizeiptr)tail_bytes, zero_tail);
+        GLenum error = p_glGetError();
+        p_glBindBuffer(GL_SHADER_STORAGE_BUFFER, 0);
+        if (error != GL_NO_ERROR) return NULL;
         s->host_dirty = 0;
         s->device_dirty = 0;
     }
@@ -1066,7 +1271,13 @@ static int dispatch_kernel(const OglKernel* k, GLuint* buffers, uint32_t gx,
                            uint32_t gy, uint32_t gz) {
     if (!k || !buffers || gx == 0 || gy == 0 || gz == 0 ||
         gx > (uint32_t)max_compute_groups[0] || gy > (uint32_t)max_compute_groups[1] ||
-        gz > (uint32_t)max_compute_groups[2]) return 0;
+        gz > (uint32_t)max_compute_groups[2] || k->binding_count <= 0)
+        return 0;
+    for (int i = 0; i < k->binding_count; i++) {
+        int limit = i == k->uniform_binding
+            ? max_uniform_bindings : max_ssbo_bindings;
+        if (!buffers[i] || i >= limit) return 0;
+    }
     GLuint prog = compile_kernel(k);
     if (!prog) return 0;
     if (profile_sync < 0) {
@@ -1076,7 +1287,6 @@ static int dispatch_kernel(const OglKernel* k, GLuint* buffers, uint32_t gx,
     double t0 = profile_sync ? volvoxai_engine_now_ms() : 0.0;
     p_glUseProgram(prog);
     for (int i = 0; i < k->binding_count; i++) {
-        if (!buffers[i]) return 0;
         p_glBindBufferBase(i == k->uniform_binding ? GL_UNIFORM_BUFFER : GL_SHADER_STORAGE_BUFFER,
                            (GLuint)i, buffers[i]);
     }
@@ -1444,9 +1654,387 @@ void opengl_graph_reset(void) {
     }
     memset(state->graph_slot_storage, 0, sizeof(state->graph_slot_storage));
     state->graph_slots_count = 0;
+    free(state->shape_signature);
+    state->shape_signature = NULL;
+    state->shape_generation = opengl_generation_next(state->shape_generation);
+    state->capacity_generation =
+        opengl_generation_next(state->capacity_generation);
+    state->domain_span_count = 0;
+    state->domain_qgroupnorm_stats_bytes = 0;
+    state->domain_qlayernorm_stats_bytes = 0;
+    state->domain_enforced = 0;
+#ifdef VOLVOX_OPENGL_TESTING
+    state->test_domain_allocation_failure_after = -1;
+#endif
     if (gl_current) opengl_release_current_locked();
     opengl_device_unlock();
 }
+
+int opengl_graph_bind_shape(const char* signature) {
+    OpenGLContextState* state = opengl_context_state_get(0);
+    char* candidate;
+    size_t length;
+    int ended_forward = 0;
+    if (!state || !state->device_acquired || !signature || !signature[0] ||
+        state->domain_enforced)
+        return -1;
+    if (state->shape_signature && !strcmp(state->shape_signature, signature))
+        return 0;
+#if VOLVOXAI_ENABLE_TRAINING
+    if (state->training_is_active) return -1;
+#endif
+    length = strlen(signature);
+    if (length > 1024u * 1024u) return -1;
+    candidate = (char*)malloc(length + 1u);
+    if (!candidate) return -1;
+    memcpy(candidate, signature, length + 1u);
+    if (state->forward_active) {
+        if (opengl_graph_end_forward() != 0) {
+            free(candidate);
+            return -1;
+        }
+        ended_forward = 1;
+    }
+    (void)ended_forward;
+    opengl_device_lock();
+    if (!ogl_ready() || opengl_make_current_locked() != 0) {
+        opengl_device_unlock();
+        free(candidate);
+        return -1;
+    }
+    if (p_glFinish) p_glFinish();
+    uint64_t next_generation =
+        opengl_generation_next(state->shape_generation);
+    for (int index = 0; index < state->graph_slots_count; index++) {
+        OglTensorSlot* slot = &state->graph_slot_storage[index];
+        if (slot->is_weight) continue;
+        slot->host = NULL;
+        slot->bytes = 0;
+        slot->shape_generation = next_generation;
+        slot->host_dirty = 0;
+        slot->device_dirty = 0;
+        if (!slot->owns_buffer) {
+            slot->buffer = 0;
+            slot->cap = 0;
+            slot->capacity_generation = 0;
+        }
+    }
+    free(state->shape_signature);
+    state->shape_signature = candidate;
+    state->shape_generation = next_generation;
+    opengl_release_current_locked();
+    opengl_device_unlock();
+    return 0;
+}
+
+static int opengl_graph_domain_spans_match(
+        const VolvoxAIEnginePhysicalSpan* spans,
+        size_t span_count) {
+    OpenGLContextState* state = opengl_context_state_get(0);
+    if (!state || !spans || span_count != state->domain_span_count) return 0;
+    for (size_t index = 0; index < span_count; index++) {
+        int slot_index = graph_find_slot(spans[index].host);
+        OglTensorSlot* slot;
+        if (slot_index < 0) return 0;
+        slot = &graph_slots[slot_index];
+        if (!slot->domain_span || slot->is_weight || !slot->owns_buffer ||
+            !slot->buffer || slot->domain_capacity !=
+                spans[index].capacity_bytes ||
+            slot->bytes > slot->domain_capacity)
+            return 0;
+    }
+    return 1;
+}
+
+static int opengl_domain_candidate_allocation_allowed(
+        OpenGLContextState* state) {
+#ifdef VOLVOX_OPENGL_TESTING
+    if (state->test_domain_allocation_failure_after == 0) {
+        state->test_domain_allocation_failure_after = -1;
+        return 0;
+    }
+    if (state->test_domain_allocation_failure_after > 0)
+        state->test_domain_allocation_failure_after--;
+#else
+    (void)state;
+#endif
+    return 1;
+}
+
+int opengl_graph_bind_shape_domain(
+        const char* signature,
+        const VolvoxAIEnginePhysicalSpan* spans,
+        size_t span_count,
+        size_t qgroupnorm_stats_bytes,
+        size_t qlayernorm_stats_bytes) {
+    OpenGLContextState* state = opengl_context_state_get(0);
+    char* candidate_signature = NULL;
+    GLuint* candidate_buffers = NULL;
+    GLuint candidate_qgroupnorm_stats_buffer = 0;
+    GLuint candidate_qlayernorm_stats_buffer = 0;
+    size_t signature_length;
+    int weight_count = 0;
+    int lock_held = 0;
+    int current_held = 0;
+    int result = -1;
+    uint64_t next_shape_generation;
+    uint64_t next_capacity_generation;
+    if (!state || !state->device_acquired || !signature || !signature[0] ||
+        !spans || !span_count || span_count > OGL_GRAPH_MAX_TENSORS ||
+        state->forward_active || state->transient_active)
+        return -1;
+#if VOLVOXAI_ENABLE_TRAINING
+    if (state->training_is_active) return -1;
+#endif
+    signature_length = strlen(signature);
+    if (signature_length > 1024u * 1024u) return -1;
+    if (qgroupnorm_stats_bytes > SIZE_MAX - qlayernorm_stats_bytes ||
+        (qgroupnorm_stats_bytes &&
+         (qgroupnorm_stats_bytes > (size_t)INTPTR_MAX ||
+          max_ssbo_block_size <= 0 ||
+          (uint64_t)qgroupnorm_stats_bytes >
+              (uint64_t)max_ssbo_block_size)) ||
+        (qlayernorm_stats_bytes &&
+         (qlayernorm_stats_bytes > (size_t)INTPTR_MAX ||
+          max_ssbo_block_size <= 0 ||
+          (uint64_t)qlayernorm_stats_bytes >
+              (uint64_t)max_ssbo_block_size)))
+        return -1;
+    for (size_t index = 0; index < span_count; index++) {
+        uintptr_t start = (uintptr_t)spans[index].host;
+        size_t capacity = spans[index].capacity_bytes;
+        if (!start || !capacity || start > UINTPTR_MAX - capacity ||
+            capacity > (size_t)INTPTR_MAX || max_ssbo_block_size <= 0 ||
+            (uint64_t)capacity > (uint64_t)max_ssbo_block_size ||
+            (index && (uintptr_t)spans[index - 1u].host +
+                spans[index - 1u].capacity_bytes > start))
+            return -1;
+    }
+    if (state->domain_enforced) {
+        if (!opengl_graph_domain_spans_match(spans, span_count) ||
+            qgroupnorm_stats_bytes !=
+                state->domain_qgroupnorm_stats_bytes ||
+            qlayernorm_stats_bytes !=
+                state->domain_qlayernorm_stats_bytes)
+            return -1;
+        if (state->shape_signature &&
+            !strcmp(state->shape_signature, signature)) {
+            for (int index = 0; index < state->graph_slots_count; index++) {
+                OglTensorSlot* slot = &state->graph_slot_storage[index];
+                if (!slot->domain_span) continue;
+                slot->bytes = 0;
+                slot->host_dirty = 0;
+                slot->device_dirty = 0;
+            }
+            return 0;
+        }
+        candidate_signature = (char*)malloc(signature_length + 1u);
+        if (!candidate_signature) return -2;
+        memcpy(candidate_signature, signature, signature_length + 1u);
+        opengl_device_lock();
+        lock_held = 1;
+        if (!ogl_ready() || opengl_make_current_locked() != 0) goto done;
+        current_held = 1;
+        if (p_glFinish) p_glFinish();
+        next_shape_generation =
+            opengl_generation_next(state->shape_generation);
+        for (int index = 0; index < state->graph_slots_count; index++) {
+            OglTensorSlot* slot = &state->graph_slot_storage[index];
+            if (!slot->domain_span) continue;
+            slot->shape_generation = next_shape_generation;
+            slot->bytes = 0;
+            slot->host_dirty = 0;
+            slot->device_dirty = 0;
+        }
+        free(state->shape_signature);
+        state->shape_signature = candidate_signature;
+        candidate_signature = NULL;
+        state->shape_generation = next_shape_generation;
+        result = 0;
+        goto done;
+    }
+
+    for (int index = 0; index < state->graph_slots_count; index++) {
+        OglTensorSlot* slot = &state->graph_slot_storage[index];
+        if (!slot->is_weight) continue;
+        uintptr_t weight_start = (uintptr_t)slot->host;
+        if (!weight_start || !slot->owns_buffer || !slot->buffer ||
+            !slot->bytes || slot->bytes > slot->cap ||
+            weight_start > UINTPTR_MAX - slot->bytes)
+            return -1;
+        weight_count++;
+        for (size_t span_index = 0; span_index < span_count; span_index++) {
+            uintptr_t span_start = (uintptr_t)spans[span_index].host;
+            uintptr_t span_end = span_start + spans[span_index].capacity_bytes;
+            uintptr_t weight_end = weight_start + slot->bytes;
+            if (span_start < weight_end && weight_start < span_end)
+                return -1;
+        }
+    }
+    if (span_count > (size_t)(OGL_GRAPH_MAX_TENSORS - weight_count))
+        return -1;
+    candidate_signature = (char*)malloc(signature_length + 1u);
+    candidate_buffers = (GLuint*)calloc(span_count, sizeof(*candidate_buffers));
+    if (!candidate_signature || !candidate_buffers) {
+        result = -2;
+        goto done;
+    }
+    memcpy(candidate_signature, signature, signature_length + 1u);
+    opengl_device_lock();
+    lock_held = 1;
+    if (!ogl_ready() || opengl_make_current_locked() != 0) goto done;
+    current_held = 1;
+    state->transient_active = 1;
+    if (p_glFinish) p_glFinish();
+    for (size_t index = 0; index < span_count; index++) {
+        if (!opengl_domain_candidate_allocation_allowed(state)) {
+            result = -2;
+            goto done;
+        }
+        candidate_buffers[index] =
+            create_buffer(spans[index].capacity_bytes, NULL);
+        if (!candidate_buffers[index]) {
+            result = -2;
+            goto done;
+        }
+    }
+    if (qgroupnorm_stats_bytes) {
+        if (!opengl_domain_candidate_allocation_allowed(state)) {
+            result = -2;
+            goto done;
+        }
+        candidate_qgroupnorm_stats_buffer =
+            create_buffer(qgroupnorm_stats_bytes, NULL);
+        if (!candidate_qgroupnorm_stats_buffer) {
+            result = -2;
+            goto done;
+        }
+    }
+    if (qlayernorm_stats_bytes) {
+        if (!opengl_domain_candidate_allocation_allowed(state)) {
+            result = -2;
+            goto done;
+        }
+        candidate_qlayernorm_stats_buffer =
+            create_buffer(qlayernorm_stats_bytes, NULL);
+        if (!candidate_qlayernorm_stats_buffer) {
+            result = -2;
+            goto done;
+        }
+    }
+
+    next_shape_generation =
+        opengl_generation_next(state->shape_generation);
+    next_capacity_generation =
+        opengl_generation_next(state->capacity_generation);
+    for (int index = 0; index < state->graph_slots_count; index++) {
+        OglTensorSlot* slot = &state->graph_slot_storage[index];
+        if (!slot->is_weight && slot->owns_buffer && slot->buffer)
+            p_glDeleteBuffers(1, &slot->buffer);
+    }
+    if (state->qgroupnorm_scratch_buffer)
+        p_glDeleteBuffers(1, &state->qgroupnorm_scratch_buffer);
+    state->qgroupnorm_scratch_buffer = candidate_qgroupnorm_stats_buffer;
+    state->qgroupnorm_scratch_capacity = qgroupnorm_stats_bytes;
+    candidate_qgroupnorm_stats_buffer = 0;
+    if (state->qlayernorm_scratch_buffer)
+        p_glDeleteBuffers(1, &state->qlayernorm_scratch_buffer);
+    state->qlayernorm_scratch_buffer = candidate_qlayernorm_stats_buffer;
+    state->qlayernorm_scratch_capacity = qlayernorm_stats_bytes;
+    candidate_qlayernorm_stats_buffer = 0;
+    {
+        int kept = 0;
+        int old_slot_count = state->graph_slots_count;
+        for (int index = 0; index < old_slot_count; index++) {
+            if (!state->graph_slot_storage[index].is_weight) continue;
+            if (kept != index)
+                state->graph_slot_storage[kept] =
+                    state->graph_slot_storage[index];
+            kept++;
+        }
+        if (kept < old_slot_count) {
+            memset(&state->graph_slot_storage[kept], 0,
+                   (size_t)(old_slot_count - kept) *
+                       sizeof(state->graph_slot_storage[0]));
+        }
+        state->graph_slots_count = kept;
+    }
+    for (size_t index = 0; index < span_count; index++) {
+        OglTensorSlot* slot =
+            &state->graph_slot_storage[state->graph_slots_count++];
+        memset(slot, 0, sizeof(*slot));
+        slot->host = spans[index].host;
+        slot->cap = spans[index].capacity_bytes;
+        slot->domain_capacity = spans[index].capacity_bytes;
+        slot->buffer = candidate_buffers[index];
+        candidate_buffers[index] = 0;
+        slot->shape_generation = next_shape_generation;
+        slot->capacity_generation = next_capacity_generation;
+        slot->owns_buffer = 1;
+        slot->domain_span = 1;
+    }
+    free(state->shape_signature);
+    state->shape_signature = candidate_signature;
+    candidate_signature = NULL;
+    state->shape_generation = next_shape_generation;
+    state->capacity_generation = next_capacity_generation;
+    state->domain_span_count = span_count;
+    state->domain_qgroupnorm_stats_bytes = qgroupnorm_stats_bytes;
+    state->domain_qlayernorm_stats_bytes = qlayernorm_stats_bytes;
+    state->domain_enforced = 1;
+    result = 0;
+
+done:
+    if (candidate_buffers && current_held && p_glDeleteBuffers) {
+        for (size_t index = 0; index < span_count; index++) {
+            if (candidate_buffers[index])
+                p_glDeleteBuffers(1, &candidate_buffers[index]);
+        }
+    }
+    if (current_held && p_glDeleteBuffers &&
+        candidate_qgroupnorm_stats_buffer)
+        p_glDeleteBuffers(1, &candidate_qgroupnorm_stats_buffer);
+    if (current_held && p_glDeleteBuffers &&
+        candidate_qlayernorm_stats_buffer)
+        p_glDeleteBuffers(1, &candidate_qlayernorm_stats_buffer);
+    state->transient_active = 0;
+    if (current_held) opengl_release_current_locked();
+    if (lock_held) opengl_device_unlock();
+    free(candidate_buffers);
+    free(candidate_signature);
+    return result;
+}
+
+#ifdef VOLVOX_OPENGL_TESTING
+int opengl_graph_debug_dynamic_state(OpenGLGraphDynamicStateProbe* probe) {
+    OpenGLContextState* state = opengl_context_state_get(0);
+    if (!state || !probe) return -1;
+    memset(probe, 0, sizeof(*probe));
+    probe->shape_generation = state->shape_generation;
+    probe->capacity_generation = state->capacity_generation;
+    probe->domain_span_count = state->domain_span_count;
+    probe->domain_scratch_capacity_bytes =
+        state->qgroupnorm_scratch_capacity +
+        state->qlayernorm_scratch_capacity;
+    probe->domain_enforced = state->domain_enforced;
+    probe->slot_count = state->graph_slots_count;
+    for (int index = 0; index < state->graph_slots_count; index++) {
+        OglTensorSlot* slot = &state->graph_slot_storage[index];
+        if (!slot->owns_buffer || !slot->buffer) continue;
+        if (slot->host) probe->active_capacity_bytes += slot->cap;
+        else probe->pooled_capacity_bytes += slot->cap;
+    }
+    return 0;
+}
+
+int opengl_test_fail_domain_allocation_after(size_t successful_allocations) {
+    OpenGLContextState* state = opengl_context_state_get(0);
+    if (!state || successful_allocations > (size_t)INT_MAX) return -1;
+    state->test_domain_allocation_failure_after =
+        (int)successful_allocations;
+    return 0;
+}
+#endif
 
 void opengl_graph_begin_forward(void) {
     OpenGLContextState* state = opengl_context_state_get(0);
@@ -1547,15 +2135,54 @@ done:
     return ok;
 }
 
+void opengl_graph_retain_weight(const void* host, size_t bytes) {
+    OpenGLContextState* state = opengl_context_state_get(0);
+    if (!state || !host || !bytes) return;
+    int index = graph_find_slot(host);
+    if (index < 0) return;
+    OglTensorSlot* slot = &graph_slots[index];
+    if (slot->domain_span || !slot->owns_buffer || !slot->buffer ||
+        !slot->bytes || bytes > slot->bytes || bytes > slot->cap)
+        return;
+    slot->is_weight = 1;
+    slot->shape_generation = 0;
+}
+
+void opengl_graph_demote_weight(const void* host, size_t bytes) {
+    OpenGLContextState* state = opengl_context_state_get(0);
+    int index;
+    OglTensorSlot* slot;
+    if (!state || !host || !bytes) return;
+    index = graph_find_slot(host);
+    if (index < 0) return;
+    slot = &graph_slots[index];
+    if (slot->domain_span || !slot->bytes || bytes > slot->bytes)
+        return;
+    slot->is_weight = 0;
+    slot->shape_generation = state->shape_generation;
+}
+
 int opengl_graph_alias_f32(const float* in, float* out, long n) {
     if (n <= 0 || !in || !out) return 0;
+    OpenGLContextState* state = opengl_context_state_get(0);
+    if (state && state->domain_enforced && in != out)
+        return opengl_graph_copy_f32(in, out, n);
     size_t bytes = (size_t)n * sizeof(float);
     OglTensorSlot* src = graph_ensure_device(in, bytes, 0);
     OglTensorSlot* dst = graph_get_slot(out, bytes, 0);
     if (!src || !dst || !src->buffer) return 0;
-    if (dst->owns_buffer && dst->buffer && dst->buffer != src->buffer) p_glDeleteBuffers(1, &dst->buffer);
+    if (dst == src) {
+        graph_mark_device(dst);
+        return 1;
+    }
+    if (dst->owns_buffer && dst->buffer && dst->buffer != src->buffer) {
+        p_glDeleteBuffers(1, &dst->buffer);
+        state->capacity_generation =
+            opengl_generation_next(state->capacity_generation);
+    }
     dst->buffer = src->buffer;
     dst->cap = src->cap;
+    dst->capacity_generation = src->capacity_generation;
     dst->bytes = bytes;
     dst->owns_buffer = 0;
     graph_mark_device(dst);
@@ -2025,6 +2652,125 @@ int opengl_graph_dropout_f32(const float* in, float* out, long n, uint32_t thres
 }
 #endif
 
+/* Routed expert linear. `experts` counts staged rows; route indices stay in
+ * global slot space and are mapped through slot_rows when slot_domain != 0. */
+int opengl_graph_moe_linear_f32(const float* input, const float* expert_weight,
+                                const float* expert_bias, const float* route_indices,
+                                const float* route_weights, float* out, int rows,
+                                int d_in, int d_out, int experts, int top_k,
+                                const uint32_t* slot_rows, uint32_t slot_domain) {
+    if (rows <= 0 || d_in <= 0 || d_out <= 0 || experts <= 0 || top_k <= 0 ||
+        !input || !expert_weight || !route_indices || !route_weights || !out) return 0;
+    if (slot_rows ? (slot_domain < (uint32_t)experts ||
+                     (uint32_t)top_k > slot_domain)
+                  : top_k > experts) return 0;
+    size_t in_bytes = (size_t)rows * (size_t)d_in * sizeof(float);
+    size_t w_bytes = (size_t)experts * (size_t)d_in * (size_t)d_out * sizeof(float);
+    size_t bias_bytes = (size_t)experts * (size_t)d_out * sizeof(float);
+    size_t route_bytes = (size_t)rows * (size_t)top_k * sizeof(float);
+    size_t out_bytes = (size_t)rows * (size_t)d_out * sizeof(float);
+    uint32_t slot_extent = slot_domain ? slot_domain : 1u;
+    OglTensorSlot* si = graph_ensure_device(input, in_bytes, 0);
+    OglTensorSlot* sw = graph_ensure_device(expert_weight, w_bytes, 1);
+    OglTensorSlot* sri = graph_ensure_device(route_indices, route_bytes, 0);
+    OglTensorSlot* srw = graph_ensure_device(route_weights, route_bytes, 0);
+    OglTensorSlot* so = graph_output_slot(out, out_bytes);
+    OglTensorSlot* sb = expert_bias
+        ? graph_ensure_device(expert_bias, bias_bytes, 1) : NULL;
+    if (!si || !sw || !sri || !srw || !so || (expert_bias && !sb)) return 0;
+    /* The shader always declares a bias and a slot table; absent ones become
+     * zero-filled transients so the binding set stays complete. */
+    GLuint bias_dummy = 0;
+    if (!expert_bias) {
+        float* zeros = (float*)calloc((size_t)experts * (size_t)d_out, sizeof(float));
+        if (!zeros) return 0;
+        bias_dummy = create_buffer_target(GL_SHADER_STORAGE_BUFFER, bias_bytes, zeros);
+        free(zeros);
+        if (!bias_dummy) return 0;
+    }
+    uint32_t* table = (uint32_t*)calloc(slot_extent, sizeof(uint32_t));
+    if (!table) {
+        if (bias_dummy) p_glDeleteBuffers(1, &bias_dummy);
+        return 0;
+    }
+    if (slot_domain) memcpy(table, slot_rows, (size_t)slot_domain * sizeof(uint32_t));
+    GLuint slot_buffer = create_buffer_target(
+        GL_SHADER_STORAGE_BUFFER, (size_t)slot_extent * sizeof(uint32_t), table);
+    free(table);
+    if (!slot_buffer) {
+        if (bias_dummy) p_glDeleteBuffers(1, &bias_dummy);
+        return 0;
+    }
+    uint32_t params[8] = {
+        (uint32_t)rows, (uint32_t)d_in, (uint32_t)d_out, (uint32_t)experts,
+        (uint32_t)top_k, expert_bias ? 1u : 0u, slot_domain, 0u,
+    };
+    GLuint pb = params_buffer(params, sizeof(params));
+    GLuint bufs[8] = {
+        si->buffer, sw->buffer, expert_bias ? sb->buffer : bias_dummy,
+        sri->buffer, srw->buffer, so->buffer, pb, slot_buffer,
+    };
+    int ok = dispatch_kernel(&k_moe_linear, bufs,
+                             ((uint32_t)d_out + 63u) / 64u, (uint32_t)rows, 1);
+    if (pb) p_glDeleteBuffers(1, &pb);
+    if (bias_dummy) p_glDeleteBuffers(1, &bias_dummy);
+    p_glDeleteBuffers(1, &slot_buffer);
+    if (!ok) return 0;
+    graph_mark_device(so);
+    return 1;
+}
+
+/* Top-k expert routing. The router weight is [d_model, experts], so its expert
+ * axis is 1 and it is never a slot-indexed bank. */
+int opengl_graph_moe_router_f32(const float* input, const float* weight,
+                                const float* bias, float* route_indices,
+                                float* route_weights, int rows, int d_model,
+                                int experts, int top_k, float temperature,
+                                int normalize) {
+    if (rows <= 0 || d_model <= 0 || experts <= 0 || top_k <= 0 ||
+        top_k > experts || top_k > 8 || !(temperature > 0.0f) ||
+        !input || !weight || !route_indices || !route_weights) return 0;
+    size_t in_bytes = (size_t)rows * (size_t)d_model * sizeof(float);
+    size_t w_bytes = (size_t)d_model * (size_t)experts * sizeof(float);
+    size_t bias_bytes = (size_t)experts * sizeof(float);
+    size_t route_bytes = (size_t)rows * (size_t)top_k * sizeof(float);
+    OglTensorSlot* si = graph_ensure_device(input, in_bytes, 0);
+    OglTensorSlot* sw = graph_ensure_device(weight, w_bytes, 1);
+    OglTensorSlot* sidx = graph_output_slot(route_indices, route_bytes);
+    OglTensorSlot* srw = graph_output_slot(route_weights, route_bytes);
+    OglTensorSlot* sb = bias ? graph_ensure_device(bias, bias_bytes, 1) : NULL;
+    if (!si || !sw || !sidx || !srw || (bias && !sb)) return 0;
+    GLuint bias_dummy = 0;
+    if (!bias) {
+        float* zeros = (float*)calloc((size_t)experts, sizeof(float));
+        if (!zeros) return 0;
+        bias_dummy = create_buffer_target(GL_SHADER_STORAGE_BUFFER, bias_bytes, zeros);
+        free(zeros);
+        if (!bias_dummy) return 0;
+    }
+    uint32_t params[8];
+    params[0] = (uint32_t)rows;
+    params[1] = (uint32_t)d_model;
+    params[2] = (uint32_t)experts;
+    params[3] = (uint32_t)top_k;
+    params[4] = normalize ? 1u : 0u;
+    params[5] = bias ? 1u : 0u;
+    memcpy(&params[6], &temperature, sizeof(float));
+    params[7] = 0u;
+    GLuint pb = params_buffer(params, sizeof(params));
+    GLuint bufs[6] = {
+        si->buffer, sw->buffer, bias ? sb->buffer : bias_dummy,
+        sidx->buffer, srw->buffer, pb,
+    };
+    int ok = dispatch_kernel(&k_moe_router, bufs, ((uint32_t)rows + 63u) / 64u, 1, 1);
+    if (pb) p_glDeleteBuffers(1, &pb);
+    if (bias_dummy) p_glDeleteBuffers(1, &bias_dummy);
+    if (!ok) return 0;
+    graph_mark_device(sidx);
+    graph_mark_device(srw);
+    return 1;
+}
+
 int opengl_graph_embedding_f32(const int32_t* tokens, const float* weight, float* out,
                                int tokens_len, int d_model, int vocab_size) {
     if (tokens_len <= 0 || d_model <= 0 || vocab_size <= 0 || !tokens || !weight || !out) return 0;
@@ -2233,6 +2979,47 @@ int opengl_graph_expand_f32(const float* in, float* out, const int* in_shape, in
     p_glDeleteBuffers(1, &pb);
     if (!ok) return 0;
     graph_mark_device(dst);
+    return 1;
+}
+
+int opengl_graph_expand_32(const void* in, void* out, const int* in_shape,
+                           int in_rank, const int* out_shape, int out_rank) {
+    /* expand.wgsl is word-typed and therefore preserves every I32 bit. */
+    return opengl_graph_expand_f32(
+        (const float*)in, (float*)out,
+        in_shape, in_rank, out_shape, out_rank);
+}
+
+int opengl_graph_batch_matmul_f32(
+        const float* a, const int* a_shape, int a_rank,
+        const float* b, const int* b_shape, int b_rank,
+        float* output, const int* output_shape, int output_rank) {
+    VxBatchMatMulF32Plan plan;
+    size_t metadata_bytes;
+    if (!vx_batch_matmul_f32_plan(
+            a, a_shape, a_rank, b, b_shape, b_rank,
+            output, output_shape, output_rank, &plan))
+        return 0;
+    metadata_bytes = (size_t)plan.metadata_words * sizeof(uint32_t);
+    OglTensorSlot* a_slot = graph_ensure_device(a, plan.a_bytes, 0);
+    OglTensorSlot* b_slot = graph_ensure_device(b, plan.b_bytes, 0);
+    OglTensorSlot* output_slot =
+        graph_output_slot(output, plan.output_bytes);
+    GLuint metadata_buffer = create_buffer(metadata_bytes, plan.metadata);
+    if (!a_slot || !b_slot || !output_slot || !metadata_buffer) {
+        if (metadata_buffer) p_glDeleteBuffers(1, &metadata_buffer);
+        return 0;
+    }
+    GLuint buffers[4] = {
+        a_slot->buffer, b_slot->buffer, output_slot->buffer, metadata_buffer,
+    };
+    int ok = dispatch_kernel(
+        &k_batch_matmul, buffers,
+        (plan.n + 7u) / 8u, (plan.m + 7u) / 8u,
+        plan.output_batches);
+    p_glDeleteBuffers(1, &metadata_buffer);
+    if (!ok) return 0;
+    graph_mark_device(output_slot);
     return 1;
 }
 
@@ -3897,7 +4684,10 @@ static const int32_t* qconv_zero_bias_get(uint32_t output_channels) {
         (size_t)output_channels > SIZE_MAX / sizeof(int32_t)) return NULL;
     for (QConvZeroBiasBacking* block = qconv_zero_bias_backings; block;
          block = block->next) {
-        if (block->elements >= output_channels) return block->values;
+        /* Domain-enforced invariant slots retain an exact readable range.
+         * Give every distinct channel width a stable host key so a later
+         * smaller zero bias cannot narrow an earlier larger binding. */
+        if (block->elements == output_channels) return block->values;
     }
     QConvZeroBiasBacking* block = (QConvZeroBiasBacking*)calloc(1, sizeof(*block));
     if (!block) return NULL;
@@ -4810,6 +5600,90 @@ static int opengl_checked_float_matrix_bytes(int rows, int columns, size_t* byte
     return 1;
 }
 
+int opengl_graph_linear_f32(const float* input, const float* weight,
+                            const float* bias, float* output, int rows,
+                            int d_in, int d_out,
+                            int output_major_weight) {
+    size_t input_bytes;
+    size_t weight_bytes;
+    size_t bias_bytes;
+    size_t output_bytes;
+    const float* bound_bias;
+    OglTensorSlot* input_slot;
+    OglTensorSlot* weight_slot;
+    OglTensorSlot* bias_slot;
+    OglTensorSlot* output_slot;
+    OglTensorSlot* scale_slot = NULL;
+    uint32_t params[3];
+    GLuint params_handle;
+    uint32_t groups_x;
+    uint32_t groups_y;
+    int tiled;
+    int ok;
+    if (!input || !weight || !output || rows <= 0 || d_in <= 0 ||
+        d_out <= 0 || (output_major_weight != 0 &&
+                       output_major_weight != 1) ||
+        !opengl_checked_float_matrix_bytes(rows, d_in, &input_bytes) ||
+        !opengl_checked_float_matrix_bytes(
+            d_in, d_out, &weight_bytes) ||
+        !opengl_checked_float_matrix_bytes(1, d_out, &bias_bytes) ||
+        !opengl_checked_float_matrix_bytes(
+            rows, d_out, &output_bytes) ||
+        qsdpa_ranges_overlap(output, output_bytes, input, input_bytes) ||
+        qsdpa_ranges_overlap(output, output_bytes, weight, weight_bytes) ||
+        (bias && qsdpa_ranges_overlap(
+            output, output_bytes, bias, bias_bytes)))
+        return 0;
+    bound_bias = bias ? bias :
+        (const float*)qconv_zero_bias_get((uint32_t)d_out);
+    if (!bound_bias) return 0;
+
+    input_slot = graph_ensure_device(input, input_bytes, 0);
+    weight_slot = graph_ensure_device(weight, weight_bytes, 1);
+    bias_slot = graph_ensure_device(bound_bias, bias_bytes, 1);
+    output_slot = graph_output_slot(output, output_bytes);
+    if (!input_slot || !weight_slot || !bias_slot || !output_slot)
+        return 0;
+    if (output_major_weight) {
+        scale_slot = graph_ensure_device(
+            linear_dummy_scale, sizeof(linear_dummy_scale), 1);
+        if (!scale_slot) return 0;
+    }
+    params[0] = (uint32_t)rows;
+    params[1] = (uint32_t)d_in;
+    params[2] = (uint32_t)d_out;
+    params_handle = params_buffer(params, sizeof(params));
+    if (!params_handle) return 0;
+
+    tiled = rows > 1 && d_in >= 16 && d_out >= 16 &&
+        opengl_workgroup_supported(8u, 8u, 1u);
+    groups_x = tiled ? ((uint32_t)d_out + 15u) / 16u
+                     : ((uint32_t)d_out + 63u) / 64u;
+    groups_y = tiled ? ((uint32_t)rows + 15u) / 16u
+                     : (uint32_t)rows;
+    if (output_major_weight) {
+        GLuint buffers[6] = {
+            input_slot->buffer, weight_slot->buffer, scale_slot->buffer,
+            bias_slot->buffer, output_slot->buffer, params_handle,
+        };
+        ok = dispatch_kernel(
+            tiled ? &k_matmul_out_in_tiled : &k_matmul_out_in,
+            buffers, groups_x, groups_y, 1u);
+    } else {
+        GLuint buffers[5] = {
+            input_slot->buffer, weight_slot->buffer, bias_slot->buffer,
+            output_slot->buffer, params_handle,
+        };
+        ok = dispatch_kernel(
+            tiled ? &k_matmul_tiled : &k_matmul,
+            buffers, groups_x, groups_y, 1u);
+    }
+    p_glDeleteBuffers(1, &params_handle);
+    if (!ok) return 0;
+    graph_mark_device(output_slot);
+    return 1;
+}
+
 static int opengl_matmul_locked(const float* in, const float* w, const float* b,
                                 float* out, int seq, int d_in, int d_out) {
     if (!ogl_ready() || !in || !w || !out || seq <= 0 || d_in <= 0 || d_out <= 0) return 0;
@@ -4929,6 +5803,12 @@ static void opengl_context_resources_release_locked(OpenGLContextState* state,
     state->qlayernorm_scratch_buffer = 0;
     state->qlayernorm_scratch_capacity = 0;
     qconv_zero_bias_release_state(state);
+    free(state->shape_signature);
+    state->shape_signature = NULL;
+    state->domain_span_count = 0;
+    state->domain_qgroupnorm_stats_bytes = 0;
+    state->domain_qlayernorm_stats_bytes = 0;
+    state->domain_enforced = 0;
     state->forward_active = 0;
     state->implicit_forward = 0;
     state->transient_active = 0;
@@ -4969,13 +5849,13 @@ static void opengl_device_shutdown_locked(void) {
     max_compute_groups[0] = max_compute_groups[1] = max_compute_groups[2] = 0;
     max_compute_group_size[0] = max_compute_group_size[1] = max_compute_group_size[2] = 0;
     max_compute_invocations = 0;
+    max_ssbo_block_size = 0;
+    max_uniform_block_size = 0;
     qconv_tiled_enabled = 1;
     profile_sync = -1;
 #if VOLVOXAI_ENABLE_TRAINING
     max_compute_ssbo_blocks = 0;
     max_compute_uniform_blocks = 0;
-    max_ssbo_block_size = 0;
-    max_uniform_block_size = 0;
 #endif
     g_opengl_device_state.reference_count = 0;
 }
@@ -4991,11 +5871,22 @@ static void opengl_context_state_destroy(void* opaque_state) {
     if (state->device_acquired && g_opengl_device_state.reference_count > 0) {
         state->device_acquired = 0;
         g_opengl_device_state.reference_count--;
-        if (g_opengl_device_state.reference_count == 0)
-            opengl_device_shutdown_locked();
+        /* The EGL context stays even at zero references: compile and execute run
+         * under different engine-state scopes, so the count legitimately drops to
+         * zero between them and tearing down here rebuilt the whole GL context on
+         * every native run. Released explicitly by opengl_device_release(). */
     }
     opengl_device_unlock();
     free(state);
+}
+
+/* Drop the shared EGL/GL context once nothing holds it. Separate from
+ * opengl_cleanup so the device survives engine-state scope churn. */
+void opengl_device_release(void) {
+    opengl_device_lock();
+    if (g_opengl_device_state.reference_count == 0 && egl_context != EGL_NO_CONTEXT)
+        opengl_device_shutdown_locked();
+    opengl_device_unlock();
 }
 
 void opengl_cleanup(void) {

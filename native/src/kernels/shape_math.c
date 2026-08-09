@@ -1,6 +1,9 @@
 // --- Missing Deep Math & Shape Primitives (Batch 4) ---
 #include <stddef.h>
 #include <stdint.h>
+#if defined(__wasm_simd128__)
+#include <wasm_simd128.h>
+#endif
 void shape_f32(float* output, int n0, int n1, int n2, int n3, int ndims) {
     if (ndims > 0) output[0] = (float)n0;
     if (ndims > 1) output[1] = (float)n1;
@@ -52,8 +55,9 @@ void pad_2d_f32(const float* input, float* output, float pad_val,
 static int vx_slice_nd_validate(const uint32_t *input_shape,
         const uint32_t *output_shape, const uint32_t *starts,
         const uint32_t *steps, uint32_t rank, uint32_t output_elements,
-        size_t *input_strides) {
+        size_t *input_strides, size_t *input_elements) {
     if (!input_shape || !output_shape || !starts || !steps || !input_strides ||
+        !input_elements ||
         rank == 0 || rank > 8) return 0;
     size_t input_stride = 1, output_product = 1;
     for (uint32_t reverse = rank; reverse-- > 0;) {
@@ -69,15 +73,86 @@ static int vx_slice_nd_validate(const uint32_t *input_shape,
         input_stride *= input_size;
         output_product *= output_size;
     }
+    *input_elements = input_stride;
     return output_product == output_elements;
+}
+
+/* A Slice that leaves a trailing set of axes whole is a sequence of contiguous
+ * blocks.  Copy those blocks directly instead of recovering every output
+ * coordinate with rank-many integer divisions.  The disjoint-storage check
+ * keeps the exported kernel's existing ordered behavior for unusual callers
+ * that overlap input and output; graph arenas use distinct live ranges. */
+static int vx_slice_nd_copy_contiguous_blocks(const void *input, void *output,
+        const uint32_t *input_shape, const uint32_t *output_shape,
+        const uint32_t *starts, const uint32_t *steps, uint32_t rank,
+        uint32_t output_elements, const size_t *input_strides,
+        size_t input_elements) {
+    const uintptr_t input_address = (uintptr_t)input;
+    const uintptr_t output_address = (uintptr_t)output;
+    size_t contiguous_elements = 1u;
+    uint32_t prefix_rank = rank;
+    size_t input_bytes;
+    size_t output_bytes;
+    size_t block_bytes;
+    size_t blocks;
+    if (input_elements > SIZE_MAX / sizeof(uint32_t) ||
+        (size_t)output_elements > SIZE_MAX / sizeof(uint32_t)) return 0;
+    input_bytes = input_elements * sizeof(uint32_t);
+    output_bytes = (size_t)output_elements * sizeof(uint32_t);
+    if (input_bytes > UINTPTR_MAX - input_address ||
+        output_bytes > UINTPTR_MAX - output_address ||
+        !((input_address + input_bytes <= output_address) ||
+          (output_address + output_bytes <= input_address))) return 0;
+    while (prefix_rank > 0u) {
+        const uint32_t axis = prefix_rank - 1u;
+        if (starts[axis] != 0u || steps[axis] != 1u ||
+            output_shape[axis] != input_shape[axis]) break;
+        if (contiguous_elements > SIZE_MAX / output_shape[axis]) return 0;
+        contiguous_elements *= output_shape[axis];
+        prefix_rank--;
+    }
+    if (contiguous_elements < 4u ||
+        (size_t)output_elements % contiguous_elements != 0u ||
+        contiguous_elements > SIZE_MAX / sizeof(uint32_t)) return 0;
+    block_bytes = contiguous_elements * sizeof(uint32_t);
+    blocks = (size_t)output_elements / contiguous_elements;
+    for (size_t block = 0u; block < blocks; block++) {
+        size_t remaining = block;
+        size_t input_index = 0u;
+        const uint8_t *source;
+        uint8_t *destination;
+        size_t byte = 0u;
+        for (uint32_t reverse = prefix_rank; reverse-- > 0u;) {
+            const uint32_t coordinate =
+                (uint32_t)(remaining % output_shape[reverse]);
+            remaining /= output_shape[reverse];
+            input_index +=
+                (size_t)(starts[reverse] + coordinate * steps[reverse]) *
+                input_strides[reverse];
+        }
+        source = (const uint8_t *)input + input_index * sizeof(uint32_t);
+        destination = (uint8_t *)output + block * block_bytes;
+#if defined(__wasm_simd128__)
+        for (; block_bytes - byte >= 16u; byte += 16u) {
+            wasm_v128_store(destination + byte, wasm_v128_load(source + byte));
+        }
+#endif
+        for (; byte < block_bytes; byte++) destination[byte] = source[byte];
+    }
+    return 1;
 }
 
 int slice_nd_f32(const float *input, float *output, const uint32_t *input_shape,
         const uint32_t *output_shape, const uint32_t *starts, const uint32_t *steps,
         uint32_t rank, uint32_t output_elements) {
     size_t input_strides[8];
+    size_t input_elements;
     if (!input || !output || !vx_slice_nd_validate(input_shape, output_shape,
-        starts, steps, rank, output_elements, input_strides)) return 0;
+        starts, steps, rank, output_elements, input_strides,
+        &input_elements)) return 0;
+    if (vx_slice_nd_copy_contiguous_blocks(input, output, input_shape,
+        output_shape, starts, steps, rank, output_elements, input_strides,
+        input_elements)) return 1;
     for (uint32_t output_index = 0; output_index < output_elements; output_index++) {
         size_t remaining = output_index, input_index = 0;
         for (uint32_t reverse = rank; reverse-- > 0;) {
@@ -97,8 +172,13 @@ int slice_nd_u32(const uint32_t *input, uint32_t *output,
         const uint32_t *starts, const uint32_t *steps, uint32_t rank,
         uint32_t output_elements) {
     size_t input_strides[8];
+    size_t input_elements;
     if (!input || !output || !vx_slice_nd_validate(input_shape, output_shape,
-        starts, steps, rank, output_elements, input_strides)) return 0;
+        starts, steps, rank, output_elements, input_strides,
+        &input_elements)) return 0;
+    if (vx_slice_nd_copy_contiguous_blocks(input, output, input_shape,
+        output_shape, starts, steps, rank, output_elements, input_strides,
+        input_elements)) return 1;
     for (uint32_t output_index = 0; output_index < output_elements; output_index++) {
         size_t remaining = output_index, input_index = 0;
         for (uint32_t reverse = rank; reverse-- > 0;) {
@@ -122,24 +202,23 @@ static int vx_gather_i32_validate(uint32_t outer, uint32_t axis_size,
 }
 
 /* Canonical ONNX I32 Gather. Negative indices wrap once by the selected axis
-   size. Values still outside the axis use the portable inference sentinel -1
-   rather than risking an out-of-bounds read. */
+   size. Validate every value before the first output write so an invalid
+   request fails atomically instead of manufacturing sentinel data. */
 int gather_i32_f32(const float *input, const int32_t *indices, float *output,
         uint32_t outer, uint32_t axis_size, uint32_t inner,
         uint32_t indices_elements, uint32_t output_elements) {
     if (!input || !indices || !output || !vx_gather_i32_validate(outer, axis_size,
         inner, indices_elements, output_elements)) return 0;
+    for (uint32_t index_position = 0; index_position < indices_elements; index_position++) {
+        int64_t selected = indices[index_position];
+        if (selected < 0) selected += (int64_t)axis_size;
+        if (selected < 0 || selected >= (int64_t)axis_size) return 0;
+    }
     for (uint32_t outer_index = 0; outer_index < outer; outer_index++) {
         for (uint32_t index_position = 0; index_position < indices_elements; index_position++) {
             int64_t selected = indices[index_position];
             size_t output_base = ((size_t)outer_index * indices_elements + index_position) * inner;
             if (selected < 0) selected += (int64_t)axis_size;
-            if (selected < 0 || selected >= (int64_t)axis_size) {
-                for (uint32_t inner_index = 0; inner_index < inner; inner_index++) {
-                    output[output_base + inner_index] = -1.0f;
-                }
-                continue;
-            }
             size_t input_base = ((size_t)outer_index * axis_size + (size_t)selected) * inner;
             for (uint32_t inner_index = 0; inner_index < inner; inner_index++) {
                 output[output_base + inner_index] = input[input_base + inner_index];

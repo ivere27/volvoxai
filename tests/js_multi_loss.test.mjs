@@ -1,8 +1,11 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
-import { ModelBuilder, importModelCheckpoint } from '../ts/full.js';
-import { createCPUTrainingHarness } from './helpers/training_session.mjs';
+import { TrainingModelBuilder as ModelBuilder } from '../ts/training/TrainingModelBuilder.js';
+import {
+  createCPUTrainingHarness,
+  trainingGraphFromCheckpoint,
+} from './helpers/training_session.mjs';
 
 function buildTwoHeadGraph() {
   const builder = new ModelBuilder();
@@ -91,7 +94,7 @@ test('full-window normalizers make heterogeneous multi-loss accumulation exact',
   assert.equal(accumulated.graph.trainingStep, 0);
   await assert.rejects(
     () => training.exportCheckpoint(accumulated.graph),
-    /gradient accumulation is pending/,
+    /gradient accumulation to be completed or reset/,
   );
 
   const second = await training.runStep(accumulated.graph, {
@@ -104,7 +107,7 @@ test('full-window normalizers make heterogeneous multi-loss accumulation exact',
   });
   assert.equal(second.accumulating, false);
   const accumulatedCheckpoint = await training.exportCheckpoint(accumulated.graph);
-  assert.equal(importModelCheckpoint(accumulatedCheckpoint).graph.trainingStep, 1);
+  assert.equal(trainingGraphFromCheckpoint(accumulatedCheckpoint).trainingStep, 1);
   assert.equal(accumulated.graph.trainingStep, 0, 'Trainer must not mutate caller-owned graph state');
   assert.equal(second.losses[0].examples, 2);
   assert.equal(second.losses[1].examples, 2);

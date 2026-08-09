@@ -28,8 +28,8 @@ ONLY=int8 make models_efficientdet
 The example fetcher passes explicit `scores` and `boxes` output names to the
 generic exporter. Output meaning belongs here; the generic exporter otherwise
 uses positional names such as `output0` and `output1`.
-The fetcher also records the input image normalization contract in each
-generated package: `raw-255` for int8 and `zero-one` for fp16/fp32.
+Image decoding and normalization are application policy, not graph metadata.
+Use `raw-255` for int8 and `zero-one` for fp16/fp32 in the calling application.
 
 ## Test
 

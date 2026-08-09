@@ -29,19 +29,37 @@
 #define PATH_MAX 4096
 #endif
 
+#define VX_PTQ_MAX_SAFE_INTEGER UINT64_C(9007199254740991)
+
 typedef struct VxOwnedPTQObserver {
     char name[VX_PTQ_NAME_CAPACITY];
     VxDataType dtype;
     VxPTQScheme scheme;
 } VxOwnedPTQObserver;
 
-typedef struct VxOwnedPTQInput {
+typedef struct VxOwnedPTQSymbolCoverage {
     char name[VX_PTQ_NAME_CAPACITY];
-    VxDataType dtype;
-    uint32_t rank;
-    int64_t shape[VX_MAX_TENSOR_RANK];
-    size_t byte_size;
-} VxOwnedPTQInput;
+    int64_t minimum;
+    int64_t maximum;
+} VxOwnedPTQSymbolCoverage;
+
+typedef struct VxOwnedPTQActivationCoverage {
+    char name[VX_PTQ_NAME_CAPACITY];
+    uint64_t values;
+} VxOwnedPTQActivationCoverage;
+
+typedef struct VxOwnedPTQProfile {
+    char name[VX_PTQ_NAME_CAPACITY];
+    uint64_t batch_count;
+    uint64_t sample_count;
+    char** signatures;
+    size_t signature_count;
+    size_t signature_capacity;
+    VxOwnedPTQSymbolCoverage* symbols;
+    size_t symbol_count;
+    VxOwnedPTQActivationCoverage* activations;
+    size_t activation_count;
+} VxOwnedPTQProfile;
 
 struct VxPTQPlan {
     atomic_uint references;
@@ -54,10 +72,12 @@ struct VxPTQPlan {
     char* template_graph_snapshot;
     VxOwnedPTQObserver* observers;
     size_t observer_count;
-    VxOwnedPTQInput* inputs;
     size_t input_count;
+    VxOwnedPTQProfile* profiles;
+    size_t profile_count;
     char** sample_names;
     size_t sample_count;
+    uint64_t represented_sample_count;
     VxRevisionInfo revision;
     uint64_t runtime_id;
     uint64_t model_id;
@@ -77,6 +97,28 @@ static int ptq_name_valid(const char* value) {
     return value && value[0] && strlen(value) < VX_PTQ_NAME_CAPACITY;
 }
 
+static int ptq_profile_name_valid(const char* value) {
+    size_t length;
+    if (!value || !(('A' <= value[0] && value[0] <= 'Z') ||
+                    ('a' <= value[0] && value[0] <= 'z')))
+        return 0;
+    length = strlen(value);
+    if (!length || length > 64u) return 0;
+    for (size_t index = 1; index < length; index++) {
+        char character = value[index];
+        if (!(('A' <= character && character <= 'Z') ||
+              ('a' <= character && character <= 'z') ||
+              ('0' <= character && character <= '9') ||
+              character == '.' || character == '_' || character == '-'))
+            return 0;
+    }
+    return 1;
+}
+
+static int ptq_report_argument_valid(const VxReport* report) {
+    return !report || report->struct_size == sizeof(*report);
+}
+
 static void ptq_report(VxPTQPlan* plan,
                        VxReport* report,
                        VxStatus status,
@@ -84,7 +126,7 @@ static void ptq_report(VxPTQPlan* plan,
                        const char* reason,
                        const char* message) {
     size_t struct_size;
-    if (!report || report->struct_size < sizeof(*report)) return;
+    if (!report || report->struct_size != sizeof(*report)) return;
     struct_size = report->struct_size;
     memset(report, 0, sizeof(*report));
     report->struct_size = struct_size;
@@ -304,54 +346,125 @@ static int ptq_sample_exists(const VxPTQPlan* plan, const char* name) {
     return 0;
 }
 
-static VxStatus ptq_cache_inputs(VxPTQPlan* plan) {
-    VxEngineStateScope scope;
-    int count;
-    if (!plan || !plan->engine) return VX_STATUS_INVALID_ARGUMENT;
-    scope = vx_engine_state_scope_enter(plan->engine);
-    count = volvoxai_engine_graph_input_count();
-    if (count <= 0 || (size_t)count > SIZE_MAX / sizeof(*plan->inputs)) {
-        vx_engine_state_scope_leave(scope);
-        return VX_STATUS_INVALID_GRAPH;
+static void ptq_profiles_release(VxOwnedPTQProfile* profiles, size_t count) {
+    if (!profiles) return;
+    for (size_t index = 0; index < count; index++) {
+        for (size_t signature = 0;
+             signature < profiles[index].signature_count; signature++)
+            free(profiles[index].signatures[signature]);
+        free(profiles[index].signatures);
+        free(profiles[index].symbols);
+        free(profiles[index].activations);
     }
-    plan->inputs = (VxOwnedPTQInput*)calloc((size_t)count,
-                                            sizeof(*plan->inputs));
-    if (!plan->inputs) {
-        vx_engine_state_scope_leave(scope);
-        return VX_STATUS_OUT_OF_MEMORY;
-    }
-    for (int index = 0; index < count; index++) {
-        const char* name = volvoxai_engine_graph_input_name(index);
-        long numel = 0;
-        int shape[VX_MAX_TENSOR_RANK] = {0};
-        int rank = 0;
-        int dtype = -1;
-        size_t element_size = 0;
-        VxOwnedPTQInput* target = &plan->inputs[index];
-        if (!ptq_name_valid(name) || volvoxai_engine_tensor_info_ex(
-                name, &numel, shape, &rank, &dtype, &element_size) != 0 ||
-            numel < 0 || rank < 0 || rank > (int)VX_MAX_TENSOR_RANK ||
-            !element_size || (size_t)numel > SIZE_MAX / element_size) {
-            free(plan->inputs);
-            plan->inputs = NULL;
-            vx_engine_state_scope_leave(scope);
-            return VX_STATUS_INVALID_GRAPH;
+    free(profiles);
+}
+
+static VxOwnedPTQProfile* ptq_profile_find(VxPTQPlan* plan,
+                                           const char* name) {
+    if (!plan || !name) return NULL;
+    for (size_t index = 0; index < plan->profile_count; index++)
+        if (!strcmp(plan->profiles[index].name, name))
+            return &plan->profiles[index];
+    return NULL;
+}
+
+static VxStatus ptq_profiles_initialize(
+        VxPTQPlan* plan,
+        const char* const* names,
+        size_t count) {
+    VxOwnedPTQSymbolCoverage* symbols = NULL;
+    size_t symbol_capacity;
+    size_t symbol_count = 0;
+    VxStatus status = VX_STATUS_OK;
+    if (!plan || !names || !count || count > (size_t)INT32_MAX)
+        return VX_STATUS_INVALID_ARGUMENT;
+    plan->input_count = vx_model_internal_input_count(plan->model);
+    if (!plan->input_count) return VX_STATUS_INVALID_GRAPH;
+    if (plan->input_count > SIZE_MAX / VX_MAX_TENSOR_RANK ||
+        plan->input_count * VX_MAX_TENSOR_RANK >
+            SIZE_MAX / sizeof(*symbols)) return VX_STATUS_OUT_OF_MEMORY;
+    symbol_capacity = plan->input_count * VX_MAX_TENSOR_RANK;
+    symbols = (VxOwnedPTQSymbolCoverage*)calloc(
+        symbol_capacity, sizeof(*symbols));
+    if (!symbols) return VX_STATUS_OUT_OF_MEMORY;
+    for (size_t input = 0; input < plan->input_count; input++) {
+        VxTensorSpec spec = VX_TENSOR_SPEC_INIT;
+        if (vx_model_internal_input_spec(plan->model, input, &spec) !=
+            VX_STATUS_OK) {
+            status = VX_STATUS_INVALID_GRAPH;
+            goto done;
         }
-        snprintf(target->name, sizeof(target->name), "%s", name);
-        target->dtype = (VxDataType)dtype;
-        target->rank = (uint32_t)rank;
-        for (int axis = 0; axis < rank; axis++) target->shape[axis] = shape[axis];
-        target->byte_size = (size_t)numel * element_size;
+        for (uint32_t axis = 0; axis < spec.rank; axis++) {
+            const char* symbol = spec.dimensions[axis].symbol;
+            int duplicate = 0;
+            if (spec.dimensions[axis].kind != VX_DIMENSION_SYMBOLIC ||
+                !ptq_name_valid(symbol)) continue;
+            for (size_t prior = 0; prior < symbol_count; prior++)
+                if (!strcmp(symbols[prior].name, symbol)) duplicate = 1;
+            if (duplicate) continue;
+            if (symbol_count >= symbol_capacity) {
+                status = VX_STATUS_INVALID_GRAPH;
+                goto done;
+            }
+            snprintf(symbols[symbol_count].name,
+                     sizeof(symbols[symbol_count].name), "%s", symbol);
+            symbols[symbol_count].minimum = INT64_MAX;
+            symbols[symbol_count].maximum = 0;
+            symbol_count++;
+        }
     }
-    plan->input_count = (size_t)count;
-    vx_engine_state_scope_leave(scope);
-    return VX_STATUS_OK;
+    plan->profiles = (VxOwnedPTQProfile*)calloc(count, sizeof(*plan->profiles));
+    if (!plan->profiles) {
+        status = VX_STATUS_OUT_OF_MEMORY;
+        goto done;
+    }
+    plan->profile_count = count;
+    for (size_t index = 0; index < count; index++) {
+        VxOwnedPTQProfile* profile = &plan->profiles[index];
+        if (!ptq_profile_name_valid(names[index])) {
+            status = VX_STATUS_INVALID_ARGUMENT;
+            goto done;
+        }
+        for (size_t prior = 0; prior < index; prior++)
+            if (!strcmp(names[prior], names[index])) {
+                status = VX_STATUS_INVALID_ARGUMENT;
+                goto done;
+            }
+        snprintf(profile->name, sizeof(profile->name), "%s", names[index]);
+        if (symbol_count) {
+            profile->symbols = (VxOwnedPTQSymbolCoverage*)malloc(
+                symbol_count * sizeof(*profile->symbols));
+            if (!profile->symbols) {
+                status = VX_STATUS_OUT_OF_MEMORY;
+                goto done;
+            }
+            memcpy(profile->symbols, symbols,
+                   symbol_count * sizeof(*profile->symbols));
+        }
+        profile->symbol_count = symbol_count;
+        if (plan->observer_count) {
+            profile->activations = (VxOwnedPTQActivationCoverage*)calloc(
+                plan->observer_count, sizeof(*profile->activations));
+            if (!profile->activations) {
+                status = VX_STATUS_OUT_OF_MEMORY;
+                goto done;
+            }
+            profile->activation_count = plan->observer_count;
+            for (size_t observer = 0; observer < plan->observer_count;
+                 observer++)
+                snprintf(profile->activations[observer].name,
+                         sizeof(profile->activations[observer].name), "%s",
+                         plan->observers[observer].name);
+        }
+    }
+done:
+    free(symbols);
+    return status;
 }
 
 static void ptq_owner_destroy(VxPTQPlan* plan) {
     if (!plan) return;
     (void)vx_ptq_plan_close(plan, NULL);
-    free(plan->inputs);
     vx_model_release(plan->model);
     pthread_mutex_destroy(&plan->mutex);
     free(plan);
@@ -365,9 +478,13 @@ VxStatus vx_model_create_ptq_plan(VxModel* model,
     VxStatus status = VX_STATUS_INVALID_ARGUMENT;
     char* template_snapshot = NULL;
     int snapshot_status;
-    if (!model || !options || options->struct_size < sizeof(*options) ||
+    if (!ptq_report_argument_valid(report))
+        return VX_STATUS_INVALID_ARGUMENT;
+    if (!model || !options || options->struct_size != sizeof(*options) ||
         !out_plan || !options->template_graph_path ||
-        !options->template_graph_path[0] || !options->observers ||
+        !options->template_graph_path[0] || !options->profile_names ||
+        !options->profile_count || options->profile_count > (size_t)INT32_MAX ||
+        !options->observers ||
         !options->observer_count || options->observer_count > (size_t)INT32_MAX ||
         !options->layers || !options->layer_count ||
         options->layer_count > (size_t)INT32_MAX) {
@@ -439,8 +556,6 @@ VxStatus vx_model_create_ptq_plan(VxModel* model,
         status = VX_STATUS_INVALID_GRAPH;
         goto fail;
     }
-    status = ptq_cache_inputs(plan);
-    if (status != VX_STATUS_OK) goto fail;
     plan->observers = (VxOwnedPTQObserver*)calloc(
         options->observer_count, sizeof(*plan->observers));
     if (!plan->observers) {
@@ -455,7 +570,7 @@ VxStatus vx_model_create_ptq_plan(VxModel* model,
                                index < options->observer_count; index++) {
             const VxPTQObserverSpec* source = &options->observers[index];
             volvoxai_ptq_tensor_spec_t target = VOLVOXAI_PTQ_TENSOR_SPEC_INIT;
-            if (source->struct_size < sizeof(*source) ||
+            if (source->struct_size != sizeof(*source) ||
                 !ptq_name_valid(source->tensor_name) ||
                 (source->dtype != VX_DTYPE_I8 && source->dtype != VX_DTYPE_U8) ||
                 (source->scheme != VX_PTQ_SCHEME_SYMMETRIC &&
@@ -478,7 +593,7 @@ VxStatus vx_model_create_ptq_plan(VxModel* model,
                                index < options->layer_count; index++) {
             const VxPTQLayerSpec* source = &options->layers[index];
             volvoxai_ptq_layer_spec_t target = VOLVOXAI_PTQ_LAYER_SPEC_INIT;
-            if (source->struct_size < sizeof(*source) ||
+            if (source->struct_size != sizeof(*source) ||
                 source->mode != VX_PTQ_MODE_W8A8 ||
                 (source->kind != VX_PTQ_LAYER_QLINEAR &&
                  source->kind != VX_PTQ_LAYER_QCONV2D)) {
@@ -502,6 +617,9 @@ VxStatus vx_model_create_ptq_plan(VxModel* model,
     }
     if (status != VX_STATUS_OK) goto fail;
     plan->observer_count = options->observer_count;
+    status = ptq_profiles_initialize(
+        plan, options->profile_names, options->profile_count);
+    if (status != VX_STATUS_OK) goto fail;
     status = vx_model_internal_validate_authoring_revision(
         model, plan->exact_revision, plan->revision.adapter_id,
         plan->revision.adapter_revision, report);
@@ -539,8 +657,12 @@ VxStatus vx_ptq_plan_close(VxPTQPlan* plan, VxReport* report) {
     VxWeightRevisionRecord* revision;
     char* template_snapshot;
     VxOwnedPTQObserver* observers;
+    VxOwnedPTQProfile* profiles;
+    size_t profile_count;
     char** sample_names;
     size_t sample_count;
+    if (!ptq_report_argument_valid(report))
+        return VX_STATUS_INVALID_ARGUMENT;
     if (!plan) {
         ptq_report(NULL, report, VX_STATUS_INVALID_ARGUMENT,
                    VX_STAGE_PTQ_CLOSE, "INVALID_PTQ_PLAN", "PTQ plan is NULL");
@@ -559,6 +681,8 @@ VxStatus vx_ptq_plan_close(VxPTQPlan* plan, VxReport* report) {
     revision = plan->exact_revision;
     template_snapshot = plan->template_graph_snapshot;
     observers = plan->observers;
+    profiles = plan->profiles;
+    profile_count = plan->profile_count;
     sample_names = plan->sample_names;
     sample_count = plan->sample_count;
     plan->core = NULL;
@@ -567,6 +691,8 @@ VxStatus vx_ptq_plan_close(VxPTQPlan* plan, VxReport* report) {
     plan->template_graph_snapshot = NULL;
     plan->observers = NULL;
     plan->observer_count = 0;
+    plan->profiles = NULL;
+    plan->profile_count = 0;
     plan->sample_names = NULL;
     plan->sample_count = 0;
     pthread_mutex_unlock(&plan->mutex);
@@ -579,6 +705,7 @@ VxStatus vx_ptq_plan_close(VxPTQPlan* plan, VxReport* report) {
     vx_model_internal_release_weight_revision(revision);
     ptq_snapshot_release(template_snapshot);
     free(observers);
+    ptq_profiles_release(profiles, profile_count);
     ptq_samples_release(sample_names, sample_count);
     ptq_report(plan, report, VX_STATUS_OK, VX_STAGE_PTQ_CLOSE, "OK",
                "PTQ plan and private calibration state released");
@@ -596,40 +723,29 @@ size_t vx_ptq_plan_input_count(VxPTQPlan* plan) {
     size_t count = 0;
     if (!plan) return 0;
     pthread_mutex_lock(&plan->mutex);
-    if (ptq_current_locked(plan) == VX_STATUS_OK) count = plan->input_count;
+    if (ptq_current_locked(plan) == VX_STATUS_OK)
+        count = vx_model_internal_input_count(plan->model);
     pthread_mutex_unlock(&plan->mutex);
     return count;
 }
 
-VxStatus vx_ptq_plan_input_info(VxPTQPlan* plan,
+VxStatus vx_ptq_plan_input_spec(VxPTQPlan* plan,
                                 size_t index,
-                                VxTensorInfo* info,
+                                VxTensorSpec* spec,
                                 VxReport* report) {
     VxStatus status;
-    if (!plan || !info || info->struct_size < sizeof(*info)) {
+    if (!ptq_report_argument_valid(report))
+        return VX_STATUS_INVALID_ARGUMENT;
+    if (!plan || !spec || spec->struct_size != sizeof(*spec)) {
         ptq_report(plan, report, VX_STATUS_INVALID_ARGUMENT,
                    VX_STAGE_PTQ_INSPECT, "INVALID_INPUT_QUERY",
-                   "PTQ plan or tensor info buffer is invalid");
+                   "PTQ plan or tensor spec buffer is invalid");
         return VX_STATUS_INVALID_ARGUMENT;
     }
     pthread_mutex_lock(&plan->mutex);
     status = ptq_current_locked(plan);
-    if (status == VX_STATUS_OK) {
-        if (index >= plan->input_count) {
-            status = VX_STATUS_NOT_FOUND;
-        } else {
-            const VxOwnedPTQInput* source = &plan->inputs[index];
-            size_t struct_size = info->struct_size;
-            memset(info, 0, sizeof(*info));
-            info->struct_size = struct_size;
-            info->name = source->name;
-            info->dtype = source->dtype;
-            info->rank = source->rank;
-            memcpy(info->shape, source->shape, sizeof(info->shape));
-            info->byte_size = source->byte_size;
-            info->location = VX_MEMORY_HOST;
-        }
-    }
+    if (status == VX_STATUS_OK)
+        status = vx_model_internal_input_spec(plan->model, index, spec);
     pthread_mutex_unlock(&plan->mutex);
     ptq_report(plan, report, status, VX_STAGE_PTQ_INSPECT,
                status == VX_STATUS_OK ? "OK" :
@@ -637,99 +753,194 @@ VxStatus vx_ptq_plan_input_info(VxPTQPlan* plan,
                status == VX_STATUS_REVISION_CONFLICT ? "REVISION_CONFLICT" :
                status == VX_STATUS_HANDLE_DISPOSED ? "HANDLE_DISPOSED" :
                "INPUT_QUERY_FAILED",
-               status == VX_STATUS_OK ? "PTQ input metadata returned" :
-                                        "PTQ input metadata is unavailable");
+               status == VX_STATUS_OK ? "logical PTQ input spec returned" :
+                                        "logical PTQ input spec is unavailable");
     return status;
 }
 
-static VxStatus ptq_validate_inputs_locked(VxPTQPlan* plan,
-                                           const VxPTQInput* inputs,
-                                           size_t input_count) {
-    VxEngineStateScope scope;
-    int expected_count;
-    if (!inputs || !input_count || input_count > (size_t)INT32_MAX)
-        return VX_STATUS_INVALID_ARGUMENT;
-    scope = vx_engine_state_scope_enter(plan->engine);
-    expected_count = volvoxai_engine_graph_input_count();
-    if (expected_count <= 0 || input_count != (size_t)expected_count) {
-        vx_engine_state_scope_leave(scope);
-        return VX_STATUS_INVALID_ARGUMENT;
-    }
-    for (size_t index = 0; index < input_count; index++) {
-        const VxPTQInput* input = &inputs[index];
+static int ptq_coverage_complete_locked(const VxPTQPlan* plan) {
+    if (!plan || !plan->profile_count) return 0;
+    for (size_t index = 0; index < plan->profile_count; index++)
+        if (!plan->profiles[index].batch_count ||
+            !plan->profiles[index].sample_count) return 0;
+    return 1;
+}
+
+static void ptq_fill_info_locked(const VxPTQPlan* plan,
+                                 VxPTQPlanInfo* info) {
+    size_t covered = 0;
+    size_t struct_size = info->struct_size;
+    for (size_t index = 0; index < plan->profile_count; index++)
+        if (plan->profiles[index].batch_count &&
+            plan->profiles[index].sample_count) covered++;
+    memset(info, 0, sizeof(*info));
+    info->struct_size = struct_size;
+    info->calibration_batches = plan->sample_count;
+    info->calibration_samples = plan->represented_sample_count;
+    info->tensor_count = plan->observer_count;
+    info->profile_count = plan->profile_count;
+    info->covered_profile_count = covered;
+    info->coverage_complete = covered == plan->profile_count;
+    info->revision = plan->revision;
+}
+
+static const VxTensorBinding* ptq_batch_binding(
+        const VxPTQCalibrationBatch* batch,
+        const char* name) {
+    for (size_t index = 0; index < batch->input_count; index++)
+        if (!strcmp(batch->inputs[index].name, name)) return &batch->inputs[index];
+    return NULL;
+}
+
+static int ptq_profile_signature_exists(const VxOwnedPTQProfile* profile,
+                                        const char* signature) {
+    for (size_t index = 0; index < profile->signature_count; index++)
+        if (!strcmp(profile->signatures[index], signature)) return 1;
+    return 0;
+}
+
+static VxStatus ptq_profile_reserve_signature(VxOwnedPTQProfile* profile) {
+    char** expanded;
+    size_t capacity;
+    if (profile->signature_count < profile->signature_capacity)
+        return VX_STATUS_OK;
+    capacity = profile->signature_capacity
+        ? profile->signature_capacity * 2u : 4u;
+    if (capacity < profile->signature_capacity ||
+        capacity > SIZE_MAX / sizeof(*expanded)) return VX_STATUS_OUT_OF_MEMORY;
+    expanded = (char**)realloc(profile->signatures,
+                               capacity * sizeof(*expanded));
+    if (!expanded) return VX_STATUS_OUT_OF_MEMORY;
+    profile->signatures = expanded;
+    profile->signature_capacity = capacity;
+    return VX_STATUS_OK;
+}
+
+static VxStatus ptq_activation_sizes_locked(
+        VxPTQPlan* plan,
+        const VxOwnedPTQProfile* profile,
+        uint64_t* values) {
+    VxEngineStateScope scope = vx_engine_state_scope_enter(plan->engine);
+    VxStatus status = VX_STATUS_OK;
+    for (size_t index = 0; index < plan->observer_count; index++) {
         long numel = 0;
         int shape[VX_MAX_TENSOR_RANK] = {0};
         int rank = 0;
         int dtype = -1;
         size_t element_size = 0;
-        int found = 0;
-        if (input->struct_size < sizeof(*input) ||
-            !ptq_name_valid(input->name) ||
-            (input->byte_size && !input->data)) {
-            vx_engine_state_scope_leave(scope);
-            return VX_STATUS_INVALID_ARGUMENT;
+        if (volvoxai_engine_tensor_info_ex(
+                plan->observers[index].name, &numel, shape, &rank,
+                &dtype, &element_size) != 0 || numel <= 0 ||
+            dtype != VX_DTYPE_F32 ||
+            (uint64_t)numel > UINT64_MAX - profile->activations[index].values) {
+            status = VX_STATUS_INVALID_GRAPH;
+            break;
         }
-        for (size_t prior = 0; prior < index; prior++) {
-            if (!strcmp(inputs[prior].name, input->name)) {
-                vx_engine_state_scope_leave(scope);
-                return VX_STATUS_INVALID_ARGUMENT;
-            }
-        }
-        for (int descriptor = 0; descriptor < expected_count; descriptor++) {
-            const char* name = volvoxai_engine_graph_input_name(descriptor);
-            if (name && !strcmp(name, input->name)) {
-                found = 1;
+        values[index] = (uint64_t)numel;
+    }
+    vx_engine_state_scope_leave(scope);
+    return status;
+}
+
+static void ptq_profile_update_symbols(
+        VxPTQPlan* plan,
+        VxOwnedPTQProfile* profile,
+        const VxPTQCalibrationBatch* batch) {
+    for (size_t input = 0; input < plan->input_count; input++) {
+        VxTensorSpec spec = VX_TENSOR_SPEC_INIT;
+        if (vx_model_internal_input_spec(plan->model, input, &spec) !=
+            VX_STATUS_OK) continue;
+        const VxTensorBinding* binding = ptq_batch_binding(batch, spec.name);
+        if (!binding) continue;
+        for (uint32_t axis = 0; axis < spec.rank; axis++) {
+            const char* symbol = spec.dimensions[axis].symbol;
+            if (!symbol) continue;
+            for (size_t index = 0; index < profile->symbol_count; index++) {
+                VxOwnedPTQSymbolCoverage* coverage = &profile->symbols[index];
+                int64_t extent = binding->shape[axis];
+                if (strcmp(coverage->name, symbol)) continue;
+                if (!profile->batch_count || extent < coverage->minimum)
+                    coverage->minimum = extent;
+                if (!profile->batch_count || extent > coverage->maximum)
+                    coverage->maximum = extent;
                 break;
             }
         }
-        if (!found || volvoxai_engine_tensor_info_ex(
-                input->name, &numel, shape, &rank, &dtype, &element_size) != 0 ||
-            numel < 0 || !element_size ||
-            (size_t)numel > SIZE_MAX / element_size ||
-            dtype != input->dtype ||
-            (size_t)numel * element_size != input->byte_size) {
-            vx_engine_state_scope_leave(scope);
-            return VX_STATUS_INVALID_ARGUMENT;
-        }
     }
-    vx_engine_state_scope_leave(scope);
-    return VX_STATUS_OK;
 }
 
 VxStatus vx_ptq_plan_calibrate(VxPTQPlan* plan,
-                               const char* sample_name,
-                               const VxPTQInput* inputs,
-                               size_t input_count,
-                               uint64_t* calibration_samples,
+                               const VxPTQCalibrationBatch* batch,
+                               VxPTQPlanInfo* info,
                                VxReport* report) {
     VxStatus status;
     volvoxai_ptq_input_binding_t* bindings = NULL;
     char* owned_sample = NULL;
+    char* shape_signature = NULL;
+    char* owned_signature = NULL;
     char** next_names = NULL;
-    uint64_t samples = 0;
-    if (!plan || !ptq_name_valid(sample_name) || !calibration_samples) {
+    uint64_t* activation_values = NULL;
+    VxOwnedPTQProfile* profile = NULL;
+    uint64_t core_batches = 0;
+    int add_signature = 0;
+    if (!ptq_report_argument_valid(report))
+        return VX_STATUS_INVALID_ARGUMENT;
+    if (!plan || !batch || batch->struct_size != sizeof(*batch) ||
+        !ptq_profile_name_valid(batch->profile_name) ||
+        !ptq_name_valid(batch->sample_name) || !batch->sample_count ||
+        !batch->inputs || !batch->input_count ||
+        batch->input_count > (size_t)INT32_MAX ||
+        !info || info->struct_size != sizeof(*info)) {
         ptq_report(plan, report, VX_STATUS_INVALID_ARGUMENT,
                    VX_STAGE_PTQ_CALIBRATE, "INVALID_CALIBRATION_SAMPLE",
-                   "named calibration sample arguments are invalid");
+                   "named shape-bearing calibration batch is invalid");
         return VX_STATUS_INVALID_ARGUMENT;
     }
-    *calibration_samples = 0;
     pthread_mutex_lock(&plan->mutex);
     status = ptq_current_locked(plan);
     if (status != VX_STATUS_OK) goto done;
-    status = ptq_validate_inputs_locked(plan, inputs, input_count);
-    if (status != VX_STATUS_OK || ptq_sample_exists(plan, sample_name)) {
+    profile = ptq_profile_find(plan, batch->profile_name);
+    if (!profile || ptq_sample_exists(plan, batch->sample_name) ||
+        profile->batch_count == UINT64_MAX ||
+        batch->sample_count > UINT64_MAX - profile->sample_count ||
+        batch->sample_count > UINT64_MAX - plan->represented_sample_count ||
+        profile->sample_count + batch->sample_count > VX_PTQ_MAX_SAFE_INTEGER ||
+        plan->represented_sample_count + batch->sample_count >
+            VX_PTQ_MAX_SAFE_INTEGER ||
+        plan->sample_count >= (size_t)VX_PTQ_MAX_SAFE_INTEGER) {
         status = VX_STATUS_INVALID_ARGUMENT;
         goto done;
     }
+    status = vx_model_internal_bind_authoring_inputs(
+        plan->model, plan->engine, VOLVOXAI_BACKEND_CPU,
+        batch->inputs, batch->input_count, NULL, &shape_signature, report);
+    if (status != VX_STATUS_OK) goto done;
     if (plan->sample_count == SIZE_MAX ||
         plan->sample_count + 1u > SIZE_MAX / sizeof(*next_names)) {
         status = VX_STATUS_OUT_OF_MEMORY;
         goto done;
     }
-    owned_sample = ptq_string_copy(sample_name);
+    add_signature = !ptq_profile_signature_exists(profile, shape_signature);
+    if (add_signature) {
+        status = ptq_profile_reserve_signature(profile);
+        if (status != VX_STATUS_OK) goto done;
+        owned_signature = ptq_string_copy(shape_signature);
+        if (!owned_signature) {
+            status = VX_STATUS_OUT_OF_MEMORY;
+            goto done;
+        }
+    }
+    activation_values = (uint64_t*)calloc(
+        plan->observer_count, sizeof(*activation_values));
+    if (!activation_values) {
+        status = VX_STATUS_OUT_OF_MEMORY;
+        goto done;
+    }
+    status = ptq_activation_sizes_locked(plan, profile, activation_values);
+    if (status != VX_STATUS_OK) goto done;
+    owned_sample = ptq_string_copy(batch->sample_name);
     bindings = (volvoxai_ptq_input_binding_t*)calloc(
-        input_count, sizeof(*bindings));
+        batch->input_count, sizeof(*bindings));
     next_names = (char**)malloc((plan->sample_count + 1u) * sizeof(*next_names));
     if (!owned_sample || !bindings || !next_names) {
         status = VX_STATUS_OUT_OF_MEMORY;
@@ -738,22 +949,23 @@ VxStatus vx_ptq_plan_calibrate(VxPTQPlan* plan,
     if (plan->sample_count)
         memcpy(next_names, plan->sample_names,
                plan->sample_count * sizeof(*next_names));
-    for (size_t index = 0; index < input_count; index++) {
+    for (size_t index = 0; index < batch->input_count; index++) {
         bindings[index] = (volvoxai_ptq_input_binding_t)
             VOLVOXAI_PTQ_INPUT_BINDING_INIT;
-        bindings[index].tensor_name = inputs[index].name;
-        bindings[index].dtype = inputs[index].dtype;
-        bindings[index].data = inputs[index].data;
-        bindings[index].nbytes = inputs[index].byte_size;
+        bindings[index].tensor_name = batch->inputs[index].name;
+        bindings[index].dtype = batch->inputs[index].dtype;
+        bindings[index].data = batch->inputs[index].data;
+        bindings[index].nbytes = batch->inputs[index].byte_size;
     }
     {
         VxEngineStateScope scope = vx_engine_state_scope_enter(plan->engine);
         int result = volvoxai_engine_ptq_plan_calibrate_sample(
-            plan->core, sample_name, bindings, (int32_t)input_count);
+            plan->core, batch->sample_name, bindings,
+            (int32_t)batch->input_count);
         if (result == 0)
-            samples = volvoxai_ptq_plan_calibration_samples(plan->core);
+            core_batches = volvoxai_ptq_plan_calibration_samples(plan->core);
         vx_engine_state_scope_leave(scope);
-        if (result != 0 || samples != plan->sample_count + 1u) {
+        if (result != 0 || core_batches != plan->sample_count + 1u) {
             status = VX_STATUS_EXECUTION_FAILED;
             goto done;
         }
@@ -764,11 +976,24 @@ VxStatus vx_ptq_plan_calibrate(VxPTQPlan* plan,
     plan->sample_names = next_names;
     next_names = NULL;
     plan->sample_count++;
-    *calibration_samples = samples;
+    plan->represented_sample_count += batch->sample_count;
+    ptq_profile_update_symbols(plan, profile, batch);
+    profile->batch_count++;
+    profile->sample_count += batch->sample_count;
+    if (add_signature) {
+        profile->signatures[profile->signature_count++] = owned_signature;
+        owned_signature = NULL;
+    }
+    for (size_t index = 0; index < profile->activation_count; index++)
+        profile->activations[index].values += activation_values[index];
+    ptq_fill_info_locked(plan, info);
     status = VX_STATUS_OK;
 
 done:
     free(owned_sample);
+    free(owned_signature);
+    free(shape_signature);
+    free(activation_values);
     free(bindings);
     free(next_names);
     pthread_mutex_unlock(&plan->mutex);
@@ -779,8 +1004,9 @@ done:
                status == VX_STATUS_REVISION_CONFLICT ? "REVISION_CONFLICT" :
                status == VX_STATUS_HANDLE_DISPOSED ? "HANDLE_DISPOSED" :
                "CALIBRATION_EXECUTION_FAILED",
-               status == VX_STATUS_OK ? "calibration sample committed atomically" :
-                                        "calibration sample was not committed");
+               status == VX_STATUS_OK
+                   ? "named shape profile calibration batch committed atomically"
+                   : "calibration batch was not committed");
     return status;
 }
 
@@ -788,7 +1014,9 @@ VxStatus vx_ptq_plan_info(VxPTQPlan* plan,
                           VxPTQPlanInfo* info,
                           VxReport* report) {
     VxStatus status;
-    if (!plan || !info || info->struct_size < sizeof(*info)) {
+    if (!ptq_report_argument_valid(report))
+        return VX_STATUS_INVALID_ARGUMENT;
+    if (!plan || !info || info->struct_size != sizeof(*info)) {
         ptq_report(plan, report, VX_STATUS_INVALID_ARGUMENT,
                    VX_STAGE_PTQ_INSPECT, "INVALID_PTQ_INFO",
                    "PTQ plan info buffer is invalid");
@@ -796,14 +1024,7 @@ VxStatus vx_ptq_plan_info(VxPTQPlan* plan,
     }
     pthread_mutex_lock(&plan->mutex);
     status = ptq_current_locked(plan);
-    if (status == VX_STATUS_OK) {
-        size_t struct_size = info->struct_size;
-        memset(info, 0, sizeof(*info));
-        info->struct_size = struct_size;
-        info->calibration_samples = plan->sample_count;
-        info->tensor_count = plan->observer_count;
-        info->revision = plan->revision;
-    }
+    if (status == VX_STATUS_OK) ptq_fill_info_locked(plan, info);
     pthread_mutex_unlock(&plan->mutex);
     ptq_report(plan, report, status, VX_STAGE_PTQ_INSPECT,
                status == VX_STATUS_OK ? "OK" :
@@ -815,13 +1036,206 @@ VxStatus vx_ptq_plan_info(VxPTQPlan* plan,
     return status;
 }
 
+VxStatus vx_ptq_plan_profile_coverage(
+        VxPTQPlan* plan,
+        size_t index,
+        VxPTQProfileCoverage* coverage,
+        VxReport* report) {
+    VxStatus status;
+    if (!ptq_report_argument_valid(report))
+        return VX_STATUS_INVALID_ARGUMENT;
+    if (!plan || !coverage || coverage->struct_size != sizeof(*coverage)) {
+        ptq_report(plan, report, VX_STATUS_INVALID_ARGUMENT,
+                   VX_STAGE_PTQ_INSPECT, "INVALID_PTQ_PROFILE_QUERY",
+                   "PTQ profile coverage buffer is invalid");
+        return VX_STATUS_INVALID_ARGUMENT;
+    }
+    pthread_mutex_lock(&plan->mutex);
+    status = ptq_current_locked(plan);
+    if (status == VX_STATUS_OK && index >= plan->profile_count)
+        status = VX_STATUS_NOT_FOUND;
+    if (status == VX_STATUS_OK) {
+        const VxOwnedPTQProfile* profile = &plan->profiles[index];
+        size_t struct_size = coverage->struct_size;
+        memset(coverage, 0, sizeof(*coverage));
+        coverage->struct_size = struct_size;
+        snprintf(coverage->profile_name, sizeof(coverage->profile_name),
+                 "%s", profile->name);
+        coverage->calibration_batches = profile->batch_count;
+        coverage->calibration_samples = profile->sample_count;
+        coverage->shape_signature_count = profile->signature_count;
+        coverage->symbol_count = profile->symbol_count;
+    }
+    pthread_mutex_unlock(&plan->mutex);
+    ptq_report(plan, report, status, VX_STAGE_PTQ_INSPECT,
+               status == VX_STATUS_OK ? "OK" :
+               status == VX_STATUS_NOT_FOUND ? "PTQ_PROFILE_NOT_FOUND" :
+               status == VX_STATUS_REVISION_CONFLICT ? "REVISION_CONFLICT" :
+               status == VX_STATUS_HANDLE_DISPOSED ? "HANDLE_DISPOSED" :
+               "PTQ_PROFILE_QUERY_FAILED",
+               status == VX_STATUS_OK ? "PTQ profile coverage returned" :
+                                        "PTQ profile coverage is unavailable");
+    return status;
+}
+
+static char* ptq_coverage_json_locked(const VxPTQPlan* plan) {
+    cJSON* root = cJSON_CreateObject();
+    cJSON* profiles = NULL;
+    char* encoded = NULL;
+    const char* fingerprint =
+        vx_model_internal_logical_fingerprint(plan->model);
+    if (!root || !fingerprint || !fingerprint[0] ||
+        !cJSON_AddStringToObject(root, "format", "volvox.ptq-coverage/v1") ||
+        !cJSON_AddStringToObject(root, "logicalFingerprint", fingerprint) ||
+        !cJSON_AddBoolToObject(root, "complete",
+                               ptq_coverage_complete_locked(plan)) ||
+        !cJSON_AddNumberToObject(root, "totalBatches",
+                                 (double)plan->sample_count) ||
+        !cJSON_AddNumberToObject(root, "totalSamples",
+                                 (double)plan->represented_sample_count))
+        goto done;
+    profiles = cJSON_CreateArray();
+    if (!profiles) goto done;
+    if (!cJSON_AddItemToObject(root, "profiles", profiles)) {
+        cJSON_Delete(profiles);
+        goto done;
+    }
+    for (size_t index = 0; index < plan->profile_count; index++) {
+        const VxOwnedPTQProfile* source = &plan->profiles[index];
+        cJSON* profile = cJSON_CreateObject();
+        cJSON* signatures = NULL;
+        cJSON* symbols = NULL;
+        cJSON* activations = NULL;
+        if (!profile ||
+            !cJSON_AddStringToObject(profile, "name", source->name) ||
+            !cJSON_AddNumberToObject(profile, "batches",
+                                     (double)source->batch_count) ||
+            !cJSON_AddNumberToObject(profile, "samples",
+                                     (double)source->sample_count))
+            goto profile_failed;
+        signatures = cJSON_CreateArray();
+        if (!signatures) goto profile_failed;
+        if (!cJSON_AddItemToObject(profile, "signatures", signatures)) {
+            cJSON_Delete(signatures);
+            goto profile_failed;
+        }
+        for (size_t signature = 0; signature < source->signature_count;
+             signature++) {
+            cJSON* value = cJSON_CreateString(source->signatures[signature]);
+            if (!value || !cJSON_AddItemToArray(signatures, value)) {
+                cJSON_Delete(value);
+                goto profile_failed;
+            }
+        }
+        symbols = cJSON_CreateObject();
+        if (!symbols) goto profile_failed;
+        if (!cJSON_AddItemToObject(profile, "symbols", symbols)) {
+            cJSON_Delete(symbols);
+            goto profile_failed;
+        }
+        if (source->batch_count) {
+            for (size_t symbol = 0; symbol < source->symbol_count; symbol++) {
+                cJSON* range = cJSON_CreateObject();
+                if (!range || !cJSON_AddNumberToObject(
+                        range, "minimum", (double)source->symbols[symbol].minimum) ||
+                    !cJSON_AddNumberToObject(
+                        range, "maximum", (double)source->symbols[symbol].maximum) ||
+                    !cJSON_AddItemToObject(
+                        symbols, source->symbols[symbol].name, range)) {
+                    cJSON_Delete(range);
+                    goto profile_failed;
+                }
+            }
+        }
+        activations = cJSON_CreateObject();
+        if (!activations) goto profile_failed;
+        if (!cJSON_AddItemToObject(
+                profile, "activationSamples", activations)) {
+            cJSON_Delete(activations);
+            goto profile_failed;
+        }
+        for (size_t activation = 0;
+             activation < source->activation_count; activation++) {
+            if (!cJSON_AddNumberToObject(
+                    activations, source->activations[activation].name,
+                    (double)source->activations[activation].values)) {
+                goto profile_failed;
+            }
+        }
+        if (!cJSON_AddItemToArray(profiles, profile)) {
+            goto profile_failed;
+        }
+        continue;
+profile_failed:
+        cJSON_Delete(profile);
+        goto done;
+    }
+    encoded = cJSON_PrintUnformatted(root);
+done:
+    cJSON_Delete(root);
+    return encoded;
+}
+
+VxStatus vx_ptq_plan_coverage_json(VxPTQPlan* plan,
+                                   char* output,
+                                   size_t output_capacity,
+                                   size_t* required_size,
+    VxReport* report) {
+    VxStatus status;
+    char* encoded = NULL;
+    size_t required = 0;
+    if (!ptq_report_argument_valid(report))
+        return VX_STATUS_INVALID_ARGUMENT;
+    if (!plan || !required_size || (!output && output_capacity)) {
+        ptq_report(plan, report, VX_STATUS_INVALID_ARGUMENT,
+                   VX_STAGE_PTQ_INSPECT, "INVALID_PTQ_COVERAGE_QUERY",
+                   "PTQ coverage JSON query is invalid");
+        return VX_STATUS_INVALID_ARGUMENT;
+    }
+    *required_size = 0;
+    pthread_mutex_lock(&plan->mutex);
+    status = ptq_current_locked(plan);
+    if (status == VX_STATUS_OK) {
+        encoded = ptq_coverage_json_locked(plan);
+        if (!encoded) {
+            status = VX_STATUS_OUT_OF_MEMORY;
+        } else {
+            required = strlen(encoded) + 1u;
+            *required_size = required;
+            if (output) {
+                if (output_capacity < required) {
+                    status = VX_STATUS_INVALID_ARGUMENT;
+                } else {
+                    memcpy(output, encoded, required);
+                }
+            }
+        }
+    }
+    pthread_mutex_unlock(&plan->mutex);
+    free(encoded);
+    ptq_report(plan, report, status, VX_STAGE_PTQ_INSPECT,
+               status == VX_STATUS_OK ? "OK" :
+               status == VX_STATUS_INVALID_ARGUMENT
+                   ? "PTQ_COVERAGE_BUFFER_TOO_SMALL" :
+               status == VX_STATUS_OUT_OF_MEMORY ? "OUT_OF_MEMORY" :
+               status == VX_STATUS_REVISION_CONFLICT ? "REVISION_CONFLICT" :
+               status == VX_STATUS_HANDLE_DISPOSED ? "HANDLE_DISPOSED" :
+               "PTQ_COVERAGE_QUERY_FAILED",
+               status == VX_STATUS_OK ? "PTQ profile coverage JSON returned" :
+                                        "PTQ profile coverage JSON is unavailable");
+    return status;
+}
+
 VxStatus vx_ptq_plan_tensor_parameters(
     VxPTQPlan* plan,
     size_t index,
     VxPTQTensorParameters* parameters,
     VxReport* report) {
     VxStatus status;
-    if (!plan || !parameters || parameters->struct_size < sizeof(*parameters)) {
+    if (!ptq_report_argument_valid(report))
+        return VX_STATUS_INVALID_ARGUMENT;
+    if (!plan || !parameters ||
+        parameters->struct_size != sizeof(*parameters)) {
         ptq_report(plan, report, VX_STATUS_INVALID_ARGUMENT,
                    VX_STAGE_PTQ_INSPECT, "INVALID_PTQ_TENSOR_QUERY",
                    "PTQ tensor parameter buffer is invalid");
@@ -872,7 +1286,9 @@ VxStatus vx_ptq_plan_write_package(VxPTQPlan* plan,
                                    const VxPTQPackageOptions* options,
                                    VxReport* report) {
     VxStatus status;
-    if (!plan || !options || options->struct_size < sizeof(*options) ||
+    if (!ptq_report_argument_valid(report))
+        return VX_STATUS_INVALID_ARGUMENT;
+    if (!plan || !options || options->struct_size != sizeof(*options) ||
         !ptq_output_graph_name_valid(options->output_graph_path) ||
         !ptq_weights_name_valid(options->output_weights_path) ||
         !ptq_paths_are_siblings(options->output_graph_path,
@@ -885,29 +1301,41 @@ VxStatus vx_ptq_plan_write_package(VxPTQPlan* plan,
     }
     pthread_mutex_lock(&plan->mutex);
     status = ptq_current_locked(plan);
-    if (status == VX_STATUS_OK && !plan->sample_count)
+    if (status == VX_STATUS_OK && !ptq_coverage_complete_locked(plan))
         status = VX_STATUS_INVALID_ARGUMENT;
     if (status == VX_STATUS_OK) {
         volvoxai_ptq_package_options_t target = VOLVOXAI_PTQ_PACKAGE_OPTIONS_INIT;
         VxEngineStateScope scope;
+        char* coverage_json = ptq_coverage_json_locked(plan);
+        if (!coverage_json) {
+            status = VX_STATUS_OUT_OF_MEMORY;
+            goto write_done;
+        }
         target.template_graph_path = plan->template_graph_snapshot;
         target.source_weights_path = plan->engine->weight_paths[0];
         target.output_graph_path = options->output_graph_path;
         target.output_weights_path = options->output_weights_path;
+        target.logical_fingerprint =
+            vx_model_internal_logical_fingerprint(plan->model);
+        target.profile_coverage_json = coverage_json;
         scope = vx_engine_state_scope_enter(plan->engine);
         if (volvoxai_ptq_plan_write_package(plan->core, &target) != 0)
             status = VX_STATUS_INVALID_GRAPH;
         vx_engine_state_scope_leave(scope);
+        free(coverage_json);
     }
+write_done:
     pthread_mutex_unlock(&plan->mutex);
     ptq_report(plan, report, status, VX_STAGE_PTQ_WRITE,
                status == VX_STATUS_OK ? "OK" :
-               status == VX_STATUS_INVALID_ARGUMENT ? "CALIBRATION_REQUIRED" :
+               status == VX_STATUS_INVALID_ARGUMENT ? "PTQ_PROFILE_COVERAGE_REQUIRED" :
+               status == VX_STATUS_OUT_OF_MEMORY ? "OUT_OF_MEMORY" :
                status == VX_STATUS_INVALID_GRAPH ? "PTQ_PACKAGE_WRITE_FAILED" :
                status == VX_STATUS_REVISION_CONFLICT ? "REVISION_CONFLICT" :
                status == VX_STATUS_HANDLE_DISPOSED ? "HANDLE_DISPOSED" :
                "PTQ_WRITE_FAILED",
-               status == VX_STATUS_OK ? "W8A8 package written as graph.json plus safetensors" :
-                                        "PTQ package was not written");
+               status == VX_STATUS_OK
+                   ? "W8A8 package written with complete named-profile coverage"
+                   : "PTQ package was not written");
     return status;
 }

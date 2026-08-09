@@ -45,6 +45,17 @@ test('browser profiles stay monolithic and preserve their dependency boundaries'
   assert.equal(full.outputFiles.length, 1);
   assert.equal(wasm.outputFiles.length, 1);
   assert.deepEqual(trainingInputs(inference), []);
+  const inferenceInputs = Object.keys(inference.metafile.inputs);
+  for (const forbiddenInput of [
+    'ts/core/RuntimeGraphLoader.ts',
+    'ts/core/RuntimeGraphBuilder.ts',
+  ]) {
+    assert.equal(
+      inferenceInputs.includes(forbiddenInput),
+      false,
+      `inference bundle unexpectedly contains legacy model input ${forbiddenInput}`,
+    );
+  }
   for (const forbiddenInput of [
     'ts/ops/dropout.ts',
     'ts/ops/attentionDropout.ts',
@@ -163,6 +174,15 @@ test('package exports use readable defaults and explicit minified variants', asy
   assert.deepEqual(packageJson.files, ['bin/', `dist/${packageJson.version}/`]);
 });
 
+test('the shipped CLI uses only the logical v1 lifecycle', async () => {
+  const source = await readFile(new URL('../bin/volvox.js', import.meta.url), 'utf8');
+  assert.match(source, /\bModelLoader\.load\s*\(modelUrl\.href\)/);
+  assert.match(source, /\bModel\.capture\s*\(/);
+  assert.match(source, /\bruntime\.compile\s*\(/);
+  assert.doesNotMatch(source, /\bruntime\.loadModel\s*\(/);
+  assert.doesNotMatch(source, /\bmodel\.compile\s*\(/);
+});
+
 test('the bundled inference entry resolves its adjacent WASM sidecar', async () => {
   const directory = await mkdtemp(join(tmpdir(), 'volvoxai-wasm-profile-'));
   try {
@@ -263,6 +283,7 @@ test('the browser-only WASM entry resolves its adjacent full WASM sidecar', asyn
       'WasmPTQ', 'WasmPTQObserver', 'createWasmPTQ',
       'normalizeCrossEntropyLosses', 'crossEntropyGradient', 'addGradient',
       'executionIdentity', 'normalizeBackendReport', 'releaseBackendExecutionSnapshot',
+      'createExecutionResult',
       'cloneRuntimeArray', 'AdapterManager', 'ModelSnapshot', 'runtimeError',
       'parseStrictJSON',
     ]) assert.equal(module[hidden], undefined);

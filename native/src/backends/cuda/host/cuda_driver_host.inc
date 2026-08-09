@@ -108,6 +108,13 @@ static int cuda_load_driver_api(void) {
     CUDA_LOAD(p_cuDeviceGetName, PFN_cuDeviceGetName, "cuDeviceGetName");
     CUDA_LOAD(p_cuDeviceComputeCapability, PFN_cuDeviceComputeCapability,
               "cuDeviceComputeCapability");
+    CUDA_LOAD(p_cuDeviceGetAttribute, PFN_cuDeviceGetAttribute,
+              "cuDeviceGetAttribute");
+    p_cuDeviceTotalMem =
+        (PFN_cuDeviceTotalMem)cuda_symbol("cuDeviceTotalMem_v2");
+    if (!p_cuDeviceTotalMem)
+        CUDA_LOAD(p_cuDeviceTotalMem, PFN_cuDeviceTotalMem,
+                  "cuDeviceTotalMem");
     CUDA_LOAD(p_cuDevicePrimaryCtxRetain, PFN_cuDevicePrimaryCtxRetain,
               "cuDevicePrimaryCtxRetain");
     p_cuDevicePrimaryCtxRelease = (PFN_cuDevicePrimaryCtxRelease)

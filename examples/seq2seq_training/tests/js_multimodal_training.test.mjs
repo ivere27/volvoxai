@@ -1,8 +1,11 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
-import { ModelBuilder, importModelCheckpoint } from '../../../ts/full.js';
-import { createCPUTrainingHarness } from '../../../tests/helpers/training_session.mjs';
+import { TrainingModelBuilder as ModelBuilder } from '../../../ts/training/TrainingModelBuilder.js';
+import {
+  createCPUTrainingHarness,
+  trainingGraphFromCheckpoint,
+} from '../../../tests/helpers/training_session.mjs';
 import { buildEncoderDecoderTransformer } from '../Seq2SeqBuilder.js';
 
 test('NHWC Conv2D + GroupNorm image features train through a multimodal encoder-decoder', async () => {
@@ -86,7 +89,7 @@ test('NHWC Conv2D + GroupNorm image features train through a multimodal encoder-
       updateMode: 'adamw',
       optimizer: { learningRate: 2e-3, maxGradNorm: 1 },
     });
-    trained = importModelCheckpoint(await training.exportCheckpoint(graph)).graph;
+    trained = trainingGraphFromCheckpoint(await training.exportCheckpoint(graph));
   } finally {
     await training.close();
   }

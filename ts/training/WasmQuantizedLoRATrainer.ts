@@ -1,8 +1,8 @@
 import { WasmEngine } from '../backends/WasmEngine.js';
-import { Graph } from '../core/Graph.js';
+import { RuntimeGraph } from '../core/RuntimeGraph.js';
 import { Tensor } from '../core/Tensor.js';
 import type { PerAxisQuantization } from '../types.js';
-import type { TrainingStepOptions } from './TrainingStep.js';
+import type { TrainingKernelStepOptions } from './TrainingStep.js';
 import { ensureTrainingGraphState } from './TrainingGraph.js';
 import { WasmAutograd } from './WasmAutograd.js';
 import { resolveTrainingOptimizer } from './TrainingOptimizer.js';
@@ -77,11 +77,11 @@ function sameShape(left: readonly number[], right: readonly number[]): boolean {
 }
 
 function stageBindings(
-  trainingGraph: Graph,
-  inferenceGraph: Graph,
+  trainingGraph: RuntimeGraph,
+  inferenceGraph: RuntimeGraph,
   inputs: readonly WasmQuantizedLoRABinding[],
 ): StagedBinding[] {
-  if (!(trainingGraph instanceof Graph) || !(inferenceGraph instanceof Graph)) {
+  if (!(trainingGraph instanceof RuntimeGraph) || !(inferenceGraph instanceof RuntimeGraph)) {
     throw new Error('Quantized LoRA training requires VolvoxAI training and inference graphs.');
   }
   if (trainingGraph === inferenceGraph) {
@@ -191,8 +191,8 @@ function stageBindings(
  * separate W8 graph is an inference snapshot refreshed after applied updates.
  */
 export class WasmQuantizedLoRATrainer {
-  readonly trainingGraph: Graph;
-  readonly inferenceGraph: Graph;
+  readonly trainingGraph: RuntimeGraph;
+  readonly inferenceGraph: RuntimeGraph;
   readonly engine: WasmEngine;
   readonly trainer: WasmAutograd;
   readonly bindings: readonly Readonly<Required<WasmQuantizedLoRABinding>>[];
@@ -206,8 +206,8 @@ export class WasmQuantizedLoRATrainer {
 
   static async create(
     engine: WasmEngine,
-    trainingGraph: Graph,
-    inferenceGraph: Graph,
+    trainingGraph: RuntimeGraph,
+    inferenceGraph: RuntimeGraph,
     options: WasmQuantizedLoRATrainerOptions,
   ): Promise<WasmQuantizedLoRATrainer> {
     if (!(engine instanceof WasmEngine)) {
@@ -242,8 +242,8 @@ export class WasmQuantizedLoRATrainer {
 
   private constructor(
     engine: WasmEngine,
-    trainingGraph: Graph,
-    inferenceGraph: Graph,
+    trainingGraph: RuntimeGraph,
+    inferenceGraph: RuntimeGraph,
     trainer: WasmAutograd,
     bindings: readonly StagedBinding[],
   ) {
@@ -362,7 +362,6 @@ export class WasmQuantizedLoRATrainer {
         weightRevision: this.inferenceGraph.weightRevision,
       });
     }
-    this.inferenceGraph.adapters?._assertBaseMutationAllowed();
     const packed = this._stagePacked(bindings);
     const snapshots: TargetSnapshot[] = packed.map(({ binding }) => ({
       binding,
@@ -432,7 +431,7 @@ export class WasmQuantizedLoRATrainer {
       if (this._trained || this._initializedFromQuantized) {
         throw new Error('Quantized LoRA masters can only be initialized once before this trainer updates them.');
       }
-      const stateful = this.trainingGraph as Graph & {
+      const stateful = this.trainingGraph as RuntimeGraph & {
         trainingStep?: number;
         optimizerState?: Map<string, unknown> | null;
         _pendingGradientAccumulation?: boolean;
@@ -443,7 +442,6 @@ export class WasmQuantizedLoRATrainer {
           'Quantized LoRA master initialization requires an untrained graph without optimizer or pending-gradient state.',
         );
       }
-      this.trainingGraph.adapters?._assertBaseMutationAllowed();
       const kernels = this.trainer.kernels;
       if (!kernels) throw new Error('WasmQuantizedLoRATrainer has been disposed.');
       const values = this._bindings.map((binding) => kernels.dequantizeWeightI8(
@@ -465,7 +463,7 @@ export class WasmQuantizedLoRATrainer {
 
   /** Train selected bound masters and synchronize only when an update applied. */
   trainStep(
-    options: TrainingStepOptions = {},
+    options: TrainingKernelStepOptions = {},
   ): Promise<WasmTrainStepResult & WasmQuantizedLoRASyncResult> {
     return this._enqueue(async () => {
       this._assertBindingsCurrent();

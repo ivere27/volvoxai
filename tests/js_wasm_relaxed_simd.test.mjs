@@ -4,7 +4,7 @@ import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-import { Graph } from '../ts/core/Graph.js';
+import { RuntimeGraph } from '../ts/core/RuntimeGraph.js';
 import { WasmEngine } from '../ts/backends/WasmEngine.js';
 
 const textEncoder = new TextEncoder();
@@ -76,22 +76,24 @@ async function initFixture(children) {
 }
 
 function decodeQLinearGraph() {
-  const graph = new Graph();
+  const graph = new RuntimeGraph();
   const input = graph.addInput('input', [1, 2, 3], 'int8', {
     quantization: { scheme: 'per_tensor', scale: 0.25, zero_point: -1 },
   });
-  const weight = graph.addWeight('weight', [2, 3], 'int8', {
-    buffer: Int8Array.of(2, 0, -1, -2, 1, 3),
+  const weight = graph.addWeight('weight', [8, 3], 'int8', {
+    buffer: Int8Array.from({ length: 24 }, (_, index) => index % 7 - 3),
     quantization: {
-      scheme: 'per_axis', axis: 0, scales: [0.5, 0.25], zero_points: [1, -2],
+      scheme: 'per_axis', axis: 0,
+      scales: Array.from({ length: 8 }, (_, index) => 0.125 * (index + 1)),
+      zero_points: Array.from({ length: 8 }, (_, index) => index - 4),
     },
   });
-  const bias = graph.addWeight('bias', [2], 'int32', {
-    buffer: Int32Array.of(2, -4),
+  const bias = graph.addWeight('bias', [8], 'int32', {
+    buffer: Int32Array.from({ length: 8 }, (_, index) => index * 3 - 7),
   });
   const { out } = graph.addOp('QLinear', { input, weight, bias }, {
     out: {
-      name: 'out', shape: [1, 2, 2], dtype: 'int8',
+      name: 'out', shape: [1, 2, 8], dtype: 'int8',
       quantization: { scheme: 'per_tensor', scale: 0.125, zero_point: 0 },
     },
   });
@@ -259,9 +261,9 @@ test('WASM Relaxed-SIMD QLinear dispatch is decode-row-only and preserves fallba
     assert.equal(args[0], engine.pointers.get('input') + 3, 'row input byte offset');
     assert.equal(args[1], engine.pointers.get('weight'), 'raw weight pointer');
     assert.equal(args[2], descriptor.packedWeightPointer, 'packed weight pointer');
-    assert.equal(args[6], engine.pointers.get('out') + 2, 'row output byte offset');
+    assert.equal(args[6], engine.pointers.get('out') + 8, 'row output byte offset');
     assert.equal(args[7], 1, 'one decode row');
-    assert.deepEqual(args.slice(8, 10), [3, 2]);
+    assert.deepEqual(args.slice(8, 10), [3, 8]);
   });
 
   await t.test('packed and child descriptor rejection retain the canonical raw fallback', async () => {

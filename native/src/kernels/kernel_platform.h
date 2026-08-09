@@ -59,6 +59,12 @@ typedef struct {
      * probing, and they already reflect the clamp. */
     int has_avx2;
     int has_avx_vnni;
+    /* Vector width, not a tier.  The ladder above orders the integer dot
+     * product kernels, where AVX-512 VNNI is the top rung; an F32 kernel needs
+     * AVX-512F and gets nothing from VNNI, and the two are independent in
+     * hardware.  So this is a separate predicate and the reported isa name
+     * still describes the integer tier. */
+    int has_avx512f;
     int has_avx512_vnni;
     int has_neon;
     int has_arm_dotprod;
@@ -152,6 +158,8 @@ static inline void vx_kernel_platform_resolve(VxKernelPlatform* platform) {
     platform->has_avx2 = allow_avx2 && vx_cpu_has_avx2();
     platform->has_avx_vnni = allow_avx_vnni && platform->has_avx2 &&
         vx_cpu_has_avx_vnni();
+    platform->has_avx512f = allow_avx512_vnni && platform->has_avx2 &&
+        vx_cpu_has_avx512f();
     platform->has_avx512_vnni = allow_avx512_vnni && platform->has_avx2 &&
         vx_cpu_has_avx512_vnni();
     platform->has_neon = allow_neon && vx_cpu_has_neon();

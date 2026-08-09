@@ -48,6 +48,20 @@ LEGACY_SAFETENSORS_METADATA = frozenset({
 })
 
 
+def _node_output_names(node: Mapping[str, Any]) -> tuple[str, ...]:
+    outputs = node.get("outputs")
+    if not isinstance(outputs, Mapping):
+        return ()
+    names: list[str] = []
+    for descriptor in outputs.values():
+        if not isinstance(descriptor, Mapping):
+            continue
+        name = descriptor.get("tensor")
+        if isinstance(name, str):
+            names.append(name)
+    return tuple(names)
+
+
 @dataclass(frozen=True)
 class ExternalizationReport:
     tensors: int
@@ -151,25 +165,22 @@ def _declared_tensors(
             if not isinstance(node, Mapping):
                 continue
             outputs = node.get("outputs")
-            output_dtypes = node.get("outputs_dtype")
-            output_shapes = node.get("outputs_shape")
             if not isinstance(outputs, Mapping):
                 continue
-            for port, name in outputs.items():
+            for descriptor in outputs.values():
+                if not isinstance(descriptor, Mapping):
+                    continue
+                name = descriptor.get("tensor")
+                dtype = descriptor.get("dtype")
+                shape = descriptor.get("shape")
                 if not isinstance(name, str):
                     continue
-                if isinstance(output_dtypes, Mapping) and isinstance(
-                    output_dtypes.get(port), str
+                if isinstance(dtype, str):
+                    dtypes[name] = dtype
+                if isinstance(shape, list) and all(
+                    isinstance(v, int) for v in shape
                 ):
-                    dtypes[name] = str(output_dtypes[port])
-                else:
-                    dtypes.setdefault(name, "float32")
-                if isinstance(output_shapes, Mapping):
-                    shape = output_shapes.get(port)
-                    if isinstance(shape, list) and all(
-                        isinstance(v, int) for v in shape
-                    ):
-                        shapes[name] = tuple(shape)
+                    shapes[name] = tuple(shape)
     return dtypes, shapes
 
 
@@ -196,12 +207,11 @@ def _candidate_parameters(graph: Mapping[str, Any]) -> dict[str, tuple[str | Non
         if op in {"QuantizeLinear", "RequantizeLinear"}:
             scale = inputs.get("scale") or inputs.get("output_scale")
             zero = inputs.get("zero_point") or inputs.get("output_zero_point")
-            for target in outputs.values():
-                if isinstance(target, str):
-                    candidates[target] = (
+            for target in _node_output_names(node):
+                candidates[target] = (
                         scale if isinstance(scale, str) else None,
                         zero if isinstance(zero, str) else None,
-                    )
+                )
         if op == "DequantizeLinear":
             target = inputs.get("input")
             if isinstance(target, str):
@@ -414,8 +424,8 @@ def externalize_quantization(
                 outputs = value.get("outputs")
                 if isinstance(inputs, dict) and isinstance(outputs, Mapping):
                     if value.get("opType") == "QuantizeLinear":
-                        for target in outputs.values():
-                            descriptor = table.get(target) if isinstance(target, str) else None
+                        for target in _node_output_names(value):
+                            descriptor = table.get(target)
                             if descriptor is not None:
                                 inputs["scale"] = descriptor["scale_tensor"]
                                 inputs["zero_point"] = descriptor["zero_point_tensor"]
@@ -518,9 +528,7 @@ def prune_external_quantization(
         for node in nodes:
             outputs = node.get("outputs") if isinstance(node, Mapping) else None
             if isinstance(outputs, Mapping):
-                declared.update(
-                    name for name in outputs.values() if isinstance(name, str)
-                )
+                declared.update(_node_output_names(node))
 
     retained = {
         name: copy.deepcopy(descriptor)
@@ -638,14 +646,12 @@ def validate_external_quantization(
             node_outputs = node.get("outputs")
             if not isinstance(node_inputs, Mapping) or not isinstance(node_outputs, Mapping):
                 continue
-            if parameter_names.intersection(
-                value for value in node_outputs.values() if isinstance(value, str)
-            ):
+            if parameter_names.intersection(_node_output_names(node)):
                 _fail("VXQSTORE047", "quantization parameters cannot be node outputs")
             label = node.get("id") or node.get("source_name") or node.get("opType") or index
             if node.get("opType") == "QuantizeLinear":
-                for target in node_outputs.values():
-                    descriptor = table.get(target) if isinstance(target, str) else None
+                for target in _node_output_names(node):
+                    descriptor = table.get(target)
                     if not isinstance(descriptor, Mapping) or (
                         descriptor.get("scale_tensor") != node_inputs.get("scale")
                         or descriptor.get("zero_point_tensor") != node_inputs.get("zero_point")

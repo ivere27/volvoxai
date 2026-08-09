@@ -240,15 +240,18 @@ model/
 ```
 
 - **`graph.json`** 은 그래프 문서입니다: 순서가 있는 노드 목록이지요. 각 노드는 자신의
-  연산, 입력/출력 텐서, 파라미터, 그리고 정확한 출력 형태(엔진이 절대 추측하지 않도록 익스포터가 미리
-  계산해 둠)를 이름 붙입니다. 다음은 TinyStories의 실제 노드 하나입니다:
+  연산, 입력/출력 텐서, 파라미터, 그리고 타입이 붙은 논리 출력 형태 단언을 이름 붙입니다. 심볼은
+  그래프 `dimensions` 표의 유한 제약을 가리키므로, 컴파일은 요청이 구체적인 값을 바인딩하기 전에
+  가능한 모든 형태를 증명할 수 있습니다. 다음은 TinyStories 노드 하나입니다:
 
   ```json
   {
+    "id": "ln1_0",
     "opType": "LayerNorm",
     "inputs":  { "input": "hidden_0", "weight": "h.0.ln_1.weight", "bias": "h.0.ln_1.bias" },
-    "outputs": { "out": "ln1_0" },
-    "outputs_shape": { "out": [1, 256, 64] },
+    "outputs": {
+      "out": { "tensor": "ln1_0", "shape": [1, 256, 64], "dtype": "float32" }
+    },
     "params": { "eps": 1e-05, "d_model": 64 }
   }
   ```
@@ -257,18 +260,21 @@ model/
   [safetensors](https://github.com/huggingface/safetensors) 형식으로 담습니다 — ML 세계 전반에서
   쓰이는 단순하고 안전한 표준 레이아웃입니다.
 
-🔬 `ts/core/GraphLoader.ts` 가 둘 다 읽어 `Graph` 를 만들고 엔진에 넘깁니다 — 추론 시점에 PyTorch도,
-ONNX Runtime도, 어떤 의존성도 없이 말이지요. 다른 곳에서 **학습한 모델을 익스포트** 해 이 설계도로
-가져올 수도 있고, 또는 — 2부에서 보듯 — VolvoxAI가 **직접 학습해 설계도를 써낼** 수도 있습니다.
+🔬 `ts/core/ModelLoader.ts` 가 둘 다 읽어 불변 `Model` 을 만듭니다 — 추론 시점에
+PyTorch나 ONNX Runtime 의존성 없이 말이지요. 프로바이더는 그 스냅숏을 한 번 컴파일하고, 각
+`ExecutionContext` 는 현재의 구체 입력 형태를 자기 안에서 바인딩하고 해석합니다. 다른 곳에서
+**학습한 모델을 익스포트** 해 이 설계도로 가져올 수도 있고, 또는 — 2부에서 보듯 — VolvoxAI가
+**직접 학습해 설계도를 써낼** 수도 있습니다.
 
 > 🔬 **뜯어보기: `.safetensors` 바이트 레이아웃.** 이 형식은 일부러 파싱이 사소합니다: **8바이트
 > 리틀엔디언 길이**, 그다음 각 텐서 이름을 `{ dtype, shape, data_offsets }` 로 매핑하는 **JSON 헤더**,
 > 그다음 **원시 텐서 바이트** 가 이어집니다. 로딩 중에 아무 코드도 실행되지 않습니다 — 헤더는 코드가
 > 아니라 데이터입니다(Python pickle과 달리 이 안전성이 형식의 핵심). 네이티브 엔진은 파일을 **`mmap`**
 > 하고 각 텐서 버퍼를 매핑된 바이트에 바로 겨냥시켜(`native/src/runtime/safetensors.c`), 가중치는 만질
-> 때까지 RAM에 복사되지 않습니다; 브라우저는 `ts/core/Safetensors.ts` 로 읽습니다. 그리고 `graph.json`
-> 이 이미 모든 `outputs_shape` 를 기록하므로 로딩은 **형태 추론 없이** 한 번의 선형 순회입니다 — 엔진은
-> 실행 시점에 형태를 추론할 필요가 절대 없습니다.
+> 때까지 RAM에 복사되지 않습니다; 브라우저는 `ts/core/Safetensors.ts` 로 읽습니다. `graph.json` 은
+> 경계가 있는 논리 형태와 출력 단언을 기록합니다. 컴파일은 전체 심볼 도메인을 한 번 증명하고,
+> 요청 시에는 검사된 바인딩을 대입해 구체 계획을 캐시합니다. 최대 형태 하나를 전체 도메인의 증거로
+> 믿지 않습니다.
 
 ---
 
@@ -285,8 +291,9 @@ ONNX Runtime도, 어떤 의존성도 없이 말이지요. 다른 곳에서 **학
 
 ```mermaid
 flowchart TD
-    G["그래프 + 가중치"] --> R["VolvoxAI.createRuntime"]
-    R --> SEL{"Model.compile<br/>백엔드 정책 적용"}
+    G["그래프 + 가중치"] --> S["Model"]
+    R["VolvoxAI.createRuntime"] --> SEL{"Runtime.compile(snapshot)<br/>백엔드 정책 적용"}
+    S --> SEL
     SEL -->|브라우저 NPU/GPU| T1["Tier 1 · WebNN"]
     SEL -->|브라우저 GPU| T2["Tier 2 · WebGPU<br/>WGSL 컴퓨트 셰이더"]
     SEL -->|모든 CPU, 빠름| T3["Tier 3 · WASM SIMD<br/>컴파일된 C 커널"]
@@ -303,8 +310,9 @@ flowchart TD
   선택적으로 Vulkan/OpenGL/Metal 위에서 돕니다. **온디바이스 / 엣지 AI** 로 가는 길이며, 9장의 주제입니다.
 
 > 🔬 **뜯어보기: 계층은 어떻게 선택되고, 왜 답은 그대로인가.**
-> `VolvoxAI.createRuntime({ backends })` 는 선택한 공급자를 초기화합니다. `Model.compile()` 은
-> 선호 또는 필수 정책을 적용하고 실행 전에 모든 후보 결과를 기록합니다. 실행 실패 뒤에는 다른
+> `VolvoxAI.createRuntime({ backends })` 는 선택한 공급자를 초기화합니다.
+> `Runtime.compile(snapshot, policy)` 는 선호 또는 필수 정책을 적용하고 실행 전에 모든 후보 결과를
+> 기록합니다. 실행 실패 뒤에는 다른
 > 공급자로 바꾸지 않습니다. 모든 계층이 *속도* 는 달라도 *답* 은 다르지 않은 이유는 순수 JS CPU가
 > **참조** 이고, 패리티 하니스가 다른 모든 계층 — 그리고 9장의 네이티브 공급자 — 을 그것과 좁은
 > 허용오차 안에서 대조하기 때문입니다. "같은 설계도, 같은 답, 여러 주방"은 시험되는 계약입니다.

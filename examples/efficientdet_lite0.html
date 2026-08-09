@@ -218,8 +218,12 @@
   <pre id="out"></pre>
 
   <script type="module">
-    import { Graph, GraphLoader, VolvoxAI } from '../dist/0.3.0/volvoxai.js';
-    import { efficientDetInputFromRgba } from './efficientdet_lite0/image_input.js';
+    import {
+      ModelLoader,
+      Model,
+      VolvoxAI,
+    } from '../dist/0.4.0/volvoxai.js';
+    import { efficientDetInputViewFromRgba } from './efficientdet_lite0/image_input.js';
 
     const MODEL = '../models/efficientdet_lite0_int8/model.safetensors';
     const LABELS = '../models/efficientdet_lite0_int8/labels.txt';
@@ -251,10 +255,9 @@
     const inputCtx = inputCanvas.getContext('2d', { willReadFrequently: true });
 
     let runtime = null;
-    let model = null;
     let compiled = null;
     let context = null;
-    let graph = null;
+    let snapshot = null;
     let inputTensor = null;
     let labels = [];
     let anchors = [];
@@ -322,22 +325,24 @@
       setStatus(`Loading ${backend} backend...`);
       await context?.close();
       await compiled?.close();
-      await model?.close();
       await runtime?.close();
       context = null;
       compiled = null;
-      model = null;
       runtime = await VolvoxAI.createRuntime({
         backends: [backend],
-        wasmUrl: '../dist/0.3.0/volvoxai.wasm',
+        wasmUrl: '../dist/0.4.0/volvoxai.wasm',
       });
-      setStatus('Loading graph...');
-      graph = new Graph();
-      await GraphLoader.load(graph, MODEL);
-      inputTensor = graph.getTensor('input0');
-      if (!inputTensor?.isInput) throw new Error('model is missing image input tensor input0');
-      model = runtime.createModel(graph);
-      compiled = await model.compile({
+      setStatus('Loading logical package...');
+      snapshot = Model.capture(
+        await ModelLoader.load(MODEL),
+      );
+      const logicalInput = snapshot.graph.inputs.input0;
+      if (!logicalInput) throw new Error('model is missing image input tensor input0');
+      inputTensor = {
+        ...logicalInput,
+        quantization: snapshot.quantizationByTensor.input0,
+      };
+      compiled = await runtime.compile(snapshot, {
         backend: { mode: 'require', backend, operatorFallback: 'forbid' },
       });
       context = await compiled.createContext();
@@ -408,7 +413,7 @@
         inputCtx.fillRect(0, 0, W, H);
       }
       const rgba = inputCtx.getImageData(0, 0, W, H).data;
-      return efficientDetInputFromRgba(rgba, inputTensor);
+      return efficientDetInputViewFromRgba(rgba, inputTensor);
     }
 
     function decodeBox(raw, index) {
@@ -643,7 +648,6 @@
       void (async () => {
         await context?.close();
         await compiled?.close();
-        await model?.close();
         await runtime?.close();
       })();
     }, { once: true });

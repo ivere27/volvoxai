@@ -1,291 +1,344 @@
 #!/usr/bin/env node
 /**
- * Run one or two split packages on the real receipt fixture and report what
- * actually matters after quantization: the router's family choice and the
- * decoder's argmax tokens.
+ * Verify one or two TinyReceipt explicit-KV packages on the sealed
+ * deterministic workload.
  *
- * `compare_split_graphs.mjs` diffs two packages elementwise on synthetic
- * inputs, which is the right check for a semantics-preserving rewrite but the
- * wrong one for quantization — a W8A8 package is *supposed* to differ from
- * float32 numerically. What must not differ is the decision: the same router
- * family and the same tokens. This runs the real fixture and compares those.
- *
- * Execution uses `operatorFallback: 'forbid'`, so a package that needs an
- * operator the backend does not implement fails here rather than silently
- * falling back — which makes this a runnability check as well as an accuracy one.
+ * Every package is executed twice through TinyReceiptSplitSession: once with
+ * exact active B/Q/T/M views and once with the explicitly labelled
+ * maximum-padded reference binding. Every decoder decision must use an
+ * ordinary one-token execution with the explicit P=1 blocked-zero sentinel and
+ * growing K/V cache. The router family and every greedy token decision must
+ * agree between the two bindings and, when supplied, with the reference
+ * package.
  *
  *   node --import tsx examples/tiny_receipt_vqa/tools/verify_split_package.mjs \
- *     --package build/tr-w8a8 \
- *     [--reference build/tiny-receipt-hf-fp32] \
- *     [--fixtures build/tiny-receipt-e2e-artifacts/native-cpu] [--tokens 8]
+ *     --package build/tiny-receipt-int8-from-fp32 \
+ *     [--reference build/tiny-receipt-fp32] [--tokens 8] \
+ *     [--backend cpu|wasm] [--wasm dist/0.4.0/volvoxai.wasm]
  */
 
 import { readFile } from 'node:fs/promises';
-import { join, resolve } from 'node:path';
-import { pathToFileURL } from 'node:url';
+import { resolve } from 'node:path';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 
-import { Graph, GraphLoader, VolvoxAI } from '../../../ts/index.js';
 import {
-  nextDecoderToken,
-  resolveDecoderInputs,
-  resolveDecoderOutput,
-} from './benchmark_heldout.mjs';
+  ModelLoader,
+  Model,
+  VolvoxAI,
+} from '../../../ts/index.js';
+import {
+  createTinyReceiptSplitE2EImage,
+  TINY_RECEIPT_SPLIT_E2E_WORKLOAD,
+} from '../TinyReceiptSplitE2E.js';
+import { TinyReceiptSplitSession } from '../TinyReceiptSplitSession.js';
+
+const MAXIMUM_ENCODER_SHAPE = Object.freeze({ B: 1, Q: 192, M: 402 });
+const IMAGE_TOKENS = 210;
+const ALLOWED_OPTIONS = new Set(['package', 'reference', 'tokens', 'backend', 'wasm']);
 
 function parseArguments(values) {
   const result = {};
   for (let index = 0; index < values.length; index++) {
-    const name = values[index].replace(/^--/, '');
-    result[name] = values[index + 1]?.startsWith('--') ? true : values[++index];
+    const raw = values[index];
+    if (!raw.startsWith('--')) throw new Error(`unexpected argument ${JSON.stringify(raw)}`);
+    const name = raw.slice(2);
+    if (!ALLOWED_OPTIONS.has(name)) throw new Error(`unknown option --${name}`);
+    if (Object.hasOwn(result, name)) throw new Error(`duplicate option --${name}`);
+    const value = values[index + 1];
+    if (value === undefined || value.startsWith('--')) {
+      throw new Error(`option --${name} requires a value`);
+    }
+    result[name] = value;
+    index++;
   }
   return result;
 }
 
-function packageFetch(graphDocument, weightsBuffer) {
-  return async (url) => url === 'graph.json'
-    ? { ok: true, json: async () => graphDocument }
-    : url === 'model.safetensors'
-      ? { ok: true, arrayBuffer: async () => weightsBuffer.slice(0) }
-      : { ok: false, statusText: `unexpected source ${url}` };
+function isRecord(value) {
+  return !!value && typeof value === 'object' && !Array.isArray(value);
 }
 
-async function loadGraph(packageDir, kind) {
-  const graphDocument = JSON.parse(
-    await readFile(join(packageDir, kind, 'graph.json'), 'utf8'),
+function sameArray(left, right) {
+  return Array.isArray(left) && Array.isArray(right) && left.length === right.length
+    && left.every((value, index) => value === right[index]);
+}
+
+function sameShape(left, right) {
+  return isRecord(left) && isRecord(right)
+    && ['B', 'Q', 'T', 'M'].every((name) => left[name] === right[name]);
+}
+
+function exactShape(value, expected, label) {
+  if (!sameShape(value, expected)) {
+    throw new Error(`${label} must be B/Q/T/M=${shapeLabel(expected)}`);
+  }
+}
+
+function shapeLabel(value) {
+  return `${value.B}/${value.Q}/${value.T}/${value.M}`;
+}
+
+function firstTokenDifference(left, right) {
+  const length = Math.max(left.length, right.length);
+  for (let index = 0; index < length; index++) {
+    if (left[index] !== right[index]) return index;
+  }
+  return null;
+}
+
+function requireExplicitKVDecode(answer, label) {
+  if (!isRecord(answer) || answer.execution !== 'explicit-kv-cache'
+      || answer.decodeMode !== 'explicit-kv-cache'
+      || !Array.isArray(answer.tokenIds) || answer.tokenIds.length < 1
+      || answer.decoderOrdinaryExecutions !== answer.tokenIds.length
+      || answer.decoderSeedExecutions !== 1
+      || answer.decoderCacheStepExecutions !== answer.tokenIds.length - 1
+      || !Array.isArray(answer.decodeReports)
+      || answer.decodeReports.length !== answer.tokenIds.length
+      || !isRecord(answer.cacheShape)
+      || answer.cacheShape.initialPastLength !== 1
+      || answer.cacheShape.finalPastLength !== answer.tokenIds.length + 1
+      || answer.cacheShape.sentinelSlots !== 1) {
+    throw new Error(`${label} must use one-token explicit KV runs from one blocked sentinel`);
+  }
+  for (const [index, report] of answer.decodeReports.entries()) {
+    if (!isRecord(report)
+        || report.operation !== (index === 0 ? 'explicit-kv-seed' : 'explicit-kv-step')
+        || report.position !== index
+        || report.pastLength !== index + 1
+        || report.presentLength !== index + 2
+        || report.sentinelMaskValue !== 1) {
+      throw new Error(`${label} explicit KV report ${index} is not the exact v1 contract`);
+    }
+  }
+}
+
+/**
+ * Validate and compare one exact-active answer with its maximum-padded oracle.
+ * The returned mismatch is a semantic result; malformed lifecycle or shape
+ * evidence throws.
+ */
+export function verifyActivePaddedDecisionOracle(active, padded) {
+  if (active?.shapeMode !== 'active' || padded?.shapeMode !== 'maximum-padded') {
+    throw new Error('oracle requires one active run and one maximum-padded run');
+  }
+  if (!isRecord(active.logicalShape) || active.logicalShape.B !== 1
+      || active.logicalShape.Q < 1 || active.logicalShape.Q > 192
+      || active.logicalShape.T < 2 || active.logicalShape.T > 192
+      || active.logicalShape.M !== active.logicalShape.Q + IMAGE_TOKENS) {
+    throw new Error('active logical shape must satisfy B=1, M=Q+210, and bounded Q/T');
+  }
+  exactShape(active.activeShape, active.logicalShape, 'active binding');
+  exactShape(padded.logicalShape, active.logicalShape, 'maximum-padded logical request');
+  if (!sameArray(active.questionTokenIds, padded.questionTokenIds)
+      || active.questionTokenIds.length !== active.logicalShape.Q) {
+    throw new Error('active and maximum-padded runs must encode the same exact active question');
+  }
+  requireExplicitKVDecode(active, 'active run');
+  requireExplicitKVDecode(padded, 'maximum-padded run');
+  exactShape(
+    padded.activeShape,
+    { ...MAXIMUM_ENCODER_SHAPE, T: active.logicalShape.T },
+    'maximum-padded binding',
   );
-  const weights = await readFile(join(packageDir, kind, 'model.safetensors'));
-  const graph = new Graph();
-  await GraphLoader.load(graph, 'model.safetensors', {
-    graphUrl: 'graph.json',
-    fetch: packageFetch(graphDocument, weights.buffer.slice(
-      weights.byteOffset, weights.byteOffset + weights.byteLength,
-    )),
+
+  const activeTokens = [...active.tokenIds];
+  const paddedTokens = [...padded.tokenIds];
+  const firstDifference = firstTokenDifference(activeTokens, paddedTokens);
+  const familyMatch = active.family === padded.family && active.familyId === padded.familyId;
+  const tokensMatch = firstDifference === null;
+  return Object.freeze({
+    exact: familyMatch && tokensMatch,
+    familyMatch,
+    tokensMatch,
+    textMatch: active.text === padded.text,
+    firstTokenDifference: firstDifference,
   });
-  return { graph, document: graphDocument };
 }
 
-async function readTyped(path, Kind) {
-  const raw = await readFile(path);
-  return new Kind(raw.buffer.slice(raw.byteOffset, raw.byteOffset + raw.byteLength));
+/** Execute both explicit-KV shape modes against one already-loaded session. */
+export async function runActivePaddedOracle({
+  session,
+  image,
+  prompt,
+  family = 'auto',
+  maxNewTokens,
+}) {
+  if (!session || typeof session.generate !== 'function') {
+    throw new Error('oracle requires a loaded TinyReceipt split session');
+  }
+  if (!(image instanceof Float32Array) || image.length !== 320 * 672) {
+    throw new Error('oracle image must be preprocessed F32 [1,1,320,672]');
+  }
+  if (typeof prompt !== 'string' || prompt.length === 0) {
+    throw new Error('oracle prompt must be a non-empty string');
+  }
+  if (!Number.isSafeInteger(maxNewTokens) || maxNewTokens < 1 || maxNewTokens > 191) {
+    throw new Error('oracle maxNewTokens must be an integer in [1, 191]');
+  }
+  const runs = {};
+  for (const [name, shapeMode] of [
+    ['active', 'active'],
+    ['padded', 'maximum-padded'],
+  ]) {
+    const started = performance.now();
+    const answer = await session.generate({
+      image,
+      prompt,
+      family,
+      maxNewTokens,
+      preprocessed: true,
+      shapeMode,
+    });
+    runs[name] = Object.freeze({ answer, elapsed: performance.now() - started });
+  }
+  const comparison = verifyActivePaddedDecisionOracle(
+    runs.active.answer,
+    runs.padded.answer,
+  );
+  return Object.freeze({
+    active: runs.active,
+    padded: runs.padded,
+    comparison,
+  });
 }
 
-/** Resolve stable source semantics to their possibly generated runtime names. */
-export function resolveFixtureInputSemantics(document, kind) {
-  if (!['encoder', 'decoder'].includes(kind)) {
-    throw new Error("fixture input kind must be 'encoder' or 'decoder'");
+async function fileFetch(input) {
+  let url;
+  try {
+    url = input instanceof URL ? input : new URL(String(input));
+  } catch (error) {
+    return { ok: false, status: 400, statusText: error?.message || String(error) };
   }
-  if (!document?.inputs || typeof document.inputs !== 'object'
-      || Array.isArray(document.inputs)) {
-    throw new Error(`current ${kind} graph must declare input descriptors`);
+  if (url.protocol !== 'file:') {
+    return { ok: false, status: 400, statusText: `unsupported protocol ${url.protocol}` };
   }
-  const allowed = kind === 'encoder'
-    ? new Set(['image', 'question_ids', 'family_ids'])
-    : new Set([
-      'decoder_input_ids', 'memory', 'memory_padding_mask', 'family_ids', 'v4_keep',
-    ]);
-  const resolved = {};
-  for (const [name, descriptor] of Object.entries(document.inputs)) {
-    const semantic = descriptor?.source_name ?? name;
-    if (typeof semantic !== 'string' || semantic.length === 0 || !allowed.has(semantic)) {
-      throw new Error(`current ${kind} ABI has no input semantic '${semantic}'`);
-    }
-    if (resolved[semantic] !== undefined) {
-      throw new Error(`current ${kind} ABI declares input semantic '${semantic}' more than once`);
-    }
-    resolved[semantic] = name;
-  }
-  return Object.freeze(resolved);
-}
-
-async function fixtureInputs(fixtures, document, kind) {
-  const files = kind === 'encoder'
-    ? { image: 'image.f32', question_ids: 'question_ids.i32', family_ids: 'family_ids.i32' }
-    : {
-      decoder_input_ids: 'decoder_input_ids.i32',
-      memory: 'memory.f32',
-      memory_padding_mask: 'memory_padding_mask.i32',
-      family_ids: 'decoder_family_ids.i32',
+  try {
+    const bytes = await readFile(fileURLToPath(url));
+    return {
+      ok: true,
+      status: 200,
+      json: async () => JSON.parse(bytes.toString('utf8')),
+      arrayBuffer: async () => bytes.buffer.slice(
+        bytes.byteOffset,
+        bytes.byteOffset + bytes.byteLength,
+      ),
     };
-  const semantics = resolveFixtureInputSemantics(document, kind);
-  const inputs = {};
-  for (const [semantic, name] of Object.entries(semantics)) {
-    const file = files[semantic];
-    if (!file && semantic === 'v4_keep' && kind === 'decoder') {
-      continue;
-    }
-    if (!file) throw new Error(`current ${kind} ABI has no input semantic '${semantic}'`);
-    const Kind = file.endsWith('.i32') ? Int32Array : Float32Array;
-    inputs[name] = await readTyped(join(fixtures, file), Kind);
+  } catch (error) {
+    return { ok: false, status: 404, statusText: error?.message || String(error) };
   }
-  if (semantics.v4_keep) {
-    const name = semantics.v4_keep;
-    const descriptor = document.inputs[name];
-    const width = (descriptor.shape || []).reduce((a, b) => a * b, 1);
-    const idsName = semantics.decoder_input_ids;
-    const donor = idsName ? inputs[idsName] : null;
-    if (!donor) throw new Error(`no fixture for graph input '${name}'`);
-    if (!(donor instanceof Int32Array) || donor.length !== width) {
-      throw new Error(`decoder_input_ids cannot derive graph input '${name}'`);
-    }
-    inputs[name] = Int32Array.from(donor, (value) => (value !== 0 ? 1 : 0));
-  }
-  return inputs;
 }
 
-async function createRunner(packageDir, kind, fixtures, backend = 'cpu') {
-  const { graph, document } = await loadGraph(packageDir, kind);
-  const inputs = await fixtureInputs(fixtures, document, kind);
+async function snapshotLoader({ graphUrl, weightsUrl, fetch }) {
+  const logicalPackage = await ModelLoader.load(weightsUrl, { graphUrl, fetch });
+  return Model.capture(logicalPackage);
+}
+
+async function runPackage(packageDir, backend, wasmPath, maxNewTokens) {
   const runtime = await VolvoxAI.createRuntime({
     backends: [backend],
-    ...(backend === 'wasm'
-      ? { wasmUrl: pathToFileURL(resolve('dist/0.3.0/volvoxai.wasm')) }
-      : {}),
+    ...(backend === 'wasm' ? { wasmUrl: pathToFileURL(resolve(wasmPath)) } : {}),
   });
-  const model = runtime.createModel(graph);
-  const compiled = await model.compile({
-    backend: { mode: 'require', backend, operatorFallback: 'forbid' },
-  });
-  const context = await compiled.createContext();
-  return {
-    document,
-    inputs,
-    async execute(executionInputs = inputs) {
-      const started = performance.now();
-      const result = await context.execute(executionInputs);
-      try {
-        const outputs = {};
-        for (const name of graph.outputNames) {
-          outputs[name] = await result.output(name).read();
-        }
-        return { outputs, elapsed: performance.now() - started };
-      } finally {
-        await result.close();
-      }
-    },
-    async close() {
-      await context.close();
-      await compiled.close();
-      await model.close();
-      await runtime.close();
-    },
-  };
-}
-
-function argmax(values) {
-  let best = 0;
-  for (let index = 1; index < values.length; index++) {
-    if (values[index] > values[best]) best = index;
-  }
-  return best;
-}
-
-/** Execute one ordinary full decoder forward for every generated prefix. */
-export async function generateAutoregressiveTokens({
-  contract,
-  decoderInputs,
-  baseInputs,
-  execute,
-  tokenCount,
-  padTokenId,
-  bosTokenId,
-  eosTokenId,
-}) {
-  if (!Number.isSafeInteger(tokenCount) || tokenCount < 1 || tokenCount > 191) {
-    throw new Error('token count must be an integer in [1, 191]');
-  }
-  if (typeof execute !== 'function') throw new Error('decoder execute callback is required');
-  const decoderIds = new Int32Array(192).fill(padTokenId);
-  decoderIds[0] = bosTokenId;
-  const executionInputs = {
-    ...baseInputs,
-    [decoderInputs.decoder_input_ids]: decoderIds,
-  };
-  const decoderKeep = decoderInputs.v4_keep ? new Int32Array(192) : null;
-  if (decoderKeep) {
-    decoderKeep[0] = 1;
-    executionInputs[decoderInputs.v4_keep] = decoderKeep;
-  }
-  const tokens = [];
-  let elapsed = 0;
-  for (let step = 0; step < tokenCount; step++) {
-    const execution = await execute(executionInputs);
-    elapsed += execution.elapsed ?? 0;
-    const token = nextDecoderToken(contract, execution.outputs[contract.name], step);
-    tokens.push(token);
-    if (token === eosTokenId) break;
-    decoderIds[step + 1] = token;
-    if (decoderKeep) decoderKeep[step + 1] = 1;
-  }
-  return Object.freeze({ tokens: Object.freeze(tokens), elapsed });
-}
-
-async function describe(packageDir, fixtures, tokenCount, backend) {
-  const encoder = await createRunner(packageDir, 'encoder', fixtures, backend);
-  const decoder = await createRunner(packageDir, 'decoder', fixtures, backend);
+  let session;
   try {
-    const manifest = JSON.parse(
-      await readFile(join(packageDir, 'package_manifest.json'), 'utf8'),
-    );
-    const vocabulary = JSON.parse(await readFile(join(packageDir, 'vocab.json'), 'utf8'))
-      ?.itos?.length;
-    const contract = resolveDecoderOutput(decoder.document, manifest, vocabulary);
-    const decoderInputs = resolveDecoderInputs(decoder.document, contract.kind);
-    const tokenIds = manifest?.tokenizer?.token_ids;
-    for (const name of ['pad', 'bos', 'eos']) {
-      if (!Number.isSafeInteger(tokenIds?.[name])) {
-        throw new Error(`package tokenizer must declare integer ${name} token ID`);
-      }
-    }
-    const encoded = await encoder.execute();
-    const routerLogits = encoded.outputs.router_logits;
-    const generated = await generateAutoregressiveTokens({
-      contract,
-      decoderInputs,
-      baseInputs: decoder.inputs,
-      execute: (inputs) => decoder.execute(inputs),
-      tokenCount,
-      padTokenId: tokenIds.pad,
-      bosTokenId: tokenIds.bos,
-      eosTokenId: tokenIds.eos,
+    session = await TinyReceiptSplitSession.load({
+      runtime,
+      packageUrl: pathToFileURL(resolve(packageDir, 'package_manifest.json')),
+      fetch: fileFetch,
+      snapshotLoader,
+      compileOptions: {
+        backend: { mode: 'require', backend, operatorFallback: 'forbid' },
+      },
     });
-    return {
-      family: routerLogits ? argmax(routerLogits) : null,
-      routerLogits: routerLogits ? Array.from(routerLogits.slice(0, 8)) : null,
-      tokens: [...generated.tokens],
-      encoderMs: encoded.elapsed,
-      decoderMs: generated.elapsed,
-    };
+    if (maxNewTokens > session.package.generation.maximum_new_tokens) {
+      throw new Error(`--tokens exceeds package maximum ${
+        session.package.generation.maximum_new_tokens}`);
+    }
+    await session.preload();
+    const oracle = await runActivePaddedOracle({
+      session,
+      image: createTinyReceiptSplitE2EImage(),
+      prompt: TINY_RECEIPT_SPLIT_E2E_WORKLOAD.prompt,
+      family: TINY_RECEIPT_SPLIT_E2E_WORKLOAD.family,
+      maxNewTokens,
+    });
+    return Object.freeze({
+      oracle,
+      vocabulary: Object.freeze([...session.vocab.itos]),
+    });
   } finally {
-    await decoder.close();
-    await encoder.close();
+    try {
+      await session?.close();
+    } finally {
+      await runtime.close();
+    }
   }
+}
+
+function printRun(label, value) {
+  const answer = value.answer;
+  console.log(`  ${label.padEnd(14)} B/Q/T/M ${shapeLabel(answer.activeShape)}`
+    + `  family ${answer.familyId}:${answer.family}`
+    + `  tokens ${JSON.stringify(answer.tokenIds)}`);
+  console.log(`  ${''.padEnd(14)} ${value.elapsed.toFixed(0)} ms  decoder ordinary/cache-step `
+    + `${answer.decoderOrdinaryExecutions}/${answer.decoderCacheStepExecutions}`);
+}
+
+function printPackage(label, packageDir, backend, result) {
+  console.log(`${label} ${packageDir} [${backend}]`);
+  printRun('active', result.oracle.active);
+  printRun('max-padded ref', result.oracle.padded);
+  const speedup = result.oracle.padded.elapsed / result.oracle.active.elapsed;
+  console.log(`  active/padded decision ${result.oracle.comparison.exact ? 'MATCH' : 'DIFFERS'}`
+    + `  padded/active time ${speedup.toFixed(2)}x`);
+}
+
+async function defaultWasmPath() {
+  const metadata = JSON.parse(
+    await readFile(new URL('../../../package.json', import.meta.url), 'utf8'),
+  );
+  if (typeof metadata.version !== 'string' || metadata.version.length === 0) {
+    throw new Error('package.json must declare a version');
+  }
+  const repository = fileURLToPath(new URL('../../../', import.meta.url));
+  return resolve(repository, 'dist', metadata.version, 'volvoxai.wasm');
 }
 
 async function main() {
   const options = parseArguments(process.argv.slice(2));
-  if (!options.package) throw new Error('pass --package <dir>');
-  const fixtures = options.fixtures
-    ?? 'build/tiny-receipt-e2e-artifacts/native-cpu';
-  const tokenCount = Number(options.tokens ?? 8);
+  if (typeof options.package !== 'string') throw new Error('pass --package <dir>');
   const backend = options.backend ?? 'cpu';
+  if (backend !== 'cpu' && backend !== 'wasm') {
+    throw new Error("--backend must be 'cpu' or 'wasm'");
+  }
+  const maxNewTokens = Number(options.tokens ?? TINY_RECEIPT_SPLIT_E2E_WORKLOAD.maxNewTokens);
+  if (!Number.isSafeInteger(maxNewTokens) || maxNewTokens < 1 || maxNewTokens > 191) {
+    throw new Error('--tokens must be an integer in [1, 191]');
+  }
+  const wasmPath = options.wasm ?? await defaultWasmPath();
+  const actual = await runPackage(options.package, backend, wasmPath, maxNewTokens);
+  printPackage('package  ', options.package, backend, actual);
+  let exact = actual.oracle.comparison.exact;
 
-  const actual = await describe(options.package, fixtures, tokenCount, backend);
-  console.log(`package  ${options.package}  [${backend}]`);
-  console.log(`  router family ${actual.family}  tokens ${JSON.stringify(actual.tokens)}`);
-  console.log(`  encoder ${actual.encoderMs.toFixed(0)} ms   decoder ${actual.decoderMs.toFixed(0)} ms`);
-
-  if (!options.reference) return;
-  const expected = await describe(options.reference, fixtures, tokenCount, backend);
-  console.log(`reference ${options.reference}`);
-  console.log(`  router family ${expected.family}  tokens ${JSON.stringify(expected.tokens)}`);
-  console.log(`  encoder ${expected.encoderMs.toFixed(0)} ms   decoder ${expected.decoderMs.toFixed(0)} ms`);
-
-  const sameFamily = actual.family === expected.family;
-  const sameTokens = JSON.stringify(actual.tokens) === JSON.stringify(expected.tokens);
-  console.log(`\nrouter family ${sameFamily ? 'MATCH' : 'DIFFERS'} | `
-    + `autoregressive tokens ${sameTokens ? 'MATCH' : 'DIFFER'}`);
-  console.log(`speedup: encoder ${(expected.encoderMs / actual.encoderMs).toFixed(2)}x, `
-    + `decoder ${(expected.decoderMs / actual.decoderMs).toFixed(2)}x`);
-  if (!sameFamily || !sameTokens) process.exitCode = 1;
+  if (options.reference) {
+    const reference = await runPackage(options.reference, backend, wasmPath, maxNewTokens);
+    printPackage('reference', options.reference, backend, reference);
+    if (!sameArray(actual.vocabulary, reference.vocabulary)) {
+      throw new Error('package and reference vocabularies do not have identical token-ID semantics');
+    }
+    const actualAnswer = actual.oracle.active.answer;
+    const referenceAnswer = reference.oracle.active.answer;
+    const tokenDifference = firstTokenDifference(
+      [...actualAnswer.tokenIds],
+      [...referenceAnswer.tokenIds],
+    );
+    const familyMatch = actualAnswer.familyId === referenceAnswer.familyId;
+    const packageMatch = familyMatch && tokenDifference === null;
+    console.log(`package/reference family ${familyMatch ? 'MATCH' : 'DIFFERS'}`
+      + ` | greedy tokens ${tokenDifference === null ? 'MATCH' : `DIFFER AT ${tokenDifference}`}`);
+    exact &&= reference.oracle.comparison.exact && packageMatch;
+  }
+  if (!exact) process.exitCode = 1;
 }
 
 if (process.argv[1]

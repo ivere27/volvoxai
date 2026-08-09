@@ -109,12 +109,14 @@ to that Trainer, never to an inference context.
 🔧 A single step chains everything from Chapters 4–5: forward → loss → backward → update.
 
 ```javascript
-const trainer = await VolvoxAI.createTrainer(model, {
+const trainer = await VolvoxAI.createTrainer(sourceSnapshot, {
   backend: 'cpu',
 });
 
 const step = await trainer.trainStep({
-  inputs,
+  inputs: {
+    x: { data: inputValues, shape: [batchSize, featureWidth] },
+  },
   logitsTensor: 'logits',
   targets,
   ignoreIndex: -1,
@@ -127,8 +129,8 @@ const step = await trainer.trainStep({
   },
 });
 
-// Publish the private working revision before compiling it for inference.
-await trainer.commit();
+// Capture the private working revision as a new immutable snapshot.
+const successorSnapshot = await trainer.commit();
 ```
 
 Two design choices worth noting:
@@ -140,9 +142,11 @@ Two design choices worth noting:
   inference is reused for training; the cross-entropy loss is attached to its `logits` output at
   train time. There is no separate "training model."
 
-`trainStep()` changes only the Trainer's private working revision. There is no
-implicit publication: `commit()` atomically publishes it, while `rollback()`
-discards uncommitted work and restores the last committed baseline.
+Every input carries its concrete shape. One Trainer can move between concrete
+batch/sequence sizes inside the source snapshot's bounded symbolic domain.
+`trainStep()` changes only the Trainer's private working revision. `commit()`
+returns a new immutable successor snapshot; it does not mutate the source.
+`rollback()` discards uncommitted work and restores the last committed baseline.
 
 ## 5.4 Keeping it stable: gradient clipping
 
@@ -235,7 +239,7 @@ for each epoch:
     for each batch of the TRAINING data:        # train mode
         loss = trainer.trainStep(...)            # forward→loss→backward→AdamW
         learning_rate = cosine_schedule(step)   # anneal LR down over the run
-    trainer.commit()                            # publish this private revision
+    successor = trainer.commit()                # capture an immutable revision
     for each batch of the VALIDATION data:      # eval mode, no updates
         measure exact-match accuracy
     if validation improved:  save "best.checkpoint"
@@ -251,9 +255,9 @@ for each epoch:
   that matters to users, such as exact-match accuracy or a routing score.
 - **Checkpoints.** `await trainer.exportCheckpoint()` persists weights, AdamW moments,
   per-parameter steps, the training step, and application metadata from the private working
-  revision. Build a Model from `importModelCheckpoint(checkpoint).graph`, then pass `checkpoint`
-  to `VolvoxAI.createTrainer(model, options)` to resume. The application owns rolling and
-  best-so-far checkpoint policy.
+  revision. Import `const { snapshot } = importModelCheckpoint(checkpoint)`, then pass that
+  immutable snapshot and `checkpoint` to `VolvoxAI.createTrainer(snapshot, options)` to resume
+  exact optimizer state. The application owns rolling and best-so-far checkpoint policy.
 
 > 🔬 **Under the hood: the cosine curve, and why "best" ≠ "last".** A cosine schedule ramps the LR up
 > over a short **warmup**, then follows `lr = ½·lr_max·(1 + cos(π · t / T))` down toward ~0 by the
@@ -281,8 +285,9 @@ tiny pair of low-rank matrices of a chosen rank beside each big Linear. Only tho
 
 🔬 Because rank 8 is minuscule next to a full weight matrix, the trainable set shrinks by orders of
 magnitude — which is precisely what the `trainableTensors` allow-list (§5.3) expresses.
-`ModelBuilder.loraLinear()` creates explicit A/B graph weights and returns their names;
-the ordinary `Trainer.trainStep()` updates only those names. Deployment policy can then export:
+Dynamic v1 represents LoRA explicitly in the bounded logical graph: A/B weights, scale,
+MatMul nodes, and Add. The ordinary `Trainer.trainStep()` updates only the A/B names.
+Deployment policy can then export:
 
 - **`lora.safetensors`** — just the trained deltas, tiny and shareable.
 - **`lora_base/`** — the untouched base package (zero inline LoRA tensors).

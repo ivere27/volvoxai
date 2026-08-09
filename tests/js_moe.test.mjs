@@ -1,11 +1,12 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
-import { Graph, ModelBuilder } from '../ts/index.js';
+import { RuntimeGraph } from '../ts/core/RuntimeGraph.js';
+import { RuntimeGraphBuilder } from '../ts/core/RuntimeGraphBuilder.js';
 import { CPUEngine } from '../ts/backends/CPUEngine.js';
 
 test('MoERouter selects deterministic top-k experts and MoELinear mixes them', async () => {
-  const graph = new Graph();
+  const graph = new RuntimeGraph();
   const input = graph.addInput('x', [1, 2]);
   const routerWeight = graph.addWeight('router', [2, 3]);
   routerWeight.buffer = Float32Array.from([
@@ -42,7 +43,7 @@ test('MoERouter selects deterministic top-k experts and MoELinear mixes them', a
 });
 
 test('MoERouter rejects invalid top-k', async () => {
-  const graph = new Graph();
+  const graph = new RuntimeGraph();
   const input = graph.addInput('x', [1, 1]);
   const weight = graph.addWeight('router', [1, 2]);
   weight.buffer = Float32Array.from([1, 2]);
@@ -55,8 +56,8 @@ test('MoERouter rejects invalid top-k', async () => {
   await assert.rejects(() => engine.execute({ x: Float32Array.from([1]) }), /top_k/);
 });
 
-test('ModelBuilder exposes MoE and adapter-routing design helpers', () => {
-  const builder = new ModelBuilder();
+test('RuntimeGraphBuilder exposes MoE design helpers', () => {
+  const builder = new RuntimeGraphBuilder();
   const input = builder.input('x', [2, 4]);
   const router = builder.weight('router', [4, 3], 'float32', new Float32Array(12));
   const experts = builder.weight('experts', [3, 4, 5], 'float32', new Float32Array(60));
@@ -68,7 +69,4 @@ test('ModelBuilder exposes MoE and adapter-routing design helpers', () => {
   assert.deepEqual(graph.nodes.map((node) => node.opType), ['MoERouter', 'MoELinear']);
   assert.deepEqual(routes.indices.shape, [2, 2]);
   assert.deepEqual(result.out.shape, [2, 5]);
-  assert.deepEqual(builder.adapterRouting(builder.adapterRoute('tenant', 3, 0.5)), {
-    adapters: [{ name: 'tenant', version: 3, scale: 0.5 }],
-  });
 });

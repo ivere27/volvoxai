@@ -1,11 +1,11 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
-import { Graph } from '../ts/core/Graph.js';
+import { RuntimeGraph } from '../ts/core/RuntimeGraph.js';
 import { CPUEngine } from '../ts/backends/CPUEngine.js';
 
 function batchMatMulGraph() {
-  const graph = new Graph();
+  const graph = new RuntimeGraph();
   const a = graph.addInput('a', [2, 1, 2, 3]);
   const b = graph.addInput('b', [1, 2, 3, 2]);
   const { out } = graph.addOp('BatchMatMul', { a, b }, {
@@ -35,7 +35,7 @@ function referenceBatchMatMul(a, b) {
 }
 
 function logicalGraph() {
-  const graph = new Graph();
+  const graph = new RuntimeGraph();
   const a = graph.addInput('a', [2, 1, 3], 'int32');
   const b = graph.addInput('b', [1, 2, 1], 'int32');
   const equal = graph.addOp('Equal', { a, b }, {
@@ -52,7 +52,7 @@ function logicalGraph() {
 }
 
 function typedSelectionGraph() {
-  const graph = new Graph();
+  const graph = new RuntimeGraph();
   const input = graph.addInput('input', [6], 'int32');
   const condition = graph.addInput('condition', [6], 'int32');
   const clipped = graph.addOp('Clip', { input }, {
@@ -71,32 +71,32 @@ function typedSelectionGraph() {
 }
 
 function typedShapeGraph() {
-  const graph = new Graph();
+  const graph = new RuntimeGraph();
   const a = graph.addInput('a', [2, 2], 'int32');
   const b = graph.addInput('b', [2, 1], 'int32');
   const joined = graph.addOp('Concat', { input0: a, input1: b }, {
     out: { name: 'joined', shape: [2, 3], dtype: 'int32' },
-  }, { axis: 1, count: 2 }).out;
+  }, { axis: 1 }).out;
   const reshaped = graph.addOp('Reshape', { input: joined }, {
     out: { name: 'reshaped', shape: [3, 2], dtype: 'int32' },
-  }).out;
+  }, { shape: [3, 2] }).out;
   const transposed = graph.addOp('Transpose', { input: reshaped }, {
     out: { name: 'transposed', shape: [2, 3], dtype: 'int32' },
   }, { perm: [1, 0] }).out;
   const sliced = graph.addOp('Slice', { input: transposed }, {
     out: { name: 'sliced', shape: [2, 2], dtype: 'int32' },
-  }, { axes: [1], starts: [1], steps: [1] }).out;
+  }, { axes: [1], starts: [1], ends: [3], steps: [1] }).out;
   const shaped = graph.addOp('Reshape', { input: sliced }, {
     out: { name: 'shaped', shape: [2, 1, 2], dtype: 'int32' },
-  }).out;
+  }, { shape: [2, 1, 2] }).out;
   const expanded = graph.addOp('Expand', { input: shaped }, {
     out: { name: 'expanded', shape: [2, 3, 2], dtype: 'int32' },
-  }).out;
+  }, { shape: [2, 3, 2] }).out;
   const split = graph.addOp('Split', { input: expanded }, {
     out0: { name: 'out0', shape: [2, 1, 2], dtype: 'int32' },
     out1: { name: 'out1', shape: [2, 1, 2], dtype: 'int32' },
     out2: { name: 'out2', shape: [2, 1, 2], dtype: 'int32' },
-  }, { axis: 1 });
+  }, { axis: 1, num_outputs: 3 });
   graph.setOutputs([split.out0.name, split.out1.name, split.out2.name]);
   return graph;
 }
@@ -108,7 +108,7 @@ async function execute(graph, inputs) {
 }
 
 test('CPU Softmax normalizes every last-axis row of a rank-4 tensor', async () => {
-  const graph = new Graph();
+  const graph = new RuntimeGraph();
   const input = graph.addInput('input', [1, 2, 2, 3]);
   const out = graph.addOp('Softmax', { input }, {
     out: { name: 'out', shape: [1, 2, 2, 3] },
@@ -140,7 +140,7 @@ test('CPU LayerNorm preserves high-offset low-variance rows', async () => {
   values[0] -= 2 ** -10;
   values[dModel - 1] += 2 ** -10;
 
-  const graph = new Graph();
+  const graph = new RuntimeGraph();
   const input = graph.addInput('input', [1, dModel]);
   const weight = graph.addWeight('weight', [dModel], 'float32', {
     buffer: new Float32Array(dModel).fill(1),
@@ -191,8 +191,8 @@ test('CPU I32 Clip and exact-shape Where retain integer values', async () => {
   assert.deepEqual([...result.selected], [-2, 91, 0, 93, 5, 5]);
 });
 
-test('CPU Gather normalizes ONNX negative indices and keeps invalid selections fail-closed', async () => {
-  const graph = new Graph();
+test('CPU Gather normalizes legal ONNX negative indices and rejects out-of-range values', async () => {
+  const graph = new RuntimeGraph();
   const input = graph.addInput('input', [2, 3, 2]);
   const indices = graph.addInput('indices', [5], 'int32');
   const out = graph.addOp('Gather', { input, indices }, {
@@ -202,12 +202,19 @@ test('CPU Gather normalizes ONNX negative indices and keeps invalid selections f
 
   const result = await execute(graph, {
     input: Float32Array.from({ length: 12 }, (_, index) => index + 1),
-    indices: Int32Array.of(-1, -3, -4, 3, 0),
+    indices: Int32Array.of(-1, -3, 0, 2, 1),
   });
   assert.deepEqual([...result.out], [
-    5, 6, 1, 2, -1, -1, -1, -1, 1, 2,
-    11, 12, 7, 8, -1, -1, -1, -1, 7, 8,
+    5, 6, 1, 2, 1, 2, 5, 6, 3, 4,
+    11, 12, 7, 8, 7, 8, 11, 12, 9, 10,
   ]);
+  await assert.rejects(
+    execute(graph, {
+      input: Float32Array.from({ length: 12 }, (_, index) => index + 1),
+      indices: Int32Array.of(-1, -3, -4, 3, 0),
+    }),
+    /outside axis extent/,
+  );
 });
 
 test('CPU storage-only shape operators preserve I32 through a complete chain', async () => {
@@ -222,7 +229,7 @@ test('CPU storage-only shape operators preserve I32 through a complete chain', a
 });
 
 test('BatchMatMul rejects incompatible broadcast geometry instead of flattening it', async () => {
-  const graph = new Graph();
+  const graph = new RuntimeGraph();
   const a = graph.addInput('a', [2, 2, 3]);
   const b = graph.addInput('b', [3, 3, 2]);
   const out = graph.addOp('BatchMatMul', { a, b }, {

@@ -42,16 +42,18 @@ export function comparisonDescriptor(node) {
   const aElements = tensorElements(a);
   const bElements = tensorElements(b);
   const outputElements = tensorElements(output);
+  const params = node.params ?? {};
   if (operation < 0 || inputNames.length !== 2 || inputNames[0] !== 'a' ||
       inputNames[1] !== 'b' || outputNames.length !== 1 || !a || !b || !output ||
       a.dtype !== 'int32' || b.dtype !== 'int32' || output.dtype !== 'int32' ||
+      a.quantization != null || b.quantization != null || output.quantization != null ||
       aElements == null || bElements == null || outputElements == null ||
       !Number.isInteger(aRank) || !Number.isInteger(bRank) ||
       !Number.isInteger(outputRank) || aRank < 0 || bRank < 0 ||
       aRank > MAX_COMPARISON_RANK || bRank > MAX_COMPARISON_RANK ||
-      outputRank !== Math.max(aRank, bRank) || node.params == null ||
-      typeof node.params !== 'object' || Array.isArray(node.params) ||
-      Object.keys(node.params).length !== 0) {
+      outputRank !== Math.max(aRank, bRank) || params == null ||
+      typeof params !== 'object' || Array.isArray(params) ||
+      Reflect.ownKeys(params).length !== 0) {
     throw new Error(
       `${node.opType} node ${node.id ?? '<unnamed>'} requires exactly I32 { a, b } -> { out } with rank-0..8 ONNX broadcasting and no parameters.`,
     );

@@ -28,7 +28,6 @@ service RuntimeService {
   rpc CreateTrainer(CreateTrainerRequest) returns (TrainerHandle);
   rpc CloseTrainer(TrainerRef) returns (OperationReport);
   rpc ReleaseTrainer(TrainerRef) returns (Empty);
-  rpc SetTrainerInput(SetTrainerInputRequest) returns (OperationReport);
   rpc TrainStep(TrainStepRequest) returns (TrainStepResult);
   rpc CommitTrainer(TrainerRef) returns (RevisionInfo);
   rpc RollbackTrainer(TrainerRef) returns (OperationReport);
@@ -51,7 +50,6 @@ service RuntimeService {
       returns (ExecutionContextHandle);
   rpc CloseExecutionContext(ExecutionContextRef) returns (OperationReport);
   rpc ReleaseExecutionContext(ExecutionContextRef) returns (Empty);
-  rpc SetInput(SetInputRequest) returns (OperationReport);
   rpc Execute(ExecuteRequest) returns (ExecutionResultHandle);
   rpc DecodeSeed(DecodeSeedRequest) returns (ExecutionResultHandle);
   rpc DecodeStep(DecodeStepRequest) returns (ExecutionResultHandle);
@@ -388,13 +386,8 @@ message CreateTrainerRequest {
 
 message TrainerHandle {
   string trainer_id = 1;
-  repeated TensorInfo inputs = 2;
+  repeated TensorSpec inputs = 2;
   OperationReport report = 3;
-}
-
-message SetTrainerInputRequest {
-  string trainer_id = 1;
-  Tensor input = 2;
 }
 
 message CrossEntropyLoss {
@@ -421,12 +414,15 @@ message TrainerOptimizerOptions {
 // slots, accumulation, and RNG state. It never publishes a Model revision.
 message TrainStepRequest {
   string trainer_id = 1;
-  repeated CrossEntropyLoss losses = 2;
-  repeated string trainable_names = 3;
-  TrainerOptimizerOptions optimizer = 4;
-  optional uint32 accumulation_steps = 5;
-  bool flush_accumulation = 6;
-  bool reset_accumulation = 7;
+  // One atomic complete shape-bearing batch. No Trainer input state exists
+  // outside this request.
+  repeated Tensor inputs = 2;
+  repeated CrossEntropyLoss losses = 3;
+  repeated string trainable_names = 4;
+  TrainerOptimizerOptions optimizer = 5;
+  optional uint32 accumulation_steps = 6;
+  bool flush_accumulation = 7;
+  bool reset_accumulation = 8;
 }
 
 message TrainingMetric {
@@ -482,13 +478,14 @@ message PtqLayerSpec {
 message CreatePtqPlanRequest {
   string model_id = 1;
   string template_graph_path = 2;
-  repeated PtqObserverSpec observers = 3;
-  repeated PtqLayerSpec layers = 4;
+  repeated string profile_names = 3;
+  repeated PtqObserverSpec observers = 4;
+  repeated PtqLayerSpec layers = 5;
 }
 
 message PtqPlanHandle {
   string ptq_plan_id = 1;
-  repeated TensorInfo inputs = 2;
+  repeated TensorSpec inputs = 2;
   OperationReport report = 3;
 }
 
@@ -497,13 +494,17 @@ message PtqPlanHandle {
 // observer ranges only if every input and observed tensor succeeds.
 message CalibratePtqPlanRequest {
   string ptq_plan_id = 1;
-  string sample_name = 2;
-  repeated Tensor inputs = 3;
+  string profile_name = 2;
+  string sample_name = 3;
+  uint64 sample_count = 4;
+  repeated Tensor inputs = 5;
 }
 
 message PtqCalibrationInfo {
-  uint64 calibration_samples = 1;
-  OperationReport report = 2;
+  uint64 calibration_batches = 1;
+  uint64 calibration_samples = 2;
+  bool coverage_complete = 3;
+  OperationReport report = 4;
 }
 
 message PtqTensorParameters {
@@ -517,11 +518,42 @@ message PtqTensorParameters {
   uint64 observed_values = 8;
 }
 
+message PtqSymbolCoverage {
+  string symbol = 1;
+  int64 minimum = 2;
+  int64 maximum = 3;
+}
+
+message PtqActivationCoverage {
+  string tensor_name = 1;
+  uint64 observed_values = 2;
+}
+
+message PtqProfileCoverage {
+  string name = 1;
+  uint64 batches = 2;
+  uint64 samples = 3;
+  repeated string signatures = 4;
+  repeated PtqSymbolCoverage symbols = 5;
+  repeated PtqActivationCoverage activations = 6;
+}
+
+message PtqCoverage {
+  string format = 1;
+  string logical_fingerprint = 2;
+  bool complete = 3;
+  uint64 total_batches = 4;
+  uint64 total_samples = 5;
+  repeated PtqProfileCoverage profiles = 6;
+}
+
 message PtqPlanInfo {
-  uint64 calibration_samples = 1;
-  repeated PtqTensorParameters tensors = 2;
-  RevisionInfo revision = 3;
-  OperationReport report = 4;
+  uint64 calibration_batches = 1;
+  uint64 calibration_samples = 2;
+  repeated PtqTensorParameters tensors = 3;
+  PtqCoverage coverage = 4;
+  RevisionInfo revision = 5;
+  OperationReport report = 6;
 }
 
 message WritePtqPackageRequest {
@@ -565,8 +597,26 @@ message CreateExecutionContextRequest {
 
 message ExecutionContextHandle {
   string context_id = 1;
-  repeated TensorInfo inputs = 2;
+  repeated TensorSpec inputs = 2;
   OperationReport report = 3;
+}
+
+// One axis of a logical bounded tensor. A fixed axis has an empty symbol,
+// min == max, and multiple_of == 1. A symbolic axis has a non-empty canonical
+// symbol and positive min/max/multiple_of values.
+message DimensionConstraint {
+  string symbol = 1;
+  int64 min = 2;
+  int64 max = 3;
+  int64 multiple_of = 4;
+}
+
+// Logical model contract. Concrete request shapes are carried only by Tensor.
+message TensorSpec {
+  string name = 1;
+  DataType dtype = 2;
+  repeated DimensionConstraint dimensions = 3;
+  MemoryLocation location = 4;
 }
 
 message TensorInfo {
@@ -585,19 +635,26 @@ message Tensor {
   MemoryLocation location = 5;
 }
 
-message SetInputRequest {
+// Inference inputs form one atomic, complete named batch. Every tensor is
+// validated before the native context/provider may commit any input mutation.
+message ExecuteRequest {
   string context_id = 1;
-  Tensor input = 2;
+  repeated Tensor inputs = 2;
 }
 
-message ExecuteRequest { string context_id = 1; }
-
-message DecodeSeedRequest { string context_id = 1; }
+message DecodeSeedRequest {
+  string context_id = 1;
+  repeated Tensor inputs = 2;
+}
 
 message DecodeStepRequest {
   string context_id = 1;
   // Omitted asks the backend to advance from its current decode position.
   optional int32 position = 2;
+  // After one successful complete seed, step may replace an atomic subset of
+  // values while preserving the seeded semantic shape signature exactly.
+  // Empty reuses every seeded input.
+  repeated Tensor inputs = 3;
 }
 
 message SelectAdapterRequest {

@@ -20,13 +20,15 @@ Large `.safetensors` files and generated model directories should stay out of gi
 
 A model graph contains:
 
-- `Tensor`: name, shape, dtype, and `isWeight`.
-- `Node`: `opType`, named `inputs`, named `outputs`, and `params`.
-- `graph.outputNames`: exact output tensor names returned by ExecutionResult.
+- bounded dimension constraints and fixed-rank logical tensor descriptors;
+- nodes with an `id`, `opType`, named inputs, unified output assertions, and
+  explicit `params`;
+- exact public output tensor names returned by `ExecutionResult`.
 
-`GraphLoader.ts` builds this graph from `graph.json` and `model.safetensors`.
-Applications can also construct graphs programmatically with `addInput`,
-`addWeight`, and `addOp`.
+`ModelLoader.ts` parses the closed graph document and safetensors into a
+`Model`. Compilation proves its complete bounded shape domain;
+an `ExecutionContext` then binds one concrete public-input shape set without
+mutating the snapshot.
 
 When the graph URL cannot be derived from the safetensors URL, pass it explicitly
 as `graphUrl`. Its basename must be `graph.json` or a named `*.graph.json`
@@ -34,30 +36,40 @@ document.
 
 ## Volvox Graph Document
 
-The only persisted graph format is a precomputed `volvox-graph/v1` document:
+The only persisted graph format is the closed, bounded-shape
+`volvox-graph/v1` document:
 
 ```json
 {
   "format": "volvox-graph/v1",
+  "dimensions": {},
   "inputs": {
     "image": { "shape": [1, 320, 320, 3], "dtype": "float32" }
   },
   "nodes": [
     {
+      "id": "stem",
       "opType": "Conv2D",
       "inputs": { "input": "image", "weight": "stem.weight", "bias": "stem.bias" },
-      "outputs": { "out": "stem.out" },
-      "outputs_shape": { "out": [1, 160, 160, 32] },
-      "outputs_dtype": { "out": "float32" },
-      "params": { "stride": [2, 2], "padding": [1, 1], "weight_layout": "OHWI" }
+      "outputs": {
+        "out": { "tensor": "stem.out", "shape": [1, 160, 160, 32], "dtype": "float32" }
+      },
+      "params": {
+        "kernel": [3, 3], "stride": [2, 2], "dilation": [1, 1],
+        "pads": [1, 1, 1, 1], "groups": 1, "data_layout": "NHWC",
+        "weight_layout": "HWIO"
+      }
     }
   ],
   "outputs": ["stem.out"]
 }
 ```
 
-Exporters map source-model ops to Volvox `opType`s, precompute tensor shapes,
-and write immutable tensor payloads into safetensors. Import and lowering are
+Each symbolic axis names an entry in `dimensions`; every entry has finite
+caller-supplied `min`/`max` bounds and may add `multiple_of`. Anonymous source
+dimensions become symbols only when the caller supplies such bounds. Exporters
+map source-model ops to Volvox `opType`s, preserve symbolic shape formulas, and
+write immutable tensor payloads into safetensors. Import and lowering are
 different stages: ONNX and TensorFlow Lite source adapters first preserve the
 source graph in SourceIR without graph rewrites, then a legality-checked lowerer
 creates verified RuntimeIR. Unsupported semantics fail with a source diagnostic;
@@ -104,30 +116,11 @@ Use repeatable `--input-shape`, `--input-dtype`, `--output-dtype`, and
 `--specialize-input` bindings for supported ONNX lowering. Those bindings are
 not yet enabled on the transitional TensorFlow Lite lowerer.
 
-Image-capable frontends may use an optional normalization contract on each
-graph input:
-
-```json
-{
-  "inputs": {
-    "image": {
-      "shape": [1, 320, 320, 3],
-      "dtype": "float32",
-      "image_normalization": "zero-one"
-    }
-  }
-}
-```
-
-The supported values are `zero-one`, `minus-one-one`, and `raw-255`. This is
-application preprocessing metadata rather than a graph operation: runtimes
-still receive an already prepared tensor. A frontend must not infer the value
-from the input dtype, because F32 and byte inputs can each use different source
-pixel ranges. `tools/export_safetensors.py` writes this metadata only when the
-export workflow supplies `--image-normalization INPUT=MODE`; repeat the option
-for multiple image inputs. The native task example requires this metadata for
-`--image` unless the caller supplies an explicit `--image-normalize` override;
-it does not silently choose a pixel range.
+Image normalization is application preprocessing, not executable graph
+semantics. The closed input descriptor therefore contains exactly `shape` and
+`dtype`; task manifests or calling applications own color conversion,
+normalization, resize policy, and semantic aliases. Exporters reject attempts
+to place that metadata in `graph.json`.
 
 Every node input name must resolve to a tensor declared in `inputs`, a named
 tensor loaded from `model.safetensors`, or an output produced by an earlier
@@ -138,10 +131,10 @@ Every graph execution tensor has one of four dtypes: `float32`, `int32`,
 `int8`, or `uint8`. These names are lowercase and case-sensitive. Safetensors
 may store internal weights as F16, but F16 is storage rather than an execution
 dtype. A standalone F16 weight selected as a graph output is exposed as F32.
-Current v1 requires `outputs_dtype` for every node output port, including
-`float32`; loaders reject a missing or incomplete map rather than infer an
-implicit dtype. Explicit output dtypes keep typed round trips and target
-capability checks unambiguous.
+Every node output port contains one exact `{tensor, shape, dtype}` assertion.
+The loader rejects split output-name/shape/dtype maps and verifies each unified
+assertion against canonical operator shape inference over the complete bounded
+domain; it never infers an implicit F32 dtype.
 
 Graph documents must select public outputs with a non-empty, unique
 tensor-name array, for example `"outputs": ["scores", "boxes"]`. Each name
@@ -149,10 +142,9 @@ resolves directly to a declared graph tensor. Package loading does not infer
 leaf outputs. Every backend returns all declared outputs by exact name through
 ExecutionResult.
 
-`GraphLoader` owns package parsing and graph-assembly orchestration. Reusable,
-model-independent operator layout normalization and portable quantized-graph
-validation live under `ts/ops/`, alongside the computation contracts they
-protect.
+`ModelLoader` owns package parsing and logical snapshot assembly.
+Reusable operator shape proofs and portable quantized-graph validation live
+under `ts/ops/`, alongside the computation contracts they protect.
 
 ## Safetensors Loading
 
@@ -197,9 +189,41 @@ Runtime image tensors use NHWC:
 [batch, height, width, channels]
 ```
 
-Browser Conv2D kernels use HWIO/HWCM internally. Native TFLite exports may keep
-TFLite-native layouts such as `OHWI` for regular conv and `1HWO` for depthwise conv;
-the native engine prepares HWIO/HWCM compute caches at load time.
+Ordinary FP32 `Conv2D` weights ship in the layout the microkernels index:
+`HWIO` for regular and grouped convolution, `HWCM` for depthwise. The exporter
+performs the permutation once, so no runtime transposes at load or holds a second
+copy of the weight.
+
+Canonical W8A8 `QConv2D` weights stay `OHWI`, which is the layout its own kernels
+index and the axis its per-output-channel affine metadata is bound to.
+
+`Conv1D` and `ConvTranspose2D` follow the same rule, with output channels
+innermost so the accumulation loop stays contiguous:
+
+```text
+Conv1D            NLC  [batch, length, channels]   WIO  [k, in_per_group, out_c]
+ConvTranspose2D   NHWC [batch, height, width, c]   HWIO [kh, kw, in_c, out_c]
+```
+
+Keeping `Conv1D` channels-last also means it needs no layout transpose at its
+boundaries when it sits between `LayerNorm`/`Linear`/attention in a sequence
+model, which is where the channels-first form cost the most.
+
+There is no compatibility interpretation for retired ordinary-convolution
+layouts; packages must be re-exported into the canonical form.
+
+FP32 `Linear`/`MatMul`/`Gemm` weights carry an explicit `weight_layout` of
+`din_dout` (`[d_in, d_out]`) or `dout_din` (`[d_out, d_in]`). Both are
+first-class: for an immutable model weight the runtime may pack either into the
+same physical B panel. W8A8 `QLinear`/`QMatMul`/`QGemm` instead have one
+operator-defined layout, `dout_din`; their `params` object is empty and axis 0
+is where per-output-channel scales are bound. Weight-only W8A32 also uses
+`dout_din`.
+
+Validation rejects a canonical FP32 dense node that omits `weight_layout`, and
+rejects a quantized dense node that tries to override its fixed layout. It does
+not guess from a non-square weight, accept `transB` as a package alias, or choose
+a default for square FP32 weights.
 
 ## Precision Policy
 
@@ -226,16 +250,16 @@ INT8 handling:
   reports the selected route. Opt-in CUDA has a separate broad packed-byte
   allowlist and strict no-CPU-fallback routing; see
   [cuda.md](cuda.md#status).
-- The fixed-B=1 TinyReceipt [browser/Node wrapper](../examples/tiny_receipt_vqa/TinyReceiptW8A8Session.js)
-  and [native wrapper](../examples/tiny_receipt_vqa/native/tiny_receipt_w8a8.c)
-  have an opt-in incremental mode. Both are examples rather than fixed runtime
-  entry points or release artifacts. Browser execution uses a private
-  ExecutionContext for each decode stream; seed, step, and reset are FIFO
-  operations on that context.
+- The bounded-active TinyReceipt
+  [browser/Node split session](../examples/tiny_receipt_vqa/TinyReceiptSplitSession.js)
+  and [native split application](../examples/tiny_receipt_vqa/native/tiny_receipt_split_w8a8.c)
+  use separate encoder and retained-decoder contexts. Both are examples rather
+  than fixed runtime entry points or release artifacts. Seed, step, and reset
+  are FIFO operations on each private decoder context.
 
 See [the operation matrix](operation_list.md#quantized-execution) for the exact
-operator and backend contract, including the TinyReceiptVQA materialized W8A8
-package workflow.
+operator and backend contract, including the TinyReceiptVQA split W8A8 package
+workflow.
 
 ## LLM Scope
 

@@ -158,19 +158,23 @@ static int cuda_resident_backend_selected(void) {
 #endif
 }
 
+/* Bytes of a sequence tensor that precede `row`.
+ *
+ * This used to require shape[0] == 1 and read the token axis from shape[1],
+ * which is only the [1,S,D] spelling.  A decoder whose tensors are the equally
+ * canonical sequence-major [S,D] therefore failed here — silently, since this
+ * refusal carries no diagnostic — after every node in the closure had already
+ * proved row-compatible.  vx_incremental_row_extent already answers the same
+ * question for both spellings, so it answers it here too. */
 static int hybrid_tensor_prefix_bytes(const T* tensor, int row, size_t* bytes_out) {
-    long rows;
-    long row_elements;
+    long row_elements = 0;
+    int rows;
     size_t elements;
-    if (!tensor || !bytes_out || row < 0 || tensor->ndim < 2 ||
-        tensor->shape[0] != 1 || tensor->shape[1] <= row ||
-        tensor->shape[1] <= 0 || tensor->numel <= 0 || !tensor->elem_size)
-        return -1;
-    rows = tensor->shape[1];
-    if (tensor->numel % rows) return -1;
-    row_elements = tensor->numel / rows;
-    if (row_elements <= 0 || (size_t)row > SIZE_MAX / (size_t)row_elements)
-        return -1;
+    if (!tensor || !bytes_out || row < 0 || tensor->numel <= 0 ||
+        !tensor->elem_size || tensor->ndim < 2) return -1;
+    rows = vx_incremental_row_extent(tensor, &row_elements);
+    if (rows <= row || row_elements <= 0) return -1;
+    if ((size_t)row > SIZE_MAX / (size_t)row_elements) return -1;
     elements = (size_t)row * (size_t)row_elements;
     if (elements > SIZE_MAX / tensor->elem_size) return -1;
     *bytes_out = elements * tensor->elem_size;
@@ -211,20 +215,37 @@ static int hybrid_row_plan_expand_locked(int row, VxHybridRowPlan* plan) {
             }
         }
         if (!should_run) continue;
-        if (!vx_runtime_node_incremental_row_compatible(&g_n[node], node, row)) return 0;
+        if (!vx_runtime_node_incremental_row_compatible(&g_n[node], node, row)) {
+            /* Naming the first refusal is what makes an O(T) decode diagnosable;
+             * the plan is discarded either way. */
+            if (getenv("VOLVOXAI_ROW_DEBUG"))
+                fprintf(stderr, "[row] node %d op=%s blocks row execution\n",
+                        node, g_n[node].op);
+            return 0;
+        }
         plan->nodes[node] = 1;
         plan->node_count++;
         for (int output = 0; output < g_incremental_plan.output_counts[node]; output++)
             plan->tensors[g_incremental_plan.output_indices[node][output]] = 1;
     }
-    if (!plan->node_count) return 0;
+    if (!plan->node_count) {
+        if (getenv("VOLVOXAI_ROW_DEBUG"))
+            fprintf(stderr, "[row] no dirty node reaches row execution\n");
+        return 0;
+    }
 
     /* Noncausal attention is row-safe only when its memory K/V is outside the
      * dirty decoder closure. Causal self-attention deliberately consumes the
      * synchronized prefix produced by dirty row-linear nodes. */
     for (int node = 0; node < g_nn; node++) {
         if (plan->nodes[node] &&
-            !hybrid_qsdpa_dirty_kv_supported(&g_n[node], plan)) return 0;
+            !hybrid_qsdpa_dirty_kv_supported(&g_n[node], plan)) {
+            if (getenv("VOLVOXAI_ROW_DEBUG"))
+                fprintf(stderr,
+                        "[row] node %d op=%s has dirty memory K/V\n",
+                        node, g_n[node].op);
+            return 0;
+        }
     }
 
     for (int node = 0; node < g_nn; node++) {
@@ -239,7 +260,13 @@ static int hybrid_row_plan_expand_locked(int row, VxHybridRowPlan* plan) {
         for (int output = 0; output < g_incremental_plan.output_counts[node]; output++) {
             int index = g_incremental_plan.output_indices[node][output];
             if (hybrid_tensor_prefix_bytes(&g_t[index], row,
-                                           &plan->prefix_bytes[index]) != 0) return 0;
+                                           &plan->prefix_bytes[index]) != 0) {
+                if (getenv("VOLVOXAI_ROW_DEBUG"))
+                    fprintf(stderr,
+                            "[row] node %d op=%s output %s has no row prefix\n",
+                            node, g_n[node].op, g_t[index].name);
+                return 0;
+            }
         }
     }
     return 1;
@@ -281,7 +308,11 @@ int vx_incremental_prepare_hybrid_row_locked(int row) {
     int was_active = g_hybrid_row_active;
     int status;
     if (!g_loaded || row < 0) return -1;
-    if (!vx_runtime_backend_has_graph()) return 1;
+    if (!vx_runtime_backend_has_graph()) {
+        if (row < 1) return 0;
+        if (!g_cache_valid || g_weight_caches_dirty) return -1;
+        return hybrid_row_plan_build_locked(row, &plan);
+    }
     /* A device seed does not provide an older prefix at row zero. Keep the
      * public row API fail-closed there instead of transferring ownership with
      * device-dirty outputs whose current row has not been synchronized. */

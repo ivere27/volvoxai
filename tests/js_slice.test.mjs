@@ -19,7 +19,9 @@ test('CPU Slice maps canonical rank-five normalized axes and starts', () => {
     id: 'slice_rank_five',
     inputs: { input },
     outputs: { out },
-    params: { axes: [-5, -3, -1], starts: [-1, 1, -5], steps: [1, 2, 2] },
+    params: {
+      axes: [-5, -3, -1], starts: [-1, 1, -5], ends: [2, 4, 6], steps: [1, 2, 2],
+    },
   });
 
   const expected = [];
@@ -42,7 +44,7 @@ test('CPU Slice accepts the rank-eight upper bound', () => {
     id: 'slice_rank_eight',
     inputs: { input },
     outputs: { out },
-    params: { axes: [-2, -1], starts: [-1, -3], steps: [1, 2] },
+    params: { axes: [-2, -1], starts: [-1, -3], ends: [2, 3], steps: [1, 2] },
   });
 
   assert.deepEqual([...out.buffer], [3, 5]);
@@ -53,15 +55,15 @@ test('CPU Slice rejects non-positive steps, impossible output selections, and ra
   const out = tensor([2]);
   assert.throws(() => _cpuSlice({
     id: 'slice_step', inputs: { input }, outputs: { out },
-    params: { axes: [0], starts: [0], steps: [0] },
-  }), /positive integer steps/);
+    params: { axes: [0], starts: [0], ends: [4], steps: [0] },
+  }), /positive safe integers/);
   assert.throws(() => _cpuSlice({
     id: 'slice_bounds', inputs: { input }, outputs: { out },
-    params: { axes: [0], starts: [3], steps: [1] },
-  }), /output shape exceeds its input selection/);
+    params: { axes: [0], starts: [3], ends: [4], steps: [1] },
+  }), /output shape .* does not match/);
   const rankNineInput = tensor(new Array(9).fill(1), [1]);
   const rankNineOut = tensor(new Array(9).fill(1));
   assert.throws(() => _cpuSlice({
     id: 'slice_rank_nine', inputs: { input: rankNineInput }, outputs: { out: rankNineOut }, params: {},
-  }), /rank 1\.\.8 input\/output tensors/);
+  }), /input rank must be in \[1, 8\]/);
 });

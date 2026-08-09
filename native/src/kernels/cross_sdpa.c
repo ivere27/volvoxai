@@ -5,8 +5,8 @@
  * The previous implementation walked the key axis three times per (query, head)
  * — once to find the maximum logit, once to accumulate the softmax denominator,
  * and once to accumulate the output — recomputing the same Q.K dot on every
- * pass.  With the TinyReceiptVQA decoder's 402-row memory that made each cross
- * node cost three times the necessary arithmetic, all of it scalar: 31 ms per
+ * pass.  With a 402-row cross-attention memory that made each node cost three
+ * times the necessary arithmetic, all of it scalar: 31 ms per
  * node per token, which was 92% of an FP32 decode step.
  *
  * The online-softmax recurrence that replaced it lives in

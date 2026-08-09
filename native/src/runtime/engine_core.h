@@ -42,6 +42,55 @@ typedef struct {
     int cpu_threads; /* zero keeps the runtime default */
 } VolvoxAIEngineOptions;
 
+/* Concrete projection of one logical graph tensor for a single execution.
+ * These descriptors are internal to the native engine boundary: public
+ * callers bind VxTensorBinding values through volvoxai.h. */
+typedef struct {
+    const char* name;
+    int dtype;
+    int rank;
+    int shape[8];
+} VolvoxAIEngineResolvedTensor;
+
+/* Pointwise shape/byte maxima for the complete declared shape domain.  This
+ * is an allocation proof input, not a jointly executable shape: correlated
+ * tensor maxima need not be realizable by one request. */
+typedef struct {
+    const char* name;
+    int dtype;
+    int rank;
+    int maximum_shape[8];
+    size_t maximum_byte_size;
+} VolvoxAIEngineMaximumTensor;
+
+/* One context-owned physical activation span.  Several logical tensors may
+ * share a span only when their immutable topology lifetimes do not overlap. */
+typedef struct {
+    const void* host;
+    size_t capacity_bytes;
+} VolvoxAIEnginePhysicalSpan;
+
+typedef struct {
+    const char* name;
+    int dtype;
+    const void* data;
+    size_t byte_size;
+} VolvoxAIEngineInputBinding;
+
+typedef struct {
+    size_t struct_size;
+    int plan_cache_hit;
+    size_t logical_bytes;
+    size_t required_arena_bytes;
+    size_t arena_capacity_bytes;
+    size_t arena_high_water_bytes;
+    uint64_t arena_grow_count;
+    uint64_t resource_generation;
+} VolvoxAIEngineDynamicShapeStats;
+
+#define VOLVOXAI_ENGINE_DYNAMIC_SHAPE_STATS_INIT \
+    { sizeof(VolvoxAIEngineDynamicShapeStats), 0, 0, 0, 0, 0, 0, 0 }
+
 /* Backend-neutral autoregressive execution. A decode session is created after
  * model initialization, then seeded once after the caller writes all inputs.
  * Later steps rerun the dependency closure; CPU may additionally refresh one
@@ -108,6 +157,43 @@ int    volvoxai_engine_init_with_weight_files(const char* graph_path,
 /* Mutable view of an F32 graph input; typed inputs return NULL. */
 float* volvoxai_engine_input_ptr(const char* name, long* numel);
 int    volvoxai_engine_set_input_raw(const char* name, int dtype, const void* data, size_t nbytes);
+/* Validate the complete resolved descriptor/input batch, prepare a cached
+ * liveness plan, grow one reusable host activation arena transactionally,
+ * prebind any selected native graph backend, and only then publish tensor
+ * metadata and input bytes. A negative return leaves the previously committed
+ * tensor descriptors, pointers, and arena intact. */
+int    volvoxai_engine_commit_dynamic_shape(
+           const char* signature,
+           const VolvoxAIEngineResolvedTensor* tensors,
+           size_t tensor_count,
+           const VolvoxAIEngineInputBinding* inputs,
+           size_t input_count,
+           VolvoxAIEngineDynamicShapeStats* stats);
+/* Build the fixed topology-liveness fallback from pointwise tensor byte
+ * maxima. Every later concrete plan is checked against this bound and uses
+ * its fixed offsets. The function never executes a synthetic maximum shape. */
+int    volvoxai_engine_configure_dynamic_shape_domain(
+           const VolvoxAIEngineMaximumTensor* tensors,
+           size_t tensor_count);
+/* Bootstrap kernels classify operands by port use. Clear any temporary
+ * weight classification attached to logical tensor identities before true
+ * immutable model origins are retained. */
+int    volvoxai_engine_demote_preloaded_logical_tensors_locked(void);
+/* Allocate the proved host arena and reserve every backend physical span while
+ * the owning context is still unpublished. A later exact bind consumes this
+ * reservation without growing host or device capacity. */
+int    volvoxai_engine_reserve_dynamic_shape_domain(void);
+/* Atomic validation/copy path used by decode steps after a successful seed.
+ * It deliberately does not re-plan: decode steps must keep the seeded shape
+ * signature and retained incremental storage exactly. */
+int    volvoxai_engine_commit_input_bindings(
+           const VolvoxAIEngineInputBinding* inputs,
+           size_t input_count);
+/* Reserve one context-owned CPU workspace at its already proved maximum.
+ * Kernels may borrow it only for the duration of a serialized engine call and
+ * must accept an undersized/NULL view by selecting an allocation-free route. */
+int    volvoxai_engine_configure_cpu_typed_workspace(size_t bounded_bytes);
+void*  volvoxai_engine_cpu_typed_workspace(size_t* capacity_bytes);
 /* Copy real F32 values into an F32 graph input, or quantize them into a
  * per-tensor I8/U8 graph input using its declared scale and zero point. */
 int    volvoxai_engine_set_input_f32(const char* name, const float* data, long numel);

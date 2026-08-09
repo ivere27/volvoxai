@@ -64,6 +64,9 @@ int vx_matmul_quantized_f32_packed(const float* input, const void* packed_weight
         uint32_t weight_dtype, uint32_t scale_elements,
         uint32_t zero_point_dtype, uint32_t zero_point_elements);
 
+int vx_packed_q8_prefers_signed_activations(const void* packed_weight,
+        const int32_t* weight_zero_points, uint32_t output_channels);
+
 int vx_qlinear_i8u8_packed(const void* input, const void* packed_weight,
         const int32_t* bias, const float* weight_scales,
         const int32_t* weight_zero_points, void* output,
@@ -72,16 +75,26 @@ int vx_qlinear_i8u8_packed(const void* input, const void* packed_weight,
         float output_scale, int32_t output_zero_point,
         uint32_t input_dtype, uint32_t weight_dtype, uint32_t output_dtype);
 
-/* Native physical-QLinear policy. The exact packed AVX2 K4/N16 kernel is
- * available only for symmetric I8 weights. Packs without -128 use a bounded
- * signed-absolute dot; other packs retain the exact unsigned split. Short-K
- * M=1 adapter projections also benefit, while ordinary M=1 decode keeps the
- * raw GEMV dispatcher. Other ISAs retain their runtime-gated raw kernels. */
+/* Native physical-QLinear policy. The packed pair layout is available only for
+ * symmetric I8 weights. AVX2 uses its exact K4/N16 kernels generally; a
+ * single-threaded, wide-enough call uses N32 with either the proved
+ * saturation-free plain dot or the signed-absolute spelling for weights that
+ * exclude -128. VNNI N32 accepts the complete signed byte range through
+ * VPDPBUSD. Short-K M=1 adapter
+ * projections also benefit, while ordinary M=1 decode keeps the raw GEMV
+ * dispatcher. Other ISAs retain their runtime-gated raw kernels. */
 int vx_packed_q8_preferred_for_native_w8a8(uint32_t rows, uint32_t d_in,
         uint32_t d_out, uint32_t weight_dtype, int weight_zero_all_zero);
 
 #ifdef __cplusplus
 }
 #endif
+
+
+/* The K block the packed quantized kernels step, derived from the detected L1
+ * rather than fixed, and the check that the derivation still reproduces the
+ * value it replaced on a 32 KiB L1. */
+uint32_t vx_qgemm_kc(void);
+int vx_qgemm_kc_is_baseline(void);
 
 #endif

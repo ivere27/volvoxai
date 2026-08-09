@@ -2,19 +2,25 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 
 import {
-  Graph,
+  Model,
   VOLVOXAI_BACKEND_PROVIDER_VERSION,
   VolvoxAI,
   createBackendProviderCapabilities,
+  parseGraphDocument,
+  requireHostExecutionInputs,
 } from '../ts/index.js';
+import { RuntimeGraph } from '../ts/core/RuntimeGraph.js';
 import { BackendEngine, assertBuiltInEngine } from '../ts/backends/BackendEngine.js';
-import { BuiltInBackendProvider } from '../ts/backends/BackendProvider.js';
+import {
+  BuiltInBackendProvider,
+  assertBackendProvider,
+  createBackendCompileInput,
+} from '../ts/backends/BackendProvider.js';
 import { CPUEngine } from '../ts/backends/CPUEngine.js';
 import { GraphExecutor } from '../ts/backends/GraphExecutor.js';
 import { WasmEngine } from '../ts/backends/WasmEngine.js';
 import { WebGPUEngine } from '../ts/backends/WebGPUEngine.js';
 import { WebNNEngine } from '../ts/backends/WebNNEngine.js';
-import { ModelSnapshot } from '../ts/core/ModelSnapshot.js';
 
 class RecordingBackend extends BackendEngine {
   constructor(name = 'recording', capabilities = {}) {
@@ -59,7 +65,7 @@ function internalReluGraph(adapters = null) {
 }
 
 function identityGraph() {
-  const graph = new Graph();
+  const graph = new RuntimeGraph();
   const input = graph.addInput('x', [1]);
   const output = graph.addOp('Identity', { input }, {
     out: { name: 'y', shape: [1] },
@@ -68,8 +74,22 @@ function identityGraph() {
   return graph;
 }
 
+function logicalIdentitySnapshot() {
+  const graph = parseGraphDocument({
+    format: 'volvox-graph/v1',
+    dimensions: {},
+    inputs: { x: { dtype: 'float32', shape: [1] } },
+    nodes: [{
+      id: 'identity', opType: 'Identity', inputs: { input: 'x' },
+      outputs: { out: { tensor: 'y', dtype: 'float32', shape: [1] } }, params: {},
+    }],
+    outputs: ['y'],
+  }, []);
+  return Model.capture({ graph, weights: {} });
+}
+
 function genericByteAddGraph({ quantized = true, dtype = 'int8' } = {}) {
-  const graph = new Graph();
+  const graph = new RuntimeGraph();
   const quantization = { scheme: 'per_tensor', scale: 0.25, zero_point: 0 };
   const options = quantized ? { quantization } : {};
   const a = graph.addInput('a', [4], dtype, options);
@@ -90,6 +110,7 @@ function hostOutput(value) {
     shape: Object.freeze([1]),
     dtype: 'float32',
     location: 'host',
+    ownership: 'borrowed',
     data: Float32Array.of(value),
   });
 }
@@ -99,11 +120,12 @@ test('built-in engine lifecycle stays private and structurally consistent', () =
   const webnn = new WebNNEngine({});
   assert.equal(cpu.backendName, 'cpu');
   assert.deepEqual(cpu.capabilities, {
-    incrementalExecution: true, incrementalRows: true, outputLocation: 'host',
+    incrementalExecution: true, incrementalRows: true,
+    sequenceMajorRows: false, outputLocation: 'host',
   });
   assert.equal(webnn.backendName, 'webnn');
   assert.deepEqual(webnn.capabilities, {
-    incrementalExecution: false, incrementalRows: false, outputLocation: 'host',
+    incrementalExecution: false, incrementalRows: false, sequenceMajorRows: false, outputLocation: 'host',
   });
   for (const engine of [cpu, webnn]) {
     assert.equal(assertBuiltInEngine(engine), engine);
@@ -132,7 +154,7 @@ test('built-in engine lifecycle stays private and structurally consistent', () =
   );
 });
 
-test('built-in CompiledModel owns one immutable prepared graph across contexts', async () => {
+test('non-CPU built-ins explicitly reject provider bounded domains before preparation', async () => {
   const events = { prepare: 0, allocations: [], disposed: 0 };
   class PreparedBackend extends RecordingBackend {
     constructor() { super('prepared'); }
@@ -149,32 +171,35 @@ test('built-in CompiledModel owns one immutable prepared graph across contexts',
   }
 
   const provider = new BuiltInBackendProvider(new PreparedBackend());
-  const compiled = await provider.compile(ModelSnapshot.capture(identityGraph()), {
-    operatorFallback: 'forbid',
-  });
-  const first = await compiled.createContext();
-  const second = await compiled.createContext();
-
-  assert.equal(events.prepare, 1);
-  assert.equal(events.allocations.length, 2);
-  assert.equal(events.allocations[0].preparedGraph, events.allocations[1].preparedGraph);
-  assert.equal(Object.isFrozen(events.allocations[0].preparedGraph), true);
-  assert.notEqual(events.allocations[0].graph, events.allocations[1].graph,
-    'contexts retain private tensor graphs while sharing only the prepared blueprint');
-  assert.notEqual(events.allocations[0].engine, events.allocations[1].engine);
-
-  await first.close();
-  await second.close();
-  await compiled.close();
+  assert.equal(provider.capabilities.dynamicShapeDomain.support, 'unsupported');
+  assert.deepEqual(
+    Reflect.ownKeys(provider.capabilities.dynamicShapeDomain).sort(),
+    ['proofProtocol', 'resourceProtocol', 'support'].sort(),
+  );
+  assert.equal(Object.isFrozen(provider.capabilities.dynamicShapeDomain), true);
+  await assert.rejects(
+    provider.compile(createBackendCompileInput(logicalIdentitySnapshot()), {
+      operatorFallback: 'forbid',
+    }),
+    (error) => error.code === 'BACKEND_UNSUPPORTED',
+  );
+  assert.equal(events.prepare, 0);
+  assert.equal(events.allocations.length, 0);
   await provider.close();
-  assert.equal(events.disposed, 3);
+  assert.equal(events.disposed, 1);
 });
 
 test('WASM prepared schedules are frozen, pointer-free, and reject unknown operators', () => {
   const engine = new WasmEngine({
     instance: { exports: { memory: new WebAssembly.Memory({ initial: 1 }) } },
   });
-  const prepared = engine.prepareGraph(identityGraph());
+  const firstGraph = identityGraph();
+  const invariant = engine.prepareInvariantSchedule({
+    nodes: firstGraph.nodes,
+    tensorCount: firstGraph.tensors.size,
+    outputNames: firstGraph.outputNames,
+  });
+  const prepared = engine.prepareGraph(firstGraph, invariant);
 
   assert.equal(Object.isFrozen(prepared), true);
   assert.equal(Object.isFrozen(prepared.schedule), true);
@@ -186,13 +211,28 @@ test('WASM prepared schedules are frozen, pointer-free, and reject unknown opera
   assert.equal(prepared.schedule[0].tensor, undefined);
   assert.throws(() => prepared.schedule.push({}), TypeError);
 
-  const unsupported = new Graph();
+  const secondGraph = new RuntimeGraph();
+  const secondInput = secondGraph.addInput('x', [7]);
+  const secondOutput = secondGraph.addOp('Identity', { input: secondInput }, {
+    out: { name: 'y', shape: [7] },
+  }).out;
+  secondGraph.setOutputs(secondOutput);
+  const rebound = engine.prepareGraph(secondGraph, invariant);
+  assert.strictEqual(rebound.schedule, prepared.schedule,
+    'shape variants must retain the compiled-model schedule object');
+  assert.strictEqual(rebound.inputPreflights, prepared.inputPreflights);
+
+  const unsupported = new RuntimeGraph();
   const input = unsupported.addInput('x', [1]);
   const output = unsupported.addOp('UnknownKernel', { input }, {
     out: { name: 'y', shape: [1] },
   }).out;
   unsupported.setOutputs(output);
   assert.throws(() => engine.prepareGraph(unsupported), /operator 'UnknownKernel' is unsupported/);
+  assert.throws(
+    () => engine.prepareGraph(unsupported, invariant),
+    /invariant prepared schedule does not match/,
+  );
 });
 
 test('provider capability validation uses typed initialization failures', () => {
@@ -205,6 +245,45 @@ test('provider capability validation uses typed initialization failures', () => 
       assert.equal(error.phase, 'initialization');
       return true;
     });
+  }
+});
+
+test('provider composition rejects unknown capability members and malformed provider ABI tags before compile', () => {
+  const provider = {
+    providerVersion: VOLVOXAI_BACKEND_PROVIDER_VERSION,
+    backendName: 'versioned-fixture',
+    capabilities: createBackendProviderCapabilities({
+      operatorFallback: 'none',
+      outputLocation: 'host',
+      dynamicShapeDomain: 'full',
+    }),
+    async compile() { throw new Error('compile must not be reached'); },
+    async close() {},
+  };
+  assert.equal(assertBackendProvider(provider), provider);
+  const malformedCapability = Object.freeze({
+    ...provider.capabilities.dynamicShapeDomain,
+    unknownMember: true,
+  });
+  assert.throws(
+    () => assertBackendProvider({
+      ...provider,
+      capabilities: Object.freeze({
+        ...provider.capabilities,
+        dynamicShapeDomain: malformedCapability,
+      }),
+    }),
+    (error) => error.code === 'ABI_UNSUPPORTED',
+  );
+  for (const providerVersion of [0, 0xffff_ffff]) {
+    assert.throws(
+      () => assertBackendProvider({ ...provider, providerVersion }),
+      (error) => error.code === 'ABI_UNSUPPORTED' &&
+        error.phase === 'initialization' &&
+        error.message.includes(
+          `VOLVOXAI_BACKEND_PROVIDER_VERSION ${VOLVOXAI_BACKEND_PROVIDER_VERSION}`,
+        ),
+    );
   }
 });
 
@@ -231,7 +310,7 @@ test('WebNN uses only the current dataType/shape descriptor contract', async () 
     async readTensor() { return Float32Array.of(3).buffer; },
   };
   try {
-    const graph = new Graph();
+    const graph = new RuntimeGraph();
     const input = graph.addInput('x', [1]);
     const output = graph.addOp('ReLU', { input }, {
       out: { name: 'y', shape: [1] },
@@ -265,7 +344,7 @@ test('WebNN releases every partially created request tensor after failure', asyn
   }
   globalThis.MLGraphBuilder = CurrentWebNNBuilder;
   const makeGraph = () => {
-    const graph = new Graph();
+    const graph = new RuntimeGraph();
     const input = graph.addInput('x', [1]);
     const output = graph.addOp('ReLU', { input }, {
       out: { name: 'y', shape: [1] },
@@ -314,6 +393,218 @@ test('WebNN releases every partially created request tensor after failure', asyn
       /dispatch failed/,
     );
     assert.deepEqual(dispatched.map((tensor) => tensor.destroyed), [true, true]);
+  } finally {
+    if (previousBuilder === undefined) delete globalThis.MLGraphBuilder;
+    else globalThis.MLGraphBuilder = previousBuilder;
+  }
+});
+
+test('WebNN fails closed on a missing or incorrectly sized ordinary input', async () => {
+  const previousBuilder = globalThis.MLGraphBuilder;
+  class CurrentWebNNBuilder {
+    input(name, descriptor) { return { name, ...descriptor }; }
+    relu(input) { return { ...input, name: 'y' }; }
+    async build(outputs) { return outputs; }
+  }
+  globalThis.MLGraphBuilder = CurrentWebNNBuilder;
+  let tensorCreations = 0;
+  const context = {
+    async createTensor() { tensorCreations++; return { destroy() {} }; },
+    writeTensor() {}, dispatch() {}, async readTensor() { return new ArrayBuffer(4); },
+  };
+  try {
+    const graph = new RuntimeGraph();
+    const input = graph.addInput('x', [2]);
+    const output = graph.addOp('ReLU', { input }, {
+      out: { name: 'y', shape: [2] },
+    }).out;
+    graph.setOutputs(output);
+    const engine = new WebNNEngine(context);
+    await engine.allocateGraph(graph);
+    await assert.rejects(engine.execute({}), /missing ordinary input 'x'/);
+    await assert.rejects(
+      engine.execute({ x: Float32Array.of(1) }),
+      /exactly 2 float32 elements/,
+    );
+    assert.equal(tensorCreations, 0);
+  } finally {
+    if (previousBuilder === undefined) delete globalThis.MLGraphBuilder;
+    else globalThis.MLGraphBuilder = previousBuilder;
+  }
+});
+
+test('WebNN preserves dense, convolution, activation, embedding, normalization, and attention semantics', async () => {
+  const previousBuilder = globalThis.MLGraphBuilder;
+  const calls = [];
+  const operand = (kind, fields = {}) => ({ kind, ...fields });
+  class RecordingWebNNBuilder {
+    input(name, descriptor) {
+      calls.push({ kind: 'input', name, descriptor });
+      return operand('input', { name, descriptor });
+    }
+    constant(descriptor, data) {
+      calls.push({ kind: 'constant', descriptor, data });
+      return operand('constant', { descriptor });
+    }
+    transpose(input, options) {
+      calls.push({ kind: 'transpose', input, options });
+      return operand('transpose', { input, options });
+    }
+    matmul(a, b) { calls.push({ kind: 'matmul', a, b }); return operand('matmul', { a, b }); }
+    add(a, b) { calls.push({ kind: 'add', a, b }); return operand('add', { a, b }); }
+    mul(a, b) { calls.push({ kind: 'mul', a, b }); return operand('mul', { a, b }); }
+    relu(input) { calls.push({ kind: 'relu', input }); return operand('relu', { input }); }
+    clamp(input, options) {
+      calls.push({ kind: 'clamp', input, options });
+      return operand('clamp', { input, options });
+    }
+    conv2d(input, filter, options) {
+      calls.push({ kind: 'conv2d', input, filter, options });
+      return operand('conv2d', { input, filter, options });
+    }
+    gather(input, indices, options) {
+      calls.push({ kind: 'gather', input, indices, options });
+      return operand('gather', { input, indices, options });
+    }
+    cast(input, dataType) {
+      calls.push({ kind: 'cast', input, dataType });
+      return operand('cast', { input, dataType });
+    }
+    layerNormalization(input, options) {
+      calls.push({ kind: 'layerNormalization', input, options });
+      return operand('layerNormalization', { input, options });
+    }
+    reshape(input, shape) {
+      calls.push({ kind: 'reshape', input, shape });
+      return operand('reshape', { input, shape });
+    }
+    slice(input, starts, sizes) {
+      calls.push({ kind: 'slice', input, starts, sizes });
+      return operand('slice', { input, starts, sizes });
+    }
+    softmax(input, axis) {
+      calls.push({ kind: 'softmax', input, axis });
+      return operand('softmax', { input, axis });
+    }
+    async build(outputs) { calls.push({ kind: 'build', outputs }); return outputs; }
+  }
+  globalThis.MLGraphBuilder = RecordingWebNNBuilder;
+  const weight = (graph, name, shape, values = null) => graph.addWeight(
+    name,
+    shape,
+    'float32',
+    { buffer: values ?? new Float32Array(shape.reduce((total, value) => total * value, 1)) },
+  );
+  const allocate = async (graph) => new WebNNEngine({}).allocateGraph(graph);
+  try {
+    const linear = new RuntimeGraph();
+    const linearInput = linear.addInput('x', [2, 3]);
+    const linearWeight = weight(linear, 'w', [4, 3]);
+    const linearBias = weight(linear, 'bias', [4]);
+    const linearOutput = linear.addOp('Linear', {
+      input: linearInput, weight: linearWeight, bias: linearBias,
+    }, { out: { name: 'y', shape: [2, 4] } }, { weight_layout: 'OUT_IN' }).out;
+    linear.setOutputs(linearOutput);
+    await allocate(linear);
+    assert.deepEqual(calls.filter(({ kind }) => ['transpose', 'matmul', 'add'].includes(kind))
+      .map(({ kind }) => kind), ['transpose', 'matmul', 'add']);
+    assert.deepEqual(calls.find(({ kind }) => kind === 'transpose').options, {
+      permutation: [1, 0],
+    });
+
+    calls.length = 0;
+    const convolution = new RuntimeGraph();
+    const image = convolution.addInput('image', [1, 5, 6, 2]);
+    const kernel = weight(convolution, 'kernel', [3, 2, 1, 4]);
+    const convBias = weight(convolution, 'bias', [4]);
+    const convOutput = convolution.addOp('Conv2D', {
+      input: image, weight: kernel, bias: convBias,
+    }, { out: { name: 'y', shape: [1, 4, 10, 4] } }, {
+      data_layout: 'NHWC', weight_layout: 'HWIO', groups: 2,
+      stride: [2, 1], pads: [1, 2, 3, 4], dilation: [1, 2], relu: 2,
+    }).out;
+    convolution.setOutputs(convOutput);
+    await allocate(convolution);
+    const convCall = calls.find(({ kind }) => kind === 'conv2d');
+    assert.deepEqual({
+      inputLayout: convCall.options.inputLayout,
+      filterLayout: convCall.options.filterLayout,
+      strides: convCall.options.strides,
+      padding: convCall.options.padding,
+      dilations: convCall.options.dilations,
+      groups: convCall.options.groups,
+    }, {
+      inputLayout: 'nhwc', filterLayout: 'hwio', strides: [2, 1],
+      padding: [1, 3, 2, 4], dilations: [1, 2], groups: 2,
+    });
+    assert.deepEqual(calls.find(({ kind }) => kind === 'clamp').options, {
+      minValue: 0, maxValue: 6,
+    });
+
+    calls.length = 0;
+    const add = new RuntimeGraph();
+    const a = add.addInput('a', [2]);
+    const b = add.addInput('b', [2]);
+    const addOutput = add.addOp('Add', { a, b }, {
+      out: { name: 'y', shape: [2] },
+    }, { relu: 1 }).out;
+    add.setOutputs(addOutput);
+    await allocate(add);
+    assert.deepEqual(calls.filter(({ kind }) => kind === 'add' || kind === 'relu')
+      .map(({ kind }) => kind), ['add', 'relu']);
+
+    calls.length = 0;
+    const embedding = new RuntimeGraph();
+    const ids = embedding.addInput('ids', [2], 'int32');
+    const table = weight(embedding, 'table', [5, 3]);
+    const embeddingOutput = embedding.addOp('Embedding', { input: ids, weight: table }, {
+      out: { name: 'y', shape: [2, 3] },
+    }).out;
+    embedding.setOutputs(embeddingOutput);
+    await allocate(embedding);
+    assert.equal(calls.some(({ kind }) => kind === 'cast'), false,
+      'canonical int32 indices reach gather without a redundant cast');
+    assert.deepEqual(calls.find(({ kind }) => kind === 'gather').options, { axis: 0 });
+
+    calls.length = 0;
+    const normalization = new RuntimeGraph();
+    const normInput = normalization.addInput('x', [2, 3]);
+    const scale = weight(normalization, 'scale', [3]);
+    const offset = weight(normalization, 'offset', [3]);
+    const normOutput = normalization.addOp('LayerNorm', {
+      input: normInput, weight: scale, bias: offset,
+    }, { out: { name: 'y', shape: [2, 3] } }, { eps: 1e-4 }).out;
+    normalization.setOutputs(normOutput);
+    await allocate(normalization);
+    const layerNorm = calls.find(({ kind }) => kind === 'layerNormalization');
+    assert.deepEqual(layerNorm.options.axes, [1]);
+    assert.equal(layerNorm.options.epsilon, 1e-4);
+    assert.equal(layerNorm.options.scale.kind, 'constant');
+    assert.equal(layerNorm.options.bias.kind, 'constant');
+
+    for (const causal of [false, true]) {
+      calls.length = 0;
+      const attention = new RuntimeGraph();
+      const qkv = attention.addInput('qkv', [2, 6]);
+      const output = attention.addOp('SDPA', { qkv }, {
+        out: { name: 'y', shape: [2, 2] },
+      }, { heads: 1, causal }).out;
+      attention.setOutputs(output);
+      await allocate(attention);
+      assert.deepEqual(calls.filter(({ kind }) => kind === 'constant')
+        .map(({ descriptor }) => descriptor.shape), causal ? [[1], [2, 2]] : [[1]]);
+      assert.equal(calls.filter(({ kind }) => kind === 'add').length, causal ? 1 : 0);
+    }
+
+    calls.length = 0;
+    const masked = new RuntimeGraph();
+    const qkv = masked.addInput('qkv', [2, 6]);
+    const mask = masked.addInput('mask', [2], 'int32');
+    const maskedOutput = masked.addOp('SDPA', { qkv, mask }, {
+      out: { name: 'y', shape: [2, 2] },
+    }, { heads: 1, causal: false }).out;
+    masked.setOutputs(maskedOutput);
+    await assert.rejects(allocate(masked), /does not support an explicit attention mask/);
   } finally {
     if (previousBuilder === undefined) delete globalThis.MLGraphBuilder;
     else globalThis.MLGraphBuilder = previousBuilder;
@@ -492,16 +783,6 @@ test('DecodeSession rejects unknown inputs and dynamically unavailable caching',
     training.seed({ x: Float32Array.of(1) }, { training: {} }),
     /does not accept training or Dropout RNG options/,
   );
-
-  graph.adapters = {
-    hasActive() { return true; },
-    _pinExecution() { return Object.freeze({ kind: 'single' }); },
-  };
-  const adapter = engine.createDecodeSession({ requireIncremental: true });
-  await assert.rejects(
-    adapter.seed({ x: Float32Array.of(1) }),
-    /unavailable while an adapter is active/,
-  );
 });
 
 test('WebGPU context forks share only device caches and release them at the final owner', async () => {
@@ -587,7 +868,7 @@ test('WebGPU context forks share only device caches and release them at the fina
   assert.equal(events[0], 'compile');
 });
 
-test('runtime-local provider composition covers Model, contexts, decode, and results', async () => {
+test('runtime-local provider composition covers logical compile, contexts, decode, and results', async () => {
   const name = 'interface-fixture';
   const events = [];
   let nextContext = 0;
@@ -597,19 +878,37 @@ test('runtime-local provider composition covers Model, contexts, decode, and res
     capabilities: createBackendProviderCapabilities({
       operatorFallback: 'none',
       outputLocation: 'host',
+      dynamicShapeDomain: 'full',
     }),
-    async compile(snapshot, options) {
-      events.push(['compile', snapshot.outputNames, options]);
+    async compile(input, options) {
+      events.push(['compile', input.outputNames, options]);
       return {
         backendName: name,
+        compilationEvidence: Object.freeze({
+          device: null,
+          allocationBytes: 0,
+          operatorFallbackUsed: false,
+          offendingNode: null,
+          shapeDomain: Object.freeze({
+            proofProtocol: 'canonical-symbolic-domain-proof/v1',
+            resourceProtocol: 'bounded-resource-maxima/v1',
+            support: 'full',
+            graphFingerprint: input.graphFingerprint,
+            proof: input.shapeDomainProof,
+            maximumTensorBytes: 4,
+            maximumResidentBytes: 8,
+            resourceLimitBytes: 1024,
+          }),
+        }),
         async createContext() {
           const contextId = ++nextContext;
           let closed = false;
-          const execute = async (inputs, options = {}) => {
+          const execute = async (request) => {
             assert.equal(closed, false);
-            events.push(['execute', contextId, options]);
+            events.push(['execute', contextId, request.options]);
+            const inputs = requireHostExecutionInputs(request, name);
             return Object.freeze({
-              outputs: Object.freeze([hostOutput(inputs.x[0] + contextId)]),
+              outputs: Object.freeze([hostOutput(inputs.x.data[0] + contextId)]),
               backendReport: Object.freeze({ contextId }),
             });
           };
@@ -637,8 +936,7 @@ test('runtime-local provider composition covers Model, contexts, decode, and res
     },
   });
   assert.deepEqual(runtime.listBackends(), [name]);
-  const model = runtime.createModel(identityGraph());
-  const compiled = await model.compile({
+  const compiled = await runtime.compile(logicalIdentitySnapshot(), {
     backend: { mode: 'require', backend: name, operatorFallback: 'forbid' },
   });
   assert.equal(compiled.backend, name);
@@ -646,8 +944,10 @@ test('runtime-local provider composition covers Model, contexts, decode, and res
 
   const firstContext = await compiled.createContext();
   const secondContext = await compiled.createContext();
-  const first = await firstContext.execute({ x: Float32Array.of(2) });
-  const second = await secondContext.decode.seed({ x: Float32Array.of(5) });
+  const first = await firstContext.execute({ x: { data: Float32Array.of(2), shape: [1] } });
+  const second = await secondContext.decode.seed({
+    x: { data: Float32Array.of(5), shape: [1] },
+  });
   assert.deepEqual(await first.output('y').read(), Float32Array.of(3));
   assert.deepEqual(await second.output('y').read(), Float32Array.of(7));
   assert.deepEqual(first.report.backendReport, { contextId: 1 });
@@ -657,7 +957,6 @@ test('runtime-local provider composition covers Model, contexts, decode, and res
   assert.deepEqual(await first.output('y').read(), Float32Array.of(3));
   await secondContext.close();
   await compiled.close();
-  await model.close();
   await runtime.close();
   assert.deepEqual(events.slice(-4), [
     ['context-close', 1],

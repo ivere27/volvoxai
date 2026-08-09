@@ -7,7 +7,7 @@ import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
 
-import { Graph } from '../ts/index.js';
+import { TrainingGraph as Graph } from '../ts/training/TrainingGraph.js';
 import { createWasmStepRunner } from './helpers/training_session.mjs';
 import { CPUAutograd } from '../ts/training/CPUAutograd.js';
 
@@ -138,10 +138,12 @@ async function trainParity(runWasmStep, makeGraph, counter) {
     ...options, inputs: wasmCase.executionInputs, backend: 'wasm',
   });
   const cpu = await CPUAutograd.trainStep(cpuCase.graph, {
-    ...options, inputs: cpuCase.executionInputs,
+    ...options, inputs: cpuCase.executionInputs, shapeSignature: wasm.shapeSignature,
   });
   assert.equal(wasm.backend, 'wasm');
-  assert.ok(Math.abs(wasm.loss - cpu.loss) <= 5e-5, `loss at dropout counter ${counter}`);
+  assert.ok(Math.abs(wasm.loss - cpu.loss) <= 5e-5,
+    `loss at dropout counter ${counter} for ${wasmCase.graph.nodes[0].opType} ` +
+    `${JSON.stringify(wasmCase.graph.nodes[0].params)}: ${wasm.loss} != ${cpu.loss}`);
   for (const name of wasmCase.trainable) {
     closeArray(wasm.gradients.get(name), cpu.gradients.get(name), `${name} gradient at counter ${counter}`);
   }

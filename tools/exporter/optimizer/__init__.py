@@ -73,7 +73,10 @@ from .typed_pipeline import (
     runtime_ptq_authoring_pipeline,
     serialize_pipeline_report,
 )
-from .static_qdq_fusion import RuntimeStaticQDQComputeFusionPass
+from .static_qdq_fusion import (
+    RuntimeStaticQDQBatchMatMulFusionPass,
+    RuntimeStaticQDQComputeFusionPass,
+)
 from .typed_affine_canonicalization import (
     RuntimeAffineReferenceCanonicalizationPass,
 )
@@ -168,6 +171,7 @@ __all__ = [
     "RuntimeShapeChainPass",
     "RuntimeSiluFusionPass",
     "RuntimeSingletonTransposePass",
+    "RuntimeStaticQDQBatchMatMulFusionPass",
     "RuntimeStaticQDQComputeFusionPass",
     "RuntimeVocabularyPass",
     "ScopedTiming",

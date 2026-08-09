@@ -12,20 +12,24 @@
             let oc = batch_c % params.out_c;
             var sum = 0.0;
             if (params.has_bias == 1u) { sum = bias[oc]; }
-            for (var ic = 0u; ic < params.in_c; ic = ic + 1u) {
-                for (var ky = 0u; ky < params.kh; ky = ky + 1u) {
-                    for (var kx = 0u; kx < params.kw; kx = kx + 1u) {
-                        let oy_shifted = i32(y) + i32(params.ph) - i32(ky);
-                        let ox_shifted = i32(x) + i32(params.pw) - i32(kx);
-                        if (oy_shifted % i32(params.sh) == 0 && ox_shifted % i32(params.sw) == 0) {
-                            let iy = oy_shifted / i32(params.sh);
-                            let ix = ox_shifted / i32(params.sw);
-                            if (iy >= 0 && iy < i32(params.in_h) && ix >= 0 && ix < i32(params.in_w)) {
-                                let in_val = input[((ob * params.in_h + u32(iy)) * params.in_w + u32(ix)) * params.in_c + ic];
-                                let w_val = weight[ic * (params.out_c * params.kh * params.kw) + oc * (params.kh * params.kw) + ky * params.kw + kx];
-                                sum = sum + in_val * w_val;
-                            }
-                        }
+            // Weights are HWIO [kh, kw, in_c, out_c]. Tap geometry depends only
+            // on (ky, kx), so it is resolved once per tap rather than per input
+            // channel the way the channel-outer form did.
+            for (var ky = 0u; ky < params.kh; ky = ky + 1u) {
+                let oy_shifted = i32(y) + i32(params.ph) - i32(ky);
+                if (oy_shifted < 0 || oy_shifted % i32(params.sh) != 0) { continue; }
+                let iy = oy_shifted / i32(params.sh);
+                if (iy >= i32(params.in_h)) { continue; }
+                for (var kx = 0u; kx < params.kw; kx = kx + 1u) {
+                    let ox_shifted = i32(x) + i32(params.pw) - i32(kx);
+                    if (ox_shifted < 0 || ox_shifted % i32(params.sw) != 0) { continue; }
+                    let ix = ox_shifted / i32(params.sw);
+                    if (ix >= i32(params.in_w)) { continue; }
+                    let in_base = ((ob * params.in_h + u32(iy)) * params.in_w + u32(ix)) * params.in_c;
+                    let w_tap = (ky * params.kw + kx) * params.in_c * params.out_c;
+                    for (var ic = 0u; ic < params.in_c; ic = ic + 1u) {
+                        sum = sum + input[in_base + ic] *
+                              weight[w_tap + ic * params.out_c + oc];
                     }
                 }
             }

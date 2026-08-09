@@ -1,12 +1,12 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
-import { Graph } from '../ts/core/Graph.js';
-import { GraphLoader } from '../ts/core/GraphLoader.js';
+import { RuntimeGraph } from '../ts/core/RuntimeGraph.js';
+import { RuntimeGraphLoader } from '../ts/core/RuntimeGraphLoader.js';
 import { CPUEngine } from '../ts/backends/CPUEngine.js';
 
 function qGroupNormGraph() {
-  const graph = new Graph();
+  const graph = new RuntimeGraph();
   const input = graph.addInput('input', [1, 2, 2, 4], 'int8', {
     quantization: { scheme: 'per_tensor', scale: 0.25, zero_point: -1 },
   });
@@ -28,7 +28,7 @@ function qGroupNormGraph() {
 
 test('CPU dispatches QGroupNorm through the byte-domain kernel, not F32 GroupNorm', async () => {
   const { graph } = qGroupNormGraph();
-  assert.doesNotThrow(() => GraphLoader._assertBrowserQuantizationSupported(graph));
+  assert.doesNotThrow(() => RuntimeGraphLoader._assertBrowserQuantizationSupported(graph));
 
   const engine = new CPUEngine();
   engine.allocateGraph(graph);
@@ -48,18 +48,18 @@ test('CPU dispatches QGroupNorm through the byte-domain kernel, not F32 GroupNor
   assert.deepEqual([...result.out], [-12, -4, 6, 11, 6, -6, 4, -21, -1, -16, -2, 1, -11, -13, 3, -11]);
 });
 
-test('GraphLoader rejects non-canonical QGroupNorm byte boundaries', () => {
+test('RuntimeGraphLoader rejects non-canonical QGroupNorm byte boundaries', () => {
   const invalidGroups = qGroupNormGraph();
   invalidGroups.node.params.num_groups = 3;
   assert.throws(
-    () => GraphLoader._assertBrowserQuantizationSupported(invalidGroups.graph),
+    () => RuntimeGraphLoader._assertBrowserQuantizationSupported(invalidGroups.graph),
     /rank-4 NHWC per-tensor I8\/U8 activation edges/,
   );
 
   const unexpectedInput = qGroupNormGraph();
   unexpectedInput.node.inputs.extra = unexpectedInput.input;
   assert.throws(
-    () => GraphLoader._assertBrowserQuantizationSupported(unexpectedInput.graph),
+    () => RuntimeGraphLoader._assertBrowserQuantizationSupported(unexpectedInput.graph),
     /exact input\/weight\/bias inputs/,
   );
 });

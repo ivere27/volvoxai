@@ -1,11 +1,13 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
-import { Graph, Trainer, VolvoxAI } from '../ts/full.js';
+import { Trainer } from '../ts/full.js';
 import { WebGPUAutograd } from '../ts/training/WebGPUAutograd.js';
+import { TrainingGraph as Graph } from '../ts/training/TrainingGraph.js';
 import { GraphExecutor } from '../ts/backends/GraphExecutor.js';
 import { _cpuDropout, dropoutContext, dropoutHash } from '../ts/ops/dropout.js';
 import { attentionProbabilityIndex } from '../ts/ops/attentionDropout.js';
+import { logicalSnapshotFromTrainingGraph } from './helpers/training_fixture.mjs';
 
 // Node does not expose WebGPU constants. These values are only bit masks for
 // the host-side mock; their numeric values are irrelevant to these tests.
@@ -23,12 +25,20 @@ function tensor(name, shape, { dtype = 'float32', buffer = null, isWeight = fals
 }
 
 function mockDevice() {
-  const state = { buffers: [], bindGroups: [], shaderModules: 0, pipelines: 0, workDone: 0 };
+  const state = {
+    buffers: [], bindGroups: [], shaderModules: 0, pipelines: 0, workDone: 0,
+    failNextBuffer: false,
+  };
   const device = {
     state,
     createBuffer(descriptor) {
+      if (state.failNextBuffer) {
+        state.failNextBuffer = false;
+        throw new Error('injected WebGPU allocation failure');
+      }
       const value = {
         descriptor,
+        size: descriptor.size,
         bytes: new Uint8Array(descriptor.size),
         destroyed: false,
         destroy() { this.destroyed = true; },
@@ -83,7 +93,7 @@ function makeTrainer(nodes, tensors) {
     nodes,
     getTensor(name) { return tensors.find((value) => value.name === name); },
   };
-  const trainer = new DispatchRecorder(device, graph, { gpuBuffers, _dinWeights: new Map() });
+  const trainer = new DispatchRecorder(device, graph, { gpuBuffers });
   return { trainer, device };
 }
 
@@ -103,7 +113,7 @@ test('Linear backward dispatches odd 16x16 gradient tiles and a 64-wide bias row
   const bias = tensor('linear_bias', [23]);
   const output = tensor('linear_output', [17, 23]);
   const node = {
-    id: 'linear_tiled_backward', opType: 'Linear',
+    id: 'linear_tiled_backward', opType: 'Linear', wLayout: 'dout',
     inputs: { input, weight, bias }, outputs: { out: output }, params: {},
   };
   const { trainer } = makeTrainer([node], [input, weight, bias, output]);
@@ -118,10 +128,78 @@ test('Linear backward dispatches odd 16x16 gradient tiles and a 64-wide bias row
     { shader: 'matMulBackward.weight_main', workgroupCount: [2, 2, 1] },
     { shader: 'matMulBackward.bias_main', workgroupCount: [1, 1, 1] },
   ]);
+  const params = dispatches[0].entries.find(([binding]) => binding === 6)[1];
+  assert.deepEqual([...new Uint32Array(params.bytes.buffer)], [17, 19, 23, 1, 0, 0, 0, 0]);
   trainer.dispose();
 });
 
-test('full-profile Trainer owns WebGPU training and retains its Model handle', async () => {
+test('WebGPU input-major Linear backward and optimizer upload preserve canonical storage', async () => {
+  const input = tensor('linear_input', [2, 3]);
+  const weight = tensor('linear_weight', [3, 4], {
+    buffer: Float32Array.from({ length: 12 }, (_, index) => index + 1),
+    isWeight: true,
+  });
+  const output = tensor('linear_output', [2, 4]);
+  const node = {
+    id: 'linear_input_major', opType: 'MatMul', wLayout: 'din',
+    inputs: { input, weight }, outputs: { out: output },
+    params: { weight_layout: 'din_dout' },
+  };
+  const { trainer, device } = makeTrainer([node], [input, weight, output]);
+  trainer.gradientBuffers.set(output.name, { tensor: 'grad_output' });
+
+  const dispatches = await trainer._buildBackwardDispatches();
+  const params = dispatches[0].entries.find(([binding]) => binding === 6)[1];
+  assert.deepEqual([...new Uint32Array(params.bytes.buffer)], [2, 3, 4, 0, 1, 1, 0, 0]);
+
+  const gpuWeight = device.createBuffer({ size: weight.sizeBytes });
+  trainer.executor.gpuBuffers.set(weight.name, gpuWeight);
+  trainer._uploadUpdatedTensor(weight);
+  assert.deepEqual(
+    [...new Float32Array(gpuWeight.bytes.buffer)],
+    [...weight.buffer],
+    'updated weights must not be transposed away from the direct input-major forward route',
+  );
+  trainer.dispose();
+});
+
+test('WebGPU backward derives layout per consumer of a shared square weight', async () => {
+  const dinInput = tensor('din_input', [2, 3]);
+  const doutInput = tensor('dout_input', [2, 3]);
+  const sharedWeight = tensor('shared_square_weight', [3, 3], { isWeight: true });
+  const dinOutput = tensor('din_output', [2, 3]);
+  const doutOutput = tensor('dout_output', [2, 3]);
+  const dinNode = {
+    id: 'shared_din_consumer', opType: 'MatMul', wLayout: 'din',
+    inputs: { input: dinInput, weight: sharedWeight }, outputs: { out: dinOutput },
+    params: { weight_layout: 'din_dout' },
+  };
+  const doutNode = {
+    id: 'shared_dout_consumer', opType: 'Linear', wLayout: 'dout',
+    inputs: { input: doutInput, weight: sharedWeight }, outputs: { out: doutOutput },
+    params: { weight_layout: 'dout_din' },
+  };
+  const { trainer } = makeTrainer(
+    [dinNode, doutNode],
+    [dinInput, doutInput, sharedWeight, dinOutput, doutOutput],
+  );
+  trainer.gradientBuffers.set(dinOutput.name, { tensor: 'grad_din_output' });
+  trainer.gradientBuffers.set(doutOutput.name, { tensor: 'grad_dout_output' });
+
+  const dispatches = await trainer._buildBackwardDispatches();
+  const inputDispatches = dispatches.filter(({ shaderName, entryPoint }) =>
+    shaderName === 'matMulBackward' && entryPoint === 'input_main');
+  const layoutFlags = inputDispatches.map((dispatch) => {
+    const params = dispatch.entries.find(([binding]) => binding === 6)[1];
+    return [...new Uint32Array(params.bytes.buffer).slice(4, 6)];
+  });
+
+  assert.deepEqual(layoutFlags, [[0, 0], [1, 1]],
+    'reverse traversal must preserve each consumer node layout, not tensor-name metadata');
+  trainer.dispose();
+});
+
+test('full-profile Trainer owns WebGPU training without exposing a concrete graph', async () => {
   const device = mockDevice();
   const graph = new Graph();
   const input = graph.addInput('x', [1]);
@@ -130,9 +208,8 @@ test('full-profile Trainer owns WebGPU training and retains its Model handle', a
   }).out;
   graph.setOutputs(output);
 
-  const runtime = await VolvoxAI.createRuntime({ backends: ['cpu'] });
-  const model = runtime.createModel(graph);
-  const trainer = await VolvoxAI.createTrainer(model, {
+  const snapshot = logicalSnapshotFromTrainingGraph(graph);
+  const trainer = await Trainer.create(snapshot, {
     backend: 'webgpu',
     device,
   });
@@ -140,15 +217,98 @@ test('full-profile Trainer owns WebGPU training and retains its Model handle', a
   assert.equal(trainer.backend, 'webgpu');
   assert.equal(Object.hasOwn(trainer, 'graph'), false);
 
-  let modelClosed = false;
-  const modelClose = model.close().then(() => { modelClosed = true; });
-  await Promise.resolve();
-  assert.equal(modelClosed, false, 'Trainer must retain its Model until Trainer.close()');
   await trainer.close();
-  await modelClose;
-  assert.equal(modelClosed, true);
   await trainer.close();
-  await runtime.close();
+});
+
+test('WebGPU training reuses detached forward/backward plans and one growable arena on shape return', async () => {
+  const device = mockDevice();
+  const makeGraph = (batch, opType = 'Identity') => {
+    const graph = new Graph();
+    const input = graph.addInput('x', [batch, 2]);
+    const output = graph.addOp(opType, { input }, {
+      out: { name: 'y', shape: [batch, 2] },
+    }).out;
+    graph.setOutputs(output);
+    return graph;
+  };
+  const largest = makeGraph(4);
+  const executor = new GraphExecutor(device, largest, {
+    shaderLibrary: {
+      getCopyShader() { return '@compute @workgroup_size(1) fn main() {}'; },
+      getCopy32Shader() { return '@compute @workgroup_size(1) fn main() {}'; },
+    },
+  });
+  await executor.compile();
+  const trainer = new WebGPUAutograd(device, largest, executor);
+  await trainer.rebind(largest, { shapeSignature: 'B=4', tacticSignature: 'identity' });
+  await trainer._buildBackwardDispatches();
+  const pipelineBuilds = device.state.pipelines;
+  const largestBytes = executor.inspectDynamicResources().activationCapacityBytes;
+
+  await trainer.rebind(makeGraph(1), { shapeSignature: 'B=1', tacticSignature: 'identity' });
+  await trainer._buildBackwardDispatches();
+  const small = executor.inspectDynamicResources();
+  await trainer.rebind(makeGraph(4), { shapeSignature: 'B=4', tacticSignature: 'identity' });
+  await trainer._buildBackwardDispatches();
+  const returned = executor.inspectDynamicResources();
+  const planCache = trainer.inspectPlanCache();
+
+  assert.equal(device.state.pipelines, pipelineBuilds,
+    'shape return must reuse device-cached compute pipelines');
+  assert.equal(small.activationCapacityBytes, largestBytes);
+  assert.equal(returned.activationCapacityBytes, largestBytes,
+    'one context-owned capacity pool serves both concrete shapes');
+  assert.ok(returned.specializationRebindCount >= 2);
+  assert.deepEqual({
+    entries: planCache.entries,
+    hits: planCache.hits,
+    misses: planCache.misses,
+    recipeBuilds: planCache.recipeBuilds,
+    forwardPlanBuilds: planCache.forwardPlanBuilds,
+    backwardPlanBuilds: planCache.backwardPlanBuilds,
+    forwardMaterializations: planCache.forwardMaterializations,
+    backwardMaterializations: planCache.backwardMaterializations,
+  }, {
+    entries: 2,
+    hits: 1,
+    misses: 2,
+    recipeBuilds: 2,
+    forwardPlanBuilds: 2,
+    backwardPlanBuilds: 2,
+    forwardMaterializations: 3,
+    backwardMaterializations: 3,
+  });
+  assert.ok(planCache.metadataBytes <= planCache.metadataLimitBytes);
+
+  await assert.rejects(
+    trainer.rebind(makeGraph(1), { shapeSignature: 'B=4', tacticSignature: 'identity' }),
+    /concrete tensor descriptors do not match/i,
+  );
+  assert.deepEqual(trainer.inspectPlanCache(), planCache,
+    'failed cached-plan materialization must preserve telemetry and LRU state');
+
+  const beforeResourceFailure = trainer.inspectPlanCache();
+  device.state.failNextBuffer = true;
+  await assert.rejects(
+    trainer.rebind(makeGraph(8), { shapeSignature: 'B=8', tacticSignature: 'identity' }),
+    /injected WebGPU allocation failure/,
+  );
+  assert.deepEqual(trainer.inspectPlanCache(), beforeResourceFailure,
+    'failed resource staging must not publish or reorder a backend plan recipe');
+  assert.equal(executor.inspectDynamicResources().shapeSignature, 'B=4',
+    'failed resource staging must leave the prior concrete generation executable');
+
+  await trainer.rebind(makeGraph(4, 'Reshape'), {
+    shapeSignature: 'B=4',
+    tacticSignature: 'reshape',
+  });
+  const changedTopology = trainer.inspectPlanCache();
+  assert.equal(changedTopology.entries, 1);
+  assert.equal(changedTopology.evictions, 2,
+    'a different logical topology invalidates every prior context-owned recipe');
+  trainer.dispose();
+  executor.dispose();
 });
 
 test('WebGPU inference compiles Dropout away while the Trainer owns its forward pipeline', async () => {
@@ -514,7 +674,7 @@ test('pooling, resize, and axis-aware concat use dedicated backward dispatches',
   const poolOut = tensor('pool_out', [2, 1, 1, 1]);
   const pool = {
     id: 'pool', opType: 'MaxPool2D', inputs: { input: poolInput }, outputs: { out: poolOut },
-    params: { kernel: [2, 2], stride: [2, 2], padding: [0, 0] },
+    params: { kernel: [2, 2], stride: [2, 2], pads: [1, 0, 0, 0] },
   };
   const { trainer: poolTrainer } = makeTrainer([pool], [poolInput, poolOut]);
   poolTrainer.gradientBuffers.set(poolOut.name, { tensor: 'grad_pool' });
@@ -523,14 +683,31 @@ test('pooling, resize, and axis-aware concat use dedicated backward dispatches',
   assert.deepEqual(poolDispatch.workgroupCount, [1, 1, 1]);
   const poolParams = poolDispatch.entries.find(([binding]) => binding === 3)[1];
   assert.deepEqual([...new Uint32Array(poolParams.bytes.buffer)], [
-    2, 2, 2, 1, 1, 1, 2, 2, 2, 2, 0, 0,
+    2, 2, 2, 1, 1, 1, 2, 2, 2, 2, 1, 0,
   ]);
+
+  const invalidPoolOut = tensor('invalid_pool_out', [2, 2, 1, 1]);
+  const invalidPool = {
+    ...pool,
+    id: 'invalid_pool',
+    outputs: { out: invalidPoolOut },
+  };
+  const { trainer: invalidPoolTrainer } = makeTrainer(
+    [invalidPool], [poolInput, invalidPoolOut],
+  );
+  invalidPoolTrainer.gradientBuffers.set(invalidPoolOut.name, { tensor: 'grad_invalid_pool' });
+  await assert.rejects(
+    invalidPoolTrainer._buildBackwardDispatches(),
+    /output shape is incompatible with its canonical pooling parameters/i,
+  );
+  assert.equal(invalidPoolTrainer.gradientBuffers.has(poolInput.name), false,
+    'invalid output geometry must fail before allocating an input-gradient buffer');
 
   const resizeInput = tensor('resize_in', [1, 2, 2, 1]);
   const resizeOut = tensor('resize_out', [1, 3, 3, 1]);
   const resize = {
     id: 'resize', opType: 'Resize', inputs: { input: resizeInput }, outputs: { out: resizeOut },
-    params: { mode: 'bilinear' },
+    params: { mode: 'linear' },
   };
   const { trainer: resizeTrainer } = makeTrainer([resize], [resizeInput, resizeOut]);
   resizeTrainer.gradientBuffers.set(resizeOut.name, { tensor: 'grad_resize' });
@@ -756,7 +933,7 @@ test('WebGPU training selects one sequence row per batch target', async () => {
   };
   const executor = {
     gpuBuffers: new Map([['logits', logitsBuffer]]),
-    _dinWeights: new Map(), compiledTopologyRevision: 0, compiledWeightRevision: 0,
+    compiledTopologyRevision: 0, compiledWeightRevision: 0,
     async execute() {},
   };
   class GradientReader extends DispatchRecorder {
@@ -843,7 +1020,7 @@ test('WebGPU trainStep rejects non-finite gradients before mutating weights', as
   };
   const executor = {
     gpuBuffers: new Map([['parameter', { tensor: 'parameter' }], ['logits', { tensor: 'logits' }]]),
-    _dinWeights: new Map(), compiledTopologyRevision: 0, compiledWeightRevision: 0,
+    compiledTopologyRevision: 0, compiledWeightRevision: 0,
     async execute() {},
   };
   class NonFiniteTrainer extends DispatchRecorder {

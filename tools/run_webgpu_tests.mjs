@@ -6,7 +6,8 @@
 //     [--cdp=host:port] [--url=URL]
 //
 // With no --cdp it launches local headless Chrome with SwiftShader WebGPU and
-// serves the repo over http. Requires: google-chrome on PATH (local mode).
+// serves the repo over http. Requires Chrome in local mode: google-chrome on
+// PATH, or an explicit binary in the CHROME environment variable.
 import http from 'node:http';
 import { spawn } from 'node:child_process';
 import { readFileSync, statSync } from 'node:fs';
@@ -90,7 +91,7 @@ async function main() {
     chromeArguments.splice(-1, 0, '--use-webgpu-adapter=swiftshader');
   }
   console.log(`Adapter mode: ${adapterMode}`);
-  const chrome = spawn('google-chrome', chromeArguments, { stdio: 'ignore' });
+  const chrome = spawn(process.env.CHROME || 'google-chrome', chromeArguments, { stdio: 'ignore' });
   try {
     // Wait for the debugging endpoint, then find our page target.
     let targets = [];

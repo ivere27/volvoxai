@@ -32,7 +32,9 @@ class RuntimeElementwiseTransposePass(IRPass):
     """Sink/join F32 Transposes until a bounded fixed point is reached."""
 
     name = "runtime-elementwise-transpose"
-    contract = PassContract.preserving(IRDialect.RUNTIME, repeatable=True)
+    contract = PassContract.preserving(
+        IRDialect.RUNTIME, repeatable=True
+    )
 
     def __init__(self, *, max_rewrites: int = 4096) -> None:
         if max_rewrites < 1:

@@ -9,6 +9,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { formatAdapterIdentity, requirePhysicalWebGPU } from './lib/backend.mjs';
+import { concreteExecutionInputs } from './lib/runmodel.mjs';
 import { pathToFileURL, fileURLToPath } from 'node:url';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
@@ -52,35 +53,39 @@ const module = await import(pathToFileURL(path.join(ROOT, 'dist', ver, 'volvoxai
 const wasmPath = path.join(ROOT, 'dist', ver, 'volvoxai.wasm');
 const modelUrl = pathToFileURL(path.join(ROOT, 'models', modelName, 'model.safetensors')).href;
 
-const graph = new module.Graph();
-await module.GraphLoader.load(graph, modelUrl);
+const snapshot = module.Model.capture(
+  await module.ModelLoader.load(modelUrl),
+);
+const graph = snapshot.graph;
 const runtime = await module.VolvoxAI.createRuntime({ backends: ['webgpu'], wasmUrl: wasmPath });
-const model = runtime.createModel(graph);
 let compiled;
 let context;
 let execution;
 try {
-  compiled = await model.compile({
+  compiled = await runtime.compile(snapshot, {
     backend: { mode: 'require', backend: 'webgpu', operatorFallback: 'forbid' },
   });
   const adapterInfo = requirePhysicalWebGPU(compiled, 'EfficientDet GPU consensus');
   console.log(`Adapter: ${formatAdapterIdentity(adapterInfo)}`);
   atomicWriteJson(path.join(outDir, 'webgpu_adapter.json'), adapterInfo);
   context = await compiled.createContext();
-  const warmup = await context.execute({ input0 });
+  const inputs = concreteExecutionInputs(snapshot, { input0 });
+  const warmup = await context.execute(inputs);
   await warmup.close();
-  execution = await context.execute({ input0 });
+  execution = await context.execute(inputs);
 
-  const outNames = graph.outputNames || [];
+  const outNames = snapshot.outputNames;
   if (outNames.length === 0) throw new Error('WebGPU graph has no declared outputs');
   console.log(`outputNames=${JSON.stringify(outNames)}`);
 
   const outputs = {};
   for (const name of outNames) {
-    const tensor = graph.getTensor(name);
+    const tensor = graph.tensors[name];
     if (!tensor) throw new Error(`graph has no output tensor '${name}'`);
     const arr = await execution.output(name).read();
-    if (!ArrayBuffer.isView(arr) || arr.byteLength !== tensor.sizeBytes) {
+    const bytes = { float32: 4, int32: 4, int8: 1, uint8: 1 }[tensor.dtype];
+    const expectedBytes = tensor.shape.reduce((size, extent) => size * extent, bytes);
+    if (!ArrayBuffer.isView(arr) || arr.byteLength !== expectedBytes) {
       throw new Error(`WebGPU output '${name}' readback has the wrong logical size`);
     }
     const flat = arr instanceof Float32Array ? arr : Float32Array.from(arr);
@@ -101,6 +106,5 @@ try {
   await execution?.close();
   await context?.close();
   await compiled?.close();
-  await model.close();
   await runtime.close();
 }

@@ -21,6 +21,27 @@ int vx_engine_state_init(VxEngineState* state) {
         state->conv_pw_gemm_enabled =
             !(value && value[0] && strcmp(value, "0") == 0);
     }
+    {
+        /* Default on, and the shape decides the rest.
+         *
+         * This was default off, from a comment citing three image-encoder
+         * shapes where the packed kernel measured 8.16 GMAC/s against 20.38 for
+         * unpacked.  That measurement was real but the conclusion did not
+         * generalize: it inverted at LLM shapes, where the unpacked kernel
+         * collapses to 4-7 GMAC/s because it has no cache blocking and rereads
+         * the whole weight per row block, while packed stayed flat.  A
+         * process-wide boolean cannot express that, which is why the packed
+         * kernel now carries a plan (vx_gemm_f32_plan) and picks its blocking
+         * and regime from M, K and N.  Measured after that change, one thread:
+         * 402x320x320 42.1 -> 56.6, 512x2048x2048 7.6 -> 52.6, 1x4096x4096
+         * 1.2 -> 4.2 GMAC/s, bit-identical to matmul_f32 throughout.
+         *
+         * The switch remains as an escape hatch to the unpacked kernel, not as
+         * the place the policy lives. */
+        const char* value = getenv("VOLVOX_F32_GEMM_PACKED");
+        state->gemm_f32_packed_enabled =
+            !(value && value[0] && strcmp(value, "0") == 0);
+    }
 #if VOLVOXAI_ENABLE_TRAINING
     state->dynamic_autograd_forward_backend = -1;
 #endif
@@ -50,6 +71,14 @@ void vx_engine_state_deinit(VxEngineState* state) {
     assert(!state->loaded);
     assert(!state->graph_root);
     assert(!state->merged_adapter_weights);
+    /* Shutdown normally owns this cleanup. Keep deinit complete for an engine
+     * whose load was abandoned after residency registration but before init. */
+    for (size_t index = 0; index < state->bank_residency_count; index++)
+        free(state->bank_residency[index].slot_rows);
+    free(state->bank_residency);
+    state->bank_residency = NULL;
+    state->bank_residency_count = 0;
+    state->bank_residency_capacity = 0;
     if (state->adapter_registry_state_destroy)
         state->adapter_registry_state_destroy(state->adapter_registry_state);
     state->adapter_registry_state = NULL;
@@ -74,6 +103,13 @@ void vx_engine_state_deinit(VxEngineState* state) {
         state->cuda_context_state_destroy(state->cuda_context_state);
     state->cuda_context_state = NULL;
     state->cuda_context_state_destroy = NULL;
+    /* Ordinary shutdown releases this first. Keep deinit defensive for a
+     * partially initialized context whose graph load never reached shutdown. */
+    free(state->cpu_typed_workspace);
+    state->cpu_typed_workspace = NULL;
+    state->cpu_typed_workspace_bound_bytes = 0u;
+    state->cpu_typed_workspace_capacity_bytes = 0u;
+    state->cpu_typed_workspace_configured = 0;
     vx_kernel_thread_pool_destroy(state->kernel_thread_pool);
     state->kernel_thread_pool = NULL;
     pthread_mutex_destroy(&state->metadata_mutex);

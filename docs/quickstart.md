@@ -6,8 +6,8 @@ VolvoxAI ships three JavaScript profiles:
 - volvoxai.full.js: multi-backend inference plus Trainer and authoring tools.
 - volvoxai.wasm.js: strict browser-only WASM inference and training.
 
-All profiles use the same Runtime → Model → CompiledModel → ExecutionContext →
-ExecutionResult inference lifecycle.
+All profiles use the same Runtime → Model → CompiledModel →
+ExecutionContext → ExecutionResult inference lifecycle.
 
 ## Build
 
@@ -20,14 +20,14 @@ make build_web
 It creates exactly:
 
 ~~~text
-dist/0.3.0/volvoxai.js
-dist/0.3.0/volvoxai.min.js
-dist/0.3.0/volvoxai.full.js
-dist/0.3.0/volvoxai.full.min.js
-dist/0.3.0/volvoxai.wasm.js
-dist/0.3.0/volvoxai.wasm.min.js
-dist/0.3.0/volvoxai.wasm
-dist/0.3.0/volvoxai.full.wasm
+dist/0.4.0/volvoxai.js
+dist/0.4.0/volvoxai.min.js
+dist/0.4.0/volvoxai.full.js
+dist/0.4.0/volvoxai.full.min.js
+dist/0.4.0/volvoxai.wasm.js
+dist/0.4.0/volvoxai.wasm.min.js
+dist/0.4.0/volvoxai.wasm
+dist/0.4.0/volvoxai.full.wasm
 ~~~
 
 For local TypeScript and JavaScript work:
@@ -55,24 +55,30 @@ graph.json must declare:
 
 ~~~json
 {
-  "format": "volvox-graph/v1"
+  "format": "volvox-graph/v1",
+  "dimensions": {}
 }
 ~~~
 
-The discriminator is exact and case-sensitive.
+The format discriminator is exact and case-sensitive. Dynamic shape is the
+default `volvox-graph/v1` contract; symbols in input or node-output shape specs
+require finite entries in `dimensions`.
 
 ## Run inference
 
 ~~~javascript
-import { VolvoxAI } from 'volvoxai';
+import {
+  Model,
+  VolvoxAI,
+} from 'volvoxai';
 
 const runtime = await VolvoxAI.createRuntime({
   backends: ['webgpu', 'wasm', 'cpu'],
 });
-const model = await runtime.loadModel(
+const snapshot = await Model.load(
   './models/my-model/model.safetensors',
 );
-const compiled = await model.compile({
+const compiled = await runtime.compile(snapshot, {
   backend: {
     mode: 'prefer',
     order: ['webgpu', 'wasm', 'cpu'],
@@ -82,22 +88,28 @@ const compiled = await model.compile({
 const context = await compiled.createContext();
 
 const result = await context.execute({
-  images: new Float32Array(1 * 224 * 224 * 3),
+  images: {
+    data: new Float32Array(2 * 224 * 224 * 3),
+    shape: [2, 224, 224, 3],
+  },
 });
 const scores = await result.output('scores').read();
 
 await result.close();
 await context.close();
 await compiled.close();
-await model.close();
 await runtime.close();
 ~~~
+
+Every public input is an explicit `{ data, shape }` view, including inputs to
+constant-only packages. One compiled snapshot can accept different legal
+concrete shapes in independent contexts without mutating its logical graph.
 
 Use mode: require and operatorFallback: forbid when the request must compile
 entirely for one provider:
 
 ~~~javascript
-const compiled = await model.compile({
+const compiled = await runtime.compile(snapshot, {
   backend: {
     mode: 'require',
     backend: 'webgpu',
@@ -115,43 +127,53 @@ and context closure until result.close().
 ~~~javascript
 import {
   ModelBuilder,
+  Model,
+  Trainer,
   VolvoxAI,
 } from 'volvoxai/full';
 
-const builder = new ModelBuilder();
-const x = builder.input('x', [1, 4]);
-const weight = builder.weight('weight', [4, 2], 'float32', {
-  initializer: { type: 'xavierUniform', seed: 7 },
+const builder = new ModelBuilder({
+  dimensions: { B: { min: 1, max: 8 } },
+  inputs: { x: { dtype: 'float32', shape: ['B', 4] } },
+  weights: [{ name: 'weight', dtype: 'float32', shape: [4, 2] }],
+  nodes: [{
+    id: 'projection',
+    opType: 'MatMul',
+    inputs: { input: 'x', weight: 'weight' },
+    outputs: {
+      out: { tensor: 'logits', dtype: 'float32', shape: ['B', 2] },
+    },
+    params: {},
+  }],
+  outputs: ['logits'],
 });
-const logits = builder.addOp(
-  'MatMul',
-  { input: x, weight },
-  { out: { name: 'logits', shape: [1, 2] } },
-  {},
-  { id: 'projection', wLayout: 'din' },
-).out;
-builder.outputs(logits);
-const graph = builder.build();
-
-const runtime = await VolvoxAI.createRuntime({ backends: ['cpu'] });
-const model = runtime.createModel(graph);
-const trainer = await VolvoxAI.createTrainer(model, {
-  backend: 'cpu',
+const source = Model.capture({
+  graph: builder.snapshot(),
+  weights: {
+    weight: {
+      name: 'weight', dtype: 'float32', shape: [4, 2],
+      data: Float32Array.from({ length: 8 }, (_, i) => (i - 4) / 16),
+    },
+  },
 });
+const trainer = await Trainer.create(source, { backend: 'cpu' });
 
 const step = await trainer.trainStep({
-  inputs: { x: new Float32Array([1, 2, 3, 4]) },
+  inputs: {
+    x: { data: new Float32Array([1, 2, 3, 4]), shape: [1, 4] },
+  },
   logitsTensor: 'logits',
   targets: new Int32Array([1]),
   trainableTensors: ['weight'],
   updateMode: 'adamw',
   optimizer: { learningRate: 1e-3 },
 });
-await trainer.commit();
+const successor = await trainer.commit();
 
 await trainer.close();
 
-const compiled = await model.compile({
+const runtime = await VolvoxAI.createRuntime({ backends: ['cpu'] });
+const compiled = await runtime.compile(successor, {
   backend: {
     mode: 'require',
     backend: 'cpu',
@@ -161,9 +183,10 @@ const compiled = await model.compile({
 ~~~
 
 `trainStep()` changes only the Trainer's private working revision. `commit()`
-publishes the update atomically; compile after that call to bind the new Model
-revision. Compiled models created earlier remain pinned to their original
-weights. There is no implicit publication. Call `rollback()` to discard private
+returns the immutable successor snapshot; compile that returned snapshot for
+inference. The source and previously compiled snapshots keep their original
+weights. Every input carries its concrete shape, and one Trainer may accept any
+shape inside the declared bounded domain. Call `rollback()` to discard private
 updates and restore the last committed baseline.
 
 Trainer also supports webgpu and wasm. WASM training is strict: unsupported

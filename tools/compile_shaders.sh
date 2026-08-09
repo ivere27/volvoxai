@@ -7,6 +7,12 @@ WGSL_DIR="$REPO_ROOT/shaders"
 NATIVE_DIR="$REPO_ROOT/native/shaders"
 SOURCE_ROOTS=("$WGSL_DIR/inference" "$WGSL_DIR/training")
 CARGO_BUILD_DIR="${CARGO_TARGET_DIR:-$NATIVE_DIR/.native-shader-compiler-target}"
+NATIVE_SHADER_COMPILER="${VOLVOXAI_NATIVE_SHADER_COMPILER:-}"
+
+if [ -n "$NATIVE_SHADER_COMPILER" ] && [ ! -x "$NATIVE_SHADER_COMPILER" ]; then
+    echo "VOLVOXAI_NATIVE_SHADER_COMPILER is not executable: $NATIVE_SHADER_COMPILER" >&2
+    exit 1
+fi
 
 export LC_ALL=C
 
@@ -114,15 +120,26 @@ compile_source_dir() {
     # files. Passing each containing source directory separately also supports
     # WGSL files below future nested inference/training subdirectories while
     # retaining flat native artifact names.
-    CARGO_TARGET_DIR="$CARGO_BUILD_DIR" cargo run --quiet --locked \
-        --manifest-path "$SCRIPT_DIR/metal_shader_compiler/Cargo.toml" -- \
-        glsl "$source_dir" "$NATIVE_DIR/glsl" "$NATIVE_DIR/gles" \
-        "${native_shaders[@]}"
-
-    if [ "${#metal_shaders[@]}" -gt 0 ]; then
+    if [ -n "$NATIVE_SHADER_COMPILER" ]; then
+        "$NATIVE_SHADER_COMPILER" \
+            glsl "$source_dir" "$NATIVE_DIR/glsl" "$NATIVE_DIR/gles" \
+            "${native_shaders[@]}"
+    else
         CARGO_TARGET_DIR="$CARGO_BUILD_DIR" cargo run --quiet --locked \
             --manifest-path "$SCRIPT_DIR/metal_shader_compiler/Cargo.toml" -- \
-            msl "$source_dir" "$NATIVE_DIR/metal" "${metal_shaders[@]}"
+            glsl "$source_dir" "$NATIVE_DIR/glsl" "$NATIVE_DIR/gles" \
+            "${native_shaders[@]}"
+    fi
+
+    if [ "${#metal_shaders[@]}" -gt 0 ]; then
+        if [ -n "$NATIVE_SHADER_COMPILER" ]; then
+            "$NATIVE_SHADER_COMPILER" \
+                msl "$source_dir" "$NATIVE_DIR/metal" "${metal_shaders[@]}"
+        else
+            CARGO_TARGET_DIR="$CARGO_BUILD_DIR" cargo run --quiet --locked \
+                --manifest-path "$SCRIPT_DIR/metal_shader_compiler/Cargo.toml" -- \
+                msl "$source_dir" "$NATIVE_DIR/metal" "${metal_shaders[@]}"
+        fi
     fi
 }
 

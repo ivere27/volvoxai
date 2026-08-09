@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 
 import { CPUEngine } from '../ts/backends/CPUEngine.js';
-import { Graph } from '../ts/core/Graph.js';
+import { RuntimeGraph } from '../ts/core/RuntimeGraph.js';
 
 const q = { scheme: 'per_tensor', scale: 0.25, zero_point: -3 };
 
@@ -11,7 +11,7 @@ function output(name, shape, dtype = 'int8', quantization = q) {
 }
 
 test('CPU keeps raw W8A8 bytes through MaxPool, nearest resize, reshape, and concat', async () => {
-  const graph = new Graph();
+  const graph = new RuntimeGraph();
   const input = graph.addInput('input', [1, 2, 2, 1], 'int8', { quantization: q });
   const { out: pooled } = graph.addOp('MaxPool2D', { input }, {
     out: output('pooled', [1, 1, 1, 1]),
@@ -21,10 +21,10 @@ test('CPU keeps raw W8A8 bytes through MaxPool, nearest resize, reshape, and con
   }, { mode: 'nearest' });
   const { out: flat } = graph.addOp('Reshape', { input: resized }, {
     out: output('flat', [1, 2]),
-  });
+  }, { shape: [1, 2] });
   const { out } = graph.addOp('Concat', { input0: flat, input1: flat }, {
     out: output('out', [1, 4]),
-  }, { axis: 1, count: 2 });
+  }, { axis: 1 });
   graph.setOutputs([out.name]);
   const engine = new CPUEngine();
   engine.allocateGraph(graph);
@@ -34,7 +34,7 @@ test('CPU keeps raw W8A8 bytes through MaxPool, nearest resize, reshape, and con
 });
 
 test('CPU refuses a raw shape operation that would change a byte tensor interpretation', () => {
-  const graph = new Graph();
+  const graph = new RuntimeGraph();
   const input = graph.addInput('input', [1], 'int8', { quantization: q });
   graph.addOp('Identity', { input }, {
     out: output('out', [1], 'int8', { scheme: 'per_tensor', scale: 0.5, zero_point: -3 }),
@@ -47,7 +47,7 @@ test('CPU refuses a raw shape operation that would change a byte tensor interpre
 });
 
 test('CPU refuses bilinear resize and fused sigmoid concat for byte activations', () => {
-  const resizeGraph = new Graph();
+  const resizeGraph = new RuntimeGraph();
   const input = resizeGraph.addInput('input', [1, 1, 1, 1], 'int8', { quantization: q });
   resizeGraph.addOp('Resize', { input }, {
     out: output('resized', [1, 2, 2, 1]),
@@ -57,7 +57,7 @@ test('CPU refuses bilinear resize and fused sigmoid concat for byte activations'
     /mode "nearest"/,
   );
 
-  const concatGraph = new Graph();
+  const concatGraph = new RuntimeGraph();
   const concatenatedInput = concatGraph.addInput('input', [1, 2, 2, 1], 'int8', {
     quantization: q,
   });
@@ -65,7 +65,7 @@ test('CPU refuses bilinear resize and fused sigmoid concat for byte activations'
     input0: concatenatedInput, input1: concatenatedInput,
   }, {
     out: output('out', [1, 2, 2, 2]),
-  }, { axis: 3, count: 2, sigmoid: 1 });
+  }, { axis: 3, sigmoid: 1 });
   assert.throws(
     () => new CPUEngine().allocateGraph(concatGraph),
     /no fused sigmoid/,
@@ -74,7 +74,7 @@ test('CPU refuses bilinear resize and fused sigmoid concat for byte activations'
 });
 
 test('CPU typed pool and nearest resize reject non-canonical semantics', () => {
-  const dilationGraph = new Graph();
+  const dilationGraph = new RuntimeGraph();
   const dilationInput = dilationGraph.addInput('input', [1, 3, 3, 1], 'int8', { quantization: q });
   dilationGraph.addOp('MaxPool2D', { input: dilationInput }, {
     out: output('pooled', [1, 2, 2, 1]),
@@ -84,7 +84,7 @@ test('CPU typed pool and nearest resize reject non-canonical semantics', () => {
     /only with unit dilation/,
   );
 
-  const ceilGraph = new Graph();
+  const ceilGraph = new RuntimeGraph();
   const ceilInput = ceilGraph.addInput('input', [1, 3, 3, 1], 'int8', { quantization: q });
   ceilGraph.addOp('MaxPool2D', { input: ceilInput }, {
     out: output('pooled', [1, 2, 2, 1]),
@@ -94,7 +94,7 @@ test('CPU typed pool and nearest resize reject non-canonical semantics', () => {
     /does not support ceil_mode/,
   );
 
-  const resizeGraph = new Graph();
+  const resizeGraph = new RuntimeGraph();
   const resizeInput = resizeGraph.addInput('input', [1, 2, 2, 1], 'int8', { quantization: q });
   const { out: resized } = resizeGraph.addOp('Resize', { input: resizeInput }, {
     out: output('resized', [1, 4, 4, 1]),
@@ -105,7 +105,7 @@ test('CPU typed pool and nearest resize reject non-canonical semantics', () => {
   );
   assert.equal(resized.dtype, 'int8');
 
-  const misspelledGraph = new Graph();
+  const misspelledGraph = new RuntimeGraph();
   const misspelledInput = misspelledGraph.addInput('input', [1, 2, 2, 1], 'int8', {
     quantization: q,
   });

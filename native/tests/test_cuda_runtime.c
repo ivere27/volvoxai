@@ -558,7 +558,7 @@ int main(void) {
         "\"input\":\"x\",\"weight\":\"weight\",\"bias\":\"bias\"},"
         "\"outputs\":{\"out\":\"y\"},"
         "\"outputs_shape\":{\"out\":[1,2,2]},"
-        "\"params\":{\"weight_layout\":\"OUT_IN\"}}],"
+        "\"params\":{\"weight_layout\":\"dout_din\"}}],"
         "\"outputs\":[\"y\"]}";
     const char* adapter_graph =
         "{\"format\":\"volvox-graph/v1\",\"inputs\":{"
@@ -569,7 +569,7 @@ int main(void) {
         "\"input\":\"x\",\"weight\":\"weight\",\"bias\":\"bias\"},"
         "\"outputs\":{\"out\":\"y\"},"
         "\"outputs_shape\":{\"out\":[2,1,3]},"
-        "\"params\":{\"weight_layout\":\"IN_OUT\"}}],"
+        "\"params\":{\"weight_layout\":\"din_dout\"}}],"
         "\"outputs\":[\"y\"]}";
     const float x[4] = {1.0f, -2.0f, 3.0f, 4.0f};
     const float weight[6] = {1.0f, 2.0f, -1.0f,
@@ -597,6 +597,8 @@ int main(void) {
     uint64_t slot_exact_lookup_before;
     uint64_t slot_hash_probe_before;
     uint64_t slot_containing_scan_before;
+    CudaGraphDynamicStateProbe dynamic_before = {0};
+    CudaGraphDynamicStateProbe dynamic_after = {0};
     int graph_api;
     VolvoxAIEngineOptions options = {
         .backend = VOLVOXAI_BACKEND_CUDA,
@@ -772,6 +774,40 @@ int main(void) {
     CHECK(volvoxai_engine_forward() == 0);
     CHECK(cuda_test_graph_capture_count() - graph_capture_before ==
           (uint64_t)(graph_api ? 1 : 0));
+
+    /* Exact semantic shape rebinding must invalidate a ready replay before
+     * retiring transient slot identities. Rebinding the same exact key is a
+     * no-op, and a rejected empty key cannot disturb the committed state. */
+    CHECK(cuda_test_graph_dynamic_state("not-bound", &dynamic_before) == 0);
+    graph_invalidation_before = cuda_test_graph_invalidation_count();
+    CHECK(cuda_graph_bind_shape(
+              "graph:x=f32[1,2,2];weight=f32[2,3];slope=f32[1]") == 0);
+    CHECK(cuda_test_graph_dynamic_state(
+              "graph:x=f32[1,2,2];weight=f32[2,3];slope=f32[1]",
+              &dynamic_after) == 0);
+    CHECK(dynamic_after.exact_signature_match &&
+          dynamic_after.shape_generation > dynamic_before.shape_generation &&
+          dynamic_after.capacity_generation >=
+              dynamic_before.capacity_generation &&
+          dynamic_after.replay_plan == 0 &&
+          dynamic_after.replay_shape_generation == 0 &&
+          dynamic_after.replay_capacity_generation == 0);
+    CHECK(cuda_test_graph_invalidation_count() - graph_invalidation_before ==
+          (uint64_t)(graph_api ? 1 : 0));
+    dynamic_before = dynamic_after;
+    graph_invalidation_before = cuda_test_graph_invalidation_count();
+    CHECK(cuda_graph_bind_shape(
+              "graph:x=f32[1,2,2];weight=f32[2,3];slope=f32[1]") == 0);
+    CHECK(cuda_graph_bind_shape("") == -1);
+    CHECK(cuda_test_graph_dynamic_state(
+              "graph:x=f32[1,2,2];weight=f32[2,3];slope=f32[1]",
+              &dynamic_after) == 0);
+    CHECK(dynamic_after.shape_generation == dynamic_before.shape_generation &&
+          dynamic_after.capacity_generation ==
+              dynamic_before.capacity_generation &&
+          cuda_test_graph_invalidation_count() == graph_invalidation_before);
+    /* Rebuild an observed plan so shutdown still exercises plan destruction. */
+    CHECK(volvoxai_engine_forward() == 0);
     graph_invalidation_before = cuda_test_graph_invalidation_count();
     volvoxai_engine_shutdown();
     CHECK(cuda_test_graph_invalidation_count() - graph_invalidation_before ==
@@ -802,7 +838,7 @@ int main(void) {
     options.debug = 0;
     remove(graph_path);
 
-    /* TinyVQA ties its token embedding to an OUT_IN language-model head.
+    /* Tied token embeddings commonly expose an OUT_IN language-model head.
      * Explicit CUDA must execute that physical layout directly rather than
      * rejecting the dense node or silently transposing it on the CPU. */
     {

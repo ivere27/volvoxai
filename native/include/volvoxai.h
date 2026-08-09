@@ -89,15 +89,35 @@ typedef struct VxRuntimeOptions {
 
 #define VX_RUNTIME_OPTIONS_INIT { sizeof(VxRuntimeOptions), 0, 0 }
 
+/* Which slots of a declared weight bank to materialize.
+ *
+ * Residency is part of the immutable loaded Model source. Every compiled
+ * context owns a private engine/weight snapshot and materializes the same
+ * selected rows. Slot ids are ascending, unique, and index the bank's full
+ * extent. Route indices stay in that global slot space at execution, so a
+ * model loaded with a subset still routes by the ids the exporter emitted. */
+typedef struct VxBankResidency {
+    size_t struct_size;
+    /* Weight tensor named by the graph document's "banks" table. */
+    const char* bank;
+    const uint32_t* slots;
+    size_t slot_count;
+} VxBankResidency;
+
+#define VX_BANK_RESIDENCY_INIT { sizeof(VxBankResidency), NULL, NULL, 0 }
+
 typedef struct VxModelSource {
     size_t struct_size;
     /* Basename is graph.json or a named *.graph.json document. */
     const char* graph_path;
     const char* const* weight_paths;
     size_t weight_path_count;
+    /* Optional; a bank left out is fully resident. */
+    const VxBankResidency* bank_residency;
+    size_t bank_residency_count;
 } VxModelSource;
 
-#define VX_MODEL_SOURCE_INIT { sizeof(VxModelSource), NULL, NULL, 0 }
+#define VX_MODEL_SOURCE_INIT { sizeof(VxModelSource), NULL, NULL, 0, NULL, 0 }
 
 typedef struct VxBackendPolicy {
     size_t struct_size;
@@ -173,6 +193,61 @@ typedef struct VxTensorInfo {
 #define VX_TENSOR_INFO_INIT \
     { sizeof(VxTensorInfo), NULL, VX_DTYPE_F32, 0, {0}, 0, VX_MEMORY_HOST }
 
+/* Logical tensor dimensions are either one positive fixed extent or one
+ * canonical bounded symbol. Malformed mixed states are rejected: fixed axes
+ * require symbol == NULL, min == max, and multiple_of == 1; symbolic axes
+ * require a non-empty canonical symbol and positive min/max/multiple_of. */
+typedef enum VxDimensionKind {
+    VX_DIMENSION_FIXED = 1,
+    VX_DIMENSION_SYMBOLIC = 2
+} VxDimensionKind;
+
+typedef struct VxDimensionConstraint {
+    size_t struct_size;
+    VxDimensionKind kind;
+    const char* symbol;
+    int64_t min;
+    int64_t max;
+    int64_t multiple_of;
+} VxDimensionConstraint;
+
+#define VX_DIMENSION_CONSTRAINT_INIT \
+    { sizeof(VxDimensionConstraint), VX_DIMENSION_FIXED, NULL, 1, 1, 1 }
+
+/* Logical model contract. Returned name and symbolic-dimension strings are
+ * borrowed from the execution context and remain valid until that context is
+ * released. No byte size is reported because a symbolic tensor has many
+ * concrete byte sizes within its bounded domain. */
+typedef struct VxTensorSpec {
+    size_t struct_size;
+    const char* name;
+    VxDataType dtype;
+    uint32_t rank;
+    VxDimensionConstraint dimensions[VX_MAX_TENSOR_RANK];
+    VxMemoryLocation location;
+} VxTensorSpec;
+
+#define VX_TENSOR_SPEC_INIT \
+    { sizeof(VxTensorSpec), NULL, VX_DTYPE_F32, 0, {{0}}, VX_MEMORY_HOST }
+
+/* One concrete host tensor supplied as part of an atomic execution batch.
+ * The runtime borrows the descriptor, name, and data only until the
+ * synchronous API call returns. Device bindings are rejected. */
+typedef struct VxTensorBinding {
+    size_t struct_size;
+    const char* name;
+    VxDataType dtype;
+    uint32_t rank;
+    int64_t shape[VX_MAX_TENSOR_RANK];
+    const void* data;
+    size_t byte_size;
+    VxMemoryLocation location;
+} VxTensorBinding;
+
+#define VX_TENSOR_BINDING_INIT \
+    { sizeof(VxTensorBinding), NULL, VX_DTYPE_F32, 0, {0}, NULL, 0, \
+      VX_MEMORY_HOST }
+
 /* Resolved per-tensor affine metadata. Numeric values are loaded from the
  * safetensors tensors referenced by graph.quantization.tensors; they are not
  * graph JSON parameters. */
@@ -234,22 +309,18 @@ VX_API VxStatus vx_execution_context_close(VxExecutionContext* context,
                                     VxReport* report);
 
 VX_API size_t vx_execution_context_input_count(VxExecutionContext* context);
-VX_API VxStatus vx_execution_context_input_info(VxExecutionContext* context,
+VX_API VxStatus vx_execution_context_input_spec(VxExecutionContext* context,
                                          size_t index,
-                                         VxTensorInfo* info,
+                                         VxTensorSpec* spec,
                                          VxReport* report);
 VX_API VxStatus vx_execution_context_input_affine_quantization(
     VxExecutionContext* context,
     const char* name,
     VxAffineQuantization* quantization,
     VxReport* report);
-VX_API VxStatus vx_execution_context_set_input(VxExecutionContext* context,
-                                        const char* name,
-                                        VxDataType dtype,
-                                        const void* data,
-                                        size_t byte_size,
-                                        VxReport* report);
 VX_API VxStatus vx_execution_context_execute(VxExecutionContext* context,
+                                      const VxTensorBinding* inputs,
+                                      size_t input_count,
                                       VxResult** out_result,
                                       VxReport* report);
 /* Recompute only the leading row_count rows of a fixed-shape sequence graph.
@@ -259,6 +330,8 @@ VX_API VxStatus vx_execution_context_execute(VxExecutionContext* context,
 VX_API VxStatus vx_execution_context_execute_prefix(
                                       VxExecutionContext* context,
                                       int32_t row_count,
+                                      const VxTensorBinding* inputs,
+                                      size_t input_count,
                                       VxResult** out_result,
                                       VxReport* report);
 /* Decode contexts are enabled through VxContextOptions. Seed executes the
@@ -266,10 +339,14 @@ VX_API VxStatus vx_execution_context_execute_prefix(
  * clears the context-local decode/KV state. Seed and step return ordinary
  * immutable result snapshots. */
 VX_API VxStatus vx_execution_context_decode_seed(VxExecutionContext* context,
+                                          const VxTensorBinding* inputs,
+                                          size_t input_count,
                                           VxResult** out_result,
                                           VxReport* report);
 VX_API VxStatus vx_execution_context_decode_step(VxExecutionContext* context,
                                           int32_t position,
+                                          const VxTensorBinding* inputs,
+                                          size_t input_count,
                                           VxResult** out_result,
                                           VxReport* report);
 VX_API VxStatus vx_execution_context_decode_reset(VxExecutionContext* context,

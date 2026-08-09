@@ -141,7 +141,15 @@ def _upsample2x(T, node):
 def _conv2d(T, node):
     x, i, p = _inp(T, node), node["inputs"], node.get("params", {})
     xn = x.permute(0, 3, 1, 2)                      # NHWC → NCHW
-    wn = T[i["weight"]].permute(0, 3, 1, 2)          # OHWI → OIHW
+    layout = p.get("weight_layout", "OHWI")
+    w = T[i["weight"]]
+    if layout == "HWIO":                             # [kh,kw,I/g,O] → OIHW
+        wn = w.permute(3, 2, 0, 1)
+    elif layout == "HWCM":                           # [kh,kw,C,M] → [C*M,1,kh,kw]
+        kh, kw, channels, multiplier = w.shape
+        wn = w.permute(2, 3, 0, 1).reshape(channels * multiplier, 1, kh, kw)
+    else:                                            # OHWI → OIHW
+        wn = w.permute(0, 3, 1, 2)
     b = T[i["bias"]] if "bias" in i else None
     pads = p.get("pads", [0, 0, 0, 0])               # [t,l,b,r]; test cases use symmetric
     y = F.conv2d(xn, wn, b, stride=tuple(p.get("stride", [1, 1])),
@@ -150,6 +158,30 @@ def _conv2d(T, node):
     if p.get("relu"):
         y = torch.clamp(y, 0, 6)                      # relu != 0 → fused ReLU6
     return y.permute(0, 2, 3, 1).contiguous()         # → NHWC
+
+
+def _conv1d(T, node):
+    # NLC activations [N,L,C]; WIO weights [k, in_per_group, out_c].
+    x, i, p = _inp(T, node), node["inputs"], node.get("params", {})
+    xn = x.permute(0, 2, 1)                          # NLC → NCL
+    wn = T[i["weight"]].permute(2, 1, 0)             # WIO → OIW
+    b = T[i["bias"]] if "bias" in i else None
+    y = F.conv1d(xn, wn, b, stride=p.get("stride", 1),
+                 padding=p.get("padding", 0), groups=p.get("groups", 1))
+    if p.get("relu"):
+        y = torch.clamp(y, min=0)
+    return y.permute(0, 2, 1).contiguous()           # NCL → NLC
+
+
+def _conv_transpose2d(T, node):
+    # NHWC activations; HWIO weights [kh, kw, in_c, out_c] → torch wants [I,O,kh,kw].
+    x, i, p = _inp(T, node), node["inputs"], node.get("params", {})
+    xn = x.permute(0, 3, 1, 2)                       # NHWC → NCHW
+    wn = T[i["weight"]].permute(2, 3, 0, 1)          # HWIO → IOHW
+    b = T[i["bias"]] if "bias" in i else None
+    y = F.conv_transpose2d(xn, wn, b, stride=tuple(p.get("stride", [1, 1])),
+                           padding=tuple(p.get("padding", [0, 0])))
+    return y.permute(0, 2, 3, 1).contiguous()        # NCHW → NHWC
 
 
 def _pad(T, node):
@@ -168,6 +200,10 @@ def _pad(T, node):
 _STATE = {"cfg": {}, "Q": {}}
 
 
+def _output_tensor(node, port="out"):
+    return node["outputs"][port]["tensor"]
+
+
 def _affine(T, tensor_name):
     descriptor = _STATE["cfg"]["quantization"]["tensors"][tensor_name]
     scale = T[descriptor["scale_tensor"]]
@@ -180,7 +216,7 @@ def _affine(T, tensor_name):
 def _quantize(T, node):
     i = node["inputs"]
     zp = T[i["zero_point"]] if "zero_point" in i else 0
-    output_name = node["outputs"]["out"]
+    output_name = _output_tensor(node)
     oq = _affine(T, output_name)
     _STATE["Q"][output_name] = oq
     return torch.clamp(torch.round(T[i["input"]] / T[i["scale"]]) + zp, -128, 127)  # int8 grid
@@ -193,7 +229,7 @@ def _qconv2d(T, node):
     iq = _STATE["Q"][i["input"]]
     in_s, in_zp = iq["scale"], iq["zp"]
     wsc = _affine(T, i["weight"])["scale"].to(torch.float64)
-    oq = _affine(T, node["outputs"]["out"])
+    oq = _affine(T, _output_tensor(node))
     out_s, out_zp = oq["scale"], oq["zp"]
     xn = (T[i["input"]] - in_zp).permute(0, 3, 1, 2)   # NHWC → NCHW
     wn = T[i["weight"]].permute(0, 3, 1, 2)             # OHWI → OIHW
@@ -206,7 +242,7 @@ def _qconv2d(T, node):
     if p.get("relu"):
         real = torch.clamp(real, 0, 6)
     out_q = torch.clamp(torch.round(real / out_s) + out_zp, -128, 127)
-    _STATE["Q"][node["outputs"]["out"]] = {"scale": out_s, "zp": out_zp}
+    _STATE["Q"][_output_tensor(node)] = {"scale": out_s, "zp": out_zp}
     return out_q.permute(0, 2, 3, 1).contiguous()      # NCHW → NHWC
 
 
@@ -261,14 +297,14 @@ OP = {
     "ReduceMean": lambda T, n: _rows(_inp(T, n)).mean(dim=-1),
     "ReduceSum": lambda T, n: _rows(_inp(T, n)).sum(dim=-1),
     "Transpose": lambda T, n: _inp(T, n).permute(*n["params"]["perm"]).contiguous(),
-    "Reshape": lambda T, n: _inp(T, n).reshape(*n["outputs_shape"]["out"]),
+    "Reshape": lambda T, n: _inp(T, n).reshape(*n["outputs"]["out"]["shape"]),
     "Flatten": _flatten,
     "Identity": lambda T, n: _inp(T, n),
     "Squeeze": _squeeze,
     "Unsqueeze": _unsqueeze,
     "Slice": _slice,
-    "Expand": lambda T, n: _inp(T, n).expand(*n["outputs_shape"]["out"]).contiguous(),
-    "Broadcast": lambda T, n: _inp(T, n).expand(*n["outputs_shape"]["out"]).contiguous(),
+    "Expand": lambda T, n: _inp(T, n).expand(*n["outputs"]["out"]["shape"]).contiguous(),
+    "Broadcast": lambda T, n: _inp(T, n).expand(*n["outputs"]["out"]["shape"]).contiguous(),
     "Concat": lambda T, n: torch.cat([T[v] for k, v in sorted(n["inputs"].items()) if k.startswith("input")], dim=n["params"]["axis"]),
     "GlobalAveragePool": _globalavgpool,
     "BatchNorm2D": _batchnorm,
@@ -279,6 +315,8 @@ OP = {
     "MeanHeight": lambda T, n: _inp(T, n).mean(dim=1).permute(0, 2, 1).contiguous(),  # NHWC → [N,C,W]
     "ArgMax": lambda T, n: _inp(T, n).argmax(dim=n.get("params", {}).get("axis", -1)).to(torch.float64),
     "Conv2D": _conv2d,
+    "Conv1D": _conv1d,
+    "ConvTranspose2D": _conv_transpose2d,
     "QuantizeLinear": _quantize,
     "DequantizeLinear": _dequantize,
     "QConv2D": _qconv2d,
@@ -305,7 +343,7 @@ def run_case(d):
         if node["opType"] not in OP:
             return None  # op not yet mapped → skip (reported as uncovered)
         output = OP[node["opType"]](T, node)
-        declared_shape = node.get("outputs_shape", {}).get("out")
+        declared_shape = node.get("outputs", {}).get("out", {}).get("shape")
         if declared_shape is not None:
             expected = math.prod(declared_shape)
             if output.numel() != expected:
@@ -318,7 +356,7 @@ def run_case(d):
             # shape so the v2 structural signature checks the same tensor ABI as
             # VolvoxAI instead of silently accepting a flattened oracle output.
             output = output.reshape(tuple(declared_shape))
-        T[node["outputs"]["out"]] = output
+        T[_output_tensor(node)] = output
     final = cfg["outputs"][0]
     return T[final]
 

@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
-import { Graph } from '../ts/index.js';
+import { TrainingGraph as Graph } from '../ts/training/TrainingGraph.js';
 import { CPUEngine } from '../ts/backends/CPUEngine.js';
 import { CPUAutograd } from '../ts/training/CPUAutograd.js';
 import { GraphExecutor } from '../ts/backends/GraphExecutor.js';
@@ -233,7 +233,7 @@ test('WebGPU GroupNorm backward emits input and affine dispatches with shared pa
   const tensors = [input, weight, bias, out];
   const gpuBuffers = new Map(tensors.map((value) => [value.name, { tensor: value.name }]));
   const graph = { nodes: [node], getTensor: (name) => tensors.find((value) => value.name === name) };
-  const trainer = new DispatchRecorder(device, graph, { gpuBuffers, _dinWeights: new Map() });
+  const trainer = new DispatchRecorder(device, graph, { gpuBuffers });
   trainer.gradientBuffers.set(out.name, { tensor: 'grad_out' });
 
   const dispatches = await trainer._buildBackwardDispatches();

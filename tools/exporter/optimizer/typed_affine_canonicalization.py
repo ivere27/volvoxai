@@ -53,11 +53,23 @@ class RuntimeAffineReferenceCanonicalizationPass(IRPass):
             if key is not None:
                 groups.setdefault(key, []).append(name)
 
-        aliases = {
-            alias: names[0]
-            for names in groups.values()
-            for alias in names[1:]
+        public_affine_refs = {
+            reference
+            for tensor in graph.tensors.values()
+            if (tensor.public_input or tensor.public_output)
+            if tensor.quantization is not None
+            for reference in (
+                tensor.quantization.scale,
+                tensor.quantization.zero_point,
+            )
         }
+        aliases: dict[str, str] = {}
+        for names in groups.values():
+            protected = [name for name in names if name in public_affine_refs]
+            canonical = protected[0] if protected else names[0]
+            for alias in names:
+                if alias != canonical and alias not in public_affine_refs:
+                    aliases[alias] = canonical
         if not aliases:
             return PassResult(0)
 

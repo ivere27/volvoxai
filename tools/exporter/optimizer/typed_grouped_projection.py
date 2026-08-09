@@ -1,19 +1,37 @@
 """Split a packed F32 dense projection into proven contiguous groups.
 
-The pass is a model-neutral fuse-before-quantize transform.  It simulates the
-storage-only chain between a canonical dense projection and its Slice leaves,
-then emits one dense operator per contiguous output-channel group.  Immutable
-weight and optional bias payloads are sliced without changing values.
+The pass is a model-neutral fuse-before-quantize transform.  It proves what the
+storage-only chain between a canonical dense projection and its Slice leaves
+does to the layout, then emits one dense operator per contiguous output-channel
+group.  Immutable weight and optional bias payloads are sliced without changing
+values.
 
 Unlike the retired dictionary implementation, the source dense result must be
 an executable RuntimeIR tensor with the natural ``[..., width]`` shape.  Any
 group axes must be represented by explicit Reshape/Transpose nodes, so the
 typed verifier remains authoritative throughout the rewrite.
+
+The proof is symbolic.  It used to label every element of the dense result with
+its flat index, push the labels through the chain with numpy, and read the
+group off the Slice output.  That is only possible when every intermediate
+shape is concrete, so on a bounded-dynamic decoder — where the token axis is a
+symbol — the pass refused at the first movement node and reported zero changes
+for the whole graph.  It is also the transform that deletes the QKV split, and
+those Slice leaves are what stops row-incremental decode from engaging, so the
+refusal cost a per-step factor rather than a missed tidy-up.
+
+The replacement splits the width axis into a group factor and an element factor
+and tracks where those factors land, using the same slot machinery the
+attention passes use.  A Slice proves out when it selects exactly the group
+factor and leaves the remaining factors in natural row-major order.  That holds
+for every binding of the bounded symbols at once, so the token axis never has
+to be concrete.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
+from itertools import count
 from math import prod
 from typing import Any, Mapping, MutableMapping
 
@@ -21,11 +39,21 @@ import numpy as np
 
 from ..ir import (
     IRDialect,
+    OpAttribute,
     OpNode,
     TensorDataRef,
     TensorValue,
 )
 from ..pipeline import IRPass, PassContract, PassResult
+from .typed_attention_common import (
+    Extent,
+    Slot,
+    layout_of,
+    resolved_shape,
+    same_element_count,
+    slot_sequence,
+    trace_layout,
+)
 
 
 _DENSE_OPS = frozenset({"Linear", "MatMul", "Gemm"})
@@ -33,7 +61,6 @@ _MOVEMENT_OPS = frozenset({
     "Reshape", "Transpose", "Squeeze", "Unsqueeze", "Identity", "Flatten",
 })
 _MAX_CHAIN = 8
-_MAX_PROOF_ELEMENTS = 16 * 1024 * 1024
 
 
 @dataclass(frozen=True)
@@ -41,7 +68,7 @@ class _Assignment:
     group: int
     leaf_index: int
     output: str
-    shape: tuple[int, ...]
+    shape: tuple[Extent, ...]
 
 
 @dataclass(frozen=True)
@@ -55,7 +82,7 @@ class _Plan:
     layout: str
     width: int
     part: int
-    natural_shape: tuple[int, ...]
+    natural_shape: tuple[Extent, ...]
 
     @property
     def dropped_indices(self) -> frozenset[int]:
@@ -70,7 +97,9 @@ class RuntimeGroupedProjectionSplitPass(IRPass):
     """Split packed output columns after an index-simulation proof."""
 
     name = "runtime-grouped-projection-split"
-    contract = PassContract.preserving(IRDialect.RUNTIME, repeatable=True)
+    contract = PassContract.preserving(
+        IRDialect.RUNTIME, repeatable=True
+    )
 
     def __init__(self, tensor_data: MutableMapping[str, Any]) -> None:
         if not isinstance(tensor_data, MutableMapping):
@@ -121,7 +150,7 @@ class RuntimeGroupedProjectionSplitPass(IRPass):
         if (
             params is None
             or set(params) != {"weight_layout"}
-            or params["weight_layout"] not in {"IN_OUT", "OUT_IN"}
+            or params["weight_layout"] not in {"din_dout", "dout_din"}
         ):
             return None
         layout = str(params["weight_layout"])
@@ -134,11 +163,15 @@ class RuntimeGroupedProjectionSplitPass(IRPass):
         activation = graph.tensors[input_name]
         weight = graph.tensors[weight_name]
         output = graph.tensors[output_name]
+        # Only the feature axes take part in the split, so the leading batch and
+        # sequence axes may stay symbolic; the weight itself is always concrete.
+        width = output.shape[-1] if output.rank else None
+        d_in = activation.shape[-1] if activation.rank else None
         if (
             activation.dtype != "float32"
             or activation.quantization is not None
             or activation.initializer
-            or not activation.concrete
+            or not isinstance(d_in, int)
             or weight.dtype != "float32"
             or weight.quantization is not None
             or not weight.initializer
@@ -147,14 +180,12 @@ class RuntimeGroupedProjectionSplitPass(IRPass):
             or output.dtype != "float32"
             or output.quantization is not None
             or output.initializer
-            or not output.concrete
+            or not isinstance(width, int)
             or output.rank != activation.rank
             or output.shape[:-1] != activation.shape[:-1]
         ):
             return None
-        width = int(output.shape[-1])
-        d_in = int(activation.shape[-1])
-        expected_weight = (d_in, width) if layout == "IN_OUT" else (width, d_in)
+        expected_weight = (d_in, width) if layout == "din_dout" else (width, d_in)
         if weight.shape != expected_weight:
             return None
         weight_values = self._initializer(graph, weight_name)
@@ -197,7 +228,7 @@ class RuntimeGroupedProjectionSplitPass(IRPass):
                 following_output.dtype != "float32"
                 or following_output.quantization is not None
                 or following_output.initializer
-                or not following_output.concrete
+                or not _valid_movement(graph, following)
             ):
                 return None
             chain.append(following_index)
@@ -214,13 +245,25 @@ class RuntimeGroupedProjectionSplitPass(IRPass):
         if width % groups:
             return None
         part = width // groups
-        if prod(output.shape) > _MAX_PROOF_ELEMENTS:
+
+        # Split the width axis into its group and element factors and follow
+        # where the chain puts them.  Everything below is a statement about
+        # those factors, so it holds for every binding of the bounded symbols.
+        root_shape = resolved_shape(graph, output.shape)
+        counter = count()
+        start = layout_of(
+            root_shape, counter, factors={output.rank - 1: (groups, part)},
+        )
+        traced = trace_layout(graph, tuple(chain), start)
+        if traced is None:
             return None
-        values = np.arange(prod(output.shape), dtype=np.int64).reshape(output.shape)
-        for chain_index in chain:
-            values = _apply_movement(graph, values, graph.nodes[chain_index])
-            if values is None:
-                return None
+        group_slot, element_slot = start[output.rank - 1]
+        # The natural order the split result must be left in: every factor of
+        # the leading axes, in their original order, then the element factor.
+        expected_tail = (
+            *(slot for axis in start[:-1] for slot in axis),
+            element_slot,
+        )
 
         assignments: list[_Assignment] = []
         for use in leaves:
@@ -233,10 +276,9 @@ class RuntimeGroupedProjectionSplitPass(IRPass):
                 or set(leaf_outputs) != {"out"}
             ):
                 return None
-            selected = _apply_slice(graph, values, leaf)
-            if selected is None:
-                return None
-            group = _group_of(selected, width, part)
+            group = _sliced_group(
+                graph, leaf, traced, group_slot, element_slot, groups, part,
+            )
             if group is None:
                 return None
             leaf_output = leaf_outputs["out"]
@@ -245,20 +287,31 @@ class RuntimeGroupedProjectionSplitPass(IRPass):
                 leaf_tensor.dtype != "float32"
                 or leaf_tensor.quantization is not None
                 or leaf_tensor.initializer
-                or not leaf_tensor.concrete
             ):
+                return None
+            # Removing the group factor must leave the remaining factors in
+            # natural row-major order; otherwise the slice is a group's values
+            # in some permuted arrangement, which one dense operator cannot
+            # reproduce.
+            remaining = tuple(
+                slot for slot in slot_sequence(traced) if slot != group_slot
+            )
+            if remaining != expected_tail:
                 return None
             assignments.append(_Assignment(
                 group=group,
                 leaf_index=use.node_index,
                 output=leaf_output,
-                shape=tuple(int(value) for value in leaf_tensor.shape),
+                # The tensor's own spelling, not the resolved one.  Pinning a
+                # single-valued symbol is right for a proof and wrong for a
+                # descriptor: emitting (M, 1, 320) where the graph declares
+                # (M, B, 320) contradicts canonical inference even though B can
+                # only ever be one.
+                shape=tuple(leaf_tensor.shape),
             ))
         if {item.group for item in assignments} != set(range(groups)):
             return None
         natural = (*activation.shape[:-1], part)
-        if any(not isinstance(value, int) for value in natural):
-            return None
         return _Plan(
             dense_index=dense_index,
             chain_indices=tuple(chain),
@@ -269,7 +322,7 @@ class RuntimeGroupedProjectionSplitPass(IRPass):
             layout=layout,
             width=width,
             part=part,
-            natural_shape=tuple(int(value) for value in natural),
+            natural_shape=natural,
         )
 
     def _initializer(self, graph, name: str) -> np.ndarray | None:
@@ -312,7 +365,7 @@ class RuntimeGroupedProjectionSplitPass(IRPass):
             )
             grouped_weight = (
                 weight[:, columns]
-                if plan.layout == "IN_OUT" else weight[columns, :]
+                if plan.layout == "din_dout" else weight[columns, :]
             )
             self._add_initializer_like(
                 graph,
@@ -354,7 +407,7 @@ class RuntimeGroupedProjectionSplitPass(IRPass):
                 emitted_names.append(dense_name)
                 continue
 
-            if prod(assignment.shape) != prod(plan.natural_shape):
+            if not same_element_count(assignment.shape, plan.natural_shape):
                 raise RuntimeError("grouped projection target shape changed after planning")
             staged = _allocate(
                 f"{assignment.output}.projection", occupied_tensors,
@@ -386,6 +439,11 @@ class RuntimeGroupedProjectionSplitPass(IRPass):
                 "Reshape",
                 {"input": staged},
                 {"out": assignment.output},
+                attributes=(OpAttribute(
+                    "params",
+                    "volvox.params",
+                    {"shape": list(assignment.shape)},
+                ),),
                 provenance=provenance,
                 metadata={"grouped_projection": assignment.group},
             ))
@@ -458,51 +516,82 @@ def _params(node: OpNode) -> dict[str, Any] | None:
     return dict(node.attributes[0].value)
 
 
-def _apply_movement(graph, values: np.ndarray, node: OpNode) -> np.ndarray | None:
+def _valid_movement(graph, node: OpNode) -> bool:
+    """Accept only the movement forms the slot tracer models exactly."""
+
     inputs = node.input_map()
     outputs = node.output_map()
     if set(inputs) != {"input"} or set(outputs) != {"out"}:
-        return None
-    target = graph.tensors[outputs["out"]].shape
+        return False
     params = _params(node)
     if params is None:
-        return None
+        return False
+    source = graph.tensors.get(inputs["input"])
+    target = graph.tensors.get(outputs["out"])
+    if source is None or target is None:
+        return False
+    source_shape = resolved_shape(graph, source.shape)
+    target_shape = resolved_shape(graph, target.shape)
     if node.op_type == "Transpose":
-        if set(params) != {"perm"}:
-            return None
         permutation = params.get("perm")
         if (
-            not isinstance(permutation, list)
+            set(params) != {"perm"}
+            or not isinstance(permutation, list)
             or any(
                 isinstance(axis, bool) or not isinstance(axis, int)
                 for axis in permutation
             )
-            or sorted(permutation) != list(range(values.ndim))
+            or sorted(permutation) != list(range(len(source_shape)))
         ):
-            return None
-        values = values.transpose(permutation)
-        if tuple(target) != values.shape:
-            return None
-    else:
-        if params:
-            return None
-        if node.op_type == "Identity" and tuple(target) != values.shape:
-            return None
-    if prod(target) != values.size:
-        return None
-    try:
-        return values.reshape(target)
-    except ValueError:
-        return None
+            return False
+        return target_shape == tuple(source_shape[axis] for axis in permutation)
+    if node.op_type == "Identity":
+        return not params and target_shape == source_shape
+    # The reshape-like ops carry their own parameters in this dialect —
+    # Reshape a target shape, Squeeze and Unsqueeze an axis list, Flatten an
+    # axis — and requiring empty params here rejected every graph an importer
+    # produces.  They do not need interpreting: the shape contract already
+    # requires each one's declared output to agree with its parameters, and the
+    # slot regrouping works from that declared output.  What matters is only
+    # that no unexpected parameter changes the operator's meaning.
+    allowed = {
+        "Reshape": {"shape"},
+        "Squeeze": {"axes"},
+        "Unsqueeze": {"axes"},
+        "Flatten": {"axis"},
+    }.get(node.op_type)
+    return allowed is not None and set(params) <= allowed
 
 
-def _apply_slice(graph, values: np.ndarray, node: OpNode) -> np.ndarray | None:
+def _sliced_group(
+    graph,
+    node: OpNode,
+    traced,
+    group_slot: Slot,
+    element_slot: Slot,
+    groups: int,
+    part: int,
+) -> int | None:
+    """Which group this Slice selects, or None if it does not select one.
+
+    Two arrangements reach here.  The chain may have given the group factor an
+    axis of its own, where the slice is one index; or it may have left the
+    width axis intact, where the slice is a contiguous ``part``-wide run.  Both
+    are stated against the factors, so neither needs a concrete token extent.
+    """
+
     params = _params(node)
-    # Runtime Slice uses the verified output descriptor as its selection length;
-    # `ends` belongs to the ONNX source dialect and must never be guessed here.
-    if params is None or not set(params) <= {"starts", "axes", "steps"}:
+    # `ends` is a canonical runtime Slice parameter, not an ONNX-dialect
+    # leftover: _concrete_slice_plan reads axes, starts, ends and steps, and
+    # every Slice an importer produces carries it.  Refusing it therefore
+    # refused every real graph, which is why this pass reported zero changes on
+    # a package whose decoder contains exactly the pattern it exists to rewrite.
+    # It is checked rather than trusted: the selection it implies has to be the
+    # declared output, so nothing here is guessed.
+    if params is None or not set(params) <= {"starts", "ends", "axes", "steps"}:
         return None
     starts = params.get("starts")
+    ends = params.get("ends")
     axes = params.get("axes")
     steps = params.get("steps")
     if (
@@ -510,65 +599,90 @@ def _apply_slice(graph, values: np.ndarray, node: OpNode) -> np.ndarray | None:
         or not isinstance(axes, list)
         or not isinstance(steps, list)
         or not (len(starts) == len(axes) == len(steps))
-        or not starts
+        or len(starts) != 1
         or any(
             isinstance(item, bool) or not isinstance(item, int)
             for item in (*starts, *axes, *steps)
         )
+        or (ends is not None and (
+            not isinstance(ends, list)
+            or len(ends) != len(starts)
+            or any(
+                isinstance(item, bool) or not isinstance(item, int)
+                for item in ends
+            )
+        ))
     ):
         return None
-    output_name = node.output_map().get("out")
-    output = graph.tensors.get(output_name or "")
-    if output is None or not output.concrete:
+    output = graph.tensors.get(node.output_map().get("out") or "")
+    if output is None:
         return None
-    if len(output.shape) != values.ndim:
+    output_shape = resolved_shape(graph, output.shape)
+    if len(output_shape) != len(traced):
         return None
-    selector: list[Any] = [slice(None)] * values.ndim
-    seen: set[int] = set()
-    for raw_start, raw_axis, step in zip(starts, axes, steps):
-        axis = raw_axis + values.ndim if raw_axis < 0 else raw_axis
-        if axis < 0 or axis >= values.ndim or axis in seen or step <= 0:
+    rank = len(traced)
+    axis = axes[0] + rank if axes[0] < 0 else axes[0]
+    if axis < 0 or axis >= rank or steps[0] != 1:
+        return None
+
+    # Every other axis must survive whole, or the slice is dropping data this
+    # rewrite does not reproduce.
+    source_extents = [
+        _axis_extent(traced[index]) for index in range(rank)
+    ]
+    if any(extent is None for extent in source_extents):
+        return None
+    for index in range(rank):
+        if index == axis:
+            continue
+        if output_shape[index] != source_extents[index]:
             return None
-        start = raw_start + values.shape[axis] if raw_start < 0 else raw_start
-        if start < 0 or start >= values.shape[axis]:
-            return None
-        length = int(output.shape[axis])
-        if start + (length - 1) * step >= values.shape[axis]:
-            return None
-        selector[axis] = slice(start, start + length * step, step)
-        seen.add(axis)
-    if any(
-        axis not in seen and int(output.shape[axis]) != values.shape[axis]
-        for axis in range(values.ndim)
-    ):
+
+    start = starts[0]
+    length = output_shape[axis]
+    if not isinstance(length, int) or length <= 0:
         return None
-    selected = values[tuple(selector)]
-    if selected.shape != output.shape:
-        return None
-    return selected
+    if ends is not None:
+        # Reproduce _concrete_slice_plan's clamping and require it to land on
+        # the declared extent.  A disagreement means the two descriptions of
+        # this Slice differ, and this pass is not the place to pick a winner.
+        extent = source_extents[axis]
+        if not isinstance(extent, int):
+            return None
+        begin = start + extent if start < 0 else start
+        finish = ends[0] + extent if ends[0] < 0 else ends[0]
+        begin = min(extent, max(0, begin))
+        finish = min(extent, max(0, finish))
+        if finish <= begin or (finish - begin - 1) // steps[0] + 1 != length:
+            return None
+    sliced = traced[axis]
+    if sliced == (group_slot,):
+        # The group factor owns this axis: one index is one group.
+        if start < 0:
+            start += groups
+        if length != 1 or start < 0 or start >= groups:
+            return None
+        return start
+    if sliced == (group_slot, element_slot):
+        # The width axis is intact: a group is a contiguous run of `part`.
+        if start < 0:
+            start += groups * part
+        if length != part or start % part or start < 0 or start >= groups * part:
+            return None
+        return start // part
+    return None
 
 
-def _group_of(selected: np.ndarray, width: int, part: int) -> int | None:
-    flat = selected.reshape(-1)
-    if flat.size == 0 or flat.size % part:
+def _axis_extent(axis) -> Extent | None:
+    """The extent an axis denotes, or None when it is not a single factor."""
+
+    if not axis:
+        return 1
+    if len(axis) == 1:
+        return axis[0].extent
+    if any(not isinstance(slot.extent, int) for slot in axis):
         return None
-    rows = flat.size // part
-    matrix = flat.reshape(rows, part)
-    first = int(matrix[0, 0] % width)
-    if first % part:
-        return None
-    group = first // part
-    if group < 0 or (group + 1) * part > width:
-        return None
-    columns = np.arange(group * part, (group + 1) * part, dtype=np.int64)
-    if not np.array_equal(matrix % width, np.tile(columns, (rows, 1))):
-        return None
-    expected_rows = np.repeat(np.arange(rows, dtype=np.int64), part).reshape(
-        rows, part,
-    )
-    if not np.array_equal(matrix // width, expected_rows):
-        return None
-    return group
+    return prod(slot.extent for slot in axis)
 
 
 def _allocate(stem: str, occupied: set[str]) -> str:

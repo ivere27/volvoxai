@@ -4,6 +4,9 @@
 #include "incremental_runtime.h"
 #include "inference_kernels.h"
 #include "runtime_state.h"
+#if defined(VOLVOXAI_INCREMENTAL_FAKE_NNAPI_TEST)
+#include "nnapi_engine.h"
+#endif
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -40,8 +43,8 @@ void nnapi_cleanup(void) {
 
 void nnapi_free_weight_cache(void) {}
 
-void nnapi_matmul(const float* input, const float* weight, const float* bias,
-                  float* output, int rows, int d_in, int d_out) {
+int nnapi_matmul(const float* input, const float* weight, const float* bias,
+                 float* output, int rows, int d_in, int d_out) {
     (void)input;
     (void)weight;
     (void)bias;
@@ -50,6 +53,15 @@ void nnapi_matmul(const float* input, const float* weight, const float* bias,
     g_fake_nnapi_d_in = d_in;
     g_fake_nnapi_d_out = d_out;
     for (int index = 0; index < rows * d_out; index++) output[index] = 37.0f;
+    return 1;
+}
+
+int nnapi_cache_telemetry(NnapiCacheTelemetry* telemetry) {
+    if (!telemetry) return -1;
+    memset(telemetry, 0, sizeof(*telemetry));
+    telemetry->entry_capacity = NNAPI_MODEL_CACHE_CAPACITY;
+    telemetry->executions = (uint64_t)g_fake_nnapi_run_count;
+    return 0;
 }
 #endif
 
@@ -123,7 +135,7 @@ static int test_decode_session_preserves_nnapi_seed_dispatch(void) {
         "\"nodes\":[{\"opType\":\"Linear\","
         "\"inputs\":{\"input\":\"x\",\"weight\":\"w\"},"
         "\"outputs\":{\"out\":\"y\"},\"outputs_shape\":{\"out\":[4,512]},"
-        "\"params\":{\"weight_layout\":\"IN_OUT\"}}],"
+        "\"params\":{\"weight_layout\":\"din_dout\"}}],"
         "\"outputs\":[\"y\"]}";
     const int weight_shape[2] = {N, K};
     float* input = (float*)calloc((size_t)ROWS * K, sizeof(*input));
@@ -166,6 +178,13 @@ static int test_decode_session_preserves_nnapi_seed_dispatch(void) {
           g_fake_nnapi_d_out == N);
     CHECK(volvoxai_engine_copy_tensor_f32("y", output, ROWS * N) == 0);
     for (int index = 0; index < ROWS * N; index++) CHECK(output[index] == 37.0f);
+    {
+        char telemetry[192] = {0};
+        CHECK(vx_runtime_backend_append_dynamic_telemetry(
+                  telemetry, sizeof(telemetry)) == 0);
+        CHECK(strstr(telemetry, "nnapi_cache=0/0") != NULL);
+        CHECK(strstr(telemetry, "nnapi_build_ms=0.000") != NULL);
+    }
 
     volvoxai_engine_decode_session_destroy(session);
     volvoxai_engine_shutdown();
@@ -673,6 +692,234 @@ static int test_incremental_w8a8_row_cache(void) {
     CHECK(unsetenv("VOLVOX_ARENA") == 0);
     remove(graph_path);
     remove(weights_path);
+    return 0;
+}
+
+static int test_decode_session_cpu_row_closure_negotiation(void) {
+    const char* graph_path =
+        "/tmp/volvox-decode-cpu-row-negotiation-graph.json";
+    const char* incompatible_graph_path =
+        "/tmp/volvox-decode-cpu-row-incompatible-graph.json";
+    const char* weights_path =
+        "/tmp/volvox-decode-cpu-row-negotiation-weights.safetensors";
+    const char* graph =
+        "{\"format\":\"volvox-graph/v1\",\"inputs\":{"
+        "\"compatible_ids\":{\"shape\":[1,3],\"dtype\":\"int32\"},"
+        "\"sequence_values\":{\"shape\":[3,1,4],\"dtype\":\"int8\"}},"
+        "\"quantization\":{\"format\":\"volvox-affine-safetensors/v1\","
+        "\"tensors\":{"
+        "\"table\":{\"scheme\":\"per_axis\",\"axis\":0,"
+        "\"scale_tensor\":\"table.scale\","
+        "\"zero_point_tensor\":\"table.zero_point\"},"
+        "\"compatible_embed\":{\"scheme\":\"per_tensor\","
+        "\"scale_tensor\":\"unit.scale\","
+        "\"zero_point_tensor\":\"unit.zero_point\"},"
+        "\"sequence_values\":{\"scheme\":\"per_tensor\","
+        "\"scale_tensor\":\"unit.scale\","
+        "\"zero_point_tensor\":\"unit.zero_point\"},"
+        "\"sequence_bias\":{\"scheme\":\"per_tensor\","
+        "\"scale_tensor\":\"unit.scale\","
+        "\"zero_point_tensor\":\"unit.zero_point\"},"
+        "\"sequence_sum\":{\"scheme\":\"per_tensor\","
+        "\"scale_tensor\":\"unit.scale\","
+        "\"zero_point_tensor\":\"unit.zero_point\"}}},"
+        "\"nodes\":["
+        "{\"opType\":\"QEmbedding\","
+        "\"inputs\":{\"input\":\"compatible_ids\",\"weight\":\"table\"},"
+        "\"outputs\":{\"out\":\"compatible_embed\"},"
+        "\"outputs_shape\":{\"out\":[1,3,4]},"
+        "\"outputs_dtype\":{\"out\":\"int8\"},\"params\":{}},"
+        "{\"opType\":\"QArgMax\","
+        "\"inputs\":{\"input\":\"compatible_embed\"},"
+        "\"outputs\":{\"out\":\"compatible_tokens\"},"
+        "\"outputs_shape\":{\"out\":[1,3]},"
+        "\"outputs_dtype\":{\"out\":\"int32\"},"
+        "\"params\":{\"axis\":-1}},"
+        "{\"opType\":\"QAdd\","
+        "\"inputs\":{\"a\":\"sequence_values\",\"b\":\"sequence_bias\"},"
+        "\"outputs\":{\"out\":\"sequence_sum\"},"
+        "\"outputs_shape\":{\"out\":[3,1,4]},"
+        "\"outputs_dtype\":{\"out\":\"int8\"},\"params\":{}}],"
+        "\"outputs\":[\"compatible_tokens\",\"sequence_sum\"]}";
+    const char* incompatible_graph =
+        "{\"format\":\"volvox-graph/v1\",\"inputs\":{"
+        "\"sequence_values\":{\"shape\":[3,1,4],\"dtype\":\"int8\"}},"
+        "\"quantization\":{\"format\":\"volvox-affine-safetensors/v1\","
+        "\"tensors\":{"
+        "\"sequence_values\":{\"scheme\":\"per_tensor\","
+        "\"scale_tensor\":\"unit.scale\","
+        "\"zero_point_tensor\":\"unit.zero_point\"},"
+        "\"sequence_bias\":{\"scheme\":\"per_tensor\","
+        "\"scale_tensor\":\"unit.scale\","
+        "\"zero_point_tensor\":\"unit.zero_point\"},"
+        "\"sequence_sum\":{\"scheme\":\"per_tensor\","
+        "\"scale_tensor\":\"unit.scale\","
+        "\"zero_point_tensor\":\"unit.zero_point\"}}},"
+        "\"nodes\":[{\"opType\":\"QAdd\","
+        "\"inputs\":{\"a\":\"sequence_values\",\"b\":\"sequence_bias\"},"
+        "\"outputs\":{\"out\":\"sequence_sum\"},"
+        "\"outputs_shape\":{\"out\":[3,1,4]},"
+        "\"outputs_dtype\":{\"out\":\"int8\"},\"params\":{}}],"
+        "\"outputs\":[\"sequence_sum\"]}";
+    const int table_shape[2] = {4, 4};
+    const int sequence_shape[3] = {3, 1, 4};
+    const int8_t table[16] = {
+        0, 0, 0, 0, 2, -2, 1, -1,
+        -3, 3, 2, -2, 4, 1, -1, 2,
+    };
+    const int8_t sequence_bias[12] = {
+        1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+    };
+    const int8_t sequence_seed[12] = {
+        1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12,
+    };
+    const int8_t sequence_update[12] = {
+        -12, -11, -10, -9, -8, -7, -6, -5, -4, -3, -2, -1,
+    };
+    int8_t sequence_actual[12];
+    int8_t sequence_before_failure[12];
+    int32_t ids[3] = {1, 0, 0};
+    VolvoxAIDecodeSessionOptions decode_options =
+        VOLVOXAI_DECODE_SESSION_OPTIONS_INIT;
+    VolvoxAIDecodeSession* session;
+    SafetensorsFile file;
+
+    CHECK(write_text(graph_path, graph) == 0);
+    CHECK(safetensors_init_empty(&file, SAFETENSORS_OPEN_READ_WRITE) == 0);
+    CHECK(safetensors_add_tensor(&file, "table", SAFETENSORS_DTYPE_I8,
+                                 table_shape, 2, table, sizeof(table)) == 0);
+    CHECK(safetensors_add_tensor(&file, "sequence_bias", SAFETENSORS_DTYPE_I8,
+                                 sequence_shape, 3, sequence_bias,
+                                 sizeof(sequence_bias)) == 0);
+    CHECK(add_unit_i8_quantization_parameters(&file) == 0);
+    CHECK(safetensors_save(weights_path, &file) == 0);
+    safetensors_free(&file);
+
+    CHECK(volvoxai_engine_init(graph_path, weights_path) == 0);
+    CHECK(volvoxai_engine_set_input_raw("compatible_ids", VOLVOXAI_DTYPE_I32,
+                                        ids, sizeof(ids)) == 0);
+    CHECK(volvoxai_engine_set_input_raw("sequence_values", VOLVOXAI_DTYPE_I8,
+                                        sequence_seed,
+                                        sizeof(sequence_seed)) == 0);
+
+    {
+        VolvoxAIDecodeSessionOptions oversized = decode_options;
+        oversized.struct_size++;
+        CHECK(volvoxai_engine_decode_session_create(&oversized) == NULL);
+    }
+
+    /* One canonical decoder closure advertises row capability. Its actual
+     * changed closure remains row-executed on CPU. */
+    session = volvoxai_engine_decode_session_create(&decode_options);
+    CHECK(session != NULL);
+    CHECK(volvoxai_engine_decode_session_mode(session) ==
+          VOLVOXAI_DECODE_MODE_INCREMENTAL_ROW);
+    CHECK(volvoxai_engine_decode_session_seed(session) == 0);
+    ids[1] = 2;
+    CHECK(volvoxai_engine_set_input_raw("compatible_ids", VOLVOXAI_DTYPE_I32,
+                                        ids, sizeof(ids)) == 0);
+    CHECK(volvoxai_engine_decode_session_step(session, 1) == 0);
+    CHECK(volvoxai_engine_decode_session_last_execution_mode(session) ==
+          VOLVOXAI_DECODE_MODE_INCREMENTAL_ROW);
+
+    /* The sequence-major QAdd is outside the row-kernel contract. AUTO must
+     * detect that complete dirty closure before executing it, preserve the
+     * valid seed, and permanently negotiate down to dependency execution. */
+    CHECK(volvoxai_engine_set_input_raw("sequence_values", VOLVOXAI_DTYPE_I8,
+                                        sequence_update,
+                                        sizeof(sequence_update)) == 0);
+    CHECK(volvoxai_engine_decode_session_step(session, 1) == 0);
+    CHECK(volvoxai_engine_decode_session_mode(session) ==
+          VOLVOXAI_DECODE_MODE_INCREMENTAL_DEPENDENCY);
+    CHECK(volvoxai_engine_decode_session_last_execution_mode(session) ==
+          VOLVOXAI_DECODE_MODE_INCREMENTAL_DEPENDENCY);
+    CHECK(volvoxai_engine_decode_session_seeded(session) == 1);
+    CHECK(volvoxai_engine_copy_tensor_raw("sequence_sum", sequence_actual,
+                                          sizeof(sequence_actual)) == 0);
+    for (int index = 0; index < 12; index++)
+        CHECK(sequence_actual[index] == sequence_update[index] + 1);
+    volvoxai_engine_decode_session_destroy(session);
+
+    /* REQUIRED performs the same side-effect-free preflight but cannot
+     * downgrade. The failed step invalidates the cache without partially
+     * rewriting the retained output. */
+    ids[1] = 0;
+    CHECK(volvoxai_engine_set_input_raw("compatible_ids", VOLVOXAI_DTYPE_I32,
+                                        ids, sizeof(ids)) == 0);
+    CHECK(volvoxai_engine_set_input_raw("sequence_values", VOLVOXAI_DTYPE_I8,
+                                        sequence_seed,
+                                        sizeof(sequence_seed)) == 0);
+    decode_options.row_mode = VOLVOXAI_DECODE_ROW_REQUIRED;
+    session = volvoxai_engine_decode_session_create(&decode_options);
+    CHECK(session != NULL);
+    CHECK(volvoxai_engine_decode_session_seed(session) == 0);
+    CHECK(volvoxai_engine_copy_tensor_raw("sequence_sum",
+                                          sequence_before_failure,
+                                          sizeof(sequence_before_failure)) == 0);
+    CHECK(volvoxai_engine_set_input_raw("sequence_values", VOLVOXAI_DTYPE_I8,
+                                        sequence_update,
+                                        sizeof(sequence_update)) == 0);
+    CHECK(volvoxai_engine_decode_session_step(session, 1) != 0);
+    CHECK(volvoxai_engine_decode_session_seeded(session) == 0);
+    CHECK(volvoxai_engine_decode_session_last_execution_mode(session) ==
+          VOLVOXAI_DECODE_MODE_NONE);
+    CHECK(volvoxai_engine_copy_tensor_raw("sequence_sum", sequence_actual,
+                                          sizeof(sequence_actual)) == 0);
+    CHECK(memcmp(sequence_actual, sequence_before_failure,
+                 sizeof(sequence_actual)) == 0);
+
+    volvoxai_engine_decode_session_destroy(session);
+    volvoxai_engine_shutdown();
+
+    /* CPU contexts are created before a dynamic decoder extent is bound, so
+     * capability remains provisional until the first concrete dirty closure.
+     * A model with no compatible closure must still negotiate safely at the
+     * step boundary: AUTO falls back and REQUIRED fails before mutation. */
+    CHECK(write_text(incompatible_graph_path, incompatible_graph) == 0);
+    CHECK(volvoxai_engine_init(incompatible_graph_path, weights_path) == 0);
+    CHECK(volvoxai_engine_set_input_raw("sequence_values", VOLVOXAI_DTYPE_I8,
+                                        sequence_seed,
+                                        sizeof(sequence_seed)) == 0);
+    decode_options.row_mode = VOLVOXAI_DECODE_ROW_AUTO;
+    session = volvoxai_engine_decode_session_create(&decode_options);
+    CHECK(session != NULL);
+    CHECK(volvoxai_engine_decode_session_mode(session) ==
+          VOLVOXAI_DECODE_MODE_INCREMENTAL_ROW);
+    CHECK(volvoxai_engine_decode_session_seed(session) == 0);
+    CHECK(volvoxai_engine_set_input_raw("sequence_values", VOLVOXAI_DTYPE_I8,
+                                        sequence_update,
+                                        sizeof(sequence_update)) == 0);
+    CHECK(volvoxai_engine_decode_session_step(session, 1) == 0);
+    CHECK(volvoxai_engine_decode_session_mode(session) ==
+          VOLVOXAI_DECODE_MODE_INCREMENTAL_DEPENDENCY);
+    CHECK(volvoxai_engine_decode_session_last_execution_mode(session) ==
+          VOLVOXAI_DECODE_MODE_INCREMENTAL_DEPENDENCY);
+    volvoxai_engine_decode_session_destroy(session);
+
+    CHECK(volvoxai_engine_set_input_raw("sequence_values", VOLVOXAI_DTYPE_I8,
+                                        sequence_seed,
+                                        sizeof(sequence_seed)) == 0);
+    decode_options.row_mode = VOLVOXAI_DECODE_ROW_REQUIRED;
+    session = volvoxai_engine_decode_session_create(&decode_options);
+    CHECK(session != NULL);
+    CHECK(volvoxai_engine_decode_session_seed(session) == 0);
+    CHECK(volvoxai_engine_copy_tensor_raw("sequence_sum",
+                                          sequence_before_failure,
+                                          sizeof(sequence_before_failure)) == 0);
+    CHECK(volvoxai_engine_set_input_raw("sequence_values", VOLVOXAI_DTYPE_I8,
+                                        sequence_update,
+                                        sizeof(sequence_update)) == 0);
+    CHECK(volvoxai_engine_decode_session_step(session, 1) != 0);
+    CHECK(volvoxai_engine_copy_tensor_raw("sequence_sum", sequence_actual,
+                                          sizeof(sequence_actual)) == 0);
+    CHECK(memcmp(sequence_actual, sequence_before_failure,
+                 sizeof(sequence_actual)) == 0);
+    volvoxai_engine_decode_session_destroy(session);
+    volvoxai_engine_shutdown();
+
+    remove(incompatible_graph_path);
+    remove(weights_path);
+    remove(graph_path);
     return 0;
 }
 
@@ -2065,6 +2312,7 @@ int main(void) {
     CHECK(test_incremental_dependency_cache_and_arena_lifetime() == 0);
     CHECK(test_incremental_cross_sdpa_rows() == 0);
     CHECK(test_incremental_w8a8_row_cache() == 0);
+    CHECK(test_decode_session_cpu_row_closure_negotiation() == 0);
     CHECK(test_incremental_rank2_qsdpa_row() == 0);
     CHECK(test_incremental_qbatch_matmul_dynamic_right_row() == 0);
     CHECK(test_incremental_multihead_binop_layouts() == 0);

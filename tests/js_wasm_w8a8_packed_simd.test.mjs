@@ -76,6 +76,8 @@ function executeCase(api, memory, spec) {
     weightScale = (column) => 0.00390625 * (1 + column % 7),
     inputValues = null, weightValues = null, biasValues = null,
     weightZeroPointValues = null,
+    checkMalformedPairHeader = false,
+    packMode = 'wide',
   } = spec;
   api.reset_heap();
   api.reset_w8a8_wasm_simd_calls();
@@ -98,12 +100,48 @@ function executeCase(api, memory, spec) {
   const packedOutputPointer = allocate(rows * dOut);
   new Uint8Array(memory.buffer, portableOutputPointer, rows * dOut).fill(0xa5);
   new Uint8Array(memory.buffer, packedOutputPointer, rows * dOut).fill(0xa5);
-  const packedBytes = Number(api.packed_q8_weight_size(dIn, dOut));
+  const canonicalOnly = packMode === 'canonical';
+  assert.ok(canonicalOnly || packMode === 'wide', `${name}: known pack mode`);
+  const packedBytes = Number((canonicalOnly
+    ? api.packed_q8_weight_canonical_size
+    : api.packed_q8_weight_size)(dIn, dOut));
   const packedPointer = allocate(packedBytes);
 
-  assert.equal(api.pack_q8_weight(
+  const pack = canonicalOnly
+    ? api.pack_q8_weight_canonical
+    : api.pack_q8_weight;
+  assert.equal(pack(
     packedPointer, packedBytes, weightPointer, dIn, dOut, weightDtype, 1,
   ), 1, `${name}: pack weights`);
+  {
+    const header = new DataView(memory.buffer, packedPointer, 48);
+    if (canonicalOnly) {
+      assert.ok(Number(api.packed_q8_weight_size(dIn, dOut)) > packedBytes,
+        `${name}: canonical pack omits the widened payload`);
+      assert.equal(header.getUint32(32, true), 0,
+        `${name}: canonical pair-pack N blocks`);
+      assert.equal(header.getUint32(36, true), 0,
+        `${name}: canonical pair-pack K blocks`);
+      assert.equal(header.getUint32(40, true), packedBytes,
+        `${name}: canonical bytes end at pair-data offset`);
+      assert.equal(header.getUint32(44, true), 0,
+        `${name}: canonical pair-pack flags`);
+    } else {
+      const pairNBlocks = Math.ceil(dOut / 8);
+      const pairKBlocks = Math.ceil(dIn / 2);
+      const pairDataOffset = header.getUint32(40, true);
+      assert.equal(header.getUint32(32, true), pairNBlocks,
+        `${name}: widened pair-pack N blocks`);
+      assert.equal(header.getUint32(36, true), pairKBlocks,
+        `${name}: widened pair-pack K blocks`);
+      assert.equal(packedBytes,
+        pairDataOffset + pairNBlocks * pairKBlocks * 32,
+        `${name}: widened K2/N8 payload bytes`);
+      assert.equal((header.getUint32(44, true) & 1) !== 0,
+        weightDtype === VX_DTYPE_I8,
+        `${name}: pair-pack signed-weight flag`);
+    }
+  }
   assert.equal(api.qlinear_i8u8(
     inputPointer, weightPointer, biasPointer, scalePointer, zeroPointPointer,
     portableOutputPointer, rows, dIn, dOut,
@@ -125,6 +163,34 @@ function executeCase(api, memory, spec) {
     new Uint8Array(memory.buffer, portableOutputPointer, rows * dOut).slice(),
     `${name}: exact output bytes`,
   );
+  if (expectedResult === 0) {
+    assert.deepEqual(
+      new Uint8Array(memory.buffer, packedOutputPointer, rows * dOut).slice(),
+      new Uint8Array(rows * dOut).fill(0xa5),
+      `${name}: rejection must precede the first output write`,
+    );
+  }
+  if (checkMalformedPairHeader) {
+    const header = new DataView(memory.buffer, packedPointer, 48);
+    const originalPairKBlocks = header.getUint32(36, true);
+    header.setUint32(36, originalPairKBlocks + 1, true);
+    try {
+      new Uint8Array(memory.buffer, packedOutputPointer, rows * dOut).fill(0xa5);
+      assert.equal(api.qlinear_i8u8_packed(
+        inputPointer, packedPointer, biasPointer, scalePointer, zeroPointPointer,
+        packedOutputPointer, rows, dIn, dOut,
+        inputScale, inputZeroPoint, outputScale, outputZeroPoint,
+        inputDtype, weightDtype, outputDtype,
+      ), 0, `${name}: malformed pair-pack metadata must be rejected`);
+      assert.deepEqual(
+        new Uint8Array(memory.buffer, packedOutputPointer, rows * dOut).slice(),
+        new Uint8Array(rows * dOut).fill(0xa5),
+        `${name}: malformed pair metadata must fail before output writes`,
+      );
+    } finally {
+      header.setUint32(36, originalPairKBlocks, true);
+    }
+  }
 }
 
 test('baseline WASM SIMD128 packed W8A8 is exact across byte types and tails', {
@@ -148,6 +214,12 @@ test('baseline WASM SIMD128 packed W8A8 is exact across byte types and tails', {
     assert.ok(memory instanceof WebAssembly.Memory);
     assert.equal(typeof api.w8a8_wasm_simd_calls, 'function');
     assert.equal(typeof api.w8a8_wasm_symmetric_i8_calls, 'function');
+    assert.equal(typeof api.qlinear_i8u8_packed, 'function',
+      'the canonical packed QLinear ABI must remain exported');
+    assert.equal(api.vx_qlinear_i8u8_packed, undefined,
+      'the packed QLinear ABI must not depend on its internal C symbol');
+    assert.equal(api.vx_packed_q8_prefers_signed_activations, undefined,
+      'the native-only packed-domain policy helper must not enter WASM');
 
     executeCase(api, memory, {
       name: 'I8 input/weight/output with odd MR, K, and N tails',
@@ -178,7 +250,16 @@ test('baseline WASM SIMD128 packed W8A8 is exact across byte types and tails', {
       inputZeroPoint: -19, outputZeroPoint: 173, expectedSimdCalls: 1,
     });
     executeCase(api, memory, {
-      name: 'TinyReceipt seed M=402 K=320 N=320',
+      name: 'N<8 canonical-only W8A8 pack stays exact on the scalar path',
+      rows: 3, dIn: 19, dOut: 7,
+      inputDtype: VX_DTYPE_U8, weightDtype: VX_DTYPE_I8,
+      outputDtype: VX_DTYPE_U8,
+      inputZeroPoint: 137, outputZeroPoint: 121, expectedSimdCalls: 0,
+      weightZeroPointValues: new Int32Array(7),
+      packMode: 'canonical',
+    });
+    executeCase(api, memory, {
+      name: 'bounded seed M=402 K=320 N=320',
       rows: 402, dIn: 320, dOut: 320,
       inputDtype: VX_DTYPE_I8, weightDtype: VX_DTYPE_I8,
       outputDtype: VX_DTYPE_I8,
@@ -194,6 +275,31 @@ test('baseline WASM SIMD128 packed W8A8 is exact across byte types and tails', {
       inputZeroPoint: 0, outputZeroPoint: 0, expectedSimdCalls: 1,
       expectedSymmetricCalls: 1,
       weightZeroPointValues: new Int32Array(16),
+    });
+    executeCase(api, memory, {
+      name: 'affine U8 panel with symmetric I8 weights',
+      rows: 7, dIn: 67, dOut: 16,
+      inputDtype: VX_DTYPE_U8, weightDtype: VX_DTYPE_I8,
+      outputDtype: VX_DTYPE_U8,
+      inputZeroPoint: 137, outputZeroPoint: 121, expectedSimdCalls: 1,
+      weightZeroPointValues: new Int32Array(16),
+      checkMalformedPairHeader: true,
+    });
+    executeCase(api, memory, {
+      name: 'affine I8 panel with symmetric I8 weights and nonzero zero points',
+      rows: 4, dIn: 65, dOut: 16,
+      inputDtype: VX_DTYPE_I8, weightDtype: VX_DTYPE_I8,
+      outputDtype: VX_DTYPE_I8,
+      inputZeroPoint: -13, outputZeroPoint: 9, expectedSimdCalls: 1,
+      weightZeroPointValues: new Int32Array(16),
+    });
+    executeCase(api, memory, {
+      name: 'affine U8 symmetric-weight path with odd K and N tails',
+      rows: 3, dIn: 19, dOut: 13,
+      inputDtype: VX_DTYPE_U8, weightDtype: VX_DTYPE_I8,
+      outputDtype: VX_DTYPE_U8,
+      inputZeroPoint: 137, outputZeroPoint: 121, expectedSimdCalls: 1,
+      weightZeroPointValues: new Int32Array(13),
     });
     executeCase(api, memory, {
       name: 'vector requantization preserves round-to-nearest ties-to-even',

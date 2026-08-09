@@ -197,7 +197,7 @@ prefix/row 함수를 노출하지 않음.
 **텐서(Tensor)** — 형태를 지닌 다차원 숫자 배열; 엔진의 유일한 자료형.
 
 **계층(Tier)** — VolvoxAI의 브라우저 프로바이더(WebNN / WebGPU / WASM / CPU) 중 하나로,
-Model.compile() 정책에서 선택하고 고정함.
+`Runtime.compile(snapshot, policy)` 에서 선택하고 고정함.
 
 **토큰(Token)** — 정수 id에 매핑된 텍스트 조각(단어/서브워드/바이트).
 

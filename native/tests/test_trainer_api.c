@@ -78,9 +78,11 @@ static int weights_differ(const float left[4], const float right[4]) {
     return 0;
 }
 
-static VxStatus trainer_bind_and_step(VxTrainer* trainer,
-                                      const float input[2],
-                                      int32_t target,
+static VxStatus trainer_bind_and_step_batch(VxTrainer* trainer,
+                                      const float* input,
+                                      size_t batch_size,
+                                      const int32_t* targets,
+                                      size_t target_count,
                                       const char* logits_name,
                                       VxOptimizerKind optimizer,
                                       uint32_t accumulation_steps,
@@ -91,13 +93,21 @@ static VxStatus trainer_bind_and_step(VxTrainer* trainer,
     const char* trainables[] = {"w"};
     VxCrossEntropyLoss loss = VX_CROSS_ENTROPY_LOSS_INIT;
     VxTrainStepOptions options = VX_TRAIN_STEP_OPTIONS_INIT;
-    VxStatus status = vx_trainer_set_input(
-        trainer, "x", VX_DTYPE_F32, input, 2u * sizeof(float), report);
-    if (status != VX_STATUS_OK) return status;
+    VxTensorBinding binding = VX_TENSOR_BINDING_INIT;
+    binding.name = "x";
+    binding.dtype = VX_DTYPE_F32;
+    binding.rank = 2;
+    binding.shape[0] = (int64_t)batch_size;
+    binding.shape[1] = 2;
+    binding.data = input;
+    binding.byte_size = batch_size * 2u * sizeof(float);
+    binding.location = VX_MEMORY_HOST;
     loss.logits_name = logits_name;
-    loss.targets = &target;
-    loss.target_count = 1;
+    loss.targets = targets;
+    loss.target_count = target_count;
     loss.normalizer = normalizer;
+    options.inputs = &binding;
+    options.input_count = 1;
     options.losses = &loss;
     options.loss_count = 1;
     options.trainable_names = trainables;
@@ -111,6 +121,76 @@ static VxStatus trainer_bind_and_step(VxTrainer* trainer,
     return vx_trainer_train_step(trainer, &options, result, report);
 }
 
+static VxStatus trainer_bind_and_step(VxTrainer* trainer,
+                                      const float input[2],
+                                      int32_t target,
+                                      const char* logits_name,
+                                      VxOptimizerKind optimizer,
+                                      uint32_t accumulation_steps,
+                                      int flush,
+                                      float normalizer,
+                                      VxTrainStepResult* result,
+                                      VxReport* report) {
+    return trainer_bind_and_step_batch(
+        trainer, input, 1u, &target, 1u, logits_name, optimizer,
+        accumulation_steps, flush, normalizer, result, report);
+}
+
+static int oversized_step_descriptors_are_rejected(
+        VxTrainer* trainer, const float input_values[2], VxReport* report) {
+    const char* trainables[] = {"w"};
+    const int32_t target = 0;
+    VxTensorBinding input = VX_TENSOR_BINDING_INIT;
+    VxCrossEntropyLoss loss = VX_CROSS_ENTROPY_LOSS_INIT;
+    VxTrainStepOptions options = VX_TRAIN_STEP_OPTIONS_INIT;
+    VxTrainStepResult result = VX_TRAIN_STEP_RESULT_INIT;
+    VxReport oversized_report = VX_REPORT_INIT;
+
+    input.name = "x";
+    input.dtype = VX_DTYPE_F32;
+    input.rank = 2;
+    input.shape[0] = 1;
+    input.shape[1] = 2;
+    input.data = input_values;
+    input.byte_size = 2u * sizeof(float);
+    input.location = VX_MEMORY_HOST;
+    loss.logits_name = "logits";
+    loss.targets = &target;
+    loss.target_count = 1;
+    options.inputs = &input;
+    options.input_count = 1;
+    options.losses = &loss;
+    options.loss_count = 1;
+    options.trainable_names = trainables;
+    options.trainable_count = 1;
+
+    options.struct_size++;
+    CHECK(vx_trainer_train_step(trainer, &options, &result, report) ==
+          VX_STATUS_INVALID_ARGUMENT);
+    options.struct_size = sizeof(options);
+    result.struct_size++;
+    CHECK(vx_trainer_train_step(trainer, &options, &result, report) ==
+          VX_STATUS_INVALID_ARGUMENT);
+    result.struct_size = sizeof(result);
+    options.optimizer.struct_size++;
+    CHECK(vx_trainer_train_step(trainer, &options, &result, report) ==
+          VX_STATUS_INVALID_ARGUMENT);
+    options.optimizer.struct_size = sizeof(options.optimizer);
+    loss.struct_size++;
+    CHECK(vx_trainer_train_step(trainer, &options, &result, report) ==
+          VX_STATUS_INVALID_ARGUMENT);
+    loss.struct_size = sizeof(loss);
+    input.struct_size++;
+    CHECK(vx_trainer_train_step(trainer, &options, &result, report) ==
+          VX_STATUS_INVALID_ARGUMENT);
+    input.struct_size = sizeof(input);
+    oversized_report.struct_size++;
+    CHECK(vx_trainer_train_step(
+              trainer, &options, &result, &oversized_report) ==
+          VX_STATUS_INVALID_ARGUMENT);
+    return 0;
+}
+
 static int execute_compiled(VxCompiledModel* compiled,
                             const float input[2],
                             float output[2]) {
@@ -118,13 +198,15 @@ static int execute_compiled(VxCompiledModel* compiled,
     VxReport report = VX_REPORT_INIT;
     VxExecutionContext* context = NULL;
     VxResult* result = NULL;
+    const VxTensorBinding binding = {
+        sizeof(VxTensorBinding), "x", VX_DTYPE_F32, 2u, {1, 2},
+        input, 2u * sizeof(float), VX_MEMORY_HOST,
+    };
     VxStatus status = vx_compiled_model_create_context(
         compiled, &options, &context, &report);
     if (status == VX_STATUS_OK)
-        status = vx_execution_context_set_input(
-            context, "x", VX_DTYPE_F32, input, 2u * sizeof(float), &report);
-    if (status == VX_STATUS_OK)
-        status = vx_execution_context_execute(context, &result, &report);
+        status = vx_execution_context_execute(
+            context, &binding, 1u, &result, &report);
     if (status == VX_STATUS_OK)
         status = vx_result_read(result, "logits", output,
                                 2u * sizeof(float), NULL, &report);
@@ -159,11 +241,12 @@ int main(void) {
     const char* restored_export_path = "/tmp/volvox-trainer-restored.safetensors";
     const char* graph =
         "{\"format\":\"volvox-graph/v1\","
-        "\"inputs\":{\"x\":{\"shape\":[1,2],\"dtype\":\"float32\"}},"
-        "\"nodes\":[{\"opType\":\"MatMul\","
+        "\"dimensions\":{\"B\":{\"min\":1,\"max\":2}},"
+        "\"inputs\":{\"x\":{\"shape\":[\"B\",2],\"dtype\":\"float32\"}},"
+        "\"nodes\":[{\"id\":\"matmul\",\"opType\":\"MatMul\","
         "\"inputs\":{\"input\":\"x\",\"weight\":\"w\"},"
-        "\"outputs\":{\"output\":\"logits\"},"
-        "\"outputs_shape\":{\"output\":[1,2]}}],"
+        "\"outputs\":{\"out\":{\"tensor\":\"logits\","
+        "\"dtype\":\"float32\",\"shape\":[\"B\",2]}},\"params\":{}}],"
         "\"outputs\":[\"logits\"]}";
     const char* initial_paths[] = {initial_weights_path};
     const char* baseline_exports[] = {baseline_export_path};
@@ -222,6 +305,22 @@ int main(void) {
           VX_STATUS_OK);
 
     {
+        VxTrainer* rejected = NULL;
+        VxTrainerOptions oversized = trainer_options;
+        VxReport oversized_report = VX_REPORT_INIT;
+        oversized.struct_size++;
+        CHECK(vx_model_create_trainer(
+                  model, &oversized, &rejected, &report) ==
+              VX_STATUS_INVALID_ARGUMENT);
+        CHECK(rejected == NULL);
+        oversized_report.struct_size++;
+        CHECK(vx_model_create_trainer(
+                  model, &trainer_options, &rejected, &oversized_report) ==
+              VX_STATUS_INVALID_ARGUMENT);
+        CHECK(rejected == NULL);
+    }
+
+    {
         VxTrainer* unavailable = NULL;
         VxTrainerOptions exact = VX_TRAINER_OPTIONS_INIT;
         exact.backend = "nnapi";
@@ -244,16 +343,30 @@ int main(void) {
     CHECK(!strcmp(report.backend, "cpu"));
     CHECK(vx_trainer_input_count(trainer) == 1);
     {
-        VxTensorInfo info = VX_TENSOR_INFO_INIT;
-        CHECK(vx_trainer_input_info(trainer, 0, &info, &report) == VX_STATUS_OK);
-        CHECK(info.name && !strcmp(info.name, "x") &&
-              info.dtype == VX_DTYPE_F32 && info.rank == 2 &&
-              info.shape[0] == 1 && info.shape[1] == 2 &&
-              info.byte_size == 2u * sizeof(float));
-        CHECK(vx_trainer_set_input(trainer, "x", VX_DTYPE_I32,
-                                   input, sizeof(input), &report) ==
+        VxTensorSpec spec = VX_TENSOR_SPEC_INIT;
+        VxRevisionInfo published = VX_REVISION_INFO_INIT;
+        VxReport oversized_report = VX_REPORT_INIT;
+        spec.struct_size++;
+        CHECK(vx_trainer_input_spec(trainer, 0, &spec, &report) ==
               VX_STATUS_INVALID_ARGUMENT);
+        published.struct_size++;
+        CHECK(vx_trainer_commit(trainer, &published, &report) ==
+              VX_STATUS_INVALID_ARGUMENT);
+        oversized_report.struct_size++;
+        CHECK(vx_trainer_close(trainer, &oversized_report) ==
+              VX_STATUS_INVALID_ARGUMENT);
+        CHECK(vx_trainer_input_count(trainer) == 1);
+        spec = (VxTensorSpec)VX_TENSOR_SPEC_INIT;
+        CHECK(vx_trainer_input_spec(trainer, 0, &spec, &report) == VX_STATUS_OK);
+        CHECK(spec.name && !strcmp(spec.name, "x") &&
+              spec.dtype == VX_DTYPE_F32 && spec.rank == 2 &&
+              spec.dimensions[0].kind == VX_DIMENSION_SYMBOLIC &&
+              !strcmp(spec.dimensions[0].symbol, "B") &&
+              spec.dimensions[0].min == 1 && spec.dimensions[0].max == 2 &&
+              spec.dimensions[1].kind == VX_DIMENSION_FIXED &&
+              spec.dimensions[1].min == 2);
     }
+    CHECK(oversized_step_descriptors_are_rejected(trainer, input, &report) == 0);
 
     /* An unfinished accumulation window is private and cannot be committed. */
     CHECK(trainer_bind_and_step(trainer, input, 0, "logits",
@@ -268,6 +381,16 @@ int main(void) {
     CHECK(vx_trainer_commit(trainer, NULL, &report) ==
           VX_STATUS_INVALID_ARGUMENT);
     CHECK(!strcmp(report.reason, "ACCUMULATION_PENDING"));
+
+    {
+        const float other_shape[4] = {1.0f, -0.5f, 0.25f, 0.75f};
+        const int32_t other_targets[2] = {0, 1};
+        VxTrainStepResult rejected = VX_TRAIN_STEP_RESULT_INIT;
+        CHECK(trainer_bind_and_step_batch(
+                  trainer, other_shape, 2u, other_targets, 2u, "logits",
+                  VX_OPTIMIZER_SGD, 2, 0, 2.0f, &rejected, &report) ==
+              VX_STATUS_INVALID_ARGUMENT);
+    }
 
     CHECK(trainer_bind_and_step(trainer, input, 0, "logits",
                                 VX_OPTIMIZER_SGD, 2, 0, 2.0f,
@@ -403,9 +526,11 @@ int main(void) {
 
     CHECK(vx_trainer_close(trainer, &report) == VX_STATUS_OK);
     CHECK(vx_trainer_close(trainer, &report) == VX_STATUS_OK);
-    CHECK(vx_trainer_set_input(trainer, "x", VX_DTYPE_F32,
-                               input, sizeof(input), &report) ==
-          VX_STATUS_HANDLE_DISPOSED);
+    {
+        VxTensorSpec closed_spec = VX_TENSOR_SPEC_INIT;
+        CHECK(vx_trainer_input_spec(trainer, 0, &closed_spec, &report) ==
+              VX_STATUS_HANDLE_DISPOSED);
+    }
 
     vx_trainer_release(retained);
     vx_trainer_release(right);

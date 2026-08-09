@@ -30,12 +30,10 @@ except ImportError:  # Imported as tools.generate_kernel_registry in tests.
 
 ROOT = Path(__file__).resolve().parents[1]
 REGISTRY_OPTION = "volvoxai.kernel_registry.registry"
-NATIVE_NO_FALLBACK_TARGETS = frozenset({
-    "backend:vulkan",
-    "backend:opengl",
-    "backend:metal",
-    "backend:cuda",
-})
+SHAPE_FUNCTION_ID_RE = re.compile(
+    r"volvox\.shape\.[a-z][a-z0-9]*(?:-[a-z0-9]+)*\.v[1-9][0-9]*"
+)
+SHAPE_CLASSIFICATION_PREFIX = "SHAPE_CONTRACT_CLASSIFICATION_"
 
 
 @dataclass(frozen=True)
@@ -86,13 +84,22 @@ class Variant:
 
 
 @dataclass(frozen=True)
+class ShapeContract:
+    operator: str
+    shape_function_id: str
+    classification: str
+
+
+@dataclass(frozen=True)
 class Registry:
     schema_version: int
     backends: tuple[Backend, ...]
     target_profiles: tuple[tuple[str, tuple[str, ...]], ...]
     variants: tuple[Variant, ...]
+    shape_contracts: tuple[ShapeContract, ...]
     operator_numbers: dict[str, int]
     graph_names: dict[str, str]
+    shape_classification_numbers: dict[str, int]
     registry_hash: str
     public_hash: str
 
@@ -266,7 +273,14 @@ def load_registry(registry_proto: Path, public_proto: Path) -> Registry:
     source = registry_bytes.decode("utf-8")
     public_source = public_bytes.decode("utf-8")
     root = parse_registry_option(source)
-    reject_unknown(root, {"schema_version", "backend", "target_profile", "variant", "operator_set"}, "registry")
+    reject_unknown(
+        root,
+        {
+            "schema_version", "backend", "target_profile", "variant",
+            "operator_set", "shape_contract",
+        },
+        "registry",
+    )
 
     schema_version = scalar(root, "schema_version", int, "registry")
     if schema_version != 1:
@@ -283,6 +297,48 @@ def load_registry(registry_proto: Path, public_proto: Path) -> Registry:
     profiles = parse_declared_enum(source, "KernelProfile")
     phases = parse_declared_enum(source, "KernelPhase")
     modes = parse_declared_enum(source, "RuntimeSupportMode")
+    shape_classifications = parse_declared_enum(source, "ShapeContractClassification")
+
+    shape_contracts: list[ShapeContract] = []
+    shape_contract_operators: list[str] = []
+    classification_by_shape_function: dict[str, str] = {}
+    shape_contract_fields = {"operator", "shape_function_id", "classification"}
+    for index, item in enumerate(values(root, "shape_contract", dict, "registry")):
+        where = f"shape_contract[{index}]"
+        reject_unknown(item, shape_contract_fields, where)
+        operator = scalar(item, "operator", str, where)
+        shape_function_id = scalar(item, "shape_function_id", str, where)
+        classification = scalar(item, "classification", str, where)
+        if operator not in allowed_operators:
+            raise ValueError(f"{where} has unknown operator {operator!r}")
+        if SHAPE_FUNCTION_ID_RE.fullmatch(shape_function_id) is None:
+            raise ValueError(
+                f"{where}.shape_function_id has invalid stable ID {shape_function_id!r}"
+            )
+        if (
+            classification not in shape_classifications
+            or shape_classifications[classification] == 0
+        ):
+            raise ValueError(f"{where} has invalid shape-contract classification {classification!r}")
+        previous_classification = classification_by_shape_function.setdefault(
+            shape_function_id, classification
+        )
+        if previous_classification != classification:
+            raise ValueError(
+                f"shape-function ID {shape_function_id!r} has conflicting classifications"
+            )
+        shape_contract_operators.append(operator)
+        shape_contracts.append(ShapeContract(operator, shape_function_id, classification))
+    unique(shape_contract_operators, "shape-contract operator")
+    shape_contract_operator_set = set(shape_contract_operators)
+    if shape_contract_operator_set != allowed_operators:
+        missing = sorted(allowed_operators - shape_contract_operator_set)
+        extra = sorted(shape_contract_operator_set - allowed_operators)
+        raise ValueError(
+            "shape contracts must exactly cover OperatorKind; "
+            f"missing={missing}, extra={extra}"
+        )
+    shape_contracts.sort(key=lambda item: operator_numbers[item.operator])
 
     operator_sets: dict[str, tuple[str, ...]] = {}
     for index, item in enumerate(values(root, "operator_set", dict, "registry")):
@@ -350,9 +406,6 @@ def load_registry(registry_proto: Path, public_proto: Path) -> Registry:
             raise ValueError(f"{where} qualifies an operator absent from runtime registration")
         if qualified and not target:
             raise ValueError(f"{where} has qualification without exporter_target")
-        if target in NATIVE_NO_FALLBACK_TARGETS and qualified:
-            raise ValueError(f"{target} must remain empty until no-fallback route attestation exists")
-
         routes: list[Route] = []
         route_fields = {"operator", "route", "predicate_id"}
         for route_index, route_item in enumerate(values(item, "route", dict, where)):
@@ -451,8 +504,10 @@ def load_registry(registry_proto: Path, public_proto: Path) -> Registry:
         tuple(backends),
         tuple(target_profiles),
         tuple(variants),
+        tuple(shape_contracts),
         operator_numbers,
         graph_names,
+        shape_classifications,
         hashlib.sha256(registry_bytes).hexdigest(),
         hashlib.sha256(public_bytes).hexdigest(),
     )
@@ -474,6 +529,12 @@ def graph_names(registry: Registry, operators: Iterable[str]) -> list[str]:
     return [registry.graph_names[operator] for operator in ordered_operators(registry, operators)]
 
 
+def shape_classification_label(classification: str) -> str:
+    if not classification.startswith(SHAPE_CLASSIFICATION_PREFIX):
+        raise ValueError(f"invalid shape-contract classification {classification!r}")
+    return classification.removeprefix(SHAPE_CLASSIFICATION_PREFIX).lower().replace("_", "-")
+
+
 def render_python(registry: Registry) -> bytes:
     atomic_targets = [backend.exporter_target for backend in registry.backends if backend.exporter_target]
     profiles = {name: members for name, members in registry.target_profiles}
@@ -486,6 +547,28 @@ def render_python(registry: Registry) -> bytes:
     lines.append(f"ATOMIC_TARGETS = {tuple(atomic_targets)!r}")
     lines.append(f"PROFILE_MEMBERS = MappingProxyType({profiles!r})")
     lines.append("TARGETS = (*PROFILE_MEMBERS, *ATOMIC_TARGETS)")
+    classifications = tuple(
+        shape_classification_label(name)
+        for name, number in sorted(
+            registry.shape_classification_numbers.items(), key=lambda item: item[1]
+        )
+        if number != 0
+    )
+    lines.append(f"SHAPE_CONTRACT_CLASSIFICATIONS = frozenset({classifications!r})")
+    lines.append("OPERATOR_SHAPE_CONTRACTS = MappingProxyType({")
+    for contract in registry.shape_contracts:
+        operator = registry.graph_names[contract.operator]
+        route = {
+            "shape_function_id": contract.shape_function_id,
+            "classification": shape_classification_label(contract.classification),
+        }
+        lines.append(f"    {operator!r}: MappingProxyType({route!r}),")
+    lines.append("})")
+    lines.append("SHAPE_FUNCTION_ID_BY_OPERATOR = MappingProxyType({")
+    for contract in registry.shape_contracts:
+        operator = registry.graph_names[contract.operator]
+        lines.append(f"    {operator!r}: {contract.shape_function_id!r},")
+    lines.append("})")
     lines.append("RUNTIME_OPERATORS_BY_BACKEND = MappingProxyType({")
     for backend in registry.backends:
         lines.append(f"    {backend.runtime_id!r}: frozenset({graph_names(registry, backend.runtime_operators)!r}),")
@@ -575,6 +658,17 @@ def ts_frozen_record_map(mapping: dict[str, dict[str, str]]) -> str:
     return f"Object.freeze({{{fields}}})"
 
 
+def ts_frozen_shape_contract_map(registry: Registry) -> str:
+    fields = ",".join(
+        f"{ts_literal(registry.graph_names[contract.operator])}:Object.freeze({{"
+        f"shapeFunctionId:{ts_literal(contract.shape_function_id)},"
+        f"classification:{ts_literal(shape_classification_label(contract.classification))}"
+        "})"
+        for contract in registry.shape_contracts
+    )
+    return f"Object.freeze({{{fields}}})"
+
+
 def ts_frozen_variants(variants: list[dict[str, Any]]) -> str:
     items: list[str] = []
     for variant in variants:
@@ -626,7 +720,41 @@ def render_ts(registry: Registry) -> bytes:
     targets_literal = ts_frozen_array_map(targets)
     profiles_literal = ts_frozen_array_map(profiles)
     variants_literal = ts_frozen_variants(variants)
+    shape_contracts_literal = ts_frozen_shape_contract_map(registry)
+    shape_function_ids = {
+        registry.graph_names[contract.operator]: contract.shape_function_id
+        for contract in registry.shape_contracts
+    }
+    shape_function_ids_literal = (
+        f"Object.freeze({ts_literal(shape_function_ids)} as const)"
+    )
+    shape_classification_values = [
+        shape_classification_label(name)
+        for name, number in sorted(
+            registry.shape_classification_numbers.items(), key=lambda item: item[1]
+        )
+        if number != 0
+    ]
+    shape_classifications_literal = (
+        f"Object.freeze({ts_literal(shape_classification_values)} as const)"
+    )
     content = banner(registry, "//") + f"""
+export const shapeContractClassifications = {shape_classifications_literal};
+export type ShapeContractClassification = (typeof shapeContractClassifications)[number];
+
+export interface GeneratedOperatorShapeContract {{
+  readonly shapeFunctionId: string;
+  readonly classification: ShapeContractClassification;
+}}
+
+export const operatorShapeContracts = {shape_contracts_literal} as
+  Readonly<Record<string, GeneratedOperatorShapeContract>>;
+export const operatorShapeFunctionIds = {shape_function_ids_literal};
+
+export function operatorShapeContract(operator: string): GeneratedOperatorShapeContract | null {{
+  return operatorShapeContracts[operator] ?? null;
+}}
+
 export const kernelBackends = Object.freeze({ts_literal(backend_ids)} as const);
 export type KernelBackend = (typeof kernelBackends)[number];
 
@@ -700,6 +828,13 @@ def c_string(value: str) -> str:
 
 
 def render_c(registry: Registry) -> bytes:
+    shape_classifications = [
+        (name, number)
+        for name, number in sorted(
+            registry.shape_classification_numbers.items(), key=lambda item: item[1]
+        )
+        if number != 0
+    ]
     lines = [
         banner(registry, "/*").replace("\n", " */\n").rstrip(),
         "#ifndef VOLVOXAI_INTERNAL_KERNEL_REGISTRY_H",
@@ -709,13 +844,50 @@ def render_c(registry: Registry) -> bytes:
         "#include <string.h>",
         '#include "volvoxai_enums.h"',
         "",
+        "typedef enum VxShapeContractClassification {",
+    ]
+    for classification, number in shape_classifications:
+        lines.append(f"    VX_{classification} = {number},")
+    lines.extend([
+        "} VxShapeContractClassification;",
+        "",
+        "typedef struct VxGeneratedShapeContractRoute {",
+        "    VxOperatorKind operator_kind; const char* operator_name;",
+        "    const char* shape_function_id; VxShapeContractClassification classification;",
+        "} VxGeneratedShapeContractRoute;",
+        "",
+        "static const VxGeneratedShapeContractRoute vx_generated_shape_contract_routes[] = {",
+    ])
+    for contract in registry.shape_contracts:
+        lines.append("    {" + ", ".join((
+            str(registry.operator_numbers[contract.operator]),
+            c_string(registry.graph_names[contract.operator]),
+            c_string(contract.shape_function_id),
+            f"VX_{contract.classification}",
+        )) + "},")
+    lines.extend([
+        "};",
+        "static const size_t vx_generated_shape_contract_route_count =",
+        "    sizeof(vx_generated_shape_contract_routes) / sizeof(vx_generated_shape_contract_routes[0]);",
+        "",
+        "static inline const VxGeneratedShapeContractRoute* vx_kernel_shape_contract_find(",
+        "        const char* operator_name) {",
+        "    size_t index;",
+        "    if (!operator_name) return NULL;",
+        "    for (index = 0; index < vx_generated_shape_contract_route_count; ++index) {",
+        "        const VxGeneratedShapeContractRoute* item = &vx_generated_shape_contract_routes[index];",
+        "        if (!strcmp(item->operator_name, operator_name)) return item;",
+        "    }",
+        "    return NULL;",
+        "}",
+        "",
         "typedef struct VxKernelRegistration {",
         "    const char* backend; VxOperatorKind operator_kind; const char* operator_name;",
         "    const char* route; const char* predicate_id; int dynamic; int exporter_qualified;",
         "} VxKernelRegistration;",
         "",
         "static const VxKernelRegistration vx_kernel_registrations[] = {",
-    ]
+    ])
     for backend in registry.backends:
         qualified = set(backend.qualified_operators)
         dynamic = int(backend.support_mode == "RUNTIME_SUPPORT_MODE_DYNAMIC")
@@ -838,11 +1010,30 @@ def render_docs(registry: Registry) -> bytes:
         "only; profile-separated generated files prevent future full-only entries from leaking",
         "into inference artifacts.",
         "",
+        "## Shape-contract routes",
+        "",
+        "Every runtime `OperatorKind` has exactly one stable logical shape-function route.",
+        "`canonical` selects the authoritative contract for the current implementation tranche;",
+        "it does not attest cross-language coverage, backend proof, or release qualification.",
+        "`deferred` reserves an ID for a later tranche. `bounded-value-dependent` marks the",
+        "fixed-capacity plus valid-count/padding convention, never compact data-dependent shape.",
+        "",
+        "| Operator | Shape-function ID | Classification |",
+        "| --- | --- | --- |",
+    ]
+    for contract in registry.shape_contracts:
+        lines.append(
+            f"| `{registry.graph_names[contract.operator]}` | "
+            f"`{contract.shape_function_id}` | "
+            f"{shape_classification_label(contract.classification)} |"
+        )
+    lines.extend([
+        "",
         "## Backends",
         "",
         "| Backend | Runtime mode | Registered operators | Exporter target | Qualified operators | Physical variants |",
         "| --- | --- | ---: | --- | ---: | ---: |",
-    ]
+    ])
     for backend in registry.backends:
         mode = backend.support_mode.removeprefix("RUNTIME_SUPPORT_MODE_").lower()
         variant_count = sum(1 for variant in registry.variants if variant.backend == backend.kind)

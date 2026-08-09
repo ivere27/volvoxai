@@ -13,6 +13,7 @@
 #include "packed_quant_gemm.h"
 #include "w8a8_affine.h"
 #include "kernel_platform.h"
+#include "gemm_f32.h"
 
 #include <limits.h>
 #include <stddef.h>
@@ -21,8 +22,10 @@
 #ifdef __wasm__
 #include <wasm_simd128.h>
 #define VX_QGEMM_WASM_SIMD 1
+#define VX_QGEMM_WASM_PAIR_PACK 1
 #else
 #define VX_QGEMM_WASM_SIMD 0
+#define VX_QGEMM_WASM_PAIR_PACK 0
 #endif
 
 #if !defined(__wasm__) && (defined(__i386__) || defined(__x86_64__)) && \
@@ -32,6 +35,14 @@
 #include <immintrin.h>
 #define VX_QGEMM_X86_AVX2 1
 #define VX_QGEMM_TARGET_AVX2 __attribute__((target("avx2")))
+/* Two ways to reach a 256-bit VPDPBUSD: the VEX encoding that Alder Lake and
+ * Zen 4 expose as AVX-VNNI, and the EVEX encoding available on the AVX-512-VNNI
+ * parts that predate it, such as Ice Lake and Tiger Lake.  Both accumulate four
+ * byte products straight into I32, so neither can saturate and neither needs
+ * the magnitude/sign decomposition the AVX2 spelling pays for. */
+#define VX_QGEMM_TARGET_AVXVNNI __attribute__((target("avx2,avxvnni")))
+#define VX_QGEMM_TARGET_AVX512VNNI \
+    __attribute__((target("avx512f,avx512bw,avx512vl,avx512vnni")))
 #else
 #define VX_QGEMM_X86_AVX2 0
 #define VX_QGEMM_TARGET_AVX2
@@ -52,7 +63,11 @@ enum {
     /* Five rows amortize each SIMD128 weight shuffle while limiting the
      * paired output accumulator set to ten vectors. */
     VX_QGEMM_WASM_MR = 5u,
-    VX_QGEMM_KC = 960u,
+    /* Baseline K block, and the value the derivation below has to reproduce on
+     * the 32 KiB L1 this file used to assume unconditionally. */
+    VX_QGEMM_KC_BASELINE = 960u,
+    VX_QGEMM_KC_MIN = 64u,
+    VX_QGEMM_KC_ALIGNMENT = 64u,
     VX_QGEMM_PAIR_SIGNED_I8 = 1u,
     VX_QGEMM_PAIR_NO_NEG128 = 2u,
     /* Every weight satisfies |w| <= VX_QGEMM_PAIR_SAFE_ABS_WEIGHT.  VPMADDUBSW
@@ -66,6 +81,46 @@ enum {
 };
 
 enum { VX_QGEMM_PAIR_SAFE_ABS_WEIGHT = 64 };
+
+/*
+ * The K block, derived from the same detected L1 the F32 path uses.
+ *
+ * It was the literal 960 with no cache query at all, while gemm_f32.c next
+ * door detected L1, L2 and L3 — so on a machine with a 48 KiB L1 the float
+ * kernels adapted and the quantized ones did not.  The budget here is the one
+ * the microkernel guide already describes: three quarters of L1, holding one
+ * byte-wide B panel of KC x NR, the widest A form the kernel accepts (four F32
+ * activation rows), and the I32 accumulators.
+ *
+ * On a 32 KiB L1 that is (4*4 + 8*1) * KC + 4*8*4 <= 24576, so KC <= 1018,
+ * which floors to 960 at 64-element alignment: exactly the constant this
+ * replaces.  vx_qgemm_kc_is_baseline() states that, and
+ * test_packed_quant_gemm checks it, so the derivation is pinned to the
+ * measured value it came from rather than quietly moving.
+ */
+static uint32_t vx_qgemm_kc_for_l1(uint32_t l1_bytes) {
+    const uint32_t budget = l1_bytes - l1_bytes / 4u;
+    const uint32_t accumulators = VX_QGEMM_MR * VX_QGEMM_NR * 4u;
+    const uint32_t per_k = VX_QGEMM_MR * 4u + VX_QGEMM_NR * 1u;
+    uint32_t available = budget > accumulators ? budget - accumulators : 0u;
+    uint32_t kc = per_k ? available / per_k : 0u;
+    kc -= kc % VX_QGEMM_KC_ALIGNMENT;
+    return kc < VX_QGEMM_KC_MIN ? VX_QGEMM_KC_MIN : kc;
+}
+
+uint32_t vx_qgemm_kc(void) {
+#if defined(__wasm__)
+    /* Browsers report no cache topology, so this is the deterministic policy
+     * the F32 path uses for the same reason. */
+    return vx_qgemm_kc_for_l1(32u * 1024u);
+#else
+    return vx_qgemm_kc_for_l1(vx_gemm_f32_tile_config().l1_bytes);
+#endif
+}
+
+int vx_qgemm_kc_is_baseline(void) {
+    return vx_qgemm_kc_for_l1(32u * 1024u) == VX_QGEMM_KC_BASELINE;
+}
 
 static uint32_t vx_qgemm_align16(uint32_t value) {
     return (value + 15u) & ~15u;
@@ -104,6 +159,34 @@ static int vx_qgemm_positive_product_multiplier(
     return vx_w8a8_finite_f32(multiplier) && multiplier > 0.0f;
 }
 
+/* Header, per-N8 sums, and canonical KxN8 bytes only.  W8A32 and scalar
+ * kernels consume this representation directly and must not pay for the
+ * widened SIMD-only payload. */
+static uint32_t vx_qgemm_canonical_weight_size(
+        uint32_t d_in, uint32_t d_out) {
+    uint64_t n_blocks;
+    uint64_t sums_bytes;
+    uint64_t data_bytes;
+    uint64_t data_offset;
+    uint64_t total;
+    if (!d_in || !d_out || d_in > (uint32_t)(INT32_MAX / 255)) return 0;
+    n_blocks = ((uint64_t)d_out - 1u) / VX_QGEMM_NR + 1u;
+    sums_bytes = n_blocks * VX_QGEMM_NR * sizeof(int32_t);
+    data_bytes = n_blocks * d_in * VX_QGEMM_NR;
+    data_offset = ((uint64_t)sizeof(VxPackedQ8Header) + sums_bytes + 15u) &
+        ~(uint64_t)15u;
+    total = (data_offset + data_bytes + 15u) & ~(uint64_t)15u;
+    return total <= UINT32_MAX ? (uint32_t)total : 0u;
+}
+
+#if VX_QGEMM_WASM_PAIR_PACK
+WASM_EXPORT("packed_q8_weight_canonical_size")
+uint32_t vx_packed_q8_weight_canonical_size(
+        uint32_t d_in, uint32_t d_out) {
+    return vx_qgemm_canonical_weight_size(d_in, d_out);
+}
+#endif
+
 WASM_EXPORT("packed_q8_weight_size")
 uint32_t vx_packed_q8_weight_size(uint32_t d_in, uint32_t d_out) {
     uint64_t n_blocks;
@@ -130,18 +213,33 @@ uint32_t vx_packed_q8_weight_size(uint32_t d_in, uint32_t d_out) {
     pair_n_blocks = ((uint64_t)d_out + 7u) / 8u;
     pair_k_blocks = ((uint64_t)d_in + 3u) / 4u;
     pair_bytes = pair_n_blocks * pair_k_blocks * 32u;
+#elif VX_QGEMM_WASM_PAIR_PACK
+    /* SIMD128 consumes adjacent K values for one N8 panel.  Keep the
+     * canonical Kx8 bytes for scalar/W8A32 execution and add a target-derived
+     * I16 pack laid out as
+     *   [w(k0,n0), w(k1,n0), ..., w(k0,n7), w(k1,n7)].
+     * Two aligned v128 loads now produce the dot-product vectors directly,
+     * without sign extension or rebuilding the interleave in every row panel.
+     * The measured compute saving outweighs the doubled derived payload for
+     * encoder-sized QLinear/QConv shapes.  This private pack is
+     * context-derived and never serialized. */
+    pair_n_blocks = n_blocks;
+    pair_k_blocks = ((uint64_t)d_in + 1u) / 2u;
+    pair_bytes = pair_n_blocks * pair_k_blocks * 32u;
 #endif
     pair_data_offset = (data_offset + data_bytes + 15u) & ~(uint64_t)15u;
     total = pair_data_offset + pair_bytes;
     return total <= UINT32_MAX ? (uint32_t)total : 0u;
 }
 
-WASM_EXPORT("pack_q8_weight")
-int vx_pack_q8_weight(void* packed, uint32_t packed_bytes, const void* weight,
+static int vx_pack_q8_weight_impl(
+        void* packed, uint32_t packed_bytes, const void* weight,
         uint32_t d_in, uint32_t d_out, uint32_t weight_dtype,
-        uint32_t out_in) {
+        uint32_t out_in, int canonical_only) {
     VxPackedQ8Header* header = (VxPackedQ8Header*)packed;
-    uint32_t needed = vx_packed_q8_weight_size(d_in, d_out);
+    uint32_t needed = canonical_only
+        ? vx_qgemm_canonical_weight_size(d_in, d_out)
+        : vx_packed_q8_weight_size(d_in, d_out);
     uint32_t n_blocks = (d_out - 1u) / VX_QGEMM_NR + 1u;
     uint32_t sums_offset = vx_qgemm_align16((uint32_t)sizeof(*header));
     uint32_t data_offset = vx_qgemm_align16(sums_offset +
@@ -153,7 +251,7 @@ int vx_pack_q8_weight(void* packed, uint32_t packed_bytes, const void* weight,
     int32_t* sums;
     uint8_t* data;
     uint8_t* pair_data;
-    uint32_t pair_flags = weight_dtype == VX_DTYPE_I8
+    uint32_t pair_flags = !canonical_only && weight_dtype == VX_DTYPE_I8
         ? VX_QGEMM_PAIR_SIGNED_I8 | VX_QGEMM_PAIR_NO_NEG128 |
           VX_QGEMM_PAIR_NO_SATURATE : 0u;
     if (!packed || !weight || !needed || packed_bytes < needed ||
@@ -166,12 +264,17 @@ int vx_pack_q8_weight(void* packed, uint32_t packed_bytes, const void* weight,
     header->weight_dtype = weight_dtype;
     header->sums_offset = sums_offset;
     header->data_offset = data_offset;
+    if (!canonical_only) {
 #if VX_QGEMM_X86_AVX2
-    pair_n_blocks = (d_out + 7u) / 8u;
-    pair_k_blocks = (d_in + 3u) / 4u;
+        pair_n_blocks = (d_out + 7u) / 8u;
+        pair_k_blocks = (d_in + 3u) / 4u;
+#elif VX_QGEMM_WASM_PAIR_PACK
+        pair_n_blocks = n_blocks;
+        pair_k_blocks = (d_in + 1u) / 2u;
 #else
-    pair_flags = 0u;
+        pair_flags = 0u;
 #endif
+    }
     header->pair_n_blocks = pair_n_blocks;
     header->pair_k_blocks = pair_k_blocks;
     header->pair_data_offset = pair_data_offset;
@@ -201,7 +304,32 @@ int vx_pack_q8_weight(void* packed, uint32_t packed_bytes, const void* weight,
         }
         sums[column] = (int32_t)sum;
     }
+    if (canonical_only) return 1;
     pair_data = (uint8_t*)packed + pair_data_offset;
+#if VX_QGEMM_WASM_PAIR_PACK
+    for (uint32_t block = 0; block < pair_n_blocks; block++) {
+        for (uint32_t k_block = 0; k_block < pair_k_blocks; k_block++) {
+            for (uint32_t lane = 0; lane < VX_QGEMM_NR; lane++) {
+                const uint32_t column = block * VX_QGEMM_NR + lane;
+                for (uint32_t k_lane = 0; k_lane < 2u; k_lane++) {
+                    const uint32_t dimension = k_block * 2u + k_lane;
+                    uint8_t raw = 0;
+                    if (column < d_out && dimension < d_in) {
+                        size_t source = out_in
+                            ? (size_t)column * d_in + dimension
+                            : (size_t)dimension * d_out + column;
+                        raw = ((const uint8_t*)weight)[source];
+                    }
+                    ((int16_t*)pair_data)[
+                        ((size_t)block * pair_k_blocks + k_block) *
+                            16u + lane * 2u + k_lane] =
+                        weight_dtype == VX_DTYPE_I8
+                            ? (int16_t)(int8_t)raw : (int16_t)raw;
+                }
+            }
+        }
+    }
+#else
     for (uint32_t block = 0; block < pair_n_blocks; block++) {
         for (uint32_t k_block = 0; k_block < pair_k_blocks; k_block++) {
             for (uint32_t lane = 0; lane < 8u; lane++) {
@@ -221,15 +349,46 @@ int vx_pack_q8_weight(void* packed, uint32_t packed_bytes, const void* weight,
             }
         }
     }
+#endif
     header->pair_flags = pair_flags;
     return 1;
 }
 
+WASM_EXPORT("pack_q8_weight")
+int vx_pack_q8_weight(void* packed, uint32_t packed_bytes, const void* weight,
+        uint32_t d_in, uint32_t d_out, uint32_t weight_dtype,
+        uint32_t out_in) {
+    return vx_pack_q8_weight_impl(packed, packed_bytes, weight, d_in, d_out,
+        weight_dtype, out_in, 0);
+}
+
+#if VX_QGEMM_WASM_PAIR_PACK
+WASM_EXPORT("pack_q8_weight_canonical")
+int vx_pack_q8_weight_canonical(
+        void* packed, uint32_t packed_bytes, const void* weight,
+        uint32_t d_in, uint32_t d_out, uint32_t weight_dtype,
+        uint32_t out_in) {
+    return vx_pack_q8_weight_impl(packed, packed_bytes, weight, d_in, d_out,
+        weight_dtype, out_in, 1);
+}
+#endif
+
 static const VxPackedQ8Header* vx_qgemm_validate(const void* packed,
         uint32_t d_in, uint32_t d_out, uint32_t weight_dtype) {
     const VxPackedQ8Header* header = (const VxPackedQ8Header*)packed;
-    uint32_t expected = vx_packed_q8_weight_size(d_in, d_out);
-    if (!header || !expected) return NULL;
+    uint32_t expected;
+    int canonical_only = 0;
+    if (!header) return NULL;
+#if VX_QGEMM_WASM_PAIR_PACK
+    canonical_only = header->pair_n_blocks == 0u &&
+        header->pair_k_blocks == 0u && header->pair_flags == 0u;
+    expected = canonical_only
+        ? vx_qgemm_canonical_weight_size(d_in, d_out)
+        : vx_packed_q8_weight_size(d_in, d_out);
+#else
+    expected = vx_packed_q8_weight_size(d_in, d_out);
+#endif
+    if (!expected) return NULL;
     uint32_t n_blocks = (d_out - 1u) / VX_QGEMM_NR + 1u;
     uint32_t expected_sums = vx_qgemm_align16((uint32_t)sizeof(*header));
     uint32_t expected_data = vx_qgemm_align16(expected_sums +
@@ -241,6 +400,11 @@ static const VxPackedQ8Header* vx_qgemm_validate(const void* packed,
 #if VX_QGEMM_X86_AVX2
     expected_pair_n = (d_out + 7u) / 8u;
     expected_pair_k = (d_in + 3u) / 4u;
+#elif VX_QGEMM_WASM_PAIR_PACK
+    if (!canonical_only) {
+        expected_pair_n = n_blocks;
+        expected_pair_k = (d_in + 1u) / 2u;
+    }
 #endif
     if (header->magic != VX_QGEMM_MAGIC ||
         header->bytes != expected || header->d_in != d_in ||
@@ -258,8 +422,13 @@ static const VxPackedQ8Header* vx_qgemm_validate(const void* packed,
         ((header->pair_flags & VX_QGEMM_PAIR_NO_SATURATE) &&
          !(header->pair_flags & VX_QGEMM_PAIR_NO_NEG128)) ||
         (header->pair_flags && weight_dtype != VX_DTYPE_I8) ||
+#if VX_QGEMM_WASM_PAIR_PACK
+        (!canonical_only && weight_dtype == VX_DTYPE_I8 &&
+         !(header->pair_flags & VX_QGEMM_PAIR_SIGNED_I8)) ||
+#endif
         (uint64_t)expected_pair_data +
-            (uint64_t)expected_pair_n * expected_pair_k * 32u != expected)
+            (uint64_t)expected_pair_n * expected_pair_k *
+                32u != expected)
         return NULL;
     return header;
 }
@@ -269,6 +438,7 @@ static int vx_qgemm_w8a32_m1(const float* input,
         const void* zero_point, const float* bias, float* output,
         uint32_t scale_elements, uint32_t zero_point_dtype,
         uint32_t zero_point_elements) {
+    const uint32_t qgemm_kc = vx_qgemm_kc();
     const uint8_t* packed = (const uint8_t*)header + header->data_offset;
     for (uint32_t block = 0; block < header->n_blocks; block++) {
         double accum[VX_QGEMM_NR] = {0};
@@ -281,8 +451,8 @@ static int vx_qgemm_w8a32_m1(const float* input,
             zero[lane] = zero_point ? vx_qgemm_typed_value(zero_point,
                 zero_point_dtype, zero_point_elements == 1u ? 0u : column) : 0.0;
         }
-        for (uint32_t kc = 0; kc < header->d_in; kc += VX_QGEMM_KC) {
-            uint32_t kend = kc + VX_QGEMM_KC;
+        for (uint32_t kc = 0; kc < header->d_in; kc += qgemm_kc) {
+            uint32_t kend = kc + qgemm_kc;
             if (kend > header->d_in) kend = header->d_in;
             for (uint32_t k = kc; k < kend; k++) {
                 const uint8_t* weights = packed +
@@ -317,12 +487,13 @@ uint32_t vx_w8a32_wasm_simd_calls(void) {
 
 WASM_EXPORT("reset_w8a32_wasm_simd_calls")
 void vx_reset_w8a32_wasm_simd_calls(void) {
+    const uint32_t qgemm_kc = vx_qgemm_kc();
     vx_qgemm_w8a32_wasm_simd_calls = 0;
 }
 #endif
 
-/* The F32 accumulator is intentionally limited to the audited Tiny VQA
- * W8A32 envelope.  Other valid descriptors retain the scalar/double ABI. */
+/* The F32 accumulator is intentionally limited to an audited bounded W8A32
+ * numerical envelope. Other valid descriptors retain the scalar/double ABI. */
 static int vx_qgemm_w8a32_m1_wasm_simd_eligible(const float* input,
         const VxPackedQ8Header* header, const float* scale,
         uint32_t scale_elements) {
@@ -342,6 +513,7 @@ static int vx_qgemm_w8a32_m1_wasm_simd_eligible(const float* input,
 static int vx_qgemm_w8a32_m1_wasm_simd(const float* input,
         const VxPackedQ8Header* header, const float* scale,
         const float* bias, float* output, uint32_t scale_elements) {
+    const uint32_t qgemm_kc = vx_qgemm_kc();
     const uint8_t* packed = (const uint8_t*)header + header->data_offset;
     uint32_t full_blocks = header->d_out / VX_QGEMM_NR;
 #if defined(VOLVOXAI_W8A32_SIMD_TESTING)
@@ -353,8 +525,8 @@ static int vx_qgemm_w8a32_m1_wasm_simd(const float* input,
         v128_t accum_hi = wasm_f32x4_splat(0.0f);
         v128_t correction_lo = wasm_f32x4_splat(0.0f);
         v128_t correction_hi = wasm_f32x4_splat(0.0f);
-        for (uint32_t kc = 0; kc < header->d_in; kc += VX_QGEMM_KC) {
-            uint32_t kend = kc + VX_QGEMM_KC;
+        for (uint32_t kc = 0; kc < header->d_in; kc += qgemm_kc) {
+            uint32_t kend = kc + qgemm_kc;
             if (kend > header->d_in) kend = header->d_in;
             for (uint32_t k = kc; k < kend; k++) {
                 const uint8_t* weights = packed +
@@ -430,6 +602,7 @@ int vx_matmul_quantized_f32_packed(const float* input, const void* packed_weight
         float* output, uint32_t rows, uint32_t d_in, uint32_t d_out,
         uint32_t weight_dtype, uint32_t scale_elements,
         uint32_t zero_point_dtype, uint32_t zero_point_elements) {
+    const uint32_t qgemm_kc = vx_qgemm_kc();
     const VxPackedQ8Header* header = vx_qgemm_validate(
         packed_weight, d_in, d_out, weight_dtype);
     size_t input_elements = rows;
@@ -485,8 +658,8 @@ int vx_matmul_quantized_f32_packed(const float* input, const void* packed_weight
                 uint32_t mr = rows - row_base;
                 double accum[VX_QGEMM_MR][VX_QGEMM_NR] = {{0}};
                 if (mr > VX_QGEMM_MR) mr = VX_QGEMM_MR;
-                for (uint32_t kc = 0; kc < d_in; kc += VX_QGEMM_KC) {
-                    uint32_t kend = kc + VX_QGEMM_KC;
+                for (uint32_t kc = 0; kc < d_in; kc += qgemm_kc) {
+                    uint32_t kend = kc + qgemm_kc;
                     if (kend > d_in) kend = d_in;
                     for (uint32_t k = kc; k < kend; k++) {
                         const uint8_t* weights = packed +
@@ -573,6 +746,7 @@ void vx_reset_w8a8_wasm_simd_calls(void) {
 
 WASM_EXPORT("w8a8_wasm_symmetric_i8_calls")
 uint32_t vx_w8a8_wasm_symmetric_i8_calls(void) {
+    const uint32_t qgemm_kc = vx_qgemm_kc();
     return vx_qgemm_w8a8_wasm_symmetric_i8_calls;
 }
 #endif
@@ -607,16 +781,104 @@ static v128_t vx_qgemm_w8a8_wasm_requantize(v128_t accum,
 /* The materialized W8A8 model uses symmetric I8 tensors throughout its dense
  * islands.  Keep that common case separate so the K loop does not reload and
  * subtract eight zero weight zero-points for every two input elements. */
+/* Activation panel for the hoisted pair-pack, in i16-pair u32 layout.
+ *
+ * `wasm_i32x4_dot_i16x8` wants two activations side by side as i16 lanes, which
+ * the byte input does not provide. Rebuilding that pair inside the innermost
+ * loop costs six scalar ops per sixteen MACs, and because the d_out block loop
+ * sits outside, every activation pair is rebuilt d_out/8 times -- 160 times for
+ * a 1280-wide FFN. Packing each panel once and swapping the block loop inside
+ * row_base leaves a single v128.load32_splat there instead.
+ *
+ * The WASM build is single-threaded (vx_kernels_parallel_for runs its range
+ * inline), so one module-scope panel is safe. Panels wider than this fall back
+ * to the original loop rather than growing the buffer. */
+enum { VX_QGEMM_WASM_PANEL_MAX_PAIRS = 4096u };
+static uint32_t vx_qgemm_wasm_panel[VX_QGEMM_WASM_MR *
+                                    VX_QGEMM_WASM_PANEL_MAX_PAIRS];
+
 static int vx_qgemm_w8a8_wasm_symmetric_i8(const int8_t* input,
         const VxPackedQ8Header* header, const int32_t* bias,
         const float* weight_scales, int8_t* output, uint32_t rows,
         float input_scale, float output_scale) {
-    const uint8_t* weights_base = (const uint8_t*)header + header->data_offset;
+    const uint8_t* pair_weights =
+        (const uint8_t*)header + header->pair_data_offset;
     const uint32_t full_blocks = header->d_out / VX_QGEMM_NR;
+    const uint32_t panel_pairs = header->pair_k_blocks;
 #if defined(VOLVOXAI_W8A8_SIMD_TESTING)
     vx_qgemm_w8a8_wasm_simd_calls++;
     vx_qgemm_w8a8_wasm_symmetric_i8_calls++;
 #endif
+    if (panel_pairs <= VX_QGEMM_WASM_PANEL_MAX_PAIRS) {
+        for (uint32_t row_base = 0; row_base < rows;
+             row_base += VX_QGEMM_WASM_MR) {
+            uint32_t mr = rows - row_base;
+            if (mr > VX_QGEMM_WASM_MR) mr = VX_QGEMM_WASM_MR;
+            /* One scalar pass over this panel's activations, reused by every
+             * output block below. Rows are adjacent within a pair so the inner
+             * loop can splat straight out of the panel. */
+            for (uint32_t row = 0; row < mr; row++) {
+                const int8_t* source = input +
+                    (size_t)(row_base + row) * header->d_in;
+                for (uint32_t pair = 0; pair < panel_pairs; pair++) {
+                    const int32_t x0 = source[pair * 2u];
+                    const int32_t x1 = pair * 2u + 1u < header->d_in
+                        ? source[pair * 2u + 1u] : 0;
+                    vx_qgemm_wasm_panel[(size_t)pair * VX_QGEMM_WASM_MR + row] =
+                        (uint16_t)(int16_t)x0 |
+                        ((uint32_t)(uint16_t)(int16_t)x1 << 16u);
+                }
+            }
+            for (uint32_t block = 0; block < full_blocks; block++) {
+                const uint32_t base = block * VX_QGEMM_NR;
+                const v128_t bias_lo = wasm_v128_load(bias + base);
+                const v128_t bias_hi = wasm_v128_load(bias + base + 4u);
+                const v128_t multiplier_lo = wasm_f32x4_div(wasm_f32x4_mul(
+                    wasm_f32x4_splat(input_scale),
+                    wasm_v128_load(weight_scales + base)),
+                    wasm_f32x4_splat(output_scale));
+                const v128_t multiplier_hi = wasm_f32x4_div(wasm_f32x4_mul(
+                    wasm_f32x4_splat(input_scale),
+                    wasm_v128_load(weight_scales + base + 4u)),
+                    wasm_f32x4_splat(output_scale));
+                v128_t accum_lo[VX_QGEMM_WASM_MR];
+                v128_t accum_hi[VX_QGEMM_WASM_MR];
+                for (uint32_t row = 0; row < mr; row++) {
+                    accum_lo[row] = bias_lo;
+                    accum_hi[row] = bias_hi;
+                }
+                for (uint32_t pair = 0; pair < panel_pairs; pair++) {
+                    const uint8_t* packed = pair_weights +
+                        ((size_t)block * panel_pairs + pair) * 32u;
+                    const v128_t w_lo = wasm_v128_load(packed);
+                    const v128_t w_hi = wasm_v128_load(packed + 16u);
+                    const uint32_t* pairs = vx_qgemm_wasm_panel +
+                        (size_t)pair * VX_QGEMM_WASM_MR;
+                    for (uint32_t row = 0; row < mr; row++) {
+                        const v128_t x = wasm_v128_load32_splat(pairs + row);
+                        accum_lo[row] = wasm_i32x4_add(accum_lo[row],
+                            wasm_i32x4_dot_i16x8(x, w_lo));
+                        accum_hi[row] = wasm_i32x4_add(accum_hi[row],
+                            wasm_i32x4_dot_i16x8(x, w_hi));
+                    }
+                }
+                for (uint32_t row = 0; row < mr; row++) {
+                    const v128_t quantized_lo = vx_qgemm_w8a8_wasm_requantize(
+                        accum_lo[row], multiplier_lo, 0, -128, 127);
+                    const v128_t quantized_hi = vx_qgemm_w8a8_wasm_requantize(
+                        accum_hi[row], multiplier_hi, 0, -128, 127);
+                    const v128_t quantized16 = wasm_i16x8_narrow_i32x4(
+                        quantized_lo, quantized_hi);
+                    const v128_t quantized8 = wasm_i8x16_narrow_i16x8(
+                        quantized16, quantized16);
+                    wasm_v128_store64_lane(output +
+                        (size_t)(row_base + row) * header->d_out + base,
+                        quantized8, 0);
+                }
+            }
+        }
+        return 1;
+    }
     for (uint32_t block = 0; block < full_blocks; block++) {
         const uint32_t base = block * VX_QGEMM_NR;
         const v128_t bias_lo = wasm_v128_load(bias + base);
@@ -639,52 +901,25 @@ static int vx_qgemm_w8a8_wasm_symmetric_i8(const int8_t* input,
                 accum_lo[row] = bias_lo;
                 accum_hi[row] = bias_hi;
             }
-            for (uint32_t kc = 0; kc < header->d_in; kc += VX_QGEMM_KC) {
-                uint32_t kend = kc + VX_QGEMM_KC;
-                uint32_t dimension = kc;
-                if (kend > header->d_in) kend = header->d_in;
-                for (; dimension + 1u < kend; dimension += 2u) {
-                    const uint8_t* packed = weights_base +
-                        ((size_t)block * header->d_in + dimension) *
-                        VX_QGEMM_NR;
-                    const v128_t bytes = wasm_v128_load(packed);
-                    const v128_t first = wasm_i16x8_extend_low_i8x16(bytes);
-                    const v128_t second = wasm_i16x8_extend_high_i8x16(bytes);
-                    const v128_t w_lo = wasm_i16x8_shuffle(
-                        first, second, 0, 8, 1, 9, 2, 10, 3, 11);
-                    const v128_t w_hi = wasm_i16x8_shuffle(
-                        first, second, 4, 12, 5, 13, 6, 14, 7, 15);
-                    for (uint32_t row = 0; row < mr; row++) {
-                        const size_t index = (size_t)(row_base + row) *
-                            header->d_in + dimension;
-                        const int32_t x0 = input[index];
-                        const int32_t x1 = input[index + 1u];
-                        const uint32_t pair = (uint16_t)(int16_t)x0 |
-                            ((uint32_t)(uint16_t)(int16_t)x1 << 16u);
-                        const v128_t x = wasm_i32x4_splat((int32_t)pair);
-                        accum_lo[row] = wasm_i32x4_add(accum_lo[row],
-                            wasm_i32x4_dot_i16x8(x, w_lo));
-                        accum_hi[row] = wasm_i32x4_add(accum_hi[row],
-                            wasm_i32x4_dot_i16x8(x, w_hi));
-                    }
-                }
-                if (dimension < kend) {
-                    const uint8_t* packed = weights_base +
-                        ((size_t)block * header->d_in + dimension) *
-                        VX_QGEMM_NR;
-                    const v128_t w16 = wasm_i16x8_extend_low_i8x16(
-                        wasm_v128_load64_zero(packed));
-                    const v128_t w_lo = wasm_i32x4_extend_low_i16x8(w16);
-                    const v128_t w_hi = wasm_i32x4_extend_high_i16x8(w16);
-                    for (uint32_t row = 0; row < mr; row++) {
-                        const size_t index = (size_t)(row_base + row) *
-                            header->d_in + dimension;
-                        const v128_t x = wasm_i32x4_splat(input[index]);
-                        accum_lo[row] = wasm_i32x4_add(accum_lo[row],
-                            wasm_i32x4_mul(x, w_lo));
-                        accum_hi[row] = wasm_i32x4_add(accum_hi[row],
-                            wasm_i32x4_mul(x, w_hi));
-                    }
+            for (uint32_t pair_index = 0;
+                 pair_index < panel_pairs; pair_index++) {
+                const uint8_t* packed = pair_weights +
+                    ((size_t)block * panel_pairs + pair_index) * 32u;
+                const v128_t w_lo = wasm_v128_load(packed);
+                const v128_t w_hi = wasm_v128_load(packed + 16u);
+                for (uint32_t row = 0; row < mr; row++) {
+                    const size_t index = (size_t)(row_base + row) *
+                        header->d_in + pair_index * 2u;
+                    const int32_t x0 = input[index];
+                    const int32_t x1 = pair_index * 2u + 1u < header->d_in
+                        ? input[index + 1u] : 0;
+                    const uint32_t pair = (uint16_t)(int16_t)x0 |
+                        ((uint32_t)(uint16_t)(int16_t)x1 << 16u);
+                    const v128_t x = wasm_i32x4_splat((int32_t)pair);
+                    accum_lo[row] = wasm_i32x4_add(accum_lo[row],
+                        wasm_i32x4_dot_i16x8(x, w_lo));
+                    accum_hi[row] = wasm_i32x4_add(accum_hi[row],
+                        wasm_i32x4_dot_i16x8(x, w_hi));
                 }
             }
             for (uint32_t row = 0; row < mr; row++) {
@@ -705,6 +940,122 @@ static int vx_qgemm_w8a8_wasm_symmetric_i8(const int8_t* input,
     return 1;
 }
 
+/* QConv2D keeps symmetric I8 weights but ordinarily has affine U8
+ * activations and outputs.  The generic SIMD spelling rebuilds each raw
+ * activation pair once per N8 block and also subtracts a vector of zero
+ * weight zero-points inside the K loop.  For a proved-zero I8 weight zero
+ * point, pack each MR panel once just like the fully symmetric dense path and
+ * fold the activation zero point into the initial accumulator:
+ *
+ *   sum((x-xz)w) = sum(xw) - xz*sum(w).
+ *
+ * Raw U8 values fit exactly in I16, so wasm_i32x4_dot_i16x8 retains the
+ * canonical I32 accumulation and requantization boundaries. */
+static int vx_qgemm_w8a8_wasm_symmetric_i8_affine_panel(
+        const void* input, const VxPackedQ8Header* header,
+        const int32_t* bias, const float* weight_scales, void* output,
+        uint32_t rows, float input_scale, int32_t input_zero_point,
+        float output_scale, int32_t output_zero_point,
+        uint32_t input_dtype, uint32_t output_dtype) {
+    const uint32_t panel_pairs = header->pair_k_blocks;
+    const uint32_t full_blocks = header->d_out / VX_QGEMM_NR;
+    const uint8_t* pair_weights =
+        (const uint8_t*)header + header->pair_data_offset;
+    const int32_t* raw_sums = (const int32_t*)((const uint8_t*)header +
+        header->sums_offset);
+    const int32_t output_minimum =
+        output_dtype == VX_DTYPE_I8 ? -128 : 0;
+    const int32_t output_maximum =
+        output_dtype == VX_DTYPE_I8 ? 127 : 255;
+    if (panel_pairs > VX_QGEMM_WASM_PANEL_MAX_PAIRS ||
+        header->d_out % VX_QGEMM_NR) return 0;
+#if defined(VOLVOXAI_W8A8_SIMD_TESTING)
+    vx_qgemm_w8a8_wasm_simd_calls++;
+#endif
+    for (uint32_t row_base = 0; row_base < rows;
+         row_base += VX_QGEMM_WASM_MR) {
+        uint32_t mr = rows - row_base;
+        if (mr > VX_QGEMM_WASM_MR) mr = VX_QGEMM_WASM_MR;
+        for (uint32_t row = 0; row < mr; row++) {
+            const size_t source_base =
+                (size_t)(row_base + row) * header->d_in;
+            for (uint32_t pair = 0; pair < panel_pairs; pair++) {
+                const size_t index = source_base + pair * 2u;
+                const int32_t x0 = input_dtype == VX_DTYPE_I8
+                    ? ((const int8_t*)input)[index]
+                    : ((const uint8_t*)input)[index];
+                const int32_t x1 = pair * 2u + 1u < header->d_in
+                    ? (input_dtype == VX_DTYPE_I8
+                        ? ((const int8_t*)input)[index + 1u]
+                        : ((const uint8_t*)input)[index + 1u])
+                    : 0;
+                vx_qgemm_wasm_panel[(size_t)pair * VX_QGEMM_WASM_MR + row] =
+                    (uint16_t)(int16_t)x0 |
+                    ((uint32_t)(uint16_t)(int16_t)x1 << 16u);
+            }
+        }
+        for (uint32_t block = 0; block < full_blocks; block++) {
+            const uint32_t base = block * VX_QGEMM_NR;
+            const v128_t negative_input_zero =
+                wasm_i32x4_splat(-input_zero_point);
+            const v128_t initial_lo = wasm_i32x4_add(
+                wasm_v128_load(bias + base), wasm_i32x4_mul(
+                    negative_input_zero, wasm_v128_load(raw_sums + base)));
+            const v128_t initial_hi = wasm_i32x4_add(
+                wasm_v128_load(bias + base + 4u), wasm_i32x4_mul(
+                    negative_input_zero,
+                    wasm_v128_load(raw_sums + base + 4u)));
+            const v128_t multiplier_lo = wasm_f32x4_div(wasm_f32x4_mul(
+                wasm_f32x4_splat(input_scale),
+                wasm_v128_load(weight_scales + base)),
+                wasm_f32x4_splat(output_scale));
+            const v128_t multiplier_hi = wasm_f32x4_div(wasm_f32x4_mul(
+                wasm_f32x4_splat(input_scale),
+                wasm_v128_load(weight_scales + base + 4u)),
+                wasm_f32x4_splat(output_scale));
+            v128_t accum_lo[VX_QGEMM_WASM_MR];
+            v128_t accum_hi[VX_QGEMM_WASM_MR];
+            for (uint32_t row = 0; row < mr; row++) {
+                accum_lo[row] = initial_lo;
+                accum_hi[row] = initial_hi;
+            }
+            for (uint32_t pair = 0; pair < panel_pairs; pair++) {
+                const uint8_t* packed = pair_weights +
+                    ((size_t)block * panel_pairs + pair) * 32u;
+                const v128_t w_lo = wasm_v128_load(packed);
+                const v128_t w_hi = wasm_v128_load(packed + 16u);
+                const uint32_t* pairs = vx_qgemm_wasm_panel +
+                    (size_t)pair * VX_QGEMM_WASM_MR;
+                for (uint32_t row = 0; row < mr; row++) {
+                    const v128_t x =
+                        wasm_v128_load32_splat(pairs + row);
+                    accum_lo[row] = wasm_i32x4_add(accum_lo[row],
+                        wasm_i32x4_dot_i16x8(x, w_lo));
+                    accum_hi[row] = wasm_i32x4_add(accum_hi[row],
+                        wasm_i32x4_dot_i16x8(x, w_hi));
+                }
+            }
+            for (uint32_t row = 0; row < mr; row++) {
+                const v128_t quantized_lo = vx_qgemm_w8a8_wasm_requantize(
+                    accum_lo[row], multiplier_lo, output_zero_point,
+                    output_minimum, output_maximum);
+                const v128_t quantized_hi = vx_qgemm_w8a8_wasm_requantize(
+                    accum_hi[row], multiplier_hi, output_zero_point,
+                    output_minimum, output_maximum);
+                const v128_t quantized16 = wasm_i16x8_narrow_i32x4(
+                    quantized_lo, quantized_hi);
+                const v128_t quantized8 = output_dtype == VX_DTYPE_I8
+                    ? wasm_i8x16_narrow_i16x8(quantized16, quantized16)
+                    : wasm_u8x16_narrow_i16x8(quantized16, quantized16);
+                wasm_v128_store64_lane((uint8_t*)output +
+                    (size_t)(row_base + row) * header->d_out + base,
+                    quantized8, 0);
+            }
+        }
+    }
+    return 1;
+}
+
 static int vx_qgemm_w8a8_wasm_simd(const void* input,
         const VxPackedQ8Header* header, const int32_t* bias,
         const float* weight_scales, const int32_t* weight_zero_points,
@@ -713,6 +1064,8 @@ static int vx_qgemm_w8a8_wasm_simd(const void* input,
         int32_t output_zero_point, uint32_t input_dtype,
         uint32_t output_dtype) {
     const uint8_t* weights_base = (const uint8_t*)header + header->data_offset;
+    const uint8_t* pair_weights =
+        (const uint8_t*)header + header->pair_data_offset;
     const int32_t* raw_sums = (const int32_t*)((const uint8_t*)header +
         header->sums_offset);
     const int32_t output_minimum =
@@ -758,65 +1111,33 @@ static int vx_qgemm_w8a8_wasm_simd(const void* input,
                 accum_lo[row] = wasm_i32x4_add(wasm_v128_load(bias + base), correction_lo);
                 accum_hi[row] = wasm_i32x4_add(wasm_v128_load(bias + base + 4u), correction_hi);
             }
-            for (uint32_t kc = 0; kc < header->d_in; kc += VX_QGEMM_KC) {
-                uint32_t kend = kc + VX_QGEMM_KC;
-                if (kend > header->d_in) kend = header->d_in;
-                uint32_t dimension = kc;
-                for (; dimension + 1u < kend; dimension += 2u) {
-                    const uint8_t* packed = weights_base +
-                        ((size_t)block * header->d_in + dimension) * VX_QGEMM_NR;
-                    v128_t bytes = wasm_v128_load(packed);
-                    v128_t first = header->weight_dtype == VX_DTYPE_I8
-                        ? wasm_i16x8_extend_low_i8x16(bytes)
-                        : wasm_u16x8_extend_low_u8x16(bytes);
-                    v128_t second = header->weight_dtype == VX_DTYPE_I8
-                        ? wasm_i16x8_extend_high_i8x16(bytes)
-                        : wasm_u16x8_extend_high_u8x16(bytes);
-                    v128_t w_lo = wasm_i16x8_sub(wasm_i16x8_shuffle(
-                        first, second, 0, 8, 1, 9, 2, 10, 3, 11), zp_pair_lo);
-                    v128_t w_hi = wasm_i16x8_sub(wasm_i16x8_shuffle(
-                        first, second, 4, 12, 5, 13, 6, 14, 7, 15), zp_pair_hi);
-                    for (uint32_t row = 0; row < mr; row++) {
-                        size_t index = (size_t)(row_base + row) *
-                            header->d_in + dimension;
-                        int32_t x0 = input_dtype == VX_DTYPE_I8
-                            ? ((const int8_t*)input)[index]
-                            : ((const uint8_t*)input)[index];
-                        int32_t x1 = input_dtype == VX_DTYPE_I8
+            for (uint32_t pair_index = 0;
+                 pair_index < header->pair_k_blocks; pair_index++) {
+                const uint8_t* packed = pair_weights +
+                    ((size_t)block * header->pair_k_blocks + pair_index) *
+                    32u;
+                v128_t w_lo = wasm_i16x8_sub(
+                    wasm_v128_load(packed), zp_pair_lo);
+                v128_t w_hi = wasm_i16x8_sub(
+                    wasm_v128_load(packed + 16u), zp_pair_hi);
+                for (uint32_t row = 0; row < mr; row++) {
+                    size_t index = (size_t)(row_base + row) *
+                        header->d_in + pair_index * 2u;
+                    int32_t x0 = input_dtype == VX_DTYPE_I8
+                        ? ((const int8_t*)input)[index]
+                        : ((const uint8_t*)input)[index];
+                    int32_t x1 = pair_index * 2u + 1u < header->d_in
+                        ? (input_dtype == VX_DTYPE_I8
                             ? ((const int8_t*)input)[index + 1u]
-                            : ((const uint8_t*)input)[index + 1u];
-                        uint32_t pair = (uint16_t)(int16_t)x0 |
-                            ((uint32_t)(uint16_t)(int16_t)x1 << 16u);
-                        v128_t x = wasm_i32x4_splat((int32_t)pair);
-                        accum_lo[row] = wasm_i32x4_add(accum_lo[row],
-                            wasm_i32x4_dot_i16x8(x, w_lo));
-                        accum_hi[row] = wasm_i32x4_add(accum_hi[row],
-                            wasm_i32x4_dot_i16x8(x, w_hi));
-                    }
-                }
-                if (dimension < kend) {
-                    const uint8_t* packed = weights_base +
-                        ((size_t)block * header->d_in + dimension) * VX_QGEMM_NR;
-                    v128_t bytes = wasm_v128_load64_zero(packed);
-                    v128_t w16 = header->weight_dtype == VX_DTYPE_I8
-                        ? wasm_i16x8_extend_low_i8x16(bytes)
-                        : wasm_u16x8_extend_low_u8x16(bytes);
-                    v128_t w_lo = wasm_i32x4_sub(
-                        wasm_i32x4_extend_low_i16x8(w16), zp_lo);
-                    v128_t w_hi = wasm_i32x4_sub(
-                        wasm_i32x4_extend_high_i16x8(w16), zp_hi);
-                    for (uint32_t row = 0; row < mr; row++) {
-                        size_t index = (size_t)(row_base + row) *
-                            header->d_in + dimension;
-                        int32_t raw_input = input_dtype == VX_DTYPE_I8
-                            ? ((const int8_t*)input)[index]
-                            : ((const uint8_t*)input)[index];
-                        v128_t x = wasm_i32x4_splat(raw_input);
-                        accum_lo[row] = wasm_i32x4_add(accum_lo[row],
-                            wasm_i32x4_mul(x, w_lo));
-                        accum_hi[row] = wasm_i32x4_add(accum_hi[row],
-                            wasm_i32x4_mul(x, w_hi));
-                    }
+                            : ((const uint8_t*)input)[index + 1u])
+                        : 0;
+                    uint32_t pair = (uint16_t)(int16_t)x0 |
+                        ((uint32_t)(uint16_t)(int16_t)x1 << 16u);
+                    v128_t x = wasm_i32x4_splat((int32_t)pair);
+                    accum_lo[row] = wasm_i32x4_add(accum_lo[row],
+                        wasm_i32x4_dot_i16x8(x, w_lo));
+                    accum_hi[row] = wasm_i32x4_add(accum_hi[row],
+                        wasm_i32x4_dot_i16x8(x, w_hi));
                 }
             }
             for (uint32_t row = 0; row < mr; row++) {
@@ -904,6 +1225,7 @@ typedef struct {
 static VX_QGEMM_TARGET_AVX2 void vx_qgemm_w8a8_avx2_range(
         const VxQGemmW8A8Avx2Call* call,
         uint32_t block_begin, uint32_t block_end) {
+    const uint32_t qgemm_kc = vx_qgemm_kc();
     const VxPackedQ8Header* header = call->header;
     const uint8_t* weights_base = (const uint8_t*)header + header->data_offset;
     const int32_t* raw_sums = (const int32_t*)((const uint8_t*)header +
@@ -941,8 +1263,8 @@ static VX_QGEMM_TARGET_AVX2 void vx_qgemm_w8a8_avx2_range(
             int32_t input_sums[VX_QGEMM_MR] = {0};
             if (mr > VX_QGEMM_MR) mr = VX_QGEMM_MR;
             for (uint32_t row = 0; row < mr; row++) accum[row] = initial;
-            for (uint32_t kc = 0; kc < header->d_in; kc += VX_QGEMM_KC) {
-                uint32_t kend = kc + VX_QGEMM_KC;
+            for (uint32_t kc = 0; kc < header->d_in; kc += qgemm_kc) {
+                uint32_t kend = kc + qgemm_kc;
                 uint32_t k = kc;
                 if (kend > header->d_in) kend = header->d_in;
                 for (; k + 1u < kend; k += 2u) {
@@ -1229,6 +1551,161 @@ static VX_QGEMM_TARGET_AVX2 void vx_qgemm_w8a8_avx2_pair_range_nosat(
     }
 }
 
+/* AVX2 targets have enough vector registers for four N8 panels and
+ * two activation rows at once.  The ordinary N16/M4 loop is balanced for the
+ * general affine path, but the common signed-absolute path then rebuilds each
+ * activation's magnitude once per N16 group.  N32/M2 keeps the same eight
+ * independent I32 accumulators while sharing that work across twice as many
+ * output channels.  Restrict this spelling to the single-threaded route: N16
+ * exposes twice as many independent channel tasks to the pool. */
+/* --- N32 pair kernel instantiations -------------------------------------- */
+#define VX_PN32_TARGET            VX_QGEMM_TARGET_AVX2
+#define VX_PN32_NAME              vx_qgemm_w8a8_avx2_pair_signed_n32_body
+#define VX_PN32_ALLOW_SIGNED_ABS  1
+#define VX_PN32_DOT_SIGNED_ABS(A0, A1, A2, A3) do { \
+        const __m256i vx_magnitudes = _mm256_abs_epi8(vx_inputs); \
+        (A0) = _mm256_add_epi32((A0), _mm256_madd_epi16( \
+            _mm256_maddubs_epi16(vx_magnitudes, \
+                _mm256_sign_epi8(weights0, vx_inputs)), ones16)); \
+        (A1) = _mm256_add_epi32((A1), _mm256_madd_epi16( \
+            _mm256_maddubs_epi16(vx_magnitudes, \
+                _mm256_sign_epi8(weights1, vx_inputs)), ones16)); \
+        (A2) = _mm256_add_epi32((A2), _mm256_madd_epi16( \
+            _mm256_maddubs_epi16(vx_magnitudes, \
+                _mm256_sign_epi8(weights2, vx_inputs)), ones16)); \
+        (A3) = _mm256_add_epi32((A3), _mm256_madd_epi16( \
+            _mm256_maddubs_epi16(vx_magnitudes, \
+                _mm256_sign_epi8(weights3, vx_inputs)), ones16)); \
+    } while (0)
+#define VX_PN32_DOT_PLAIN(A0, A1, A2, A3) do { \
+        (A0) = _mm256_add_epi32((A0), _mm256_madd_epi16( \
+            _mm256_maddubs_epi16(vx_inputs, weights0), ones16)); \
+        (A1) = _mm256_add_epi32((A1), _mm256_madd_epi16( \
+            _mm256_maddubs_epi16(vx_inputs, weights1), ones16)); \
+        (A2) = _mm256_add_epi32((A2), _mm256_madd_epi16( \
+            _mm256_maddubs_epi16(vx_inputs, weights2), ones16)); \
+        (A3) = _mm256_add_epi32((A3), _mm256_madd_epi16( \
+            _mm256_maddubs_epi16(vx_inputs, weights3), ones16)); \
+    } while (0)
+#include "qgemm_pair_n32_kernel.inc"
+#undef VX_PN32_TARGET
+#undef VX_PN32_NAME
+#undef VX_PN32_ALLOW_SIGNED_ABS
+#undef VX_PN32_DOT_SIGNED_ABS
+#undef VX_PN32_DOT_PLAIN
+
+/* VPDPBUSD cannot saturate, so these tiers never need the signed-absolute
+ * spelling and the compiler drops it. */
+#define VX_PN32_TARGET            VX_QGEMM_TARGET_AVXVNNI
+#define VX_PN32_NAME              vx_qgemm_w8a8_avxvnni_pair_signed_n32_body
+#define VX_PN32_ALLOW_SIGNED_ABS  0
+#define VX_PN32_DOT_SIGNED_ABS(A0, A1, A2, A3) do { (void)ones16; } while (0)
+#define VX_PN32_DOT_PLAIN(A0, A1, A2, A3) do { \
+        (A0) = _mm256_dpbusd_avx_epi32((A0), vx_inputs, weights0); \
+        (A1) = _mm256_dpbusd_avx_epi32((A1), vx_inputs, weights1); \
+        (A2) = _mm256_dpbusd_avx_epi32((A2), vx_inputs, weights2); \
+        (A3) = _mm256_dpbusd_avx_epi32((A3), vx_inputs, weights3); \
+    } while (0)
+#include "qgemm_pair_n32_kernel.inc"
+#undef VX_PN32_TARGET
+#undef VX_PN32_NAME
+#undef VX_PN32_ALLOW_SIGNED_ABS
+#undef VX_PN32_DOT_SIGNED_ABS
+#undef VX_PN32_DOT_PLAIN
+
+#define VX_PN32_TARGET            VX_QGEMM_TARGET_AVX512VNNI
+#define VX_PN32_NAME              vx_qgemm_w8a8_avx512vnni_pair_signed_n32_body
+#define VX_PN32_ALLOW_SIGNED_ABS  0
+#define VX_PN32_DOT_SIGNED_ABS(A0, A1, A2, A3) do { (void)ones16; } while (0)
+#define VX_PN32_DOT_PLAIN(A0, A1, A2, A3) do { \
+        (A0) = _mm256_dpbusd_epi32((A0), vx_inputs, weights0); \
+        (A1) = _mm256_dpbusd_epi32((A1), vx_inputs, weights1); \
+        (A2) = _mm256_dpbusd_epi32((A2), vx_inputs, weights2); \
+        (A3) = _mm256_dpbusd_epi32((A3), vx_inputs, weights3); \
+    } while (0)
+#include "qgemm_pair_n32_kernel.inc"
+#undef VX_PN32_TARGET
+#undef VX_PN32_NAME
+#undef VX_PN32_ALLOW_SIGNED_ABS
+#undef VX_PN32_DOT_SIGNED_ABS
+#undef VX_PN32_DOT_PLAIN
+
+/* The activation remap is one general-purpose XOR per broadcast operand, and it
+ * sits on the dependency chain feeding every PMADDUBSW.  Passing the mask as a
+ * literal lets an already-remapped tensor compile to a plain broadcast from
+ * memory: the scalar load, the GPR xor and the GPR-to-XMM transfer all fold
+ * away.  The two instantiations are otherwise identical, so the only cost is
+ * code size. */
+/* One dispatch macro so the four (spelling x activation domain) combinations
+ * stay literal at every tier; passing either as a runtime value stops the
+ * remap and the dead spelling from folding away. */
+#define VX_PN32_DISPATCH(BODY) do { \
+        if (use_signed_abs) { \
+            if (call->input_dtype == VX_DTYPE_U8) \
+                BODY(call, group_begin, group_end, 0x80808080u, 1); \
+            else \
+                BODY(call, group_begin, group_end, 0u, 1); \
+        } else { \
+            if (call->input_dtype == VX_DTYPE_I8) \
+                BODY(call, group_begin, group_end, 0x80808080u, 0); \
+            else \
+                BODY(call, group_begin, group_end, 0u, 0); \
+        } \
+    } while (0)
+
+static VX_QGEMM_TARGET_AVX2 void vx_qgemm_w8a8_avx2_pair_signed_n32_avx2(
+        const VxQGemmW8A8Avx2Call* call,
+        uint32_t group_begin, uint32_t group_end, int use_signed_abs) {
+    VX_PN32_DISPATCH(vx_qgemm_w8a8_avx2_pair_signed_n32_body);
+}
+
+static VX_QGEMM_TARGET_AVXVNNI void vx_qgemm_w8a8_avx2_pair_signed_n32_avxvnni(
+        const VxQGemmW8A8Avx2Call* call,
+        uint32_t group_begin, uint32_t group_end, int use_signed_abs) {
+    (void)use_signed_abs;
+    use_signed_abs = 0;
+    VX_PN32_DISPATCH(vx_qgemm_w8a8_avxvnni_pair_signed_n32_body);
+}
+
+static VX_QGEMM_TARGET_AVX512VNNI void
+vx_qgemm_w8a8_avx2_pair_signed_n32_avx512vnni(
+        const VxQGemmW8A8Avx2Call* call,
+        uint32_t group_begin, uint32_t group_end, int use_signed_abs) {
+    (void)use_signed_abs;
+    use_signed_abs = 0;
+    VX_PN32_DISPATCH(vx_qgemm_w8a8_avx512vnni_pair_signed_n32_body);
+}
+
+static int vx_qgemm_w8a8_n32_uses_vnni(void) {
+    const VxKernelPlatform* platform = vx_kernel_platform();
+    return platform->has_avx_vnni || platform->has_avx512_vnni;
+}
+
+/* VPDPBUSD accumulates into I32, so a VNNI tier is both faster and free of the
+ * saturation question: it needs neither the proved weight bound nor the
+ * magnitude/sign fallback.  Select it through the resolved platform so the
+ * VOLVOXAI_CPU_ISA ceiling remains authoritative for tests and deployments.
+ * The VEX form is preferred where present because it avoids the frequency
+ * behaviour of EVEX-encoded 512-bit state on some parts; the EVEX form covers
+ * Ice Lake and Tiger Lake, which have AVX-512-VNNI but no AVX-VNNI. */
+static VX_QGEMM_TARGET_AVX2 void vx_qgemm_w8a8_avx2_pair_signed_n32_range(
+        const VxQGemmW8A8Avx2Call* call,
+        uint32_t group_begin, uint32_t group_end, int use_signed_abs) {
+    const VxKernelPlatform* platform = vx_kernel_platform();
+    if (platform->has_avx_vnni) {
+        vx_qgemm_w8a8_avx2_pair_signed_n32_avxvnni(
+            call, group_begin, group_end, use_signed_abs);
+        return;
+    }
+    if (platform->has_avx512_vnni) {
+        vx_qgemm_w8a8_avx2_pair_signed_n32_avx512vnni(
+            call, group_begin, group_end, use_signed_abs);
+        return;
+    }
+    vx_qgemm_w8a8_avx2_pair_signed_n32_avx2(
+        call, group_begin, group_end, use_signed_abs);
+}
+
 static VX_QGEMM_TARGET_AVX2 void vx_qgemm_w8a8_avx2_pair_range(
         const VxQGemmW8A8Avx2Call* call,
         uint32_t group_begin, uint32_t group_end) {
@@ -1492,7 +1969,24 @@ static int vx_qgemm_w8a8_avx2(
         /* Choose the accumulation form once, outside every loop. */
         const int no_saturate =
             (header->pair_flags & VX_QGEMM_PAIR_NO_SATURATE) != 0u;
-        if (threads > 1 && full_groups > 1u &&
+        const int signed_absolute =
+            (header->pair_flags & VX_QGEMM_PAIR_NO_NEG128) != 0u;
+        const int n32_vnni = vx_qgemm_w8a8_n32_uses_vnni();
+        if (threads == 1 && (n32_vnni || signed_absolute) &&
+            full_blocks >= 4u) {
+            const uint32_t n32_groups = full_blocks / 4u;
+            const uint32_t n16_begin = n32_groups * 2u;
+            vx_qgemm_w8a8_avx2_pair_signed_n32_range(
+                &call, 0u, n32_groups, signed_absolute && !no_saturate);
+            if (n16_begin < full_groups) {
+                if (no_saturate)
+                    vx_qgemm_w8a8_avx2_pair_range_nosat(
+                        &call, n16_begin, full_groups);
+                else
+                    vx_qgemm_w8a8_avx2_pair_range(
+                        &call, n16_begin, full_groups);
+            }
+        } else if (threads > 1 && full_groups > 1u &&
             products >= VX_QGEMM_AVX2_PARALLEL_PRODUCTS) {
             uint32_t grain =
                 (full_groups + (uint32_t)threads * 4u - 1u) /
@@ -1562,6 +2056,36 @@ static int vx_qgemm_w8a8_avx2(
 }
 #endif
 
+/* Which activation domain the proved spelling wants, for callers that are
+ * already writing the activation buffer and can hand it over in that domain for
+ * free -- today the QConv im2col.  Returning 1 means the signed-absolute
+ * spelling will run and wants bytes remapped to the signed domain; 0 means the
+ * plain spelling will run and wants them left unsigned.  Keep this beside the
+ * dispatcher below: the two encode the same decision. */
+#if VX_QGEMM_X86_AVX2
+int vx_packed_q8_prefers_signed_activations(const void* packed_weight,
+        const int32_t* weight_zero_points, uint32_t output_channels) {
+    const VxPackedQ8Header* header = (const VxPackedQ8Header*)packed_weight;
+    const VxKernelPlatform* platform = vx_kernel_platform();
+    if (!header || !weight_zero_points || !platform->has_avx2 ||
+        !(header->pair_flags & VX_QGEMM_PAIR_SIGNED_I8) ||
+        !header->pair_n_blocks || !header->pair_k_blocks ||
+        header->d_out < 16u || header->d_out != output_channels) return 0;
+    for (uint32_t column = 0; column < output_channels; column++)
+        if (weight_zero_points[column] != 0) return 0;
+    if (header->pair_flags & VX_QGEMM_PAIR_NO_SATURATE) return 0;
+    if (!(header->pair_flags & VX_QGEMM_PAIR_NO_NEG128)) return 0;
+    /* A single-thread N32 VNNI body consumes ordinary U8 bytes.  Pre-remapping
+     * them would make that body XOR every K4 pack back again.  Multi-threaded
+     * execution intentionally uses the N16 AVX2 spelling, and sub-N32 output
+     * widths never reach the VNNI body, so those retain the signed-domain
+     * im2col optimization. */
+    if (vx_kernels_thread_count() == 1 && header->d_out / 8u >= 4u &&
+        vx_qgemm_w8a8_n32_uses_vnni()) return 0;
+    return 1;
+}
+#endif
+
 WASM_EXPORT("qlinear_i8u8_packed")
 int vx_qlinear_i8u8_packed(const void* input, const void* packed_weight,
         const int32_t* bias, const float* weight_scales,
@@ -1570,6 +2094,7 @@ int vx_qlinear_i8u8_packed(const void* input, const void* packed_weight,
         float input_scale, int32_t input_zero_point,
         float output_scale, int32_t output_zero_point,
         uint32_t input_dtype, uint32_t weight_dtype, uint32_t output_dtype) {
+    const uint32_t qgemm_kc = vx_qgemm_kc();
     const VxPackedQ8Header* header = vx_qgemm_validate(
         packed_weight, d_in, d_out, weight_dtype);
     size_t input_elements = rows;
@@ -1581,6 +2106,8 @@ int vx_qlinear_i8u8_packed(const void* input, const void* packed_weight,
     int symmetric_i8 = input_dtype == VX_DTYPE_I8 &&
         weight_dtype == VX_DTYPE_I8 && output_dtype == VX_DTYPE_I8 &&
         input_zero_point == 0 && output_zero_point == 0 &&
+        d_out % VX_QGEMM_NR == 0u;
+    int symmetric_i8_weight = weight_dtype == VX_DTYPE_I8 &&
         d_out % VX_QGEMM_NR == 0u;
 #endif
     if (!input || !bias || !weight_scales || !weight_zero_points || !output ||
@@ -1599,12 +2126,16 @@ int vx_qlinear_i8u8_packed(const void* input, const void* packed_weight,
                 input_scale, weight_scales[column], output_scale) ||
             !vx_w8a8_zero_point_valid(weight_zero_points[column], weight_dtype)) return 0;
 #if VX_QGEMM_WASM_SIMD
-        if (weight_zero_points[column] != 0) symmetric_i8 = 0;
+        if (weight_zero_points[column] != 0) {
+            symmetric_i8 = 0;
+            symmetric_i8_weight = 0;
+        }
 #endif
     }
     packed = (const uint8_t*)header + header->data_offset;
 #if VX_QGEMM_WASM_SIMD
-    if (d_out >= VX_QGEMM_NR &&
+    if (header->pair_n_blocks && header->pair_k_blocks &&
+        d_out >= VX_QGEMM_NR &&
         vx_qgemm_w8a8_wasm_simd_eligible(header, bias, weight_scales,
             input_scale, input_zero_point, output_scale, input_dtype)) {
         if (symmetric_i8) {
@@ -1612,6 +2143,11 @@ int vx_qlinear_i8u8_packed(const void* input, const void* packed_weight,
                 (const int8_t*)input, header, bias, weight_scales,
                 (int8_t*)output, rows, input_scale, output_scale);
         }
+        if (symmetric_i8_weight &&
+            vx_qgemm_w8a8_wasm_symmetric_i8_affine_panel(
+                input, header, bias, weight_scales, output, rows,
+                input_scale, input_zero_point, output_scale,
+                output_zero_point, input_dtype, output_dtype)) return 1;
         return vx_qgemm_w8a8_wasm_simd(input, header, bias, weight_scales,
             weight_zero_points, output, rows, input_scale, input_zero_point,
             output_scale, output_zero_point, input_dtype, output_dtype);
@@ -1637,8 +2173,8 @@ int vx_qlinear_i8u8_packed(const void* input, const void* packed_weight,
             for (uint32_t row = 0; row < mr; row++)
                 for (uint32_t lane = 0; lane < lanes; lane++)
                     accum[row][lane] = bias[base + lane];
-            for (uint32_t kc = 0; kc < d_in; kc += VX_QGEMM_KC) {
-                uint32_t kend = kc + VX_QGEMM_KC;
+            for (uint32_t kc = 0; kc < d_in; kc += qgemm_kc) {
+                uint32_t kend = kc + qgemm_kc;
                 if (kend > d_in) kend = d_in;
                 for (uint32_t k = kc; k < kend; k++) {
                     const uint8_t* weights = packed +

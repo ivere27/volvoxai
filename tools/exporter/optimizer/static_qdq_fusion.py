@@ -4,13 +4,18 @@ The pass recognizes only closed, canonical islands of the form::
 
     byte --DequantizeLinear--> F32 --op--> F32 --QuantizeLinear--> byte
 
-and replaces them with the corresponding byte-domain runtime operator.  For
-``Add`` both operands must arrive through independent canonical DQ nodes.  The
-supported operators are ``Add``, ``LayerNorm``, ``GELU``, ``SiLU``, and
-``GroupNorm``; their replacements are the matching ``Q*`` operators.
+and replaces them with the corresponding byte-domain runtime operator.  The
+broad static-QDQ pass supports ``Add``, ``LayerNorm``, ``GELU``, ``SiLU``, and
+``GroupNorm``.  A separate opt-in pass owns ``BatchMatMul`` so an application
+can qualify dynamic attention products without implicitly accepting unrelated
+QDQ compute migrations.  Binary operands must arrive through independent
+canonical DQ nodes.
 
-This transform never reads or writes tensor payloads and never derives or
-modifies an affine.  Input and output activation mappings are the exact
+This transform never writes tensor payloads and never derives or modifies an
+affine.  The BatchMatMul proof reads its three scalar affine payloads to reject
+an invalid F32 requantization multiplier or possible I32 accumulator overflow;
+all other rewrites remain reference-only.  Input and output mappings are the
+exact
 :class:`~tools.exporter.ir.AffineQuantization` objects already attached to the
 producer byte tensors and terminal Q output.
 
@@ -20,12 +25,16 @@ reduction order from a backend's separate DQ, float operator, and Q kernels
 (LayerNorm and GroupNorm are the clearest examples).  Callers must therefore
 opt in explicitly and qualify the emitted package as a numerical migration.
 
-Matching is deliberately fail-closed.  A statically proved Add broadcast is
-made explicit with descriptor-preserving byte ``Expand`` nodes before the
-canonical exact-shape ``QAdd``.  Symbolic/incompatible shapes, shared F32
-boundaries, missing affines, aliases, source-style attributes, optional norm
-bias, and any non-canonical port or parameter spelling leave the source graph
-unchanged.
+Matching is deliberately fail-closed.  An authored explicit float ``Expand``
+at an Add input is transferred to a descriptor-preserving byte ``Expand``
+before the canonical exact-shape ``QAdd``.  Implicit, symbolic, or incompatible
+broadcasts, shared F32 boundaries, missing affines, aliases, source-style
+attributes, optional norm bias, and any non-canonical port or parameter
+spelling leave the source graph unchanged.
+
+A canonical DQ value that is also a public F32 output may supply a byte-domain
+compute operand.  That public DQ node and tensor remain in the graph; only its
+sole internal compute use is redirected to the existing byte producer.
 """
 
 from __future__ import annotations
@@ -35,6 +44,8 @@ import math
 import struct
 from typing import Any, Mapping
 
+import numpy as np
+
 from ..errors import Diagnostic
 from ..ir import IRDialect, OpAttribute, OpNode
 from ..pipeline import IRPass, PassContract, PassResult
@@ -42,16 +53,18 @@ from ..typed_broadcast import (
     build_descriptor_preserving_byte_expand,
     concrete_broadcast_shape,
 )
+from .typed_attention_common import resolved_shape
 
 
 _BYTE_DTYPES = frozenset({"int8", "uint8"})
-_FUSIONS = {
+_COMPUTE_FUSIONS = {
     "Add": "QAdd",
     "LayerNorm": "QLayerNorm",
     "GELU": "QGELU",
     "SiLU": "QSiLU",
     "GroupNorm": "QGroupNorm",
 }
+_QBATCH_MATMUL_FUSION = {"BatchMatMul": "QBatchMatMul"}
 
 
 def _f32(value: Any) -> float:
@@ -108,11 +121,79 @@ def _per_tensor_byte(graph, name: str):
     return tensor
 
 
+def _scalar_affine_values(
+    graph, tensor_data: Mapping[str, Any], name: str,
+) -> tuple[np.float32, int] | None:
+    """Return one materialized scalar affine after exact descriptor checks."""
+
+    tensor = _per_tensor_byte(graph, name)
+    if tensor is None:
+        return None
+    affine = tensor.quantization
+    assert affine is not None
+    scale_tensor = graph.tensors.get(affine.scale)
+    zero_tensor = graph.tensors.get(affine.zero_point)
+    scale_value = tensor_data.get(affine.scale)
+    zero_value = tensor_data.get(affine.zero_point)
+    expected_zero_dtype = np.dtype(
+        np.int8 if tensor.dtype == "int8" else np.uint8,
+    )
+    if (
+        scale_tensor is None
+        or zero_tensor is None
+        or not scale_tensor.initializer
+        or not zero_tensor.initializer
+        or scale_tensor.public_input
+        or scale_tensor.public_output
+        or zero_tensor.public_input
+        or zero_tensor.public_output
+        or scale_tensor.dtype != "float32"
+        or zero_tensor.dtype != tensor.dtype
+        or scale_tensor.shape != (1,)
+        or zero_tensor.shape != (1,)
+        or scale_value is None
+        or zero_value is None
+    ):
+        return None
+    scale = np.asarray(scale_value)
+    zero = np.asarray(zero_value)
+    if (
+        scale.dtype != np.dtype(np.float32)
+        or zero.dtype != expected_zero_dtype
+        or scale.shape != (1,)
+        or zero.shape != (1,)
+        or not bool(np.isfinite(scale[0]) and scale[0] > np.float32(0.0))
+    ):
+        return None
+    return np.float32(scale[0]), int(zero[0])
+
+
+def _maximum_extent(graph, extent: int | str) -> int | None:
+    if isinstance(extent, bool):
+        return None
+    if isinstance(extent, int):
+        return extent if extent > 0 else None
+    if not isinstance(extent, str):
+        return None
+    constraint = graph.shape_environment.get(extent)
+    return None if constraint is None else constraint.max
+
+
+def _centered_magnitude(dtype: str, zero_point: int) -> int | None:
+    if dtype == "int8":
+        minimum, maximum = -128, 127
+    elif dtype == "uint8":
+        minimum, maximum = 0, 255
+    else:
+        return None
+    return max(abs(minimum - zero_point), abs(maximum - zero_point))
+
+
 @dataclass(frozen=True)
 class _DQInput:
-    node_index: int
+    node_indices: tuple[int, ...]
     byte_name: str
-    float_name: str
+    float_names: tuple[str, ...]
 
 
 @dataclass(frozen=True)
@@ -134,14 +215,25 @@ class RuntimeStaticQDQComputeFusionPass(IRPass):
     """
 
     name = "runtime-static-qdq-compute-fusion"
-    contract = PassContract.preserving(IRDialect.RUNTIME, repeatable=True)
+    fusions = _COMPUTE_FUSIONS
+    contract = PassContract.preserving(
+        IRDialect.RUNTIME, repeatable=True
+    )
 
-    def __init__(self, *, allow_numerical_migration: bool) -> None:
+    def __init__(
+        self,
+        *,
+        allow_numerical_migration: bool,
+        tensor_data: Mapping[str, Any] | None = None,
+    ) -> None:
         if allow_numerical_migration is not True:
             raise ValueError(
                 "static-QDQ compute fusion requires explicit "
                 "numerical-migration opt-in"
             )
+        if tensor_data is not None and not isinstance(tensor_data, Mapping):
+            raise TypeError("static-QDQ tensor data must be a mapping or None")
+        self.tensor_data = tensor_data
 
     def run(self, graph) -> PassResult:
         graph.invalidate_analyses()
@@ -156,7 +248,7 @@ class RuntimeStaticQDQComputeFusionPass(IRPass):
         diagnostics: list[Diagnostic] = []
 
         for compute_index, compute in enumerate(nodes):
-            if compute.op_type not in _FUSIONS:
+            if compute.op_type not in self.fusions:
                 continue
             if not self._has_terminal_quantize(nodes, index, compute_index):
                 continue
@@ -317,7 +409,9 @@ class RuntimeStaticQDQComputeFusionPass(IRPass):
 
         inputs = compute.input_map()
         activation_ports = (
-            ("a", "b") if compute.op_type == "Add" else ("input",)
+            ("a", "b")
+            if compute.op_type in {"Add", "BatchMatMul"}
+            else ("input",)
         )
         for port in activation_ports:
             name = inputs.get(port)
@@ -390,7 +484,6 @@ class RuntimeStaticQDQComputeFusionPass(IRPass):
         if (
             float_tensor is None
             or float_tensor.dtype != "float32"
-            or float_tensor.public_output
             or byte_tensor is None
             or byte_tensor.shape != float_tensor.shape
             or dq_inputs.get("scale") != byte_tensor.quantization.scale
@@ -451,7 +544,10 @@ class RuntimeStaticQDQComputeFusionPass(IRPass):
         if any(dq.byte_name == output_name for dq in dq_inputs):
             return None
 
-        block = {compute_index, *(dq.node_index for dq in dq_inputs)}
+        block = {
+            compute_index,
+            *(node_index for dq in dq_inputs for node_index in dq.node_indices),
+        }
         provenance = tuple(
             item
             for node_index in sorted((*block, quantize_index))
@@ -486,7 +582,7 @@ class RuntimeStaticQDQComputeFusionPass(IRPass):
 
         replacement = OpNode.from_maps(
             name=quantize.name,
-            op_type=_FUSIONS[compute.op_type],
+            op_type=self.fusions[compute.op_type],
             inputs=replacement_inputs,
             outputs={"out": output_name},
             attributes=(OpAttribute(
@@ -495,7 +591,10 @@ class RuntimeStaticQDQComputeFusionPass(IRPass):
             provenance=provenance,
             metadata=dict(quantize.metadata),
         )
-        discarded = {float_output, *(dq.float_name for dq in dq_inputs)}
+        discarded = {
+            float_output,
+            *(name for dq in dq_inputs for name in dq.float_names),
+        }
         return _Fusion(
             replacement_index=quantize_index,
             remove_indices=frozenset(block),
@@ -530,12 +629,62 @@ class RuntimeStaticQDQComputeFusionPass(IRPass):
 
     @staticmethod
     def _canonical_dequantize(
-        graph, nodes, index, compute_index: int, float_name: str,
+        graph,
+        nodes,
+        index,
+        compute_index: int,
+        float_name: str,
+        *,
+        allow_expand: bool = True,
     ) -> _DQInput | None:
         definition = index.producers.get(float_name)
         if definition is None:
             return None
         node = nodes[definition.node_index]
+        if allow_expand and node.op_type == "Expand":
+            if (
+                not _exact_ports(node, inputs={"input"}, outputs={"out"})
+                or node.output_map().get("out") != float_name
+            ):
+                return None
+            params = _params(node)
+            output_tensor = graph.tensors.get(float_name)
+            source_name = node.input_map().get("input")
+            source_tensor = graph.tensors.get(source_name or "")
+            target = params.get("shape") if params is not None else None
+            uses = index.consumers.get(float_name, ())
+            if (
+                params is None
+                or set(params) != {"shape"}
+                or not isinstance(target, (list, tuple))
+                or output_tensor is None
+                or source_tensor is None
+                or output_tensor.dtype != "float32"
+                or source_tensor.dtype != "float32"
+                or tuple(target) != output_tensor.shape
+                or concrete_broadcast_shape(
+                    source_tensor.shape, output_tensor.shape,
+                ) != output_tensor.shape
+                or len(uses) != 1
+                or uses[0].node_index != compute_index
+            ):
+                return None
+            assert source_name is not None
+            boundary = RuntimeStaticQDQComputeFusionPass._canonical_dequantize(
+                graph,
+                nodes,
+                index,
+                definition.node_index,
+                source_name,
+                allow_expand=False,
+            )
+            if boundary is None:
+                return None
+            return _DQInput(
+                (*boundary.node_indices, definition.node_index),
+                boundary.byte_name,
+                (*boundary.float_names, float_name),
+            )
         if (
             node.op_type != "DequantizeLinear"
             or not _exact_ports(
@@ -554,7 +703,6 @@ class RuntimeStaticQDQComputeFusionPass(IRPass):
         if (
             float_tensor is None
             or float_tensor.dtype != "float32"
-            or float_tensor.public_output
         ):
             return None
         inputs = node.input_map()
@@ -567,7 +715,17 @@ class RuntimeStaticQDQComputeFusionPass(IRPass):
             or inputs.get("zero_point") != byte_tensor.quantization.zero_point
         ):
             return None
-        return _DQInput(definition.node_index, byte_name, float_name)
+        # A public F32 result is an ABI boundary, not an obstacle to using the
+        # already-authored byte value inside the graph.  Keep its DQ node and
+        # tensor intact while replacing only the private compute island.  The
+        # single-consumer proof above remains mandatory, so this does not
+        # bypass a shared internal F32 value or change another consumer.
+        retain_public_boundary = float_tensor.public_output
+        return _DQInput(
+            () if retain_public_boundary else (definition.node_index,),
+            byte_name,
+            () if retain_public_boundary else (float_name,),
+        )
 
     def _match_compute_inputs(
         self, graph, nodes, index, compute_index: int, compute: OpNode,
@@ -578,6 +736,44 @@ class RuntimeStaticQDQComputeFusionPass(IRPass):
         if params is None:
             return None
         output = graph.tensors[output_name]
+
+        if compute.op_type == "BatchMatMul":
+            if (
+                params != {}
+                or set(inputs) != {"a", "b"}
+                or len(inputs) != len(compute.inputs)
+            ):
+                return None
+            left = self._canonical_dequantize(
+                graph,
+                nodes,
+                index,
+                compute_index,
+                inputs["a"],
+                allow_expand=False,
+            )
+            right = self._canonical_dequantize(
+                graph,
+                nodes,
+                index,
+                compute_index,
+                inputs["b"],
+                allow_expand=False,
+            )
+            if (
+                left is None
+                or right is None
+                or not set(left.node_indices).isdisjoint(right.node_indices)
+                or not self._qbatch_matmul_is_safe(
+                    graph, left.byte_name, right.byte_name, output_name,
+                )
+            ):
+                return None
+            return (
+                {"a": left.byte_name, "b": right.byte_name},
+                (left, right),
+                {},
+            )
 
         if compute.op_type == "Add":
             if set(inputs) != {"a", "b"} or len(inputs) != len(compute.inputs):
@@ -599,7 +795,7 @@ class RuntimeStaticQDQComputeFusionPass(IRPass):
             if (
                 left is None
                 or right is None
-                or left.node_index == right.node_index
+                or not set(left.node_indices).isdisjoint(right.node_indices)
                 or left.byte_name == right.byte_name
             ):
                 return None
@@ -732,5 +928,84 @@ class RuntimeStaticQDQComputeFusionPass(IRPass):
 
         return None
 
+    def _qbatch_matmul_is_safe(
+        self, graph, left_name: str, right_name: str, output_name: str,
+    ) -> bool:
+        """Prove the strict no-broadcast QBatchMatMul descriptor domain."""
 
-__all__ = ["RuntimeStaticQDQComputeFusionPass"]
+        if self.tensor_data is None or output_name in {left_name, right_name}:
+            return False
+        left = _per_tensor_byte(graph, left_name)
+        right = _per_tensor_byte(graph, right_name)
+        output = _per_tensor_byte(graph, output_name)
+        if left is None or right is None or output is None:
+            return False
+        left_shape = resolved_shape(graph, left.shape)
+        right_shape = resolved_shape(graph, right.shape)
+        output_shape = resolved_shape(graph, output.shape)
+        if (
+            not 2 <= len(left_shape) <= 8
+            or len(right_shape) != len(left_shape)
+            or left_shape[:-2] != right_shape[:-2]
+            or left_shape[-1] != right_shape[-2]
+            or output_shape
+            != (*left_shape[:-2], left_shape[-2], right_shape[-1])
+        ):
+            return False
+
+        left_affine = _scalar_affine_values(
+            graph, self.tensor_data, left_name,
+        )
+        right_affine = _scalar_affine_values(
+            graph, self.tensor_data, right_name,
+        )
+        output_affine = _scalar_affine_values(
+            graph, self.tensor_data, output_name,
+        )
+        if left_affine is None or right_affine is None or output_affine is None:
+            return False
+        with np.errstate(over="ignore", under="ignore", divide="ignore"):
+            product_scale = np.multiply(
+                left_affine[0], right_affine[0], dtype=np.float32,
+            )
+            multiplier = np.divide(
+                product_scale, output_affine[0], dtype=np.float32,
+            )
+        if not bool(np.isfinite(multiplier) and multiplier > np.float32(0.0)):
+            return False
+
+        contracted = _maximum_extent(graph, left_shape[-1])
+        left_magnitude = _centered_magnitude(left.dtype, left_affine[1])
+        right_magnitude = _centered_magnitude(right.dtype, right_affine[1])
+        return (
+            contracted is not None
+            and left_magnitude is not None
+            and right_magnitude is not None
+            and contracted * left_magnitude * right_magnitude <= 2**31 - 1
+        )
+
+
+class RuntimeStaticQDQBatchMatMulFusionPass(RuntimeStaticQDQComputeFusionPass):
+    """Fuse only fully proved dynamic-operand QDQ BatchMatMul islands."""
+
+    name = "runtime-static-qdq-qbatch-matmul-fusion"
+    fusions = _QBATCH_MATMUL_FUSION
+
+    def __init__(
+        self,
+        *,
+        allow_numerical_migration: bool,
+        tensor_data: Mapping[str, Any],
+    ) -> None:
+        if not isinstance(tensor_data, Mapping):
+            raise TypeError("QDQ BatchMatMul fusion requires tensor data")
+        super().__init__(
+            allow_numerical_migration=allow_numerical_migration,
+            tensor_data=tensor_data,
+        )
+
+
+__all__ = [
+    "RuntimeStaticQDQBatchMatMulFusionPass",
+    "RuntimeStaticQDQComputeFusionPass",
+]

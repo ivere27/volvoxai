@@ -3,11 +3,9 @@
 //   node tests/parity/decode/decode_parity.mjs [backend ...]   # default cpu wasm; produce token seqs
 //   node tests/parity/decode/decode_parity.mjs compare         # compare tiers + PyTorch greedy generate
 //
-// L3 only checks a single forward pass. Text generation is an autoregressive loop:
-// pick argmax of the last position, append, repeat. This drives greedy decode on each
-// backend (full recompute per step; the model is causal, so padding past the current
-// length can't affect the last real position) and checks every tier produces the SAME
-// tokens, and that they match PyTorch's greedy `generate` (decode_torch_oracle.py).
+// The whole-model campaign keeps a separate explicit [1,256] maximum-capacity
+// oracle. This campaign exercises the deployment contract instead: allocate one
+// request-sized capacity, seed the prompt once, then retain state across steps.
 import fs from 'node:fs';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
@@ -27,6 +25,10 @@ import {
 } from '../lib/artifact.mjs';
 import { requirePhysicalWebGPU } from '../lib/backend.mjs';
 import { captureStableResult } from '../lib/runmodel.mjs';
+import {
+  createTinyStoriesDecodeState,
+  resolveTinyStoriesSequenceContract,
+} from '../../../examples/tinystories/browser_session.js';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(HERE, '..', '..', '..');
@@ -41,7 +43,9 @@ const nf = globalThis.fetch;
 globalThis.fetch = async (u, i) => { const h = typeof u === 'string' ? u : u?.url; if (h && h.startsWith('file://')) return new Response(await fs.promises.readFile(fileURLToPath(h))); return nf(u, i); };
 
 const MODEL = 'models/tinystories_1m';
-const SEQ = 256, VOCAB = 50257, PROMPT_LEN = 8, N_NEW = 16;
+const FIXTURE_SEQUENCE_CAPACITY = 256;
+const VOCAB = 50257, EOS = 50256, PROMPT_LEN = 8, N_NEW = 16;
+const REQUEST_SEQUENCE_CAPACITY = PROMPT_LEN + N_NEW;
 const ver = JSON.parse(fs.readFileSync(path.join(ROOT, 'package.json'), 'utf8')).version;
 const modelUrl = pathToFileURL(path.join(ROOT, MODEL, 'model.safetensors')).href;
 const wasmPath = path.join(ROOT, 'dist', ver, 'volvoxai.wasm');
@@ -71,6 +75,8 @@ function campaignFingerprint() {
       path.join(HERE, 'decode_torch_oracle.py'),
       path.join(HERE, '..', 'lib', 'artifact.mjs'),
       path.join(HERE, '..', 'lib', 'backend.mjs'),
+      path.join(HERE, '..', 'lib', 'runmodel.mjs'),
+      path.join(ROOT, 'examples', 'tinystories', 'browser_session.js'),
     ],
     buildFiles: [bundlePath, wasmPath],
     // Deno's GPU command intentionally has no --allow-run, so fingerprint the
@@ -105,79 +111,104 @@ function validateTokens(payload, backend) {
 
 function readTokensFixture() {
   const b = fs.readFileSync(path.join(ROOT, MODEL, 'tokens.i32'));
-  return new Int32Array(b.buffer, b.byteOffset, b.byteLength / 4);
+  const tokens = new Int32Array(b.buffer, b.byteOffset, b.byteLength / 4);
+  if (tokens.length !== FIXTURE_SEQUENCE_CAPACITY) {
+    throw new Error(
+      `TinyStories oracle fixture must contain ${FIXTURE_SEQUENCE_CAPACITY} I32 tokens`,
+    );
+  }
+  return tokens;
 }
 
 async function decode(module, backend, prompt) {
-  const graph = new module.Graph();
-  await module.GraphLoader.load(graph, modelUrl);
+  const snapshot = module.Model.capture(
+    await module.ModelLoader.load(modelUrl),
+  );
   const runtime = await module.VolvoxAI.createRuntime({ backends: [backend], wasmUrl: wasmPath });
-  const model = runtime.createModel(graph);
   let compiled;
   let context;
   try {
-    compiled = await model.compile({
+    compiled = await runtime.compile(snapshot, {
       backend: { mode: 'require', backend, operatorFallback: 'forbid' },
     });
     if (compiled.backend !== backend) {
       throw new Error(`requested backend '${backend}' compiled on '${compiled.backend || 'unknown'}'`);
     }
     if (backend === 'webgpu') requirePhysicalWebGPU(compiled, 'decode WebGPU parity');
-    context = await compiled.createContext();
-    const outputName = graph.outputNames.includes('logits') ? 'logits' : graph.outputNames[0];
-    const outputTensor = graph.getTensor(outputName);
-    if (!outputTensor || outputTensor.dtype !== 'float32') {
-      throw new Error(`decode requires a declared float32 logits output (got '${outputName || 'none'}')`);
+    const contract = resolveTinyStoriesSequenceContract(snapshot);
+    if (contract.vocabularySize !== VOCAB ||
+        contract.maximumSequenceCapacity !== FIXTURE_SEQUENCE_CAPACITY) {
+      throw new Error('TinyStories package differs from the qualified vocabulary/capacity contract');
     }
-    const positions = new Int32Array(SEQ);
-    for (let i = 0; i < SEQ; i++) positions[i] = i;
-    const seq = [...prompt];
+    const state = createTinyStoriesDecodeState(prompt, {
+      requestedNewTokens: N_NEW,
+      eosTokenId: EOS,
+      contract,
+    });
+    if (state.sequenceCapacity !== REQUEST_SEQUENCE_CAPACITY) {
+      throw new Error(
+        `decode request resolved capacity ${state.sequenceCapacity}; expected ${REQUEST_SEQUENCE_CAPACITY}`,
+      );
+    }
+    context = await compiled.createContext({
+      decode: {
+        changedInputs: ['tokens'],
+        rowMode: 'auto',
+        requireIncremental: true,
+      },
+    });
     const generated = [];
     let runtimeEvidence = null;
+    let last = state.promptLength - 1;
     for (let step = 0; step < N_NEW; step++) {
-      const len = seq.length;
-      const tokens = new Int32Array(SEQ); // pad with 0 past `len`
-      for (let i = 0; i < len; i++) tokens[i] = seq[i];
-      const result = await context.execute({ tokens, positions });
+      const result = step === 0
+        ? await context.decode.seed(state.inputs, { position: last })
+        : await context.decode.step(
+          { tokens: state.inputs.tokens },
+          { position: last },
+        );
       let flat;
       if (step === N_NEW - 1) {
         const execution = result.report;
         const captured = await captureStableResult(
-          graph,
+          snapshot.graph,
           result,
           context,
           backend,
-          graph.outputNames,
+          snapshot.outputNames,
         );
         context = null;
-        flat = captured.outputs[outputName];
+        flat = captured.outputs[contract.outputName];
         runtimeEvidence = createRuntimeEvidence({
           compilation: compiled.report,
           execution,
           stableResult: captured.stableResult,
         });
       } else {
-        const values = await result.output(outputName).read();
+        const values = await result.output(contract.outputName).read();
         flat = values instanceof Float32Array ? values : Float32Array.from(values);
         await result.close();
       }
-      if (flat.byteLength !== outputTensor.sizeBytes) {
-        throw new Error(`${backend}: logits output has ${flat.byteLength} bytes, expected ${outputTensor.sizeBytes}`);
+      const expectedBytes = state.sequenceCapacity * contract.vocabularySize * 4;
+      if (flat.byteLength !== expectedBytes) {
+        throw new Error(`${backend}: logits output has ${flat.byteLength} bytes, expected ${expectedBytes}`);
       }
-      const base = (len - 1) * VOCAB;
+      const base = last * VOCAB;
       let best = 0, bestV = -Infinity;
       for (let c = 0; c < VOCAB; c++) {
         const value = flat[base + c];
         if (value > bestV) { bestV = value; best = c; }
       }
-      seq.push(best);
       generated.push(best);
+      if (step + 1 < N_NEW) {
+        last++;
+        state.tokens[last] = best;
+      }
     }
     return { tokens: generated, runtimeEvidence };
   } finally {
     await context?.close();
     await compiled?.close();
-    await model.close();
     await runtime.close();
   }
 }
@@ -201,6 +232,11 @@ async function produce(backends) {
       kind: globalThis.Deno ? 'deno' : 'node',
       backends,
       runtimeEvidenceTiers: backends,
+      executionContract: 'execution-context-retained-seed-step-v1',
+      shapedInputs: true,
+      promptActiveLength: PROMPT_LEN,
+      requestSequenceCapacity: REQUEST_SEQUENCE_CAPACITY,
+      maximumFixtureSequenceCapacity: FIXTURE_SEQUENCE_CAPACITY,
     },
   });
   const prompt = [...readTokensFixture().slice(0, PROMPT_LEN)];
@@ -211,7 +247,13 @@ async function produce(backends) {
       file: 'prompt.json',
       case: CASE_ID,
       tier: 'prompt',
-      payload: { prompt, nNew: N_NEW },
+      payload: {
+        prompt,
+        nNew: N_NEW,
+        executionContract: 'execution-context-retained-seed-step-v1',
+        requestSequenceCapacity: REQUEST_SEQUENCE_CAPACITY,
+        maximumFixtureSequenceCapacity: FIXTURE_SEQUENCE_CAPACITY,
+      },
       outputRoot: OUT,
     });
     promptReady = true;
@@ -282,7 +324,11 @@ function compare() {
   const prompt = readRunArtifactSync('prompt.json', manifest, {
     case: CASE_ID, tier: 'prompt', outputRoot: OUT,
   });
-  if (!Array.isArray(prompt?.prompt) || prompt.prompt.length !== PROMPT_LEN || prompt.nNew !== N_NEW) {
+  if (!Array.isArray(prompt?.prompt) || prompt.prompt.length !== PROMPT_LEN ||
+      prompt.nNew !== N_NEW ||
+      prompt.executionContract !== 'execution-context-retained-seed-step-v1' ||
+      prompt.requestSequenceCapacity !== REQUEST_SEQUENCE_CAPACITY ||
+      prompt.maximumFixtureSequenceCapacity !== FIXTURE_SEQUENCE_CAPACITY) {
     throw new Error('current decode prompt artifact has the wrong shape');
   }
   const current = {};

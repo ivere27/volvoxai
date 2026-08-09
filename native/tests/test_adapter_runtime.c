@@ -453,7 +453,7 @@ static int test_out_in_lora_merge_exact(void) {
     strcpy(g_n[0].ins[0].key, "input"); strcpy(g_n[0].ins[0].name, "x");
     strcpy(g_n[0].ins[1].key, "weight"); strcpy(g_n[0].ins[1].name, "w-out-in");
     volvoxai_engine_tensor_name_index_invalidate();
-    g_n[0].params = cJSON_Parse("{\"weight_layout\":\"OUT_IN\"}");
+    g_n[0].params = cJSON_Parse("{\"weight_layout\":\"dout_din\"}");
     CHECK(g_n[0].params != NULL);
     input[0] = 1.5f; input[1] = -0.5f; g_loaded = 1;
     CHECK(stage_one("lora-out-in", "w-out-in", 2, 3, 1, a, b, 1, 1) == 0);

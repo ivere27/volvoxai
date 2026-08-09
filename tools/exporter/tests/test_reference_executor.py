@@ -19,12 +19,13 @@ from tools.exporter.differential import (
     runtime_capture_order,
 )
 from tools.exporter.reference_executor import ReferenceExecutor, execute_reference
+from tools.exporter.shape_system import ShapeEnvironment
 
 
 def tensor(
     graph: GraphIR,
     name: str,
-    shape: tuple[int, ...],
+    shape: tuple[int | str, ...],
     dtype: str = "float32",
     *,
     initializer: bool = False,
@@ -103,7 +104,7 @@ def core_graph() -> tuple[GraphIR, dict[str, np.ndarray]]:
         "Linear",
         {"input": "mm", "weight": "linear_weight", "bias": "linear_bias"},
         "linear",
-        params={"weight_layout": "OUT_IN"},
+        params={"weight_layout": "dout_din"},
     )
     node(graph, "relu_node", "Relu", {"input": "linear"}, "relu")
     node(graph, "sigmoid_node", "Sigmoid", {"input": "relu"}, "sigmoid")
@@ -213,7 +214,8 @@ class ReferenceExecutorTests(unittest.TestCase):
             [-np.inf, -100.0, -0.25, 0.25, 0.75, np.nan, np.inf],
             dtype=np.float32,
         )
-        execution = ReferenceExecutor(graph, initializers).run({"x": values})
+        executor = ReferenceExecutor(graph, initializers)
+        execution = executor.run(executor.bind({"x": values}))
         np.testing.assert_array_equal(
             execution.intermediates["q"],
             np.asarray([-128, -128, -2, 0, 0, -1, 127], dtype=np.int8),
@@ -226,6 +228,44 @@ class ReferenceExecutorTests(unittest.TestCase):
             execution.outputs["requantized"],
             np.asarray([0, 0, 126, 130, 130, 128, 255], dtype=np.uint8),
         )
+
+    def test_dynamic_execution_consumes_and_rechecks_concrete_bindings(self):
+        graph = GraphIR(
+            source_format="volvoxai", source_name="dynamic.json",
+            dialect=IRDialect.RUNTIME,
+        )
+        graph.shape_environment = ShapeEnvironment(({
+            "name": "batch", "min": 1, "max": 8, "multiple_of": 1,
+        },))
+        tensor(graph, "x", ("batch", 3), public_input=True)
+        tensor(graph, "y", ("batch", 3), public_output=True)
+        graph.inputs.append("x")
+        node(graph, "relu", "ReLU", {"input": "x"}, "y")
+        graph.outputs.append("y")
+        executor = ReferenceExecutor(graph, {})
+
+        first_values = np.asarray(
+            [[-1.0, 0.0, 2.0], [3.0, -4.0, 5.0]], dtype=np.float32,
+        )
+        first_binding = executor.bind({"x": first_values})
+        first = executor.run(first_binding)
+        self.assertEqual(first.binding.symbols, (("batch", 2),))
+        self.assertEqual(first.outputs["y"].shape, (2, 3))
+        np.testing.assert_array_equal(
+            first.outputs["y"], np.maximum(first_values, np.float32(0.0)),
+        )
+
+        second_values = np.arange(15, dtype=np.float32).reshape(5, 3)
+        second_binding = executor.bind({"x": second_values})
+        second = executor.run(second_binding)
+        self.assertEqual(second.binding.symbols, (("batch", 5),))
+        self.assertEqual(second.outputs["y"].shape, (5, 3))
+        self.assertNotEqual(first.binding.signature, second.binding.signature)
+
+        with self.assertRaisesRegex(ExporterError, "BOUND_VIOLATION"):
+            executor.bind({"x": np.zeros((9, 3), dtype=np.float32)})
+        with self.assertRaisesRegex(ExporterError, "requires a ShapeBinding"):
+            executor.run({"x": first_values})
 
     def test_linear_dequantizes_per_output_weight_from_central_refs(self):
         graph = GraphIR(
@@ -260,7 +300,7 @@ class ReferenceExecutorTests(unittest.TestCase):
                 "bias": "bias",
             },
             "y",
-            params={"weight_layout": "OUT_IN"},
+            params={"weight_layout": "dout_din"},
         )
         graph.outputs.append("y")
         execution = execute_reference(

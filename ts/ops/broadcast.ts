@@ -1,6 +1,8 @@
-function elementCount(shape) {
-  return shape.reduce((count, dimension) => count * dimension, 1);
-}
+import type { RuntimeDType } from '../types.js';
+import {
+  assertShapeKernelOutput,
+  assertShapeKernelTensor,
+} from './shapeKernelValidation.js';
 
 function strides(shape) {
   const out = new Array(shape.length);
@@ -12,38 +14,41 @@ function strides(shape) {
   return out;
 }
 
-function assertShape(shape, label) {
-  if (!Array.isArray(shape) || shape.some((dimension) => !Number.isSafeInteger(dimension) || dimension <= 0)) {
-    throw new Error(`${label} must have a positive integer shape.`);
-  }
-}
-
-export function cpuBroadcastBinary(node, operation, operationName) {
+export function cpuBroadcastBinary(
+  node,
+  operation,
+  operationName,
+  options: Readonly<{ dtypes?: readonly RuntimeDType[]; maximumRank?: number }> = {},
+) {
   const a = node.inputs.a;
   const b = node.inputs.b;
   const output = node.outputs.out || Object.values(node.outputs || {})[0];
-  assertShape(a?.shape, `${operationName} input a`);
-  assertShape(b?.shape, `${operationName} input b`);
-  assertShape(output?.shape, `${operationName} output`);
-  if (!a.buffer || !b.buffer || !output.buffer ||
-      a.buffer.length !== elementCount(a.shape) || b.buffer.length !== elementCount(b.shape) ||
-      output.buffer.length !== elementCount(output.shape)) {
-    throw new Error(`${operationName} tensor storage does not match its shape.`);
+  const dtypes = options.dtypes;
+  assertShapeKernelTensor(a, `${operationName} input a`, {
+    ...(dtypes === undefined ? {} : { dtypes }),
+    ...(options.maximumRank === undefined ? {} : { maximumRank: options.maximumRank }),
+  });
+  assertShapeKernelTensor(b, `${operationName} input b`, {
+    dtypes: [a.dtype],
+    ...(options.maximumRank === undefined ? {} : { maximumRank: options.maximumRank }),
+  });
+  if (a.quantization != null || b.quantization != null) {
+    throw new Error(`${operationName} does not accept quantized arithmetic inputs.`);
   }
   const rank = Math.max(a.shape.length, b.shape.length);
-  if (output.shape.length !== rank) {
-    throw new Error(`${operationName} output rank does not match the broadcast rank.`);
-  }
   const aOffset = rank - a.shape.length;
   const bOffset = rank - b.shape.length;
+  const expectedShape = new Array(rank);
   for (let dimension = 0; dimension < rank; dimension++) {
     const ad = dimension < aOffset ? 1 : a.shape[dimension - aOffset];
     const bd = dimension < bOffset ? 1 : b.shape[dimension - bOffset];
     const expected = Math.max(ad, bd);
-    if ((ad !== 1 && bd !== 1 && ad !== bd) || output.shape[dimension] !== expected) {
+    if (ad !== 1 && bd !== 1 && ad !== bd) {
       throw new Error(`${operationName} shapes [${a.shape}] and [${b.shape}] do not broadcast to [${output.shape}].`);
     }
+    expectedShape[dimension] = expected;
   }
+  assertShapeKernelOutput(output, expectedShape, a.dtype, undefined, operationName);
 
   if (a.buffer.length === output.buffer.length && b.buffer.length === output.buffer.length) {
     for (let index = 0; index < output.buffer.length; index++) {

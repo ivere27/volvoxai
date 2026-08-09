@@ -1,7 +1,16 @@
 // --- The Final N-Dimensional "No Stubs" Primitives (Batch 5) ---
 #include "../../include/volvoxai_enums.h"
 #include "kernel_platform.h"
+#include <stddef.h>
 #include <stdint.h>
+
+#if defined(__wasm__) && defined(__wasm_simd128__) && \
+    !defined(VOLVOXAI_DISABLE_MATMUL_WASM_SIMD)
+#include <wasm_simd128.h>
+#define VX_MATMUL_WASM_SIMD 1
+#else
+#define VX_MATMUL_WASM_SIMD 0
+#endif
 
 static int32_t vx_cast_integer_read(const void *input, int dtype, int index) {
     if (dtype == VX_DTYPE_I32) return ((const int32_t *)input)[index];
@@ -175,14 +184,102 @@ enum { VX_MATMUL_MR = 4, VX_MATMUL_NR = 16 };
 
 static void matmul_f32_k_major_scalar(const float* input, const float* weight,
                                       const float* bias, float* output,
-                                      int seq_len, int d_in, int d_out) {
+                                      int seq_len, int d_in, int columns,
+                                      int stride);
+
+#if VX_MATMUL_WASM_SIMD
+
+enum { VX_MATMUL_WASM_MR = 4, VX_MATMUL_WASM_NR = 8 };
+
+#if defined(VOLVOXAI_MATMUL_WASM_SIMD_TESTING)
+static uint32_t vx_matmul_wasm_simd_calls;
+
+WASM_EXPORT("matmul_wasm_simd_calls")
+uint32_t vx_matmul_wasm_simd_call_count(void) {
+    return vx_matmul_wasm_simd_calls;
+}
+
+WASM_EXPORT("reset_matmul_wasm_simd_calls")
+void vx_reset_matmul_wasm_simd_call_count(void) {
+    vx_matmul_wasm_simd_calls = 0;
+}
+#endif
+
+/* B is [K,N], so adjacent output columns are independent reduction lanes.
+ * Four rows reuse each pair of contiguous B vectors while eight accumulators
+ * keep the separate multiply/add chains in registers.  Every lane visits K in
+ * the same order as matmul_f32_k_major_scalar; baseline SIMD128 has no FMA, so
+ * the graph-visible F32 result remains bit-identical to the scalar definition.
+ * Ragged columns retain the generic scalar tail. */
+static void matmul_f32_k_major_wasm(
+        const float* input, const float* weight, const float* bias,
+        float* output, int seq_len, int d_in, int d_out) {
+    int row = 0;
+#if defined(VOLVOXAI_MATMUL_WASM_SIMD_TESTING)
+    vx_matmul_wasm_simd_calls++;
+#endif
+    for (; row < seq_len; row += VX_MATMUL_WASM_MR) {
+        const int rows = seq_len - row < VX_MATMUL_WASM_MR
+            ? seq_len - row : VX_MATMUL_WASM_MR;
+        int column = 0;
+        for (; column + VX_MATMUL_WASM_NR <= d_out;
+             column += VX_MATMUL_WASM_NR) {
+            v128_t low[VX_MATMUL_WASM_MR];
+            v128_t high[VX_MATMUL_WASM_MR];
+            for (int r = 0; r < rows; r++) {
+                low[r] = bias ? wasm_v128_load(bias + column)
+                              : wasm_f32x4_splat(0.0f);
+                high[r] = bias ? wasm_v128_load(bias + column + 4)
+                               : wasm_f32x4_splat(0.0f);
+            }
+            for (int k = 0; k < d_in; k++) {
+                const float* weight_row =
+                    weight + (size_t)k * d_out + column;
+                const v128_t weight_low = wasm_v128_load(weight_row);
+                const v128_t weight_high = wasm_v128_load(weight_row + 4);
+                for (int r = 0; r < rows; r++) {
+                    const v128_t value = wasm_f32x4_splat(
+                        input[(size_t)(row + r) * d_in + k]);
+                    low[r] = wasm_f32x4_add(
+                        low[r], wasm_f32x4_mul(value, weight_low));
+                    high[r] = wasm_f32x4_add(
+                        high[r], wasm_f32x4_mul(value, weight_high));
+                }
+            }
+            for (int r = 0; r < rows; r++) {
+                float* output_row =
+                    output + (size_t)(row + r) * d_out + column;
+                wasm_v128_store(output_row, low[r]);
+                wasm_v128_store(output_row + 4, high[r]);
+            }
+        }
+        if (column < d_out)
+            matmul_f32_k_major_scalar(
+                input + (size_t)row * d_in, weight + column,
+                bias ? bias + column : NULL,
+                output + (size_t)row * d_out + column,
+                rows, d_in, d_out - column, d_out);
+    }
+}
+
+#endif /* VX_MATMUL_WASM_SIMD */
+
+/* `columns` is how many outputs to compute; `stride` is the row pitch of both
+ * weight and output.  They differ whenever this runs as the column tail of the
+ * vector kernel, which computes a slice of each row but must still step whole
+ * rows.  Collapsing the two into one parameter silently read and wrote the
+ * wrong rows for every d_out above VX_MATMUL_NR that is not a multiple of it. */
+static void matmul_f32_k_major_scalar(const float* input, const float* weight,
+                                      const float* bias, float* output,
+                                      int seq_len, int d_in, int columns,
+                                      int stride) {
     for (int i = 0; i < seq_len; i++) {
-        for (int j = 0; j < d_out; j++) {
+        for (int j = 0; j < columns; j++) {
             float sum = bias ? bias[j] : 0.0f;
             for (int k = 0; k < d_in; k++) {
-                sum += input[(size_t)i * d_in + k] * weight[(size_t)k * d_out + j];
+                sum += input[(size_t)i * d_in + k] * weight[(size_t)k * stride + j];
             }
-            output[(size_t)i * d_out + j] = sum;
+            output[(size_t)i * stride + j] = sum;
         }
     }
 }
@@ -242,7 +339,7 @@ static VX_MATMUL_TARGET_AVX2 void matmul_f32_k_major_avx2(
             matmul_f32_k_major_scalar(input + (size_t)row * d_in,
                                       weight + column, bias ? bias + column : NULL,
                                       output + (size_t)row * d_out + column,
-                                      rows, d_in, d_out - column);
+                                      rows, d_in, d_out - column, d_out);
     }
 }
 
@@ -289,6 +386,16 @@ static VX_MATMUL_TARGET_AVX2 void matmul_f32_out_in_avx2(
 
 #endif /* VX_MATMUL_X86_AVX2 */
 
+/* Resolve this translation unit's ISA cache on the dispatching thread before
+ * callers fan independent MatMul jobs out to the shared pool. The cache in
+ * kernel_platform.h is intentionally TU-local, so resolving a copy from the
+ * runtime translation unit would not make the worker calls below race-free. */
+void matmul_f32_prepare_dispatch(void) {
+#if VX_MATMUL_X86_AVX2
+    (void)vx_kernel_platform();
+#endif
+}
+
 WASM_EXPORT("matmul_f32")
 void matmul_f32(const float* input, const float* weight, const float* bias, float* output, int seq_len, int d_in, int d_out) {
 #if VX_MATMUL_X86_AVX2
@@ -297,7 +404,15 @@ void matmul_f32(const float* input, const float* weight, const float* bias, floa
         return;
     }
 #endif
-    matmul_f32_k_major_scalar(input, weight, bias, output, seq_len, d_in, d_out);
+#if VX_MATMUL_WASM_SIMD
+    if (d_out >= VX_MATMUL_WASM_NR) {
+        matmul_f32_k_major_wasm(input, weight, bias, output,
+                               seq_len, d_in, d_out);
+        return;
+    }
+#endif
+    matmul_f32_k_major_scalar(input, weight, bias, output, seq_len, d_in, d_out,
+                              d_out);
 }
 
 /* Shares matmul_f32's dispatch so the Linear node's OUT_IN fallback is not the

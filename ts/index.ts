@@ -1,13 +1,20 @@
-export * from './core/Tensor.js';
-export type * from './types.js';
+export type {
+  RuntimeDType,
+  RuntimeTypedArray,
+  PerTensorQuantization,
+  PerAxisQuantization,
+  TensorQuantization,
+  ExecutionInputs,
+  ExecutionOptions,
+  DecodeExecutionOptions,
+} from './types.js';
 export * from './core/Graph.js';
+export * from './core/ModelLoader.js';
 export * from './core/ModelBuilder.js';
-export {
-  GraphLoader,
-  ReadOnlySafetensorsCache,
-  VOLVOX_GRAPH_FORMAT,
-} from './core/GraphLoader.js';
-export type { GraphFetch, GraphLoaderOptions } from './core/GraphLoader.js';
+export * from './core/Model.js';
+export * from './core/ResolvedShapePlan.js';
+export * from './ops/shapeSystem.js';
+export type { DeviceTensorReference } from './ops/deviceTensorReference.js';
 export {
   SAFETENSORS_DTYPE_INFO,
   SAFETENSORS_TENSOR_READABLE,
@@ -24,10 +31,6 @@ export type {
   SafetensorsFileOptions,
   SafetensorsOpenOptions,
 } from './core/Safetensors.js';
-export {
-  VOLVOX_ADAPTER_FORMAT,
-  VOLVOX_ADAPTER_MANIFEST_KEY,
-} from './core/AdapterManager.js';
 export * from './core/Tokenizer.js';
 export { VolvoxAIError } from './core/RuntimeErrors.js';
 export type {
@@ -49,11 +52,27 @@ export type {
   ExecutionDecodeState,
   ExecutionReport,
 } from './core/ExecutionResult.js';
-export * from './core/ContextRuntime.js';
+export {
+  Runtime,
+  CompiledModel,
+  ExecutionContext,
+} from './core/ContextRuntime.js';
+export type {
+  BackendPolicy,
+  RuntimeOptions,
+  ModelCompileOptions,
+  ExecutionContextOptions,
+  CompilationCandidateReport,
+  CompilationReport,
+  ExecutionFailureReport,
+  RuntimeDiagnostic,
+  ExecutionContextDecode,
+} from './core/ContextRuntime.js';
 export {
   VOLVOXAI_BACKEND_PROVIDER_VERSION,
   createBackendDeviceIdentity,
   createBackendProviderCapabilities,
+  requireHostExecutionInputs,
 } from './backends/BackendProvider.js';
 export type {
   OperatorFallbackAttestation,
@@ -61,9 +80,15 @@ export type {
   BackendProviderCompilationEvidence,
   BackendProviderCapabilityOptions,
   BackendProviderCapabilities,
+  BackendDynamicShapeDomainCapability,
+  BackendShapeDomainCompilationAttestation,
+  DynamicShapeDomainSupport,
   BackendProviderCompileOptions,
-  BackendModelSnapshot,
+  BackendLogicalCompileInput,
+  BackendResolvedAdapterSelection,
+  BackendResolvedExecutionRequest,
   BackendProviderExecutionContext,
+  BackendProviderContextOptions,
   BackendProviderCompiledModel,
   BackendProvider,
   BackendProviderFactoryContext,

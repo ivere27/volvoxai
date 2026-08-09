@@ -16,18 +16,27 @@ creates a new affine, or decodes an initializer.  Every rewritten movement
 edge reuses the source :class:`AffineQuantization` references verbatim.
 
 The match is deliberately fail-closed: the entire F32 chain must be linear,
-private, concrete, shape-valid, and end at a canonical QuantizeLinear with the
-same affine descriptor.  A shared F32 value or intermediate graph output keeps
-the original graph unchanged.
+private, shape-valid, and end at a canonical QuantizeLinear with the same
+affine descriptor.  A shared F32 value or intermediate graph output keeps the
+original graph unchanged.
+
+It is not required to be *concrete*, and used to be.  A permutation of bytes
+does not depend on what the extents are, only that both sides agree on them,
+so the concreteness demand proved nothing and cost everything: on a
+bounded-dynamic package 388 of 399 encoder node outputs carry a symbolic axis,
+so this pass fired nowhere and left twenty-one dequantize-move-requantize round
+trips in the graph.  Agreement is now stated with ``same_element_count`` and
+``resolved_shape`` from ``typed_attention_common``, which every pass proving a
+movement chain shares.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from math import prod
 from typing import Any
 
 from ..ir import IRDialect, OpNode, ValuePort
+from .typed_attention_common import resolved_shape, same_element_count
 from ..pipeline import IRPass, PassContract, PassResult
 
 
@@ -36,6 +45,14 @@ _MOVEMENT_OPS = frozenset({
 })
 _RESHAPE_LIKE_OPS = _MOVEMENT_OPS - {"Transpose"}
 _MAX_MOVEMENT_CHAIN = 32
+_LAYOUT_EQUIVARIANT_FLOAT_UNARY = frozenset({
+    "Clip", "Cos", "GELU", "Identity", "LeakyReLU", "ReLU", "Sigmoid",
+    "SiLU", "Sin", "Tanh",
+})
+_LAYOUT_EQUIVARIANT_QUANTIZATION = frozenset({
+    "DequantizeLinear", "QuantizeLinear", "RequantizeLinear",
+})
+_MAX_LAYOUT_EQUIVARIANT_CHAIN = 32
 
 
 @dataclass(frozen=True)
@@ -50,13 +67,13 @@ class _QDQMovementPlan:
 
 
 @dataclass(frozen=True)
-class _DQTransposeCancellationPlan:
+class _LayoutEquivariantTransposeCancellationPlan:
     first_transpose: int
-    dequantize: int
+    interior: tuple[int, ...]
     second_transpose: int
     source: str
-    byte_intermediate: str
-    float_intermediate: str
+    transposed: str
+    final_intermediate: str
     output: str
 
 
@@ -84,7 +101,9 @@ class RuntimeQDQMovementPass(IRPass):
     """
 
     name = "runtime-qdq-movement"
-    contract = PassContract.preserving(IRDialect.RUNTIME, repeatable=True)
+    contract = PassContract.preserving(
+        IRDialect.RUNTIME, repeatable=True
+    )
 
     def run(self, graph):
         changes = 0
@@ -149,7 +168,6 @@ class RuntimeQDQMovementPass(IRPass):
             or dequantized.dtype != "float32"
             or dequantized.quantization is not None
             or dequantized.shape != source.shape
-            or not source.concrete
             or dequantized_name in graph.outputs
         ):
             return None
@@ -316,15 +334,19 @@ class RuntimeQDQMovementPass(IRPass):
 
 
 class RuntimeQDQTransposeCancellationPass(IRPass):
-    """Cancel inverse transposes separated only by scalar-affine DQ.
+    """Cancel inverse transposes around a layout-equivariant quantized chain.
 
-    ``Transpose(byte) -> DQ -> Transpose(float)`` is exactly one DQ when the
-    transposes are inverse and both byte descriptors reference the same
-    scalar affine.  No numeric affine value or tensor payload is inspected.
+    The retained interior may contain F32 pointwise unary operators and
+    per-tensor Q/DQ/requantization boundaries.  Every such operation acts on
+    each logical element independently, so applying the same chain before an
+    index permutation is exact.  Axis-sensitive operators and per-axis
+    affines are deliberately outside the match.
     """
 
     name = "runtime-qdq-transpose-cancellation"
-    contract = PassContract.preserving(IRDialect.RUNTIME, repeatable=True)
+    contract = PassContract.preserving(
+        IRDialect.RUNTIME, repeatable=True
+    )
 
     def run(self, graph) -> PassResult:
         changes = 0
@@ -338,13 +360,16 @@ class RuntimeQDQTransposeCancellationPass(IRPass):
         notes = ()
         if changes:
             notes = (
-                f"cancelled {changes} inverse byte/DQ/float transpose pair(s); "
+                f"cancelled {changes} inverse transpose pair(s) around "
+                "layout-equivariant unary/per-tensor quantization chains; "
                 "reused existing affine refs",
             )
         return PassResult(changes, touched_nodes=tuple(touched), notes=notes)
 
     @staticmethod
-    def _find_plan(graph) -> _DQTransposeCancellationPlan | None:
+    def _find_plan(
+        graph,
+    ) -> _LayoutEquivariantTransposeCancellationPlan | None:
         graph.invalidate_analyses()
         index = graph.use_def()
         for first_index, first in enumerate(graph.nodes):
@@ -355,105 +380,121 @@ class RuntimeQDQTransposeCancellationPass(IRPass):
             if set(first_inputs) != {"input"} or set(first_outputs) != {"out"}:
                 continue
             source_name = first_inputs["input"]
-            byte_name = first_outputs["out"]
-            uses = index.consumers.get(byte_name, ())
-            if len(uses) != 1:
-                continue
-            dq_index = uses[0].node_index
-            dq = graph.nodes[dq_index]
-            dq_inputs = dq.input_map()
-            dq_outputs = dq.output_map()
-            if (
-                dq.op_type != "DequantizeLinear"
-                or set(dq_inputs) != {"input", "scale", "zero_point"}
-                or dq_inputs["input"] != byte_name
-                or set(dq_outputs) != {"out"}
-                or _params(dq) != {}
-            ):
-                continue
-            float_name = dq_outputs["out"]
-            float_uses = index.consumers.get(float_name, ())
-            if len(float_uses) != 1:
-                continue
-            second_index = float_uses[0].node_index
-            second = graph.nodes[second_index]
-            second_inputs = second.input_map()
-            second_outputs = second.output_map()
-            if (
-                second.op_type != "Transpose"
-                or set(second_inputs) != {"input"}
-                or second_inputs["input"] != float_name
-                or set(second_outputs) != {"out"}
-            ):
-                continue
-            output_name = second_outputs["out"]
             source = graph.tensors.get(source_name)
-            byte_value = graph.tensors.get(byte_name)
-            float_value = graph.tensors.get(float_name)
-            output = graph.tensors.get(output_name)
+            transposed_name = first_outputs["out"]
+            transposed = graph.tensors.get(transposed_name)
             first_perm = _transpose_permutation(graph, first)
-            second_perm = _transpose_permutation(graph, second)
             if (
                 source is None
-                or byte_value is None
-                or float_value is None
-                or output is None
-                or source.dtype not in {"int8", "uint8"}
-                or byte_value.dtype != source.dtype
-                or source.quantization is None
-                or byte_value.quantization != source.quantization
-                or not _scalar_affine_refs(graph, source_name)
-                or not _scalar_affine_refs(graph, byte_name)
-                or dq_inputs["scale"] != source.quantization.scale
-                or dq_inputs["zero_point"] != source.quantization.zero_point
-                or float_value.dtype != "float32"
-                or output.dtype != "float32"
-                or float_value.quantization is not None
-                or output.quantization is not None
-                or byte_name in graph.outputs
-                or float_name in graph.outputs
+                or transposed is None
                 or first_perm is None
-                or second_perm is None
-                or not _inverse_permutations(first_perm, second_perm)
-                or output.shape != source.shape
+                or not _same_storage_affine(graph, source_name, transposed_name)
+                or transposed_name in graph.outputs
             ):
                 continue
-            return _DQTransposeCancellationPlan(
-                first_index, dq_index, second_index, source_name, byte_name,
-                float_name, output_name,
-            )
+
+            current_name = transposed_name
+            interior: list[int] = []
+            saw_quantization = False
+            for _ in range(_MAX_LAYOUT_EQUIVARIANT_CHAIN):
+                if current_name in graph.outputs:
+                    break
+                uses = index.consumers.get(current_name, ())
+                if len(uses) != 1:
+                    break
+                consumer_index = uses[0].node_index
+                if consumer_index <= first_index:
+                    break
+                consumer = graph.nodes[consumer_index]
+                if consumer.op_type == "Transpose":
+                    second_inputs = consumer.input_map()
+                    second_outputs = consumer.output_map()
+                    second_perm = _transpose_permutation(graph, consumer)
+                    if (
+                        not interior
+                        or not saw_quantization
+                        or set(second_inputs) != {"input"}
+                        or second_inputs["input"] != current_name
+                        or set(second_outputs) != {"out"}
+                        or second_perm is None
+                        or not _inverse_permutations(first_perm, second_perm)
+                    ):
+                        break
+                    output_name = second_outputs["out"]
+                    output = graph.tensors.get(output_name)
+                    if (
+                        output is None
+                        or output.shape != source.shape
+                        or not _same_storage_affine(
+                            graph, current_name, output_name,
+                        )
+                    ):
+                        break
+                    return _LayoutEquivariantTransposeCancellationPlan(
+                        first_transpose=first_index,
+                        interior=tuple(interior),
+                        second_transpose=consumer_index,
+                        source=source_name,
+                        transposed=transposed_name,
+                        final_intermediate=current_name,
+                        output=output_name,
+                    )
+
+                output_name = _layout_equivariant_step_output(
+                    graph, consumer, current_name,
+                )
+                if output_name is None:
+                    break
+                interior.append(consumer_index)
+                saw_quantization = saw_quantization or (
+                    consumer.op_type in _LAYOUT_EQUIVARIANT_QUANTIZATION
+                )
+                current_name = output_name
         return None
 
     @staticmethod
-    def _apply(graph, plan: _DQTransposeCancellationPlan) -> str:
+    def _apply(
+        graph,
+        plan: _LayoutEquivariantTransposeCancellationPlan,
+    ) -> str:
         nodes = graph.nodes
         first = nodes[plan.first_transpose]
-        dq = nodes[plan.dequantize]
+        interior = [nodes[index] for index in plan.interior]
         second = nodes[plan.second_transpose]
-        dq.inputs = tuple(
+        first_retained = interior[0]
+        last_retained = interior[-1]
+        first_retained.inputs = tuple(
             ValuePort(
                 port.name,
                 plan.source if port.name == "input" else port.value,
                 port.position,
             )
-            for port in dq.inputs
+            for port in first_retained.inputs
         )
-        dq.outputs = tuple(
+        last_retained.outputs = tuple(
             ValuePort(
                 port.name,
                 plan.output if port.name == "out" else port.value,
                 port.position,
             )
-            for port in dq.outputs
+            for port in last_retained.outputs
         )
-        dq.provenance = (*first.provenance, *dq.provenance, *second.provenance)
+        first_retained.provenance = (
+            *first.provenance, *first_retained.provenance,
+        )
+        last_retained.provenance = (
+            *last_retained.provenance, *second.provenance,
+        )
+        source_shape = graph.tensors[plan.source].shape
+        for retained in interior[:-1]:
+            graph.tensors[retained.output_map()["out"]].shape = source_shape
         _remove_nodes_and_features(
             graph, {plan.first_transpose, plan.second_transpose},
         )
-        graph.tensors.pop(plan.byte_intermediate, None)
-        graph.tensors.pop(plan.float_intermediate, None)
+        graph.tensors.pop(plan.transposed, None)
+        graph.tensors.pop(plan.final_intermediate, None)
         graph.invalidate_analyses()
-        return dq.name
+        return last_retained.name
 
 
 class RuntimePointwiseTransposeHoistPass(IRPass):
@@ -466,7 +507,9 @@ class RuntimePointwiseTransposeHoistPass(IRPass):
     """
 
     name = "runtime-pointwise-transpose-hoist"
-    contract = PassContract.preserving(IRDialect.RUNTIME, repeatable=True)
+    contract = PassContract.preserving(
+        IRDialect.RUNTIME, repeatable=True
+    )
 
     def run(self, graph) -> PassResult:
         changes = 0
@@ -659,6 +702,117 @@ class RuntimePointwiseTransposeHoistPass(IRPass):
         return (sigmoid.name, multiply.name, quantize.name)
 
 
+def _same_storage_affine(graph, left_name: str, right_name: str) -> bool:
+    """Prove that a Transpose changes only indices, never stored values."""
+
+    left = graph.tensors.get(left_name)
+    right = graph.tensors.get(right_name)
+    if left is None or right is None or left.dtype != right.dtype:
+        return False
+    if left.dtype == "float32":
+        return left.quantization is None and right.quantization is None
+    if left.dtype not in {"int8", "uint8"}:
+        return False
+    return bool(
+        left.quantization is not None
+        and left.quantization.scheme == "per_tensor"
+        and right.quantization == left.quantization
+        and _scalar_affine_refs(graph, left_name)
+        and _scalar_affine_refs(graph, right_name)
+    )
+
+
+def _layout_equivariant_step_output(
+    graph,
+    node: OpNode,
+    input_name: str,
+) -> str | None:
+    """Return the sole output of one proven axis-independent chain step."""
+
+    inputs = node.input_map()
+    outputs = node.output_map()
+    params = _params(node)
+    if set(outputs) != {"out"} or params is None:
+        return None
+    output_name = outputs["out"]
+    source = graph.tensors.get(input_name)
+    output = graph.tensors.get(output_name)
+    if source is None or output is None or source.shape != output.shape:
+        return None
+
+    if node.op_type in _LAYOUT_EQUIVARIANT_FLOAT_UNARY:
+        if (
+            set(inputs) != {"input"}
+            or inputs["input"] != input_name
+            or source.dtype != "float32"
+            or output.dtype != "float32"
+            or source.quantization is not None
+            or output.quantization is not None
+        ):
+            return None
+        allowed_params = {
+            "Clip": frozenset({"min", "max"}),
+            "GELU": frozenset({"approximate"}),
+            "LeakyReLU": frozenset({"alpha"}),
+        }.get(node.op_type, frozenset())
+        return output_name if set(params).issubset(allowed_params) else None
+
+    if node.op_type == "QuantizeLinear":
+        quantization = output.quantization
+        if (
+            set(inputs) != {"input", "scale", "zero_point"}
+            or inputs["input"] != input_name
+            or params
+            or source.dtype != "float32"
+            or source.quantization is not None
+            or output.dtype not in {"int8", "uint8"}
+            or quantization is None
+            or quantization.scheme != "per_tensor"
+            or inputs["scale"] != quantization.scale
+            or inputs["zero_point"] != quantization.zero_point
+            or not _scalar_affine_refs(graph, output_name)
+        ):
+            return None
+        return output_name
+
+    if node.op_type == "DequantizeLinear":
+        quantization = source.quantization
+        if (
+            set(inputs) != {"input", "scale", "zero_point"}
+            or inputs["input"] != input_name
+            or params
+            or source.dtype not in {"int8", "uint8"}
+            or quantization is None
+            or quantization.scheme != "per_tensor"
+            or inputs["scale"] != quantization.scale
+            or inputs["zero_point"] != quantization.zero_point
+            or not _scalar_affine_refs(graph, input_name)
+            or output.dtype != "float32"
+            or output.quantization is not None
+        ):
+            return None
+        return output_name
+
+    if node.op_type == "RequantizeLinear":
+        if (
+            set(inputs) != {"input"}
+            or inputs["input"] != input_name
+            or params
+            or source.dtype not in {"int8", "uint8"}
+            or output.dtype not in {"int8", "uint8"}
+            or source.quantization is None
+            or source.quantization.scheme != "per_tensor"
+            or output.quantization is None
+            or output.quantization.scheme != "per_tensor"
+            or not _scalar_affine_refs(graph, input_name)
+            or not _scalar_affine_refs(graph, output_name)
+        ):
+            return None
+        return output_name
+
+    return None
+
+
 def _params(node: OpNode) -> dict[str, Any] | None:
     """Return one well-formed runtime params object, or ``None`` if malformed."""
 
@@ -695,8 +849,6 @@ def _transpose_permutation(graph, node: OpNode) -> tuple[int, ...] | None:
     if (
         source is None
         or output is None
-        or not source.concrete
-        or not output.concrete
         or not isinstance(permutation, list)
         or len(permutation) != source.rank
         or any(
@@ -704,7 +856,8 @@ def _transpose_permutation(graph, node: OpNode) -> tuple[int, ...] | None:
             for axis in permutation
         )
         or sorted(permutation) != list(range(source.rank))
-        or output.shape != tuple(source.shape[axis] for axis in permutation)
+        or resolved_shape(graph, output.shape) != tuple(
+            resolved_shape(graph, source.shape)[axis] for axis in permutation)
     ):
         return None
     return tuple(permutation)
@@ -770,9 +923,8 @@ def _valid_float_movement(
         or output.dtype != "float32"
         or source.quantization is not None
         or output.quantization is not None
-        or not source.concrete
-        or not output.concrete
-        or prod(source.shape) != prod(output.shape)
+        or not same_element_count(resolved_shape(graph, source.shape),
+                                  resolved_shape(graph, output.shape))
     ):
         return False
 
@@ -795,7 +947,8 @@ def _valid_float_movement(
         or sorted(permutation) != list(range(source.rank))
     ):
         return False
-    return output.shape == tuple(source.shape[axis] for axis in permutation)
+    return resolved_shape(graph, output.shape) == tuple(
+        resolved_shape(graph, source.shape)[axis] for axis in permutation)
 
 
 __all__ = [

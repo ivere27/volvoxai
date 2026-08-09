@@ -28,8 +28,10 @@ import {
   removeParityOutputsSync,
   sha256Bytes,
   sourceStateSync,
+  validateNativeCapabilityEvidence,
   validateNativeRuntimeEvidence,
   validateParityFingerprint,
+  validateRuntimeFailureEvidence,
   validateRuntimeEvidence,
   writeRunArtifactSync,
   writeRunManifestSync,
@@ -88,6 +90,85 @@ function runtimeEvidenceFixture() {
       resultClosedAfterVerification: true,
     },
   });
+}
+
+function runtimeFailureEvidenceFixture() {
+  return {
+    schema: 'volvoxai.runtime-failure-evidence',
+    version: 1,
+    outcome: 'failure',
+    status: 'BACKEND_UNSUPPORTED',
+    stage: 'compile',
+    request: {
+      backend: 'vulkan',
+      policy: { mode: 'require', operatorFallback: 'forbid' },
+    },
+    source: {
+      graphPath: 'models/toy/graph.json',
+      weightPaths: ['models/toy/model.safetensors'],
+    },
+    report: {
+      backend: 'vulkan',
+      device: { backend: 'vulkan', device: 'builtin:vulkan' },
+      reason: 'BOUNDED_DOMAIN_UNSUPPORTED',
+      message: 'built-in backend cannot attest the complete declared shape domain',
+      offendingNode: null,
+      candidateOutcomes: 'vulkan:domain-unsupported',
+      routeEvidence: 'domain=unsupported',
+      fallbackEvidence: 'tier=forbidden;operator=forbidden',
+      tierFallback: false,
+      operatorFallbackUsed: false,
+      routeAttested: true,
+    },
+    lineage: {
+      runtimeId: 'native-runtime-1',
+      modelId: 'native-model-2',
+      compilationId: 'native-compiled-3',
+      definitionId: 'native-graph-4',
+      weightRevisionId: 'native-weight-5',
+      topologyRevision: '6',
+      weightRevision: '1',
+    },
+  };
+}
+
+function nativeCapabilityEvidenceFixture() {
+  return {
+    schema: 'volvoxai.parity.native-capability-evidence',
+    version: 1,
+    campaign: {
+      id: '1'.repeat(64),
+      sourceFingerprint: '2'.repeat(64),
+      registryFingerprint: '3'.repeat(64),
+    },
+    authority: {
+      kind: 'kernel-registry', target: 'backend:vulkan', exporterQualified: false,
+    },
+    model: {
+      id: 'toy',
+      graphPath: 'models/toy/graph.json',
+      graphSha256: '4'.repeat(64),
+      weights: [{ path: 'models/toy/model.safetensors', sha256: '5'.repeat(64) }],
+    },
+    request: {
+      tier: 'native-vulkan',
+      backend: 'vulkan',
+      policy: { mode: 'require', operatorFallback: 'forbid' },
+    },
+    adapter: { backend: 'vulkan', device: 'Example GPU' },
+    result: {
+      outcome: 'expected-compile-rejection',
+      exitCode: 1,
+      status: 'BACKEND_UNSUPPORTED',
+      stage: 'compile',
+      reason: 'BOUNDED_DOMAIN_UNSUPPORTED',
+      offendingNode: null,
+      message: 'built-in backend cannot attest the complete declared shape domain',
+    },
+    runtimeFailureEvidence: runtimeFailureEvidenceFixture(),
+    runtimeFailureEvidenceSha256: '6'.repeat(64),
+    nativeLogSha256: '7'.repeat(64),
+  };
 }
 
 function fixture(t) {
@@ -205,6 +286,11 @@ test('runtime evidence binds selection, revisions, routing, context, and stable 
   assert.equal(evidence.execution.revisions.weightRevisionId, 'definition-1:weight:3');
   assert.equal(evidence.stableResult.readableAfterContextClose, true);
 
+  const noAdapters = structuredClone(evidence);
+  noAdapters.compilation.revisions.adapterRevisionIds = [];
+  noAdapters.execution.revisions.adapterRevisionIds = [];
+  assert.equal(validateRuntimeEvidence(noAdapters), noAdapters);
+
   const exactNativeRevisions = structuredClone(evidence);
   exactNativeRevisions.compilation.revisions.topologyRevision = '18446744073709551615';
   exactNativeRevisions.execution.revisions.topologyRevision = '18446744073709551615';
@@ -268,6 +354,55 @@ test('runtime evidence binds selection, revisions, routing, context, and stable 
   const extraField = structuredClone(evidence);
   extraField.execution.retry = 'cpu';
   assert.throws(() => validateRuntimeEvidence(extraField), /must contain exactly/);
+});
+
+test('native capability wire evidence is strict and embeds the typed CLI failure report', () => {
+  const failure = runtimeFailureEvidenceFixture();
+  assert.equal(validateRuntimeFailureEvidence(failure), failure);
+  const evidence = nativeCapabilityEvidenceFixture();
+  assert.equal(validateNativeCapabilityEvidence(evidence), evidence);
+
+  const absentLineage = structuredClone(failure);
+  for (const field of Object.keys(absentLineage.lineage)) absentLineage.lineage[field] = null;
+  assert.equal(validateRuntimeFailureEvidence(absentLineage), absentLineage);
+
+  const zeroIdentity = structuredClone(failure);
+  zeroIdentity.lineage.runtimeId = 'native-runtime-0';
+  assert.throws(() => validateRuntimeFailureEvidence(zeroIdentity), /lineage.runtimeId is invalid/);
+
+  const zeroRevision = structuredClone(failure);
+  zeroRevision.lineage.weightRevision = '0';
+  assert.throws(() => validateRuntimeFailureEvidence(zeroRevision), /positive decimal string/);
+
+  const duplicateWeightPath = structuredClone(failure);
+  duplicateWeightPath.source.weightPaths.push(duplicateWeightPath.source.weightPaths[0]);
+  assert.throws(
+    () => validateRuntimeFailureEvidence(duplicateWeightPath),
+    /duplicate runtime failure evidence weight path/,
+  );
+
+  const fallback = structuredClone(evidence);
+  fallback.runtimeFailureEvidence.report.operatorFallbackUsed = true;
+  assert.equal(
+    validateNativeCapabilityEvidence(fallback),
+    fallback,
+    'wire validation preserves typed failures; contextual policy rejects fallback use',
+  );
+
+  const untypedLineage = structuredClone(evidence);
+  untypedLineage.runtimeFailureEvidence.lineage.compilationId = '3';
+  assert.throws(
+    () => validateNativeCapabilityEvidence(untypedLineage),
+    /lineage.compilationId is invalid/,
+  );
+
+  const extra = structuredClone(evidence);
+  extra.runtimeFailureEvidence.report.retryBackend = 'cpu';
+  assert.throws(() => validateNativeCapabilityEvidence(extra), /must contain exactly/);
+
+  const successExit = structuredClone(evidence);
+  successExit.result.exitCode = 0;
+  assert.throws(() => validateNativeCapabilityEvidence(successExit), /compile rejection/);
 });
 
 test('atomic writes and exact removals stay beneath the parity output root', (t) => {
@@ -464,4 +599,40 @@ test('manifest completion fails required skips and producer errors', (t) => {
     reason: 'binary absent',
   });
   assert.equal(finalizeRunManifest(requiredSkip).outcome, 'error');
+});
+
+test('native capability manifest jobs require structured evidence and cannot masquerade as success', (t) => {
+  const { options } = fixture(t);
+  const makeManifest = () => createRunManifest({
+    command: 'native-sig native-vulkan',
+    fingerprint: createParityFingerprintSync(options),
+    jobs: [{ case: 'toy', tier: 'native-vulkan', expectation: 'expected-skip' }],
+    producer: {
+      kind: 'native-fold',
+      capabilityEvidenceTiers: ['native-vulkan'],
+    },
+  });
+
+  const missing = makeManifest();
+  assert.throws(() => recordRunResult(missing, {
+    case: 'toy', tier: 'native-vulkan', status: 'expected-skip', reason: 'unsupported',
+  }), /must record an expected skip with capability evidence/);
+
+  const unexpectedSuccess = makeManifest();
+  assert.throws(() => recordRunResult(unexpectedSuccess, {
+    case: 'toy',
+    tier: 'native-vulkan',
+    status: 'success',
+    artifact: { path: 'toy.json', sha256: '8'.repeat(64), size: 1 },
+  }), /must record an expected skip with capability evidence/);
+
+  const accepted = makeManifest();
+  recordRunResult(accepted, {
+    case: 'toy',
+    tier: 'native-vulkan',
+    status: 'expected-skip',
+    reason: 'BOUNDED_DOMAIN_UNSUPPORTED',
+    metadata: { capabilityEvidence: nativeCapabilityEvidenceFixture() },
+  });
+  assert.equal(finalizeRunManifest(accepted).outcome, 'success');
 });

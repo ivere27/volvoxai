@@ -22,6 +22,8 @@ never retried on another provider.
 
 ## JavaScript provider SPI
 
+`VOLVOXAI_BACKEND_PROVIDER_VERSION` is 1.
+
 Supply a provider factory under a canonical lowercase name when creating its
 owning Runtime:
 
@@ -31,6 +33,7 @@ import {
   VolvoxAI,
   createBackendDeviceIdentity,
   createBackendProviderCapabilities,
+  requireHostExecutionInputs,
 } from 'volvoxai';
 
 const myNpuProvider = async ({ name }) => {
@@ -47,17 +50,28 @@ const myNpuProvider = async ({ name }) => {
       capabilities: createBackendProviderCapabilities({
         operatorFallback: 'none',
         outputLocation: 'host',
+        dynamicShapeDomain: 'full',
       }),
 
-      async compile(snapshot, options) {
-        const plan = await compileVendorPlan(snapshot, options);
+      async compile(input, options) {
+        const plan = await compileVendorPlan(input, options);
 
         return {
           backendName: name,
-          compilationEvidence: {
+          compilationEvidence: Object.freeze({
             device: deviceIdentity,
             allocationBytes: plan.allocationBytes ?? null,
-          },
+            shapeDomain: Object.freeze({
+              proofProtocol: 'canonical-symbolic-domain-proof/v1',
+              resourceProtocol: 'bounded-resource-maxima/v1',
+              support: 'full',
+              graphFingerprint: input.graphFingerprint,
+              proof: input.shapeDomainProof,
+              maximumTensorBytes: plan.maximumTensorBytes,
+              maximumResidentBytes: plan.maximumResidentBytes,
+              resourceLimitBytes: plan.resourceLimitBytes ?? null,
+            }),
+          }),
 
           async createContext(contextOptions = {}) {
             const state = await plan.createExecutionState(contextOptions);
@@ -65,10 +79,11 @@ const myNpuProvider = async ({ name }) => {
             return {
               backendName: name,
 
-              async execute(inputs, executionOptions = {}) {
+              async execute(request) {
+                const inputs = requireHostExecutionInputs(request, name);
                 const outputs = await state.execute(
                   inputs,
-                  executionOptions,
+                  request.options,
                 );
                 return {
                   outputs,
@@ -105,11 +120,11 @@ const runtime = await VolvoxAI.createRuntime({
 ~~~
 
 The factory receives name, runtime, and wasmUrl. It may return null when its
-device is unavailable. The descriptor must use the exported provider version,
-return frozen capabilities from createBackendProviderCapabilities(), and use a
-backendName matching the configured name. createBackendDeviceIdentity() copies
-non-empty string fields into frozen serializable metadata. Built-in names are
-reserved.
+device is unavailable. The descriptor uses
+`VOLVOXAI_BACKEND_PROVIDER_VERSION`, returns frozen capabilities from
+createBackendProviderCapabilities(), and uses a backendName matching the
+configured name. createBackendDeviceIdentity() copies non-empty string fields
+into frozen serializable metadata. Built-in names are reserved.
 
 A provider factory or already-created provider instance belongs only to the
 Runtime whose `providers` option receives it. Runtime closure closes the
@@ -117,7 +132,7 @@ initialized provider; there is no process-global provider registry.
 
 ### Compilation
 
-compile() receives an immutable ModelSnapshot and:
+compile() receives an immutable logical compile input and:
 
 ~~~ts
 interface BackendProviderCompileOptions {
@@ -125,19 +140,22 @@ interface BackendProviderCompileOptions {
 }
 ~~~
 
-The snapshot identifies its definition, topology revision, weight revision,
-declared outputs, tensor count, and node count. A provider may create a private
-execution Graph through snapshot.createExecutionGraph(). It must not retain or
-mutate the caller's original Graph or Tensor storage.
+The input carries the immutable Model snapshot and Graph together with its
+definition, topology revision, weight revision, declared inputs and outputs,
+tensor count, node count, graph fingerprint, and accepted bounded-shape proof.
+A provider may create a private execution Graph through
+`input.snapshot.createExecutionGraph()`. It must not retain or mutate the
+caller's original Graph or Tensor storage.
 
 Compilation must reject unsupported operators, dtypes, shapes, layouts,
 attributes, quantization descriptors, or fallback policy. A provider that
 advertises operatorFallback: 'none' promises the complete selected graph stays
 on that provider.
 
-The optional compilationEvidence object records a provider-reported device
-identity and a non-negative allocation-byte total, or null when the provider
-cannot report them. VolvoxAI copies this evidence into the immutable
+The required compilationEvidence object records a provider-reported device
+identity, a non-negative allocation-byte total or null, and a frozen
+`shapeDomain` attestation tied to the exact compile input proof and graph
+fingerprint. VolvoxAI validates and copies this evidence into the immutable
 compilation report together with compile time and route evidence; it does not
 invent a physical-device string.
 
@@ -163,17 +181,23 @@ Each createContext() call returns a distinct mutable execution owner:
 ~~~ts
 interface BackendProviderExecutionContext {
   readonly backendName: string;
-  execute(inputs, options?): Promise<BackendExecutionSnapshot>;
-  decodeSeed?(inputs, options?): Promise<BackendExecutionSnapshot>;
-  decodeStep?(inputs, options?): Promise<BackendExecutionSnapshot>;
+  execute(request: BackendResolvedExecutionRequest): Promise<BackendExecutionSnapshot>;
+  decodeSeed?(request: BackendResolvedExecutionRequest): Promise<BackendExecutionSnapshot>;
+  decodeStep?(request: BackendResolvedExecutionRequest): Promise<BackendExecutionSnapshot>;
   decodeReset?(): Promise<void>;
   close(): Promise<void> | void;
 }
 ~~~
 
-Inputs are typed arrays keyed by declared graph input name. A context may own
-device allocations, scratch, command encoders, adapter routing, and decode/KV
-state. It must not share those mutable resources with another context.
+The resolved request contains the exact shaped public inputs, descriptors,
+shape plan, adapters, options, and an opaque `deviceInputs` lease map. Host
+providers call `requireHostExecutionInputs()` and receive typed arrays keyed by
+declared graph input name. A provider must not inspect or retain a public
+`TensorResult` or raw caller `GPUBuffer`; only the built-in WebGPU provider can
+resolve a lease, and only against its exact physical `GPUDevice`. Device inputs
+are currently admitted for ordinary `execute` only. A context may own device
+allocations, scratch, command encoders, adapter routing, and decode/KV state.
+It must not share those mutable resources with another context.
 
 close() is required. VolvoxAI serializes accepted context work and waits for it
 before calling close.
@@ -189,15 +213,17 @@ exact name. Host output entries have this shape:
   shape: [1, 32, 8000],
   dtype: 'float32',
   location: 'host',
+  ownership: 'transfer',
   data: new Float32Array(values),
 }
 ~~~
 
-Returning the snapshot transfers exclusive ownership of host data to
-`ExecutionResult`. A provider must allocate isolated storage and must not retain
-or mutate it after returning. `ExecutionResult` validates and adopts that
-storage; each public `read()` still returns a fresh caller-owned copy. Supported
-dtypes are float32, int32, int8, and uint8.
+With `ownership: 'transfer'`, returning the snapshot transfers exclusive host
+storage to `ExecutionResult`; the provider must not retain or mutate it. With
+`ownership: 'borrowed'`, `ExecutionResult` clones the exact logical storage once
+and the provider may retain its original buffer. Each public `read()` still
+returns a fresh caller-owned copy. Supported dtypes are float32, int32, int8,
+and uint8.
 
 A device entry provides a result-owned GPUBuffer plus read and release
 callbacks:
@@ -208,7 +234,12 @@ callbacks:
   shape: [1, 32, 8000],
   dtype: 'float32',
   location: 'device',
+  logicalSizeBytes: 1 * 32 * 8000 * Float32Array.BYTES_PER_ELEMENT,
   deviceBuffer,
+  // Built-in WebGPU snapshots may opt into same-device handoff. These fields
+  // are not a public raw-buffer input API and external providers omit them.
+  deviceType: 'webgpu',
+  device,
   async read() {
     return copyDeviceBufferToFloat32(deviceBuffer);
   },
@@ -221,7 +252,11 @@ callbacks:
 The provider transfers ownership of that snapshot to ExecutionResult. Device
 buffers must remain valid across later context executions and context closure,
 until release is called during result close. read() must return storage
-compatible with the declared dtype and shape.
+compatible with the declared dtype and shape. A handoff-capable built-in
+WebGPU snapshot is also retained by each accepted consumer until submitted GPU
+work reaches its queue fence. Closing the producer waits for accepted reads and
+consumer leases; queue failure retires ownership without unsafe early buffer
+destruction. Publicly constructed result-shaped objects cannot mint a lease.
 
 backendReport may contain only copyable JSON data. A provider with
 operatorFallback: 'reported' must set route.operatorFallbackUsed on every
@@ -261,9 +296,10 @@ static VxStatus provider_runtime_create(
 
 static VxStatus provider_compile(
     void* runtime_instance,
-    const VxModelSource* source,
+    const VxBackendCompileInput* input,
     const VxBackendPolicy* policy,
     void** out_compiled,
+    VxBackendShapeDomainAttestation* attestation,
     VxReport* report);
 
 static VxStatus provider_context_create(
@@ -272,16 +308,10 @@ static VxStatus provider_context_create(
     void** out_context,
     VxReport* report);
 
-static VxStatus provider_context_set_input(
-    void* context_instance,
-    const char* name,
-    VxDataType dtype,
-    const void* data,
-    size_t byte_size,
-    VxReport* report);
-
 static VxStatus provider_context_execute(
     void* context_instance,
+    const VxTensorBinding* inputs,
+    size_t input_count,
     const VxBackendOutputSink* sink,
     VxReport* report);
 
@@ -303,18 +333,25 @@ VxBackendProvider provider = {
     .abi_version = VX_BACKEND_ABI_VERSION,
     .name = "my-npu",
     .user_data = &driver,
+    .shape_domain = VX_BACKEND_SHAPE_DOMAIN_CAPABILITY_INIT,
     .runtime_create = provider_runtime_create,
     .runtime_destroy = provider_runtime_destroy,
     .compile = provider_compile,
     .compiled_destroy = provider_compiled_destroy,
     .context_create = provider_context_create,
-    .context_set_input = provider_context_set_input,
     .context_execute = provider_context_execute,
     .context_select_adapter = provider_context_select_adapter,
     .context_close = provider_context_close,
     .context_destroy = provider_context_destroy,
 };
+
+provider.shape_domain.support = VX_BACKEND_SHAPE_DOMAIN_FULL;
 ~~~
+
+Provider, capability, compile, attestation, output-sink, and callback-side
+tensor descriptors require exact `struct_size` values. The capability
+declares the proof and resource protocols; graph shape semantics come from
+`volvox-graph/v1` and have no second discriminator.
 
 Names are canonical lowercase identifiers; cpu is reserved. The runtime copies
 the descriptor and name. Callback code, user_data, and everything reachable
@@ -392,9 +429,16 @@ vx_model_compile(model, &policy, &compiled, &report);
 vx_compiled_model_create_context(
     compiled, &context_options, &context, &report);
 
-vx_execution_context_set_input(
-    context, "input", VX_DTYPE_F32, input, input_bytes, &report);
-vx_execution_context_execute(context, &result, &report);
+VxTensorBinding binding = VX_TENSOR_BINDING_INIT;
+binding.name = "input";
+binding.dtype = VX_DTYPE_F32;
+binding.rank = 2;
+binding.shape[0] = batch;
+binding.shape[1] = sequence;
+binding.data = input;
+binding.byte_size = input_bytes;
+binding.location = VX_MEMORY_HOST;
+vx_execution_context_execute(context, &binding, 1, &result, &report);
 ~~~
 
 `vx_runtime_register_provider` is a provider-host SPI operation, not a

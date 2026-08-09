@@ -163,12 +163,16 @@ extern "C" VX_CUDA_GLOBAL void vx_cuda_moe_router_f32(
     }
 }
 
+/* `experts` counts the staged rows of a possibly partially resident bank.
+ * Route indices stay in the model's global slot space; slot_rows maps them to
+ * staged rows and holds VX_MOE_SLOT_ABSENT (0xffffffff) for absent slots. A
+ * zero slot_domain means the bank is fully resident and ids are already rows. */
 extern "C" VX_CUDA_GLOBAL void vx_cuda_moe_linear_f32(
         const float* input, const float* expert_weight,
         const float* expert_bias, const float* route_indices,
         const float* route_weights, float* output, vx_u32 rows,
         vx_u32 d_in, vx_u32 d_out, vx_u32 experts, vx_u32 top_k,
-        vx_u32 has_bias) {
+        vx_u32 has_bias, const vx_u32* slot_rows, vx_u32 slot_domain) {
     vx_u32 flat = vx_global_x();
     vx_u32 count = rows * d_out;
     if (flat >= count) return;
@@ -178,6 +182,10 @@ extern "C" VX_CUDA_GLOBAL void vx_cuda_moe_linear_f32(
     for (vx_u32 slot = 0u; slot < top_k; ++slot) {
         vx_u32 route = row * top_k + slot;
         vx_u32 expert = (vx_u32)route_indices[route];
+        if (slot_domain != 0u) {
+            if (expert >= slot_domain) continue;
+            expert = slot_rows[expert];
+        }
         if (expert >= experts) continue;
         float value = has_bias != 0u
             ? expert_bias[expert * d_out + column] : 0.0f;

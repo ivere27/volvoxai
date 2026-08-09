@@ -36,12 +36,14 @@ examples/target/bin/volvoxai-tasks run models/my_model \
 
 examples/target/bin/volvoxai-tasks classify models/classifier \
   --image image=photo.jpg \
+  --image-normalize zero-one \
   --logits logits \
   --labels labels.txt \
   --top-k 5
 
 examples/target/bin/volvoxai-tasks detect models/efficientdet_lite0_int8 \
   --image input0=photo.jpg \
+  --image-normalize raw-255 \
   --max-det 20
 ```
 
@@ -67,18 +69,20 @@ a `label` column; `--labels` overrides that path. Detection tables retain the ra
 percentage. Detection reads `boxes` and `scores` by default. Models with other
 output names must select them explicitly with `--boxes` and `--scores`; the
 application does not guess detection semantics from tensor shapes. Image
-commands accept named `--image tensor=file` bindings. When an input declares
-`image_normalization` in `graph.json`, the application automatically selects
-its `zero-one`, `minus-one-one`, or `raw-255` mode. An explicit
-`--image-normalize` overrides package metadata for every image binding. If
-metadata is absent and no override is provided, the application fails instead
-of guessing from dtype. The accepted modes are `zero-one`, `minus-one-one`, and
-`raw-255`. This remains example policy, not engine behavior. Every mode
-supports F32, U8, and I8 graph inputs. For byte inputs, `raw-255` preserves
-physical pixels (U8 stores the pixel directly and I8 stores `pixel - 128`);
-normalized modes use the input's declared per-tensor quantization scale and
-zero point. The EfficientDet export workflow records `raw-255` for int8 and
-`zero-one` for fp16/fp32.
+commands accept named `--image tensor=file` bindings. Image preprocessing is
+application policy and is not legal graph metadata in the closed dynamic-v1
+schema. Every image command therefore requires an explicit
+`--image-normalize zero-one`, `minus-one-one`, or `raw-255`; the application
+fails instead of guessing from dtype. Every mode supports F32, U8, and I8 graph
+inputs. For byte inputs, `raw-255` preserves physical pixels (U8 stores the
+pixel directly and I8 stores `pixel - 128`); normalized modes use the input's
+declared per-tensor quantization scale and zero point. Use `raw-255` for the
+int8 EfficientDet package and `zero-one` for its fp16/fp32 variants.
+
+Fixed inputs may use `--input name=file` or `--image name=file`. A dynamic
+input requires its concrete shape, for example
+`--input 'tokens[3,128]=tokens.i32'`. Shape is validated against the logical
+rank, bounds, symbol equality, and exact file byte length before execution.
 
 CPU is the default backend. Pass at most one of `--vulkan`, `--opengl`,
 `--metal`, `--nnapi`, or `--cuda`; an explicitly requested unavailable backend is an

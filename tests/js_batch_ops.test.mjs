@@ -27,10 +27,12 @@ function close(actual, expected, tolerance = 1e-6) {
 }
 
 test('Conv1D and projected CrossAttention keep batch rows independent', () => {
-  const convInput = tensor([2, 1, 3], [1, 2, 3, 10, 20, 30]);
+  // NLC [batch, l, c] activations, WIO [k, in_c, out_c] weight. With one
+  // channel the element order is the same as the old NCL/OIW form.
+  const convInput = tensor([2, 3, 1], [1, 2, 3, 10, 20, 30]);
   const convWeight = tensor([1, 1, 1], [2]);
   const convBias = tensor([1], [1]);
-  const convOutput = tensor([2, 1, 3]);
+  const convOutput = tensor([2, 3, 1]);
   _cpuConv1D({
     inputs: { input: convInput, weight: convWeight, bias: convBias },
     outputs: { out: convOutput },

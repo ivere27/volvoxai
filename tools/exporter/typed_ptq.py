@@ -45,6 +45,7 @@ from .ir import (
 )
 from .runtime_ir import export_runtime_package
 from .quantized_embedding import embedding_ids_preflight_proof
+from .shape_system import MAX_SAFE_INTEGER
 from .typed_broadcast import (
     build_descriptor_preserving_byte_expand,
     concrete_broadcast_shape,
@@ -54,6 +55,10 @@ from .typed_broadcast import (
 PTQ_PLAN_FORMAT = "volvox-typed-ptq/v1"
 _ACTIVATION_DTYPES = frozenset({"int8", "uint8"})
 _ACTIVATION_SCHEMES = frozenset({"symmetric", "asymmetric"})
+# Full signed authoring range, and the narrowed range that keeps
+# 255 * bound * 2 within I16 so a byte-domain dot cannot saturate.
+_WEIGHT_BOUND_FULL = 127
+_WEIGHT_BOUND_REDUCED = 64
 _DENSE_FLOAT_OPS = frozenset({"Linear", "MatMul"})
 _WEIGHTED_FLOAT_OPS = frozenset({"Conv2D", "Embedding"})
 _BYTE_FLOAT_OPS = frozenset({
@@ -132,6 +137,148 @@ def _public_runtime_abi(graph: GraphIR) -> tuple[Any, ...]:
     )
 
 
+def _has_bounded_shape(graph: GraphIR, tensor: TensorValue) -> bool:
+    """Return whether every axis is positive concrete or a declared bound."""
+
+    return all(
+        (
+            isinstance(dimension, int)
+            and not isinstance(dimension, bool)
+            and dimension > 0
+        )
+        or (
+            isinstance(dimension, str)
+            and graph.shape_environment.get(dimension) is not None
+        )
+        for dimension in tensor.shape
+    )
+
+
+def _fixed_extent(value: object, label: str, node: OpNode) -> int:
+    """Read a feature/kernel extent that quantization must know at authoring."""
+
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, int)
+        or value <= 0
+    ):
+        _fail(
+            "VXPTQ098",
+            f"{node.op_type} PTQ requires a concrete positive {label} extent",
+            node=node,
+        )
+    return value
+
+
+def _pinned_extents(graph: GraphIR, shape: tuple) -> tuple:
+    """Replace every symbol whose domain is a single value with that value.
+
+    A symbol pinned to one extent — `B` in a `B=1` package — denotes the same
+    length as the integer, but a raw tuple comparison does not know that. The
+    attention descriptors below build their accepted shapes from resolved
+    extents like `batch = 1`, so a mask declared `(B, M)` would be rejected
+    against `(1, M)` for a difference that cannot exist at runtime.
+    """
+
+    resolved = []
+    for dimension in shape:
+        constraint = (
+            graph.shape_environment.get(dimension)
+            if isinstance(dimension, str) else None
+        )
+        resolved.append(
+            constraint.min
+            if constraint is not None and constraint.min == constraint.max
+            else dimension
+        )
+    return tuple(resolved)
+
+
+def _maximum_shape(graph: GraphIR, tensor: TensorValue) -> tuple[int, ...]:
+    """Resolve one verified bounded descriptor at its maximum corner."""
+
+    maximum: list[int] = []
+    for dimension in tensor.shape:
+        if isinstance(dimension, int) and not isinstance(dimension, bool):
+            maximum.append(dimension)
+            continue
+        constraint = (
+            graph.shape_environment.get(dimension)
+            if isinstance(dimension, str)
+            else None
+        )
+        if constraint is None:
+            raise AssertionError("verified RuntimeIR contains an unbounded axis")
+        maximum.append(constraint.max)
+    return tuple(maximum)
+
+
+def _aggregate_element_bounds(
+    graph: GraphIR,
+    tensor: TensorValue,
+    sample_count: int,
+    observed_name: str,
+) -> tuple[int, int]:
+    """Return safe total element bounds for a bounded symbolic observation."""
+
+    minimum_total = sample_count
+    maximum_total = sample_count
+    for dimension in tensor.shape:
+        if isinstance(dimension, int) and not isinstance(dimension, bool):
+            minimum = maximum = dimension
+        else:
+            constraint = (
+                graph.shape_environment.get(dimension)
+                if isinstance(dimension, str)
+                else None
+            )
+            if constraint is None:
+                raise AssertionError("verified RuntimeIR contains an unbounded axis")
+            minimum = constraint.min
+            maximum = constraint.max
+            if constraint.multiple_of is not None:
+                multiple = constraint.multiple_of
+                minimum += (-minimum) % multiple
+                maximum -= maximum % multiple
+        if (
+            minimum_total <= 0
+            or maximum_total <= 0
+            or minimum <= 0
+            or maximum <= 0
+            or minimum_total > MAX_SAFE_INTEGER // minimum
+            or maximum_total > MAX_SAFE_INTEGER // maximum
+        ):
+            _fail(
+                "VXPTQ098",
+                f"aggregate calibration range {observed_name!r} element-count "
+                "bounds exceed the JavaScript safe integer range",
+            )
+        minimum_total *= minimum
+        maximum_total *= maximum
+    return minimum_total, maximum_total
+
+
+def _descriptor_broadcast_shape(
+    left: Sequence[int | str | None],
+    right: Sequence[int | str | None],
+) -> tuple[int | str | None, ...] | None:
+    """Broadcast exact logical descriptors without choosing a shape profile."""
+
+    result: list[int | str | None] = []
+    for offset in range(1, max(len(left), len(right)) + 1):
+        lhs = left[-offset] if offset <= len(left) else 1
+        rhs = right[-offset] if offset <= len(right) else 1
+        if lhs == rhs:
+            result.append(lhs)
+        elif lhs == 1:
+            result.append(rhs)
+        elif rhs == 1:
+            result.append(lhs)
+        else:
+            return None
+    return tuple(reversed(result))
+
+
 @dataclass(frozen=True)
 class TensorObservation:
     minimum: float
@@ -158,13 +305,25 @@ class PTQConfig:
     symmetric with zero point 0, while U8 is asymmetric.  Supplying a scheme
     explicitly makes all four I8/U8 and symmetric/asymmetric combinations
     available without changing the default I8 symmetric authoring policy.
+
+    ``reduce_range`` narrows authored weights from the full signed range to
+    ``|w| <= 64``.  That is what lets a runtime prove ``VPMADDUBSW`` cannot
+    saturate against an unsigned activation, because ``255 * 64 * 2`` stays
+    inside I16; a backend can then take its plain accumulation spelling and stay
+    bit-exact instead of paying for a magnitude/sign decomposition.  It costs one
+    bit of weight precision and is therefore off by default: enabling it is an
+    accuracy decision the author has to qualify, not a free speed switch.
     """
 
     activation_dtype: str = "int8"
     float_ops: frozenset[str] = frozenset()
     activation_scheme: Optional[str] = None
+    float_nodes: frozenset[str] = frozenset()
+    reduce_range: bool = False
 
     def __post_init__(self) -> None:
+        if not isinstance(self.reduce_range, bool):
+            raise TypeError("reduce_range must be a bool")
         if self.activation_dtype not in _ACTIVATION_DTYPES:
             raise ValueError("activation_dtype must be 'int8' or 'uint8'")
         scheme = self.activation_scheme
@@ -184,7 +343,18 @@ class PTQConfig:
             ) from error
         if any(not isinstance(name, str) or not name for name in excluded):
             raise ValueError("float_ops must contain non-empty runtime opType strings")
+        if isinstance(self.float_nodes, (str, bytes)):
+            raise ValueError("float_nodes must be a set of runtime node names")
+        try:
+            excluded_nodes = frozenset(self.float_nodes)
+        except TypeError as error:
+            raise ValueError(
+                "float_nodes must be a set of runtime node names"
+            ) from error
+        if any(not isinstance(name, str) or not name for name in excluded_nodes):
+            raise ValueError("float_nodes must contain non-empty runtime node names")
         object.__setattr__(self, "float_ops", excluded)
+        object.__setattr__(self, "float_nodes", excluded_nodes)
         object.__setattr__(self, "activation_scheme", scheme)
 
 
@@ -246,17 +416,18 @@ class CalibrationTable:
             tensor = graph.tensors.get(name)
             if tensor is None:
                 _fail("VXPTQ002", f"unknown calibration tensor {name!r}")
-            if tensor.dtype != "float32" or not tensor.concrete:
+            if tensor.dtype != "float32" or not _has_bounded_shape(graph, tensor):
                 _fail(
                     "VXPTQ003",
-                    f"calibration tensor {name!r} must be concrete F32",
+                    f"calibration tensor {name!r} must be bounded fixed-rank F32",
                 )
         self._graph_fingerprint = graph.fingerprint()
         self._specs = {
-            name: (tuple(int(dimension) for dimension in graph.tensors[name].shape),
+            name: (tuple(graph.tensors[name].shape),
                    np.dtype(np.float32))
             for name in requested
         }
+        self._shape_environment = graph.shape_environment
         self._observations: dict[str, TensorObservation] = {}
         self._sample_count = 0
         self._digest = hashlib.sha256()
@@ -277,9 +448,33 @@ class CalibrationTable:
         sample_index = self._sample_count
         pending: dict[str, TensorObservation] = {}
         digest_parts: list[tuple[str, np.ndarray]] = []
+        symbol_bindings: dict[str, int] = {}
         for name, (shape, dtype) in self._specs.items():
             array = np.asarray(values[name])
-            if array.shape != shape or array.dtype != dtype:
+            shape_matches = len(array.shape) == len(shape)
+            if shape_matches:
+                for axis, (declared, actual) in enumerate(zip(shape, array.shape)):
+                    if isinstance(declared, int):
+                        if actual != declared:
+                            shape_matches = False
+                            break
+                        continue
+                    constraint = self._shape_environment.get(declared)
+                    previous = symbol_bindings.get(declared)
+                    if (
+                        constraint is None
+                        or actual < constraint.min
+                        or actual > constraint.max
+                        or (
+                            constraint.multiple_of is not None
+                            and actual % constraint.multiple_of != 0
+                        )
+                        or (previous is not None and previous != actual)
+                    ):
+                        shape_matches = False
+                        break
+                    symbol_bindings[declared] = actual
+            if not shape_matches or array.dtype != dtype:
                 _fail(
                     "VXPTQ006",
                     f"calibration tensor {name!r} is shape={array.shape}, "
@@ -350,9 +545,11 @@ def calibration_profile_from_ranges(
     This is the strict bridge for external calibrators that retain aggregate
     ranges rather than individual samples. ``aliases`` maps a required tensor
     in the exact optimized graph to the source name under which it was
-    observed. Element counts are derived as ``sample_count * tensor_elements``;
-    callers cannot invent a smaller coverage count. ``sample_digest`` remains
-    the external calibrator's exact SHA-256 sample/artifact identity.
+    observed. Concrete element counts are derived as ``sample_count *
+    tensor_elements``. Bounded symbolic descriptors require the calibrator's
+    exact sample and element counts, which must fit the descriptor's aggregate
+    minimum/maximum element envelope. ``sample_digest`` remains the external
+    calibrator's exact SHA-256 sample/artifact identity.
     """
 
     if not isinstance(graph, GraphIR):
@@ -424,12 +621,59 @@ def calibration_profile_from_ranges(
                 f"aggregate calibration range {observed_name!r} must be finite and ordered",
             )
         descriptor = graph.tensors[tensor_name]
-        elements_per_sample = math.prod(int(value) for value in descriptor.shape)
+        declared_samples = bounds.get("samples")
+        declared_elements = bounds.get("elements")
+        symbolic = not descriptor.concrete
+        if symbolic:
+            if (
+                isinstance(declared_samples, bool)
+                or not isinstance(declared_samples, int)
+                or declared_samples != sample_count
+                or isinstance(declared_elements, bool)
+                or not isinstance(declared_elements, int)
+                or declared_elements <= 0
+                or declared_elements > MAX_SAFE_INTEGER
+            ):
+                _fail(
+                    "VXPTQ098",
+                    f"aggregate calibration range {observed_name!r} for a bounded "
+                    "symbolic tensor requires exact samples/elements counts",
+                )
+            minimum_elements, maximum_elements = _aggregate_element_bounds(
+                graph, descriptor, sample_count, observed_name,
+            )
+            if not minimum_elements <= declared_elements <= maximum_elements:
+                _fail(
+                    "VXPTQ098",
+                    f"aggregate calibration range {observed_name!r} elements count "
+                    f"{declared_elements} is outside bounded total "
+                    f"[{minimum_elements}, {maximum_elements}]",
+                )
+            observation_samples = declared_samples
+            observation_elements = declared_elements
+        else:
+            elements_per_sample = math.prod(
+                int(value) for value in descriptor.shape
+            )
+            observation_samples = sample_count
+            observation_elements = elements_per_sample * sample_count
+            if declared_samples is not None and declared_samples != observation_samples:
+                _fail(
+                    "VXPTQ098",
+                    f"aggregate calibration range {observed_name!r} samples count "
+                    "does not match sample_count",
+                )
+            if declared_elements is not None and declared_elements != observation_elements:
+                _fail(
+                    "VXPTQ098",
+                    f"aggregate calibration range {observed_name!r} elements count "
+                    "does not match its concrete descriptor",
+                )
         observations.append((tensor_name, TensorObservation(
             minimum=minimum,
             maximum=maximum,
-            samples=sample_count,
-            elements=elements_per_sample * sample_count,
+            samples=observation_samples,
+            elements=observation_elements,
         )))
     if missing:
         _fail(
@@ -443,6 +687,352 @@ def calibration_profile_from_ranges(
         sample_count=sample_count,
         sample_digest=sample_digest,
     )
+
+
+def validate_named_profile_range_counts(
+    graph: GraphIR,
+    ranges: Mapping[str, Mapping[str, Any]],
+    coverage: Mapping[str, Any],
+    *,
+    excluded_tensors: Iterable[str] = (),
+    selected_nodes: Optional[Sequence[str]] = None,
+    config: PTQConfig = PTQConfig(),
+) -> None:
+    """Bind aggregate range counts to exact named-profile observations.
+
+    External calibration keeps one aggregate ``min``/``max`` range per tensor,
+    while shaped PTQ coverage retains exact element counts per named profile.
+    A bounded-domain minimum/maximum envelope is not sufficient to connect the
+    two: many invented aggregate counts fit inside that envelope.  This bridge
+    therefore requires one exact shape signature per profile, verifies the
+    complete runtime F32 candidate universe, and proves every aggregate
+    ``samples``/``elements`` count from the raw coverage before PTQ mutates a
+    graph or tensor store.
+
+    Public F32 inputs are not promoted activation outputs, so their element
+    totals are derived independently from the same exact profile bindings.
+    ``excluded_tensors`` is reserved for separately proven non-affine domains
+    such as additive ``{0, -Infinity}`` masks.
+    """
+
+    if not isinstance(graph, GraphIR):
+        raise TypeError("graph must be a GraphIR")
+    if not isinstance(ranges, Mapping):
+        raise TypeError("ranges must be a tensor-name mapping")
+    if not isinstance(coverage, Mapping):
+        raise TypeError("coverage must be a named-profile mapping")
+    if not isinstance(config, PTQConfig):
+        raise TypeError("config must be a PTQConfig")
+    if isinstance(excluded_tensors, (str, bytes)):
+        raise TypeError("excluded_tensors must be an iterable of tensor names")
+    try:
+        excluded = frozenset(excluded_tensors)
+    except TypeError as error:
+        raise TypeError(
+            "excluded_tensors must be an iterable of tensor names"
+        ) from error
+    if any(not isinstance(name, str) or not name for name in excluded):
+        raise ValueError("excluded_tensors must contain non-empty tensor names")
+
+    graph.verify(IRDialect.RUNTIME)
+    unknown_exclusions = sorted(excluded - set(graph.tensors))
+    if unknown_exclusions:
+        _fail(
+            "VXPTQ100",
+            f"named-profile exclusions contain unknown tensors {unknown_exclusions!r}",
+        )
+
+    def positive_safe_integer(value: Any, label: str) -> int:
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, int)
+            or value <= 0
+            or value > MAX_SAFE_INTEGER
+        ):
+            _fail("VXPTQ100", f"{label} must be a positive safe integer")
+        return value
+
+    def checked_add(left: int, right: int, label: str) -> int:
+        if right < 0 or left > MAX_SAFE_INTEGER - right:
+            _fail("VXPTQ100", f"{label} exceeds the safe integer range")
+        return left + right
+
+    def tensor_elements(
+        tensor_name: str,
+        binding: Mapping[str, int],
+        label: str,
+    ) -> int:
+        tensor = graph.tensors[tensor_name]
+        result = 1
+        for axis, dimension in enumerate(tensor.shape):
+            extent = binding.get(dimension) if isinstance(dimension, str) else dimension
+            if (
+                isinstance(extent, bool)
+                or not isinstance(extent, int)
+                or extent <= 0
+                or result > MAX_SAFE_INTEGER // extent
+            ):
+                _fail(
+                    "VXPTQ100",
+                    f"{label} cannot resolve {tensor_name!r} axis {axis} to a "
+                    "positive safe element count",
+                )
+            result *= extent
+        return result
+
+    candidate_names: list[str] = []
+    for tensor_name in (
+        *graph.outputs,
+        *(
+            port.value
+            for node in graph.nodes
+            for port in node.outputs
+            if port.value is not None
+        ),
+    ):
+        tensor = graph.tensors[tensor_name]
+        if (
+            tensor.dtype == "float32"
+            and not tensor.initializer
+            and tensor_name not in excluded
+            and tensor_name not in candidate_names
+        ):
+            candidate_names.append(tensor_name)
+    candidate_set = set(candidate_names)
+
+    public_f32_names = [
+        name for name in graph.inputs
+        if graph.tensors[name].dtype == "float32" and name not in excluded
+    ]
+    expected_range_names = set((*candidate_names, *public_f32_names))
+    required = set(required_ptq_observations(
+        graph, selected_nodes, config=config,
+    ))
+    uncovered_required = sorted(required - expected_range_names)
+    if uncovered_required:
+        _fail(
+            "VXPTQ100",
+            "named-profile candidate/input universe omits required PTQ tensors "
+            f"{uncovered_required!r}",
+        )
+
+    raw_range_names = set(ranges)
+    if any(not isinstance(name, str) or not name for name in raw_range_names):
+        _fail("VXPTQ100", "named-profile ranges require non-empty tensor names")
+    missing_ranges = sorted(expected_range_names - raw_range_names)
+    unexpected_ranges = sorted(raw_range_names - expected_range_names)
+    if missing_ranges or unexpected_ranges:
+        _fail(
+            "VXPTQ100",
+            "named-profile ranges must cover exactly the runtime F32 candidates "
+            f"and public inputs (missing={missing_ranges!r}, "
+            f"unexpected={unexpected_ranges!r})",
+        )
+
+    profiles = coverage.get("profiles")
+    if not isinstance(profiles, list) or not profiles:
+        _fail("VXPTQ100", "named-profile coverage requires a non-empty profiles array")
+    declared_total_batches = positive_safe_integer(
+        coverage.get("totalBatches"), "named-profile totalBatches",
+    )
+    declared_total_samples = positive_safe_integer(
+        coverage.get("totalSamples"), "named-profile totalSamples",
+    )
+
+    constraints = {
+        constraint.name: constraint
+        for constraint in graph.shape_environment.dimensions
+    }
+    # A named profile certifies one *request* geometry. Weight-bank dimensions
+    # are weight-indexed: they declare that an immutable weight's axis 0 is
+    # sliceable, they appear on no activation or public input, and the runtime's
+    # resolved shape plan does not carry them. Demanding that a calibrator
+    # certify an extent for them would demand a number no execution produces.
+    request_symbols = {
+        dimension
+        for tensor in graph.tensors.values()
+        if not tensor.initializer
+        for dimension in tensor.shape
+        if isinstance(dimension, str)
+    }
+    expected_symbol_names = set(constraints) & request_symbols
+    aggregate_activation_elements = {
+        name: 0 for name in candidate_names
+    }
+    exact_profiles: list[tuple[str, Mapping[str, int], int]] = []
+    observed_total_batches = 0
+    observed_total_samples = 0
+
+    for index, raw_profile in enumerate(profiles):
+        profile_label = f"named-profile coverage profiles[{index}]"
+        if not isinstance(raw_profile, Mapping):
+            _fail("VXPTQ100", f"{profile_label} must be an object")
+        profile_name = raw_profile.get("name")
+        if not isinstance(profile_name, str) or not profile_name:
+            _fail("VXPTQ100", f"{profile_label}.name must be non-empty")
+        batches = positive_safe_integer(
+            raw_profile.get("batches"), f"{profile_label}.batches",
+        )
+        samples = positive_safe_integer(
+            raw_profile.get("samples"), f"{profile_label}.samples",
+        )
+        observed_total_batches = checked_add(
+            observed_total_batches, batches, "named-profile batch total",
+        )
+        observed_total_samples = checked_add(
+            observed_total_samples, samples, "named-profile sample total",
+        )
+
+        signatures = raw_profile.get("signatures")
+        if (
+            not isinstance(signatures, list)
+            or len(signatures) != 1
+            or not isinstance(signatures[0], str)
+            or not signatures[0]
+        ):
+            _fail(
+                "VXPTQ100",
+                f"{profile_label} must certify exactly one concrete shape signature",
+            )
+
+        raw_symbols = raw_profile.get("symbols")
+        if not isinstance(raw_symbols, Mapping) or set(raw_symbols) != expected_symbol_names:
+            _fail(
+                "VXPTQ100",
+                f"{profile_label}.symbols must bind exactly "
+                f"{sorted(expected_symbol_names)!r}",
+            )
+        binding: dict[str, int] = {}
+        for symbol_name, constraint in constraints.items():
+            if symbol_name not in expected_symbol_names:
+                # Not a request extent; pin it so element counting stays total.
+                binding[symbol_name] = constraint.min
+                continue
+            raw_extent = raw_symbols[symbol_name]
+            if (
+                not isinstance(raw_extent, Mapping)
+                or set(raw_extent) != {"minimum", "maximum"}
+            ):
+                _fail(
+                    "VXPTQ100",
+                    f"{profile_label}.symbols.{symbol_name} requires exact "
+                    "minimum/maximum fields",
+                )
+            minimum = raw_extent["minimum"]
+            maximum = raw_extent["maximum"]
+            if (
+                isinstance(minimum, bool)
+                or not isinstance(minimum, int)
+                or minimum != maximum
+                or minimum < constraint.min
+                or minimum > constraint.max
+                or (
+                    constraint.multiple_of is not None
+                    and minimum % constraint.multiple_of != 0
+                )
+            ):
+                _fail(
+                    "VXPTQ100",
+                    f"{profile_label}.symbols.{symbol_name} must be one exact "
+                    "extent admitted by the graph",
+                )
+            binding[symbol_name] = minimum
+
+        raw_activations = raw_profile.get("activationSamples")
+        if not isinstance(raw_activations, Mapping):
+            _fail("VXPTQ100", f"{profile_label}.activationSamples must be an object")
+        activation_names = set(raw_activations)
+        if activation_names != candidate_set:
+            _fail(
+                "VXPTQ100",
+                f"{profile_label}.activationSamples must cover the exact runtime "
+                f"F32 candidate universe (missing={sorted(candidate_set - activation_names)!r}, "
+                f"unexpected={sorted(activation_names - candidate_set)!r})",
+            )
+        for tensor_name in candidate_names:
+            declared_elements = positive_safe_integer(
+                raw_activations[tensor_name],
+                f"{profile_label}.activationSamples.{tensor_name}",
+            )
+            elements_per_batch = tensor_elements(
+                tensor_name, binding, profile_label,
+            )
+            if elements_per_batch > MAX_SAFE_INTEGER // batches:
+                _fail(
+                    "VXPTQ100",
+                    f"{profile_label} element count for {tensor_name!r} exceeds "
+                    "the safe integer range",
+                )
+            expected_elements = elements_per_batch * batches
+            if declared_elements != expected_elements:
+                _fail(
+                    "VXPTQ100",
+                    f"{profile_label}.activationSamples.{tensor_name} is "
+                    f"{declared_elements}, expected {expected_elements} from its "
+                    "exact shape and logical batch count",
+                )
+            aggregate_activation_elements[tensor_name] = checked_add(
+                aggregate_activation_elements[tensor_name],
+                declared_elements,
+                f"named-profile aggregate for {tensor_name!r}",
+            )
+        exact_profiles.append((profile_name, MappingProxyType(binding), batches))
+
+    if (
+        observed_total_batches != declared_total_batches
+        or observed_total_samples != declared_total_samples
+    ):
+        _fail(
+            "VXPTQ100",
+            "named-profile totalBatches/totalSamples disagree with profile totals",
+        )
+
+    expected_elements_by_range = dict(aggregate_activation_elements)
+    for tensor_name in public_f32_names:
+        if tensor_name in expected_elements_by_range:
+            continue
+        total = 0
+        for profile_name, binding, batches in exact_profiles:
+            elements_per_batch = tensor_elements(
+                tensor_name, binding, f"named profile {profile_name!r}",
+            )
+            if elements_per_batch > MAX_SAFE_INTEGER // batches:
+                _fail(
+                    "VXPTQ100",
+                    f"named profile {profile_name!r} public input {tensor_name!r} "
+                    "exceeds the safe integer range",
+                )
+            total = checked_add(
+                total,
+                elements_per_batch * batches,
+                f"named-profile aggregate for public input {tensor_name!r}",
+            )
+        expected_elements_by_range[tensor_name] = total
+
+    for tensor_name in sorted(expected_range_names):
+        bounds = ranges[tensor_name]
+        if not isinstance(bounds, Mapping):
+            _fail(
+                "VXPTQ100",
+                f"named-profile range {tensor_name!r} must be an object",
+            )
+        declared_samples = bounds.get("samples")
+        declared_elements = bounds.get("elements")
+        expected_elements = expected_elements_by_range[tensor_name]
+        if (
+            isinstance(declared_samples, bool)
+            or not isinstance(declared_samples, int)
+            or declared_samples != declared_total_samples
+            or isinstance(declared_elements, bool)
+            or not isinstance(declared_elements, int)
+            or declared_elements != expected_elements
+        ):
+            _fail(
+                "VXPTQ100",
+                f"named-profile range {tensor_name!r} requires samples="
+                f"{declared_total_samples} and elements={expected_elements}; got "
+                f"samples={declared_samples!r}, elements={declared_elements!r}",
+            )
 
 
 @dataclass(frozen=True)
@@ -501,6 +1091,9 @@ class ConvNodePTQPlan:
     output_tensor: str
     source_weight: str
     source_bias: Optional[str]
+    #: Spelling of ``source_weight``. ``weight_shape`` below is always OHWI, so
+    #: materialization must repeat the same transpose planning applied.
+    source_weight_layout: str
     weight_shape: tuple[int, int, int, int]
     quantized_weight: WeightQuantizationPlan
     quantized_bias_tensor: str
@@ -630,6 +1223,11 @@ class _ConvSource:
     bias_tensor: Optional[str]
     weight_shape: tuple[int, int, int, int]
     params: tuple[tuple[str, Any], ...]
+    #: Source spelling of the immutable weight. Float ``Conv2D`` carries HWIO
+    #: (the image-layout canonical form), while ``QConv2D`` is defined on OHWI,
+    #: so authoring transposes when these differ. ``weight_shape`` is always the
+    #: OHWI shape the emitted node will declare.
+    source_weight_layout: str = "OHWI"
 
 
 @dataclass(frozen=True)
@@ -744,11 +1342,12 @@ def _dynamic_f32_activation(
         tensor.dtype != "float32"
         or tensor.quantization is not None
         or tensor.initializer
-        or not tensor.concrete
+        or not _has_bounded_shape(graph, tensor)
     ):
         _fail(
             "VXPTQ053",
-            f"{node.op_type} PTQ requires concrete dynamic F32 activation edges",
+            f"{node.op_type} PTQ requires bounded fixed-rank dynamic F32 "
+            "activation edges",
             node=node,
         )
     return tensor
@@ -800,10 +1399,22 @@ def _selected_indices(
     config: PTQConfig,
 ) -> tuple[int, ...]:
     excluded = config.float_ops
+    excluded_nodes = config.float_nodes
+    graph_node_names = {node.name for node in graph.nodes}
+    unknown_float_nodes = sorted(excluded_nodes - graph_node_names)
+    if unknown_float_nodes:
+        _fail(
+            "VXPTQ099",
+            f"float_nodes do not exist in the graph: {unknown_float_nodes!r}",
+        )
     if selected_nodes is None:
         return tuple(
             index for index, node in enumerate(graph.nodes)
-            if node.op_type in _SUPPORTED_FLOAT_OPS and node.op_type not in excluded
+            if (
+                node.op_type in _SUPPORTED_FLOAT_OPS
+                and node.op_type not in excluded
+                and node.name not in excluded_nodes
+            )
         )
     requested = tuple(selected_nodes)
     if len(requested) != len(set(requested)):
@@ -821,10 +1432,20 @@ def _selected_indices(
             "VXPTQ023",
             f"selected nodes are not supported FP32 PTQ ops: {unsupported!r}",
         )
+    conflicting = [name for name in requested if name in excluded_nodes]
+    if conflicting:
+        _fail(
+            "VXPTQ099",
+            f"selected PTQ nodes are explicitly retained in F32: {conflicting!r}",
+        )
     requested_set = set(requested)
     return tuple(
         index for index, node in enumerate(graph.nodes)
-        if node.name in requested_set and node.op_type not in excluded
+        if (
+            node.name in requested_set
+            and node.op_type not in excluded
+            and node.name not in excluded_nodes
+        )
     )
 
 
@@ -889,11 +1510,11 @@ def _dense_source(graph: GraphIR, node_index: int) -> _DenseSource:
                 node=node,
             )
         if set(params) != {"weight_layout"} or params["weight_layout"] not in {
-            "IN_OUT", "OUT_IN",
+            "din_dout", "dout_din",
         }:
             _fail(
                 "VXPTQ026",
-                "Linear requires one explicit weight_layout IN_OUT or OUT_IN",
+                "Linear requires one explicit weight_layout din_dout or dout_din",
                 node=node,
             )
         input_name = inputs["input"]
@@ -910,7 +1531,7 @@ def _dense_source(graph: GraphIR, node_index: int) -> _DenseSource:
         input_name = inputs["a"]
         weight_name = inputs["b"]
         bias_name = None
-        layout = "IN_OUT"
+        layout = "din_dout"
 
     input_tensor = graph.tensors[input_name]
     output_name = outputs["out"]
@@ -935,6 +1556,7 @@ def _dense_source(graph: GraphIR, node_index: int) -> _DenseSource:
         or weight_tensor.public_input
         or weight_tensor.public_output
         or weight_tensor.quantization is not None
+        or not weight_tensor.concrete
         or weight_tensor.rank != 2
     ):
         _fail(
@@ -946,9 +1568,9 @@ def _dense_source(graph: GraphIR, node_index: int) -> _DenseSource:
         _fail("VXPTQ030", "dense activation/output ranks are incompatible", node=node)
     if input_tensor.shape[:-1] != output_tensor.shape[:-1]:
         _fail("VXPTQ030", "dense activation/output outer shapes differ", node=node)
-    d_in = int(input_tensor.shape[-1])
-    d_out = int(output_tensor.shape[-1])
-    expected_weight = (d_out, d_in) if layout == "OUT_IN" else (d_in, d_out)
+    d_in = _fixed_extent(input_tensor.shape[-1], "input feature", node)
+    d_out = _fixed_extent(output_tensor.shape[-1], "output feature", node)
+    expected_weight = (d_out, d_in) if layout == "dout_din" else (d_in, d_out)
     if weight_tensor.shape != expected_weight:
         _fail(
             "VXPTQ031",
@@ -1034,14 +1656,15 @@ def _conv_source(graph: GraphIR, node_index: int) -> _ConvSource:
     }
     if set(params) - allowed:
         _fail("VXPTQ079", "Conv2D has unsupported geometry parameters", node=node)
+    source_weight_layout = str(params.get("weight_layout", "OHWI"))
     if (
         params.get("data_layout", "NHWC") != "NHWC"
-        or params.get("weight_layout", "OHWI") != "OHWI"
+        or source_weight_layout not in {"OHWI", "HWIO"}
     ):
         _fail(
             "VXPTQ078",
-            "typed Conv2D PTQ requires prior canonicalization to NHWC/OHWI; "
-            "relabeling or transposing another layout is not implicit",
+            "typed Conv2D PTQ requires NHWC activations and an OHWI or HWIO "
+            "weight; relabeling or transposing another layout is not implicit",
             node=node,
         )
     stride = _integer_sequence(
@@ -1089,30 +1712,51 @@ def _conv_source(graph: GraphIR, node_index: int) -> _ConvSource:
     ):
         _fail(
             "VXPTQ079",
-            "Conv2D PTQ requires concrete NHWC F32 activations and an immutable rank-4 F32 OHWI weight",
+            "Conv2D PTQ requires bounded NHWC F32 activations and an immutable "
+            "concrete rank-4 F32 OHWI weight",
             node=node,
         )
-    weight_shape = tuple(int(value) for value in weight.shape)
-    out_channels, kernel_h, kernel_w, input_per_group = weight_shape
-    batch, input_h, input_w, input_channels = (
-        int(value) for value in activation.shape
+    declared_shape = tuple(int(value) for value in weight.shape)
+    if source_weight_layout == "HWIO":
+        kernel_h, kernel_w, input_per_group, out_channels = declared_shape
+    else:
+        out_channels, kernel_h, kernel_w, input_per_group = declared_shape
+    # Downstream planning and the emitted node are defined on OHWI regardless of
+    # how the float weight was spelled.
+    weight_shape = (out_channels, kernel_h, kernel_w, input_per_group)
+    batch, input_h, input_w, raw_input_channels = activation.shape
+    input_channels = _fixed_extent(raw_input_channels, "input-channel", node)
+    output_batch, output_h, output_w, raw_output_channels = output.shape
+    output_channels = _fixed_extent(
+        raw_output_channels, "output-channel", node,
     )
     if input_channels != input_per_group * groups or out_channels % groups:
         _fail("VXPTQ079", "Conv2D grouped-channel geometry is incompatible", node=node)
-    expected_h = (
-        input_h + pads[0] + pads[2] - dilation[0] * (kernel_h - 1) - 1
-    ) // stride[0] + 1
-    expected_w = (
-        input_w + pads[1] + pads[3] - dilation[1] * (kernel_w - 1) - 1
-    ) // stride[1] + 1
-    if expected_h <= 0 or expected_w <= 0 or output.shape != (
-        batch, expected_h, expected_w, out_channels,
-    ):
+    if output_channels != out_channels or output_batch != batch:
         _fail("VXPTQ079", "Conv2D output shape does not match its exact geometry", node=node)
+    if all(
+        isinstance(value, int) and not isinstance(value, bool)
+        for value in (input_h, input_w, output_h, output_w)
+    ):
+        expected_h = (
+            input_h + pads[0] + pads[2] - dilation[0] * (kernel_h - 1) - 1
+        ) // stride[0] + 1
+        expected_w = (
+            input_w + pads[1] + pads[3] - dilation[1] * (kernel_w - 1) - 1
+        ) // stride[1] + 1
+        if expected_h <= 0 or expected_w <= 0 or (
+            output_h, output_w
+        ) != (expected_h, expected_w):
+            _fail(
+                "VXPTQ079",
+                "Conv2D output shape does not match its exact geometry",
+                node=node,
+            )
     if bias_name is not None:
         _immutable_f32_affine(graph, bias_name, (out_channels,), node)
 
     return _ConvSource(
+        source_weight_layout=source_weight_layout,
         node=node,
         node_index=node_index,
         input_tensor=input_name,
@@ -1158,7 +1802,7 @@ def _embedding_source(graph: GraphIR, node_index: int) -> _EmbeddingSource:
         ids.dtype != "int32"
         or ids.quantization is not None
         or ids.initializer
-        or not ids.concrete
+        or not _has_bounded_shape(graph, ids)
         or ids.rank < 1
         or weight.dtype != "float32"
         or weight.quantization is not None
@@ -1170,7 +1814,8 @@ def _embedding_source(graph: GraphIR, node_index: int) -> _EmbeddingSource:
     ):
         _fail(
             "VXPTQ081",
-            "Embedding PTQ requires concrete I32 IDs, immutable rank-2 F32 weight, and F32 output",
+            "Embedding PTQ requires bounded fixed-rank I32 IDs, an immutable "
+            "concrete rank-2 F32 weight, and bounded F32 output",
             node=node,
         )
     vocab, hidden = (int(value) for value in weight.shape)
@@ -1233,6 +1878,14 @@ def _byte_source(graph: GraphIR, node_index: int) -> _ByteSource:
             name = inputs[port]
             if graph.tensors[name].initializer:
                 constant = _immutable_f32_constant(graph, name, node)
+                if not output.concrete:
+                    _fail(
+                        "VXPTQ096",
+                        "Add constant broadcasting cannot materialize one immutable "
+                        "byte tensor for a symbolic output domain",
+                        node=node,
+                        constraint="retain this Add in F32 or make both operands dynamic and exact-shape",
+                    )
                 broadcast = concrete_broadcast_shape(
                     constant.shape, output.shape,
                 )
@@ -1246,6 +1899,22 @@ def _byte_source(graph: GraphIR, node_index: int) -> _ByteSource:
             else:
                 operand = _dynamic_f32_activation(graph, name, node)
                 if operand.shape != output.shape:
+                    if not operand.concrete or not output.concrete:
+                        if _descriptor_broadcast_shape(
+                            operand.shape, output.shape,
+                        ) == output.shape:
+                            _fail(
+                                "VXPTQ096",
+                                "dynamic symbolic Add broadcasting exceeds the "
+                                "static byte Expand authoring contract",
+                                node=node,
+                                constraint="retain this Add in F32 or use exact-shape symbolic operands",
+                            )
+                        _fail(
+                            "VXPTQ058",
+                            "Add activation cannot broadcast exactly to its declared output",
+                            node=node,
+                        )
                     broadcast = concrete_broadcast_shape(
                         operand.shape, output.shape,
                     )
@@ -1332,7 +2001,7 @@ def _byte_source(graph: GraphIR, node_index: int) -> _ByteSource:
                 "LayerNorm requires matching rank-1..8 [...,D] activation/output",
                 node=node,
             )
-        d_model = int(activation.shape[-1])
+        d_model = _fixed_extent(activation.shape[-1], "normalized feature", node)
         _immutable_f32_affine(graph, inputs["weight"], (d_model,), node)
         _immutable_f32_affine(graph, inputs["bias"], (d_model,), node)
         if set(params) - {"eps", "d_model"}:
@@ -1368,7 +2037,7 @@ def _byte_source(graph: GraphIR, node_index: int) -> _ByteSource:
                 "GroupNorm PTQ requires matching rank-4 NHWC activation/output",
                 node=node,
             )
-        channels = int(activation.shape[-1])
+        channels = _fixed_extent(activation.shape[-1], "channel", node)
         _immutable_f32_affine(graph, inputs["weight"], (channels,), node)
         _immutable_f32_affine(graph, inputs["bias"], (channels,), node)
         if set(params) - {"num_groups", "eps", "data_layout"}:
@@ -1407,13 +2076,13 @@ def _byte_source(graph: GraphIR, node_index: int) -> _ByteSource:
         right = _dynamic_f32_activation(graph, inputs["b"], node)
         if not 2 <= left.rank <= 8 or not 2 <= right.rank <= 8:
             _fail("VXPTQ083", "BatchMatMul requires rank-2..8 operands", node=node)
-        expected: tuple[int, ...] | None = None
+        expected: tuple[int | str | None, ...] | None = None
         if left.shape[-1] == right.shape[-2]:
-            try:
-                batch = tuple(np.broadcast_shapes(left.shape[:-2], right.shape[:-2]))
-                expected = (*batch, int(left.shape[-2]), int(right.shape[-1]))
-            except ValueError:
-                expected = None
+            batch = _descriptor_broadcast_shape(
+                left.shape[:-2], right.shape[:-2],
+            )
+            if batch is not None:
+                expected = (*batch, left.shape[-2], right.shape[-1])
         if expected != output.shape:
             _fail(
                 "VXPTQ083",
@@ -1471,7 +2140,7 @@ def _byte_source(graph: GraphIR, node_index: int) -> _ByteSource:
                 "QSDPA requires q/out [Q,D] or [B,Q,D] and compatible K/V geometry",
                 node=node,
             )
-        d_model = int(q.shape[-1])
+        d_model = _fixed_extent(q.shape[-1], "model feature", node)
         if (
             d_model % heads
             or d_model % 4
@@ -1484,7 +2153,7 @@ def _byte_source(graph: GraphIR, node_index: int) -> _ByteSource:
                 node=node,
             )
         if any(
-            math.prod(int(value) for value in tensor.shape) > 2**32 - 1
+            math.prod(_maximum_shape(graph, tensor)) > 2**32 - 1
             for tensor in (q, k, v, output)
         ):
             _fail("VXPTQ086", "QSDPA exceeds the U32 tensor-element ABI", node=node)
@@ -1498,16 +2167,18 @@ def _byte_source(graph: GraphIR, node_index: int) -> _ByteSource:
         if "mask" in inputs:
             mask_name = inputs["mask"]
             mask = graph.tensors[mask_name]
-            batch = 1 if q.rank == 2 else int(q.shape[0])
-            queries = int(q.shape[-2])
-            keys = int(k.shape[-2])
+            batch = 1 if q.rank == 2 else q.shape[0]
+            queries = q.shape[-2]
+            keys = k.shape[-2]
             if (
                 mask.dtype != "int32"
                 or mask.quantization is not None
-                or not mask.concrete
-                or mask.shape not in {
-                    (keys,), (batch, keys), (queries, keys),
-                    (batch, queries, keys),
+                or not _has_bounded_shape(graph, mask)
+                or _pinned_extents(graph, mask.shape) not in {
+                    _pinned_extents(graph, candidate) for candidate in (
+                        (keys,), (batch, keys), (queries, keys),
+                        (batch, queries, keys),
+                    )
                 }
             ):
                 _fail(
@@ -1515,7 +2186,7 @@ def _byte_source(graph: GraphIR, node_index: int) -> _ByteSource:
                     "QSDPA mask must be an I32 keep mask shaped [K], [B,K], [Q,K], or [B,Q,K]",
                     node=node,
                 )
-            if math.prod(int(value) for value in mask.shape) > 2**32 - 1:
+            if math.prod(_maximum_shape(graph, mask)) > 2**32 - 1:
                 _fail("VXPTQ087", "QSDPA mask exceeds the U32 tensor-element ABI", node=node)
             parameters.append(("mask", mask_name))
             if mask.initializer:
@@ -1763,12 +2434,14 @@ def _pack_activation(
     return np.ascontiguousarray(np.rint(clipped).astype(output_dtype))
 
 
-def _weight_scale(row: np.ndarray) -> np.float32:
+def _weight_scale(
+    row: np.ndarray, bound: int = _WEIGHT_BOUND_FULL,
+) -> np.float32:
     maximum = np.max(np.abs(row), initial=np.float32(0.0))
     if maximum == np.float32(0.0):
         return np.float32(1.0)
     with np.errstate(over="ignore", under="ignore", invalid="ignore"):
-        scale = np.divide(maximum, np.float32(127.0), dtype=np.float32)
+        scale = np.divide(maximum, np.float32(bound), dtype=np.float32)
     if not bool(np.isfinite(scale) and scale > np.float32(0.0)):
         _fail("VXPTQ037", "weight row has no positive finite F32 scale")
     return np.float32(scale)
@@ -1777,13 +2450,16 @@ def _weight_scale(row: np.ndarray) -> np.float32:
 def _pack_weight(
     out_in: np.ndarray,
     scales: Optional[np.ndarray] = None,
+    bound: int = _WEIGHT_BOUND_FULL,
 ) -> tuple[np.ndarray, np.ndarray, int, float, float]:
     if out_in.dtype != np.dtype(np.float32) or out_in.ndim != 2:
-        _fail("VXPTQ038", "weight packing requires rank-2 F32 OUT_IN storage")
+        _fail("VXPTQ038", "weight packing requires rank-2 F32 dout_din storage")
     if not bool(np.all(np.isfinite(out_in))):
         _fail("VXPTQ039", "weight contains non-finite values")
     if scales is None:
-        scales = np.asarray([_weight_scale(row) for row in out_in], dtype=np.float32)
+        scales = np.asarray(
+            [_weight_scale(row, bound) for row in out_in], dtype=np.float32,
+        )
     else:
         scales = np.asarray(scales, dtype=np.float32)
         if (
@@ -1795,12 +2471,11 @@ def _pack_weight(
     with np.errstate(over="ignore", invalid="ignore", divide="ignore"):
         transformed = np.divide(out_in, scales[:, None], dtype=np.float32)
     rounded = np.rint(transformed)
+    limit = np.float32(bound)
     saturation_count = int(np.count_nonzero(
-        (rounded < np.float32(-127.0)) | (rounded > np.float32(127.0))
+        (rounded < -limit) | (rounded > limit)
     ))
-    packed = np.clip(
-        rounded, np.float32(-127.0), np.float32(127.0),
-    ).astype(np.int8)
+    packed = np.clip(rounded, -limit, limit).astype(np.int8)
     reconstructed = np.multiply(
         packed.astype(np.float32), scales[:, None], dtype=np.float32,
     )
@@ -1885,7 +2560,8 @@ def _prove_batch_matmul_contract(
     left = activations[operands["a"]]
     right = activations[operands["b"]]
     output = activations[source.output_tensor]
-    width = int(graph.tensors[operands["a"]].shape[-1])
+    left_tensor = graph.tensors[operands["a"]]
+    width = _maximum_shape(graph, left_tensor)[-1]
     bound = (
         width
         * _storage_magnitude(left.dtype, left.zero_point)
@@ -1920,7 +2596,9 @@ def _prove_qsdpa_contract(
     output = activations[source.output_tensor]
     params = dict(source.params)
     heads = int(params["heads"])
-    head_dim = int(graph.tensors[operands["q"]].shape[-1]) // heads
+    head_dim = _fixed_extent(
+        graph.tensors[operands["q"]].shape[-1], "model feature", source.node,
+    ) // heads
     scale_source = params.get("scale")
     attention_scale = np.float32(
         1.0 / math.sqrt(head_dim) if scale_source is None else scale_source
@@ -1971,6 +2649,9 @@ def plan_runtime_ptq(
         raise TypeError("calibration must be an immutable CalibrationProfile")
     if not isinstance(config, PTQConfig):
         raise TypeError("config must be a PTQConfig")
+    weight_bound = (
+        _WEIGHT_BOUND_REDUCED if config.reduce_range else _WEIGHT_BOUND_FULL
+    )
     graph.verify(IRDialect.RUNTIME)
     _validate_tensor_store(graph, tensors)
     graph_fingerprint = graph.fingerprint()
@@ -2061,11 +2742,11 @@ def plan_runtime_ptq(
         output_plan = activation_by_name[source.output_tensor]
         source_weight = np.asarray(tensors[source.weight_tensor])
         out_in = np.ascontiguousarray(
-            source_weight if source.layout == "OUT_IN" else source_weight.T,
+            source_weight if source.layout == "dout_din" else source_weight.T,
             dtype=np.float32,
         )
         packed, weight_scales, saturation_count, maximum_error, mean_error = (
-            _pack_weight(out_in)
+            _pack_weight(out_in, None, weight_bound)
         )
         weight_plan = WeightQuantizationPlan(
             source_tensor=source.weight_tensor,
@@ -2126,12 +2807,17 @@ def plan_runtime_ptq(
         input_plan = activation_by_name[source.input_tensor]
         output_plan = activation_by_name[source.output_tensor]
         source_weight = np.asarray(tensors[source.weight_tensor])
+        if source.source_weight_layout == "HWIO":
+            # HWIO [kh, kw, in, out] -> OHWI [out, kh, kw, in]. Per-output-channel
+            # scales are derived after this, so the transpose has to happen before
+            # the reshape that defines those rows.
+            source_weight = np.transpose(source_weight, (3, 0, 1, 2))
         out_channels = source.weight_shape[0]
         flattened = np.ascontiguousarray(
             source_weight.reshape(out_channels, -1), dtype=np.float32,
         )
         packed_rows, weight_scales, saturation_count, maximum_error, mean_error = (
-            _pack_weight(flattened)
+            _pack_weight(flattened, None, weight_bound)
         )
         packed = np.ascontiguousarray(packed_rows.reshape(source.weight_shape))
         weight_plan = WeightQuantizationPlan(
@@ -2176,6 +2862,7 @@ def plan_runtime_ptq(
             output_tensor=source.output_tensor,
             source_weight=source.weight_tensor,
             source_bias=source.bias_tensor,
+            source_weight_layout=source.source_weight_layout,
             weight_shape=source.weight_shape,
             quantized_weight=weight_plan,
             quantized_bias_tensor=allocator.allocate(source.node.name, "bias"),
@@ -2193,7 +2880,7 @@ def plan_runtime_ptq(
             np.asarray(tensors[source.weight_tensor]), dtype=np.float32,
         )
         packed, weight_scales, saturation_count, maximum_error, mean_error = (
-            _pack_weight(table)
+            _pack_weight(table, None, weight_bound)
         )
         weight_plan = WeightQuantizationPlan(
             source_tensor=source.weight_tensor,
@@ -2336,6 +3023,10 @@ def _apply_plan(
     tensors: MutableMapping[str, Any],
     plan: PTQPlan,
 ) -> PTQMaterializationReport:
+    weight_bound = (
+        _WEIGHT_BOUND_REDUCED if plan.config.reduce_range
+        else _WEIGHT_BOUND_FULL
+    )
     activation_by_name = {
         activation.source_tensor: activation for activation in plan.activations
     }
@@ -2372,10 +3063,16 @@ def _apply_plan(
 
     for byte_plan in plan.byte_nodes:
         output_plan = activation_by_name[byte_plan.output_tensor]
-        output_shape = tuple(
-            int(value) for value in graph.tensors[byte_plan.output_tensor].shape
-        )
+        output_shape: tuple[int, ...] | None = None
+        if byte_plan.constant_inputs:
+            descriptor = graph.tensors[byte_plan.output_tensor]
+            if not descriptor.concrete:
+                raise AssertionError(
+                    "symbolic Add constants must be retained before materialization"
+                )
+            output_shape = tuple(int(value) for value in descriptor.shape)
         for constant_plan in byte_plan.constant_inputs:
+            assert output_shape is not None
             expanded = np.ascontiguousarray(
                 np.broadcast_to(
                     np.asarray(tensors[constant_plan.source_tensor]), output_shape,
@@ -2416,12 +3113,12 @@ def _apply_plan(
         weight_plan = node_plan.quantized_weight
         source_weight = np.asarray(tensors[node_plan.source_weight])
         out_in = np.ascontiguousarray(
-            source_weight if node_plan.source_layout == "OUT_IN"
+            source_weight if node_plan.source_layout == "dout_din"
             else source_weight.T,
             dtype=np.float32,
         )
         weight_scales = np.asarray(weight_plan.scales, dtype=np.float32)
-        packed, actual_scales, *_ = _pack_weight(out_in, weight_scales)
+        packed, actual_scales, *_ = _pack_weight(out_in, weight_scales, weight_bound)
         if (
             not np.array_equal(actual_scales, weight_scales)
             or hashlib.sha256(packed.tobytes(order="C")).hexdigest()
@@ -2457,12 +3154,15 @@ def _apply_plan(
 
     for node_plan in plan.conv_nodes:
         weight_plan = node_plan.quantized_weight
-        source_weight = np.ascontiguousarray(
-            np.asarray(tensors[node_plan.source_weight]), dtype=np.float32,
-        )
+        source_weight = np.asarray(tensors[node_plan.source_weight])
+        if node_plan.source_weight_layout == "HWIO":
+            source_weight = np.transpose(source_weight, (3, 0, 1, 2))
+        source_weight = np.ascontiguousarray(source_weight, dtype=np.float32)
         weight_scales = np.asarray(weight_plan.scales, dtype=np.float32)
         packed_rows, actual_scales, *_ = _pack_weight(
-            source_weight.reshape(node_plan.weight_shape[0], -1), weight_scales,
+            source_weight.reshape(node_plan.weight_shape[0], -1),
+            weight_scales,
+            weight_bound,
         )
         packed = np.ascontiguousarray(packed_rows.reshape(node_plan.weight_shape))
         if (
@@ -2504,7 +3204,7 @@ def _apply_plan(
             np.asarray(tensors[node_plan.source_weight]), dtype=np.float32,
         )
         weight_scales = np.asarray(weight_plan.scales, dtype=np.float32)
-        packed, actual_scales, *_ = _pack_weight(source_weight, weight_scales)
+        packed, actual_scales, *_ = _pack_weight(source_weight, weight_scales, weight_bound)
         if (
             not np.array_equal(actual_scales, weight_scales)
             or hashlib.sha256(packed.tobytes(order="C")).hexdigest()

@@ -40,6 +40,30 @@ static double vx_now(void) {
     return (double)t.tv_sec + 1e-9 * (double)t.tv_nsec;
 }
 
+/*
+ * Each case allocates, fills and packs its own operands, and the caller times
+ * the whole call.  That is accurate while the repetition count is high enough
+ * to amortize setup, which it is for the encoder shapes this file started
+ * with — 402x320x320 repeats 48 times.  It stops being accurate as the shapes
+ * grow: reps is 2e9/work, so a 512x2048x2048 GEMM repeats once and the timer
+ * then measures filling and packing a 16 MB weight alongside the kernel, which
+ * reported 24 GMAC/s for a kernel doing 52.
+ *
+ * A case may therefore bracket its own repetition loop.  When it does, that
+ * measurement is authoritative; when it does not, the caller's whole-call
+ * timing stands, which remains correct at the sizes those cases run.
+ */
+static double g_vx_bench_inner_start;
+static double g_vx_bench_inner_ms;
+
+#define VX_BENCH_TIME_BEGIN() \
+    do { g_vx_bench_inner_start = vx_now(); } while (0)
+#define VX_BENCH_TIME_END(reps)                                              \
+    do {                                                                     \
+        g_vx_bench_inner_ms =                                                \
+            (vx_now() - g_vx_bench_inner_start) / (double)(reps);            \
+    } while (0)
+
 static uint32_t vx_rand_state = 0x12345678u;
 static uint32_t vx_rand(void) {
     vx_rand_state = vx_rand_state * 1103515245u + 12345u;
@@ -136,9 +160,9 @@ static int vx_bench_qlinear(const VxBenchCase* c, int reps, int reference) {
 /* The runtime hands convolution a pre-packed weight, which routes im2col into
  * the packed GEMM.  Measuring only the unpacked entry point would report a path
  * the model never takes, so both are cases. */
-/* The raw QLinear dispatcher.  This is the only path that reaches the AVX-VNNI
- * and AVX-512-VNNI kernels: the packed GEMM above has no VNNI variant, so
- * without this case those kernels get no throughput coverage at all. */
+/* The raw QLinear dispatcher has its own K-major tiled AVX-VNNI and
+ * AVX-512-VNNI kernels.  Keep it beside the packed N32 VNNI case above so the
+ * benchmark covers both physical layouts and their independent dispatchers. */
 static int vx_bench_qlinear_raw(const VxBenchCase* c, int reps, int reference) {
     const uint32_t M = c->m, K = c->k, N = c->n;
     int8_t* weight = (int8_t*)vx_alloc((size_t)K * N);
@@ -169,6 +193,49 @@ static int vx_bench_qlinear_raw(const VxBenchCase* c, int reps, int reference) {
 #undef VX_BENCH_QLINEAR_RAW
     free(weight); free(input); free(out); free(ref);
     free(bias); free(wscale); free(wzp);
+    return ok;
+}
+
+/* Dynamic W8A8 MatMul cannot retain an immutable packed B, so this measures
+ * the complete one-pair kernel, including any per-call panel preparation.
+ * The two attention shapes exercise QK^T and the dynamic projection shapes
+ * exercise both narrow and wide N without baking model-specific routing into
+ * the kernel itself. */
+static int vx_bench_qbatch_matmul(const VxBenchCase* c, int reps,
+                                  int reference) {
+    const uint32_t M = c->m, K = c->k, N = c->n;
+    uint8_t* a = (uint8_t*)vx_alloc((size_t)M * K);
+    int8_t* b = (int8_t*)vx_alloc((size_t)K * N);
+    uint8_t* out = (uint8_t*)vx_alloc((size_t)M * N);
+    uint8_t* ref = (uint8_t*)vx_alloc((size_t)M * N);
+    const size_t workspace_bytes =
+        vx_qbatch_matmul_i8u8_native_workspace_bytes(M, K, N);
+    void* workspace = workspace_bytes ? vx_alloc(workspace_bytes) : NULL;
+    int ok = 1;
+    vx_seed(13u + M * 7u + K * 17u + N * 31u);
+    vx_fill_u8(a, (size_t)M * K);
+    vx_fill_i8(b, (size_t)K * N);
+    if (reference) {
+        ok = qbatch_matmul_i8u8(
+            a, b, ref, M, K, N, 0.01f, 128, 0.01f, 0, 0.1f, 128,
+            VX_DTYPE_U8, VX_DTYPE_I8, VX_DTYPE_U8);
+        if (ok && (!vx_qbatch_matmul_i8u8_native_with_workspace(
+                a, b, out, M, K, N, 0.01f, 128, 0.01f, 0, 0.1f, 128,
+                VX_DTYPE_U8, VX_DTYPE_I8, VX_DTYPE_U8,
+                workspace, workspace_bytes) ||
+                memcmp(out, ref, (size_t)M * N) != 0))
+            ok = -1;
+    }
+    if (ok > 0) {
+        VX_BENCH_TIME_BEGIN();
+        for (int i = 0; i < reps; i++)
+            vx_qbatch_matmul_i8u8_native_with_workspace(
+                a, b, out, M, K, N, 0.01f, 128, 0.01f, 0, 0.1f, 128,
+                VX_DTYPE_U8, VX_DTYPE_I8, VX_DTYPE_U8,
+                workspace, workspace_bytes);
+        VX_BENCH_TIME_END(reps);
+    }
+    free(a); free(b); free(out); free(ref); free(workspace);
     return ok;
 }
 
@@ -224,7 +291,7 @@ static int vx_bench_qconv_common(const VxBenchCase* c, int reps, int reference,
     vx_qconv2d_i8u8_native_prepacked(input, weight, bias, wscale, wzp, (dst), \
                  1u, IH, IW, CIN, OH, OW, COUT, 3u, 3u, CIN, S, S, 1u, 1u, \
                  1u, 1u, 1u, 1u, 1u, 0u, 0.01f, 128, 0.05f, 128, \
-                 VX_DTYPE_U8, VX_DTYPE_I8, VX_DTYPE_U8, packed)
+                 VX_DTYPE_U8, VX_DTYPE_I8, VX_DTYPE_U8, packed, NULL)
     if (reference) {
         VX_BENCH_QCONV(ref);
         VX_BENCH_QCONV_NATIVE(out);
@@ -446,9 +513,12 @@ static int vx_bench_gemm_f32_packed(const VxBenchCase* c, int reps, int referenc
         else if (!vx_f32_close(out, ref, (size_t)M * N)) ok = -1;
         else ok = VX_BENCH_CLOSE;
     }
-    if (ok > 0)
+    if (ok > 0) {
+        VX_BENCH_TIME_BEGIN();
         for (int i = 0; i < reps; i++)
             vx_gemm_f32_run_packed(a, packed, bias, out, M, K, N);
+        VX_BENCH_TIME_END(reps);
+    }
     free(a); free(weight); free(packed); free(bias); free(out); free(ref);
     return ok;
 }
@@ -477,9 +547,12 @@ static int vx_bench_matmul_f32(const VxBenchCase* c, int reps, int reference) {
         matmul_f32(a, b, NULL, out, (int)M, (int)K, (int)N);
         ok = vx_f32_close(out, ref, (size_t)M * N) ? VX_BENCH_CLOSE : -1;
     }
-    if (ok > 0)
+    if (ok > 0) {
+        VX_BENCH_TIME_BEGIN();
         for (int i = 0; i < reps; i++)
             matmul_f32(a, b, NULL, out, (int)M, (int)K, (int)N);
+        VX_BENCH_TIME_END(reps);
+    }
     free(a); free(b); free(out); free(ref);
     return ok;
 }
@@ -539,10 +612,8 @@ static int vx_bench_cross_sdpa_f32(const VxBenchCase* c, int reps, int reference
     const int d_model = (int)c->k, heads = (int)c->b;
     const int head_dim = d_model / heads;
     const float scale = 1.0f / (float)__builtin_sqrt((double)head_dim);
-    /* c->c selects the mask mode.  The TinyReceipt decoder always passes a key
-     * mask (memory_padding_mask), so an unmasked-only case measured a shape the
-     * model never executes — and the kernel's masked and unmasked paths differ
-     * enough that the distinction matters. */
+    /* c->c selects the mask mode. Bounded cross-attention decoders commonly
+     * pass a key memory mask, whose distinct cost is worth benchmarking. */
     const int mask_mode = (int)c->c;
     float* q = (float*)vx_alloc((size_t)seq_q * d_model * 4);
     float* k = (float*)vx_alloc((size_t)seq_kv * d_model * 4);
@@ -743,8 +814,8 @@ typedef struct {
     int (*run)(const VxBenchCase*, int, int);
 } VxBenchEntry;
 
-/* Shapes are the ones the TinyReceipt encoder and decoder actually execute, so
- * a win here is a win in the model rather than on a synthetic square. */
+/* Shapes are representative bounded encoder and decoder workloads rather than
+ * synthetic square matrices. */
 static const VxBenchEntry vx_bench_entries[] = {
   /* name              onnx op            shape                    m     k     n    a   b  c  unit        */
   {{"qlinear",         "QLinearMatMul",  "402x320x320",          402,  320,  320,  0,  0, 0, VX_UNIT_MAC, 0}, vx_bench_qlinear},
@@ -755,6 +826,11 @@ static const VxBenchEntry vx_bench_entries[] = {
   {{"qlinear_raw",     "QLinearMatMul",  "402x320x320",          402,  320,  320,  0,  0, 0, VX_UNIT_MAC, 0}, vx_bench_qlinear_raw},
   {{"qlinear_raw",     "QLinearMatMul",  "402x64x320",           402,   64,  320,  0,  0, 0, VX_UNIT_MAC, 0}, vx_bench_qlinear_raw},
   {{"qlinear_raw",     "QLinearMatMul",  "402x1280x320",         402, 1280,  320,  0,  0, 0, VX_UNIT_MAC, 0}, vx_bench_qlinear_raw},
+  {{"qbatch_matmul",   "QLinearMatMul",  "attention 218x40x218", 218,   40,  218,  0,  0, 0, VX_UNIT_MAC, 0}, vx_bench_qbatch_matmul},
+  {{"qbatch_matmul",   "QLinearMatMul",  "dynamic 218x320x64",   218,  320,   64,  0,  0, 0, VX_UNIT_MAC, 0}, vx_bench_qbatch_matmul},
+  {{"qbatch_matmul",   "QLinearMatMul",  "dynamic 218x64x320",   218,   64,  320,  0,  0, 0, VX_UNIT_MAC, 0}, vx_bench_qbatch_matmul},
+  {{"qbatch_matmul",   "QLinearMatMul",  "decode 1x40x218",        1,   40,  218,  0,  0, 0, VX_UNIT_MAC, 0}, vx_bench_qbatch_matmul},
+  {{"qbatch_matmul",   "QLinearMatMul",  "decode 1x320x64",        1,  320,   64,  0,  0, 0, VX_UNIT_MAC, 0}, vx_bench_qbatch_matmul},
   {{"qconv2d",         "QLinearConv",    "80x168 c48->96 s1",      0,   48,   96, 80,168, 1, VX_UNIT_MAC, 0}, vx_bench_qconv},
   {{"qconv2d",         "QLinearConv",    "40x84 c96->192 s1",      0,   96,  192, 40, 84, 1, VX_UNIT_MAC, 0}, vx_bench_qconv},
   {{"qconv2d",         "QLinearConv",    "20x42 c192->320 s1",     0,  192,  320, 20, 42, 1, VX_UNIT_MAC, 0}, vx_bench_qconv},
@@ -777,6 +853,28 @@ static const VxBenchEntry vx_bench_entries[] = {
   {{"gemm_f32_packed", "MatMul",         "1x320x320",              1,  320,  320,  0,  0, 0, VX_UNIT_MAC, 0}, vx_bench_gemm_f32_packed},
   {{"matmul_f32",      "MatMul",         "402x320x320",          402,  320,  320,  0,  0, 0, VX_UNIT_MAC, 0}, vx_bench_matmul_f32},
   {{"matmul_f32",      "MatMul",         "192x402x320",          192,  402,  320,  0,  0, 0, VX_UNIT_MAC, 0}, vx_bench_matmul_f32},
+  /* Shapes no model in this repository runs today.  They are here because the
+   * dense cases above are all one model's encoder, and a kernel tuned only
+   * against them looked healthy while collapsing by an order of magnitude as K
+   * and N grew: the unpacked kernel measured 42 GMAC/s at 402x320x320 and 4.0
+   * at 256x4096x4096, because nothing here had ever asked it for a shape whose
+   * weights leave L2.  LLM prefill is the compute-bound regime, LLM decode the
+   * bandwidth-bound one where M=1 and no blocking can help, and im2col is what
+   * a convolution lowered to a GEMM looks like.  A dense kernel that regresses
+   * on any of the three is not general, whatever it scores on the rest. */
+  {{"gemm_f32_packed", "MatMul",         "llm prefill 512x2048x2048",  512, 2048, 2048, 0, 0, 0, VX_UNIT_MAC, 0}, vx_bench_gemm_f32_packed},
+  {{"gemm_f32_packed", "MatMul",         "llm prefill 512x2048x5632",  512, 2048, 5632, 0, 0, 0, VX_UNIT_MAC, 0}, vx_bench_gemm_f32_packed},
+  {{"gemm_f32_packed", "MatMul",         "llm prefill 256x4096x4096",  256, 4096, 4096, 0, 0, 0, VX_UNIT_MAC, 0}, vx_bench_gemm_f32_packed},
+  {{"gemm_f32_packed", "MatMul",         "llm decode  1x2048x2048",      1, 2048, 2048, 0, 0, 0, VX_UNIT_MAC, 0}, vx_bench_gemm_f32_packed},
+  {{"gemm_f32_packed", "MatMul",         "llm decode  1x4096x4096",      1, 4096, 4096, 0, 0, 0, VX_UNIT_MAC, 0}, vx_bench_gemm_f32_packed},
+  {{"gemm_f32_packed", "MatMul",         "cnn im2col  3136x576x128",  3136,  576,  128, 0, 0, 0, VX_UNIT_MAC, 0}, vx_bench_gemm_f32_packed},
+  {{"gemm_f32_packed", "MatMul",         "cnn im2col  784x1152x256",   784, 1152,  256, 0, 0, 0, VX_UNIT_MAC, 0}, vx_bench_gemm_f32_packed},
+  /* Ragged in all three dimensions: exercises the edge microkernel, which is
+   * where the packed and unpacked paths most easily disagree. */
+  {{"gemm_f32_packed", "MatMul",         "ragged      101x333x257",    101,  333,  257, 0, 0, 0, VX_UNIT_MAC, 0}, vx_bench_gemm_f32_packed},
+  {{"matmul_f32",      "MatMul",         "llm prefill 512x2048x2048",  512, 2048, 2048, 0, 0, 0, VX_UNIT_MAC, 0}, vx_bench_matmul_f32},
+  {{"matmul_f32",      "MatMul",         "llm decode  1x4096x4096",      1, 4096, 4096, 0, 0, 0, VX_UNIT_MAC, 0}, vx_bench_matmul_f32},
+  {{"matmul_f32",      "MatMul",         "ragged      101x333x257",    101,  333,  257, 0, 0, 0, VX_UNIT_MAC, 0}, vx_bench_matmul_f32},
   {{"conv2d_f32",      "Conv",           "80x168 c48->96 s1",      0,   48,   96, 80,168, 1, VX_UNIT_MAC, 0}, vx_bench_conv2d_f32},
   {{"conv2d_f32",      "Conv",           "40x84 c96->192 s1",      0,   96,  192, 40, 84, 1, VX_UNIT_MAC, 0}, vx_bench_conv2d_f32},
   {{"conv2d_f32",      "Conv",           "20x42 c192->320 s1",     0,  192,  320, 20, 42, 1, VX_UNIT_MAC, 0}, vx_bench_conv2d_f32},
@@ -801,7 +899,8 @@ static const VxBenchEntry vx_bench_entries[] = {
 
 static double vx_case_work(const VxBenchEntry* e) {
     const VxBenchCase* c = &e->c;
-    if (e->run == vx_bench_qlinear || e->run == vx_bench_qlinear_raw)
+    if (e->run == vx_bench_qlinear || e->run == vx_bench_qlinear_raw ||
+        e->run == vx_bench_qbatch_matmul)
         return (double)c->m * c->k * c->n;
     if (e->run == vx_bench_qconv || e->run == vx_bench_qconv_packed)
         return (double)c->a * c->b * 9.0 * c->k * c->n;
@@ -880,9 +979,13 @@ int main(int argc, char** argv) {
         double best = 1e30;
         if (verdict >= 0) {
             for (int t = 0; t < VX_BENCH_TRIALS; t++) {
-                double t0 = vx_now();
+                double t0;
+                double dt;
+                g_vx_bench_inner_ms = -1.0;
+                t0 = vx_now();
                 e->run(&e->c, reps, 0);
-                double dt = (vx_now() - t0) / (double)reps;
+                dt = g_vx_bench_inner_ms >= 0.0
+                    ? g_vx_bench_inner_ms : (vx_now() - t0) / (double)reps;
                 if (dt < best) best = dt;
             }
         }

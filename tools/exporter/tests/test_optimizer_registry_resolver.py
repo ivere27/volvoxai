@@ -36,6 +36,9 @@ from tools.exporter.optimizer.typed_quantized_attention import (
 from tools.exporter.optimizer.typed_quantized_bias_folding import (
     RuntimeQuantizedBiasFoldingPass,
 )
+from tools.exporter.optimizer.typed_groupnorm_silu_island import (
+    RuntimeStaticQDQGroupNormSiLUFusionPass,
+)
 from tools.exporter.optimizer.typed_specialization import InputHoistingSpec
 from tools.exporter.optimizer.typed_pipeline import (
     default_runtime_pipeline,
@@ -101,15 +104,17 @@ def _flatten(recipe_id: str, features=()) -> tuple[str, ...]:
 def _identity_package() -> dict:
     return {
         "format": "volvox-graph/v1",
+        "dimensions": {},
         "inputs": {"x": {"shape": [1], "dtype": "float32"}},
         "outputs": ["y"],
         "nodes": [{
             "id": "identity",
             "opType": "Identity",
             "inputs": {"input": "x"},
-            "outputs": {"out": "y"},
-            "outputs_shape": {"out": [1]},
-            "outputs_dtype": {"out": "float32"},
+            "outputs": {"out": {
+                "tensor": "y", "shape": [1], "dtype": "float32",
+            }},
+            "params": {},
         }],
     }
 
@@ -117,6 +122,7 @@ def _identity_package() -> dict:
 def _transpose_elementwise_package(operator: str) -> dict:
     return {
         "format": "volvox-graph/v1",
+        "dimensions": {},
         "inputs": {"x": {"shape": [1, 2, 3], "dtype": "float32"}},
         "outputs": ["y"],
         "nodes": [
@@ -124,26 +130,30 @@ def _transpose_elementwise_package(operator: str) -> dict:
                 "id": "to-moved",
                 "opType": "Transpose",
                 "inputs": {"input": "x"},
-                "outputs": {"out": "moved"},
-                "outputs_shape": {"out": [1, 3, 2]},
-                "outputs_dtype": {"out": "float32"},
+                "outputs": {"out": {
+                    "tensor": "moved", "shape": [1, 3, 2],
+                    "dtype": "float32",
+                }},
                 "params": {"perm": [0, 2, 1]},
             },
             {
                 "id": "elementwise",
                 "opType": operator,
                 "inputs": {"input": "moved"},
-                "outputs": {"out": "activated"},
-                "outputs_shape": {"out": [1, 3, 2]},
-                "outputs_dtype": {"out": "float32"},
+                "outputs": {"out": {
+                    "tensor": "activated", "shape": [1, 3, 2],
+                    "dtype": "float32",
+                }},
+                "params": {},
             },
             {
                 "id": "to-source",
                 "opType": "Transpose",
                 "inputs": {"input": "activated"},
-                "outputs": {"out": "y"},
-                "outputs_shape": {"out": [1, 2, 3]},
-                "outputs_dtype": {"out": "float32"},
+                "outputs": {"out": {
+                    "tensor": "y", "shape": [1, 2, 3],
+                    "dtype": "float32",
+                }},
                 "params": {"perm": [0, 2, 1]},
             },
         ],
@@ -153,6 +163,7 @@ def _transpose_elementwise_package(operator: str) -> dict:
 def _relu_chain_package(count: int, *, stale_package_class: bool = False) -> dict:
     document = {
         "format": "volvox-graph/v1",
+        "dimensions": {},
         "inputs": {"x": {"shape": [1], "dtype": "float32"}},
         "outputs": [f"value_{count}"],
         "nodes": [
@@ -162,9 +173,12 @@ def _relu_chain_package(count: int, *, stale_package_class: bool = False) -> dic
                 "inputs": {
                     "input": "x" if index == 0 else f"value_{index}"
                 },
-                "outputs": {"out": f"value_{index + 1}"},
-                "outputs_shape": {"out": [1]},
-                "outputs_dtype": {"out": "float32"},
+                "outputs": {"out": {
+                    "tensor": f"value_{index + 1}",
+                    "shape": [1],
+                    "dtype": "float32",
+                }},
+                "params": {},
             }
             for index in range(count)
         ],
@@ -406,7 +420,34 @@ class OptimizerRegistryResolverTests(unittest.TestCase):
             _flatten("runtime-package"),
         )
 
-    def test_quantized_bias_factory_is_bound_only_to_migration_recipes(self):
+    def test_silu_migration_is_a_narrow_explicit_runtime_package_feature(self):
+        default = default_runtime_pipeline(tensor_data={})
+        selected = default_runtime_pipeline(
+            tensor_data={},
+            allow_silu_numerical_migration=True,
+        )
+
+        self.assertNotIn("runtime-silu-fusion", default.metadata.pass_ids)
+        self.assertEqual(selected.metadata.recipe_id, "runtime-package")
+        self.assertEqual(selected.metadata.selection_features, ("silu-fusion",))
+        self.assertIn("runtime-silu-migration-prelude", selected.metadata.group_ids)
+        self.assertEqual(selected.metadata.pass_ids.count("runtime-silu-fusion"), 1)
+        for unrelated in (
+            "runtime-bias-folding",
+            "runtime-grouped-projection-split",
+            "runtime-sequence-layout",
+        ):
+            self.assertNotIn(unrelated, selected.metadata.pass_ids)
+
+        broader = default_runtime_pipeline(
+            tensor_data={},
+            allow_silu_numerical_migration=True,
+            enable_fp32_pre_ptq_optimization=True,
+        )
+        self.assertEqual(broader.metadata.recipe_id, "runtime-fp32-pre-ptq")
+        self.assertEqual(broader.metadata.pass_ids.count("runtime-silu-fusion"), 1)
+
+    def test_quantized_bias_factory_has_independent_narrow_opt_in(self):
         tensors = {}
         pipeline = default_runtime_pipeline(
             tensor_data=tensors,
@@ -437,6 +478,90 @@ class OptimizerRegistryResolverTests(unittest.TestCase):
             "runtime-quantized-bias-folding",
             _flatten("runtime-ptq-authoring", ("ptq-authoring",)),
         )
+
+        narrow = default_runtime_pipeline(
+            tensor_data=tensors,
+            allow_quantized_bias_folding_numerical_migration=True,
+        )
+        self.assertEqual(
+            narrow.metadata.selection_features,
+            ("quantized-bias-folding",),
+        )
+        self.assertIn(
+            "runtime-quantized-bias-migration-prelude",
+            narrow.metadata.group_ids,
+        )
+        self.assertNotIn(
+            "runtime-quantized-migration-prelude",
+            narrow.metadata.group_ids,
+        )
+        self.assertEqual(
+            narrow.metadata.pass_ids.count("runtime-quantized-bias-folding"),
+            1,
+        )
+        for unrelated in (
+            "runtime-static-qdq-compute-fusion",
+            "runtime-bias-folding",
+            "runtime-silu-fusion",
+            "runtime-grouped-projection-split",
+            "runtime-sequence-layout",
+        ):
+            self.assertNotIn(unrelated, narrow.metadata.pass_ids)
+
+        combined = default_runtime_pipeline(
+            tensor_data=tensors,
+            allow_static_qdq_compute_numerical_migration=True,
+            allow_quantized_bias_folding_numerical_migration=True,
+        )
+        self.assertEqual(
+            combined.metadata.pass_ids.count("runtime-quantized-bias-folding"),
+            1,
+        )
+        self.assertIn(
+            "runtime-quantized-migration-prelude",
+            combined.metadata.group_ids,
+        )
+        self.assertNotIn(
+            "runtime-quantized-bias-migration-prelude",
+            combined.metadata.group_ids,
+        )
+
+    def test_groupnorm_silu_factory_has_independent_narrow_opt_in(self):
+        tensors = {}
+        default = default_runtime_pipeline(tensor_data=tensors)
+        selected = default_runtime_pipeline(
+            tensor_data=tensors,
+            allow_static_qdq_groupnorm_silu_numerical_migration=True,
+        )
+
+        self.assertNotIn(
+            "runtime-static-qdq-groupnorm-silu-fusion",
+            default.metadata.pass_ids,
+        )
+        self.assertEqual(
+            selected.metadata.selection_features,
+            ("static-qdq-groupnorm-silu-migration",),
+        )
+        self.assertIn(
+            "runtime-static-qdq-groupnorm-silu-migration",
+            selected.metadata.group_ids,
+        )
+        instances = {
+            item.name: item
+            for group in selected.groups
+            for item in group.passes
+        }
+        fusion = instances["runtime-static-qdq-groupnorm-silu-fusion"]
+        self.assertIsInstance(
+            fusion, RuntimeStaticQDQGroupNormSiLUFusionPass,
+        )
+        self.assertIs(fusion.tensor_data, tensors)
+        for unrelated in (
+            "runtime-static-qdq-compute-fusion",
+            "runtime-static-qdq-qbatch-matmul-fusion",
+            "runtime-quantized-bias-folding",
+        ):
+            self.assertNotIn(unrelated, selected.metadata.pass_ids)
 
     def test_independent_features_compose_without_cartesian_recipes(self):
         specialization = OutputArgMaxSpecialization("logits", "token")
@@ -558,6 +683,7 @@ class OptimizerRegistryResolverTests(unittest.TestCase):
             _transpose_elementwise_package("ReLU"),
             {},
             target_environment=_target("portable"),
+            shape_profile={},
         )
         moved = [
             run for run in report.runs
@@ -597,15 +723,12 @@ class OptimizerRegistryResolverTests(unittest.TestCase):
         self.assertEqual(caught.exception.diagnostic.code, "VXCAP_NATIVE_NODES")
         self.assertEqual(caught.exception.diagnostic.target, "native-cpu")
 
-        stale = import_runtime_package(
-            _relu_chain_package(1, stale_package_class=True),
-            {},
-        )
-        report = default_runtime_pipeline(
-            tensor_data={},
-            target_environment=_target("portable"),
-        ).run(stale)
-        self.assertTrue(report.runs)
+        with self.assertRaises(ExporterError) as stale:
+            import_runtime_package(
+                _relu_chain_package(1, stale_package_class=True),
+                {},
+            )
+        self.assertEqual(stale.exception.diagnostic.code, "VXRTIR038")
 
     def test_compile_and_tune_backends_are_validated_but_do_not_select_passes(self):
         with self.assertRaisesRegex(
@@ -673,6 +796,13 @@ class OptimizerRegistryResolverTests(unittest.TestCase):
         ):
             resolve_runtime_pipeline(_request(
                 features=("static-qdq-compute-migration",),
+            ))
+
+        with self.assertRaisesRegex(
+            OptimizerRegistryError, "rewrite policy rejects pass",
+        ):
+            resolve_runtime_pipeline(_request(
+                features=("quantized-bias-folding",),
             ))
 
         specialization = OutputArgMaxSpecialization("logits", "token")

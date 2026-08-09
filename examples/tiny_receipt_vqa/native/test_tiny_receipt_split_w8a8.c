@@ -3,6 +3,7 @@
 #endif
 
 #include "tiny_receipt_split_w8a8.h"
+#include "tiny_receipt_image.h"
 
 #include "safetensors.h"
 
@@ -78,6 +79,52 @@ static int write_bytes(const char* path, const unsigned char* bytes, size_t coun
     return 0;
 }
 
+static int test_image_normalization_f32_contract(void) {
+    static const unsigned char rgb[] = {
+        64, 64, 64, 128, 128, 128, 191, 191, 191,
+    };
+    static const uint32_t expected[] = {
+        0xbefefefeu, 0x3b808100u, 0x3efeff00u,
+    };
+    float output[3];
+    CHECK(tiny_receipt_rgb_to_grayscale_bilinear(rgb, 3, 1, output, 3, 1) == 0);
+    for (size_t index = 0; index < 3; index++) {
+        uint32_t bits;
+        memcpy(&bits, &output[index], sizeof(bits));
+        CHECK(bits == expected[index]);
+    }
+    return 0;
+}
+
+static VxReport strict_report_fixture(const char* backend) {
+    VxReport report = VX_REPORT_INIT;
+    report.policy_mode = VX_BACKEND_REQUIRE;
+    report.operator_fallback = VX_OPERATOR_FALLBACK_FORBID;
+    report.route_attested = 1;
+    snprintf(report.backend, sizeof(report.backend), "%s", backend);
+    snprintf(report.route_evidence, sizeof(report.route_evidence), "%s",
+             "provider=builtin:cpu;nodes=1;selected=1;fallback=0;missing=0");
+    snprintf(report.fallback_evidence, sizeof(report.fallback_evidence), "%s",
+             "tier=none;operator=none");
+    return report;
+}
+
+static int test_strict_backend_report_contract(void) {
+    VxReport report = strict_report_fixture("cpu");
+    CHECK(tiny_receipt_split_w8a8_report_proves_strict_backend(
+        &report, "cpu") == 1);
+    CHECK(tiny_receipt_split_w8a8_report_proves_strict_backend(
+        &report, "cuda") == 0);
+    report.operator_fallback = VX_OPERATOR_FALLBACK_ALLOW;
+    CHECK(tiny_receipt_split_w8a8_report_proves_strict_backend(
+        &report, "cpu") == 0);
+    report = strict_report_fixture("cpu");
+    report.policy_mode = VX_BACKEND_PREFER;
+    CHECK(tiny_receipt_split_w8a8_report_proves_strict_backend(
+        &report, "cpu") == 0);
+    return 0;
+}
+
 static long file_size(const char* path) {
     struct stat st;
     return stat(path, &st) == 0 && st.st_size > 0 ? (long)st.st_size : -1;
@@ -144,7 +191,130 @@ static int output_has_line(const char* output, const char* expected) {
     return 0;
 }
 
-static int run_and_capture(int argc, char** argv, int expect_success,
+static size_t output_line_count(const char* output, const char* expected,
+                                int exact) {
+    const char* cursor = output;
+    const size_t expected_length = strlen(expected);
+    size_t count = 0;
+    while (cursor && *cursor) {
+        const char* newline = strchr(cursor, '\n');
+        size_t length = newline ? (size_t)(newline - cursor) : strlen(cursor);
+        if (length >= expected_length &&
+            memcmp(cursor, expected, expected_length) == 0 &&
+            (!exact || length == expected_length))
+            count++;
+        cursor = newline ? newline + 1 : NULL;
+    }
+    return count;
+}
+
+static int read_capture(FILE* capture, char** output) {
+    long output_size;
+    char* value = NULL;
+    if (!capture || !output || fseek(capture, 0, SEEK_END) != 0 ||
+        (output_size = ftell(capture)) < 0 ||
+        fseek(capture, 0, SEEK_SET) != 0 ||
+        !(value = (char*)malloc((size_t)output_size + 1)) ||
+        fread(value, 1, (size_t)output_size, capture) != (size_t)output_size) {
+        free(value);
+        return -1;
+    }
+    value[output_size] = 0;
+    *output = value;
+    return 0;
+}
+
+static int run_and_capture_warmup(int argc, char** argv, int warmup_count,
+                                  const char* expected_answer) {
+    FILE* stdout_capture = NULL;
+    FILE* stderr_capture = NULL;
+    int saved_stdout = -1;
+    int saved_stderr = -1;
+    int stdout_redirected = 0;
+    int stderr_redirected = 0;
+    int run_status;
+    int status = -1;
+    char* output = NULL;
+    char* debug = NULL;
+    char count_evidence[96];
+
+    if (warmup_count < 1 || !expected_answer ||
+        fflush(stdout) != 0 || fflush(stderr) != 0 ||
+        !(stdout_capture = tmpfile()) || !(stderr_capture = tmpfile()) ||
+        (saved_stdout = dup(STDOUT_FILENO)) < 0 ||
+        (saved_stderr = dup(STDERR_FILENO)) < 0 ||
+        dup2(fileno(stdout_capture), STDOUT_FILENO) < 0)
+        goto done;
+    stdout_redirected = 1;
+    if (dup2(fileno(stderr_capture), STDERR_FILENO) < 0) goto done;
+    stderr_redirected = 1;
+    run_status = tiny_receipt_split_w8a8_run(argc, argv);
+    if (fflush(stdout) != 0 || fflush(stderr) != 0 ||
+        dup2(saved_stdout, STDOUT_FILENO) < 0 ||
+        dup2(saved_stderr, STDERR_FILENO) < 0)
+        goto done;
+    stdout_redirected = 0;
+    stderr_redirected = 0;
+    if (run_status != 0 || read_capture(stdout_capture, &output) != 0 ||
+        read_capture(stderr_capture, &debug) != 0)
+        goto done;
+    snprintf(count_evidence, sizeof(count_evidence),
+             "count=%d warmup_timed=0 measured_runs=1", warmup_count);
+    if (output_line_count(output, expected_answer, 1) != 1 ||
+        output_line_count(output, "WARMUP_RESULT ", 0) != 1 ||
+        !strstr(output, count_evidence) ||
+        !strstr(output,
+                "same_runtime=1 same_encoder_context=1 same_decoder_context=1 ") ||
+        !strstr(output,
+                "strict_no_fallback=1 token_parity=1 cache_parity=1 cache_reset=1 ") ||
+        !strstr(output,
+                "family_id=0 tokens=2 token_digest=9a76ad00c5544905 ") ||
+        !strstr(output,
+                "token_ids=4,2 seed_P=1 seed_R=2 last_P=2 last_R=3 cache_preserved=1") ||
+        output_line_count(debug, "[debug] tinyreceipt split ABI=", 0) != 1 ||
+        output_line_count(debug,
+                          "[debug] tinyreceipt split input_f32_sha256=", 0) != 1 ||
+        output_line_count(debug,
+                          "[debug] tinyreceipt split question_token_ids=", 0) != 1 ||
+        output_line_count(debug, "[debug] tinyreceipt split router=", 0) != 1 ||
+        output_line_count(debug,
+                          "[debug] tinyreceipt split encoder shape ", 0) != 1 ||
+        output_line_count(debug,
+                          "[debug] tinyreceipt explicit-kv family=phone step=", 0) != 2 ||
+        output_line_count(debug,
+                          "[debug] tinyreceipt split decoder shape ", 0) != 2 ||
+        output_line_count(debug,
+                          "[debug] tinyreceipt explicit-kv family=phone tokens=", 0) != 1 ||
+        output_line_count(debug,
+                          "[debug] tinyreceipt split emitted_token_ids=", 0) != 1 ||
+        output_line_count(debug,
+                          "[debug] tinyreceipt split shape mode=", 0) != 1) {
+        fprintf(stderr,
+                "FAIL: warmup output is not uniquely parseable\nstdout:\n%s\nstderr:\n%s",
+                output, debug);
+        goto done;
+    }
+    status = 0;
+
+done:
+    if (stdout_redirected) {
+        (void)fflush(stdout);
+        if (saved_stdout >= 0) (void)dup2(saved_stdout, STDOUT_FILENO);
+    }
+    if (stderr_redirected) {
+        (void)fflush(stderr);
+        if (saved_stderr >= 0) (void)dup2(saved_stderr, STDERR_FILENO);
+    }
+    if (saved_stdout >= 0) close(saved_stdout);
+    if (saved_stderr >= 0) close(saved_stderr);
+    if (stdout_capture) fclose(stdout_capture);
+    if (stderr_capture) fclose(stderr_capture);
+    free(output);
+    free(debug);
+    return status;
+}
+
+static int run_and_capture(int argc, char** argv, int expected_status,
                            const char* expected_answer) {
     FILE* capture = NULL;
     int saved_stdout = -1;
@@ -161,7 +331,7 @@ static int run_and_capture(int argc, char** argv, int expect_success,
     run_status = tiny_receipt_split_w8a8_run(argc, argv);
     if (fflush(stdout) != 0 || dup2(saved_stdout, STDOUT_FILENO) < 0) goto done;
     redirected = 0;
-    if ((run_status == 0) != expect_success ||
+    if (run_status != expected_status ||
         fseek(capture, 0, SEEK_END) != 0 ||
         (output_size = ftell(capture)) < 0 ||
         (size_t)output_size >= sizeof(output) ||
@@ -258,29 +428,6 @@ static void cleanup_fixture(const SplitFixture* fixture) {
     rmdir(fixture->root);
 }
 
-static int write_vocab(const char* path, int duplicate) {
-    FILE* file = fopen(path, "wb");
-    static const char* const special[] = {
-        "<pad>", "<bos>", "<eos>", "<unk>", "A",
-    };
-    if (!file) return -1;
-    if (fputs("{\"itos\":[", file) == EOF) goto fail;
-    for (int index = 0; index < 760; index++) {
-        if (index > 0 && fputc(',', file) == EOF) goto fail;
-        if (index < 5) {
-            if (fprintf(file, "\"%s\"", special[index]) < 0) goto fail;
-        } else if (fprintf(file, "\"fixture-token-%03d\"",
-                           duplicate && index == 6 ? 5 : index) < 0) {
-            goto fail;
-        }
-    }
-    if (fputs("]}\n", file) == EOF || fclose(file) != 0) return -1;
-    return 0;
-fail:
-    fclose(file);
-    return -1;
-}
-
 static int write_bpe_vocab(const char* path, BpeFixtureVariant variant) {
     static const char* const atomic[] = {
         "<field>", "</field>", "<value>", "</value>",
@@ -354,30 +501,43 @@ fail:
 }
 
 static int write_encoder_weights(const char* path) {
-    const int memory_shape[3] = {1, 402, 320};
-    const int mask_shape[2] = {1, 402};
+    const int memory_shape[3] = {1, 210, 320};
+    const int mask_shape[2] = {1, 210};
+    const int embedding_shape[2] = {1536, 320};
     const int router_shape[2] = {1, 8};
     const int family_shape[1] = {1};
+    const int cross_shape[4] = {1, 8, 402, 40};
     const float router_logits[8] = {8.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
     const int32_t selected_family[1] = {0};
-    float* memory = (float*)calloc(402u * 320u, sizeof(*memory));
-    int32_t* mask = (int32_t*)calloc(402u, sizeof(*mask));
+    float* memory = (float*)calloc(210u * 320u, sizeof(*memory));
+    int32_t* mask = (int32_t*)calloc(210u, sizeof(*mask));
+    float* embedding = (float*)calloc(1536u * 320u, sizeof(*embedding));
+    float* cross = (float*)calloc(8u * 402u * 40u, sizeof(*cross));
     SafetensorsFile file;
     int status = -1;
 
-    if (!memory || !mask) goto done;
+    if (!memory || !mask || !embedding || !cross) goto done;
+    for (size_t index = 0; index < 8u * 402u * 40u; index++)
+        cross[index] = 0.25f;
     if (safetensors_init_empty(&file, SAFETENSORS_OPEN_READ_WRITE) != 0) goto done;
     if (safetensors_add_tensor(&file, "memory_value", SAFETENSORS_DTYPE_F32,
                                memory_shape, 3, memory,
-                               402u * 320u * sizeof(*memory)) != 0 ||
+                               210u * 320u * sizeof(*memory)) != 0 ||
         safetensors_add_tensor(&file, "mask_value", SAFETENSORS_DTYPE_I32,
-                               mask_shape, 2, mask, 402u * sizeof(*mask)) != 0 ||
+                               mask_shape, 2, mask, 210u * sizeof(*mask)) != 0 ||
+        safetensors_add_tensor(&file, "question_embedding",
+                               SAFETENSORS_DTYPE_F32,
+                               embedding_shape, 2, embedding,
+                               1536u * 320u * sizeof(*embedding)) != 0 ||
         safetensors_add_tensor(&file, "router_value", SAFETENSORS_DTYPE_F32,
                                router_shape, 2, router_logits,
                                sizeof(router_logits)) != 0 ||
         safetensors_add_tensor(&file, "family_value", SAFETENSORS_DTYPE_I32,
                                family_shape, 1, selected_family,
                                sizeof(selected_family)) != 0 ||
+        safetensors_add_tensor(&file, "cross_value", SAFETENSORS_DTYPE_F32,
+                               cross_shape, 4, cross,
+                               8u * 402u * 40u * sizeof(*cross)) != 0 ||
         safetensors_save(path, &file) != 0) {
         safetensors_free(&file);
         goto done;
@@ -385,13 +545,15 @@ static int write_encoder_weights(const char* path) {
     safetensors_free(&file);
     status = 0;
 done:
+    free(cross);
+    free(embedding);
     free(mask);
     free(memory);
     return status;
 }
 
-static int write_decoder_weights(const char* path, int runtime_family,
-                                 int vocab_count) {
+static int write_decoder_weights(const char* path, int vocab_count,
+                                 int bos_next_token) {
     const int table_shape[2] = {vocab_count, vocab_count};
     const int table_parameter_shape[1] = {vocab_count};
     const int scalar_shape[1] = {1};
@@ -406,7 +568,8 @@ static int write_decoder_weights(const char* path, int runtime_family,
     SafetensorsFile file;
     int status = -1;
 
-    if (vocab_count <= 4 || (size_t)vocab_count > SIZE_MAX / (size_t)vocab_count)
+    if (vocab_count <= 4 || bos_next_token < 0 || bos_next_token >= vocab_count ||
+        (size_t)vocab_count > SIZE_MAX / (size_t)vocab_count)
         return -1;
     table_elements = (size_t)vocab_count * (size_t)vocab_count;
     table = (int8_t*)calloc(table_elements, sizeof(*table));
@@ -419,7 +582,7 @@ static int write_decoder_weights(const char* path, int runtime_family,
         table_scales[token] = 1.0f;
     }
     table[(size_t)vocab_count + 2u] = 0;
-    table[(size_t)vocab_count + 4u] = 8; /* BOS -> token ID 4 */
+    table[(size_t)vocab_count + (size_t)bos_next_token] = 8;
     for (int index = 0; index < 192; index++) address_token_ids[index] = 2;
     address_token_ids[0] = 5;
     if (safetensors_init_empty(&file, SAFETENSORS_OPEN_READ_WRITE) != 0) goto done;
@@ -436,13 +599,12 @@ static int write_decoder_weights(const char* path, int runtime_family,
         safetensors_add_tensor(&file, "unit.zero_point", SAFETENSORS_DTYPE_I8,
                                scalar_shape, 1, unit_zero_point,
                                sizeof(unit_zero_point)) != 0 ||
-        (runtime_family &&
-         (safetensors_add_tensor(&file, "address_family", SAFETENSORS_DTYPE_I32,
-                                 scalar_shape, 1, address_family,
-                                 sizeof(address_family)) != 0 ||
-          safetensors_add_tensor(&file, "address_token_ids", SAFETENSORS_DTYPE_I32,
-                                 (const int[]){1, 192}, 2, address_token_ids,
-                                 sizeof(address_token_ids)) != 0)) ||
+        safetensors_add_tensor(&file, "address_family", SAFETENSORS_DTYPE_I32,
+                               scalar_shape, 1, address_family,
+                               sizeof(address_family)) != 0 ||
+        safetensors_add_tensor(&file, "address_token_ids", SAFETENSORS_DTYPE_I32,
+                               (const int[]){1, 192}, 2, address_token_ids,
+                               sizeof(address_token_ids)) != 0 ||
         safetensors_save(path, &file) != 0) {
         safetensors_free(&file);
         goto done;
@@ -456,272 +618,390 @@ done:
     return status;
 }
 
-static int write_manifest(const SplitFixture* fixture, const char* format,
-                          int runtime_family, int direct_logits, int bpe) {
-    enum {
-        ASSET_CONFIG,
-        ASSET_VOCAB,
-        ASSET_ENCODER_GRAPH,
-        ASSET_ENCODER_WEIGHTS,
-        ASSET_ENCODER_REPORT,
-        ASSET_DECODER_GRAPH,
-        ASSET_DECODER_WEIGHTS,
-        ASSET_DECODER_REPORT,
-        ASSET_COUNT,
-    };
-    char manifest[16384];
-    char digests[ASSET_COUNT][65];
-    const char* const paths[ASSET_COUNT] = {
-        fixture->config,
-        fixture->vocab,
-        fixture->encoder_graph,
-        fixture->encoder_weights,
-        fixture->encoder_report,
-        fixture->decoder_graph,
-        fixture->decoder_weights,
-        fixture->decoder_report,
-    };
-    const long vocab_bytes = file_size(fixture->vocab);
-    const long config_bytes = file_size(fixture->config);
-    const long encoder_graph_bytes = file_size(fixture->encoder_graph);
-    const long encoder_weights_bytes = file_size(fixture->encoder_weights);
-    const long encoder_report_bytes = file_size(fixture->encoder_report);
-    const long decoder_graph_bytes = file_size(fixture->decoder_graph);
-    const long decoder_weights_bytes = file_size(fixture->decoder_weights);
-    const long decoder_report_bytes = file_size(fixture->decoder_report);
-    const char* routing = runtime_family ?
-        "\"routing\":{\"mode\":\"runtime\",\"family_inputs\":{"
-        "\"encoder\":\"enc_family_phys\",\"decoder\":\"dec_family_phys\"}}," :
-        "\"routing\":{\"mode\":\"specialized\",\"family_id\":0},";
-    const char* generation = direct_logits ?
-        "\"generation\":{\"strategy\":\"greedy-autoregressive\","
-        "\"decoder_input_length\":192,\"maximum_new_tokens\":191,"
-        "\"bos_token_id\":1,\"eos_token_id\":2,\"pad_token_id\":0,"
-        "\"logits_row\":\"prefix_length_minus_one\","
-        "\"tie_policy\":\"first-index\"}," :
-        "\"generation\":{\"strategy\":\"greedy-autoregressive\","
-        "\"decoder_input_length\":192,\"maximum_new_tokens\":191,"
-        "\"bos_token_id\":1,\"eos_token_id\":2,\"pad_token_id\":0,"
-        "\"decoder_output\":\"token_ids\","
-        "\"token_ids_row\":\"prefix_length_minus_one\","
-        "\"tie_policy\":\"first-index\"},";
-    const char* tokenizer = bpe ?
-        "\"tokenizer\":{\"type\":\"byte_fallback_bpe\",\"version\":1,"
-        "\"vocab_size\":1536,\"normalization\":\"NFC\","
-        "\"tokenizer_hash\":"
-        "\"612e8425883fd7e3f0292912ab39bd44c72a1da9e399ee455639e6e612acb939\","
-        "\"itos_key\":\"itos\",\"merges_key\":\"merges\","
-        "\"token_ids\":{\"pad\":0,\"bos\":1,\"eos\":2,\"unk\":3}}," :
-        "\"tokenizer\":{\"type\":\"char-vocab\",\"version\":1,"
-        "\"itos_key\":\"itos\","
-        "\"token_ids\":{\"pad\":0,\"bos\":1,\"eos\":2,\"unk\":3}},";
-    int count;
-
-    CHECK(vocab_bytes > 0 && config_bytes > 0 && encoder_graph_bytes > 0 &&
-          encoder_weights_bytes > 0 && encoder_report_bytes > 0 &&
-          decoder_graph_bytes > 0 && decoder_weights_bytes > 0 &&
-          decoder_report_bytes > 0);
-    for (int index = 0; index < ASSET_COUNT; index++) {
-        CHECK(tiny_receipt_split_w8a8_sha256_file(paths[index], digests[index]) == 0);
+static int write_kv_encoder_graph(const char* path) {
+    FILE* file = fopen(path, "wb");
+    if (!file) return -1;
+    if (fputs(
+            "{\"format\":\"volvox-graph/v1\","
+            "\"dimensions\":{\"B\":{\"min\":1,\"max\":1},"
+            "\"Q\":{\"min\":1,\"max\":192},"
+            "\"M\":{\"min\":211,\"max\":402}},\"inputs\":{"
+            "\"enc_pixels_phys\":{\"shape\":[1,1,320,672],\"dtype\":\"float32\"},"
+            "\"enc_question_phys\":{\"shape\":[\"B\",\"Q\"],\"dtype\":\"int32\"},"
+            "\"enc_family_phys\":{\"shape\":[\"B\"],\"dtype\":\"int32\"},"
+            "\"enc_positions_phys\":{\"shape\":[\"B\",\"Q\"],\"dtype\":\"int32\"}},"
+            "\"nodes\":["
+            "{\"id\":\"image_rows\",\"opType\":\"Reshape\","
+            "\"inputs\":{\"input\":\"enc_pixels_phys\"},"
+            "\"outputs\":{\"out\":{\"tensor\":\"image_rows\","
+            "\"shape\":[\"B\",672,320],\"dtype\":\"float32\"}},"
+            "\"params\":{\"shape\":[1,672,320]}},"
+            "{\"id\":\"image_memory\",\"opType\":\"Slice\","
+            "\"inputs\":{\"input\":\"image_rows\"},"
+            "\"outputs\":{\"out\":{\"tensor\":\"image_memory\","
+            "\"shape\":[\"B\",210,320],\"dtype\":\"float32\"}},"
+            "\"params\":{\"starts\":[0],\"ends\":[210],\"axes\":[1],\"steps\":[1]}},"
+            "{\"id\":\"image_flat\",\"opType\":\"Reshape\","
+            "\"inputs\":{\"input\":\"enc_pixels_phys\"},"
+            "\"outputs\":{\"out\":{\"tensor\":\"image_flat\","
+            "\"shape\":[\"B\",215040],\"dtype\":\"float32\"}},"
+            "\"params\":{\"shape\":[1,215040]}},"
+            "{\"id\":\"image_mask_values\",\"opType\":\"Slice\","
+            "\"inputs\":{\"input\":\"image_flat\"},"
+            "\"outputs\":{\"out\":{\"tensor\":\"image_mask_values\","
+            "\"shape\":[\"B\",210],\"dtype\":\"float32\"}},"
+            "\"params\":{\"starts\":[0],\"ends\":[210],\"axes\":[1],\"steps\":[1]}},"
+            "{\"id\":\"image_mask_i32\",\"opType\":\"Cast\","
+            "\"inputs\":{\"input\":\"image_mask_values\"},"
+            "\"outputs\":{\"out\":{\"tensor\":\"image_mask_i32\","
+            "\"shape\":[\"B\",210],\"dtype\":\"int32\"}},"
+            "\"params\":{\"to\":\"int32\"}},"
+            "{\"id\":\"image_mask\",\"opType\":\"Equal\","
+            "\"inputs\":{\"a\":\"image_mask_i32\",\"b\":\"image_mask_i32\"},"
+            "\"outputs\":{\"out\":{\"tensor\":\"image_mask\","
+            "\"shape\":[\"B\",210],\"dtype\":\"int32\"}},\"params\":{}},"
+            "{\"id\":\"question_embedding\",\"opType\":\"Embedding\","
+            "\"inputs\":{\"input\":\"enc_question_phys\","
+            "\"weight\":\"question_embedding\"},"
+            "\"outputs\":{\"out\":{\"tensor\":\"question_memory\","
+            "\"shape\":[\"B\",\"Q\",320],\"dtype\":\"float32\"}},\"params\":{}},"
+            "{\"id\":\"encoder_memory\",\"opType\":\"Concat\","
+            "\"inputs\":{\"input0\":\"image_memory\",\"input1\":\"question_memory\"},"
+            "\"outputs\":{\"out\":{\"tensor\":\"enc_memory_phys\","
+            "\"shape\":[\"B\",\"M\",320],\"dtype\":\"float32\"}},"
+            "\"params\":{\"axis\":1}},"
+            "{\"id\":\"question_mask\",\"opType\":\"Equal\","
+            "\"inputs\":{\"a\":\"enc_question_phys\",\"b\":\"enc_question_phys\"},"
+            "\"outputs\":{\"out\":{\"tensor\":\"question_mask\","
+            "\"shape\":[\"B\",\"Q\"],\"dtype\":\"int32\"}},\"params\":{}},"
+            "{\"id\":\"encoder_mask\",\"opType\":\"Concat\","
+            "\"inputs\":{\"input0\":\"image_mask\",\"input1\":\"question_mask\"},"
+            "\"outputs\":{\"out\":{\"tensor\":\"enc_mask_phys\","
+            "\"shape\":[\"B\",\"M\"],\"dtype\":\"int32\"}},"
+            "\"params\":{\"axis\":1}},"
+            "{\"id\":\"encoder_router\",\"opType\":\"Identity\","
+            "\"inputs\":{\"input\":\"router_value\"},"
+            "\"outputs\":{\"out\":{\"tensor\":\"enc_router_phys\","
+            "\"shape\":[1,8],\"dtype\":\"float32\"}},\"params\":{}},"
+            "{\"id\":\"encoder_selected\",\"opType\":\"Clip\","
+            "\"inputs\":{\"input\":\"enc_family_phys\"},"
+            "\"outputs\":{\"out\":{\"tensor\":\"enc_selected_phys\","
+            "\"shape\":[1],\"dtype\":\"int32\"}},"
+            "\"params\":{\"min\":0,\"max\":7}},"
+            "{\"id\":\"encoder_cross_head\",\"opType\":\"Slice\","
+            "\"inputs\":{\"input\":\"enc_memory_phys\"},"
+            "\"outputs\":{\"out\":{\"tensor\":\"cross_bmh\","
+            "\"shape\":[\"B\",\"M\",40],\"dtype\":\"float32\"}},"
+            "\"params\":{\"starts\":[0],\"ends\":[40],\"axes\":[2],\"steps\":[1]}},"
+            "{\"id\":\"encoder_cross_unsqueeze\",\"opType\":\"Unsqueeze\","
+            "\"inputs\":{\"input\":\"cross_bmh\"},"
+            "\"outputs\":{\"out\":{\"tensor\":\"cross_b1mh\","
+            "\"shape\":[\"B\",1,\"M\",40],\"dtype\":\"float32\"}},"
+            "\"params\":{\"axes\":[1]}},"
+            "{\"id\":\"encoder_cross_heads\",\"opType\":\"Concat\","
+            "\"inputs\":{\"input0\":\"cross_b1mh\",\"input1\":\"cross_b1mh\","
+            "\"input2\":\"cross_b1mh\",\"input3\":\"cross_b1mh\","
+            "\"input4\":\"cross_b1mh\",\"input5\":\"cross_b1mh\","
+            "\"input6\":\"cross_b1mh\",\"input7\":\"cross_b1mh\"},"
+            "\"outputs\":{\"out\":{\"tensor\":\"cross_value_dynamic\","
+            "\"shape\":[\"B\",8,\"M\",40],\"dtype\":\"float32\"}},"
+            "\"params\":{\"axis\":1}}",
+            file) == EOF)
+        goto fail;
+    for (int index = 0; index < 8; index++) {
+        const char* kind = index % 2 ? "v" : "k";
+        const int layer = index / 2;
+        if (fprintf(
+                file,
+                ",{\"id\":\"encoder_cross_%s_%d\",\"opType\":\"Identity\","
+                "\"inputs\":{\"input\":\"cross_value_dynamic\"},"
+                "\"outputs\":{\"out\":{\"tensor\":\"enc_cross_%s_%d_phys\","
+                "\"shape\":[\"B\",8,\"M\",40],\"dtype\":\"float32\"}},"
+                "\"params\":{}}",
+                kind, layer, kind, layer) < 0)
+            goto fail;
     }
-    count = snprintf(
-        manifest, sizeof(manifest),
-        "{\"format\":\"%s\","
-        "\"assets\":{"
-        "\"config\":{\"path\":\"config.json\",\"bytes\":%ld,\"sha256\":\"%s\"},"
-        "\"vocab\":{\"path\":\"vocab.json\",\"bytes\":%ld,\"sha256\":\"%s\"}},"
-        "%s"
-        "\"preprocessing\":{\"layout\":\"NCHW\",\"shape\":[1,1,320,672],"
-        "\"color\":\"grayscale\",\"resize\":{\"width\":672,\"height\":320,"
-        "\"method\":\"bilinear\"},\"normalization\":\"(x / 255 - 0.5) / 0.5\"},"
-        "\"families\":{\"auto_id\":-1,\"ordered_names\":[\"phone\",\"address\","
-        "\"store\",\"item_row\",\"item_math\",\"item_lookup\",\"math\",\"other\"],"
-        "\"name_to_id\":{\"phone\":0,\"address\":1,\"store\":2,\"item_row\":3,"
-        "\"item_math\":4,\"item_lookup\":5,\"math\":6,\"other\":7}},"
-        "%s%s"
-        "\"graphs\":{"
-        "\"encoder\":{"
-        "\"graph\":{\"path\":\"encoder/graph.json\",\"bytes\":%ld,\"sha256\":\"%s\"},"
-        "\"weights\":{\"path\":\"encoder/model.safetensors\",\"bytes\":%ld,"
-        "\"sha256\":\"%s\"},"
-        "\"export_report\":{\"path\":\"encoder/export_report.json\",\"bytes\":%ld,"
-        "\"sha256\":\"%s\"},"
-        "\"inputs\":{\"image\":\"enc_pixels_phys\","
-        "\"question_ids\":\"enc_question_phys\"%s},"
-        "\"outputs\":{\"memory\":\"enc_memory_phys\","
-        "\"memory_padding_mask\":\"enc_mask_phys\","
-        "\"router_logits\":\"enc_router_phys\","
-        "\"selected_family_ids\":\"enc_selected_phys\"}},"
-        "\"decoder\":{"
-        "\"graph\":{\"path\":\"decoder/graph.json\",\"bytes\":%ld,\"sha256\":\"%s\"},"
-        "\"weights\":{\"path\":\"decoder/model.safetensors\",\"bytes\":%ld,"
-        "\"sha256\":\"%s\"},"
-        "\"export_report\":{\"path\":\"decoder/export_report.json\",\"bytes\":%ld,"
-        "\"sha256\":\"%s\"},"
-        "\"inputs\":{\"decoder_input_ids\":\"dec_ids_phys\","
-        "\"memory\":\"dec_memory_phys\","
-        "\"memory_padding_mask\":\"dec_mask_phys\"%s%s},"
-        "\"outputs\":{%s}}},"
-        "\"mask_semantics\":{\"memory_padding_mask\":\"nonzero_means_blocked\"}}\n",
-        format, config_bytes, digests[ASSET_CONFIG],
-        vocab_bytes, digests[ASSET_VOCAB],
-        tokenizer, routing, generation,
-        encoder_graph_bytes, digests[ASSET_ENCODER_GRAPH],
-        encoder_weights_bytes, digests[ASSET_ENCODER_WEIGHTS],
-        encoder_report_bytes, digests[ASSET_ENCODER_REPORT],
-        runtime_family ? ",\"family_ids\":\"enc_family_phys\"" : "",
-        decoder_graph_bytes, digests[ASSET_DECODER_GRAPH],
-        decoder_weights_bytes, digests[ASSET_DECODER_WEIGHTS],
-        decoder_report_bytes, digests[ASSET_DECODER_REPORT],
-        runtime_family ? ",\"family_ids\":\"dec_family_phys\"" : "",
-        ",\"v4_keep\":\"dec_keep_phys\"",
-        direct_logits ? "\"logits\":\"dec_logits_phys\"" :
-                        "\"token_ids\":\"dec_tokens_phys\"");
-    CHECK(count > 0 && (size_t)count < sizeof(manifest));
-    return write_text(fixture->manifest, manifest);
+    if (fputs(
+            "],\"outputs\":[\"enc_memory_phys\",\"enc_mask_phys\","
+            "\"enc_router_phys\",\"enc_selected_phys\"",
+            file) == EOF)
+        goto fail;
+    for (int index = 0; index < 8; index++) {
+        if (fprintf(file, ",\"enc_cross_%c_%d_phys\"",
+                    index % 2 ? 'v' : 'k', index / 2) < 0)
+            goto fail;
+    }
+    if (fputs("]}\n", file) == EOF || fclose(file) != 0) return -1;
+    return 0;
+
+fail:
+    fclose(file);
+    return -1;
 }
 
-static int create_fixture(SplitFixture* fixture, int runtime_family,
-                          int direct_logits) {
-    static const char specialized_encoder_graph[] =
-        "{\"format\":\"volvox-graph/v1\",\"inputs\":{"
-        "\"enc_pixels_phys\":{\"shape\":[1,1,320,672],\"dtype\":\"float32\"},"
-        "\"enc_question_phys\":{\"shape\":[1,192],\"dtype\":\"int32\"}},"
-        "\"nodes\":["
-        "{\"opType\":\"Identity\",\"inputs\":{\"input\":\"memory_value\"},"
-        "\"outputs\":{\"out\":\"enc_memory_phys\"},"
-        "\"outputs_shape\":{\"out\":[1,402,320]},"
-        "\"outputs_dtype\":{\"out\":\"float32\"},\"params\":{}},"
-        "{\"opType\":\"Identity\",\"inputs\":{\"input\":\"mask_value\"},"
-        "\"outputs\":{\"out\":\"enc_mask_phys\"},"
-        "\"outputs_shape\":{\"out\":[1,402]},"
-        "\"outputs_dtype\":{\"out\":\"int32\"},\"params\":{}},"
-        "{\"opType\":\"Identity\",\"inputs\":{\"input\":\"router_value\"},"
-        "\"outputs\":{\"out\":\"enc_router_phys\"},"
-        "\"outputs_shape\":{\"out\":[1,8]},"
-        "\"outputs_dtype\":{\"out\":\"float32\"},\"params\":{}},"
-        "{\"opType\":\"Identity\",\"inputs\":{\"input\":\"family_value\"},"
-        "\"outputs\":{\"out\":\"enc_selected_phys\"},"
-        "\"outputs_shape\":{\"out\":[1]},"
-        "\"outputs_dtype\":{\"out\":\"int32\"},\"params\":{}}],"
-        "\"outputs\":[\"enc_memory_phys\",\"enc_mask_phys\",\"enc_router_phys\","
-        "\"enc_selected_phys\"]}";
-    static const char runtime_encoder_graph[] =
-        "{\"format\":\"volvox-graph/v1\",\"inputs\":{"
-        "\"enc_pixels_phys\":{\"shape\":[1,1,320,672],\"dtype\":\"float32\"},"
-        "\"enc_question_phys\":{\"shape\":[1,192],\"dtype\":\"int32\"},"
-        "\"enc_family_phys\":{\"shape\":[1],\"dtype\":\"int32\"}},"
-        "\"nodes\":["
-        "{\"opType\":\"Identity\",\"inputs\":{\"input\":\"memory_value\"},"
-        "\"outputs\":{\"out\":\"enc_memory_phys\"},"
-        "\"outputs_shape\":{\"out\":[1,402,320]},"
-        "\"outputs_dtype\":{\"out\":\"float32\"},\"params\":{}},"
-        "{\"opType\":\"Identity\",\"inputs\":{\"input\":\"mask_value\"},"
-        "\"outputs\":{\"out\":\"enc_mask_phys\"},"
-        "\"outputs_shape\":{\"out\":[1,402]},"
-        "\"outputs_dtype\":{\"out\":\"int32\"},\"params\":{}},"
-        "{\"opType\":\"Identity\",\"inputs\":{\"input\":\"router_value\"},"
-        "\"outputs\":{\"out\":\"enc_router_phys\"},"
-        "\"outputs_shape\":{\"out\":[1,8]},"
-        "\"outputs_dtype\":{\"out\":\"float32\"},\"params\":{}},"
-        "{\"opType\":\"Clip\",\"inputs\":{\"input\":\"enc_family_phys\"},"
-        "\"outputs\":{\"out\":\"enc_selected_phys\"},"
-        "\"outputs_shape\":{\"out\":[1]},"
-        "\"outputs_dtype\":{\"out\":\"int32\"},"
-        "\"params\":{\"min\":0,\"max\":7}}],"
-        "\"outputs\":[\"enc_memory_phys\",\"enc_mask_phys\",\"enc_router_phys\","
-        "\"enc_selected_phys\"]}";
-    static const char specialized_decoder_graph[] =
-        "{\"format\":\"volvox-graph/v1\",\"inputs\":{"
-        "\"dec_ids_phys\":{\"shape\":[1,192],\"dtype\":\"int32\"},"
-        "\"dec_memory_phys\":{\"shape\":[1,402,320],\"dtype\":\"float32\"},"
-        "\"dec_mask_phys\":{\"shape\":[1,402],\"dtype\":\"int32\"},"
-        "\"dec_keep_phys\":{\"shape\":[1,192],\"dtype\":\"int32\"}},"
-        "\"quantization\":{\"format\":\"volvox-affine-safetensors/v1\","
-        "\"tensors\":{"
-        "\"next_token_table\":{\"scheme\":\"per_axis\",\"axis\":0,"
-        "\"scale_tensor\":\"table.scale\",\"zero_point_tensor\":\"table.zero_point\"},"
-        "\"next_token_logits\":{\"scheme\":\"per_tensor\","
-        "\"scale_tensor\":\"unit.scale\",\"zero_point_tensor\":\"unit.zero_point\"}}},"
-        "\"nodes\":["
-        "{\"opType\":\"QEmbedding\","
-        "\"inputs\":{\"input\":\"dec_ids_phys\",\"weight\":\"next_token_table\"},"
-        "\"outputs\":{\"out\":\"next_token_logits\"},"
-        "\"outputs_shape\":{\"out\":[1,192,760]},"
-        "\"outputs_dtype\":{\"out\":\"int8\"},\"params\":{}},"
-        "{\"opType\":\"QArgMax\",\"inputs\":{\"input\":\"next_token_logits\"},"
-        "\"outputs\":{\"out\":\"dec_tokens_phys\"},"
-        "\"outputs_shape\":{\"out\":[1,192]},"
-        "\"outputs_dtype\":{\"out\":\"int32\"},\"params\":{\"axis\":-1}}],"
-        "\"outputs\":[\"dec_tokens_phys\"]}";
-    static const char runtime_decoder_graph[] =
-        "{\"format\":\"volvox-graph/v1\",\"inputs\":{"
-        "\"dec_ids_phys\":{\"shape\":[1,192],\"dtype\":\"int32\"},"
-        "\"dec_memory_phys\":{\"shape\":[1,402,320],\"dtype\":\"float32\"},"
-        "\"dec_mask_phys\":{\"shape\":[1,402],\"dtype\":\"int32\"},"
-        "\"dec_family_phys\":{\"shape\":[1],\"dtype\":\"int32\"},"
-        "\"dec_keep_phys\":{\"shape\":[1,192],\"dtype\":\"int32\"}},"
-        "\"quantization\":{\"format\":\"volvox-affine-safetensors/v1\","
-        "\"tensors\":{"
-        "\"next_token_table\":{\"scheme\":\"per_axis\",\"axis\":0,"
-        "\"scale_tensor\":\"table.scale\",\"zero_point_tensor\":\"table.zero_point\"},"
-        "\"next_token_logits\":{\"scheme\":\"per_tensor\","
-        "\"scale_tensor\":\"unit.scale\",\"zero_point_tensor\":\"unit.zero_point\"}}},"
-        "\"nodes\":["
-        "{\"opType\":\"QEmbedding\","
-        "\"inputs\":{\"input\":\"dec_ids_phys\",\"weight\":\"next_token_table\"},"
-        "\"outputs\":{\"out\":\"next_token_logits\"},"
-        "\"outputs_shape\":{\"out\":[1,192,760]},"
-        "\"outputs_dtype\":{\"out\":\"int8\"},\"params\":{}},"
-        "{\"opType\":\"QArgMax\",\"inputs\":{\"input\":\"next_token_logits\"},"
-        "\"outputs\":{\"out\":\"base_token_ids\"},"
-        "\"outputs_shape\":{\"out\":[1,192]},"
-        "\"outputs_dtype\":{\"out\":\"int32\"},\"params\":{\"axis\":-1}},"
-        "{\"opType\":\"Equal\","
-        "\"inputs\":{\"a\":\"dec_family_phys\",\"b\":\"address_family\"},"
-        "\"outputs\":{\"out\":\"address_selected\"},"
-        "\"outputs_shape\":{\"out\":[1]},"
-        "\"outputs_dtype\":{\"out\":\"int32\"},\"params\":{}},"
-        "{\"opType\":\"Expand\","
-        "\"inputs\":{\"input\":\"address_selected\"},"
-        "\"outputs\":{\"out\":\"address_selected_expanded\"},"
-        "\"outputs_shape\":{\"out\":[1,192]},"
-        "\"outputs_dtype\":{\"out\":\"int32\"},\"params\":{}},"
-        "{\"opType\":\"Where\","
-        "\"inputs\":{\"condition\":\"address_selected_expanded\","
-        "\"x\":\"address_token_ids\",\"y\":\"base_token_ids\"},"
-        "\"outputs\":{\"out\":\"dec_tokens_phys\"},"
-        "\"outputs_shape\":{\"out\":[1,192]},"
-        "\"outputs_dtype\":{\"out\":\"int32\"},\"params\":{}}],"
-        "\"outputs\":[\"dec_tokens_phys\"]}";
-    static const char direct_logits_decoder_graph[] =
-        "{\"format\":\"volvox-graph/v1\",\"inputs\":{"
-        "\"dec_ids_phys\":{\"shape\":[1,192],\"dtype\":\"int32\"},"
-        "\"dec_memory_phys\":{\"shape\":[1,402,320],\"dtype\":\"float32\"},"
-        "\"dec_mask_phys\":{\"shape\":[1,402],\"dtype\":\"int32\"},"
-        "\"dec_family_phys\":{\"shape\":[1],\"dtype\":\"int32\"},"
-        "\"dec_keep_phys\":{\"shape\":[1,192],\"dtype\":\"int32\"}},"
-        "\"quantization\":{\"format\":\"volvox-affine-safetensors/v1\","
-        "\"tensors\":{"
-        "\"next_token_table\":{\"scheme\":\"per_axis\",\"axis\":0,"
-        "\"scale_tensor\":\"table.scale\","
-        "\"zero_point_tensor\":\"table.zero_point\"},"
-        "\"next_token_logits\":{\"scheme\":\"per_tensor\","
-        "\"scale_tensor\":\"unit.scale\","
-        "\"zero_point_tensor\":\"unit.zero_point\"}}},"
-        "\"nodes\":["
-        "{\"opType\":\"QEmbedding\","
-        "\"inputs\":{\"input\":\"dec_ids_phys\",\"weight\":\"next_token_table\"},"
-        "\"outputs\":{\"out\":\"next_token_logits\"},"
-        "\"outputs_shape\":{\"out\":[1,192,760]},"
-        "\"outputs_dtype\":{\"out\":\"int8\"},\"params\":{}},"
-        "{\"opType\":\"DequantizeLinear\","
-        "\"inputs\":{\"input\":\"next_token_logits\","
-        "\"scale\":\"unit.scale\",\"zero_point\":\"unit.zero_point\"},"
-        "\"outputs\":{\"out\":\"dec_logits_phys\"},"
-        "\"outputs_shape\":{\"out\":[1,192,760]},"
-        "\"outputs_dtype\":{\"out\":\"float32\"},\"params\":{}}],"
-        "\"outputs\":[\"dec_logits_phys\"]}";
+static int write_kv_decoder_graph(const char* path) {
+    FILE* file = fopen(path, "wb");
+    if (!file) return -1;
+    if (fputs(
+            "{\"format\":\"volvox-graph/v1\","
+            "\"dimensions\":{\"B\":{\"min\":1,\"max\":1},"
+            "\"M\":{\"min\":211,\"max\":402},"
+            "\"P\":{\"min\":1,\"max\":191},"
+            "\"R\":{\"min\":2,\"max\":192}},\"inputs\":{"
+            "\"dec_ids_phys\":{\"shape\":[\"B\",1],\"dtype\":\"int32\"},"
+            "\"dec_position_phys\":{\"shape\":[\"B\"],\"dtype\":\"int32\"},"
+            "\"dec_family_phys\":{\"shape\":[\"B\"],\"dtype\":\"int32\"},"
+            "\"dec_memory_mask_phys\":{\"shape\":[\"B\",\"M\"],\"dtype\":\"int32\"},"
+            "\"dec_past_mask_phys\":{\"shape\":[\"B\",\"P\"],\"dtype\":\"int32\"}",
+            file) == EOF)
+        goto fail;
+    for (int index = 0; index < 8; index++) {
+        if (fprintf(file,
+                    ",\"dec_cross_%c_%d_phys\":{\"shape\":[\"B\",8,\"M\",40],"
+                    "\"dtype\":\"float32\"}",
+                    index % 2 ? 'v' : 'k', index / 2) < 0)
+            goto fail;
+    }
+    for (int index = 0; index < 8; index++) {
+        if (fprintf(file,
+                    ",\"dec_past_%c_%d_phys\":{\"shape\":[\"B\",8,\"P\",40],"
+                    "\"dtype\":\"float32\"}",
+                    index % 2 ? 'v' : 'k', index / 2) < 0)
+            goto fail;
+    }
+    if (fputs(
+            "},\"quantization\":{\"format\":\"volvox-affine-safetensors/v1\","
+            "\"tensors\":{\"next_token_table\":{\"scheme\":\"per_axis\","
+            "\"axis\":0,\"scale_tensor\":\"table.scale\","
+            "\"zero_point_tensor\":\"table.zero_point\"},"
+            "\"next_token_logits\":{\"scheme\":\"per_tensor\","
+            "\"scale_tensor\":\"unit.scale\","
+            "\"zero_point_tensor\":\"unit.zero_point\"}}},"
+            "\"nodes\":["
+            "{\"id\":\"decoder_embedding\",\"opType\":\"QEmbedding\","
+            "\"inputs\":{\"input\":\"dec_ids_phys\","
+            "\"weight\":\"next_token_table\"},"
+            "\"outputs\":{\"out\":{\"tensor\":\"next_token_logits\","
+            "\"shape\":[\"B\",1,1536],\"dtype\":\"int8\"}},\"params\":{}},"
+            "{\"id\":\"decoder_dequantize\",\"opType\":\"DequantizeLinear\","
+            "\"inputs\":{\"input\":\"next_token_logits\","
+            "\"scale\":\"unit.scale\",\"zero_point\":\"unit.zero_point\"},"
+            "\"outputs\":{\"out\":{\"tensor\":\"dec_logits_phys\","
+            "\"shape\":[\"B\",1,1536],\"dtype\":\"float32\"}},\"params\":{}},"
+            "{\"id\":\"current_mask_one\",\"opType\":\"Equal\","
+            "\"inputs\":{\"a\":\"dec_ids_phys\",\"b\":\"dec_ids_phys\"},"
+            "\"outputs\":{\"out\":{\"tensor\":\"current_mask_one\","
+            "\"shape\":[\"B\",1],\"dtype\":\"int32\"}},\"params\":{}},"
+            "{\"id\":\"current_mask_zero\",\"opType\":\"Not\","
+            "\"inputs\":{\"input\":\"current_mask_one\"},"
+            "\"outputs\":{\"out\":{\"tensor\":\"current_mask_zero\","
+            "\"shape\":[\"B\",1],\"dtype\":\"int32\"}},\"params\":{}},"
+            "{\"id\":\"current_mask\",\"opType\":\"Equal\","
+            "\"inputs\":{\"a\":\"dec_ids_phys\",\"b\":\"current_mask_zero\"},"
+            "\"outputs\":{\"out\":{\"tensor\":\"current_mask\","
+            "\"shape\":[\"B\",1],\"dtype\":\"int32\"}},\"params\":{}},"
+            "{\"id\":\"current_cache\",\"opType\":\"Slice\","
+            "\"inputs\":{\"input\":\"dec_cross_k_0_phys\"},"
+            "\"outputs\":{\"out\":{\"tensor\":\"current_cache\","
+            "\"shape\":[\"B\",8,1,40],\"dtype\":\"float32\"}},"
+            "\"params\":{\"starts\":[0],\"ends\":[1],\"axes\":[2],\"steps\":[1]}},"
+            "{\"id\":\"present_mask\",\"opType\":\"Concat\","
+            "\"inputs\":{\"input0\":\"dec_past_mask_phys\","
+            "\"input1\":\"current_mask\"},"
+            "\"outputs\":{\"out\":{\"tensor\":\"dec_present_mask_phys\","
+            "\"shape\":[\"B\",\"R\"],\"dtype\":\"int32\"}},"
+            "\"params\":{\"axis\":1}}",
+            file) == EOF)
+        goto fail;
+    for (int index = 0; index < 8; index++) {
+        const char kind = index % 2 ? 'v' : 'k';
+        const int layer = index / 2;
+        if (fprintf(
+                file,
+                ",{\"id\":\"present_%c_%d\",\"opType\":\"Concat\","
+                "\"inputs\":{\"input0\":\"dec_past_%c_%d_phys\","
+                "\"input1\":\"current_cache\"},"
+                "\"outputs\":{\"out\":{\"tensor\":\"dec_present_%c_%d_phys\","
+                "\"shape\":[\"B\",8,\"R\",40],\"dtype\":\"float32\"}},"
+                "\"params\":{\"axis\":2}}",
+                kind, layer, kind, layer, kind, layer) < 0)
+            goto fail;
+    }
+    if (fputs(
+            "],\"outputs\":[\"dec_logits_phys\",\"dec_present_mask_phys\"",
+            file) == EOF)
+        goto fail;
+    for (int index = 0; index < 8; index++) {
+        if (fprintf(file, ",\"dec_present_%c_%d_phys\"",
+                    index % 2 ? 'v' : 'k', index / 2) < 0)
+            goto fail;
+    }
+    if (fputs("]}\n", file) == EOF || fclose(file) != 0) return -1;
+    return 0;
+
+fail:
+    fclose(file);
+    return -1;
+}
+
+static int write_kv_manifest(const SplitFixture* fixture) {
+    enum {
+        KV_ASSET_CONFIG,
+        KV_ASSET_VOCAB,
+        KV_ASSET_ENCODER_GRAPH,
+        KV_ASSET_ENCODER_WEIGHTS,
+        KV_ASSET_ENCODER_REPORT,
+        KV_ASSET_DECODER_GRAPH,
+        KV_ASSET_DECODER_WEIGHTS,
+        KV_ASSET_DECODER_REPORT,
+        KV_ASSET_COUNT,
+    };
+    const char* const paths[KV_ASSET_COUNT] = {
+        fixture->config, fixture->vocab, fixture->encoder_graph,
+        fixture->encoder_weights, fixture->encoder_report,
+        fixture->decoder_graph, fixture->decoder_weights,
+        fixture->decoder_report,
+    };
+    long bytes[KV_ASSET_COUNT];
+    char digests[KV_ASSET_COUNT][65];
+    FILE* file = NULL;
+    for (int index = 0; index < KV_ASSET_COUNT; index++) {
+        bytes[index] = file_size(paths[index]);
+        CHECK(bytes[index] > 0);
+        CHECK(tiny_receipt_split_w8a8_sha256_file(paths[index], digests[index]) == 0);
+    }
+    file = fopen(fixture->manifest, "wb");
+    if (!file) return -1;
+    if (fprintf(
+            file,
+            "{\"format\":\"volvoxai-tiny-receipt-vqa-split-kv-onnx-package-v1\","
+            "\"assets\":{"
+            "\"config\":{\"path\":\"config.json\",\"bytes\":%ld,\"sha256\":\"%s\"},"
+            "\"vocab\":{\"path\":\"vocab.json\",\"bytes\":%ld,\"sha256\":\"%s\"}},"
+            "\"tokenizer\":{\"type\":\"byte_fallback_bpe\",\"version\":1,"
+            "\"vocab_size\":1536,\"normalization\":\"NFC\","
+            "\"tokenizer_hash\":"
+            "\"612e8425883fd7e3f0292912ab39bd44c72a1da9e399ee455639e6e612acb939\","
+            "\"itos_key\":\"itos\",\"merges_key\":\"merges\","
+            "\"token_ids\":{\"pad\":0,\"bos\":1,\"eos\":2,\"unk\":3}},"
+            "\"preprocessing\":{\"layout\":\"NCHW\",\"shape\":[1,1,320,672],"
+            "\"color\":\"grayscale\",\"resize\":{\"width\":672,\"height\":320,"
+            "\"method\":\"bilinear\"},\"normalization\":\"(x / 255 - 0.5) / 0.5\"},"
+            "\"families\":{\"auto_id\":-1,\"ordered_names\":[\"phone\",\"address\","
+            "\"store\",\"item_row\",\"item_math\",\"item_lookup\",\"math\",\"other\"],"
+            "\"name_to_id\":{\"phone\":0,\"address\":1,\"store\":2,\"item_row\":3,"
+            "\"item_math\":4,\"item_lookup\":5,\"math\":6,\"other\":7}},"
+            "\"routing\":{\"mode\":\"runtime\",\"family_inputs\":{"
+            "\"encoder\":\"enc_family_phys\",\"decoder\":\"dec_family_phys\"}},"
+            "\"generation\":{\"strategy\":\"greedy-autoregressive-explicit-kv\","
+            "\"maximum_target_length\":192,\"maximum_new_tokens\":191,"
+            "\"bos_token_id\":1,\"eos_token_id\":2,\"pad_token_id\":0,"
+            "\"logits_row\":\"current_token\",\"tie_policy\":\"first-index\"},"
+            "\"shape_contract\":{"
+            "\"graph_shape_mode\":\"bounded-explicit-kv-v1\","
+            "\"dimensions\":{\"B\":{\"min\":1,\"max\":1},"
+            "\"Q\":{\"min\":1,\"max\":192},"
+            "\"M\":{\"min\":211,\"max\":402},"
+            "\"P\":{\"min\":1,\"max\":191},"
+            "\"R\":{\"min\":2,\"max\":192}},"
+            "\"fixed_geometry\":{\"image\":[1,1,320,672],\"image_tokens\":210,"
+            "\"feature_width\":320,\"attention_heads\":8,"
+            "\"attention_head_width\":40,\"decoder_layers\":4,"
+            "\"adapter_families\":8},"
+            "\"relations\":{"
+            "\"encoder_memory\":{\"operator\":\"Concat\",\"axis\":1,"
+            "\"fixed_image_tokens\":210,\"dynamic_question_dimension\":\"Q\","
+            "\"derived_memory_dimension\":\"M\"},"
+            "\"present_cache\":{\"operator\":\"Concat\",\"axis\":2,"
+            "\"past_dimension\":\"P\",\"fixed_current_tokens\":1,"
+            "\"derived_present_dimension\":\"R\"}},"
+            "\"semantic_inputs\":{\"question_position_ids\":{"
+            "\"shape\":[\"B\",\"Q\"],\"values\":\"zero_based_contiguous\"}}},"
+            "\"cache_contract\":{\"format\":\"masked-zero-sentinel-v1\","
+            "\"layers\":4,\"heads\":8,\"head_width\":40,"
+            "\"past_dimension\":\"P\",\"present_dimension\":\"R\","
+            "\"initial_past_length\":1,\"sentinel_mask_value\":1,"
+            "\"cache_dtype\":\"float32\"},"
+            "\"graphs\":{\"encoder\":{"
+            "\"graph\":{\"path\":\"encoder/graph.json\",\"bytes\":%ld,\"sha256\":\"%s\"},"
+            "\"weights\":{\"path\":\"encoder/model.safetensors\",\"bytes\":%ld,"
+            "\"sha256\":\"%s\"},"
+            "\"export_report\":{\"path\":\"encoder/export_report.json\",\"bytes\":%ld,"
+            "\"sha256\":\"%s\"},"
+            "\"inputs\":{\"image\":\"enc_pixels_phys\","
+            "\"question_ids\":\"enc_question_phys\","
+            "\"family_ids\":\"enc_family_phys\","
+            "\"question_position_ids\":\"enc_positions_phys\"},"
+            "\"outputs\":{\"memory\":\"enc_memory_phys\","
+            "\"memory_padding_mask\":\"enc_mask_phys\","
+            "\"router_logits\":\"enc_router_phys\","
+            "\"selected_family_ids\":\"enc_selected_phys\"",
+            bytes[KV_ASSET_CONFIG], digests[KV_ASSET_CONFIG],
+            bytes[KV_ASSET_VOCAB], digests[KV_ASSET_VOCAB],
+            bytes[KV_ASSET_ENCODER_GRAPH], digests[KV_ASSET_ENCODER_GRAPH],
+            bytes[KV_ASSET_ENCODER_WEIGHTS], digests[KV_ASSET_ENCODER_WEIGHTS],
+            bytes[KV_ASSET_ENCODER_REPORT], digests[KV_ASSET_ENCODER_REPORT]) < 0)
+        goto fail;
+    for (int index = 0; index < 8; index++) {
+        if (fprintf(file, ",\"cross_%c_%d\":\"enc_cross_%c_%d_phys\"",
+                    index % 2 ? 'v' : 'k', index / 2,
+                    index % 2 ? 'v' : 'k', index / 2) < 0)
+            goto fail;
+    }
+    if (fprintf(
+            file,
+            "}},\"decoder\":{"
+            "\"graph\":{\"path\":\"decoder/graph.json\",\"bytes\":%ld,\"sha256\":\"%s\"},"
+            "\"weights\":{\"path\":\"decoder/model.safetensors\",\"bytes\":%ld,"
+            "\"sha256\":\"%s\"},"
+            "\"export_report\":{\"path\":\"decoder/export_report.json\",\"bytes\":%ld,"
+            "\"sha256\":\"%s\"},"
+            "\"inputs\":{\"decoder_input_ids\":\"dec_ids_phys\","
+            "\"position_ids\":\"dec_position_phys\","
+            "\"family_ids\":\"dec_family_phys\","
+            "\"memory_padding_mask\":\"dec_memory_mask_phys\","
+            "\"past_padding_mask\":\"dec_past_mask_phys\"",
+            bytes[KV_ASSET_DECODER_GRAPH], digests[KV_ASSET_DECODER_GRAPH],
+            bytes[KV_ASSET_DECODER_WEIGHTS], digests[KV_ASSET_DECODER_WEIGHTS],
+            bytes[KV_ASSET_DECODER_REPORT], digests[KV_ASSET_DECODER_REPORT]) < 0)
+        goto fail;
+    for (int index = 0; index < 8; index++) {
+        if (fprintf(file, ",\"cross_%c_%d\":\"dec_cross_%c_%d_phys\"",
+                    index % 2 ? 'v' : 'k', index / 2,
+                    index % 2 ? 'v' : 'k', index / 2) < 0)
+            goto fail;
+    }
+    for (int index = 0; index < 8; index++) {
+        if (fprintf(file, ",\"past_%c_%d\":\"dec_past_%c_%d_phys\"",
+                    index % 2 ? 'v' : 'k', index / 2,
+                    index % 2 ? 'v' : 'k', index / 2) < 0)
+            goto fail;
+    }
+    if (fputs(
+            "},\"outputs\":{\"logits\":\"dec_logits_phys\","
+            "\"present_padding_mask\":\"dec_present_mask_phys\"",
+            file) == EOF)
+        goto fail;
+    for (int index = 0; index < 8; index++) {
+        if (fprintf(file, ",\"present_%c_%d\":\"dec_present_%c_%d_phys\"",
+                    index % 2 ? 'v' : 'k', index / 2,
+                    index % 2 ? 'v' : 'k', index / 2) < 0)
+            goto fail;
+    }
+    if (fputs(
+            "}}},\"mask_semantics\":{"
+            "\"memory_padding_mask\":\"nonzero_means_blocked\","
+            "\"past_padding_mask\":\"nonzero_means_blocked\"}}\n",
+            file) == EOF || fclose(file) != 0)
+        return -1;
+    return 0;
+
+fail:
+    fclose(file);
+    return -1;
+}
+
+static int create_kv_fixture(SplitFixture* fixture, int bos_next_token) {
     static const unsigned char png[] = {
         0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d,
         0x49, 0x48, 0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01,
@@ -730,238 +1010,56 @@ static int create_fixture(SplitFixture* fixture, int runtime_family,
         0x1f, 0x00, 0x05, 0x00, 0x01, 0xff, 0x89, 0x99, 0x3d, 0x1d, 0x00, 0x00,
         0x00, 0x00, 0x49, 0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82,
     };
-
     CHECK(mkdir(fixture->encoder_dir, 0700) == 0);
     CHECK(mkdir(fixture->decoder_dir, 0700) == 0);
-    CHECK(write_text(fixture->encoder_graph,
-                     runtime_family ? runtime_encoder_graph :
-                                      specialized_encoder_graph) == 0);
+    CHECK(write_kv_encoder_graph(fixture->encoder_graph) == 0);
     CHECK(write_encoder_weights(fixture->encoder_weights) == 0);
     CHECK(write_text(fixture->encoder_report, "{}\n") == 0);
-    CHECK(write_text(fixture->decoder_graph,
-                     direct_logits ? direct_logits_decoder_graph :
-                     (runtime_family ? runtime_decoder_graph :
-                                       specialized_decoder_graph)) == 0);
-    CHECK(write_decoder_weights(fixture->decoder_weights, runtime_family, 760) == 0);
+    CHECK(write_kv_decoder_graph(fixture->decoder_graph) == 0);
+    CHECK(write_decoder_weights(fixture->decoder_weights, 1536,
+                                bos_next_token) == 0);
     CHECK(write_text(fixture->decoder_report, "{}\n") == 0);
     CHECK(write_text(fixture->config, "{}\n") == 0);
-    CHECK(write_vocab(fixture->vocab, 0) == 0);
+    CHECK(write_bpe_vocab(fixture->vocab, BPE_FIXTURE_VALID) == 0);
     CHECK(write_bytes(fixture->image, png, sizeof(png)) == 0);
-    CHECK(write_manifest(fixture,
-        "volvoxai-tiny-receipt-vqa-split-onnx-package-v1", runtime_family,
-        direct_logits, 0) == 0);
+    CHECK(write_kv_manifest(fixture) == 0);
     return 0;
 }
 
-static int test_split_session(void) {
-    char template_path[] = "/tmp/volvox-tinyreceipt-split-w8a8-XXXXXX";
+static int test_explicit_kv_two_step_session(void) {
+    char template_path[] = "/tmp/volvox-tinyreceipt-explicit-kv-XXXXXX";
     char* root = mkdtemp(template_path);
     SplitFixture fixture;
+    char prompt[192];
+    const char* prompts[1];
+    const int32_t maximum_new_tokens[1] = {2};
+    TinyReceiptSplitShapeEvidence evidence[1];
+    char* argv[17];
     int status = -1;
-    char* default_argv[12];
-    char* incremental_argv[13];
-    char* required_row_argv[13];
-    char* incremental_required_row_argv[14];
-    char* no_kv_argv[13];
-    char* ordinary_argv[13];
-    char* ordinary_incremental_argv[14];
-    char* ordinary_required_row_argv[14];
-    char* no_kv_incremental_argv[14];
-    char* no_kv_ordinary_argv[14];
-    char* no_kv_required_row_argv[14];
-    int32_t tokenizer_ids[4];
-    size_t tokenizer_count = 0;
-    char tokenizer_text[16];
-
     memset(&fixture, 0, sizeof(fixture));
+    memset(prompt, 'A', sizeof(prompt) - 1);
+    prompt[sizeof(prompt) - 1] = 0;
+    prompts[0] = prompt;
     if (!root || fixture_paths(&fixture, root) != 0 ||
-        create_fixture(&fixture, 0, 0) != 0)
+        create_kv_fixture(&fixture, 4) != 0 ||
+        tiny_receipt_split_w8a8_profile_sequence(
+            fixture.root, fixture.image, prompts, maximum_new_tokens, 1,
+            evidence) != 0)
         goto done;
-    if (tiny_receipt_split_w8a8_tokenizer_roundtrip(
-            fixture.root, "  A\t", tokenizer_ids,
-            sizeof(tokenizer_ids) / sizeof(tokenizer_ids[0]),
-            &tokenizer_count, tokenizer_text, sizeof(tokenizer_text)) != 0 ||
-        tokenizer_count != 2 || tokenizer_ids[0] != 4 ||
-        tokenizer_ids[1] != 2 || strcmp(tokenizer_text, "A") != 0)
-        goto done;
-
-    default_argv[0] = "tiny_receipt_split_w8a8";
-    default_argv[1] = fixture.root;
-    default_argv[2] = "--image";
-    default_argv[3] = fixture.image;
-    default_argv[4] = "--prompt";
-    default_argv[5] = "A";
-    default_argv[6] = "--max-new";
-    default_argv[7] = "2";
-    default_argv[8] = "--family";
-    default_argv[9] = "phone";
-    default_argv[10] = "--cpu";
-    default_argv[11] = NULL;
-    if (run_and_capture(11, default_argv, 1, "A") != 0) goto done;
-
-    memcpy(incremental_argv, default_argv, 11 * sizeof(*incremental_argv));
-    incremental_argv[11] = "--incremental";
-    incremental_argv[12] = NULL;
-    if (run_and_capture(12, incremental_argv, 1, "A") != 0) goto done;
-
-    memcpy(required_row_argv, default_argv, 11 * sizeof(*required_row_argv));
-    required_row_argv[11] = "--require-row";
-    required_row_argv[12] = NULL;
-    if (run_and_capture(12, required_row_argv, 1, "A") != 0) goto done;
-
-    memcpy(incremental_required_row_argv, default_argv,
-           11 * sizeof(*incremental_required_row_argv));
-    incremental_required_row_argv[11] = "--incremental";
-    incremental_required_row_argv[12] = "--require-row";
-    incremental_required_row_argv[13] = NULL;
-    if (run_and_capture(13, incremental_required_row_argv, 1, "A") != 0) goto done;
-
-    memcpy(no_kv_argv, default_argv, 11 * sizeof(*no_kv_argv));
-    no_kv_argv[11] = "--no-kv";
-    no_kv_argv[12] = NULL;
-    if (run_and_capture(12, no_kv_argv, 1, "A") != 0) goto done;
-
-    memcpy(ordinary_argv, default_argv, 11 * sizeof(*ordinary_argv));
-    ordinary_argv[11] = "--ordinary";
-    ordinary_argv[12] = NULL;
-    if (run_and_capture(12, ordinary_argv, 1, "A") != 0) goto done;
-
-    memcpy(ordinary_incremental_argv, default_argv,
-           11 * sizeof(*ordinary_incremental_argv));
-    ordinary_incremental_argv[11] = "--ordinary";
-    ordinary_incremental_argv[12] = "--incremental";
-    ordinary_incremental_argv[13] = NULL;
-    if (tiny_receipt_split_w8a8_run(13, ordinary_incremental_argv) != 2) goto done;
-
-    memcpy(ordinary_required_row_argv, default_argv,
-           11 * sizeof(*ordinary_required_row_argv));
-    ordinary_required_row_argv[11] = "--ordinary";
-    ordinary_required_row_argv[12] = "--require-row";
-    ordinary_required_row_argv[13] = NULL;
-    if (tiny_receipt_split_w8a8_run(13, ordinary_required_row_argv) != 2) goto done;
-
-    memcpy(no_kv_incremental_argv, default_argv,
-           11 * sizeof(*no_kv_incremental_argv));
-    no_kv_incremental_argv[11] = "--no-kv";
-    no_kv_incremental_argv[12] = "--incremental";
-    no_kv_incremental_argv[13] = NULL;
-    if (tiny_receipt_split_w8a8_run(13, no_kv_incremental_argv) != 2) goto done;
-
-    memcpy(no_kv_ordinary_argv, default_argv,
-           11 * sizeof(*no_kv_ordinary_argv));
-    no_kv_ordinary_argv[11] = "--no-kv";
-    no_kv_ordinary_argv[12] = "--ordinary";
-    no_kv_ordinary_argv[13] = NULL;
-    if (tiny_receipt_split_w8a8_run(13, no_kv_ordinary_argv) != 2) goto done;
-
-    memcpy(no_kv_required_row_argv, default_argv,
-           11 * sizeof(*no_kv_required_row_argv));
-    no_kv_required_row_argv[11] = "--no-kv";
-    no_kv_required_row_argv[12] = "--require-row";
-    no_kv_required_row_argv[13] = NULL;
-    if (tiny_receipt_split_w8a8_run(13, no_kv_required_row_argv) != 2) goto done;
-
-    {
-        const long original_size = file_size(fixture.config);
-        if (write_text(fixture.config, "[]\n") != 0 ||
-            file_size(fixture.config) != original_size ||
-            run_and_capture(11, default_argv, 0, NULL) != 0 ||
-            write_text(fixture.config, "{}\n") != 0) goto done;
-    }
-
-    if (replace_once_in_file(
-            fixture.manifest,
-            "\"tie_policy\":\"first-index\"",
-            "\"tie_policy\":\"first-index\",\"tie_policy\":\"last-index\"") != 0 ||
-        run_and_capture(11, default_argv, 0, NULL) != 0 ||
-        write_manifest(&fixture,
-            "volvoxai-tiny-receipt-vqa-split-onnx-package-v1", 0, 0, 0) != 0)
-        goto done;
-
-    if (write_vocab(fixture.vocab, 1) != 0 ||
-        write_manifest(&fixture,
-            "volvoxai-tiny-receipt-vqa-split-onnx-package-v1", 0, 0, 0) != 0 ||
-        run_and_capture(11, default_argv, 0, NULL) != 0 ||
-        write_vocab(fixture.vocab, 0) != 0 ||
-        write_manifest(&fixture,
-            "volvoxai-tiny-receipt-vqa-split-onnx-package-v1", 0, 0, 0) != 0)
-        goto done;
-
-    if (write_manifest(&fixture, "volvoxai-tiny-receipt-vqa-split-onnx-package-v0",
-                       0, 0, 0) != 0)
-        goto done;
-    if (run_and_capture(11, default_argv, 0, NULL) != 0) goto done;
-
-    status = 0;
-done:
-    cleanup_fixture(&fixture);
-    return status;
-}
-
-static int test_runtime_family_session(void) {
-    char template_path[] = "/tmp/volvox-tinyreceipt-split-runtime-family-XXXXXX";
-    char* root = mkdtemp(template_path);
-    SplitFixture fixture;
-    int status = -1;
-    char* auto_argv[10];
-    char* address_argv[12];
-    char* address_required_row_argv[13];
-
-    memset(&fixture, 0, sizeof(fixture));
-    if (!root || fixture_paths(&fixture, root) != 0 ||
-        create_fixture(&fixture, 1, 0) != 0)
-        goto done;
-
-    auto_argv[0] = "tiny_receipt_split_w8a8";
-    auto_argv[1] = fixture.root;
-    auto_argv[2] = "--image";
-    auto_argv[3] = fixture.image;
-    auto_argv[4] = "--prompt";
-    auto_argv[5] = "A";
-    auto_argv[6] = "--max-new";
-    auto_argv[7] = "1";
-    auto_argv[8] = "--cpu";
-    auto_argv[9] = NULL;
-    if (run_and_capture(9, auto_argv, 1, "A") != 0) goto done;
-
-    memcpy(address_argv, auto_argv, 8 * sizeof(*address_argv));
-    address_argv[8] = "--family";
-    address_argv[9] = "address";
-    address_argv[10] = "--cpu";
-    address_argv[11] = NULL;
-    if (run_and_capture(11, address_argv, 1, "fixture-token-005") != 0) goto done;
-
-    memcpy(address_required_row_argv, address_argv,
-           11 * sizeof(*address_required_row_argv));
-    address_required_row_argv[11] = "--require-row";
-    address_required_row_argv[12] = NULL;
-    if (run_and_capture(12, address_required_row_argv, 1,
-                        "fixture-token-005") != 0) goto done;
-
-    if (replace_once_in_file(fixture.manifest,
-                             "\"family_ids\":\"dec_family_phys\",", "") != 0 ||
-        run_and_capture(11, address_argv, 0, NULL) != 0 ||
-        write_manifest(&fixture,
-            "volvoxai-tiny-receipt-vqa-split-onnx-package-v1", 1, 0, 0) != 0)
-        goto done;
-
-    status = 0;
-done:
-    cleanup_fixture(&fixture);
-    return status;
-}
-
-static int test_direct_logits_session(void) {
-    char template_path[] = "/tmp/volvox-tinyreceipt-split-direct-logits-XXXXXX";
-    char* root = mkdtemp(template_path);
-    SplitFixture fixture;
-    int status = -1;
-    char* argv[15];
-
-    memset(&fixture, 0, sizeof(fixture));
-    if (!root || fixture_paths(&fixture, root) != 0 ||
-        create_fixture(&fixture, 1, 1) != 0)
-        goto done;
+    CHECK(evidence[0].question_length == 192);
+    CHECK(evidence[0].memory_length == 402);
+    CHECK(evidence[0].decoder_seed_past_length == 1);
+    CHECK(evidence[0].decoder_seed_present_length == 2);
+    CHECK(evidence[0].decoder_step_past_length == 2);
+    CHECK(evidence[0].decoder_step_present_length == 3);
+    CHECK(evidence[0].explicit_kv_sentinel_preserved == 1);
+    CHECK(evidence[0].generated_tokens == 2);
+    CHECK(evidence[0].decoder_seed_result_bytes ==
+          1536u * sizeof(float) + 2u * sizeof(int32_t) +
+              8u * 8u * 2u * 40u * sizeof(float));
+    CHECK(evidence[0].decoder_step_result_bytes ==
+          1536u * sizeof(float) + 3u * sizeof(int32_t) +
+              8u * 8u * 3u * 40u * sizeof(float));
 
     argv[0] = "tiny_receipt_split_w8a8";
     argv[1] = fixture.root;
@@ -974,36 +1072,206 @@ static int test_direct_logits_session(void) {
     argv[8] = "--family";
     argv[9] = "phone";
     argv[10] = "--cpu";
-    argv[11] = "--incremental";
-    argv[12] = "--require-row";
-    argv[13] = "--timing";
-    argv[14] = NULL;
-    if (run_and_capture(14, argv, 1, "A") != 0) goto done;
-
-    if (replace_once_in_file(
-            fixture.manifest,
-            "\"outputs\":{\"logits\":\"dec_logits_phys\"}",
-            "\"outputs\":{\"logits\":\"dec_logits_phys\","
-            "\"token_ids\":\"dec_tokens_phys\"}") != 0 ||
-        run_and_capture(14, argv, 0, NULL) != 0 ||
-        write_manifest(&fixture,
-            "volvoxai-tiny-receipt-vqa-split-onnx-package-v1", 1, 1, 0) != 0)
+    argv[11] = "--shape-mode";
+    argv[12] = "maximum-padded";
+    argv[13] = NULL;
+    if (run_and_capture(13, argv, 0, "<field>") != 0) goto done;
+    argv[13] = "--warmup";
+    argv[14] = "2";
+    argv[15] = "--timing";
+    argv[16] = NULL;
+    if (run_and_capture_warmup(16, argv, 2, "<field>") != 0) goto done;
+    argv[13] = NULL;
+    if (replace_once_in_file(fixture.manifest,
+                             "\"sentinel_mask_value\":1",
+                             "\"sentinel_mask_value\":0") != 0 ||
+        run_and_capture(13, argv, 1, NULL) != 0)
         goto done;
-
-    if (replace_once_in_file(
-            fixture.manifest,
-            "\"decoder\":\"dec_family_phys\"",
-            "\"decoder\":\"wrong_family_input\"") != 0 ||
-        run_and_capture(14, argv, 0, NULL) != 0)
-        goto done;
-
     status = 0;
+
 done:
     cleanup_fixture(&fixture);
     return status;
 }
 
-static int test_bpe1536_tokenizer_session(void) {
+static int test_ordinary_cli_defaults_to_strict_cpu(void) {
+    char template_path[] = "/tmp/volvox-tinyreceipt-default-cpu-XXXXXX";
+    char* root = mkdtemp(template_path);
+    SplitFixture fixture;
+    char* argv[11];
+    int status = -1;
+
+    memset(&fixture, 0, sizeof(fixture));
+    if (!root || fixture_paths(&fixture, root) != 0 ||
+        create_kv_fixture(&fixture, 4) != 0)
+        goto done;
+    argv[0] = "tiny_receipt_split_w8a8";
+    argv[1] = fixture.root;
+    argv[2] = "--image";
+    argv[3] = fixture.image;
+    argv[4] = "--prompt";
+    argv[5] = "A";
+    argv[6] = "--max-new";
+    argv[7] = "2";
+    argv[8] = "--family";
+    argv[9] = "phone";
+    argv[10] = NULL;
+    if (run_and_capture(10, argv, 0, "<field>") != 0) goto done;
+    status = 0;
+
+done:
+    cleanup_fixture(&fixture);
+    return status;
+}
+
+static int test_explicit_kv_pad_mask_two_step(void) {
+    char template_path[] = "/tmp/volvox-tinyreceipt-explicit-kv-pad-XXXXXX";
+    char* root = mkdtemp(template_path);
+    SplitFixture fixture;
+    char prompt[192];
+    const char* prompts[1];
+    const int32_t maximum_new_tokens[1] = {2};
+    TinyReceiptSplitShapeEvidence evidence[1];
+    int status = -1;
+
+    memset(&fixture, 0, sizeof(fixture));
+    memset(prompt, 'A', sizeof(prompt) - 1);
+    prompt[sizeof(prompt) - 1] = 0;
+    prompts[0] = prompt;
+    if (!root || fixture_paths(&fixture, root) != 0 ||
+        create_kv_fixture(&fixture, 0) != 0 ||
+        tiny_receipt_split_w8a8_profile_sequence(
+            fixture.root, fixture.image, prompts, maximum_new_tokens, 1,
+            evidence) != 0)
+        goto done;
+    CHECK(evidence[0].decoder_seed_past_length == 1);
+    CHECK(evidence[0].decoder_seed_present_length == 2);
+    CHECK(evidence[0].decoder_step_past_length == 2);
+    CHECK(evidence[0].decoder_step_present_length == 3);
+    CHECK(evidence[0].explicit_kv_sentinel_preserved == 1);
+    CHECK(evidence[0].generated_tokens == 2);
+    status = 0;
+
+done:
+    cleanup_fixture(&fixture);
+    return status;
+}
+
+static int test_explicit_kv_context_reuse(void) {
+    char template_path[] = "/tmp/volvox-tinyreceipt-explicit-kv-reuse-XXXXXX";
+    char* root = mkdtemp(template_path);
+    SplitFixture fixture;
+    char prompt_a[192];
+    char prompt_b[192];
+    char prompt_c[192];
+    const char* prompts[] = {prompt_a, prompt_b, prompt_c};
+    const int32_t maximum_new_tokens[] = {2, 2, 2};
+    TinyReceiptSplitShapeEvidence evidence[3];
+    int status = -1;
+
+    memset(&fixture, 0, sizeof(fixture));
+    memset(prompt_a, 'A', sizeof(prompt_a) - 1);
+    memset(prompt_b, 'B', sizeof(prompt_b) - 1);
+    memset(prompt_c, 'C', sizeof(prompt_c) - 1);
+    prompt_a[sizeof(prompt_a) - 1] = 0;
+    prompt_b[sizeof(prompt_b) - 1] = 0;
+    prompt_c[sizeof(prompt_c) - 1] = 0;
+    if (!root || fixture_paths(&fixture, root) != 0 ||
+        create_kv_fixture(&fixture, 4) != 0 ||
+        tiny_receipt_split_w8a8_profile_sequence(
+            fixture.root, fixture.image, prompts, maximum_new_tokens, 3,
+            evidence) != 0)
+        goto done;
+    for (size_t index = 0; index < 3; index++) {
+        CHECK(evidence[index].question_length > 0);
+        CHECK(evidence[index].memory_length ==
+              evidence[index].question_length + 210);
+        CHECK(evidence[index].decoder_seed_past_length == 1);
+        CHECK(evidence[index].decoder_seed_present_length == 2);
+        CHECK(evidence[index].decoder_step_past_length == 2);
+        CHECK(evidence[index].decoder_step_present_length == 3);
+        CHECK(evidence[index].explicit_kv_sentinel_preserved == 1);
+        CHECK(evidence[index].generated_tokens == 2);
+    }
+    status = 0;
+
+done:
+    cleanup_fixture(&fixture);
+    return status;
+}
+
+static int test_explicit_kv_dynamic_qualification(void) {
+    char template_path[] = "/tmp/volvox-tinyreceipt-explicit-kv-dynamic-XXXXXX";
+    char* root = mkdtemp(template_path);
+    SplitFixture fixture;
+    const char* prompts[] = {"A", "phone number last one", "phone number last one", "A"};
+    const int32_t maximum_new_tokens[] = {2, 2, 2, 2};
+    const int32_t shape_modes[] = {0, 0, 1, 0};
+    TinyReceiptSplitShapeEvidence evidence[4];
+    char* argv[9];
+    int status = -1;
+
+    memset(&fixture, 0, sizeof(fixture));
+    if (!root || fixture_paths(&fixture, root) != 0 ||
+        create_kv_fixture(&fixture, 4) != 0 ||
+        tiny_receipt_split_w8a8_qualify_sequence(
+            fixture.root, fixture.image, prompts, maximum_new_tokens,
+            shape_modes, 4, "cpu", evidence) != 0)
+        goto done;
+    CHECK(evidence[0].shape_mode == 0);
+    CHECK(evidence[1].shape_mode == 0);
+    CHECK(evidence[2].shape_mode == 1);
+    CHECK(evidence[3].shape_mode == 0);
+    CHECK(evidence[0].question_length < evidence[1].question_length);
+    CHECK(evidence[1].question_length == evidence[2].question_length);
+    CHECK(evidence[1].memory_length == evidence[1].question_length + 210);
+    CHECK(evidence[2].memory_length == 402);
+    CHECK(evidence[3].question_length == evidence[0].question_length);
+    CHECK(evidence[3].memory_length == evidence[0].memory_length);
+    CHECK(evidence[0].token_digest == evidence[3].token_digest);
+    CHECK(evidence[1].token_digest == evidence[2].token_digest);
+    for (size_t index = 0; index < 4; index++) {
+        CHECK(evidence[index].selected_family_id == 0);
+        CHECK(evidence[index].generated_tokens == 2);
+        CHECK(evidence[index].decoder_seed_past_length == 1);
+        CHECK(evidence[index].decoder_seed_present_length == 2);
+        CHECK(evidence[index].decoder_step_past_length == 2);
+        CHECK(evidence[index].decoder_step_present_length == 3);
+        CHECK(evidence[index].explicit_kv_sentinel_preserved == 1);
+    }
+
+    argv[0] = "tiny_receipt_split_w8a8";
+    argv[1] = fixture.root;
+    argv[2] = "--image";
+    argv[3] = fixture.image;
+    argv[4] = "--qualify-dynamic";
+    argv[5] = NULL;
+    if (run_and_capture(5, argv, 2, NULL) != 0) goto done;
+    argv[5] = "--cpu";
+    argv[6] = NULL;
+    if (run_and_capture(
+            6, argv, 0,
+            "DYNAMIC_REBIND_RESULT status=pass backend=cpu timed=0 "
+            "same_runtime=1 same_encoder_context=1 same_decoder_context=1 "
+            "strict_no_fallback=1 cpu_threads=1") != 0)
+        goto done;
+    argv[6] = "--threads";
+    argv[7] = "3";
+    argv[8] = NULL;
+    if (run_and_capture(
+            8, argv, 0,
+            "DYNAMIC_REBIND_RESULT status=pass backend=cpu timed=0 "
+            "same_runtime=1 same_encoder_context=1 same_decoder_context=1 "
+            "strict_no_fallback=1 cpu_threads=3") != 0)
+        goto done;
+    status = 0;
+
+done:
+    cleanup_fixture(&fixture);
+    return status;
+}
+
+static int test_bpe1536_tokenizer_v1(void) {
     static const int32_t expected_question[] = {
         286, 287, 19, 217, 191, 248, 174, 153, 2,
     };
@@ -1012,23 +1280,18 @@ static int test_bpe1536_tokenizer_session(void) {
         "612e8425883fd7e3f0292912ab39bd44c72a1da9e399ee455639e6e612acb939";
     static const char corrupt_hash[] =
         "712e8425883fd7e3f0292912ab39bd44c72a1da9e399ee455639e6e612acb939";
-    char template_path[] = "/tmp/volvox-tinyreceipt-split-bpe1536-XXXXXX";
+    char template_path[] = "/tmp/volvox-tinyreceipt-explicit-kv-bpe-XXXXXX";
     char* root = mkdtemp(template_path);
     SplitFixture fixture;
     int32_t ids[32];
     size_t ids_count = 0;
     char decoded[128];
-    char* argv[14];
     int status = -1;
 
     memset(&fixture, 0, sizeof(fixture));
     if (!root || fixture_paths(&fixture, root) != 0 ||
-        create_fixture(&fixture, 0, 0) != 0 ||
-        write_bpe_vocab(fixture.vocab, BPE_FIXTURE_VALID) != 0 ||
-        write_manifest(&fixture,
-            "volvoxai-tiny-receipt-vqa-split-onnx-package-v1", 0, 0, 1) != 0)
+        create_kv_fixture(&fixture, 4) != 0)
         goto done;
-
     if (tiny_receipt_split_w8a8_tokenizer_roundtrip(
             fixture.root, "  phone\t7\xc3\xa9\xe2\x98\x83\n", ids,
             sizeof(ids) / sizeof(ids[0]), &ids_count, decoded,
@@ -1037,7 +1300,6 @@ static int test_bpe1536_tokenizer_session(void) {
         memcmp(ids, expected_question, sizeof(expected_question)) != 0 ||
         strcmp(decoded, "phone 7\xc3\xa9\xe2\x98\x83") != 0)
         goto done;
-
     if (tiny_receipt_split_w8a8_tokenizer_roundtrip(
             fixture.root, "<answer>42</answer>", ids,
             sizeof(ids) / sizeof(ids[0]), &ids_count, decoded,
@@ -1046,7 +1308,6 @@ static int test_bpe1536_tokenizer_session(void) {
         memcmp(ids, expected_atomic, sizeof(expected_atomic)) != 0 ||
         strcmp(decoded, "<answer>42</answer>") != 0)
         goto done;
-
     if (tiny_receipt_split_w8a8_tokenizer_roundtrip(
             fixture.root, "\xc3\xa9", ids, 2, &ids_count, decoded,
             sizeof(decoded)) != 0 || ids_count != 2 || ids[0] != 217 ||
@@ -1057,36 +1318,12 @@ static int test_bpe1536_tokenizer_session(void) {
             &ids_count, decoded, sizeof(decoded)) == 0)
         goto done;
 
-    argv[0] = "tiny_receipt_split_w8a8";
-    argv[1] = fixture.root;
-    argv[2] = "--image";
-    argv[3] = fixture.image;
-    argv[4] = "--prompt";
-    argv[5] = "phone";
-    argv[6] = "--max-new";
-    argv[7] = "2";
-    argv[8] = "--family";
-    argv[9] = "phone";
-    argv[10] = "--cpu";
-    argv[11] = "--threads";
-    argv[12] = "1";
-    argv[13] = NULL;
-    if (run_and_capture(13, argv, 1, "<field>") != 0) goto done;
-    argv[12] = "0";
-    if (tiny_receipt_split_w8a8_run(13, argv) != 2) goto done;
-    argv[12] = "1";
-
     if (replace_once_in_file(fixture.vocab, original_hash, corrupt_hash) != 0 ||
-        write_manifest(&fixture,
-            "volvoxai-tiny-receipt-vqa-split-onnx-package-v1", 0, 0, 1) != 0 ||
+        write_kv_manifest(&fixture) != 0 ||
         tiny_receipt_split_w8a8_tokenizer_roundtrip(
             fixture.root, "phone", ids, sizeof(ids) / sizeof(ids[0]),
-            &ids_count, decoded, sizeof(decoded)) == 0 ||
-        write_bpe_vocab(fixture.vocab, BPE_FIXTURE_VALID) != 0 ||
-        write_manifest(&fixture,
-            "volvoxai-tiny-receipt-vqa-split-onnx-package-v1", 0, 0, 1) != 0)
+            &ids_count, decoded, sizeof(decoded)) == 0)
         goto done;
-
     {
         static const BpeFixtureVariant tampered[] = {
             BPE_FIXTURE_ATOMIC_SWAPPED,
@@ -1099,9 +1336,7 @@ static int test_bpe1536_tokenizer_session(void) {
             const char* tampered_hash = bpe_fixture_hash(tampered[index]);
             if (!tampered_hash ||
                 write_bpe_vocab(fixture.vocab, tampered[index]) != 0 ||
-                write_manifest(&fixture,
-                    "volvoxai-tiny-receipt-vqa-split-onnx-package-v1",
-                    0, 0, 1) != 0 ||
+                write_kv_manifest(&fixture) != 0 ||
                 replace_once_in_file(fixture.manifest, original_hash,
                                      tampered_hash) != 0 ||
                 tiny_receipt_split_w8a8_tokenizer_roundtrip(
@@ -1111,75 +1346,112 @@ static int test_bpe1536_tokenizer_session(void) {
                 goto done;
         }
     }
-
     if (write_bpe_vocab(fixture.vocab, BPE_FIXTURE_VALID) != 0 ||
-        write_manifest(&fixture,
-            "volvoxai-tiny-receipt-vqa-split-onnx-package-v1", 0, 0, 1) != 0)
-        goto done;
-
-    if (replace_once_in_file(fixture.manifest,
+        write_kv_manifest(&fixture) != 0 ||
+        replace_once_in_file(fixture.manifest,
                              "\"merges_key\":\"merges\",", "") != 0 ||
         tiny_receipt_split_w8a8_tokenizer_roundtrip(
             fixture.root, "phone", ids, sizeof(ids) / sizeof(ids[0]),
             &ids_count, decoded, sizeof(decoded)) == 0)
         goto done;
-
     status = 0;
+
 done:
     cleanup_fixture(&fixture);
     return status;
 }
 
-static int test_bpe1536_direct_logits_session(void) {
-    static const char int8_shape_760[] =
-        "\"outputs_shape\":{\"out\":[1,192,760]},"
-        "\"outputs_dtype\":{\"out\":\"int8\"}";
-    static const char int8_shape_1536[] =
-        "\"outputs_shape\":{\"out\":[1,192,1536]},"
-        "\"outputs_dtype\":{\"out\":\"int8\"}";
-    static const char f32_shape_760[] =
-        "\"outputs_shape\":{\"out\":[1,192,760]},"
-        "\"outputs_dtype\":{\"out\":\"float32\"}";
-    static const char f32_shape_1536[] =
-        "\"outputs_shape\":{\"out\":[1,192,1536]},"
-        "\"outputs_dtype\":{\"out\":\"float32\"}";
-    char template_path[] = "/tmp/volvox-tinyreceipt-split-bpe1536-logits-XXXXXX";
+static int test_explicit_kv_manifest_contract(void) {
+    char template_path[] = "/tmp/volvox-tinyreceipt-explicit-kv-manifest-XXXXXX";
     char* root = mkdtemp(template_path);
     SplitFixture fixture;
-    char* argv[15];
+    char prompt[192];
+    char* argv[10];
     int status = -1;
 
     memset(&fixture, 0, sizeof(fixture));
+    memset(prompt, 'A', sizeof(prompt) - 1);
+    prompt[sizeof(prompt) - 1] = 0;
     if (!root || fixture_paths(&fixture, root) != 0 ||
-        create_fixture(&fixture, 1, 1) != 0 ||
-        replace_once_in_file(fixture.decoder_graph, int8_shape_760,
-                             int8_shape_1536) != 0 ||
-        replace_once_in_file(fixture.decoder_graph, f32_shape_760,
-                             f32_shape_1536) != 0 ||
-        write_decoder_weights(fixture.decoder_weights, 1, 1536) != 0 ||
-        write_bpe_vocab(fixture.vocab, BPE_FIXTURE_VALID) != 0 ||
-        write_manifest(&fixture,
-            "volvoxai-tiny-receipt-vqa-split-onnx-package-v1", 1, 1, 1) != 0)
+        create_kv_fixture(&fixture, 4) != 0)
         goto done;
-
     argv[0] = "tiny_receipt_split_w8a8";
     argv[1] = fixture.root;
     argv[2] = "--image";
     argv[3] = fixture.image;
     argv[4] = "--prompt";
-    argv[5] = "phone";
+    argv[5] = prompt;
     argv[6] = "--max-new";
     argv[7] = "2";
-    argv[8] = "--family";
-    argv[9] = "phone";
-    argv[10] = "--cpu";
-    argv[11] = "--threads";
-    argv[12] = "1";
-    argv[13] = "--ordinary";
-    argv[14] = NULL;
-    if (run_and_capture(14, argv, 1, "<field>") != 0) goto done;
+    argv[8] = "--cpu";
+    argv[9] = NULL;
 
+    if (write_text(fixture.config, "[]\n") != 0 ||
+        run_and_capture(9, argv, 1, NULL) != 0 ||
+        write_text(fixture.config, "{}\n") != 0 ||
+        write_kv_manifest(&fixture) != 0)
+        goto done;
+    if (replace_once_in_file(
+            fixture.manifest,
+            "\"shape_contract\":{\"graph_shape_mode\"",
+            "\"shape_contract\":{\"shape_system\":"
+            "\"volvox-bounded-shape/v1\",\"graph_shape_mode\"") != 0 ||
+        run_and_capture(9, argv, 1, NULL) != 0 ||
+        write_kv_manifest(&fixture) != 0)
+        goto done;
+    if (replace_once_in_file(
+            fixture.manifest,
+            "\"tie_policy\":\"first-index\"",
+            "\"tie_policy\":\"first-index\",\"tie_policy\":\"last-index\"") != 0 ||
+        run_and_capture(9, argv, 1, NULL) != 0 ||
+        write_kv_manifest(&fixture) != 0)
+        goto done;
+    if (replace_once_in_file(
+            fixture.manifest,
+            "\"past_v_3\":\"dec_past_v_3_phys\"",
+            "\"past_v_3\":\"dec_past_k_3_phys\"") != 0 ||
+        run_and_capture(9, argv, 1, NULL) != 0 ||
+        write_kv_manifest(&fixture) != 0)
+        goto done;
+    if (replace_once_in_file(
+            fixture.manifest,
+            "\"routing\":{\"mode\":\"runtime\"",
+            "\"routing\":{\"mode\":\"specialized\"") != 0 ||
+        run_and_capture(9, argv, 1, NULL) != 0)
+        goto done;
     status = 0;
+
+done:
+    cleanup_fixture(&fixture);
+    return status;
+}
+
+static int test_wrong_package_format_rejected(void) {
+    char template_path[] = "/tmp/volvox-tinyreceipt-explicit-kv-only-XXXXXX";
+    char* root = mkdtemp(template_path);
+    SplitFixture fixture;
+    char* argv[7];
+    int status = -1;
+
+    memset(&fixture, 0, sizeof(fixture));
+    if (!root || fixture_paths(&fixture, root) != 0 ||
+        create_kv_fixture(&fixture, 4) != 0)
+        goto done;
+    argv[0] = "tiny_receipt_split_w8a8";
+    argv[1] = fixture.root;
+    argv[2] = "--image";
+    argv[3] = fixture.image;
+    argv[4] = "--prompt";
+    argv[5] = "A";
+    argv[6] = NULL;
+    if (replace_once_in_file(
+            fixture.manifest,
+            "volvoxai-tiny-receipt-vqa-split-kv-onnx-package-v1",
+            "unsupported-package-format") != 0 ||
+        run_and_capture(6, argv, 1, NULL) != 0)
+        goto done;
+    status = 0;
+
 done:
     cleanup_fixture(&fixture);
     return status;
@@ -1187,11 +1459,16 @@ done:
 
 int main(void) {
     CHECK(test_sha256_known_vector() == 0);
-    CHECK(test_split_session() == 0);
-    CHECK(test_runtime_family_session() == 0);
-    CHECK(test_direct_logits_session() == 0);
-    CHECK(test_bpe1536_tokenizer_session() == 0);
-    CHECK(test_bpe1536_direct_logits_session() == 0);
+    CHECK(test_image_normalization_f32_contract() == 0);
+    CHECK(test_strict_backend_report_contract() == 0);
+    CHECK(test_explicit_kv_two_step_session() == 0);
+    CHECK(test_ordinary_cli_defaults_to_strict_cpu() == 0);
+    CHECK(test_explicit_kv_pad_mask_two_step() == 0);
+    CHECK(test_explicit_kv_context_reuse() == 0);
+    CHECK(test_explicit_kv_dynamic_qualification() == 0);
+    CHECK(test_bpe1536_tokenizer_v1() == 0);
+    CHECK(test_explicit_kv_manifest_contract() == 0);
+    CHECK(test_wrong_package_format_rejected() == 0);
     puts("TinyReceipt split W8A8 native example tests passed");
     return 0;
 }

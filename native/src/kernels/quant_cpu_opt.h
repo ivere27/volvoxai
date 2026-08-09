@@ -1,6 +1,7 @@
 #ifndef VOLVOX_QUANT_CPU_OPT_H
 #define VOLVOX_QUANT_CPU_OPT_H
 
+#include <stddef.h>
 #include <stdint.h>
 
 /* Native-only dispatcher for the canonical physical W8A8 QLinear ABI.  It
@@ -63,7 +64,21 @@ int vx_qconv2d_i8u8_native_prepacked(const void* input, const void* weight,
                             int32_t input_zero_point, float output_scale,
                             int32_t output_zero_point, uint32_t input_dtype,
                             uint32_t weight_dtype, uint32_t output_dtype,
-                            const void* packed_qlinear_weight);
+                            const void* packed_qlinear_weight,
+                            const void* small_c_packed_weight);
+
+/* Load-time transpose for the narrow-input AVX2 QConv2D path, which needs eight
+ * adjacent output channels contiguous per input load.  The size query returns 0
+ * for geometries (or targets) that can never take the path, so callers allocate
+ * only when the prepack is usable.  Pass the result to
+ * vx_qconv2d_i8u8_native_prepacked; NULL keeps the per-call transpose. */
+size_t vx_w8a8_qconv_small_c_pack_size(uint32_t kernel_height,
+                            uint32_t kernel_width, uint32_t input_per_group,
+                            uint32_t output_channels, uint32_t groups);
+int vx_w8a8_qconv_pack_small_c(void* packed, size_t bytes, const void* weight,
+                            uint32_t kernel_height, uint32_t kernel_width,
+                            uint32_t input_per_group, uint32_t output_channels,
+                            uint32_t groups);
 
 /* Native-only parallel route for a QSDPA call that the runtime has already
  * validated against the canonical physical-byte ABI.  Large whole-tensor

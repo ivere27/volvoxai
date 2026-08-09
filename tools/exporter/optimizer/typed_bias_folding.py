@@ -31,7 +31,9 @@ class RuntimeBiasFoldingPass(IRPass):
     """Fold proven ``dense -> Add(immutable bias)`` pairs transactionally."""
 
     name = "runtime-bias-folding"
-    contract = PassContract.preserving(IRDialect.RUNTIME, repeatable=True)
+    contract = PassContract.preserving(
+        IRDialect.RUNTIME, repeatable=True
+    )
 
     def __init__(self, tensor_data: MutableMapping[str, Any]) -> None:
         if not isinstance(tensor_data, MutableMapping):
@@ -73,7 +75,7 @@ class RuntimeBiasFoldingPass(IRPass):
                 continue
             params = self._params(dense)
             assert params is not None
-            if params.get("weight_layout") not in {"IN_OUT", "OUT_IN"}:
+            if params.get("weight_layout") not in {"din_dout", "dout_din"}:
                 continue
 
             intermediate_name = dense_outputs["out"]
@@ -85,8 +87,13 @@ class RuntimeBiasFoldingPass(IRPass):
                 or intermediate.initializer
                 or intermediate.dtype != "float32"
                 or intermediate.quantization is not None
-                or not intermediate.concrete
                 or intermediate.rank < 1
+                # Only the feature axis takes part in the fold; the leading
+                # batch and sequence axes may stay symbolic. Requiring the whole
+                # descriptor to be concrete refused every bounded-dynamic dense
+                # layer and left the bias materialized at full activation size.
+                or not isinstance(intermediate.shape[-1], int)
+                or isinstance(intermediate.shape[-1], bool)
             ):
                 continue
             uses = use_def.consumers.get(intermediate_name, ())
@@ -149,7 +156,30 @@ class RuntimeBiasFoldingPass(IRPass):
             return False
         return not params or params == {"relu": 0}
 
+    def _bias_source(self, graph, name: str) -> str:
+        """See through one Expand that only materializes an immutable bias.
+
+        The importer emits `Add(dense, Expand(bias))` rather than relying on
+        broadcast, so the operand reaching the Add is a computed tensor and not
+        the initializer this fold needs. Following that single hop is what makes
+        the pattern recognizable; the Expand is left for dead-code removal.
+        """
+
+        producer = None
+        for node in graph.nodes:
+            if name in {port.value for port in node.outputs}:
+                producer = node
+                break
+        if producer is None or producer.op_type != "Expand":
+            return name
+        inputs = producer.input_map()
+        if set(inputs) != {"input"}:
+            return name
+        source = graph.tensors.get(inputs["input"])
+        return inputs["input"] if source is not None and source.initializer else name
+
     def _canonical_bias(self, graph, name: str, width: int) -> str | None:
+        name = self._bias_source(graph, name)
         tensor = graph.tensors.get(name)
         value = self.tensor_data.get(name)
         if (

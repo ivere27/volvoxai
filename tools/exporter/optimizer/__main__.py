@@ -9,7 +9,11 @@ from pathlib import Path
 from typing import Any
 
 from ..publication import ArtifactTransaction
-from ..runtime_ir import import_runtime_package, load_runtime_document
+from ..runtime_ir import (
+    import_runtime_package,
+    load_runtime_document,
+    prove_dynamic_quantized_runtime_domain,
+)
 from .compiled_model import build_compiled_model_plan
 from .registry_resolver import default_target_environment
 from .safetensors_io import read_safetensors, write_safetensors
@@ -85,7 +89,16 @@ def _validate_staged_runtime_package(
     weights: dict[str, Any],
 ) -> None:
     document = load_runtime_document(graph_path)
-    import_runtime_package(document, weights, source_name=str(graph_path))
+    bounded_domain_proof = prove_dynamic_quantized_runtime_domain(
+        document,
+        weights,
+    )
+    import_runtime_package(
+        document,
+        weights,
+        source_name=str(graph_path),
+        bounded_domain_proof=bounded_domain_proof,
+    )
 
 
 def _output_argmax(value: str) -> OutputArgMaxSpecialization:
@@ -98,6 +111,25 @@ def _output_argmax(value: str) -> OutputArgMaxSpecialization:
         return OutputArgMaxSpecialization(source, result)
     except ValueError as error:
         raise argparse.ArgumentTypeError(str(error)) from error
+
+
+def _dimension_binding(value: str) -> tuple[str, int]:
+    name, separator, raw_value = value.partition("=")
+    if separator != "=" or not name or not raw_value or "=" in raw_value:
+        raise argparse.ArgumentTypeError(
+            "expected SYMBOL=VALUE, for example batch=4"
+        )
+    try:
+        concrete = int(raw_value)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError(
+            f"shape binding for {name!r} must be an integer"
+        ) from error
+    if concrete <= 0:
+        raise argparse.ArgumentTypeError(
+            f"shape binding for {name!r} must be positive"
+        )
+    return name, concrete
 
 
 def _target_environment(args: argparse.Namespace) -> TargetEnvironment:
@@ -245,11 +277,48 @@ def main() -> int:
         ),
     )
     parser.add_argument(
+        "--concrete-profile",
+        action="store_true",
+        help=(
+            "explicitly authorize concrete-profile-only rewrites; for a "
+            "symbolic graph, pair this with one --bind-dimension per symbol"
+        ),
+    )
+    parser.add_argument(
+        "--bind-dimension",
+        action="append",
+        default=[],
+        type=_dimension_binding,
+        metavar="SYMBOL=VALUE",
+        help=(
+            "bind one declared shape symbol for constant-only emission; "
+            "repeat for every symbol"
+        ),
+    )
+    parser.add_argument(
         "--allow-static-qdq-compute-migration",
         action="store_true",
         help=(
             "opt into registered DQ/F32/Q to quantized-compute numerical "
             "migration while preserving imported affine parameters"
+        ),
+    )
+    parser.add_argument(
+        "--allow-quantized-bias-folding-migration",
+        action="store_true",
+        help=(
+            "opt into only immutable F32 post-bias folding for existing "
+            "QLinear/QMatMul/QGemm accumulators; does not enable broad "
+            "static-QDQ compute migration"
+        ),
+    )
+    parser.add_argument(
+        "--allow-static-qdq-groupnorm-silu-migration",
+        action="store_true",
+        help=(
+            "opt into only closed DQ/GroupNorm/layout/SiLU/Q byte-domain "
+            "migration using existing scalar endpoint affines; does not "
+            "enable LayerNorm or broad static-QDQ migration"
         ),
     )
     parser.add_argument(
@@ -285,6 +354,14 @@ def main() -> int:
         ),
     )
     args = parser.parse_args()
+
+    shape_profile: dict[str, int] | None = None
+    if args.concrete_profile or args.bind_dimension:
+        shape_profile = {}
+        for name, value in args.bind_dimension:
+            if name in shape_profile:
+                parser.error(f"--bind-dimension repeats symbol {name!r}")
+            shape_profile[name] = value
 
     unselected_backend = default_target_environment().compile_backend
     if (
@@ -334,6 +411,12 @@ def main() -> int:
         allow_static_qdq_compute_numerical_migration=(
             args.allow_static_qdq_compute_migration
         ),
+        allow_quantized_bias_folding_numerical_migration=(
+            args.allow_quantized_bias_folding_migration
+        ),
+        allow_static_qdq_groupnorm_silu_numerical_migration=(
+            args.allow_static_qdq_groupnorm_silu_migration
+        ),
         allow_float_attention_numerical_migration=(
             args.allow_float_attention_migration
         ),
@@ -345,6 +428,7 @@ def main() -> int:
         ),
         enable_fp32_pre_ptq_optimization=args.prepare_fp32_for_ptq,
         target_environment=target_environment,
+        shape_profile=shape_profile,
     )
     serialized = serialize_pipeline_report(report)
     serialized["target_environment"] = _serialize_target_environment(

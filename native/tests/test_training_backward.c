@@ -146,15 +146,9 @@ static float cross_entropy_loss(const T* logits, const int* targets, int count) 
     return (float)(loss / count);
 }
 
-static float test_fast_tanh(float x) {
-    union { float f; uint32_t i; } value;
-    value.i = (uint32_t)(12102203.0f * (2.0f * x) + 1064866805.0f);
-    return (value.f - 1.0f) / (value.f + 1.0f);
-}
-
 static float reference_gelu(float x, int approximate_tanh) {
     if (approximate_tanh) {
-        return 0.5f * x * (1.0f + test_fast_tanh(
+        return 0.5f * x * (1.0f + tanhf(
             0.79788456f * (x + 0.044715f * x * x * x)));
     }
     return 0.5f * x * (1.0f + erff(x * 0.7071067811865475f));
@@ -1618,7 +1612,7 @@ static int run_linear_runtime_parity_case(int use_cuda, float* updated_weight,
     CHECK(add_tensor("linear.bias", bias_shape, 1, bias));
     CHECK(add_tensor("logits", output_shape, 2, NULL));
     Node* node = add_node("Linear", "logits",
-                          "{\"weight_layout\":\"OUT_IN\"}");
+                          "{\"weight_layout\":\"dout_din\"}");
     CHECK(node && node_input(node, "input", "linear.input") == 0 &&
           node_input(node, "weight", "linear.weight") == 0 &&
           node_input(node, "bias", "linear.bias") == 0);
@@ -1688,7 +1682,7 @@ static int run_composed_runtime_parity_case(int use_cuda, float* updated_weight,
     CHECK(add_tensor("composed.relu", output_shape, 2, NULL));
     CHECK(add_tensor("logits", output_shape, 2, NULL));
     Node* node = add_node("Linear", "composed.linear",
-                          "{\"weight_layout\":\"OUT_IN\"}");
+                          "{\"weight_layout\":\"dout_din\"}");
     CHECK(node && node_input(node, "input", "composed.input") == 0 &&
           node_input(node, "weight", "composed.weight") == 0 &&
           node_input(node, "bias", "composed.bias") == 0);

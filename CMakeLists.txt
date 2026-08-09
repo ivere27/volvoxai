@@ -12,6 +12,8 @@
 cmake_minimum_required(VERSION 3.20)
 
 # --- Version / provenance ----------------------------------------------------
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+  "${CMAKE_CURRENT_SOURCE_DIR}/package.json")
 file(READ "${CMAKE_CURRENT_SOURCE_DIR}/package.json" _volvox_pkg_json)
 string(JSON VOLVOXAI_VERSION GET "${_volvox_pkg_json}" version)
 

@@ -32,6 +32,10 @@ struct ANeuralNetworksExecution {
 static pthread_mutex_t g_fake_mutex = PTHREAD_MUTEX_INITIALIZER;
 static int g_model_created;
 static int g_model_freed;
+static int g_compilation_created;
+static int g_compilation_freed;
+static int g_fail_next_model_finish;
+static int g_fail_next_execution;
 static const float g_bias[2] = {0.0f, 0.0f};
 
 int ANeuralNetworks_getDeviceCount(uint32_t* count) {
@@ -88,6 +92,10 @@ int ANeuralNetworksModel_identifyInputsAndOutputs(
 }
 
 int ANeuralNetworksModel_finish(ANeuralNetworksModel* model) {
+    if (g_fail_next_model_finish) {
+        g_fail_next_model_finish = 0;
+        return -1;
+    }
     return model ? ANEURALNETWORKS_NO_ERROR : -1;
 }
 
@@ -98,12 +106,20 @@ int ANeuralNetworksCompilation_create(
         (ANeuralNetworksCompilation*)calloc(1, sizeof(*next));
     if (!next) return -1;
     next->model = model;
+    pthread_mutex_lock(&g_fake_mutex);
+    g_compilation_created++;
+    pthread_mutex_unlock(&g_fake_mutex);
     *compilation = next;
     return ANEURALNETWORKS_NO_ERROR;
 }
 
 void ANeuralNetworksCompilation_free(
     ANeuralNetworksCompilation* compilation) {
+    if (compilation) {
+        pthread_mutex_lock(&g_fake_mutex);
+        g_compilation_freed++;
+        pthread_mutex_unlock(&g_fake_mutex);
+    }
     free(compilation);
 }
 
@@ -155,6 +171,10 @@ int ANeuralNetworksExecution_compute(ANeuralNetworksExecution* execution) {
     size_t count = execution->output_bytes / sizeof(float);
     for (size_t index = 0; index < count; index++)
         ((float*)execution->output)[index] = identity;
+    if (g_fail_next_execution) {
+        g_fail_next_execution = 0;
+        return -1;
+    }
     return ANEURALNETWORKS_NO_ERROR;
 }
 
@@ -185,6 +205,130 @@ static void* run_nnapi_thread(void* opaque) {
     }
     vx_engine_state_scope_leave(scope);
     return NULL;
+}
+
+static int test_exact_shape_signature(void) {
+    VxEngineState* state = (VxEngineState*)calloc(1, sizeof(*state));
+    const float weight[4] = {1.0f, 0.0f, 0.0f, 1.0f};
+    const float input[4] = {1.0f, 2.0f, 3.0f, 4.0f};
+    float output[4] = {0};
+    NnapiCacheTelemetry telemetry = {0};
+    CHECK(state && vx_engine_state_init(state) == 0);
+    VxEngineStateScope scope = vx_engine_state_scope_enter(state);
+    CHECK(nnapi_init() == 0);
+    CHECK(nnapi_matmul(input, weight, g_bias, output, 1, 2, 2) == 1);
+    CHECK(nnapi_matmul(input, weight, g_bias, output, 2, 2, 2) == 1);
+    CHECK(nnapi_matmul(input, weight, g_bias, output, 1, 2, 2) == 1);
+    CHECK(nnapi_test_cache_telemetry(&telemetry) == 0);
+    CHECK(telemetry.entry_count == 2 && telemetry.model_builds == 2 &&
+          telemetry.cache_misses == 2 && telemetry.cache_hits == 1 &&
+          telemetry.cache_hit_rate > 0.33 && telemetry.cache_hit_rate < 0.34 &&
+          telemetry.last_model_build_time_ms >= 0.0 &&
+          telemetry.total_model_build_time_ms >=
+              telemetry.last_model_build_time_ms);
+    nnapi_cleanup();
+    vx_engine_state_scope_leave(scope);
+    vx_engine_state_deinit(state);
+    free(state);
+    return 0;
+}
+
+static int test_bounded_exact_cache_and_fail_closed(void) {
+    VxEngineState* state = (VxEngineState*)calloc(1, sizeof(*state));
+    float shared_weight[4] = {1.0f, 0.0f, 0.0f, 1.0f};
+    float unique_weights[NNAPI_MODEL_CACHE_CAPACITY][4];
+    NnapiCacheTelemetry telemetry = {0};
+    NnapiThreadProbe first_probe = {state, shared_weight, 0};
+    NnapiThreadProbe second_probe = {state, shared_weight, 0};
+    pthread_t first_thread;
+    pthread_t second_thread;
+    int models_before = g_model_created;
+    int compilations_before = g_compilation_created;
+    CHECK(state && vx_engine_state_init(state) == 0);
+    VxEngineStateScope scope = vx_engine_state_scope_enter(state);
+    CHECK(nnapi_init() == 0);
+    vx_engine_state_scope_leave(scope);
+
+    CHECK(pthread_create(&first_thread, NULL, run_nnapi_thread,
+                         &first_probe) == 0);
+    CHECK(pthread_create(&second_thread, NULL, run_nnapi_thread,
+                         &second_probe) == 0);
+    CHECK(pthread_join(first_thread, NULL) == 0);
+    CHECK(pthread_join(second_thread, NULL) == 0);
+    CHECK(first_probe.ok && second_probe.ok);
+    CHECK(g_model_created == models_before + 1);
+
+    scope = vx_engine_state_scope_enter(state);
+    CHECK(nnapi_test_cache_telemetry(&telemetry) == 0);
+    CHECK(telemetry.entry_count == 1 &&
+          telemetry.entry_capacity == NNAPI_MODEL_CACHE_CAPACITY &&
+          telemetry.model_builds == 1 && telemetry.cache_misses == 1 &&
+          telemetry.cache_hits == 63 && telemetry.cache_hit_rate > 0.98 &&
+          telemetry.cache_hit_rate < 0.99);
+
+    float sentinel_output[4] = {91.0f, 92.0f, 93.0f, 94.0f};
+    float expected_output[4];
+    memcpy(expected_output, sentinel_output, sizeof(expected_output));
+    CHECK(nnapi_matmul(NULL, shared_weight, g_bias, sentinel_output,
+                       2, 2, 2) == 0);
+    CHECK(memcmp(sentinel_output, expected_output, sizeof(expected_output)) == 0);
+    CHECK(nnapi_matmul(expected_output, shared_weight, g_bias, sentinel_output,
+                       INT32_MAX, 2, 2) == 0);
+    CHECK(memcmp(sentinel_output, expected_output, sizeof(expected_output)) == 0);
+
+    g_fail_next_execution = 1;
+    CHECK(nnapi_matmul(expected_output, shared_weight, g_bias, sentinel_output,
+                       2, 2, 2) == 0);
+    CHECK(memcmp(sentinel_output, expected_output, sizeof(expected_output)) == 0);
+
+    float failed_weight[4] = {2.0f, 0.0f, 0.0f, 2.0f};
+    g_fail_next_model_finish = 1;
+    CHECK(nnapi_matmul(expected_output, failed_weight, g_bias, sentinel_output,
+                       2, 2, 2) == 0);
+    CHECK(memcmp(sentinel_output, expected_output, sizeof(expected_output)) == 0);
+    CHECK(nnapi_test_cache_telemetry(&telemetry) == 0);
+    CHECK(telemetry.entry_count == 1 && telemetry.model_build_failures == 1 &&
+          telemetry.execution_failures == 1 &&
+          telemetry.missing_input_rejections == 1 &&
+          telemetry.limit_rejections == 1);
+
+    for (int index = 0; index < NNAPI_MODEL_CACHE_CAPACITY; index++) {
+        for (int value = 0; value < 4; value++)
+            unique_weights[index][value] = (float)(index * 4 + value + 1);
+    }
+    for (int index = 0; index < NNAPI_MODEL_CACHE_CAPACITY - 1; index++) {
+        float output[4] = {0};
+        run_matmul(output, unique_weights[index], 2);
+        CHECK(output[0] > 0.0f);
+    }
+    /* Refresh the original key. The next build must deterministically evict
+       unique_weights[0], the oldest remaining exact key. */
+    {
+        float output[4] = {0};
+        run_matmul(output, shared_weight, 2);
+        run_matmul(output, unique_weights[NNAPI_MODEL_CACHE_CAPACITY - 1], 2);
+        CHECK(nnapi_test_cache_telemetry(&telemetry) == 0);
+        CHECK(telemetry.entry_count == NNAPI_MODEL_CACHE_CAPACITY &&
+              telemetry.evictions == 1);
+        uint64_t builds = telemetry.model_builds;
+        run_matmul(output, shared_weight, 2);
+        CHECK(nnapi_test_cache_telemetry(&telemetry) == 0);
+        CHECK(telemetry.model_builds == builds);
+        run_matmul(output, unique_weights[0], 2);
+        CHECK(nnapi_test_cache_telemetry(&telemetry) == 0);
+        CHECK(telemetry.model_builds == builds + 1 &&
+              telemetry.evictions == 2 &&
+              telemetry.entry_count == NNAPI_MODEL_CACHE_CAPACITY);
+    }
+    nnapi_cleanup();
+    vx_engine_state_scope_leave(scope);
+    vx_engine_state_deinit(state);
+    free(state);
+    CHECK(g_model_created - models_before ==
+          g_model_freed - models_before);
+    CHECK(g_compilation_created - compilations_before ==
+          g_compilation_freed - compilations_before);
+    return 0;
 }
 
 int main(void) {
@@ -271,6 +415,15 @@ int main(void) {
     vx_engine_state_deinit(implicit);
     free(implicit);
     CHECK(g_model_freed == g_model_created);
+    CHECK(g_compilation_freed == g_compilation_created);
+
+    CHECK(test_exact_shape_signature() == 0);
+    CHECK(g_model_freed == g_model_created);
+    CHECK(g_compilation_freed == g_compilation_created);
+
+    CHECK(test_bounded_exact_cache_and_fail_closed() == 0);
+    CHECK(g_model_freed == g_model_created);
+    CHECK(g_compilation_freed == g_compilation_created);
 
     puts("NNAPI per-engine ownership checks passed");
     return 0;

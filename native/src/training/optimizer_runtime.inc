@@ -10,7 +10,7 @@
 static void volvoxai_engine_free_optimizer_states(void) {
     for (int i = 0; i < MAXT; i++) {
 #if VOLVOXAI_ENABLE_CUDA
-        if (g_opt_states[i].m && g_opt_states[i].v)
+        if (g_use_cuda && g_opt_states[i].m && g_opt_states[i].v)
             cuda_training_optimizer_forget(g_opt_states[i].m,
                                            g_opt_states[i].v);
 #endif
@@ -27,7 +27,7 @@ static EngineOptimizerState* optimizer_state_for(const char* name, long numel) {
             EngineOptimizerState* state = &g_opt_states[i];
             if (state->numel != numel) {
 #if VOLVOXAI_ENABLE_CUDA
-                if (state->m && state->v)
+                if (g_use_cuda && state->m && state->v)
                     cuda_training_optimizer_forget(state->m, state->v);
 #endif
                 free(state->m);
@@ -63,7 +63,7 @@ static void optimizer_state_remove(const char* name) {
     for (int i = 0; i < MAXT; i++) {
         if (g_opt_states[i].name[0] && !strcmp(g_opt_states[i].name, name)) {
 #if VOLVOXAI_ENABLE_CUDA
-            if (g_opt_states[i].m && g_opt_states[i].v)
+            if (g_use_cuda && g_opt_states[i].m && g_opt_states[i].v)
                 cuda_training_optimizer_forget(g_opt_states[i].m,
                                                g_opt_states[i].v);
 #endif
@@ -173,13 +173,17 @@ static int volvoxai_engine_apply_tensor_update_f32_impl(
         EngineOptimizerState* state = optimizer_state_for(name, numel);
         if (!state) return -1;
 #if VOLVOXAI_ENABLE_CUDA
-        if (cuda_training_optimizer_materialize(
+        /* A compiled CUDA backend does not give a CPU-owned engine a CUDA
+           context capsule. Only a CUDA-routed engine can own optimizer
+           mirrors that need to be materialized or forgotten here. */
+        if (g_use_cuda && cuda_training_optimizer_materialize(
                 state->m, state->v, (size_t)numel * sizeof(float)) != 0)
             return -1;
         /* The CPU update below makes the host moments authoritative again.
            Drop the old device mirror so a later CUDA step seeds from these
            newly updated values instead of reusing stale device state. */
-        cuda_training_optimizer_forget(state->m, state->v);
+        if (g_use_cuda)
+            cuda_training_optimizer_forget(state->m, state->v);
 #endif
         float bias_correction1 = 1.0f - powf(beta1, (float)step);
         float bias_correction2 = 1.0f - powf(beta2, (float)step);
@@ -279,7 +283,8 @@ int volvoxai_engine_save_optimizer_state(const char* path, long training_step) {
         if (!state->name[0] || state->numel <= 0 || !state->m || !state->v ||
             state->numel > INT_MAX) continue;
 #if VOLVOXAI_ENABLE_CUDA
-        if (cuda_training_optimizer_materialize(
+        /* CPU-owned optimizer states have no CUDA capsule or mirror. */
+        if (g_use_cuda && cuda_training_optimizer_materialize(
                 state->m, state->v,
                 (size_t)state->numel * sizeof(float)) != 0) goto done;
 #endif

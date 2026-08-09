@@ -93,7 +93,9 @@ class RuntimeQuantizedAttentionFusionPass(IRPass):
     """Fuse a proved static-QDQ attention region into runnable ``QSDPA``."""
 
     name = "runtime-quantized-attention-fusion"
-    contract = PassContract.preserving(IRDialect.RUNTIME, repeatable=True)
+    contract = PassContract.preserving(
+        IRDialect.RUNTIME, repeatable=True
+    )
 
     def __init__(
         self,
@@ -572,7 +574,9 @@ class RuntimeQuantizedAttentionLayoutPass(IRPass):
     """Commute scalar Q/DQ through exact singleton-batch attention layout."""
 
     name = "runtime-quantized-attention-layout"
-    contract = PassContract.preserving(IRDialect.RUNTIME, repeatable=True)
+    contract = PassContract.preserving(
+        IRDialect.RUNTIME, repeatable=True
+    )
 
     def __init__(self, tensor_data: Mapping[str, Any]) -> None:
         if not isinstance(tensor_data, Mapping):

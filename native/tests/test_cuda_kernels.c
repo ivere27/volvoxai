@@ -58,6 +58,11 @@ static int32_t reference_raw_value(uint8_t raw, uint32_t dtype) {
         ? (int32_t)raw - 256 : (int32_t)raw;
 }
 
+static uint8_t qbatch_encode_centered(int32_t centered,
+                                      int32_t zero_point) {
+    return (uint8_t)(centered + zero_point);
+}
+
 static float reference_qgelu_erf(float value) {
     const float sign = value >= 0.0f ? 1.0f : -1.0f;
     const float magnitude = fabsf(value);
@@ -512,6 +517,467 @@ done:
     return ok;
 }
 
+static int run_dynamic_copy(const float* input, float* output,
+                            long elements) {
+    int dispatched;
+    int ended;
+    cuda_graph_begin_forward();
+    dispatched = cuda_graph_copy_f32(input, output, elements);
+    ended = cuda_graph_end_forward();
+    if (!dispatched || ended != 0 ||
+        !cuda_graph_sync_host(output, (size_t)elements * sizeof(float), 0))
+        return 0;
+    return memcmp(input, output,
+                  (size_t)elements * sizeof(float)) == 0;
+}
+
+static int run_dynamic_matmul(const float* input, const float* weight,
+                              float* output) {
+    int dispatched;
+    int ended;
+    cuda_graph_begin_forward();
+    dispatched = cuda_graph_matmul_f32(
+        input, weight, NULL, output, 1, 2, 2);
+    ended = cuda_graph_end_forward();
+    return dispatched && ended == 0 &&
+        cuda_graph_sync_host(output, 2u * sizeof(float), 0);
+}
+
+static int test_dynamic_shape_capacity_pool(void) {
+    float small_input_a[4] = {1.0f, 2.0f, 3.0f, 4.0f};
+    float small_output_a[4] = {0};
+    float small_input_b[4] = {5.0f, 6.0f, 7.0f, 8.0f};
+    float small_output_b[4] = {0};
+    float medium_input[7] = {9.0f, 8.0f, 7.0f, 6.0f,
+                             5.0f, 4.0f, 3.0f};
+    float medium_output[7] = {0};
+    float large_input_a[128];
+    float large_output_a[128] = {0};
+    float large_input_b[128];
+    float large_output_b[128] = {0};
+    const float weight[4] = {1.0f, 2.0f, 3.0f, 4.0f};
+    float weight_input_a[2] = {1.0f, 2.0f};
+    float weight_output_a[2] = {0};
+    float weight_input_b[2] = {-2.0f, 4.0f};
+    float weight_output_b[2] = {0};
+    CudaGraphDynamicStateProbe populated = {0};
+    CudaGraphDynamicStateProbe pooled = {0};
+    CudaGraphDynamicStateProbe reused = {0};
+    CudaGraphDynamicStateProbe before_failure = {0};
+    CudaGraphDynamicStateProbe after_failure = {0};
+    CudaGraphDynamicStateProbe grown = {0};
+    CudaGraphDynamicStateProbe weight_active = {0};
+    CudaGraphDynamicStateProbe weight_pooled = {0};
+    uint64_t allocations;
+    uint64_t uploads;
+    int failed_dispatch;
+    int failed_end;
+    int phase = 0;
+    int ok = 0;
+
+    for (int index = 0; index < 128; index++) {
+        large_input_a[index] = (float)(index - 17);
+        large_input_b[index] = (float)(63 - index);
+    }
+
+    /* Populate a maximum-capacity multiset, return it to the anonymous pool,
+     * then bind smaller requests through different host identities. This is
+     * the allocator-level contract required by a separately proved maximum-
+     * domain prewarm: best-fit must not allocate or consume the larger class. */
+    cuda_graph_reset();
+    if (cuda_graph_bind_shape("pool:small-large:a") != 0 ||
+        !run_dynamic_copy(small_input_a, small_output_a, 4) ||
+        !run_dynamic_copy(large_input_a, large_output_a, 128) ||
+        cuda_test_graph_dynamic_state(
+            "pool:small-large:a", &populated) != 0 ||
+        !populated.exact_signature_match || populated.slot_count != 4 ||
+        populated.active_capacity_bytes !=
+            2u * sizeof(small_input_a) + 2u * sizeof(large_input_a) ||
+        populated.pooled_capacity_bytes != 0)
+        goto done;
+    allocations = cuda_test_graph_allocation_count();
+    phase = 1;
+    if (cuda_graph_bind_shape("pool:small-large:b") != 0 ||
+        cuda_test_graph_dynamic_state(
+            "pool:small-large:b", &pooled) != 0 ||
+        pooled.shape_generation == populated.shape_generation ||
+        pooled.capacity_generation != populated.capacity_generation ||
+        pooled.active_capacity_bytes != 0 ||
+        pooled.pooled_capacity_bytes != populated.active_capacity_bytes ||
+        pooled.slot_count != populated.slot_count ||
+        cuda_test_graph_allocation_count() != allocations)
+        goto done;
+    phase = 2;
+    if (!run_dynamic_copy(small_input_b, small_output_b, 3) ||
+        cuda_test_graph_dynamic_state(
+            "pool:small-large:b", &reused) != 0 ||
+        reused.capacity_generation != pooled.capacity_generation ||
+        reused.active_capacity_bytes != 2u * sizeof(small_input_b) ||
+        reused.pooled_capacity_bytes != 2u * sizeof(large_input_a) ||
+        reused.slot_count != pooled.slot_count ||
+        cuda_test_graph_allocation_count() != allocations)
+        goto done;
+    phase = 3;
+    if (cuda_graph_bind_shape("pool:small-large:c") != 0 ||
+        !run_dynamic_copy(large_input_b, large_output_b, 100) ||
+        cuda_test_graph_dynamic_state(
+            "pool:small-large:c", &reused) != 0 ||
+        reused.capacity_generation != pooled.capacity_generation ||
+        reused.active_capacity_bytes != 2u * sizeof(large_input_b) ||
+        reused.pooled_capacity_bytes != 2u * sizeof(small_input_a) ||
+        reused.slot_count != pooled.slot_count ||
+        cuda_test_graph_allocation_count() != allocations)
+        goto done;
+    for (int iteration = 0; iteration < 8; iteration++) {
+        const int use_small = (iteration & 1) != 0;
+        const char* signature = use_small
+            ? "pool:cycle:small" : "pool:cycle:large";
+        if (cuda_graph_bind_shape(signature) != 0 ||
+            !(use_small
+                ? run_dynamic_copy(small_input_b, small_output_b, 2)
+                : run_dynamic_copy(large_input_b, large_output_b, 96)) ||
+            cuda_test_graph_dynamic_state(signature, &reused) != 0 ||
+            reused.capacity_generation != pooled.capacity_generation ||
+            reused.slot_count != pooled.slot_count ||
+            reused.active_capacity_bytes + reused.pooled_capacity_bytes !=
+                populated.active_capacity_bytes ||
+            cuda_test_graph_allocation_count() != allocations)
+            goto done;
+    }
+
+    /* An injected growth failure must leave the anonymous owner, capacity,
+     * epoch, and exact key untouched. Retrying grows the same two metadata
+     * slots geometrically, and a nearby larger shape reuses that headroom. */
+    phase = 4;
+    cuda_graph_reset();
+    if (cuda_graph_bind_shape("pool:growth:small") != 0 ||
+        !run_dynamic_copy(small_input_a, small_output_a, 4) ||
+        cuda_graph_bind_shape("pool:growth:medium") != 0 ||
+        cuda_test_graph_dynamic_state(
+            "pool:growth:medium", &before_failure) != 0 ||
+        before_failure.active_capacity_bytes != 0 ||
+        before_failure.pooled_capacity_bytes !=
+            2u * sizeof(small_input_a) ||
+        before_failure.slot_count != 2)
+        goto done;
+    cuda_test_fail_next_graph_allocation();
+    cuda_graph_begin_forward();
+    failed_dispatch = cuda_graph_copy_f32(
+        medium_input, medium_output, 6);
+    failed_end = cuda_graph_end_forward();
+    if (failed_dispatch || failed_end != 0 ||
+        cuda_test_graph_dynamic_state(
+            "pool:growth:medium", &after_failure) != 0 ||
+        !after_failure.exact_signature_match ||
+        after_failure.shape_generation != before_failure.shape_generation ||
+        after_failure.capacity_generation !=
+            before_failure.capacity_generation ||
+        after_failure.slot_epoch != before_failure.slot_epoch ||
+        after_failure.active_capacity_bytes != 0 ||
+        after_failure.pooled_capacity_bytes !=
+            before_failure.pooled_capacity_bytes ||
+        after_failure.slot_count != before_failure.slot_count)
+        goto done;
+    phase = 5;
+    if (!run_dynamic_copy(medium_input, medium_output, 6) ||
+        cuda_test_graph_dynamic_state(
+            "pool:growth:medium", &grown) != 0 ||
+        grown.capacity_generation <= before_failure.capacity_generation ||
+        grown.active_capacity_bytes != 64u ||
+        grown.pooled_capacity_bytes != 0 || grown.slot_count != 2)
+        goto done;
+    phase = 6;
+    if (cuda_graph_bind_shape("pool:growth:nearby") != 0 ||
+        !run_dynamic_copy(medium_input, medium_output, 7) ||
+        cuda_test_graph_dynamic_state(
+            "pool:growth:nearby", &reused) != 0 ||
+        reused.capacity_generation != grown.capacity_generation ||
+        reused.active_capacity_bytes != grown.active_capacity_bytes ||
+        reused.pooled_capacity_bytes != 0 || reused.slot_count != 2)
+        goto done;
+    if (cuda_graph_bind_shape("pool:growth:large") != 0 ||
+        !run_dynamic_copy(large_input_a, large_output_a, 128) ||
+        cuda_test_graph_dynamic_state("pool:growth:large", &grown) != 0 ||
+        grown.capacity_generation <= reused.capacity_generation ||
+        grown.active_capacity_bytes < 2u * sizeof(large_input_a) ||
+        grown.pooled_capacity_bytes != 0 || grown.slot_count != 2)
+        goto done;
+    phase = 7;
+    if (cuda_graph_bind_shape("pool:growth:small-return") != 0 ||
+        !run_dynamic_copy(small_input_a, small_output_a, 4) ||
+        cuda_test_graph_dynamic_state(
+            "pool:growth:small-return", &reused) != 0 ||
+        reused.capacity_generation != grown.capacity_generation ||
+        reused.active_capacity_bytes != grown.active_capacity_bytes ||
+        reused.pooled_capacity_bytes != 0 || reused.slot_count != 2)
+        goto done;
+
+    /* Shape return never retires immutable weights. The second pass must use
+     * the same resident weight without another host-to-device upload. */
+    phase = 8;
+    cuda_graph_reset();
+    if (cuda_graph_bind_shape("pool:weight:a") != 0 ||
+        !run_dynamic_matmul(weight_input_a, weight, weight_output_a) ||
+        weight_output_a[0] != 7.0f || weight_output_a[1] != 10.0f ||
+        cuda_test_graph_resident_weight_slot_count() != 1u ||
+        cuda_test_graph_dynamic_state(
+            "pool:weight:a", &weight_active) != 0 ||
+        weight_active.slot_count != 3)
+        goto done;
+    allocations = cuda_test_graph_allocation_count();
+    uploads = cuda_test_host_to_device_count();
+    if (cuda_graph_bind_shape("pool:weight:b") != 0 ||
+        cuda_test_graph_dynamic_state(
+            "pool:weight:b", &weight_pooled) != 0 ||
+        weight_pooled.capacity_generation !=
+            weight_active.capacity_generation ||
+        weight_pooled.active_capacity_bytes != sizeof(weight) ||
+        weight_pooled.pooled_capacity_bytes !=
+            sizeof(weight_input_a) + sizeof(weight_output_a) ||
+        weight_pooled.slot_count != weight_active.slot_count ||
+        cuda_test_graph_resident_weight_slot_count() != 1u ||
+        !run_dynamic_matmul(weight_input_b, weight, weight_output_b) ||
+        weight_output_b[0] != 10.0f || weight_output_b[1] != 12.0f ||
+        cuda_test_graph_allocation_count() != allocations ||
+        cuda_test_host_to_device_count() - uploads != 1u ||
+        cuda_test_graph_resident_weight_slot_count() != 1u)
+        goto done;
+
+    ok = 1;
+done:
+    if (!ok) {
+        fprintf(stderr,
+                "CUDA dynamic capacity-pool mismatch phase=%d "
+                "slots=%llu weights=%llu orphans=%llu\n",
+                phase,
+                (unsigned long long)cuda_test_graph_slot_count(),
+                (unsigned long long)
+                    cuda_test_graph_resident_weight_slot_count(),
+                (unsigned long long)
+                    cuda_test_quarantined_transient_slot_count());
+    }
+    cuda_graph_reset();
+    return ok;
+}
+
+static int test_dynamic_domain_reservation(void) {
+    float arena[64] = {0};
+    float bootstrap_input[1] = {2.0f};
+    float logical_storage[4] = {3.0f, 4.0f, 5.0f, 6.0f};
+    float logical_copy[4] = {0};
+    const float generic_constant[1] = {0.5f};
+    float bootstrap_output[1] = {0};
+    float missing_input[4] = {1.0f, 2.0f, 3.0f, 4.0f};
+    float missing_output[4] = {0};
+    const uint32_t output_strides[1] = {1u};
+    const uint32_t input_strides[1] = {1u};
+    const uint32_t scalar_strides[1] = {0u};
+    const VolvoxAIEnginePhysicalSpan spans[2] = {
+        {arena, 32u * sizeof(float)},
+        {arena + 32, 32u * sizeof(float)},
+    };
+    uint64_t allocations;
+    uint64_t uploads;
+    size_t span_count = 0;
+    int preload_complete = 0;
+    int enforced = 0;
+    int replay_plan = -1;
+    int dispatched;
+    int ended;
+    int phase = 0;
+    int ok = 0;
+
+    cuda_graph_reset();
+    cuda_graph_clear_allocation_failure();
+    if (cuda_graph_bind_shape("domain:bootstrap") != 0) goto done;
+    cuda_graph_begin_forward();
+    dispatched = cuda_graph_add_f32(
+        bootstrap_input, generic_constant, bootstrap_output, 1);
+    dispatched = dispatched && cuda_graph_copy_f32(
+        logical_storage, logical_copy, 4);
+    ended = cuda_graph_end_forward();
+    if (!dispatched || ended != 0 ||
+        !cuda_graph_sync_host(
+            bootstrap_output, sizeof(bootstrap_output), 0) ||
+        !cuda_graph_sync_host(logical_copy, sizeof(logical_copy), 0) ||
+        bootstrap_output[0] != 2.5f ||
+        memcmp(logical_copy, logical_storage, sizeof(logical_copy)) != 0)
+        goto done;
+
+    /* Simulate a logical tensor consumed through a weight/affine port. The
+     * post-prewarm logical scan demotes that exact identity before the model
+     * scan retains the separate immutable invariant. Completion must release
+     * only the demoted bootstrap slot. */
+    phase = 1;
+    cuda_graph_retain_weight(
+        logical_storage + 1, sizeof(logical_storage[0]));
+    if (cuda_test_graph_resident_weight_slot_count() != 1u) goto done;
+    cuda_graph_demote_weight(
+        logical_storage + 1, sizeof(logical_storage[0]));
+    if (cuda_test_graph_resident_weight_slot_count() != 0u) goto done;
+    cuda_graph_retain_weight(generic_constant, sizeof(generic_constant));
+    if (cuda_test_graph_resident_weight_slot_count() != 1u ||
+        cuda_graph_complete_invariant_preload() != 0 ||
+        cuda_test_graph_slot_count() != 1u ||
+        cuda_test_graph_domain_reservation(
+            &span_count, &preload_complete, &enforced,
+            &replay_plan) != 0 ||
+        span_count != 0u || !preload_complete || enforced ||
+        replay_plan != 0)
+        goto done;
+
+    /* A failed all-span reservation leaves the invariant slot and unpublished
+     * domain state untouched. The exact retry may then commit normally. */
+    phase = 2;
+    cuda_test_fail_next_graph_allocation();
+    if (cuda_graph_bind_shape_domain(
+            "domain:q4", spans, 2u) != -2 ||
+        !cuda_graph_last_allocation_failed() ||
+        cuda_test_graph_slot_count() != 1u ||
+        cuda_test_graph_resident_weight_slot_count() != 1u ||
+        cuda_test_graph_domain_reservation(
+            &span_count, NULL, &enforced, &replay_plan) != 0 ||
+        span_count != 0u || enforced || replay_plan != 0)
+        goto done;
+
+    phase = 3;
+    cuda_graph_clear_allocation_failure();
+    if (cuda_graph_bind_shape_domain("domain:q4", spans, 2u) != 0 ||
+        cuda_graph_last_allocation_failed() ||
+        cuda_test_graph_domain_reservation(
+            &span_count, &preload_complete, &enforced,
+            &replay_plan) != 0 ||
+        span_count != 2u || !preload_complete || !enforced ||
+        replay_plan != 0 || cuda_test_graph_slot_count() != 3u)
+        goto done;
+    allocations = cuda_test_graph_allocation_count();
+    uploads = cuda_test_host_to_device_count();
+
+    for (int index = 0; index < 4; index++) arena[index] = (float)index;
+    cuda_graph_begin_forward();
+    dispatched = cuda_graph_binary_f32(
+        arena, 4, generic_constant, 1, arena + 32, 4,
+        output_strides, input_strides, scalar_strides, 1, 3);
+    ended = cuda_graph_end_forward();
+    if (!dispatched || ended != 0 ||
+        !cuda_graph_sync_host(arena + 32, 4u * sizeof(float), 0) ||
+        arena[32] != 0.5f || arena[33] != 1.5f ||
+        arena[34] != 2.5f || arena[35] != 3.5f ||
+        cuda_test_host_to_device_count() != uploads + 1u ||
+        cuda_test_graph_allocation_count() != allocations)
+        goto done;
+
+    /* The exact-key hot path resets only logical views. It performs neither
+     * a host allocation for a replacement signature nor a device allocation. */
+    phase = 4;
+    if (cuda_graph_bind_shape_domain("domain:q4", spans, 2u) != 0 ||
+        cuda_test_graph_allocation_count() != allocations)
+        goto done;
+    uploads = cuda_test_host_to_device_count();
+    for (int index = 0; index < 4; index++) arena[index] = (float)(index + 10);
+    cuda_graph_begin_forward();
+    dispatched = cuda_graph_binary_f32(
+        arena, 4, generic_constant, 1, arena + 32, 4,
+        output_strides, input_strides, scalar_strides, 1, 3);
+    ended = cuda_graph_end_forward();
+    if (!dispatched || ended != 0 ||
+        !cuda_graph_sync_host(arena + 32, 4u * sizeof(float), 0) ||
+        arena[32] != 10.5f || arena[35] != 13.5f ||
+        cuda_test_host_to_device_count() != uploads + 1u ||
+        cuda_test_graph_allocation_count() != allocations)
+        goto done;
+
+    /* Enforce mode must reject an unproved host identity without attempting
+     * growth. The legacy shape binder cannot disable the fixed domain. */
+    phase = 5;
+    cuda_graph_begin_forward();
+    dispatched = cuda_graph_copy_f32(
+        missing_input, missing_output, 4);
+    ended = cuda_graph_end_forward();
+    if (dispatched || ended != 0 || cuda_graph_last_allocation_failed() ||
+        cuda_test_graph_allocation_count() != allocations ||
+        cuda_graph_bind_shape("domain:legacy") == 0)
+        goto done;
+
+    ok = 1;
+done:
+    if (!ok) {
+        fprintf(stderr,
+                "CUDA dynamic-domain reservation mismatch phase=%d "
+                "slots=%llu weights=%llu allocations=%llu\n",
+                phase,
+                (unsigned long long)cuda_test_graph_slot_count(),
+                (unsigned long long)
+                    cuda_test_graph_resident_weight_slot_count(),
+                (unsigned long long)cuda_test_graph_allocation_count());
+    }
+    cuda_graph_reset();
+    return ok;
+}
+
+static int test_growth_rollback_ownership(void) {
+    float small_input[4] = {1.0f, 2.0f, 3.0f, 4.0f};
+    float small_output[4] = {0};
+    float larger_input[7] = {7.0f, 6.0f, 5.0f, 4.0f,
+                             3.0f, 2.0f, 1.0f};
+    float larger_output[7] = {0};
+    CudaGraphDynamicStateProbe before = {0};
+    CudaGraphDynamicStateProbe after = {0};
+    int dispatched;
+    int ended;
+    int phase = 0;
+    int ok = 0;
+
+    cuda_graph_reset();
+    if (cuda_graph_bind_shape("rollback:small") != 0 ||
+        !run_dynamic_copy(small_input, small_output, 4) ||
+        cuda_graph_bind_shape("rollback:grow") != 0 ||
+        cuda_test_graph_dynamic_state("rollback:grow", &before) != 0 ||
+        before.active_capacity_bytes != 0u ||
+        before.pooled_capacity_bytes != 2u * sizeof(small_input) ||
+        before.slot_count != 2)
+        goto done;
+
+    /* Simulate both Driver releases in the transactional growth rollback
+     * failing. The old slot must remain unchanged and the unpublished new
+     * CUdeviceptr must stay owned by one anonymous quarantine slot. */
+    phase = 1;
+    cuda_test_fail_next_graph_growth_rollback();
+    cuda_graph_begin_forward();
+    dispatched = cuda_graph_copy_f32(
+        larger_input, larger_output, 7);
+    ended = cuda_graph_end_forward();
+    if (dispatched || ended != 0 ||
+        cuda_test_graph_dynamic_state("rollback:grow", &after) != 0 ||
+        !after.exact_signature_match ||
+        after.shape_generation != before.shape_generation ||
+        after.capacity_generation != before.capacity_generation ||
+        after.active_capacity_bytes != 0u ||
+        after.pooled_capacity_bytes != before.pooled_capacity_bytes ||
+        after.slot_count != before.slot_count + 1 ||
+        cuda_test_quarantined_transient_slot_count() != 1u)
+        goto done;
+
+    phase = 2;
+    cuda_graph_release_transients();
+    if (cuda_test_graph_slot_count() != 0u ||
+        cuda_test_quarantined_transient_slot_count() != 0u)
+        goto done;
+    ok = 1;
+done:
+    if (!ok) {
+        fprintf(stderr,
+                "CUDA growth rollback ownership mismatch phase=%d "
+                "slots=%llu orphans=%llu\n",
+                phase,
+                (unsigned long long)cuda_test_graph_slot_count(),
+                (unsigned long long)
+                    cuda_test_quarantined_transient_slot_count());
+    }
+    cuda_graph_reset();
+    return ok;
+}
+
 static int test_transient_release_failure_safety(int fail_sync) {
     float input[2] = {1.0f, 2.0f};
     const float weight[4] = {1.0f, 2.0f, 3.0f, 4.0f};
@@ -587,6 +1053,9 @@ int main(void) {
     CHECK(cuda_test_caller_context_is_clear());
     CHECK(test_matmul_tiled_tail(0));
     CHECK(test_matmul_tiled_tail(1));
+    CHECK(test_dynamic_shape_capacity_pool());
+    CHECK(test_dynamic_domain_reservation());
+    CHECK(test_growth_rollback_ownership());
     CHECK(test_transient_release_failure_safety(0));
     CHECK(test_transient_release_failure_safety(1));
 
@@ -717,6 +1186,89 @@ int main(void) {
         CHECK(cuda_graph_end_forward() == 0);
         CHECK(cuda_graph_sync_host(output, sizeof(output), 0));
         CHECK(memcmp(output, expected, sizeof(output)) == 0);
+    }
+
+    /* Every dtype pairing and an asymmetric zero point use the same signed
+     * DP4A physical route. K=5 guarantees one packed group plus one scalar
+     * tail value for each broadcast output coordinate. */
+    for (int qcase = 0; qcase < 4; qcase++) {
+        static const uint32_t a_dtypes[4] = {
+            VX_DTYPE_I8, VX_DTYPE_I8, VX_DTYPE_U8, VX_DTYPE_U8,
+        };
+        static const uint32_t b_dtypes[4] = {
+            VX_DTYPE_I8, VX_DTYPE_U8, VX_DTYPE_I8, VX_DTYPE_U8,
+        };
+        static const uint32_t output_dtypes[4] = {
+            VX_DTYPE_I8, VX_DTYPE_U8, VX_DTYPE_I8, VX_DTYPE_U8,
+        };
+        static const int32_t a_zero_points[4] = {-37, 27, 173, 91};
+        static const int32_t b_zero_points[4] = {51, 19, -29, 201};
+        static const int32_t output_zero_points[4] = {-7, 137, 5, 111};
+        const int a_shape[4] = {2, 1, 2, 5};
+        const int b_shape[3] = {3, 5, 2};
+        const int output_shape[4] = {2, 3, 2, 2};
+        uint8_t a[20];
+        uint8_t b[30];
+        uint8_t output[24] = {0};
+        uint8_t expected[24] = {0};
+        uint64_t dp4a_before;
+        uint64_t tail_before;
+        for (int index = 0; index < 20; index++) {
+            int32_t centered = (int32_t)((index * 5 + 3) % 11) - 5;
+            a[index] = qbatch_encode_centered(
+                centered, a_zero_points[qcase]);
+        }
+        for (int index = 0; index < 30; index++) {
+            int32_t centered = (int32_t)((index * 7 + 1) % 13) - 6;
+            b[index] = qbatch_encode_centered(
+                centered, b_zero_points[qcase]);
+        }
+        for (int a_batch = 0; a_batch < 2; a_batch++) {
+            for (int b_batch = 0; b_batch < 3; b_batch++) {
+                for (int row = 0; row < 2; row++) {
+                    for (int column = 0; column < 2; column++) {
+                        int32_t accumulator = 0;
+                        int output_index =
+                            ((a_batch * 3 + b_batch) * 2 + row) * 2 +
+                            column;
+                        for (int inner = 0; inner < 5; inner++) {
+                            int a_index = (a_batch * 2 + row) * 5 + inner;
+                            int b_index = (b_batch * 5 + inner) * 2 + column;
+                            int32_t a_value = reference_raw_value(
+                                a[a_index], a_dtypes[qcase]) -
+                                a_zero_points[qcase];
+                            int32_t b_value = reference_raw_value(
+                                b[b_index], b_dtypes[qcase]) -
+                                b_zero_points[qcase];
+                            accumulator += a_value * b_value;
+                        }
+                        expected[output_index] = reference_quantize(
+                            (float)accumulator +
+                                (float)output_zero_points[qcase],
+                            output_zero_points[qcase],
+                            output_dtypes[qcase]);
+                    }
+                }
+            }
+        }
+        cuda_graph_reset();
+        cuda_graph_begin_forward();
+        dp4a_before = cuda_test_qbatch_matmul_dp4a_group_count();
+        tail_before = cuda_test_qbatch_matmul_scalar_tail_count();
+        CHECK(cuda_graph_qbatch_matmul_i8u8(
+                  a, a_shape, 4, 0.5f, a_zero_points[qcase],
+                  a_dtypes[qcase],
+                  b, b_shape, 3, 0.25f, b_zero_points[qcase],
+                  b_dtypes[qcase],
+                  output, output_shape, 4, 0.125f,
+                  output_zero_points[qcase], output_dtypes[qcase]));
+        CHECK(cuda_graph_end_forward() == 0);
+        CHECK(cuda_graph_sync_host(output, sizeof(output), 0));
+        CHECK(memcmp(output, expected, sizeof(output)) == 0);
+        CHECK(cuda_test_qbatch_matmul_dp4a_group_count() - dp4a_before ==
+              24u);
+        CHECK(cuda_test_qbatch_matmul_scalar_tail_count() - tail_before ==
+              24u);
     }
 
     cuda_graph_reset();
@@ -1872,25 +2424,112 @@ int main(void) {
     cuda_graph_reset();
     cuda_graph_begin_forward();
     {
-        const int8_t input[4] = {-2, 1, 3, 4};
-        const int8_t weight[8] = {1, 2, -1, 1, 2, 0, 1, -2};
+        const int8_t input[5] = {-2, 1, 3, 4, -1};
+        const int8_t weight[10] = {
+            1, 2, -1, 1, 3,
+            2, 0, 1, -2, -4,
+        };
         const float weight_scales[2] = {0.5f, 0.5f};
         const float tiny_scales[2] = {0x1p-149f, 0x1p-149f};
         const int32_t weight_zero_points[2] = {0, 0};
         const int32_t bias[2] = {0, 0};
         int8_t output[2] = {0};
         CHECK(!cuda_graph_qlinear_i8u8(input, weight, tiny_scales,
-            weight_zero_points, bias, output, 1, 4, 2,
+            weight_zero_points, bias, output, 1, 5, 2,
             0x1p-149f, 0, 1.0f, 0,
             VX_DTYPE_I8, VX_DTYPE_I8, VX_DTYPE_I8));
         CHECK(cuda_graph_qlinear_i8u8(input, weight, weight_scales,
-            weight_zero_points, bias, output, 1, 4, 2,
+            weight_zero_points, bias, output, 1, 5, 2,
             0.5f, 0, 0.25f, 0,
             VX_DTYPE_I8, VX_DTYPE_I8, VX_DTYPE_I8));
         CHECK(cuda_graph_end_forward() == 0);
         CHECK(cuda_graph_sync_host(output, sizeof(output), 0));
-        CHECK(output[0] == 1);
-        CHECK(output[1] == -9);
+        CHECK(output[0] == -2);
+        CHECK(output[1] == -5);
+        CHECK(cuda_test_qlinear_warp_dp4a_launch_count() == 0u);
+        CHECK(cuda_test_qlinear_thread_dp4a_launch_count() == 1u);
+        CHECK(cuda_test_qlinear_dp4a_group_count() == 2u);
+        CHECK(cuda_test_qlinear_scalar_tail_count() == 2u);
+    }
+
+    /* QLinear, QGemm, and QMatMul share this row-major physical ABI. Drive
+     * every I8/U8 operand pairing through the large warp-DP4A tactic. K=37
+     * covers an unaligned packed load plus a scalar tail; K=64 covers the
+     * aligned 32-bit load tier. */
+    for (int qcase = 0; qcase < 4; qcase++) {
+        static const uint32_t input_dtypes[4] = {
+            VX_DTYPE_I8, VX_DTYPE_I8, VX_DTYPE_U8, VX_DTYPE_U8,
+        };
+        static const uint32_t weight_dtypes[4] = {
+            VX_DTYPE_I8, VX_DTYPE_U8, VX_DTYPE_I8, VX_DTYPE_U8,
+        };
+        static const uint32_t output_dtypes[4] = {
+            VX_DTYPE_I8, VX_DTYPE_U8, VX_DTYPE_U8, VX_DTYPE_I8,
+        };
+        const uint32_t rows = 3u;
+        const uint32_t d_in = qcase < 2 ? 37u : 64u;
+        const uint32_t d_out = 5u;
+        const int32_t input_zero_point =
+            input_dtypes[qcase] == VX_DTYPE_I8 ? -37 :
+            (qcase == 2 ? 173 : 91);
+        const int32_t output_zero_point =
+            output_dtypes[qcase] == VX_DTYPE_I8 ? -11 : 131;
+        uint8_t input[3u * 64u] = {0};
+        uint8_t weight[5u * 64u] = {0};
+        float weight_scales[5] = {0};
+        int32_t weight_zero_points[5] = {0};
+        const int32_t bias[5] = {7, -11, 5, 0, 13};
+        uint8_t output[15] = {0};
+        uint8_t expected[15] = {0};
+        for (uint32_t index = 0u; index < rows * d_in; index++) {
+            int32_t centered = (int32_t)((index * 5u + 3u) % 15u) - 7;
+            input[index] = (uint8_t)(input_zero_point + centered);
+        }
+        for (uint32_t channel = 0u; channel < d_out; channel++) {
+            int32_t base = weight_dtypes[qcase] == VX_DTYPE_I8 ? 23 : 151;
+            weight_zero_points[channel] = base + ((int32_t)channel - 2) * 3;
+            weight_scales[channel] = 0.25f;
+            for (uint32_t inner = 0u; inner < d_in; inner++) {
+                uint32_t index = channel * d_in + inner;
+                int32_t centered =
+                    (int32_t)((index * 7u + channel) % 11u) - 5;
+                weight[index] =
+                    (uint8_t)(weight_zero_points[channel] + centered);
+            }
+        }
+        for (uint32_t row = 0u; row < rows; row++) {
+            for (uint32_t channel = 0u; channel < d_out; channel++) {
+                int32_t accumulator = bias[channel];
+                for (uint32_t inner = 0u; inner < d_in; inner++) {
+                    int32_t av = reference_raw_value(
+                        input[row * d_in + inner], input_dtypes[qcase]);
+                    int32_t wv = reference_raw_value(
+                        weight[channel * d_in + inner],
+                        weight_dtypes[qcase]);
+                    accumulator += (av - input_zero_point) *
+                        (wv - weight_zero_points[channel]);
+                }
+                expected[row * d_out + channel] = reference_quantize(
+                    (float)accumulator + (float)output_zero_point,
+                    output_zero_point, output_dtypes[qcase]);
+            }
+        }
+        cuda_graph_reset();
+        cuda_graph_begin_forward();
+        CHECK(cuda_graph_qlinear_i8u8(
+              input, weight, weight_scales, weight_zero_points, bias, output,
+              rows, d_in, d_out, 0.5f, input_zero_point, 0.125f,
+              output_zero_point, input_dtypes[qcase], weight_dtypes[qcase],
+              output_dtypes[qcase]));
+        CHECK(cuda_graph_end_forward() == 0);
+        CHECK(cuda_graph_sync_host(output, sizeof(output), 0));
+        CHECK(memcmp(output, expected, sizeof(output)) == 0);
+        CHECK(cuda_test_qlinear_warp_dp4a_launch_count() == 1u);
+        CHECK(cuda_test_qlinear_thread_dp4a_launch_count() == 0u);
+        CHECK(cuda_test_qlinear_dp4a_group_count() ==
+              (uint64_t)rows * d_out * (d_in / 4u));
+        CHECK(cuda_test_qlinear_scalar_tail_count() ==
+              (uint64_t)rows * d_out * (d_in % 4u));
     }
 
     cuda_graph_reset();
@@ -2011,6 +2650,112 @@ int main(void) {
         CHECK(cuda_graph_sync_host(output, sizeof(output), 0));
         for (int index = 0; index < 4; index++)
             CHECK(output[index] == expected[index]);
+        CHECK(cuda_test_qconv2d_warp_dp4a_launch_count() == 0u);
+        CHECK(cuda_test_qconv2d_thread_dp4a_launch_count() == 1u);
+    }
+
+    /* Large padded QConv reductions share the exact centered DP4A primitive.
+     * C=9 checks that packed groups never cross a padding/spatial boundary and
+     * preserves one scalar channel tail; C=12 checks aligned vector loads. */
+    for (int qcase = 0; qcase < 4; qcase++) {
+        static const uint32_t input_dtypes[4] = {
+            VX_DTYPE_I8, VX_DTYPE_I8, VX_DTYPE_U8, VX_DTYPE_U8,
+        };
+        static const uint32_t weight_dtypes[4] = {
+            VX_DTYPE_I8, VX_DTYPE_U8, VX_DTYPE_I8, VX_DTYPE_U8,
+        };
+        static const uint32_t output_dtypes[4] = {
+            VX_DTYPE_I8, VX_DTYPE_U8, VX_DTYPE_U8, VX_DTYPE_I8,
+        };
+        const uint32_t height = 3u;
+        const uint32_t width = 4u;
+        const uint32_t channels = qcase < 2 ? 9u : 12u;
+        const uint32_t output_channels = 3u;
+        const int32_t input_zero_point =
+            input_dtypes[qcase] == VX_DTYPE_I8 ? -37 :
+            (qcase == 2 ? 173 : 91);
+        const int32_t output_zero_point =
+            output_dtypes[qcase] == VX_DTYPE_I8 ? -11 : 131;
+        uint8_t input[3u * 4u * 12u] = {0};
+        uint8_t weight[3u * 3u * 3u * 12u] = {0};
+        float weight_scales[3] = {0};
+        int32_t weight_zero_points[3] = {0};
+        const int32_t bias[3] = {3, -7, 11};
+        uint8_t output[3u * 4u * 3u] = {0};
+        uint8_t expected[3u * 4u * 3u] = {0};
+        for (uint32_t index = 0u; index < height * width * channels;
+             index++) {
+            int32_t centered = (int32_t)((index * 5u + 3u) % 15u) - 7;
+            input[index] = (uint8_t)(input_zero_point + centered);
+        }
+        for (uint32_t channel = 0u; channel < output_channels; channel++) {
+            int32_t base = weight_dtypes[qcase] == VX_DTYPE_I8 ? 23 : 151;
+            weight_zero_points[channel] = base + ((int32_t)channel - 1) * 5;
+            weight_scales[channel] = 0.25f;
+            for (uint32_t ky = 0u; ky < 3u; ky++) {
+                for (uint32_t kx = 0u; kx < 3u; kx++) {
+                    for (uint32_t inner = 0u; inner < channels; inner++) {
+                        uint32_t index =
+                            ((channel * 3u + ky) * 3u + kx) * channels +
+                            inner;
+                        int32_t centered =
+                            (int32_t)((index * 7u + channel) % 11u) - 5;
+                        weight[index] = (uint8_t)(
+                            weight_zero_points[channel] + centered);
+                    }
+                }
+            }
+        }
+        for (uint32_t oy = 0u; oy < height; oy++) {
+            for (uint32_t ox = 0u; ox < width; ox++) {
+                for (uint32_t channel = 0u;
+                     channel < output_channels; channel++) {
+                    int32_t accumulator = bias[channel];
+                    for (uint32_t ky = 0u; ky < 3u; ky++) {
+                        int32_t iy = (int32_t)oy + (int32_t)ky - 1;
+                        if (iy < 0 || iy >= (int32_t)height) continue;
+                        for (uint32_t kx = 0u; kx < 3u; kx++) {
+                            int32_t ix = (int32_t)ox + (int32_t)kx - 1;
+                            if (ix < 0 || ix >= (int32_t)width) continue;
+                            for (uint32_t inner = 0u;
+                                 inner < channels; inner++) {
+                                uint32_t input_index =
+                                    (((uint32_t)iy * width + (uint32_t)ix) *
+                                     channels) + inner;
+                                uint32_t weight_index =
+                                    ((channel * 3u + ky) * 3u + kx) *
+                                    channels + inner;
+                                int32_t av = reference_raw_value(
+                                    input[input_index], input_dtypes[qcase]);
+                                int32_t wv = reference_raw_value(
+                                    weight[weight_index],
+                                    weight_dtypes[qcase]);
+                                accumulator += (av - input_zero_point) *
+                                    (wv - weight_zero_points[channel]);
+                            }
+                        }
+                    }
+                    expected[(oy * width + ox) * output_channels + channel] =
+                        reference_quantize(
+                            (float)accumulator + (float)output_zero_point,
+                            output_zero_point, output_dtypes[qcase]);
+                }
+            }
+        }
+        cuda_graph_reset();
+        cuda_graph_begin_forward();
+        CHECK(cuda_graph_qconv2d_i8u8(
+              input, weight, weight_scales, weight_zero_points, bias, output,
+              1u, height, width, channels, height, width, output_channels,
+              3u, 3u, channels, 1u, 1u, 1u, 1u, 1u, 1u, 1u, 1u, 1u, 0u,
+              0.5f, input_zero_point, 0.125f, output_zero_point,
+              input_dtypes[qcase], weight_dtypes[qcase],
+              output_dtypes[qcase]));
+        CHECK(cuda_graph_end_forward() == 0);
+        CHECK(cuda_graph_sync_host(output, sizeof(output), 0));
+        CHECK(memcmp(output, expected, sizeof(output)) == 0);
+        CHECK(cuda_test_qconv2d_warp_dp4a_launch_count() == 1u);
+        CHECK(cuda_test_qconv2d_thread_dp4a_launch_count() == 0u);
     }
 
     cuda_graph_reset();

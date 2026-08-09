@@ -1,77 +1,132 @@
-import { assertRawQuantizedShapeTensors } from './quantizedShape.js';
+import type { TensorQuantization } from '../types.js';
+import { sameQuantizationDescriptor } from './quantizedShape.js';
+import {
+  assertShapeKernelOutput,
+  assertShapeKernelParams,
+  assertShapeKernelTensor,
+  normalizeShapeKernelAxis,
+} from './shapeKernelValidation.js';
 
-export function _cpuConcat2(node) {
+function orderedInputs(node): readonly any[] {
+  const entries = Object.entries(node.inputs || {}).filter(([, tensor]) => tensor);
+  if (entries.length < 2) throw new Error('Concat requires at least two input tensors.');
+  if (entries.every(([name]) => /^input(0|[1-9][0-9]*)$/.test(name))) {
+    entries.sort(([left], [right]) => Number(left.slice(5)) - Number(right.slice(5)));
+    if (entries.some(([name], index) => name !== `input${index}`)) {
+      throw new Error("Concat canonical 'inputN' ports must be contiguous.");
+    }
+    return entries.map(([, tensor]) => tensor);
+  }
+  const preferred = new Map(
+    ['input', 'a', 'b', 'c', 'd', 'e', 'f', 'g', 'h'].map((name, index) => [name, index]),
+  );
+  entries.sort(([left], [right]) => {
+    const leftOrder = preferred.get(left) ?? Number.POSITIVE_INFINITY;
+    const rightOrder = preferred.get(right) ?? Number.POSITIVE_INFINITY;
+    return leftOrder - rightOrder || left.localeCompare(right);
+  });
+  return entries.map(([, tensor]) => tensor);
+}
 
-    const output = node.outputs.out;
-    if (!output || !['float32', 'int32', 'int8', 'uint8'].includes(output.dtype) ||
-        !output.buffer) {
-      throw new Error(`Concat node ${node.id || "<unnamed>"} requires typed output storage.`);
-    }
-    const outBuf = output.buffer;
-    const rank = output.shape.length;
-    let axis = node.params?.axis ?? 0;
-    if (axis < 0) axis += rank;
-    if (!Number.isInteger(axis) || axis < 0 || axis >= rank) {
-      throw new Error(`Concat node ${node.id || "<unnamed>"} has an invalid axis.`);
-    }
-
-    const preferred = ['input', 'a', 'b', 'c', 'd', 'e', 'f', 'g', 'h'];
-    const seen = new Set();
-    const entries: Array<[string, any]> = [];
-    for (const key of preferred) {
-      if (node.inputs[key]) {
-        entries.push([key, node.inputs[key]]);
-        seen.add(key);
-      }
-    }
-    entries.push(...Object.entries(node.inputs)
-      .filter(([key, tensor]) => tensor && !seen.has(key))
-      .sort(([left], [right]) => {
-        const li = /^input(\d+)$/.exec(left);
-        const ri = /^input(\d+)$/.exec(right);
-        if (li && ri) return Number(li[1]) - Number(ri[1]);
-        return left.localeCompare(right);
-      }));
-
-    const inner = output.shape.slice(axis + 1).reduce((count, dim) => count * dim, 1);
-    const outer = output.shape.slice(0, axis).reduce((count, dim) => count * dim, 1);
-    const outputAxis = output.shape[axis];
-    let summedAxis = 0;
-    for (const [, tensor] of entries) {
-      if (tensor.dtype !== output.dtype || !tensor.buffer ||
-          tensor.shape.length !== rank ||
-          tensor.shape.some((dim, index) => index !== axis && dim !== output.shape[index])) {
-        throw new Error(`Concat node ${node.id || "<unnamed>"} has incompatible input shapes or dtypes.`);
-      }
-      summedAxis += tensor.shape[axis];
-    }
-    if (summedAxis !== outputAxis) {
-      throw new Error(`Concat node ${node.id || "<unnamed>"} input axes do not match its output.`);
-    }
-    const quantized = assertRawQuantizedShapeTensors(node,
-      [...entries.map(([, tensor]) => tensor), output], 'Concat');
-    if (quantized && node.params?.sigmoid) {
-      throw new Error(`Concat node ${node.id || '<unnamed>'} cannot fuse sigmoid into quantized byte storage; insert an explicit F32 boundary.`);
-    }
-    if (output.dtype === 'int32' && node.params?.sigmoid) {
-      throw new Error(`Concat node ${node.id || '<unnamed>'} cannot fuse sigmoid into I32 storage.`);
-    }
-
-    for (let outerIndex = 0; outerIndex < outer; outerIndex++) {
-      let axisOffset = 0;
-      for (const [, tensor] of entries) {
-        const inputAxis = tensor.shape[axis];
-        const block = inputAxis * inner;
-        const srcStart = outerIndex * block;
-        const dstStart = (outerIndex * outputAxis + axisOffset) * inner;
-        if (node.params?.sigmoid) {
-          for (let i = 0; i < block; i++) {
-            outBuf[dstStart + i] = 1 / (1 + Math.exp(-tensor.buffer[srcStart + i]));
-          }
-        } else {
-          outBuf.set(tensor.buffer.subarray(srcStart, srcStart + block), dstStart);
-        }
-        axisOffset += inputAxis;
-      }
+function concatQuantization(inputs: readonly any[], axis: number): TensorQuantization | undefined {
+  const first = inputs[0].quantization;
+  if (inputs.some((input) => !sameQuantizationDescriptor(input.quantization, first))) {
+    if (first?.scheme !== 'per_axis' || first.axis !== axis ||
+        inputs.some((input) => input.quantization?.scheme !== 'per_axis' ||
+          input.quantization.axis !== axis)) {
+      throw new Error(
+        'Concat inputs need identical quantization unless concatenating their common per-axis dimension.',
+      );
     }
   }
+  if (first == null) return undefined;
+  if (first.scheme === 'per_tensor' || first.axis !== axis) return first;
+  const scales: number[] = [];
+  const zeroPoints: number[] = [];
+  for (const input of inputs) {
+    if (input.quantization?.scheme !== 'per_axis' || input.quantization.axis !== axis) {
+      throw new Error('Concat inputs have incompatible per-axis quantization metadata.');
+    }
+    scales.push(...input.quantization.scales);
+    zeroPoints.push(...input.quantization.zero_points);
+  }
+  return Object.freeze({
+    scheme: 'per_axis',
+    axis,
+    scales: Object.freeze(scales),
+    zero_points: Object.freeze(zeroPoints),
+  });
+}
+
+export function _cpuConcat2(node) {
+  const operation = node.opType || 'Concat';
+  const output = node.outputs?.out || Object.values(node.outputs || {})[0];
+  const inputs = orderedInputs(node);
+  const first = inputs[0];
+  assertShapeKernelTensor(first, `${operation} input0`, {
+    minimumRank: 1, maximumRank: 8,
+  });
+  const rank = first.shape.length;
+  for (let index = 1; index < inputs.length; index++) {
+    assertShapeKernelTensor(inputs[index], `${operation} input${index}`, {
+      dtypes: [first.dtype], minimumRank: rank, maximumRank: rank,
+    });
+  }
+  const params = operation === 'Concat2'
+    ? assertShapeKernelParams(node, ['axis', 'sigmoid'], operation)
+    : assertShapeKernelParams(node, ['axis'], operation);
+  const axis = normalizeShapeKernelAxis(params.axis, rank, 0, operation);
+  const expectedShape = [...first.shape];
+  expectedShape[axis] = 0;
+  for (let inputIndex = 0; inputIndex < inputs.length; inputIndex++) {
+    const input = inputs[inputIndex];
+    for (let dimension = 0; dimension < rank; dimension++) {
+      if (dimension !== axis && input.shape[dimension] !== first.shape[dimension]) {
+        throw new Error(`${operation} input${inputIndex} shape is incompatible outside axis ${axis}.`);
+      }
+    }
+    expectedShape[axis] += input.shape[axis];
+    if (!Number.isSafeInteger(expectedShape[axis])) {
+      throw new Error(`${operation} axis extent exceeds the safe integer range.`);
+    }
+  }
+  const expectedQuantization = concatQuantization(inputs, axis);
+  assertShapeKernelOutput(
+    output,
+    expectedShape,
+    first.dtype,
+    expectedQuantization,
+    operation,
+  );
+  const sigmoid = params.sigmoid ?? false;
+  if (sigmoid && first.dtype !== 'float32') {
+    throw new Error(`${operation} cannot fuse sigmoid into ${first.dtype} storage.`);
+  }
+
+  const inner = expectedShape.slice(axis + 1)
+    .reduce((count, dimension) => count * dimension, 1);
+  const outer = expectedShape.slice(0, axis)
+    .reduce((count, dimension) => count * dimension, 1);
+  const outputAxis = expectedShape[axis];
+  for (let outerIndex = 0; outerIndex < outer; outerIndex++) {
+    let axisOffset = 0;
+    for (const input of inputs) {
+      const inputAxis = input.shape[axis];
+      const block = inputAxis * inner;
+      const sourceStart = outerIndex * block;
+      const destinationStart = (outerIndex * outputAxis + axisOffset) * inner;
+      if (sigmoid) {
+        for (let index = 0; index < block; index++) {
+          output.buffer[destinationStart + index] =
+            1 / (1 + Math.exp(-input.buffer[sourceStart + index]));
+        }
+      } else {
+        output.buffer.set(
+          input.buffer.subarray(sourceStart, sourceStart + block),
+          destinationStart,
+        );
+      }
+      axisOffset += inputAxis;
+    }
+  }
+}

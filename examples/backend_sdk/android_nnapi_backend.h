@@ -13,6 +13,10 @@ extern "C" {
 VxStatus volvoxai_example_nnapi_backend_register(VxRuntime* runtime,
                                                  VxReport* report);
 
+#if defined(VOLVOXAI_PUBLIC_API_TESTING)
+int volvoxai_example_nnapi_backend_test_oversized_descriptors(void);
+#endif
+
 #ifdef __cplusplus
 }
 #endif

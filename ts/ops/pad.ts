@@ -1,35 +1,76 @@
+import {
+  assertShapeKernelOutput,
+  assertShapeKernelParams,
+  assertShapeKernelTensor,
+} from './shapeKernelValidation.js';
+
+function normalizedPads(value, rank) {
+  if (!Array.isArray(value) ||
+      value.some((amount) => !Number.isSafeInteger(amount) || amount < 0)) {
+    throw new Error('Pad pads must be non-negative safe integers.');
+  }
+  if (value.length === rank * 2) {
+    return { before: value.slice(0, rank), after: value.slice(rank) };
+  }
+  // Legacy NHWC static graphs used [top, left, bottom, right]. Bounded-shape
+  // v1 always supplies the rank-general 2*rank form above.
+  if (rank === 4 && value.length === 4) {
+    return {
+      before: [0, value[0], value[1], 0],
+      after: [0, value[2], value[3], 0],
+    };
+  }
+  throw new Error(`Pad pads must contain exactly ${rank * 2} entries.`);
+}
+
 export function _cpuPad(node) {
-    const input = node.inputs.input || node.inputs.data;
-    const outBuf = node.outputs.out.buffer;
-    const pads = node.params.pads || [];
-    const val = node.params.value || 0.0;
-
-    let pt = 0, pb = 0, pl = 0, pr = 0;
-    if (pads.length === 8) {
-        pt = pads[1];
-        pl = pads[2];
-        pb = pads[5];
-        pr = pads[6];
-    } else if (pads.length === 4) {
-        pt = pads[0]; pl = pads[1]; pb = pads[2]; pr = pads[3];
+  const input = node.inputs?.input || node.inputs?.data;
+  const output = node.outputs?.out || Object.values(node.outputs || {})[0];
+  const inputElements = assertShapeKernelTensor(input, 'Pad input', { minimumRank: 1 });
+  const params = assertShapeKernelParams(node, ['pads', 'value'], 'Pad');
+  const pads = normalizedPads(params.pads, input.shape.length);
+  const value = params.value ?? 0;
+  if (typeof value !== 'number' || !Number.isFinite(value)) {
+    throw new Error('Pad value must be finite.');
+  }
+  const expectedShape = input.shape.map((dimension, axis) => {
+    const result = dimension + pads.before[axis] + pads.after[axis];
+    if (!Number.isSafeInteger(result) || result <= 0) {
+      throw new Error(`Pad axis ${axis} exceeds the safe integer range.`);
     }
-    
-    const inShape = input.shape.length === 4 ? input.shape : [1, input.shape[0] || 1, input.shape[1] || 1, 1];
-    const [b, in_h, in_w, c] = inShape;
-    const out_h = in_h + pt + pb;
-    const out_w = in_w + pl + pr;
-    
-    for (let i = 0; i < outBuf.length; i++) outBuf[i] = val;
+    return result;
+  });
+  if (input.quantization?.scheme === 'per_axis' &&
+      (pads.before[input.quantization.axis] !== 0 || pads.after[input.quantization.axis] !== 0)) {
+    throw new Error('Pad must not extend a per-axis quantization dimension.');
+  }
+  assertShapeKernelOutput(
+    output,
+    expectedShape,
+    input.dtype,
+    input.quantization,
+    'Pad',
+  );
 
-    for (let batch = 0; batch < b; batch++) {
-        for (let y = 0; y < in_h; y++) {
-            for (let x = 0; x < in_w; x++) {
-                for (let chan = 0; chan < c; chan++) {
-                    const inIdx = ((batch * in_h + y) * in_w + x) * c + chan;
-                    const outIdx = ((batch * out_h + (y + pt)) * out_w + (x + pl)) * c + chan;
-                    outBuf[outIdx] = input.buffer[inIdx];
-                }
-            }
-        }
+  output.buffer.fill(value);
+  const inputStrides = new Array(input.shape.length);
+  const outputStrides = new Array(output.shape.length);
+  let inputStride = 1;
+  let outputStride = 1;
+  for (let axis = input.shape.length - 1; axis >= 0; axis--) {
+    inputStrides[axis] = inputStride;
+    outputStrides[axis] = outputStride;
+    inputStride *= input.shape[axis];
+    outputStride *= output.shape[axis];
+  }
+  for (let inputIndex = 0; inputIndex < inputElements; inputIndex++) {
+    let remaining = inputIndex;
+    let outputIndex = 0;
+    for (let axis = 0; axis < input.shape.length; axis++) {
+      const coordinate = Math.floor(remaining / inputStrides[axis]);
+      remaining %= inputStrides[axis];
+      outputIndex += (coordinate + pads.before[axis]) * outputStrides[axis];
     }
+    output.buffer[outputIndex] = input.buffer[inputIndex];
+  }
 }

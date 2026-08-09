@@ -56,6 +56,7 @@ class OptimizerRegistryGeneratorTests(unittest.TestCase):
             "runtime-vocabulary",
             "runtime-input-specialization",
             "runtime-input-hoisting",
+            "runtime-declared-input-pruning",
             "runtime-constant-folding",
             "runtime-output-qargmax",
             "runtime-packed-qlinear-split",
@@ -73,6 +74,9 @@ class OptimizerRegistryGeneratorTests(unittest.TestCase):
             "runtime-elementwise-transpose",
             "runtime-shape-chain",
             "runtime-static-qdq-compute-fusion",
+            "runtime-static-qdq-qbatch-matmul-fusion",
+            "runtime-static-qdq-groupnorm-silu-fusion",
+            "runtime-common-subexpression",
             "runtime-canonicalize",
             "redundant-qdq",
             "runtime-dead-code",
@@ -108,10 +112,16 @@ class OptimizerRegistryGeneratorTests(unittest.TestCase):
                 "output-qargmax",
                 "input-specialization",
                 "input-hoisting",
+                "declared-input-pruning",
                 "static-qdq-compute-migration",
+                "quantized-bias-folding",
+                "static-qdq-qbatch-matmul-migration",
+                "static-qdq-groupnorm-silu-migration",
                 "defer-static-qdq-layout",
                 "float-attention-fusion",
                 "quantized-attention-fusion",
+                "silu-fusion",
+                "exact-common-subexpression",
                 "fp32-pre-ptq",
                 "ptq-authoring",
             },
@@ -138,10 +148,16 @@ class OptimizerRegistryGeneratorTests(unittest.TestCase):
                 "output-qargmax",
                 "input-specialization",
                 "input-hoisting",
+                "declared-input-pruning",
                 "static-qdq-compute-migration",
+                "quantized-bias-folding",
+                "static-qdq-qbatch-matmul-migration",
+                "static-qdq-groupnorm-silu-migration",
                 "defer-static-qdq-layout",
                 "float-attention-fusion",
                 "quantized-attention-fusion",
+                "silu-fusion",
+                "exact-common-subexpression",
             },
         )
         self.assertTrue(recipes["runtime-package"].allow_public_abi_change)
@@ -150,9 +166,23 @@ class OptimizerRegistryGeneratorTests(unittest.TestCase):
         self.assertIn("runtime-constant-folding", safe_passes)
         self.assertNotIn("runtime-silu-fusion", safe_passes)
         self.assertNotIn("runtime-static-qdq-compute-fusion", safe_passes)
+        self.assertNotIn(
+            "runtime-static-qdq-qbatch-matmul-fusion", safe_passes,
+        )
+        self.assertNotIn(
+            "runtime-static-qdq-groupnorm-silu-fusion", safe_passes,
+        )
         self.assertIn("runtime-quantized-attention-layout", safe_passes)
         self.assertIn("runtime-attention-layout", safe_passes)
         self.assertIn("runtime-keep-mask", safe_passes)
+
+        silu_only = _active_pass_ids(
+            self.registry, "runtime-package", ("silu-fusion",),
+        )
+        self.assertIn("runtime-silu-fusion", silu_only)
+        self.assertNotIn("runtime-bias-folding", silu_only)
+        self.assertNotIn("runtime-grouped-projection-split", silu_only)
+        self.assertNotIn("runtime-sequence-layout", silu_only)
 
         static_deferred = _active_pass_ids(
             self.registry,
@@ -162,6 +192,16 @@ class OptimizerRegistryGeneratorTests(unittest.TestCase):
         self.assertIn("runtime-static-qdq-compute-fusion", static_deferred)
         self.assertNotIn("runtime-qdq-movement", static_deferred)
         self.assertNotIn("runtime-quantized-attention-layout", static_deferred)
+
+        qbatch_only = _active_pass_ids(
+            self.registry,
+            "runtime-package",
+            ("static-qdq-qbatch-matmul-migration",),
+        )
+        self.assertIn(
+            "runtime-static-qdq-qbatch-matmul-fusion", qbatch_only,
+        )
+        self.assertNotIn("runtime-static-qdq-compute-fusion", qbatch_only)
 
         self.assertEqual(
             recipes["runtime-fp32-pre-ptq"].required_features,

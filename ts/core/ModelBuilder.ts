@@ -1,608 +1,559 @@
-import { Graph } from './Graph.js';
-import { SafetensorsFile } from './Safetensors.js';
-import type { Tensor } from './Tensor.js';
+import {
+  VOLVOX_AFFINE_QUANTIZATION_FORMAT,
+  VOLVOX_LOGICAL_GRAPH_FORMAT,
+  parseGraphDocument,
+} from './Graph.js';
 import type {
-  AdapterDescription,
-  AdapterSelector,
-  AdapterSpec,
-  AdapterStageOptions,
-  AdapterVersion,
-  AddTensorOptions,
-  GraphDocument,
-  GraphNode,
-  GraphNodePatch,
-  GraphNodeSpec,
-  GraphValidationReport,
-  NodeOutputSpec,
-  NodeParameters,
-  RuntimeDType,
-  SerializedAffineQuantizationReference,
-  TensorPatch,
-  TensorReference,
-  TensorStorage,
-} from '../types.js';
+  AffineQuantizationReference,
+  Graph,
+  JsonValue,
+  WeightDescriptorInput,
+} from './Graph.js';
+import type { ShapeDimensionSpec } from '../ops/shapeSystem.js';
+import type { RuntimeDType } from '../types.js';
 
-type ConcreteNode = GraphNode<Tensor>;
-type ConcreteNodeSpec = GraphNodeSpec<Tensor>;
-type ConcreteNodePatch = GraphNodePatch<Tensor>;
-type ConcreteTensorReference = TensorReference<Tensor>;
-type NodeOptions = Partial<Pick<ConcreteNodeSpec, 'id' | 'wLayout'>> & Record<string, unknown>;
-
-interface GroupNormOptions {
-  numGroups?: number;
-  epsilon?: number;
-  name?: string;
+export interface ModelDimensionSpec {
+  readonly min: number;
+  readonly max: number;
+  readonly multiple_of?: number;
 }
 
-interface MoeRouterOptions {
-  bias?: Tensor | null;
-  topK?: number;
-  numExperts?: number;
-  normalize?: boolean;
-  temperature?: number;
-  name?: string;
+export interface ModelTensorSpec {
+  readonly dtype: RuntimeDType;
+  readonly shape: readonly ShapeDimensionSpec[];
 }
 
-interface MoeRoutes {
-  indices?: Tensor;
-  expert_indices?: Tensor;
-  weights?: Tensor;
-  expert_weights?: Tensor;
+export interface ModelNodeOutputSpec extends ModelTensorSpec {
+  readonly tensor: string;
 }
 
-interface MoeLinearOptions {
-  bias?: Tensor | null;
-  name?: string;
+export interface ModelNodeSpec {
+  /** Omit only when the builder should derive a deterministic topology-local ID. */
+  readonly id?: string;
+  readonly opType: string;
+  readonly inputs: Readonly<Record<string, string>>;
+  readonly outputs: Readonly<Record<string, ModelNodeOutputSpec>>;
+  readonly params?: Readonly<Record<string, JsonValue>>;
 }
 
-export interface ModelBuilderGraphPackage {
-  graph: GraphDocument;
-  quantizationParameters: SafetensorsFile;
+export interface ModelQuantizationTable {
+  readonly format: typeof VOLVOX_AFFINE_QUANTIZATION_FORMAT;
+  readonly tensors: Readonly<Record<string, AffineQuantizationReference>>;
+}
+
+/** Canonical decoded JSON document returned by {@link ModelBuilder}. */
+export interface ModelGraphDocument {
+  readonly format: typeof VOLVOX_LOGICAL_GRAPH_FORMAT;
+  readonly dimensions: Readonly<Record<string, Required<ModelDimensionSpec>>>;
+  readonly inputs: Readonly<Record<string, ModelTensorSpec>>;
+  readonly nodes: readonly (ModelNodeSpec & { readonly id: string })[];
+  readonly outputs: readonly string[];
+  readonly quantization?: ModelQuantizationTable;
 }
 
 /**
- * Programmatic model construction and editing facade.
+ * Programmatic source for one initially valid logical model.
  *
- * ModelBuilder never owns a separate graph representation: every successful
- * operation is committed directly to `graph`, and every failed operation leaves
- * it untouched. This makes a builder equally useful for a new model and for an
- * already-loaded model that is being edited.
+ * A builder deliberately has no invalid empty state. Start with at least one
+ * selected tensor, then use a topology transaction for edits that temporarily
+ * break references while they are being assembled.
+ */
+export interface ModelBuilderDefinition {
+  readonly dimensions: Readonly<Record<string, ModelDimensionSpec>>;
+  readonly inputs: Readonly<Record<string, ModelTensorSpec>>;
+  readonly weights?: readonly WeightDescriptorInput[];
+  readonly nodes?: readonly ModelNodeSpec[];
+  readonly outputs: readonly string[];
+  readonly quantization?: ModelQuantizationTable | null;
+}
+
+interface MutableModelGraphDocument {
+  format: typeof VOLVOX_LOGICAL_GRAPH_FORMAT;
+  dimensions: Record<string, ModelDimensionSpec>;
+  inputs: Record<string, ModelTensorSpec>;
+  nodes: Array<ModelNodeSpec & { id: string }>;
+  outputs: string[];
+  quantization?: ModelQuantizationTable;
+}
+
+interface BuilderDraft {
+  document: MutableModelGraphDocument;
+  weights: WeightDescriptorInput[];
+}
+
+interface BuilderState {
+  readonly graph: Graph;
+  readonly document: ModelGraphDocument;
+  readonly weights: readonly WeightDescriptorInput[];
+}
+
+export class ModelBuilderError extends Error {
+  constructor(message: string) {
+    super(`[ModelBuilder] ${message}`);
+    this.name = 'ModelBuilderError';
+  }
+}
+
+function defineRecordValue<T>(record: Record<string, T>, name: string, value: T): void {
+  Object.defineProperty(record, name, {
+    configurable: true,
+    enumerable: true,
+    value,
+    writable: true,
+  });
+}
+
+function cloneRecord<T>(
+  source: Readonly<Record<string, T>>,
+  cloneValue: (value: T) => T,
+): Record<string, T> {
+  const result = Object.create(null) as Record<string, T>;
+  for (const name of Object.keys(source)) defineRecordValue(result, name, cloneValue(source[name]));
+  return result;
+}
+
+function cloneLogicalJson(value: JsonValue): JsonValue {
+  if (value === null || typeof value !== 'object') return value;
+  if (Array.isArray(value)) return value.map(cloneLogicalJson);
+  return cloneRecord(value as Readonly<Record<string, JsonValue>>, cloneLogicalJson);
+}
+
+function cloneShape(shape: readonly ShapeDimensionSpec[]): ShapeDimensionSpec[] {
+  return [...shape];
+}
+
+function cloneDimensionSpec(value: ModelDimensionSpec): ModelDimensionSpec {
+  return {
+    min: value.min,
+    max: value.max,
+    ...(value.multiple_of === undefined ? {} : { multiple_of: value.multiple_of }),
+  };
+}
+
+function cloneTensorSpec(value: ModelTensorSpec): ModelTensorSpec {
+  return { dtype: value.dtype, shape: cloneShape(value.shape) };
+}
+
+function cloneNodeOutputSpec(value: ModelNodeOutputSpec): ModelNodeOutputSpec {
+  return { tensor: value.tensor, dtype: value.dtype, shape: cloneShape(value.shape) };
+}
+
+function cloneQuantizationReference(
+  value: AffineQuantizationReference,
+): AffineQuantizationReference {
+  return value.scheme === 'per_axis'
+    ? {
+        scheme: 'per_axis',
+        axis: value.axis,
+        scale_tensor: value.scale_tensor,
+        zero_point_tensor: value.zero_point_tensor,
+      }
+    : {
+        scheme: 'per_tensor',
+        scale_tensor: value.scale_tensor,
+        zero_point_tensor: value.zero_point_tensor,
+      };
+}
+
+function cloneQuantizationTable(
+  table: ModelQuantizationTable,
+): ModelQuantizationTable {
+  return {
+    format: table.format,
+    tensors: cloneRecord(table.tensors, cloneQuantizationReference),
+  };
+}
+
+function cloneNode(
+  node: ModelNodeSpec & { readonly id: string },
+): ModelNodeSpec & { id: string } {
+  return {
+    id: node.id,
+    opType: node.opType,
+    inputs: cloneRecord(node.inputs, (value) => value),
+    outputs: cloneRecord(node.outputs, cloneNodeOutputSpec),
+    params: node.params === undefined
+      ? Object.create(null) as Record<string, JsonValue>
+      : cloneRecord(node.params, cloneLogicalJson),
+  };
+}
+
+function cloneWeight(value: WeightDescriptorInput): WeightDescriptorInput {
+  return { name: value.name, dtype: value.dtype, shape: [...value.shape] };
+}
+
+function deepFreeze<T>(value: T): T {
+  if (value === null || typeof value !== 'object' || Object.isFrozen(value)) return value;
+  for (const name of Object.getOwnPropertyNames(value)) {
+    deepFreeze((value as Record<string, unknown>)[name]);
+  }
+  return Object.freeze(value);
+}
+
+function canonicalDocumentFromGraph(graph: Graph): ModelGraphDocument {
+  const dimensions = Object.fromEntries(Object.entries(graph.dimensions).map(([name, value]) => [
+    name,
+    { min: value.min, max: value.max, multiple_of: value.multiple_of },
+  ]));
+  const inputs = Object.fromEntries(Object.entries(graph.inputs).map(([name, value]) => [
+    name,
+    { dtype: value.dtype, shape: [...value.shape] },
+  ]));
+  const nodes = graph.nodes.map((node) => ({
+    id: node.id,
+    opType: node.opType,
+    inputs: Object.fromEntries(Object.entries(node.inputs)),
+    outputs: Object.fromEntries(Object.entries(node.outputs).map(([port, value]) => [
+      port,
+      { tensor: value.tensor, dtype: value.dtype, shape: [...value.shape] },
+    ])),
+    params: cloneLogicalJson(node.params) as Readonly<Record<string, JsonValue>>,
+  }));
+  const quantization = graph.quantization === null
+    ? {}
+    : {
+        quantization: {
+          format: graph.quantization.format,
+          tensors: Object.fromEntries(Object.entries(graph.quantization.tensors).map(
+            ([name, reference]) => [name, cloneQuantizationReference(reference)],
+          )),
+        },
+      };
+  return deepFreeze({
+    format: VOLVOX_LOGICAL_GRAPH_FORMAT,
+    dimensions,
+    inputs,
+    nodes,
+    outputs: [...graph.outputs],
+    ...quantization,
+  });
+}
+
+function canonicalWeightsFromGraph(graph: Graph): readonly WeightDescriptorInput[] {
+  return deepFreeze(Object.values(graph.weights).map((weight) => ({
+    name: weight.name,
+    dtype: weight.dtype,
+    shape: [...weight.shape],
+  })));
+}
+
+function validateState(
+  document: unknown,
+  weights: readonly WeightDescriptorInput[],
+): BuilderState {
+  const graph = parseGraphDocument(document, weights);
+  return Object.freeze({
+    graph,
+    document: canonicalDocumentFromGraph(graph),
+    weights: canonicalWeightsFromGraph(graph),
+  });
+}
+
+function mutableDraftFromState(state: BuilderState): BuilderDraft {
+  const document = state.document;
+  return {
+    document: {
+      format: document.format,
+      dimensions: cloneRecord(document.dimensions, cloneDimensionSpec),
+      inputs: cloneRecord(document.inputs, cloneTensorSpec),
+      nodes: document.nodes.map(cloneNode),
+      outputs: [...document.outputs],
+      ...(document.quantization === undefined
+        ? {}
+        : { quantization: cloneQuantizationTable(document.quantization) }),
+    },
+    weights: state.weights.map(cloneWeight),
+  };
+}
+
+function nextGeneratedNodeId(nodes: readonly { readonly id?: unknown }[]): string {
+  const occupied = new Set(nodes
+    .map((node) => node.id)
+    .filter((id): id is string => typeof id === 'string'));
+  for (let ordinal = 0; ; ordinal++) {
+    const candidate = `node_${ordinal}`;
+    if (!occupied.has(candidate)) return candidate;
+  }
+}
+
+function assignInitialNodeIds(
+  nodes: readonly ModelNodeSpec[],
+): Array<ModelNodeSpec & { id: string }> {
+  const explicitIds = new Set(nodes
+    .map((node) => node.id)
+    .filter((id): id is string => typeof id === 'string'));
+  let ordinal = 0;
+  return nodes.map((node) => {
+    let id = node.id;
+    if (id === undefined) {
+      do id = `node_${ordinal++}`; while (explicitIds.has(id));
+      explicitIds.add(id);
+    }
+    return {
+      ...node,
+      id,
+      params: node.params ?? {},
+    } as ModelNodeSpec & { id: string };
+  });
+}
+
+function isThenable(value: unknown): value is PromiseLike<unknown> {
+  return value !== null && (typeof value === 'object' || typeof value === 'function') &&
+    typeof (value as { then?: unknown }).then === 'function';
+}
+
+const TRANSACTION_FACADE_PROPERTIES = new Set<PropertyKey>([
+  'snapshot',
+  'documentSnapshot',
+  'weightDescriptorsSnapshot',
+  'fingerprint',
+  'topologyTransaction',
+  'setDimension',
+  'removeDimension',
+  'setInput',
+  'removeInput',
+  'setWeight',
+  'removeWeight',
+  'addNode',
+  'replaceNode',
+  'removeNode',
+  'selectOutputs',
+  'setQuantization',
+]);
+
+/**
+ * Transactional authoring facade for the redesigned logical graph only.
+ *
+ * The builder imports no concrete Graph, Tensor, provider, or backend type.
+ * Every committed edit is reparsed through `parseGraphDocument`, and a
+ * failed edit cannot replace any previously published immutable snapshot.
  */
 export class ModelBuilder {
-  graph: Graph;
+  private state: BuilderState;
+  private activeDraft: BuilderDraft | null = null;
+  private activeTransactionToken: object | null = null;
 
-  constructor(graph: Graph = new Graph()) {
-    if (!(graph instanceof Graph)) throw new Error("ModelBuilder expects a Graph instance.");
-    this.graph = graph;
+  constructor(definition: ModelBuilderDefinition) {
+    const document = {
+      format: VOLVOX_LOGICAL_GRAPH_FORMAT,
+      dimensions: definition.dimensions,
+      inputs: definition.inputs,
+      nodes: assignInitialNodeIds(definition.nodes ?? []),
+      outputs: definition.outputs,
+      ...(definition.quantization == null ? {} : { quantization: definition.quantization }),
+    };
+    this.state = validateState(document, definition.weights ?? []);
+  }
+
+  /** Strictly adopt an already-decoded new-v1 document and fixed weight metadata. */
+  static fromDocument(
+    document: unknown,
+    weights: readonly WeightDescriptorInput[] = [],
+  ): ModelBuilder {
+    const state = validateState(document, weights);
+    const builder = Object.create(ModelBuilder.prototype) as ModelBuilder;
+    builder.state = state;
+    builder.activeDraft = null;
+    builder.activeTransactionToken = null;
+    return builder;
+  }
+
+  /** Return the current immutable, allocation-free logical model snapshot. */
+  snapshot(): Graph {
+    return this.state.graph;
+  }
+
+  /** Return the current immutable canonical decoded `graph.json` snapshot. */
+  documentSnapshot(): ModelGraphDocument {
+    return this.state.document;
+  }
+
+  /** Fixed descriptor metadata only; payloads and concrete Tensor objects are absent. */
+  weightDescriptorsSnapshot(): readonly WeightDescriptorInput[] {
+    return this.state.weights;
+  }
+
+  get fingerprint(): string {
+    return this.state.graph.fingerprint;
   }
 
   /**
-   * Run a group of structural builder edits atomically.
+   * Atomically validate and publish a group of topology edits.
    *
-   * A thrown error or rejected promise restores the exact prior topology,
-   * selected outputs, object identities, and revision counters. Tensor-value
-   * updates and adapter lifecycle changes are intentionally outside this scope.
+   * Transactions are intentionally synchronous and non-nested. During the
+   * callback, public snapshot methods continue to expose the prior committed
+   * state. The candidate becomes visible only after the logical parser accepts
+   * the complete graph.
    */
   topologyTransaction<T>(callback: (builder: this) => T): T {
-    if (typeof callback !== "function") {
-      throw new Error("topologyTransaction expects a callback.");
+    if (typeof callback !== 'function') {
+      throw new ModelBuilderError('topologyTransaction expects a callback.');
     }
-    return this.graph._runTopologyTransaction(() => callback(this));
-  }
-
-  tensor(
-    name: string,
-    shape: readonly number[],
-    dtype: RuntimeDType = "float32",
-    options: AddTensorOptions = {},
-  ): Tensor {
-    return this.graph.addTensor(name, shape, dtype, options);
-  }
-
-  input(
-    name: string,
-    shape: readonly number[],
-    dtype: RuntimeDType = "float32",
-    options: AddTensorOptions = {},
-  ): Tensor {
-    return this.graph.addInput(name, shape, dtype, options);
-  }
-
-  weight(
-    name: string,
-    shape: readonly number[],
-    dtype: RuntimeDType = "float32",
-    dataOrOptions: AddTensorOptions | TensorStorage = {},
-  ): Tensor {
-    const options = ArrayBuffer.isView(dataOrOptions) || dataOrOptions instanceof ArrayBuffer
-      ? { buffer: dataOrOptions }
-      : dataOrOptions;
-    return this.graph.addWeight(name, shape, dtype, options);
-  }
-
-  getTensor(name: string): Tensor | undefined {
-    return this.graph.getTensor(name);
-  }
-
-  updateTensor(name: string, patch: TensorPatch = {}): Tensor {
-    return this.graph.updateTensor(name, patch);
-  }
-
-  renameTensor(name: string, nextName: string): Tensor {
-    return this.graph.renameTensor(name, nextName);
-  }
-
-  removeTensor(name: string, options: { cascade?: boolean } = {}): boolean {
-    return this.graph.removeTensor(name, options);
-  }
-
-  addNode(spec: ConcreteNodeSpec): ConcreteNode {
-    return this.graph.addNode(spec);
-  }
-
-  /** Add an operator and return its named output tensors. */
-  addOp(
-    opType: string,
-    inputs: Record<string, ConcreteTensorReference>,
-    outputs: Record<string, NodeOutputSpec<Tensor>>,
-    params: NodeParameters = {},
-    options: NodeOptions = {},
-  ): Record<string, Tensor> {
-    return this.graph.addNode({ ...options, opType, inputs, outputs, params }).outputs;
-  }
-
-  /** Add NHWC GroupNorm with trainable per-channel affine tensors supplied by the caller. */
-  groupNorm(input: Tensor, weight: Tensor, bias: Tensor, {
-    numGroups,
-    epsilon = 1e-5,
-    name = `group_norm_${this.graph.nodes.length}`,
-  }: GroupNormOptions = {}): Tensor {
-    if (!input || input.dtype !== "float32" || input.shape?.length !== 4) {
-      throw new Error("groupNorm input must be a rank-4 NHWC float32 tensor.");
+    if (this.activeDraft !== null) {
+      throw new ModelBuilderError('nested topology transactions are not supported.');
     }
-    const channels = input.shape[3];
-    if (typeof numGroups !== 'number' || !Number.isSafeInteger(numGroups) ||
-        numGroups <= 0 || channels % numGroups !== 0) {
-      throw new Error(`groupNorm numGroups must be a positive divisor of ${channels}.`);
-    }
-    if (!weight || !bias || weight.dtype !== "float32" || bias.dtype !== "float32" ||
-        weight.shape?.length !== 1 || bias.shape?.length !== 1 ||
-        weight.shape[0] !== channels || bias.shape[0] !== channels) {
-      throw new Error(`groupNorm weight and bias must be float32 tensors shaped [${channels}].`);
-    }
-    if (typeof epsilon !== "number" || !Number.isFinite(epsilon) || epsilon <= 0) {
-      throw new Error("groupNorm epsilon must be positive and finite.");
-    }
-    return this.addOp(
-      "GroupNorm",
-      { input, weight, bias },
-      { out: { name: `${name}.out`, shape: [...input.shape] } },
-      { num_groups: numGroups, eps: epsilon },
-      { id: name },
-    ).out;
-  }
 
-  /** Add a differentiable top-k Mixture-of-Experts router. */
-  moeRouter(input: Tensor, routerWeight: Tensor, {
-    bias = null,
-    topK = 2,
-    numExperts = routerWeight?.shape?.[routerWeight.shape.length - 1],
-    normalize = true,
-    temperature = 1,
-    name = `moe_router_${this.graph.nodes.length}`,
-  }: MoeRouterOptions = {}): Record<string, Tensor> {
-    const routeShape = [...input.shape.slice(0, -1), topK];
-    return this.addOp('MoERouter', {
-      input,
-      weight: routerWeight,
-      ...(bias ? { bias } : {}),
-    }, {
-      indices: { name: `${name}.indices`, shape: routeShape },
-      weights: { name: `${name}.weights`, shape: routeShape },
-    }, { num_experts: numExperts, top_k: topK, normalize, temperature }, { id: name });
-  }
-
-  /** Add a routed expert linear layer using MoERouter outputs. */
-  moeLinear(input: Tensor, expertWeight: Tensor, routes: MoeRoutes, {
-    bias = null,
-    name = `moe_linear_${this.graph.nodes.length}`,
-  }: MoeLinearOptions = {}): Record<string, Tensor> {
-    const routeIndices = (routes.indices || routes.expert_indices) as Tensor;
-    const routeWeights = (routes.weights || routes.expert_weights) as Tensor;
-    const dOut = expertWeight.shape[expertWeight.shape.length - 1];
-    return this.addOp('MoELinear', {
-      input,
-      expert_weight: expertWeight,
-      route_indices: routeIndices,
-      route_weights: routeWeights,
-      ...(bias ? { expert_bias: bias } : {}),
-    }, {
-      out: { name: `${name}.out`, shape: [...input.shape.slice(0, -1), dOut] },
-    }, {}, { id: name });
-  }
-
-  /** Pool [B,T,D] tokens with caller-supplied normalized F32 weights [B,T]. */
-  maskedMean(input: Tensor, normalizedWeights: Tensor, {
-    name = `masked_mean_${this.graph.nodes.length}`,
-  }: { name?: string } = {}): Tensor {
-    if (input?.dtype !== "float32" || input.shape?.length !== 3) {
-      throw new Error("maskedMean input must be a [B,T,D] float32 tensor.");
-    }
-    const [batch, length, width] = input.shape;
-    if (normalizedWeights?.dtype !== "float32" || normalizedWeights.shape?.length !== 2 ||
-        normalizedWeights.shape[0] !== batch || normalizedWeights.shape[1] !== length) {
-      throw new Error(`maskedMean weights must be a float32 tensor shaped [${batch},${length}].`);
-    }
-    const transposed = this.addOp(
-      "Transpose",
-      { input },
-      { out: { name: `${name}.transposed`, shape: [batch, width, length] } },
-      { perm: [0, 2, 1] },
-      { id: `${name}.transpose` },
-    ).out;
-    const expandedWeights = this.addOp(
-      "Unsqueeze",
-      { input: normalizedWeights },
-      { out: { name: `${name}.weights`, shape: [batch, 1, length] } },
-      { axes: [1] },
-      { id: `${name}.weights` },
-    ).out;
-    const weighted = this.addOp(
-      "Mul",
-      { a: transposed, b: expandedWeights },
-      { out: { name: `${name}.weighted`, shape: [batch, width, length] } },
-      {},
-      { id: `${name}.weighted` },
-    ).out;
-    return this.addOp(
-      "ReduceSum",
-      { input: weighted },
-      { out: { name: `${name}.out`, shape: [batch, width] } },
-      { axis: -1, keepdims: false },
-      { id: name },
-    ).out;
-  }
-
-  stageAdapter(name: string, spec: AdapterSpec, options: AdapterStageOptions = {}): AdapterDescription {
-    return this.graph.stageAdapter(name, spec, options);
-  }
-
-  activateAdapter(name: string | null, version?: AdapterVersion): AdapterDescription | null {
-    return this.graph.activateAdapter(name, version);
-  }
-
-  removeAdapter(name: string, version?: AdapterVersion): boolean {
-    return this.graph.removeAdapter(name, version);
-  }
-
-  /** Build an execution selector accepted by CPU and WebGPU execute(). */
-  adapterRoute(name: string | null, version?: number, scale = 1): AdapterSelector | null {
-    if (name == null) return null;
-    return { name, ...(version == null ? {} : { version }), scale };
-  }
-
-  /** Build per-request or per-batch adapter routing options. */
-  adapterRouting(...routes: Array<AdapterSelector | null | readonly (AdapterSelector | null)[]>): {
-    adapters: readonly (AdapterSelector | null)[];
-  } {
-    const list: readonly (AdapterSelector | null)[] = routes.length === 1 && Array.isArray(routes[0])
-      ? routes[0]
-      : routes as Array<AdapterSelector | null>;
-    return { adapters: list };
-  }
-
-  insertNodeAt(index: number, spec: ConcreteNodeSpec): ConcreteNode {
-    return this.graph.insertNodeAt(index, spec);
-  }
-
-  insertNode(
-    reference: string | number | ConcreteNode,
-    spec: ConcreteNodeSpec,
-    { position = "before" }: { position?: 'before' | 'after' | string } = {},
-  ): ConcreteNode {
-    if (position === "before") return this.graph.insertNodeBefore(reference, spec);
-    if (position === "after") return this.graph.insertNodeAfter(reference, spec);
-    throw new Error(`Unsupported insertion position '${position}'. Use 'before' or 'after'.`);
-  }
-
-  replaceNode(reference: string | number | ConcreteNode, spec: ConcreteNodePatch): ConcreteNode {
-    return this.graph.replaceNodeAt(this.graph._nodeIndex(reference), spec);
-  }
-
-  patchNode(reference: string | number | ConcreteNode, patch: ConcreteNodePatch): ConcreteNode {
-    return this.graph.patchNodeAt(this.graph._nodeIndex(reference), patch);
-  }
-
-  removeNode(
-    reference: string | number | ConcreteNode,
-    options: {
-      cascade?: boolean;
-      removeOutputs?: boolean;
-      preserveOutputsAsInputs?: boolean;
-      rewire?: Record<string, ConcreteTensorReference>;
-    } = {},
-  ): ConcreteNode {
-    return this.graph.removeNode(reference, options);
-  }
-
-  getNode(reference: string | number | ConcreteNode): ConcreteNode {
-    return this.graph.getNode(reference);
-  }
-
-  outputs(...references: Array<ConcreteTensorReference | readonly ConcreteTensorReference[]>): this {
-    this.graph.setOutputs(...references);
-    return this;
-  }
-
-  autoOutputs(): this {
-    this.graph.inferOutputs();
-    return this;
-  }
-
-  validate(options: { throwOnError?: boolean } = {}): GraphValidationReport {
-    return this.graph.validate(options);
-  }
-
-  build({ validate = true }: { validate?: boolean } = {}): Graph {
-    if (validate) this.graph.assertValid();
-    return this.graph;
-  }
-
-  private _graphDocument(
-    quantizationReferences: ReadonlyMap<string, SerializedAffineQuantizationReference>,
-    nodeInputOverrides: ReadonlyMap<ConcreteNode, ReadonlyMap<string, string>> = new Map(),
-  ): GraphDocument {
-    const inputs: GraphDocument['inputs'] = {};
-    for (const tensor of this.graph.tensors.values()) {
-      if (tensor.isInput) {
-        inputs[tensor.name] = {
-          shape: [...tensor.shape],
-          dtype: tensor.dtype,
-        };
+    const draft = mutableDraftFromState(this.state);
+    const token = Object.freeze({});
+    this.activeDraft = draft;
+    this.activeTransactionToken = token;
+    const transactionBuilder = this.createTransactionFacade(token, draft);
+    try {
+      const result = callback(transactionBuilder);
+      const returnsFacade = Object.is(result, transactionBuilder);
+      if (!returnsFacade && isThenable(result)) {
+        // The public transaction fails synchronously, but the callback already
+        // created a promise. Observe its eventual rejection so a blocked late
+        // edit cannot become an unhandled rejection.
+        void Promise.resolve(result).catch(() => undefined);
+        throw new ModelBuilderError('topologyTransaction callback must be synchronous.');
       }
+      const nextState = validateState(draft.document, draft.weights);
+      this.state = nextState;
+      // Fluent editor methods return the guarded facade inside the callback.
+      // Do not leak that now-inactive object to the caller after commit.
+      return (returnsFacade ? this : result) as T;
+    } finally {
+      this.activeDraft = null;
+      this.activeTransactionToken = null;
     }
-    const nodes = this.graph.nodes.map((node) => {
-      const params = { ...(node.params || {}) };
-      if (["MatMul", "Linear", "Gemm"].includes(node.opType) && node.wLayout && !params.weight_layout) {
-        params.weight_layout = node.wLayout === "din" ? "IN_OUT" : "OUT_IN";
-      }
-      if (node.opType === "Conv2D" && !params.weight_layout) {
-        const inputChannels = (node.inputs.input || node.inputs.x)?.shape?.at(-1);
-        params.weight_layout = params.groups === inputChannels ? "HWCM" : "HWIO";
-      }
-      const inputs = Object.fromEntries(
-        Object.entries(node.inputs || {}).map(([key, tensor]) => [key, tensor.name]),
-      );
-      for (const [key, name] of nodeInputOverrides.get(node) || []) inputs[key] = name;
-      return {
-        id: node.id,
-        opType: node.opType,
-        inputs,
-        outputs: Object.fromEntries(Object.entries(node.outputs || {}).map(([key, tensor]) => [key, tensor.name])),
-        outputs_shape: Object.fromEntries(Object.entries(node.outputs || {}).map(([key, tensor]) => [key, [...tensor.shape]])),
-        outputs_dtype: Object.fromEntries(Object.entries(node.outputs || {}).map(([key, tensor]) => [key, tensor.dtype])),
-        params,
-      };
+  }
+
+  setDimension(name: string, constraint: ModelDimensionSpec): this {
+    return this.edit((draft) => {
+      defineRecordValue(draft.document.dimensions, name, constraint);
+      return this;
     });
-    const quantization = Object.fromEntries(quantizationReferences);
-    return {
-      format: 'volvox-graph/v1',
-      inputs,
-      nodes,
-      ...(Object.keys(quantization).length ? {
-        quantization: {
-          format: 'volvox-affine-safetensors/v1' as const,
-          tensors: quantization,
-        },
-      } : {}),
-      outputs: [...this.graph.outputNames],
-    };
   }
 
-  /** Export an unquantized graph document. Quantized graphs require the package API. */
-  toGraphDocument(): GraphDocument {
-    if ([...this.graph.tensors.values()].some((tensor) => tensor.quantization)) {
-      throw new Error(
-        'Quantized graphs must use toGraphPackage() so scale and zero-point data are emitted to Safetensors.',
-      );
-    }
-    return this._graphDocument(new Map());
+  removeDimension(name: string): boolean {
+    return this.edit((draft) => delete draft.document.dimensions[name]);
   }
 
-  /** Export graph.json plus the immutable Safetensors affine parameter shard. */
-  toGraphPackage(): ModelBuilderGraphPackage {
-    const parameterFile = SafetensorsFile.empty();
-    const references = new Map<string, SerializedAffineQuantizationReference>();
-    const existingNames = new Set(this.graph.tensors.keys());
-    const generatedDescriptors = new Map<string, SerializedAffineQuantizationReference>();
-    const boundaryDescriptors = new Map<string, SerializedAffineQuantizationReference>();
-    const nodeInputOverrides = new Map<ConcreteNode, Map<string, string>>();
-    let parameterId = 0;
+  setInput(name: string, descriptor: ModelTensorSpec): this {
+    return this.edit((draft) => {
+      defineRecordValue(draft.document.inputs, name, descriptor);
+      return this;
+    });
+  }
 
-    const allocateParameterPair = (): [string, string] => {
-      let scaleName: string;
-      let zeroName: string;
-      do {
-        parameterId++;
-        scaleName = `__quant__.${parameterId}.scale`;
-        zeroName = `__quant__.${parameterId}.zero_point`;
-      } while (existingNames.has(scaleName) || existingNames.has(zeroName));
-      existingNames.add(scaleName);
-      existingNames.add(zeroName);
-      return [scaleName, zeroName];
-    };
+  removeInput(name: string): boolean {
+    return this.edit((draft) => delete draft.document.inputs[name]);
+  }
 
-    const parameterValues = (tensor: Tensor): { scales: number[]; zeroPoints: number[] } => {
-      const quantization = tensor.quantization;
-      if (!quantization) {
-        throw new Error(`Quantization boundary tensor '${tensor.name}' has no affine descriptor.`);
-      }
-      return quantization.scheme === 'per_axis'
-        ? { scales: [...quantization.scales], zeroPoints: [...quantization.zero_points] }
-        : { scales: [quantization.scale], zeroPoints: [quantization.zero_point] };
-    };
+  setWeight(descriptor: WeightDescriptorInput): this {
+    return this.edit((draft) => {
+      const index = draft.weights.findIndex((weight) => weight.name === descriptor.name);
+      if (index < 0) draft.weights.push(descriptor);
+      else draft.weights[index] = descriptor;
+      return this;
+    });
+  }
 
-    const addParameter = (
-      name: string,
-      dtype: 'F32' | 'I8' | 'U8',
-      values: Float32Array | Int8Array | Uint8Array,
-    ): void => {
-      const existing = parameterFile.getTensor(name);
-      if (existing) {
-        const stored = parameterFile.toRuntimeTypedArray(existing);
-        if (existing.dtype !== dtype || existing.shape.length !== 1 ||
-            existing.shape[0] !== values.length || stored.length !== values.length ||
-            Array.from(stored).some((value, index) => !Object.is(value, values[index]))) {
-          throw new Error(`Quantization parameter tensor '${name}' has conflicting payloads.`);
-        }
-        return;
-      }
-      parameterFile.addTensor(name, dtype, [values.length], values);
-    };
+  removeWeight(name: string): boolean {
+    return this.edit((draft) => {
+      const index = draft.weights.findIndex((weight) => weight.name === name);
+      if (index < 0) return false;
+      draft.weights.splice(index, 1);
+      return true;
+    });
+  }
 
-    const addExistingParameter = (
-      parameter: Tensor,
-      dtype: 'F32' | 'I8' | 'U8',
-      expectedValues: readonly number[],
-      targetName: string,
-    ): void => {
-      const expectedDtype = dtype === 'F32' ? 'float32' : dtype === 'I8' ? 'int8' : 'uint8';
-      const expectedClass = dtype === 'F32' ? Float32Array : dtype === 'I8' ? Int8Array : Uint8Array;
-      if (parameter.dtype !== expectedDtype || parameter.shape.length !== 1 ||
-          parameter.shape[0] !== expectedValues.length || !(parameter.buffer instanceof expectedClass) ||
-          parameter.buffer.length !== expectedValues.length) {
-        throw new Error(
-          `Quantization parameter '${parameter.name}' for '${targetName}' must be ` +
-          `a stored rank-1 ${expectedDtype} tensor of length ${expectedValues.length}.`,
+  /** Add one node using only the unified output-descriptor map. */
+  addNode(spec: ModelNodeSpec): string {
+    return this.edit((draft) => {
+      const id = spec.id === undefined ? nextGeneratedNodeId(draft.document.nodes) : spec.id;
+      draft.document.nodes.push({ ...spec, id, params: spec.params ?? {} });
+      return id;
+    });
+  }
+
+  /** Replace a node; an omitted replacement ID preserves the selected node ID. */
+  replaceNode(id: string, spec: ModelNodeSpec): this {
+    return this.edit((draft) => {
+      const index = draft.document.nodes.findIndex((node) => node.id === id);
+      if (index < 0) throw new ModelBuilderError(`unknown node '${id}'.`);
+      draft.document.nodes[index] = {
+        ...spec,
+        id: spec.id === undefined ? id : spec.id,
+        params: spec.params ?? {},
+      };
+      return this;
+    });
+  }
+
+  removeNode(id: string): boolean {
+    return this.edit((draft) => {
+      const index = draft.document.nodes.findIndex((node) => node.id === id);
+      if (index < 0) return false;
+      draft.document.nodes.splice(index, 1);
+      return true;
+    });
+  }
+
+  selectOutputs(outputs: readonly string[]): this {
+    return this.edit((draft) => {
+      draft.document.outputs = [...outputs];
+      return this;
+    });
+  }
+
+  setQuantization(table: ModelQuantizationTable | null): this {
+    return this.edit((draft) => {
+      if (table === null) delete draft.document.quantization;
+      else draft.document.quantization = table;
+      return this;
+    });
+  }
+
+  private edit<T>(operation: (draft: BuilderDraft) => T): T {
+    if (this.activeDraft !== null) return operation(this.activeDraft);
+    let result!: T;
+    this.topologyTransaction(() => {
+      result = operation(this.activeDraft!);
+    });
+    return result;
+  }
+
+  private createTransactionFacade(token: object, draft: BuilderDraft): this {
+    const target = this;
+    let facade!: this;
+    const assertActive = (): void => {
+      if (target.activeTransactionToken !== token || target.activeDraft !== draft) {
+        throw new ModelBuilderError(
+          'transaction editor is no longer active; late asynchronous edits are forbidden.',
         );
       }
-      for (let index = 0; index < expectedValues.length; index++) {
-        const expected = dtype === 'F32' ? Math.fround(expectedValues[index]) : expectedValues[index];
-        if (!Object.is(parameter.buffer[index], expected)) {
-          throw new Error(
-            `Quantization parameter '${parameter.name}' does not match '${targetName}' metadata at index ${index}.`,
+    };
+    facade = new Proxy(target, {
+      get(current, property) {
+        assertActive();
+        if (!TRANSACTION_FACADE_PROPERTIES.has(property)) {
+          throw new ModelBuilderError(
+            `transaction editor does not expose '${String(property)}'.`,
           );
         }
-      }
-      addParameter(parameter.name, dtype, parameter.buffer as Float32Array | Int8Array | Uint8Array);
-    };
-
-    const descriptorFor = (
-      tensor: Tensor,
-      scaleName: string,
-      zeroName: string,
-    ): SerializedAffineQuantizationReference => tensor.quantization!.scheme === 'per_axis'
-      ? {
-          scheme: 'per_axis',
-          axis: tensor.quantization!.axis,
-          scale_tensor: scaleName,
-          zero_point_tensor: zeroName,
-        }
-      : {
-          scheme: 'per_tensor',
-          scale_tensor: scaleName,
-          zero_point_tensor: zeroName,
+        const value = Reflect.get(current, property, current) as unknown;
+        if (typeof value !== 'function') return value;
+        return (...args: unknown[]) => {
+          assertActive();
+          const result = Reflect.apply(value, current, args) as unknown;
+          return result === current ? facade : result;
         };
-
-    const bindBoundary = (node: ConcreteNode, target: Tensor): void => {
-      const quantization = target.quantization;
-      if (!quantization || (target.dtype !== 'int8' && target.dtype !== 'uint8')) {
-        throw new Error(
-          `${node.opType} node '${String(node.id)}' requires an affine I8/U8 boundary tensor.`,
-        );
-      }
-      const { scales, zeroPoints } = parameterValues(target);
-      const scale = node.inputs.scale;
-      if (!scale) {
-        throw new Error(`${node.opType} node '${String(node.id)}' requires a scale tensor input.`);
-      }
-      addExistingParameter(scale, 'F32', scales, target.name);
-      const zero = node.inputs.zero_point;
-      if (zero) {
-        addExistingParameter(zero, target.dtype === 'int8' ? 'I8' : 'U8', zeroPoints, target.name);
-      }
-
-      let descriptor = boundaryDescriptors.get(target.name);
-      if (!descriptor) {
-        let zeroName: string;
-        if (zero) {
-          zeroName = zero.name;
-        } else {
-          [, zeroName] = allocateParameterPair();
-          addParameter(
-            zeroName,
-            target.dtype === 'int8' ? 'I8' : 'U8',
-            target.dtype === 'int8' ? new Int8Array(zeroPoints) : new Uint8Array(zeroPoints),
-          );
-        }
-        descriptor = descriptorFor(target, scale.name, zeroName);
-        boundaryDescriptors.set(target.name, descriptor);
-      } else if (descriptor.scheme !== quantization.scheme ||
-                 (descriptor.scheme === 'per_axis' &&
-                  (quantization.scheme !== 'per_axis' || descriptor.axis !== quantization.axis))) {
-        throw new Error(`Quantization boundary tensor '${target.name}' has conflicting schemes.`);
-      }
-      let overrides = nodeInputOverrides.get(node);
-      if (!overrides) {
-        overrides = new Map();
-        nodeInputOverrides.set(node, overrides);
-      }
-      overrides.set('scale', descriptor.scale_tensor);
-      overrides.set('zero_point', descriptor.zero_point_tensor);
-    };
-
-    for (const node of this.graph.nodes) {
-      if (node.opType === 'QuantizeLinear') {
-        for (const target of Object.values(node.outputs || {})) bindBoundary(node, target);
-      } else if (node.opType === 'DequantizeLinear') {
-        const target = node.inputs.input;
-        if (!target) {
-          throw new Error(`DequantizeLinear node '${String(node.id)}' requires an input tensor.`);
-        }
-        bindBoundary(node, target);
-      }
-    }
-
-    for (const tensor of [...this.graph.tensors.values()]
-      .filter((value) => value.quantization)
-      .sort((left, right) => left.name.localeCompare(right.name))) {
-      const quantization = tensor.quantization!;
-      const scales = quantization.scheme === 'per_axis'
-        ? [...quantization.scales]
-        : [quantization.scale];
-      const zeroPoints = quantization.scheme === 'per_axis'
-        ? [...quantization.zero_points]
-        : [quantization.zero_point];
-      const key = JSON.stringify([
-        quantization.scheme,
-        quantization.scheme === 'per_axis' ? quantization.axis : null,
-        tensor.dtype,
-        scales,
-        zeroPoints,
-      ]);
-      let descriptor = boundaryDescriptors.get(tensor.name) || generatedDescriptors.get(key);
-      if (!descriptor) {
-        const [scaleName, zeroName] = allocateParameterPair();
-        addParameter(
-          scaleName,
-          'F32',
-          new Float32Array(scales),
-        );
-        addParameter(
-          zeroName,
-          tensor.dtype === 'int8' ? 'I8' : 'U8',
-          tensor.dtype === 'int8'
-            ? new Int8Array(zeroPoints)
-            : new Uint8Array(zeroPoints),
-        );
-        descriptor = descriptorFor(tensor, scaleName, zeroName);
-        generatedDescriptors.set(key, descriptor);
-      }
-      references.set(tensor.name, descriptor);
-    }
-    return {
-      graph: this._graphDocument(references, nodeInputOverrides),
-      quantizationParameters: parameterFile,
-    };
+      },
+      set() {
+        assertActive();
+        throw new ModelBuilderError('transaction editor properties are read-only.');
+      },
+      defineProperty() {
+        assertActive();
+        throw new ModelBuilderError('transaction editor properties are read-only.');
+      },
+      deleteProperty() {
+        assertActive();
+        throw new ModelBuilderError('transaction editor properties are read-only.');
+      },
+    }) as this;
+    return facade;
   }
 }

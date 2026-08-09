@@ -8,18 +8,19 @@ import numpy as np
 from tools.exporter.ir import OpAttribute
 from tools.exporter.optimizer.typed_qdq_layout import RuntimeQDQMovementPass
 from tools.exporter.pipeline import VerifiedPipeline
-from tools.exporter.reference_executor import ReferenceExecutor
+from tools.exporter.reference_executor import execute_reference
 from tools.exporter.runtime_ir import (
     export_runtime_package,
     import_runtime_package,
+    prove_dynamic_quantized_runtime_domain,
 )
 
 
 _ALL_MOVEMENTS = (
     ("Reshape", [1, 2, 3], None),
     ("Transpose", [1, 3, 2], {"perm": [0, 2, 1]}),
-    ("Squeeze", [3, 2], None),
-    ("Unsqueeze", [1, 3, 2], None),
+    ("Squeeze", [3, 2], {"axes": [0]}),
+    ("Unsqueeze", [1, 3, 2], {"axes": [0]}),
     ("Identity", [1, 3, 2], None),
 )
 
@@ -31,6 +32,7 @@ def _layout_package(
     shared_dequantized: bool = False,
     extra_output: str | None = None,
     initializer_source: bool = False,
+    dimensions: dict | None = None,
 ):
     tensors = {
         "scale": np.asarray([0.25], dtype=np.float32),
@@ -53,9 +55,10 @@ def _layout_package(
         "id": "dq",
         "opType": "DequantizeLinear",
         "inputs": {"input": "x", "scale": "scale", "zero_point": "zero"},
-        "outputs": {"out": "f0"},
-        "outputs_shape": {"out": [2, 3]},
-        "outputs_dtype": {"out": "float32"},
+        "outputs": {"out": {
+            "tensor": "f0", "shape": [2, 3], "dtype": "float32",
+        }},
+        "params": {},
     }]
     graph_outputs = ["y"]
     if shared_dequantized:
@@ -63,9 +66,10 @@ def _layout_package(
             "id": "side",
             "opType": "Identity",
             "inputs": {"input": "f0"},
-            "outputs": {"out": "side"},
-            "outputs_shape": {"out": [2, 3]},
-            "outputs_dtype": {"out": "float32"},
+            "outputs": {"out": {
+                "tensor": "side", "shape": [2, 3], "dtype": "float32",
+            }},
+            "params": {},
         })
         graph_outputs.append("side")
 
@@ -77,12 +81,17 @@ def _layout_package(
             "id": f"movement-{index}",
             "opType": op_type,
             "inputs": {"input": current},
-            "outputs": {"out": output},
-            "outputs_shape": {"out": list(output_shape)},
-            "outputs_dtype": {"out": "float32"},
+            "outputs": {"out": {
+                "tensor": output,
+                "shape": list(output_shape),
+                "dtype": "float32",
+            }},
+            "params": {},
         }
         if params is not None:
             node["params"] = copy.deepcopy(params)
+        elif op_type in {"Reshape", "Expand"}:
+            node["params"] = {"shape": list(output_shape)}
         nodes.append(node)
         current = output
         current_shape = list(output_shape)
@@ -93,15 +102,17 @@ def _layout_package(
         "id": "q",
         "opType": "QuantizeLinear",
         "inputs": {"input": current, "scale": q_scale, "zero_point": q_zero},
-        "outputs": {"out": "y"},
-        "outputs_shape": {"out": current_shape},
-        "outputs_dtype": {"out": "int8"},
+        "outputs": {"out": {
+            "tensor": "y", "shape": current_shape, "dtype": "int8",
+        }},
+        "params": {},
     })
     if extra_output is not None:
         graph_outputs.append(extra_output)
 
     document = {
         "format": "volvox-graph/v1",
+        "dimensions": dimensions or {},
         "inputs": inputs,
         "outputs": graph_outputs,
         "nodes": nodes,
@@ -130,7 +141,9 @@ class RuntimeQDQMovementPassTests(unittest.TestCase):
         graph = import_runtime_package(document, tensors)
         source_affine = graph.tensors["x"].quantization
 
-        report = VerifiedPipeline([RuntimeQDQMovementPass()]).run(graph)
+        report = VerifiedPipeline(
+            [RuntimeQDQMovementPass()], shape_profile={},
+        ).run(graph)
 
         self.assertEqual(report.runs[0].changes, 1)
         self.assertIn("reused affine refs 'scale'/'zero'", report.runs[0].notes[0])
@@ -159,6 +172,49 @@ class RuntimeQDQMovementPassTests(unittest.TestCase):
         np.testing.assert_array_equal(optimized_tensors["scale"], tensors["scale"])
         np.testing.assert_array_equal(optimized_tensors["zero"], tensors["zero"])
 
+    def test_bounded_dynamic_shapes_are_rewritten(self):
+        """The same chain with a symbolic leading axis.
+
+        This pass required every shape in the chain to be concrete, which is a
+        demand a byte permutation cannot justify: it depends on both sides
+        agreeing on their extents, not on knowing them. On a bounded-dynamic
+        package the requirement fired nowhere, and an INT8 encoder kept
+        twenty-one dequantize-move-requantize round trips whose only purpose
+        was to reach a movement operator.
+        """
+
+        movements = (
+            ("Transpose", [3, "S", 1], {"perm": [1, 2, 0]}),
+            ("Reshape", ["S", 3], None),
+        )
+        document, tensors = _layout_package(
+            movements=movements,
+            dimensions={"S": {"min": 1, "max": 8}},
+        )
+        document["inputs"] = {"x": {"shape": [1, 3, "S"], "dtype": "int8"}}
+        document["nodes"][0]["outputs"]["out"]["shape"] = [1, 3, "S"]
+        # A dynamic quantized document carries its own exact-domain proof.
+        graph = import_runtime_package(
+            document, tensors,
+            bounded_domain_proof=prove_dynamic_quantized_runtime_domain(
+                document, tensors),
+        )
+        before = sum(
+            1 for node in graph.nodes
+            if node.op_type in {"QuantizeLinear", "DequantizeLinear"}
+        )
+        self.assertEqual(before, 2)
+
+        report = VerifiedPipeline(
+            (RuntimeQDQMovementPass(),), shape_profile=None,
+        ).run(graph)
+
+        self.assertEqual(report.total_changes, 1)
+        self.assertEqual(
+            [node.op_type for node in graph.nodes], ["Transpose", "Reshape"],
+            "the boundary pair is gone and the movement stays in the byte domain",
+        )
+
     def test_reshape_transpose_identity_is_byte_exact_against_reference(self):
         movements = (
             ("Reshape", [1, 2, 3], None),
@@ -172,9 +228,11 @@ class RuntimeQDQMovementPassTests(unittest.TestCase):
             [[-128, -9, -3], [0, 17, 127]], dtype=np.int8,
         )
 
-        expected = ReferenceExecutor(before, tensors).run({"x": values}).outputs["y"]
-        VerifiedPipeline([RuntimeQDQMovementPass()]).run(after)
-        actual = ReferenceExecutor(after, tensors).run({"x": values}).outputs["y"]
+        expected = execute_reference(before, tensors, {"x": values}).outputs["y"]
+        VerifiedPipeline(
+            [RuntimeQDQMovementPass()], shape_profile={},
+        ).run(after)
+        actual = execute_reference(after, tensors, {"x": values}).outputs["y"]
 
         np.testing.assert_array_equal(actual, expected)
         np.testing.assert_array_equal(
@@ -187,7 +245,9 @@ class RuntimeQDQMovementPassTests(unittest.TestCase):
         original_payload = tensors["x"].tobytes()
         graph = import_runtime_package(document, tensors)
 
-        VerifiedPipeline([RuntimeQDQMovementPass()]).run(graph)
+        VerifiedPipeline(
+            [RuntimeQDQMovementPass()], shape_profile={},
+        ).run(graph)
         _, optimized_tensors = export_runtime_package(graph, tensors)
 
         self.assertEqual(tensors["x"].tobytes(), original_payload)
@@ -226,7 +286,9 @@ class RuntimeQDQMovementPassTests(unittest.TestCase):
 
         document, tensors = _layout_package()
         graph = import_runtime_package(document, tensors)
-        changed = VerifiedPipeline([RuntimeQDQMovementPass()]).run(graph)
+        changed = VerifiedPipeline(
+            [RuntimeQDQMovementPass()], shape_profile={},
+        ).run(graph)
         self.assertEqual(changed.runs[0].changes, 1)
         self.assertEqual(graph.outputs, ["y"])
         self.assertTrue(graph.tensors["y"].public_output)

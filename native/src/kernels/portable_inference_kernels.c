@@ -9,9 +9,13 @@
 #include "mathcompat.h"
 #include "inference_kernels.h"
 #include "kernel_platform.h"
+#include "fast_exp.h"
 #include "w8a8_affine.h"
 #include <stddef.h>
 #include <stdint.h>
+#if !defined(__wasm__)
+#include <string.h>
+#endif
 
 #if defined(__wasm_simd128__)
 #include <wasm_simd128.h>
@@ -214,6 +218,42 @@ int compare_broadcast_i32(const int32_t *a, const int32_t *b, int32_t *output,
         output[index] = kind == 0u
             ? a[a_index] == b[b_index]
             : a[a_index] >= b[b_index];
+    }
+    return 1;
+}
+
+/* Canonical Where broadcasts the condition and both data branches
+ * independently to the output shape. Branch storage is copied as U32 words so
+ * both F32 and I32 values retain their exact bit patterns. */
+WASM_EXPORT("where_broadcast_32")
+int where_broadcast_32(const void *condition, uint32_t condition_dtype,
+        const uint32_t *a, const uint32_t *b, uint32_t *output,
+        const uint32_t *condition_shape, const uint32_t *a_shape,
+        const uint32_t *b_shape, const uint32_t *output_shape,
+        uint32_t condition_rank, uint32_t a_rank, uint32_t b_rank,
+        uint32_t output_rank, uint32_t elements, uint32_t data_dtype) {
+    size_t condition_strides[8], condition_b_strides[8];
+    size_t a_strides[8], b_strides[8];
+    if (!condition || !a || !b || !output ||
+        (condition_dtype != VX_DTYPE_F32 && condition_dtype != VX_DTYPE_I32) ||
+        (data_dtype != VX_DTYPE_F32 && data_dtype != VX_DTYPE_I32) ||
+        !vx_pf_broadcast_validate(condition_shape, a_shape, output_shape,
+            condition_rank, a_rank, output_rank, elements,
+            condition_strides, a_strides) ||
+        !vx_pf_broadcast_validate(condition_shape, b_shape, output_shape,
+            condition_rank, b_rank, output_rank, elements,
+            condition_b_strides, b_strides)) return 0;
+    for (uint32_t index = 0; index < elements; index++) {
+        size_t condition_index = vx_pf_broadcast_index(index, condition_shape,
+            condition_rank, output_shape, output_rank, condition_strides);
+        size_t a_index = vx_pf_broadcast_index(index, a_shape, a_rank,
+            output_shape, output_rank, a_strides);
+        size_t b_index = vx_pf_broadcast_index(index, b_shape, b_rank,
+            output_shape, output_rank, b_strides);
+        int selected = condition_dtype == VX_DTYPE_I32
+            ? ((const int32_t *)condition)[condition_index] != 0
+            : ((const float *)condition)[condition_index] != 0.0f;
+        output[index] = selected ? a[a_index] : b[b_index];
     }
     return 1;
 }
@@ -876,6 +916,10 @@ int qgelu_i8u8(const void *input, void *output, uint32_t elements,
  * paired qGroupNormStats/qGroupNormApply shaders without materializing an F32
  * activation tensor.  Every descriptor, affine coefficient, and overlap is
  * preflighted before output storage is touched. */
+/* Channel ceiling for the per-channel statistic fan-out below. Anything wider
+ * falls back to the strided per-group transform, which needs no scratch. */
+#define VX_QGROUPNORM_MAX_CHANNELS 4096
+
 WASM_EXPORT("qgroupnorm_i8u8")
 int qgroupnorm_i8u8(const void *input, const float *weight, const float *bias,
         void *output, uint32_t batch, uint32_t height, uint32_t width,
@@ -917,6 +961,11 @@ int qgroupnorm_i8u8(const void *input, const float *weight, const float *bias,
     {
         const uint32_t channels_per_group = channels / groups;
         const size_t sample_stride = area * channels;
+        /* Per-channel copies of each group's (mean, 1/sigma), so the final
+         * elementwise transform can sweep the activation contiguously. */
+        float channel_mean[VX_QGROUPNORM_MAX_CHANNELS];
+        float channel_inverse[VX_QGROUPNORM_MAX_CHANNELS];
+        const int deferred = channels <= VX_QGROUPNORM_MAX_CHANNELS;
         for (uint32_t sample = 0; sample < batch; sample++) {
             const size_t sample_offset = (size_t)sample * sample_stride;
             for (uint32_t group = 0; group < groups; group++) {
@@ -951,30 +1000,67 @@ int qgroupnorm_i8u8(const void *input, const float *weight, const float *bias,
                             if (real_variance < 0.0f) real_variance = 0.0f;
                             {
                                 const float inverse_stddev = 1.0f / sqrtf(real_variance + epsilon);
-                                for (size_t spatial = 0; spatial < area; spatial++) {
-                                    const size_t offset = sample_offset + spatial * channels + channel_start;
+                                /* The statistics above are order-dependent
+                                 * reductions and stay exactly as written. This
+                                 * final transform is elementwise, so publishing
+                                 * (mean, 1/sigma) per channel lets a single
+                                 * linear vectorized sweep replace the strided
+                                 * per-group walk without touching any partial
+                                 * sum. See the sweep after this loop nest. */
+                                if (deferred) {
                                     for (uint32_t local = 0; local < channels_per_group; local++) {
-                                        const uint32_t channel = channel_start + local;
-                                        const float raw = (float)(vx_w8a8_byte_value(input,
-                                            input_dtype, offset + local) - input_zero_point);
-                                        const float scaled = (raw - mean_raw) * input_scale;
-                                        const float normalized = scaled * inverse_stddev;
-                                        const float affine = normalized *
-                                            vx_w8a8_affine_f32_at(weight, channel) +
-                                            vx_w8a8_affine_f32_at(bias, channel);
-                                        const float output_scaled = affine / output_scale;
-                                        const float transformed = output_scaled +
-                                            (float)output_zero_point;
-                                        const int32_t quantized = vx_w8a8_requantize(
-                                            transformed, output_minimum, output_maximum,
-                                            output_zero_point);
-                                        vx_w8a8_store_byte(output, output_dtype,
-                                                                 offset + local, quantized);
+                                        channel_mean[channel_start + local] = mean_raw;
+                                        channel_inverse[channel_start + local] = inverse_stddev;
+                                    }
+                                } else {
+                                    /* Wider than the scratch: transform in place
+                                     * with the original strided walk. */
+                                    for (size_t spatial = 0; spatial < area; spatial++) {
+                                        const size_t offset = sample_offset +
+                                            spatial * channels + channel_start;
+                                        for (uint32_t local = 0; local < channels_per_group; local++) {
+                                            const uint32_t channel = channel_start + local;
+                                            const float raw = (float)(vx_w8a8_byte_value(input,
+                                                input_dtype, offset + local) - input_zero_point);
+                                            const float scaled = (raw - mean_raw) * input_scale;
+                                            const float normalized = scaled * inverse_stddev;
+                                            const float affine = normalized *
+                                                vx_w8a8_affine_f32_at(weight, channel) +
+                                                vx_w8a8_affine_f32_at(bias, channel);
+                                            const float output_scaled = affine / output_scale;
+                                            const float transformed = output_scaled +
+                                                (float)output_zero_point;
+                                            vx_w8a8_store_byte(output, output_dtype, offset + local,
+                                                vx_w8a8_requantize(transformed, output_minimum,
+                                                    output_maximum, output_zero_point));
+                                        }
                                     }
                                 }
                             }
                         }
                     }
+                }
+            }
+            /* Elementwise transform, one linear sweep per sample.  Each output
+             * runs the identical scalar sequence the per-group walk ran, so the
+             * result is bit-identical; only the traversal order changed, and
+             * this order is contiguous instead of `groups` strided passes. */
+            if (deferred) for (size_t spatial = 0; spatial < area; spatial++) {
+                const size_t row = sample_offset + spatial * channels;
+                for (uint32_t channel = 0; channel < channels; channel++) {
+                    const size_t index = row + channel;
+                    const float raw = (float)(vx_w8a8_byte_value(input,
+                        input_dtype, index) - input_zero_point);
+                    const float scaled = (raw - channel_mean[channel]) * input_scale;
+                    const float normalized = scaled * channel_inverse[channel];
+                    const float affine = normalized *
+                        vx_w8a8_affine_f32_at(weight, channel) +
+                        vx_w8a8_affine_f32_at(bias, channel);
+                    const float output_scaled = affine / output_scale;
+                    const float transformed = output_scaled + (float)output_zero_point;
+                    vx_w8a8_store_byte(output, output_dtype, index,
+                        vx_w8a8_requantize(transformed, output_minimum,
+                            output_maximum, output_zero_point));
                 }
             }
         }
@@ -1131,7 +1217,7 @@ static int vx_pf_qsdpa_key_allowed(const int32_t *mask, uint32_t mask_mode,
 }
 
 #if defined(__wasm_simd128__)
-/* QSDPA is the largest remaining TinyReceipt WASM seed kernel.  Its centered
+/* QSDPA is one of the largest remaining WASM seed kernels. Its centered
  * byte products are proven I32-safe by qsdpa_i8u8() before execution, so SIMD
  * may regroup the exact integer sum without changing the result.  Keep this
  * local to the WASM build: native execution has its own parallel dispatcher. */
@@ -1191,11 +1277,66 @@ static int32_t vx_pf_qsdpa_wasm_centered_dot(const void *q, const void *k,
     }
 }
 
+/* Dot over Q and K already centered into I16.
+ *
+ * The byte helper re-widens and re-centers K for every query, so each K element
+ * is decoded seq_q times. Centering one head's K once leaves only the loads and
+ * the dot here. The products are the same integers either way, and the sum is
+ * proven I32-safe before execution, so the result is identical. */
+static int32_t vx_pf_qsdpa_wasm_dot_i16(const int16_t *q, const int16_t *k,
+        uint32_t dimensions) {
+    v128_t sums = wasm_i32x4_splat(0);
+    uint32_t dimension = 0;
+    int32_t sum;
+    for (; dimension + 8u <= dimensions; dimension += 8u) {
+        sums = wasm_i32x4_add(sums, wasm_i32x4_dot_i16x8(
+            wasm_v128_load(q + dimension), wasm_v128_load(k + dimension)));
+    }
+    sum = wasm_i32x4_extract_lane(sums, 0) + wasm_i32x4_extract_lane(sums, 1) +
+          wasm_i32x4_extract_lane(sums, 2) + wasm_i32x4_extract_lane(sums, 3);
+    for (; dimension < dimensions; dimension++)
+        sum += (int32_t)q[dimension] * (int32_t)k[dimension];
+    return sum;
+}
+
 enum {
     VX_PF_QSDPA_ACCUMULATOR_INITIALIZE = 0,
     VX_PF_QSDPA_ACCUMULATOR_RESCALE = 1,
     VX_PF_QSDPA_ACCUMULATOR_ADD = 2,
 };
+
+/* Same recurrence as the byte helper below, reading V already centered and
+ * widened to F32.
+ *
+ * The byte helper re-decodes V for every (query, key) pair, so each V element
+ * is converted seq_q times -- 402 here. Converting one head's V once and
+ * reusing it across every query is the same arithmetic: the scale is still
+ * applied in the original position of each expression, so `(weight * value) *
+ * scale` stays exactly that and the result is bit-identical. */
+static void vx_pf_qsdpa_wasm_accumulate_centered(float *accumulator,
+        const float *v_centered, uint32_t dimensions, float v_scale,
+        float weight, uint32_t mode) {
+    const v128_t scale = wasm_f32x4_splat(v_scale);
+    const v128_t weight_vector = wasm_f32x4_splat(weight);
+    for (uint32_t dimension = 0; dimension < dimensions; dimension += 4u) {
+        const v128_t values = wasm_v128_load(v_centered + dimension);
+        v128_t next;
+        if (mode == VX_PF_QSDPA_ACCUMULATOR_INITIALIZE) {
+            next = wasm_f32x4_mul(values, scale);
+        } else if (mode == VX_PF_QSDPA_ACCUMULATOR_RESCALE) {
+            next = wasm_f32x4_add(
+                wasm_f32x4_mul(wasm_v128_load(accumulator + dimension),
+                               weight_vector),
+                wasm_f32x4_mul(values, scale));
+        } else {
+            const v128_t contribution = wasm_f32x4_mul(
+                wasm_f32x4_mul(weight_vector, values), scale);
+            next = wasm_f32x4_add(wasm_v128_load(accumulator + dimension),
+                                  contribution);
+        }
+        wasm_v128_store(accumulator + dimension, next);
+    }
+}
 
 /* Each F32 lane still observes keys in the original order.  The explicit
  * multiply ordering mirrors the scalar recurrence so baseline SIMD remains
@@ -1239,6 +1380,16 @@ static void vx_pf_qsdpa_wasm_accumulate(float *accumulator, const void *v,
  * softmax keeps just a max, a sum, and one F32 value vector (head_dim <= 64)
  * in local storage, so scores and dequantized activations never become graph
  * tensors.  The all-masked case is intentionally the output zero point. */
+/* One head's V, centered and widened to F32, reused by every query of that
+ * head. Sized for seq_kv * head_dim; larger heads keep the per-key byte path. */
+enum { VX_PF_QSDPA_V_SCRATCH_FLOATS = 65536u };
+static float vx_pf_qsdpa_v_centered[VX_PF_QSDPA_V_SCRATCH_FLOATS];
+enum { VX_PF_QSDPA_ALLOWED_SCRATCH = 8192u };
+static unsigned char vx_pf_qsdpa_key_allowed_cache[VX_PF_QSDPA_ALLOWED_SCRATCH];
+/* One head's K, centered into I16 and padded to a multiple of eight so the dot
+ * never falls into its scalar tail. */
+static int16_t vx_pf_qsdpa_k_centered[VX_PF_QSDPA_V_SCRATCH_FLOATS + 8u];
+
 WASM_EXPORT("qsdpa_i8u8")
 int qsdpa_i8u8(const void *q, const void *k, const void *v,
         const int32_t *mask, void *output, uint32_t batch, uint32_t seq_q,
@@ -1320,14 +1471,57 @@ int qsdpa_i8u8(const void *q, const void *k, const void *v,
         (mask_bytes && vx_w8a8_ranges_overlap(output, q_elements, mask, mask_bytes))) return 0;
     output_minimum = output_dtype == VX_DTYPE_I8 ? -128 : 0;
     output_maximum = output_dtype == VX_DTYPE_I8 ? 127 : 255;
+    /* Head outside query so one head's V decode is shared by every query. Each
+     * (query, head) output is independent, so the swap changes no result. */
     for (uint32_t batch_index = 0; batch_index < batch; batch_index++) {
         const size_t q_batch_base = (size_t)batch_index * seq_q * d_model;
         const size_t kv_batch_base = (size_t)batch_index * seq_kv * d_model;
-        for (uint32_t query = 0; query < seq_q; query++) {
-            const size_t q_row_base = q_batch_base + (size_t)query * d_model;
-            for (uint32_t head = 0; head < heads; head++) {
-                const uint32_t head_base = head * head_dim;
+        const int use_v_scratch =
+            (size_t)seq_kv * head_dim <= VX_PF_QSDPA_V_SCRATCH_FLOATS;
+        /* For these modes the allowance depends only on the key, so resolve it
+         * once per batch rather than dispatching mask_mode per (query, head,
+         * key) -- ten million times on this encoder. */
+        const int allowance_is_key_only =
+            !causal && mask_mode <= 2u &&
+            (size_t)seq_kv <= VX_PF_QSDPA_ALLOWED_SCRATCH;
+        if (allowance_is_key_only) {
+            for (uint32_t key = 0; key < seq_kv; key++)
+                vx_pf_qsdpa_key_allowed_cache[key] = (unsigned char)
+                    vx_pf_qsdpa_key_allowed(mask, mask_mode, batch_index,
+                                            0u, key, seq_q, seq_kv, causal);
+        }
+        for (uint32_t head = 0; head < heads; head++) {
+            const uint32_t head_base = head * head_dim;
+            if (use_v_scratch) {
+                for (uint32_t key = 0; key < seq_kv; key++) {
+                    const size_t row = kv_batch_base + (size_t)key * d_model + head_base;
+                    float *destination = vx_pf_qsdpa_v_centered +
+                        (size_t)key * head_dim;
+                    int16_t *k_destination = vx_pf_qsdpa_k_centered +
+                        (size_t)key * head_dim;
+                    for (uint32_t dimension = 0; dimension < head_dim; dimension++) {
+                        destination[dimension] = (float)(vx_w8a8_byte_value(
+                            v, v_dtype, row + dimension) - v_zero_point);
+                        k_destination[dimension] = (int16_t)(vx_w8a8_byte_value(
+                            k, k_dtype, row + dimension) - k_zero_point);
+                    }
+                }
+                /* The dot reads eight at a time; zero the padding so a
+                 * head_dim that is not a multiple of eight still reads
+                 * defined lanes that contribute nothing. */
+                for (uint32_t pad = 0; pad < 8u; pad++)
+                    vx_pf_qsdpa_k_centered[(size_t)seq_kv * head_dim + pad] = 0;
+            }
+            for (uint32_t query = 0; query < seq_q; query++) {
+                const size_t q_row_base = q_batch_base + (size_t)query * d_model;
                 float accumulator[64] = {0.0f};
+                int16_t q_centered[72] = {0};
+                if (use_v_scratch) {
+                    for (uint32_t dimension = 0; dimension < head_dim; dimension++)
+                        q_centered[dimension] = (int16_t)(vx_w8a8_byte_value(
+                            q, q_dtype, q_row_base + head_base + dimension) -
+                            q_zero_point);
+                }
                 float maximum_score = 0.0f;
                 float sum = 0.0f;
                 int have_key = 0;
@@ -1336,14 +1530,20 @@ int qsdpa_i8u8(const void *q, const void *k, const void *v,
                     float score;
                     float weight;
                     const size_t kv_row_base = kv_batch_base + (size_t)key * d_model;
-                    if (!vx_pf_qsdpa_key_allowed(mask, mask_mode, batch_index,
-                                                  query, key, seq_q, seq_kv,
-                                                  causal)) continue;
+                    if (allowance_is_key_only
+                            ? !vx_pf_qsdpa_key_allowed_cache[key]
+                            : !vx_pf_qsdpa_key_allowed(mask, mask_mode,
+                                  batch_index, query, key, seq_q, seq_kv,
+                                  causal)) continue;
 #if defined(__wasm_simd128__)
-                    dot = vx_pf_qsdpa_wasm_centered_dot(q, k,
-                        q_row_base + head_base, kv_row_base + head_base,
-                        head_dim, q_dtype, k_dtype, q_zero_point,
-                        k_zero_point);
+                    dot = use_v_scratch
+                        ? vx_pf_qsdpa_wasm_dot_i16(q_centered,
+                              vx_pf_qsdpa_k_centered + (size_t)key * head_dim,
+                              head_dim)
+                        : vx_pf_qsdpa_wasm_centered_dot(q, k,
+                              q_row_base + head_base, kv_row_base + head_base,
+                              head_dim, q_dtype, k_dtype, q_zero_point,
+                              k_zero_point);
 #else
                     for (uint32_t dimension = 0; dimension < head_dim; dimension++) {
                         const int32_t q_value = vx_w8a8_byte_value(q, q_dtype,
@@ -1358,10 +1558,16 @@ int qsdpa_i8u8(const void *q, const void *k, const void *v,
                         maximum_score = score;
                         sum = 1.0f;
 #if defined(__wasm_simd128__)
-                        vx_pf_qsdpa_wasm_accumulate(accumulator, v,
-                            kv_row_base + head_base, head_dim, v_dtype,
-                            v_zero_point, v_scale, 1.0f,
-                            VX_PF_QSDPA_ACCUMULATOR_INITIALIZE);
+                        if (use_v_scratch)
+                            vx_pf_qsdpa_wasm_accumulate_centered(accumulator,
+                                vx_pf_qsdpa_v_centered + (size_t)key * head_dim,
+                                head_dim, v_scale, 1.0f,
+                                VX_PF_QSDPA_ACCUMULATOR_INITIALIZE);
+                        else
+                            vx_pf_qsdpa_wasm_accumulate(accumulator, v,
+                                kv_row_base + head_base, head_dim, v_dtype,
+                                v_zero_point, v_scale, 1.0f,
+                                VX_PF_QSDPA_ACCUMULATOR_INITIALIZE);
 #else
                         for (uint32_t dimension = 0; dimension < head_dim; dimension++) {
                             const int32_t v_value = vx_w8a8_byte_value(v, v_dtype,
@@ -1373,13 +1579,19 @@ int qsdpa_i8u8(const void *q, const void *k, const void *v,
                         continue;
                     }
                     if (score > maximum_score) {
-                        weight = expf(maximum_score - score);
+                        weight = accurate_expf(maximum_score - score);
                         sum = sum * weight + 1.0f;
 #if defined(__wasm_simd128__)
-                        vx_pf_qsdpa_wasm_accumulate(accumulator, v,
-                            kv_row_base + head_base, head_dim, v_dtype,
-                            v_zero_point, v_scale, weight,
-                            VX_PF_QSDPA_ACCUMULATOR_RESCALE);
+                        if (use_v_scratch)
+                            vx_pf_qsdpa_wasm_accumulate_centered(accumulator,
+                                vx_pf_qsdpa_v_centered + (size_t)key * head_dim,
+                                head_dim, v_scale, weight,
+                                VX_PF_QSDPA_ACCUMULATOR_RESCALE);
+                        else
+                            vx_pf_qsdpa_wasm_accumulate(accumulator, v,
+                                kv_row_base + head_base, head_dim, v_dtype,
+                                v_zero_point, v_scale, weight,
+                                VX_PF_QSDPA_ACCUMULATOR_RESCALE);
 #else
                         for (uint32_t dimension = 0; dimension < head_dim; dimension++) {
                             const int32_t v_value = vx_w8a8_byte_value(v, v_dtype,
@@ -1390,13 +1602,19 @@ int qsdpa_i8u8(const void *q, const void *k, const void *v,
 #endif
                         maximum_score = score;
                     } else {
-                        weight = expf(score - maximum_score);
+                        weight = accurate_expf(score - maximum_score);
                         sum += weight;
 #if defined(__wasm_simd128__)
-                        vx_pf_qsdpa_wasm_accumulate(accumulator, v,
-                            kv_row_base + head_base, head_dim, v_dtype,
-                            v_zero_point, v_scale, weight,
-                            VX_PF_QSDPA_ACCUMULATOR_ADD);
+                        if (use_v_scratch)
+                            vx_pf_qsdpa_wasm_accumulate_centered(accumulator,
+                                vx_pf_qsdpa_v_centered + (size_t)key * head_dim,
+                                head_dim, v_scale, weight,
+                                VX_PF_QSDPA_ACCUMULATOR_ADD);
+                        else
+                            vx_pf_qsdpa_wasm_accumulate(accumulator, v,
+                                kv_row_base + head_base, head_dim, v_dtype,
+                                v_zero_point, v_scale, weight,
+                                VX_PF_QSDPA_ACCUMULATOR_ADD);
 #else
                         for (uint32_t dimension = 0; dimension < head_dim; dimension++) {
                             const int32_t v_value = vx_w8a8_byte_value(v, v_dtype,
@@ -1672,6 +1890,29 @@ static int vx_pf_qconv_accumulator_i32_valid(const int32_t *bias,
 }
 
 #ifdef __wasm__
+static void vx_pf_qconv_copy_bytes(uint8_t *destination,
+        const uint8_t *source, size_t bytes) {
+    size_t index = 0u;
+#if defined(__wasm_simd128__)
+    for (; bytes - index >= 16u; index += 16u) {
+        wasm_v128_store(destination + index, wasm_v128_load(source + index));
+    }
+#endif
+    for (; index < bytes; index++) destination[index] = source[index];
+}
+
+static void vx_pf_qconv_fill_bytes(uint8_t *destination, uint8_t value,
+        size_t bytes) {
+    size_t index = 0u;
+#if defined(__wasm_simd128__)
+    const v128_t values = wasm_i8x16_splat((int8_t)value);
+    for (; bytes - index >= 16u; index += 16u) {
+        wasm_v128_store(destination + index, values);
+    }
+#endif
+    for (; index < bytes; index++) destination[index] = value;
+}
+
 /* WASM-internal layout-only groups=1 bridge for the packed-GEMM convolution
  * route.  It is intentionally absent from the native public kernel ABI.
  * Padding stores the raw activation zero point, making every padded product
@@ -1726,6 +1967,62 @@ int qconv2d_im2col_i8u8(const void *input, void *columns,
     padding_byte = input_dtype == VX_DTYPE_I8
         ? (uint8_t)(int8_t)input_zero_point :
         (uint8_t)input_zero_point;
+    if (kernel_height == 3u && kernel_width == 3u &&
+        dilation_y == 1u && dilation_x == 1u) {
+        const size_t input_plane = (size_t)input_height * input_width;
+        const size_t output_plane = (size_t)output_height * output_width;
+        const size_t strip_bytes = (size_t)3u * input_channels;
+        for (uint32_t sample = 0; sample < batch; sample++) {
+            for (uint32_t output_y = 0; output_y < output_height; output_y++) {
+                const int64_t input_y_origin =
+                    (int64_t)output_y * stride_y - padding_top;
+                for (uint32_t output_x = 0; output_x < output_width;
+                        output_x++) {
+                    const size_t location = (size_t)sample * output_plane +
+                        (size_t)output_y * output_width + output_x;
+                    uint8_t *row = column_bytes + location * patch_elements;
+                    const int64_t input_x_origin =
+                        (int64_t)output_x * stride_x - padding_left;
+                    for (uint32_t kernel_y = 0; kernel_y < 3u; kernel_y++) {
+                        const int64_t input_y = input_y_origin + kernel_y;
+                        uint8_t *block = row + (size_t)kernel_y * strip_bytes;
+                        if (input_y < 0 || input_y >= input_height) {
+                            vx_pf_qconv_fill_bytes(
+                                block, padding_byte, strip_bytes);
+                        } else if (input_x_origin >= 0 &&
+                                   input_x_origin + 2 < input_width) {
+                            const size_t source =
+                                ((size_t)sample * input_plane +
+                                 (size_t)input_y * input_width +
+                                 (size_t)input_x_origin) * input_channels;
+                            vx_pf_qconv_copy_bytes(
+                                block, input_bytes + source, strip_bytes);
+                        } else {
+                            for (uint32_t kernel_x = 0; kernel_x < 3u;
+                                    kernel_x++) {
+                                const int64_t input_x =
+                                    input_x_origin + kernel_x;
+                                uint8_t *channels = block +
+                                    (size_t)kernel_x * input_channels;
+                                if (input_x < 0 || input_x >= input_width) {
+                                    vx_pf_qconv_fill_bytes(channels,
+                                        padding_byte, input_channels);
+                                } else {
+                                    const size_t source =
+                                        ((size_t)sample * input_plane +
+                                         (size_t)input_y * input_width +
+                                         (size_t)input_x) * input_channels;
+                                    vx_pf_qconv_copy_bytes(channels,
+                                        input_bytes + source, input_channels);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        return 1;
+    }
     for (uint32_t sample = 0; sample < batch; sample++) {
         for (uint32_t output_y = 0; output_y < output_height; output_y++) {
             for (uint32_t output_x = 0; output_x < output_width; output_x++) {
@@ -1909,6 +2206,111 @@ static int vx_pf_expand_validate(const uint32_t *input_shape,
     return output_product == output_elements;
 }
 
+/* Return the largest contiguous suffix that Expand can copy without any
+ * broadcast-index arithmetic. Attention masks and position/adapter constants
+ * commonly widen only leading axes, leaving hundreds of trailing values
+ * contiguous. Resolving the right-aligned index once per such block avoids a
+ * rank-sized chain of integer divisions for every output element. */
+static uint32_t vx_pf_expand_contiguous_suffix(
+        const uint32_t *input_shape, const uint32_t *output_shape,
+        uint32_t input_rank, uint32_t output_rank) {
+    uint32_t elements = 1u;
+    uint32_t offset = output_rank - input_rank;
+    for (uint32_t reverse = output_rank; reverse-- > offset;) {
+        uint32_t input_dimension = input_shape[reverse - offset];
+        if (input_dimension != output_shape[reverse]) break;
+        elements *= output_shape[reverse];
+    }
+    return elements;
+}
+
+static void vx_pf_expand_copy_contiguous(const uint8_t *source,
+        uint8_t *destination, uint32_t elements, size_t element_size) {
+#if defined(__wasm__)
+    uint32_t index = 0u;
+    /* The freestanding module's general memcpy is deliberately a volatile
+     * byte loop so LLVM cannot turn its definition into an unresolved libc
+     * call. Expand moves large aligned F32/I32 suffixes, so spelling out the
+     * element-width loop here lets the SIMD build move them a vector at a time
+     * without routing every four-byte element through that byte loop. */
+    if (element_size == sizeof(uint32_t)) {
+#if defined(__wasm_simd128__)
+        for (; elements - index >= 4u; index += 4u) {
+            wasm_v128_store(destination + (size_t)index * sizeof(uint32_t),
+                wasm_v128_load(source + (size_t)index * sizeof(uint32_t)));
+        }
+#endif
+        for (; index < elements; index++) {
+            uint32_t value;
+            /* Constant-size builtins lower to one unaligned i32 load/store in
+             * wasm, while retaining memcpy's alias-safe bit-copy semantics for
+             * the float entry point. */
+            __builtin_memcpy(&value,
+                source + (size_t)index * sizeof(value), sizeof(value));
+            __builtin_memcpy(destination + (size_t)index * sizeof(value),
+                &value, sizeof(value));
+        }
+        return;
+    }
+#if defined(__wasm_simd128__)
+    for (; elements - index >= 16u; index += 16u) {
+        wasm_v128_store(destination + index, wasm_v128_load(source + index));
+    }
+#endif
+    for (; index < elements; index++) destination[index] = source[index];
+#else
+    memcpy(destination, source, (size_t)elements * element_size);
+#endif
+}
+
+static int vx_pf_expand_copy_blocks(const void *input, void *output,
+        const uint32_t *input_shape, const uint32_t *output_shape,
+        uint32_t input_rank, uint32_t output_rank,
+        uint32_t output_elements, size_t element_size,
+        const size_t *input_strides) {
+    const uint32_t block_elements = vx_pf_expand_contiguous_suffix(
+        input_shape, output_shape, input_rank, output_rank);
+    const uint32_t block_count = output_elements / block_elements;
+    uint32_t suffix_rank = 0u;
+    uint32_t suffix_elements = 1u;
+    uint32_t prefix_rank;
+    const uint8_t *source = (const uint8_t *)input;
+    uint8_t *destination = (uint8_t *)output;
+    size_t input_steps[8] = {0};
+    uint32_t coordinates[8] = {0};
+    size_t input_index = 0;
+    const uint32_t offset = output_rank - input_rank;
+    if (!element_size || (size_t)output_elements > SIZE_MAX / element_size)
+        return 0;
+    if (input == output) return block_count == 1u;
+    while (suffix_rank < output_rank && suffix_elements < block_elements) {
+        suffix_elements *= output_shape[output_rank - 1u - suffix_rank];
+        suffix_rank++;
+    }
+    prefix_rank = output_rank - suffix_rank;
+    for (uint32_t axis = 0; axis < prefix_rank; axis++) {
+        if (axis >= offset && input_shape[axis - offset] != 1u)
+            input_steps[axis] = input_strides[axis - offset];
+    }
+    for (uint32_t block = 0; block < block_count; block++) {
+        const uint32_t output_index = block * block_elements;
+        vx_pf_expand_copy_contiguous(source + input_index * element_size,
+            destination + (size_t)output_index * element_size,
+            block_elements, element_size);
+        for (uint32_t reverse = prefix_rank; reverse-- > 0;) {
+            coordinates[reverse]++;
+            if (coordinates[reverse] < output_shape[reverse]) {
+                input_index += input_steps[reverse];
+                break;
+            }
+            coordinates[reverse] = 0u;
+            input_index -= (size_t)(output_shape[reverse] - 1u) *
+                input_steps[reverse];
+        }
+    }
+    return 1;
+}
+
 WASM_EXPORT("expand_nd_f32")
 int expand_nd_f32(const float *input, float *output, const uint32_t *input_shape,
         const uint32_t *output_shape, uint32_t input_rank, uint32_t output_rank,
@@ -1916,11 +2318,8 @@ int expand_nd_f32(const float *input, float *output, const uint32_t *input_shape
     size_t input_strides[8];
     if (!input || !output || !vx_pf_expand_validate(input_shape, output_shape,
         input_rank, output_rank, output_elements, input_strides)) return 0;
-    for (uint32_t index = 0; index < output_elements; index++) {
-        output[index] = input[vx_pf_broadcast_index(index, input_shape, input_rank,
-            output_shape, output_rank, input_strides)];
-    }
-    return 1;
+    return vx_pf_expand_copy_blocks(input, output, input_shape, output_shape,
+        input_rank, output_rank, output_elements, sizeof(*output), input_strides);
 }
 
 WASM_EXPORT("expand_nd_u32")
@@ -1930,11 +2329,8 @@ int expand_nd_u32(const uint32_t *input, uint32_t *output,
     size_t input_strides[8];
     if (!input || !output || !vx_pf_expand_validate(input_shape, output_shape,
         input_rank, output_rank, output_elements, input_strides)) return 0;
-    for (uint32_t index = 0; index < output_elements; index++) {
-        output[index] = input[vx_pf_broadcast_index(index, input_shape, input_rank,
-            output_shape, output_rank, input_strides)];
-    }
-    return 1;
+    return vx_pf_expand_copy_blocks(input, output, input_shape, output_shape,
+        input_rank, output_rank, output_elements, sizeof(*output), input_strides);
 }
 
 WASM_EXPORT("expand_nd_i8u8")
@@ -1945,19 +2341,46 @@ int expand_nd_i8u8(const uint8_t *input, uint8_t *output,
     if (!input || !output || input == output ||
         !vx_pf_expand_validate(input_shape, output_shape,
             input_rank, output_rank, output_elements, input_strides)) return 0;
-    for (uint32_t index = 0; index < output_elements; index++) {
-        output[index] = input[vx_pf_broadcast_index(index, input_shape, input_rank,
-            output_shape, output_rank, input_strides)];
-    }
-    return 1;
+    return vx_pf_expand_copy_blocks(input, output, input_shape, output_shape,
+        input_rank, output_rank, output_elements, sizeof(*output), input_strides);
 }
 
-WASM_EXPORT("transpose_nd_f32")
-int transpose_nd_f32(const float *input, float *output, const uint32_t *input_shape,
-        const uint32_t *permutation, uint32_t rank, uint32_t elements) {
+/* Shared transpose plan: validates the permutation and precomputes, per output
+ * axis, the extent and the input-element step that advancing it costs.
+ *
+ * The obvious loop recovers each output coordinate with a `%` and a `/` per
+ * rank per element -- eight integer divisions per byte at rank 4, on runtime
+ * shapes the compiler cannot strength-reduce. Walking the output linearly makes
+ * those coordinates an odometer instead: increment the innermost counter, and
+ * on wrap subtract the axis span and carry. Every element then costs one add.
+ */
+/* Square tile for the 2-D path, in elements. 32x32 keeps both the strided reads
+ * and the contiguous writes of a tile inside L1 for every element width here. */
+#define VX_PF_TRANSPOSE_TILE 32
+
+typedef struct {
+    size_t step[8];      /* input elements advanced by +1 on this output axis */
+    size_t span[8];      /* step * (extent - 1): undone when the axis wraps */
+    uint32_t extent[8];
+    uint32_t counter[8];
+    size_t run;          /* contiguous elements copied per block */
+    size_t blocks;       /* number of runs covering the output */
+    int carry_axis;      /* first axis the odometer carries from, -1 if none */
+    /* Set when the whole transpose collapses to a 2-D swap: the output is
+     * [rows][cols] and the input element for (r, c) sits at
+     * r*row_step + c*col_step. Worth separating because that case is a strided
+     * gather the odometer cannot make cache-friendly -- NHWC<->NCHW is exactly
+     * this, and it is where the encoder spends its transpose time. */
+    int tiled;
+    size_t rows, cols, row_step, col_step;
+} VxTransposePlan;
+
+static int vx_pf_transpose_plan(const uint32_t *input_shape,
+        const uint32_t *permutation, uint32_t rank, uint32_t elements,
+        VxTransposePlan *plan) {
     size_t input_strides[8], product = 1;
     uint32_t seen = 0;
-    if (!input || !output || !input_shape || !permutation || rank == 0 || rank > 8 ||
+    if (!input_shape || !permutation || rank == 0 || rank > 8 ||
         !vx_pf_contiguous_strides(input_shape, rank, input_strides)) return 0;
     for (uint32_t axis = 0; axis < rank; axis++) {
         uint32_t source_axis = permutation[axis];
@@ -1966,16 +2389,96 @@ int transpose_nd_f32(const float *input, float *output, const uint32_t *input_sh
         seen |= 1u << source_axis;
     }
     if (product != elements) return 0;
-    for (uint32_t output_index = 0; output_index < elements; output_index++) {
-        size_t remaining = output_index;
-        size_t input_index = 0;
-        for (uint32_t reverse = rank; reverse-- > 0;) {
-            uint32_t source_axis = permutation[reverse];
-            uint32_t coordinate = (uint32_t)(remaining % input_shape[source_axis]);
-            remaining /= input_shape[source_axis];
-            input_index += (size_t)coordinate * input_strides[source_axis];
+    for (uint32_t axis = 0; axis < rank; axis++) {
+        uint32_t source_axis = permutation[axis];
+        plan->extent[axis] = input_shape[source_axis];
+        plan->step[axis] = input_strides[source_axis];
+        plan->span[axis] = (size_t)(plan->extent[axis] - 1) * plan->step[axis];
+        plan->counter[axis] = 0;
+    }
+    /* When the innermost output axis is also the contiguous input axis, its
+     * whole run is contiguous on both sides and copies as one block. */
+    plan->run = plan->step[rank - 1] == 1 ? plan->extent[rank - 1] : 1;
+    plan->blocks = plan->run ? elements / plan->run : 0;
+    plan->carry_axis = (int)rank - 1 - (plan->run > 1 ? 1 : 0);
+
+    /* Merge output axes that are already adjacent in the input, then drop the
+     * unit axes. Rank-4 NHWC<->NCHW collapses to two axes this way. */
+    size_t merged_extent[8], merged_step[8];
+    uint32_t merged = 0;
+    for (uint32_t axis = 0; axis < rank; axis++) {
+        size_t extent = plan->extent[axis], step = plan->step[axis];
+        if (merged && merged_step[merged - 1] == step * extent) {
+            merged_extent[merged - 1] *= extent;
+            merged_step[merged - 1] = step;
+        } else {
+            merged_extent[merged] = extent;
+            merged_step[merged] = step;
+            merged++;
         }
-        output[output_index] = input[input_index];
+    }
+    uint32_t significant = 0;
+    for (uint32_t axis = 0; axis < merged; axis++) {
+        if (merged_extent[axis] == 1) continue;
+        merged_extent[significant] = merged_extent[axis];
+        merged_step[significant] = merged_step[axis];
+        significant++;
+    }
+    /* Two strided axes is the transpose proper; one axis (or none) is already a
+     * copy or a single strided walk the odometer handles fine. */
+    plan->tiled = significant == 2 && merged_step[1] != 1;
+    if (plan->tiled) {
+        plan->rows = merged_extent[0];
+        plan->cols = merged_extent[1];
+        plan->row_step = merged_step[0];
+        plan->col_step = merged_step[1];
+    }
+    return elements == 0 || plan->run != 0;
+}
+
+/* Tile bounds shared by the three element widths. */
+#define VX_PF_TRANSPOSE_TILED(TYPE)                                            \
+    for (size_t row_base = 0; row_base < plan.rows; row_base += VX_PF_TRANSPOSE_TILE) { \
+        size_t row_end = row_base + VX_PF_TRANSPOSE_TILE;                      \
+        if (row_end > plan.rows) row_end = plan.rows;                          \
+        for (size_t col_base = 0; col_base < plan.cols; col_base += VX_PF_TRANSPOSE_TILE) { \
+            size_t col_end = col_base + VX_PF_TRANSPOSE_TILE;                  \
+            if (col_end > plan.cols) col_end = plan.cols;                      \
+            for (size_t row = row_base; row < row_end; row++) {                \
+                const TYPE *source = input + row * plan.row_step;              \
+                TYPE *destination = output + row * plan.cols;                  \
+                for (size_t col = col_base; col < col_end; col++)              \
+                    destination[col] = source[col * plan.col_step];            \
+            }                                                                  \
+        }                                                                      \
+    }
+
+/* Advance the odometer past one emitted run. Returns the new input index. */
+static size_t vx_pf_transpose_advance(VxTransposePlan *plan, size_t input_index) {
+    for (int axis = plan->carry_axis; axis >= 0; axis--) {
+        if (++plan->counter[axis] < plan->extent[axis]) return input_index + plan->step[axis];
+        plan->counter[axis] = 0;
+        input_index -= plan->span[axis];
+    }
+    return input_index;
+}
+
+WASM_EXPORT("transpose_nd_f32")
+int transpose_nd_f32(const float *input, float *output, const uint32_t *input_shape,
+        const uint32_t *permutation, uint32_t rank, uint32_t elements) {
+    VxTransposePlan plan;
+    size_t input_index = 0, written = 0;
+    if (!input || !output ||
+        !vx_pf_transpose_plan(input_shape, permutation, rank, elements, &plan)) return 0;
+    if (plan.tiled) {
+        VX_PF_TRANSPOSE_TILED(float)
+        return 1;
+    }
+    for (size_t block = 0; block < plan.blocks; block++) {
+        for (size_t offset = 0; offset < plan.run; offset++)
+            output[written + offset] = input[input_index + offset];
+        written += plan.run;
+        input_index = vx_pf_transpose_advance(&plan, input_index);
     }
     return 1;
 }
@@ -1984,27 +2487,19 @@ WASM_EXPORT("transpose_nd_u32")
 int transpose_nd_u32(const uint32_t *input, uint32_t *output,
         const uint32_t *input_shape, const uint32_t *permutation,
         uint32_t rank, uint32_t elements) {
-    size_t input_strides[8], product = 1;
-    uint32_t seen = 0;
-    if (!input || !output || !input_shape || !permutation || rank == 0 || rank > 8 ||
-        !vx_pf_contiguous_strides(input_shape, rank, input_strides)) return 0;
-    for (uint32_t axis = 0; axis < rank; axis++) {
-        uint32_t source_axis = permutation[axis];
-        if (source_axis >= rank || (seen & (1u << source_axis)) ||
-            !vx_pf_mul_size(&product, input_shape[source_axis])) return 0;
-        seen |= 1u << source_axis;
+    VxTransposePlan plan;
+    size_t input_index = 0, written = 0;
+    if (!input || !output ||
+        !vx_pf_transpose_plan(input_shape, permutation, rank, elements, &plan)) return 0;
+    if (plan.tiled) {
+        VX_PF_TRANSPOSE_TILED(uint32_t)
+        return 1;
     }
-    if (product != elements) return 0;
-    for (uint32_t output_index = 0; output_index < elements; output_index++) {
-        size_t remaining = output_index;
-        size_t input_index = 0;
-        for (uint32_t reverse = rank; reverse-- > 0;) {
-            uint32_t source_axis = permutation[reverse];
-            uint32_t coordinate = (uint32_t)(remaining % input_shape[source_axis]);
-            remaining /= input_shape[source_axis];
-            input_index += (size_t)coordinate * input_strides[source_axis];
-        }
-        output[output_index] = input[input_index];
+    for (size_t block = 0; block < plan.blocks; block++) {
+        for (size_t offset = 0; offset < plan.run; offset++)
+            output[written + offset] = input[input_index + offset];
+        written += plan.run;
+        input_index = vx_pf_transpose_advance(&plan, input_index);
     }
     return 1;
 }
@@ -2013,30 +2508,20 @@ WASM_EXPORT("transpose_nd_i8u8")
 int transpose_nd_i8u8(const uint8_t *input, uint8_t *output,
         const uint32_t *input_shape, const uint32_t *permutation,
         uint32_t rank, uint32_t elements, uint32_t dtype) {
-    size_t input_strides[8], product = 1;
-    uint32_t seen = 0;
-    if (!input || !output || input == output || !input_shape || !permutation ||
+    VxTransposePlan plan;
+    size_t input_index = 0, written = 0;
+    if (!input || !output || input == output ||
         (dtype != VX_DTYPE_I8 && dtype != VX_DTYPE_U8) ||
-        rank == 0 || rank > 8 ||
-        !vx_pf_contiguous_strides(input_shape, rank, input_strides)) return 0;
-    for (uint32_t axis = 0; axis < rank; axis++) {
-        uint32_t source_axis = permutation[axis];
-        if (source_axis >= rank || (seen & (1u << source_axis)) ||
-            !vx_pf_mul_size(&product, input_shape[source_axis])) return 0;
-        seen |= 1u << source_axis;
+        !vx_pf_transpose_plan(input_shape, permutation, rank, elements, &plan)) return 0;
+    if (plan.tiled) {
+        VX_PF_TRANSPOSE_TILED(uint8_t)
+        return 1;
     }
-    if (product != elements) return 0;
-    for (uint32_t output_index = 0; output_index < elements; output_index++) {
-        size_t remaining = output_index;
-        size_t input_index = 0;
-        for (uint32_t reverse = rank; reverse-- > 0;) {
-            uint32_t source_axis = permutation[reverse];
-            uint32_t coordinate =
-                (uint32_t)(remaining % input_shape[source_axis]);
-            remaining /= input_shape[source_axis];
-            input_index += (size_t)coordinate * input_strides[source_axis];
-        }
-        output[output_index] = input[input_index];
+    for (size_t block = 0; block < plan.blocks; block++) {
+        for (size_t offset = 0; offset < plan.run; offset++)
+            output[written + offset] = input[input_index + offset];
+        written += plan.run;
+        input_index = vx_pf_transpose_advance(&plan, input_index);
     }
     return 1;
 }
@@ -2297,6 +2782,467 @@ static VX_GROUPNORM_TARGET_AVX2 void vx_groupnorm_group_avx2(
 }
 #endif
 
+/* One accumulator pair per group lives on the stack during the streaming pass;
+ * beyond this the original per-group loop still runs (correct, just slower). */
+#define VX_GROUPNORM_MAX_STREAMED_GROUPS 512
+/* A group narrower than one AVX2 vector never enters the vector body. */
+#define VX_GROUPNORM_MIN_VECTOR_CHANNELS 8
+
+#if VX_GROUPNORM_X86_AVX2
+/* Keep a bounded NHWC row tile resident while vectorizing four independent
+ * narrow groups in the F64 lanes.  Sixteen common image-encoder rows fit in
+ * L1; wider legal tensors keep the same bounded, allocation-free algorithm
+ * and merely lose some locality. */
+#define VX_GROUPNORM_AVX2_SPATIAL_TILE 16u
+
+static VX_GROUPNORM_TARGET_AVX2 void vx_groupnorm_streamed_avx2(
+        const float *input, const float *weight, const float *bias,
+        float *output, uint32_t batch, uint32_t channels, uint32_t groups,
+        uint32_t channels_per_group, size_t spatial, size_t values,
+        size_t sample_stride, double epsilon) {
+    double sums[VX_GROUPNORM_MAX_STREAMED_GROUPS];
+    double squares[VX_GROUPNORM_MAX_STREAMED_GROUPS];
+    double means[VX_GROUPNORM_MAX_STREAMED_GROUPS];
+    double inverses[VX_GROUPNORM_MAX_STREAMED_GROUPS];
+    for (uint32_t sample = 0; sample < batch; sample++) {
+        const size_t sample_offset = (size_t)sample * sample_stride;
+        size_t tile;
+        uint32_t group;
+        for (group = 0; group < groups; group++) sums[group] = 0.0;
+        for (tile = 0; tile < spatial; tile += VX_GROUPNORM_AVX2_SPATIAL_TILE) {
+            size_t limit = tile + VX_GROUPNORM_AVX2_SPATIAL_TILE;
+            if (limit > spatial) limit = spatial;
+            for (group = 0; group + 3u < groups; group += 4u) {
+                __m256d total = _mm256_loadu_pd(sums + group);
+                const uint32_t first = group * channels_per_group;
+                for (size_t point = tile; point < limit; point++) {
+                    const float *span0 = input + sample_offset +
+                        point * channels + first;
+                    const float *span1 = span0 + channels_per_group;
+                    const float *span2 = span1 + channels_per_group;
+                    const float *span3 = span2 + channels_per_group;
+                    for (uint32_t local = 0; local < channels_per_group; local++)
+                        total = _mm256_add_pd(total, _mm256_set_pd(
+                            (double)span3[local], (double)span2[local],
+                            (double)span1[local], (double)span0[local]));
+                }
+                _mm256_storeu_pd(sums + group, total);
+            }
+            for (; group < groups; group++) {
+                double total = sums[group];
+                const uint32_t first = group * channels_per_group;
+                for (size_t point = tile; point < limit; point++) {
+                    const float *span = input + sample_offset +
+                        point * channels + first;
+                    for (uint32_t local = 0; local < channels_per_group; local++)
+                        total += (double)span[local];
+                }
+                sums[group] = total;
+            }
+        }
+        for (group = 0; group < groups; group++) {
+            means[group] = sums[group] / (double)values;
+            squares[group] = 0.0;
+        }
+        for (tile = 0; tile < spatial; tile += VX_GROUPNORM_AVX2_SPATIAL_TILE) {
+            size_t limit = tile + VX_GROUPNORM_AVX2_SPATIAL_TILE;
+            if (limit > spatial) limit = spatial;
+            for (group = 0; group + 3u < groups; group += 4u) {
+                __m256d total = _mm256_loadu_pd(squares + group);
+                const __m256d mean = _mm256_loadu_pd(means + group);
+                const uint32_t first = group * channels_per_group;
+                for (size_t point = tile; point < limit; point++) {
+                    const float *span0 = input + sample_offset +
+                        point * channels + first;
+                    const float *span1 = span0 + channels_per_group;
+                    const float *span2 = span1 + channels_per_group;
+                    const float *span3 = span2 + channels_per_group;
+                    for (uint32_t local = 0; local < channels_per_group; local++) {
+                        const __m256d centered = _mm256_sub_pd(_mm256_set_pd(
+                            (double)span3[local], (double)span2[local],
+                            (double)span1[local], (double)span0[local]), mean);
+                        total = _mm256_add_pd(total,
+                            _mm256_mul_pd(centered, centered));
+                    }
+                }
+                _mm256_storeu_pd(squares + group, total);
+            }
+            for (; group < groups; group++) {
+                double total = squares[group];
+                const double mean = means[group];
+                const uint32_t first = group * channels_per_group;
+                for (size_t point = tile; point < limit; point++) {
+                    const float *span = input + sample_offset +
+                        point * channels + first;
+                    for (uint32_t local = 0; local < channels_per_group; local++) {
+                        const double centered = (double)span[local] - mean;
+                        total += centered * centered;
+                    }
+                }
+                squares[group] = total;
+            }
+        }
+        for (group = 0; group < groups; group++)
+            inverses[group] = 1.0 /
+                __builtin_sqrt(squares[group] / (double)values + epsilon);
+
+        /* Four adjacent groups form one contiguous channel bundle.  Build each
+         * statistics vector once per tile/channel lane, then apply it to the
+         * resident rows without changing the scalar operation order. */
+        for (tile = 0; tile < spatial; tile += VX_GROUPNORM_AVX2_SPATIAL_TILE) {
+            size_t limit = tile + VX_GROUPNORM_AVX2_SPATIAL_TILE;
+            if (limit > spatial) limit = spatial;
+            for (group = 0; group + 3u < groups; group += 4u) {
+                const uint32_t first = group * channels_per_group;
+                const uint32_t bundle = 4u * channels_per_group;
+                uint32_t local = 0;
+                for (; local + 4u <= bundle; local += 4u) {
+                    const uint32_t c0 = first + local;
+                    const uint32_t g0 = group + local / channels_per_group;
+                    const uint32_t g1 = group + (local + 1u) / channels_per_group;
+                    const uint32_t g2 = group + (local + 2u) / channels_per_group;
+                    const uint32_t g3 = group + (local + 3u) / channels_per_group;
+                    const __m256d mean = _mm256_set_pd(
+                        means[g3], means[g2], means[g1], means[g0]);
+                    const __m256d inverse = _mm256_set_pd(
+                        inverses[g3], inverses[g2], inverses[g1], inverses[g0]);
+                    const __m256d gain = _mm256_cvtps_pd(
+                        _mm_loadu_ps(weight + c0));
+                    const __m256d offset = bias
+                        ? _mm256_cvtps_pd(_mm_loadu_ps(bias + c0))
+                        : _mm256_setzero_pd();
+                    for (size_t point = tile; point < limit; point++) {
+                        const size_t row = sample_offset + point * channels + c0;
+                        __m256d normalized = _mm256_sub_pd(
+                            _mm256_cvtps_pd(_mm_loadu_ps(input + row)), mean);
+                        normalized = _mm256_mul_pd(normalized, inverse);
+                        normalized = _mm256_mul_pd(normalized, gain);
+                        normalized = _mm256_add_pd(normalized, offset);
+                        _mm_storeu_ps(output + row,
+                            _mm256_cvtpd_ps(normalized));
+                    }
+                }
+                for (; local < bundle; local++) {
+                    const uint32_t channel = first + local;
+                    const uint32_t lane_group =
+                        group + local / channels_per_group;
+                    for (size_t point = tile; point < limit; point++) {
+                        const size_t row = sample_offset + point * channels + channel;
+                        output[row] = (float)(((double)input[row] -
+                            means[lane_group]) * inverses[lane_group] *
+                            weight[channel] + (bias ? bias[channel] : 0.0f));
+                    }
+                }
+            }
+            for (; group < groups; group++) {
+                const uint32_t first = group * channels_per_group;
+                for (size_t point = tile; point < limit; point++) {
+                    const size_t row = sample_offset + point * channels + first;
+                    for (uint32_t local = 0; local < channels_per_group; local++) {
+                        const uint32_t channel = first + local;
+                        output[row + local] = (float)(((double)input[row + local] -
+                            means[group]) * inverses[group] * weight[channel] +
+                            (bias ? bias[channel] : 0.0f));
+                    }
+                }
+            }
+        }
+    }
+}
+#endif
+
+#if defined(__wasm__) && defined(__wasm_simd128__) && \
+    !defined(VOLVOXAI_DISABLE_GROUPNORM_WASM_SIMD)
+#define VX_GROUPNORM_WASM_SIMD 1
+#else
+#define VX_GROUPNORM_WASM_SIMD 0
+#endif
+
+#if VX_GROUPNORM_WASM_SIMD
+/* Keep one small NHWC row tile resident while visiting independent groups.
+ * Sixteen 320-channel F32 rows occupy 20 KiB, leaving room in a conservative
+ * 32 KiB L1 for statistics and affine vectors. Wider tensors still retain
+ * exact behavior and merely lose some locality. */
+#ifndef VOLVOXAI_GROUPNORM_WASM_SPATIAL_TILE
+#define VOLVOXAI_GROUPNORM_WASM_SPATIAL_TILE 16u
+#endif
+#if VOLVOXAI_GROUPNORM_WASM_SPATIAL_TILE == 0
+#error "VOLVOXAI_GROUPNORM_WASM_SPATIAL_TILE must be positive"
+#endif
+
+#if defined(VOLVOXAI_GROUPNORM_WASM_SIMD_TESTING)
+static uint32_t vx_groupnorm_wasm_simd_call_count = 0;
+
+WASM_EXPORT("groupnorm_wasm_simd_calls")
+uint32_t groupnorm_wasm_simd_calls(void) {
+    return vx_groupnorm_wasm_simd_call_count;
+}
+
+WASM_EXPORT("reset_groupnorm_wasm_simd_calls")
+void reset_groupnorm_wasm_simd_calls(void) {
+    vx_groupnorm_wasm_simd_call_count = 0;
+}
+#endif
+
+/* Pair independent groups in the two F64 lanes.  Each lane observes points
+ * and channels in exactly the scalar order, so this is not a reassociation of
+ * either reduction.  Tiling amortizes the load/store of the accumulator pair
+ * while keeping the strided group spans in L1. */
+static void vx_groupnorm_streamed_wasm_simd(
+        const float *input, const float *weight, const float *bias,
+        float *output, uint32_t batch, uint32_t channels, uint32_t groups,
+        uint32_t channels_per_group, size_t spatial, size_t values,
+        size_t sample_stride, double epsilon) {
+    double sums[VX_GROUPNORM_MAX_STREAMED_GROUPS];
+    double squares[VX_GROUPNORM_MAX_STREAMED_GROUPS];
+    double means[VX_GROUPNORM_MAX_STREAMED_GROUPS];
+    double inverses[VX_GROUPNORM_MAX_STREAMED_GROUPS];
+    for (uint32_t sample = 0; sample < batch; sample++) {
+        const size_t sample_offset = (size_t)sample * sample_stride;
+        uint32_t group;
+        size_t tile;
+        for (group = 0; group < groups; group++) sums[group] = 0.0;
+        for (tile = 0; tile < spatial;) {
+            const size_t remaining = spatial - tile;
+            const size_t limit = remaining < VOLVOXAI_GROUPNORM_WASM_SPATIAL_TILE
+                ? spatial : tile + VOLVOXAI_GROUPNORM_WASM_SPATIAL_TILE;
+            for (group = 0; group + 7u < groups; group += 8u) {
+                v128_t total01 = wasm_v128_load(sums + group);
+                v128_t total23 = wasm_v128_load(sums + group + 2u);
+                v128_t total45 = wasm_v128_load(sums + group + 4u);
+                v128_t total67 = wasm_v128_load(sums + group + 6u);
+                const uint32_t first = group * channels_per_group;
+                for (size_t point = tile; point < limit; point++) {
+                    const float *span0 = input + sample_offset +
+                        point * channels + first;
+                    const float *span1 = span0 + channels_per_group;
+                    const float *span2 = span1 + channels_per_group;
+                    const float *span3 = span2 + channels_per_group;
+                    const float *span4 = span3 + channels_per_group;
+                    const float *span5 = span4 + channels_per_group;
+                    const float *span6 = span5 + channels_per_group;
+                    const float *span7 = span6 + channels_per_group;
+                    for (uint32_t local = 0; local < channels_per_group; local++) {
+                        total01 = wasm_f64x2_add(total01, wasm_f64x2_make(
+                            (double)span0[local], (double)span1[local]));
+                        total23 = wasm_f64x2_add(total23, wasm_f64x2_make(
+                            (double)span2[local], (double)span3[local]));
+                        total45 = wasm_f64x2_add(total45, wasm_f64x2_make(
+                            (double)span4[local], (double)span5[local]));
+                        total67 = wasm_f64x2_add(total67, wasm_f64x2_make(
+                            (double)span6[local], (double)span7[local]));
+                    }
+                }
+                wasm_v128_store(sums + group, total01);
+                wasm_v128_store(sums + group + 2u, total23);
+                wasm_v128_store(sums + group + 4u, total45);
+                wasm_v128_store(sums + group + 6u, total67);
+            }
+            for (; group + 3u < groups; group += 4u) {
+                v128_t total01 = wasm_v128_load(sums + group);
+                v128_t total23 = wasm_v128_load(sums + group + 2u);
+                const uint32_t first = group * channels_per_group;
+                for (size_t point = tile; point < limit; point++) {
+                    const float *span0 = input + sample_offset +
+                        point * channels + first;
+                    const float *span1 = span0 + channels_per_group;
+                    const float *span2 = span1 + channels_per_group;
+                    const float *span3 = span2 + channels_per_group;
+                    for (uint32_t local = 0; local < channels_per_group; local++) {
+                        total01 = wasm_f64x2_add(total01, wasm_f64x2_make(
+                            (double)span0[local], (double)span1[local]));
+                        total23 = wasm_f64x2_add(total23, wasm_f64x2_make(
+                            (double)span2[local], (double)span3[local]));
+                    }
+                }
+                wasm_v128_store(sums + group, total01);
+                wasm_v128_store(sums + group + 2u, total23);
+            }
+            for (; group + 1u < groups; group += 2u) {
+                v128_t total = wasm_v128_load(sums + group);
+                const uint32_t first = group * channels_per_group;
+                for (size_t point = tile; point < limit; point++) {
+                    const float *low = input + sample_offset +
+                        point * channels + first;
+                    const float *high = low + channels_per_group;
+                    for (uint32_t local = 0; local < channels_per_group; local++)
+                        total = wasm_f64x2_add(total, wasm_f64x2_make(
+                            (double)low[local], (double)high[local]));
+                }
+                wasm_v128_store(sums + group, total);
+            }
+            if (group < groups) {
+                double total = sums[group];
+                const uint32_t first = group * channels_per_group;
+                for (size_t point = tile; point < limit; point++) {
+                    const float *span = input + sample_offset +
+                        point * channels + first;
+                    for (uint32_t local = 0; local < channels_per_group; local++)
+                        total += span[local];
+                }
+                sums[group] = total;
+            }
+            tile = limit;
+        }
+        for (group = 0; group < groups; group++) {
+            means[group] = sums[group] / (double)values;
+            squares[group] = 0.0;
+        }
+        for (tile = 0; tile < spatial;) {
+            const size_t remaining = spatial - tile;
+            const size_t limit = remaining < VOLVOXAI_GROUPNORM_WASM_SPATIAL_TILE
+                ? spatial : tile + VOLVOXAI_GROUPNORM_WASM_SPATIAL_TILE;
+            for (group = 0; group + 7u < groups; group += 8u) {
+                v128_t total01 = wasm_v128_load(squares + group);
+                v128_t total23 = wasm_v128_load(squares + group + 2u);
+                v128_t total45 = wasm_v128_load(squares + group + 4u);
+                v128_t total67 = wasm_v128_load(squares + group + 6u);
+                const v128_t mean01 = wasm_v128_load(means + group);
+                const v128_t mean23 = wasm_v128_load(means + group + 2u);
+                const v128_t mean45 = wasm_v128_load(means + group + 4u);
+                const v128_t mean67 = wasm_v128_load(means + group + 6u);
+                const uint32_t first = group * channels_per_group;
+                for (size_t point = tile; point < limit; point++) {
+                    const float *span0 = input + sample_offset +
+                        point * channels + first;
+                    const float *span1 = span0 + channels_per_group;
+                    const float *span2 = span1 + channels_per_group;
+                    const float *span3 = span2 + channels_per_group;
+                    const float *span4 = span3 + channels_per_group;
+                    const float *span5 = span4 + channels_per_group;
+                    const float *span6 = span5 + channels_per_group;
+                    const float *span7 = span6 + channels_per_group;
+                    for (uint32_t local = 0; local < channels_per_group; local++) {
+                        const v128_t centered01 = wasm_f64x2_sub(
+                            wasm_f64x2_make((double)span0[local],
+                                            (double)span1[local]), mean01);
+                        const v128_t centered23 = wasm_f64x2_sub(
+                            wasm_f64x2_make((double)span2[local],
+                                            (double)span3[local]), mean23);
+                        const v128_t centered45 = wasm_f64x2_sub(
+                            wasm_f64x2_make((double)span4[local],
+                                            (double)span5[local]), mean45);
+                        const v128_t centered67 = wasm_f64x2_sub(
+                            wasm_f64x2_make((double)span6[local],
+                                            (double)span7[local]), mean67);
+                        total01 = wasm_f64x2_add(total01,
+                            wasm_f64x2_mul(centered01, centered01));
+                        total23 = wasm_f64x2_add(total23,
+                            wasm_f64x2_mul(centered23, centered23));
+                        total45 = wasm_f64x2_add(total45,
+                            wasm_f64x2_mul(centered45, centered45));
+                        total67 = wasm_f64x2_add(total67,
+                            wasm_f64x2_mul(centered67, centered67));
+                    }
+                }
+                wasm_v128_store(squares + group, total01);
+                wasm_v128_store(squares + group + 2u, total23);
+                wasm_v128_store(squares + group + 4u, total45);
+                wasm_v128_store(squares + group + 6u, total67);
+            }
+            for (; group + 3u < groups; group += 4u) {
+                v128_t total01 = wasm_v128_load(squares + group);
+                v128_t total23 = wasm_v128_load(squares + group + 2u);
+                const v128_t mean01 = wasm_v128_load(means + group);
+                const v128_t mean23 = wasm_v128_load(means + group + 2u);
+                const uint32_t first = group * channels_per_group;
+                for (size_t point = tile; point < limit; point++) {
+                    const float *span0 = input + sample_offset +
+                        point * channels + first;
+                    const float *span1 = span0 + channels_per_group;
+                    const float *span2 = span1 + channels_per_group;
+                    const float *span3 = span2 + channels_per_group;
+                    for (uint32_t local = 0; local < channels_per_group; local++) {
+                        const v128_t centered01 = wasm_f64x2_sub(
+                            wasm_f64x2_make((double)span0[local],
+                                            (double)span1[local]), mean01);
+                        const v128_t centered23 = wasm_f64x2_sub(
+                            wasm_f64x2_make((double)span2[local],
+                                            (double)span3[local]), mean23);
+                        total01 = wasm_f64x2_add(total01,
+                            wasm_f64x2_mul(centered01, centered01));
+                        total23 = wasm_f64x2_add(total23,
+                            wasm_f64x2_mul(centered23, centered23));
+                    }
+                }
+                wasm_v128_store(squares + group, total01);
+                wasm_v128_store(squares + group + 2u, total23);
+            }
+            for (; group + 1u < groups; group += 2u) {
+                v128_t total = wasm_v128_load(squares + group);
+                const v128_t mean = wasm_v128_load(means + group);
+                const uint32_t first = group * channels_per_group;
+                for (size_t point = tile; point < limit; point++) {
+                    const float *low = input + sample_offset +
+                        point * channels + first;
+                    const float *high = low + channels_per_group;
+                    for (uint32_t local = 0; local < channels_per_group; local++) {
+                        const v128_t centered = wasm_f64x2_sub(
+                            wasm_f64x2_make((double)low[local],
+                                            (double)high[local]), mean);
+                        total = wasm_f64x2_add(total,
+                            wasm_f64x2_mul(centered, centered));
+                    }
+                }
+                wasm_v128_store(squares + group, total);
+            }
+            if (group < groups) {
+                double total = squares[group];
+                const double mean = means[group];
+                const uint32_t first = group * channels_per_group;
+                for (size_t point = tile; point < limit; point++) {
+                    const float *span = input + sample_offset +
+                        point * channels + first;
+                    for (uint32_t local = 0; local < channels_per_group; local++) {
+                        const double centered = (double)span[local] - mean;
+                        total += centered * centered;
+                    }
+                }
+                squares[group] = total;
+            }
+            tile = limit;
+        }
+        for (group = 0; group < groups; group++)
+            inverses[group] = 1.0 /
+                __builtin_sqrt(squares[group] / (double)values + epsilon);
+        for (size_t point = 0; point < spatial; point++) {
+            const size_t row = sample_offset + point * channels;
+            for (group = 0; group < groups; group++) {
+                const uint32_t first = group * channels_per_group;
+                const v128_t mean = wasm_f64x2_splat(means[group]);
+                const v128_t inverse = wasm_f64x2_splat(inverses[group]);
+                uint32_t local = 0;
+                for (; local + 2u <= channels_per_group; local += 2u) {
+                    const uint32_t channel = first + local;
+                    const v128_t centered = wasm_f64x2_sub(
+                        wasm_f64x2_promote_low_f32x4(
+                            wasm_v128_load64_zero(input + row + channel)), mean);
+                    const v128_t gain = wasm_f64x2_promote_low_f32x4(
+                        wasm_v128_load64_zero(weight + channel));
+                    v128_t normalized = wasm_f64x2_mul(
+                        wasm_f64x2_mul(centered, inverse), gain);
+                    if (bias)
+                        normalized = wasm_f64x2_add(normalized,
+                            wasm_f64x2_promote_low_f32x4(
+                                wasm_v128_load64_zero(bias + channel)));
+                    wasm_v128_store64_lane(output + row + channel,
+                        wasm_f32x4_demote_f64x2_zero(normalized), 0);
+                }
+                for (; local < channels_per_group; local++) {
+                    const uint32_t channel = first + local;
+                    output[row + channel] = (float)(((double)input[row + channel] -
+                        means[group]) * inverses[group] * weight[channel] +
+                        (bias ? bias[channel] : 0.0f));
+                }
+            }
+        }
+    }
+#if defined(VOLVOXAI_GROUPNORM_WASM_SIMD_TESTING)
+    vx_groupnorm_wasm_simd_call_count++;
+#endif
+}
+#endif
+
 WASM_EXPORT("groupnorm_f32")
 int groupnorm_f32(const float *input, const float *weight, const float *bias,
         float *output, uint32_t batch, uint32_t height, uint32_t width,
@@ -2313,16 +3259,97 @@ int groupnorm_f32(const float *input, const float *weight, const float *bias,
         batch > (size_t)-1 / sample_stride) return 0;
 #if VX_GROUPNORM_X86_AVX2
     if (vx_kernel_platform()->has_avx2) {
-        for (uint32_t sample = 0; sample < batch; sample++) {
-            const size_t sample_offset = (size_t)sample * sample_stride;
-            for (uint32_t group = 0; group < groups; group++)
-                vx_groupnorm_group_avx2(input, weight, bias, output,
-                    sample_offset, group * channels_per_group, channels,
-                    channels_per_group, spatial, values, epsilon);
+        if (channels_per_group < VX_GROUPNORM_MIN_VECTOR_CHANNELS &&
+            groups <= VX_GROUPNORM_MAX_STREAMED_GROUPS) {
+            vx_groupnorm_streamed_avx2(input, weight, bias, output, batch,
+                channels, groups, channels_per_group, spatial, values,
+                sample_stride, epsilon);
+            return 1;
         }
+        if (channels_per_group >= VX_GROUPNORM_MIN_VECTOR_CHANNELS) {
+            for (uint32_t sample = 0; sample < batch; sample++) {
+                const size_t sample_offset = (size_t)sample * sample_stride;
+                for (uint32_t group = 0; group < groups; group++)
+                    vx_groupnorm_group_avx2(input, weight, bias, output,
+                        sample_offset, group * channels_per_group, channels,
+                        channels_per_group, spatial, values, epsilon);
+            }
+            return 1;
+        }
+    }
+#endif
+#if VX_GROUPNORM_WASM_SIMD
+    if (groups <= VX_GROUPNORM_MAX_STREAMED_GROUPS) {
+        vx_groupnorm_streamed_wasm_simd(input, weight, bias, output, batch,
+            channels, groups, channels_per_group, spatial, values,
+            sample_stride, epsilon);
         return 1;
     }
 #endif
+    /* Stream every group at once with spatial outermost.
+     *
+     * Walking one group at a time reads `channels_per_group` floats out of each
+     * `channels`-float row, so with cpg=3 of 96 each pass touches every cache
+     * line to use 12 of its 384 bytes -- and there are three such passes per
+     * group. Hoisting spatial outside and carrying one accumulator per group
+     * turns that into three sequential passes over the tensor, total.
+     *
+     * Each group's additions still happen in the original order (point ascending,
+     * then channel), and accumulation stays in double, so results are unchanged.
+     * Variance keeps the two-pass form on purpose: folding it into sum/sumsq
+     * would subtract two nearly equal numbers and lose the low bits. */
+    if (groups <= VX_GROUPNORM_MAX_STREAMED_GROUPS) {
+        double sums[VX_GROUPNORM_MAX_STREAMED_GROUPS];
+        double squares[VX_GROUPNORM_MAX_STREAMED_GROUPS];
+        double means[VX_GROUPNORM_MAX_STREAMED_GROUPS];
+        double inverses[VX_GROUPNORM_MAX_STREAMED_GROUPS];
+        for (uint32_t sample = 0; sample < batch; sample++) {
+            const size_t sample_offset = (size_t)sample * sample_stride;
+            for (uint32_t group = 0; group < groups; group++) sums[group] = 0.0;
+            for (size_t point = 0; point < spatial; point++) {
+                const float *row = input + sample_offset + point * channels;
+                for (uint32_t group = 0; group < groups; group++) {
+                    const float *span = row + (size_t)group * channels_per_group;
+                    double total = sums[group];
+                    for (uint32_t local = 0; local < channels_per_group; local++)
+                        total += span[local];
+                    sums[group] = total;
+                }
+            }
+            for (uint32_t group = 0; group < groups; group++) {
+                means[group] = sums[group] / (double)values;
+                squares[group] = 0.0;
+            }
+            for (size_t point = 0; point < spatial; point++) {
+                const float *row = input + sample_offset + point * channels;
+                for (uint32_t group = 0; group < groups; group++) {
+                    const float *span = row + (size_t)group * channels_per_group;
+                    double mean = means[group], total = squares[group];
+                    for (uint32_t local = 0; local < channels_per_group; local++) {
+                        double centered = (double)span[local] - mean;
+                        total += centered * centered;
+                    }
+                    squares[group] = total;
+                }
+            }
+            for (uint32_t group = 0; group < groups; group++)
+                inverses[group] = 1.0 /
+                    __builtin_sqrt(squares[group] / (double)values + epsilon);
+            for (size_t point = 0; point < spatial; point++) {
+                const size_t row = sample_offset + point * channels;
+                for (uint32_t group = 0; group < groups; group++) {
+                    const uint32_t first_channel = group * channels_per_group;
+                    const double mean = means[group], inverse = inverses[group];
+                    for (uint32_t local = 0; local < channels_per_group; local++) {
+                        uint32_t channel = first_channel + local;
+                        output[row + channel] = (float)(((double)input[row + channel] - mean) *
+                            inverse * weight[channel] + (bias ? bias[channel] : 0.0f));
+                    }
+                }
+            }
+        }
+        return 1;
+    }
     for (uint32_t sample = 0; sample < batch; sample++) {
         size_t sample_offset = (size_t)sample * sample_stride;
         for (uint32_t group = 0; group < groups; group++) {
@@ -2535,6 +3562,26 @@ static int vx_pf_route_index(const float *indices, uint32_t offset,
     return 1;
 }
 
+/* Resolve one global slot id against a partially resident bank.  slot_rows maps
+ * every id in [0, slot_domain) to its staged row, or VX_MOE_SLOT_ABSENT when the
+ * context did not materialize it.  A NULL table means the bank is fully
+ * resident and ids are already rows.  Routing to an absent slot is an error
+ * rather than a silent read of a neighbouring expert. */
+static int vx_pf_moe_resident_row(const uint32_t *slot_rows, uint32_t slot_domain,
+        uint32_t staged_rows, uint32_t slot, uint32_t *row) {
+    uint32_t mapped;
+    if (!slot_rows) {
+        if (slot >= staged_rows) return 0;
+        *row = slot;
+        return 1;
+    }
+    if (slot >= slot_domain) return 0;
+    mapped = slot_rows[slot];
+    if (mapped >= staged_rows) return 0;
+    *row = mapped;
+    return 1;
+}
+
 WASM_EXPORT("moe_router_f32")
 int moe_router_f32(const float *input, const float *weight, const float *bias,
         float *indices, float *route_weights, uint32_t rows, uint32_t d_model,
@@ -2604,23 +3651,47 @@ int moe_router_f32(const float *input, const float *weight, const float *bias,
 }
 
 WASM_EXPORT("moe_linear_f32")
+int vx_moe_linear_banked_f32(const float *, const float *, const float *,
+        const float *, const float *, float *, uint32_t, uint32_t, uint32_t,
+        uint32_t, uint32_t, const uint32_t *, uint32_t);
+
 int moe_linear_f32(const float *input, const float *expert_weight,
         const float *expert_bias, const float *route_indices,
         const float *route_weights, float *output, uint32_t rows,
         uint32_t d_in, uint32_t d_out, uint32_t experts, uint32_t top_k) {
+    return vx_moe_linear_banked_f32(input, expert_weight, expert_bias,
+        route_indices, route_weights, output, rows, d_in, d_out, experts,
+        top_k, NULL, 0);
+}
+
+WASM_EXPORT("vx_moe_linear_banked_f32")
+/* Banked form.  expert_weight holds only the resident slots, so `experts` is
+ * the staged row count while route indices stay in the model's global slot
+ * space.  slot_rows/slot_domain carry the mapping; NULL means fully resident. */
+int vx_moe_linear_banked_f32(const float *input, const float *expert_weight,
+        const float *expert_bias, const float *route_indices,
+        const float *route_weights, float *output, uint32_t rows,
+        uint32_t d_in, uint32_t d_out, uint32_t experts, uint32_t top_k,
+        const uint32_t *slot_rows, uint32_t slot_domain) {
+    uint32_t route_domain = slot_rows ? slot_domain : experts;
     if (!input || !expert_weight || !route_indices || !route_weights || !output ||
         !vx_pf_moe_linear_dimensions_valid(rows, d_in, d_out, experts, top_k)) return 0;
+    if (slot_rows && (slot_domain < experts || top_k > slot_domain)) return 0;
     for (uint32_t row = 0; row < rows; row++) {
         for (uint32_t column = 0; column < d_out; column++) {
             double sum = 0.0;
             for (uint32_t slot = 0; slot < top_k; slot++) {
                 uint32_t route_offset = row * top_k + slot;
                 uint32_t expert;
+                uint32_t staged;
                 float gate = route_weights[route_offset];
                 size_t expert_offset;
                 double value;
-                if (!vx_pf_route_index(route_indices, route_offset, experts, &expert) ||
+                if (!vx_pf_route_index(route_indices, route_offset, route_domain, &expert) ||
                     !vx_pf_finite_f32(gate)) return 0;
+                if (!vx_pf_moe_resident_row(slot_rows, slot_domain, experts, expert,
+                        &staged)) return 0;
+                expert = staged;
                 expert_offset = (size_t)expert * d_in * d_out;
                 value = expert_bias ? expert_bias[(size_t)expert * d_out + column] : 0.0;
                 for (uint32_t dimension = 0; dimension < d_in; dimension++) {

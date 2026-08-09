@@ -20,7 +20,7 @@ from __future__ import annotations
 
 import copy
 import hashlib
-from collections.abc import Mapping, MutableMapping, Sequence
+from collections.abc import Iterable, Mapping, MutableMapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
@@ -124,7 +124,7 @@ class RuntimeInputSpecializationPass(IRPass):
     """Freeze explicitly bound public inputs into immutable tensor payloads."""
 
     name = "runtime-input-specialization"
-    contract = PassContract.preserving(IRDialect.RUNTIME)
+    contract = PassContract.concrete_profile_only(IRDialect.RUNTIME)
 
     def __init__(
         self,
@@ -267,11 +267,62 @@ class RuntimeInputSpecializationPass(IRPass):
         return _surviving_node_order(graph, touched)
 
 
+class RuntimeDeclaredInputPruningPass(IRPass):
+    """Drop explicitly named public inputs that no node consumes any more.
+
+    A caller declares an input whose meaning a later pass may absorb, such as
+    an additive causal mask that attention fusion folds into the kernel's own
+    ``causal`` parameter.  Once nothing reads it, keeping it in the ABI would
+    force every caller to build and bind a tensor the graph ignores.  Only the
+    declared names are considered, so no inferred input is ever removed.
+    """
+
+    name = "runtime-declared-input-pruning"
+    contract = PassContract.symbolic_abi_changing(IRDialect.RUNTIME)
+
+    def __init__(self, declared: Iterable[str]) -> None:
+        if isinstance(declared, (str, bytes)):
+            raise TypeError("declared prunable inputs must be a collection")
+        self.declared = frozenset(declared)
+
+    def run(self, graph) -> PassResult:
+        graph.invalidate_analyses()
+        use_def = graph.use_def()
+        removed = [
+            name for name in graph.inputs
+            if name in self.declared
+            and name not in graph.outputs
+            and not use_def.consumers.get(name, ())
+        ]
+        if not removed:
+            return PassResult(0)
+        snapshot = graph.clone()
+        try:
+            graph.inputs[:] = [
+                name for name in graph.inputs if name not in removed
+            ]
+            for name in removed:
+                graph.tensors.pop(name, None)
+            graph.invalidate_analyses()
+            graph.verify(IRDialect.RUNTIME)
+        except Exception:
+            graph.restore(snapshot)
+            raise
+        return PassResult(
+            len(removed),
+            notes=tuple(
+                f"removed declared public input {name!r}; no node reads it "
+                "after fusion"
+                for name in removed
+            ),
+        )
+
+
 class RuntimeInputHoistingPass(IRPass):
     """Promote explicitly selected pure computed values to public inputs."""
 
     name = "runtime-input-hoisting"
-    contract = PassContract.preserving(IRDialect.RUNTIME)
+    contract = PassContract.symbolic_abi_changing(IRDialect.RUNTIME)
 
     def __init__(
         self,

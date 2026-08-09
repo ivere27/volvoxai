@@ -78,8 +78,123 @@ class OnnxFrontendRegressionTests(unittest.TestCase):
         self.assertEqual(graph["outputs"], ["output0"])
         self.assertEqual(len(graph["nodes"]), 1)
         self.assertEqual(graph["nodes"][0]["opType"], "Identity")
-        self.assertEqual(graph["nodes"][0]["outputs"]["out"], "output0")
+        self.assertEqual(
+            graph["nodes"][0]["outputs"]["out"]["tensor"], "output0",
+        )
         self.assertIn(graph["nodes"][0]["inputs"]["input"], weights)
+
+    def test_dynamic_constant_broadcast_materializes_expand_source_weight(self):
+        path = _save_model(
+            self.root,
+            "dynamic_constant_broadcast.onnx",
+            nodes=[helper.make_node("Add", ["tokens", "bias"], ["result"], name="add_bias")],
+            inputs=[_value("tokens", TensorProto.FLOAT, ["B", "Q", 3])],
+            outputs=[_value("result", TensorProto.FLOAT, ["B", "Q", 3])],
+            initializers=[
+                _initializer("bias", np.asarray([[[1.0, 2.0, 3.0]]], dtype=np.float32))
+            ],
+        )
+
+        graph, weights = OnnxCompiler(
+            str(path),
+            dimension_bounds={
+                "B": {"min": 1, "max": 2},
+                "Q": {"min": 1, "max": 8},
+            },
+        ).lower()
+
+        expand = next(node for node in graph["nodes"] if node["opType"] == "Expand")
+        self.assertIn(expand["inputs"]["input"], weights)
+        self.assertEqual(expand["outputs"]["out"]["shape"], ["B", "Q", 3])
+        self.assertTrue(validate_graph(graph, ["portable"], weights=weights).supported)
+
+    def test_singleton_inference_preserves_proven_public_batch_symbol(self):
+        path = _save_model(
+            self.root,
+            "singleton_public_concat.onnx",
+            nodes=[helper.make_node(
+                "Concat", ["image_mask", "question_mask"], ["memory_mask"],
+                name="memory_mask_concat", axis=1,
+            )],
+            inputs=[_value("question_mask", TensorProto.INT32, ["B", "Q"])],
+            outputs=[_value("memory_mask", TensorProto.INT32, ["B", "M"])],
+            initializers=[
+                _initializer("image_mask", np.zeros((1, 210), dtype=np.int32))
+            ],
+        )
+
+        graph, weights = OnnxCompiler(
+            str(path),
+            dimension_bounds={
+                "B": {"min": 1, "max": 1},
+                "Q": {"min": 1, "max": 192},
+                "M": {"min": 211, "max": 402},
+            },
+        ).lower()
+
+        self.assertEqual(
+            graph["nodes"][0]["outputs"]["out"]["shape"],
+            ["B", "M"],
+        )
+        self.assertTrue(validate_graph(graph, ["portable"], weights=weights).supported)
+
+    def test_public_symbol_restore_rejects_non_equivalent_domain(self):
+        path = _save_model(
+            self.root,
+            "conflicting_public_concat.onnx",
+            nodes=[helper.make_node(
+                "Concat", ["image_mask", "question_mask"], ["memory_mask"],
+                name="memory_mask_concat", axis=1,
+            )],
+            inputs=[_value("question_mask", TensorProto.INT32, ["B", "Q"])],
+            outputs=[_value("memory_mask", TensorProto.INT32, ["B", "M"])],
+            initializers=[
+                _initializer("image_mask", np.zeros((1, 210), dtype=np.int32))
+            ],
+        )
+
+        with self.assertRaises(ExporterError) as caught:
+            OnnxCompiler(
+                str(path),
+                dimension_bounds={
+                    "B": {"min": 1, "max": 2},
+                    "Q": {"min": 1, "max": 192},
+                    "M": {"min": 211, "max": 402},
+                },
+            )
+        self.assertEqual(
+            caught.exception.diagnostic.code,
+            "VXONNX_PUBLIC_SHAPE_CONFLICT",
+        )
+
+    def test_public_symbol_restore_does_not_mask_rank_conflict(self):
+        path = _save_model(
+            self.root,
+            "rank_conflicting_public_concat.onnx",
+            nodes=[helper.make_node(
+                "Concat", ["image_mask", "question_mask"], ["memory_mask"],
+                name="memory_mask_concat", axis=1,
+            )],
+            inputs=[_value("question_mask", TensorProto.INT32, ["B", "Q"])],
+            outputs=[_value("memory_mask", TensorProto.INT32, ["B", "M", 1])],
+            initializers=[
+                _initializer("image_mask", np.zeros((1, 210), dtype=np.int32))
+            ],
+        )
+
+        with self.assertRaises(ExporterError) as caught:
+            OnnxCompiler(
+                str(path),
+                dimension_bounds={
+                    "B": {"min": 1, "max": 1},
+                    "Q": {"min": 1, "max": 192},
+                    "M": {"min": 211, "max": 402},
+                },
+            )
+        self.assertEqual(
+            caught.exception.diagnostic.code,
+            "VXONNX_SHAPE_INFERENCE",
+        )
 
     def test_output_binding_cannot_retype_float_data(self):
         path = _save_model(
@@ -149,7 +264,7 @@ class OnnxFrontendRegressionTests(unittest.TestCase):
             OnnxCompiler(str(path)).lower()
         self.assertEqual(caught.exception.diagnostic.code, "VXROUTER_DISPATCH")
 
-    def test_quantized_gemm_without_optional_zero_point_is_w8a32(self):
+    def test_quantized_gemm_without_v1_affine_operator_materializes_fp32(self):
         raw = np.arange(12, dtype=np.int8).reshape(3, 4)
         scales = np.asarray([0.1, 0.2, 0.3, 0.4], dtype=np.float32)
         path = _save_model(
@@ -169,16 +284,16 @@ class OnnxFrontendRegressionTests(unittest.TestCase):
             initializers=[_initializer("raw_weight", raw), _initializer("scales", scales)],
         )
 
-        graph, weights = OnnxCompiler(str(path)).lower()
-
-        self.assertEqual(graph["source"]["package_class"], "w8a32")
+        compiler = OnnxCompiler(str(path))
+        graph, weights = compiler.lower()
+        self.assertEqual(compiler.publication_report["package_class"], "fp32")
         linear = graph["nodes"][0]
-        self.assertEqual(linear["params"]["weight_layout"], "OUT_IN")
-        np.testing.assert_array_equal(weights[linear["inputs"]["weight"]], raw.T)
+        self.assertEqual(linear["params"]["weight_layout"], "din_dout")
+        self.assertEqual(set(linear["inputs"]), {"input", "weight"})
         np.testing.assert_allclose(
-            weights[linear["inputs"]["weight_scale"]], scales * np.float32(0.5)
+            weights[linear["inputs"]["weight"]],
+            raw.astype(np.float32) * scales.reshape(1, -1) * np.float32(0.5),
         )
-        self.assertNotIn("weight_zero_point", linear["inputs"])
 
     def test_quantized_gemm_rejects_nonpositive_alpha(self):
         path = _save_model(
@@ -228,7 +343,9 @@ class OnnxFrontendRegressionTests(unittest.TestCase):
 
         self.assertEqual([node["opType"] for node in graph["nodes"]], ["Add"])
         constant = graph["nodes"][0]["inputs"]["b"]
-        np.testing.assert_array_equal(weights[constant], np.asarray([0.5, -1.0, 1.5], dtype=np.float32))
+        np.testing.assert_array_equal(
+            weights[constant], np.asarray([[0.5, -1.0, 1.5]], dtype=np.float32),
+        )
 
     def test_layer_norm_rejects_public_statistics_output(self):
         path = _save_model(
@@ -327,9 +444,10 @@ class OnnxFrontendRegressionTests(unittest.TestCase):
         )
         path = _attention_model(self.root, "hard_attention_mask.onnx", hard_mask)
 
-        graph, weights = OnnxCompiler(str(path)).lower()
+        compiler = OnnxCompiler(str(path))
+        graph, weights = compiler.lower()
 
-        self.assertEqual(len(graph["source"]["features"]["attention"]), 1)
+        self.assertEqual(len(compiler.publication_report["features"]["attention"]), 1)
         self.assertEqual([node["opType"] for node in graph["nodes"]], ["CrossSDPA"])
         self.assertEqual(graph["nodes"][0]["params"]["causal"], True)
         self.assertNotIn("mask", graph["nodes"][0]["inputs"])

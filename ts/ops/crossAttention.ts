@@ -1,20 +1,62 @@
-export function _cpuCrossAttention(node) {
+import {
+  assertShapeKernelOutput,
+  assertShapeKernelTensor,
+  sameShape,
+} from './shapeKernelValidation.js';
 
-    const q_in = node.inputs.q.buffer;
-    const kv_in = node.inputs.kv.buffer;
-    const wBuf = node.inputs.weight.buffer;
-    const scale = node.inputs.scale ? node.inputs.scale.buffer : null;
-    const bias = node.inputs.bias ? node.inputs.bias.buffer : null;
-    const outBuf = node.outputs.out.buffer;
-    const qShape = node.inputs.q.shape;
-    const kvShape = node.inputs.kv.shape;
-    const outShape = node.outputs.out.shape;
+export function _cpuCrossAttention(node) {
+    const qTensor = node.inputs?.q;
+    const kvTensor = node.inputs?.kv;
+    const weightTensor = node.inputs?.weight;
+    const scaleTensor = node.inputs?.scale || null;
+    const biasTensor = node.inputs?.bias || null;
+    const output = node.outputs?.out;
+    assertShapeKernelTensor(qTensor, 'CrossAttention q', {
+      dtypes: ['float32'], minimumRank: 2, maximumRank: 3,
+    });
+    assertShapeKernelTensor(kvTensor, 'CrossAttention kv', {
+      dtypes: ['float32'], minimumRank: qTensor.shape.length,
+      maximumRank: qTensor.shape.length,
+    });
+    assertShapeKernelTensor(weightTensor, 'CrossAttention weight', {
+      dtypes: ['float32'], minimumRank: 2, maximumRank: 2,
+    });
+
+    const qShape = qTensor.shape;
+    const kvShape = kvTensor.shape;
     const rank = qShape.length;
     const batch = rank === 3 ? qShape[0] : 1;
     const seq_len_q = qShape[rank - 2];
     const seq_len_kv = kvShape[rank - 2];
-    const d_model = outShape[rank - 1];
-    const num_heads = node.params.heads || 8;
+    const d_model = qShape[rank - 1];
+    const projection = 3 * d_model;
+    if (!Number.isSafeInteger(projection) || kvShape[rank - 1] !== d_model ||
+        (rank === 3 && kvShape[0] !== batch) ||
+        !sameShape(weightTensor.shape, [projection, d_model])) {
+      throw new Error('CrossAttention has incompatible batch, feature, or projection dimensions.');
+    }
+    for (const [name, tensor] of [['scale', scaleTensor], ['bias', biasTensor]]) {
+      if (!tensor) continue;
+      assertShapeKernelTensor(tensor, `CrossAttention ${name}`, {
+        dtypes: ['float32'], minimumRank: 1, maximumRank: 1,
+      });
+      if (!sameShape(tensor.shape, [projection])) {
+        throw new Error(`CrossAttention ${name} must have shape [${projection}].`);
+      }
+    }
+    assertShapeKernelOutput(
+      output, qShape, 'float32', undefined, 'CrossAttention',
+    );
+    const num_heads = node.params?.heads ?? 8;
+    if (!Number.isSafeInteger(num_heads) || num_heads <= 0 || d_model % num_heads !== 0) {
+      throw new Error(`CrossAttention heads must be a positive divisor of ${d_model}.`);
+    }
+    const q_in = qTensor.buffer;
+    const kv_in = kvTensor.buffer;
+    const wBuf = weightTensor.buffer;
+    const scale = scaleTensor?.buffer || null;
+    const bias = biasTensor?.buffer || null;
+    const outBuf = output.buffer;
     const head_dim = d_model / num_heads;
     const scale_factor = 1 / Math.sqrt(head_dim);
     for (let b = 0; b < batch; b++) {

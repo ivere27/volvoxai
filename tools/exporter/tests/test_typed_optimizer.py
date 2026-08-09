@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import json
 import unittest
 
@@ -14,10 +15,49 @@ from tools.exporter.optimizer.typed_passes import (
 )
 from tools.exporter.optimizer.typed_pipeline import (
     optimize_runtime_graph,
-    optimize_runtime_package,
+    optimize_runtime_package as _optimize_runtime_package,
 )
 from tools.exporter.pipeline import PassGroup, VerifiedPipeline
 from tools.exporter.runtime_ir import import_runtime_package
+
+
+def _closed_fixture(document):
+    """Return the sole bounded-shape, unified-output v1 package spelling."""
+
+    authored = copy.deepcopy(document)
+    authored.pop("source", None)
+    authored.setdefault("dimensions", {})
+    for index, node in enumerate(authored.get("nodes", ())):
+        node.setdefault("id", f"node-{index}")
+        node.setdefault("params", {})
+        shapes = node.pop("outputs_shape", {})
+        dtypes = node.pop("outputs_dtype", {})
+        outputs = node.get("outputs", {})
+        if all(isinstance(name, str) for name in outputs.values()):
+            node["outputs"] = {
+                port: {
+                    "tensor": name,
+                    "shape": copy.deepcopy(shapes[port]),
+                    "dtype": dtypes[port],
+                }
+                for port, name in outputs.items()
+            }
+        if node.get("opType") in {"Reshape", "Expand"}:
+            node["params"].setdefault(
+                "shape", copy.deepcopy(node["outputs"]["out"]["shape"]),
+            )
+    return authored
+
+
+def optimize_runtime_package(document, tensors, **kwargs):
+    """Exercise the public optimizer with an explicitly static v1 profile."""
+
+    kwargs.setdefault("shape_profile", {})
+    return _optimize_runtime_package(_closed_fixture(document), tensors, **kwargs)
+
+
+def _output_name(node, port="out"):
+    return node["outputs"][port]["tensor"]
 
 
 def qdq_graph(*, output_scale="s", output_zero="z"):
@@ -26,7 +66,7 @@ def qdq_graph(*, output_scale="s", output_zero="z"):
         "z": np.asarray([0], dtype=np.int8),
         "s2": np.asarray([0.5], dtype=np.float32),
         "z2": np.asarray([1], dtype=np.int8),
-        "dead_weight": np.asarray([1.0], dtype=np.float32),
+        "dead_weight": np.asarray([1.0, 1.0], dtype=np.float32),
     }
     quant = {
         "scheme": "per_tensor", "scale_tensor": "s",
@@ -62,7 +102,7 @@ def qdq_graph(*, output_scale="s", output_zero="z"):
             },
         },
     }
-    return import_runtime_package(document, tensors)
+    return import_runtime_package(_closed_fixture(document), tensors)
 
 
 def dequantized_logits_package(*, scale=np.float32(0.25)):
@@ -106,7 +146,7 @@ def dequantized_logits_package(*, scale=np.float32(0.25)):
             },
         },
     }
-    return document, tensors
+    return _closed_fixture(document), tensors
 
 
 def packed_qlinear_package(*, post_bias=True, duplicate_last_group=False):
@@ -126,9 +166,12 @@ def packed_qlinear_package(*, post_bias=True, duplicate_last_group=False):
         "output_zero": np.asarray([121], dtype=np.uint8),
     }
     if post_bias:
-        tensors["post_bias"] = np.asarray(
-            [0.5, 1.5, 2.5, 3.5, 4.5, 5.5], dtype=np.float32,
-        )
+        tensors["post_bias"] = np.broadcast_to(
+            np.asarray(
+                [0.5, 1.5, 2.5, 3.5, 4.5, 5.5], dtype=np.float32,
+            ),
+            (2, 6),
+        ).copy()
 
     nodes = [
         {
@@ -190,7 +233,10 @@ def packed_qlinear_package(*, post_bias=True, duplicate_last_group=False):
             "outputs": {"out": f"part{group}"},
             "outputs_shape": {"out": [1, 2, 1, 2]},
             "outputs_dtype": {"out": "float32"},
-            "params": {"starts": [selected], "axes": [0], "steps": [1]},
+            "params": {
+                "starts": [selected], "ends": [selected + 1],
+                "axes": [0], "steps": [1],
+            },
         })
 
     document = {
@@ -219,7 +265,7 @@ def packed_qlinear_package(*, post_bias=True, duplicate_last_group=False):
             },
         },
     }
-    return document, tensors
+    return _closed_fixture(document), tensors
 
 
 class TypedOptimizerTests(unittest.TestCase):
@@ -240,6 +286,7 @@ class TypedOptimizerTests(unittest.TestCase):
                 output_argmax=(
                     OutputArgMaxSpecialization("missing", "token_ids"),
                 ),
+                shape_profile={},
             )
 
         self.assertEqual(graph.fingerprint(), before_graph)
@@ -253,6 +300,7 @@ class TypedOptimizerTests(unittest.TestCase):
             output_argmax=(
                 OutputArgMaxSpecialization("logits", "token_ids"),
             ),
+            shape_profile={},
         )
         self.assertEqual(report.total_changes, 2)
         self.assertEqual(graph.outputs, ["token_ids"])
@@ -286,13 +334,9 @@ class TypedOptimizerTests(unittest.TestCase):
             optimize_runtime_package(document, {})
         self.assertEqual(empty.exception.diagnostic.code, "VXRTIR015")
 
-    def test_post_ptq_publication_replaces_stale_package_class(self):
-        document = {
+    def test_post_ptq_classification_is_out_of_band(self):
+        document = _closed_fixture({
             "format": "volvox-graph/v1",
-            "source": {
-                "package_class": "fp32",
-                "quantized_graph_contract": "w8a8-v1",
-            },
             "inputs": {
                 "memory": {"shape": [1, 2, 3], "dtype": "float32"},
                 "tokens": {"shape": [1, 2, 4], "dtype": "int8"},
@@ -307,10 +351,9 @@ class TypedOptimizerTests(unittest.TestCase):
                 "outputs_dtype": {"out": "int32"},
                 "params": {"axis": -1},
             }],
-        }
+        })
         self.assertEqual(refresh_package_class(document, {}), "hybrid")
-        self.assertEqual(document["source"]["package_class"], "hybrid")
-        self.assertNotIn("quantized_graph_contract", document["source"])
+        self.assertNotIn("source", document)
 
     def test_explicit_output_argmax_removes_terminal_dq_and_records_abi(self):
         document, tensors = dequantized_logits_package()
@@ -325,27 +368,50 @@ class TypedOptimizerTests(unittest.TestCase):
                          ["QArgMax"])
         qargmax = optimized["nodes"][0]
         self.assertEqual(qargmax["inputs"], {"input": "logits_byte"})
-        self.assertEqual(qargmax["outputs"], {"out": "token_ids"})
-        self.assertEqual(qargmax["outputs_shape"], {"out": [1, 2]})
-        self.assertEqual(qargmax["outputs_dtype"], {"out": "int32"})
+        self.assertEqual(qargmax["outputs"], {"out": {
+            "tensor": "token_ids", "shape": [1, 2], "dtype": "int32",
+        }})
         self.assertEqual(qargmax["params"], {"axis": -1})
         self.assertEqual(set(optimized_tensors), {"logits_scale", "logits_zero"})
 
-        abi_changes = optimized["source"]["abi_changes"]
-        self.assertEqual(abi_changes[0]["kind"], "input-dtype")
-        self.assertEqual(abi_changes[-1]["kind"], "output-specialization")
-        self.assertEqual(abi_changes[-1]["source"]["name"], "logits")
-        self.assertEqual(abi_changes[-1]["exported"]["name"], "token_ids")
-        self.assertEqual(abi_changes[-1]["exported"]["tie_policy"], "first-index")
-        self.assertEqual(optimized["source"]["package_class"], "w8a8-v1")
-        self.assertEqual(
-            optimized["source"]["quantized_graph_contract"], "w8a8-v1",
-        )
+        self.assertNotIn("source", optimized)
         specialization_run = next(
             run for run in report.runs if run.name == "runtime-output-qargmax"
         )
         self.assertEqual(specialization_run.changes, 1)
         self.assertIn("logits", specialization_run.notes[0])
+
+    def test_output_argmax_preserves_bounded_dynamic_public_abi(self):
+        document, tensors = dequantized_logits_package()
+        document["dimensions"] = {
+            "B": {"min": 1, "max": 4},
+            "T": {"min": 1, "max": 192},
+        }
+        document["inputs"]["logits_byte"]["shape"] = ["B", "T", 4]
+        document["nodes"][0]["outputs"]["out"]["shape"] = ["B", "T", 4]
+
+        optimized, _, report = _optimize_runtime_package(
+            document,
+            tensors,
+            output_argmax=(OutputArgMaxSpecialization("logits", "token_ids"),),
+        )
+
+        self.assertEqual(optimized["dimensions"], document["dimensions"])
+        self.assertEqual(
+            optimized["inputs"]["logits_byte"]["shape"], ["B", "T", 4]
+        )
+        self.assertEqual(optimized["outputs"], ["token_ids"])
+        self.assertEqual(
+            optimized["nodes"][0]["outputs"]["out"]["shape"], ["B", "T"]
+        )
+        specialization = next(
+            run for run in report.runs if run.name == "runtime-output-qargmax"
+        )
+        self.assertFalse(specialization.skipped)
+        # The pipeline is symbolic end to end: a bounded-dynamic package no
+        # longer has to trade optimization for its shape domain, so nothing is
+        # skipped for want of a concrete profile.
+        self.assertEqual([run.name for run in report.runs if run.skipped], [])
 
     def test_output_argmax_is_never_inferred_and_invalid_requests_fail_closed(self):
         document, tensors = dequantized_logits_package()
@@ -353,7 +419,7 @@ class TypedOptimizerTests(unittest.TestCase):
         self.assertEqual(unchanged["outputs"], ["logits"])
         self.assertEqual([node["opType"] for node in unchanged["nodes"]],
                          ["DequantizeLinear"])
-        self.assertEqual(unchanged["source"]["package_class"], "hybrid")
+        self.assertNotIn("source", unchanged)
 
         with self.assertRaisesRegex(Exception, "not a public graph output"):
             optimize_runtime_package(
@@ -413,7 +479,7 @@ class TypedOptimizerTests(unittest.TestCase):
             if run.name == "runtime-packed-qlinear-split"
         )
         self.assertEqual(split_run.changes, 1)
-        self.assertIn("3 exact OUT_IN projections", split_run.notes[0])
+        self.assertIn("3 exact dout_din projections", split_run.notes[0])
 
         op_types = [node["opType"] for node in optimized["nodes"]]
         self.assertEqual(op_types.count("QLinear"), 3)
@@ -432,11 +498,11 @@ class TypedOptimizerTests(unittest.TestCase):
             if node["opType"] == "DequantizeLinear"
         }
         add_nodes = {
-            node["outputs"]["out"]: node for node in optimized["nodes"]
+            _output_name(node): node for node in optimized["nodes"]
             if node["opType"] == "Add"
         }
         reshape_nodes = {
-            node["outputs"]["out"]: node for node in optimized["nodes"]
+            _output_name(node): node for node in optimized["nodes"]
             if node["opType"] == "Reshape"
         }
         for group, qlinear in enumerate(qlinear_nodes):
@@ -462,9 +528,10 @@ class TypedOptimizerTests(unittest.TestCase):
                 original_weight_zero[channel_slice],
             )
 
-            byte_name = qlinear["outputs"]["out"]
-            self.assertEqual(qlinear["outputs_shape"], {"out": [2, 2]})
-            self.assertEqual(qlinear["outputs_dtype"], {"out": "uint8"})
+            byte_name = _output_name(qlinear)
+            self.assertEqual(qlinear["outputs"]["out"], {
+                "tensor": byte_name, "shape": [2, 2], "dtype": "uint8",
+            })
             self.assertEqual(quantization[byte_name], {
                 "scheme": "per_tensor",
                 "scale_tensor": "output_scale",
@@ -480,11 +547,11 @@ class TypedOptimizerTests(unittest.TestCase):
                 name for name in add["inputs"].values()
                 if name in optimized_tensors
                 and optimized_tensors[name].dtype == np.dtype(np.float32)
-                and optimized_tensors[name].shape == (2,)
+                and optimized_tensors[name].shape == (2, 2)
             )
             np.testing.assert_array_equal(
                 optimized_tensors[float_bias_name],
-                original_float_bias[channel_slice],
+                original_float_bias[..., channel_slice],
             )
             # The source used bias as Add.a.  Keeping that port order proves
             # this is a post-DQ F32 Add, not an accumulator-domain fold.
@@ -530,22 +597,11 @@ class TypedOptimizerTests(unittest.TestCase):
         first_slice = next(
             node for node in source_slice["nodes"] if node["opType"] == "Slice"
         )
-        # `ends` is an ONNX-source attribute, not part of the canonical runtime
-        # Slice contract.  Even a numerically plausible value must fail closed
-        # instead of being ignored by the proof.
-        first_slice["params"]["ends"] = [2]
-        source_style, _, source_style_report = optimize_runtime_package(
-            source_slice, source_slice_tensors,
-        )
-        source_style_split = next(
-            run for run in source_style_report.runs
-            if run.name == "runtime-packed-qlinear-split"
-        )
-        self.assertEqual(source_style_split.changes, 0)
-        self.assertEqual(
-            [node["opType"] for node in source_style["nodes"]].count("QLinear"),
-            1,
-        )
+        # Closed v1 rejects producer-private Slice fields at package import;
+        # they cannot reach a rewrite proof as silently ignored metadata.
+        first_slice["params"]["legacy_end"] = 2
+        with self.assertRaises(ExporterError):
+            optimize_runtime_package(source_slice, source_slice_tensors)
 
     def test_packed_qlinear_split_is_byte_stable_after_reoptimization(self):
         document, tensors = packed_qlinear_package()
@@ -611,7 +667,7 @@ class TypedOptimizerTests(unittest.TestCase):
                 "z": np.asarray([0], dtype=np.int8),
                 "s2": np.asarray([0.5], dtype=np.float32),
                 "z2": np.asarray([1], dtype=np.int8),
-                "dead_weight": np.asarray([1.0], dtype=np.float32),
+                "dead_weight": np.asarray([1.0, 1.0], dtype=np.float32),
             }.items()
         }
         document, tensors = export_runtime_package(graph, source_tensors)

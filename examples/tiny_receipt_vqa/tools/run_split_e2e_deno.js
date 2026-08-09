@@ -1,11 +1,10 @@
 #!/usr/bin/env -S deno run --allow-read --allow-write --unstable-webgpu
 
 import {
-  Graph,
-  GraphLoader,
-  ReadOnlySafetensorsCache,
+  ModelLoader,
+  Model,
   VolvoxAI,
-} from '../../../dist/0.3.0/volvoxai.js';
+} from '../../../dist/0.4.0/volvoxai.js';
 import {
   requireTinyReceiptPhysicalAdapterIdentity,
   runTinyReceiptSplitE2E,
@@ -126,14 +125,12 @@ async function main() {
   }
   const requiredAdapter = requiredString(options['require-adapter'], '--require-adapter');
   const manifest = packageUrl(options.package);
-  if (options.reference && options['no-reference']) {
-    fail('--reference and --no-reference are mutually exclusive.');
+  if (Boolean(options.reference) === Boolean(options['no-reference'])) {
+    fail('pass exactly one of --reference <v1-oracle> or --no-reference.');
   }
   const reference = options['no-reference']
     ? null
-    : JSON.parse(await Deno.readTextFile(options.reference
-      ? fileUrl(options.reference, '--reference')
-      : new URL('../references/split_int8_e2e_ort_cpu.json', import.meta.url)));
+    : JSON.parse(await Deno.readTextFile(fileUrl(options.reference, '--reference')));
   const gpu = navigator.gpu;
   if (!gpu) fail('WebGPU is unavailable.');
   const originalRequestAdapter = gpu.requestAdapter;
@@ -147,7 +144,7 @@ async function main() {
   let report;
   try {
     report = await runTinyReceiptSplitE2E({
-      api: { Graph, GraphLoader, ReadOnlySafetensorsCache, VolvoxAI },
+      api: { ModelLoader, Model, VolvoxAI },
       backend,
       packageUrl: manifest,
       fetch: fileFetch,

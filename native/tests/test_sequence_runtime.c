@@ -2,8 +2,12 @@
 
 #include "safetensors.h"
 #include "engine_core.h"
+#include "fast_exp.h"
+#include "inference_kernels.h"
 #include "runtime_state.h"
+#include "thread_pool.h"
 
+#include <float.h>
 #include <math.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -467,6 +471,85 @@ static int test_required_onnx_operator_graph(const char* weights_path) {
     return 0;
 }
 
+static int test_slice_unit_step_contiguous_blocks(const char* weights_path) {
+    const char* path = "/tmp/volvox-slice-unit-step-graph.json";
+    const char* graph =
+        "{\"format\":\"volvox-graph/v1\",\"inputs\":{"
+        "\"x\":{\"shape\":[3,4,5],\"dtype\":\"float32\"},"
+        "\"xi\":{\"shape\":[3,4,5],\"dtype\":\"int32\"}},"
+        "\"nodes\":["
+        "{\"opType\":\"Slice\",\"inputs\":{\"input\":\"x\"},"
+        "\"outputs\":{\"out\":\"leading\"},"
+        "\"outputs_shape\":{\"out\":[2,4,5]},"
+        "\"params\":{\"starts\":[1],\"axes\":[0],\"steps\":[1]}},"
+        "{\"opType\":\"Slice\",\"inputs\":{\"input\":\"x\"},"
+        "\"outputs\":{\"out\":\"last_axis\"},"
+        "\"outputs_shape\":{\"out\":[3,4,4]},"
+        "\"params\":{\"starts\":[1],\"axes\":[2],\"steps\":[1]}},"
+        "{\"opType\":\"Slice\",\"inputs\":{\"input\":\"x\"},"
+        "\"outputs\":{\"out\":\"multi_axis\"},"
+        "\"outputs_shape\":{\"out\":[2,3,5]},"
+        "\"params\":{\"starts\":[1,1],\"axes\":[0,1],"
+        "\"steps\":[1,1]}},"
+        "{\"opType\":\"Slice\",\"inputs\":{\"input\":\"xi\"},"
+        "\"outputs\":{\"out\":\"whole_i32\"},"
+        "\"outputs_shape\":{\"out\":[3,4,5]},"
+        "\"outputs_dtype\":{\"out\":\"int32\"},"
+        "\"params\":{\"starts\":[0],\"axes\":[1],\"steps\":[1]}},"
+        "{\"opType\":\"Slice\",\"inputs\":{\"input\":\"xi\"},"
+        "\"outputs\":{\"out\":\"leading_i32\"},"
+        "\"outputs_shape\":{\"out\":[2,4,5]},"
+        "\"outputs_dtype\":{\"out\":\"int32\"},"
+        "\"params\":{\"starts\":[1],\"axes\":[0],\"steps\":[1]}}],"
+        "\"outputs\":[\"leading\",\"last_axis\",\"multi_axis\","
+        "\"whole_i32\",\"leading_i32\"]}";
+    float input[60];
+    int32_t input_i32[60];
+    float leading[40];
+    float last_axis[48];
+    float multi_axis[30];
+    int32_t whole_i32[60];
+    int32_t leading_i32[40];
+    for (int index = 0; index < 60; index++) {
+        input[index] = (float)(index * 3 - 71) / 7.0f;
+        input_i32[index] = index * 17 - 300;
+    }
+
+    CHECK(write_text(path, graph) == 0);
+    CHECK(volvoxai_engine_init(path, weights_path) == 0);
+    CHECK(volvoxai_engine_set_input_raw(
+              "x", VOLVOXAI_DTYPE_F32, input, sizeof(input)) == 0);
+    CHECK(volvoxai_engine_set_input_raw(
+              "xi", VOLVOXAI_DTYPE_I32, input_i32, sizeof(input_i32)) == 0);
+    CHECK(volvoxai_engine_forward() == 0);
+    CHECK(volvoxai_engine_copy_tensor_f32("leading", leading, 40) == 0);
+    CHECK(volvoxai_engine_copy_tensor_f32("last_axis", last_axis, 48) == 0);
+    CHECK(volvoxai_engine_copy_tensor_f32("multi_axis", multi_axis, 30) == 0);
+    CHECK(volvoxai_engine_copy_tensor_raw(
+              "whole_i32", whole_i32, sizeof(whole_i32)) == 0);
+    CHECK(volvoxai_engine_copy_tensor_raw(
+              "leading_i32", leading_i32, sizeof(leading_i32)) == 0);
+
+    CHECK(memcmp(leading, input + 20, sizeof(leading)) == 0);
+    CHECK(memcmp(whole_i32, input_i32, sizeof(whole_i32)) == 0);
+    CHECK(memcmp(leading_i32, input_i32 + 20, sizeof(leading_i32)) == 0);
+    for (int outer = 0; outer < 12; outer++) {
+        CHECK(memcmp(last_axis + outer * 4,
+                     input + outer * 5 + 1, 4 * sizeof(float)) == 0);
+    }
+    for (int first = 0; first < 2; first++) {
+        for (int second = 0; second < 3; second++) {
+            CHECK(memcmp(multi_axis + (first * 3 + second) * 5,
+                         input + ((first + 1) * 4 + second + 1) * 5,
+                         5 * sizeof(float)) == 0);
+        }
+    }
+
+    volvoxai_engine_shutdown();
+    remove(path);
+    return 0;
+}
+
 static int test_split_preserves_declared_output_order(
     const char* weights_path) {
     const char* path = "/tmp/volvox-split-declared-order-graph.json";
@@ -604,6 +687,219 @@ static int test_normalization_shape_contracts(const char* weights_path) {
         CHECK(volvoxai_engine_forward() != 0);
         volvoxai_engine_shutdown();
     }
+    remove(path);
+    return 0;
+}
+
+static void reference_softmax_f32(const float* input, float* output,
+                                  int rows, int width) {
+    for (int row = 0; row < rows; row++) {
+        const float* source = input + (size_t)row * width;
+        float* destination = output + (size_t)row * width;
+        float maximum = source[0];
+        float sum = 0.0f;
+        for (int column = 1; column < width; column++) {
+            if (source[column] > maximum) maximum = source[column];
+        }
+        for (int column = 0; column < width; column++) {
+            destination[column] = accurate_expf(source[column] - maximum);
+            sum += destination[column];
+        }
+        for (int column = 0; column < width; column++) destination[column] /= sum;
+    }
+}
+
+static int test_softmax_numerical_contract(void) {
+    enum { ROWS = 7, WIDTH = 33, SPECIAL_ROWS = 5, SPECIAL_WIDTH = 8 };
+    float input[ROWS * WIDTH];
+    float expected[ROWS * WIDTH];
+    float output[ROWS * WIDTH];
+    float in_place[ROWS * WIDTH];
+    const float special[SPECIAL_ROWS * SPECIAL_WIDTH] = {
+        NAN, 1.0f, -2.0f, 3.0f, 0.0f, -4.0f, 2.0f, 1.0f,
+        1.0f, -2.0f, NAN, 3.0f, 0.0f, -4.0f, 2.0f, 1.0f,
+        1.0f, -2.0f, INFINITY, 3.0f, 0.0f, -4.0f, 2.0f, 1.0f,
+        -INFINITY, -INFINITY, -INFINITY, -INFINITY,
+        -INFINITY, -INFINITY, -INFINITY, -INFINITY,
+        -INFINITY, 0.0f, -1.0f, -2.0f, -3.0f, -4.0f, -5.0f, -6.0f,
+    };
+    float special_expected[SPECIAL_ROWS * SPECIAL_WIDTH];
+    float special_output[SPECIAL_ROWS * SPECIAL_WIDTH];
+
+    for (int index = 0; index < ROWS * WIDTH; index++) {
+        input[index] = (float)((index * 73) % 509 - 254) / 23.0f;
+    }
+    input[0] = FLT_MAX;
+    input[1] = -FLT_MAX;
+    input[WIDTH] = 100.0f;
+    input[WIDTH + 1] = 13.0f;
+    input[WIDTH + 2] = 12.75f;
+    input[WIDTH + 3] = -FLT_MAX;
+    input[WIDTH + 4] = 100.0f;
+    reference_softmax_f32(input, expected, ROWS, WIDTH);
+    vx_set_num_threads(1);
+    softmax_f32(input, output, ROWS, WIDTH);
+    CHECK(memcmp(output, expected, sizeof(output)) == 0);
+    memcpy(in_place, input, sizeof(input));
+    softmax_f32(in_place, in_place, ROWS, WIDTH);
+    CHECK(memcmp(in_place, expected, sizeof(in_place)) == 0);
+
+    reference_softmax_f32(
+        special, special_expected, SPECIAL_ROWS, SPECIAL_WIDTH);
+    softmax_f32(special, special_output, SPECIAL_ROWS, SPECIAL_WIDTH);
+    for (int index = 0; index < SPECIAL_ROWS * SPECIAL_WIDTH; index++) {
+        if (isnan(special_expected[index])) {
+            CHECK(isnan(special_output[index]));
+        } else {
+            CHECK(memcmp(special_output + index, special_expected + index,
+                         sizeof(float)) == 0);
+        }
+    }
+    {
+        double sum = 0.0;
+        CHECK(special_output[4 * SPECIAL_WIDTH] == 0.0f);
+        for (int column = 0; column < SPECIAL_WIDTH; column++) {
+            CHECK(isfinite(special_output[4 * SPECIAL_WIDTH + column]));
+            sum += special_output[4 * SPECIAL_WIDTH + column];
+        }
+        CHECK(fabs(sum - 1.0) < 2.0e-6);
+    }
+    vx_set_num_threads(0);
+    return 0;
+}
+
+static int test_parallel_f32_row_and_batch_parity(const char* weights_path) {
+    enum {
+        BATCHES = 8,
+        M = 128,
+        K = 64,
+        N = 128,
+        SOFTMAX_ROWS = 128,
+        SOFTMAX_WIDTH = 512,
+    };
+    const char* path = "/tmp/volvox-parallel-f32-row-batch-graph.json";
+    const char* graph =
+        "{\"format\":\"volvox-graph/v1\",\"inputs\":{"
+        "\"a\":{\"shape\":[8,128,64],\"dtype\":\"float32\"},"
+        "\"b\":{\"shape\":[1,64,128],\"dtype\":\"float32\"},"
+        "\"scores\":{\"shape\":[128,512],\"dtype\":\"float32\"}},"
+        "\"nodes\":["
+        "{\"opType\":\"BatchMatMul\",\"inputs\":{\"a\":\"a\",\"b\":\"b\"},"
+        "\"outputs\":{\"out\":\"product\"},"
+        "\"outputs_shape\":{\"out\":[8,128,128]}},"
+        "{\"opType\":\"Softmax\",\"inputs\":{\"input\":\"scores\"},"
+        "\"outputs\":{\"out\":\"probabilities\"},"
+        "\"outputs_shape\":{\"out\":[128,512]},\"params\":{\"axis\":-1}},"
+        "{\"opType\":\"LogSoftmax\",\"inputs\":{\"input\":\"scores\"},"
+        "\"outputs\":{\"out\":\"log_probabilities\"},"
+        "\"outputs_shape\":{\"out\":[128,512]},\"params\":{\"axis\":-1}}],"
+        "\"outputs\":[\"product\",\"probabilities\",\"log_probabilities\"]}";
+    const size_t a_count = (size_t)BATCHES * M * K;
+    const size_t b_count = (size_t)K * N;
+    const size_t product_count = (size_t)BATCHES * M * N;
+    const size_t scores_count = (size_t)SOFTMAX_ROWS * SOFTMAX_WIDTH;
+    float* a = (float*)malloc(a_count * sizeof(float));
+    float* b = (float*)malloc(b_count * sizeof(float));
+    float* scores = (float*)malloc(scores_count * sizeof(float));
+    float* product_1t = (float*)malloc(product_count * sizeof(float));
+    float* product_6t = (float*)malloc(product_count * sizeof(float));
+    float* probabilities_1t = (float*)malloc(scores_count * sizeof(float));
+    float* probabilities_6t = (float*)malloc(scores_count * sizeof(float));
+    float* log_probabilities_1t = (float*)malloc(scores_count * sizeof(float));
+    float* log_probabilities_6t = (float*)malloc(scores_count * sizeof(float));
+    VolvoxAIEngineOptions options = {
+        .backend = VOLVOXAI_BACKEND_CPU,
+        .debug = 0,
+        .cpu_threads = 1,
+    };
+
+    CHECK(a && b && scores && product_1t && product_6t && probabilities_1t &&
+          probabilities_6t && log_probabilities_1t && log_probabilities_6t);
+    for (size_t index = 0; index < a_count; index++)
+        a[index] = (float)((int)(index * 17u % 97u) - 48) / 64.0f;
+    for (size_t index = 0; index < b_count; index++)
+        b[index] = (float)((int)(index * 29u % 89u) - 44) / 57.0f;
+    for (size_t index = 0; index < scores_count; index++)
+        scores[index] = (float)((int)(index * 13u % 101u) - 50) / 19.0f;
+
+    CHECK(write_text(path, graph) == 0);
+    CHECK(volvoxai_engine_configure(&options) == 0);
+    CHECK(volvoxai_engine_init(path, weights_path) == 0);
+    CHECK(volvoxai_engine_set_input_raw(
+              "a", VOLVOXAI_DTYPE_F32, a, a_count * sizeof(float)) == 0);
+    CHECK(volvoxai_engine_set_input_raw(
+              "b", VOLVOXAI_DTYPE_F32, b, b_count * sizeof(float)) == 0);
+    CHECK(volvoxai_engine_set_input_raw(
+              "scores", VOLVOXAI_DTYPE_F32,
+              scores, scores_count * sizeof(float)) == 0);
+
+    /* Exercise the parallel path first in this process. This keeps a lazy ISA
+     * dispatch cache from being accidentally warmed by the serial reference
+     * and covers the owner-thread preparation required before pool dispatch. */
+    vx_set_num_threads(6);
+    CHECK(vx_kernels_thread_count() == 6);
+    CHECK(volvoxai_engine_forward() == 0);
+    CHECK(volvoxai_engine_copy_tensor_f32(
+              "product", product_6t, (long)product_count) == 0);
+    CHECK(volvoxai_engine_copy_tensor_f32(
+              "probabilities", probabilities_6t, (long)scores_count) == 0);
+    CHECK(volvoxai_engine_copy_tensor_f32(
+              "log_probabilities", log_probabilities_6t,
+              (long)scores_count) == 0);
+
+    vx_set_num_threads(1);
+    CHECK(vx_kernels_thread_count() == 1);
+    CHECK(volvoxai_engine_forward() == 0);
+    CHECK(volvoxai_engine_copy_tensor_f32(
+              "product", product_1t, (long)product_count) == 0);
+    CHECK(volvoxai_engine_copy_tensor_f32(
+              "probabilities", probabilities_1t, (long)scores_count) == 0);
+    CHECK(volvoxai_engine_copy_tensor_f32(
+              "log_probabilities", log_probabilities_1t,
+              (long)scores_count) == 0);
+
+    CHECK(memcmp(product_1t, product_6t,
+                 product_count * sizeof(float)) == 0);
+    CHECK(memcmp(probabilities_1t, probabilities_6t,
+                 scores_count * sizeof(float)) == 0);
+    CHECK(memcmp(log_probabilities_1t, log_probabilities_6t,
+                 scores_count * sizeof(float)) == 0);
+    for (int batch = 0; batch < BATCHES; batch++) {
+        for (int row = 0; row < M; row += 31) {
+            for (int column = 0; column < N; column += 29) {
+                float expected = 0.0f;
+                for (int inner = 0; inner < K; inner++) {
+                    expected += a[((size_t)batch * M + row) * K + inner] *
+                        b[(size_t)inner * N + column];
+                }
+                CHECK(closef(product_1t[
+                    ((size_t)batch * M + row) * N + column], expected));
+            }
+        }
+    }
+    for (int row = 0; row < SOFTMAX_ROWS; row++) {
+        double probability_sum = 0.0;
+        double log_probability_sum = 0.0;
+        for (int column = 0; column < SOFTMAX_WIDTH; column++) {
+            size_t index = (size_t)row * SOFTMAX_WIDTH + column;
+            probability_sum += probabilities_1t[index];
+            log_probability_sum += exp((double)log_probabilities_1t[index]);
+        }
+        CHECK(fabs(probability_sum - 1.0) < 2.0e-5);
+        CHECK(fabs(log_probability_sum - 1.0) < 2.0e-5);
+    }
+
+    vx_set_num_threads(0);
+    volvoxai_engine_shutdown();
+    free(log_probabilities_6t);
+    free(log_probabilities_1t);
+    free(probabilities_6t);
+    free(probabilities_1t);
+    free(product_6t);
+    free(product_1t);
+    free(scores);
+    free(b);
+    free(a);
     remove(path);
     return 0;
 }
@@ -759,7 +1055,10 @@ int main(void) {
     CHECK(test_graph_contract_validation(weights_path) == 0);
     CHECK(test_inputs_have_no_name_based_defaults(weights_path) == 0);
     CHECK(test_argmax_f32_to_i32(weights_path) == 0);
+    CHECK(test_softmax_numerical_contract() == 0);
+    CHECK(test_parallel_f32_row_and_batch_parity(weights_path) == 0);
     CHECK(test_required_onnx_operator_graph(weights_path) == 0);
+    CHECK(test_slice_unit_step_contiguous_blocks(weights_path) == 0);
     CHECK(test_split_preserves_declared_output_order(weights_path) == 0);
     CHECK(test_consumed_graph_output_survives_arena_reuse(weights_path) == 0);
     CHECK(test_normalization_shape_contracts(weights_path) == 0);

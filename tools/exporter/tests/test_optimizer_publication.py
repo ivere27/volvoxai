@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import contextlib
+import copy
 import importlib
 import io
 import json
@@ -22,6 +23,27 @@ from tools.exporter.optimizer.safetensors_io import (
 optimizer_main = importlib.import_module("tools.exporter.optimizer.__main__")
 
 
+def _dynamic_v1(document):
+    result = copy.deepcopy(document)
+    result["dimensions"] = {}
+    for node in result.get("nodes", []):
+        outputs = node.get("outputs", {})
+        shapes = node.pop("outputs_shape", {})
+        dtypes = node.pop("outputs_dtype", {})
+        node["outputs"] = {
+            port: {
+                "tensor": tensor,
+                "shape": shapes[port],
+                "dtype": dtypes[port],
+            }
+            for port, tensor in outputs.items()
+        }
+        node.setdefault("params", {})
+        if node.get("opType") in {"Reshape", "Expand"}:
+            node["params"].setdefault("shape", copy.deepcopy(shapes["out"]))
+    return result
+
+
 class OptimizerCliPublicationTests(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory(
@@ -33,12 +55,12 @@ class OptimizerCliPublicationTests(unittest.TestCase):
         self.output_graph = self.root / "output.graph.json"
         self.output_weights = self.root / "output.safetensors"
         self.source_graph.write_text(
-            json.dumps({
+            json.dumps(_dynamic_v1({
                 "format": "volvox-graph/v1",
                 "inputs": {"x": {"shape": [1], "dtype": "float32"}},
                 "nodes": [],
                 "outputs": ["x"],
-            }),
+            })),
             encoding="utf-8",
         )
         write_safetensors(self.source_weights, {})
@@ -57,6 +79,7 @@ class OptimizerCliPublicationTests(unittest.TestCase):
             str(self.source_graph),
             "--weights",
             str(self.source_weights),
+            "--concrete-profile",
         ]
         if in_place:
             argv.append("--in-place")
@@ -77,6 +100,36 @@ class OptimizerCliPublicationTests(unittest.TestCase):
     def assert_no_staging(self):
         self.assertEqual(list(self.root.glob(".*.publish-*")), [])
 
+    def test_staged_validation_supplies_the_canonical_dynamic_domain_proof(self):
+        document = {"format": "volvox-graph/v1"}
+        weights = {"payload": object()}
+        proof = object()
+        with (
+            mock.patch.object(
+                optimizer_main,
+                "load_runtime_document",
+                return_value=document,
+            ),
+            mock.patch.object(
+                optimizer_main,
+                "prove_dynamic_quantized_runtime_domain",
+                return_value=proof,
+            ) as prove,
+            mock.patch.object(optimizer_main, "import_runtime_package") as load,
+        ):
+            optimizer_main._validate_staged_runtime_package(
+                self.output_graph,
+                weights,
+            )
+
+        prove.assert_called_once_with(document, weights)
+        load.assert_called_once_with(
+            document,
+            weights,
+            source_name=str(self.output_graph),
+            bounded_domain_proof=proof,
+        )
+
     def test_success_reloads_and_publishes_complete_staged_package(self):
         self.assertEqual(self.run_optimizer(), 0)
         document = json.loads(self.output_graph.read_text(encoding="utf-8"))
@@ -84,9 +137,33 @@ class OptimizerCliPublicationTests(unittest.TestCase):
         self.assertEqual(read_safetensors(self.output_weights), {})
         self.assert_no_staging()
 
+    def test_quantized_bias_folding_cli_selects_only_the_narrow_feature(self):
+        report_path = self.root / "bias-folding-report.json"
+        self.assertEqual(self.run_optimizer(extra=(
+            "--allow-quantized-bias-folding-migration",
+            "--report",
+            str(report_path),
+        )), 0)
+
+        report = json.loads(report_path.read_text(encoding="utf-8"))
+        recipe = report["pipeline"]["recipe"]
+        self.assertEqual(
+            recipe["selection_features"],
+            ["quantized-bias-folding"],
+        )
+        self.assertIn(
+            "runtime-quantized-bias-folding",
+            recipe["passes"],
+        )
+        self.assertNotIn(
+            "runtime-static-qdq-compute-fusion",
+            recipe["passes"],
+        )
+        self.assertNotIn("runtime-silu-fusion", recipe["passes"])
+
     def test_in_place_replaces_the_graph_and_weights_as_one_package(self):
         self.source_graph.write_text(
-            json.dumps({
+            json.dumps(_dynamic_v1({
                 "format": "volvox-graph/v1",
                 "inputs": {"x": {"shape": [2, 3], "dtype": "float32"}},
                 "nodes": [
@@ -119,7 +196,7 @@ class OptimizerCliPublicationTests(unittest.TestCase):
                     },
                 ],
                 "outputs": ["y"],
-            }),
+            })),
             encoding="utf-8",
         )
         before_graph = self.source_graph.read_bytes()
@@ -224,11 +301,12 @@ class OptimizerCliPublicationTests(unittest.TestCase):
     def test_malformed_float_operator_never_publishes(self):
         document = json.loads(self.source_graph.read_text(encoding="utf-8"))
         document["nodes"] = [{
+            "id": "malformed-conv",
             "opType": "Conv2D",
             "inputs": {"input": "x"},
-            "outputs": {"out": "y"},
-            "outputs_shape": {"out": [1]},
-            "outputs_dtype": {"out": "float32"},
+            "outputs": {"out": {
+                "tensor": "y", "shape": [1], "dtype": "float32",
+            }},
             "params": {},
         }]
         document["outputs"] = ["y"]
@@ -376,7 +454,7 @@ class OptimizerCliPublicationTests(unittest.TestCase):
 
     def test_compile_and_tune_axes_only_change_derived_plan_and_report(self):
         self.source_graph.write_text(
-            json.dumps({
+            json.dumps(_dynamic_v1({
                 "format": "volvox-graph/v1",
                 "inputs": {"x": {"shape": [2, 3], "dtype": "float32"}},
                 "nodes": [
@@ -409,7 +487,7 @@ class OptimizerCliPublicationTests(unittest.TestCase):
                     },
                 ],
                 "outputs": ["y"],
-            }),
+            })),
             encoding="utf-8",
         )
 
@@ -430,6 +508,7 @@ class OptimizerCliPublicationTests(unittest.TestCase):
                 str(self.source_graph),
                 "--weights",
                 str(self.source_weights),
+                "--concrete-profile",
                 "--out",
                 str(graph),
                 "--out-weights",

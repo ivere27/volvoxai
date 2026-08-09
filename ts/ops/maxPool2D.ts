@@ -1,76 +1,120 @@
-import { assertRawQuantizedShapeTensors } from './quantizedShape.js';
+import {
+  assertShapeKernelOutput,
+  assertShapeKernelParams,
+  assertShapeKernelTensor,
+} from './shapeKernelValidation.js';
+import {
+  assertCanonicalLayout,
+  assertDistinctOutputStorage,
+  assertFalseOrAbsent,
+  checkedWindowOutput,
+  fullSpatialPads,
+  spatialKernelPorts,
+  spatialPair,
+} from './spatialKernelValidation.js';
 
-function pairParameter(value, fallback) {
-  const values = Array.isArray(value) ? value : [value ?? fallback];
-  return [values[0], values[1] ?? values[0]];
-}
-
-function falseOrAbsent(value) {
-  return value == null || value === false || value === 0;
-}
-
-// MaxPool preserves integer ordering when its I8/U8 descriptor is unchanged.
-// Keep that typed path deliberately narrow so CPU, WASM, and WebGPU all use
-// the same floor-window, unit-dilation NHWC semantics.
+// MaxPool preserves integer ordering when its per-tensor I8/U8 descriptor is
+// unchanged. The canonical path deliberately excludes dilated and ceil-mode
+// windows so every backend implements one floor-window NHWC contract.
 export function _cpuMaxPool2D(node) {
-  const input = node.inputs.input || node.inputs.x || node.inputs.data;
-  const output = node.outputs.out || Object.values(node.outputs || {})[0];
-  const [n, h, w, c] = input.shape;
-  const params = node.params || {};
-  const [ky, kx] = pairParameter(params.kernel, 1);
-  const [sy, sx] = pairParameter(params.stride, 1);
-  const [defaultPadY, defaultPadX] = pairParameter(params.padding, 0);
-  let padY = defaultPadY;
-  let padX = defaultPadX;
-  const outH = output.shape[1];
-  const outW = output.shape[2];
-  const inBuf = input.buffer;
-  const outBuf = output.buffer;
-  const quantized = assertRawQuantizedShapeTensors(node, [input, output], 'MaxPool2D');
-
-  if (quantized) {
-    if (!falseOrAbsent(params.ceil_mode)) {
-      throw new Error(`MaxPool2D node ${node.id || '<unnamed>'} does not support ceil_mode for raw I8/U8 storage.`);
-    }
-    if (params.kernel == null || ![ky, kx, sy, sx].every((value) => Number.isInteger(value) && value > 0) ||
-        (params.padding != null && ![defaultPadY, defaultPadX].every((value) => Number.isInteger(value) && value >= 0))) {
-      throw new Error(`MaxPool2D node ${node.id || '<unnamed>'} requires positive kernel/stride and non-negative padding parameters for raw I8/U8 storage.`);
-    }
-    const [dilationY, dilationX] = pairParameter(params.dilation, 1);
-    if (![dilationY, dilationX].every((value) => Number.isInteger(value) && value === 1)) {
-      throw new Error(`MaxPool2D node ${node.id || '<unnamed>'} supports raw I8/U8 storage only with unit dilation.`);
-    }
-    const pads = params.pads ?? [defaultPadY, defaultPadX, defaultPadY, defaultPadX];
-    if (!Array.isArray(pads) || pads.length !== 4 ||
-        !pads.every((value) => Number.isInteger(value) && value >= 0) ||
-        input.shape.length !== 4 || output.shape.length !== 4 ||
-        input.shape[0] !== output.shape[0] || input.shape[3] !== output.shape[3]) {
-      throw new Error(`MaxPool2D node ${node.id || '<unnamed>'} requires canonical rank-4 NHWC I8/U8 tensors and non-negative top/left/bottom/right pads.`);
-    }
-    const expectedHeight = Math.floor((h + pads[0] + pads[2] - ky) / sy) + 1;
-    const expectedWidth = Math.floor((w + pads[1] + pads[3] - kx) / sx) + 1;
-    if (outH !== expectedHeight || outW !== expectedWidth) {
-      throw new Error(`MaxPool2D node ${node.id || '<unnamed>'} output shape is incompatible with canonical raw I8/U8 parameters.`);
-    }
-    [padY, padX] = pads;
+  const operation = 'MaxPool2D';
+  const ports = spatialKernelPorts(
+    node,
+    [['input', 'x', 'data']],
+    [],
+    operation,
+  );
+  const input = ports.inputs[0];
+  const output = ports.output;
+  assertShapeKernelTensor(input, `${operation} input`, {
+    dtypes: ['float32', 'int8', 'uint8'], minimumRank: 4, maximumRank: 4,
+  });
+  const params = assertShapeKernelParams(
+    node,
+    ['kernel', 'stride', 'padding', 'pads', 'dilation', 'ceil_mode', 'data_layout'],
+    operation,
+  );
+  assertCanonicalLayout(params.data_layout, 'NHWC', operation, 'data_layout');
+  assertFalseOrAbsent(params.ceil_mode, operation, 'ceil_mode');
+  const [kernelY, kernelX] = spatialPair(
+    params.kernel,
+    1,
+    operation,
+    'kernel',
+    false,
+    true,
+  );
+  const [strideY, strideX] = spatialPair(params.stride, 1, operation, 'stride', false);
+  const [dilationY, dilationX] = spatialPair(
+    params.dilation,
+    1,
+    operation,
+    'dilation',
+    false,
+  );
+  if (dilationY !== 1 || dilationX !== 1) {
+    throw new Error(`${operation} supports only unit dilation.`);
+  }
+  const pads = fullSpatialPads(params, operation);
+  if ((input.dtype === 'int8' || input.dtype === 'uint8') &&
+      input.quantization?.scheme !== 'per_tensor') {
+    throw new Error(`${operation} raw byte storage requires per-tensor quantization.`);
   }
 
-  for (let b = 0; b < n; b++) {
-    for (let oy = 0; oy < outH; oy++) {
-      for (let ox = 0; ox < outW; ox++) {
-        for (let ch = 0; ch < c; ch++) {
+  const [batch, inputHeight, inputWidth, channels] = input.shape;
+  const outputHeight = checkedWindowOutput(
+    inputHeight,
+    kernelY,
+    strideY,
+    pads[0],
+    pads[2],
+    1,
+    `${operation} output height`,
+  );
+  const outputWidth = checkedWindowOutput(
+    inputWidth,
+    kernelX,
+    strideX,
+    pads[1],
+    pads[3],
+    1,
+    `${operation} output width`,
+  );
+  assertShapeKernelOutput(
+    output,
+    [batch, outputHeight, outputWidth, channels],
+    input.dtype,
+    input.quantization,
+    operation,
+  );
+  assertDistinctOutputStorage(output, [input], operation);
+
+  const inputBuffer = input.buffer;
+  const outputBuffer = output.buffer;
+  const quantized = input.dtype === 'int8' || input.dtype === 'uint8';
+  for (let batchIndex = 0; batchIndex < batch; batchIndex++) {
+    for (let outputY = 0; outputY < outputHeight; outputY++) {
+      for (let outputX = 0; outputX < outputWidth; outputX++) {
+        for (let channel = 0; channel < channels; channel++) {
           let best = quantized ? (input.dtype === 'int8' ? -128 : 0) : -Infinity;
-          for (let dy = 0; dy < ky; dy++) {
-            for (let dx = 0; dx < kx; dx++) {
-              const ih = oy * sy + dy - padY;
-              const iw = ox * sx + dx - padX;
-              if (ih >= 0 && ih < h && iw >= 0 && iw < w) {
-                const value = inBuf[((b * h + ih) * w + iw) * c + ch];
+          for (let kernelOffsetY = 0; kernelOffsetY < kernelY; kernelOffsetY++) {
+            for (let kernelOffsetX = 0; kernelOffsetX < kernelX; kernelOffsetX++) {
+              const inputY = outputY * strideY + kernelOffsetY - pads[0];
+              const inputX = outputX * strideX + kernelOffsetX - pads[1];
+              if (inputY >= 0 && inputY < inputHeight &&
+                  inputX >= 0 && inputX < inputWidth) {
+                const value = inputBuffer[
+                  ((batchIndex * inputHeight + inputY) * inputWidth + inputX) *
+                    channels + channel
+                ];
                 if (value > best) best = value;
               }
             }
           }
-          outBuf[((b * outH + oy) * outW + ox) * c + ch] = best;
+          outputBuffer[
+            ((batchIndex * outputHeight + outputY) * outputWidth + outputX) *
+              channels + channel
+          ] = best;
         }
       }
     }

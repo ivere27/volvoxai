@@ -17,6 +17,12 @@ extern "C" {
  * the cache once through the host OS (sysconf on Linux/Android, sysctl on
  * macOS); WASM and failed/unsupported queries use the conservative 32 KiB
  * fallback. Cache policy is entirely automatic and has no user tuning knob.
+ *
+ * MR and NR are resolved from the ISA, not from the shape.  That distinction
+ * is the point: once both operands are packed the microkernel sees only
+ * contiguous fixed-width panels, so one microkernel per ISA covers every
+ * shape and the number of kernels to write is the number of ISAs rather than
+ * their product with the shapes a particular model happens to use.
  */
 typedef struct {
     uint32_t mr;
@@ -28,6 +34,32 @@ typedef struct {
 } VxGemmF32TileConfig;
 
 VxGemmF32TileConfig vx_gemm_f32_tile_config(void);
+
+/*
+ * Shape-driven execution plan.  Everything the shape decides lives here and is
+ * backend-independent integer arithmetic; everything the ISA decides lives in
+ * the microkernel.  This is the narrow tactic identity the dynamic-shape ADR
+ * separates from the shape signature, computed for one GEMM.
+ *
+ * Two regimes, not a spectrum.  STREAM is m == 1 decode: no reuse exists, the
+ * cost is one pass over B, and blocking cannot improve a memory-bound loop.
+ * BLOCK is everything else, where cache blocking and A packing decide whether
+ * the kernel reaches peak or streams weights from DRAM once per row block.
+ */
+enum { VX_GEMM_F32_REGIME_STREAM = 0, VX_GEMM_F32_REGIME_BLOCK = 1 };
+
+typedef struct {
+    uint32_t mr;      /* microkernel row tile, resolved by ISA            */
+    uint32_t nr;      /* microkernel column tile and packed panel width   */
+    uint32_t mc;      /* A row block; the packed A block targets L2       */
+    uint32_t nc;      /* B column block; bounds how often C is revisited  */
+    uint32_t kc;      /* K block; one B micro-panel targets half of L1    */
+    int regime;
+    int micro;        /* resolved microkernel; zero when the ISA has none   */
+    int blocked;      /* the blocked driver owns this shape                 */
+} VxGemmF32Plan;
+
+VxGemmF32Plan vx_gemm_f32_plan(uint32_t m, uint32_t k, uint32_t n);
 
 /* Return the padded number of F32 elements needed for a packed KxN matrix, or
  * zero if the dimensions are invalid or cannot be represented by this ABI. */

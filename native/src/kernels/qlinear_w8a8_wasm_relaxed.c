@@ -16,9 +16,12 @@
  *       weight_dtype, output_dtype)
  *
  * raw_weight is canonical [d_out,d_in].  packed_weight is the existing V8Q2
- * panel and supplies validated per-output weight sums.  The function returns 1
- * only after writing a complete output row.  It returns 0 without writing any
- * output for unsupported or unsafe descriptors, so the baseline kernel can run.
+ * panel and supplies validated per-output weight sums.  Its widened baseline
+ * SIMD payload is not consumed by this raw-weight child, but is still required
+ * and span/header-validated as part of the shared allocation.  The function
+ * returns 1 only after writing a
+ * complete output row.  It returns 0 without writing any output for unsupported
+ * or unsafe descriptors, so the baseline kernel can run.
  */
 #include <limits.h>
 #include <stddef.h>
@@ -36,6 +39,9 @@ enum {
     VX_RELAXED_Q8_NR = VX_PACKED_Q8_NR,
     VX_RELAXED_I8 = VX_DTYPE_I8,
     VX_RELAXED_U8 = VX_DTYPE_U8,
+    VX_RELAXED_PAIR_SIGNED_I8 = 1u,
+    VX_RELAXED_PAIR_NO_NEG128 = 2u,
+    VX_RELAXED_PAIR_NO_SATURATE = 4u,
 };
 
 static uint32_t vx_relaxed_align16(uint32_t value) {
@@ -63,6 +69,8 @@ static uint32_t vx_relaxed_packed_size(uint32_t d_in, uint32_t d_out) {
     uint64_t sums_bytes;
     uint64_t data_bytes;
     uint64_t data_offset;
+    uint64_t pair_n_blocks;
+    uint64_t pair_k_blocks;
     uint64_t pair_data_offset;
     uint64_t total;
     if (!d_in || !d_out || d_in > (uint32_t)(INT32_MAX / 255)) return 0;
@@ -72,9 +80,9 @@ static uint32_t vx_relaxed_packed_size(uint32_t d_in, uint32_t d_out) {
     data_offset = ((uint64_t)sizeof(VxPackedQ8Header) + sums_bytes + 15u) &
         ~(uint64_t)15u;
     pair_data_offset = (data_offset + data_bytes + 15u) & ~(uint64_t)15u;
-    /* The wasm parent has no native AVX2 pair payload, but V8Q2 still records
-     * its aligned offset as the end of the allocation. */
-    total = pair_data_offset;
+    pair_n_blocks = n_blocks;
+    pair_k_blocks = ((uint64_t)d_in + 1u) / 2u;
+    total = pair_data_offset + pair_n_blocks * pair_k_blocks * 32u;
     return total <= UINT32_MAX ? (uint32_t)total : 0u;
 }
 
@@ -86,6 +94,8 @@ static const VxPackedQ8Header* vx_relaxed_validate_packed(
     uint32_t n_blocks;
     uint32_t sums_offset;
     uint32_t data_offset;
+    uint32_t pair_n_blocks;
+    uint32_t pair_k_blocks;
     uint32_t pair_data_offset;
     if (!expected || !vx_relaxed_span_valid(packed, expected, memory_bytes))
         return NULL;
@@ -95,13 +105,27 @@ static const VxPackedQ8Header* vx_relaxed_validate_packed(
         n_blocks * VX_RELAXED_Q8_NR * (uint32_t)sizeof(int32_t));
     pair_data_offset = vx_relaxed_align16(data_offset +
         n_blocks * d_in * VX_RELAXED_Q8_NR);
+    pair_n_blocks = n_blocks;
+    pair_k_blocks = (d_in + 1u) / 2u;
     if (header->magic != VX_PACKED_Q8_MAGIC || header->bytes != expected ||
         header->d_in != d_in || header->d_out != d_out ||
         header->n_blocks != n_blocks || header->weight_dtype != weight_dtype ||
         header->sums_offset != sums_offset || header->data_offset != data_offset ||
-        header->pair_n_blocks != 0u || header->pair_k_blocks != 0u ||
+        header->pair_n_blocks != pair_n_blocks ||
+        header->pair_k_blocks != pair_k_blocks ||
         header->pair_data_offset != pair_data_offset ||
-        header->pair_flags != 0u || pair_data_offset != expected)
+        (header->pair_flags & ~(VX_RELAXED_PAIR_SIGNED_I8 |
+                                VX_RELAXED_PAIR_NO_NEG128 |
+                                VX_RELAXED_PAIR_NO_SATURATE)) != 0u ||
+        ((header->pair_flags & VX_RELAXED_PAIR_NO_NEG128) &&
+         !(header->pair_flags & VX_RELAXED_PAIR_SIGNED_I8)) ||
+        ((header->pair_flags & VX_RELAXED_PAIR_NO_SATURATE) &&
+         !(header->pair_flags & VX_RELAXED_PAIR_NO_NEG128)) ||
+        (weight_dtype == VX_RELAXED_I8
+            ? !(header->pair_flags & VX_RELAXED_PAIR_SIGNED_I8)
+            : header->pair_flags != 0u) ||
+        (uint64_t)pair_data_offset +
+            (uint64_t)pair_n_blocks * pair_k_blocks * 32u != expected)
         return NULL;
     return header;
 }

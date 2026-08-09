@@ -1,17 +1,28 @@
+import {
+  assertShapeKernelOutput,
+  assertShapeKernelTensor,
+} from './shapeKernelValidation.js';
+
 export function _cpuInterp1D(node) {
 
-    const input = node.inputs.input;
-    const output = node.outputs.out;
+    const input = node.inputs?.input;
+    const output = node.outputs?.out;
+    assertShapeKernelTensor(input, 'Interpolate1D input', {
+      dtypes: ['float32'], minimumRank: 3, maximumRank: 3,
+    });
     const [batch, c, in_l] = input.shape;
-    const out_l = node.params.size;
+    const out_l = node.params?.size;
+    if (!Number.isSafeInteger(out_l) || out_l <= 0) {
+      throw new Error('Interpolate1D size must be a positive safe integer.');
+    }
+    assertShapeKernelOutput(
+      output, [batch, c, out_l], 'float32', undefined, 'Interpolate1D',
+    );
     const inBuf = input.buffer;
     const outBuf = output.buffer;
     // Half-pixel (align_corners=false) mapping, matching interp1d_f32 and the
     // WebGPU shader (PyTorch F.interpolate default).
     const scale = in_l / out_l;
-    if (output.shape.length !== 3 || output.shape[0] !== batch || output.shape[1] !== c || output.shape[2] !== out_l) {
-      throw new Error('Interpolate1D requires matching rank-3 NCL input/output tensors.');
-    }
     for (let b = 0; b < batch; b++) for (let ch = 0; ch < c; ch++) {
       for (let x = 0; x < out_l; x++) {
         let pos = (x + 0.5) * scale - 0.5;

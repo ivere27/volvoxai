@@ -10,7 +10,6 @@
         build_native test_native test_native_all test_all test_js test_exporter \
         verify_native_isa benchmark_native test_native_gpu clean_native \
         build_native_task_cli test_native_task_cli \
-        build_tiny_receipt_native_example test_tiny_receipt_native_example \
         build_tiny_receipt_split_native_example test_tiny_receipt_split_native_example \
         build_wasm test_wasm_relaxed_simd benchmark_wasm_w8a8_seed \
         benchmark_wasm_qbatch_matmul build_web \
@@ -18,7 +17,8 @@
         parity parity_native_gpu parity_webgpu parity_webgpu_matrix \
         parity_native_gpu_matrix parity_gpu_consensus parity_backward \
         parity_decode parity_kvcache parity_kvcache_webgpu parity_goldens \
-        parity_ops parity_graphs parity_coverage parity_image parity_gpu_required \
+        parity_ops parity_graphs parity_portable parity_portable_webgpu \
+        parity_coverage parity_image parity_gpu_required \
         models models_efficientdet models_tinystories models_deps models_clean \
         validate_model_packages \
         proto_codegen_fetch proto_codegen proto_codegen_check \
@@ -75,13 +75,12 @@ help:
 	@echo "    test_native_gpu     configured GPU tests (needs a real device)"
 	@echo "  Opt-in native example binaries (-> examples/target/bin/):"
 	@echo "    build_native_task_cli  volvoxai-tasks (generate/detect/classify/...)"
-	@echo "    build_tiny_receipt_native_example  tiny_receipt_w8a8"
 	@echo "    build_tiny_receipt_split_native_example  tiny_receipt_split_w8a8"
 	@echo "  Full suite:"
 	@echo "    test_js             JS/TS unit suite (npm test)"
 	@echo "    test_exporter       hermetic exporter contract tests"
 	@echo "    test_all            test_js + test_native_all"
-	@echo "    parity_gpu_required fail-closed physical RTX parity campaign"
+	@echo "    parity_gpu_required fail-closed physical WebGPU + native capability campaign"
 	@echo "  Web / FFI / models:"
 	@echo "    build_wasm build_web publish_npm  build_ffi  models"
 	@echo "    benchmark_wasm_qbatch_matmul  compare scalar/SIMD128 QBatchMatMul"
@@ -122,7 +121,8 @@ test_native_all: build_native
 	$(DOCKER_RUN) ctest --test-dir $(CMAKE_BUILD_DIR) -L 'native|example' --output-on-failure
 
 verify_native_isa: build_native
-	$(DOCKER_RUN) ctest --test-dir $(CMAKE_BUILD_DIR) -L verify --output-on-failure
+	$(DOCKER_RUN) env CLANG="$(WASM_CC)" \
+		ctest --test-dir $(CMAKE_BUILD_DIR) -L verify --output-on-failure
 
 benchmark_native: build_native
 	$(DOCKER_RUN) ctest --test-dir $(CMAKE_BUILD_DIR) -L benchmark --output-on-failure
@@ -155,20 +155,6 @@ build_native_task_cli: build_docker
 test_native_task_cli: build_native_task_cli
 	$(DOCKER_RUN) ctest --test-dir $(CMAKE_BUILD_DIR) -R '^test_native_task_cli$$' --output-on-failure
 
-build_tiny_receipt_native_example: build_docker
-	$(DOCKER_RUN) bash -c 'set -e; \
-		cmake -S . -B $(CMAKE_BUILD_DIR) $(CMAKE_CONFIG); \
-		cmake --build $(CMAKE_BUILD_DIR) --target tiny_receipt_w8a8 test_tiny_receipt_w8a8 -j"$$(nproc)"; \
-		mkdir -p $(EXAMPLES_BIN_DIR); \
-		cp $(CMAKE_BUILD_DIR)/native/tiny_receipt_w8a8 $(EXAMPLES_BIN_DIR)/tiny_receipt_w8a8; \
-		cp $(CMAKE_BUILD_DIR)/native/test_tiny_receipt_w8a8 $(EXAMPLES_BIN_DIR)/test_tiny_receipt_w8a8; \
-		chown -R $(HOST_UID):$(HOST_GID) $(CMAKE_BUILD_DIR) native/shaders \
-			$(EXAMPLES_BIN_DIR) 2>/dev/null || true'
-	@echo "Built $(EXAMPLES_BIN_DIR)/tiny_receipt_w8a8"
-
-test_tiny_receipt_native_example: build_tiny_receipt_native_example
-	$(DOCKER_RUN) ctest --test-dir $(CMAKE_BUILD_DIR) -R '^test_tiny_receipt_native_example$$' --output-on-failure
-
 build_tiny_receipt_split_native_example: build_docker
 	$(DOCKER_RUN) bash -c 'set -e; \
 		cmake -S . -B $(CMAKE_BUILD_DIR) $(CMAKE_CONFIG); \
@@ -191,12 +177,8 @@ test_js:
 # installed ONNX/SafeTensors dependencies enable the frontend fixture suite.
 test_exporter:
 	PYTHONDONTWRITEBYTECODE=1 $(PY) -m unittest discover -s tools/exporter/tests -p 'test_*.py'
-	PYTHONDONTWRITEBYTECODE=1 $(PY) -m unittest \
-		examples.tiny_receipt_vqa.tests.test_make_calibration_records \
-		examples.tiny_receipt_vqa.tests.test_import_hf_split_onnx \
-		examples.tiny_receipt_vqa.tests.test_assemble_onnx_suite \
-		examples.tiny_receipt_vqa.tests.test_generate_split_onnx_e2e_reference \
-		examples.tiny_receipt_vqa.tests.test_run_native_split_e2e
+	PYTHONDONTWRITEBYTECODE=1 $(PY) -m unittest discover \
+		-s examples/tiny_receipt_vqa/tests -p 'test_*.py'
 
 # Full portable regression: exporter contracts + JS suite + native suite.
 test_all: test_exporter test_js test_native_all
@@ -219,10 +201,14 @@ parity:
 	node tests/parity/run.mjs external-sig
 	node tests/parity/run.mjs compare
 
-# Best-effort GPU tiers (need a Vulkan/OpenGL loader); never gate CI on these.
+# Audit the currently declared native Vulkan/OpenGL whole-model capability. A
+# policy-authorized compile rejection is accepted only with sealed registry,
+# model, campaign, physical-adapter, and exact-reason evidence. Any registry
+# promotion invalidates the skip and requires deliberate promotion of this
+# producer and policy to required numerical execution.
 parity_native_gpu:
-	-bash tests/parity/produce_native.sh native-vulkan
-	-bash tests/parity/produce_native.sh native-opengl
+	bash tests/parity/produce_native.sh native-vulkan
+	bash tests/parity/produce_native.sh native-opengl
 	node tests/parity/run.mjs native-sig native-vulkan native-opengl
 	node tests/parity/run.mjs compare
 
@@ -250,10 +236,9 @@ parity_webgpu_matrix:
 	node tests/parity/run.mjs opmatrix-compare
 	node tests/parity/run.mjs graphmatrix-compare
 
-# Native-GPU L1/L2 matrix producer: runs every authored op/graph package through the
-# native binary with --vulkan and --opengl, emitting <id>.native-vulkan.json /
-# <id>.native-opengl.json beside the other tiers. Run on a box with the GPU loaders
-# after `make parity_ops`/`parity_graphs` authored the packages.
+# Future/manual native-GPU L1/L2 execution qualification. This target requires
+# exporter-qualified public Vulkan/OpenGL routes; it is intentionally not part
+# of parity_gpu_required while those generated registry sets are empty.
 parity_native_gpu_matrix:
 	set -e; for be in "native-vulkan --vulkan" "native-opengl --opengl"; do set -- $$be; \
 	  node tests/parity/run.mjs matrix-begin ops $$1; \
@@ -266,10 +251,11 @@ parity_native_gpu_matrix:
 	node tests/parity/run.mjs opmatrix-compare
 	node tests/parity/run.mjs graphmatrix-compare
 
-# EfficientDet GPU consensus gate: webgpu (Deno) == native OpenGL == native Vulkan,
-# bit-identical for int8 and ~1e-6 for fp32. The correct gate for the true-int8 GPU
-# tier (which can't be gated against the folded-fp32 CPU oracle). Needs a GPU box +
-# the native binary. Override DENO=/NODE= if not on PATH.
+# Future/manual EfficientDet GPU consensus diagnostic: webgpu (Deno) versus
+# qualified native OpenGL and Vulkan, bit-identical for int8 and ~1e-6 for
+# fp32. It is not release evidence until both native public routes complete
+# bounded-domain/exporter qualification and the script seals their lifecycle
+# no-fallback reports. Override DENO=/NODE= if needed.
 parity_gpu_consensus:
 	DENO=$(DENO) bash tests/parity/gpu_consensus_check.sh
 
@@ -302,11 +288,12 @@ parity_kvcache_webgpu:
 	$(DENO) run --unstable-webgpu --allow-read --allow-write --allow-env --allow-ffi tests/parity/kvcache/kvcache_parity.mjs cpu wasm webgpu
 	node tests/parity/kvcache/kvcache_parity.mjs compare cpu wasm webgpu
 
-# One fail-closed physical-GPU campaign for protected self-hosted CI. This is a
-# sequential recipe rather than parallel prerequisites because L1/L2 authorship
-# invalidates every previous matrix import. Every selected L3 GPU job is required;
-# L1/L2 accept only the skips declared in their case policy. The final verifier
-# revalidates current fingerprints/artifact hashes and seals a compact summary.
+# One fail-closed dynamic-v1 hardware campaign for protected self-hosted CI. It
+# requires physical WebGPU whole-model, L1/L2, portable-closure, and KV-cache
+# execution. Native Vulkan/OpenGL are capability probes until their public routes
+# are qualified: only the exact policy/registry-backed compile rejection is
+# accepted, and it is reported separately from executed parity. Native matrices
+# and cross-GPU consensus remain future/manual qualification targets.
 parity_gpu_required:
 	node tests/parity/run.mjs gpu-begin
 	$(MAKE) parity
@@ -316,11 +303,10 @@ parity_gpu_required:
 	$(DENO) run --unstable-webgpu --allow-read --allow-write --allow-env --allow-ffi --allow-run=git tests/parity/webgpu_deno.js
 	bash tests/parity/produce_native.sh native-vulkan
 	bash tests/parity/produce_native.sh native-opengl
-	node tests/parity/run.mjs native-sig --required native-vulkan native-opengl
+	node tests/parity/run.mjs native-sig native-vulkan native-opengl
 	node tests/parity/run.mjs compare
 	$(MAKE) parity_webgpu_matrix
-	$(MAKE) parity_native_gpu_matrix
-	$(MAKE) parity_gpu_consensus
+	$(MAKE) parity_portable_webgpu
 	$(MAKE) parity_kvcache_webgpu
 	node tests/parity/run.mjs gpu-verify
 
@@ -346,6 +332,23 @@ parity_graphs:
 	-python3 tests/parity/graphs/torch_interp.py tests/parity/out/graphcases tests/parity/out/graphsigs
 	node tests/parity/run.mjs matrix-import graphs torch
 	node tests/parity/run.mjs graphmatrix-compare
+
+# Generated-inventory-bound numerical closure for the audited portable gaps.
+# CPU, strict WASM, and strict native CPU are hard gates; physical WebGPU uses
+# these same cases through the protected hardware matrix campaign.
+parity_portable:
+	node tests/parity/run.mjs portablematrix
+	node tests/parity/run.mjs portablematrix-compare
+
+# Re-author the portable closure packages, execute every case on a required
+# physical WebGPU adapter, seal the artifacts, and compare all four providers.
+# Select a Linux adapter with DRI_PRIME/DENO_WEBGPU_BACKEND when necessary.
+parity_portable_webgpu:
+	node tests/parity/run.mjs portablematrix
+	node tests/parity/run.mjs matrix-begin portable webgpu
+	$(DENO) run --unstable-webgpu --allow-read --allow-write --allow-env --allow-ffi tests/parity/webgpu_matrix_deno.js tests/parity/out/portablecases tests/parity/out/portable
+	node tests/parity/run.mjs matrix-import portable webgpu
+	node tests/parity/run.mjs portablematrix-compare
 
 # Operator coverage vs generated kernel registry: how much of VolvoxAI is parity-tested.
 parity_coverage:
@@ -405,7 +408,7 @@ test_wasm_relaxed_simd: build_wasm
 		tools/test_wasm_relaxed_simd.mjs $(WEB_WASM_ARTIFACTS)
 
 benchmark_wasm_w8a8_seed: build_wasm
-	$(DOCKER_RUN) node tools/benchmark_wasm_w8a8_seed.mjs \
+	$(DOCKER_RUN) node examples/tiny_receipt_vqa/tools/benchmark_wasm_w8a8_seed.mjs \
 		$(WEB_DIST_DIR)/volvoxai.wasm
 
 benchmark_wasm_qbatch_matmul: build_wasm

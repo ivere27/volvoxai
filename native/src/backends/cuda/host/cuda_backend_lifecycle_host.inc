@@ -81,8 +81,34 @@ static int cuda_device_initialize_locked(int requested_device,
     if (unavailable_failure) *unavailable_failure = 0;
     if (requested_device < 0 || requested_device >= device_count) goto found;
     if (!cuda_ok(p_cuDeviceGet(&cuda_device, requested_device),
-                 "cuDeviceGet") ||
-        !cuda_ok(p_cuDevicePrimaryCtxRetain(&cuda_context, cuda_device),
+                 "cuDeviceGet")) goto found;
+    {
+        int limits[8] = {0};
+        const int attributes[8] = {
+            CU_DEVICE_ATTRIBUTE_MAX_GRID_DIM_X,
+            CU_DEVICE_ATTRIBUTE_MAX_GRID_DIM_Y,
+            CU_DEVICE_ATTRIBUTE_MAX_GRID_DIM_Z,
+            CU_DEVICE_ATTRIBUTE_MAX_BLOCK_DIM_X,
+            CU_DEVICE_ATTRIBUTE_MAX_BLOCK_DIM_Y,
+            CU_DEVICE_ATTRIBUTE_MAX_BLOCK_DIM_Z,
+            CU_DEVICE_ATTRIBUTE_MAX_THREADS_PER_BLOCK,
+            CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK,
+        };
+        for (int index = 0; index < 8; index++)
+            if (!cuda_ok(p_cuDeviceGetAttribute(
+                    &limits[index], attributes[index], cuda_device),
+                    "cuDeviceGetAttribute") || limits[index] <= 0)
+                goto found;
+        if (!cuda_ok(p_cuDeviceTotalMem(&cuda_total_memory, cuda_device),
+                     "cuDeviceTotalMem") || !cuda_total_memory) goto found;
+        for (int axis = 0; axis < 3; axis++) {
+            cuda_max_grid[axis] = (unsigned int)limits[axis];
+            cuda_max_block[axis] = (unsigned int)limits[axis + 3];
+        }
+        cuda_max_threads_per_block = (unsigned int)limits[6];
+        cuda_max_shared_memory_per_block = (unsigned int)limits[7];
+    }
+    if (!cuda_ok(p_cuDevicePrimaryCtxRetain(&cuda_context, cuda_device),
                  "cuDevicePrimaryCtxRetain")) goto found;
     cuda_primary_retained = 1;
     if (!cuda_context_enter_device_locked(&guard)) goto found;
@@ -178,6 +204,39 @@ int cuda_init(void) {
 int cuda_init_failure_is_unavailable(void) {
     CudaContextState* state = cuda_context_state_get();
     return !state || (!state->ready && state->unavailable_failure);
+}
+
+int cuda_query_domain_limits(CudaDomainLimits* limits) {
+    CudaContextState* state = cuda_context_state_get();
+    int ready = 0;
+    if (!limits) return -1;
+    memset(limits, 0, sizeof(*limits));
+    if (!state || !state->ready || !state->device_attached) return -1;
+    if (pthread_mutex_lock(&cuda_device_state.mutex) != 0) return -1;
+    if (cuda_device_state.ready &&
+        cuda_device_state.selected_device_index == cuda_device_index()) {
+        limits->total_memory_bytes = (uint64_t)cuda_total_memory;
+        for (size_t axis = 0; axis < 3u; axis++) {
+            limits->maximum_grid[axis] = cuda_max_grid[axis];
+            limits->maximum_block[axis] = cuda_max_block[axis];
+        }
+        limits->maximum_threads_per_block = cuda_max_threads_per_block;
+        limits->maximum_shared_memory_per_block =
+            cuda_max_shared_memory_per_block;
+        limits->maximum_tensor_slots = CUDA_GRAPH_MAX_TENSORS;
+        ready = limits->total_memory_bytes > 0u &&
+            limits->maximum_grid[0] > 0u &&
+            limits->maximum_grid[1] > 0u &&
+            limits->maximum_grid[2] > 0u &&
+            limits->maximum_block[0] > 0u &&
+            limits->maximum_block[1] > 0u &&
+            limits->maximum_block[2] > 0u &&
+            limits->maximum_threads_per_block > 0u &&
+            limits->maximum_shared_memory_per_block > 0u &&
+            limits->maximum_tensor_slots > 0u;
+    }
+    (void)pthread_mutex_unlock(&cuda_device_state.mutex);
+    return ready ? 0 : -1;
 }
 
 #if defined(VOLVOXAI_CUDA_TESTING)
@@ -327,6 +386,24 @@ uint64_t cuda_test_slot_containing_scan_count(void) {
     return cuda_slot_containing_scan_count;
 }
 
+uint64_t cuda_test_graph_allocation_count(void) {
+    return cuda_graph_allocation_count;
+}
+
+int cuda_test_graph_domain_reservation(size_t* span_count,
+                                       int* preload_complete,
+                                       int* enforced,
+                                       int* replay_plan) {
+    CudaContextState* state = cuda_context_state_get();
+    if (!state || !state->ready) return -1;
+    if (span_count) *span_count = state->domain_span_count;
+    if (preload_complete)
+        *preload_complete = state->invariant_preload_complete;
+    if (enforced) *enforced = state->domain_enforced;
+    if (replay_plan) *replay_plan = state->replay.plan;
+    return 0;
+}
+
 uint64_t cuda_test_graph_slot_count(void) {
     return graph_slot_count >= 0 ? (uint64_t)graph_slot_count : 0u;
 }
@@ -336,6 +413,54 @@ uint64_t cuda_test_graph_resident_weight_slot_count(void) {
     for (int index = 0; index < graph_slot_count; index++)
         if (graph_slot_is_resident_weight(&graph_slots[index])) count++;
     return count;
+}
+
+uint64_t cuda_test_qlinear_warp_dp4a_launch_count(void) {
+    CudaContextState* state = cuda_context_state_get();
+    return state ? state->qlinear_warp_dp4a_launch_count : 0u;
+}
+
+uint64_t cuda_test_qlinear_thread_dp4a_launch_count(void) {
+    CudaContextState* state = cuda_context_state_get();
+    return state ? state->qlinear_thread_dp4a_launch_count : 0u;
+}
+
+uint64_t cuda_test_qlinear_dp4a_group_count(void) {
+    CudaContextState* state = cuda_context_state_get();
+    return state ? state->qlinear_dp4a_group_count : 0u;
+}
+
+uint64_t cuda_test_qlinear_scalar_tail_count(void) {
+    CudaContextState* state = cuda_context_state_get();
+    return state ? state->qlinear_scalar_tail_count : 0u;
+}
+
+uint64_t cuda_test_qconv2d_warp_dp4a_launch_count(void) {
+    CudaContextState* state = cuda_context_state_get();
+    return state ? state->qconv2d_warp_dp4a_launch_count : 0u;
+}
+
+uint64_t cuda_test_qconv2d_thread_dp4a_launch_count(void) {
+    CudaContextState* state = cuda_context_state_get();
+    return state ? state->qconv2d_thread_dp4a_launch_count : 0u;
+}
+
+uint64_t cuda_test_qbatch_matmul_dp4a_group_count(void) {
+    CudaContextState* state = cuda_context_state_get();
+    return state ? state->qbatch_matmul_dp4a_group_count : 0u;
+}
+
+uint64_t cuda_test_qbatch_matmul_scalar_tail_count(void) {
+    CudaContextState* state = cuda_context_state_get();
+    return state ? state->qbatch_matmul_scalar_tail_count : 0u;
+}
+
+void cuda_test_fail_next_graph_allocation(void) {
+    cuda_test_graph_allocation_failure = 1;
+}
+
+void cuda_test_fail_next_graph_growth_rollback(void) {
+    cuda_test_graph_growth_rollback_failure = 1;
 }
 
 size_t cuda_test_training_basic_workspace_bytes(void) {
@@ -357,13 +482,39 @@ void cuda_test_fail_next_transient_release_sync(void) {
 uint64_t cuda_test_quarantined_transient_slot_count(void) {
     uint64_t count = 0;
     for (int index = 0; index < graph_slot_count; index++) {
-        if (!graph_slots[index].host && graph_slots[index].device) count++;
+        if (!graph_slots[index].host && graph_slots[index].device &&
+            !graph_slots[index].pool_eligible) count++;
     }
     return count;
 }
 
 int cuda_test_graph_api_available(void) {
     return cuda_graph_api_available;
+}
+
+int cuda_test_graph_dynamic_state(const char* expected_signature,
+                                  CudaGraphDynamicStateProbe* probe) {
+    CudaContextState* state = cuda_context_state_get();
+    if (!state || !probe) return -1;
+    memset(probe, 0, sizeof(*probe));
+    probe->shape_generation = state->shape_generation;
+    probe->capacity_generation = state->capacity_generation;
+    probe->slot_epoch = graph_slot_epoch;
+    probe->replay_shape_generation = state->replay.shape_generation;
+    probe->replay_capacity_generation = state->replay.capacity_generation;
+    probe->replay_plan = state->replay.plan;
+    probe->slot_count = graph_slot_count;
+    for (int index = 0; index < graph_slot_count; index++) {
+        CudaTensorSlot* slot = &graph_slots[index];
+        if (!slot->device || !slot->capacity) continue;
+        if (slot->host) probe->active_capacity_bytes += slot->capacity;
+        else if (slot->pool_eligible)
+            probe->pooled_capacity_bytes += slot->capacity;
+    }
+    probe->exact_signature_match = expected_signature &&
+        state->shape_signature &&
+        !strcmp(expected_signature, state->shape_signature);
+    return 0;
 }
 
 int cuda_test_caller_context_is_clear(void) {
@@ -388,6 +539,8 @@ void cuda_cleanup(void) {
     if (cuda_forward_scope_active)
         (void)cuda_graph_end_runtime_forward(0);
     graph_release_slots();
+    free(cuda_shape_signature);
+    cuda_shape_signature = NULL;
 #if VOLVOXAI_ENABLE_TRAINING
     if (cuda_profile.record_count) {
         if (cuda_context_enter(&guard)) {
@@ -439,6 +592,8 @@ void cuda_cleanup(void) {
     memset(&cuda_replay, 0, sizeof(cuda_replay));
 #if defined(VOLVOXAI_CUDA_TESTING)
     cuda_test_transient_release_failure = 0;
+    cuda_test_graph_allocation_failure = 0;
+    cuda_test_graph_growth_rollback_failure = 0;
 #endif
     memset(&cuda_forward_context_guard, 0,
            sizeof(cuda_forward_context_guard));
@@ -454,13 +609,39 @@ void cuda_cleanup(void) {
 #endif
 }
 
+/* Every graph slot must have released its device allocation before the owning
+ * context state goes away; a live CUdeviceptr here means a missed deactivate
+ * leaked Driver memory. Only referenced from the assert below, so it is
+ * compiled out under NDEBUG.
+ *
+ * `graph_slots`/`graph_slot_count` are object-like macros that redirect to the
+ * *current* context, so they are suspended here: this predicate inspects the
+ * state being destroyed, which is not necessarily the current one. */
+#pragma push_macro("graph_slots")
+#pragma push_macro("graph_slot_count")
+#undef graph_slots
+#undef graph_slot_count
+static int cuda_context_state_graph_slots_empty(const CudaContextState* state) {
+    if (!state) return 1;
+    if (state->graph_slot_count < 0 ||
+        state->graph_slot_count > CUDA_GRAPH_MAX_TENSORS) return 0;
+    for (int index = 0; index < state->graph_slot_count; index++)
+        if (state->graph_slots[index].device) return 0;
+    return 1;
+}
+#pragma pop_macro("graph_slot_count")
+#pragma pop_macro("graph_slots")
+
 static void cuda_context_state_destroy(void* opaque_state) {
     CudaContextState* state = (CudaContextState*)opaque_state;
+    int graph_slots_empty;
     if (!state) return;
     /* Backend deactivation owns Driver-resource release; catching a missed
      * deactivate here is safer than silently leaking another runtime's ref. */
     assert(!state->device_attached);
-    assert(cuda_context_state_graph_slots_empty(state));
+    graph_slots_empty = cuda_context_state_graph_slots_empty(state);
+    assert(graph_slots_empty);
+    (void)graph_slots_empty;
     assert(!state->lora_workspace);
 #if VOLVOXAI_ENABLE_TRAINING
     assert(!state->training_active);
@@ -474,5 +655,6 @@ static void cuda_context_state_destroy(void* opaque_state) {
         state->profile_path_history = next;
     }
 #endif
+    free(state->shape_signature);
     free(state);
 }

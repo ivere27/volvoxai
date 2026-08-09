@@ -15,7 +15,11 @@
 import { readFile } from 'node:fs/promises';
 import { join } from 'node:path';
 
-import { Graph, GraphLoader, VolvoxAI } from '../../../ts/index.js';
+import {
+  ModelLoader,
+  Model,
+  VolvoxAI,
+} from '../../../ts/index.js';
 
 function parseArguments(values) {
   const result = {};
@@ -39,14 +43,16 @@ async function loadGraph(packageDir, kind) {
     await readFile(join(packageDir, kind, 'graph.json'), 'utf8'),
   );
   const weights = await readFile(join(packageDir, kind, 'model.safetensors'));
-  const graph = new Graph();
-  await GraphLoader.load(graph, 'model.safetensors', {
+  const logicalPackage = await ModelLoader.load('model.safetensors', {
     graphUrl: 'graph.json',
     fetch: packageFetch(graphDocument, weights.buffer.slice(
       weights.byteOffset, weights.byteOffset + weights.byteLength,
     )),
   });
-  return { graph, document: graphDocument };
+  return {
+    snapshot: Model.capture(logicalPackage),
+    document: graphDocument,
+  };
 }
 
 /** Deterministic pseudo-random inputs, identical for both packages. */
@@ -58,38 +64,44 @@ function makeInputs(document, seed = 12345) {
   };
   const inputs = {};
   for (const [name, descriptor] of Object.entries(document.inputs || {})) {
-    const count = (descriptor.shape || []).reduce((a, b) => a * b, 1);
+    const shape = (descriptor.shape || []).map((dimension) => (
+      Number.isSafeInteger(dimension)
+        ? dimension
+        : document.dimensions?.[dimension]?.max
+    ));
+    if (shape.some((dimension) => !Number.isSafeInteger(dimension) || dimension <= 0)) {
+      throw new Error(`input '${name}' has no concrete bounded comparison shape`);
+    }
+    const count = shape.reduce((a, b) => a * b, 1);
     if (descriptor.dtype === 'int32') {
       const values = new Int32Array(count);
       // Token-ish ids and 0/1 masks both live in a small non-negative range.
       for (let i = 0; i < count; i++) values[i] = Math.floor(next() * 8);
-      inputs[name] = values;
+      inputs[name] = { data: values, shape };
     } else {
       const values = new Float32Array(count);
       for (let i = 0; i < count; i++) values[i] = next() * 2 - 1;
-      inputs[name] = values;
+      inputs[name] = { data: values, shape };
     }
   }
   return inputs;
 }
 
 async function run(packageDir, kind, inputs) {
-  const { graph } = await loadGraph(packageDir, kind);
+  const { snapshot, document } = await loadGraph(packageDir, kind);
   const runtime = await VolvoxAI.createRuntime({ backends: ['cpu'] });
-  const model = runtime.createModel(graph);
-  const compiled = await model.compile({
+  const compiled = await runtime.compile(snapshot, {
     backend: { mode: 'require', backend: 'cpu', operatorFallback: 'forbid' },
   });
   const context = await compiled.createContext();
   const result = await context.execute(inputs);
   const outputs = {};
-  for (const name of graph.outputNames) {
+  for (const name of document.outputs) {
     outputs[name] = Float32Array.from(await result.output(name).read());
   }
   await result.close();
   await context.close();
   await compiled.close();
-  await model.close();
   await runtime.close();
   return outputs;
 }

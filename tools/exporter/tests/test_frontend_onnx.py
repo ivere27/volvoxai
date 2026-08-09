@@ -19,7 +19,7 @@ except ImportError as error:  # This module is the installed-export-dependencies
         "ONNX frontend tests require installed numpy, onnx, and safetensors"
     ) from error
 
-from tools.exporter.capabilities import validate_graph
+from tools.exporter.capabilities import classify_package, validate_graph
 from tools.exporter.errors import ExporterError
 from tools.exporter.frontend_onnx import OnnxCompiler
 from tools.exporter.quantization_storage import validate_external_quantization
@@ -302,7 +302,7 @@ def _evaluate_preserved_lora(graph, weights, tokens: np.ndarray) -> np.ndarray:
         op_type = node["opType"]
         if op_type == "Linear":
             weight = values[inputs["weight"]]
-            if node["params"]["weight_layout"] == "OUT_IN":
+            if node["params"]["weight_layout"] == "dout_din":
                 weight = weight.T
             result = np.matmul(values[inputs["input"]], weight)
             if "bias" in inputs:
@@ -313,8 +313,25 @@ def _evaluate_preserved_lora(graph, weights, tokens: np.ndarray) -> np.ndarray:
             result = values[inputs["a"]] + values[inputs["b"]]
         else:  # Keep this evaluator deliberately scoped to the preserved region.
             raise AssertionError(f"unexpected LoRA node {op_type!r}")
-        values[node["outputs"]["out"]] = result
+        values[node["outputs"]["out"]["tensor"]] = result
     return values[graph["outputs"][0]]
+
+
+def _output_descriptor(node, port: str = "out") -> dict:
+    return node["outputs"][port]
+
+
+def _output_tensor(node, port: str = "out") -> str:
+    return _output_descriptor(node, port)["tensor"]
+
+
+def _nodes_by_source(compiler: OnnxCompiler, graph: dict) -> dict[str, dict]:
+    nodes_by_id = {node["id"]: node for node in graph["nodes"]}
+    return {
+        item["source_node"]: nodes_by_id[item["id"]]
+        for item in compiler.publication_report["node_sources"]
+        if item["id"] in nodes_by_id
+    }
 
 
 class InstalledOnnxFrontendTests(unittest.TestCase):
@@ -347,22 +364,613 @@ class InstalledOnnxFrontendTests(unittest.TestCase):
     def assert_no_stage_directories(self, directory: Path) -> None:
         self.assertEqual(list(directory.glob(".model.export-*")), [])
 
+    def _dynamic_concat_model(
+        self,
+        filename: str,
+        *,
+        first_axis: int | str,
+        second_axis: int | str,
+        output_axis: str,
+    ) -> Path:
+        return _save_model(
+            self.root,
+            filename,
+            nodes=[helper.make_node(
+                "Concat",
+                ["first", "second"],
+                ["memory"],
+                name="memory_concat",
+                axis=1,
+            )],
+            inputs=[
+                _value("first", TensorProto.FLOAT, ["B", first_axis, 320]),
+                _value("second", TensorProto.FLOAT, ["B", second_axis, 320]),
+            ],
+            outputs=[
+                _value("memory", TensorProto.FLOAT, ["B", output_axis, 320])
+            ],
+        )
+
+    def test_dynamic_concat_uses_exact_canonical_output_only_symbol(self):
+        path = self._dynamic_concat_model(
+            "dynamic_concat.onnx",
+            first_axis=210,
+            second_axis="Q",
+            output_axis="M",
+        )
+        bounds = {
+            "B": {"min": 1, "max": 1},
+            "Q": {"min": 1, "max": 192},
+            "M": {"min": 211, "max": 402},
+        }
+        graph, weights = OnnxCompiler(
+            str(path), dimension_bounds=bounds
+        ).lower()
+
+        self.assertEqual(graph["dimensions"], bounds)
+        self.assertEqual(graph["nodes"], [{
+            "id": "node_0",
+            "opType": "Concat",
+            "inputs": {"input0": "input0", "input1": "input1"},
+            "outputs": {"out": {
+                "tensor": "output0",
+                "dtype": "float32",
+                "shape": ["B", "M", 320],
+            }},
+            "params": {"axis": 1},
+        }])
+        self.assertTrue(
+            validate_graph(graph, ["portable"], weights=weights).supported
+        )
+
+    def test_dynamic_concat_reuses_one_affine_symbol_for_memory_and_mask(self):
+        path = _save_model(
+            self.root,
+            "dynamic_memory_and_mask_concat.onnx",
+            nodes=[
+                helper.make_node(
+                    "Concat",
+                    ["image", "question"],
+                    ["memory"],
+                    name="memory_concat",
+                    axis=1,
+                ),
+                helper.make_node(
+                    "Concat",
+                    ["image_mask", "question_mask"],
+                    ["memory_mask"],
+                    name="mask_concat",
+                    axis=1,
+                ),
+            ],
+            inputs=[
+                _value("image", TensorProto.FLOAT, ["B", 210, 320]),
+                _value("question", TensorProto.FLOAT, ["B", "Q", 320]),
+                _value("image_mask", TensorProto.INT32, ["B", 210]),
+                _value("question_mask", TensorProto.INT32, ["B", "Q"]),
+            ],
+            outputs=[
+                _value("memory", TensorProto.FLOAT, ["B", "M", 320]),
+                _value("memory_mask", TensorProto.INT32, ["B", "M"]),
+            ],
+        )
+        graph, weights = OnnxCompiler(
+            str(path),
+            dimension_bounds={
+                "B": {"min": 1, "max": 1},
+                "Q": {"min": 1, "max": 192},
+                "M": {"min": 211, "max": 402},
+            },
+        ).lower()
+
+        self.assertEqual(
+            [node["outputs"]["out"]["shape"] for node in graph["nodes"]],
+            [["B", "M", 320], ["B", "M"]],
+        )
+        self.assertTrue(
+            validate_graph(graph, ["portable"], weights=weights).supported
+        )
+
+    def test_kv_cache_concat_proves_positive_seed_affine_domain(self):
+        path = _save_model(
+            self.root,
+            "kv_cache_concat.onnx",
+            nodes=[helper.make_node(
+                "Concat",
+                ["past_k", "current_k"],
+                ["present_k"],
+                name="append_key_cache",
+                axis=2,
+            )],
+            inputs=[
+                _value("past_k", TensorProto.FLOAT, ["B", 8, "P", 40]),
+                _value("current_k", TensorProto.FLOAT, ["B", 8, 1, 40]),
+            ],
+            outputs=[
+                _value("present_k", TensorProto.FLOAT, ["B", 8, "R", 40])
+            ],
+        )
+        bounds = {
+            "B": {"min": 1, "max": 1},
+            # P=1 is the representable masked-zero seed.  Zero extents remain
+            # outside the bounded runtime contract.
+            "P": {"min": 1, "max": 191},
+            "R": {"min": 2, "max": 192},
+        }
+
+        graph, weights = OnnxCompiler(
+            str(path), dimension_bounds=bounds
+        ).lower()
+
+        self.assertEqual(graph["dimensions"], bounds)
+        self.assertEqual(len(graph["nodes"]), 1)
+        self.assertEqual(graph["nodes"][0]["opType"], "Concat")
+        self.assertEqual(
+            graph["nodes"][0]["outputs"]["out"]["shape"],
+            ["B", 8, "R", 40],
+        )
+        self.assertTrue(
+            validate_graph(graph, ["portable"], weights=weights).supported
+        )
+        zero_seed_error = self.assert_diagnostic(
+            "VXIR053",
+            lambda: OnnxCompiler(
+                str(path),
+                dimension_bounds={
+                    "B": {"min": 1, "max": 1},
+                    "P": {"min": 0, "max": 191},
+                    "R": {"min": 1, "max": 192},
+                },
+            ),
+        )
+        self.assertIn("positive safe integer", zero_seed_error.diagnostic.message)
+
+    def test_symbolic_shape_program_lowers_cached_projection_structurally(self):
+        path = _save_model(
+            self.root,
+            "cached_projection_shape_program.onnx",
+            nodes=[
+                helper.make_node(
+                    "Shape", ["token_state"], ["state_shape"], name="state_shape"
+                ),
+                helper.make_node(
+                    "Gather",
+                    ["state_shape", "batch_axis"],
+                    ["batch_extent"],
+                    name="gather_batch",
+                    axis=0,
+                ),
+                helper.make_node(
+                    "Gather",
+                    ["state_shape", "step_axis"],
+                    ["step_extent"],
+                    name="gather_step",
+                    axis=0,
+                ),
+                helper.make_node(
+                    "Concat",
+                    ["batch_extent", "step_extent", "heads", "head_width"],
+                    ["projection_shape"],
+                    name="assemble_projection_shape",
+                    axis=0,
+                ),
+                helper.make_node(
+                    "Reshape",
+                    ["token_state", "projection_shape"],
+                    ["current_bshd"],
+                    name="reshape_projection",
+                ),
+                helper.make_node(
+                    "Transpose",
+                    ["current_bshd"],
+                    ["current_k"],
+                    name="transpose_projection",
+                    perm=[0, 2, 1, 3],
+                ),
+                helper.make_node(
+                    "Concat",
+                    ["past_k", "current_k"],
+                    ["present_k"],
+                    name="append_key_cache",
+                    axis=2,
+                ),
+            ],
+            inputs=[
+                _value("token_state", TensorProto.FLOAT, ["B", 1, 320]),
+                _value("past_k", TensorProto.FLOAT, ["B", 8, "P", 40]),
+            ],
+            outputs=[
+                _value("present_k", TensorProto.FLOAT, ["B", 8, "R", 40])
+            ],
+            initializers=[
+                _initializer("batch_axis", np.asarray([0], dtype=np.int64)),
+                _initializer("step_axis", np.asarray([1], dtype=np.int64)),
+                _initializer("heads", np.asarray([8], dtype=np.int64)),
+                _initializer("head_width", np.asarray([40], dtype=np.int64)),
+            ],
+            value_info=[
+                _value("current_bshd", TensorProto.FLOAT, ["B", 1, 8, 40]),
+                _value("current_k", TensorProto.FLOAT, ["B", 8, 1, 40]),
+            ],
+            opset=18,
+        )
+        compiler = OnnxCompiler(
+            str(path),
+            dimension_bounds={
+                "B": {"min": 1, "max": 1},
+                "P": {"min": 1, "max": 191},
+                "R": {"min": 2, "max": 192},
+            },
+        )
+        graph, weights = compiler.lower()
+
+        structural_sources = {
+            compiler.model.graph.node[index].name
+            for index in compiler.structural_shape_nodes
+        }
+        self.assertEqual(structural_sources, {
+            "state_shape",
+            "gather_batch",
+            "gather_step",
+            "assemble_projection_shape",
+        })
+        self.assertEqual(
+            [node["opType"] for node in graph["nodes"]],
+            ["Reshape", "Concat"],
+        )
+        self.assertEqual(
+            graph["nodes"][-1]["outputs"]["out"]["shape"],
+            ["B", 8, "R", 40],
+        )
+        self.assertTrue(
+            validate_graph(graph, ["portable"], weights=weights).supported
+        )
+
+    def test_symbolic_shape_program_is_not_erased_when_shape_value_escapes(self):
+        path = _save_model(
+            self.root,
+            "escaping_shape_program.onnx",
+            nodes=[
+                helper.make_node(
+                    "Shape", ["tokens"], ["runtime_shape"], name="runtime_shape"
+                ),
+                helper.make_node(
+                    "Reshape",
+                    ["tokens", "runtime_shape"],
+                    ["reshaped"],
+                    name="reshape_tokens",
+                ),
+            ],
+            inputs=[_value("tokens", TensorProto.FLOAT, ["B", 4])],
+            outputs=[
+                _value("reshaped", TensorProto.FLOAT, ["B", 4]),
+                _value("runtime_shape", TensorProto.INT64, [2]),
+            ],
+        )
+        compiler = OnnxCompiler(
+            str(path),
+            dimension_bounds={"B": {"min": 1, "max": 8}},
+            output_dtypes={"runtime_shape": "int32"},
+        )
+
+        self.assertEqual(compiler.structural_shape_nodes, set())
+        error = self.assert_diagnostic("VXONNX_UNSUPPORTED", compiler.lower)
+        self.assertEqual(error.diagnostic.source_node, "runtime_shape")
+        self.assertEqual(error.diagnostic.source_op, "Shape")
+
+    def test_symbolic_shape_program_rejects_non_identity_cast_semantics(self):
+        path = _save_model(
+            self.root,
+            "shape_program_bool_cast.onnx",
+            nodes=[
+                helper.make_node(
+                    "Shape", ["tokens"], ["runtime_shape"], name="runtime_shape"
+                ),
+                helper.make_node(
+                    "Cast",
+                    ["runtime_shape"],
+                    ["truth_shape"],
+                    name="shape_to_bool",
+                    to=TensorProto.BOOL,
+                ),
+                helper.make_node(
+                    "Cast",
+                    ["truth_shape"],
+                    ["integer_shape"],
+                    name="bool_to_shape",
+                    to=TensorProto.INT64,
+                ),
+                helper.make_node(
+                    "Reshape",
+                    ["tokens", "integer_shape"],
+                    ["reshaped"],
+                    name="reshape_tokens",
+                ),
+            ],
+            inputs=[_value("tokens", TensorProto.FLOAT, ["B", 4])],
+            outputs=[_value("reshaped", TensorProto.FLOAT, ["B", 4])],
+        )
+        compiler = OnnxCompiler(
+            str(path), dimension_bounds={"B": {"min": 1, "max": 8}}
+        )
+
+        # For B > 1 the source Casts produce [1, 1], not [B, 4].  Treating
+        # either Cast as metadata-only would silently change ONNX semantics.
+        self.assertEqual(compiler.structural_shape_nodes, set())
+        error = self.assert_diagnostic("VXONNX_UNSUPPORTED", compiler.lower)
+        self.assertEqual(error.diagnostic.source_node, "runtime_shape")
+        self.assertEqual(error.diagnostic.source_op, "Shape")
+
+    def test_kv_cache_concat_recovers_unique_opaque_qdq_axis(self):
+        path = _save_model(
+            self.root,
+            "kv_cache_concat_qdq_opaque_axis.onnx",
+            nodes=[
+                helper.make_node(
+                    "Concat",
+                    ["past_v", "current_v"],
+                    ["present_v_float"],
+                    name="append_value_cache",
+                    axis=2,
+                ),
+                helper.make_node(
+                    "QuantizeLinear",
+                    ["present_v_float", "scale", "zero"],
+                    ["present_v_byte"],
+                    name="quantize_present_v",
+                ),
+                helper.make_node(
+                    "DequantizeLinear",
+                    ["present_v_byte", "scale", "zero"],
+                    ["present_v"],
+                    name="dequantize_present_v",
+                ),
+            ],
+            inputs=[
+                _value("past_v", TensorProto.FLOAT, ["B", 8, "P", 40]),
+                _value("current_v", TensorProto.FLOAT, ["B", 8, 1, 40]),
+            ],
+            outputs=[
+                _value("present_v", TensorProto.FLOAT, ["B", 8, "R", 40])
+            ],
+            initializers=[
+                _initializer("scale", np.asarray(0.125, dtype=np.float32)),
+                _initializer("zero", np.asarray(0, dtype=np.uint8)),
+            ],
+            value_info=[
+                _value(
+                    "present_v_float",
+                    TensorProto.FLOAT,
+                    ["B", 8, "unk__7", 40],
+                ),
+                _value(
+                    "present_v_byte",
+                    TensorProto.UINT8,
+                    ["B", 8, "unk__7", 40],
+                ),
+            ],
+        )
+        graph, weights = OnnxCompiler(
+            str(path),
+            dimension_bounds={
+                "B": {"min": 1, "max": 1},
+                "P": {"min": 1, "max": 191},
+                "R": {"min": 2, "max": 192},
+            },
+        ).lower()
+
+        self.assertEqual(
+            [node["outputs"]["out"]["shape"] for node in graph["nodes"]],
+            [["B", 8, "R", 40]] * 3,
+        )
+        self.assertTrue(
+            validate_graph(graph, ["portable"], weights=weights).supported
+        )
+
+    def test_static_cache_reshape_refines_only_inference_opaque_axis(self):
+        path = _save_model(
+            self.root,
+            "cache_static_reshape_opaque_batch.onnx",
+            nodes=[
+                helper.make_node(
+                    "Reshape",
+                    ["cache_heads", "flattened_shape"],
+                    ["flattened_opaque"],
+                    name="flatten_cache_heads",
+                ),
+                helper.make_node(
+                    "Identity",
+                    ["flattened_opaque"],
+                    ["flattened"],
+                    name="publish_flattened_cache",
+                ),
+            ],
+            inputs=[
+                _value("cache_heads", TensorProto.FLOAT, ["B", 8, 1, 40])
+            ],
+            outputs=[
+                _value("flattened", TensorProto.FLOAT, ["B", 1, 320])
+            ],
+            initializers=[
+                _initializer(
+                    "flattened_shape", np.asarray([-1, 1, 320], dtype=np.int64)
+                )
+            ],
+            value_info=[
+                _value(
+                    "flattened_opaque",
+                    TensorProto.FLOAT,
+                    ["unk__9", 1, 320],
+                )
+            ],
+        )
+        compiler = OnnxCompiler(
+            str(path),
+            dimension_bounds={"B": {"min": 1, "max": 8}},
+        )
+        graph, weights = compiler.lower()
+
+        self.assertEqual(compiler.shape_of("flattened_opaque"), ["B", 1, 320])
+        self.assertEqual(
+            graph["nodes"][0]["outputs"]["out"]["shape"], ["B", 1, 320]
+        )
+        self.assertTrue(
+            validate_graph(graph, ["portable"], weights=weights).supported
+        )
+
+    def test_source_bool_identity_cast_preserves_int32_mask_representation(self):
+        path = _save_model(
+            self.root,
+            "bool_identity_cast_mask.onnx",
+            nodes=[
+                helper.make_node(
+                    "Cast",
+                    ["blocked_mask"],
+                    ["blocked_again"],
+                    name="source_bool_identity",
+                    to=TensorProto.BOOL,
+                ),
+                helper.make_node(
+                    "Where",
+                    ["blocked_again", "blocked_score", "scores"],
+                    ["masked_scores"],
+                    name="apply_blocked_mask",
+                ),
+            ],
+            inputs=[
+                _value("blocked_mask", TensorProto.BOOL, ["B", "R"]),
+                _value("scores", TensorProto.FLOAT, ["B", "R"]),
+            ],
+            outputs=[
+                _value("masked_scores", TensorProto.FLOAT, ["B", "R"])
+            ],
+            initializers=[
+                _initializer("blocked_score", np.asarray(-1.0e4, dtype=np.float32))
+            ],
+        )
+        compiler = OnnxCompiler(
+            str(path),
+            dimension_bounds={
+                "B": {"min": 1, "max": 1},
+                "R": {"min": 2, "max": 192},
+            },
+            input_dtypes={"blocked_mask": "int32"},
+        )
+        graph, weights = compiler.lower()
+
+        self.assertEqual(compiler.identity_bool_casts, {0})
+        self.assertNotIn("Cast", [node["opType"] for node in graph["nodes"]])
+        where = next(node for node in graph["nodes"] if node["opType"] == "Where")
+        self.assertEqual(where["inputs"]["condition"], "input0")
+        self.assertIn({
+            "kind": "input-dtype",
+            "name": "blocked_mask",
+            "source": "bool",
+            "exported": "int32",
+        }, compiler.publication_report["abi_changes"])
+        self.assertTrue(
+            validate_graph(graph, ["portable"], weights=weights).supported
+        )
+
+        unsafe_path = _save_model(
+            self.root,
+            "int32_to_bool_cast.onnx",
+            nodes=[helper.make_node(
+                "Cast",
+                ["values"],
+                ["condition"],
+                name="nonzero_to_bool",
+                to=TensorProto.BOOL,
+            )],
+            inputs=[_value("values", TensorProto.INT32, [1, 2])],
+            outputs=[_value("condition", TensorProto.BOOL, [1, 2])],
+        )
+        self.assert_diagnostic(
+            "VXCAST_DTYPE",
+            lambda: OnnxCompiler(
+                str(unsafe_path), output_dtypes={"condition": "int32"}
+            ).lower(),
+        )
+
+    def test_dynamic_concat_rejects_unsound_bounds_and_multiple_terms(self):
+        cases = (
+            (
+                "concat_bad_bounds.onnx",
+                210,
+                "Q",
+                {"M": {"min": 211, "max": 401}},
+                "declared output 'out'.shape[1]",
+            ),
+            (
+                "concat_two_dynamic.onnx",
+                "Q",
+                "T",
+                {"T": {"min": 1, "max": 192}, "M": {"min": 2, "max": 384}},
+                "more than one dynamic axis term",
+            ),
+        )
+        for filename, first_axis, second_axis, extra_bounds, detail in cases:
+            with self.subTest(filename=filename):
+                path = self._dynamic_concat_model(
+                    filename,
+                    first_axis=first_axis,
+                    second_axis=second_axis,
+                    output_axis="M",
+                )
+                bounds = {
+                    "B": {"min": 1, "max": 1},
+                    "Q": {"min": 1, "max": 192},
+                    **extra_bounds,
+                }
+                error = self.assert_diagnostic(
+                    "VXDYNAMIC_CONCAT_AXIS",
+                    lambda: OnnxCompiler(
+                        str(path), dimension_bounds=bounds
+                    ).lower(),
+                )
+                self.assertIn("UNPROVABLE_DYNAMIC_SHAPE_FORMULA", error.diagnostic.message)
+                self.assertIn(detail, error.diagnostic.message)
+
+    def test_dynamic_concat_does_not_trust_onnx_dimension_expressions(self):
+        path = self._dynamic_concat_model(
+            "concat_expression.onnx",
+            first_axis=210,
+            second_axis="Q",
+            output_axis="Q + 210",
+        )
+        error = self.assert_diagnostic(
+            "VXCONCAT_SHAPE",
+            lambda: OnnxCompiler(
+                str(path),
+                dimension_bounds={
+                    "B": {"min": 1, "max": 1},
+                    "Q": {"min": 1, "max": 192},
+                    "M": {"min": 211, "max": 402},
+                },
+            ).lower(),
+        )
+        self.assertIn("INVALID_DOMAIN", error.diagnostic.message)
+        self.assertIn("valid symbol name", error.diagnostic.message)
+
     def test_explicit_fp32_lora_is_preserved_and_numerically_structural(self):
         path, tokens, base_weight, a_weight, b_weight, scale = _lora_model(self.root)
 
-        graph, weights = OnnxCompiler(
+        compiler = OnnxCompiler(
             str(path), weight_dtype="float32", output_names=["answer"]
-        ).lower()
+        )
+        graph, weights = compiler.lower()
+        report = compiler.publication_report
 
-        feature = graph["source"]["features"]["lora"]
+        feature = report["features"]["lora"]
         self.assertEqual(len(feature), 1)
         self.assertEqual(feature[0]["rank"], 2)
         self.assertEqual(feature[0]["scale"], float(scale))
-        self.assertEqual(graph["source"]["package_class"], "fp32")
-        self.assertEqual(graph["source"]["source_ir"]["dialect"], "source")
-        self.assertEqual(graph["source"]["source_ir"]["nodes"], 5)
+        self.assertEqual(report["package_class"], "fp32")
+        self.assertNotIn("source", graph)
+        self.assertEqual(report["source_ir"]["dialect"], "source")
+        self.assertEqual(report["source_ir"]["nodes"], 5)
         self.assertEqual(
-            graph["source"]["typed_optimizer"]["runs"][0]["input_dialect"],
+            report["typed_optimizer"]["runs"][0]["input_dialect"],
             "runtime",
         )
         self.assertEqual(
@@ -371,7 +979,7 @@ class InstalledOnnxFrontendTests(unittest.TestCase):
         )
         self.assertTrue(all(value.dtype == np.float32 for value in weights.values()))
 
-        nodes_by_source = {node["source_name"]: node for node in graph["nodes"]}
+        nodes_by_source = _nodes_by_source(compiler, graph)
         np.testing.assert_array_equal(
             weights[nodes_by_source["base_projection"]["inputs"]["weight"]],
             base_weight,
@@ -400,8 +1008,10 @@ class InstalledOnnxFrontendTests(unittest.TestCase):
             outputs=[_value("result", TensorProto.FLOAT, [3, 1, 4])],
         )
 
-        optimized, _ = OnnxCompiler(str(path)).lower()
-        deferred, _ = OnnxCompiler(str(path)).lower(
+        optimized_compiler = OnnxCompiler(str(path))
+        optimized, _ = optimized_compiler.lower()
+        deferred_compiler = OnnxCompiler(str(path))
+        deferred, _ = deferred_compiler.lower(
             enable_static_qdq_layout_optimization=False,
         )
 
@@ -412,13 +1022,88 @@ class InstalledOnnxFrontendTests(unittest.TestCase):
             [node["opType"] for node in deferred["nodes"]], ["Transpose"],
         )
         optimized_passes = {
-            run["pass"] for run in optimized["source"]["typed_optimizer"]["runs"]
+            run["pass"] for run in optimized_compiler.publication_report["typed_optimizer"]["runs"]
         }
         deferred_passes = {
-            run["pass"] for run in deferred["source"]["typed_optimizer"]["runs"]
+            run["pass"] for run in deferred_compiler.publication_report["typed_optimizer"]["runs"]
         }
         self.assertIn("runtime-singleton-transpose", optimized_passes)
         self.assertNotIn("runtime-singleton-transpose", deferred_passes)
+
+    def test_silu_fusion_requires_the_narrow_numerical_migration_opt_in(self):
+        path = _save_model(
+            self.root,
+            "decomposed_silu.onnx",
+            nodes=[
+                helper.make_node(
+                    "Sigmoid", ["tokens"], ["gate"], name="silu_gate"
+                ),
+                helper.make_node(
+                    "Mul", ["tokens", "gate"], ["result"], name="silu_mul"
+                ),
+            ],
+            inputs=[_value("tokens", TensorProto.FLOAT, ["B", 2, 4])],
+            outputs=[_value("result", TensorProto.FLOAT, ["B", 2, 4])],
+        )
+
+        bounds = {"B": {"min": 1, "max": 4}}
+        default_compiler = OnnxCompiler(str(path), dimension_bounds=bounds)
+        default_graph, _ = default_compiler.lower()
+        fused_compiler = OnnxCompiler(str(path), dimension_bounds=bounds)
+        fused_graph, _ = fused_compiler.lower(
+            allow_silu_numerical_migration=True,
+        )
+
+        self.assertEqual(
+            [node["opType"] for node in default_graph["nodes"]],
+            ["Sigmoid", "Mul"],
+        )
+        self.assertEqual(
+            [node["opType"] for node in fused_graph["nodes"]],
+            ["SiLU"],
+        )
+        fused_report = fused_compiler.publication_report["typed_optimizer"]
+        pipeline = fused_report["pipeline"]["recipe"]
+        self.assertEqual(pipeline["selection_features"], ["silu-fusion"])
+        self.assertEqual(
+            sum(
+                run["changes"]
+                for run in fused_report["runs"]
+                if run["pass"] == "runtime-silu-fusion"
+            ),
+            1,
+        )
+        for unrelated in (
+            "runtime-bias-folding",
+            "runtime-grouped-projection-split",
+            "runtime-sequence-layout",
+        ):
+            self.assertNotIn(unrelated, pipeline["passes"])
+
+    def test_silu_opt_in_is_a_zero_rewrite_for_a_silu_free_decoder_graph(self):
+        path = _save_model(
+            self.root,
+            "decoder_without_silu.onnx",
+            nodes=[helper.make_node(
+                "Add", ["tokens", "tokens"], ["result"], name="decoder_add"
+            )],
+            inputs=[_value("tokens", TensorProto.FLOAT, ["B", 1, 4])],
+            outputs=[_value("result", TensorProto.FLOAT, ["B", 1, 4])],
+        )
+        compiler = OnnxCompiler(
+            str(path), dimension_bounds={"B": {"min": 1, "max": 1}}
+        )
+
+        graph, _ = compiler.lower(allow_silu_numerical_migration=True)
+
+        self.assertEqual([node["opType"] for node in graph["nodes"]], ["Add"])
+        report = compiler.publication_report["typed_optimizer"]
+        silu_runs = [
+            run for run in report["runs"]
+            if run["pass"] == "runtime-silu-fusion"
+        ]
+        self.assertEqual(len(silu_runs), 1)
+        self.assertEqual(silu_runs[0]["changes"], 0)
 
     def test_fixed_static_adapter_is_recognized_and_preserved(self):
         down_weight = np.arange(8, dtype=np.float32).reshape(4, 2) / 10.0
@@ -447,9 +1132,10 @@ class InstalledOnnxFrontendTests(unittest.TestCase):
             ],
         )
 
-        graph, weights = OnnxCompiler(str(path), weight_dtype="float32").lower()
+        compiler = OnnxCompiler(str(path), weight_dtype="float32")
+        graph, weights = compiler.lower()
 
-        features = graph["source"]["features"]["static_adapter"]
+        features = compiler.publication_report["features"]["static_adapter"]
         self.assertEqual(len(features), 1)
         self.assertEqual(
             {key: features[0][key] for key in ("source_node", "input", "down", "up")},
@@ -529,13 +1215,14 @@ class InstalledOnnxFrontendTests(unittest.TestCase):
             ],
         )
 
-        graph, weights = OnnxCompiler(
+        compiler = OnnxCompiler(
             str(path), weight_dtype="float32", output_dtypes={"route": "int32"}
-        ).lower()
-        self.assertEqual(graph["source"]["package_class"], "fp32")
-        self.assertEqual(len(graph["source"]["features"]["router"]), 1)
+        )
+        graph, weights = compiler.lower()
+        self.assertEqual(compiler.publication_report["package_class"], "fp32")
+        self.assertEqual(len(compiler.publication_report["features"]["router"]), 1)
         argmax = next(node for node in graph["nodes"] if node["opType"] == "ArgMax")
-        self.assertEqual(argmax["outputs_dtype"]["out"], "int32")
+        self.assertEqual(_output_descriptor(argmax)["dtype"], "int32")
         self.assertTrue(validate_graph(graph, ["browser"], weights=weights).supported)
         portable = validate_graph(graph, ["portable"], weights=weights)
         self.assertTrue(portable.supported)
@@ -558,7 +1245,8 @@ class InstalledOnnxFrontendTests(unittest.TestCase):
         self.assertEqual(browser_run.returncode, 0, browser_run.stderr)
         self.assertTrue(browser_weights.is_file())
         browser_graph = json.loads((browser_directory / "graph.json").read_text(encoding="utf-8"))
-        self.assertEqual(browser_graph["source"]["package_class"], "fp32")
+        self.assertNotIn("source", browser_graph)
+        self.assertEqual(classify_package(browser_graph), "fp32")
         with safe_open(str(browser_weights), framework="numpy", device="cpu") as tensors:
             self.assertGreater(len(tensors.keys()), 0)
 
@@ -579,7 +1267,7 @@ class InstalledOnnxFrontendTests(unittest.TestCase):
         self.assertEqual(portable_run.returncode, 0, portable_run.stderr)
         self.assertTrue(portable_weights.is_file())
         self.assertEqual(
-            json.loads(portable_graph.read_text(encoding="utf-8"))["source"]["package_class"],
+            classify_package(json.loads(portable_graph.read_text(encoding="utf-8"))),
             "fp32",
         )
 
@@ -593,10 +1281,12 @@ class InstalledOnnxFrontendTests(unittest.TestCase):
         unsafe_path = self.root / "fp32_router_unclamped.onnx"
         onnx.checker.check_model(unsafe_model)
         onnx.save(unsafe_model, unsafe_path)
-        unsafe_graph, _ = OnnxCompiler(
+        unsafe_compiler = OnnxCompiler(
             str(unsafe_path), output_dtypes={"route": "int32"}
-        ).lower()
-        self.assertNotIn("router", unsafe_graph["source"]["features"])
+        )
+        unsafe_graph, _ = unsafe_compiler.lower()
+        self.assertNotIn("router", unsafe_compiler.publication_report["features"])
+        self.assertNotIn("source", unsafe_graph)
         self.assert_no_stage_directories(portable_directory)
 
     def test_specialized_gather_removes_selector_and_family_bank(self):
@@ -624,12 +1314,15 @@ class InstalledOnnxFrontendTests(unittest.TestCase):
             initializers=[_initializer("family_bank", family_bank)],
         )
 
-        graph, weights = OnnxCompiler(
+        compiler = OnnxCompiler(
             str(path), specialize_inputs={"family_selector": 1}
-        ).lower()
+        )
+        graph, weights = compiler.lower()
 
         self.assertEqual(list(graph["inputs"]), ["input0"])
-        self.assertEqual(graph["inputs"]["input0"]["source_name"], "tokens")
+        self.assertEqual(graph["inputs"]["input0"], {
+            "shape": [1, 3], "dtype": "float32",
+        })
         self.assertNotIn("Gather", [node["opType"] for node in graph["nodes"]])
         self.assertEqual(len(graph["nodes"]), 1)
         linear = graph["nodes"][0]
@@ -637,7 +1330,7 @@ class InstalledOnnxFrontendTests(unittest.TestCase):
         np.testing.assert_array_equal(selected, family_bank[1])
         self.assertFalse(any(value.ndim == 3 for value in weights.values()))
         self.assertEqual(
-            graph["source"]["abi_changes"],
+            compiler.publication_report["abi_changes"],
             [
                 {
                     "kind": "specialize-input",
@@ -672,13 +1365,14 @@ class InstalledOnnxFrontendTests(unittest.TestCase):
             [node["opType"] for node in graph["nodes"]],
             ["Slice", "Squeeze"],
         )
-        self.assertEqual(graph["nodes"][0]["outputs_shape"]["out"], [1, 3, 4])
+        self.assertEqual(_output_descriptor(graph["nodes"][0])["shape"], [1, 3, 4])
         self.assertEqual(graph["nodes"][0]["params"], {
             "starts": [1],
+            "ends": [2],
             "axes": [0],
             "steps": [1],
         })
-        self.assertEqual(graph["nodes"][1]["outputs_shape"]["out"], [3, 4])
+        self.assertEqual(_output_descriptor(graph["nodes"][1])["shape"], [3, 4])
         self.assertTrue(validate_graph(graph, ["portable"], weights=weights).supported)
 
     def test_opset18_static_shape_value_chain_folds_from_bound_runtime_input(self):
@@ -793,11 +1487,11 @@ class InstalledOnnxFrontendTests(unittest.TestCase):
         )
         self.assertEqual(graph["inputs"]["input0"]["shape"], [1, 3, 4])
         self.assertEqual(
-            [(node["opType"], node["source_name"]) for node in graph["nodes"]],
+            [(node["opType"], source) for source, node in _nodes_by_source(compiler, graph).items()],
             [("Reshape", "reshape_runtime_again")],
         )
         self.assertEqual(graph["nodes"][0]["inputs"], {"input": "input0"})
-        self.assertGreater(graph["source"]["typed_optimizer"]["total_changes"], 0)
+        self.assertGreater(compiler.publication_report["typed_optimizer"]["total_changes"], 0)
         self.assertEqual(weights, {})
 
     def test_opset18_pytorch_association_of_exact_erf_gelu_is_recognized(self):
@@ -847,12 +1541,13 @@ class InstalledOnnxFrontendTests(unittest.TestCase):
             opset=18,
         )
 
-        graph, weights = OnnxCompiler(
+        compiler = OnnxCompiler(
             str(path), weight_dtype="float32"
-        ).lower()
+        )
+        graph, weights = compiler.lower()
 
         self.assertEqual(
-            graph["source"]["features"]["gelu"],
+            compiler.publication_report["features"]["gelu"],
             [
                 {
                     "source_node": "gelu",
@@ -870,7 +1565,7 @@ class InstalledOnnxFrontendTests(unittest.TestCase):
         )
         self.assertEqual(len(weights), 1)
 
-    def test_weight_only_qdq_preserves_raw_int8_out_in_weight_and_scales(self):
+    def test_weight_only_qdq_is_materialized_as_canonical_fp32_linear(self):
         raw_weight = np.asarray(
             [[1, -2, 3, 4], [5, 6, -7, 8], [-9, 10, 11, -12]],
             dtype=np.int8,
@@ -900,25 +1595,23 @@ class InstalledOnnxFrontendTests(unittest.TestCase):
             ],
         )
 
-        graph, weights = OnnxCompiler(str(path), weight_dtype="float32").lower()
+        compiler = OnnxCompiler(str(path), weight_dtype="float32")
+        graph, weights = compiler.lower()
 
-        self.assertEqual(graph["source"]["package_class"], "w8a32")
-        self.assertEqual(
-            graph["source"]["features"]["w8a32_linear"],
-            [{"source_node": "quantized_linear"}],
-        )
+        self.assertEqual(compiler.publication_report["package_class"], "fp32")
         self.assertEqual(len(graph["nodes"]), 1)
         linear = graph["nodes"][0]
         self.assertEqual(linear["opType"], "Linear")
-        self.assertEqual(linear["params"]["weight_layout"], "OUT_IN")
-        preserved_weight = weights[linear["inputs"]["weight"]]
-        preserved_scales = weights[linear["inputs"]["weight_scale"]]
-        self.assertEqual(preserved_weight.dtype, np.dtype(np.int8))
-        np.testing.assert_array_equal(preserved_weight, raw_weight.T)
-        self.assertEqual(preserved_scales.dtype, np.dtype(np.float32))
-        np.testing.assert_array_equal(preserved_scales, scales)
-        self.assertNotIn("weight_zero_point", linear["inputs"])
-        self.assertFalse(any(value.shape == raw_weight.shape and value.dtype.kind == "f" for value in weights.values()))
+        self.assertEqual(linear["params"]["weight_layout"], "din_dout")
+        self.assertEqual(set(linear["inputs"]), {"input", "weight"})
+        np.testing.assert_allclose(
+            weights[linear["inputs"]["weight"]],
+            raw_weight.astype(np.float32) * scales.reshape(1, -1),
+        )
+        self.assertEqual(
+            compiler.publication_report["features"]["dequantized_weight_linear"][0]["source_node"],
+            "quantized_linear",
+        )
 
     def test_dynamic_lora_scale_is_rejected(self):
         path, *_ = _lora_model(self.root, dynamic_scale=True)
@@ -1047,7 +1740,7 @@ class InstalledOnnxFrontendTests(unittest.TestCase):
         graph, _weights = OnnxCompiler(
             str(path), output_dtypes={"route": "int32"}
         ).lower()
-        self.assertEqual(graph["nodes"][0]["outputs_dtype"]["out"], "int32")
+        self.assertEqual(_output_descriptor(graph["nodes"][0])["dtype"], "int32")
 
     def test_qdq_byte_logits_lower_to_canonical_qargmax(self):
         path = _save_model(
@@ -1083,13 +1776,14 @@ class InstalledOnnxFrontendTests(unittest.TestCase):
         )
         self.assertEqual(error.diagnostic.constraint, "--output-dtype NAME=int32")
 
-        graph, weights = OnnxCompiler(
+        compiler = OnnxCompiler(
             str(path), output_dtypes={"route": "int32"}
-        ).lower()
+        )
+        graph, weights = compiler.lower()
 
         self.assertEqual(len(weights), 2)
-        self.assertEqual(graph["source"]["package_class"], "w8a8-v1")
-        self.assertEqual(graph["source"]["quantized_graph_contract"], "w8a8-v1")
+        self.assertEqual(compiler.publication_report["package_class"], "w8a8-v1")
+        self.assertNotIn("source", graph)
         self.assertEqual(
             _resolved_quantization(graph, weights, "input0"),
             {"scheme": "per_tensor", "scale": 0.125, "zero_point": 117},
@@ -1099,8 +1793,8 @@ class InstalledOnnxFrontendTests(unittest.TestCase):
         self.assertEqual(node["opType"], "QArgMax")
         self.assertEqual(node["inputs"], {"input": "input0"})
         self.assertEqual(node["params"], {"axis": 1})
-        self.assertEqual(node["outputs_shape"], {"out": [2]})
-        self.assertEqual(node["outputs_dtype"], {"out": "int32"})
+        self.assertEqual(_output_descriptor(node)["shape"], [2])
+        self.assertEqual(_output_descriptor(node)["dtype"], "int32")
         self.assertNotIn("outputs_quantization", node)
         self.assertTrue(validate_graph(graph, ["portable"], weights=weights).supported)
 
@@ -1160,10 +1854,11 @@ class InstalledOnnxFrontendTests(unittest.TestCase):
             ],
         )
 
-        graph, weights = OnnxCompiler(str(path), weight_dtype="float32").lower()
+        compiler = OnnxCompiler(str(path), weight_dtype="float32")
+        graph, weights = compiler.lower()
 
-        self.assertEqual(graph["source"]["package_class"], "w8a8-v1")
-        self.assertEqual(graph["source"]["quantized_graph_contract"], "w8a8-v1")
+        self.assertEqual(compiler.publication_report["package_class"], "w8a8-v1")
+        self.assertNotIn("source", graph)
         self.assertEqual(
             _resolved_quantization(graph, weights, "input0"),
             {"scheme": "per_tensor", "scale": 0.25, "zero_point": 128},
@@ -1171,10 +1866,10 @@ class InstalledOnnxFrontendTests(unittest.TestCase):
         self.assertEqual(len(graph["nodes"]), 1)
         node = graph["nodes"][0]
         self.assertEqual(node["opType"], "QLinear")
-        self.assertNotIn("params", node)
-        self.assertEqual(node["outputs_dtype"], {"out": "uint8"})
+        self.assertEqual(node["params"], {})
+        self.assertEqual(_output_descriptor(node)["dtype"], "uint8")
         self.assertEqual(
-            _resolved_quantization(graph, weights, node["outputs"]["out"]),
+            _resolved_quantization(graph, weights, _output_tensor(node)),
             {"scheme": "per_tensor", "scale": 0.125, "zero_point": 120},
         )
         preserved_weight = weights[node["inputs"]["weight"]]
@@ -1218,8 +1913,9 @@ class InstalledOnnxFrontendTests(unittest.TestCase):
         inexact_path = self.root / "qdq_qlinear_inexact_bias.onnx"
         onnx.checker.check_model(inexact_model)
         onnx.save(inexact_model, inexact_path)
-        hybrid_graph, _ = OnnxCompiler(str(inexact_path), weight_dtype="float32").lower()
-        self.assertEqual(hybrid_graph["source"]["package_class"], "hybrid")
+        hybrid_compiler = OnnxCompiler(str(inexact_path), weight_dtype="float32")
+        hybrid_graph, _ = hybrid_compiler.lower()
+        self.assertEqual(hybrid_compiler.publication_report["package_class"], "hybrid")
         self.assertNotIn("QLinear", [node["opType"] for node in hybrid_graph["nodes"]])
 
         overflow_model = onnx.load(path)
@@ -1234,8 +1930,9 @@ class InstalledOnnxFrontendTests(unittest.TestCase):
         overflow_path = self.root / "qdq_qlinear_accumulator_overflow.onnx"
         onnx.checker.check_model(overflow_model)
         onnx.save(overflow_model, overflow_path)
-        overflow_graph, _ = OnnxCompiler(str(overflow_path), weight_dtype="float32").lower()
-        self.assertEqual(overflow_graph["source"]["package_class"], "hybrid")
+        overflow_compiler = OnnxCompiler(str(overflow_path), weight_dtype="float32")
+        overflow_graph, _ = overflow_compiler.lower()
+        self.assertEqual(overflow_compiler.publication_report["package_class"], "hybrid")
         self.assertNotIn("QLinear", [node["opType"] for node in overflow_graph["nodes"]])
 
     def test_qdq_metadata_propagates_after_static_input_binding(self):
@@ -1275,7 +1972,7 @@ class InstalledOnnxFrontendTests(unittest.TestCase):
 
         graph, weights = compiler.lower()
         self.assertEqual(
-            [node["outputs_shape"]["out"] for node in graph["nodes"]],
+            [_output_descriptor(node)["shape"] for node in graph["nodes"]],
             [[2, 3], [2, 3], [2, 3]],
         )
         self.assertTrue(validate_graph(graph, ["portable"], weights=weights).supported)
@@ -1349,16 +2046,17 @@ class InstalledOnnxFrontendTests(unittest.TestCase):
             initializers=initializers,
         )
 
-        graph, weights = OnnxCompiler(str(path)).lower()
+        compiler = OnnxCompiler(str(path))
+        graph, weights = compiler.lower()
 
         self.assertEqual(
             [node["opType"] for node in graph["nodes"]],
             ["QLinear", "QLinear"],
         )
         self.assertEqual(
-            len(graph["source"]["features"]["w8a8_qlinear"]), 2
+            len(compiler.publication_report["features"]["w8a8_qlinear"]), 2
         )
-        self.assertEqual(graph["source"]["package_class"], "w8a8-v1")
+        self.assertEqual(compiler.publication_report["package_class"], "w8a8-v1")
         self.assertTrue(validate_graph(graph, ["portable"], weights=weights).supported)
 
         unsafe = onnx.load(path)
@@ -1375,7 +2073,8 @@ class InstalledOnnxFrontendTests(unittest.TestCase):
         onnx.checker.check_model(unsafe)
         onnx.save(unsafe, unsafe_path)
 
-        hybrid, hybrid_weights = OnnxCompiler(str(unsafe_path)).lower()
+        hybrid_compiler = OnnxCompiler(str(unsafe_path))
+        hybrid, hybrid_weights = hybrid_compiler.lower()
         hybrid_ops = [node["opType"] for node in hybrid["nodes"]]
         self.assertEqual(hybrid_ops.count("QLinear"), 2)
         self.assertEqual(hybrid_ops.count("DequantizeLinear"), 1)
@@ -1383,7 +2082,7 @@ class InstalledOnnxFrontendTests(unittest.TestCase):
         self.assertLess(
             hybrid_ops.index("DequantizeLinear"), hybrid_ops.index("Identity")
         )
-        self.assertEqual(hybrid["source"]["package_class"], "hybrid")
+        self.assertEqual(hybrid_compiler.publication_report["package_class"], "hybrid")
         self.assertTrue(
             validate_graph(hybrid, ["portable"], weights=hybrid_weights).supported
         )
@@ -1498,7 +2197,8 @@ class InstalledOnnxFrontendTests(unittest.TestCase):
             )
 
         path = save("qdq_qgemm.onnx")
-        graph, weights = OnnxCompiler(str(path)).lower()
+        compiler = OnnxCompiler(str(path))
+        graph, weights = compiler.lower()
 
         self.assertEqual([node["opType"] for node in graph["nodes"]], ["QGemm"])
         node = graph["nodes"][0]
@@ -1509,8 +2209,8 @@ class InstalledOnnxFrontendTests(unittest.TestCase):
                 graph, weights, node["inputs"]["weight"]
             )["axis"], 0
         )
-        self.assertEqual(len(graph["source"]["features"]["w8a8_qgemm"]), 1)
-        self.assertEqual(graph["source"]["package_class"], "w8a8-v1")
+        self.assertEqual(len(compiler.publication_report["features"]["w8a8_qgemm"]), 1)
+        self.assertEqual(compiler.publication_report["package_class"], "w8a8-v1")
         self.assertTrue(validate_graph(graph, ["portable"], weights=weights).supported)
 
         negative_axis_graph, negative_axis_weights = OnnxCompiler(str(save(
@@ -1638,7 +2338,8 @@ class InstalledOnnxFrontendTests(unittest.TestCase):
             )
 
         path = save("qdq_qbatch_matmul.onnx")
-        graph, weights = OnnxCompiler(str(path)).lower()
+        compiler = OnnxCompiler(str(path))
+        graph, weights = compiler.lower()
 
         self.assertEqual(len(weights), 6)
         self.assertEqual(
@@ -1646,7 +2347,7 @@ class InstalledOnnxFrontendTests(unittest.TestCase):
         )
         node = graph["nodes"][0]
         self.assertEqual(node["inputs"], {"a": "input0", "b": "input1"})
-        self.assertEqual(node["outputs_shape"], {"out": [2, 5, 3, 6]})
+        self.assertEqual(_output_descriptor(node)["shape"], [2, 5, 3, 6])
         self.assertEqual(
             _resolved_quantization(graph, weights, "input0"),
             {"scheme": "per_tensor", "scale": 0.25, "zero_point": 128},
@@ -1656,9 +2357,67 @@ class InstalledOnnxFrontendTests(unittest.TestCase):
             {"scheme": "per_tensor", "scale": 0.5, "zero_point": 127},
         )
         self.assertEqual(
-            len(graph["source"]["features"]["w8a8_qbatch_matmul"]), 1
+            len(compiler.publication_report["features"]["w8a8_qbatch_matmul"]), 1
         )
         self.assertTrue(validate_graph(graph, ["portable"], weights=weights).supported)
+
+        symbolic_path = _save_model(
+            self.root,
+            "qdq_qbatch_symbolic_output.onnx",
+            nodes=[
+                helper.make_node(
+                    "DequantizeLinear", ["raw_a", "a_scale", "a_zero"], ["a"]
+                ),
+                helper.make_node(
+                    "DequantizeLinear", ["raw_b", "b_scale", "b_zero"], ["b"]
+                ),
+                helper.make_node("MatMul", ["a", "b"], ["product"]),
+                helper.make_node(
+                    "QuantizeLinear",
+                    ["product", "output_scale", "output_zero"],
+                    ["result"],
+                ),
+            ],
+            inputs=[
+                _value("raw_a", TensorProto.UINT8, ["B", 8, "T", 40]),
+                _value("raw_b", TensorProto.UINT8, ["B", 8, 40, "M"]),
+            ],
+            outputs=[
+                _value("result", TensorProto.UINT8, ["B", 8, "T", "M"])
+            ],
+            initializers=[
+                _initializer("a_scale", np.asarray(0.25, dtype=np.float32)),
+                _initializer("a_zero", np.asarray(128, dtype=np.uint8)),
+                _initializer("b_scale", np.asarray(0.5, dtype=np.float32)),
+                _initializer("b_zero", np.asarray(127, dtype=np.uint8)),
+                _initializer("output_scale", np.asarray(0.125, dtype=np.float32)),
+                _initializer("output_zero", np.asarray(120, dtype=np.uint8)),
+            ],
+        )
+        symbolic = OnnxCompiler(
+            str(symbolic_path),
+            dimension_bounds={
+                "B": {"min": 1, "max": 1},
+                "T": {"min": 1, "max": 192},
+                "M": {"min": 211, "max": 402},
+            },
+        )
+        symbolic_graph, symbolic_weights = symbolic.lower(
+            enable_static_qdq_layout_optimization=False,
+        )
+        self.assertEqual(
+            [node["opType"] for node in symbolic_graph["nodes"]],
+            ["QBatchMatMul"],
+        )
+        self.assertEqual(
+            _output_descriptor(symbolic_graph["nodes"][0])["shape"],
+            ["B", 8, "T", "M"],
+        )
+        self.assertTrue(
+            validate_graph(
+                symbolic_graph, ["portable"], weights=symbolic_weights,
+            ).supported
+        )
 
         biased = OnnxCompiler(str(save("qdq_qbatch_bias.onnx", add_bias=True)))
         self.assertFalse(biased.qbatch_matmul_replacements)
@@ -1713,7 +2472,8 @@ class InstalledOnnxFrontendTests(unittest.TestCase):
             weight_zero_points=weight_zeros,
         )
 
-        graph, weights = OnnxCompiler(str(path)).lower()
+        compiler = OnnxCompiler(str(path))
+        graph, weights = compiler.lower()
 
         self.assertEqual(
             [node["opType"] for node in graph["nodes"]],
@@ -1721,16 +2481,16 @@ class InstalledOnnxFrontendTests(unittest.TestCase):
         )
         before, qconv, after = graph["nodes"]
         self.assertEqual(before["params"], {"perm": [0, 2, 3, 1]})
-        self.assertEqual(before["outputs_shape"], {"out": [1, 3, 4, 2]})
+        self.assertEqual(_output_descriptor(before)["shape"], [1, 3, 4, 2])
         self.assertEqual(after["params"], {"perm": [0, 3, 1, 2]})
-        self.assertEqual(after["outputs_shape"], {"out": [1, 3, 3, 4]})
+        self.assertEqual(_output_descriptor(after)["shape"], [1, 3, 3, 4])
         self.assertEqual(
-            _resolved_quantization(graph, weights, before["outputs"]["out"]),
+            _resolved_quantization(graph, weights, _output_tensor(before)),
             {"scheme": "per_tensor", "scale": 0.25, "zero_point": 128},
         )
         self.assertEqual(
-            _resolved_quantization(graph, weights, qconv["outputs"]["out"]),
-            _resolved_quantization(graph, weights, after["outputs"]["out"]),
+            _resolved_quantization(graph, weights, _output_tensor(qconv)),
+            _resolved_quantization(graph, weights, _output_tensor(after)),
         )
         self.assertEqual(
             qconv["params"],
@@ -1761,8 +2521,8 @@ class InstalledOnnxFrontendTests(unittest.TestCase):
                 "zero_points": [0, 1, -2],
             },
         )
-        self.assertEqual(len(graph["source"]["features"]["w8a8_qconv2d"]), 1)
-        self.assertEqual(graph["source"]["package_class"], "w8a8-v1")
+        self.assertEqual(len(compiler.publication_report["features"]["w8a8_qconv2d"]), 1)
+        self.assertEqual(compiler.publication_report["package_class"], "w8a8-v1")
         self.assertTrue(validate_graph(graph, ["portable"], weights=weights).supported)
 
         raw_input = (
@@ -1811,6 +2571,38 @@ class InstalledOnnxFrontendTests(unittest.TestCase):
             None, {"raw_input": raw_input}
         )[0]
         np.testing.assert_array_equal(expected, source_result)
+
+    def test_qdq_conv_preserves_a_bounded_symbolic_batch(self):
+        path = _qdq_conv_model(
+            self.root,
+            "qdq_qconv_symbolic_batch.onnx",
+            input_shape=("B", 2, 3, 4),
+        )
+        compiler = OnnxCompiler(
+            str(path), dimension_bounds={"B": {"min": 1, "max": 4}}
+        )
+
+        graph, weights = compiler.lower()
+
+        self.assertEqual(
+            [node["opType"] for node in graph["nodes"]],
+            ["Transpose", "QConv2D", "Transpose"],
+        )
+        self.assertEqual(
+            _output_descriptor(graph["nodes"][0])["shape"],
+            ["B", 3, 4, 2],
+        )
+        self.assertEqual(
+            _output_descriptor(graph["nodes"][1])["shape"],
+            ["B", 3, 4, 3],
+        )
+        self.assertEqual(
+            _output_descriptor(graph["nodes"][2])["shape"],
+            ["B", 3, 3, 4],
+        )
+        self.assertTrue(
+            validate_graph(graph, ["portable"], weights=weights).supported
+        )
 
     def test_qdq_conv_rejects_noncanonical_descriptors_and_unsafe_regions(self):
         invalid_paths = [
@@ -1951,9 +2743,10 @@ class InstalledOnnxFrontendTests(unittest.TestCase):
             ],
         )
 
-        graph, _ = OnnxCompiler(str(path), weight_dtype="float32").lower()
+        compiler = OnnxCompiler(str(path), weight_dtype="float32")
+        graph, _ = compiler.lower()
 
-        self.assertEqual(graph["source"]["features"]["lora"][0]["rank"], 2)
+        self.assertEqual(compiler.publication_report["features"]["lora"][0]["rank"], 2)
         self.assertEqual(
             [node["opType"] for node in graph["nodes"]],
             ["Linear", "Linear", "Linear", "Mul", "Add"],
@@ -1994,8 +2787,8 @@ class InstalledOnnxFrontendTests(unittest.TestCase):
                     ["Transpose"],
                 )
                 self.assertEqual(
-                    graph["nodes"][0]["outputs_dtype"],
-                    {"out": dtype},
+                    _output_descriptor(graph["nodes"][0])["dtype"],
+                    dtype,
                 )
                 self.assertTrue(
                     validate_graph(graph, ["portable"], weights=weights).supported

@@ -1,9 +1,10 @@
 import { Tensor } from '../core/Tensor.js';
 import { DataType } from '../generated/volvoxaiEnums.js';
-import type { Graph } from '../core/Graph.js';
+import type { RuntimeGraph } from '../core/RuntimeGraph.js';
 import type { ShaderLibrary as ShaderLibraryClass } from './ShaderLibrary.js';
 import { geluApproximation } from '../ops/gELU.js';
 import { normalizeSpatialPair } from '../ops/spatialParameters.js';
+import { fullSpatialPads, spatialPair } from '../ops/spatialKernelValidation.js';
 import { batchMatMulDescriptor } from '../ops/batchMatMul.js';
 import { qBatchMatMulMetadataDescriptor } from '../ops/qBatchMatMul.js';
 import { comparisonDescriptor, logicalNotDescriptor } from '../ops/comparison.js';
@@ -14,6 +15,7 @@ import type {
   ExecutorNode,
   ExecutorTensor,
   IncrementalRowByteCopy,
+  IncrementalRowPlan,
 } from './WebGPUContracts.js';
 
 // ShaderLibrary statically imports WGSL text. Keep it lazy so importing CPU or
@@ -22,26 +24,79 @@ type ShaderLibraryConstructor = typeof ShaderLibraryClass;
 let ShaderLibrary: ShaderLibraryConstructor;
 
 export interface WebGPUCompiledGraphPlan {
-  readonly dinWeights: readonly (readonly [
-    string,
-    Readonly<{ din: number; dout: number }>,
-  ])[];
   readonly resultCopyTensorNames: readonly string[];
 }
 
-function nodeOutput(node: Graph['nodes'][number]) {
+type WebGPUDenseWeightLayout = 'din' | 'dout';
+
+function explicitWebGPUDenseWeightLayout(
+  node: Pick<RuntimeGraph['nodes'][number], 'id' | 'opType' | 'params'>,
+): WebGPUDenseWeightLayout | null {
+  const rawLayout = node.params?.weight_layout;
+  let weightLayout: WebGPUDenseWeightLayout | null = null;
+  if (rawLayout != null && rawLayout !== '') {
+    if (['IN_OUT', 'in_out', 'IO', 'din_dout'].includes(rawLayout as string)) {
+      weightLayout = 'din';
+    } else if (['OUT_IN', 'out_in', 'OI', 'peft', 'dout_din'].includes(rawLayout as string)) {
+      weightLayout = 'dout';
+    } else {
+      throw new Error(
+        `WebGPU ${node.opType} node ${String(node.id)} has unsupported ` +
+        `weight_layout '${String(rawLayout)}'.`,
+      );
+    }
+  }
+
+  const rawTransB = node.params?.transB;
+  if (rawTransB !== undefined && typeof rawTransB !== 'boolean') {
+    throw new Error(
+      `WebGPU ${node.opType} node ${String(node.id)} requires boolean transB metadata.`,
+    );
+  }
+  const transBLayout = rawTransB === undefined ? null : (rawTransB ? 'dout' : 'din');
+  if (weightLayout && transBLayout && weightLayout !== transBLayout) {
+    throw new Error(
+      `WebGPU ${node.opType} node ${String(node.id)} has contradictory explicit ` +
+      'weight_layout and transB metadata.',
+    );
+  }
+  return weightLayout ?? transBLayout;
+}
+
+function webGPUDenseWeightLayout(
+  node: Pick<RuntimeGraph['nodes'][number], 'id' | 'opType' | 'params' | 'wLayout'>,
+): WebGPUDenseWeightLayout {
+  const explicitLayout = explicitWebGPUDenseWeightLayout(node);
+  if (node.wLayout !== undefined && node.wLayout !== 'din' && node.wLayout !== 'dout') {
+    throw new Error(
+      `WebGPU ${node.opType} node ${String(node.id)} has invalid normalized ` +
+      `weight layout '${String(node.wLayout)}'.`,
+    );
+  }
+  if (node.wLayout && explicitLayout && node.wLayout !== explicitLayout) {
+    throw new Error(
+      `WebGPU ${node.opType} node ${String(node.id)} has contradictory weight layout ` +
+      `metadata: normalized wLayout '${node.wLayout}' conflicts with explicit ` +
+      `'${explicitLayout}' metadata.`,
+    );
+  }
+  if (node.wLayout) return node.wLayout;
+  if (explicitLayout) return explicitLayout;
+  return node.opType === 'Linear' ? 'dout' : 'din';
+}
+
+function nodeOutput(node: RuntimeGraph['nodes'][number]) {
   return node.outputs?.out || Object.values(node.outputs || {})[0];
 }
 
-function dropoutInput(node: Graph['nodes'][number]) {
+function dropoutInput(node: RuntimeGraph['nodes'][number]) {
   return node.inputs?.input || node.inputs?.x || node.inputs?.data;
 }
 
 /** Pure, immutable planning performed before context resources are allocated. */
 export function compileWebGPUGraphPlan(
-  graph: Graph,
+  graph: RuntimeGraph,
 ): WebGPUCompiledGraphPlan {
-  const dinWeights = new Map<string, { readonly din: number; readonly dout: number }>();
   for (const node of graph.nodes) {
     if (Object.prototype.hasOwnProperty.call(node.params || {}, 'coordinate_transform_mode')) {
       throw new Error(
@@ -50,16 +105,10 @@ export function compileWebGPUGraphPlan(
       );
     }
     if ((node.opType === 'MatMul' || node.opType === 'Linear' || node.opType === 'Gemm') &&
-        node.wLayout === 'din' && node.inputs.weight && !node.inputs.scale &&
-        !node.inputs.weight_scale) {
-      const input = node.inputs.input || node.inputs.x || node.inputs.a;
-      const output = nodeOutput(node);
-      const din = input?.shape?.at(-1);
-      const dout = output?.shape?.at(-1);
-      if (!Number.isInteger(din) || !Number.isInteger(dout) || din! <= 0 || dout! <= 0) {
-        throw new Error(`WebGPU linear node ${String(node.id)} has invalid din/dout dimensions.`);
-      }
-      dinWeights.set(node.inputs.weight.name, Object.freeze({ din: din!, dout: dout! }));
+        !node.inputs.scale && !node.inputs.weight_scale) {
+      // Keep normalized per-node layout authoritative and reject contradictory
+      // direct-graph metadata before any graph resource is staged.
+      webGPUDenseWeightLayout(node);
     }
   }
 
@@ -79,11 +128,8 @@ export function compileWebGPUGraphPlan(
     }
   }
 
-  const immutableDinWeights = Object.freeze([...dinWeights].map(([name, dimensions]) =>
-    Object.freeze([name, dimensions] as const)));
   const immutableResultCopyTensorNames = Object.freeze([...resultCopyTensorNames]);
   return Object.freeze({
-    dinWeights: immutableDinWeights,
     resultCopyTensorNames: immutableResultCopyTensorNames,
   });
 }
@@ -108,6 +154,54 @@ function concatInputEntries(node: ExecutorNode): Array<[string, ExecutorTensor]>
     });
   ordered.push(...remaining);
   return ordered;
+}
+
+function orderedSplitOutputKeys(node: ExecutorNode): string[] {
+  const keys = Object.keys(node.outputs || {});
+  if (keys.every((name) => /^out(0|[1-9][0-9]*)$/.test(name))) {
+    const ordered = [...keys].sort((left, right) =>
+      Number(left.slice(3)) - Number(right.slice(3)));
+    if (ordered.some((name, index) => name !== `out${index}`)) {
+      throw new Error(`WebGPU Split node ${node.id} requires contiguous canonical outN ports.`);
+    }
+    return ordered;
+  }
+  // Direct legacy RuntimeGraphs used arbitrary insertion-ordered output names.
+  return keys;
+}
+
+interface WebGPUResidentSlotTable {
+  readonly slots: readonly number[];
+  readonly domain: number;
+}
+
+function webGPUResidentSlotTable(
+  node: ExecutorNode,
+  stagedRows: number,
+  label: string,
+): WebGPUResidentSlotTable | null {
+  const slots = node.residentSlots;
+  const domain = node.residentSlotDomain;
+  if (slots === undefined) {
+    if (domain !== undefined) {
+      throw new Error(
+        `WebGPU ${label} node ${node.id} has a resident slot domain without a slot table.`,
+      );
+    }
+    return null;
+  }
+  if (!Array.isArray(slots) || slots.length !== stagedRows ||
+      typeof domain !== 'number' || !Number.isSafeInteger(domain) ||
+      domain <= 0 || domain > 0xffffffff ||
+      slots.some((slot, index) =>
+        !Number.isSafeInteger(slot) || slot < 0 || slot >= domain ||
+        (index > 0 && slot <= slots[index - 1]))) {
+    throw new Error(
+      `WebGPU ${label} node ${node.id} has invalid resident slot-domain metadata ` +
+      `for ${stagedRows} staged rows.`,
+    );
+  }
+  return { slots, domain };
 }
 
 function float32Storage(storage: ExecutorTensor['buffer']): Float32Array {
@@ -752,18 +846,26 @@ function webGpuSliceDescriptor(node, input, output) {
   for (let index = 0; index < axesInput.length; index++) {
     let axis = axesInput[index];
     if (axis < 0) axis += rank;
-    let start = startsInput[index];
+    const rawStart = startsInput[index];
     const step = stepsInput[index];
     if (!Number.isInteger(axis) || axis < 0 || axis >= rank || seen.has(axis) ||
-        !Number.isSafeInteger(start) || !Number.isSafeInteger(step) || step <= 0 || step > 0xffffffff) {
+        !Number.isSafeInteger(rawStart) || !Number.isSafeInteger(step) || step <= 0) {
       throw new Error(`WebGPU Slice node ${node.id} requires unique axes, integer starts, and positive integer steps.`);
     }
-    if (start < 0) start += input.shape[axis];
-    if (start < 0 || start >= input.shape[axis]) {
+    const extent = input.shape[axis];
+    const start = Math.min(extent, Math.max(
+      0,
+      rawStart < 0 ? rawStart + extent : rawStart,
+    ));
+    if (start >= extent) {
       throw new Error(`WebGPU Slice node ${node.id} start is outside its input axis.`);
     }
     starts[axis] = start;
-    steps[axis] = step;
+    // A step larger than u32 is canonical only when this axis emits one
+    // element: every multi-element selection is bounded by its u32 input
+    // extent. In that single-coordinate case the shader never observes the
+    // increment, so encode the equivalent unit step instead of wrapping it.
+    steps[axis] = output.shape[axis] === 1 && step > 0xffffffff ? 1 : step;
     seen.add(axis);
   }
   const inputStrides = new Array(rank);
@@ -795,74 +897,103 @@ export class WebGPUGraphCompiler {
     async _compileIncrementalRowPipelines(
       nodeIndices: Iterable<number> = this.host.incrementalRowCandidates.keys(),
     ): Promise<void> {
-      for (const nodeIndex of nodeIndices) {
-        if (this.host.incrementalRowPlans.has(nodeIndex)) continue;
-        const candidate = this.host.incrementalRowCandidates.get(nodeIndex);
-        if (!candidate) continue;
-        const buffers = new Map(this.host.gpuBuffers);
-        const scratchByName = new Map<string, GPUBuffer>();
-        for (const [name, logicalCapacity] of candidate.scratchCapacities) {
-          const scratch = this.host.device.createBuffer({
-            label: `IncrementalRow_${nodeIndex}_${name}`,
-            size: Math.max(4, Math.ceil(logicalCapacity / 4) * 4),
-            usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST,
-          });
-          this.host.auxiliaryBuffers.add(scratch);
-          scratchByName.set(name, scratch);
-          buffers.set(name, scratch);
-        }
-        const pipelines: CompiledWebGPUPipeline[] = [];
-        await this.host._buildNodePipeline(candidate.sampleNode, { pipelines, buffers });
-        if (pipelines.length === 0) continue;
-        for (const pipeline of pipelines) pipeline.graphNodeIndex = nodeIndex;
-        const byteCopyPipeline = candidate.byteCopyInputs.size || candidate.byteCopyOutputs.size
-          ? await this.host._cachedComputePipeline(ShaderLibrary!.getIncrementalRowByteCopyShader())
-          : null;
-        const makeByteCopies = (
-          names: Set<string>,
-          input: boolean,
-        ): Map<string, IncrementalRowByteCopy> => {
-          const copies = new Map<string, IncrementalRowByteCopy>();
-          for (const name of names) {
-            const full = this.host.gpuBuffers.get(name);
-            const scratch = scratchByName.get(name);
-            if (!byteCopyPipeline || !full || !scratch) {
-              throw new Error(`WebGPU incremental row byte-copy resources for '${name}' are incomplete.`);
-            }
-            const paramsBuffer = this.host.device.createBuffer({
-              label: `IncrementalRow_${nodeIndex}_${name}_${input ? 'input' : 'output'}_copy_params`,
-              size: 16,
-              usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+      const candidateResources = new Set<GPUBuffer>();
+      const stagedPlans: Array<readonly [number, IncrementalRowPlan]> = [];
+      const previousResources = this.host._activeSpecializationResources;
+      const previousBufferCreateCount = this.host.specializationBufferCreateCount;
+      const previousBindGroupCreateCount = this.host.bindGroupCreateCount;
+      this.host._activeSpecializationResources = candidateResources;
+      try {
+        for (const nodeIndex of nodeIndices) {
+          if (this.host.incrementalRowPlans.has(nodeIndex)) continue;
+          const candidate = this.host.incrementalRowCandidates.get(nodeIndex);
+          if (!candidate) continue;
+          const buffers = new Map(this.host.gpuBuffers);
+          const scratchByName = new Map<string, GPUBuffer>();
+          for (const [name, logicalCapacity] of candidate.scratchCapacities) {
+            const scratch = this.host._createSpecializationBuffer({
+              label: `IncrementalRow_${nodeIndex}_${name}`,
+              size: Math.max(4, Math.ceil(logicalCapacity / 4) * 4),
+              usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST,
             });
-            this.host.auxiliaryBuffers.add(paramsBuffer);
-            copies.set(name, {
-              paramsBuffer,
-              bindGroup: this.host.device.createBindGroup({
-                layout: byteCopyPipeline.getBindGroupLayout(0),
-                entries: [
-                  { binding: 0, resource: { buffer: input ? full : scratch } },
-                  { binding: 1, resource: { buffer: input ? scratch : full } },
-                  { binding: 2, resource: { buffer: paramsBuffer } },
-                ],
-              }),
-            });
+            scratchByName.set(name, scratch);
+            buffers.set(name, scratch);
           }
-          return copies;
-        };
-        const inputByteCopies = makeByteCopies(candidate.byteCopyInputs, true);
-        const outputByteCopies = makeByteCopies(candidate.byteCopyOutputs, false);
-        this.host.incrementalRowPlans.set(nodeIndex, {
-          ...candidate,
-          buffers,
-          scratchByName,
-          pipelines,
-          qsdpaParamsBuffer: candidate.node.opType === 'QSDPA'
-            ? pipelines.find((pipeline) => pipeline.paramsBuffer)?.paramsBuffer || null
-            : null,
-          byteCopyPipeline,
-          inputByteCopies,
-          outputByteCopies,
-        });
+          const pipelines: CompiledWebGPUPipeline[] = [];
+          await this.host._buildNodePipeline(candidate.sampleNode, {
+            pipelines,
+            buffers,
+            resources: candidateResources,
+          });
+          if (pipelines.length === 0) {
+            throw new Error(
+              `WebGPU incremental row node ${String(candidate.node?.id ?? nodeIndex)} produced no pipeline.`,
+            );
+          }
+          for (const pipeline of pipelines) pipeline.graphNodeIndex = nodeIndex;
+          const byteCopyPipeline = candidate.byteCopyInputs.size || candidate.byteCopyOutputs.size
+            ? await this.host._cachedComputePipeline(ShaderLibrary!.getIncrementalRowByteCopyShader())
+            : null;
+          const makeByteCopies = (
+            names: Set<string>,
+            input: boolean,
+          ): Map<string, IncrementalRowByteCopy> => {
+            const copies = new Map<string, IncrementalRowByteCopy>();
+            for (const name of names) {
+              const full = this.host.gpuBuffers.get(name);
+              const scratch = scratchByName.get(name);
+              if (!byteCopyPipeline || !full || !scratch) {
+                throw new Error(`WebGPU incremental row byte-copy resources for '${name}' are incomplete.`);
+              }
+              const paramsBuffer = this.host._createSpecializationBuffer({
+                label: `IncrementalRow_${nodeIndex}_${name}_${input ? 'input' : 'output'}_copy_params`,
+                size: 16,
+                usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+              });
+              copies.set(name, {
+                paramsBuffer,
+                bindGroup: this.host._createSpecializationBindGroup(byteCopyPipeline, {
+                  layout: byteCopyPipeline.getBindGroupLayout(0),
+                  entries: [
+                    { binding: 0, resource: { buffer: input ? full : scratch } },
+                    { binding: 1, resource: { buffer: input ? scratch : full } },
+                    { binding: 2, resource: { buffer: paramsBuffer } },
+                  ],
+                }),
+              });
+            }
+            return copies;
+          };
+          const inputByteCopies = makeByteCopies(candidate.byteCopyInputs, true);
+          const outputByteCopies = makeByteCopies(candidate.byteCopyOutputs, false);
+          const plan: IncrementalRowPlan = {
+            ...candidate,
+            buffers,
+            scratchByName,
+            pipelines,
+            qsdpaParamsBuffer: candidate.node.opType === 'QSDPA'
+              ? pipelines.find((pipeline) => pipeline.paramsBuffer)?.paramsBuffer || null
+              : null,
+            byteCopyPipeline,
+            inputByteCopies,
+            outputByteCopies,
+          };
+          stagedPlans.push([nodeIndex, plan]);
+        }
+        // Publish the selected row generation only after every missing node is
+        // complete. A later node failure must not leave an earlier plan alive
+        // with resources that escaped the failed request.
+        for (const buffer of candidateResources) this.host.auxiliaryBuffers.add(buffer);
+        for (const [nodeIndex, plan] of stagedPlans) {
+          this.host.incrementalRowPlans.set(nodeIndex, plan);
+        }
+      } catch (error) {
+        for (const buffer of candidateResources) buffer.destroy?.();
+        this.host.specializationBufferCreateCount = previousBufferCreateCount;
+        this.host.bindGroupCreateCount = previousBindGroupCreateCount;
+        throw error;
+      } finally {
+        this.host._activeSpecializationResources = previousResources;
       }
     }
     /**
@@ -872,11 +1003,9 @@ export class WebGPUGraphCompiler {
     async _ensureAdapterPipeline(): Promise<GPUComputePipeline> {
       if (this.host.adapterPipeline) return this.host.adapterPipeline;
       if (!ShaderLibrary) ({ ShaderLibrary } = await import('./ShaderLibrary.js'));
-      const module = this.host.device.createShaderModule({ code: ShaderLibrary.getLoRAApplyShader() });
-      this.host.adapterPipeline = await this.host.device.createComputePipelineAsync({
-        layout: "auto",
-        compute: { module, entryPoint: "main" },
-      });
+      this.host.adapterPipeline = await this.host._cachedComputePipeline(
+        ShaderLibrary.getLoRAApplyShader(),
+      );
       return this.host.adapterPipeline;
     }
 
@@ -890,67 +1019,31 @@ export class WebGPUGraphCompiler {
         constants?: Record<string, number | boolean> | null;
       } = {},
     ): Promise<GPUComputePipeline> {
-      const constantEntries = constants
-        ? Object.entries(constants).sort(([left], [right]) => left.localeCompare(right))
-        : [];
-      const constantKeyEntries = constantEntries.map(([name, value]) => {
-        let encoded;
-        if (typeof value === 'boolean') encoded = value ? 'boolean:true' : 'boolean:false';
-        else if (typeof value !== 'number') {
-          throw new TypeError(`WebGPU pipeline constant '${name}' must be numeric or boolean.`);
-        } else if (Number.isNaN(value)) encoded = 'number:NaN';
-        else if (Object.is(value, -0)) encoded = 'number:-0';
-        else encoded = `number:${String(value)}`;
-        return [name, encoded];
-      });
-      const variantKey = JSON.stringify([entryPoint, constantKeyEntries]);
-      let variants = this.host.computePipelineCache.get(code);
-      if (!variants) {
-        variants = new Map();
-        this.host.computePipelineCache.set(code, variants);
-      }
-      let pending = variants.get(variantKey);
-      if (!pending) {
-        const module = this.host.device.createShaderModule({ code });
-        const compute: GPUProgrammableStage = { module, entryPoint };
-        if (constantEntries.length) {
-          compute.constants = Object.fromEntries(constantEntries) as Record<string, number>;
-        }
-        try {
-          pending = Promise.resolve(this.host.device.createComputePipelineAsync({ layout: "auto", compute }));
-        } catch (error) {
-          if (variants.size === 0) this.host.computePipelineCache.delete(code);
-          throw error;
-        }
-        variants.set(variantKey, pending);
-      }
-      try {
-        return await pending;
-      } catch (error) {
-        // A rejected optional-feature pipeline must not poison a later retry or
-        // prevent the caller from compiling its portable fallback.
-        if (variants.get(variantKey) === pending) variants.delete(variantKey);
-        if (variants.size === 0) this.host.computePipelineCache.delete(code);
-        throw error;
-      }
+      return this.host.deviceState.computePipeline(code, { entryPoint, constants });
     }
 
     async _buildNodePipeline(node: ExecutorNode, {
       pipelines = this.host.pipelines,
       buffers = this.host.gpuBuffers,
+      resources = this.host.auxiliaryBuffers,
     }: {
       pipelines?: CompiledWebGPUPipeline[];
       buffers?: Map<string, GPUBuffer>;
+      resources?: Set<GPUBuffer>;
     } = {}): Promise<void> {
       const previousPipelines = this.host._activePipelineTarget;
       const previousBuffers = this.host._activePipelineBuffers;
+      const previousResources = this.host._activeSpecializationResources;
       this.host._activePipelineTarget = pipelines;
       this.host._activePipelineBuffers = buffers;
+      this.host._activeSpecializationResources = resources;
+      this.host._setSpecializationScope(`${String(node.id)}:${node.opType}`);
       try {
         return await this.host._buildNodePipelineImpl(node);
       } finally {
         this.host._activePipelineTarget = previousPipelines;
         this.host._activePipelineBuffers = previousBuffers;
+        this.host._activeSpecializationResources = previousResources;
       }
     }
 
@@ -958,6 +1051,8 @@ export class WebGPUGraphCompiler {
       let wgslCode = "";
       let fallbackWgslCode = "";
       let fallbackWorkgroupCount: number[] | null = null;
+      let tacticId: string | undefined;
+      let fallbackTacticId: string | undefined;
       let bindGroupEntries: GPUBindGroupEntry[] = [];
       let workgroupCount = [1, 1, 1];
       if (node.opType === "QConv2D") {
@@ -1076,9 +1171,8 @@ export class WebGPUGraphCompiler {
         pi[21] = outputQuantization.zero_point;
         pf[24] = inputQuantization.scale;
         pf[25] = outputQuantization.scale;
-        const paramsBuf = this.host.device.createBuffer({ size: 112, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
-        this.host.device.queue.writeBuffer(paramsBuf, 0, p);
-        this.host.auxiliaryBuffers.add(paramsBuf);
+        const paramsBuf = this.host._createSpecializationBuffer({ size: 112, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+        this.host._writeSpecializationBuffer(paramsBuf, 0, p);
         bindGroupEntries = [
           { binding: 0, resource: { buffer: this.host._buffer(input) } },
           { binding: 1, resource: { buffer: this.host._buffer(weight) } },
@@ -1107,30 +1201,41 @@ export class WebGPUGraphCompiler {
         const groups = node.params.groups || 1;
         const pads = Array.isArray(node.params.pads) ? node.params.pads : [pt, pl, pt, pl];
         const noPad = pads.length >= 4 && pads[0] === 0 && pads[1] === 0 && pads[2] === 0 && pads[3] === 0;
-        const weightLayout = node.params.weight_layout || (groups === c ? "HWCM" : "HWIO");
+        const weightLayout = node.params.weight_layout || "HWIO";
         fallbackWgslCode = wgslCode;
         fallbackWorkgroupCount = [Math.ceil(outW / 8), Math.ceil(outH / 8), n * outC];
+        tacticId = 'webgpu.conv2d.scalar';
+        fallbackTacticId = tacticId;
         if (groups === 1 && weightLayout === "HWIO" && c === 3 && (outC & 15) === 0) {
           wgslCode = ShaderLibrary.getConv2DRegularC3Out16Shader();
           workgroupCount = [Math.ceil(outW / 8), Math.ceil(outH / 8), n * (outC / 16)];
+          tacticId = 'webgpu.conv2d.c3-out16';
         } else if (groups === c && weightLayout === "HWCM" && outC === c && (outC & 7) === 0) {
           wgslCode = ShaderLibrary.getConv2DDepthwise8Shader();
           workgroupCount = [Math.ceil(outW / 8), Math.ceil(outH / 8), n * Math.ceil(outC / 8)];
+          tacticId = 'webgpu.conv2d.depthwise8';
         } else if (groups === 1 && weightLayout === "HWIO" && kh === 1 && kw === 1 &&
                    sy === 1 && sx === 1 && noPad && dy === 1 && dx === 1 &&
                    outH === h && outW === w) {
           if ((outC & 15) === 0) {
             wgslCode = ShaderLibrary.getConv2DPointwise16TileShader();
             workgroupCount = [Math.ceil(outW / 8), Math.ceil(outH / 8), n * (outC / 16)];
+            tacticId = 'webgpu.conv2d.pointwise16-tile';
           } else if ((outC & 3) === 0) {
             wgslCode = ShaderLibrary.getConv2DPointwise8Vec4Shader();
             workgroupCount = [Math.ceil(outW / 8), Math.ceil(outH / 8), n * Math.ceil(outC / 8)];
+            tacticId = 'webgpu.conv2d.pointwise8-vec4';
           } else if ((outC & 1) === 0) {
             wgslCode = ShaderLibrary.getConv2DPointwise8Vec2Shader();
             workgroupCount = [Math.ceil(outW / 8), Math.ceil(outH / 8), n * Math.ceil(outC / 8)];
+            tacticId = 'webgpu.conv2d.pointwise8-vec2';
           }
+        } else if (groups === 1 && weightLayout === "HWIO" && (outC & 15) === 0) {
+          wgslCode = ShaderLibrary.getConv2DRegularOut16Shader();
+          workgroupCount = [Math.ceil(outW / 8), Math.ceil(outH / 8), n * (outC / 16)];
+          tacticId = 'webgpu.conv2d.regular-out16';
         }
-        const biasBuf = this.host._buffer(node.inputs.bias) || this.host.device.createBuffer({
+        const biasBuf = this.host._buffer(node.inputs.bias) || this.host._createSpecializationBuffer({
           size: Math.max(4, outC * 4),
           usage: GPUBufferUsage.STORAGE,
         });
@@ -1153,8 +1258,8 @@ export class WebGPUGraphCompiler {
           dy,
           dx
         ]);
-        const paramBuf = this.host.device.createBuffer({ size: Math.ceil(p.byteLength / 16) * 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
-        this.host.device.queue.writeBuffer(paramBuf, 0, p);
+        const paramBuf = this.host._createSpecializationBuffer({ size: Math.ceil(p.byteLength / 16) * 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+        this.host._writeSpecializationBuffer(paramBuf, 0, p);
         bindGroupEntries = [
           { binding: 0, resource: { buffer: inputBuf } },
           { binding: 1, resource: { buffer: weightBuf } },
@@ -1167,39 +1272,40 @@ export class WebGPUGraphCompiler {
         wgslCode = ShaderLibrary.getConv1DShader();
         const inputShape = node.inputs.input.shape;
         const outputShape = node.outputs.out.shape;
+        // NLC activations [batch, l, c]; WIO weights [k, in_per_group, out_c].
         if (inputShape.length !== 3 || outputShape.length !== 3 ||
             inputShape[0] <= 0 || outputShape[0] !== inputShape[0]) {
-          throw new Error(`Conv1D node ${node.id} has incompatible batched NCL dimensions.`);
+          throw new Error(`Conv1D node ${node.id} has incompatible batched NLC dimensions.`);
         }
         const groups = node.params.groups ?? 1;
         const inPerGroup = node.inputs.weight.shape[1];
-        if (!Number.isInteger(groups) || groups <= 0 || inputShape[1] % groups || outputShape[1] % groups ||
-            inPerGroup !== inputShape[1] / groups) {
-          throw new Error(`Conv1D node ${node.id} has incompatible grouped NCL dimensions.`);
+        if (!Number.isInteger(groups) || groups <= 0 || inputShape[2] % groups || outputShape[2] % groups ||
+            inPerGroup !== inputShape[2] / groups) {
+          throw new Error(`Conv1D node ${node.id} has incompatible grouped NLC dimensions.`);
         }
         const inputBuf = this.host._buffer(node.inputs.input);
         const weightBuf = this.host._buffer(node.inputs.weight);
         const outputBuf = this.host._buffer(node.outputs.out);
-        const biasBuf = this.host._buffer(node.inputs.bias) || this.host.device.createBuffer({
-          size: Math.max(4, node.inputs.weight.shape[0] * 4),
+        const biasBuf = this.host._buffer(node.inputs.bias) || this.host._createSpecializationBuffer({
+          size: Math.max(4, node.inputs.weight.shape[2] * 4),
           usage: GPUBufferUsage.STORAGE,
         });
         const p = new Uint32Array([
-          node.inputs.input.shape[1],
-          node.inputs.input.shape[2],
-          node.outputs.out.shape[1],
-          node.inputs.weight.shape[2],
+          inputShape[2],
+          inputShape[1],
+          outputShape[2],
+          node.inputs.weight.shape[0],
           normalizeSpatialPair(node.params.stride, 1)[0],
           normalizeSpatialPair(node.params.padding, 0)[0],
           node.params.relu ? 1 : 0,
           inputShape[0],
           groups,
           inPerGroup,
-          outputShape[2],
+          outputShape[1],
           0
         ]);
-        const paramBuf = this.host.device.createBuffer({ size: p.byteLength, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
-        this.host.device.queue.writeBuffer(paramBuf, 0, p);
+        const paramBuf = this.host._createSpecializationBuffer({ size: p.byteLength, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+        this.host._writeSpecializationBuffer(paramBuf, 0, p);
         bindGroupEntries = [
           { binding: 0, resource: { buffer: inputBuf } },
           { binding: 1, resource: { buffer: weightBuf } },
@@ -1207,7 +1313,7 @@ export class WebGPUGraphCompiler {
           { binding: 3, resource: { buffer: outputBuf } },
           { binding: 4, resource: { buffer: paramBuf } }
         ];
-        workgroupCount = [Math.ceil(node.outputs.out.shape[2] / 64), node.outputs.out.shape[1], inputShape[0]];
+        workgroupCount = [Math.ceil(outputShape[1] / 64), outputShape[2], inputShape[0]];
       } else if (node.opType === "SpatialSoftargmaxY") {
         wgslCode = ShaderLibrary.getSpatialSoftargmaxYShader();
         const inputBuf = this.host._buffer(node.inputs.input);
@@ -1222,8 +1328,8 @@ export class WebGPUGraphCompiler {
           node.inputs.input.shape[3],
           node.inputs.input.shape[0]
         ]);
-        const paramBuf = this.host.device.createBuffer({ size: p.byteLength, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
-        this.host.device.queue.writeBuffer(paramBuf, 0, p);
+        const paramBuf = this.host._createSpecializationBuffer({ size: p.byteLength, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+        this.host._writeSpecializationBuffer(paramBuf, 0, p);
         bindGroupEntries = [
           { binding: 0, resource: { buffer: inputBuf } },
           { binding: 1, resource: { buffer: outputBuf } },
@@ -1240,8 +1346,8 @@ export class WebGPUGraphCompiler {
           node.inputs.input.shape[2],
           node.inputs.input.shape[3]
         ]);
-        const paramBuf = this.host.device.createBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
-        this.host.device.queue.writeBuffer(paramBuf, 0, p);
+        const paramBuf = this.host._createSpecializationBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+        this.host._writeSpecializationBuffer(paramBuf, 0, p);
         bindGroupEntries = [
           { binding: 0, resource: { buffer: inputBuf } },
           { binding: 1, resource: { buffer: outputBuf } },
@@ -1273,17 +1379,13 @@ export class WebGPUGraphCompiler {
         if (ordinaryDtype === 'int32' && node.params?.sigmoid) {
           throw new Error(`Concat node ${node.id} cannot fuse sigmoid into I32 storage.`);
         }
-        const shaderModule = this.host.device.createShaderModule({
-          code: hasTypedStorage
+        const pipeline = await this.host._cachedComputePipeline(
+          hasTypedStorage
             ? ShaderLibrary.getTypedConcatCopyShader()
             : ordinaryDtype === 'int32'
               ? ShaderLibrary.getConcatCopy32Shader()
               : ShaderLibrary.getConcatCopyShader(),
-        });
-        const pipeline = await this.host.device.createComputePipelineAsync({
-          layout: "auto",
-          compute: { module: shaderModule, entryPoint: "main" }
-        });
+        );
         const rank = output.shape.length;
         let axis = node.params?.axis ?? 0;
         if (!Number.isInteger(axis)) throw new Error(`Concat node ${node.id} has a non-integer axis.`);
@@ -1311,9 +1413,9 @@ export class WebGPUGraphCompiler {
             size, axisOffset, inputAxis, output.shape[axis], inner,
             node.params?.sigmoid ? 1 : 0, 0, 0,
           ]);
-          const paramsBuf = this.host.device.createBuffer({ size: p.byteLength, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
-          this.host.device.queue.writeBuffer(paramsBuf, 0, p);
-          const bindGroup = this.host.device.createBindGroup({
+          const paramsBuf = this.host._createSpecializationBuffer({ size: p.byteLength, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+          this.host._writeSpecializationBuffer(paramsBuf, 0, p);
+          const bindGroup = this.host._createSpecializationBindGroup(pipeline, {
             layout: pipeline.getBindGroupLayout(0),
             entries: [
               { binding: 0, resource: { buffer: this.host._buffer(t) } },
@@ -1338,8 +1440,8 @@ export class WebGPUGraphCompiler {
           node.inputs.input.shape[1], node.inputs.input.shape[2],
           node.inputs.input.shape[3], node.inputs.input.shape[0]
         ]);
-        const paramBuf = this.host.device.createBuffer({ size: p.byteLength, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
-        this.host.device.queue.writeBuffer(paramBuf, 0, p);
+        const paramBuf = this.host._createSpecializationBuffer({ size: p.byteLength, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+        this.host._writeSpecializationBuffer(paramBuf, 0, p);
         bindGroupEntries = [
           { binding: 0, resource: { buffer: inputBuf } },
           { binding: 1, resource: { buffer: outputBuf } },
@@ -1358,8 +1460,8 @@ export class WebGPUGraphCompiler {
           node.inputs.input.shape[1], node.inputs.input.shape[2],
           node.inputs.input.shape[3], node.inputs.input.shape[0]
         ]);
-        const paramBuf = this.host.device.createBuffer({ size: p.byteLength, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
-        this.host.device.queue.writeBuffer(paramBuf, 0, p);
+        const paramBuf = this.host._createSpecializationBuffer({ size: p.byteLength, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+        this.host._writeSpecializationBuffer(paramBuf, 0, p);
         bindGroupEntries = [
           { binding: 0, resource: { buffer: inputBuf } },
           { binding: 1, resource: { buffer: outputBuf } },
@@ -1377,8 +1479,8 @@ export class WebGPUGraphCompiler {
           throw new Error(`${node.opType} node ${node.id} requires matching rank-3 NCL tensors.`);
         }
         const p = new Uint32Array([node.inputs.input.shape[1], node.inputs.input.shape[2], node.params.size, node.inputs.input.shape[0]]);
-        const paramBuf = this.host.device.createBuffer({ size: p.byteLength, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
-        this.host.device.queue.writeBuffer(paramBuf, 0, p);
+        const paramBuf = this.host._createSpecializationBuffer({ size: p.byteLength, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+        this.host._writeSpecializationBuffer(paramBuf, 0, p);
         bindGroupEntries = [
           { binding: 0, resource: { buffer: inputBuf } },
           { binding: 1, resource: { buffer: outputBuf } },
@@ -1456,6 +1558,9 @@ export class WebGPUGraphCompiler {
         wgslCode = this.host.hasPackedDot4
           ? (tiledQLinear ? ShaderLibrary.getQLinearDotTiledShader() : ShaderLibrary.getQLinearDotShader())
           : portableQLinearShader;
+        tacticId = tiledQLinear
+          ? (this.host.hasPackedDot4 ? 'webgpu.qlinear.dot-tiled' : 'webgpu.qlinear.tiled')
+          : (this.host.hasPackedDot4 ? 'webgpu.qlinear.dot' : 'webgpu.qlinear.scalar');
         const p = new ArrayBuffer(64);
         const pu = new Uint32Array(p);
         const pi = new Int32Array(p);
@@ -1470,9 +1575,8 @@ export class WebGPUGraphCompiler {
         pi[9] = outputQuantization.zero_point;
         pf[12] = inputQuantization.scale;
         pf[13] = outputQuantization.scale;
-        const paramsBuf = this.host.device.createBuffer({ size: 64, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
-        this.host.device.queue.writeBuffer(paramsBuf, 0, p);
-        this.host.auxiliaryBuffers.add(paramsBuf);
+        const paramsBuf = this.host._createSpecializationBuffer({ size: 64, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+        this.host._writeSpecializationBuffer(paramsBuf, 0, p);
         bindGroupEntries = [
           { binding: 0, resource: { buffer: this.host._buffer(input) } },
           { binding: 1, resource: { buffer: this.host._buffer(weight) } },
@@ -1488,6 +1592,9 @@ export class WebGPUGraphCompiler {
         if (this.host.hasPackedDot4) {
           fallbackWgslCode = portableQLinearShader;
           fallbackWorkgroupCount = [...workgroupCount];
+          fallbackTacticId = tiledQLinear
+            ? 'webgpu.qlinear.tiled'
+            : 'webgpu.qlinear.scalar';
         }
       } else if (node.opType === "QBatchMatMul") {
         const descriptor = qBatchMatMulMetadataDescriptor(node);
@@ -1511,14 +1618,13 @@ export class WebGPUGraphCompiler {
         metadata.set(descriptor.outputBatchStrides, 0);
         metadata.set(descriptor.aBatchStrides, descriptor.batchRank);
         metadata.set(descriptor.bBatchStrides, descriptor.batchRank * 2);
-        const metadataBuffer = this.host.device.createBuffer({
+        const metadataBuffer = this.host._createSpecializationBuffer({
           size: Math.max(4, metadata.byteLength),
           usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
         });
         if (metadata.byteLength) {
-          this.host.device.queue.writeBuffer(metadataBuffer, 0, metadata);
+          this.host._writeSpecializationBuffer(metadataBuffer, 0, metadata);
         }
-        this.host.auxiliaryBuffers.add(metadataBuffer);
         const params = new ArrayBuffer(64);
         const pu = new Uint32Array(params);
         const pi = new Int32Array(params);
@@ -1539,13 +1645,18 @@ export class WebGPUGraphCompiler {
         pf[12] = descriptor.aScale;
         pf[13] = descriptor.bScale;
         pf[14] = descriptor.outputScale;
-        const paramsBuffer = this.host.device.createBuffer({
+        const paramsBuffer = this.host._createSpecializationBuffer({
           size: params.byteLength,
           usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
         });
-        this.host.device.queue.writeBuffer(paramsBuffer, 0, params);
-        this.host.auxiliaryBuffers.add(paramsBuffer);
-        wgslCode = ShaderLibrary.getQBatchMatMulShader();
+        this.host._writeSpecializationBuffer(paramsBuffer, 0, params);
+        const portableQBatchMatMulShader = ShaderLibrary.getQBatchMatMulShader();
+        wgslCode = this.host.hasPackedDot4
+          ? ShaderLibrary.getQBatchMatMulDotShader()
+          : portableQBatchMatMulShader;
+        tacticId = this.host.hasPackedDot4
+          ? 'webgpu.qbatch-matmul.dot'
+          : 'webgpu.qbatch-matmul.scalar';
         bindGroupEntries = [
           { binding: 0, resource: { buffer: aBuffer } },
           { binding: 1, resource: { buffer: bBuffer } },
@@ -1554,6 +1665,11 @@ export class WebGPUGraphCompiler {
           { binding: 4, resource: { buffer: paramsBuffer } },
         ];
         workgroupCount = [workgroups, 1, 1];
+        if (this.host.hasPackedDot4) {
+          fallbackWgslCode = portableQBatchMatMulShader;
+          fallbackWorkgroupCount = [...workgroupCount];
+          fallbackTacticId = 'webgpu.qbatch-matmul.scalar';
+        }
       } else if (node.opType === "BatchMatMul") {
         const descriptor = batchMatMulDescriptor(node);
         if (descriptor.outputBatchCount > 65535 ||
@@ -1569,12 +1685,11 @@ export class WebGPUGraphCompiler {
         metadata.set(descriptor.outputBatchStrides, 5);
         metadata.set(descriptor.aBatchStrides, 5 + descriptor.batchRank);
         metadata.set(descriptor.bBatchStrides, 5 + descriptor.batchRank * 2);
-        const metadataBuffer = this.host.device.createBuffer({
+        const metadataBuffer = this.host._createSpecializationBuffer({
           size: Math.max(4, metadata.byteLength),
           usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
         });
-        this.host.device.queue.writeBuffer(metadataBuffer, 0, metadata);
-        this.host.auxiliaryBuffers.add(metadataBuffer);
+        this.host._writeSpecializationBuffer(metadataBuffer, 0, metadata);
         wgslCode = ShaderLibrary.getBatchMatMulShader();
         bindGroupEntries = [
           { binding: 0, resource: { buffer: this.host._buffer(descriptor.a) } },
@@ -1606,10 +1721,11 @@ export class WebGPUGraphCompiler {
             output.sizeBytes !== seq_len * d_out * 4) {
           throw new Error(`WebGPU ${node.opType} node ${node.id} has incompatible matrix dimensions.`);
         }
-        const dummyBias = this.host.device.createBuffer({
+        const denseWeightLayout = scale ? null : webGPUDenseWeightLayout(node);
+        const dummyBias = this.host._createSpecializationBuffer({
           size: Math.max(4, d_out * 4), usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
         });
-        this.host.device.queue.writeBuffer(dummyBias, 0, new Float32Array(Math.max(1, d_out)));
+        this.host._writeSpecializationBuffer(dummyBias, 0, new Float32Array(Math.max(1, d_out)));
         if (scale) {
           const scaleElements = webGpuTypedElementCount(scale);
           const zeroPointElements = zeroPoint ? webGpuTypedElementCount(zeroPoint) : 0;
@@ -1629,16 +1745,16 @@ export class WebGPUGraphCompiler {
           wgslCode = useTiledLinear
             ? ShaderLibrary.getLinearInt8TiledShader()
             : ShaderLibrary.getLinearInt8Shader();
-          const dummyZeroPoint = this.host.device.createBuffer({
+          const dummyZeroPoint = this.host._createSpecializationBuffer({
             size: 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
           });
-          this.host.device.queue.writeBuffer(dummyZeroPoint, 0, new Uint32Array(1));
+          this.host._writeSpecializationBuffer(dummyZeroPoint, 0, new Uint32Array(1));
           const p = new Uint32Array([
             seq_len, d_in, d_out, webGpuTypedDtypeCode(weight.dtype), scaleElements,
             zeroPointType, zeroPointElements, 0,
           ]);
-          const paramsBuf = this.host.device.createBuffer({ size: p.byteLength, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
-          this.host.device.queue.writeBuffer(paramsBuf, 0, p);
+          const paramsBuf = this.host._createSpecializationBuffer({ size: p.byteLength, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+          this.host._writeSpecializationBuffer(paramsBuf, 0, p);
           bindGroupEntries = [
             { binding: 0, resource: { buffer: this.host._buffer(input) } },
             { binding: 1, resource: { buffer: this.host._buffer(weight) } },
@@ -1649,24 +1765,46 @@ export class WebGPUGraphCompiler {
             { binding: 6, resource: { buffer: paramsBuf } },
           ];
         } else {
-          if (weight.dtype !== 'float32' ||
+          const inputMajorWeight = denseWeightLayout === 'din';
+          const expectedWeightShape = inputMajorWeight ? [d_in, d_out] : [d_out, d_in];
+          if (weight.dtype !== 'float32' || !sameTensorShape(weight.shape, expectedWeightShape) ||
               (bias && (bias.dtype !== 'float32' || !sameTensorShape(bias.shape, [d_out])))) {
-            throw new Error(`WebGPU ${node.opType} node ${node.id} requires canonical F32 weight and optional bias.`);
+            throw new Error(
+              `WebGPU ${node.opType} node ${node.id} requires canonical ` +
+              `${inputMajorWeight ? '[d_in,d_out] input-major' : '[d_out,d_in] output-major'} ` +
+              'F32 weight and optional bias.',
+            );
           }
           const useTiledLinear = seq_len > 1 && d_in >= 16 && d_out >= 16;
-          wgslCode = useTiledLinear
-            ? ShaderLibrary.getLinearF32TiledShader()
-            : ShaderLibrary.getLinearF32Shader();
           const p = new Uint32Array([seq_len, d_in, d_out]);
-          const paramsBuf = this.host.device.createBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
-          this.host.device.queue.writeBuffer(paramsBuf, 0, p);
-          bindGroupEntries = [
-            { binding: 0, resource: { buffer: this.host._buffer(input) } },
-            { binding: 1, resource: { buffer: this.host._buffer(weight) } },
-            { binding: 3, resource: { buffer: bias ? this.host._buffer(bias) : dummyBias } },
-            { binding: 4, resource: { buffer: this.host._buffer(output) } },
-            { binding: 5, resource: { buffer: paramsBuf } },
-          ];
+          const paramsBuf = this.host._createSpecializationBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+          this.host._writeSpecializationBuffer(paramsBuf, 0, p);
+          if (inputMajorWeight) {
+            wgslCode = useTiledLinear
+              ? ShaderLibrary.getLinearF32RowMajorTiledShader()
+              : ShaderLibrary.getLinearF32RowMajorShader();
+            tacticId = useTiledLinear
+              ? 'webgpu.linear.input-major.tiled'
+              : 'webgpu.linear.input-major.scalar';
+            bindGroupEntries = [
+              { binding: 0, resource: { buffer: this.host._buffer(input) } },
+              { binding: 1, resource: { buffer: this.host._buffer(weight) } },
+              { binding: 2, resource: { buffer: bias ? this.host._buffer(bias) : dummyBias } },
+              { binding: 3, resource: { buffer: this.host._buffer(output) } },
+              { binding: 4, resource: { buffer: paramsBuf } },
+            ];
+          } else {
+            wgslCode = useTiledLinear
+              ? ShaderLibrary.getLinearF32TiledShader()
+              : ShaderLibrary.getLinearF32Shader();
+            bindGroupEntries = [
+              { binding: 0, resource: { buffer: this.host._buffer(input) } },
+              { binding: 1, resource: { buffer: this.host._buffer(weight) } },
+              { binding: 3, resource: { buffer: bias ? this.host._buffer(bias) : dummyBias } },
+              { binding: 4, resource: { buffer: this.host._buffer(output) } },
+              { binding: 5, resource: { buffer: paramsBuf } },
+            ];
+          }
         }
         const useTiledLinear = seq_len > 1 && d_in >= 16 && d_out >= 16;
         workgroupCount = useTiledLinear
@@ -1682,9 +1820,9 @@ export class WebGPUGraphCompiler {
         const p = new ArrayBuffer(16);
         new Uint32Array(p).set([seq_len, d_model!]);
         new Float32Array(p)[2] = node.params.eps ?? 1e-6;
-        const paramsBuf = this.host.device.createBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
-        this.host.device.queue.writeBuffer(paramsBuf, 0, p);
-        const biasBuf = this.host._buffer(node.inputs.bias) || this.host.device.createBuffer({
+        const paramsBuf = this.host._createSpecializationBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+        this.host._writeSpecializationBuffer(paramsBuf, 0, p);
+        const biasBuf = this.host._buffer(node.inputs.bias) || this.host._createSpecializationBuffer({
           size: Math.max(4, d_model! * 4), usage: GPUBufferUsage.STORAGE,
         });
         bindGroupEntries = [
@@ -1727,11 +1865,11 @@ export class WebGPUGraphCompiler {
         const f32 = new Float32Array(raw);
         u32.set([batch, height, width, channels, numGroups!, 1]);
         f32[6] = eps;
-        const paramsBuf = this.host.device.createBuffer({
+        const paramsBuf = this.host._createSpecializationBuffer({
           size: 32,
           usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
         });
-        this.host.device.queue.writeBuffer(paramsBuf, 0, raw);
+        this.host._writeSpecializationBuffer(paramsBuf, 0, raw);
         bindGroupEntries = [
           { binding: 0, resource: { buffer: this.host._buffer(input) } },
           { binding: 1, resource: { buffer: this.host._buffer(weight) } },
@@ -1743,8 +1881,8 @@ export class WebGPUGraphCompiler {
       } else if (node.opType === "GELU") {
         wgslCode = ShaderLibrary.getGELUShader();
         const num_elements = node.outputs.out.shape.reduce((a, b) => a * b, 1);
-        const paramsBuf = this.host.device.createBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
-        this.host.device.queue.writeBuffer(paramsBuf, 0, new Uint32Array([
+        const paramsBuf = this.host._createSpecializationBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+        this.host._writeSpecializationBuffer(paramsBuf, 0, new Uint32Array([
           num_elements,
           geluApproximation(node) === "tanh" ? 1 : 0,
           0,
@@ -1807,9 +1945,8 @@ export class WebGPUGraphCompiler {
         pu[4] = webGpuTypedDtypeCode(output.dtype);
         pi[5] = outputQuantization.zero_point;
         pf[6] = outputQuantization.scale;
-        const paramsBuf = this.host.device.createBuffer({ size: 32, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
-        this.host.device.queue.writeBuffer(paramsBuf, 0, p);
-        this.host.auxiliaryBuffers.add(paramsBuf);
+        const paramsBuf = this.host._createSpecializationBuffer({ size: 32, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+        this.host._writeSpecializationBuffer(paramsBuf, 0, p);
         bindGroupEntries = [
           { binding: 0, resource: { buffer: this.host._buffer(input) } },
           { binding: 1, resource: { buffer: this.host._buffer(weight) } },
@@ -1834,8 +1971,8 @@ export class WebGPUGraphCompiler {
           throw new Error(`Embedding node ${node.id} has incompatible token, weight, or output dimensions.`);
         }
         const p = new Uint32Array([seq_len, d_model, vocabSize, 0]);
-        const paramsBuf = this.host.device.createBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
-        this.host.device.queue.writeBuffer(paramsBuf, 0, p);
+        const paramsBuf = this.host._createSpecializationBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+        this.host._writeSpecializationBuffer(paramsBuf, 0, p);
         bindGroupEntries = [
           { binding: 0, resource: { buffer: this.host._buffer(node.inputs.input) } },
           { binding: 1, resource: { buffer: this.host._buffer(node.inputs.weight) } },
@@ -1879,9 +2016,9 @@ export class WebGPUGraphCompiler {
         pu[4] = node.params.normalize === false ? 0 : 1;
         pu[5] = bias ? 1 : 0;
         pf[6] = temperature;
-        const paramsBuf = this.host.device.createBuffer({ size: 32, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
-        this.host.device.queue.writeBuffer(paramsBuf, 0, p);
-        const dummyBias = this.host.device.createBuffer({ size: Math.max(4, numExperts * 4), usage: GPUBufferUsage.STORAGE });
+        const paramsBuf = this.host._createSpecializationBuffer({ size: 32, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+        this.host._writeSpecializationBuffer(paramsBuf, 0, p);
+        const dummyBias = this.host._createSpecializationBuffer({ size: Math.max(4, numExperts * 4), usage: GPUBufferUsage.STORAGE });
         bindGroupEntries = [
           { binding: 0, resource: { buffer: this.host._buffer(input) } },
           { binding: 1, resource: { buffer: this.host._buffer(weight) } },
@@ -1917,11 +2054,51 @@ export class WebGPUGraphCompiler {
             (expertBias && (expertBias.dtype !== "float32" || expertBias.sizeBytes / 4 !== numExperts * dOut))) {
           throw new Error(`MoELinear node ${node.id} has incompatible expert or routing dimensions.`);
         }
+        // A partially resident bank routes by global slot id, so the shader
+        // needs the global -> staged-row table the bound graph attached.
+        const resident = webGPUResidentSlotTable(node, numExperts, 'MoELinear');
+        const slotDomain = resident?.domain ?? 0;
+        if (routeIndices.isWeight) {
+          if (!(routeIndices.buffer instanceof Float32Array)) {
+            throw new Error(`WebGPU MoELinear node ${node.id} invariant route indices require F32 storage.`);
+          }
+          const residentSet = resident ? new Set(resident.slots) : null;
+          for (let offset = 0; offset < routeIndices.buffer.length; offset++) {
+            const expert = routeIndices.buffer[offset];
+            const valid = Number.isInteger(expert) && expert >= 0 &&
+              (residentSet === null ? expert < numExperts : residentSet.has(expert));
+            if (!valid) {
+              throw new Error(
+                `WebGPU MoELinear node ${node.id} invariant route index ${expert} ` +
+                `at offset ${offset} is invalid for this residency.`,
+              );
+            }
+          }
+        }
+        if (routeWeights.isWeight &&
+            (!(routeWeights.buffer instanceof Float32Array) ||
+             !routeWeights.buffer.every(Number.isFinite))) {
+          throw new Error(
+            `WebGPU MoELinear node ${node.id} invariant route weights must all be finite F32 values.`,
+          );
+        }
         const p = new Uint32Array(8);
-        p[0] = rows; p[1] = dIn; p[2] = dOut; p[3] = numExperts; p[4] = topK; p[5] = expertBias ? 1 : 0;
-        const paramsBuf = this.host.device.createBuffer({ size: 32, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
-        this.host.device.queue.writeBuffer(paramsBuf, 0, p);
-        const dummyBias = this.host.device.createBuffer({ size: Math.max(4, numExperts * dOut * 4), usage: GPUBufferUsage.STORAGE });
+        p[0] = rows; p[1] = dIn; p[2] = dOut; p[3] = numExperts; p[4] = topK;
+        p[5] = expertBias ? 1 : 0; p[6] = slotDomain;
+        const paramsBuf = this.host._createSpecializationBuffer({ size: 32, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+        this.host._writeSpecializationBuffer(paramsBuf, 0, p);
+        const dummyBias = this.host._createSpecializationBuffer({ size: Math.max(4, numExperts * dOut * 4), usage: GPUBufferUsage.STORAGE });
+        const slotRowsBuf = this.host._createSpecializationBuffer({
+          size: Math.max(4, slotDomain * 4),
+          usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+        });
+        if (resident) {
+          const rowsTable = new Uint32Array(slotDomain).fill(0xffffffff);
+          for (let row = 0; row < resident.slots.length; row++) {
+            rowsTable[resident.slots[row]] = row;
+          }
+          this.host._writeSpecializationBuffer(slotRowsBuf, 0, rowsTable);
+        }
         bindGroupEntries = [
           { binding: 0, resource: { buffer: this.host._buffer(input) } },
           { binding: 1, resource: { buffer: this.host._buffer(expertWeight) } },
@@ -1930,6 +2107,7 @@ export class WebGPUGraphCompiler {
           { binding: 4, resource: { buffer: this.host._buffer(routeWeights) } },
           { binding: 5, resource: { buffer: this.host._buffer(output) } },
           { binding: 6, resource: { buffer: paramsBuf } },
+          { binding: 7, resource: { buffer: slotRowsBuf } },
         ];
         workgroupCount = [Math.ceil(dOut / 64), rows, 1];
       } else if (node.opType === "SDPA") {
@@ -1963,8 +2141,8 @@ export class WebGPUGraphCompiler {
         p_f32[5] = scale;
         p_u32[6] = node.params.causal === false ? 0 : 1;
         p_u32[7] = maskMode;
-        const paramsBuf = this.host.device.createBuffer({ size: 32, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
-        this.host.device.queue.writeBuffer(paramsBuf, 0, p);
+        const paramsBuf = this.host._createSpecializationBuffer({ size: 32, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+        this.host._writeSpecializationBuffer(paramsBuf, 0, p);
         bindGroupEntries = [
           { binding: 0, resource: { buffer: this.host._buffer(node.inputs.qkv) } },
           { binding: 1, resource: { buffer: this.host._buffer(mask) || this.host._buffer(node.inputs.qkv) } },
@@ -2009,8 +2187,8 @@ export class WebGPUGraphCompiler {
         p_f32[6] = scale;
         p_u32[7] = node.params.causal === true ? 1 : 0;
         p_u32[8] = maskMode;
-        const paramsBuf = this.host.device.createBuffer({ size: 48, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
-        this.host.device.queue.writeBuffer(paramsBuf, 0, p);
+        const paramsBuf = this.host._createSpecializationBuffer({ size: 48, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+        this.host._writeSpecializationBuffer(paramsBuf, 0, p);
         bindGroupEntries = [
           { binding: 0, resource: { buffer: this.host._buffer(node.inputs.q) } },
           { binding: 1, resource: { buffer: this.host._buffer(node.inputs.k) } },
@@ -2090,11 +2268,11 @@ export class WebGPUGraphCompiler {
         p_u32[6] = scale ? 1 : 0;
         p_u32[7] = bias ? 1 : 0;
         p_u32[8] = batch;
-        const paramsBuf = this.host.device.createBuffer({ size: 48, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
-        this.host.device.queue.writeBuffer(paramsBuf, 0, p);
+        const paramsBuf = this.host._createSpecializationBuffer({ size: 48, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+        this.host._writeSpecializationBuffer(paramsBuf, 0, p);
         
-        const dummyScale = this.host.device.createBuffer({ size: 4096, usage: GPUBufferUsage.STORAGE });
-        const dummyBias = this.host.device.createBuffer({ size: 4096, usage: GPUBufferUsage.STORAGE });
+        const dummyScale = this.host._createSpecializationBuffer({ size: 4096, usage: GPUBufferUsage.STORAGE });
+        const dummyBias = this.host._createSpecializationBuffer({ size: 4096, usage: GPUBufferUsage.STORAGE });
         
         bindGroupEntries = [
           { binding: 0, resource: { buffer: this.host._buffer(q) } },
@@ -2116,8 +2294,8 @@ export class WebGPUGraphCompiler {
           node.inputs.input.shape[1], node.inputs.input.shape[2],
           node.inputs.input.shape[3], node.inputs.input.shape[0]
         ]);
-        const paramBuf = this.host.device.createBuffer({ size: Math.ceil(p.byteLength / 16) * 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
-        this.host.device.queue.writeBuffer(paramBuf, 0, p);
+        const paramBuf = this.host._createSpecializationBuffer({ size: Math.ceil(p.byteLength / 16) * 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+        this.host._writeSpecializationBuffer(paramBuf, 0, p);
         bindGroupEntries = [
           { binding: 0, resource: { buffer: this.host._buffer(node.inputs.input) } },
           { binding: 1, resource: { buffer: this.host._buffer(node.outputs.out) } },
@@ -2128,12 +2306,11 @@ export class WebGPUGraphCompiler {
         const descriptor = webGpuQGroupNormDescriptor(
           node, this.host._activePipelineBuffers || this.host.gpuBuffers,
         );
-        const statsBuffer = this.host.device.createBuffer({
+        const statsBuffer = this.host._createSpecializationBuffer({
           label: `QGroupNorm_stats_${node.id}`,
           size: descriptor.statsBytes,
           usage: GPUBufferUsage.STORAGE,
         });
-        this.host.auxiliaryBuffers.add(statsBuffer);
 
         const parameterData = new ArrayBuffer(64);
         const parameterU32 = new Uint32Array(parameterData);
@@ -2149,19 +2326,17 @@ export class WebGPUGraphCompiler {
         parameterF32[12] = descriptor.inputQuantization.scale;
         parameterF32[13] = descriptor.outputQuantization.scale;
         parameterF32[14] = descriptor.epsilon;
-        const paramsBuffer = this.host.device.createBuffer({
+        const paramsBuffer = this.host._createSpecializationBuffer({
           label: `QGroupNorm_params_${node.id}`,
           size: 64,
           usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
         });
-        this.host.device.queue.writeBuffer(paramsBuffer, 0, parameterData);
-        this.host.auxiliaryBuffers.add(paramsBuffer);
+        this.host._writeSpecializationBuffer(paramsBuffer, 0, parameterData);
 
-        const statsModule = this.host.device.createShaderModule({ code: ShaderLibrary.getQGroupNormStatsShader() });
-        const statsPipeline = await this.host.device.createComputePipelineAsync({
-          layout: 'auto', compute: { module: statsModule, entryPoint: 'main' },
-        });
-        const statsBindGroup = this.host.device.createBindGroup({
+        const statsPipeline = await this.host._cachedComputePipeline(
+          ShaderLibrary.getQGroupNormStatsShader(),
+        );
+        const statsBindGroup = this.host._createSpecializationBindGroup(statsPipeline, {
           layout: statsPipeline.getBindGroupLayout(0),
           entries: [
             { binding: 0, resource: { buffer: this.host._buffer(descriptor.input) } },
@@ -2170,11 +2345,10 @@ export class WebGPUGraphCompiler {
           ],
         });
 
-        const applyModule = this.host.device.createShaderModule({ code: ShaderLibrary.getQGroupNormApplyShader() });
-        const applyPipeline = await this.host.device.createComputePipelineAsync({
-          layout: 'auto', compute: { module: applyModule, entryPoint: 'main' },
-        });
-        const applyBindGroup = this.host.device.createBindGroup({
+        const applyPipeline = await this.host._cachedComputePipeline(
+          ShaderLibrary.getQGroupNormApplyShader(),
+        );
+        const applyBindGroup = this.host._createSpecializationBindGroup(applyPipeline, {
           layout: applyPipeline.getBindGroupLayout(0),
           entries: [
             { binding: 0, resource: { buffer: this.host._buffer(descriptor.input) } },
@@ -2202,12 +2376,11 @@ export class WebGPUGraphCompiler {
         const descriptor = webGpuQLayerNormDescriptor(
           node, this.host._activePipelineBuffers || this.host.gpuBuffers,
         );
-        const statsBuffer = this.host.device.createBuffer({
+        const statsBuffer = this.host._createSpecializationBuffer({
           label: `QLayerNorm_stats_${node.id}`,
           size: descriptor.statsBytes,
           usage: GPUBufferUsage.STORAGE,
         });
-        this.host.auxiliaryBuffers.add(statsBuffer);
 
         const parameterData = new ArrayBuffer(48);
         const parameterU32 = new Uint32Array(parameterData);
@@ -2222,18 +2395,17 @@ export class WebGPUGraphCompiler {
         parameterF32[8] = descriptor.inputQuantization.scale;
         parameterF32[9] = descriptor.outputQuantization.scale;
         parameterF32[10] = descriptor.epsilon;
-        const paramsBuffer = this.host.device.createBuffer({
+        const paramsBuffer = this.host._createSpecializationBuffer({
           label: `QLayerNorm_params_${node.id}`,
           size: 48,
           usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
         });
-        this.host.device.queue.writeBuffer(paramsBuffer, 0, parameterData);
-        this.host.auxiliaryBuffers.add(paramsBuffer);
+        this.host._writeSpecializationBuffer(paramsBuffer, 0, parameterData);
 
         const statsPipeline = await this.host._cachedComputePipeline(
           ShaderLibrary.getQLayerNormStatsShader(),
         );
-        const statsBindGroup = this.host.device.createBindGroup({
+        const statsBindGroup = this.host._createSpecializationBindGroup(statsPipeline, {
           layout: statsPipeline.getBindGroupLayout(0),
           entries: [
             { binding: 0, resource: { buffer: this.host._buffer(descriptor.input) } },
@@ -2245,7 +2417,7 @@ export class WebGPUGraphCompiler {
         const applyPipeline = await this.host._cachedComputePipeline(
           ShaderLibrary.getQLayerNormApplyShader(),
         );
-        const applyBindGroup = this.host.device.createBindGroup({
+        const applyBindGroup = this.host._createSpecializationBindGroup(applyPipeline, {
           layout: applyPipeline.getBindGroupLayout(0),
           entries: [
             { binding: 0, resource: { buffer: this.host._buffer(descriptor.input) } },
@@ -2285,18 +2457,16 @@ export class WebGPUGraphCompiler {
         parameterI32[9] = descriptor.outputQuantization.zero_point;
         parameterF32[10] = descriptor.inputScale;
         parameterF32[11] = descriptor.outputScale;
-        const paramsBuffer = this.host.device.createBuffer({
+        const paramsBuffer = this.host._createSpecializationBuffer({
           label: `QMaskedMean_params_${node.id}`,
           size: 48,
           usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
         });
-        this.host.device.queue.writeBuffer(paramsBuffer, 0, parameterData);
-        this.host.auxiliaryBuffers.add(paramsBuffer);
-        const module = this.host.device.createShaderModule({ code: ShaderLibrary.getQMaskedMeanShader() });
-        const pipeline = await this.host.device.createComputePipelineAsync({
-          layout: 'auto', compute: { module, entryPoint: 'main' },
-        });
-        const bindGroup = this.host.device.createBindGroup({
+        this.host._writeSpecializationBuffer(paramsBuffer, 0, parameterData);
+        const pipeline = await this.host._cachedComputePipeline(
+          ShaderLibrary.getQMaskedMeanShader(),
+        );
+        const bindGroup = this.host._createSpecializationBindGroup(pipeline, {
           layout: pipeline.getBindGroupLayout(0),
           entries: [
             { binding: 0, resource: { buffer: this.host._buffer(descriptor.input) } },
@@ -2336,22 +2506,20 @@ export class WebGPUGraphCompiler {
           descriptor.qScale, descriptor.kScale, descriptor.vScale, descriptor.outputScale,
           descriptor.attentionScale,
         ], 12);
-        const paramsBuffer = this.host.device.createBuffer({
+        const paramsBuffer = this.host._createSpecializationBuffer({
           label: `QSDPA_params_${node.id}`,
           size: 80,
           usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
         });
-        this.host.device.queue.writeBuffer(paramsBuffer, 0, parameterData);
-        this.host.auxiliaryBuffers.add(paramsBuffer);
-        const dummyMask = descriptor.mask ? null : this.host.device.createBuffer({
+        this.host._writeSpecializationBuffer(paramsBuffer, 0, parameterData);
+        const dummyMask = descriptor.mask ? null : this.host._createSpecializationBuffer({
           label: `QSDPA_dummy_mask_${node.id}`,
           size: 4,
           usage: GPUBufferUsage.STORAGE,
         });
-        if (dummyMask) this.host.auxiliaryBuffers.add(dummyMask);
 
         const pipeline = await this.host._cachedComputePipeline(ShaderLibrary.getQSDPAShader());
-        const bindGroup = this.host.device.createBindGroup({
+        const bindGroup = this.host._createSpecializationBindGroup(pipeline, {
           layout: pipeline.getBindGroupLayout(0),
           entries: [
             { binding: 0, resource: { buffer: this.host._buffer(descriptor.q) } },
@@ -2374,17 +2542,16 @@ export class WebGPUGraphCompiler {
         const descriptor = webGpuQArgMaxDescriptor(
           node, this.host._activePipelineBuffers || this.host.gpuBuffers,
         );
-        const paramsBuffer = this.host.device.createBuffer({
+        const paramsBuffer = this.host._createSpecializationBuffer({
           label: `QArgMax_params_${node.id}`,
           size: 16,
           usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
         });
-        this.host.device.queue.writeBuffer(paramsBuffer, 0, new Uint32Array([
+        this.host._writeSpecializationBuffer(paramsBuffer, 0, new Uint32Array([
           descriptor.outer, descriptor.axisSize, descriptor.inner, descriptor.inputDtype,
         ]));
-        this.host.auxiliaryBuffers.add(paramsBuffer);
         const pipeline = await this.host._cachedComputePipeline(ShaderLibrary.getQArgMaxShader());
-        const bindGroup = this.host.device.createBindGroup({
+        const bindGroup = this.host._createSpecializationBindGroup(pipeline, {
           layout: pipeline.getBindGroupLayout(0),
           entries: [
             { binding: 0, resource: { buffer: this.host._buffer(descriptor.input) } },
@@ -2432,9 +2599,8 @@ export class WebGPUGraphCompiler {
         pi[5] = outputQuantization.zero_point;
         pf[8] = inputQuantization.scale;
         pf[9] = outputQuantization.scale;
-        const paramsBuf = this.host.device.createBuffer({ size: 48, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
-        this.host.device.queue.writeBuffer(paramsBuf, 0, p);
-        this.host.auxiliaryBuffers.add(paramsBuf);
+        const paramsBuf = this.host._createSpecializationBuffer({ size: 48, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+        this.host._writeSpecializationBuffer(paramsBuf, 0, p);
         bindGroupEntries = [
           { binding: 0, resource: { buffer: this.host._buffer(input) } },
           { binding: 1, resource: { buffer: this.host._buffer(output) } },
@@ -2470,9 +2636,8 @@ export class WebGPUGraphCompiler {
         pi[5] = outputQuantization.zero_point;
         pf[8] = inputQuantization.scale;
         pf[9] = outputQuantization.scale;
-        const paramsBuf = this.host.device.createBuffer({ size: 48, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
-        this.host.device.queue.writeBuffer(paramsBuf, 0, p);
-        this.host.auxiliaryBuffers.add(paramsBuf);
+        const paramsBuf = this.host._createSpecializationBuffer({ size: 48, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+        this.host._writeSpecializationBuffer(paramsBuf, 0, p);
         bindGroupEntries = [
           { binding: 0, resource: { buffer: this.host._buffer(input) } },
           { binding: 1, resource: { buffer: this.host._buffer(output) } },
@@ -2529,8 +2694,8 @@ export class WebGPUGraphCompiler {
           elements = output.shape.reduce((a, b) => a * b, 1);
         }
         const p = new Uint32Array([elements]);
-        const paramsBuf = this.host.device.createBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
-        this.host.device.queue.writeBuffer(paramsBuf, 0, p);
+        const paramsBuf = this.host._createSpecializationBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+        this.host._writeSpecializationBuffer(paramsBuf, 0, p);
         bindGroupEntries = [
           { binding: 0, resource: { buffer: this.host._buffer(input) } },
           { binding: 1, resource: { buffer: this.host._buffer(output) } },
@@ -2573,8 +2738,8 @@ export class WebGPUGraphCompiler {
         pf[9] = qb.scale;
         pf[10] = qo.scale;
         pu[11] = relu;
-        const paramsBuf = this.host.device.createBuffer({ size: 48, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
-        this.host.device.queue.writeBuffer(paramsBuf, 0, p);
+        const paramsBuf = this.host._createSpecializationBuffer({ size: 48, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+        this.host._writeSpecializationBuffer(paramsBuf, 0, p);
         bindGroupEntries = [
           { binding: 0, resource: { buffer: this.host._buffer(a) } },
           { binding: 1, resource: { buffer: this.host._buffer(b) } },
@@ -2622,8 +2787,8 @@ export class WebGPUGraphCompiler {
           meta[2 + rank + d] = aStrides[d];
           meta[2 + 2 * rank + d] = bStrides[d];
         }
-        const metaBuf = this.host.device.createBuffer({ size: Math.ceil(meta.byteLength / 4) * 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
-        this.host.device.queue.writeBuffer(metaBuf, 0, meta);
+        const metaBuf = this.host._createSpecializationBuffer({ size: Math.ceil(meta.byteLength / 4) * 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
+        this.host._writeSpecializationBuffer(metaBuf, 0, meta);
         bindGroupEntries = [
           { binding: 0, resource: { buffer: this.host._buffer(node.inputs.a) } },
           { binding: 1, resource: { buffer: this.host._buffer(node.inputs.b) } },
@@ -2640,12 +2805,11 @@ export class WebGPUGraphCompiler {
         metadata.set(descriptor.aStrides, 2 + descriptor.rank);
         metadata.set(descriptor.bStrides, 2 + descriptor.rank * 2);
         metadata[2 + descriptor.rank * 3] = descriptor.operation;
-        const metadataBuffer = this.host.device.createBuffer({
+        const metadataBuffer = this.host._createSpecializationBuffer({
           size: Math.max(4, metadata.byteLength),
           usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
         });
-        this.host.device.queue.writeBuffer(metadataBuffer, 0, metadata);
-        this.host.auxiliaryBuffers.add(metadataBuffer);
+        this.host._writeSpecializationBuffer(metadataBuffer, 0, metadata);
         wgslCode = ShaderLibrary.getCompareI32Shader();
         bindGroupEntries = [
           { binding: 0, resource: { buffer: this.host._buffer(descriptor.a) } },
@@ -2656,14 +2820,13 @@ export class WebGPUGraphCompiler {
         workgroupCount = [Math.ceil(descriptor.elements / 64), 1, 1];
       } else if (node.opType === "Not") {
         const descriptor = logicalNotDescriptor(node);
-        const paramsBuffer = this.host.device.createBuffer({
+        const paramsBuffer = this.host._createSpecializationBuffer({
           size: 16,
           usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
         });
-        this.host.device.queue.writeBuffer(
+        this.host._writeSpecializationBuffer(
           paramsBuffer, 0, new Uint32Array([descriptor.elements, 0, 0, 0]),
         );
-        this.host.auxiliaryBuffers.add(paramsBuffer);
         wgslCode = ShaderLibrary.getNotI32Shader();
         bindGroupEntries = [
           { binding: 0, resource: { buffer: this.host._buffer(descriptor.input) } },
@@ -2715,9 +2878,8 @@ export class WebGPUGraphCompiler {
         const meta = new Uint32Array(2 + rank * 2);
         meta[0] = total; meta[1] = rank;
         for (let d = 0; d < rank; d++) { meta[2 + d] = outStrides[d]; meta[2 + rank + d] = inStrides[perm[d]]; }
-        const metaBuf = this.host.device.createBuffer({ size: Math.ceil(meta.byteLength / 4) * 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
-        this.host.device.queue.writeBuffer(metaBuf, 0, meta);
-        this.host.auxiliaryBuffers.add(metaBuf);
+        const metaBuf = this.host._createSpecializationBuffer({ size: Math.ceil(meta.byteLength / 4) * 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
+        this.host._writeSpecializationBuffer(metaBuf, 0, meta);
         wgslCode = byteTranspose
           ? ShaderLibrary.getTypedTransposeShader()
           : ShaderLibrary.getGeneralTransposeShader();
@@ -2742,8 +2904,8 @@ export class WebGPUGraphCompiler {
           }
         }
         const p = new Uint32Array([b, d]);
-        const paramsBuf = this.host.device.createBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
-        this.host.device.queue.writeBuffer(paramsBuf, 0, p);
+        const paramsBuf = this.host._createSpecializationBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+        this.host._writeSpecializationBuffer(paramsBuf, 0, p);
         bindGroupEntries = [
           { binding: 0, resource: { buffer: this.host._buffer(node.inputs.input) } },
           { binding: 1, resource: { buffer: this.host._buffer(node.outputs.out) } },
@@ -2757,8 +2919,8 @@ export class WebGPUGraphCompiler {
         const p = new ArrayBuffer(16);
         new Uint32Array(p, 0, 1)[0] = elements;
         new Float32Array(p, 4, 1)[0] = alpha;
-        const paramsBuf = this.host.device.createBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
-        this.host.device.queue.writeBuffer(paramsBuf, 0, p);
+        const paramsBuf = this.host._createSpecializationBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+        this.host._writeSpecializationBuffer(paramsBuf, 0, p);
         bindGroupEntries = [
           { binding: 0, resource: { buffer: this.host._buffer(node.inputs.input) } },
           { binding: 1, resource: { buffer: this.host._buffer(node.outputs.out) } },
@@ -2781,8 +2943,8 @@ export class WebGPUGraphCompiler {
           throw new Error(`PReLU node ${node.id} weight must contain 1 or ${c} F32 values.`);
         }
         const p = new Uint32Array([elements, c, weightLength, 0]);
-        const paramsBuf = this.host.device.createBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
-        this.host.device.queue.writeBuffer(paramsBuf, 0, p);
+        const paramsBuf = this.host._createSpecializationBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+        this.host._writeSpecializationBuffer(paramsBuf, 0, p);
         bindGroupEntries = [
           { binding: 0, resource: { buffer: this.host._buffer(input) } },
           { binding: 1, resource: { buffer: this.host._buffer(weight) } },
@@ -2799,8 +2961,8 @@ export class WebGPUGraphCompiler {
         const p = new ArrayBuffer(16);
         new Uint32Array(p, 0, 2).set([seq_len, d_model]);
         new Float32Array(p, 8, 1)[0] = eps;
-        const paramsBuf = this.host.device.createBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
-        this.host.device.queue.writeBuffer(paramsBuf, 0, p);
+        const paramsBuf = this.host._createSpecializationBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+        this.host._writeSpecializationBuffer(paramsBuf, 0, p);
         bindGroupEntries = [
           { binding: 0, resource: { buffer: this.host._buffer(node.inputs.input) } },
           { binding: 1, resource: { buffer: this.host._buffer(node.inputs.weight) } },
@@ -2816,8 +2978,8 @@ export class WebGPUGraphCompiler {
         const W = inShape[2] || 1;
         const C = inShape[3] || 1;
         const p = new Uint32Array([B, H, W, C]);
-        const paramsBuf = this.host.device.createBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
-        this.host.device.queue.writeBuffer(paramsBuf, 0, p);
+        const paramsBuf = this.host._createSpecializationBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+        this.host._writeSpecializationBuffer(paramsBuf, 0, p);
         bindGroupEntries = [
           { binding: 0, resource: { buffer: this.host._buffer(node.inputs.input) } },
           { binding: 1, resource: { buffer: this.host._buffer(node.outputs.out) } },
@@ -2831,8 +2993,8 @@ export class WebGPUGraphCompiler {
         const p = new ArrayBuffer(32);
         new Uint32Array(p, 0, 4).set([bn, cn, hn, wn]);
         new Float32Array(p, 16, 1)[0] = eps;
-        const paramsBuf = this.host.device.createBuffer({ size: 32, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
-        this.host.device.queue.writeBuffer(paramsBuf, 0, p);
+        const paramsBuf = this.host._createSpecializationBuffer({ size: 32, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+        this.host._writeSpecializationBuffer(paramsBuf, 0, p);
         bindGroupEntries = [
           { binding: 0, resource: { buffer: this.host._buffer(node.inputs.input) } },
           { binding: 1, resource: { buffer: this.host._buffer(node.inputs.weight) } },
@@ -2866,8 +3028,8 @@ export class WebGPUGraphCompiler {
         }
         const mode = nearest ? 0 : 1;
         const p = new Uint32Array([rb, inH, inW, rc, outH, outW, mode, 0]);
-        const paramsBuf = this.host.device.createBuffer({ size: 32, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
-        this.host.device.queue.writeBuffer(paramsBuf, 0, p);
+        const paramsBuf = this.host._createSpecializationBuffer({ size: 32, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+        this.host._writeSpecializationBuffer(paramsBuf, 0, p);
         bindGroupEntries = [
           { binding: 0, resource: { buffer: this.host._buffer(input) } },
           { binding: 1, resource: { buffer: this.host._buffer(output) } },
@@ -2890,9 +3052,10 @@ export class WebGPUGraphCompiler {
         if (!Number.isInteger(axis) || axis < 0 || axis >= inShape.length) {
           throw new Error(`WebGPU Split node ${node.id} has an invalid axis.`);
         }
-        // Preserve the graph declaration order; lexical sorting corrupts
-        // numeric-suffixed output sequences once they reach out10.
-        const outKeys = Object.keys(node.outputs);
+        // Graph parsing canonicalizes object keys lexically, so restore numeric
+        // outN order before assigning positional slice offsets (out10 must not
+        // precede out2). Legacy arbitrary names retain insertion order.
+        const outKeys = orderedSplitOutputKeys(node);
         const numOutputs = outKeys.length;
         if (numOutputs === 0 || inShape[axis] % numOutputs !== 0) {
           throw new Error(`WebGPU Split node ${node.id} requires equal-sized output slices.`);
@@ -2900,11 +3063,9 @@ export class WebGPUGraphCompiler {
         const splitSize = inShape[axis] / numOutputs;
         let inner = 1;
         for (let i = axis + 1; i < inShape.length; i++) inner *= inShape[i];
-        const shaderModule = this.host.device.createShaderModule({ code: ShaderLibrary.getSplitShader() });
-        const pipeline = await this.host.device.createComputePipelineAsync({
-          layout: "auto",
-          compute: { module: shaderModule, entryPoint: "main" }
-        });
+        const pipeline = await this.host._cachedComputePipeline(
+          ShaderLibrary.getSplitShader(),
+        );
         for (let o = 0; o < numOutputs; o++) {
           const outT = node.outputs[outKeys[o]];
           const expectedShape = [...inShape];
@@ -2915,9 +3076,9 @@ export class WebGPUGraphCompiler {
             throw new Error(`WebGPU Split node ${node.id} has an incompatible ${input.dtype} output.`);
           }
           const p = new Uint32Array([total, inner, splitSize, inShape[axis], o * splitSize]);
-          const paramsBuf = this.host.device.createBuffer({ size: 32, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
-          this.host.device.queue.writeBuffer(paramsBuf, 0, p);
-          const bindGroup = this.host.device.createBindGroup({
+          const paramsBuf = this.host._createSpecializationBuffer({ size: 32, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+          this.host._writeSpecializationBuffer(paramsBuf, 0, p);
+          const bindGroup = this.host._createSpecializationBindGroup(pipeline, {
             layout: pipeline.getBindGroupLayout(0),
             entries: [
               { binding: 0, resource: { buffer: this.host._buffer(input) } },
@@ -2981,8 +3142,8 @@ export class WebGPUGraphCompiler {
         pf[5] = maxVal;
         pi[8] = input.dtype === 'int32' ? minVal : 0;
         pi[9] = input.dtype === 'int32' ? maxVal : 0;
-        const paramsBuf = this.host.device.createBuffer({ size: 48, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
-        this.host.device.queue.writeBuffer(paramsBuf, 0, p);
+        const paramsBuf = this.host._createSpecializationBuffer({ size: 48, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+        this.host._writeSpecializationBuffer(paramsBuf, 0, p);
         bindGroupEntries = [
           { binding: 0, resource: { buffer: this.host._buffer(input) } },
           { binding: 1, resource: { buffer: this.host._buffer(output) } },
@@ -3044,8 +3205,8 @@ export class WebGPUGraphCompiler {
           ky, kx, sy, sx, pads[0], pads[1]
         ]);
         if (hasTypedStorage) p[12] = webGpuTypedDtypeCode(input.dtype);
-        const paramBuf = this.host.device.createBuffer({ size: Math.ceil(p.byteLength / 16) * 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
-        this.host.device.queue.writeBuffer(paramBuf, 0, p);
+        const paramBuf = this.host._createSpecializationBuffer({ size: Math.ceil(p.byteLength / 16) * 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+        this.host._writeSpecializationBuffer(paramBuf, 0, p);
         bindGroupEntries = [
           { binding: 0, resource: { buffer: this.host._buffer(input) } },
           { binding: 1, resource: { buffer: this.host._buffer(output) } },
@@ -3092,8 +3253,8 @@ export class WebGPUGraphCompiler {
         p_f32[5] = iouThreshold;
         p_f32[6] = scoreThreshold;
         wgslCode = ShaderLibrary.getNonMaxSuppressionShader();
-        const paramsBuf = this.host.device.createBuffer({ size: 32, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
-        this.host.device.queue.writeBuffer(paramsBuf, 0, p);
+        const paramsBuf = this.host._createSpecializationBuffer({ size: 32, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+        this.host._writeSpecializationBuffer(paramsBuf, 0, p);
         bindGroupEntries = [
           { binding: 0, resource: { buffer: this.host._buffer(boxes) } },
           { binding: 1, resource: { buffer: this.host._buffer(scores) } },
@@ -3111,8 +3272,8 @@ export class WebGPUGraphCompiler {
           throw new Error(`Cast node ${node.id} requires equal-size F32/I32/I8/U8 input and declared output tensors.`);
         }
         wgslCode = ShaderLibrary.getCastShader();
-        const paramsBuf = this.host.device.createBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
-        this.host.device.queue.writeBuffer(paramsBuf, 0, new Uint32Array([
+        const paramsBuf = this.host._createSpecializationBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+        this.host._writeSpecializationBuffer(paramsBuf, 0, new Uint32Array([
           outputElements, webGpuTypedDtypeCode(input.dtype), webGpuTypedDtypeCode(output.dtype), 0,
         ]));
         bindGroupEntries = [
@@ -3143,8 +3304,8 @@ export class WebGPUGraphCompiler {
           throw new Error(`${node.opType} node ${node.id} requires exact-shape same-dtype F32/I32 operands/output and an F32 or I32 condition.`);
         }
         wgslCode = ShaderLibrary.getWhereTypedShader();
-        const paramsBuf = this.host.device.createBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
-        this.host.device.queue.writeBuffer(paramsBuf, 0, new Uint32Array([
+        const paramsBuf = this.host._createSpecializationBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+        this.host._writeSpecializationBuffer(paramsBuf, 0, new Uint32Array([
           outputElements, webGpuTypedDtypeCode(cond.dtype), 0, 0,
         ]));
         bindGroupEntries = [
@@ -3182,8 +3343,8 @@ export class WebGPUGraphCompiler {
           0,
           0,
         ]);
-        const paramsBuf = this.host.device.createBuffer({ size: 32, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
-        this.host.device.queue.writeBuffer(paramsBuf, 0, p);
+        const paramsBuf = this.host._createSpecializationBuffer({ size: 32, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+        this.host._writeSpecializationBuffer(paramsBuf, 0, p);
         bindGroupEntries = [
           { binding: 0, resource: { buffer: this.host._buffer(input) } },
           { binding: 1, resource: { buffer: this.host._buffer(scale) } },
@@ -3222,8 +3383,8 @@ export class WebGPUGraphCompiler {
             DataType.Unspecified,
           zeroPoint ? 1 : 0,
         ]);
-        const paramsBuf = this.host.device.createBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
-        this.host.device.queue.writeBuffer(paramsBuf, 0, p);
+        const paramsBuf = this.host._createSpecializationBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+        this.host._writeSpecializationBuffer(paramsBuf, 0, p);
         bindGroupEntries = [
           { binding: 0, resource: { buffer: this.host._buffer(input) } },
           { binding: 1, resource: { buffer: this.host._buffer(scale) } },
@@ -3261,8 +3422,8 @@ export class WebGPUGraphCompiler {
         pi[4] = inputQuantization.zero_point;
         pi[5] = outputQuantization.zero_point;
         pf[8] = multiplier;
-        const paramsBuf = this.host.device.createBuffer({ size: 48, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
-        this.host.device.queue.writeBuffer(paramsBuf, 0, p);
+        const paramsBuf = this.host._createSpecializationBuffer({ size: 48, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+        this.host._writeSpecializationBuffer(paramsBuf, 0, p);
         bindGroupEntries = [
           { binding: 0, resource: { buffer: this.host._buffer(input) } },
           { binding: 1, resource: { buffer: this.host._buffer(output) } },
@@ -3277,13 +3438,15 @@ export class WebGPUGraphCompiler {
           output.dtype === inp.dtype;
         const plainStorage = inp && output && ['float32', 'int32'].includes(inp.dtype) &&
           output.dtype === inp.dtype;
+        const parameterNames = Object.keys(node.params || {});
+        const hasCanonicalTarget = parameterNames.length === 1 && parameterNames[0] === 'shape';
         if (!inp || !output || (!plainStorage && !byteStorage) ||
             webGpuTypedElementCount(inp) == null ||
             webGpuTypedElementCount(output) == null ||
             inp.shape.length === 0 || inp.shape.length > outShape.length || outShape.length > 8 ||
             inp.shape.some((dimension) => !Number.isInteger(dimension) || dimension <= 0) ||
             outShape.some((dimension) => !Number.isInteger(dimension) || dimension <= 0) ||
-            inp === output || Object.keys(node.params || {}).length !== 0) {
+            inp === output || (parameterNames.length !== 0 && !hasCanonicalTarget)) {
           throw new Error(`WebGPU ${node.opType} requires positive rank-1..8 input/output shapes.`);
         }
         if (byteStorage) {
@@ -3311,8 +3474,8 @@ export class WebGPUGraphCompiler {
         p.set([inp.shape.length, outShape.length, 0, elements]);
         p.set(inp.shape, 4);
         p.set(outShape, 12);
-        const paramsBuf = this.host.device.createBuffer({ size: 80, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
-        this.host.device.queue.writeBuffer(paramsBuf, 0, p);
+        const paramsBuf = this.host._createSpecializationBuffer({ size: 80, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+        this.host._writeSpecializationBuffer(paramsBuf, 0, p);
         bindGroupEntries = [
           { binding: 0, resource: { buffer: this.host._buffer(inp) } },
           { binding: 1, resource: { buffer: this.host._buffer(output) } },
@@ -3327,22 +3490,24 @@ export class WebGPUGraphCompiler {
         wgslCode = ShaderLibrary.getPadShader();
         const inp = node.inputs.input || node.inputs.data;
         const pads = node.params.pads || [];
-        const pt = pads.length === 8 ? pads[1] : (pads[0] || 0);
-        const pl = pads.length === 8 ? pads[2] : (pads[1] || 0);
         const val = node.params.value || 0.0;
         const is = [1, 1, 1, 1].slice(0, 4 - inp.shape.length).concat(inp.shape);
         const os = [1, 1, 1, 1].slice(0, 4 - node.outputs.out.shape.length).concat(node.outputs.out.shape);
-        const buf = new ArrayBuffer(48);
+        const before = [0, 0, 0, 0]
+          .slice(0, 4 - inp.shape.length)
+          .concat(pads.slice(0, inp.shape.length));
+        const outputElements = os.reduce((product, dimension) => product * dimension, 1);
+        const buf = new ArrayBuffer(64);
         const u = new Uint32Array(buf); const f = new Float32Array(buf);
-        u[0] = is[0]; u[1] = is[1]; u[2] = is[2]; u[3] = is[3]; u[4] = os[1]; u[5] = os[2]; u[6] = pt; u[7] = pl; f[8] = val;
-        const paramsBuf = this.host.device.createBuffer({ size: 48, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
-        this.host.device.queue.writeBuffer(paramsBuf, 0, buf);
+        u.set(is, 0); u.set(os, 4); u.set(before, 8); u[12] = outputElements; f[13] = val;
+        const paramsBuf = this.host._createSpecializationBuffer({ size: 64, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+        this.host._writeSpecializationBuffer(paramsBuf, 0, buf);
         bindGroupEntries = [
           { binding: 0, resource: { buffer: this.host._buffer(inp) } },
           { binding: 1, resource: { buffer: this.host._buffer(node.outputs.out) } },
           { binding: 2, resource: { buffer: paramsBuf } }
         ];
-        workgroupCount = [Math.ceil((os[0] * os[1] * os[2] * os[3]) / 64), 1, 1];
+        workgroupCount = [Math.ceil(outputElements / 64), 1, 1];
       } else if (node.opType === "Slice") {
         const input = node.inputs.input || node.inputs.x || node.inputs.data;
         const output = node.outputs.out;
@@ -3354,8 +3519,8 @@ export class WebGPUGraphCompiler {
         p.set([...descriptor.steps, ...new Array(WEBGPU_SLICE_MAX_RANK - descriptor.rank).fill(1)], 20);
         p.set([...descriptor.inputStrides, ...new Array(WEBGPU_SLICE_MAX_RANK - descriptor.rank).fill(1)], 28);
         wgslCode = ShaderLibrary.getSliceNdShader();
-        const paramsBuf = this.host.device.createBuffer({ size: 144, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
-        this.host.device.queue.writeBuffer(paramsBuf, 0, p);
+        const paramsBuf = this.host._createSpecializationBuffer({ size: 144, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+        this.host._writeSpecializationBuffer(paramsBuf, 0, p);
         bindGroupEntries = [
           { binding: 0, resource: { buffer: this.host._buffer(input) } },
           { binding: 1, resource: { buffer: this.host._buffer(output) } },
@@ -3394,17 +3559,58 @@ export class WebGPUGraphCompiler {
         if (indices.dtype === "int32") {
           // Canonical portable path: I32 indices and arbitrary valid axis.
           wgslCode = ShaderLibrary.getGatherInt32Shader();
-          const p = new Uint32Array(20);
+          const resident = webGPUResidentSlotTable(node, inp.shape[0], 'Gather');
+          if (resident && axis !== 0) {
+            throw new Error(
+              `WebGPU Gather node ${node.id} can index a partially resident bank only along axis 0.`,
+            );
+          }
+          if (resident && indices.isWeight) {
+            if (!(indices.buffer instanceof Int32Array)) {
+              throw new Error(`WebGPU Gather node ${node.id} invariant indices require I32 storage.`);
+            }
+            const residentSet = new Set(resident.slots);
+            for (let offset = 0; offset < indices.buffer.length; offset++) {
+              const raw = indices.buffer[offset];
+              const normalized = raw < 0 ? raw + resident.domain : raw;
+              if (normalized < 0 || normalized >= resident.domain ||
+                  !residentSet.has(normalized)) {
+                throw new Error(
+                  `WebGPU Gather node ${node.id} invariant slot ${raw} at offset ${offset} ` +
+                  `is invalid for this residency.`,
+                );
+              }
+            }
+          } else if (resident && !indices.isInput) {
+            throw new Error(
+              `WebGPU Gather node ${node.id} cannot preflight device-produced indices ` +
+              `against this residency.`,
+            );
+          }
+          const p = new Uint32Array(24);
           p.set([dataRank, indicesRank, axis, total]);
           p.set(inp.shape, 4);
           p.set(output.shape, 12);
-          const paramsBuf = this.host.device.createBuffer({ size: 80, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
-          this.host.device.queue.writeBuffer(paramsBuf, 0, p);
+          p[20] = resident?.domain ?? 0;
+          const paramsBuf = this.host._createSpecializationBuffer({ size: 96, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+          this.host._writeSpecializationBuffer(paramsBuf, 0, p);
+          const slotRowsBuf = this.host._createSpecializationBuffer({
+            size: Math.max(4, (resident?.domain ?? 0) * 4),
+            usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+          });
+          if (resident) {
+            const rowsTable = new Uint32Array(resident.domain).fill(0xffffffff);
+            for (let row = 0; row < resident.slots.length; row++) {
+              rowsTable[resident.slots[row]] = row;
+            }
+            this.host._writeSpecializationBuffer(slotRowsBuf, 0, rowsTable);
+          }
           bindGroupEntries = [
             { binding: 0, resource: { buffer: this.host._buffer(inp) } },
             { binding: 1, resource: { buffer: this.host._buffer(indices) } },
             { binding: 2, resource: { buffer: this.host._buffer(output) } },
-            { binding: 3, resource: { buffer: paramsBuf } }
+            { binding: 3, resource: { buffer: paramsBuf } },
+            { binding: 4, resource: { buffer: slotRowsBuf } },
           ];
         } else {
           throw new Error(`Gather node ${node.id} requires I32 indices.`);
@@ -3436,8 +3642,8 @@ export class WebGPUGraphCompiler {
         p.set([rank, axis, total, 0]);
         p.set(inp.shape, 4);
         p.set(indices.shape, 12);
-        const paramsBuf = this.host.device.createBuffer({ size: 80, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
-        this.host.device.queue.writeBuffer(paramsBuf, 0, p);
+        const paramsBuf = this.host._createSpecializationBuffer({ size: 80, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+        this.host._writeSpecializationBuffer(paramsBuf, 0, p);
         bindGroupEntries = [
           { binding: 0, resource: { buffer: this.host._buffer(inp) } },
           { binding: 1, resource: { buffer: this.host._buffer(indices) } },
@@ -3477,8 +3683,8 @@ export class WebGPUGraphCompiler {
           throw new Error(`ArgMax node ${node.id} has incompatible input/output dimensions or dtype '${output.dtype}'.`);
         }
         const p = new Uint32Array([outer, axisSize, inner, outputElements]);
-        const paramsBuf = this.host.device.createBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
-        this.host.device.queue.writeBuffer(paramsBuf, 0, p);
+        const paramsBuf = this.host._createSpecializationBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+        this.host._writeSpecializationBuffer(paramsBuf, 0, p);
         if (output.dtype === "float32") {
           wgslCode = ShaderLibrary.getArgMaxF32Shader();
           workgroupCount = [Math.ceil(outputElements / 64), 1, 1];
@@ -3510,8 +3716,8 @@ export class WebGPUGraphCompiler {
         const inv = node.opType === "ReduceMean" ? 1.0 / d : 1.0;
         const buf = new ArrayBuffer(16);
         new Uint32Array(buf, 0, 2).set([b, d]); new Float32Array(buf, 8, 1)[0] = inv;
-        const paramsBuf = this.host.device.createBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
-        this.host.device.queue.writeBuffer(paramsBuf, 0, buf);
+        const paramsBuf = this.host._createSpecializationBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+        this.host._writeSpecializationBuffer(paramsBuf, 0, buf);
         bindGroupEntries = [
           { binding: 0, resource: { buffer: this.host._buffer(inp) } },
           { binding: 1, resource: { buffer: this.host._buffer(node.outputs.out) } },
@@ -3525,11 +3731,10 @@ export class WebGPUGraphCompiler {
         const [, out_h, out_w] = node.outputs.out.shape;
         const [kh, kw] = normalizeSpatialPair(node.params.kernel, 1);
         const [sh, sw] = normalizeSpatialPair(node.params.stride, 1);
-        const ph = node.params.padding ? node.params.padding[0] : 0;
-        const pw = node.params.padding ? node.params.padding[1] : 0;
+        const [ph, pw] = fullSpatialPads(node.params, 'AveragePool2D', true);
         const p = new Uint32Array([b, in_h, in_w, c, out_h, out_w, kh, kw, sh, sw, ph, pw]);
-        const paramsBuf = this.host.device.createBuffer({ size: 48, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
-        this.host.device.queue.writeBuffer(paramsBuf, 0, p);
+        const paramsBuf = this.host._createSpecializationBuffer({ size: 48, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+        this.host._writeSpecializationBuffer(paramsBuf, 0, p);
         bindGroupEntries = [
           { binding: 0, resource: { buffer: this.host._buffer(inp) } },
           { binding: 1, resource: { buffer: this.host._buffer(node.outputs.out) } },
@@ -3541,16 +3746,20 @@ export class WebGPUGraphCompiler {
         const inp = node.inputs.input || node.inputs.x;
         const [b, in_h, in_w, in_c] = inp.shape;
         const [, out_h, out_w, out_c] = node.outputs.out.shape;
-        const kh = node.params.kernel![0], kw = node.params.kernel![1];
-        const sh = node.params.stride ? node.params.stride[0] : 1;
-        const sw = node.params.stride ? node.params.stride[1] : 1;
-        const ph = node.params.padding ? node.params.padding[0] : 0;
-        const pw = node.params.padding ? node.params.padding[1] : 0;
+        const [kh, kw] = spatialPair(
+          node.params.kernel, 1, 'ConvTranspose2D', 'kernel', false, true,
+        );
+        const [sh, sw] = spatialPair(
+          node.params.stride, 1, 'ConvTranspose2D', 'stride', false,
+        );
+        const [ph, pw] = spatialPair(
+          node.params.padding, 0, 'ConvTranspose2D', 'padding', true,
+        );
         const hasBias = node.inputs.bias ? 1 : 0;
         const p = new Uint32Array([b, in_h, in_w, in_c, out_h, out_w, out_c, kh, kw, sh, sw, ph, pw, hasBias]);
-        const paramsBuf = this.host.device.createBuffer({ size: 64, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
-        this.host.device.queue.writeBuffer(paramsBuf, 0, p);
-        const dummyBias = this.host.device.createBuffer({ size: 16, usage: GPUBufferUsage.STORAGE });
+        const paramsBuf = this.host._createSpecializationBuffer({ size: 64, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+        this.host._writeSpecializationBuffer(paramsBuf, 0, p);
+        const dummyBias = this.host._createSpecializationBuffer({ size: 16, usage: GPUBufferUsage.STORAGE });
         bindGroupEntries = [
           { binding: 0, resource: { buffer: this.host._buffer(inp) } },
           { binding: 1, resource: { buffer: this.host._buffer(node.inputs.weight) } },
@@ -3580,6 +3789,7 @@ export class WebGPUGraphCompiler {
           this.host.rejectedSpecializedShaders.has(wgslCode)) {
         wgslCode = fallbackWgslCode;
         workgroupCount = fallbackWorkgroupCount;
+        tacticId = fallbackTacticId;
       }
       let pipeline;
       try {
@@ -3590,12 +3800,16 @@ export class WebGPUGraphCompiler {
         this.host.rejectedSpecializedShaders.add(wgslCode);
         wgslCode = fallbackWgslCode;
         workgroupCount = fallbackWorkgroupCount;
+        tacticId = fallbackTacticId;
         pipeline = await this.host._cachedComputePipeline(wgslCode);
       }
-      const bindGroup = this.host.device.createBindGroup({
+      const bindGroup = this.host._createSpecializationBindGroup(pipeline, {
         layout: pipeline.getBindGroupLayout(0),
         entries: bindGroupEntries
       });
-      (this.host._activePipelineTarget || this.host.pipelines).push({ pipeline, bindGroup, workgroupCount, nodeName: node.id });
+      (this.host._activePipelineTarget || this.host.pipelines).push({
+        pipeline, bindGroup, workgroupCount, nodeName: node.id,
+        ...(tacticId === undefined ? {} : { tacticId }),
+      });
     }
 }

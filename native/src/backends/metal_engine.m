@@ -3,6 +3,7 @@
 #import "metal_engine.h"
 #include "runtime_state.h"
 #include "shader_store.h"
+#include "batch_matmul_f32_plan.h"
 #include "expand_f32_plan.h"
 #include "qbatch_matmul_plan.h"
 #include "qlinear_multiplier.h"
@@ -10,6 +11,7 @@
 
 #include <math.h>
 #include <stdint.h>
+#include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -59,10 +61,15 @@ typedef struct {
     const void* host;
     size_t bytes;
     size_t cap;
+    size_t domain_capacity;
     id<MTLBuffer> buffer;
+    uint64_t shape_generation;
+    uint64_t capacity_generation;
     int host_dirty;
     int device_dirty;
     int is_weight;
+    int is_alias;
+    int domain_span;
 } MetalTensorSlot;
 
 typedef struct {
@@ -193,6 +200,16 @@ typedef struct {
     id<MTLBuffer> qlayernorm_scratch_buffer;
     size_t qlayernorm_scratch_capacity;
     QConvZeroBiasBacking* qconv_zero_bias_storage;
+    char* shape_signature;
+    uint64_t shape_generation;
+    uint64_t capacity_generation;
+    size_t domain_span_count;
+    size_t domain_qgroupnorm_stats_bytes;
+    size_t domain_qlayernorm_stats_bytes;
+    int domain_enforced;
+#ifdef VOLVOX_METAL_TESTING
+    int test_domain_allocation_failure_after;
+#endif
 #if VOLVOXAI_ENABLE_TRAINING
     int training_is_active;
     MetalTrainingKernel training_kernel_storage[METAL_TRAINING_MAX_KERNELS];
@@ -263,6 +280,10 @@ static const MetalKernel k_broadcast_binary = {"broadcastBinaryNative", METAL_SH
 static const MetalKernel k_split = {"split", METAL_SHADER_DIR "/split.metal", 3, 2, 64, 1, 1};
 static const MetalKernel k_conv1d = {"conv1D", METAL_SHADER_DIR "/conv1D.metal", 5, 4, 64, 1, 1};
 static const MetalKernel k_embedding = {"embedding", METAL_SHADER_DIR "/embedding.metal", 4, 3, 64, 1, 1};
+/* Bindings 0-5 storage, 6 uniform params, 7 the resident-slot table. */
+static const MetalKernel k_moe_linear = {"moeLinear", METAL_SHADER_DIR "/moeLinear.metal", 8, 6, 64, 1, 1};
+/* Bindings 0-4 storage, 5 uniform params. */
+static const MetalKernel k_moe_router = {"moeRouter", METAL_SHADER_DIR "/moeRouter.metal", 6, 5, 64, 1, 1};
 static const MetalKernel k_sdpa = {"sDPA", METAL_SHADER_DIR "/sDPA.metal", 4, 3, 64, 1, 1};
 static const MetalKernel k_cross_sdpa = {"crossSDPA", METAL_SHADER_DIR "/crossSDPA.metal", 6, 5, 64, 1, 1};
 #if VOLVOXAI_ENABLE_TRAINING
@@ -316,6 +337,7 @@ static const MetalKernel k_softmax = {"softmax", METAL_SHADER_DIR "/softmax.meta
 static const MetalKernel k_reduce = {"reduce", METAL_SHADER_DIR "/reduce.metal", 3, 2, 64, 1, 1};
 static const MetalKernel k_transpose = {"generalTranspose", METAL_SHADER_DIR "/generalTranspose.metal", 3, -1, 64, 1, 1};
 static const MetalKernel k_expand = {"expand", METAL_SHADER_DIR "/expand.metal", 3, 2, 64, 1, 1};
+static const MetalKernel k_batch_matmul = {"batchMatMul", METAL_SHADER_DIR "/batchMatMul.metal", 4, -1, 8, 8, 1};
 static const MetalKernel k_gather = {"gather", METAL_SHADER_DIR "/gather.metal", 4, 3, 64, 1, 1};
 static const MetalKernel k_slice = {"slice", METAL_SHADER_DIR "/slice.metal", 3, 2, 64, 1, 1};
 static const MetalKernel k_concat = {"concatCopy", METAL_SHADER_DIR "/concatCopy.metal", 3, 2, 64, 1, 1};
@@ -337,6 +359,11 @@ static MetalContextState* metal_context_state_get(int create) {
     if (!state && create) {
         state = (MetalContextState*)calloc(1, sizeof(*state));
         if (!state) return NULL;
+        state->shape_generation = 1;
+        state->capacity_generation = 1;
+#ifdef VOLVOX_METAL_TESTING
+        state->test_domain_allocation_failure_after = -1;
+#endif
         owner->metal_context_state = state;
         owner->metal_context_state_destroy = metal_context_state_destroy;
     }
@@ -381,12 +408,7 @@ static NSString* metal_shader_source(const char* path) {
 static void clear_slot(MetalTensorSlot* s) {
     if (!s) return;
     VX_METAL_RELEASE(s->buffer);
-    s->host = NULL;
-    s->bytes = 0;
-    s->cap = 0;
-    s->host_dirty = 0;
-    s->device_dirty = 0;
-    s->is_weight = 0;
+    memset(s, 0, sizeof(*s));
 }
 
 static MetalPipelineCacheEntry* metal_pipeline_cache_entry(
@@ -569,8 +591,70 @@ static MetalTrainingKernel* compile_training_kernel(const MetalTrainingShaderDes
 }
 #endif
 
+static uint64_t metal_generation_next(uint64_t generation) {
+    generation++;
+    return generation ? generation : 1u;
+}
+
+static size_t metal_max_buffer_length(void) {
+    if (!device) return 0;
+    if (@available(macOS 10.14, *)) return (size_t)[device maxBufferLength];
+    return UINT32_MAX;
+}
+
+static int metal_buffer_size_valid(size_t bytes) {
+    size_t limit = metal_max_buffer_length();
+    return bytes > 0 && bytes <= UINT32_MAX && limit && bytes <= limit;
+}
+
+int metal_query_domain_limits(MetalDomainLimits* limits) {
+    MetalContextState* state = metal_context_state_get(0);
+    int ready = 0;
+    if (!limits) return -1;
+    memset(limits, 0, sizeof(*limits));
+    if (!state || !state->device_acquired) return -1;
+    metal_device_lock();
+    if (device && commandQueue) {
+        size_t buffer_limit = metal_max_buffer_length();
+        MTLSize workgroup_limit = [device maxThreadsPerThreadgroup];
+        uint64_t thread_product = (uint64_t)workgroup_limit.width;
+        if (!workgroup_limit.height || thread_product >
+                UINT64_MAX / (uint64_t)workgroup_limit.height) {
+            thread_product = UINT64_MAX;
+        } else {
+            thread_product *= (uint64_t)workgroup_limit.height;
+            if (!workgroup_limit.depth || thread_product >
+                    UINT64_MAX / (uint64_t)workgroup_limit.depth)
+                thread_product = UINT64_MAX;
+            else
+                thread_product *= (uint64_t)workgroup_limit.depth;
+        }
+        if (buffer_limit > UINT32_MAX) buffer_limit = UINT32_MAX;
+        limits->maximum_buffer_bytes = (uint64_t)buffer_limit;
+        for (size_t axis = 0; axis < 3u; axis++)
+            limits->maximum_workgroups[axis] = UINT32_MAX;
+        limits->maximum_workgroup_size[0] = workgroup_limit.width > UINT32_MAX
+            ? UINT32_MAX : (uint32_t)workgroup_limit.width;
+        limits->maximum_workgroup_size[1] = workgroup_limit.height > UINT32_MAX
+            ? UINT32_MAX : (uint32_t)workgroup_limit.height;
+        limits->maximum_workgroup_size[2] = workgroup_limit.depth > UINT32_MAX
+            ? UINT32_MAX : (uint32_t)workgroup_limit.depth;
+        limits->maximum_threads_per_workgroup = thread_product > UINT32_MAX
+            ? UINT32_MAX : (uint32_t)thread_product;
+        limits->maximum_tensor_slots = METAL_GRAPH_MAX_TENSORS;
+        limits->maximum_bindings = METAL_MAX_BINDINGS - 1u;
+        ready = limits->maximum_buffer_bytes > 0u &&
+            limits->maximum_workgroup_size[0] > 0u &&
+            limits->maximum_workgroup_size[1] > 0u &&
+            limits->maximum_workgroup_size[2] > 0u &&
+            limits->maximum_threads_per_workgroup > 0u;
+    }
+    metal_device_unlock();
+    return ready ? 0 : -1;
+}
+
 static id<MTLBuffer> create_buffer(size_t bytes, const void* data) {
-    if (!metal_ready() || bytes == 0) return nil;
+    if (!metal_ready() || !metal_buffer_size_valid(bytes)) return nil;
     id<MTLBuffer> b = [device newBufferWithLength:bytes options:MTLResourceStorageModeShared];
     if (!b) return nil;
     if (data) memcpy([b contents], data, bytes);
@@ -578,28 +662,36 @@ static id<MTLBuffer> create_buffer(size_t bytes, const void* data) {
 }
 
 static id<MTLBuffer> qgroupnorm_stats_ensure(size_t bytes) {
+    MetalContextState* state = metal_context_state_get(0);
     id<MTLBuffer> next;
-    if (!metal_ready() || bytes == 0) return nil;
+    if (!metal_ready() || !state || bytes == 0) return nil;
     if (qgroupnorm_stats_buffer && qgroupnorm_stats_capacity >= bytes)
         return qgroupnorm_stats_buffer;
+    if (state->domain_enforced) return nil;
     next = create_buffer(bytes, NULL);
     if (!next) return nil;
     VX_METAL_RELEASE(qgroupnorm_stats_buffer);
     qgroupnorm_stats_buffer = next;
     qgroupnorm_stats_capacity = bytes;
+    state->capacity_generation =
+        metal_generation_next(state->capacity_generation);
     return qgroupnorm_stats_buffer;
 }
 
 static id<MTLBuffer> qlayernorm_stats_ensure(size_t bytes) {
+    MetalContextState* state = metal_context_state_get(0);
     id<MTLBuffer> next;
-    if (!metal_ready() || bytes == 0) return nil;
+    if (!metal_ready() || !state || bytes == 0) return nil;
     if (qlayernorm_stats_buffer && qlayernorm_stats_capacity >= bytes)
         return qlayernorm_stats_buffer;
+    if (state->domain_enforced) return nil;
     next = create_buffer(bytes, NULL);
     if (!next) return nil;
     VX_METAL_RELEASE(qlayernorm_stats_buffer);
     qlayernorm_stats_buffer = next;
     qlayernorm_stats_capacity = bytes;
+    state->capacity_generation =
+        metal_generation_next(state->capacity_generation);
     return qlayernorm_stats_buffer;
 }
 
@@ -714,27 +806,74 @@ static int training_ensure_encoder(void) {
 #endif
 
 static int graph_find_slot(const void* host) {
+    MetalContextState* state = metal_context_state_get(0);
     if (!host) return -1;
     for (int i = 0; i < graph_slot_count; i++) {
-        if (graph_slots[i].host == host) return i;
+        if (graph_slots[i].host == host &&
+            (graph_slots[i].is_weight ||
+             (state && graph_slots[i].shape_generation ==
+                           state->shape_generation))) return i;
     }
     return -1;
 }
 
+static int graph_find_reusable_slot(size_t bytes) {
+    int best = -1;
+    int empty = -1;
+    int grow = -1;
+    for (int index = 0; index < graph_slot_count; index++) {
+        MetalTensorSlot* slot = &graph_slots[index];
+        if (slot->host || slot->is_weight) continue;
+        if (!slot->buffer || slot->is_alias) {
+            if (empty < 0) empty = index;
+            continue;
+        }
+        if (slot->cap >= bytes &&
+            (best < 0 || slot->cap < graph_slots[best].cap)) best = index;
+        else if (grow < 0 || slot->cap > graph_slots[grow].cap) grow = index;
+    }
+    return best >= 0 ? best : (empty >= 0 ? empty : grow);
+}
+
 static MetalTensorSlot* graph_get_slot(const void* host, size_t bytes, int is_weight) {
-    if (!metal_ready() || !host || bytes == 0) return NULL;
+    MetalContextState* state = metal_context_state_get(0);
+    if (!metal_ready() || !state || !host ||
+        !metal_buffer_size_valid(bytes)) return NULL;
     int idx = graph_find_slot(host);
+    if (state->domain_enforced) {
+        MetalTensorSlot* slot = idx >= 0 ? &graph_slots[idx] : NULL;
+        if (!slot || !slot->buffer || slot->is_alias || bytes > slot->cap)
+            return NULL;
+        if (slot->domain_span) {
+            /* Public inputs retain activation lifetime even when a kernel
+             * consumes one through a weight/affine argument. The binding
+             * commit marks this reserved span host-dirty on each run. */
+            if (bytes > slot->domain_capacity) return NULL;
+            if (bytes > slot->bytes) {
+                slot->bytes = bytes;
+                slot->host_dirty = 1;
+                slot->device_dirty = 0;
+            }
+            return slot;
+        }
+        if (!slot->is_weight || !slot->host || !slot->bytes ||
+            bytes > slot->bytes) return NULL;
+        return slot;
+    }
     if (idx < 0) {
-        if (graph_slot_count >= METAL_GRAPH_MAX_TENSORS) return NULL;
-        idx = graph_slot_count++;
+        idx = graph_find_reusable_slot(bytes);
+        if (idx < 0) {
+            if (graph_slot_count >= METAL_GRAPH_MAX_TENSORS) return NULL;
+            idx = graph_slot_count++;
+            memset(&graph_slots[idx], 0, sizeof(graph_slots[idx]));
+        }
         MetalTensorSlot* s = &graph_slots[idx];
         s->host = host;
         s->bytes = 0;
-        s->cap = 0;
-        s->buffer = nil;
         s->host_dirty = 1;
         s->device_dirty = 0;
         s->is_weight = is_weight;
+        s->shape_generation = is_weight ? 0 : state->shape_generation;
     }
     MetalTensorSlot* s = &graph_slots[idx];
     s->bytes = bytes;
@@ -742,14 +881,38 @@ static MetalTensorSlot* graph_get_slot(const void* host, size_t bytes, int is_we
     return s;
 }
 
+static int graph_slot_ensure_capacity(MetalTensorSlot* slot, size_t bytes,
+                                      const void* data, size_t data_bytes,
+                                      int clear_tail) {
+    MetalContextState* state = metal_context_state_get(0);
+    size_t capacity = bytes;
+    id<MTLBuffer> candidate;
+    if (!state || !slot || data_bytes > bytes ||
+        !metal_buffer_size_valid(bytes)) return 0;
+    if (state->domain_enforced &&
+        (!slot->buffer || slot->is_alias || slot->cap < bytes)) return 0;
+    if (!slot->is_alias && slot->cap && slot->cap <= SIZE_MAX / 2u &&
+        slot->cap * 2u > capacity &&
+        metal_buffer_size_valid(slot->cap * 2u)) capacity = slot->cap * 2u;
+    candidate = create_buffer(capacity, NULL);
+    if (!candidate) return 0;
+    if (clear_tail) memset([candidate contents], 0, capacity);
+    if (data && data_bytes) memcpy([candidate contents], data, data_bytes);
+    VX_METAL_RELEASE(slot->buffer);
+    slot->buffer = candidate;
+    slot->cap = capacity;
+    slot->is_alias = 0;
+    state->capacity_generation =
+        metal_generation_next(state->capacity_generation);
+    slot->capacity_generation = state->capacity_generation;
+    return 1;
+}
+
 static MetalTensorSlot* graph_ensure_device(const void* host, size_t bytes, int is_weight) {
     MetalTensorSlot* s = graph_get_slot(host, bytes, is_weight);
     if (!s) return NULL;
-    if (!s->buffer || s->cap < bytes) {
-        VX_METAL_RELEASE(s->buffer);
-        s->buffer = create_buffer(bytes, host);
-        if (!s->buffer) return NULL;
-        s->cap = bytes;
+    if (!s->buffer || s->cap < bytes || s->is_alias) {
+        if (!graph_slot_ensure_capacity(s, bytes, host, bytes, 0)) return NULL;
         s->host_dirty = 0;
         s->device_dirty = 0;
         return s;
@@ -779,15 +942,12 @@ static MetalTensorSlot* graph_ensure_packed_bytes(const void* host, size_t logic
     if (!host || !graph_packed_bytes(logical_bytes, &storage_bytes)) return NULL;
     MetalTensorSlot* s = graph_get_slot(host, storage_bytes, is_weight);
     if (!s) return NULL;
-    if (!s->buffer || s->cap < storage_bytes) {
-        unsigned char* packed = (unsigned char*)calloc(storage_bytes, 1);
-        if (!packed) return NULL;
-        memcpy(packed, host, logical_bytes);
-        VX_METAL_RELEASE(s->buffer);
-        s->buffer = create_buffer(storage_bytes, packed);
-        free(packed);
-        if (!s->buffer) return NULL;
-        s->cap = storage_bytes;
+    if (!s->buffer || s->cap < storage_bytes || s->is_alias) {
+        /* Shared Metal storage can be cleared and populated directly. Avoid a
+         * maximum-shape host calloc merely to materialize at most three tail
+         * zero bytes for the shader's packed-u32 view. */
+        if (!graph_slot_ensure_capacity(
+                s, storage_bytes, host, logical_bytes, 1)) return NULL;
         s->host_dirty = 0;
         s->device_dirty = 0;
     } else if (s->host_dirty) {
@@ -808,12 +968,8 @@ static MetalTensorSlot* graph_output_packed_bytes(const void* host, size_t logic
 static MetalTensorSlot* graph_output_slot(const void* host, size_t bytes) {
     MetalTensorSlot* s = graph_get_slot(host, bytes, 0);
     if (!s) return NULL;
-    if (!s->buffer || s->cap < bytes) {
-        VX_METAL_RELEASE(s->buffer);
-        s->buffer = create_buffer(bytes, NULL);
-        if (!s->buffer) return NULL;
-        s->cap = bytes;
-    }
+    if (!s->buffer || s->cap < bytes || s->is_alias)
+        if (!graph_slot_ensure_capacity(s, bytes, NULL, 0, 0)) return NULL;
     s->host_dirty = 0;
     s->device_dirty = 0;
     return s;
@@ -823,10 +979,6 @@ static void graph_mark_device(MetalTensorSlot* s) {
     if (!s) return;
     s->device_dirty = 1;
     s->host_dirty = 0;
-}
-
-static uint32_t binding_size_u32(size_t bytes) {
-    return bytes > UINT32_MAX ? UINT32_MAX : (uint32_t)bytes;
 }
 
 static void graph_release_retained_bindings(void) {
@@ -882,18 +1034,25 @@ static int graph_ensure_command(void) {
 
 static int dispatch_kernel(const MetalKernel* k, const MetalBinding* binds,
                            uint32_t gx, uint32_t gy, uint32_t gz) {
-    id<MTLComputePipelineState> pipeline = compile_kernel(k);
-    if (!pipeline || !binds || gx == 0 || gy == 0 || gz == 0) return 0;
+    id<MTLComputePipelineState> pipeline;
+    if (!metal_ready() || !k || !binds || gx == 0 || gy == 0 || gz == 0)
+        return 0;
     if (k->binding_count <= 0 || k->binding_count >= METAL_MAX_BINDINGS) return 0;
     uint64_t threads_per_group = (uint64_t)k->wg_x * (uint64_t)k->wg_y * (uint64_t)k->wg_z;
-    if (threads_per_group == 0 ||
-        threads_per_group >
-            (uint64_t)[pipeline maxTotalThreadsPerThreadgroup]) return 0;
+    MTLSize device_limit = [device maxThreadsPerThreadgroup];
+    if (threads_per_group == 0 || k->wg_x <= 0 || k->wg_y <= 0 ||
+        k->wg_z <= 0 || (NSUInteger)k->wg_x > device_limit.width ||
+        (NSUInteger)k->wg_y > device_limit.height ||
+        (NSUInteger)k->wg_z > device_limit.depth) return 0;
     uint32_t sizes[METAL_MAX_BINDINGS] = {0};
     for (int i = 0; i < k->binding_count; i++) {
-        if (!binds[i].buffer || binds[i].bytes == 0) return 0;
-        sizes[i] = binding_size_u32(binds[i].bytes);
+        if (!binds[i].buffer || !metal_buffer_size_valid(binds[i].bytes))
+            return 0;
+        sizes[i] = (uint32_t)binds[i].bytes;
     }
+    pipeline = compile_kernel(k);
+    if (!pipeline || threads_per_group >
+            (uint64_t)[pipeline maxTotalThreadsPerThreadgroup]) return 0;
     if (graph_forward_active && graph_forward_error) return 0;
     if (!graph_forward_active) graph_forward_error = 0;
     if (graph_retained_binding_count >
@@ -1131,6 +1290,8 @@ void metal_training_end(void) {
 #endif
 
 void metal_graph_reset(void) {
+    MetalContextState* state = metal_context_state_get(0);
+    if (!state) return;
 #if VOLVOXAI_ENABLE_TRAINING
     /* Training slots may retain aliases into graph_slots. End the lazy
        training session first so reset cannot invalidate a live alias. */
@@ -1141,6 +1302,305 @@ void metal_graph_reset(void) {
     graph_forward_error = 0;
     for (int i = 0; i < graph_slot_count; i++) clear_slot(&graph_slots[i]);
     graph_slot_count = 0;
+    free(state->shape_signature);
+    state->shape_signature = NULL;
+    state->shape_generation = metal_generation_next(state->shape_generation);
+    state->capacity_generation =
+        metal_generation_next(state->capacity_generation);
+    state->domain_span_count = 0;
+    state->domain_qgroupnorm_stats_bytes = 0;
+    state->domain_qlayernorm_stats_bytes = 0;
+    state->domain_enforced = 0;
+#ifdef VOLVOX_METAL_TESTING
+    state->test_domain_allocation_failure_after = -1;
+#endif
+}
+
+int metal_graph_bind_shape(const char* signature) {
+    MetalContextState* state = metal_context_state_get(0);
+    char* candidate;
+    size_t length;
+    uint64_t next_generation;
+    if (!state || !metal_ready() || !signature || !signature[0] ||
+        state->domain_enforced) return -1;
+    if (state->shape_signature && !strcmp(state->shape_signature, signature))
+        return 0;
+#if VOLVOXAI_ENABLE_TRAINING
+    if (training_active) return -1;
+#endif
+    length = strlen(signature);
+    if (length > 1024u * 1024u) return -1;
+    candidate = (char*)malloc(length + 1u);
+    if (!candidate) return -1;
+    memcpy(candidate, signature, length + 1u);
+    if (graph_flush_commands() != 0) {
+        free(candidate);
+        return -1;
+    }
+    graph_forward_active = 0;
+    graph_forward_error = 0;
+    next_generation = metal_generation_next(state->shape_generation);
+    for (int index = 0; index < graph_slot_count; index++) {
+        MetalTensorSlot* slot = &graph_slots[index];
+        if (slot->is_weight) continue;
+        slot->host = NULL;
+        slot->bytes = 0;
+        slot->shape_generation = next_generation;
+        slot->host_dirty = 0;
+        slot->device_dirty = 0;
+        if (slot->is_alias) {
+            VX_METAL_RELEASE(slot->buffer);
+            slot->cap = 0;
+            slot->capacity_generation = 0;
+            slot->is_alias = 0;
+        }
+    }
+    free(state->shape_signature);
+    state->shape_signature = candidate;
+    state->shape_generation = next_generation;
+    return 0;
+}
+
+static int metal_graph_domain_spans_match(
+        const VolvoxAIEnginePhysicalSpan* spans,
+        size_t span_count) {
+    MetalContextState* state = metal_context_state_get(0);
+    if (!state || !spans || span_count != state->domain_span_count) return 0;
+    for (size_t index = 0; index < span_count; index++) {
+        int slot_index = graph_find_slot(spans[index].host);
+        MetalTensorSlot* slot;
+        if (slot_index < 0) return 0;
+        slot = &graph_slots[slot_index];
+        if (!slot->domain_span || slot->is_weight || !slot->buffer ||
+            slot->is_alias || slot->domain_capacity !=
+                spans[index].capacity_bytes ||
+            slot->bytes > slot->domain_capacity)
+            return 0;
+    }
+    return 1;
+}
+
+static int metal_domain_candidate_allocation_allowed(
+        MetalContextState* state) {
+#ifdef VOLVOX_METAL_TESTING
+    if (state->test_domain_allocation_failure_after == 0) {
+        state->test_domain_allocation_failure_after = -1;
+        return 0;
+    }
+    if (state->test_domain_allocation_failure_after > 0)
+        state->test_domain_allocation_failure_after--;
+#else
+    (void)state;
+#endif
+    return 1;
+}
+
+int metal_graph_bind_shape_domain(
+        const char* signature,
+        const VolvoxAIEnginePhysicalSpan* spans,
+        size_t span_count,
+        size_t qgroupnorm_stats_bytes,
+        size_t qlayernorm_stats_bytes) {
+    MetalContextState* state = metal_context_state_get(0);
+    char* candidate_signature = NULL;
+    MetalTensorSlot* candidate_slots = NULL;
+    id<MTLBuffer> candidate_qgroupnorm_stats_buffer = nil;
+    id<MTLBuffer> candidate_qlayernorm_stats_buffer = nil;
+    size_t signature_length;
+    int weight_count = 0;
+    int result = -1;
+    uint64_t next_shape_generation;
+    uint64_t next_capacity_generation;
+    if (!state || !metal_ready() || !signature || !signature[0] ||
+        !spans || !span_count || span_count > METAL_GRAPH_MAX_TENSORS ||
+        graph_forward_active)
+        return -1;
+#if VOLVOXAI_ENABLE_TRAINING
+    if (training_active) return -1;
+#endif
+    signature_length = strlen(signature);
+    if (signature_length > 1024u * 1024u) return -1;
+    if (qgroupnorm_stats_bytes > SIZE_MAX - qlayernorm_stats_bytes ||
+        (qgroupnorm_stats_bytes &&
+         !metal_buffer_size_valid(qgroupnorm_stats_bytes)) ||
+        (qlayernorm_stats_bytes &&
+         !metal_buffer_size_valid(qlayernorm_stats_bytes)))
+        return -1;
+    for (size_t index = 0; index < span_count; index++) {
+        uintptr_t start = (uintptr_t)spans[index].host;
+        size_t capacity = spans[index].capacity_bytes;
+        if (!start || !capacity || start > UINTPTR_MAX - capacity ||
+            !metal_buffer_size_valid(capacity) ||
+            (index && (uintptr_t)spans[index - 1u].host +
+                spans[index - 1u].capacity_bytes > start))
+            return -1;
+    }
+    if (state->domain_enforced) {
+        if (!metal_graph_domain_spans_match(spans, span_count) ||
+            qgroupnorm_stats_bytes !=
+                state->domain_qgroupnorm_stats_bytes ||
+            qlayernorm_stats_bytes !=
+                state->domain_qlayernorm_stats_bytes)
+            return -1;
+        if (state->shape_signature &&
+            !strcmp(state->shape_signature, signature)) {
+            for (int index = 0; index < graph_slot_count; index++) {
+                MetalTensorSlot* slot = &graph_slots[index];
+                if (!slot->domain_span) continue;
+                slot->bytes = 0;
+                slot->host_dirty = 0;
+                slot->device_dirty = 0;
+            }
+            return 0;
+        }
+        candidate_signature = (char*)malloc(signature_length + 1u);
+        if (!candidate_signature) return -2;
+        memcpy(candidate_signature, signature, signature_length + 1u);
+        if (graph_flush_commands() != 0) goto done;
+        graph_forward_error = 0;
+        next_shape_generation =
+            metal_generation_next(state->shape_generation);
+        for (int index = 0; index < graph_slot_count; index++) {
+            MetalTensorSlot* slot = &graph_slots[index];
+            if (!slot->domain_span) continue;
+            slot->shape_generation = next_shape_generation;
+            slot->bytes = 0;
+            slot->host_dirty = 0;
+            slot->device_dirty = 0;
+        }
+        free(state->shape_signature);
+        state->shape_signature = candidate_signature;
+        candidate_signature = NULL;
+        state->shape_generation = next_shape_generation;
+        result = 0;
+        goto done;
+    }
+
+    for (int index = 0; index < graph_slot_count; index++) {
+        MetalTensorSlot* slot = &graph_slots[index];
+        if (!slot->is_weight) continue;
+        uintptr_t weight_start = (uintptr_t)slot->host;
+        if (!weight_start || !slot->buffer || slot->is_alias ||
+            !slot->bytes || slot->bytes > slot->cap ||
+            weight_start > UINTPTR_MAX - slot->bytes)
+            return -1;
+        weight_count++;
+        for (size_t span_index = 0; span_index < span_count; span_index++) {
+            uintptr_t span_start = (uintptr_t)spans[span_index].host;
+            uintptr_t span_end = span_start + spans[span_index].capacity_bytes;
+            uintptr_t weight_end = weight_start + slot->bytes;
+            if (span_start < weight_end && weight_start < span_end)
+                return -1;
+        }
+    }
+    if (span_count > (size_t)(METAL_GRAPH_MAX_TENSORS - weight_count))
+        return -1;
+    candidate_signature = (char*)malloc(signature_length + 1u);
+    candidate_slots =
+        (MetalTensorSlot*)calloc(span_count, sizeof(*candidate_slots));
+    if (!candidate_signature || !candidate_slots) {
+        result = -2;
+        goto done;
+    }
+    memcpy(candidate_signature, signature, signature_length + 1u);
+    if (graph_flush_commands() != 0) goto done;
+    graph_forward_error = 0;
+    @autoreleasepool {
+        for (size_t index = 0; index < span_count; index++) {
+            if (!metal_domain_candidate_allocation_allowed(state)) {
+                result = -2;
+                break;
+            }
+            candidate_slots[index].buffer =
+                create_buffer(spans[index].capacity_bytes, NULL);
+            if (!candidate_slots[index].buffer) {
+                result = -2;
+                break;
+            }
+        }
+        if (result != -2 && qgroupnorm_stats_bytes) {
+            if (!metal_domain_candidate_allocation_allowed(state)) {
+                result = -2;
+            } else {
+                candidate_qgroupnorm_stats_buffer =
+                    create_buffer(qgroupnorm_stats_bytes, NULL);
+                if (!candidate_qgroupnorm_stats_buffer) result = -2;
+            }
+        }
+        if (result != -2 && qlayernorm_stats_bytes) {
+            if (!metal_domain_candidate_allocation_allowed(state)) {
+                result = -2;
+            } else {
+                candidate_qlayernorm_stats_buffer =
+                    create_buffer(qlayernorm_stats_bytes, NULL);
+                if (!candidate_qlayernorm_stats_buffer) result = -2;
+            }
+        }
+    }
+    if (result == -2) goto done;
+
+    next_shape_generation =
+        metal_generation_next(state->shape_generation);
+    next_capacity_generation =
+        metal_generation_next(state->capacity_generation);
+    for (int index = 0; index < graph_slot_count; index++) {
+        if (!graph_slots[index].is_weight) clear_slot(&graph_slots[index]);
+    }
+    VX_METAL_RELEASE(state->qgroupnorm_scratch_buffer);
+    state->qgroupnorm_scratch_buffer = candidate_qgroupnorm_stats_buffer;
+    state->qgroupnorm_scratch_capacity = qgroupnorm_stats_bytes;
+    candidate_qgroupnorm_stats_buffer = nil;
+    VX_METAL_RELEASE(state->qlayernorm_scratch_buffer);
+    state->qlayernorm_scratch_buffer = candidate_qlayernorm_stats_buffer;
+    state->qlayernorm_scratch_capacity = qlayernorm_stats_bytes;
+    candidate_qlayernorm_stats_buffer = nil;
+    {
+        int kept = 0;
+        int old_slot_count = graph_slot_count;
+        for (int index = 0; index < old_slot_count; index++) {
+            if (!graph_slots[index].is_weight) continue;
+            if (kept != index) graph_slots[kept] = graph_slots[index];
+            kept++;
+        }
+        if (kept < old_slot_count) {
+            memset(&graph_slots[kept], 0,
+                   (size_t)(old_slot_count - kept) * sizeof(graph_slots[0]));
+        }
+        graph_slot_count = kept;
+    }
+    for (size_t index = 0; index < span_count; index++) {
+        MetalTensorSlot* slot = &graph_slots[graph_slot_count++];
+        memset(slot, 0, sizeof(*slot));
+        slot->host = spans[index].host;
+        slot->cap = spans[index].capacity_bytes;
+        slot->domain_capacity = spans[index].capacity_bytes;
+        slot->buffer = candidate_slots[index].buffer;
+        candidate_slots[index].buffer = nil;
+        slot->shape_generation = next_shape_generation;
+        slot->capacity_generation = next_capacity_generation;
+        slot->domain_span = 1;
+    }
+    free(state->shape_signature);
+    state->shape_signature = candidate_signature;
+    candidate_signature = NULL;
+    state->shape_generation = next_shape_generation;
+    state->capacity_generation = next_capacity_generation;
+    state->domain_span_count = span_count;
+    state->domain_qgroupnorm_stats_bytes = qgroupnorm_stats_bytes;
+    state->domain_qlayernorm_stats_bytes = qlayernorm_stats_bytes;
+    state->domain_enforced = 1;
+    result = 0;
+
+done:
+    if (candidate_slots) {
+        for (size_t index = 0; index < span_count; index++)
+            clear_slot(&candidate_slots[index]);
+    }
+    VX_METAL_RELEASE(candidate_qgroupnorm_stats_buffer);
+    VX_METAL_RELEASE(candidate_qlayernorm_stats_buffer);
+    free(candidate_slots);
+    free(candidate_signature);
+    return result;
 }
 
 void metal_graph_begin_forward(void) {
@@ -1192,6 +1652,33 @@ int metal_graph_sync_host(const void* host, size_t bytes, int is_weight) {
     return 1;
 }
 
+void metal_graph_retain_weight(const void* host, size_t bytes) {
+    MetalContextState* state = metal_context_state_get(0);
+    if (!state || !host || !bytes) return;
+    int index = graph_find_slot(host);
+    if (index < 0) return;
+    MetalTensorSlot* slot = &graph_slots[index];
+    if (slot->domain_span || !slot->buffer || slot->is_alias ||
+        !slot->bytes || bytes > slot->bytes || bytes > slot->cap)
+        return;
+    slot->is_weight = 1;
+    slot->shape_generation = 0;
+}
+
+void metal_graph_demote_weight(const void* host, size_t bytes) {
+    MetalContextState* state = metal_context_state_get(0);
+    int index;
+    MetalTensorSlot* slot;
+    if (!state || !host || !bytes) return;
+    index = graph_find_slot(host);
+    if (index < 0) return;
+    slot = &graph_slots[index];
+    if (slot->domain_span || !slot->bytes || bytes > slot->bytes)
+        return;
+    slot->is_weight = 0;
+    slot->shape_generation = state->shape_generation;
+}
+
 #ifdef VOLVOX_METAL_TESTING
 void metal_graph_debug_reset_counters(void) {
     graph_debug_dispatch_count = 0;
@@ -1204,6 +1691,35 @@ void metal_graph_debug_counters(uint64_t* dispatches, uint64_t* commits,
     if (dispatches) *dispatches = graph_debug_dispatch_count;
     if (commits) *commits = graph_debug_commit_count;
     if (waits) *waits = graph_debug_wait_count;
+}
+
+int metal_graph_debug_dynamic_state(MetalGraphDynamicStateProbe* probe) {
+    MetalContextState* state = metal_context_state_get(0);
+    if (!state || !probe) return -1;
+    memset(probe, 0, sizeof(*probe));
+    probe->shape_generation = state->shape_generation;
+    probe->capacity_generation = state->capacity_generation;
+    probe->domain_span_count = state->domain_span_count;
+    probe->domain_scratch_capacity_bytes =
+        state->qgroupnorm_scratch_capacity +
+        state->qlayernorm_scratch_capacity;
+    probe->domain_enforced = state->domain_enforced;
+    probe->slot_count = state->graph_slots_count;
+    for (int index = 0; index < state->graph_slots_count; index++) {
+        MetalTensorSlot* slot = &state->graph_slot_storage[index];
+        if (!slot->buffer || slot->is_alias) continue;
+        if (slot->host) probe->active_capacity_bytes += slot->cap;
+        else probe->pooled_capacity_bytes += slot->cap;
+    }
+    return 0;
+}
+
+int metal_test_fail_domain_allocation_after(size_t successful_allocations) {
+    MetalContextState* state = metal_context_state_get(0);
+    if (!state || successful_allocations > (size_t)INT_MAX) return -1;
+    state->test_domain_allocation_failure_after =
+        (int)successful_allocations;
+    return 0;
 }
 #endif
 
@@ -1253,6 +1769,12 @@ static void metal_context_resources_release(MetalContextState* state) {
         VX_METAL_RELEASE(state->qlayernorm_scratch_buffer);
         state->qlayernorm_scratch_capacity = 0;
         qconv_zero_bias_release_state(state);
+        free(state->shape_signature);
+        state->shape_signature = NULL;
+        state->domain_span_count = 0;
+        state->domain_qgroupnorm_stats_bytes = 0;
+        state->domain_qlayernorm_stats_bytes = 0;
+        state->domain_enforced = 0;
     }
 }
 
@@ -1299,16 +1821,25 @@ void metal_cleanup(void) {
 
 int metal_graph_alias_f32(const float* in, float* out, long n) {
     if (!in || !out || n <= 0 || (uint64_t)n > UINT32_MAX) return 0;
+    MetalContextState* state = metal_context_state_get(0);
+    if (state && state->domain_enforced && in != out)
+        return metal_graph_copy_f32(in, out, n);
     size_t bytes = (size_t)n * sizeof(float);
     MetalTensorSlot* src = graph_ensure_device(in, bytes, 0);
     MetalTensorSlot* dst = graph_get_slot(out, bytes, 0);
     if (!src || !dst || !src->buffer) return 0;
-    if (dst != src && dst->buffer != src->buffer) {
+    if (dst == src) {
+        graph_mark_device(dst);
+        return 1;
+    }
+    if (dst->buffer != src->buffer) {
         VX_METAL_RELEASE(dst->buffer);
         VX_METAL_RETAIN_ASSIGN(dst->buffer, src->buffer);
     }
     dst->cap = src->cap;
+    dst->capacity_generation = src->capacity_generation;
     dst->bytes = bytes;
+    dst->is_alias = 1;
     dst->device_dirty = src->device_dirty;
     dst->host_dirty = 0;
     return 1;
@@ -1788,6 +2319,51 @@ int metal_graph_expand_f32(const float* in, float* out, const int* in_shape,
     return 1;
 }
 
+int metal_graph_expand_32(const void* in, void* out, const int* in_shape,
+                          int in_rank, const int* out_shape, int out_rank) {
+    /* expand.wgsl uses u32 storage and is the shared F32/I32 word-copy route. */
+    return metal_graph_expand_f32(
+        (const float*)in, (float*)out,
+        in_shape, in_rank, out_shape, out_rank);
+}
+
+int metal_graph_batch_matmul_f32(
+        const float* a, const int* a_shape, int a_rank,
+        const float* b, const int* b_shape, int b_rank,
+        float* output, const int* output_shape, int output_rank) {
+    VxBatchMatMulF32Plan plan;
+    size_t metadata_bytes;
+    if (!vx_batch_matmul_f32_plan(
+            a, a_shape, a_rank, b, b_shape, b_rank,
+            output, output_shape, output_rank, &plan))
+        return 0;
+    metadata_bytes = (size_t)plan.metadata_words * sizeof(uint32_t);
+    MetalTensorSlot* a_slot = graph_ensure_device(a, plan.a_bytes, 0);
+    MetalTensorSlot* b_slot = graph_ensure_device(b, plan.b_bytes, 0);
+    MetalTensorSlot* output_slot =
+        graph_output_slot(output, plan.output_bytes);
+    id<MTLBuffer> metadata_buffer =
+        create_buffer(metadata_bytes, plan.metadata);
+    if (!a_slot || !b_slot || !output_slot || !metadata_buffer) {
+        VX_METAL_RELEASE(metadata_buffer);
+        return 0;
+    }
+    MetalBinding bindings[4] = {
+        {a_slot->buffer, plan.a_bytes},
+        {b_slot->buffer, plan.b_bytes},
+        {output_slot->buffer, plan.output_bytes},
+        {metadata_buffer, metadata_bytes},
+    };
+    int ok = dispatch_kernel(
+        &k_batch_matmul, bindings,
+        (plan.n + 7u) / 8u, (plan.m + 7u) / 8u,
+        plan.output_batches);
+    VX_METAL_RELEASE(metadata_buffer);
+    if (!ok) return 0;
+    graph_mark_device(output_slot);
+    return 1;
+}
+
 int metal_graph_gather_i32_f32(const float* input, const int32_t* indices,
                                float* output, int outer, int axis_size,
                                int inner, int indices_elements,
@@ -2218,6 +2794,123 @@ int metal_graph_conv1d_f32(const float* in, const float* weight, const float* bi
     if (delete_bias) VX_METAL_RELEASE(bias_buf);
     if (!ok) return 0;
     graph_mark_device(dst);
+    return 1;
+}
+
+/* Routed expert linear. `experts` counts staged rows; route indices stay in
+ * global slot space and are mapped through slot_rows when slot_domain != 0. */
+int metal_graph_moe_linear_f32(const float* input, const float* expert_weight,
+                               const float* expert_bias, const float* route_indices,
+                               const float* route_weights, float* out, int rows,
+                               int d_in, int d_out, int experts, int top_k,
+                               const uint32_t* slot_rows, uint32_t slot_domain) {
+    if (rows <= 0 || d_in <= 0 || d_out <= 0 || experts <= 0 || top_k <= 0 ||
+        !input || !expert_weight || !route_indices || !route_weights || !out) return 0;
+    if (slot_rows ? (slot_domain < (uint32_t)experts ||
+                     (uint32_t)top_k > slot_domain)
+                  : top_k > experts) return 0;
+    size_t in_bytes = (size_t)rows * (size_t)d_in * sizeof(float);
+    size_t w_bytes = (size_t)experts * (size_t)d_in * (size_t)d_out * sizeof(float);
+    size_t bias_bytes = (size_t)experts * (size_t)d_out * sizeof(float);
+    size_t route_bytes = (size_t)rows * (size_t)top_k * sizeof(float);
+    size_t out_bytes = (size_t)rows * (size_t)d_out * sizeof(float);
+    uint32_t slot_extent = slot_domain ? slot_domain : 1u;
+    MetalTensorSlot* si = graph_ensure_device(input, in_bytes, 0);
+    MetalTensorSlot* sw = graph_ensure_device(expert_weight, w_bytes, 1);
+    MetalTensorSlot* sri = graph_ensure_device(route_indices, route_bytes, 0);
+    MetalTensorSlot* srw = graph_ensure_device(route_weights, route_bytes, 0);
+    MetalTensorSlot* dst = graph_output_slot(out, out_bytes);
+    MetalTensorSlot* sb = expert_bias
+        ? graph_ensure_device(expert_bias, bias_bytes, 1) : NULL;
+    if (!si || !sw || !sri || !srw || !dst || (expert_bias && !sb)) return 0;
+    /* The shader always declares a bias and a slot table; absent ones become
+     * zero-filled transients so the binding set stays complete. */
+    id<MTLBuffer> bias_dummy = expert_bias ? nil : create_buffer(bias_bytes, NULL);
+    if (!expert_bias && !bias_dummy) return 0;
+    if (!expert_bias) memset([bias_dummy contents], 0, bias_bytes);
+    id<MTLBuffer> slot_buffer =
+        create_buffer((size_t)slot_extent * sizeof(uint32_t), NULL);
+    if (!slot_buffer) {
+        VX_METAL_RELEASE(bias_dummy);
+        return 0;
+    }
+    memset([slot_buffer contents], 0, (size_t)slot_extent * sizeof(uint32_t));
+    if (slot_domain)
+        memcpy([slot_buffer contents], slot_rows,
+               (size_t)slot_domain * sizeof(uint32_t));
+    uint32_t params[8] = {
+        (uint32_t)rows, (uint32_t)d_in, (uint32_t)d_out, (uint32_t)experts,
+        (uint32_t)top_k, expert_bias ? 1u : 0u, slot_domain, 0u,
+    };
+    id<MTLBuffer> pb = create_buffer(sizeof(params), params);
+    if (!pb) {
+        VX_METAL_RELEASE(bias_dummy);
+        VX_METAL_RELEASE(slot_buffer);
+        return 0;
+    }
+    MetalBinding binds[8] = {
+        {si->buffer, in_bytes}, {sw->buffer, w_bytes},
+        {expert_bias ? sb->buffer : bias_dummy, bias_bytes},
+        {sri->buffer, route_bytes}, {srw->buffer, route_bytes},
+        {dst->buffer, out_bytes}, {pb, sizeof(params)},
+        {slot_buffer, (size_t)slot_extent * sizeof(uint32_t)},
+    };
+    int ok = dispatch_kernel(&k_moe_linear, binds,
+                             ((uint32_t)d_out + 63u) / 64u, (uint32_t)rows, 1);
+    VX_METAL_RELEASE(pb);
+    VX_METAL_RELEASE(bias_dummy);
+    VX_METAL_RELEASE(slot_buffer);
+    if (!ok) return 0;
+    graph_mark_device(dst);
+    return 1;
+}
+
+/* Top-k expert routing. The router weight is [d_model, experts], so its expert
+ * axis is 1 and it is never a slot-indexed bank. */
+int metal_graph_moe_router_f32(const float* input, const float* weight,
+                               const float* bias, float* route_indices,
+                               float* route_weights, int rows, int d_model,
+                               int experts, int top_k, float temperature,
+                               int normalize) {
+    if (rows <= 0 || d_model <= 0 || experts <= 0 || top_k <= 0 ||
+        top_k > experts || top_k > 8 || !(temperature > 0.0f) ||
+        !input || !weight || !route_indices || !route_weights) return 0;
+    size_t in_bytes = (size_t)rows * (size_t)d_model * sizeof(float);
+    size_t w_bytes = (size_t)d_model * (size_t)experts * sizeof(float);
+    size_t bias_bytes = (size_t)experts * sizeof(float);
+    size_t route_bytes = (size_t)rows * (size_t)top_k * sizeof(float);
+    MetalTensorSlot* si = graph_ensure_device(input, in_bytes, 0);
+    MetalTensorSlot* sw = graph_ensure_device(weight, w_bytes, 1);
+    MetalTensorSlot* sidx = graph_output_slot(route_indices, route_bytes);
+    MetalTensorSlot* srw = graph_output_slot(route_weights, route_bytes);
+    MetalTensorSlot* sb = bias ? graph_ensure_device(bias, bias_bytes, 1) : NULL;
+    if (!si || !sw || !sidx || !srw || (bias && !sb)) return 0;
+    id<MTLBuffer> bias_dummy = bias ? nil : create_buffer(bias_bytes, NULL);
+    if (!bias && !bias_dummy) return 0;
+    if (!bias) memset([bias_dummy contents], 0, bias_bytes);
+    uint32_t params[8];
+    params[0] = (uint32_t)rows;
+    params[1] = (uint32_t)d_model;
+    params[2] = (uint32_t)experts;
+    params[3] = (uint32_t)top_k;
+    params[4] = normalize ? 1u : 0u;
+    params[5] = bias ? 1u : 0u;
+    memcpy(&params[6], &temperature, sizeof(float));
+    params[7] = 0u;
+    id<MTLBuffer> pb = create_buffer(sizeof(params), params);
+    if (!pb) { VX_METAL_RELEASE(bias_dummy); return 0; }
+    MetalBinding binds[6] = {
+        {si->buffer, in_bytes}, {sw->buffer, w_bytes},
+        {bias ? sb->buffer : bias_dummy, bias_bytes},
+        {sidx->buffer, route_bytes}, {srw->buffer, route_bytes},
+        {pb, sizeof(params)},
+    };
+    int ok = dispatch_kernel(&k_moe_router, binds, ((uint32_t)rows + 63u) / 64u, 1, 1);
+    VX_METAL_RELEASE(pb);
+    VX_METAL_RELEASE(bias_dummy);
+    if (!ok) return 0;
+    graph_mark_device(sidx);
+    graph_mark_device(srw);
     return 1;
 }
 
@@ -3729,7 +4422,10 @@ static const int32_t* qconv_zero_bias_get(uint32_t output_channels) {
         (size_t)output_channels > SIZE_MAX / sizeof(int32_t)) return NULL;
     for (QConvZeroBiasBacking* block = qconv_zero_bias_backings; block;
          block = block->next) {
-        if (block->elements >= output_channels) return block->values;
+        /* Domain-enforced immutable slots retain an exact readable range.
+         * A smaller node needs its own durable host key or it would narrow
+         * the slot later reused by an earlier wider convolution. */
+        if (block->elements == output_channels) return block->values;
     }
     QConvZeroBiasBacking* block = (QConvZeroBiasBacking*)calloc(1, sizeof(*block));
     if (!block) return NULL;

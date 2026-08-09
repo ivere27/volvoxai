@@ -17,6 +17,7 @@ build composition, numerical contracts, operator coverage, and validation.
 | Training residency | Optimizer-updated weights and Adam moments remain device-authoritative until materialized |
 | F32-to-W8 authoring | Implemented in the full profile, including optional I32 bias packing |
 | Physical W8A8 inference | Implemented with manual I8/U8 kernels |
+| Public bounded dynamic shapes | Implemented for the qualified CUDA inference subset; complete domain, route, launch, slot, and resident-resource proof is required |
 | CUDA Graph replay | Implemented for a conservative static-inference allowlist |
 | Native FP16/BF16 arithmetic | Not implemented; F16 package weights are widened and computed as F32 |
 | TF32 and tensor cores | Not used |
@@ -163,7 +164,8 @@ cmake -S . -B build/cuda -G Ninja \
 cmake --build build/cuda --target volvoxai volvoxai-full
 ~~~
 
-VOLVOXAI_CUDA_ARCH is the numeric compute capability and defaults to 75.
+VOLVOXAI_CUDA_ARCH is the numeric compute capability, defaults to 75, and must
+be at least 61 because the W8A8 QBatchMatMul route uses signed DP4A.
 CMake prefers nvcc and otherwise searches for clang++ with NVPTX support. The
 Clang path uses -nocudainc and -nocudalib, so CUDA headers and SDK link
 libraries are not required.
@@ -210,9 +212,11 @@ fast-math globally, FP16, BF16, or tensor cores.
 
 ## Execution and memory
 
-The backend uses one ordinary CUDA stream. Its graph memory system maintains
-append-only tensor slots that map runtime-owned tensor storage to device
-allocations:
+The backend uses one ordinary CUDA stream. Its graph memory system maps
+runtime-owned tensor storage to retained device-capacity slots. Static and
+private direct execution can lazily grow a slot and recycle detached transient
+allocations through an anonymous capacity pool. Public bounded-dynamic
+execution instead uses a fixed reservation described below. Both paths retain:
 
 - up to 8,192 tensor slots;
 - a 16,384-entry exact-pointer hash table;
@@ -245,6 +249,36 @@ transfer pipeline.
 Training teardown removes transient activation and gradient identities while
 retaining stable model-weight slots. Activations and gradients do not yet use
 one persistent device arena across Trainer steps.
+
+### Bounded dynamic shapes
+
+CUDA accepts a public bounded-dynamic graph only when compilation proves the
+complete declared domain. The proof covers canonical tensor relations, the
+qualified operator subset and its shape-dependent predicates, kernel launch
+limits, tensor-slot count, and simultaneous host/device resident resources.
+An unproved shape, route, launch, or resource bound rejects compilation; it
+does not fall back to CPU.
+
+Logical F16 activations are not admitted to a dynamic CUDA domain: the graph
+ABI does not provide two-byte activation slots for its F32 compute routes.
+Immutable F16 package weights remain supported and are widened, preloaded, and
+retained as F32 before the maximum-domain reservation is published.
+
+Context creation bootstraps the minimum-domain graph to preload invariant
+weights and derived metadata, then releases every transient bootstrap slot.
+It builds one fixed maximum-domain host liveness arena and atomically reserves
+the corresponding physical CUDA spans. Concrete shape plans are projected
+onto those fixed offsets and must fit the proved capacities. After context
+publication, shape rebinding neither grows the host arena nor calls
+`cuMemAlloc`; a missing or undersized reserved span fails closed.
+
+A changed shape synchronizes submitted stream work, invalidates replay and
+stale coherence identities, and commits the new semantic signature only after
+the reserved binding succeeds. The previous binding remains usable when
+candidate planning fails. Repeating the current signature resets only its
+per-forward logical/coherence state; the binding fast path issues no additional
+stream synchronization and does not advance shape/capacity generations. CUDA
+Graph capture/replay remains restricted to static inference.
 
 ### CUDA Graph replay
 
@@ -281,7 +315,8 @@ The F32 dispatcher covers:
 - activations: ReLU, Sigmoid, GELU, SiLU, Tanh, HardSwish,
   HardSigmoid, LeakyReLU, PReLU, and Clip;
 - normalization and reduction: LayerNorm, RMSNorm, GroupNorm, BatchNorm2D,
-  final-axis Softmax/LogSoftmax, ReduceSum, and ReduceMean;
+  final-axis Softmax/LogSoftmax, ReduceSum, ReduceMean, and ArgMax with I32
+  output;
 - pooling and resize: GlobalAveragePool, AveragePool2D, MaxPool2D, nearest and
   bilinear Resize, and linear 1D interpolation;
 - movement and shape: Embedding, Transpose, Expand/Broadcast, axis-0 Gather,
@@ -314,6 +349,14 @@ zero point. Byte resize uses nearest/asymmetric/floor behavior.
 QBatchMatMul uses independent per-tensor I8/U8 descriptors for both operands
 and the output. It accumulates centered products in I32 and rejects a
 descriptor whose worst-case dot product could overflow I32 before launch.
+Complete groups of four contracted values use signed DP4A. U8 operands and
+zero points are shifted into the signed-byte domain, so all I8/U8 pairings and
+asymmetric zero points preserve the same exact centered-product contract;
+`K % 4` uses a scalar tail. Dynamic route evidence reports cumulative packed
+groups and tail values for the context. IMMA is not selected here: arbitrary
+rank/broadcast geometry, arbitrary K/N, and decode M=1 would require padded
+shape-specific tensor-core layouts plus a second generic tactic whose setup
+cost dominates these small dynamic attention products.
 
 ## Full-command CUDA training
 
@@ -491,8 +534,12 @@ specialized tactic.
   positive steps.
 - Launch dimensions and element counts are bounded by 32-bit kernel
   parameters.
-- Examples without built-in F32 CUDA inference include F32 ArgMax,
-  RoPE, SSMScan/SelectiveScan, Sin, and Cos.
+- Public bounded-dynamic CUDA currently requires the base adapter and
+  non-decode execution. Dynamic decode and non-base adapter selection fail
+  closed until their persistent device layouts have separate complete-domain
+  proofs and reservations.
+- Examples without built-in F32 CUDA inference include RoPE,
+  SSMScan/SelectiveScan, Sin, and Cos.
 - There is no public caller-owned device-buffer API.
 - Activations and gradients are not persistent across Trainer
   steps.
@@ -515,6 +562,7 @@ cmake -S . -B build/cuda-tests -G Ninja \
 cmake --build build/cuda-tests --target \
   test_cuda_kernels \
   test_cuda_runtime \
+  test_cuda_public_dynamic \
   test_cuda_training \
   test_training_backward \
   test_cuda_ptq \
@@ -523,7 +571,7 @@ cmake --build build/cuda-tests --target \
   volvoxai-full
 
 ctest --test-dir build/cuda-tests --output-on-failure \
-  -R '^(test_cuda_(kernels|runtime|training|ptq|state_ownership)|test_training_backward|test_incremental_runtime|native_profile_boundaries|native_training_boundary|cuda_ptx_embedding|cuda_fp32_build_contract|cuda_source_composition|cuda_state_ownership_audit)$'
+  -R '^(test_cuda_(kernels|runtime|public_dynamic|training|ptq|state_ownership)|test_training_backward|test_incremental_runtime|native_profile_boundaries|native_training_boundary|cuda_ptx_embedding|cuda_fp32_build_contract|cuda_source_composition|cuda_state_ownership_audit)$'
 ~~~
 
 Run the source-composition and PTX build-contract tests directly with:
@@ -539,6 +587,8 @@ The focused tests cover:
 
 - forward F32 and W8A8 kernel correctness;
 - strict runtime routing and no-fallback behavior;
+- public bounded-dynamic proof, fixed reservation, shape-plan reuse, and
+  out-of-domain rejection;
 - graph residency, views, aliases, fusions, and replay;
 - all CUDA backward command families;
 - loss, accumulation, clipping, SGD, AdamW, and optimizer state;

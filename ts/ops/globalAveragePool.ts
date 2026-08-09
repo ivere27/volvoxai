@@ -1,21 +1,46 @@
-export function _cpuGlobalAveragePool(node) {
+import {
+  assertShapeKernelOutput,
+  assertShapeKernelParams,
+  assertShapeKernelTensor,
+} from './shapeKernelValidation.js';
+import {
+  assertCanonicalLayout,
+  assertDistinctOutputStorage,
+  spatialKernelPorts,
+} from './spatialKernelValidation.js';
 
-    const input = node.inputs.input;
-    const output = node.outputs.out;
-    const B = input.shape[0];
-    const H = input.shape[1];
-    const W = input.shape[2];
-    const C = input.shape[3];
-    const spatial = H * W;
-    for (let b = 0; b < B; b++) {
-      for (let c = 0; c < C; c++) {
-        let sum = 0;
-        for (let i = 0; i < spatial; i++) {
-          const y = Math.floor(i / W);
-          const x = i - y * W;
-          sum += input.buffer[((b * H + y) * W + x) * C + c];
-        }
-        output.buffer[b * C + c] = sum / spatial;
+export function _cpuGlobalAveragePool(node) {
+  const operation = 'GlobalAveragePool';
+  const ports = spatialKernelPorts(node, [['input']], [], operation);
+  const input = ports.inputs[0];
+  const output = ports.output;
+  assertShapeKernelTensor(input, `${operation} input`, {
+    dtypes: ['float32'], minimumRank: 4, maximumRank: 4,
+  });
+  const params = assertShapeKernelParams(node, ['data_layout'], operation);
+  assertCanonicalLayout(params.data_layout, 'NHWC', operation, 'data_layout');
+  const [batch, height, width, channels] = input.shape;
+  assertShapeKernelOutput(
+    output,
+    [batch, 1, 1, channels],
+    'float32',
+    undefined,
+    operation,
+  );
+  assertDistinctOutputStorage(output, [input], operation);
+
+  const spatial = height * width;
+  for (let batchIndex = 0; batchIndex < batch; batchIndex++) {
+    for (let channel = 0; channel < channels; channel++) {
+      let sum = 0;
+      for (let offset = 0; offset < spatial; offset++) {
+        const y = Math.floor(offset / width);
+        const x = offset - y * width;
+        sum += input.buffer[
+          ((batchIndex * height + y) * width + x) * channels + channel
+        ];
       }
+      output.buffer[batchIndex * channels + channel] = sum / spatial;
     }
   }
+}

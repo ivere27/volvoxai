@@ -141,7 +141,9 @@ def build_descriptor_preserving_byte_expand(
         op_type="Expand",
         inputs={"input": source_name},
         outputs={"out": output_name},
-        attributes=(OpAttribute("params", "volvox.params", {}),),
+        attributes=(OpAttribute(
+            "params", "volvox.params", {"shape": list(shape)},
+        ),),
         provenance=tuple(provenance),
         metadata=authored_metadata,
     )

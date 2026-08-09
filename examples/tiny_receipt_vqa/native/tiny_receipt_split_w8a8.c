@@ -8,7 +8,6 @@
 #include "tiny_receipt_image.h"
 #include "volvoxai.h"
 
-#include <ctype.h>
 #include <errno.h>
 #include <limits.h>
 #include <math.h>
@@ -23,22 +22,44 @@
 #define PATH_MAX 4096
 #endif
 
-#define SPLIT_PACKAGE_FORMAT "volvoxai-tiny-receipt-vqa-split-onnx-package-v1"
+#define SPLIT_PACKAGE_FORMAT "volvoxai-tiny-receipt-vqa-split-kv-onnx-package-v1"
 #define SPLIT_FAMILY_COUNT 8
-#define SPLIT_CHAR_VOCAB_COUNT 760
 #define SPLIT_BPE_VOCAB_COUNT 1536
 #define SPLIT_IMAGE_HEIGHT 320
 #define SPLIT_IMAGE_WIDTH 672
+#define SPLIT_IMAGE_TOKENS 210
 #define SPLIT_QUESTION_LENGTH 192
 #define SPLIT_MEMORY_LENGTH 402
 #define SPLIT_MODEL_WIDTH 320
 #define SPLIT_DECODER_LENGTH 192
 #define SPLIT_MAX_NEW_TOKENS 191
+#define SPLIT_MAX_WARMUP_RUNS 20
 #define SPLIT_MAX_NAME 128
 #define SPLIT_MAX_JSON_BYTES (16u * 1024u * 1024u)
+#define SPLIT_CACHE_LAYERS 4
+#define SPLIT_CACHE_HEADS 8
+#define SPLIT_CACHE_HEAD_WIDTH 40
+#define SPLIT_CACHE_TENSORS (SPLIT_CACHE_LAYERS * 2)
+#define SPLIT_MAX_BINDINGS 24
+#define SPLIT_MAX_GRAPH_OUTPUTS 16
 
 static const char* const k_split_family_names[SPLIT_FAMILY_COUNT] = {
     "phone", "address", "store", "item_row", "item_math", "item_lookup", "math", "other",
+};
+
+static const char* const k_split_cross_semantics[SPLIT_CACHE_TENSORS] = {
+    "cross_k_0", "cross_v_0", "cross_k_1", "cross_v_1",
+    "cross_k_2", "cross_v_2", "cross_k_3", "cross_v_3",
+};
+
+static const char* const k_split_past_semantics[SPLIT_CACHE_TENSORS] = {
+    "past_k_0", "past_v_0", "past_k_1", "past_v_1",
+    "past_k_2", "past_v_2", "past_k_3", "past_v_3",
+};
+
+static const char* const k_split_present_semantics[SPLIT_CACHE_TENSORS] = {
+    "present_k_0", "present_v_0", "present_k_1", "present_v_1",
+    "present_k_2", "present_v_2", "present_k_3", "present_v_3",
 };
 
 static const char* const k_split_bpe_atomic_tokens[] = {
@@ -49,8 +70,7 @@ static const char* const k_split_bpe_atomic_tokens[] = {
 
 typedef enum {
     SPLIT_TOKENIZER_INVALID = 0,
-    SPLIT_TOKENIZER_CHAR_VOCAB = 1,
-    SPLIT_TOKENIZER_BYTE_FALLBACK_BPE = 2,
+    SPLIT_TOKENIZER_BYTE_FALLBACK_BPE = 1,
 } SplitTokenizerKind;
 
 typedef struct {
@@ -84,31 +104,29 @@ typedef struct {
     char export_report[PATH_MAX];
     char image[SPLIT_MAX_NAME];
     char question_ids[SPLIT_MAX_NAME];
+    char question_position_ids[SPLIT_MAX_NAME];
     char family_ids[SPLIT_MAX_NAME];
     char memory[SPLIT_MAX_NAME];
     char memory_padding_mask[SPLIT_MAX_NAME];
     char router_logits[SPLIT_MAX_NAME];
     char selected_family_ids[SPLIT_MAX_NAME];
+    char cross_kv[SPLIT_CACHE_TENSORS][SPLIT_MAX_NAME];
 } SplitEncoderDefinition;
-
-typedef enum {
-    SPLIT_DECODER_OUTPUT_INVALID = 0,
-    SPLIT_DECODER_OUTPUT_TOKEN_IDS = 1,
-    SPLIT_DECODER_OUTPUT_F32_LOGITS = 2,
-} SplitDecoderOutputKind;
 
 typedef struct {
     char graph[PATH_MAX];
     char weights[PATH_MAX];
     char export_report[PATH_MAX];
     char decoder_input_ids[SPLIT_MAX_NAME];
-    char memory[SPLIT_MAX_NAME];
     char memory_padding_mask[SPLIT_MAX_NAME];
     char family_ids[SPLIT_MAX_NAME];
-    char v4_keep[SPLIT_MAX_NAME];
-    char token_ids[SPLIT_MAX_NAME];
     char logits[SPLIT_MAX_NAME];
-    SplitDecoderOutputKind output_kind;
+    char position_ids[SPLIT_MAX_NAME];
+    char past_padding_mask[SPLIT_MAX_NAME];
+    char cross_kv[SPLIT_CACHE_TENSORS][SPLIT_MAX_NAME];
+    char past_kv[SPLIT_CACHE_TENSORS][SPLIT_MAX_NAME];
+    char present_padding_mask[SPLIT_MAX_NAME];
+    char present_kv[SPLIT_CACHE_TENSORS][SPLIT_MAX_NAME];
 } SplitDecoderDefinition;
 
 typedef struct {
@@ -120,9 +138,12 @@ typedef struct {
     SplitTokenizerKind tokenizer_kind;
     int tokenizer_vocab_count;
     char tokenizer_hash[65];
-    int runtime_family;
-    int specialized_family_id;
 } SplitPackage;
+
+typedef enum {
+    SPLIT_SHAPE_MODE_ACTIVE = 0,
+    SPLIT_SHAPE_MODE_MAXIMUM_PADDED = 1,
+} SplitShapeMode;
 
 typedef struct {
     const char* package_arg;
@@ -131,11 +152,10 @@ typedef struct {
     const char* family;
     int family_id;
     int max_new;
-    int incremental_explicit;
-    int ordinary;
-    int no_kv;
-    int require_row;
+    int warmup;
+    SplitShapeMode shape_mode;
     int timing;
+    int qualify_dynamic;
     VxRuntimeOptions runtime_options;
     VxBackendPolicy backend_policy;
     const char* backend_candidates[1];
@@ -145,13 +165,24 @@ typedef struct {
     VxModel* model;
     VxCompiledModel* compiled;
     VxExecutionContext* context;
+    VxBackendPolicyMode expected_policy_mode;
+    VxOperatorFallback expected_operator_fallback;
+    char expected_backend[VX_REPORT_BACKEND_CAPACITY];
 } SplitGraph;
+
+typedef struct {
+    VxTensorBinding values[SPLIT_MAX_BINDINGS];
+    size_t count;
+} SplitBindingBatch;
 
 typedef struct {
     float* memory;
     int32_t* memory_padding_mask;
+    float* cross_kv[SPLIT_CACHE_TENSORS];
     float router_logits[SPLIT_FAMILY_COUNT];
     int selected_family_id;
+    int question_length;
+    int memory_length;
     double execution_ms;
 } SplitEncoderOutput;
 
@@ -321,6 +352,32 @@ int tiny_receipt_split_w8a8_sha256_file(const char* path, char digest_hex[65]) {
     return 0;
 }
 
+static int split_sha256_f32_le(const float* values, size_t count,
+                               char digest_hex[65]) {
+    static const char hex[] = "0123456789abcdef";
+    unsigned char digest[32];
+    SplitSha256 sha;
+    if (!values || !digest_hex) return -1;
+    split_sha256_init(&sha);
+    for (size_t index = 0; index < count; index++) {
+        unsigned char bytes[4];
+        uint32_t bits;
+        memcpy(&bits, &values[index], sizeof(bits));
+        bytes[0] = (unsigned char)bits;
+        bytes[1] = (unsigned char)(bits >> 8);
+        bytes[2] = (unsigned char)(bits >> 16);
+        bytes[3] = (unsigned char)(bits >> 24);
+        split_sha256_update(&sha, bytes, sizeof(bytes));
+    }
+    split_sha256_final(&sha, digest);
+    for (size_t index = 0; index < sizeof(digest); index++) {
+        digest_hex[index * 2] = hex[digest[index] >> 4];
+        digest_hex[index * 2 + 1] = hex[digest[index] & 0x0fu];
+    }
+    digest_hex[64] = 0;
+    return 0;
+}
+
 static double split_now_ms(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
@@ -331,20 +388,20 @@ static void split_help(const char* argv0) {
     printf("Usage: %s <package-dir|package_manifest.json> --image <png|jpg> --prompt <text> [options]\n\n",
            argv0);
     printf("Run a qualified TinyReceiptVQA split encoder/decoder package.\n");
-    printf("Supports token_ids output and F32 logits with host first-index argmax.\n");
-    printf("The decoder uses reset + seed + incremental row/dependency steps by default.\n\n");
+    printf("Requires the explicit KV-cache v1 package ABI.\n");
+    printf("F32 logits use host first-index argmax; cache tensors advance explicitly.\n\n");
     printf("Options:\n");
     printf("  --image <file>               Receipt PNG/JPEG (required).\n");
     printf("  --prompt <text>              Valid UTF-8 question already normalized to NFC;\n");
     printf("                               encoded by the packaged tokenizer (required).\n");
-    printf("  --family <name|auto>         Select a runtime family, or verify a specialized package\n");
+    printf("  --family <name|auto>         Request a runtime family or let the router select\n");
     printf("                               (default auto).\n");
     printf("  --max-new <0..191>           Maximum generated tokens (default 191).\n");
-    printf("  --incremental                Use reset + seed + incremental steps (default).\n");
-    printf("  --no-kv                      Recompute only the growing prefix each token.\n");
-    printf("  --ordinary                   Diagnostic full decoder forward for every token.\n");
-    printf("  --require-row                Fail unless native row execution remains active.\n");
+    printf("  --warmup <0..20>             Untimed same-context full requests (default 0).\n");
+    printf("  --shape-mode <mode>          Bind active Q/M or maximum-padded encoder extents\n");
+    printf("                               (decoder advances P/R one token per call; default active).\n");
     printf("  --timing                     Emit application timings without per-node tracing.\n");
+    printf("  --qualify-dynamic            Untimed short/grow/maximum-padded/shrink qualification.\n");
     printf("  --threads <n>                Set the positive CPU worker count.\n");
     printf("  --cpu | --vulkan | --opengl | --metal | --nnapi | --cuda\n");
     printf("  --debug\n");
@@ -604,41 +661,80 @@ static int split_shape_equals(const cJSON* value, const int* shape, int rank) {
     return 1;
 }
 
+static int split_symbolic_shape_equals(const cJSON* value,
+                                       const char* const* shape, int rank) {
+    if (!cJSON_IsArray(value) || cJSON_GetArraySize(value) != rank) return 0;
+    for (int axis = 0; axis < rank; axis++) {
+        const cJSON* item = cJSON_GetArrayItem((cJSON*)value, axis);
+        if (!cJSON_IsString(item) || !item->valuestring ||
+            strcmp(item->valuestring, shape[axis]) != 0) return 0;
+    }
+    return 1;
+}
+
+static int split_exact_dimension(const cJSON* dimensions, const char* name,
+                                 int minimum, int maximum) {
+    static const char* const keys[] = {"min", "max"};
+    const cJSON* dimension = dimensions ?
+        cJSON_GetObjectItemCaseSensitive((cJSON*)dimensions, name) : NULL;
+    int value;
+    return !cJSON_IsObject(dimension) ||
+        split_exact_keys(dimension, keys, 2, name) != 0 ||
+        split_integer(dimension, "min", name, minimum, minimum, &value) != 0 ||
+        split_integer(dimension, "max", name, maximum, maximum, &value) != 0;
+}
+
 static int split_copy_mapping(const cJSON* mapping, const char* semantic,
                               char* out, size_t out_size, const char* label) {
     const char* value = split_string(mapping, semantic, label);
     return value ? split_copy_string(out, out_size, value, label) : -1;
 }
 
-static int split_parse_encoder(const cJSON* graph, const char* package_dir,
-                               SplitEncoderDefinition* encoder) {
-    static const char* const specialized_input_keys[] = {"image", "question_ids"};
-    static const char* const runtime_input_keys[] = {
-        "image", "question_ids", "family_ids",
+static int split_mappings_unique(const char* const* values, size_t count,
+                                 const char* label) {
+    for (size_t left = 0; left < count; left++) {
+        if (!values[left] || !values[left][0]) return -1;
+        for (size_t right = left + 1; right < count; right++) {
+            if (!strcmp(values[left], values[right])) {
+                fprintf(stderr, "[tinyreceipt] %s semantic tensors may not alias\n",
+                        label);
+                return -1;
+            }
+        }
+    }
+    return 0;
+}
+
+static int split_parse_encoder_v1(const cJSON* graph, const char* package_dir,
+                                  SplitEncoderDefinition* encoder) {
+    static const char* const input_keys[] = {
+        "image", "question_ids", "family_ids", "question_position_ids",
     };
     static const char* const output_keys[] = {
         "memory", "memory_padding_mask", "router_logits", "selected_family_ids",
+        "cross_k_0", "cross_v_0", "cross_k_1", "cross_v_1",
+        "cross_k_2", "cross_v_2", "cross_k_3", "cross_v_3",
     };
     const cJSON* inputs;
     const cJSON* outputs;
-    int runtime_family;
+    const char* input_values[4];
+    const char* output_values[4 + SPLIT_CACHE_TENSORS];
+    char label[128];
     if (!graph || !encoder) return -1;
     inputs = split_object(graph, "inputs", "graphs.encoder.inputs");
     outputs = split_object(graph, "outputs", "graphs.encoder.outputs");
-    runtime_family = inputs &&
-        cJSON_GetObjectItemCaseSensitive((cJSON*)inputs, "family_ids") != NULL;
     if (!inputs || !outputs ||
-        split_exact_keys(inputs,
-                         runtime_family ? runtime_input_keys : specialized_input_keys,
-                         runtime_family ? 3 : 2, "graphs.encoder.inputs") != 0 ||
-        split_exact_keys(outputs, output_keys, 4, "graphs.encoder.outputs") != 0 ||
+        split_exact_keys(inputs, input_keys, 4, "graphs.encoder.inputs") != 0 ||
+        split_exact_keys(outputs, output_keys, 4 + SPLIT_CACHE_TENSORS,
+                         "graphs.encoder.outputs") != 0 ||
         split_parse_asset(cJSON_GetObjectItemCaseSensitive((cJSON*)graph, "graph"),
                           package_dir, encoder->graph, sizeof(encoder->graph),
                           "graphs.encoder.graph") != 0 ||
         split_parse_asset(cJSON_GetObjectItemCaseSensitive((cJSON*)graph, "weights"),
                           package_dir, encoder->weights, sizeof(encoder->weights),
                           "graphs.encoder.weights") != 0 ||
-        split_parse_asset(cJSON_GetObjectItemCaseSensitive((cJSON*)graph, "export_report"),
+        split_parse_asset(cJSON_GetObjectItemCaseSensitive((cJSON*)graph,
+                                                           "export_report"),
                           package_dir, encoder->export_report,
                           sizeof(encoder->export_report),
                           "graphs.encoder.export_report") != 0 ||
@@ -647,195 +743,188 @@ static int split_parse_encoder(const cJSON* graph, const char* package_dir,
         split_copy_mapping(inputs, "question_ids", encoder->question_ids,
                            sizeof(encoder->question_ids),
                            "graphs.encoder.inputs.question_ids") != 0 ||
-        (runtime_family &&
-         split_copy_mapping(inputs, "family_ids", encoder->family_ids,
-                            sizeof(encoder->family_ids),
-                            "graphs.encoder.inputs.family_ids") != 0) ||
-        split_copy_mapping(outputs, "memory", encoder->memory, sizeof(encoder->memory),
+        split_copy_mapping(inputs, "family_ids", encoder->family_ids,
+                           sizeof(encoder->family_ids),
+                           "graphs.encoder.inputs.family_ids") != 0 ||
+        split_copy_mapping(inputs, "question_position_ids",
+                           encoder->question_position_ids,
+                           sizeof(encoder->question_position_ids),
+                           "graphs.encoder.inputs.question_position_ids") != 0 ||
+        split_copy_mapping(outputs, "memory", encoder->memory,
+                           sizeof(encoder->memory),
                            "graphs.encoder.outputs.memory") != 0 ||
-        split_copy_mapping(outputs, "memory_padding_mask", encoder->memory_padding_mask,
+        split_copy_mapping(outputs, "memory_padding_mask",
+                           encoder->memory_padding_mask,
                            sizeof(encoder->memory_padding_mask),
                            "graphs.encoder.outputs.memory_padding_mask") != 0 ||
         split_copy_mapping(outputs, "router_logits", encoder->router_logits,
                            sizeof(encoder->router_logits),
                            "graphs.encoder.outputs.router_logits") != 0 ||
-        split_copy_mapping(outputs, "selected_family_ids", encoder->selected_family_ids,
+        split_copy_mapping(outputs, "selected_family_ids",
+                           encoder->selected_family_ids,
                            sizeof(encoder->selected_family_ids),
-                           "graphs.encoder.outputs.selected_family_ids") != 0) return -1;
-    {
-        const char* values[] = {
-            encoder->image, encoder->question_ids, encoder->family_ids,
-        };
-        const int count = runtime_family ? 3 : 2;
-        for (int left = 0; left < count; left++) {
-            for (int right = left + 1; right < count; right++) {
-                if (!strcmp(values[left], values[right])) {
-                    fprintf(stderr, "[tinyreceipt] encoder semantic inputs may not alias\n");
-                    return -1;
-                }
-            }
-        }
+                           "graphs.encoder.outputs.selected_family_ids") != 0)
+        return -1;
+    for (int index = 0; index < SPLIT_CACHE_TENSORS; index++) {
+        if (snprintf(label, sizeof(label), "graphs.encoder.outputs.%s",
+                     k_split_cross_semantics[index]) >= (int)sizeof(label) ||
+            split_copy_mapping(outputs, k_split_cross_semantics[index],
+                               encoder->cross_kv[index],
+                               sizeof(encoder->cross_kv[index]), label) != 0)
+            return -1;
     }
-    {
-        const char* values[] = {
-            encoder->memory, encoder->memory_padding_mask,
-            encoder->router_logits, encoder->selected_family_ids,
-        };
-        for (int left = 0; left < 4; left++) {
-            for (int right = left + 1; right < 4; right++) {
-                if (!strcmp(values[left], values[right])) {
-                    fprintf(stderr, "[tinyreceipt] encoder semantic outputs may not alias\n");
-                    return -1;
-                }
-            }
-        }
-    }
+    input_values[0] = encoder->image;
+    input_values[1] = encoder->question_ids;
+    input_values[2] = encoder->family_ids;
+    input_values[3] = encoder->question_position_ids;
+    output_values[0] = encoder->memory;
+    output_values[1] = encoder->memory_padding_mask;
+    output_values[2] = encoder->router_logits;
+    output_values[3] = encoder->selected_family_ids;
+    for (int index = 0; index < SPLIT_CACHE_TENSORS; index++)
+        output_values[4 + index] = encoder->cross_kv[index];
+    if (split_mappings_unique(input_values, 4, "encoder input") != 0 ||
+        split_mappings_unique(output_values, 4 + SPLIT_CACHE_TENSORS,
+                              "encoder output") != 0)
+        return -1;
     return 0;
 }
 
-static int split_parse_decoder(const cJSON* graph, const char* package_dir,
-                               SplitDecoderDefinition* decoder) {
-    const char* input_keys[5] = {
-        "decoder_input_ids", "memory", "memory_padding_mask", NULL, NULL,
+static int split_parse_decoder_v1(const cJSON* graph, const char* package_dir,
+                                  SplitDecoderDefinition* decoder) {
+    static const char* const input_keys[] = {
+        "decoder_input_ids", "position_ids", "family_ids",
+        "memory_padding_mask", "past_padding_mask",
+        "cross_k_0", "cross_v_0", "cross_k_1", "cross_v_1",
+        "cross_k_2", "cross_v_2", "cross_k_3", "cross_v_3",
+        "past_k_0", "past_v_0", "past_k_1", "past_v_1",
+        "past_k_2", "past_v_2", "past_k_3", "past_v_3",
     };
-    const char* output_keys[1];
+    static const char* const output_keys[] = {
+        "logits", "present_padding_mask",
+        "present_k_0", "present_v_0", "present_k_1", "present_v_1",
+        "present_k_2", "present_v_2", "present_k_3", "present_v_3",
+    };
     const cJSON* inputs;
     const cJSON* outputs;
-    const char* values[5];
-    int input_count = 3;
-    int value_count = 3;
-    int runtime_family;
-    int hoisted_keep;
-    int token_ids_output;
-    int logits_output;
+    const char* input_values[5 + SPLIT_CACHE_TENSORS * 2];
+    const char* output_values[2 + SPLIT_CACHE_TENSORS];
+    char label[128];
     if (!graph || !decoder) return -1;
     inputs = split_object(graph, "inputs", "graphs.decoder.inputs");
     outputs = split_object(graph, "outputs", "graphs.decoder.outputs");
-    runtime_family = inputs &&
-        cJSON_GetObjectItemCaseSensitive((cJSON*)inputs, "family_ids") != NULL;
-    hoisted_keep = inputs &&
-        cJSON_GetObjectItemCaseSensitive((cJSON*)inputs, "v4_keep") != NULL;
-    token_ids_output = outputs &&
-        cJSON_GetObjectItemCaseSensitive((cJSON*)outputs, "token_ids") != NULL;
-    logits_output = outputs &&
-        cJSON_GetObjectItemCaseSensitive((cJSON*)outputs, "logits") != NULL;
-    if (runtime_family) input_keys[input_count++] = "family_ids";
-    if (hoisted_keep) input_keys[input_count++] = "v4_keep";
-    if (token_ids_output == logits_output) {
-        fprintf(stderr,
-                "[tinyreceipt] decoder must expose exactly one supported output ABI: token_ids or logits\n");
-        return -1;
-    }
-    decoder->output_kind = token_ids_output ? SPLIT_DECODER_OUTPUT_TOKEN_IDS :
-                                              SPLIT_DECODER_OUTPUT_F32_LOGITS;
-    output_keys[0] = token_ids_output ? "token_ids" : "logits";
     if (!inputs || !outputs ||
-        split_exact_keys(inputs, input_keys, input_count,
+        split_exact_keys(inputs, input_keys, 5 + SPLIT_CACHE_TENSORS * 2,
                          "graphs.decoder.inputs") != 0 ||
-        split_exact_keys(outputs, output_keys, 1, "graphs.decoder.outputs") != 0 ||
+        split_exact_keys(outputs, output_keys, 2 + SPLIT_CACHE_TENSORS,
+                         "graphs.decoder.outputs") != 0 ||
         split_parse_asset(cJSON_GetObjectItemCaseSensitive((cJSON*)graph, "graph"),
                           package_dir, decoder->graph, sizeof(decoder->graph),
                           "graphs.decoder.graph") != 0 ||
         split_parse_asset(cJSON_GetObjectItemCaseSensitive((cJSON*)graph, "weights"),
                           package_dir, decoder->weights, sizeof(decoder->weights),
                           "graphs.decoder.weights") != 0 ||
-        split_parse_asset(cJSON_GetObjectItemCaseSensitive((cJSON*)graph, "export_report"),
+        split_parse_asset(cJSON_GetObjectItemCaseSensitive((cJSON*)graph,
+                                                           "export_report"),
                           package_dir, decoder->export_report,
                           sizeof(decoder->export_report),
                           "graphs.decoder.export_report") != 0 ||
-        split_copy_mapping(inputs, "decoder_input_ids", decoder->decoder_input_ids,
+        split_copy_mapping(inputs, "decoder_input_ids",
+                           decoder->decoder_input_ids,
                            sizeof(decoder->decoder_input_ids),
                            "graphs.decoder.inputs.decoder_input_ids") != 0 ||
-        split_copy_mapping(inputs, "memory", decoder->memory, sizeof(decoder->memory),
-                           "graphs.decoder.inputs.memory") != 0 ||
-        split_copy_mapping(inputs, "memory_padding_mask", decoder->memory_padding_mask,
+        split_copy_mapping(inputs, "position_ids", decoder->position_ids,
+                           sizeof(decoder->position_ids),
+                           "graphs.decoder.inputs.position_ids") != 0 ||
+        split_copy_mapping(inputs, "family_ids", decoder->family_ids,
+                           sizeof(decoder->family_ids),
+                           "graphs.decoder.inputs.family_ids") != 0 ||
+        split_copy_mapping(inputs, "memory_padding_mask",
+                           decoder->memory_padding_mask,
                            sizeof(decoder->memory_padding_mask),
                            "graphs.decoder.inputs.memory_padding_mask") != 0 ||
-        (runtime_family &&
-         split_copy_mapping(inputs, "family_ids", decoder->family_ids,
-                            sizeof(decoder->family_ids),
-                            "graphs.decoder.inputs.family_ids") != 0) ||
-        (hoisted_keep &&
-         split_copy_mapping(inputs, "v4_keep", decoder->v4_keep,
-                            sizeof(decoder->v4_keep),
-                            "graphs.decoder.inputs.v4_keep") != 0) ||
-        (token_ids_output &&
-         split_copy_mapping(outputs, "token_ids", decoder->token_ids,
-                            sizeof(decoder->token_ids),
-                            "graphs.decoder.outputs.token_ids") != 0) ||
-        (logits_output &&
-         split_copy_mapping(outputs, "logits", decoder->logits,
-                            sizeof(decoder->logits),
-                            "graphs.decoder.outputs.logits") != 0)) return -1;
-    values[0] = decoder->decoder_input_ids;
-    values[1] = decoder->memory;
-    values[2] = decoder->memory_padding_mask;
-    if (runtime_family) values[value_count++] = decoder->family_ids;
-    if (hoisted_keep) values[value_count++] = decoder->v4_keep;
-    for (int left = 0; left < value_count; left++) {
-        for (int right = left + 1; right < value_count; right++) {
-            if (!strcmp(values[left], values[right])) {
-                fprintf(stderr, "[tinyreceipt] decoder semantic inputs may not alias\n");
-                return -1;
-            }
-        }
+        split_copy_mapping(inputs, "past_padding_mask",
+                           decoder->past_padding_mask,
+                           sizeof(decoder->past_padding_mask),
+                           "graphs.decoder.inputs.past_padding_mask") != 0 ||
+        split_copy_mapping(outputs, "logits", decoder->logits,
+                           sizeof(decoder->logits),
+                           "graphs.decoder.outputs.logits") != 0 ||
+        split_copy_mapping(outputs, "present_padding_mask",
+                           decoder->present_padding_mask,
+                           sizeof(decoder->present_padding_mask),
+                           "graphs.decoder.outputs.present_padding_mask") != 0)
+        return -1;
+    for (int index = 0; index < SPLIT_CACHE_TENSORS; index++) {
+        if (snprintf(label, sizeof(label), "graphs.decoder.inputs.%s",
+                     k_split_cross_semantics[index]) >= (int)sizeof(label) ||
+            split_copy_mapping(inputs, k_split_cross_semantics[index],
+                               decoder->cross_kv[index],
+                               sizeof(decoder->cross_kv[index]), label) != 0 ||
+            snprintf(label, sizeof(label), "graphs.decoder.inputs.%s",
+                     k_split_past_semantics[index]) >= (int)sizeof(label) ||
+            split_copy_mapping(inputs, k_split_past_semantics[index],
+                               decoder->past_kv[index],
+                               sizeof(decoder->past_kv[index]), label) != 0 ||
+            snprintf(label, sizeof(label), "graphs.decoder.outputs.%s",
+                     k_split_present_semantics[index]) >= (int)sizeof(label) ||
+            split_copy_mapping(outputs, k_split_present_semantics[index],
+                               decoder->present_kv[index],
+                               sizeof(decoder->present_kv[index]), label) != 0)
+            return -1;
     }
+    input_values[0] = decoder->decoder_input_ids;
+    input_values[1] = decoder->position_ids;
+    input_values[2] = decoder->family_ids;
+    input_values[3] = decoder->memory_padding_mask;
+    input_values[4] = decoder->past_padding_mask;
+    for (int index = 0; index < SPLIT_CACHE_TENSORS; index++) {
+        input_values[5 + index] = decoder->cross_kv[index];
+        input_values[5 + SPLIT_CACHE_TENSORS + index] = decoder->past_kv[index];
+    }
+    output_values[0] = decoder->logits;
+    output_values[1] = decoder->present_padding_mask;
+    for (int index = 0; index < SPLIT_CACHE_TENSORS; index++)
+        output_values[2 + index] = decoder->present_kv[index];
+    if (split_mappings_unique(input_values, 5 + SPLIT_CACHE_TENSORS * 2,
+                              "decoder input") != 0 ||
+        split_mappings_unique(output_values, 2 + SPLIT_CACHE_TENSORS,
+                              "decoder output") != 0)
+        return -1;
     return 0;
 }
 
 static int split_parse_routing(const cJSON* root, SplitPackage* package) {
-    static const char* const runtime_keys[] = {"mode", "family_inputs"};
-    static const char* const specialized_keys[] = {"mode", "family_id"};
+    static const char* const routing_keys[] = {"mode", "family_inputs"};
     static const char* const family_input_keys[] = {"encoder", "decoder"};
     const cJSON* routing;
     const cJSON* family_inputs;
     const char* mode;
     const char* encoder_input;
     const char* decoder_input;
-    int family_id;
     if (!root || !package) return -1;
     routing = split_object(root, "routing", "routing");
     mode = routing ? split_string(routing, "mode", "routing.mode") : NULL;
     if (!routing || !mode) return -1;
-    if (!strcmp(mode, "runtime")) {
-        family_inputs = split_object(routing, "family_inputs",
-                                     "routing.family_inputs");
-        encoder_input = family_inputs ? split_string(
-            family_inputs, "encoder", "routing.family_inputs.encoder") : NULL;
-        decoder_input = family_inputs ? split_string(
-            family_inputs, "decoder", "routing.family_inputs.decoder") : NULL;
-        if (split_exact_keys(routing, runtime_keys, 2, "routing") != 0 ||
-            !family_inputs ||
-            split_exact_keys(family_inputs, family_input_keys, 2,
-                             "routing.family_inputs") != 0 ||
-            !encoder_input || !decoder_input ||
-            !package->encoder.family_ids[0] || !package->decoder.family_ids[0] ||
-            strcmp(encoder_input, package->encoder.family_ids) != 0 ||
-            strcmp(decoder_input, package->decoder.family_ids) != 0) {
-            fprintf(stderr,
-                    "[tinyreceipt] runtime routing must exactly name both graph family_ids inputs\n");
-            return -1;
-        }
-        package->runtime_family = 1;
-        package->specialized_family_id = -1;
-        return 0;
+    family_inputs = split_object(routing, "family_inputs",
+                                 "routing.family_inputs");
+    encoder_input = family_inputs ? split_string(
+        family_inputs, "encoder", "routing.family_inputs.encoder") : NULL;
+    decoder_input = family_inputs ? split_string(
+        family_inputs, "decoder", "routing.family_inputs.decoder") : NULL;
+    if (strcmp(mode, "runtime") != 0 ||
+        split_exact_keys(routing, routing_keys, 2, "routing") != 0 ||
+        !family_inputs ||
+        split_exact_keys(family_inputs, family_input_keys, 2,
+                         "routing.family_inputs") != 0 ||
+        !encoder_input || !decoder_input ||
+        strcmp(encoder_input, package->encoder.family_ids) != 0 ||
+        strcmp(decoder_input, package->decoder.family_ids) != 0) {
+        fprintf(stderr,
+                "[tinyreceipt] explicit-KV v1 routing must exactly name both graph family_ids inputs\n");
+        return -1;
     }
-    if (!strcmp(mode, "specialized")) {
-        if (split_exact_keys(routing, specialized_keys, 2, "routing") != 0 ||
-            split_integer(routing, "family_id", "routing.family_id", 0,
-                          SPLIT_FAMILY_COUNT - 1, &family_id) != 0 ||
-            package->encoder.family_ids[0] || package->decoder.family_ids[0]) {
-            fprintf(stderr,
-                    "[tinyreceipt] specialized routing requires one family_id and forbids graph family_ids inputs\n");
-            return -1;
-        }
-        package->runtime_family = 0;
-        package->specialized_family_id = family_id;
-        return 0;
-    }
-    fprintf(stderr,
-            "[tinyreceipt] routing.mode must be exactly runtime or specialized\n");
-    return -1;
+    return 0;
 }
 
 static int split_validate_tokenizer(const cJSON* root, SplitPackage* package) {
@@ -859,61 +948,44 @@ static int split_validate_tokenizer(const cJSON* root, SplitPackage* package) {
     int unk;
     if (!tokenizer || !package) return -1;
     type = split_string(tokenizer, "type", "tokenizer.type");
-    if (!type) return -1;
-    if (!strcmp(type, "byte_fallback_bpe")) {
-        token_ids = split_object(tokenizer, "token_ids", "tokenizer.token_ids");
-        itos_key = split_string(tokenizer, "itos_key", "tokenizer.itos_key");
-        merges_key = split_string(tokenizer, "merges_key",
-                                  "tokenizer.merges_key");
-        normalization = split_string(tokenizer, "normalization",
-                                     "tokenizer.normalization");
-        tokenizer_hash = split_string(tokenizer, "tokenizer_hash",
-                                      "tokenizer.tokenizer_hash");
-        if (split_exact_keys(tokenizer, bpe_keys, 8, "tokenizer") != 0 ||
-            !token_ids || !itos_key || strcmp(itos_key, "itos") != 0 ||
-            !merges_key || strcmp(merges_key, "merges") != 0 ||
-            split_exact_keys(token_ids, token_id_keys, 4,
-                             "tokenizer.token_ids") != 0 ||
-            !normalization || strcmp(normalization, "NFC") != 0 ||
-            !tokenizer_hash || !split_sha256_string_valid(tokenizer_hash) ||
-            split_integer(tokenizer, "version", "tokenizer.version", 1, 1,
-                          &version) != 0 ||
-            split_integer(tokenizer, "vocab_size", "tokenizer.vocab_size",
-                          SPLIT_BPE_VOCAB_COUNT, SPLIT_BPE_VOCAB_COUNT,
-                          &vocab_size) != 0 ||
-            split_integer(token_ids, "pad", "tokenizer.token_ids.pad", 0, 0,
-                          &pad) != 0 ||
-            split_integer(token_ids, "bos", "tokenizer.token_ids.bos", 1, 1,
-                          &bos) != 0 ||
-            split_integer(token_ids, "eos", "tokenizer.token_ids.eos", 2, 2,
-                          &eos) != 0 ||
-            split_integer(token_ids, "unk", "tokenizer.token_ids.unk", 3, 3,
-                          &unk) != 0 ||
-            split_copy_string(package->tokenizer_hash,
-                              sizeof(package->tokenizer_hash), tokenizer_hash,
-                              "tokenizer hash") != 0) {
-            fprintf(stderr,
-                    "[tinyreceipt] tokenizer must be the qualified byte_fallback_bpe v1 1536-token NFC contract\n");
-            return -1;
-        }
-        package->tokenizer_kind = SPLIT_TOKENIZER_BYTE_FALLBACK_BPE;
-        package->tokenizer_vocab_count = vocab_size;
-        return 0;
-    }
     token_ids = split_object(tokenizer, "token_ids", "tokenizer.token_ids");
     itos_key = split_string(tokenizer, "itos_key", "tokenizer.itos_key");
-    if (!token_ids || !type || !itos_key || strcmp(type, "char-vocab") != 0 ||
-        strcmp(itos_key, "itos") != 0 ||
-        split_integer(tokenizer, "version", "tokenizer.version", 1, 1, &version) != 0 ||
-        split_integer(token_ids, "pad", "tokenizer.token_ids.pad", 0, 0, &pad) != 0 ||
-        split_integer(token_ids, "bos", "tokenizer.token_ids.bos", 1, 1, &bos) != 0 ||
-        split_integer(token_ids, "eos", "tokenizer.token_ids.eos", 2, 2, &eos) != 0 ||
-        split_integer(token_ids, "unk", "tokenizer.token_ids.unk", 3, 3, &unk) != 0) {
-        fprintf(stderr, "[tinyreceipt] tokenizer must be char-vocab v1 with token IDs 0,1,2,3\n");
+    merges_key = split_string(tokenizer, "merges_key",
+                              "tokenizer.merges_key");
+    normalization = split_string(tokenizer, "normalization",
+                                 "tokenizer.normalization");
+    tokenizer_hash = split_string(tokenizer, "tokenizer_hash",
+                                  "tokenizer.tokenizer_hash");
+    if (!type || strcmp(type, "byte_fallback_bpe") != 0 ||
+        split_exact_keys(tokenizer, bpe_keys, 8, "tokenizer") != 0 ||
+        !token_ids || !itos_key || strcmp(itos_key, "itos") != 0 ||
+        !merges_key || strcmp(merges_key, "merges") != 0 ||
+        split_exact_keys(token_ids, token_id_keys, 4,
+                         "tokenizer.token_ids") != 0 ||
+        !normalization || strcmp(normalization, "NFC") != 0 ||
+        !tokenizer_hash || !split_sha256_string_valid(tokenizer_hash) ||
+        split_integer(tokenizer, "version", "tokenizer.version", 1, 1,
+                      &version) != 0 ||
+        split_integer(tokenizer, "vocab_size", "tokenizer.vocab_size",
+                      SPLIT_BPE_VOCAB_COUNT, SPLIT_BPE_VOCAB_COUNT,
+                      &vocab_size) != 0 ||
+        split_integer(token_ids, "pad", "tokenizer.token_ids.pad", 0, 0,
+                      &pad) != 0 ||
+        split_integer(token_ids, "bos", "tokenizer.token_ids.bos", 1, 1,
+                      &bos) != 0 ||
+        split_integer(token_ids, "eos", "tokenizer.token_ids.eos", 2, 2,
+                      &eos) != 0 ||
+        split_integer(token_ids, "unk", "tokenizer.token_ids.unk", 3, 3,
+                      &unk) != 0 ||
+        split_copy_string(package->tokenizer_hash,
+                          sizeof(package->tokenizer_hash), tokenizer_hash,
+                          "tokenizer hash") != 0) {
+        fprintf(stderr,
+                "[tinyreceipt] tokenizer must be the qualified byte_fallback_bpe v1 1536-token NFC contract\n");
         return -1;
     }
-    package->tokenizer_kind = SPLIT_TOKENIZER_CHAR_VOCAB;
-    package->tokenizer_vocab_count = SPLIT_CHAR_VOCAB_COUNT;
+    package->tokenizer_kind = SPLIT_TOKENIZER_BYTE_FALLBACK_BPE;
+    package->tokenizer_vocab_count = vocab_size;
     return 0;
 }
 
@@ -980,69 +1052,244 @@ static int split_validate_families(const cJSON* root) {
     return 0;
 }
 
-static int split_validate_generation(const cJSON* root,
-                                     SplitDecoderOutputKind output_kind) {
+static int split_validate_generation_v1(const cJSON* root) {
+    static const char* const keys[] = {
+        "strategy", "maximum_target_length", "maximum_new_tokens",
+        "bos_token_id", "eos_token_id", "pad_token_id", "logits_row",
+        "tie_policy",
+    };
     const cJSON* generation = split_object(root, "generation", "generation");
     const char* strategy;
-    const char* decoder_output;
-    const char* row;
-    const char* tie;
-    const cJSON* logits_row;
-    const cJSON* token_ids_row;
-    const cJSON* decoder_output_value;
+    const char* logits_row;
+    const char* tie_policy;
     int value;
-    if (!generation) return -1;
+    if (!generation || split_exact_keys(generation, keys, 8, "generation") != 0)
+        goto invalid;
     strategy = split_string(generation, "strategy", "generation.strategy");
-    tie = split_string(generation, "tie_policy", "generation.tie_policy");
-    decoder_output_value = cJSON_GetObjectItemCaseSensitive(
-        (cJSON*)generation, "decoder_output");
-    decoder_output = decoder_output_value ?
-        split_string(generation, "decoder_output", "generation.decoder_output") : NULL;
-    logits_row = cJSON_GetObjectItemCaseSensitive((cJSON*)generation, "logits_row");
-    token_ids_row = cJSON_GetObjectItemCaseSensitive((cJSON*)generation,
-                                                     "token_ids_row");
-    row = output_kind == SPLIT_DECODER_OUTPUT_TOKEN_IDS ?
-        (token_ids_row ? split_string(generation, "token_ids_row",
-                                      "generation.token_ids_row") : NULL) :
-        (logits_row ? split_string(generation, "logits_row",
-                                   "generation.logits_row") : NULL);
-    if (!strategy || !row || !tie ||
-        strcmp(strategy, "greedy-autoregressive") != 0 ||
-        strcmp(row, "prefix_length_minus_one") != 0 ||
-        strcmp(tie, "first-index") != 0 ||
-        (output_kind == SPLIT_DECODER_OUTPUT_TOKEN_IDS &&
-         (!decoder_output || strcmp(decoder_output, "token_ids") != 0 ||
-          logits_row != NULL)) ||
-        (output_kind == SPLIT_DECODER_OUTPUT_F32_LOGITS &&
-         ((decoder_output_value &&
-           (!decoder_output || strcmp(decoder_output, "logits") != 0)) ||
-          token_ids_row != NULL)) ||
-        split_integer(generation, "decoder_input_length", "generation.decoder_input_length",
-                      SPLIT_DECODER_LENGTH, SPLIT_DECODER_LENGTH, &value) != 0 ||
-        split_integer(generation, "maximum_new_tokens", "generation.maximum_new_tokens",
-                      SPLIT_MAX_NEW_TOKENS, SPLIT_MAX_NEW_TOKENS, &value) != 0 ||
-        split_integer(generation, "pad_token_id", "generation.pad_token_id", 0, 0,
-                      &value) != 0 ||
-        split_integer(generation, "bos_token_id", "generation.bos_token_id", 1, 1,
-                      &value) != 0 ||
-        split_integer(generation, "eos_token_id", "generation.eos_token_id", 2, 2,
-                      &value) != 0) {
+    logits_row = split_string(generation, "logits_row", "generation.logits_row");
+    tie_policy = split_string(generation, "tie_policy", "generation.tie_policy");
+    if (!strategy || strcmp(strategy, "greedy-autoregressive-explicit-kv") != 0 ||
+        !logits_row || strcmp(logits_row, "current_token") != 0 ||
+        !tie_policy || strcmp(tie_policy, "first-index") != 0 ||
+        split_integer(generation, "maximum_target_length",
+                      "generation.maximum_target_length", SPLIT_DECODER_LENGTH,
+                      SPLIT_DECODER_LENGTH, &value) != 0 ||
+        split_integer(generation, "maximum_new_tokens",
+                      "generation.maximum_new_tokens", SPLIT_MAX_NEW_TOKENS,
+                      SPLIT_MAX_NEW_TOKENS, &value) != 0 ||
+        split_integer(generation, "bos_token_id", "generation.bos_token_id",
+                      1, 1, &value) != 0 ||
+        split_integer(generation, "eos_token_id", "generation.eos_token_id",
+                      2, 2, &value) != 0 ||
+        split_integer(generation, "pad_token_id", "generation.pad_token_id",
+                      0, 0, &value) != 0)
+        goto invalid;
+    return 0;
+
+invalid:
+    fprintf(stderr,
+            "[tinyreceipt] generation must match the explicit KV-cache v1 contract\n");
+    return -1;
+}
+
+static int split_validate_mask_semantics_v1(const cJSON* root) {
+    static const char* const keys[] = {
+        "memory_padding_mask", "past_padding_mask",
+    };
+    const cJSON* masks = split_object(root, "mask_semantics", "mask_semantics");
+    const char* memory = masks ? split_string(
+        masks, "memory_padding_mask", "mask_semantics.memory_padding_mask") : NULL;
+    const char* past = masks ? split_string(
+        masks, "past_padding_mask", "mask_semantics.past_padding_mask") : NULL;
+    if (!masks || split_exact_keys(masks, keys, 2, "mask_semantics") != 0 ||
+        !memory || strcmp(memory, "nonzero_means_blocked") != 0 ||
+        !past || strcmp(past, "nonzero_means_blocked") != 0) {
         fprintf(stderr,
-                "[tinyreceipt] generation must match the detected decoder output ABI and fixed-length greedy contract\n");
+                "[tinyreceipt] explicit KV masks must declare nonzero as blocked\n");
         return -1;
     }
     return 0;
 }
 
-static int split_validate_mask_semantics(const cJSON* root) {
-    const cJSON* masks = split_object(root, "mask_semantics", "mask_semantics");
-    const char* value = masks ? split_string(
-        masks, "memory_padding_mask", "mask_semantics.memory_padding_mask") : NULL;
-    if (!value || strcmp(value, "nonzero_means_blocked") != 0) {
-        fprintf(stderr, "[tinyreceipt] memory_padding_mask must mean nonzero_means_blocked\n");
-        return -1;
-    }
+static int split_validate_cache_contract_v1(const cJSON* root) {
+    static const char* const keys[] = {
+        "format", "layers", "heads", "head_width", "past_dimension",
+        "present_dimension", "initial_past_length", "sentinel_mask_value",
+        "cache_dtype",
+    };
+    const cJSON* cache = split_object(root, "cache_contract", "cache_contract");
+    const char* format;
+    const char* past_dimension;
+    const char* present_dimension;
+    const char* cache_dtype;
+    int value;
+    if (!cache || split_exact_keys(cache, keys, 9, "cache_contract") != 0)
+        goto invalid;
+    format = split_string(cache, "format", "cache_contract.format");
+    past_dimension = split_string(
+        cache, "past_dimension", "cache_contract.past_dimension");
+    present_dimension = split_string(
+        cache, "present_dimension", "cache_contract.present_dimension");
+    cache_dtype = split_string(cache, "cache_dtype", "cache_contract.cache_dtype");
+    if (!format || strcmp(format, "masked-zero-sentinel-v1") != 0 ||
+        !past_dimension || strcmp(past_dimension, "P") != 0 ||
+        !present_dimension || strcmp(present_dimension, "R") != 0 ||
+        !cache_dtype || strcmp(cache_dtype, "float32") != 0 ||
+        split_integer(cache, "layers", "cache_contract.layers",
+                      SPLIT_CACHE_LAYERS, SPLIT_CACHE_LAYERS, &value) != 0 ||
+        split_integer(cache, "heads", "cache_contract.heads",
+                      SPLIT_CACHE_HEADS, SPLIT_CACHE_HEADS, &value) != 0 ||
+        split_integer(cache, "head_width", "cache_contract.head_width",
+                      SPLIT_CACHE_HEAD_WIDTH, SPLIT_CACHE_HEAD_WIDTH, &value) != 0 ||
+        split_integer(cache, "initial_past_length",
+                      "cache_contract.initial_past_length", 1, 1, &value) != 0 ||
+        split_integer(cache, "sentinel_mask_value",
+                      "cache_contract.sentinel_mask_value", 1, 1, &value) != 0)
+        goto invalid;
     return 0;
+
+invalid:
+    fprintf(stderr,
+            "[tinyreceipt] cache_contract must be the P=1 masked zero-sentinel ABI\n");
+    return -1;
+}
+
+static int split_validate_shape_contract_v1(const cJSON* root) {
+    static const char* const contract_keys[] = {
+        "graph_shape_mode", "dimensions", "fixed_geometry", "relations",
+        "semantic_inputs",
+    };
+    static const char* const dimension_keys[] = {"B", "Q", "M", "P", "R"};
+    static const char* const geometry_keys[] = {
+        "image", "image_tokens", "feature_width", "attention_heads",
+        "attention_head_width", "decoder_layers", "adapter_families",
+    };
+    static const char* const relation_keys[] = {
+        "encoder_memory", "present_cache",
+    };
+    static const char* const encoder_relation_keys[] = {
+        "operator", "axis", "fixed_image_tokens", "dynamic_question_dimension",
+        "derived_memory_dimension",
+    };
+    static const char* const present_relation_keys[] = {
+        "operator", "axis", "past_dimension", "fixed_current_tokens",
+        "derived_present_dimension",
+    };
+    static const char* const semantic_keys[] = {"question_position_ids"};
+    static const char* const position_keys[] = {"shape", "values"};
+    static const char* const bq[] = {"B", "Q"};
+    const int image_shape[] = {1, 1, SPLIT_IMAGE_HEIGHT, SPLIT_IMAGE_WIDTH};
+    const cJSON* contract = split_object(root, "shape_contract", "shape_contract");
+    const cJSON* dimensions;
+    const cJSON* geometry;
+    const cJSON* relations;
+    const cJSON* encoder_relation;
+    const cJSON* present_relation;
+    const cJSON* semantics;
+    const cJSON* question_positions;
+    const char* graph_mode;
+    const char* value;
+    int integer;
+    if (!contract || split_exact_keys(contract, contract_keys, 5,
+                                      "shape_contract") != 0)
+        goto invalid;
+    graph_mode = split_string(
+        contract, "graph_shape_mode", "shape_contract.graph_shape_mode");
+    dimensions = split_object(contract, "dimensions", "shape_contract.dimensions");
+    geometry = split_object(contract, "fixed_geometry",
+                            "shape_contract.fixed_geometry");
+    relations = split_object(contract, "relations", "shape_contract.relations");
+    semantics = split_object(contract, "semantic_inputs",
+                             "shape_contract.semantic_inputs");
+    if (!graph_mode || strcmp(graph_mode, "bounded-explicit-kv-v1") != 0 ||
+        !dimensions || split_exact_keys(dimensions, dimension_keys, 5,
+                                        "shape_contract.dimensions") != 0 ||
+        split_exact_dimension(dimensions, "B", 1, 1) ||
+        split_exact_dimension(dimensions, "Q", 1, SPLIT_QUESTION_LENGTH) ||
+        split_exact_dimension(dimensions, "M", SPLIT_IMAGE_TOKENS + 1,
+                              SPLIT_MEMORY_LENGTH) ||
+        split_exact_dimension(dimensions, "P", 1, SPLIT_MAX_NEW_TOKENS) ||
+        split_exact_dimension(dimensions, "R", 2, SPLIT_DECODER_LENGTH) ||
+        !geometry || split_exact_keys(geometry, geometry_keys, 7,
+                                      "shape_contract.fixed_geometry") != 0 ||
+        !split_shape_equals(cJSON_GetObjectItemCaseSensitive(
+                                (cJSON*)geometry, "image"),
+                            image_shape, 4) ||
+        split_integer(geometry, "image_tokens", "fixed_geometry.image_tokens",
+                      SPLIT_IMAGE_TOKENS, SPLIT_IMAGE_TOKENS, &integer) != 0 ||
+        split_integer(geometry, "feature_width", "fixed_geometry.feature_width",
+                      SPLIT_MODEL_WIDTH, SPLIT_MODEL_WIDTH, &integer) != 0 ||
+        split_integer(geometry, "attention_heads", "fixed_geometry.attention_heads",
+                      SPLIT_CACHE_HEADS, SPLIT_CACHE_HEADS, &integer) != 0 ||
+        split_integer(geometry, "attention_head_width",
+                      "fixed_geometry.attention_head_width",
+                      SPLIT_CACHE_HEAD_WIDTH, SPLIT_CACHE_HEAD_WIDTH, &integer) != 0 ||
+        split_integer(geometry, "decoder_layers", "fixed_geometry.decoder_layers",
+                      SPLIT_CACHE_LAYERS, SPLIT_CACHE_LAYERS, &integer) != 0 ||
+        split_integer(geometry, "adapter_families",
+                      "fixed_geometry.adapter_families", SPLIT_FAMILY_COUNT,
+                      SPLIT_FAMILY_COUNT, &integer) != 0 ||
+        !relations || split_exact_keys(relations, relation_keys, 2,
+                                       "shape_contract.relations") != 0 ||
+        !semantics || split_exact_keys(semantics, semantic_keys, 1,
+                                       "shape_contract.semantic_inputs") != 0)
+        goto invalid;
+    encoder_relation = split_object(
+        relations, "encoder_memory", "shape_contract.relations.encoder_memory");
+    present_relation = split_object(
+        relations, "present_cache", "shape_contract.relations.present_cache");
+    if (!encoder_relation || split_exact_keys(
+            encoder_relation, encoder_relation_keys, 5,
+            "shape_contract.relations.encoder_memory") != 0 ||
+        !(value = split_string(encoder_relation, "operator",
+                               "encoder_memory.operator")) ||
+        strcmp(value, "Concat") != 0 ||
+        split_integer(encoder_relation, "axis", "encoder_memory.axis", 1, 1,
+                      &integer) != 0 ||
+        split_integer(encoder_relation, "fixed_image_tokens",
+                      "encoder_memory.fixed_image_tokens", SPLIT_IMAGE_TOKENS,
+                      SPLIT_IMAGE_TOKENS, &integer) != 0 ||
+        !(value = split_string(encoder_relation, "dynamic_question_dimension",
+                               "encoder_memory.dynamic_question_dimension")) ||
+        strcmp(value, "Q") != 0 ||
+        !(value = split_string(encoder_relation, "derived_memory_dimension",
+                               "encoder_memory.derived_memory_dimension")) ||
+        strcmp(value, "M") != 0 ||
+        !present_relation || split_exact_keys(
+            present_relation, present_relation_keys, 5,
+            "shape_contract.relations.present_cache") != 0 ||
+        !(value = split_string(present_relation, "operator",
+                               "present_cache.operator")) ||
+        strcmp(value, "Concat") != 0 ||
+        split_integer(present_relation, "axis", "present_cache.axis", 2, 2,
+                      &integer) != 0 ||
+        !(value = split_string(present_relation, "past_dimension",
+                               "present_cache.past_dimension")) ||
+        strcmp(value, "P") != 0 ||
+        split_integer(present_relation, "fixed_current_tokens",
+                      "present_cache.fixed_current_tokens", 1, 1, &integer) != 0 ||
+        !(value = split_string(present_relation, "derived_present_dimension",
+                               "present_cache.derived_present_dimension")) ||
+        strcmp(value, "R") != 0)
+        goto invalid;
+    question_positions = split_object(
+        semantics, "question_position_ids",
+        "shape_contract.semantic_inputs.question_position_ids");
+    value = question_positions ? split_string(
+        question_positions, "values", "question_position_ids.values") : NULL;
+    if (!question_positions || split_exact_keys(
+            question_positions, position_keys, 2,
+            "shape_contract.semantic_inputs.question_position_ids") != 0 ||
+        !value || strcmp(value, "zero_based_contiguous") != 0 ||
+        !split_symbolic_shape_equals(cJSON_GetObjectItemCaseSensitive(
+            (cJSON*)question_positions, "shape"), bq, 2))
+        goto invalid;
+    return 0;
+
+invalid:
+    fprintf(stderr,
+            "[tinyreceipt] shape_contract must be the bounded explicit-KV v1 ABI\n");
+    return -1;
 }
 
 static int split_load_package(const char* package_arg, SplitPackage* package) {
@@ -1092,7 +1339,8 @@ static int split_load_package(const char* package_arg, SplitPackage* package) {
     }
     format = split_string(root, "format", "format");
     if (!format || strcmp(format, SPLIT_PACKAGE_FORMAT) != 0) {
-        fprintf(stderr, "[tinyreceipt] unsupported package format; expected qualified split package v1\n");
+        fprintf(stderr,
+                "[tinyreceipt] unsupported package format; expected explicit-KV v1\n");
         goto cleanup;
     }
     assets = split_object(root, "assets", "assets");
@@ -1106,15 +1354,21 @@ static int split_load_package(const char* package_arg, SplitPackage* package) {
                           sizeof(package->vocab_path), "assets.vocab") != 0 ||
         split_validate_tokenizer(root, package) != 0 ||
         split_validate_preprocessing(root) != 0 ||
-        split_validate_families(root) != 0 ||
-        split_validate_mask_semantics(root) != 0 ||
-        split_parse_encoder(split_object(graphs, "encoder", "graphs.encoder"),
-                            package->package_dir, &package->encoder) != 0 ||
-        split_parse_decoder(split_object(graphs, "decoder", "graphs.decoder"),
-                            package->package_dir, &package->decoder) != 0 ||
-        split_parse_routing(root, package) != 0 ||
-        split_validate_generation(root, package->decoder.output_kind) != 0)
+        split_validate_families(root) != 0)
         goto cleanup;
+    if (split_validate_shape_contract_v1(root) != 0 ||
+        split_validate_mask_semantics_v1(root) != 0 ||
+        split_validate_cache_contract_v1(root) != 0 ||
+        split_parse_encoder_v1(
+            split_object(graphs, "encoder", "graphs.encoder"),
+            package->package_dir, &package->encoder) != 0 ||
+        split_parse_decoder_v1(
+            split_object(graphs, "decoder", "graphs.decoder"),
+            package->package_dir, &package->decoder) != 0 ||
+        split_parse_routing(root, package) != 0 ||
+        split_validate_generation_v1(root) != 0) {
+        goto cleanup;
+    }
     rc = 0;
 
 cleanup:
@@ -1627,10 +1881,8 @@ static int split_load_bpe_metadata(const cJSON* root, const SplitPackage* packag
 }
 
 static int split_load_vocab(const SplitPackage* package, SplitVocab* vocab) {
-    static const char* const char_root_keys[] = {"itos"};
     char* text = NULL;
     cJSON* root = NULL;
-    const cJSON* itos = NULL;
     int rc = -1;
     if (!package || !vocab) return -1;
     memset(vocab, 0, sizeof(*vocab));
@@ -1646,22 +1898,11 @@ static int split_load_vocab(const SplitPackage* package, SplitVocab* vocab) {
         fprintf(stderr, "[tinyreceipt] tokenizer JSON contains duplicate object keys\n");
         goto cleanup;
     }
-    if (package->tokenizer_kind == SPLIT_TOKENIZER_CHAR_VOCAB) {
-        itos = cJSON_GetObjectItemCaseSensitive(root, "itos");
-        if (split_exact_keys(root, char_root_keys, 1, "vocab.json") != 0 ||
-            split_vocab_copy_items(vocab, itos, package->tokenizer_vocab_count,
-                                   "CharVocab", 0) != 0) {
-            fprintf(stderr, "[tinyreceipt] cannot parse strict CharVocab JSON: %s\n",
-                    package->vocab_path);
-            goto cleanup;
-        }
-        vocab->kind = SPLIT_TOKENIZER_CHAR_VOCAB;
-    } else if (package->tokenizer_kind == SPLIT_TOKENIZER_BYTE_FALLBACK_BPE) {
-        if (split_load_bpe_metadata(root, package, vocab) != 0) goto cleanup;
-    } else {
-        fprintf(stderr, "[tinyreceipt] package has no supported tokenizer contract\n");
+    if (package->tokenizer_kind != SPLIT_TOKENIZER_BYTE_FALLBACK_BPE) {
+        fprintf(stderr, "[tinyreceipt] package has no canonical BPE tokenizer contract\n");
         goto cleanup;
     }
+    if (split_load_bpe_metadata(root, package, vocab) != 0) goto cleanup;
     rc = 0;
 
 cleanup:
@@ -1669,58 +1910,6 @@ cleanup:
     free(text);
     if (rc != 0) split_vocab_free(vocab);
     return rc;
-}
-
-static int split_utf8_len(const unsigned char* text, size_t remaining) {
-    unsigned char first;
-    if (!text || remaining == 0) return 0;
-    first = text[0];
-    if (first < 0x80) return 1;
-    if (first >= 0xc2 && first <= 0xdf && remaining >= 2 &&
-        (text[1] & 0xc0) == 0x80) return 2;
-    if (first >= 0xe0 && first <= 0xef && remaining >= 3 &&
-        (text[1] & 0xc0) == 0x80 && (text[2] & 0xc0) == 0x80) return 3;
-    if (first >= 0xf0 && first <= 0xf4 && remaining >= 4 &&
-        (text[1] & 0xc0) == 0x80 && (text[2] & 0xc0) == 0x80 &&
-        (text[3] & 0xc0) == 0x80) return 4;
-    return 1;
-}
-
-static int split_is_unicode_space(const unsigned char* text, int length) {
-    if (length == 1) return isspace(text[0]) != 0;
-    if (length == 2) return text[0] == 0xc2 && text[1] == 0xa0;
-    if (length != 3) return 0;
-    if (text[0] == 0xe1 && text[1] == 0x9a && text[2] == 0x80) return 1;
-    if (text[0] == 0xe2 && text[1] == 0x80 && text[2] >= 0x80 && text[2] <= 0x8a) return 1;
-    if (text[0] == 0xe2 && text[1] == 0x80 &&
-        (text[2] == 0xa8 || text[2] == 0xa9 || text[2] == 0xaf)) return 1;
-    if (text[0] == 0xe2 && text[1] == 0x81 && text[2] == 0x9f) return 1;
-    return text[0] == 0xe3 && text[1] == 0x80 && text[2] == 0x80;
-}
-
-static char* split_clean_text(const char* input) {
-    const unsigned char* source = (const unsigned char*)(input ? input : "");
-    size_t input_length = strlen((const char*)source);
-    char* output = (char*)malloc(input_length + 1);
-    size_t in = 0;
-    size_t out = 0;
-    int pending_space = 0;
-    if (!output) return NULL;
-    while (in < input_length) {
-        int length = split_utf8_len(source + in, input_length - in);
-        if (split_is_unicode_space(source + in, length)) {
-            pending_space = out > 0;
-            in += (size_t)length;
-            continue;
-        }
-        if (pending_space) output[out++] = ' ';
-        pending_space = 0;
-        memcpy(output + out, source + in, (size_t)length);
-        out += (size_t)length;
-        in += (size_t)length;
-    }
-    output[out] = 0;
-    return output;
 }
 
 static char* split_clean_bpe_text(const char* input) {
@@ -1754,29 +1943,6 @@ static char* split_clean_bpe_text(const char* input) {
     }
     output[out] = 0;
     return output;
-}
-
-static int split_encode_char_question(const SplitVocab* vocab, const char* prompt,
-                                      int32_t* ids, int capacity) {
-    char* clean;
-    size_t length;
-    size_t offset = 0;
-    int count = 0;
-    if (!vocab || !ids || capacity <= 0) return -1;
-    clean = split_clean_text(prompt);
-    if (!clean) return -1;
-    length = strlen(clean);
-    while (offset < length && count < capacity) {
-        int bytes = split_utf8_len((const unsigned char*)clean + offset,
-                                   length - offset);
-        int id = split_vocab_find(vocab, clean + offset, (size_t)bytes);
-        ids[count++] = id >= 0 ? id : vocab->unk;
-        offset += (size_t)bytes;
-    }
-    if (count < capacity) ids[count++] = vocab->eos;
-    else ids[capacity - 1] = vocab->eos;
-    free(clean);
-    return count;
 }
 
 static int split_bpe_atomic_match(const SplitVocab* vocab, const char* text,
@@ -1958,12 +2124,8 @@ cleanup:
 
 static int split_encode_question(const SplitVocab* vocab, const char* prompt,
                                  int32_t* ids, int capacity) {
-    if (!vocab) return -1;
-    if (vocab->kind == SPLIT_TOKENIZER_CHAR_VOCAB)
-        return split_encode_char_question(vocab, prompt, ids, capacity);
-    if (vocab->kind == SPLIT_TOKENIZER_BYTE_FALLBACK_BPE)
-        return split_encode_bpe_question(vocab, prompt, ids, capacity);
-    return -1;
+    if (!vocab || vocab->kind != SPLIT_TOKENIZER_BYTE_FALLBACK_BPE) return -1;
+    return split_encode_bpe_question(vocab, prompt, ids, capacity);
 }
 
 static size_t split_utf8_replacement_advance(const unsigned char* bytes,
@@ -2104,8 +2266,63 @@ static void split_report_failure(const char* action, VxStatus status,
     fprintf(stderr, "[tinyreceipt] %s failed: %s", action, vx_status_string(status));
     if (report && report->reason[0]) fprintf(stderr, " (%s)", report->reason);
     if (report && report->message[0]) fprintf(stderr, ": %s", report->message);
+    if (report && report->route_evidence[0])
+        fprintf(stderr, " {%s}", report->route_evidence);
+    if (report && report->offending_node[0])
+        fprintf(stderr, " <node=%s>", report->offending_node);
     if (report && report->decode_state[0]) fprintf(stderr, " [%s]", report->decode_state);
     fputc('\n', stderr);
+}
+
+static int split_report_has_no_operator_fallback(const char* evidence) {
+    static const char expected[] = "operator=none";
+    const char* cursor = evidence;
+    if (!cursor) return 0;
+    while (*cursor) {
+        const char* end = strchr(cursor, ';');
+        size_t length = end ? (size_t)(end - cursor) : strlen(cursor);
+        if (length == sizeof(expected) - 1 &&
+            memcmp(cursor, expected, sizeof(expected) - 1) == 0)
+            return 1;
+        if (!end) break;
+        cursor = end + 1;
+    }
+    return 0;
+}
+
+int tiny_receipt_split_w8a8_report_proves_strict_backend(
+        const VxReport* report, const char* expected_backend) {
+    return report && expected_backend && expected_backend[0] &&
+        report->policy_mode == VX_BACKEND_REQUIRE &&
+        report->operator_fallback == VX_OPERATOR_FALLBACK_FORBID &&
+        report->backend[0] && strcmp(report->backend, expected_backend) == 0 &&
+        report->route_attested && report->route_evidence[0] &&
+        report->operator_fallback_used == 0 &&
+        split_report_has_no_operator_fallback(report->fallback_evidence);
+}
+
+static int split_report_proves_strict_backend(const SplitGraph* graph,
+                                              const VxReport* report,
+                                              const char* label) {
+    if (graph && graph->expected_policy_mode == VX_BACKEND_REQUIRE &&
+        graph->expected_operator_fallback == VX_OPERATOR_FALLBACK_FORBID &&
+        tiny_receipt_split_w8a8_report_proves_strict_backend(
+            report, graph->expected_backend))
+        return 0;
+    fprintf(stderr,
+            "[tinyreceipt] %s did not attest the requested strict provider with fallback 0",
+            label ? label : "execution");
+    if (graph && graph->expected_backend[0])
+        fprintf(stderr, " expected=%s", graph->expected_backend);
+    if (report) {
+        fprintf(stderr, " actual=%s policy=%d operator_fallback=%d",
+                report->backend[0] ? report->backend : "unknown",
+                (int)report->policy_mode, (int)report->operator_fallback);
+        if (report->route_evidence[0])
+            fprintf(stderr, " {%s}", report->route_evidence);
+    }
+    fputc('\n', stderr);
+    return -1;
 }
 
 static int split_select_backend(SplitCommand* command, const char* backend) {
@@ -2168,6 +2385,20 @@ static int split_graph_open(VxRuntime* runtime, const char* graph_path,
     char action[64];
     double compile_ms = 0.0;
     memset(graph, 0, sizeof(*graph));
+    if (!policy || policy->mode != VX_BACKEND_REQUIRE ||
+        policy->operator_fallback != VX_OPERATOR_FALLBACK_FORBID ||
+        policy->backend_count != 1 || !policy->backends ||
+        !policy->backends[0] || !policy->backends[0][0] ||
+        strlen(policy->backends[0]) >= sizeof(graph->expected_backend)) {
+        fprintf(stderr,
+                "[tinyreceipt] %s requires one exact backend with operator fallback forbidden\n",
+                label ? label : "graph");
+        goto fail;
+    }
+    graph->expected_policy_mode = policy->mode;
+    graph->expected_operator_fallback = policy->operator_fallback;
+    snprintf(graph->expected_backend, sizeof(graph->expected_backend), "%s",
+             policy->backends[0]);
     source.graph_path = graph_path;
     source.weight_paths = weight_paths;
     source.weight_path_count = 1;
@@ -2184,6 +2415,9 @@ static int split_graph_open(VxRuntime* runtime, const char* graph_path,
         split_report_failure(action, status, &report);
         goto fail;
     }
+    snprintf(action, sizeof(action), "%s model compile", label);
+    if (split_report_proves_strict_backend(graph, &report, action) != 0)
+        goto fail;
     compile_ms = report.compile_time_ms;
     report = (VxReport)VX_REPORT_INIT;
     status = vx_compiled_model_create_context(graph->compiled, context_options,
@@ -2193,6 +2427,9 @@ static int split_graph_open(VxRuntime* runtime, const char* graph_path,
         split_report_failure(action, status, &report);
         goto fail;
     }
+    snprintf(action, sizeof(action), "%s context creation", label);
+    if (split_report_proves_strict_backend(graph, &report, action) != 0)
+        goto fail;
     if (debug) {
         fprintf(stderr, "[debug] tinyreceipt split %s compile=%.3f ms backend=%s%s%s\n",
                 label, compile_ms, report.backend[0] ? report.backend : "unknown",
@@ -2207,13 +2444,14 @@ fail:
 }
 
 static int split_find_input(VxExecutionContext* context, const char* name,
-                            VxTensorInfo* found) {
+                            VxTensorSpec* found) {
     size_t count = vx_execution_context_input_count(context);
     for (size_t index = 0; index < count; index++) {
-        VxTensorInfo info = VX_TENSOR_INFO_INIT;
-        if (vx_execution_context_input_info(context, index, &info, NULL) == VX_STATUS_OK &&
-            info.name && strcmp(info.name, name) == 0) {
-            *found = info;
+        VxTensorSpec spec = VX_TENSOR_SPEC_INIT;
+        if (vx_execution_context_input_spec(context, index, &spec, NULL) ==
+                VX_STATUS_OK &&
+            spec.name && strcmp(spec.name, name) == 0) {
+            *found = spec;
             return 0;
         }
     }
@@ -2223,20 +2461,20 @@ static int split_find_input(VxExecutionContext* context, const char* name,
 static int split_exact_inputs(VxExecutionContext* context,
                               const char* const* names, size_t expected,
                               const char* label) {
-    int seen[5] = {0, 0, 0, 0, 0};
+    int seen[SPLIT_MAX_BINDINGS] = {0};
     size_t count = vx_execution_context_input_count(context);
-    if (expected > 5 || count != expected) {
+    if (expected > SPLIT_MAX_BINDINGS || count != expected) {
         fprintf(stderr, "[tinyreceipt] %s graph must expose exactly %zu inputs\n",
                 label, expected);
         return -1;
     }
     for (size_t index = 0; index < count; index++) {
-        VxTensorInfo info = VX_TENSOR_INFO_INIT;
+        VxTensorSpec spec = VX_TENSOR_SPEC_INIT;
         size_t match;
-        if (vx_execution_context_input_info(context, index, &info, NULL) != VX_STATUS_OK ||
-            !info.name) return -1;
+        if (vx_execution_context_input_spec(context, index, &spec, NULL) !=
+                VX_STATUS_OK || !spec.name) return -1;
         for (match = 0; match < expected; match++) {
-            if (!strcmp(info.name, names[match])) break;
+            if (!strcmp(spec.name, names[match])) break;
         }
         if (match == expected || seen[match]) {
             fprintf(stderr, "[tinyreceipt] %s runtime inputs differ from manifest mapping\n",
@@ -2251,14 +2489,24 @@ static int split_exact_inputs(VxExecutionContext* context,
 static int split_input_spec(VxExecutionContext* context, const char* name,
                             VxDataType dtype, const int64_t* shape, uint32_t rank,
                             size_t byte_size, const char* label) {
-    VxTensorInfo info = VX_TENSOR_INFO_INIT;
+    VxTensorSpec spec = VX_TENSOR_SPEC_INIT;
     VxAffineQuantization affine = VX_AFFINE_QUANTIZATION_INIT;
     VxStatus affine_status;
-    if (split_find_input(context, name, &info) != 0 || info.dtype != dtype ||
-        info.rank != rank || info.byte_size != byte_size) goto invalid;
+    size_t expected_bytes = dtype == VX_DTYPE_F32 || dtype == VX_DTYPE_I32
+        ? 4u : dtype == VX_DTYPE_I8 || dtype == VX_DTYPE_U8 ? 1u : 0u;
+    if (split_find_input(context, name, &spec) != 0 || spec.dtype != dtype ||
+        spec.rank != rank || !expected_bytes) goto invalid;
     for (uint32_t axis = 0; axis < rank; axis++) {
-        if (info.shape[axis] != shape[axis]) goto invalid;
+        const VxDimensionConstraint* dimension = &spec.dimensions[axis];
+        if (shape[axis] <= 0 || shape[axis] < dimension->min ||
+            shape[axis] > dimension->max ||
+            shape[axis] % dimension->multiple_of != 0 ||
+            (dimension->kind == VX_DIMENSION_FIXED &&
+             shape[axis] != dimension->min) ||
+            (uint64_t)shape[axis] > SIZE_MAX / expected_bytes) goto invalid;
+        expected_bytes *= (size_t)shape[axis];
     }
+    if (expected_bytes != byte_size) goto invalid;
     affine_status = vx_execution_context_input_affine_quantization(
         context, name, &affine, NULL);
     /* Built-in contexts expose affine metadata, so enforce the package's
@@ -2276,71 +2524,118 @@ invalid:
 }
 
 static int split_validate_encoder_inputs(VxExecutionContext* context,
-                                         const SplitEncoderDefinition* encoder) {
+                                         const SplitEncoderDefinition* encoder,
+                                         int question_length) {
     const char* names[] = {
-        encoder->image, encoder->question_ids, encoder->family_ids,
+        encoder->image, encoder->question_ids,
+        encoder->question_position_ids, encoder->family_ids,
     };
     const int64_t image_shape[] = {1, 1, SPLIT_IMAGE_HEIGHT, SPLIT_IMAGE_WIDTH};
-    const int64_t question_shape[] = {1, SPLIT_QUESTION_LENGTH};
+    const int64_t question_shape[] = {1, question_length};
     const int64_t family_shape[] = {1};
-    const int runtime_family = encoder->family_ids[0] != 0;
-    return split_exact_inputs(context, names, runtime_family ? 3 : 2, "encoder") ||
+    return question_length < 1 || question_length > SPLIT_QUESTION_LENGTH ||
+        split_exact_inputs(context, names, 4, "encoder") ||
         split_input_spec(context, encoder->image, VX_DTYPE_F32, image_shape, 4,
                          (size_t)SPLIT_IMAGE_HEIGHT * SPLIT_IMAGE_WIDTH * sizeof(float),
                          "encoder image") ||
         split_input_spec(context, encoder->question_ids, VX_DTYPE_I32,
                          question_shape, 2,
-                         (size_t)SPLIT_QUESTION_LENGTH * sizeof(int32_t),
+                         (size_t)question_length * sizeof(int32_t),
                          "encoder question_ids") ||
-        (runtime_family &&
-         split_input_spec(context, encoder->family_ids, VX_DTYPE_I32,
-                          family_shape, 1, sizeof(int32_t),
-                          "encoder family_ids"));
+        split_input_spec(context, encoder->question_position_ids, VX_DTYPE_I32,
+                         question_shape, 2,
+                         (size_t)question_length * sizeof(int32_t),
+                         "encoder question_position_ids") ||
+        split_input_spec(context, encoder->family_ids, VX_DTYPE_I32,
+                         family_shape, 1, sizeof(int32_t),
+                         "encoder family_ids");
 }
 
-static int split_validate_decoder_inputs(VxExecutionContext* context,
-                                         const SplitDecoderDefinition* decoder) {
-    const char* names[5];
-    const int64_t ids_shape[] = {1, SPLIT_DECODER_LENGTH};
-    const int64_t memory_shape[] = {1, SPLIT_MEMORY_LENGTH, SPLIT_MODEL_WIDTH};
-    const int64_t mask_shape[] = {1, SPLIT_MEMORY_LENGTH};
-    const int64_t family_shape[] = {1};
+static int split_validate_decoder_inputs_v1(
+        VxExecutionContext* context, const SplitDecoderDefinition* decoder,
+        int memory_length, int past_length) {
+    const char* names[5 + SPLIT_CACHE_TENSORS * 2];
+    const int64_t token_shape[] = {1, 1};
+    const int64_t scalar_shape[] = {1};
+    const int64_t memory_mask_shape[] = {1, memory_length};
+    const int64_t past_mask_shape[] = {1, past_length};
+    const int64_t cross_shape[] = {
+        1, SPLIT_CACHE_HEADS, memory_length, SPLIT_CACHE_HEAD_WIDTH,
+    };
+    const int64_t past_shape[] = {
+        1, SPLIT_CACHE_HEADS, past_length, SPLIT_CACHE_HEAD_WIDTH,
+    };
+    const size_t cross_bytes = (size_t)SPLIT_CACHE_HEADS *
+        (size_t)memory_length * SPLIT_CACHE_HEAD_WIDTH * sizeof(float);
+    const size_t past_bytes = (size_t)SPLIT_CACHE_HEADS *
+        (size_t)past_length * SPLIT_CACHE_HEAD_WIDTH * sizeof(float);
     size_t input_count = 0;
     names[input_count++] = decoder->decoder_input_ids;
-    names[input_count++] = decoder->memory;
+    names[input_count++] = decoder->position_ids;
+    names[input_count++] = decoder->family_ids;
     names[input_count++] = decoder->memory_padding_mask;
-    if (decoder->family_ids[0]) names[input_count++] = decoder->family_ids;
-    if (decoder->v4_keep[0]) names[input_count++] = decoder->v4_keep;
-    return split_exact_inputs(context, names, input_count, "decoder") ||
+    names[input_count++] = decoder->past_padding_mask;
+    for (int index = 0; index < SPLIT_CACHE_TENSORS; index++)
+        names[input_count++] = decoder->cross_kv[index];
+    for (int index = 0; index < SPLIT_CACHE_TENSORS; index++)
+        names[input_count++] = decoder->past_kv[index];
+    if (memory_length < SPLIT_IMAGE_TOKENS + 1 ||
+        memory_length > SPLIT_MEMORY_LENGTH || past_length < 1 ||
+        past_length > SPLIT_MAX_NEW_TOKENS ||
+        split_exact_inputs(context, names, input_count, "decoder") != 0 ||
         split_input_spec(context, decoder->decoder_input_ids, VX_DTYPE_I32,
-                         ids_shape, 2,
-                         (size_t)SPLIT_DECODER_LENGTH * sizeof(int32_t),
-                         "decoder decoder_input_ids") ||
-        split_input_spec(context, decoder->memory, VX_DTYPE_F32, memory_shape, 3,
-                         (size_t)SPLIT_MEMORY_LENGTH * SPLIT_MODEL_WIDTH * sizeof(float),
-                         "decoder memory") ||
+                         token_shape, 2, sizeof(int32_t),
+                         "decoder decoder_input_ids") != 0 ||
+        split_input_spec(context, decoder->position_ids, VX_DTYPE_I32,
+                         scalar_shape, 1, sizeof(int32_t),
+                         "decoder position_ids") != 0 ||
+        split_input_spec(context, decoder->family_ids, VX_DTYPE_I32,
+                         scalar_shape, 1, sizeof(int32_t),
+                         "decoder family_ids") != 0 ||
         split_input_spec(context, decoder->memory_padding_mask, VX_DTYPE_I32,
-                         mask_shape, 2,
-                         (size_t)SPLIT_MEMORY_LENGTH * sizeof(int32_t),
-                         "decoder memory_padding_mask") ||
-        (decoder->family_ids[0] &&
-         split_input_spec(context, decoder->family_ids, VX_DTYPE_I32,
-                          family_shape, 1, sizeof(int32_t),
-                          "decoder family_ids")) ||
-        (decoder->v4_keep[0] &&
-         split_input_spec(context, decoder->v4_keep, VX_DTYPE_I32, ids_shape, 2,
-                          (size_t)SPLIT_DECODER_LENGTH * sizeof(int32_t),
-                          "decoder v4_keep"));
+                         memory_mask_shape, 2,
+                         (size_t)memory_length * sizeof(int32_t),
+                         "decoder memory_padding_mask") != 0 ||
+        split_input_spec(context, decoder->past_padding_mask, VX_DTYPE_I32,
+                         past_mask_shape, 2,
+                         (size_t)past_length * sizeof(int32_t),
+                         "decoder past_padding_mask") != 0)
+        return -1;
+    for (int index = 0; index < SPLIT_CACHE_TENSORS; index++) {
+        if (split_input_spec(context, decoder->cross_kv[index], VX_DTYPE_F32,
+                             cross_shape, 4, cross_bytes,
+                             k_split_cross_semantics[index]) != 0 ||
+            split_input_spec(context, decoder->past_kv[index], VX_DTYPE_F32,
+                             past_shape, 4, past_bytes,
+                             k_split_past_semantics[index]) != 0)
+            return -1;
+    }
+    return 0;
 }
 
-static int split_set_input(VxExecutionContext* context, const char* name,
-                           VxDataType dtype, const void* data, size_t byte_size) {
-    VxReport report = VX_REPORT_INIT;
-    VxStatus status = vx_execution_context_set_input(context, name, dtype, data,
-                                                     byte_size, &report);
-    if (status == VX_STATUS_OK) return 0;
-    split_report_failure("input upload", status, &report);
-    return -1;
+static int split_add_input(VxExecutionContext* context,
+                           SplitBindingBatch* batch, const char* name,
+                           VxDataType dtype, const int64_t* shape,
+                           uint32_t rank, const void* data,
+                           size_t byte_size) {
+    VxTensorSpec spec = VX_TENSOR_SPEC_INIT;
+    VxTensorBinding* binding;
+    if (!batch || batch->count >= sizeof(batch->values) / sizeof(batch->values[0]) ||
+        !data || split_find_input(context, name, &spec) != 0 ||
+        split_input_spec(context, name, dtype, shape, rank, byte_size,
+                         name) != 0) return -1;
+    for (size_t index = 0; index < batch->count; index++)
+        if (!strcmp(batch->values[index].name, spec.name)) return -1;
+    binding = &batch->values[batch->count++];
+    *binding = (VxTensorBinding)VX_TENSOR_BINDING_INIT;
+    binding->name = spec.name;
+    binding->dtype = dtype;
+    binding->rank = rank;
+    memcpy(binding->shape, shape, rank * sizeof(*shape));
+    binding->data = data;
+    binding->byte_size = byte_size;
+    binding->location = VX_MEMORY_HOST;
+    return 0;
 }
 
 static int split_find_output(const VxResult* result, const char* name,
@@ -2359,9 +2654,9 @@ static int split_find_output(const VxResult* result, const char* name,
 
 static int split_exact_outputs(const VxResult* result, const char* const* names,
                                size_t expected, const char* label) {
-    int seen[4] = {0, 0, 0, 0};
+    int seen[SPLIT_MAX_GRAPH_OUTPUTS] = {0};
     size_t count = vx_result_output_count(result);
-    if (expected > 4 || count != expected) goto invalid;
+    if (expected > SPLIT_MAX_GRAPH_OUTPUTS || count != expected) goto invalid;
     for (size_t index = 0; index < count; index++) {
         VxTensorInfo info = VX_TENSOR_INFO_INIT;
         size_t match;
@@ -2406,76 +2701,158 @@ invalid:
     return -1;
 }
 
+static void split_encoder_output_release(SplitEncoderOutput* output) {
+    if (!output) return;
+    free(output->memory);
+    free(output->memory_padding_mask);
+    for (int index = 0; index < SPLIT_CACHE_TENSORS; index++)
+        free(output->cross_kv[index]);
+    memset(output, 0, sizeof(*output));
+}
+
 static int split_run_encoder(SplitGraph* graph,
                              const SplitEncoderDefinition* definition,
                              const SplitVocab* vocab, const char* image_path,
                              const char* prompt, int requested_family,
-                             int debug, SplitEncoderOutput* output) {
-    const char* output_names[] = {
-        definition->memory, definition->memory_padding_mask,
-        definition->router_logits, definition->selected_family_ids,
+                             SplitShapeMode shape_mode, int debug,
+                             SplitEncoderOutput* output,
+                             TinyReceiptSplitShapeEvidence* evidence) {
+    const char* output_names[4 + SPLIT_CACHE_TENSORS];
+    int64_t memory_shape[] = {1, 0, SPLIT_MODEL_WIDTH};
+    int64_t mask_shape[] = {1, 0};
+    int64_t cross_shape[] = {
+        1, SPLIT_CACHE_HEADS, 0, SPLIT_CACHE_HEAD_WIDTH,
     };
-    const int64_t memory_shape[] = {1, SPLIT_MEMORY_LENGTH, SPLIT_MODEL_WIDTH};
-    const int64_t mask_shape[] = {1, SPLIT_MEMORY_LENGTH};
     const int64_t logits_shape[] = {1, SPLIT_FAMILY_COUNT};
     const int64_t selected_shape[] = {1};
     const int image_shape[] = {1, SPLIT_IMAGE_HEIGHT, SPLIT_IMAGE_WIDTH, 1};
     float* image = NULL;
     int32_t question_ids[SPLIT_QUESTION_LENGTH];
+    int32_t question_position_ids[SPLIT_QUESTION_LENGTH];
     VxResult* result = NULL;
     VxReport report = VX_REPORT_INIT;
+    SplitBindingBatch bindings = {0};
     VxStatus status;
     char image_error[256] = {0};
     double started;
     int question_count;
+    int bound_question_length;
     int32_t family_id = requested_family;
     int32_t selected = -1;
     int router_family = 0;
     int rc = -1;
+    int memory_length;
     if (!graph || !definition || !vocab || !output) return -1;
     memset(output, 0, sizeof(*output));
-    if (split_validate_encoder_inputs(graph->context, definition) != 0) return -1;
+    output_names[0] = definition->memory;
+    output_names[1] = definition->memory_padding_mask;
+    output_names[2] = definition->router_logits;
+    output_names[3] = definition->selected_family_ids;
+    for (int index = 0; index < SPLIT_CACHE_TENSORS; index++)
+        output_names[4 + index] = definition->cross_kv[index];
     image = (float*)malloc((size_t)SPLIT_IMAGE_HEIGHT * SPLIT_IMAGE_WIDTH * sizeof(float));
     output->memory = (float*)malloc(
         (size_t)SPLIT_MEMORY_LENGTH * SPLIT_MODEL_WIDTH * sizeof(float));
     output->memory_padding_mask = (int32_t*)malloc(
         (size_t)SPLIT_MEMORY_LENGTH * sizeof(int32_t));
     if (!image || !output->memory || !output->memory_padding_mask) goto cleanup;
+    {
+        const size_t cross_elements = (size_t)SPLIT_CACHE_HEADS *
+            SPLIT_MEMORY_LENGTH * SPLIT_CACHE_HEAD_WIDTH;
+        for (int tensor = 0; tensor < SPLIT_CACHE_TENSORS; tensor++) {
+            output->cross_kv[tensor] = (float*)malloc(
+                cross_elements * sizeof(*output->cross_kv[tensor]));
+            if (!output->cross_kv[tensor]) goto cleanup;
+            for (size_t index = 0; index < cross_elements; index++)
+                output->cross_kv[tensor][index] = NAN;
+        }
+    }
+    for (size_t index = 0;
+         index < (size_t)SPLIT_MEMORY_LENGTH * SPLIT_MODEL_WIDTH; index++)
+        output->memory[index] = NAN;
+    for (int index = 0; index < SPLIT_MEMORY_LENGTH; index++)
+        output->memory_padding_mask[index] = INT32_MIN;
     if (tiny_receipt_load_image_to_tensor(image_path, image, image_shape, 4,
                                           image_error, sizeof(image_error)) != 0) {
         fprintf(stderr, "[tinyreceipt] image load failed: %s\n",
                 image_error[0] ? image_error : image_path);
         goto cleanup;
     }
+    if (debug) {
+        char input_digest[65];
+        if (split_sha256_f32_le(
+                image,
+                (size_t)SPLIT_IMAGE_HEIGHT * (size_t)SPLIT_IMAGE_WIDTH,
+                input_digest) != 0)
+            goto cleanup;
+        fprintf(stderr,
+                "[debug] tinyreceipt split input_f32_sha256=%s\n",
+                input_digest);
+    }
     for (int index = 0; index < SPLIT_QUESTION_LENGTH; index++)
         question_ids[index] = vocab->pad;
     question_count = split_encode_question(vocab, prompt, question_ids,
                                            SPLIT_QUESTION_LENGTH);
-    if (question_count < 0) goto cleanup;
-    if (debug) fprintf(stderr, "[debug] tinyreceipt split question_tokens=%d\n",
-                       question_count);
-    if (split_set_input(graph->context, definition->image, VX_DTYPE_F32, image,
-                        (size_t)SPLIT_IMAGE_HEIGHT * SPLIT_IMAGE_WIDTH * sizeof(float)) != 0 ||
-        split_set_input(graph->context, definition->question_ids, VX_DTYPE_I32,
-                        question_ids, sizeof(question_ids)) != 0 ||
-        (definition->family_ids[0] &&
-         split_set_input(graph->context, definition->family_ids, VX_DTYPE_I32,
-                         &family_id, sizeof(family_id)) != 0)) goto cleanup;
+    if (question_count < 1 || question_count > SPLIT_QUESTION_LENGTH) goto cleanup;
+    bound_question_length = shape_mode == SPLIT_SHAPE_MODE_MAXIMUM_PADDED ?
+        SPLIT_QUESTION_LENGTH : question_count;
+    memory_length = bound_question_length + SPLIT_IMAGE_TOKENS;
+    memory_shape[1] = memory_length;
+    mask_shape[1] = memory_length;
+    cross_shape[2] = memory_length;
+    for (int index = 0; index < bound_question_length; index++)
+        question_position_ids[index] = index;
+    if (split_validate_encoder_inputs(
+            graph->context, definition, bound_question_length) != 0) goto cleanup;
+    if (debug) {
+        fprintf(stderr, "[debug] tinyreceipt split question_tokens=%d\n",
+                question_count);
+        fputs("[debug] tinyreceipt split question_token_ids=", stderr);
+        for (int index = 0; index < question_count; index++)
+            fprintf(stderr, "%s%d", index == 0 ? "" : ",",
+                    question_ids[index]);
+        fputc('\n', stderr);
+    }
+    if (split_add_input(
+            graph->context, &bindings, definition->image, VX_DTYPE_F32,
+            (const int64_t[]){1, 1, SPLIT_IMAGE_HEIGHT, SPLIT_IMAGE_WIDTH},
+            4u, image,
+            (size_t)SPLIT_IMAGE_HEIGHT * SPLIT_IMAGE_WIDTH * sizeof(float)) != 0 ||
+        split_add_input(
+            graph->context, &bindings, definition->question_ids,
+            VX_DTYPE_I32,
+            (const int64_t[]){1, bound_question_length}, 2u,
+            question_ids,
+            (size_t)bound_question_length * sizeof(*question_ids)) != 0 ||
+        split_add_input(
+            graph->context, &bindings, definition->question_position_ids,
+            VX_DTYPE_I32,
+            (const int64_t[]){1, bound_question_length}, 2u,
+            question_position_ids,
+            (size_t)bound_question_length * sizeof(*question_position_ids)) != 0 ||
+        split_add_input(graph->context, &bindings, definition->family_ids,
+                        VX_DTYPE_I32, (const int64_t[]){1}, 1u,
+                        &family_id, sizeof(family_id)) != 0) goto cleanup;
     started = split_now_ms();
-    status = vx_execution_context_execute(graph->context, &result, &report);
+    status = vx_execution_context_execute(
+        graph->context, bindings.values, bindings.count, &result, &report);
     output->execution_ms = split_now_ms() - started;
     if (status != VX_STATUS_OK) {
         split_report_failure("encoder execution", status, &report);
         goto cleanup;
     }
-    if (split_exact_outputs(result, output_names, 4, "encoder") != 0 ||
+    if (split_report_proves_strict_backend(
+            graph, &report, "encoder execution") != 0)
+        goto cleanup;
+    if (split_exact_outputs(result, output_names, 4 + SPLIT_CACHE_TENSORS,
+                            "encoder") != 0 ||
         split_read_output(result, definition->memory, VX_DTYPE_F32, memory_shape, 3,
                           output->memory,
-                          (size_t)SPLIT_MEMORY_LENGTH * SPLIT_MODEL_WIDTH * sizeof(float),
+                          (size_t)memory_length * SPLIT_MODEL_WIDTH * sizeof(float),
                           "encoder memory") != 0 ||
         split_read_output(result, definition->memory_padding_mask, VX_DTYPE_I32,
                           mask_shape, 2, output->memory_padding_mask,
-                          (size_t)SPLIT_MEMORY_LENGTH * sizeof(int32_t),
+                          (size_t)memory_length * sizeof(int32_t),
                           "encoder memory_padding_mask") != 0 ||
         split_read_output(result, definition->router_logits, VX_DTYPE_F32,
                           logits_shape, 2, output->router_logits,
@@ -2483,10 +2860,51 @@ static int split_run_encoder(SplitGraph* graph,
         split_read_output(result, definition->selected_family_ids, VX_DTYPE_I32,
                           selected_shape, 1, &selected, sizeof(selected),
                           "encoder selected_family_ids") != 0) goto cleanup;
-    for (int index = 0; index < SPLIT_MEMORY_LENGTH; index++) {
+    {
+        const size_t active_elements = (size_t)SPLIT_CACHE_HEADS *
+            (size_t)memory_length * SPLIT_CACHE_HEAD_WIDTH;
+        for (int tensor = 0; tensor < SPLIT_CACHE_TENSORS; tensor++) {
+            if (split_read_output(
+                    result, definition->cross_kv[tensor], VX_DTYPE_F32,
+                    cross_shape, 4, output->cross_kv[tensor],
+                    active_elements * sizeof(*output->cross_kv[tensor]),
+                    k_split_cross_semantics[tensor]) != 0)
+                goto cleanup;
+            for (size_t index = 0; index < active_elements; index++) {
+                if (!isfinite(output->cross_kv[tensor][index])) {
+                    fprintf(stderr,
+                            "[tinyreceipt] encoder %s contains a non-finite value\n",
+                            k_split_cross_semantics[tensor]);
+                    goto cleanup;
+                }
+            }
+        }
+    }
+    for (int index = 0; index < memory_length; index++) {
         if (output->memory_padding_mask[index] != 0 &&
             output->memory_padding_mask[index] != 1) {
             fprintf(stderr, "[tinyreceipt] encoder memory_padding_mask contains a value other than 0 or 1\n");
+            goto cleanup;
+        }
+    }
+    for (size_t index = 0;
+         index < (size_t)memory_length * SPLIT_MODEL_WIDTH; index++) {
+        if (!isfinite(output->memory[index])) {
+            fprintf(stderr,
+                    "[tinyreceipt] encoder memory contains a non-finite value\n");
+            goto cleanup;
+        }
+    }
+    for (size_t index = (size_t)memory_length * SPLIT_MODEL_WIDTH;
+         index < (size_t)SPLIT_MEMORY_LENGTH * SPLIT_MODEL_WIDTH; index++) {
+        if (!isnan(output->memory[index])) {
+            fprintf(stderr, "[tinyreceipt] encoder result read overwrote inactive memory tail\n");
+            goto cleanup;
+        }
+    }
+    for (int index = memory_length; index < SPLIT_MEMORY_LENGTH; index++) {
+        if (output->memory_padding_mask[index] != INT32_MIN) {
+            fprintf(stderr, "[tinyreceipt] encoder result read overwrote inactive mask tail\n");
             goto cleanup;
         }
     }
@@ -2511,12 +2929,25 @@ static int split_run_encoder(SplitGraph* graph,
         goto cleanup;
     }
     output->selected_family_id = selected;
+    output->question_length = question_count;
+    output->memory_length = memory_length;
+    if (evidence) {
+        evidence->shape_mode = (int32_t)shape_mode;
+        evidence->question_length = question_count;
+        evidence->memory_length = memory_length;
+        evidence->selected_family_id = selected;
+        evidence->encoder_result_bytes = report.result_bytes;
+        evidence->encoder_ms = report.execution_time_ms;
+        snprintf(evidence->encoder_route, sizeof(evidence->encoder_route), "%s",
+                 report.route_evidence);
+    }
     if (debug) {
         fprintf(stderr, "[debug] tinyreceipt split router=%s selected=%s%s encoder=%.3f ms\n",
                 k_split_family_names[router_family], k_split_family_names[selected],
-                requested_family >= 0 ?
-                    (definition->family_ids[0] ? " (requested)" : " (verified)") : "",
+                requested_family >= 0 ? " (requested)" : "",
                 output->execution_ms);
+        fprintf(stderr, "[debug] tinyreceipt split encoder shape %s\n",
+                report.route_evidence);
     }
     rc = 0;
 
@@ -2524,9 +2955,7 @@ cleanup:
     vx_result_release(result);
     free(image);
     if (rc != 0) {
-        free(output->memory);
-        free(output->memory_padding_mask);
-        memset(output, 0, sizeof(*output));
+        split_encoder_output_release(output);
     }
     return rc;
 }
@@ -2555,207 +2984,293 @@ static int split_run_decoder(SplitGraph* graph,
                              const SplitDecoderDefinition* definition,
                              const SplitVocab* vocab,
                              const SplitEncoderOutput* encoded, int max_new,
-                             int ordinary, int no_kv, int debug) {
-    const char* output_names[1];
-    const int64_t token_shape[] = {1, SPLIT_DECODER_LENGTH};
-    int64_t logits_shape[3];
-    int32_t decoder_ids[SPLIT_DECODER_LENGTH];
-    int32_t decoder_keep[SPLIT_DECODER_LENGTH];
-    int32_t token_ids[SPLIT_DECODER_LENGTH];
-    int32_t generated_ids[SPLIT_MAX_NEW_TOKENS];
+                             int debug, int emit_answer,
+                             TinyReceiptSplitShapeEvidence* evidence) {
+    const char* output_names[2 + SPLIT_CACHE_TENSORS];
+    const size_t maximum_cache_elements = (size_t)SPLIT_CACHE_HEADS *
+        SPLIT_DECODER_LENGTH * SPLIT_CACHE_HEAD_WIDTH;
+    float* past_kv[SPLIT_CACHE_TENSORS] = {0};
+    float* present_kv[SPLIT_CACHE_TENSORS] = {0};
+    int32_t* past_padding_mask = NULL;
+    int32_t* present_padding_mask = NULL;
     float* logits = NULL;
+    int32_t generated_ids[SPLIT_MAX_NEW_TOKENS];
+    int32_t emitted_ids[SPLIT_MAX_NEW_TOKENS];
+    int32_t current_token;
+    int32_t family_id;
+    int past_length = 1;
+    int generated = 0;
+    int emitted = 0;
+    uint64_t token_digest = UINT64_C(1469598103934665603);
     char* decoded = NULL;
     size_t decoded_length = 0;
-    int32_t family_id;
     VxResult* result = NULL;
     VxReport report = VX_REPORT_INIT;
-    int prefix_length = 1;
-    int generated = 0;
-    int steady_steps = 0;
     double generation_started = split_now_ms();
-    double seed_ms = 0.0;
-    double steady_ms = 0.0;
     int rc = -1;
-    if (!graph || !definition || !vocab || !encoded) return -1;
-    logits_shape[0] = 1;
-    logits_shape[1] = SPLIT_DECODER_LENGTH;
-    logits_shape[2] = vocab->count;
-    output_names[0] = definition->output_kind == SPLIT_DECODER_OUTPUT_TOKEN_IDS ?
-        definition->token_ids : definition->logits;
-    if (split_validate_decoder_inputs(graph->context, definition) != 0) return -1;
-    if (definition->output_kind == SPLIT_DECODER_OUTPUT_F32_LOGITS) {
-        if ((size_t)vocab->count >
-            SIZE_MAX / ((size_t)SPLIT_DECODER_LENGTH * sizeof(*logits)))
-            return -1;
-        logits = (float*)malloc((size_t)SPLIT_DECODER_LENGTH *
-                                (size_t)vocab->count * sizeof(*logits));
-        if (!logits) return -1;
+    if (!graph || !definition || !vocab || !encoded || max_new < 0 ||
+        max_new > SPLIT_MAX_NEW_TOKENS)
+        return -1;
+    output_names[0] = definition->logits;
+    output_names[1] = definition->present_padding_mask;
+    for (int index = 0; index < SPLIT_CACHE_TENSORS; index++)
+        output_names[2 + index] = definition->present_kv[index];
+    logits = (float*)malloc((size_t)vocab->count * sizeof(*logits));
+    past_padding_mask = (int32_t*)calloc(
+        SPLIT_DECODER_LENGTH, sizeof(*past_padding_mask));
+    present_padding_mask = (int32_t*)malloc(
+        SPLIT_DECODER_LENGTH * sizeof(*present_padding_mask));
+    if (!logits || !past_padding_mask || !present_padding_mask) goto cleanup;
+    past_padding_mask[0] = 1;
+    for (int tensor = 0; tensor < SPLIT_CACHE_TENSORS; tensor++) {
+        past_kv[tensor] = (float*)calloc(
+            maximum_cache_elements, sizeof(*past_kv[tensor]));
+        present_kv[tensor] = (float*)malloc(
+            maximum_cache_elements * sizeof(*present_kv[tensor]));
+        if (!past_kv[tensor] || !present_kv[tensor]) goto cleanup;
     }
-    for (int index = 0; index < SPLIT_DECODER_LENGTH; index++) {
-        decoder_ids[index] = vocab->pad;
-        decoder_keep[index] = 0;
-    }
-    decoder_ids[0] = vocab->bos;
-    decoder_keep[0] = 1;
+    current_token = vocab->bos;
     family_id = encoded->selected_family_id;
-
-    /* Cross-attention inputs are intentionally uploaded once. Re-uploading
-     * either after seed marks retained K/V state dirty and defeats row mode. */
-    if (split_set_input(graph->context, definition->memory, VX_DTYPE_F32,
-                        encoded->memory,
-                        (size_t)SPLIT_MEMORY_LENGTH * SPLIT_MODEL_WIDTH * sizeof(float)) != 0 ||
-        split_set_input(graph->context, definition->memory_padding_mask, VX_DTYPE_I32,
-                        encoded->memory_padding_mask,
-                        (size_t)SPLIT_MEMORY_LENGTH * sizeof(int32_t)) != 0 ||
-        split_set_input(graph->context, definition->decoder_input_ids, VX_DTYPE_I32,
-                        decoder_ids, sizeof(decoder_ids)) != 0 ||
-        (definition->family_ids[0] &&
-         split_set_input(graph->context, definition->family_ids, VX_DTYPE_I32,
-                         &family_id, sizeof(family_id)) != 0) ||
-        (definition->v4_keep[0] &&
-         split_set_input(graph->context, definition->v4_keep, VX_DTYPE_I32,
-                         decoder_keep, sizeof(decoder_keep)) != 0)) goto cleanup;
-
-    if (!ordinary && !no_kv) {
-        VxStatus status;
-        report = (VxReport)VX_REPORT_INIT;
-        status = vx_execution_context_decode_reset(graph->context, &report);
-        if (status != VX_STATUS_OK) {
-            split_report_failure("decoder reset", status, &report);
-            goto cleanup;
-        }
-        if (debug) fprintf(stderr, "[debug] tinyreceipt split decode reset %s\n",
-                           report.decode_state[0] ? report.decode_state : "complete");
-    }
-
+    if (evidence) evidence->target_length = max_new + 1;
     generation_started = split_now_ms();
     for (int step = 0; step < max_new; step++) {
+        SplitBindingBatch bindings = {0};
+        const int present_length = past_length + 1;
+        const int32_t position_id = past_length - 1;
+        const int64_t token_shape[] = {1, 1};
+        const int64_t scalar_shape[] = {1};
+        const int64_t memory_mask_shape[] = {1, encoded->memory_length};
+        const int64_t past_mask_shape[] = {1, past_length};
+        const int64_t cross_shape[] = {
+            1, SPLIT_CACHE_HEADS, encoded->memory_length, SPLIT_CACHE_HEAD_WIDTH,
+        };
+        const int64_t past_shape[] = {
+            1, SPLIT_CACHE_HEADS, past_length, SPLIT_CACHE_HEAD_WIDTH,
+        };
+        const int64_t logits_shape[] = {1, 1, vocab->count};
+        const int64_t present_mask_shape[] = {1, present_length};
+        const int64_t present_shape[] = {
+            1, SPLIT_CACHE_HEADS, present_length, SPLIT_CACHE_HEAD_WIDTH,
+        };
+        const size_t cross_bytes = (size_t)SPLIT_CACHE_HEADS *
+            (size_t)encoded->memory_length * SPLIT_CACHE_HEAD_WIDTH * sizeof(float);
+        const size_t past_bytes = (size_t)SPLIT_CACHE_HEADS *
+            (size_t)past_length * SPLIT_CACHE_HEAD_WIDTH * sizeof(float);
+        const size_t present_bytes = (size_t)SPLIT_CACHE_HEADS *
+            (size_t)present_length * SPLIT_CACHE_HEAD_WIDTH * sizeof(float);
         VxStatus status;
-        double step_started = split_now_ms();
-        double step_ms;
-        int row = prefix_length - 1;
         int32_t next;
-        if (ordinary || no_kv) {
-            if (split_set_input(graph->context, definition->decoder_input_ids,
-                                VX_DTYPE_I32, decoder_ids, sizeof(decoder_ids)) != 0 ||
-                (definition->v4_keep[0] &&
-                 split_set_input(graph->context, definition->v4_keep,
-                                 VX_DTYPE_I32, decoder_keep,
-                                 sizeof(decoder_keep)) != 0))
-                goto cleanup;
-            report = (VxReport)VX_REPORT_INIT;
-            status = no_kv
-                ? vx_execution_context_execute_prefix(
-                      graph->context, prefix_length, &result, &report)
-                : vx_execution_context_execute(graph->context, &result, &report);
-        } else if (step == 0) {
-            report = (VxReport)VX_REPORT_INIT;
-            status = vx_execution_context_decode_seed(graph->context, &result, &report);
-        } else {
-            /* Only the decoder IDs and an optional hoisted keep mask change
-             * after seed. Family routing and cross-attention inputs stay clean. */
-            if (split_set_input(graph->context, definition->decoder_input_ids,
-                                VX_DTYPE_I32, decoder_ids, sizeof(decoder_ids)) != 0 ||
-                (definition->v4_keep[0] &&
-                 split_set_input(graph->context, definition->v4_keep,
-                                 VX_DTYPE_I32, decoder_keep,
-                                 sizeof(decoder_keep)) != 0))
-                goto cleanup;
-            report = (VxReport)VX_REPORT_INIT;
-            status = vx_execution_context_decode_step(graph->context, row,
-                                                       &result, &report);
+        double step_started;
+        double step_ms;
+        if (past_padding_mask[0] != 1 ||
+            split_validate_decoder_inputs_v1(
+                graph->context, definition, encoded->memory_length,
+                past_length) != 0)
+            goto cleanup;
+        for (int tensor = 0; tensor < SPLIT_CACHE_TENSORS; tensor++) {
+            for (int head = 0; head < SPLIT_CACHE_HEADS; head++) {
+                const size_t sentinel = (size_t)head * (size_t)past_length *
+                    SPLIT_CACHE_HEAD_WIDTH;
+                for (int width = 0; width < SPLIT_CACHE_HEAD_WIDTH; width++) {
+                    if (past_kv[tensor][sentinel + (size_t)width] != 0.0f) {
+                        fprintf(stderr,
+                                "[tinyreceipt] explicit KV sentinel changed before step %d\n",
+                                step);
+                        goto cleanup;
+                    }
+                }
+            }
         }
+        if (split_add_input(graph->context, &bindings,
+                            definition->decoder_input_ids, VX_DTYPE_I32,
+                            token_shape, 2, &current_token,
+                            sizeof(current_token)) != 0 ||
+            split_add_input(graph->context, &bindings, definition->position_ids,
+                            VX_DTYPE_I32, scalar_shape, 1, &position_id,
+                            sizeof(position_id)) != 0 ||
+            split_add_input(graph->context, &bindings, definition->family_ids,
+                            VX_DTYPE_I32, scalar_shape, 1, &family_id,
+                            sizeof(family_id)) != 0 ||
+            split_add_input(graph->context, &bindings,
+                            definition->memory_padding_mask, VX_DTYPE_I32,
+                            memory_mask_shape, 2, encoded->memory_padding_mask,
+                            (size_t)encoded->memory_length * sizeof(int32_t)) != 0 ||
+            split_add_input(graph->context, &bindings,
+                            definition->past_padding_mask, VX_DTYPE_I32,
+                            past_mask_shape, 2, past_padding_mask,
+                            (size_t)past_length * sizeof(int32_t)) != 0)
+            goto cleanup;
+        for (int tensor = 0; tensor < SPLIT_CACHE_TENSORS; tensor++) {
+            if (split_add_input(graph->context, &bindings,
+                                definition->cross_kv[tensor], VX_DTYPE_F32,
+                                cross_shape, 4, encoded->cross_kv[tensor],
+                                cross_bytes) != 0 ||
+                split_add_input(graph->context, &bindings,
+                                definition->past_kv[tensor], VX_DTYPE_F32,
+                                past_shape, 4, past_kv[tensor], past_bytes) != 0)
+                goto cleanup;
+        }
+        step_started = split_now_ms();
+        report = (VxReport)VX_REPORT_INIT;
+        status = vx_execution_context_execute(
+            graph->context, bindings.values, bindings.count, &result, &report);
         step_ms = split_now_ms() - step_started;
         if (status != VX_STATUS_OK) {
-            split_report_failure(no_kv ? "no-KV prefix decoder execution" :
-                                 (ordinary ? "ordinary decoder execution" :
-                                 (step == 0 ? "decoder seed" : "decoder step")),
-                                 status, &report);
+            split_report_failure("explicit KV decoder execution", status, &report);
             goto cleanup;
         }
-        if (split_exact_outputs(result, output_names, 1, "decoder") != 0)
+        if (split_report_proves_strict_backend(
+                graph, &report, "decoder execution") != 0)
             goto cleanup;
-        if (definition->output_kind == SPLIT_DECODER_OUTPUT_TOKEN_IDS) {
-            if (split_read_output(result, definition->token_ids, VX_DTYPE_I32,
-                                  token_shape, 2, token_ids, sizeof(token_ids),
-                                  "decoder token_ids") != 0) goto cleanup;
-            next = token_ids[row];
-        } else {
-            if (split_read_output(
-                    result, definition->logits, VX_DTYPE_F32, logits_shape, 3,
-                    logits,
-                    (size_t)SPLIT_DECODER_LENGTH * (size_t)vocab->count *
-                        sizeof(*logits),
-                    "decoder logits") != 0 ||
-                split_argmax_logits_row(logits, row, vocab->count, &next) != 0)
+        if (split_exact_outputs(result, output_names,
+                                2 + SPLIT_CACHE_TENSORS, "decoder") != 0 ||
+            split_read_output(result, definition->logits, VX_DTYPE_F32,
+                              logits_shape, 3, logits,
+                              (size_t)vocab->count * sizeof(*logits),
+                              "decoder logits") != 0 ||
+            split_read_output(result, definition->present_padding_mask,
+                              VX_DTYPE_I32, present_mask_shape, 2,
+                              present_padding_mask,
+                              (size_t)present_length * sizeof(int32_t),
+                              "decoder present_padding_mask") != 0 ||
+            split_argmax_logits_row(logits, 0, vocab->count, &next) != 0)
+            goto cleanup;
+        for (int index = 0; index < present_length; index++) {
+            if ((present_padding_mask[index] != 0 &&
+                 present_padding_mask[index] != 1) ||
+                (index < past_length &&
+                 present_padding_mask[index] != past_padding_mask[index])) {
+                fprintf(stderr,
+                        "[tinyreceipt] explicit KV present mask did not preserve its past prefix\n");
                 goto cleanup;
+            }
         }
-        vx_result_release(result);
-        result = NULL;
-        if (step == 0) seed_ms = step_ms;
-        else {
-            steady_ms += step_ms;
-            steady_steps++;
-        }
-        if (next < 0 || next >= vocab->count) {
-            fprintf(stderr, "[tinyreceipt] decoder emitted out-of-vocabulary token %d\n",
-                    next);
+        if (present_padding_mask[0] != 1 ||
+            present_padding_mask[past_length] !=
+                (current_token == vocab->pad ? 1 : 0)) {
+            fprintf(stderr,
+                    "[tinyreceipt] explicit KV sentinel/current mask lifecycle is invalid\n");
             goto cleanup;
+        }
+        for (int tensor = 0; tensor < SPLIT_CACHE_TENSORS; tensor++) {
+            if (split_read_output(result, definition->present_kv[tensor],
+                                  VX_DTYPE_F32, present_shape, 4,
+                                  present_kv[tensor], present_bytes,
+                                  k_split_present_semantics[tensor]) != 0)
+                goto cleanup;
+            for (int head = 0; head < SPLIT_CACHE_HEADS; head++) {
+                const size_t past_offset = (size_t)head * (size_t)past_length *
+                    SPLIT_CACHE_HEAD_WIDTH;
+                const size_t present_offset = (size_t)head *
+                    (size_t)present_length * SPLIT_CACHE_HEAD_WIDTH;
+                const size_t prefix_bytes = (size_t)past_length *
+                    SPLIT_CACHE_HEAD_WIDTH * sizeof(float);
+                if (memcmp(present_kv[tensor] + present_offset,
+                           past_kv[tensor] + past_offset,
+                           prefix_bytes) != 0) {
+                    fprintf(stderr,
+                            "[tinyreceipt] explicit KV %s did not preserve its past prefix\n",
+                            k_split_present_semantics[tensor]);
+                    goto cleanup;
+                }
+                for (int width = 0; width < SPLIT_CACHE_HEAD_WIDTH; width++) {
+                    const float appended = present_kv[tensor][
+                        present_offset + (size_t)past_length *
+                            SPLIT_CACHE_HEAD_WIDTH + (size_t)width];
+                    if (!isfinite(appended) ||
+                        present_kv[tensor][present_offset + (size_t)width] != 0.0f) {
+                        fprintf(stderr,
+                                "[tinyreceipt] explicit KV %s has an invalid sentinel or append\n",
+                                k_split_present_semantics[tensor]);
+                        goto cleanup;
+                    }
+                }
+            }
+        }
+        token_digest ^= (uint32_t)next;
+        token_digest *= UINT64_C(1099511628211);
+        emitted_ids[emitted++] = next;
+        if (evidence) {
+            if (step == 0) {
+                evidence->decoder_seed_result_bytes = report.result_bytes;
+                evidence->decoder_seed_ms = report.execution_time_ms;
+                evidence->decoder_seed_past_length = past_length;
+                evidence->decoder_seed_present_length = present_length;
+                snprintf(evidence->decoder_seed_route,
+                         sizeof(evidence->decoder_seed_route), "%s",
+                         report.route_evidence);
+            } else {
+                evidence->decoder_step_result_bytes = report.result_bytes;
+                evidence->decoder_warm_ms = report.execution_time_ms;
+                evidence->decoder_step_past_length = past_length;
+                evidence->decoder_step_present_length = present_length;
+                snprintf(evidence->decoder_step_route,
+                         sizeof(evidence->decoder_step_route), "%s",
+                         report.route_evidence);
+            }
+            evidence->explicit_kv_sentinel_preserved = 1;
         }
         if (debug) {
             fprintf(stderr,
-                    "[debug] tinyreceipt split family=%s step=%d row=%d token=%d time=%.3f ms%s%s\n",
-                    k_split_family_names[encoded->selected_family_id], step, row, next,
-                    step_ms, report.decode_state[0] ? " decode=" : "",
-                    report.decode_state[0] ? report.decode_state :
-                        (no_kv ? "no-kv-prefix" :
-                         (ordinary ? "ordinary" : "")));
+                    "[debug] tinyreceipt explicit-kv family=%s step=%d P=%d R=%d token=%d time=%.3f ms\n",
+                    k_split_family_names[encoded->selected_family_id], step,
+                    past_length, present_length, next, step_ms);
+            fprintf(stderr, "[debug] tinyreceipt split decoder shape %s\n",
+                    report.route_evidence);
+        }
+        vx_result_release(result);
+        result = NULL;
+        for (int tensor = 0; tensor < SPLIT_CACHE_TENSORS; tensor++) {
+            float* swap = past_kv[tensor];
+            past_kv[tensor] = present_kv[tensor];
+            present_kv[tensor] = swap;
+        }
+        {
+            int32_t* swap = past_padding_mask;
+            past_padding_mask = present_padding_mask;
+            present_padding_mask = swap;
+        }
+        past_length = present_length;
+        if (next < 0 || next >= vocab->count) {
+            fprintf(stderr,
+                    "[tinyreceipt] decoder emitted out-of-vocabulary token %d\n",
+                    next);
+            goto cleanup;
         }
         if (next == vocab->eos) break;
-        if (vocab->kind == SPLIT_TOKENIZER_BYTE_FALLBACK_BPE) {
-            generated_ids[generated] = next;
-        } else {
-            if (next != vocab->pad && next != vocab->bos)
-                fputs(vocab->items[next], stdout);
-            fflush(stdout);
-        }
-        generated++;
-        if (prefix_length >= SPLIT_DECODER_LENGTH) {
-            fprintf(stderr, "[tinyreceipt] decoder prefix exhausted its fixed sequence\n");
-            goto cleanup;
-        }
-        decoder_ids[prefix_length] = next;
-        decoder_keep[prefix_length] = 1;
-        prefix_length++;
+        generated_ids[generated++] = next;
+        current_token = next;
     }
-    if (vocab->kind == SPLIT_TOKENIZER_BYTE_FALLBACK_BPE) {
-        if (split_vocab_decode_alloc(vocab, generated_ids, (size_t)generated,
-                                     &decoded, &decoded_length) != 0 ||
-            (decoded_length > 0 &&
-             fwrite(decoded, 1, decoded_length, stdout) != decoded_length))
-            goto cleanup;
+    if (split_vocab_decode_alloc(vocab, generated_ids, (size_t)generated,
+                                 &decoded, &decoded_length) != 0 ||
+        (emit_answer && decoded_length > 0 &&
+         fwrite(decoded, 1, decoded_length, stdout) != decoded_length))
+        goto cleanup;
+    if (emit_answer) {
         fflush(stdout);
+        fputc('\n', stdout);
     }
-    fputc('\n', stdout);
     if (debug) {
-        double total_ms = split_now_ms() - generation_started;
-        double tokens_per_second = generated > 0 && total_ms > 0.0 ?
-            (double)generated * 1000.0 / total_ms : 0.0;
-        double steady_mean_ms = steady_steps > 0 ?
-            steady_ms / (double)steady_steps : 0.0;
-        double steady_tokens_per_second = steady_ms > 0.0 ?
-            (double)steady_steps * 1000.0 / steady_ms : 0.0;
+        const double total_ms = split_now_ms() - generation_started;
         fprintf(stderr,
-                "[debug] tinyreceipt split family=%s tokens=%d total=%.3f ms tok/s=%.2f (%s)\n",
-                k_split_family_names[encoded->selected_family_id], generated,
-                total_ms, tokens_per_second,
-                no_kv ? "no-kv growing-prefix execution" :
-                    (ordinary ? "ordinary full-tensor execution" :
-                                "incremental retained execution context"));
-        fprintf(stderr,
-                "[debug] tinyreceipt split timing encoder=%.3f ms first=%.3f ms steady_steps=%d steady_mean=%.3f ms steady_tok/s=%.2f\n",
-                encoded->execution_ms, seed_ms, steady_steps, steady_mean_ms,
-                steady_tokens_per_second);
+                "[debug] tinyreceipt explicit-kv family=%s tokens=%d total=%.3f ms\n",
+                k_split_family_names[encoded->selected_family_id], emitted,
+                total_ms);
+        fprintf(stderr, "[debug] tinyreceipt split emitted_token_ids=");
+        if (emitted == 0) {
+            fputs("none", stderr);
+        } else {
+            for (int index = 0; index < emitted; index++)
+                fprintf(stderr, "%s%d", index == 0 ? "" : ",",
+                        emitted_ids[index]);
+        }
+        fputc('\n', stderr);
+    }
+    if (evidence) {
+        evidence->generated_tokens = emitted;
+        memcpy(evidence->emitted_token_ids, emitted_ids,
+               (size_t)emitted * sizeof(*emitted_ids));
+        evidence->token_digest = token_digest;
     }
     rc = 0;
 
@@ -2763,7 +3278,271 @@ cleanup:
     vx_result_release(result);
     free(decoded);
     free(logits);
+    free(past_padding_mask);
+    free(present_padding_mask);
+    for (int tensor = 0; tensor < SPLIT_CACHE_TENSORS; tensor++) {
+        free(past_kv[tensor]);
+        free(present_kv[tensor]);
+    }
     return rc;
+}
+static int split_qualify_sequence(
+    const char* package_path, const char* image_path,
+    const char* const* prompts, const int32_t* maximum_new_tokens,
+    const int32_t* shape_modes, size_t request_count, const char* backend,
+    int cpu_threads, int debug, TinyReceiptSplitShapeEvidence* evidence) {
+    const char* backends[1];
+    SplitPackage package;
+    SplitVocab vocab;
+    SplitGraph encoder_graph = {0};
+    SplitGraph decoder_graph = {0};
+    SplitEncoderOutput encoded = {0};
+    VxRuntime* runtime = NULL;
+    VxRuntimeOptions runtime_options = VX_RUNTIME_OPTIONS_INIT;
+    VxBackendPolicy policy = VX_BACKEND_POLICY_INIT;
+    VxContextOptions encoder_options = VX_CONTEXT_OPTIONS_INIT;
+    VxContextOptions decoder_options = VX_CONTEXT_OPTIONS_INIT;
+    VxReport report = VX_REPORT_INIT;
+    int rc = -1;
+    if (!package_path || !image_path || !prompts || !maximum_new_tokens ||
+        !shape_modes || !backend || !backend[0] || cpu_threads <= 0 ||
+        !evidence || request_count == 0)
+        return -1;
+    memset(&package, 0, sizeof(package));
+    memset(&vocab, 0, sizeof(vocab));
+    memset(evidence, 0, request_count * sizeof(*evidence));
+    runtime_options.cpu_threads = cpu_threads;
+    policy.mode = VX_BACKEND_REQUIRE;
+    policy.operator_fallback = VX_OPERATOR_FALLBACK_FORBID;
+    backends[0] = backend;
+    policy.backends = backends;
+    policy.backend_count = 1;
+    if (vx_runtime_create(&runtime_options, &runtime, &report) != VX_STATUS_OK ||
+        split_load_package(package_path, &package) != 0 ||
+        split_load_vocab(&package, &vocab) != 0)
+        goto cleanup_sequence;
+    if (split_graph_open(runtime, package.encoder.graph, package.encoder.weights,
+                         &policy, &encoder_options, "encoder", debug,
+                         &encoder_graph) != 0 ||
+        split_graph_open(runtime, package.decoder.graph, package.decoder.weights,
+                         &policy, &decoder_options, "decoder", debug,
+                         &decoder_graph) != 0) goto cleanup_sequence;
+    for (size_t index = 0; index < request_count; index++) {
+        if (!prompts[index] || maximum_new_tokens[index] < 2 ||
+            maximum_new_tokens[index] > SPLIT_MAX_NEW_TOKENS ||
+            (shape_modes[index] != SPLIT_SHAPE_MODE_ACTIVE &&
+             shape_modes[index] != SPLIT_SHAPE_MODE_MAXIMUM_PADDED) ||
+            split_run_encoder(
+                &encoder_graph, &package.encoder, &vocab, image_path,
+                prompts[index], 0, (SplitShapeMode)shape_modes[index], debug,
+                &encoded, &evidence[index]) != 0 ||
+            split_run_decoder(&decoder_graph, &package.decoder, &vocab,
+                              &encoded, maximum_new_tokens[index], debug, 1,
+                              &evidence[index]) != 0)
+            goto cleanup_sequence;
+        split_encoder_output_release(&encoded);
+    }
+    rc = 0;
+
+cleanup_sequence:
+    split_encoder_output_release(&encoded);
+    split_graph_close(&decoder_graph);
+    split_graph_close(&encoder_graph);
+    split_vocab_free(&vocab);
+    if (runtime) (void)vx_runtime_close(runtime, NULL);
+    vx_runtime_release(runtime);
+    return rc;
+}
+
+int tiny_receipt_split_w8a8_qualify_sequence(
+    const char* package_path, const char* image_path,
+    const char* const* prompts, const int32_t* maximum_new_tokens,
+    const int32_t* shape_modes, size_t request_count, const char* backend,
+    TinyReceiptSplitShapeEvidence* evidence) {
+    return split_qualify_sequence(
+        package_path, image_path, prompts, maximum_new_tokens, shape_modes,
+        request_count, backend, 1, 0, evidence);
+}
+
+int tiny_receipt_split_w8a8_profile_sequence(
+    const char* package_path, const char* image_path,
+    const char* const* prompts, const int32_t* maximum_new_tokens,
+    size_t request_count, TinyReceiptSplitShapeEvidence* evidence) {
+    int32_t* shape_modes;
+    int rc;
+    if (!request_count || request_count > SIZE_MAX / sizeof(*shape_modes) ||
+        !(shape_modes = (int32_t*)calloc(request_count, sizeof(*shape_modes))))
+        return -1;
+    rc = tiny_receipt_split_w8a8_qualify_sequence(
+        package_path, image_path, prompts, maximum_new_tokens, shape_modes,
+        request_count, "cpu", evidence);
+    free(shape_modes);
+    return rc;
+}
+
+static int split_run_dynamic_qualification(const SplitCommand* command) {
+    static const char* const prompts[] = {
+        "x", "phone number last one", "phone number last one", "x",
+    };
+    static const int32_t maximum_new_tokens[] = {4, 4, 4, 4};
+    static const int32_t shape_modes[] = {
+        SPLIT_SHAPE_MODE_ACTIVE, SPLIT_SHAPE_MODE_ACTIVE,
+        SPLIT_SHAPE_MODE_MAXIMUM_PADDED, SPLIT_SHAPE_MODE_ACTIVE,
+    };
+    TinyReceiptSplitShapeEvidence evidence[4];
+    const char* backend;
+    if (!command || command->backend_policy.backend_count != 1)
+        return -1;
+    backend = command->backend_policy.backends[0];
+    if (split_qualify_sequence(
+            command->package_arg, command->image_path, prompts,
+            maximum_new_tokens, shape_modes, 4, backend,
+            command->runtime_options.cpu_threads > 0 ?
+                command->runtime_options.cpu_threads : 1,
+            1, evidence) != 0)
+        return -1;
+    if (evidence[0].question_length >= evidence[1].question_length ||
+        evidence[1].question_length != evidence[2].question_length ||
+        evidence[1].memory_length == SPLIT_MEMORY_LENGTH ||
+        evidence[2].memory_length != SPLIT_MEMORY_LENGTH ||
+        evidence[3].question_length != evidence[0].question_length ||
+        evidence[3].memory_length != evidence[0].memory_length ||
+        evidence[3].selected_family_id != evidence[0].selected_family_id ||
+        evidence[3].token_digest != evidence[0].token_digest ||
+        evidence[2].selected_family_id != evidence[1].selected_family_id ||
+        evidence[2].token_digest != evidence[1].token_digest) {
+        fprintf(stderr, "[tinyreceipt] dynamic qualification parity failed\n");
+        return -1;
+    }
+    for (size_t index = 0; index < 4; index++) {
+        const TinyReceiptSplitShapeEvidence* item = &evidence[index];
+        const int bound_q = item->memory_length - SPLIT_IMAGE_TOKENS;
+        if (item->generated_tokens < 2 ||
+            item->decoder_seed_past_length != 1 ||
+            item->decoder_seed_present_length != 2 ||
+            item->decoder_step_past_length < 2 ||
+            item->decoder_step_present_length != item->decoder_step_past_length + 1 ||
+            !item->explicit_kv_sentinel_preserved) {
+            fprintf(stderr, "[tinyreceipt] dynamic qualification cache lifecycle failed\n");
+            return -1;
+        }
+        printf("DYNAMIC_REBIND_RUN index=%zu mode=%s logical_Q=%d bound_Q=%d "
+               "logical_M=%d bound_M=%d family_id=%d tokens=%d token_digest=%016llx "
+               "token_ids=",
+               index,
+               item->shape_mode == SPLIT_SHAPE_MODE_MAXIMUM_PADDED ?
+                   "maximum-padded" : "active",
+               item->question_length, bound_q,
+               item->question_length + SPLIT_IMAGE_TOKENS, item->memory_length,
+               item->selected_family_id, item->generated_tokens,
+               (unsigned long long)item->token_digest);
+        for (int token = 0; token < item->generated_tokens; token++)
+            printf("%s%d", token == 0 ? "" : ",",
+                   item->emitted_token_ids[token]);
+        printf(" seed_P=%d seed_R=%d step_P=%d step_R=%d cache_preserved=1\n",
+               item->decoder_seed_past_length, item->decoder_seed_present_length,
+               item->decoder_step_past_length, item->decoder_step_present_length);
+    }
+    printf("DYNAMIC_REBIND_RESULT status=pass backend=%s timed=0 same_runtime=1 "
+           "same_encoder_context=1 same_decoder_context=1 strict_no_fallback=1 "
+           "cpu_threads=%d\n",
+           backend,
+           command->runtime_options.cpu_threads > 0 ?
+               command->runtime_options.cpu_threads : 1);
+    return 0;
+}
+
+static int split_request_evidence_is_valid(
+        const TinyReceiptSplitShapeEvidence* evidence, int max_new) {
+    if (!evidence || max_new < 0 ||
+        evidence->target_length != max_new + 1 ||
+        evidence->question_length < 1 ||
+        (evidence->shape_mode == SPLIT_SHAPE_MODE_ACTIVE &&
+         evidence->memory_length !=
+             evidence->question_length + SPLIT_IMAGE_TOKENS) ||
+        (evidence->shape_mode == SPLIT_SHAPE_MODE_MAXIMUM_PADDED &&
+         evidence->memory_length != SPLIT_MEMORY_LENGTH) ||
+        (evidence->shape_mode != SPLIT_SHAPE_MODE_ACTIVE &&
+         evidence->shape_mode != SPLIT_SHAPE_MODE_MAXIMUM_PADDED) ||
+        evidence->selected_family_id < 0 ||
+        evidence->selected_family_id >= SPLIT_FAMILY_COUNT ||
+        evidence->generated_tokens < 0 ||
+        evidence->generated_tokens > max_new)
+        return 0;
+    if (evidence->generated_tokens == 0) {
+        return evidence->decoder_seed_past_length == 0 &&
+            evidence->decoder_seed_present_length == 0 &&
+            evidence->decoder_step_past_length == 0 &&
+            evidence->decoder_step_present_length == 0 &&
+            evidence->explicit_kv_sentinel_preserved == 0;
+    }
+    if (evidence->decoder_seed_past_length != 1 ||
+        evidence->decoder_seed_present_length != 2 ||
+        !evidence->explicit_kv_sentinel_preserved)
+        return 0;
+    if (evidence->generated_tokens == 1) {
+        return evidence->decoder_step_past_length == 0 &&
+            evidence->decoder_step_present_length == 0;
+    }
+    return evidence->decoder_step_past_length == evidence->generated_tokens &&
+        evidence->decoder_step_present_length == evidence->generated_tokens + 1;
+}
+
+static int split_request_evidence_has_parity(
+        const TinyReceiptSplitShapeEvidence* expected,
+        const TinyReceiptSplitShapeEvidence* actual) {
+    if (!expected || !actual ||
+        expected->shape_mode != actual->shape_mode ||
+        expected->question_length != actual->question_length ||
+        expected->target_length != actual->target_length ||
+        expected->memory_length != actual->memory_length ||
+        expected->selected_family_id != actual->selected_family_id ||
+        expected->generated_tokens != actual->generated_tokens ||
+        expected->token_digest != actual->token_digest ||
+        expected->decoder_seed_past_length !=
+            actual->decoder_seed_past_length ||
+        expected->decoder_seed_present_length !=
+            actual->decoder_seed_present_length ||
+        expected->decoder_step_past_length !=
+            actual->decoder_step_past_length ||
+        expected->decoder_step_present_length !=
+            actual->decoder_step_present_length ||
+        expected->explicit_kv_sentinel_preserved !=
+            actual->explicit_kv_sentinel_preserved)
+        return 0;
+    return memcmp(expected->emitted_token_ids, actual->emitted_token_ids,
+                  (size_t)expected->generated_tokens *
+                      sizeof(*expected->emitted_token_ids)) == 0;
+}
+
+static void split_emit_warmup_result(
+        int count, const TinyReceiptSplitShapeEvidence* evidence) {
+    int last_past = 0;
+    int last_present = 0;
+    if (evidence->generated_tokens == 1) {
+        last_past = evidence->decoder_seed_past_length;
+        last_present = evidence->decoder_seed_present_length;
+    } else if (evidence->generated_tokens > 1) {
+        last_past = evidence->decoder_step_past_length;
+        last_present = evidence->decoder_step_present_length;
+    }
+    printf("WARMUP_RESULT status=pass count=%d warmup_timed=0 measured_runs=1 "
+           "same_runtime=1 same_encoder_context=1 same_decoder_context=1 "
+           "strict_no_fallback=1 token_parity=1 cache_parity=1 cache_reset=1 "
+           "family_id=%d tokens=%d token_digest=%016llx token_ids=",
+           count, evidence->selected_family_id, evidence->generated_tokens,
+           (unsigned long long)evidence->token_digest);
+    if (evidence->generated_tokens == 0) {
+        fputs("none", stdout);
+    } else {
+        for (int index = 0; index < evidence->generated_tokens; index++)
+            printf("%s%d", index == 0 ? "" : ",",
+                   evidence->emitted_token_ids[index]);
+    }
+    printf(" seed_P=%d seed_R=%d last_P=%d last_R=%d cache_preserved=%d\n",
+           evidence->decoder_seed_past_length,
+           evidence->decoder_seed_present_length, last_past, last_present,
+           evidence->explicit_kv_sentinel_preserved);
 }
 
 int tiny_receipt_split_w8a8_run(int argc, char** argv) {
@@ -2777,6 +3556,8 @@ int tiny_receipt_split_w8a8_run(int argc, char** argv) {
     VxContextOptions encoder_options = VX_CONTEXT_OPTIONS_INIT;
     VxContextOptions decoder_options = VX_CONTEXT_OPTIONS_INIT;
     VxReport report = VX_REPORT_INIT;
+    TinyReceiptSplitShapeEvidence warmup_reference = {0};
+    TinyReceiptSplitShapeEvidence request_evidence = {0};
     int emit_timing = 0;
     int rc = 1;
     memset(&command, 0, sizeof(command));
@@ -2809,16 +3590,29 @@ int tiny_receipt_split_w8a8_run(int argc, char** argv) {
                 fprintf(stderr, "[tinyreceipt] --max-new must be an integer from 0 through 191\n");
                 return 2;
             }
-        } else if (!strcmp(arg, "--incremental")) {
-            command.incremental_explicit = 1;
-        } else if (!strcmp(arg, "--ordinary")) {
-            command.ordinary = 1;
-        } else if (!strcmp(arg, "--no-kv")) {
-            command.no_kv = 1;
-        } else if (!strcmp(arg, "--require-row")) {
-            command.require_row = 1;
+        } else if (!strcmp(arg, "--shape-mode") && index + 1 < argc) {
+            const char* mode = argv[++index];
+            if (!strcmp(mode, "active")) {
+                command.shape_mode = SPLIT_SHAPE_MODE_ACTIVE;
+            } else if (!strcmp(mode, "maximum-padded")) {
+                command.shape_mode = SPLIT_SHAPE_MODE_MAXIMUM_PADDED;
+            } else {
+                fprintf(stderr,
+                        "[tinyreceipt] --shape-mode must be active or maximum-padded\n");
+                return 2;
+            }
         } else if (!strcmp(arg, "--timing")) {
             command.timing = 1;
+        } else if (!strcmp(arg, "--warmup")) {
+            if (index + 1 >= argc ||
+                split_parse_nonnegative(argv[++index], SPLIT_MAX_WARMUP_RUNS,
+                                        &command.warmup) != 0) {
+                fprintf(stderr,
+                        "[tinyreceipt] --warmup must be an integer from 0 through 20\n");
+                return 2;
+            }
+        } else if (!strcmp(arg, "--qualify-dynamic")) {
+            command.qualify_dynamic = 1;
         } else if (!strcmp(arg, "--threads")) {
             int threads;
             if (index + 1 >= argc ||
@@ -2835,40 +3629,27 @@ int tiny_receipt_split_w8a8_run(int argc, char** argv) {
             return 2;
         }
     }
-    if (!command.image_path || !command.prompt) {
-        fprintf(stderr, "[tinyreceipt] --image and --prompt are required\n");
+    if (!command.image_path || (!command.qualify_dynamic && !command.prompt)) {
+        fprintf(stderr,
+                "[tinyreceipt] --image and either --prompt or --qualify-dynamic are required\n");
         split_help(argv[0]);
         return 2;
     }
-    if (command.ordinary && command.incremental_explicit) {
-        fprintf(stderr, "[tinyreceipt] --ordinary and --incremental are mutually exclusive\n");
-        return 2;
+    if (command.qualify_dynamic) {
+        if (command.backend_policy.backend_count != 1) {
+            fprintf(stderr,
+                    "[tinyreceipt] --qualify-dynamic requires one explicit backend\n");
+            return 2;
+        }
+        return split_run_dynamic_qualification(&command) == 0 ? 0 : 1;
     }
-    if (command.no_kv && command.incremental_explicit) {
-        fprintf(stderr, "[tinyreceipt] --no-kv and --incremental are mutually exclusive\n");
+    if (command.backend_policy.backend_count == 0 &&
+        split_select_backend(&command, "cpu") < 0)
         return 2;
-    }
-    if (command.no_kv && command.ordinary) {
-        fprintf(stderr, "[tinyreceipt] --no-kv and --ordinary are mutually exclusive\n");
-        return 2;
-    }
-    if (command.ordinary && command.require_row) {
-        fprintf(stderr, "[tinyreceipt] --ordinary and --require-row are mutually exclusive\n");
-        return 2;
-    }
-    if (command.no_kv && command.require_row) {
-        fprintf(stderr, "[tinyreceipt] --no-kv and --require-row are mutually exclusive\n");
-        return 2;
-    }
     command.family_id = split_family_id(command.family);
     if (command.family_id == -2) {
         fprintf(stderr, "[tinyreceipt] unknown family: %s\n", command.family);
         return 2;
-    }
-    if (!command.ordinary && !command.no_kv) {
-        decoder_options.decode_row_mode = command.require_row ?
-            VX_DECODE_ROW_REQUIRED : VX_DECODE_ROW_AUTO;
-        decoder_options.require_incremental = 1;
     }
     emit_timing = command.timing || command.runtime_options.debug;
     printf("VolvoxAI Native Runtime\n");
@@ -2884,24 +3665,13 @@ int tiny_receipt_split_w8a8_run(int argc, char** argv) {
     if (split_load_package(command.package_arg, &package) != 0) goto cleanup;
     if (emit_timing) {
         fprintf(stderr,
-                "[debug] tinyreceipt split ABI routing=%s decoder_output=%s keep_input=%s argmax=%s\n",
-                package.runtime_family ? "runtime" : "specialized",
-                package.decoder.output_kind == SPLIT_DECODER_OUTPUT_TOKEN_IDS ?
-                    "token_ids" : "f32_logits",
-                package.decoder.v4_keep[0] ? "hoisted" : "derived",
-                package.decoder.output_kind == SPLIT_DECODER_OUTPUT_TOKEN_IDS ?
-                    "graph" : "host-first-index");
-    }
-    if (!package.runtime_family) {
-        if (command.family_id >= 0 &&
-            command.family_id != package.specialized_family_id) {
-            fprintf(stderr,
-                    "[tinyreceipt] package is specialized for %s, but --family requested %s\n",
-                    k_split_family_names[package.specialized_family_id],
-                    k_split_family_names[command.family_id]);
-            goto cleanup;
-        }
-        command.family_id = package.specialized_family_id;
+                "[debug] tinyreceipt split ABI=%s routing=%s decoder_output=%s shape_mode=%s argmax=%s\n",
+                "explicit-kv-v1",
+                "runtime",
+                "f32_logits",
+                command.shape_mode == SPLIT_SHAPE_MODE_MAXIMUM_PADDED ?
+                    "maximum-padded" : "active",
+                "host-first-index");
     }
     if (split_load_vocab(&package, &vocab) != 0 ||
         split_graph_open(runtime, package.encoder.graph, package.encoder.weights,
@@ -2909,18 +3679,64 @@ int tiny_receipt_split_w8a8_run(int argc, char** argv) {
                          emit_timing, &encoder_graph) != 0 ||
         split_graph_open(runtime, package.decoder.graph, package.decoder.weights,
                          &command.backend_policy, &decoder_options, "decoder",
-                         emit_timing, &decoder_graph) != 0 ||
+                         emit_timing, &decoder_graph) != 0)
+        goto cleanup;
+    for (int index = 0; index < command.warmup; index++) {
+        memset(&request_evidence, 0, sizeof(request_evidence));
+        if (split_run_encoder(
+                &encoder_graph, &package.encoder, &vocab,
+                command.image_path, command.prompt, command.family_id,
+                command.shape_mode, 0, &encoded, &request_evidence) != 0 ||
+            split_run_decoder(
+                &decoder_graph, &package.decoder, &vocab, &encoded,
+                command.max_new, 0, 0, &request_evidence) != 0 ||
+            !split_request_evidence_is_valid(
+                &request_evidence, command.max_new) ||
+            (index > 0 && !split_request_evidence_has_parity(
+                &warmup_reference, &request_evidence))) {
+            fprintf(stderr,
+                    "[tinyreceipt] same-context warmup correctness/parity failed\n");
+            goto cleanup;
+        }
+        if (index == 0) warmup_reference = request_evidence;
+        split_encoder_output_release(&encoded);
+    }
+    memset(&request_evidence, 0, sizeof(request_evidence));
+    if (
         split_run_encoder(&encoder_graph, &package.encoder, &vocab,
                           command.image_path, command.prompt, command.family_id,
-                          emit_timing, &encoded) != 0 ||
+                          command.shape_mode, emit_timing, &encoded,
+                          command.warmup > 0 ? &request_evidence : NULL) != 0 ||
         split_run_decoder(&decoder_graph, &package.decoder, &vocab, &encoded,
-                          command.max_new, command.ordinary, command.no_kv,
-                          emit_timing) != 0) goto cleanup;
+                          command.max_new, emit_timing, 1,
+                          command.warmup > 0 ? &request_evidence : NULL) != 0)
+        goto cleanup;
+    if (command.warmup > 0 &&
+        (!split_request_evidence_is_valid(&request_evidence, command.max_new) ||
+         !split_request_evidence_has_parity(
+             &warmup_reference, &request_evidence))) {
+        fprintf(stderr,
+                "[tinyreceipt] measured request differs from same-context warmup\n");
+        goto cleanup;
+    }
+    if (emit_timing) {
+        const int bound_question_length =
+            encoded.memory_length - SPLIT_IMAGE_TOKENS;
+        const int logical_target_length = command.max_new + 1;
+        fprintf(stderr,
+                "[debug] tinyreceipt split shape mode=%s logical_Q=%d bound_Q=%d logical_M=%d bound_M=%d seed_P=1 maximum_R=%d\n",
+                command.shape_mode == SPLIT_SHAPE_MODE_MAXIMUM_PADDED ?
+                    "maximum-padded" : "active",
+                encoded.question_length, bound_question_length,
+                encoded.question_length + SPLIT_IMAGE_TOKENS,
+                encoded.memory_length, logical_target_length);
+    }
+    if (command.warmup > 0)
+        split_emit_warmup_result(command.warmup, &request_evidence);
     rc = 0;
 
 cleanup:
-    free(encoded.memory);
-    free(encoded.memory_padding_mask);
+    split_encoder_output_release(&encoded);
     split_graph_close(&decoder_graph);
     split_graph_close(&encoder_graph);
     split_vocab_free(&vocab);

@@ -35,6 +35,12 @@ from ..generated.kernel_registry import (
 )
 from ..generated.optimizer_registry import KERNEL_REGISTRY_SHA256
 from ..ir import GraphIR, IRDialect, OpNode
+from ..portable_domain import (
+    PortableDomainProofError,
+    PortableGraphDomainProof,
+    prove_portable_graph_domain,
+    runtime_weights_fingerprint,
+)
 from ..runtime_ir import export_runtime_package
 from .quantized_regions import (
     QuantizedRegionCandidateAnalysis,
@@ -90,13 +96,46 @@ class KernelPredicateContext:
     """Read-only inputs supplied to one physical kernel predicate."""
 
     predicate_id: str
+    kernel_variant_id: str
     graph: GraphIR
     node: OpNode
     tensors: Mapping[str, Any]
     target: TargetEnvironment
     source_graph_fingerprint: str
     source_weights_fingerprint: str
+    shape_domain_proof: PortableGraphDomainProof
+    shape_function_id: str
     kernel_registry_sha256: str = KERNEL_REGISTRY_SHA256
+
+    def __post_init__(self) -> None:
+        for value, label in (
+            (self.predicate_id, "kernel predicate ID"),
+            (self.kernel_variant_id, "kernel variant ID"),
+            (self.source_graph_fingerprint, "predicate graph fingerprint"),
+            (self.source_weights_fingerprint, "predicate weights fingerprint"),
+            (self.shape_function_id, "predicate shape function ID"),
+            (self.kernel_registry_sha256, "predicate kernel registry hash"),
+        ):
+            _text(value, label)
+        if not isinstance(self.graph, GraphIR) or not isinstance(self.node, OpNode):
+            raise TypeError("kernel predicate context requires typed graph and node")
+        if not isinstance(self.tensors, Mapping):
+            raise TypeError("kernel predicate context requires a tensor mapping")
+        if not isinstance(self.target, TargetEnvironment):
+            raise TypeError("kernel predicate context requires a target environment")
+        if not isinstance(self.shape_domain_proof, PortableGraphDomainProof):
+            raise TypeError("kernel predicate context requires a shape-domain proof")
+        if self.graph.fingerprint() != self.source_graph_fingerprint:
+            raise ValueError("kernel predicate graph fingerprint is stale")
+        if self.shape_domain_proof.weights_fingerprint != self.source_weights_fingerprint:
+            raise ValueError("kernel predicate shape proof names different weights")
+        node_proof = self.shape_domain_proof.node(self.node.name)
+        if (
+            node_proof is None
+            or node_proof.operator != self.node.op_type
+            or node_proof.shape_function_id != self.shape_function_id
+        ):
+            raise ValueError("kernel predicate shape proof does not match its node")
 
 
 @dataclass(frozen=True)
@@ -104,6 +143,7 @@ class KernelPredicateEvidence:
     """Typed predicate result bound to an exact physical-plan context."""
 
     predicate_id: str
+    kernel_variant_id: str
     accepted: bool
     source_graph_fingerprint: str
     source_weights_fingerprint: str
@@ -113,18 +153,27 @@ class KernelPredicateEvidence:
     compile_features: tuple[str, ...]
     compile_device_fingerprint: str
     kernel_registry_sha256: str
+    shape_proof_protocol: str
+    shape_domain_proof_identity: str
+    shape_function_id: str
+    shape_constraints: tuple[str, ...]
+    domain_facts: tuple[str, ...]
     facts: tuple[str, ...] = ()
     failures: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         for value, label in (
             (self.predicate_id, "kernel predicate ID"),
+            (self.kernel_variant_id, "kernel variant ID"),
             (self.source_graph_fingerprint, "predicate graph fingerprint"),
             (self.source_weights_fingerprint, "predicate weights fingerprint"),
             (self.node_name, "predicate node name"),
             (self.operator, "predicate operator"),
             (self.compile_backend, "predicate compile backend"),
             (self.kernel_registry_sha256, "predicate kernel registry hash"),
+            (self.shape_proof_protocol, "predicate shape proof protocol"),
+            (self.shape_domain_proof_identity, "predicate shape proof identity"),
+            (self.shape_function_id, "predicate shape function ID"),
         ):
             _text(value, label)
         if not isinstance(self.accepted, bool):
@@ -140,6 +189,8 @@ class KernelPredicateEvidence:
         failures = tuple(self.failures)
         for values, label in (
             (features, "predicate compile features"),
+            (self.shape_constraints, "predicate shape constraints"),
+            (self.domain_facts, "predicate domain facts"),
             (facts, "predicate facts"),
             (failures, "predicate failures"),
         ):
@@ -155,6 +206,8 @@ class KernelPredicateEvidence:
         if not self.accepted and not failures:
             raise ValueError("rejected predicate evidence requires failures")
         object.__setattr__(self, "compile_features", features)
+        object.__setattr__(self, "shape_constraints", tuple(self.shape_constraints))
+        object.__setattr__(self, "domain_facts", tuple(self.domain_facts))
         object.__setattr__(self, "facts", facts)
         object.__setattr__(self, "failures", failures)
 
@@ -187,6 +240,7 @@ class KernelPredicateEvidence:
             raise TypeError("kernel predicate evidence requires its typed context")
         return cls(
             predicate_id=context.predicate_id,
+            kernel_variant_id=context.kernel_variant_id,
             accepted=accepted,
             source_graph_fingerprint=context.source_graph_fingerprint,
             source_weights_fingerprint=context.source_weights_fingerprint,
@@ -196,6 +250,15 @@ class KernelPredicateEvidence:
             compile_features=tuple(context.target.compile_features),
             compile_device_fingerprint=context.target.compile_device_fingerprint,
             kernel_registry_sha256=context.kernel_registry_sha256,
+            shape_proof_protocol=context.shape_domain_proof.proof_protocol,
+            shape_domain_proof_identity=(
+                context.shape_domain_proof.proof_identity
+            ),
+            shape_function_id=context.shape_function_id,
+            shape_constraints=context.shape_domain_proof.constraint_facts,
+            domain_facts=(
+                context.shape_domain_proof.node(context.node.name).facts
+            ),
             facts=facts,
             failures=failures,
         )
@@ -203,6 +266,7 @@ class KernelPredicateEvidence:
     def matches(self, context: "KernelPredicateContext") -> bool:
         return (
             self.predicate_id == context.predicate_id
+            and self.kernel_variant_id == context.kernel_variant_id
             and self.source_graph_fingerprint == context.source_graph_fingerprint
             and self.source_weights_fingerprint == context.source_weights_fingerprint
             and self.node_name == context.node.name
@@ -212,11 +276,20 @@ class KernelPredicateEvidence:
             and self.compile_device_fingerprint
             == context.target.compile_device_fingerprint
             and self.kernel_registry_sha256 == context.kernel_registry_sha256
+            and self.shape_proof_protocol
+            == context.shape_domain_proof.proof_protocol
+            and self.shape_domain_proof_identity
+            == context.shape_domain_proof.proof_identity
+            and self.shape_function_id == context.shape_function_id
+            and self.shape_constraints == context.shape_domain_proof.constraint_facts
+            and self.domain_facts
+            == context.shape_domain_proof.node(context.node.name).facts
         )
 
     def to_dict(self) -> dict[str, object]:
         return {
             "predicate_id": self.predicate_id,
+            "kernel_variant_id": self.kernel_variant_id,
             "accepted": self.accepted,
             "source_graph_fingerprint": self.source_graph_fingerprint,
             "source_weights_fingerprint": self.source_weights_fingerprint,
@@ -226,6 +299,11 @@ class KernelPredicateEvidence:
             "compile_features": list(self.compile_features),
             "compile_device_fingerprint": self.compile_device_fingerprint,
             "kernel_registry_sha256": self.kernel_registry_sha256,
+            "shape_proof_protocol": self.shape_proof_protocol,
+            "shape_domain_proof_identity": self.shape_domain_proof_identity,
+            "shape_function_id": self.shape_function_id,
+            "shape_constraints": list(self.shape_constraints),
+            "domain_facts": list(self.domain_facts),
             "facts": list(self.facts),
             "failures": list(self.failures),
         }
@@ -234,15 +312,19 @@ class KernelPredicateEvidence:
     def from_dict(cls, value: object) -> "KernelPredicateEvidence":
         payload = _mapping(value, "kernel predicate evidence")
         required = frozenset({
-            "predicate_id", "accepted", "source_graph_fingerprint",
+            "predicate_id", "kernel_variant_id", "accepted",
+            "source_graph_fingerprint",
             "source_weights_fingerprint", "node_name", "operator",
             "compile_backend", "compile_features",
             "compile_device_fingerprint", "kernel_registry_sha256",
-            "facts", "failures",
+            "shape_proof_protocol",
+            "shape_domain_proof_identity", "shape_function_id",
+            "shape_constraints", "domain_facts", "facts", "failures",
         })
         _exact_keys(payload, required=required, label="kernel predicate evidence")
         return cls(
             predicate_id=payload["predicate_id"],
+            kernel_variant_id=payload["kernel_variant_id"],
             accepted=payload["accepted"],
             source_graph_fingerprint=payload["source_graph_fingerprint"],
             source_weights_fingerprint=payload["source_weights_fingerprint"],
@@ -254,6 +336,15 @@ class KernelPredicateEvidence:
             ),
             compile_device_fingerprint=payload["compile_device_fingerprint"],
             kernel_registry_sha256=payload["kernel_registry_sha256"],
+            shape_proof_protocol=payload["shape_proof_protocol"],
+            shape_domain_proof_identity=payload["shape_domain_proof_identity"],
+            shape_function_id=payload["shape_function_id"],
+            shape_constraints=tuple(_array(
+                payload["shape_constraints"], "predicate shape constraints",
+            )),
+            domain_facts=tuple(_array(
+                payload["domain_facts"], "predicate domain facts",
+            )),
             facts=tuple(_array(payload["facts"], "predicate facts")),
             failures=tuple(_array(payload["failures"], "predicate failures")),
         )
@@ -369,6 +460,8 @@ class CompiledNodePlan:
             )
             if self.selection_evidence.predicate_id != selected.predicate_id:
                 raise ValueError("selected kernel evidence names a different predicate")
+            if self.selection_evidence.kernel_variant_id != selected.id:
+                raise ValueError("selected kernel evidence names a different variant")
             if not self.selection_evidence.accepted:
                 raise ValueError("selected kernel evidence must be accepted")
         elif self.selection_evidence is not None:
@@ -483,6 +576,7 @@ class CompiledModelPlan:
     runtime_backend: str
     compile_features: tuple[str, ...]
     compile_device_fingerprint: str
+    shape_domain_proof: PortableGraphDomainProof
     nodes: tuple[CompiledNodePlan, ...]
     region_opportunities: tuple[CompiledRegionOpportunity, ...] = ()
     kernel_registry_schema_version: int = KERNEL_REGISTRY_SCHEMA_VERSION
@@ -511,6 +605,8 @@ class CompiledModelPlan:
             raise ValueError("compiled model features must contain strings")
         object.__setattr__(self, "backend_profile_members", members)
         object.__setattr__(self, "compile_features", features)
+        if not isinstance(self.shape_domain_proof, PortableGraphDomainProof):
+            raise TypeError("compiled model plan requires a shape-domain proof")
         nodes = tuple(self.nodes)
         regions = tuple(self.region_opportunities)
         if any(not isinstance(value, CompiledNodePlan) for value in nodes):
@@ -543,6 +639,24 @@ class CompiledModelPlan:
             raise ValueError(
                 "compiled model backend profile members do not match the registry"
             )
+        if self.shape_domain_proof.backend_members != members:
+            raise ValueError(
+                "compiled model shape proof names different backend members"
+            )
+        if (
+            self.shape_domain_proof.weights_fingerprint
+            != self.source_weights_fingerprint
+        ):
+            raise ValueError("compiled model shape proof names different weights")
+        proof_nodes = tuple(
+            (value.node_id, value.operator)
+            for value in self.shape_domain_proof.nodes
+        )
+        plan_nodes = tuple((value.node_name, value.operator) for value in nodes)
+        if proof_nodes != plan_nodes:
+            raise ValueError(
+                "compiled model shape proof does not match the node plan"
+            )
         expected_backend = _runtime_backend(self.compile_backend)
         if self.runtime_backend != expected_backend:
             raise ValueError(
@@ -573,6 +687,7 @@ class CompiledModelPlan:
             evidence = node.selection_evidence
             if evidence is None:
                 continue
+            node_proof = self.shape_domain_proof.node(node.node_name)
             if (
                 evidence.source_graph_fingerprint
                 != self.source_graph_fingerprint
@@ -586,6 +701,16 @@ class CompiledModelPlan:
                 != self.compile_device_fingerprint
                 or evidence.kernel_registry_sha256
                 != self.kernel_registry_sha256
+                or evidence.shape_proof_protocol
+                != self.shape_domain_proof.proof_protocol
+                or evidence.shape_domain_proof_identity
+                != self.shape_domain_proof.proof_identity
+                or node_proof is None
+                or evidence.shape_function_id
+                != node_proof.shape_function_id
+                or evidence.shape_constraints
+                != self.shape_domain_proof.constraint_facts
+                or evidence.domain_facts != node_proof.facts
             ):
                 raise ValueError(
                     "selected kernel evidence is not bound to this compiled plan"
@@ -604,6 +729,7 @@ class CompiledModelPlan:
             "runtime_backend": self.runtime_backend,
             "compile_features": list(self.compile_features),
             "compile_device_fingerprint": self.compile_device_fingerprint,
+            "shape_domain_proof": self.shape_domain_proof.to_dict(),
             "kernel_registry": {
                 "schema_version": self.kernel_registry_schema_version,
                 "sha256": self.kernel_registry_sha256,
@@ -634,8 +760,8 @@ class CompiledModelPlan:
             "plan_id", "format", "source_graph_fingerprint",
             "source_weights_fingerprint", "backend_profile",
             "compile_backend", "runtime_backend", "compile_features",
-            "compile_device_fingerprint", "kernel_registry", "nodes",
-            "region_opportunities",
+            "compile_device_fingerprint", "shape_domain_proof",
+            "kernel_registry", "nodes", "region_opportunities",
         })
         _exact_keys(payload, required=required, label="compiled model plan")
         if payload["format"] != COMPILED_MODEL_PLAN_FORMAT:
@@ -663,6 +789,9 @@ class CompiledModelPlan:
                 payload["compile_features"], "compiled plan features",
             )),
             compile_device_fingerprint=payload["compile_device_fingerprint"],
+            shape_domain_proof=PortableGraphDomainProof.from_dict(
+                payload["shape_domain_proof"]
+            ),
             nodes=tuple(
                 CompiledNodePlan.from_dict(item)
                 for item in _array(payload["nodes"], "compiled plan nodes")
@@ -709,7 +838,7 @@ def _validate_portable_graph(
     graph: GraphIR,
     members: tuple[str, ...],
     tensors: Mapping[str, Any],
-) -> dict[str, Any]:
+) -> tuple[dict[str, Any], PortableGraphDomainProof]:
     try:
         document, live_tensors = export_runtime_package(graph, tensors)
     except Exception as error:
@@ -726,47 +855,29 @@ def _validate_portable_graph(
             "portable graph fails backend profile descriptor validation "
             f"({first.code}): {first.message}"
         )
-    return live_tensors
+    try:
+        proof = prove_portable_graph_domain(
+            document,
+            live_tensors,
+            members,
+            allow_deferred_singleton=not graph.shape_environment.dimensions,
+        )
+    except PortableDomainProofError as error:
+        raise CompiledModelPlanningError(
+            "portable graph lacks a whole-domain backend proof "
+            f"({error.code} at {error.path}): {error.detail}"
+        ) from error
+    return live_tensors, proof
 
 
 def _weights_fingerprint(tensors: Mapping[str, Any]) -> str:
     """Hash exact live tensor values without depending on Python identities."""
-
-    digest = hashlib.sha256(b"volvox-compiled-model-weights/v1\0")
-    for name in sorted(tensors):
-        if not isinstance(name, str) or not name:
-            raise CompiledModelPlanningError(
-                "compiled model tensor names must be non-empty strings"
-            )
-        try:
-            array = np.asarray(tensors[name])
-        except Exception as error:
-            raise CompiledModelPlanningError(
-                f"cannot fingerprint tensor {name!r}: {error}"
-            ) from error
-        if array.dtype.hasobject:
-            raise CompiledModelPlanningError(
-                f"cannot fingerprint object tensor {name!r}"
-            )
-        canonical_dtype = array.dtype.newbyteorder("<")
-        canonical = np.ascontiguousarray(array.astype(canonical_dtype, copy=False))
-        metadata = json.dumps(
-            {
-                "name": name,
-                "dtype": canonical.dtype.str,
-                "shape": list(canonical.shape),
-                "bytes": canonical.nbytes,
-            },
-            sort_keys=True,
-            separators=(",", ":"),
-            ensure_ascii=True,
-        ).encode("utf-8")
-        digest.update(len(metadata).to_bytes(8, "little"))
-        digest.update(metadata)
-        payload = canonical.tobytes(order="C")
-        digest.update(len(payload).to_bytes(8, "little"))
-        digest.update(payload)
-    return f"sha256:{digest.hexdigest()}"
+    try:
+        return runtime_weights_fingerprint(tensors)
+    except PortableDomainProofError as error:
+        raise CompiledModelPlanningError(
+            f"cannot fingerprint compiled-model weights: {error.detail}"
+        ) from error
 
 
 def _variant_candidates(
@@ -841,8 +952,10 @@ def build_compiled_model_plan(
             "strict CompiledModel plans do not admit operator fallback"
         )
     members = _profile_members(target.backend_profile)
-    live_tensors = _validate_portable_graph(graph, members, tensors)
-    source_weights_fingerprint = _weights_fingerprint(live_tensors)
+    live_tensors, shape_domain_proof = _validate_portable_graph(
+        graph, members, tensors,
+    )
+    source_weights_fingerprint = shape_domain_proof.weights_fingerprint
     backend = _runtime_backend(target.compile_backend)
     runtime_ops = RUNTIME_OPERATORS_BY_BACKEND[backend]
     routes = KERNEL_ROUTES_BY_BACKEND.get(backend)
@@ -893,18 +1006,26 @@ def build_compiled_model_plan(
             predicate_node = next(
                 value for value in predicate_graph.nodes if value.name == node.name
             )
+            node_domain_proof = shape_domain_proof.node(node.name)
+            if node_domain_proof is None:
+                raise RuntimeError(
+                    f"whole-domain proof omitted node {node.name!r}"
+                )
             predicate_tensors = {
                 name: np.array(np.asarray(value), copy=True)
                 for name, value in live_tensors.items()
             }
             context = KernelPredicateContext(
                 predicate_id=chosen.predicate_id,
+                kernel_variant_id=chosen.id,
                 graph=predicate_graph,
                 node=predicate_node,
                 tensors=MappingProxyType(predicate_tensors),
                 target=target,
                 source_graph_fingerprint=source_fingerprint,
                 source_weights_fingerprint=source_weights_fingerprint,
+                shape_domain_proof=shape_domain_proof,
+                shape_function_id=node_domain_proof.shape_function_id,
             )
             before_predicate_graph = predicate_graph.fingerprint()
             before_predicate_weights = _weights_fingerprint(predicate_tensors)
@@ -961,6 +1082,7 @@ def build_compiled_model_plan(
         runtime_backend=backend,
         compile_features=tuple(compile_features),
         compile_device_fingerprint=target.compile_device_fingerprint,
+        shape_domain_proof=shape_domain_proof,
         nodes=tuple(node_plans),
         region_opportunities=region_opportunities,
     )

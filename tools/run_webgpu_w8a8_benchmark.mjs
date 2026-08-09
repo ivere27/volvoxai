@@ -77,10 +77,10 @@ function serve(root, port) {
       const pathname = decodeURIComponent(new URL(request.url, 'http://localhost').pathname);
       let allowedRoot = root;
       let filename;
-      if (pathname.startsWith('/__tinyreceipt_model__/') && modelDirectory) {
+      if (pathname.startsWith('/__benchmark_model__/') && modelDirectory) {
         allowedRoot = modelDirectory;
-        filename = resolve(modelDirectory, pathname.slice('/__tinyreceipt_model__/'.length));
-      } else if (pathname === '/__tinyreceipt_image__' && imageFilename) {
+        filename = resolve(modelDirectory, pathname.slice('/__benchmark_model__/'.length));
+      } else if (pathname === '/__benchmark_image__' && imageFilename) {
         allowedRoot = dirname(imageFilename);
         filename = imageFilename;
       } else {

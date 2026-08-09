@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
-import { Graph } from '../ts/core/Graph.js';
+import { RuntimeGraph } from '../ts/core/RuntimeGraph.js';
 import { CPUEngine } from '../ts/backends/CPUEngine.js';
 import { _cpuQLinear } from '../ts/ops/qLinear.js';
 
@@ -42,7 +42,7 @@ function addQLinear(graph, {
 }
 
 test('QLinear keeps I8 activations and I32 accumulation through per-axis requantization', () => {
-  const graph = new Graph();
+  const graph = new RuntimeGraph();
   const node = addQLinear(graph, {
     inputValues: [1, -2, 3, 4, 0, -1],
     inputShape: [2, 3],
@@ -62,7 +62,7 @@ test('QLinear keeps I8 activations and I32 accumulation through per-axis requant
 });
 
 test('QLinear supports asymmetric U8 tensors and saturates its quantized output', () => {
-  const graph = new Graph();
+  const graph = new RuntimeGraph();
   const node = addQLinear(graph, {
     inputDtype: 'uint8',
     inputValues: [255, 255],
@@ -89,7 +89,7 @@ test('QLinear rejects underflowing and overflowing F32 requantization multiplier
     ['underflowing', minimumF32, minimumF32],
     ['overflowing', 1e30, 1e30],
   ]) {
-    const graph = new Graph();
+    const graph = new RuntimeGraph();
     const node = addQLinear(graph, {
       inputValues: [1],
       inputShape: [1, 1],
@@ -112,7 +112,7 @@ test('QLinear rejects underflowing and overflowing F32 requantization multiplier
 });
 
 test('CPU engine dispatches explicit QLinear without entering the W8A32 MatMul path', async () => {
-  const graph = new Graph();
+  const graph = new RuntimeGraph();
   const node = addQLinear(graph, {
     inputValues: [1, -2, 3], inputShape: [1, 3],
     inputQuantization: { scheme: 'per_tensor', scale: 0.25, zero_point: -1 },
@@ -129,7 +129,7 @@ test('CPU engine dispatches explicit QLinear without entering the W8A32 MatMul p
 });
 
 test('QLinear rejects noncanonical activation, weight, bias, and shape contracts', () => {
-  const badInputGraph = new Graph();
+  const badInputGraph = new RuntimeGraph();
   const badInput = addQLinear(badInputGraph, {
     inputValues: [1, 2], inputShape: [1, 2],
     inputQuantization: { scheme: 'per_axis', axis: 0, scales: [0.25], zero_points: [0] },
@@ -140,7 +140,7 @@ test('QLinear rejects noncanonical activation, weight, bias, and shape contracts
   });
   assert.throws(() => _cpuQLinear(badInput), /input requires per_tensor quantization/);
 
-  const badWeightGraph = new Graph();
+  const badWeightGraph = new RuntimeGraph();
   const badWeight = addQLinear(badWeightGraph, {
     inputValues: [1, 2, 3], inputShape: [1, 3],
     inputQuantization: { scheme: 'per_tensor', scale: 0.25, zero_point: 0 },
@@ -151,7 +151,7 @@ test('QLinear rejects noncanonical activation, weight, bias, and shape contracts
   });
   assert.throws(() => _cpuQLinear(badWeight), /weight quantization along axis 0/);
 
-  const badBiasGraph = new Graph();
+  const badBiasGraph = new RuntimeGraph();
   const badBias = addQLinear(badBiasGraph, {
     inputValues: [1, 2], inputShape: [1, 2],
     inputQuantization: { scheme: 'per_tensor', scale: 0.25, zero_point: 0 },
@@ -163,7 +163,7 @@ test('QLinear rejects noncanonical activation, weight, bias, and shape contracts
   badBias.inputs.bias.dtype = 'float32';
   assert.throws(() => _cpuQLinear(badBias), /bias requires int32 storage/);
 
-  const badShapeGraph = new Graph();
+  const badShapeGraph = new RuntimeGraph();
   const badShape = addQLinear(badShapeGraph, {
     inputValues: [1, 2], inputShape: [1, 2],
     inputQuantization: { scheme: 'per_tensor', scale: 0.25, zero_point: 0 },

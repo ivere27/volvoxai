@@ -2,8 +2,8 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 
 import { CPUEngine } from '../ts/backends/CPUEngine.js';
-import { Graph } from '../ts/core/Graph.js';
-import { GraphLoader } from '../ts/core/GraphLoader.js';
+import { RuntimeGraph } from '../ts/core/RuntimeGraph.js';
+import { RuntimeGraphLoader } from '../ts/core/RuntimeGraphLoader.js';
 
 const qInput = { scheme: 'per_tensor', scale: 0.25, zero_point: 128 };
 const qActivation = { scheme: 'per_tensor', scale: 0.25, zero_point: 0 };
@@ -17,7 +17,7 @@ function typedOutput(name, shape, dtype = 'int8') {
 }
 
 test('canonical W8A8 graph document preserves physical bytes through a browser CPU inference island', async () => {
-  const graph = new Graph();
+  const graph = new RuntimeGraph();
   const tensors = new Map();
   const addInput = (name, shape, dtype, options) => {
     const tensor = graph.addInput(name, shape, dtype, options);
@@ -90,11 +90,12 @@ test('canonical W8A8 graph document preserves physical bytes through a browser C
       {
         opType: 'Reshape', inputs: { input: 'resized' },
         ...typedOutput('flat', [1, 2]),
+        params: { shape: [1, 2] },
       },
       {
         opType: 'Concat', inputs: { input0: 'flat', input1: 'flat' },
         ...typedOutput('concat', [1, 4]),
-        params: { axis: 1, count: 2 },
+        params: { axis: 1 },
       },
       {
         opType: 'DequantizeLinear', inputs: { input: 'concat', scale: 'out_scale', zero_point: 'out_zero_point' },
@@ -103,7 +104,7 @@ test('canonical W8A8 graph document preserves physical bytes through a browser C
     ],
     outputs: ['result'],
   };
-  GraphLoader._buildFromGraphDocument(graph, document, tensors, {
+  RuntimeGraphLoader._buildFromGraphDocument(graph, document, tensors, {
     quantizationByTensor: Object.fromEntries(
       ['qx', 'conv', 'added', 'pooled', 'resized', 'flat', 'concat']
         .map((name) => [name, qActivation]),
@@ -127,7 +128,7 @@ test('canonical W8A8 graph document preserves physical bytes through a browser C
 });
 
 test('canonical W8A8 decoder island keeps embedding, attention, logits, and token selection typed', async () => {
-  const graph = new Graph();
+  const graph = new RuntimeGraph();
   const tensors = new Map();
   const addInput = (name, shape, dtype, options) => {
     const tensor = graph.addInput(name, shape, dtype, options);
@@ -228,7 +229,7 @@ test('canonical W8A8 decoder island keeps embedding, attention, logits, and toke
     ],
     outputs: ['token_ids'],
   };
-  GraphLoader._buildFromGraphDocument(graph, document, tensors, {
+  RuntimeGraphLoader._buildFromGraphDocument(graph, document, tensors, {
     quantizationByTensor: Object.fromEntries(
       ['embedded', 'q', 'k', 'v', 'attended', 'logits']
         .map((name) => [name, activation]),

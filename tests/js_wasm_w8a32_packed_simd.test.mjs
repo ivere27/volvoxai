@@ -117,15 +117,29 @@ function executeCase(api, memory, spec) {
   const scalePointer = writeArray(memory, allocate, scales);
   const zeroPointPointer = writeArray(memory, allocate, zeroPoints);
   const biasPointer = writeArray(memory, allocate, bias);
-  const packedBytes = Number(api.packed_q8_weight_size(dIn, dOut));
+  const packedBytes = Number(api.packed_q8_weight_canonical_size(dIn, dOut));
+  const widenedBytes = Number(api.packed_q8_weight_size(dIn, dOut));
   assert.ok(packedBytes > 0, `${name}: packed size`);
+  assert.ok(widenedBytes > packedBytes,
+    `${name}: W8A32 canonical pack must omit the widened W8A8 payload`);
   const packedPointer = allocate(packedBytes);
   const packedOutputPointer = allocate(rows * dOut * 4);
   const portableOutputPointer = allocate(rows * dOut * 4);
 
-  assert.equal(api.pack_q8_weight(
+  assert.equal(api.pack_q8_weight_canonical(
     packedPointer, packedBytes, weightPointer, dIn, dOut, weightDtype, 1,
   ), 1, `${name}: pack output-major weights`);
+  {
+    const header = new DataView(memory.buffer, packedPointer, 48);
+    assert.equal(header.getUint32(32, true), 0,
+      `${name}: canonical-only pair N blocks`);
+    assert.equal(header.getUint32(36, true), 0,
+      `${name}: canonical-only pair K blocks`);
+    assert.equal(header.getUint32(40, true), packedBytes,
+      `${name}: canonical-only payload ends at the pair-data offset`);
+    assert.equal(header.getUint32(44, true), 0,
+      `${name}: canonical-only pair flags`);
+  }
   assert.equal(api.matmul_quantized_f32(
     inputPointer, weightPointer, scalePointer, zeroPointPointer, biasPointer,
     portableOutputPointer, rows, dIn, dOut, weightDtype, scaleElements,
@@ -165,6 +179,17 @@ test('actual WASM SIMD128 packed W8A32 M=1 is correct and preserves fallbacks', 
     const memory = api.memory;
     assert.ok(memory instanceof WebAssembly.Memory);
     assert.equal(typeof api.w8a32_wasm_simd_calls, 'function');
+    assert.equal(typeof api.packed_q8_weight_canonical_size, 'function');
+    assert.equal(typeof api.pack_q8_weight_canonical, 'function');
+    assert.equal(
+      api.packed_q8_weight_canonical_size(
+        Math.floor(0x7fffffff / 255) + 1, 1,
+      ),
+      0,
+      'canonical size must reject K beyond the exact I32 accumulation bound',
+    );
+    assert.equal(api.packed_q8_weight_canonical_size(1, 0xffffffff), 0,
+      'canonical size must reject a byte-count overflow');
 
     executeCase(api, memory, {
       name: 'I8 asymmetric per-channel F32 zero point scalar fallback',
@@ -341,11 +366,21 @@ test('actual WASM SIMD128 packed W8A32 M=1 is correct and preserves fallbacks', 
     const malformedWeight = writeArray(memory, allocate, malformedWeightValues);
     const malformedScale = writeArray(memory, allocate, Float32Array.of(0.125));
     const malformedZeroPoint = writeArray(memory, allocate, Int8Array.of(0));
-    const malformedPackedBytes = Number(api.packed_q8_weight_size(3, 8));
+    const malformedPackedBytes = Number(api.packed_q8_weight_canonical_size(3, 8));
     const malformedPacked = allocate(malformedPackedBytes);
     const malformedOutput = allocate(8 * 4);
+    new Uint8Array(memory.buffer, malformedPacked, malformedPackedBytes).fill(0xa5);
+    assert.equal(api.pack_q8_weight_canonical(
+      malformedPacked, malformedPackedBytes - 1, malformedWeight, 3, 8,
+      VX_DTYPE_I8, 1,
+    ), 0, 'an undersized canonical destination must be rejected');
+    assert.deepEqual(
+      [...new Uint8Array(memory.buffer, malformedPacked, malformedPackedBytes)],
+      Array(malformedPackedBytes).fill(0xa5),
+      'canonical packing must validate capacity before its first write',
+    );
     new Uint8Array(memory.buffer, malformedOutput, 8 * 4).fill(0xa5);
-    assert.equal(api.pack_q8_weight(
+    assert.equal(api.pack_q8_weight_canonical(
       malformedPacked, malformedPackedBytes, malformedWeight, 3, 8,
       VX_DTYPE_I8, 1,
     ), 1);

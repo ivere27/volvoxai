@@ -82,30 +82,28 @@ import {
   incrementalRowPosition,
   prepareQuantizedRows,
 } from './quantizedRowExecution.js';
-import type { Graph } from '../core/Graph.js';
+import type { RuntimeGraph } from '../core/RuntimeGraph.js';
 import type { GraphNode, TensorLike } from '../types.js';
+import { dropoutDescriptor } from '../ops/dropoutContract.js';
 
 interface CpuNodeExecution {
-  graph?: Graph;
+  graph?: RuntimeGraph;
   adapterPlan?: any;
   nodeIndex?: number;
   rowPosition?: number | null;
 }
 
-function aliasInferenceDropout(node: GraphNode): void {
-  const input = node.inputs.input || node.inputs.x;
-  const output = node.outputs.out || Object.values(node.outputs || {})[0];
-  if (input?.dtype !== 'float32' || output?.dtype !== 'float32' ||
-      !(input.buffer instanceof Float32Array) || !(output.buffer instanceof Float32Array) ||
-      input.buffer.length !== output.buffer.length) {
-    throw new Error(`Dropout node ${node.id ?? '<unnamed>'} requires equal-size F32 input/output tensors.`);
-  }
-  output.buffer = input.buffer;
+function copyInferenceDropout(node: GraphNode): void {
+  const { input, output } = dropoutDescriptor(node);
+  // Dynamic liveness arenas may reuse the input region after this node while
+  // the Dropout value remains live on a branch. Preserve the preplanned exact
+  // output view instead of mutating the graph into an unproved storage alias.
+  output.buffer.set(input.buffer);
 }
 
 export class CPUEngine extends BackendEngine {
   tensors: Map<string, TensorLike>;
-  graph?: Graph;
+  graph?: RuntimeGraph;
   declare compiledTopologyRevision: number;
 
   declare _cpuAdd: typeof _cpuAdd;
@@ -195,7 +193,6 @@ export class CPUEngine extends BackendEngine {
     });
     this.tensors = /* @__PURE__ */ new Map();
     this._incrementalCacheValid = false;
-    console.log("[VolvoxAI] CPU Fallback Engine ready.");
   }
 
   /** Create an independent graph owner for multi-graph inference sessions. */
@@ -213,7 +210,7 @@ export class CPUEngine extends BackendEngine {
   /**
    * Allocates CPU memory (ArrayBuffers) for the graph's tensors.
    */
-  allocateGraph(graph: Graph) {
+  allocateGraph(graph: RuntimeGraph) {
     this._assertPortableQuantizedGraph(graph);
     this.graph = graph;
     this.resetDecodeCache();
@@ -245,11 +242,7 @@ export class CPUEngine extends BackendEngine {
     assertInferenceExecutionOptions(options, 'CPU inference');
     if (!explicitGraph) graph.assertTopologyRevision?.(this.compiledTopologyRevision, "CPU");
     this._beginDecodeExecution(options);
-    const hasAdapterSelector = Object.prototype.hasOwnProperty.call(options, "adapter") ||
-      Object.prototype.hasOwnProperty.call(options, "adapters");
-    const adapterPlan = (hasAdapterSelector || graph.adapters?.hasActive())
-      ? graph.adapters._pinExecution(options)
-      : null;
+    const adapterPlan = null;
     const incremental = incrementalExecutionEnabled(options, adapterPlan);
     const cacheWasValid = this._incrementalCacheValid;
     const selectedNodes = incremental
@@ -264,11 +257,14 @@ export class CPUEngine extends BackendEngine {
       : prepareQuantizedRows(graph, selectedNodes, rowPosition, {
           changedInputs: options.changedInputs ?? Object.keys(inputs),
         });
+    const copiedInputs = selectedNodes === null
+      ? null
+      : new Set(options.changedInputs ?? Object.keys(inputs));
     for (const [name, data] of Object.entries(inputs)) {
       const tensor = graph.tensors.get(name);
       if (!tensor?.isInput || !tensor.buffer) throw new Error(`Unknown graph input '${name}'.`);
       Tensor.assertCompatibleInput(tensor.dtype, data, tensor.sizeBytes, `Input '${name}'`);
-      tensor.buffer.set(data);
+      if (copiedInputs === null || copiedInputs.has(name)) tensor.buffer.set(data);
     }
     for (let nodeIndex = 0; nodeIndex < graph.nodes.length; nodeIndex++) {
       if (selectedNodes && !selectedNodes.has(nodeIndex)) continue;
@@ -404,7 +400,7 @@ export class CPUEngine extends BackendEngine {
       case "ProfileY": return this._cpuProfileY(node);
       case "MeanHeight": return this._cpuMeanHeight(node);
 
-      case "Dropout": return aliasInferenceDropout(node);
+      case "Dropout": return copyInferenceDropout(node);
 
       // Shape-only ops just copy their data through to the output buffer.
       case "Reshape":

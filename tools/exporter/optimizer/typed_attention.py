@@ -16,16 +16,18 @@ for already-runnable attention nodes.
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from dataclasses import dataclass
 import math
 from typing import Any, Mapping, MutableMapping
 
 import numpy as np
 
-from ..ir import IRDialect, OpNode, TensorValue, ValuePort
+from ..ir import IRDialect, OpAttribute, OpNode, TensorValue, ValuePort
 from ..pipeline import IRPass, PassContract, PassResult
 from .typed_attention_common import (
     AdditiveMaskPlan,
+    Extent,
     HeadMergePlan,
     HeadSplitPlan,
     exact_ports,
@@ -37,7 +39,9 @@ from .typed_attention_common import (
     params_attribute,
     plan_additive_mask,
     remove_feature_nodes,
+    resolved_shape,
     runtime_params,
+    scalar_broadcast,
     scalar_initializer,
     unique_name,
 )
@@ -76,13 +80,16 @@ class RuntimeFloatAttentionFusionPass(IRPass):
     """Atomically fuse decomposed F32 multi-head attention to ``CrossSDPA``."""
 
     name = "runtime-float-attention-fusion"
-    contract = PassContract.preserving(IRDialect.RUNTIME, repeatable=True)
+    contract = PassContract.preserving(
+        IRDialect.RUNTIME, repeatable=True
+    )
 
     def __init__(
         self,
         tensor_data: MutableMapping[str, Any],
         *,
         allow_numerical_migration: bool,
+        causal_mask_inputs: Iterable[str] = (),
     ) -> None:
         if not isinstance(tensor_data, MutableMapping):
             raise TypeError("attention fusion tensor_data must be mutable")
@@ -91,6 +98,11 @@ class RuntimeFloatAttentionFusionPass(IRPass):
                 "F32 attention fusion requires explicit numerical-migration opt-in"
             )
         self.tensor_data = tensor_data
+        # A bounded graph cannot hold a [T,T] causal constant, so the producer
+        # supplies it as a public input.  Its additive values are outside the
+        # graph, so treating one as causal is an explicit caller contract and
+        # is never inferred from topology.
+        self.causal_mask_inputs = frozenset(causal_mask_inputs)
         self.refused = 0
 
     def run(self, graph) -> PassResult:
@@ -308,6 +320,7 @@ class RuntimeFloatAttentionFusionPass(IRPass):
                 batch=query.split.batch,
                 queries=query.split.sequence,
                 keys=key.split.sequence,
+                causal_inputs=self.causal_mask_inputs,
             )
             if mask_plan is None:
                 return None
@@ -362,10 +375,14 @@ class RuntimeFloatAttentionFusionPass(IRPass):
                     or use_def.consumers[name][0].node_index != terminal
                 ):
                     return None
+                product_shape = resolved_shape(
+                    graph, graph.tensors[name].shape,
+                )
                 resolved = []
                 for operand_name in candidate.input_map().values():
-                    value = scalar_initializer(
-                        graph, self.tensor_data, operand_name, positive=True,
+                    value = scalar_broadcast(
+                        graph, self.tensor_data, operand_name,
+                        match_shape=product_shape, positive=True,
                     )
                     if value is not None:
                         resolved.append((operand_name, value))
@@ -477,7 +494,9 @@ class RuntimeAttentionLayoutPass(IRPass):
     """
 
     name = "runtime-attention-layout"
-    contract = PassContract.preserving(IRDialect.RUNTIME, repeatable=True)
+    contract = PassContract.preserving(
+        IRDialect.RUNTIME, repeatable=True
+    )
 
     def run(self, graph) -> PassResult:
         changes = 0
@@ -593,7 +612,9 @@ class RuntimeKeepMaskPass(IRPass):
     """
 
     name = "runtime-keep-mask"
-    contract = PassContract.preserving(IRDialect.RUNTIME, repeatable=True)
+    contract = PassContract.preserving(
+        IRDialect.RUNTIME, repeatable=True
+    )
 
     def __init__(self, tensor_data: Mapping[str, Any]) -> None:
         if not isinstance(tensor_data, Mapping):
@@ -707,6 +728,11 @@ def _materialize_sequence_view(
         op_type="Reshape",
         inputs={"input": split.root},
         outputs={"out": name},
+        attributes=(OpAttribute(
+            "params",
+            "volvox.params",
+            {"shape": list(split.canonical_shape)},
+        ),),
         provenance=merge_provenance(source_nodes),
         metadata={"optimizer_layout": "remove-singleton-axis"},
     ))
@@ -798,16 +824,16 @@ def _trace_i32_mask_root(
     graph,
     start: str,
     *,
-    batch: int,
-    queries: int,
-    keys: int,
+    batch: Extent,
+    queries: Extent,
+    keys: Extent,
 ) -> str | None:
     graph.invalidate_analyses()
     use_def = graph.use_def()
     current = start
     for _ in range(8):
         tensor = graph.tensors[current]
-        shape = tuple(int(item) for item in tensor.shape)
+        shape = resolved_shape(graph, tensor.shape)
         if (
             tensor.dtype == "int32"
             and mask_shape_is_unambiguous(
@@ -832,7 +858,7 @@ def _trace_i32_mask_root(
         source = graph.tensors[source_name]
         if source.dtype != "int32" or tensor.dtype != "int32":
             return None
-        source_shape = tuple(int(item) for item in source.shape)
+        source_shape = resolved_shape(graph, source.shape)
         if node.op_type == "Expand":
             if (
                 len(source_shape) != len(shape)
@@ -849,21 +875,25 @@ def _trace_i32_mask_root(
     return None
 
 
-def _attention_geometry(graph, node: OpNode) -> tuple[int, int, int] | None:
+def _attention_geometry(graph, node: OpNode):
+    """Report the batch, query, and key extents, which may stay symbolic."""
+
     inputs = node.input_map()
     if node.op_type == "SDPA":
         qkv = graph.tensors.get(inputs.get("qkv", ""))
         if qkv is None or qkv.rank not in {2, 3}:
             return None
-        batch = 1 if qkv.rank == 2 else int(qkv.shape[0])
-        sequence = int(qkv.shape[-2])
-        return batch, sequence, sequence
+        shape = resolved_shape(graph, qkv.shape)
+        batch = 1 if qkv.rank == 2 else shape[0]
+        return batch, shape[-2], shape[-2]
     q = graph.tensors.get(inputs.get("q", ""))
     k = graph.tensors.get(inputs.get("k", ""))
     if q is None or k is None or q.rank not in {2, 3} or q.rank != k.rank:
         return None
-    batch = 1 if q.rank == 2 else int(q.shape[0])
-    return batch, int(q.shape[-2]), int(k.shape[-2])
+    q_shape = resolved_shape(graph, q.shape)
+    k_shape = resolved_shape(graph, k.shape)
+    batch = 1 if q.rank == 2 else q_shape[0]
+    return batch, q_shape[-2], k_shape[-2]
 
 
 def _removal_is_private(

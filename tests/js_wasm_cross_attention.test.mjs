@@ -7,7 +7,7 @@ import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
 
-import { Graph } from '../ts/core/Graph.js';
+import { RuntimeGraph } from '../ts/core/RuntimeGraph.js';
 import { CPUEngine } from '../ts/backends/CPUEngine.js';
 import { WasmEngine } from '../ts/backends/WasmEngine.js';
 
@@ -30,7 +30,7 @@ function ramp(length, scale = 0.1, offset = 0) {
 }
 
 function crossAttentionGraph({ batch, useAffine }) {
-  const graph = new Graph();
+  const graph = new RuntimeGraph();
   const qShape = batch === 1 ? [2, 4] : [batch, 2, 4];
   const kvShape = batch === 1 ? [3, 4] : [batch, 3, 4];
   const outputShape = batch === 1 ? [2, 4] : [batch, 2, 4];

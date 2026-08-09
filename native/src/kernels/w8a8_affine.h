@@ -130,6 +130,28 @@ static inline int32_t vx_w8a8_requantize(float transformed, int32_t minimum,
     return vx_w8a8_round_ties_even(transformed);
 }
 
+/* Canonical affine requantization from the integer accumulator domain.  The
+ * multiplication and zero-point addition are two separately rounded F32
+ * operations in the portable ABI.  In particular, an x86 target attribute
+ * that enables FMA must not contract them: the fused value can cross a
+ * ties-to-even boundary and change the graph-visible byte.  Volatile pins both
+ * operations to their required F32 boundaries for every optimized caller. */
+static inline float vx_w8a8_transform_accumulator(
+        int64_t accumulator, float multiplier, int32_t output_zero_point) {
+    volatile float scaled = (float)accumulator * multiplier;
+    volatile float transformed = scaled + (float)output_zero_point;
+    return (float)transformed;
+}
+
+static inline int32_t vx_w8a8_requantize_accumulator(
+        int64_t accumulator, float multiplier, int32_t output_zero_point,
+        int32_t minimum, int32_t maximum) {
+    const float transformed = vx_w8a8_transform_accumulator(
+        accumulator, multiplier, output_zero_point);
+    return vx_w8a8_requantize(transformed, minimum, maximum,
+                              output_zero_point);
+}
+
 /*
  * The canonical per-output-channel requantization multiplier:
  *

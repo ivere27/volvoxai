@@ -217,7 +217,7 @@ as the identity in the backward pass, so gradients keep flowing (Chapter 7).
 **Tensor** — a multi-dimensional array of numbers with a shape; the only data type in the engine.
 
 **Tier** — one of VolvoxAI's browser providers (WebNN / WebGPU / WASM / CPU), selected and fixed by
-Model.compile() policy.
+`Runtime.compile(snapshot, policy)`.
 
 **Token** — a chunk of text (word/sub-word/byte) mapped to an integer id.
 

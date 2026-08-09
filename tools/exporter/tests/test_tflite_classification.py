@@ -4,17 +4,28 @@ import contextlib
 import io
 import json
 import tempfile
+from types import SimpleNamespace
 import unittest
+from unittest.mock import patch
 from pathlib import Path
 
 import flatbuffers
 
-from tools.export_safetensors import export_tflite_model
+from tools.export_safetensors import export_onnx_model, export_tflite_model
 from tools.exporter.capabilities import classify_package
 
 
 def classify(nodes, inputs):
     return classify_package({"nodes": nodes, "inputs": inputs})
+
+
+def typed_node(op_type: str, dtype: str) -> dict:
+    return {
+        "opType": op_type,
+        "outputs": {
+            "out": {"tensor": f"{op_type}.out", "dtype": dtype, "shape": [1]},
+        },
+    }
 
 
 def _offset_vector(builder, values):
@@ -74,7 +85,7 @@ def _minimal_passthrough_tflite() -> bytes:
 
 class TflitePackageClassificationTests(unittest.TestCase):
     def test_float_graph_is_not_stamped_w8a8(self):
-        nodes = [{"opType": "Conv2D", "outputs_dtype": {"out": "float32"}}]
+        nodes = [typed_node("Conv2D", "float32")]
         self.assertEqual(
             classify(nodes, {"input0": {"dtype": "float32"}}),
             "fp32",
@@ -82,9 +93,9 @@ class TflitePackageClassificationTests(unittest.TestCase):
 
     def test_complete_typed_graph_is_w8a8(self):
         nodes = [
-            {"opType": "QConv2D", "outputs_dtype": {"out": "int8"}},
-            {"opType": "MaxPool2D", "outputs_dtype": {"out": "int8"}},
-            {"opType": "RequantizeLinear", "outputs_dtype": {"out": "int8"}},
+            typed_node("QConv2D", "int8"),
+            typed_node("MaxPool2D", "int8"),
+            typed_node("RequantizeLinear", "int8"),
         ]
         self.assertEqual(
             classify(nodes, {"input0": {"dtype": "int8"}}),
@@ -93,9 +104,9 @@ class TflitePackageClassificationTests(unittest.TestCase):
 
     def test_byte_graph_with_float_island_is_hybrid(self):
         nodes = [
-            {"opType": "QConv2D", "outputs_dtype": {"out": "int8"}},
-            {"opType": "Sigmoid", "outputs_dtype": {"out": "float32"}},
-            {"opType": "QuantizeLinear", "outputs_dtype": {"out": "int8"}},
+            typed_node("QConv2D", "int8"),
+            typed_node("Sigmoid", "float32"),
+            typed_node("QuantizeLinear", "int8"),
         ]
         self.assertEqual(
             classify(nodes, {"input0": {"dtype": "int8"}}),
@@ -104,15 +115,15 @@ class TflitePackageClassificationTests(unittest.TestCase):
 
     def test_qdq_boundaries_without_byte_compute_are_not_w8a8(self):
         nodes = [
-            {"opType": "DequantizeLinear", "outputs_dtype": {"out": "float32"}},
-            {"opType": "QuantizeLinear", "outputs_dtype": {"out": "int8"}},
+            typed_node("DequantizeLinear", "float32"),
+            typed_node("QuantizeLinear", "int8"),
         ]
         self.assertEqual(
             classify(nodes, {"input0": {"dtype": "int8"}}),
             "hybrid",
         )
 
-    def test_actual_tflite_export_assigns_package_class_before_serialization(self):
+    def test_actual_tflite_export_emits_closed_constant_only_dynamic_v1(self):
         with tempfile.TemporaryDirectory(prefix="volvoxai-tflite-class-") as temporary:
             directory = Path(temporary)
             source = directory / "model.tflite"
@@ -123,9 +134,67 @@ class TflitePackageClassificationTests(unittest.TestCase):
                 export_tflite_model(str(source), str(output))
 
             graph = json.loads((directory / "graph.json").read_text(encoding="utf-8"))
-            self.assertEqual(graph["source"]["package_class"], "fp32")
-            self.assertNotIn("quantized_graph_contract", graph["source"])
+            self.assertEqual(graph["format"], "volvox-graph/v1")
+            self.assertEqual(graph["dimensions"], {})
+            self.assertEqual(
+                set(graph),
+                {"format", "dimensions", "inputs", "nodes", "outputs"},
+            )
+            self.assertEqual(graph["inputs"], {
+                "input0": {"shape": [1], "dtype": "float32"},
+            })
+            self.assertEqual(classify_package(graph), "fp32")
             self.assertTrue(output.is_file())
+
+    def test_onnx_wrapper_rejects_legacy_delegated_publication(self):
+        legacy = {
+            "format": "volvox-graph/v1",
+            "inputs": {"input0": {"shape": [1], "dtype": "float32"}},
+            "nodes": [{
+                "opType": "Identity",
+                "inputs": {"input": "input0"},
+                "outputs": {"out": "output0"},
+                "outputs_shape": {"out": [1]},
+                "outputs_dtype": {"out": "float32"},
+            }],
+            "outputs": ["output0"],
+        }
+        delegated = SimpleNamespace(
+            compile_onnx_model=lambda *_args, **_kwargs: legacy,
+        )
+        with (
+            patch("tools.export_safetensors._exporter_module", return_value=delegated),
+            self.assertRaisesRegex(RuntimeError, "non-closed graph root"),
+        ):
+            export_onnx_model("source.onnx", "model.safetensors")
+
+    def test_onnx_wrapper_rejects_retired_shape_system_field(self):
+        graph = {
+            "format": "volvox-graph/v1",
+            "shape_system": "volvox-bounded-shape/v1",
+            "dimensions": {},
+            "inputs": {"input0": {"shape": [1], "dtype": "float32"}},
+            "nodes": [{
+                "id": "identity",
+                "opType": "Identity",
+                "inputs": {"input": "input0"},
+                "outputs": {"out": {
+                    "tensor": "output0",
+                    "shape": [1],
+                    "dtype": "float32",
+                }},
+                "params": {},
+            }],
+            "outputs": ["output0"],
+        }
+        delegated = SimpleNamespace(
+            compile_onnx_model=lambda *_args, **_kwargs: graph,
+        )
+        with (
+            patch("tools.export_safetensors._exporter_module", return_value=delegated),
+            self.assertRaisesRegex(RuntimeError, "non-closed graph root"),
+        ):
+            export_onnx_model("source.onnx", "model.safetensors")
 
 
 if __name__ == "__main__":

@@ -76,7 +76,7 @@ function outputDescriptor(meta) {
   }
   const elements = meta.outputShape.reduce((count, dim) => count * dim, 1);
   if (!Number.isSafeInteger(elements) || elements <= 0) throw new Error('declared output element count is invalid');
-  return { ...dtype, elements, sizeBytes: elements * dtype.bytes };
+  return { ...dtype, name: meta.output, elements, sizeBytes: elements * dtype.bytes };
 }
 
 // Inputs were materialized as inputs/<name>.<ext>; find whichever dtype exists.
@@ -119,14 +119,14 @@ for (const id of ids) {
       if (!f) throw new Error(`no input file for ${name}`);
       args.push('--input', `${name}=${f}`);
     }
-    const outf = path.join(pkg, `${tier}_y.${output.ext}`);
-    stagedOutput = path.join(pkg, `.${tier}_y.${process.pid}.${randomUUID()}.tmp.${output.ext}`);
+    const outf = path.join(pkg, `${tier}_${output.name}.${output.ext}`);
+    stagedOutput = path.join(pkg, `.${tier}_${output.name}.${process.pid}.${randomUUID()}.tmp.${output.ext}`);
     stagedEvidence = path.join(
       pkg,
       `.${tier}_runtime.${process.pid}.${randomUUID()}.tmp.json`,
     );
     args.push(
-      '--output', `y=${stagedOutput}`,
+      '--output', `${output.name}=${stagedOutput}`,
       flag,
       '--report-json', stagedEvidence,
     );

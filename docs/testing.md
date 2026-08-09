@@ -2,7 +2,8 @@
 
 VolvoxAI validation follows the public ownership boundary:
 
-- Runtime, Model, CompiledModel, ExecutionContext, and ExecutionResult lifetime.
+- Runtime, Model, CompiledModel, ExecutionContext, and
+  ExecutionResult lifetime.
 - same-model and two-model context isolation.
 - interleaved execution and decode state.
 - stable host and device result snapshots.
@@ -29,7 +30,7 @@ Focused runtime tests cover:
 - caller Graph and Tensor immutability.
 - context-local execution and decode state.
 - FIFO operation and close behavior.
-- Model and Runtime retention by children.
+- CompiledModel and Runtime retention by contexts.
 - stable named outputs after later executions and parent closure.
 - host read copy ownership and WebGPU result-buffer lifetime.
 - compilation and execution reports.

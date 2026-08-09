@@ -12,6 +12,92 @@ import type {
   TensorStorage,
 } from '../types.js';
 
+interface CachedQuantizationNormalization {
+  readonly dtype: RuntimeDType;
+  readonly rank: number;
+  readonly axis: number | null;
+  readonly axisExtent: number | null;
+  readonly descriptor: TensorQuantization;
+}
+
+/* Bound plans deliberately share immutable quantization descriptors across
+ * concrete shape variants. Keep normalization proportional to the number of
+ * distinct descriptors, rather than cloning every per-axis array every time a
+ * variant is materialized. Mutable caller objects never enter this cache. */
+const QUANTIZATION_NORMALIZATION_CACHE = new WeakMap<
+  object,
+  readonly CachedQuantizationNormalization[]
+>();
+
+function hasOnlyFrozenDataFields(value: object): boolean {
+  if (!Object.isFrozen(value) || Object.getOwnPropertySymbols(value).length !== 0) return false;
+  const prototype = Object.getPrototypeOf(value);
+  if (prototype !== Object.prototype && prototype !== Array.prototype && prototype !== null) {
+    return false;
+  }
+  for (const name of Object.getOwnPropertyNames(value)) {
+    const descriptor = Object.getOwnPropertyDescriptor(value, name);
+    if (descriptor === undefined || !Object.prototype.hasOwnProperty.call(descriptor, 'value')) {
+      return false;
+    }
+  }
+  return true;
+}
+
+function isCacheableQuantization(value: TensorQuantizationInput | TensorQuantization): boolean {
+  if (!hasOnlyFrozenDataFields(value)) return false;
+  if (value.scheme !== 'per_axis') {
+    return value.scheme === 'per_tensor' &&
+      Object.prototype.hasOwnProperty.call(value, 'scheme') &&
+      Object.prototype.hasOwnProperty.call(value, 'scale') &&
+      Object.prototype.hasOwnProperty.call(value, 'zero_point');
+  }
+  if (!['scheme', 'axis', 'scales', 'zero_points'].every((name) =>
+    Object.prototype.hasOwnProperty.call(value, name))) return false;
+  return Array.isArray(value.scales) && Array.isArray(value.zero_points) &&
+    hasOnlyFrozenDataFields(value.scales) && hasOnlyFrozenDataFields(value.zero_points);
+}
+
+function cachedQuantization(
+  dtype: RuntimeDType,
+  shape: readonly number[],
+  quantization: TensorQuantizationInput | TensorQuantization,
+): TensorQuantization | null {
+  const entries = QUANTIZATION_NORMALIZATION_CACHE.get(quantization);
+  if (entries === undefined) return null;
+  if (quantization.scheme === 'per_tensor') {
+    return entries.find((entry) => entry.dtype === dtype && entry.axis === null)?.descriptor ?? null;
+  }
+  if (quantization.scheme !== 'per_axis' || !Number.isInteger(quantization.axis)) return null;
+  const axis = quantization.axis < 0 ? quantization.axis + shape.length : quantization.axis;
+  if (axis < 0 || axis >= shape.length) return null;
+  return entries.find((entry) => entry.dtype === dtype && entry.rank === shape.length &&
+    entry.axis === axis && entry.axisExtent === shape[axis])?.descriptor ?? null;
+}
+
+function cacheQuantization(
+  dtype: RuntimeDType,
+  shape: readonly number[],
+  source: TensorQuantizationInput | TensorQuantization,
+  descriptor: TensorQuantization,
+): void {
+  if (!isCacheableQuantization(source)) return;
+  const axis = descriptor.scheme === 'per_axis' ? descriptor.axis : null;
+  const entry = Object.freeze({
+    dtype,
+    rank: shape.length,
+    axis,
+    axisExtent: axis === null ? null : shape[axis],
+    descriptor,
+  });
+  const previous = QUANTIZATION_NORMALIZATION_CACHE.get(source) ?? [];
+  QUANTIZATION_NORMALIZATION_CACHE.set(source, Object.freeze([...previous, entry]));
+  if (source !== descriptor) {
+    const canonical = QUANTIZATION_NORMALIZATION_CACHE.get(descriptor) ?? [];
+    QUANTIZATION_NORMALIZATION_CACHE.set(descriptor, Object.freeze([...canonical, entry]));
+  }
+}
+
 export class Tensor {
   name: string;
   shape: TensorShape;
@@ -128,6 +214,8 @@ export class Tensor {
     if (dtype !== "int8" && dtype !== "uint8") {
       throw new Error(`${label} requires int8 or uint8 tensor storage.`);
     }
+    const cached = cachedQuantization(dtype, shape, quantization);
+    if (cached !== null) return cached;
     const minimum = dtype === "int8" ? -128 : 0;
     const maximum = dtype === "int8" ? 127 : 255;
     const scheme = quantization.scheme ?? "per_tensor";
@@ -147,11 +235,13 @@ export class Tensor {
     };
     if (scheme === "per_tensor") {
       const descriptor = quantization as PerTensorQuantizationInput;
-      return Object.freeze({
+      const normalized = Object.freeze({
         scheme,
         scale: scale(descriptor.scale, "scale"),
         zero_point: zeroPoint(descriptor.zero_point ?? 0, "zero_point"),
       });
+      cacheQuantization(dtype, shape, quantization, normalized);
+      return normalized;
     }
     if (scheme === "per_axis") {
       const descriptor = quantization as PerAxisQuantizationInput;
@@ -168,12 +258,14 @@ export class Tensor {
         throw new Error(`${label} zero_points must contain one value for each axis-${axis} element.`);
       }
       const zeroPoints = sourceZeroPoints.map((value, index) => zeroPoint(value, `zero_points[${index}]`));
-      return Object.freeze({
+      const normalized = Object.freeze({
         scheme,
         axis,
         scales: Object.freeze(scales),
         zero_points: Object.freeze(zeroPoints),
       });
+      cacheQuantization(dtype, shape, quantization, normalized);
+      return normalized;
     }
     throw new Error(`${label} has unsupported scheme '${scheme}'.`);
   }

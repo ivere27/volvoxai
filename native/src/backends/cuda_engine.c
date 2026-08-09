@@ -9,6 +9,7 @@
 
 #include <errno.h>
 #include <assert.h>
+#include <inttypes.h>
 #include <limits.h>
 #include <locale.h>
 #include <math.h>
@@ -41,6 +42,14 @@ typedef uintptr_t CUdeviceptr;
 enum {
     CUDA_SUCCESS = 0,
     CU_STREAM_CAPTURE_MODE_THREAD_LOCAL = 1,
+    CU_DEVICE_ATTRIBUTE_MAX_THREADS_PER_BLOCK = 1,
+    CU_DEVICE_ATTRIBUTE_MAX_BLOCK_DIM_X = 2,
+    CU_DEVICE_ATTRIBUTE_MAX_BLOCK_DIM_Y = 3,
+    CU_DEVICE_ATTRIBUTE_MAX_BLOCK_DIM_Z = 4,
+    CU_DEVICE_ATTRIBUTE_MAX_GRID_DIM_X = 5,
+    CU_DEVICE_ATTRIBUTE_MAX_GRID_DIM_Y = 6,
+    CU_DEVICE_ATTRIBUTE_MAX_GRID_DIM_Z = 7,
+    CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK = 8,
 };
 
 #ifdef _WIN32
@@ -54,6 +63,8 @@ typedef CUresult (CUDAAPI *PFN_cuDeviceGetCount)(int*);
 typedef CUresult (CUDAAPI *PFN_cuDeviceGet)(CUdevice*, int);
 typedef CUresult (CUDAAPI *PFN_cuDeviceGetName)(char*, int, CUdevice);
 typedef CUresult (CUDAAPI *PFN_cuDeviceComputeCapability)(int*, int*, CUdevice);
+typedef CUresult (CUDAAPI *PFN_cuDeviceGetAttribute)(int*, int, CUdevice);
+typedef CUresult (CUDAAPI *PFN_cuDeviceTotalMem)(size_t*, CUdevice);
 typedef CUresult (CUDAAPI *PFN_cuDevicePrimaryCtxRetain)(CUcontext*, CUdevice);
 typedef CUresult (CUDAAPI *PFN_cuDevicePrimaryCtxRelease)(CUdevice);
 typedef CUresult (CUDAAPI *PFN_cuCtxGetCurrent)(CUcontext*);
@@ -98,7 +109,7 @@ enum {
 #undef VOLVOXAI_CUDA_FORWARD_FUNCTION
     CUDA_FORWARD_FUNCTION_COUNT
 };
-_Static_assert(CUDA_FORWARD_FUNCTION_COUNT == 88,
+_Static_assert(CUDA_FORWARD_FUNCTION_COUNT == 90,
                "CUDA forward function registry coverage");
 
 #if VOLVOXAI_ENABLE_TRAINING
@@ -132,6 +143,8 @@ typedef struct {
     PFN_cuDeviceGet cuDeviceGet;
     PFN_cuDeviceGetName cuDeviceGetName;
     PFN_cuDeviceComputeCapability cuDeviceComputeCapability;
+    PFN_cuDeviceGetAttribute cuDeviceGetAttribute;
+    PFN_cuDeviceTotalMem cuDeviceTotalMem;
     PFN_cuDevicePrimaryCtxRetain cuDevicePrimaryCtxRetain;
     PFN_cuDevicePrimaryCtxRelease cuDevicePrimaryCtxRelease;
     PFN_cuCtxGetCurrent cuCtxGetCurrent;
@@ -173,6 +186,11 @@ typedef struct {
     int ready;
     int error_logged;
     int graph_api_supported;
+    unsigned int max_grid[3];
+    unsigned int max_block[3];
+    unsigned int max_threads_per_block;
+    unsigned int max_shared_memory_per_block;
+    size_t total_memory;
     CUfunction forward_functions[CUDA_FORWARD_FUNCTION_COUNT];
 #if VOLVOXAI_ENABLE_TRAINING
     CUfunction training_functions[CUDA_TRAINING_FUNCTION_COUNT];
@@ -189,6 +207,8 @@ static CudaDeviceState cuda_device_state = {
 #define p_cuDeviceGet (cuda_device_state.cuDeviceGet)
 #define p_cuDeviceGetName (cuda_device_state.cuDeviceGetName)
 #define p_cuDeviceComputeCapability (cuda_device_state.cuDeviceComputeCapability)
+#define p_cuDeviceGetAttribute (cuda_device_state.cuDeviceGetAttribute)
+#define p_cuDeviceTotalMem (cuda_device_state.cuDeviceTotalMem)
 #define p_cuDevicePrimaryCtxRetain (cuda_device_state.cuDevicePrimaryCtxRetain)
 #define p_cuDevicePrimaryCtxRelease (cuda_device_state.cuDevicePrimaryCtxRelease)
 #define p_cuCtxGetCurrent (cuda_device_state.cuCtxGetCurrent)
@@ -227,6 +247,12 @@ static CudaDeviceState cuda_device_state = {
 #define cuda_stream (cuda_device_state.stream)
 #define cuda_primary_retained (cuda_device_state.primary_retained)
 #define cuda_error_logged (cuda_device_state.error_logged)
+#define cuda_max_grid (cuda_device_state.max_grid)
+#define cuda_max_block (cuda_device_state.max_block)
+#define cuda_max_threads_per_block (cuda_device_state.max_threads_per_block)
+#define cuda_max_shared_memory_per_block \
+    (cuda_device_state.max_shared_memory_per_block)
+#define cuda_total_memory (cuda_device_state.total_memory)
 
 #define CUDA_FORWARD_FUNCTION(handle) \
     (cuda_device_state.forward_functions[CUDA_FORWARD_REGISTRY_HANDLE_##handle])
@@ -246,10 +272,15 @@ _Static_assert(CUDA_GRAPH_MAX_TENSORS < UINT16_MAX,
 typedef struct {
     const void* host;
     size_t bytes;
+    size_t capacity;
     CUdeviceptr device;
+    uint64_t shape_generation;
+    uint64_t capacity_generation;
     int host_dirty;
     int device_dirty;
     int is_weight;
+    int pool_eligible;
+    int domain_span;
 } CudaTensorSlot;
 
 typedef struct {
@@ -347,6 +378,9 @@ typedef struct {
     int prestaging;
     uint64_t generation;
     uint64_t slot_epoch;
+    uint64_t shape_generation;
+    uint64_t capacity_generation;
+    const char* shape_signature;
     uint32_t launch_count;
     uint32_t launch_index;
     CUgraph captured_graph;
@@ -402,12 +436,21 @@ typedef struct {
     uint16_t graph_slot_hash[CUDA_GRAPH_SLOT_HASH_CAPACITY];
     int graph_slot_hash_valid;
     uint64_t graph_slot_epoch;
+    char* shape_signature;
+    uint64_t shape_generation;
+    uint64_t capacity_generation;
+    size_t domain_span_count;
+    int invariant_preload_complete;
+    int domain_enforced;
+    int graph_allocation_failed;
     CudaReplayState replay;
     CudaQactLutCache qact_lut_cache;
     CudaContextGuard forward_context_guard;
     int forward_scope_active;
     int forward_context_ready;
     int forward_context_failed;
+    uint64_t qbatch_matmul_dp4a_group_count;
+    uint64_t qbatch_matmul_scalar_tail_count;
     CUdeviceptr lora_workspace;
     size_t lora_workspace_bytes;
 #if VOLVOXAI_ENABLE_TRAINING
@@ -426,6 +469,12 @@ typedef struct {
     uint64_t profile_scope_serial;
 #endif
 #if defined(VOLVOXAI_CUDA_TESTING)
+    uint64_t qlinear_warp_dp4a_launch_count;
+    uint64_t qlinear_thread_dp4a_launch_count;
+    uint64_t qlinear_dp4a_group_count;
+    uint64_t qlinear_scalar_tail_count;
+    uint64_t qconv2d_warp_dp4a_launch_count;
+    uint64_t qconv2d_thread_dp4a_launch_count;
     uint64_t ownership_probe;
     uint64_t launch_count;
     uint64_t host_to_device_count;
@@ -460,7 +509,10 @@ typedef struct {
     uint64_t slot_exact_lookup_count;
     uint64_t slot_hash_probe_count;
     uint64_t slot_containing_scan_count;
+    uint64_t graph_allocation_count;
     int transient_release_failure;
+    int graph_allocation_failure;
+    int graph_growth_rollback_failure;
 #endif
 } CudaContextState;
 
@@ -483,6 +535,8 @@ static CudaContextState* cuda_context_state_require(void) {
     state->unavailable_failure = 1;
     state->graph_slot_hash_valid = 1;
     state->graph_slot_epoch = 1;
+    state->shape_generation = 1;
+    state->capacity_generation = 1;
     engine_state->cuda_context_state = state;
     engine_state->cuda_context_state_destroy = cuda_context_state_destroy;
     return state;
@@ -503,12 +557,25 @@ static inline CudaContextState* cuda_context_state_current(void) {
 #define graph_slot_hash CUDA_CONTEXT_FIELD(graph_slot_hash)
 #define graph_slot_hash_valid CUDA_CONTEXT_FIELD(graph_slot_hash_valid)
 #define graph_slot_epoch CUDA_CONTEXT_FIELD(graph_slot_epoch)
+#define cuda_shape_signature CUDA_CONTEXT_FIELD(shape_signature)
+#define cuda_shape_generation CUDA_CONTEXT_FIELD(shape_generation)
+#define cuda_capacity_generation CUDA_CONTEXT_FIELD(capacity_generation)
+#define cuda_domain_span_count CUDA_CONTEXT_FIELD(domain_span_count)
+#define cuda_invariant_preload_complete \
+    CUDA_CONTEXT_FIELD(invariant_preload_complete)
+#define cuda_domain_enforced CUDA_CONTEXT_FIELD(domain_enforced)
+#define cuda_graph_allocation_failed \
+    CUDA_CONTEXT_FIELD(graph_allocation_failed)
 #define cuda_replay CUDA_CONTEXT_FIELD(replay)
 #define qact_lut_cache CUDA_CONTEXT_FIELD(qact_lut_cache)
 #define cuda_forward_context_guard CUDA_CONTEXT_FIELD(forward_context_guard)
 #define cuda_forward_scope_active CUDA_CONTEXT_FIELD(forward_scope_active)
 #define cuda_forward_context_ready CUDA_CONTEXT_FIELD(forward_context_ready)
 #define cuda_forward_context_failed CUDA_CONTEXT_FIELD(forward_context_failed)
+#define cuda_qbatch_matmul_dp4a_group_count \
+    CUDA_CONTEXT_FIELD(qbatch_matmul_dp4a_group_count)
+#define cuda_qbatch_matmul_scalar_tail_count \
+    CUDA_CONTEXT_FIELD(qbatch_matmul_scalar_tail_count)
 #define cuda_lora_workspace CUDA_CONTEXT_FIELD(lora_workspace)
 #define cuda_lora_workspace_bytes CUDA_CONTEXT_FIELD(lora_workspace_bytes)
 #if VOLVOXAI_ENABLE_TRAINING
@@ -532,6 +599,18 @@ static inline CudaContextState* cuda_context_state_current(void) {
 #define cuda_profile_scope_serial CUDA_CONTEXT_FIELD(profile_scope_serial)
 #endif
 #if defined(VOLVOXAI_CUDA_TESTING)
+#define cuda_qlinear_warp_dp4a_launch_count \
+    CUDA_CONTEXT_FIELD(qlinear_warp_dp4a_launch_count)
+#define cuda_qlinear_thread_dp4a_launch_count \
+    CUDA_CONTEXT_FIELD(qlinear_thread_dp4a_launch_count)
+#define cuda_qlinear_dp4a_group_count \
+    CUDA_CONTEXT_FIELD(qlinear_dp4a_group_count)
+#define cuda_qlinear_scalar_tail_count \
+    CUDA_CONTEXT_FIELD(qlinear_scalar_tail_count)
+#define cuda_qconv2d_warp_dp4a_launch_count \
+    CUDA_CONTEXT_FIELD(qconv2d_warp_dp4a_launch_count)
+#define cuda_qconv2d_thread_dp4a_launch_count \
+    CUDA_CONTEXT_FIELD(qconv2d_thread_dp4a_launch_count)
 #define cuda_launch_count CUDA_CONTEXT_FIELD(launch_count)
 #define cuda_host_to_device_count CUDA_CONTEXT_FIELD(host_to_device_count)
 #define cuda_device_to_host_count CUDA_CONTEXT_FIELD(device_to_host_count)
@@ -583,8 +662,14 @@ static inline CudaContextState* cuda_context_state_current(void) {
 #define cuda_slot_hash_probe_count CUDA_CONTEXT_FIELD(slot_hash_probe_count)
 #define cuda_slot_containing_scan_count \
     CUDA_CONTEXT_FIELD(slot_containing_scan_count)
+#define cuda_graph_allocation_count \
+    CUDA_CONTEXT_FIELD(graph_allocation_count)
 #define cuda_test_transient_release_failure \
     CUDA_CONTEXT_FIELD(transient_release_failure)
+#define cuda_test_graph_allocation_failure \
+    CUDA_CONTEXT_FIELD(graph_allocation_failure)
+#define cuda_test_graph_growth_rollback_failure \
+    CUDA_CONTEXT_FIELD(graph_growth_rollback_failure)
 #endif
 
 #include "cuda/host/cuda_profile_host.inc"

@@ -203,7 +203,148 @@ def _write_source(root: Path) -> Path:
         },
     }
     (root / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+    _upgrade_source_to_bpe(root)
     return root
+
+
+def _upgrade_source_to_kv(source: Path) -> Path:
+    encoder_path = source / "encoder_model.onnx"
+    encoder = onnx.load(encoder_path)
+    for name in importer.KV_CROSS_NAMES:
+        encoder.graph.node.append(_constant(
+            f"{name}_value",
+            name,
+            np.zeros((1, importer.KV_HEADS, 1, importer.KV_HEAD_WIDTH), np.float32),
+        ))
+        encoder.graph.output.append(_value(
+            name,
+            TensorProto.FLOAT,
+            [
+                "batch",
+                f"Transpose{name}_dim_1",
+                "memory_length",
+                f"Transpose{name}_dim_3",
+            ],
+        ))
+    encoder.ir_version = 11
+    onnx.save(encoder, encoder_path)
+
+    decoder_inputs = [
+        _value("decoder_input_ids", TensorProto.INT64, ["batch", 1]),
+        _value("position_ids", TensorProto.INT64, ["batch"]),
+        _value("family_ids", TensorProto.INT64, ["batch"]),
+        _value("memory_padding_mask", TensorProto.BOOL, ["batch", "memory_length"]),
+        _value("past_padding_mask", TensorProto.BOOL, ["batch", "past_length"]),
+    ]
+    decoder_inputs.extend(
+        _value(name, TensorProto.FLOAT,
+               ["batch", importer.KV_HEADS, "memory_length", importer.KV_HEAD_WIDTH])
+        for name in importer.KV_CROSS_NAMES
+    )
+    decoder_inputs.extend(
+        _value(name, TensorProto.FLOAT,
+               ["batch", importer.KV_HEADS, "past_length", importer.KV_HEAD_WIDTH])
+        for name in importer.KV_PAST_NAMES
+    )
+    nodes = [
+        helper.make_node(
+            "Cast", ["decoder_input_ids"], ["decoder_token_f32"],
+            name="decoder_token_f32_value", to=TensorProto.FLOAT,
+        ),
+        _constant("logits_axis_value", "logits_axis", np.asarray([2], np.int64)),
+        helper.make_node(
+            "Unsqueeze", ["decoder_token_f32", "logits_axis"], ["decoder_token_row"],
+            name="decoder_token_row_value",
+        ),
+        _constant(
+            "logits_repeats_value", "logits_repeats",
+            np.asarray([1, 1, importer.BPE_VOCAB_SIZE], np.int64),
+        ),
+        helper.make_node(
+            "Tile", ["decoder_token_row", "logits_repeats"], ["logits"],
+            name="logits_value",
+        ),
+        _constant(
+            "cache_axis_value", "cache_axis", np.asarray([3], np.int64),
+        ),
+        helper.make_node(
+            "Unsqueeze", ["decoder_token_row", "cache_axis"], ["current_cache_scalar"],
+            name="current_cache_scalar_value",
+        ),
+        _constant(
+            "cache_repeats_value", "cache_repeats",
+            np.asarray([1, importer.KV_HEADS, 1, importer.KV_HEAD_WIDTH], np.int64),
+        ),
+        helper.make_node(
+            "Tile", ["current_cache_scalar", "cache_repeats"], ["current_cache_base"],
+            name="current_cache_base_value",
+        ),
+        _constant("pad_value", "pad_value", np.asarray(0, np.int64)),
+        helper.make_node(
+            "Equal", ["decoder_input_ids", "pad_value"], ["current_padding_mask"],
+            name="current_padding_mask_value",
+        ),
+        helper.make_node(
+            "Concat", ["past_padding_mask", "current_padding_mask"],
+            ["present_padding_mask"], name="present_padding_mask_concat", axis=1,
+        ),
+    ]
+    for index, (past_name, present_name) in enumerate(zip(
+        importer.KV_PAST_NAMES, importer.KV_PRESENT_NAMES
+    )):
+        current = f"current_cache_{index}"
+        nodes.extend([
+            helper.make_node(
+                "Identity", ["current_cache_base"], [current],
+                name=f"{current}_value",
+            ),
+            helper.make_node(
+                "Concat", [past_name, current], [present_name],
+                name=f"{present_name}_concat", axis=2,
+            ),
+        ])
+    decoder_outputs = [
+        _value("logits", TensorProto.FLOAT, ["batch", 1, importer.BPE_VOCAB_SIZE]),
+        _value("present_padding_mask", TensorProto.BOOL, ["batch", "present_length"]),
+    ]
+    decoder_outputs.extend(
+        _value(name, TensorProto.FLOAT,
+               ["batch", importer.KV_HEADS, "present_length", importer.KV_HEAD_WIDTH])
+        for name in importer.KV_PRESENT_NAMES
+    )
+    decoder = helper.make_model(
+        helper.make_graph(nodes, "kv-decoder", decoder_inputs, decoder_outputs),
+        opset_imports=[helper.make_opsetid("", 18)],
+    )
+    # The test environment's ONNX Runtime supports IR versions through 11.
+    decoder.ir_version = 11
+    decoder_path = source / "decoder_model.onnx"
+    onnx.save(decoder, decoder_path)
+
+    manifest_path = source / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["format"] = importer.SOURCE_FORMAT
+    manifest["kv_cache"] = {
+        "format": "tiny_receipt_vqa_default_kv_cache_v1",
+        "default_for": ["fp32", "int8_w8a8"],
+    }
+    manifest["generation"]["strategy"] = (
+        "greedy autoregressive one-token decoding with per-layer KV cache"
+    )
+    manifest["outputs"] = {
+        "encoder": [
+            "memory", "memory_padding_mask", "router_logits",
+            "selected_family_ids", *importer.KV_CROSS_NAMES,
+        ],
+        "decoder": ["logits", "present_padding_mask", *importer.KV_PRESENT_NAMES],
+    }
+    for key, path in (("encoder", encoder_path), ("decoder", decoder_path)):
+        manifest["files"][f"{key}_bytes"] = path.stat().st_size
+        manifest["files"][f"{key}_sha256"] = _sha256(path)
+        manifest["variants"]["fp32"][f"{key}_bytes"] = path.stat().st_size
+        manifest["variants"]["fp32"][f"{key}_sha256"] = _sha256(path)
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    return source
 
 
 def _set_decoder_vocab_size(source: Path, vocab_size: int) -> None:
@@ -375,6 +516,15 @@ def _add_int8_w8a8_variant(source: Path) -> dict[str, Path]:
         base_key = key.split("_", 1)[0]
         path = source / filename
         model = onnx.load(source / importer.SOURCE_FILES[base_key])
+        if base_key == "encoder":
+            for output in model.graph.output:
+                if output.name not in importer.KV_CROSS_NAMES:
+                    continue
+                dims = output.type.tensor_type.shape.dim
+                dims[1].dim_param = ""
+                dims[1].dim_value = importer.KV_HEADS
+                dims[3].dim_param = ""
+                dims[3].dim_value = importer.KV_HEAD_WIDTH
         _append_static_u8s8_qdq(model, base_key)
         onnx.save(model, path)
         manifest["files"][key] = filename
@@ -453,15 +603,24 @@ class FakeExporter:
         self,
         fail_on_call: int | None = None,
         *,
-        vocab_size: int = importer.CHAR_VOCAB_SIZE,
+        vocab_size: int = importer.BPE_VOCAB_SIZE,
     ):
         self.commands: list[list[str]] = []
+        self.model_signatures: list[dict[str, dict[str, tuple[int, list]]]] = []
         self.fail_on_call = fail_on_call
         self.vocab_size = vocab_size
 
     @staticmethod
     def _option(command: list[str], name: str) -> str:
         return command[command.index(name) + 1]
+
+    @staticmethod
+    def _options(command: list[str], name: str) -> list[str]:
+        return [
+            command[index + 1]
+            for index, value in enumerate(command)
+            if value == name
+        ]
 
     def __call__(self, raw_command) -> None:
         command = list(raw_command)
@@ -470,10 +629,28 @@ class FakeExporter:
             raise importer.ImportFailure("injected exporter failure")
         output = Path(self._option(command, "--out"))
         report = Path(self._option(command, "--report"))
+        authored_model = onnx.load(self._option(command, "--model"), load_external_data=False)
+        self.model_signatures.append({
+            "inputs": {
+                value.name: importer._tensor_signature(value)
+                for value in authored_model.graph.input
+            },
+            "outputs": {
+                value.name: importer._tensor_signature(value)
+                for value in authored_model.graph.output
+            },
+        })
         output.parent.mkdir(parents=True, exist_ok=True)
         output.write_bytes(b"fake-safetensors")
+        requested_targets = self._options(command, "--target")
         report.write_text(json.dumps({
             "format": "volvox-export-report/v1",
+            "supported": True,
+            "published": True,
+            "targets": {
+                "requested": requested_targets,
+                "resolved": list(importer.expand_targets(requested_targets)),
+            },
             "source": {
                 "path": self._option(command, "--model"),
                 "format": "onnx",
@@ -482,51 +659,66 @@ class FakeExporter:
         if output.parent.name == "encoder":
             inputs = {
                 "input0": {
-                    "source_name": "image",
-                    "shape": [1, 1, 320, 672],
+                    "shape": ["B", 1, 320, 672],
                     "dtype": "float32",
                 },
                 "input1": {
-                    "source_name": "question_ids",
-                    "shape": [1, 192],
+                    "shape": ["B", "Q"],
                     "dtype": "int32",
                 },
                 "input2": {
-                    "source_name": "family_ids",
-                    "shape": [1],
+                    "shape": ["B"],
+                    "dtype": "int32",
+                },
+                "input3": {
+                    "shape": ["B", "Q"],
                     "dtype": "int32",
                 },
             }
             outputs = {
-                "memory": ([1, 402, 320], "float32"),
-                "memory_padding_mask": ([1, 402], "int32"),
-                "router_logits": ([1, 8], "float32"),
-                "selected_family_ids": ([1], "int32"),
+                "memory": (["B", "M", 320], "float32"),
+                "memory_padding_mask": (["B", "M"], "int32"),
+                "router_logits": (["B", 8], "float32"),
+                "selected_family_ids": (["B"], "int32"),
+            }
+            dimensions = {
+                "B": {"min": 1, "max": 1},
+                "Q": {"min": 1, "max": 192},
+                "M": {"min": 211, "max": 402},
             }
         else:
             inputs = {
                 "input0": {
-                    "source_name": "decoder_input_ids",
-                    "shape": [1, 192],
+                    "shape": ["B", "T"],
                     "dtype": "int32",
                 },
                 "input1": {
-                    "source_name": "memory",
-                    "shape": [1, 402, 320],
+                    "shape": ["B", "M", 320],
                     "dtype": "float32",
                 },
                 "input2": {
-                    "source_name": "memory_padding_mask",
-                    "shape": [1, 402],
+                    "shape": ["B", "M"],
                     "dtype": "int32",
                 },
                 "input3": {
-                    "source_name": "family_ids",
-                    "shape": [1],
+                    "shape": ["B"],
                     "dtype": "int32",
                 },
+                "input4": {
+                    "shape": ["B", "T"],
+                    "dtype": "int32",
+                },
+                "input5": {
+                    "shape": ["T", "T"],
+                    "dtype": "float32",
+                },
             }
-            outputs = {"logits": ([1, 192, self.vocab_size], "float32")}
+            outputs = {"logits": (["B", "T", self.vocab_size], "float32")}
+            dimensions = {
+                "B": {"min": 1, "max": 1},
+                "T": {"min": 1, "max": 192},
+                "M": {"min": 211, "max": 402},
+            }
         nodes = []
         if "_int8" in Path(self._option(command, "--model")).stem:
             first_input = next(iter(inputs))
@@ -538,31 +730,72 @@ class FakeExporter:
                     "scale": "fixture_scale",
                     "zero_point": "fixture_zero_point",
                 },
-                "outputs": {"out": "fixture_u8"},
-                "outputs_shape": {"out": inputs[first_input]["shape"]},
-                "outputs_dtype": {"out": "uint8"},
+                "outputs": {"out": {
+                    "tensor": "fixture_u8",
+                    "shape": inputs[first_input]["shape"],
+                    "dtype": "uint8",
+                }},
                 "params": {},
             })
+        if output.parent.name == "encoder":
+            nodes.extend([
+                {
+                    "id": "fixture-image-tokens",
+                    "opType": "Identity",
+                    "inputs": {"input": "input0"},
+                    "outputs": {"out": {
+                        "tensor": "fixture_image_tokens",
+                        "shape": ["B", 210, 320],
+                        "dtype": "float32",
+                    }},
+                    "params": {},
+                },
+                {
+                    "id": "fixture-question-tokens",
+                    "opType": "Identity",
+                    "inputs": {"input": "input1"},
+                    "outputs": {"out": {
+                        "tensor": "fixture_question_tokens",
+                        "shape": ["B", "Q", 320],
+                        "dtype": "float32",
+                    }},
+                    "params": {},
+                },
+                {
+                    "id": "fixture-memory-concat",
+                    "opType": "Concat",
+                    "inputs": {
+                        "input0": "fixture_image_tokens",
+                        "input1": "fixture_question_tokens",
+                    },
+                    "outputs": {"out": {
+                        "tensor": "fixture_encoded_sequence",
+                        "shape": ["B", "M", 320],
+                        "dtype": "float32",
+                    }},
+                    "params": {"axis": 1},
+                },
+            ])
         for index, (name, (shape, dtype)) in enumerate(outputs.items()):
+            source = (
+                "fixture_encoded_sequence"
+                if output.parent.name == "encoder" and name == "memory"
+                else next(iter(inputs))
+            )
             nodes.append({
                 "id": f"output-{index}",
                 "opType": "Identity",
-                "inputs": {"input": next(iter(inputs))},
-                "outputs": {"out": name},
-                "outputs_shape": {"out": shape},
-                "outputs_dtype": {"out": dtype},
+                "inputs": {"input": source},
+                "outputs": {"out": {
+                    "tensor": name,
+                    "shape": shape,
+                    "dtype": dtype,
+                }},
                 "params": {},
             })
         graph = {
             "format": "volvox-graph/v1",
-            "source": {
-                "onnx": Path(self._option(command, "--model")).name,
-                "package_class": (
-                    "hybrid"
-                    if "_int8" in Path(self._option(command, "--model")).stem
-                    else "fp32"
-                ),
-            },
+            "dimensions": dimensions,
             "inputs": inputs,
             "nodes": nodes,
             "outputs": list(outputs),
@@ -570,6 +803,176 @@ class FakeExporter:
         (output.parent / "graph.json").write_text(
             json.dumps(graph),
             encoding="utf-8",
+        )
+
+
+class FakeKVExporter(FakeExporter):
+    def __call__(self, raw_command) -> None:
+        command = list(raw_command)
+        self.commands.append(command)
+        if self.fail_on_call == len(self.commands):
+            raise importer.ImportFailure("injected exporter failure")
+        output_path = Path(self._option(command, "--out"))
+        report_path = Path(self._option(command, "--report"))
+        authored_model = onnx.load(
+            self._option(command, "--model"), load_external_data=False
+        )
+        self.model_signatures.append({
+            "inputs": {
+                value.name: importer._tensor_signature(value)
+                for value in authored_model.graph.input
+            },
+            "outputs": {
+                value.name: importer._tensor_signature(value)
+                for value in authored_model.graph.output
+            },
+        })
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_bytes(b"fake-kv-safetensors")
+        requested_targets = self._options(command, "--target")
+        report_path.write_text(json.dumps({
+            "format": "volvox-export-report/v1",
+            "supported": True,
+            "published": True,
+            "targets": {
+                "requested": requested_targets,
+                "resolved": list(importer.expand_targets(requested_targets)),
+            },
+            "source": {"path": self._option(command, "--model"), "format": "onnx"},
+        }), encoding="utf-8")
+
+        nodes = []
+        if output_path.parent.name == "encoder":
+            inputs = {
+                "input0": {"shape": ["B", 1, 320, 672], "dtype": "float32"},
+                "input1": {"shape": ["B", "Q"], "dtype": "int32"},
+                "input2": {"shape": ["B"], "dtype": "int32"},
+                "input3": {"shape": ["B", "Q"], "dtype": "int32"},
+            }
+            dimensions = {
+                "B": {"min": 1, "max": 1},
+                "Q": {"min": 1, "max": 192},
+                "M": {"min": 211, "max": 402},
+            }
+            outputs = {
+                "memory": (["B", "M", 320], "float32"),
+                "memory_padding_mask": (["B", "M"], "int32"),
+                "router_logits": (["B", 8], "float32"),
+                "selected_family_ids": (["B"], "int32"),
+                **{
+                    name: (["B", 8, "M", 40], "float32")
+                    for name in importer.KV_CROSS_NAMES
+                },
+            }
+            nodes.extend([
+                {
+                    "id": "image-tokens", "opType": "Identity",
+                    "inputs": {"input": "input0"},
+                    "outputs": {"out": {"tensor": "image_tokens", "shape": ["B", 210, 320], "dtype": "float32"}},
+                    "params": {},
+                },
+                {
+                    "id": "question-tokens", "opType": "Identity",
+                    "inputs": {"input": "input1"},
+                    "outputs": {"out": {"tensor": "question_tokens", "shape": ["B", "Q", 320], "dtype": "float32"}},
+                    "params": {},
+                },
+                {
+                    "id": "memory-concat", "opType": "Concat",
+                    "inputs": {"input0": "image_tokens", "input1": "question_tokens"},
+                    "outputs": {"out": {"tensor": "memory", "shape": ["B", "M", 320], "dtype": "float32"}},
+                    "params": {"axis": 1},
+                },
+            ])
+            for index, (name, (shape, dtype)) in enumerate(outputs.items()):
+                if name == "memory":
+                    continue
+                nodes.append({
+                    "id": f"encoder-output-{index}", "opType": "Identity",
+                    "inputs": {"input": "input0"},
+                    "outputs": {"out": {"tensor": name, "shape": shape, "dtype": dtype}},
+                    "params": {},
+                })
+        else:
+            inputs = {
+                "input0": {"shape": ["B", 1], "dtype": "int32"},
+                "input1": {"shape": ["B"], "dtype": "int32"},
+                "input2": {"shape": ["B"], "dtype": "int32"},
+                "input3": {"shape": ["B", "M"], "dtype": "int32"},
+                "input4": {"shape": ["B", "P"], "dtype": "int32"},
+            }
+            for index, _name in enumerate(importer.KV_CROSS_NAMES):
+                inputs[f"input{index + 5}"] = {
+                    "shape": ["B", 8, "M", 40], "dtype": "float32",
+                }
+            for index, _name in enumerate(importer.KV_PAST_NAMES):
+                inputs[f"input{index + 13}"] = {
+                    "shape": ["B", 8, "P", 40], "dtype": "float32",
+                }
+            dimensions = {
+                "B": {"min": 1, "max": 1},
+                "M": {"min": 211, "max": 402},
+                "P": {"min": 1, "max": 191},
+                "R": {"min": 2, "max": 192},
+            }
+            outputs = {
+                "logits": (["B", 1, importer.BPE_VOCAB_SIZE], "float32"),
+                "present_padding_mask": (["B", "R"], "int32"),
+                **{
+                    name: (["B", 8, "R", 40], "float32")
+                    for name in importer.KV_PRESENT_NAMES
+                },
+            }
+            for index, name in enumerate(importer.KV_PRESENT_NAMES):
+                current = f"current_cache_{index}"
+                nodes.extend([
+                    {
+                        "id": f"current-{index}", "opType": "Identity",
+                        "inputs": {"input": "input0"},
+                        "outputs": {"out": {"tensor": current, "shape": ["B", 8, 1, 40], "dtype": "float32"}},
+                        "params": {},
+                    },
+                    {
+                        "id": f"present-{index}", "opType": "Concat",
+                        "inputs": {"input0": f"input{index + 13}", "input1": current},
+                        "outputs": {"out": {"tensor": name, "shape": ["B", 8, "R", 40], "dtype": "float32"}},
+                        "params": {"axis": 2},
+                    },
+                ])
+            for index, name in enumerate(("logits", "present_padding_mask")):
+                shape, dtype = outputs[name]
+                nodes.append({
+                    "id": f"decoder-output-{index}", "opType": "Identity",
+                    "inputs": {"input": "input0"},
+                    "outputs": {"out": {"tensor": name, "shape": shape, "dtype": dtype}},
+                    "params": {},
+                })
+        if "_int8" in Path(self._option(command, "--model")).stem:
+            first_input = next(iter(inputs))
+            nodes.append({
+                "id": "preserved-quantize",
+                "opType": "QuantizeLinear",
+                "inputs": {
+                    "input": first_input,
+                    "scale": "fixture_scale",
+                    "zero_point": "fixture_zero_point",
+                },
+                "outputs": {"out": {
+                    "tensor": "fixture_u8",
+                    "shape": inputs[first_input]["shape"],
+                    "dtype": "uint8",
+                }},
+                "params": {},
+            })
+        graph = {
+            "format": "volvox-graph/v1",
+            "dimensions": dimensions,
+            "inputs": inputs,
+            "nodes": nodes,
+            "outputs": list(outputs),
+        }
+        (output_path.parent / "graph.json").write_text(
+            json.dumps(graph), encoding="utf-8"
         )
 
 
@@ -662,6 +1065,500 @@ def _heldout_summary(files, *, changed_predictions: int):
 
 
 class TinyReceiptSplitImporterTests(unittest.TestCase):
+    def test_staged_graph_rejects_retired_shape_system_field(self):
+        with tempfile.TemporaryDirectory(
+            prefix="volvoxai-split-retired-shape-system-"
+        ) as temporary:
+            stage = Path(temporary)
+            (stage / "graph.json").write_text(json.dumps({
+                "format": importer.GRAPH_FORMAT,
+                "shape_system": "volvox-bounded-shape/v1",
+                "dimensions": {},
+                "inputs": {},
+                "nodes": [],
+                "outputs": [],
+            }), encoding="utf-8")
+            (stage / "model.safetensors").write_bytes(b"fixture")
+            (stage / "export_report.json").write_text("{}", encoding="utf-8")
+
+            with self.assertRaisesRegex(
+                importer.ImportFailure,
+                "does not use the closed v1 root schema",
+            ):
+                importer._validate_staged_graph(
+                    stage,
+                    label="fixture",
+                    expected_dimensions={},
+                    expected_inputs={},
+                    expected_outputs={},
+                )
+
+    def test_explicit_kv_sentinel_rejects_nonfinite_logits(self):
+        with tempfile.TemporaryDirectory(prefix="volvoxai-split-kv-nan-") as temporary:
+            source = _upgrade_source_to_kv(_write_source(Path(temporary) / "source"))
+            validated = importer.validate_source(source)
+            decoder_path = Path(validated["selected_paths"]["decoder"])
+            decoder = onnx.load(decoder_path)
+            logits_node = next(
+                node for node in decoder.graph.node if node.name == "logits_value"
+            )
+            logits_node.output[0] = "unused_finite_logits"
+            decoder.graph.node.append(_constant(
+                "nonfinite_logits",
+                "logits",
+                np.full((1, 1, importer.BPE_VOCAB_SIZE), np.nan, np.float32),
+            ))
+            onnx.save(decoder, decoder_path)
+            with self.assertRaisesRegex(importer.ImportFailure, "invalid logits"):
+                importer.verify_explicit_kv_sentinel(validated)
+
+    def test_explicit_kv_source_proves_sentinel_and_publishes_typed_v1_package(self):
+        with tempfile.TemporaryDirectory(prefix="volvoxai-split-kv-import-") as temporary:
+            root = Path(temporary)
+            source = _upgrade_source_to_kv(_write_source(root / "source"))
+            validated = importer.validate_source(source)
+            source_hashes = {
+                key: _sha256(path) for key, path in validated["paths"].items()
+            }
+            parity = importer.verify_explicit_kv_sentinel(validated)
+            self.assertEqual(parity["families_verified"], list(importer.FAMILY_ORDER))
+            self.assertEqual(parity["producer_initial_past_length"], 0)
+            self.assertEqual(parity["package_initial_past_length"], 1)
+            self.assertEqual(parity["sentinel_mask_value"], 1)
+            self.assertEqual(parity["logits_max_abs_difference"], 0.0)
+            self.assertEqual(parity["present_cache_suffix_max_abs_difference"], 0.0)
+
+            fake = FakeKVExporter()
+
+            def verified_parity(import_source):
+                self.assertEqual(import_source["cache_mode"], "explicit-kv")
+                return parity
+
+            output = root / "package"
+            importer.import_package(
+                source,
+                output,
+                exporter=fake,
+                parity_verifier=verified_parity,
+            )
+            manifest = json.loads(
+                (output / "package_manifest.json").read_text(encoding="utf-8")
+            )
+
+            self.assertEqual(manifest["format"], importer.PACKAGE_FORMAT)
+            self.assertEqual(
+                manifest["variant"]["compiled_graph_package_class"],
+                {"encoder": "fp32", "decoder": "fp32"},
+            )
+            self.assertIs(
+                manifest["variant"]["complete_w8a8_fusion"],
+                False,
+            )
+            self.assertEqual(
+                set(manifest["shape_contract"]),
+                {
+                    "graph_shape_mode", "dimensions", "fixed_geometry",
+                    "relations", "semantic_inputs",
+                },
+            )
+            self.assertEqual(
+                manifest["shape_contract"]["dimensions"],
+                {
+                    "B": {"min": 1, "max": 1},
+                    "Q": {"min": 1, "max": 192},
+                    "M": {"min": 211, "max": 402},
+                    "P": {"min": 1, "max": 191},
+                    "R": {"min": 2, "max": 192},
+                },
+            )
+            self.assertEqual(
+                manifest["shape_contract"]["semantic_inputs"],
+                {
+                    "question_position_ids": {
+                        "shape": ["B", "Q"],
+                        "values": "zero_based_contiguous",
+                    }
+                },
+            )
+            self.assertEqual(
+                manifest["cache_contract"],
+                {
+                    "format": "masked-zero-sentinel-v1",
+                    "layers": 4,
+                    "heads": 8,
+                    "head_width": 40,
+                    "past_dimension": "P",
+                    "present_dimension": "R",
+                    "initial_past_length": 1,
+                    "sentinel_mask_value": 1,
+                    "cache_dtype": "float32",
+                },
+            )
+            self.assertEqual(
+                manifest["generation"]["strategy"],
+                "greedy-autoregressive-explicit-kv",
+            )
+            self.assertEqual(len(manifest["graphs"]["encoder"]["inputs"]), 4)
+            self.assertEqual(len(manifest["graphs"]["encoder"]["outputs"]), 12)
+            self.assertEqual(len(manifest["graphs"]["decoder"]["inputs"]), 21)
+            self.assertEqual(len(manifest["graphs"]["decoder"]["outputs"]), 10)
+            self.assertEqual(
+                manifest["validation"]["canonical_present_relation"]["witness_count"],
+                8,
+            )
+            self.assertEqual(
+                manifest["validation"]["kv_authoring_normalization"]["decoder"]
+                ["executable_nodes_rewritten"],
+                0,
+            )
+            self.assertEqual(
+                manifest["validation"]["kv_authoring_parity"]["decoder"],
+                {
+                    "status": "not_applicable",
+                    "reason": "decoder executable nodes were not rewritten",
+                },
+            )
+            self.assertEqual(
+                manifest["validation"]["offline_target"],
+                "portable",
+            )
+            self.assertNotIn(
+                "offline_target_attestation", manifest["validation"]
+            )
+            self.assertEqual(len(fake.commands), 2)
+            self.assertTrue(all(
+                [
+                    command[index + 1]
+                    for index, value in enumerate(command)
+                    if value == "--target"
+                ] == ["portable"]
+                for command in fake.commands
+            ))
+            self.assertTrue(all(
+                command.count("--allow-silu-numerical-migration") == 1
+                for command in fake.commands
+            ))
+            self.assertTrue(all(
+                "--allow-static-qdq-qbatch-matmul-migration" not in command
+                for command in fake.commands
+            ))
+            self.assertTrue(all(
+                "--allow-static-qdq-groupnorm-silu-migration" not in command
+                for command in fake.commands
+            ))
+            self.assertTrue(all(
+                "--allow-quantized-bias-folding-migration" not in command
+                for command in fake.commands
+            ))
+            self.assertTrue(all(
+                "--defer-static-qdq-layout-optimization" not in command
+                for command in fake.commands
+            ))
+            self.assertTrue(all(
+                command.count(
+                    "--enable-exact-common-subexpression-elimination"
+                ) == 1
+                for command in fake.commands
+            ))
+            decoder_bounds = [
+                fake.commands[1][index + 1]
+                for index, value in enumerate(fake.commands[1])
+                if value == "--dimension-bound"
+            ]
+            self.assertEqual(
+                decoder_bounds,
+                ["B=1:1", "M=211:402", "P=1:191", "R=2:192"],
+            )
+            self.assertEqual(len(fake.model_signatures[0]["outputs"]), 12)
+            self.assertEqual(len(fake.model_signatures[1]["inputs"]), 21)
+            self.assertEqual(len(fake.model_signatures[1]["outputs"]), 10)
+            self.assertEqual(
+                {_key: _sha256(path) for _key, path in validated["paths"].items()},
+                source_hashes,
+            )
+
+    def test_repeated_export_targets_are_intersected_and_recorded(self):
+        with tempfile.TemporaryDirectory(
+            prefix="volvoxai-split-kv-targets-"
+        ) as temporary:
+            root = Path(temporary)
+            source = _upgrade_source_to_kv(_write_source(root / "source"))
+            fake = FakeKVExporter()
+
+            output = root / "package"
+            importer.import_package(
+                source,
+                output,
+                targets=(
+                    "portable",
+                    "backend:vulkan",
+                    "backend:opengl",
+                    "backend:cuda",
+                    "backend:vulkan",
+                ),
+                exporter=fake,
+                parity_verifier=lambda _source: {},
+            )
+
+            expected_requested = [
+                "portable",
+                "backend:vulkan",
+                "backend:opengl",
+                "backend:cuda",
+            ]
+            expected_resolved = [
+                "cpu-js",
+                "wasm",
+                "webgpu",
+                "native-cpu",
+                "backend:vulkan",
+                "backend:opengl",
+                "backend:cuda",
+            ]
+            self.assertEqual(len(fake.commands), 2)
+            for command in fake.commands:
+                self.assertEqual(
+                    [
+                        command[index + 1]
+                        for index, value in enumerate(command)
+                        if value == "--target"
+                    ],
+                    expected_requested,
+                )
+            manifest = json.loads(
+                (output / "package_manifest.json").read_text(encoding="utf-8")
+            )
+            self.assertNotIn("offline_target", manifest["validation"])
+            self.assertEqual(
+                manifest["validation"]["offline_target_attestation"],
+                {
+                    "requested": expected_requested,
+                    "resolved": expected_resolved,
+                },
+            )
+
+    def test_mismatched_export_target_report_fails_before_publication(self):
+        with tempfile.TemporaryDirectory(
+            prefix="volvoxai-split-kv-target-report-"
+        ) as temporary:
+            root = Path(temporary)
+            source = _upgrade_source_to_kv(_write_source(root / "source"))
+            fake = FakeKVExporter()
+
+            def mismatched_exporter(command):
+                fake(command)
+                report_path = Path(FakeKVExporter._option(command, "--report"))
+                report = json.loads(report_path.read_text(encoding="utf-8"))
+                report["targets"] = {
+                    "requested": ["portable"],
+                    "resolved": ["cpu-js", "wasm", "webgpu", "native-cpu"],
+                }
+                report_path.write_text(json.dumps(report), encoding="utf-8")
+
+            output = root / "package"
+            with self.assertRaisesRegex(
+                importer.ImportFailure,
+                "does not attest the requested targets",
+            ):
+                importer.import_package(
+                    source,
+                    output,
+                    targets=("portable", "backend:vulkan"),
+                    exporter=mismatched_exporter,
+                    parity_verifier=lambda _source: {},
+                )
+            self.assertFalse(output.exists())
+            self.assertEqual(list(root.glob(".package.stage-*")), [])
+
+    def test_target_cli_repeats_generic_exporter_targets(self):
+        arguments = importer.parse_args(
+            [
+                "--source", "source",
+                "--out-dir", "package",
+                "--target", "portable",
+                "--target", "backend:vulkan",
+                "--target", "backend:opengl",
+                "--target", "backend:cuda",
+            ]
+        )
+        self.assertEqual(
+            arguments.targets,
+            [
+                "portable",
+                "backend:vulkan",
+                "backend:opengl",
+                "backend:cuda",
+            ],
+        )
+        self.assertIsNone(
+            importer.parse_args([
+                "--source", "source",
+                "--out-dir", "package",
+            ]).targets
+        )
+
+    def test_explicit_kv_int8_enables_narrow_quantized_migrations_for_both_graphs(self):
+        with tempfile.TemporaryDirectory(prefix="volvoxai-split-kv-int8-") as temporary:
+            root = Path(temporary)
+            source = _upgrade_source_to_kv(_write_source(root / "source"))
+            _add_int8_w8a8_variant(source)
+            fake = FakeKVExporter()
+
+            output = root / "package"
+            importer.import_package(
+                source,
+                output,
+                variant="int8-w8a8",
+                exporter=fake,
+                parity_verifier=lambda _source: {},
+            )
+
+            manifest = json.loads(
+                (output / "package_manifest.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(
+                manifest["variant"]["compiled_graph_package_class"],
+                {"encoder": "hybrid", "decoder": "hybrid"},
+            )
+            self.assertIs(
+                manifest["variant"]["complete_w8a8_fusion"],
+                False,
+            )
+            self.assertEqual(len(fake.commands), 2)
+            self.assertTrue(all(
+                command.count(
+                    "--allow-static-qdq-qbatch-matmul-migration"
+                ) == 1
+                for command in fake.commands
+            ))
+            self.assertTrue(all(
+                command.count(
+                    "--allow-quantized-bias-folding-migration"
+                ) == 1
+                for command in fake.commands
+            ))
+            self.assertTrue(all(
+                "--allow-static-qdq-groupnorm-silu-migration" not in command
+                for command in fake.commands
+            ))
+            self.assertTrue(all(
+                "_int8" in Path(FakeKVExporter._option(command, "--model")).stem
+                for command in fake.commands
+            ))
+
+    def test_explicit_kv_int8_rejects_every_nonhybrid_compiled_class(self):
+        with tempfile.TemporaryDirectory(
+            prefix="volvoxai-split-kv-int8-class-"
+        ) as temporary:
+            root = Path(temporary)
+            source = _upgrade_source_to_kv(_write_source(root / "source"))
+            _add_int8_w8a8_variant(source)
+
+            for package_class in ("fp32", "w8a8-v1"):
+                with self.subTest(package_class=package_class):
+                    output = root / f"package-{package_class}"
+                    with patch.object(
+                        importer,
+                        "classify_package",
+                        return_value=package_class,
+                    ):
+                        with self.assertRaisesRegex(
+                            importer.ImportFailure,
+                            "must classify both KV INT8 graphs as hybrid",
+                        ):
+                            importer.import_package(
+                                source,
+                                output,
+                                variant="int8-w8a8",
+                                exporter=FakeKVExporter(),
+                                parity_verifier=lambda _source: {},
+                            )
+                    self.assertFalse(output.exists())
+
+    def test_explicit_kv_source_rejects_weakened_cache_and_present_shapes(self):
+        with tempfile.TemporaryDirectory(prefix="volvoxai-split-kv-cache-") as temporary:
+            source = _upgrade_source_to_kv(_write_source(Path(temporary) / "source"))
+            manifest_path = source / "manifest.json"
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            manifest["kv_cache"]["format"] = "unsupported-cache-contract"
+            manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+            with self.assertRaisesRegex(
+                importer.ImportFailure, "KV source cache declaration is invalid"
+            ):
+                importer.validate_source(source)
+
+        with tempfile.TemporaryDirectory(prefix="volvoxai-split-kv-shape-") as temporary:
+            source = _upgrade_source_to_kv(_write_source(Path(temporary) / "source"))
+            decoder_path = source / "decoder_model.onnx"
+            decoder = onnx.load(decoder_path)
+            decoder.graph.output[2].type.tensor_type.shape.dim[2].dim_param = "past_length"
+            onnx.save(decoder, decoder_path)
+            _refresh_model_record(source, "decoder")
+            with self.assertRaisesRegex(
+                importer.ImportFailure, "KV decoder output signature differs"
+            ):
+                importer.validate_source(source)
+
+    def test_wrong_source_format_is_rejected(self):
+        with tempfile.TemporaryDirectory(prefix="volvoxai-split-wrong-format-") as temporary:
+            source = _write_source(Path(temporary) / "source")
+            manifest_path = source / "manifest.json"
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            manifest["format"] = "unsupported-source-format"
+            manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+            with self.assertRaisesRegex(
+                importer.ImportFailure,
+                "source manifest format must be",
+            ):
+                importer.validate_source(source)
+
+    def test_dynamic_reshape_normalizer_rejects_two_independent_inferred_extents(self):
+        model = helper.make_model(
+            helper.make_graph(
+                [
+                    helper.make_node(
+                        "Shape",
+                        ["data"],
+                        ["source_shape"],
+                        name="dynamic_shape",
+                    ),
+                    helper.make_node(
+                        "Gather",
+                        ["source_shape", "reorder"],
+                        ["target_shape"],
+                        name="swap_dynamic_extents",
+                        axis=0,
+                    ),
+                    helper.make_node(
+                        "Reshape",
+                        ["data", "target_shape"],
+                        ["output"],
+                        name="unrepresentable_reshape",
+                    ),
+                ],
+                "two-independent-extents",
+                [_value("data", TensorProto.FLOAT, ["B", "T", "M"])],
+                [_value("output", TensorProto.FLOAT, ["B", "M", "T"])],
+                initializer=[
+                    numpy_helper.from_array(
+                        np.asarray([0, 2, 1], dtype=np.int64),
+                        "reorder",
+                    )
+                ],
+            ),
+            opset_imports=[helper.make_opsetid("", 18)],
+        )
+
+        with self.assertRaisesRegex(
+            importer.ImportFailure,
+            "needs 2 independent inferred dimensions",
+        ):
+            importer._rewrite_dynamic_reshape_targets(
+                model,
+                role="decoder",
+                onnx=onnx,
+            )
+
     def test_zero_changed_predictions_is_a_valid_nonnegative_count(self):
         files = {}
         for index, key in enumerate(
@@ -685,756 +1582,43 @@ class TinyReceiptSplitImporterTests(unittest.TestCase):
                         files,
                     )
 
-    def test_import_delegates_both_graphs_and_publishes_one_typed_manifest(self):
-        with tempfile.TemporaryDirectory(prefix="volvoxai-split-import-") as temporary:
-            root = Path(temporary)
-            source = _write_source(root / "source")
-            output = root / "package"
-            fake = FakeExporter()
-
-            importer.import_package(
-                source,
-                output,
-                exporter=fake,
-                parity_verifier=_parity,
-            )
-            manifest = json.loads(
-                (output / "package_manifest.json").read_text(encoding="utf-8")
-            )
-            encoder_report = json.loads(
-                (output / "encoder" / "export_report.json").read_text(encoding="utf-8")
-            )
-
-        self.assertEqual(manifest["format"], importer.PACKAGE_FORMAT)
-        self.assertEqual(
-            manifest["tokenizer"],
-            {
-                "type": "char-vocab",
-                "version": 1,
-                "itos_key": "itos",
-                "token_ids": {"pad": 0, "bos": 1, "eos": 2, "unk": 3},
-            },
-        )
-        self.assertEqual(len(fake.commands), 2)
-        self.assertIn("question_ids=int32", fake.commands[0])
-        self.assertIn("memory_padding_mask=int32", fake.commands[0])
-        self.assertIn("decoder_input_ids=int32", fake.commands[1])
-        self.assertNotIn(
-            "--defer-static-qdq-layout-optimization", fake.commands[0],
-        )
-        self.assertNotIn(
-            "--defer-static-qdq-layout-optimization", fake.commands[1],
-        )
-        self.assertEqual(
-            manifest["graphs"]["encoder"]["inputs"],
-            {"image": "input0", "question_ids": "input1", "family_ids": "input2"},
-        )
-        self.assertEqual(
-            manifest["routing"],
-            {
-                "mode": "runtime",
-                "family_inputs": {
-                    "encoder": "input2",
-                    "decoder": "input3",
-                },
-            },
-        )
-        self.assertEqual(
-            manifest["mask_semantics"]["memory_padding_mask"],
-            "nonzero_means_blocked",
-        )
-        self.assertEqual(manifest["generation"]["logits_row"], "prefix_length_minus_one")
-        self.assertEqual(encoder_report["source"]["path"], "encoder_model.onnx")
-        self.assertNotIn(str(source), json.dumps(manifest))
-        self.assertNotIn(str(source), json.dumps(encoder_report))
-
-    def test_bpe1536_source_is_validated_and_packaged_with_its_tokenizer_contract(self):
-        with tempfile.TemporaryDirectory(prefix="volvoxai-split-bpe-") as temporary:
-            root = Path(temporary)
-            source = _write_source(root / "source")
-            source_vocab = _upgrade_source_to_bpe(source)
-            validated = importer.validate_source(source)
-            output = root / "package"
-            fake = FakeExporter(vocab_size=importer.BPE_VOCAB_SIZE)
-
-            importer.import_package(
-                source,
-                output,
-                exporter=fake,
-                parity_verifier=_parity,
-            )
-            manifest = json.loads(
-                (output / "package_manifest.json").read_text(encoding="utf-8")
-            )
-            packaged_vocab = json.loads(
-                (output / "vocab.json").read_text(encoding="utf-8")
-            )
-            decoder_graph = json.loads(
-                (output / "decoder" / "graph.json").read_text(encoding="utf-8")
-            )
-
-        expected_tokenizer = {
-            "type": "byte_fallback_bpe",
-            "version": 1,
-            "vocab_size": importer.BPE_VOCAB_SIZE,
-            "normalization": "NFC",
-            "tokenizer_hash": source_vocab["tokenizer_hash"],
-            "itos_key": "itos",
-            "merges_key": "merges",
-            "token_ids": {"pad": 0, "bos": 1, "eos": 2, "unk": 3},
-        }
-        self.assertEqual(validated["vocab_size"], importer.BPE_VOCAB_SIZE)
-        self.assertEqual(validated["tokenizer"], expected_tokenizer)
-        self.assertEqual(manifest["tokenizer"], expected_tokenizer)
-        self.assertEqual(packaged_vocab, source_vocab)
-        self.assertEqual(
-            decoder_graph["nodes"][-1]["outputs_shape"]["out"],
-            [1, 192, importer.BPE_VOCAB_SIZE],
-        )
-
-    def test_bpe_tokenizer_hash_tampering_is_rejected(self):
-        with tempfile.TemporaryDirectory(prefix="volvoxai-split-bpe-hash-") as temporary:
-            root = Path(temporary)
-            source = _write_source(root / "source")
-            _upgrade_source_to_bpe(source)
-            vocab_path = source / "vocab.json"
-            vocab = json.loads(vocab_path.read_text(encoding="utf-8"))
-            vocab["tokenizer_hash"] = "0" * 64
-            vocab_path.write_text(json.dumps(vocab), encoding="utf-8")
-
-            with self.assertRaisesRegex(importer.ImportFailure, "tokenizer_hash"):
+    def test_explicit_kv_source_hash_tampering_is_rejected(self):
+        with tempfile.TemporaryDirectory(prefix="volvoxai-split-kv-hash-") as temporary:
+            source = _upgrade_source_to_kv(_write_source(Path(temporary) / "source"))
+            with (source / "encoder_model.onnx").open("ab") as stream:
+                stream.write(b"tampered")
+            with self.assertRaisesRegex(
+                importer.ImportFailure,
+                "byte size does not match",
+            ):
                 importer.validate_source(source)
 
-    def test_publication_is_deterministic_and_distribution_readable(self):
-        with tempfile.TemporaryDirectory(prefix="volvoxai-split-deterministic-") as temporary:
+    def test_explicit_kv_publication_is_atomic_and_never_overwrites(self):
+        with tempfile.TemporaryDirectory(prefix="volvoxai-split-kv-atomic-") as temporary:
             root = Path(temporary)
-            source = _write_source(root / "source")
-            outputs = (root / "package-a", root / "package-b")
-            snapshots = []
-            for output in outputs:
-                importer.import_package(
-                    source,
-                    output,
-                    exporter=FakeExporter(),
-                    parity_verifier=_parity,
-                )
-                self.assertEqual(stat.S_IMODE(output.stat().st_mode), 0o755)
-                snapshot = {}
-                for path in sorted(output.rglob("*"), key=lambda item: item.as_posix()):
-                    relative = path.relative_to(output).as_posix()
-                    if path.is_dir():
-                        self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o755)
-                    else:
-                        self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o644)
-                        snapshot[relative] = path.read_bytes()
-                snapshots.append(snapshot)
-            self.assertEqual(snapshots[0], snapshots[1])
-
-    def test_second_export_failure_leaves_no_package_or_stage(self):
-        with tempfile.TemporaryDirectory(prefix="volvoxai-split-atomic-") as temporary:
-            root = Path(temporary)
-            source = _write_source(root / "source")
+            source = _upgrade_source_to_kv(_write_source(root / "source"))
             output = root / "package"
-            with self.assertRaisesRegex(importer.ImportFailure, "injected"):
+            with self.assertRaisesRegex(importer.ImportFailure, "injected exporter"):
                 importer.import_package(
                     source,
                     output,
-                    exporter=FakeExporter(fail_on_call=2),
-                    parity_verifier=_parity,
+                    exporter=FakeKVExporter(fail_on_call=2),
+                    parity_verifier=lambda _source: {},
                 )
             self.assertFalse(output.exists())
             self.assertEqual(list(root.glob(".package.stage-*")), [])
 
-    def test_concurrent_empty_destination_is_not_overwritten(self):
-        with tempfile.TemporaryDirectory(prefix="volvoxai-split-publish-race-") as temporary:
-            root = Path(temporary)
-            source = _write_source(root / "source")
-            output = root / "package"
-            fake = FakeExporter()
-
-            def create_destination_after_export(command):
-                fake(command)
-                if len(fake.commands) == 2:
-                    output.mkdir()
-
-            with self.assertRaisesRegex(
-                importer.ImportFailure,
-                "already exists",
-            ):
+            output.mkdir()
+            marker = output / "owner.txt"
+            marker.write_text("preserve", encoding="utf-8")
+            with self.assertRaisesRegex(importer.ImportFailure, "already exists"):
                 importer.import_package(
                     source,
                     output,
-                    exporter=create_destination_after_export,
-                    parity_verifier=_parity,
+                    exporter=FakeKVExporter(),
+                    parity_verifier=lambda _source: {},
                 )
-            self.assertTrue(output.is_dir())
-            self.assertEqual(list(output.iterdir()), [])
-            self.assertEqual(list(root.glob(".package.stage-*")), [])
-
-    def test_hash_and_signature_changes_fail_before_export(self):
-        with tempfile.TemporaryDirectory(prefix="volvoxai-split-source-") as temporary:
-            root = Path(temporary)
-            source = _write_source(root / "source")
-            (source / "encoder_model.onnx").write_bytes(
-                (source / "encoder_model.onnx").read_bytes() + b"x"
-            )
-            with self.assertRaisesRegex(importer.ImportFailure, "byte size"):
-                importer.validate_source(source)
-
-        with tempfile.TemporaryDirectory(prefix="volvoxai-split-signature-") as temporary:
-            root = Path(temporary)
-            source = _write_source(root / "source")
-            model = onnx.load(source / "decoder_model.onnx")
-            model.graph.output[0].name = "wrong_logits"
-            model.graph.node[0].output[0] = "wrong_logits"
-            onnx.save(model, source / "decoder_model.onnx")
-            _refresh_model_record(source, "decoder")
-            with self.assertRaisesRegex(importer.ImportFailure, "output signature"):
-                importer.validate_source(source)
-
-    def test_int8_w8a8_variant_is_selected_hashed_and_described_honestly(self):
-        with tempfile.TemporaryDirectory(prefix="volvoxai-split-int8-complete-") as temporary:
-            root = Path(temporary)
-            source = _write_source(root / "source")
-            int8_paths = _add_int8_w8a8_variant(source)
-            validated = importer.validate_source(source, variant="int8-w8a8")
-            self.assertEqual(
-                {key: validated["paths"][key] for key in int8_paths},
-                int8_paths,
-            )
-            self.assertEqual(
-                validated["selected_paths"],
-                {
-                    "encoder": int8_paths["encoder_int8_w8a8"],
-                    "decoder": int8_paths["decoder_int8_w8a8"],
-                },
-            )
-            for key, path in int8_paths.items():
-                self.assertEqual(validated["hashes"][key], _sha256(path))
-
-            output = root / "package"
-            fake = FakeExporter()
-            importer.import_package(
-                source,
-                output,
-                variant="int8-w8a8",
-                exporter=fake,
-                parity_verifier=_parity,
-            )
-            manifest = json.loads(
-                (output / "package_manifest.json").read_text(encoding="utf-8")
-            )
-            report = json.loads(
-                (output / "encoder" / "export_report.json").read_text(encoding="utf-8")
-            )
-            self.assertTrue(
-                FakeExporter._option(fake.commands[0], "--model").endswith(
-                    "encoder_model_int8.onnx"
-                )
-            )
-            self.assertEqual(
-                FakeExporter._option(fake.commands[0], "--quant-mode"),
-                "preserve",
-            )
-            self.assertIn(
-                "--defer-static-qdq-layout-optimization", fake.commands[0],
-            )
-            self.assertIn(
-                "--defer-static-qdq-layout-optimization", fake.commands[1],
-            )
-            self.assertEqual(manifest["source"]["variant"], "int8-w8a8")
-            self.assertEqual(
-                manifest["source"]["encoder_onnx"]["path"],
-                "encoder_model_int8.onnx",
-            )
-            self.assertEqual(manifest["variant"]["requested"], "int8-w8a8")
-            self.assertEqual(
-                Path(FakeExporter._option(fake.commands[0], "--model")),
-                int8_paths["encoder_int8_w8a8"],
-            )
-            self.assertEqual(
-                Path(FakeExporter._option(fake.commands[1], "--model")),
-                int8_paths["decoder_int8_w8a8"],
-            )
-            self.assertEqual(
-                manifest["variant"]["compiled_graph_package_class"],
-                {"encoder": "hybrid", "decoder": "hybrid"},
-            )
-            self.assertFalse(manifest["variant"]["complete_w8a8_fusion"])
-            self.assertEqual(report["source"]["path"], "encoder_model_int8.onnx")
-            self.assertNotIn(str(source), json.dumps(manifest))
-            self.assertNotIn(str(source), json.dumps(report))
-            self.assertFalse((output / ".static-qdq-source").exists())
-
-    def test_int8_runtime_accepts_declared_dynamic_prefix_lengths_within_bounds(self):
-        with tempfile.TemporaryDirectory(prefix="volvoxai-split-prefixes-") as temporary:
-            root = Path(temporary)
-            source = _write_source(root / "source")
-            _upgrade_source_to_bpe(source)
-            _add_int8_w8a8_variant(source)
-            manifest_path = source / "manifest.json"
-            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-            runtime = manifest["variants"]["int8_w8a8"]["validation"]["runtime"]
-            runtime["dynamic_prefix_lengths"] = [1, 10, 20]
-            manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
-
-            validated = importer.validate_source(source, variant="int8-w8a8")
-            self.assertEqual(validated["vocab_size"], importer.BPE_VOCAB_SIZE)
-
-            for invalid in ([2, 10, 20], [1, 20, 20], [1, 20, 193], [1, True, 20]):
-                with self.subTest(invalid=invalid):
-                    runtime["dynamic_prefix_lengths"] = invalid
-                    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
-                    with self.assertRaisesRegex(
-                        importer.ImportFailure,
-                        "runtime validation",
-                    ):
-                        importer.validate_source(source, variant="int8-w8a8")
-
-    def test_int8_import_rejects_a_claimed_hybrid_identity_graph(self):
-        with tempfile.TemporaryDirectory(prefix="volvoxai-split-int8-class-") as temporary:
-            root = Path(temporary)
-            source = _write_source(root / "source")
-            _add_int8_w8a8_variant(source)
-            output = root / "package"
-            fake = FakeExporter()
-
-            def claim_hybrid_without_live_descriptors(command):
-                fake(command)
-                graph_path = Path(FakeExporter._option(list(command), "--out")).parent / "graph.json"
-                graph = json.loads(graph_path.read_text(encoding="utf-8"))
-                graph["nodes"] = [
-                    node for node in graph["nodes"]
-                    if node["opType"] == "Identity"
-                ]
-                graph["source"]["package_class"] = "hybrid"
-                graph_path.write_text(json.dumps(graph), encoding="utf-8")
-
-            with self.assertRaisesRegex(
-                importer.ImportFailure,
-                "does not match its live descriptors",
-            ):
-                importer.import_package(
-                    source,
-                    output,
-                    variant="int8-w8a8",
-                    exporter=claim_hybrid_without_live_descriptors,
-                    parity_verifier=_parity,
-                )
-            self.assertFalse(output.exists())
-            self.assertEqual(list(root.glob(".package.stage-*")), [])
-
-    def test_int8_source_mutation_prevents_atomic_publication(self):
-        with tempfile.TemporaryDirectory(prefix="volvoxai-split-int8-mutate-") as temporary:
-            root = Path(temporary)
-            source = _write_source(root / "source")
-            int8_paths = _add_int8_w8a8_variant(source)
-            output = root / "package"
-            fake = FakeExporter()
-
-            def mutate_int8_after_validation(command):
-                fake(command)
-                if len(fake.commands) == 1:
-                    path = int8_paths["encoder_int8_w8a8"]
-                    path.write_bytes(path.read_bytes() + b"x")
-
-            with self.assertRaisesRegex(
-                importer.ImportFailure,
-                "source files changed",
-            ):
-                importer.import_package(
-                    source,
-                    output,
-                    variant="int8-w8a8",
-                    exporter=mutate_int8_after_validation,
-                    parity_verifier=_parity,
-                )
-            self.assertFalse(output.exists())
-            self.assertEqual(list(root.glob(".package.stage-*")), [])
-
-    def test_incomplete_unknown_legacy_or_invalid_int8_files_are_rejected(self):
-        with tempfile.TemporaryDirectory(prefix="volvoxai-split-int8-incomplete-") as temporary:
-            root = Path(temporary)
-            source = _write_source(root / "source")
-            manifest_path = source / "manifest.json"
-            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-            manifest["files"]["encoder_int8_w8a8"] = "encoder_model_int8.onnx"
-            manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
-            with self.assertRaisesRegex(
-                importer.ImportFailure,
-                "complete six-key set",
-            ):
-                importer.validate_source(source)
-
-        with tempfile.TemporaryDirectory(prefix="volvoxai-split-int8-legacy-") as temporary:
-            root = Path(temporary)
-            source = _write_source(root / "source")
-            manifest_path = source / "manifest.json"
-            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-            manifest["files"]["encoder_int8_weight_only"] = "encoder_model_int8.onnx"
-            manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
-            with self.assertRaisesRegex(importer.ImportFailure, "unsupported keys"):
-                importer.validate_source(source)
-
-        with tempfile.TemporaryDirectory(prefix="volvoxai-split-int8-unknown-") as temporary:
-            root = Path(temporary)
-            source = _write_source(root / "source")
-            manifest_path = source / "manifest.json"
-            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-            manifest["files"]["encoder_dynamic"] = "encoder_dynamic.onnx"
-            manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
-            with self.assertRaisesRegex(importer.ImportFailure, "unsupported keys"):
-                importer.validate_source(source)
-
-        with tempfile.TemporaryDirectory(prefix="volvoxai-split-int8-name-") as temporary:
-            root = Path(temporary)
-            source = _write_source(root / "source")
-            _add_int8_w8a8_variant(source)
-            manifest_path = source / "manifest.json"
-            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-            manifest["files"]["encoder_int8_w8a8"] = "wrong.onnx"
-            manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
-            with self.assertRaisesRegex(
-                importer.ImportFailure,
-                "encoder_model_int8.onnx",
-            ):
-                importer.validate_source(source)
-
-        with tempfile.TemporaryDirectory(prefix="volvoxai-split-int8-symlink-") as temporary:
-            root = Path(temporary)
-            source = _write_source(root / "source")
-            int8_paths = _add_int8_w8a8_variant(source)
-            encoder_int8 = int8_paths["encoder_int8_w8a8"]
-            encoder_int8.unlink()
-            encoder_int8.symlink_to(int8_paths["decoder_int8_w8a8"].name)
-            with self.assertRaisesRegex(importer.ImportFailure, "non-symlink"):
-                importer.validate_source(source)
-
-        with tempfile.TemporaryDirectory(prefix="volvoxai-split-int8-size-") as temporary:
-            root = Path(temporary)
-            source = _write_source(root / "source")
-            int8_paths = _add_int8_w8a8_variant(source)
-            path = int8_paths["decoder_int8_w8a8"]
-            path.write_bytes(path.read_bytes() + b"x")
-            with self.assertRaisesRegex(importer.ImportFailure, "byte size"):
-                importer.validate_source(source)
-
-        with tempfile.TemporaryDirectory(prefix="volvoxai-split-int8-hash-") as temporary:
-            root = Path(temporary)
-            source = _write_source(root / "source")
-            _add_int8_w8a8_variant(source)
-            manifest_path = source / "manifest.json"
-            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-            manifest["files"]["decoder_int8_w8a8_sha256"] = "0" * 64
-            manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
-            with self.assertRaisesRegex(importer.ImportFailure, "SHA-256"):
-                importer.validate_source(source)
-
-    def test_int8_variant_contract_and_qdq_tampering_are_rejected(self):
-        with tempfile.TemporaryDirectory(prefix="volvoxai-split-int8-contract-") as temporary:
-            root = Path(temporary)
-            source = _write_source(root / "source")
-            _add_int8_w8a8_variant(source)
-            manifest_path = source / "manifest.json"
-            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-            manifest["variants"]["int8_w8a8"]["scheme"] = "S8S8"
-            manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
-            with self.assertRaisesRegex(importer.ImportFailure, "exact static U8S8"):
-                importer.validate_source(source, variant="int8-w8a8")
-
-        with tempfile.TemporaryDirectory(prefix="volvoxai-split-int8-qdq-") as temporary:
-            root = Path(temporary)
-            source = _write_source(root / "source")
-            _add_int8_w8a8_variant(source)
-            encoder_path = source / "encoder_model_int8.onnx"
-            model = onnx.load(encoder_path)
-            quantize = next(
-                node for node in model.graph.node if node.op_type == "QuantizeLinear"
-            )
-            initializers = {item.name: item for item in model.graph.initializer}
-            initializers[quantize.input[2]].data_type = TensorProto.INT8
-            onnx.save(model, encoder_path)
-            _refresh_model_record(source, "encoder_int8_w8a8")
-            with self.assertRaisesRegex(importer.ImportFailure, "produce UINT8"):
-                importer.validate_source(source, variant="int8-w8a8")
-
-    def test_missing_int8_variant_and_cli_selection_are_explicit(self):
-        with tempfile.TemporaryDirectory(prefix="volvoxai-split-int8-absent-") as temporary:
-            root = Path(temporary)
-            source = _write_source(root / "source")
-            with self.assertRaisesRegex(importer.ImportFailure, "variant is absent"):
-                importer.validate_source(source, variant="int8-w8a8")
-
-        defaults = importer.parse_args(["--source", "source", "--out-dir", "package"])
-        selected = importer.parse_args([
-            "--source",
-            "source",
-            "--out-dir",
-            "package",
-            "--variant",
-            "int8-w8a8",
-        ])
-        self.assertEqual(defaults.variant, "fp32")
-        self.assertEqual(defaults.weight_dtype, "auto")
-        self.assertEqual(selected.variant, "int8-w8a8")
-
-        invalid_cli_requests = (
-            [
-                "--source", "source", "--out-dir", "package",
-                "--variant", "unknown",
-            ],
-        )
-        for arguments in invalid_cli_requests:
-            with self.subTest(arguments=arguments):
-                with contextlib.redirect_stderr(io.StringIO()):
-                    with self.assertRaises(SystemExit):
-                        importer.parse_args(arguments)
-
-    def test_unused_custom_import_is_allowed_but_custom_nodes_are_rejected(self):
-        with tempfile.TemporaryDirectory(prefix="volvoxai-split-unused-domain-") as temporary:
-            root = Path(temporary)
-            source = _write_source(root / "source")
-            encoder_path = source / "encoder_model.onnx"
-            model = onnx.load(encoder_path)
-            model.opset_import.append(helper.make_opsetid("private.unused", 1))
-            onnx.save(model, encoder_path)
-            _refresh_model_record(source, "encoder")
-            importer.validate_source(source)
-
-        with tempfile.TemporaryDirectory(prefix="volvoxai-split-custom-node-") as temporary:
-            root = Path(temporary)
-            source = _write_source(root / "source")
-            encoder_path = source / "encoder_model.onnx"
-            model = onnx.load(encoder_path)
-            model.opset_import.append(helper.make_opsetid("private.used", 1))
-            model.graph.node.append(
-                helper.make_node(
-                    "PrivateIdentity",
-                    ["image"],
-                    ["private_result"],
-                    domain="private.used",
-                )
-            )
-            onnx.save(model, encoder_path)
-            _refresh_model_record(source, "encoder")
-            with self.assertRaisesRegex(importer.ImportFailure, "custom-domain nodes"):
-                importer.validate_source(source)
-
-        with tempfile.TemporaryDirectory(prefix="volvoxai-split-local-function-") as temporary:
-            root = Path(temporary)
-            source = _write_source(root / "source")
-            encoder_path = source / "encoder_model.onnx"
-            model = onnx.load(encoder_path)
-            model.functions.append(
-                helper.make_function(
-                    "local.wrapper",
-                    "Wrapper",
-                    ["x"],
-                    ["y"],
-                    [
-                        helper.make_node(
-                            "PrivateIdentity",
-                            ["x"],
-                            ["y"],
-                            domain="private.function",
-                        )
-                    ],
-                    [helper.make_opsetid("private.function", 1)],
-                )
-            )
-            onnx.save(model, encoder_path)
-            _refresh_model_record(source, "encoder")
-            with self.assertRaisesRegex(importer.ImportFailure, "custom-domain nodes"):
-                importer.validate_source(source)
-
-        with tempfile.TemporaryDirectory(prefix="volvoxai-split-custom-subgraph-") as temporary:
-            root = Path(temporary)
-            source = _write_source(root / "source")
-            encoder_path = source / "encoder_model.onnx"
-            model = onnx.load(encoder_path)
-            condition_name = "private_condition"
-            model.graph.initializer.append(
-                numpy_helper.from_array(np.asarray(True, np.bool_), condition_name)
-            )
-            branch_output = _value("branch_output", TensorProto.FLOAT, [1])
-            private_branch = helper.make_graph(
-                [
-                    helper.make_node(
-                        "PrivateConstant",
-                        [],
-                        ["branch_output"],
-                        domain="private.subgraph",
-                    )
-                ],
-                "private_branch",
-                [],
-                [branch_output],
-            )
-            standard_branch = helper.make_graph(
-                [
-                    _constant(
-                        "standard_constant",
-                        "branch_output",
-                        np.zeros((1,), np.float32),
-                    )
-                ],
-                "standard_branch",
-                [],
-                [branch_output],
-            )
-            model.graph.node.append(
-                helper.make_node(
-                    "If",
-                    [condition_name],
-                    ["unused_branch_result"],
-                    then_branch=private_branch,
-                    else_branch=standard_branch,
-                )
-            )
-            onnx.save(model, encoder_path)
-            _refresh_model_record(source, "encoder")
-            with self.assertRaisesRegex(importer.ImportFailure, "custom-domain nodes"):
-                importer.validate_source(source)
-
-    def test_required_asset_symlinks_are_rejected(self):
-        with tempfile.TemporaryDirectory(prefix="volvoxai-split-symlink-") as temporary:
-            root = Path(temporary)
-            source = _write_source(root / "source")
-            config = source / "config.json"
-            real_config = source / "config.real.json"
-            config.rename(real_config)
-            config.symlink_to(real_config.name)
-            with self.assertRaisesRegex(importer.ImportFailure, "non-symlink"):
-                importer.validate_source(source)
-
-    def test_constant_attribute_external_tensor_data_is_rejected(self):
-        with tempfile.TemporaryDirectory(prefix="volvoxai-split-external-") as temporary:
-            root = Path(temporary)
-            source = _write_source(root / "source")
-            encoder_path = source / "encoder_model.onnx"
-            model = onnx.load(encoder_path)
-            tensor = model.graph.node[0].attribute[0].t
-            tensor.ClearField("raw_data")
-            tensor.data_location = TensorProto.EXTERNAL
-            location = tensor.external_data.add()
-            location.key = "location"
-            location.value = "constant.bin"
-            onnx.save_model(model, encoder_path, save_as_external_data=False)
-            _refresh_model_record(source, "encoder")
-
-            with self.assertRaisesRegex(
-                importer.ImportFailure,
-                "encoder contains external tensor data",
-            ):
-                importer.validate_source(source)
-
-    def test_publishable_json_assets_reject_private_absolute_paths(self):
-        with tempfile.TemporaryDirectory(prefix="volvoxai-split-config-path-") as temporary:
-            root = Path(temporary)
-            source = _write_source(root / "source")
-            config_path = source / "config.json"
-            config = json.loads(config_path.read_text(encoding="utf-8"))
-            config["producer_cache"] = str((root / "sensitive-config").resolve())
-            config_path.write_text(json.dumps(config), encoding="utf-8")
-            with self.assertRaisesRegex(
-                importer.ImportFailure,
-                "source config contains a private absolute path",
-            ):
-                importer.validate_source(source)
-
-        with tempfile.TemporaryDirectory(prefix="volvoxai-split-vocab-path-") as temporary:
-            root = Path(temporary)
-            source = _write_source(root / "source")
-            vocab_path = source / "vocab.json"
-            vocab = json.loads(vocab_path.read_text(encoding="utf-8"))
-            vocab["itos"][4] = str((root / "sensitive-vocab").resolve())
-            vocab_path.write_text(json.dumps(vocab), encoding="utf-8")
-            with self.assertRaisesRegex(
-                importer.ImportFailure,
-                "source vocab contains a private absolute path",
-            ):
-                importer.validate_source(source)
-
-        with tempfile.TemporaryDirectory(prefix="volvoxai-split-config-key-") as temporary:
-            root = Path(temporary)
-            source = _write_source(root / "source")
-            config_path = source / "config.json"
-            config = json.loads(config_path.read_text(encoding="utf-8"))
-            config["producer"] = {
-                str((root / "sensitive-config-key").resolve()): "private"
-            }
-            config_path.write_text(json.dumps(config), encoding="utf-8")
-            with self.assertRaisesRegex(
-                importer.ImportFailure,
-                "source config contains a private absolute path",
-            ):
-                importer.validate_source(source)
-
-        with tempfile.TemporaryDirectory(prefix="volvoxai-split-file-uri-") as temporary:
-            root = Path(temporary)
-            source = _write_source(root / "source")
-            config_path = source / "config.json"
-            config = json.loads(config_path.read_text(encoding="utf-8"))
-            config["producer_cache"] = "FILE:" + "/" + "private/cache"
-            config_path.write_text(json.dumps(config), encoding="utf-8")
-            with self.assertRaisesRegex(
-                importer.ImportFailure,
-                "source config contains a private absolute path",
-            ):
-                importer.validate_source(source)
-
-    def test_non_finite_json_and_parity_outputs_are_rejected(self):
-        with tempfile.TemporaryDirectory(prefix="volvoxai-split-json-number-") as temporary:
-            root = Path(temporary)
-            source = _write_source(root / "source")
-            config_path = source / "config.json"
-            config = json.loads(config_path.read_text(encoding="utf-8"))
-            config["producer_score"] = float("nan")
-            config_path.write_text(json.dumps(config), encoding="utf-8")
-            with self.assertRaisesRegex(
-                importer.ImportFailure,
-                "non-finite numeric constant",
-            ):
-                importer.validate_source(source)
-
-        class FakeSession:
-            def __init__(self, path, providers):
-                self.kind = Path(path).name
-                self.calls = 0
-                self.providers = providers
-
-            def run(self, _outputs, inputs):
-                self.calls += 1
-                if self.kind == "encoder":
-                    length = int(inputs["question_ids"].shape[1]) + 210
-                    router = np.zeros((1, 8), dtype=np.float32)
-                    router[0, 0] = np.nan
-                    mask = np.zeros((1, length), dtype=np.bool_)
-                    if int(inputs["question_ids"].shape[1]) == 192:
-                        mask[:, 213:] = True
-                    return [
-                        np.zeros((1, length, 320), dtype=np.float32),
-                        mask,
-                        router,
-                        np.zeros((1,), dtype=np.int64),
-                    ]
-                length = int(inputs["decoder_input_ids"].shape[1])
-                return [np.zeros((1, length, 760), dtype=np.float32)]
-
-        source = {
-            "paths": {
-                "encoder": Path("encoder"),
-                "decoder": Path("decoder"),
-            },
-            "config": {"max_q_len": 192, "max_out_len": 192},
-        }
-        fake_runtime = types.SimpleNamespace(InferenceSession=FakeSession)
-        with patch.dict(sys.modules, {"onnxruntime": fake_runtime}):
-            with self.assertRaisesRegex(
-                importer.ImportFailure,
-                "non-finite outputs or differences",
-            ):
-                importer.verify_static_padding(source)
+            self.assertEqual(marker.read_text(encoding="utf-8"), "preserve")
 
 
 if __name__ == "__main__":

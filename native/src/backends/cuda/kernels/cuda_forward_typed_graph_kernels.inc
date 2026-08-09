@@ -33,6 +33,17 @@ extern "C" VX_CUDA_GLOBAL void vx_cuda_batch_matmul_f32(
     output[index] = sum;
 }
 
+/* QBatchMatMul admits arbitrary batch broadcasting and arbitrary positive K.
+ * A tensor-core IMMA route would need shape-specific tiled layouts, padding,
+ * and a second generic tactic; that setup is especially costly for decode
+ * shapes with M=1.  DP4A preserves the existing one-thread-per-output route,
+ * consumes every complete group of four K values, and leaves only K % 4 to
+ * the scalar tail.
+ *
+ * U8 values are XOR-shifted into the signed byte domain (raw - 128).  Applying
+ * the same shift to their zero points lets the shared signed-DP4A primitive
+ * cover every I8/U8 operand pairing exactly. */
+
 extern "C" VX_CUDA_GLOBAL void vx_cuda_qbatch_matmul_i8u8(
         const vx_u8* a, const vx_u8* b, vx_u8* output, vx_u32 elements,
         VxCudaBatchMatMulParams params,
@@ -64,7 +75,20 @@ extern "C" VX_CUDA_GLOBAL void vx_cuda_qbatch_matmul_i8u8(
     vx_i32 accumulator = 0;
     vx_u32 a_row = a_batch_offset + row * params.k;
     vx_u32 b_column = b_batch_offset + column;
-    for (vx_u32 inner = 0u; inner < params.k; inner++) {
+    vx_i32 a_center = a_zero_point -
+        (a_dtype == VX_DTYPE_U8 ? 128 : 0);
+    vx_i32 b_center = b_zero_point -
+        (b_dtype == VX_DTYPE_U8 ? 128 : 0);
+    vx_u32 packed_end = params.k & ~3u;
+    for (vx_u32 inner = 0u; inner < packed_end; inner += 4u) {
+        vx_u32 a_packed = vx_cuda_pack4_s8(
+            a, a_row + inner, 1u, a_dtype, 0u);
+        vx_u32 b_packed = vx_cuda_pack4_s8(
+            b, b_column + inner * params.n, params.n, b_dtype, 0u);
+        accumulator += vx_cuda_centered_dot4_s8(
+            a_packed, b_packed, a_center, b_center);
+    }
+    for (vx_u32 inner = packed_end; inner < params.k; inner++) {
         vx_i32 a_value =
             vx_typed_byte(a, a_row + inner, a_dtype) - a_zero_point;
         vx_i32 b_value =

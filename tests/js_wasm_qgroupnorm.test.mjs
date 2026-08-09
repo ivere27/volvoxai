@@ -7,7 +7,7 @@ import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
 
-import { Graph } from '../ts/core/Graph.js';
+import { RuntimeGraph } from '../ts/core/RuntimeGraph.js';
 import { CPUEngine } from '../ts/backends/CPUEngine.js';
 import { WasmEngine } from '../ts/backends/WasmEngine.js';
 
@@ -42,7 +42,7 @@ function qGroupNormGraph({
   eps = 1e-5,
   dataLayout,
 } = {}) {
-  const graph = new Graph();
+  const graph = new RuntimeGraph();
   const input = graph.addInput('input', inputShape, inputDtype, {
     buffer: bytes(inputDtype, inputValues), quantization: inputQuantization,
   });
@@ -65,13 +65,13 @@ function qGroupNormGraph({
 }
 
 function qGroupNormDynamicAffineGraph() {
-  const graph = new Graph();
+  const graph = new RuntimeGraph();
   const inputValues = Int8Array.of(-8, -3, 4, 7, 5, -1, 2, -6, 0, 8, -4, 3, -7, 6, 1, -2);
   const input = graph.addInput('input', [1, 2, 2, 4], 'int8', {
     buffer: inputValues,
     quantization: { scheme: 'per_tensor', scale: 0.25, zero_point: -1 },
   });
-  // GraphLoader intentionally permits dynamic F32 affine values. Their
+  // RuntimeGraphLoader intentionally permits dynamic F32 affine values. Their
   // compile-time placeholders may be nonfinite because execute() supplies
   // the actual tensors before qgroupnorm_i8u8 runs.
   const weight = graph.addInput('weight', [4], 'float32', {

@@ -7,8 +7,13 @@ graph.json
 model.safetensors
 ~~~
 
-Every graph root must contain the exact discriminator
-format: volvox-graph/v1. Public model-source fields use graph terminology.
+Every graph root must use the closed dynamic-first contract: the exact
+`format: volvox-graph/v1` discriminator, a `dimensions` object, logical input
+descriptors, nodes with
+unified output descriptors, and the public output-name array. Legacy split
+`outputs_shape` and `outputs_dtype` fields are rejected. Public model-source
+fields use graph terminology; the complete schema is in
+[Model Format](model-format.md).
 
 The public C API uses only opaque handles:
 
@@ -53,6 +58,8 @@ stay in opt-in applications under examples/.
 ## Opaque C API
 
 Include the public header:
+
+`VX_NATIVE_API_VERSION` is 1.
 
 ~~~c
 #include "volvoxai.h"
@@ -139,12 +146,13 @@ vx_model_publish_adapter(model, &adapter, &published, &report);
 Compiled models remain pinned to the revision captured at compile time. Use
 vx_compiled_model_report() to retrieve their stored policy and route evidence.
 
-Create a context, set typed inputs, and execute:
+Create a context and execute one atomic batch of shaped bindings:
 
 ~~~c
 VxContextOptions context_options = VX_CONTEXT_OPTIONS_INIT;
 VxExecutionContext* context = NULL;
 VxResult* result = NULL;
+VxTensorBinding input = VX_TENSOR_BINDING_INIT;
 
 status = vx_compiled_model_create_context(
     compiled, &context_options, &context, &report);
@@ -153,20 +161,29 @@ if (status != VX_STATUS_OK) {
     return 1;
 }
 
-status = vx_execution_context_set_input(
-    context,
-    "input",
-    VX_DTYPE_F32,
-    input_values,
-    input_bytes,
-    &report);
-if (status == VX_STATUS_OK) {
-    status = vx_execution_context_execute(context, &result, &report);
-}
+input.name = "input";
+input.dtype = VX_DTYPE_F32;
+input.rank = 2;
+input.shape[0] = batch;
+input.shape[1] = sequence;
+input.data = input_values;
+input.byte_size = input_bytes;
+input.location = VX_MEMORY_HOST;
+
+status = vx_execution_context_execute(
+    context, &input, 1, &result, &report);
 ~~~
 
+There is no persistent inference `set_input` operation. Every
+ordinary, prefix, decode-seed, and decode-step call supplies the complete named
+input set with concrete rank and shape. The runtime validates the whole batch
+and bounded domain before committing a binding; failure leaves the context's
+previous successful binding usable. Binding descriptors and host storage are
+borrowed only until the synchronous call returns.
+
 For a fixed-capacity sequence graph that supports row-aware operators,
-`vx_execution_context_execute_prefix(context, row_count, ...)` recomputes only
+`vx_execution_context_execute_prefix(context, row_count, inputs, input_count,
+...)` recomputes only
 the leading rows. It is stateless ordinary execution: no self-attention K/V or
 dependency cache is retained between calls. This is useful for growing-prefix
 parity and no-KV benchmarks. Built-in backends validate the prefix contract;
@@ -182,9 +199,10 @@ vx_execution_context_rebind_adapter(context, &report);
 
 No context adopts a graph, weight, or adapter revision implicitly.
 
-Input dtype and byte size must match the graph declaration. Use
-vx_execution_context_input_count() and vx_execution_context_input_info() to
-inspect declared inputs.
+Input dtype, rank, concrete shape, and byte size must match the graph's bounded
+logical declaration. Use `vx_execution_context_input_count()` and
+`vx_execution_context_input_spec()` to inspect each input's dtype, rank, fixed
+dimensions, and symbolic min/max/multiple-of constraints.
 
 Every result contains each declared graph output by exact name. Query and copy
 an output into caller-owned storage:
@@ -269,8 +287,9 @@ diagnostic text.
 
 ## Native provider SPI
 
-External devices implement VxBackendProvider from volvoxai_backend.h. The
-descriptor creates explicit provider-runtime, compiled-model, and
+External devices implement VxBackendProvider from volvoxai_backend.h.
+`VX_BACKEND_ABI_VERSION` is 1, and provider descriptors use exact structure
+sizes. The descriptor creates explicit provider-runtime, compiled-model, and
 execution-context instances. Context execution writes every declared output
 through a copying VxBackendOutputSink. The sink accepts only the graph's exact
 name, F32/I32/I8/U8 dtype, rank, dimensions, and byte size for each output;
@@ -285,16 +304,18 @@ VxBackendProvider provider = {
     .abi_version = VX_BACKEND_ABI_VERSION,
     .name = "my-npu",
     .user_data = &driver,
+    .shape_domain = VX_BACKEND_SHAPE_DOMAIN_CAPABILITY_INIT,
     .runtime_create = provider_runtime_create,
     .runtime_destroy = provider_runtime_destroy,
     .compile = provider_compile,
     .compiled_destroy = provider_compiled_destroy,
     .context_create = provider_context_create,
-    .context_set_input = provider_context_set_input,
     .context_execute = provider_context_execute,
     .context_close = provider_context_close,
     .context_destroy = provider_context_destroy,
 };
+
+provider.shape_domain.support = VX_BACKEND_SHAPE_DOMAIN_FULL;
 
 VxReport report = VX_REPORT_INIT;
 VxStatus status = vx_runtime_register_provider(runtime, &provider, &report);
@@ -306,7 +327,10 @@ name through protobuf `BackendPolicy` and receive their route evidence through
 generated reports.
 
 Callbacks never resolve graph or tensor state through a process-global table.
-Each context owns its mutable request/device state. See
+`compile` receives the complete logical input/output domain and returns an exact
+shape-domain/resource attestation. `context_execute` receives one complete
+`VxTensorBinding` array and must publish every exact concrete output through the
+sink. Each context owns its mutable request/device state. See
 [Backend SDK](backend-sdk.md) for the full contract.
 
 ## Raw tensor runner
@@ -422,63 +446,50 @@ owning tokenization or sampling policy:
 ~~~bash
 examples/target/bin/volvoxai-tasks classify models/classifier \
   --image image=photo.jpg \
+  --image-normalize zero-one \
   --logits logits \
   --labels labels.txt \
   --top-k 5
 
 examples/target/bin/volvoxai-tasks detect models/detector \
   --image image=receipt.jpg \
+  --image-normalize raw-255 \
   --classes classes \
   --max-det 20
 
 examples/target/bin/volvoxai-tasks decode models/decoder --help
 ~~~
 
-Build the legacy whole-model and qualified encoder/decoder TinyReceipt
-applications separately:
+Build the TinyReceipt encoder/decoder application separately:
 
 ~~~bash
-make -C examples native_receipt_inference_example
 make -C examples native_receipt_split_inference_example
 ~~~
 
-Both command lines accept an explicit incremental mode:
+The application accepts the explicit-KV v1 package and chooses either active
+or maximum-padded encoder extents:
 
 ~~~bash
-examples/target/bin/tiny_receipt_w8a8 build/tiny-receipt-w8a8 \
+examples/target/bin/tiny_receipt_split_w8a8 build/tiny-receipt-kv-int8 \
   --image receipt.png --prompt "What is the phone number?" \
-  --family phone --max-new 96 --incremental
-
-examples/target/bin/tiny_receipt_split_w8a8 build/tiny-receipt-runtime-int8 \
-  --image receipt.png --prompt "What is the phone number?" \
-  --family phone --max-new 96 --incremental --cpu --require-row
+  --family phone --max-new 96 --shape-mode active --cpu
 ~~~
 
-The legacy `tiny_receipt_w8a8` command uses ordinary per-token forwards by
-default. `--incremental` instead seeds once and then uses decode steps with
-dependency and native CPU row/KV reuse where supported. The split
-`tiny_receipt_split_w8a8` command uses incremental decoding by default and
-also accepts `--incremental` to make that selection explicit. `--no-kv`
-recomputes only the growing prefix with
-`vx_execution_context_execute_prefix()` and retains no decoder cache;
-`--ordinary` recomputes the complete fixed-capacity decoder tensor every
-token. These modes are mutually exclusive, and `--require-row` applies only to
-incremental execution.
+`tiny_receipt_split_w8a8` owns the autoregressive loop and passes the package's
+eight cross-cache pairs, eight self-cache pairs, and past mask explicitly
+between ordinary bounded decoder calls. `--shape-mode active` binds the actual
+encoder `Q/M`; `maximum-padded` binds their declared maxima while the decoder
+still advances `P/R` one token per call.
 
-The legacy command warns when a package manifest explicitly marks its
-activation profile as `qualified_per_edge_calibration: false`. A single-scale
-fallback package is suitable for graph and loader checks, not answer-quality
-validation; ordinary and incremental execution are expected to reproduce the
-same potentially inaccurate tokens from that package.
+Image preprocessing is exclusively application policy. `volvoxai-tasks`
+requires `--image-normalize zero-one`, `minus-one-one`, or `raw-255` whenever
+`--image` is present and never reads a normalization choice from graph/package
+metadata.
 
-Image packages may declare per-input image_normalization metadata. Explicit
-frontend options select zero-one, minus-one-one, or raw-255 behavior when
-application policy requires it.
-
-The TinyReceipt applications likewise validate their package manifests,
-perform grayscale and resize preprocessing, run or consume their router, own
-the autoregressive loop, and read the declared token_ids result. They are not
-linked into either fixed release executable.
+The TinyReceipt split application validates its closed package manifest,
+performs grayscale and resize preprocessing, executes the encoder, owns the
+retained autoregressive decoder loop, and reads the declared result ABI. It is
+not linked into either fixed release executable.
 
 ## Backend composition
 
@@ -558,8 +569,8 @@ QSDPA partitions independent batch/query rows. QGroupNorm partitions groups,
 QLayerNorm partitions final-axis rows, and large QSiLU tensors partition
 contiguous byte ranges. Single-row decode and small work stay on the caller to
 avoid worker wake-up. In particular, the QSiLU and QLayerNorm thresholds keep
-the bounded TinyReceipt decoder prefix on the caller while still pooling its
-larger encoder tensors.
+small decoder-sized rows on the caller while still pooling larger multi-row
+tensors.
 
 On AVX2, QLayerNorm retains the canonical scalar order for mean and variance
 and vectorizes only independent affine/requantization lanes. QGroupNorm can
@@ -576,6 +587,82 @@ ties-to-even requantization math as the scalar route.
 Vulkan, OpenGL, CUDA, and Metal have strict device implementations for their
 documented operator subsets. Backend compilation validates dtype, shape,
 layout, quantization, and operator-fallback policy before creating a context.
+
+CPU and the qualified Vulkan, OpenGL, Metal, and CUDA subsets support public
+bounded-dynamic execution. Compilation proves every legal shape in the closed
+logical tensor domain, including operator geometry, launch grids, workgroup
+limits, tensor slots, packed-byte rounding, backend storage alignment, norm
+scratch, immutable representations, and the transactional publication peak.
+It rejects the graph when any route or resource bound is not provable.
+
+The native-GPU proof also closes value predicates that device wrappers cannot
+safely infer from a host mirror. Public Gather indices and Embedding IDs are
+checked graph-wide before any input binding, shape-plan publication, upload, or
+dispatch; Gather accepts canonical negative indices in `[-axis_size,
+axis_size)`. Public QGroupNorm/QLayerNorm affine values are checked for
+finiteness at the same boundary. Immutable values are checked while their host
+storage is authoritative. A small, explicit producer proof admits Clip,
+exact-axis ArgMax/QArgMax, and shape-only value-preserving chains; other
+device-produced origins are rejected at compile time. Qualified GPU wrappers
+then consume the current device value without rereading a stale host mirror.
+Partially resident bank mappings are not yet qualified for Gather, Embedding,
+or QEmbedding and are rejected rather than interpreting global slot IDs as
+resident rows.
+
+Before a native GPU context is published, VolvoxAI preloads invariant model
+data and reserves one fixed maximum-domain host arena plus its backend device
+spans. Concrete executions project onto that layout and only rebind semantic
+shape metadata; min/max/min execution does not grow activation capacity.
+Vulkan, OpenGL, and Metal use the same common proof protocol as CUDA, with
+backend-specific limits and allocation lifetimes. NNAPI is deliberately not a
+bounded-dynamic backend.
+
+An operand's kernel port does not determine its lifetime. After the minimum
+bootstrap forward, VolvoxAI first reclassifies every logical tensor identity as
+transient and only then confirms actually materialized immutable model tensors.
+This prevents a public Conv2D weight, Embedding table, or normalization affine
+that happened to use a weight-like port from surviving beside the fixed domain
+as a stale duplicate. Parsed quantization metadata, lookup tables, and synthetic
+backend constants are not logical tensors and remain invariant.
+
+Qualified F32 Conv2D uses canonical `HWIO`/`HWCM` layouts. Public weights stay
+direct F32 storage and may change on every execution; non-canonical transformed
+layouts fail compilation. An immutable canonical F16 model weight may own one
+preloaded F32 widening cache. CPU convolution packs and indirection caches are
+not constructed in a native-GPU context. Physical QLinear/QMatMul/QGemm and an
+optional physical QConv2D bias require immutable safetensors-backed I32 storage,
+because their normalized metadata is cached at load. The compile proof includes
+that bias in each output channel's exact I32 accumulator bound.
+
+Bootstrap operand use does not define lifetime. After the preload forward,
+the runtime demotes every slot keyed by a logical tensor identity and then
+retains only model tensors with immutable weight origin. This keeps public
+Embedding tables, normalization affines, and canonical Conv2D weights mutable
+without preserving duplicate bootstrap buffers; parsed quantization metadata,
+conversion caches, LUTs, and backend synthetic constants remain invariant.
+
+Native-GPU Conv2D accepts only the canonical `HWIO`/`HWCM` layouts used by the
+public shape contract. A public weight must be direct F32; immutable F16 may
+own a one-time F32 widening cache. Physical QLinear/QMatMul/QGemm and QConv2D
+cache aligned I32 bias metadata, so any present bias must be an immutable model
+tensor. Their bounded-domain proof includes the exact centered-byte product
+and per-channel bias in the I32 accumulator limit; a route whose worst case can
+overflow is rejected before context publication.
+
+The resident bound includes ordered result publication (preceding snapshots
+plus the current readback and owned snapshot), the four-entry dynamic plan
+cache plus a fifth candidate, resolved-request and maximum-layout metadata,
+and the public maximum descriptors that coexist with maximum-layout
+construction. OpenGL/Metal dispatch accounting includes retained parameter
+buffers and the maximum-shape host/device zero-bias pair used by qualified
+bias-less Conv2D. Vulkan/OpenGL/Metal also charge the shape-sized host
+multiplier array built by qualified quantized dense operators; OpenGL charges
+the packed maximum-output host clear used by quantized Concat. CUDA immutable
+accounting includes QSiLU/QGELU lookup-table slots. Mask-less QSDPA also
+charges the hidden retained I32 dummy-mask host/device slot used by Vulkan,
+OpenGL, and Metal; CUDA binds no corresponding allocation. These components
+are part of compile attestation; they are not inferred from one sample
+execution.
 
 CUDA is an opt-in manual-PTX backend. Forward PTX is embedded in both profiles;
 training/PTQ PTX is present only in the full profile. Host integration resolves
@@ -597,6 +684,16 @@ contributes MSL. An all-GPU-off build carries an empty pack. CUDA PTX is
 generated from its separate authoritative CUDA sources and is not part of the
 WGSL pack.
 
+Desktop OpenGL and GLES share a portable W8A8 contract. They do not expose one
+common, standard hardware 4x8 integer-dot capability that VolvoxAI can safely
+negotiate across GL 4.3 and GLES 3.1. Consequently their physical-byte
+QLinear/QMatMul/QGemm, QConv2D, and QBatchMatMul shaders use exact scalar I32
+MACs after byte unpack; the tiled variants reduce repeated indexing and share
+loads but do not claim hardware integer-dot execution. Vulkan selects its
+separate packed-dot shaders only when the device reports accelerated signed
+packed 4x8 integer dot support, and otherwise retains the portable shader
+fallback.
+
 Inference profiles embed forward shaders only. Full profiles add training
 blocks. Each XZ-compressed block is decoded and cached only when first used.
 
@@ -606,6 +703,12 @@ For shader development:
 make compile_shaders
 VOLVOXAI_SHADER_DIR=native/shaders ./native/volvoxai --help
 ~~~
+
+`tools/compile_shaders.sh` normally builds the pinned Rust shader translator
+with Cargo. A hermetic build image may instead provide an already-built copy
+through `VOLVOXAI_NATIVE_SHADER_COMPILER=/absolute/path/to/compiler`; the
+script rejects a missing or non-executable override and still regenerates every
+native shader from the authoritative WGSL sources.
 
 VOLVOXAI_SHADER_DIR is a development override. VolvoxAI logs once only when an
 external shader is actually loaded. Missing external files fall back to the
@@ -751,11 +854,11 @@ the same process. Task policy remains outside the core runtime. See
   cross this boundary as protobuf `bytes`, so they are copied on encode and
   decode (control-plane and convenience data path).
 - `vx_*` — the hand-written native C API of `native/include/volvoxai.h` and
-  `volvoxai_full.h`. It takes raw pointers (`vx_execution_context_set_input(...,
-  const void* data, ...)`) with no serialization copy, so the performance data
-  path (zero-copy) links this directly. Callers that need zero-copy include the
-  headers and link the same library; the portable Synurang entry points remain
-  available for everyone else.
+  `volvoxai_full.h`. It takes a complete shaped `VxTensorBinding` array through
+  `vx_execution_context_execute(...)`, borrowing each raw data pointer for the
+  synchronous call and avoiding protobuf serialization. Performance-sensitive
+  callers include the headers and link this surface directly; the portable
+  Synurang entry points remain available for everyone else.
 
 Both surfaces are the same in-process engine: the plugin adapts each RPC onto
 the `vx_*` handles (`runtime/src/abi.rs`), and both are compiled into the one

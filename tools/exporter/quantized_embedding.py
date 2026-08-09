@@ -49,7 +49,19 @@ def embedding_ids_preflight_proof(
     ):
         return None
     ids = graph.tensors.get(ids_name)
-    if ids is None or ids.dtype != "int32" or ids.initializer or not ids.concrete:
+    bounded_shape = ids is not None and all(
+        (
+            isinstance(dimension, int)
+            and not isinstance(dimension, bool)
+            and dimension > 0
+        )
+        or (
+            isinstance(dimension, str)
+            and graph.shape_environment.get(dimension) is not None
+        )
+        for dimension in ids.shape
+    )
+    if ids is None or ids.dtype != "int32" or ids.initializer or not bounded_shape:
         return None
     if ids.public_input and ids_name in graph.inputs:
         return "public-input"

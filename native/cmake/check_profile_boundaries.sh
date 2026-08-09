@@ -27,17 +27,18 @@ if nm -g --defined-only "$inf" | grep -Eq \
     " (vx_model_create_trainer|vx_trainer_[A-Za-z0-9_]*|vx_model_create_ptq_plan|vx_ptq_plan_[A-Za-z0-9_]*)$"; then
   echo "Inference binary unexpectedly exposes a full-profile authoring API."; exit 1
 fi
-if ! nm -g --defined-only "$full" | grep -q " vx_model_create_trainer$"; then
-  echo "Full binary is missing the public trainer lifecycle."; exit 1
-fi
-for symbol in vx_trainer_set_input vx_trainer_train_step vx_trainer_commit vx_trainer_rollback; do
+for symbol in vx_model_create_trainer vx_trainer_retain vx_trainer_release \
+              vx_trainer_close vx_trainer_input_count vx_trainer_input_spec \
+              vx_trainer_train_step vx_trainer_commit vx_trainer_rollback \
+              vx_trainer_export_weights; do
   if ! nm -g --defined-only "$full" | grep -q " ${symbol}$"; then
     echo "Full binary is missing ${symbol}."; exit 1
   fi
 done
 for symbol in vx_model_create_ptq_plan vx_ptq_plan_retain vx_ptq_plan_release \
-              vx_ptq_plan_close vx_ptq_plan_input_count vx_ptq_plan_input_info \
+              vx_ptq_plan_close vx_ptq_plan_input_count vx_ptq_plan_input_spec \
               vx_ptq_plan_calibrate vx_ptq_plan_info \
+              vx_ptq_plan_profile_coverage vx_ptq_plan_coverage_json \
               vx_ptq_plan_tensor_parameters vx_ptq_plan_write_package; do
   if ! nm -g --defined-only "$full" | grep -q " ${symbol}$"; then
     echo "Full binary is missing ${symbol}."; exit 1
@@ -70,10 +71,10 @@ for binary in "$inf" "$full"; do
   if "$binary" --help | grep -Eq "^  (generate|classify|detect|ctc|seq2seq|chat|tinyreceipt) "; then
     echo "$binary unexpectedly exposes a model-specific command."; exit 1
   fi
-  if nm -g --defined-only "$binary" | grep -Eq " (tiny_receipt_w8a8_run|kie_chat|kie_config_is_tiny_receipt|volvoxai_tokenizer_[A-Za-z0-9_]*)$"; then
+  if nm -g --defined-only "$binary" | grep -Eq " (tiny_receipt_split_w8a8_run|kie_chat|kie_config_is_tiny_receipt|volvoxai_tokenizer_[A-Za-z0-9_]*)$"; then
     echo "$binary unexpectedly contains a model-specific session symbol."; exit 1
   fi
-  if strings "$binary" | grep -Eq "volvoxai-tiny-receipt-vqa-w8a8-materialized-package-v1|tiny_receipt_kie|vocab\.bin|merges\.txt"; then
+  if strings "$binary" | grep -Eq "volvoxai-tiny-receipt-vqa-split-kv-onnx-package-v1|tiny_receipt_kie|vocab\.bin|merges\.txt"; then
     echo "$binary unexpectedly contains model or vocabulary policy."; exit 1
   fi
 done

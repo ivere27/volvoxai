@@ -1,7 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
-import { readFile } from 'node:fs/promises';
 
 import {
   createTinyReceiptSplitE2EBindings,
@@ -13,8 +12,12 @@ import {
   tinyReceiptSplitE2ERawBytes,
   validateTinyReceiptSplitE2EReference,
 } from '../TinyReceiptSplitE2E.js';
+import {
+  TINY_RECEIPT_SPLIT_KV_PACKAGE_FORMAT,
+} from '../TinyReceiptSplitSession.js';
 
 const SHA = 'a'.repeat(64);
+const TOKENIZER_HASH = '5'.repeat(64);
 
 function sha256(bytes) {
   return createHash('sha256').update(bytes).digest('hex');
@@ -29,6 +32,27 @@ function vocabulary() {
     [16, 's'], [17, 't'],
   ]) result[id] = character;
   return result;
+}
+
+function fixtureVocab() {
+  const itos = vocabulary();
+  while (itos.length < 1536) itos.push(`token-${itos.length}`);
+  const stoi = new Map(itos.map((token, index) => [token, index]));
+  return {
+    type: 'byte_fallback_bpe',
+    version: 1,
+    tokenizerHash: TOKENIZER_HASH,
+    itos,
+    pad: 0,
+    bos: 1,
+    eos: 2,
+    unk: 3,
+    encodeQuestion(text, capacity) {
+      const ids = [...text].map((character) => stoi.get(character) ?? 3);
+      ids.push(2);
+      return ids.slice(0, capacity);
+    },
+  };
 }
 
 function route(overrides = {}) {
@@ -94,7 +118,8 @@ function fakeEnvironment({
   compilationDeviceMismatch = false,
   executionDeviceMismatch = false,
   cleanupFailure = false,
-  tokenizerHash = null,
+  tokenizerHash = TOKENIZER_HASH,
+  packageFormat = TINY_RECEIPT_SPLIT_KV_PACKAGE_FORMAT,
 } = {}) {
   const state = {
     sessionClosed: 0,
@@ -114,10 +139,12 @@ function fakeEnvironment({
         return runtime;
       },
     },
-    Graph: class Graph {},
-    GraphLoader: { async load() { throw new Error('fake session must not load graphs'); } },
-    ReadOnlySafetensorsCache: class Cache {
+    ModelLoader: { async load() { throw new Error('fake session must not load graphs'); } },
+    Model: { capture() { throw new Error('fake session must not capture'); } },
+    SafetensorsCache: class Cache {
       clear() { state.cacheCleared++; }
+      get size() { return 0; }
+      async load(_source, loader) { return loader(); }
     },
   };
   const itos = vocabulary();
@@ -129,6 +156,7 @@ function fakeEnvironment({
 
     constructor() {
       this.package = {
+        format: packageFormat,
         encoder: {
           graph: { sha256: SHA },
           weights: { sha256: 'b'.repeat(64) },
@@ -138,7 +166,7 @@ function fakeEnvironment({
           weights: { sha256: 'd'.repeat(64) },
         },
       };
-      this.vocab = { itos, ...(tokenizerHash == null ? {} : { tokenizerHash }) };
+      this.vocab = { itos, tokenizerHash };
     }
 
     async generate(options) {
@@ -206,37 +234,48 @@ test('fixed workload is byte-exact and emits native raw binding metadata', async
     '028acedd12b13cfcd706b8c364f41e82dd80fd34218e61612e31c0c9ad5474fa');
   assert.deepEqual([...image.slice(0, 4)], [-1, -0.8125, -0.625, -0.4375]);
 
-  const bindings = createTinyReceiptSplitE2EBindings({ itos: vocabulary() });
+  const bindings = createTinyReceiptSplitE2EBindings({ vocab: fixtureVocab() });
   assert.deepEqual([...bindings.familyIds], [-1]);
-  assert.equal(bindings.decoderInputIds[0], 1);
-  assert.ok(bindings.decoderInputIds.slice(1).every((value) => value === 0));
+  assert.deepEqual([...bindings.decoderInputIds], [1]);
+  assert.deepEqual([...bindings.positionIds], [0]);
+  assert.deepEqual([...bindings.pastPaddingMask], [1]);
+  assert.equal(Object.keys(bindings.pastCaches).length, 8);
+  assert.ok(Object.values(bindings.pastCaches).every((cache) =>
+    cache.length === 8 * 40 && cache.every((value) => value === 0)));
+  assert.equal(bindings.questionPositionIds[191], 191);
   assert.equal(bindings.questionIds.at(bindings.questionTokenIds.length - 1), 2);
   assert.ok(bindings.questionIds.slice(bindings.questionTokenIds.length)
     .every((value) => value === 0));
 
   const raw = tinyReceiptSplitE2ERawBytes(bindings);
-  const paths = {
-    image: 'image.f32',
-    question_ids: 'question_ids.i32',
-    family_ids: 'family_ids.i32',
-    decoder_input_ids: 'decoder_input_ids.i32',
-  };
   const records = Object.fromEntries(Object.entries(raw).map(([name, bytes]) => [
     name,
-    { path: paths[name], bytes: bytes.byteLength, sha256: sha256(bytes) },
+    {
+      path: `${name}.${name === 'image' || name.startsWith('past_') ? 'f32' : 'i32'}`,
+      bytes: bytes.byteLength,
+      sha256: sha256(bytes),
+    },
   ]));
   const manifest = await createTinyReceiptSplitE2EFixtureManifest(bindings, records);
   assert.equal(manifest.schema, 'volvoxai.tiny-receipt-split-e2e-fixture/v1');
   assert.deepEqual(manifest.tensors.image.shape, [1, 1, 320, 672]);
+  assert.deepEqual(manifest.tensors.decoder_input_ids.shape, [1, 1]);
+  assert.deepEqual(manifest.tensors.past_padding_mask.shape, [1, 1]);
+  assert.deepEqual(manifest.tensors.past_k_0.shape, [1, 8, 1, 40]);
   assert.equal(manifest.tensors.decoder_input_ids.byteOrder, 'little');
   assert.equal(JSON.stringify(manifest).includes('/home/'), false);
 });
 
 test('fixed workload bindings accept deployed BPE tokenization semantics', () => {
   const vocab = {
+    type: 'byte_fallback_bpe',
+    version: 1,
+    tokenizerHash: TOKENIZER_HASH,
     itos: Array.from({ length: 1536 }, (_unused, index) => `token-${index}`),
     pad: 0,
     bos: 1,
+    eos: 2,
+    unk: 3,
     encodeQuestion(text, capacity) {
       assert.equal(text, 'phone number last one');
       assert.equal(capacity, 192);
@@ -248,6 +287,19 @@ test('fixed workload bindings accept deployed BPE tokenization semantics', () =>
     [1038, 54, 1124, 54, 1181, 54, 1031, 2]);
   assert.deepEqual([...bindings.questionIds.slice(0, 10)],
     [1038, 54, 1124, 54, 1181, 54, 1031, 2, 0, 0]);
+
+  assert.throws(
+    () => createTinyReceiptSplitE2EBindings({
+      vocab: { ...vocab, itos: vocab.itos.slice(0, 1535) },
+    }),
+    /canonical 1536-token/,
+  );
+  assert.throws(
+    () => createTinyReceiptSplitE2EBindings({
+      vocab: { ...vocab, encodeQuestion: () => [1038] },
+    }),
+    /terminate with EOS/,
+  );
 });
 
 test('BPE package identity uses the semantic tokenizer hash', async () => {
@@ -262,26 +314,30 @@ test('BPE package identity uses the semantic tokenizer hash', async () => {
     verifyPackageAssets: false,
   });
   assert.equal(report.package.vocabularySha256, tokenizerHash);
-});
-
-test('checked-in split INT8 reference validates as an independent ORT oracle', async () => {
-  const reference = JSON.parse(await readFile(
-    new URL('../references/split_int8_e2e_ort_cpu.json', import.meta.url),
-    'utf8',
-  ));
-  assert.equal(await validateTinyReceiptSplitE2EReference(reference), reference);
-  assert.equal(reference.provenance.kind, 'onnx-runtime-oracle');
-  assert.deepEqual(reference.expected.tokenIds, [29, 66, 69, 65]);
-  assert.equal(reference.workload.image.sha256,
-    '028acedd12b13cfcd706b8c364f41e82dd80fd34218e61612e31c0c9ad5474fa');
-  assert.equal(JSON.stringify(reference).includes('/home/'), false);
+  assert.equal(report.package.format, TINY_RECEIPT_SPLIT_KV_PACKAGE_FORMAT);
 });
 
 test('reference integrity rejects corrupted router bytes and numeric summaries', async () => {
-  const reference = JSON.parse(await readFile(
-    new URL('../references/split_int8_e2e_ort_cpu.json', import.meta.url),
-    'utf8',
-  ));
+  const fixture = fakeEnvironment();
+  const candidate = await runTinyReceiptSplitE2E({
+    api: fixture.api,
+    backend: 'cpu',
+    packageUrl: 'https://example.test/package_manifest.json',
+    reference: null,
+    sessionClass: fixture.Session,
+    verifyPackageAssets: false,
+  });
+  const reference = createTinyReceiptSplitE2EReference(candidate, {
+    provenance: {
+      kind: 'onnx-runtime-oracle',
+      sourceFormat: 'tiny_receipt_vqa_split_kv_onnx_v1',
+      sourceVariant: 'int8-w8a8',
+      provider: 'fixture oracle',
+      description: 'Independent explicit-KV fixture values.',
+    },
+    routerAtol: 0,
+    routerRtol: 0,
+  });
   const corruptedDigest = structuredClone(reference);
   corruptedDigest.expected.routerLogits.sha256 = '0'.repeat(64);
   await assert.rejects(
@@ -294,6 +350,24 @@ test('reference integrity rejects corrupted router bytes and numeric summaries',
   await assert.rejects(
     validateTinyReceiptSplitE2EReference(corruptedSummary),
     /hashes or numeric summaries are internally inconsistent/,
+  );
+
+  const outOfRangeToken = structuredClone(reference);
+  outOfRangeToken.expected.tokenIds[0] = 1536;
+  assert.throws(
+    () => createTinyReceiptSplitE2EReference({
+      ...candidate,
+      output: { ...candidate.output, tokenIds: [1536, 21] },
+    }, {
+      provenance: reference.provenance,
+      routerAtol: 0,
+      routerRtol: 0,
+    }),
+    /token IDs from 0 through 1535/,
+  );
+  await assert.rejects(
+    validateTinyReceiptSplitE2EReference(outOfRangeToken),
+    /token IDs from 0 through 1535/,
   );
 });
 
@@ -346,7 +420,7 @@ test('runner proves strict provider routing, compares a reference, and closes ev
   const reference = createTinyReceiptSplitE2EReference(candidate, {
     provenance: {
       kind: 'onnx-runtime-oracle',
-      sourceFormat: 'tiny_receipt_vqa_split_onnx_v1',
+      sourceFormat: 'tiny_receipt_vqa_split_kv_onnx_v1',
       sourceVariant: 'int8-w8a8',
       provider: 'fixture oracle',
       description: 'Independent fixture values.',
@@ -449,7 +523,7 @@ test('reference mismatch is fatal and cleanup still completes', async () => {
   const reference = createTinyReceiptSplitE2EReference(candidate, {
     provenance: {
       kind: 'onnx-runtime-oracle',
-      sourceFormat: 'tiny_receipt_vqa_split_onnx_v1',
+      sourceFormat: 'tiny_receipt_vqa_split_kv_onnx_v1',
       sourceVariant: 'int8-w8a8',
       provider: 'fixture oracle',
       description: 'Independent fixture values.',

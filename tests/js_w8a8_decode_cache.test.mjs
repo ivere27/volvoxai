@@ -7,7 +7,7 @@ import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
 
-import { Graph } from '../ts/core/Graph.js';
+import { RuntimeGraph } from '../ts/core/RuntimeGraph.js';
 import { CPUEngine } from '../ts/backends/CPUEngine.js';
 import { WasmEngine } from '../ts/backends/WasmEngine.js';
 import { quantizedRowNode } from '../ts/backends/quantizedRowExecution.js';
@@ -110,7 +110,7 @@ function floatBatchAdapter(graph, input, name) {
 }
 
 function decoderGraph() {
-  const graph = new Graph();
+  const graph = new RuntimeGraph();
   const yIds = graph.addInput('y_ids', [1, SEQUENCE], 'int32');
   const yKeep = graph.addInput('y_keep', [1, SEQUENCE], 'int32');
   const memoryK = graph.addInput('memory_k', [1, MEMORY, WIDTH], 'int8', { quantization: perTensor() });
@@ -217,7 +217,7 @@ function decoderGraph() {
 }
 
 function mixedDecoderGraph() {
-  const graph = new Graph();
+  const graph = new RuntimeGraph();
   const yIds = graph.addInput('y_ids', [1, SEQUENCE], 'int32');
   const yKeep = graph.addInput('y_keep', [1, SEQUENCE], 'int32');
   const memoryK = graph.addInput('memory_k', [1, MEMORY, WIDTH], 'float32');
@@ -517,7 +517,7 @@ test('CPU mixed-precision incremental decode slices float rows and safe Add broa
 });
 
 test('mixed-precision row Add fails closed on a non-broadcast operand', () => {
-  const graph = new Graph();
+  const graph = new RuntimeGraph();
   const a = graph.addInput('a', [1, SEQUENCE, WIDTH], 'float32', {
     buffer: new Float32Array(SEQUENCE * WIDTH),
   });
@@ -535,7 +535,7 @@ test('mixed-precision row Add fails closed on a non-broadcast operand', () => {
 });
 
 test('byte Expand row keeps an invariant [1,1,D] source and slices only output', () => {
-  const graph = new Graph();
+  const graph = new RuntimeGraph();
   const source = graph.addWeight('source', [1, 1, WIDTH], 'int8', {
     buffer: Int8Array.of(-3, -2, -1, 0), quantization: perTensor(),
   });
@@ -555,7 +555,7 @@ test('byte Expand row keeps an invariant [1,1,D] source and slices only output',
 });
 
 test('Reshape row accepts only layout-preserving contiguous sequence views', () => {
-  const graph = new Graph();
+  const graph = new RuntimeGraph();
   const input = graph.addInput('input', [1, SEQUENCE, WIDTH], 'float32', {
     buffer: Float32Array.from({ length: SEQUENCE * WIDTH }, (_, index) => index),
   });
@@ -571,7 +571,7 @@ test('Reshape row accepts only layout-preserving contiguous sequence views', () 
   assert.equal(row.inputs.input.buffer.byteOffset,
     input.buffer.byteOffset + 2 * WIDTH * Float32Array.BYTES_PER_ELEMENT);
 
-  const invalid = new Graph();
+  const invalid = new RuntimeGraph();
   const invalidInput = invalid.addInput('input', [1, SEQUENCE, WIDTH], 'float32', {
     buffer: new Float32Array(SEQUENCE * WIDTH),
   });
@@ -587,7 +587,7 @@ test('Reshape row accepts only layout-preserving contiguous sequence views', () 
 
 for (const opType of ['Add', 'Mul']) {
   test(`${opType} row rejects a dirty broadcast scalar before input or output writes`, async () => {
-    const graph = new Graph();
+    const graph = new RuntimeGraph();
     const activation = graph.addInput('activation', [SEQUENCE, WIDTH], 'float32');
     const scale = graph.addInput('scale', [1], 'float32');
     const output = graph.addOp(opType, { a: activation, b: scale }, {
@@ -617,7 +617,7 @@ for (const opType of ['Add', 'Mul']) {
 }
 
 test('Expand row rejects a dirty broadcast source before input or output writes', async () => {
-  const graph = new Graph();
+  const graph = new RuntimeGraph();
   const source = graph.addInput('source', [1, 1, WIDTH], 'int8', {
     quantization: perTensor(),
   });
@@ -649,7 +649,7 @@ for (const [opType, dtype, TypedArray] of [
   ['QBatchMatMul', 'int8', Int8Array],
 ]) {
   test(`${opType} row rejects a dirty right-hand matrix before input or output writes`, async () => {
-    const graph = new Graph();
+    const graph = new RuntimeGraph();
     const tensorOptions = dtype === 'int8' ? { quantization: perTensor() } : {};
     const a = graph.addInput('a', [1, SEQUENCE, 2], dtype, tensorOptions);
     const b = graph.addInput('b', [1, 2, WIDTH], dtype, tensorOptions);
@@ -712,7 +712,10 @@ for (const [inputName, label, replacement] of [
 test('W8A8 decode row rejects unsupported descendants and invalidates the seed cache', async () => {
   const graph = decoderGraph();
   const source = graph.tensors.get('token_ids');
-  const unsupported = graph.addOp('Identity', { input: source }, {
+  // Softmax, not Identity: Identity is a re-view and is now row-local, so it
+  // no longer stands in for an operator without a row proof. Softmax genuinely
+  // has none — a row cannot be normalized without seeing the others.
+  const unsupported = graph.addOp('Softmax', { input: source }, {
     out: { name: 'unsupported', shape: [1, SEQUENCE], dtype: 'int32' },
   }).out;
   graph.setOutputs([unsupported.name]);
@@ -728,7 +731,7 @@ test('W8A8 decode row rejects unsupported descendants and invalidates the seed c
   yKeep[1] = 1;
   await assert.rejects(cpu.execute(decoderInputs(yIds, yKeep), {
     incremental: true, changedInputs: ['y_ids', 'y_keep'], incrementalRowPosition: 1,
-  }), /unsupported op 'Identity'/);
+  }), /unsupported op 'Softmax'/);
   assert.equal(cpu._incrementalCacheValid, false);
 });
 

@@ -1,9 +1,11 @@
+import { visionProfileKernelDescriptor } from './visionProfileKernel.js';
+
 export function _cpuProfileX(node) {
 
     // Column (W) profile: collapse H, keep W -> [N, 2C, W].
-    const input = node.inputs.input;
-    const output = node.outputs.out;
-    const [n, h, w, c] = input.shape;
+    const { input, output, n, h, w, c } = visionProfileKernelDescriptor(
+      node, 'ProfileX', 'profile-x',
+    );
     const inBuf = input.buffer;
     const outBuf = output.buffer;
     for (let batch = 0; batch < n; batch++) {

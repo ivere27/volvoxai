@@ -1,4 +1,4 @@
-import { Graph } from '../core/Graph.js';
+import { RuntimeGraph } from '../core/RuntimeGraph.js';
 import type { Tensor } from '../core/Tensor.js';
 import type { GraphInspection, GraphInspectionOptions } from '../types.js';
 import type {
@@ -7,7 +7,7 @@ import type {
   TrainingUpdateMode,
 } from './TrainingOptimizer.js';
 
-interface OptimizerMoments {
+export interface OptimizerMoments {
   m: Float32Array;
   v: Float32Array;
   step: number;
@@ -16,7 +16,7 @@ interface OptimizerMoments {
 const OPTIMIZER_TENSOR_REFERENCES: unique symbol =
   Symbol('volvoxai.optimizerTensorReferences');
 
-type OptimizerReferenceOwner = Graph & {
+type OptimizerReferenceOwner = RuntimeGraph & {
   [OPTIMIZER_TENSOR_REFERENCES]?: Map<string, Tensor>;
 };
 
@@ -25,9 +25,13 @@ export interface TrainingGraphState {
   optimizerDescriptor: TrainingOptimizerDescriptor | null;
   trainingStep: number;
   trainingMetadata: unknown;
+  /** Exact concrete activation binding owned by the current Trainer context. */
+  trainingShapeSignature: string;
+  /** Backend tactic key derived from the same immutable concrete plan. */
+  trainingTacticSignature: string;
 }
 
-export type StatefulTrainingGraph = Graph & TrainingGraphState;
+export type StatefulTrainingGraph = RuntimeGraph & TrainingGraphState;
 
 export interface TrainingTensorUpdateOptions extends TrainingOptimizerOptions {
   mode?: 'assign' | 'add' | TrainingUpdateMode;
@@ -35,7 +39,7 @@ export interface TrainingTensorUpdateOptions extends TrainingOptimizerOptions {
 
 type TrainingTensorUpdate = Float32Array | ArrayBuffer | ArrayBufferView | ArrayLike<number>;
 
-function optimizerTensorReferences(graph: Graph): Map<string, Tensor> {
+function optimizerTensorReferences(graph: RuntimeGraph): Map<string, Tensor> {
   const owner = graph as OptimizerReferenceOwner;
   let references = owner[OPTIMIZER_TENSOR_REFERENCES];
   if (!references) {
@@ -78,9 +82,9 @@ function tensorLength(tensor: Tensor | undefined): number {
 
 /**
  * Add full-profile state and methods to a core graph supplied directly to a
- * trainer. The inference Graph class remains free of these fields and methods.
+ * trainer. The inference RuntimeGraph class remains free of these fields and methods.
  */
-export function ensureTrainingGraphState<TGraph extends Graph>(graph: TGraph): TGraph & TrainingGraphState {
+export function ensureTrainingGraphState<TGraph extends RuntimeGraph>(graph: TGraph): TGraph & TrainingGraphState {
   if (!graph || (typeof graph !== 'object' && typeof graph !== 'function')) {
     throw new Error('Training requires a graph object.');
   }
@@ -88,25 +92,27 @@ export function ensureTrainingGraphState<TGraph extends Graph>(graph: TGraph): T
   defineState(graph, 'optimizerDescriptor', null);
   defineState(graph, 'trainingStep', 0);
   defineState(graph, 'trainingMetadata', null);
+  defineState(graph, 'trainingShapeSignature', '');
+  defineState(graph, 'trainingTacticSignature', '');
 
-  if (graph instanceof Graph && graph.applyTensorUpdate === Graph.prototype.applyTensorUpdate) {
+  if (graph instanceof RuntimeGraph && graph.applyTensorUpdate === RuntimeGraph.prototype.applyTensorUpdate) {
     Object.defineProperty(graph, 'applyTensorUpdate', {
       configurable: true,
       value(name: string, update: TrainingTensorUpdate, options: TrainingTensorUpdateOptions = {}) {
         const mode = options.mode || 'sgd';
         if (mode === 'assign' || mode === 'add') {
-          return Graph.prototype.applyTensorUpdate.call(this, name, update, options);
+          return RuntimeGraph.prototype.applyTensorUpdate.call(this, name, update, options);
         }
         return applyTrainingTensorUpdate(this, name, update, { ...options, mode });
       },
     });
   }
-  if (graph instanceof Graph && graph.inspect === Graph.prototype.inspect) {
+  if (graph instanceof RuntimeGraph && graph.inspect === RuntimeGraph.prototype.inspect) {
     Object.defineProperty(graph, 'inspect', {
       configurable: true,
       value(options: GraphInspectionOptions = {}) {
         const trainingGraph = this as StatefulTrainingGraph;
-        return { ...Graph.prototype.inspect.call(this, options), trainingStep: trainingGraph.trainingStep };
+        return { ...RuntimeGraph.prototype.inspect.call(this, options), trainingStep: trainingGraph.trainingStep };
       },
     });
   }
@@ -114,7 +120,7 @@ export function ensureTrainingGraphState<TGraph extends Graph>(graph: TGraph): T
 }
 
 /** Drop stale optimizer moments after structural tensor edits. */
-export function synchronizeTrainingGraphState(graph: Graph): StatefulTrainingGraph {
+export function synchronizeTrainingGraphState(graph: RuntimeGraph): StatefulTrainingGraph {
   const trainingGraph = ensureTrainingGraphState(graph);
   if (!(trainingGraph.optimizerState instanceof Map)) return trainingGraph;
   const references = optimizerTensorReferences(trainingGraph);
@@ -137,7 +143,7 @@ export function synchronizeTrainingGraphState(graph: Graph): StatefulTrainingGra
 
 /** Apply an SGD or AdamW parameter update owned entirely by the full profile. */
 export function applyTrainingTensorUpdate(
-  graph: Graph,
+  graph: RuntimeGraph,
   name: string,
   update: TrainingTensorUpdate,
   options: TrainingTensorUpdateOptions = {},
@@ -201,7 +207,7 @@ export function applyTrainingTensorUpdate(
     nextState = { m: firstMoment, v: secondMoment, step };
   }
 
-  const result = Graph.prototype.applyTensorUpdate.call(trainingGraph, name, next, { mode: 'assign' });
+  const result = RuntimeGraph.prototype.applyTensorUpdate.call(trainingGraph, name, next, { mode: 'assign' });
   if (nextState) {
     trainingGraph.optimizerState ||= new Map();
     trainingGraph.optimizerState.set(name, nextState);
@@ -211,12 +217,14 @@ export function applyTrainingTensorUpdate(
   return result;
 }
 
-/** Graph variant exported by the full profile. */
-export class TrainingGraph extends Graph {
+/** RuntimeGraph variant exported by the full profile. */
+export class TrainingGraph extends RuntimeGraph {
   declare optimizerState: Map<string, OptimizerMoments> | null;
   declare optimizerDescriptor: TrainingOptimizerDescriptor | null;
   declare trainingStep: number;
   declare trainingMetadata: unknown;
+  declare trainingShapeSignature: string;
+  declare trainingTacticSignature: string;
 
   constructor() {
     super();

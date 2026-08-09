@@ -24,7 +24,7 @@ function requireByteQuantization(tensor) {
  * Convert canvas RGBA bytes to the model's RGB input convention: zero-one F32,
  * physical U8 bytes, or signed I8 source levels centered on zero.
  */
-export function efficientDetInputFromRgba(rgba, tensor) {
+export function efficientDetInputViewFromRgba(rgba, tensor) {
   const { height, width } = imageShape(tensor);
   if (!(rgba instanceof Uint8Array) && !(rgba instanceof Uint8ClampedArray)) {
     throw new Error('EfficientDet image pixels must use U8 RGBA storage.');
@@ -65,5 +65,8 @@ export function efficientDetInputFromRgba(rgba, tensor) {
       input[destination + 2] = rgba[source + 2];
     }
   }
-  return input;
+  return Object.freeze({
+    data: input,
+    shape: Object.freeze([1, height, width, 3]),
+  });
 }

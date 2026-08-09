@@ -122,9 +122,9 @@ int main(void) {
     int result;
     if (!pool) return 1;
     scope = vx_kernel_thread_pool_scope_enter(pool);
-    result = run_case("tinyreceipt-encoder-self", 402u, 402u, 320u, 0u, 4) != 0 ||
-        run_case("tinyreceipt-decoder-self", 192u, 192u, 320u, 1u, 8) != 0 ||
-        run_case("tinyreceipt-decoder-cross", 192u, 402u, 320u, 0u, 5) != 0 ||
+    result = run_case("bounded-encoder-self", 402u, 402u, 320u, 0u, 4) != 0 ||
+        run_case("bounded-decoder-self", 192u, 192u, 320u, 1u, 8) != 0 ||
+        run_case("bounded-decoder-cross", 192u, 402u, 320u, 0u, 5) != 0 ||
         run_case("incremental-cross-row", 1u, 402u, 320u, 0u, 300) != 0;
     vx_set_num_threads(0);
     vx_kernels_shutdown();

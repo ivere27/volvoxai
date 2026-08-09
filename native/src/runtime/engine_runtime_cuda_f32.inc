@@ -999,7 +999,7 @@ static int try_cuda_graph_node(Node* n, int idx, const char** node_backend) {
         materialize_tensor_f32(in);
         p_pair(p, "kernel", 1, &kernel_y, &kernel_x);
         p_pair(p, "stride", 1, &stride_y, &stride_x);
-        p_pair(p, "padding", 0, &padding_y, &padding_x);
+        p_spatial_pad_origin(p, &padding_y, &padding_x);
         if (cuda_graph_average_pool2d_f32(in->data, o->data, in->shape[0],
                 in->shape[1], in->shape[2], in->shape[3], o->shape[1],
                 o->shape[2], kernel_y, kernel_x, stride_y, stride_x,
@@ -1058,7 +1058,7 @@ static int try_cuda_graph_node(Node* n, int idx, const char** node_backend) {
             o->shape[3] != in->shape[3]) return 0;
         p_pair(p, "kernel", 1, &kernel_y, &kernel_x);
         p_pair(p, "stride", 1, &stride_y, &stride_x);
-        p_pair(p, "padding", 0, &padding_y, &padding_x);
+        p_spatial_pad_origin(p, &padding_y, &padding_x);
         if (cuda_graph_maxpool2d_f32(in->data, o->data, in->shape[0],
                 in->shape[1], in->shape[2], in->shape[3], o->shape[1],
                 o->shape[2], kernel_y, kernel_x, stride_y, stride_x,

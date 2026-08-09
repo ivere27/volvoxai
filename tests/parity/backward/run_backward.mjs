@@ -5,7 +5,7 @@
 //
 // The engine ships autograd + optimizer + loss but nothing checked gradients across
 // tiers or against an external oracle. Each case runs one forward + cross-entropy +
-// backward via Runtime -> Model -> Trainer on cpu and wasm (webgpu on a GPU
+// backward via Model -> Trainer on cpu and wasm (webgpu on a GPU
 // box), and dumps the exact weights/inputs/targets so backward_torch_oracle.py can
 // compute the PyTorch reference. Gates wasm vs cpu (consistency) + both vs PyTorch.
 import { signature, compareSignature } from '../lib/extract.mjs';
@@ -73,31 +73,63 @@ const CASES = [
 
 const LR = 0.1; // SGD learning rate for the optimizer-step check
 
-function buildGraph(Graph, c) {
-  const g = new Graph();
+function buildSnapshot(full, c) {
   const [xName, xd] = Object.entries(c.input)[0];
-  const x = g.addInput(xName, xd.shape);
   const xbuf = seeded(prod(xd.shape), xd.seed, xd.lo, xd.hi);
-  const w = {}, dump = { [xName]: { buf: xbuf, shape: xd.shape } };
+  const weights = {};
+  const weightDescriptors = [];
+  const dump = { [xName]: { buf: xbuf, shape: xd.shape } };
   for (const [name, ws] of Object.entries(c.weights)) {
-    // Pass the buffer into addWeight (not set afterward) so GPU tiers upload the
-    // right values at allocation time, not a stale/zero initial buffer.
     const buf = seeded(prod(ws.shape), ws.seed, ws.lo, ws.hi);
-    const t = g.addWeight(name, ws.shape, 'float32', buf);
-    w[name] = t; dump[name] = { buf, shape: ws.shape };
+    weightDescriptors.push({ name, dtype: 'float32', shape: ws.shape });
+    weights[name] = { name, dtype: 'float32', shape: ws.shape, data: buf };
+    dump[name] = { buf, shape: ws.shape };
   }
-  let out;
-  if (c.arch === 'linear') out = g.addOp('Linear', { input: x, weight: w.W, bias: w.b }, { out: [c.B, c.C] }).out;
-  else if (c.arch === 'mlp') {
-    const h1 = g.addOp('Linear', { input: x, weight: w.W1, bias: w.b1 }, { out: [c.B, c.H] }).out;
-    const a = g.addOp('GELU', { input: h1 }, { out: [c.B, c.H] }).out;
-    out = g.addOp('Linear', { input: a, weight: w.W2, bias: w.b2 }, { out: [c.B, c.C] }).out;
+  const output = (tensor, shape) => ({ out: { tensor, dtype: 'float32', shape } });
+  const linear = (id, input, weight, bias, tensor, shape) => ({
+    id,
+    opType: 'Linear',
+    inputs: { input, weight, bias },
+    outputs: output(tensor, shape),
+    params: { weight_layout: 'din_dout' },
+  });
+  const nodes = [];
+  let outputName;
+  if (c.arch === 'linear') {
+    outputName = 'logits';
+    nodes.push(linear('linear', xName, 'W', 'b', outputName, [c.B, c.C]));
+  } else if (c.arch === 'mlp') {
+    nodes.push(linear('linear1', xName, 'W1', 'b1', 'hidden', [c.B, c.H]));
+    nodes.push({
+      id: 'gelu', opType: 'GELU', inputs: { input: 'hidden' },
+      outputs: output('activated', [c.B, c.H]), params: {},
+    });
+    outputName = 'logits';
+    nodes.push(linear('linear2', 'activated', 'W2', 'b2', outputName, [c.B, c.C]));
   } else if (c.arch === 'layernorm') {
-    const ln = g.addOp('LayerNorm', { input: x, weight: w.g, bias: w.be }, { out: [c.B, c.D] }, { eps: 1e-5 }).out;
-    out = g.addOp('Linear', { input: ln, weight: w.W, bias: w.b }, { out: [c.B, c.C] }).out;
+    nodes.push({
+      id: 'layernorm', opType: 'LayerNorm',
+      inputs: { input: xName, weight: 'g', bias: 'be' },
+      outputs: output('normalized', [c.B, c.D]),
+      params: { eps: 1e-5, d_model: c.D },
+    });
+    outputName = 'logits';
+    nodes.push(linear('linear', 'normalized', 'W', 'b', outputName, [c.B, c.C]));
+  } else {
+    throw new Error(`unknown backward architecture '${c.arch}'`);
   }
-  g.setOutputs([out.name]);
-  return { g, xName, xbuf, dump };
+  const builder = new full.ModelBuilder({
+    dimensions: {},
+    inputs: { [xName]: { dtype: 'float32', shape: xd.shape } },
+    weights: weightDescriptors,
+    nodes,
+    outputs: [outputName],
+  });
+  const snapshot = full.Model.capture({
+    graph: builder.snapshot(),
+    weights,
+  });
+  return { snapshot, xName, xbuf, dump };
 }
 
 function manifestFile(tier) {
@@ -127,13 +159,13 @@ function exactOutputFiles(tiers, { includeFixtures = false, includeReport = fals
   return files;
 }
 
-function refreshFixtures(Graph) {
+function refreshFixtures(full) {
   removeParityOutputsSync(
     CASES.flatMap((c) => fixtureFiles(c)),
     { outputRoot: OUT },
   );
   for (const c of CASES) {
-    const { xName, dump } = buildGraph(Graph, c);
+    const { xName, dump } = buildSnapshot(full, c);
     const dir = path.join(OUT, c.id);
     fs.mkdirSync(dir, { recursive: true });
     for (const [name, tensor] of Object.entries(dump)) {
@@ -225,7 +257,7 @@ async function produce(tiers) {
     includeReport: true,
   }), { outputRoot: OUT });
   const full = await import(pathToFileURL(path.join(ROOT, 'dist', ver, 'volvoxai.full.js')).href);
-  refreshFixtures(full.Graph);
+  refreshFixtures(full);
   const fingerprint = backwardFingerprint(ver);
 
   let campaignRunId;
@@ -253,13 +285,11 @@ async function produce(tiers) {
   let failures = 0;
   for (const tier of requested) {
     let runtime;
-    let probeModel;
     let probeCompiled;
     try {
       runtime = await full.VolvoxAI.createRuntime({ backends: [tier], wasmUrl: wasmPath });
-      const probe = buildGraph(full.Graph, CASES[0]);
-      probeModel = runtime.createModel(probe.g);
-      probeCompiled = await probeModel.compile({
+      const probe = buildSnapshot(full, CASES[0]);
+      probeCompiled = await runtime.compile(probe.snapshot, {
         backend: { mode: 'require', backend: tier, operatorFallback: 'forbid' },
       });
       if (probeCompiled.backend !== tier) {
@@ -274,33 +304,33 @@ async function produce(tiers) {
       console.error(`  [${tier}] initialization ERROR ${message}`);
     } finally {
       await probeCompiled?.close().catch(() => undefined);
-      await probeModel?.close().catch(() => undefined);
       if (initializationErrors.has(tier)) await runtime?.close().catch(() => undefined);
     }
   }
-  const runTier = async (tier, graph, options, { commit = false } = {}) => {
+  const runTier = async (tier, snapshot, options, { commit = false } = {}) => {
     const runtime = runtimes.get(tier);
     if (!runtime) throw new Error(`training runtime '${tier}' is unavailable`);
-    const model = runtime.createModel(graph);
     let trainer;
     try {
-      trainer = await full.VolvoxAI.createTrainer(model, {
+      trainer = await full.VolvoxAI.createTrainer(snapshot, {
         backend: tier,
         wasmUrl: wasmPath,
       });
       if (trainer.backend !== tier) {
         throw new Error(`requested training backend '${tier}' created '${trainer.backend || 'unknown'}'`);
       }
-      const result = await trainer.trainStep(options);
-      if (commit) await trainer.commit();
+      const shapedInputs = Object.fromEntries(Object.entries(options.inputs || {}).map(
+        ([name, data]) => [name, { data, shape: [...snapshot.graph.inputs[name].shape] }],
+      ));
+      const result = await trainer.trainStep({ ...options, inputs: shapedInputs });
+      const successor = commit ? await trainer.commit() : null;
       const checkpoint = await trainer.exportCheckpoint({ includeOptimizerState: false });
       return {
         result,
-        trainedGraph: full.importModelCheckpoint(checkpoint).graph,
+        trainedSnapshot: successor ?? full.importModelCheckpoint(checkpoint).snapshot,
       };
     } finally {
       await trainer?.close();
-      await model.close();
     }
   };
   for (const c of CASES) {
@@ -315,9 +345,9 @@ async function produce(tiers) {
         });
         continue;
       }
-      const { g, xName, xbuf } = buildGraph(full.Graph, c);
+      const { snapshot, xName, xbuf } = buildSnapshot(full, c);
       try {
-        const { result: res } = await runTier(tier, g, { inputs: { [xName]: xbuf }, targets: c.targets, trainableTensors: c.trainable, updateMode: 'sgd', optimizer: { learningRate: 0 } });
+        const { result: res } = await runTier(tier, snapshot, { inputs: { [xName]: xbuf }, targets: c.targets, trainableTensors: c.trainable, updateMode: 'sgd', optimizer: { learningRate: 0 } });
         const sigs = {};
         for (const name of c.trainable) {
           sigs[name] = signature(res.gradients.get(name), { topk: 0, shape: c.weights[name].shape });
@@ -325,16 +355,16 @@ async function produce(tiers) {
         // One SGD step (lr>0) on a fresh graph: compare the *updated weights* — exercises
         // each tier's optimizer-apply path (a GPU update shader can be wrong independent
         // of the gradient), not just gradient computation.
-        const step = buildGraph(full.Graph, c);
-        const { trainedGraph } = await runTier(
+        const step = buildSnapshot(full, c);
+        const { trainedSnapshot } = await runTier(
           tier,
-          step.g,
+          step.snapshot,
           { inputs: { [step.xName]: step.xbuf }, targets: c.targets, trainableTensors: c.trainable, updateMode: 'sgd', optimizer: { learningRate: LR } },
           { commit: true },
         );
         const stepSigs = {};
         for (const name of c.trainable) {
-          stepSigs[name] = signature(trainedGraph.getTensor(name).buffer, { topk: 0, shape: c.weights[name].shape });
+          stepSigs[name] = signature(trainedSnapshot.copyWeightData(name), { topk: 0, shape: c.weights[name].shape });
         }
         writeRunArtifactSync({
           manifest,

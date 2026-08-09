@@ -32,6 +32,10 @@ export const PARITY_ARTIFACT_SCHEMA = 'volvoxai.parity-artifact';
 export const PARITY_FINGERPRINT_SCHEMA = 'volvoxai.parity-fingerprint';
 export const PARITY_RUN_MANIFEST_SCHEMA = 'volvoxai.parity-run-manifest';
 export const PARITY_RUNTIME_EVIDENCE_SCHEMA = 'volvoxai.runtime-evidence';
+export const PARITY_RUNTIME_FAILURE_EVIDENCE_SCHEMA =
+  'volvoxai.runtime-failure-evidence';
+export const PARITY_NATIVE_CAPABILITY_EVIDENCE_SCHEMA =
+  'volvoxai.parity.native-capability-evidence';
 export const PARITY_SCHEMA_VERSION = 1;
 
 export const PARITY_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
@@ -162,8 +166,8 @@ function validateExecutionRevisions(value, label) {
   assertRevision(value.weightRevision, `${label}.weightRevision`);
   assertNonEmptyString(value.weightRevisionId, `${label}.weightRevisionId`);
   assertNullableString(value.adapterRevisionId, `${label}.adapterRevisionId`);
-  if (!Array.isArray(value.adapterRevisionIds) || value.adapterRevisionIds.length === 0) {
-    throw new Error(`${label}.adapterRevisionIds must be a non-empty array`);
+  if (!Array.isArray(value.adapterRevisionIds)) {
+    throw new Error(`${label}.adapterRevisionIds must be an array`);
   }
   value.adapterRevisionIds.forEach((id, index) =>
     assertNullableString(id, `${label}.adapterRevisionIds[${index}]`));
@@ -188,6 +192,187 @@ function validateDecodeState(value, label) {
   }
   if (value.position !== null) assertNonNegativeInteger(value.position, `${label}.position`);
   return value;
+}
+
+/** Validate the native CLI's machine-readable failure-channel report. */
+export function validateRuntimeFailureEvidence(evidence) {
+  assertExactObject(evidence, 'runtime failure evidence', [
+    'schema', 'version', 'outcome', 'status', 'stage', 'request', 'source',
+    'report', 'lineage',
+  ]);
+  if (evidence.schema !== PARITY_RUNTIME_FAILURE_EVIDENCE_SCHEMA ||
+      evidence.version !== PARITY_SCHEMA_VERSION || evidence.outcome !== 'failure') {
+    throw new Error('unsupported runtime failure evidence schema, version, or outcome');
+  }
+  assertNonEmptyString(evidence.status, 'runtime failure evidence.status');
+  assertNonEmptyString(evidence.stage, 'runtime failure evidence.stage');
+
+  const request = assertExactObject(evidence.request, 'runtime failure evidence.request', [
+    'backend', 'policy',
+  ]);
+  if (request.backend !== null) assertNonEmptyString(request.backend, 'runtime failure request.backend');
+  const policy = assertExactObject(request.policy, 'runtime failure evidence.request.policy', [
+    'mode', 'operatorFallback',
+  ]);
+  if (!((policy.mode === 'require' && policy.operatorFallback === 'forbid' &&
+         request.backend !== null) ||
+        (policy.mode === 'prefer' && policy.operatorFallback === 'allow' &&
+         request.backend === null))) {
+    throw new Error('runtime failure evidence has inconsistent request policy');
+  }
+
+  const source = assertExactObject(evidence.source, 'runtime failure evidence.source', [
+    'graphPath', 'weightPaths',
+  ]);
+  assertNonEmptyString(source.graphPath, 'runtime failure evidence.source.graphPath');
+  if (!Array.isArray(source.weightPaths)) {
+    throw new Error('runtime failure evidence.source.weightPaths must be an array');
+  }
+  const sourceWeightPaths = new Set();
+  source.weightPaths.forEach((weightPath, index) => {
+    assertNonEmptyString(weightPath, `runtime failure evidence.source.weightPaths[${index}]`);
+    if (sourceWeightPaths.has(weightPath)) {
+      throw new Error(`duplicate runtime failure evidence weight path: ${weightPath}`);
+    }
+    sourceWeightPaths.add(weightPath);
+  });
+
+  const report = assertExactObject(evidence.report, 'runtime failure evidence.report', [
+    'backend', 'device', 'reason', 'message', 'offendingNode',
+    'candidateOutcomes', 'routeEvidence', 'fallbackEvidence',
+    'tierFallback', 'operatorFallbackUsed', 'routeAttested',
+  ]);
+  for (const field of [
+    'backend', 'reason', 'message', 'offendingNode',
+    'candidateOutcomes', 'routeEvidence', 'fallbackEvidence',
+  ]) {
+    assertNullableString(report[field], `runtime failure evidence.report.${field}`);
+  }
+  validateDeviceIdentity(report.device, 'runtime failure evidence.report.device');
+  for (const field of ['tierFallback', 'operatorFallbackUsed', 'routeAttested']) {
+    if (typeof report[field] !== 'boolean') {
+      throw new Error(`runtime failure evidence.report.${field} must be boolean`);
+    }
+  }
+
+  const lineage = assertExactObject(evidence.lineage, 'runtime failure evidence.lineage', [
+    'runtimeId', 'modelId', 'compilationId', 'definitionId', 'weightRevisionId',
+    'topologyRevision', 'weightRevision',
+  ]);
+  const identities = {
+    runtimeId: 'runtime',
+    modelId: 'model',
+    compilationId: 'compiled',
+    definitionId: 'graph',
+    weightRevisionId: 'weight',
+  };
+  for (const [field, kind] of Object.entries(identities)) {
+    if (lineage[field] !== null &&
+        (typeof lineage[field] !== 'string' ||
+         !new RegExp(`^native-${kind}-[1-9][0-9]*$`).test(lineage[field]))) {
+      throw new Error(`runtime failure evidence.lineage.${field} is invalid`);
+    }
+  }
+  for (const field of ['topologyRevision', 'weightRevision']) {
+    if (lineage[field] !== null &&
+        (typeof lineage[field] !== 'string' || !/^[1-9][0-9]*$/.test(lineage[field]))) {
+      throw new Error(`runtime failure evidence.lineage.${field} is not null or a positive decimal string`);
+    }
+  }
+  return evidence;
+}
+
+/** Validate the fail-closed wire evidence for an expected native GPU compile rejection. */
+export function validateNativeCapabilityEvidence(evidence) {
+  assertExactObject(evidence, 'native capability evidence', [
+    'schema', 'version', 'campaign', 'authority', 'model', 'request',
+    'adapter', 'result', 'runtimeFailureEvidence',
+    'runtimeFailureEvidenceSha256', 'nativeLogSha256',
+  ]);
+  if (evidence.schema !== PARITY_NATIVE_CAPABILITY_EVIDENCE_SCHEMA ||
+      evidence.version !== PARITY_SCHEMA_VERSION) {
+    throw new Error('unsupported native capability evidence schema or version');
+  }
+
+  const campaign = assertExactObject(evidence.campaign, 'native capability campaign', [
+    'id', 'sourceFingerprint', 'registryFingerprint',
+  ]);
+  for (const field of ['id', 'sourceFingerprint', 'registryFingerprint']) {
+    if (!SHA256_RE.test(campaign[field] ?? '')) {
+      throw new Error(`native capability campaign.${field} must be a SHA-256 digest`);
+    }
+  }
+
+  const authority = assertExactObject(evidence.authority, 'native capability authority', [
+    'kind', 'target', 'exporterQualified',
+  ]);
+  if (authority.kind !== 'kernel-registry' ||
+      !['backend:vulkan', 'backend:opengl'].includes(authority.target) ||
+      authority.exporterQualified !== false) {
+    throw new Error('native capability evidence has invalid registry authority');
+  }
+
+  const model = assertExactObject(evidence.model, 'native capability model', [
+    'id', 'graphPath', 'graphSha256', 'weights',
+  ]);
+  assertNonEmptyString(model.id, 'native capability model.id');
+  normalizeRelativeLabel(model.graphPath, 'native capability model.graphPath');
+  if (!SHA256_RE.test(model.graphSha256 ?? '')) {
+    throw new Error('native capability model.graphSha256 must be a SHA-256 digest');
+  }
+  if (!Array.isArray(model.weights) || model.weights.length === 0) {
+    throw new Error('native capability model.weights must be a non-empty array');
+  }
+  const weightPaths = new Set();
+  for (const [index, weight] of model.weights.entries()) {
+    const label = `native capability model.weights[${index}]`;
+    assertExactObject(weight, label, ['path', 'sha256']);
+    normalizeRelativeLabel(weight.path, `${label}.path`);
+    if (weightPaths.has(weight.path)) throw new Error(`duplicate native capability weight: ${weight.path}`);
+    weightPaths.add(weight.path);
+    if (!SHA256_RE.test(weight.sha256 ?? '')) {
+      throw new Error(`${label}.sha256 must be a SHA-256 digest`);
+    }
+  }
+
+  const request = assertExactObject(evidence.request, 'native capability request', [
+    'tier', 'backend', 'policy',
+  ]);
+  if (!['native-vulkan', 'native-opengl'].includes(request.tier) ||
+      !['vulkan', 'opengl'].includes(request.backend) ||
+      request.tier !== `native-${request.backend}`) {
+    throw new Error('native capability evidence has invalid tier/backend request');
+  }
+  const requestPolicy = assertExactObject(request.policy, 'native capability request.policy', [
+    'mode', 'operatorFallback',
+  ]);
+  if (requestPolicy.mode !== 'require' || requestPolicy.operatorFallback !== 'forbid') {
+    throw new Error('native capability evidence did not request a strict no-fallback backend');
+  }
+  validateDeviceIdentity(evidence.adapter, 'native capability adapter');
+
+  const result = assertExactObject(evidence.result, 'native capability result', [
+    'outcome', 'exitCode', 'status', 'stage', 'reason', 'offendingNode', 'message',
+  ]);
+  if (result.outcome !== 'expected-compile-rejection' ||
+      !Number.isSafeInteger(result.exitCode) || result.exitCode === 0 ||
+      result.status !== 'BACKEND_UNSUPPORTED' || result.stage !== 'compile') {
+    throw new Error('native capability evidence is not an expected compile rejection');
+  }
+  assertNonEmptyString(result.reason, 'native capability result.reason');
+  assertNonEmptyString(result.message, 'native capability result.message');
+  if (result.offendingNode !== null && typeof result.offendingNode !== 'string' &&
+      !Number.isSafeInteger(result.offendingNode)) {
+    throw new Error('native capability result.offendingNode must be a string, integer, or null');
+  }
+  if (!SHA256_RE.test(evidence.nativeLogSha256 ?? '')) {
+    throw new Error('native capability nativeLogSha256 must be a SHA-256 digest');
+  }
+  validateRuntimeFailureEvidence(evidence.runtimeFailureEvidence);
+  if (!SHA256_RE.test(evidence.runtimeFailureEvidenceSha256 ?? '')) {
+    throw new Error('native capability runtimeFailureEvidenceSha256 must be a SHA-256 digest');
+  }
+  return evidence;
 }
 
 /** Validate the exact machine-readable lifecycle evidence sealed into JS parity manifests. */
@@ -323,6 +508,19 @@ export function validateNativeRuntimeEvidence(evidence, expectedBackend) {
 
 /** Reduce public compilation/result reports and an observed stability check to the parity wire schema. */
 export function createRuntimeEvidence({ compilation, execution, stableResult } = {}) {
+  // Runtime reports may add provider-local decode telemetry without changing
+  // this versioned parity wire schema. Project the v1 lifecycle fields instead
+  // of retaining the report object by reference and accidentally widening the
+  // signed artifact whenever execution diagnostics evolve.
+  const decodeState = execution?.decodeState == null
+    ? execution?.decodeState
+    : {
+        operation: execution.decodeState.operation,
+        mode: execution.decodeState.mode,
+        cacheState: execution.decodeState.cacheState,
+        cacheGeneration: execution.decodeState.cacheGeneration,
+        position: execution.decodeState.position,
+      };
   const evidence = {
     schema: PARITY_RUNTIME_EVIDENCE_SCHEMA,
     version: PARITY_SCHEMA_VERSION,
@@ -355,7 +553,7 @@ export function createRuntimeEvidence({ compilation, execution, stableResult } =
         adapterRevisionIds: execution?.adapterRevisionIds,
       },
       route: execution?.routeEvidence,
-      decodeState: execution?.decodeState,
+      decodeState,
     },
     stableResult,
   };
@@ -733,6 +931,11 @@ function resultRequiresRuntimeEvidence(manifest, tier) {
     manifest.producer?.runtimeEvidenceTiers?.includes(tier) === true;
 }
 
+function resultRequiresCapabilityEvidence(manifest, tier) {
+  return manifest.producer?.capabilityEvidenceRequired === true ||
+    manifest.producer?.capabilityEvidenceTiers?.includes(tier) === true;
+}
+
 function derivedManifestOutcome(jobs, results) {
   if (jobs.size !== results.size) return null;
   for (const [key, result] of results) {
@@ -811,8 +1014,18 @@ export function recordRunResult(manifest, result) {
       result.metadata?.runtimeEvidence == null && status === 'success') {
     throw new Error('successful runtime parity result must include runtime evidence');
   }
+  if (resultRequiresCapabilityEvidence(manifest, normalized.tier) &&
+      (status !== 'expected-skip' || result.metadata?.capabilityEvidence == null)) {
+    throw new Error('native capability job must record an expected skip with capability evidence');
+  }
   if (result.metadata?.runtimeEvidence != null) {
     validateRuntimeEvidence(result.metadata.runtimeEvidence);
+  }
+  if (result.metadata?.capabilityEvidence != null) {
+    if (status !== 'expected-skip') {
+      throw new Error('native capability evidence is valid only for an expected skip');
+    }
+    validateNativeCapabilityEvidence(result.metadata.capabilityEvidence);
   }
   if (result.metadata != null) entry.metadata = canonicalValue(result.metadata);
   manifest.results.push(entry);
@@ -910,6 +1123,19 @@ export function validateRunManifest(manifest, {
     manifest.producer.runtimeEvidenceTiers.forEach((tier, index) =>
       assertNonEmptyString(tier, `manifest producer.runtimeEvidenceTiers[${index}]`));
   }
+  if (manifest.producer?.capabilityEvidenceRequired != null &&
+      typeof manifest.producer.capabilityEvidenceRequired !== 'boolean') {
+    throw new Error('manifest producer.capabilityEvidenceRequired must be boolean');
+  }
+  if (manifest.producer?.capabilityEvidenceTiers != null) {
+    if (!Array.isArray(manifest.producer.capabilityEvidenceTiers) ||
+        new Set(manifest.producer.capabilityEvidenceTiers).size !==
+          manifest.producer.capabilityEvidenceTiers.length) {
+      throw new Error('manifest producer.capabilityEvidenceTiers must be a unique array');
+    }
+    manifest.producer.capabilityEvidenceTiers.forEach((tier, index) =>
+      assertNonEmptyString(tier, `manifest producer.capabilityEvidenceTiers[${index}]`));
+  }
   const jobs = new Map();
   for (const raw of manifest.selection.jobs) {
     const job = normalizeJob(raw);
@@ -940,6 +1166,16 @@ export function validateRunManifest(manifest, {
       assertNonEmptyString(result.error, 'result error');
     } else {
       assertNonEmptyString(result.reason, 'expected skip reason');
+    }
+    if (resultRequiresCapabilityEvidence(manifest, result.tier) &&
+        (result.status !== 'expected-skip' || result.metadata?.capabilityEvidence == null)) {
+      throw new Error(`native capability result lacks evidence: ${result.case}/${result.tier}`);
+    }
+    if (result.metadata?.capabilityEvidence != null) {
+      if (result.status !== 'expected-skip') {
+        throw new Error(`native capability evidence is attached to non-skip: ${result.case}/${result.tier}`);
+      }
+      validateNativeCapabilityEvidence(result.metadata.capabilityEvidence);
     }
     results.set(key, result);
   }

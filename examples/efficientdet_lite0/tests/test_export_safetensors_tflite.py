@@ -10,6 +10,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from tools.exporter.capabilities import classify_package
+
 
 ROOT = Path(__file__).resolve().parents[3]
 EXPORTER = ROOT / "tools" / "export_safetensors.py"
@@ -110,19 +112,15 @@ class GenericExporterOutputNamingTests(unittest.TestCase):
         self.assertNotIn('"boxes" if shape', source)
         self.assertNotIn('"scores" if shape', source)
 
-    def test_image_normalization_annotation_is_explicit_and_input_scoped(self) -> None:
+    def test_image_normalization_is_rejected_as_application_policy(self) -> None:
         inputs = {
             "input0": {"shape": [1, 320, 320, 3], "dtype": "float32"},
             "input1": {"shape": [1], "dtype": "int32"},
         }
-        self.exporter._apply_image_normalizations(inputs, ["input0=zero-one"])
-        self.assertEqual(inputs["input0"]["image_normalization"], "zero-one")
-        self.assertNotIn("image_normalization", inputs["input1"])
-
-        with self.assertRaisesRegex(ValueError, "unknown exported input"):
-            self.exporter._apply_image_normalizations(inputs, ["image=raw-255"])
-        with self.assertRaisesRegex(ValueError, "INPUT=MODE"):
-            self.exporter._apply_image_normalizations(inputs, ["input0=automatic"])
+        before = json.loads(json.dumps(inputs))
+        with self.assertRaisesRegex(ValueError, "application preprocessing"):
+            self.exporter._apply_image_normalizations(inputs, ["input0=zero-one"])
+        self.assertEqual(inputs, before)
 
 
 class DirectTfliteW8A8ExportTests(unittest.TestCase):
@@ -151,9 +149,10 @@ class DirectTfliteW8A8ExportTests(unittest.TestCase):
             )
 
     def assert_typed_quantized_output(self, graph, tensors, node) -> None:
-        dtype = node.get("outputs_dtype", {}).get("out")
+        output_descriptor = node.get("outputs", {}).get("out", {})
+        dtype = output_descriptor.get("dtype")
         self.assertIn(dtype, ("int8", "uint8"), node)
-        output = node.get("outputs", {}).get("out")
+        output = output_descriptor.get("tensor")
         quantization = graph.get("quantization", {}).get("tensors", {}).get(output)
         self.assertIsInstance(quantization, dict, node)
         self.assertEqual(quantization.get("scheme"), "per_tensor", node)
@@ -186,8 +185,6 @@ class DirectTfliteW8A8ExportTests(unittest.TestCase):
                     str(EFFICIENTDET_INT8),
                     "--out",
                     str(output_path),
-                    "--image-normalization",
-                    "input0=raw-255",
                     "--output-name",
                     "scores",
                     "--output-name",
@@ -211,13 +208,12 @@ class DirectTfliteW8A8ExportTests(unittest.TestCase):
             tensors = self.safetensors_torch.load_file(str(output_path), device="cpu")
 
         self.assertEqual(graph.get("format"), "volvox-graph/v1")
-        self.assertEqual(
-            graph.get("inputs", {}).get("input0", {}).get("image_normalization"),
-            "raw-255",
-        )
+        self.assertNotIn("shape_system", graph)
+        self.assertEqual(graph.get("dimensions"), {})
+        self.assertNotIn("image_normalization", graph.get("inputs", {}).get("input0", {}))
         self.assertEqual(graph.get("outputs"), ["scores", "boxes"])
-        self.assertEqual(graph.get("source", {}).get("package_class"), "hybrid")
-        self.assertNotIn("quantized_graph_contract", graph.get("source", {}))
+        self.assertEqual(classify_package(graph, tensors), "hybrid")
+        self.assertNotIn("source", graph)
         self.assertGreater(len(tensors), 0)
         self.assertNotIn("input_scale", set(_iter_keys(graph)))
         self.assertNotIn("weight_scale", set(_iter_keys(graph)))
@@ -231,6 +227,19 @@ class DirectTfliteW8A8ExportTests(unittest.TestCase):
         self.assertGreater(len(qconv_nodes), 0)
         self.assertGreater(len(qadd_nodes), 0)
         self.assertEqual(len(sigmoid_nodes), 1)
+
+        affine_bridge_nodes = [
+            node for node in nodes
+            if node.get("opType") in {
+                "QuantizeLinear", "DequantizeLinear", "RequantizeLinear",
+            }
+        ]
+        self.assertGreater(len(affine_bridge_nodes), 0)
+        for node in affine_bridge_nodes:
+            self.assertEqual(
+                node.get("params"), {},
+                "affine conversion nodes must not carry retired layout metadata",
+            )
 
         for node in requantize_nodes + qconv_nodes + qadd_nodes:
             self.assert_typed_quantized_output(graph, tensors, node)
@@ -320,8 +329,6 @@ class EfficientDetNativeEndToEndTests(unittest.TestCase):
                     str(output_path),
                     "--weight-dtype",
                     variant["weight_dtype"],
-                    "--image-normalization",
-                    f"input0={variant['normalization']}",
                     "--output-name",
                     "scores",
                     "--output-name",
@@ -338,9 +345,9 @@ class EfficientDetNativeEndToEndTests(unittest.TestCase):
                 f"exporter failed:\nstdout:\n{exported.stdout}\nstderr:\n{exported.stderr}",
             )
             graph = json.loads((model_dir / "graph.json").read_text(encoding="utf-8"))
-            self.assertEqual(
-                graph.get("inputs", {}).get("input0", {}).get("image_normalization"),
-                variant["normalization"],
+            self.assertNotIn(
+                "image_normalization",
+                graph.get("inputs", {}).get("input0", {}),
             )
             shutil.copyfile(LABELS, model_dir / "labels.txt")
 
@@ -353,6 +360,8 @@ class EfficientDetNativeEndToEndTests(unittest.TestCase):
                             str(model_dir),
                             "--image",
                             f"input0={LABELS.parent / filename}",
+                            "--image-normalize",
+                            variant["normalization"],
                             "--max-det",
                             "1",
                         ],

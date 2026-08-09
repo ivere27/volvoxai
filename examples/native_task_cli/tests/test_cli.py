@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import json
-import math
 import struct
 import subprocess
 import sys
@@ -63,7 +62,6 @@ def write_image_identity_graph(
     *,
     scale: float | None = None,
     zero_point: int = 0,
-    image_normalization: str | None = None,
 ) -> Path | None:
     input_descriptor: dict[str, object] = {
         "shape": [1, 1, 2, 3],
@@ -104,21 +102,26 @@ def write_image_identity_graph(
         weights_path.write_bytes(
             struct.pack("<Q", len(header)) + header + scale_bytes + zero_bytes
         )
-    if image_normalization is not None:
-        input_descriptor["image_normalization"] = image_normalization
     path.write_text(
         json.dumps(
             {
                 "format": "volvox-graph/v1",
+                "dimensions": {},
                 **({"quantization": graph_quantization} if graph_quantization else {}),
                 "inputs": {"image": input_descriptor},
                 "nodes": [
                     {
+                        "id": "identity",
                         "opType": "Identity",
                         "inputs": {"input": "image"},
-                        "outputs": {"out": "pixels"},
-                        "outputs_shape": {"out": [1, 1, 2, 3]},
-                        "outputs_dtype": {"out": dtype},
+                        "outputs": {
+                            "out": {
+                                "tensor": "pixels",
+                                "dtype": dtype,
+                                "shape": [1, 1, 2, 3],
+                            }
+                        },
+                        "params": {},
                     }
                 ],
                 "outputs": ["pixels"],
@@ -135,6 +138,17 @@ def main() -> int:
         return 2
     binary = Path(sys.argv[1]).resolve()
     require(binary.is_file(), f"Native task CLI not found: {binary}")
+    package_path = Path(__file__).resolve().parents[3] / "package.json"
+    package_version = json.loads(package_path.read_text(encoding="utf-8"))["version"]
+    version_result = run(binary, "--version")
+    require(
+        version_result.returncode == 0
+        and version_result.stdout.startswith(
+            f"VolvoxAI Native Task Example {package_version} (".encode()
+        ),
+        f"Native task CLI version does not match package version {package_version}",
+        version_result,
+    )
 
     help_result = run(binary, "--help")
     require(help_result.returncode == 0, "Task CLI help failed", help_result)
@@ -172,16 +186,24 @@ def main() -> int:
             json.dumps(
                 {
                     "format": "volvox-graph/v1",
+                    "dimensions": {},
                     "inputs": {
                         "x": {"shape": [2], "dtype": "float32"},
                         "ids": {"shape": [2], "dtype": "int32"},
                     },
                     "nodes": [
                         {
-                            "opType": "Sin",
+                            "id": "identity",
+                            "opType": "Identity",
                             "inputs": {"input": "x"},
-                            "outputs": {"out": "y"},
-                            "outputs_shape": {"out": [2]},
+                            "outputs": {
+                                "out": {
+                                    "tensor": "y",
+                                    "dtype": "float32",
+                                    "shape": [2],
+                                }
+                            },
+                            "params": {},
                         }
                     ],
                     "outputs": ["y", "ids"],
@@ -208,7 +230,7 @@ def main() -> int:
         require(result.returncode == 0, "Weightless typed task-CLI run failed", result)
         values = struct.unpack("=2f", y_output.read_bytes())
         require(
-            abs(values[0]) < 1.0e-6 and abs(values[1] - math.sin(1.0)) < 1.0e-6,
+            abs(values[0]) < 1.0e-6 and abs(values[1] - 1.0) < 1.0e-6,
             f"Unexpected F32 output: {values}",
         )
         require(
@@ -231,7 +253,6 @@ def main() -> int:
                 dtype,
                 scale=scale,
                 zero_point=zero_point,
-                image_normalization="raw-255",
             )
             result = run(
                 binary,
@@ -241,6 +262,8 @@ def main() -> int:
                 str(image_weights),
                 "--image",
                 f"image={image_path}",
+                "--image-normalize",
+                "raw-255",
                 "--output",
                 f"pixels={image_output}",
             )
@@ -270,7 +293,6 @@ def main() -> int:
                 dtype,
                 scale=scale,
                 zero_point=zero_point,
-                image_normalization=normalize,
             )
             result = run(
                 binary,
@@ -280,6 +302,8 @@ def main() -> int:
                 str(image_weights),
                 "--image",
                 f"image={image_path}",
+                "--image-normalize",
+                normalize,
                 "--output",
                 f"pixels={image_output}",
             )
@@ -292,15 +316,15 @@ def main() -> int:
 
         f32_image_graph = root / "image-f32.graph.json"
         f32_image_output = root / "image-f32.f32"
-        write_image_identity_graph(
-            f32_image_graph, "float32", image_normalization="zero-one"
-        )
+        write_image_identity_graph(f32_image_graph, "float32")
         result = run(
             binary,
             "run",
             str(f32_image_graph),
             "--image",
             f"image={image_path}",
+            "--image-normalize",
+            "zero-one",
             "--output",
             f"pixels={f32_image_output}",
         )
@@ -313,7 +337,7 @@ def main() -> int:
             result,
         )
 
-        f32_override_output = root / "image-f32-override.f32"
+        f32_raw_output = root / "image-f32-raw.f32"
         result = run(
             binary,
             "run",
@@ -323,14 +347,14 @@ def main() -> int:
             "--image-normalize",
             "raw-255",
             "--output",
-            f"pixels={f32_override_output}",
+            f"pixels={f32_raw_output}",
         )
-        require(result.returncode == 0, "Explicit image normalization override failed", result)
-        f32_override_pixels = struct.unpack("=6f", f32_override_output.read_bytes())
+        require(result.returncode == 0, "Explicit raw image normalization failed", result)
+        f32_raw_pixels = struct.unpack("=6f", f32_raw_output.read_bytes())
         require(
             all(abs(actual - expected) < 1.0e-6
-                for actual, expected in zip(f32_override_pixels, image_pixels)),
-            f"Explicit image normalization did not override package metadata: {f32_override_pixels}",
+                for actual, expected in zip(f32_raw_pixels, image_pixels)),
+            f"Explicit raw image normalization is incorrect: {f32_raw_pixels}",
             result,
         )
 
@@ -348,9 +372,9 @@ def main() -> int:
         )
         require(
             result.returncode != 0
-            and b"Input image does not declare image_normalization; add package metadata or pass --image-normalize explicitly."
+            and b"requires explicit --image-normalize; graph metadata is never used"
             in result.stderr,
-            "Unannotated image input did not fail closed",
+            "Image input without explicit normalization did not fail closed",
             result,
         )
 
@@ -372,20 +396,21 @@ def main() -> int:
         )
 
         f32_invalid_graph = root / "image-f32-invalid.graph.json"
-        write_image_identity_graph(
-            f32_invalid_graph, "float32", image_normalization="automatic"
-        )
+        write_image_identity_graph(f32_invalid_graph, "float32")
         result = run(
             binary,
             "run",
             str(f32_invalid_graph),
             "--image",
             f"image={image_path}",
+            "--image-normalize",
+            "automatic",
         )
         require(
             result.returncode != 0
-            and b"Input image has unsupported image_normalization 'automatic'" in result.stderr,
-            "Invalid package image normalization was not rejected",
+            and b"--image-normalize expects zero-one, minus-one-one, or raw-255"
+            in result.stderr,
+            "Invalid explicit image normalization was not rejected",
             result,
         )
 
@@ -419,22 +444,37 @@ def main() -> int:
             json.dumps(
                 {
                     "format": "volvox-graph/v1",
+                    "dimensions": {},
                     "inputs": {
                         "box_in": {"shape": [2, 4], "dtype": "float32"},
                         "score_in": {"shape": [2, 3], "dtype": "float32"},
                     },
                     "nodes": [
                         {
+                            "id": "boxes",
                             "opType": "Identity",
                             "inputs": {"input": "box_in"},
-                            "outputs": {"out": "boxes"},
-                            "outputs_shape": {"out": [2, 4]},
+                            "outputs": {
+                                "out": {
+                                    "tensor": "boxes",
+                                    "dtype": "float32",
+                                    "shape": [2, 4],
+                                }
+                            },
+                            "params": {},
                         },
                         {
+                            "id": "scores",
                             "opType": "Identity",
                             "inputs": {"input": "score_in"},
-                            "outputs": {"out": "scores"},
-                            "outputs_shape": {"out": [2, 3]},
+                            "outputs": {
+                                "out": {
+                                    "tensor": "scores",
+                                    "dtype": "float32",
+                                    "shape": [2, 3],
+                                }
+                            },
+                            "params": {},
                         },
                     ],
                     "outputs": ["boxes", "scores"],

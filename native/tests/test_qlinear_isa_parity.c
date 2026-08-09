@@ -2,11 +2,10 @@
  * Byte-exact parity of every ISA tier the host can run, for the raw QLinear and
  * QConv dispatchers.
  *
- * benchmark_kernel_unit checks the packed GEMM, which has no VNNI variant, so it
- * never reaches vx_w8a8_qlinear_avx*vnni_*.  Those kernels are selected only by
- * the raw dispatcher and only above a per-tier minimum reduction length, so this
- * test drives that dispatcher across shapes that straddle each threshold and
- * compares against the portable reference byte for byte.
+ * test_packed_quant_gemm owns the packed N32 AVX2/VNNI tier walk.  This test
+ * drives the distinct raw QLinear and direct QConv dispatchers across shapes
+ * that straddle their thresholds and compares them against the portable
+ * reference byte for byte.
  *
  * VOLVOXAI_CPU_ISA lets one binary walk every tier the CPU supports, so the same
  * test covers baseline, AVX2, AVX-VNNI and AVX-512-VNNI on whatever host it runs
@@ -187,7 +186,7 @@ static int qconv_parity(const char* tier) {
     return mismatches;
 }
 
-int main(void) {
+int main(int argc, char** argv) {
     static const char* TIERS[] = {
         "baseline", "avx2", "avxvnni", "avx512vnni",
     };
@@ -216,11 +215,15 @@ int main(void) {
     }
 
     /* No pin: re-exec once per tier so every tier gets a fresh resolution. */
+    if (argc < 1 || !argv[0] || !argv[0][0]) {
+        fprintf(stderr, "cannot resolve test executable path\n");
+        return 2;
+    }
     int failures = 0;
     for (size_t i = 0; i < sizeof TIERS / sizeof TIERS[0]; i++) {
         char command[512];
         snprintf(command, sizeof command,
-                 "VOLVOXAI_CPU_ISA=%s \"%s\"", TIERS[i], "/proc/self/exe");
+                 "VOLVOXAI_CPU_ISA=%s \"%s\"", TIERS[i], argv[0]);
         const int rc = system(command);
         if (rc != 0) failures++;
     }

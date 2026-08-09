@@ -2,6 +2,7 @@
 @group(0) @binding(0) var<storage, read> input : array<f32>;
 @group(0) @binding(1) var<storage, read> indices : array<i32>;
 @group(0) @binding(2) var<storage, read_write> output : array<f32>;
+@group(0) @binding(4) var<storage, read> slot_rows : array<u32>;
 
 struct Params {
   // data_rank, indices_rank, axis, output_elements
@@ -10,6 +11,10 @@ struct Params {
   data_shape1 : vec4<u32>,
   output_shape0 : vec4<u32>,
   output_shape1 : vec4<u32>,
+  // slot_domain, reserved, reserved, reserved. A zero domain selects the
+  // ordinary fully resident path; otherwise slot_rows maps global ids to the
+  // staged axis-0 rows and 0xffffffff marks a non-resident slot.
+  bank : vec4<u32>,
 }
 @group(0) @binding(3) var<uniform> params : Params;
 
@@ -51,14 +56,23 @@ fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
     index_offset = index_offset * output_dim(output_dimension) + output_coords[output_dimension];
   }
   var gathered = indices[index_offset];
+  let index_domain = select(data_dim(axis), params.bank.x, params.bank.x != 0u);
   if (gathered < 0) {
-    gathered = gathered + i32(data_dim(axis));
+    gathered = gathered + i32(index_domain);
   }
-  if (gathered < 0 || gathered >= i32(data_dim(axis))) {
-    // Match the portable Gather sentinel without forming an out-of-bounds
-    // address when one ONNX negative-index normalization is still invalid.
+  if (gathered < 0 || gathered >= i32(index_domain)) {
+    // Host/static preflight makes this unreachable for canonical graphs. Keep
+    // a defensive value so malformed direct dispatches never address OOB.
     output[output_index] = -1.0;
     return;
+  }
+  if (params.bank.x != 0u) {
+    let staged_row = slot_rows[u32(gathered)];
+    if (staged_row == 0xffffffffu) {
+      output[output_index] = -1.0;
+      return;
+    }
+    gathered = i32(staged_row);
   }
 
   var input_index = 0u;

@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
-import { Graph } from '../ts/core/Graph.js';
+import { RuntimeGraph } from '../ts/core/RuntimeGraph.js';
 import { _cpuQSDPA } from '../ts/ops/qSDPA.js';
 
 function byteStorage(dtype, values) {
@@ -38,7 +38,7 @@ function qSDPAGraph({
   scale = 0.5,
   outputFill = 0,
 } = {}) {
-  const graph = new Graph();
+  const graph = new RuntimeGraph();
   const q = graph.addInput('q', qShape, qDtype, {
     buffer: byteStorage(qDtype, qValues), quantization: qQuantization,
   });

@@ -1,6 +1,7 @@
 import { WasmEngine } from './backends/WasmEngine.js';
-import { BuiltInBackendProvider } from './backends/BackendProvider.js';
-import { Runtime, type Model, type RuntimeOptions } from './core/ContextRuntime.js';
+import { WasmBackendProvider } from './backends/WasmBackendProvider.js';
+import { Runtime, type RuntimeOptions } from './core/ContextRuntime.js';
+import type { Model } from './core/Model.js';
 import { VolvoxAIError, runtimeError } from './core/RuntimeErrors.js';
 import {
   createTrainer as createStrictTrainer,
@@ -11,8 +12,10 @@ export interface WasmRuntimeOptions extends RuntimeOptions {
   readonly wasmUrl?: string | URL;
 }
 
+export type WasmRuntime = Runtime;
+
 /** Create the strict browser-only WASM runtime. */
-export async function createRuntime(options: WasmRuntimeOptions = {}): Promise<Runtime> {
+export async function createRuntime(options: WasmRuntimeOptions = {}): Promise<WasmRuntime> {
   if (!options || typeof options !== 'object' || Array.isArray(options)) {
     throw new VolvoxAIError('INVALID_ARGUMENT',
       '[VolvoxAI] WASM runtime options must be an object.', {
@@ -52,15 +55,15 @@ export async function createRuntime(options: WasmRuntimeOptions = {}): Promise<R
       });
   }
   const runtime = new Runtime({ onDiagnostic });
-  runtime._addProvider('wasm', new BuiltInBackendProvider(engine));
+  runtime._addProvider('wasm', new WasmBackendProvider(engine));
   return runtime;
 }
 
 export function createTrainer(
-  model: Model,
+  snapshot: Model,
   options: TrainerOptions = {},
 ) {
-  return createStrictTrainer(model, {
+  return createStrictTrainer(snapshot, {
     ...options,
     wasmUrl: options.wasmUrl ?? new URL('./volvoxai.full.wasm', import.meta.url),
   });

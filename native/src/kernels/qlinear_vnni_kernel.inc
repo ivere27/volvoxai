@@ -116,10 +116,9 @@ static VX_MK_TARGET void VX_MK_FN(_range)(
                     (int64_t)d_in * input_zero_unsigned * weight_zero_signed;
                 const float product_scale = input_scale * weight_scales[column];
                 const float multiplier = product_scale / output_scale;
-                const float scaled = (float)accumulator * multiplier;
-                const float transformed = scaled + (float)output_zero_point;
-                const int32_t quantized = vx_w8a8_requantize(transformed,
-                    output_minimum, output_maximum, output_zero_point);
+                const int32_t quantized = vx_w8a8_requantize_accumulator(
+                    accumulator, multiplier, output_zero_point,
+                    output_minimum, output_maximum);
                 vx_w8a8_store_byte(output, output_dtype,
                     output_offset + column, quantized);
             }
@@ -246,12 +245,11 @@ static VX_MK_TARGET void VX_MK_FN(_tiled_range)(
                         (int64_t)weight_zero_signed * input_sums[tile_row] -
                         (int64_t)input_zero_unsigned * weight_sum +
                         (int64_t)d_in * input_zero_unsigned * weight_zero_signed;
-                    const float scaled = (float)accumulator * multiplier;
-                    const float transformed =
-                        scaled + (float)call->output_zero_point;
-                    const int32_t quantized = vx_w8a8_requantize(
-                        transformed, output_minimum, output_maximum,
-                        call->output_zero_point);
+                    const int32_t quantized =
+                        vx_w8a8_requantize_accumulator(
+                            accumulator, multiplier,
+                            call->output_zero_point, output_minimum,
+                            output_maximum);
                     vx_w8a8_store_byte(call->output, call->output_dtype,
                         output_offsets[tile_row] + column, quantized);
                 }

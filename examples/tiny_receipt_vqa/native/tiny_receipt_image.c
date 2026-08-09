@@ -17,7 +17,9 @@ static void tiny_receipt_set_error(char* err, size_t err_size, const char* messa
 }
 
 static float tiny_receipt_normalize(float value) {
-    return (value / 255.0f) * 2.0f - 1.0f;
+    const float unit = value / 255.0f;
+    const float doubled = unit * 2.0f;
+    return doubled - 1.0f;
 }
 
 /* Match the source evaluator's semantic order:
