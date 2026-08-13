@@ -1,8 +1,11 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
-import { ModelBuilder, importModelCheckpoint } from '../ts/full.js';
-import { createCPUTrainingHarness } from './helpers/training_session.mjs';
+import { TrainingModelBuilder as ModelBuilder } from '../ts/training/TrainingModelBuilder.js';
+import {
+  createCPUTrainingHarness,
+  trainingGraphFromCheckpoint,
+} from './helpers/training_session.mjs';
 
 test('maskedMean pools variable-length token rows and backpropagates through reduction', async () => {
   const builder = new ModelBuilder();
@@ -45,7 +48,7 @@ test('maskedMean pools variable-length token rows and backpropagates through red
       updateMode: 'sgd',
       optimizer: { learningRate: 1e-2 },
     });
-    trained = importModelCheckpoint(await training.exportCheckpoint(graph)).graph;
+    trained = trainingGraphFromCheckpoint(await training.exportCheckpoint(graph));
   } finally {
     await training.close();
   }

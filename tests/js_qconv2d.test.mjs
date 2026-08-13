@@ -2,10 +2,10 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 
 import { CPUEngine } from '../ts/backends/CPUEngine.js';
-import { Graph } from '../ts/core/Graph.js';
+import { RuntimeGraph } from '../ts/core/RuntimeGraph.js';
 
 test('CPU QConv2D executes canonical NHWC/OHWI W8A8 with per-output weight scales', async () => {
-  const graph = new Graph();
+  const graph = new RuntimeGraph();
   const input = graph.addInput('input', [1, 2, 2, 2], 'int8', {
     quantization: { scheme: 'per_tensor', scale: 0.5, zero_point: 0 },
   });
@@ -29,7 +29,7 @@ test('CPU QConv2D executes canonical NHWC/OHWI W8A8 with per-output weight scale
 });
 
 test('CPU QConv2D applies quantized ReLU at the output descriptor zero point', async () => {
-  const graph = new Graph();
+  const graph = new RuntimeGraph();
   const input = graph.addInput('input', [1, 1, 2, 1], 'int8', {
     quantization: { scheme: 'per_tensor', scale: 0.5, zero_point: 0 },
   });
@@ -51,7 +51,7 @@ test('CPU QConv2D applies quantized ReLU at the output descriptor zero point', a
 });
 
 test('CPU QConv2D rejects a per-tensor weight descriptor', () => {
-  const graph = new Graph();
+  const graph = new RuntimeGraph();
   const input = graph.addInput('input', [1, 1, 1, 1], 'int8', {
     quantization: { scheme: 'per_tensor', scale: 0.5, zero_point: 0 },
   });
@@ -73,7 +73,7 @@ test('CPU QConv2D rejects a per-tensor weight descriptor', () => {
 });
 
 test('CPU QConv2D maps an overflowing zero accumulator to its output zero point', async () => {
-  const graph = new Graph();
+  const graph = new RuntimeGraph();
   const input = graph.addInput('input', [1, 1, 1, 1], 'int8', {
     quantization: { scheme: 'per_tensor', scale: 3e38, zero_point: 1 },
   });

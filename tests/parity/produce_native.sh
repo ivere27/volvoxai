@@ -5,12 +5,13 @@
 #
 # <tier> is a label recorded in the report and used to pick the backend flag:
 #   native-cpu      (--cpu)              — the always-runnable gate tier
-#   native-vulkan   (--vulkan)           — best-effort (needs a Vulkan loader)
-#   native-opengl   (--opengl)           — best-effort
+#   native-vulkan   (--vulkan)           — physical capability probe
+#   native-opengl   (--opengl)           — physical capability probe
 #
-# Runs the fixed native binary `native/volvoxai run` on each model's fixed inputs
-# and dumps raw output tensors under tests/parity/out/native/<tier>/<model>/.
-# `run.mjs native-sig` then folds those into comparable signatures.
+# Runs the fixed native binary `native/volvoxai run` on each model's fixed inputs.
+# CPU publishes raw tensors; native GPU tiers publish policy-bound capability
+# evidence when strict compilation reaches an exact expected rejection.
+# `run.mjs native-sig` validates and imports either result.
 set -euo pipefail
 cd "$(dirname "$0")/../.."
 
@@ -20,11 +21,12 @@ BIN="native/volvoxai"
 OUT="tests/parity/out/native/${TIER}"
 FIX="tests/parity/out/fixtures"
 FLAG_ARGS=()
+CAPABILITY_EXPECTED=0
 
 case "$TIER" in
   native-cpu)    EXPECTED_BACKEND="cpu"; FLAG_ARGS=(--cpu) ;;
-  native-vulkan) EXPECTED_BACKEND="vulkan"; FLAG_ARGS=(--vulkan) ;;
-  native-opengl) EXPECTED_BACKEND="opengl"; FLAG_ARGS=(--opengl) ;;
+  native-vulkan) EXPECTED_BACKEND="vulkan"; FLAG_ARGS=(--vulkan); CAPABILITY_EXPECTED=1 ;;
+  native-opengl) EXPECTED_BACKEND="opengl"; FLAG_ARGS=(--opengl); CAPABILITY_EXPECTED=1 ;;
   *) echo "unknown tier: $TIER" >&2; exit 2 ;;
 esac
 
@@ -33,8 +35,11 @@ esac
 rm -f -- \
   "$OUT/tinystories_1m/logits.f32" "$OUT/tinystories_1m/ms.txt" "$OUT/tinystories_1m/backend.txt" \
   "$OUT/tinystories_1m/adapter.json" "$OUT/tinystories_1m/runtime-evidence.json" \
+  "$OUT/tinystories_1m/runtime-failure-evidence.json" "$OUT/tinystories_1m/native.log" "$OUT/tinystories_1m/capability-skip.json" \
   "$OUT/efficientdet_lite0_int8/scores.f32" "$OUT/efficientdet_lite0_int8/boxes.f32" "$OUT/efficientdet_lite0_int8/ms.txt" "$OUT/efficientdet_lite0_int8/backend.txt" "$OUT/efficientdet_lite0_int8/adapter.json" "$OUT/efficientdet_lite0_int8/runtime-evidence.json" \
+  "$OUT/efficientdet_lite0_int8/runtime-failure-evidence.json" "$OUT/efficientdet_lite0_int8/native.log" "$OUT/efficientdet_lite0_int8/capability-skip.json" \
   "$OUT/efficientdet_lite0_fp32/scores.f32" "$OUT/efficientdet_lite0_fp32/boxes.f32" "$OUT/efficientdet_lite0_fp32/ms.txt" "$OUT/efficientdet_lite0_fp32/backend.txt" "$OUT/efficientdet_lite0_fp32/adapter.json" "$OUT/efficientdet_lite0_fp32/runtime-evidence.json" \
+  "$OUT/efficientdet_lite0_fp32/runtime-failure-evidence.json" "$OUT/efficientdet_lite0_fp32/native.log" "$OUT/efficientdet_lite0_fp32/capability-skip.json" \
   "tests/parity/out/manifests/whole-${TIER}.json" \
   "tests/parity/out/tinystories_1m.${TIER}.json" \
   "tests/parity/out/efficientdet_lite0_int8.${TIER}.json" \
@@ -70,6 +75,7 @@ expected_elements() {
 cleanup_stage() {
   local stage="$1"
   rm -f -- "$stage/native.log" "$stage/ms.txt" "$stage/adapter.json" "$stage/runtime-evidence.json" \
+    "$stage/capability-skip.json" \
     "$stage/logits.f32" "$stage/scores.f32" "$stage/boxes.f32"
   rmdir "$stage" 2>/dev/null || true
 }
@@ -108,10 +114,54 @@ run_model() {
     return 2
   fi
 
-  local start end
+  local start end cli_status
   start=$(date +%s%N)
-  if ! "$BIN" run "$model_dir" "${FLAG_ARGS[@]}" "${cli_args[@]}" \
-      --report-json "$stage/runtime-evidence.json" >"$stage/native.log" 2>&1; then
+  set +e
+  "$BIN" run "$model_dir" "${FLAG_ARGS[@]}" "${cli_args[@]}" \
+    --report-json "$stage/runtime-evidence.json" >"$stage/native.log" 2>&1
+  cli_status=$?
+  set -e
+  if [ "$CAPABILITY_EXPECTED" -eq 1 ]; then
+    if [ "$cli_status" -eq 0 ]; then
+      echo "native ${TIER} ${out_sub}: unexpectedly compiled despite its declared capability skip" >&2
+      cat "$stage/native.log" >&2
+      cleanup_stage "$stage"
+      return 1
+    fi
+    for staged_output in "${staged_outputs[@]}"; do
+      if [ -e "$staged_output" ]; then
+        echo "native ${TIER} ${out_sub}: rejected compile still published an output" >&2
+        cleanup_stage "$stage"
+        return 1
+      fi
+    done
+    if ! "$NODE" tests/parity/seal_native_capability.mjs \
+        "$TIER" "$out_sub" "$cli_status" "$stage/native.log" \
+        "$stage/runtime-evidence.json" "$stage/capability-skip.json"; then
+      cat "$stage/native.log" >&2
+      cleanup_stage "$stage"
+      return 1
+    fi
+    if [ ! -f "$stage/capability-skip.json" ]; then
+      echo "native ${TIER} ${out_sub}: capability sealer did not publish its artifact" >&2
+      cleanup_stage "$stage"
+      return 1
+    fi
+    if ! mv -f -- "$stage/runtime-evidence.json" "${dir}/runtime-failure-evidence.json" ||
+       ! mv -f -- "$stage/native.log" "${dir}/native.log" ||
+       ! mv -f -- "$stage/capability-skip.json" "${dir}/capability-skip.json"; then
+      echo "native ${TIER} ${out_sub}: cannot publish capability evidence" >&2
+      cleanup_stage "$stage"
+      return 1
+    fi
+    if ! rmdir "$stage"; then
+      echo "native ${TIER} ${out_sub}: capability staging directory is not empty" >&2
+      cleanup_stage "$stage"
+      return 1
+    fi
+    return 0
+  fi
+  if [ "$cli_status" -ne 0 ]; then
     cat "$stage/native.log" >&2
     cleanup_stage "$stage"
     return 1
@@ -183,11 +233,11 @@ run_model() {
 
 failed=0
 
-# TinyStories — committed integer fixtures; the signature policy selects the
-# prediction row from the complete logits tensor.
+# TinyStories — explicit [1,256] maximum-capacity whole-forward oracle. This
+# fixture is parity evidence, not the deployment generation path.
 if ! run_model models/tinystories_1m tinystories_1m \
-  --input tokens=models/tinystories_1m/tokens.i32 \
-  --input positions=models/tinystories_1m/positions.i32 \
+  --input 'tokens[1,256]=models/tinystories_1m/tokens.i32' \
+  --input 'positions[1,256]=models/tinystories_1m/positions.i32' \
   --output "logits=${OUT}/tinystories_1m/logits.f32"; then
   failed=1
 fi
@@ -208,5 +258,10 @@ if ! run_model models/efficientdet_lite0_fp32 efficientdet_lite0_fp32 \
   failed=1
 fi
 
-echo "native ${TIER}: strict '${EXPECTED_BACKEND}' tier and no-operator-fallback route verified"
 [ "$failed" -eq 0 ] || exit 1
+if [ "$CAPABILITY_EXPECTED" -eq 1 ]; then
+  "$NODE" tests/parity/seal_native_capability.mjs verify-tier "$TIER" "$OUT"
+  echo "native ${TIER}: physical initialization and exact policy-declared compile rejections verified"
+else
+  echo "native ${TIER}: strict '${EXPECTED_BACKEND}' tier and no-operator-fallback route verified"
+fi

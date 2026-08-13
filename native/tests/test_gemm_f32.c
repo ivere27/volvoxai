@@ -147,18 +147,45 @@ int main(void) {
     if (!test_concurrent_tile_initialization()) return 1;
 #endif
     VxGemmF32TileConfig tile = vx_gemm_f32_tile_config();
-    /* NR is pinned because it is the packed panel width: vx_gemm_f32_pack_b and
-     * vx_gemm_f32_packed_elements both lay out memory around it, so a change
-     * there is a layout change every microkernel has to agree with.  MR is only
-     * how many C rows one call blocks over, which gemm_f32.h documents as a
-     * tunable internal policy, so assert the invariant it has to satisfy — the
-     * tile still fits the cache budget — rather than one tuned value. */
-    if (tile.nr != 8u || tile.mr < 1u || tile.kc < 64u ||
+    /* NR is the packed panel width, but it is resolved from the ISA rather than
+     * pinned: an ISA whose microkernel is wider packs wider panels, which is
+     * how one microkernel per ISA covers every shape.  Pinning it to a value
+     * would only assert which machine ran the test.  What must hold is that
+     * every function laying out or walking that memory agrees on the width, so
+     * assert the layout arithmetic against the resolved value instead. */
+    if (tile.nr == 0u || (tile.nr & (tile.nr - 1u)) != 0u ||
+        tile.mr < 1u || tile.kc < 64u ||
         tile.working_set_bytes > tile.cache_budget_bytes ||
+        vx_gemm_f32_packed_elements(4, 1) != 4u * tile.nr ||
+        vx_gemm_f32_packed_elements(3, tile.nr + 1u) != 6u * tile.nr ||
         vx_gemm_f32_packed_elements(0, 8) != 0u ||
         vx_gemm_f32_packed_elements(8, 0) != 0u) {
         fprintf(stderr, "invalid gemm_f32 tile or dimension policy\n");
         return 1;
+    }
+    /* The plan is the shape's half of the decision and must stay inside the
+     * blocking it claims for every legal shape, including the degenerate ones. */
+    {
+        const uint32_t probes[][3] = {
+            {1, 1, 1}, {1, 4096, 4096}, {512, 2048, 2048}, {7, 511, 16},
+            {3136, 576, 128}, {101, 333, 257}
+        };
+        for (size_t index = 0; index < sizeof(probes) / sizeof(probes[0]);
+             index++) {
+            VxGemmF32Plan plan = vx_gemm_f32_plan(probes[index][0],
+                                                  probes[index][1],
+                                                  probes[index][2]);
+            if (!plan.kc || !plan.mc || !plan.nc ||
+                plan.kc > probes[index][1] || plan.mc > probes[index][0] ||
+                plan.nc > probes[index][2] ||
+                plan.nr != tile.nr || plan.mr != tile.mr ||
+                (probes[index][0] <= 1u) !=
+                    (plan.regime == VX_GEMM_F32_REGIME_STREAM)) {
+                fprintf(stderr, "invalid gemm_f32 plan for %ux%ux%u\n",
+                        probes[index][0], probes[index][1], probes[index][2]);
+                return 1;
+            }
+        }
     }
     if (!run_case(1, 513, 13, 1, 1, 0)) return 1; /* decode specialization + N tail */
     if (!run_case(7, 511, 16, 0, 1, 0)) return 1; /* MR tail + IN_OUT packing */

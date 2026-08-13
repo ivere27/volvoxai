@@ -101,18 +101,56 @@ impl Fixture {
             format!(
                 r#"{{
                   {format}
+                  "dimensions":{{}},
                   "inputs":{{"x":{{"shape":[2],"dtype":"float32"}}}},
                   "nodes":[{{
+                    "id":"identity",
                     "opType":"Identity",
                     "inputs":{{"input":"x"}},
-                    "outputs":{{"out":"y"}},
-                    "outputs_shape":{{"out":[2]}}
+                    "outputs":{{"out":{{
+                      "tensor":"y","dtype":"float32","shape":[2]
+                    }}}},
+                    "params":{{}}
                   }}],
                   "outputs":["y"]
                 }}"#
             ),
         )
         .expect("write fixture graph.json");
+        Self {
+            directory,
+            graph_path,
+            weight_path: None,
+        }
+    }
+
+    fn dynamic_graph() -> Self {
+        let sequence = NEXT_FIXTURE.fetch_add(1, Ordering::Relaxed);
+        let directory = std::env::temp_dir().join(format!(
+            "volvoxai-runtime-ffi-dynamic-{}-{sequence}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&directory).expect("create dynamic fixture directory");
+        let graph_path = directory.join("graph.json");
+        std::fs::write(
+            &graph_path,
+            r#"{
+              "format":"volvox-graph/v1",
+              "dimensions":{"N":{"min":2,"max":8,"multiple_of":2}},
+              "inputs":{"x":{"shape":["N"],"dtype":"float32"}},
+              "nodes":[{
+                "id":"identity",
+                "opType":"Identity",
+                "inputs":{"input":"x"},
+                "outputs":{"out":{
+                  "tensor":"y","dtype":"float32","shape":["N"]
+                }},
+                "params":{}
+              }],
+              "outputs":["y"]
+            }"#,
+        )
+        .expect("write dynamic fixture graph.json");
         Self {
             directory,
             graph_path,
@@ -132,12 +170,16 @@ impl Fixture {
             &graph_path,
             r#"{
               "format":"volvox-graph/v1",
+              "dimensions":{},
               "inputs":{"x":{"shape":[1,2],"dtype":"float32"}},
               "nodes":[{
+                "id":"matmul",
                 "opType":"MatMul",
                 "inputs":{"input":"x","weight":"w"},
-                "outputs":{"output":"logits"},
-                "outputs_shape":{"output":[1,2]}
+                "outputs":{"out":{
+                  "tensor":"logits","dtype":"float32","shape":[1,2]
+                }},
+                "params":{}
               }],
               "outputs":["logits"]
             }"#,
@@ -164,13 +206,16 @@ impl Fixture {
             &graph_path,
             r#"{
               "format":"volvox-graph/v1",
+              "dimensions":{},
               "inputs":{"x":{"shape":[2,3],"dtype":"float32"}},
               "nodes":[{
+                "id":"linear",
                 "opType":"Linear",
                 "inputs":{"input":"x","weight":"weight","bias":"bias"},
-                "outputs":{"out":"y"},
-                "outputs_shape":{"out":[2,2]},
-                "params":{"weight_layout":"OUT_IN"}
+                "outputs":{"out":{
+                  "tensor":"y","dtype":"float32","shape":[2,2]
+                }},
+                "params":{"weight_layout":"dout_din"}
               }],
               "outputs":["y"]
             }"#,
@@ -180,14 +225,16 @@ impl Fixture {
             directory.join("template.graph.json"),
             r#"{
               "format":"volvox-graph/v1",
+              "dimensions":{},
               "inputs":{"x":{"shape":[2,3],"dtype":"int8"}},
               "nodes":[{
+                "id":"qlinear",
                 "opType":"QLinear",
                 "inputs":{"input":"x","weight":"weight.i8","bias":"bias.i32"},
-                "outputs":{"out":"y"},
-                "outputs_shape":{"out":[2,2]},
-                "outputs_dtype":{"out":"int8"},
-                "params":{"weight_layout":"OUT_IN"}
+                "outputs":{"out":{
+                  "tensor":"y","dtype":"int8","shape":[2,2]
+                }},
+                "params":{}
               }],
               "outputs":["y"]
             }"#,
@@ -255,11 +302,15 @@ fn write_ptq_safetensors(path: &Path) {
 }
 
 fn f32_tensor(name: &str, values: [f32; 2]) -> Tensor {
+    f32_values_tensor(name, &values)
+}
+
+fn f32_values_tensor(name: &str, values: &[f32]) -> Tensor {
     Tensor {
         name: name.to_string(),
-        shape: vec![2],
+        shape: vec![values.len() as i64],
         dtype: DataType::F32 as i32,
-        data: values.into_iter().flat_map(f32::to_le_bytes).collect(),
+        data: values.iter().flat_map(|value| value.to_le_bytes()).collect(),
         location: MemoryLocation::Host as i32,
     }
 }
@@ -337,7 +388,10 @@ fn create_context_with_options(
     );
     assert_eq!(context.inputs.len(), 1);
     assert_eq!(context.inputs[0].name, "x");
-    assert_eq!(context.inputs[0].shape, vec![2]);
+    assert_eq!(context.inputs[0].dimensions.len(), 1);
+    assert_eq!(context.inputs[0].dimensions[0].symbol, "");
+    assert_eq!(context.inputs[0].dimensions[0].min, 2);
+    assert_eq!(context.inputs[0].dimensions[0].max, 2);
     assert_eq!(context.inputs[0].dtype, DataType::F32 as i32);
     (
         model.model_id,
@@ -351,17 +405,11 @@ fn create_context(runtime_id: &str, graph_path: &Path) -> (String, String, Strin
 }
 
 fn execute(context_id: &str, values: [f32; 2]) -> ExecutionResultHandle {
-    let _: OperationReport = call(
-        "/volvoxai.runtime.RuntimeService/SetInput",
-        &SetInputRequest {
-            context_id: context_id.to_string(),
-            input: Some(f32_tensor("x", values)),
-        },
-    );
     call(
         "/volvoxai.runtime.RuntimeService/Execute",
         &ExecuteRequest {
             context_id: context_id.to_string(),
+            inputs: vec![f32_tensor("x", values)],
         },
     )
 }
@@ -376,14 +424,43 @@ fn read_output(result_id: &str) -> Tensor {
     )
 }
 
-fn bind_trainer_input(trainer_id: &str, values: [f32; 2]) {
-    let _: OperationReport = call(
-        "/volvoxai.runtime.RuntimeService/SetTrainerInput",
-        &SetTrainerInputRequest {
-            trainer_id: trainer_id.to_string(),
-            input: Some(f32_training_tensor(values)),
-        },
-    );
+fn trainer_step_request(
+    trainer_id: &str,
+    input: Tensor,
+    target: i32,
+    optimizer: TrainingOptimizerKind,
+    accumulation_steps: u32,
+) -> TrainStepRequest {
+    TrainStepRequest {
+        trainer_id: trainer_id.to_string(),
+        inputs: vec![input],
+        losses: vec![CrossEntropyLoss {
+            name: "loss".to_string(),
+            logits_name: "logits".to_string(),
+            targets: vec![target],
+            ignore_index: None,
+            row_index: None,
+            weight: None,
+            normalizer: if accumulation_steps > 1 { 2.0 } else { 0.0 },
+        }],
+        trainable_names: vec!["w".to_string()],
+        optimizer: Some(TrainerOptimizerOptions {
+            kind: optimizer as i32,
+            learning_rate: Some(0.05),
+            beta1: None,
+            beta2: None,
+            epsilon: None,
+            weight_decay: Some(if optimizer == TrainingOptimizerKind::Adamw {
+                0.01
+            } else {
+                0.0
+            }),
+            max_gradient_norm: None,
+        }),
+        accumulation_steps: Some(accumulation_steps),
+        flush_accumulation: false,
+        reset_accumulation: false,
+    }
 }
 
 fn trainer_step(
@@ -392,38 +469,15 @@ fn trainer_step(
     optimizer: TrainingOptimizerKind,
     accumulation_steps: u32,
 ) -> TrainStepResult {
-    bind_trainer_input(trainer_id, [1.0, -0.5]);
     call(
         "/volvoxai.runtime.RuntimeService/TrainStep",
-        &TrainStepRequest {
-            trainer_id: trainer_id.to_string(),
-            losses: vec![CrossEntropyLoss {
-                name: "loss".to_string(),
-                logits_name: "logits".to_string(),
-                targets: vec![target],
-                ignore_index: None,
-                row_index: None,
-                weight: None,
-                normalizer: if accumulation_steps > 1 { 2.0 } else { 0.0 },
-            }],
-            trainable_names: vec!["w".to_string()],
-            optimizer: Some(TrainerOptimizerOptions {
-                kind: optimizer as i32,
-                learning_rate: Some(0.05),
-                beta1: None,
-                beta2: None,
-                epsilon: None,
-                weight_decay: Some(if optimizer == TrainingOptimizerKind::Adamw {
-                    0.01
-                } else {
-                    0.0
-                }),
-                max_gradient_norm: None,
-            }),
-            accumulation_steps: Some(accumulation_steps),
-            flush_accumulation: false,
-            reset_accumulation: false,
-        },
+        &trainer_step_request(
+            trainer_id,
+            f32_training_tensor([1.0, -0.5]),
+            target,
+            optimizer,
+            accumulation_steps,
+        ),
     )
 }
 
@@ -500,6 +554,7 @@ fn contexts_are_independent_and_results_survive_parent_release() {
         "/volvoxai.runtime.RuntimeService/Execute",
         &ExecuteRequest {
             context_id: context_a.clone(),
+            inputs: vec![f32_tensor("x", [1.0, 2.0])],
         },
     )
     .expect_err("closed context accepted execution");
@@ -541,11 +596,11 @@ fn contexts_are_independent_and_results_survive_parent_release() {
             context_id: context_b_id.clone(),
         },
     );
-    let closed_input = invoke::<_, OperationReport>(
-        "/volvoxai.runtime.RuntimeService/SetInput",
-        &SetInputRequest {
+    let closed_input = invoke::<_, ExecutionResultHandle>(
+        "/volvoxai.runtime.RuntimeService/Execute",
+        &ExecuteRequest {
             context_id: context_b_id.clone(),
-            input: Some(f32_tensor("x", [1.0, 2.0])),
+            inputs: vec![f32_tensor("x", [1.0, 2.0])],
         },
     )
     .expect_err("closed context accepted input");
@@ -554,6 +609,127 @@ fn contexts_are_independent_and_results_survive_parent_release() {
         "/volvoxai.runtime.RuntimeService/ReleaseExecutionContext",
         &ExecutionContextRef {
             context_id: context_b_id,
+        },
+    );
+}
+
+#[test]
+fn one_context_executes_multiple_dynamic_shapes_transactionally() {
+    let fixture = Fixture::dynamic_graph();
+    let runtime = create_runtime();
+    let model: ModelHandle = call(
+        "/volvoxai.runtime.RuntimeService/LoadModel",
+        &LoadModelRequest {
+            runtime_id: runtime.runtime_id.clone(),
+            graph_path: path_string(&fixture.graph_path),
+            weight_paths: Vec::new(),
+        },
+    );
+    let compiled: CompiledModelHandle = call(
+        "/volvoxai.runtime.RuntimeService/CompileModel",
+        &CompileModelRequest {
+            model_id: model.model_id.clone(),
+            policy: Some(BackendPolicy {
+                mode: BackendPolicyMode::Require as i32,
+                backends: vec!["cpu".to_string()],
+                operator_fallback: OperatorFallback::Forbid as i32,
+            }),
+        },
+    );
+    let context: ExecutionContextHandle = call(
+        "/volvoxai.runtime.RuntimeService/CreateExecutionContext",
+        &CreateExecutionContextRequest {
+            compiled_model_id: compiled.compiled_model_id.clone(),
+            decode_row_mode: DecodeRowMode::Disabled as i32,
+            require_incremental: false,
+        },
+    );
+    assert_eq!(context.inputs.len(), 1);
+    assert_eq!(context.inputs[0].dimensions.len(), 1);
+    assert_eq!(context.inputs[0].dimensions[0].symbol, "N");
+    assert_eq!(context.inputs[0].dimensions[0].min, 2);
+    assert_eq!(context.inputs[0].dimensions[0].max, 8);
+    assert_eq!(context.inputs[0].dimensions[0].multiple_of, 2);
+
+    let execute_values = |values: &[f32]| -> ExecutionResultHandle {
+        call(
+            "/volvoxai.runtime.RuntimeService/Execute",
+            &ExecuteRequest {
+                context_id: context.context_id.clone(),
+                inputs: vec![f32_values_tensor("x", values)],
+            },
+        )
+    };
+    let small_values = [1.25f32, -3.5];
+    let large_values = [0.0f32, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0];
+    let small = execute_values(&small_values);
+    let large = execute_values(&large_values);
+    let small_again = execute_values(&small_values);
+
+    let invalid = invoke::<_, ExecutionResultHandle>(
+        "/volvoxai.runtime.RuntimeService/Execute",
+        &ExecuteRequest {
+            context_id: context.context_id.clone(),
+            inputs: vec![f32_values_tensor("x", &[9.0, 8.0, 7.0])],
+        },
+    )
+    .expect_err("non-multiple dynamic binding was accepted");
+    assert_eq!(invalid.code, NativeStatus::InvalidArgument as i32);
+
+    let recovered = execute_values(&small_values);
+    for (result, expected) in [
+        (&small, small_values.as_slice()),
+        (&large, large_values.as_slice()),
+        (&small_again, small_values.as_slice()),
+        (&recovered, small_values.as_slice()),
+    ] {
+        let output = read_output(&result.result_id);
+        assert_eq!(output.shape, vec![expected.len() as i64]);
+        assert_eq!(decode_f32(&output), expected);
+    }
+
+    let _: OperationReport = call(
+        "/volvoxai.runtime.RuntimeService/CloseExecutionContext",
+        &ExecutionContextRef {
+            context_id: context.context_id.clone(),
+        },
+    );
+    let _: Empty = call(
+        "/volvoxai.runtime.RuntimeService/ReleaseExecutionContext",
+        &ExecutionContextRef {
+            context_id: context.context_id,
+        },
+    );
+    for result in [small, large, small_again, recovered] {
+        let _: Empty = call(
+            "/volvoxai.runtime.RuntimeService/ReleaseResult",
+            &ResultRef {
+                result_id: result.result_id,
+            },
+        );
+    }
+    let _: Empty = call(
+        "/volvoxai.runtime.RuntimeService/ReleaseCompiledModel",
+        &CompiledModelRef {
+            compiled_model_id: compiled.compiled_model_id,
+        },
+    );
+    let _: Empty = call(
+        "/volvoxai.runtime.RuntimeService/ReleaseModel",
+        &ModelRef {
+            model_id: model.model_id,
+        },
+    );
+    let _: OperationReport = call(
+        "/volvoxai.runtime.RuntimeService/CloseRuntime",
+        &RuntimeRef {
+            runtime_id: runtime.runtime_id.clone(),
+        },
+    );
+    let _: Empty = call(
+        "/volvoxai.runtime.RuntimeService/ReleaseRuntime",
+        &RuntimeRef {
+            runtime_id: runtime.runtime_id,
         },
     );
 }
@@ -660,41 +836,35 @@ fn decode_seed_step_and_reset_use_immutable_results() {
 
     let mut wrong_shape = f32_tensor("x", [2.5, -4.0]);
     wrong_shape.shape = vec![1, 2];
-    let rejected_shape = invoke::<_, OperationReport>(
-        "/volvoxai.runtime.RuntimeService/SetInput",
-        &SetInputRequest {
+    let rejected_shape = invoke::<_, ExecutionResultHandle>(
+        "/volvoxai.runtime.RuntimeService/DecodeSeed",
+        &DecodeSeedRequest {
             context_id: context_id.clone(),
-            input: Some(wrong_shape),
+            inputs: vec![wrong_shape],
         },
     )
     .expect_err("same-byte input with the wrong declared shape was accepted");
     assert_eq!(rejected_shape.code, NativeStatus::InvalidArgument as i32);
-    assert!(rejected_shape.message.contains("shape"));
+    assert!(rejected_shape.message.contains("rank"));
 
     let mut device_input = f32_tensor("x", [2.5, -4.0]);
     device_input.location = MemoryLocation::Device as i32;
-    let rejected_location = invoke::<_, OperationReport>(
-        "/volvoxai.runtime.RuntimeService/SetInput",
-        &SetInputRequest {
+    let rejected_location = invoke::<_, ExecutionResultHandle>(
+        "/volvoxai.runtime.RuntimeService/DecodeSeed",
+        &DecodeSeedRequest {
             context_id: context_id.clone(),
-            input: Some(device_input),
+            inputs: vec![device_input],
         },
     )
     .expect_err("device input bytes were treated as host memory");
     assert_eq!(rejected_location.code, NativeStatus::InvalidArgument as i32);
     assert!(rejected_location.message.contains("MEMORY_LOCATION_HOST"));
 
-    let _: OperationReport = call(
-        "/volvoxai.runtime.RuntimeService/SetInput",
-        &SetInputRequest {
-            context_id: context_id.clone(),
-            input: Some(f32_tensor("x", [2.5, -4.0])),
-        },
-    );
     let seed: ExecutionResultHandle = call(
         "/volvoxai.runtime.RuntimeService/DecodeSeed",
         &DecodeSeedRequest {
             context_id: context_id.clone(),
+            inputs: vec![f32_tensor("x", [2.5, -4.0])],
         },
     );
     let seed_report = seed.report.as_ref().expect("decode seed report");
@@ -710,6 +880,7 @@ fn decode_seed_step_and_reset_use_immutable_results() {
         &DecodeStepRequest {
             context_id: context_id.clone(),
             position: None,
+            inputs: Vec::new(),
         },
     );
     assert_ne!(seed.execution_id, step.execution_id);
@@ -912,7 +1083,11 @@ fn trainer_lifecycle_keeps_steps_private_and_publishes_exact_revisions() {
     );
     assert_eq!(trainer.inputs.len(), 1);
     assert_eq!(trainer.inputs[0].name, "x");
-    assert_eq!(trainer.inputs[0].shape, vec![1, 2]);
+    assert_eq!(trainer.inputs[0].dimensions.len(), 2);
+    assert_eq!(trainer.inputs[0].dimensions[0].min, 1);
+    assert_eq!(trainer.inputs[0].dimensions[0].max, 1);
+    assert_eq!(trainer.inputs[0].dimensions[1].min, 2);
+    assert_eq!(trainer.inputs[0].dimensions[1].max, 2);
     let create_report = trainer.report.as_ref().expect("Trainer create report");
     assert_eq!(create_report.stage, OperationStage::TrainerCreate as i32);
     assert_eq!(create_report.backend, "cpu");
@@ -920,24 +1095,30 @@ fn trainer_lifecycle_keeps_steps_private_and_publishes_exact_revisions() {
 
     let mut wrong_shape = f32_training_tensor([1.0, -0.5]);
     wrong_shape.shape = vec![2];
-    let rejected_shape = invoke::<_, OperationReport>(
-        "/volvoxai.runtime.RuntimeService/SetTrainerInput",
-        &SetTrainerInputRequest {
-            trainer_id: trainer.trainer_id.clone(),
-            input: Some(wrong_shape),
-        },
+    let rejected_shape = invoke::<_, TrainStepResult>(
+        "/volvoxai.runtime.RuntimeService/TrainStep",
+        &trainer_step_request(
+            &trainer.trainer_id,
+            wrong_shape,
+            0,
+            TrainingOptimizerKind::Sgd,
+            1,
+        ),
     )
     .expect_err("same-byte Trainer input with the wrong shape was accepted");
     assert_eq!(rejected_shape.code, NativeStatus::InvalidArgument as i32);
 
     let mut device_input = f32_training_tensor([1.0, -0.5]);
     device_input.location = MemoryLocation::Device as i32;
-    let rejected_location = invoke::<_, OperationReport>(
-        "/volvoxai.runtime.RuntimeService/SetTrainerInput",
-        &SetTrainerInputRequest {
-            trainer_id: trainer.trainer_id.clone(),
-            input: Some(device_input),
-        },
+    let rejected_location = invoke::<_, TrainStepResult>(
+        "/volvoxai.runtime.RuntimeService/TrainStep",
+        &trainer_step_request(
+            &trainer.trainer_id,
+            device_input,
+            0,
+            TrainingOptimizerKind::Sgd,
+            1,
+        ),
     )
     .expect_err("device Trainer input bytes were treated as host memory");
     assert_eq!(rejected_location.code, NativeStatus::InvalidArgument as i32);
@@ -1039,12 +1220,15 @@ fn trainer_lifecycle_keeps_steps_private_and_publishes_exact_revisions() {
             trainer_id: trainer.trainer_id.clone(),
         },
     );
-    let closed = invoke::<_, OperationReport>(
-        "/volvoxai.runtime.RuntimeService/SetTrainerInput",
-        &SetTrainerInputRequest {
-            trainer_id: trainer.trainer_id.clone(),
-            input: Some(f32_training_tensor([1.0, -0.5])),
-        },
+    let closed = invoke::<_, TrainStepResult>(
+        "/volvoxai.runtime.RuntimeService/TrainStep",
+        &trainer_step_request(
+            &trainer.trainer_id,
+            f32_training_tensor([1.0, -0.5]),
+            0,
+            TrainingOptimizerKind::Sgd,
+            1,
+        ),
     )
     .expect_err("closed Trainer accepted input");
     assert_eq!(closed.code, -3);
@@ -1171,6 +1355,7 @@ fn ptq_plan_is_proto_owned_snapshot_scoped_and_revision_checked() {
         &CreatePtqPlanRequest {
             model_id: model.model_id.clone(),
             template_graph_path: path_string(&template_graph_path),
+            profile_names: vec!["batch-2".to_string()],
             observers: vec![
                 PtqObserverSpec {
                     tensor_name: "x".to_string(),
@@ -1199,7 +1384,11 @@ fn ptq_plan_is_proto_owned_snapshot_scoped_and_revision_checked() {
     );
     assert_eq!(plan.inputs.len(), 1);
     assert_eq!(plan.inputs[0].name, "x");
-    assert_eq!(plan.inputs[0].shape, vec![2, 3]);
+    assert_eq!(plan.inputs[0].dimensions.len(), 2);
+    assert_eq!(plan.inputs[0].dimensions[0].min, 2);
+    assert_eq!(plan.inputs[0].dimensions[0].max, 2);
+    assert_eq!(plan.inputs[0].dimensions[1].min, 3);
+    assert_eq!(plan.inputs[0].dimensions[1].max, 3);
     let create_report = plan.report.as_ref().expect("PTQ create report");
     assert_eq!(create_report.stage, OperationStage::PtqCreate as i32);
     assert_eq!(create_report.backend, "cpu");
@@ -1212,7 +1401,15 @@ fn ptq_plan_is_proto_owned_snapshot_scoped_and_revision_checked() {
             ptq_plan_id: plan.ptq_plan_id.clone(),
         },
     );
+    assert_eq!(before_calibration.calibration_batches, 0);
     assert_eq!(before_calibration.calibration_samples, 0);
+    let before_coverage = before_calibration
+        .coverage
+        .as_ref()
+        .expect("PTQ profile coverage");
+    assert!(!before_coverage.complete);
+    assert_eq!(before_coverage.profiles.len(), 1);
+    assert_eq!(before_coverage.profiles[0].name, "batch-2");
     assert_eq!(before_calibration.tensors.len(), 2);
     assert!(before_calibration
         .tensors
@@ -1230,7 +1427,9 @@ fn ptq_plan_is_proto_owned_snapshot_scoped_and_revision_checked() {
         "/volvoxai.runtime.RuntimeService/CalibratePtqPlan",
         &CalibratePtqPlanRequest {
             ptq_plan_id: plan.ptq_plan_id.clone(),
+            profile_name: "batch-2".to_string(),
             sample_name: "bad-shape".to_string(),
+            sample_count: 2,
             inputs: vec![wrong_shape],
         },
     )
@@ -1242,11 +1441,15 @@ fn ptq_plan_is_proto_owned_snapshot_scoped_and_revision_checked() {
         "/volvoxai.runtime.RuntimeService/CalibratePtqPlan",
         &CalibratePtqPlanRequest {
             ptq_plan_id: plan.ptq_plan_id.clone(),
+            profile_name: "batch-2".to_string(),
             sample_name: "sample-0".to_string(),
+            sample_count: 2,
             inputs: vec![f32_ptq_tensor(sample_values)],
         },
     );
-    assert_eq!(calibrated.calibration_samples, 1);
+    assert_eq!(calibrated.calibration_batches, 1);
+    assert_eq!(calibrated.calibration_samples, 2);
+    assert!(calibrated.coverage_complete);
     assert_eq!(
         calibrated
             .report
@@ -1259,7 +1462,9 @@ fn ptq_plan_is_proto_owned_snapshot_scoped_and_revision_checked() {
         "/volvoxai.runtime.RuntimeService/CalibratePtqPlan",
         &CalibratePtqPlanRequest {
             ptq_plan_id: plan.ptq_plan_id.clone(),
+            profile_name: "batch-2".to_string(),
             sample_name: "sample-0".to_string(),
+            sample_count: 2,
             inputs: vec![f32_ptq_tensor(sample_values)],
         },
     )
@@ -1272,7 +1477,17 @@ fn ptq_plan_is_proto_owned_snapshot_scoped_and_revision_checked() {
             ptq_plan_id: plan.ptq_plan_id.clone(),
         },
     );
-    assert_eq!(inspected.calibration_samples, 1);
+    assert_eq!(inspected.calibration_batches, 1);
+    assert_eq!(inspected.calibration_samples, 2);
+    let coverage = inspected.coverage.as_ref().expect("PTQ coverage");
+    assert_eq!(coverage.format, "volvox.ptq-coverage/v1");
+    assert!(coverage.complete);
+    assert_eq!(coverage.total_batches, 1);
+    assert_eq!(coverage.total_samples, 2);
+    assert_eq!(coverage.profiles.len(), 1);
+    assert_eq!(coverage.profiles[0].name, "batch-2");
+    assert_eq!(coverage.profiles[0].batches, 1);
+    assert_eq!(coverage.profiles[0].samples, 2);
     let input_parameters = inspected
         .tensors
         .iter()
@@ -1342,7 +1557,9 @@ fn ptq_plan_is_proto_owned_snapshot_scoped_and_revision_checked() {
         "/volvoxai.runtime.RuntimeService/CalibratePtqPlan",
         &CalibratePtqPlanRequest {
             ptq_plan_id: plan.ptq_plan_id.clone(),
+            profile_name: "batch-2".to_string(),
             sample_name: "closed".to_string(),
+            sample_count: 2,
             inputs: vec![f32_ptq_tensor(sample_values)],
         },
     )

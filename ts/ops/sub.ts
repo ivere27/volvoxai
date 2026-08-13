@@ -1,5 +1,9 @@
 import { cpuBroadcastBinary } from './broadcast.js';
+import { assertShapeKernelParams } from './shapeKernelValidation.js';
 
 export function _cpuSub(node) {
-  return cpuBroadcastBinary(node, (left, right) => left - right, 'Sub');
+  assertShapeKernelParams(node, [], 'Sub');
+  return cpuBroadcastBinary(node, (left, right) => left - right, 'Sub', {
+    dtypes: ['float32'], maximumRank: 8,
+  });
 }

@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
-import { Graph } from '../ts/core/Graph.js';
+import { RuntimeGraph } from '../ts/core/RuntimeGraph.js';
 import { _cpuQArgMax } from '../ts/ops/qArgMax.js';
 
 function byteValues(dtype, values) {
@@ -21,7 +21,7 @@ function qArgMaxGraph({
   outputShape = null,
   outputFill = 71,
 } = {}) {
-  const graph = new Graph();
+  const graph = new RuntimeGraph();
   const input = graph.addInput('input', shape, dtype, {
     buffer: byteValues(dtype, values), quantization,
   });

@@ -8,6 +8,7 @@ extern "C" {
 #include <stddef.h>
 #include <stdint.h>
 #include "../../include/volvoxai_enums.h"
+#include "../runtime/engine_core.h"
 
 #ifndef VOLVOXAI_ENABLE_TRAINING
 #define VOLVOXAI_ENABLE_TRAINING 0
@@ -36,6 +37,10 @@ enum {
 
 int opengl_init(void);
 void opengl_cleanup(void);
+/* Release the shared EGL/GL context once no engine state holds it.
+ * opengl_cleanup() only drops the calling state's context; the device
+ * deliberately outlives that so compile and execute do not each rebuild it. */
+void opengl_device_release(void);
 void opengl_set_shader_root(const char* root);
 void opengl_free_weight_cache(void);
 int opengl_matmul(const float* in, const float* w, const float* b, float* out,
@@ -44,6 +49,36 @@ int opengl_matmul(const float* in, const float* w, const float* b, float* out,
 /* Desktop compute requires OpenGL 4.3; embedded compute requires OpenGL ES 3.1. */
 int opengl_compute_version_supported(OpenGLComputeApi api, int major, int minor);
 int opengl_get_compute_capability(OpenGLComputeCapability* out);
+
+/* Cached immutable limits for the calling engine state's attached compute
+ * context. OpenGL exposes per-buffer limits but no portable total-VRAM cap. */
+typedef struct OpenGLDomainLimits {
+    uint64_t maximum_storage_buffer_bytes;
+    uint64_t maximum_uniform_buffer_bytes;
+    uint32_t maximum_workgroups[3];
+    uint32_t maximum_workgroup_size[3];
+    uint32_t maximum_workgroup_invocations;
+    uint32_t maximum_storage_bindings;
+    uint32_t maximum_uniform_bindings;
+    uint32_t maximum_tensor_slots;
+} OpenGLDomainLimits;
+
+int opengl_query_domain_limits(OpenGLDomainLimits* limits);
+
+#ifdef VOLVOX_OPENGL_TESTING
+typedef struct {
+    uint64_t shape_generation;
+    uint64_t capacity_generation;
+    size_t active_capacity_bytes;
+    size_t pooled_capacity_bytes;
+    size_t domain_span_count;
+    size_t domain_scratch_capacity_bytes;
+    int slot_count;
+    int domain_enforced;
+} OpenGLGraphDynamicStateProbe;
+int opengl_graph_debug_dynamic_state(OpenGLGraphDynamicStateProbe* probe);
+int opengl_test_fail_domain_allocation_after(size_t successful_allocations);
+#endif
 
 #if VOLVOXAI_ENABLE_TRAINING
 /*
@@ -73,10 +108,21 @@ int opengl_training_debug_compile_all(void);
 #endif
 
 void opengl_graph_reset(void);
+/* Commit an exact semantic shape key while retaining growable buffer pools. */
+int opengl_graph_bind_shape(const char* signature);
+int opengl_graph_bind_shape_domain(
+    const char* signature,
+    const VolvoxAIEnginePhysicalSpan* spans,
+    size_t span_count,
+    size_t qgroupnorm_stats_bytes,
+    size_t qlayernorm_stats_bytes);
 void opengl_graph_begin_forward(void);
 int opengl_graph_end_forward(void);
 void opengl_graph_mark_host(const void* host, size_t bytes, int is_weight);
 int opengl_graph_sync_host(const void* host, size_t bytes, int is_weight);
+/* Classification-only promotion used after the invariant bootstrap pass. */
+void opengl_graph_retain_weight(const void* host, size_t bytes);
+void opengl_graph_demote_weight(const void* host, size_t bytes);
 int opengl_graph_alias_f32(const float* in, float* out, long n);
 int opengl_graph_copy_f32(const float* in, float* out, long n);
 int opengl_graph_add_f32(const float* a, const float* b, float* out, long n);
@@ -126,6 +172,13 @@ int opengl_graph_groupnorm_f32(const float* in, const float* weight, const float
 int opengl_graph_dropout_f32(const float* in, float* out, long n, uint32_t threshold,
                              uint32_t seed, uint32_t counter, float scale);
 #endif
+/* Routed expert linear with an optional resident-slot table (NULL/0 = fully
+ * resident bank; route indices are then already staged rows). */
+int opengl_graph_moe_router_f32(const float*, const float*, const float*,
+                                float*, float*, int, int, int, int, float, int);
+int opengl_graph_moe_linear_f32(const float*, const float*, const float*,
+                                const float*, const float*, float*, int, int,
+                                int, int, int, const uint32_t*, uint32_t);
 int opengl_graph_embedding_f32(const int32_t* tokens, const float* weight, float* out,
                                int tokens_len, int d_model, int vocab_size);
 int opengl_graph_transpose_f32(const float* in, float* out, const int* in_shape,
@@ -150,6 +203,10 @@ int opengl_graph_concat_f32(const float** inputs, const long* sizes, const int* 
 int opengl_graph_concat_32(const void* const* inputs, const long* sizes,
                            const int* input_axes, int count, void* output,
                            int output_axis, int inner);
+int opengl_graph_linear_f32(const float* input, const float* weight,
+                            const float* bias, float* output, int rows,
+                            int d_in, int d_out,
+                            int output_major_weight);
 int opengl_graph_concat_flat_f32(const float** inputs, const long* sizes, int count, float* out);
 int opengl_graph_concat_sigmoid_flat_f32(const float** inputs, const long* sizes, int count, float* out);
 int opengl_graph_maxpool2d_f32(const float* in, float* out, int n, int h, int width, int c,
@@ -157,6 +214,12 @@ int opengl_graph_maxpool2d_f32(const float* in, float* out, int n, int h, int wi
                                int py, int px);
 int opengl_graph_expand_f32(const float* in, float* out, const int* in_shape, int in_rank,
                             const int* out_shape, int out_rank);
+int opengl_graph_expand_32(const void* in, void* out, const int* in_shape,
+                           int in_rank, const int* out_shape, int out_rank);
+int opengl_graph_batch_matmul_f32(
+    const float* a, const int* a_shape, int a_rank,
+    const float* b, const int* b_shape, int b_rank,
+    float* output, const int* output_shape, int output_rank);
 int opengl_graph_gather_i32_f32(const float* input, const int32_t* indices,
                                 float* output, int outer, int axis_size,
                                 int inner, int indices_elements,

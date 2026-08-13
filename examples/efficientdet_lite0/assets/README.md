@@ -3,8 +3,9 @@
 `dog.jpg` and `cat.jpg` are synthetic, photorealistic
 fixtures for manually testing the EfficientDet Lite0 models. Each image is an
 exactly 320x320 RGB JPEG, matching the model input without an additional resize.
-The generated packages declare `raw-255` normalization for int8 and `zero-one`
-for fp16/fp32, and the task CLI applies that metadata automatically.
+Pass `--image-normalize raw-255` for the int8 model or
+`--image-normalize zero-one` for fp16/fp32. Preprocessing is application policy
+and is deliberately absent from the closed graph document.
 
 The detector uses generic COCO classes rather than animal breeds:
 
@@ -30,6 +31,7 @@ Run the native detector from the repository root:
 ```bash
 examples/target/bin/volvoxai-tasks detect models/efficientdet_lite0_int8 \
   --image input0=examples/efficientdet_lite0/assets/dog.jpg \
+  --image-normalize raw-255 \
   --max-det 5
 ```
 
@@ -43,5 +45,6 @@ For either floating-point package, only change the model directory, for example:
 ```bash
 examples/target/bin/volvoxai-tasks detect models/efficientdet_lite0_fp16 \
   --image input0=examples/efficientdet_lite0/assets/cat.jpg \
+  --image-normalize zero-one \
   --max-det 5
 ```

@@ -7,8 +7,9 @@ import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
 
-import { Graph, ModelBuilder } from '../ts/wasm.js';
+import { RuntimeGraph } from '../ts/core/RuntimeGraph.js';
 import { WasmEngine } from '../ts/backends/WasmEngine.js';
+import { TrainingModelBuilder as RuntimeGraphBuilder } from '../ts/training/TrainingModelBuilder.js';
 import { WasmQuantizedLoRATrainer } from '../ts/training/WasmQuantizedLoRATrainer.js';
 
 const run = promisify(execFile);
@@ -31,7 +32,7 @@ async function buildFullWasm(output, { weightSync = true } = {}) {
 }
 
 function trainingGraph() {
-  const builder = new ModelBuilder();
+  const builder = new RuntimeGraphBuilder();
   const input = builder.input('x', [1, 2]);
   const base = builder.weight('base', [2, 2], 'float32', Float32Array.of(
     1, 0,
@@ -59,7 +60,7 @@ function qweightDescriptor(scales) {
 }
 
 function inferenceGraph({ nonzeroBias = false, targetVariant = null } = {}) {
-  const graph = new Graph();
+  const graph = new RuntimeGraph();
   const input = graph.addInput('qx', [1, 2], 'int8', {
     quantization: qdescriptor(0.25),
   });

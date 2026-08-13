@@ -32,6 +32,91 @@
  * import once per key.
  */
 
+/*
+ * The four head_dim loops of the online softmax, vectorized where WASM has
+ * vectors.
+ *
+ * WASM runs this kernel and not the tiled one — attention_f32_tiled.h is
+ * guarded by VX_SDPA_X86_AVX2 — so on that target these loops were scalar and
+ * `CrossSDPA` cost 237 ms of a 1607 ms encoder.
+ *
+ * Three of the four are elementwise in `d` and vectorize with no change to any
+ * addition order at all. The dot product is a reduction and does change it,
+ * which is admissible here and only here: cross_sdpa.c already documents the
+ * AVX2 and portable paths agreeing to a tolerance rather than exactly, and
+ * row-versus-full consistency is preserved because a row and a full forward
+ * run this same code.
+ */
+#if defined(__wasm_simd128__)
+
+static float vx_attention_dot_f32(const float* a, const float* b, int n) {
+    v128_t acc = wasm_f32x4_splat(0.0f);
+    float lane[4];
+    float sum;
+    int d = 0;
+    for (; d + 4 <= n; d += 4) {
+        acc = wasm_f32x4_add(acc, wasm_f32x4_mul(wasm_v128_load(a + d),
+                                                 wasm_v128_load(b + d)));
+    }
+    wasm_v128_store(lane, acc);
+    sum = lane[0] + lane[1] + lane[2] + lane[3];
+    for (; d < n; d++) sum += a[d] * b[d];
+    return sum;
+}
+
+static void vx_attention_axpy_f32(float* acc, const float* v, float w, int n) {
+    const v128_t wv = wasm_f32x4_splat(w);
+    int d = 0;
+    for (; d + 4 <= n; d += 4) {
+        wasm_v128_store(acc + d, wasm_f32x4_add(wasm_v128_load(acc + d),
+            wasm_f32x4_mul(wv, wasm_v128_load(v + d))));
+    }
+    for (; d < n; d++) acc[d] += w * v[d];
+}
+
+static void vx_attention_rescale_f32(float* acc, const float* v, float c, int n) {
+    const v128_t cv = wasm_f32x4_splat(c);
+    int d = 0;
+    for (; d + 4 <= n; d += 4) {
+        wasm_v128_store(acc + d, wasm_f32x4_add(
+            wasm_f32x4_mul(wasm_v128_load(acc + d), cv), wasm_v128_load(v + d)));
+    }
+    for (; d < n; d++) acc[d] = acc[d] * c + v[d];
+}
+
+static void vx_attention_scale_f32(float* acc, float s, int n) {
+    const v128_t sv = wasm_f32x4_splat(s);
+    int d = 0;
+    for (; d + 4 <= n; d += 4) {
+        wasm_v128_store(acc + d, wasm_f32x4_mul(wasm_v128_load(acc + d), sv));
+    }
+    for (; d < n; d++) acc[d] *= s;
+}
+
+#else
+
+/* Every other target keeps the scalar loops verbatim: AVX2 reaches the tiled
+ * kernel and never arrives here, and a portable build must stay portable. */
+static float vx_attention_dot_f32(const float* a, const float* b, int n) {
+    float sum = 0.0f;
+    for (int d = 0; d < n; d++) sum += a[d] * b[d];
+    return sum;
+}
+
+static void vx_attention_axpy_f32(float* acc, const float* v, float w, int n) {
+    for (int d = 0; d < n; d++) acc[d] += w * v[d];
+}
+
+static void vx_attention_rescale_f32(float* acc, const float* v, float c, int n) {
+    for (int d = 0; d < n; d++) acc[d] = acc[d] * c + v[d];
+}
+
+static void vx_attention_scale_f32(float* acc, float s, int n) {
+    for (int d = 0; d < n; d++) acc[d] *= s;
+}
+
+#endif
+
 static void vx_attention_f32_portable(
         const float* q_in, const float* k_in, const float* v_in,
         long qkv_stride, float* output, long out_stride,
@@ -57,7 +142,7 @@ static void vx_attention_f32_portable(
                                               seq_kv, causal)) continue;
                 key = k_in + (long)k_idx * qkv_stride + head_offset;
                 value = v_in + (long)k_idx * qkv_stride + head_offset;
-                for (d = 0; d < head_dim; d++) score += query[d] * key[d];
+                score = vx_attention_dot_f32(query, key, head_dim);
                 score *= scale;
                 if (!have_key) {
                     /* Seeding from the first surviving key keeps an infinite
@@ -70,22 +155,21 @@ static void vx_attention_f32_portable(
                 } else if (score <= maximum) {
                     const float weight = accurate_expf(score - maximum);
                     denominator += weight;
-                    for (d = 0; d < head_dim; d++)
-                        accumulator[d] += weight * value[d];
+                    vx_attention_axpy_f32(accumulator, value, weight, head_dim);
                 } else {
                     /* A new maximum rescales everything summed so far. */
                     const float correction = accurate_expf(maximum - score);
                     denominator = denominator * correction + 1.0f;
-                    for (d = 0; d < head_dim; d++)
-                        accumulator[d] = accumulator[d] * correction + value[d];
+                    vx_attention_rescale_f32(accumulator, value, correction,
+                                             head_dim);
                     maximum = score;
                 }
             }
             if (!have_key) {
                 for (d = 0; d < head_dim; d++) accumulator[d] = 0.0f;
             } else {
-                const float inverse = 1.0f / denominator;
-                for (d = 0; d < head_dim; d++) accumulator[d] *= inverse;
+                vx_attention_scale_f32(accumulator, 1.0f / denominator,
+                                       head_dim);
             }
         }
     }

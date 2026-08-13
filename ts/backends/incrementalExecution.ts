@@ -1,4 +1,4 @@
-import type { Graph } from '../core/Graph.js';
+import type { RuntimeGraph } from '../core/RuntimeGraph.js';
 import type { BackendExecutionOptions } from './BackendEngine.js';
 
 interface IncrementalExecutionOptions extends BackendExecutionOptions {}
@@ -7,7 +7,7 @@ interface IncrementalExecutionOptions extends BackendExecutionOptions {}
  * caching. Executor tensor storage already survives execute() calls; selected
  * nodes are the consumers of changed graph inputs and all of their descendants. */
 export function incrementalNodeSelection(
-  graph: Graph,
+  graph: RuntimeGraph,
   inputs: Record<string, unknown>,
   options: IncrementalExecutionOptions,
   cacheValid: boolean,

@@ -1,6 +1,7 @@
 #include "engine_core.h"
 #include "engine_internal.h"
 #include "backend.h"
+#include "backend_manager.h"
 #include "w8a8_device_ops.h"
 #include "attention_mask.h"
 #include "sequence_runtime.h"
@@ -43,7 +44,7 @@
 #endif
 
 #if VOLVOXAI_ENABLE_NNAPI
-extern void nnapi_matmul(const float*, const float*, const float*, float*, int, int, int);
+#include "nnapi_engine.h"
 #endif
 
 #if VOLVOXAI_ENABLE_VULKAN
@@ -76,6 +77,8 @@ static int physical_shape_model_validate(Node* node, T* output);
 
 /* These private fragments stay in one translation unit to preserve static
  * runtime state and the inference/full compilation boundary. */
+#include "incremental_runtime.h"
+
 #include "engine_runtime_model.inc"
 #include "engine_runtime_f32_cpu.inc"
 #include "engine_runtime_f32_gpu.inc"

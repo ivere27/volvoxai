@@ -7,6 +7,7 @@ exporter/runtime conformance tests.
 
 from __future__ import annotations
 
+import copy
 import math
 import struct
 from dataclasses import dataclass
@@ -21,6 +22,20 @@ from .generated.kernel_registry import (
 )
 from .ir import find_retired_affine_param_path
 from .quantization_storage import GRAPH_FORMAT, validate_external_quantization
+from .portable_domain import (
+    PortableDomainProofError,
+    prove_portable_graph_domain,
+)
+from .shape_system import (
+    ShapeContractError,
+    ShapeEnvironment,
+    create_tensor_shape_spec,
+)
+
+_GRAPH_ROOT_FIELDS = frozenset({
+    "format", "dimensions", "inputs", "outputs", "nodes", "banks",
+    "quantization",
+})
 
 _CANONICAL_BYTE_COMPUTE_OPS = frozenset({
     "QConv2D", "QAdd", "QLinear", "QMatMul", "QGemm",
@@ -70,9 +85,13 @@ def classify_package(
         if isinstance(descriptor, Mapping)
     }
     for node in nodes:
-        output_dtypes = node.get("outputs_dtype") if isinstance(node, Mapping) else None
-        if isinstance(output_dtypes, Mapping):
-            execution_dtypes.update(output_dtypes.values())
+        outputs = node.get("outputs") if isinstance(node, Mapping) else None
+        if isinstance(outputs, Mapping):
+            execution_dtypes.update(
+                descriptor.get("dtype")
+                for descriptor in outputs.values()
+                if isinstance(descriptor, Mapping)
+            )
 
     weight_dtypes = {
         str(name): str(getattr(value, "dtype", ""))
@@ -103,23 +122,13 @@ def refresh_package_class(
     graph: dict[str, Any],
     weights: Optional[Mapping[str, Any]] = None,
 ) -> str:
-    """Replace stale precision claims with descriptor-derived metadata.
+    """Return descriptor-derived package metadata without mutating the graph.
 
-    This is deliberately package-format agnostic: callers own their package
-    manifest and publication policy, while the exporter owns the canonical
-    graph classification rules.
+    Closed v1 graph documents contain execution semantics only. Package class
+    is publication metadata owned by the surrounding manifest/report.
     """
 
-    source = graph.get("source")
-    if not isinstance(source, dict):
-        raise ValueError("graph source must be an object")
-    package_class = classify_package(graph, weights)
-    source["package_class"] = package_class
-    if package_class == "w8a8-v1":
-        source["quantized_graph_contract"] = "w8a8-v1"
-    else:
-        source.pop("quantized_graph_contract", None)
-    return package_class
+    return classify_package(graph, weights)
 
 
 def normalize_targets(requested: Optional[Iterable[str]]) -> tuple[str, ...]:
@@ -145,6 +154,83 @@ def expand_targets(requested: Optional[Iterable[str]]) -> tuple[str, ...]:
 
 def _shape(value: Any) -> Optional[list[int]]:
     return list(value) if isinstance(value, list) and all(isinstance(v, int) for v in value) else None
+
+
+def _bounded_capability_projection(
+    graph: Mapping[str, Any],
+) -> tuple[dict[str, Any], bool]:
+    """Build a concrete-max descriptor view for existing physical checks.
+
+    This projection is private validator state, never a package migration.  It
+    lets monotone allocation and backend-limit checks inspect conservative
+    tensor maxima.  Canonical operator formulas are proved separately over the
+    entire symbolic domain before this view is used; the maximum corner is
+    never itself treated as domain evidence.
+    """
+
+    dimensions = graph.get("dimensions")
+    if not isinstance(dimensions, Mapping):
+        raise ValueError("dimensions must be an object")
+    constraints = []
+    for name, descriptor in dimensions.items():
+        if not isinstance(name, str) or not isinstance(descriptor, Mapping):
+            raise ValueError("dimension descriptor is malformed")
+        if "name" in descriptor:
+            raise ValueError("dimension descriptors use their object key as name")
+        constraints.append({"name": name, **dict(descriptor)})
+    try:
+        environment = ShapeEnvironment(tuple(constraints))
+    except ShapeContractError as error:
+        raise ValueError(str(error)) from error
+
+    dynamic = bool(environment.dimensions)
+
+    def concrete(shape: Any, path: str) -> list[int]:
+        try:
+            spec = create_tensor_shape_spec(shape, environment, path)
+        except ShapeContractError as error:
+            raise ValueError(str(error)) from error
+        return [
+            environment.get(axis).max if isinstance(axis, str) else axis
+            for axis in spec
+        ]
+
+    projected = copy.deepcopy(dict(graph))
+    projected_inputs = projected.get("inputs")
+    if isinstance(projected_inputs, dict):
+        for name, descriptor in projected_inputs.items():
+            if isinstance(descriptor, dict):
+                descriptor["shape"] = concrete(
+                    descriptor.get("shape"), f"input {name!r} shape"
+                )
+    projected_nodes = projected.get("nodes")
+    if isinstance(projected_nodes, list):
+        for index, node in enumerate(projected_nodes):
+            if not isinstance(node, dict):
+                continue
+            outputs = node.get("outputs")
+            if not isinstance(outputs, Mapping):
+                continue
+            tensor_names: dict[str, str] = {}
+            shapes: dict[str, list[int]] = {}
+            dtypes: dict[str, str] = {}
+            for port, descriptor in outputs.items():
+                if not isinstance(port, str) or not isinstance(descriptor, Mapping):
+                    continue
+                tensor = descriptor.get("tensor")
+                dtype = descriptor.get("dtype")
+                if isinstance(tensor, str):
+                    tensor_names[port] = tensor
+                if isinstance(dtype, str):
+                    dtypes[port] = dtype
+                shapes[port] = concrete(
+                    descriptor.get("shape"),
+                    f"node {index} output {port!r} shape",
+                )
+            node["outputs"] = tensor_names
+            node["outputs_shape"] = shapes
+            node["outputs_dtype"] = dtypes
+    return projected, dynamic
 
 
 def _node_output_shape(node: Mapping[str, Any]) -> Optional[list[int]]:
@@ -477,10 +563,10 @@ def _node_contract_diagnostics(
         return result
 
     if op == "Where":
-        if ports({"condition", "x", "y"}):
+        if ports({"condition", "a", "b"}):
             _, condition_shape, condition_dtype = tensor("condition")
-            _, x_shape, x_dtype = tensor("x")
-            _, y_shape, y_dtype = tensor("y")
+            _, x_shape, x_dtype = tensor("a")
+            _, y_shape, y_dtype = tensor("b")
             if condition_dtype != "int32":
                 reject("VXDESC_DTYPE", "requires an I32 condition")
             if x_dtype != y_dtype or x_dtype != output_dtype or output_dtype not in {"float32", "int32"}:
@@ -510,11 +596,47 @@ def _node_contract_diagnostics(
                 reject("VXDESC_BATCH_MATMUL", "has incompatible batch-broadcast matrix geometry")
         return result
 
-    if op in {"ReLU", "Sigmoid", "Tanh", "GELU", "SiLU", "Dropout"}:
+    if op in {
+        "ReLU", "Sigmoid", "Tanh", "GELU", "SiLU", "Dropout",
+        "Sin", "Cos", "LeakyReLU", "HardSigmoid", "HardSwish",
+    }:
         if ports({"input"}):
             require_f32(["input"], same_shape=True)
         if op == "GELU" and params.get("approximate", "none") not in {"none", "tanh"}:
             reject("VXDESC_GELU", "has an unsupported approximation")
+        if op == "LeakyReLU":
+            alpha = params.get("alpha", 0.01)
+            if (
+                isinstance(alpha, bool)
+                or not isinstance(alpha, (int, float))
+                or not math.isfinite(float(alpha))
+            ):
+                reject("VXDESC_LEAKY_RELU", "alpha must be a finite scalar")
+        return result
+
+    if op == "PReLU":
+        if ports({"input", "slope"}):
+            _, input_shape, input_dtype = tensor("input")
+            _, slope_shape, slope_dtype = tensor("slope")
+            valid_slope = (
+                input_shape is not None
+                and len(input_shape) >= 1
+                and slope_shape is not None
+                and len(slope_shape) == 1
+                and slope_shape[0] in {1, input_shape[-1]}
+            )
+            if (
+                input_dtype != "float32"
+                or slope_dtype not in {"float16", "float32"}
+                or output_dtype != "float32"
+                or input_shape != output_shape
+                or not valid_slope
+                or params
+            ):
+                reject(
+                    "VXDESC_PRELU",
+                    "requires an F32 activation and scalar/per-feature float slope",
+                )
         return result
 
     if op == "Clip":
@@ -549,7 +671,7 @@ def _node_contract_diagnostics(
     if op in {"Softmax", "LogSoftmax"}:
         if ports({"input"}):
             require_f32(["input"], same_shape=True)
-        if params.get("axis") != -1:
+        if params.get("axis", -1) != -1:
             reject("VXDESC_AXIS", "must use the canonical last axis")
         return result
 
@@ -572,11 +694,11 @@ def _node_contract_diagnostics(
             layout = params.get("weight_layout")
             if input_dtype != "float32" or output_dtype != "float32" or not input_shape or not weight_shape or len(weight_shape) != 2:
                 reject("VXDESC_LINEAR", "requires F32 ranked activation/output and rank-2 weight")
-            elif layout not in {"IN_OUT", "OUT_IN"}:
-                reject("VXDESC_LINEAR", "requires an explicit IN_OUT or OUT_IN layout")
+            elif layout not in {"din_dout", "dout_din"}:
+                reject("VXDESC_LINEAR", "requires an explicit din_dout or dout_din layout")
             else:
-                d_in = weight_shape[0] if layout == "IN_OUT" else weight_shape[1]
-                d_out = weight_shape[1] if layout == "IN_OUT" else weight_shape[0]
+                d_in = weight_shape[0] if layout == "din_dout" else weight_shape[1]
+                d_out = weight_shape[1] if layout == "din_dout" else weight_shape[0]
                 if input_shape[-1] != d_in or output_shape != [*input_shape[:-1], d_out]:
                     reject("VXDESC_LINEAR", "has incompatible activation/weight/output geometry")
                 bias_name, bias_shape, bias_dtype = tensor("bias") if "bias" in inputs else (None, None, None)
@@ -584,8 +706,8 @@ def _node_contract_diagnostics(
                     reject("VXDESC_LINEAR", "bias must be F32 [d_out]")
                 if weight_dtype in {"int8", "uint8"}:
                     scale_name, scale_shape, scale_dtype = tensor("weight_scale")
-                    if layout != "OUT_IN" or scale_dtype != "float32" or scale_shape not in ([1], [d_out]):
-                        reject("VXDESC_W8A32", "requires OUT_IN byte weight and F32 scalar/per-output scale")
+                    if layout != "dout_din" or scale_dtype != "float32" or scale_shape not in ([1], [d_out]):
+                        reject("VXDESC_W8A32", "requires dout_din byte weight and F32 scalar/per-output scale")
                     if "weight_zero_point" in inputs:
                         _, zero_shape, zero_dtype = tensor("weight_zero_point")
                         if zero_dtype not in {weight_dtype, "int32"} or zero_shape not in ([1], [d_out]):
@@ -722,6 +844,57 @@ def _node_contract_diagnostics(
                     reject("VXDESC_SLICE", "output shape exceeds its normalized positive-step slice")
         return result
 
+    if op == "Pad":
+        if ports({"input"}):
+            input_name, input_shape, input_dtype = tensor("input")
+            pads = params.get("pads")
+            value = params.get("value", 0)
+            valid_pads = (
+                input_shape is not None
+                and isinstance(pads, list)
+                and len(pads) == 2 * len(input_shape)
+                and all(
+                    isinstance(item, int)
+                    and not isinstance(item, bool)
+                    and item >= 0
+                    for item in pads
+                )
+            )
+            expected = None
+            if valid_pads:
+                rank = len(input_shape)
+                expected = [
+                    input_shape[axis] + pads[axis] + pads[rank + axis]
+                    for axis in range(rank)
+                ]
+            valid_storage = (
+                input_dtype == output_dtype
+                and output_dtype in {"float32", "int32", "int8", "uint8"}
+            )
+            if output_dtype in {"int8", "uint8"}:
+                valid_storage = (
+                    valid_storage
+                    and isinstance(quantization.get(input_name or ""), Mapping)
+                    and quantization.get(input_name or "") == quantization.get(output_name)
+                )
+            valid_value = (
+                not isinstance(value, bool)
+                and isinstance(value, (int, float))
+                and math.isfinite(float(value))
+                and (output_dtype != "int32" or isinstance(value, int))
+            )
+            if (
+                not valid_storage
+                or not valid_value
+                or expected != output_shape
+                or set(params) - {"pads", "value"}
+            ):
+                reject(
+                    "VXDESC_PAD",
+                    "requires exact non-negative pads and a same-dtype output descriptor",
+                )
+        return result
+
     if op == "GatherElements":
         if ports({"input", "indices"}):
             _, data_shape, data_dtype = tensor("input")
@@ -768,6 +941,64 @@ def _node_contract_diagnostics(
                     reject("VXDESC_ARGMAX", "has incompatible output shape or tie policy")
         return result
 
+    if op == "Conv1D":
+        if ports({"input", "weight"}, {"bias"}):
+            _, input_shape, input_dtype = tensor("input")
+            _, weight_shape, weight_dtype = tensor("weight")
+            stride = params.get("stride", 1)
+            padding = params.get("padding", 0)
+            groups = params.get("groups", 1)
+            valid = (
+                input_dtype == "float32"
+                and output_dtype == "float32"
+                and weight_dtype in {"float16", "float32"}
+                and input_shape is not None
+                and len(input_shape) == 3
+                and weight_shape is not None
+                and len(weight_shape) == 3
+                and output_shape is not None
+                and len(output_shape) == 3
+                and isinstance(stride, int)
+                and not isinstance(stride, bool)
+                and stride > 0
+                and isinstance(padding, int)
+                and not isinstance(padding, bool)
+                and padding >= 0
+                and isinstance(groups, int)
+                and not isinstance(groups, bool)
+                and groups > 0
+                and params.get("data_layout", "NLC") == "NLC"
+                and params.get("weight_layout", "WIO") == "WIO"
+                and params.get("relu", 0) in {0, 1, 2}
+                and set(params) <= {
+                    "stride", "padding", "groups", "relu",
+                    "data_layout", "weight_layout",
+                }
+            )
+            if valid:
+                kernel, weight_channels, output_channels = weight_shape
+                numerator = input_shape[1] + 2 * padding - kernel
+                valid = (
+                    numerator >= 0
+                    and input_shape[2] % groups == 0
+                    and output_channels % groups == 0
+                    and weight_channels == input_shape[2] // groups
+                    and output_shape == [
+                        input_shape[0], numerator // stride + 1, output_channels,
+                    ]
+                )
+            if not valid:
+                reject(
+                    "VXDESC_CONV1D",
+                    "requires canonical F32 NLC/WIO grouped-convolution geometry",
+                )
+            if "bias" in inputs:
+                _, bias_shape, bias_dtype = tensor("bias")
+                channels = weight_shape[2] if weight_shape and len(weight_shape) == 3 else None
+                if bias_dtype not in {"float16", "float32"} or bias_shape != [channels]:
+                    reject("VXDESC_CONV1D", "bias must be F16/F32 [C_out]")
+        return result
+
     if op == "Conv2D":
         if ports({"input", "weight"}, {"bias"}):
             _, input_shape, input_dtype = tensor("input")
@@ -807,6 +1038,152 @@ def _node_contract_diagnostics(
                 _, bias_shape, bias_dtype = tensor("bias")
                 if bias_dtype not in {"float16", "float32"} or bias_shape != [output_channels]:
                     reject("VXDESC_CONV", "bias must be F16/F32 [C_out]")
+        return result
+
+    if op == "ConvTranspose2D":
+        if ports({"input", "weight"}, {"bias"}):
+            _, input_shape, input_dtype = tensor("input")
+            _, weight_shape, weight_dtype = tensor("weight")
+            kernel = params.get("kernel")
+            stride = params.get("stride", [1, 1])
+            padding = params.get("padding", [0, 0])
+            valid_pair = lambda value, allow_zero: (
+                isinstance(value, list)
+                and len(value) == 2
+                and all(
+                    isinstance(item, int)
+                    and not isinstance(item, bool)
+                    and (item >= 0 if allow_zero else item > 0)
+                    for item in value
+                )
+            )
+            valid = (
+                input_dtype == "float32"
+                and output_dtype == "float32"
+                and weight_dtype in {"float16", "float32"}
+                and input_shape is not None
+                and len(input_shape) == 4
+                and weight_shape is not None
+                and len(weight_shape) == 4
+                and output_shape is not None
+                and len(output_shape) == 4
+                and valid_pair(kernel, False)
+                and valid_pair(stride, False)
+                and valid_pair(padding, True)
+                and params.get("data_layout", "NHWC") == "NHWC"
+                and params.get("weight_layout", "HWIO") == "HWIO"
+                and set(params) <= {
+                    "kernel", "stride", "padding", "data_layout", "weight_layout",
+                }
+            )
+            if valid:
+                valid = (
+                    kernel == weight_shape[:2]
+                    and weight_shape[2] == input_shape[3]
+                    and output_shape == [
+                        input_shape[0],
+                        (input_shape[1] - 1) * stride[0] - 2 * padding[0] + kernel[0],
+                        (input_shape[2] - 1) * stride[1] - 2 * padding[1] + kernel[1],
+                        weight_shape[3],
+                    ]
+                )
+            if not valid:
+                reject(
+                    "VXDESC_CONV_TRANSPOSE",
+                    "requires canonical F32 NHWC/HWIO transposed-convolution geometry",
+                )
+            if "bias" in inputs:
+                _, bias_shape, bias_dtype = tensor("bias")
+                channels = weight_shape[3] if weight_shape and len(weight_shape) == 4 else None
+                if bias_dtype not in {"float16", "float32"} or bias_shape != [channels]:
+                    reject(
+                        "VXDESC_CONV_TRANSPOSE",
+                        "bias must be F16/F32 [C_out]",
+                    )
+        return result
+
+    if op == "BatchNorm2D":
+        if ports({"input", "weight", "bias", "running_mean", "running_var"}):
+            _, input_shape, input_dtype = tensor("input")
+            channels = input_shape[-1] if input_shape and len(input_shape) == 4 else None
+            if (
+                input_dtype != "float32"
+                or output_dtype != "float32"
+                or input_shape != output_shape
+                or channels is None
+            ):
+                reject(
+                    "VXDESC_BATCH_NORM",
+                    "requires equal-shape rank-4 NHWC F32 activations",
+                )
+            for port in ("weight", "bias", "running_mean", "running_var"):
+                _, affine_shape, affine_dtype = tensor(port)
+                if affine_dtype not in {"float16", "float32"} or affine_shape != [channels]:
+                    reject(
+                        "VXDESC_BATCH_NORM",
+                        f"{port} must be a matching float [C] tensor",
+                    )
+            epsilon = params.get("eps", 1e-5)
+            if (
+                isinstance(epsilon, bool)
+                or not isinstance(epsilon, (int, float))
+                or not math.isfinite(float(epsilon))
+                or float(epsilon) <= 0
+            ):
+                reject("VXDESC_BATCH_NORM", "epsilon must be finite and positive")
+        return result
+
+    if op in {"SpatialSoftargmaxY", "MeanHeight", "ProfileX", "ProfileY"}:
+        if ports({"input"}):
+            _, input_shape, input_dtype = tensor("input")
+            expected = None
+            if input_shape is not None and len(input_shape) == 4:
+                batch, height, width, channels = input_shape
+                expected = {
+                    "SpatialSoftargmaxY": [batch, channels, width],
+                    "MeanHeight": [batch, channels, width],
+                    "ProfileX": [batch, channels * 2, width],
+                    "ProfileY": [batch, channels * 2, height],
+                }[op]
+            if (
+                input_dtype != "float32"
+                or output_dtype != "float32"
+                or expected != output_shape
+                or params
+            ):
+                reject(
+                    "VXDESC_VISION_PROFILE",
+                    "requires its exact parameter-free rank-4 F32 profile geometry",
+                )
+        return result
+
+    if op == "RMSNorm":
+        if ports({"input", "weight"}):
+            _, input_shape, input_dtype = tensor("input")
+            _, weight_shape, weight_dtype = tensor("weight")
+            feature = input_shape[-1] if input_shape else None
+            epsilon = params.get("eps", 1e-5)
+            d_model = params.get("d_model", feature)
+            if (
+                input_dtype != "float32"
+                or output_dtype != "float32"
+                or input_shape != output_shape
+                or feature is None
+                or weight_dtype not in {"float16", "float32"}
+                or weight_shape != [feature]
+                or isinstance(epsilon, bool)
+                or not isinstance(epsilon, (int, float))
+                or not math.isfinite(float(epsilon))
+                or float(epsilon) <= 0
+                or isinstance(d_model, bool)
+                or not isinstance(d_model, int)
+                or d_model != feature
+                or set(params) - {"eps", "d_model"}
+            ):
+                reject(
+                    "VXDESC_RMS_NORM",
+                    "requires equal-shape F32 activations and a matching float feature weight",
+                )
         return result
 
     if op in {"LayerNorm", "GroupNorm"}:
@@ -874,12 +1251,68 @@ def _node_contract_diagnostics(
                             "requires descriptor-preserving nearest/asymmetric/floor NHWC byte mapping",
                         )
             elif (
-                op == "Resize"
-                or input_dtype != "float32"
+                input_dtype != "float32"
                 or output_dtype != "float32"
                 or not ranked
             ):
                 reject("VXDESC_SPATIAL", "requires rank-4 F32 input/output")
+            elif op in {"Resize", "ResizeNearest2D"}:
+                allowed_params = {
+                    "mode", "coordinate_transformation_mode", "nearest_mode",
+                    "align_corners", "antialias", "data_layout",
+                }
+                mode = params.get("mode")
+                nearest = op == "ResizeNearest2D" or mode == "nearest"
+                transform = params.get("coordinate_transformation_mode")
+                nearest_mode = params.get("nearest_mode")
+                invalid_mode = (
+                    mode not in {None, "nearest", "linear"}
+                    if op == "Resize"
+                    else mode not in {None, "nearest"}
+                )
+                invalid_sampling = (
+                    transform not in {None, "asymmetric"}
+                    or nearest_mode not in {None, "floor"}
+                    if nearest
+                    else transform not in {None, "half_pixel"}
+                    or "nearest_mode" in params
+                )
+                if (
+                    set(params) - allowed_params
+                    or invalid_mode
+                    or invalid_sampling
+                    or params.get("align_corners") not in {None, False, 0}
+                    or params.get("antialias") not in {None, False, 0}
+                    or params.get("data_layout") not in {None, "NHWC"}
+                    or input_shape[0] != output_shape[0]
+                    or input_shape[3] != output_shape[3]
+                ):
+                    reject(
+                        "VXDESC_RESIZE",
+                        "requires canonical NHWC batch/channel-preserving resize geometry",
+                    )
+        return result
+
+    if op == "UpsampleNearest2D":
+        if ports({"input"}):
+            _, input_shape, input_dtype = tensor("input")
+            expected = None
+            if input_shape is not None and len(input_shape) == 4:
+                expected = [
+                    input_shape[0], input_shape[1] * 2,
+                    input_shape[2] * 2, input_shape[3],
+                ]
+            if (
+                input_dtype != "float32"
+                or output_dtype != "float32"
+                or expected != output_shape
+                or params.get("data_layout", "NHWC") != "NHWC"
+                or set(params) - {"data_layout"}
+            ):
+                reject(
+                    "VXDESC_UPSAMPLE_NEAREST",
+                    "requires canonical F32 NHWC exact-2x spatial geometry",
+                )
         return result
 
     if op == "SDPA":
@@ -1692,18 +2125,31 @@ def _validate_graph(
     weights: Optional[Mapping[str, Any]] = None,
     check_target_membership: bool,
 ) -> ValidationResult:
-    """Validate static descriptors and, optionally, selected target routes."""
+    """Validate bounded descriptors and, optionally, selected target routes."""
 
     atomic_targets = (
         expand_targets(targets) if check_target_membership else ()
     )
     diagnostics: list[Diagnostic] = []
+    logical_graph = graph
     inputs = graph.get("inputs")
     nodes = graph.get("nodes")
     outputs = graph.get("outputs")
     graph_format = graph.get("format")
     if graph_format != GRAPH_FORMAT:
         diagnostics.append(Diagnostic("VXPKG001", f"graph format must be {GRAPH_FORMAT!r}", "serialize"))
+    unsupported_root_fields = sorted(set(graph) - _GRAPH_ROOT_FIELDS)
+    if unsupported_root_fields:
+        diagnostics.append(Diagnostic(
+            "VXPKG022",
+            "graph root contains unsupported field "
+            f"{unsupported_root_fields[0]!r}",
+            "serialize",
+        ))
+    if not isinstance(graph.get("dimensions"), Mapping):
+        diagnostics.append(Diagnostic(
+            "VXPKG023", "graph dimensions must be an object", "serialize",
+        ))
     if not isinstance(inputs, Mapping):
         diagnostics.append(Diagnostic("VXPKG002", "graph inputs must be an object", "serialize"))
         inputs = {}
@@ -1718,7 +2164,9 @@ def _validate_graph(
     tensor_quantization: dict[str, Mapping[str, Any]] = {}
     if graph_format == GRAPH_FORMAT:
         try:
-            stored_quantization = validate_external_quantization(graph, weights or {})
+            stored_quantization = validate_external_quantization(
+                logical_graph, weights or {}
+            )
         except ExporterError as error:
             # The capability layer reports the offending node below with its
             # source operator. Standalone quantization-storage callers retain
@@ -1741,6 +2189,40 @@ def _validate_graph(
                         "zero_point": int(descriptor.zero_points[0]),
                     }
                 )
+    try:
+        projected_graph, has_dynamic_dimensions = _bounded_capability_projection(
+            logical_graph
+        )
+    except ValueError as error:
+        diagnostics.append(Diagnostic(
+            "VXPKG024",
+            f"cannot resolve bounded descriptor maxima: {error}",
+            "logical-shapes",
+        ))
+        return ValidationResult(atomic_targets, tuple(diagnostics))
+    graph = projected_graph
+    projected_inputs = graph.get("inputs")
+    projected_nodes = graph.get("nodes")
+    inputs = projected_inputs if isinstance(projected_inputs, Mapping) else {}
+    nodes = projected_nodes if isinstance(projected_nodes, list) else []
+    outputs = graph.get("outputs")
+    if has_dynamic_dimensions and check_target_membership:
+        try:
+            prove_portable_graph_domain(
+                logical_graph,
+                weights or {},
+                atomic_targets,
+            )
+        except PortableDomainProofError as error:
+            diagnostics.append(Diagnostic(
+                error.code,
+                error.detail,
+                "capability",
+                source_node=error.path,
+                constraint="canonical whole-bounded-domain route proof",
+            ))
+        except ExporterError as error:
+            diagnostics.append(error.diagnostic)
     available_tensors: set[str] = set()
     for name, descriptor in inputs.items():
         shape = descriptor.get("shape") if isinstance(descriptor, Mapping) else None
@@ -1919,9 +2401,9 @@ def _validate_graph(
 
         if op in {"MatMul", "Linear", "Gemm"}:
             layout = params.get("weight_layout")
-            if layout not in {"IN_OUT", "OUT_IN"}:
+            if layout not in {"din_dout", "dout_din"}:
                 diagnostics.append(Diagnostic(
-                    "VXLINEAR001", f"{label} requires explicit IN_OUT or OUT_IN weight_layout",
+                    "VXLINEAR001", f"{label} requires explicit din_dout or dout_din weight_layout",
                     "capability", source_node=label, source_op=op,
                     constraint="unambiguous linear weight orientation",
                 ))
@@ -1937,7 +2419,7 @@ def _validate_graph(
                 scale_name = ports.get("weight_scale") or ports.get("scale")
                 scale_shape = tensor_shapes.get(str(scale_name))
                 scale_dtype = tensor_dtypes.get(str(scale_name))
-                output_width = weight_shape[0] if weight_shape and layout == "OUT_IN" else None
+                output_width = weight_shape[0] if weight_shape and layout == "dout_din" else None
                 if (
                     scale_name is None
                     or scale_dtype != "float32"
@@ -2106,10 +2588,10 @@ def _validate_graph(
                         "capability", target=target, source_node=label, source_op=str(op or ""),
                     ))
 
-    source = graph.get("source")
+    source = logical_graph.get("source")
     declared_class = source.get("package_class") if isinstance(source, Mapping) else None
     if declared_class is not None:
-        actual_class = classify_package(graph, weights)
+        actual_class = classify_package(logical_graph, weights)
         if declared_class != actual_class:
             diagnostics.append(Diagnostic(
                 "VXPKG_CLASS",

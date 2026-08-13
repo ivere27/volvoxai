@@ -76,6 +76,42 @@ int vx_cpu_has_avx_vnni(void) {
     return value;
 }
 
+/* AVX-512F plus the VL/BW/DQ pieces a float kernel needs, without VNNI.
+ * VNNI is an integer dot product, so gating an F32 kernel on it would exclude
+ * every AVX-512 machine that predates it — Skylake-X has AVX-512F and no VNNI
+ * — while implying a capability the kernel never uses. */
+static int vx_cpu_probe_avx512f(void) {
+#if VX_CPU_X86_RUNTIME_QUERY
+    unsigned int eax, ebx, ecx, edx;
+    const unsigned int required_ebx = (1u << 5u) |  /* AVX2 */
+        (1u << 16u) | /* AVX-512F */
+        (1u << 17u) | /* AVX-512DQ */
+        (1u << 30u) | /* AVX-512BW */
+        (1u << 31u);  /* AVX-512VL */
+    const uint64_t required_xcr0 = (1ull << 1u) | (1ull << 2u) |
+        (1ull << 5u) | (1ull << 6u) | (1ull << 7u);
+    if ((unsigned int)__get_cpuid_max(0, 0) < 7u) return 0;
+    __cpuid(1, eax, ebx, ecx, edx);
+    if ((ecx & (1u << 28u)) == 0 || (ecx & (1u << 27u)) == 0 ||
+        (ecx & (1u << 26u)) == 0 ||
+        (vx_cpu_xgetbv0() & required_xcr0) != required_xcr0) return 0;
+    __cpuid_count(7, 0, eax, ebx, ecx, edx);
+    return (ebx & required_ebx) == required_ebx;
+#else
+    return 0;
+#endif
+}
+
+int vx_cpu_has_avx512f(void) {
+    static int cached = VX_CPU_FEATURE_UNKNOWN;
+    int value = cached;
+    if (value == VX_CPU_FEATURE_UNKNOWN) {
+        value = vx_cpu_probe_avx512f();
+        cached = value;
+    }
+    return value;
+}
+
 static int vx_cpu_probe_avx512_vnni(void) {
 #if VX_CPU_X86_RUNTIME_QUERY
     unsigned int eax, ebx, ecx, edx;

@@ -45,14 +45,23 @@ on another backend.
 ## Model and tensor contract
 
 A model source names exactly one `graph.json` plus ordered safetensors shards.
-The graph root must contain:
+The graph uses the closed bounded-shape v1 root contract; a minimal valid
+pass-through document is:
 
 ```json
-{ "format": "volvox-graph/v1" }
+{
+  "format": "volvox-graph/v1",
+  "dimensions": {},
+  "inputs": {"x": {"shape": [1], "dtype": "float32"}},
+  "nodes": [],
+  "outputs": ["x"]
+}
 ```
 
 The path must name `graph.json` or a named `*.graph.json` document. No alternate
-graph filename or discriminator is searched.
+graph filename or discriminator is searched. Legacy split node outputs such as
+`outputs_shape` and `outputs_dtype` are rejected; every non-empty node uses an
+`id`, unified output descriptors, and an explicit `params` object.
 
 Tensor payloads are little-endian and row-major. Input payloads must use
 `MEMORY_LOCATION_HOST` because protobuf bytes are caller-owned host memory.

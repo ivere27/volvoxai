@@ -1,6 +1,7 @@
 #ifndef VOLVOXAI_INFERENCE_KERNELS_H
 #define VOLVOXAI_INFERENCE_KERNELS_H
 
+#include <stddef.h>
 #include <stdint.h>
 #include "../../include/volvoxai_enums.h"
 #include "gemm_f32.h"
@@ -17,6 +18,8 @@ enum {
 };
 
 void matmul_f32(const float*, const float*, const float*, float*, int, int, int);
+/* Resolve any translation-unit-local ISA dispatch before parallel callers. */
+void matmul_f32_prepare_dispatch(void);
 /* Same product with the weight stored [N,K] instead of [K,N]. */
 void matmul_f32_out_in(const float*, const float*, const float*, float*, int, int, int);
 void add_f32(const float*, const float*, float*, int);
@@ -38,6 +41,7 @@ void tanh_f32(const float*, float*, int);
 void clip_f32(const float*, float*, int, float, float);
 void maxpool2d_f32(const float*, float*, int, int, int, int, int, int, int,
                    int, int, int, int);
+void resize_bilinear_f32(const float*, float*, int, int, int, int, int, int);
 void global_average_pool_f32(const float*, float*, int, int, int, int);
 void copy_f32(const float*, float*, int);
 void layernorm_f32(const float*, const float*, const float*, float*, int, int, float);
@@ -56,6 +60,10 @@ int binary_broadcast_f32(const float*, const float*, float*, const uint32_t*,
 int compare_broadcast_i32(const int32_t*, const int32_t*, int32_t*,
                          const uint32_t*, const uint32_t*, const uint32_t*,
                          uint32_t, uint32_t, uint32_t, uint32_t, uint32_t);
+int where_broadcast_32(const void*, uint32_t, const uint32_t*, const uint32_t*,
+                       uint32_t*, const uint32_t*, const uint32_t*,
+                       const uint32_t*, const uint32_t*, uint32_t, uint32_t,
+                       uint32_t, uint32_t, uint32_t, uint32_t);
 int not_i32(const int32_t*, int32_t*, uint32_t);
 int matmul_quantized_f32(const float*, const void*, const float*, const void*,
                          const float*, float*, uint32_t, uint32_t, uint32_t,
@@ -90,6 +98,14 @@ int moe_router_f32(const float*, const float*, const float*, float*, float*,
 int moe_linear_f32(const float*, const float*, const float*, const float*,
                    const float*, float*, uint32_t, uint32_t, uint32_t,
                    uint32_t, uint32_t);
+/* Partially resident expert bank. `experts` counts staged rows; route indices
+ * stay in global slot space and are mapped through slot_rows[slot_domain].
+ * A NULL slot_rows selects the fully resident behaviour of moe_linear_f32. */
+int vx_moe_linear_banked_f32(const float*, const float*, const float*,
+                             const float*, const float*, float*, uint32_t,
+                             uint32_t, uint32_t, uint32_t, uint32_t,
+                             const uint32_t*, uint32_t);
+#define VX_MOE_SLOT_ABSENT 0xFFFFFFFFu
 
 int qlinear_i8u8(const void*, const void*, const int32_t*, const float*,
                  const int32_t*, void*, uint32_t, uint32_t, uint32_t, float,
@@ -101,6 +117,15 @@ int vx_qbatch_matmul_i8u8_native(const void*, const void*, void*, uint32_t,
                                 uint32_t, uint32_t, float, int32_t, float,
                                 int32_t, float, int32_t, uint32_t, uint32_t,
                                 uint32_t);
+/* The optimized dynamic-operand route consumes caller-owned transient bytes.
+ * A zero/undersized workspace is valid and selects an allocation-free exact
+ * fallback; the kernel never allocates or retains caller data itself. */
+size_t vx_qbatch_matmul_i8u8_native_workspace_bytes(uint32_t, uint32_t,
+                                                    uint32_t);
+int vx_qbatch_matmul_i8u8_native_with_workspace(
+    const void*, const void*, void*, uint32_t, uint32_t, uint32_t,
+    float, int32_t, float, int32_t, float, int32_t,
+    uint32_t, uint32_t, uint32_t, void*, size_t);
 uint32_t vx_packed_q8_weight_size(uint32_t, uint32_t);
 int vx_pack_q8_weight(void*, uint32_t, const void*, uint32_t, uint32_t,
                       uint32_t, uint32_t);

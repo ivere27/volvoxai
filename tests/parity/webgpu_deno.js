@@ -14,7 +14,12 @@
 // (out/<model>.onnx.json), webgpu is also gated against it at `external` tol.
 import { signature, compareSignature } from './lib/extract.mjs';
 import { formatAdapterIdentity, requirePhysicalWebGPU } from './lib/backend.mjs';
-import { captureStableResult } from './lib/runmodel.mjs';
+import {
+  buildInputs,
+  captureStableResult,
+  concreteExecutionInputs,
+  runtimeFailureMessage,
+} from './lib/runmodel.mjs';
 import {
   createRuntimeEvidence,
   createParityFingerprintSync,
@@ -43,21 +48,6 @@ globalThis.fetch = async (url, init) => {
   return nativeFetch(url, init);
 };
 
-// --- exact mirror of lib/tensorio.mjs seeded PRNG (so external oracles line up) ---
-const TA = { f32: Float32Array, i32: Int32Array, u8: Uint8Array, i8: Int8Array };
-function seededUint8(n, seed) { const o = new Uint8Array(n); let s = (seed >>> 0) || 1; for (let i = 0; i < n; i++) { s = (Math.imul(s, 1664525) + 1013904223) >>> 0; o[i] = (s >>> 24) & 0xff; } return o; }
-function seededFloat32(n, seed, lo = 0, hi = 1) { const o = new Float32Array(n); let s = (seed >>> 0) || 1; const span = hi - lo; for (let i = 0; i < n; i++) { s = (Math.imul(s, 1664525) + 1013904223) >>> 0; o[i] = lo + (s >>> 8) / 0x1000000 * span; } return o; }
-function readTensor(file, dtype) { const b = fs.readFileSync(path.join(ROOT, file)); const C = TA[dtype] || Float32Array; return new C(b.buffer, b.byteOffset, b.byteLength / C.BYTES_PER_ELEMENT); }
-function buildInputs(model) {
-  const inputs = {};
-  for (const inp of model.inputs) {
-    if (inp.file) inputs[inp.name] = readTensor(inp.file, inp.dtype);
-    else if (inp.gen === 'seededU8') inputs[inp.name] = seededUint8(inp.shape.reduce((a, b) => a * b, 1), inp.seed);
-    else if (inp.gen === 'seededF32') inputs[inp.name] = seededFloat32(inp.shape.reduce((a, b) => a * b, 1), inp.seed, inp.lo ?? 0, inp.hi ?? 1);
-    else throw new Error(`input ${inp.name}: need file or gen`);
-  }
-  return inputs;
-}
 const sliceForSpec = (flat, spec) => spec.kind === 'row' ? flat.subarray(spec.row * spec.cols, spec.row * spec.cols + spec.cols) : flat;
 
 const policy = JSON.parse(fs.readFileSync(path.join(ROOT, 'tests/parity/policy.json'), 'utf8'));
@@ -93,7 +83,8 @@ function materializeFixtures(names) {
     const values = buildInputs(model);
     for (const input of model.inputs.filter((candidate) => candidate.gen)) {
       atomicWriteBytes(path.join(OUT, 'fixtures', name,
-        `${input.name}.${input.dtype === 'f32' ? 'f32' : input.dtype}`), values[input.name]);
+        `${input.name}.${input.dtype === 'f32' ? 'f32' : input.dtype}`),
+      values[input.name].data);
     }
   }
 }
@@ -140,14 +131,14 @@ try {
 // Run one model on one backend; return { outputs: {name: {flat, len}}, ms }.
 async function run(model, backend) {
   const modelUrl = pathToFileURL(path.join(ROOT, model.dir, 'model.safetensors')).href;
-  const graph = new module.Graph();
-  await module.GraphLoader.load(graph, modelUrl);
+  const snapshot = module.Model.capture(
+    await module.ModelLoader.load(modelUrl),
+  );
   const runtime = await module.VolvoxAI.createRuntime({ backends: [backend], wasmUrl: wasmPath });
-  const runtimeModel = runtime.createModel(graph);
   let compiled;
   let context;
   try {
-    compiled = await runtimeModel.compile({
+    compiled = await runtime.compile(snapshot, {
       backend: { mode: 'require', backend, operatorFallback: 'forbid' },
     });
     if (compiled.backend !== backend) {
@@ -157,7 +148,7 @@ async function run(model, backend) {
       ? requirePhysicalWebGPU(compiled, 'whole-model WebGPU parity')
       : null;
     context = await compiled.createContext();
-    const inputs = buildInputs(model);
+    const inputs = concreteExecutionInputs(snapshot, buildInputs(model));
     const warmup = await context.execute(inputs);
     await warmup.close();
     const t0 = performance.now();
@@ -165,7 +156,7 @@ async function run(model, backend) {
     const ms = performance.now() - t0;
     const execution = result.report;
     const captured = await captureStableResult(
-      graph,
+      snapshot.graph,
       result,
       context,
       backend,
@@ -188,7 +179,6 @@ async function run(model, backend) {
   } finally {
     await context?.close();
     await compiled?.close();
-    await runtimeModel.close();
     await runtime.close();
   }
 }
@@ -231,7 +221,7 @@ for (const name of wanted) {
       console.log(`  [${be}] ok ${res[be].ms.toFixed(1)}ms ${lens}`);
       if (res[be].adapterInfo) console.log(`    adapter: ${formatAdapterIdentity(res[be].adapterInfo)}`);
     } catch (e) {
-      const message = String(e.message || e).slice(0, 300);
+      const message = runtimeFailureMessage(e).slice(0, 1000);
       console.log(`  [${be}] ERROR ${message}`);
       modelErrors.push(`${be}: ${message}`);
     }

@@ -1,5 +1,7 @@
 import linearF32Shader from '../../shaders/inference/linearF32.wgsl';
 import linearF32TiledShader from '../../shaders/inference/linearF32Tiled.wgsl';
+import linearF32RowMajorShader from '../../shaders/inference/linearF32RowMajor.wgsl';
+import linearF32RowMajorTiledShader from '../../shaders/inference/linearF32RowMajorTiled.wgsl';
 import linearInt8Shader from '../../shaders/inference/linearInt8.wgsl';
 import linearInt8TiledShader from '../../shaders/inference/linearInt8Tiled.wgsl';
 import conv2DShader from '../../shaders/inference/conv2D.wgsl';
@@ -9,6 +11,7 @@ import conv2DPointwise16TileShader from '../../shaders/inference/conv2DPointwise
 import conv2DPointwise8Vec2Shader from '../../shaders/inference/conv2DPointwise8Vec2.wgsl';
 import conv2DPointwise8Vec4Shader from '../../shaders/inference/conv2DPointwise8Vec4.wgsl';
 import conv2DRegularC3Out16Shader from '../../shaders/inference/conv2DRegularC3Out16.wgsl';
+import conv2DRegularOut16Shader from '../../shaders/inference/conv2DRegularOut16.wgsl';
 import layerNormShader from '../../shaders/inference/layerNorm.wgsl';
 import groupNormShader from '../../shaders/inference/groupNorm.wgsl';
 import binaryBroadcastShader from '../../shaders/inference/binaryBroadcast.wgsl';
@@ -100,6 +103,7 @@ import loraApplyShader from '../../shaders/inference/loraApply.wgsl';
 import incrementalRowByteCopyShader from '../../shaders/inference/incrementalRowByteCopy.wgsl';
 import batchMatMulShader from '../../shaders/inference/batchMatMul.wgsl';
 import qBatchMatMulShader from '../../shaders/inference/qBatchMatMul.wgsl';
+import qBatchMatMulDotShader from '../../shaders/inference/qBatchMatMulDot.wgsl';
 import compareI32Shader from '../../shaders/inference/compareI32.wgsl';
 import notI32Shader from '../../shaders/inference/notI32.wgsl';
 import clipTypedShader from '../../shaders/inference/clipTyped.wgsl';
@@ -112,6 +116,12 @@ export class ShaderLibrary {
   }
   static getLinearF32TiledShader() {
     return linearF32TiledShader;
+  }
+  static getLinearF32RowMajorShader() {
+    return linearF32RowMajorShader;
+  }
+  static getLinearF32RowMajorTiledShader() {
+    return linearF32RowMajorTiledShader;
   }
   static getLinearInt8Shader() {
     return linearInt8Shader;
@@ -139,6 +149,9 @@ export class ShaderLibrary {
   }
   static getConv2DRegularC3Out16Shader() {
     return conv2DRegularC3Out16Shader;
+  }
+  static getConv2DRegularOut16Shader() {
+    return conv2DRegularOut16Shader;
   }
   static getLayerNormShader() {
     return layerNormShader;
@@ -339,6 +352,28 @@ export class ShaderLibrary {
     // Substitute the per-op expression (Add/Mul/Sub/Div) into the shared template.
     return broadcastBinaryShader.replace("//__BINOP__", binOp);
   }
+  static getBroadcastAddShader() {
+    return this.getBroadcastBinaryShader("out_val = av + bv;");
+  }
+  static getBroadcastAddReLUShader() {
+    return this.getBroadcastBinaryShader(
+      "out_val = av + bv; if (out_val < 0.0) { out_val = 0.0; }",
+    );
+  }
+  static getBroadcastAddReLU6Shader() {
+    return this.getBroadcastBinaryShader(
+      "out_val = av + bv; if (out_val < 0.0) { out_val = 0.0; } if (out_val > 6.0) { out_val = 6.0; }",
+    );
+  }
+  static getBroadcastMulShader() {
+    return this.getBroadcastBinaryShader("out_val = av * bv;");
+  }
+  static getBroadcastSubShader() {
+    return this.getBroadcastBinaryShader("out_val = av - bv;");
+  }
+  static getBroadcastDivShader() {
+    return this.getBroadcastBinaryShader("out_val = av / bv;");
+  }
   static getGeneralTransposeShader() {
     return generalTransposeShader;
   }
@@ -413,6 +448,9 @@ export class ShaderLibrary {
   }
   static getQBatchMatMulShader() {
     return qBatchMatMulShader;
+  }
+  static getQBatchMatMulDotShader() {
+    return qBatchMatMulDotShader;
   }
   static getCompareI32Shader() {
     return compareI32Shader;

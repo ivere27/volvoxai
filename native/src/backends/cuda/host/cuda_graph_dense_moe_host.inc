@@ -81,9 +81,13 @@ static int cuda_lora_workspace_reserve(size_t bytes) {
     CudaContextGuard guard;
     if (!bytes || !p_cuMemAlloc || !p_cuMemFree) return 0;
     if (cuda_lora_workspace && cuda_lora_workspace_bytes >= bytes) return 1;
+    if (cuda_domain_enforced) return 0;
     if (!cuda_context_enter(&guard)) return 0;
     if (!cuda_ok(p_cuMemAlloc(&next, bytes),
-                 "cuMemAlloc(CUDA LoRA workspace)")) goto done;
+                 "cuMemAlloc(CUDA LoRA workspace)")) {
+        cuda_graph_allocation_failed = 1;
+        goto done;
+    }
     if (cuda_lora_workspace && cuda_stream &&
         !cuda_ok(p_cuStreamSynchronize(cuda_stream),
                  "cuStreamSynchronize(CUDA LoRA workspace)")) goto done;
@@ -248,7 +252,8 @@ int cuda_graph_moe_linear_f32(
         const float* input, const float* expert_weight,
         const float* expert_bias, const float* route_indices,
         const float* route_weights, float* output, int rows, int d_in,
-        int d_out, int experts, int top_k) {
+        int d_out, int experts, int top_k, const unsigned int* slot_rows,
+        unsigned int slot_domain) {
     uint32_t row_count;
     uint32_t input_width;
     uint32_t output_width;
@@ -270,11 +275,18 @@ int cuda_graph_moe_linear_f32(
     CudaTensorView indices_view;
     CudaTensorView routes_view;
     CudaTensorView output_view;
+    CudaTensorView slot_view;
     CUdeviceptr bias_device = 0;
-    void* args[12];
+    CUdeviceptr slot_device = 0;
+    uint32_t slot_extent = slot_rows ? (uint32_t)slot_domain : 0u;
+    size_t slot_bytes;
+    void* args[14];
     if (!input || !expert_weight || !route_indices || !route_weights ||
         !output || rows <= 0 || d_in <= 0 || d_out <= 0 || experts <= 0 ||
-        top_k <= 0 || top_k > experts || top_k > 8) return 0;
+        top_k <= 0 || top_k > 8) return 0;
+    if (slot_rows ? (slot_extent < (uint32_t)experts ||
+                     (uint32_t)top_k > slot_extent)
+                  : top_k > experts) return 0;
     row_count = (uint32_t)rows;
     input_width = (uint32_t)d_in;
     output_width = (uint32_t)d_out;
@@ -291,7 +303,9 @@ int cuda_graph_moe_linear_f32(
         !size_product_u32(row_count, route_width, sizeof(float),
                           &route_bytes) ||
         !size_product_u32(expert_count, output_width, sizeof(float),
-                          &bias_bytes)) return 0;
+                          &bias_bytes) ||
+        !size_product_u32(1u, slot_extent ? slot_extent : 1u,
+                          sizeof(uint32_t), &slot_bytes)) return 0;
     input_elements = row_count * input_width;
     output_elements = row_count * output_width;
     route_elements = row_count * route_width;
@@ -308,6 +322,13 @@ int cuda_graph_moe_linear_f32(
             return 0;
         bias_device = bias_view.device;
     }
+    if (slot_extent) {
+        /* The table is immutable for the life of a context residency, so it is
+         * uploaded through the same invariant-input path as the weights. */
+        if (!graph_ensure_input_view((const float*)slot_rows, slot_bytes, 1,
+                                     &slot_view)) return 0;
+        slot_device = slot_view.device;
+    }
     args[0] = &input_view.device;
     args[1] = &weight_view.device;
     args[2] = &bias_device;
@@ -320,6 +341,8 @@ int cuda_graph_moe_linear_f32(
     args[9] = &expert_count;
     args[10] = &route_width;
     args[11] = &has_bias;
+    args[12] = &slot_device;
+    args[13] = &slot_extent;
     if (!cuda_launch_1d(CUDA_FORWARD_FUNCTION(k_moe_linear), output_elements, args)) return 0;
     graph_mark_device(output_view.slot);
     (void)input_elements;

@@ -810,39 +810,201 @@ static int backward_global_average_pool(float** grads, Node* n, T* out, const fl
     return 0;
 }
 
+typedef struct {
+    int batch;
+    int input_height;
+    int input_width;
+    int channels;
+    int output_height;
+    int output_width;
+    int kernel_y;
+    int kernel_x;
+    int stride_y;
+    int stride_x;
+    int pads[4];
+} TrainingMaxPool2DGeometry;
+
+static int training_maxpool_integer(const cJSON* value, int minimum,
+                                    int* output) {
+    double number;
+    if (!value || !output || !cJSON_IsNumber(value)) return -1;
+    number = value->valuedouble;
+    if (!isfinite(number) || number < minimum || number > INT_MAX ||
+        floor(number) != number) return -1;
+    *output = (int)number;
+    return 0;
+}
+
+static int training_maxpool_pair(cJSON* params, const char* name,
+                                 int default_value, int minimum, int required,
+                                 int output[2]) {
+    cJSON* value = params
+        ? cJSON_GetObjectItemCaseSensitive(params, name) : NULL;
+    if (!value) {
+        if (required) return -1;
+        output[0] = default_value;
+        output[1] = default_value;
+        return 0;
+    }
+    if (cJSON_IsNumber(value)) {
+        if (training_maxpool_integer(value, minimum, &output[0]) != 0)
+            return -1;
+        output[1] = output[0];
+        return 0;
+    }
+    if (cJSON_IsArray(value)) {
+        int count = cJSON_GetArraySize(value);
+        if (count < 1 || count > 2 ||
+            training_maxpool_integer(cJSON_GetArrayItem(value, 0), minimum,
+                                     &output[0]) != 0)
+            return -1;
+        if (count == 1) output[1] = output[0];
+        else if (training_maxpool_integer(cJSON_GetArrayItem(value, 1),
+                                          minimum, &output[1]) != 0)
+            return -1;
+        return 0;
+    }
+    return -1;
+}
+
+static int training_maxpool_pads(cJSON* params, int pads[4]) {
+    int padding[2];
+    cJSON* padding_value = params
+        ? cJSON_GetObjectItemCaseSensitive(params, "padding") : NULL;
+    cJSON* pads_value = params
+        ? cJSON_GetObjectItemCaseSensitive(params, "pads") : NULL;
+    if (training_maxpool_pair(params, "padding", 0, 0, 0, padding) != 0)
+        return -1;
+    pads[0] = padding[0];
+    pads[1] = padding[1];
+    pads[2] = padding[0];
+    pads[3] = padding[1];
+    if (!pads_value) return 0;
+    if (!cJSON_IsArray(pads_value) || cJSON_GetArraySize(pads_value) != 4)
+        return -1;
+    for (int index = 0; index < 4; index++) {
+        if (training_maxpool_integer(cJSON_GetArrayItem(pads_value, index),
+                                     0, &pads[index]) != 0)
+            return -1;
+    }
+    if (padding_value &&
+        (pads[0] != padding[0] || pads[1] != padding[1] ||
+         pads[2] != padding[0] || pads[3] != padding[1]))
+        return -1;
+    return 0;
+}
+
+static int training_maxpool_numel(const int shape[4], int64_t* output) {
+    int64_t value = 1;
+    if (!shape || !output) return -1;
+    for (int axis = 0; axis < 4; axis++) {
+        if (shape[axis] <= 0 || value > INT64_MAX / shape[axis]) return -1;
+        value *= shape[axis];
+    }
+    *output = value;
+    return 0;
+}
+
+/* CPU and GPU training share this descriptor-only check.  In particular,
+ * bottom/right padding participates in the exact output shape even though the
+ * kernels need only the top/left origin offsets.  No destination-gradient
+ * allocation or write is allowed until this complete geometry is accepted. */
+static int training_maxpool2d_geometry(Node* n, T* in, T* out,
+                                       TrainingMaxPool2DGeometry* geometry) {
+    int kernel[2], stride[2], dilation[2], pads[4];
+    int64_t input_numel, output_numel;
+    int64_t padded_height, padded_width;
+    int64_t output_height, output_width;
+    cJSON* ceil_mode;
+    cJSON* data_layout;
+    if (!n || !in || !out || !geometry || in->dtype != T_F32 ||
+        out->dtype != T_F32 || in->ndim != 4 || out->ndim != 4)
+        return -1;
+    for (int axis = 0; axis < 4; axis++)
+        if (in->shape[axis] <= 0 || out->shape[axis] <= 0) return -1;
+    if (training_maxpool_pair(n->params, "kernel", 1, 1, 1, kernel) != 0 ||
+        training_maxpool_pair(n->params, "stride", 1, 1, 0, stride) != 0 ||
+        training_maxpool_pair(n->params, "dilation", 1, 1, 0,
+                              dilation) != 0 ||
+        training_maxpool_pads(n->params, pads) != 0 ||
+        dilation[0] != 1 || dilation[1] != 1)
+        return -1;
+    ceil_mode = n->params
+        ? cJSON_GetObjectItemCaseSensitive(n->params, "ceil_mode") : NULL;
+    if (ceil_mode && !cJSON_IsFalse(ceil_mode) &&
+        !(cJSON_IsNumber(ceil_mode) && ceil_mode->valuedouble == 0.0))
+        return -1;
+    data_layout = n->params
+        ? cJSON_GetObjectItemCaseSensitive(n->params, "data_layout") : NULL;
+    if (data_layout &&
+        (!cJSON_IsString(data_layout) || !data_layout->valuestring ||
+         strcmp(data_layout->valuestring, "NHWC")))
+        return -1;
+
+    if (training_maxpool_numel(in->shape, &input_numel) != 0 ||
+        training_maxpool_numel(out->shape, &output_numel) != 0)
+        return -1;
+    padded_height = (int64_t)in->shape[1] + pads[0] + pads[2];
+    padded_width = (int64_t)in->shape[2] + pads[1] + pads[3];
+    if (input_numel != in->numel || padded_height < kernel[0] ||
+        padded_width < kernel[1])
+        return -1;
+    output_height = (padded_height - kernel[0]) / stride[0] + 1;
+    output_width = (padded_width - kernel[1]) / stride[1] + 1;
+    if (output_height <= 0 || output_height > INT_MAX || output_width <= 0 ||
+        output_width > INT_MAX || out->shape[0] != in->shape[0] ||
+        out->shape[1] != output_height || out->shape[2] != output_width ||
+        out->shape[3] != in->shape[3])
+        return -1;
+    if (output_numel != out->numel) return -1;
+
+    geometry->batch = in->shape[0];
+    geometry->input_height = in->shape[1];
+    geometry->input_width = in->shape[2];
+    geometry->channels = in->shape[3];
+    geometry->output_height = (int)output_height;
+    geometry->output_width = (int)output_width;
+    geometry->kernel_y = kernel[0];
+    geometry->kernel_x = kernel[1];
+    geometry->stride_y = stride[0];
+    geometry->stride_x = stride[1];
+    memcpy(geometry->pads, pads, sizeof(geometry->pads));
+    return 0;
+}
+
 static int backward_maxpool2d(float** grads, Node* n, T* out, const float* go) {
     T* in = node_input_default(n);
-    if (!in || !out || !go || in->dtype != T_F32 || out->dtype != T_F32 ||
-        in->ndim != 4 || out->ndim != 4 || in->shape[0] != out->shape[0] || in->shape[3] != out->shape[3]) return -1;
-    int ky, kx, sy, sx, py, px;
-    p_pair(n->params, "kernel", 1, &ky, &kx);
-    p_pair(n->params, "stride", 1, &sy, &sx);
-    p_pair(n->params, "padding", 0, &py, &px);
-    if (ky <= 0 || kx <= 0 || sy <= 0 || sx <= 0) return -1;
-    int batch = in->shape[0], h = in->shape[1], w = in->shape[2], c = in->shape[3];
-    int oh = out->shape[1], ow = out->shape[2];
+    TrainingMaxPool2DGeometry geometry;
+    if (!go || training_maxpool2d_geometry(n, in, out, &geometry) != 0)
+        return -1;
     float* gi = grad_for(grads, in);
     if (!gi) return -1;
-    for (int bn = 0; bn < batch; bn++) {
-        for (int oy = 0; oy < oh; oy++) {
-            int iy0 = oy * sy - py;
-            for (int ox = 0; ox < ow; ox++) {
-                int ix0 = ox * sx - px;
-                for (int ch = 0; ch < c; ch++) {
+    for (int bn = 0; bn < geometry.batch; bn++) {
+        for (int oy = 0; oy < geometry.output_height; oy++) {
+            int iy0 = oy * geometry.stride_y - geometry.pads[0];
+            for (int ox = 0; ox < geometry.output_width; ox++) {
+                int ix0 = ox * geometry.stride_x - geometry.pads[1];
+                for (int ch = 0; ch < geometry.channels; ch++) {
                     long best_i = -1;
                     float best = -INFINITY;
-                    for (int yy = 0; yy < ky; yy++) {
+                    for (int yy = 0; yy < geometry.kernel_y; yy++) {
                         int iy = iy0 + yy;
-                        if ((unsigned)iy >= (unsigned)h) continue;
-                        for (int xx = 0; xx < kx; xx++) {
+                        if ((unsigned)iy >=
+                            (unsigned)geometry.input_height) continue;
+                        for (int xx = 0; xx < geometry.kernel_x; xx++) {
                             int ix = ix0 + xx;
-                            if ((unsigned)ix >= (unsigned)w) continue;
-                            long ii = (((long)bn * h + iy) * w + ix) * c + ch;
+                            if ((unsigned)ix >=
+                                (unsigned)geometry.input_width) continue;
+                            long ii = (((long)bn * geometry.input_height + iy) *
+                                geometry.input_width + ix) *
+                                geometry.channels + ch;
                             if (in->data[ii] > best) { best = in->data[ii]; best_i = ii; }
                         }
                     }
                     if (best_i >= 0) {
-                        long oi = (((long)bn * oh + oy) * ow + ox) * c + ch;
+                        long oi = (((long)bn * geometry.output_height + oy) *
+                            geometry.output_width + ox) *
+                            geometry.channels + ch;
                         gi[best_i] += go[oi];
                     }
                 }

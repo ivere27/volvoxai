@@ -1396,6 +1396,175 @@ static void conv2d_generic_f32(const float *in, float *out,
   }
 }
 
+/*
+ * Dense (groups == 1) HWC convolution, blocked and vectorized over output
+ * channels.
+ *
+ * The generic nest below carries the output channel on the *outside*, so it
+ * re-reads every input element `out_c` times and walks the weights with an
+ * `out_c` stride. For groups == 1 both of those are avoidable: the weight row
+ * for one (ky, kx, ic) is contiguous across every output channel, so carrying a
+ * block of channels in registers turns the weights into a unit-stride stream,
+ * broadcasts each input value once, and keeps the accumulators out of memory
+ * entirely.
+ *
+ * The addition order for any single output channel is unchanged — input
+ * channel, then kernel row, then kernel column — so this produces bit-identical
+ * results to the scalar path, not merely close ones.
+ *
+ * This matters for convolution-heavy image encoders: in one measured WASM
+ * graph, 13 convolutions were 94% of encoder time, and the build has no other
+ * FP32 convolution to fall back to (`conv_f32_opt.c` is native-only).
+ */
+#define VX_CONV_HWC_BLOCK 16
+
+/*
+ * Output pixels per weight load.
+ *
+ * This kernel used to compute one output pixel at a time, so each weight
+ * vector served sixteen multiply-adds. The native spatial kernel blocks its
+ * pixels and serves far more from the same load, and that ratio — not the
+ * weight layout, not a fused multiply-add, not accumulator residency, all of
+ * which were measured and moved nothing — is what separated the two.
+ *
+ * Two, chosen by measurement, on the encoder's three shapes: 15.68/12.23/10.60
+ * GMAC/s at two, 10.80/10.10/8.92 at four, 8.50/8.20/7.80 at six. Two pixels
+ * hold eight accumulators against four weight vectors and a broadcast, which
+ * is thirteen live v128; four needs twenty-one and an engine has sixteen on
+ * x86-64. The same ceiling the WASM GEMM tile found at four rows.
+ */
+#define VX_CONV_PIXELS 2
+
+/* One block of VX_CONV_PIXELS output pixels, for a window position where every
+ * tap is in range for all of them, so there is no per-pixel bounds test in the
+ * reduction. */
+static void conv2d_hwc_block_f32(const float *src_b, float *dst,
+                                 const float *wgt, const void *bias,
+                                 int bias_is_f16, int oc0, int block,
+                                 int iy0, int ix0, int w, int c, int taps,
+                                 int kh, int kw, int wc, int out_c,
+                                 int h, int sx, int relu, int dy, int dx) {
+  v128_t acc[VX_CONV_PIXELS][4];
+  float lane[VX_CONV_HWC_BLOCK];
+  for (int p = 0; p < VX_CONV_PIXELS; p++) {
+    for (int part = 0; part < 4; part++) {
+      for (int i = 0; i < 4; i++) {
+        lane[i] = vx_bias_load_f32(bias, bias_is_f16, oc0 + part * 4 + i);
+      }
+      acc[p][part] = wasm_v128_load(lane);
+    }
+  }
+  for (int ic = 0; ic < taps; ic++) {
+    for (int ky = 0; ky < kh; ky++) {
+      const int iy = iy0 + ky * dy;
+      if ((unsigned)iy >= (unsigned)h) continue;
+      for (int kx = 0; kx < kw; kx++) {
+        const int ix = ix0 + kx * dx;
+        const float *ww =
+            wgt + (((long)ky * kw + kx) * wc + ic) * out_c + oc0;
+        const v128_t w0 = wasm_v128_load(ww + 0);
+        const v128_t w1 = wasm_v128_load(ww + 4);
+        const v128_t w2 = wasm_v128_load(ww + 8);
+        const v128_t w3 = wasm_v128_load(ww + 12);
+        for (int p = 0; p < VX_CONV_PIXELS; p++) {
+          const v128_t av = wasm_f32x4_splat(
+              src_b[((long)iy * w + ix + (long)p * sx) * c + ic]);
+          /* A relaxed-SIMD fused multiply-add measured 1.15-1.21x here once
+           * the pixel block made this loop arithmetic-bound; it measured
+           * nothing before that, while it was still load-bound. Taking it
+           * needs the relaxed child module, which today exports only QLinear. */
+          acc[p][0] = wasm_f32x4_add(acc[p][0], wasm_f32x4_mul(av, w0));
+          acc[p][1] = wasm_f32x4_add(acc[p][1], wasm_f32x4_mul(av, w1));
+          acc[p][2] = wasm_f32x4_add(acc[p][2], wasm_f32x4_mul(av, w2));
+          acc[p][3] = wasm_f32x4_add(acc[p][3], wasm_f32x4_mul(av, w3));
+        }
+      }
+    }
+  }
+  (void)block;
+  for (int p = 0; p < VX_CONV_PIXELS; p++) {
+    float *out = dst + (long)p * out_c;
+    for (int part = 0; part < 4; part++) {
+      wasm_v128_store(lane, acc[p][part]);
+      for (int i = 0; i < 4; i++) {
+        out[oc0 + part * 4 + i] = relu_value(lane[i], relu);
+      }
+    }
+  }
+}
+
+static void conv2d_hwc_dense_f32(const float *src_b, float *dst_b,
+                                 const float *wgt, const void *bias,
+                                 int bias_is_f16,
+                                 int h, int w, int c, int kh, int kw, int wc,
+                                 int out_c, int out_h, int out_w,
+                                 int sy, int sx, int pt, int pl,
+                                 int relu, int dy, int dx) {
+  const int taps = wc < c ? wc : c;
+  /* The x range where every tap is in range for every pixel, so a block needs
+   * no per-pixel bounds test. Outside it the original per-pixel path runs. */
+  const int interior_lo = sx > 0 ? (pl + sx - 1) / sx : out_w;
+  const int interior_hi = sx > 0 && (w - 1 + pl - (kw - 1) * dx) >= 0
+      ? ((w - 1 + pl - (kw - 1) * dx) / sx) + 1 : 0;
+  for (int oy = 0; oy < out_h; oy++) {
+    const int iy0 = oy * sy - pt;
+    for (int ox = 0; ox < out_w; ox++) {
+      const int ix0 = ox * sx - pl;
+      if (ox >= interior_lo && ox + VX_CONV_PIXELS <= interior_hi &&
+          ox + VX_CONV_PIXELS <= out_w && out_c % VX_CONV_HWC_BLOCK == 0) {
+        float *dst_block = dst_b + ((long)oy * out_w + ox) * out_c;
+        for (int oc0 = 0; oc0 < out_c; oc0 += VX_CONV_HWC_BLOCK) {
+          conv2d_hwc_block_f32(src_b, dst_block, wgt, bias, bias_is_f16, oc0,
+                               VX_CONV_HWC_BLOCK, iy0, ix0, w, c, taps,
+                               kh, kw, wc, out_c, h, sx, relu, dy, dx);
+        }
+        ox += VX_CONV_PIXELS - 1;
+        continue;
+      }
+      float *dst = dst_b + ((long)oy * out_w + ox) * out_c;
+      for (int oc0 = 0; oc0 < out_c; oc0 += VX_CONV_HWC_BLOCK) {
+        const int block = (out_c - oc0) < VX_CONV_HWC_BLOCK
+            ? (out_c - oc0) : VX_CONV_HWC_BLOCK;
+        float acc[VX_CONV_HWC_BLOCK];
+        for (int lane = 0; lane < block; lane++) {
+          acc[lane] = vx_bias_load_f32(bias, bias_is_f16, oc0 + lane);
+        }
+        for (int ic = 0; ic < taps; ic++) {
+          for (int ky = 0; ky < kh; ky++) {
+            const int iy = iy0 + ky * dy;
+            if ((unsigned)iy >= (unsigned)h) continue;
+            for (int kx = 0; kx < kw; kx++) {
+              const int ix = ix0 + kx * dx;
+              if ((unsigned)ix >= (unsigned)w) continue;
+              const float a = src_b[((long)iy * w + ix) * c + ic];
+              const float *ww =
+                  wgt + (((long)ky * kw + kx) * wc + ic) * out_c + oc0;
+              /* `wasm_simd128_polyfill.h` maps these onto native vector
+               * extensions, so the same body vectorizes in both builds. */
+              if (block == VX_CONV_HWC_BLOCK) {
+                const v128_t av = wasm_f32x4_splat(a);
+                wasm_v128_store(acc + 0, wasm_f32x4_add(wasm_v128_load(acc + 0),
+                    wasm_f32x4_mul(av, wasm_v128_load(ww + 0))));
+                wasm_v128_store(acc + 4, wasm_f32x4_add(wasm_v128_load(acc + 4),
+                    wasm_f32x4_mul(av, wasm_v128_load(ww + 4))));
+                wasm_v128_store(acc + 8, wasm_f32x4_add(wasm_v128_load(acc + 8),
+                    wasm_f32x4_mul(av, wasm_v128_load(ww + 8))));
+                wasm_v128_store(acc + 12, wasm_f32x4_add(wasm_v128_load(acc + 12),
+                    wasm_f32x4_mul(av, wasm_v128_load(ww + 12))));
+                continue;
+              }
+              for (int lane = 0; lane < block; lane++) acc[lane] += a * ww[lane];
+            }
+          }
+        }
+        for (int lane = 0; lane < block; lane++) {
+          dst[oc0 + lane] = relu_value(acc[lane], relu);
+        }
+      }
+    }
+  }
+}
+
 static void conv2d_image_f32_impl(const float *in, float *out, const void *wgt, const void *bias,
                                   int weight_is_f16, int bias_is_f16,
                                   int n, int h, int w, int c,
@@ -1410,7 +1579,10 @@ static void conv2d_image_f32_impl(const float *in, float *out, const void *wgt, 
   if (dy <= 0) dy = 1;
   if (dx <= 0) dx = 1;
 
-  const int depthwise = (groups == c && wc == c);
+  /* At c == 1 a dense convolution also looks depthwise, but the depthwise
+   * branch below has no channel parallelism to exploit there and the two weight
+   * layouts coincide, so the dense path owns that case. */
+  const int depthwise = (c > 1 && groups == c && wc == c);
   const int out_c = depthwise ? c * out_or_mult : out_or_mult;
   const int group_out = depthwise ? out_or_mult : out_c / groups;
   const int group_in = depthwise ? 1 : wc;
@@ -1418,6 +1590,14 @@ static void conv2d_image_f32_impl(const float *in, float *out, const void *wgt, 
   for (int b = 0; b < n; b++) {
     const float *src_b = in + (long)b * h * w * c;
     float *dst_b = out + (long)b * out_h * out_w * out_c;
+    /* F16 weights keep the generic path; every shipped FP32 image graph here
+     * is dense and F32, which is the case worth vectorizing. */
+    if (!depthwise && groups == 1 && !weight_is_f16) {
+      conv2d_hwc_dense_f32(src_b, dst_b, (const float *)wgt, bias, bias_is_f16,
+                           h, w, c, kh, kw, wc, out_c, out_h, out_w,
+                           sy, sx, pt, pl, relu, dy, dx);
+      continue;
+    }
     for (int oy = 0; oy < out_h; oy++) {
       int iy0 = oy * sy - pt;
       for (int ox = 0; ox < out_w; ox++) {
@@ -1634,63 +1814,47 @@ void conv1d_f32(uintptr_t in_p, uintptr_t out_p, uintptr_t w_p, uintptr_t b_p,
   const float *bias = (const float *)(uintptr_t)b_p;
   int out_l = (l + 2 * pad - k) / stride + 1;
   int group_out = out_c / groups;
-  int group_in = c / groups;
-  for (int oc = 0; oc < out_c; oc++) {
-    int g = oc / group_out;
-    int in_start = g * group_in;
-    const float *ww_oc = wgt + oc * in_per_group * k;
-    float *dst = out + oc * out_l;
-    if (stride == 1 && groups == 1 && k == 3 && pad == 1 && out_l >= 3) {
-      dst[0] = relu_value(bias ? bias[oc] : 0.0f, 0);
-      float s0 = bias ? bias[oc] : 0.0f;
-      for (int ic = 0; ic < c; ic++) {
-        const float *src = in + ic * l;
-        const float *ww = ww_oc + ic * 3;
-        s0 += src[0] * ww[1] + src[1] * ww[2];
-      }
-      dst[0] = relu_value(s0, relu);
-      int x = 1;
-      for (; x + 4 <= out_l - 1; x += 4) {
-        v128_t sum = wasm_f32x4_splat(bias ? bias[oc] : 0.0f);
-        for (int ic = 0; ic < c; ic++) {
-          const float *src = in + ic * l;
-          const float *ww = ww_oc + ic * 3;
-          v128_t a = wasm_v128_load(src + x - 1);
-          v128_t b = wasm_v128_load(src + x);
-          v128_t ccc = wasm_v128_load(src + x + 1);
-          sum = wasm_f32x4_add(sum, wasm_f32x4_mul(a, wasm_f32x4_splat(ww[0])));
-          sum = wasm_f32x4_add(sum, wasm_f32x4_mul(b, wasm_f32x4_splat(ww[1])));
-          sum = wasm_f32x4_add(sum, wasm_f32x4_mul(ccc, wasm_f32x4_splat(ww[2])));
-        }
-        if (relu) sum = wasm_f32x4_max(sum, wasm_f32x4_splat(0.0f));
-        wasm_v128_store(dst + x, sum);
-      }
-      for (; x < out_l; x++) {
-        float sum = bias ? bias[oc] : 0.0f;
-        for (int ic = 0; ic < c; ic++) {
-          const float *src = in + ic * l;
-          const float *ww = ww_oc + ic * 3;
-          int ix0 = x - 1;
-          if ((unsigned)ix0 < (unsigned)l) sum += src[ix0] * ww[0];
-          if ((unsigned)x < (unsigned)l) sum += src[x] * ww[1];
-          if ((unsigned)(x + 1) < (unsigned)l) sum += src[x + 1] * ww[2];
-        }
-        dst[x] = relu_value(sum, relu);
-      }
-    } else {
-      for (int ox = 0; ox < out_l; ox++) {
-        int ix0 = ox * stride - pad;
-        float sum = bias ? bias[oc] : 0.0f;
+  /* NLC activations [l, c] with WIO weights [k, in_per_group, out_c]: the 1-D
+   * projection of the NHWC/HWIO Conv2D contract. out_c is contiguous in the
+   * weight row and the output row, so the accumulation vectorizes over output
+   * channels and one input value broadcasts across the lanes. */
+  for (int ox = 0; ox < out_l; ox++) {
+    float *dst = out + (size_t)ox * out_c;
+    for (int oc = 0; oc < out_c; oc++) dst[oc] = bias ? bias[oc] : 0.0f;
+    int ix0 = ox * stride - pad;
+    for (int kk = 0; kk < k; kk++) {
+      int ix = ix0 + kk;
+      if ((unsigned)ix >= (unsigned)l) continue;
+      const float *src = in + (size_t)ix * c;
+      const float *w_tap = wgt + (size_t)kk * in_per_group * out_c;
+      for (int g = 0; g < groups; g++) {
+        const float *src_g = src + (size_t)g * in_per_group;
+        float *dst_g = dst + (size_t)g * group_out;
         for (int ci = 0; ci < in_per_group; ci++) {
-          const float *src = in + (in_start + ci) * l;
-          const float *ww = ww_oc + ci * k;
-          for (int kk = 0; kk < k; kk++) {
-            int ix = ix0 + kk;
-            if ((unsigned)ix < (unsigned)l) sum += src[ix] * ww[kk];
+          float value = src_g[ci];
+          const float *w_row = w_tap + (size_t)ci * out_c + (size_t)g * group_out;
+          int oc = 0;
+          v128_t splat = wasm_f32x4_splat(value);
+          for (; oc + 4 <= group_out; oc += 4) {
+            v128_t acc = wasm_v128_load(dst_g + oc);
+            v128_t wv = wasm_v128_load(w_row + oc);
+            wasm_v128_store(dst_g + oc,
+                            wasm_f32x4_add(acc, wasm_f32x4_mul(wv, splat)));
           }
+          for (; oc < group_out; oc++) dst_g[oc] += value * w_row[oc];
         }
-        dst[ox] = relu_value(sum, relu);
       }
+    }
+    if (relu) {
+      int oc = 0;
+      v128_t zero = wasm_f32x4_splat(0.0f);
+      v128_t six = wasm_f32x4_splat(6.0f);
+      for (; oc + 4 <= out_c; oc += 4) {
+        v128_t v = wasm_f32x4_max(wasm_v128_load(dst + oc), zero);
+        if (relu >= 2) v = wasm_f32x4_min(v, six);
+        wasm_v128_store(dst + oc, v);
+      }
+      for (; oc < out_c; oc++) dst[oc] = relu_value(dst[oc], relu);
     }
   }
 }

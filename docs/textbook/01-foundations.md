@@ -251,15 +251,18 @@ model/
 ```
 
 - **`graph.json`** is the graph document: an ordered list of nodes. Each node names its op, its
-  input/output tensors, its parameters, and the exact output shape (pre-computed by the
-  exporter so the engine never has to guess). Here is one real node from TinyStories:
+  input/output tensors, its parameters, and a typed logical output-shape assertion. Symbols name
+  finite constraints in the graph's `dimensions` table, so compilation can prove every legal
+  shape before a request binds one concrete value. Here is one TinyStories node:
 
   ```json
   {
+    "id": "ln1_0",
     "opType": "LayerNorm",
     "inputs":  { "input": "hidden_0", "weight": "h.0.ln_1.weight", "bias": "h.0.ln_1.bias" },
-    "outputs": { "out": "ln1_0" },
-    "outputs_shape": { "out": [1, 256, 64] },
+    "outputs": {
+      "out": { "tensor": "ln1_0", "shape": [1, 256, 64], "dtype": "float32" }
+    },
     "params": { "eps": 1e-05, "d_model": 64 }
   }
   ```
@@ -268,10 +271,11 @@ model/
   [safetensors](https://github.com/huggingface/safetensors) format — a simple, safe, standard
   layout used across the ML world.
 
-🔬 `ts/core/GraphLoader.ts` reads both, builds the `Graph`, and hands it to the engine — with no
-PyTorch, no ONNX Runtime, no dependencies at inference time. You can **export a model trained
-elsewhere** into this graph package, or — as Part II shows — let VolvoxAI **train and write the
-package itself**.
+🔬 `ts/core/ModelLoader.ts` reads both and creates an immutable
+`Model` — with no PyTorch or ONNX Runtime dependency at inference time. A provider
+compiles that snapshot once, and each `ExecutionContext` privately binds and resolves the current
+concrete input shapes. You can **export a model trained elsewhere** into this graph package, or —
+as Part II shows — let VolvoxAI **train and write the package itself**.
 
 > 🔬 **Under the hood: the `.safetensors` byte layout.** The format is deliberately trivial to parse:
 > an **8-byte little-endian length**, then a **JSON header** mapping each tensor name to its
@@ -279,9 +283,10 @@ package itself**.
 > loading — the header is data, not code (that safety is the whole point of the format versus Python
 > pickles). The native engine **`mmap`s** the file and points each tensor's buffer straight at the
 > mapped bytes (`native/src/runtime/safetensors.c`), so a weight isn't copied into RAM until it's
-> touched; the browser reads it via `ts/core/Safetensors.ts`. And because `graph.json` already records
-> every `outputs_shape`, loading is one linear pass with **no shape inference** — the engine never has
-> to reason about shapes at run time.
+> touched; the browser reads it via `ts/core/Safetensors.ts`. `graph.json` stores bounded logical
+> shapes and output assertions. Compilation proves the complete symbolic domain once; request-time
+> resolution substitutes one checked binding and caches its concrete plan rather than trusting a
+> precomputed maximum shape.
 
 ---
 
@@ -298,8 +303,9 @@ package itself**.
 
 ```mermaid
 flowchart TD
-    G[Graph + weights] --> R[VolvoxAI.createRuntime]
-    R --> SEL{Model.compile<br/>applies backend policy}
+    G[Graph + weights] --> S[Model]
+    R[VolvoxAI.createRuntime] --> SEL{Runtime.compile snapshot<br/>applies backend policy}
+    S --> SEL
     SEL -->|browser NPU/GPU| T1[Tier 1 · WebNN]
     SEL -->|browser GPU| T2[Tier 2 · WebGPU<br/>WGSL compute shaders]
     SEL -->|any CPU, fast| T3[Tier 3 · WASM SIMD<br/>compiled C kernels]
@@ -319,8 +325,9 @@ flowchart TD
   **on-device / edge AI**, and it's the subject of Chapter 9.
 
 > 🔬 **Under the hood: how a tier gets picked, and why answers still match.**
-> `VolvoxAI.createRuntime({ backends })` initializes the selected providers. `Model.compile()`
-> applies a preferred or required policy and records every candidate outcome before execution.
+> `VolvoxAI.createRuntime({ backends })` initializes the selected providers.
+> `Runtime.compile(snapshot, policy)` applies a preferred or required policy and records every
+> candidate outcome before execution.
 > Execution failure never switches provider. Every tier is free to differ in *speed* but not in
 > *answer* because the pure-JS CPU implementation is the **reference**, and parity checks every other
 > tier — and the native providers of Chapter 9 — against it within a tight tolerance. "Same

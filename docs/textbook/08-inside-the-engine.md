@@ -33,9 +33,10 @@ binary). They differ only in **who does the arithmetic** and **where the tensors
 
 ```mermaid
 flowchart TD
-    G["graph.json + safetensors"] --> R["VolvoxAI.createRuntime()"]
-    R --> M["Runtime.loadModel() / createModel()"]
-    M --> C["Model.compile({ backend: policy })"]
+    G["graph.json + safetensors"] --> L["ModelLoader.load()"]
+    L --> S["Model.capture()"]
+    R["VolvoxAI.createRuntime()"] --> C["Runtime.compile(snapshot, { backend: policy })"]
+    S --> C
     C --> T1["WebNN provider<br/>browser ML API → NPU/GPU/CPU"]
     C --> T2["WebGPU provider<br/>compiled GPU route"]
     C --> T3["WASM provider<br/>compiled C kernels over linear memory"]

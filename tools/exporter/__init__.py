@@ -14,6 +14,7 @@ from .capabilities import (
 )
 from .errors import Diagnostic, ExporterError, UsageError
 from .ir import (
+    attach_public_dimension_bounds,
     AffineQuantization,
     GraphIR,
     IRDialect,
@@ -23,6 +24,11 @@ from .ir import (
     TensorDataRef,
     TensorValue,
     ValuePort,
+)
+from .shape_system import (
+    DimensionConstraint,
+    ShapeEnvironment,
+    TensorShapeSpec,
 )
 from .report import ExportReport
 from .typed_ptq import (
@@ -46,10 +52,12 @@ from .typed_ptq import (
     plan_runtime_ptq,
     quantize_runtime_ptq,
     required_ptq_observations,
+    validate_named_profile_range_counts,
 )
 
 __all__ = [
     "AffineQuantization",
+    "attach_public_dimension_bounds",
     "ActivationQuantizationPlan",
     "BroadcastActivationPTQPlan",
     "ByteNodePTQPlan",
@@ -59,6 +67,7 @@ __all__ = [
     "ConvNodePTQPlan",
     "DenseNodePTQPlan",
     "Diagnostic",
+    "DimensionConstraint",
     "ExporterError",
     "EmbeddingNodePTQPlan",
     "ExportReport",
@@ -73,10 +82,12 @@ __all__ = [
     "Provenance",
     "TARGETS",
     "TensorValue",
+    "TensorShapeSpec",
     "TensorDataRef",
     "TensorObservation",
     "UsageError",
     "ValuePort",
+    "ShapeEnvironment",
     "WeightQuantizationPlan",
     "calibration_profile_from_ranges",
     "classify_package",
@@ -86,6 +97,7 @@ __all__ = [
     "plan_runtime_ptq",
     "quantize_runtime_ptq",
     "required_ptq_observations",
+    "validate_named_profile_range_counts",
     "validate_graph",
     "validate_runtime_descriptors",
 ]

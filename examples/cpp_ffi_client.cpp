@@ -67,6 +67,19 @@ static std::string as_string(const SynurangLiteBytes& value) {
     return std::string(reinterpret_cast<const char*>(value.data), value.len);
 }
 
+static size_t runtime_dtype_size(VolvoxaiRuntimeDataType dtype) {
+    switch (dtype) {
+        case VOLVOXAI_RUNTIME_DATA_TYPE_DATA_TYPE_U8:
+        case VOLVOXAI_RUNTIME_DATA_TYPE_DATA_TYPE_I8:
+            return 1;
+        case VOLVOXAI_RUNTIME_DATA_TYPE_DATA_TYPE_I32:
+        case VOLVOXAI_RUNTIME_DATA_TYPE_DATA_TYPE_F32:
+            return 4;
+        default:
+            throw std::runtime_error("input uses an unsupported runtime dtype");
+    }
+}
+
 static bool read_varint(const uint8_t* data,
                         size_t size,
                         size_t* position,
@@ -373,52 +386,68 @@ int main(int argc, char** argv) {
         const std::string context_id = as_string(context.field_context_id);
         std::cout << "context: " << context_id << "\n";
 
-        for (size_t index = 0; index < context.field_inputs.len; ++index) {
-            const VolvoxaiRuntimeTensorInfo& info = context.field_inputs.data[index];
-            const std::string name = as_string(info.field_name);
-            std::vector<uint8_t> zeroes(static_cast<size_t>(info.field_byte_size), 0);
-
-            VolvoxaiRuntimeSetInputRequest set_input;
-            volvoxai_runtime_set_input_request_init(&set_input);
-            assign_string(set_input._allocator, &set_input.field_context_id, context_id,
-                          "assign context_id");
-            set_input.field_input = allocate_message<VolvoxaiRuntimeTensor>(
-                set_input._allocator, volvoxai_runtime_tensor_init_with_allocator);
-            assign_string(set_input._allocator, &set_input.field_input->field_name, name,
-                          "assign input name");
-            set_input.field_input->field_dtype = info.field_dtype;
-            set_input.field_input->field_location =
-                VOLVOXAI_RUNTIME_MEMORY_LOCATION_MEMORY_LOCATION_HOST;
-            if (info.field_shape.len != 0) {
-                set_input.field_input->field_shape.data =
-                    static_cast<int64_t*>(set_input._allocator->allocate(
-                        set_input._allocator->context,
-                        info.field_shape.len * sizeof(int64_t)));
-                if (!set_input.field_input->field_shape.data) {
-                    throw std::runtime_error("input shape allocation failed");
-                }
-                std::memcpy(set_input.field_input->field_shape.data,
-                            info.field_shape.data,
-                            info.field_shape.len * sizeof(int64_t));
-                set_input.field_input->field_shape.len = info.field_shape.len;
-                set_input.field_input->field_shape.cap = info.field_shape.len;
-            }
-            assign_bytes(set_input._allocator, &set_input.field_input->field_data,
-                         zeroes.data(), zeroes.size(), "assign input data");
-            auto report = service.call(
-                "/volvoxai.runtime.RuntimeService/SetInput", set_input,
-                volvoxai_runtime_set_input_request_encode,
-                volvoxai_runtime_operation_report_init,
-                volvoxai_runtime_operation_report_decode);
-            volvoxai_runtime_operation_report_free(&report);
-            volvoxai_runtime_set_input_request_free(&set_input);
-            std::cout << "  input " << name << ": " << zeroes.size() << " bytes\n";
-        }
-
         VolvoxaiRuntimeExecuteRequest execute;
         volvoxai_runtime_execute_request_init(&execute);
         assign_string(execute._allocator, &execute.field_context_id, context_id,
                       "assign context_id");
+        if (context.field_inputs.len != 0) {
+            execute.field_inputs.data =
+                static_cast<VolvoxaiRuntimeTensor*>(execute._allocator->allocate(
+                    execute._allocator->context,
+                    context.field_inputs.len * sizeof(VolvoxaiRuntimeTensor)));
+            if (!execute.field_inputs.data) {
+                throw std::runtime_error("input batch allocation failed");
+            }
+            std::memset(execute.field_inputs.data, 0,
+                        context.field_inputs.len * sizeof(VolvoxaiRuntimeTensor));
+            execute.field_inputs.len = context.field_inputs.len;
+            execute.field_inputs.cap = context.field_inputs.len;
+        }
+        for (size_t index = 0; index < context.field_inputs.len; ++index) {
+            const VolvoxaiRuntimeTensorSpec& spec = context.field_inputs.data[index];
+            VolvoxaiRuntimeTensor& input = execute.field_inputs.data[index];
+            volvoxai_runtime_tensor_init_with_allocator(&input, execute._allocator);
+            const std::string name = as_string(spec.field_name);
+            assign_string(execute._allocator, &input.field_name, name,
+                          "assign input name");
+            input.field_dtype = spec.field_dtype;
+            input.field_location =
+                VOLVOXAI_RUNTIME_MEMORY_LOCATION_MEMORY_LOCATION_HOST;
+            size_t elements = 1;
+            if (spec.field_dimensions.len != 0) {
+                input.field_shape.data =
+                    static_cast<int64_t*>(execute._allocator->allocate(
+                        execute._allocator->context,
+                        spec.field_dimensions.len * sizeof(int64_t)));
+                if (!input.field_shape.data) {
+                    throw std::runtime_error("input shape allocation failed");
+                }
+                input.field_shape.len = spec.field_dimensions.len;
+                input.field_shape.cap = spec.field_dimensions.len;
+            }
+            for (size_t axis = 0; axis < spec.field_dimensions.len; ++axis) {
+                const VolvoxaiRuntimeDimensionConstraint& dimension =
+                    spec.field_dimensions.data[axis];
+                const int64_t extent = dimension.field_min;
+                if (extent <= 0 || extent > dimension.field_max ||
+                    dimension.field_multiple_of <= 0 ||
+                    extent % dimension.field_multiple_of != 0 ||
+                    static_cast<uint64_t>(extent) >
+                        std::numeric_limits<size_t>::max() / elements) {
+                    throw std::runtime_error("input has an invalid logical dimension");
+                }
+                input.field_shape.data[axis] = extent;
+                elements *= static_cast<size_t>(extent);
+            }
+            const size_t element_size = runtime_dtype_size(spec.field_dtype);
+            if (element_size > std::numeric_limits<size_t>::max() / elements) {
+                throw std::runtime_error("input byte size overflows size_t");
+            }
+            std::vector<uint8_t> zeroes(elements * element_size, 0);
+            assign_bytes(execute._allocator, &input.field_data,
+                         zeroes.data(), zeroes.size(), "assign input data");
+            std::cout << "  input " << name << ": " << zeroes.size() << " bytes\n";
+        }
         auto result = service.call(
             "/volvoxai.runtime.RuntimeService/Execute", execute,
             volvoxai_runtime_execute_request_encode,

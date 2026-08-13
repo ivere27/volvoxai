@@ -103,12 +103,14 @@ SGD는 동작하지만, 모든 가중치·모든 방향에 같은 무딘 걸음 
 🔧 하나의 스텝이 4–5장의 모든 걸 엮습니다: 순전파 → 손실 → 역전파 → 갱신.
 
 ```javascript
-const trainer = await VolvoxAI.createTrainer(model, {
+const trainer = await VolvoxAI.createTrainer(sourceSnapshot, {
   backend: 'cpu',
 });
 
 const step = await trainer.trainStep({
-  inputs,
+  inputs: {
+    x: { data: inputValues, shape: [batchSize, featureWidth] },
+  },
   logitsTensor: 'logits',
   targets,
   ignoreIndex: -1,
@@ -121,8 +123,8 @@ const step = await trainer.trainStep({
   },
 });
 
-// 추론용으로 컴파일하기 전에 비공개 작업 리비전을 게시합니다.
-await trainer.commit();
+// 비공개 작업 리비전을 새 불변 스냅샷으로 캡처합니다.
+const successorSnapshot = await trainer.commit();
 ```
 
 주목할 두 설계 선택:
@@ -134,9 +136,10 @@ await trainer.commit();
   재사용하고, 교차 엔트로피 손실을 학습 때 그 `logits` 출력에 붙입니다. 별도의 "학습 모델" 은
   없습니다.
 
-`trainStep()` 은 Trainer의 비공개 작업 리비전만 바꿉니다. 암묵적 게시는 없습니다.
-`commit()` 이 이를 원자적으로 게시하고, `rollback()` 은 게시하지 않은 작업을 버린 뒤 마지막으로
-커밋된 기준 상태를 복원합니다.
+모든 입력은 구체적인 shape를 함께 전달합니다. 하나의 Trainer는 소스 스냅샷의 제한된 심볼릭 도메인
+안에서 배치/시퀀스 크기를 바꿀 수 있습니다. `trainStep()` 은 Trainer의 비공개 작업 리비전만
+바꿉니다. `commit()` 은 소스를 바꾸지 않고 새 불변 후속 스냅샷을 반환합니다. `rollback()` 은
+커밋하지 않은 작업을 버리고 마지막 기준 상태를 복원합니다.
 
 ## 5.4 안정 유지: 기울기 클리핑
 
@@ -225,7 +228,7 @@ dropout 켠 채 평가하거나 검증셋으로 갱신 — 전형적 버그입�
     학습 데이터의 각 배치마다:                # 학습 모드
         loss = trainer.trainStep(...)         # 순전파→손실→역전파→AdamW
         learning_rate = cosine_schedule(step) # 실행 동안 LR을 서서히 낮춤
-    trainer.commit()                          # 이 비공개 리비전을 게시
+    successor = trainer.commit()              # 새 불변 리비전으로 캡처
     검증 데이터의 각 배치마다:                # 평가 모드, 갱신 없음
         정확 일치 정확도 측정
     검증이 개선되면:  "best.checkpoint" 저장
@@ -241,9 +244,9 @@ dropout 켠 채 평가하거나 검증셋으로 갱신 — 전형적 버그입�
   사용자에게 중요한 과제 지표를 별도로 계산합니다.
 - **체크포인트.** `await trainer.exportCheckpoint()` 는 비공개 작업 리비전의 가중치, AdamW 모멘트,
   파라미터별 스텝, 학습 스텝, 애플리케이션 메타데이터를 저장합니다.
-  `importModelCheckpoint(checkpoint).graph` 로 Model을 만든 뒤 `checkpoint` 를
-  `VolvoxAI.createTrainer(model, options)` 에 넘겨 재개합니다. 굴러가는 `last` 와 지금까지의 최선
-  `best` 정책은 애플리케이션이 소유합니다.
+  `const { snapshot } = importModelCheckpoint(checkpoint)` 로 불변 스냅샷을 가져온 뒤 그 스냅샷과
+  `checkpoint` 를 `VolvoxAI.createTrainer(snapshot, options)` 에 넘기면 최적화기 상태까지 정확히
+  재개합니다. 굴러가는 `last` 와 지금까지의 최선 `best` 정책은 애플리케이션이 소유합니다.
 
 > 🔬 **뜯어보기: 코사인 곡선, 그리고 왜 "best" ≠ "last".** 코사인 스케줄은 짧은 **예열** 동안 LR을 올린
 > 뒤 `lr = ½·lr_max·(1 + cos(π · t / T))` 를 따라 지평선 `T` 까지 ~0으로 내립니다 — 초반엔 큰 걸음으로
@@ -269,9 +272,9 @@ dropout 켠 채 평가하거나 검증셋으로 갱신 — 전형적 버그입�
 ```
 
 🔬 rank 8은 전체 가중치 행렬 옆에서 미미해서, 학습 가능한 집합이 자릿수 단위로 줄어듭니다 — 바로
-`trainableTensors` 허용 목록(§5.3)이 표현하는 것입니다. `ModelBuilder.loraLinear()` 는
-명시적인 A/B Graph 가중치와 그 이름을 만들고, 일반 `Trainer.trainStep()` 이 그 이름만 갱신합니다.
-배포 정책은 다음 아티팩트를 내보낼 수 있습니다:
+`trainableTensors` 허용 목록(§5.3)이 표현하는 것입니다. 동적 v1은 제한된 논리 그래프에 A/B
+가중치, scale, MatMul 노드, Add를 명시적으로 표현하며, 일반 `Trainer.trainStep()` 이 A/B 이름만
+갱신합니다. 배포 정책은 다음 아티팩트를 내보낼 수 있습니다:
 
 - **`lora.safetensors`** — 학습된 델타만, 작고 공유 가능.
 - **`lora_base/`** — 손대지 않은 베이스 패키지(인라인 LoRA 텐서 0).

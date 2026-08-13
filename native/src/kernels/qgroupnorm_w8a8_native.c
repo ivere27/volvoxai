@@ -38,7 +38,7 @@ extern int qgroupnorm_i8u8(const void* input, const float* weight,
 
 enum {
     /* Below this size, pool wake-up is normally more expensive than the
-     * scalar kernel.  TinyReceipt's encoder GroupNorm calls are all larger. */
+     * scalar kernel.  Large image-encoder GroupNorm calls exceed it. */
     VX_QGROUPNORM_PARALLEL_ELEMENTS = 16u * 1024u,
 };
 
@@ -204,7 +204,7 @@ static VX_QGROUPNORM_TARGET_AVX2 __m128i vx_qgroupnorm_quantize4(
 /* Four groups occupy four independent SIMD lanes.  For every lane, the
  * spatial/local traversal and each F32 addition occur in the same order as
  * the portable group-major kernel; only mutually independent groups execute
- * together.  This is especially effective for TinyReceipt's C/G=3,6,10
+ * together.  This is especially effective for narrow C/G=3,6,10
  * channels-last GroupNorm shapes. */
 static VX_QGROUPNORM_TARGET_AVX2 void vx_qgroupnorm_group4_worker(
         void* opaque, int begin, int end) {

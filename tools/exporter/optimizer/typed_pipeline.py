@@ -12,10 +12,13 @@ from typing import Any, Iterable, Mapping, MutableMapping, Sequence
 
 import numpy as np
 
-from ..capabilities import refresh_package_class
 from ..ir import GraphIR, IRDialect
-from ..pipeline import PipelineReport, VerifiedPipeline
-from ..runtime_ir import export_runtime_package, import_runtime_package
+from ..pipeline import ConcretePassPolicy, PipelineReport, VerifiedPipeline
+from ..runtime_ir import (
+    export_runtime_package,
+    import_runtime_package,
+    prove_dynamic_quantized_runtime_domain,
+)
 from ..typed_ptq import CalibrationProfile, PTQConfig
 from .candidate import RewritePolicy, RewriteSemantics
 from .registry_resolver import (
@@ -35,13 +38,20 @@ def default_runtime_pipeline(
     monotonic_argmax_inputs: Iterable[str] = (),
     input_specializations: Mapping[str, Any] | None = None,
     input_hoistings: Iterable[InputHoistingSpec] = (),
+    causal_mask_inputs: Iterable[str] = (),
     tensor_data: MutableMapping[str, Any] | None = None,
     allow_static_qdq_compute_numerical_migration: bool = False,
+    allow_quantized_bias_folding_numerical_migration: bool = False,
+    allow_static_qdq_qbatch_matmul_numerical_migration: bool = False,
+    allow_static_qdq_groupnorm_silu_numerical_migration: bool = False,
     allow_float_attention_numerical_migration: bool = False,
     allow_quantized_attention_numerical_migration: bool = False,
+    allow_silu_numerical_migration: bool = False,
     enable_static_qdq_layout_optimization: bool = True,
+    enable_exact_common_subexpression_elimination: bool = False,
     enable_fp32_pre_ptq_optimization: bool = False,
     target_environment: TargetEnvironment | None = None,
+    shape_profile: Mapping[str, int] | None = None,
 ) -> VerifiedPipeline:
     """Resolve the generated RuntimeIR recipe for explicit caller facts.
 
@@ -53,8 +63,25 @@ def default_runtime_pipeline(
     replacing closed DQ -> float compute -> Q islands with byte-domain Q*
     kernels.  The latter preserves existing affines and initializer payloads,
     but is not promised bit-exact across backend evaluation orders.
+    ``allow_quantized_bias_folding_numerical_migration=True`` independently
+    selects only immutable F32 post-bias folding into an existing QLinear,
+    QMatMul, or QGemm accumulator. It does not select static-QDQ normalization,
+    activation, or elementwise compute migration.
+    ``allow_static_qdq_qbatch_matmul_numerical_migration=True`` selects only
+    the strict no-broadcast dynamic-operand BatchMatMul migration; it does not
+    opt into the broader static-QDQ compute pass.
+    ``allow_static_qdq_groupnorm_silu_numerical_migration=True`` selects only
+    closed GroupNorm/layout/SiLU islands whose existing scalar endpoint
+    affines can be reused. It does not select LayerNorm or the broad static-QDQ
+    migration.
     Float and producer-quantized attention fusion have separate numerical-
     migration opt-ins and atomically emit runnable CrossSDPA/QSDPA nodes.
+    ``allow_silu_numerical_migration=True`` selects only canonical F32
+    ``x * sigmoid(x)`` to ``SiLU`` fusion; it does not select the unrelated
+    bias, grouped-projection, sequence-layout, or other FP32 pre-PTQ passes.
+    ``enable_exact_common_subexpression_elimination=True`` shares only proved
+    byte-identical ``Reshape`` and ``Expand`` computations and is kept opt-in
+    so existing exporters retain byte-for-byte graph structure by default.
     ``enable_fp32_pre_ptq_optimization=True`` selects the separate generic
     FP32 pre-PTQ mode; independent ABI and float-attention features compose
     through generated conditional group overlays.
@@ -70,21 +97,41 @@ def default_runtime_pipeline(
         features.add("input-specialization")
     if hoisting_specs:
         features.add("input-hoisting")
+    causal_inputs = frozenset(causal_mask_inputs)
+    if causal_inputs:
+        features.add("declared-input-pruning")
     if allow_static_qdq_compute_numerical_migration:
         features.add("static-qdq-compute-migration")
+    if allow_quantized_bias_folding_numerical_migration:
+        features.add("quantized-bias-folding")
+    if allow_static_qdq_qbatch_matmul_numerical_migration:
+        features.add("static-qdq-qbatch-matmul-migration")
+    if allow_static_qdq_groupnorm_silu_numerical_migration:
+        features.add("static-qdq-groupnorm-silu-migration")
     if allow_float_attention_numerical_migration:
         features.add("float-attention-fusion")
     if allow_quantized_attention_numerical_migration:
         features.add("quantized-attention-fusion")
+    if allow_silu_numerical_migration and not enable_fp32_pre_ptq_optimization:
+        # The full FP32 pre-PTQ recipe already owns this pass. Treat the narrow
+        # opt-in as redundant when that broader recipe is explicitly selected,
+        # rather than selecting the pass twice.
+        features.add("silu-fusion")
     if not enable_static_qdq_layout_optimization:
         features.add("defer-static-qdq-layout")
+    if enable_exact_common_subexpression_elimination:
+        features.add("exact-common-subexpression")
     if enable_fp32_pre_ptq_optimization:
         features.add("fp32-pre-ptq")
 
     allow_numerical_migration = (
         allow_static_qdq_compute_numerical_migration
+        or allow_quantized_bias_folding_numerical_migration
+        or allow_static_qdq_qbatch_matmul_numerical_migration
+        or allow_static_qdq_groupnorm_silu_numerical_migration
         or allow_float_attention_numerical_migration
         or allow_quantized_attention_numerical_migration
+        or allow_silu_numerical_migration
         or enable_fp32_pre_ptq_optimization
     )
     policy_factory = (
@@ -99,6 +146,7 @@ def default_runtime_pipeline(
             monotonic_argmax_inputs=monotonic_argmax_inputs,
             input_specializations=input_bindings,
             input_hoistings=hoisting_specs,
+            causal_mask_inputs=causal_inputs,
         ),
         target=(
             default_target_environment()
@@ -106,12 +154,25 @@ def default_runtime_pipeline(
             else target_environment
         ),
         rewrite_policy=policy_factory(
+            # Declaring a prunable input is itself a caller-owned ABI contract:
+            # the pass removes it once a fusion has absorbed its meaning.
             allow_abi_change=bool(
                 specializations or input_bindings or hoisting_specs
+                or causal_inputs
             ),
         ),
         allow_calibration=False,
         selection_features=frozenset(features),
+        shape_profile=shape_profile,
+        concrete_pass_policy=(
+            ConcretePassPolicy.FAIL
+            if (
+                input_bindings
+                or hoisting_specs
+                or allow_numerical_migration
+            )
+            else ConcretePassPolicy.SKIP
+        ),
     )
     return resolve_runtime_pipeline(request)
 
@@ -120,6 +181,7 @@ def runtime_ptq_authoring_pipeline(
     *,
     tensor_data: MutableMapping[str, Any],
     calibration: CalibrationProfile,
+    shape_profile: Mapping[str, int] | None,
     selected_nodes: Sequence[str] | None = None,
     config: PTQConfig = PTQConfig(),
     target_environment: TargetEnvironment | None = None,
@@ -151,6 +213,12 @@ def runtime_ptq_authoring_pipeline(
         })),
         allow_calibration=True,
         selection_features=frozenset({"ptq-authoring"}),
+        shape_profile=shape_profile,
+        concrete_pass_policy=(
+            ConcretePassPolicy.FAIL
+            if shape_profile is not None
+            else ConcretePassPolicy.SKIP
+        ),
     )
     return resolve_runtime_pipeline(request)
 
@@ -192,11 +260,17 @@ def optimize_runtime_package(
     input_specializations: Mapping[str, Any] | None = None,
     input_hoistings: Iterable[InputHoistingSpec] = (),
     allow_static_qdq_compute_numerical_migration: bool = False,
+    allow_quantized_bias_folding_numerical_migration: bool = False,
+    allow_static_qdq_qbatch_matmul_numerical_migration: bool = False,
+    allow_static_qdq_groupnorm_silu_numerical_migration: bool = False,
     allow_float_attention_numerical_migration: bool = False,
     allow_quantized_attention_numerical_migration: bool = False,
+    allow_silu_numerical_migration: bool = False,
     enable_static_qdq_layout_optimization: bool = True,
+    enable_exact_common_subexpression_elimination: bool = False,
     enable_fp32_pre_ptq_optimization: bool = False,
     target_environment: TargetEnvironment | None = None,
+    shape_profile: Mapping[str, int] | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any], PipelineReport]:
     """Verify, optimize, and re-emit one current v1 package in memory.
 
@@ -209,8 +283,15 @@ def optimize_runtime_package(
     # private so a failed verified pipeline cannot partially alter its caller's
     # tensor inventory.
     working_tensors = dict(tensors)
+    bounded_domain_proof = prove_dynamic_quantized_runtime_domain(
+        document,
+        working_tensors,
+    )
     graph = import_runtime_package(
-        document, working_tensors, source_name=source_name,
+        document,
+        working_tensors,
+        source_name=source_name,
+        bounded_domain_proof=bounded_domain_proof,
     )
     report = optimize_runtime_graph(
         graph,
@@ -221,24 +302,39 @@ def optimize_runtime_package(
         allow_static_qdq_compute_numerical_migration=(
             allow_static_qdq_compute_numerical_migration
         ),
+        allow_quantized_bias_folding_numerical_migration=(
+            allow_quantized_bias_folding_numerical_migration
+        ),
+        allow_static_qdq_qbatch_matmul_numerical_migration=(
+            allow_static_qdq_qbatch_matmul_numerical_migration
+        ),
+        allow_static_qdq_groupnorm_silu_numerical_migration=(
+            allow_static_qdq_groupnorm_silu_numerical_migration
+        ),
         allow_float_attention_numerical_migration=(
             allow_float_attention_numerical_migration
         ),
         allow_quantized_attention_numerical_migration=(
             allow_quantized_attention_numerical_migration
         ),
+        allow_silu_numerical_migration=allow_silu_numerical_migration,
         enable_static_qdq_layout_optimization=(
             enable_static_qdq_layout_optimization
         ),
+        enable_exact_common_subexpression_elimination=(
+            enable_exact_common_subexpression_elimination
+        ),
         enable_fp32_pre_ptq_optimization=enable_fp32_pre_ptq_optimization,
         target_environment=target_environment,
+        shape_profile=shape_profile,
     )
     optimized_document, optimized_tensors = export_runtime_package(
-        graph, working_tensors,
+        graph,
+        working_tensors,
+        shape_profile=(
+            shape_profile if graph.shape_environment.dimensions else None
+        ),
     )
-    source = optimized_document.get("source")
-    if isinstance(source, dict) and "package_class" in source:
-        refresh_package_class(optimized_document, optimized_tensors)
     return optimized_document, optimized_tensors, report
 
 
@@ -250,11 +346,17 @@ def optimize_runtime_graph(
     input_specializations: Mapping[str, Any] | None = None,
     input_hoistings: Iterable[InputHoistingSpec] = (),
     allow_static_qdq_compute_numerical_migration: bool = False,
+    allow_quantized_bias_folding_numerical_migration: bool = False,
+    allow_static_qdq_qbatch_matmul_numerical_migration: bool = False,
+    allow_static_qdq_groupnorm_silu_numerical_migration: bool = False,
     allow_float_attention_numerical_migration: bool = False,
     allow_quantized_attention_numerical_migration: bool = False,
+    allow_silu_numerical_migration: bool = False,
     enable_static_qdq_layout_optimization: bool = True,
+    enable_exact_common_subexpression_elimination: bool = False,
     enable_fp32_pre_ptq_optimization: bool = False,
     target_environment: TargetEnvironment | None = None,
+    shape_profile: Mapping[str, int] | None = None,
 ) -> PipelineReport:
     """Optimize an already-imported RuntimeIR graph transactionally.
 
@@ -285,17 +387,31 @@ def optimize_runtime_graph(
             allow_static_qdq_compute_numerical_migration=(
                 allow_static_qdq_compute_numerical_migration
             ),
+            allow_quantized_bias_folding_numerical_migration=(
+                allow_quantized_bias_folding_numerical_migration
+            ),
+            allow_static_qdq_qbatch_matmul_numerical_migration=(
+                allow_static_qdq_qbatch_matmul_numerical_migration
+            ),
+            allow_static_qdq_groupnorm_silu_numerical_migration=(
+                allow_static_qdq_groupnorm_silu_numerical_migration
+            ),
             allow_float_attention_numerical_migration=(
                 allow_float_attention_numerical_migration
             ),
             allow_quantized_attention_numerical_migration=(
                 allow_quantized_attention_numerical_migration
             ),
+            allow_silu_numerical_migration=allow_silu_numerical_migration,
             enable_static_qdq_layout_optimization=(
                 enable_static_qdq_layout_optimization
             ),
+            enable_exact_common_subexpression_elimination=(
+                enable_exact_common_subexpression_elimination
+            ),
             enable_fp32_pre_ptq_optimization=enable_fp32_pre_ptq_optimization,
             target_environment=target_environment,
+            shape_profile=shape_profile,
         ).run(graph)
     except Exception:
         graph.restore(graph_snapshot)
@@ -309,6 +425,7 @@ def author_runtime_ptq_package(
     tensors: Mapping[str, Any],
     calibration: CalibrationProfile,
     *,
+    shape_profile: Mapping[str, int],
     source_name: str = "graph.json",
     selected_nodes: Sequence[str] | None = None,
     config: PTQConfig = PTQConfig(),
@@ -331,6 +448,7 @@ def author_runtime_ptq_package(
         graph,
         working_tensors,
         calibration,
+        shape_profile=shape_profile,
         selected_nodes=selected_nodes,
         config=config,
         target_environment=target_environment,
@@ -339,9 +457,6 @@ def author_runtime_ptq_package(
         graph,
         working_tensors,
     )
-    source = authored_document.get("source")
-    if isinstance(source, dict) and "package_class" in source:
-        refresh_package_class(authored_document, authored_tensors)
     return authored_document, authored_tensors, report
 
 
@@ -350,6 +465,7 @@ def author_runtime_ptq_graph(
     tensors: MutableMapping[str, Any],
     calibration: CalibrationProfile,
     *,
+    shape_profile: Mapping[str, int] | None,
     selected_nodes: Sequence[str] | None = None,
     config: PTQConfig = PTQConfig(),
     target_environment: TargetEnvironment | None = None,
@@ -375,6 +491,7 @@ def author_runtime_ptq_graph(
         return runtime_ptq_authoring_pipeline(
             tensor_data=tensors,
             calibration=calibration,
+            shape_profile=shape_profile,
             selected_nodes=selected_nodes,
             config=config,
             target_environment=target_environment,
@@ -400,6 +517,7 @@ def serialize_pipeline_report(report: PipelineReport) -> dict[str, Any]:
                 "output_dialect": run.output_dialect.value,
                 "before": run.before,
                 "after": run.after,
+                **({"skipped": True} if run.skipped else {}),
                 **({"notes": list(run.notes)} if run.notes else {}),
                 **({"metrics": dict(run.metrics)} if run.metrics else {}),
                 **(

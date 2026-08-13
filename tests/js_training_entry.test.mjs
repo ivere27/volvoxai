@@ -1,81 +1,129 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
-import * as core from '../ts/index.js';
+import * as inference from '../ts/index.js';
 import * as full from '../ts/full.js';
 import { Trainer as StrictWasmTrainer } from '../ts/training/WasmTrainer.js';
+import {
+  dropoutContext,
+  dropoutMultiplier,
+} from '../ts/ops/dropout.js';
 
-test('training classes live in the full entry rather than the inference entry', () => {
-  for (const implementationName of [
+const INITIAL_PARAMETER = Float32Array.of(0.2, -0.4, 0.1, 0.3);
+
+function makeTrainingSnapshot({ minimum = 1, maximum = 4, dropout = false } = {}) {
+  const projectedName = dropout ? 'projected' : 'logits';
+  const nodes = [{
+    id: 'projection',
+    opType: 'MatMul',
+    inputs: { input: 'x', weight: 'parameter' },
+    outputs: {
+      out: { tensor: projectedName, dtype: 'float32', shape: ['B', 2] },
+    },
+    params: {},
+  }];
+  if (dropout) {
+    nodes.push({
+      id: 'dropout',
+      opType: 'Dropout',
+      inputs: { input: projectedName },
+      outputs: {
+        out: { tensor: 'logits', dtype: 'float32', shape: ['B', 2] },
+      },
+      params: { p: 0.5, seed: 9 },
+    });
+  }
+  const builder = new full.ModelBuilder({
+    dimensions: { B: { min: minimum, max: maximum } },
+    inputs: { x: { dtype: 'float32', shape: ['B', 2] } },
+    weights: [{ name: 'parameter', dtype: 'float32', shape: [2, 2] }],
+    nodes,
+    outputs: ['logits'],
+  });
+  return full.Model.capture({
+    graph: builder.snapshot(),
+    weights: {
+      parameter: {
+        name: 'parameter',
+        dtype: 'float32',
+        shape: [2, 2],
+        data: INITIAL_PARAMETER,
+      },
+    },
+  });
+}
+
+function shapedBatch(batchSize) {
+  const values = new Float32Array(batchSize * 2);
+  for (let index = 0; index < values.length; index++) {
+    values[index] = Math.fround(((index * 3) % 11 - 5) / 7);
+  }
+  return {
+    inputs: { x: { data: values, shape: [batchSize, 2] } },
+    targets: Array.from({ length: batchSize }, (_, index) => index % 2),
+  };
+}
+
+function stepOptions(batchSize, overrides = {}) {
+  return {
+    ...shapedBatch(batchSize),
+    trainableTensors: ['parameter'],
+    updateMode: 'sgd',
+    optimizer: { learningRate: 0.05 },
+    ...overrides,
+  };
+}
+
+function closeNumber(actual, expected, tolerance = 1e-6) {
+  assert.ok(
+    Math.abs(actual - expected) <= tolerance * (1 + Math.abs(actual) + Math.abs(expected)),
+    `${actual} != ${expected}`,
+  );
+}
+
+function closeArray(actual, expected, tolerance = 1e-6) {
+  assert.equal(actual.length, expected.length);
+  for (let index = 0; index < actual.length; index++) {
+    closeNumber(actual[index], expected[index], tolerance);
+  }
+}
+
+test('the v1 entries expose logical authoring while concrete/training internals stay private', () => {
+  for (const name of [
+    'RuntimeGraph',
+    'Tensor',
+    'RuntimeGraphBuilder',
+    'createModel',
     'CPUAutograd',
     'WebGPUAutograd',
     'WasmAutograd',
     'WasmTrainer',
-    'WasmQuantizedLoRATrainer',
-    'WasmPTQ',
-    'WasmPTQObserver',
-    'createWasmPTQ',
-    'TrainingModelBuilder',
     'TrainingGraph',
+    'TrainingModelBuilder',
     'ensureTrainingGraphState',
     'applyTrainingTensorUpdate',
     'accumulateGradients',
     'resolveTrainingOptimizer',
-    'normalizeCrossEntropyLosses',
-    'crossEntropyGradient',
-    'addGradient',
-    'AdapterManager',
-    'ModelSnapshot',
     'runtimeError',
-    'parseStrictJSON',
   ]) {
-    assert.equal(core[implementationName], undefined);
-    assert.equal(full[implementationName], undefined);
+    assert.equal(inference[name], undefined, `${name} leaked from inference`);
+    assert.equal(full[name], undefined, `${name} leaked from full`);
   }
-  assert.equal(core.Trainer, undefined);
-  assert.equal(core.buildEncoderDecoderTransformer, undefined);
-  assert.equal(full.buildEncoderDecoderTransformer, undefined);
-  assert.equal(full.ModelBuilder.prototype.encoderDecoderTransformer, undefined);
-  assert.equal(core.initializeTensor, undefined);
-  assert.equal(typeof core.VolvoxAI.createRuntime, 'function');
-  assert.equal(core.VolvoxAI.trainStep, undefined);
-  assert.equal(typeof full.VolvoxAI.createRuntime, 'function');
-  assert.equal(typeof full.VolvoxAI.createTrainer, 'function');
+
+  assert.equal(typeof inference.ModelBuilder, 'function');
+  assert.equal(typeof inference.Model, 'function');
+  assert.equal(inference.Trainer, undefined);
+  assert.equal(inference.PTQCalibrator, undefined);
+  assert.equal(typeof full.ModelBuilder, 'function');
+  assert.equal(typeof full.Model, 'function');
   assert.equal(typeof full.Trainer.create, 'function');
-  assert.notEqual(full.Graph, core.Graph);
-  assert.notEqual(full.ModelBuilder, core.ModelBuilder);
+  assert.equal(typeof full.VolvoxAI.createTrainer, 'function');
   assert.equal(typeof full.PTQCalibrator, 'function');
   assert.equal(typeof full.exportModelCheckpoint, 'function');
   assert.equal(typeof full.initializeTensor, 'function');
 });
 
-test('training graph state and optimizer updates exist only in the full profile', () => {
-  const inferenceGraph = new core.Graph();
-  const inferenceWeight = inferenceGraph.addWeight(
-    'weight', [1], 'float32', Float32Array.of(1),
-  );
-  assert.equal(Object.hasOwn(inferenceGraph, 'trainingStep'), false);
-  assert.equal(Object.hasOwn(inferenceGraph, 'optimizerState'), false);
-  assert.equal(Object.hasOwn(inferenceGraph.inspect(), 'trainingStep'), false);
-  assert.throws(
-    () => inferenceGraph.applyTensorUpdate(inferenceWeight.name, Float32Array.of(1), { mode: 'sgd' }),
-    /Unsupported generic tensor update mode/,
-  );
-
-  const trainingGraph = new full.Graph();
-  const trainingWeight = trainingGraph.addWeight(
-    'weight', [1], 'float32', Float32Array.of(1),
-  );
-  trainingGraph.applyTensorUpdate(trainingWeight.name, Float32Array.of(2), {
-    mode: 'sgd', learningRate: 0.25,
-  });
-  assert.equal(trainingWeight.buffer[0], 0.5);
-  assert.equal(trainingGraph.trainingStep, 0);
-  assert.equal(trainingGraph.optimizerState, null);
-  assert.equal(trainingGraph.inspect().trainingStep, 0);
-});
-
-test('Trainer construction and closed handles expose stable typed failures', async () => {
+test('Trainer accepts only immutable logical snapshots and closed handles fail predictably', async () => {
   for (const create of [
     () => full.Trainer.create(null),
     () => StrictWasmTrainer.create(null),
@@ -87,363 +135,316 @@ test('Trainer construction and closed handles expose stable typed failures', asy
     });
   }
 
-  const runtime = await full.VolvoxAI.createRuntime({ backends: ['cpu'] });
-  const graph = new full.Graph();
-  const output = graph.addWeight('logits', [1, 2], 'float32', Float32Array.of(0, 0));
-  graph.setOutputs(output);
-  const model = runtime.createModel(graph);
+  const snapshot = makeTrainingSnapshot();
   await assert.rejects(
-    full.Trainer.create(model, { backend: 'remote' }),
+    full.Trainer.create(snapshot, { backend: 'remote' }),
     (error) => error.code === 'INVALID_ARGUMENT' && error.phase === 'selection',
   );
   await assert.rejects(
-    full.Trainer.create(model, { backend: 'webgpu', device: null }),
+    full.Trainer.create(snapshot, { backend: 'webgpu', device: null }),
     (error) => error.code === 'BACKEND_UNAVAILABLE' &&
       error.phase === 'initialization' && error.backend === 'webgpu',
   );
 
-  const trainer = await full.Trainer.create(model, { backend: 'cpu' });
+  const trainer = await full.Trainer.create(snapshot, { backend: 'cpu' });
   await trainer.close();
-  assert.throws(() => trainer.getGradientAccumulationState(), (error) =>
+  assert.throws(() => trainer.inspectShapeState(), (error) =>
     error.code === 'HANDLE_DISPOSED' && error.phase === 'lifecycle');
   await assert.rejects(trainer.exportCheckpoint(), (error) =>
     error.code === 'HANDLE_DISPOSED' && error.phase === 'lifecycle');
-
-  await model.close();
-  await runtime.close();
 });
 
-test('the full profile creates a retained CPU Trainer over a Model', async () => {
-  const runtime = await full.VolvoxAI.createRuntime({ backends: ['cpu'] });
-  const builder = new full.ModelBuilder();
-  const parameter = builder.weight('parameter', [1, 2], 'float32', Float32Array.from([0.2, -0.4]));
-  const { out } = builder.addOp('Identity', { input: parameter }, { out: [1, 2] });
-  builder.outputs(out);
-  const graph = builder.build();
-  const model = runtime.createModel(graph);
-  const trainer = await full.VolvoxAI.createTrainer(model, { backend: 'cpu' });
-  const result = await trainer.trainStep({
-    targets: [0],
+test('dynamic CPU microbatches match equivalent static plans', async () => {
+  for (const batchSize of [1, 3]) {
+    const dynamic = await full.Trainer.create(makeTrainingSnapshot(), { backend: 'cpu' });
+    const fixed = await full.Trainer.create(makeTrainingSnapshot({
+      minimum: batchSize,
+      maximum: batchSize,
+    }), { backend: 'cpu' });
+    try {
+      const options = stepOptions(batchSize, { optimizer: { learningRate: 0.025 } });
+      const dynamicResult = await dynamic.trainStep(options);
+      const fixedResult = await fixed.trainStep(options);
+      closeNumber(dynamicResult.loss, fixedResult.loss);
+      closeArray(
+        dynamicResult.gradients.get('parameter'),
+        fixedResult.gradients.get('parameter'),
+      );
+      assert.deepEqual(dynamicResult.activationShapes.logits, [batchSize, 2]);
+      assert.deepEqual(dynamicResult.activationGradientShapes.logits, [batchSize, 2]);
+      const dynamicSuccessor = await dynamic.commit();
+      const fixedSuccessor = await fixed.commit();
+      closeArray(
+        dynamicSuccessor.copyWeightData('parameter'),
+        fixedSuccessor.copyWeightData('parameter'),
+      );
+    } finally {
+      await Promise.all([dynamic.close(), fixed.close()]);
+    }
+  }
+});
+
+test('different legal microbatch shapes sum to one fixed combined loss and gradient oracle', async () => {
+  const totalExamples = 4;
+  const firstBatch = shapedBatch(1);
+  const secondBatch = shapedBatch(3);
+  const combinedValues = new Float32Array(totalExamples * 2);
+  combinedValues.set(firstBatch.inputs.x.data, 0);
+  combinedValues.set(secondBatch.inputs.x.data, firstBatch.inputs.x.data.length);
+  const combinedTargets = [...firstBatch.targets, ...secondBatch.targets];
+  const snapshot = makeTrainingSnapshot({ minimum: 1, maximum: totalExamples });
+  const first = await full.Trainer.create(snapshot, { backend: 'cpu' });
+  const second = await full.Trainer.create(snapshot, { backend: 'cpu' });
+  const combined = await full.Trainer.create(makeTrainingSnapshot({
+    minimum: totalExamples,
+    maximum: totalExamples,
+  }), { backend: 'cpu' });
+  const options = (batch, targets) => ({
+    inputs: { x: batch },
+    losses: [{
+      name: 'combined-window',
+      logitsTensor: 'logits',
+      targets,
+      normalizer: totalExamples,
+    }],
     trainableTensors: ['parameter'],
     updateMode: 'sgd',
     optimizer: { learningRate: 0 },
   });
-  assert.equal(result.examples, 1);
-  const modelClose = model.close();
-  let modelClosed = false;
-  modelClose.then(() => { modelClosed = true; });
-  await Promise.resolve();
-  assert.equal(modelClosed, false, 'Model.close should drain its retained Trainer');
-  await trainer.close();
-  await modelClose;
-  await runtime.close();
+  try {
+    const firstResult = await first.trainStep(options(
+      firstBatch.inputs.x,
+      firstBatch.targets,
+    ));
+    const secondResult = await second.trainStep(options(
+      secondBatch.inputs.x,
+      secondBatch.targets,
+    ));
+    const combinedResult = await combined.trainStep(options(
+      { data: combinedValues, shape: [totalExamples, 2] },
+      combinedTargets,
+    ));
+
+    closeNumber(
+      firstResult.loss + secondResult.loss,
+      combinedResult.loss,
+      2e-6,
+    );
+    const expectedGradient = Float32Array.from(
+      firstResult.gradients.get('parameter'),
+      (value, index) => value + secondResult.gradients.get('parameter')[index],
+    );
+    closeArray(
+      expectedGradient,
+      combinedResult.gradients.get('parameter'),
+      2e-6,
+    );
+    assert.notEqual(firstResult.shapeSignature, secondResult.shapeSignature);
+    assert.deepEqual(combinedResult.activationShapes.logits, [totalExamples, 2]);
+  } finally {
+    await Promise.all([first.close(), second.close(), combined.close()]);
+  }
 });
 
-test('Trainer publication preserves definition identity and leaves old contexts pinned', async () => {
-  const runtime = await full.VolvoxAI.createRuntime({ backends: ['cpu'] });
-  const graph = new full.Graph();
-  const parameter = graph.addWeight(
-    'parameter', [1, 2], 'float32', Float32Array.from([0.2, -0.4]),
-  );
-  const { out } = graph.addOp('Identity', { input: parameter }, { out: [1, 2] });
-  graph.setOutputs(out);
-  const model = runtime.createModel(graph);
-  const definitionId = model.definitionId;
-  const originalRevision = model.weightRevisionId;
-  const oldCompiled = await model.compile({
-    backend: { mode: 'require', backend: 'cpu', operatorFallback: 'forbid' },
-  });
-  const oldContext = await oldCompiled.createContext();
-  const before = await oldContext.execute({});
-
-  const trainer = await full.VolvoxAI.createTrainer(model, { backend: 'cpu' });
-  const update = await trainer.trainStep({
-    targets: [0],
-    trainableTensors: ['parameter'],
-    updateMode: 'sgd',
-    optimizer: { learningRate: 0.1 },
-  });
-  assert.deepEqual(update.updatedTensorNames, ['parameter']);
-  assert.equal(Object.hasOwn(update, 'updatedTensors'), false);
-  assert.deepEqual(parameter.buffer, Float32Array.from([0.2, -0.4]));
-  assert.equal(model.definitionId, definitionId);
-  assert.equal(model.weightRevisionId, originalRevision,
-    'a training step must remain private before commit');
-  assert.equal(trainer.hasUncommittedUpdates, true);
-  const committed = await trainer.commit();
-  assert.equal(committed.definitionId, definitionId);
-  assert.equal(committed.weightRevisionId, model.weightRevisionId);
-  assert.equal(trainer.hasUncommittedUpdates, false);
-  assert.notEqual(model.weightRevisionId, originalRevision);
-
-  const newCompiled = await model.compile({
-    backend: { mode: 'require', backend: 'cpu', operatorFallback: 'forbid' },
-  });
-  const newContext = await newCompiled.createContext();
-  const after = await newContext.execute({});
-  const oldAgain = await oldContext.execute({});
-  assert.deepEqual(
-    [...await before.output(out.name).read()],
-    [...await oldAgain.output(out.name).read()],
-  );
-  assert.notDeepEqual(
-    [...await after.output(out.name).read()],
-    [...await before.output(out.name).read()],
-  );
-
-  await Promise.all([before.close(), oldAgain.close(), after.close()]);
-  await Promise.all([oldContext.close(), newContext.close(), trainer.close()]);
-  await Promise.all([oldCompiled.close(), newCompiled.close()]);
-  await model.close();
-  await runtime.close();
-});
-
-test('Trainer commits only applied updates and rejects unfinished accumulation', async () => {
-  const runtime = await full.VolvoxAI.createRuntime({ backends: ['cpu'] });
-  const graph = new full.Graph();
-  const parameter = graph.addWeight(
-    'parameter', [1, 2], 'float32', Float32Array.from([0.3, -0.2]),
-  );
-  const { out } = graph.addOp('Identity', { input: parameter }, { out: [1, 2] });
-  graph.setOutputs(out);
-  const model = runtime.createModel(graph);
-  const trainer = await full.VolvoxAI.createTrainer(model, { backend: 'cpu' });
-  const initialRevision = model.weightRevisionId;
-  const beforeFailure = await trainer.exportCheckpoint();
-
-  await assert.rejects(
-    trainer.trainStep({
-      targets: [99],
-      trainableTensors: ['parameter'],
-      updateMode: 'sgd',
-      optimizer: { learningRate: 0.1 },
-    }),
-    /target/i,
-  );
-  assert.equal(model.weightRevisionId, initialRevision);
-  const afterFailure = await trainer.exportCheckpoint();
-  assert.equal(afterFailure.trainingStep, beforeFailure.trainingStep);
-  assert.deepEqual(
-    new Uint8Array(afterFailure.weights),
-    new Uint8Array(beforeFailure.weights),
-    'a failed step must leave the Trainer working revision unchanged',
-  );
-
-  const accumulating = await trainer.trainStep({
-    targets: [0],
-    trainableTensors: ['parameter'],
-    updateMode: 'sgd',
-    optimizer: { learningRate: 0.1 },
-    gradientAccumulationSteps: 2,
-  });
-  assert.equal(accumulating.updatedTensorNames.length, 0);
-  assert.equal(model.weightRevisionId, initialRevision);
-  await assert.rejects(trainer.commit(), (error) => {
-    assert.equal(error.code, 'INVALID_ARGUMENT');
-    assert.match(error.message, /accumulation/i);
-    return true;
-  });
-
-  const applied = await trainer.trainStep({
-    targets: [0],
-    trainableTensors: ['parameter'],
-    updateMode: 'sgd',
-    optimizer: { learningRate: 0.1 },
-    gradientAccumulationSteps: 2,
-  });
-  assert.deepEqual(applied.updatedTensorNames, ['parameter']);
-  assert.equal(model.weightRevisionId, initialRevision);
-  await trainer.commit();
-  assert.notEqual(model.weightRevisionId, initialRevision);
-
-  await trainer.close();
-  await model.close();
-  await runtime.close();
-});
-
-test('Trainer exports and resumes its private working revision', async () => {
-  const runtime = await full.VolvoxAI.createRuntime({ backends: ['cpu'] });
-  const graph = new full.Graph();
-  const parameter = graph.addWeight(
-    'parameter', [1, 2], 'float32', Float32Array.from([0.4, -0.1]),
-  );
-  const { out } = graph.addOp('Identity', { input: parameter }, { out: [1, 2] });
-  graph.setOutputs(out);
-  const model = runtime.createModel(graph);
-  const trainer = await full.VolvoxAI.createTrainer(model, { backend: 'cpu' });
-  await trainer.trainStep({
-    targets: [0],
-    trainableTensors: ['parameter'],
-    updateMode: 'adamw',
-    optimizer: { learningRate: 0.1 },
-  });
-  const checkpoint = await trainer.exportCheckpoint();
-  assert.equal(checkpoint.trainingStep, 1);
-  assert.deepEqual(parameter.buffer, Float32Array.from([0.4, -0.1]));
-  await trainer.close();
-  await model.close();
-
-  const restored = full.importModelCheckpoint(checkpoint);
-  const resumedModel = runtime.createModel(restored.graph);
-  const resumed = await full.VolvoxAI.createTrainer(resumedModel, {
+test('shape plans vary while parameter, gradient, and optimizer storage stay fixed', async () => {
+  const trainer = await full.Trainer.create(makeTrainingSnapshot(), {
     backend: 'cpu',
-    checkpoint,
+    planCacheEntries: 2,
   });
-  assert.equal(resumed.trainingStep, 1);
-  const second = await resumed.trainStep({
-    targets: [0],
-    trainableTensors: ['parameter'],
-  });
-  assert.equal(resumed.trainingStep, 2);
-  assert.deepEqual(second.updatedTensorNames, ['parameter']);
-  assert.equal(resumed.hasUncommittedUpdates, true);
-  await resumed.commit();
-  assert.equal(resumed.hasUncommittedUpdates, false);
-
-  await resumed.close();
-  await resumedModel.close();
-  await runtime.close();
+  const seen = [];
+  try {
+    for (const batchSize of [1, 4, 1]) {
+      const result = await trainer.trainStep(stepOptions(batchSize, {
+        updateMode: 'adamw',
+        optimizer: { learningRate: 0.01 },
+      }));
+      seen.push({ result, inspection: trainer.inspectShapeState() });
+    }
+    assert.notEqual(seen[0].result.shapeSignature, seen[1].result.shapeSignature);
+    assert.equal(seen[0].result.shapeSignature, seen[2].result.shapeSignature);
+    for (const { inspection } of seen) {
+      assert.equal(inspection.parameterBytes, INITIAL_PARAMETER.byteLength);
+      assert.equal(inspection.parameterGradientBytes, INITIAL_PARAMETER.byteLength);
+      assert.equal(inspection.optimizerBytes, INITIAL_PARAMETER.byteLength * 2);
+    }
+    assert.equal(seen[2].inspection.planCacheEntries, 2);
+    assert.equal(seen[2].inspection.planCacheMisses, 2);
+    assert.equal(seen[2].inspection.planCacheHits, 1);
+    assert.ok(seen[1].inspection.activationCapacityBytes >= seen[0].inspection.activationCapacityBytes);
+    assert.equal(
+      seen[2].inspection.activationCapacityBytes,
+      seen[1].inspection.activationCapacityBytes,
+      'shrinking a microbatch must reuse the one growable activation pool',
+    );
+  } finally {
+    await trainer.close();
+  }
 });
 
-test('Trainer constructors reject checkpoints from a different Model definition', async () => {
-  const retainedGraph = new full.Graph();
-  const retainedWeight = retainedGraph.addWeight(
-    'retained', [1], 'float32', Float32Array.of(3),
-  );
-  const retainedOutput = retainedGraph.addOp('Identity', { input: retainedWeight }, {
-    out: { name: 'retained_output', shape: [1] },
-  }).out;
-  retainedGraph.setOutputs(retainedOutput);
-
-  const unrelatedGraph = new full.Graph();
-  const unrelatedWeight = unrelatedGraph.addWeight(
-    'unrelated', [2], 'float32', Float32Array.of(7, 8),
-  );
-  const unrelatedOutput = unrelatedGraph.addOp('Identity', { input: unrelatedWeight }, {
-    out: { name: 'unrelated_output', shape: [2] },
-  }).out;
-  unrelatedGraph.setOutputs(unrelatedOutput);
-  const unrelatedCheckpoint = full.exportModelCheckpoint(unrelatedGraph);
-
-  const runtime = await full.VolvoxAI.createRuntime({ backends: ['cpu'] });
-  const model = runtime.createModel(retainedGraph);
-  const definitionId = model.definitionId;
-  const weightRevisionId = model.weightRevisionId;
-  const assertDefinitionMismatch = (error) => {
-    assert.equal(error.code, 'INVALID_ARGUMENT');
-    assert.match(error.message, /checkpoint definition.*retained Model/i);
-    return true;
-  };
-
-  await assert.rejects(
-    full.Trainer.create(model, { backend: 'cpu', checkpoint: unrelatedCheckpoint }),
-    assertDefinitionMismatch,
-  );
-  await assert.rejects(
-    StrictWasmTrainer.create(model, {
-      checkpoint: unrelatedCheckpoint,
-      wasmUrl: new URL('missing-training-runtime.wasm', import.meta.url),
-    }),
-    assertDefinitionMismatch,
-  );
-  assert.equal(model.definitionId, definitionId);
-  assert.equal(model.weightRevisionId, weightRevisionId);
-
-  const compiled = await model.compile({
-    backend: { mode: 'require', backend: 'cpu', operatorFallback: 'forbid' },
-  });
-  const context = await compiled.createContext();
-  const result = await context.execute({});
-  assert.deepEqual(await result.output('retained_output').read(), Float32Array.of(3));
-  assert.throws(() => result.output('unrelated_output'), (error) => error.code === 'INVALID_ARGUMENT');
-
-  await result.close();
-  await context.close();
-  await compiled.close();
-  await model.close();
-  await runtime.close();
-});
-
-test('concurrent Trainers reject stale successor publication', async () => {
-  const runtime = await full.VolvoxAI.createRuntime({ backends: ['cpu'] });
-  const graph = new full.Graph();
-  const parameter = graph.addWeight(
-    'parameter', [1, 2], 'float32', Float32Array.from([0.2, -0.3]),
-  );
-  const { out } = graph.addOp('Identity', { input: parameter }, { out: [1, 2] });
-  graph.setOutputs(out);
-  const model = runtime.createModel(graph);
-  const initialRevision = model.weightRevisionId;
-  const first = await full.VolvoxAI.createTrainer(model, { backend: 'cpu' });
-  const stale = await full.VolvoxAI.createTrainer(model, { backend: 'cpu' });
-  const options = {
-    targets: [0],
-    trainableTensors: ['parameter'],
-    updateMode: 'sgd',
-    optimizer: { learningRate: 0.1 },
-  };
-
-  const staleBefore = await stale.exportCheckpoint();
-  await first.trainStep(options);
-  assert.equal(model.weightRevisionId, initialRevision);
-  await first.commit();
-  const publishedRevision = model.weightRevisionId;
-  await stale.trainStep(options);
-  const staleAfterStep = await stale.exportCheckpoint();
-  await assert.rejects(stale.commit(), (error) => {
-    assert.equal(error.code, 'EXECUTION_FAILED');
-    assert.match(error.message, /revision changed/);
-    return true;
-  });
-  assert.equal(model.weightRevisionId, publishedRevision);
-  const staleAfter = await stale.exportCheckpoint();
-  assert.equal(staleAfter.trainingStep, staleAfterStep.trainingStep);
-  assert.deepEqual(
-    new Uint8Array(staleAfter.weights),
-    new Uint8Array(staleAfterStep.weights),
-    'a stale commit must leave the private successor intact',
-  );
-  await stale.rollback();
-  const staleRolledBack = await stale.exportCheckpoint();
-  assert.equal(staleRolledBack.trainingStep, staleBefore.trainingStep);
-  assert.deepEqual(new Uint8Array(staleRolledBack.weights), new Uint8Array(staleBefore.weights));
-  assert.equal(stale.hasUncommittedUpdates, false);
-
-  await Promise.all([first.close(), stale.close()]);
-  await model.close();
-  await runtime.close();
-});
-
-test('Trainer rollback discards private weights, optimizer state, and publication intent', async () => {
-  const runtime = await full.VolvoxAI.createRuntime({ backends: ['cpu'] });
-  const graph = new full.Graph();
-  const parameter = graph.addWeight(
-    'parameter', [1, 2], 'float32', Float32Array.from([0.25, -0.15]),
-  );
-  const { out } = graph.addOp('Identity', { input: parameter }, { out: [1, 2] });
-  graph.setOutputs(out);
-  const model = runtime.createModel(graph);
-  const initialRevision = model.weightRevisionId;
-  const trainer = await full.VolvoxAI.createTrainer(model, { backend: 'cpu' });
+test('accumulation rejects a shape change and rollback discards the complete private window', async () => {
+  const snapshot = makeTrainingSnapshot();
+  const trainer = await full.Trainer.create(snapshot, { backend: 'cpu' });
   const baseline = await trainer.exportCheckpoint();
+  try {
+    const first = await trainer.trainStep(stepOptions(1, {
+      gradientAccumulationSteps: 2,
+    }));
+    assert.equal(first.accumulating, true);
+    assert.equal(trainer.getGradientAccumulationState().pending, true);
+    const firstSignature = trainer.inspectShapeState().currentShapeSignature;
 
-  await trainer.trainStep({
-    targets: [0],
-    trainableTensors: ['parameter'],
-    updateMode: 'adamw',
-    optimizer: { learningRate: 0.1 },
+    await assert.rejects(
+      trainer.trainStep(stepOptions(2, { gradientAccumulationSteps: 2 })),
+      (error) => error.code === 'INVALID_ARGUMENT' && /exact activation shape signature/i.test(error.message),
+    );
+    assert.equal(trainer.inspectShapeState().currentShapeSignature, firstSignature);
+    assert.equal(trainer.getGradientAccumulationState().microbatches, 1);
+    await assert.rejects(trainer.commit(), /accumulation/i);
+    await assert.rejects(trainer.exportCheckpoint(), /accumulation/i);
+
+    await trainer.rollback();
+    assert.equal(trainer.getGradientAccumulationState().pending, false);
+    assert.equal(trainer.inspectShapeState().currentShapeSignature, null);
+    assert.equal(trainer.hasUncommittedUpdates, false);
+    const restored = await trainer.exportCheckpoint();
+    assert.equal(restored.trainingStep, baseline.trainingStep);
+    assert.deepEqual(
+      new Uint8Array(restored.parameters),
+      new Uint8Array(baseline.parameters),
+    );
+
+    const changedShape = await trainer.trainStep(stepOptions(2));
+    assert.equal(changedShape.accumulating, false);
+    assert.deepEqual(changedShape.activationShapes.logits, [2, 2]);
+  } finally {
+    await trainer.close();
+  }
+});
+
+async function dropoutRun(batchSize, dropout) {
+  const trainer = await full.Trainer.create(makeTrainingSnapshot({ dropout: true }), {
+    backend: 'cpu',
   });
-  assert.equal(trainer.hasUncommittedUpdates, true);
-  await trainer.rollback();
-  const restored = await trainer.exportCheckpoint();
-  assert.equal(trainer.trainingStep, baseline.trainingStep);
-  assert.equal(trainer.hasUncommittedUpdates, false);
-  assert.equal(model.weightRevisionId, initialRevision);
-  assert.deepEqual(new Uint8Array(restored.weights), new Uint8Array(baseline.weights));
-  assert.equal(restored.optimizer, null);
-  await assert.rejects(trainer.commit(), (error) => error.code === 'INVALID_ARGUMENT');
+  try {
+    const result = await trainer.trainStep(stepOptions(batchSize, {
+      optimizer: { learningRate: 0 },
+      dropout,
+    }));
+    return {
+      loss: result.loss,
+      gradient: new Float32Array(result.gradients.get('parameter')),
+      signature: result.shapeSignature,
+    };
+  } finally {
+    await trainer.close();
+  }
+}
 
-  await trainer.close();
-  await model.close();
-  await runtime.close();
+test('Dropout is reproducible for seed+counter+shape and changes when either component changes', async () => {
+  const rng = { seed: 17, counter: 23 };
+  const first = await dropoutRun(4, rng);
+  const repeated = await dropoutRun(4, rng);
+  closeNumber(first.loss, repeated.loss, 0);
+  assert.deepEqual(first.gradient, repeated.gradient);
+  assert.equal(first.signature, repeated.signature);
+
+  const nextCounter = await dropoutRun(4, { ...rng, counter: rng.counter + 1 });
+  assert.notDeepEqual(nextCounter.gradient, first.gradient);
+
+  const otherShape = await dropoutRun(1, rng);
+  assert.notEqual(otherShape.signature, first.signature);
+  const dropoutNode = { id: 'dropout', params: { p: 0.5, seed: 9 } };
+  const firstContext = dropoutContext({ ...rng, shapeSignature: first.signature });
+  const otherContext = dropoutContext({ ...rng, shapeSignature: otherShape.signature });
+  assert.notEqual(firstContext.shapeHash, otherContext.shapeHash);
+  assert.ok(
+    Array.from({ length: 32 }, (_, index) => index).some((index) =>
+      dropoutMultiplier(dropoutNode, firstContext, index) !==
+      dropoutMultiplier(dropoutNode, otherContext, index)),
+    'the concrete shape signature must participate in the deterministic Dropout stream',
+  );
+});
+
+test('commit returns one immutable logical successor and leaves its source revision untouched', async () => {
+  const source = makeTrainingSnapshot();
+  const sourceBytes = source.copyWeightBytes('parameter');
+  const trainer = await full.VolvoxAI.createTrainer(source, { backend: 'cpu' });
+  try {
+    const update = await trainer.trainStep(stepOptions(2));
+    assert.deepEqual(update.updatedTensorNames, ['parameter']);
+    assert.equal(trainer.hasUncommittedUpdates, true);
+    const successor = await trainer.commit();
+    assert.ok(successor instanceof full.Model);
+    assert.notEqual(successor, source);
+    assert.equal(successor.definitionId, source.definitionId);
+    assert.equal(successor.definitionFingerprint, source.definitionFingerprint);
+    assert.equal(successor.weightRevision, source.weightRevision + 1);
+    assert.equal(trainer.snapshot, successor);
+    assert.equal(trainer.hasUncommittedUpdates, false);
+    assert.deepEqual(source.copyWeightBytes('parameter'), sourceBytes);
+    assert.notDeepEqual(successor.copyWeightBytes('parameter'), sourceBytes);
+    await assert.rejects(trainer.commit(), (error) => error.code === 'INVALID_ARGUMENT');
+  } finally {
+    await trainer.close();
+  }
+});
+
+test('logical checkpoint v1 preserves bounds/fingerprint and rejects legacy or mismatched definitions', async () => {
+  const source = makeTrainingSnapshot({ minimum: 1, maximum: 4 });
+  const trainer = await full.Trainer.create(source, { backend: 'cpu' });
+  let checkpoint;
+  try {
+    await trainer.trainStep(stepOptions(2, {
+      updateMode: 'adamw',
+      optimizer: { learningRate: 0.01 },
+    }));
+    checkpoint = await trainer.exportCheckpoint();
+  } finally {
+    await trainer.close();
+  }
+
+  assert.equal(checkpoint.format, 'volvox.training-checkpoint/v1');
+  assert.equal(checkpoint.logicalFingerprint, source.definitionFingerprint);
+  assert.deepEqual(checkpoint.logicalGraph.dimensions.B, {
+    min: 1,
+    max: 4,
+    multiple_of: 1,
+  });
+  assert.deepEqual(checkpoint.logicalGraph.inputs.x.shape, ['B', 2]);
+  assert.ok(checkpoint.parameters instanceof ArrayBuffer);
+  assert.ok(checkpoint.optimizer instanceof ArrayBuffer);
+  assert.deepEqual(checkpoint.parameterDescriptors[0].shape, [2, 2]);
+  assert.deepEqual(checkpoint.optimizerEntries[0].shape, [2, 2]);
+
+  const imported = full.importModelCheckpoint(checkpoint);
+  assert.ok(imported.snapshot instanceof full.Model);
+  assert.equal(imported.snapshot.definitionFingerprint, source.definitionFingerprint);
+  assert.deepEqual(imported.snapshot.graph.dimensions.B, source.graph.dimensions.B);
+  const resumed = await full.Trainer.create(source, { backend: 'cpu', checkpoint });
+  try {
+    assert.equal(resumed.trainingStep, 1);
+    const maximum = await resumed.trainStep(stepOptions(4));
+    assert.deepEqual(maximum.activationShapes.logits, [4, 2]);
+  } finally {
+    await resumed.close();
+  }
+
+  assert.throws(
+    () => full.importModelCheckpoint({ format: 'volvox.checkpoint.v1' }),
+    /not loadable by dynamic training v1/i,
+  );
+  const tampered = {
+    ...checkpoint,
+    logicalGraph: {
+      ...checkpoint.logicalGraph,
+      dimensions: { B: { min: 1, max: 5, multiple_of: 1 } },
+    },
+  };
+  assert.throws(() => full.importModelCheckpoint(tampered), /fingerprint.*bounds/i);
+
+  const differentBounds = makeTrainingSnapshot({ minimum: 1, maximum: 3 });
+  await assert.rejects(
+    full.Trainer.create(differentBounds, { backend: 'cpu', checkpoint }),
+    (error) => error.code === 'INVALID_ARGUMENT' && /fingerprint|symbolic constraints/i.test(error.message),
+  );
 });

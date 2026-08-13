@@ -373,7 +373,7 @@ function buildEncoderDecoderTransformerUnsafe(builder, options = {}) {
       "Linear",
       { input, weight: matrix, bias },
       { out: output(`${suffix}.out`, [...input.shape.slice(0, -1), outFeatures]) },
-      { weight_layout: "IN_OUT" },
+      { weight_layout: "din_dout" },
       { id: `${name}.${suffix}`, wLayout: "din" },
     ).out;
   };
@@ -547,7 +547,7 @@ function buildEncoderDecoderTransformerUnsafe(builder, options = {}) {
       "Linear",
       { input: hidden, weight: targetTokenTable },
       { out: output(projectionSuffix, [batchSize, targetLength, targetVocabSize]) },
-      { weight_layout: "OUT_IN" },
+      { weight_layout: "dout_din" },
       { id: `${name}.lm_head`, wLayout: "dout" },
     ).out;
     if (options.lmHeadBias === true) {

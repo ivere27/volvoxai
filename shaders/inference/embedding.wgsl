@@ -1,3 +1,6 @@
+// Canonical graphs validate public IDs before upload and prove invariant or
+// device-produced ID ranges during physical compilation. The zero branch is a
+// defensive OOB guard for malformed direct dispatches only.
 @group(0) @binding(0) var<storage, read> tokens : array<i32>;
             @group(0) @binding(1) var<storage, read> weight : array<f32>;
             @group(0) @binding(2) var<storage, read_write> output : array<f32>;

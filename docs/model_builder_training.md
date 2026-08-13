@@ -1,109 +1,98 @@
-# Model construction and training
+# Logical model construction and training
 
-The full JavaScript profile adds training-aware Graph and ModelBuilder exports
-plus a retained Trainer. Models can be built from initialized tensors without
-an exporter or pre-existing safetensors file.
+Dynamic training v1 accepts one public model type: an immutable,
+fixed-rank, bounded-shape `Model`. Concrete kernel graphs and
+training builders are implementation details and are not package exports.
+There is no compatibility path for a pre-v1 mutable graph checkpoint.
 
-Training follows this ownership chain:
+Training has this ownership model:
 
 ~~~text
-Runtime
-  Model
-    published immutable weight revision
-
-Trainer
-  retained Model
-  private mutable working revision
-  gradients, optimizer slots, and accumulation state
+Model (immutable topology, bounds, and fixed weights)
+  └─ Trainer (private weights, optimizer slots, accumulation, shape cache)
+       └─ commit() → new immutable Model
 ~~~
 
-A successful optimizer update remains in the Trainer's private working
-revision. `commit()` publishes that revision as a new Model weight revision
-atomically. Existing CompiledModel and ExecutionContext objects stay pinned to
-the revision they compiled. No training step publishes implicitly.
+`trainStep()` never mutates its source snapshot. `commit()` captures the
+Trainer's current weights as a successor and updates `trainer.snapshot` to that
+successor. Previously compiled snapshots remain unchanged.
 
-## Build a graph
+## Author a bounded logical snapshot
+
+`ModelBuilder` edits validated logical graph documents. Weight bytes are
+supplied only when the logical graph is captured as a snapshot.
 
 ~~~javascript
 import {
   ModelBuilder,
+  Model,
+  Trainer,
   VolvoxAI,
 } from 'volvoxai/full';
 
-const builder = new ModelBuilder();
-const x = builder.input('x', [1, 4]);
-const weight = builder.weight('projection', [4, 8], 'float32', {
-  initializer: { type: 'xavierUniform', seed: 17 },
-});
-
-const hidden = builder.addOp(
-  'MatMul',
-  { input: x, weight },
-  { out: { name: 'hidden', shape: [1, 8] } },
-  {},
-  { id: 'projection', wLayout: 'din' },
-).out;
-const logits = builder.addOp(
-  'GELU',
-  { input: hidden },
-  { out: { name: 'logits', shape: [1, 8] } },
-  {},
-  { id: 'activation' },
-).out;
-
-builder.outputs(logits);
-const graph = builder.build();
-
-const runtime = await VolvoxAI.createRuntime({ backends: ['cpu'] });
-const model = runtime.createModel(graph);
-~~~
-
-The full profile exports training-aware `ModelBuilder` and `Graph` classes. The
-inference profile contains only the model-agnostic graph and builder; it does not include
-initializers, optimizer state, Dropout authoring, or training helpers.
-
-Built-in F32 initializers are deterministic for a given seed:
-
-- zeros
-- ones
-- normal
-- xavierUniform
-- xavierNormal
-
-normal defaults to mean 0 and standard deviation 0.02. Xavier initializers
-derive fan-in and fan-out from the shape and accept an optional gain.
-
-Every topology operation is transactional. An invalid add, insert, patch,
-replace, remove, or rename leaves the graph unchanged. Group several edits with
-builder.topologyTransaction():
-
-~~~javascript
-builder.topologyTransaction(current => {
-  current.patchNode('projection', {
-    params: { weight_layout: 'IN_OUT' },
-  });
-  current.replaceNode('activation', replacementNode);
-});
-~~~
-
-Removing a value with consumers requires an explicit rewire map or cascade.
-Published adapter versions refer to a topology and prevent structural edits
-until those versions are removed.
-
-## Create a Trainer
-
-~~~javascript
-const trainer = await VolvoxAI.createTrainer(model, {
-  backend: 'cpu',
-});
-
-const step = await trainer.trainStep({
+const builder = new ModelBuilder({
+  dimensions: {
+    B: { min: 1, max: 16, multiple_of: 1 },
+  },
   inputs: {
-    x: new Float32Array([1, 2, 3, 4]),
+    x: { dtype: 'float32', shape: ['B', 4] },
+  },
+  weights: [
+    { name: 'projection.weight', dtype: 'float32', shape: [4, 8] },
+  ],
+  nodes: [{
+    id: 'projection',
+    opType: 'MatMul',
+    inputs: { input: 'x', weight: 'projection.weight' },
+    outputs: {
+      out: { tensor: 'logits', dtype: 'float32', shape: ['B', 8] },
+    },
+    params: {},
+  }],
+  outputs: ['logits'],
+});
+
+const source = Model.capture({
+  graph: builder.snapshot(),
+  weights: {
+    'projection.weight': {
+      name: 'projection.weight',
+      dtype: 'float32',
+      shape: [4, 8],
+      data: Float32Array.from(
+        { length: 32 },
+        (_, index) => (index - 16) / 64,
+      ),
+    },
+  },
+});
+~~~
+
+The shape domain is part of the graph fingerprint. Every symbol has finite
+`min`, `max`, and `multiple_of` constraints, and ranks never change. All graph
+states published by the builder are validated and immutable. Group related
+topology edits with `builder.topologyTransaction(edit => { ... })`; a rejected
+transaction leaves the prior snapshot intact.
+
+For exported models, load `volvox-graph/v1` and safetensors bytes with
+`ModelLoader`, then pass the loaded package to
+`Model.capture()`.
+
+## Create and use a Trainer
+
+~~~javascript
+const trainer = await Trainer.create(source, { backend: 'cpu' });
+
+const first = await trainer.trainStep({
+  inputs: {
+    x: {
+      data: new Float32Array([1, 2, 3, 4]),
+      shape: [1, 4],
+    },
   },
   logitsTensor: 'logits',
-  targets: new Int32Array([3]),
-  trainableTensors: ['projection'],
+  targets: Int32Array.of(3),
+  trainableTensors: ['projection.weight'],
   updateMode: 'adamw',
   optimizer: {
     learningRate: 1e-3,
@@ -111,89 +100,125 @@ const step = await trainer.trainStep({
     maxGradNorm: 1,
   },
 });
-await trainer.commit();
-~~~
 
-`trainStep()` mutates only the Trainer's private state. Call `commit()` before
-compiling inference against the update. Call `rollback()` instead to discard
-uncommitted work and restore the last committed baseline.
-
-Trainer backends are cpu, webgpu, and wasm:
-
-~~~javascript
-const gpuTrainer = await VolvoxAI.createTrainer(model, {
-  backend: 'webgpu',
-  device,
+// The same Trainer binds another concrete point in the declared domain.
+const second = await trainer.trainStep({
+  inputs: {
+    x: {
+      data: new Float32Array([
+        1, 2, 3, 4,
+        4, 3, 2, 1,
+        0, 1, 0, 1,
+      ]),
+      shape: [3, 4],
+    },
+  },
+  logitsTensor: 'logits',
+  targets: Int32Array.of(3, 2, 1),
+  trainableTensors: ['projection.weight'],
+  updateMode: 'adamw',
+  optimizer: { learningRate: 1e-3, maxGradNorm: 1 },
 });
 
-const wasmTrainer = await VolvoxAI.createTrainer(model, {
+const successor = await trainer.commit();
+await trainer.close();
+~~~
+
+Every input is a `{ data, shape }` view, even for a fully static graph. Storage
+length never supplies an implicit shape. A step fails before mutation if an
+input is missing, has the wrong dtype/rank/byte length, violates a symbol
+constraint, or binds one symbol inconsistently across inputs.
+
+The result contains copied gradients, stable updated parameter names, the
+canonical shape and tactic signatures, and concrete activation/gradient shape
+maps. It never exposes mutable internal tensors.
+
+`VolvoxAI.createTrainer(source, options)` is an equivalent namespace form.
+Calls on one Trainer are FIFO-serialized. `close()` rejects new work, drains
+accepted work, and releases backend resources; `close()` and `dispose()` are
+idempotent.
+
+## Shape specialization and capacity
+
+One Trainer retains a bounded LRU of immutable plan/tactic metadata and one
+growable activation-capacity pool. Returning to a prior shape can reuse cached
+plans and backend pipelines. WASM keeps one module instance and scratch arena;
+WebGPU keeps one device/executor cache. Shape changes do not recreate a Trainer.
+
+~~~javascript
+const state = trainer.inspectShapeState();
+// state.planCacheEntries, state.planCacheMetadataBytes,
+// state.activationCapacityBytes, state.activationCapacityHighWaterBytes, ...
+~~~
+
+Capacity and metadata limits are explicit Trainer options:
+
+~~~javascript
+const boundedTrainer = await Trainer.create(source, {
+  backend: 'webgpu',
+  planCacheEntries: 8,
+  planCacheMetadataBytes: 256 * 1024,
+  maxCapacityBytes: 64 * 1024 * 1024,
+  capacityGrowthFactor: 2,
+});
+~~~
+
+A pending gradient-accumulation window is shape-stable. Flush or reset it
+before changing the concrete shape.
+
+## Backend selection
+
+The full profile supports explicit `cpu`, `webgpu`, and `wasm` training:
+
+~~~javascript
+const gpuTrainer = await Trainer.create(source, {
+  backend: 'webgpu',
+  device, // omit to request a device owned by the Trainer
+});
+
+const wasmTrainer = await Trainer.create(source, {
   backend: 'wasm',
   wasmUrl: new URL('./volvoxai.full.wasm', import.meta.url),
 });
 ~~~
 
-If a WebGPU device is omitted, Trainer requests one. If supplied, the caller
-retains ownership of it. WASM training preflights its strict portable subset
-and never falls back to CPU.
+Strict WASM training is also available from the WASM-only JavaScript profile.
+It contains no CPU, WebGPU, or training fallback implementation. WASM and
+WebGPU preflight their supported graph/layout subset before optimizer mutation.
+A step never switches backend after execution starts.
 
-Calls on one Trainer are FIFO-serialized. Starting close rejects new work,
-drains accepted steps, releases optimizer/backend resources, and releases its
-Model retention. close() and dispose() are idempotent.
+## Publish and compile a successor
 
-~~~javascript
-await trainer.close();
-await model.close();
-await runtime.close();
-~~~
-
-Model close waits for its Trainer. Close the Trainer explicitly so lifecycle
-errors are reported at the point the application expects.
-
-## Publish and compile revisions
-
-When `step.updatedTensorNames` is non-empty, the Trainer has updated its private
-working weights. The step result contains stable names and copied gradients,
-never mutable internal tensor handles. Publish explicitly, then compile against
-the new Model revision:
+`commit()` requires at least one completed optimizer update and no incomplete
+accumulation window. It returns a new snapshot; it does not publish into a
+mutable Model object.
 
 ~~~javascript
-const revision = await trainer.commit();
-const compiled = await model.compile({
+const successor = await trainer.commit();
+const runtime = await VolvoxAI.createRuntime({ backends: ['cpu'] });
+const compiled = await runtime.compile(successor, {
   backend: {
     mode: 'require',
     backend: 'cpu',
     operatorFallback: 'forbid',
   },
 });
+
 const context = await compiled.createContext();
-const result = await context.execute(inputs);
-~~~
-
-The model definition identity remains the same, while weightRevision and
-weightRevisionId change. `commit()` rejects an incomplete accumulation window.
-`rollback()` restores the private working state to the last successfully
-committed baseline and publishes nothing.
-
-## Losses
-
-The single-loss shorthand accepts logitsTensor, targets, ignoreIndex, lossMask,
-and lastToken:
-
-~~~javascript
-await trainer.trainStep({
-  inputs,
-  logitsTensor: 'logits',
-  targets: targetIds,
-  ignoreIndex: -1,
-  lossMask,
-  trainableTensors,
-  updateMode: 'adamw',
-  optimizer: { learningRate: 1e-4 },
+const result = await context.execute({
+  x: { data: new Float32Array([1, 2, 3, 4]), shape: [1, 4] },
 });
 ~~~
 
-Use losses for multiple weighted cross-entropy objectives. Each item has a
-unique name and its own logits, targets, mask, weight, and denominator:
+The successor retains definition identity when topology and shape bounds are
+unchanged, while its weight revision changes. `rollback()` discards private
+work and returns the Trainer to its last committed baseline.
+
+## Losses
+
+The single-loss shorthand accepts `logitsTensor`, `targets`, `ignoreIndex`,
+`lossMask`, and `lastToken`. Use `losses` for several weighted cross-entropy
+objectives:
 
 ~~~javascript
 const step = await trainer.trainStep({
@@ -222,46 +247,37 @@ const step = await trainer.trainStep({
 });
 ~~~
 
-Without normalizer, each loss is divided by its own active example count and
-then multiplied by weight. With accumulation and more than one loss, every
-loss must provide the full-window normalizer. Repeated logits tensors are
-allowed; their seeded gradients add before backward.
-
-The result reports total loss, per-loss metrics, `updatedTensorNames`, accumulation
-state, and gradient clipping evidence. maxGradNorm clips one Euclidean norm
-over the complete trainable set. Zero disables clipping.
+Without `normalizer`, each loss is divided by its active example count and then
+multiplied by `weight`. With accumulation and multiple losses, every loss must
+provide its full-window normalizer. Repeated logits tensors are allowed; their
+seeded gradients add before backward. `maxGradNorm` clips one Euclidean norm
+over the complete trainable set; zero disables clipping.
 
 ## Gradient accumulation
 
-gradientAccumulationSteps defaults to one. Before a window is complete,
-trainStep returns `accumulating: true` and an empty `updatedTensorNames` array. The optimizer
-state, graph training step, and private working revision advance only when the
-window is applied. The Model revision does not advance until `commit()`.
+`gradientAccumulationSteps` defaults to one. Before a window completes, the
+result reports `accumulating: true` and no updated parameter names. Apply a
+short final window with `flushGradientAccumulation: true`, or discard pending
+gradients with:
 
 ~~~javascript
 const state = trainer.getGradientAccumulationState();
-// { pending, microbatches, accumulationSteps, examples }
-
 await trainer.resetGradientAccumulation();
 ~~~
 
-flushGradientAccumulation applies a partial window.
-resetGradientAccumulation discards the pending window before processing the
-current microbatch.
+Changing concrete shape, topology, optimizer/loss signature, or trainable set
+while gradients are pending is rejected. Checkpoint export and commit also
+require the window to be completed or reset.
 
-Changing backend, topology, optimizer/loss signature, or trainable tensor set
-while gradients are pending is rejected. Reset the window first.
+## Checkpoints and exact resume
 
-## Checkpoints
-
-Trainer checkpoints preserve graph topology, weights, optimizer moments,
-per-parameter steps, the training step, and optional application/tokenizer
-metadata from the private working revision:
+Dynamic checkpoints preserve the bounded logical document and fingerprint,
+fixed parameter descriptors/bytes, optimizer descriptor and moments,
+per-parameter steps, training step, quantization metadata, and optional
+application/tokenizer metadata.
 
 ~~~javascript
-import {
-  importModelCheckpoint,
-} from 'volvoxai/full';
+import { importModelCheckpoint } from 'volvoxai/full';
 
 const checkpoint = await trainer.exportCheckpoint({
   tokenizerMetadata,
@@ -269,225 +285,50 @@ const checkpoint = await trainer.exportCheckpoint({
 });
 
 const restored = importModelCheckpoint(checkpoint);
-const restoredModel = runtime.createModel(restored.graph);
-const restoredTrainer = await VolvoxAI.createTrainer(
-  restoredModel,
-  { backend: 'cpu', checkpoint },
-);
-~~~
-
-The checkpoint is structured-cloneable. Weight and optimizer payloads are
-safetensors ArrayBuffers. A checkpoint cannot be exported while unapplied
-gradient accumulation is pending; flush or reset it first. For low-level
-authoring, `exportModelCheckpoint()` and `importModelCheckpoint()`
-operate on explicit inputs. Post-step export uses `Trainer.exportCheckpoint()`
-so it captures the Trainer's private revision.
-
-## Dropout
-
-builder.dropout() creates inverted train-only Dropout:
-
-~~~javascript
-const regularized = builder.dropout(hidden, {
-  probability: 0.1,
-  seed: 42,
-  name: 'encoder.dropout',
+const resumed = await Trainer.create(restored.snapshot, {
+  backend: 'cpu',
+  checkpoint,
 });
 ~~~
 
-Its mask is deterministic from the node seed and training counter. Backward
-reconstructs the same mask. Inference treats the node as an exact identity and
-does not allocate a mask or load a backward shader.
+`importModelCheckpoint()` returns `{ snapshot, trainingStep,
+optimizerDescriptor, ... }`; it never returns a mutable graph. Passing the
+checkpoint to `Trainer.create()` restores the exact private optimizer state.
+The checkpoint and target snapshot must have the same logical fingerprint,
+including all symbolic bounds. Legacy concrete checkpoint formats are rejected.
 
-SDPA and CrossSDPA attention-probability dropout is applied after softmax
-during training and omitted during inference. JavaScript CPU, WebGPU, native
-CPU, Vulkan, OpenGL compute, and Metal regenerate the same deterministic rule
-for backward.
+`exportModelCheckpoint(snapshot)` creates a checkpoint for an immutable source
+without Trainer optimizer state. `Trainer.exportCheckpoint()` captures the
+private working revision. Checkpoint payloads are structured-cloneable and use
+safetensors `ArrayBuffer`s for parameters and optimizer slots.
 
-## GroupNorm
+## Dropout and trainable low-rank adapters
 
-builder.groupNorm() constructs NHWC GroupNorm with caller-supplied F32 affine
-tensors shaped [C]. The channel count must be divisible by numGroups:
+Author train-only Dropout as an ordinary logical node with a bounded symbolic
+output and `{ p, seed }` parameters. Its mask is deterministic from the node
+seed and training counter; inference treats it as identity. SDPA and CrossSDPA
+may similarly declare attention-probability dropout for training.
 
-~~~javascript
-const scale = builder.weight('norm.scale', [64], 'float32', {
-  initializer: { type: 'ones' },
-});
-const bias = builder.weight('norm.bias', [64], 'float32', {
-  initializer: { type: 'zeros' },
-});
-const normalized = builder.groupNorm(features, scale, bias, {
-  numGroups: 8,
-  epsilon: 1e-5,
-  name: 'vision.norm',
-});
-~~~
-
-GroupNorm and affine gradients are supported by JavaScript CPU, WebGPU, native
-CPU, Vulkan, OpenGL compute, and Metal training paths.
-
-## Mixture of Experts
-
-MoERouter returns top-k expert indices and weights. MoELinear executes the
-selected expert matrices and combines their results:
-
-~~~javascript
-const routerWeight = builder.weight(
-  'router', [8, 4], 'float32', new Float32Array(32));
-const experts = builder.weight(
-  'experts', [4, 8, 16], 'float32', new Float32Array(512));
-const routes = builder.moeRouter(hidden, routerWeight, {
-  topK: 2,
-  normalize: true,
-  temperature: 1,
-});
-const routed = builder.moeLinear(hidden, experts, routes).out;
-~~~
-
-With normalize: true, selected weights are renormalized among the top-k. With
-false, they remain probabilities from the softmax over all experts, so router
-gradients include selected and unselected logits.
-
-maskedMean(input, normalizedWeights) pools [B,T,D] to [B,D]. The caller supplies
-already normalized F32 weights shaped [B,T].
-
-Portable GPU MoE routing limits topK to 8. Native CPU does not inherit that
-shader limit.
-
-## Trainable LoRA
-
-`ModelBuilder.loraLinear()` adds explicit F32 factor weights and returns
-their exact names:
-
-~~~javascript
-const lora = builder.loraLinear(hidden, baseWeight, {
-  rank: 8,
-  alpha: 16,
-  bias: baseBias,
-  name: 'decoder.projection',
-});
-builder.outputs(lora.out);
-
-await trainer.trainStep({
-  inputs,
-  logitsTensor: 'logits',
-  targets,
-  trainableTensors: lora.trainableTensors,
-  updateMode: 'adamw',
-  optimizer: { learningRate: 1e-4 },
-});
-await trainer.commit();
-~~~
-
-The helper creates A=[d_in,rank] and B=[rank,d_out], a frozen scalar scale, and
-explicit base, low-rank, scale, and Add nodes. A uses Xavier-uniform
-initialization and B starts at zero unless overridden. Only A and B appear in
-trainableTensors; the base weight, bias, and scale remain frozen. Use
-layout: 'dout' for a base matrix stored [d_out,d_in].
-
-Immutable staged adapters are inference routing snapshots, not differentiable
-parameters. Train explicit A/B graph tensors, checkpoint them with optimizer
-state, and create a separate staged snapshot for deployment if needed.
-
-## Adapter routing
-
-An execution context owns its adapter selector:
-
-~~~javascript
-const route = builder.adapterRouting(
-  builder.adapterRoute('tenant-a', 3, 0.75),
-  builder.adapterRoute('tenant-b', 1, 1),
-);
-
-const compiled = await model.compile();
-const context = await compiled.createContext();
-const result = await context.execute(inputs, route);
-~~~
-
-A routed bottleneck adapter uses ordinary graph weights and can therefore be
-trained:
-
-~~~javascript
-const down = builder.weight(
-  'adapter.down', [experts, dModel, bottleneck], 'float32',
-  { initializer: { type: 'xavierUniform', seed: 20 } },
-);
-const up = builder.weight(
-  'adapter.up', [experts, bottleneck, dModel], 'float32',
-  { initializer: { type: 'zeros' } },
-);
-const adapted = builder.routedBottleneckAdapter(
-  hidden,
-  down,
-  up,
-  routes,
-  { dropout: 0.1, seed: 21, name: 'decoder.adapter' },
-);
-~~~
-
-The helper applies routed down projection, GELU, routed up projection, optional
-Dropout, and a residual Add.
-
-## Encoder-decoder construction
-
-Model-family builders stay under examples/. The seq2seq example composes the
-generic builder into token and position embeddings, full encoder
-self-attention, causal decoder self-attention, cross-attention, pre-norm
-feed-forward blocks, and a vocabulary projection.
-
-~~~javascript
-import {
-  buildEncoderDecoderTransformer,
-} from '../examples/seq2seq_training/Seq2SeqBuilder.js';
-
-const seq2seq = buildEncoderDecoderTransformer(builder, {
-  batchSize: 2,
-  sourceLength: 32,
-  targetLength: 24,
-  vocabSize: 8000,
-  dModel: 256,
-  numHeads: 8,
-  dFF: 1024,
-  encoderLayers: 4,
-  decoderLayers: 4,
-  padTokenId: 0,
-  bosTokenId: 1,
-  seed: 42,
-});
-
-const batch = seq2seq.teacherForcing(sourceTokenIds, targetTokenIds);
-await trainer.trainStep({
-  ...batch,
-  updateMode: 'adamw',
-  optimizer: { learningRate: 3e-4 },
-});
-await trainer.commit();
-~~~
-
-batchSize may be any positive model shape. Token, position, and attention-mask
-values are I32. Teacher forcing shifts each target row right, inserts bosTokenId,
-constructs position IDs and keep masks, and excludes padding from the loss.
-
-An F32 sourceFeatures tensor shaped [B,F,D] may be prepended to source token
-embeddings. Encoder memory and its mask then have length F+S. Feature-producing
-CNN/projection weights can train end-to-end when listed in the trainable set.
-
-SDPA and CrossSDPA masks may have shape [K], [B,K], [Q,K], or [B,Q,K];
-nonzero means visible. Fully masked rows produce zeros rather than NaNs.
+LoRA is represented explicitly in the logical graph: fixed base projection,
+F32 A and B weights, scale, low-rank MatMul nodes, and Add. Put only the A/B
+weight names in `trainableTensors`. There is no public concrete builder helper
+that hides those nodes. Immutable staged inference adapters are routing
+snapshots, not differentiable training parameters.
 
 ## Training limits
 
-- Trainable tensors must be F32.
-- Every operation between a loss and a trainable tensor needs a backward
-  implementation; unsupported paths fail the step explicitly.
-- SDPA and CrossSDPA support rank-2 [sequence,width] and rank-3
-  [batch,sequence,width] inputs.
+- Trainable parameters must be F32 and have fixed storage shape.
+- Public input ranks are fixed; only declared bounded extents are dynamic.
+- Every operation between a loss and a trainable parameter needs a backward
+  implementation; unsupported paths fail explicitly.
+- SDPA and CrossSDPA support rank-2 `[sequence,width]` and rank-3
+  `[batch,sequence,width]` inputs on documented training paths.
 - Portable WebGPU and native GPU attention shaders limit head width to 64.
-- Native and WebGPU BatchNorm training uses stored running statistics as an
-  affine operation and does not update those statistics.
-- Native GPU training preflights a complete backward plan. An unsupported GPU
-  path selects the complete native CPU path before backward begins.
-- The full inference entry remains free of gradient allocation until a Trainer
-  is created; the inference-only entry contains no training dependency.
+- Deep quantized operator backward, fake-quantization QAT, and FP16/AMP
+  training are not supported.
+- The inference entry contains no Trainer, optimizer, autograd, or compiled
+  training code.
 
-See [the operation matrix](operation_list.md) for exact backend coverage.
+See [the operation matrix](operation_list.md) and
+[training/PTQ runtime matrix](training-ptq-runtime-matrix.md) for backend
+coverage.

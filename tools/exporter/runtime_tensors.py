@@ -15,8 +15,8 @@ JS_NUMBER_MAX_SAFE_INTEGER = (1 << 53) - 1
 
 # Runtime graph values use the four canonical execution dtypes. F16 is legal
 # only as immutable safetensors storage, but allocation accounting is still
-# four bytes per element because GraphLoader expands it to an F32 array before
-# constructing the JavaScript weight Tensor. Physical F16 file-span checks
+# four bytes per element because logical weight hydration expands it to an F32
+# execution buffer. Physical F16 file-span checks
 # remain the responsibility of the safetensors parser.
 RUNTIME_DTYPE_BYTES = {
     "float32": 4,

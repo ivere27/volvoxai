@@ -155,11 +155,14 @@ int main(void) {
     if (!pool) return 1;
     scope = vx_kernel_thread_pool_scope_enter(pool);
     static const QSDPATestCase cases[] = {
-        /* Exact TinyReceipt decoder cross-attention dimensions. */
+        /* Representative bounded decoder cross-attention dimensions. */
         {1u, 192u, 402u, 320u, 8u, VX_DTYPE_I8, VX_DTYPE_I8,
          VX_DTYPE_I8, VX_DTYPE_I8, 0u, 0u},
         {1u, 96u, 96u, 128u, 8u, VX_DTYPE_U8, VX_DTYPE_I8,
          VX_DTYPE_U8, VX_DTYPE_U8, 1u, 1u},
+        /* Head dimension 12 exercises the AVX2 dot's scalar four-byte tail. */
+        {1u, 17u, 23u, 96u, 8u, VX_DTYPE_U8, VX_DTYPE_U8,
+         VX_DTYPE_I8, VX_DTYPE_I8, 0u, 0u},
         {2u, 48u, 64u, 128u, 8u, VX_DTYPE_I8, VX_DTYPE_U8,
          VX_DTYPE_I8, VX_DTYPE_U8, 0u, 2u},
         {2u, 48u, 64u, 128u, 8u, VX_DTYPE_U8, VX_DTYPE_U8,

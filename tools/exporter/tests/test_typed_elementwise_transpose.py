@@ -117,7 +117,7 @@ class RuntimeElementwiseTransposeTests(unittest.TestCase):
             RuntimeElementwiseTransposePass(),
             RuntimeShapeChainPass(),
             RuntimeCanonicalizePass(),
-        )).run(graph)
+        ), shape_profile={}).run(graph)
 
         self.assertGreaterEqual(report.total_changes, 2)
         self.assertEqual([node.op_type for node in graph.nodes], ["ReLU", "Identity"])
@@ -131,7 +131,9 @@ class RuntimeElementwiseTransposeTests(unittest.TestCase):
         b = np.asarray([[[6, 5, 4], [3, 2, 1]]], dtype=np.float32)
         expected = execute_reference(graph, {}, {"a": a, "b": b}).outputs["y"]
 
-        report = VerifiedPipeline((RuntimeElementwiseTransposePass(),)).run(graph)
+        report = VerifiedPipeline(
+            (RuntimeElementwiseTransposePass(),), shape_profile={},
+        ).run(graph)
 
         self.assertEqual(report.total_changes, 1)
         self.assertEqual([node.op_type for node in graph.nodes], ["Add", "Transpose"])
@@ -156,7 +158,9 @@ class RuntimeElementwiseTransposeTests(unittest.TestCase):
             with self.subTest(source=graph.source_name, outputs=tuple(graph.outputs)):
                 before = graph.fingerprint()
                 expected = execute_reference(graph, {}, inputs).outputs
-                report = VerifiedPipeline((RuntimeElementwiseTransposePass(),)).run(graph)
+                report = VerifiedPipeline(
+                    (RuntimeElementwiseTransposePass(),), shape_profile={},
+                ).run(graph)
                 self.assertEqual(report.total_changes, 0)
                 self.assertEqual(graph.fingerprint(), before)
                 actual = execute_reference(graph, {}, inputs).outputs

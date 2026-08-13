@@ -10,7 +10,20 @@ import { runtimeOperatorNames } from './generated/volvoxaiGraphOperators.mjs';
 export const VOLVOX_GRAPH_FORMAT = 'volvox-graph/v1';
 export const VOLVOX_AFFINE_FORMAT = 'volvox-affine-safetensors/v1';
 const GRAPH_DTYPES = new Set(['float32', 'int32', 'int8', 'uint8']);
+const GRAPH_DTYPE_BYTES = new Map([
+  ['float32', 4n],
+  ['int32', 4n],
+  ['int8', 1n],
+  ['uint8', 1n],
+]);
 const RUNTIME_OPERATOR_NAMES = new Set(runtimeOperatorNames);
+const SHAPE_SYMBOL_PATTERN = /^[A-Za-z][A-Za-z0-9_]{0,63}$/u;
+const MAX_SAFE_INTEGER_BIGINT = BigInt(Number.MAX_SAFE_INTEGER);
+const ROOT_FIELDS = ['format', 'dimensions', 'inputs', 'nodes', 'outputs'];
+const ROOT_OPTIONAL_FIELDS = ['banks', 'quantization'];
+const INPUT_FIELDS = ['dtype', 'shape'];
+const NODE_FIELDS = ['id', 'opType', 'inputs', 'outputs', 'params'];
+const OUTPUT_FIELDS = ['tensor', 'dtype', 'shape'];
 const runFile = promisify(execFile);
 const REPOSITORY_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const SAFETENSORS_DTYPES = new Map([
@@ -215,24 +228,27 @@ async function readSafetensorsFile(filename) {
       throw new Error(`${filename}: tensor ${JSON.stringify(name)} has unsupported dtype ${JSON.stringify(entry.dtype)}`);
     }
     if (!Array.isArray(entry.shape) || entry.shape.some((dimension) =>
-      !Number.isSafeInteger(dimension) || dimension < 0)) {
+      !Number.isSafeInteger(dimension) || dimension <= 0)) {
       throw new Error(`${filename}: tensor ${JSON.stringify(name)} has an invalid shape`);
     }
-    let elementCount = 1;
+    let elementCount = 1n;
     for (const dimension of entry.shape) {
-      elementCount *= dimension;
-      if (!Number.isSafeInteger(elementCount)) {
-        throw new Error(`${filename}: tensor ${JSON.stringify(name)} shape is too large`);
-      }
+      elementCount *= BigInt(dimension);
     }
-    const expectedBytes = elementCount * dtypeInfo.bytes;
-    if (!Number.isSafeInteger(expectedBytes) || !Array.isArray(entry.data_offsets) ||
+    const expectedBytes = elementCount * BigInt(dtypeInfo.bytes);
+    if (elementCount > MAX_SAFE_INTEGER_BIGINT || expectedBytes > MAX_SAFE_INTEGER_BIGINT) {
+      throw new Error(
+        `${filename}: tensor ${JSON.stringify(name)} exceeds safe static allocation limits`,
+      );
+    }
+    if (!Array.isArray(entry.data_offsets) ||
         entry.data_offsets.length !== 2 || entry.data_offsets.some((offset) =>
           !Number.isSafeInteger(offset))) {
       throw new Error(`${filename}: tensor ${JSON.stringify(name)} has invalid data offsets`);
     }
     const [start, end] = entry.data_offsets;
-    if (start < 0 || end < start || end > dataLength || end - start !== expectedBytes) {
+    if (start < 0 || end < start || end > dataLength ||
+        BigInt(end - start) !== expectedBytes) {
       throw new Error(`${filename}: tensor ${JSON.stringify(name)} data span is invalid`);
     }
     const tensor = {
@@ -314,6 +330,110 @@ function sameFields(value, expected) {
   return actual.length === wanted.length && actual.every((field, index) => field === wanted[index]);
 }
 
+function exactFields(value, required, optional, label, failures) {
+  if (!isObject(value)) {
+    failures.push(`${label} must be an object`);
+    return false;
+  }
+  const allowed = new Set([...required, ...optional]);
+  const unsupported = Object.keys(value).filter((field) => !allowed.has(field)).sort();
+  const missing = required.filter((field) => !Object.hasOwn(value, field));
+  if (unsupported.length > 0) {
+    failures.push(`${label} has unsupported field ${JSON.stringify(unsupported[0])}`);
+  }
+  if (missing.length > 0) {
+    failures.push(`${label} requires field ${JSON.stringify(missing[0])}`);
+  }
+  return unsupported.length === 0 && missing.length === 0;
+}
+
+function validateDimensions(value, filename, failures) {
+  if (!isObject(value)) {
+    failures.push(`${filename}: graph dimensions must be an object`);
+    return null;
+  }
+  const environment = new Map();
+  for (const name of Object.keys(value).sort()) {
+    const label = `${filename}: dimension ${JSON.stringify(name)}`;
+    if (!SHAPE_SYMBOL_PATTERN.test(name)) {
+      failures.push(`${label} name must match /^[A-Za-z][A-Za-z0-9_]{0,63}$/`);
+      continue;
+    }
+    const descriptor = value[name];
+    if (!exactFields(descriptor, ['min', 'max'], ['multiple_of'], label, failures)) {
+      continue;
+    }
+    const minimum = descriptor.min;
+    const maximum = descriptor.max;
+    const multiple = Object.hasOwn(descriptor, 'multiple_of')
+      ? descriptor.multiple_of
+      : 1;
+    if (![minimum, maximum, multiple].every((item) =>
+      Number.isSafeInteger(item) && item > 0) || minimum > maximum) {
+      failures.push(
+        `${label} requires positive safe-integer min/max/multiple_of with min <= max`,
+      );
+      continue;
+    }
+    const minimumBig = BigInt(minimum);
+    const maximumBig = BigInt(maximum);
+    const multipleBig = BigInt(multiple);
+    const firstLegal = ((minimumBig + multipleBig - 1n) / multipleBig) * multipleBig;
+    if (firstLegal > maximumBig) {
+      failures.push(`${label} has no legal multiple_of value inside its bounds`);
+      continue;
+    }
+    environment.set(name, Object.freeze({ min: minimum, max: maximum, multiple_of: multiple }));
+  }
+  return environment;
+}
+
+function validateBoundedShape(value, dtype, environment, label, failures) {
+  if (!Array.isArray(value)) {
+    failures.push(`${label} must be a fixed-rank shape array`);
+    return false;
+  }
+  let elementCount = 1n;
+  let valid = true;
+  for (const [axis, dimension] of value.entries()) {
+    let maximum;
+    if (Number.isSafeInteger(dimension) && dimension > 0) {
+      maximum = dimension;
+    } else if (typeof dimension === 'string' && environment?.has(dimension)) {
+      maximum = environment.get(dimension).max;
+    } else {
+      failures.push(
+        `${label}[${axis}] must be a positive safe integer or declared dimension symbol`,
+      );
+      valid = false;
+      continue;
+    }
+    elementCount *= BigInt(maximum);
+    if (elementCount > MAX_SAFE_INTEGER_BIGINT) {
+      failures.push(`${label} maximum element count exceeds Number.MAX_SAFE_INTEGER`);
+      valid = false;
+      break;
+    }
+  }
+  const dtypeBytes = GRAPH_DTYPE_BYTES.get(dtype);
+  if (dtypeBytes !== undefined && elementCount * dtypeBytes > MAX_SAFE_INTEGER_BIGINT) {
+    failures.push(`${label} maximum byte length exceeds Number.MAX_SAFE_INTEGER`);
+    valid = false;
+  }
+  return valid;
+}
+
+function nodeOutputTensorNames(node) {
+  if (!isObject(node?.outputs)) return [];
+  const names = [];
+  for (const descriptor of Object.values(node.outputs)) {
+    if (isObject(descriptor) && typeof descriptor.tensor === 'string') {
+      names.push(descriptor.tensor);
+    }
+  }
+  return names;
+}
+
 function findInlineAffineParam(value, path = 'params') {
   if (Array.isArray(value)) {
     for (const [index, item] of value.entries()) {
@@ -331,6 +451,124 @@ function findInlineAffineParam(value, path = 'params') {
     if (found) return found;
   }
   return null;
+}
+
+function validateClosedGraphSchema(document, filename, failures) {
+  if (document.format !== VOLVOX_GRAPH_FORMAT) {
+    failures.push(
+      `${filename}: format must be exactly '${VOLVOX_GRAPH_FORMAT}', got ${JSON.stringify(document.format)}`,
+    );
+  }
+  exactFields(
+    document,
+    ROOT_FIELDS,
+    ROOT_OPTIONAL_FIELDS,
+    `${filename}: graph root`,
+    failures,
+  );
+  const environment = validateDimensions(document.dimensions, filename, failures);
+
+  if (!isObject(document.inputs)) {
+    failures.push(`${filename}: graph requires an inputs object`);
+  } else {
+    for (const [name, descriptor] of Object.entries(document.inputs)) {
+      const label = `${filename}: input ${JSON.stringify(name)}`;
+      if (!name.trim()) failures.push(`${label} name must be non-empty`);
+      if (!exactFields(descriptor, INPUT_FIELDS, [], label, failures)) continue;
+      if (!GRAPH_DTYPES.has(descriptor.dtype)) {
+        failures.push(`${label} requires a canonical lowercase runtime dtype`);
+      }
+      validateBoundedShape(
+        descriptor.shape,
+        descriptor.dtype,
+        environment,
+        `${label} shape`,
+        failures,
+      );
+    }
+  }
+
+  const nodeIds = new Set();
+  if (!Array.isArray(document.nodes)) {
+    failures.push(`${filename}: graph requires a nodes array`);
+  } else {
+    document.nodes.forEach((node, index) => {
+      const label = `${filename}: node ${index}`;
+      if (!isObject(node)) {
+        failures.push(`${label} must be an object`);
+        return;
+      }
+      if (Object.hasOwn(node, 'outputs_shape') || Object.hasOwn(node, 'outputs_dtype')) {
+        failures.push(
+          `${label} uses legacy split output descriptors; re-export with unified outputs`,
+        );
+        return;
+      }
+      if (!exactFields(node, NODE_FIELDS, [], label, failures)) return;
+      if (typeof node.id !== 'string' || !node.id.trim()) {
+        failures.push(`${label} requires a non-empty id`);
+      } else if (nodeIds.has(node.id)) {
+        failures.push(`${label} duplicates node id ${JSON.stringify(node.id)}`);
+      } else {
+        nodeIds.add(node.id);
+      }
+      if (typeof node.opType !== 'string' || !node.opType.trim()) {
+        failures.push(`${label} requires a non-empty opType`);
+      } else if (!RUNTIME_OPERATOR_NAMES.has(node.opType)) {
+        failures.push(
+          `${label} uses unknown or offline-only current-v1 opType ${JSON.stringify(node.opType)}`,
+        );
+      }
+      if (!isObject(node.inputs)) {
+        failures.push(`${label} requires an inputs object`);
+      } else {
+        for (const [port, tensor] of Object.entries(node.inputs)) {
+          if (!port.trim() || typeof tensor !== 'string' || !tensor.trim()) {
+            failures.push(`${label} input ${JSON.stringify(port)} must name a tensor`);
+          }
+        }
+      }
+      if (!isObject(node.params)) {
+        failures.push(`${label} params must be an object`);
+      } else {
+        const inlineAffinePath = findInlineAffineParam(node.params);
+        if (inlineAffinePath) {
+          failures.push(`${label} forbids inline affine field '${inlineAffinePath}'`);
+        }
+      }
+      if (!isObject(node.outputs) || Object.keys(node.outputs).length === 0) {
+        failures.push(`${label} requires named output descriptors`);
+        return;
+      }
+      for (const [port, descriptor] of Object.entries(node.outputs)) {
+        const outputLabel = `${label} output ${JSON.stringify(port)}`;
+        if (!port.trim()) failures.push(`${outputLabel} port must be non-empty`);
+        if (!exactFields(descriptor, OUTPUT_FIELDS, [], outputLabel, failures)) continue;
+        if (typeof descriptor.tensor !== 'string' || !descriptor.tensor.trim()) {
+          failures.push(`${outputLabel} tensor must be a non-empty name`);
+        }
+        if (!GRAPH_DTYPES.has(descriptor.dtype)) {
+          failures.push(`${outputLabel} requires a canonical lowercase runtime dtype`);
+        }
+        validateBoundedShape(
+          descriptor.shape,
+          descriptor.dtype,
+          environment,
+          `${outputLabel} shape`,
+          failures,
+        );
+      }
+    });
+  }
+
+  if (!Array.isArray(document.outputs) || document.outputs.length === 0 ||
+      document.outputs.some((name) => typeof name !== 'string' || !name.trim()) ||
+      new Set(document.outputs).size !== document.outputs.length) {
+    failures.push(
+      `${filename}: graph outputs must be a non-empty array of unique non-empty tensor names`,
+    );
+  }
+  return environment;
 }
 
 function tensorValues(tensor) {
@@ -369,7 +607,8 @@ function validateTopology(document, safetensors, filename, failures) {
       }
     }
     if (!isObject(node.outputs)) continue;
-    for (const [port, name] of Object.entries(node.outputs)) {
+    for (const [port, descriptor] of Object.entries(node.outputs)) {
+      const name = isObject(descriptor) ? descriptor.tensor : null;
       if (!port.trim() || typeof name !== 'string' || !name.trim()) continue;
       if (available.has(name)) {
         failures.push(`${filename}: node ${index} output ${JSON.stringify(name)} collides with an existing tensor`);
@@ -382,6 +621,53 @@ function validateTopology(document, safetensors, filename, failures) {
   for (const name of document.outputs) {
     if (typeof name === 'string' && name.trim() && !available.has(name)) {
       failures.push(`${filename}: public output ${JSON.stringify(name)} is unresolved`);
+    }
+  }
+}
+
+function validateWeightBanks(document, safetensors, filename, failures) {
+  if (!Object.hasOwn(document, 'banks')) return;
+  if (!isObject(document.banks)) {
+    failures.push(`${filename}: banks must be an object`);
+    return;
+  }
+  const dimensions = isObject(document.dimensions) ? document.dimensions : {};
+  for (const [name, dimension] of Object.entries(document.banks)) {
+    const label = `${filename}: bank ${JSON.stringify(name)}`;
+    if (typeof dimension !== 'string' || !dimension.trim()) {
+      failures.push(`${label} must name a non-empty declared dimension`);
+      continue;
+    }
+    const constraint = dimensions[dimension];
+    if (!isObject(constraint)) {
+      failures.push(`${label} references undeclared dimension ${JSON.stringify(dimension)}`);
+      continue;
+    }
+    const multiple = Object.hasOwn(constraint, 'multiple_of') ? constraint.multiple_of : 1;
+    if (![constraint.min, constraint.max, multiple].every((value) =>
+      Number.isSafeInteger(value) && value > 0) || constraint.min > constraint.max) {
+      // validateDimensions owns the malformed-constraint diagnostic.
+      continue;
+    }
+    const weight = safetensors.get(name);
+    if (!weight) {
+      failures.push(`${label} does not name a supplied fixed weight`);
+      continue;
+    }
+    if (weight.shape.length < 2) {
+      failures.push(`${label} weight needs a slot axis and at least one payload axis`);
+      continue;
+    }
+    const slots = weight.shape[0];
+    if (slots < constraint.min || slots > constraint.max) {
+      failures.push(
+        `${label} supplies ${slots} slots outside dimension ${JSON.stringify(dimension)} ` +
+        `bounds [${constraint.min}, ${constraint.max}]`,
+      );
+      continue;
+    }
+    if (slots % multiple !== 0) {
+      failures.push(`${label} supplies ${slots} slots, which is not a multiple of ${multiple}`);
     }
   }
 }
@@ -402,13 +688,6 @@ function validateAffineQuantization(document, safetensors, filename, failures) {
       failures.push(`${filename}: node ${index} forbids inline outputs_quantization`);
     }
   }
-  for (const [name, descriptor] of Object.entries(
-    isObject(document.standaloneTensors) ? document.standaloneTensors : {},
-  )) {
-    if (isObject(descriptor) && Object.hasOwn(descriptor, 'quantization')) {
-      failures.push(`${filename}: standalone tensor ${JSON.stringify(name)} forbids inline quantization`);
-    }
-  }
   if (document.quantization == null) return;
   const root = document.quantization;
   if (!isObject(root) || !sameFields(root, ['format', 'tensors']) ||
@@ -425,20 +704,15 @@ function validateAffineQuantization(document, safetensors, filename, failures) {
     }
   }
   for (const node of Array.isArray(document.nodes) ? document.nodes : []) {
-    if (!isObject(node) || !isObject(node.outputs) || !isObject(node.outputs_shape) ||
-        !isObject(node.outputs_dtype)) continue;
-    for (const [port, name] of Object.entries(node.outputs)) {
-      if (typeof name === 'string' && GRAPH_DTYPES.has(node.outputs_dtype[port]) &&
-          Array.isArray(node.outputs_shape[port])) {
-        declared.set(name, { dtype: node.outputs_dtype[port], shape: node.outputs_shape[port] });
+    if (!isObject(node) || !isObject(node.outputs)) continue;
+    for (const descriptor of Object.values(node.outputs)) {
+      if (isObject(descriptor) && typeof descriptor.tensor === 'string' &&
+          GRAPH_DTYPES.has(descriptor.dtype) && Array.isArray(descriptor.shape)) {
+        declared.set(descriptor.tensor, {
+          dtype: descriptor.dtype,
+          shape: descriptor.shape,
+        });
       }
-    }
-  }
-  for (const [name, descriptor] of Object.entries(
-    isObject(document.standaloneTensors) ? document.standaloneTensors : {},
-  )) {
-    if (isObject(descriptor) && GRAPH_DTYPES.has(descriptor.dtype) && Array.isArray(descriptor.shape)) {
-      declared.set(name, { dtype: descriptor.dtype, shape: descriptor.shape });
     }
   }
 
@@ -476,6 +750,12 @@ function validateAffineQuantization(document, safetensors, filename, failures) {
         continue;
       }
       count = target.shape[axis];
+      if (!Number.isSafeInteger(count) || count <= 0) {
+        failures.push(
+          `${filename}: per-axis quantization for ${JSON.stringify(name)} requires a constant target axis`,
+        );
+        continue;
+      }
     }
     const scale = safetensors.get(descriptor.scale_tensor);
     const zeroPoint = safetensors.get(descriptor.zero_point_tensor);
@@ -510,7 +790,7 @@ function validateAffineQuantization(document, safetensors, filename, failures) {
       failures.push(`${filename}: quantization parameter ${JSON.stringify(name)} cannot be a public output`);
     }
     for (const [index, node] of (Array.isArray(document.nodes) ? document.nodes : []).entries()) {
-      if (isObject(node) && isObject(node.outputs) && Object.values(node.outputs).includes(name)) {
+      if (isObject(node) && nodeOutputTensorNames(node).includes(name)) {
         failures.push(`${filename}: node ${index} cannot produce reserved quantization parameter ${JSON.stringify(name)}`);
       }
     }
@@ -518,7 +798,7 @@ function validateAffineQuantization(document, safetensors, filename, failures) {
   for (const [index, node] of (Array.isArray(document.nodes) ? document.nodes : []).entries()) {
     if (!isObject(node) || !isObject(node.inputs) || !isObject(node.outputs)) continue;
     if (node.opType === 'QuantizeLinear') {
-      for (const outputName of Object.values(node.outputs)) {
+      for (const outputName of nodeOutputTensorNames(node)) {
         const descriptor = root.tensors[outputName];
         if (!isObject(descriptor) || descriptor.scale_tensor !== node.inputs.scale ||
             descriptor.zero_point_tensor !== node.inputs.zero_point) {
@@ -582,76 +862,7 @@ export async function validateModelPackages(roots) {
           failures.push(`${filename}: graph document must be a JSON object`);
           continue;
         }
-        if (document.format !== VOLVOX_GRAPH_FORMAT) {
-          failures.push(
-            `${filename}: format must be exactly '${VOLVOX_GRAPH_FORMAT}', got ${JSON.stringify(document.format)}`,
-          );
-        }
-        if (!isObject(document.inputs)) {
-          failures.push(`${filename}: graph requires an inputs object`);
-        } else {
-          for (const [name, descriptor] of Object.entries(document.inputs)) {
-            if (!isObject(descriptor) || !Array.isArray(descriptor.shape) ||
-                descriptor.shape.some((dimension) =>
-                  !Number.isSafeInteger(dimension) || dimension <= 0) ||
-                !GRAPH_DTYPES.has(descriptor.dtype)) {
-              failures.push(
-                `${filename}: input ${JSON.stringify(name)} requires a positive-integer shape array and canonical lowercase dtype`,
-              );
-            }
-          }
-        }
-        if (!Array.isArray(document.nodes)) {
-          failures.push(`${filename}: graph requires a nodes array`);
-        } else {
-          document.nodes.forEach((node, index) => {
-            if (!isObject(node) || typeof node.opType !== 'string' || !node.opType.trim()) {
-              failures.push(`${filename}: node ${index} requires a non-empty opType`);
-              return;
-            }
-            if (!RUNTIME_OPERATOR_NAMES.has(node.opType)) {
-              failures.push(
-                `${filename}: node ${index} uses unknown or offline-only current-v1 opType ${JSON.stringify(node.opType)}`,
-              );
-            }
-            if (Object.hasOwn(node, 'op')) {
-              failures.push(`${filename}: node ${index} forbids alias field 'op'; use 'opType'`);
-            }
-            if (!isObject(node.inputs)) {
-              failures.push(`${filename}: node ${index} requires an inputs object`);
-            }
-            if (Object.hasOwn(node, 'params') && !isObject(node.params)) {
-              failures.push(`${filename}: node ${index} params must be an object`);
-            } else if (isObject(node.params)) {
-              const inlineAffinePath = findInlineAffineParam(node.params);
-              if (inlineAffinePath) {
-                failures.push(`${filename}: node ${index} forbids inline affine field '${inlineAffinePath}'`);
-              }
-            }
-            if (!isObject(node.outputs) || Object.keys(node.outputs).length === 0 ||
-                Object.values(node.outputs || {}).some((name) =>
-                  typeof name !== 'string' || name.trim().length === 0)) {
-              failures.push(`${filename}: node ${index} requires named outputs`);
-              return;
-            }
-            if (!isObject(node.outputs_shape)) {
-              failures.push(`${filename}: node ${index} requires an outputs_shape object`);
-              return;
-            }
-            const outputKeys = Object.keys(node.outputs);
-            if (Object.keys(node.outputs_shape).some((key) => !outputKeys.includes(key)) ||
-                outputKeys.some((key) => !Array.isArray(node.outputs_shape[key]) ||
-                  node.outputs_shape[key].some((dimension) =>
-                    !Number.isSafeInteger(dimension) || dimension <= 0))) {
-              failures.push(`${filename}: node ${index} outputs_shape must provide one positive-integer shape array per output`);
-            }
-            if (!isObject(node.outputs_dtype) ||
-                Object.keys(node.outputs_dtype).some((key) => !outputKeys.includes(key)) ||
-                outputKeys.some((key) => !GRAPH_DTYPES.has(node.outputs_dtype[key]))) {
-              failures.push(`${filename}: node ${index} outputs_dtype must use canonical lowercase dtypes`);
-            }
-          });
-        }
+        validateClosedGraphSchema(document, filename, failures);
         const graphSafetensors = nearestSafetensorsFiles(filename, safetensorsFiles);
         semanticPackages.push(Object.freeze({
           graph: filename,
@@ -670,12 +881,8 @@ export async function validateModelPackages(roots) {
           }
         }
         const safetensorsIndex = safetensorsIndexes.get(cacheKey);
+        validateWeightBanks(document, safetensorsIndex, filename, failures);
         validateAffineQuantization(document, safetensorsIndex, filename, failures);
-        if (!Array.isArray(document.outputs) || document.outputs.length === 0 ||
-            document.outputs.some((name) => typeof name !== 'string' || name.trim().length === 0) ||
-            new Set(document.outputs).size !== document.outputs.length) {
-          failures.push(`${filename}: graph outputs must be a non-empty array of unique non-empty tensor names`);
-        }
         validateTopology(document, safetensorsIndex, filename, failures);
         continue;
       }

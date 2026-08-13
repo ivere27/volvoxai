@@ -58,6 +58,20 @@ fn output_byte(value : i32) -> u32 {
   return bitcast<u32>(value) & 255u;
 }
 
+fn requantize(accumulator : i32) -> u32 {
+  let multiplier = (params.a_scale * params.b_scale) / params.output_scale;
+  let transformed = f32(accumulator) * multiplier +
+    f32(params.output_zero_point);
+  let minimum = select(0, -128, params.output_type == 6u);
+  let maximum = select(255, 127, params.output_type == 6u);
+  if (transformed != transformed) {
+    return output_byte(params.output_zero_point);
+  }
+  if (transformed <= f32(minimum)) { return output_byte(minimum); }
+  if (transformed >= f32(maximum)) { return output_byte(maximum); }
+  return output_byte(round_even(transformed));
+}
+
 fn matmul_one(index : u32) -> u32 {
   if (index >= params.output_elements) { return 0u; }
   let matrix_elements = params.m * params.n;
@@ -83,26 +97,67 @@ fn matmul_one(index : u32) -> u32 {
       (a_element - params.a_zero_point) *
       (b_element - params.b_zero_point);
   }
-  let multiplier = (params.a_scale * params.b_scale) / params.output_scale;
-  let transformed = f32(accumulator) * multiplier +
-    f32(params.output_zero_point);
-  let minimum = select(0, -128, params.output_type == 6u);
-  let maximum = select(255, 127, params.output_type == 6u);
-  if (transformed != transformed) {
-    return output_byte(params.output_zero_point);
+  return requantize(accumulator);
+}
+
+// The portable path is also the OpenGL fallback, where no signed integer dot
+// product extension is guaranteed.  One storage invocation still owns one
+// packed output word, but the common four-adjacent-column case shares the
+// broadcast indexing and A loads across all four results.  This preserves the
+// arbitrary-N contract: packed words that straddle a matrix row use the scalar
+// path below.
+fn matmul_word(first : u32) -> u32 {
+  let matrix_elements = params.m * params.n;
+  let matrix_index = first % matrix_elements;
+  let column = matrix_index % params.n;
+  if (first + 3u >= params.output_elements || column + 3u >= params.n) {
+    var packed = matmul_one(first);
+    packed = packed | (matmul_one(first + 1u) << 8u);
+    packed = packed | (matmul_one(first + 2u) << 16u);
+    packed = packed | (matmul_one(first + 3u) << 24u);
+    return packed;
   }
-  if (transformed <= f32(minimum)) { return output_byte(minimum); }
-  if (transformed >= f32(maximum)) { return output_byte(maximum); }
-  return output_byte(round_even(transformed));
+
+  let batch = first / matrix_elements;
+  let row = matrix_index / params.n;
+  var remaining = batch;
+  var a_base = 0u;
+  var b_base = 0u;
+  for (var axis = 0u; axis < params.batch_rank; axis = axis + 1u) {
+    let output_stride = metadata[axis];
+    let coordinate = remaining / output_stride;
+    remaining = remaining % output_stride;
+    a_base = a_base + coordinate * metadata[params.batch_rank + axis];
+    b_base = b_base + coordinate * metadata[2u * params.batch_rank + axis];
+  }
+
+  var accumulator0 = 0;
+  var accumulator1 = 0;
+  var accumulator2 = 0;
+  var accumulator3 = 0;
+  for (var inner = 0u; inner < params.k; inner = inner + 1u) {
+    let a_element = a_value(a_base + row * params.k + inner) -
+      params.a_zero_point;
+    let b_offset = b_base + inner * params.n + column;
+    accumulator0 = accumulator0 + a_element *
+      (b_value(b_offset) - params.b_zero_point);
+    accumulator1 = accumulator1 + a_element *
+      (b_value(b_offset + 1u) - params.b_zero_point);
+    accumulator2 = accumulator2 + a_element *
+      (b_value(b_offset + 2u) - params.b_zero_point);
+    accumulator3 = accumulator3 + a_element *
+      (b_value(b_offset + 3u) - params.b_zero_point);
+  }
+
+  return requantize(accumulator0) |
+    (requantize(accumulator1) << 8u) |
+    (requantize(accumulator2) << 16u) |
+    (requantize(accumulator3) << 24u);
 }
 
 @compute @workgroup_size(64)
 fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
   let first = gid.x * 4u;
   if (first >= params.output_elements) { return; }
-  var packed = matmul_one(first);
-  packed = packed | (matmul_one(first + 1u) << 8u);
-  packed = packed | (matmul_one(first + 2u) << 16u);
-  packed = packed | (matmul_one(first + 3u) << 24u);
-  output_words[gid.x] = packed;
+  output_words[gid.x] = matmul_word(first);
 }

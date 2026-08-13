@@ -1,6 +1,4 @@
 .PHONY: all clean cpp_ffi_example run_cpp_ffi_example \
-	native_receipt_inference_example \
-	test_native_receipt_inference run_native_receipt_inference \
 	native_receipt_split_inference_example \
 	test_native_receipt_split_inference run_native_receipt_split_inference \
 	native_task_cli test_native_task_cli build_ffi
@@ -15,7 +13,6 @@ CPP_FFI_LITE_HEADER    := $(CPP_FFI_LITE_DIR)/volvoxai_lite.h
 CPP_FFI_LITE_SOURCE    := $(CPP_FFI_LITE_DIR)/volvoxai_lite.c
 CPP_FFI_LITE_OBJECT    := $(OBJ_DIR)/volvoxai_lite.o
 CPP_FFI_EXAMPLE        := $(BIN_DIR)/cpp_ffi_client
-NATIVE_RECEIPT_EXAMPLE       := $(BIN_DIR)/tiny_receipt_w8a8
 NATIVE_RECEIPT_SPLIT_EXAMPLE := $(BIN_DIR)/tiny_receipt_split_w8a8
 NATIVE_TASK_CLI              := $(BIN_DIR)/volvoxai-tasks
 
@@ -47,18 +44,6 @@ run_cpp_ffi_example: build_ffi cpp_ffi_example
 	$(CPP_FFI_EXAMPLE) $(RUNTIME_LIBRARY) \
 		$(ROOT)/models/efficientdet_lite0_fp32/graph.json \
 		$(ROOT)/models/efficientdet_lite0_fp32/model.safetensors
-
-native_receipt_inference_example:
-	$(MAKE) -C $(ROOT) build_tiny_receipt_native_example
-
-test_native_receipt_inference:
-	$(MAKE) -C $(ROOT) test_tiny_receipt_native_example
-
-run_native_receipt_inference: native_receipt_inference_example
-	@test -n "$(PACKAGE)" || { echo "Error: pass PACKAGE=/path/to/package"; exit 1; }
-	@test -n "$(IMAGE)" || { echo "Error: pass IMAGE=/path/to/receipt.png"; exit 1; }
-	@test -n "$(PROMPT)" || { echo "Error: pass PROMPT='question'"; exit 1; }
-	$(NATIVE_RECEIPT_EXAMPLE) "$(PACKAGE)" --image "$(IMAGE)" --prompt "$(PROMPT)"
 
 native_receipt_split_inference_example:
 	$(MAKE) -C $(ROOT) build_tiny_receipt_split_native_example

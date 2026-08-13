@@ -2,10 +2,10 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 
 import { CPUEngine } from '../ts/backends/CPUEngine.js';
-import { Graph } from '../ts/core/Graph.js';
+import { RuntimeGraph } from '../ts/core/RuntimeGraph.js';
 
 function makeGraph(inputDtype, inputQuantization, outputDtype, outputQuantization) {
-  const graph = new Graph();
+  const graph = new RuntimeGraph();
   const input = graph.addInput('input', [7], inputDtype, { quantization: inputQuantization });
   const { out } = graph.addOp('RequantizeLinear', { input }, {
     out: { name: 'out', shape: [7], dtype: outputDtype, quantization: outputQuantization },
@@ -38,7 +38,7 @@ test('CPU RequantizeLinear uses ties-to-even and saturates in the destination ra
 });
 
 test('CPU RequantizeLinear rejects a missing typed descriptor', () => {
-  const graph = new Graph();
+  const graph = new RuntimeGraph();
   const input = graph.addInput('input', [1], 'int8', {
     quantization: { scheme: 'per_tensor', scale: 0.25, zero_point: 0 },
   });

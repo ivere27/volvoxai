@@ -71,8 +71,11 @@ entry.
 - [ ] Add device-side sampling primitives after P1 semantics are fixed.
 - [ ] Close the EfficientDet CUDA/TensorRT gap through equivalent-workload
       profiling and end-to-end validated tactics.
-- [ ] Add public device-buffer input only for a measured caller, with explicit
-      ownership, synchronization, and lifetime rules.
+- [x] Add measured same-device WebGPU result handoff: ordinary execution accepts
+      only a live VolvoxAI-issued `TensorResult` with exact dtype/shape/bytes on
+      the same `GPUDevice`; source/result closure is fenced behind accepted GPU
+      work. Raw buffers, forged/cross-device results, decode seed/step, and
+      non-WebGPU providers remain rejected.
 
 ## P4 — Provider and model coverage
 

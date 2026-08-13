@@ -64,50 +64,87 @@ export const SAFETENSORS_OPEN_READ_WRITE = 1 << 0;
 
 export function assertLosslessJSONValue(value: unknown, label = 'JSON'): void {
   const seen = new WeakSet<object>();
-  const visit = (item: unknown, path: string): void => {
+  /* The path is only ever read when throwing, so it is kept as a stack of
+   * segments and joined on the failure path. Building `${path}.${key}` for
+   * every value walked cost more than every check here combined. */
+  const trail: string[] = [];
+  const describe = (): string => label + trail.join('');
+  const visit = (item: unknown): void => {
     if (item == null || typeof item === 'string' || typeof item === 'boolean') return;
     if (typeof item === 'number') {
       if (!Number.isFinite(item)) {
-        throw new SyntaxError(`${path} contains a non-finite JSON number.`);
+        throw new SyntaxError(`${describe()} contains a non-finite JSON number.`);
       }
       if (Number.isInteger(item) && !Number.isSafeInteger(item)) {
-        throw new SyntaxError(`${path} contains an integer outside JSON's safe range.`);
+        throw new SyntaxError(`${describe()} contains an integer outside JSON's safe range.`);
       }
       return;
     }
     if (typeof item !== 'object') {
-      throw new SyntaxError(`${path} contains a non-JSON ${typeof item} value.`);
+      throw new SyntaxError(`${describe()} contains a non-JSON ${typeof item} value.`);
     }
-    if (seen.has(item)) throw new SyntaxError(`${path} contains a JSON cycle.`);
+    if (seen.has(item)) throw new SyntaxError(`${describe()} contains a JSON cycle.`);
     seen.add(item);
     if (Array.isArray(item)) {
-      item.forEach((child, index) => visit(child, `${path}[${index}]`));
+      for (let index = 0; index < item.length; index++) {
+        trail.push(`[${index}]`);
+        visit(item[index]);
+        trail.pop();
+      }
     } else {
-      for (const [key, child] of Object.entries(item)) {
-        visit(child, `${path}.${key}`);
+      const keys = Object.keys(item);
+      for (let index = 0; index < keys.length; index++) {
+        const key = keys[index];
+        trail.push(`.${key}`);
+        visit((item as Record<string, unknown>)[key]);
+        trail.pop();
       }
     }
     seen.delete(item);
   };
-  visit(value, label);
+  visit(value);
 }
 
+/* Character codes for the scanner below. Indexing a string with [] allocates a
+ * one-character string per read, which dominates a scan of this size. */
+const enum StrictJsonChar {
+  Tab = 9, NewLine = 10, CarriageReturn = 13, Space = 32,
+  Quote = 34, Comma = 44, Colon = 58,
+  Backslash = 92, OpenBracket = 91, CloseBracket = 93,
+  OpenBrace = 123, CloseBrace = 125,
+}
+
+/**
+ * JSON.parse, then a second pass that rejects duplicate object keys.
+ *
+ * The duplicate-key rule is the reason for the rescan: JSON.parse silently
+ * keeps the last value, which would let a package smuggle a second definition
+ * past validation. The scan reads character codes rather than substrings, and
+ * only falls back to JSON.parse for a key that actually contains an escape --
+ * an unescaped key is its own slice.
+ */
 export function parseStrictJSON(source: string, label = 'JSON'): unknown {
   const parsed = JSON.parse(source);
+  const length = source.length;
   let cursor = 0;
-  const isWhitespace = (character: string): boolean =>
-    character === ' ' || character === '\t' || character === '\n' || character === '\r';
+  const isWhitespace = (code: number): boolean =>
+    code === StrictJsonChar.Space || code === StrictJsonChar.Tab ||
+    code === StrictJsonChar.NewLine || code === StrictJsonChar.CarriageReturn;
   const skipWhitespace = (): void => {
-    while (cursor < source.length && isWhitespace(source[cursor])) cursor++;
+    while (cursor < length && isWhitespace(source.charCodeAt(cursor))) cursor++;
   };
   const readString = (): string => {
     const start = cursor++;
-    while (cursor < source.length) {
-      const character = source[cursor++];
-      if (character === '\\') {
+    let escaped = false;
+    while (cursor < length) {
+      const code = source.charCodeAt(cursor++);
+      if (code === StrictJsonChar.Backslash) {
+        escaped = true;
         cursor++;
-      } else if (character === '"') {
-        return JSON.parse(source.slice(start, cursor));
+      } else if (code === StrictJsonChar.Quote) {
+        return escaped
+          ? JSON.parse(source.slice(start, cursor)) as string
+          : source.slice(start + 1, cursor - 1);
       }
     }
     return ''; // The first JSON.parse validated the source, so this is unreachable.
@@ -115,12 +152,13 @@ export function parseStrictJSON(source: string, label = 'JSON'): unknown {
   const scanObject = (): void => {
     cursor++;
     skipWhitespace();
-    const keys = new Set<string>();
-    if (source[cursor] === '}') {
+    if (source.charCodeAt(cursor) === StrictJsonChar.CloseBrace) {
       cursor++;
       return;
     }
-    while (cursor < source.length) {
+    /* Allocated only for objects that actually have members. */
+    const keys = new Set<string>();
+    while (cursor < length) {
       skipWhitespace();
       const key = readString();
       if (keys.has(key)) {
@@ -134,7 +172,7 @@ export function parseStrictJSON(source: string, label = 'JSON'): unknown {
       cursor++; // ':'
       scanValue();
       skipWhitespace();
-      if (source[cursor] === ',') {
+      if (source.charCodeAt(cursor) === StrictJsonChar.Comma) {
         cursor++;
         continue;
       }
@@ -145,14 +183,14 @@ export function parseStrictJSON(source: string, label = 'JSON'): unknown {
   const scanArray = (): void => {
     cursor++;
     skipWhitespace();
-    if (source[cursor] === ']') {
+    if (source.charCodeAt(cursor) === StrictJsonChar.CloseBracket) {
       cursor++;
       return;
     }
-    while (cursor < source.length) {
+    while (cursor < length) {
       scanValue();
       skipWhitespace();
-      if (source[cursor] === ',') {
+      if (source.charCodeAt(cursor) === StrictJsonChar.Comma) {
         cursor++;
         continue;
       }
@@ -162,16 +200,19 @@ export function parseStrictJSON(source: string, label = 'JSON'): unknown {
   };
   function scanValue(): void {
     skipWhitespace();
-    if (source[cursor] === '{') {
+    const code = source.charCodeAt(cursor);
+    if (code === StrictJsonChar.OpenBrace) {
       scanObject();
-    } else if (source[cursor] === '[') {
+    } else if (code === StrictJsonChar.OpenBracket) {
       scanArray();
-    } else if (source[cursor] === '"') {
+    } else if (code === StrictJsonChar.Quote) {
       readString();
     } else {
-      while (cursor < source.length &&
-             !isWhitespace(source[cursor]) &&
-             source[cursor] !== ',' && source[cursor] !== ']' && source[cursor] !== '}') {
+      while (cursor < length) {
+        const scalar = source.charCodeAt(cursor);
+        if (isWhitespace(scalar) || scalar === StrictJsonChar.Comma ||
+            scalar === StrictJsonChar.CloseBracket ||
+            scalar === StrictJsonChar.CloseBrace) break;
         cursor++;
       }
     }

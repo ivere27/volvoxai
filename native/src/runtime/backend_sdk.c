@@ -22,19 +22,66 @@ struct VxProviderRegistry {
     size_t count;
 };
 
+typedef enum ProviderRegistrationOutcome {
+    PROVIDER_REGISTRATION_DUPLICATE = 0,
+    PROVIDER_REGISTRATION_CAPACITY,
+    PROVIDER_REGISTRATION_RUNTIME_FAILURE,
+    PROVIDER_REGISTRATION_MISSING_RUNTIME,
+    PROVIDER_REGISTRATION_SUCCESS
+} ProviderRegistrationOutcome;
+
+static int provider_report_writable(const VxReport* report) {
+    return report && report->struct_size == sizeof(*report);
+}
+
+static void provider_report_terminate_strings(VxReport* report) {
+    report->backend[sizeof(report->backend) - 1u] = '\0';
+    report->device[sizeof(report->device) - 1u] = '\0';
+    report->reason[sizeof(report->reason) - 1u] = '\0';
+    report->message[sizeof(report->message) - 1u] = '\0';
+    report->candidate_outcomes[sizeof(report->candidate_outcomes) - 1u] = '\0';
+    report->route_evidence[sizeof(report->route_evidence) - 1u] = '\0';
+    report->fallback_evidence[sizeof(report->fallback_evidence) - 1u] = '\0';
+    report->offending_node[sizeof(report->offending_node) - 1u] = '\0';
+    report->decode_state[sizeof(report->decode_state) - 1u] = '\0';
+}
+
 static void provider_report(VxReport* report,
                             VxStatus status,
                             const char* reason,
                             const char* message) {
-    size_t struct_size;
-    if (!report || report->struct_size < sizeof(*report)) return;
-    struct_size = report->struct_size;
+    if (!provider_report_writable(report)) return;
     memset(report, 0, sizeof(*report));
-    report->struct_size = struct_size;
+    report->struct_size = sizeof(*report);
     report->status = status;
     report->stage = VX_STAGE_RUNTIME_CREATE;
     snprintf(report->reason, sizeof(report->reason), "%s", reason ? reason : "");
     snprintf(report->message, sizeof(report->message), "%s", message ? message : "");
+}
+
+static void provider_runtime_failure_report(
+    VxReport* report,
+    VxStatus status,
+    const VxReport* callback_report) {
+    const char* reason = status == VX_STATUS_OUT_OF_MEMORY ? "OUT_OF_MEMORY" :
+        status == VX_STATUS_BACKEND_UNAVAILABLE ? "BACKEND_UNAVAILABLE" :
+        "PROVIDER_RUNTIME_CREATE_FAILED";
+    const char* message = status == VX_STATUS_OUT_OF_MEMORY ?
+        "backend provider runtime allocation failed" :
+        "backend provider runtime creation failed";
+    if (!provider_report_writable(report)) return;
+    if (callback_report && callback_report->struct_size == sizeof(*callback_report))
+        *report = *callback_report;
+    else
+        memset(report, 0, sizeof(*report));
+    report->struct_size = sizeof(*report);
+    report->status = status;
+    report->stage = VX_STAGE_RUNTIME_CREATE;
+    provider_report_terminate_strings(report);
+    if (!report->reason[0])
+        snprintf(report->reason, sizeof(report->reason), "%s", reason);
+    if (!report->message[0])
+        snprintf(report->message, sizeof(report->message), "%s", message);
 }
 
 static int provider_name_valid(const char* name) {
@@ -54,14 +101,27 @@ static int provider_name_valid(const char* name) {
     return 1;
 }
 
+static int provider_shape_domain_valid(
+    const VxBackendShapeDomainCapability* capability) {
+    return capability && capability->struct_size == sizeof(*capability) &&
+        capability->proof_protocol && capability->resource_protocol &&
+        !strcmp(capability->proof_protocol,
+                VX_BACKEND_SHAPE_PROOF_PROTOCOL) &&
+        !strcmp(capability->resource_protocol,
+                VX_BACKEND_RESOURCE_PROTOCOL) &&
+        (capability->support == VX_BACKEND_SHAPE_DOMAIN_FULL ||
+         capability->support == VX_BACKEND_SHAPE_DOMAIN_UNSUPPORTED);
+}
+
 static int provider_descriptor_valid(const VxBackendProvider* provider) {
-    return provider && provider->struct_size >= sizeof(*provider) &&
+    return provider && provider->struct_size == sizeof(*provider) &&
         provider->abi_version == VX_BACKEND_ABI_VERSION &&
         provider_name_valid(provider->name) && provider->flags == 0 &&
+        provider_shape_domain_valid(&provider->shape_domain) &&
         provider->runtime_create && provider->runtime_destroy &&
         provider->compile && provider->compiled_destroy &&
-        provider->context_create && provider->context_set_input &&
-        provider->context_execute && provider->context_destroy;
+        provider->context_create && provider->context_execute &&
+        provider->context_destroy;
 }
 
 VxProviderRegistry* vx_provider_registry_create(void) {
@@ -91,6 +151,7 @@ VxStatus vx_provider_registry_register(VxProviderRegistry* registry,
                                        const VxBackendProvider* provider,
                                        VxReport* report) {
     VxStatus status = VX_STATUS_INVALID_ARGUMENT;
+    ProviderRegistrationOutcome outcome = PROVIDER_REGISTRATION_DUPLICATE;
     void* runtime_instance = NULL;
     VxReport callback_report = VX_REPORT_INIT;
     if (!registry || !options) {
@@ -98,8 +159,7 @@ VxStatus vx_provider_registry_register(VxProviderRegistry* registry,
                         "provider registry or runtime options are invalid");
         return status;
     }
-    if (provider && provider->struct_size >=
-            offsetof(VxBackendProvider, abi_version) + sizeof(provider->abi_version) &&
+    if (provider && provider->struct_size == sizeof(*provider) &&
         provider->abi_version != VX_BACKEND_ABI_VERSION) {
         provider_report(report, VX_STATUS_ABI_UNSUPPORTED, "ABI_UNSUPPORTED",
                         "backend provider ABI version is unsupported");
@@ -116,12 +176,19 @@ VxStatus vx_provider_registry_register(VxProviderRegistry* registry,
     }
     if (registry->count >= VX_PROVIDER_CAPACITY) {
         status = VX_STATUS_OUT_OF_MEMORY;
+        outcome = PROVIDER_REGISTRATION_CAPACITY;
         goto done;
     }
     status = provider->runtime_create(provider->user_data, options,
                                       &runtime_instance, &callback_report);
-    if (status != VX_STATUS_OK || !runtime_instance) {
-        if (status == VX_STATUS_OK) status = VX_STATUS_BACKEND_UNAVAILABLE;
+    if (status != VX_STATUS_OK) {
+        runtime_instance = NULL;
+        outcome = PROVIDER_REGISTRATION_RUNTIME_FAILURE;
+        goto done;
+    }
+    if (!runtime_instance) {
+        status = VX_STATUS_BACKEND_UNAVAILABLE;
+        outcome = PROVIDER_REGISTRATION_MISSING_RUNTIME;
         goto done;
     }
     VxProviderSlot* slot = &registry->slots[registry->count++];
@@ -129,20 +196,30 @@ VxStatus vx_provider_registry_register(VxProviderRegistry* registry,
     slot->provider = *provider;
     memcpy(slot->name, provider->name, strlen(provider->name) + 1u);
     slot->provider.name = slot->name;
+    slot->provider.shape_domain.proof_protocol =
+        VX_BACKEND_SHAPE_PROOF_PROTOCOL;
+    slot->provider.shape_domain.resource_protocol =
+        VX_BACKEND_RESOURCE_PROTOCOL;
     slot->runtime_instance = runtime_instance;
     runtime_instance = NULL;
     status = VX_STATUS_OK;
+    outcome = PROVIDER_REGISTRATION_SUCCESS;
 done:
     pthread_mutex_unlock(&registry->mutex);
-    if (runtime_instance) provider->runtime_destroy(runtime_instance);
-    provider_report(report, status,
-                    status == VX_STATUS_OK ? "OK" :
-                    status == VX_STATUS_BACKEND_UNAVAILABLE ?
-                        "BACKEND_UNAVAILABLE" : "PROVIDER_ALREADY_REGISTERED",
-                    status == VX_STATUS_OK ? "backend provider registered" :
-                    status == VX_STATUS_BACKEND_UNAVAILABLE ?
-                        "backend provider runtime creation failed" :
-                        "backend provider name is unavailable");
+    if (outcome == PROVIDER_REGISTRATION_RUNTIME_FAILURE) {
+        provider_runtime_failure_report(report, status, &callback_report);
+    } else if (outcome == PROVIDER_REGISTRATION_CAPACITY) {
+        provider_report(report, status, "OUT_OF_MEMORY",
+                        "backend provider registry is full");
+    } else if (outcome == PROVIDER_REGISTRATION_MISSING_RUNTIME) {
+        provider_report(report, status, "BACKEND_UNAVAILABLE",
+                        "backend provider runtime creation returned no runtime");
+    } else if (outcome == PROVIDER_REGISTRATION_SUCCESS) {
+        provider_report(report, status, "OK", "backend provider registered");
+    } else {
+        provider_report(report, status, "PROVIDER_ALREADY_REGISTERED",
+                        "backend provider name is already registered");
+    }
     return status;
 }
 

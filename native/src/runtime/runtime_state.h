@@ -69,6 +69,11 @@ typedef struct {
     int disabled;
     int fuse_relu6;
     int skip;
+    /* Partially resident weight bank read by this node: global slot id ->
+     * staged row, VX_MOE_SLOT_ABSENT where the context did not materialize it.
+     * NULL/0 means the bank is fully resident and ids are already rows. */
+    const uint32_t* resident_slot_rows;
+    uint32_t resident_slot_domain;
 } Node;
 
 /* Parsed once from the safetensors-backed affine descriptor table for an
@@ -122,6 +127,9 @@ typedef struct {
     int32_t* bias;
     void* packed_weight;
     uint32_t packed_weight_bytes;
+    /* OHWI transposed once for the narrow-input AVX2 path, which cannot read
+     * eight adjacent output channels contiguously out of OHWI. */
+    void* small_c_packed_weight;
 } QConv2DMetadata;
 
 /* Canonical physical-byte QEmbedding metadata. Token IDs remain conventional
@@ -247,6 +255,57 @@ typedef struct {
     size_t nbytes;
 } EngineMergedAdapterWeight;
 
+/* Load-time bank selection is part of one private engine snapshot. Nodes keep
+ * borrowed pointers into these tables after the requested rows are staged. */
+typedef struct VxBankResidencyState {
+    char bank[128];
+    /* Global-id -> staged row, VX_MOE_SLOT_ABSENT where not resident. */
+    uint32_t* slot_rows;
+    uint32_t slot_domain;
+    uint32_t staged_rows;
+    int applied;
+} VxBankResidencyState;
+
+enum { VX_DYNAMIC_SHAPE_PLAN_CACHE_CAPACITY = 4 };
+
+/* A resolved plan is context-local because VxEngineState is owned by exactly
+ * one public execution context.  Topology stays in Node/T; cache entries keep
+ * only the concrete byte layout for an exact logical input signature. */
+typedef struct {
+    char* signature;
+    int tensor_count;
+    int* tensor_indices;
+    size_t* offsets;
+    size_t* tensor_bytes;
+    int* tensor_shapes; /* [rank, axis0, ..., axis7] per tensor */
+    size_t arena_bytes;
+    size_t logical_bytes;
+    uint64_t last_use;
+    uint64_t model_generation;
+} VxDynamicShapePlan;
+
+/* Independently packed from pointwise tensor maxima and immutable topology
+ * lifetimes. Concrete best-fit packing is not monotone as tensor sizes shrink,
+ * so every concrete native plan projects onto these fixed offsets instead. */
+typedef struct {
+    int tensor_count;
+    int* tensor_indices;
+    size_t* offsets;
+    size_t* tensor_bytes;
+    int physical_span_count;
+    size_t* physical_offsets;
+    size_t* physical_capacities;
+    size_t arena_bytes;
+    /* Maximum backend-private F32 statistics storage for the quantized norm
+     * kernels. These buffers are not logical tensors, so activation spans do
+     * not account for them. Domain reservation must publish them atomically
+     * with the physical activation layout. */
+    size_t qgroupnorm_stats_bytes;
+    size_t qlayernorm_stats_bytes;
+    uint64_t model_generation;
+    int configured;
+} VxDynamicShapeMaximumLayout;
+
 /* Context-owned state used by the private native graph implementation. */
 typedef struct VxEngineState {
     T tensors[MAXT];
@@ -265,6 +324,9 @@ typedef struct VxEngineState {
     char first_input[128];
     int loaded;
     int weight_caches_dirty;
+    VxBankResidencyState* bank_residency;
+    size_t bank_residency_count;
+    size_t bank_residency_capacity;
 
     int backend;
     int use_vulkan;
@@ -300,6 +362,33 @@ typedef struct VxEngineState {
     int arena_buffer_count;
     int* arena_tensor_indices;
     int arena_tensor_count;
+
+    VxDynamicShapePlan dynamic_shape_plans[
+        VX_DYNAMIC_SHAPE_PLAN_CACHE_CAPACITY];
+    VxDynamicShapeMaximumLayout dynamic_shape_maximum_layout;
+    void* dynamic_shape_reserved_arena;
+    uint64_t dynamic_shape_plan_clock;
+    size_t dynamic_arena_capacity_bytes;
+    size_t dynamic_arena_current_bytes;
+    size_t dynamic_arena_high_water_bytes;
+    uint64_t dynamic_arena_grow_count;
+    uint64_t dynamic_resource_generation;
+    int dynamic_arena_active;
+
+    /* Set only by the public built-in compiler after graph-wide native-GPU
+     * value-origin proof succeeds. Public I32/F32 sources are then preflighted
+     * before each binding commit, so GPU wrappers must not reread potentially
+     * stale host mirrors of device-produced values. Raw private-engine users
+     * leave this clear and retain the legacy host-value validation. */
+    int bounded_gpu_value_domain_proven;
+
+    /* One audited transient workspace shared sequentially by CPU kernels in
+     * this execution context. Its immutable bound is derived from the model's
+     * complete declared shape domain before the context is created. */
+    void* cpu_typed_workspace;
+    size_t cpu_typed_workspace_bound_bytes;
+    size_t cpu_typed_workspace_capacity_bytes;
+    int cpu_typed_workspace_configured;
 
     char removed_graph_outputs[MAXT][128];
     int removed_graph_output_count;
@@ -340,7 +429,19 @@ typedef struct VxEngineState {
     uint64_t conv_f32_igemm_indir_key[MAXN];
     float* conv_f32_igemm_zero[MAXN];
     int conv_f32_igemm_zero_cap[MAXN];
+    /* Spatial convolution weights repacked to [oc/16][tap][ic][16]. In HWIO the
+     * igemm inner loop steps `out_c * 4` bytes per input channel — 1280 at 320
+     * channels, which is 3.2 cache lines per 4K page across 100 pages, so no
+     * prefetch stream forms and the L1 dTLB thrashes. Packed, the same loop
+     * advances one full cache line per step. */
+    float* conv_f32_igemm_pack[MAXN];
+    long conv_f32_igemm_pack_cap[MAXN];
+    const float* conv_f32_igemm_pack_src[MAXN];
     int conv_pw_gemm_enabled;
+    /* The packed F32 GEMM is measurably slower than the unpacked kernel at
+     * this model's shapes, so the choice is a switch rather than a constant.
+     * See VOLVOX_F32_GEMM_PACKED in runtime_state.c. */
+    int gemm_f32_packed_enabled;
     VxGemmF32Cache gemm_f32_cache;
 
     EngineMergedAdapterWeight* merged_adapter_weights;
@@ -380,6 +481,8 @@ typedef struct VxEngineState {
     /* Trainer-owned stream key mixed into packaged-graph Dropout counters.
      * Zero selects the internal counter used by non-Trainer tests. */
     uint32_t native_training_rng_seed;
+    /* Exact concrete activation signature mixed with seed and counter. */
+    uint32_t native_training_shape_hash;
     int required_training_backend;
     int last_training_backend;
     uint32_t gpu_training_dummy[4];

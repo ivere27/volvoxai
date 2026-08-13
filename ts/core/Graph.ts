@@ -1,1119 +1,1002 @@
-import { Tensor } from './Tensor.js';
-import { AdapterManager } from './AdapterManager.js';
-import type { SafetensorsFile } from './Safetensors.js';
+import { runtimeDTypes, runtimeOperatorNames } from '../generated/volvoxaiEnums.js';
+import type { RuntimeDType } from '../types.js';
+import {
+  PublicInputShapeContract,
+  SHAPE_SYMBOL_PATTERN,
+  ShapeContractError,
+  ShapeEnvironment,
+  checkedTensorByteLength,
+  createTensorShapeSpec,
+} from '../ops/shapeSystem.js';
 import type {
-  AdapterDescription,
-  AdapterExportOptions,
-  AdapterLoadOptions,
-  AdapterSpec,
-  AdapterStageOptions,
-  AdapterUpdateOptions,
-  AdapterVersion,
-  AddTensorOptions,
-  GraphInspection,
-  GraphInspectionOptions,
-  GraphNode,
-  GraphNodePatch,
-  GraphNodeSpec,
-  GraphValidationReport,
-  NodeOutputSpec,
-  NodeParameters,
-  RuntimeDType,
-  TensorPatch,
-  TensorReference,
-  TensorStorage,
-} from '../types.js';
+  DimensionConstraintInput,
+  ShapeDimensionSpec,
+  TensorShapeSpec,
+} from '../ops/shapeSystem.js';
 
-type ConcreteNode = GraphNode<Tensor>;
-type ConcreteNodeSpec = GraphNodeSpec<Tensor>;
-type ConcreteNodePatch = GraphNodePatch<Tensor>;
-type ConcreteTensorReference = TensorReference<Tensor>;
+export const VOLVOX_LOGICAL_GRAPH_FORMAT = 'volvox-graph/v1' as const;
+export const VOLVOX_AFFINE_QUANTIZATION_FORMAT = 'volvox-affine-safetensors/v1' as const;
 
-const REPLACE_EXISTING_OUTPUT: unique symbol = Symbol('replaceExistingOutput');
-type PreparedOutputDescriptor = Exclude<
-  NodeOutputSpec<Tensor>,
-  readonly number[] | ConcreteTensorReference
-> & { [REPLACE_EXISTING_OUTPUT]?: boolean };
+export type GraphErrorDiagnostic = 'INVALID_GRAPH' | 'REEXPORT_REQUIRED';
 
-interface TopologySnapshot {
-  nodes: ConcreteNode[];
-  tensors: Map<string, Tensor>;
-  outputNames: string[];
-  autoOutputNames: string[];
-  outputsExplicit: boolean;
-  topologyRevision: number;
-  nextTopologyRevision: number;
-  nextNodeId: number;
-  lastTopologyMutation: string | null;
-  weightRevision: number;
-  nextWeightRevision: number;
-  nodeDescriptors: Map<ConcreteNode, PropertyDescriptorMap>;
-  tensorDescriptors: Map<Tensor, PropertyDescriptorMap>;
+/** Stable model-load failure raised before tensors or backends are created. */
+export class GraphError extends Error {
+  readonly code = 'INVALID_GRAPH' as const;
+  readonly diagnostic: GraphErrorDiagnostic;
+  readonly path: string;
+
+  constructor(
+    path: string,
+    message: string,
+    diagnostic: GraphErrorDiagnostic = 'INVALID_GRAPH',
+    cause?: unknown,
+  ) {
+    super(`[Graph] ${path}: ${message}`, cause === undefined ? undefined : { cause });
+    this.name = 'GraphError';
+    this.diagnostic = diagnostic;
+    this.path = path;
+  }
 }
 
-interface RemoveTensorOptions {
-  cascade?: boolean;
+export interface DimensionDescriptor {
+  readonly name: string;
+  readonly min: number;
+  readonly max: number;
+  /** Canonical descriptors always materialize the schema default of one. */
+  readonly multiple_of: number;
 }
 
-interface RemoveNodeOptions {
-  cascade?: boolean;
-  removeOutputs?: boolean;
-  preserveOutputsAsInputs?: boolean;
-  rewire?: Record<string, ConcreteTensorReference>;
+/**
+ * Declares that axis 0 of a fixed weight is a runtime-selected slot axis: a
+ * bank of LoRA families or MoE experts. The slot count is governed by a bounded
+ * dimension, so slots may be added up to `max` without changing graph topology.
+ */
+export interface WeightBankSpec {
+  readonly name: string;
+  readonly dimension: string;
+  readonly min: number;
+  readonly max: number;
 }
 
-interface TensorUpdateOptions {
-  mode?: 'assign' | 'add' | string;
+export interface PerTensorQuantizationReference {
+  readonly scheme: 'per_tensor';
+  readonly scale_tensor: string;
+  readonly zero_point_tensor: string;
 }
 
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return !!value && typeof value === "object" && !Array.isArray(value);
+export interface PerAxisQuantizationReference {
+  readonly scheme: 'per_axis';
+  /** Always normalized into [0, target rank). */
+  readonly axis: number;
+  readonly scale_tensor: string;
+  readonly zero_point_tensor: string;
 }
 
-export function isValidGraphName(value: unknown): value is string {
-  return typeof value === "string" && value.trim().length > 0 &&
-    value !== "__metadata__" &&
-    !Object.prototype.hasOwnProperty.call(Object.prototype, value);
+export type AffineQuantizationReference =
+  | PerTensorQuantizationReference
+  | PerAxisQuantizationReference;
+
+export interface AffineQuantizationTable {
+  readonly format: typeof VOLVOX_AFFINE_QUANTIZATION_FORMAT;
+  readonly tensors: Readonly<Record<string, AffineQuantizationReference>>;
 }
 
-function sameNames<T>(a: readonly T[], b: readonly T[]): boolean {
-  return a.length === b.length && a.every((name, index) => name === b[index]);
+interface TensorDescriptorBase {
+  readonly name: string;
+  readonly dtype: RuntimeDType;
+  readonly shape: TensorShapeSpec;
+  /** Present only when the central affine table targets this tensor. */
+  readonly quantization?: AffineQuantizationReference;
 }
 
-function validateShape(shape: unknown, label: string): number[] {
-  if (!Array.isArray(shape)) throw new Error(`${label} shape must be an array.`);
-  for (const [index, dim] of shape.entries()) {
-    if (!Number.isInteger(dim) || dim <= 0) {
-      throw new Error(`${label} shape dimension ${index} must be a positive integer.`);
+export interface InputDescriptor extends TensorDescriptorBase {
+  readonly kind: 'input';
+}
+
+export interface WeightDescriptor extends TensorDescriptorBase {
+  readonly kind: 'weight';
+  /** Weight shapes are fixed, so this refinement contains numbers only. */
+  readonly shape: readonly number[];
+  /** Non-null when axis 0 indexes runtime-selected slots. */
+  readonly bank: WeightBankSpec | null;
+}
+
+export interface ValueDescriptor extends TensorDescriptorBase {
+  readonly kind: 'value';
+  readonly producerNodeId: string;
+  readonly producerPort: string;
+}
+
+export type TensorDescriptor =
+  | InputDescriptor
+  | WeightDescriptor
+  | ValueDescriptor;
+
+export interface WeightDescriptorInput {
+  readonly name: string;
+  readonly dtype: RuntimeDType;
+  readonly shape: readonly number[];
+}
+
+export interface NodeOutputDescriptor {
+  readonly tensor: string;
+  readonly dtype: RuntimeDType;
+  /** Assertion retained for canonical operator inference in DS2. */
+  readonly shape: TensorShapeSpec;
+  readonly quantization?: AffineQuantizationReference;
+}
+
+export type JsonValue =
+  | null
+  | boolean
+  | number
+  | string
+  | readonly JsonValue[]
+  | Readonly<{ [name: string]: JsonValue }>;
+
+export interface NodeDescriptor {
+  readonly id: string;
+  readonly opType: string;
+  readonly inputs: Readonly<Record<string, string>>;
+  readonly outputs: Readonly<Record<string, NodeOutputDescriptor>>;
+  readonly params: Readonly<Record<string, JsonValue>>;
+}
+
+/** Immutable logical topology. It contains no Tensor allocation or backend state. */
+export interface Graph {
+  readonly format: typeof VOLVOX_LOGICAL_GRAPH_FORMAT;
+  readonly environment: ShapeEnvironment;
+  readonly dimensions: Readonly<Record<string, DimensionDescriptor>>;
+  readonly inputs: Readonly<Record<string, InputDescriptor>>;
+  readonly weights: Readonly<Record<string, WeightDescriptor>>;
+  readonly banks: Readonly<Record<string, WeightBankSpec>>;
+  readonly tensors: Readonly<Record<string, TensorDescriptor>>;
+  readonly nodes: readonly NodeDescriptor[];
+  readonly outputs: readonly string[];
+  readonly quantization: AffineQuantizationTable | null;
+  /** Collision-free canonical serialization suitable as a definition fingerprint. */
+  readonly fingerprint: string;
+}
+
+type UnknownRecord = Record<string, unknown>;
+
+const RUNTIME_DTYPES = new Set<unknown>(runtimeDTypes);
+const RUNTIME_OPERATORS = new Set<unknown>(runtimeOperatorNames);
+const UTF8_ENCODER = new TextEncoder();
+const RETIRED_INLINE_AFFINE_FIELDS = new Set([
+  'quantization',
+  'zero_point',
+  'input_scale', 'input_zero_point',
+  'output_scale', 'output_zero_point',
+  'weight_scale', 'weight_zero_point',
+  'scales', 'zero_points',
+  'scale_tensor', 'zero_point_tensor',
+]);
+
+function fail(
+  path: string,
+  message: string,
+  diagnostic: GraphErrorDiagnostic = 'INVALID_GRAPH',
+): never {
+  throw new GraphError(path, message, diagnostic);
+}
+
+function isWellFormedUnicode(value: string): boolean {
+  for (let index = 0; index < value.length; index++) {
+    const codeUnit = value.charCodeAt(index);
+    if (codeUnit >= 0xd800 && codeUnit <= 0xdbff) {
+      if (index + 1 >= value.length) return false;
+      const trailing = value.charCodeAt(index + 1);
+      if (trailing < 0xdc00 || trailing > 0xdfff) return false;
+      index++;
+    } else if (codeUnit >= 0xdc00 && codeUnit <= 0xdfff) {
+      return false;
     }
   }
-  return [...shape];
+  return true;
 }
 
-function nodeLabel(node: Partial<ConcreteNode> | null | undefined, index: number): string {
-  return `node '${String(node?.id ?? index)}' at index ${index}`;
+function assertWellFormedUnicode(value: string, path: string): void {
+  if (!isWellFormedUnicode(value)) {
+    fail(path, 'must not contain an unpaired UTF-16 surrogate.');
+  }
 }
 
-function explicitLinearLayout(params: NodeParameters | undefined, id: string | number): 'din' | 'dout' | null {
-  const layout = params?.weight_layout;
-  if (layout == null || layout === "") return params?.transB ? "dout" : null;
-  if (["OUT_IN", "out_in", "OI", "peft"].includes(layout)) return "dout";
-  if (["IN_OUT", "in_out", "IO", "din_dout"].includes(layout)) return "din";
-  throw new Error(`Unsupported linear weight_layout '${layout}' at node ${String(id)}.`);
+function hasOwn(value: object, key: PropertyKey): boolean {
+  return Object.prototype.hasOwnProperty.call(value, key);
 }
 
-export class Graph {
-  nodes: ConcreteNode[];
-  tensors: Map<string, Tensor>;
-  weightFiles: SafetensorsFile[];
-  private _outputNames: readonly string[];
-  topologyRevision: number;
-  weightRevision: number;
-  _nextTopologyRevision: number;
-  _nextWeightRevision: number;
-  _nextNodeId: number;
-  _autoOutputNames: string[];
-  _outputsExplicit: boolean;
-  _lastTopologyMutation: string | null;
-  adapters: AdapterManager;
-
-  constructor() {
-    this.nodes = [];
-    this.tensors = /* @__PURE__ */ new Map();
-    this.weightFiles = [];
-    this._outputNames = Object.freeze([]);
-    this.topologyRevision = 0;
-    this.weightRevision = 0;
-    this._nextTopologyRevision = 1;
-    this._nextWeightRevision = 1;
-    this._nextNodeId = 0;
-    this._autoOutputNames = [];
-    this._outputsExplicit = false;
-    this._lastTopologyMutation = null;
-    this.adapters = new AdapterManager(this);
+function compareUnsignedBytes(left: Uint8Array, right: Uint8Array): number {
+  const shared = Math.min(left.length, right.length);
+  for (let index = 0; index < shared; index++) {
+    if (left[index] !== right[index]) return left[index] - right[index];
   }
+  return left.length - right.length;
+}
 
-  get outputNames(): readonly string[] {
-    return this._outputNames;
+/** Locale-independent ordering required by the bounded-shape v1 contract. */
+function compareCanonicalNames(left: string, right: string): number {
+  const compared = compareUnsignedBytes(UTF8_ENCODER.encode(left), UTF8_ENCODER.encode(right));
+  if (compared !== 0) return compared;
+  // TextEncoder replaces isolated UTF-16 surrogates. Preserve determinism even
+  // for such programmatically supplied strings, while ordinary JSON names take
+  // the normative UTF-8 branch above.
+  return left < right ? -1 : left > right ? 1 : 0;
+}
+
+function sortedNames(value: object): string[] {
+  const names = Object.getOwnPropertyNames(value);
+  for (const name of names) assertWellFormedUnicode(name, 'object member name');
+  return names.sort(compareCanonicalNames);
+}
+
+function assertPlainRecord(value: unknown, path: string): UnknownRecord {
+  if (value == null || typeof value !== 'object' || Array.isArray(value)) {
+    fail(path, 'must be a decoded JSON object.');
   }
-
-  _setOutputNames(names: readonly string[]): void {
-    this._outputNames = Object.freeze([...names]);
+  const prototype = Object.getPrototypeOf(value);
+  if (prototype !== Object.prototype && prototype !== null) {
+    fail(path, 'must be a plain decoded JSON object.');
   }
-
-  _assertTopologyMutationAllowed(): void {
-    this.adapters?._assertGraphPatchAllowed();
+  if (Object.getOwnPropertySymbols(value).length !== 0) {
+    fail(path, 'must not contain symbol-keyed fields.');
   }
-
-  _resolveTensorRef(
-    value: ConcreteTensorReference,
-    label = "Tensor reference",
-    tensors: Map<string, Tensor> = this.tensors,
-  ): Tensor {
-    const name = typeof value === "string" ? value : value?.name;
-    if (!isValidGraphName(name)) throw new Error(`${label} must reference a named tensor.`);
-    const tensor = tensors.get(name);
-    if (!tensor) throw new Error(`${label} references missing tensor '${name}'.`);
-    if (typeof value !== "string" && value !== tensor) {
-      throw new Error(`${label} references a non-canonical Tensor object for '${name}'.`);
-    }
-    return tensor;
-  }
-
-  _commitTopology(nodes: readonly ConcreteNode[], tensors: Map<string, Tensor>, reason: string): number {
-    this.nodes.splice(0, this.nodes.length, ...nodes);
-    this.tensors.clear();
-    for (const [name, tensor] of tensors) this.tensors.set(name, tensor);
-    this._refreshOutputNames();
-    this.topologyRevision = this._nextTopologyRevision++;
-    this._lastTopologyMutation = reason;
-    return this.topologyRevision;
-  }
-
-  _refreshOutputNames(): readonly string[] {
-    if (this._outputsExplicit) {
-      this._setOutputNames([...new Set(this.outputNames.filter((name) => this.tensors.has(name)))]);
-      return this.outputNames;
-    }
-    const consumed = new Set<string>();
-    for (const node of this.nodes) {
-      for (const tensor of Object.values(node.inputs || {})) if (tensor?.name) consumed.add(tensor.name);
-    }
-    const inferred: string[] = [];
-    for (const node of this.nodes) {
-      for (const tensor of Object.values(node.outputs || {})) {
-        if (tensor?.name && !consumed.has(tensor.name) && !inferred.includes(tensor.name)) inferred.push(tensor.name);
-      }
-    }
-    this._setOutputNames(inferred);
-    this._autoOutputNames = [...inferred];
-    return this.outputNames;
-  }
-
-  _topologySnapshot(): TopologySnapshot {
-    return {
-      nodes: [...this.nodes],
-      tensors: new Map(this.tensors),
-      outputNames: [...this.outputNames],
-      autoOutputNames: [...this._autoOutputNames],
-      outputsExplicit: this._outputsExplicit,
-      topologyRevision: this.topologyRevision,
-      nextTopologyRevision: this._nextTopologyRevision,
-      nextNodeId: this._nextNodeId,
-      lastTopologyMutation: this._lastTopologyMutation,
-      weightRevision: this.weightRevision,
-      nextWeightRevision: this._nextWeightRevision,
-      nodeDescriptors: new Map(this.nodes.map((node) => [
-        node, Object.getOwnPropertyDescriptors(node),
-      ])),
-      tensorDescriptors: new Map(Array.from(this.tensors.values(), (tensor) => [
-        tensor, Object.getOwnPropertyDescriptors(tensor),
-      ])),
-    };
-  }
-
-  _restoreTopologySnapshot(snapshot: TopologySnapshot): void {
-    const restoreProperties = (target: object, descriptors: PropertyDescriptorMap): void => {
-      for (const key of Reflect.ownKeys(target)) {
-        if (!Object.prototype.hasOwnProperty.call(descriptors, key)) Reflect.deleteProperty(target, key);
-      }
-      Object.defineProperties(target, descriptors);
-    };
-    for (const [node, descriptors] of snapshot.nodeDescriptors) restoreProperties(node, descriptors);
-    for (const [tensor, descriptors] of snapshot.tensorDescriptors) restoreProperties(tensor, descriptors);
-    this.nodes.splice(0, this.nodes.length, ...snapshot.nodes);
-    this.tensors.clear();
-    for (const [name, tensor] of snapshot.tensors) this.tensors.set(name, tensor);
-    this._setOutputNames(snapshot.outputNames);
-    this._autoOutputNames = [...snapshot.autoOutputNames];
-    this._outputsExplicit = snapshot.outputsExplicit;
-    this.topologyRevision = snapshot.topologyRevision;
-    this._nextTopologyRevision = snapshot.nextTopologyRevision;
-    this._nextNodeId = snapshot.nextNodeId;
-    this._lastTopologyMutation = snapshot.lastTopologyMutation;
-    this.weightRevision = snapshot.weightRevision;
-    this._nextWeightRevision = snapshot.nextWeightRevision;
-  }
-
-  _runTopologyTransaction<T>(callback: () => T): T {
-    const snapshot = this._topologySnapshot();
-    const rollback = (error: unknown): never => {
-      this._restoreTopologySnapshot(snapshot);
-      throw error;
-    };
-    try {
-      const result = callback();
-      return result && typeof (result as { then?: unknown }).then === "function"
-        ? Promise.resolve(result).catch(rollback) as T
-        : result;
-    } catch (error) {
-      return rollback(error);
+  for (const field of Object.getOwnPropertyNames(value)) {
+    const descriptor = Object.getOwnPropertyDescriptor(value, field)!;
+    if (!hasOwn(descriptor, 'value') || descriptor.enumerable !== true) {
+      fail(`${path}.${field}`, 'must be an enumerable decoded JSON data field.');
     }
   }
+  return value as UnknownRecord;
+}
 
-  _createTensor(
-    name: string,
-    shape: readonly number[],
-    dtype: RuntimeDType,
-    {
-      isWeight = false,
-      isInput = false,
-      buffer,
-      quantization,
-    }: AddTensorOptions = {},
-  ): Tensor {
-    if (!isValidGraphName(name)) throw new Error("Tensor name must be a non-empty string.");
-    if (!isValidGraphName(dtype)) throw new Error(`Tensor '${name}' dtype must be a non-empty string.`);
-    if (isWeight && isInput) throw new Error(`Tensor '${name}' cannot be both an input and a weight.`);
-    const tensor = new Tensor(name, validateShape(shape, `Tensor '${name}'`), dtype, isWeight, { isInput, quantization });
-    if (buffer != null) {
-      Tensor.assertCompatibleBuffer(dtype, buffer, tensor.sizeBytes, `Tensor '${name}' buffer`);
-      tensor.buffer = buffer;
-    }
-    return tensor;
+function assertDenseArray(value: unknown, path: string): readonly unknown[] {
+  if (!Array.isArray(value)) fail(path, 'must be a decoded JSON array.');
+  if (Object.getOwnPropertySymbols(value).length !== 0) {
+    fail(path, 'must not contain symbol-keyed fields.');
   }
+  for (let index = 0; index < value.length; index++) {
+    if (!hasOwn(value, index)) fail(`${path}[${index}]`, 'must not be an array hole.');
+    const descriptor = Object.getOwnPropertyDescriptor(value, String(index))!;
+    if (!hasOwn(descriptor, 'value') || descriptor.enumerable !== true) {
+      fail(`${path}[${index}]`, 'must be an enumerable decoded JSON data item.');
+    }
+  }
+  for (const field of Object.getOwnPropertyNames(value)) {
+    if (field === 'length') continue;
+    const index = Number(field);
+    if (!Number.isSafeInteger(index) || index < 0 || index >= value.length || String(index) !== field) {
+      fail(`${path}.${field}`, 'is not a decoded JSON array index.');
+    }
+  }
+  return value;
+}
 
-  /** Define a standalone tensor. Intermediate values must later be produced by a node. */
-  addTensor(
-    name: string,
-    shape: readonly number[],
-    dtype: RuntimeDType = "float32",
-    options: AddTensorOptions = {},
-  ): Tensor {
-    this._assertTopologyMutationAllowed();
-    if (Object.prototype.hasOwnProperty.call(options, 'data')) {
-      throw new Error(`Tensor '${name}' options contain unsupported field 'data'; use 'buffer'.`);
+function assertFields(
+  value: UnknownRecord,
+  path: string,
+  required: readonly string[],
+  optional: readonly string[] = [],
+): void {
+  const allowed = new Set([...required, ...optional]);
+  for (const field of sortedNames(value)) {
+    if (!allowed.has(field)) fail(path, `has unsupported field '${field}'.`);
+  }
+  for (const field of required) {
+    if (!hasOwn(value, field)) fail(path, `requires field '${field}'.`);
+  }
+}
+
+function assertNonEmptyString(value: unknown, path: string): string {
+  if (typeof value !== 'string' || value.trim().length === 0) {
+    fail(path, 'must be a non-empty string.');
+  }
+  assertWellFormedUnicode(value, path);
+  return value;
+}
+
+function assertRuntimeDType(value: unknown, path: string): RuntimeDType {
+  if (typeof value !== 'string' || !RUNTIME_DTYPES.has(value)) {
+    fail(path, `must be one of ${runtimeDTypes.map((dtype) => `'${dtype}'`).join(', ')}.`);
+  }
+  return value as RuntimeDType;
+}
+
+function freezeRecord<T>(entries: readonly (readonly [string, T])[]): Readonly<Record<string, T>> {
+  return Object.freeze(Object.fromEntries(entries)) as Readonly<Record<string, T>>;
+}
+
+function parseShapeSpec(
+  value: unknown,
+  environment: ShapeEnvironment,
+  path: string,
+): TensorShapeSpec {
+  const shape = assertDenseArray(value, path);
+  return createTensorShapeSpec(shape as readonly ShapeDimensionSpec[], environment, path);
+}
+
+function parseDimensions(
+  raw: unknown,
+): {
+  readonly environment: ShapeEnvironment;
+  readonly dimensions: Readonly<Record<string, DimensionDescriptor>>;
+} {
+  const dimensions = assertPlainRecord(raw, 'dimensions');
+  const constraints: DimensionConstraintInput[] = [];
+  for (const name of sortedNames(dimensions)) {
+    if (!SHAPE_SYMBOL_PATTERN.test(name) || name.length > 64) {
+      fail(
+        `dimensions.${JSON.stringify(name)}`,
+        'symbol names must match /^[A-Za-z][A-Za-z0-9_]{0,63}$/.',
+      );
     }
-    if (this.tensors.has(name)) throw new Error(`Tensor '${name}' already exists.`);
-    const role = options.role || "value";
-    if (!new Set(["value", "input", "weight"]).has(role)) {
-      throw new Error(`Tensor '${name}' has unsupported role '${role}'.`);
-    }
-    const tensor = this._createTensor(name, shape, dtype, {
-      isInput: role === "input" || options.isInput === true,
-      isWeight: role === "weight" || options.isWeight === true,
-      buffer: options.buffer,
-      quantization: options.quantization,
+    const descriptor = assertPlainRecord(dimensions[name], `dimensions.${name}`);
+    assertFields(descriptor, `dimensions.${name}`, ['min', 'max'], ['multiple_of']);
+    constraints.push({
+      name,
+      min: descriptor.min as number,
+      max: descriptor.max as number,
+      ...(hasOwn(descriptor, 'multiple_of')
+        ? { multiple_of: descriptor.multiple_of as number }
+        : {}),
     });
-    const tensors = new Map(this.tensors);
-    tensors.set(name, tensor);
-    this._commitTopology([...this.nodes], tensors, `add tensor '${name}'`);
-    return tensor;
   }
 
-  /**
-   * Define an input tensor
-   */
-  addInput(
-    name: string,
-    shape: readonly number[],
-    dtype: RuntimeDType = "float32",
-    options: AddTensorOptions = {},
-  ): Tensor {
-    return this.addTensor(name, shape, dtype, { ...options, role: "input" });
-  }
-  /**
-   * Define a weight tensor (learned parameter)
-   */
-  addWeight(
-    name: string,
-    shape: readonly number[],
-    dtype: RuntimeDType = "float32",
-    options: AddTensorOptions | TensorStorage = {},
-  ): Tensor {
-    const normalized = ArrayBuffer.isView(options) || options instanceof ArrayBuffer
-      ? { buffer: options }
-      : { ...options };
-    if ('initializer' in normalized && normalized.initializer != null) {
-      throw new Error("Weight initializers are available only from the full-profile ModelBuilder.");
+  const environment = new ShapeEnvironment(constraints);
+  const entries = environment.dimensions.map((constraint) => {
+    const descriptor: DimensionDescriptor = Object.freeze({
+      name: constraint.name,
+      min: constraint.min,
+      max: constraint.max,
+      multiple_of: constraint.multiple_of ?? 1,
+    });
+    return [constraint.name, descriptor] as const;
+  });
+  return Object.freeze({ environment, dimensions: freezeRecord(entries) });
+}
+
+function parseInputs(
+  raw: unknown,
+  environment: ShapeEnvironment,
+): Readonly<Record<string, InputDescriptor>> {
+  const inputs = assertPlainRecord(raw, 'inputs');
+  const candidates: Array<{ name: string; dtype: RuntimeDType; shape: TensorShapeSpec }> = [];
+  for (const name of sortedNames(inputs)) {
+    assertNonEmptyString(name, `inputs.${JSON.stringify(name)} name`);
+    const descriptor = assertPlainRecord(inputs[name], `inputs.${name}`);
+    if (hasOwn(descriptor, 'quantization')) {
+      fail(
+        `inputs.${name}.quantization`,
+        'inline quantization is forbidden; use the central quantization table.',
+      );
     }
-    delete (normalized as AddTensorOptions & { initializer?: unknown }).initializer;
-    return this.addTensor(name, shape, dtype, { ...normalized, role: "weight" });
+    assertFields(descriptor, `inputs.${name}`, ['dtype', 'shape']);
+    candidates.push({
+      name,
+      dtype: assertRuntimeDType(descriptor.dtype, `inputs.${name}.dtype`),
+      shape: parseShapeSpec(descriptor.shape, environment, `inputs.${name}.shape`),
+    });
   }
 
-  _nextAvailableNodeId(
-    requested: string | number | null | undefined,
-    nodes: readonly ConcreteNode[] = this.nodes,
-  ): string | number {
-    const ids = new Set(nodes.map((node) => String(node.id)));
-    if (requested != null) {
-      if ((typeof requested !== "string" && typeof requested !== "number") || String(requested).length === 0) {
-        throw new Error("Node id must be a non-empty string or number.");
-      }
-      if (ids.has(String(requested))) throw new Error(`Node id '${String(requested)}' already exists.`);
-      return requested;
+  // The public contract is the authoritative model-independent input
+  // normalizer. Constructing it also guarantees a canonical name order.
+  const contract = new PublicInputShapeContract(environment, candidates);
+  return freezeRecord(contract.inputs.map((input) => [input.name, Object.freeze({
+    kind: 'input' as const,
+    name: input.name,
+    dtype: input.dtype,
+    shape: input.shape,
+  })] as const));
+}
+
+function parseWeights(
+  raw: readonly WeightDescriptorInput[],
+  environment: ShapeEnvironment,
+): Readonly<Record<string, WeightDescriptor>> {
+  const weights = assertDenseArray(raw, 'weights');
+  const entries: Array<readonly [string, WeightDescriptor]> = [];
+  const seen = new Set<string>();
+  for (let index = 0; index < weights.length; index++) {
+    const path = `weights[${index}]`;
+    const source = assertPlainRecord(weights[index], path);
+    if (hasOwn(source, 'quantization')) {
+      fail(
+        `${path}.quantization`,
+        'inline quantization is forbidden; use the central quantization table.',
+      );
     }
-    let id = this._nextNodeId;
-    while (ids.has(String(id))) id++;
-    return id;
+    assertFields(source, path, ['name', 'dtype', 'shape']);
+    const name = assertNonEmptyString(source.name, `${path}.name`);
+    if (seen.has(name)) fail(`${path}.name`, `duplicates tensor '${name}'.`);
+    seen.add(name);
+    const dtype = assertRuntimeDType(source.dtype, `${path}.dtype`);
+    const parsedShape = parseShapeSpec(source.shape, environment, `${path}.shape`);
+    if (parsedShape.some((dimension) => typeof dimension !== 'number')) {
+      fail(`${path}.shape`, 'weight shapes must contain constant dimensions only.');
+    }
+    const shape = parsedShape as readonly number[];
+    // Fixed weights are validated at load rather than deferred to a binding.
+    checkedTensorByteLength(shape, dtype, `weight '${name}'`);
+    entries.push([name, Object.freeze({ kind: 'weight', name, dtype, shape, bank: null })]);
+  }
+  entries.sort(([left], [right]) => compareCanonicalNames(left, right));
+  return freezeRecord(entries);
+}
+
+/**
+ * Parse the optional `banks` table: weight name -> bounded dimension governing
+ * its slot axis. Slot residency is a context concern; this only records that a
+ * weight is sliceable along axis 0 and how far it may grow.
+ */
+function parseBanks(
+  raw: unknown,
+  dimensions: Readonly<Record<string, DimensionDescriptor>>,
+  weights: Readonly<Record<string, WeightDescriptor>>,
+): Readonly<Record<string, WeightBankSpec>> {
+  if (raw === undefined) return freezeRecord([]);
+  const banks = assertPlainRecord(raw, 'banks');
+  const entries: Array<readonly [string, WeightBankSpec]> = [];
+  for (const name of sortedNames(banks)) {
+    const path = `banks.${name}`;
+    const dimension = assertNonEmptyString(banks[name], path);
+    const constraint = hasOwn(dimensions, dimension) ? dimensions[dimension] : undefined;
+    if (constraint === undefined) {
+      fail(path, `references undeclared dimension '${dimension}'.`);
+    }
+    const weight = hasOwn(weights, name) ? weights[name] : undefined;
+    if (weight === undefined) {
+      fail(path, `names tensor '${name}', which is not a supplied fixed weight.`);
+    }
+    if (weight.shape.length < 2) {
+      fail(path, 'a bank weight needs a slot axis and at least one payload axis.');
+    }
+    const slots = weight.shape[0];
+    if (slots < constraint.min || slots > constraint.max) {
+      fail(
+        path,
+        `supplies ${slots} slots, outside the '${dimension}' bound ` +
+        `[${constraint.min}, ${constraint.max}].`,
+      );
+    }
+    if (constraint.multiple_of !== 1 && slots % constraint.multiple_of !== 0) {
+      fail(path, `supplies ${slots} slots, which is not a multiple of ${constraint.multiple_of}.`);
+    }
+    entries.push([name, Object.freeze({
+      name, dimension, min: constraint.min, max: constraint.max,
+    })]);
+  }
+  return freezeRecord(entries);
+}
+
+function cloneLogicalJson(
+  value: unknown,
+  path: string,
+  seen: WeakSet<object>,
+): JsonValue {
+  if (value === null || typeof value === 'boolean') return value;
+  if (typeof value === 'string') {
+    assertWellFormedUnicode(value, path);
+    return value;
+  }
+  if (typeof value === 'number') {
+    if (!Number.isFinite(value)) fail(path, 'must be a finite decoded JSON number.');
+    return value;
+  }
+  if (typeof value !== 'object') fail(path, 'must contain decoded JSON values only.');
+  if (seen.has(value)) fail(path, 'must not contain cycles or shared object aliases.');
+  seen.add(value);
+
+  if (Array.isArray(value)) {
+    const source = assertDenseArray(value, path);
+    return Object.freeze(source.map((entry, index) =>
+      cloneLogicalJson(entry, `${path}[${index}]`, seen)));
   }
 
-  _prepareNode(
-    spec: ConcreteNodeSpec,
-    tensors: Map<string, Tensor>,
-    nodes: readonly ConcreteNode[],
-  ): ConcreteNode {
-    if (!isRecord(spec)) throw new Error("Node specification must be an object.");
-    if (Object.prototype.hasOwnProperty.call(spec, 'op')) {
-      throw new Error("Node specification contains unsupported field 'op'; use 'opType'.");
+  const source = assertPlainRecord(value, path);
+  const entries = sortedNames(source).map((name) => {
+    if (RETIRED_INLINE_AFFINE_FIELDS.has(name)) {
+      fail(
+        `${path}.${name}`,
+        'is retired inline affine metadata; use the central quantization table.',
+      );
     }
-    const opType = spec.opType;
-    if (!isValidGraphName(opType)) throw new Error("Node opType must be a non-empty string.");
-    if (!isRecord(spec.inputs)) throw new Error(`Node '${opType}' inputs must be an object.`);
-    if (!isRecord(spec.outputs) || Object.keys(spec.outputs).length === 0) {
-      throw new Error(`Node '${opType}' requires at least one output.`);
+    return [name, cloneLogicalJson(source[name], `${path}.${name}`, seen)] as const;
+  });
+  return freezeRecord(entries);
+}
+
+function parseParams(raw: unknown, path: string): Readonly<Record<string, JsonValue>> {
+  const source = assertPlainRecord(raw, path);
+  return cloneLogicalJson(source, path, new WeakSet()) as Readonly<Record<string, JsonValue>>;
+}
+
+function parseNodeInputs(
+  raw: unknown,
+  path: string,
+  availableTensors: ReadonlySet<string>,
+): Readonly<Record<string, string>> {
+  const inputs = assertPlainRecord(raw, path);
+  const entries: Array<readonly [string, string]> = [];
+  for (const port of sortedNames(inputs)) {
+    assertNonEmptyString(port, `${path} port`);
+    const tensor = assertNonEmptyString(inputs[port], `${path}.${port}`);
+    if (!availableTensors.has(tensor)) {
+      fail(`${path}.${port}`, `references unresolved tensor '${tensor}'; inputs must be topological.`);
     }
-    const id = this._nextAvailableNodeId(spec.id, nodes);
-    const inputs: Record<string, Tensor> = {};
-    for (const [key, value] of Object.entries(spec.inputs)) {
-      if (!isValidGraphName(key)) throw new Error(`Node '${opType}' has an invalid input key.`);
-      inputs[key] = this._resolveTensorRef(value, `Node '${opType}' input '${key}'`, tensors);
+    entries.push([port, tensor]);
+  }
+  return freezeRecord(entries);
+}
+
+function parseNodeOutputs(
+  raw: unknown,
+  path: string,
+  environment: ShapeEnvironment,
+  occupiedTensors: ReadonlySet<string>,
+): Readonly<Record<string, NodeOutputDescriptor>> {
+  const outputs = assertPlainRecord(raw, path);
+  const ports = sortedNames(outputs);
+  if (ports.length === 0) fail(path, 'must declare at least one output port.');
+  const entries: Array<readonly [string, NodeOutputDescriptor]> = [];
+  const localTensors = new Set<string>();
+  for (const port of ports) {
+    assertNonEmptyString(port, `${path} port`);
+    const descriptorPath = `${path}.${port}`;
+    const descriptor = assertPlainRecord(outputs[port], descriptorPath);
+    if (hasOwn(descriptor, 'quantization')) {
+      fail(
+        `${descriptorPath}.quantization`,
+        'inline quantization is forbidden; use the central quantization table.',
+      );
     }
-    const outputs: Record<string, Tensor> = {};
-    for (const [key, value] of Object.entries(spec.outputs)) {
-      if (!isValidGraphName(key)) throw new Error(`Node '${opType}' has an invalid output key.`);
-      if (typeof value === "string" || value instanceof Tensor) {
-        outputs[key] = this._resolveTensorRef(value, `Node '${opType}' output '${key}'`, tensors);
-        continue;
+    assertFields(descriptor, descriptorPath, ['tensor', 'dtype', 'shape']);
+    const tensor = assertNonEmptyString(descriptor.tensor, `${descriptorPath}.tensor`);
+    if (occupiedTensors.has(tensor) || localTensors.has(tensor)) {
+      fail(`${descriptorPath}.tensor`, `duplicates tensor '${tensor}'.`);
+    }
+    localTensors.add(tensor);
+    entries.push([port, Object.freeze({
+      tensor,
+      dtype: assertRuntimeDType(descriptor.dtype, `${descriptorPath}.dtype`),
+      shape: parseShapeSpec(descriptor.shape, environment, `${descriptorPath}.shape`),
+    })]);
+  }
+  return freezeRecord(entries);
+}
+
+interface ParsedQuantization {
+  readonly table: AffineQuantizationTable;
+  readonly parameterNames: ReadonlySet<string>;
+}
+
+function hasExactShape(shape: readonly ShapeDimensionSpec[], expected: number): boolean {
+  return shape.length === 1 && shape[0] === expected;
+}
+
+function parseAffineQuantization(
+  raw: unknown,
+  tensors: Readonly<Record<string, TensorDescriptor>>,
+  weights: Readonly<Record<string, WeightDescriptor>>,
+): ParsedQuantization {
+  const root = assertPlainRecord(raw, 'quantization');
+  assertFields(root, 'quantization', ['format', 'tensors']);
+  if (root.format !== VOLVOX_AFFINE_QUANTIZATION_FORMAT) {
+    fail(
+      'quantization.format',
+      `must be exactly '${VOLVOX_AFFINE_QUANTIZATION_FORMAT}'.`,
+    );
+  }
+  const rawTensors = assertPlainRecord(root.tensors, 'quantization.tensors');
+  const targetNames = sortedNames(rawTensors);
+  if (targetNames.length === 0) {
+    fail('quantization.tensors', 'must be a non-empty object.');
+  }
+
+  const entries: Array<readonly [string, AffineQuantizationReference]> = [];
+  const parameterNames = new Set<string>();
+  for (const targetName of targetNames) {
+    assertNonEmptyString(targetName, 'quantization target name');
+    if (!hasOwn(tensors, targetName)) {
+      fail(`quantization.tensors.${targetName}`, `targets unknown tensor '${targetName}'.`);
+    }
+    const target = tensors[targetName];
+    if (target.dtype !== 'int8' && target.dtype !== 'uint8') {
+      fail(
+        `quantization.tensors.${targetName}`,
+        `target '${targetName}' must have int8 or uint8 storage.`,
+      );
+    }
+
+    const descriptorPath = `quantization.tensors.${targetName}`;
+    const source = assertPlainRecord(rawTensors[targetName], descriptorPath);
+    const perAxis = source.scheme === 'per_axis';
+    if (source.scheme !== 'per_tensor' && !perAxis) {
+      fail(`${descriptorPath}.scheme`, `must be 'per_tensor' or 'per_axis'.`);
+    }
+    assertFields(
+      source,
+      descriptorPath,
+      perAxis
+        ? ['scheme', 'axis', 'scale_tensor', 'zero_point_tensor']
+        : ['scheme', 'scale_tensor', 'zero_point_tensor'],
+    );
+    const scaleName = assertNonEmptyString(source.scale_tensor, `${descriptorPath}.scale_tensor`);
+    const zeroName = assertNonEmptyString(
+      source.zero_point_tensor,
+      `${descriptorPath}.zero_point_tensor`,
+    );
+    if (scaleName === zeroName) {
+      fail(descriptorPath, 'requires distinct scale and zero-point parameter tensors.');
+    }
+    const scale = hasOwn(weights, scaleName) ? weights[scaleName] : undefined;
+    const zeroPoint = hasOwn(weights, zeroName) ? weights[zeroName] : undefined;
+    if (!scale || !zeroPoint) {
+      fail(descriptorPath, 'scale and zero-point parameters must exist in supplied fixed weights.');
+    }
+    if (scale.dtype !== 'float32') {
+      fail(
+        `${descriptorPath}.scale_tensor`,
+        `parameter '${scaleName}' must have float32 storage.`,
+      );
+    }
+    if (zeroPoint.dtype !== target.dtype) {
+      fail(
+        `${descriptorPath}.zero_point_tensor`,
+        `parameter '${zeroName}' dtype must match target dtype '${target.dtype}'.`,
+      );
+    }
+
+    let reference: AffineQuantizationReference;
+    if (perAxis) {
+      if (!Number.isSafeInteger(source.axis) || target.shape.length === 0) {
+        fail(`${descriptorPath}.axis`, 'must be an integer axis for a non-scalar target.');
       }
-      const descriptor = (Array.isArray(value) ? { shape: value } : value) as
-        PreparedOutputDescriptor;
-      if (!isRecord(descriptor)) {
-        throw new Error(`Node '${opType}' output '${key}' must be a shape, tensor name, Tensor, or descriptor.`);
+      const rawAxis = source.axis as number;
+      if (rawAxis < -target.shape.length || rawAxis >= target.shape.length) {
+        fail(`${descriptorPath}.axis`, `is outside target rank ${target.shape.length}.`);
       }
-      for (const unsupportedField of ['data', 'replace', 'reuse']) {
-        if (Object.prototype.hasOwnProperty.call(descriptor, unsupportedField)) {
-          throw new Error(
-            `Node '${opType}' output '${key}' contains unsupported field '${unsupportedField}'.`,
+      const axis = rawAxis < 0 ? rawAxis + target.shape.length : rawAxis;
+      const extent = target.shape[axis];
+      if (typeof extent !== 'number') {
+        fail(
+          `${descriptorPath}.axis`,
+          `target axis ${axis} is symbolic; per-axis quantization requires a constant extent.`,
+        );
+      }
+      if (!hasExactShape(scale.shape, extent) || !hasExactShape(zeroPoint.shape, extent)) {
+        fail(descriptorPath, `parameter tensors must both have shape [${extent}].`);
+      }
+      reference = Object.freeze({
+        scheme: 'per_axis',
+        axis,
+        scale_tensor: scaleName,
+        zero_point_tensor: zeroName,
+      });
+    } else {
+      if (!hasExactShape(scale.shape, 1) || !hasExactShape(zeroPoint.shape, 1)) {
+        fail(descriptorPath, 'per-tensor parameter tensors must both have scalar shape [1].');
+      }
+      reference = Object.freeze({
+        scheme: 'per_tensor',
+        scale_tensor: scaleName,
+        zero_point_tensor: zeroName,
+      });
+    }
+    entries.push([targetName, reference]);
+    parameterNames.add(scaleName);
+    parameterNames.add(zeroName);
+  }
+
+  const references = freezeRecord(entries);
+  for (const parameterName of parameterNames) {
+    if (hasOwn(references, parameterName)) {
+      fail(
+        `quantization.tensors.${parameterName}`,
+        `parameter tensor '${parameterName}' cannot itself be a quantization target.`,
+      );
+    }
+  }
+  return Object.freeze({
+    table: Object.freeze({
+      format: VOLVOX_AFFINE_QUANTIZATION_FORMAT,
+      tensors: references,
+    }),
+    parameterNames,
+  });
+}
+
+function attachTensorQuantization<TDescriptor extends TensorDescriptor>(
+  descriptors: Readonly<Record<string, TDescriptor>>,
+  references: Readonly<Record<string, AffineQuantizationReference>>,
+): Readonly<Record<string, TDescriptor>> {
+  return freezeRecord(Object.entries(descriptors).map(([name, descriptor]) => {
+    const reference = hasOwn(references, name) ? references[name] : undefined;
+    return [name, reference === undefined
+      ? descriptor
+      : Object.freeze({ ...descriptor, quantization: reference }) as unknown as TDescriptor] as const;
+  }));
+}
+
+function attachNodeOutputQuantization(
+  nodes: readonly NodeDescriptor[],
+  references: Readonly<Record<string, AffineQuantizationReference>>,
+): readonly NodeDescriptor[] {
+  return Object.freeze(nodes.map((node) => {
+    let changed = false;
+    const outputs = freezeRecord(Object.entries(node.outputs).map(([port, descriptor]) => {
+      const reference = hasOwn(references, descriptor.tensor)
+        ? references[descriptor.tensor]
+        : undefined;
+      if (reference === undefined) return [port, descriptor] as const;
+      changed = true;
+      return [port, Object.freeze({ ...descriptor, quantization: reference })] as const;
+    }));
+    return changed ? Object.freeze({ ...node, outputs }) : node;
+  }));
+}
+
+function validateQuantizationOperatorReferences(
+  nodes: readonly NodeDescriptor[],
+  references: Readonly<Record<string, AffineQuantizationReference>>,
+): void {
+  for (let index = 0; index < nodes.length; index++) {
+    const node = nodes[index];
+    if (node.opType === 'QuantizeLinear') {
+      for (const descriptor of Object.values(node.outputs)) {
+        const reference = hasOwn(references, descriptor.tensor)
+          ? references[descriptor.tensor]
+          : undefined;
+        if (!reference || node.inputs.scale !== reference.scale_tensor ||
+            node.inputs.zero_point !== reference.zero_point_tensor) {
+          fail(
+            `nodes[${index}]`,
+            `QuantizeLinear parameter inputs must match output '${descriptor.tensor}' quantization references.`,
           );
         }
       }
-      const outName = descriptor.name || `${opType}_${String(id)}_out_${key}`;
-      if (tensors.has(outName)) {
-        if (descriptor[REPLACE_EXISTING_OUTPUT] === true) {
-          const existing = tensors.get(outName)!;
-          if (existing.isInput || existing.isWeight) {
-            throw new Error(`Node '${opType}' cannot replace source tensor '${outName}'.`);
-          }
-          const tensor = this._createTensor(outName, descriptor.shape, descriptor.dtype || existing.dtype, {
-            buffer: descriptor.buffer,
-            quantization: descriptor.quantization,
-          });
-          tensors.set(outName, tensor);
-          outputs[key] = tensor;
-          continue;
-        }
-        throw new Error(`Tensor '${outName}' already exists.`);
+    } else if (node.opType === 'DequantizeLinear') {
+      const inputName = node.inputs.input;
+      const reference = inputName !== undefined && hasOwn(references, inputName)
+        ? references[inputName]
+        : undefined;
+      if (!reference || node.inputs.scale !== reference.scale_tensor ||
+          node.inputs.zero_point !== reference.zero_point_tensor) {
+        fail(
+          `nodes[${index}]`,
+          `DequantizeLinear parameter inputs must match input '${String(inputName)}' quantization references.`,
+        );
       }
-      const tensor = this._createTensor(outName, descriptor.shape, descriptor.dtype || "float32", {
-        buffer: descriptor.buffer,
-        quantization: descriptor.quantization,
-      });
-      tensors.set(outName, tensor);
-      outputs[key] = tensor;
     }
-    const node: ConcreteNode = {
-      ...spec,
-      id,
-      opType,
-      inputs,
-      outputs,
-      params: { ...(spec.params || {}) },
-    };
-    if (["MatMul", "Linear", "Gemm"].includes(opType) && node.wLayout == null) {
-      node.wLayout = explicitLinearLayout(node.params, id) || undefined;
+  }
+}
+
+function canonicalJson(value: JsonValue): string {
+  if (value === null) return 'null';
+  if (typeof value === 'boolean' || typeof value === 'number' || typeof value === 'string') {
+    return JSON.stringify(value);
+  }
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(',')}]`;
+  const record = value as Readonly<Record<string, JsonValue>>;
+  return `{${Object.keys(record).sort(compareCanonicalNames).map((name) =>
+    `${JSON.stringify(name)}:${canonicalJson(record[name])}`).join(',')}}`;
+}
+
+function graphFingerprint(graph: Omit<Graph, 'fingerprint'>): string {
+  const dimensions = Object.fromEntries(Object.entries(graph.dimensions).map(([name, descriptor]) => [
+    name,
+    { min: descriptor.min, max: descriptor.max, multiple_of: descriptor.multiple_of },
+  ]));
+  const inputs = Object.fromEntries(Object.entries(graph.inputs).map(([name, descriptor]) => [
+    name,
+    { dtype: descriptor.dtype, shape: descriptor.shape },
+  ]));
+  const weights = Object.fromEntries(Object.entries(graph.weights).map(([name, descriptor]) => [
+    name,
+    {
+      dtype: descriptor.dtype,
+      // A bank's slot extent is the bounded dimension, not the currently
+      // supplied slot count, so filling a slot keeps the definition identity.
+      shape: descriptor.bank === null
+        ? descriptor.shape
+        : [descriptor.bank.dimension, ...descriptor.shape.slice(1)],
+    },
+  ]));
+  const banks = Object.fromEntries(Object.entries(graph.banks).map(([name, spec]) => [
+    name,
+    { dimension: spec.dimension, min: spec.min, max: spec.max },
+  ]));
+  const nodes = graph.nodes.map((node) => ({
+    id: node.id,
+    opType: node.opType,
+    inputs: node.inputs,
+    outputs: node.outputs,
+    params: node.params,
+  }));
+  const value = {
+    format: graph.format,
+    banks,
+    dimensions,
+    inputs,
+    weights,
+    nodes,
+    outputs: graph.outputs,
+    quantization: graph.quantization,
+  } as unknown as JsonValue;
+  return `volvox-logical-graph/v1|${canonicalJson(value)}`;
+}
+
+/**
+ * Parse the dynamic-first graph schema into a backend-independent immutable
+ * model. Supplied weight metadata participates in topology and identity, but
+ * no weight or activation storage is allocated here.
+ */
+export function parseGraphDocument(
+  raw: unknown,
+  weightDescriptors: readonly WeightDescriptorInput[] = [],
+): Graph {
+  try {
+    const document = assertPlainRecord(raw, 'graph');
+    if (document.format !== VOLVOX_LOGICAL_GRAPH_FORMAT) {
+      fail('format', `must be exactly '${VOLVOX_LOGICAL_GRAPH_FORMAT}'.`);
     }
-    return node;
-  }
-
-  /** Add a fully described node and return the node object. */
-  addNode(spec: ConcreteNodeSpec): ConcreteNode {
-    return this.insertNodeAt(this.nodes.length, spec);
-  }
-
-  /** Insert a fully described node at an execution-order index. */
-  insertNodeAt(index: number, spec: ConcreteNodeSpec): ConcreteNode {
-    this._assertTopologyMutationAllowed();
-    if (!Number.isInteger(index) || index < 0 || index > this.nodes.length) {
-      throw new Error(`Node insertion index ${index} is out of range.`);
-    }
-    const tensors = new Map(this.tensors);
-    const nodes = [...this.nodes];
-    const node = this._prepareNode(spec, tensors, nodes);
-    nodes.splice(index, 0, node);
-    // Outputs are refreshed atomically at commit time. The pre-commit output
-    // list is intentionally excluded because staged builders may rename a new
-    // output before appending the next node.
-    this._assertValidState(nodes, tensors, []);
-    this._commitTopology(nodes, tensors, `insert node '${String(node.id)}'`);
-    if (typeof node.id === "number" && node.id >= this._nextNodeId) this._nextNodeId = node.id + 1;
-    else if (spec.id == null) this._nextNodeId++;
-    return node;
-  }
-
-  insertNodeBefore(index: string | number | ConcreteNode, spec: ConcreteNodeSpec): ConcreteNode {
-    return this.insertNodeAt(this._nodeIndex(index), spec);
-  }
-
-  insertNodeAfter(index: string | number | ConcreteNode, spec: ConcreteNodeSpec): ConcreteNode {
-    return this.insertNodeAt(this._nodeIndex(index) + 1, spec);
-  }
-
-  /**
-   * Add a computation operation to the graph
-   * @param {string} opType - e.g., 'MatMul', 'Conv2D', 'LayerNorm'
-   * @param {Object} inputs - Key-value pair of input names to Tensor objects
-   * @param {Object} outputs - Key-value pair of output names to Tensor shapes
-   * @param {Object} params - Uniform parameters for the shader (e.g., stride, kernel size)
-   */
-  addOp(
-    opType: string,
-    inputs: Record<string, ConcreteTensorReference>,
-    outputs: Record<string, NodeOutputSpec<Tensor>>,
-    params: NodeParameters = {},
-  ): Record<string, Tensor> {
-    return this.addNode({ opType, inputs, outputs, params }).outputs;
-  }
-
-  insertOpAt(
-    index: number,
-    opType: string,
-    inputs: Record<string, ConcreteTensorReference>,
-    outputs: Record<string, NodeOutputSpec<Tensor>>,
-    params: NodeParameters = {},
-    options: Omit<ConcreteNodeSpec, 'opType' | 'inputs' | 'outputs' | 'params'> = {},
-  ): Record<string, Tensor> {
-    return this.insertNodeAt(index, { ...options, opType, inputs, outputs, params }).outputs;
-  }
-
-  getTensor(name: string): Tensor | undefined {
-    return this.tensors.get(name);
-  }
-
-  getNodeById(id: string | number): ConcreteNode | undefined {
-    return this.nodes.find((node) => String(node.id) === String(id));
-  }
-
-  _nodeIndex(reference: string | number | ConcreteNode): number {
-    if (reference && typeof reference === "object") {
-      const index = this.nodes.indexOf(reference);
-      if (index < 0) throw new Error("Node object does not belong to this graph.");
-      return index;
-    }
-    const index = this.nodes.findIndex((node) => String(node.id) === String(reference));
-    if (index >= 0) return index;
-    // Numeric references primarily address node ids. Fall back to an execution
-    // index for graphs imported with non-numeric ids; explicit *NodeAt methods
-    // always use an index and remain unambiguous.
-    if (typeof reference === "number" && Number.isInteger(reference) && reference >= 0 && reference < this.nodes.length) {
-      return reference;
-    }
-    throw new Error(`Node id '${String(reference)}' not found.`);
-  }
-
-  getNode(reference: string | number | ConcreteNode): ConcreteNode {
-    return this.nodes[this._nodeIndex(reference)];
-  }
-
-  _validationReport(
-    nodes: readonly ConcreteNode[] = this.nodes,
-    tensors: Map<string, Tensor> = this.tensors,
-    outputNames: readonly string[] = this.outputNames,
-  ): GraphValidationReport {
-    const errors: string[] = [];
-    const warnings: string[] = [];
-    const ids = new Set<string>();
-    const producers = new Map<string, number>();
-    const consumed = new Set<string>();
-
-    for (const [name, tensor] of tensors) {
-      if (!isValidGraphName(name)) errors.push("Tensor map contains an invalid name.");
-      if (!(tensor instanceof Tensor)) errors.push(`Tensor '${name}' is not a Tensor instance.`);
-      if (tensor?.name !== name) errors.push(`Tensor map key '${name}' does not match tensor name '${tensor?.name}'.`);
-      if (!Array.isArray(tensor?.shape) || tensor.shape.some((dim) => !Number.isInteger(dim) || dim <= 0)) {
-        errors.push(`Tensor '${name}' has an invalid shape.`);
+    for (const field of ['weights_quantization', 'weights_quantization_storage']) {
+      if (hasOwn(document, field)) {
+        fail(
+          `graph.${field}`,
+          'legacy inline quantization is forbidden; use the central quantization table.',
+          'REEXPORT_REQUIRED',
+        );
       }
-      if (!isValidGraphName(tensor?.dtype)) errors.push(`Tensor '${name}' has an invalid dtype.`);
-      else {
-        try {
-          const expected = tensor._calculateByteSize();
-          if (tensor.sizeBytes !== expected) errors.push(`Tensor '${name}' sizeBytes does not match its shape/dtype.`);
-          if (tensor.buffer != null) Tensor.assertCompatibleBuffer(tensor.dtype, tensor.buffer, expected, `Tensor '${name}' buffer`);
-          Tensor.normalizeQuantization(tensor.dtype, tensor.shape, tensor.quantization,
-            `Tensor '${name}' quantization`);
-        } catch (error) {
-          errors.push(error instanceof Error ? error.message : String(error));
-        }
+    }
+    assertFields(
+      document,
+      'graph',
+      ['format', 'dimensions', 'inputs', 'nodes', 'outputs'],
+      ['banks', 'quantization'],
+    );
+
+    const { environment, dimensions } = parseDimensions(document.dimensions);
+    const baseInputs = parseInputs(document.inputs, environment);
+    const parsedWeights = parseWeights(weightDescriptors, environment);
+    const banks = parseBanks(document.banks, dimensions, parsedWeights);
+    const baseWeights = freezeRecord(Object.entries(parsedWeights).map(
+      ([name, descriptor]) => [
+        name,
+        hasOwn(banks, name)
+          ? Object.freeze({ ...descriptor, bank: banks[name] })
+          : descriptor,
+      ] as const,
+    ));
+
+    const tensorEntries: Array<readonly [string, TensorDescriptor]> = [];
+    const occupiedTensors = new Set<string>();
+    for (const descriptor of Object.values(baseInputs)) {
+      occupiedTensors.add(descriptor.name);
+      tensorEntries.push([descriptor.name, descriptor]);
+    }
+    for (const descriptor of Object.values(baseWeights)) {
+      if (occupiedTensors.has(descriptor.name)) {
+        fail('weights', `tensor '${descriptor.name}' duplicates a public input.`);
       }
-      if (tensor?.isWeight && tensor?.isInput) errors.push(`Tensor '${name}' cannot be both input and weight.`);
+      occupiedTensors.add(descriptor.name);
+      tensorEntries.push([descriptor.name, descriptor]);
     }
 
-    nodes.forEach((node, index) => {
-      const label = nodeLabel(node, index);
-      const id = String(node?.id ?? "");
-      if (!id.length) errors.push(`${label} has no id.`);
-      else if (ids.has(id)) errors.push(`Duplicate node id '${id}'.`);
-      else ids.add(id);
-      if (!isValidGraphName(node?.opType)) errors.push(`${label} has an invalid opType.`);
-      if (!isRecord(node?.inputs)) errors.push(`${label} inputs must be an object.`);
-      if (!isRecord(node?.outputs) || Object.keys(node.outputs).length === 0) {
-        errors.push(`${label} requires at least one output.`);
+    const rawNodes = assertDenseArray(document.nodes, 'nodes');
+    const nodeIds = new Set<string>();
+    const nodes: NodeDescriptor[] = [];
+    for (let index = 0; index < rawNodes.length; index++) {
+      const path = `nodes[${index}]`;
+      const source = assertPlainRecord(rawNodes[index], path);
+      if (hasOwn(source, 'outputs_shape') || hasOwn(source, 'outputs_dtype')) {
+        fail(
+          path,
+          "uses legacy 'outputs_shape'/'outputs_dtype' fields; re-export the model with unified output descriptors.",
+          'REEXPORT_REQUIRED',
+        );
       }
-      const localOutputs = new Set<string>();
-      for (const [key, tensor] of Object.entries(node?.outputs || {})) {
-        const canonical = tensor?.name ? tensors.get(tensor.name) : undefined;
-        if (!isValidGraphName(key)) errors.push(`${label} has an invalid output key.`);
-        if (!canonical) errors.push(`${label} output '${key}' references a missing tensor.`);
-        else if (canonical !== tensor) errors.push(`${label} output '${key}' is not the canonical tensor '${tensor.name}'.`);
-        if (canonical?.isInput || canonical?.isWeight) {
-          errors.push(`${label} output '${key}' cannot produce source tensor '${canonical.name}'.`);
-        }
-        if (canonical && localOutputs.has(canonical.name)) {
-          errors.push(`${label} produces tensor '${canonical.name}' more than once.`);
-        }
-        if (canonical) {
-          localOutputs.add(canonical.name);
-          if (producers.has(canonical.name)) {
-            const producerIndex = producers.get(canonical.name)!;
-            errors.push(`Tensor '${canonical.name}' is produced by both ${nodeLabel(nodes[producerIndex], producerIndex)} and ${label}.`);
-          } else {
-            producers.set(canonical.name, index);
-          }
-        }
+      if (hasOwn(source, 'outputs_quantization')) {
+        fail(
+          `${path}.outputs_quantization`,
+          'inline output quantization is forbidden; use the central quantization table.',
+          'REEXPORT_REQUIRED',
+        );
       }
-    });
+      assertFields(source, path, ['id', 'opType', 'inputs', 'outputs', 'params']);
+      const id = assertNonEmptyString(source.id, `${path}.id`);
+      if (nodeIds.has(id)) fail(`${path}.id`, `duplicates node id '${id}'.`);
+      nodeIds.add(id);
+      const opType = assertNonEmptyString(source.opType, `${path}.opType`);
+      if (!RUNTIME_OPERATORS.has(opType)) {
+        fail(`${path}.opType`, `uses unsupported runtime operator '${opType}'.`);
+      }
 
-    nodes.forEach((node, index) => {
-      const label = nodeLabel(node, index);
-      for (const [key, tensor] of Object.entries(node?.inputs || {})) {
-        const canonical = tensor?.name ? tensors.get(tensor.name) : undefined;
-        if (!isValidGraphName(key)) errors.push(`${label} has an invalid input key.`);
-        if (!canonical) {
-          errors.push(`${label} input '${key}' references a missing tensor.`);
-          continue;
-        }
-        if (canonical !== tensor) errors.push(`${label} input '${key}' is not the canonical tensor '${tensor.name}'.`);
-        consumed.add(canonical.name);
-        const producer = producers.get(canonical.name);
-        if (producer == null) {
-          if (!canonical.isInput && !canonical.isWeight) {
-            errors.push(`${label} input '${key}' references detached value tensor '${canonical.name}'.`);
-          }
-        } else if (producer >= index) {
-          errors.push(`${label} input '${key}' uses '${canonical.name}' before it is produced.`);
-        }
-      }
-    });
+      // Inputs resolve before this node publishes any outputs, preventing
+      // self-reference and forward-reference ambiguities.
+      const nodeInputs = parseNodeInputs(source.inputs, `${path}.inputs`, occupiedTensors);
+      const nodeOutputs = parseNodeOutputs(
+        source.outputs,
+        `${path}.outputs`,
+        environment,
+        occupiedTensors,
+      );
+      const params = parseParams(source.params, `${path}.params`);
+      const node = Object.freeze({ id, opType, inputs: nodeInputs, outputs: nodeOutputs, params });
+      nodes.push(node);
 
-    const seenOutputs = new Set();
-    for (const name of outputNames || []) {
-      if (!isValidGraphName(name) || !tensors.has(name)) errors.push(`Graph output '${String(name)}' does not exist.`);
-      else if (seenOutputs.has(name)) errors.push(`Graph output '${name}' is listed more than once.`);
+      for (const [port, descriptor] of Object.entries(nodeOutputs)) {
+        occupiedTensors.add(descriptor.tensor);
+        tensorEntries.push([descriptor.tensor, Object.freeze({
+          kind: 'value',
+          name: descriptor.tensor,
+          dtype: descriptor.dtype,
+          shape: descriptor.shape,
+          producerNodeId: id,
+          producerPort: port,
+        })]);
+      }
+    }
+
+    const rawOutputs = assertDenseArray(document.outputs, 'outputs');
+    if (rawOutputs.length === 0) fail('outputs', 'must be a non-empty array.');
+    const outputNames: string[] = [];
+    const seenOutputs = new Set<string>();
+    for (let index = 0; index < rawOutputs.length; index++) {
+      const name = assertNonEmptyString(rawOutputs[index], `outputs[${index}]`);
+      if (seenOutputs.has(name)) fail(`outputs[${index}]`, `duplicates graph output '${name}'.`);
+      if (!occupiedTensors.has(name)) fail(`outputs[${index}]`, `references unresolved tensor '${name}'.`);
       seenOutputs.add(name);
-    }
-    for (const [name, tensor] of tensors) {
-      if (!tensor.isInput && !tensor.isWeight && !producers.has(name)) {
-        warnings.push(`Value tensor '${name}' is detached.`);
-      }
-      if (tensor.isWeight && !consumed.has(name)) warnings.push(`Weight tensor '${name}' is unused.`);
-    }
-    if (nodes.length > 0 && (outputNames || []).length === 0) warnings.push("Graph has nodes but no selected outputs.");
-    return Object.freeze({
-      valid: errors.length === 0,
-      errors: Object.freeze(errors),
-      warnings: Object.freeze(warnings),
-      nodeCount: nodes.length,
-      tensorCount: tensors.size,
-      topologyRevision: this.topologyRevision,
-    });
-  }
-
-  _assertValidState(
-    nodes: readonly ConcreteNode[],
-    tensors: Map<string, Tensor>,
-    outputNames: readonly string[] = this.outputNames,
-  ): GraphValidationReport {
-    const report = this._validationReport(nodes, tensors, outputNames);
-    if (!report.valid) throw new Error(`Invalid graph: ${report.errors.join(" ")}`);
-    return report;
-  }
-
-  validate({ throwOnError = false }: { throwOnError?: boolean } = {}): GraphValidationReport {
-    const report = this._validationReport();
-    if (throwOnError && !report.valid) throw new Error(`Invalid graph: ${report.errors.join(" ")}`);
-    return report;
-  }
-
-  assertValid(): this {
-    this.validate({ throwOnError: true });
-    return this;
-  }
-
-  assertTopologyRevision(compiledRevision: number, backend = "Compiled backend"): void {
-    if (compiledRevision !== this.topologyRevision) {
-      const reason = this._lastTopologyMutation ? ` Last mutation: ${this._lastTopologyMutation}.` : "";
-      throw new Error(`${backend} graph topology changed after compilation; recompile before execution.${reason}`);
-    }
-  }
-
-  setOutputs(...references: Array<ConcreteTensorReference | readonly ConcreteTensorReference[]>): this {
-    this._assertTopologyMutationAllowed();
-    const values: readonly ConcreteTensorReference[] = references.length === 1 && Array.isArray(references[0])
-      ? references[0]
-      : references as ConcreteTensorReference[];
-    const names = values.map((value, index) => this._resolveTensorRef(value, `Graph output ${index}`).name);
-    if (new Set(names).size !== names.length) throw new Error("Graph outputs must be unique.");
-    this._setOutputNames(names);
-    this._outputsExplicit = true;
-    this._commitTopology([...this.nodes], new Map(this.tensors), "select graph outputs");
-    return this;
-  }
-
-  inferOutputs(): string[] {
-    this._assertTopologyMutationAllowed();
-    this._outputsExplicit = false;
-    this._setOutputNames(this._autoOutputNames);
-    this._commitTopology([...this.nodes], new Map(this.tensors), "infer graph outputs");
-    return [...this.outputNames];
-  }
-
-  renameTensor(name: string, nextName: string): Tensor {
-    this._assertTopologyMutationAllowed();
-    const tensor = this.getTensor(name);
-    if (!tensor) throw new Error(`Tensor '${name}' not found.`);
-    if (!isValidGraphName(nextName)) throw new Error("Tensor name must be a non-empty string.");
-    if (this.tensors.has(nextName)) throw new Error(`Tensor '${nextName}' already exists.`);
-    const replacement = Object.assign(Object.create(Object.getPrototypeOf(tensor)), tensor, { name: nextName });
-    const tensors = new Map();
-    for (const [entryName, entry] of this.tensors) tensors.set(entryName === name ? nextName : entryName, entry === tensor ? replacement : entry);
-    const nodes = this.nodes.map((node) => ({
-      ...node,
-      inputs: Object.fromEntries(Object.entries(node.inputs || {}).map(([key, value]) => [key, value === tensor ? replacement : value])),
-      outputs: Object.fromEntries(Object.entries(node.outputs || {}).map(([key, value]) => [key, value === tensor ? replacement : value])),
-      params: { ...(node.params || {}) },
-    }));
-    const mappedOutputs = this.outputNames.map((value) => value === name ? nextName : value);
-    this._assertValidState(nodes, tensors, mappedOutputs);
-    tensor.name = nextName;
-    tensors.set(nextName, tensor);
-    const committedNodes = nodes.map((node) => ({
-      ...node,
-      inputs: Object.fromEntries(Object.entries(node.inputs || {}).map(([key, value]) => [key, value === replacement ? tensor : value])),
-      outputs: Object.fromEntries(Object.entries(node.outputs || {}).map(([key, value]) => [key, value === replacement ? tensor : value])),
-      params: { ...(node.params || {}) },
-    }));
-    this._setOutputNames(mappedOutputs);
-    if (!this._outputsExplicit) this._autoOutputNames = [...mappedOutputs];
-    this._commitTopology(committedNodes, tensors, `rename tensor '${name}' to '${nextName}'`);
-    return tensor;
-  }
-
-  updateTensor(name: string, patch: TensorPatch = {}): Tensor {
-    this._assertTopologyMutationAllowed();
-    const tensor = this.getTensor(name);
-    if (!tensor) throw new Error(`Tensor '${name}' not found.`);
-    if (!isRecord(patch as unknown)) throw new Error("Tensor patch must be an object.");
-    if (Object.prototype.hasOwnProperty.call(patch, 'data')) {
-      throw new Error(`Tensor '${name}' patch contains unsupported field 'data'; use 'buffer'.`);
-    }
-    if (patch.name != null && patch.name !== name) return this.renameTensor(name, patch.name);
-    const next = Object.assign(Object.create(Object.getPrototypeOf(tensor)), tensor);
-    if (patch.shape != null) next.shape = validateShape(patch.shape, `Tensor '${name}'`);
-    if (patch.dtype != null) {
-      if (!isValidGraphName(patch.dtype)) throw new Error(`Tensor '${name}' dtype must be a non-empty string.`);
-      next.dtype = patch.dtype;
-    }
-    if (Object.prototype.hasOwnProperty.call(patch, "quantization")) {
-      next.quantization = Tensor.normalizeQuantization(next.dtype, next.shape, patch.quantization,
-        `Tensor '${name}' quantization`);
-    } else if (next.quantization) {
-      // A shape/dtype update can invalidate a per-axis descriptor. Revalidate
-      // it rather than leaving an inconsistent quantized edge in the graph.
-      next.quantization = Tensor.normalizeQuantization(next.dtype, next.shape, next.quantization,
-        `Tensor '${name}' quantization`);
-    }
-    if (patch.role != null) {
-      if (!["value", "input", "weight"].includes(patch.role)) throw new Error(`Unsupported tensor role '${patch.role}'.`);
-      next.isWeight = patch.role === "weight";
-      next.isInput = patch.role === "input";
-    }
-    const buffer = patch.buffer;
-    if (buffer != null) {
-      const expected = next._calculateByteSize();
-      Tensor.assertCompatibleBuffer(next.dtype, buffer, expected, `Tensor '${name}' buffer`);
-      next.buffer = buffer;
-      next.sizeBytes = expected;
-    } else if (patch.shape != null || patch.dtype != null) {
-      next.sizeBytes = next._calculateByteSize();
-      if (next.buffer && next.buffer.byteLength !== next.sizeBytes) next.buffer = undefined;
-    }
-    const tensors = new Map(this.tensors);
-    tensors.set(name, next);
-    const nodes = this.nodes.map((node) => ({
-      ...node,
-      inputs: Object.fromEntries(Object.entries(node.inputs || {}).map(([key, value]) => [key, value === tensor ? next : value])),
-      outputs: Object.fromEntries(Object.entries(node.outputs || {}).map(([key, value]) => [key, value === tensor ? next : value])),
-      params: { ...(node.params || {}) },
-    }));
-    this._assertValidState(nodes, tensors);
-    this._commitTopology(nodes, tensors, `update tensor '${name}'`);
-    return next;
-  }
-
-  removeTensor(name: string, { cascade = false }: RemoveTensorOptions = {}): boolean {
-    this._assertTopologyMutationAllowed();
-    if (!this.tensors.has(name)) return false;
-    const direct = new Set<number>();
-    this.nodes.forEach((node, index) => {
-      if (Object.values(node.inputs || {}).some((tensor) => tensor?.name === name) ||
-          Object.values(node.outputs || {}).some((tensor) => tensor?.name === name)) direct.add(index);
-    });
-    if (direct.size && !cascade) {
-      throw new Error(`Tensor '${name}' is referenced by ${direct.size} node(s); pass { cascade: true } to remove dependent nodes.`);
-    }
-    const remove = new Set<number>(direct);
-    if (cascade) {
-      let changed = true;
-      while (changed) {
-        changed = false;
-        const removedOutputs = new Set<string>();
-        for (const index of remove) {
-          for (const tensor of Object.values(this.nodes[index]?.outputs || {})) removedOutputs.add(tensor.name);
-        }
-        this.nodes.forEach((node, index) => {
-          if (!remove.has(index) && Object.values(node.inputs || {}).some((tensor) => removedOutputs.has(tensor.name))) {
-            remove.add(index);
-            changed = true;
-          }
-        });
-      }
-    }
-    const tensors = new Map(this.tensors);
-    tensors.delete(name);
-    for (const index of remove) {
-      for (const tensor of Object.values(this.nodes[index].outputs || {})) tensors.delete(tensor.name);
-    }
-    const nodes = this.nodes.filter((_, index) => !remove.has(index));
-    this._assertValidState(nodes, tensors, []);
-    this._commitTopology(nodes, tensors, `remove tensor '${name}'`);
-    return true;
-  }
-
-  replaceNodeAt(index: number, replacement: ConcreteNodePatch = {}): ConcreteNode {
-    this._assertTopologyMutationAllowed();
-    if (!Number.isInteger(index) || index < 0 || index >= this.nodes.length) {
-      throw new Error(`Node index ${index} is out of range.`);
-    }
-    if (!isRecord(replacement)) throw new Error("Replacement node specification must be an object.");
-    const previous = this.nodes[index];
-    const spec: ConcreteNodeSpec = {
-      ...previous,
-      ...replacement,
-      id: replacement.id ?? previous.id,
-      opType: replacement.opType || previous.opType,
-      inputs: replacement.inputs ?? previous.inputs,
-      outputs: replacement.outputs ?? previous.outputs,
-      params: replacement.params ?? previous.params,
-    };
-    if (replacement.outputs) {
-      spec.outputs = Object.fromEntries(Object.entries(replacement.outputs).map(([key, value]) => {
-        const oldTensor = previous.outputs?.[key];
-        if (Array.isArray(value) && oldTensor) {
-          return [key, {
-            name: oldTensor.name,
-            shape: value,
-            dtype: oldTensor.dtype,
-            [REPLACE_EXISTING_OUTPUT]: true,
-          }];
-        }
-        if (isRecord(value) && !(value instanceof Tensor) && oldTensor && !value.name) {
-          const descriptor = value as Record<string, unknown>;
-          return [key, {
-            ...descriptor,
-            name: oldTensor.name,
-            [REPLACE_EXISTING_OUTPUT]: true,
-          }];
-        }
-        return [key, value];
-      }));
-    }
-    const tensors = new Map(this.tensors);
-    const nodesWithoutPrevious = this.nodes.filter((_, nodeIndex) => nodeIndex !== index);
-    const next = this._prepareNode(spec, tensors, nodesWithoutPrevious);
-    const rewrites = new Map();
-    for (const [key, oldTensor] of Object.entries(previous.outputs || {})) {
-      const nextTensor = next.outputs?.[key];
-      if (nextTensor && nextTensor !== oldTensor) rewrites.set(oldTensor, nextTensor);
-    }
-    const nodes = this.nodes.map((node, nodeIndex) => {
-      if (nodeIndex === index) return next;
-      if (nodeIndex < index || rewrites.size === 0) return node;
-      return {
-        ...node,
-        inputs: Object.fromEntries(Object.entries(node.inputs || {}).map(([key, tensor]) => [key, rewrites.get(tensor) || tensor])),
-        outputs: { ...(node.outputs || {}) },
-        params: { ...(node.params || {}) },
-      };
-    });
-    const retained = new Set();
-    for (const node of nodes) {
-      for (const tensor of Object.values(node.inputs || {})) retained.add(tensor.name);
-      for (const tensor of Object.values(node.outputs || {})) retained.add(tensor.name);
-    }
-    for (const oldTensor of Object.values(previous.outputs || {})) {
-      if (!retained.has(oldTensor.name)) tensors.delete(oldTensor.name);
-    }
-    const nextOutputNames = this.outputNames.map((name) => {
-      const oldTensor = Object.values(previous.outputs || {}).find((tensor) => tensor.name === name);
-      return oldTensor && rewrites.has(oldTensor) ? rewrites.get(oldTensor).name : name;
-    }).filter((name) => tensors.has(name));
-    this._assertValidState(nodes, tensors, nextOutputNames);
-    if (this._outputsExplicit) this._setOutputNames(nextOutputNames);
-    this._commitTopology(nodes, tensors, `replace node '${String(previous.id)}'`);
-    if (typeof next.id === "number" && next.id >= this._nextNodeId) this._nextNodeId = next.id + 1;
-    return next;
-  }
-
-  removeNodeAt(index: number, options: RemoveNodeOptions = {}): ConcreteNode[] {
-    this._assertTopologyMutationAllowed();
-    if (!Number.isInteger(index) || index < 0 || index >= this.nodes.length) {
-      throw new Error(`Node index ${index} is out of range.`);
-    }
-    const cascade = options.cascade === true;
-    const preserveOutputs = options.removeOutputs === false || options.preserveOutputsAsInputs === true;
-    const rewireSpec = options.rewire || {};
-    if (!isRecord(rewireSpec)) throw new Error("Node rewire option must be an object.");
-    const remove = new Set([index]);
-    const rewrites = new Map();
-    const start = this.nodes[index];
-    for (const [key, tensor] of Object.entries(start.outputs || {})) {
-      const value = rewireSpec[tensor.name] ?? rewireSpec[key];
-      if (value != null) rewrites.set(tensor, this._resolveTensorRef(value, `Rewire for '${tensor.name}'`));
+      outputNames.push(name);
     }
 
-    let changed = true;
-    while (changed) {
-      changed = false;
-      const removedOutputs = new Set();
-      for (const nodeIndex of remove) {
-        for (const tensor of Object.values(this.nodes[nodeIndex].outputs || {})) removedOutputs.add(tensor);
-      }
-      this.nodes.forEach((node, nodeIndex) => {
-        if (remove.has(nodeIndex)) return;
-        for (const tensor of Object.values(node.inputs || {})) {
-          if (!removedOutputs.has(tensor) || rewrites.has(tensor) || preserveOutputs) continue;
-          if (!cascade) {
-            throw new Error(`Cannot remove node '${String(start.id)}'; tensor '${tensor.name}' is consumed by node '${String(node.id)}'. Rewire it or pass { cascade: true }.`);
-          }
-          remove.add(nodeIndex);
-          changed = true;
-          break;
-        }
-      });
-    }
-    const removedNodes = [...remove].sort((a, b) => a - b).map((nodeIndex) => this.nodes[nodeIndex]);
-
-    const tensors = new Map(this.tensors);
-    if (preserveOutputs) {
-      for (const nodeIndex of remove) {
-        for (const tensor of Object.values(this.nodes[nodeIndex].outputs || {})) {
-          if (rewrites.has(tensor)) continue;
-          const input = Object.assign(Object.create(Object.getPrototypeOf(tensor)), tensor, { isInput: true, isWeight: false });
-          tensors.set(input.name, input);
-          rewrites.set(tensor, input);
-        }
-      }
-    } else {
-      for (const nodeIndex of remove) {
-        for (const tensor of Object.values(this.nodes[nodeIndex].outputs || {})) {
-          tensors.delete(tensor.name);
+    tensorEntries.sort(([left], [right]) => compareCanonicalNames(left, right));
+    const baseTensors = freezeRecord(tensorEntries);
+    const parsedQuantization = hasOwn(document, 'quantization')
+      ? parseAffineQuantization(document.quantization, baseTensors, baseWeights)
+      : null;
+    const quantization = parsedQuantization?.table ?? null;
+    const references = quantization?.tensors ?? freezeRecord<AffineQuantizationReference>([]);
+    if (parsedQuantization) {
+      validateQuantizationOperatorReferences(nodes, references);
+      for (let index = 0; index < outputNames.length; index++) {
+        if (parsedQuantization.parameterNames.has(outputNames[index])) {
+          fail(
+            `outputs[${index}]`,
+            `quantization parameter tensor '${outputNames[index]}' cannot be a public graph output.`,
+          );
         }
       }
     }
-    const nodes = this.nodes.filter((_, nodeIndex) => !remove.has(nodeIndex)).map((node) => ({
-      ...node,
-      inputs: Object.fromEntries(Object.entries(node.inputs || {}).map(([key, tensor]) => [key, rewrites.get(tensor) || tensor])),
-      outputs: Object.fromEntries(Object.entries(node.outputs || {}).map(([key, tensor]) => [key, rewrites.get(tensor) || tensor])),
-      params: { ...(node.params || {}) },
-    }));
-    const nextOutputNames = this.outputNames.map((name) => {
-      const oldTensor = this.tensors.get(name);
-      return oldTensor && rewrites.has(oldTensor) ? rewrites.get(oldTensor).name : name;
-    }).filter((name) => tensors.has(name));
-    this._assertValidState(nodes, tensors, nextOutputNames);
-    if (this._outputsExplicit) this._setOutputNames(nextOutputNames);
-    this._commitTopology(nodes, tensors, `remove node '${String(start.id)}'`);
-    return removedNodes;
-  }
 
-  removeNode(reference: string | number | ConcreteNode, options: RemoveNodeOptions = {}): ConcreteNode {
-    const index = this._nodeIndex(reference);
-    const removed = this.nodes[index];
-    this.removeNodeAt(index, options);
-    return removed;
-  }
-
-  setTensorBuffer(name: string, buffer: ArrayBuffer | ArrayBufferView): Tensor {
-    const tensor = this.getTensor(name);
-    if (!tensor) throw new Error(`Tensor '${name}' not found.`);
-    if (tensor.isWeight) this.adapters._assertBaseMutationAllowed();
-    Tensor.assertCompatibleBuffer(tensor.dtype, buffer, tensor._calculateByteSize(), `Tensor '${name}' buffer`);
-    tensor.buffer = buffer;
-    tensor.sizeBytes = buffer.byteLength;
-    if (tensor.isWeight) this._advanceWeightRevision();
-    return tensor;
-  }
-
-  stageAdapter(name: string, spec: AdapterSpec, options: AdapterStageOptions = {}): AdapterDescription {
-    return this.adapters.stage(name, spec, options);
-  }
-
-  updateAdapter(
-    name: string,
-    updates: Record<string, Record<string, unknown>>,
-    options: AdapterUpdateOptions = {},
-  ): AdapterDescription {
-    return this.adapters.update(name, updates, options);
-  }
-
-  loadAdapter(
-    source: SafetensorsFile | ArrayBuffer | ArrayBufferView,
-    options: AdapterLoadOptions = {},
-  ): AdapterDescription {
-    return this.adapters.load(source, options);
-  }
-
-  activateAdapter(name: string | null, version?: AdapterVersion): AdapterDescription | null {
-    return this.adapters.activate(name, version);
-  }
-
-  removeAdapter(name: string, version?: AdapterVersion): boolean {
-    return this.adapters.remove(name, version);
-  }
-
-  listAdapters(): AdapterDescription[] {
-    return this.adapters.list();
-  }
-
-  activeAdapter(): AdapterDescription | null {
-    return this.adapters.active();
-  }
-
-  exportAdapter(
-    name: string,
-    version?: AdapterVersion | AdapterExportOptions,
-    options: AdapterExportOptions = {},
-  ): ArrayBuffer | Blob | SafetensorsFile {
-    return this.adapters.export(name, version, options);
-  }
-
-  mergeAdapter(name: string, version?: AdapterVersion): AdapterDescription {
-    return this.adapters.merge(name, version);
-  }
-
-  unmergeAdapter(): AdapterDescription | null {
-    return this.adapters.unmerge();
-  }
-
-  applyTensorUpdate(
-    name: string,
-    update: Float32Array | ArrayBuffer | ArrayBufferView | ArrayLike<number>,
-    options: TensorUpdateOptions = {},
-  ): Tensor {
-    const tensor = this.getTensor(name);
-    if (!tensor) throw new Error(`Tensor '${name}' not found.`);
-    if (tensor.isWeight) this.adapters._assertBaseMutationAllowed();
-    if (tensor.dtype !== "float32") {
-      throw new Error(`Tensor '${name}' update requires float32, got '${tensor.dtype}'.`);
-    }
-    if (!tensor.buffer) throw new Error(`Tensor '${name}' has no CPU buffer to update.`);
-    const target = tensor.buffer instanceof Float32Array
-      ? tensor.buffer
-      : new Float32Array(tensor.buffer instanceof ArrayBuffer ? tensor.buffer : tensor.buffer.buffer);
-    const source = update instanceof Float32Array
-      ? update
-      : ArrayBuffer.isView(update)
-        ? new Float32Array(update.buffer, update.byteOffset, update.byteLength / 4)
-        : new Float32Array(update);
-    if (source.length !== target.length) {
-      throw new Error(`Tensor '${name}' update length mismatch: got ${source.length}, want ${target.length}.`);
-    }
-
-    const mode = options.mode || "assign";
-
-    if (mode === "assign") {
-      target.set(source);
-    } else if (mode === "add") {
-      for (let i = 0; i < target.length; i++) target[i] += source[i];
-    } else {
-      throw new Error(`Unsupported generic tensor update mode '${mode}'.`);
-    }
-
-    tensor.buffer = target;
-    tensor.sizeBytes = target.byteLength;
-    if (tensor.isWeight) this._advanceWeightRevision();
-    return tensor;
-  }
-
-  _advanceWeightRevision(): number {
-    this.weightRevision = this._nextWeightRevision++;
-    return this.weightRevision;
-  }
-
-  inspect({ includeWeightFiles = true, includeParams = true }: GraphInspectionOptions = {}): GraphInspection {
-    const tensors: GraphInspection['tensors'] = [];
-    for (const tensor of this.tensors.values()) {
-      tensors.push({
-        name: tensor.name,
-        shape: [...tensor.shape],
-        dtype: tensor.dtype,
-        isWeight: !!tensor.isWeight,
-        isInput: !!tensor.isInput,
-        role: tensor.isWeight ? "weight" : tensor.isInput ? "input" : "value",
-        sizeBytes: tensor.sizeBytes || tensor.buffer?.byteLength || 0,
-      });
-    }
-    const nodes = this.nodes.map((node, index) => ({
-      index,
-      id: String(node.id ?? index),
-      opType: node.opType,
-      inputs: Object.fromEntries(Object.entries(node.inputs || {}).map(([k, t]) => [k, t?.name || ""])),
-      outputs: Object.fromEntries(Object.entries(node.outputs || {}).map(([k, t]) => [k, t?.name || ""])),
-      outputShapes: Object.fromEntries(Object.entries(node.outputs || {}).map(([k, t]) => [k, [...(t?.shape || [])]])),
-      params: includeParams ? { ...(node.params || {}) } : undefined,
-    }));
-    return {
-      tensorCount: tensors.length,
-      nodeCount: nodes.length,
+    const tensors = attachTensorQuantization(baseTensors, references);
+    const inputs = freezeRecord(Object.keys(baseInputs).map((name) =>
+      [name, tensors[name] as InputDescriptor] as const));
+    const weights = freezeRecord(Object.keys(baseWeights).map((name) =>
+      [name, tensors[name] as WeightDescriptor] as const));
+    const logicalNodes = attachNodeOutputQuantization(nodes, references);
+    const graphWithoutFingerprint: Omit<Graph, 'fingerprint'> = Object.freeze({
+      format: VOLVOX_LOGICAL_GRAPH_FORMAT,
+      environment,
+      dimensions,
+      inputs,
+      weights,
+      banks,
       tensors,
-      nodes,
-      weightFiles: includeWeightFiles ? this.weightFiles.map((file) => file.inspect()) : [],
-      outputNames: [...(this.outputNames || [])],
-      topologyRevision: this.topologyRevision,
-      weightRevision: this.weightRevision,
-      adapters: this.listAdapters(),
-      activeAdapter: this.activeAdapter(),
-    };
-  }
-
-  patchNodeAt(index: number, patch: ConcreteNodePatch = {}): ConcreteNode {
-    const node = this.nodes[index];
-    if (!node) throw new Error(`Node ${index} not found.`);
-    if (!isRecord(patch)) throw new Error("Node patch must be an object.");
-    const replacement = this.replaceNodeAt(index, {
-      ...patch,
-      id: node.id,
-      opType: patch.opType || node.opType,
-      inputs: patch.inputs ? { ...(node.inputs || {}), ...patch.inputs } : node.inputs,
-      outputs: patch.outputs ? { ...(node.outputs || {}), ...patch.outputs } : node.outputs,
-      params: patch.params
-        ? (patch.replaceParams ? { ...patch.params } : { ...(node.params || {}), ...patch.params })
-        : node.params,
+      nodes: logicalNodes,
+      outputs: Object.freeze(outputNames),
+      quantization,
     });
-    // patchNodeAt keeps its node handle stable while using replaceNodeAt's
-    // transactional validation and downstream tensor rewrites.
-    Object.assign(node, replacement);
-    this.nodes[index] = node;
-    return node;
+    return Object.freeze({
+      ...graphWithoutFingerprint,
+      fingerprint: graphFingerprint(graphWithoutFingerprint),
+    });
+  } catch (error) {
+    if (error instanceof GraphError) throw error;
+    if (error instanceof ShapeContractError) {
+      const prefix = `${error.path}: `;
+      const message = error.message.startsWith(prefix) ? error.message.slice(prefix.length) : error.message;
+      throw new GraphError(error.path, message, 'INVALID_GRAPH', error);
+    }
+    throw error;
   }
-};
+}

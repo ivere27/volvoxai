@@ -8,6 +8,10 @@ import {
   type BackendProvider,
   type BackendProviderFactory,
 } from './backends/BackendProvider.js';
+import { CPUBackendProvider } from './backends/CPUBackendProvider.js';
+import { WasmBackendProvider } from './backends/WasmBackendProvider.js';
+import { WebGPUBackendProvider } from './backends/WebGPUBackendProvider.js';
+import { WebNNBackendProvider } from './backends/WebNNBackendProvider.js';
 import { Runtime, type RuntimeOptions } from './core/ContextRuntime.js';
 import { VolvoxAIError } from './core/RuntimeErrors.js';
 
@@ -22,7 +26,7 @@ export interface CreateRuntimeOptions extends RuntimeOptions {
 }
 
 interface BrowserMLContextFactory {
-  createContext(options: { deviceType: string }): Promise<unknown>;
+  createContext(options: { accelerated: boolean }): Promise<unknown>;
 }
 
 interface BrowserGPUAdapter {
@@ -75,11 +79,11 @@ async function initializeBuiltin(
   name: string,
   wasmUrl: string | URL,
 ): Promise<BackendProvider> {
-  if (name === 'cpu') return new BuiltInBackendProvider(new CPUEngine());
+  if (name === 'cpu') return new CPUBackendProvider(new CPUEngine());
   if (name === 'wasm') {
     const engine = await WasmEngine.init(wasmUrl);
     if (!engine) throw new Error(`WASM could not load '${String(wasmUrl)}'.`);
-    return new BuiltInBackendProvider(engine);
+    return new WasmBackendProvider(engine);
   }
   if (name === 'webgpu') {
     const runtimeNavigator = browserNavigator();
@@ -87,13 +91,13 @@ async function initializeBuiltin(
     const adapter = await requestWebGPUAdapter(runtimeNavigator.gpu);
     if (!adapter) throw new Error('WebGPU adapter is unavailable.');
     const device = await adapter.requestDevice();
-    return new BuiltInBackendProvider(new WebGPUEngine(device, { adapterInfo: adapter.info }));
+    return new WebGPUBackendProvider(new WebGPUEngine(device, { adapterInfo: adapter.info }));
   }
   if (name === 'webnn') {
     const runtimeNavigator = browserNavigator();
     if (!runtimeNavigator?.ml) throw new Error('WebNN is unavailable.');
-    const context = await runtimeNavigator.ml.createContext({ deviceType: 'npu' });
-    return new BuiltInBackendProvider(new WebNNEngine(context));
+    const context = await runtimeNavigator.ml.createContext({ accelerated: true });
+    return new WebNNBackendProvider(new WebNNEngine(context));
   }
   throw new Error(`Unknown built-in backend '${name}'.`);
 }
@@ -134,7 +138,7 @@ function runtimeProviderSources(
   return result;
 }
 
-/** Create the root handle for the Runtime -> Model -> Context lifecycle. */
+/** Create the root handle for the Runtime -> Model -> CompiledModel -> ExecutionContext lifecycle. */
 export async function createRuntime(options: CreateRuntimeOptions = {}): Promise<Runtime> {
   if (!options || typeof options !== 'object' || Array.isArray(options)) {
     throw new VolvoxAIError('INVALID_ARGUMENT',

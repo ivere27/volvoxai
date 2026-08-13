@@ -24,22 +24,27 @@ from tools.exporter.optimizer.typed_pipeline import (
 from tools.exporter.optimizer.typed_ptq_authoring import RuntimePTQAuthoringPass
 from tools.exporter.reference_executor import execute_reference
 from tools.exporter.runtime_ir import import_runtime_package
-from tools.exporter.typed_ptq import CalibrationTable, PTQConfig
+from tools.exporter.typed_ptq import (
+    CalibrationTable,
+    PTQConfig,
+    calibration_profile_from_ranges,
+)
 
 
 def _linear_package() -> tuple[dict, dict[str, np.ndarray]]:
     document = {
         "format": "volvox-graph/v1",
+        "dimensions": {},
         "inputs": {"x": {"shape": [2, 3], "dtype": "float32"}},
         "outputs": ["y"],
         "nodes": [{
             "id": "dense",
             "opType": "Linear",
             "inputs": {"input": "x", "weight": "weight", "bias": "bias"},
-            "outputs": {"out": "y"},
-            "outputs_shape": {"out": [2, 2]},
-            "outputs_dtype": {"out": "float32"},
-            "params": {"weight_layout": "IN_OUT"},
+            "outputs": {"out": {
+                "tensor": "y", "shape": [2, 2], "dtype": "float32",
+            }},
+            "params": {"weight_layout": "din_dout"},
         }],
     }
     tensors = {
@@ -85,20 +90,36 @@ class RuntimePTQAuthoringPipelineTests(unittest.TestCase):
     def test_portable_broadcast_ptq_registry_contract_emits_expand_then_qadd(self):
         document = {
             "format": "volvox-graph/v1",
+            "dimensions": {},
             "inputs": {
                 "x": {"shape": [1, 2, 4], "dtype": "float32"},
                 "route": {"shape": [1, 1, 4], "dtype": "float32"},
             },
             "outputs": ["y"],
-            "nodes": [{
-                "id": "broadcast-add",
-                "opType": "Add",
-                "inputs": {"a": "x", "b": "route"},
-                "outputs": {"out": "y"},
-                "outputs_shape": {"out": [1, 2, 4]},
-                "outputs_dtype": {"out": "float32"},
-                "params": {},
-            }],
+            "nodes": [
+                {
+                    "id": "expand-route",
+                    "opType": "Expand",
+                    "inputs": {"input": "route"},
+                    "outputs": {"out": {
+                        "tensor": "expanded_route",
+                        "shape": [1, 2, 4],
+                        "dtype": "float32",
+                    }},
+                    "params": {"shape": [1, 2, 4]},
+                },
+                {
+                    "id": "broadcast-add",
+                    "opType": "Add",
+                    "inputs": {"a": "x", "b": "expanded_route"},
+                    "outputs": {"out": {
+                        "tensor": "y",
+                        "shape": [1, 2, 4],
+                        "dtype": "float32",
+                    }},
+                    "params": {},
+                },
+            ],
         }
         graph = import_runtime_package(document, {})
         sample = {
@@ -117,6 +138,7 @@ class RuntimePTQAuthoringPipelineTests(unittest.TestCase):
             graph,
             {},
             table.profile(),
+            shape_profile={},
             target_environment=_target(),
         )
 
@@ -131,19 +153,25 @@ class RuntimePTQAuthoringPipelineTests(unittest.TestCase):
         self.assertEqual(
             [node.op_type for node in graph.nodes],
             [
-                "QuantizeLinear",
-                "QuantizeLinear",
                 "Expand",
+                "QuantizeLinear",
+                "QuantizeLinear",
                 "QAdd",
                 "DequantizeLinear",
             ],
         )
-        expand = graph.nodes[2]
+        expand = graph.nodes[0]
+        route_quantize = graph.nodes[2]
         qadd = graph.nodes[3]
-        self.assertEqual(qadd.input_map()["b"], expand.output_map()["out"])
         self.assertEqual(
-            graph.tensors[expand.input_map()["input"]].quantization,
-            graph.tensors[expand.output_map()["out"]].quantization,
+            route_quantize.input_map()["input"], expand.output_map()["out"],
+        )
+        self.assertEqual(
+            qadd.input_map()["b"], route_quantize.output_map()["out"],
+        )
+        self.assertEqual(
+            graph.tensors[route_quantize.output_map()["out"]].quantization,
+            graph.tensors[qadd.input_map()["b"]].quantization,
         )
 
     def test_registry_requires_both_authoring_policy_and_calibration_opt_in(self):
@@ -258,6 +286,7 @@ class RuntimePTQAuthoringPipelineTests(unittest.TestCase):
             document,
             tensors,
             calibration,
+            shape_profile={},
             target_environment=_target(),
         )
 
@@ -301,6 +330,7 @@ class RuntimePTQAuthoringPipelineTests(unittest.TestCase):
                 stale_document,
                 tensors,
                 calibration,
+                shape_profile={},
                 target_environment=_target(),
             )
         self.assertEqual(caught.exception.diagnostic.code, "VXPTQ047")
@@ -315,6 +345,7 @@ class RuntimePTQAuthoringPipelineTests(unittest.TestCase):
             graph,
             mutable_tensors,
             calibration,
+            shape_profile={},
             target_environment=_target(),
         )
         self.assertEqual(report.metadata.recipe_id, "runtime-ptq-authoring")
@@ -342,6 +373,7 @@ class RuntimePTQAuthoringPipelineTests(unittest.TestCase):
                 stale_graph,
                 stale_tensors,
                 calibration,
+                shape_profile={},
                 target_environment=_target(),
             )
         self.assertEqual(caught.exception.diagnostic.code, "VXPTQ047")
@@ -349,10 +381,62 @@ class RuntimePTQAuthoringPipelineTests(unittest.TestCase):
         for name, expected in tensors.items():
             np.testing.assert_array_equal(stale_tensors[name], expected)
 
-    def test_retained_f32_instances_are_structured_pipeline_diagnostics(self):
-        shape = [1, 1, 1, 1, 1, 1, 1, 2, 4]
+    def test_symbolic_authoring_runs_the_whole_pipeline_and_keeps_abi(self):
+        document, tensors = _linear_package()
+        document["dimensions"] = {"B": {"min": 1, "max": 4}}
+        document["inputs"]["x"]["shape"] = ["B", 3]
+        document["nodes"][0]["outputs"]["out"]["shape"] = ["B", 2]
+        graph = import_runtime_package(document, tensors)
+        calibration = calibration_profile_from_ranges(
+            graph,
+            {
+                "x": {
+                    "min": -2.0, "max": 2.0, "samples": 2, "elements": 18,
+                },
+                "y": {
+                    "min": -1.0, "max": 1.0, "samples": 2, "elements": 12,
+                },
+            },
+            sample_count=2,
+            sample_digest="d" * 64,
+        )
+
+        report = author_runtime_ptq_graph(
+            graph,
+            tensors,
+            calibration,
+            shape_profile=None,
+            target_environment=_target(),
+        )
+
+        self.assertEqual(
+            [(item.name, item.min, item.max)
+             for item in graph.shape_environment.dimensions],
+            [("B", 1, 4)],
+        )
+        self.assertEqual(graph.tensors["x"].shape, ("B", 3))
+        self.assertEqual(graph.tensors["y"].shape, ("B", 2))
+        self.assertEqual(
+            [node.op_type for node in graph.nodes],
+            ["QuantizeLinear", "QLinear", "DequantizeLinear"],
+        )
+        authoring = next(
+            run for run in report.runs if run.name == "runtime-ptq-authoring"
+        )
+        canonicalize = next(
+            run for run in report.runs if run.name == "runtime-canonicalize"
+        )
+        self.assertFalse(authoring.skipped)
+        # `runtime-canonicalize` is symbolic-preserving since the optimizer
+        # migration, so a profile-free symbolic authoring run executes it
+        # instead of skipping it, and the ABI above still holds.
+        self.assertFalse(canonicalize.skipped)
+
+    def test_implicit_broadcast_fails_before_ptq_authoring(self):
+        shape = [1, 2, 4]
         document = {
             "format": "volvox-graph/v1",
+            "dimensions": {},
             "inputs": {
                 "x": {"shape": shape, "dtype": "float32"},
                 "route": {"shape": [4], "dtype": "float32"},
@@ -362,37 +446,16 @@ class RuntimePTQAuthoringPipelineTests(unittest.TestCase):
                 "id": "broadcast-add",
                 "opType": "Add",
                 "inputs": {"a": "x", "b": "route"},
-                "outputs": {"out": "y"},
-                "outputs_shape": {"out": shape},
-                "outputs_dtype": {"out": "float32"},
+                "outputs": {"out": {
+                    "tensor": "y", "shape": shape, "dtype": "float32",
+                }},
                 "params": {},
             }],
         }
-        graph = import_runtime_package(document, {})
-        calibration = CalibrationTable(graph).profile()
-        report = author_runtime_ptq_graph(
-            graph, {}, calibration, target_environment=_target(),
-        )
-        authoring_run = next(
-            run for run in report.runs
-            if run.name == "runtime-ptq-authoring"
-        )
-        self.assertEqual(
-            dict(authoring_run.metrics)["retained_f32_instances"], 1,
-        )
-        self.assertEqual(len(authoring_run.diagnostics), 1)
-        retained = authoring_run.diagnostics[0]
-        self.assertEqual(retained.code, "VXPTQ096")
-        self.assertEqual(retained.source_node, "broadcast-add")
-        self.assertEqual(retained.source_op, "Add")
-        serialized = serialize_pipeline_report(report)
-        serialized_run = next(
-            run for run in serialized["runs"]
-            if run["pass"] == "runtime-ptq-authoring"
-        )
-        self.assertEqual(
-            serialized_run["diagnostics"][0]["code"], "VXPTQ096",
-        )
+        with self.assertRaises(ExporterError) as caught:
+            import_runtime_package(document, {})
+        self.assertEqual(caught.exception.diagnostic.code, "VXRTIR035")
+        self.assertIn("exactly equal shapes", caught.exception.diagnostic.message)
 
 
 if __name__ == "__main__":

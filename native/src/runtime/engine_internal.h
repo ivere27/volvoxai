@@ -2,6 +2,7 @@
 #define VOLVOX_ENGINE_INTERNAL_H
 
 #include "backend_config.h"
+#include "engine_core.h"
 #include "runtime_state.h"
 #include <stddef.h>
 #include <stdint.h>
@@ -28,6 +29,11 @@ typedef struct VxBackend VxBackend;
 #define g_first_input (vx_engine_state_current()->first_input)
 #define g_loaded (vx_engine_state_current()->loaded)
 #define g_weight_caches_dirty (vx_engine_state_current()->weight_caches_dirty)
+#define g_bank_residency (vx_engine_state_current()->bank_residency)
+#define g_bank_residency_count \
+    (vx_engine_state_current()->bank_residency_count)
+#define g_bank_residency_capacity \
+    (vx_engine_state_current()->bank_residency_capacity)
 #define g_active_row (vx_engine_state_current()->active_row)
 #define g_prefix_rows (vx_engine_state_current()->prefix_rows)
 #define g_prefix_row_capacity \
@@ -105,6 +111,8 @@ typedef struct VxBackend VxBackend;
 #define g_vx_cuda_replay_generation \
     (vx_engine_state_current()->runtime_cuda_replay_generation)
 #define g_vx_forward_ok (vx_engine_state_current()->runtime_forward_ok)
+#define g_bounded_gpu_value_domain_proven \
+    (vx_engine_state_current()->bounded_gpu_value_domain_proven)
 #define g_vx_backend_registry (vx_engine_state_current()->backend_registry)
 
 #define g_use_vulkan (vx_engine_state_current()->use_vulkan)
@@ -127,6 +135,20 @@ int volvoxai_engine_tensor_is_removed_output(const char* name);
 void materialize_tensor_f32(T* t);
 void vx_runtime_backend_reset(void);
 void vx_runtime_backend_reset_transients(void);
+int vx_runtime_backend_bind_shape(const char* signature);
+/* Atomically bind one exact semantic shape to an already proved fixed domain
+ * layout. Native GPU backends reserve every physical span before publishing
+ * the new key; CPU has no device-side work here. */
+int vx_runtime_backend_bind_shape_domain(
+        const char* signature,
+        const VolvoxAIEnginePhysicalSpan* spans,
+        size_t span_count,
+        size_t qgroupnorm_stats_bytes,
+        size_t qlayernorm_stats_bytes);
+/* Append backend-specific specialization telemetry to a report suffix.
+ * Backends without graph/cache telemetry append an empty string. */
+int vx_runtime_backend_append_dynamic_telemetry(char* output,
+                                                size_t output_capacity);
 void vx_runtime_backend_teardown(void);
 void vx_runtime_backend_begin_forward(int ordinary_static_replay_eligible,
                                       uint64_t model_generation);
@@ -135,6 +157,8 @@ int vx_runtime_backend_end_forward(int forward_ok);
 int vx_runtime_backend_cuda_replay_eligible(void);
 void vx_runtime_backend_mark_host(const void* host, size_t bytes, int is_weight);
 int vx_runtime_backend_sync_host(const void* host, size_t bytes, int is_weight);
+void vx_runtime_backend_retain_weight(const void* host, size_t bytes);
+void vx_runtime_backend_demote_weight(const void* host, size_t bytes);
 int vx_runtime_backend_has_graph(void);
 int vx_runtime_backend_stage(void);
 int vx_runtime_full_graph_execution_eligible(void);
@@ -150,6 +174,10 @@ void vk_mark_owned_tensors_host_dirty(void);
 char* read_file(const char* path, long* out_size);
 int volvoxai_engine_load_weight_files(const char* const* paths, int count);
 int build_graph(const char* graph_path);
+/* Load-time weight-bank residency; call before engine init. */
+int volvoxai_engine_add_bank_residency(const char* bank,
+                                       const uint32_t* slots,
+                                       size_t slot_count);
 void volvoxai_engine_free_arena(void);
 int volvoxai_engine_prepare_tensor_table_mutation(void);
 void volvoxai_engine_finish_tensor_table_mutation(void);
@@ -181,6 +209,7 @@ int volvoxai_engine_forward_incremental_locked(void);
 int volvoxai_engine_forward_incremental_row_locked(int row);
 int volvoxai_engine_tensor_is_model_weight_locked(const char* name);
 int volvoxai_engine_sync_model_weights_locked(void);
+int volvoxai_engine_retain_preloaded_model_weights_locked(void);
 int volvoxai_engine_tensor_is_quantization_parameter_locked(const char* name);
 int volvoxai_engine_add_model_tensor_raw_locked(const char* name,
                                                 const int* shape, int ndim,
@@ -203,7 +232,7 @@ int volvoxai_engine_apply_tensor_update_f32_locked(const char* name, const float
                                            float epsilon, float weight_decay, float max_grad_norm,
                                            long step);
 #endif
-int prepack_conv_weights(void);
+int prepack_cpu_weights(void);
 int run_node(Node* n, int idx, int is_last);
 int run_node_cpu_direct(Node* n, int idx, int is_last);
 /* Side-effect-free preflight for canonical operators whose CPU implementation

@@ -20,9 +20,10 @@ def _node(identifier, op_type, inputs, output, shape, dtype, params=None):
         "id": identifier,
         "opType": op_type,
         "inputs": dict(inputs),
-        "outputs": {"out": output},
-        "outputs_shape": {"out": list(shape)},
-        "outputs_dtype": {"out": dtype},
+        "outputs": {"out": {
+            "tensor": output, "shape": list(shape), "dtype": dtype,
+        }},
+        "params": {},
     }
     if params is not None:
         node["params"] = dict(params)
@@ -54,13 +55,14 @@ def _single_input_package(compute_nodes, *, shape=(2, 4), outputs=None, extra=No
         *compute_nodes,
         _node(
             "q", "QuantizeLinear",
-            {"input": compute_nodes[-1]["outputs"]["out"],
+            {"input": compute_nodes[-1]["outputs"]["out"]["tensor"],
              "scale": "out_scale", "zero_point": "out_zero"},
             "output_byte", shape, "uint8",
         ),
     ]
     document = {
         "format": "volvox-graph/v1",
+        "dimensions": {},
         "inputs": {"input_byte": {"shape": list(shape), "dtype": "int8"}},
         "outputs": list(outputs or ("output_byte",)),
         "nodes": nodes,
@@ -88,13 +90,17 @@ def _closed_broadcast_graph():
                 "activated", shape, "float32", {"approximate": "none"},
             ),
         ],
-        extra={"bias_value": np.linspace(-0.2, 0.2, 4, dtype=np.float32)},
+        extra={
+            "bias_value": np.tile(
+                np.linspace(-0.2, 0.2, 4, dtype=np.float32), (2, 1),
+            ),
+        },
     )
     return import_runtime_package(document, tensors)
 
 
 class QuantizedRegionAnalysisTests(unittest.TestCase):
-    def test_discovers_closed_multi_op_broadcast_region(self):
+    def test_discovers_closed_multi_op_region(self):
         shape = (2, 4)
         compute = [
             _node(
@@ -108,7 +114,11 @@ class QuantizedRegionAnalysisTests(unittest.TestCase):
         ]
         document, tensors = _single_input_package(
             compute,
-            extra={"bias_value": np.linspace(-0.2, 0.2, 4, dtype=np.float32)},
+            extra={
+                "bias_value": np.tile(
+                    np.linspace(-0.2, 0.2, 4, dtype=np.float32), (2, 1),
+                ),
+            },
         )
 
         report = QuantizedRegionAnalysis().run(
@@ -125,8 +135,7 @@ class QuantizedRegionAnalysisTests(unittest.TestCase):
         self.assertEqual(region.open_float_inputs, ())
         self.assertEqual(region.escaping_tensors, ())
         self.assertEqual(region.unquantized_intermediates, ("biased",))
-        self.assertEqual(len(region.broadcasts), 1)
-        self.assertEqual(region.broadcasts[0].input_port, "b")
+        self.assertEqual(region.broadcasts, ())
         self.assertEqual(region.input_boundaries[0].byte_tensor, "input_byte")
         self.assertEqual(region.output_boundaries[0].byte_tensor, "output_byte")
         self.assertEqual(report.by_node["bias"], region.id)
@@ -147,7 +156,7 @@ class QuantizedRegionAnalysisTests(unittest.TestCase):
         document, tensors = _single_input_package(
             compute,
             outputs=("output_byte", "biased"),
-            extra={"bias_value": np.zeros(4, dtype=np.float32)},
+            extra={"bias_value": np.zeros(shape, dtype=np.float32)},
         )
 
         region = QuantizedRegionAnalysis().run(
@@ -172,6 +181,7 @@ class QuantizedRegionAnalysisTests(unittest.TestCase):
         }
         document = {
             "format": "volvox-graph/v1",
+            "dimensions": {},
             "inputs": {
                 "a_byte": {"shape": list(shape), "dtype": "int8"},
                 "b_byte": {"shape": list(shape), "dtype": "uint8"},
@@ -231,7 +241,7 @@ class QuantizedRegionAnalysisTests(unittest.TestCase):
                 "norm", "GroupNorm",
                 {"input": "decoded", "weight": "norm_weight", "bias": "norm_bias"},
                 "normalized", shape, "float32",
-                {"num_groups": 2, "eps": 1e-5, "data_layout": "NHWC"},
+                {"num_groups": 2, "eps": 1e-5},
             ),
             _node(
                 "sigmoid", "Sigmoid", {"input": "normalized"},
@@ -307,7 +317,7 @@ class QuantizedRegionAnalysisTests(unittest.TestCase):
             "bind-registered-portable-logical-rewrite",
             portable.requirements,
         )
-        self.assertEqual(portable.broadcast_edges, ("bias:b",))
+        self.assertEqual(portable.broadcast_edges, ())
         self.assertEqual(portable.unquantized_intermediates, ("biased",))
 
         self.assertEqual(
@@ -370,7 +380,7 @@ class QuantizedRegionAnalysisTests(unittest.TestCase):
         document, tensors = _single_input_package(
             compute,
             outputs=("output_byte", "biased"),
-            extra={"bias_value": np.zeros(4, dtype=np.float32)},
+            extra={"bias_value": np.zeros(shape, dtype=np.float32)},
         )
         graph = import_runtime_package(document, tensors)
 

@@ -1,18 +1,40 @@
+import {
+  assertShapeKernelOutput,
+  assertShapeKernelParams,
+  assertShapeKernelTensor,
+  normalizeShapeKernelAxis,
+  sameShape,
+} from './shapeKernelValidation.js';
+
+function reductionDescriptor(node, operation) {
+  const input = node.inputs?.input || node.inputs?.data;
+  const output = node.outputs?.out || Object.values(node.outputs || {})[0];
+  const elements = assertShapeKernelTensor(input, `${operation} input`, {
+    dtypes: ['float32'], minimumRank: 1,
+  });
+  if (input.quantization != null) throw new Error(`${operation} input must be unquantized.`);
+  const params = assertShapeKernelParams(node, ['axis', 'keepdims'], operation);
+  const axis = normalizeShapeKernelAxis(params.axis, input.shape.length, -1, operation);
+  if (axis !== input.shape.length - 1) throw new Error(`${operation} must reduce the last axis.`);
+  const droppedShape = [...input.shape.slice(0, -1)];
+  const keepShape = [...droppedShape, 1];
+  // Legacy concrete graphs encoded keepdims only through their output shape.
+  // Logical v1 supplies the canonical boolean/default before this kernel runs.
+  const keepdims = params.keepdims ?? !sameShape(output?.shape ?? [], droppedShape);
+  if (typeof keepdims !== 'boolean') throw new Error(`${operation} keepdims must be boolean.`);
+  const expectedShape = keepdims ? keepShape : droppedShape;
+  assertShapeKernelOutput(output, expectedShape, 'float32', undefined, operation);
+  const axisSize = input.shape.at(-1);
+  return { input, output, axisSize, rows: elements / axisSize };
+}
+
 export function _cpuReduceSum(node) {
-    const input = node.inputs.input || node.inputs.data;
-    const inBuf = input.buffer;
-    const outBuf = node.outputs.out.buffer;
-    const d = input.shape.at(-1);
-    const b = input.shape.slice(0, -1).reduce((count, dimension) => count * dimension, 1);
-    if (!Number.isSafeInteger(d) || d <= 0 || inBuf.length !== b * d || outBuf.length !== b) {
-      throw new Error(`ReduceSum node ${node.id ?? "<unnamed>"} must reduce the last axis into one value per outer row.`);
+  const { input, output, axisSize, rows } = reductionDescriptor(node, 'ReduceSum');
+  for (let row = 0; row < rows; row++) {
+    let sum = 0;
+    for (let column = 0; column < axisSize; column++) {
+      sum += input.buffer[row * axisSize + column];
     }
-    
-    for (let i = 0; i < b; i++) {
-        let sum = 0.0;
-        for (let j = 0; j < d; j++) {
-            sum += inBuf[i * d + j];
-        }
-        outBuf[i] = sum;
-    }
+    output.buffer[row] = sum;
+  }
 }

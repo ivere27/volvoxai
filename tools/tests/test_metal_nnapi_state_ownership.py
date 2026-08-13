@@ -14,6 +14,9 @@ NNAPI = ROOT / "native/src/backends/nnapi_engine.c"
 RUNTIME_HEADER = ROOT / "native/src/runtime/runtime_state.h"
 RUNTIME_IMPL = ROOT / "native/src/runtime/runtime_state.c"
 METAL_TEST = ROOT / "native/tests/test_metal_training.m"
+RUNTIME_ARENA = ROOT / "native/src/runtime/arena.c"
+RUNTIME_DISPATCH = ROOT / "native/src/runtime/engine_runtime_dispatch.inc"
+PUBLIC_API = ROOT / "native/src/runtime/public_api.c"
 
 
 def typedef_body(source: str, name: str) -> str:
@@ -32,6 +35,9 @@ class MetalNnapiStateOwnershipTests(unittest.TestCase):
         cls.runtime_header = RUNTIME_HEADER.read_text(encoding="utf-8")
         cls.runtime_impl = RUNTIME_IMPL.read_text(encoding="utf-8")
         cls.metal_test = METAL_TEST.read_text(encoding="utf-8")
+        cls.runtime_arena = RUNTIME_ARENA.read_text(encoding="utf-8")
+        cls.runtime_dispatch = RUNTIME_DISPATCH.read_text(encoding="utf-8")
+        cls.public_api = PUBLIC_API.read_text(encoding="utf-8")
 
     def test_metal_has_one_explicit_mutable_device_global(self) -> None:
         self.assertRegex(
@@ -95,6 +101,9 @@ class MetalNnapiStateOwnershipTests(unittest.TestCase):
             "qgroupnorm_scratch_buffer",
             "qlayernorm_scratch_buffer",
             "qconv_zero_bias_storage",
+            "shape_signature",
+            "shape_generation",
+            "capacity_generation",
             "MetalTrainingKernel training_kernel_storage",
             "MetalTrainingTensorSlot training_slot_storage",
             "training_command_buffer",
@@ -118,6 +127,20 @@ class MetalNnapiStateOwnershipTests(unittest.TestCase):
             with self.subTest(evidence=evidence):
                 self.assertIn(evidence, self.metal_test)
 
+    def test_metal_dynamic_shape_rebind_is_exact_and_transactional(self) -> None:
+        for evidence in (
+            "metal_graph_bind_shape",
+            "!strcmp(state->shape_signature, signature)",
+            "candidate = (char*)malloc",
+            "graph_flush_commands()",
+            "graph_slot_ensure_capacity",
+            "candidate = create_buffer",
+            "test_dynamic_shape_capacity_lifecycle",
+            "pooled_capacity_bytes",
+        ):
+            with self.subTest(evidence=evidence):
+                self.assertIn(evidence, self.metal + self.metal_test)
+
     def test_nnapi_cache_is_context_owned_and_exactly_keyed(self) -> None:
         self.assertNotRegex(
             self.nnapi,
@@ -125,18 +148,49 @@ class MetalNnapiStateOwnershipTests(unittest.TestCase):
         )
         body = typedef_body(self.nnapi, "NnapiContextState")
         self.assertIn("NnapiWeightEntry* weight_entries", body)
+        for bounded_field in (
+            "pthread_mutex_t mutex",
+            "weight_entry_capacity",
+            "cache_clock",
+            "output_staging",
+            "model_builds",
+            "last_model_build_time_ms",
+            "evictions",
+            "missing_input_rejections",
+        ):
+            with self.subTest(bounded_field=bounded_field):
+                self.assertIn(bounded_field, body)
         for key in (
             "source_weight",
             "source_bias",
-            "sequence",
-            "input_width",
-            "output_width",
+            "shape_signature",
         ):
             with self.subTest(key=key):
                 self.assertIn(key, self.nnapi)
         self.assertIn("void* nnapi_context_state;", self.runtime_header)
         self.assertIn("nnapi_context_state_destroy", self.runtime_header)
         self.assertIn("state->nnapi_context_state_destroy", self.runtime_impl)
+        self.assertIn("NNAPI_MODEL_CACHE_CAPACITY", self.nnapi)
+        self.assertIn("nnapi_weight_entry_victim", self.nnapi)
+        self.assertIn("nnapi_weight_entry_release", self.nnapi)
+        self.assertIn("nnapi_matmul_plan", self.nnapi)
+        self.assertIn("cache_hit_rate", self.nnapi)
+        self.assertIn("return execution_ok", self.nnapi)
+        self.assertIn("output left unwritten", self.nnapi)
+
+    def test_nnapi_public_dynamic_route_preserves_immutable_cache_inputs(self) -> None:
+        self.assertNotIn("!g_loaded || g_use_nnapi", self.runtime_arena)
+        self.assertRegex(
+            self.public_api,
+            r'!strcmp\(backend, "metal"\)[\s\S]*?'
+            r'!strcmp\(backend, "nnapi"\)',
+        )
+        self.assertIn(
+            "volvoxai_engine_tensor_is_model_weight_locked(call.weight_name)",
+            self.runtime_dispatch,
+        )
+        self.assertIn("nnapi_cache_telemetry", self.runtime_dispatch)
+        self.assertIn("nnapi_build_ms", self.runtime_dispatch)
 
     def test_shader_override_path_remains_store_owned(self) -> None:
         self.assertIn("metal_set_shader_root", self.metal)

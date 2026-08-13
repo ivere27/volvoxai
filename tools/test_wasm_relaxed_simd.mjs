@@ -104,6 +104,13 @@ const weightPointer = allocate(dIn * dOut);
 const packedBytes = Number(parent.exports.packed_q8_weight_size(dIn, dOut));
 assert.ok(packedBytes > 0);
 const packedPointer = allocate(packedBytes);
+assert.equal(typeof parent.exports.packed_q8_weight_canonical_size, 'function');
+assert.equal(typeof parent.exports.pack_q8_weight_canonical, 'function');
+const canonicalPackedBytes = Number(
+  parent.exports.packed_q8_weight_canonical_size(dIn, dOut),
+);
+assert.ok(canonicalPackedBytes > 0 && canonicalPackedBytes < packedBytes);
+const canonicalPackedPointer = allocate(canonicalPackedBytes);
 const biasPointer = allocate(dOut * 4);
 const scalesPointer = allocate(dOut * 4);
 const zeroPointsPointer = allocate(dOut * 4);
@@ -123,6 +130,7 @@ function align16(value) {
 function expectedV8Q2HeaderWords(inputDimension, outputDimension,
     weightDtype, bytes) {
   const nBlocks = Math.ceil(outputDimension / VX_PACKED_Q8_NR);
+  const pairKBlocks = Math.ceil(inputDimension / 2);
   const sumsOffset = align16(VX_PACKED_Q8_HEADER_WORDS * 4);
   const dataOffset = align16(
     sumsOffset + nBlocks * VX_PACKED_Q8_NR * Int32Array.BYTES_PER_ELEMENT,
@@ -130,12 +138,22 @@ function expectedV8Q2HeaderWords(inputDimension, outputDimension,
   const pairDataOffset = align16(
     dataOffset + nBlocks * inputDimension * VX_PACKED_Q8_NR,
   );
-  assert.equal(bytes, pairDataOffset,
-    'the wasm V8Q2 pack must end at its aligned pair-data offset');
+  const pairBytes = nBlocks * pairKBlocks * 32;
+  assert.equal(bytes, pairDataOffset + pairBytes,
+    'the wasm V8Q2 pack must include its derived widened K2/N8 panels');
+  let pairFlags = 0;
+  if (weightDtype === VX_DTYPE_I8) {
+    pairFlags = 1;
+    const signed = Array.from(rawWeights, (raw) => semanticByte(raw, weightDtype));
+    if (signed.every((value) => value !== -128)) {
+      pairFlags |= 2;
+      if (signed.every((value) => Math.abs(value) <= 64)) pairFlags |= 4;
+    }
+  }
   return [
     VX_PACKED_Q8_MAGIC_V8Q2, bytes, inputDimension, outputDimension,
     nBlocks, weightDtype, sumsOffset, dataOffset,
-    0, 0, pairDataOffset, 0,
+    nBlocks, pairKBlocks, pairDataOffset, pairFlags,
   ];
 }
 
@@ -229,6 +247,27 @@ for (const inputDtype of [VX_DTYPE_I8, VX_DTYPE_U8]) {
     }
   }
 }
+
+/* The child deliberately requires the widened shared pack even though its
+ * arithmetic reads raw weights.  A canonical-only pack must fail before any
+ * output write so the parent can continue through its packed scalar fallback. */
+writeBytes(zeroPointsPointer, unsignedWeightZeroPoints);
+assert.equal(parent.exports.pack_q8_weight_canonical(
+  canonicalPackedPointer, canonicalPackedBytes, weightPointer,
+  dIn, dOut, VX_DTYPE_U8, 1,
+), 1);
+new Uint8Array(memory.buffer, outputPointer, dOut).fill(0xa5);
+assert.equal(qlinear(
+  inputPointer, weightPointer, canonicalPackedPointer, biasPointer,
+  scalesPointer, zeroPointsPointer, outputPointer,
+  1, dIn, dOut, 1, 131, 256, 121,
+  VX_DTYPE_U8, VX_DTYPE_U8, VX_DTYPE_U8,
+), 0, 'the Relaxed-SIMD child must reject a canonical-only pack');
+assert.deepEqual(
+  [...new Uint8Array(memory.buffer, outputPointer, dOut)],
+  Array(dOut).fill(0xa5),
+  'canonical-only child rejection must precede the first output write',
+);
 
 function assertCorruptPackedHeaderRejected(word, replacement, label) {
   const byteOffset = word * 4;

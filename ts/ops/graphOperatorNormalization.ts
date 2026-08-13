@@ -11,7 +11,7 @@ export class GraphOperatorNormalizer {
     const explicitLayout = (n) => {
       const layout = n.params?.weight_layout;
       if (layout == null || layout === "") return n.params?.transB ? "dout" : null;
-      if (["OUT_IN", "out_in", "OI", "peft"].includes(layout)) return "dout";
+      if (["OUT_IN", "out_in", "OI", "peft", "dout_din"].includes(layout)) return "dout";
       if (["IN_OUT", "in_out", "IO", "din_dout"].includes(layout)) return "din";
       throw new Error(`[GraphLoader] Unsupported linear weight_layout '${layout}' at node ${n.id}.`);
     };
@@ -40,7 +40,12 @@ export class GraphOperatorNormalizer {
       else if (explicitLayout(n)) n.wLayout = explicitLayout(n);
       else if (w && w.length >= 2 && K !== N && w[0] === N && w[1] === K) n.wLayout = "dout";
       else if (w && w.length >= 2 && K !== N && w[0] === K && w[1] === N) n.wLayout = "din";
-      else n.wLayout = model;                                          // square → model convention
+      // A square weight satisfies both readings, so shape cannot disambiguate
+      // it. The model-majority convention used to decide it here, but native
+      // falls through to IN_OUT instead, so the same graph could mean different
+      // things on the two tiers with nothing to signal it. Match native.
+      else if (w && w.length >= 2 && K === N) n.wLayout = "din";
+      else n.wLayout = model;                                          // rank<2 / dynamic → model convention
     }
   }
 

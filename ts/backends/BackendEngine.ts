@@ -9,12 +9,15 @@ export type BackendOutputLocation = MemoryLocationValue;
 export interface BackendCapabilityOptions {
   incrementalExecution?: boolean;
   incrementalRows?: boolean;
+  /** See ProviderDecodeCapabilities.sequenceMajorRows. */
+  sequenceMajorRows?: boolean;
   outputLocation?: BackendOutputLocation;
 }
 
 export interface BackendCapabilities {
   readonly incrementalExecution: boolean;
   readonly incrementalRows: boolean;
+  readonly sequenceMajorRows: boolean;
   readonly outputLocation: BackendOutputLocation;
 }
 
@@ -62,6 +65,7 @@ export function assertInferenceExecutionOptions(options: unknown, label: string)
 export function createBackendCapabilities({
   incrementalExecution = false,
   incrementalRows = false,
+  sequenceMajorRows = false,
   outputLocation = 'host',
 }: BackendCapabilityOptions = {}): Readonly<BackendCapabilities> {
   if (incrementalRows && !incrementalExecution) {
@@ -70,9 +74,13 @@ export function createBackendCapabilities({
   if (!OUTPUT_LOCATIONS.has(outputLocation)) {
     throw new Error("Backend outputLocation must be 'host' or 'device'.");
   }
+  if (sequenceMajorRows && !incrementalRows) {
+    throw new Error('sequenceMajorRows requires incrementalRows.');
+  }
   return Object.freeze({
     incrementalExecution: incrementalExecution === true,
     incrementalRows: incrementalRows === true,
+    sequenceMajorRows: sequenceMajorRows === true,
     outputLocation,
   });
 }

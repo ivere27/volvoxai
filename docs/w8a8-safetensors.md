@@ -15,6 +15,26 @@ A quantized graph has one central reference table:
 ```json
 {
   "format": "volvox-graph/v1",
+  "dimensions": {},
+  "inputs": {
+    "hidden_q": {"shape": [1, 4], "dtype": "int8"}
+  },
+  "nodes": [
+    {
+      "id": "projection",
+      "opType": "QLinear",
+      "inputs": {
+        "input": "hidden_q",
+        "weight": "projection.weight",
+        "bias": "projection.bias"
+      },
+      "outputs": {
+        "out": {"tensor": "projected_q", "shape": [1, 2], "dtype": "int8"}
+      },
+      "params": {}
+    }
+  ],
+  "outputs": ["projected_q"],
   "quantization": {
     "format": "volvox-affine-safetensors/v1",
     "tensors": {
@@ -28,6 +48,11 @@ A quantized graph has one central reference table:
         "axis": 0,
         "scale_tensor": "__quant__.projection.weight.scale",
         "zero_point_tensor": "__quant__.projection.weight.zero_point"
+      },
+      "projected_q": {
+        "scheme": "per_tensor",
+        "scale_tensor": "__quant__.projected.scale",
+        "zero_point_tensor": "__quant__.projected.zero_point"
       }
     }
   }
@@ -107,15 +132,16 @@ names MUST be identical to the central descriptor references:
 
 ```json
 {
+  "id": "quantize_hidden",
   "opType": "QuantizeLinear",
   "inputs": {
     "input": "hidden",
     "scale": "__quant__.hidden.scale",
     "zero_point": "__quant__.hidden.zero_point"
   },
-  "outputs": {"out": "hidden_q"},
-  "outputs_shape": {"out": [1, 320]},
-  "outputs_dtype": {"out": "int8"},
+  "outputs": {
+    "out": {"tensor": "hidden_q", "shape": [1, 320], "dtype": "int8"}
+  },
   "params": {}
 }
 ```

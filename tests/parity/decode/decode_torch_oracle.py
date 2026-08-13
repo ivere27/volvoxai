@@ -25,6 +25,9 @@ CASE_ID = "tinystories-decode"
 SCHEMA_VERSION = 1
 ARTIFACT_SCHEMA = "volvoxai.parity-artifact"
 MANIFEST_SCHEMA = "volvoxai.parity-run-manifest"
+EXECUTION_CONTRACT = "execution-context-retained-seed-step-v1"
+REQUEST_SEQUENCE_CAPACITY = 24
+MAXIMUM_FIXTURE_SEQUENCE_CAPACITY = 256
 
 
 def utc_now():
@@ -84,6 +87,12 @@ def main():
     prompt, n_new = list(spec["prompt"]), int(spec["nNew"])
     if not prompt or n_new <= 0:
         raise ValueError("decode prompt and generation length must be non-empty")
+    if (spec.get("executionContract") != EXECUTION_CONTRACT or
+            spec.get("requestSequenceCapacity") != REQUEST_SEQUENCE_CAPACITY or
+            spec.get("maximumFixtureSequenceCapacity") !=
+            MAXIMUM_FIXTURE_SEQUENCE_CAPACITY or
+            len(prompt) + n_new != REQUEST_SEQUENCE_CAPACITY):
+        raise ValueError("decode prompt does not declare the qualified request-sized contract")
     started_at = utc_now()
     policy = json.load(open(os.path.join(ROOT, "tests", "parity", "policy.json")))
     external = policy["models"]["tinystories_1m"]["external"]
@@ -135,6 +144,10 @@ def main():
             "kind": "python",
             "backend": "torch",
             "parentRunId": parent_manifest["runId"],
+            "comparedExecutionContract": EXECUTION_CONTRACT,
+            "promptActiveLength": len(prompt),
+            "requestSequenceCapacity": REQUEST_SEQUENCE_CAPACITY,
+            "maximumFixtureSequenceCapacity": MAXIMUM_FIXTURE_SEQUENCE_CAPACITY,
         },
         "startedAt": started_at,
         "completedAt": utc_now(),

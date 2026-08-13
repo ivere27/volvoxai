@@ -4,6 +4,7 @@ import type {
   MemoryLocationValue,
   RuntimeDType as ProtoRuntimeDType,
 } from './generated/volvoxaiEnums.js';
+import type { ShapedExecutionTensorView } from './ops/shapeSystem.js';
 
 export type RuntimeDType = ProtoRuntimeDType;
 
@@ -67,7 +68,7 @@ export interface TensorLike {
 
 export type TensorReference<TTensor extends TensorLike = TensorLike> = string | TTensor;
 
-export interface TensorDescriptor {
+export interface RuntimeTensorDescriptor {
   name?: string;
   shape: readonly number[];
   dtype?: RuntimeDType;
@@ -78,7 +79,7 @@ export interface TensorDescriptor {
 export type NodeOutputSpec<TTensor extends TensorLike = TensorLike> =
   | readonly number[]
   | TensorReference<TTensor>
-  | TensorDescriptor;
+  | RuntimeTensorDescriptor;
 
 export interface NodeParameters {
   weight_layout?: string;
@@ -171,8 +172,6 @@ export interface GraphInspection {
   outputNames: string[];
   topologyRevision: number;
   weightRevision: number;
-  adapters: AdapterDescription[];
-  activeAdapter: AdapterDescription | null;
 }
 
 export type SerializedAffineQuantizationReference =
@@ -210,82 +209,11 @@ export interface GraphDocument {
   outputs: string[];
 }
 
-export interface AdapterTensorValue {
-  data: ArrayLike<number> | ArrayBuffer | ArrayBufferView;
-  shape?: readonly number[];
-}
-
-export type AdapterTensorInput =
-  | ArrayLike<number>
-  | ArrayBuffer
-  | ArrayBufferView
-  | AdapterTensorValue;
-
-export interface AdapterTargetSpec {
-  weight: string;
-  layout?: string;
-  rank?: number;
-  alpha?: number;
-  scale?: number;
-  A: AdapterTensorInput;
-  B: AdapterTensorInput;
-}
-
-export interface AdapterSpec {
-  kind: 'lora';
-  layout?: string;
-  rank?: number;
-  alpha?: number;
-  scale?: number;
-  sourceVersion?: string | number | null;
-  metadata?: Record<string, string>;
-  targets: readonly AdapterTargetSpec[];
-}
-
-export interface AdapterDescription {
-  readonly id: string;
-  readonly name: string;
-  readonly version: number;
-  readonly sourceVersion: string | number | null;
-  readonly kind: 'lora';
-  readonly metadata: Readonly<Record<string, string>>;
-  readonly active: boolean;
-  readonly merged: boolean;
-  readonly targets: readonly {
-    readonly weight: string;
-    readonly rank: number;
-    readonly din: number;
-    readonly dout: number;
-    readonly alpha: number;
-    readonly scale: number;
-    readonly layout: 'din_r_r_dout';
-  }[];
-}
-
-export type AdapterVersion = number | string | null | undefined;
-
 /** Canonical execution-time adapter selector. */
 export interface AdapterSelector {
   name: string;
   version?: number;
   scale?: number;
-}
-
-export interface AdapterStageOptions {
-  activate?: boolean;
-}
-
-export interface AdapterUpdateOptions extends AdapterStageOptions {
-  version?: AdapterVersion;
-  mode?: 'assign' | 'add';
-}
-
-export interface AdapterLoadOptions extends AdapterStageOptions {
-  name?: string;
-}
-
-export interface AdapterExportOptions {
-  as?: 'arraybuffer' | 'file' | 'blob';
 }
 
 export interface BackendCapabilityContract {
@@ -294,7 +222,12 @@ export interface BackendCapabilityContract {
   readonly outputLocation: MemoryLocationValue;
 }
 
-export type ExecutionInputs = Record<string, RuntimeTypedArray>;
+/**
+ * Dynamic-v1 execution never infers logical shape from storage length. Every
+ * public input, including inputs to an otherwise constant graph, carries an
+ * explicit concrete shape alongside its typed storage.
+ */
+export type ExecutionInputs = Readonly<Record<string, ShapedExecutionTensorView>>;
 export interface ExecutionOptions {
   readonly adapter?: Readonly<AdapterSelector> | null;
   readonly adapters?: readonly (Readonly<AdapterSelector> | null)[];

@@ -1,4 +1,4 @@
-import type { Graph } from '../core/Graph.js';
+import type { RuntimeGraph } from '../core/RuntimeGraph.js';
 import type { Tensor } from '../core/Tensor.js';
 import type { RuntimeTypedArray } from '../types.js';
 import { dropoutContext } from '../ops/dropout.js';
@@ -22,7 +22,7 @@ import {
   gradientAccumulationIndex,
   resetGradientAccumulation as resetPendingGradients,
 } from './GradientAccumulation.js';
-import type { TrainingStepOptions } from './TrainingStep.js';
+import type { TrainingKernelStepOptions } from './TrainingStep.js';
 
 type GradientMap = Map<string, Float32Array>;
 type TrainingDropoutContext = ReturnType<typeof dropoutContext>;
@@ -46,7 +46,7 @@ interface TrainingLossMetric {
  */
 export interface AcceleratedTrainingExecution {
   readonly backend: string;
-  preflight(graph: StatefulTrainingGraph, options: TrainingStepOptions): void | Promise<void>;
+  preflight(graph: StatefulTrainingGraph, options: TrainingKernelStepOptions): void | Promise<void>;
   forward(
     graph: StatefulTrainingGraph,
     inputs: Record<string, RuntimeTypedArray>,
@@ -97,8 +97,8 @@ function backwardFailure(node: any, detail: string): never {
 
 /** Run one all-accelerated train step without importing CPUAutograd/CPUEngine. */
 export async function acceleratedTrainStep(
-  inputGraph: Graph,
-  options: TrainingStepOptions,
+  inputGraph: RuntimeGraph,
+  options: TrainingKernelStepOptions,
   execution: AcceleratedTrainingExecution,
 ) {
   const graph = ensureTrainingGraphState(inputGraph);
@@ -117,6 +117,8 @@ export async function acceleratedTrainStep(
     gradientAccumulationSteps = 1,
     flushGradientAccumulation = false,
     resetGradientAccumulation = false,
+    shapeSignature = graph.trainingShapeSignature,
+    tacticSignature = graph.trainingTacticSignature,
   } = options;
   const backendName = execution?.backend;
   if (!graph) throw new Error('Accelerated training requires a graph.');
@@ -172,7 +174,6 @@ export async function acceleratedTrainStep(
         !(tensor.buffer instanceof Float32Array)) {
       throw new Error(`Trainable tensor '${name}' must be an initialized F32 graph weight.`);
     }
-    graph.adapters?._assertBaseMutationAllowed();
     return tensor;
   });
   const topologyRevision = graph.topologyRevision;
@@ -188,6 +189,7 @@ export async function acceleratedTrainStep(
   const trainingDropout = dropoutContext({
     seed: dropout.seed ?? 0,
     counter: dropout.counter ?? defaultDropoutCounter,
+    shapeSignature,
   });
 
   await execution.forward(graph, inputs, { dropout: trainingDropout });
@@ -301,6 +303,8 @@ export async function acceleratedTrainStep(
   }
   const accumulationSignature = JSON.stringify({
     backend: backendName,
+    activationShapeSignature: shapeSignature,
+    tacticSignature,
     topologyRevision,
     weightRevision,
     trainableTensors,

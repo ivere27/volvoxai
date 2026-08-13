@@ -402,7 +402,10 @@ class PortableQuantizedBoundaryAndStructuralTests(unittest.TestCase):
             ("Unsqueeze", (2, 4), (1, 2, 4), {"input": "x"}, {}),
             ("Transpose", (2, 3, 4), (4, 2, 3), {"input": "x"}, {"perm": [2, 0, 1]}),
             ("Slice", (2, 4), (2, 2), {"input": "x"}, {"starts": [0], "ends": [2]}),
-            ("Expand", (1, 4), (3, 4), {"input": "x"}, {}),
+            (
+                "Expand", (1, 4), (3, 4), {"input": "x"},
+                {"shape": [3, 4]},
+            ),
             (
                 "ResizeNearest2D", (1, 2, 2, 4), (1, 4, 4, 4),
                 {"input": "x"}, {"mode": "nearest"},
@@ -432,9 +435,9 @@ class PortableQuantizedBoundaryAndStructuralTests(unittest.TestCase):
 
     def test_expand_rejects_incompatible_rank_affine_and_parameters(self):
         cases = (
-            ((1, 4), (3, 5), _pt(), _pt(), {}),
-            ((1,) * 9, (1,) * 9, _pt(), _pt(), {}),
-            ((1, 4), (3, 4), _pt(), _pt(scale=0.5), {}),
+            ((1, 4), (3, 5), _pt(), _pt(), {"shape": [3, 5]}),
+            ((1,) * 9, (1,) * 9, _pt(), _pt(), {"shape": [1] * 9}),
+            ((1, 4), (3, 4), _pt(), _pt(scale=0.5), {"shape": [3, 4]}),
             ((1, 4), (3, 4), _pt(), _pt(), {"axis": 0}),
         )
         for input_shape, output_shape, input_q, output_q, params in cases:
@@ -617,15 +620,16 @@ class PortableQuantizedImportBoundaryTests(unittest.TestCase):
         }
         document = {
             "format": "volvox-graph/v1",
+            "dimensions": {},
             "inputs": {"x": {"shape": [2, 4], "dtype": "int8"}},
             "outputs": ["y"],
             "nodes": [{
                 "id": "subject",
                 "opType": op_type,
                 "inputs": {"input": "x", "weight": "w", "bias": "bias"},
-                "outputs": {"out": "y"},
-                "outputs_shape": {"out": [2, 3]},
-                "outputs_dtype": {"out": "uint8"},
+                "outputs": {"out": {
+                    "tensor": "y", "shape": [2, 3], "dtype": "uint8",
+                }},
                 "params": {},
             }],
             "quantization": {
@@ -668,15 +672,16 @@ class PortableQuantizedImportBoundaryTests(unittest.TestCase):
         }
         document = {
             "format": "volvox-graph/v1",
+            "dimensions": {},
             "inputs": {"x": {"shape": [2, 4], "dtype": "int8"}},
             "outputs": ["y"],
             "nodes": [{
                 "id": "gelu",
                 "opType": "QGELU",
                 "inputs": {"input": "x"},
-                "outputs": {"out": "y"},
-                "outputs_shape": {"out": [2, 4]},
-                "outputs_dtype": {"out": "int8"},
+                "outputs": {"out": {
+                    "tensor": "y", "shape": [2, 4], "dtype": "int8",
+                }},
                 "params": {"approximate": "tanh"},
             }],
             "quantization": {
@@ -710,6 +715,7 @@ class PortableQuantizedImportBoundaryTests(unittest.TestCase):
         }
         document = {
             "format": "volvox-graph/v1",
+            "dimensions": {},
             "inputs": {"ids": {"shape": [2, 3], "dtype": "int32"}},
             "outputs": ["y"],
             "nodes": [
@@ -717,18 +723,20 @@ class PortableQuantizedImportBoundaryTests(unittest.TestCase):
                     "id": "copy_ids",
                     "opType": "Identity",
                     "inputs": {"input": "ids"},
-                    "outputs": {"out": "generated_ids"},
-                    "outputs_shape": {"out": [2, 3]},
-                    "outputs_dtype": {"out": "int32"},
+                    "outputs": {"out": {
+                        "tensor": "generated_ids",
+                        "shape": [2, 3],
+                        "dtype": "int32",
+                    }},
                     "params": {},
                 },
                 {
                     "id": "embedding",
                     "opType": "QEmbedding",
                     "inputs": {"input": "generated_ids", "weight": "w"},
-                    "outputs": {"out": "y"},
-                    "outputs_shape": {"out": [2, 3, 4]},
-                    "outputs_dtype": {"out": "int8"},
+                    "outputs": {"out": {
+                        "tensor": "y", "shape": [2, 3, 4], "dtype": "int8",
+                    }},
                     "params": {},
                 },
             ],
@@ -767,6 +775,7 @@ class PortableQuantizedImportBoundaryTests(unittest.TestCase):
         }
         document = {
             "format": "volvox-graph/v1",
+            "dimensions": {},
             "inputs": {"ids": {"shape": [2, 3], "dtype": "int32"}},
             "outputs": ["y"],
             "nodes": [
@@ -774,18 +783,20 @@ class PortableQuantizedImportBoundaryTests(unittest.TestCase):
                     "id": "bound_ids",
                     "opType": "Clip",
                     "inputs": {"input": "ids"},
-                    "outputs": {"out": "bounded_ids"},
-                    "outputs_shape": {"out": [2, 3]},
-                    "outputs_dtype": {"out": "int32"},
+                    "outputs": {"out": {
+                        "tensor": "bounded_ids",
+                        "shape": [2, 3],
+                        "dtype": "int32",
+                    }},
                     "params": {"min": 0, "max": 9},
                 },
                 {
                     "id": "embedding",
                     "opType": "QEmbedding",
                     "inputs": {"input": "bounded_ids", "weight": "w"},
-                    "outputs": {"out": "y"},
-                    "outputs_shape": {"out": [2, 3, 4]},
-                    "outputs_dtype": {"out": "int8"},
+                    "outputs": {"out": {
+                        "tensor": "y", "shape": [2, 3, 4], "dtype": "int8",
+                    }},
                     "params": {},
                 },
             ],
@@ -823,22 +834,23 @@ class PortableQuantizedImportBoundaryTests(unittest.TestCase):
     def test_import_rejects_raw_byte_relu_without_affine_metadata(self):
         document = {
             "format": "volvox-graph/v1",
+            "dimensions": {},
             "inputs": {"x": {"shape": [2, 4], "dtype": "int8"}},
             "outputs": ["y"],
             "nodes": [{
                 "id": "relu",
                 "opType": "ReLU",
                 "inputs": {"input": "x"},
-                "outputs": {"out": "y"},
-                "outputs_shape": {"out": [2, 4]},
-                "outputs_dtype": {"out": "int8"},
+                "outputs": {"out": {
+                    "tensor": "y", "shape": [2, 4], "dtype": "int8",
+                }},
                 "params": {},
             }],
         }
         with self.assertRaises(ExporterError) as caught:
             import_runtime_package(document, {})
-        self.assertEqual(caught.exception.diagnostic.code, "VXRTIR025")
-        self.assertIn("explicit F32 boundary", caught.exception.diagnostic.message)
+        self.assertEqual(caught.exception.diagnostic.code, "VXRTIR035")
+        self.assertIn("float32", caught.exception.diagnostic.message)
 
 
 if __name__ == "__main__":

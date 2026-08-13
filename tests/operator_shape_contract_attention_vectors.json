@@ -1,0 +1,416 @@
+{
+  "format": "volvox-operator-shape-vectors/v1",
+  "families": [
+    { "id": "sdpa", "operators": ["SDPA"] },
+    { "id": "cross-sdpa", "operators": ["CrossSDPA"] },
+    { "id": "rope", "operators": ["RoPE"] }
+  ],
+  "success_cases": [
+    {
+      "id": "sdpa-rank2-unmasked",
+      "family": "sdpa",
+      "operators": ["SDPA"],
+      "request": {
+        "inputs": { "qkv": { "shape": [3, 24], "dtype": "float32" } },
+        "params": { "heads": 2, "causal": true }
+      },
+      "expected_shape_function_id": "volvox.shape.sdpa.v1",
+      "expected": { "out": { "shape": [3, 8], "dtype": "float32" } }
+    },
+    {
+      "id": "sdpa-rank3-unmasked",
+      "family": "sdpa",
+      "operators": ["SDPA"],
+      "request": {
+        "inputs": { "qkv": { "shape": [2, 3, 24], "dtype": "float32" } },
+        "params": { "heads": 4, "causal": false, "scale": 0.5 }
+      },
+      "expected_shape_function_id": "volvox.shape.sdpa.v1",
+      "expected": { "out": { "shape": [2, 3, 8], "dtype": "float32" } }
+    },
+    {
+      "id": "sdpa-mask-k",
+      "family": "sdpa",
+      "operators": ["SDPA"],
+      "request": {
+        "inputs": {
+          "qkv": { "shape": [2, 4, 12], "dtype": "float32" },
+          "mask": { "shape": [4], "dtype": "int32" }
+        },
+        "params": { "heads": 2, "causal": false }
+      },
+      "expected_shape_function_id": "volvox.shape.sdpa.v1",
+      "expected": { "out": { "shape": [2, 4, 4], "dtype": "float32" } }
+    },
+    {
+      "id": "sdpa-mask-bk",
+      "family": "sdpa",
+      "operators": ["SDPA"],
+      "request": {
+        "inputs": {
+          "qkv": { "shape": [2, 4, 12], "dtype": "float32" },
+          "mask": { "shape": [2, 4], "dtype": "int32" }
+        },
+        "params": { "heads": 2, "causal": true }
+      },
+      "expected_shape_function_id": "volvox.shape.sdpa.v1",
+      "expected": { "out": { "shape": [2, 4, 4], "dtype": "float32" } }
+    },
+    {
+      "id": "sdpa-mask-qk",
+      "family": "sdpa",
+      "operators": ["SDPA"],
+      "request": {
+        "inputs": {
+          "qkv": { "shape": [2, 4, 12], "dtype": "float32" },
+          "mask": { "shape": [4, 4], "dtype": "int32" }
+        },
+        "params": { "heads": 1, "causal": false }
+      },
+      "expected_shape_function_id": "volvox.shape.sdpa.v1",
+      "expected": { "out": { "shape": [2, 4, 4], "dtype": "float32" } }
+    },
+    {
+      "id": "sdpa-mask-bqk",
+      "family": "sdpa",
+      "operators": ["SDPA"],
+      "request": {
+        "inputs": {
+          "qkv": { "shape": [2, 4, 12], "dtype": "float32" },
+          "mask": { "shape": [2, 4, 4], "dtype": "int32" }
+        },
+        "params": { "heads": 4, "causal": true }
+      },
+      "expected_shape_function_id": "volvox.shape.sdpa.v1",
+      "expected": { "out": { "shape": [2, 4, 4], "dtype": "float32" } }
+    },
+    {
+      "id": "cross-sdpa-rank2-unmasked",
+      "family": "cross-sdpa",
+      "operators": ["CrossSDPA"],
+      "request": {
+        "inputs": {
+          "q": { "shape": [3, 8], "dtype": "float32" },
+          "k": { "shape": [5, 8], "dtype": "float32" },
+          "v": { "shape": [5, 8], "dtype": "float32" }
+        },
+        "params": { "heads": 2, "causal": false }
+      },
+      "expected_shape_function_id": "volvox.shape.cross-sdpa.v1",
+      "expected": { "out": { "shape": [3, 8], "dtype": "float32" } }
+    },
+    {
+      "id": "cross-sdpa-rank3-unmasked",
+      "family": "cross-sdpa",
+      "operators": ["CrossSDPA"],
+      "request": {
+        "inputs": {
+          "q": { "shape": [2, 3, 8], "dtype": "float32" },
+          "k": { "shape": [2, 5, 8], "dtype": "float32" },
+          "v": { "shape": [2, 5, 8], "dtype": "float32" }
+        },
+        "params": { "heads": 4, "causal": true, "scale": 0.25 }
+      },
+      "expected_shape_function_id": "volvox.shape.cross-sdpa.v1",
+      "expected": { "out": { "shape": [2, 3, 8], "dtype": "float32" } }
+    },
+    {
+      "id": "cross-sdpa-mask-k",
+      "family": "cross-sdpa",
+      "operators": ["CrossSDPA"],
+      "request": {
+        "inputs": {
+          "q": { "shape": [2, 3, 8], "dtype": "float32" },
+          "k": { "shape": [2, 5, 8], "dtype": "float32" },
+          "v": { "shape": [2, 5, 8], "dtype": "float32" },
+          "mask": { "shape": [5], "dtype": "int32" }
+        },
+        "params": { "heads": 2, "causal": false }
+      },
+      "expected_shape_function_id": "volvox.shape.cross-sdpa.v1",
+      "expected": { "out": { "shape": [2, 3, 8], "dtype": "float32" } }
+    },
+    {
+      "id": "cross-sdpa-mask-bk",
+      "family": "cross-sdpa",
+      "operators": ["CrossSDPA"],
+      "request": {
+        "inputs": {
+          "q": { "shape": [2, 3, 8], "dtype": "float32" },
+          "k": { "shape": [2, 5, 8], "dtype": "float32" },
+          "v": { "shape": [2, 5, 8], "dtype": "float32" },
+          "mask": { "shape": [2, 5], "dtype": "int32" }
+        },
+        "params": { "heads": 2, "causal": false }
+      },
+      "expected_shape_function_id": "volvox.shape.cross-sdpa.v1",
+      "expected": { "out": { "shape": [2, 3, 8], "dtype": "float32" } }
+    },
+    {
+      "id": "cross-sdpa-mask-qk",
+      "family": "cross-sdpa",
+      "operators": ["CrossSDPA"],
+      "request": {
+        "inputs": {
+          "q": { "shape": [2, 3, 8], "dtype": "float32" },
+          "k": { "shape": [2, 5, 8], "dtype": "float32" },
+          "v": { "shape": [2, 5, 8], "dtype": "float32" },
+          "mask": { "shape": [3, 5], "dtype": "int32" }
+        },
+        "params": { "heads": 2, "causal": true }
+      },
+      "expected_shape_function_id": "volvox.shape.cross-sdpa.v1",
+      "expected": { "out": { "shape": [2, 3, 8], "dtype": "float32" } }
+    },
+    {
+      "id": "cross-sdpa-mask-bqk",
+      "family": "cross-sdpa",
+      "operators": ["CrossSDPA"],
+      "request": {
+        "inputs": {
+          "q": { "shape": [2, 3, 8], "dtype": "float32" },
+          "k": { "shape": [2, 5, 8], "dtype": "float32" },
+          "v": { "shape": [2, 5, 8], "dtype": "float32" },
+          "mask": { "shape": [2, 3, 5], "dtype": "int32" }
+        },
+        "params": { "heads": 1, "causal": false }
+      },
+      "expected_shape_function_id": "volvox.shape.cross-sdpa.v1",
+      "expected": { "out": { "shape": [2, 3, 8], "dtype": "float32" } }
+    },
+    {
+      "id": "cross-sdpa-mask-bk-precedence",
+      "family": "cross-sdpa",
+      "operators": ["CrossSDPA"],
+      "request": {
+        "inputs": {
+          "q": { "shape": [2, 2, 4], "dtype": "float32" },
+          "k": { "shape": [2, 3, 4], "dtype": "float32" },
+          "v": { "shape": [2, 3, 4], "dtype": "float32" },
+          "mask": { "shape": [2, 3], "dtype": "int32" }
+        },
+        "params": { "heads": 2, "causal": false }
+      },
+      "expected_shape_function_id": "volvox.shape.cross-sdpa.v1",
+      "expected": { "out": { "shape": [2, 2, 4], "dtype": "float32" } }
+    },
+    {
+      "id": "rope-rank2-implicit-positions",
+      "family": "rope",
+      "operators": ["RoPE"],
+      "request": {
+        "inputs": { "input": { "shape": [3, 8], "dtype": "float32" } },
+        "params": {}
+      },
+      "expected_shape_function_id": "volvox.shape.rope-preserve.v1",
+      "expected": { "out": { "shape": [3, 8], "dtype": "float32" } }
+    },
+    {
+      "id": "rope-rank3-partial-interleaved",
+      "family": "rope",
+      "operators": ["RoPE"],
+      "request": {
+        "inputs": { "input": { "shape": [2, 4, 8], "dtype": "float32" } },
+        "params": {
+          "rotary_dim": 4,
+          "theta": 1000,
+          "position_offset": 7,
+          "interleaved": true
+        }
+      },
+      "expected_shape_function_id": "volvox.shape.rope-preserve.v1",
+      "expected": { "out": { "shape": [2, 4, 8], "dtype": "float32" } }
+    },
+    {
+      "id": "rope-position-s",
+      "family": "rope",
+      "operators": ["RoPE"],
+      "request": {
+        "inputs": {
+          "input": { "shape": [2, 4, 8], "dtype": "float32" },
+          "position_ids": { "shape": [4], "dtype": "int32" }
+        },
+        "params": { "rotary_dim": 8, "interleaved": false }
+      },
+      "expected_shape_function_id": "volvox.shape.rope-preserve.v1",
+      "expected": { "out": { "shape": [2, 4, 8], "dtype": "float32" } }
+    },
+    {
+      "id": "rope-position-bs",
+      "family": "rope",
+      "operators": ["RoPE"],
+      "request": {
+        "inputs": {
+          "input": { "shape": [2, 4, 8], "dtype": "float32" },
+          "position_ids": { "shape": [2, 4], "dtype": "int32" }
+        },
+        "params": { "rotary_dim": 4, "theta": 10000 }
+      },
+      "expected_shape_function_id": "volvox.shape.rope-preserve.v1",
+      "expected": { "out": { "shape": [2, 4, 8], "dtype": "float32" } }
+    }
+  ],
+  "failure_cases": [
+    {
+      "id": "sdpa-packed-width-not-triple",
+      "family": "sdpa",
+      "operators": ["SDPA"],
+      "request": {
+        "inputs": { "qkv": { "shape": [3, 25], "dtype": "float32" } },
+        "params": { "heads": 1, "causal": true }
+      },
+      "expected_shape_function_id": "volvox.shape.sdpa.v1",
+      "expected_error": { "code": "SHAPE_MISMATCH", "path": "operator input 'qkv'.shape[1]" }
+    },
+    {
+      "id": "sdpa-causal-required",
+      "family": "sdpa",
+      "operators": ["SDPA"],
+      "request": {
+        "inputs": { "qkv": { "shape": [3, 24], "dtype": "float32" } },
+        "params": { "heads": 2 }
+      },
+      "expected_shape_function_id": "volvox.shape.sdpa.v1",
+      "expected_error": { "code": "INVALID_PARAMS", "path": "operator params.causal" }
+    },
+    {
+      "id": "sdpa-mask-geometry-invalid",
+      "family": "sdpa",
+      "operators": ["SDPA"],
+      "request": {
+        "inputs": {
+          "qkv": { "shape": [2, 4, 12], "dtype": "float32" },
+          "mask": { "shape": [3, 4], "dtype": "int32" }
+        },
+        "params": { "heads": 2, "causal": false }
+      },
+      "expected_shape_function_id": "volvox.shape.sdpa.v1",
+      "expected_error": { "code": "SHAPE_MISMATCH", "path": "operator input 'mask'.shape" }
+    },
+    {
+      "id": "sdpa-mask-dtype-invalid",
+      "family": "sdpa",
+      "operators": ["SDPA"],
+      "request": {
+        "inputs": {
+          "qkv": { "shape": [4, 12], "dtype": "float32" },
+          "mask": { "shape": [4], "dtype": "float32" }
+        },
+        "params": { "heads": 2, "causal": true }
+      },
+      "expected_shape_function_id": "volvox.shape.sdpa.v1",
+      "expected_error": { "code": "INVALID_DTYPE", "path": "operator input 'mask'.dtype" }
+    },
+    {
+      "id": "cross-sdpa-kv-sequence-mismatch",
+      "family": "cross-sdpa",
+      "operators": ["CrossSDPA"],
+      "request": {
+        "inputs": {
+          "q": { "shape": [2, 3, 8], "dtype": "float32" },
+          "k": { "shape": [2, 5, 8], "dtype": "float32" },
+          "v": { "shape": [2, 4, 8], "dtype": "float32" }
+        },
+        "params": { "heads": 2, "causal": false }
+      },
+      "expected_shape_function_id": "volvox.shape.cross-sdpa.v1",
+      "expected_error": { "code": "SHAPE_MISMATCH", "path": "operator input 'v'.shape[1]" }
+    },
+    {
+      "id": "cross-sdpa-feature-mismatch",
+      "family": "cross-sdpa",
+      "operators": ["CrossSDPA"],
+      "request": {
+        "inputs": {
+          "q": { "shape": [3, 8], "dtype": "float32" },
+          "k": { "shape": [5, 4], "dtype": "float32" },
+          "v": { "shape": [5, 4], "dtype": "float32" }
+        },
+        "params": { "heads": 2, "causal": false }
+      },
+      "expected_shape_function_id": "volvox.shape.cross-sdpa.v1",
+      "expected_error": { "code": "SHAPE_MISMATCH", "path": "operator inputs" }
+    },
+    {
+      "id": "cross-sdpa-mask-geometry-invalid",
+      "family": "cross-sdpa",
+      "operators": ["CrossSDPA"],
+      "request": {
+        "inputs": {
+          "q": { "shape": [2, 3, 8], "dtype": "float32" },
+          "k": { "shape": [2, 5, 8], "dtype": "float32" },
+          "v": { "shape": [2, 5, 8], "dtype": "float32" },
+          "mask": { "shape": [2, 4, 5], "dtype": "int32" }
+        },
+        "params": { "heads": 2, "causal": false }
+      },
+      "expected_shape_function_id": "volvox.shape.cross-sdpa.v1",
+      "expected_error": { "code": "SHAPE_MISMATCH", "path": "operator input 'mask'.shape" }
+    },
+    {
+      "id": "cross-sdpa-heads-not-divisor",
+      "family": "cross-sdpa",
+      "operators": ["CrossSDPA"],
+      "request": {
+        "inputs": {
+          "q": { "shape": [3, 8], "dtype": "float32" },
+          "k": { "shape": [5, 8], "dtype": "float32" },
+          "v": { "shape": [5, 8], "dtype": "float32" }
+        },
+        "params": { "heads": 3, "causal": false }
+      },
+      "expected_shape_function_id": "volvox.shape.cross-sdpa.v1",
+      "expected_error": { "code": "SHAPE_MISMATCH", "path": "operator params.heads" }
+    },
+    {
+      "id": "rope-rotary-width-odd",
+      "family": "rope",
+      "operators": ["RoPE"],
+      "request": {
+        "inputs": { "input": { "shape": [3, 8], "dtype": "float32" } },
+        "params": { "rotary_dim": 3 }
+      },
+      "expected_shape_function_id": "volvox.shape.rope-preserve.v1",
+      "expected_error": { "code": "INVALID_PARAMS", "path": "operator params.rotary_dim" }
+    },
+    {
+      "id": "rope-position-shape-invalid-for-rank2",
+      "family": "rope",
+      "operators": ["RoPE"],
+      "request": {
+        "inputs": {
+          "input": { "shape": [3, 8], "dtype": "float32" },
+          "position_ids": { "shape": [1, 3], "dtype": "int32" }
+        },
+        "params": {}
+      },
+      "expected_shape_function_id": "volvox.shape.rope-preserve.v1",
+      "expected_error": { "code": "SHAPE_MISMATCH", "path": "operator input 'position_ids'.shape" }
+    },
+    {
+      "id": "rope-position-dtype-invalid",
+      "family": "rope",
+      "operators": ["RoPE"],
+      "request": {
+        "inputs": {
+          "input": { "shape": [3, 8], "dtype": "float32" },
+          "position_ids": { "shape": [3], "dtype": "float32" }
+        },
+        "params": { "rotary_dim": 4 }
+      },
+      "expected_shape_function_id": "volvox.shape.rope-preserve.v1",
+      "expected_error": { "code": "INVALID_DTYPE", "path": "operator input 'position_ids'.dtype" }
+    },
+    {
+      "id": "rope-position-offset-overflow",
+      "family": "rope",
+      "operators": ["RoPE"],
+      "request": {
+        "inputs": { "input": { "shape": [2, 8], "dtype": "float32" } },
+        "params": { "position_offset": 2147483647 }
+      },
+      "expected_shape_function_id": "volvox.shape.rope-preserve.v1",
+      "expected_error": { "code": "INVALID_PARAMS", "path": "operator params.position_offset" }
+    }
+  ]
+}

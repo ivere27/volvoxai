@@ -1,9 +1,13 @@
-import { Graph } from './Graph.js';
-import { GraphLoader } from './GraphLoader.js';
-import { ModelSnapshot, type ModelOutputDescriptor } from './ModelSnapshot.js';
+import { Model } from './Model.js';
+import {
+  resolveMinimumGraphShapes,
+  type ResolvedShapePlan,
+  type ResolvedTensorDescriptor,
+} from './ResolvedShapePlan.js';
 import { runtimeIdentity } from './Identity.js';
 import {
   ExecutionResult,
+  createExecutionResult,
   executionIdentity,
   normalizeBackendReport,
   releaseBackendExecutionSnapshot,
@@ -17,24 +21,35 @@ import {
   assertBackendProvider,
   assertProviderCompiledModel,
   assertProviderExecutionContext,
+  createBackendCompileInput,
   createBackendDeviceIdentity,
   type BackendProvider,
   type BackendProviderCapabilities,
   type BackendProviderCompiledModel,
   type BackendProviderExecutionContext,
+  type BackendResolvedAdapterSelection,
+  type BackendResolvedExecutionRequest,
 } from '../backends/BackendProvider.js';
-import type { GraphLoaderOptions } from './GraphLoader.js';
 import type {
   AdapterSelector,
   DecodeExecutionOptions,
   ExecutionInputs,
   ExecutionOptions,
+  RuntimeTypedArray,
 } from '../types.js';
 import type {
   BackendPolicyModeValue,
   DecodeRowModeValue,
   OperatorFallbackValue,
 } from '../generated/volvoxaiEnums.js';
+import { decodeRowModes } from '../generated/volvoxaiEnums.js';
+import {
+  acquireDeviceTensorInputLease,
+  deviceTensorInputLeaseMatches,
+  inspectDeviceTensorReference,
+  releaseDeviceTensorInputLease,
+  type DeviceTensorInputLease,
+} from '../ops/deviceTensorReference.js';
 
 export type BackendPolicy =
   | {
@@ -58,11 +73,23 @@ export interface ModelCompileOptions {
 
 export interface ExecutionContextOptions {
   readonly adapter?: Readonly<AdapterSelector> | null;
+  /**
+   * Explicit logical dimension used to validate batch-indexed adapter arrays.
+   * Logical snapshots do not infer this application meaning from axis names.
+   */
+  readonly adapterBatchDimension?: string | null;
   readonly decode?: Readonly<{
     changedInputs?: readonly string[] | null;
     rowMode?: DecodeRowModeValue;
     requireIncremental?: boolean;
   }>;
+  /**
+   * Global slot ids to keep resident per declared weight bank, ascending. A
+   * bank left out stays fully resident. Residency is context-private: sibling
+   * contexts of the same CompiledModel may hold different slots, and it
+   * participates in this context's plan-cache key.
+   */
+  readonly bankResidency?: Readonly<Record<string, readonly number[]>>;
 }
 
 export interface CompilationCandidateReport {
@@ -112,8 +139,11 @@ export interface ExecutionFailureReport {
   readonly topologyRevision: number;
   readonly weightRevision: number;
   readonly weightRevisionId: string;
+  readonly shapeSignature: string | null;
   readonly adapterRevisionId: string | null;
   readonly adapterRevisionIds: readonly (string | null)[];
+  readonly shapeBindTimeMs: number | null;
+  readonly providerTimeMs: number | null;
   readonly executionTimeMs: number;
   readonly routeEvidence: ExecutionRouteEvidence;
   readonly decodeState: ExecutionDecodeState;
@@ -128,6 +158,16 @@ interface ProviderEntry {
   readonly name: string;
   readonly provider: BackendProvider;
 }
+
+const EMPTY_EXECUTION_OPTIONS = Object.freeze({}) as Readonly<DecodeExecutionOptions>;
+const EMPTY_ADAPTER_REVISION_IDS = Object.freeze([]) as readonly (string | null)[];
+const EMPTY_ADAPTER_SELECTORS = Object.freeze([]) as readonly (
+  Readonly<AdapterSelector> | null
+)[];
+const EMPTY_ADAPTER_SELECTION = Object.freeze({
+  batchSize: null,
+  selectors: EMPTY_ADAPTER_SELECTORS,
+}) as Readonly<BackendResolvedAdapterSelection>;
 
 function identity(prefix: 'compilation' | 'context'): string {
   return runtimeIdentity(prefix);
@@ -235,7 +275,7 @@ function routeEvidence(
 function freezeCompilationReport(
   compilationId: string,
   policy: BackendPolicy,
-  snapshot: ModelSnapshot,
+  snapshot: Model,
   selectedBackend: string | null,
   candidates: readonly CompilationCandidateReport[],
   compileTimeMs: number,
@@ -250,8 +290,8 @@ function freezeCompilationReport(
     topologyRevision: snapshot.topologyRevision,
     weightRevision: snapshot.weightRevision,
     weightRevisionId: snapshot.weightRevisionId,
-    adapterRevisionId: snapshot.adapterRevisionId,
-    adapterRevisionIds: snapshot.adapterRevisionIds,
+    adapterRevisionId: null,
+    adapterRevisionIds: Object.freeze([]),
     compileTimeMs,
     allocationBytes: selected?.allocationBytes ?? null,
     routeEvidence: selected?.routeEvidence || null,
@@ -300,12 +340,28 @@ function assertExactOptionObject(
   }
 }
 
-const CONTEXT_OPTION_NAMES = new Set(['adapter', 'decode']);
+const CONTEXT_OPTION_NAMES = new Set([
+  'adapter', 'adapterBatchDimension', 'decode', 'bankResidency',
+]);
 const DECODE_CONTEXT_OPTION_NAMES = new Set(['changedInputs', 'rowMode', 'requireIncremental']);
 const EXECUTION_OPTION_NAMES = new Set(['adapter', 'adapters']);
 const DECODE_EXECUTION_OPTION_NAMES = new Set([
   'adapter', 'adapters', 'changedInputs', 'position',
 ]);
+
+function cloneRuntimeData(data: ExecutionInputs[string]['data']): RuntimeTypedArray {
+  if (data instanceof Float32Array) return new Float32Array(data);
+  if (data instanceof Int32Array) return new Int32Array(data);
+  if (data instanceof Int8Array) return new Int8Array(data);
+  if (data instanceof Uint8ClampedArray) return new Uint8ClampedArray(data);
+  if (data instanceof Uint8Array) return new Uint8Array(data);
+  throw new VolvoxAIError('BACKEND_UNSUPPORTED',
+    'Decode retained inputs require host typed-array storage; device inputs are ordinary-execute only.', {
+      phase: 'execution',
+    });
+}
+
+const EMPTY_DEVICE_INPUTS: Readonly<Record<string, DeviceTensorInputLease>> = Object.freeze({});
 
 function assertExecutionContextOptions(options: unknown): void {
   assertExactOptionObject(options, CONTEXT_OPTION_NAMES, 'Execution context options');
@@ -313,6 +369,22 @@ function assertExecutionContextOptions(options: unknown): void {
   if (decode !== undefined) {
     assertExactOptionObject(decode, DECODE_CONTEXT_OPTION_NAMES,
       'Execution context decode options');
+  }
+  const residency = (options as ExecutionContextOptions).bankResidency;
+  if (residency !== undefined && (residency === null || typeof residency !== 'object' ||
+      Array.isArray(residency))) {
+    throw new VolvoxAIError('INVALID_ARGUMENT',
+      'Execution context bankResidency must be an object of slot-id arrays.', {
+        phase: 'compilation',
+      });
+  }
+  const batchDimension = (options as ExecutionContextOptions).adapterBatchDimension;
+  if (batchDimension !== undefined && batchDimension !== null &&
+      (typeof batchDimension !== 'string' || batchDimension.length === 0)) {
+    throw new VolvoxAIError('INVALID_ARGUMENT',
+      'Execution context adapterBatchDimension must be a non-empty string or null.', {
+        phase: 'compilation',
+      });
   }
 }
 
@@ -408,6 +480,15 @@ function executionDecodeState(
   const reportPosition = Number.isSafeInteger(backendDecode?.position)
     ? backendDecode!.position as number
     : null;
+  const positiveDecodeInteger = (value: unknown): number | null =>
+    Number.isSafeInteger(value) && (value as number) > 0 ? value as number : null;
+  const activeSequenceLength = positiveDecodeInteger(backendDecode?.activeSequenceLength);
+  const kvCapacity = positiveDecodeInteger(backendDecode?.kvCapacity);
+  const kvCapacityClass = positiveDecodeInteger(backendDecode?.kvCapacityClass);
+  const automaticResetCount = Number.isSafeInteger(backendDecode?.automaticResetCount) &&
+      (backendDecode!.automaticResetCount as number) >= 0
+    ? backendDecode!.automaticResetCount as number
+    : 0;
   return Object.freeze({
     operation,
     mode: typeof backendDecode?.mode === 'string' && backendDecode.mode
@@ -418,6 +499,21 @@ function executionDecodeState(
       : operation === 'step' ? 'advanced' : 'not-applicable',
     cacheGeneration,
     position: operation === 'step' ? reportPosition ?? optionPosition : null,
+    activeSequenceLength,
+    kvCapacity,
+    kvCapacityClass,
+    semanticSeedSignature:
+      typeof backendDecode?.semanticSeedSignature === 'string' &&
+        backendDecode.semanticSeedSignature.length > 0
+        ? backendDecode.semanticSeedSignature
+        : null,
+    automaticReset: backendDecode?.automaticReset === true,
+    automaticResetReason:
+      typeof backendDecode?.automaticResetReason === 'string' &&
+        backendDecode.automaticResetReason.length > 0
+        ? backendDecode.automaticResetReason
+        : null,
+    automaticResetCount,
   });
 }
 
@@ -473,44 +569,20 @@ export class Runtime {
     return Object.freeze([...this.#order]);
   }
 
-  createModel(graph: Graph): Model {
-    this.#assertOpen();
-    try {
-      const snapshot = ModelSnapshot.capture(graph);
-      return new Model(this, snapshot, this.#retainChild());
-    } catch (error) {
-      throw runtimeError(error, 'INVALID_ARGUMENT', 'Model graph is invalid.', {
-        phase: 'initialization',
-      });
-    }
-  }
-
-  async loadModel(
-    sources: string | readonly string[],
-    options: GraphLoaderOptions = {},
-  ): Promise<Model> {
-    this.#assertOpen();
-    const releaseRuntime = this.#retainChild();
-    let transferred = false;
-    try {
-      const graph = new Graph();
-      await GraphLoader.load(graph, sources, options);
-      const snapshot = ModelSnapshot.capture(graph);
-      const model = new Model(this, snapshot, releaseRuntime);
-      transferred = true;
-      return model;
-    } catch (error) {
-      throw runtimeError(error, 'INVALID_ARGUMENT', 'Model package could not be loaded.', {
-        phase: 'initialization',
-      });
-    } finally {
-      if (!transferred) releaseRuntime();
-    }
-  }
-
-  async _compile(snapshot: ModelSnapshot, options: ModelCompileOptions = {}): Promise<CompiledModel> {
+  /** Compile one exact immutable logical model revision through the provider SPI. */
+  async compile(
+    snapshot: Model,
+    options: ModelCompileOptions = {},
+  ): Promise<CompiledModel> {
     this._assertAcceptingWork();
+    if (!(snapshot instanceof Model)) {
+      throw new VolvoxAIError('INVALID_ARGUMENT',
+        'Runtime.compile requires a Model.', {
+          phase: 'compilation',
+        });
+    }
     const policy = normalizePolicy(options.backend, this.#order);
+    const compileInput = createBackendCompileInput(snapshot);
     const releaseRuntime = this.#retainChild();
     let transferred = false;
     try {
@@ -563,14 +635,34 @@ export class Runtime {
           continue;
         }
 
+        if (entry.provider.capabilities.dynamicShapeDomain.support !== 'full') {
+          candidates.push({
+            backend: name,
+            outcome: 'unsupported',
+            code: 'BACKEND_UNSUPPORTED',
+            message: `Backend '${name}' does not attest the complete bounded shape domain.`,
+            operatorFallback: entry.provider.capabilities.operatorFallback,
+            device: createBackendDeviceIdentity(entry.provider.deviceIdentity),
+            elapsedMs: elapsedMilliseconds(candidateStarted),
+            allocationBytes: null,
+            routeEvidence: routeEvidence(
+              reachedByTierFallback,
+              entry.provider.capabilities.operatorFallback,
+              null,
+            ),
+          });
+          if (policy.mode === 'require') break;
+          continue;
+        }
+
         try {
           let candidate: unknown = null;
           let compiled: BackendProviderCompiledModel;
           try {
-            candidate = await entry.provider.compile(snapshot, {
+            candidate = await entry.provider.compile(compileInput, Object.freeze({
               operatorFallback: policy.operatorFallback,
-            });
-            compiled = assertProviderCompiledModel(candidate, name);
+            }));
+            compiled = assertProviderCompiledModel(candidate, name, compileInput);
             if (entry.provider.capabilities.operatorFallback === 'none' &&
                 compiled.compilationEvidence?.operatorFallbackUsed === true) {
               throw new VolvoxAIError(
@@ -640,7 +732,11 @@ export class Runtime {
             });
           candidates.push({
             backend: name,
-            outcome: failure.code === 'BACKEND_UNAVAILABLE' ? 'unavailable' : 'failed',
+            outcome: failure.code === 'BACKEND_UNAVAILABLE'
+              ? 'unavailable'
+              : failure.code === 'BACKEND_UNSUPPORTED'
+                ? 'unsupported'
+                : 'failed',
             code: failure.code,
             message: failure.message,
             operatorFallback: entry.provider.capabilities.operatorFallback,
@@ -725,10 +821,6 @@ export class Runtime {
     }
   }
 
-  #assertOpen(): void {
-    this._assertAcceptingWork();
-  }
-
   #retainChild(): () => void {
     this.#retainedChildren++;
     let released = false;
@@ -753,182 +845,6 @@ export class Runtime {
   }
 }
 
-export class Model {
-  readonly #runtime: Runtime;
-  readonly #releaseRuntime: () => void;
-  #snapshot: ModelSnapshot;
-  #state: 'open' | 'closing' | 'closed' = 'open';
-  #retainedChildren = 0;
-  #resolveChildDrain: (() => void) | null = null;
-  #publicationTail: Promise<void> = Promise.resolve();
-  #publicationHeld = false;
-  #closePromise: Promise<void> | null = null;
-
-  constructor(runtime: Runtime, snapshot: ModelSnapshot, releaseRuntime: () => void) {
-    this.#runtime = runtime;
-    this.#snapshot = snapshot;
-    this.#releaseRuntime = releaseRuntime;
-  }
-
-  get definitionId(): string { return this.#snapshot.definitionId; }
-  get topologyRevision(): number { return this.#snapshot.topologyRevision; }
-  get weightRevision(): number { return this.#snapshot.weightRevision; }
-  get weightRevisionId(): string { return this.#snapshot.weightRevisionId; }
-  get adapterRevisionId(): string | null { return this.#snapshot.adapterRevisionId; }
-  get adapterRevisionIds(): readonly string[] { return this.#snapshot.adapterRevisionIds; }
-
-  async compile(options: ModelCompileOptions = {}): Promise<CompiledModel> {
-    const release = this._retainChild();
-    try {
-      return await this.#runtime._compile(this.#snapshot, options);
-    } finally {
-      release();
-    }
-  }
-
-  /** Publish a new private revision for future compilations; existing children stay pinned. */
-  publishRevision(graph: Graph): ModelSnapshot {
-    this.#assertOpen();
-    if (this.#publicationHeld) {
-      throw new VolvoxAIError('EXECUTION_FAILED',
-        'Model revision publication is already in progress.', {
-          phase: 'execution',
-        });
-    }
-    this.#snapshot = ModelSnapshot.derive(graph, this.#snapshot);
-    return this.#snapshot;
-  }
-
-  /** @internal Serialize successor preparation and reject stale Trainers before mutation. */
-  async _acquireRetainedRevision(expectedWeightRevisionId: string): Promise<() => void> {
-    if (this.#retainedChildren === 0 || this.#state === 'closed') {
-      throw new VolvoxAIError('HANDLE_DISPOSED', 'Model has no retained child publisher.', {
-        phase: 'lifecycle',
-      });
-    }
-    let unlock!: () => void;
-    const held = new Promise<void>((resolve) => { unlock = resolve; });
-    const previous = this.#publicationTail;
-    this.#publicationTail = previous.then(() => held, () => held);
-    await previous.catch(() => undefined);
-    if (this.#retainedChildren === 0) {
-      unlock();
-      throw new VolvoxAIError('HANDLE_DISPOSED', 'Model has no retained child publisher.', {
-        phase: 'lifecycle',
-      });
-    }
-    if (this.#snapshot.weightRevisionId !== expectedWeightRevisionId) {
-      unlock();
-      throw new VolvoxAIError('EXECUTION_FAILED',
-        'Model revision changed while a Trainer was preparing its successor.', {
-          phase: 'execution',
-        });
-    }
-    this.#publicationHeld = true;
-    let released = false;
-    return () => {
-      if (released) return;
-      released = true;
-      this.#publicationHeld = false;
-      unlock();
-    };
-  }
-
-  /** @internal Retained children may atomically publish while Model.close() drains them. */
-  _publishRetainedRevision(
-    graph: Graph,
-    expectedWeightRevisionId: string = this.#snapshot.weightRevisionId,
-  ): ModelSnapshot {
-    if (this.#retainedChildren === 0 || this.#state === 'closed') {
-      throw new VolvoxAIError('HANDLE_DISPOSED', 'Model has no retained child publisher.', {
-        phase: 'lifecycle',
-      });
-    }
-    if (!this.#publicationHeld) {
-      throw new VolvoxAIError('EXECUTION_FAILED',
-        'Model successor publication requires an acquired revision slot.', {
-          phase: 'execution',
-        });
-    }
-    if (this.#snapshot.weightRevisionId !== expectedWeightRevisionId) {
-      throw new VolvoxAIError('EXECUTION_FAILED',
-        'Model revision changed while a Trainer was preparing its successor.', {
-          phase: 'execution',
-        });
-    }
-    this.#snapshot = ModelSnapshot.derive(graph, this.#snapshot);
-    return this.#snapshot;
-  }
-
-  /** @internal Create private mutable storage for a retained Trainer. */
-  _createRetainedWorkingGraph(): Graph {
-    if (this.#retainedChildren === 0 || this.#state === 'closed') {
-      throw new VolvoxAIError('HANDLE_DISPOSED', 'Model has no retained child owner.', {
-        phase: 'lifecycle',
-      });
-    }
-    return this.#snapshot.createExecutionGraph();
-  }
-
-  /** @internal Reject a checkpoint whose graph cannot be a successor of this Model. */
-  _assertRetainedDefinition(graph: Graph): void {
-    if (this.#retainedChildren === 0 || this.#state === 'closed') {
-      throw new VolvoxAIError('HANDLE_DISPOSED', 'Model has no retained child owner.', {
-        phase: 'lifecycle',
-      });
-    }
-    if (!this.#snapshot.matchesDefinition(graph)) {
-      throw new VolvoxAIError('INVALID_ARGUMENT',
-        'Trainer checkpoint definition does not match the retained Model.', {
-          phase: 'execution',
-        });
-    }
-  }
-
-  /** @internal Retain the model for a compiled operation or full-profile Trainer. */
-  _retainChild(): () => void {
-    this.#assertOpen();
-    this.#retainedChildren++;
-    let released = false;
-    return () => {
-      if (released) return;
-      released = true;
-      this.#retainedChildren--;
-      if (this.#retainedChildren === 0) {
-        const resolve = this.#resolveChildDrain;
-        this.#resolveChildDrain = null;
-        resolve?.();
-      }
-    };
-  }
-
-  close(): Promise<void> {
-    if (this.#closePromise) return this.#closePromise;
-    this.#state = 'closing';
-    this.#closePromise = (async () => {
-      if (this.#retainedChildren > 0) {
-        await new Promise<void>((resolve) => {
-          this.#resolveChildDrain = resolve;
-        });
-      }
-      this.#state = 'closed';
-      this.#releaseRuntime();
-    })();
-    return this.#closePromise;
-  }
-
-  dispose(): Promise<void> { return this.close(); }
-
-  #assertOpen(): void {
-    if (this.#state !== 'open') {
-      throw new VolvoxAIError('HANDLE_DISPOSED', 'Model is closing or closed.', {
-        phase: 'lifecycle',
-      });
-    }
-    this.#runtime._assertAcceptingWork();
-  }
-}
-
 export class CompiledModel {
   readonly backend: string;
   readonly report: CompilationReport;
@@ -936,10 +852,10 @@ export class CompiledModel {
   readonly topologyRevision: number;
   readonly weightRevision: number;
   readonly weightRevisionId: string;
-  readonly adapterRevisionId: string | null;
-  readonly adapterRevisionIds: readonly string[];
+  readonly adapterRevisionId: null = null;
+  readonly adapterRevisionIds: readonly string[] = Object.freeze([]);
   readonly #runtime: Runtime;
-  readonly #snapshot: ModelSnapshot;
+  readonly #snapshot: Model;
   readonly #compiled: BackendProviderCompiledModel;
   readonly #capabilities: BackendProviderCapabilities;
   readonly #onDiagnostic: ((event: RuntimeDiagnostic) => void) | null;
@@ -951,7 +867,7 @@ export class CompiledModel {
 
   constructor(
     runtime: Runtime,
-    snapshot: ModelSnapshot,
+    snapshot: Model,
     compiled: BackendProviderCompiledModel,
     capabilities: BackendProviderCapabilities,
     report: CompilationReport,
@@ -964,8 +880,6 @@ export class CompiledModel {
     this.topologyRevision = snapshot.topologyRevision;
     this.weightRevision = snapshot.weightRevision;
     this.weightRevisionId = snapshot.weightRevisionId;
-    this.adapterRevisionId = snapshot.adapterRevisionId;
-    this.adapterRevisionIds = snapshot.adapterRevisionIds;
     this.#runtime = runtime;
     this.#snapshot = snapshot;
     this.#compiled = compiled;
@@ -982,9 +896,57 @@ export class CompiledModel {
     }
     try {
       assertExecutionContextOptions(options);
-      this.#snapshot.resolveAdapterRevisionId(options.adapter);
+      if (options.adapter != null) {
+        throw new VolvoxAIError('INVALID_ARGUMENT',
+          'Logical model snapshots do not contain adapter revisions.', {
+            phase: 'compilation', backend: this.backend,
+          });
+      }
+      if (options.adapterBatchDimension != null &&
+          !Object.prototype.hasOwnProperty.call(
+            this.#snapshot.graph.dimensions,
+            options.adapterBatchDimension,
+          )) {
+        throw new VolvoxAIError('INVALID_ARGUMENT',
+          `Adapter batch dimension '${options.adapterBatchDimension}' is not declared by the logical model.`, {
+            phase: 'compilation', backend: this.backend,
+          });
+      }
+      const decode = options.decode;
+      if (decode?.rowMode !== undefined && !decodeRowModes.includes(decode.rowMode)) {
+        throw new VolvoxAIError('INVALID_ARGUMENT',
+          `Execution context decode rowMode '${String(decode.rowMode)}' is invalid.`, {
+            phase: 'compilation', backend: this.backend,
+          });
+      }
+      if (decode?.requireIncremental !== undefined &&
+          typeof decode.requireIncremental !== 'boolean') {
+        throw new VolvoxAIError('INVALID_ARGUMENT',
+          'Execution context decode requireIncremental must be boolean.', {
+            phase: 'compilation', backend: this.backend,
+          });
+      }
+      if (decode?.changedInputs !== undefined && decode.changedInputs !== null) {
+        if (!Array.isArray(decode.changedInputs)) {
+          throw new VolvoxAIError('INVALID_ARGUMENT',
+            'Execution context decode changedInputs must be an array or null.', {
+              phase: 'compilation', backend: this.backend,
+            });
+        }
+        const seen = new Set<string>();
+        for (const name of decode.changedInputs) {
+          if (typeof name !== 'string' || !this.#snapshot.inputNames.includes(name) ||
+              seen.has(name)) {
+            throw new VolvoxAIError('INVALID_ARGUMENT',
+              'Execution context decode changedInputs must contain unique declared public input names.', {
+                phase: 'compilation', backend: this.backend,
+              });
+          }
+          seen.add(name);
+        }
+      }
     } catch (error) {
-      throw runtimeError(error, 'INVALID_ARGUMENT', 'Execution context adapter selector is invalid.', {
+      throw runtimeError(error, 'INVALID_ARGUMENT', 'Execution context options are invalid.', {
         phase: 'compilation', backend: this.backend,
       });
     }
@@ -992,7 +954,35 @@ export class CompiledModel {
     let candidate: unknown = null;
     let backendContext: BackendProviderExecutionContext | null = null;
     try {
-      candidate = await this.#compiled.createContext(options as ExecutionOptions);
+      const decode = options.decode;
+      const initialPlan = options.bankResidency === undefined && this.#snapshot.staticShapePlan
+        ? this.#snapshot.staticShapePlan
+        : resolveMinimumGraphShapes(
+          this.#snapshot.graph,
+          this.#snapshot.quantizationByTensor,
+          options.bankResidency,
+        );
+      const providerOptions = Object.freeze({
+        initialPlan,
+        ...(decode === undefined
+          ? {}
+          : {
+            decode: Object.freeze({
+              ...(decode.changedInputs === undefined
+                ? {}
+                : {
+                  changedInputs: decode.changedInputs === null
+                    ? null
+                    : Object.freeze([...decode.changedInputs]),
+                }),
+              ...(decode.rowMode === undefined ? {} : { rowMode: decode.rowMode }),
+              ...(decode.requireIncremental === undefined
+                ? {}
+                : { requireIncremental: decode.requireIncremental }),
+            }),
+          }),
+      });
+      candidate = await this.#compiled.createContext(providerOptions);
       backendContext = assertProviderExecutionContext(
         candidate,
         this.backend,
@@ -1067,6 +1057,7 @@ export class CompiledModel {
 
 export interface ExecutionContextDecode {
   seed(inputs: ExecutionInputs, options?: DecodeExecutionOptions): Promise<ExecutionResult>;
+  /** A step may supply only its effective changed-input set after a successful seed. */
   step(inputs: ExecutionInputs, options?: DecodeExecutionOptions): Promise<ExecutionResult>;
   reset(): Promise<void>;
 }
@@ -1099,21 +1090,23 @@ export class ExecutionContext {
   readonly weightRevision: number;
   readonly weightRevisionId: string;
   readonly decode: ExecutionContextDecode;
-  readonly #snapshot: ModelSnapshot;
+  readonly #snapshot: Model;
   readonly #backendContext: BackendProviderExecutionContext;
   readonly #capabilities: BackendProviderCapabilities;
   readonly #compilationReport: CompilationReport;
-  readonly #outputDescriptors: readonly ModelOutputDescriptor[];
   readonly #onDiagnostic: ((event: RuntimeDiagnostic) => void) | null;
   readonly #releaseCompiled: () => void;
   #adapter: ExecutionContextOptions['adapter'];
-  #adapterRevisionId: string | null;
+  readonly #adapterBatchDimension: string | null;
+  readonly #decodeChangedInputs: readonly string[] | null;
+  #retainedDecodeInputs: ExecutionInputs | null = null;
   #tail: Promise<void> = Promise.resolve();
+  readonly #bankResidency: Readonly<Record<string, readonly number[]>> | undefined;
   #state: 'open' | 'closing' | 'closed' = 'open';
   #closePromise: Promise<void> | null = null;
 
   constructor(
-    snapshot: ModelSnapshot,
+    snapshot: Model,
     backendContext: BackendProviderExecutionContext,
     capabilities: BackendProviderCapabilities,
     compilationReport: CompilationReport,
@@ -1131,39 +1124,51 @@ export class ExecutionContext {
     this.#backendContext = backendContext;
     this.#capabilities = capabilities;
     this.#compilationReport = compilationReport;
-    this.#outputDescriptors = Object.freeze(snapshot.outputDescriptors.map((output) => Object.freeze({
-      ...output,
-      shape: Object.freeze([...output.shape]),
-    })));
     this.#onDiagnostic = onDiagnostic;
     this.#releaseCompiled = releaseCompiled;
     this.#adapter = cloneSelector(options.adapter);
-    this.#adapterRevisionId = snapshot.resolveAdapterRevisionId(options.adapter);
+    this.#adapterBatchDimension = options.adapterBatchDimension ?? null;
+    this.#bankResidency = options.bankResidency === undefined
+      ? undefined
+      : Object.freeze(Object.fromEntries(Object.entries(options.bankResidency).map(
+        ([name, slots]) => [name, Object.freeze([...slots])]))); 
+    this.#decodeChangedInputs = options.decode?.changedInputs == null
+      ? null
+      : Object.freeze([...options.decode.changedInputs]);
     this.decode = new ContextDecode(this);
   }
 
   get closed(): boolean { return this.#state === 'closed'; }
-  get adapterRevisionId(): string | null { return this.#adapterRevisionId; }
+  get adapterRevisionId(): null { return null; }
 
-  execute(inputs: ExecutionInputs, options: ExecutionOptions = {}): Promise<ExecutionResult> {
-    return this.#enqueue(() => this.#run('execute',
-      (resolved) => this.#backendContext.execute(inputs, resolved),
+  execute(
+    inputs: ExecutionInputs,
+    options: ExecutionOptions = EMPTY_EXECUTION_OPTIONS,
+  ): Promise<ExecutionResult> {
+    let deviceInputs: Readonly<Record<string, DeviceTensorInputLease>>;
+    try {
+      deviceInputs = this.#acquireDeviceInputs(inputs, 'execute');
+    } catch (error) {
+      return Promise.reject(error);
+    }
+    return this.#enqueue(() => this.#run('execute', inputs,
+      (request) => this.#backendContext.execute(request),
       options,
-    ));
+      deviceInputs,
+    )).finally(() => {
+      for (const lease of Object.values(deviceInputs)) releaseDeviceTensorInputLease(lease);
+    });
   }
 
   selectAdapter(adapter: ExecutionContextOptions['adapter']): Promise<void> {
     return this.#enqueue(() => {
-      let revisionId: string | null;
-      try {
-        revisionId = this.#snapshot.resolveAdapterRevisionId(adapter);
-      } catch (error) {
-        throw runtimeError(error, 'INVALID_ARGUMENT', 'Adapter selector is invalid.', {
+      if (adapter != null) {
+        throw new VolvoxAIError('INVALID_ARGUMENT',
+          'Logical model snapshots do not contain adapter revisions.', {
           phase: 'execution', backend: this.backend,
         });
       }
-      this.#adapter = cloneSelector(adapter);
-      this.#adapterRevisionId = revisionId;
+      this.#adapter = adapter;
     });
   }
 
@@ -1172,7 +1177,12 @@ export class ExecutionContext {
     inputs: ExecutionInputs,
     options: DecodeExecutionOptions,
   ): Promise<ExecutionResult> {
-    return this.#enqueue(() => this.#run(operation, async (resolved) => {
+    try {
+      this.#acquireDeviceInputs(inputs, operation);
+    } catch (error) {
+      return Promise.reject(error);
+    }
+    return this.#enqueue(() => this.#run(operation, inputs, async (request) => {
       const execute = operation === 'seed'
         ? this.#backendContext.decodeSeed
         : this.#backendContext.decodeStep;
@@ -1182,8 +1192,44 @@ export class ExecutionContext {
             phase: 'execution', backend: this.backend,
           });
       }
-      return execute.call(this.#backendContext, inputs, resolved);
-    }, options));
+      return execute.call(this.#backendContext, request);
+    }, options, EMPTY_DEVICE_INPUTS));
+  }
+
+  #acquireDeviceInputs(
+    inputs: ExecutionInputs,
+    operation: ExecutionDecodeState['operation'],
+  ): Readonly<Record<string, DeviceTensorInputLease>> {
+    if (!inputs || typeof inputs !== 'object' || Array.isArray(inputs) ||
+        ArrayBuffer.isView(inputs)) return EMPTY_DEVICE_INPUTS;
+    const found: Record<string, DeviceTensorInputLease> = {};
+    try {
+      for (const name of Object.getOwnPropertyNames(inputs)) {
+        const view = inputs[name];
+        if (!view || typeof view !== 'object') continue;
+        const reference = inspectDeviceTensorReference(view.data);
+        if (!reference) continue;
+        if (operation !== 'execute') {
+          throw new VolvoxAIError('BACKEND_UNSUPPORTED',
+            'Device TensorResult inputs are supported only by ordinary execute, not decode seed/step.', {
+              phase: 'execution', backend: this.backend,
+            });
+        }
+        if (this.backend !== 'webgpu') {
+          throw new VolvoxAIError('BACKEND_UNSUPPORTED',
+            `Backend '${this.backend}' does not accept device TensorResult inputs; read the tensor to host storage first.`, {
+              phase: 'execution', backend: this.backend,
+            });
+        }
+        found[name] = acquireDeviceTensorInputLease(view.data);
+      }
+      return Object.keys(found).length === 0
+        ? EMPTY_DEVICE_INPUTS
+        : Object.freeze(found);
+    } catch (error) {
+      for (const lease of Object.values(found)) releaseDeviceTensorInputLease(lease);
+      throw error;
+    }
   }
 
   _decodeReset(): Promise<void> {
@@ -1195,6 +1241,7 @@ export class ExecutionContext {
           });
       }
       await this.#backendContext.decodeReset();
+      this.#retainedDecodeInputs = null;
     });
   }
 
@@ -1212,7 +1259,10 @@ export class ExecutionContext {
         `Backend '${this.backend}' context close failed.`, {
           phase: 'lifecycle', backend: this.backend,
         });
-    }).finally(this.#releaseCompiled);
+    }).finally(() => {
+      this.#retainedDecodeInputs = null;
+      this.#releaseCompiled();
+    });
     this.#tail = close.then(() => undefined, () => undefined);
     this.#closePromise = close;
     return close;
@@ -1233,47 +1283,210 @@ export class ExecutionContext {
 
   async #run(
     executionOperation: ExecutionDecodeState['operation'],
-    operation: (options: DecodeExecutionOptions) => Promise<BackendExecutionSnapshot>,
+    inputs: ExecutionInputs,
+    operation: (request: BackendResolvedExecutionRequest) => Promise<BackendExecutionSnapshot>,
     options: DecodeExecutionOptions,
+    deviceInputs: Readonly<Record<string, DeviceTensorInputLease>>,
   ): Promise<ExecutionResult> {
     const executionId = executionIdentity();
     const executionStarted = monotonicMilliseconds();
     let snapshot: BackendExecutionSnapshot | null = null;
     let snapshotTransferred = false;
     let reportedBackendReport: Readonly<Record<string, unknown>> | null = null;
-    assertExecutionOptions(options, executionOperation);
-    const resolved: {
-      -readonly [Key in keyof DecodeExecutionOptions]: DecodeExecutionOptions[Key]
-    } = { ...options };
-    if (!Object.prototype.hasOwnProperty.call(resolved, 'adapter') &&
-        !Object.prototype.hasOwnProperty.call(resolved, 'adapters') &&
-        this.#adapter !== undefined) {
-      resolved.adapter = this.#adapter;
-    }
-    let adapterRevisionIds: readonly (string | null)[] = Object.freeze([
-      this.#adapterRevisionId,
-    ]);
+    let resolvedOptions: Readonly<DecodeExecutionOptions> = EMPTY_EXECUTION_OPTIONS;
+    let adapterRevisionIds: readonly (string | null)[] = EMPTY_ADAPTER_REVISION_IDS;
+    let plan: ResolvedShapePlan | null = null;
+    let shapeBindTimeMs: number | null = null;
+    let providerTimeMs: number | null = null;
     try {
-      if (Object.prototype.hasOwnProperty.call(resolved, 'adapters')) {
-        if (!Array.isArray(resolved.adapters)) {
+      assertExecutionOptions(options, executionOperation);
+      if (options.position !== undefined &&
+          (!Number.isSafeInteger(options.position) || options.position < 0)) {
+        throw new VolvoxAIError('INVALID_ARGUMENT',
+          'Decode position must be a non-negative safe integer.', {
+            phase: 'execution', backend: this.backend,
+          });
+      }
+      const optionChangedInputs = this.#normalizeChangedInputs(options.changedInputs);
+      let bindingInputs = inputs;
+      let effectiveStepChangedInputs: readonly string[] | null = null;
+      if (executionOperation === 'step') {
+        const prepared = this.#prepareDecodeStepInputs(inputs, optionChangedInputs);
+        bindingInputs = prepared.inputs;
+        effectiveStepChangedInputs = prepared.changedInputs;
+      }
+      for (const [name, lease] of Object.entries(deviceInputs)) {
+        if (!deviceTensorInputLeaseMatches(lease, bindingInputs[name]?.data)) {
+          throw new VolvoxAIError('INVALID_ARGUMENT',
+            `Device tensor input '${name}' changed after execute accepted it.`, {
+              phase: 'execution', backend: this.backend,
+            });
+        }
+      }
+      for (const name of this.#snapshot.inputNames) {
+        if (inspectDeviceTensorReference(bindingInputs[name]?.data) && !deviceInputs[name]) {
+          throw new VolvoxAIError('INVALID_ARGUMENT',
+            `Device tensor input '${name}' was supplied after execute acceptance and has no ownership lease.`, {
+              phase: 'execution', backend: this.backend,
+            });
+        }
+      }
+      const shapeBindStarted = monotonicMilliseconds();
+      try {
+        plan = this.#snapshot.bindShapes(bindingInputs, this.#bankResidency);
+      } catch (error) {
+        shapeBindTimeMs = elapsedMilliseconds(shapeBindStarted);
+        throw runtimeError(error, 'INVALID_ARGUMENT',
+          'Execution inputs do not satisfy the complete logical shape contract.', {
+            phase: 'execution', backend: this.backend,
+          });
+      }
+      shapeBindTimeMs = elapsedMilliseconds(shapeBindStarted);
+
+      const mutableOptions: {
+        -readonly [Key in keyof DecodeExecutionOptions]: DecodeExecutionOptions[Key]
+      } = options === EMPTY_EXECUTION_OPTIONS && this.#adapter === undefined &&
+          effectiveStepChangedInputs === null
+        ? EMPTY_EXECUTION_OPTIONS
+        : { ...options };
+      if (!Object.prototype.hasOwnProperty.call(mutableOptions, 'adapter') &&
+          !Object.prototype.hasOwnProperty.call(mutableOptions, 'adapters') &&
+          this.#adapter !== undefined) {
+        mutableOptions.adapter = this.#adapter;
+      }
+
+      let adapterSelection: BackendResolvedAdapterSelection;
+      if (Object.prototype.hasOwnProperty.call(mutableOptions, 'adapters')) {
+        if (!Array.isArray(mutableOptions.adapters)) {
           throw new VolvoxAIError('INVALID_ARGUMENT', 'Execution adapters must be an array.', {
             phase: 'execution', backend: this.backend,
           });
         }
-        const selectors = Object.freeze(resolved.adapters.map((selector) => cloneSelector(selector)));
-        resolved.adapters = selectors;
-        adapterRevisionIds = Object.freeze(selectors.map((selector) =>
-          this.#snapshot.resolveAdapterRevisionId(selector)));
+        if (this.#adapterBatchDimension === null) {
+          throw new VolvoxAIError('INVALID_ARGUMENT',
+            'Batch-indexed adapters require an explicit context adapterBatchDimension.', {
+              phase: 'execution', backend: this.backend,
+            });
+        }
+        const batchSize = plan.symbols[this.#adapterBatchDimension];
+        if (!Number.isSafeInteger(batchSize) || batchSize <= 0) {
+          throw new VolvoxAIError('INVALID_ARGUMENT',
+            `Resolved plan does not bind adapter batch dimension '${this.#adapterBatchDimension}'.`, {
+              phase: 'execution', backend: this.backend,
+            });
+        }
+        if (mutableOptions.adapters.length !== batchSize) {
+          throw new VolvoxAIError('INVALID_ARGUMENT',
+            `Execution adapters length ${mutableOptions.adapters.length} does not match resolved batch ${batchSize}.`, {
+              phase: 'execution', backend: this.backend,
+            });
+        }
+        const selectors = Object.freeze(mutableOptions.adapters.map((selector) => {
+          if (selector != null) {
+            throw new VolvoxAIError('INVALID_ARGUMENT',
+              'Logical model snapshots do not contain adapter revisions.', {
+                phase: 'execution', backend: this.backend,
+              });
+          }
+          return null;
+        }));
+        mutableOptions.adapters = selectors;
+        adapterRevisionIds = Object.freeze(selectors.map(() => null));
+        adapterSelection = Object.freeze({ batchSize, selectors });
       } else {
-        const selector = Object.prototype.hasOwnProperty.call(resolved, 'adapter')
-          ? cloneSelector(resolved.adapter)
+        const selector = Object.prototype.hasOwnProperty.call(mutableOptions, 'adapter')
+          ? mutableOptions.adapter
           : undefined;
-        if (Object.prototype.hasOwnProperty.call(resolved, 'adapter')) resolved.adapter = selector;
-        adapterRevisionIds = Object.freeze([
-          this.#snapshot.resolveAdapterRevisionId(selector),
-        ]);
+        if (selector != null) {
+          throw new VolvoxAIError('INVALID_ARGUMENT',
+            'Logical model snapshots do not contain adapter revisions.', {
+              phase: 'execution', backend: this.backend,
+            });
+        }
+        if (Object.prototype.hasOwnProperty.call(mutableOptions, 'adapter')) {
+          mutableOptions.adapter = selector;
+        }
+        adapterSelection = Object.prototype.hasOwnProperty.call(mutableOptions, 'adapter')
+          ? Object.freeze({ batchSize: null, selectors: EMPTY_ADAPTER_SELECTORS })
+          : EMPTY_ADAPTER_SELECTION;
       }
-      snapshot = await operation(resolved);
+
+      if (executionOperation === 'step') {
+        mutableOptions.changedInputs = effectiveStepChangedInputs!;
+      } else if (optionChangedInputs !== undefined) {
+        mutableOptions.changedInputs = optionChangedInputs;
+      }
+      resolvedOptions = mutableOptions === EMPTY_EXECUTION_OPTIONS
+        ? EMPTY_EXECUTION_OPTIONS
+        : Object.freeze(mutableOptions);
+
+      const normalizedInputRecord: Record<string, ExecutionInputs[string]> = {};
+      const mutableInputDescriptors: ResolvedTensorDescriptor[] = [];
+      for (const name of this.#snapshot.inputNames) {
+        const descriptor = plan.tensors[name];
+        normalizedInputRecord[name] = Object.freeze({
+          data: bindingInputs[name].data,
+          shape: descriptor.shape,
+        });
+        mutableInputDescriptors.push(descriptor);
+      }
+      const normalizedInputs = Object.freeze(normalizedInputRecord) as ExecutionInputs;
+      const inputDescriptors = Object.freeze(mutableInputDescriptors);
+      // Prepare fallible host clones before a provider can commit device-side
+      // decode mutation. Publication remains conditional on provider success.
+      const stagedRetainedDecodeInputs = executionOperation === 'seed'
+        ? this.#cloneDecodeInputs(normalizedInputs)
+        : executionOperation === 'step'
+          ? this.#cloneDecodeInputs(
+            normalizedInputs,
+            effectiveStepChangedInputs!,
+            this.#retainedDecodeInputs,
+          )
+          : null;
+      let executionCommitted = false;
+      const commitCoreExecution = () => {
+        if (executionCommitted) return;
+        executionCommitted = true;
+        this.#retainedDecodeInputs = null;
+      };
+      let providerCommitActive = true;
+      const commitExecution = () => {
+        if (!providerCommitActive) return;
+        commitCoreExecution();
+      };
+      const request: BackendResolvedExecutionRequest = Object.freeze({
+        operation: executionOperation,
+        commitExecution,
+        signature: plan.signature,
+        inputs: normalizedInputs,
+        deviceInputs,
+        inputDescriptors,
+        tensors: plan.tensors,
+        outputDescriptors: plan.outputs,
+        plan,
+        adapters: adapterSelection,
+        options: resolvedOptions,
+      });
+
+      // This is the first provider call in the execution. Every complete input,
+      // adapter, and graph-wide shape check above is therefore pre-mutation.
+      const providerStarted = monotonicMilliseconds();
+      try {
+        snapshot = await operation(request);
+      } finally {
+        // Provider requests are retainable objects. Revoke the public hook as
+        // soon as this call settles so a late callback cannot clear decode
+        // state published by a later FIFO operation.
+        providerCommitActive = false;
+        providerTimeMs = elapsedMilliseconds(providerStarted);
+      }
+      // External providers that do not expose an earlier mutation boundary
+      // still commit no later than successful return. Decode candidates are
+      // published only after that complete provider success.
+      commitCoreExecution();
+      if (executionOperation !== 'execute') {
+        this.#retainedDecodeInputs = stagedRetainedDecodeInputs;
+      }
       const backendReport = normalizeBackendReport(snapshot.backendReport);
       reportedBackendReport = backendReport;
       const route = executionRouteEvidence(
@@ -1281,7 +1494,7 @@ export class ExecutionContext {
         this.#compilationReport,
         backendReport,
       );
-      const decodeState = executionDecodeState(executionOperation, resolved, backendReport);
+      const decodeState = executionDecodeState(executionOperation, resolvedOptions, backendReport);
       const report: ExecutionReport = Object.freeze({
         executionId,
         contextId: this.id,
@@ -1291,15 +1504,18 @@ export class ExecutionContext {
         topologyRevision: this.topologyRevision,
         weightRevision: this.weightRevision,
         weightRevisionId: this.weightRevisionId,
+        shapeSignature: plan.signature,
         adapterRevisionId: adapterRevisionIds.length === 1 ? adapterRevisionIds[0] : null,
         adapterRevisionIds,
+        shapeBindTimeMs,
+        providerTimeMs,
         executionTimeMs: elapsedMilliseconds(executionStarted),
         routeEvidence: route,
         decodeState,
         operatorFallback: this.#capabilities.operatorFallback,
         backendReport,
       });
-      const result = new ExecutionResult(this.backend, snapshot, report, this.#outputDescriptors);
+      const result = createExecutionResult(this.backend, snapshot, report, plan.outputs);
       snapshotTransferred = true;
       this.#emit({ kind: 'execution', report });
       return result;
@@ -1320,8 +1536,11 @@ export class ExecutionContext {
         topologyRevision: this.topologyRevision,
         weightRevision: this.weightRevision,
         weightRevisionId: this.weightRevisionId,
+        shapeSignature: plan?.signature ?? null,
         adapterRevisionId: adapterRevisionIds.length === 1 ? adapterRevisionIds[0] : null,
         adapterRevisionIds,
+        shapeBindTimeMs,
+        providerTimeMs,
         executionTimeMs: elapsedMilliseconds(executionStarted),
         routeEvidence: executionFailureRouteEvidence(
           this.#capabilities,
@@ -1329,7 +1548,7 @@ export class ExecutionContext {
           reportedBackendReport,
           failure.node,
         ),
-        decodeState: executionDecodeState(executionOperation, resolved, null),
+        decodeState: executionDecodeState(executionOperation, resolvedOptions, null),
       });
       this.#emit({ kind: 'execution-error', report: failureReport });
       throw new VolvoxAIError(failure.code, failure.message, {
@@ -1348,5 +1567,104 @@ export class ExecutionContext {
     } catch {
       // Application diagnostics must never change runtime control flow.
     }
+  }
+
+  #normalizeChangedInputs(value: DecodeExecutionOptions['changedInputs']):
+    readonly string[] | undefined {
+    if (value === undefined) return undefined;
+    if (!Array.isArray(value)) {
+      throw new VolvoxAIError('INVALID_ARGUMENT', 'Decode changedInputs must be an array.', {
+        phase: 'execution', backend: this.backend,
+      });
+    }
+    const seen = new Set<string>();
+    const normalized = value.map((name) => {
+      if (typeof name !== 'string' || !this.#snapshot.inputNames.includes(name) ||
+          seen.has(name)) {
+        throw new VolvoxAIError('INVALID_ARGUMENT',
+          'Decode changedInputs must contain unique declared public input names.', {
+            phase: 'execution', backend: this.backend,
+          });
+      }
+      seen.add(name);
+      return name;
+    });
+    return Object.freeze(normalized);
+  }
+
+  #prepareDecodeStepInputs(
+    supplied: ExecutionInputs,
+    optionChangedInputs: readonly string[] | undefined,
+  ): Readonly<{ inputs: ExecutionInputs; changedInputs: readonly string[] }> {
+    const retained = this.#retainedDecodeInputs;
+    if (retained === null) {
+      throw new VolvoxAIError('INVALID_ARGUMENT',
+        'Decode step requires a successful seed on this execution context.', {
+          phase: 'execution', backend: this.backend,
+        });
+    }
+    if (!supplied || typeof supplied !== 'object' || Array.isArray(supplied) ||
+        ArrayBuffer.isView(supplied) || Object.getOwnPropertySymbols(supplied).length !== 0) {
+      throw new VolvoxAIError('INVALID_ARGUMENT',
+        'Decode step inputs must be a named tensor-view record.', {
+          phase: 'execution', backend: this.backend,
+        });
+    }
+    const suppliedNames = Object.getOwnPropertyNames(supplied);
+    const declared = new Set(this.#snapshot.inputNames);
+    if (suppliedNames.some((name) => !declared.has(name))) {
+      throw new VolvoxAIError('INVALID_ARGUMENT',
+        'Decode step inputs contain an undeclared public input.', {
+          phase: 'execution', backend: this.backend,
+        });
+    }
+    const complete = suppliedNames.length === this.#snapshot.inputNames.length &&
+      this.#snapshot.inputNames.every((name) => Object.prototype.hasOwnProperty.call(supplied, name));
+    const expected = optionChangedInputs ?? this.#decodeChangedInputs;
+    const changedInputs = expected === null
+      ? Object.freeze(this.#snapshot.inputNames.filter((name) =>
+          Object.prototype.hasOwnProperty.call(supplied, name)))
+      : expected;
+    const changed = new Set(changedInputs);
+    const missingChanged = changedInputs.filter((name) =>
+      !Object.prototype.hasOwnProperty.call(supplied, name));
+    const extraPartial = complete
+      ? []
+      : suppliedNames.filter((name) => !changed.has(name));
+    if (missingChanged.length !== 0 || extraPartial.length !== 0) {
+      throw new VolvoxAIError('INVALID_ARGUMENT',
+        'Partial decode step inputs must exactly match the effective changedInputs set.', {
+          phase: 'execution', backend: this.backend,
+        });
+    }
+    const merged: Record<string, ExecutionInputs[string]> = {};
+    for (const name of this.#snapshot.inputNames) {
+      merged[name] = changed.has(name) ? supplied[name] : retained[name];
+    }
+    return Object.freeze({
+      inputs: Object.freeze(merged),
+      changedInputs: Object.freeze([...changedInputs]),
+    });
+  }
+
+  #cloneDecodeInputs(
+    inputs: ExecutionInputs,
+    changedInputs: readonly string[] = this.#snapshot.inputNames,
+    previous: ExecutionInputs | null = null,
+  ): ExecutionInputs {
+    const changed = new Set(changedInputs);
+    const retained: Record<string, ExecutionInputs[string]> = {};
+    for (const name of this.#snapshot.inputNames) {
+      if (!changed.has(name) && previous !== null) {
+        retained[name] = previous[name];
+        continue;
+      }
+      const input = inputs[name];
+      retained[name] = Object.freeze({
+        data: cloneRuntimeData(input.data),
+        shape: Object.freeze([...input.shape]),
+      });
+    }
+    return Object.freeze(retained);
   }
 }

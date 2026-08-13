@@ -61,7 +61,9 @@ class RuntimeQuantizedBiasFoldingPass(IRPass):
     """Absorb a proven F32 post-DQ bias into QLinear's I32 bias."""
 
     name = "runtime-quantized-bias-folding"
-    contract = PassContract.preserving(IRDialect.RUNTIME, repeatable=True)
+    contract = PassContract.preserving(
+        IRDialect.RUNTIME, repeatable=True
+    )
 
     def __init__(
         self,
@@ -141,7 +143,7 @@ class RuntimeQuantizedBiasFoldingPass(IRPass):
             len(activation_ports) != 1
             or set(inputs) != {*activation_ports, "weight", "bias"}
             or set(outputs) != {"out"}
-            or _params(dense) not in ({}, {"weight_layout": "OUT_IN"})
+            or _params(dense) not in ({}, {"weight_layout": "dout_din"})
         ):
             return None
         byte_output = outputs["out"]
@@ -212,9 +214,12 @@ class RuntimeQuantizedBiasFoldingPass(IRPass):
             or byte_output.dtype not in _BYTE_DTYPES
             or intermediate.dtype != "float32"
             or result.dtype != "float32"
-            or not all(value.concrete for value in (
-                activation, weight, byte_output, intermediate, result,
-            ))
+            # Folding rewrites per-output-channel payloads, so only the weight
+            # and the feature axis must be concrete; batch and sequence extents
+            # stay symbolic in a bounded package.
+            or not weight.concrete
+            or not isinstance(byte_output.shape[-1], int)
+            or not isinstance(activation.shape[-1], int)
             or activation.rank < 1
             or weight.rank != 2
             or byte_output.rank != activation.rank
@@ -272,7 +277,7 @@ class RuntimeQuantizedBiasFoldingPass(IRPass):
         }
         if any(value is None for value in arrays.values()):
             return None
-        float_bias = self._initializer_any_shape(
+        float_bias = self._broadcast_initializer(
             graph, match["float_bias"], np.float32,
         )
         if (
@@ -282,10 +287,17 @@ class RuntimeQuantizedBiasFoldingPass(IRPass):
             or any(int(value) != 1 for value in float_bias.shape[:-1])
         ):
             return None
-        try:
-            if np.broadcast_shapes(result.shape, float_bias.shape) != result.shape:
-                return None
-        except ValueError:
+        # The bias is right-aligned against a possibly symbolic result shape, so
+        # compare axis by axis instead of asking numpy to broadcast symbols.
+        if len(float_bias.shape) > result.rank:
+            return None
+        if any(
+            not (extent == 1 or extent == result.shape[axis])
+            for axis, extent in zip(
+                range(result.rank - len(float_bias.shape), result.rank),
+                float_bias.shape,
+            )
+        ):
             return None
 
         input_scale = arrays["input_scale"]
@@ -366,6 +378,32 @@ class RuntimeQuantizedBiasFoldingPass(IRPass):
         if value is None or value.shape != shape:
             return None
         return value
+
+    def _broadcast_initializer(
+        self,
+        graph,
+        name: str,
+        dtype: Any,
+    ) -> np.ndarray | None:
+        """Read a constant that may be broadcast by an explicit ``Expand``.
+
+        A bounded package cannot pre-broadcast a bias into a symbolic extent, so
+        the producer emits ``Expand`` over the per-channel initializer.  The
+        payload is unchanged by that expansion, so folding reads the source.
+        """
+
+        direct = self._initializer_any_shape(graph, name, dtype)
+        if direct is not None:
+            return direct
+        definition = graph.use_def().producers.get(name)
+        if definition is None:
+            return None
+        node = graph.nodes[definition.node_index]
+        if node.op_type != "Expand" or set(node.input_map()) != {"input"}:
+            return None
+        return self._initializer_any_shape(
+            graph, node.input_map()["input"], dtype,
+        )
 
     def _initializer_any_shape(
         self,

@@ -10,6 +10,7 @@ static int tensor_contiguous_strides(const T* tensor, long strides[8]) {
     return stride == tensor->numel ? 0 : -1;
 }
 
+
 static int tensor_broadcast_strides(const T* input, const T* output, long strides[8]) {
     if (!input || !output || !strides || output->ndim <= 0 || output->ndim > 8 ||
         input->ndim < 0 || input->ndim > output->ndim) return -1;
@@ -344,7 +345,19 @@ static int compare_i32_forward(Node* node, int comparison) {
     const int32_t* left = (const int32_t*)a->data;
     const int32_t* right = (const int32_t*)b->data;
     int32_t* result = (int32_t*)output->data;
-    for (long index = 0; index < output->numel; index++) {
+    /* Under row execution only the token just written differs from the retained
+     * prefix, so recomputing that one element reproduces the whole tensor. */
+    long begin = 0;
+    long end = output->numel;
+    if (g_active_row >= 0) {
+        long width = 0;
+        int tokens = vx_incremental_row_extent(output, &width);
+        if (tokens > g_active_row && width > 0) {
+            begin = (long)g_active_row * width;
+            end = begin + width;
+        }
+    }
+    for (long index = begin; index < end; index++) {
         long left_index = tensor_broadcast_index(
             index, output->ndim, output_strides, a_strides);
         long right_index = tensor_broadcast_index(
@@ -393,11 +406,81 @@ static int where_plain_32_forward(Node* node) {
     return 0;
 }
 
+typedef struct VxBatchMatMulF32Context {
+    const T* a;
+    const T* b;
+    T* output;
+    int m;
+    int k;
+    int n;
+    int batch_rank;
+    int narrow;
+    long row;
+} VxBatchMatMulF32Context;
+
+static void batch_matmul_f32_range(VxBatchMatMulF32Context* context,
+                                   long begin, long end) {
+    const T* a = context->a;
+    const T* b = context->b;
+    T* output = context->output;
+    const int m = context->m;
+    const int k = context->k;
+    const int n = context->n;
+    const int batch_rank = context->batch_rank;
+    for (long batch = begin; batch < end; batch++) {
+        int coordinates[6] = {0};
+        long remainder = batch;
+        for (int dimension = batch_rank - 1; dimension >= 0; dimension--) {
+            int size = output->shape[dimension];
+            coordinates[dimension] = (int)(remainder % size);
+            remainder /= size;
+        }
+        long a_batch = 0;
+        int a_offset = batch_rank - (a->ndim - 2);
+        for (int dimension = 0; dimension < a->ndim - 2; dimension++) {
+            int size = a->shape[dimension];
+            int coordinate = size == 1 ? 0 : coordinates[a_offset + dimension];
+            a_batch = a_batch * size + coordinate;
+        }
+        long b_batch = 0;
+        int b_offset = batch_rank - (b->ndim - 2);
+        for (int dimension = 0; dimension < b->ndim - 2; dimension++) {
+            int size = b->shape[dimension];
+            int coordinate = size == 1 ? 0 : coordinates[b_offset + dimension];
+            b_batch = b_batch * size + coordinate;
+        }
+        matmul_f32(
+            a->data + a_batch * (long)m * k + context->row * k,
+            b->data + b_batch * (long)k * n,
+            NULL,
+            output->data + batch * (long)m * n + context->row * n,
+            context->narrow ? 1 : m, k, n);
+    }
+}
+
+static void batch_matmul_f32_parallel_range(void* opaque, int begin, int end) {
+    batch_matmul_f32_range((VxBatchMatMulF32Context*)opaque,
+                           (long)begin, (long)end);
+}
+
+static int batch_matmul_f32_should_parallel(long batches, int m, int k, int n,
+                                            int threads) {
+    const uint64_t threshold = 4u * 1024u * 1024u;
+    uint64_t work = (uint64_t)(uint32_t)m * (uint64_t)(uint32_t)k;
+    if (threads <= 1 || batches <= 1 || batches > INT32_MAX) return 0;
+    if (work >= threshold) return 1;
+    /* work is below threshold here, so multiplying by any positive int still
+     * fits uint64_t. This comparison avoids overflowing on adversarial legal
+     * dimensions while retaining only an estimate for dispatch policy. */
+    work *= (uint64_t)(uint32_t)n;
+    if (work >= threshold) return 1;
+    return (uint64_t)batches >= (threshold + work - 1u) / work;
+}
+
 static int batch_matmul_f32_forward(Node* node) {
     T* a = nin(node, "a");
     T* b = nin(node, "b");
     T* output = t_find(node->out);
-    int coordinates[6] = {0};
     if (!a || !b || !output || a->dtype != T_F32 || b->dtype != T_F32 ||
         output->dtype != T_F32 || a->ndim < 2 || b->ndim < 2 ||
         a->ndim > 8 || b->ndim > 8 ||
@@ -433,33 +516,35 @@ static int batch_matmul_f32_forward(Node* node) {
         b->numel != b_batches * (long)k * n ||
         output->numel != batch_count * (long)m * n)
         return -1;
-    for (long batch = 0; batch < batch_count; batch++) {
-        long remainder = batch;
-        for (int dimension = batch_rank - 1; dimension >= 0; dimension--) {
-            int size = output->shape[dimension];
-            coordinates[dimension] = (int)(remainder % size);
-            remainder /= size;
-        }
-        long a_batch = 0;
-        int a_offset = batch_rank - (a->ndim - 2);
-        for (int dimension = 0; dimension < a->ndim - 2; dimension++) {
-            int size = a->shape[dimension];
-            int coordinate = size == 1 ? 0 : coordinates[a_offset + dimension];
-            a_batch = a_batch * size + coordinate;
-        }
-        long b_batch = 0;
-        int b_offset = batch_rank - (b->ndim - 2);
-        for (int dimension = 0; dimension < b->ndim - 2; dimension++) {
-            int size = b->shape[dimension];
-            int coordinate = size == 1 ? 0 : coordinates[b_offset + dimension];
-            b_batch = b_batch * size + coordinate;
-        }
-        matmul_f32(
-            a->data + a_batch * (long)m * k,
-            b->data + b_batch * (long)k * n,
-            NULL,
-            output->data + batch * (long)m * n,
-            m, k, n);
+    /* Row execution narrows to the active token, but only once the token axis
+     * is proven to be this operator's m axis. A tensor whose leading non-unit
+     * extent is m is sequence-major in the sense seq_range means; anything
+     * else keeps the full multiply, which stays correct because the retained
+     * prefix is valid. */
+    long token_width = 0;
+    const int narrow = g_active_row >= 0 && g_active_row < m &&
+        vx_incremental_row_extent(a, &token_width) == m &&
+        token_width == (long)k;
+    const long row = narrow ? (long)g_active_row : 0;
+    VxBatchMatMulF32Context context = {
+        a, b, output, m, k, n, batch_rank, narrow, row
+    };
+    const int threads = vx_kernels_thread_count();
+    /* Incremental execution computes one active row even when the retained
+     * prefix tensor still has a large M extent. Base dispatch on the work that
+     * will actually run, otherwise a long decode would wake the pool for a
+     * tiny 1xKxN multiply on every token. */
+    if (batch_matmul_f32_should_parallel(
+            batch_count, narrow ? 1 : m, k, n, threads)) {
+        const uint64_t target_chunks = (uint64_t)(uint32_t)threads * 4u;
+        int grain = (int)((uint64_t)batch_count / target_chunks +
+                          ((uint64_t)batch_count % target_chunks != 0u));
+        if (grain < 1) grain = 1;
+        matmul_f32_prepare_dispatch();
+        vx_kernels_parallel_for((int)batch_count, grain,
+                                batch_matmul_f32_parallel_range, &context);
+    } else {
+        batch_matmul_f32_range(&context, 0, batch_count);
     }
     return 0;
 }
@@ -711,18 +796,50 @@ static int expand_plain_32_forward(Node* node) {
     T* output = t_find(node->out);
     long output_strides[8] = {0};
     long input_strides[8] = {0};
+    long coordinates[8] = {0};
+    long block_elements = 1;
+    long block_count;
+    int prefix_rank;
     if (!input || !output || !tensor_plain_32(input) ||
         !tensor_plain_32(output) || input->dtype != output->dtype ||
         output->ndim <= 0 || output->ndim > 8 ||
+        output->numel <= 0 ||
+        (size_t)output->numel > SIZE_MAX / sizeof(uint32_t) ||
         tensor_contiguous_strides(output, output_strides) != 0 ||
         tensor_broadcast_strides(input, output, input_strides) != 0)
         return -1;
     const uint32_t* source = (const uint32_t*)input->data;
     uint32_t* destination = (uint32_t*)output->data;
-    for (long index = 0; index < output->numel; index++) {
-        long input_index = tensor_broadcast_index(
-            index, output->ndim, output_strides, input_strides);
-        destination[index] = source[input_index];
+    if (input->data == output->data) return input->numel == output->numel ? 0 : -1;
+    for (int dimension = output->ndim - 1;
+         dimension >= output->ndim - input->ndim; dimension--) {
+        const int source_dimension = dimension - (output->ndim - input->ndim);
+        if (input->shape[source_dimension] != output->shape[dimension]) break;
+        block_elements *= output->shape[dimension];
+    }
+    prefix_rank = output->ndim;
+    for (long elements = 1; prefix_rank > 0 && elements < block_elements;
+         prefix_rank--)
+        elements *= output->shape[prefix_rank - 1];
+    block_count = output->numel / block_elements;
+    long input_index = 0;
+    for (long block = 0; block < block_count; block++) {
+        const long output_index = block * block_elements;
+        if (block_elements == 1)
+            destination[output_index] = source[input_index];
+        else
+            memcpy(destination + output_index, source + input_index,
+                   (size_t)block_elements * sizeof(*destination));
+        for (int dimension = prefix_rank - 1; dimension >= 0; dimension--) {
+            coordinates[dimension]++;
+            if (coordinates[dimension] < output->shape[dimension]) {
+                input_index += input_strides[dimension];
+                break;
+            }
+            coordinates[dimension] = 0;
+            input_index -= (output->shape[dimension] - 1) *
+                input_strides[dimension];
+        }
     }
     return 0;
 }
@@ -770,15 +887,31 @@ static int gather_f32_i32_forward(Node* node) {
         return -1;
     const int32_t* selections = (const int32_t*)indices->data;
     int axis_size = input->shape[axis];
+    /* Selecting along a partially resident bank's slot axis keeps the model's
+     * global slot ids, so map them to staged rows exactly as the MoE kernels
+     * do. Any other axis is an ordinary gather. */
+    const uint32_t* slot_rows =
+        (axis == 0 && node->resident_slot_rows) ? node->resident_slot_rows : NULL;
+    const uint32_t slot_domain = slot_rows ? node->resident_slot_domain : 0u;
     for (long index = 0; index < indices->numel; index++) {
         int64_t selected = selections[index];
+        if (slot_rows) {
+            if (selected < 0) selected += (int64_t)slot_domain;
+            if (selected < 0 || (uint64_t)selected >= slot_domain ||
+                slot_rows[selected] >= (uint32_t)axis_size) return -1;
+            continue;
+        }
         if (selected < 0) selected += axis_size;
         if (selected < 0 || selected >= axis_size) return -1;
     }
     for (long outer_index = 0; outer_index < outer; outer_index++) {
         for (long index = 0; index < indices->numel; index++) {
             int64_t selected = selections[index];
-            if (selected < 0) selected += axis_size;
+            if (slot_rows) {
+                if (selected < 0) selected += (int64_t)slot_domain;
+                selected = slot_rows[selected];
+            }
+            else if (selected < 0) selected += axis_size;
             const float* source = input->data +
                 ((outer_index * axis_size + selected) * inner);
             float* destination = output->data +
@@ -809,6 +942,7 @@ static int slice_plain_32_forward(Node* node) {
         ? cJSON_GetObjectItemCaseSensitive(node->params, "steps") : NULL;
     int starts[8] = {0};
     int steps[8] = {1, 1, 1, 1, 1, 1, 1, 1};
+    int unit_steps = 1;
     unsigned seen = 0;
     long input_strides[8] = {0};
     if (!input || !output || !tensor_plain_32(input) ||
@@ -838,6 +972,7 @@ static int slice_plain_32_forward(Node* node) {
             return -1;
         starts[axis] = start;
         steps[axis] = step;
+        if (step != 1) unit_steps = 0;
         seen |= 1u << (unsigned)axis;
     }
     for (int dimension = 0; dimension < input->ndim; dimension++) {
@@ -854,6 +989,41 @@ static int slice_plain_32_forward(Node* node) {
     }
     const uint32_t* source = (const uint32_t*)input->data;
     uint32_t* destination = (uint32_t*)output->data;
+    if (unit_steps) {
+        int last_changed = -1;
+        long block_elements = 1;
+        for (int dimension = 0; dimension < input->ndim; dimension++) {
+            if (starts[dimension] != 0 ||
+                output->shape[dimension] != input->shape[dimension]) {
+                last_changed = dimension;
+            }
+        }
+        if (last_changed < 0) return tensor_copy_plain_32(input, output);
+        /* The last shortened/offset axis and every complete trailing axis form
+         * one contiguous row-major block. Only the preceding coordinates need
+         * index decoding; the selected payload itself is a bulk copy. */
+        for (int dimension = last_changed; dimension < input->ndim; dimension++) {
+            if (block_elements > LONG_MAX / output->shape[dimension]) return -1;
+            block_elements *= output->shape[dimension];
+        }
+        if (block_elements <= 0 || output->numel % block_elements != 0 ||
+            (size_t)block_elements > SIZE_MAX / sizeof(uint32_t)) return -1;
+        const long blocks = output->numel / block_elements;
+        const size_t block_bytes = (size_t)block_elements * sizeof(uint32_t);
+        for (long block = 0; block < blocks; block++) {
+            long remainder = block;
+            long input_index = starts[last_changed] * input_strides[last_changed];
+            for (int dimension = last_changed - 1; dimension >= 0; dimension--) {
+                int coordinate = (int)(remainder % output->shape[dimension]);
+                remainder /= output->shape[dimension];
+                input_index +=
+                    (starts[dimension] + (long)coordinate) * input_strides[dimension];
+            }
+            memmove(destination + block * block_elements, source + input_index,
+                    block_bytes);
+        }
+        return 0;
+    }
     for (long output_index = 0; output_index < output->numel; output_index++) {
         long remainder = output_index;
         long input_index = 0;
@@ -898,6 +1068,71 @@ static int resize_nearest2d_image(const T* in, T* out) {
     return resize_nearest2d_f32(
         in->data, out->data, (uint32_t)n, (uint32_t)h, (uint32_t)w,
         (uint32_t)c, (uint32_t)oh, (uint32_t)ow) ? 0 : -1;
+}
+
+static int resize_bilinear2d_image(const T* in, T* out) {
+    if (!in || !out || in->dtype != T_F32 || out->dtype != T_F32 ||
+        in->ndim != 4 || out->ndim != 4 || in->shape[0] != out->shape[0] ||
+        in->shape[3] != out->shape[3])
+        return -1;
+    int n = in->shape[0], h = in->shape[1], w = in->shape[2], c = in->shape[3];
+    int oh = out->shape[1], ow = out->shape[2];
+    if (n <= 0 || h <= 0 || w <= 0 || c <= 0 || oh <= 0 || ow <= 0)
+        return -1;
+    resize_bilinear_f32(in->data, out->data, n, h, w, c, oh, ow);
+    return 0;
+}
+
+static int resize_false_or_absent(cJSON* params, const char* name) {
+    cJSON* value = params ? cJSON_GetObjectItem(params, name) : NULL;
+    if (!value || cJSON_IsNull(value) || cJSON_IsFalse(value)) return 0;
+    if (cJSON_IsNumber(value) && isfinite(value->valuedouble) &&
+        value->valuedouble == 0.0) return 0;
+    return -1;
+}
+
+/* Validate the same canonical F32 Resize surface used by the logical shape
+ * contract before selecting either CPU sampling kernel. */
+static int resize_f32_parameters(const Node* node, int* nearest_out) {
+    cJSON* params;
+    cJSON* mode;
+    cJSON* transform;
+    cJSON* nearest_mode;
+    cJSON* layout;
+    int nearest;
+    if (!node || !nearest_out || strcmp(node->op, "Resize")) return -1;
+    params = node->params;
+    mode = params ? cJSON_GetObjectItem(params, "mode") : NULL;
+    if (mode && !cJSON_IsNull(mode) &&
+        (!cJSON_IsString(mode) || !mode->valuestring)) return -1;
+    if (!mode || cJSON_IsNull(mode) || !strcmp(mode->valuestring, "linear")) {
+        nearest = 0;
+    } else if (!strcmp(mode->valuestring, "nearest")) {
+        nearest = 1;
+    } else {
+        return -1;
+    }
+    if (params && cJSON_GetObjectItem(params, "coordinate_transform_mode"))
+        return -1;
+    transform = params ?
+        cJSON_GetObjectItem(params, "coordinate_transformation_mode") : NULL;
+    if (transform && !cJSON_IsNull(transform) &&
+        (!cJSON_IsString(transform) || !transform->valuestring ||
+         strcmp(transform->valuestring, nearest ? "asymmetric" : "half_pixel")))
+        return -1;
+    nearest_mode = params ? cJSON_GetObjectItem(params, "nearest_mode") : NULL;
+    if (nearest_mode && !cJSON_IsNull(nearest_mode) &&
+        (!nearest || !cJSON_IsString(nearest_mode) ||
+         !nearest_mode->valuestring || strcmp(nearest_mode->valuestring, "floor")))
+        return -1;
+    layout = params ? cJSON_GetObjectItem(params, "data_layout") : NULL;
+    if (layout && !cJSON_IsNull(layout) &&
+        (!cJSON_IsString(layout) || !layout->valuestring ||
+         strcmp(layout->valuestring, "NHWC"))) return -1;
+    if (resize_false_or_absent(params, "align_corners") != 0 ||
+        resize_false_or_absent(params, "antialias") != 0) return -1;
+    *nearest_out = nearest;
+    return 0;
 }
 
 static void maxpool2d_f32_image(const T* in, T* out, int ky, int kx, int sy, int sx, int py, int px) {
@@ -946,7 +1181,13 @@ static void conv2d_f32_image(int node_idx, const T* in, T* out, const T* wt, con
     int kh = wt->shape[0], kw = wt->shape[1];
     int n = in->shape[0], h = in->shape[1], w = in->shape[2], c = in->shape[3];
     int oh = out->shape[1], ow = out->shape[2], out_c = out->shape[3];
-    if (groups == c && wt->shape[2] == c && out_c == c * wt->shape[3]) {
+    /* A single-input-channel dense convolution also satisfies the depthwise
+     * test — `groups == c` is trivially true at c == 1 — but the depthwise
+     * kernel parallelizes across channels and has none to work with there. The
+     * grayscale stem of this model measured 1.7 GFLOP/s that way against ~60
+     * from the generic kernel. At c == 1 the HWCM and HWIO weight layouts are
+     * the same buffer, so the generic path is a drop-in. */
+    if (c > 1 && groups == c && wt->shape[2] == c && out_c == c * wt->shape[3]) {
         vx_conv2d_depthwise_f32(in->data, out->data, wt->data, bias ? bias->data : NULL,
                                      n, h, w, c, oh, ow, out_c,
                                      kh, kw, wt->shape[2], wt->shape[3],
@@ -1036,7 +1277,7 @@ static int layout_is(const char* layout, const char* want) {
 
 static T* prepare_conv_weight_image(int node_idx, T* wt, cJSON* params, int in_c, int out_c, int groups, T* tmp) {
     if (!wt || wt->ndim != 4 || node_idx < 0 || node_idx >= MAXN) return NULL;
-    const char* layout = p_str(params, "weight_layout", groups == in_c ? "1HWO" : "OHWI");
+    const char* layout = p_str(params, "weight_layout", "HWIO");
 
     if (layout_is(layout, "HWIO") || layout_is(layout, "HWCM")) {
         if (wt->dtype == T_F32) return wt;
@@ -1113,8 +1354,14 @@ static T* prepare_conv_weight_image(int node_idx, T* wt, cJSON* params, int in_c
 }
 
 int prepack_conv_weights(void) {
+    /* Native GPU contexts keep invariant Conv weights device-resident and
+     * account at most one host layout conversion. Eager CPU pointwise/IGEMM
+     * packs would add CPU-only copies (and freeze mutable public weights)
+     * before the strict GPU route starts, so mirror the dense prepack gate. */
+    if (vx_backend_manager_current() != VOLVOXAI_BACKEND_CPU) return 0;
     double t0 = g_debug ? volvoxai_engine_now_ms() : 0.0;
     int conv_weights = 0, biases = 0, pointwise_packs = 0, igemm_indirs = 0;
+    int igemm_packs = 0;
     for (int i = 0; i < g_nn; i++) {
         Node* n = &g_n[i];
         if (strcmp(n->op, "Conv2D")) continue;
@@ -1147,6 +1394,12 @@ int prepack_conv_weights(void) {
                                                stride[0], stride[1], pads, dilation[0], dilation[1])) {
                 igemm_indirs++;
             }
+            /* Repack the weights here too, so the one-time cost lands in
+             * prepack rather than inside the first node's measured time. */
+            if (vx_f32_igemm_pack_cache(i, wp->data, in->shape[3], out->shape[3],
+                                        wp->shape[0] * wp->shape[1])) {
+                igemm_packs++;
+            }
         }
         if (b && b->dtype == T_F16) {
             if (!f16_tensor_f32_cache(g_f16bcache, i, b)) return -1;
@@ -1154,10 +1407,60 @@ int prepack_conv_weights(void) {
         }
     }
     if (g_debug && (conv_weights || biases || pointwise_packs || igemm_indirs)) {
-        fprintf(stderr, "[debug] prepack_conv weights=%d biases=%d pointwise_packs=%d igemm_indirs=%d %.3f ms\n",
-                conv_weights, biases, pointwise_packs, igemm_indirs, volvoxai_engine_now_ms() - t0);
+        fprintf(stderr, "[debug] prepack_conv weights=%d biases=%d pointwise_packs=%d igemm_indirs=%d igemm_packs=%d %.3f ms\n",
+                conv_weights, biases, pointwise_packs, igemm_indirs, igemm_packs, volvoxai_engine_now_ms() - t0);
     }
     return 0;
+}
+
+static int prepack_gemm_f32_weights(void) {
+    VxEngineState* state = vx_engine_state_current();
+    /* A non-CPU backend may keep every immutable dense weight device-resident.
+     * Do not add a second host packed copy merely because the model was
+     * initialized. Any operator that genuinely falls back to CPU retains the
+     * existing lazy cache path on its first execution. */
+    if (!state || !state->gemm_f32_packed_enabled ||
+        vx_backend_manager_current() != VOLVOXAI_BACKEND_CPU) return 0;
+    double t0 = g_debug ? volvoxai_engine_now_ms() : 0.0;
+    int packed = 0;
+    for (int i = 0; i < g_nn; i++) {
+        Node* node = &g_n[i];
+        if (node->skip || node->disabled ||
+            (strcmp(node->op, "MatMul") && strcmp(node->op, "Gemm") &&
+             strcmp(node->op, "Linear"))) continue;
+        T* input = node_input_default(node);
+        T* output = t_find(node->out);
+        T* weight = nin(node, "weight");
+        if (!input || !output || !weight || input->dtype != T_F32 ||
+            output->dtype != T_F32 || weight->dtype != T_F32 ||
+            input->ndim <= 0 || output->ndim <= 0 || weight->ndim != 2 ||
+            !volvoxai_engine_tensor_is_model_weight_locked(weight->name)) {
+            continue;
+        }
+        int d_in = input->shape[input->ndim - 1];
+        int d_out = output->shape[output->ndim - 1];
+        /* Dynamic batch/sequence dimensions do not affect a Linear pack. A
+         * symbolic feature dimension, however, cannot be packed until its
+         * first concrete specialization and retains the existing lazy path. */
+        if (d_in <= 0 || d_out <= 0) continue;
+        int out_in = 0;
+        if (linear_node_weight_layout(node, input, output, weight, &out_in) != 0)
+            continue;
+        if (vx_gemm_f32_pack_cache(&state->gemm_f32_cache, i, weight->data,
+                                   (uint32_t)d_in, (uint32_t)d_out, out_in)) {
+            packed++;
+        }
+    }
+    if (g_debug && packed) {
+        fprintf(stderr, "[debug] prepack_gemm_f32 weights=%d %.3f ms\n",
+                packed, volvoxai_engine_now_ms() - t0);
+    }
+    return 0;
+}
+
+int prepack_cpu_weights(void) {
+    if (prepack_conv_weights() != 0) return -1;
+    return prepack_gemm_f32_weights();
 }
 
 static int qconv2d_weight_only_f32(int node_idx, const T* in, T* out, const T* wt,

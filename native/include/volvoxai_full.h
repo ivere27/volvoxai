@@ -67,6 +67,10 @@ typedef struct VxOptimizerOptions {
 
 typedef struct VxTrainStepOptions {
     size_t struct_size;
+    /* One complete logical input batch. Every binding is validated and copied
+     * atomically before the private forward/backward step may begin. */
+    const VxTensorBinding* inputs;
+    size_t input_count;
     const VxCrossEntropyLoss* losses;
     size_t loss_count;
     const char* const* trainable_names;
@@ -78,7 +82,7 @@ typedef struct VxTrainStepOptions {
 } VxTrainStepOptions;
 
 #define VX_TRAIN_STEP_OPTIONS_INIT \
-    { sizeof(VxTrainStepOptions), NULL, 0, NULL, 0, \
+    { sizeof(VxTrainStepOptions), NULL, 0, NULL, 0, NULL, 0, \
       VX_OPTIMIZER_OPTIONS_INIT, 1u, 0, 0 }
 
 typedef struct VxTrainingMetric {
@@ -114,16 +118,10 @@ VX_API void vx_trainer_release(VxTrainer* trainer);
 VX_API VxStatus vx_trainer_close(VxTrainer* trainer, VxReport* report);
 
 VX_API size_t vx_trainer_input_count(VxTrainer* trainer);
-VX_API VxStatus vx_trainer_input_info(VxTrainer* trainer,
+VX_API VxStatus vx_trainer_input_spec(VxTrainer* trainer,
                                       size_t index,
-                                      VxTensorInfo* info,
+                                      VxTensorSpec* spec,
                                       VxReport* report);
-VX_API VxStatus vx_trainer_set_input(VxTrainer* trainer,
-                                     const char* name,
-                                     VxDataType dtype,
-                                     const void* data,
-                                     size_t byte_size,
-                                     VxReport* report);
 
 /* A step mutates only Trainer-owned weights, gradients, optimizer slots, RNG,
  * and accumulation state. update_applied is false for an unfinished
@@ -191,6 +189,10 @@ typedef struct VxPTQLayerSpec {
 typedef struct VxPTQPlanOptions {
     size_t struct_size;
     const char* template_graph_path;
+    /* Every declared profile must receive at least one successful calibration
+     * batch before package materialization is allowed. */
+    const char* const* profile_names;
+    size_t profile_count;
     const VxPTQObserverSpec* observers;
     size_t observer_count;
     const VxPTQLayerSpec* layers;
@@ -198,28 +200,46 @@ typedef struct VxPTQPlanOptions {
 } VxPTQPlanOptions;
 
 #define VX_PTQ_PLAN_OPTIONS_INIT \
-    { sizeof(VxPTQPlanOptions), NULL, NULL, 0, NULL, 0 }
+    { sizeof(VxPTQPlanOptions), NULL, NULL, 0, NULL, 0, NULL, 0 }
 
-typedef struct VxPTQInput {
+typedef struct VxPTQCalibrationBatch {
     size_t struct_size;
-    const char* name;
-    VxDataType dtype;
-    const void* data;
-    size_t byte_size;
-} VxPTQInput;
+    const char* profile_name;
+    const char* sample_name;
+    /* Number of logical examples represented by this batch. */
+    uint64_t sample_count;
+    const VxTensorBinding* inputs;
+    size_t input_count;
+} VxPTQCalibrationBatch;
 
-#define VX_PTQ_INPUT_INIT \
-    { sizeof(VxPTQInput), NULL, VX_DTYPE_F32, NULL, 0 }
+#define VX_PTQ_CALIBRATION_BATCH_INIT \
+    { sizeof(VxPTQCalibrationBatch), NULL, NULL, 0, NULL, 0 }
 
 typedef struct VxPTQPlanInfo {
     size_t struct_size;
+    uint64_t calibration_batches;
     uint64_t calibration_samples;
     size_t tensor_count;
+    size_t profile_count;
+    size_t covered_profile_count;
+    int32_t coverage_complete;
     VxRevisionInfo revision;
 } VxPTQPlanInfo;
 
 #define VX_PTQ_PLAN_INFO_INIT \
-    { sizeof(VxPTQPlanInfo), 0, 0, VX_REVISION_INFO_INIT }
+    { sizeof(VxPTQPlanInfo), 0, 0, 0, 0, 0, 0, VX_REVISION_INFO_INIT }
+
+typedef struct VxPTQProfileCoverage {
+    size_t struct_size;
+    char profile_name[VX_PTQ_NAME_CAPACITY];
+    uint64_t calibration_batches;
+    uint64_t calibration_samples;
+    size_t shape_signature_count;
+    size_t symbol_count;
+} VxPTQProfileCoverage;
+
+#define VX_PTQ_PROFILE_COVERAGE_INIT \
+    { sizeof(VxPTQProfileCoverage), { 0 }, 0, 0, 0, 0 }
 
 typedef struct VxPTQTensorParameters {
     size_t struct_size;
@@ -256,19 +276,29 @@ VX_API void vx_ptq_plan_retain(VxPTQPlan* plan);
 VX_API void vx_ptq_plan_release(VxPTQPlan* plan);
 VX_API VxStatus vx_ptq_plan_close(VxPTQPlan* plan, VxReport* report);
 VX_API size_t vx_ptq_plan_input_count(VxPTQPlan* plan);
-VX_API VxStatus vx_ptq_plan_input_info(VxPTQPlan* plan,
+VX_API VxStatus vx_ptq_plan_input_spec(VxPTQPlan* plan,
                                        size_t index,
-                                       VxTensorInfo* info,
+                                       VxTensorSpec* spec,
                                        VxReport* report);
 VX_API VxStatus vx_ptq_plan_calibrate(VxPTQPlan* plan,
-                                      const char* sample_name,
-                                      const VxPTQInput* inputs,
-                                      size_t input_count,
-                                      uint64_t* calibration_samples,
+                                      const VxPTQCalibrationBatch* batch,
+                                      VxPTQPlanInfo* info,
                                       VxReport* report);
 VX_API VxStatus vx_ptq_plan_info(VxPTQPlan* plan,
                                  VxPTQPlanInfo* info,
                                  VxReport* report);
+VX_API VxStatus vx_ptq_plan_profile_coverage(
+    VxPTQPlan* plan,
+    size_t index,
+    VxPTQProfileCoverage* coverage,
+    VxReport* report);
+/* UTF-8 JSON in the shared `volvox.ptq-coverage/v1` format. The first call
+ * may pass NULL/zero to query the required byte count including the NUL. */
+VX_API VxStatus vx_ptq_plan_coverage_json(VxPTQPlan* plan,
+                                          char* output,
+                                          size_t output_capacity,
+                                          size_t* required_size,
+                                          VxReport* report);
 VX_API VxStatus vx_ptq_plan_tensor_parameters(
     VxPTQPlan* plan,
     size_t index,

@@ -41,14 +41,19 @@ export function singleNodeGraph({ opType, inputs, params, outShape, outDtype = '
   const cfgInputs = {};
   for (const name of Object.values(inputs)) cfgInputs[name] = { shape: outShape, dtype: 'float32' };
   const node = {
+    id: 'node.0',
     opType,
     inputs,
-    outputs: { out: 'y' },
-    outputs_shape: { out: outShape },
-    outputs_dtype: { out: outDtype },
+    outputs: { out: { tensor: 'y', shape: outShape, dtype: outDtype } },
+    params: { ...(params || {}) },
   };
-  if (params && Object.keys(params).length) node.params = params;
-  return { format: 'volvox-graph/v1', inputs: cfgInputs, nodes: [node], outputs: ['y'] };
+  return {
+    format: 'volvox-graph/v1',
+    dimensions: {},
+    inputs: cfgInputs,
+    nodes: [node],
+    outputs: ['y'],
+  };
 }
 
 export function ensureDir(dir) { fs.mkdirSync(dir, { recursive: true }); return dir; }

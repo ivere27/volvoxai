@@ -80,6 +80,10 @@ VX_CONV_F32_ENTRY(const float**, vx_f32_igemm_indirection_cache,
      int sy, int sx, const int* pads, int dy, int dx),
     (node_idx, input, n, h, w, c, oh, ow, kh, kw, sy, sx, pads, dy, dx))
 
+VX_CONV_F32_ENTRY(const float*, vx_f32_igemm_pack_cache,
+    (int node_idx, const float* weights, int c, int out_channels, int ks),
+    (node_idx, weights, c, out_channels, ks))
+
 VX_CONV_F32_ENTRY(int, vx_conv2d_spatial_igemm_f32,
     (int node_idx, const float* input, float* output,
      const float* weights, const float* bias,

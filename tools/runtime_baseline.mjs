@@ -2,17 +2,24 @@
 
 import process from 'node:process';
 import { spawnSync } from 'node:child_process';
-import { readFile } from 'node:fs/promises';
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import { Graph, VolvoxAI } from '../ts/index.js';
+import {
+  Model,
+  VolvoxAI,
+  parseGraphDocument,
+} from '../ts/index.js';
 
 const SCHEMA = 'volvoxai.runtime-baseline/v1';
 const REFERENCE_SCHEMA = 'volvoxai.runtime-latency-reference/v1';
 const DEFAULT_REFERENCE = fileURLToPath(
   new URL('../tests/baselines/runtime_cpu_identity.json', import.meta.url),
 );
+const REPOSITORY_ROOT = fileURLToPath(new URL('../', import.meta.url));
+const MEASUREMENT_RUNS = 5;
 
 function integerArgument(name, fallback, minimum, maximum) {
   const prefix = `--${name}=`;
@@ -25,11 +32,22 @@ function integerArgument(name, fallback, minimum, maximum) {
 }
 
 function rejectUnknownArguments() {
-  const known = new Set(['samples', 'warmup', 'width', 'reference', 'latency-worker']);
+  const known = new Set([
+    'backend', 'samples', 'warmup', 'width', 'reference', 'wasm',
+    'native-build-dir', 'latency-worker',
+  ]);
   for (const argument of process.argv.slice(2)) {
     const match = /^--([^=]+)=/.exec(argument);
     if (!match || !known.has(match[1])) throw new Error(`unknown argument '${argument}'`);
   }
+}
+
+function backendArgument() {
+  const backend = stringArgument('backend', 'cpu');
+  if (!['cpu', 'wasm', 'native-cpu'].includes(backend)) {
+    throw new Error("--backend must be 'cpu', 'wasm', or 'native-cpu'");
+  }
+  return backend;
 }
 
 function stringArgument(name, fallback) {
@@ -90,13 +108,20 @@ async function latencyReference(filename, { samples, warmup, width }) {
 }
 
 function graphFor(width) {
-  const graph = new Graph();
-  const input = graph.addInput('x', [1, width]);
-  const output = graph.addOp('Identity', { input }, {
-    out: { name: 'y', shape: [1, width], dtype: 'float32' },
-  }).out;
-  graph.setOutputs(output);
-  return graph;
+  const graph = parseGraphDocument({
+    format: 'volvox-graph/v1',
+    dimensions: {},
+    inputs: { x: { dtype: 'float32', shape: [1, width] } },
+    nodes: [{
+      id: 'identity',
+      opType: 'Identity',
+      inputs: { input: 'x' },
+      outputs: { out: { tensor: 'y', dtype: 'float32', shape: [1, width] } },
+      params: {},
+    }],
+    outputs: ['y'],
+  }, []);
+  return Model.capture({ graph, weights: {} });
 }
 
 function memoryFields() {
@@ -129,6 +154,23 @@ function median(values) {
     : ordered[middle];
 }
 
+function percentile(values, fraction) {
+  if (!Array.isArray(values) || values.length === 0 ||
+      !Number.isFinite(fraction) || fraction <= 0 || fraction > 1) {
+    throw new Error('percentile requires samples and a fraction in (0, 1]');
+  }
+  const ordered = [...values].sort((left, right) => left - right);
+  return ordered[Math.ceil(fraction * ordered.length) - 1];
+}
+
+function populationVariance(values) {
+  if (!Array.isArray(values) || values.length === 0) {
+    throw new Error('variance requires at least one sample');
+  }
+  const mean = values.reduce((sum, value) => sum + value, 0) / values.length;
+  return values.reduce((sum, value) => sum + (value - mean) ** 2, 0) / values.length;
+}
+
 function sameBytes(left, right) {
   if (!ArrayBuffer.isView(left) || !ArrayBuffer.isView(right) ||
       left.byteLength !== right.byteLength) return false;
@@ -150,14 +192,16 @@ function byteDigest(value) {
   return digest;
 }
 
-async function stableHostReadEvidence(result, outputName) {
+async function stableHostReadEvidence(result, outputName, expected) {
   let first = await result.output(outputName).read();
   let second = await result.output(outputName).read();
   const evidence = {
     freshCallerOwnedReads: first !== second && first.buffer !== second.buffer &&
       sameBytes(first, second),
+    byteExactIdentity: sameBytes(first, expected),
     outputBytes: first.byteLength,
     digest: byteDigest(first),
+    expectedDigest: byteDigest(expected),
   };
   first = null;
   second = null;
@@ -171,11 +215,20 @@ async function resultDigest(result, outputName) {
   return digest;
 }
 
-async function collectRuntimeEvidence({ samples, warmup, width }) {
+async function collectRuntimeEvidence({ backend, samples, warmup, width, wasmUrl }) {
   const input = Float32Array.from({ length: width }, (_, index) => (index % 257) / 257);
-  const graph = graphFor(width);
-  const runtime = await VolvoxAI.createRuntime({ backends: ['cpu'] });
-  const model = runtime.createModel(graph);
+  const inputView = Object.freeze({ data: input, shape: Object.freeze([1, width]) });
+  const snapshot = graphFor(width);
+  const profileWasm = backend === 'wasm';
+  if (profileWasm) {
+    globalThis.__VOLVOX_WASM_COMPILE_PROFILE = true;
+    globalThis.__VOLVOX_WASM_COMPILE_PROFILE_RESULT = null;
+    globalThis.__VOLVOX_WASM_COMPILE_PROFILE_RESULTS = [];
+  }
+  const runtime = await VolvoxAI.createRuntime({
+    backends: [backend],
+    ...(profileWasm ? { wasmUrl } : {}),
+  });
   let compiled;
   let idleOne;
   let idleTwo;
@@ -183,15 +236,15 @@ async function collectRuntimeEvidence({ samples, warmup, width }) {
   let stableContext;
   let stableResult;
   try {
-    compiled = await model.compile({
-      backend: { mode: 'require', backend: 'cpu', operatorFallback: 'forbid' },
+    compiled = await runtime.compile(snapshot, {
+      backend: { mode: 'require', backend, operatorFallback: 'forbid' },
     });
     const compilationReport = compiled.report;
 
     // Initialize model-level caches before taking the retained-runtime baseline.
     const primerContext = await compiled.createContext();
     for (let index = 0; index < 4; index++) {
-      const primerResult = await primerContext.execute({ x: input });
+      const primerResult = await primerContext.execute({ x: inputView });
       await primerResult.output('y').read();
       await primerResult.output('y').read();
       await primerResult.close();
@@ -211,13 +264,13 @@ async function collectRuntimeEvidence({ samples, warmup, width }) {
 
     latencyContext = await compiled.createContext();
     for (let index = 0; index < warmup; index++) {
-      const result = await latencyContext.execute({ x: input });
+      const result = await latencyContext.execute({ x: inputView });
       await result.close();
     }
     const latencySamplesMs = [];
     for (let index = 0; index < samples; index++) {
       const started = performance.now();
-      const result = await latencyContext.execute({ x: input });
+      const result = await latencyContext.execute({ x: inputView });
       await result.close();
       latencySamplesMs.push(performance.now() - started);
     }
@@ -225,18 +278,24 @@ async function collectRuntimeEvidence({ samples, warmup, width }) {
     latencyContext = null;
 
     stableContext = await compiled.createContext();
+    // Provider contexts allocate activation capacity on first bind. Prime that
+    // context before isolating result-owned snapshot bytes.
+    const stablePrimer = await stableContext.execute({ x: inputView });
+    await stablePrimer.close();
     const beforeStableResult = await measuredMemory();
-    stableResult = await stableContext.execute({ x: input });
+    stableResult = await stableContext.execute({ x: inputView });
     const executionReport = stableResult.report;
     const stableResultAllocated = await measuredMemory();
-    const stableRead = await stableHostReadEvidence(stableResult, 'y');
+    const stableRead = await stableHostReadEvidence(stableResult, 'y', input);
     const freshCallerOwnedReads = stableRead.freshCallerOwnedReads;
+    const byteExactIdentity = stableRead.byteExactIdentity;
     const outputBytes = stableRead.outputBytes;
     const stableBytesDigest = stableRead.digest;
+    const expectedBytesDigest = stableRead.expectedDigest;
     const stableResultWithCallerReads = await measuredMemory();
 
     // Closing immediately after enqueue must drain the already accepted execution.
-    const acceptedExecution = stableContext.execute({ x: input });
+    const acceptedExecution = stableContext.execute({ x: inputView });
     const firstClose = stableContext.close();
     const secondClose = stableContext.close();
     const acceptedResult = await acceptedExecution;
@@ -255,9 +314,12 @@ async function collectRuntimeEvidence({ samples, warmup, width }) {
     const stableResultClosed = await measuredMemory();
 
     await compiled.close();
-    await model.close();
     await runtime.close();
     compiled = null;
+    const wasmCompileProfiles = profileWasm
+      ? [...(globalThis.__VOLVOX_WASM_COMPILE_PROFILE_RESULTS || [])]
+          .map((profile) => ({ ...profile }))
+      : [];
     return {
       compilationReport,
       executionReport,
@@ -272,6 +334,10 @@ async function collectRuntimeEvidence({ samples, warmup, width }) {
       stableResultClosed,
       latencySamplesMs,
       outputBytes,
+      byteExactIdentity,
+      stableBytesDigest,
+      expectedBytesDigest,
+      wasmCompileProfiles,
       freshCallerOwnedReads,
       readableAfterContextClose,
       acceptedWorkDrained: true,
@@ -285,8 +351,12 @@ async function collectRuntimeEvidence({ samples, warmup, width }) {
     await idleTwo?.close();
     await idleOne?.close();
     await compiled?.close();
-    await model.close();
     await runtime.close();
+    if (profileWasm) {
+      delete globalThis.__VOLVOX_WASM_COMPILE_PROFILE;
+      delete globalThis.__VOLVOX_WASM_COMPILE_PROFILE_RESULT;
+      delete globalThis.__VOLVOX_WASM_COMPILE_PROFILE_RESULTS;
+    }
   }
 }
 
@@ -305,10 +375,12 @@ function installDiagnosticConsole() {
   };
 }
 
-async function runLatencyWorker(samples, warmup, width) {
+async function runLatencyWorker(backend, samples, warmup, width, wasmUrl) {
   const restoreConsole = installDiagnosticConsole();
   try {
-    const measurement = await collectRuntimeEvidence({ samples, warmup, width });
+    const measurement = await collectRuntimeEvidence({
+      backend, samples, warmup, width, wasmUrl,
+    });
     process.stdout.write(`${JSON.stringify({
       samplesMs: measurement.latencySamplesMs,
       medianMs: median(measurement.latencySamplesMs),
@@ -318,7 +390,7 @@ async function runLatencyWorker(samples, warmup, width) {
   }
 }
 
-function additionalLatencyRuns(count, samples, warmup, width) {
+function additionalLatencyRuns(count, backend, samples, warmup, width, wasmUrl) {
   const runs = [];
   const script = fileURLToPath(import.meta.url);
   for (let index = 1; index < count; index++) {
@@ -326,9 +398,11 @@ function additionalLatencyRuns(count, samples, warmup, width) {
       ...process.execArgv,
       script,
       '--latency-worker=1',
+      `--backend=${backend}`,
       `--samples=${samples}`,
       `--warmup=${warmup}`,
       `--width=${width}`,
+      ...(backend === 'wasm' ? [`--wasm=${wasmUrl}`] : []),
     ], {
       cwd: process.cwd(),
       encoding: 'utf8',
@@ -356,33 +430,236 @@ function additionalLatencyRuns(count, samples, warmup, width) {
   return runs;
 }
 
-async function main() {
-  rejectUnknownArguments();
-  if (typeof globalThis.gc !== 'function') {
-    throw new Error('explicit GC is required; run through npm run baseline:runtime');
+function checkedSpawn(command, args, options, label) {
+  const child = spawnSync(command, args, {
+    encoding: 'utf8',
+    maxBuffer: 4 * 1024 * 1024,
+    ...options,
+  });
+  if (child.error) throw child.error;
+  if (child.status !== 0) {
+    throw new Error(
+      `${label} failed: ${child.stderr?.trim() || child.stdout?.trim() || `exit ${child.status}`}`,
+    );
   }
-  const samples = integerArgument('samples', 51, 3, 101);
-  const warmup = integerArgument('warmup', 10, 0, 20);
-  const width = integerArgument('width', 65_536, 1, 1_048_576);
-  const workerArgument = process.argv.slice(2).find((argument) =>
-    argument.startsWith('--latency-worker='));
-  if (workerArgument != null) {
-    if (workerArgument !== '--latency-worker=1') {
-      throw new Error('--latency-worker is an internal flag and must equal 1');
-    }
-    await runLatencyWorker(samples, warmup, width);
-    return;
-  }
-  const reference = await latencyReference(
-    stringArgument('reference', DEFAULT_REFERENCE),
-    { samples, warmup, width },
+  return child;
+}
+
+async function buildNativeBaselineWorker(buildDirectory, temporaryDirectory) {
+  const nativeBuildDirectory = path.join(buildDirectory, 'native');
+  const linkFile = path.join(
+    nativeBuildDirectory,
+    'CMakeFiles',
+    'volvoxai_cpu_only.dir',
+    'link.txt',
   );
+  let linkCommand;
+  try {
+    linkCommand = (await readFile(linkFile, 'utf8')).trim();
+  } catch (error) {
+    throw new Error(
+      `cannot read '${linkFile}'; run 'make build_native' first: ${error.message}`,
+    );
+  }
+  const tokens = (linkCommand.match(/[^\s"']+|"[^"]*"|'[^']*'/gu) || []).map(
+    (token) => (/^(["']).*\1$/u.test(token) ? token.slice(1, -1) : token),
+  );
+  const compiler = tokens.shift();
+  if (!compiler || tokens.some((token) => /["']/.test(token))) {
+    throw new Error(`native CPU link command '${linkFile}' is unsupported`);
+  }
+  const mainObjectIndex = tokens.findIndex((token) => token.endsWith('/cli/main.c.o'));
+  const outputIndex = tokens.indexOf('-o');
+  if (mainObjectIndex < 0 || outputIndex < 0 || outputIndex + 1 >= tokens.length) {
+    throw new Error(`native CPU link command '${linkFile}' has no replaceable CLI entry`);
+  }
+
+  const source = path.join(REPOSITORY_ROOT, 'tools', 'native_runtime_baseline.c');
+  const object = path.join(temporaryDirectory, 'native_runtime_baseline.o');
+  const executable = path.join(temporaryDirectory, 'native_runtime_baseline');
+  checkedSpawn(compiler, [
+    '-std=c11', '-O2', '-Wall', '-Wextra', '-Werror',
+    '-I', path.join(REPOSITORY_ROOT, 'native', 'include'),
+    '-c', source, '-o', object,
+  ], { cwd: REPOSITORY_ROOT }, 'native baseline helper compilation');
+
+  tokens.splice(mainObjectIndex, 1);
+  const adjustedOutputIndex = tokens.indexOf('-o');
+  tokens.splice(adjustedOutputIndex, 0, object);
+  tokens[adjustedOutputIndex + 2] = executable;
+  checkedSpawn(compiler, tokens, { cwd: nativeBuildDirectory },
+    'native baseline helper link');
+  return Object.freeze({ executable, compiler, linkFile });
+}
+
+function nativeGraphDocument(width) {
+  return {
+    format: 'volvox-graph/v1',
+    dimensions: {},
+    inputs: { x: { shape: [1, width], dtype: 'float32' } },
+    nodes: [{
+      id: 'identity',
+      opType: 'Identity',
+      inputs: { input: 'x' },
+      outputs: { out: { tensor: 'y', dtype: 'float32', shape: [1, width] } },
+      params: {},
+    }],
+    outputs: ['y'],
+  };
+}
+
+function parseNativeWorker(child, runIndex, samples) {
+  const lines = child.stdout.trim().split(/\r?\n/u).filter(Boolean);
+  if (lines.length === 0) {
+    throw new Error(`native baseline worker ${runIndex + 1} returned no JSON`);
+  }
+  if (lines.length > 1) {
+    process.stderr.write(`${lines.slice(0, -1).join('\n')}\n`);
+  }
+  let result;
+  try {
+    result = JSON.parse(lines.at(-1));
+  } catch {
+    throw new Error(`native baseline worker ${runIndex + 1} returned invalid JSON`);
+  }
+  if (result?.schema !== 'volvoxai.native-runtime-baseline-worker/v1' ||
+      !Array.isArray(result?.latency?.samplesMs) ||
+      result.latency.samplesMs.length !== samples ||
+      result.latency.samplesMs.some((value) => !Number.isFinite(value) || value < 0) ||
+      !Number.isFinite(result?.compilation?.compileTimeMs) ||
+      result.compilation.compileTimeMs < 0 ||
+      result?.parity?.byteExactIdentity !== true) {
+    throw new Error(`native baseline worker ${runIndex + 1} returned invalid evidence`);
+  }
+  return result;
+}
+
+async function nativeRuntimeBaseline({ samples, warmup, width, buildDirectory }) {
+  const temporaryDirectory = await mkdtemp(path.join(tmpdir(), 'volvoxai-native-baseline-'));
+  try {
+    const graphPath = path.join(temporaryDirectory, 'graph.json');
+    await writeFile(graphPath, `${JSON.stringify(nativeGraphDocument(width))}\n`, 'utf8');
+    const worker = await buildNativeBaselineWorker(buildDirectory, temporaryDirectory);
+    const runs = [];
+    for (let runIndex = 0; runIndex < MEASUREMENT_RUNS; runIndex++) {
+      const child = checkedSpawn(worker.executable, [
+        graphPath, String(width), String(warmup), String(samples),
+      ], { cwd: REPOSITORY_ROOT }, `native baseline worker ${runIndex + 1}`);
+      runs.push(parseNativeWorker(child, runIndex, samples));
+    }
+    const latencyRunsMs = runs.map((run) => run.latency.samplesMs);
+    const latencySamplesMs = latencyRunsMs.flat();
+    const compileSamplesMs = runs.map((run) => run.compilation.compileTimeMs);
+    const runMediansMs = latencyRunsMs.map(median);
+    const first = runs[0];
+    const expectedDigest = first.parity.expectedDigest;
+    if (runs.some((run) => run.parity.expectedDigest !== expectedDigest ||
+        run.parity.actualDigest !== expectedDigest)) {
+      throw new Error('native baseline runs disagree on Identity parity digest');
+    }
+    return {
+      schema: SCHEMA,
+      recordedAt: new Date().toISOString(),
+      environment: {
+        runtime: 'native',
+        version: `native-api-v${first.nativeApiVersion}`,
+        platform: process.platform,
+        architecture: process.arch,
+        backend: 'native-cpu',
+        cpuThreads: 1,
+        buildDirectory: path.relative(REPOSITORY_ROOT, buildDirectory) || '.',
+        linkDescription: path.relative(REPOSITORY_ROOT, worker.linkFile),
+        compiler: worker.compiler,
+      },
+      workload: {
+        ...first.workload,
+        measurementRuns: MEASUREMENT_RUNS,
+      },
+      latency: {
+        samplesMs: latencySamplesMs,
+        runMediansMs,
+        p50Ms: percentile(latencySamplesMs, 0.5),
+        p95Ms: percentile(latencySamplesMs, 0.95),
+        varianceMs2: populationVariance(latencySamplesMs),
+        medianOfRunMediansMs: median(runMediansMs),
+        minimumMs: Math.min(...latencySamplesMs),
+        maximumMs: Math.max(...latencySamplesMs),
+        source: 'VxReport.execution_time_ms',
+        gate: null,
+      },
+      compilation: {
+        samplesMs: compileSamplesMs,
+        p50Ms: percentile(compileSamplesMs, 0.5),
+        p95Ms: percentile(compileSamplesMs, 0.95),
+        minimumMs: Math.min(...compileSamplesMs),
+        maximumMs: Math.max(...compileSamplesMs),
+        reportedAllocationBytes: runs.map((run) =>
+          run.compilation.reportedAllocationBytes),
+      },
+      allocation: {
+        ...first.allocation,
+        semantics: {
+          reported: 'public VxReport retained lineage; execution includes the owned result snapshot',
+          logical: 'sum of concrete public input and output tensor bytes',
+        },
+      },
+      memory: {
+        metric: 'process-rss',
+        runs: runs.map((run) => run.memory),
+        maximumSampledCurrentBytes: Math.max(...runs.flatMap((run) =>
+          Object.values(run.memory.currentBytes))),
+        maximumSampledCurrentDeltaFromRetainedBaselineBytes: Math.max(
+          ...runs.map((run) => Math.max(...Object.values(run.memory.currentBytes)) -
+            run.memory.currentBytes.retainedBaseline),
+        ),
+        maximumHighWaterBytes: Math.max(...runs.map((run) => run.memory.highWaterBytes)),
+        maximumHighWaterDeltaBytes: Math.max(
+          ...runs.map((run) => run.memory.highWaterDeltaBytes),
+        ),
+        limitation: 'RSS is process-level; allocator-exact native tensor high-water is not exposed before the redesign.',
+      },
+      snapshot: {
+        outputBytes: first.allocation.resultSnapshotBytes,
+        byteExactIdentity: true,
+        expectedDigest,
+        actualDigest: expectedDigest,
+      },
+      runtime: {
+        runs: runs.map((run) => ({
+          compilation: run.compilation,
+          allocation: run.allocation,
+        })),
+      },
+    };
+  } finally {
+    await rm(temporaryDirectory, { recursive: true, force: true });
+  }
+}
+
+function sampledMemoryHighWater(snapshots) {
+  const fields = Object.keys(snapshots[0][1]);
+  return Object.fromEntries(fields.map((field) => [
+    field,
+    Math.max(...snapshots.map(([, snapshot]) => snapshot[field])),
+  ]));
+}
+
+async function javascriptRuntimeBaseline({ backend, samples, warmup, width, wasmUrl }) {
+  const reference = backend === 'cpu'
+    ? await latencyReference(
+        stringArgument('reference', DEFAULT_REFERENCE),
+        { samples, warmup, width },
+      )
+    : null;
+  const measurementRuns = reference?.measurementRuns || MEASUREMENT_RUNS;
   const restoreConsole = installDiagnosticConsole();
   try {
-    const measurements = await collectRuntimeEvidence({ samples, warmup, width });
+    const measurements = await collectRuntimeEvidence({
+      backend, samples, warmup, width, wasmUrl,
+    });
     // Collect after the lifecycle's async frame has returned. Await expressions
     // may retain their resolved caller-owned arrays until that frame completes;
-    // those arrays are not runtime resources and must not contaminate this gate.
+    // those arrays are not runtime resources and must not contaminate the CPU gate.
     const allOwnersClosed = await measuredMemory();
     const {
       compilationReport,
@@ -398,6 +675,10 @@ async function main() {
       stableResultClosed,
       latencySamplesMs: firstLatencySamplesMs,
       outputBytes,
+      byteExactIdentity,
+      stableBytesDigest,
+      expectedBytesDigest,
+      wasmCompileProfiles,
       freshCallerOwnedReads,
       readableAfterContextClose,
       acceptedWorkDrained,
@@ -407,15 +688,20 @@ async function main() {
 
     const latencyRunsMs = [
       firstLatencySamplesMs,
-      ...additionalLatencyRuns(reference.measurementRuns, samples, warmup, width),
+      ...additionalLatencyRuns(
+        measurementRuns, backend, samples, warmup, width, wasmUrl,
+      ),
     ];
     const latencyRunMediansMs = latencyRunsMs.map(median);
     const latencySamplesMs = latencyRunsMs.flat();
     const medianMs = median(latencyRunMediansMs);
-    const maximumMedianMs = reference.medianMs *
-      (1 + reference.maximumRegressionPercent / 100);
-    const regressionPercent = ((medianMs / reference.medianMs) - 1) * 100;
-    const latencyGatePassed = medianMs <= maximumMedianMs;
+    const maximumMedianMs = reference
+      ? reference.medianMs * (1 + reference.maximumRegressionPercent / 100)
+      : null;
+    const regressionPercent = reference
+      ? ((medianMs / reference.medianMs) - 1) * 100
+      : null;
+    const latencyGatePassed = reference ? medianMs <= maximumMedianMs : null;
     const alignedOutputBytes = Math.ceil(outputBytes / 256) * 256;
     const oneIdleBytes = memoryDelta(oneIdleContext, retainedBaseline).arrayBufferBytes;
     const twoIdleBytes = memoryDelta(twoIdleContexts, retainedBaseline).arrayBufferBytes;
@@ -424,13 +710,26 @@ async function main() {
     const allOwnersClosedBytes = memoryDelta(allOwnersClosed, retainedBaseline).arrayBufferBytes;
     const stableSnapshotBytes =
       memoryDelta(stableResultAllocated, beforeStableResult).arrayBufferBytes;
-    const memoryGatePassed = oneIdleBytes > 0 &&
-      twoIdleBytes <= oneIdleBytes * 2.2 &&
+    const memoryGatePassed = backend === 'cpu' ? oneIdleBytes >= 0 &&
+      twoIdleBytes <= Math.max(oneIdleBytes, 0) * 2.2 &&
       stableSnapshotBytes <= alignedOutputBytes * 1.1 &&
       idleContextsClosedBytes <= 0 &&
-      allOwnersClosedBytes <= 0;
+      allOwnersClosedBytes <= 0 : null;
     const disposalGatePassed = acceptedWorkDrained && contextCloseIsIdempotent &&
-      resultCloseIsIdempotent && freshCallerOwnedReads && readableAfterContextClose;
+      resultCloseIsIdempotent && freshCallerOwnedReads && readableAfterContextClose &&
+      byteExactIdentity && stableBytesDigest === expectedBytesDigest;
+    const memorySnapshots = [
+      ['retainedBaseline', retainedBaseline],
+      ['oneIdleContext', oneIdleContext],
+      ['twoIdleContexts', twoIdleContexts],
+      ['idleContextsClosed', idleContextsClosed],
+      ['beforeStableResult', beforeStableResult],
+      ['stableResultAllocated', stableResultAllocated],
+      ['stableResultWithCallerReads', stableResultWithCallerReads],
+      ['stableResultAfterContextClose', stableResultAfterContextClose],
+      ['stableResultClosed', stableResultClosed],
+      ['allOwnersClosed', allOwnersClosed],
+    ];
 
     const evidence = {
       schema: SCHEMA,
@@ -440,8 +739,9 @@ async function main() {
         version: process.version,
         platform: process.platform,
         architecture: process.arch,
-        backend: 'cpu',
+        backend,
         explicitGc: true,
+        ...(backend === 'wasm' ? { wasmArtifact: path.relative(process.cwd(), wasmUrl) } : {}),
       },
       workload: {
         operation: 'Identity',
@@ -449,15 +749,21 @@ async function main() {
         shape: [1, width],
         warmupExecutions: warmup,
         measuredExecutions: samples,
-        measurementRuns: reference.measurementRuns,
+        measurementRuns,
+        logicalInputBytes: width * Float32Array.BYTES_PER_ELEMENT,
+        logicalOutputBytes: width * Float32Array.BYTES_PER_ELEMENT,
+        logicalLiveTensorBytes: width * Float32Array.BYTES_PER_ELEMENT * 2,
       },
       latency: {
         samplesMs: latencySamplesMs,
         runMediansMs: latencyRunMediansMs,
+        p50Ms: percentile(latencySamplesMs, 0.5),
+        p95Ms: percentile(latencySamplesMs, 0.95),
+        varianceMs2: populationVariance(latencySamplesMs),
         medianMs,
         minimumMs: Math.min(...latencySamplesMs),
         maximumMs: Math.max(...latencySamplesMs),
-        gate: {
+        gate: reference ? {
           referenceSchema: REFERENCE_SCHEMA,
           referenceFile: path.relative(process.cwd(), reference.filename) || '.',
           referenceRecordedAt: reference.recordedAt,
@@ -466,7 +772,14 @@ async function main() {
           maximumMedianMs,
           regressionPercent,
           passed: latencyGatePassed,
-        },
+        } : null,
+      },
+      allocation: {
+        compilationReportedBytes: compilationReport.allocationBytes,
+        logicalInputBytes: width * Float32Array.BYTES_PER_ELEMENT,
+        logicalOutputBytes: outputBytes,
+        logicalLiveTensorBytes: width * Float32Array.BYTES_PER_ELEMENT + outputBytes,
+        resultSnapshotBytes: outputBytes,
       },
       memory: {
         retainedBaseline,
@@ -479,6 +792,9 @@ async function main() {
         stableResultAfterContextClose,
         stableResultClosed,
         allOwnersClosed,
+        sampledProcessHighWater: sampledMemoryHighWater(memorySnapshots),
+        sampledProcessHighWaterSemantics:
+          'maximum of the forced-GC process snapshots above, not an allocator event trace',
         deltasFromRetainedBaseline: {
           oneIdleContext: memoryDelta(oneIdleContext, retainedBaseline),
           twoIdleContexts: memoryDelta(twoIdleContexts, retainedBaseline),
@@ -491,38 +807,58 @@ async function main() {
           afterContextClose: memoryDelta(stableResultAfterContextClose, beforeStableResult),
           closed: memoryDelta(stableResultClosed, beforeStableResult),
         },
+        ...(backend === 'wasm' ? {
+          wasmLinearMemory: {
+            contextProfiles: wasmCompileProfiles,
+            maximumContextHeapBytes: Math.max(
+              0, ...wasmCompileProfiles.map((profile) => profile.finalHeapBytes || 0),
+            ),
+            twoConcurrentIdleContextHeapBytes: wasmCompileProfiles.length >= 3
+              ? wasmCompileProfiles[1].finalHeapBytes + wasmCompileProfiles[2].finalHeapBytes
+              : null,
+            totalObservedGrowCount: wasmCompileProfiles.reduce(
+              (sum, profile) => sum + (profile.growCount || 0), 0,
+            ),
+            semantics:
+              'opt-in per-context WasmEngine allocation profiles; closed heaps are not counted as live capacity',
+          },
+        } : {}),
       },
       snapshot: {
         outputBytes,
         alignedOutputBytes,
         freshCallerOwnedReads,
         readableAfterContextClose,
+        byteExactIdentity,
+        expectedDigest: expectedBytesDigest,
+        actualDigest: stableBytesDigest,
       },
       disposal: {
         acceptedWorkDrained,
         contextCloseIsIdempotent,
         resultCloseIsIdempotent,
-        allOwnersClosed: allOwnersClosedBytes <= 0,
+        allOwnersClosed: backend === 'cpu' ? allOwnersClosedBytes <= 0 : null,
       },
       runtime: {
         compilation: compilationReport,
         execution: executionReport,
       },
-      budgets: {
+      budgets: backend === 'cpu' ? {
         medianOneContextLatencyRegressionPercent: reference.maximumRegressionPercent,
         twoIdleContextsToOneMutableStorageRatio: 2.2,
+        idleContextAllocation: 'lazy',
         stableSnapshotBookkeepingPercent: 10,
         closedUnretainedResourcesReturnToBaseline: true,
-      },
+      } : null,
     };
     process.stdout.write(`${JSON.stringify(evidence, null, 2)}\n`);
-    if (!latencyGatePassed) {
+    if (backend === 'cpu' && !latencyGatePassed) {
       throw new Error(
         `median one-context latency ${medianMs.toFixed(6)} ms exceeds the committed ` +
         `${maximumMedianMs.toFixed(6)} ms budget`,
       );
     }
-    if (!memoryGatePassed) {
+    if (backend === 'cpu' && !memoryGatePassed) {
       throw new Error(
         'runtime ownership memory budget failed: ' +
         `oneIdle=${oneIdleBytes}, twoIdle=${twoIdleBytes}, ` +
@@ -531,11 +867,53 @@ async function main() {
       );
     }
     if (!disposalGatePassed) {
-      throw new Error('runtime lifecycle/disposal evidence failed');
+      throw new Error('runtime lifecycle/disposal or byte-parity evidence failed');
     }
   } finally {
     restoreConsole();
   }
+}
+
+async function main() {
+  rejectUnknownArguments();
+  const backend = backendArgument();
+  const samples = integerArgument('samples', 51, 3, 101);
+  const warmup = integerArgument('warmup', 10, 0, 20);
+  const width = integerArgument('width', 65_536, 1, 1_048_576);
+  const wasmUrl = backend === 'wasm'
+    ? path.resolve(stringArgument('wasm', ''))
+    : null;
+  const workerArgument = process.argv.slice(2).find((argument) =>
+    argument.startsWith('--latency-worker='));
+  if (workerArgument != null) {
+    if (workerArgument !== '--latency-worker=1') {
+      throw new Error('--latency-worker is an internal flag and must equal 1');
+    }
+    if (backend === 'native-cpu') {
+      throw new Error('--latency-worker does not support native-cpu');
+    }
+    if (typeof globalThis.gc !== 'function') {
+      throw new Error('explicit GC is required; run through npm run baseline:runtime');
+    }
+    await runLatencyWorker(backend, samples, warmup, width, wasmUrl);
+    return;
+  }
+  if (backend === 'native-cpu') {
+    const evidence = await nativeRuntimeBaseline({
+      samples,
+      warmup,
+      width,
+      buildDirectory: path.resolve(
+        stringArgument('native-build-dir', 'build/cmake'),
+      ),
+    });
+    process.stdout.write(`${JSON.stringify(evidence, null, 2)}\n`);
+    return;
+  }
+  if (typeof globalThis.gc !== 'function') {
+    throw new Error('explicit GC is required; run through npm run baseline:runtime');
+  }
+  await javascriptRuntimeBaseline({ backend, samples, warmup, width, wasmUrl });
 }
 
 main().catch((error) => {

@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
-import { Graph } from '../ts/core/Graph.js';
+import { RuntimeGraph } from '../ts/core/RuntimeGraph.js';
 import { _cpuQLayerNorm } from '../ts/ops/qLayerNorm.js';
 
 function byteStorage(dtype, values) {
@@ -24,7 +24,7 @@ function qLayerNormGraph({
   eps = 1e-5,
   dModel,
 } = {}) {
-  const graph = new Graph();
+  const graph = new RuntimeGraph();
   const input = graph.addInput('input', inputShape, inputDtype, {
     buffer: byteStorage(inputDtype, inputValues), quantization: inputQuantization,
   });

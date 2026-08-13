@@ -135,6 +135,16 @@ function benchmarkCase(spec) {
 
 const cases = [
   {
+    name: 'encoder attention M=218 K=40 N=218 U8S8',
+    m: 218,
+    k: 40,
+    n: 218,
+    aDtype: VX_DTYPE_U8,
+    bDtype: VX_DTYPE_I8,
+    outputDtype: VX_DTYPE_I8,
+    iterations: 100,
+  },
+  {
     name: 'decoder M=1 K=320 N=320 U8S8',
     m: 1,
     k: 320,

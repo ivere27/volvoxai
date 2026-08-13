@@ -4,7 +4,6 @@
 
 #include "volvoxai.h"
 
-#include "cJSON.h"
 #include "image_io.h"
 
 #include <errno.h>
@@ -37,6 +36,9 @@
 typedef struct Binding {
     char name[128];
     char path[PATH_MAX];
+    int64_t shape[VX_MAX_TENSOR_RANK];
+    uint32_t rank;
+    int has_shape;
 } Binding;
 
 typedef struct ModelPaths {
@@ -57,7 +59,6 @@ typedef struct TaskOptions {
     int debug;
     int cpu_threads;
     int image_normalization;
-    int image_normalization_explicit;
     int warmup_runs;
     int timed_runs;
     int include_transfers;
@@ -69,8 +70,10 @@ typedef struct TaskSession {
     VxCompiledModel* compiled;
     VxExecutionContext* context;
     VxResult* result;
+    VxTensorBinding input_bindings[MAX_BINDINGS];
+    void* input_storage[MAX_BINDINGS];
+    size_t input_binding_count;
     VxReport report;
-    char graph_path[PATH_MAX];
 } TaskSession;
 
 typedef struct LabelList {
@@ -151,6 +154,7 @@ static const char* discover_file(const char* model, const char* explicit_path,
 
 static int parse_binding(const char* argument, Binding* binding, int require_name) {
     const char* equals;
+    const char* shape_open = NULL;
     size_t name_length;
     if (!argument || !binding) return -1;
     memset(binding, 0, sizeof(*binding));
@@ -161,6 +165,34 @@ static int parse_binding(const char* argument, Binding* binding, int require_nam
         return binding->path[0] ? 0 : -1;
     }
     name_length = (size_t)(equals - argument);
+    if (name_length && argument[name_length - 1u] == ']') {
+        const char* cursor;
+        const char* shape_end = equals - 1;
+        for (cursor = shape_end; cursor > argument; cursor--)
+            if (cursor[-1] == '[') {
+                shape_open = cursor - 1;
+                break;
+            }
+        if (!shape_open || shape_open == argument) return -1;
+        cursor = shape_open + 1;
+        while (cursor < shape_end) {
+            char* parsed_end = NULL;
+            unsigned long long extent;
+            if (binding->rank == VX_MAX_TENSOR_RANK ||
+                *cursor < '1' || *cursor > '9') return -1;
+            errno = 0;
+            extent = strtoull(cursor, &parsed_end, 10);
+            if (errno == ERANGE || !parsed_end || parsed_end == cursor ||
+                extent > (unsigned long long)INT64_MAX ||
+                parsed_end > shape_end ||
+                (parsed_end < shape_end && *parsed_end != ',')) return -1;
+            binding->shape[binding->rank++] = (int64_t)extent;
+            cursor = parsed_end < shape_end ? parsed_end + 1 : parsed_end;
+        }
+        if (!binding->rank) return -1;
+        binding->has_shape = 1;
+        name_length = (size_t)(shape_open - argument);
+    }
     if (!name_length || name_length >= sizeof(binding->name) || !equals[1]) return -1;
     memcpy(binding->name, argument, name_length);
     binding->name[name_length] = 0;
@@ -256,7 +288,9 @@ static int parse_common_option(int argc, char** argv, int* index,
     if (!strcmp(argument, "--input")) {
         if (*index + 1 >= argc || options->input_count == MAX_BINDINGS ||
             parse_binding(argv[++(*index)], &options->inputs[options->input_count], 1) != 0) {
-            fprintf(stderr, "--input expects name=file.\n");
+            fprintf(stderr,
+                    "--input expects name=file for a fixed input or "
+                    "name[d0,d1,...]=file for a dynamic input.\n");
             return -1;
         }
         options->input_count++;
@@ -265,7 +299,9 @@ static int parse_common_option(int argc, char** argv, int* index,
     if (!strcmp(argument, "--image")) {
         if (*index + 1 >= argc || options->image_count == MAX_BINDINGS ||
             parse_binding(argv[++(*index)], &options->images[options->image_count], 1) != 0) {
-            fprintf(stderr, "--image expects name=file.\n");
+            fprintf(stderr,
+                    "--image expects name=file for a fixed input or "
+                    "name[d0,d1,...]=file for a dynamic input.\n");
             return -1;
         }
         options->image_count++;
@@ -287,7 +323,6 @@ static int parse_common_option(int argc, char** argv, int* index,
                     "--image-normalize expects zero-one, minus-one-one, or raw-255.\n");
             return -1;
         }
-        options->image_normalization_explicit = 1;
         return 1;
     }
     return 0;
@@ -364,14 +399,15 @@ static int read_file(const char* path, void** bytes, size_t* size) {
     return 0;
 }
 
-static int find_input(TaskSession* session, const char* name, VxTensorInfo* found) {
+static int find_input(TaskSession* session, const char* name,
+                      VxTensorSpec* found) {
     size_t count = vx_execution_context_input_count(session->context);
     for (size_t index = 0; index < count; index++) {
-        VxTensorInfo info = VX_TENSOR_INFO_INIT;
-        if (vx_execution_context_input_info(session->context, index, &info,
+        VxTensorSpec spec = VX_TENSOR_SPEC_INIT;
+        if (vx_execution_context_input_spec(session->context, index, &spec,
                                             &session->report) == VX_STATUS_OK &&
-            info.name && !strcmp(info.name, name)) {
-            *found = info;
+            spec.name && !strcmp(spec.name, name)) {
+            *found = spec;
             return 0;
         }
     }
@@ -379,17 +415,88 @@ static int find_input(TaskSession* session, const char* name, VxTensorInfo* foun
     return -1;
 }
 
+static size_t dtype_byte_size(VxDataType dtype) {
+    switch (dtype) {
+        case VX_DTYPE_I8:
+        case VX_DTYPE_U8: return 1u;
+        case VX_DTYPE_F32:
+        case VX_DTYPE_I32: return 4u;
+        default: return 0u;
+    }
+}
+
+static int prepare_binding_descriptor(TaskSession* session,
+                                      const Binding* source,
+                                      const VxTensorSpec* spec,
+                                      VxTensorBinding* prepared) {
+    size_t byte_size = dtype_byte_size(spec->dtype);
+    if (!byte_size || spec->rank > VX_MAX_TENSOR_RANK ||
+        (source->has_shape && source->rank != spec->rank)) {
+        fprintf(stderr, "Input %s has an unsupported dtype or rank.\n",
+                source->name);
+        return -1;
+    }
+    *prepared = (VxTensorBinding)VX_TENSOR_BINDING_INIT;
+    prepared->name = spec->name;
+    prepared->dtype = spec->dtype;
+    prepared->rank = spec->rank;
+    for (uint32_t axis = 0; axis < spec->rank; axis++) {
+        int64_t extent;
+        if (source->has_shape) {
+            extent = source->shape[axis];
+        } else if (spec->dimensions[axis].kind == VX_DIMENSION_FIXED) {
+            extent = spec->dimensions[axis].min;
+        } else {
+            fprintf(stderr,
+                    "Dynamic input %s requires an explicit shape: "
+                    "%s[d0,d1,...]=file.\n",
+                    source->name, source->name);
+            return -1;
+        }
+        if (extent <= 0 || (uint64_t)extent > SIZE_MAX / byte_size) {
+            fprintf(stderr, "Input %s shape is too large.\n", source->name);
+            return -1;
+        }
+        prepared->shape[axis] = extent;
+        byte_size *= (size_t)extent;
+    }
+    prepared->byte_size = byte_size;
+    prepared->location = VX_MEMORY_HOST;
+    (void)session;
+    return 0;
+}
+
+static int append_prepared_input(TaskSession* session,
+                                 const VxTensorBinding* prepared,
+                                 void* storage) {
+    if (!session || !prepared || !storage ||
+        session->input_binding_count >= MAX_BINDINGS) return -1;
+    for (size_t index = 0; index < session->input_binding_count; index++)
+        if (!strcmp(session->input_bindings[index].name, prepared->name)) {
+            fprintf(stderr, "Input %s was bound more than once.\n",
+                    prepared->name);
+            return -1;
+        }
+    session->input_bindings[session->input_binding_count] = *prepared;
+    session->input_bindings[session->input_binding_count].data = storage;
+    session->input_storage[session->input_binding_count] = storage;
+    session->input_binding_count++;
+    return 0;
+}
+
 static int set_raw_input(TaskSession* session, const Binding* binding) {
-    VxTensorInfo info = VX_TENSOR_INFO_INIT;
+    VxTensorSpec spec = VX_TENSOR_SPEC_INIT;
+    VxTensorBinding prepared = VX_TENSOR_BINDING_INIT;
     const char* suffix;
     void* bytes = NULL;
     size_t size = 0;
-    VxStatus status;
-    if (find_input(session, binding->name, &info) != 0) return -1;
-    suffix = dtype_suffix(info.dtype);
+    if (find_input(session, binding->name, &spec) != 0 ||
+        prepare_binding_descriptor(session, binding, &spec, &prepared) != 0)
+        return -1;
+    suffix = dtype_suffix(spec.dtype);
     if (!suffix || !has_suffix(binding->path, suffix)) {
         fprintf(stderr, "Input %s has dtype %s and requires a %s file: %s\n",
-                binding->name, dtype_name(info.dtype), suffix ? suffix : "supported raw",
+                binding->name, dtype_name(spec.dtype), suffix ? suffix : "supported raw",
                 binding->path);
         return -1;
     }
@@ -397,69 +504,17 @@ static int set_raw_input(TaskSession* session, const Binding* binding) {
         fprintf(stderr, "Cannot read input file: %s\n", binding->path);
         return -1;
     }
-    if (size != info.byte_size) {
+    if (size != prepared.byte_size) {
         fprintf(stderr, "Input %s expects %zu raw bytes, got %zu from %s\n",
-                binding->name, info.byte_size, size, binding->path);
+                binding->name, prepared.byte_size, size, binding->path);
         free(bytes);
         return -1;
     }
-    status = vx_execution_context_set_input(session->context, binding->name,
-                                            info.dtype, bytes, size,
-                                            &session->report);
-    free(bytes);
-    if (status != VX_STATUS_OK) {
-        print_failure("Setting input", status, &session->report);
+    if (append_prepared_input(session, &prepared, bytes) != 0) {
+        free(bytes);
         return -1;
     }
     return 0;
-}
-
-static int read_graph_root(const char* path, cJSON** root) {
-    void* bytes = NULL;
-    size_t size = 0;
-    char* text;
-    if (!root || read_file(path, &bytes, &size) != 0 || size == SIZE_MAX) {
-        free(bytes);
-        return -1;
-    }
-    text = (char*)realloc(bytes, size + 1);
-    if (!text) {
-        free(bytes);
-        return -1;
-    }
-    text[size] = 0;
-    *root = cJSON_Parse(text);
-    free(text);
-    return *root ? 0 : -1;
-}
-
-static int image_metadata(const char* graph_path, const char* input_name,
-                          int* normalization) {
-    cJSON* root = NULL;
-    cJSON* inputs;
-    cJSON* input;
-    cJSON* normalization_json;
-    const char* value = NULL;
-    int result = -1;
-    if (read_graph_root(graph_path, &root) != 0) return -1;
-    inputs = cJSON_GetObjectItemCaseSensitive(root, "inputs");
-    input = cJSON_IsObject(inputs)
-        ? cJSON_GetObjectItemCaseSensitive(inputs, input_name) : NULL;
-    if (!cJSON_IsObject(input)) goto cleanup;
-    normalization_json = cJSON_GetObjectItemCaseSensitive(input, "image_normalization");
-    if (cJSON_IsString(normalization_json) && normalization_json->valuestring)
-        value = normalization_json->valuestring;
-    if (!value) {
-        *normalization = -1;
-    } else if (parse_normalization(value, normalization) != 0) {
-        fprintf(stderr, "Input %s has unsupported image_normalization '%s'.\n",
-                input_name, value);
-        goto cleanup;
-    }
-    result = 0;
-cleanup:
-    cJSON_Delete(root);
-    return result;
 }
 
 static int clamp_rounded(float value, int minimum, int maximum) {
@@ -471,7 +526,8 @@ static int clamp_rounded(float value, int minimum, int maximum) {
 
 static int set_image_input(TaskSession* session, const Binding* binding,
                            const TaskOptions* options) {
-    VxTensorInfo info = VX_TENSOR_INFO_INIT;
+    VxTensorSpec spec = VX_TENSOR_SPEC_INIT;
+    VxTensorBinding prepared = VX_TENSOR_BINDING_INIT;
     VxAffineQuantization quantization = VX_AFFINE_QUANTIZATION_INIT;
     int shape[VX_MAX_TENSOR_RANK] = {0};
     size_t element_count;
@@ -480,52 +536,52 @@ static int set_image_input(TaskSession* session, const Binding* binding,
     int normalization = -1;
     char error[256] = {0};
     VxStatus status;
-    if (find_input(session, binding->name, &info) != 0) return -1;
-    if (info.dtype != VX_DTYPE_F32 && info.dtype != VX_DTYPE_I8 &&
-        info.dtype != VX_DTYPE_U8) {
+    if (find_input(session, binding->name, &spec) != 0 ||
+        prepare_binding_descriptor(session, binding, &spec, &prepared) != 0)
+        return -1;
+    if (spec.dtype != VX_DTYPE_F32 && spec.dtype != VX_DTYPE_I8 &&
+        spec.dtype != VX_DTYPE_U8) {
         fprintf(stderr, "Image input %s requires F32, I8, or U8, got %s.\n",
-                binding->name, dtype_name(info.dtype));
+                binding->name, dtype_name(spec.dtype));
         return -1;
     }
-    for (uint32_t axis = 0; axis < info.rank; axis++) {
-        if (info.shape[axis] <= 0 || info.shape[axis] > INT_MAX) {
+    for (uint32_t axis = 0; axis < prepared.rank; axis++) {
+        if (prepared.shape[axis] <= 0 || prepared.shape[axis] > INT_MAX) {
             fprintf(stderr, "Image input %s has an unsupported shape.\n", binding->name);
             return -1;
         }
-        shape[axis] = (int)info.shape[axis];
+        shape[axis] = (int)prepared.shape[axis];
     }
-    if (image_metadata(session->graph_path, binding->name, &normalization) != 0)
-        return -1;
-    if (options->image_normalization_explicit)
-        normalization = options->image_normalization;
+    normalization = options->image_normalization;
     if (normalization < 0) {
         fprintf(stderr,
-                "Input %s does not declare image_normalization; add package metadata or pass --image-normalize explicitly.\n",
+                "Image input %s requires explicit --image-normalize; graph metadata is never used for application preprocessing.\n",
                 binding->name);
         return -1;
     }
-    element_count = info.dtype == VX_DTYPE_F32
-        ? info.byte_size / sizeof(float) : info.byte_size;
+    element_count = spec.dtype == VX_DTYPE_F32
+        ? prepared.byte_size / sizeof(float) : prepared.byte_size;
     decoded = (float*)malloc(element_count * sizeof(float));
-    storage = malloc(info.byte_size ? info.byte_size : 1);
+    storage = malloc(prepared.byte_size ? prepared.byte_size : 1);
     if (!decoded || !storage) {
         fprintf(stderr, "Cannot allocate image input %s.\n", binding->name);
         free(decoded);
         free(storage);
         return -1;
     }
-    if (volvox_load_image_to_tensor(binding->path, decoded, shape, (int)info.rank,
+    if (volvox_load_image_to_tensor(binding->path, decoded, shape,
+                                    (int)prepared.rank,
                                     normalization, error, sizeof(error)) != 0) {
         fprintf(stderr, "Cannot decode image %s: %s\n", binding->path, error);
         free(decoded);
         free(storage);
         return -1;
     }
-    if (info.dtype == VX_DTYPE_F32) {
-        memcpy(storage, decoded, info.byte_size);
+    if (spec.dtype == VX_DTYPE_F32) {
+        memcpy(storage, decoded, prepared.byte_size);
     } else if (normalization == VOLVOX_IMAGE_RAW_255) {
         for (size_t index = 0; index < element_count; index++) {
-            if (info.dtype == VX_DTYPE_U8)
+            if (spec.dtype == VX_DTYPE_U8)
                 ((uint8_t*)storage)[index] = (uint8_t)clamp_rounded(decoded[index], 0, 255);
             else
                 ((int8_t*)storage)[index] = (int8_t)clamp_rounded(decoded[index] - 128.0f,
@@ -552,19 +608,15 @@ static int set_image_input(TaskSession* session, const Binding* binding,
         for (size_t index = 0; index < element_count; index++) {
             float quantized = decoded[index] / quantization.scale +
                               (float)quantization.zero_point;
-            if (info.dtype == VX_DTYPE_U8)
+            if (spec.dtype == VX_DTYPE_U8)
                 ((uint8_t*)storage)[index] = (uint8_t)clamp_rounded(quantized, 0, 255);
             else
                 ((int8_t*)storage)[index] = (int8_t)clamp_rounded(quantized, -128, 127);
         }
     }
-    status = vx_execution_context_set_input(session->context, binding->name,
-                                            info.dtype, storage, info.byte_size,
-                                            &session->report);
     free(decoded);
-    free(storage);
-    if (status != VX_STATUS_OK) {
-        print_failure("Setting image input", status, &session->report);
+    if (append_prepared_input(session, &prepared, storage) != 0) {
+        free(storage);
         return -1;
     }
     return 0;
@@ -576,6 +628,8 @@ static void session_close(TaskSession* session) {
     session->result = NULL;
     if (session->context) (void)vx_execution_context_close(session->context, NULL);
     vx_execution_context_release(session->context);
+    for (size_t index = 0; index < session->input_binding_count; index++)
+        free(session->input_storage[index]);
     vx_compiled_model_release(session->compiled);
     vx_model_release(session->model);
     if (session->runtime) (void)vx_runtime_close(session->runtime, NULL);
@@ -595,8 +649,6 @@ static int session_open(TaskSession* session, const char* model_path,
     memset(session, 0, sizeof(*session));
     session->report = (VxReport)VX_REPORT_INIT;
     if (resolve_model_paths(model_path, &paths) != 0) return -1;
-    if (copy_string(session->graph_path, sizeof(session->graph_path), paths.graph) != 0)
-        return -1;
     if (!options->weight_path_count && paths.default_weights[0])
         options->weight_paths[options->weight_path_count++] = paths.default_weights;
     runtime_options.debug = options->debug;
@@ -646,8 +698,9 @@ static int execute_once(TaskSession* session) {
     VxStatus status;
     vx_result_release(session->result);
     session->result = NULL;
-    status = vx_execution_context_execute(session->context, &session->result,
-                                          &session->report);
+    status = vx_execution_context_execute(
+        session->context, session->input_bindings,
+        session->input_binding_count, &session->result, &session->report);
     if (status != VX_STATUS_OK) {
         print_failure("Native inference", status, &session->report);
         return -1;
@@ -835,8 +888,8 @@ static void print_root_help(const char* argv0) {
 
 static void print_common_help(void) {
     printf("  --weights <file>             Add a safetensors shard (repeatable).\n");
-    printf("  --input <name=file>          Load exact typed raw input data.\n");
-    printf("  --image <name=file>          Decode a PNG/JPEG into an image input.\n");
+    printf("  --input <name[shape]=file>   Load one exact typed input; shape is required for dynamic axes.\n");
+    printf("  --image <name[shape]=file>   Decode an image; shape is required for dynamic axes.\n");
     printf("  --image-normalize <mode>     zero-one, minus-one-one, or raw-255.\n");
     printf("  --output <name=file|file>    Write exact typed raw output data.\n");
     printf("  --vulkan | --opengl | --metal | --nnapi | --cuda\n");
@@ -1112,8 +1165,9 @@ static int command_decode(int argc, char** argv) {
         }
     }
     if (session_open(&session, argv[2], &options, 1) != 0) return 1;
-    status = vx_execution_context_decode_seed(session.context, &session.result,
-                                              &session.report);
+    status = vx_execution_context_decode_seed(
+        session.context, session.input_bindings,
+        session.input_binding_count, &session.result, &session.report);
     if (status != VX_STATUS_OK) {
         print_failure("Decode seed", status, &session.report);
         goto cleanup;
@@ -1122,7 +1176,8 @@ static int command_decode(int argc, char** argv) {
         VxResult* next = NULL;
         status = vx_execution_context_decode_step(session.context,
                                                   start_position + index,
-                                                  &next, &session.report);
+                                                  NULL, 0u, &next,
+                                                  &session.report);
         if (status != VX_STATUS_OK) {
             print_failure("Decode step", status, &session.report);
             vx_result_release(next);

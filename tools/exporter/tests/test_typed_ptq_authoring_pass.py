@@ -35,7 +35,7 @@ def _linear() -> tuple[GraphIR, dict[str, np.ndarray]]:
         {"input": "x", "weight": "weight", "bias": "bias"},
         {"out": "y"},
         attributes=(OpAttribute(
-            "params", "volvox.params", {"weight_layout": "OUT_IN"},
+            "params", "volvox.params", {"weight_layout": "dout_din"},
         ),),
     ))
     tensors = {

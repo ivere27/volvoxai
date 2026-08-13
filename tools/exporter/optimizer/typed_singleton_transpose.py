@@ -8,13 +8,20 @@ the logical shape, so the operation is exactly the same byte copy as a runtime
 
 This pass is deliberately independent of model families and quantization
 authoring.  It does not derive, replace, or otherwise mutate affine metadata.
+
+Shapes are read through ``resolved_shape`` rather than required to be concrete.
+Which axes have extent one is the only thing this proof needs, and a symbol
+declared over a single value has extent one as surely as the literal does —
+demanding the whole shape be concrete refused every bounded-dynamic graph and
+missed the pinned unit axes in the ones it did see.
 """
 
 from __future__ import annotations
 
 from typing import Any
 
-from ..ir import IRDialect, OpNode
+from ..ir import IRDialect, OpAttribute, OpNode
+from .typed_attention_common import resolved_shape
 from ..pipeline import IRPass, PassContract, PassResult
 
 
@@ -61,7 +68,9 @@ class RuntimeSingletonTransposePass(IRPass):
     """Turn exact singleton-axis ``Transpose`` nodes into ``Reshape`` nodes."""
 
     name = "runtime-singleton-transpose"
-    contract = PassContract.preserving(IRDialect.RUNTIME, repeatable=True)
+    contract = PassContract.preserving(
+        IRDialect.RUNTIME, repeatable=True
+    )
 
     def run(self, graph) -> PassResult:
         touched: list[str] = []
@@ -81,8 +90,6 @@ class RuntimeSingletonTransposePass(IRPass):
                 source is None
                 or output is None
                 or params is None
-                or not source.concrete
-                or not output.concrete
                 or not 1 <= source.rank <= 8
                 or output.rank != source.rank
                 or source.dtype not in _RUNTIME_STORAGE_DTYPES
@@ -105,15 +112,20 @@ class RuntimeSingletonTransposePass(IRPass):
                     for axis in permutation
                 )
                 or sorted(permutation) != list(range(source.rank))
-                or output.shape != tuple(
-                    source.shape[axis] for axis in permutation
+                or resolved_shape(graph, output.shape) != tuple(
+                    resolved_shape(graph, source.shape)[axis]
+                    for axis in permutation
                 )
-                or not _singleton_only_permutation(source.shape, permutation)
+                or not _singleton_only_permutation(
+                    resolved_shape(graph, source.shape), permutation
+                )
             ):
                 continue
 
             node.op_type = "Reshape"
-            node.attributes = ()
+            node.attributes = (OpAttribute(
+                "params", "volvox.params", {"shape": list(output.shape)},
+            ),)
             touched.append(node.name)
 
         if not touched:

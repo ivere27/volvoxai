@@ -8,7 +8,8 @@ function equalArrays(left, right) {
 }
 
 export function sameQuantizationDescriptor(left, right) {
-  if (!left || !right || left.scheme !== right.scheme) return false;
+  if (left == null || right == null) return left == null && right == null;
+  if (left.scheme !== right.scheme) return false;
   if (left.scheme === 'per_tensor') {
     return left.scale === right.scale && left.zero_point === right.zero_point;
   }

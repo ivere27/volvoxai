@@ -10,6 +10,7 @@ import fs from 'fs';
 import path from 'path';
 import { pathToFileURL, fileURLToPath } from 'url';
 import { execFileSync } from 'child_process';
+import { concreteExecutionInputs } from './lib/runmodel.mjs';
 import { readTensor } from './lib/tensorio.mjs';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
@@ -46,22 +47,26 @@ async function runVolvox(backend) {
     wasmUrl: path.join(ROOT, 'dist', ver, 'volvoxai.wasm'),
   });
   const url = pathToFileURL(path.join(modelDir, 'model.safetensors')).href;
-  const graph = new volvox.Graph();
-  await volvox.GraphLoader.load(graph, url);
-  const model = runtime.createModel(graph);
+  const snapshot = volvox.Model.capture(
+    await volvox.ModelLoader.load(url),
+  );
   let compiled;
   let context;
   try {
-    compiled = await model.compile({
+    compiled = await runtime.compile(snapshot, {
       backend: { mode: 'require', backend, operatorFallback: 'forbid' },
     });
     context = await compiled.createContext();
-    const result = await context.execute({ input0: input });
+    const result = await context.execute(concreteExecutionInputs(snapshot, { input0: input }));
     try {
       const checked = async (name) => {
-        const tensor = graph.getTensor(name);
+        const tensor = snapshot.graph.tensors[name];
         const values = await result.output(name).read();
-        if (!tensor || !ArrayBuffer.isView(values) || values.byteLength !== tensor.sizeBytes) {
+        const dtypeBytes = { float32: 4, int32: 4, int8: 1, uint8: 1 }[tensor?.dtype];
+        const sizeBytes = tensor?.shape.reduce(
+          (size, dimension) => size * dimension, dtypeBytes,
+        );
+        if (!tensor || !ArrayBuffer.isView(values) || values.byteLength !== sizeBytes) {
           throw new Error(`${backend}: invalid output '${name}'`);
         }
         return values instanceof Float32Array ? values : Float32Array.from(values);
@@ -73,7 +78,6 @@ async function runVolvox(backend) {
   } finally {
     await context?.close();
     await compiled?.close();
-    await model.close();
     await runtime.close();
   }
 }

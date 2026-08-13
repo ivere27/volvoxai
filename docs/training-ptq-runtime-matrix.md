@@ -6,11 +6,11 @@ VolvoxAI has two capability profiles:
 - full: inference plus Trainer, backward kernels, optimizer state, checkpoints,
   and PTQ authoring.
 
-The JavaScript inference lifecycle is always Runtime → Model → CompiledModel →
-ExecutionContext → ExecutionResult. Training state has a separate retained
-Trainer owner. The native public C surface uses matching opaque inference
-handles; native/volvoxai-full additionally contains the model-agnostic train
-command.
+The JavaScript inference lifecycle is always Runtime → Model →
+CompiledModel → ExecutionContext → ExecutionResult. Training state has a
+separate Trainer owner. The native public C surface uses matching opaque
+inference handles; native/volvoxai-full additionally contains the
+model-agnostic shaped train command.
 
 Legend: ✅ supported, ⚠️ supported with stated restrictions, ❌ unsupported.
 
@@ -31,25 +31,26 @@ CPU, WebNN, WebGPU, WGSL, or Node filesystem implementation.
 
 | State | Owner |
 | --- | --- |
-| Immutable topology and published weights | Model |
+| Immutable topology, bounds, and source weights | Model |
 | Exact compiled revision | CompiledModel |
 | Request, scratch, adapter, and decode state | ExecutionContext |
 | Stable output snapshots | ExecutionResult |
 | Gradients and optimizer slots | Trainer |
 | Accumulation state | Trainer |
 | Private mutable working revision | Trainer |
-| Published successor revision | Model, committed atomically by Trainer |
+| Immutable successor revision | Returned by `Trainer.commit()` |
 
-`trainStep()` never publishes a Model revision. A completed optimizer update
-remains private until `commit()` publishes it atomically. `rollback()` restores
-the last committed baseline. Compiled models created before a commit remain
-pinned to their original weights.
+`trainStep()` never mutates a Model. A completed optimizer update
+remains private until `commit()` captures and returns an immutable successor.
+`rollback()` restores the last committed baseline. The source and previously
+compiled snapshots remain pinned to their original weights.
 
 ## Trainer support
 
 | Capability | JavaScript CPU | Browser WebGPU | Strict WASM | Native full command |
 | --- | --- | --- | --- | --- |
-| Create graph with full ModelBuilder | ✅ | ✅ | ✅ | Package supplied by caller |
+| Bounded logical snapshot authoring | ✅ | ✅ | ✅ | Package supplied by caller |
+| Shape changes inside one Trainer | ✅ | ✅ cached specialization | ✅ cached specialization | ✅ shaped ABI |
 | F32 forward/backward | ✅ | ✅ documented subset | ✅ documented subset | ✅ CPU/device subset |
 | Cross-entropy | ✅ | ✅ | ✅ | ✅ |
 | Multiple weighted losses | ✅ | ✅ | ✅ | ✅ |
@@ -75,17 +76,18 @@ pinned to their original weights.
 Use:
 
 ~~~javascript
-const trainer = await VolvoxAI.createTrainer(model, {
+const trainer = await VolvoxAI.createTrainer(sourceSnapshot, {
   backend: 'cpu', // or 'webgpu' / 'wasm'
 });
 
 const step = await trainer.trainStep(options);
-await trainer.commit();
+const successorSnapshot = await trainer.commit();
 await trainer.close();
 ~~~
 
 Commit only after a completed optimizer update; an incomplete accumulation
-window cannot be committed. There is no implicit publication.
+window cannot be committed. The returned successor is the only published
+result; the source snapshot is unchanged.
 
 WASM preflights the complete supported graph before forward execution or
 optimizer mutation. WebGPU owns its device resources inside Trainer. Supplying
@@ -101,6 +103,9 @@ operator, residency, and numerical limits are in [cuda.md](cuda.md).
 | Capability | JavaScript full profile | WASM numerical sidecar | Native profiles |
 | --- | --- | --- | --- |
 | Min/max observation | ✅ PTQObserver | Full sidecar kernels | Full build internals |
+| Named shaped profiles and exact-fingerprint coverage | ✅ PTQCalibrator | JS orchestration | ✅ package metadata |
+| Transactional logical-batch promotion-chunk staging | ✅ PTQCalibrator | JS orchestration | ❌ single atomic batch API |
+| Per-activation scalar-element coverage | ✅ | JS orchestration | ✅ full only |
 | Multiple calibration samples | ✅ Runtime result loop | JS orchestration | Full command/tooling |
 | Symmetric parameters | ✅ | ✅ | ✅ full only |
 | Asymmetric parameters | ✅ | ✅ | ✅ full only |
@@ -125,10 +130,29 @@ boundary as a graph output. TensorResult.read() supplies caller-owned F32 values
 to PTQObserver. Device backends therefore use the same stable result contract;
 no backend intermediate or stale host mirror is exposed.
 
+`PTQCalibrator` declares the complete activation universe up front. A large
+logical batch may be observed through disjoint public-output promotion chunks
+by repeating its `batchId`, profile, represented sample count, exact shaped
+input bytes, and `chunkCount` while advancing the zero-based `chunkIndex`.
+Pending chunks are invisible. The calibrator commits ranges and coverage once,
+and only once, after the chunk-index set and activation-name union are both
+complete. Duplicate chunks or activations, changed metadata or input bytes,
+incomplete coverage, and reuse of a completed ID fail closed without changing
+committed state.
+
+Coverage keeps three different units. `batches` counts unique completed
+logical batch IDs, `samples` counts the represented logical samples supplied by
+the caller, and each `activationSamples[name]` is the number of F32 scalar
+elements observed for that activation. For a batched or dynamically shaped
+tensor, `activationSamples` will normally be much larger than `samples`.
+
 Current full-profile authoring functions are:
 
 | Purpose | JavaScript |
 | --- | --- |
+| Stage and atomically commit a logical calibration batch | PTQCalibrator.observeBatchChunk() |
+| Inspect exact profile, batch, symbol, and activation coverage | PTQCalibrator.coverage() |
+| Derive parameters from complete calibrated coverage | PTQCalibrator.parameters() |
 | Observe values | PTQObserver.observe() |
 | Derive parameters | derivePTQParameters() |
 | Quantize values | quantizePTQ() |
@@ -146,15 +170,18 @@ weight-quantization compatibility field.
 The `Insert quantized graph nodes automatically` and `Infer quantization
 boundaries` rows describe these low-level JavaScript/native authoring APIs. The
 separate offline typed toolchain can plan and transactionally materialize its
-exact supported dense subset; see [typed-ptq.md](typed-ptq.md). It fails closed
-outside that subset and does not claim general automatic Conv, normalization,
-attention, or mixed-precision policy selection.
+exact supported `Linear`, static-RHS `MatMul`, `Conv2D`, `Embedding`, `Add`,
+`GELU`, `SiLU`, `LayerNorm`, `GroupNorm`, `BatchMatMul`, and explicit-Q/K/V
+`CrossSDPA` forms; see [typed-ptq.md](typed-ptq.md). Those forms may retain
+bounded symbolic activation descriptors when their canonical geometry and
+all-declared-domain proof succeed. The toolchain does not support arbitrary
+operators or automatically choose a mixed-precision/sensitivity policy.
 
 ## WASM boundary
 
 ~~~text
 JavaScript
-  Runtime/Model/Context ownership
+  Runtime/Model/CompiledModel/ExecutionContext ownership
   Trainer policy and checkpoints
   PTQ observations and package bytes
                    |

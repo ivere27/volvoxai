@@ -21,6 +21,8 @@ static int g_opengl_cleanup_calls;
 static int g_cuda_init_result;
 static int g_cuda_init_calls;
 static int g_cuda_cleanup_calls;
+static int g_device_release_calls;
+static int g_opengl_device_release_calls;
 
 int vk_init(void) {
     g_init_calls++;
@@ -31,6 +33,12 @@ void vk_cleanup(void) {
     g_cleanup_calls++;
 }
 
+/* The shared device outlives individual contexts, so deactivation releases it
+ * separately from the per-state cleanup. */
+void vk_device_release(void) {
+    g_device_release_calls++;
+}
+
 int opengl_init(void) {
     g_opengl_init_calls++;
     return g_opengl_init_result;
@@ -38,6 +46,10 @@ int opengl_init(void) {
 
 void opengl_cleanup(void) {
     g_opengl_cleanup_calls++;
+}
+
+void opengl_device_release(void) {
+    g_opengl_device_release_calls++;
 }
 
 int cuda_init(void) {
@@ -65,6 +77,9 @@ int main(void) {
     CHECK(vx_backend_manager_activate(VOLVOXAI_BACKEND_VULKAN) == -1);
     CHECK(g_init_calls == 1);
     CHECK(g_cleanup_calls == 1);
+    /* Deactivation drops only the per-state context; the shared device is
+     * released at process exit so compile and execute reuse one device. */
+    CHECK(g_device_release_calls == 0);
     CHECK(state->use_vulkan == 0);
     CHECK(vx_backend_manager_current() == VOLVOXAI_BACKEND_CPU);
 
@@ -109,6 +124,7 @@ int main(void) {
 
     vx_backend_manager_deactivate();
     CHECK(g_cleanup_calls == 2);
+    CHECK(g_device_release_calls == 0);
     CHECK(state->use_vulkan == 0);
     CHECK(vx_backend_manager_current() == VOLVOXAI_BACKEND_CPU);
 

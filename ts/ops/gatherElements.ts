@@ -1,33 +1,98 @@
+import {
+  assertShapeKernelOutput,
+  assertShapeKernelParams,
+  assertShapeKernelTensor,
+  normalizeShapeKernelAxis,
+  sliceShapeKernelQuantization,
+} from './shapeKernelValidation.js';
+
+function strides(shape) {
+  const result = new Array(shape.length);
+  let stride = 1;
+  for (let axis = shape.length - 1; axis >= 0; axis--) {
+    result[axis] = stride;
+    stride *= shape[axis];
+  }
+  return result;
+}
+
 export function _cpuGatherElements(node) {
-
-    // ONNX GatherElements: output has the same shape as `indices`; each element
-    // pulls from `data` at the same coordinates but with the `axis` coordinate
-    // replaced by the corresponding index value.
-    const data = node.inputs.input || node.inputs.data;
-    const indices = node.inputs.indices;
-    const out = node.outputs.out;
-    const dBuf = data.buffer;
-    const iBuf = indices.buffer;
-    const oBuf = out.buffer;
-    const dShape = data.shape;
-    const iShape = indices.shape;
-    let axis = node.params.axis !== undefined ? node.params.axis : 0;
-    if (axis < 0) axis += dShape.length;
-
-    const dStrides = new Array(dShape.length);
-    { let s = 1; for (let k = dShape.length - 1; k >= 0; k--) { dStrides[k] = s; s *= dShape[k]; } }
-    const iStrides = new Array(iShape.length);
-    { let s = 1; for (let k = iShape.length - 1; k >= 0; k--) { iStrides[k] = s; s *= iShape[k]; } }
-
-    const rank = iShape.length;
-    const coord = new Array(rank);
-    for (let lin = 0; lin < oBuf.length; lin++) {
-      let rem = lin;
-      for (let k = 0; k < rank; k++) { coord[k] = Math.floor(rem / iStrides[k]); rem %= iStrides[k]; }
-      let idx = iBuf[lin] | 0;
-      if (idx < 0) idx += dShape[axis];
-      let off = 0;
-      for (let k = 0; k < rank; k++) off += (k === axis ? idx : coord[k]) * dStrides[k];
-      oBuf[lin] = dBuf[off];
+  const input = node.inputs?.input || node.inputs?.data;
+  const indices = node.inputs?.indices;
+  const output = node.outputs?.out || Object.values(node.outputs || {})[0];
+  assertShapeKernelTensor(input, 'GatherElements input', { minimumRank: 1 });
+  const outputElements = assertShapeKernelTensor(indices, 'GatherElements indices', {
+    dtypes: ['int32'], minimumRank: 1,
+  });
+  if (indices.quantization != null) {
+    throw new Error('GatherElements indices must be unquantized I32.');
+  }
+  if (indices.shape.length !== input.shape.length) {
+    throw new Error('GatherElements input and indices must have equal rank.');
+  }
+  const params = assertShapeKernelParams(node, ['axis'], 'GatherElements');
+  const axis = normalizeShapeKernelAxis(
+    params.axis,
+    input.shape.length,
+    0,
+    'GatherElements',
+  );
+  for (let dimension = 0; dimension < input.shape.length; dimension++) {
+    if (dimension !== axis && indices.shape[dimension] > input.shape[dimension]) {
+      throw new Error(
+        `GatherElements indices axis ${dimension} exceeds the corresponding input extent.`,
+      );
     }
   }
+  let expectedQuantization = input.quantization;
+  if (input.quantization?.scheme === 'per_axis') {
+    if (input.quantization.axis === axis) {
+      throw new Error('GatherElements cannot reorder a per-axis quantization dimension.');
+    }
+    const extent = indices.shape[input.quantization.axis];
+    expectedQuantization = sliceShapeKernelQuantization(
+      input.quantization,
+      input.quantization.axis,
+      0,
+      extent,
+    );
+  }
+  assertShapeKernelOutput(
+    output,
+    indices.shape,
+    input.dtype,
+    expectedQuantization,
+    'GatherElements',
+  );
+
+  const axisExtent = input.shape[axis];
+  for (let index = 0; index < indices.buffer.length; index++) {
+    const normalized = indices.buffer[index] < 0
+      ? indices.buffer[index] + axisExtent
+      : indices.buffer[index];
+    if (normalized < 0 || normalized >= axisExtent) {
+      throw new Error(
+        `GatherElements index ${indices.buffer[index]} is outside axis extent ${axisExtent}.`,
+      );
+    }
+  }
+
+  const inputStrides = strides(input.shape);
+  const indexStrides = strides(indices.shape);
+  const coordinates = new Array(indices.shape.length);
+  for (let linear = 0; linear < outputElements; linear++) {
+    let remaining = linear;
+    for (let dimension = 0; dimension < indices.shape.length; dimension++) {
+      coordinates[dimension] = Math.floor(remaining / indexStrides[dimension]);
+      remaining %= indexStrides[dimension];
+    }
+    let gathered = indices.buffer[linear];
+    if (gathered < 0) gathered += axisExtent;
+    let inputOffset = 0;
+    for (let dimension = 0; dimension < input.shape.length; dimension++) {
+      inputOffset += (dimension === axis ? gathered : coordinates[dimension]) *
+        inputStrides[dimension];
+    }
+    output.buffer[linear] = input.buffer[inputOffset];
+  }
+}

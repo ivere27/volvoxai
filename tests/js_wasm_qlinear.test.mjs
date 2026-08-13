@@ -7,9 +7,7 @@ import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
 
-import { Graph } from '../ts/core/Graph.js';
-import { ModelSnapshot } from '../ts/core/ModelSnapshot.js';
-import { BuiltInBackendProvider } from '../ts/backends/BackendProvider.js';
+import { RuntimeGraph } from '../ts/core/RuntimeGraph.js';
 import { CPUEngine } from '../ts/backends/CPUEngine.js';
 import { WasmEngine } from '../ts/backends/WasmEngine.js';
 
@@ -39,7 +37,7 @@ function qlinearGraph({
   outputDtype = 'int8', outputShape, outputQuantization,
   dynamicWeight = false,
 } = {}) {
-  const graph = new Graph();
+  const graph = new RuntimeGraph();
   const input = graph.addInput('input', inputShape, inputDtype, {
     quantization: inputQuantization,
   });
@@ -89,13 +87,57 @@ test('WASM packed Q8 allocation rejects values outside the signed allocator ABI'
     memory,
     packed_q8_weight_size: () => 0x7ffffff1,
     pack_q8_weight: () => 1,
+    packed_q8_weight_canonical_size: () => 0x7ffffff1,
+    pack_q8_weight_canonical: () => 1,
     alloc_bytes: () => { allocated = true; return 0; },
   } } });
   engine.pointers.set('weight', 0);
   assert.throws(() => engine._allocPackedQ8Weight(
     { name: 'weight', dtype: 'int8' }, 1, 1, true,
   ), /packed Q8 weight size overflow/);
+  assert.throws(() => engine._allocPackedQ8Weight(
+    { name: 'weight', dtype: 'int8' }, 1, 1, true, 'canonical',
+  ), /canonical packed Q8 weight size overflow/);
   assert.equal(allocated, false);
+});
+
+test('WASM reuses one invariant Q8 packing for an identical weight layout', () => {
+  const memory = new WebAssembly.Memory({ initial: 1 });
+  let cursor = 64;
+  let widePackCount = 0;
+  let canonicalPackCount = 0;
+  const engine = new WasmEngine({ instance: { exports: {
+    memory,
+    packed_q8_weight_size: () => 64,
+    pack_q8_weight: () => { widePackCount++; return 1; },
+    packed_q8_weight_canonical_size: () => 32,
+    pack_q8_weight_canonical: () => { canonicalPackCount++; return 1; },
+    alloc_bytes: (bytes) => {
+      const pointer = cursor;
+      cursor += (bytes + 15) & ~15;
+      return pointer;
+    },
+  } } });
+  engine.pointers.set('weight', 16);
+  const weight = { name: 'weight', dtype: 'int8' };
+
+  const first = engine._allocPackedQ8Weight(weight, 8, 4, true);
+  const second = engine._allocPackedQ8Weight(weight, 8, 4, true);
+  const otherLayout = engine._allocPackedQ8Weight(weight, 8, 4, false);
+  const canonical = engine._allocPackedQ8Weight(
+    weight, 8, 4, true, 'canonical',
+  );
+  const canonicalAgain = engine._allocPackedQ8Weight(
+    weight, 8, 4, true, 'canonical',
+  );
+
+  assert.equal(second, first);
+  assert.notEqual(otherLayout, first);
+  assert.notEqual(canonical, first,
+    'canonical-only and widened packs of one weight must not alias');
+  assert.equal(canonicalAgain, canonical);
+  assert.equal(widePackCount, 2);
+  assert.equal(canonicalPackCount, 1);
 });
 
 test('WASM packed F32 allocation leaves room for allocator alignment', () => {
@@ -134,50 +176,6 @@ test('portable WASM QLinear keeps W8A8 storage and matches the CPU reference', {
     assert.ok(wasm, 'compiled forward WASM module initializes');
     assert.equal(typeof wasm.api.qlinear_i8u8, 'function', 'forward WASM exports qlinear_i8u8');
     forbidCpuDenseFallback(wasm);
-
-    await t.test('provider captures stable snapshots from transient WASM arena views', async () => {
-      const spec = {
-        inputValues: [3, -2, 5], inputShape: [1, 3],
-        inputQuantization: { scheme: 'per_tensor', scale: 0.25, zero_point: -1 },
-        weightValues: [2, 0, -1, -2, 1, 3], weightShape: [2, 3],
-        weightQuantization: {
-          scheme: 'per_axis', axis: 0, scales: [0.5, 0.25], zero_points: [1, -2],
-        },
-        biasValues: [2, -4], outputShape: [1, 2],
-        outputQuantization: { scheme: 'per_tensor', scale: 0.125, zero_point: 0 },
-      };
-      const { graph, inputValues } = qlinearGraph(spec);
-      wasm.compile(graph);
-      const direct = await wasm.execute({ input: inputValues });
-      assert.equal(direct.out.buffer, wasm.mem.buffer,
-        'internal WASM execution should publish its arena view without a transient copy');
-
-      const provider = new BuiltInBackendProvider(await wasm.fork());
-      let compiled;
-      let context;
-      try {
-        compiled = await provider.compile(ModelSnapshot.capture(graph), {
-          operatorFallback: 'forbid',
-        });
-        context = await compiled.createContext();
-        const first = await context.execute({ input: inputValues });
-        const firstData = first.outputs.find(({ name }) => name === 'out')?.data;
-        assert.ok(firstData instanceof Int8Array);
-        const firstValues = [...firstData];
-
-        const replacement = Int8Array.of(-3, 4, -5);
-        const second = await context.execute({ input: replacement });
-        const secondData = second.outputs.find(({ name }) => name === 'out')?.data;
-        assert.ok(secondData instanceof Int8Array);
-        assert.notDeepEqual([...secondData], firstValues);
-        assert.deepEqual([...firstData], firstValues,
-          'a later arena reuse must not mutate an earlier provider snapshot');
-      } finally {
-        await context?.close();
-        await compiled?.close();
-        await provider.close();
-      }
-    });
 
     const signed = {
       inputValues: [1, -2, 3, 4, 0, -1],

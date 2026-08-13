@@ -1,44 +1,98 @@
-export function _cpuSplit(node) {
-    const input = node.inputs.input || node.inputs.x || node.inputs.data;
-    if (!input || !['float32', 'int32'].includes(input.dtype) || !input.buffer ||
-        !Array.isArray(input.shape) || input.shape.length < 1) {
-      throw new Error(`Split node ${node.id ?? '<unnamed>'} requires an F32 or I32 input tensor.`);
+import {
+  assertShapeKernelOutput,
+  assertShapeKernelParams,
+  assertShapeKernelTensor,
+  normalizeShapeKernelAxis,
+  sliceShapeKernelQuantization,
+} from './shapeKernelValidation.js';
+
+function orderedOutputKeys(node): readonly string[] {
+  const keys = Object.keys(node.outputs || {});
+  if (keys.length === 0) throw new Error('Split requires at least one output tensor.');
+  if (keys.every((name) => /^out(0|[1-9][0-9]*)$/.test(name))) {
+    const ordered = [...keys].sort((left, right) => Number(left.slice(3)) - Number(right.slice(3)));
+    if (ordered.some((name, index) => name !== `out${index}`)) {
+      throw new Error("Split canonical 'outN' ports must be contiguous.");
     }
-    const inBuf = input.buffer;
-    const inShape = input.shape;
-    let axis = node.params?.axis ?? 0;
-    if (axis < 0) axis += inShape.length;
-    if (!Number.isInteger(axis) || axis < 0 || axis >= inShape.length) {
-      throw new Error(`Split node ${node.id ?? '<unnamed>'} has an invalid axis.`);
-    }
-    // The graph's declared output order is Split's slice order. Lexical sorting
-    // would incorrectly place out10 before out2.
-    const outKeys = Object.keys(node.outputs);
-    const numOutputs = outKeys.length;
-    if (numOutputs === 0 || inShape[axis] % numOutputs !== 0) {
-      throw new Error(`Split node ${node.id ?? '<unnamed>'} requires equal-sized output slices.`);
-    }
-    const splitSize = inShape[axis] / numOutputs;
-    let outerSize = 1;
-    for (let i = 0; i < axis; i++) outerSize *= inShape[i];
-    let innerSize = 1;
-    for (let i = axis + 1; i < inShape.length; i++) innerSize *= inShape[i];
-    const chunkSize = splitSize * innerSize;
-    for (let o = 0; o < numOutputs; o++) {
-        const output = node.outputs[outKeys[o]];
-        const expectedShape = [...inShape];
-        expectedShape[axis] = splitSize;
-        if (!output || output.dtype !== input.dtype || !output.buffer ||
-            output.shape.length !== expectedShape.length ||
-            output.shape.some((dimension, index) => dimension !== expectedShape[index]) ||
-            output.buffer.length !== outerSize * chunkSize) {
-          throw new Error(`Split node ${node.id ?? '<unnamed>'} has an incompatible ${input.dtype} output.`);
-        }
-        const outBuf = output.buffer;
-        for (let i = 0; i < outerSize; i++) {
-            const inOffset = (i * inShape[axis] + o * splitSize) * innerSize;
-            const outOffset = i * chunkSize;
-            outBuf.set(inBuf.subarray(inOffset, inOffset + chunkSize), outOffset);
-        }
-    }
+    return ordered;
   }
+  // Static legacy Graphs used arbitrary insertion-ordered output names. The
+  // logical v1 path always uses contiguous outN ports.
+  return keys;
+}
+
+function splitSizes(params, axisExtent, outputCount) {
+  if (params.split !== undefined && params.num_outputs !== undefined) {
+    throw new Error('Split must specify split or num_outputs, not both.');
+  }
+  if (params.split !== undefined) {
+    if (!Array.isArray(params.split) || params.split.length !== outputCount ||
+        params.split.some((size) => !Number.isSafeInteger(size) || size <= 0)) {
+      throw new Error('Split params.split must contain one positive size per output.');
+    }
+    return [...params.split];
+  }
+  const count = params.num_outputs ?? outputCount;
+  if (!Number.isSafeInteger(count) || count <= 0 || count !== outputCount) {
+    throw new Error('Split num_outputs must equal the concrete output count.');
+  }
+  if (axisExtent % count !== 0) {
+    throw new Error(`Split num_outputs must divide axis extent ${axisExtent}.`);
+  }
+  return new Array(count).fill(axisExtent / count);
+}
+
+export function _cpuSplit(node) {
+  const input = node.inputs?.input || node.inputs?.x || node.inputs?.data;
+  assertShapeKernelTensor(input, 'Split input', { minimumRank: 1 });
+  const params = assertShapeKernelParams(node, ['axis', 'split', 'num_outputs'], 'Split');
+  const axis = normalizeShapeKernelAxis(params.axis, input.shape.length, 0, 'Split');
+  const outputKeys = orderedOutputKeys(node);
+  const sizes = splitSizes(params, input.shape[axis], outputKeys.length);
+  const sum = sizes.reduce((total, size) => total + size, 0);
+  if (!Number.isSafeInteger(sum) || sum !== input.shape[axis]) {
+    throw new Error(`Split sizes sum to ${sum}, expected ${input.shape[axis]}.`);
+  }
+
+  let quantizationOffset = 0;
+  const descriptors = outputKeys.map((key, index) => {
+    const expectedShape = [...input.shape];
+    expectedShape[axis] = sizes[index];
+    const expectedQuantization = input.quantization?.scheme === 'per_axis' &&
+      input.quantization.axis === axis
+      ? sliceShapeKernelQuantization(
+        input.quantization,
+        axis,
+        quantizationOffset,
+        quantizationOffset + sizes[index],
+      )
+      : input.quantization;
+    quantizationOffset += sizes[index];
+    const output = node.outputs[key];
+    assertShapeKernelOutput(
+      output,
+      expectedShape,
+      input.dtype,
+      expectedQuantization,
+      `Split ${key}`,
+    );
+    return { output, size: sizes[index] };
+  });
+
+  const outer = input.shape.slice(0, axis)
+    .reduce((product, dimension) => product * dimension, 1);
+  const inner = input.shape.slice(axis + 1)
+    .reduce((product, dimension) => product * dimension, 1);
+  let axisOffset = 0;
+  for (const descriptor of descriptors) {
+    const chunk = descriptor.size * inner;
+    for (let outerIndex = 0; outerIndex < outer; outerIndex++) {
+      const inputOffset = (outerIndex * input.shape[axis] + axisOffset) * inner;
+      descriptor.output.buffer.set(
+        input.buffer.subarray(inputOffset, inputOffset + chunk),
+        outerIndex * chunk,
+      );
+    }
+    axisOffset += descriptor.size;
+  }
+}

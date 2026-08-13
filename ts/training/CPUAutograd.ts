@@ -1,5 +1,5 @@
 import { CPUEngine } from '../backends/CPUEngine.js';
-import type { Graph } from '../core/Graph.js';
+import type { RuntimeGraph } from '../core/RuntimeGraph.js';
 import type { Tensor } from '../core/Tensor.js';
 import { normalizeSpatialPair } from '../ops/spatialParameters.js';
 import { geluApproximation, geluDerivative } from '../ops/gELU.js';
@@ -29,7 +29,12 @@ import {
   resetGradientAccumulation as resetPendingGradients,
 } from './GradientAccumulation.js';
 import type { RuntimeTypedArray } from '../types.js';
-import type { TrainingStepOptions } from './TrainingStep.js';
+import type { TrainingKernelStepOptions } from './TrainingStep.js';
+import {
+  checkedWindowOutput,
+  fullSpatialPads,
+  spatialPair,
+} from '../ops/spatialKernelValidation.js';
 
 type TrainingDropoutContext = ReturnType<typeof dropoutContext>;
 type CrossEntropyGradientResult = ReturnType<typeof crossEntropyGradient>;
@@ -37,7 +42,7 @@ type GradientMap = Map<string, Float32Array>;
 
 interface AcceleratedTrainingExecution {
   backend?: string;
-  preflight?(graph: StatefulTrainingGraph, options: TrainingStepOptions): void | Promise<void>;
+  preflight?(graph: StatefulTrainingGraph, options: TrainingKernelStepOptions): void | Promise<void>;
   forward?(
     graph: StatefulTrainingGraph,
     inputs: Record<string, RuntimeTypedArray>,
@@ -897,33 +902,51 @@ function backwardConv1D(node, go, grads) {
   const output = firstOutput(node);
   if (input?.dtype !== 'float32' || weight?.dtype !== 'float32' || !input.buffer || !weight.buffer ||
       !output?.buffer || input.shape.length !== 3 || weight.shape.length !== 3 || output.shape.length !== 3) {
-    backwardFailure(node, 'Conv1D requires rank-3 NCL F32 input, weight, and output storage');
+    backwardFailure(node, 'Conv1D requires rank-3 NLC F32 input, weight, and output storage');
   }
-  const [batch, inChannels, inputLength] = input.shape;
-  const [outChannels, inputPerGroup, kernel] = weight.shape;
-  const outputLength = output.shape[2];
+  // NLC activations [batch, l, c]; WIO weights [k, in_per_group, out_c].
+  const [batch, inputLength, inChannels] = input.shape;
+  const [kernel, inputPerGroup, outChannels] = weight.shape;
+  const outputLength = output.shape[1];
   const groups = node.params?.groups ?? 1;
   const stride = normalizeSpatialPair(node.params?.stride, 1)[0];
   const padding = normalizeSpatialPair(node.params?.padding, 0)[0];
   if (!Number.isInteger(groups) || groups <= 0 || inChannels % groups || outChannels % groups ||
-      inputPerGroup !== inChannels / groups || output.shape[0] !== batch || output.shape[1] !== outChannels) {
-    backwardFailure(node, 'Conv1D has incompatible grouped NCL dimensions');
+      inputPerGroup !== inChannels / groups || output.shape[0] !== batch || output.shape[2] !== outChannels) {
+    backwardFailure(node, 'Conv1D has incompatible grouped NLC dimensions');
   }
   const gi = gradFor(grads, input), gw = gradFor(grads, weight);
   const gb = bias?.dtype === 'float32' ? gradFor(grads, bias) : null;
   const groupOut = outChannels / groups;
-  for (let b = 0; b < batch; b++) for (let oc = 0; oc < outChannels; oc++) for (let ox = 0; ox < outputLength; ox++) {
-    const outputIndex = (b * outChannels + oc) * outputLength + ox;
-    const gradient = node.params?.relu && output.buffer[outputIndex] <= 0 ? 0 : go[outputIndex];
-    if (gb) gb[oc] += gradient;
-    const inputStart = Math.floor(oc / groupOut) * inputPerGroup;
-    for (let localIc = 0; localIc < inputPerGroup; localIc++) for (let kk = 0; kk < kernel; kk++) {
+  for (let b = 0; b < batch; b++) for (let ox = 0; ox < outputLength; ox++) {
+    const outRow = (b * outputLength + ox) * outChannels;
+    if (gb) {
+      for (let oc = 0; oc < outChannels; oc++) {
+        gb[oc] += node.params?.relu && output.buffer[outRow + oc] <= 0 ? 0 : go[outRow + oc];
+      }
+    }
+    for (let kk = 0; kk < kernel; kk++) {
       const ix = ox * stride + kk - padding;
       if (ix < 0 || ix >= inputLength) continue;
-      const inputIndex = (b * inChannels + inputStart + localIc) * inputLength + ix;
-      const weightIndex = (oc * inputPerGroup + localIc) * kernel + kk;
-      gi[inputIndex] += gradient * weight.buffer[weightIndex];
-      gw[weightIndex] += gradient * input.buffer[inputIndex];
+      const inRow = (b * inputLength + ix) * inChannels;
+      const wTap = kk * inputPerGroup * outChannels;
+      for (let g = 0; g < groups; g++) {
+        const icBase = inRow + g * inputPerGroup;
+        const ocBase = g * groupOut;
+        for (let localIc = 0; localIc < inputPerGroup; localIc++) {
+          const wRow = wTap + localIc * outChannels + ocBase;
+          const inputIndex = icBase + localIc;
+          const inputValue = input.buffer[inputIndex];
+          let inputGrad = 0;
+          for (let oc = 0; oc < groupOut; oc++) {
+            const index = outRow + ocBase + oc;
+            const gradient = node.params?.relu && output.buffer[index] <= 0 ? 0 : go[index];
+            inputGrad += gradient * weight.buffer[wRow + oc];
+            gw[wRow + oc] += gradient * inputValue;
+          }
+          gi[inputIndex] += inputGrad;
+        }
+      }
     }
   }
 }
@@ -935,23 +958,44 @@ function backwardConvTranspose2D(node, go, grads) {
     backwardFailure(node, 'ConvTranspose2D requires NHWC input/output and rank-4 F32 weights');
   }
   const [batch, inHeight, inWidth, inChannels] = input.shape, [, outHeight, outWidth, outChannels] = output.shape;
-  const [, weightOutChannels, kernelY, kernelX] = weight.shape;
+  // HWIO weights [kh, kw, in_c, out_c].
+  const [kernelY, kernelX, weightInChannels, weightOutChannels] = weight.shape;
   const [strideY, strideX] = normalizeSpatialPair(node.params?.stride, 1);
   const [padY, padX] = normalizeSpatialPair(node.params?.padding, 0);
-  if (weight.shape[0] !== inChannels || weightOutChannels !== outChannels ||
+  if (weightInChannels !== inChannels || weightOutChannels !== outChannels ||
       outHeight !== (inHeight - 1) * strideY + kernelY - 2 * padY || outWidth !== (inWidth - 1) * strideX + kernelX - 2 * padX) {
     backwardFailure(node, 'ConvTranspose2D has incompatible dimensions or output shape');
   }
   const gi = gradFor(grads, input), gw = gradFor(grads, weight), gb = bias?.dtype === 'float32' ? gradFor(grads, bias) : null;
-  for (let b = 0; b < batch; b++) for (let iy = 0; iy < inHeight; iy++) for (let ix = 0; ix < inWidth; ix++) for (let ic = 0; ic < inChannels; ic++) for (let oc = 0; oc < outChannels; oc++) for (let ky = 0; ky < kernelY; ky++) for (let kx = 0; kx < kernelX; kx++) {
-    const oy = iy * strideY - padY + ky, ox = ix * strideX - padX + kx;
-    if (oy < 0 || oy >= outHeight || ox < 0 || ox >= outWidth) continue;
-    const inputIndex = ((b * inHeight + iy) * inWidth + ix) * inChannels + ic;
-    const weightIndex = ((ic * outChannels + oc) * kernelY + ky) * kernelX + kx;
-    const outputIndex = ((b * outHeight + oy) * outWidth + ox) * outChannels + oc;
-    gi[inputIndex] += go[outputIndex] * weight.buffer[weightIndex];
-    gw[weightIndex] += go[outputIndex] * input.buffer[inputIndex];
-    if (gb) gb[oc] += go[outputIndex];
+  if (gb) {
+    for (let b = 0; b < batch; b++) for (let oy = 0; oy < outHeight; oy++) for (let ox = 0; ox < outWidth; ox++) {
+      const outBase = ((b * outHeight + oy) * outWidth + ox) * outChannels;
+      for (let oc = 0; oc < outChannels; oc++) gb[oc] += go[outBase + oc];
+    }
+  }
+  for (let b = 0; b < batch; b++) for (let iy = 0; iy < inHeight; iy++) for (let ix = 0; ix < inWidth; ix++) {
+    const inBase = ((b * inHeight + iy) * inWidth + ix) * inChannels;
+    for (let ky = 0; ky < kernelY; ky++) {
+      const oy = iy * strideY - padY + ky;
+      if (oy < 0 || oy >= outHeight) continue;
+      for (let kx = 0; kx < kernelX; kx++) {
+        const ox = ix * strideX - padX + kx;
+        if (ox < 0 || ox >= outWidth) continue;
+        const outBase = ((b * outHeight + oy) * outWidth + ox) * outChannels;
+        const wTap = (ky * kernelX + kx) * inChannels * outChannels;
+        for (let ic = 0; ic < inChannels; ic++) {
+          const wRow = wTap + ic * outChannels;
+          const inputValue = input.buffer[inBase + ic];
+          let inputGrad = 0;
+          for (let oc = 0; oc < outChannels; oc++) {
+            const upstream = go[outBase + oc];
+            inputGrad += upstream * weight.buffer[wRow + oc];
+            gw[wRow + oc] += upstream * inputValue;
+          }
+          gi[inBase + ic] += inputGrad;
+        }
+      }
+    }
   }
 }
 
@@ -975,13 +1019,26 @@ function backwardMoELinear(node, go, grads) {
   const dOut = output.shape[output.shape.length - 1];
   const rows = input.buffer.length / dIn;
   const topK = routeIndices.shape[routeIndices.shape.length - 1];
+  // Routes stay global for a partially resident bank; gradients accumulate
+  // into the staged rows, so only the resident families are trained.
+  const residentSlots = node.residentSlots || null;
+  const slotToRow: Map<number, number> | null = residentSlots === null
+    ? null
+    : new Map(residentSlots.map((globalSlot, row) => [globalSlot, row] as [number, number]));
+  if (residentSlots !== null && residentSlots.length !== expertWeight.shape[0]) {
+    backwardFailure(node, 'residentSlots must match the staged expert rows');
+  }
   for (let row = 0; row < rows; row++) {
     for (let slot = 0; slot < topK; slot++) {
       const routeOffset = row * topK + slot;
-      const expert = Math.trunc(routeIndices.buffer[routeOffset]);
-      if (!Number.isInteger(expert) || expert < 0 || expert >= expertWeight.shape[0]) {
+      const routed = Math.trunc(routeIndices.buffer[routeOffset]);
+      const known = slotToRow === null
+        ? routed < expertWeight.shape[0]
+        : slotToRow.has(routed);
+      if (!Number.isInteger(routed) || routed < 0 || !known) {
         backwardFailure(node, `expert index ${routeIndices.buffer[routeOffset]} is out of range`);
       }
+      const expert = slotToRow === null ? routed : slotToRow.get(routed)!;
       const gate = routeWeights.buffer[routeOffset];
       const expertBase = expert * dIn * dOut;
       for (let col = 0; col < dOut; col++) {
@@ -1119,7 +1176,7 @@ class CPUTrainingForwardEngine extends CPUEngine {
 export class CPUAutograd {
   /** @internal Trainer-owned forward entry used by gradient verification tests. */
   static async _forward(
-    graph: Graph,
+    graph: RuntimeGraph,
     inputs: Record<string, RuntimeTypedArray>,
     dropout: TrainingDropoutContext,
   ): Promise<void> {
@@ -1128,14 +1185,14 @@ export class CPUAutograd {
     await engine.execute(graph, inputs, { adapter: null });
   }
 
-  static async trainStep(graph: Graph, options: TrainingStepOptions = {}) {
+  static async trainStep(graph: RuntimeGraph, options: TrainingKernelStepOptions = {}) {
     return this._trainStepWithExecution(ensureTrainingGraphState(graph), options, null);
   }
 
   /** Internal execution hook used by strict accelerated training backends. */
   static async _trainStepWithExecution(
     graph: any,
-    options: TrainingStepOptions = {},
+    options: TrainingKernelStepOptions = {},
     execution: AcceleratedTrainingExecution | null = null,
   ) {
     const {
@@ -1153,6 +1210,8 @@ export class CPUAutograd {
       gradientAccumulationSteps = 1,
       flushGradientAccumulation = false,
       resetGradientAccumulation = false,
+      shapeSignature = graph?.trainingShapeSignature ?? '',
+      tacticSignature = graph?.trainingTacticSignature ?? '',
     } = options;
     if (!graph) throw new Error("CPUAutograd.trainStep requires a graph.");
     ensureTrainingGraphState(graph);
@@ -1215,6 +1274,7 @@ export class CPUAutograd {
     const trainingDropout = dropoutContext({
       seed: dropout.seed ?? 0,
       counter: dropout.counter ?? defaultDropoutCounter,
+      shapeSignature,
     });
 
     if (execution?.forward) {
@@ -1418,20 +1478,31 @@ export class CPUAutograd {
         }
       } else if (node.opType === "MaxPool2D" || node.opType === "AveragePool" || node.opType === "AveragePool2D") {
         const input = nodeInput(node);
-        if (input?.dtype !== "float32" || input.shape.length !== 4 || out?.dtype !== "float32") backwardFailure(node, `${node.opType} requires rank-4 NHWC F32 tensors`);
+        if (input?.dtype !== "float32" || input.shape.length !== 4 || out?.dtype !== "float32" || out.shape.length !== 4) backwardFailure(node, `${node.opType} requires rank-4 NHWC F32 tensors`);
         const [batch, height, width, channels] = input.shape;
         const [, outHeight, outWidth] = out.shape;
-        const [kernelY, kernelX] = node.params?.kernel || [];
-        const [strideY, strideX] = node.params?.stride || [1, 1];
-        const [padY, padX] = node.params?.padding || [0, 0];
-        if (![kernelY, kernelX, strideY, strideX, padY, padX].every(Number.isInteger) || kernelY <= 0 || kernelX <= 0 || strideY <= 0 || strideX <= 0 || padY < 0 || padX < 0) backwardFailure(node, `${node.opType} has unsupported pooling parameters`);
+        const params = node.params || {};
+        const [kernelY, kernelX] = spatialPair(params.kernel, 1, node.opType, 'kernel', false, true);
+        const [strideY, strideX] = spatialPair(params.stride, 1, node.opType, 'stride', false);
+        const pads = fullSpatialPads(params, node.opType, node.opType !== "MaxPool2D");
+        const expectedHeight = checkedWindowOutput(
+          height, kernelY, strideY, pads[0], pads[2], 1, `${node.opType} backward output height`,
+        );
+        const expectedWidth = checkedWindowOutput(
+          width, kernelX, strideX, pads[1], pads[3], 1, `${node.opType} backward output width`,
+        );
+        if (out.shape[0] !== batch || outHeight !== expectedHeight || outWidth !== expectedWidth ||
+            out.shape[3] !== channels) {
+          backwardFailure(node, `${node.opType} output shape is incompatible with its canonical pooling parameters`);
+        }
+        const [padY, padX] = pads;
         const gi = gradFor(grads, input);
         for (let n=0;n<batch;n++) for (let oy=0;oy<outHeight;oy++) for (let ox=0;ox<outWidth;ox++) {
           if (node.opType === "MaxPool2D") {
             for (let c=0;c<channels;c++) {
               let best = -Infinity, bestIndex = -1;
               for (let ky=0;ky<kernelY;ky++) for (let kx=0;kx<kernelX;kx++) { const iy=oy*strideY+ky-padY, ix=ox*strideX+kx-padX; if(iy>=0&&iy<height&&ix>=0&&ix<width){const index=((n*height+iy)*width+ix)*channels+c; if(input.buffer[index]>best){best=input.buffer[index];bestIndex=index;}} }
-              gi[bestIndex] += go[((n*outHeight+oy)*outWidth+ox)*channels+c];
+              if (bestIndex >= 0) gi[bestIndex] += go[((n*outHeight+oy)*outWidth+ox)*channels+c];
             }
           } else {
             let count = 0;
@@ -1901,6 +1972,8 @@ export class CPUAutograd {
     }
     const accumulationSignature = JSON.stringify({
       backend: backendName,
+      activationShapeSignature: shapeSignature,
+      tacticSignature,
       topologyRevision,
       weightRevision,
       trainableTensors,

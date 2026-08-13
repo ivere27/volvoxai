@@ -70,6 +70,144 @@ static int check_one_shot_matmul_tails_and_fallback(void) {
     return 0;
 }
 
+static void reference_graph_linear(const float* input, const float* weight,
+                                   const float* bias, float* output, int rows,
+                                   int d_in, int d_out,
+                                   int output_major_weight) {
+    for (int row = 0; row < rows; row++) {
+        for (int column = 0; column < d_out; column++) {
+            float sum = bias ? bias[column] : 0.0f;
+            for (int k = 0; k < d_in; k++) {
+                size_t weight_index = output_major_weight
+                    ? (size_t)column * (size_t)d_in + (size_t)k
+                    : (size_t)k * (size_t)d_out + (size_t)column;
+                sum += input[(size_t)row * (size_t)d_in + (size_t)k] *
+                    weight[weight_index];
+            }
+            output[(size_t)row * (size_t)d_out + (size_t)column] = sum;
+        }
+    }
+}
+
+static int run_reserved_graph_linear(
+        float* input, const float* weight, float* output, float* expected,
+        int rows, int d_in, int d_out, const char* signature) {
+    size_t input_bytes = (size_t)rows * (size_t)d_in * sizeof(float);
+    size_t output_bytes = (size_t)rows * (size_t)d_out * sizeof(float);
+    fill_f32_matrix(input, (size_t)rows * (size_t)d_in,
+                    7 + rows, 29, 14, 0.03125f);
+    reference_graph_linear(input, weight, NULL, expected, rows, d_in, d_out, 1);
+    CHECK(opengl_graph_bind_shape_domain(
+              signature, (VolvoxAIEnginePhysicalSpan[2]){
+                  {input, (size_t)17 * 19 * sizeof(float)},
+                  {output, (size_t)17 * 23 * sizeof(float)},
+              }, 2u, 0u, 0u) == 0);
+    opengl_graph_mark_host(input, input_bytes, 0);
+    opengl_graph_begin_forward();
+    CHECK(opengl_graph_linear_f32(input, weight, NULL, output,
+                                  rows, d_in, d_out, 1) == 1);
+    CHECK(opengl_graph_end_forward() == 0);
+    CHECK(opengl_graph_sync_host(output, output_bytes, 0) == 1);
+    for (int index = 0; index < rows * d_out; index++)
+        CHECK(fabsf(output[index] - expected[index]) <= 1.0e-4f);
+    return 0;
+}
+
+static int check_graph_linear_dynamic_domain(void) {
+    enum { MAX_ROWS = 17, D_IN = 19, D_OUT = 23 };
+    float arena[MAX_ROWS * D_IN + MAX_ROWS * D_OUT];
+    float* input = arena;
+    float* output = arena + MAX_ROWS * D_IN;
+    float weight[D_OUT * D_IN];
+    float input_major_weight[D_IN * D_OUT];
+    float bias[D_OUT];
+    float narrower_weight[17 * D_IN];
+    float narrower_output[17];
+    float expected[MAX_ROWS * D_OUT];
+    OpenGLGraphDynamicStateProbe reserved = {0};
+    OpenGLGraphDynamicStateProbe maximum = {0};
+    OpenGLGraphDynamicStateProbe rebound = {0};
+    OpenGLGraphDynamicStateProbe rejected = {0};
+    const VolvoxAIEnginePhysicalSpan spans[2] = {
+        {input, sizeof(float) * MAX_ROWS * D_IN},
+        {output, sizeof(float) * MAX_ROWS * D_OUT},
+    };
+    fill_f32_matrix(weight, D_OUT * D_IN, 11, 31, 15, 0.015625f);
+    fill_f32_matrix(narrower_weight, 17 * D_IN,
+                    9, 23, 11, 0.015625f);
+    for (int k = 0; k < D_IN; k++)
+        for (int column = 0; column < D_OUT; column++)
+            input_major_weight[k * D_OUT + column] =
+                weight[column * D_IN + k];
+    fill_f32_matrix(bias, D_OUT, 5, 13, 6, 0.0625f);
+    fill_f32_matrix(input, D_IN, 3, 17, 8, 0.0625f);
+
+    opengl_graph_reset();
+    CHECK(opengl_graph_bind_shape("linear:input-major-tiled") == 0);
+    fill_f32_matrix(input, MAX_ROWS * D_IN, 13, 29, 14, 0.03125f);
+    reference_graph_linear(input, input_major_weight, bias, expected,
+                           MAX_ROWS, D_IN, D_OUT, 0);
+    opengl_graph_begin_forward();
+    CHECK(opengl_graph_linear_f32(
+              input, input_major_weight, bias, output,
+              MAX_ROWS, D_IN, D_OUT, 0) == 1);
+    CHECK(opengl_graph_end_forward() == 0);
+    CHECK(opengl_graph_sync_host(output, sizeof(expected), 0) == 1);
+    for (int index = 0; index < MAX_ROWS * D_OUT; index++)
+        CHECK(fabsf(output[index] - expected[index]) <= 1.0e-4f);
+    opengl_graph_reset();
+
+    CHECK(opengl_graph_bind_shape("linear:bootstrap") == 0);
+    opengl_graph_begin_forward();
+    CHECK(opengl_graph_linear_f32(input, weight, NULL, output,
+                                  1, D_IN, D_OUT, 1) == 1);
+    /* Distinct null-bias widths retain distinct invariant host keys. */
+    CHECK(opengl_graph_linear_f32(input, narrower_weight, NULL,
+                                  narrower_output, 1, D_IN, 17, 1) == 1);
+    CHECK(opengl_graph_end_forward() == 0);
+    CHECK(opengl_graph_sync_host(output, D_OUT * sizeof(float), 0) == 1);
+    CHECK(opengl_graph_bind_shape_domain(
+              "linear:q1", spans, 2u, 0u, 0u) == 0);
+    CHECK(opengl_graph_debug_dynamic_state(&reserved) == 0);
+    CHECK(reserved.domain_enforced && reserved.domain_span_count == 2u &&
+          reserved.slot_count == 7);
+
+    CHECK(run_reserved_graph_linear(input, weight, output, expected,
+                                    1, D_IN, D_OUT, "linear:q1") == 0);
+    CHECK(run_reserved_graph_linear(input, weight, output, expected,
+                                    MAX_ROWS, D_IN, D_OUT,
+                                    "linear:q17") == 0);
+    CHECK(opengl_graph_debug_dynamic_state(&maximum) == 0);
+    CHECK(maximum.capacity_generation == reserved.capacity_generation &&
+          maximum.active_capacity_bytes == reserved.active_capacity_bytes);
+    CHECK(run_reserved_graph_linear(input, weight, output, expected,
+                                    1, D_IN, D_OUT, "linear:q1") == 0);
+    CHECK(opengl_graph_debug_dynamic_state(&rebound) == 0);
+    CHECK(rebound.capacity_generation == maximum.capacity_generation &&
+          rebound.active_capacity_bytes == maximum.active_capacity_bytes);
+
+    opengl_graph_begin_forward();
+    CHECK(opengl_graph_linear_f32(input, weight, NULL, input,
+                                  1, D_IN, D_OUT, 1) == 0);
+    CHECK(opengl_graph_linear_f32(input, weight, NULL, input + 1,
+                                  1, D_IN, D_OUT, 1) == 0);
+    CHECK(opengl_graph_linear_f32(input, weight, NULL, output,
+                                  0, D_IN, D_OUT, 1) == 0);
+    CHECK(opengl_graph_linear_f32(input, weight, NULL, output,
+                                  1, D_IN, D_OUT, 2) == 0);
+    CHECK(opengl_graph_linear_f32(input, weight, NULL, output,
+                                  MAX_ROWS + 1, D_IN, D_OUT, 1) == 0);
+    CHECK(opengl_graph_end_forward() == 0);
+    CHECK(opengl_graph_debug_dynamic_state(&rejected) == 0);
+    CHECK(rejected.capacity_generation == rebound.capacity_generation &&
+          rejected.active_capacity_bytes == rebound.active_capacity_bytes &&
+          rejected.slot_count == rebound.slot_count);
+    CHECK(run_reserved_graph_linear(input, weight, output, expected,
+                                    1, D_IN, D_OUT, "linear:q1") == 0);
+    opengl_graph_reset();
+    return 0;
+}
+
 static int check_tiled_qlinear_i8u8_tails(void) {
     enum { ROWS = 9, D_IN = 19, D_OUT = 36 };
     int8_t input[ROWS * D_IN];
@@ -1987,6 +2125,223 @@ static int check_qbatch_and_typed_transpose(void) {
     return 0;
 }
 
+static int check_dynamic_shape_capacity_lifecycle(void) {
+    float small_input_a[4] = {1.0f, 2.0f, 3.0f, 4.0f};
+    float small_output_a[4] = {0};
+    float small_input_b[4] = {5.0f, 6.0f, 7.0f, 8.0f};
+    float small_output_b[4] = {0};
+    float large_input[128];
+    float large_output[128] = {0};
+    OpenGLGraphDynamicStateProbe bound = {0};
+    OpenGLGraphDynamicStateProbe active = {0};
+    OpenGLGraphDynamicStateProbe pooled = {0};
+    OpenGLGraphDynamicStateProbe reused = {0};
+    OpenGLGraphDynamicStateProbe grown = {0};
+    for (int index = 0; index < 128; index++)
+        large_input[index] = (float)(index - 17);
+
+    opengl_graph_reset();
+    CHECK(opengl_graph_bind_shape("copy:f32:[4]->[4]") == 0);
+    CHECK(opengl_graph_debug_dynamic_state(&bound) == 0);
+    CHECK(bound.shape_generation != 0);
+    CHECK(opengl_graph_bind_shape("copy:f32:[4]->[4]") == 0);
+    CHECK(opengl_graph_debug_dynamic_state(&active) == 0);
+    CHECK(active.shape_generation == bound.shape_generation);
+    CHECK(opengl_graph_bind_shape("") == -1);
+    CHECK(opengl_graph_debug_dynamic_state(&active) == 0);
+    CHECK(active.shape_generation == bound.shape_generation);
+
+    opengl_graph_begin_forward();
+    CHECK(opengl_graph_copy_f32(small_input_a, small_output_a, 4) == 1);
+    CHECK(opengl_graph_end_forward() == 0);
+    CHECK(opengl_graph_sync_host(
+              small_output_a, sizeof(small_output_a), 0) == 1);
+    CHECK(memcmp(small_input_a, small_output_a, sizeof(small_input_a)) == 0);
+    CHECK(opengl_graph_debug_dynamic_state(&active) == 0);
+    CHECK(active.active_capacity_bytes > 0 && active.pooled_capacity_bytes == 0 &&
+          active.slot_count == 2);
+
+    CHECK(opengl_graph_bind_shape("copy:f32:[1,4]->[1,4]") == 0);
+    CHECK(opengl_graph_debug_dynamic_state(&pooled) == 0);
+    CHECK(pooled.shape_generation != active.shape_generation &&
+          pooled.capacity_generation == active.capacity_generation &&
+          pooled.active_capacity_bytes == 0 &&
+          pooled.pooled_capacity_bytes == active.active_capacity_bytes &&
+          pooled.slot_count == active.slot_count);
+    opengl_graph_begin_forward();
+    CHECK(opengl_graph_copy_f32(small_input_b, small_output_b, 4) == 1);
+    CHECK(opengl_graph_end_forward() == 0);
+    CHECK(opengl_graph_sync_host(
+              small_output_b, sizeof(small_output_b), 0) == 1);
+    CHECK(memcmp(small_input_b, small_output_b, sizeof(small_input_b)) == 0);
+    CHECK(opengl_graph_debug_dynamic_state(&reused) == 0);
+    CHECK(reused.capacity_generation == pooled.capacity_generation &&
+          reused.slot_count == pooled.slot_count &&
+          reused.active_capacity_bytes == active.active_capacity_bytes);
+
+    CHECK(opengl_graph_bind_shape("copy:f32:[128]->[128]") == 0);
+    opengl_graph_begin_forward();
+    CHECK(opengl_graph_copy_f32(large_input, large_output, 128) == 1);
+    CHECK(opengl_graph_end_forward() == 0);
+    CHECK(opengl_graph_sync_host(large_output, sizeof(large_output), 0) == 1);
+    CHECK(memcmp(large_input, large_output, sizeof(large_input)) == 0);
+    CHECK(opengl_graph_debug_dynamic_state(&grown) == 0);
+    CHECK(grown.capacity_generation > reused.capacity_generation &&
+          grown.active_capacity_bytes >= sizeof(large_input) * 2u &&
+          grown.slot_count == reused.slot_count);
+    opengl_graph_reset();
+    return 0;
+}
+
+static int check_dynamic_domain_reservation(void) {
+    const size_t qgroupnorm_stats_bytes = 64u;
+    const size_t qlayernorm_stats_bytes = 80u;
+    float arena[64] = {0};
+    float bootstrap_input[4] = {1.0f, 2.0f, 3.0f, 4.0f};
+    const float invariant[4] = {0.5f, 1.5f, 2.5f, 3.5f};
+    float bootstrap_output[4] = {0};
+    float missing_input[4] = {0};
+    float missing_output[4] = {0};
+    const VolvoxAIEnginePhysicalSpan spans[2] = {
+        {arena, 32u * sizeof(float)},
+        {arena + 32, 32u * sizeof(float)},
+    };
+    const VolvoxAIEnginePhysicalSpan mismatch[2] = {
+        {arena, 31u * sizeof(float)},
+        {arena + 32, 32u * sizeof(float)},
+    };
+    OpenGLDomainLimits limits = {0};
+    OpenGLGraphDynamicStateProbe before = {0};
+    OpenGLGraphDynamicStateProbe rolled_back = {0};
+    OpenGLGraphDynamicStateProbe reserved = {0};
+    OpenGLGraphDynamicStateProbe same = {0};
+    OpenGLGraphDynamicStateProbe rebound = {0};
+    OpenGLGraphDynamicStateProbe executed = {0};
+
+    CHECK(opengl_query_domain_limits(&limits) == 0);
+    CHECK(limits.maximum_storage_buffer_bytes >= spans[0].capacity_bytes &&
+          limits.maximum_uniform_buffer_bytes > 0u &&
+          limits.maximum_workgroups[0] > 0u &&
+          limits.maximum_workgroup_size[0] > 0u &&
+          limits.maximum_workgroup_invocations > 0u &&
+          limits.maximum_storage_bindings > 0u &&
+          limits.maximum_uniform_bindings > 0u &&
+          limits.maximum_tensor_slots >= 2u);
+
+    opengl_graph_reset();
+    CHECK(opengl_graph_bind_shape("domain:published") == 0);
+    opengl_graph_begin_forward();
+    CHECK(opengl_graph_add_f32(
+              bootstrap_input, invariant, bootstrap_output, 4) == 1);
+    CHECK(opengl_graph_end_forward() == 0);
+    CHECK(opengl_graph_sync_host(
+              bootstrap_output, sizeof(bootstrap_output), 0) == 1);
+    opengl_graph_retain_weight(bootstrap_input, sizeof(bootstrap_input));
+    opengl_graph_demote_weight(bootstrap_input, sizeof(bootstrap_input));
+    opengl_graph_retain_weight(invariant, sizeof(invariant));
+    CHECK(opengl_graph_debug_dynamic_state(&before) == 0);
+    CHECK(opengl_test_fail_domain_allocation_after(1u) == 0);
+    CHECK(opengl_graph_bind_shape_domain(
+              "domain:q4", spans, 2u, qgroupnorm_stats_bytes,
+              qlayernorm_stats_bytes) == -2);
+    CHECK(opengl_graph_debug_dynamic_state(&rolled_back) == 0);
+    CHECK(rolled_back.shape_generation == before.shape_generation &&
+          rolled_back.capacity_generation == before.capacity_generation &&
+          rolled_back.active_capacity_bytes == before.active_capacity_bytes &&
+          rolled_back.pooled_capacity_bytes == before.pooled_capacity_bytes &&
+          rolled_back.domain_scratch_capacity_bytes ==
+              before.domain_scratch_capacity_bytes &&
+          rolled_back.domain_span_count == 0u &&
+          rolled_back.slot_count == before.slot_count &&
+          !rolled_back.domain_enforced);
+    CHECK(opengl_test_fail_domain_allocation_after(3u) == 0);
+    CHECK(opengl_graph_bind_shape_domain(
+              "domain:q4", spans, 2u, qgroupnorm_stats_bytes,
+              qlayernorm_stats_bytes) == -2);
+    CHECK(opengl_graph_debug_dynamic_state(&rolled_back) == 0);
+    CHECK(rolled_back.shape_generation == before.shape_generation &&
+          rolled_back.capacity_generation == before.capacity_generation &&
+          rolled_back.active_capacity_bytes == before.active_capacity_bytes &&
+          rolled_back.pooled_capacity_bytes == before.pooled_capacity_bytes &&
+          rolled_back.domain_scratch_capacity_bytes ==
+              before.domain_scratch_capacity_bytes &&
+          rolled_back.domain_span_count == 0u &&
+          rolled_back.slot_count == before.slot_count &&
+          !rolled_back.domain_enforced);
+
+    CHECK(opengl_graph_bind_shape_domain(
+              "domain:q4", spans, 2u, qgroupnorm_stats_bytes,
+              qlayernorm_stats_bytes) == 0);
+    CHECK(opengl_graph_debug_dynamic_state(&reserved) == 0);
+    CHECK(reserved.shape_generation != before.shape_generation &&
+          reserved.capacity_generation != before.capacity_generation &&
+          reserved.active_capacity_bytes ==
+              spans[0].capacity_bytes * 2u + sizeof(invariant) &&
+          reserved.pooled_capacity_bytes == 0u &&
+          reserved.domain_scratch_capacity_bytes ==
+              qgroupnorm_stats_bytes + qlayernorm_stats_bytes &&
+          reserved.domain_span_count == 2u && reserved.slot_count == 3 &&
+          reserved.domain_enforced);
+
+    CHECK(opengl_graph_bind_shape_domain(
+              "domain:q4", spans, 2u, qgroupnorm_stats_bytes,
+              qlayernorm_stats_bytes) == 0);
+    CHECK(opengl_graph_debug_dynamic_state(&same) == 0);
+    CHECK(same.shape_generation == reserved.shape_generation &&
+          same.capacity_generation == reserved.capacity_generation &&
+          same.active_capacity_bytes == reserved.active_capacity_bytes &&
+          same.domain_scratch_capacity_bytes ==
+              reserved.domain_scratch_capacity_bytes &&
+          same.slot_count == reserved.slot_count);
+
+    CHECK(opengl_graph_bind_shape_domain(
+              "domain:q8", spans, 2u, qgroupnorm_stats_bytes,
+              qlayernorm_stats_bytes) == 0);
+    CHECK(opengl_graph_debug_dynamic_state(&rebound) == 0);
+    CHECK(rebound.shape_generation != same.shape_generation &&
+          rebound.capacity_generation == same.capacity_generation &&
+          rebound.active_capacity_bytes == same.active_capacity_bytes &&
+          rebound.domain_scratch_capacity_bytes ==
+              same.domain_scratch_capacity_bytes &&
+          rebound.slot_count == same.slot_count);
+    CHECK(opengl_graph_bind_shape_domain(
+              "domain:q8", spans, 2u, qgroupnorm_stats_bytes + 1u,
+              qlayernorm_stats_bytes) == -1);
+    CHECK(opengl_graph_bind_shape_domain(
+              "domain:q8", mismatch, 2u, qgroupnorm_stats_bytes,
+              qlayernorm_stats_bytes) == -1);
+    CHECK(opengl_graph_debug_dynamic_state(&executed) == 0);
+    CHECK(executed.shape_generation == rebound.shape_generation &&
+          executed.capacity_generation == rebound.capacity_generation &&
+          executed.active_capacity_bytes == rebound.active_capacity_bytes &&
+          executed.domain_scratch_capacity_bytes ==
+              rebound.domain_scratch_capacity_bytes &&
+          executed.slot_count == rebound.slot_count);
+    CHECK(opengl_graph_bind_shape("domain:legacy") == -1);
+
+    for (int index = 0; index < 4; index++) arena[index] = (float)(index + 3);
+    opengl_graph_begin_forward();
+    CHECK(opengl_graph_add_f32(arena, invariant, arena + 32, 4) == 1);
+    CHECK(opengl_graph_end_forward() == 0);
+    CHECK(opengl_graph_sync_host(arena + 32, 4u * sizeof(float), 0) == 1);
+    for (int index = 0; index < 4; index++)
+        CHECK(arena[32 + index] == arena[index] + invariant[index]);
+    opengl_graph_begin_forward();
+    CHECK(opengl_graph_alias_f32(arena, arena + 32, 4) == 1);
+    CHECK(opengl_graph_end_forward() == 0);
+    CHECK(opengl_graph_sync_host(arena + 32, 4u * sizeof(float), 0) == 1);
+    CHECK(memcmp(arena, arena + 32, 4u * sizeof(float)) == 0);
+    opengl_graph_begin_forward();
+    CHECK(opengl_graph_copy_f32(missing_input, missing_output, 4) == 0);
+    CHECK(opengl_graph_end_forward() == 0);
+    CHECK(opengl_graph_debug_dynamic_state(&executed) == 0);
+    CHECK(executed.capacity_generation == rebound.capacity_generation &&
+          executed.active_capacity_bytes == rebound.active_capacity_bytes &&
+          executed.slot_count == rebound.slot_count);
+    opengl_graph_reset();
+    return 0;
+}
+
 int main(void) {
     VxEngineState* engine_state =
         (VxEngineState*)calloc(1, sizeof(*engine_state));
@@ -2105,6 +2460,7 @@ int main(void) {
     CHECK(opengl_training_supports("notARealShader", "main", copy_bytes, 3,
                                    1, 1, 1) == 0);
     CHECK(check_one_shot_matmul_tails_and_fallback() == 0);
+    CHECK(check_graph_linear_dynamic_domain() == 0);
     CHECK(check_tiled_qlinear_i8u8_tails() == 0);
     CHECK(check_tiled_qlinear_staged_rounding() == 0);
     CHECK(check_lazy_training_dispatch() == 0);
@@ -2128,6 +2484,8 @@ int main(void) {
     CHECK(check_typed_control_graph_ops() == 0);
     CHECK(check_expand_f32_uniform_abi() == 0);
     CHECK(check_qbatch_and_typed_transpose() == 0);
+    CHECK(check_dynamic_shape_capacity_lifecycle() == 0);
+    CHECK(check_dynamic_domain_reservation() == 0);
     CHECK(opengl_training_debug_compile_all() == 0);
     int programs = 0, buffers = -1, inference_buffers = -1;
     opengl_training_debug_resource_counts(&programs, &buffers, &inference_buffers);

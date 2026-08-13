@@ -177,6 +177,7 @@ set(RUNTIME_SRCS
   src/runtime/safetensors.c src/runtime/adapter_runtime.c src/runtime/attention_mask.c
   src/runtime/sequence_runtime.c src/runtime/backend.c src/runtime/arena.c
   src/runtime/backend_sdk.c src/runtime/runtime_state.c src/runtime/public_api.c
+  src/runtime/shape_contract.c
   src/runtime/incremental_runtime.c src/runtime/decode_session.c
   src/backends/w8a8_device_ops.c src/runtime/engine_runtime.c src/runtime/engine.c)
 set(KERNEL_SRCS
@@ -193,7 +194,7 @@ set(KERNEL_SRCS
 # conv_f32_opt.c holds hand-written AVX2 conv bodies behind `#if
 # defined(__AVX2__)`.  Compiling it only at VOLVOXAI_CPU_TARGET (default
 # `baseline`) preprocessed them away, so AVX2 machines ran the scalar fallback —
-# 23.5x slower on the TinyReceiptVQA encoder's Conv2D nodes.  Build the same
+# substantially slower on representative encoder Conv2D nodes.  Build the same
 # source a second time with the higher ISA and let conv_f32_dispatch.c pick at
 # runtime.  Only this one file gets the flags, and it is reached only after a
 # vx_kernel_platform() check, so the binary's own CPU requirement is unchanged.
@@ -226,6 +227,10 @@ if(VOLVOXAI_ENABLE_CUDA)
   if(NOT VOLVOXAI_CUDA_ARCH MATCHES "^[0-9]+$")
     message(FATAL_ERROR
       "VOLVOXAI_CUDA_ARCH must be a numeric compute capability such as 75 or 86")
+  endif()
+  if(VOLVOXAI_CUDA_ARCH LESS 61)
+    message(FATAL_ERROR
+      "VOLVOXAI_CUDA_ARCH must be at least 61 for the exact DP4A W8A8 kernels")
   endif()
 
   if(VOLVOXAI_CUDA_FAST_FP32)
@@ -455,7 +460,11 @@ add_custom_command(
   COMMAND ${CMAKE_COMMAND} -E make_directory ${GEN}
   # compile_shaders.sh drives `cargo`, which chokes on make's jobserver when
   # run as a build step; clear MAKEFLAGS so cargo builds standalone.
-  COMMAND ${CMAKE_COMMAND} -E env MAKEFLAGS= MAKELEVEL= ${REPO}/tools/compile_shaders.sh
+  # An optional absolute prebuilt compiler is forwarded for hermetic builders
+  # that intentionally do not install Cargo.
+  COMMAND ${CMAKE_COMMAND} -E env MAKEFLAGS= MAKELEVEL=
+          VOLVOXAI_NATIVE_SHADER_COMPILER=$ENV{VOLVOXAI_NATIVE_SHADER_COMPILER}
+          ${REPO}/tools/compile_shaders.sh
   COMMAND ${CMAKE_COMMAND} -E touch ${SHADER_STAMP}
   WORKING_DIRECTORY ${REPO}
   DEPENDS ${WGSL_SOURCES} ${REPO}/tools/compile_shaders.sh
@@ -565,10 +574,43 @@ volvox_test(test_runtime_state
   DEFS VOLVOXAI_ENABLE_TRAINING=0
   OPTS -std=c11 -O2 -Wall -Wextra -Werror)
 
+volvox_test(test_wasm_heap_arena
+  SOURCES src/kernels/core.c tests/test_wasm_heap_arena.c
+  DEFS VOLVOXAI_ENABLE_TRAINING=0
+  OPTS -std=c11 -O2 -Wall -Wextra -Werror)
+
+volvox_test(test_shape_contract_vectors
+  SOURCES third_party/cJSON.c src/runtime/shape_contract.c
+          tests/test_shape_contract_vectors.c
+  DEFS VOLVOXAI_ENABLE_TRAINING=0
+  OPTS -std=c11 -O2 -Wall -Wextra -Werror
+  RUN_ARGS ${REPO}/tests/operator_shape_contract_vectors.json)
+add_test(NAME test_shape_contract_spatial_vectors
+  COMMAND $<TARGET_FILE:test_shape_contract_vectors>
+          ${REPO}/tests/operator_shape_contract_spatial_vectors.json)
+set_tests_properties(test_shape_contract_spatial_vectors PROPERTIES LABELS native)
+add_test(NAME test_shape_contract_wave_b_vectors
+  COMMAND $<TARGET_FILE:test_shape_contract_vectors>
+          ${REPO}/tests/operator_shape_contract_wave_b_vectors.json)
+set_tests_properties(test_shape_contract_wave_b_vectors PROPERTIES LABELS native)
+add_test(NAME test_shape_contract_attention_vectors
+  COMMAND $<TARGET_FILE:test_shape_contract_vectors>
+          ${REPO}/tests/operator_shape_contract_attention_vectors.json)
+set_tests_properties(test_shape_contract_attention_vectors PROPERTIES LABELS native)
+add_test(NAME test_shape_contract_quantized_vectors
+  COMMAND $<TARGET_FILE:test_shape_contract_vectors>
+          ${REPO}/tests/operator_shape_contract_quantized_vectors.json)
+set_tests_properties(test_shape_contract_quantized_vectors PROPERTIES LABELS native)
+add_test(NAME test_shape_contract_final_vectors
+  COMMAND $<TARGET_FILE:test_shape_contract_vectors>
+          ${REPO}/tests/operator_shape_contract_final_vectors.json)
+set_tests_properties(test_shape_contract_final_vectors PROPERTIES LABELS native)
+
 volvox_test(test_nnapi_state_ownership
   SOURCES src/runtime/runtime_state.c src/kernels/thread_pool.c
           src/backends/nnapi_engine.c tests/test_nnapi_state_ownership.c
   DEFS VOLVOXAI_ENABLE_TRAINING=0 __ANDROID__=1
+       VOLVOXAI_NNAPI_TESTING=1
   OPTS -std=c11 -O2 -Wall -Wextra -Werror)
 target_include_directories(test_nnapi_state_ownership PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/tests/fake_android)
@@ -599,6 +641,10 @@ volvox_test(test_public_api
           tests/test_public_api.c
   DEFS VOLVOXAI_ENABLE_TRAINING=0 VOLVOXAI_PUBLIC_API_TESTING=1 ${BK_CPU_ONLY}
   OPTS -std=c11 -O2 GEN cpu_only)
+add_test(NAME test_public_api_affine_concat_domain
+  COMMAND $<TARGET_FILE:test_public_api> --affine-concat-domain)
+set_tests_properties(test_public_api_affine_concat_domain
+  PROPERTIES LABELS native)
 
 volvox_test(test_trainer_api
   SOURCES ${CPU_ONLY_SRCS} ${FULL_PROFILE_SRCS} ${FULL_SHADER_SRCS}
@@ -617,7 +663,7 @@ volvox_test(test_backend_provider_examples
           ../examples/backend_sdk/host_backend.c
           ../examples/backend_sdk/android_nnapi_backend.c
           tests/test_backend_provider_examples.c
-  DEFS VOLVOXAI_ENABLE_TRAINING=0 ${BK_CPU_ONLY}
+  DEFS VOLVOXAI_ENABLE_TRAINING=0 VOLVOXAI_PUBLIC_API_TESTING=1 ${BK_CPU_ONLY}
   OPTS -std=c11 -O2 GEN cpu_only)
 target_include_directories(test_backend_provider_examples PRIVATE
   ${REPO}/examples/backend_sdk)
@@ -652,10 +698,27 @@ volvox_test(test_sequence_ops
   SOURCES src/kernels/sequence_ops.c tests/test_sequence_ops.c
   OPTS -std=c11 -O2 -Wall -Wextra -Werror)
 
+volvox_test(test_moe_bank
+  SOURCES src/kernels/kernels.c src/kernels/cpu_features.c
+    src/kernels/quant_cpu_opt.c src/kernels/training_kernels.c
+    tests/test_moe_bank.c
+  DEFS VOLVOXAI_ENABLE_TRAINING=1
+  OPTS -std=c11 -O2)
+
 volvox_test(test_sequence_runtime
   SOURCES ${CPU_ONLY_SRCS} tests/test_sequence_runtime.c
   DEFS VOLVOXAI_ENABLE_TRAINING=0 ${BK_CPU_ONLY}
   OPTS -std=c11 -O2)
+
+volvox_test(test_moe_gpu_route
+  SOURCES ${ENGINE_SRCS} ${INFERENCE_SHADER_SRCS} tests/test_moe_gpu_route.c
+  DEFS VOLVOXAI_ENABLE_TRAINING=0 ${BK_DEFAULT}
+  OPTS -O2 GEN inference)
+
+volvox_test(test_bank_residency
+  SOURCES ${ENGINE_SRCS} ${INFERENCE_SHADER_SRCS} tests/test_bank_residency.c
+  DEFS VOLVOXAI_ENABLE_TRAINING=0 ${BK_DEFAULT}
+  OPTS -O2 GEN inference)
 
 volvox_test(test_incremental_runtime
   SOURCES ${ENGINE_SRCS} ${INFERENCE_SHADER_SRCS} tests/test_incremental_runtime.c
@@ -674,8 +737,17 @@ volvox_test(test_gemm_f32
           src/kernels/cpu_features.c tests/test_gemm_f32.c
   OPTS -std=c11 -O3 -Wall -Wextra -Werror)
 
+volvox_test(test_thread_pool
+  SOURCES src/kernels/thread_pool.c tests/test_thread_pool.c
+  OPTS -std=c11 -O2 -Wall -Wextra -Werror)
+
 volvox_test(test_gemm_f32_runtime
   SOURCES ${CPU_ONLY_SRCS} tests/test_gemm_f32_runtime.c
+  DEFS VOLVOXAI_ENABLE_TRAINING=0 ${BK_CPU_ONLY}
+  OPTS -std=c11 -O3)
+
+volvox_test(test_conv2d_f32_runtime
+  SOURCES ${CPU_ONLY_SRCS} tests/test_conv2d_f32_runtime.c
   DEFS VOLVOXAI_ENABLE_TRAINING=0 ${BK_CPU_ONLY}
   OPTS -std=c11 -O3)
 
@@ -775,30 +847,6 @@ add_test(NAME test_native_task_cli
   COMMAND ${PY} ${REPO}/examples/native_task_cli/tests/test_cli.py $<TARGET_FILE:volvoxai-tasks>)
 set_tests_properties(test_native_task_cli PROPERTIES LABELS example)
 
-foreach(_variant tiny_receipt_w8a8:main test_tiny_receipt_w8a8:test_tiny_receipt_w8a8)
-  string(REPLACE ":" ";" _pair ${_variant})
-  list(GET _pair 0 _bin)
-  list(GET _pair 1 _entry)
-  add_executable(${_bin}
-    ${ENGINE_SRCS} ${INFERENCE_SHADER_SRCS}
-    ${REPO}/examples/tiny_receipt_vqa/native/tiny_receipt_image.c
-    ${REPO}/examples/tiny_receipt_vqa/native/tiny_receipt_w8a8.c
-    ${REPO}/examples/tiny_receipt_vqa/native/${_entry}.c)
-  add_dependencies(${_bin} volvoxai_pack_inference_shaders)
-  volvox_cuda_codegen_before(${_bin})
-  target_link_libraries(${_bin} PRIVATE volvox_common)
-  target_compile_definitions(${_bin} PRIVATE VOLVOXAI_ENABLE_TRAINING=0 ${BK_DEFAULT})
-  target_include_directories(${_bin} PRIVATE
-    ${GEN}/inference ${REPO}/examples/tiny_receipt_vqa/native)
-  target_compile_options(${_bin} PRIVATE -O3)
-endforeach()
-add_test(NAME test_tiny_receipt_native_example
-  COMMAND ${CMAKE_COMMAND}
-    -DBIN=$<TARGET_FILE:tiny_receipt_w8a8>
-    -DTEST_BIN=$<TARGET_FILE:test_tiny_receipt_w8a8>
-    -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/run_tiny_receipt.cmake)
-set_tests_properties(test_tiny_receipt_native_example PROPERTIES LABELS example)
-
 foreach(_variant tiny_receipt_split_w8a8:main_split
                  test_tiny_receipt_split_w8a8:test_tiny_receipt_split_w8a8)
   string(REPLACE ":" ";" _pair ${_variant})
@@ -821,7 +869,7 @@ add_test(NAME test_tiny_receipt_split_native_example
   COMMAND ${CMAKE_COMMAND}
     -DBIN=$<TARGET_FILE:tiny_receipt_split_w8a8>
     -DTEST_BIN=$<TARGET_FILE:test_tiny_receipt_split_w8a8>
-    -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/run_tiny_receipt.cmake)
+    -P ${CMAKE_CURRENT_SOURCE_DIR}/../examples/tiny_receipt_vqa/native/run_tiny_receipt.cmake)
 set_tests_properties(test_tiny_receipt_split_native_example PROPERTIES LABELS example)
 
 # Canonical W8A8 affine contract. Proves the shared header before any kernel is
@@ -839,16 +887,59 @@ volvox_test(test_kernel_platform
   OPTS -std=c11 -O2 -Wall -Wextra -Werror
   LABELS native)
 
+# The unpacked dense kernels against a reference stated in the test, sweeping
+# output widths rather than sampling one model's.  broadcast_ops.c is a member
+# of the kernels.c amalgamation and is compiled through it, not on its own.
+# Deliberately no BENCH_CPU_FLAGS: matmul_f32 selects its ISA at runtime, so
+# fixing the flags here would only decide which tier the test can reach.
+volvox_test(test_matmul_f32_shapes
+  SOURCES src/kernels/kernels.c src/kernels/cpu_features.c
+          src/kernels/quant_cpu_opt.c
+          tests/test_matmul_f32_shapes.c
+  OPTS -O2
+  LABELS native)
+
 # Byte-exact parity of every ISA tier the host can run, for the raw QLinear and
-# QConv dispatchers. The VNNI kernels are unreachable through the packed path, so
-# this is the only coverage they get; on a pre-VNNI CPU it proves only the tiers
-# that exist, which is why it prints the tier list.
+# direct QConv dispatchers. Packed N32 AVX2/VNNI coverage belongs to
+# test_packed_quant_gemm; on a pre-VNNI CPU both tests prove only the tiers that
+# exist, which is why they print the tier list.
 volvox_test(test_qlinear_isa_parity
   SOURCES src/kernels/kernels.c src/kernels/cpu_features.c
           src/kernels/quant_cpu_opt.c
           src/kernels/qlinear_w8a8_x86.c src/kernels/qlinear_w8a8_arm.c
           src/kernels/qconv_w8a8_x86.c src/kernels/qconv_w8a8_arm.c ${ARM_OBJS}
           tests/test_qlinear_isa_parity.c
+  OPTS -O2 ${BENCH_CPU_FLAGS}
+  LABELS native)
+
+# The same tier-walking coverage for QBatchMatMul, which the static-INT8
+# attention path runs for both score and projection products. It covers the
+# centered-I16 packed AVX2 path as well as the allocation-free U8xI8 edge path,
+# including reductions outside the latter's narrower raw-dot bound.
+# conv2d_hwc_dense_f32 reorders convolution loops for speed without reordering
+# the arithmetic. That claim is only worth anything if it is checked, and it is
+# the kernel the WASM encoder's runtime now rests on.
+volvox_test(test_conv2d_hwc_dense_parity
+  SOURCES tests/test_conv2d_hwc_dense_parity.c
+  OPTS -O2 -ffp-contract=off -D_GNU_SOURCE
+  LABELS native)
+
+volvox_test(test_qbatch_matmul_isa_parity
+  SOURCES src/kernels/kernels.c src/kernels/cpu_features.c
+          src/kernels/quant_cpu_opt.c
+          src/kernels/qbatch_matmul_w8a8_native.c
+          tests/test_qbatch_matmul_isa_parity.c
+  OPTS -O2 ${BENCH_CPU_FLAGS}
+  LABELS native)
+
+# The float twin of the two tests above, and deliberately not byte-exact: each
+# F32 tier keeps its own arithmetic and resolves its own tile, so this measures
+# how far apart they are instead of asserting they agree. Anything that selects
+# a tier at run time needs that number first.
+volvox_test(test_gemm_f32_isa_parity
+  SOURCES src/kernels/kernels.c src/kernels/cpu_features.c
+          src/kernels/quant_cpu_opt.c
+          tests/test_gemm_f32_isa_parity.c
   OPTS -O2 ${BENCH_CPU_FLAGS}
   LABELS native)
 
@@ -863,7 +954,7 @@ volvox_test(benchmark_w8a8_native
   SOURCES src/kernels/kernels.c src/kernels/quant_cpu_opt.c src/kernels/cpu_features.c
           src/kernels/qlinear_w8a8_x86.c src/kernels/qlinear_w8a8_arm.c
           src/kernels/qconv_w8a8_x86.c src/kernels/qconv_w8a8_arm.c ${ARM_OBJS}
-          tests/benchmark_w8a8_native.c
+          ${CMAKE_CURRENT_SOURCE_DIR}/../examples/tiny_receipt_vqa/native/benchmark_w8a8_native.c
   OPTS -O3 ${BENCH_CPU_FLAGS}
   LABELS benchmark)
 
@@ -925,6 +1016,14 @@ if(VOLVOXAI_ENABLE_CUDA)
     OPTS -std=c11 -O2 GEN cpu_only
     LABELS gpu)
   set_tests_properties(test_cuda_runtime PROPERTIES SKIP_RETURN_CODE 77)
+  volvox_test(test_cuda_public_dynamic
+    SOURCES ${CPU_ONLY_SRCS} ${CUDA_BACKEND_SRCS} ${SHADER_STORE_SRCS}
+            ${EMB_CPU_ONLY} tests/test_cuda_public_dynamic.c
+    DEFS VOLVOXAI_ENABLE_TRAINING=0 VOLVOXAI_PUBLIC_API_TESTING=1
+         VOLVOXAI_CUDA_TESTING=1 ${BK_CUDA}
+    OPTS -std=c11 -O2 GEN cpu_only
+    LABELS gpu)
+  set_tests_properties(test_cuda_public_dynamic PROPERTIES SKIP_RETURN_CODE 77)
 
   volvox_test(test_cuda_training
     SOURCES ${CUDA_BACKEND_SRCS} ${CUDA_TRAINING_PTX_SRCS}
@@ -965,7 +1064,8 @@ if(VOLVOXAI_ENABLE_CUDA)
   volvox_test(test_cuda_ptq
     SOURCES ${FULL_ENGINE_SRCS} ${FULL_PROFILE_SRCS} ${FULL_SHADER_SRCS}
             tests/test_cuda_ptq.c
-    DEFS VOLVOXAI_ENABLE_TRAINING=1 VOLVOXAI_CUDA_TESTING=1 ${BK_CUDA}
+    DEFS VOLVOXAI_ENABLE_TRAINING=1 VOLVOXAI_CUDA_TESTING=1
+         VOLVOXAI_PUBLIC_API_TESTING=1 ${BK_CUDA}
     OPTS -std=c11 -O2 GEN full
     LABELS "native;gpu")
   volvox_cuda_training_codegen_before(test_cuda_ptq)
@@ -989,6 +1089,18 @@ if(VOLVOXAI_ENABLE_OPENGL)
     OPTS -O2 GEN full
     LABELS gpu)
 endif()
+if(VOLVOXAI_ENABLE_VULKAN OR VOLVOXAI_ENABLE_OPENGL OR
+   (APPLE AND VOLVOXAI_ENABLE_METAL))
+  volvox_test(test_native_gpu_public_dynamic
+    SOURCES ${ENGINE_SRCS} ${INFERENCE_SHADER_SRCS}
+            tests/test_native_gpu_public_dynamic.c
+    DEFS VOLVOXAI_ENABLE_TRAINING=0 VOLVOXAI_PUBLIC_API_TESTING=1
+         ${BK_DEFAULT}
+    OPTS -std=c11 -O2 GEN inference
+    LABELS gpu)
+  set_tests_properties(test_native_gpu_public_dynamic
+    PROPERTIES SKIP_RETURN_CODE 77)
+endif()
 if(APPLE AND VOLVOXAI_ENABLE_METAL)
   volvox_test(test_metal_training
     SOURCES src/runtime/runtime_state.c src/kernels/thread_pool.c
@@ -1011,6 +1123,9 @@ if(VOLVOX_X86)
     COMMAND ${_verify} emit-ymm ${_kern}/qconv_w8a8_x86.c ${_kern})
   add_test(NAME verify_native_qconv_avx512vnni
     COMMAND ${_verify} emit-zmm ${_kern}/qconv_w8a8_x86.c ${_kern})
+  add_test(NAME verify_native_qconv_im2col_specialization
+    COMMAND ${_verify} emit-qconv-im2col
+            ${_kern}/qconv_w8a8_x86.c ${_kern})
   add_test(NAME verify_native_qlinear_maddubs
     COMMAND ${_verify} emit-maddubs ${_kern}/qlinear_w8a8_x86.c ${_kern})
   add_test(NAME verify_native_qbatch_maddubs
@@ -1021,14 +1136,19 @@ if(VOLVOX_X86)
   add_test(NAME verify_native_packed_qgemm_signed_maddubs
     COMMAND ${_verify} emit-signed-maddubs
             ${_kern}/packed_quant_gemm.c ${_kern})
+  add_test(NAME verify_native_packed_qgemm_vnni
+    COMMAND ${_verify} emit-packed-vnni
+            ${_kern}/packed_quant_gemm.c ${_kern})
   add_test(NAME verify_native_w8a8_baseline_isa
     COMMAND ${_verify} baseline ${_kern})
   set_tests_properties(
     verify_native_avxvnni verify_native_avx512vnni
     verify_native_qconv_avxvnni verify_native_qconv_avx512vnni
+    verify_native_qconv_im2col_specialization
     verify_native_qlinear_maddubs verify_native_qbatch_maddubs
     verify_native_packed_qgemm_maddubs
     verify_native_packed_qgemm_signed_maddubs
+    verify_native_packed_qgemm_vnni
     verify_native_w8a8_baseline_isa
     PROPERTIES LABELS verify)
 endif()

@@ -7,10 +7,15 @@
 extern "C" {
 #endif
 
+/* Provider ABI version. */
 #define VX_BACKEND_ABI_VERSION UINT32_C(1)
 #define VX_BACKEND_NAME_CAPACITY 64u
+#define VX_BACKEND_SHAPE_PROOF_PROTOCOL \
+    "canonical-symbolic-domain-proof/v1"
+#define VX_BACKEND_RESOURCE_PROTOCOL "bounded-resource-maxima/v1"
 
-/* Provider-host service provider interface (SPI). These callbacks compose a
+/* Provider callback descriptors use exact struct sizes.
+ * Provider-host service provider interface (SPI). These callbacks compose a
  * native runtime implementation; they are not application-facing Synurang FFI
  * operations. Shared statuses, stages, dtypes, and policies come from the
  * protobuf-derived declarations included through volvoxai.h. */
@@ -31,12 +36,67 @@ typedef struct VxBackendOutputSink {
                       size_t byte_size);
 } VxBackendOutputSink;
 
+typedef enum VxBackendShapeDomainSupport {
+    VX_BACKEND_SHAPE_DOMAIN_UNSUPPORTED = 0,
+    VX_BACKEND_SHAPE_DOMAIN_FULL = 1
+} VxBackendShapeDomainSupport;
+
+/* Provider-wide declaration. FULL means compile either attests the complete
+ * bounded domain supplied in VxBackendCompileInput or rejects it before
+ * creating a compiled instance. */
+typedef struct VxBackendShapeDomainCapability {
+    size_t struct_size;
+    const char* proof_protocol;
+    const char* resource_protocol;
+    VxBackendShapeDomainSupport support;
+} VxBackendShapeDomainCapability;
+
+#define VX_BACKEND_SHAPE_DOMAIN_CAPABILITY_INIT \
+    { sizeof(VxBackendShapeDomainCapability), VX_BACKEND_SHAPE_PROOF_PROTOCOL, \
+      VX_BACKEND_RESOURCE_PROTOCOL, \
+      VX_BACKEND_SHAPE_DOMAIN_UNSUPPORTED }
+
+/* Immutable callback-duration model view. graph_fingerprint and
+ * shape_domain_proof_identity identify the exact graph and complete bounded
+ * proof represented by the logical input/output specifications. */
+typedef struct VxBackendCompileInput {
+    size_t struct_size;
+    const VxModelSource* source;
+    const char* graph_fingerprint;
+    const char* shape_domain_proof_identity;
+    const VxTensorSpec* inputs;
+    size_t input_count;
+    const VxTensorSpec* outputs;
+    size_t output_count;
+} VxBackendCompileInput;
+
+#define VX_BACKEND_COMPILE_INPUT_INIT \
+    { sizeof(VxBackendCompileInput), NULL, NULL, NULL, NULL, 0, NULL, 0 }
+
+/* A successful provider compile must attest the exact input identities and
+ * conservative resource maxima. resource_limit_bytes is meaningful only when
+ * has_resource_limit is non-zero. Provider string pointers are borrowed only
+ * until compile returns; the runtime validates them synchronously. */
+typedef struct VxBackendShapeDomainAttestation {
+    size_t struct_size;
+    const char* graph_fingerprint;
+    const char* shape_domain_proof_identity;
+    uint64_t maximum_tensor_bytes;
+    uint64_t maximum_resident_bytes;
+    uint64_t resource_limit_bytes;
+    int32_t has_resource_limit;
+} VxBackendShapeDomainAttestation;
+
+#define VX_BACKEND_SHAPE_DOMAIN_ATTESTATION_INIT \
+    { sizeof(VxBackendShapeDomainAttestation), NULL, NULL, 0, 0, 0, 0 }
+
 typedef struct VxBackendProvider {
     size_t struct_size;
     uint32_t abi_version;
     const char* name;
     void* user_data;
     uint32_t flags;
+    VxBackendShapeDomainCapability shape_domain;
 
     VxStatus (*runtime_create)(void* user_data,
                                const VxRuntimeOptions* options,
@@ -48,9 +108,10 @@ typedef struct VxBackendProvider {
      * operator_fallback is forbidden it must also leave
      * operator_fallback_used clear; the runtime rejects an unattested plan. */
     VxStatus (*compile)(void* runtime_instance,
-                        const VxModelSource* source,
+                        const VxBackendCompileInput* input,
                         const VxBackendPolicy* policy,
                         void** out_compiled_instance,
+                        VxBackendShapeDomainAttestation* attestation,
                         VxReport* report);
     void (*compiled_destroy)(void* compiled_instance);
 
@@ -58,13 +119,15 @@ typedef struct VxBackendProvider {
                                const VxContextOptions* options,
                                void** out_context_instance,
                                VxReport* report);
-    VxStatus (*context_set_input)(void* context_instance,
-                                  const char* name,
-                                  VxDataType dtype,
-                                  const void* data,
-                                  size_t byte_size,
-                                  VxReport* report);
+    /* Binding arrays and all referenced storage are borrowed only for the
+     * synchronous callback. HOST is the sole accepted location.
+     * Providers validate the complete batch/domain/resource transition before
+     * mutating context state. A pre-commit failure preserves prior binding and
+     * decode state; failures after dispatch are not required to roll back
+     * arbitrary backend/device side effects. */
     VxStatus (*context_execute)(void* context_instance,
+                                const VxTensorBinding* inputs,
+                                size_t input_count,
                                 const VxBackendOutputSink* output_sink,
                                 VxReport* report);
     /* Optional decode callbacks. A provider context created with decode
@@ -72,10 +135,14 @@ typedef struct VxBackendProvider {
      * absent. Seed/step obey the same complete-output sink contract as
      * context_execute. */
     VxStatus (*context_decode_seed)(void* context_instance,
+                                    const VxTensorBinding* inputs,
+                                    size_t input_count,
                                     const VxBackendOutputSink* output_sink,
                                     VxReport* report);
     VxStatus (*context_decode_step)(void* context_instance,
                                     int32_t position,
+                                    const VxTensorBinding* inputs,
+                                    size_t input_count,
                                     const VxBackendOutputSink* output_sink,
                                     VxReport* report);
     VxStatus (*context_decode_reset)(void* context_instance,

@@ -1,9 +1,10 @@
 import type { Tensor } from '../core/Tensor.js';
-import type { Graph } from '../core/Graph.js';
+import type { RuntimeGraph } from '../core/RuntimeGraph.js';
 import type { BackendExecutionOptions } from './BackendEngine.js';
 import type { ShaderLibrary as ShaderLibraryClass } from './ShaderLibrary.js';
 import type { WebGPUDeviceState } from './WebGPUDeviceState.js';
 import type { RuntimeTypedArray } from '../types.js';
+import type { DeviceTensorInputLease } from '../ops/deviceTensorReference.js';
 
 export type ShaderLibraryConstructor = typeof ShaderLibraryClass;
 
@@ -69,10 +70,14 @@ export interface ExecutorNode {
   outputs: Record<string, ExecutorTensor>;
   params: ExecutorNodeParams;
   wLayout?: 'din' | 'dout';
+  /** Global slot ids backing the staged rows of a partially resident bank. */
+  residentSlots?: readonly number[];
+  /** Complete global slot extent; distinct from the staged row count. */
+  residentSlotDomain?: number;
 }
 
-export type ExecutorGraph = Omit<Graph, 'nodes'> & { nodes: ExecutorNode[] };
-export type AdapterExecutionPlan = ReturnType<Graph['adapters']['_pinExecution']>;
+export type ExecutorGraph = Omit<RuntimeGraph, 'nodes'> & { nodes: ExecutorNode[] };
+export type AdapterExecutionPlan = null;
 
 export interface GraphExecutorOptions {
   shaderLibrary?: ShaderLibraryConstructor | null;
@@ -80,8 +85,59 @@ export interface GraphExecutorOptions {
   deviceState?: WebGPUDeviceState | null;
 }
 
+export interface WebGPURebindOptions {
+  /** Canonical logical public-input signature for telemetry and cache ownership. */
+  readonly shapeSignature: string;
+  /**
+   * Exact resident slots whose bytes back each partially resident weight bank.
+   * Rebind uses this identity to keep bank payload replacement transactional.
+   * @internal Provider-authored from the resolved bounded-shape plan.
+   */
+  readonly bankResidency?: Readonly<Record<string, readonly number[]>>;
+  /** @internal No-throw callback immediately before candidate publication. */
+  readonly beforeCommit?: (() => void);
+  /** Per-tensor aligned upper bound proved during provider compilation. */
+  readonly tensorMaximumBytes?: ReadonlyMap<string, number>;
+  /** Geometric capacity multiplier used only when a committed tensor grows. */
+  readonly capacityGrowthFactor?: number;
+}
+
+export interface WebGPUTensorCapacityInspection {
+  readonly name: string;
+  readonly logicalBytes: number;
+  readonly capacityBytes: number;
+}
+
+export interface WebGPUResourceInspection {
+  readonly shapeSignature: string | null;
+  readonly logicalActivationBytes: number;
+  readonly activationCapacityBytes: number;
+  readonly activationCapacityHighWaterBytes: number;
+  readonly activationGrowCount: number;
+  readonly specializationRebindCount: number;
+  readonly specializationBufferCreateCount: number;
+  readonly specializationBufferReuseCount: number;
+  readonly liveSpecializationBufferCount: number;
+  readonly bindGroupCreateCount: number;
+  readonly bindGroupReuseCount: number;
+  readonly liveBindGroupCount: number;
+  /** Queue writes actually committed while specializing concrete shapes. */
+  readonly specializationWriteCount: number;
+  readonly specializationWriteBytes: number;
+  /** Byte-identical writes elided using the context-owned exact content mirror. */
+  readonly specializationWriteSkipCount: number;
+  readonly specializationWriteSkipBytes: number;
+  /** Exact host bytes retained to make write elision collision-free. */
+  readonly specializationContentBytes: number;
+  readonly pendingRetiredBufferCount: number;
+  readonly selectedTactics: readonly string[];
+  readonly tensorCapacities: readonly WebGPUTensorCapacityInspection[];
+}
+
+export type WebGPUExecutionInput = RuntimeTypedArray | DeviceTensorInputLease;
+
 export interface WebGPUExecutionInputs {
-  [name: string]: RuntimeTypedArray;
+  [name: string]: WebGPUExecutionInput;
 }
 
 export interface WebGPUAdapterSelector {
@@ -113,6 +169,7 @@ export interface CompiledWebGPUPipeline {
   graphNodeIndex?: number;
   paramsBuffer?: GPUBuffer;
   resources?: GPUBuffer[];
+  tacticId?: string;
 }
 
 export interface IncrementalRowCandidate {

@@ -1,3 +1,5 @@
+import { assertShapeKernelParams } from './shapeKernelValidation.js';
+
 function sameShape(left, right) {
   return Array.isArray(left) && Array.isArray(right) && left.length === right.length &&
     left.every((dimension, index) => dimension === right[index]);
@@ -16,7 +18,7 @@ function tensorElements(tensor) {
 
 function f32Tensor(tensor) {
   return !!tensor && tensor.dtype === 'float32' && tensor.buffer instanceof Float32Array &&
-    tensorElements(tensor) != null;
+    tensor.quantization == null && tensorElements(tensor) != null;
 }
 
 function bcMode(tensor, batch, sequence, stateWidth, rank) {
@@ -38,12 +40,15 @@ export function ssmScanDescriptor(node) {
   const initialState = node.inputs.initial_state || null;
   const output = node.outputs.out || Object.values(node.outputs || {})[0];
   const finalState = node.outputs.state || node.outputs.final_state || null;
+  const params = assertShapeKernelParams(
+    node, ['delta_softplus'], node.opType || 'SSMScan',
+  );
   const rank = input?.shape?.length;
   const batch = rank === 2 ? 1 : input?.shape?.[0];
   const sequence = input?.shape?.[rank - 2];
   const channels = input?.shape?.[rank - 1];
   const stateWidth = a?.shape?.[1];
-  const deltaSoftplus = node.params?.delta_softplus ?? true;
+  const deltaSoftplus = params.delta_softplus ?? true;
   const bMode = bcMode(b, batch, sequence, stateWidth, rank);
   const cMode = bcMode(c, batch, sequence, stateWidth, rank);
   const stateShape = [batch, channels, stateWidth];
@@ -56,7 +61,7 @@ export function ssmScanDescriptor(node) {
       (d && (!f32Tensor(d) || !sameShape(d.shape, [channels]))) ||
       (z && (!f32Tensor(z) || !sameShape(z.shape, input.shape))) ||
       (initialState && (!f32Tensor(initialState) || !sameShape(initialState.shape, stateShape))) ||
-      (finalState && (!f32Tensor(finalState) || !sameShape(finalState.shape, stateShape))) ||
+      !finalState || !f32Tensor(finalState) || !sameShape(finalState.shape, stateShape) ||
       typeof deltaSoftplus !== 'boolean') {
     throw new Error(`SSMScan node ${node.id} requires canonical F32 selective-scan tensors.`);
   }

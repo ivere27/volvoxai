@@ -155,8 +155,8 @@ const artifact = materializePTQWeights(trainingGraph, [{
 }]);
 ```
 
-The output is the same **package** you met in Chapter 1 — a `graph.json` with the exact root
-discriminator `"format": "volvox-graph/v1"`, whose quantized nodes are now
+The output is the same **package** you met in Chapter 1 — a `graph.json` with
+the exact root discriminator `"format": "volvox-graph/v1"`, whose quantized nodes are now
 `QLinear`/`QConv2D` and whose sole central table refers to scale and zero-point tensors, plus a
 `model.safetensors` carrying the packed int8 weights and every numeric affine parameter. No numeric
 scale or zero point is stored in JSON or safetensors metadata. It loads and runs through the ordinary

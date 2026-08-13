@@ -1,12 +1,12 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
-import { Graph } from '../ts/core/Graph.js';
-import { GraphLoader } from '../ts/core/GraphLoader.js';
+import { RuntimeGraph } from '../ts/core/RuntimeGraph.js';
+import { RuntimeGraphLoader } from '../ts/core/RuntimeGraphLoader.js';
 import { CPUEngine } from '../ts/backends/CPUEngine.js';
 
 function qSDPAGraph() {
-  const graph = new Graph();
+  const graph = new RuntimeGraph();
   const q = graph.addInput('q', [2, 4], 'int8', {
     quantization: { scheme: 'per_tensor', scale: 0.25, zero_point: -1 },
   });
@@ -28,7 +28,7 @@ function qSDPAGraph() {
 
 test('CPU dispatches QSDPA through the byte-domain kernel, not F32 attention kernels', async () => {
   const { graph } = qSDPAGraph();
-  assert.doesNotThrow(() => GraphLoader._assertBrowserQuantizationSupported(graph));
+  assert.doesNotThrow(() => RuntimeGraphLoader._assertBrowserQuantizationSupported(graph));
 
   const engine = new CPUEngine();
   engine.allocateGraph(graph);
@@ -51,22 +51,22 @@ test('CPU dispatches QSDPA through the byte-domain kernel, not F32 attention ker
   assert.deepEqual([...result.out], [0, 0, 2, 0, 0, 0, 2, -1]);
 });
 
-test('GraphLoader accepts only canonical QSDPA byte boundaries', () => {
+test('RuntimeGraphLoader accepts only canonical QSDPA byte boundaries', () => {
   const explicitNullScale = qSDPAGraph();
   explicitNullScale.node.params.scale = null;
-  assert.doesNotThrow(() => GraphLoader._assertBrowserQuantizationSupported(explicitNullScale.graph));
+  assert.doesNotThrow(() => RuntimeGraphLoader._assertBrowserQuantizationSupported(explicitNullScale.graph));
 
   const missingCausal = qSDPAGraph();
   delete missingCausal.node.params.causal;
   assert.throws(
-    () => GraphLoader._assertBrowserQuantizationSupported(missingCausal.graph),
+    () => RuntimeGraphLoader._assertBrowserQuantizationSupported(missingCausal.graph),
     /explicit heads\/causal/,
   );
 
   const overflowScale = qSDPAGraph();
   overflowScale.node.params.scale = 3e38;
   assert.throws(
-    () => GraphLoader._assertBrowserQuantizationSupported(overflowScale.graph),
+    () => RuntimeGraphLoader._assertBrowserQuantizationSupported(overflowScale.graph),
     /finite score scaling/,
   );
 
@@ -74,14 +74,14 @@ test('GraphLoader accepts only canonical QSDPA byte boundaries', () => {
   const mask = malformedMask.graph.addInput('mask', [3], 'int32');
   malformedMask.node.inputs.mask = mask;
   assert.throws(
-    () => GraphLoader._assertBrowserQuantizationSupported(malformedMask.graph),
+    () => RuntimeGraphLoader._assertBrowserQuantizationSupported(malformedMask.graph),
     /optional I32 mask inputs/,
   );
 
   const generic = qSDPAGraph();
   generic.node.opType = 'CrossSDPA';
   assert.throws(
-    () => GraphLoader._assertBrowserQuantizationSupported(generic.graph),
+    () => RuntimeGraphLoader._assertBrowserQuantizationSupported(generic.graph),
     /unsupported generic operator/,
   );
 });

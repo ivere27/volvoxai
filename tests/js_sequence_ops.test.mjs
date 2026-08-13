@@ -7,7 +7,7 @@ import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
 
-import { Graph } from '../ts/core/Graph.js';
+import { RuntimeGraph } from '../ts/core/RuntimeGraph.js';
 import { CPUEngine } from '../ts/backends/CPUEngine.js';
 import { WasmEngine } from '../ts/backends/WasmEngine.js';
 
@@ -29,7 +29,7 @@ function closeArray(actual, expected, tolerance = 2e-5) {
 }
 
 function unaryGraph() {
-  const graph = new Graph();
+  const graph = new RuntimeGraph();
   const input = graph.addInput('input', [7]);
   const sin = graph.addOp('Sin', { input }, { out: { name: 'sin', shape: [7] } }).out;
   const cos = graph.addOp('Cos', { input }, { out: { name: 'cos', shape: [7] } }).out;
@@ -38,7 +38,7 @@ function unaryGraph() {
 }
 
 function ropeGraph() {
-  const graph = new Graph();
+  const graph = new RuntimeGraph();
   const input = graph.addInput('input', [2, 2, 6]);
   const positions = graph.addWeight('positions', [2, 2], 'int32', {
     buffer: Int32Array.of(0, 2, 1, 3),
@@ -73,7 +73,7 @@ function expectedRoPE(input, positions, interleaved, offset = 0) {
 }
 
 function ssmGraph(opType, variableB) {
-  const graph = new Graph();
+  const graph = new RuntimeGraph();
   const input = graph.addInput('input', [2, 3, 2]);
   const delta = graph.addInput('delta', [2, 3, 2]);
   const A = graph.addWeight('A', [2, 2], 'float32', {
@@ -199,7 +199,7 @@ test('portable Sin/Cos, RoPE, and selective scan agree on CPU(JS) and C/WASM', {
 });
 
 test('sequence operator contracts reject ambiguous layouts', async () => {
-  const invalidRoPE = new Graph();
+  const invalidRoPE = new RuntimeGraph();
   const input = invalidRoPE.addInput('input', [2, 3]);
   invalidRoPE.addOp('RoPE', { input }, { out: { name: 'out', shape: [2, 3] } }, { rotary_dim: 3 });
   const engine = new CPUEngine();

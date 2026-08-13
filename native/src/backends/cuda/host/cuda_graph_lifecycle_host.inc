@@ -4,14 +4,36 @@ void cuda_graph_reset(void) {
      * therefore cannot own graph slots that need releasing. */
     if (!cuda_context_state_get()) return;
     graph_release_slots();
+    free(cuda_shape_signature);
+    cuda_shape_signature = NULL;
+    cuda_domain_span_count = 0;
+    cuda_invariant_preload_complete = 0;
+    cuda_domain_enforced = 0;
+    cuda_graph_allocation_failed = 0;
+#if defined(VOLVOXAI_CUDA_TESTING)
+    cuda_qlinear_warp_dp4a_launch_count = 0u;
+    cuda_qlinear_thread_dp4a_launch_count = 0u;
+    cuda_qlinear_dp4a_group_count = 0u;
+    cuda_qlinear_scalar_tail_count = 0u;
+    cuda_qconv2d_warp_dp4a_launch_count = 0u;
+    cuda_qconv2d_thread_dp4a_launch_count = 0u;
+#endif
+    cuda_qbatch_matmul_dp4a_group_count = 0u;
+    cuda_qbatch_matmul_scalar_tail_count = 0u;
+    cuda_shape_generation = cuda_generation_next(cuda_shape_generation);
+    cuda_capacity_generation =
+        cuda_generation_next(cuda_capacity_generation);
 }
 
 void cuda_graph_begin_runtime_forward(int replay_eligible,
                                       uint64_t model_generation) {
+    const char* current_shape_signature =
+        cuda_shape_signature ? cuda_shape_signature : "";
     if (cuda_forward_scope_active) {
         cuda_forward_context_failed = 1;
         return;
     }
+    if (cuda_domain_enforced) replay_eligible = 0;
     memset(&cuda_forward_context_guard, 0,
            sizeof(cuda_forward_context_guard));
     cuda_forward_scope_active = 1;
@@ -47,7 +69,12 @@ void cuda_graph_begin_runtime_forward(int replay_eligible,
     }
     if (cuda_replay.plan != CUDA_REPLAY_PLAN_EMPTY &&
         (cuda_replay.generation != model_generation ||
-         cuda_replay.slot_epoch != graph_slot_epoch))
+         cuda_replay.slot_epoch != graph_slot_epoch ||
+         cuda_replay.shape_generation != cuda_shape_generation ||
+         cuda_replay.capacity_generation != cuda_capacity_generation ||
+         !cuda_replay.shape_signature ||
+         strcmp(cuda_replay.shape_signature,
+                current_shape_signature)))
         cuda_replay_clear_plan_current(1);
     if (cuda_replay.plan == CUDA_REPLAY_PLAN_READY &&
         cuda_replay.executable) {
@@ -60,6 +87,9 @@ void cuda_graph_begin_runtime_forward(int replay_eligible,
     }
     cuda_replay_clear_plan_current(0);
     cuda_replay.generation = model_generation;
+    cuda_replay.shape_generation = cuda_shape_generation;
+    cuda_replay.capacity_generation = cuda_capacity_generation;
+    cuda_replay.shape_signature = current_shape_signature;
     cuda_replay.pass = CUDA_REPLAY_PASS_OBSERVE;
 }
 
@@ -73,7 +103,14 @@ int cuda_graph_prepare_runtime_forward(void) {
         cuda_forward_context_failed) return -1;
     if (cuda_replay.pass == CUDA_REPLAY_PASS_CAPTURE ||
         cuda_replay.pass == CUDA_REPLAY_PASS_VALIDATE) {
-        if (cuda_replay.slot_epoch != graph_slot_epoch) {
+        const char* current_shape_signature =
+            cuda_shape_signature ? cuda_shape_signature : "";
+        if (cuda_replay.slot_epoch != graph_slot_epoch ||
+            cuda_replay.shape_generation != cuda_shape_generation ||
+            cuda_replay.capacity_generation != cuda_capacity_generation ||
+            !cuda_replay.shape_signature ||
+            strcmp(cuda_replay.shape_signature,
+                   current_shape_signature)) {
             cuda_replay_fail();
             return -1;
         }
@@ -178,6 +215,8 @@ int cuda_graph_end_runtime_forward(int forward_ok) {
                     if (synchronized) {
                         cuda_replay.plan = CUDA_REPLAY_PLAN_READY;
                         cuda_replay.slot_epoch = graph_slot_epoch;
+                        cuda_replay.capacity_generation =
+                            cuda_capacity_generation;
                     } else {
                         failed = 1;
                         cuda_replay_clear_plan_current(1);
@@ -212,6 +251,8 @@ int cuda_graph_end_runtime_forward(int forward_ok) {
                     cuda_replay.launch_count > 0) {
                     cuda_replay.plan = CUDA_REPLAY_PLAN_OBSERVED;
                     cuda_replay.slot_epoch = graph_slot_epoch;
+                    cuda_replay.capacity_generation =
+                        cuda_capacity_generation;
                 } else {
                     cuda_replay_clear_plan_current(1);
                 }
@@ -247,7 +288,6 @@ void cuda_graph_mark_host(const void* host, size_t bytes, int is_weight) {
     view.slot->device_dirty = 0;
 }
 
-#if VOLVOXAI_ENABLE_TRAINING
 void cuda_graph_retain_weight(const void* host, size_t bytes) {
     int index;
     uintptr_t offset;
@@ -266,7 +306,22 @@ void cuda_graph_retain_weight(const void* host, size_t bytes) {
         slot->is_weight = 1;
     }
 }
-#endif
+
+void cuda_graph_demote_weight(const void* host, size_t bytes) {
+    int index;
+    uintptr_t offset;
+    CudaTensorSlot* slot;
+    if (!host || !bytes) return;
+    index = graph_find_containing_slot(host, bytes);
+    if (index < 0) return;
+    slot = &graph_slots[index];
+    offset = (uintptr_t)host - (uintptr_t)slot->host;
+    if (slot->domain_span || !slot->bytes || offset > slot->bytes ||
+        bytes > slot->bytes - offset)
+        return;
+    slot->is_weight = 0;
+    slot->shape_generation = cuda_shape_generation;
+}
 
 int cuda_graph_sync_host(const void* host, size_t bytes, int is_weight) {
     CudaContextState* state = cuda_context_state_get();

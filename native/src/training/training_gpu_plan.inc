@@ -878,9 +878,12 @@ static int gpu_plan_batchnorm(GpuTrainingPlan* plan, float** grads, Node* n, T* 
 static int gpu_plan_pooling(GpuTrainingPlan* plan, float** grads, Node* n, T* out, float* go,
                             int max_pool) {
     T* in = node_input_default(n);
+    TrainingMaxPool2DGeometry geometry;
     if (!in || !out || !go || in->dtype != T_F32 || out->dtype != T_F32 ||
         in->ndim != 4 || in->shape[0] <= 0 || in->shape[1] <= 0 ||
         in->shape[2] <= 0 || in->shape[3] <= 0) return -1;
+    if (max_pool && training_maxpool2d_geometry(n, in, out, &geometry) != 0)
+        return -1;
     int batch = in->shape[0], h = in->shape[1], width = in->shape[2], channels = in->shape[3];
     uint32_t* params = (uint32_t*)gpu_training_plan_alloc(plan, 12 * sizeof(uint32_t));
     float* gi = grad_for(grads, in);
@@ -889,16 +892,14 @@ static int gpu_plan_pooling(GpuTrainingPlan* plan, float** grads, Node* n, T* ou
     params[0] = (uint32_t)batch; params[1] = (uint32_t)h; params[2] = (uint32_t)width;
     params[3] = (uint32_t)channels;
     if (max_pool) {
-        if (out->ndim != 4 || out->shape[0] != batch || out->shape[3] != channels) return -1;
-        int ky, kx, sy, sx, py, px;
-        p_pair(n->params, "kernel", 1, &ky, &kx);
-        p_pair(n->params, "stride", 1, &sy, &sx);
-        p_pair(n->params, "padding", 0, &py, &px);
-        if (out->shape[1] <= 0 || out->shape[2] <= 0 || ky <= 0 || kx <= 0 ||
-            sy <= 0 || sx <= 0 || py < 0 || px < 0) return -1;
-        params[4] = (uint32_t)out->shape[1]; params[5] = (uint32_t)out->shape[2];
-        params[6] = (uint32_t)ky; params[7] = (uint32_t)kx; params[8] = (uint32_t)sy;
-        params[9] = (uint32_t)sx; params[10] = (uint32_t)py; params[11] = (uint32_t)px;
+        params[4] = (uint32_t)geometry.output_height;
+        params[5] = (uint32_t)geometry.output_width;
+        params[6] = (uint32_t)geometry.kernel_y;
+        params[7] = (uint32_t)geometry.kernel_x;
+        params[8] = (uint32_t)geometry.stride_y;
+        params[9] = (uint32_t)geometry.stride_x;
+        params[10] = (uint32_t)geometry.pads[0];
+        params[11] = (uint32_t)geometry.pads[1];
     } else if (out->numel != (long)batch * channels) {
         return -1;
     }

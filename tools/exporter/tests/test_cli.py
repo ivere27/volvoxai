@@ -21,23 +21,25 @@ def _write_fixture_package(
 ) -> None:
     output_path = Path(output)
     save_file({"unused": np.asarray([1.0], dtype=np.float32)}, str(output_path))
-    source = {}
-    if declared_package_class is not None:
-        source["package_class"] = declared_package_class
     graph = {
         "format": graph_format,
-        "source": source,
+        "dimensions": {},
         "inputs": {"x": {"shape": [1], "dtype": "float32"}},
         "outputs": ["y"],
         "nodes": [{
             "id": "identity",
             "opType": "Identity",
             "inputs": {"input": "x"},
-            "outputs": {"out": "y"},
-            "outputs_shape": {"out": [1]},
-            "outputs_dtype": {"out": "float32"},
+            "outputs": {"out": {
+                "tensor": "y", "shape": [1], "dtype": "float32",
+            }},
+            "params": {},
         }],
     }
+    if declared_package_class is not None:
+        # This is intentionally invalid in the closed executable schema. It
+        # proves stale report metadata cannot influence package classification.
+        graph["source"] = {"package_class": declared_package_class}
     (output_path.parent / "graph.json").write_text(
         json.dumps(graph), encoding="utf-8"
     )
@@ -45,7 +47,11 @@ def _write_fixture_package(
 
 class ExporterCliTests(unittest.TestCase):
     def test_removed_prototype_options_are_rejected(self):
-        for removed in (["--verify-targets"], ["--quant-metadata", "companion"]):
+        for removed in (
+            ["--verify-targets"],
+            ["--quant-metadata", "companion"],
+            ["--image-normalization", "input0=zero-one"],
+        ):
             with self.subTest(option=removed[0]):
                 with (
                     redirect_stderr(io.StringIO()),
@@ -60,6 +66,7 @@ class ExporterCliTests(unittest.TestCase):
         help_text = _parser().format_help()
         self.assertNotIn("verify-targets", help_text)
         self.assertNotIn("quant-metadata", help_text)
+        self.assertNotIn("image-normalization", help_text)
 
     def test_current_v1_package_is_validated_and_published(self):
         with tempfile.TemporaryDirectory(prefix="volvox-export-cli-") as directory:
@@ -69,7 +76,21 @@ class ExporterCliTests(unittest.TestCase):
 
             def export_callback(_model, staged_output, **kwargs):
                 self.assertEqual(kwargs["quant_mode"], "preserve")
+                self.assertFalse(kwargs["allow_silu_numerical_migration"])
+                self.assertFalse(
+                    kwargs[
+                        "allow_quantized_bias_folding_numerical_migration"
+                    ]
+                )
+                self.assertFalse(
+                    kwargs[
+                        "allow_static_qdq_qbatch_matmul_numerical_migration"
+                    ]
+                )
                 self.assertTrue(kwargs["enable_static_qdq_layout_optimization"])
+                self.assertFalse(
+                    kwargs["enable_exact_common_subexpression_elimination"]
+                )
                 _write_fixture_package(staged_output)
 
             with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
@@ -84,8 +105,8 @@ class ExporterCliTests(unittest.TestCase):
             self.assertEqual(status, 0)
             self.assertTrue(output.is_file())
             self.assertEqual(
-                json.loads((root / "graph.json").read_text())["format"],
-                "volvox-graph/v1",
+                set(json.loads((root / "graph.json").read_text())),
+                {"format", "dimensions", "inputs", "nodes", "outputs"},
             )
             report = json.loads(report_path.read_text())
             self.assertTrue(report["supported"])
@@ -112,6 +133,188 @@ class ExporterCliTests(unittest.TestCase):
             self.assertEqual(status, 0)
             self.assertEqual(observed, [False])
             self.assertTrue(output.is_file())
+
+    def test_silu_numerical_migration_requires_an_explicit_flag(self):
+        with tempfile.TemporaryDirectory(prefix="volvox-export-cli-") as directory:
+            output = Path(directory) / "model.safetensors"
+            observed = []
+
+            def export_callback(_model, staged_output, **kwargs):
+                observed.append(kwargs["allow_silu_numerical_migration"])
+                _write_fixture_package(staged_output)
+
+            with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+                status = main(export_callback, [
+                    "--model", "fixture.onnx",
+                    "--out", str(output),
+                    "--allow-silu-numerical-migration",
+                ])
+
+            self.assertEqual(status, 0)
+            self.assertEqual(observed, [True])
+            self.assertTrue(output.is_file())
+
+    def test_quantized_bias_folding_requires_an_explicit_flag(self):
+        with tempfile.TemporaryDirectory(prefix="volvox-export-cli-") as directory:
+            output = Path(directory) / "model.safetensors"
+            observed = []
+
+            def export_callback(_model, staged_output, **kwargs):
+                observed.append(
+                    kwargs[
+                        "allow_quantized_bias_folding_numerical_migration"
+                    ]
+                )
+                _write_fixture_package(staged_output)
+
+            with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+                status = main(export_callback, [
+                    "--model", "fixture.onnx",
+                    "--out", str(output),
+                    "--allow-quantized-bias-folding-migration",
+                ])
+
+            self.assertEqual(status, 0)
+            self.assertEqual(observed, [True])
+            self.assertTrue(output.is_file())
+
+    def test_groupnorm_silu_migration_requires_an_explicit_flag(self):
+        with tempfile.TemporaryDirectory(prefix="volvox-export-cli-") as directory:
+            output = Path(directory) / "model.safetensors"
+            observed = []
+
+            def export_callback(_model, staged_output, **kwargs):
+                observed.append(
+                    kwargs[
+                        "allow_static_qdq_groupnorm_silu_numerical_migration"
+                    ]
+                )
+                _write_fixture_package(staged_output)
+
+            with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+                status = main(export_callback, [
+                    "--model", "fixture.onnx",
+                    "--out", str(output),
+                    "--allow-static-qdq-groupnorm-silu-migration",
+                ])
+
+            self.assertEqual(status, 0)
+            self.assertEqual(observed, [True])
+            self.assertTrue(output.is_file())
+
+    def test_exact_common_subexpression_elimination_requires_an_explicit_flag(self):
+        with tempfile.TemporaryDirectory(prefix="volvox-export-cli-") as directory:
+            output = Path(directory) / "model.safetensors"
+            observed = []
+
+            def export_callback(_model, staged_output, **kwargs):
+                observed.append(
+                    kwargs["enable_exact_common_subexpression_elimination"]
+                )
+                _write_fixture_package(staged_output)
+
+            with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+                status = main(export_callback, [
+                    "--model", "fixture.onnx",
+                    "--out", str(output),
+                    "--enable-exact-common-subexpression-elimination",
+                ])
+
+            self.assertEqual(status, 0)
+            self.assertEqual(observed, [True])
+            self.assertTrue(output.is_file())
+
+    def test_qdq_qbatch_matmul_migration_requires_an_explicit_flag(self):
+        with tempfile.TemporaryDirectory(prefix="volvox-export-cli-") as directory:
+            output = Path(directory) / "model.safetensors"
+            report_path = Path(directory) / "report.json"
+            observed = []
+
+            def export_callback(_model, staged_output, **kwargs):
+                observed.append(
+                    kwargs[
+                        "allow_static_qdq_qbatch_matmul_numerical_migration"
+                    ]
+                )
+                kwargs["report_callback"]({
+                    "features": {"w8a8_qbatch_matmul": [{
+                        "source_node": "/attention/MatMul_4",
+                    }]},
+                    "abi_changes": [],
+                    "node_sources": [],
+                    "typed_optimizer": {
+                        "pipeline": {"selection_features": [
+                            "static-qdq-qbatch-matmul-migration",
+                        ]},
+                        "runs": [{
+                            "pass": (
+                                "runtime-static-qdq-qbatch-matmul-fusion"
+                            ),
+                            "changes": 6,
+                            "metrics": {
+                                "static_qdq_candidates_fused": 6,
+                            },
+                        }],
+                    },
+                })
+                _write_fixture_package(staged_output)
+
+            with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+                status = main(export_callback, [
+                    "--model", "fixture.onnx",
+                    "--out", str(output),
+                    "--allow-static-qdq-qbatch-matmul-migration",
+                    "--report", str(report_path),
+                    "--report-format", "json",
+                ])
+
+            self.assertEqual(status, 0)
+            self.assertEqual(observed, [True])
+            self.assertTrue(output.is_file())
+            report = json.loads(report_path.read_text(encoding="utf-8"))
+            self.assertEqual(report["features"]["optimizer_selection"], [
+                "static-qdq-qbatch-matmul-migration",
+            ])
+            self.assertEqual(
+                report["features"]["w8a8_qbatch_matmul"],
+                ["source-node:/attention/MatMul_4"],
+            )
+            self.assertEqual(
+                report["features"][
+                    "optimizer_pass:runtime-static-qdq-qbatch-matmul-fusion"
+                ],
+                ["changes=6", "static_qdq_candidates_fused=6"],
+            )
+
+    def test_symbolic_dimension_bounds_are_passed_without_staticizing(self):
+        with tempfile.TemporaryDirectory(prefix="volvox-export-cli-") as directory:
+            root = Path(directory)
+            output = root / "model.safetensors"
+            observed = []
+
+            def export_callback(_model, staged_output, **kwargs):
+                observed.append((
+                    kwargs["dimension_bounds"],
+                    kwargs["anonymous_dimension_bounds"],
+                ))
+                _write_fixture_package(staged_output)
+
+            with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+                status = main(export_callback, [
+                    "--model", "fixture.onnx",
+                    "--out", str(output),
+                    "--dimension-bound", "batch=1:8:1",
+                    "--anonymous-dimension-bound", "tokens:1=sequence:1:512:8",
+                ])
+
+            self.assertEqual(status, 0)
+            self.assertEqual(observed, [(
+                {"batch": {"min": 1, "max": 8, "multiple_of": 1}},
+                {("tokens", 1): {
+                    "name": "sequence", "min": 1, "max": 512,
+                    "multiple_of": 8,
+                }},
+            )])
 
     def test_non_v1_graph_fails_without_publishing(self):
         with tempfile.TemporaryDirectory(prefix="volvox-export-cli-") as directory:

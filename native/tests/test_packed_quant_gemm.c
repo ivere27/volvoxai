@@ -1,6 +1,7 @@
 #include "inference_kernels.h"
 #include "packed_quant_gemm.h"
 #include "cpu_features.h"
+#include "kernel_platform.h"
 #include "thread_pool.h"
 
 #include <math.h>
@@ -237,6 +238,136 @@ cleanup:
     return ok;
 }
 
+/* The single-thread packed kernel handles four N8 panels at a time.  Use a K4
+ * tail, an odd row tail, and an N16 remainder after the N32 body. Full-domain
+ * activations plus weights outside the non-saturating |w|<=64 subset exercise
+ * the exact signed-absolute spelling on AVX2 and VPDPBUSD on a VNNI tier. */
+static int test_w8a8_signed_n32_single_thread(void) {
+    enum { rows = 5, d_in = 37, d_out = 48 };
+    const size_t input_count = (size_t)rows * d_in;
+    const size_t weight_count = (size_t)d_out * d_in;
+    const size_t output_count = (size_t)rows * d_out;
+    uint8_t* input = (uint8_t*)malloc(input_count);
+    int8_t* weight = (int8_t*)malloc(weight_count);
+    int32_t* bias = (int32_t*)malloc((size_t)d_out * sizeof(*bias));
+    float* scales = (float*)malloc((size_t)d_out * sizeof(*scales));
+    int32_t* zero_points = (int32_t*)calloc(d_out, sizeof(*zero_points));
+    uint8_t* expected = (uint8_t*)malloc(output_count);
+    uint8_t* actual = (uint8_t*)malloc(output_count);
+    const uint32_t packed_bytes = vx_packed_q8_weight_size(d_in, d_out);
+    void* packed = malloc(packed_bytes);
+    int ok = input && weight && bias && scales && zero_points && expected &&
+        actual && packed && packed_bytes;
+    if (!ok) goto cleanup;
+    for (size_t index = 0; index < input_count; index++)
+        input[index] = (uint8_t)(index * 197u + index / 3u + 251u);
+    for (size_t index = 0; index < weight_count; index++) {
+        int value = (int)(index * 89u % 255u) - 127;
+        weight[index] = (int8_t)value;
+    }
+    weight[0] = -127;
+    weight[1] = 127;
+    for (uint32_t column = 0; column < d_out; column++) {
+        bias[column] = (int32_t)column * 97 - 1703;
+        scales[column] = (float)(1u + column % 7u) / 512.0f;
+    }
+    ok = vx_pack_q8_weight(packed, packed_bytes, weight, d_in, d_out,
+                           VX_DTYPE_I8, 1u);
+    for (uint32_t input_kind = 0; input_kind < 2u && ok; input_kind++) {
+        const uint32_t input_dtype = input_kind ? VX_DTYPE_U8 : VX_DTYPE_I8;
+        const int32_t input_zero_point = input_kind ? 137 : -11;
+        for (uint32_t output_kind = 0; output_kind < 2u && ok; output_kind++) {
+            const uint32_t output_dtype =
+                output_kind ? VX_DTYPE_U8 : VX_DTYPE_I8;
+            const int32_t output_zero_point = output_kind ? 121 : -5;
+            ok = qlinear_i8u8(input, weight, bias, scales, zero_points,
+                    expected, rows, d_in, d_out, 1.0f / 256.0f,
+                    input_zero_point, 2.0f, output_zero_point, input_dtype,
+                    VX_DTYPE_I8, output_dtype) &&
+                vx_qlinear_i8u8_packed(input, packed, bias, scales,
+                    zero_points, actual, rows, d_in, d_out, 1.0f / 256.0f,
+                    input_zero_point, 2.0f, output_zero_point, input_dtype,
+                    VX_DTYPE_I8, output_dtype) &&
+                memcmp(expected, actual, output_count) == 0;
+        }
+    }
+cleanup:
+    free(packed);
+    free(actual);
+    free(expected);
+    free(zero_points);
+    free(scales);
+    free(bias);
+    free(weight);
+    free(input);
+    return ok;
+}
+
+/* Bounded symmetric weights select PAIR_NO_SATURATE.  On a forced AVX2 tier
+ * this is the N32 plain U8xI8 spelling (use_signed_abs=false), not the
+ * signed-absolute body.  M=5 and K=37 cover the odd-row and K4 tails, while
+ * N=48 runs one N32 group followed by its N16 remainder. */
+static int test_w8a8_n32_nosat_single_thread(void) {
+    enum { rows = 5, d_in = 37, d_out = 48 };
+    const size_t input_count = (size_t)rows * d_in;
+    const size_t weight_count = (size_t)d_out * d_in;
+    const size_t output_count = (size_t)rows * d_out;
+    uint8_t* input = (uint8_t*)malloc(input_count);
+    int8_t* weight = (int8_t*)malloc(weight_count);
+    int32_t* bias = (int32_t*)malloc((size_t)d_out * sizeof(*bias));
+    float* scales = (float*)malloc((size_t)d_out * sizeof(*scales));
+    int32_t* zero_points = (int32_t*)calloc(d_out, sizeof(*zero_points));
+    uint8_t* expected = (uint8_t*)malloc(output_count);
+    uint8_t* actual = (uint8_t*)malloc(output_count);
+    const uint32_t packed_bytes = vx_packed_q8_weight_size(d_in, d_out);
+    void* packed = malloc(packed_bytes);
+    int ok = input && weight && bias && scales && zero_points && expected &&
+        actual && packed && packed_bytes && vx_kernels_thread_count() == 1;
+    if (!ok) goto cleanup;
+
+    for (size_t index = 0; index < input_count; index++)
+        input[index] = (uint8_t)(index * 197u + index / 3u + 251u);
+    for (size_t index = 0; index < weight_count; index++)
+        weight[index] = (int8_t)((int)(index * 67u % 129u) - 64);
+    weight[0] = -64;
+    weight[1] = 64;
+    for (uint32_t column = 0; column < d_out; column++) {
+        bias[column] = (int32_t)column * 53 - 1201;
+        scales[column] = (float)(1u + column % 3u) / 128.0f;
+    }
+    ok = vx_pack_q8_weight(packed, packed_bytes, weight, d_in, d_out,
+                           VX_DTYPE_I8, 1u);
+    for (uint32_t input_kind = 0; input_kind < 2u && ok; input_kind++) {
+        const uint32_t input_dtype = input_kind ? VX_DTYPE_U8 : VX_DTYPE_I8;
+        const int32_t input_zero_point = input_kind ? 131 : -7;
+        for (uint32_t output_kind = 0; output_kind < 2u && ok; output_kind++) {
+            const uint32_t output_dtype =
+                output_kind ? VX_DTYPE_U8 : VX_DTYPE_I8;
+            const int32_t output_zero_point = output_kind ? 127 : -3;
+            ok = qlinear_i8u8(input, weight, bias, scales, zero_points,
+                    expected, rows, d_in, d_out, 1.0f / 128.0f,
+                    input_zero_point, 1.0f / 8.0f, output_zero_point,
+                    input_dtype, VX_DTYPE_I8, output_dtype) &&
+                vx_qlinear_i8u8_packed(input, packed, bias, scales,
+                    zero_points, actual, rows, d_in, d_out, 1.0f / 128.0f,
+                    input_zero_point, 1.0f / 8.0f, output_zero_point,
+                    input_dtype, VX_DTYPE_I8, output_dtype) &&
+                memcmp(expected, actual, output_count) == 0;
+        }
+    }
+
+cleanup:
+    free(packed);
+    free(actual);
+    free(expected);
+    free(zero_points);
+    free(scales);
+    free(bias);
+    free(weight);
+    free(input);
+    return ok;
+}
+
 static int test_metadata_and_malformed_packs(void) {
     enum { d_in = 5, d_out = 3 };
     const float input[d_in] = {1.0f, -2.0f, 0.5f, 4.0f, -3.0f};
@@ -335,7 +466,149 @@ static int test_w8a8_multiplier_representability_matches_portable(void) {
     return 1;
 }
 
-int main(void) {
+#if (defined(__i386__) || defined(__x86_64__)) && \
+    (defined(__clang__) || defined(__GNUC__)) && !defined(_WIN32)
+/* One fresh process per forced tier keeps the header-only platform cache honest.
+ * The bounded-weight helper above covers the AVX2 N32 plain dot.  The first
+ * pack here takes the signed-absolute AVX2 route but must stay in the ordinary
+ * U8 domain on a single-thread VNNI tier.  The second contains -128, so it
+ * reaches the full-range VNNI N32 route while AVX2 retains its exact split N16
+ * fallback. */
+static int test_w8a8_forced_isa_case(const char* requested) {
+    enum { rows = 5, d_in = 37, d_out = 64 };
+    const size_t input_count = (size_t)rows * d_in;
+    const size_t weight_count = (size_t)d_out * d_in;
+    const size_t output_count = (size_t)rows * d_out;
+    uint8_t input[input_count];
+    int8_t signed_weight[weight_count];
+    int8_t full_weight[weight_count];
+    int32_t bias[d_out];
+    float scales[d_out];
+    int32_t zero_points[d_out];
+    int8_t expected[output_count];
+    int8_t actual[output_count];
+    const uint32_t packed_bytes = vx_packed_q8_weight_size(d_in, d_out);
+    void* packed = malloc(packed_bytes);
+    VxKernelPlatform platform;
+
+    CHECK(requested && requested[0] && packed && packed_bytes);
+    vx_kernel_platform_resolve(&platform);
+    CHECK(strcmp(vx_kernel_isa_name(platform.isa), requested) == 0);
+    CHECK(vx_kernels_thread_count() == 1);
+    if (platform.isa == VX_KERNEL_ISA_AVX2)
+        CHECK(test_w8a8_n32_nosat_single_thread());
+    for (size_t index = 0; index < input_count; index++)
+        input[index] = (uint8_t)(index * 197u + index / 3u + 251u);
+    for (size_t index = 0; index < weight_count; index++) {
+        signed_weight[index] = (int8_t)((int)(index * 89u % 255u) - 127);
+        full_weight[index] = signed_weight[index];
+    }
+    signed_weight[0] = -127;
+    signed_weight[1] = 127;
+    full_weight[0] = -128;
+    full_weight[1] = 127;
+    for (uint32_t column = 0; column < d_out; column++) {
+        bias[column] = (int32_t)column * 31 - 997;
+        scales[column] = 1.0f / 64.0f;
+        zero_points[column] = 0;
+    }
+
+    CHECK(vx_pack_q8_weight(packed, packed_bytes, signed_weight, d_in, d_out,
+                            VX_DTYPE_I8, 1u));
+    CHECK(vx_packed_q8_prefers_signed_activations(
+              packed, zero_points, d_out) ==
+          (platform.isa == VX_KERNEL_ISA_AVX2));
+    zero_points[0] = 1;
+    CHECK(vx_packed_q8_prefers_signed_activations(
+              packed, zero_points, d_out) == 0);
+    zero_points[0] = 0;
+    CHECK(qlinear_i8u8(input, signed_weight, bias, scales, zero_points,
+        expected, rows, d_in, d_out, 1.0f / 64.0f, 137, 1.0f, -3,
+        VX_DTYPE_U8, VX_DTYPE_I8, VX_DTYPE_I8));
+    CHECK(vx_qlinear_i8u8_packed(input, packed, bias, scales, zero_points,
+        actual, rows, d_in, d_out, 1.0f / 64.0f, 137, 1.0f, -3,
+        VX_DTYPE_U8, VX_DTYPE_I8, VX_DTYPE_I8));
+    CHECK(memcmp(expected, actual, output_count) == 0);
+
+    CHECK(vx_pack_q8_weight(packed, packed_bytes, full_weight, d_in, d_out,
+                            VX_DTYPE_I8, 1u));
+    CHECK(vx_packed_q8_prefers_signed_activations(
+              packed, zero_points, d_out) == 0);
+    CHECK(qlinear_i8u8(input, full_weight, bias, scales, zero_points,
+        expected, rows, d_in, d_out, 1.0f / 64.0f, 137, 1.0f, -3,
+        VX_DTYPE_U8, VX_DTYPE_I8, VX_DTYPE_I8));
+    CHECK(vx_qlinear_i8u8_packed(input, packed, bias, scales, zero_points,
+        actual, rows, d_in, d_out, 1.0f / 64.0f, 137, 1.0f, -3,
+        VX_DTYPE_U8, VX_DTYPE_I8, VX_DTYPE_I8));
+    CHECK(memcmp(expected, actual, output_count) == 0);
+
+    free(packed);
+    printf("packed N32 ISA parity passed on tier %s\n", requested);
+    return 1;
+}
+
+static int test_w8a8_forced_isa_children(const char* executable) {
+    static const struct {
+        const char* name;
+        VxKernelIsa isa;
+    } tiers[] = {
+        {"baseline", VX_KERNEL_ISA_BASELINE},
+        {"avx2", VX_KERNEL_ISA_AVX2},
+        {"avxvnni", VX_KERNEL_ISA_AVX_VNNI},
+        {"avx512vnni", VX_KERNEL_ISA_AVX512_VNNI},
+    };
+    VxKernelPlatform host;
+    size_t tested = 0;
+    vx_kernel_platform_resolve(&host);
+    for (size_t index = 0; index < sizeof(tiers) / sizeof(tiers[0]); index++) {
+        char command[1024];
+        /* The packed dispatcher intentionally prefers VEX AVX-VNNI when a
+         * machine exposes both forms.  Do not report that duplicate execution
+         * as EVEX parity; an AVX-512-VNNI-only host exercises that body, while
+         * verify_native_packed_qgemm_vnni always checks its encoding. */
+        int supported = tiers[index].isa == VX_KERNEL_ISA_BASELINE ||
+            (tiers[index].isa == VX_KERNEL_ISA_AVX2 && host.has_avx2) ||
+            (tiers[index].isa == VX_KERNEL_ISA_AVX_VNNI && host.has_avx_vnni) ||
+            (tiers[index].isa == VX_KERNEL_ISA_AVX512_VNNI &&
+             host.has_avx512_vnni && !host.has_avx_vnni);
+        if (!supported) continue;
+        const int command_length = snprintf(command, sizeof(command),
+            "VOLVOXAI_CPU_ISA=%s \"%s\" --forced-isa",
+            tiers[index].name, executable);
+        CHECK(command_length > 0 && (size_t)command_length < sizeof(command));
+        CHECK(system(command) == 0);
+        tested++;
+    }
+    CHECK(tested >= 1u);
+    return 1;
+}
+#endif
+
+int main(int argc, char** argv) {
+#if (defined(__i386__) || defined(__x86_64__)) && \
+    (defined(__clang__) || defined(__GNUC__)) && !defined(_WIN32)
+    if (argc == 2 && !strcmp(argv[1], "--forced-isa")) {
+        const char* requested = getenv("VOLVOXAI_CPU_ISA");
+        return test_w8a8_forced_isa_case(requested) ? 0 : 1;
+    }
+#else
+    (void)argc;
+    (void)argv;
+#endif
+    /* The K block is derived from the detected L1 rather than fixed at 960.
+     * The derivation is only trustworthy if it still lands on the value it
+     * replaced for the cache size that value was chosen against, so check that
+     * first and check that the live block is usable at all. */
+    if (!vx_qgemm_kc_is_baseline()) {
+        fprintf(stderr, "quantized K block no longer reproduces its baseline "
+                        "on a 32 KiB L1\n");
+        return 1;
+    }
+    if (vx_qgemm_kc() < 64u || vx_qgemm_kc() % 64u) {
+        fprintf(stderr, "quantized K block %u is not a usable block\n",
+                vx_qgemm_kc());
+        return 1;
+    }
     if (vx_packed_q8_preferred_for_native_w8a8(
             0u, 320u, 320u, VX_DTYPE_I8, 1) ||
         vx_packed_q8_preferred_for_native_w8a8(
@@ -364,9 +637,15 @@ int main(void) {
                     VX_DTYPE_U8) ||
         !test_w8a8_threaded_all_byte_types() ||
         !test_w8a8_symmetric_i8_exact_panel() ||
+        !test_w8a8_signed_n32_single_thread() ||
+        !test_w8a8_n32_nosat_single_thread() ||
         !test_metadata_and_malformed_packs() ||
         !test_w8a8_overflow_matches_portable() ||
         !test_w8a8_multiplier_representability_matches_portable()) return 1;
+#if (defined(__i386__) || defined(__x86_64__)) && \
+    (defined(__clang__) || defined(__GNUC__)) && !defined(_WIN32)
+    if (!test_w8a8_forced_isa_children(argv[0])) return 1;
+#endif
     puts("packed quantized GEMM correctness tests passed");
     return 0;
 }

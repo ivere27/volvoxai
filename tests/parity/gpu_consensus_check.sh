@@ -1,9 +1,8 @@
 #!/usr/bin/env bash
-# EfficientDet GPU consensus gate: webgpu (Deno) vs native OpenGL vs native Vulkan.
-# All are GPU compute of the same graph, so they must agree — bit-identical for int8
-# (true-int8 requant is deterministic on GPU) and to ~1e-6 for fp32. This is the
-# correct gate for the *true-int8 GPU* tier, which can't be gated against the
-# int8-folded-to-fp32 CPU oracle (see webgpu_deno.js / TODO #2). Run on a GPU box.
+# Future EfficientDet GPU consensus diagnostic: WebGPU versus native OpenGL and
+# Vulkan. Run it only after both native routes are exporter-qualified. It checks
+# bit-identical int8 and close fp32 outputs, but is not release/qualification
+# evidence until it also seals strict native lifecycle/no-fallback reports.
 #
 #   [DENO=~/deno NODE=~/node/bin/node] bash tests/parity/gpu_consensus_check.sh
 set -euo pipefail
@@ -151,7 +150,7 @@ run_model () {              # $1=model  $2=dtype(u8|f32)  $3=tolerance
   done
   rm -f -- "$stage/webgpu.log" "$stage/opengl.log" "$stage/vulkan.log"
   if ! rmdir "$stage"; then return 1; fi
-  echo "  route evidence: WebGPU/OpenGL/Vulkan selected; native routes may still use documented per-node CPU fallback"
+  echo "  route evidence: WebGPU/OpenGL/Vulkan selected; strict native lifecycle reports are not yet sealed"
 }
 
 if ! run_model efficientdet_lite0_fp32 f32 1e-5; then fail=1; fi
@@ -219,4 +218,4 @@ try {
 }
 NODE
 
-echo "GPU_CONSENSUS_OK"
+echo "GPU_CONSENSUS_DIAGNOSTIC_OK"

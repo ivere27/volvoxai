@@ -4,7 +4,7 @@ import { readFile } from 'node:fs/promises';
 
 import { GraphExecutor as RuntimeGraphExecutor } from '../ts/backends/GraphExecutor.js';
 import { compileWebGPUGraphPlan } from '../ts/backends/WebGPUGraphCompiler.js';
-import { Graph } from '../ts/core/Graph.js';
+import { RuntimeGraph } from '../ts/core/RuntimeGraph.js';
 import { DataType } from '../ts/generated/volvoxaiEnums.js';
 
 // Node does not expose these WebGPU constants. The mock only needs distinct
@@ -50,12 +50,19 @@ function mockDevice() {
   const state = {
     bindGroups: [], shaderCodes: [], buffers: [], copies: [], dispatches: [], writes: [],
     submissions: [], qsdpaSeqKV: [], mapCount: 0,
+    failBufferLabel: null, failWriteLabel: null,
   };
   return {
     state,
     createBuffer(descriptor) {
+      if (state.failBufferLabel === descriptor.label) {
+        state.failBufferLabel = null;
+        throw new Error(`injected allocation failure for ${descriptor.label}`);
+      }
       const buffer = {
         descriptor,
+        size: descriptor.size,
+        usage: descriptor.usage,
         bytes: new Uint8Array(descriptor.size),
         async mapAsync() { state.mapCount++; },
         getMappedRange() { return this.bytes.buffer.slice(0); },
@@ -105,6 +112,10 @@ function mockDevice() {
     },
     queue: {
       writeBuffer(destination, offset, source, sourceOffset = 0, size = undefined) {
+        if (state.failWriteLabel === destination.descriptor?.label) {
+          state.failWriteLabel = null;
+          throw new Error(`injected write failure for ${destination.descriptor.label}`);
+        }
         const sourceBuffer = source instanceof ArrayBuffer ? source : source.buffer;
         const byteOffset = (source instanceof ArrayBuffer ? 0 : source.byteOffset) + sourceOffset;
         const byteLength = size ?? (source instanceof ArrayBuffer ? source.byteLength : source.byteLength) - sourceOffset;
@@ -267,7 +278,7 @@ test('WebGPU typed readback copies padded storage and returns the logical reques
 });
 
 test('WebGPU W8A8 incremental rows retain device K/V prefixes and update only the selected row', async () => {
-  const graph = new Graph();
+  const graph = new RuntimeGraph();
   const quantization = { scheme: 'per_tensor', scale: 0.125, zero_point: 0 };
   const q = graph.addInput('q', [1, 3, 4], 'int8', { quantization });
   const k = graph.addInput('k', [1, 3, 4], 'int8', { quantization });
@@ -342,8 +353,80 @@ test('WebGPU W8A8 incremental rows retain device K/V prefixes and update only th
   executor.dispose();
 });
 
+test('WebGPU dynamic rebind stages row-copy usage and retains it across failed candidates', async () => {
+  const graph = new RuntimeGraph();
+  const quantization = { scheme: 'per_tensor', scale: 0.125, zero_point: 0 };
+  const ids = graph.addInput('ids', [1, 3], 'int32');
+  const weight = graph.addWeight('embedding.weight', [4, 4], 'int8', {
+    buffer: new Int8Array(16),
+    quantization: {
+      scheme: 'per_axis', axis: 0,
+      scales: new Array(4).fill(0.125), zero_points: new Array(4).fill(0),
+    },
+  });
+  const embedded = graph.addOp('QEmbedding', { input: ids, weight }, {
+    out: { name: 'embedded', shape: [1, 3, 4], dtype: 'int8', quantization },
+  }).out;
+  graph.setOutputs([embedded.name]);
+
+  const device = mockDevice();
+  const executor = new RuntimeGraphExecutor(device, graph, {
+    shaderLibrary: { getQEmbeddingShader: () => 'feedback-embedding' },
+  });
+  const maxima = new Map([...graph.tensors].map(([name, value]) => [name, value.sizeBytes]));
+  await executor.rebindGraph(graph, {
+    shapeSignature: 'ids:[1,3]', tensorMaximumBytes: maxima,
+  });
+
+  for (const name of ['ids', 'embedded']) {
+    const usage = executor.tensorBufferUsages.get(name);
+    assert.ok(usage & GPUBufferUsage.COPY_SRC, `${name} row source usage`);
+    assert.ok(usage & GPUBufferUsage.COPY_DST, `${name} row destination usage`);
+  }
+  assert.deepEqual([...executor.incrementalRowCandidates.keys()], [0]);
+  assert.deepEqual([...executor.incrementalRowCopyTensorNames].sort(), ['embedded', 'ids']);
+
+  const values = Int32Array.of(0, 0, 0);
+  await executor.execute({ ids: values }, {
+    incremental: true, incrementalReset: true, changedInputs: ['ids'],
+  });
+  values[1] = 1;
+  await executor.execute({ ids: values }, {
+    incremental: true, changedInputs: ['ids'], incrementalRowPosition: 1,
+  });
+  values[2] = 2;
+  await executor.execute({ ids: values }, {
+    incremental: true, changedInputs: ['ids'], incrementalRowPosition: 2,
+  });
+  assert.deepEqual([...executor.gpuBuffers.get('embedded').bytes.subarray(0, 12)], [
+    0, 100, 0, 0,
+    0, 0, 100, 0,
+    0, 0, 0, 100,
+  ], 'successive row plans copy distinct IDs and scatter distinct embedding rows');
+
+  const committedCandidates = [...executor.incrementalRowCandidates.entries()];
+  const committedCopyNames = [...executor.incrementalRowCopyTensorNames];
+  const committedPlans = [...executor.incrementalRowPlans.entries()];
+  const committedBuffers = new Map(executor.gpuBuffers);
+  const buildNodePipeline = executor._buildNodePipeline;
+  executor._buildNodePipeline = async () => { throw new Error('injected rebind failure'); };
+  try {
+    await assert.rejects(executor.rebindGraph(graph, {
+      shapeSignature: 'rejected', tensorMaximumBytes: maxima,
+    }), /injected rebind failure/);
+  } finally {
+    executor._buildNodePipeline = buildNodePipeline;
+  }
+  assert.equal(executor.currentShapeSignature, 'ids:[1,3]');
+  assert.deepEqual([...executor.incrementalRowCandidates.entries()], committedCandidates);
+  assert.deepEqual([...executor.incrementalRowCopyTensorNames], committedCopyNames);
+  assert.deepEqual([...executor.incrementalRowPlans.entries()], committedPlans);
+  assert.deepEqual([...executor.gpuBuffers.entries()], [...committedBuffers.entries()]);
+  executor.dispose();
+});
+
 test('WebGPU row candidates reject a dirty noncausal QSDPA mask before upload', async () => {
-  const graph = new Graph();
+  const graph = new RuntimeGraph();
   const quantization = { scheme: 'per_tensor', scale: 0.125, zero_point: 0 };
   const q = graph.addInput('q', [1, 3, 4], 'int8', { quantization });
   const k = graph.addInput('k', [1, 2, 4], 'int8', { quantization });
@@ -404,7 +487,7 @@ test('WebGPU row candidates reject a dirty noncausal QSDPA mask before upload', 
 });
 
 test('WebGPU W8A8 incremental rows preserve adjacent bytes for unaligned packed rows', async () => {
-  const graph = new Graph();
+  const graph = new RuntimeGraph();
   const activationQuantization = { scheme: 'per_tensor', scale: 0.125, zero_point: 0 };
   const input = graph.addInput('input', [1, 3, 5], 'int8', {
     quantization: activationQuantization,
@@ -483,7 +566,7 @@ test('WebGPU W8A8 incremental rows preserve adjacent bytes for unaligned packed 
 });
 
 test('WebGPU device-feedback chunks resume QArgMax IDs and keep rows without per-token maps', async () => {
-  const graph = new Graph();
+  const graph = new RuntimeGraph();
   const sequence = 4;
   const vocabulary = 4;
   const activationQuantization = { scheme: 'per_tensor', scale: 0.125, zero_point: 0 };
@@ -527,20 +610,36 @@ test('WebGPU device-feedback chunks resume QArgMax IDs and keep rows without per
     },
   });
   await executor.compile();
+  const feedbackInputs = {
+    ids: Int32Array.of(0, 0, 0, 0),
+    keep: Int32Array.of(1, 0, 0, 0),
+  };
+  const feedbackOptions = {
+    tokenInput: 'ids', keepInput: 'keep', output: 'next_ids', endPosition: 2,
+  };
+  device.state.failBufferLabel = 'DeviceFeedback_control';
   await assert.rejects(
-    executor.executeDeviceFeedbackDecode({
-      ids: Int32Array.of(0, 0, 0, 0),
-      keep: Int32Array.of(1, 0, 0, 0),
-    }, {
+    executor.executeDeviceFeedbackDecode(feedbackInputs, feedbackOptions),
+    (error) => error?.code === 'OUT_OF_MEMORY' && /DeviceFeedback_control/.test(error.message),
+  );
+  device.state.failWriteLabel = 'DeviceFeedback_control';
+  await assert.rejects(
+    executor.executeDeviceFeedbackDecode(feedbackInputs, feedbackOptions),
+    /injected write failure for DeviceFeedback_control/,
+  );
+  const rejectedControl = device.state.buffers.find((buffer) =>
+    buffer.descriptor.label === 'DeviceFeedback_control');
+  assert.equal(rejectedControl?.destroyed, true);
+  assert.equal(executor.auxiliaryBuffers.has(rejectedControl), false,
+    'a failed control upload must not leave an orphaned auxiliary buffer');
+  await assert.rejects(
+    executor.executeDeviceFeedbackDecode(feedbackInputs, {
       tokenInput: 'ids', keepInput: 'keep', output: 'next_ids',
       endPosition: 2, rowsPerSubmission: 2,
     }),
     /requires rowsPerSubmission = 1/,
   );
-  const outputBuffer = await executor.executeDeviceFeedbackDecode({
-    ids: Int32Array.of(0, 0, 0, 0),
-    keep: Int32Array.of(1, 0, 0, 0),
-  }, {
+  const outputBuffer = await executor.executeDeviceFeedbackDecode(feedbackInputs, {
     tokenInput: 'ids',
     keepInput: 'keep',
     output: 'next_ids',
@@ -637,7 +736,6 @@ test('WebGPU W8A32 keeps weight_scale graphs in their canonical output-major lay
 
   await executor.compile();
 
-  assert.equal(executor._dinWeights.has('weight'), false);
   for (const value of [input, weight, weightScale, out]) {
     assert.equal(Object.hasOwn(value, 'gpuBuffer'), false,
       'WebGPU allocation must remain executor-owned');
@@ -669,16 +767,9 @@ test('WebGPU graph compilation plans expose recursively immutable records', () =
   });
 
   assert.equal(Object.isFrozen(plan), true);
-  assert.equal(Object.isFrozen(plan.dinWeights), true);
-  assert.equal(Object.isFrozen(plan.dinWeights[0]), true);
-  assert.equal(Object.isFrozen(plan.dinWeights[0][1]), true);
   assert.equal(Object.isFrozen(plan.resultCopyTensorNames), true);
-  assert.deepEqual(plan.dinWeights, [['weight', { din: 2, dout: 3 }]]);
   assert.deepEqual(plan.resultCopyTensorNames, ['dropped', 'linear_out']);
-  assert.equal(plan.dinWeights.set, undefined);
   assert.equal(plan.resultCopyTensorNames.add, undefined);
-  assert.throws(() => plan.dinWeights.push(['other', { din: 1, dout: 1 }]), TypeError);
-  assert.throws(() => { plan.dinWeights[0][1].din = 9; }, TypeError);
   assert.throws(() => plan.resultCopyTensorNames.push('other'), TypeError);
   assert.throws(() => compileWebGPUGraphPlan({
     nodes: [{
@@ -689,12 +780,91 @@ test('WebGPU graph compilation plans expose recursively immutable records', () =
   }), /unsupported 'coordinate_transform_mode'.*coordinate_transformation_mode/);
 });
 
-test('WebGPU Linear routes odd tiled shapes and preserves every row on the scalar fallback', async () => {
+test('WebGPU dense layout is authoritative per node and contradictions fail before allocation', async () => {
+  const device = mockDevice();
+  const executor = new GraphExecutor(device, { nodes: [] }, {
+    shaderLibrary: {
+      getLinearF32Shader: () => 'linear-f32-output-major',
+      getLinearF32RowMajorShader: () => 'linear-f32-input-major',
+    },
+  });
+  const dinInput = tensor('din_input', [1, 3]);
+  const doutInput = tensor('dout_input', [1, 3]);
+  const sharedWeight = tensor('shared_square_weight', [3, 3]);
+  const dinOutput = tensor('din_output', [1, 3]);
+  const doutOutput = tensor('dout_output', [1, 3]);
+
+  await executor._buildNodePipeline({
+    id: 'shared_din_consumer', opType: 'MatMul', wLayout: 'din',
+    inputs: { input: dinInput, weight: sharedWeight }, outputs: { out: dinOutput },
+    params: { weight_layout: 'din_dout' },
+  });
+  await executor._buildNodePipeline({
+    id: 'shared_dout_consumer', opType: 'Linear', wLayout: 'dout',
+    inputs: { input: doutInput, weight: sharedWeight }, outputs: { out: doutOutput },
+    params: { weight_layout: 'dout_din' },
+  });
+
+  assert.deepEqual(device.state.shaderCodes, [
+    'linear-f32-input-major',
+    'linear-f32-output-major',
+  ]);
+  assert.equal(executor.pipelines[0].tacticId, 'webgpu.linear.input-major.scalar');
+  assert.deepEqual(device.state.bindGroups.map(({ entries }) =>
+    entries.map(({ binding }) => binding)), [[0, 1, 2, 3, 4], [0, 1, 3, 4, 5]]);
+  executor.dispose();
+
+  const contradictions = [{
+    id: 'weight_layout_conflict',
+    wLayout: 'dout',
+    params: { weight_layout: 'din_dout' },
+  }, {
+    id: 'trans_b_conflict',
+    wLayout: 'din',
+    params: { transB: true },
+  }];
+  for (const contradiction of contradictions) {
+    const conflictDevice = mockDevice();
+    const input = tensor(`${contradiction.id}_input`, [1, 3]);
+    const weight = tensor(`${contradiction.id}_weight`, [3, 3], {
+      buffer: new Float32Array(9),
+    });
+    const output = tensor(`${contradiction.id}_output`, [1, 3]);
+    input.isInput = true;
+    weight.isWeight = true;
+    const graph = {
+      nodes: [{
+        ...contradiction,
+        opType: 'Linear',
+        inputs: { input, weight },
+        outputs: { out: output },
+      }],
+      tensors: new Map([[input.name, input], [weight.name, weight], [output.name, output]]),
+      outputNames: [output.name],
+    };
+    const conflictExecutor = new GraphExecutor(conflictDevice, graph, {
+      shaderLibrary: { getLinearF32Shader: () => 'must-not-compile' },
+    });
+
+    await assert.rejects(conflictExecutor.compile(),
+      /contradictory weight layout metadata.*normalized wLayout/);
+    assert.equal(conflictDevice.state.buffers.length, 0,
+      'layout conflicts must fail before tensor or specialization allocation');
+    assert.equal(conflictDevice.state.shaderCodes.length, 0,
+      'layout conflicts must fail before shader or pipeline creation');
+    assert.equal(conflictExecutor.pipelines.length, 0);
+    conflictExecutor.dispose();
+  }
+});
+
+test('WebGPU Linear routes output-major and input-major scalar/tiled shapes', async () => {
   const device = mockDevice();
   const executor = new GraphExecutor(device, { nodes: [] }, {
     shaderLibrary: {
       getLinearF32Shader: () => 'linear-f32-scalar',
       getLinearF32TiledShader: () => 'linear-f32-tiled',
+      getLinearF32RowMajorShader: () => 'linear-f32-row-major',
+      getLinearF32RowMajorTiledShader: () => 'linear-f32-row-major-tiled',
     },
   });
 
@@ -714,11 +884,42 @@ test('WebGPU Linear routes odd tiled shapes and preserves every row on the scala
     inputs: { input: scalarInput, weight: scalarWeight }, outputs: { out: scalarOutput }, params: {},
   });
 
-  assert.deepEqual(device.state.shaderCodes, ['linear-f32-tiled', 'linear-f32-scalar']);
+  const rowMajorTiledInput = tensor('row_major_tiled_input', [17, 19]);
+  const rowMajorTiledWeight = tensor('row_major_tiled_weight', [19, 23]);
+  const rowMajorTiledOutput = tensor('row_major_tiled_output', [17, 23]);
+  await executor._buildNodePipeline({
+    id: 'matmul_row_major_tiled_tails', opType: 'MatMul', wLayout: 'din',
+    inputs: { input: rowMajorTiledInput, weight: rowMajorTiledWeight },
+    outputs: { out: rowMajorTiledOutput }, params: { weight_layout: 'din_dout' },
+  });
+
+  const rowMajorScalarInput = tensor('row_major_scalar_input', [1, 19]);
+  const rowMajorScalarWeight = tensor('row_major_scalar_weight', [19, 23]);
+  const rowMajorScalarOutput = tensor('row_major_scalar_output', [1, 23]);
+  await executor._buildNodePipeline({
+    id: 'matmul_row_major_scalar', opType: 'MatMul', wLayout: 'din',
+    inputs: { input: rowMajorScalarInput, weight: rowMajorScalarWeight },
+    outputs: { out: rowMajorScalarOutput }, params: { weight_layout: 'din_dout' },
+  });
+
+  assert.deepEqual(device.state.shaderCodes, [
+    'linear-f32-tiled',
+    'linear-f32-scalar',
+    'linear-f32-row-major-tiled',
+    'linear-f32-row-major',
+  ]);
   assert.deepEqual(executor.pipelines.map(({ workgroupCount }) => workgroupCount), [
     [2, 2, 1],
     [1, 3, 1],
+    [2, 2, 1],
+    [1, 1, 1],
   ]);
+  assert.deepEqual(executor.pipelines.slice(2).map(({ tacticId }) => tacticId), [
+    'webgpu.linear.input-major.tiled',
+    'webgpu.linear.input-major.scalar',
+  ]);
+  assert.deepEqual(device.state.bindGroups.slice(2).map(({ entries }) =>
+    entries.map(({ binding }) => binding)), [[0, 1, 2, 3, 4], [0, 1, 2, 3, 4]]);
   executor.dispose();
 });
 
@@ -943,7 +1144,7 @@ test('WebGPU QEmbedding binds row quantization metadata and packed byte output',
 
 test('WebGPU QEmbedding accepts only vocabulary-bounded internal Clip IDs', async () => {
   const makeGraph = (maximum) => {
-    const graph = new Graph();
+    const graph = new RuntimeGraph();
     const raw = graph.addInput('raw_ids', [2], 'int32');
     const ids = graph.addOp('Clip', { input: raw }, {
       out: { name: 'ids', shape: [2], dtype: 'int32' },
@@ -1007,6 +1208,93 @@ test('WebGPU QEmbedding preflights graph-input IDs before any output dispatch', 
   executor.dispose();
 });
 
+test('WebGPU preflights canonical F32 index and MoE route values before upload', async () => {
+  const graphInput = (name, shape, dtype) => {
+    const value = tensor(name, shape, { dtype });
+    value.isInput = true;
+    return value;
+  };
+  const embeddingIds = graphInput('embedding_ids', [2], 'int32');
+  const embeddingWeight = tensor('embedding_weight', [3, 2]);
+  const gatherIndices = graphInput('gather_indices', [2], 'int32');
+  const gatherData = tensor('gather_bank', [2, 2]);
+  const elementIndices = graphInput('element_indices', [2, 1], 'int32');
+  const elementData = tensor('element_data', [2, 3]);
+  const routeIndices = graphInput('route_indices', [1, 1], 'float32');
+  const routeWeights = graphInput('route_weights', [1, 1], 'float32');
+  const expertWeight = tensor('expert_weight', [2, 2, 1]);
+  const nodes = [
+    {
+      id: 'embedding_preflight', opType: 'Embedding',
+      inputs: { input: embeddingIds, weight: embeddingWeight },
+      outputs: { out: tensor('embedding_out', [2, 2]) }, params: {},
+    },
+    {
+      id: 'gather_preflight', opType: 'Gather',
+      inputs: { input: gatherData, indices: gatherIndices },
+      outputs: { out: tensor('gather_out', [2, 2]) }, params: { axis: 0 },
+      residentSlots: [1, 3], residentSlotDomain: 4,
+    },
+    {
+      id: 'elements_preflight', opType: 'GatherElements',
+      inputs: { input: elementData, indices: elementIndices },
+      outputs: { out: tensor('elements_out', [2, 1]) }, params: { axis: 1 },
+    },
+    {
+      id: 'moe_preflight', opType: 'MoELinear',
+      inputs: {
+        input: tensor('moe_input', [1, 2]), expert_weight: expertWeight,
+        route_indices: routeIndices, route_weights: routeWeights,
+      },
+      outputs: { out: tensor('moe_out', [1, 1]) }, params: {},
+      residentSlots: [1, 3], residentSlotDomain: 4,
+    },
+  ];
+  const device = mockDevice();
+  const executor = new GraphExecutor(device, { nodes, weightRevision: 0 }, { shaderLibrary: {} });
+  executor.compiledWeightRevision = 0;
+  const valid = {
+    embedding_ids: Int32Array.of(0, 2),
+    gather_indices: Int32Array.of(-1, 1),
+    element_indices: Int32Array.of(-3, 2),
+    route_indices: Float32Array.of(3),
+    route_weights: Float32Array.of(0.5),
+  };
+
+  assert.doesNotThrow(() => executor._preflightCanonicalValueDomains(valid));
+  assert.throws(
+    () => executor._preflightCanonicalValueDomains({
+      ...valid, embedding_ids: Int32Array.of(0, 3),
+    }),
+    /token id 3 is outside vocabulary size 3/,
+  );
+  assert.throws(
+    () => executor._preflightCanonicalValueDomains({
+      ...valid, gather_indices: Int32Array.of(2, 1),
+    }),
+    /slot 2 is not resident/,
+  );
+  assert.throws(
+    () => executor._preflightCanonicalValueDomains({
+      ...valid, element_indices: Int32Array.of(-4, 0),
+    }),
+    /index -4 is outside axis extent 3/,
+  );
+  assert.throws(
+    () => executor._preflightCanonicalValueDomains({
+      ...valid, route_indices: Float32Array.of(1.5),
+    }),
+    /invalid route index 1.5/,
+  );
+  await assert.rejects(
+    () => executor.execute({ ...valid, route_weights: Float32Array.of(Number.NaN) }),
+    /non-finite route weight/,
+  );
+  assert.equal(device.state.writes.length, 0,
+    'a bad late consumer value is rejected before any graph input upload');
+  executor.dispose();
+});
+
 test('WebGPU QConv2D binds canonical NHWC/OHWI W8A8 metadata', async () => {
   const device = mockDevice();
   const input = tensor('input', [1, 2, 2, 2], { dtype: 'int8', buffer: Int8Array.of(2, 4, 6, 8, 10, 12, 14, 16) });
@@ -1040,6 +1328,135 @@ test('WebGPU QConv2D binds canonical NHWC/OHWI W8A8 metadata', async () => {
   assert.deepEqual([...signed.slice(20, 22)], [0, 0]);
   assert.deepEqual([...floats.slice(24, 26)], [0.5, 0.25]);
   assert.deepEqual([...new Float32Array(entries.find((entry) => entry.binding === 2).resource.buffer.bytes.buffer).slice(0, 2)], [0.25, 0.5]);
+  executor.dispose();
+});
+
+test('WebGPU Conv2D defaults to HWIO and selects depthwise only for explicit HWCM', async () => {
+  const device = mockDevice();
+  const executor = new GraphExecutor(device, { nodes: [] }, {
+    shaderLibrary: {
+      getConv2DShader: () => 'conv-generic',
+      getConv2DDepthwise8Shader: () => 'conv-depthwise-8',
+    },
+  });
+  const input = tensor('conv_input', [1, 2, 2, 8]);
+  const output = tensor('conv_output', [1, 2, 2, 8]);
+  await executor._buildNodePipeline({
+    id: 'grouped_hwio_default',
+    opType: 'Conv2D',
+    inputs: { input, weight: tensor('grouped_weight', [1, 1, 1, 8]) },
+    outputs: { out: output },
+    params: { groups: 8 },
+  });
+  await executor._buildNodePipeline({
+    id: 'depthwise_hwcm_explicit',
+    opType: 'Conv2D',
+    inputs: { input, weight: tensor('depthwise_weight', [1, 1, 8, 1]) },
+    outputs: { out: output },
+    params: { groups: 8, weight_layout: 'HWCM' },
+  });
+
+  assert.deepEqual(device.state.shaderCodes, ['conv-generic', 'conv-depthwise-8']);
+  assert.deepEqual(executor.pipelines.map(({ workgroupCount }) => workgroupCount), [
+    [1, 1, 8],
+    [1, 1, 1],
+  ]);
+  executor.dispose();
+});
+
+test('WebGPU regular Conv2D vectorizes sixteen output channels with a scalar fallback', async () => {
+  const device = mockDevice();
+  const executor = new GraphExecutor(device, { nodes: [] }, {
+    shaderLibrary: {
+      getConv2DShader: () => 'conv-generic',
+      getConv2DRegularOut16Shader: () => 'conv-regular-out16',
+      getConv2DPointwise16TileShader: () => 'conv-pointwise-16',
+    },
+  });
+  const input = tensor('conv_input', [2, 5, 7, 5]);
+  const output = tensor('conv_output', [2, 5, 7, 16]);
+  const parameters = {
+    groups: 1,
+    weight_layout: 'HWIO',
+    stride: [1, 1],
+    pads: [1, 1, 1, 1],
+    dilation: [1, 1],
+  };
+  await executor._buildNodePipeline({
+    id: 'regular_out16',
+    opType: 'Conv2D',
+    inputs: { input, weight: tensor('regular_weight', [3, 3, 5, 16]) },
+    outputs: { out: output },
+    params: parameters,
+  });
+  await executor._buildNodePipeline({
+    id: 'pointwise_priority',
+    opType: 'Conv2D',
+    inputs: { input, weight: tensor('pointwise_weight', [1, 1, 5, 16]) },
+    outputs: { out: output },
+    params: { ...parameters, pads: [0, 0, 0, 0] },
+  });
+
+  assert.deepEqual(device.state.shaderCodes, ['conv-regular-out16', 'conv-pointwise-16']);
+  assert.deepEqual(executor.pipelines.map(({ workgroupCount }) => workgroupCount), [
+    [1, 1, 2],
+    [1, 1, 2],
+  ]);
+  assert.equal(executor.pipelines[0].tacticId, 'webgpu.conv2d.regular-out16');
+  assert.equal(executor.pipelines[1].tacticId, 'webgpu.conv2d.pointwise16-tile');
+  executor.dispose();
+});
+
+test('WebGPU regular-out16 compile failure caches the scalar Conv2D fallback tactic', async () => {
+  const device = mockDevice();
+  device.createComputePipelineAsync = async ({ compute }) => {
+    if (compute.module.code === 'conv-regular-out16-rejected') {
+      throw new Error('driver rejected regular-out16');
+    }
+    return { code: compute.module.code, getBindGroupLayout() { return {}; } };
+  };
+  const executor = new GraphExecutor(device, { nodes: [] }, {
+    shaderLibrary: {
+      getConv2DShader: () => 'conv-generic-retry',
+      getConv2DRegularOut16Shader: () => 'conv-regular-out16-rejected',
+    },
+  });
+  const input = tensor('retry_input', [2, 5, 7, 5]);
+  const weight = tensor('retry_weight', [3, 3, 5, 16]);
+  const out = tensor('retry_out', [2, 5, 7, 16]);
+  const build = (id) => executor._buildNodePipeline({
+    id,
+    opType: 'Conv2D',
+    inputs: { input, weight },
+    outputs: { out },
+    params: {
+      groups: 1,
+      weight_layout: 'HWIO',
+      stride: [1, 1],
+      pads: [1, 1, 1, 1],
+      dilation: [1, 1],
+    },
+  });
+
+  await build('regular_out16_retry');
+  await build('regular_out16_retry_again');
+
+  assert.deepEqual(device.state.shaderCodes, [
+    'conv-regular-out16-rejected',
+    'conv-generic-retry',
+  ]);
+  assert.deepEqual(executor.pipelines.map(({ workgroupCount }) => workgroupCount), [
+    [1, 1, 32],
+    [1, 1, 32],
+  ]);
+  assert.deepEqual(executor.pipelines.map(({ tacticId }) => tacticId), [
+    'webgpu.conv2d.scalar',
+    'webgpu.conv2d.scalar',
+  ]);
+  assert.deepEqual(
+    [...executor.rejectedSpecializedShaders],
+    ['conv-regular-out16-rejected'],
+  );
   executor.dispose();
 });
 
@@ -1357,14 +1774,139 @@ test('WebGPU Gather uses the rank-aware I32 kernel beyond axis zero', async () =
 
   assert.deepEqual(device.state.shaderCodes, ['gather-i32']);
   assert.deepEqual(executor.pipelines[0].workgroupCount, [1, 1, 1]);
-  assert.deepEqual(device.state.bindGroups.at(-1).entries.map(({ binding }) => binding), [0, 1, 2, 3]);
+  assert.deepEqual(device.state.bindGroups.at(-1).entries.map(({ binding }) => binding), [0, 1, 2, 3, 4]);
   const params = paramsFrom(device, 3);
   const words = new Uint32Array(params.bytes.buffer);
   assert.deepEqual([...words.slice(0, 4)], [3, 2, 1, 32]);
   assert.deepEqual([...words.slice(4, 7)], [2, 3, 4]);
   assert.deepEqual([...words.slice(12, 16)], [2, 2, 2, 4]);
+  assert.equal(words[20], 0, 'ordinary tensors bypass the resident-slot table');
   executor.dispose();
 });
+
+test('WebGPU Gather maps a partial bank in the complete global slot domain', async () => {
+  const device = mockDevice();
+  const input = tensor('experts', [2, 3]);
+  const indices = tensor('indices', [2], { dtype: 'int32' });
+  indices.isInput = true;
+  const out = tensor('out', [2, 3]);
+  const executor = new GraphExecutor(device, { nodes: [] }, {
+    shaderLibrary: { getGatherInt32Shader: () => 'gather-i32-bank' },
+  });
+
+  await executor._buildNodePipeline({
+    id: 'gather_bank', opType: 'Gather', inputs: { input, indices }, outputs: { out },
+    params: { axis: 0 }, residentSlots: [1, 3], residentSlotDomain: 4,
+  });
+
+  const entries = device.state.bindGroups.at(-1).entries;
+  assert.deepEqual(entries.map(({ binding }) => binding), [0, 1, 2, 3, 4]);
+  assert.equal(new Uint32Array(paramsFrom(device, 3).bytes.buffer)[20], 4);
+  assert.deepEqual(
+    [...new Uint32Array(paramsFrom(device, 4).bytes.buffer)],
+    [0xffffffff, 0, 0xffffffff, 1],
+  );
+  await assert.rejects(
+    () => executor._buildNodePipeline({
+      id: 'gather_bank_wrong_axis', opType: 'Gather',
+      inputs: { input, indices }, outputs: { out: tensor('wrong_axis_out', [2, 2]) },
+      params: { axis: 1 }, residentSlots: [1, 3], residentSlotDomain: 4,
+    }),
+    /partially resident bank only along axis 0/,
+  );
+  executor.dispose();
+
+  const source = await readFile(
+    new URL('../shaders/inference/gatherInt32.wgsl', import.meta.url),
+    'utf8',
+  );
+  assert.match(source, /@binding\(4\).*slot_rows/);
+  assert.match(source, /select\(data_dim\(axis\), params\.bank\.x/);
+  assert.match(source, /staged_row == 0xffffffffu/);
+});
+
+test('WebGPU bank rebinds publish fresh payload generations and roll back rejected candidates',
+  async () => {
+    const fullBank = Float32Array.of(10, 20, 30, 40);
+    const bankGraph = (slots) => {
+      const graph = new RuntimeGraph();
+      const experts = graph.addWeight('experts', [slots.length, 1], 'float32', {
+        buffer: Float32Array.from(slots, (slot) => fullBank[slot]),
+      });
+      const indices = graph.addInput('indices', [1], 'int32');
+      const out = graph.addOp('Gather', { input: experts, indices }, {
+        out: { name: 'out', shape: [1, 1], dtype: 'float32' },
+      }, { axis: 0 }).out;
+      graph.nodes[0].residentSlots = Object.freeze([...slots]);
+      graph.nodes[0].residentSlotDomain = fullBank.length;
+      graph.setOutputs(out);
+      return graph;
+    };
+    const residency = (slots) => Object.freeze({ experts: Object.freeze([...slots]) });
+    const maxima = new Map([['experts', fullBank.byteLength], ['indices', 4], ['out', 4]]);
+    const device = mockDevice();
+    device.queue.onSubmittedWorkDone = () => Promise.resolve();
+    const firstGraph = bankGraph([0, 2]);
+    const executor = new RuntimeGraphExecutor(device, firstGraph, {
+      shaderLibrary: { getGatherInt32Shader: () => 'gather-i32-bank-rebind' },
+    });
+    const bind = (graph, slots, shapeSignature) => executor.rebindGraph(graph, {
+      shapeSignature,
+      bankResidency: residency(slots),
+      tensorMaximumBytes: maxima,
+    });
+    const values = (buffer, count) => [
+      ...new Float32Array(buffer.bytes.buffer, 0, count),
+    ];
+
+    await bind(firstGraph, [0, 2], 'bank:A');
+    const firstBuffer = executor.gpuBuffers.get('experts');
+    assert.deepEqual(values(firstBuffer, 2), [10, 30]);
+
+    const secondGraph = bankGraph([1, 3]);
+    await bind(secondGraph, [1, 3], 'bank:B');
+    const secondBuffer = executor.gpuBuffers.get('experts');
+    assert.notEqual(secondBuffer, firstBuffer,
+      'equal-capacity bank payloads require distinct committed GPU storage');
+    assert.deepEqual(values(secondBuffer, 2), [20, 40]);
+    await Promise.resolve();
+    assert.equal(firstBuffer.destroyed, true,
+      'the evicted bank generation is destroyed after its queue fence');
+
+    const rejectedGraph = bankGraph([3]);
+    const buffersBeforeReject = device.state.buffers.length;
+    const buildNodePipeline = executor._buildNodePipeline;
+    executor._buildNodePipeline = async () => { throw new Error('injected bank rebind failure'); };
+    try {
+      await assert.rejects(bind(rejectedGraph, [3], 'bank:rejected'),
+        /injected bank rebind failure/);
+    } finally {
+      executor._buildNodePipeline = buildNodePipeline;
+    }
+    const rejectedBuffers = device.state.buffers.slice(buffersBeforeReject);
+    assert.ok(rejectedBuffers.some((buffer) => buffer.descriptor.label === 'Tensor_experts'));
+    assert.ok(rejectedBuffers.every((buffer) => buffer.destroyed),
+      'every buffer created for a rejected bank generation is destroyed');
+    assert.equal(executor.gpuBuffers.get('experts'), secondBuffer);
+    assert.deepEqual(values(secondBuffer, 2), [20, 40],
+      'rollback leaves the committed bank payload untouched');
+    assert.deepEqual(executor.currentBankResidency, { experts: [1, 3] });
+
+    await bind(rejectedGraph, [3], 'bank:smaller');
+    const smallerBuffer = executor.gpuBuffers.get('experts');
+    assert.notEqual(smallerBuffer, secondBuffer,
+      'a smaller replacement still receives fresh transactional storage');
+    assert.deepEqual(values(smallerBuffer, 1), [40]);
+
+    const returnedGraph = bankGraph([0, 2]);
+    await bind(returnedGraph, [0, 2], 'bank:A-again');
+    const returnedBuffer = executor.gpuBuffers.get('experts');
+    assert.notEqual(returnedBuffer, smallerBuffer);
+    assert.deepEqual(values(returnedBuffer, 2), [10, 30],
+      'returning to an earlier slot set uploads that set again');
+    assert.deepEqual(executor.currentBankResidency, { experts: [0, 2] });
+    executor.dispose();
+  });
 
 test('WebGPU Gather rejects F32 indices for every axis', async () => {
   const input = tensor('input', [4, 3]);
@@ -2371,6 +2913,72 @@ test('WebGPU Slice uses canonical rank-1..8 metadata with normalized axes and st
   executor.dispose();
 });
 
+test('WebGPU canonical spatial attributes specialize to exact pool and transpose geometry', async () => {
+  const device = mockDevice();
+  const executor = new GraphExecutor(device, { nodes: [] }, {
+    shaderLibrary: {
+      getAveragePool2DShader: () => 'average-pool-2d',
+      getConvTranspose2DShader: () => 'conv-transpose-2d',
+    },
+  });
+
+  await executor._buildNodePipeline({
+    id: 'average_pool_symmetric_pads', opType: 'AveragePool2D',
+    inputs: { input: tensor('pool_input', [1, 2, 2, 1]) },
+    outputs: { out: tensor('pool_output', [1, 3, 3, 1]) },
+    params: { kernel: 2, stride: [1], pads: [1, 1, 1, 1] },
+  });
+  assert.deepEqual(
+    [...new Uint32Array(paramsFrom(device, 2).bytes.buffer).slice(0, 12)],
+    [1, 2, 2, 1, 3, 3, 2, 2, 1, 1, 1, 1],
+    'AveragePool2D consumes the canonical pads field and scalar/one-element pairs',
+  );
+
+  await executor._buildNodePipeline({
+    id: 'conv_transpose_scalar_geometry', opType: 'ConvTranspose2D',
+    inputs: {
+      input: tensor('transpose_input', [1, 2, 3, 1]),
+      weight: tensor('transpose_weight', [2, 2, 1, 1]),
+    },
+    outputs: { out: tensor('transpose_output', [1, 2, 4, 1]) },
+    params: { kernel: 2, stride: [2], padding: 1 },
+  });
+  assert.deepEqual(
+    [...new Uint32Array(paramsFrom(device, 4).bytes.buffer).slice(0, 14)],
+    [1, 2, 3, 1, 2, 4, 1, 2, 2, 2, 2, 1, 1, 0],
+    'ConvTranspose2D expands scalar and one-element geometry before u32 specialization',
+  );
+  assert.deepEqual(executor.pipelines.map((pipeline) => pipeline.workgroupCount), [
+    [1, 1, 1],
+    [1, 1, 1],
+  ]);
+  executor.dispose();
+});
+
+test('WebGPU Slice matches canonical clamping and encodes unobserved huge steps safely', async () => {
+  const device = mockDevice();
+  const input = tensor('input', [4]);
+  const out = tensor('out', [1]);
+  const executor = new GraphExecutor(device, { nodes: [] }, {
+    shaderLibrary: { getSliceNdShader: () => 'slice-nd' },
+  });
+
+  await executor._buildNodePipeline({
+    id: 'slice_clamped_start', opType: 'Slice', inputs: { input }, outputs: { out },
+    params: {
+      axes: [0], starts: [-Number.MAX_SAFE_INTEGER], ends: [1],
+      steps: [Number.MAX_SAFE_INTEGER],
+    },
+  });
+
+  const words = new Uint32Array(paramsFrom(device, 2).bytes.buffer);
+  assert.deepEqual([...words.slice(0, 4)], [1, 1, 0, 0]);
+  assert.deepEqual([...words.slice(12, 20)], [0, 0, 0, 0, 0, 0, 0, 0]);
+  assert.deepEqual([...words.slice(20, 28)], [1, 1, 1, 1, 1, 1, 1, 1],
+    'a one-element axis uses an equivalent unit step instead of wrapping a safe integer');
+  executor.dispose();
+});
+
 test('WebGPU Slice accepts the rank-eight upper bound', async () => {
   const device = mockDevice();
   const input = tensor('input', [1, 1, 1, 1, 1, 1, 2, 3]);
@@ -2527,6 +3135,84 @@ test('WebGPU QBatchMatMul accepts device-only tensors and binds canonical U8S8 m
   );
   assert.deepEqual([...new Int32Array(params).slice(8, 11)], [10, -1, 100]);
   assert.deepEqual([...new Float32Array(params).slice(12, 15)], [0.5, 0.25, 0.125]);
+  assert.equal(executor.pipelines.at(-1).tacticId, 'webgpu.qbatch-matmul.scalar');
+  executor.dispose();
+});
+
+test('WebGPU packed-dot feature selects QBatchMatMul DP4a for arbitrary K', async () => {
+  const device = mockDevice();
+  const executor = new GraphExecutor(device, { nodes: [] }, {
+    wgslLanguageFeatures: new Set(['packed_4x8_integer_dot_product']),
+    shaderLibrary: {
+      getQBatchMatMulShader: () => 'qbatch-portable',
+      getQBatchMatMulDotShader: () => 'qbatch-dot',
+    },
+  });
+  const a = quantizedTensor('dot_a', [2, 1, 5, 5], {
+    dtype: 'uint8', scale: 0.03125, zeroPoint: 173,
+  });
+  const b = quantizedTensor('dot_b', [1, 4, 5, 9], {
+    dtype: 'int8', scale: 0.0625, zeroPoint: -37,
+  });
+  const out = quantizedTensor('dot_out', [2, 4, 5, 9], {
+    dtype: 'int8', scale: 0.125, zeroPoint: -11,
+  });
+  await executor._buildNodePipeline({
+    id: 'qbatch_dot', opType: 'QBatchMatMul',
+    inputs: { a, b }, outputs: { out }, params: {},
+  });
+
+  assert.deepEqual(device.state.shaderCodes, ['qbatch-dot']);
+  assert.equal(executor.pipelines.at(-1).tacticId, 'webgpu.qbatch-matmul.dot');
+  assert.deepEqual(executor.pipelines.at(-1).workgroupCount, [2, 1, 1]);
+  const entries = device.state.bindGroups.at(-1).entries;
+  const params = entries.find(({ binding }) => binding === 4).resource.buffer.bytes.buffer;
+  assert.deepEqual(
+    [...new Uint32Array(params).slice(0, 8)],
+    [2, 5, 5, 9, 360, DataType.U8, DataType.I8, DataType.I8],
+  );
+  assert.deepEqual([...new Int32Array(params).slice(8, 11)], [173, -37, -11]);
+  executor.dispose();
+});
+
+test('WebGPU QBatchMatMul packed-dot compile failure caches the scalar fallback', async () => {
+  const device = mockDevice();
+  device.createComputePipelineAsync = async ({ compute }) => {
+    if (compute.module.code === 'qbatch-dot-rejected') {
+      throw new Error('driver rejected packed dot');
+    }
+    return { getBindGroupLayout() { return {}; } };
+  };
+  const executor = new GraphExecutor(device, { nodes: [] }, {
+    wgslLanguageFeatures: new Set(['packed_4x8_integer_dot_product']),
+    shaderLibrary: {
+      getQBatchMatMulShader: () => 'qbatch-portable-retry',
+      getQBatchMatMulDotShader: () => 'qbatch-dot-rejected',
+    },
+  });
+  const a = quantizedTensor('retry_a', [1, 1, 5], {
+    dtype: 'int8', scale: 0.25, zeroPoint: -3,
+  });
+  const b = quantizedTensor('retry_b', [1, 5, 3], {
+    dtype: 'uint8', scale: 0.125, zeroPoint: 151,
+  });
+  const out = quantizedTensor('retry_out', [1, 1, 3], {
+    dtype: 'uint8', scale: 0.5, zeroPoint: 117,
+  });
+  const build = (id) => executor._buildNodePipeline({
+    id, opType: 'QBatchMatMul', inputs: { a, b }, outputs: { out }, params: {},
+  });
+  await build('qbatch_retry');
+  await build('qbatch_retry_again');
+
+  assert.deepEqual(device.state.shaderCodes, [
+    'qbatch-dot-rejected', 'qbatch-portable-retry',
+  ]);
+  assert.deepEqual(
+    executor.pipelines.map(({ tacticId }) => tacticId),
+    ['webgpu.qbatch-matmul.scalar', 'webgpu.qbatch-matmul.scalar'],
+  );
+  assert.deepEqual([...executor.rejectedSpecializedShaders], ['qbatch-dot-rejected']);
   executor.dispose();
 });
 
@@ -2682,16 +3368,17 @@ test('WebGPU Transpose uses packed descriptor-preserving I8/U8 dispatch', async 
   executor.dispose();
 });
 
-test('WebGPU Split preserves declared order with twelve outputs', async () => {
+test('WebGPU Split restores canonical numeric order after lexical graph parsing', async () => {
   const device = mockDevice();
   const executor = new GraphExecutor(device, { nodes: [] }, {
     shaderLibrary: { getSplitShader: () => 'split-declared-order' },
   });
   const input = tensor('input', [2, 12]);
-  const outputs = {};
-  for (let index = 0; index < 12; index++) {
-    outputs[`out${index}`] = tensor(`slice${index}`, [2, 1]);
-  }
+  const outputs = Object.fromEntries(
+    Array.from({ length: 12 }, (_, index) =>
+      [`out${index}`, tensor(`slice${index}`, [2, 1])])
+      .sort(([left], [right]) => left.localeCompare(right)),
+  );
   const firstBindGroup = device.state.bindGroups.length;
   await executor._buildNodePipeline({
     id: 'split_many', opType: 'Split',
@@ -3034,7 +3721,7 @@ test('WebGPU typed Resize uses nearest-neighbor packed-byte forwarding only', as
 
 test('WebGPU snapshots every declared output, including input, weight, and Dropout aliases', async () => {
   const device = mockDevice();
-  const graph = new Graph();
+  const graph = new RuntimeGraph();
   const input = graph.addInput('input', [1], 'float32');
   const weight = graph.addWeight('weight', [1], 'float32', Float32Array.of(2));
   const { out: dropout } = graph.addOp('Dropout', { input }, { out: [1] });

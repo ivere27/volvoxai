@@ -20,9 +20,29 @@ from tools.exporter.quantization_storage import (
 )
 
 
+def _new_v1(graph):
+    result = copy.deepcopy(graph)
+    result["dimensions"] = {}
+    for index, node in enumerate(result.get("nodes", [])):
+        outputs = node.get("outputs", {})
+        shapes = node.pop("outputs_shape", {})
+        dtypes = node.pop("outputs_dtype", {})
+        node["outputs"] = {
+            port: {
+                "tensor": tensor,
+                "shape": shapes[port],
+                "dtype": dtypes[port],
+            }
+            for port, tensor in outputs.items()
+        }
+        node.setdefault("id", f"node-{index}")
+        node.setdefault("params", {})
+    return result
+
+
 class QuantizationStorageTests(unittest.TestCase):
     def authoring_graph(self):
-        graph = {
+        graph = _new_v1({
             "format": GRAPH_FORMAT,
             "inputs": {
                 "x": {
@@ -45,7 +65,7 @@ class QuantizationStorageTests(unittest.TestCase):
                 }
             ],
             "outputs": ["y"],
-        }
+        })
         descriptors = {
             "x": {
                 "scheme": "per_tensor",
@@ -97,7 +117,7 @@ class QuantizationStorageTests(unittest.TestCase):
         self.assertEqual(validation.diagnostics, ())
 
     def test_explicit_quantize_parameters_are_reused_bit_exactly(self):
-        graph = {
+        graph = _new_v1({
             "format": "volvox-graph/v1",
             "inputs": {"x": {"shape": [2], "dtype": "float32"}},
             "nodes": [{
@@ -108,7 +128,7 @@ class QuantizationStorageTests(unittest.TestCase):
                 "outputs_dtype": {"out": "uint8"},
             }],
             "outputs": ["q"],
-        }
+        })
         tensors = {
             "s": np.asarray([0.5], dtype=np.float32),
             "z": np.asarray([127], dtype=np.uint8),
@@ -166,7 +186,7 @@ class QuantizationStorageTests(unittest.TestCase):
             np.testing.assert_array_equal(tensors[name], tensors_before[name])
 
     def test_validator_rejects_inline_values_in_v1(self):
-        graph = {
+        graph = _new_v1({
             "format": GRAPH_FORMAT,
             "inputs": {"x": {
                 "shape": [1], "dtype": "int8",
@@ -174,12 +194,12 @@ class QuantizationStorageTests(unittest.TestCase):
             }},
             "nodes": [],
             "outputs": ["x"],
-        }
+        })
         with self.assertRaises(ExporterError) as caught:
             validate_external_quantization(graph, {})
         self.assertEqual(caught.exception.diagnostic.code, "VXQSTORE022")
 
-        graph = {
+        graph = _new_v1({
             "format": GRAPH_FORMAT,
             "inputs": {},
             "nodes": [],
@@ -190,7 +210,7 @@ class QuantizationStorageTests(unittest.TestCase):
                 },
             },
             "outputs": ["state"],
-        }
+        })
         with self.assertRaises(ExporterError) as caught:
             validate_external_quantization(graph, {})
         self.assertEqual(caught.exception.diagnostic.code, "VXQSTORE024")
@@ -205,7 +225,7 @@ class QuantizationStorageTests(unittest.TestCase):
             "scales", "zero_points",
             "scale_tensor", "zero_point_tensor",
         )
-        graph = {
+        graph = _new_v1({
             "format": GRAPH_FORMAT,
             "inputs": {"x": {"shape": [1], "dtype": "float32"}},
             "nodes": [{
@@ -218,7 +238,7 @@ class QuantizationStorageTests(unittest.TestCase):
                 "params": {"scale": 0.5},
             }],
             "outputs": ["y"],
-        }
+        })
         self.assertEqual(validate_external_quantization(graph, {}), {})
 
         for field in forbidden:
@@ -253,12 +273,12 @@ class QuantizationStorageTests(unittest.TestCase):
         self.assertEqual(caught.exception.diagnostic.code, "VXQSTORE021")
 
     def test_validator_rejects_non_v1_graph_format(self):
-        graph = {
+        graph = _new_v1({
             "format": "volvox-graph/v2",
             "inputs": {"x": {"shape": [1], "dtype": "float32"}},
             "nodes": [],
             "outputs": ["x"],
-        }
+        })
         with self.assertRaises(ExporterError) as caught:
             validate_external_quantization(graph, {})
         self.assertEqual(caught.exception.diagnostic.code, "VXQSTORE020")
@@ -280,7 +300,7 @@ class QuantizationStorageTests(unittest.TestCase):
         self.assertEqual(validate_external_quantization(graph, {}), {})
 
     def test_optimizer_prunes_only_removed_activation_targets(self):
-        graph = {
+        graph = _new_v1({
             "format": GRAPH_FORMAT,
             "inputs": {"x": {"shape": [1], "dtype": "int8"}},
             "nodes": [{
@@ -291,7 +311,7 @@ class QuantizationStorageTests(unittest.TestCase):
                 "outputs_dtype": {"out": "int8"},
             }],
             "outputs": ["x"],
-        }
+        })
         tensors = {}
         descriptor = {
             "scheme": "per_tensor", "scale": 0.25, "zero_point": 0,

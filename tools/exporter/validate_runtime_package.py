@@ -4,7 +4,9 @@ This module is the semantic companion to ``tools/validate_model_packages.mjs``.
 The JavaScript validator owns package discovery and file-name rules; this
 module re-opens each discovered graph and its already-scoped safetensors files
 with the strict Python readers, merges the tensor inventory without aliases,
-and runs the same ``import_runtime_package`` gate used by the optimizer.
+proves every canonical operator over the exact bounded domain for all four
+portable members, and runs the same ``import_runtime_package`` gate used by
+the optimizer.  Warm profiles are not accepted as qualification evidence.
 """
 
 from __future__ import annotations
@@ -16,7 +18,9 @@ from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
+from .generated.kernel_registry import PROFILE_MEMBERS
 from .optimizer.safetensors_io import read_safetensors
+from .portable_domain import prove_portable_graph_domain
 from .runtime_ir import import_runtime_package, load_runtime_document
 
 
@@ -85,7 +89,18 @@ def validate_runtime_package(
             tensors[name] = value
 
     document = load_runtime_document(graph)
-    import_runtime_package(document, tensors, source_name=str(graph))
+    portable_members = tuple(PROFILE_MEMBERS["portable"])
+    bounded_domain_proof = prove_portable_graph_domain(
+        document,
+        tensors,
+        portable_members,
+    )
+    import_runtime_package(
+        document,
+        tensors,
+        source_name=str(graph),
+        bounded_domain_proof=bounded_domain_proof,
+    )
 
 
 def validate_runtime_packages(

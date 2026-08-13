@@ -128,6 +128,7 @@ int main(void) {
         return 1;
     }
     scope = vx_engine_state_scope_enter(state);
+    state->gemm_f32_packed_enabled = 1;
     enum { ROWS = 7, K = 17, N = 13 };
     const char* graph_path = "/tmp/volvox-gemm-f32-runtime.json";
     const char* weights_path = "/tmp/volvox-gemm-f32-runtime.safetensors";
@@ -136,7 +137,7 @@ int main(void) {
         "\"nodes\":[{\"opType\":\"Linear\","
         "\"inputs\":{\"input\":\"x\",\"weight\":\"w\",\"bias\":\"b\"},"
         "\"outputs\":{\"out\":\"y\"},\"outputs_shape\":{\"out\":[7,13]},"
-        "\"params\":{\"weight_layout\":\"OUT_IN\"}}],\"outputs\":[\"y\"]}";
+        "\"params\":{\"weight_layout\":\"dout_din\"}}],\"outputs\":[\"y\"]}";
     const int weight_shape[2] = {N, K};
     const int bias_shape[1] = {N};
     float input[ROWS * K];
@@ -170,21 +171,43 @@ int main(void) {
 
     CHECK(volvoxai_engine_configure(&options) == 0);
     CHECK(volvoxai_engine_init(graph_path, weights_path) == 0);
+    T* runtime_weight = t_find("w");
+    CHECK(runtime_weight && runtime_weight->dtype == T_F32);
+    VxGemmF32CacheEntry* cache_entry = &state->gemm_f32_cache.entries[0];
+    CHECK(cache_entry->packed != NULL);
+    CHECK(cache_entry->source == runtime_weight->data);
+    CHECK(cache_entry->k == K && cache_entry->n == N && cache_entry->out_in == 1);
+    uint32_t packed_elements = vx_gemm_f32_packed_elements(K, N);
+    CHECK(packed_elements > 0);
+    float* original_pack = (float*)malloc((size_t)packed_elements * sizeof(float));
+    CHECK(original_pack != NULL);
+    memcpy(original_pack, cache_entry->packed,
+           (size_t)packed_elements * sizeof(float));
+    const float* first_pack = cache_entry->packed;
     CHECK(volvoxai_engine_set_input_raw("x", VOLVOXAI_DTYPE_F32,
                                         input, sizeof(input)) == 0);
     reference(input, weight, bias, expected, ROWS, K, N);
     CHECK(volvoxai_engine_forward() == 0);
     CHECK(volvoxai_engine_copy_tensor_f32("y", output, ROWS * N) == 0);
     CHECK(close_array(output, expected, ROWS * N));
-    T* runtime_weight = t_find("w");
-    CHECK(runtime_weight && runtime_weight->dtype == T_F32);
-    const float* first_pack = vx_gemm_f32_pack_cache(
-        &state->gemm_f32_cache, 0, runtime_weight->data, K, N, 1);
-    CHECK(first_pack != NULL);
+    CHECK(cache_entry->packed == first_pack);
 
     CHECK(volvoxai_engine_forward() == 0);
     CHECK(vx_gemm_f32_pack_cache(&state->gemm_f32_cache, 0,
                                  runtime_weight->data, K, N, 1) == first_pack);
+    const char* invalid_patch =
+        "[{\"node_index\":0,\"mode\":3,\"patch\":{\"opType\":\"Identity\","
+        "\"inputs\":{\"input\":\"y\"},\"outputs\":{\"output\":\"bad\"},"
+        "\"output_shapes\":{\"output\":[7,13]}}}]";
+    CHECK(volvoxai_engine_patch_graph_json(invalid_patch, 0, 1) == -1);
+    CHECK(g_nn == 1 && g_weight_caches_dirty == 0);
+    CHECK(cache_entry->packed != NULL && cache_entry->source == runtime_weight->data);
+    CHECK(cache_entry->k == K && cache_entry->n == N && cache_entry->out_in == 1);
+    CHECK(memcmp(cache_entry->packed, original_pack,
+                 (size_t)packed_elements * sizeof(float)) == 0);
+    CHECK(volvoxai_engine_forward() == 0);
+    CHECK(volvoxai_engine_copy_tensor_f32("y", output, ROWS * N) == 0);
+    CHECK(close_array(output, expected, ROWS * N));
     CHECK(volvoxai_engine_set_tensor_f32("w", updated_weight, N * K) == 0);
     CHECK(g_weight_caches_dirty == 1);
     reference(input, updated_weight, bias, expected, ROWS, K, N);
@@ -192,8 +215,25 @@ int main(void) {
     CHECK(g_weight_caches_dirty == 0);
     CHECK(volvoxai_engine_copy_tensor_f32("y", output, ROWS * N) == 0);
     CHECK(close_array(output, expected, ROWS * N));
+    CHECK(cache_entry->packed != NULL);
+    CHECK(cache_entry->source == runtime_weight->data);
+    CHECK(cache_entry->k == K && cache_entry->n == N && cache_entry->out_in == 1);
+    CHECK(memcmp(cache_entry->packed, original_pack,
+                 (size_t)packed_elements * sizeof(float)) != 0);
 
     volvoxai_engine_shutdown();
+    CHECK(cache_entry->source == NULL && cache_entry->packed == NULL);
+    CHECK(cache_entry->k == 0 && cache_entry->n == 0 && cache_entry->out_in == 0);
+
+    /* A device-only initialization must not duplicate every dense weight in a
+     * host pack. CPU fallback still packs lazily when it actually executes. */
+    state->backend = VOLVOXAI_BACKEND_CUDA;
+    CHECK(volvoxai_engine_init(graph_path, weights_path) == 0);
+    CHECK(cache_entry->source == NULL && cache_entry->packed == NULL);
+    state->backend = VOLVOXAI_BACKEND_CPU;
+    volvoxai_engine_shutdown();
+
+    free(original_pack);
     vx_engine_state_scope_leave(scope);
     vx_engine_state_deinit(state);
     free(state);

@@ -4,6 +4,7 @@
 #include <stddef.h>
 #include <stdint.h>
 #include "../../include/volvoxai_enums.h"
+#include "../runtime/engine_core.h"
 
 #ifndef VOLVOXAI_ENABLE_TRAINING
 #define VOLVOXAI_ENABLE_TRAINING 0
@@ -11,10 +12,35 @@
 
 int vk_init();
 void vk_cleanup();
+/* Release the shared VkDevice/VkInstance once no engine state holds a context.
+ * vk_cleanup() only drops the calling state's context; the device deliberately
+ * outlives that so compile and execute do not each rebuild it. */
+void vk_device_release(void);
 void vk_set_shader_root(const char* root);
 void vk_free_weight_cache(void);
 int vk_matmul(const float* in, const float* w, const float* b, float* out,
               int seq, int d_in, int d_out);
+
+/* Immutable device/context ceilings consumed by the bounded-shape proof.
+ * maximum_total_span_bytes is the graph-arena region after the fixed legacy
+ * prefix and command scratch reservation; resident weights share that region. */
+typedef struct VulkanDomainLimits {
+    uint64_t maximum_storage_buffer_bytes;
+    uint64_t maximum_uniform_buffer_bytes;
+    uint64_t maximum_total_span_bytes;
+    uint64_t maximum_scratch_bytes;
+    uint64_t current_graph_scratch_bytes;
+    uint64_t storage_alignment;
+    uint32_t maximum_workgroups[3];
+    uint32_t maximum_workgroup_size[3];
+    uint32_t maximum_workgroup_invocations;
+    uint32_t maximum_storage_bindings;
+    uint32_t maximum_uniform_bindings;
+    uint32_t maximum_tensor_slots;
+    uint32_t maximum_dispatches;
+} VulkanDomainLimits;
+
+int vk_query_domain_limits(VulkanDomainLimits* limits);
 
 #if defined(VOLVOXAI_VULKAN_TESTING)
 typedef struct {
@@ -25,15 +51,61 @@ typedef struct {
     int is_training;
 } VkContextStateProbe;
 
+typedef struct {
+    uint64_t shape_generation;
+    uint64_t capacity_generation;
+    size_t active_capacity_bytes;
+    size_t pooled_capacity_bytes;
+    size_t domain_span_count;
+    size_t domain_scratch_capacity_bytes;
+    int slot_count;
+    int domain_enforced;
+} VkGraphDynamicStateProbe;
+
+typedef struct {
+    uint64_t dot_tiled_dispatches;
+    uint64_t tiled_dispatches;
+    uint64_t scalar_dispatches;
+} VkQConvTacticProbe;
+
+typedef struct {
+    uint64_t pointwise_selections;
+    uint64_t out16_dispatches;
+    uint64_t scalar_dispatches;
+} VkConvTacticProbe;
+
 int vk_test_context_state_write(const VkContextStateProbe* probe);
 int vk_test_context_state_read(VkContextStateProbe* probe);
+int vk_test_graph_dynamic_state(VkGraphDynamicStateProbe* probe);
+int vk_test_fail_domain_allocation_after(size_t successful_allocations);
+int vk_test_set_packed_dot_disabled(int disabled);
+void vk_test_qconv_tactic_reset(void);
+int vk_test_qconv_tactic_read(VkQConvTacticProbe* probe);
+void vk_test_conv_tactic_reset(void);
+int vk_test_conv_tactic_read(VkConvTacticProbe* probe);
 #endif
 
 void vk_graph_reset(void);
+/* Commit an exact semantic shape key without discarding reusable capacities.
+ * A failure leaves the prior key and live tensor bindings untouched. */
+int vk_graph_bind_shape(const char* signature);
+int vk_graph_bind_shape_domain(
+    const char* signature,
+    const VolvoxAIEnginePhysicalSpan* spans,
+    size_t span_count,
+    size_t qgroupnorm_stats_bytes,
+    size_t qlayernorm_stats_bytes);
 void vk_graph_begin_forward(void);
 int vk_graph_end_forward(void);
+/* Append compact nonzero per-forward physical tactic counts to public route
+ * evidence: c16/cs, ql[dts], qb[ds], and qc[dts]. */
+int vk_graph_append_dynamic_telemetry(char* output,
+                                      size_t output_capacity);
 void vk_graph_mark_host(const void* host, size_t bytes, int is_weight);
 int vk_graph_sync_host(const void* host, size_t bytes, int is_weight);
+/* Classification-only promotion used after the invariant bootstrap pass. */
+void vk_graph_retain_weight(const void* host, size_t bytes);
+void vk_graph_demote_weight(const void* host, size_t bytes);
 int vk_graph_alias_f32(const float* in, float* out, long n);
 int vk_graph_copy_f32(const float* in, float* out, long n);
 int vk_graph_add_f32(const float* a, const float* b, float* out, long n);
@@ -82,6 +154,13 @@ int vk_graph_groupnorm_f32(const float* in, const float* weight, const float* bi
 int vk_graph_dropout_f32(const float* in, float* out, long n, uint32_t threshold,
                          uint32_t seed, uint32_t counter, float scale);
 #endif
+/* Routed expert linear with an optional resident-slot table (NULL/0 = the bank
+ * is fully resident and route indices are already staged rows). */
+int vk_graph_moe_router_f32(const float*, const float*, const float*,
+                            float*, float*, int, int, int, int, float, int);
+int vk_graph_moe_linear_f32(const float*, const float*, const float*,
+                            const float*, const float*, float*, int, int, int,
+                            int, int, const uint32_t*, uint32_t);
 int vk_graph_embedding_f32(const int32_t* tokens, const float* weight, float* out,
                            int tokens_len, int d_model, int vocab_size);
 int vk_graph_transpose_f32(const float* in, float* out, const int* in_shape,
@@ -106,6 +185,9 @@ int vk_graph_concat_f32(const float** inputs, const long* sizes, const int* inpu
 int vk_graph_concat_32(const void* const* inputs, const long* sizes,
                        const int* input_axes, int count, void* output,
                        int output_axis, int inner);
+int vk_graph_linear_f32(const float* input, const float* weight,
+                        const float* bias, float* output, int rows,
+                        int d_in, int d_out, int output_major_weight);
 int vk_graph_concat_flat_f32(const float** inputs, const long* sizes, int count, float* out);
 int vk_graph_concat_sigmoid_flat_f32(const float** inputs, const long* sizes, int count, float* out);
 int vk_graph_maxpool2d_f32(const float* in, float* out, int n, int h, int width, int c,
@@ -113,6 +195,12 @@ int vk_graph_maxpool2d_f32(const float* in, float* out, int n, int h, int width,
                            int py, int px);
 int vk_graph_expand_f32(const float* in, float* out, const int* in_shape, int in_rank,
                         const int* out_shape, int out_rank);
+int vk_graph_expand_32(const void* in, void* out, const int* in_shape, int in_rank,
+                       const int* out_shape, int out_rank);
+int vk_graph_batch_matmul_f32(
+    const float* a, const int* a_shape, int a_rank,
+    const float* b, const int* b_shape, int b_rank,
+    float* output, const int* output_shape, int output_rank);
 int vk_graph_gather_i32_f32(const float* input, const int32_t* indices,
                             float* output, int outer, int axis_size, int inner,
                             int indices_elements, int output_elements);

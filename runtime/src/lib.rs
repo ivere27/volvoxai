@@ -271,23 +271,115 @@ fn tensor_info_message(info: &VxTensorInfo) -> Result<TensorInfo, FfiError> {
     })
 }
 
-fn input_descriptors(
+fn canonical_shape_symbol(value: &str) -> bool {
+    if value.is_empty() || value.len() > 64 {
+        return false;
+    }
+    let mut bytes = value.bytes();
+    matches!(bytes.next(), Some(b'a'..=b'z' | b'A'..=b'Z'))
+        && bytes.all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+}
+
+fn tensor_spec_message(spec: &VxTensorSpec) -> Result<TensorSpec, FfiError> {
+    if spec.rank as usize > VX_MAX_TENSOR_RANK {
+        return Err(service_error(
+            "native tensor-spec rank exceeds the public limit",
+            INTERNAL,
+        ));
+    }
+    let name = if spec.name.is_null() {
+        return Err(service_error("native tensor spec has no name", INTERNAL));
+    } else {
+        unsafe { CStr::from_ptr(spec.name) }
+            .to_str()
+            .map_err(|_| service_error("native tensor-spec name is not UTF-8", INTERNAL))?
+            .to_owned()
+    };
+    if name.is_empty() {
+        return Err(service_error("native tensor spec has an empty name", INTERNAL));
+    }
+    let mut dimensions = Vec::with_capacity(spec.rank as usize);
+    for native in &spec.dimensions[..spec.rank as usize] {
+        if native.struct_size != std::mem::size_of::<VxDimensionConstraint>()
+            || native.min <= 0
+            || native.max < native.min
+            || native.multiple_of <= 0
+        {
+            return Err(service_error(
+                "native returned a malformed dimension constraint",
+                INTERNAL,
+            ));
+        }
+        let symbol = match native.kind {
+            VX_DIMENSION_FIXED => {
+                if !native.symbol.is_null()
+                    || native.min != native.max
+                    || native.multiple_of != 1
+                {
+                    return Err(service_error(
+                        "native returned a malformed fixed dimension",
+                        INTERNAL,
+                    ));
+                }
+                String::new()
+            }
+            VX_DIMENSION_SYMBOLIC => {
+                if native.symbol.is_null() {
+                    return Err(service_error(
+                        "native returned a symbolic dimension without a symbol",
+                        INTERNAL,
+                    ));
+                }
+                let symbol = unsafe { CStr::from_ptr(native.symbol) }
+                    .to_str()
+                    .map_err(|_| {
+                        service_error("native dimension symbol is not UTF-8", INTERNAL)
+                    })?
+                    .to_owned();
+                if !canonical_shape_symbol(&symbol) {
+                    return Err(service_error(
+                        "native returned a non-canonical dimension symbol",
+                        INTERNAL,
+                    ));
+                }
+                symbol
+            }
+            _ => {
+                return Err(service_error(
+                    "native returned an invalid dimension kind",
+                    INTERNAL,
+                ))
+            }
+        };
+        dimensions.push(DimensionConstraint {
+            symbol,
+            min: native.min,
+            max: native.max,
+            multiple_of: native.multiple_of,
+        });
+    }
+    Ok(TensorSpec {
+        name,
+        dtype: protobuf_dtype(spec.dtype)?,
+        dimensions,
+        location: protobuf_location(spec.location)?,
+    })
+}
+
+fn input_specs(
     count: usize,
-    mut query: impl FnMut(usize, &mut VxTensorInfo, &mut VxReport) -> c_int,
-) -> Result<Vec<TensorInfo>, FfiError> {
+    mut query: impl FnMut(usize, &mut VxTensorSpec, &mut VxReport) -> c_int,
+) -> Result<Vec<TensorSpec>, FfiError> {
     let mut inputs = Vec::with_capacity(count);
-    // Count functions have no report channel and return zero for both a live
-    // zero-input owner and a closed owner. Probe index zero so native lifecycle
-    // errors win over request-shape validation.
     for index in 0..count.max(1) {
-        let mut info = VxTensorInfo::new();
+        let mut spec = VxTensorSpec::new();
         let mut report = VxReport::new();
-        let status = query(index, &mut info, &mut report);
+        let status = query(index, &mut spec, &mut report);
         if count == 0 && status == VX_STATUS_NOT_FOUND {
             return Ok(inputs);
         }
         check_native(status, &report)?;
-        inputs.push(tensor_info_message(&info)?);
+        inputs.push(tensor_spec_message(&spec)?);
     }
     Ok(inputs)
 }
@@ -310,9 +402,14 @@ fn checked_tensor_bytes(shape: &[i64], native_dtype: c_int) -> Result<usize, Ffi
     }
     let mut elements = 1usize;
     for dimension in shape {
-        let dimension = usize::try_from(*dimension).map_err(|_| {
-            service_error("tensor dimensions must be non-negative", INVALID_ARGUMENT)
-        })?;
+        if *dimension <= 0 {
+            return Err(service_error(
+                "tensor dimensions must be positive",
+                INVALID_ARGUMENT,
+            ));
+        }
+        let dimension = usize::try_from(*dimension)
+            .map_err(|_| service_error("tensor dimension is too large", INVALID_ARGUMENT))?;
         elements = elements
             .checked_mul(dimension)
             .ok_or_else(|| service_error("tensor is too large", INVALID_ARGUMENT))?;
@@ -322,66 +419,367 @@ fn checked_tensor_bytes(shape: &[i64], native_dtype: c_int) -> Result<usize, Ffi
         .ok_or_else(|| service_error("tensor is too large", INVALID_ARGUMENT))
 }
 
-fn validate_host_input(
-    input: &Tensor,
-    descriptors: &[TensorInfo],
-) -> Result<(CString, c_int), FfiError> {
-    if MemoryLocation::try_from(input.location).ok() != Some(MemoryLocation::Host) {
-        return Err(service_error(
-            "input.location must be MEMORY_LOCATION_HOST",
-            INVALID_ARGUMENT,
-        ));
+struct NativeBindingBatch {
+    _names: Vec<CString>,
+    bindings: Vec<VxTensorBinding>,
+}
+
+impl NativeBindingBatch {
+    fn new(
+        inputs: &[Tensor],
+        specs: &[TensorSpec],
+        require_complete: bool,
+    ) -> Result<Self, FfiError> {
+        if require_complete && inputs.len() != specs.len() {
+            return Err(service_error(
+                "execution requires every declared input exactly once",
+                INVALID_ARGUMENT,
+            ));
+        }
+        if inputs.len() > specs.len() {
+            return Err(service_error("too many input tensors", INVALID_ARGUMENT));
+        }
+        let mut names = Vec::with_capacity(inputs.len());
+        let mut seen = HashSet::with_capacity(inputs.len());
+        let mut symbols: HashMap<&str, i64> = HashMap::new();
+        let mut native_rows = Vec::with_capacity(inputs.len());
+        for input in inputs {
+            if MemoryLocation::try_from(input.location).ok() != Some(MemoryLocation::Host) {
+                return Err(service_error(
+                    "input.location must be MEMORY_LOCATION_HOST",
+                    INVALID_ARGUMENT,
+                ));
+            }
+            if !seen.insert(input.name.as_str()) {
+                return Err(service_error(
+                    format!("duplicate input tensor {}", input.name),
+                    INVALID_ARGUMENT,
+                ));
+            }
+            let spec = specs
+                .iter()
+                .find(|candidate| candidate.name == input.name)
+                .ok_or_else(|| {
+                    service_error(
+                        format!("unknown input tensor {}", input.name),
+                        INVALID_ARGUMENT,
+                    )
+                })?;
+            if input.dtype != spec.dtype {
+                return Err(service_error(
+                    format!("input {} dtype does not match its logical spec", input.name),
+                    INVALID_ARGUMENT,
+                ));
+            }
+            if input.shape.len() != spec.dimensions.len() {
+                return Err(service_error(
+                    format!("input {} rank does not match its logical spec", input.name),
+                    INVALID_ARGUMENT,
+                ));
+            }
+            for (axis, (extent, constraint)) in
+                input.shape.iter().zip(&spec.dimensions).enumerate()
+            {
+                if *extent <= 0
+                    || *extent < constraint.min
+                    || *extent > constraint.max
+                    || constraint.multiple_of <= 0
+                    || *extent % constraint.multiple_of != 0
+                {
+                    return Err(service_error(
+                        format!("input {} axis {axis} violates its bounded domain", input.name),
+                        INVALID_ARGUMENT,
+                    ));
+                }
+                if !constraint.symbol.is_empty() {
+                    if let Some(previous) = symbols.insert(&constraint.symbol, *extent) {
+                        if previous != *extent {
+                            return Err(service_error(
+                                format!(
+                                    "input {} conflicts on shape symbol {}",
+                                    input.name, constraint.symbol
+                                ),
+                                INVALID_ARGUMENT,
+                            ));
+                        }
+                    }
+                } else if constraint.min != constraint.max || *extent != constraint.min {
+                    return Err(service_error(
+                        format!("input {} axis {axis} violates its fixed extent", input.name),
+                        INVALID_ARGUMENT,
+                    ));
+                }
+            }
+            let dtype = native_dtype(input.dtype)?;
+            let expected_bytes = checked_tensor_bytes(&input.shape, dtype)?;
+            if input.data.len() != expected_bytes {
+                return Err(service_error(
+                    format!(
+                        "input {} has {} bytes, expected {}",
+                        input.name,
+                        input.data.len(),
+                        expected_bytes
+                    ),
+                    INVALID_ARGUMENT,
+                ));
+            }
+            names.push(required_text(&input.name, "input.name")?);
+            native_rows.push((dtype, input));
+        }
+        if require_complete {
+            for spec in specs {
+                if !seen.contains(spec.name.as_str()) {
+                    return Err(service_error(
+                        format!("missing input tensor {}", spec.name),
+                        INVALID_ARGUMENT,
+                    ));
+                }
+            }
+        }
+        let bindings = native_rows
+            .into_iter()
+            .zip(&names)
+            .map(|((dtype, input), name)| {
+                let mut shape = [0i64; VX_MAX_TENSOR_RANK];
+                shape[..input.shape.len()].copy_from_slice(&input.shape);
+                VxTensorBinding {
+                    struct_size: std::mem::size_of::<VxTensorBinding>(),
+                    name: name.as_ptr(),
+                    dtype,
+                    rank: input.shape.len() as u32,
+                    shape,
+                    data: input.data.as_ptr().cast::<c_void>(),
+                    byte_size: input.data.len(),
+                    location: VX_MEMORY_HOST,
+                }
+            })
+            .collect();
+        Ok(Self {
+            _names: names,
+            bindings,
+        })
     }
-    let name = required_text(&input.name, "input.name")?;
-    let descriptor = descriptors
-        .iter()
-        .find(|descriptor| descriptor.name == input.name)
+
+    fn pointer(&self) -> *const VxTensorBinding {
+        if self.bindings.is_empty() {
+            std::ptr::null()
+        } else {
+            self.bindings.as_ptr()
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.bindings.len()
+    }
+}
+
+fn ptq_json_object<'a>(
+    value: &'a serde_json::Value,
+    path: &str,
+) -> Result<&'a serde_json::Map<String, serde_json::Value>, FfiError> {
+    value
+        .as_object()
+        .ok_or_else(|| service_error(format!("native PTQ coverage {path} is not an object"), INTERNAL))
+}
+
+fn ptq_json_text(
+    object: &serde_json::Map<String, serde_json::Value>,
+    field: &str,
+    path: &str,
+) -> Result<String, FfiError> {
+    let value = object
+        .get(field)
+        .and_then(serde_json::Value::as_str)
         .ok_or_else(|| {
             service_error(
-                format!("unknown input tensor {}", input.name),
-                INVALID_ARGUMENT,
+                format!("native PTQ coverage {path}.{field} is not a string"),
+                INTERNAL,
             )
         })?;
-    if input.shape != descriptor.shape {
+    if value.is_empty() {
         return Err(service_error(
-            format!(
-                "input {} shape {:?} does not match declared shape {:?}",
-                input.name, input.shape, descriptor.shape
-            ),
-            INVALID_ARGUMENT,
-        ));
-    }
-    if input.dtype != descriptor.dtype {
-        return Err(service_error(
-            format!(
-                "input {} dtype {} does not match declared dtype {}",
-                input.name, input.dtype, descriptor.dtype
-            ),
-            INVALID_ARGUMENT,
-        ));
-    }
-    let dtype = native_dtype(input.dtype)?;
-    let expected_bytes = checked_tensor_bytes(&descriptor.shape, dtype)?;
-    let descriptor_bytes = usize::try_from(descriptor.byte_size)
-        .map_err(|_| service_error("declared input byte size is not representable", INTERNAL))?;
-    if expected_bytes != descriptor_bytes {
-        return Err(service_error(
-            "native input descriptor has an inconsistent byte size",
+            format!("native PTQ coverage {path}.{field} is empty"),
             INTERNAL,
         ));
     }
-    if input.data.len() != expected_bytes {
+    Ok(value.to_owned())
+}
+
+fn ptq_json_u64(
+    object: &serde_json::Map<String, serde_json::Value>,
+    field: &str,
+    path: &str,
+) -> Result<u64, FfiError> {
+    object
+        .get(field)
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| {
+            service_error(
+                format!("native PTQ coverage {path}.{field} is not an unsigned integer"),
+                INTERNAL,
+            )
+        })
+}
+
+fn ptq_json_i64(
+    object: &serde_json::Map<String, serde_json::Value>,
+    field: &str,
+    path: &str,
+) -> Result<i64, FfiError> {
+    object
+        .get(field)
+        .and_then(serde_json::Value::as_i64)
+        .ok_or_else(|| {
+            service_error(
+                format!("native PTQ coverage {path}.{field} is not an integer"),
+                INTERNAL,
+            )
+        })
+}
+
+fn ptq_json_bool(
+    object: &serde_json::Map<String, serde_json::Value>,
+    field: &str,
+    path: &str,
+) -> Result<bool, FfiError> {
+    object
+        .get(field)
+        .and_then(serde_json::Value::as_bool)
+        .ok_or_else(|| {
+            service_error(
+                format!("native PTQ coverage {path}.{field} is not a boolean"),
+                INTERNAL,
+            )
+        })
+}
+
+fn ptq_coverage_message(bytes: &[u8]) -> Result<PtqCoverage, FfiError> {
+    let value: serde_json::Value = serde_json::from_slice(bytes).map_err(|error| {
+        service_error(
+            format!("native PTQ coverage is not valid JSON: {error}"),
+            INTERNAL,
+        )
+    })?;
+    let root = ptq_json_object(&value, "root")?;
+    let format = ptq_json_text(root, "format", "root")?;
+    if format != "volvox.ptq-coverage/v1" {
         return Err(service_error(
-            format!(
-                "input {} has {} bytes, expected {}",
-                input.name,
-                input.data.len(),
-                expected_bytes
-            ),
-            INVALID_ARGUMENT,
+            format!("native returned unsupported PTQ coverage format {format}"),
+            INTERNAL,
         ));
     }
-    Ok((name, dtype))
+    let profile_values = root
+        .get("profiles")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| service_error("native PTQ coverage profiles is not an array", INTERNAL))?;
+    let mut profiles = Vec::with_capacity(profile_values.len());
+    for (profile_index, profile_value) in profile_values.iter().enumerate() {
+        let path = format!("profiles[{profile_index}]");
+        let profile = ptq_json_object(profile_value, &path)?;
+        let signature_values = profile
+            .get("signatures")
+            .and_then(serde_json::Value::as_array)
+            .ok_or_else(|| {
+                service_error(
+                    format!("native PTQ coverage {path}.signatures is not an array"),
+                    INTERNAL,
+                )
+            })?;
+        let signatures = signature_values
+            .iter()
+            .enumerate()
+            .map(|(index, signature)| {
+                signature
+                    .as_str()
+                    .filter(|value| !value.is_empty())
+                    .map(str::to_owned)
+                    .ok_or_else(|| {
+                        service_error(
+                            format!(
+                                "native PTQ coverage {path}.signatures[{index}] is invalid"
+                            ),
+                            INTERNAL,
+                        )
+                    })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let symbols_value = profile.get("symbols").ok_or_else(|| {
+            service_error(
+                format!("native PTQ coverage {path}.symbols is missing"),
+                INTERNAL,
+            )
+        })?;
+        let symbols_object = ptq_json_object(symbols_value, &format!("{path}.symbols"))?;
+        let mut symbols = Vec::with_capacity(symbols_object.len());
+        for (symbol, range_value) in symbols_object {
+            if !canonical_shape_symbol(symbol) {
+                return Err(service_error(
+                    format!("native PTQ coverage {path} has invalid symbol {symbol}"),
+                    INTERNAL,
+                ));
+            }
+            let range_path = format!("{path}.symbols.{symbol}");
+            let range = ptq_json_object(range_value, &range_path)?;
+            let minimum = ptq_json_i64(range, "minimum", &range_path)?;
+            let maximum = ptq_json_i64(range, "maximum", &range_path)?;
+            if minimum <= 0 || maximum < minimum {
+                return Err(service_error(
+                    format!("native PTQ coverage {range_path} has an invalid range"),
+                    INTERNAL,
+                ));
+            }
+            symbols.push(PtqSymbolCoverage {
+                symbol: symbol.clone(),
+                minimum,
+                maximum,
+            });
+        }
+        let activation_value = profile.get("activationSamples").ok_or_else(|| {
+            service_error(
+                format!("native PTQ coverage {path}.activationSamples is missing"),
+                INTERNAL,
+            )
+        })?;
+        let activation_object =
+            ptq_json_object(activation_value, &format!("{path}.activationSamples"))?;
+        let mut activations = Vec::with_capacity(activation_object.len());
+        for (tensor_name, count) in activation_object {
+            let observed_values = count.as_u64().ok_or_else(|| {
+                service_error(
+                    format!(
+                        "native PTQ coverage {path}.activationSamples.{tensor_name} is invalid"
+                    ),
+                    INTERNAL,
+                )
+            })?;
+            if tensor_name.is_empty() {
+                return Err(service_error(
+                    format!("native PTQ coverage {path} has an empty activation name"),
+                    INTERNAL,
+                ));
+            }
+            activations.push(PtqActivationCoverage {
+                tensor_name: tensor_name.clone(),
+                observed_values,
+            });
+        }
+        profiles.push(PtqProfileCoverage {
+            name: ptq_json_text(profile, "name", &path)?,
+            batches: ptq_json_u64(profile, "batches", &path)?,
+            samples: ptq_json_u64(profile, "samples", &path)?,
+            signatures,
+            symbols,
+            activations,
+        });
+    }
+    Ok(PtqCoverage {
+        format,
+        logical_fingerprint: ptq_json_text(root, "logicalFingerprint", "root")?,
+        complete: ptq_json_bool(root, "complete", "root")?,
+        total_batches: ptq_json_u64(root, "totalBatches", "root")?,
+        total_samples: ptq_json_u64(root, "totalSamples", "root")?,
+        profiles,
+    })
 }
 
 fn native_optimizer_options(
@@ -582,10 +980,10 @@ impl Plugin {
     fn context_inputs(
         &self,
         context: *mut VxExecutionContext,
-    ) -> Result<Vec<TensorInfo>, FfiError> {
+    ) -> Result<Vec<TensorSpec>, FfiError> {
         let count = unsafe { vx_execution_context_input_count(context) };
-        input_descriptors(count, |index, info, report| unsafe {
-            vx_execution_context_input_info(context, index, info, report)
+        input_specs(count, |index, spec, report| unsafe {
+            vx_execution_context_input_spec(context, index, spec, report)
         })
     }
 
@@ -602,17 +1000,17 @@ impl Plugin {
         Ok(outputs)
     }
 
-    fn trainer_inputs(&self, trainer: *mut VxTrainer) -> Result<Vec<TensorInfo>, FfiError> {
+    fn trainer_inputs(&self, trainer: *mut VxTrainer) -> Result<Vec<TensorSpec>, FfiError> {
         let count = unsafe { vx_trainer_input_count(trainer) };
-        input_descriptors(count, |index, info, report| unsafe {
-            vx_trainer_input_info(trainer, index, info, report)
+        input_specs(count, |index, spec, report| unsafe {
+            vx_trainer_input_spec(trainer, index, spec, report)
         })
     }
 
-    fn ptq_inputs(&self, plan: *mut VxPTQPlan) -> Result<Vec<TensorInfo>, FfiError> {
+    fn ptq_inputs(&self, plan: *mut VxPTQPlan) -> Result<Vec<TensorSpec>, FfiError> {
         let count = unsafe { vx_ptq_plan_input_count(plan) };
-        input_descriptors(count, |index, info, report| unsafe {
-            vx_ptq_plan_input_info(plan, index, info, report)
+        input_specs(count, |index, spec, report| unsafe {
+            vx_ptq_plan_input_spec(plan, index, spec, report)
         })
     }
 
@@ -621,6 +1019,60 @@ impl Plugin {
         let mut report = VxReport::new();
         let status = unsafe { vx_ptq_plan_info(plan, &mut native, &mut report) };
         let report = check_native(status, &report)?;
+        let mut coverage_size = 0usize;
+        let mut coverage_report = VxReport::new();
+        let status = unsafe {
+            vx_ptq_plan_coverage_json(
+                plan,
+                std::ptr::null_mut(),
+                0,
+                &mut coverage_size,
+                &mut coverage_report,
+            )
+        };
+        check_native(status, &coverage_report)?;
+        if coverage_size <= 1 {
+            return Err(service_error(
+                "native PTQ coverage payload is empty",
+                INTERNAL,
+            ));
+        }
+        let mut coverage_bytes = vec![0u8; coverage_size];
+        let mut returned_size = coverage_size;
+        let mut coverage_report = VxReport::new();
+        let status = unsafe {
+            vx_ptq_plan_coverage_json(
+                plan,
+                coverage_bytes.as_mut_ptr().cast::<c_char>(),
+                coverage_bytes.len(),
+                &mut returned_size,
+                &mut coverage_report,
+            )
+        };
+        check_native(status, &coverage_report)?;
+        if returned_size != coverage_size || coverage_bytes.last() != Some(&0) {
+            return Err(service_error(
+                "native PTQ coverage payload changed during inspection",
+                INTERNAL,
+            ));
+        }
+        let coverage = ptq_coverage_message(&coverage_bytes[..coverage_size - 1])?;
+        let covered_profiles = coverage
+            .profiles
+            .iter()
+            .filter(|profile| profile.batches > 0)
+            .count();
+        if coverage.total_batches != native.calibration_batches
+            || coverage.total_samples != native.calibration_samples
+            || coverage.profiles.len() != native.profile_count
+            || covered_profiles != native.covered_profile_count
+            || coverage.complete != (native.coverage_complete != 0)
+        {
+            return Err(service_error(
+                "native PTQ coverage disagrees with plan metadata",
+                INTERNAL,
+            ));
+        }
         let mut tensors = Vec::with_capacity(native.tensor_count);
         for index in 0..native.tensor_count {
             let mut parameters = VxPTQTensorParameters::new();
@@ -651,8 +1103,10 @@ impl Plugin {
             });
         }
         Ok(PtqPlanInfo {
+            calibration_batches: native.calibration_batches,
             calibration_samples: native.calibration_samples,
             tensors,
+            coverage: Some(coverage),
             revision: Some(revision_message(&native.revision, report.clone())),
             report: Some(report),
         })
@@ -747,6 +1201,8 @@ impl RuntimeServicePlugin for Plugin {
                 weight_pointers.as_ptr()
             },
             weight_path_count: weight_pointers.len(),
+            bank_residency: std::ptr::null(),
+            bank_residency_count: 0,
         };
         let mut model = std::ptr::null_mut();
         let mut report = VxReport::new();
@@ -866,32 +1322,10 @@ impl RuntimeServicePlugin for Plugin {
         Ok(Empty {})
     }
 
-    fn set_trainer_input(
-        &self,
-        request: SetTrainerInputRequest,
-    ) -> Result<OperationReport, FfiError> {
-        let trainer = self.trainer(&request.trainer_id)?;
-        let input = request
-            .input
-            .ok_or_else(|| service_error("input tensor is required", INVALID_ARGUMENT))?;
-        let descriptors = self.trainer_inputs(trainer.pointer())?;
-        let (name, dtype) = validate_host_input(&input, &descriptors)?;
-        let mut report = VxReport::new();
-        let status = unsafe {
-            vx_trainer_set_input(
-                trainer.pointer(),
-                name.as_ptr(),
-                dtype,
-                input.data.as_ptr().cast::<c_void>(),
-                input.data.len(),
-                &mut report,
-            )
-        };
-        check_native(status, &report)
-    }
-
     fn train_step(&self, request: TrainStepRequest) -> Result<TrainStepResult, FfiError> {
         let trainer = self.trainer(&request.trainer_id)?;
+        let specs = self.trainer_inputs(trainer.pointer())?;
+        let input_batch = NativeBindingBatch::new(&request.inputs, &specs, true)?;
         let loss_names = request
             .losses
             .iter()
@@ -935,6 +1369,8 @@ impl RuntimeServicePlugin for Plugin {
         let optimizer = native_optimizer_options(request.optimizer)?;
         let options = VxTrainStepOptions {
             struct_size: std::mem::size_of::<VxTrainStepOptions>(),
+            inputs: input_batch.pointer(),
+            input_count: input_batch.len(),
             losses: losses.as_ptr(),
             loss_count: losses.len(),
             trainable_names: trainable_pointers.as_ptr(),
@@ -1044,6 +1480,22 @@ impl RuntimeServicePlugin for Plugin {
                 INVALID_ARGUMENT,
             ));
         }
+        if request.profile_names.is_empty() {
+            return Err(service_error(
+                "at least one PTQ shape profile is required",
+                INVALID_ARGUMENT,
+            ));
+        }
+        let profile_names = request
+            .profile_names
+            .iter()
+            .enumerate()
+            .map(|(index, name)| required_text(name, &format!("profile_names[{index}]")))
+            .collect::<Result<Vec<_>, _>>()?;
+        let profile_name_pointers = profile_names
+            .iter()
+            .map(|name| name.as_ptr())
+            .collect::<Vec<_>>();
         let observer_names = request
             .observers
             .iter()
@@ -1168,6 +1620,8 @@ impl RuntimeServicePlugin for Plugin {
         let options = VxPTQPlanOptions {
             struct_size: std::mem::size_of::<VxPTQPlanOptions>(),
             template_graph_path: template_graph_path.as_ptr(),
+            profile_names: profile_name_pointers.as_ptr(),
+            profile_count: profile_name_pointers.len(),
             observers: native_observers.as_ptr(),
             observer_count: native_observers.len(),
             layers: native_layers.as_ptr(),
@@ -1223,59 +1677,39 @@ impl RuntimeServicePlugin for Plugin {
         request: CalibratePtqPlanRequest,
     ) -> Result<PtqCalibrationInfo, FfiError> {
         let plan = self.ptq_plan(&request.ptq_plan_id)?;
+        let profile_name = required_text(&request.profile_name, "profile_name")?;
         let sample_name = required_text(&request.sample_name, "sample_name")?;
-        let descriptors = self.ptq_inputs(plan.pointer())?;
-        if request.inputs.len() != descriptors.len() {
+        if request.sample_count == 0 {
             return Err(service_error(
-                format!(
-                    "calibration sample has {} inputs, expected {}",
-                    request.inputs.len(),
-                    descriptors.len()
-                ),
+                "sample_count must be positive",
                 INVALID_ARGUMENT,
             ));
         }
-        let mut seen = HashSet::with_capacity(request.inputs.len());
-        let input_names = request
-            .inputs
-            .iter()
-            .map(|input| {
-                if !seen.insert(input.name.as_str()) {
-                    return Err(service_error(
-                        format!("duplicate calibration input {}", input.name),
-                        INVALID_ARGUMENT,
-                    ));
-                }
-                validate_host_input(input, &descriptors).map(|(name, _)| name)
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        let native_inputs = request
-            .inputs
-            .iter()
-            .enumerate()
-            .map(|(index, input)| VxPTQInput {
-                struct_size: std::mem::size_of::<VxPTQInput>(),
-                name: input_names[index].as_ptr(),
-                dtype: input.dtype,
-                data: input.data.as_ptr().cast::<c_void>(),
-                byte_size: input.data.len(),
-            })
-            .collect::<Vec<_>>();
-        let mut calibration_samples = 0;
+        let specs = self.ptq_inputs(plan.pointer())?;
+        let input_batch = NativeBindingBatch::new(&request.inputs, &specs, true)?;
+        let native_batch = VxPTQCalibrationBatch {
+            struct_size: std::mem::size_of::<VxPTQCalibrationBatch>(),
+            profile_name: profile_name.as_ptr(),
+            sample_name: sample_name.as_ptr(),
+            sample_count: request.sample_count,
+            inputs: input_batch.pointer(),
+            input_count: input_batch.len(),
+        };
+        let mut info = VxPTQPlanInfo::new();
         let mut report = VxReport::new();
         let status = unsafe {
             vx_ptq_plan_calibrate(
                 plan.pointer(),
-                sample_name.as_ptr(),
-                native_inputs.as_ptr(),
-                native_inputs.len(),
-                &mut calibration_samples,
+                &native_batch,
+                &mut info,
                 &mut report,
             )
         };
         let report = check_native(status, &report)?;
         Ok(PtqCalibrationInfo {
-            calibration_samples,
+            calibration_batches: info.calibration_batches,
+            calibration_samples: info.calibration_samples,
+            coverage_complete: info.coverage_complete != 0,
             report: Some(report),
         })
     }
@@ -1470,43 +1904,39 @@ impl RuntimeServicePlugin for Plugin {
         Ok(Empty {})
     }
 
-    fn set_input(&self, request: SetInputRequest) -> Result<OperationReport, FfiError> {
+    fn execute(&self, request: ExecuteRequest) -> Result<ExecutionResultHandle, FfiError> {
         let context = self.context(&request.context_id)?;
-        let input = request
-            .input
-            .ok_or_else(|| service_error("input tensor is required", INVALID_ARGUMENT))?;
-        let descriptors = self.context_inputs(context.pointer())?;
-        let (name, dtype) = validate_host_input(&input, &descriptors)?;
+        let specs = self.context_inputs(context.pointer())?;
+        let batch = NativeBindingBatch::new(&request.inputs, &specs, true)?;
+        let mut result = std::ptr::null_mut();
         let mut report = VxReport::new();
         let status = unsafe {
-            vx_execution_context_set_input(
+            vx_execution_context_execute(
                 context.pointer(),
-                name.as_ptr(),
-                dtype,
-                input.data.as_ptr().cast::<c_void>(),
-                input.data.len(),
+                batch.pointer(),
+                batch.len(),
+                &mut result,
                 &mut report,
             )
         };
-        check_native(status, &report)
-    }
-
-    fn execute(&self, request: ExecuteRequest) -> Result<ExecutionResultHandle, FfiError> {
-        let context = self.context(&request.context_id)?;
-        let mut result = std::ptr::null_mut();
-        let mut report = VxReport::new();
-        let status =
-            unsafe { vx_execution_context_execute(context.pointer(), &mut result, &mut report) };
         let report = check_native(status, &report)?;
         self.store_result(result, report)
     }
 
     fn decode_seed(&self, request: DecodeSeedRequest) -> Result<ExecutionResultHandle, FfiError> {
         let context = self.context(&request.context_id)?;
+        let specs = self.context_inputs(context.pointer())?;
+        let batch = NativeBindingBatch::new(&request.inputs, &specs, true)?;
         let mut result = std::ptr::null_mut();
         let mut report = VxReport::new();
         let status = unsafe {
-            vx_execution_context_decode_seed(context.pointer(), &mut result, &mut report)
+            vx_execution_context_decode_seed(
+                context.pointer(),
+                batch.pointer(),
+                batch.len(),
+                &mut result,
+                &mut report,
+            )
         };
         let report = check_native(status, &report)?;
         self.store_result(result, report)
@@ -1521,10 +1951,19 @@ impl RuntimeServicePlugin for Plugin {
             ));
         }
         let context = self.context(&request.context_id)?;
+        let specs = self.context_inputs(context.pointer())?;
+        let batch = NativeBindingBatch::new(&request.inputs, &specs, false)?;
         let mut result = std::ptr::null_mut();
         let mut report = VxReport::new();
         let status = unsafe {
-            vx_execution_context_decode_step(context.pointer(), position, &mut result, &mut report)
+            vx_execution_context_decode_step(
+                context.pointer(),
+                position,
+                batch.pointer(),
+                batch.len(),
+                &mut result,
+                &mut report,
+            )
         };
         let report = check_native(status, &report)?;
         self.store_result(result, report)
@@ -1646,11 +2085,128 @@ mod tests {
     #[test]
     fn tensor_size_validation_is_checked() {
         assert_eq!(checked_tensor_bytes(&[2, 3], VX_DTYPE_F32).unwrap(), 24);
+        assert!(checked_tensor_bytes(&[0, 3], VX_DTYPE_F32).is_err());
         assert!(checked_tensor_bytes(&[-1], VX_DTYPE_F32).is_err());
         assert!(checked_tensor_bytes(&[i64::MAX, 3], VX_DTYPE_F32).is_err());
         assert!(native_dtype(DataType::Unspecified as i32).is_err());
         assert!(native_dtype(DataType::Bool as i32).is_err());
         assert!(DataType::try_from(23).is_err());
+    }
+
+    fn bounded_spec(name: &str, dimensions: Vec<DimensionConstraint>) -> TensorSpec {
+        TensorSpec {
+            name: name.to_owned(),
+            dtype: DataType::F32 as i32,
+            dimensions,
+            location: MemoryLocation::Host as i32,
+        }
+    }
+
+    fn host_tensor(name: &str, shape: Vec<i64>) -> Tensor {
+        let bytes = checked_tensor_bytes(&shape, VX_DTYPE_F32).unwrap();
+        Tensor {
+            name: name.to_owned(),
+            shape,
+            dtype: DataType::F32 as i32,
+            data: vec![0; bytes],
+            location: MemoryLocation::Host as i32,
+        }
+    }
+
+    #[test]
+    fn inference_binding_batch_is_complete_owned_and_shape_aware() {
+        let specs = vec![
+            bounded_spec(
+                "x",
+                vec![
+                    DimensionConstraint {
+                        symbol: "B".into(),
+                        min: 1,
+                        max: 4,
+                        multiple_of: 1,
+                    },
+                    DimensionConstraint {
+                        symbol: String::new(),
+                        min: 3,
+                        max: 3,
+                        multiple_of: 1,
+                    },
+                ],
+            ),
+            bounded_spec(
+                "mask",
+                vec![DimensionConstraint {
+                    symbol: "B".into(),
+                    min: 1,
+                    max: 4,
+                    multiple_of: 1,
+                }],
+            ),
+        ];
+        let inputs = vec![host_tensor("mask", vec![2]), host_tensor("x", vec![2, 3])];
+        let batch = NativeBindingBatch::new(&inputs, &specs, true).unwrap();
+        assert_eq!(batch.len(), 2);
+        assert!(!batch.pointer().is_null());
+        assert_eq!(batch.bindings[0].shape[0], 2);
+        assert_eq!(batch.bindings[1].shape[..2], [2, 3]);
+        assert_eq!(batch.bindings[1].byte_size, 24);
+
+        assert!(NativeBindingBatch::new(&inputs[..1], &specs, true).is_err());
+        assert!(NativeBindingBatch::new(&inputs[..1], &specs, false).is_ok());
+        let duplicate = vec![host_tensor("x", vec![2, 3]), host_tensor("x", vec![2, 3])];
+        assert!(NativeBindingBatch::new(&duplicate, &specs, true).is_err());
+        let conflicting = vec![host_tensor("x", vec![2, 3]), host_tensor("mask", vec![3])];
+        assert!(NativeBindingBatch::new(&conflicting, &specs, true).is_err());
+    }
+
+    #[test]
+    fn inference_binding_batch_rejects_device_and_domain_violations() {
+        let specs = vec![bounded_spec(
+            "x",
+            vec![DimensionConstraint {
+                symbol: "S".into(),
+                min: 2,
+                max: 8,
+                multiple_of: 2,
+            }],
+        )];
+        assert!(NativeBindingBatch::new(&[host_tensor("x", vec![3])], &specs, true).is_err());
+        assert!(NativeBindingBatch::new(&[host_tensor("x", vec![10])], &specs, true).is_err());
+        let mut device = host_tensor("x", vec![4]);
+        device.location = MemoryLocation::Device as i32;
+        assert!(NativeBindingBatch::new(&[device], &specs, true).is_err());
+    }
+
+    #[test]
+    fn native_logical_spec_preserves_fixed_and_symbolic_constraints() {
+        let name = CString::new("x").unwrap();
+        let symbol = CString::new("B").unwrap();
+        let mut native = VxTensorSpec::new();
+        native.name = name.as_ptr();
+        native.dtype = VX_DTYPE_F32;
+        native.rank = 2;
+        native.dimensions[0] = VxDimensionConstraint {
+            struct_size: std::mem::size_of::<VxDimensionConstraint>(),
+            kind: VX_DIMENSION_SYMBOLIC,
+            symbol: symbol.as_ptr(),
+            min: 1,
+            max: 4,
+            multiple_of: 1,
+        };
+        native.dimensions[1] = VxDimensionConstraint {
+            struct_size: std::mem::size_of::<VxDimensionConstraint>(),
+            kind: VX_DIMENSION_FIXED,
+            symbol: std::ptr::null(),
+            min: 3,
+            max: 3,
+            multiple_of: 1,
+        };
+        let message = tensor_spec_message(&native).unwrap();
+        assert_eq!(message.name, "x");
+        assert_eq!(message.dimensions[0].symbol, "B");
+        assert_eq!(message.dimensions[0].max, 4);
+        assert_eq!(message.dimensions[1].symbol, "");
+        assert_eq!(message.dimensions[1].min, 3);
     }
 
     #[test]

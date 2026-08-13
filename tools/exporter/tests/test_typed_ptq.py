@@ -21,6 +21,7 @@ from tools.exporter.ir import (
 )
 from tools.exporter.reference_executor import execute_reference
 from tools.exporter.runtime_ir import export_runtime_package, import_runtime_package
+from tools.exporter.shape_system import ShapeEnvironment
 from tools.exporter.optimizer.safetensors_io import read_safetensors, write_safetensors
 from tools.exporter.typed_ptq import (
     CalibrationTable,
@@ -35,7 +36,7 @@ from tools.exporter.typed_ptq import (
 def add_tensor(
     graph: GraphIR,
     name: str,
-    shape: tuple[int, ...],
+    shape: tuple[int | str, ...],
     *,
     initializer: bool = False,
     public_input: bool = False,
@@ -55,7 +56,7 @@ def add_tensor(
 
 def linear_graph(
     *,
-    layout: str = "IN_OUT",
+    layout: str = "din_dout",
     bias: bool = True,
 ) -> tuple[GraphIR, dict[str, np.ndarray]]:
     graph = GraphIR(
@@ -64,7 +65,7 @@ def linear_graph(
         dialect=IRDialect.RUNTIME,
     )
     add_tensor(graph, "x", (2, 3), public_input=True)
-    weight_shape = (3, 2) if layout == "IN_OUT" else (2, 3)
+    weight_shape = (3, 2) if layout == "din_dout" else (2, 3)
     add_tensor(graph, "weight", weight_shape, initializer=True)
     if bias:
         add_tensor(graph, "bias", (2,), initializer=True)
@@ -88,7 +89,7 @@ def linear_graph(
         [-0.25, 0.75, 0.25],
     ], dtype=np.float32)
     tensors = {
-        "weight": np.ascontiguousarray(out_in.T if layout == "IN_OUT" else out_in),
+        "weight": np.ascontiguousarray(out_in.T if layout == "din_dout" else out_in),
     }
     if bias:
         tensors["bias"] = np.asarray([0.125, -0.25], dtype=np.float32)
@@ -120,7 +121,7 @@ def chain_graph() -> tuple[GraphIR, dict[str, np.ndarray]]:
             inputs={"input": input_name, "weight": weight, "bias": bias},
             outputs={"out": output},
             attributes=(OpAttribute(
-                "params", "volvox.params", {"weight_layout": "OUT_IN"},
+                "params", "volvox.params", {"weight_layout": "dout_din"},
             ),),
         ))
     graph.outputs.append("y")
@@ -453,6 +454,94 @@ class TypedPTQTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "activation_scheme"):
             PTQConfig(activation_scheme="unknown")
 
+    def test_reduce_range_is_off_by_default_and_bounds_authored_weights(self):
+        """A backend can only prove VPMADDUBSW is saturation-free when every
+        weight satisfies |w| <= 64, since 255 * 64 * 2 stays inside I16.  The
+        option that guarantees it costs a bit of weight precision, so the
+        default has to stay the full signed range."""
+        self.assertFalse(PTQConfig().reduce_range)
+        self.assertTrue(PTQConfig(reduce_range=True).reduce_range)
+        for value in (0, 1, None, "false", np.bool_(True)):
+            with self.subTest(invalid_reduce_range=value):
+                with self.assertRaisesRegex(TypeError, "reduce_range"):
+                    PTQConfig(reduce_range=value)
+
+        def authored_weight(reduce_range):
+            graph, tensors = linear_graph()
+            table = CalibrationTable(graph)
+            table.observe({
+                "x": np.asarray(
+                    [[-1.0, 0.0, 3.0], [0.0, 1.0, 2.0]], dtype=np.float32,
+                ),
+                "y": np.asarray(
+                    [[-1.0, 0.0], [1.0, 3.0]], dtype=np.float32,
+                ),
+            })
+            plan = plan_runtime_ptq(
+                graph, tensors, table.profile(),
+                config=PTQConfig(reduce_range=reduce_range),
+            )
+            weight_name = plan.nodes[0].quantized_weight.quantized_tensor
+            materialize_runtime_ptq(graph, tensors, plan)
+            return np.asarray(tensors[weight_name])
+
+        full = authored_weight(False)
+        reduced = authored_weight(True)
+        self.assertEqual(int(np.abs(full.astype(np.int16)).max()), 127)
+        self.assertEqual(int(np.abs(reduced.astype(np.int16)).max()), 64)
+
+    def test_reduce_range_materializes_conv_weights_including_subnormals(self):
+        cases = (
+            (None, np.linspace(-1.0, 1.0, 18, dtype=np.float32)),
+            (
+                np.float32(1.0229478789571165e-43),
+                np.linspace(-1e30, 1e30, 18, dtype=np.float32),
+            ),
+        )
+        for weight_value, sample in cases:
+            with self.subTest(weight_value=weight_value):
+                graph, tensors = conv_graph()
+                if weight_value is not None:
+                    tensors["weight"].fill(weight_value)
+                calibration, _ = calibrate(
+                    graph, tensors, (sample.reshape(1, 3, 3, 2),),
+                )
+                plan = plan_runtime_ptq(
+                    graph, tensors, calibration,
+                    config=PTQConfig(reduce_range=True),
+                )
+                weight_plan = plan.conv_nodes[0].quantized_weight
+                if weight_value is not None:
+                    self.assertGreater(weight_plan.saturation_count, 0)
+                materialize_runtime_ptq(graph, tensors, plan)
+                packed = np.asarray(tensors[weight_plan.quantized_tensor])
+                self.assertEqual(
+                    int(np.abs(packed.astype(np.int16)).max()), 64,
+                )
+                descriptor = graph.tensors[weight_plan.quantized_tensor]
+                self.assertEqual(descriptor.quantization.axis, 0)
+                np.testing.assert_array_equal(
+                    tensors[weight_plan.zero_point_tensor],
+                    np.zeros(len(weight_plan.zero_points), dtype=np.int8),
+                )
+
+    def test_reduce_range_bounds_embedding_weights(self):
+        graph, tensors = embedding_graph()
+        plan = plan_runtime_ptq(
+            graph, tensors, CalibrationTable(graph).profile(),
+            config=PTQConfig(reduce_range=True),
+        )
+        weight_plan = plan.embedding_nodes[0].quantized_weight
+        materialize_runtime_ptq(graph, tensors, plan)
+        packed = np.asarray(tensors[weight_plan.quantized_tensor])
+        self.assertEqual(int(np.abs(packed.astype(np.int16)).max()), 64)
+        descriptor = graph.tensors[weight_plan.quantized_tensor]
+        self.assertEqual(descriptor.quantization.axis, 0)
+        np.testing.assert_array_equal(
+            tensors[weight_plan.zero_point_tensor],
+            np.zeros(len(weight_plan.zero_points), dtype=np.int8),
+        )
+
     def test_int8_asymmetric_uses_full_signed_affine_domain(self):
         graph, tensors = linear_graph()
         table = CalibrationTable(graph)
@@ -546,6 +635,152 @@ class TypedPTQTests(unittest.TestCase):
             )
         self.assertEqual(caught.exception.diagnostic.code, "VXPTQ094")
 
+    def test_symbolic_ptq_preserves_bounds_across_weighted_and_byte_islands(self):
+        cases = []
+
+        graph, tensors = linear_graph()
+        graph.shape_environment = ShapeEnvironment((
+            {"name": "B", "min": 1, "max": 4},
+        ))
+        graph.tensors["x"].shape = ("B", 3)
+        graph.tensors["y"].shape = ("B", 2)
+        cases.append(("linear", graph, tensors, {"B": 2}))
+
+        graph, tensors = conv_graph()
+        graph.shape_environment = ShapeEnvironment((
+            {"name": "B", "min": 1, "max": 4},
+        ))
+        graph.tensors["x"].shape = ("B", 3, 3, 2)
+        graph.tensors["y"].shape = ("B", 2, 2, 2)
+        cases.append(("conv", graph, tensors, {"B": 2}))
+
+        graph, tensors = embedding_graph()
+        graph.shape_environment = ShapeEnvironment((
+            {"name": "B", "min": 1, "max": 4},
+            {"name": "S", "min": 1, "max": 8},
+        ))
+        graph.tensors["ids"].shape = ("B", "S")
+        graph.tensors["y"].shape = ("B", "S", 4)
+        cases.append(("embedding", graph, tensors, {"B": 2, "S": 3}))
+
+        graph, tensors = pointwise_norm_graph()
+        graph.shape_environment = ShapeEnvironment((
+            {"name": "B", "min": 1, "max": 4},
+            {"name": "S", "min": 1, "max": 8},
+        ))
+        for name in ("x", "residual", "added", "normalized", "gelu", "y"):
+            graph.tensors[name].shape = ("B", "S", 4)
+        cases.append(("pointwise", graph, tensors, {"B": 2, "S": 3}))
+
+        graph, tensors = batch_matmul_graph()
+        graph.shape_environment = ShapeEnvironment((
+            {"name": "B", "min": 1, "max": 4},
+            {"name": "S", "min": 1, "max": 8},
+        ))
+        graph.tensors["a"].shape = ("B", "S", 3)
+        graph.tensors["b"].shape = (1, 3, 2)
+        graph.tensors["y"].shape = ("B", "S", 2)
+        cases.append(("batch-matmul", graph, tensors, {"B": 2, "S": 3}))
+
+        graph, tensors = attention_graph()
+        graph.shape_environment = ShapeEnvironment((
+            {"name": "B", "min": 1, "max": 4},
+            {"name": "Q", "min": 1, "max": 8},
+            {"name": "K", "min": 1, "max": 12},
+        ))
+        graph.tensors["q"].shape = ("B", "Q", 4)
+        graph.tensors["k"].shape = ("B", "K", 4)
+        graph.tensors["v"].shape = ("B", "K", 4)
+        graph.tensors["mask"].shape = ("B", "K")
+        graph.tensors["y"].shape = ("B", "Q", 4)
+        cases.append(("attention", graph, tensors, {"B": 2, "Q": 3, "K": 5}))
+
+        for label, graph, tensors, profile in cases:
+            with self.subTest(label=label):
+                graph.verify(IRDialect.RUNTIME)
+                logical_shapes = {
+                    name: tensor.shape for name, tensor in graph.tensors.items()
+                }
+                ranges = {}
+                for name in required_ptq_observations(graph):
+                    shape = tuple(
+                        profile[dimension] if isinstance(dimension, str) else dimension
+                        for dimension in graph.tensors[name].shape
+                    )
+                    ranges[name] = {
+                        "min": -1.0,
+                        "max": 1.0,
+                        "samples": 1,
+                        "elements": int(np.prod(shape)),
+                    }
+                calibration = calibration_profile_from_ranges(
+                    graph,
+                    ranges,
+                    sample_count=1,
+                    sample_digest="b" * 64,
+                )
+                plan = plan_runtime_ptq(graph, tensors, calibration)
+                materialize_runtime_ptq(graph, tensors, plan)
+                graph.verify(IRDialect.RUNTIME)
+                self.assertTrue(graph.shape_environment.dimensions)
+                for name in graph.inputs + graph.outputs:
+                    self.assertEqual(graph.tensors[name].shape, logical_shapes[name])
+                self.assertTrue(any(
+                    node.op_type.startswith("Q") for node in graph.nodes
+                ))
+
+        graph, _ = linear_graph()
+        graph.shape_environment = ShapeEnvironment((
+            {"name": "B", "min": 1, "max": 4},
+        ))
+        graph.tensors["x"].shape = ("B", 3)
+        graph.tensors["y"].shape = ("B", 2)
+        graph.verify(IRDialect.RUNTIME)
+        with self.assertRaises(ExporterError) as caught:
+            calibration_profile_from_ranges(
+                graph,
+                {name: {"min": -1.0, "max": 1.0}
+                 for name in required_ptq_observations(graph)},
+                sample_count=1,
+                sample_digest="c" * 64,
+            )
+        self.assertEqual(caught.exception.diagnostic.code, "VXPTQ098")
+
+    def test_symbolic_aggregate_element_counts_must_fit_bounded_totals(self):
+        graph, _ = linear_graph()
+        graph.shape_environment = ShapeEnvironment((
+            {"name": "B", "min": 1, "max": 4},
+        ))
+        graph.tensors["x"].shape = ("B", 3)
+        graph.tensors["y"].shape = ("B", 2)
+        graph.verify(IRDialect.RUNTIME)
+        valid = {
+            "x": {
+                "min": -1.0, "max": 1.0, "samples": 2, "elements": 12,
+            },
+            "y": {
+                "min": -1.0, "max": 1.0, "samples": 2, "elements": 8,
+            },
+        }
+
+        for label, elements in (("below-minimum", 5), ("above-maximum", 25)):
+            with self.subTest(label=label):
+                ranges = {
+                    name: dict(bounds) for name, bounds in valid.items()
+                }
+                ranges["x"]["elements"] = elements
+                with self.assertRaises(ExporterError) as caught:
+                    calibration_profile_from_ranges(
+                        graph,
+                        ranges,
+                        sample_count=2,
+                        sample_digest="e" * 64,
+                    )
+                self.assertEqual(caught.exception.diagnostic.code, "VXPTQ098")
+                self.assertIn(
+                    "outside bounded total [6, 24]", str(caught.exception),
+                )
+
     def test_default_calibration_requests_only_exact_ptq_demand(self):
         graph, _ = linear_graph()
         add_tensor(graph, "attention_mask", (2, 2), public_input=True)
@@ -600,7 +835,7 @@ class TypedPTQTests(unittest.TestCase):
         self.assertEqual(table.profile().sample_count, 1)
 
     def test_linear_materializes_only_central_safetensor_refs_and_matches_oracle(self):
-        graph, tensors = linear_graph(layout="IN_OUT", bias=True)
+        graph, tensors = linear_graph(layout="din_dout", bias=True)
         sample = np.asarray(
             [[1.0, -2.0, 0.5], [-0.75, 0.25, 2.0]], dtype=np.float32,
         )
@@ -610,7 +845,7 @@ class TypedPTQTests(unittest.TestCase):
         plan = plan_runtime_ptq(graph, tensors, calibration)
         duplicate = plan_runtime_ptq(graph.clone(), dict(tensors), calibration)
         self.assertEqual(plan, duplicate)
-        self.assertEqual(plan.nodes[0].source_layout, "IN_OUT")
+        self.assertEqual(plan.nodes[0].source_layout, "din_dout")
         self.assertEqual(plan.nodes[0].quantized_weight.saturation_count, 0)
 
         report = materialize_runtime_ptq(graph, tensors, plan)
@@ -733,7 +968,7 @@ class TypedPTQTests(unittest.TestCase):
 
     def test_biasless_out_in_linear_and_static_rhs_matmul_synthesize_i32_bias(self):
         cases = [
-            (*linear_graph(layout="OUT_IN", bias=False), "x", PTQConfig("uint8")),
+            (*linear_graph(layout="dout_din", bias=False), "x", PTQConfig("uint8")),
             (*matmul_graph(), "a", PTQConfig("int8")),
         ]
         samples = {
@@ -966,7 +1201,7 @@ class TypedPTQTests(unittest.TestCase):
             ("x", "route", "sum"),
         )
 
-    def test_automatic_ptq_retains_add_broadcast_beyond_portable_rank(self):
+    def test_unrepresentable_implicit_broadcast_cannot_be_republished(self):
         graph = GraphIR(
             "volvoxai", "rank-nine-add.json", IRDialect.RUNTIME,
         )
@@ -987,9 +1222,12 @@ class TypedPTQTests(unittest.TestCase):
             tuple(item.diagnostic_code for item in plan.retained_nodes),
             ("VXPTQ096",),
         )
-        report = materialize_runtime_ptq(graph, {}, plan)
-        self.assertEqual(report.nodes_quantized, 0)
-        self.assertEqual([node.op_type for node in graph.nodes], ["Add"])
+        before = graph.fingerprint()
+        with self.assertRaises(ExporterError) as caught:
+            materialize_runtime_ptq(graph, {}, plan)
+        self.assertEqual(caught.exception.diagnostic.code, "VXRTIR035")
+        self.assertIn("broadcasting is explicit", caught.exception.diagnostic.message)
+        self.assertEqual(graph.fingerprint(), before)
 
         strict = graph.clone()
         with self.assertRaisesRegex(ExporterError, "rank-1..8 byte Expand"):
@@ -1314,7 +1552,7 @@ class TypedPTQTests(unittest.TestCase):
         }),)
         with self.assertRaises(ExporterError) as caught:
             required_ptq_observations(graph)
-        self.assertEqual(caught.exception.diagnostic.code, "VXPTQ078")
+        self.assertEqual(caught.exception.diagnostic.code, "VXPTQ079")
 
         graph, _ = attention_graph()
         graph.nodes[0].attributes = (OpAttribute("params", "volvox.params", {
@@ -1359,7 +1597,7 @@ class TypedPTQTests(unittest.TestCase):
             "params",
             "volvox.params",
             {
-                "weight_layout": "IN_OUT",
+                "weight_layout": "din_dout",
                 "private": [{"affine": {"zero_point": 0}}],
             },
         ),)
@@ -1441,7 +1679,7 @@ class TypedPTQTests(unittest.TestCase):
         )
         qlinear = next(node for node in graph.nodes if node.op_type == "QLinear")
         qlinear.attributes = (
-            OpAttribute("params", "volvox.params", {"weight_layout": "OUT_IN"}),
+            OpAttribute("params", "volvox.params", {"weight_layout": "dout_din"}),
         )
         with self.assertRaises(ExporterError) as caught:
             graph.verify(IRDialect.RUNTIME)

@@ -45,15 +45,16 @@ mutable backend intermediates.
 
 ~~~javascript
 import {
-  PTQObserver,
+  Model,
+  PTQCalibrator,
   VolvoxAI,
 } from 'volvoxai/full';
 
 const runtime = await VolvoxAI.createRuntime({
   backends: ['webgpu', 'wasm', 'cpu'],
 });
-const model = runtime.createModel(calibrationGraph);
-const compiled = await model.compile({
+const snapshot = Model.capture(calibrationPackage);
+const compiled = await runtime.compile(snapshot, {
   backend: {
     mode: 'require',
     backend: 'cpu',
@@ -62,56 +63,83 @@ const compiled = await model.compile({
 });
 const context = await compiled.createContext();
 
-const observers = new Map([
-  ['encoder.out', new PTQObserver()],
-  ['decoder.hidden', new PTQObserver()],
-]);
+const calibrator = new PTQCalibrator(snapshot, {
+  profiles: ['short', 'maximum'],
+  activations: ['encoder.out', 'decoder.hidden'],
+});
 
-for (const inputs of calibrationSamples) {
+for (const { id, profile, samples, inputs } of calibrationBatches) {
   const result = await context.execute(inputs);
   try {
-    for (const [name, observer] of observers) {
-      const values = await result.output(name).read();
-      if (!(values instanceof Float32Array)) {
-        throw new Error(name + ' must be an F32 calibration output');
-      }
-      observer.observe(values);
-    }
+    const encoder = result.output('encoder.out');
+    const decoder = result.output('decoder.hidden');
+    calibrator.observeBatchChunk({
+      batchId: id,
+      profile,
+      samples,
+      chunkIndex: 0,
+      chunkCount: 1,
+      inputs,
+      activations: {
+        'encoder.out': {
+          data: await encoder.read(),
+          shape: encoder.shape,
+        },
+        'decoder.hidden': {
+          data: await decoder.read(),
+          shape: decoder.shape,
+        },
+      },
+    });
   } finally {
     await result.close();
   }
 }
 
+const coverage = calibrator.coverage();
+const activationParameters = calibrator.parameters();
+
 await context.close();
 await compiled.close();
-await model.close();
 await runtime.close();
 ~~~
 
 This path works for host and device outputs because TensorResult.read() returns
 a fresh caller-owned typed array. It cannot sample a stale host mirror.
 
+Every input and activation observation is a shaped tensor view. Each declared
+profile must receive at least one batch before materialization, and coverage is
+bound to the exact logical fingerprint. The report records concrete shape
+signatures, observed symbol extrema, unique logical sample/batch counts, and
+per-activation scalar-observation counts.
+
+Large graphs may require several executions of the same logical input because
+promoting every intermediate to a public output at once keeps too much storage
+live. Declare the complete F32 activation universe in the calibrator, then call
+`observeBatchChunk` with the same `batchId`, profile, sample count, shaped
+inputs, and `chunkCount` for every disjoint promotion chunk. `chunkIndex` is
+zero-based. A logical batch contributes to coverage exactly once, only after
+its chunk indexes and activation-name union are complete. Repeated chunks must
+also preserve the exact input bytes. Duplicate indexes or activations,
+inconsistent metadata or inputs, missing activation coverage, and reuse of a
+completed ID fail closed. Pending chunks never affect observers or published
+coverage; a bad chunk or counter overflow leaves committed ranges and coverage
+unchanged.
+
 Calibration data should represent the deployment distribution. Run semantic
 specialization first: a profile collected from an unspecialized graph is not a
 profile for one specialized route. Record sample identity, preprocessing,
-exact graph fingerprint, observer policy, selected backend/device, sample
-digest/count, and route/profile coverage so package creation is reproducible.
-Never reuse the heldout task-score set for calibration.
+observer policy, selected backend/device, sample digest/count, and profile
+meaning so package creation is reproducible. Never reuse the heldout task-score
+set for calibration.
 
 ## Derive activation parameters
 
 ~~~javascript
-import { derivePTQParameters } from 'volvoxai/full';
-
-const activationParameters = Object.fromEntries(
-  [...observers].map(([name, observer]) => [
-    name,
-    derivePTQParameters(observer, {
-      dtype: 'int8',
-      scheme: 'symmetric',
-    }),
-  ]),
-);
+const activationParameters = calibrator.parameters({
+  dtype: 'int8',
+  scheme: 'symmetric',
+});
 ~~~
 
 Symmetric parameters use:
@@ -124,9 +152,10 @@ zero_point = 0 for I8
 Asymmetric parameters map an ordered range that includes zero into the complete
 I8 or U8 domain with ties-to-even rounding.
 
-PTQObserver rejects non-finite values, counts every observed element, and can
-be reset and reused. parameters() is a shorthand for
-derivePTQParameters(observer, options).
+`PTQObserver` remains the lower-level single-range primitive. It rejects
+non-finite values, counts every observed element, and can be reset and reused.
+For package publication, use `PTQCalibrator` so the exact logical fingerprint
+and required named shape profiles accompany those parameters.
 
 ## Quantize activations
 
@@ -197,7 +226,7 @@ import {
   materializePTQWeights,
 } from 'volvoxai/full';
 
-const artifact = materializePTQWeights(trainingGraph, [
+const artifact = materializePTQWeights(snapshot, [
   {
     name: 'decoder.proj.weight',
     outputName: 'decoder.proj.weight.i8',
@@ -208,7 +237,7 @@ const artifact = materializePTQWeights(trainingGraph, [
     inputScale: activationParameters['decoder.proj.input'].scale,
     axis: 0,
   },
-]);
+], { coverage });
 
 const safetensorsBytes = artifact.weights.toArrayBuffer();
 const quantization = artifact.quantization;
@@ -217,6 +246,10 @@ const quantization = artifact.quantization;
 Unselected weights are copied by default. Set includeUnselected: false only
 when the destination graph needs none of them. Output tensor names must not
 collide with graph inputs, node outputs, or unselected weights.
+
+Materialization rejects incomplete named-profile coverage or coverage from a
+different logical fingerprint. The artifact retains the original bounded
+logical graph and embeds the coverage report in safetensors metadata.
 
 `artifact.quantization` is the reference-only table for tensors materialized by
 this call. Install it directly when it describes every byte tensor in the
@@ -228,6 +261,7 @@ writes the exact root discriminator:
 ~~~json
 {
   "format": "volvox-graph/v1",
+  "dimensions": {},
   "quantization": {
     "format": "volvox-affine-safetensors/v1",
     "tensors": {
@@ -255,9 +289,10 @@ The destination graph explicitly owns:
 - any QuantizeLinear, RequantizeLinear, or DequantizeLinear boundary;
 - the declared graph outputs.
 
-The materializer does not mutate the source Model or publish a training
-revision. Package creation produces new bytes; load and compile that package
-through a new Runtime/Model lifecycle to validate it.
+The materializer does not mutate the source logical snapshot or publish a
+training revision. Package creation produces new bytes; load it with
+`ModelLoader`, capture a new `Model`, and compile that
+snapshot through a new Runtime lifecycle to validate it.
 
 ## Validate the package
 
@@ -283,7 +318,7 @@ safetensors contract is documented in
 
 - Calibration contexts own execution and device state.
 - Each ExecutionResult owns stable output snapshots.
-- Observers own only copied F32 ranges.
+- Calibrators own copied F32 ranges and fingerprint-bound profile coverage.
 - Materializers own newly allocated typed arrays and safetensors bytes.
 - Inference entries import and export no PTQ observers or materializers.
 - Native inference builds contain no PTQ authoring implementation or public

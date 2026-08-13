@@ -18,7 +18,7 @@ from __future__ import annotations
 from math import prod
 from typing import Any, Mapping
 
-from ..ir import IRDialect, OpNode, ValuePort
+from ..ir import IRDialect, OpAttribute, OpNode, ValuePort
 from ..pipeline import IRPass, PassContract, PassResult
 
 
@@ -33,13 +33,18 @@ _RESHAPING = frozenset({
     "Reshape", "Squeeze", "Unsqueeze", "Flatten", "Identity",
 })
 _MOVEMENT = _RESHAPING | {"Transpose"}
+# Operators whose params carry an authoritative target shape, so a descriptor
+# rewritten underneath them leaves the node contradicting its own output.
+_TARGET_SHAPE_OPS = frozenset({"Reshape", "Expand"})
 
 
 class RuntimeSequenceLayoutPass(IRPass):
     """Rewrite proven internal sequence aliases toward batch-first layout."""
 
     name = "runtime-sequence-layout"
-    contract = PassContract.preserving(IRDialect.RUNTIME, repeatable=True)
+    contract = PassContract.preserving(
+        IRDialect.RUNTIME, repeatable=True
+    )
 
     def __init__(self) -> None:
         self.rewritten = 0
@@ -62,11 +67,33 @@ class RuntimeSequenceLayoutPass(IRPass):
                 if port.value is not None
             )
         }
+        producers = {
+            port.value: node
+            for node in graph.nodes
+            for port in node.outputs
+            if port.value is not None
+        }
         for name, target in targets.items():
             tensor = graph.tensors[name]
             if tensor.shape == target:
                 continue
             tensor.shape = target
+            # Reshape states its target in params, and the shape contract
+            # requires the declared output to match it element for element.
+            # Rewriting only the descriptor left the node asserting the old
+            # spelling, which failed export at the first such node rather than
+            # here: `declared output 'out'.shape[0]: must equal target constant
+            # 251`.  The rewrite is a re-spelling of identical row-major
+            # storage, so the target moves with it.
+            producer = producers.get(name)
+            if producer is not None and producer.op_type == "Reshape":
+                params = _params(producer)
+                if params is not None and "shape" in params:
+                    updated = dict(params)
+                    updated["shape"] = list(target)
+                    producer.attributes = (
+                        OpAttribute("params", "volvox.params", updated),
+                    )
             self.rewritten += 1
         graph.invalidate_analyses()
 
@@ -99,6 +126,16 @@ class RuntimeSequenceLayoutPass(IRPass):
                 continue
             for name in _dynamic_values(graph, node):
                 candidates.pop(name, None)
+
+        # An Expand's params.shape names which axes broadcast, so re-spelling
+        # its output is not the same operator afterwards.  Reshape is safe
+        # because its target is pure storage and moves with the descriptor.
+        for node in graph.nodes:
+            if node.op_type not in _TARGET_SHAPE_OPS or node.op_type == "Reshape":
+                continue
+            for port in node.outputs:
+                if port.value is not None:
+                    candidates.pop(port.value, None)
 
         # A layout-agnostic operator still relates ranks/leading dimensions.
         # Propagate an incompatible anchored spelling through those relations.

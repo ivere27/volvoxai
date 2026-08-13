@@ -208,6 +208,143 @@ static int test_one_shot_matmul_tails_and_fallback(void) {
     return 0;
 }
 
+static void reference_graph_linear(const float* input, const float* weight,
+                                   const float* bias, float* output, int rows,
+                                   int d_in, int d_out,
+                                   int output_major_weight) {
+    for (int row = 0; row < rows; row++) {
+        for (int column = 0; column < d_out; column++) {
+            float sum = bias ? bias[column] : 0.0f;
+            for (int k = 0; k < d_in; k++) {
+                size_t weight_index = output_major_weight
+                    ? (size_t)column * (size_t)d_in + (size_t)k
+                    : (size_t)k * (size_t)d_out + (size_t)column;
+                sum += input[(size_t)row * (size_t)d_in + (size_t)k] *
+                    weight[weight_index];
+            }
+            output[(size_t)row * (size_t)d_out + (size_t)column] = sum;
+        }
+    }
+}
+
+static int run_reserved_graph_linear(
+        float* input, const float* weight, float* output, float* expected,
+        int rows, int d_in, int d_out, const char* signature) {
+    size_t input_bytes = (size_t)rows * (size_t)d_in * sizeof(float);
+    size_t output_bytes = (size_t)rows * (size_t)d_out * sizeof(float);
+    fill_f32_matrix(input, (size_t)rows * (size_t)d_in,
+                    7 + rows, 29, 14, 0.03125f);
+    reference_graph_linear(input, weight, NULL, expected, rows, d_in, d_out, 1);
+    CHECK(vk_graph_bind_shape_domain(signature, (VolvoxAIEnginePhysicalSpan[2]){
+              {input, (size_t)17 * 19 * sizeof(float)},
+              {output, (size_t)17 * 23 * sizeof(float)},
+          }, 2u, 0u, 0u) == 0);
+    vk_graph_mark_host(input, input_bytes, 0);
+    vk_graph_begin_forward();
+    CHECK(vk_graph_linear_f32(input, weight, NULL, output,
+                              rows, d_in, d_out, 1) == 1);
+    CHECK(vk_graph_end_forward() == 0);
+    CHECK(vk_graph_sync_host(output, output_bytes, 0) == 1);
+    for (int index = 0; index < rows * d_out; index++)
+        CHECK(close_enough(output[index], expected[index]));
+    return 0;
+}
+
+static int test_graph_linear_dynamic_domain(void) {
+    enum { MAX_ROWS = 17, D_IN = 19, D_OUT = 23 };
+    float arena[MAX_ROWS * D_IN + MAX_ROWS * D_OUT];
+    float* input = arena;
+    float* output = arena + MAX_ROWS * D_IN;
+    float weight[D_OUT * D_IN];
+    float input_major_weight[D_IN * D_OUT];
+    float bias[D_OUT];
+    float narrower_weight[17 * D_IN];
+    float narrower_output[17];
+    float expected[MAX_ROWS * D_OUT];
+    VkGraphDynamicStateProbe reserved = {0};
+    VkGraphDynamicStateProbe maximum = {0};
+    VkGraphDynamicStateProbe rebound = {0};
+    VkGraphDynamicStateProbe rejected = {0};
+    const VolvoxAIEnginePhysicalSpan spans[2] = {
+        {input, sizeof(float) * MAX_ROWS * D_IN},
+        {output, sizeof(float) * MAX_ROWS * D_OUT},
+    };
+    fill_f32_matrix(weight, D_OUT * D_IN, 11, 31, 15, 0.015625f);
+    fill_f32_matrix(narrower_weight, 17 * D_IN,
+                    9, 23, 11, 0.015625f);
+    for (int k = 0; k < D_IN; k++)
+        for (int column = 0; column < D_OUT; column++)
+            input_major_weight[k * D_OUT + column] =
+                weight[column * D_IN + k];
+    fill_f32_matrix(bias, D_OUT, 5, 13, 6, 0.0625f);
+    fill_f32_matrix(input, D_IN, 3, 17, 8, 0.0625f);
+
+    vk_graph_reset();
+    CHECK(vk_graph_bind_shape("linear:input-major-tiled") == 0);
+    fill_f32_matrix(input, MAX_ROWS * D_IN, 13, 29, 14, 0.03125f);
+    reference_graph_linear(input, input_major_weight, bias, expected,
+                           MAX_ROWS, D_IN, D_OUT, 0);
+    vk_graph_begin_forward();
+    CHECK(vk_graph_linear_f32(input, input_major_weight, bias, output,
+                              MAX_ROWS, D_IN, D_OUT, 0) == 1);
+    CHECK(vk_graph_end_forward() == 0);
+    CHECK(vk_graph_sync_host(output, sizeof(expected), 0) == 1);
+    for (int index = 0; index < MAX_ROWS * D_OUT; index++)
+        CHECK(close_enough(output[index], expected[index]));
+    vk_graph_reset();
+
+    CHECK(vk_graph_bind_shape("linear:bootstrap") == 0);
+    vk_graph_begin_forward();
+    CHECK(vk_graph_linear_f32(input, weight, NULL, output,
+                              1, D_IN, D_OUT, 1) == 1);
+    /* A smaller later null-bias node must not narrow the retained zero slot
+     * used by the wider Linear above. */
+    CHECK(vk_graph_linear_f32(input, narrower_weight, NULL,
+                              narrower_output, 1, D_IN, 17, 1) == 1);
+    CHECK(vk_graph_end_forward() == 0);
+    CHECK(vk_graph_sync_host(output, D_OUT * sizeof(float), 0) == 1);
+    CHECK(vk_graph_bind_shape_domain(
+              "linear:q1", spans, 2u, 0u, 0u) == 0);
+    CHECK(vk_test_graph_dynamic_state(&reserved) == 0);
+    CHECK(reserved.domain_enforced && reserved.domain_span_count == 2u &&
+          reserved.slot_count == 7);
+
+    CHECK(run_reserved_graph_linear(input, weight, output, expected,
+                                    1, D_IN, D_OUT, "linear:q1") == 0);
+    CHECK(run_reserved_graph_linear(input, weight, output, expected,
+                                    MAX_ROWS, D_IN, D_OUT,
+                                    "linear:q17") == 0);
+    CHECK(vk_test_graph_dynamic_state(&maximum) == 0);
+    CHECK(maximum.capacity_generation == reserved.capacity_generation &&
+          maximum.active_capacity_bytes == reserved.active_capacity_bytes);
+    CHECK(run_reserved_graph_linear(input, weight, output, expected,
+                                    1, D_IN, D_OUT, "linear:q1") == 0);
+    CHECK(vk_test_graph_dynamic_state(&rebound) == 0);
+    CHECK(rebound.capacity_generation == maximum.capacity_generation &&
+          rebound.active_capacity_bytes == maximum.active_capacity_bytes);
+
+    vk_graph_begin_forward();
+    CHECK(vk_graph_linear_f32(input, weight, NULL, input,
+                              1, D_IN, D_OUT, 1) == 0);
+    CHECK(vk_graph_linear_f32(input, weight, NULL, input + 1,
+                              1, D_IN, D_OUT, 1) == 0);
+    CHECK(vk_graph_linear_f32(input, weight, NULL, output,
+                              0, D_IN, D_OUT, 1) == 0);
+    CHECK(vk_graph_linear_f32(input, weight, NULL, output,
+                              1, D_IN, D_OUT, 2) == 0);
+    CHECK(vk_graph_linear_f32(input, weight, NULL, output,
+                              MAX_ROWS + 1, D_IN, D_OUT, 1) == 0);
+    CHECK(vk_graph_end_forward() == 0);
+    CHECK(vk_test_graph_dynamic_state(&rejected) == 0);
+    CHECK(rejected.capacity_generation == rebound.capacity_generation &&
+          rejected.active_capacity_bytes == rebound.active_capacity_bytes &&
+          rejected.slot_count == rebound.slot_count);
+    CHECK(run_reserved_graph_linear(input, weight, output, expected,
+                                    1, D_IN, D_OUT, "linear:q1") == 0);
+    vk_graph_reset();
+    return 0;
+}
+
 static int test_tiled_qlinear_i8u8_tails(void) {
     enum { ROWS = 9, D_IN = 19, D_OUT = 36 };
     int8_t input[ROWS * D_IN];
@@ -286,6 +423,62 @@ static int test_tiled_qlinear_staged_rounding(void) {
     CHECK(vk_graph_sync_host(output, sizeof(output), 0) == 1);
     for (int index = 0; index < ROWS * D_OUT; index++)
         CHECK(output[index] == 124u);
+    vk_graph_reset();
+    return 0;
+}
+
+static int test_qbatch_matmul_i8u8_arbitrary_k(void) {
+    enum {
+        BATCH = 2, HEADS = 4, ROWS = 3, K = 5, COLUMNS = 7,
+        A_ELEMENTS = BATCH * ROWS * K,
+        B_ELEMENTS = HEADS * K * COLUMNS,
+        OUTPUT_ELEMENTS = BATCH * HEADS * ROWS * COLUMNS,
+    };
+    const int a_shape[4] = {BATCH, 1, ROWS, K};
+    const int b_shape[4] = {1, HEADS, K, COLUMNS};
+    const int output_shape[4] = {BATCH, HEADS, ROWS, COLUMNS};
+    const int32_t a_zero_point = 173;
+    const int32_t b_zero_point = -37;
+    const int32_t output_zero_point = -11;
+    uint8_t a[A_ELEMENTS];
+    int8_t b[B_ELEMENTS];
+    int8_t output[OUTPUT_ELEMENTS];
+    int8_t expected[OUTPUT_ELEMENTS];
+
+    for (int index = 0; index < A_ELEMENTS; index++)
+        a[index] = (uint8_t)(a_zero_point + (index * 7) % 5 - 2);
+    for (int index = 0; index < B_ELEMENTS; index++)
+        b[index] = (int8_t)(b_zero_point + (index * 11) % 5 - 2);
+    for (int batch = 0; batch < BATCH; batch++) {
+        for (int head = 0; head < HEADS; head++) {
+            for (int row = 0; row < ROWS; row++) {
+                for (int column = 0; column < COLUMNS; column++) {
+                    int accumulator = 0;
+                    for (int inner = 0; inner < K; inner++) {
+                        int a_value = a[(batch * ROWS + row) * K + inner];
+                        int b_value = b[(head * K + inner) * COLUMNS + column];
+                        accumulator += (a_value - a_zero_point) *
+                            (b_value - b_zero_point);
+                    }
+                    expected[((batch * HEADS + head) * ROWS + row) *
+                        COLUMNS + column] =
+                            (int8_t)(accumulator + output_zero_point);
+                }
+            }
+        }
+    }
+
+    memset(output, 0, sizeof(output));
+    vk_graph_reset();
+    vk_graph_begin_forward();
+    CHECK(vk_graph_qbatch_matmul_i8u8(
+        a, a_shape, 4, 1.0f, a_zero_point, VX_DTYPE_U8,
+        b, b_shape, 4, 1.0f, b_zero_point, VX_DTYPE_I8,
+        output, output_shape, 4, 1.0f, output_zero_point,
+        VX_DTYPE_I8) == 1);
+    CHECK(vk_graph_end_forward() == 0);
+    CHECK(vk_graph_sync_host(output, sizeof(output), 0) == 1);
+    CHECK(memcmp(output, expected, sizeof(output)) == 0);
     vk_graph_reset();
     return 0;
 }
@@ -1064,7 +1257,9 @@ static int test_qconv2d_i8u8_packed_chain(void) {
         0, 2, 4, 2, 6, 10, 0, 2, 4,
     };
 
+    VkQConvTacticProbe grouped_tactic = {0};
     vk_graph_reset();
+    vk_test_qconv_tactic_reset();
     vk_graph_begin_forward();
     CHECK(vk_graph_qconv2d_i8u8(input, weight, scales, zero_points, NULL, hidden,
                                  1u, 3u, 4u, 3u, 3u, 3u, 3u, 2u, 2u, 1u,
@@ -1072,6 +1267,10 @@ static int test_qconv2d_i8u8_packed_chain(void) {
                                  1.0f, 0, 1.0f, 0,
                                  VX_DTYPE_U8, VX_DTYPE_I8,
                                  VX_DTYPE_U8) == 1);
+    CHECK(vk_test_qconv_tactic_read(&grouped_tactic) == 0);
+    CHECK(grouped_tactic.dot_tiled_dispatches == 0u &&
+          grouped_tactic.tiled_dispatches == 0u &&
+          grouped_tactic.scalar_dispatches == 1u);
     /* `hidden` is deliberately not synced before this byte-domain bridge. */
     CHECK(vk_graph_requantize_linear_i8u8(hidden, 27u, output, 27u,
                                           1.0f, 0, 0.5f, -2,
@@ -1109,6 +1308,237 @@ static int test_qconv2d_i8u8_packed_chain(void) {
                                  1.0f, 0, 1.0f, 0,
                                  VX_DTYPE_U8, VX_DTYPE_I8,
                                  VX_DTYPE_U8) == 0);
+    vk_graph_reset();
+    return 0;
+}
+
+static int test_conv2d_f32_regular_out16(void) {
+    enum {
+        INPUT_HEIGHT = 3,
+        INPUT_WIDTH = 4,
+        INPUT_CHANNELS = 5,
+        OUTPUT_HEIGHT = 3,
+        OUTPUT_WIDTH = 3,
+        OUTPUT_CHANNELS = 16,
+        KERNEL_HEIGHT = 2,
+        KERNEL_WIDTH = 2,
+    };
+    float input[INPUT_HEIGHT * INPUT_WIDTH * INPUT_CHANNELS];
+    float weight[KERNEL_HEIGHT * KERNEL_WIDTH * INPUT_CHANNELS *
+                 OUTPUT_CHANNELS];
+    float bias[OUTPUT_CHANNELS];
+    float output[OUTPUT_HEIGHT * OUTPUT_WIDTH * OUTPUT_CHANNELS];
+    float expected[OUTPUT_HEIGHT * OUTPUT_WIDTH * OUTPUT_CHANNELS];
+    VkConvTacticProbe tactic = {0};
+    char telemetry[128] = {0};
+    for (size_t index = 0; index < sizeof(input) / sizeof(input[0]); index++)
+        input[index] = (float)((int)(index * 3u + 1u) % 11 - 5) * 0.0625f;
+    for (size_t index = 0; index < sizeof(weight) / sizeof(weight[0]); index++)
+        weight[index] = (float)((int)(index * 5u + 2u) % 13 - 6) * 0.03125f;
+    for (int channel = 0; channel < OUTPUT_CHANNELS; channel++)
+        bias[channel] = (float)(channel % 5 - 2) * 0.125f;
+    for (int output_y = 0; output_y < OUTPUT_HEIGHT; output_y++) {
+        for (int output_x = 0; output_x < OUTPUT_WIDTH; output_x++) {
+            for (int output_channel = 0; output_channel < OUTPUT_CHANNELS;
+                 output_channel++) {
+                float sum = 0.0f;
+                for (int input_channel = 0; input_channel < INPUT_CHANNELS;
+                     input_channel++) {
+                    for (int kernel_y = 0; kernel_y < KERNEL_HEIGHT; kernel_y++) {
+                        const int input_y = output_y + kernel_y * 2 - 1;
+                        if (input_y < 0 || input_y >= INPUT_HEIGHT) continue;
+                        for (int kernel_x = 0; kernel_x < KERNEL_WIDTH; kernel_x++) {
+                            const int input_x = output_x * 2 + kernel_x - 1;
+                            if (input_x < 0 || input_x >= INPUT_WIDTH) continue;
+                            const size_t input_index =
+                                ((size_t)input_y * INPUT_WIDTH + (size_t)input_x) *
+                                    INPUT_CHANNELS + (size_t)input_channel;
+                            const size_t weight_index =
+                                (((size_t)kernel_y * KERNEL_WIDTH +
+                                  (size_t)kernel_x) * INPUT_CHANNELS +
+                                 (size_t)input_channel) * OUTPUT_CHANNELS +
+                                    (size_t)output_channel;
+                            sum += input[input_index] * weight[weight_index];
+                        }
+                    }
+                }
+                expected[((size_t)output_y * OUTPUT_WIDTH +
+                          (size_t)output_x) * OUTPUT_CHANNELS +
+                         (size_t)output_channel] = sum + bias[output_channel];
+            }
+        }
+    }
+
+    vk_graph_reset();
+    vk_test_conv_tactic_reset();
+    vk_graph_begin_forward();
+    CHECK(vk_graph_conv2d_f32(
+              input, output, weight, bias,
+              1, INPUT_HEIGHT, INPUT_WIDTH, INPUT_CHANNELS, OUTPUT_CHANNELS,
+              KERNEL_HEIGHT, KERNEL_WIDTH, OUTPUT_HEIGHT, OUTPUT_WIDTH,
+              1, 2, 1, 1, 1, 0, 2, 1) == 1);
+    CHECK(vk_graph_end_forward() == 0);
+    CHECK(vk_graph_sync_host(output, sizeof(output), 0) == 1);
+    CHECK(vk_test_conv_tactic_read(&tactic) == 0);
+    CHECK(tactic.out16_dispatches == 1u && tactic.scalar_dispatches == 0u);
+    CHECK(vk_graph_append_dynamic_telemetry(
+              telemetry, sizeof(telemetry)) == 0);
+    CHECK(strstr(telemetry, ";vk_c16=1") != NULL &&
+          strstr(telemetry, "vk_cs=") == NULL);
+    for (size_t index = 0; index < sizeof(output) / sizeof(output[0]); index++)
+        CHECK(close_enough(output[index], expected[index]));
+    vk_graph_reset();
+    return 0;
+}
+
+/* A 1x1 pointwise convolution also satisfies the regular out_c%16 shape.
+ * Keep the pointwise selector ahead of the generic regular-out16 tactic. */
+static int test_conv2d_f32_pointwise_precedes_regular_out16(void) {
+    enum {
+        INPUT_HEIGHT = 2,
+        INPUT_WIDTH = 3,
+        INPUT_CHANNELS = 5,
+        OUTPUT_CHANNELS = 16,
+    };
+    float input[INPUT_HEIGHT * INPUT_WIDTH * INPUT_CHANNELS];
+    float weight[INPUT_CHANNELS * OUTPUT_CHANNELS];
+    float bias[OUTPUT_CHANNELS];
+    float output[INPUT_HEIGHT * INPUT_WIDTH * OUTPUT_CHANNELS];
+    float expected[INPUT_HEIGHT * INPUT_WIDTH * OUTPUT_CHANNELS];
+    VkConvTacticProbe tactic = {0};
+
+    for (size_t index = 0; index < sizeof(input) / sizeof(input[0]); index++)
+        input[index] = (float)((int)(index * 7u + 3u) % 13 - 6) * 0.0625f;
+    for (size_t index = 0; index < sizeof(weight) / sizeof(weight[0]); index++)
+        weight[index] = (float)((int)(index * 5u + 1u) % 11 - 5) * 0.03125f;
+    for (int output_channel = 0; output_channel < OUTPUT_CHANNELS;
+         output_channel++) {
+        bias[output_channel] = (float)(output_channel % 7 - 3) * 0.0625f;
+    }
+    for (int position = 0; position < INPUT_HEIGHT * INPUT_WIDTH; position++) {
+        for (int output_channel = 0; output_channel < OUTPUT_CHANNELS;
+             output_channel++) {
+            float sum = bias[output_channel];
+            for (int input_channel = 0; input_channel < INPUT_CHANNELS;
+                 input_channel++) {
+                sum += input[position * INPUT_CHANNELS + input_channel] *
+                    weight[input_channel * OUTPUT_CHANNELS + output_channel];
+            }
+            expected[position * OUTPUT_CHANNELS + output_channel] = sum;
+        }
+    }
+
+    vk_graph_reset();
+    vk_test_conv_tactic_reset();
+    vk_graph_begin_forward();
+    CHECK(vk_graph_conv2d_f32(
+              input, output, weight, bias,
+              1, INPUT_HEIGHT, INPUT_WIDTH, INPUT_CHANNELS, OUTPUT_CHANNELS,
+              1, 1, INPUT_HEIGHT, INPUT_WIDTH,
+              1, 1, 0, 0, 1, 0, 1, 1) == 1);
+    CHECK(vk_graph_end_forward() == 0);
+    CHECK(vk_graph_sync_host(output, sizeof(output), 0) == 1);
+    CHECK(vk_test_conv_tactic_read(&tactic) == 0);
+    CHECK(tactic.pointwise_selections == 1u);
+    CHECK(tactic.out16_dispatches == 0u);
+    for (size_t index = 0; index < sizeof(output) / sizeof(output[0]); index++)
+        CHECK(close_enough(output[index], expected[index]));
+    vk_graph_reset();
+    return 0;
+}
+
+/* The feature-independent 8x4 Vulkan QConv tactic must cover an asymmetric
+ * U8/I8 boundary, padded output positions, and a 17-byte reduction tail.
+ * Force packed dot off so this remains deterministic on dot-capable hosts;
+ * groups != 1 is covered by the scalar assertion above. */
+static int test_qconv2d_i8u8_scalar_tiled_tail(void) {
+    enum {
+        INPUT_HEIGHT = 2,
+        INPUT_WIDTH = 3,
+        INPUT_CHANNELS = 17,
+        OUTPUT_HEIGHT = 4,
+        OUTPUT_WIDTH = 5,
+        OUTPUT_CHANNELS = 36,
+    };
+    uint8_t input[INPUT_HEIGHT * INPUT_WIDTH * INPUT_CHANNELS];
+    int8_t weight[OUTPUT_CHANNELS * INPUT_CHANNELS];
+    float scales[OUTPUT_CHANNELS];
+    int32_t zero_points[OUTPUT_CHANNELS];
+    int32_t bias[OUTPUT_CHANNELS];
+    int8_t output[OUTPUT_HEIGHT * OUTPUT_WIDTH * OUTPUT_CHANNELS];
+    int8_t expected[OUTPUT_HEIGHT * OUTPUT_WIDTH * OUTPUT_CHANNELS];
+    VkQConvTacticProbe tactic = {0};
+    char telemetry[128] = {0};
+    const int32_t input_zero_point = 131;
+    const int32_t output_zero_point = -7;
+
+    for (size_t index = 0; index < sizeof(input); index++)
+        input[index] = (uint8_t)(input_zero_point +
+            ((int32_t)(index * 3u + 1u) % 5) - 2);
+    for (int channel = 0; channel < OUTPUT_CHANNELS; channel++) {
+        zero_points[channel] = -4 + channel % 5;
+        scales[channel] = 0.5f;
+        bias[channel] = channel % 7 - 3;
+        for (int k = 0; k < INPUT_CHANNELS; k++) {
+            weight[channel * INPUT_CHANNELS + k] = (int8_t)(
+                zero_points[channel] + (channel * 3 + k * 7 + 1) % 5 - 2);
+        }
+    }
+    for (int output_y = 0; output_y < OUTPUT_HEIGHT; output_y++) {
+        for (int output_x = 0; output_x < OUTPUT_WIDTH; output_x++) {
+            const int input_y = output_y - 1;
+            const int input_x = output_x - 1;
+            for (int channel = 0; channel < OUTPUT_CHANNELS; channel++) {
+                int32_t accumulator = bias[channel];
+                if (input_y >= 0 && input_y < INPUT_HEIGHT &&
+                    input_x >= 0 && input_x < INPUT_WIDTH) {
+                    for (int k = 0; k < INPUT_CHANNELS; k++) {
+                        const size_t input_index =
+                            ((size_t)input_y * INPUT_WIDTH + (size_t)input_x) *
+                                INPUT_CHANNELS + (size_t)k;
+                        const size_t weight_index =
+                            (size_t)channel * INPUT_CHANNELS + (size_t)k;
+                        accumulator +=
+                            ((int32_t)input[input_index] - input_zero_point) *
+                            ((int32_t)weight[weight_index] - zero_points[channel]);
+                    }
+                }
+                int32_t quantized = accumulator + output_zero_point;
+                if (quantized < -128) quantized = -128;
+                if (quantized > 127) quantized = 127;
+                expected[((size_t)output_y * OUTPUT_WIDTH + (size_t)output_x) *
+                    OUTPUT_CHANNELS + (size_t)channel] = (int8_t)quantized;
+            }
+        }
+    }
+
+    vk_graph_reset();
+    const int previous_dot_disabled = vk_test_set_packed_dot_disabled(1);
+    CHECK(previous_dot_disabled >= 0);
+    vk_test_qconv_tactic_reset();
+    vk_graph_begin_forward();
+    CHECK(vk_graph_qconv2d_i8u8(
+              input, weight, scales, zero_points, bias, output,
+              1u, INPUT_HEIGHT, INPUT_WIDTH, INPUT_CHANNELS,
+              OUTPUT_HEIGHT, OUTPUT_WIDTH, OUTPUT_CHANNELS,
+              1u, 1u, INPUT_CHANNELS,
+              1u, 1u, 1u, 1u,
+              1u, 1u, 1u, 1u,
+              1u, 0u,
+              0.25f, input_zero_point, 0.125f, output_zero_point,
+              VX_DTYPE_U8, VX_DTYPE_I8, VX_DTYPE_I8) == 1);
+    CHECK(vk_graph_end_forward() == 0);
+    CHECK(vk_graph_sync_host(output, sizeof(output), 0) == 1);
+    CHECK(vk_test_qconv_tactic_read(&tactic) == 0);
+    CHECK(tactic.dot_tiled_dispatches == 0u &&
+          tactic.tiled_dispatches == 1u &&
+          tactic.scalar_dispatches == 0u);
+    CHECK(vk_graph_append_dynamic_telemetry(
+              telemetry, sizeof(telemetry)) == 0);
+    CHECK(strstr(telemetry, ";vk_qct=1") != NULL &&
+          strstr(telemetry, "vk_qcs=") == NULL);
+    CHECK(memcmp(output, expected, sizeof(output)) == 0);
+    CHECK(vk_test_set_packed_dot_disabled(previous_dot_disabled) == 1);
     vk_graph_reset();
     return 0;
 }
@@ -2033,6 +2463,232 @@ static int test_expand_f32_uniform_abi(void) {
     return 0;
 }
 
+static int test_dynamic_shape_capacity_lifecycle(void) {
+    float small_input_a[4] = {1.0f, 2.0f, 3.0f, 4.0f};
+    float small_output_a[4] = {0};
+    float small_input_b[4] = {5.0f, 6.0f, 7.0f, 8.0f};
+    float small_output_b[4] = {0};
+    float large_input[128];
+    float large_output[128] = {0};
+    VkGraphDynamicStateProbe bound = {0};
+    VkGraphDynamicStateProbe active = {0};
+    VkGraphDynamicStateProbe pooled = {0};
+    VkGraphDynamicStateProbe reused = {0};
+    VkGraphDynamicStateProbe grown = {0};
+    for (int index = 0; index < 128; index++)
+        large_input[index] = (float)(index - 17);
+
+    vk_graph_reset();
+    CHECK(vk_graph_bind_shape("copy:f32:[4]->[4]") == 0);
+    CHECK(vk_test_graph_dynamic_state(&bound) == 0);
+    CHECK(bound.shape_generation != 0);
+    CHECK(vk_graph_bind_shape("copy:f32:[4]->[4]") == 0);
+    CHECK(vk_test_graph_dynamic_state(&active) == 0);
+    CHECK(active.shape_generation == bound.shape_generation);
+    CHECK(vk_graph_bind_shape("") == -1);
+    CHECK(vk_test_graph_dynamic_state(&active) == 0);
+    CHECK(active.shape_generation == bound.shape_generation);
+
+    vk_graph_begin_forward();
+    CHECK(vk_graph_copy_f32(small_input_a, small_output_a, 4) == 1);
+    CHECK(vk_graph_end_forward() == 0);
+    CHECK(vk_graph_sync_host(small_output_a, sizeof(small_output_a), 0) == 1);
+    CHECK(memcmp(small_input_a, small_output_a, sizeof(small_input_a)) == 0);
+    CHECK(vk_test_graph_dynamic_state(&active) == 0);
+    CHECK(active.active_capacity_bytes > 0 && active.pooled_capacity_bytes == 0 &&
+          active.slot_count == 2);
+
+    CHECK(vk_graph_bind_shape("copy:f32:[1,4]->[1,4]") == 0);
+    CHECK(vk_test_graph_dynamic_state(&pooled) == 0);
+    CHECK(pooled.shape_generation != active.shape_generation &&
+          pooled.capacity_generation == active.capacity_generation &&
+          pooled.active_capacity_bytes == 0 &&
+          pooled.pooled_capacity_bytes == active.active_capacity_bytes &&
+          pooled.slot_count == active.slot_count);
+    vk_graph_begin_forward();
+    CHECK(vk_graph_copy_f32(small_input_b, small_output_b, 4) == 1);
+    CHECK(vk_graph_end_forward() == 0);
+    CHECK(vk_graph_sync_host(small_output_b, sizeof(small_output_b), 0) == 1);
+    CHECK(memcmp(small_input_b, small_output_b, sizeof(small_input_b)) == 0);
+    CHECK(vk_test_graph_dynamic_state(&reused) == 0);
+    CHECK(reused.capacity_generation == pooled.capacity_generation &&
+          reused.slot_count == pooled.slot_count &&
+          reused.active_capacity_bytes == active.active_capacity_bytes);
+
+    CHECK(vk_graph_bind_shape("copy:f32:[128]->[128]") == 0);
+    vk_graph_begin_forward();
+    CHECK(vk_graph_copy_f32(large_input, large_output, 128) == 1);
+    CHECK(vk_graph_end_forward() == 0);
+    CHECK(vk_graph_sync_host(large_output, sizeof(large_output), 0) == 1);
+    CHECK(memcmp(large_input, large_output, sizeof(large_input)) == 0);
+    CHECK(vk_test_graph_dynamic_state(&grown) == 0);
+    CHECK(grown.capacity_generation > reused.capacity_generation &&
+          grown.active_capacity_bytes >= sizeof(large_input) * 2u &&
+          grown.slot_count == reused.slot_count);
+    vk_graph_reset();
+    return 0;
+}
+
+static int test_dynamic_domain_reservation(void) {
+    const size_t qgroupnorm_stats_bytes = 64u;
+    const size_t qlayernorm_stats_bytes = 80u;
+    float arena[64] = {0};
+    float bootstrap_input[4] = {1.0f, 2.0f, 3.0f, 4.0f};
+    const float invariant[4] = {0.5f, 1.5f, 2.5f, 3.5f};
+    float bootstrap_output[4] = {0};
+    float missing_input[4] = {0};
+    float missing_output[4] = {0};
+    const VolvoxAIEnginePhysicalSpan spans[2] = {
+        {arena, 32u * sizeof(float)},
+        {arena + 32, 32u * sizeof(float)},
+    };
+    const VolvoxAIEnginePhysicalSpan mismatch[2] = {
+        {arena, 31u * sizeof(float)},
+        {arena + 32, 32u * sizeof(float)},
+    };
+    VulkanDomainLimits limits = {0};
+    VkGraphDynamicStateProbe before = {0};
+    VkGraphDynamicStateProbe rolled_back = {0};
+    VkGraphDynamicStateProbe reserved = {0};
+    VkGraphDynamicStateProbe same = {0};
+    VkGraphDynamicStateProbe rebound = {0};
+    VkGraphDynamicStateProbe executed = {0};
+
+    CHECK(vk_query_domain_limits(&limits) == 0);
+    CHECK(limits.maximum_storage_buffer_bytes >= spans[0].capacity_bytes &&
+          limits.maximum_uniform_buffer_bytes > 0u &&
+          limits.maximum_total_span_bytes >= spans[0].capacity_bytes * 2u &&
+          limits.maximum_scratch_bytes > 0u &&
+          limits.current_graph_scratch_bytes <=
+              limits.maximum_scratch_bytes &&
+          limits.storage_alignment > 0u &&
+          limits.maximum_workgroups[0] > 0u &&
+          limits.maximum_workgroup_size[0] > 0u &&
+          limits.maximum_workgroup_invocations > 0u &&
+          limits.maximum_storage_bindings > 0u &&
+          limits.maximum_uniform_bindings > 0u &&
+          limits.maximum_tensor_slots >= 2u &&
+          limits.maximum_dispatches > 0u);
+
+    vk_graph_reset();
+    CHECK(vk_graph_bind_shape("domain:published") == 0);
+    vk_graph_begin_forward();
+    CHECK(vk_graph_add_f32(
+              bootstrap_input, invariant, bootstrap_output, 4) == 1);
+    CHECK(vk_graph_end_forward() == 0);
+    CHECK(vk_query_domain_limits(&limits) == 0 &&
+          limits.current_graph_scratch_bytes > 0u &&
+          limits.current_graph_scratch_bytes % limits.storage_alignment == 0u &&
+          limits.current_graph_scratch_bytes <=
+              limits.maximum_scratch_bytes);
+    CHECK(vk_graph_sync_host(
+              bootstrap_output, sizeof(bootstrap_output), 0) == 1);
+    /* Simulate a public tensor consumed through a weight/affine port during
+     * bootstrap, then apply the logical-preload completion classification. */
+    vk_graph_retain_weight(bootstrap_input, sizeof(bootstrap_input));
+    vk_graph_demote_weight(bootstrap_input, sizeof(bootstrap_input));
+    vk_graph_retain_weight(invariant, sizeof(invariant));
+    CHECK(vk_test_graph_dynamic_state(&before) == 0);
+    CHECK(vk_graph_bind_shape_domain(
+              "domain:q4", spans, 2u, 1024u * 1024u, 1u) == -1);
+    CHECK(vk_test_graph_dynamic_state(&rolled_back) == 0);
+    CHECK(rolled_back.shape_generation == before.shape_generation &&
+          rolled_back.capacity_generation == before.capacity_generation &&
+          rolled_back.active_capacity_bytes == before.active_capacity_bytes &&
+          rolled_back.pooled_capacity_bytes == before.pooled_capacity_bytes &&
+          rolled_back.domain_scratch_capacity_bytes ==
+              before.domain_scratch_capacity_bytes &&
+          rolled_back.domain_span_count == 0u &&
+          rolled_back.slot_count == before.slot_count &&
+          !rolled_back.domain_enforced);
+    CHECK(vk_test_fail_domain_allocation_after(1u) == 0);
+    CHECK(vk_graph_bind_shape_domain(
+              "domain:q4", spans, 2u, qgroupnorm_stats_bytes,
+              qlayernorm_stats_bytes) == -2);
+    CHECK(vk_test_graph_dynamic_state(&rolled_back) == 0);
+    CHECK(rolled_back.shape_generation == before.shape_generation &&
+          rolled_back.capacity_generation == before.capacity_generation &&
+          rolled_back.active_capacity_bytes == before.active_capacity_bytes &&
+          rolled_back.pooled_capacity_bytes == before.pooled_capacity_bytes &&
+          rolled_back.domain_scratch_capacity_bytes ==
+              before.domain_scratch_capacity_bytes &&
+          rolled_back.domain_span_count == 0u &&
+          rolled_back.slot_count == before.slot_count &&
+          !rolled_back.domain_enforced);
+
+    CHECK(vk_graph_bind_shape_domain(
+              "domain:q4", spans, 2u, qgroupnorm_stats_bytes,
+              qlayernorm_stats_bytes) == 0);
+    CHECK(vk_test_graph_dynamic_state(&reserved) == 0);
+    CHECK(reserved.shape_generation != before.shape_generation &&
+          reserved.capacity_generation != before.capacity_generation &&
+          reserved.active_capacity_bytes >=
+              spans[0].capacity_bytes * 2u + sizeof(invariant) &&
+          reserved.pooled_capacity_bytes == 0u &&
+          reserved.domain_scratch_capacity_bytes ==
+              qgroupnorm_stats_bytes + qlayernorm_stats_bytes &&
+          reserved.domain_span_count == 2u && reserved.slot_count == 3 &&
+          reserved.domain_enforced);
+
+    CHECK(vk_graph_bind_shape_domain(
+              "domain:q4", spans, 2u, qgroupnorm_stats_bytes,
+              qlayernorm_stats_bytes) == 0);
+    CHECK(vk_test_graph_dynamic_state(&same) == 0);
+    CHECK(same.shape_generation == reserved.shape_generation &&
+          same.capacity_generation == reserved.capacity_generation &&
+          same.active_capacity_bytes == reserved.active_capacity_bytes &&
+          same.domain_scratch_capacity_bytes ==
+              reserved.domain_scratch_capacity_bytes &&
+          same.slot_count == reserved.slot_count);
+
+    CHECK(vk_graph_bind_shape_domain(
+              "domain:q8", spans, 2u, qgroupnorm_stats_bytes,
+              qlayernorm_stats_bytes) == 0);
+    CHECK(vk_test_graph_dynamic_state(&rebound) == 0);
+    CHECK(rebound.shape_generation != same.shape_generation &&
+          rebound.capacity_generation == same.capacity_generation &&
+          rebound.active_capacity_bytes == same.active_capacity_bytes &&
+          rebound.domain_scratch_capacity_bytes ==
+              same.domain_scratch_capacity_bytes &&
+          rebound.slot_count == same.slot_count);
+    CHECK(vk_graph_bind_shape_domain(
+              "domain:q8", spans, 2u, qgroupnorm_stats_bytes + 1u,
+              qlayernorm_stats_bytes) == -1);
+    CHECK(vk_graph_bind_shape_domain(
+              "domain:q8", mismatch, 2u, qgroupnorm_stats_bytes,
+              qlayernorm_stats_bytes) == -1);
+    CHECK(vk_test_graph_dynamic_state(&executed) == 0);
+    CHECK(executed.shape_generation == rebound.shape_generation &&
+          executed.capacity_generation == rebound.capacity_generation &&
+          executed.active_capacity_bytes == rebound.active_capacity_bytes &&
+          executed.domain_scratch_capacity_bytes ==
+              rebound.domain_scratch_capacity_bytes &&
+          executed.slot_count == rebound.slot_count);
+    CHECK(vk_graph_bind_shape("domain:legacy") == -1);
+
+    for (int index = 0; index < 4; index++) arena[index] = (float)(index + 3);
+    vk_graph_begin_forward();
+    CHECK(vk_graph_add_f32(arena, invariant, arena + 32, 4) == 1);
+    CHECK(vk_graph_end_forward() == 0);
+    CHECK(vk_graph_sync_host(arena + 32, 4u * sizeof(float), 0) == 1);
+    for (int index = 0; index < 4; index++)
+        CHECK(arena[32 + index] == arena[index] + invariant[index]);
+    vk_graph_begin_forward();
+    CHECK(vk_graph_alias_f32(arena, arena + 32, 4) == 1);
+    CHECK(vk_graph_end_forward() == 0);
+    CHECK(vk_graph_sync_host(arena + 32, 4u * sizeof(float), 0) == 1);
+    CHECK(memcmp(arena, arena + 32, 4u * sizeof(float)) == 0);
+    vk_graph_begin_forward();
+    CHECK(vk_graph_copy_f32(missing_input, missing_output, 4) == 0);
+    CHECK(vk_graph_end_forward() == 0);
+    CHECK(vk_test_graph_dynamic_state(&executed) == 0);
+    CHECK(executed.capacity_generation == rebound.capacity_generation &&
+          executed.active_capacity_bytes == rebound.active_capacity_bytes &&
+          executed.slot_count == rebound.slot_count);
+    vk_graph_reset();
+    return 0;
+}
+
 int main(void) {
     VxEngineState* state;
     VxEngineStateScope state_scope;
@@ -2073,8 +2729,10 @@ int main(void) {
     CHECK(vk_training_plan_supported(1, copy_params, &oversized_tensor, 1) == 0);
     CHECK(vk_training_plan_supported(4097, NULL, NULL, 0) == 0);
     CHECK(test_one_shot_matmul_tails_and_fallback() == 0);
+    CHECK(test_graph_linear_dynamic_domain() == 0);
     CHECK(test_tiled_qlinear_i8u8_tails() == 0);
     CHECK(test_tiled_qlinear_staged_rounding() == 0);
+    CHECK(test_qbatch_matmul_i8u8_arbitrary_k() == 0);
     CHECK(test_layernorm_epsilon() == 0);
     CHECK(test_qlinear_i8u8_packed_chain() == 0);
     CHECK(test_qembedding_i8u8_packed_gather() == 0);
@@ -2086,11 +2744,16 @@ int main(void) {
     CHECK(test_qsdpa_i8u8_packed_chain() == 0);
     CHECK(test_qargmax_i8u8_raw() == 0);
     CHECK(test_qmaskedmean_i8u8_packed() == 0);
+    CHECK(test_conv2d_f32_regular_out16() == 0);
+    CHECK(test_conv2d_f32_pointwise_precedes_regular_out16() == 0);
     CHECK(test_qconv2d_i8u8_packed_chain() == 0);
+    CHECK(test_qconv2d_i8u8_scalar_tiled_tail() == 0);
     CHECK(test_typed_i8u8_shape_qdq_chain() == 0);
     CHECK(test_general_gather_i32() == 0);
     CHECK(test_typed_control_graph_ops() == 0);
     CHECK(test_expand_f32_uniform_abi() == 0);
+    CHECK(test_dynamic_shape_capacity_lifecycle() == 0);
+    CHECK(test_dynamic_domain_reservation() == 0);
     CHECK(vk_training_begin() == 0);
 
     float dummy = 0.0f;

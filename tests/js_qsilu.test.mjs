@@ -1,8 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
-import { Graph } from '../ts/core/Graph.js';
-import { GraphLoader } from '../ts/core/GraphLoader.js';
+import { RuntimeGraph } from '../ts/core/RuntimeGraph.js';
+import { RuntimeGraphLoader } from '../ts/core/RuntimeGraphLoader.js';
 import { CPUEngine } from '../ts/backends/CPUEngine.js';
 import { _cpuQSiLU } from '../ts/ops/qSiLU.js';
 
@@ -45,7 +45,7 @@ function qSiLUGraph({
   params = {},
   inputs = null,
 } = {}) {
-  const graph = new Graph();
+  const graph = new RuntimeGraph();
   const input = graph.addInput('input', inputShape, inputDtype, {
     buffer: byteStorage(inputDtype, inputValues), quantization: inputQuantization,
   });
@@ -144,20 +144,20 @@ test('CPU engine dispatches QSiLU without entering the F32 SiLU path', async () 
   assert.deepEqual([...result.out], [-2, 0, 1, 4, 10]);
 });
 
-test('GraphLoader accepts only the parameter-free canonical QSiLU byte boundary', () => {
+test('RuntimeGraphLoader accepts only the parameter-free canonical QSiLU byte boundary', () => {
   const valid = qSiLUGraph();
-  assert.doesNotThrow(() => GraphLoader._assertBrowserQuantizationSupported(valid.graph));
+  assert.doesNotThrow(() => RuntimeGraphLoader._assertBrowserQuantizationSupported(valid.graph));
 
   const extra = qSiLUGraph();
   extra.node.inputs.extra = extra.input;
   assert.throws(
-    () => GraphLoader._assertBrowserQuantizationSupported(extra.graph),
+    () => RuntimeGraphLoader._assertBrowserQuantizationSupported(extra.graph),
     /unsupported canonical W8A8 input 'extra'/,
   );
 
   const parameterized = qSiLUGraph({ params: { alpha: 0.5 } });
   assert.throws(
-    () => GraphLoader._assertBrowserQuantizationSupported(parameterized.graph),
+    () => RuntimeGraphLoader._assertBrowserQuantizationSupported(parameterized.graph),
     /same-shape canonical per-tensor I8\/U8 activation input\/output pair with distinct tensors and no parameters/,
   );
 });

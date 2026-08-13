@@ -1,8 +1,9 @@
-import type { Graph } from '../core/Graph.js';
+import type { RuntimeGraph } from '../core/RuntimeGraph.js';
 import { Tensor } from '../core/Tensor.js';
 import type { RuntimeDType, RuntimeTypedArray } from '../types.js';
 import type { GraphExecutor } from './GraphExecutor.js';
 import { submitWebGPUBufferCopies, type WebGPUBufferCopy } from './WebGPUDispatch.js';
+import { createWebGPUBufferOrOOM } from './WebGPUResources.js';
 
 export interface WebGPUOutputSnapshot {
   readonly name: string;
@@ -14,7 +15,7 @@ export interface WebGPUOutputSnapshot {
 
 export function snapshotWebGPUOutputs(
   device: GPUDevice,
-  graph: Graph,
+  graph: RuntimeGraph,
   buffers: ReadonlyMap<string, GPUBuffer>,
 ): ReadonlyMap<string, WebGPUOutputSnapshot> {
   const snapshots = new Map<string, WebGPUOutputSnapshot>();
@@ -28,11 +29,15 @@ export function snapshotWebGPUOutputs(
         throw new Error(`WebGPU declared output '${name}' has no allocated device tensor.`);
       }
       const paddedSize = Math.ceil(tensor.sizeBytes / 4) * 4;
-      const deviceBuffer = device.createBuffer({
-        label: `Result_${name}`,
-        size: paddedSize,
-        usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST,
-      });
+      const deviceBuffer = createWebGPUBufferOrOOM(
+        device,
+        {
+          label: `Result_${name}`,
+          size: paddedSize,
+          usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST,
+        },
+        `WebGPU result '${name}' snapshot`,
+      );
       created.push(deviceBuffer);
       copies.push({ source, destination: deviceBuffer, size: paddedSize });
       snapshots.set(name, Object.freeze({
@@ -109,7 +114,7 @@ export class WebGPUResults {
     if (this.host.compiledTopologyRevision == null) {
       throw new Error('WebGPU snapshotOutputs requires a compiled graph.');
     }
-    return snapshotWebGPUOutputs(this.host.device, this.host.graph as Graph, this.host.gpuBuffers);
+    return snapshotWebGPUOutputs(this.host.device, this.host.graph as RuntimeGraph, this.host.gpuBuffers);
   }
 
   readBuffer(

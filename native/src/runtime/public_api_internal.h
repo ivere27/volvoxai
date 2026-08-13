@@ -28,6 +28,25 @@ VX_PUBLIC_INTERNAL VxStatus vx_model_internal_create_authoring_engine(
     VxReport* report);
 VX_PUBLIC_INTERNAL void vx_model_internal_destroy_authoring_engine(
     VxEngineState* state);
+VX_PUBLIC_INTERNAL size_t vx_model_internal_input_count(const VxModel* model);
+VX_PUBLIC_INTERNAL VxStatus vx_model_internal_input_spec(
+    const VxModel* model,
+    size_t index,
+    VxTensorSpec* spec);
+VX_PUBLIC_INTERNAL const char* vx_model_internal_logical_fingerprint(
+    const VxModel* model);
+/* Validate one complete shaped batch, resolve the logical graph, optionally
+ * require an existing accumulation signature, and atomically bind the private
+ * authoring engine. `out_shape_signature` is heap-owned by the caller. */
+VX_PUBLIC_INTERNAL VxStatus vx_model_internal_bind_authoring_inputs(
+    VxModel* model,
+    VxEngineState* state,
+    VolvoxAIEngineBackend backend,
+    const VxTensorBinding* inputs,
+    size_t input_count,
+    const char* required_shape_signature,
+    char** out_shape_signature,
+    VxReport* report);
 VX_PUBLIC_INTERNAL VxStatus vx_model_internal_validate_authoring_revision(
     VxModel* model,
     VxWeightRevisionRecord* exact_revision,

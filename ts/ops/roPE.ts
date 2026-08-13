@@ -14,7 +14,7 @@ function tensorElements(tensor) {
   return tensor.buffer?.length === elements ? elements : null;
 }
 
-export function ropeDescriptor(node) {
+export function ropeDescriptor(node, { validatePositionValues = true } = {}) {
   const input = node.inputs.input || node.inputs.x;
   const positions = node.inputs.position_ids || null;
   const output = node.outputs.out || Object.values(node.outputs || {})[0];
@@ -47,8 +47,10 @@ export function ropeDescriptor(node) {
     if (sameShape(positions.shape, [sequence])) positionMode = 1;
     else if (rank === 3 && sameShape(positions.shape, [batch, sequence])) positionMode = 2;
     else throw new Error(`RoPE node ${node.id} position_ids must have shape [S] or [B,S].`);
-    for (const position of positions.buffer) {
-      if (position < 0) throw new Error(`RoPE node ${node.id} position_ids must be non-negative.`);
+    if (validatePositionValues) {
+      for (const position of positions.buffer) {
+        if (position < 0) throw new Error(`RoPE node ${node.id} position_ids must be non-negative.`);
+      }
     }
   }
   return { input, positions, output, batch, sequence, width, rotaryWidth, theta,

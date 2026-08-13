@@ -1,8 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
-import { Graph } from '../ts/core/Graph.js';
-import { GraphLoader } from '../ts/core/GraphLoader.js';
+import { RuntimeGraph } from '../ts/core/RuntimeGraph.js';
+import { RuntimeGraphLoader } from '../ts/core/RuntimeGraphLoader.js';
 import { CPUEngine } from '../ts/backends/CPUEngine.js';
 import { _cpuQGELU, qgeluValueF32 } from '../ts/ops/qGELU.js';
 
@@ -76,7 +76,7 @@ function qGELUGraph({
   params = {},
   inputs = null,
 } = {}) {
-  const graph = new Graph();
+  const graph = new RuntimeGraph();
   const input = graph.addInput('input', inputShape, inputDtype, {
     buffer: byteStorage(inputDtype, inputValues), quantization: inputQuantization,
   });
@@ -176,22 +176,22 @@ test('CPU engine dispatches QGELU without entering the F32 GELU path', async () 
   assert.deepEqual([...result.out], [-1, 0, 1, 5, 11]);
 });
 
-test('GraphLoader accepts only fixed portable-erf QGELU semantics', () => {
+test('RuntimeGraphLoader accepts only fixed portable-erf QGELU semantics', () => {
   const omitted = qGELUGraph();
-  assert.doesNotThrow(() => GraphLoader._assertBrowserQuantizationSupported(omitted.graph));
+  assert.doesNotThrow(() => RuntimeGraphLoader._assertBrowserQuantizationSupported(omitted.graph));
 
   const explicitNone = qGELUGraph({ params: { approximate: 'none' } });
-  assert.doesNotThrow(() => GraphLoader._assertBrowserQuantizationSupported(explicitNone.graph));
+  assert.doesNotThrow(() => RuntimeGraphLoader._assertBrowserQuantizationSupported(explicitNone.graph));
 
   const tanh = qGELUGraph({ params: { approximate: 'tanh' } });
   assert.throws(
-    () => GraphLoader._assertBrowserQuantizationSupported(tanh.graph),
+    () => RuntimeGraphLoader._assertBrowserQuantizationSupported(tanh.graph),
     /only omitted parameters or approximate='none'/,
   );
 
   const extraParameter = qGELUGraph({ params: { approximate: 'none', alpha: 0.5 } });
   assert.throws(
-    () => GraphLoader._assertBrowserQuantizationSupported(extraParameter.graph),
+    () => RuntimeGraphLoader._assertBrowserQuantizationSupported(extraParameter.graph),
     /only omitted parameters or approximate='none'/,
   );
 });

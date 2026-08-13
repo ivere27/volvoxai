@@ -195,6 +195,13 @@ test('generated Trainer messages preserve explicit private-step options', () => 
 
   const step = new TrainStepRequest({
     trainerId: 'trainer-3',
+    inputs: [new Tensor({
+      name: 'tokens',
+      shape: [2n, 16n],
+      dtype: DataType.DATA_TYPE_I32,
+      data: new Uint8Array(2 * 16 * 4),
+      location: MemoryLocation.MEMORY_LOCATION_HOST,
+    })],
     losses: [new CrossEntropyLoss({
       name: 'language-model-loss',
       logitsName: 'logits',
@@ -220,6 +227,7 @@ test('generated PTQ messages preserve the complete authoring contract', () => {
   const create = new CreatePtqPlanRequest({
     modelId: 'model-2',
     templateGraphPath: 'authoring/graph.json',
+    profileNames: ['short', 'maximum'],
     observers: [new PtqObserverSpec({
       tensorName: 'hidden',
       dtype: DataType.DATA_TYPE_I8,
@@ -309,7 +317,6 @@ test('generated FFI client exposes the complete application lifecycle route', ()
     '/volvoxai.runtime.RuntimeService/CreateTrainer',
     '/volvoxai.runtime.RuntimeService/CloseTrainer',
     '/volvoxai.runtime.RuntimeService/ReleaseTrainer',
-    '/volvoxai.runtime.RuntimeService/SetTrainerInput',
     '/volvoxai.runtime.RuntimeService/TrainStep',
     '/volvoxai.runtime.RuntimeService/CommitTrainer',
     '/volvoxai.runtime.RuntimeService/RollbackTrainer',
@@ -326,7 +333,6 @@ test('generated FFI client exposes the complete application lifecycle route', ()
     '/volvoxai.runtime.RuntimeService/CreateExecutionContext',
     '/volvoxai.runtime.RuntimeService/CloseExecutionContext',
     '/volvoxai.runtime.RuntimeService/ReleaseExecutionContext',
-    '/volvoxai.runtime.RuntimeService/SetInput',
     '/volvoxai.runtime.RuntimeService/Execute',
     '/volvoxai.runtime.RuntimeService/DecodeSeed',
     '/volvoxai.runtime.RuntimeService/DecodeStep',
@@ -341,6 +347,11 @@ test('generated FFI client exposes the complete application lifecycle route', ()
     RuntimeServiceMethods.RegisterProvider,
     undefined,
     'provider callback composition is an SPI, not an application FFI operation',
+  );
+  assert.equal(
+    RuntimeServiceMethods.SetInput,
+    undefined,
+    'v1 carries an atomic tensor binding batch on execute/decode requests',
   );
 
   const calls = [];

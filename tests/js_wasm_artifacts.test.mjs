@@ -54,7 +54,9 @@ const trainingExports = [
   'volvoxai_training_maxpool2d_f32',
   'volvoxai_training_mean_height_backward_f32',
   'volvoxai_training_mean_height_f32',
+  'volvoxai_training_moe_linear_backward_banked_f32',
   'volvoxai_training_moe_linear_backward_f32',
+  'volvoxai_training_moe_linear_banked_f32',
   'volvoxai_training_moe_linear_f32',
   'volvoxai_training_moe_router_backward_f32',
   'volvoxai_training_moe_router_f32',
@@ -159,7 +161,13 @@ test('forward and full WASM artifacts enforce the training ABI boundary', {
     const fullModule = await WebAssembly.compile(await readFile(fullPath));
     const inferenceEntries = WebAssembly.Module.exports(inferenceModule);
     const fullEntries = WebAssembly.Module.exports(fullModule);
+    const inferenceByName = new Map(inferenceEntries.map((entry) => [entry.name, entry.kind]));
     const fullByName = new Map(fullEntries.map((entry) => [entry.name, entry.kind]));
+
+    assert.equal(inferenceByName.get('__heap_base'), 'global',
+      'the inference sidecar exposes its exact static/stack prefix');
+    assert.equal(fullByName.get('__heap_base'), 'global',
+      'the full sidecar exposes its exact static/stack prefix');
 
     assert.deepEqual(
       inferenceEntries.filter(({ name }) => name.startsWith(trainingPrefix)),
@@ -185,6 +193,10 @@ test('forward and full WASM artifacts enforce the training ABI boundary', {
     }
 
     const full = await WebAssembly.instantiate(fullModule, importsFor(fullModule));
+    const fullStaticPrefixBytes = Number(full.exports.__heap_base.value);
+    assert.ok(Number.isSafeInteger(fullStaticPrefixBytes) && fullStaticPrefixBytes > 0);
+    assert.equal(fullStaticPrefixBytes % 16, 0);
+    assert.equal(full.exports.heap_mark(), fullStaticPrefixBytes);
     assert.equal(full.exports.volvoxai_training_abi_version(), 1);
     assert.equal(full.exports.volvoxai_training_capabilities(), 0x1ff);
   } finally {

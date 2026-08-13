@@ -7,7 +7,7 @@ import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
 
-import { Graph } from '../ts/core/Graph.js';
+import { RuntimeGraph } from '../ts/core/RuntimeGraph.js';
 import { CPUEngine } from '../ts/backends/CPUEngine.js';
 import { WasmEngine } from '../ts/backends/WasmEngine.js';
 
@@ -31,20 +31,23 @@ async function cpuResult(graph, inputs) {
   return engine.execute(inputs);
 }
 
-function argMaxGraph({ inputDtype = 'float32', outputDtype = 'int32', axis }) {
-  const graph = new Graph();
+function argMaxGraph({ axis, keepdims }) {
+  const graph = new RuntimeGraph();
   const inputShape = [2, 3, 2];
   const normalizedAxis = axis < 0 ? axis + inputShape.length : axis;
-  const input = graph.addInput('input', inputShape, inputDtype);
+  const outputShape = keepdims
+    ? inputShape.map((dimension, index) => index === normalizedAxis ? 1 : dimension)
+    : inputShape.filter((_, index) => index !== normalizedAxis);
+  const input = graph.addInput('input', inputShape, 'float32');
   const { out } = graph.addOp('ArgMax', { input }, {
-    out: { name: 'out', shape: inputShape.filter((_, index) => index !== normalizedAxis), dtype: outputDtype },
-  }, { axis });
+    out: { name: 'out', shape: outputShape, dtype: 'int32' },
+  }, { axis, keepdims, select_last_index: 0 });
   graph.setOutputs([out.name]);
   return graph;
 }
 
 function nmsGraph(outputDtype) {
-  const graph = new Graph();
+  const graph = new RuntimeGraph();
   const boxes = graph.addInput('boxes', [1, 3, 4]);
   const scores = graph.addInput('scores', [1, 1, 3]);
   const maximum = graph.addInput('maximum', [1], 'int32');
@@ -87,8 +90,8 @@ test('portable WASM ArgMax and NMS execute C kernels with CPU-equivalent typed o
         1, 9, 5, 3, 5, 4,
         2, 0, 8, 7, 6, 10,
       ]);
-      const cpu = await cpuResult(argMaxGraph({ axis: 1 }), { input: values });
-      const graph = argMaxGraph({ axis: 1 });
+      const cpu = await cpuResult(argMaxGraph({ axis: 1, keepdims: false }), { input: values });
+      const graph = argMaxGraph({ axis: 1, keepdims: false });
       wasm.compile(graph);
       const result = await wasm.execute({ input: values });
       assert.ok(result.out instanceof Int32Array);
@@ -96,16 +99,17 @@ test('portable WASM ArgMax and NMS execute C kernels with CPU-equivalent typed o
       assert.deepEqual([...result.out], [1, 0, 1, 2]);
     });
 
-    await t.test('ArgMax honors integer input storage and Float32 output storage', async () => {
-      const values = Uint8Array.from([
+    await t.test('ArgMax preserves an explicit keepdims axis with canonical F32 to I32 storage', async () => {
+      const values = Float32Array.from([
         1, 9, 5, 3, 5, 4,
         2, 0, 8, 7, 6, 10,
       ]);
-      const cpu = await cpuResult(argMaxGraph({ inputDtype: 'uint8', outputDtype: 'float32', axis: -1 }), { input: values });
-      const graph = argMaxGraph({ inputDtype: 'uint8', outputDtype: 'float32', axis: -1 });
+      const cpu = await cpuResult(argMaxGraph({ axis: -1, keepdims: true }), { input: values });
+      const graph = argMaxGraph({ axis: -1, keepdims: true });
       wasm.compile(graph);
       const result = await wasm.execute({ input: values });
-      assert.ok(result.out instanceof Float32Array);
+      assert.ok(result.out instanceof Int32Array);
+      assert.deepEqual(graph.tensors.get('out').shape, [2, 3, 1]);
       assert.deepEqual([...result.out], [...cpu.out]);
       assert.deepEqual([...result.out], [1, 0, 0, 0, 0, 1]);
     });

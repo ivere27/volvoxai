@@ -1,12 +1,12 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
-import { Graph } from '../ts/core/Graph.js';
-import { GraphLoader } from '../ts/core/GraphLoader.js';
+import { RuntimeGraph } from '../ts/core/RuntimeGraph.js';
+import { RuntimeGraphLoader } from '../ts/core/RuntimeGraphLoader.js';
 import { CPUEngine } from '../ts/backends/CPUEngine.js';
 
 function qArgMaxGraph() {
-  const graph = new Graph();
+  const graph = new RuntimeGraph();
   const input = graph.addInput('input', [2, 3, 2], 'int8', {
     quantization: { scheme: 'per_tensor', scale: 0.25, zero_point: -3 },
   });
@@ -19,7 +19,7 @@ function qArgMaxGraph() {
 
 test('CPU dispatches QArgMax through its raw-byte kernel, not generic ArgMax', async () => {
   const { graph } = qArgMaxGraph();
-  assert.doesNotThrow(() => GraphLoader._assertBrowserQuantizationSupported(graph));
+  assert.doesNotThrow(() => RuntimeGraphLoader._assertBrowserQuantizationSupported(graph));
 
   const engine = new CPUEngine();
   engine.allocateGraph(graph);
@@ -39,41 +39,41 @@ test('CPU dispatches QArgMax through its raw-byte kernel, not generic ArgMax', a
   assert.deepEqual([...result.out], [1, 0, 1, 2]);
 });
 
-test('GraphLoader admits only the canonical QArgMax byte boundary', () => {
-  assert.doesNotThrow(() => GraphLoader._assertBrowserQuantizationSupported(qArgMaxGraph().graph));
+test('RuntimeGraphLoader admits only the canonical QArgMax byte boundary', () => {
+  assert.doesNotThrow(() => RuntimeGraphLoader._assertBrowserQuantizationSupported(qArgMaxGraph().graph));
 
   const badParams = qArgMaxGraph();
   badParams.node.params.keepdims = false;
   assert.throws(
-    () => GraphLoader._assertBrowserQuantizationSupported(badParams.graph),
+    () => RuntimeGraphLoader._assertBrowserQuantizationSupported(badParams.graph),
     /exact \{ axis: integer \}/,
   );
 
   const quantizedOutput = qArgMaxGraph();
   quantizedOutput.out.quantization = Object.freeze({ scheme: 'per_tensor', scale: 0.25, zero_point: 0 });
   assert.throws(
-    () => GraphLoader._assertBrowserQuantizationSupported(quantizedOutput.graph),
+    () => RuntimeGraphLoader._assertBrowserQuantizationSupported(quantizedOutput.graph),
     /unquantized I32 output/,
   );
 
   const wrongName = qArgMaxGraph();
   wrongName.node.inputs = { x: wrongName.input };
   assert.throws(
-    () => GraphLoader._assertBrowserQuantizationSupported(wrongName.graph),
+    () => RuntimeGraphLoader._assertBrowserQuantizationSupported(wrongName.graph),
     /exactly \{ input \}/,
   );
 
   const mutableDescriptor = qArgMaxGraph();
   mutableDescriptor.input.quantization = { scheme: 'per_tensor', scale: 0.25, zero_point: -3 };
   assert.throws(
-    () => GraphLoader._assertBrowserQuantizationSupported(mutableDescriptor.graph),
+    () => RuntimeGraphLoader._assertBrowserQuantizationSupported(mutableDescriptor.graph),
     /immutable per-tensor/,
   );
 
   const generic = qArgMaxGraph();
   generic.node.opType = 'ArgMax';
   assert.throws(
-    () => GraphLoader._assertBrowserQuantizationSupported(generic.graph),
+    () => RuntimeGraphLoader._assertBrowserQuantizationSupported(generic.graph),
     /unsupported generic operator/,
   );
 });

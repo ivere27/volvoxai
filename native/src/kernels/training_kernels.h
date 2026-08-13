@@ -269,6 +269,18 @@ uint32_t volvoxai_training_moe_router_backward_f32(
     float *dinput, float *dweight, float *dbias,
     uint32_t rows, uint32_t d_model, uint32_t experts, uint32_t top_k,
     float temperature, uint32_t normalize);
+/* Partially resident expert banks: `experts` counts staged rows while route
+ * indices stay in global slot space, mapped through slot_rows[slot_domain].
+ * NULL slot_rows selects the fully resident behaviour. */
+uint32_t volvoxai_training_moe_linear_banked_f32(
+    const float*, const float*, const float*, const float*, const float*,
+    float*, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t,
+    const uint32_t*, uint32_t);
+uint32_t volvoxai_training_moe_linear_backward_banked_f32(
+    const float*, const float*, const float*, const float*, const float*,
+    const float*, float*, float*, float*, float*, uint32_t, uint32_t,
+    uint32_t, uint32_t, uint32_t, const uint32_t*, uint32_t);
+
 uint32_t volvoxai_training_moe_linear_f32(
     const float *input, const float *expert_weight, const float *expert_bias,
     const float *route_indices, const float *route_weights, float *output,

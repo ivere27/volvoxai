@@ -187,8 +187,24 @@ option (volvoxai.optimizer_registry.registry) = {
     summary: "Promote explicitly contracted source or rewrite-derived values to public inputs."
   }
   feature: {
+    id: "declared-input-pruning"
+    summary: "Remove caller-declared public inputs whose meaning a fusion absorbed."
+  }
+  feature: {
     id: "static-qdq-compute-migration"
     summary: "Migrate qualified static-QDQ float islands to byte-domain compute kernels."
+  }
+  feature: {
+    id: "quantized-bias-folding"
+    summary: "Fold qualified immutable F32 post-biases into existing quantized dense accumulators."
+  }
+  feature: {
+    id: "static-qdq-qbatch-matmul-migration"
+    summary: "Migrate only qualified no-broadcast QDQ BatchMatMul islands to QBatchMatMul."
+  }
+  feature: {
+    id: "static-qdq-groupnorm-silu-migration"
+    summary: "Migrate only closed GroupNorm/layout/SiLU QDQ islands to a continuous byte domain."
   }
   feature: {
     id: "defer-static-qdq-layout"
@@ -201,6 +217,14 @@ option (volvoxai.optimizer_registry.registry) = {
   feature: {
     id: "quantized-attention-fusion"
     summary: "Fuse proved producer-quantized attention into runnable QSDPA."
+  }
+  feature: {
+    id: "silu-fusion"
+    summary: "Fuse canonical F32 x*sigmoid(x) into a SiLU kernel boundary."
+  }
+  feature: {
+    id: "exact-common-subexpression"
+    summary: "Share byte-identical explicit Reshape and Expand computations."
   }
   feature: {
     id: "fp32-pre-ptq"
@@ -266,6 +290,23 @@ option (volvoxai.optimizer_registry.registry) = {
     must_run_before: "runtime-ptq-authoring"
     must_run_before: "runtime-canonicalize"
     must_run_before: "runtime-dead-code"
+  }
+
+  pass: {
+    id: "runtime-declared-input-pruning"
+    version: 1
+    implementation_id: "tools.exporter.optimizer.typed_specialization:RuntimeDeclaredInputPruningPass"
+    summary: "Remove caller-declared public inputs whose meaning a fusion absorbed and which no node reads."
+    scope: OPTIMIZER_PASS_SCOPE_PORTABLE_PACKAGE
+    stage: OPTIMIZER_PASS_STAGE_ABI_SPECIALIZATION
+    input_dialect: OPTIMIZER_DIALECT_RUNTIME
+    output_dialect: OPTIMIZER_DIALECT_RUNTIME
+    semantics: REWRITE_SEMANTICS_EXACT
+    changes_public_abi: true
+    must_run_after: "runtime-float-attention-fusion"
+    must_run_after: "runtime-quantized-attention-fusion"
+    must_run_after: "runtime-input-hoisting"
+    must_run_after: "runtime-dead-code"
   }
 
   pass: {
@@ -574,7 +615,7 @@ option (volvoxai.optimizer_registry.registry) = {
     id: "runtime-qdq-transpose-cancellation"
     version: 1
     implementation_id: "tools.exporter.optimizer.typed_qdq_layout:RuntimeQDQTransposeCancellationPass"
-    summary: "Cancel proven inverse Transpose operations across one Q/DQ boundary."
+    summary: "Cancel proven inverse Transpose operations around layout-equivariant unary and per-tensor quantization chains."
     scope: OPTIMIZER_PASS_SCOPE_PORTABLE_PACKAGE
     stage: OPTIMIZER_PASS_STAGE_QUANTIZED_REGION
     input_dialect: OPTIMIZER_DIALECT_RUNTIME
@@ -582,7 +623,19 @@ option (volvoxai.optimizer_registry.registry) = {
     repeatable: true
     semantics: REWRITE_SEMANTICS_EXACT
     matched_operator: OPERATOR_KIND_TRANSPOSE
+    matched_operator: OPERATOR_KIND_QUANTIZE_LINEAR
     matched_operator: OPERATOR_KIND_DEQUANTIZE_LINEAR
+    matched_operator: OPERATOR_KIND_REQUANTIZE_LINEAR
+    matched_operator: OPERATOR_KIND_SILU
+    matched_operator: OPERATOR_KIND_GELU
+    matched_operator: OPERATOR_KIND_SIGMOID
+    matched_operator: OPERATOR_KIND_TANH
+    matched_operator: OPERATOR_KIND_RELU
+    matched_operator: OPERATOR_KIND_LEAKY_RELU
+    matched_operator: OPERATOR_KIND_CLIP
+    matched_operator: OPERATOR_KIND_IDENTITY
+    matched_operator: OPERATOR_KIND_SIN
+    matched_operator: OPERATOR_KIND_COS
     must_run_after: "runtime-singleton-transpose"
     must_run_before: "runtime-pointwise-transpose-hoist"
   }
@@ -738,6 +791,70 @@ option (volvoxai.optimizer_registry.registry) = {
   }
 
   pass: {
+    id: "runtime-static-qdq-qbatch-matmul-fusion"
+    version: 1
+    implementation_id: "tools.exporter.optimizer.static_qdq_fusion:RuntimeStaticQDQBatchMatMulFusionPass"
+    summary: "Fuse only qualified no-broadcast QDQ BatchMatMul islands into QBatchMatMul."
+    scope: OPTIMIZER_PASS_SCOPE_PORTABLE_PACKAGE
+    stage: OPTIMIZER_PASS_STAGE_QUANTIZED_REGION
+    input_dialect: OPTIMIZER_DIALECT_RUNTIME
+    output_dialect: OPTIMIZER_DIALECT_RUNTIME
+    repeatable: true
+    semantics: REWRITE_SEMANTICS_NUMERICAL_MIGRATION
+    changes_precision: true
+    matched_operator: OPERATOR_KIND_QUANTIZE_LINEAR
+    matched_operator: OPERATOR_KIND_DEQUANTIZE_LINEAR
+    matched_operator: OPERATOR_KIND_BATCH_MATMUL
+    emitted_operator: OPERATOR_KIND_Q_BATCH_MATMUL
+    must_run_after: "runtime-shape-chain"
+    target: {
+      backend: BACKEND_KIND_CPU_JS
+      backend: BACKEND_KIND_WASM
+      backend: BACKEND_KIND_WEBGPU
+      backend: BACKEND_KIND_NATIVE_CPU
+      required_operator: OPERATOR_KIND_Q_BATCH_MATMUL
+    }
+  }
+
+  pass: {
+    id: "runtime-static-qdq-groupnorm-silu-fusion"
+    version: 1
+    implementation_id: "tools.exporter.optimizer.typed_groupnorm_silu_island:RuntimeStaticQDQGroupNormSiLUFusionPass"
+    summary: "Fuse only closed DQ/GroupNorm/layout/SiLU/Q islands into continuous byte-domain operators."
+    scope: OPTIMIZER_PASS_SCOPE_PORTABLE_PACKAGE
+    stage: OPTIMIZER_PASS_STAGE_QUANTIZED_REGION
+    input_dialect: OPTIMIZER_DIALECT_RUNTIME
+    output_dialect: OPTIMIZER_DIALECT_RUNTIME
+    repeatable: true
+    semantics: REWRITE_SEMANTICS_NUMERICAL_MIGRATION
+    changes_precision: true
+    matched_operator: OPERATOR_KIND_DEQUANTIZE_LINEAR
+    matched_operator: OPERATOR_KIND_GROUP_NORM
+    matched_operator: OPERATOR_KIND_TRANSPOSE
+    matched_operator: OPERATOR_KIND_SILU
+    matched_operator: OPERATOR_KIND_QUANTIZE_LINEAR
+    emitted_operator: OPERATOR_KIND_Q_GROUP_NORM
+    emitted_operator: OPERATOR_KIND_TRANSPOSE
+    emitted_operator: OPERATOR_KIND_Q_SILU
+    must_run_after: "runtime-affine-reference-canonicalization"
+    must_run_after: "runtime-canonicalize"
+    must_run_after: "runtime-dead-code"
+    target: {
+      backend: BACKEND_KIND_CPU_JS
+      backend: BACKEND_KIND_WASM
+      backend: BACKEND_KIND_WEBGPU
+      backend: BACKEND_KIND_NATIVE_CPU
+      backend: BACKEND_KIND_VULKAN
+      backend: BACKEND_KIND_OPENGL
+      backend: BACKEND_KIND_METAL
+      backend: BACKEND_KIND_CUDA
+      required_operator: OPERATOR_KIND_Q_GROUP_NORM
+      required_operator: OPERATOR_KIND_TRANSPOSE
+      required_operator: OPERATOR_KIND_Q_SILU
+    }
+  }
+
+  pass: {
     id: "runtime-canonicalize"
     version: 1
     implementation_id: "tools.exporter.optimizer.typed_passes:RuntimeCanonicalizePass"
@@ -758,6 +875,26 @@ option (volvoxai.optimizer_registry.registry) = {
     must_run_after: "runtime-shape-chain"
     must_run_after: "runtime-static-qdq-compute-fusion"
     must_run_before: "redundant-qdq"
+  }
+
+  pass: {
+    id: "runtime-common-subexpression"
+    version: 1
+    implementation_id: "tools.exporter.optimizer.typed_common_subexpression:RuntimeCommonSubexpressionEliminationPass"
+    summary: "Share exactly equivalent explicit Reshape and Expand computations."
+    scope: OPTIMIZER_PASS_SCOPE_PORTABLE_PACKAGE
+    stage: OPTIMIZER_PASS_STAGE_CANONICALIZATION
+    input_dialect: OPTIMIZER_DIALECT_RUNTIME
+    output_dialect: OPTIMIZER_DIALECT_RUNTIME
+    repeatable: true
+    semantics: REWRITE_SEMANTICS_EXACT
+    matched_operator: OPERATOR_KIND_RESHAPE
+    matched_operator: OPERATOR_KIND_EXPAND
+    must_run_after: "runtime-input-hoisting"
+    must_run_after: "runtime-affine-reference-canonicalization"
+    must_run_after: "runtime-canonicalize"
+    must_run_after: "redundant-qdq"
+    must_run_after: "runtime-dead-code"
   }
 
   pass: {
@@ -997,6 +1134,12 @@ option (volvoxai.optimizer_registry.registry) = {
     max_iterations: 1
   }
   group: {
+    id: "runtime-declared-input-pruning"
+    summary: "Caller-configured removal of declared public inputs that a fusion absorbed."
+    pass_id: "runtime-declared-input-pruning"
+    max_iterations: 1
+  }
+  group: {
     id: "runtime-exact-prelude"
     summary: "Exact initializer folding and dense canonicalization."
     pass_id: "runtime-constant-folding"
@@ -1005,6 +1148,12 @@ option (volvoxai.optimizer_registry.registry) = {
   group: {
     id: "runtime-quantized-migration-prelude"
     summary: "Opt-in quantized dense accumulator preparation before packed projection splitting."
+    pass_id: "runtime-quantized-bias-folding"
+    max_iterations: 1
+  }
+  group: {
+    id: "runtime-quantized-bias-migration-prelude"
+    summary: "Independent opt-in for immutable F32 post-bias folding only."
     pass_id: "runtime-quantized-bias-folding"
     max_iterations: 1
   }
@@ -1027,6 +1176,12 @@ option (volvoxai.optimizer_registry.registry) = {
     max_iterations: 1
   }
   group: {
+    id: "runtime-silu-migration-prelude"
+    summary: "Opt-in canonical F32 Sigmoid/Mul lowering to SiLU only."
+    pass_id: "runtime-silu-fusion"
+    max_iterations: 1
+  }
+  group: {
     id: "runtime-quantized-attention-migration-prelude"
     summary: "Opt-in runnable QSDPA lowering for proved producer-quantized attention."
     pass_id: "runtime-quantized-attention-fusion"
@@ -1045,6 +1200,12 @@ option (volvoxai.optimizer_registry.registry) = {
     pass_id: "runtime-keep-mask"
     fixed_point: true
     max_iterations: 8
+  }
+  group: {
+    id: "runtime-exact-common-subexpression"
+    summary: "Explicit exact sharing of repeated shape and broadcast computations."
+    pass_id: "runtime-common-subexpression"
+    max_iterations: 1
   }
   group: {
     id: "runtime-safe-fixed-point"
@@ -1101,6 +1262,18 @@ option (volvoxai.optimizer_registry.registry) = {
     max_iterations: 8
   }
   group: {
+    id: "runtime-static-qdq-qbatch-matmul-migration"
+    summary: "One opt-in no-broadcast QDQ BatchMatMul migration transaction."
+    pass_id: "runtime-static-qdq-qbatch-matmul-fusion"
+    max_iterations: 1
+  }
+  group: {
+    id: "runtime-static-qdq-groupnorm-silu-migration"
+    summary: "One opt-in closed GroupNorm/layout/SiLU byte-domain migration transaction."
+    pass_id: "runtime-static-qdq-groupnorm-silu-fusion"
+    max_iterations: 1
+  }
+  group: {
     id: "runtime-fp32-pre-ptq-fixed-point"
     summary: "Opt-in model-neutral FP32 preparation before PTQ plus exact cleanup."
     pass_id: "runtime-silu-fusion"
@@ -1149,12 +1322,21 @@ option (volvoxai.optimizer_registry.registry) = {
       required_feature: "float-attention-fusion"
     }
     group_overlay: {
+      group_id: "runtime-silu-migration-prelude"
+      required_feature: "silu-fusion"
+    }
+    group_overlay: {
       group_id: "runtime-quantized-attention-migration-prelude"
       required_feature: "quantized-attention-fusion"
     }
     group_overlay: {
       group_id: "runtime-quantized-migration-prelude"
       required_feature: "static-qdq-compute-migration"
+    }
+    group_overlay: {
+      group_id: "runtime-quantized-bias-migration-prelude"
+      required_feature: "quantized-bias-folding"
+      forbidden_feature: "static-qdq-compute-migration"
     }
     group_overlay: { group_id: "runtime-packed-projection-prelude" }
     group_overlay: {
@@ -1190,16 +1372,38 @@ option (volvoxai.optimizer_registry.registry) = {
       required_feature: "static-qdq-compute-migration"
       required_feature: "defer-static-qdq-layout"
     }
+    group_overlay: {
+      group_id: "runtime-static-qdq-qbatch-matmul-migration"
+      required_feature: "static-qdq-qbatch-matmul-migration"
+    }
+    group_overlay: {
+      group_id: "runtime-static-qdq-groupnorm-silu-migration"
+      required_feature: "static-qdq-groupnorm-silu-migration"
+    }
+    group_overlay: {
+      group_id: "runtime-exact-common-subexpression"
+      required_feature: "exact-common-subexpression"
+    }
+    group_overlay: {
+      group_id: "runtime-declared-input-pruning"
+      required_feature: "declared-input-pruning"
+    }
     allowed_semantics: REWRITE_SEMANTICS_EXACT
     allowed_semantics: REWRITE_SEMANTICS_NUMERICAL_MIGRATION
     allow_public_abi_change: true
     supported_feature: "output-qargmax"
     supported_feature: "input-specialization"
     supported_feature: "input-hoisting"
+    supported_feature: "declared-input-pruning"
     supported_feature: "static-qdq-compute-migration"
+    supported_feature: "quantized-bias-folding"
+    supported_feature: "static-qdq-qbatch-matmul-migration"
+    supported_feature: "static-qdq-groupnorm-silu-migration"
     supported_feature: "defer-static-qdq-layout"
     supported_feature: "float-attention-fusion"
     supported_feature: "quantized-attention-fusion"
+    supported_feature: "silu-fusion"
+    supported_feature: "exact-common-subexpression"
   }
   pipeline: {
     id: "runtime-fp32-pre-ptq"
@@ -1225,6 +1429,18 @@ option (volvoxai.optimizer_registry.registry) = {
       required_feature: "input-hoisting"
     }
     group_overlay: { group_id: "runtime-fp32-pre-ptq-fixed-point" }
+    group_overlay: {
+      group_id: "runtime-static-qdq-qbatch-matmul-migration"
+      required_feature: "static-qdq-qbatch-matmul-migration"
+    }
+    group_overlay: {
+      group_id: "runtime-exact-common-subexpression"
+      required_feature: "exact-common-subexpression"
+    }
+    group_overlay: {
+      group_id: "runtime-declared-input-pruning"
+      required_feature: "declared-input-pruning"
+    }
     allowed_semantics: REWRITE_SEMANTICS_EXACT
     allowed_semantics: REWRITE_SEMANTICS_NUMERICAL_MIGRATION
     allow_public_abi_change: true
@@ -1232,7 +1448,10 @@ option (volvoxai.optimizer_registry.registry) = {
     supported_feature: "output-qargmax"
     supported_feature: "input-specialization"
     supported_feature: "input-hoisting"
+    supported_feature: "declared-input-pruning"
     supported_feature: "float-attention-fusion"
+    supported_feature: "static-qdq-qbatch-matmul-migration"
+    supported_feature: "exact-common-subexpression"
   }
   pipeline: {
     id: "runtime-ptq-authoring"

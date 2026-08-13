@@ -7,7 +7,7 @@ import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
 
-import { Graph } from '../ts/core/Graph.js';
+import { RuntimeGraph } from '../ts/core/RuntimeGraph.js';
 import { CPUEngine } from '../ts/backends/CPUEngine.js';
 import { WasmEngine } from '../ts/backends/WasmEngine.js';
 
@@ -62,7 +62,7 @@ function forbidCpuFallbacks(engine) {
     '_cpuResize', '_cpuSiLU', '_cpuTanh', '_cpuAdd', '_cpuMul', '_cpuSub', '_cpuDiv',
     '_cpuSoftmax', '_cpuLogSoftmax', '_cpuTranspose', '_cpuConcat2', '_cpuSplit', '_cpuExpand',
     '_cpuLeakyReLU', '_cpuPReLU', '_cpuUpsample2x', '_cpuInterp1D', '_cpuPad',
-    '_cpuAveragePool2D',
+    '_cpuAveragePool2D', '_cpuMaxPool2D',
   ];
   for (const helper of helpers) {
     engine[helper] = () => {
@@ -80,7 +80,7 @@ async function assertWasmParity(wasm, label, makeGraph, inputs, tolerance = 5e-5
 }
 
 function linearGraph(opType) {
-  const graph = new Graph();
+  const graph = new RuntimeGraph();
   const input = graph.addInput('input', [2, 3]);
   const weight = graph.addWeight('weight', [3, 2], 'float32', {
     buffer: Float32Array.of(0.25, -0.5, 1.5, 0.75, -1, 0.5),
@@ -94,7 +94,7 @@ function linearGraph(opType) {
 }
 
 function broadcastBiasLinearGraph() {
-  const graph = new Graph();
+  const graph = new RuntimeGraph();
   const input = graph.addInput('input', [1, 2, 3]);
   const weight = graph.addWeight('weight', [3, 2], 'float32', {
     buffer: Float32Array.of(0.25, -0.5, 1.5, 0.75, -1, 0.5),
@@ -110,7 +110,7 @@ function broadcastBiasLinearGraph() {
 }
 
 function relu6Conv2DGraph() {
-  const graph = new Graph();
+  const graph = new RuntimeGraph();
   const input = graph.addInput('input', [1, 1, 2, 1]);
   const weight = graph.addWeight('weight', [1, 1, 1, 1], 'float32', {
     buffer: Float32Array.of(4),
@@ -125,8 +125,118 @@ function relu6Conv2DGraph() {
   return graph;
 }
 
+// Deterministic filler so the CPU reference and the WASM kernel see identical
+// bytes without shipping large literal buffers.
+function ramp(length, step, offset) {
+  return Float32Array.from(
+    { length }, (_, index) => Math.fround(((index * step + offset) % 17) / 8 - 1),
+  );
+}
+
+function poolOutputExtent(input, kernel, stride, before, after) {
+  return Math.floor((input + before + after - kernel) / stride) + 1;
+}
+
+function pool2DGraph(opType, spec, outputShape = null) {
+  const graph = new RuntimeGraph();
+  const input = graph.addInput(
+    'input', [spec.batch, spec.inputHeight, spec.inputWidth, spec.channels],
+  );
+  const inferredShape = [
+    spec.batch,
+    poolOutputExtent(
+      spec.inputHeight, spec.kernel[0], spec.stride[0], spec.pads[0], spec.pads[2],
+    ),
+    poolOutputExtent(
+      spec.inputWidth, spec.kernel[1], spec.stride[1], spec.pads[1], spec.pads[3],
+    ),
+    spec.channels,
+  ];
+  const { out } = graph.addOp(opType, { input }, {
+    out: { name: 'out', shape: outputShape ?? inferredShape },
+  }, {
+    kernel: spec.kernel,
+    stride: spec.stride,
+    pads: spec.pads,
+    dilation: [1, 1],
+    ceil_mode: false,
+  });
+  graph.setOutputs([out.name]);
+  return graph;
+}
+
+function pool2DInputs(spec) {
+  return {
+    input: ramp(
+      spec.batch * spec.inputHeight * spec.inputWidth * spec.channels, 5, 2,
+    ),
+  };
+}
+
+// Conv1D: NLC activations [batch, l, c], WIO weights [k, in_per_group, out_c].
+const CONV1D_SPECS = [
+  { label: 'plain', batch: 1, inL: 6, inC: 2, outC: 4, k: 3, stride: 1, padding: 1, groups: 1, relu: 0 },
+  { label: 'strided relu', batch: 2, inL: 9, inC: 3, outC: 6, k: 3, stride: 2, padding: 1, groups: 1, relu: 1 },
+  { label: 'grouped', batch: 1, inL: 8, inC: 4, outC: 8, k: 5, stride: 1, padding: 2, groups: 2, relu: 0 },
+  { label: 'depthwise', batch: 2, inL: 7, inC: 6, outC: 6, k: 3, stride: 1, padding: 0, groups: 3, relu: 1 },
+];
+
+function conv1DOutputLength(spec) {
+  return Math.floor((spec.inL + 2 * spec.padding - spec.k) / spec.stride) + 1;
+}
+
+function conv1DInputs(spec) {
+  return { input: ramp(spec.batch * spec.inL * spec.inC, 5, 3) };
+}
+
+function conv1DGraph(spec) {
+  const graph = new RuntimeGraph();
+  const perGroup = spec.inC / spec.groups;
+  const input = graph.addInput('input', [spec.batch, spec.inL, spec.inC]);
+  const weight = graph.addWeight('weight', [spec.k, perGroup, spec.outC], 'float32', {
+    buffer: ramp(spec.k * perGroup * spec.outC, 7, 1),
+  });
+  const bias = graph.addWeight('bias', [spec.outC], 'float32', {
+    buffer: ramp(spec.outC, 3, 2),
+  });
+  const { out } = graph.addOp('Conv1D', { input, weight, bias }, {
+    out: { name: 'out', shape: [spec.batch, conv1DOutputLength(spec), spec.outC] },
+  }, { stride: spec.stride, padding: spec.padding, groups: spec.groups, relu: spec.relu });
+  graph.setOutputs([out.name]);
+  return graph;
+}
+
+// ConvTranspose2D: NHWC activations, HWIO weights [kh, kw, in_c, out_c].
+const CONV_TRANSPOSE_SPECS = [
+  { label: 'plain', batch: 1, inH: 2, inW: 2, inC: 1, outC: 2, kh: 2, kw: 2, sh: 1, sw: 1, ph: 0, pw: 0 },
+  { label: 'strided', batch: 2, inH: 3, inW: 4, inC: 3, outC: 5, kh: 3, kw: 3, sh: 2, sw: 2, ph: 1, pw: 1 },
+  { label: 'wide kernel', batch: 1, inH: 4, inW: 4, inC: 2, outC: 2, kh: 4, kw: 4, sh: 2, sw: 2, ph: 1, pw: 1 },
+];
+
+function convTranspose2DInputs(spec) {
+  return { input: ramp(spec.batch * spec.inH * spec.inW * spec.inC, 5, 4) };
+}
+
+function convTranspose2DGraph(spec) {
+  const graph = new RuntimeGraph();
+  const outH = (spec.inH - 1) * spec.sh + spec.kh - 2 * spec.ph;
+  const outW = (spec.inW - 1) * spec.sw + spec.kw - 2 * spec.pw;
+  const input = graph.addInput('input', [spec.batch, spec.inH, spec.inW, spec.inC]);
+  const weight = graph.addWeight('weight', [spec.kh, spec.kw, spec.inC, spec.outC], 'float32', {
+    buffer: ramp(spec.kh * spec.kw * spec.inC * spec.outC, 7, 2),
+  });
+  const bias = graph.addWeight('bias', [spec.outC], 'float32', {
+    buffer: ramp(spec.outC, 3, 5),
+  });
+  const { out } = graph.addOp('ConvTranspose2D', { input, weight, bias }, {
+    out: { name: 'out', shape: [spec.batch, outH, outW, spec.outC] },
+  }, { kernel: [spec.kh, spec.kw], stride: [spec.sh, spec.sw], padding: [spec.ph, spec.pw] });
+  graph.setOutputs([out.name]);
+  return graph;
+}
+
 function dynamicDoutLinearGraph(opType) {
-  const graph = new Graph();
+  const graph = new RuntimeGraph();
   const input = graph.addInput('input', [1, 2]);
   const weight = graph.addInput('weight', [2, 2]);
   const { out } = graph.addOp(opType, { input, weight }, {
@@ -139,7 +249,7 @@ function dynamicDoutLinearGraph(opType) {
 function sharedPackedLinearGraph(opType, rows = 7) {
   const dIn = 17;
   const dOut = 13;
-  const graph = new Graph();
+  const graph = new RuntimeGraph();
   const inputA = graph.addInput('inputA', [rows, dIn]);
   const inputB = graph.addInput('inputB', [rows, dIn]);
   const weight = graph.addWeight('sharedWeight', [dOut, dIn], 'float32', {
@@ -160,7 +270,7 @@ function sharedPackedLinearGraph(opType, rows = 7) {
 }
 
 function quantizedOddWidthLinearGraph(opType) {
-  const graph = new Graph();
+  const graph = new RuntimeGraph();
   const input = graph.addInput('input', [1, 3]);
   const weight = graph.addWeight('weight', [2, 3], 'int8', {
     buffer: Int8Array.of(1, 2, 3, -1, 2, -3),
@@ -176,7 +286,7 @@ function quantizedOddWidthLinearGraph(opType) {
 }
 
 function quantizedUint8LinearGraph(opType) {
-  const graph = new Graph();
+  const graph = new RuntimeGraph();
   const input = graph.addInput('input', [1, 3]);
   const weight = graph.addWeight('weight', [2, 3], 'uint8', {
     buffer: Uint8Array.of(2, 3, 4, 5, 6, 7),
@@ -191,7 +301,7 @@ function quantizedUint8LinearGraph(opType) {
 }
 
 function rmsNormGraph() {
-  const graph = new Graph();
+  const graph = new RuntimeGraph();
   const input = graph.addInput('input', [2, 2, 3]);
   const weight = graph.addWeight('weight', [3], 'float32', { buffer: Float32Array.of(1.2, 0.75, 1.5) });
   const { out } = graph.addOp('RMSNorm', { input, weight }, {
@@ -202,7 +312,7 @@ function rmsNormGraph() {
 }
 
 function rmsNormExtremeGraph() {
-  const graph = new Graph();
+  const graph = new RuntimeGraph();
   const input = graph.addInput('input', [1, 2]);
   const weight = graph.addWeight('weight', [2], 'float32', { buffer: Float32Array.of(1, 1) });
   const { out } = graph.addOp('RMSNorm', { input, weight }, {
@@ -213,7 +323,7 @@ function rmsNormExtremeGraph() {
 }
 
 function groupNormGraph() {
-  const graph = new Graph();
+  const graph = new RuntimeGraph();
   const input = graph.addInput('input', [2, 2, 2, 4]);
   const weight = graph.addWeight('weight', [4], 'float32', { buffer: Float32Array.of(1, 0.75, 1.25, 0.5) });
   const bias = graph.addWeight('bias', [4], 'float32', { buffer: Float32Array.of(0.1, -0.2, 0.3, -0.4) });
@@ -225,7 +335,7 @@ function groupNormGraph() {
 }
 
 function groupNormPrecisionGraph() {
-  const graph = new Graph();
+  const graph = new RuntimeGraph();
   const input = graph.addInput('input', [1, 1, 1, 2]);
   const weight = graph.addWeight('weight', [2], 'float32', { buffer: Float32Array.of(1, 1) });
   const bias = graph.addWeight('bias', [2], 'float32', { buffer: Float32Array.of(0, 0) });
@@ -237,7 +347,7 @@ function groupNormPrecisionGraph() {
 }
 
 function moeGraph(temperature = 1.25) {
-  const graph = new Graph();
+  const graph = new RuntimeGraph();
   const input = graph.addInput('input', [2, 3]);
   const routerWeight = graph.addWeight('routerWeight', [3, 3], 'float32', {
     buffer: Float32Array.of(0.5, -0.25, 0.75, -0.5, 1, 0.25, 0.2, -0.3, 0.6),
@@ -269,7 +379,7 @@ function moeGraph(temperature = 1.25) {
 }
 
 function resizeNearestGraph() {
-  const graph = new Graph();
+  const graph = new RuntimeGraph();
   const input = graph.addInput('input', [2, 2, 3, 2]);
   const { out } = graph.addOp('ResizeNearest2D', { input }, {
     out: { name: 'out', shape: [2, 3, 5, 2] },
@@ -279,7 +389,7 @@ function resizeNearestGraph() {
 }
 
 function resizeModeNearestGraph() {
-  const graph = new Graph();
+  const graph = new RuntimeGraph();
   const input = graph.addInput('input', [2, 2, 3, 2]);
   const { out } = graph.addOp('Resize', { input }, {
     out: { name: 'out', shape: [2, 3, 5, 2] },
@@ -289,7 +399,7 @@ function resizeModeNearestGraph() {
 }
 
 function upsampleGraph(opType) {
-  const graph = new Graph();
+  const graph = new RuntimeGraph();
   const input = graph.addInput('input', [2, 2, 2, 1]);
   const { out } = graph.addOp(opType, { input }, {
     out: { name: 'out', shape: [2, 4, 4, 1] },
@@ -299,7 +409,7 @@ function upsampleGraph(opType) {
 }
 
 function interpGraph(opType) {
-  const graph = new Graph();
+  const graph = new RuntimeGraph();
   const input = graph.addInput('input', [2, 1, 3]);
   const { out } = graph.addOp(opType, { input }, {
     out: { name: 'out', shape: [2, 1, 5] },
@@ -309,7 +419,7 @@ function interpGraph(opType) {
 }
 
 function leakyGraph() {
-  const graph = new Graph();
+  const graph = new RuntimeGraph();
   const input = graph.addInput('input', [1, 5]);
   const { out } = graph.addOp('LeakyReLU', { input }, {
     out: { name: 'out', shape: [1, 5] },
@@ -319,7 +429,7 @@ function leakyGraph() {
 }
 
 function preluGraph() {
-  const graph = new Graph();
+  const graph = new RuntimeGraph();
   const input = graph.addInput('input', [1, 5]);
   const slope = graph.addInput('slope', [2]);
   const { out } = graph.addOp('PReLU', { input, slope }, {
@@ -330,7 +440,7 @@ function preluGraph() {
 }
 
 function unaryGraph(opType) {
-  const graph = new Graph();
+  const graph = new RuntimeGraph();
   const input = graph.addInput('input', [2, 3]);
   const { out } = graph.addOp(opType, { input }, { out: { name: 'out', shape: [2, 3] } });
   graph.setOutputs([out.name]);
@@ -338,7 +448,7 @@ function unaryGraph(opType) {
 }
 
 function binaryBroadcastGraph(opType, params = {}) {
-  const graph = new Graph();
+  const graph = new RuntimeGraph();
   const a = graph.addInput('a', [2, 1, 3]);
   const b = graph.addInput('b', [1, 4, 1]);
   const { out } = graph.addOp(opType, { a, b }, {
@@ -348,18 +458,18 @@ function binaryBroadcastGraph(opType, params = {}) {
   return graph;
 }
 
-function softmaxGraph(opType) {
-  const graph = new Graph();
-  const input = graph.addInput('input', [2, 1, 2, 2]);
+function softmaxGraph(opType, width = 2) {
+  const graph = new RuntimeGraph();
+  const input = graph.addInput('input', [2, 1, 2, width]);
   const { out } = graph.addOp(opType, { input }, {
-    out: { name: 'out', shape: [2, 1, 2, 2] },
+    out: { name: 'out', shape: [2, 1, 2, width] },
   }, { axis: -1 });
   graph.setOutputs([out.name]);
   return graph;
 }
 
 function typedShapeCopyGraph(dtype) {
-  const graph = new Graph();
+  const graph = new RuntimeGraph();
   let value = graph.addInput('values', [1, 2, 2], dtype);
   for (const [index, opType, shape, params] of [
     [0, 'Identity', [1, 2, 2], {}],
@@ -377,7 +487,7 @@ function typedShapeCopyGraph(dtype) {
 }
 
 function reductionGraph(opType, inputKey) {
-  const graph = new Graph();
+  const graph = new RuntimeGraph();
   const values = graph.addInput('values', [2, 2, 4]);
   const { out } = graph.addOp(opType, { [inputKey]: values }, {
     out: { name: 'out', shape: [2, 2] },
@@ -387,7 +497,7 @@ function reductionGraph(opType, inputKey) {
 }
 
 function padGraph(inputKey) {
-  const graph = new Graph();
+  const graph = new RuntimeGraph();
   const values = graph.addInput('values', [1, 2, 2, 1]);
   const { out } = graph.addOp('Pad', { [inputKey]: values }, {
     out: { name: 'out', shape: [1, 3, 4, 1] },
@@ -397,7 +507,7 @@ function padGraph(inputKey) {
 }
 
 function averagePoolGraph(opType, inputKey) {
-  const graph = new Graph();
+  const graph = new RuntimeGraph();
   const values = graph.addInput('values', [1, 3, 3, 1]);
   const { out } = graph.addOp(opType, { [inputKey]: values }, {
     out: { name: 'out', shape: [1, 2, 2, 1] },
@@ -407,7 +517,7 @@ function averagePoolGraph(opType, inputKey) {
 }
 
 function transposeGraph() {
-  const graph = new Graph();
+  const graph = new RuntimeGraph();
   const input = graph.addInput('input', [2, 3, 2]);
   const { out } = graph.addOp('Transpose', { input }, {
     out: { name: 'out', shape: [2, 2, 3] },
@@ -417,7 +527,7 @@ function transposeGraph() {
 }
 
 function concatGraph(opType, params = {}) {
-  const graph = new Graph();
+  const graph = new RuntimeGraph();
   const a = graph.addInput('a', [2, 1, 2]);
   const b = graph.addInput('b', [2, 2, 2]);
   const inputs = opType === 'Concat2' ? { a, b } : {
@@ -434,7 +544,7 @@ function concatGraph(opType, params = {}) {
 }
 
 function splitGraph() {
-  const graph = new Graph();
+  const graph = new RuntimeGraph();
   const input = graph.addInput('input', [2, 6, 2]);
   const outputs = graph.addNode({
     opType: 'Split',
@@ -451,7 +561,7 @@ function splitGraph() {
 }
 
 function splitMixedCaseGraph() {
-  const graph = new Graph();
+  const graph = new RuntimeGraph();
   const input = graph.addInput('input', [1, 4]);
   const outputs = graph.addNode({
     opType: 'Split',
@@ -467,7 +577,7 @@ function splitMixedCaseGraph() {
 }
 
 function splitManyOutputsGraph() {
-  const graph = new Graph();
+  const graph = new RuntimeGraph();
   const input = graph.addInput('input', [2, 12]);
   const outputSpecs = {};
   for (let index = 0; index < 12; index++) {
@@ -497,7 +607,7 @@ function assertManySplitOutputs(results, label) {
 }
 
 function expandGraph(opType) {
-  const graph = new Graph();
+  const graph = new RuntimeGraph();
   const input = graph.addInput('input', [1, 3]);
   const { out } = graph.addOp(opType, { input }, {
     out: { name: 'out', shape: [2, 4, 3] },
@@ -533,6 +643,65 @@ test('ordinary forward WASM implements every supported row with direct kernels',
       });
     });
 
+    await t.test('Conv1D and ConvTranspose2D match CPU on their image layouts', async () => {
+      // Conv1D is NLC + WIO and ConvTranspose2D is NHWC + HWIO; the C kernels
+      // index those directly, so a layout slip here shows up as a value
+      // mismatch against the CPU reference rather than a shape error.
+      for (const spec of CONV1D_SPECS) {
+        await assertWasmParity(
+          wasm, `Conv1D ${spec.label}`, () => conv1DGraph(spec), conv1DInputs(spec),
+        );
+      }
+      for (const spec of CONV_TRANSPOSE_SPECS) {
+        await assertWasmParity(
+          wasm, `ConvTranspose2D ${spec.label}`,
+          () => convTranspose2DGraph(spec), convTranspose2DInputs(spec),
+        );
+      }
+    });
+
+    await t.test('F32 pooling honors canonical pads and every batch', async () => {
+      const maxPoolCases = [
+        {
+          label: 'batched asymmetric pads', batch: 2, inputHeight: 2, inputWidth: 3,
+          channels: 1, kernel: [2, 2], stride: [1, 1], pads: [1, 0, 0, 1],
+        },
+        {
+          label: 'image-model same pads', batch: 1, inputHeight: 3, inputWidth: 3,
+          channels: 2, kernel: [3, 3], stride: [2, 2], pads: [1, 1, 1, 1],
+        },
+      ];
+      for (const spec of maxPoolCases) {
+        await assertWasmParity(
+          wasm, `MaxPool2D ${spec.label}`,
+          () => pool2DGraph('MaxPool2D', spec), pool2DInputs(spec),
+        );
+      }
+
+      const averagePool = {
+        label: 'batched symmetric pads', batch: 2, inputHeight: 3, inputWidth: 4,
+        channels: 2, kernel: [3, 3], stride: [2, 2], pads: [1, 1, 1, 1],
+      };
+      await assertWasmParity(
+        wasm, `AveragePool2D ${averagePool.label}`,
+        () => pool2DGraph('AveragePool2D', averagePool), pool2DInputs(averagePool),
+      );
+
+      const wrongOutput = pool2DGraph(
+        'MaxPool2D', maxPoolCases[1], [1, 3, 2, 2],
+      );
+      assert.throws(
+        () => wasm.compile(wrongOutput),
+        /output shape is incompatible with its canonical descriptor/,
+      );
+      const malformedPads = pool2DGraph('MaxPool2D', maxPoolCases[1]);
+      malformedPads.nodes[0].params.pads = [1, 1, 1];
+      assert.throws(
+        () => wasm.compile(malformedPads),
+        /pads must contain non-negative top, left, bottom, and right safe integers/,
+      );
+    });
+
     await t.test('Linear and Gemm use canonical F32 and quantized C paths', async () => {
       const inputs = { input: Float32Array.of(1, -2, 3, -4, 5, -6) };
       await assertWasmParity(wasm, 'Linear', () => linearGraph('Linear'), inputs);
@@ -563,11 +732,20 @@ test('ordinary forward WASM implements every supported row with direct kernels',
       assertResultsClose(packedAgain, packedExpected, 'packed shared odd-tail Linear repeat');
       assert.equal([...wasm.f32PackedWeights.values()][0].pointer, packedPointers[0],
         'repeat execution does not repack immutable weights');
+      // The WASM tile is four rows by an eight-wide panel, measured rather than
+      // assumed: six rows costs throughput on every blocked shape here because
+      // twelve v128 accumulators plus operands start spilling. kc follows from
+      // the deterministic 32 KiB L1 assumption, since browsers report no cache
+      // topology. These are pinned because a silent change to any of them is a
+      // change to the packed weight layout every microkernel walks.
       assert.equal(wasm.api.gemm_f32_tile_mr(), 4);
       assert.equal(wasm.api.gemm_f32_tile_nr(), 8);
       assert.equal(wasm.api.gemm_f32_tile_kc(), 496);
       assert.equal(wasm.api.gemm_f32_cache_budget_bytes(), 24576);
       assert.equal(wasm.api.gemm_f32_working_set_bytes(), 23936);
+      assert.ok(
+        wasm.api.gemm_f32_working_set_bytes() <= wasm.api.gemm_f32_cache_budget_bytes(),
+        'the tile must fit the cache budget it was derived from');
       const quantizedInputs = { input: Float32Array.of(1, 2, 3) };
       await assertWasmParity(wasm, 'odd-width quantized Linear', () => quantizedOddWidthLinearGraph('Linear'), quantizedInputs);
       await assertWasmParity(wasm, 'odd-width quantized Gemm', () => quantizedOddWidthLinearGraph('Gemm'), quantizedInputs);
@@ -657,6 +835,11 @@ test('ordinary forward WASM implements every supported row with direct kernels',
       };
       await assertWasmParity(wasm, 'Softmax', () => softmaxGraph('Softmax'), inputs);
       await assertWasmParity(wasm, 'LogSoftmax', () => softmaxGraph('LogSoftmax'), inputs);
+      await assertWasmParity(wasm, 'Softmax SIMD128 rows',
+        () => softmaxGraph('Softmax', 19), {
+          input: Float32Array.from({ length: 76 }, (_, index) =>
+            index % 19 === 0 ? -80 : (index % 13) * 0.375 - 2.0),
+        });
     });
 
     await t.test('F32 and I32 shape-copy chains stay inside WASM', async () => {

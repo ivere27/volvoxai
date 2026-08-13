@@ -546,8 +546,13 @@ int cuda_graph_embedding_f32(const int32_t* tokens, const float* weight,
                           sizeof(float), &weight_bytes) ||
         !size_product_u32((uint32_t)token_count, (uint32_t)width,
                           sizeof(float), &output_bytes)) return 0;
-    for (int i = 0; i < token_count; i++)
-        if (tokens[i] < 0 || tokens[i] >= vocab_size) return 0;
+    /* Public bounded-GPU execution proves every producer chain at compile
+     * time and preflights public IDs before committing a run. Device-produced
+     * IDs can therefore have a deliberately stale host mirror here. Raw
+     * private-engine callers keep the legacy host validation below. */
+    if (!vx_engine_state_current()->bounded_gpu_value_domain_proven)
+        for (int i = 0; i < token_count; i++)
+            if (tokens[i] < 0 || tokens[i] >= vocab_size) return 0;
     count = (uint32_t)token_count;
     row_width = (uint32_t)width;
     if (!graph_ensure_input_view(tokens,

@@ -1,13 +1,19 @@
 import { Tensor } from './Tensor.js';
 import { runtimeIdentity } from './Identity.js';
 import { VolvoxAIError } from './RuntimeErrors.js';
-import type { ModelOutputDescriptor } from './ModelSnapshot.js';
+import type { ResolvedTensorDescriptor } from './ResolvedShapePlan.js';
 import type { RuntimeDType, RuntimeTypedArray } from '../types.js';
 import { memoryLocations, runtimeDTypes } from '../generated/volvoxaiEnums.js';
 import type { MemoryLocationValue } from '../generated/volvoxaiEnums.js';
+import {
+  DEVICE_TENSOR_REFERENCE_BRAND,
+  registerDeviceTensorReference,
+  type DeviceTensorReference,
+} from '../ops/deviceTensorReference.js';
 
 const RUNTIME_DTYPES = new Set<unknown>(runtimeDTypes);
 const MEMORY_LOCATIONS = new Set<unknown>(memoryLocations);
+const INTERNAL_RESULT_CONSTRUCTION_TOKEN = Symbol('volvoxai.internal-result-construction');
 
 interface BackendTensorSnapshotBase {
   readonly name: string;
@@ -17,12 +23,20 @@ interface BackendTensorSnapshotBase {
 
 export interface BackendHostTensorSnapshot extends BackendTensorSnapshotBase {
   readonly location: 'host';
+  /** `transfer` hands exact storage to the result; `borrowed` is cloned once. */
+  readonly ownership: 'transfer' | 'borrowed';
   readonly data: RuntimeTypedArray;
 }
 
 export interface BackendDeviceTensorSnapshot extends BackendTensorSnapshotBase {
   readonly location: 'device';
+  /** Exact logical bytes; deviceBuffer may include only mandatory API alignment padding. */
+  readonly logicalSizeBytes: number;
   readonly deviceBuffer: GPUBuffer;
+  /** Present only when this snapshot can be handed to the built-in WebGPU provider. */
+  readonly deviceType?: 'webgpu';
+  /** Exact physical owner used for same-device input validation. */
+  readonly device?: GPUDevice;
   read(): Promise<RuntimeTypedArray>;
   release(): void;
 }
@@ -51,6 +65,13 @@ export interface ExecutionDecodeState {
   readonly cacheState: 'not-applicable' | 'seeded' | 'advanced';
   readonly cacheGeneration: number | null;
   readonly position: number | null;
+  readonly activeSequenceLength: number | null;
+  readonly kvCapacity: number | null;
+  readonly kvCapacityClass: number | null;
+  readonly semanticSeedSignature: string | null;
+  readonly automaticReset: boolean;
+  readonly automaticResetReason: string | null;
+  readonly automaticResetCount: number;
 }
 
 /** @internal Release an unclaimed provider snapshot after validation or construction fails. */
@@ -80,8 +101,13 @@ export interface ExecutionReport {
   readonly topologyRevision: number;
   readonly weightRevision: number;
   readonly weightRevisionId: string;
+  readonly shapeSignature: string;
   readonly adapterRevisionId: string | null;
   readonly adapterRevisionIds: readonly (string | null)[];
+  /** Complete logical graph binding only; excludes provider specialization and dispatch. */
+  readonly shapeBindTimeMs: number;
+  /** Provider call including any cold specialization, dispatch, and result snapshot staging. */
+  readonly providerTimeMs: number;
   readonly executionTimeMs: number;
   readonly routeEvidence: ExecutionRouteEvidence;
   readonly decodeState: ExecutionDecodeState;
@@ -183,6 +209,16 @@ function expectedBytes(snapshot: BackendTensorSnapshot): number {
   return bytes;
 }
 
+function alignedDeviceBytes(logicalBytes: number, name: string): number {
+  if (logicalBytes > Number.MAX_SAFE_INTEGER - 3) {
+    throw new VolvoxAIError('EXECUTION_FAILED',
+      `Result tensor '${name}' cannot be aligned safely for device storage.`, {
+        phase: 'execution',
+      });
+  }
+  return Math.ceil(logicalBytes / 4) * 4;
+}
+
 function validateSnapshotOutput(value: unknown): BackendTensorSnapshot {
   const output = value as Partial<BackendTensorSnapshot> | null;
   if (!output || typeof output !== 'object' ||
@@ -196,7 +232,8 @@ function validateSnapshotOutput(value: unknown): BackendTensorSnapshot {
   }
   expectedBytes(output as BackendTensorSnapshot);
   if (output.location === 'host') {
-    if (!ArrayBuffer.isView(output.data) || output.data instanceof DataView) {
+    if ((output.ownership !== 'transfer' && output.ownership !== 'borrowed') ||
+        !ArrayBuffer.isView(output.data) || output.data instanceof DataView) {
       throw new VolvoxAIError('EXECUTION_FAILED',
         `Host result tensor '${output.name}' has no typed-array data.`, {
           phase: 'execution',
@@ -205,9 +242,20 @@ function validateSnapshotOutput(value: unknown): BackendTensorSnapshot {
   } else {
     const deviceOutput = output as Partial<BackendDeviceTensorSnapshot>;
     if (!deviceOutput.deviceBuffer || typeof deviceOutput.deviceBuffer.size !== 'number' ||
+        !Number.isSafeInteger(deviceOutput.logicalSizeBytes) ||
         typeof deviceOutput.read !== 'function' || typeof deviceOutput.release !== 'function') {
       throw new VolvoxAIError('EXECUTION_FAILED',
         `Device result tensor '${output.name}' has an invalid ownership contract.`, {
+          phase: 'execution',
+        });
+    }
+    const hasDeviceType = Object.prototype.hasOwnProperty.call(deviceOutput, 'deviceType');
+    const hasDevice = Object.prototype.hasOwnProperty.call(deviceOutput, 'device');
+    if (hasDeviceType !== hasDevice ||
+        (hasDeviceType && (deviceOutput.deviceType !== 'webgpu' ||
+          !deviceOutput.device || typeof deviceOutput.device !== 'object'))) {
+      throw new VolvoxAIError('EXECUTION_FAILED',
+        `Device result tensor '${output.name}' has invalid handoff ownership metadata.`, {
           phase: 'execution',
         });
     }
@@ -219,14 +267,21 @@ function assertHostSnapshot(snapshot: BackendHostTensorSnapshot): RuntimeTypedAr
   const sizeBytes = expectedBytes(snapshot);
   Tensor.assertCompatibleBuffer(snapshot.dtype, snapshot.data, sizeBytes,
     `Result tensor '${snapshot.name}'`);
-  return snapshot.data;
+  // The built-in CPU has already created an exact owned clone and transfers
+  // it without a second full-output copy. External providers may retain their
+  // storage by declaring it borrowed, in which case the result snapshots once.
+  return snapshot.ownership === 'transfer'
+    ? snapshot.data
+    : cloneRuntimeArray(snapshot.data);
 }
 
-export class TensorResult {
+export class TensorResult implements DeviceTensorReference {
+  readonly [DEVICE_TENSOR_REFERENCE_BRAND] = true as const;
   readonly name: string;
   readonly shape: readonly number[];
   readonly dtype: RuntimeDType;
   readonly location: MemoryLocationValue;
+  readonly logicalSizeBytes: number;
   readonly deviceBuffer?: GPUBuffer;
   #data: RuntimeTypedArray | null;
   readonly #deviceRead: (() => Promise<RuntimeTypedArray>) | null;
@@ -234,23 +289,84 @@ export class TensorResult {
   readonly #isDisposed: () => boolean;
   #tail: Promise<void> = Promise.resolve();
   #released = false;
+  #deviceInputLeases = 0;
+  #deviceInputDrain: Promise<void> | null = null;
+  #resolveDeviceInputDrain: (() => void) | null = null;
 
-  constructor(snapshot: BackendTensorSnapshot, isDisposed: () => boolean) {
+  constructor(
+    snapshot: BackendTensorSnapshot,
+    isDisposed: () => boolean,
+    constructionToken?: symbol,
+  ) {
     this.name = snapshot.name;
     this.shape = Object.freeze([...snapshot.shape]);
     this.dtype = snapshot.dtype;
     this.location = snapshot.location;
-    if (snapshot.location === 'device' && snapshot.deviceBuffer.size < expectedBytes(snapshot)) {
+    const logicalBytes = expectedBytes(snapshot);
+    this.logicalSizeBytes = logicalBytes;
+    if (snapshot.location === 'device' &&
+        (snapshot.logicalSizeBytes !== logicalBytes ||
+          snapshot.deviceBuffer.size !== alignedDeviceBytes(logicalBytes, snapshot.name))) {
       throw new VolvoxAIError('EXECUTION_FAILED',
-        `Device result tensor '${snapshot.name}' is smaller than its declared shape.`, {
+        `Device result tensor '${snapshot.name}' must expose its exact logical length with only required alignment padding.`, {
           phase: 'execution',
         });
     }
     this.#data = snapshot.location === 'host' ? assertHostSnapshot(snapshot) : null;
     this.#deviceRead = snapshot.location === 'device' ? snapshot.read.bind(snapshot) : null;
     this.#release = snapshot.location === 'device' ? snapshot.release.bind(snapshot) : null;
-    if (snapshot.location === 'device') this.deviceBuffer = snapshot.deviceBuffer;
+    if (snapshot.location === 'device') {
+      this.deviceBuffer = snapshot.deviceBuffer;
+      // TensorResult is a public runtime value for compatibility, but only a
+      // result constructed by the runtime may issue an opaque device input.
+      // A caller-created result still owns/readbacks its supplied snapshot; it
+      // cannot mint a registry entry for an arbitrary raw GPUBuffer.
+      if (constructionToken === INTERNAL_RESULT_CONSTRUCTION_TOKEN &&
+          snapshot.deviceType === 'webgpu' && snapshot.device) {
+        registerDeviceTensorReference(this, {
+          kind: 'webgpu',
+          owner: snapshot.device,
+          resource: snapshot.deviceBuffer,
+          dtype: snapshot.dtype,
+          shape: this.shape,
+          logicalSizeBytes: logicalBytes,
+          acquire: () => this.#acquireDeviceInputLease(),
+        });
+      }
+    }
     this.#isDisposed = isDisposed;
+  }
+
+  #acquireDeviceInputLease(): () => void {
+    if (this.#isDisposed() || this.#released) {
+      throw new VolvoxAIError('RESULT_DISPOSED',
+        `Result tensor '${this.name}' is disposed and cannot be used as device input.`, {
+          phase: 'execution',
+        });
+    }
+    this.#deviceInputLeases++;
+    let released = false;
+    return () => {
+      if (released) return;
+      released = true;
+      this.#deviceInputLeases--;
+      if (this.#deviceInputLeases === 0 && this.#resolveDeviceInputDrain) {
+        const resolve = this.#resolveDeviceInputDrain;
+        this.#resolveDeviceInputDrain = null;
+        this.#deviceInputDrain = null;
+        resolve();
+      }
+    };
+  }
+
+  #drainDeviceInputLeases(): Promise<void> {
+    if (this.#deviceInputLeases === 0) return Promise.resolve();
+    if (!this.#deviceInputDrain) {
+      this.#deviceInputDrain = new Promise((resolve) => {
+        this.#resolveDeviceInputDrain = resolve;
+      });
+    }
+    return this.#deviceInputDrain;
   }
 
   read(): Promise<RuntimeTypedArray> {
@@ -270,6 +386,7 @@ export class TensorResult {
         shape: this.shape,
         dtype: this.dtype,
         location: 'host',
+        ownership: 'transfer',
         data,
       }), `Result tensor '${this.name}' readback`);
       return cloneRuntimeArray(data);
@@ -282,6 +399,7 @@ export class TensorResult {
   /** @internal Drain accepted reads before releasing result-owned storage. */
   async _close(): Promise<void> {
     await this.#tail;
+    await this.#drainDeviceInputLeases();
     if (this.#released) return;
     this.#released = true;
     this.#data = null;
@@ -326,7 +444,8 @@ export class ExecutionResult {
     backend: string,
     snapshot: BackendExecutionSnapshot,
     report: ExecutionReport,
-    expectedOutputs: readonly ModelOutputDescriptor[],
+    expectedOutputs: readonly ResolvedTensorDescriptor[],
+    constructionToken?: symbol,
   ) {
     this.backend = backend;
     this.report = Object.freeze({ ...report });
@@ -365,8 +484,15 @@ export class ExecutionResult {
       }
     }
     const outputs = new Map<string, TensorResult>();
-    for (const tensor of validated) {
-      outputs.set(tensor.name, new TensorResult(tensor, () => this.#state !== 'open'));
+    for (const expected of expectedOutputs) {
+      const tensor = outputsByName.get(expected.name)!;
+      outputs.set(tensor.name, new TensorResult(
+        tensor,
+        () => this.#state !== 'open',
+        constructionToken === INTERNAL_RESULT_CONSTRUCTION_TOKEN
+          ? INTERNAL_RESULT_CONSTRUCTION_TOKEN
+          : undefined,
+      ));
     }
     this.#ownedOutputs = outputs;
     this.outputs = new ResultOutputMap(outputs);
@@ -408,4 +534,20 @@ export class ExecutionResult {
   dispose(): Promise<void> {
     return this.close();
   }
+}
+
+/** @internal Construct the only ExecutionResult allowed to issue device inputs. */
+export function createExecutionResult(
+  backend: string,
+  snapshot: BackendExecutionSnapshot,
+  report: ExecutionReport,
+  expectedOutputs: readonly ResolvedTensorDescriptor[],
+): ExecutionResult {
+  return new ExecutionResult(
+    backend,
+    snapshot,
+    report,
+    expectedOutputs,
+    INTERNAL_RESULT_CONSTRUCTION_TOKEN,
+  );
 }

@@ -1,22 +1,43 @@
 /*
- * Browser/native-JS host session for the typed TinyReceipt split-ONNX package.
+ * Browser/native-JS host session for the typed TinyReceipt explicit-KV package.
  *
- * The encoder runs once. On WASM, the decoder seeds its fixed [1,192] graph
- * and then executes one retained row at prefixLength - 1; other backends keep
- * ordinary fixed-length forwards unless the caller explicitly requires row
- * decode. Optimized packages expose in-graph QArgMax token IDs;
- * source-preserving packages expose logits and use the same first-index greedy
- * policy on the host.
+ * The encoder binds the exact active question extent Q and produces M=Q+210
+ * memory rows. The decoder executes one token at a time with explicit
+ * cross-attention and per-layer self-attention K/V tensors, starting from a
+ * blocked, all-zero P=1 sentinel because Volvox graphs require positive
+ * dynamic extents. It exposes current-token logits and uses first-index greedy
+ * selection on the host.
  */
 
-import {
-  TinyReceiptCharVocab,
-  preprocessTinyReceiptImage,
-} from './TinyReceiptW8A8Session.js';
+import { preprocessTinyReceiptImage } from './TinyReceiptInput.js';
 
-const PACKAGE_FORMAT = 'volvoxai-tiny-receipt-vqa-split-onnx-package-v1';
+const KV_PACKAGE_FORMAT = 'volvoxai-tiny-receipt-vqa-split-kv-onnx-package-v1';
 const BPE_VOCAB_SIZE = 1536;
-const DECODE_POLICIES = new Set(['auto', 'required', 'ordinary']);
+const IMAGE_TOKENS = 210;
+const MAX_Q = 192;
+const MAX_T = 192;
+const CACHE_LAYERS = 4;
+const CACHE_HEADS = 8;
+const CACHE_HEAD_WIDTH = 40;
+const CACHE_SEED_FORMAT = 'masked-zero-sentinel-v1';
+const KV_TRANSFER_MODES = Object.freeze([
+  'host-validated',
+  'device-resident',
+  'device-qualified',
+]);
+const CACHE_INPUT_KEYS = Object.freeze([
+  ...[...Array(CACHE_LAYERS).keys()].flatMap((layer) => [
+    `cross_k_${layer}`, `cross_v_${layer}`,
+  ]),
+  ...[...Array(CACHE_LAYERS).keys()].flatMap((layer) => [
+    `past_k_${layer}`, `past_v_${layer}`,
+  ]),
+]);
+const CACHE_OUTPUT_KEYS = Object.freeze([
+  ...[...Array(CACHE_LAYERS).keys()].flatMap((layer) => [
+    `present_k_${layer}`, `present_v_${layer}`,
+  ]),
+]);
 const FAMILY_ORDER = Object.freeze([
   'phone', 'address', 'store', 'item_row', 'item_math', 'item_lookup', 'math', 'other',
 ]);
@@ -43,6 +64,19 @@ function fail(message) {
   throw new Error(`[TinyReceiptSplitSession] ${message}`);
 }
 
+async function closeResources(resources) {
+  const errors = [];
+  for (const resource of resources) {
+    if (!resource || typeof resource.close !== 'function') continue;
+    try {
+      await resource.close();
+    } catch (error) {
+      errors.push(error);
+    }
+  }
+  return errors;
+}
+
 function isRecord(value) {
   return !!value && typeof value === 'object' && !Array.isArray(value);
 }
@@ -60,6 +94,145 @@ function nonEmptyString(value, label) {
 function integer(value, label) {
   if (!Number.isInteger(value)) fail(`${label} must be an integer.`);
   return value;
+}
+
+function dimension(value, name, minimum, maximum, label) {
+  if (!isRecord(value) || value.min !== minimum || value.max !== maximum ||
+      (value.multiple_of != null && value.multiple_of !== 1)) {
+    fail(`${label}.${name} must be bounded to [${minimum},${maximum}].`);
+  }
+  return Object.freeze({ min: minimum, max: maximum });
+}
+
+function normalizeKVShapeContract(value) {
+  exactRecordKeys(value, [
+    'graph_shape_mode', 'dimensions', 'fixed_geometry', 'relations', 'semantic_inputs',
+  ], 'shape_contract');
+  if (!isRecord(value) || value.graph_shape_mode !== 'bounded-explicit-kv-v1') {
+    fail('KV shape_contract must use bounded-explicit-kv-v1.');
+  }
+  exactRecordKeys(value.dimensions, ['B', 'Q', 'M', 'P', 'R'], 'shape_contract.dimensions');
+  const dimensions = Object.freeze({
+    B: dimension(value.dimensions.B, 'B', 1, 1, 'shape_contract.dimensions'),
+    Q: dimension(value.dimensions.Q, 'Q', 1, MAX_Q, 'shape_contract.dimensions'),
+    M: dimension(
+      value.dimensions.M,
+      'M',
+      IMAGE_TOKENS + 1,
+      IMAGE_TOKENS + MAX_Q,
+      'shape_contract.dimensions',
+    ),
+    // Volvox bounded shapes stay positive. P=1 is the manifest-declared
+    // masked sentinel used to adapt the producer's empty P=0 seed.
+    P: dimension(value.dimensions.P, 'P', 1, MAX_T - 1, 'shape_contract.dimensions'),
+    R: dimension(value.dimensions.R, 'R', 2, MAX_T, 'shape_contract.dimensions'),
+  });
+  if (!isRecord(value.fixed_geometry) ||
+      !sameShape(value.fixed_geometry.image, [1, 1, 320, 672]) ||
+      value.fixed_geometry.image_tokens !== IMAGE_TOKENS ||
+      value.fixed_geometry.feature_width !== 320 ||
+      value.fixed_geometry.attention_heads !== CACHE_HEADS ||
+      value.fixed_geometry.attention_head_width !== CACHE_HEAD_WIDTH ||
+      value.fixed_geometry.decoder_layers !== CACHE_LAYERS ||
+      value.fixed_geometry.adapter_families !== 8) {
+    fail('KV shape_contract.fixed_geometry is not the TinyReceipt v1 geometry.');
+  }
+  if (!isRecord(value.relations?.encoder_memory) ||
+      value.relations.encoder_memory.operator !== 'Concat' ||
+      value.relations.encoder_memory.fixed_image_tokens !== IMAGE_TOKENS ||
+      value.relations.encoder_memory.dynamic_question_dimension !== 'Q' ||
+      value.relations.encoder_memory.derived_memory_dimension !== 'M' ||
+      !isRecord(value.relations?.present_cache) ||
+      value.relations.present_cache.operator !== 'Concat' ||
+      value.relations.present_cache.past_dimension !== 'P' ||
+      value.relations.present_cache.fixed_current_tokens !== 1 ||
+      value.relations.present_cache.derived_present_dimension !== 'R') {
+    fail('KV shape_contract must prove M=Q+210 and R=P+1 with canonical Concat witnesses.');
+  }
+  const semanticInputs = value.semantic_inputs;
+  exactRecordKeys(
+    semanticInputs,
+    ['question_position_ids'],
+    'shape_contract.semantic_inputs',
+  );
+  if (!sameShape(semanticInputs.question_position_ids?.shape, ['B', 'Q']) ||
+      semanticInputs.question_position_ids?.values !== 'zero_based_contiguous') {
+    fail('KV question_position_ids must use the canonical [B,Q] ABI.');
+  }
+  return Object.freeze({ dimensions });
+}
+
+function normalizeKVCacheContract(value, maskSemantics) {
+  exactRecordKeys(value, [
+    'format', 'layers', 'heads', 'head_width', 'past_dimension', 'present_dimension',
+    'initial_past_length', 'sentinel_mask_value', 'cache_dtype',
+  ], 'cache_contract');
+  if (value.format !== CACHE_SEED_FORMAT || value.layers !== CACHE_LAYERS ||
+      value.heads !== CACHE_HEADS || value.head_width !== CACHE_HEAD_WIDTH ||
+      value.past_dimension !== 'P' || value.present_dimension !== 'R' ||
+      value.initial_past_length !== 1 || value.cache_dtype !== 'float32' ||
+      !Number.isInteger(value.sentinel_mask_value) ||
+      ![0, 1].includes(value.sentinel_mask_value)) {
+    fail('cache_contract is not the qualified positive-shape sentinel ABI.');
+  }
+  const expected = 1;
+  if (maskSemantics !== 'nonzero_means_blocked' ||
+      value.sentinel_mask_value !== expected) {
+    fail('cache_contract sentinel value does not match past_padding_mask semantics.');
+  }
+  return Object.freeze({
+    mode: 'explicit-kv',
+    format: value.format,
+    layers: CACHE_LAYERS,
+    heads: CACHE_HEADS,
+    headWidth: CACHE_HEAD_WIDTH,
+    initialPastLength: 1,
+    sentinelMaskValue: expected,
+  });
+}
+
+function shaped(data, shape, label) {
+  if (!ArrayBuffer.isView(data) || data instanceof DataView) {
+    fail(`${label} data must be a runtime typed array.`);
+  }
+  let elements = 1;
+  for (const [axis, extent] of shape.entries()) {
+    if (!Number.isSafeInteger(extent) || extent <= 0 ||
+        !Number.isSafeInteger(elements * extent)) {
+      fail(`${label} shape axis ${axis} is invalid.`);
+    }
+    elements *= extent;
+  }
+  if (data.length !== elements) {
+    fail(`${label} data length ${data.length} does not match [${shape.join(',')}].`);
+  }
+  return Object.freeze({ data, shape: Object.freeze([...shape]) });
+}
+
+function deviceShaped(data, shape, label) {
+  if (!isRecord(data) || data.location !== 'device' || data.dtype !== 'float32' ||
+      !sameShape(data.shape, shape) || typeof data.read !== 'function') {
+    fail(`${label} must be a live device F32 result with shape [${shape.join(',')}].`);
+  }
+  return Object.freeze({ data, shape: Object.freeze([...shape]) });
+}
+
+function monotonicMilliseconds() {
+  return globalThis.performance?.now?.() ?? Date.now();
+}
+
+function normalizeKVTransferMode(value) {
+  const mode = value ?? KV_TRANSFER_MODES[0];
+  if (!KV_TRANSFER_MODES.includes(mode)) {
+    fail(`kvTransferMode must be one of ${KV_TRANSFER_MODES.join(', ')}.`);
+  }
+  return mode;
+}
+
+function activePositionIds(length) {
+  const result = new Int32Array(length);
+  for (let index = 0; index < length; index++) result[index] = index;
+  return result;
 }
 
 function assetPath(value, label) {
@@ -446,121 +619,44 @@ function normalizeTokenIds(value, label) {
 }
 
 function normalizeTokenizer(value) {
-  if (!isRecord(value) || value.version !== 1) {
-    fail('tokenizer must declare a supported version 1 contract.');
+  exactRecordKeys(value, [
+    'type', 'version', 'vocab_size', 'normalization', 'tokenizer_hash',
+    'itos_key', 'merges_key', 'token_ids',
+  ], 'tokenizer');
+  if (value.type !== 'byte_fallback_bpe' || value.version !== 1 ||
+      value.vocab_size !== BPE_VOCAB_SIZE || value.normalization !== 'NFC' ||
+      typeof value.tokenizer_hash !== 'string' ||
+      !/^[0-9a-f]{64}$/.test(value.tokenizer_hash) ||
+      value.itos_key !== 'itos' || value.merges_key !== 'merges' ||
+      !isRecord(value.token_ids)) {
+    fail('tokenizer must be the canonical byte_fallback_bpe v1 1536-token NFC contract.');
   }
-  if (value.type === 'char-vocab') {
-    if (value.itos_key !== 'itos') fail("char-vocab tokenizer itos_key must be 'itos'.");
-    return Object.freeze({
-      type: value.type,
-      version: value.version,
-      itosKey: 'itos',
-      mergesKey: null,
-      vocabSize: null,
-      normalization: null,
-      tokenizerHash: null,
-      tokenIds: normalizeTokenIds(value.token_ids, 'tokenizer.token_ids'),
-    });
-  }
-  if (value.type === 'byte_fallback_bpe') {
-    exactRecordKeys(value, [
-      'type', 'version', 'vocab_size', 'normalization', 'tokenizer_hash',
-      'itos_key', 'merges_key', 'token_ids',
-    ], 'tokenizer');
-    if (value.vocab_size !== BPE_VOCAB_SIZE ||
-        value.normalization !== 'NFC' ||
-        typeof value.tokenizer_hash !== 'string' ||
-        !/^[0-9a-f]{64}$/.test(value.tokenizer_hash) ||
-        value.itos_key !== 'itos' || value.merges_key !== 'merges' ||
-        !isRecord(value.token_ids)) {
-      fail('byte_fallback_bpe tokenizer must declare vocab_size, NFC, and tokenizer_hash.');
-    }
-    return Object.freeze({
-      type: value.type,
-      version: value.version,
-      itosKey: 'itos',
-      mergesKey: 'merges',
-      vocabSize: value.vocab_size,
-      normalization: value.normalization,
-      tokenizerHash: value.tokenizer_hash,
-      tokenIds: normalizeTokenIds(value.token_ids, 'tokenizer.token_ids'),
-    });
-  }
-  fail("tokenizer.type must be 'char-vocab' or 'byte_fallback_bpe'.");
+  return Object.freeze({
+    type: value.type,
+    version: value.version,
+    itosKey: 'itos',
+    mergesKey: 'merges',
+    vocabSize: value.vocab_size,
+    normalization: value.normalization,
+    tokenizerHash: value.tokenizer_hash,
+    tokenIds: normalizeTokenIds(value.token_ids, 'tokenizer.token_ids'),
+  });
 }
 
-function normalizeGeneration(value, tokenIds, decoderGraph) {
-  if (!isRecord(value) || value.strategy !== 'greedy-autoregressive' ||
-      value.decoder_input_length !== 192 || value.maximum_new_tokens !== 191 ||
+function normalizeKVGeneration(value, tokenIds) {
+  if (!isRecord(value) || value.strategy !== 'greedy-autoregressive-explicit-kv' ||
+      value.maximum_target_length !== MAX_T ||
+      value.maximum_new_tokens !== MAX_T - 1 || value.logits_row !== 'current_token' ||
       value.tie_policy !== 'first-index' ||
       value.pad_token_id !== tokenIds.pad || value.bos_token_id !== tokenIds.bos ||
       value.eos_token_id !== tokenIds.eos) {
-    fail('generation must use the fixed-length first-index greedy contract.');
+    fail('KV generation must use one-token first-index greedy decoding.');
   }
-  const outputs = decoderGraph?.outputs;
-  if (isRecord(outputs) && Object.keys(outputs).length === 1 &&
-      typeof outputs.logits === 'string') {
-    if ((value.decoder_output != null && value.decoder_output !== 'logits') ||
-        value.logits_row !== 'prefix_length_minus_one') {
-      fail('logits decoder generation must select prefix_length_minus_one.');
-    }
-    return Object.freeze({ ...value, decoderOutput: 'logits', outputKeys: ['logits'] });
-  }
-  if (isRecord(outputs) && Object.keys(outputs).length === 1 &&
-      typeof outputs.token_ids === 'string') {
-    if (value.decoder_output !== 'token_ids' ||
-        value.token_ids_row !== 'prefix_length_minus_one') {
-      fail('token_ids decoder generation must select prefix_length_minus_one.');
-    }
-    return Object.freeze({ ...value, decoderOutput: 'token_ids', outputKeys: ['token_ids'] });
-  }
-  fail('decoder outputs must declare exactly logits or token_ids.');
-}
-
-function normalizeRouting(value, graphs) {
-  const coreEncoder = ['image', 'question_ids'];
-  const coreDecoder = ['decoder_input_ids', 'memory', 'memory_padding_mask'];
-  // Hoisting the causal keep mask is independent of whether the decoder
-  // publishes logits or in-graph token IDs. The manifest is authoritative.
-  if (isRecord(graphs?.decoder?.inputs) &&
-      Object.hasOwn(graphs.decoder.inputs, 'v4_keep')) {
-    coreDecoder.push('v4_keep');
-  }
-  if (!isRecord(value)) fail('package manifest requires explicit routing.');
-  if (value.mode === 'specialized') {
-    exactRecordKeys(value, ['mode', 'family_id'], 'routing');
-    const familyId = integer(value.family_id, 'routing.family_id');
-    if (familyId < 0 || familyId >= FAMILY_ORDER.length) {
-      fail('routing.family_id must be an ID from 0 through 7.');
-    }
-    exactRecordKeys(graphs?.encoder?.inputs, coreEncoder, 'graphs.encoder.inputs');
-    exactRecordKeys(graphs?.decoder?.inputs, coreDecoder, 'graphs.decoder.inputs');
-    return Object.freeze({
-      mode: 'specialized',
-      familyId,
-      encoder: coreEncoder,
-      decoder: coreDecoder,
-    });
-  }
-  if (value.mode === 'runtime') {
-    exactRecordKeys(value, ['mode', 'family_inputs'], 'routing');
-    exactRecordKeys(value.family_inputs, ['encoder', 'decoder'], 'routing.family_inputs');
-    const encoder = [...coreEncoder, 'family_ids'];
-    const decoder = [...coreDecoder, 'family_ids'];
-    exactRecordKeys(graphs?.encoder?.inputs, encoder, 'graphs.encoder.inputs');
-    exactRecordKeys(graphs?.decoder?.inputs, decoder, 'graphs.decoder.inputs');
-    for (const kind of ['encoder', 'decoder']) {
-      const declared = nonEmptyString(
-        value.family_inputs[kind],
-        `routing.family_inputs.${kind}`,
-      );
-      if (declared !== graphs[kind].inputs.family_ids) {
-        fail(`routing.family_inputs.${kind} must match graphs.${kind}.inputs.family_ids.`);
-      }
-    }
-    return Object.freeze({ mode: 'runtime', familyId: null, encoder, decoder });
-  }
-  fail("routing.mode must be 'specialized' or 'runtime'.");
+  return Object.freeze({
+    ...value,
+    decoderOutput: 'logits',
+    outputKeys: Object.freeze(['logits', 'present_padding_mask', ...CACHE_OUTPUT_KEYS]),
+  });
 }
 
 function normalizeGraph(value, manifestUrl, kind, inputKeys, outputKeys) {
@@ -578,6 +674,12 @@ function normalizeGraph(value, manifestUrl, kind, inputKeys, outputKeys) {
   for (const name of outputKeys) {
     outputs[name] = nonEmptyString(value.outputs[name], `graphs.${kind}.outputs.${name}`);
   }
+  if (new Set(Object.values(inputs)).size !== inputKeys.length) {
+    fail(`graphs.${kind}.inputs must map every semantic input to a distinct graph tensor.`);
+  }
+  if (new Set(Object.values(outputs)).size !== outputKeys.length) {
+    fail(`graphs.${kind}.outputs must map every semantic output to a distinct graph tensor.`);
+  }
   return Object.freeze({
     graphUrl: assetUrl(manifestUrl, graph),
     weightsUrl: assetUrl(manifestUrl, weights),
@@ -591,35 +693,56 @@ function normalizeGraph(value, manifestUrl, kind, inputKeys, outputKeys) {
 }
 
 function normalizeManifest(value, url) {
-  if (!isRecord(value) || value.format !== PACKAGE_FORMAT) {
-    fail(`package manifest must use format '${PACKAGE_FORMAT}'.`);
+  if (!isRecord(value) || value.format !== KV_PACKAGE_FORMAT) {
+    fail(`package manifest must use format '${KV_PACKAGE_FORMAT}'.`);
   }
   const tokenizer = normalizeTokenizer(value.tokenizer);
   const tokenIds = tokenizer.tokenIds;
-  if (!isRecord(value.assets)) fail('package manifest requires assets.');
+  if (!isRecord(value.assets)) fail('KV package manifest requires assets.');
+  if (!isRecord(value.graphs)) fail('KV package manifest requires encoder and decoder graphs.');
   const config = assetRecord(value.assets.config, 'assets.config');
   const vocab = assetRecord(value.assets.vocab, 'assets.vocab');
   const preprocessing = value.preprocessing;
   if (!isRecord(preprocessing) || preprocessing.layout !== 'NCHW' ||
       !sameShape(preprocessing.shape, [1, 1, 320, 672]) ||
       preprocessing.color !== 'grayscale') {
-    fail('preprocessing must be grayscale F32 NCHW [1,1,320,672].');
+    fail('KV preprocessing must be grayscale F32 NCHW [1,1,320,672].');
   }
   const families = value.families;
   if (!isRecord(families) || families.auto_id !== -1 ||
       !sameShape(families.ordered_names, FAMILY_ORDER) ||
       !isRecord(families.name_to_id) ||
       FAMILY_ORDER.some((name, index) => families.name_to_id[name] !== index)) {
-    fail('families must preserve the canonical eight-family order and AUTO=-1.');
+    fail('KV families must preserve the canonical eight-family order and AUTO=-1.');
   }
-  const generation = normalizeGeneration(value.generation, tokenIds, value.graphs?.decoder);
-  if (value.mask_semantics?.memory_padding_mask !== 'nonzero_means_blocked') {
-    fail('memory_padding_mask must declare nonzero_means_blocked.');
+  if (!isRecord(value.routing) || value.routing.mode !== 'runtime' ||
+      !isRecord(value.routing.family_inputs) ||
+      value.routing.family_inputs.encoder !== value.graphs?.encoder?.inputs?.family_ids ||
+      value.routing.family_inputs.decoder !== value.graphs?.decoder?.inputs?.family_ids) {
+    fail('KV routing must retain one explicit family_ids input on both graphs.');
   }
-  if (!isRecord(value.graphs)) fail('package manifest requires encoder and decoder graphs.');
-  const routing = normalizeRouting(value.routing, value.graphs);
+  const pastMaskSemantics = value.mask_semantics?.past_padding_mask;
+  if (value.mask_semantics?.memory_padding_mask !== 'nonzero_means_blocked' ||
+      pastMaskSemantics !== 'nonzero_means_blocked') {
+    fail('KV memory/past padding-mask semantics are not explicit.');
+  }
+  const generation = normalizeKVGeneration(value.generation, tokenIds);
+  const shapeContract = normalizeKVShapeContract(value.shape_contract);
+  const cache = normalizeKVCacheContract(value.cache_contract, pastMaskSemantics);
+  const encoderInputKeys = [
+    'image', 'question_ids', 'question_position_ids', 'family_ids',
+  ];
+  const encoderOutputKeys = [
+    'memory', 'memory_padding_mask', 'router_logits', 'selected_family_ids',
+    ...CACHE_INPUT_KEYS.filter((name) => name.startsWith('cross_')),
+  ];
+  const decoderInputKeys = [
+    'decoder_input_ids', 'position_ids', 'family_ids', 'memory_padding_mask',
+    'past_padding_mask', ...CACHE_INPUT_KEYS,
+  ];
   return Object.freeze({
     url,
+    format: KV_PACKAGE_FORMAT,
     configUrl: assetUrl(url, config),
     vocabUrl: assetUrl(url, vocab),
     tokenizer,
@@ -629,27 +752,29 @@ function normalizeManifest(value, url) {
       height: 320,
       shape: Object.freeze([1, 1, 320, 672]),
     }),
-    generation: Object.freeze({ ...generation }),
-    routing: Object.freeze({ mode: routing.mode, familyId: routing.familyId }),
+    generation,
+    shapeContract,
+    cache: Object.freeze({ ...cache, pastMaskSemantics }),
+    routing: Object.freeze({ mode: 'runtime', familyId: null }),
     encoder: normalizeGraph(
       value.graphs.encoder,
       url,
       'encoder',
-      routing.encoder,
-      ['memory', 'memory_padding_mask', 'router_logits', 'selected_family_ids'],
+      encoderInputKeys,
+      encoderOutputKeys,
     ),
     decoder: normalizeGraph(
       value.graphs.decoder,
       url,
       'decoder',
-      routing.decoder,
+      decoderInputKeys,
       generation.outputKeys,
     ),
   });
 }
 
 function graphTensor(graph, name, label) {
-  const tensor = graph?.getTensor?.(name) || graph?.tensors?.get?.(name);
+  const tensor = graph?.tensors?.[name];
   if (!tensor) fail(`${label} '${name}' is absent from its graph.`);
   return tensor;
 }
@@ -659,105 +784,218 @@ function requireTensor(graph, name, { shape, dtype, input = false, output = fals
   if (tensor.dtype !== dtype || tensor.quantization != null || !sameShape(tensor.shape, shape)) {
     fail(`${label} '${name}' must be unquantized ${dtype} [${shape.join(',')}].`);
   }
-  if (input && tensor.isInput !== true) fail(`${label} '${name}' must be a graph input.`);
-  if (output && (!Array.isArray(graph.outputNames) || !graph.outputNames.includes(name))) {
+  if (input && tensor.kind !== 'input') fail(`${label} '${name}' must be a graph input.`);
+  if (output && (!Array.isArray(graph.outputs) || !graph.outputs.includes(name))) {
     fail(`${label} '${name}' must be a declared graph output.`);
   }
   return tensor;
 }
 
 function requireExactGraphInterface(graph, inputNames, outputNames, label) {
-  const actualInputs = [...graph.tensors.values()]
-    .filter((tensor) => tensor.isInput === true)
-    .map((tensor) => tensor.name);
+  const actualInputs = Object.keys(graph.inputs || {});
   if (actualInputs.length !== inputNames.length ||
       inputNames.some((name) => !actualInputs.includes(name))) {
     fail(`${label} graph inputs must be exactly ${inputNames.join(', ')}.`);
   }
-  if (!Array.isArray(graph.outputNames) || graph.outputNames.length !== outputNames.length ||
-      outputNames.some((name) => !graph.outputNames.includes(name))) {
+  if (!Array.isArray(graph.outputs) || graph.outputs.length !== outputNames.length ||
+      outputNames.some((name) => !graph.outputs.includes(name))) {
     fail(`${label} graph outputs must be exactly ${outputNames.join(', ')}.`);
   }
 }
 
-function validateEncoderGraph(graph, definition) {
-  const inputNames = [definition.inputs.image, definition.inputs.question_ids];
-  if (definition.inputs.family_ids) inputNames.push(definition.inputs.family_ids);
-  requireExactGraphInterface(
-    graph,
-    inputNames,
-    [
-      definition.outputs.memory,
-      definition.outputs.memory_padding_mask,
-      definition.outputs.router_logits,
-      definition.outputs.selected_family_ids,
-    ],
-    'encoder',
+function requireGraphDimensions(graph, expected, label) {
+  const dimensions = graph?.dimensions;
+  const wanted = {
+    B: [1, 1], Q: [1, MAX_Q], M: [IMAGE_TOKENS + 1, IMAGE_TOKENS + MAX_Q],
+    P: [1, MAX_T - 1], R: [2, MAX_T],
+  };
+  const bankDimensions = new Set(
+    isRecord(graph?.banks)
+      ? Object.values(graph.banks).map((bank) => (isRecord(bank) ? bank.dimension : bank))
+      : [],
   );
-  requireTensor(graph, definition.inputs.image,
-    { shape: [1, 1, 320, 672], dtype: 'float32', input: true }, 'encoder image');
-  requireTensor(graph, definition.inputs.question_ids,
-    { shape: [1, 192], dtype: 'int32', input: true }, 'encoder question_ids');
-  if (definition.inputs.family_ids) {
-    requireTensor(graph, definition.inputs.family_ids,
-      { shape: [1], dtype: 'int32', input: true }, 'encoder family_ids');
+  const requestDimensions = isRecord(dimensions)
+    ? Object.keys(dimensions).filter((name) => !bankDimensions.has(name)) : [];
+  if (!isRecord(dimensions) ||
+      requestDimensions.sort().join('\0') !== [...expected].sort().join('\0')) {
+    fail(`${label} KV graph dimensions must be exactly ${expected.join(', ')}.`);
   }
-  requireTensor(graph, definition.outputs.memory,
-    { shape: [1, 402, 320], dtype: 'float32', output: true }, 'encoder memory');
-  requireTensor(graph, definition.outputs.memory_padding_mask,
-    { shape: [1, 402], dtype: 'int32', output: true }, 'encoder memory_padding_mask');
-  requireTensor(graph, definition.outputs.router_logits,
-    { shape: [1, 8], dtype: 'float32', output: true }, 'encoder router_logits');
-  requireTensor(graph, definition.outputs.selected_family_ids,
-    { shape: [1], dtype: 'int32', output: true }, 'encoder selected_family_ids');
+  for (const name of expected) {
+    const descriptor = dimensions[name];
+    if (!wanted[name] || !isRecord(descriptor) || descriptor.min !== wanted[name][0] ||
+        descriptor.max !== wanted[name][1] ||
+        (descriptor.multiple_of != null && descriptor.multiple_of !== 1)) {
+      fail(`${label} KV graph dimension ${name} has the wrong bounds.`);
+    }
+  }
 }
 
-function validateDecoderGraph(graph, definition, generation, vocabSize) {
-  const inputNames = [
-    definition.inputs.decoder_input_ids,
-    definition.inputs.memory,
-    definition.inputs.memory_padding_mask,
+function requireEncoderConcatWitness(graph, memoryOutput) {
+  const witnesses = graph.nodes.filter((node) => {
+    if (node?.opType !== 'Concat' || node.params?.axis !== 1) return false;
+    const inputNames = Object.values(node.inputs || {});
+    const outputs = Object.values(node.outputs || {});
+    if (inputNames.length !== 2 || outputs.length !== 1) return false;
+    const inputShapes = inputNames.map((name) => graphTensor(graph, name, 'encoder Concat').shape);
+    const output = outputs[0];
+    return sameShape(inputShapes[0], ['B', 210, 320]) &&
+      sameShape(inputShapes[1], ['B', 'Q', 320]) &&
+      isRecord(output) && sameShape(output.shape, ['B', 'M', 320]) &&
+      output.dtype === 'float32';
+  });
+  if (witnesses.length !== 1 || !sameShape(graphTensor(
+    graph,
+    memoryOutput,
+    'encoder memory',
+  ).shape, ['B', 'M', 320])) {
+    fail('encoder graph must retain exactly one qualified M=Q+210 Concat witness.');
+  }
+}
+
+function validateEncoderGraph(graph, definition) {
+  requireGraphDimensions(graph, ['B', 'Q', 'M'], 'encoder');
+  const inputNames = [definition.inputs.image, definition.inputs.question_ids];
+  inputNames.push(definition.inputs.question_position_ids);
+  inputNames.push(definition.inputs.family_ids);
+  const crossKeys = CACHE_INPUT_KEYS.filter((name) => name.startsWith('cross_'));
+  const outputNames = [
+    definition.outputs.memory,
+    definition.outputs.memory_padding_mask,
+    definition.outputs.router_logits,
+    definition.outputs.selected_family_ids,
+    ...crossKeys.map((key) => definition.outputs[key]),
   ];
-  if (definition.inputs.v4_keep) inputNames.push(definition.inputs.v4_keep);
-  if (definition.inputs.family_ids) inputNames.push(definition.inputs.family_ids);
-  const outputName = generation.decoderOutput === 'token_ids'
-    ? definition.outputs.token_ids
-    : definition.outputs.logits;
+  requireExactGraphInterface(graph, inputNames, outputNames, 'encoder');
+  requireTensor(graph, definition.inputs.image,
+    { shape: ['B', 1, 320, 672], dtype: 'float32', input: true }, 'encoder image');
+  requireTensor(graph, definition.inputs.question_ids,
+    { shape: ['B', 'Q'], dtype: 'int32', input: true }, 'encoder question_ids');
+  requireTensor(graph, definition.inputs.question_position_ids,
+    { shape: ['B', 'Q'], dtype: 'int32', input: true }, 'encoder question_position_ids');
+  requireTensor(graph, definition.inputs.family_ids,
+    { shape: ['B'], dtype: 'int32', input: true }, 'encoder family_ids');
+  requireTensor(graph, definition.outputs.memory,
+    { shape: ['B', 'M', 320], dtype: 'float32', output: true }, 'encoder memory');
+  requireTensor(graph, definition.outputs.memory_padding_mask,
+    { shape: ['B', 'M'], dtype: 'int32', output: true }, 'encoder memory_padding_mask');
+  requireTensor(graph, definition.outputs.router_logits,
+    { shape: ['B', 8], dtype: 'float32', output: true }, 'encoder router_logits');
+  requireTensor(graph, definition.outputs.selected_family_ids,
+    { shape: ['B'], dtype: 'int32', output: true }, 'encoder selected_family_ids');
+  for (const key of crossKeys) {
+    requireTensor(graph, definition.outputs[key], {
+      shape: ['B', CACHE_HEADS, 'M', CACHE_HEAD_WIDTH],
+      dtype: 'float32',
+      output: true,
+    }, `encoder ${key}`);
+  }
+  requireEncoderConcatWitness(graph, definition.outputs.memory);
+}
+
+function validateDecoderGraph(graph, definition, vocabSize) {
+  requireGraphDimensions(graph, ['B', 'M', 'P', 'R'], 'decoder');
+  const inputKeys = [
+    'decoder_input_ids', 'position_ids', 'family_ids', 'memory_padding_mask',
+    'past_padding_mask', ...CACHE_INPUT_KEYS,
+  ];
+  const outputKeys = ['logits', 'present_padding_mask', ...CACHE_OUTPUT_KEYS];
   requireExactGraphInterface(
     graph,
-    inputNames,
-    [outputName],
+    inputKeys.map((key) => definition.inputs[key]),
+    outputKeys.map((key) => definition.outputs[key]),
     'decoder',
   );
   requireTensor(graph, definition.inputs.decoder_input_ids,
-    { shape: [1, 192], dtype: 'int32', input: true }, 'decoder decoder_input_ids');
-  requireTensor(graph, definition.inputs.memory,
-    { shape: [1, 402, 320], dtype: 'float32', input: true }, 'decoder memory');
+    { shape: ['B', 1], dtype: 'int32', input: true }, 'decoder decoder_input_ids');
+  requireTensor(graph, definition.inputs.position_ids,
+    { shape: ['B'], dtype: 'int32', input: true }, 'decoder position_ids');
+  requireTensor(graph, definition.inputs.family_ids,
+    { shape: ['B'], dtype: 'int32', input: true }, 'decoder family_ids');
   requireTensor(graph, definition.inputs.memory_padding_mask,
-    { shape: [1, 402], dtype: 'int32', input: true }, 'decoder memory_padding_mask');
-  if (definition.inputs.v4_keep) {
-    requireTensor(graph, definition.inputs.v4_keep,
-      { shape: [1, 192], dtype: 'int32', input: true }, 'decoder v4_keep');
+    { shape: ['B', 'M'], dtype: 'int32', input: true }, 'decoder memory_padding_mask');
+  requireTensor(graph, definition.inputs.past_padding_mask,
+    { shape: ['B', 'P'], dtype: 'int32', input: true }, 'decoder past_padding_mask');
+  for (const key of CACHE_INPUT_KEYS) {
+    const shape = key.startsWith('cross_')
+      ? ['B', CACHE_HEADS, 'M', CACHE_HEAD_WIDTH]
+      : ['B', CACHE_HEADS, 'P', CACHE_HEAD_WIDTH];
+    requireTensor(graph, definition.inputs[key], {
+      shape, dtype: 'float32', input: true,
+    }, `decoder ${key}`);
   }
-  if (definition.inputs.family_ids) {
-    requireTensor(graph, definition.inputs.family_ids,
-      { shape: [1], dtype: 'int32', input: true }, 'decoder family_ids');
+  requireTensor(graph, definition.outputs.logits,
+    { shape: ['B', 1, vocabSize], dtype: 'float32', output: true }, 'decoder logits');
+  requireTensor(graph, definition.outputs.present_padding_mask,
+    { shape: ['B', 'R'], dtype: 'int32', output: true }, 'decoder present_padding_mask');
+  for (const key of CACHE_OUTPUT_KEYS) {
+    requireTensor(graph, definition.outputs[key], {
+      shape: ['B', CACHE_HEADS, 'R', CACHE_HEAD_WIDTH],
+      dtype: 'float32',
+      output: true,
+    }, `decoder ${key}`);
   }
-  if (generation.decoderOutput === 'token_ids') {
-    requireTensor(graph, definition.outputs.token_ids,
-      { shape: [1, 192], dtype: 'int32', output: true }, 'decoder token_ids');
-  } else {
-    requireTensor(graph, definition.outputs.logits,
-      { shape: [1, 192, vocabSize], dtype: 'float32', output: true }, 'decoder logits');
+  const producers = new Map();
+  for (const node of graph.nodes || []) {
+    for (const descriptor of Object.values(node?.outputs || {})) {
+      if (isRecord(descriptor) && typeof descriptor.tensor === 'string') {
+        producers.set(descriptor.tensor, node);
+      }
+    }
+  }
+  const witnessIds = new Set();
+  for (const key of CACHE_OUTPUT_KEYS) {
+    let tensorName = definition.outputs[key];
+    let node = producers.get(tensorName);
+    while (['Identity', 'QuantizeLinear', 'DequantizeLinear', 'Cast'].includes(node?.opType)) {
+      const dataInput = node.inputs?.input;
+      if (typeof dataInput !== 'string') break;
+      tensorName = dataInput;
+      node = producers.get(tensorName);
+    }
+    const inputNames = Object.values(node?.inputs || {});
+    const outputs = Object.values(node?.outputs || {});
+    if (node?.opType !== 'Concat' || node.params?.axis !== 2 ||
+        inputNames.length !== 2 || outputs.length !== 1 ||
+        !sameShape(graphTensor(graph, inputNames[0], `decoder ${key} Concat`).shape,
+          ['B', CACHE_HEADS, 'P', CACHE_HEAD_WIDTH]) ||
+        !sameShape(graphTensor(graph, inputNames[1], `decoder ${key} Concat`).shape,
+          ['B', CACHE_HEADS, 1, CACHE_HEAD_WIDTH]) ||
+        !sameShape(outputs[0]?.shape, ['B', CACHE_HEADS, 'R', CACHE_HEAD_WIDTH]) ||
+        outputs[0]?.dtype !== 'float32') {
+      fail(`decoder ${key} must retain a qualified R=P+1 Concat witness.`);
+    }
+    witnessIds.add(node.id);
+  }
+  if (witnessIds.size !== CACHE_OUTPUT_KEYS.length) {
+    fail('decoder present caches must retain eight distinct R=P+1 Concat witnesses.');
   }
 }
 
-async function copyOutput(result, name, Type, expectedLength, label) {
-  const value = await result.output(name).read();
+async function copyOutput(result, name, Type, expectedShape, label) {
+  const output = result.output(name);
+  if (Array.isArray(output.shape) && !sameShape(output.shape, expectedShape)) {
+    fail(`${label} '${name}' returned shape [${output.shape.join(',')}], expected ` +
+      `[${expectedShape.join(',')}].`);
+  }
+  const value = await output.read();
+  const expectedLength = expectedShape.reduce((product, extent) => product * extent, 1);
   if (!(value instanceof Type) || value.length !== expectedLength) {
     fail(`${label} '${name}' returned the wrong typed length.`);
   }
   return value.slice();
+}
+
+function deviceOutput(result, name, expectedShape, label) {
+  if (result?.backend !== 'webgpu') {
+    fail(`${label} device-resident KV requires a WebGPU execution result.`);
+  }
+  const output = result.output(name);
+  if (output.location !== 'device' || output.dtype !== 'float32' ||
+      !sameShape(output.shape, expectedShape) || typeof output.read !== 'function') {
+    fail(`${label} '${name}' is not a device-resident F32 output with shape ` +
+      `[${expectedShape.join(',')}].`);
+  }
+  return output;
 }
 
 function firstIndexArgmax(values, row, width) {
@@ -785,11 +1023,11 @@ function isReadOnlySafetensorsCache(value) {
 export class TinyReceiptSplitSession {
   static async load(options = {}) {
     const runtime = options.runtime;
-    if (!runtime || typeof runtime.createModel !== 'function') {
-      fail('load requires a Runtime handle with createModel().');
+    if (!runtime || typeof runtime.compile !== 'function') {
+      fail('load requires a Runtime handle with compile().');
     }
-    if (typeof options.graphLoader !== 'function') {
-      fail('load requires a graphLoader function.');
+    if (typeof options.snapshotLoader !== 'function') {
+      fail('load requires a snapshotLoader function.');
     }
     const url = packageManifestUrl(options.packageUrl);
     const fetchImpl = options.fetch || globalThis.fetch?.bind(globalThis);
@@ -798,34 +1036,23 @@ export class TinyReceiptSplitSession {
       url,
     );
     const rawVocab = await fetchJson(fetchImpl, manifest.vocabUrl, 'vocab.json');
-    let vocab;
-    if (manifest.tokenizer.type === 'char-vocab') {
-      exactRecordKeys(rawVocab, ['itos'], 'vocab.json');
-      vocab = new TinyReceiptCharVocab(rawVocab?.itos, manifest.tokenIds);
-    } else {
-      vocab = await TinyReceiptByteFallbackBPEVocab.fromJSON(
-        rawVocab,
-        manifest.tokenIds,
-        manifest.tokenizer,
-      );
-    }
+    const vocab = await TinyReceiptByteFallbackBPEVocab.fromJSON(
+      rawVocab,
+      manifest.tokenIds,
+      manifest.tokenizer,
+    );
     const cache = options.safetensorsCache ?? null;
     if (cache != null && !isReadOnlySafetensorsCache(cache)) {
       fail('safetensorsCache must be a ReadOnlySafetensorsCache when provided.');
-    }
-    const decodePolicy = options.decodePolicy ?? 'auto';
-    if (!DECODE_POLICIES.has(decodePolicy)) {
-      fail("decodePolicy must be 'auto', 'required', or 'ordinary'.");
     }
     return new TinyReceiptSplitSession({
       runtime,
       manifest,
       vocab,
-      graphLoader: options.graphLoader,
+      snapshotLoader: options.snapshotLoader,
       fetchImpl,
       cache,
       compileOptions: options.compileOptions || {},
-      decodePolicy,
     });
   }
 
@@ -833,20 +1060,18 @@ export class TinyReceiptSplitSession {
     runtime,
     manifest,
     vocab,
-    graphLoader,
+    snapshotLoader,
     fetchImpl,
     cache,
     compileOptions,
-    decodePolicy,
   }) {
     this.runtime = runtime;
     this.package = manifest;
     this.vocab = vocab;
-    this._graphLoader = graphLoader;
+    this._snapshotLoader = snapshotLoader;
     this._fetch = fetchImpl;
     this._cache = cache;
     this._compileOptions = compileOptions;
-    this._decodePolicy = decodePolicy;
     this._records = new Map();
     this._tail = Promise.resolve();
     this._closed = false;
@@ -865,7 +1090,7 @@ export class TinyReceiptSplitSession {
     const cached = this._records.get(kind);
     if (cached) return cached;
     const definition = this.package[kind];
-    const graph = await this._graphLoader({
+    const snapshot = await this._snapshotLoader({
       kind,
       graphUrl: definition.graphUrl,
       weightsUrl: definition.weightsUrl,
@@ -874,54 +1099,34 @@ export class TinyReceiptSplitSession {
       fetch: this._fetch,
       safetensorsCache: this._cache,
     });
-    if (!graph || !graph.tensors || !Array.isArray(graph.nodes)) {
-      fail(`${kind} graph loader returned an invalid graph.`);
+    const graph = snapshot?.graph;
+    if (!graph || !graph.tensors || !Array.isArray(graph.nodes)
+        || !Array.isArray(snapshot.inputNames) || !Array.isArray(snapshot.outputNames)) {
+      fail(`${kind} snapshot loader returned an invalid logical model snapshot.`);
     }
     if (kind === 'encoder') validateEncoderGraph(graph, definition);
-    else validateDecoderGraph(
-      graph,
-      definition,
-      this.package.generation,
-      this.vocab.itos.length,
-    );
-    const model = this.runtime.createModel(graph);
+    else validateDecoderGraph(graph, definition, this.vocab.itos.length);
     let compiled;
     let context;
-    let requireRetainedRow = false;
     try {
-      compiled = await model.compile(this._compileOptions);
-      requireRetainedRow = kind === 'decoder' &&
-        (this._decodePolicy === 'required' ||
-          (this._decodePolicy === 'auto' && compiled.backend === 'wasm'));
-      if (requireRetainedRow) {
-        const changedInputs = [definition.inputs.decoder_input_ids];
-        if (definition.inputs.v4_keep) changedInputs.push(definition.inputs.v4_keep);
-        context = await compiled.createContext({
-          decode: {
-            changedInputs,
-            rowMode: 'required',
-            requireIncremental: true,
-          },
-        });
-      } else {
-        context = await compiled.createContext();
-      }
+      compiled = await this.runtime.compile(snapshot, this._compileOptions);
+      context = await compiled.createContext();
     } catch (error) {
-      await context?.close();
-      await compiled?.close();
-      await model.close();
+      const cleanupErrors = await closeResources([context, compiled]);
+      if (cleanupErrors.length > 0) {
+        throw new AggregateError(
+          [error, ...cleanupErrors],
+          `[TinyReceiptSplitSession] ${kind} setup and cleanup both failed.`,
+        );
+      }
       throw error;
     }
     const record = {
       graph,
-      model,
+      snapshot,
       compiled,
       context,
-      decoderExecution: kind !== 'decoder'
-        ? null
-        : requireRetainedRow
-          ? 'context-decode-retained-row'
-          : 'fixed-length-ordinary-forward',
+      decoderExecution: kind === 'decoder' ? 'explicit-kv-cache' : null,
     };
     this._records.set(kind, record);
     return record;
@@ -965,56 +1170,120 @@ export class TinyReceiptSplitSession {
     return value;
   }
 
-  async _encoderForward({ image, prompt, family, preprocessed }) {
+  async _encoderForward({
+    image,
+    prompt,
+    family,
+    preprocessed,
+    paddedMaximum,
+    kvTransferMode,
+  }) {
     const requestedFamilyId = this._familyId(family);
-    if (this.package.routing.mode === 'specialized' && requestedFamilyId >= 0 &&
-        requestedFamilyId !== this.package.routing.familyId) {
-      fail(`specialized package is fixed to family '${
-        FAMILY_ORDER[this.package.routing.familyId]}'.`);
-    }
     const encoder = await this._record('encoder');
     const definition = this.package.encoder;
-    const encodedQuestion = this.vocab.encodeQuestion(prompt, 192);
-    const questionIds = new Int32Array(192);
+    const encodedQuestion = this.vocab.encodeQuestion(prompt, MAX_Q);
+    const questionLength = encodedQuestion.length;
+    const boundQuestionLength = paddedMaximum ? MAX_Q : questionLength;
+    const memoryLength = boundQuestionLength + IMAGE_TOKENS;
+    const questionIds = new Int32Array(boundQuestionLength);
     questionIds.fill(this.vocab.pad);
     questionIds.set(encodedQuestion);
     const inputs = {
-      [definition.inputs.image]: await this._prepareImage(image, preprocessed),
-      [definition.inputs.question_ids]: questionIds,
+      [definition.inputs.image]: shaped(
+        await this._prepareImage(image, preprocessed),
+        [1, 1, 320, 672],
+        'encoder image',
+      ),
+      [definition.inputs.question_ids]: shaped(
+        questionIds,
+        [1, boundQuestionLength],
+        'encoder question_ids',
+      ),
+      [definition.inputs.question_position_ids]: shaped(
+        activePositionIds(boundQuestionLength),
+        [1, boundQuestionLength],
+        'encoder question_position_ids',
+      ),
+      [definition.inputs.family_ids]: shaped(
+        Int32Array.of(requestedFamilyId),
+        [1],
+        'encoder family_ids',
+      ),
     };
-    if (definition.inputs.family_ids) {
-      inputs[definition.inputs.family_ids] = Int32Array.of(requestedFamilyId);
-    }
+    const deviceKV = kvTransferMode !== 'host-validated';
+    const qualifyDeviceKV = kvTransferMode === 'device-qualified';
+    const executionStarted = monotonicMilliseconds();
     const execution = await encoder.context.execute(inputs);
+    let keepExecution = false;
     try {
-      const memory = await copyOutput(
+      const memory = deviceKV ? null : await copyOutput(
         execution,
         definition.outputs.memory,
         Float32Array,
-        402 * 320,
+        [1, memoryLength, 320],
         'encoder memory',
       );
-      const memoryPaddingMask = await copyOutput(
-        execution,
-        definition.outputs.memory_padding_mask,
-        Int32Array,
-        402,
-        'encoder memory_padding_mask',
-      );
-      const routerLogits = await copyOutput(
-        execution,
-        definition.outputs.router_logits,
-        Float32Array,
-        8,
-        'encoder router_logits',
-      );
-      const selected = await copyOutput(
-        execution,
-        definition.outputs.selected_family_ids,
-        Int32Array,
-        1,
-        'encoder selected_family_ids',
-      );
+      const [memoryPaddingMask, routerLogits, selected] = deviceKV
+        ? await Promise.all([
+          copyOutput(
+            execution,
+            definition.outputs.memory_padding_mask,
+            Int32Array,
+            [1, memoryLength],
+            'encoder memory_padding_mask',
+          ),
+          copyOutput(
+            execution,
+            definition.outputs.router_logits,
+            Float32Array,
+            [1, 8],
+            'encoder router_logits',
+          ),
+          copyOutput(
+            execution,
+            definition.outputs.selected_family_ids,
+            Int32Array,
+            [1],
+            'encoder selected_family_ids',
+          ),
+        ])
+        : [
+          await copyOutput(
+            execution,
+            definition.outputs.memory_padding_mask,
+            Int32Array,
+            [1, memoryLength],
+            'encoder memory_padding_mask',
+          ),
+          await copyOutput(
+            execution,
+            definition.outputs.router_logits,
+            Float32Array,
+            [1, 8],
+            'encoder router_logits',
+          ),
+          await copyOutput(
+            execution,
+            definition.outputs.selected_family_ids,
+            Int32Array,
+            [1],
+            'encoder selected_family_ids',
+          ),
+        ];
+      // Device-resident execution is synchronized by only the small public
+      // values required by application control flow. Capture the component
+      // boundary before argmax/validation and before any optional qualification
+      // readback. The host path still needs every cache on the host and records
+      // its completion after those required transfers below.
+      const synchronizedEncoderExecutionMs = deviceKV
+        ? monotonicMilliseconds() - executionStarted
+        : null;
+      if (memory?.some((value) => !Number.isFinite(value))) {
+        fail('encoder memory contains a non-finite value.');
+      }
+      if (routerLogits.some((value) => !Number.isFinite(value))) {
+        fail('encoder router_logits contains a non-finite value.');
+      }
       if (memoryPaddingMask.some((value) => value !== 0 && value !== 1)) {
         fail('encoder memory_padding_mask must contain I32 0/1 blocked flags.');
       }
@@ -1023,25 +1292,518 @@ export class TinyReceiptSplitSession {
           selectedFamilyId < 0 || selectedFamilyId >= FAMILY_ORDER.length) {
         fail('encoder selected_family_ids returned an invalid family.');
       }
-      if (this.package.routing.mode === 'specialized' &&
-          selectedFamilyId !== this.package.routing.familyId) {
-        fail('encoder selected family does not match specialized package routing.');
-      }
-      if (this.package.routing.mode === 'runtime' && requestedFamilyId >= 0 &&
-          selectedFamilyId !== requestedFamilyId) {
+      if (requestedFamilyId >= 0 && selectedFamilyId !== requestedFamilyId) {
         fail('encoder did not preserve the explicitly requested family.');
       }
+      if (qualifyDeviceKV) {
+        const qualifiedMemory = await copyOutput(
+          execution,
+          definition.outputs.memory,
+          Float32Array,
+          [1, memoryLength, 320],
+          'encoder memory',
+        );
+        if (qualifiedMemory.some((value) => !Number.isFinite(value))) {
+          fail('encoder memory contains a non-finite value.');
+        }
+      }
+      const crossCache = {};
+      for (const key of CACHE_INPUT_KEYS.filter((name) => name.startsWith('cross_'))) {
+        const shape = [1, CACHE_HEADS, memoryLength, CACHE_HEAD_WIDTH];
+        if (deviceKV) {
+          const output = deviceOutput(
+            execution,
+            definition.outputs[key],
+            shape,
+            `encoder ${key}`,
+          );
+          if (qualifyDeviceKV) {
+            const values = await copyOutput(
+              execution,
+              definition.outputs[key],
+              Float32Array,
+              shape,
+              `encoder ${key}`,
+            );
+            if (values.some((value) => !Number.isFinite(value))) {
+              fail(`encoder ${key} contains a non-finite cache value.`);
+            }
+          }
+          crossCache[key] = output;
+        } else {
+          const values = await copyOutput(
+            execution,
+            definition.outputs[key],
+            Float32Array,
+            shape,
+            `encoder ${key}`,
+          );
+          if (values.some((value) => !Number.isFinite(value))) {
+            fail(`encoder ${key} contains a non-finite cache value.`);
+          }
+          crossCache[key] = values;
+        }
+      }
+      const encoderExecutionMs = synchronizedEncoderExecutionMs ??
+        monotonicMilliseconds() - executionStarted;
+      keepExecution = deviceKV;
       return {
         memory,
         memoryPaddingMask,
         routerLogits,
         selectedFamilyId,
         requestedFamilyId,
+        questionLength,
+        boundQuestionLength,
+        memoryLength,
         questionTokenIds: Object.freeze([...encodedQuestion]),
+        crossCache: Object.freeze(crossCache),
+        cacheExecution: deviceKV ? execution : null,
+        encoderExecutionMs,
+        encoderMemoryReadbackValidated: qualifyDeviceKV,
       };
     } finally {
-      await execution.close();
+      if (!keepExecution) await execution.close();
     }
+  }
+
+  async _generateExplicitKVHost({ encoded, limit, shapeMode }) {
+    const decoder = await this._record('decoder');
+    const definition = this.package.decoder;
+    const cache = this.package.cache;
+    const selectedFamilyIds = Int32Array.of(encoded.selectedFamilyId);
+    const pastKeys = CACHE_INPUT_KEYS.filter((name) => name.startsWith('past_'));
+    let pastLength = cache.initialPastLength;
+    let pastPaddingMask = Int32Array.of(cache.sentinelMaskValue);
+    let pastCache = Object.fromEntries(pastKeys.map((key) => [
+      key,
+      new Float32Array(CACHE_HEADS * pastLength * CACHE_HEAD_WIDTH),
+    ]));
+    let currentToken = this.vocab.bos;
+    const tokenIds = [];
+    const decodeReports = [];
+    let stoppedAtEos = false;
+    for (let position = 0; position < limit; position++) {
+      const inputs = {
+        [definition.inputs.decoder_input_ids]: shaped(
+          Int32Array.of(currentToken),
+          [1, 1],
+          'decoder decoder_input_ids',
+        ),
+        [definition.inputs.position_ids]: shaped(
+          Int32Array.of(position),
+          [1],
+          'decoder position_ids',
+        ),
+        [definition.inputs.family_ids]: shaped(
+          selectedFamilyIds,
+          [1],
+          'decoder family_ids',
+        ),
+        [definition.inputs.memory_padding_mask]: shaped(
+          encoded.memoryPaddingMask,
+          [1, encoded.memoryLength],
+          'decoder memory_padding_mask',
+        ),
+        [definition.inputs.past_padding_mask]: shaped(
+          pastPaddingMask,
+          [1, pastLength],
+          'decoder past_padding_mask',
+        ),
+      };
+      for (const key of CACHE_INPUT_KEYS.filter((name) => name.startsWith('cross_'))) {
+        inputs[definition.inputs[key]] = shaped(
+          encoded.crossCache[key],
+          [1, CACHE_HEADS, encoded.memoryLength, CACHE_HEAD_WIDTH],
+          `decoder ${key}`,
+        );
+      }
+      for (const key of pastKeys) {
+        inputs[definition.inputs[key]] = shaped(
+          pastCache[key],
+          [1, CACHE_HEADS, pastLength, CACHE_HEAD_WIDTH],
+          `decoder ${key}`,
+        );
+      }
+      const executionStarted = monotonicMilliseconds();
+      const execution = await decoder.context.execute(inputs);
+      const presentLength = pastLength + 1;
+      let next;
+      let nextMask;
+      const nextCache = {};
+      try {
+        const logits = await copyOutput(
+          execution,
+          definition.outputs.logits,
+          Float32Array,
+          [1, 1, this.vocab.itos.length],
+          'decoder logits',
+        );
+        next = firstIndexArgmax(logits, 0, this.vocab.itos.length);
+        nextMask = await copyOutput(
+          execution,
+          definition.outputs.present_padding_mask,
+          Int32Array,
+          [1, presentLength],
+          'decoder present_padding_mask',
+        );
+        const expectedCurrentMask = currentToken === this.vocab.pad ? 1 : 0;
+        if (nextMask.some((value) => value !== 0 && value !== 1) ||
+            nextMask[0] !== cache.sentinelMaskValue ||
+            nextMask[pastLength] !== expectedCurrentMask ||
+            pastPaddingMask.some((value, index) => nextMask[index] !== value)) {
+          fail('decoder present_padding_mask corrupted its past prefix or current token.');
+        }
+        for (const outputKey of CACHE_OUTPUT_KEYS) {
+          const pastKey = outputKey.replace(/^present_/, 'past_');
+          nextCache[pastKey] = await copyOutput(
+            execution,
+            definition.outputs[outputKey],
+            Float32Array,
+            [1, CACHE_HEADS, presentLength, CACHE_HEAD_WIDTH],
+            `decoder ${outputKey}`,
+          );
+          const values = nextCache[pastKey];
+          for (let head = 0; head < CACHE_HEADS; head++) {
+            for (let past = 0; past < pastLength; past++) {
+              const oldOffset = (head * pastLength + past) * CACHE_HEAD_WIDTH;
+              const newOffset = (head * presentLength + past) * CACHE_HEAD_WIDTH;
+              for (let width = 0; width < CACHE_HEAD_WIDTH; width++) {
+                if (values[newOffset + width] !== pastCache[pastKey][oldOffset + width]) {
+                  fail(`decoder ${outputKey} corrupted its persistent past-cache prefix.`);
+                }
+              }
+            }
+            const appendOffset = (head * presentLength + pastLength) * CACHE_HEAD_WIDTH;
+            for (let width = 0; width < CACHE_HEAD_WIDTH; width++) {
+              if (!Number.isFinite(values[appendOffset + width])) {
+                fail(`decoder ${outputKey} appended a non-finite cache value.`);
+              }
+            }
+          }
+        }
+        decodeReports.push(Object.freeze({
+          operation: position === 0 ? 'explicit-kv-seed' : 'explicit-kv-step',
+          position,
+          pastLength,
+          presentLength,
+          sentinelMaskValue: cache.sentinelMaskValue,
+          backendDecodeState: execution.report?.decodeState || null,
+          wallTimeMs: monotonicMilliseconds() - executionStarted,
+        }));
+      } finally {
+        await execution.close();
+      }
+      if (!Number.isInteger(next) || next < 0 || next >= this.vocab.itos.length) {
+        fail(`decoder returned invalid vocabulary index ${next}.`);
+      }
+      tokenIds.push(next);
+      pastPaddingMask = nextMask;
+      pastCache = nextCache;
+      pastLength = presentLength;
+      if (next === this.vocab.eos) {
+        stoppedAtEos = true;
+        break;
+      }
+      currentToken = next;
+    }
+    const logicalTargetLength = limit + 1;
+    return Object.freeze({
+      family: FAMILY_ORDER[encoded.selectedFamilyId],
+      familyId: encoded.selectedFamilyId,
+      requestedFamily: encoded.requestedFamilyId < 0
+        ? 'auto' : FAMILY_ORDER[encoded.requestedFamilyId],
+      requestedFamilyId: encoded.requestedFamilyId,
+      questionTokenIds: encoded.questionTokenIds,
+      tokenIds: Object.freeze([...tokenIds]),
+      text: this.vocab.decode(tokenIds),
+      stoppedAtEos,
+      execution: decoder.decoderExecution,
+      decodeMode: 'explicit-kv-cache',
+      decoderSeedExecutions: tokenIds.length > 0 ? 1 : 0,
+      decoderOrdinaryExecutions: tokenIds.length,
+      decoderCacheStepExecutions: Math.max(0, tokenIds.length - 1),
+      activeShape: Object.freeze({
+        B: 1,
+        Q: encoded.boundQuestionLength,
+        T: logicalTargetLength,
+        M: encoded.memoryLength,
+      }),
+      logicalShape: Object.freeze({
+        B: 1,
+        Q: encoded.questionLength,
+        T: logicalTargetLength,
+        M: encoded.questionLength + IMAGE_TOKENS,
+      }),
+      cacheShape: Object.freeze({
+        initialPastLength: cache.initialPastLength,
+        finalPastLength: pastLength,
+        sentinelSlots: 1,
+      }),
+      shapeMode,
+      decodeReports: Object.freeze(decodeReports),
+      routerLogits: encoded.routerLogits.slice(),
+      synchronizedTiming: Object.freeze({
+        completion: 'required-output-readback',
+        encoderExecutionMs: encoded.encoderExecutionMs,
+        decoderStepMs: Object.freeze(decodeReports.map(({ wallTimeMs }) => wallTimeMs)),
+      }),
+      gpuResidentKv: Object.freeze({
+        enabled: false,
+        mode: 'host-validated',
+        crossCacheOutputs: CACHE_OUTPUT_KEYS.length,
+        presentCacheOutputsPerStep: CACHE_OUTPUT_KEYS.length,
+        encoderCrossCacheHandoffs: 0,
+        decoderCacheHandoffs: 0,
+        runtimeValidatedDeviceInputs: false,
+        encoderCrossCacheReadbackValidated: true,
+        cachePrefixReadbackValidated: true,
+        appendedCacheReadbackValidated: true,
+        cacheReadbackFree: false,
+      }),
+    });
+  }
+
+  async _generateExplicitKVDevice({ encoded, limit, shapeMode, qualify }) {
+    if (encoded.cacheExecution?.backend !== 'webgpu') {
+      fail('device-resident KV requires a live WebGPU encoder result.');
+    }
+    const decoder = await this._record('decoder');
+    const definition = this.package.decoder;
+    const cache = this.package.cache;
+    const selectedFamilyIds = Int32Array.of(encoded.selectedFamilyId);
+    const crossKeys = CACHE_INPUT_KEYS.filter((name) => name.startsWith('cross_'));
+    const pastKeys = CACHE_INPUT_KEYS.filter((name) => name.startsWith('past_'));
+    let pastLength = cache.initialPastLength;
+    let pastPaddingMask = Int32Array.of(cache.sentinelMaskValue);
+    let pastCache = Object.fromEntries(pastKeys.map((key) => [
+      key,
+      new Float32Array(CACHE_HEADS * pastLength * CACHE_HEAD_WIDTH),
+    ]));
+    let qualifiedPastCache = qualify ? pastCache : null;
+    let previousExecution = null;
+    let currentToken = this.vocab.bos;
+    const tokenIds = [];
+    const decodeReports = [];
+    let stoppedAtEos = false;
+    let encoderCrossCacheHandoffs = 0;
+    let decoderCacheHandoffs = 0;
+    try {
+      for (let position = 0; position < limit; position++) {
+        const inputs = {
+          [definition.inputs.decoder_input_ids]: shaped(
+            Int32Array.of(currentToken),
+            [1, 1],
+            'decoder decoder_input_ids',
+          ),
+          [definition.inputs.position_ids]: shaped(
+            Int32Array.of(position),
+            [1],
+            'decoder position_ids',
+          ),
+          [definition.inputs.family_ids]: shaped(
+            selectedFamilyIds,
+            [1],
+            'decoder family_ids',
+          ),
+          [definition.inputs.memory_padding_mask]: shaped(
+            encoded.memoryPaddingMask,
+            [1, encoded.memoryLength],
+            'decoder memory_padding_mask',
+          ),
+          [definition.inputs.past_padding_mask]: shaped(
+            pastPaddingMask,
+            [1, pastLength],
+            'decoder past_padding_mask',
+          ),
+        };
+        for (const key of crossKeys) {
+          inputs[definition.inputs[key]] = deviceShaped(
+            encoded.crossCache[key],
+            [1, CACHE_HEADS, encoded.memoryLength, CACHE_HEAD_WIDTH],
+            `decoder ${key}`,
+          );
+          encoderCrossCacheHandoffs++;
+        }
+        for (const key of pastKeys) {
+          const shape = [1, CACHE_HEADS, pastLength, CACHE_HEAD_WIDTH];
+          inputs[definition.inputs[key]] = position === 0
+            ? shaped(pastCache[key], shape, `decoder ${key}`)
+            : deviceShaped(pastCache[key], shape, `decoder ${key}`);
+          if (position > 0) decoderCacheHandoffs++;
+        }
+
+        const executionStarted = monotonicMilliseconds();
+        const execution = await decoder.context.execute(inputs);
+        const retiredExecution = previousExecution;
+        previousExecution = execution;
+        const presentLength = pastLength + 1;
+        let logits;
+        let nextMask;
+        let wallTimeMs;
+        try {
+          [logits, nextMask] = await Promise.all([
+            copyOutput(
+              execution,
+              definition.outputs.logits,
+              Float32Array,
+              [1, 1, this.vocab.itos.length],
+              'decoder logits',
+            ),
+            copyOutput(
+              execution,
+              definition.outputs.present_padding_mask,
+              Int32Array,
+              [1, presentLength],
+              'decoder present_padding_mask',
+            ),
+          ]);
+          // Reading logits and the present mask fences this execution. Keep
+          // application validation, argmax, cache-handle bookkeeping, optional
+          // KV qualification, and result retirement outside the component time.
+          wallTimeMs = monotonicMilliseconds() - executionStarted;
+        } finally {
+          // The prior result owns the self-cache copied by this execution. Its
+          // storage remains live through the required-output synchronization,
+          // including when either small-output read fails.
+          if (retiredExecution) await retiredExecution.close();
+        }
+        const next = firstIndexArgmax(logits, 0, this.vocab.itos.length);
+        const expectedCurrentMask = currentToken === this.vocab.pad ? 1 : 0;
+        if (nextMask.some((value) => value !== 0 && value !== 1) ||
+            nextMask[0] !== cache.sentinelMaskValue ||
+            nextMask[pastLength] !== expectedCurrentMask ||
+            pastPaddingMask.some((value, index) => nextMask[index] !== value)) {
+          fail('decoder present_padding_mask corrupted its past prefix or current token.');
+        }
+
+        const nextCache = {};
+        const nextQualifiedCache = qualify ? {} : null;
+        for (const outputKey of CACHE_OUTPUT_KEYS) {
+          const pastKey = outputKey.replace(/^present_/, 'past_');
+          const shape = [1, CACHE_HEADS, presentLength, CACHE_HEAD_WIDTH];
+          nextCache[pastKey] = deviceOutput(
+            execution,
+            definition.outputs[outputKey],
+            shape,
+            `decoder ${outputKey}`,
+          );
+          if (!qualify) continue;
+          const values = await copyOutput(
+            execution,
+            definition.outputs[outputKey],
+            Float32Array,
+            shape,
+            `decoder ${outputKey}`,
+          );
+          const qualifiedPast = qualifiedPastCache[pastKey];
+          for (let head = 0; head < CACHE_HEADS; head++) {
+            for (let past = 0; past < pastLength; past++) {
+              const oldOffset = (head * pastLength + past) * CACHE_HEAD_WIDTH;
+              const newOffset = (head * presentLength + past) * CACHE_HEAD_WIDTH;
+              for (let width = 0; width < CACHE_HEAD_WIDTH; width++) {
+                if (values[newOffset + width] !== qualifiedPast[oldOffset + width]) {
+                  fail(`decoder ${outputKey} corrupted its persistent past-cache prefix.`);
+                }
+              }
+            }
+            const appendOffset = (head * presentLength + pastLength) * CACHE_HEAD_WIDTH;
+            for (let width = 0; width < CACHE_HEAD_WIDTH; width++) {
+              if (!Number.isFinite(values[appendOffset + width])) {
+                fail(`decoder ${outputKey} appended a non-finite cache value.`);
+              }
+            }
+          }
+          nextQualifiedCache[pastKey] = values;
+        }
+        decodeReports.push(Object.freeze({
+          operation: position === 0 ? 'explicit-kv-seed' : 'explicit-kv-step',
+          position,
+          pastLength,
+          presentLength,
+          sentinelMaskValue: cache.sentinelMaskValue,
+          backendDecodeState: execution.report?.decodeState || null,
+          wallTimeMs,
+        }));
+        if (!Number.isInteger(next) || next < 0 || next >= this.vocab.itos.length) {
+          fail(`decoder returned invalid vocabulary index ${next}.`);
+        }
+        tokenIds.push(next);
+        pastPaddingMask = nextMask;
+        pastCache = nextCache;
+        if (qualify) qualifiedPastCache = nextQualifiedCache;
+        pastLength = presentLength;
+        if (next === this.vocab.eos) {
+          stoppedAtEos = true;
+          break;
+        }
+        currentToken = next;
+      }
+    } finally {
+      await previousExecution?.close();
+    }
+
+    const logicalTargetLength = limit + 1;
+    return Object.freeze({
+      family: FAMILY_ORDER[encoded.selectedFamilyId],
+      familyId: encoded.selectedFamilyId,
+      requestedFamily: encoded.requestedFamilyId < 0
+        ? 'auto' : FAMILY_ORDER[encoded.requestedFamilyId],
+      requestedFamilyId: encoded.requestedFamilyId,
+      questionTokenIds: encoded.questionTokenIds,
+      tokenIds: Object.freeze([...tokenIds]),
+      text: this.vocab.decode(tokenIds),
+      stoppedAtEos,
+      execution: decoder.decoderExecution,
+      decodeMode: 'explicit-kv-cache',
+      decoderSeedExecutions: tokenIds.length > 0 ? 1 : 0,
+      decoderOrdinaryExecutions: tokenIds.length,
+      decoderCacheStepExecutions: Math.max(0, tokenIds.length - 1),
+      activeShape: Object.freeze({
+        B: 1,
+        Q: encoded.boundQuestionLength,
+        T: logicalTargetLength,
+        M: encoded.memoryLength,
+      }),
+      logicalShape: Object.freeze({
+        B: 1,
+        Q: encoded.questionLength,
+        T: logicalTargetLength,
+        M: encoded.questionLength + IMAGE_TOKENS,
+      }),
+      cacheShape: Object.freeze({
+        initialPastLength: cache.initialPastLength,
+        finalPastLength: pastLength,
+        sentinelSlots: 1,
+      }),
+      shapeMode,
+      decodeReports: Object.freeze(decodeReports),
+      routerLogits: encoded.routerLogits.slice(),
+      synchronizedTiming: Object.freeze({
+        completion: 'required-small-output-readback',
+        applicationValidationIncluded: false,
+        cacheQualificationReadbackIncluded: false,
+        encoderExecutionMs: encoded.encoderExecutionMs,
+        decoderStepMs: Object.freeze(decodeReports.map(({ wallTimeMs }) => wallTimeMs)),
+      }),
+      gpuResidentKv: Object.freeze({
+        enabled: true,
+        mode: qualify ? 'device-qualified' : 'device-resident',
+        crossCacheOutputs: crossKeys.length,
+        presentCacheOutputsPerStep: CACHE_OUTPUT_KEYS.length,
+        encoderCrossCacheHandoffs,
+        decoderCacheHandoffs,
+        runtimeValidatedDeviceInputs: tokenIds.length > 0,
+        encoderResultRetainedThroughDecode: true,
+        decoderResultRetainedUntilSuccessorExecution: true,
+        encoderMemoryReadback: qualify,
+        encoderMemoryReadbackValidated: encoded.encoderMemoryReadbackValidated === true,
+        encoderCrossCacheReadbackValidated: qualify,
+        cachePrefixReadbackValidated: qualify,
+        appendedCacheReadbackValidated: qualify,
+        cacheReadbackFree: !qualify,
+      }),
+    });
   }
 
   async _generateImpl({
@@ -1050,6 +1812,8 @@ export class TinyReceiptSplitSession {
     family = 'auto',
     maxNewTokens = null,
     preprocessed = false,
+    shapeMode = 'active',
+    kvTransferMode = 'host-validated',
   } = {}) {
     const limit = maxNewTokens == null
       ? this.package.generation.maximum_new_tokens
@@ -1058,108 +1822,32 @@ export class TinyReceiptSplitSession {
         limit > this.package.generation.maximum_new_tokens) {
       fail('maxNewTokens must be an integer from 0 through 191.');
     }
-    const encoded = await this._encoderForward({ image, prompt, family, preprocessed });
-    const decoder = await this._record('decoder');
-    const definition = this.package.decoder;
-    const decoderIds = new Int32Array(192);
-    decoderIds.fill(this.vocab.pad);
-    decoderIds[0] = this.vocab.bos;
-    const decoderKeep = definition.inputs.v4_keep ? new Int32Array(192) : null;
-    if (decoderKeep) decoderKeep[0] = 1;
-    const selectedFamilyIds = Int32Array.of(encoded.selectedFamilyId);
-    const seedInputs = {
-      [definition.inputs.decoder_input_ids]: decoderIds,
-      [definition.inputs.memory]: encoded.memory,
-      // The source and package both use nonzero=true=blocked. Do not invert it.
-      [definition.inputs.memory_padding_mask]: encoded.memoryPaddingMask,
-    };
-    if (definition.inputs.v4_keep) {
-      seedInputs[definition.inputs.v4_keep] = decoderKeep;
+    if (shapeMode !== 'active' && shapeMode !== 'maximum-padded') {
+      fail("shapeMode must be 'active' or 'maximum-padded'.");
     }
-    if (definition.inputs.family_ids) {
-      seedInputs[definition.inputs.family_ids] = selectedFamilyIds;
-    }
-    const retainedRow = decoder.decoderExecution === 'context-decode-retained-row';
-    const tokenIds = [];
-    let prefixLength = 1;
-    let stoppedAtEos = false;
-    let decoderSeedExecutions = 0;
-    let decoderRowExecutions = 0;
-    let decoderOrdinaryExecutions = 0;
-    if (retainedRow) await decoder.context.decode.reset();
-    for (let generated = 0; generated < limit; generated++) {
-      const row = prefixLength - 1;
-      let execution;
-      if (!retainedRow) {
-        execution = await decoder.context.execute(seedInputs);
-        decoderOrdinaryExecutions++;
-      } else if (row === 0) {
-        execution = await decoder.context.decode.seed(seedInputs);
-        decoderSeedExecutions++;
-      } else {
-        execution = await decoder.context.decode.step({
-          [definition.inputs.decoder_input_ids]: decoderIds,
-          ...(definition.inputs.v4_keep
-            ? { [definition.inputs.v4_keep]: decoderKeep }
-            : {}),
-        }, { position: row });
-        decoderRowExecutions++;
-      }
-      let next;
-      try {
-        if (this.package.generation.decoderOutput === 'token_ids') {
-          const selected = await copyOutput(
-            execution,
-            definition.outputs.token_ids,
-            Int32Array,
-            192,
-            'decoder token_ids',
-          );
-          next = selected[row];
-        } else {
-          const width = this.vocab.itos.length;
-          const logits = await copyOutput(
-            execution,
-            definition.outputs.logits,
-            Float32Array,
-            192 * width,
-            'decoder logits',
-          );
-          next = firstIndexArgmax(logits, row, width);
-        }
-      } finally {
-        await execution.close();
-      }
-      if (!Number.isInteger(next) || next < 0 || next >= this.vocab.itos.length) {
-        fail(`decoder returned invalid vocabulary index ${next}.`);
-      }
-      tokenIds.push(next);
-      if (next === this.vocab.eos) {
-        stoppedAtEos = true;
-        break;
-      }
-      decoderIds[prefixLength] = next;
-      if (decoderKeep) decoderKeep[prefixLength] = 1;
-      prefixLength++;
-    }
-    return Object.freeze({
-      family: FAMILY_ORDER[encoded.selectedFamilyId],
-      familyId: encoded.selectedFamilyId,
-      requestedFamily: encoded.requestedFamilyId < 0
-        ? 'auto'
-        : FAMILY_ORDER[encoded.requestedFamilyId],
-      requestedFamilyId: encoded.requestedFamilyId,
-      questionTokenIds: encoded.questionTokenIds,
-      tokenIds: Object.freeze([...tokenIds]),
-      text: this.vocab.decode(tokenIds),
-      stoppedAtEos,
-      execution: decoder.decoderExecution,
-      decodeMode: retainedRow ? 'incremental-row-required' : 'ordinary-forward',
-      decoderSeedExecutions,
-      decoderRowExecutions,
-      decoderOrdinaryExecutions,
-      routerLogits: encoded.routerLogits.slice(),
+    const normalizedKVTransferMode = normalizeKVTransferMode(kvTransferMode);
+    const paddedMaximum = shapeMode === 'maximum-padded';
+    const encoded = await this._encoderForward({
+      image,
+      prompt,
+      family,
+      preprocessed,
+      paddedMaximum,
+      kvTransferMode: normalizedKVTransferMode,
     });
+    try {
+      if (normalizedKVTransferMode === 'host-validated') {
+        return await this._generateExplicitKVHost({ encoded, limit, shapeMode });
+      }
+      return await this._generateExplicitKVDevice({
+        encoded,
+        limit,
+        shapeMode,
+        qualify: normalizedKVTransferMode === 'device-qualified',
+      });
+    } finally {
+      await encoded.cacheExecution?.close();
+    }
   }
 
   generate(options = {}) {
@@ -1171,10 +1859,19 @@ export class TinyReceiptSplitSession {
     this._closePromise = this._exclusive(async () => {
       this._closed = true;
       const records = [...this._records.values()];
-      for (const { context } of records) await context.close();
-      for (const { compiled } of records) await compiled.close();
-      for (const { model } of records) await model.close();
-      this._records.clear();
+      const errors = [];
+      try {
+        errors.push(...await closeResources(records.map(({ context }) => context)));
+        errors.push(...await closeResources(records.map(({ compiled }) => compiled)));
+      } finally {
+        this._records.clear();
+      }
+      if (errors.length > 0) {
+        throw new AggregateError(
+          errors,
+          '[TinyReceiptSplitSession] one or more owned resources failed to close.',
+        );
+      }
     });
     return this._closePromise;
   }
@@ -1182,5 +1879,5 @@ export class TinyReceiptSplitSession {
 
 export {
   FAMILY_ORDER as TINY_RECEIPT_SPLIT_FAMILY_ORDER,
-  PACKAGE_FORMAT as TINY_RECEIPT_SPLIT_PACKAGE_FORMAT,
+  KV_PACKAGE_FORMAT as TINY_RECEIPT_SPLIT_KV_PACKAGE_FORMAT,
 };

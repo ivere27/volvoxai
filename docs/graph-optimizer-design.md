@@ -58,11 +58,10 @@ inputs, not another pass list. The exporter does not own a model's package
 manifest, graph pairing, family vocabulary or routing, task preprocessing, or
 release policy.
 
-TinyReceipt-specific encoder/decoder composition, package manifests, family
-routing and specialization bindings, representative calibration records, and
-qualification live under `examples/tiny_receipt_vqa/`. Those application tools
-request registered model-neutral recipes and provide model data; they are not
-another public IR, pass framework, or general exporter contract.
+TinyReceipt-specific encoder/decoder composition, package manifests, routing,
+and qualification live under `examples/tiny_receipt_vqa/`. Its current
+explicit-KV package-v1 path imports the producer-authored FP32 or static INT8
+ONNX variant directly.
 
 The release rules are:
 
@@ -136,14 +135,18 @@ Every persisted graph has the exact discriminator:
 
 ```json
 {
-  "format": "volvox-graph/v1"
+  "format": "volvox-graph/v1",
+  "dimensions": {}
 }
 ```
 
 The current contract is strict:
 
-- each input has explicit `dtype`, and `outputs_dtype` exactly describes every
-  node output port; there is no implicit F32 default;
+- each input has exactly `shape` and `dtype`; every symbolic shape axis names a
+  finite constraint in `dimensions`;
+- each node output port is one `{tensor, shape, dtype}` assertion checked
+  against canonical whole-domain shape inference; split output maps and an
+  implicit F32 default do not exist;
 - nodes use `opType`; the old `op` alias is rejected;
 - `params` is an object;
 - operator spellings must resolve through the generated `OperatorKind`
@@ -412,89 +415,6 @@ typed evidence; copying a predicate ID string into a plan is not proof.
 `--output-argmax logits=token_ids` is an explicit output-ABI specialization;
 the optimizer never guesses that change.
 
-TinyReceipt's application-owned command composes the typed optimizer over both
-graphs and refreshes its application package identities:
-
-```bash
-python3 -m examples.tiny_receipt_vqa.tools.optimize_direct_int8 \
-  --source build/tiny-receipt-int8-imported \
-  --out build/tiny-receipt-int8-from-int8-exact
-```
-
-The packed-QLinear rule is part of this default command. It preserves the input
-package's affines and intentionally keeps `QBatchMatMul`/Softmax plus the
-explicit intermediate precision boundaries. QSDPA can have a different
-performance result on each backend, and Q* compute can round differently from
-separate DQ/F32/Q evaluation, so the comparable Direct INT8 deployment opts
-into both numerical migrations and the application-owned canonical ABI
-explicitly:
-
-```bash
-python3 -m examples.tiny_receipt_vqa.tools.optimize_direct_int8 \
-  --source build/tiny-receipt-int8-imported \
-  --out build/tiny-receipt-int8-from-int8 \
-  --fuse-attention \
-  --fuse-static-qdq-compute \
-  --canonical-deployment
-```
-
-The command resolves one protobuf-authored transaction containing the same
-exact packed/layout groups and the requested migration groups. It recognizes the static-QDQ
-`QBatchMatMul -> DQ -> Add/Softmax -> Q -> QBatchMatMul -> DQ`
-structure. It proves the head layout and mask conversion, reuses the original
-byte operands and affines, and emits canonical `QSDPA` without decoding or
-requantizing weights. It also removes the source graph's score and probability
-requantization operations. Consequently this lift is intentionally **not
-bit-exact**. The compute flag separately replaces only closed canonical
-`DQ -> Add/LayerNorm/GELU/SiLU/GroupNorm -> Q` islands with their Q* operators,
-reusing the existing input/output affine references. It performs no calibration
-and changes no initializer payload, but the fused kernel's F32 evaluation or
-reduction order can differ, so this is also a numerical migration. Neither flag
-inherits the default package's correctness or latency evidence.
-`--canonical-deployment` is a separate TinyReceipt ABI specialization performed
-after those migrations: it hoists canonical I32 `v4_keep` and replaces F32
-`logits` with byte-domain first-index I32 `token_ids`. It preserves producer
-affines and initializer payloads and requires both migration flags. Without
-that flag, even a graph using both numerical migrations retains the producer
-logits ABI. Failure to legalize every recognized attention block aborts the
-transaction; successful legalization only creates a candidate. Independent
-differential execution, task accuracy, routing, strict-backend kernel evidence,
-and paired latency qualification are required for that exact package identity
-before release.
-
-The unfused form is not inherently incompatible with native incremental
-decode. Native `QBatchMatMul` has a one-row path for the strict batch-1
-sequence layout when the right operand is complete, non-overlapping, and clean
-in the current dependency closure. Otherwise it remains a whole-tensor
-operation, and `--require-row` refuses a graph whose full changing closure is
-not row-capable. This per-operator capability is not, by itself, qualification
-of a direct imported package.
-
-Direct static INT8 import has one affine contract: preserve the producer's
-activation scales, zero points, weight scales, and serialized INT8/U8 weight
-bytes. No second activation-profile collection, recalibration, or affine rewrite
-exists for an already-quantized ONNX model, and the importer exposes no such
-mode or profile option. The generic exporter normally enables exact layout
-cleanup; an importer that must run a structural fusion first can pass
-`--defer-static-qdq-layout-optimization` and invoke the same cleanup in its
-later explicit optimizer stage. Deferral changes only pass ordering, not the
-affine or payload policy. Exact post-import passes may intern
-only byte-identical scalar affine references, replace singleton-only Transposes
-with storage-only Reshapes, cancel proven inverse Transposes, hoist a pointwise
-island across inverse Transposes, and commute a closed same-affine
-`DQ -> layout -> Q` chain into the byte domain. They keep numeric affine values
-and weight payloads unchanged. Opt-in compute and attention migrations also
-reuse those existing producer affines; they never reconstruct or requantize
-weights.
-
-There is no second deployable graph schema. The deployable semantic artifact is
-exactly the optimized `volvox-graph/v1` document and its safetensors. The
-optional `volvox-compiled-model-plan/v1` document described above is a derived,
-content-addressed inspection/search record; current runtimes do not consume it
-as a model package. Provider selection, partitioning, kernel preparation,
-target memory, and executable caches remain owned by runtime `CompiledModel`
-preparation and are recreated for the exact model revision when needed.
-
 ## 5. PTQ, specialization, and mixed precision
 
 PTQ is the registry's `quantization-authoring` stage, not another exact cleanup
@@ -571,150 +491,84 @@ those model-neutral primitives; dead-code elimination performs the final bank
 pruning. A model-specific tool may bind a route and qualify the resulting
 artifact, but route names, family values, and policy do not enter the passes.
 
-## 6. TinyReceipt qualified result
+### 5.1 Island shape decides what static-QDQ fusion can reach
 
-The current qualification scope is deliberately narrow: family `f0` (`phone`)
-and family `f1` (`address`) only. Families `f2` (`store`), `f3` (`item_row`),
-`f4` (`item_math`), `f5` (`item_lookup`), `f6` (`math`), and `f7` (`other`) are
-explicitly unqualified. No score or performance claim is made for them.
+`static-qdq-compute-fusion` matches one shape only:
 
-### Exact specialized calibration
+~~~text
+byte -> DequantizeLinear -> <exactly one float op> -> QuantizeLinear -> byte
+~~~
 
-Each qualified family was specialized before calibration, then calibrated on
-eight disjoint training records with two decoder prefixes per record on WASM.
-Both runs covered encoder and decoder and reported zero routing mismatches.
+Both ends already carry measured affines, so the rewrite invents nothing. The
+consequence is easy to misread as a coverage gap in the op list when it is
+actually a **shape** constraint. In the TinyReceipt encoder the pass fused 7
+GELU islands and refused everything else, because the remaining float region is
 
-| Family | Records | Prefixes per record | Backend | Route mismatches | Records SHA-256 | Calibration profile SHA-256 | Published provenance artifact SHA-256 |
-| --- | ---: | ---: | --- | ---: | --- | --- | --- |
-| `f0` phone | 8 | 2 | WASM | 0 | `fe885da4b7d8a4771b7beffb22f489ae9005a4f45e56c6bc9fc8ec6dbae0387e` | `338a401deb0945f870d03a54cad983c3670edb1ce5b08e9f2556d1c6fb7136a3` | `2a96e5d65d0af30cdfc47edce388ed9f3098cda824fe00c4f7e415dee3356c95` |
-| `f1` address | 8 | 2 | WASM | 0 | `15a42fe8647786392f38cbafa2007460cc57da9f4bc9a966a9d17fd0b4305604` | `ed8eaf5fc2c1315a6f35fd74dc0c6bfc51224b31fcde09b492d8192cb38abcf0` | `574ac085f1dcf399cb6948b315e34c37505b57912868d3a0c51451d5454f9c29` |
+~~~text
+byte -> DQ -> GroupNorm -> v25 -+-> Sigmoid -+
+                                 \-----------+-> Mul -> Q -> byte
+~~~
 
-The published provenance artifact differs from the pre-publication profile
-because publication finalizes and sanitizes provenance. Both identities are
-recorded so the result can be audited without treating a path string as model
-authority.
+Two float computations sit between the DQ and the Q. `GroupNorm` is not closed
+(its output feeds two float consumers and no `Q`); the `Sigmoid`/`Mul` pair is
+not closed (its input arrives as float, not through a `DQ`). Neither is
+individually a legal island, so both are correctly refused. That the pair is
+algebraically `SiLU` does not help: folding it first still leaves two ops.
 
-Shared source identities for both qualified packages are:
+Splitting such a region requires a **new** quantization boundary on the
+intermediate, which requires an affine, which requires calibration. See
+[typed-ptq.md](typed-ptq.md) for why that affine cannot be synthesized from
+weights. This is the general rule: *fusion coverage is limited by where
+boundaries exist, and creating boundaries is authoring, not optimization.*
 
-| Source | SHA-256 |
-| --- | --- |
-| producer source manifest | `1ecbfacad9c56173b299a26ffc19fcb37f997952c85e31765cc0134b7016e92f` |
-| encoder ONNX | `1889e1f5ede379489d38192597d3c70ad0dfaf966aa82ef609df99704d816451` |
-| decoder ONNX | `fd98d9f0a30c1fac869cca668ae2dcaa4ea260efe1ad3d2740e4f6677b48d494` |
-| calibration implementation | `06817b82d8ad3c8d6432b8e0f39b0feab52f6cdcf2a362ba3dc23139ba77e431` |
-| specialized pre-PTQ encoder graph | `e1734e3e7a5bdb5225b155e31897e418c1c19dd6f0ce2aa3fddb1cb63b79bd73` |
-| specialized pre-PTQ decoder graph | `f1d35eaed7d3d1c934071a00896e41e9389e74bdf20213ec434dad287f201133` |
+### 5.2 A fusion is only worth taking if the byte kernel is competitive
 
-### Generated topology and runtime evidence
+Byte-domain replacement is usually assumed to win because it quarters memory
+traffic. That assumption must be measured, because the float kernel it replaces
+may be the better-optimized one. Measured on the encoder's largest island
+(1x160x336x48, 16 groups, 2.58M elements):
 
-The calibration identities above document historical specialized inputs; they
-do not supply current graph topology, accuracy, or performance evidence for a
-new package revision. Node inventories must come from that package's encoder
-and decoder graphs and export reports. Kernel microbenchmarks remain useful for
-physical-kernel selection, but they do not substitute for end-to-end evidence.
+| path | ms | |
+| --- | ---: | --- |
+| `dequantize` | 2.33 | |
+| `groupnorm_f32` | 8.21 | streaming + vectorized |
+| `silu_f32` | 5.07 | |
+| `quantize` | 1.11 | |
+| **float island total** | **16.72** | |
+| `qgroupnorm_i8u8` (original) | **19.13** | scalar, no SIMD |
+| `qsilu_i8u8` | **1.43** | 256-entry LUT |
+| **byte island total (original)** | **20.56** | **slower than float** |
 
-## 7. Heldout evidence and interpretation
+`QSiLU` behaved exactly as predicted — a LUT beats `expf` per element by 3.5x.
+`QGroupNorm` did not: it read a quarter of the bytes and still lost, because it
+was a purely scalar validating kernel while `groupnorm_f32` had already been
+vectorized. Fusing on those numbers would have *replaced an optimized float
+kernel with an unoptimized quantized one*, and end-to-end measurement confirmed
+no gain.
 
-Generate heldout evidence for the exact package identities under qualification.
-For the current TinyReceipt native comparison, the application-owned profiler
-runs FP32-from-FP32, INT8-from-FP32, exact INT8-from-INT8, and canonical migrated
-INT8-from-INT8 on identical sorted cases with strict native CPU, incremental
-decode, required row execution, and application-only timing. Its versioned JSON
-report binds all package assets, the executable, annotations, and images by
-content hash and records timing distributions, exact match, route selection,
-and cross-artifact answer/full-text agreement.
+The fix keeps the contract intact. `QGroupNorm`'s statistics are order-dependent
+float reductions and were left byte-for-byte alone; only the final transform —
+which is elementwise, so traversal order cannot change a result — was moved from
+`groups` strided passes to one contiguous sweep, with each group's `(mean,
+1/sigma)` published per channel.
 
-The report-generation command and stable package paths live in
-`examples/tiny_receipt_vqa/README.md`. Numeric results belong in a report or a
-release record that cites its digest; this design document intentionally has no
-floating “current” node-count, latency, or accuracy table. Heldout evaluation
-must remain disjoint from calibration and must not select scales, weights,
-operator exceptions, or routing policy. A legacy artifact can be an additional
-compatibility oracle only when its calibration overlap is disclosed; it is not
-automatically a clean accuracy baseline.
+| | ms | |
+| --- | ---: | --- |
+| `qgroupnorm_i8u8` before | 19.13 | |
+| `qgroupnorm_i8u8` after | **11.56** | **1.65x**, bit-identical on 54 differential cases |
+| byte island total after | **12.99** | now **1.29x** faster than the float island |
 
-## 8. Why the old path lost, and what remains
+End-to-end, three interleaved paired rounds favoured the fused package every
+time (-25.5, -15.0, -57.0 ms cold generation), consistent with the 18.7 ms the
+kernel arithmetic predicts across five sites.
 
-The original “1:1 ONNX import” was slower than the specialized legacy package
-because graph equivalence is not execution equivalence. It retained provider-
-oriented Q/DQ boundaries, layout conversions, generic route/control flow, and
-intermediate materialization. ONNX Runtime's own quantization guidance warns
-that Q/DQ overhead can erase INT8 gains. The legacy package had already baked
-the family choice and adapter weights into a compact graph and emitted the
-terminal token ID, so it was a pre-specialized deployment artifact rather than
-merely a quantized interchange graph.
+**The rule this establishes:** before enabling a byte-domain fusion, time the
+replacement against the float kernels it displaces on the real shape. A fusion
+that is structurally valid and accuracy-neutral can still be a regression, and
+the deciding factor is how much optimization work each kernel has already
+received — not the dtype.
 
-There are now two supported packed-projection cleanup paths, with deliberately
-different contracts:
-
-| Input path | Default exact rewrite | Resulting execution contract |
-| --- | --- | --- |
-| FP32 structural optimization before PTQ | `RuntimeGroupedProjectionSplitPass` splits packed self- and cross-attention Q/K/V before calibration; runtime routing stays live unless the caller explicitly specializes it | Session package after calibrated PTQ, attention legalization, and `token_ids` output specialization; qualification still applies per route and target |
-| Imported static INT8 QDQ | Preserve producer activation/weight affines, use `RuntimePackedQLinearSplitPass`, then run exact affine-reference and layout cleanup without changing numeric affine or weight payload bytes; `--fuse-attention --fuse-static-qdq-compute` explicitly enables producer-affine numerical migrations | The no-flag exact package retains F32 logits and an explicit host argmax; adding `--canonical-deployment` after both migrations adds `v4_keep` and I32 `token_ids`, matching the session boundary but not inheriting PTQ correctness or performance evidence |
-
-The exact layout passes remove only locally proven storage work; they do not
-claim that the remaining producer hybrid graph is equivalent to the compact
-session ABI. The canonical Direct candidate additionally enables both explicit
-numerical migrations and the caller-ABI specialization above.
-
-Current node counts, performance, and accuracy must be generated from the exact
-published artifacts rather than copied from an earlier local probe. The
-TinyReceipt native heldout profiler compares FP32-from-FP32,
-INT8-from-FP32, exact INT8-from-INT8, and canonical migrated INT8-from-INT8 in a
-single strict incremental native-CPU run. Its JSON report content-binds package
-graphs and weights, the executable, annotations, and images, then publishes
-per-package timing distributions and exact match plus cross-artifact answer and
-structured-text agreement. The commands and stable artifact names are in
-`examples/tiny_receipt_vqa/README.md`; this design document intentionally embeds
-no current numeric result before that generated report exists.
-
-If such a report shows a Direct-versus-PTQ gap, inspect the persisted graph and
-split the timing into encoder, first decoder step, and steady decoder work.
-Producer Q/DQ boundaries, residual F32 islands, layouts, and cold first-use
-materialization can affect the first two even when the incremental decoder cache
-is operating correctly; steady-token timing is the relevant cache-path signal.
-
-`--require-row` selects and validates the native incremental row scheduler. It
-does not convert arbitrary full-tensor operators into row kernels. The FP32
-pre-PTQ cleanup makes the later session graph eligible for that scheduler; the
-exact direct-INT8 cleanup alone makes no whole-graph promise. Its unfused
-`QBatchMatMul` nodes can nevertheless use the native one-row kernel when their
-left row changes and their complete right operand remains clean; any dirty,
-broadcast-general, aliased, or otherwise unsupported form fails the row gate.
-
-Incorrect results came from treating graph conversion and a small structural
-check as sufficient qualification. The replacement process binds calibration
-to the exact optimized graph after any explicitly requested specialization,
-uses disjoint representative training records, records route coverage without
-making it quantization legality, covers decoder prefixes and immutable embedding
-ranges, compares intermediates independently, and gates on task answers.
-Historical specialized calibration is complete for `f0` and `f1`; the
-runtime-routed artifact and the other six families are not granted that
-qualification by the structural changes alone.
-
-The highest-value remaining work is compiler/backend work:
-
-1. **Fuse explicit float islands internally.** Teach backend `CompiledModel`
-   preparation to recognize `DQ → float Add/Embedding/LayerNorm → Q` regions
-   and generate fused physical kernels or boundary-aware schedules. Preserve
-   the explicit v1 graph and selected numerical policy while avoiding unnecessary buffers,
-   conversions, and dispatches.
-2. **Complete TensorFlow Lite lowering.** Move every supported TFLite operator
-   from lossless SourceIR through explicit RuntimeIR legality; fail with precise
-   diagnostics for unsupported forms. Do not create a second TFLite-specific
-   graph contract.
-3. **Improve backend compilation.** Derive capability-qualified partitions,
-   physical layouts, memory schedules, and measured tactic caches while
-   preparing `CompiledModel` for an exact package revision. These are runtime
-   compiled state or rebuildable caches, never additional required package
-   files; portable graph semantics and safetensors remain the sole deployment
-   inputs.
-
-Backward compatibility is not part of this roadmap. If the current contract
-changes, producers and packages are regenerated to the new current contract
-and non-current inputs are rejected.
-
-## 9. Best-practice release checklist
+## 6. Best-practice release checklist
 
 - Import once into lossless SourceIR; never optimize by mutating importer-only
   structures.
@@ -738,7 +592,7 @@ and non-current inputs are rejected.
 - Publish only qualified model families and targets. Absence of evidence is not
   compatibility or performance support.
 
-## 10. Non-goals
+## 7. Non-goals
 
 - Runtime-load graph rewriting; optimization remains offline.
 - Training ownership; PyTorch remains the experimentation/training system.

@@ -1,6 +1,6 @@
 @group(0) @binding(0) var<storage, read> input : array<f32>;
-// WebGPU forward normalizes every F32 linear weight to [d_out, d_in]. Native
-// training may retain either layout and selects it through weight_din_layout.
+// WebGPU forward preserves each F32 linear weight's canonical storage layout.
+// Training selects [d_in,d_out] or [d_out,d_in] through weight_din_layout.
 @group(0) @binding(1) var<storage, read> weight : array<f32>;
 @group(0) @binding(2) var<storage, read> grad_output : array<f32>;
 @group(0) @binding(3) var<storage, read_write> grad_input : array<f32>;

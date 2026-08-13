@@ -33,6 +33,6 @@ WASM_EXPORT("gelu_tanh_f32")
 void gelu_tanh_f32(const float* input, float* output, int n) {
     for (int i = 0; i < n; i++) {
         float x = input[i];
-        output[i] = 0.5f * x * (1.0f + fast_tanhf(0.79788456f * (x + 0.044715f * x * x * x)));
+        output[i] = 0.5f * x * (1.0f + tanhf(0.79788456f * (x + 0.044715f * x * x * x)));
     }
 }

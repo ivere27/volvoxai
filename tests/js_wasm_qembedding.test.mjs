@@ -7,7 +7,7 @@ import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
 
-import { Graph } from '../ts/core/Graph.js';
+import { RuntimeGraph } from '../ts/core/RuntimeGraph.js';
 import { CPUEngine } from '../ts/backends/CPUEngine.js';
 import { WasmEngine } from '../ts/backends/WasmEngine.js';
 
@@ -41,7 +41,7 @@ function qEmbeddingGraph({
   outputDtype = 'int8',
   outputQuantization = { scheme: 'per_tensor', scale: 0.25, zero_point: -1 },
 } = {}) {
-  const graph = new Graph();
+  const graph = new RuntimeGraph();
   const input = graph.addInput('ids', idsShape, 'int32');
   const weight = graph.addWeight('table', weightShape, weightDtype, {
     buffer: bytes(weightDtype, weightValues), quantization: weightQuantization,

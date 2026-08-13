@@ -302,6 +302,56 @@ static int test_groupnorm_optional_bias_kernel(void) {
     return 0;
 }
 
+static int test_groupnorm_narrow_group_kernel(void) {
+    enum { SPATIAL = 5, CHANNELS = 12, GROUPS = 4, CPG = 3 };
+    float input[SPATIAL * CHANNELS];
+    float weight[CHANNELS];
+    float bias[CHANNELS];
+    float expected[SPATIAL * CHANNELS];
+    float actual[SPATIAL * CHANNELS];
+    const double epsilon = 1.0e-5;
+    for (int index = 0; index < SPATIAL * CHANNELS; index++)
+        input[index] = (float)((index * 17 % 29) - 14) * 0.125f;
+    for (int channel = 0; channel < CHANNELS; channel++) {
+        weight[channel] = 0.5f + (float)(channel % 5) * 0.125f;
+        bias[channel] = (float)(channel - 6) * 0.03125f;
+    }
+    for (int group = 0; group < GROUPS; group++) {
+        double sum = 0.0;
+        double square = 0.0;
+        const int first = group * CPG;
+        for (int point = 0; point < SPATIAL; point++)
+            for (int local = 0; local < CPG; local++)
+                sum += (double)input[point * CHANNELS + first + local];
+        {
+            const double mean = sum / (double)(SPATIAL * CPG);
+            for (int point = 0; point < SPATIAL; point++) {
+                for (int local = 0; local < CPG; local++) {
+                    const double centered =
+                        (double)input[point * CHANNELS + first + local] - mean;
+                    square += centered * centered;
+                }
+            }
+            {
+                const double inverse = 1.0 /
+                    sqrt(square / (double)(SPATIAL * CPG) + epsilon);
+                for (int point = 0; point < SPATIAL; point++) {
+                    for (int local = 0; local < CPG; local++) {
+                        const int channel = first + local;
+                        const int index = point * CHANNELS + channel;
+                        expected[index] = (float)(((double)input[index] - mean) *
+                            inverse * weight[channel] + bias[channel]);
+                    }
+                }
+            }
+        }
+    }
+    CHECK(groupnorm_f32(input, weight, bias, actual, 1, 1, SPATIAL,
+                        CHANNELS, GROUPS, epsilon));
+    CHECK(memcmp(actual, expected, sizeof(actual)) == 0);
+    return 0;
+}
+
 static int8_t quantize_i8(float value, float scale, int zp) {
     int q = (int)lrintf(value / scale + (float)zp);
     if (q < -128) q = -128;
@@ -942,6 +992,15 @@ static int test_qgroupnorm_native_parallel_kernel(void) {
                 groups, 0.037f, input_zero_point, 0.041f,
                 output_zero_point, 1.0e-5f, input_dtype,
                 output_dtype) == 1);
+            /* No bound pool exercises the same SIMD group-quad kernel through
+             * its single-threaded route.  Keep that path byte-exact separately
+             * from the parallel scheduling check below. */
+            result = vx_qgroupnorm_i8u8_native_validated(
+                input, gamma, beta, actual, batch, height, width, channels,
+                groups, 0.037f, input_zero_point, 0.041f,
+                output_zero_point, 1.0e-5f, input_dtype, output_dtype);
+            CHECK(result == 1);
+            CHECK(memcmp(actual, reference, elements) == 0);
             scope = vx_kernel_thread_pool_scope_enter(pool);
             result = vx_qgroupnorm_i8u8_native_validated(
                 input, gamma, beta, actual, batch, height, width, channels,
@@ -1644,7 +1703,7 @@ static int test_physical_qlinear_native_dispatch(void) {
     return 0;
 }
 
-/* The TinyReceipt decoder seed presents full 192-row dense calls.  Force the
+/* A bounded decoder seed presents full 192-row dense calls. Force the
  * native row scheduler through one- and four-thread configurations and keep
  * the incremental M=1 result in the same parity fixture. */
 static int test_physical_qlinear_native_threaded_dispatch(void) {
@@ -1822,6 +1881,36 @@ static int test_physical_qlinear_vnni_remapping(void) {
     return 0;
 }
 
+/* The canonical affine requantization rounds the multiply to F32 before it
+ * adds the output zero point.  On an AVX-512-VNNI host, contracting these two
+ * operations to FMA changes this exact fixture from the ties-to-even value 6
+ * to 7.  Keep the widest native QLinear route byte-identical to the portable
+ * ABI while retaining a useful check on hosts that select a narrower route. */
+static int test_physical_qlinear_requantize_no_fma(void) {
+    enum { d_in = 320 };
+    int8_t input[d_in];
+    int8_t weight[d_in];
+    const int32_t bias[1] = {1672};
+    const float weight_scale[1] = {1.0f / 88.0f};
+    const int32_t weight_zero_point[1] = {0};
+    int8_t portable_output = -1;
+    int8_t native_output = -1;
+    memset(input, -7, sizeof(input));
+    memset(weight, 0, sizeof(weight));
+    CHECK(qlinear_i8u8(input, weight, bias, weight_scale,
+                       weight_zero_point, &portable_output, 1u, d_in, 1u,
+                       1.0f / 32.0f, -7, 1.0f / 16.0f, -3,
+                       VX_DTYPE_I8, VX_DTYPE_I8, VX_DTYPE_I8) == 1);
+    CHECK(vx_qlinear_i8u8_native(
+              input, weight, bias, weight_scale, weight_zero_point,
+              &native_output, 1u, d_in, 1u, 1.0f / 32.0f, -7,
+              1.0f / 16.0f, -3, VX_DTYPE_I8, VX_DTYPE_I8,
+              VX_DTYPE_I8) == 1);
+    CHECK(portable_output == 6);
+    CHECK(native_output == portable_output);
+    return 0;
+}
+
 /* Exercise the native QConv dispatcher with VNNI-width channel blocks,
  * groups, asymmetric padding, dilation, stride, ReLU6, and scalar tails.
  * Every byte-domain combination is compared directly with the portable ABI. */
@@ -1922,6 +2011,37 @@ static int test_physical_qconv_native_dispatch(void) {
                                       VX_DTYPE_I8) == 0);
         CHECK(reference == 41 && actual == 41);
     }
+    return 0;
+}
+
+/* Mirror the QLinear tie fixture through the direct 1x1 QConv route.  A host
+ * selecting the AVX-512-VNNI target must retain the same separate F32
+ * multiply/add boundaries as every portable physical W8A8 kernel. */
+static int test_physical_qconv_requantize_no_fma(void) {
+    enum { channels = 320 };
+    int8_t input[channels];
+    int8_t weight[channels];
+    const int32_t bias[1] = {1672};
+    const float weight_scale[1] = {1.0f / 88.0f};
+    const int32_t weight_zero_point[1] = {0};
+    int8_t portable_output = -1;
+    int8_t native_output = -1;
+    memset(input, -7, sizeof(input));
+    memset(weight, 0, sizeof(weight));
+    CHECK(qconv2d_i8u8(
+              input, weight, bias, weight_scale, weight_zero_point,
+              &portable_output, 1u, 1u, 1u, channels, 1u, 1u, 1u,
+              1u, 1u, channels, 1u, 1u, 1u, 1u, 0u, 0u, 0u, 0u,
+              1u, 0u, 1.0f / 32.0f, -7, 1.0f / 16.0f, -3,
+              VX_DTYPE_I8, VX_DTYPE_I8, VX_DTYPE_I8) == 1);
+    CHECK(vx_qconv2d_i8u8_native(
+              input, weight, bias, weight_scale, weight_zero_point,
+              &native_output, 1u, 1u, 1u, channels, 1u, 1u, 1u,
+              1u, 1u, channels, 1u, 1u, 1u, 1u, 0u, 0u, 0u, 0u,
+              1u, 0u, 1.0f / 32.0f, -7, 1.0f / 16.0f, -3,
+              VX_DTYPE_I8, VX_DTYPE_I8, VX_DTYPE_I8) == 1);
+    CHECK(portable_output == 6);
+    CHECK(native_output == portable_output);
     return 0;
 }
 
@@ -2030,6 +2150,19 @@ static int test_physical_qconv_im2col_qlinear_dispatch(void) {
                            1, 1, 1, 0, 1.0f / 32.0f, 123,
                            1.0f / 16.0f, -3, VX_DTYPE_U8, VX_DTYPE_I8,
                            VX_DTYPE_I8) == 1);
+        /* The prepacked one-thread route is where N32 VNNI consumes ordinary
+         * U8 activations.  It must not inherit the signed-domain im2col policy
+         * used by the multi-threaded N16 AVX2 route. */
+        vx_set_num_threads(1);
+        CHECK(vx_qconv2d_i8u8_native_prepacked(
+                  input_u8, weight_i8, bias, weight_scales, weight_zp_i8,
+                  single_thread, batch, input_height, input_width,
+                  input_channels, output_height, output_width,
+                  output_channels, kernel_height, kernel_width,
+                  input_channels, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0,
+                  1.0f / 32.0f, 123, 1.0f / 16.0f, -3,
+                  VX_DTYPE_U8, VX_DTYPE_I8, VX_DTYPE_I8, packed, NULL) == 1);
+        CHECK(memcmp(reference, single_thread, sizeof(reference)) == 0);
         vx_set_num_threads(4);
         CHECK(vx_qconv2d_i8u8_native_prepacked(
                   input_u8, weight_i8, bias, weight_scales, weight_zp_i8,
@@ -2037,7 +2170,48 @@ static int test_physical_qconv_im2col_qlinear_dispatch(void) {
                   output_height, output_width, output_channels, kernel_height,
                   kernel_width, input_channels, 1, 1, 1, 1, 1, 1, 1, 1, 1,
                   0, 1.0f / 32.0f, 123, 1.0f / 16.0f, -3, VX_DTYPE_U8,
-                  VX_DTYPE_I8, VX_DTYPE_I8, packed) == 1);
+                  VX_DTYPE_I8, VX_DTYPE_I8, packed, NULL) == 1);
+        CHECK(memcmp(reference, threaded, sizeof(reference)) == 0);
+
+        /* Dilation disables the contiguous 3x3-row writer and exercises the
+         * generic im2col worker specializations.  The unpacked call selects
+         * the plain worker; the symmetric prepack selects the remap worker on
+         * AVX2.  Both one-thread and pooled writers must remain byte-exact. */
+        CHECK(qconv2d_i8u8(input_u8, weight_i8, bias, weight_scales,
+                           weight_zp_i8, reference, batch, input_height,
+                           input_width, input_channels, output_height,
+                           output_width, output_channels, kernel_height,
+                           kernel_width, input_channels, 1, 1, 2, 2, 2, 2,
+                           2, 2, 1, 0, 1.0f / 32.0f, 123,
+                           1.0f / 16.0f, -3, VX_DTYPE_U8, VX_DTYPE_I8,
+                           VX_DTYPE_I8) == 1);
+        vx_set_num_threads(1);
+        CHECK(vx_qconv2d_i8u8_native(
+                  input_u8, weight_i8, bias, weight_scales, weight_zp_i8,
+                  single_thread, batch, input_height, input_width,
+                  input_channels, output_height, output_width,
+                  output_channels, kernel_height, kernel_width,
+                  input_channels, 1, 1, 2, 2, 2, 2, 2, 2, 1, 0,
+                  1.0f / 32.0f, 123, 1.0f / 16.0f, -3,
+                  VX_DTYPE_U8, VX_DTYPE_I8, VX_DTYPE_I8) == 1);
+        CHECK(memcmp(reference, single_thread, sizeof(reference)) == 0);
+        CHECK(vx_qconv2d_i8u8_native_prepacked(
+                  input_u8, weight_i8, bias, weight_scales, weight_zp_i8,
+                  single_thread, batch, input_height, input_width,
+                  input_channels, output_height, output_width,
+                  output_channels, kernel_height, kernel_width,
+                  input_channels, 1, 1, 2, 2, 2, 2, 2, 2, 1, 0,
+                  1.0f / 32.0f, 123, 1.0f / 16.0f, -3,
+                  VX_DTYPE_U8, VX_DTYPE_I8, VX_DTYPE_I8, packed, NULL) == 1);
+        CHECK(memcmp(reference, single_thread, sizeof(reference)) == 0);
+        vx_set_num_threads(4);
+        CHECK(vx_qconv2d_i8u8_native_prepacked(
+                  input_u8, weight_i8, bias, weight_scales, weight_zp_i8,
+                  threaded, batch, input_height, input_width, input_channels,
+                  output_height, output_width, output_channels, kernel_height,
+                  kernel_width, input_channels, 1, 1, 2, 2, 2, 2, 2, 2, 1,
+                  0, 1.0f / 32.0f, 123, 1.0f / 16.0f, -3,
+                  VX_DTYPE_U8, VX_DTYPE_I8, VX_DTYPE_I8, packed, NULL) == 1);
         CHECK(memcmp(reference, threaded, sizeof(reference)) == 0);
         free(packed);
     }
@@ -2109,7 +2283,7 @@ static int test_physical_qconv_native_threaded_dispatch(void) {
     return 0;
 }
 
-/* TinyReceipt starts with a grayscale 3x3/stride-2 convolution.  Its one input
+/* A grayscale encoder starts with a 3x3/stride-2 convolution. Its one input
  * channel does not fill one AVX2 lane block, so the native path amortizes the
  * shared input/tap traversal across eight output channels and parallelizes
  * spatial locations.  Cover that small-C path on both sides of the pool. */
@@ -2202,9 +2376,42 @@ static int test_physical_qconv_native_grayscale_stem_dispatch(void) {
                                              output_dtype) == 1);
                 CHECK(memcmp(reference, single_thread, sizeof(reference)) == 0);
                 CHECK(memcmp(reference, threaded, sizeof(reference)) == 0);
+
+                /* Same call served from the load-time transpose the runtime
+                 * caches in QConv2D node metadata. It must be byte-identical
+                 * to the per-call transpose it replaces. */
+                {
+                    const size_t packed_bytes =
+                        vx_w8a8_qconv_small_c_pack_size(kernel_height,
+                            kernel_width, input_channels, output_channels, 1u);
+                    if (packed_bytes) {
+                        void *packed = malloc(packed_bytes);
+                        CHECK(packed != NULL);
+                        CHECK(vx_w8a8_qconv_pack_small_c(packed, packed_bytes,
+                                  weight, kernel_height, kernel_width,
+                                  input_channels, output_channels, 1u) == 1);
+                        memset(threaded, 0, sizeof(threaded));
+                        CHECK(vx_qconv2d_i8u8_native_prepacked(input, weight,
+                                  bias, weight_scales, weight_zero_points,
+                                  threaded, batch, input_height, input_width,
+                                  input_channels, output_height, output_width,
+                                  output_channels, kernel_height, kernel_width,
+                                  input_channels, 2, 2, 1, 1, 1, 1, 1, 1, 1, 2,
+                                  1.0f / 32.0f, input_zero_point,
+                                  1.0f / 16.0f, output_zero_point,
+                                  input_dtype, weight_dtype, output_dtype,
+                                  NULL, packed) == 1);
+                        CHECK(memcmp(reference, threaded, sizeof(reference)) == 0);
+                        free(packed);
+                    }
+                }
             }
         }
     }
+    /* The size query is the eligibility gate the runtime allocates against:
+     * wide inputs never reach the narrow-input kernel. */
+    CHECK(vx_w8a8_qconv_small_c_pack_size(3u, 3u, 64u, 48u, 1u) == 0u);
+    CHECK(vx_w8a8_qconv_small_c_pack_size(3u, 3u, 1u, 50u, 1u) == 0u);
     vx_set_num_threads(0);
     return 0;
 }
@@ -4438,6 +4645,117 @@ static int write_quantized_test_graph(const char* path, const char* graph) {
     return 0;
 }
 
+static int test_physical_cached_bias_requires_immutable_bias(void) {
+    static const char* const paths[4] = {
+        "/tmp/volvox-qlinear-public-bias-rejected.json",
+        "/tmp/volvox-qlinear-produced-bias-rejected.json",
+        "/tmp/volvox-qconv-public-bias-rejected.json",
+        "/tmp/volvox-qconv-produced-bias-rejected.json",
+    };
+    static const char* const graphs[4] = {
+        "{\"format\":\"volvox-graph/v1\",\"inputs\":{"
+        "\"x\":{\"shape\":[1,1],\"dtype\":\"int8\"},"
+        "\"b\":{\"shape\":[3],\"dtype\":\"int32\"}},"
+        "\"nodes\":[{\"opType\":\"QLinear\",\"inputs\":{"
+        "\"input\":\"x\",\"weight\":\"lw\",\"bias\":\"b\"},"
+        "\"outputs\":{\"out\":\"y\"},\"outputs_shape\":{\"out\":[1,3]},"
+        "\"outputs_dtype\":{\"out\":\"uint8\"},\"params\":{}}],"
+        "\"outputs\":[\"y\"],\"quantization\":{"
+        "\"format\":\"volvox-affine-safetensors/v1\",\"tensors\":{"
+        "\"x\":{\"scheme\":\"per_tensor\",\"scale_tensor\":"
+        "\"__fixture_affine.scale.0\",\"zero_point_tensor\":"
+        "\"__fixture_affine.zero.0\"},\"y\":{\"scheme\":\"per_tensor\","
+        "\"scale_tensor\":\"__fixture_affine.scale.0\","
+        "\"zero_point_tensor\":\"__fixture_affine.zero.1\"},"
+        "\"lw\":{\"scheme\":\"per_axis\",\"axis\":0,"
+        "\"scale_tensor\":\"__fixture_affine.scale.1\","
+        "\"zero_point_tensor\":\"__fixture_affine.zero.2\"}}}}",
+
+        "{\"format\":\"volvox-graph/v1\",\"inputs\":{"
+        "\"x\":{\"shape\":[1,1],\"dtype\":\"int8\"},"
+        "\"bias_source\":{\"shape\":[3],\"dtype\":\"int32\"}},"
+        "\"nodes\":[{\"opType\":\"Reshape\",\"inputs\":{"
+        "\"input\":\"bias_source\"},\"outputs\":{\"out\":\"b\"},"
+        "\"outputs_shape\":{\"out\":[3]},\"outputs_dtype\":{"
+        "\"out\":\"int32\"},\"params\":{\"shape\":[3]}},{"
+        "\"opType\":\"QLinear\",\"inputs\":{\"input\":\"x\","
+        "\"weight\":\"lw\",\"bias\":\"b\"},\"outputs\":{\"out\":\"y\"},"
+        "\"outputs_shape\":{\"out\":[1,3]},\"outputs_dtype\":{"
+        "\"out\":\"uint8\"},\"params\":{}}],\"outputs\":[\"y\"],"
+        "\"quantization\":{\"format\":\"volvox-affine-safetensors/v1\","
+        "\"tensors\":{\"x\":{\"scheme\":\"per_tensor\","
+        "\"scale_tensor\":\"__fixture_affine.scale.0\","
+        "\"zero_point_tensor\":\"__fixture_affine.zero.0\"},"
+        "\"y\":{\"scheme\":\"per_tensor\",\"scale_tensor\":"
+        "\"__fixture_affine.scale.0\",\"zero_point_tensor\":"
+        "\"__fixture_affine.zero.1\"},\"lw\":{\"scheme\":\"per_axis\","
+        "\"axis\":0,\"scale_tensor\":\"__fixture_affine.scale.1\","
+        "\"zero_point_tensor\":\"__fixture_affine.zero.2\"}}}}",
+
+        "{\"format\":\"volvox-graph/v1\",\"inputs\":{"
+        "\"x\":{\"shape\":[1,1,2,1],\"dtype\":\"int8\"},"
+        "\"b\":{\"shape\":[3],\"dtype\":\"int32\"}},"
+        "\"nodes\":[{\"opType\":\"QConv2D\",\"inputs\":{"
+        "\"input\":\"x\",\"weight\":\"cw\",\"bias\":\"b\"},"
+        "\"outputs\":{\"out\":\"y\"},\"outputs_shape\":{"
+        "\"out\":[1,1,2,3]},\"outputs_dtype\":{\"out\":\"uint8\"},"
+        "\"params\":{}}],\"outputs\":[\"y\"],\"quantization\":{"
+        "\"format\":\"volvox-affine-safetensors/v1\",\"tensors\":{"
+        "\"x\":{\"scheme\":\"per_tensor\",\"scale_tensor\":"
+        "\"__fixture_affine.scale.2\",\"zero_point_tensor\":"
+        "\"__fixture_affine.zero.0\"},\"y\":{\"scheme\":\"per_tensor\","
+        "\"scale_tensor\":\"__fixture_affine.scale.2\","
+        "\"zero_point_tensor\":\"__fixture_affine.zero.8\"},"
+        "\"cw\":{\"scheme\":\"per_axis\",\"axis\":0,"
+        "\"scale_tensor\":\"__fixture_affine.scale.1\","
+        "\"zero_point_tensor\":\"__fixture_affine.zero.2\"}}}}",
+
+        "{\"format\":\"volvox-graph/v1\",\"inputs\":{"
+        "\"x\":{\"shape\":[1,1,2,1],\"dtype\":\"int8\"},"
+        "\"bias_source\":{\"shape\":[3],\"dtype\":\"int32\"}},"
+        "\"nodes\":[{\"opType\":\"Reshape\",\"inputs\":{"
+        "\"input\":\"bias_source\"},\"outputs\":{\"out\":\"b\"},"
+        "\"outputs_shape\":{\"out\":[3]},\"outputs_dtype\":{"
+        "\"out\":\"int32\"},\"params\":{\"shape\":[3]}},{"
+        "\"opType\":\"QConv2D\",\"inputs\":{\"input\":\"x\","
+        "\"weight\":\"cw\",\"bias\":\"b\"},\"outputs\":{\"out\":\"y\"},"
+        "\"outputs_shape\":{\"out\":[1,1,2,3]},\"outputs_dtype\":{"
+        "\"out\":\"uint8\"},\"params\":{}}],\"outputs\":[\"y\"],"
+        "\"quantization\":{\"format\":\"volvox-affine-safetensors/v1\","
+        "\"tensors\":{\"x\":{\"scheme\":\"per_tensor\","
+        "\"scale_tensor\":\"__fixture_affine.scale.2\","
+        "\"zero_point_tensor\":\"__fixture_affine.zero.0\"},"
+        "\"y\":{\"scheme\":\"per_tensor\",\"scale_tensor\":"
+        "\"__fixture_affine.scale.2\",\"zero_point_tensor\":"
+        "\"__fixture_affine.zero.8\"},\"cw\":{\"scheme\":\"per_axis\","
+        "\"axis\":0,\"scale_tensor\":\"__fixture_affine.scale.1\","
+        "\"zero_point_tensor\":\"__fixture_affine.zero.2\"}}}}",
+    };
+    const char* weights_path =
+        "/tmp/volvox-physical-cached-bias-rejected.safetensors";
+    const int linear_shape[2] = {3, 1};
+    const int conv_shape[4] = {3, 1, 1, 1};
+    const int8_t weights[3] = {1, 1, 1};
+    SafetensorsFile file;
+    CHECK(safetensors_init_empty(&file, SAFETENSORS_OPEN_READ_WRITE) == 0);
+    CHECK(safetensors_add_tensor(
+              &file, "lw", SAFETENSORS_DTYPE_I8, linear_shape, 2,
+              weights, sizeof(weights)) == 0);
+    CHECK(safetensors_add_tensor(
+              &file, "cw", SAFETENSORS_DTYPE_I8, conv_shape, 4,
+              weights, sizeof(weights)) == 0);
+    CHECK(safetensors_save(weights_path, &file) == 0);
+    safetensors_free(&file);
+    for (size_t index = 0; index < 4u; index++) {
+        CHECK(write_quantized_test_graph(paths[index], graphs[index]) == 0);
+        CHECK(volvoxai_engine_init(paths[index], weights_path) != 0);
+        volvoxai_engine_shutdown();
+        CHECK(remove(paths[index]) == 0);
+    }
+    CHECK(remove(weights_path) == 0);
+    return 0;
+}
+
 static int test_physical_qbatch_matmul_prefix_scope(void) {
     const char* graph_path =
         "/tmp/volvox-physical-qbatch-prefix-scope-graph.json";
@@ -4984,6 +5302,44 @@ static int test_physical_byte_expand(void) {
     CHECK(expand_nd_i8u8(
               input, actual, input_shape, invalid_output_shape,
               3, 3, 15) == 0);
+    {
+        const uint8_t blocked_input[6] = {1, 2, 3, 11, 12, 13};
+        const uint8_t blocked_expected[24] = {
+            1, 2, 3, 1, 2, 3, 1, 2, 3, 1, 2, 3,
+            11, 12, 13, 11, 12, 13, 11, 12, 13, 11, 12, 13,
+        };
+        const uint32_t blocked_input_shape[3] = {2, 1, 3};
+        const uint32_t blocked_output_shape[3] = {2, 4, 3};
+        uint8_t blocked_actual[24] = {0};
+        CHECK(expand_nd_i8u8(
+                  blocked_input, blocked_actual,
+                  blocked_input_shape, blocked_output_shape,
+                  3, 3, 24) == 1);
+        CHECK(memcmp(blocked_actual, blocked_expected,
+                     sizeof(blocked_actual)) == 0);
+    }
+    {
+        const uint8_t right_aligned_input[2] = {7, 11};
+        const uint32_t right_aligned_input_shape[2] = {2, 1};
+        const uint32_t right_aligned_output_shape[4] = {3, 4, 2, 5};
+        uint8_t right_aligned_actual[120] = {0};
+        CHECK(expand_nd_i8u8(
+                  right_aligned_input, right_aligned_actual,
+                  right_aligned_input_shape, right_aligned_output_shape,
+                  2, 4, 120) == 1);
+        for (uint32_t outer = 0; outer < 3; outer++) {
+            for (uint32_t row = 0; row < 4; row++) {
+                for (uint32_t channel = 0; channel < 2; channel++) {
+                    for (uint32_t lane = 0; lane < 5; lane++) {
+                        const uint32_t index =
+                            ((outer * 4u + row) * 2u + channel) * 5u + lane;
+                        CHECK(right_aligned_actual[index] ==
+                              right_aligned_input[channel]);
+                    }
+                }
+            }
+        }
+    }
     CHECK(write_quantized_test_graph(graph_path, graph) == 0);
     CHECK(volvoxai_engine_init(graph_path, NULL) == 0);
     CHECK(volvoxai_engine_set_input_raw("x", T_U8, input, sizeof(input)) == 0);
@@ -5241,7 +5597,7 @@ static int test_numeric_affine_params_rejected(void) {
         "\"outputs\":{\"out\":\"y\"},"
         "\"outputs_shape\":{\"out\":[1,1]},"
         "\"outputs_dtype\":{\"out\":\"float32\"},"
-        "\"params\":{\"weight_layout\":\"OUT_IN\","
+        "\"params\":{\"weight_layout\":\"dout_din\","
         "\"input_scale\":0.25,\"input_zero_point\":0,"
         "\"output_scale\":0.5,\"output_zero_point\":0}}],"
         "\"outputs\":[\"y\"]}";
@@ -5729,7 +6085,7 @@ static int test_w8a32_linear_regression(void) {
         "\"opType\":\"Linear\",\"inputs\":{\"input\":\"x\",\"weight\":\"w\","
         "\"weight_scale\":\"s\",\"weight_zero_point\":\"z\",\"bias\":\"b\"},"
         "\"outputs\":{\"out\":\"y\"},\"outputs_shape\":{\"out\":[1,2]},"
-        "\"params\":{\"weight_layout\":\"OUT_IN\"}}],\"outputs\":[\"y\"]}";
+        "\"params\":{\"weight_layout\":\"dout_din\"}}],\"outputs\":[\"y\"]}";
     FILE* graph_file = fopen(graph_path, "wb");
     CHECK(graph_file != NULL && fwrite(graph, 1, strlen(graph), graph_file) == strlen(graph));
     CHECK(fclose(graph_file) == 0);
@@ -5809,6 +6165,7 @@ int main(void) {
     CHECK(test_safetensors_rejects_recursive_duplicate_header_keys() == 0);
     CHECK(test_native_cpu_feature_contract() == 0);
     CHECK(test_groupnorm_optional_bias_kernel() == 0);
+    CHECK(test_groupnorm_narrow_group_kernel() == 0);
     CHECK(test_qbatch_matmul_portable_kernel() == 0);
     CHECK(test_qbatch_matmul_native_dispatch() == 0);
     CHECK(test_transpose_i8u8_portable_kernel() == 0);
@@ -5830,7 +6187,9 @@ int main(void) {
     CHECK(test_physical_qlinear_native_dispatch() == 0);
     CHECK(test_physical_qlinear_native_threaded_dispatch() == 0);
     CHECK(test_physical_qlinear_vnni_remapping() == 0);
+    CHECK(test_physical_qlinear_requantize_no_fma() == 0);
     CHECK(test_physical_qconv_native_dispatch() == 0);
+    CHECK(test_physical_qconv_requantize_no_fma() == 0);
     CHECK(test_physical_qconv_im2col_qlinear_dispatch() == 0);
     CHECK(test_physical_qconv_native_threaded_dispatch() == 0);
     CHECK(test_physical_qconv_native_grayscale_stem_dispatch() == 0);
@@ -5842,6 +6201,7 @@ int main(void) {
     CHECK(test_physical_qmatmul_u8_to_i8() == 0);
     CHECK(test_physical_qconv2d_grouped_relu6() == 0);
     CHECK(test_physical_qconv2d_i8_bias_relu() == 0);
+    CHECK(test_physical_cached_bias_requires_immutable_bias() == 0);
     CHECK(test_physical_qadd_and_requantize() == 0);
     CHECK(test_physical_qbatch_matmul_broadcast() == 0);
     CHECK(test_physical_qbatch_matmul_prefix_scope() == 0);

@@ -147,6 +147,7 @@ void volvoxai_engine_clear_qconv_metadata(void) {
         free(g_qconv_meta[i].weight_zero_points);
         free(g_qconv_meta[i].bias);
         free(g_qconv_meta[i].packed_weight);
+        free(g_qconv_meta[i].small_c_packed_weight);
         memset(&g_qconv_meta[i], 0, sizeof(g_qconv_meta[i]));
     }
 }
@@ -1049,7 +1050,11 @@ static int qlinear_metadata_build(int node_index, Node* n) {
         (input->dtype != T_I8 && input->dtype != T_U8) ||
         (weight->dtype != T_I8 && weight->dtype != T_U8) ||
         (output->dtype != T_I8 && output->dtype != T_U8) || bias->dtype != T_I32 ||
-        !input->quantization.valid || !output->quantization.valid) return -1;
+        !input->quantization.valid || !output->quantization.valid ||
+        /* Physical QLinear/QMatMul/QGemm execute from the aligned metadata
+         * bias copy below, not from bias->data. Only an immutable model
+         * tensor can therefore be cached without stale public/producer data. */
+        !volvoxai_engine_tensor_is_model_weight_locked(bias->name)) return -1;
     d_in = input->shape[input->ndim - 1];
     d_out = output->shape[output->ndim - 1];
     if (d_in <= 0 || d_out <= 0 || weight->shape[0] != d_out || weight->shape[1] != d_in ||
@@ -1547,7 +1552,12 @@ static int qconv2d_metadata_build(int node_index, Node* n) {
     if (expected_height != parsed.output_height || expected_width != parsed.output_width) goto fail;
     if (bias && (!bias->data || bias->dtype != T_I32 || bias->ndim != 1 ||
                  bias->shape[0] != (int)parsed.output_channels ||
-                 bias->numel != (long)parsed.output_channels)) goto fail;
+                 bias->numel != (long)parsed.output_channels ||
+                 /* The physical path reads parsed.bias, so a mutable graph
+                  * input or producer output would otherwise be silently
+                  * frozen at model-build time. */
+                 !volvoxai_engine_tensor_is_model_weight_locked(bias->name)))
+        goto fail;
     if (qconv2d_weight_quantization_build(weight, parsed.output_channels,
                                           &parsed.weight_scales,
                                           &parsed.weight_zero_points) != 0) goto fail;
@@ -1593,6 +1603,28 @@ static int qconv2d_metadata_build(int node_index, Node* n) {
             }
         }
     }
+    if (volvoxai_engine_tensor_is_model_weight_locked(weight->name)) {
+        /* Narrow-input convolutions (the RGB stem, say) cannot vectorize their
+         * channel dot product, so the AVX2 kernel transposes OHWI to put eight
+         * output channels under one input load. The bytes never change for an
+         * immutable weight, so pay for the transpose once here instead of on
+         * every call. A zero size means this geometry or target never takes
+         * that path. */
+        const size_t small_c_bytes = vx_w8a8_qconv_small_c_pack_size(
+            parsed.kernel_height, parsed.kernel_width, parsed.input_per_group,
+            parsed.output_channels, parsed.groups);
+        if (small_c_bytes) {
+            parsed.small_c_packed_weight = malloc(small_c_bytes);
+            if (!parsed.small_c_packed_weight || !vx_w8a8_qconv_pack_small_c(
+                    parsed.small_c_packed_weight, small_c_bytes, weight->data,
+                    parsed.kernel_height, parsed.kernel_width,
+                    parsed.input_per_group, parsed.output_channels,
+                    parsed.groups)) {
+                free(parsed.small_c_packed_weight);
+                parsed.small_c_packed_weight = NULL;
+            }
+        }
+    }
     parsed.valid = 1;
     g_qconv_meta[node_index] = parsed;
     return 1;
@@ -1601,6 +1633,7 @@ fail:
     free(parsed.weight_zero_points);
     free(parsed.bias);
     free(parsed.packed_weight);
+    free(parsed.small_c_packed_weight);
     return -1;
 }
 
@@ -1614,6 +1647,24 @@ static void p_iarr(cJSON* p, const char* k, int* out, int maxn, int def) {
         for (int i = 0; i < n; i++) out[i] = cJSON_GetArrayItem(v, i)->valueint;
     } else {
         out[0] = v->valueint;
+    }
+}
+
+/* Pooling kernels consume the origin offset; bottom/right padding is already
+ * reflected in the validated concrete output shape.  Canonical v1 graphs use
+ * [top,left,bottom,right] `pads`, while the symmetric `padding` pair remains a
+ * valid spelling in the closed graph schema. */
+static void p_spatial_pad_origin(cJSON* p, int* y, int* x) {
+    int pads[4];
+    p_pair(p, "padding", 0, y, x);
+    pads[0] = *y;
+    pads[1] = *x;
+    pads[2] = *y;
+    pads[3] = *x;
+    if (p && cJSON_GetObjectItem(p, "pads")) {
+        p_iarr(p, "pads", pads, 4, 0);
+        *y = pads[0];
+        *x = pads[1];
     }
 }
 
@@ -2574,7 +2625,7 @@ int volvoxai_engine_refresh_weight_caches(void) {
         free(g_q8wcache[i]); g_q8wcache[i] = NULL; g_q8wcache_bytes[i] = 0;
     }
     if (build_quant_params_pass() != 0) return -1;
-    if (prepack_conv_weights() != 0) return -1;
+    if (prepack_cpu_weights() != 0) return -1;
     g_weight_caches_dirty = 0;
     return 0;
 }
@@ -2589,7 +2640,7 @@ static int rebuild_after_graph_patch_ex(int reoptimize) {
     if (reoptimize) graph_optimize_operator_fusion();
     if (build_quant_params_pass() != 0) return -1;
     volvoxai_engine_finish_tensor_table_mutation();
-    if (prepack_conv_weights() != 0) return -1;
+    if (prepack_cpu_weights() != 0) return -1;
     g_weight_caches_dirty = 0;
     return 0;
 }
@@ -2965,7 +3016,7 @@ static int graph_patch_snapshot_restore(GraphPatchSnapshot* snapshot) {
     g_removed_graph_output_count = snapshot->removed_output_count;
     if (build_quant_params_pass() != 0) rc = -1;
     volvoxai_engine_finish_tensor_table_mutation();
-    if (prepack_conv_weights() != 0) rc = -1;
+    if (prepack_cpu_weights() != 0) rc = -1;
     g_weight_caches_dirty = rc == 0 ? 0 : 1;
     graph_patch_snapshot_free(snapshot);
     return rc;

@@ -10,7 +10,7 @@ from tools.exporter.optimizer.typed_singleton_transpose import (
     RuntimeSingletonTransposePass,
 )
 from tools.exporter.pipeline import VerifiedPipeline
-from tools.exporter.reference_executor import ReferenceExecutor
+from tools.exporter.reference_executor import execute_reference
 from tools.exporter.runtime_ir import export_runtime_package, import_runtime_package
 
 
@@ -25,13 +25,14 @@ def _transpose_package(
         "id": "move-singletons",
         "opType": "Transpose",
         "inputs": {"input": "x"},
-        "outputs": {"out": "y"},
-        "outputs_shape": {"out": list(output_shape)},
-        "outputs_dtype": {"out": dtype},
+        "outputs": {"out": {
+            "tensor": "y", "shape": list(output_shape), "dtype": dtype,
+        }},
     }
     node["params"] = {"perm": list(permutation)}
     document = {
         "format": "volvox-graph/v1",
+        "dimensions": {},
         "inputs": {"x": {"shape": list(shape), "dtype": dtype}},
         "outputs": ["y"],
         "nodes": [node],
@@ -65,19 +66,22 @@ class RuntimeSingletonTransposePassTests(unittest.TestCase):
                 if dtype == "int8":
                     values = (values.astype(np.int16) - 12).astype(np.int8)
 
-                expected = ReferenceExecutor(before, tensors).run(
-                    {"x": values},
+                expected = execute_reference(
+                    before, tensors, {"x": values},
                 ).outputs["y"]
                 report = VerifiedPipeline([
                     RuntimeSingletonTransposePass(),
-                ]).run(after)
-                actual = ReferenceExecutor(after, tensors).run(
-                    {"x": values},
+                ], shape_profile={}).run(after)
+                actual = execute_reference(
+                    after, tensors, {"x": values},
                 ).outputs["y"]
 
                 self.assertEqual(report.total_changes, 1)
                 self.assertEqual(after.nodes[0].op_type, "Reshape")
-                self.assertEqual(after.nodes[0].attributes, ())
+                self.assertEqual(
+                    after.nodes[0].attributes[0].value,
+                    {"shape": [1, 2, 1, 3, 4]},
+                )
                 np.testing.assert_array_equal(actual, expected)
                 np.testing.assert_array_equal(
                     actual,
@@ -160,7 +164,9 @@ class RuntimeSingletonTransposePassTests(unittest.TestCase):
         original_scale = tensors["scale"].tobytes()
         original_zero = tensors["zero"].tobytes()
 
-        VerifiedPipeline([RuntimeSingletonTransposePass()]).run(graph)
+        VerifiedPipeline(
+            [RuntimeSingletonTransposePass()], shape_profile={},
+        ).run(graph)
         optimized, optimized_tensors = export_runtime_package(graph, tensors)
 
         self.assertIs(graph.tensors["x"].quantization, source_affine)

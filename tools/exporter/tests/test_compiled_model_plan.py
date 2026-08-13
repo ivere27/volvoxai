@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 import unittest
 
 import numpy as np
@@ -23,12 +24,13 @@ from tools.exporter.optimizer.quantized_regions import (
     QuantizedRegionCandidateAnalysis,
 )
 from tools.exporter.optimizer.target import TargetEnvironment
+from tools.exporter.shape_system import ShapeEnvironment
 
 
 def _tensor(
     graph: GraphIR,
     name: str,
-    shape: tuple[int, ...],
+    shape: tuple[int | str, ...],
     dtype: str = "float32",
     *,
     initializer: bool = False,
@@ -151,6 +153,62 @@ def _qlinear_graph() -> GraphIR:
     return graph
 
 
+def _dynamic_qlinear_graph(maximum_batch: int) -> GraphIR:
+    graph = GraphIR("volvoxai", "qlinear-dynamic.json", dialect=IRDialect.RUNTIME)
+    graph.shape_environment = ShapeEnvironment(({
+        "name": "batch",
+        "min": 1,
+        "max": maximum_batch,
+        "multiple_of": 1,
+    },))
+    _tensor(graph, "x.scale", (1,), initializer=True)
+    _tensor(graph, "x.zero", (1,), "int8", initializer=True)
+    _tensor(
+        graph,
+        "x",
+        ("batch", 3),
+        "int8",
+        public_input=True,
+        quantization=AffineQuantization(
+            "per_tensor", "x.scale", "x.zero",
+        ),
+    )
+    _tensor(graph, "w.scale", (2,), initializer=True)
+    _tensor(graph, "w.zero", (2,), "int8", initializer=True)
+    _tensor(
+        graph,
+        "w",
+        (2, 3),
+        "int8",
+        initializer=True,
+        quantization=AffineQuantization(
+            "per_axis", "w.scale", "w.zero", axis=0,
+        ),
+    )
+    _tensor(graph, "bias", (2,), "int32", initializer=True)
+    _tensor(graph, "y.scale", (1,), initializer=True)
+    _tensor(graph, "y.zero", (1,), "int8", initializer=True)
+    _tensor(
+        graph,
+        "y",
+        ("batch", 2),
+        "int8",
+        public_output=True,
+        quantization=AffineQuantization(
+            "per_tensor", "y.scale", "y.zero",
+        ),
+    )
+    graph.inputs.append("x")
+    graph.add_node(OpNode.from_maps(
+        "dense", "QLinear",
+        {"input": "x", "weight": "w", "bias": "bias"},
+        {"out": "y"},
+    ))
+    graph.outputs.append("y")
+    graph.verify(IRDialect.RUNTIME)
+    return graph
+
+
 def _matmul_graph() -> GraphIR:
     graph = GraphIR("volvoxai", "matmul.json", dialect=IRDialect.RUNTIME)
     _tensor(graph, "x", (1, 3), public_input=True)
@@ -160,7 +218,7 @@ def _matmul_graph() -> GraphIR:
     graph.add_node(OpNode.from_maps(
         "dense", "Linear", {"input": "x", "weight": "w"}, {"out": "y"},
         attributes=(OpAttribute(
-            "params", "volvox.params", {"weight_layout": "OUT_IN"},
+            "params", "volvox.params", {"weight_layout": "dout_din"},
         ),),
     ))
     graph.outputs.append("y")
@@ -356,6 +414,23 @@ class CompiledModelPlanTests(unittest.TestCase):
             selected.nodes[0].selection_evidence.predicate_id,
             "native.qlinear.x86-eligible",
         )
+        evidence = selected.nodes[0].selection_evidence
+        self.assertEqual(
+            evidence.kernel_variant_id,
+            "native-cpu.qlinear.avx2",
+        )
+        self.assertEqual(
+            evidence.shape_domain_proof_identity,
+            selected.shape_domain_proof.proof_identity,
+        )
+        self.assertEqual(
+            evidence.shape_function_id,
+            selected.shape_domain_proof.nodes[0].shape_function_id,
+        )
+        self.assertEqual(
+            evidence.domain_facts,
+            selected.shape_domain_proof.nodes[0].facts,
+        )
         with self.assertRaisesRegex(
             CompiledModelPlanningError, "not feature/backend/operator eligible",
         ):
@@ -400,8 +475,28 @@ class CompiledModelPlanTests(unittest.TestCase):
             ),
         )
         encoded = json.loads(json.dumps(plan.to_dict(), allow_nan=False))
+        self.assertNotIn("shape_system", encoded["shape_domain_proof"])
+        self.assertNotIn(
+            "shape_system",
+            encoded["nodes"][0]["selection_evidence"],
+        )
         self.assertEqual(CompiledModelPlan.from_dict(encoded), plan)
 
+        encoded = plan.to_dict()
+        encoded["shape_domain_proof"]["shape_system"] = (
+            "volvox-bounded-shape/v1"
+        )
+        with self.assertRaisesRegex(ValueError, "invalid fields"):
+            CompiledModelPlan.from_dict(encoded)
+
+        encoded = plan.to_dict()
+        encoded["nodes"][0]["selection_evidence"]["shape_system"] = (
+            "volvox-bounded-shape/v1"
+        )
+        with self.assertRaisesRegex(ValueError, "extra"):
+            CompiledModelPlan.from_dict(encoded)
+
+        encoded = plan.to_dict()
         encoded["plan_id"] = "sha256:" + "0" * 64
         with self.assertRaisesRegex(ValueError, "plan ID"):
             CompiledModelPlan.from_dict(encoded)
@@ -412,9 +507,85 @@ class CompiledModelPlanTests(unittest.TestCase):
             CompiledModelPlan.from_dict(encoded)
 
         encoded = plan.to_dict()
+        encoded["shape_domain_proof"]["dimensions"] = [{
+            "name": "fabricated",
+            "min": 1,
+            "max": 2,
+            "multiple_of": 1,
+        }]
+        with self.assertRaisesRegex(ValueError, "identity is stale"):
+            CompiledModelPlan.from_dict(encoded)
+
+        encoded = plan.to_dict()
+        encoded["nodes"][0]["selection_evidence"]["kernel_variant_id"] = (
+            "native-cpu.qlinear.fabricated"
+        )
+        with self.assertRaisesRegex(ValueError, "different variant"):
+            CompiledModelPlan.from_dict(encoded)
+
+        encoded = plan.to_dict()
         encoded["unexpected"] = True
         with self.assertRaisesRegex(ValueError, "extra"):
             CompiledModelPlan.from_dict(encoded)
+
+    def test_predicate_evidence_is_bound_to_the_whole_dynamic_domain(self):
+        target = _target(
+            "native-cpu",
+            backend_profile="native-cpu",
+            features=frozenset({"x86.avx2"}),
+        )
+        first_graph = _dynamic_qlinear_graph(8)
+        first = build_compiled_model_plan(
+            first_graph,
+            _weights(first_graph),
+            target,
+            selected_variants={"dense": "native-cpu.qlinear.avx2"},
+            predicate_evaluator=lambda context: KernelPredicateEvidence.accept(
+                context, "physical predicate passed for the proven domain",
+            ),
+        )
+        first_evidence = first.nodes[0].selection_evidence
+        self.assertEqual(
+            first_evidence.shape_constraints,
+            ("batch:min=1,max=8,multiple_of=1",),
+        )
+
+        second_graph = _dynamic_qlinear_graph(16)
+        second = build_compiled_model_plan(
+            second_graph,
+            _weights(second_graph),
+            target,
+            selected_variants={"dense": "native-cpu.qlinear.avx2"},
+            predicate_evaluator=lambda context: KernelPredicateEvidence.accept(
+                context, "physical predicate passed for the proven domain",
+            ),
+        )
+        self.assertNotEqual(
+            first.shape_domain_proof.proof_identity,
+            second.shape_domain_proof.proof_identity,
+        )
+        self.assertNotEqual(first.plan_id, second.plan_id)
+        self.assertEqual(
+            second.nodes[0].selection_evidence.shape_constraints,
+            ("batch:min=1,max=16,multiple_of=1",),
+        )
+
+        def stale_evaluator(context):
+            return replace(
+                first_evidence,
+                source_graph_fingerprint=context.source_graph_fingerprint,
+            )
+
+        with self.assertRaisesRegex(
+            CompiledModelPlanningError, "different graph, node, backend, device",
+        ):
+            build_compiled_model_plan(
+                second_graph,
+                _weights(second_graph),
+                target,
+                selected_variants={"dense": "native-cpu.qlinear.avx2"},
+                predicate_evaluator=stale_evaluator,
+            )
 
     def test_predicate_evaluation_isolated_from_source_graph_and_weights(self):
         graph = _qlinear_graph()

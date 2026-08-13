@@ -88,6 +88,8 @@ def _node(
     quantization: AffineQuantization | None = None,
     params: dict | None = None,
 ) -> None:
+    if params is None and op in {"Reshape", "Expand"}:
+        params = {"shape": list(shape)}
     _tensor(graph, output, shape, dtype=dtype, quantization=quantization)
     graph.add_node(OpNode.from_maps(
         name=name,
@@ -231,7 +233,7 @@ def _float_attention_graph(
             graph,
             "mask.where",
             "Where",
-            {"condition": "padding", "x": "mask.neg_inf", "y": "mask.zero"},
+            {"condition": "padding", "a": "mask.neg_inf", "b": "mask.zero"},
             "mask.additive",
             (1, keys),
         )
@@ -307,7 +309,7 @@ def _shared_mask_attention_graph() -> tuple[GraphIR, dict[str, np.ndarray]]:
         graph,
         "mask.where",
         "Where",
-        {"condition": "padding", "x": "mask.neg_inf", "y": "mask.zero"},
+        {"condition": "padding", "a": "mask.neg_inf", "b": "mask.zero"},
         "mask.additive",
         (1, keys),
     )
@@ -605,7 +607,7 @@ class RuntimeFloatAttentionFusionTests(unittest.TestCase):
 
         report = VerifiedPipeline((RuntimeFloatAttentionFusionPass(
             tensors, allow_numerical_migration=True,
-        ),)).run(graph)
+        ),), shape_profile={}).run(graph)
 
         self.assertEqual(report.total_changes, 1)
         self.assertEqual([node.op_type for node in graph.nodes], ["CrossSDPA"])
@@ -630,7 +632,7 @@ class RuntimeFloatAttentionFusionTests(unittest.TestCase):
 
         VerifiedPipeline((RuntimeFloatAttentionFusionPass(
             tensors, allow_numerical_migration=True,
-        ),)).run(graph)
+        ),), shape_profile={}).run(graph)
 
         attention = next(node for node in graph.nodes if node.op_type == "CrossSDPA")
         keep_name = attention.input_map()["mask"]
@@ -641,17 +643,33 @@ class RuntimeFloatAttentionFusionTests(unittest.TestCase):
         self.assertFalse(attention.attributes[0].value["causal"])
         for name, value in original.items():
             np.testing.assert_array_equal(tensors[name], value)
-        self.assertEqual(tensors[keep.input_map()["x"]].dtype, np.int32)
-        self.assertTrue(np.all(tensors[keep.input_map()["x"]] == 0))
-        self.assertTrue(np.all(tensors[keep.input_map()["y"]] == 1))
+        # The runtime `Where` needs exact shapes rather than broadcasting, and a
+        # bounded-dynamic keep mask has no concrete extent to allocate, so each
+        # branch is a scalar initializer widened by one `Expand`.
+        zero = self._constant_branch(graph, tensors, keep.input_map()["a"])
+        one = self._constant_branch(graph, tensors, keep.input_map()["b"])
+        self.assertEqual(zero.dtype, np.int32)
+        self.assertTrue(np.all(zero == 0))
+        self.assertTrue(np.all(one == 1))
         _assert_portable(self, graph, tensors)
+
+    def _constant_branch(self, graph, tensors, name):
+        """Resolve a Where branch to its constant fill through one Expand."""
+
+        if name in tensors:
+            return tensors[name]
+        producer = next(
+            node for node in graph.nodes if node.output_map().get("out") == name
+        )
+        self.assertEqual(producer.op_type, "Expand")
+        return tensors[producer.input_map()["input"]]
 
     def test_identical_derived_keep_mask_is_materialized_once_and_reused(self):
         graph, tensors = _shared_mask_attention_graph()
 
         report = VerifiedPipeline((RuntimeFloatAttentionFusionPass(
             tensors, allow_numerical_migration=True,
-        ),)).run(graph)
+        ),), shape_profile={}).run(graph)
 
         self.assertEqual(report.total_changes, 2)
         attentions = [node for node in graph.nodes if node.op_type == "CrossSDPA"]
@@ -690,6 +708,7 @@ class RuntimeFloatAttentionFusionTests(unittest.TestCase):
             input_hoistings=(specification,),
             allow_float_attention_numerical_migration=True,
             enable_fp32_pre_ptq_optimization=True,
+            shape_profile={},
         )
 
         report = pipeline.run(graph)
@@ -711,7 +730,10 @@ class RuntimeFloatAttentionFusionTests(unittest.TestCase):
             node.output_map().get("out") == keep_name for node in graph.nodes
         ))
         document, packaged = export_runtime_package(graph, tensors)
-        self.assertEqual(document["inputs"][keep_name]["source_name"], "padding_keep")
+        self.assertEqual(
+            document["inputs"][keep_name],
+            {"shape": [1, 5], "dtype": "int32"},
+        )
         _assert_portable(self, graph, packaged)
 
     def test_refuses_ambiguous_head_permutation_without_partial_mutation(self):
@@ -722,7 +744,7 @@ class RuntimeFloatAttentionFusionTests(unittest.TestCase):
             tensors, allow_numerical_migration=True,
         )
 
-        report = VerifiedPipeline((pass_,)).run(graph)
+        report = VerifiedPipeline((pass_,), shape_profile={}).run(graph)
 
         self.assertEqual(report.total_changes, 0)
         self.assertEqual(graph.fingerprint(), before)
@@ -755,7 +777,9 @@ class RuntimeAttentionExactPassTests(unittest.TestCase):
         _output(graph, "out")
         graph.verify(IRDialect.RUNTIME)
 
-        report = VerifiedPipeline((RuntimeAttentionLayoutPass(),)).run(graph)
+        report = VerifiedPipeline(
+            (RuntimeAttentionLayoutPass(),), shape_profile={},
+        ).run(graph)
 
         self.assertEqual(report.total_changes, 1)
         self.assertEqual([node.op_type for node in graph.nodes], ["CrossSDPA"])
@@ -783,7 +807,9 @@ class RuntimeAttentionExactPassTests(unittest.TestCase):
         _output(graph, "out")
         graph.verify(IRDialect.RUNTIME)
 
-        report = VerifiedPipeline((RuntimeKeepMaskPass(tensors),)).run(graph)
+        report = VerifiedPipeline(
+            (RuntimeKeepMaskPass(tensors),), shape_profile={},
+        ).run(graph)
 
         self.assertEqual(report.total_changes, 1)
         self.assertNotIn("mask", graph.nodes[0].input_map())
@@ -801,7 +827,9 @@ class RuntimeQuantizedAttentionTests(unittest.TestCase):
         }
         payloads = {name: value.tobytes() for name, value in tensors.items()}
 
-        report = VerifiedPipeline((RuntimeQuantizedAttentionLayoutPass(tensors),)).run(graph)
+        report = VerifiedPipeline(
+            (RuntimeQuantizedAttentionLayoutPass(tensors),), shape_profile={},
+        ).run(graph)
 
         self.assertEqual(report.total_changes, 1)
         attention = next(node for node in graph.nodes if node.op_type == "QSDPA")
@@ -832,7 +860,7 @@ class RuntimeQuantizedAttentionTests(unittest.TestCase):
 
         report = VerifiedPipeline((RuntimeQuantizedAttentionFusionPass(
             tensors, allow_numerical_migration=True,
-        ),)).run(graph)
+        ),), shape_profile={}).run(graph)
 
         self.assertEqual(report.total_changes, 1)
         self.assertEqual(dict(report.runs[0].metrics), {
@@ -875,7 +903,7 @@ class RuntimeQuantizedAttentionTests(unittest.TestCase):
             tensors, allow_numerical_migration=True,
         )
 
-        report = VerifiedPipeline((pass_,)).run(graph)
+        report = VerifiedPipeline((pass_,), shape_profile={}).run(graph)
 
         self.assertEqual(report.total_changes, 0)
         self.assertEqual(graph.fingerprint(), before)

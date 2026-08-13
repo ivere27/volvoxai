@@ -2,14 +2,14 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 
 import { CPUEngine } from '../ts/backends/CPUEngine.js';
-import { Graph } from '../ts/core/Graph.js';
+import { RuntimeGraph } from '../ts/core/RuntimeGraph.js';
 
 function typedInput(graph, name, dtype, quantization) {
   return graph.addInput(name, [5], dtype, { quantization });
 }
 
 test('CPU QAdd requantizes differing I8/U8 activation descriptors', async () => {
-  const graph = new Graph();
+  const graph = new RuntimeGraph();
   const a = typedInput(graph, 'a', 'int8', { scheme: 'per_tensor', scale: 0.5, zero_point: -2 });
   const b = typedInput(graph, 'b', 'uint8', { scheme: 'per_tensor', scale: 0.25, zero_point: 128 });
   const { out } = graph.addOp('QAdd', { a, b }, {
@@ -30,7 +30,7 @@ test('CPU QAdd requantizes differing I8/U8 activation descriptors', async () => 
 });
 
 test('CPU QAdd refuses a graph with non-authoritative output quantization metadata', () => {
-  const graph = new Graph();
+  const graph = new RuntimeGraph();
   const a = typedInput(graph, 'a', 'int8', { scheme: 'per_tensor', scale: 0.5, zero_point: 0 });
   const b = typedInput(graph, 'b', 'int8', { scheme: 'per_tensor', scale: 0.5, zero_point: 0 });
   const { out } = graph.addOp('QAdd', { a, b }, { out: { name: 'out', shape: [5], dtype: 'int8' } });
@@ -43,7 +43,7 @@ test('CPU QAdd refuses a graph with non-authoritative output quantization metada
 });
 
 test('CPU QAdd clamps fused ReLU and ReLU6 in the output quantization domain', async () => {
-  const graph = new Graph();
+  const graph = new RuntimeGraph();
   const q = { scheme: 'per_tensor', scale: 0.5, zero_point: -2 };
   const a = graph.addInput('a', [3], 'int8', { quantization: q });
   const b = graph.addInput('b', [3], 'int8', { quantization: q });
@@ -61,7 +61,7 @@ test('CPU QAdd clamps fused ReLU and ReLU6 in the output quantization domain', a
 });
 
 test('CPU QAdd maps extreme non-finite real sums to the output zero point', async () => {
-  const graph = new Graph();
+  const graph = new RuntimeGraph();
   const q = { scheme: 'per_tensor', scale: 3e38, zero_point: 0 };
   const a = graph.addInput('a', [1], 'int8', { quantization: q });
   const b = graph.addInput('b', [1], 'int8', { quantization: q });
@@ -76,7 +76,7 @@ test('CPU QAdd maps extreme non-finite real sums to the output zero point', asyn
 });
 
 test('CPU byte Expand makes a broadcast explicit before exact-shape QAdd', async () => {
-  const graph = new Graph();
+  const graph = new RuntimeGraph();
   const left = graph.addInput('left', [2, 4], 'int8', {
     quantization: { scheme: 'per_tensor', scale: 0.5, zero_point: -2 },
   });
@@ -106,7 +106,7 @@ test('CPU byte Expand makes a broadcast explicit before exact-shape QAdd', async
 });
 
 test('CPU byte Expand rejects a changed affine descriptor', () => {
-  const graph = new Graph();
+  const graph = new RuntimeGraph();
   const input = graph.addInput('input', [1, 4], 'int8', {
     quantization: { scheme: 'per_tensor', scale: 0.25, zero_point: -3 },
   });

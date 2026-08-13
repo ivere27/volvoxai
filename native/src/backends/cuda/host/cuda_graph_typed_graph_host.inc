@@ -211,8 +211,24 @@ int cuda_graph_qbatch_matmul_i8u8(
     if (!cuda_launch_1d(CUDA_FORWARD_FUNCTION(k_qbatch_matmul),
                         output_elements, args))
         return 0;
+    cuda_qbatch_matmul_dp4a_group_count +=
+        (uint64_t)output_elements * (uint64_t)(params.k / 4u);
+    cuda_qbatch_matmul_scalar_tail_count +=
+        (uint64_t)output_elements * (uint64_t)(params.k % 4u);
     graph_mark_device(output_slot);
     return 1;
+}
+
+int cuda_graph_append_dynamic_telemetry(char* output,
+                                        size_t output_capacity) {
+    CudaContextState* state = cuda_context_state_get();
+    if (!output || !output_capacity || !state) return -1;
+    (void)snprintf(
+        output, output_capacity,
+        ";cuda_qbatch_dp4a=%" PRIu64 ";cuda_qbatch_tail=%" PRIu64,
+        state->qbatch_matmul_dp4a_group_count,
+        state->qbatch_matmul_scalar_tail_count);
+    return 0;
 }
 
 int cuda_graph_argmax_f32(const float* input, int32_t* output,

@@ -1056,6 +1056,7 @@ class _Validator:
     def _expand(self, node: OpNode) -> None:
         inputs = self._inputs(node)
         output = self._single_output(node, self._outputs(node))
+        params = _params(node)
         self._only_inputs(node, inputs, frozenset({"input", "x", "data"}))
         activation = self._node_input(
             node, inputs, ("input", "x", "data"), "activation",
@@ -1080,11 +1081,13 @@ class _Validator:
             or not exact_broadcast
             or output.size_bytes < activation.size_bytes
             or activation.name == output.name
-            or bool(_params(node))
+            or set(params) != {"shape"}
+            or not isinstance(params.get("shape"), (list, tuple))
+            or tuple(params["shape"]) != output.shape
         ):
             self._reject(
                 node,
-                "requires a distinct descriptor-preserving rank-1..8 I8/U8 exact broadcast with no parameters",
+                "requires a distinct descriptor-preserving rank-1..8 I8/U8 exact broadcast with matching params.shape",
             )
 
     @staticmethod

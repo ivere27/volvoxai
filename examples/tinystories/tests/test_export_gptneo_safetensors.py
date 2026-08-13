@@ -12,6 +12,8 @@ from unittest import mock
 EXAMPLE_ROOT = Path(__file__).resolve().parents[1]
 REPOSITORY_ROOT = Path(__file__).resolve().parents[3]
 TOOLS = EXAMPLE_ROOT / "tools"
+if str(REPOSITORY_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPOSITORY_ROOT))
 if str(TOOLS) not in sys.path:
     sys.path.insert(0, str(TOOLS))
 
@@ -25,6 +27,7 @@ except ImportError as error:  # pragma: no cover - environment dependency.
 try:
     import export_gptneo_safetensors as exporter
     import export_tokenizer as tokenizer_exporter
+    from tools.exporter.validate_runtime_package import validate_runtime_package
 except ImportError as error:  # pragma: no cover - environment dependency.
     raise unittest.SkipTest(f"TinyStories exporter dependencies are unavailable: {error}")
 
@@ -34,6 +37,7 @@ def minimal_config(num_layers=0):
         hidden_size=2,
         num_layers=num_layers,
         num_heads=1,
+        activation_function="gelu_new",
         layer_norm_epsilon=1e-5,
         vocab_size=5,
         eos_token_id=4,
@@ -43,7 +47,7 @@ def minimal_config(num_layers=0):
 def minimal_state_dict():
     return {
         "transformer.wte.weight": torch.arange(10, dtype=torch.float32).reshape(5, 2),
-        "transformer.wpe.weight": torch.zeros((exporter.SEQUENCE_LENGTH, 2)),
+        "transformer.wpe.weight": torch.zeros((exporter.MAX_SEQUENCE_LENGTH, 2)),
         "transformer.ln_f.weight": torch.ones(2),
         "transformer.ln_f.bias": torch.zeros(2),
     }
@@ -104,17 +108,59 @@ class TinyStoriesExporterTests(unittest.TestCase):
         self.assertEqual(tuple(tensors["h.0.mlp.c_fc.weight"].shape), (2, 8))
         self.assertEqual(tuple(tensors["h.0.mlp.c_proj.weight"].shape), (8, 2))
         self.assertEqual(tuple(tensors["lm_head.weight"].shape), (2, 5))
-        self.assertEqual(nodes[-1]["outputs"], {"out": "logits"})
-        self.assertEqual(nodes[-1]["outputs_shape"]["out"], [1, 256, 5])
-        self.assertTrue(all(node["outputs_dtype"] == {"out": "float32"}
-                            for node in nodes))
+        self.assertEqual(nodes[-1]["outputs"]["out"], {
+            "tensor": "logits", "shape": [1, "S", 5], "dtype": "float32",
+        })
+        self.assertEqual(
+            [node["id"] for node in nodes],
+            [f"node_{index}" for index in range(len(nodes))],
+        )
         self.assertTrue(all(
-            node.get("params", {}).get("weight_layout") == "IN_OUT"
+            set(node) == {"id", "opType", "inputs", "outputs", "params"}
+            for node in nodes
+        ))
+        self.assertTrue(all(
+            node["params"].get("weight_layout") == "din_dout"
             for node in nodes if node["opType"] == "MatMul"
         ))
         attention = next(node for node in nodes if node["opType"] == "SDPA")
         self.assertTrue(attention["params"]["causal"])
-        self.assertAlmostEqual(attention["params"]["scale"], 1 / np.sqrt(2))
+        self.assertEqual(attention["params"]["scale"], 1.0)
+        activation = next(node for node in nodes if node["opType"] == "GELU")
+        self.assertEqual(activation["params"], {"approximate": "tanh"})
+
+    def test_graph_preserves_supported_checkpoint_gelu_semantics(self):
+        state_dict = minimal_state_dict()
+        state_dict.update(
+            {
+                "transformer.h.0.ln_1.weight": torch.ones(2),
+                "transformer.h.0.ln_1.bias": torch.zeros(2),
+                "transformer.h.0.attn.attention.q_proj.weight": torch.eye(2),
+                "transformer.h.0.attn.attention.k_proj.weight": torch.eye(2),
+                "transformer.h.0.attn.attention.v_proj.weight": torch.eye(2),
+                "transformer.h.0.attn.attention.out_proj.weight": torch.eye(2),
+                "transformer.h.0.attn.attention.out_proj.bias": torch.zeros(2),
+                "transformer.h.0.ln_2.weight": torch.ones(2),
+                "transformer.h.0.ln_2.bias": torch.zeros(2),
+                "transformer.h.0.mlp.c_fc.weight": torch.zeros((8, 2)),
+                "transformer.h.0.mlp.c_fc.bias": torch.zeros(8),
+                "transformer.h.0.mlp.c_proj.weight": torch.zeros((2, 8)),
+                "transformer.h.0.mlp.c_proj.bias": torch.zeros(2),
+            }
+        )
+
+        exact_config = minimal_config(num_layers=1)
+        exact_config.activation_function = "gelu"
+        exact_nodes = exporter.build_gptneo_graph(exact_config, state_dict, {})
+        exact_gelu = next(node for node in exact_nodes if node["opType"] == "GELU")
+        self.assertEqual(exact_gelu["params"], {"approximate": "none"})
+
+        unsupported_config = minimal_config()
+        unsupported_config.activation_function = "relu"
+        with self.assertRaisesRegex(ValueError, "supports only activation_function"):
+            exporter.build_gptneo_graph(
+                unsupported_config, minimal_state_dict(), {}
+            )
 
     def test_export_preserves_example_package_filenames(self):
         model = SimpleNamespace(config=minimal_config(), state_dict=minimal_state_dict)
@@ -131,17 +177,29 @@ class TinyStoriesExporterTests(unittest.TestCase):
                 exporter.export_model("local-checkpoint", output_path)
 
             graph = json.loads((output_dir / "graph.json").read_text(encoding="utf-8"))
+            validate_runtime_package(output_dir / "graph.json", [output_path])
             self.assertEqual(graph["format"], "volvox-graph/v1")
+            self.assertEqual(graph["dimensions"], {
+                "S": {"min": 1, "max": exporter.MAX_SEQUENCE_LENGTH},
+            })
+            self.assertEqual(
+                set(graph),
+                {"format", "dimensions", "inputs", "nodes", "outputs"},
+            )
             tensors = load_file(str(output_path), device="cpu")
             tokens = np.fromfile(output_dir / "tokens.i32", dtype=np.int32)
             positions = np.fromfile(output_dir / "positions.i32", dtype=np.int32)
 
         self.assertEqual(graph["outputs"], ["logits"])
-        self.assertEqual(graph["inputs"]["tokens"]["shape"], [1, 256])
+        self.assertEqual(graph["inputs"]["tokens"]["shape"], [1, "S"])
+        self.assertEqual(graph["inputs"]["positions"]["shape"], [1, "S"])
         self.assertIn("lm_head.weight", tensors)
-        self.assertEqual(tokens.shape, (256,))
+        self.assertEqual(tokens.shape, (exporter.MAX_SEQUENCE_LENGTH,))
         self.assertEqual(tokens[5], 4)
-        np.testing.assert_array_equal(positions, np.arange(256, dtype=np.int32))
+        np.testing.assert_array_equal(
+            positions,
+            np.arange(exporter.MAX_SEQUENCE_LENGTH, dtype=np.int32),
+        )
 
     def test_tokenizer_export_writes_binary_vocabulary_and_merges(self):
         class FakeTokenizer:

@@ -9,10 +9,11 @@ from __future__ import annotations
 
 import hashlib
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Mapping, Optional
 
 from ..errors import Diagnostic, ExporterError
 from ..ir import (
+    attach_public_dimension_bounds,
     GraphIR,
     IRDialect,
     OpAttribute,
@@ -340,8 +341,21 @@ def _import_graph(onnx: Any, graph_proto: Any, *, source_name: str,
     return graph
 
 
-def import_onnx_source(source: str | Path | Any, *, check: bool = True) -> GraphIR:
-    """Import a checked ONNX model without performing any graph rewrite."""
+def import_onnx_source(
+    source: str | Path | Any,
+    *,
+    check: bool = True,
+    dimension_bounds: Optional[Mapping[str, Any]] = None,
+    anonymous_dimension_bounds: Optional[Mapping[tuple[str, int], Any]] = None,
+) -> GraphIR:
+    """Import a checked ONNX model without performing any graph rewrite.
+
+    ``dim_param`` spellings are preserved exactly.  Supplying
+    ``dimension_bounds`` attaches the bounded RuntimeIR shape environment;
+    anonymous public axes additionally require an explicit
+    ``(input_name, axis)`` entry in ``anonymous_dimension_bounds``.  Bounds
+    are authoring facts, never inferred from one ONNX shape sample.
+    """
 
     try:
         import onnx
@@ -385,4 +399,10 @@ def import_onnx_source(source: str | Path | Any, *, check: bool = True) -> Graph
             model.SerializeToString()).hexdigest(),
     })
     graph.verify(IRDialect.SOURCE)
+    if dimension_bounds is not None or anonymous_dimension_bounds is not None:
+        graph = attach_public_dimension_bounds(
+            graph,
+            {} if dimension_bounds is None else dimension_bounds,
+            anonymous=anonymous_dimension_bounds,
+        )
     return graph

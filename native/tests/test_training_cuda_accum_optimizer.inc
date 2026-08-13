@@ -118,7 +118,7 @@ static int run_cuda_accum_optimizer_case(
     CHECK(add_tensor("cuda.accum.relu", logits_shape, 2, NULL));
     CHECK(add_tensor("logits", logits_shape, 2, NULL));
     Node* node = add_node("Linear", "cuda.accum.linear",
-                          "{\"weight_layout\":\"OUT_IN\"}");
+                          "{\"weight_layout\":\"dout_din\"}");
     CHECK(node && node_input(node, "input", "cuda.accum.input") == 0 &&
           node_input(node, "weight", "cuda.accum.weight") == 0 &&
           node_input(node, "bias", "cuda.accum.bias") == 0);
@@ -399,7 +399,7 @@ static int run_cuda_optimizer_handoff_checkpoint_case(
                      initial_bias));
     CHECK(add_tensor("logits", logits_shape, 2, NULL));
     Node* node = add_node("Linear", "logits",
-                          "{\"weight_layout\":\"OUT_IN\"}");
+                          "{\"weight_layout\":\"dout_din\"}");
     CHECK(node && node_input(node, "input", "cuda.checkpoint.input") == 0 &&
           node_input(node, "weight", "cuda.checkpoint.weight") == 0 &&
           node_input(node, "bias", "cuda.checkpoint.bias") == 0);

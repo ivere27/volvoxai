@@ -1,0 +1,718 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<title>TinyReceipt ONNX Runtime WebGPU explicit-KV benchmark</title>
+<pre id="out">Starting...</pre>
+<script type="module">
+import { preprocessTinyReceiptImage } from '/repo/examples/tiny_receipt_vqa/TinyReceiptInput.js';
+import { TinyReceiptByteFallbackBPEVocab } from '/repo/examples/tiny_receipt_vqa/TinyReceiptSplitSession.js';
+
+const out = document.getElementById('out');
+const query = new URLSearchParams(location.search);
+const FAMILY_NAMES = Object.freeze([
+  'phone', 'address', 'store', 'item_row', 'item_math', 'item_lookup', 'math', 'other',
+]);
+const CROSS_NAMES = Object.freeze([...Array(4).keys()].flatMap(
+  (layer) => [`cross_k_${layer}`, `cross_v_${layer}`],
+));
+const PAST_NAMES = Object.freeze([...Array(4).keys()].flatMap(
+  (layer) => [`past_k_${layer}`, `past_v_${layer}`],
+));
+const PRESENT_NAMES = Object.freeze(PAST_NAMES.map((name) => name.replace('past_', 'present_')));
+const EXPECTED_VERSION = '1.27.0';
+const HEADS = 8;
+const HEAD_WIDTH = 40;
+
+function show(value) {
+  out.textContent = JSON.stringify(value, null, 2);
+}
+
+function fail(message) {
+  throw new Error(`[ort_webgpu_benchmark_tinyreceipt] ${message}`);
+}
+
+function boundedInteger(name, fallback, minimum, maximum) {
+  const raw = query.get(name);
+  const value = raw == null ? fallback : Number(raw);
+  if (!Number.isSafeInteger(value) || value < minimum || value > maximum) {
+    fail(`${name} must be an integer in [${minimum}, ${maximum}].`);
+  }
+  return value;
+}
+
+function exactDims(value, expected, label) {
+  if (!value || !Array.isArray(value.dims) || value.dims.length !== expected.length ||
+      value.dims.some((dimension, index) => dimension !== expected[index])) {
+    fail(`${label} has invalid dimensions.`);
+  }
+}
+
+function cpuData(value, expectedType, expectedDims, label) {
+  exactDims(value, expectedDims, label);
+  if (value.type !== expectedType || value.location !== 'cpu') {
+    fail(`${label} must be a CPU ${expectedType} tensor.`);
+  }
+  return value.data;
+}
+
+function gpuTensor(value, expectedType, expectedDims, label) {
+  exactDims(value, expectedDims, label);
+  if (value.type !== expectedType || value.location !== 'gpu-buffer' || !value.gpuBuffer) {
+    fail(`${label} must remain a GPU-buffer ${expectedType} tensor.`);
+  }
+  return value;
+}
+
+function disposeTensor(value) {
+  if (value && typeof value.dispose === 'function' && value.location !== 'none') value.dispose();
+}
+
+function firstIndexArgmax(values) {
+  if (!(values instanceof Float32Array) || values.length !== 1536) {
+    fail('decoder logits must contain one F32 vocabulary row.');
+  }
+  let best = 0;
+  if (!Number.isFinite(values[0])) fail('decoder logits contain a non-finite value.');
+  for (let index = 1; index < values.length; index++) {
+    if (!Number.isFinite(values[index])) fail('decoder logits contain a non-finite value.');
+    if (values[index] > values[best]) best = index;
+  }
+  return best;
+}
+
+async function sha256Float32LE(value) {
+  const bytes = new Uint8Array(value.length * 4);
+  const view = new DataView(bytes.buffer);
+  for (let index = 0; index < value.length; index++) {
+    view.setFloat32(index * 4, value[index], true);
+  }
+  const digest = await crypto.subtle.digest('SHA-256', bytes);
+  return [...new Uint8Array(digest)].map((byte) => byte.toString(16).padStart(2, '0')).join('');
+}
+
+async function sha256Bytes(value) {
+  const digest = await crypto.subtle.digest('SHA-256', value);
+  return [...new Uint8Array(digest)]
+    .map((byte) => byte.toString(16).padStart(2, '0')).join('');
+}
+
+async function fetchJSON(url, label) {
+  const response = await fetch(url);
+  if (!response.ok) fail(`${label} fetch failed: HTTP ${response.status}.`);
+  const value = await response.json();
+  if (!value || typeof value !== 'object' || Array.isArray(value)) fail(`${label} is not an object.`);
+  return value;
+}
+
+async function waitForHardwareAdapter() {
+  for (let attempt = 0; attempt < 20; attempt++) {
+    const adapter = await navigator.gpu?.requestAdapter({
+      powerPreference: 'high-performance',
+      forceFallbackAdapter: false,
+    });
+    if (adapter) return adapter;
+    await new Promise((resolve) => setTimeout(resolve, 200));
+  }
+  fail('physical WebGPU adapter was unavailable after 20 attempts.');
+}
+
+function plainAdapterInfo(info, label) {
+  const result = Object.fromEntries(
+    ['vendor', 'architecture', 'device', 'description'].map((name) => [
+      name, typeof info?.[name] === 'string' ? info[name].trim() : '',
+    ]),
+  );
+  const description = Object.values(result).join(' ');
+  if (!result.vendor || !result.architecture ||
+      /\b(?:swiftshader|llvmpipe|lavapipe|softpipe|software renderer|cpu)\b/i
+        .test(description)) {
+    fail(`${label} does not identify a physical hardware adapter.`);
+  }
+  return result;
+}
+
+function bigintTensor(ort, values, dims) {
+  return new ort.Tensor(
+    'int64', BigInt64Array.from(values, (value) => BigInt(value)), dims,
+  );
+}
+
+function placementCapture() {
+  return { records: [], unsupportedKernelEvents: new Map() };
+}
+
+let activeDiagnostics = null;
+function recordDiagnostic(parts) {
+  if (!activeDiagnostics) return;
+  const text = parts.map((part) => typeof part === 'string' ? part : String(part)).join(' ');
+  const placement = /Node\(s\) placed on \[([^\]]+)\][.] Number of nodes: ([0-9]+)/g;
+  for (const match of text.matchAll(placement)) {
+    activeDiagnostics.records.push({ provider: match[1], nodes: Number(match[2]) });
+  }
+  const missing = /webgpu kernel not found in registries for Op type: ([^\s]+)/ig;
+  for (const match of text.matchAll(missing)) {
+    const name = match[1];
+    activeDiagnostics.unsupportedKernelEvents.set(
+      name, (activeDiagnostics.unsupportedKernelEvents.get(name) || 0) + 1,
+    );
+  }
+}
+
+for (const name of ['debug', 'log', 'info', 'warn', 'error']) {
+  const original = console[name].bind(console);
+  console[name] = (...parts) => {
+    recordDiagnostic(parts);
+    original(...parts);
+  };
+}
+
+function finishPlacement(capture, label) {
+  const providers = new Map();
+  for (const record of capture.records) {
+    providers.set(record.provider, (providers.get(record.provider) || 0) + record.nodes);
+  }
+  const result = {
+    providers: Object.fromEntries([...providers.entries()].sort()),
+    // GetCapability can probe one operator repeatedly. These are diagnostic
+    // event counts, not graph-node placement counts.
+    unsupportedKernelEvents: Object.fromEntries(
+      [...capture.unsupportedKernelEvents.entries()].sort(),
+    ),
+    records: capture.records,
+  };
+  if (!(result.providers.CPUExecutionProvider > 0) ||
+      !(result.providers.WebGpuExecutionProvider > 0) || capture.records.length !== 2) {
+    fail(`${label} did not produce one CPU and one WebGPU placement record.`);
+  }
+  return result;
+}
+
+async function fetchBytes(url, label) {
+  const response = await fetch(url);
+  if (!response.ok) fail(`${label} fetch failed: HTTP ${response.status}.`);
+  return new Uint8Array(await response.arrayBuffer());
+}
+
+async function probeStrictSession(ort, modelBytes, role) {
+  const strictOptions = {
+    executionProviders: ['webgpu'],
+    graphOptimizationLevel: 'all',
+    logSeverityLevel: 3,
+    extra: { session: { disable_cpu_ep_fallback: '1' } },
+  };
+  let strictError = null;
+  let strictSession = null;
+  try {
+    strictSession = await ort.InferenceSession.create(modelBytes, strictOptions);
+  } catch (error) {
+    strictError = String(error?.message || error);
+  } finally {
+    await strictSession?.release();
+  }
+  if (strictError == null) fail(`${role} unexpectedly accepted strict WebGPU fallback 0.`);
+  if (!/default CPU EP[\s\S]*fallback to CPU EP has been explicitly disabled/i.test(strictError)) {
+    fail(`${role} strict probe failed for a reason other than required CPU partitioning: ${strictError}`);
+  }
+  return { rejected: true, error: strictError.slice(0, 512) };
+}
+
+async function createSession(ort, modelBytes, role, preferredOutputLocation) {
+  const capture = placementCapture();
+  activeDiagnostics = capture;
+  let session;
+  const started = performance.now();
+  try {
+    session = await ort.InferenceSession.create(modelBytes, {
+      executionProviders: ['webgpu'],
+      graphOptimizationLevel: 'all',
+      logSeverityLevel: 0,
+      logVerbosityLevel: 4,
+      preferredOutputLocation,
+    });
+  } finally {
+    activeDiagnostics = null;
+  }
+  return {
+    session,
+    loadMs: performance.now() - started,
+    placement: finishPlacement(capture, role),
+  };
+}
+
+async function readGpuFloat32(device, tensor, label) {
+  gpuTensor(tensor, 'float32', tensor.dims, label);
+  const bytes = tensor.size * 4;
+  const output = device.createBuffer({
+    size: bytes,
+    usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
+  });
+  try {
+    const encoder = device.createCommandEncoder();
+    encoder.copyBufferToBuffer(tensor.gpuBuffer, 0, output, 0, bytes);
+    device.queue.submit([encoder.finish()]);
+    await output.mapAsync(GPUMapMode.READ);
+    return new Float32Array(output.getMappedRange().slice(0));
+  } finally {
+    if (output.mapState === 'mapped') output.unmap();
+    output.destroy();
+  }
+}
+
+function assertCacheTransition(current, previous, pastLength, presentLength, label) {
+  const row = HEAD_WIDTH;
+  for (let head = 0; head < HEADS; head++) {
+    for (let past = 0; past < pastLength; past++) {
+      const oldOffset = (head * pastLength + past) * row;
+      const newOffset = (head * presentLength + past) * row;
+      for (let width = 0; width < row; width++) {
+        if (current[newOffset + width] !== previous[oldOffset + width]) {
+          fail(`${label} corrupted its past-cache prefix.`);
+        }
+      }
+    }
+    const sentinelOffset = head * presentLength * row;
+    for (let width = 0; width < row; width++) {
+      if (current[sentinelOffset + width] !== 0) fail(`${label} corrupted its zero sentinel.`);
+    }
+    const appendOffset = (head * presentLength + pastLength) * row;
+    for (let width = 0; width < row; width++) {
+      if (!Number.isFinite(current[appendOffset + width])) fail(`${label} appended non-finite KV.`);
+    }
+  }
+}
+
+function runSignature(run) {
+  return JSON.stringify({
+    family: run.family,
+    familyId: run.familyId,
+    requestedFamily: run.requestedFamily,
+    questionTokenIds: run.questionTokenIds,
+    tokenIds: run.tokenIds,
+    shape: run.shape,
+    cache: run.cache,
+  });
+}
+
+function cacheReadbackEvidence(validateCacheValues, decoderStepCount) {
+  const crossCacheTensorReadbacks = validateCacheValues ? CROSS_NAMES.length : 0;
+  const presentCacheTensorReadbacks = validateCacheValues
+    ? PRESENT_NAMES.length * decoderStepCount
+    : 0;
+  return {
+    scope: 'application-gpu-buffer-to-host-cache-validation',
+    crossCacheTensorReadbacks,
+    presentCacheTensorReadbacks,
+    totalCacheTensorReadbacks:
+      crossCacheTensorReadbacks + presentCacheTensorReadbacks,
+    includedInExecutionTiming: false,
+    includedInRequestEndToEndInferenceMs: validateCacheValues,
+  };
+}
+
+window.__ortWebgpuBenchmarkResult = { status: 'running' };
+let encoderSession = null;
+let decoderSession = null;
+let device = null;
+try {
+  const precision = query.get('precision');
+  if (precision !== 'fp32' && precision !== 'int8') fail('precision must be fp32 or int8.');
+  const prompt = (query.get('prompt') || 'phone number last one').normalize('NFC');
+  const family = query.get('family') || 'phone';
+  const familyId = FAMILY_NAMES.indexOf(family);
+  if (familyId < 0) fail('family must name one canonical family.');
+  const maxNewTokens = boundedInteger('maxNewTokens', 4, 2, 191);
+  const warmup = boundedInteger('warmup', 1, 0, 20);
+  const sourceBase = '/source/';
+  const ortBase = '/ort/';
+  const manifest = await fetchJSON(`${sourceBase}manifest.json`, 'manifest.json');
+  const vocabulary = await fetchJSON(`${sourceBase}vocab.json`, 'vocab.json');
+  const variant = precision === 'fp32' ? manifest.variants?.fp32 : manifest.variants?.int8_w8a8;
+  if (!variant || typeof variant.encoder !== 'string' || typeof variant.decoder !== 'string') {
+    fail(`manifest lacks the ${precision} ONNX variant.`);
+  }
+  // Fetch each selected model once. The measured and strict-probe sessions
+  // therefore consume the exact same immutable byte arrays, whose hashes are
+  // returned to the parent harness and checked against validate_source().
+  const encoderModelBytes = await fetchBytes(
+    `${sourceBase}${variant.encoder}`, 'encoder model',
+  );
+  const decoderModelBytes = await fetchBytes(
+    `${sourceBase}${variant.decoder}`, 'decoder model',
+  );
+  const modelSha256 = {
+    encoder: await sha256Bytes(encoderModelBytes),
+    decoder: await sha256Bytes(decoderModelBytes),
+  };
+  const vocab = await TinyReceiptByteFallbackBPEVocab.fromJSON(
+    vocabulary,
+    { pad: 0, bos: 1, eos: 2, unk: 3 },
+    {
+      vocabSize: manifest.tokenizer?.vocab_size,
+      normalization: manifest.tokenizer?.normalization,
+      tokenizerHash: manifest.tokenizer?.tokenizer_hash,
+    },
+  );
+  const encodedQuestion = vocab.encodeQuestion(prompt, 192);
+  const questionLength = encodedQuestion.length;
+  const memoryLength = questionLength + 210;
+
+  const imageResponse = await fetch(query.get('image'));
+  if (!imageResponse.ok) fail(`image fetch failed: HTTP ${imageResponse.status}.`);
+  const bitmap = await createImageBitmap(await imageResponse.blob());
+  const preprocessStarted = performance.now();
+  const image = await preprocessTinyReceiptImage(bitmap, { width: 672, height: 320 });
+  const preprocessMs = performance.now() - preprocessStarted;
+  bitmap.close();
+  const inputTensorSha256 = await sha256Float32LE(image);
+
+  // Chromium can expose navigator.gpu before the hardware adapter is ready in
+  // a fresh headless profile. Retain a preflight adapter while ORT requests
+  // and owns its own device; passing a caller-owned device is deliberately
+  // avoided because a caller-owned device failed queue synchronization on this
+  // AMD stack; the ORT-owned device is attested directly below.
+  const preflightAdapter = await waitForHardwareAdapter();
+  const ort = await import(`${ortBase}ort.webgpu.min.mjs`);
+  if (ort.env?.versions?.web !== EXPECTED_VERSION) {
+    fail(`expected ONNX Runtime Web ${EXPECTED_VERSION}, got ${ort.env?.versions?.web}.`);
+  }
+  ort.env.wasm.numThreads = 1;
+  ort.env.wasm.proxy = false;
+  ort.env.wasm.wasmPaths = {
+    mjs: `${ortBase}ort-wasm-simd-threaded.asyncify.mjs`,
+    wasm: `${ortBase}ort-wasm-simd-threaded.asyncify.wasm`,
+  };
+  ort.env.webgpu.powerPreference = 'high-performance';
+  ort.env.webgpu.forceFallbackAdapter = false;
+  // Pin the exact hardware adapter object, while letting ORT create and own
+  // the device. Supplying a caller-created device triggers an ORT Web queue
+  // synchronization fault on this stack.
+  ort.env.webgpu.adapter = preflightAdapter;
+
+  const encoderPreferred = Object.fromEntries([
+    ['memory', 'gpu-buffer'],
+    ...CROSS_NAMES.map((name) => [name, 'gpu-buffer']),
+  ]);
+  const decoderPreferred = Object.fromEntries(PRESENT_NAMES.map((name) => [name, 'gpu-buffer']));
+  const encoderRecord = await createSession(
+    ort, encoderModelBytes, 'encoder', encoderPreferred,
+  );
+  encoderSession = encoderRecord.session;
+  device = await ort.env.webgpu.device;
+  if (!device || typeof device.createBuffer !== 'function') {
+    fail('ONNX Runtime Web did not expose its actual WebGPU device.');
+  }
+  if (ort.env.webgpu.adapter !== preflightAdapter) {
+    fail('ONNX Runtime Web did not retain the attested physical adapter.');
+  }
+  const adapterInfo = plainAdapterInfo(
+    device.adapterInfo || ort.env.webgpu.adapter?.info, 'ORT WebGPU device',
+  );
+  const preflightAdapterInfo = plainAdapterInfo(
+    preflightAdapter.info, 'preflight WebGPU adapter',
+  );
+  if (adapterInfo.vendor !== preflightAdapterInfo.vendor ||
+      adapterInfo.architecture !== preflightAdapterInfo.architecture) {
+    fail('ORT WebGPU device differs from the physical preflight adapter.');
+  }
+  const decoderRecord = await createSession(
+    ort, decoderModelBytes, 'decoder', decoderPreferred,
+  );
+  decoderSession = decoderRecord.session;
+  async function executeRequest(measured, validateCacheValues) {
+    const requestStarted = performance.now();
+    const encoderFeeds = {
+      image: new ort.Tensor('float32', image, [1, 1, 320, 672]),
+      question_ids: bigintTensor(ort, encodedQuestion, [1, questionLength]),
+      family_ids: bigintTensor(ort, [familyId], [1]),
+    };
+    let encoded;
+    let encoderExecutionMs;
+    try {
+      const encoderStarted = performance.now();
+      encoded = await encoderSession.run(encoderFeeds);
+      encoderExecutionMs = performance.now() - encoderStarted;
+    } finally {
+      for (const tensor of Object.values(encoderFeeds)) disposeTensor(tensor);
+    }
+    const expectedEncoder = new Set([
+      'memory', 'memory_padding_mask', 'router_logits', 'selected_family_ids', ...CROSS_NAMES,
+    ]);
+    if (Object.keys(encoded).length !== expectedEncoder.size ||
+        Object.keys(encoded).some((name) => !expectedEncoder.has(name))) {
+      fail('encoder output signature is not explicit-KV v1.');
+    }
+    gpuTensor(encoded.memory, 'float32', [1, memoryLength, 320], 'encoder memory');
+    const memoryMask = cpuData(
+      encoded.memory_padding_mask, 'bool', [1, memoryLength], 'memory_padding_mask',
+    ).slice();
+    const routerLogits = cpuData(encoded.router_logits, 'float32', [1, 8], 'router_logits');
+    if ([...memoryMask].some((value) => value !== 0 && value !== 1) ||
+        [...routerLogits].some((value) => !Number.isFinite(value))) {
+      fail('encoder returned invalid mask/router values.');
+    }
+    const selectedData = cpuData(
+      encoded.selected_family_ids, 'int64', [1], 'selected_family_ids',
+    );
+    const selectedFamilyId = Number(selectedData[0]);
+    if (selectedFamilyId !== familyId) fail('encoder did not preserve requested family.');
+    const crosses = Object.fromEntries(CROSS_NAMES.map((name) => [
+      name,
+      gpuTensor(encoded[name], 'float32', [1, HEADS, memoryLength, HEAD_WIDTH], name),
+    ]));
+    if (validateCacheValues) {
+      for (const [name, tensor] of Object.entries(crosses)) {
+        const snapshot = await readGpuFloat32(device, tensor, name);
+        if (snapshot.some((value) => !Number.isFinite(value))) {
+          fail(`${name} contains a non-finite encoder cache value.`);
+        }
+      }
+    }
+    disposeTensor(encoded.memory);
+    disposeTensor(encoded.memory_padding_mask);
+    disposeTensor(encoded.router_logits);
+    disposeTensor(encoded.selected_family_ids);
+    const sharedMemoryMask = new ort.Tensor('bool', memoryMask, [1, memoryLength]);
+
+    let pastLength = 1;
+    let pastMask = Uint8Array.of(1);
+    let past = Object.fromEntries(PAST_NAMES.map((name) => [
+      name, new ort.Tensor('float32', new Float32Array(HEADS * HEAD_WIDTH), [1, HEADS, 1, HEAD_WIDTH]),
+    ]));
+    let snapshots = validateCacheValues
+      ? Object.fromEntries(PAST_NAMES.map((name) => [
+        name, new Float32Array(HEADS * HEAD_WIDTH),
+      ]))
+      : null;
+    let current = 1;
+    const tokenIds = [];
+    const transitions = [];
+    const decoderStepMs = [];
+    try {
+      for (let position = 0; position < maxNewTokens; position++) {
+        const feeds = {
+          decoder_input_ids: bigintTensor(ort, [current], [1, 1]),
+          position_ids: bigintTensor(ort, [position], [1]),
+          family_ids: bigintTensor(ort, [selectedFamilyId], [1]),
+          memory_padding_mask: sharedMemoryMask,
+          past_padding_mask: new ort.Tensor('bool', pastMask, [1, pastLength]),
+          ...crosses,
+          ...past,
+        };
+        let outputs;
+        let decoderExecutionMs;
+        try {
+          const decoderStarted = performance.now();
+          outputs = await decoderSession.run(feeds);
+          decoderExecutionMs = performance.now() - decoderStarted;
+        } finally {
+          for (const [name, tensor] of Object.entries(feeds)) {
+            if (!CROSS_NAMES.includes(name) && !PAST_NAMES.includes(name) &&
+                name !== 'memory_padding_mask') {
+              disposeTensor(tensor);
+            }
+          }
+        }
+        decoderStepMs.push(decoderExecutionMs);
+        const presentLength = pastLength + 1;
+        const expectedDecoder = new Set(['logits', 'present_padding_mask', ...PRESENT_NAMES]);
+        if (Object.keys(outputs).length !== expectedDecoder.size ||
+            Object.keys(outputs).some((name) => !expectedDecoder.has(name))) {
+          fail('decoder output signature is not explicit-KV v1.');
+        }
+        const logits = cpuData(outputs.logits, 'float32', [1, 1, 1536], 'logits');
+        const next = firstIndexArgmax(logits);
+        const presentMask = cpuData(
+          outputs.present_padding_mask, 'bool', [1, presentLength], 'present_padding_mask',
+        );
+        if ([...pastMask].some((value, index) => presentMask[index] !== value) ||
+            presentMask[pastLength] !== (current === 0 ? 1 : 0)) {
+          fail('decoder mask transition corrupted its prefix or current-token flag.');
+        }
+        const nextPast = {};
+        const nextSnapshots = validateCacheValues ? {} : null;
+        for (let index = 0; index < PRESENT_NAMES.length; index++) {
+          const presentName = PRESENT_NAMES[index];
+          const pastName = PAST_NAMES[index];
+          const tensor = gpuTensor(
+            outputs[presentName], 'float32', [1, HEADS, presentLength, HEAD_WIDTH], presentName,
+          );
+          if (validateCacheValues) {
+            const snapshot = await readGpuFloat32(device, tensor, presentName);
+            assertCacheTransition(
+              snapshot, snapshots[pastName], pastLength, presentLength, presentName,
+            );
+            nextSnapshots[pastName] = snapshot;
+          }
+          nextPast[pastName] = tensor;
+        }
+        for (const tensor of Object.values(past)) disposeTensor(tensor);
+        past = nextPast;
+        snapshots = nextSnapshots;
+        pastMask = presentMask.slice();
+        disposeTensor(outputs.logits);
+        disposeTensor(outputs.present_padding_mask);
+        transitions.push({ position, pastLength, presentLength });
+        pastLength = presentLength;
+        tokenIds.push(next);
+        if (next === 2) break;
+        current = next;
+      }
+    } finally {
+      for (const tensor of Object.values(past)) disposeTensor(tensor);
+      for (const tensor of Object.values(crosses)) disposeTensor(tensor);
+      disposeTensor(sharedMemoryMask);
+    }
+    if (tokenIds.length < 2) fail('benchmark requires at least two explicit-KV decoder steps.');
+    const steady = decoderStepMs.slice(1);
+    const steadyTotalMs = steady.reduce((sum, value) => sum + value, 0);
+    const harnessCacheReadbacks = cacheReadbackEvidence(
+      validateCacheValues, tokenIds.length,
+    );
+    return {
+      measured,
+      family: FAMILY_NAMES[selectedFamilyId],
+      familyId: selectedFamilyId,
+      requestedFamily: family,
+      tokenIds,
+      stoppedAtEos: tokenIds.at(-1) === 2,
+      shape: { mode: 'active', B: 1, Q: questionLength, M: memoryLength, T: maxNewTokens + 1 },
+      cache: {
+        initialPastLength: 1,
+        finalPastLength: tokenIds.length + 1,
+        sentinelMaskValue: 1,
+        transitions,
+      },
+      timing: {
+        synchronization: 'session-run-required-cpu-output-materialization',
+        applicationValidationIncluded: false,
+        cacheQualificationReadbackIncluded: false,
+        encoderExecutionMs,
+        decoderSeedMs: decoderStepMs[0],
+        decoderSteadySteps: steady.length,
+        decoderSteadyTotalMs: steadyTotalMs,
+        decoderSteadyMeanMs: steadyTotalMs / steady.length,
+        decoderSteadyTokensPerSecond: steadyTotalMs > 0 ? 1000 * steady.length / steadyTotalMs : null,
+        decoderExecutionTotalMs: decoderStepMs.reduce((sum, value) => sum + value, 0),
+        decoderStepMs,
+      },
+      endToEndInferenceMs: performance.now() - requestStarted,
+      questionTokenIds: [...encodedQuestion],
+      publicKvBufferHandoff: {
+        crossCacheOutputsOnGpuBuffer: CROSS_NAMES.length,
+        presentCacheOutputsOnGpuBufferPerStep: PRESENT_NAMES.length,
+        encoderCrossCacheTensorObjectHandoffs:
+          tokenIds.length * CROSS_NAMES.length,
+        decoderPresentCacheTensorObjectHandoffs:
+          Math.max(0, tokenIds.length - 1) * PRESENT_NAMES.length,
+        totalDirectTensorObjectHandoffs:
+          tokenIds.length * CROSS_NAMES.length +
+          Math.max(0, tokenIds.length - 1) * PRESENT_NAMES.length,
+        preferredOutputLocation: 'gpu-buffer',
+        crossCacheReadbackValidated: validateCacheValues,
+        cachePrefixReadbackValidated: validateCacheValues,
+        appendedCacheReadbackValidated: validateCacheValues,
+        harnessCacheReadbacks,
+        measuredHarnessCacheReadbacks:
+          measured ? harnessCacheReadbacks.totalCacheTensorReadbacks : 0,
+        internalEpTransfersAttested: false,
+      },
+    };
+  }
+
+  const warmupRuns = [];
+  for (let index = 0; index < warmup; index++) {
+    warmupRuns.push(await executeRequest(false, index === 0));
+  }
+  const run = await executeRequest(true, false);
+  const signature = runSignature(run);
+  if (warmupRuns.some((value) => runSignature(value) !== signature)) {
+    fail('warmup token/cache transition parity failed.');
+  }
+  // When warmup=0, qualify cache values after the cold measured request so the
+  // correctness readback cannot warm or perturb its timing.
+  const cacheQualification = warmup > 0 ? null : await executeRequest(false, true);
+  if (cacheQualification != null && runSignature(cacheQualification) !== signature) {
+    fail('untimed cache qualification token/cache transition parity failed.');
+  }
+  const cacheQualificationRun = warmup > 0 ? warmupRuns[0] : cacheQualification;
+  // Probe strict fallback rejection after the measured request so model
+  // refetch/session setup cannot pre-warm or perturb its timing.
+  const strictProbe = {
+    encoder: await probeStrictSession(ort, encoderModelBytes, 'encoder'),
+    decoder: await probeStrictSession(ort, decoderModelBytes, 'decoder'),
+  };
+  const result = {
+    status: 'pass',
+    runtime: { name: 'onnxruntime-web', version: ort.env.versions.web },
+    backend: 'webgpu-cpu-fallback',
+    strictNoFallback: false,
+    adapter: adapterInfo,
+    adapterPreflight: preflightAdapterInfo,
+    actualAdapterObjectAttested: true,
+    precision,
+    prompt,
+    family,
+    maxNewTokens,
+    warmup,
+    iterations: 1,
+    inputTensorSha256,
+    modelSha256,
+    selectedModelFiles: { encoder: variant.encoder, decoder: variant.decoder },
+    preprocessMs,
+    sessionLoadMs: {
+      encoder: encoderRecord.loadMs,
+      decoder: decoderRecord.loadMs,
+    },
+    placement: {
+      encoder: encoderRecord.placement,
+      decoder: decoderRecord.placement,
+    },
+    strictProbe: {
+      encoder: strictProbe.encoder,
+      decoder: strictProbe.decoder,
+    },
+    cacheQualification: cacheQualification == null ? {
+      source: 'warmup-0',
+      crossCacheReadbackValidated: true,
+      cachePrefixReadbackValidated: true,
+      appendedCacheReadbackValidated: true,
+      tokenCacheTransitionParity: true,
+      harnessCacheReadbacks: {
+        ...cacheQualificationRun.publicKvBufferHandoff.harnessCacheReadbacks,
+      },
+    } : {
+      source: 'untimed-correctness-request',
+      crossCacheReadbackValidated:
+        cacheQualification.publicKvBufferHandoff.crossCacheReadbackValidated,
+      cachePrefixReadbackValidated:
+        cacheQualification.publicKvBufferHandoff.cachePrefixReadbackValidated,
+      appendedCacheReadbackValidated:
+        cacheQualification.publicKvBufferHandoff.appendedCacheReadbackValidated,
+      tokenCacheTransitionParity: true,
+      harnessCacheReadbacks: {
+        ...cacheQualification.publicKvBufferHandoff.harnessCacheReadbacks,
+      },
+    },
+    sessionReuse: {
+      sameRuntime: true,
+      sameSessions: true,
+      encoderSessionCount: 1,
+      decoderSessionCount: 1,
+    },
+    warmupRuns,
+    runs: [run],
+  };
+  window.__ortWebgpuBenchmarkResult = result;
+  show(result);
+} catch (error) {
+  const result = { status: 'fail', error: error?.stack || error?.message || String(error) };
+  window.__ortWebgpuBenchmarkResult = result;
+  show(result);
+} finally {
+  await decoderSession?.release();
+  await encoderSession?.release();
+  // ONNX Runtime Web owns its device. The fresh Chrome process is the runtime
+  // lifetime boundary; destroying the shared device here would race release().
+}
+</script>
+</html>

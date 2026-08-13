@@ -7,7 +7,11 @@
 // End-to-end per-op correctness test for the WebGPU (Tier 2) executor. Each op is
 // run through the public WebGPU provider and compared against the CPU provider.
 // Prints one PASS/FAIL line per op plus a final summary.
-import { VolvoxAI, Graph } from '../dist/0.3.0/volvoxai.js';
+import {
+  Model,
+  VolvoxAI,
+  parseGraphDocument,
+} from '../dist/0.4.0/volvoxai.js';
 
 const out = document.getElementById('out');
 const log = (s) => { out.textContent += s + '\n'; };
@@ -17,17 +21,120 @@ const failureMessage = (error) => {
   return `${error?.message || error}${details.length ? ` (${details.join('; ')})` : ''}`;
 };
 
-function buildGraph(spec) {
-  if (spec.buildGraph) return spec.buildGraph();
-  const g = new Graph();
-  for (const inp of (spec.inputs || [])) g.addInput(inp.name, inp.shape, inp.dtype || 'float32');
-  for (const w of (spec.weights || [])) { const t = g.addWeight(w.name, w.shape, w.dtype || 'float32'); t.buffer = w.data; }
-  const inMap = {};
-  for (const [k, v] of Object.entries(spec.opInputs)) inMap[k] = g.tensors.get(v);
-  const out = spec.outDtype ? { shape: spec.outShape, dtype: spec.outDtype } : spec.outShape;
-  const outs = g.addOp(spec.opType, inMap, { out }, spec.params || {});
-  g.setOutputs(outs.out);
-  return g;
+function snapshotFromDefinition({
+  inputs = [],
+  weights = [],
+  nodes,
+  outputs,
+  quantization = null,
+  quantizationByTensor = {},
+  dimensions = {},
+  banks = null,
+  bankResidency = null,
+}) {
+  const weightDescriptors = weights.map(({ name, dtype = 'float32', shape }) => ({
+    name, dtype, shape,
+  }));
+  const document = {
+    format: 'volvox-graph/v1',
+    dimensions,
+    inputs: Object.fromEntries(inputs.map(({ name, dtype = 'float32', shape }) => [
+      name, { dtype, shape },
+    ])),
+    nodes,
+    outputs,
+    ...(banks === null ? {} : { banks }),
+    ...(quantization === null ? {} : { quantization }),
+  };
+  const graph = parseGraphDocument(document, weightDescriptors);
+  const weightData = Object.fromEntries(weights.map(({ name, dtype = 'float32', shape, data }) => [
+    name, { name, dtype, shape, data },
+  ]));
+  return Object.freeze({
+    snapshot: Model.capture({
+      graph,
+      weights: weightData,
+      quantizationByTensor,
+    }),
+    inputs: Object.freeze(Object.fromEntries(inputs.map(({ name, dtype = 'float32', shape }) => [
+      name, Object.freeze({ dtype, shape: Object.freeze([...shape]) }),
+    ]))),
+    outputName: outputs[0],
+    bankResidency,
+  });
+}
+
+function buildSnapshot(spec) {
+  if (spec.buildSnapshot) return spec.buildSnapshot();
+  const outputName = `${spec.name.replace(/[^A-Za-z0-9_]/g, '_')}_out`;
+  return snapshotFromDefinition({
+    inputs: spec.inputs || [],
+    weights: spec.weights || [],
+    nodes: [{
+      id: `${outputName}_node`,
+      opType: spec.opType,
+      inputs: { ...spec.opInputs },
+      outputs: {
+        out: {
+          tensor: outputName,
+          dtype: spec.outDtype || 'float32',
+          shape: spec.outShape,
+        },
+      },
+      params: spec.params || {},
+    }],
+    outputs: [outputName],
+  });
+}
+
+function buildConcatSigmoidSnapshot() {
+  return snapshotFromDefinition({
+    inputs: [
+      { name: 'left', shape: [1, 2, 2] },
+      { name: 'right', shape: [1, 1, 2] },
+    ],
+    nodes: [
+      {
+        id: 'concat', opType: 'Concat',
+        inputs: { input0: 'left', input1: 'right' },
+        outputs: { out: { tensor: 'concatenated', dtype: 'float32', shape: [1, 3, 2] } },
+        params: { axis: 1 },
+      },
+      {
+        id: 'sigmoid', opType: 'Sigmoid',
+        inputs: { input: 'concatenated' },
+        outputs: { out: { tensor: 'out', dtype: 'float32', shape: [1, 3, 2] } },
+        params: {},
+      },
+    ],
+    outputs: ['out'],
+  });
+}
+
+function buildDequantI8Snapshot() {
+  return snapshotFromDefinition({
+    inputs: [{ name: 'x', shape: [5], dtype: 'int8' }],
+    weights: [
+      { name: 's', shape: [1], data: Float32Array.of(0.25) },
+      { name: 'z', shape: [1], dtype: 'int8', data: Int8Array.of(-1) },
+    ],
+    nodes: [{
+      id: 'dequantize', opType: 'DequantizeLinear',
+      inputs: { input: 'x', scale: 's', zero_point: 'z' },
+      outputs: { out: { tensor: 'out', dtype: 'float32', shape: [5] } },
+      params: {},
+    }],
+    outputs: ['out'],
+    quantization: {
+      format: 'volvox-affine-safetensors/v1',
+      tensors: {
+        x: { scheme: 'per_tensor', scale_tensor: 's', zero_point_tensor: 'z' },
+      },
+    },
+    quantizationByTensor: {
+      x: { scheme: 'per_tensor', scale: 0.25, zero_point: -1 },
+    },
+  });
 }
 
 function maxAbsDiff(a, b) {
@@ -37,36 +144,45 @@ function maxAbsDiff(a, b) {
   return m;
 }
 
-async function executeGraph(runtime, graph, backend, inputs) {
-  const model = runtime.createModel(graph);
+async function executeSnapshot(runtime, model, backend, inputs) {
   let compiled;
   let context;
   let result;
   try {
-    compiled = await model.compile({
+    compiled = await runtime.compile(model.snapshot, {
       backend: { mode: 'require', backend, operatorFallback: 'forbid' },
     });
-    context = await compiled.createContext();
-    result = await context.execute(inputs);
-    return await result.output(graph.outputNames[0]).read();
+    context = await compiled.createContext(
+      model.bankResidency ? { bankResidency: model.bankResidency } : {},
+    );
+    const shapedInputs = Object.fromEntries(Object.entries(model.inputs).map(([name, descriptor]) => {
+      const data = inputs[name];
+      if (!ArrayBuffer.isView(data) || data instanceof DataView) {
+        throw new Error(`input '${name}' requires a typed array`);
+      }
+      return [name, Object.freeze({ data, shape: descriptor.shape })];
+    }));
+    result = await context.execute(shapedInputs);
+    return await result.output(model.outputName).read();
   } finally {
     await result?.close();
     await context?.close();
     await compiled?.close();
-    await model.close();
   }
 }
 
 async function runCase(cpuRuntime, gpuRuntime, spec) {
   // Reference on CPU
-  const gc = buildGraph(spec);
+  const cpuModel = buildSnapshot(spec);
   const expected = spec.expected || Array.from(
-    await executeGraph(cpuRuntime, gc, 'cpu', spec.inputData || {}),
+    await executeSnapshot(cpuRuntime, cpuModel, 'cpu', spec.inputData || {}),
   );
 
   // WebGPU
-  const gg = buildGraph(spec);
-  const got = Array.from(await executeGraph(gpuRuntime, gg, 'webgpu', spec.inputData || {}));
+  const gpuModel = buildSnapshot(spec);
+  const got = Array.from(
+    await executeSnapshot(gpuRuntime, gpuModel, 'webgpu', spec.inputData || {}),
+  );
 
   const diff = maxAbsDiff(expected, got);
   const ok = diff < 1e-3;
@@ -103,7 +219,7 @@ async function runI32DequantScaleBackwardCase(device, zeroPointValues, zeroPoint
   const params = device.createBuffer({
     size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
   });
-  device.queue.writeBuffer(params, 0, Uint32Array.of(2, 1, zeroPointType, 1));
+  device.queue.writeBuffer(params, 0, Uint32Array.of(2, 16, zeroPointType, 1));
   buffers.push(params);
   const readback = device.createBuffer({ size: 4, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST });
   buffers.push(readback);
@@ -144,123 +260,263 @@ const ramp = (n, f = 1) => Float32Array.from({ length: n }, (_, i) => (i % 9 - 4
 // Keeping both values equal also makes the profile mean exactly representable.
 const extremeNegativePair = Float32Array.of(-1.1e38, -1.1e38);
 
-function buildMoEGraph() {
-  const g = new Graph();
-  const input = g.addInput('x', [2, 2]);
-  const routerWeight = g.addWeight('router_weight', [2, 3]);
-  const routerBias = g.addWeight('router_bias', [3]);
-  const expertWeight = g.addWeight('expert_weight', [3, 2, 2]);
-  const expertBias = g.addWeight('expert_bias', [3, 2]);
-  routerWeight.buffer = Float32Array.from([0.7, -0.4, 0.2, -0.3, 0.8, 0.5]);
-  routerBias.buffer = Float32Array.from([0.1, -0.2, 0.05]);
-  expertWeight.buffer = Float32Array.from([
-    0.3, -0.1, 0.2, 0.4,
-    -0.2, 0.5, 0.6, -0.3,
-    0.4, 0.2, -0.5, 0.1,
+function buildMoESnapshot() {
+  return snapshotFromDefinition({
+    inputs: [{ name: 'x', shape: [2, 2] }],
+    weights: [
+      {
+        name: 'router_weight', shape: [2, 3],
+        data: Float32Array.from([0.7, -0.4, 0.2, -0.3, 0.8, 0.5]),
+      },
+      { name: 'router_bias', shape: [3], data: Float32Array.from([0.1, -0.2, 0.05]) },
+      {
+        name: 'expert_weight', shape: [3, 2, 2], data: Float32Array.from([
+          0.3, -0.1, 0.2, 0.4,
+          -0.2, 0.5, 0.6, -0.3,
+          0.4, 0.2, -0.5, 0.1,
+        ]),
+      },
+      {
+        name: 'expert_bias', shape: [3, 2],
+        data: Float32Array.from([0.05, -0.1, -0.2, 0.3, 0.1, 0.2]),
+      },
+    ],
+    nodes: [
+      {
+        id: 'router', opType: 'MoERouter',
+        inputs: { input: 'x', weight: 'router_weight', bias: 'router_bias' },
+        outputs: {
+          indices: { tensor: 'route_indices', dtype: 'float32', shape: [2, 2] },
+          weights: { tensor: 'route_weights', dtype: 'float32', shape: [2, 2] },
+        },
+        params: { num_experts: 3, top_k: 2, normalize: true, temperature: 1 },
+      },
+      {
+        id: 'experts', opType: 'MoELinear',
+        inputs: {
+          input: 'x',
+          expert_weight: 'expert_weight',
+          expert_bias: 'expert_bias',
+          route_indices: 'route_indices',
+          route_weights: 'route_weights',
+        },
+        outputs: { out: { tensor: 'moe_out', dtype: 'float32', shape: [2, 2] } },
+        params: {},
+      },
+    ],
+    outputs: ['moe_out'],
+  });
+}
+
+/**
+ * Same expert bank, but only slots 0 and 2 are resident. Route indices stay in
+ * the model's global slot space, so the shader must map them to staged rows.
+ */
+function buildBankedMoESnapshot() {
+  // Expert k maps every input feature to the constant k + 1.
+  const staged = Float32Array.from([
+    1, 1, 1, 1,
+    3, 3, 3, 3,
   ]);
-  expertBias.buffer = Float32Array.from([0.05, -0.1, -0.2, 0.3, 0.1, 0.2]);
-  const routes = g.addOp('MoERouter', { input, weight: routerWeight, bias: routerBias }, {
-    indices: { name: 'route_indices', shape: [2, 2] },
-    weights: { name: 'route_weights', shape: [2, 2] },
-  }, { num_experts: 3, top_k: 2, normalize: true, temperature: 1 });
-  const { out } = g.addOp('MoELinear', {
-    input,
-    expert_weight: expertWeight,
-    expert_bias: expertBias,
-    route_indices: routes.indices,
-    route_weights: routes.weights,
-  }, { out: { name: 'moe_out', shape: [2, 2] } });
-  g.setOutputs(out);
-  return g;
+  return snapshotFromDefinition({
+    dimensions: { F: { min: 1, max: 4 } },
+    banks: { expert_weight: 'F' },
+    bankResidency: { expert_weight: [0, 2] },
+    inputs: [
+      { name: 'x', shape: [2, 2] },
+      { name: 'route_indices', shape: [2, 2] },
+      { name: 'route_weights', shape: [2, 2] },
+    ],
+    weights: [{ name: 'expert_weight', shape: [4, 2, 2], data: Float32Array.from([
+      1, 1, 1, 1,
+      2, 2, 2, 2,
+      3, 3, 3, 3,
+      4, 4, 4, 4,
+    ]) }],
+    nodes: [{
+      id: 'experts', opType: 'MoELinear',
+      inputs: {
+        input: 'x',
+        expert_weight: 'expert_weight',
+        route_indices: 'route_indices',
+        route_weights: 'route_weights',
+      },
+      outputs: { out: { tensor: 'banked_out', dtype: 'float32', shape: [2, 2] } },
+      params: {},
+    }],
+    outputs: ['banked_out'],
+  });
 }
 
-function buildW8A8LinearGraph() {
-  const g = new Graph();
-  const input = g.addInput('x', [3, 19], 'uint8', {
-    quantization: { scheme: 'per_tensor', scale: 0.02, zero_point: 127 },
-  });
+function buildW8A8LinearSnapshot() {
   const weightValues = Int8Array.from({ length: 36 * 19 }, (_, index) => (index * 29) % 31 - 15);
-  const weight = g.addWeight('w', [36, 19], 'int8', {
-    buffer: weightValues,
+  const weightScales = Array.from(
+    { length: 36 }, (_, channel) => 0.0125 + (channel % 5) * 0.001,
+  );
+  const weightZeroPoints = Array.from({ length: 36 }, (_, channel) => channel % 7 - 3);
+  return snapshotFromDefinition({
+    inputs: [{ name: 'x', shape: [3, 19], dtype: 'uint8' }],
+    weights: [
+      { name: 'w', shape: [36, 19], dtype: 'int8', data: weightValues },
+      {
+        name: 'b', shape: [36], dtype: 'int32',
+        data: Int32Array.from({ length: 36 }, (_, channel) => (channel % 9 - 4) * 13),
+      },
+      { name: 'x_scale', shape: [1], data: Float32Array.of(0.02) },
+      { name: 'x_zero_point', shape: [1], dtype: 'uint8', data: Uint8Array.of(127) },
+      { name: 'w_scale', shape: [36], data: Float32Array.from(weightScales) },
+      { name: 'w_zero_point', shape: [36], dtype: 'int8', data: Int8Array.from(weightZeroPoints) },
+      { name: 'out_scale', shape: [1], data: Float32Array.of(0.05) },
+      { name: 'out_zero_point', shape: [1], dtype: 'int8', data: Int8Array.of(-3) },
+    ],
+    nodes: [{
+      id: 'qlinear', opType: 'QLinear',
+      inputs: { input: 'x', weight: 'w', bias: 'b' },
+      outputs: { out: { tensor: 'out', dtype: 'int8', shape: [3, 36] } },
+      params: {},
+    }],
+    outputs: ['out'],
     quantization: {
-      scheme: 'per_axis', axis: 0,
-      scales: Array.from({ length: 36 }, (_, channel) => 0.0125 + (channel % 5) * 0.001),
-      zero_points: Array.from({ length: 36 }, (_, channel) => channel % 7 - 3),
+      format: 'volvox-affine-safetensors/v1',
+      tensors: {
+        x: {
+          scheme: 'per_tensor', scale_tensor: 'x_scale', zero_point_tensor: 'x_zero_point',
+        },
+        w: {
+          scheme: 'per_axis', axis: 0,
+          scale_tensor: 'w_scale', zero_point_tensor: 'w_zero_point',
+        },
+        out: {
+          scheme: 'per_tensor', scale_tensor: 'out_scale', zero_point_tensor: 'out_zero_point',
+        },
+      },
+    },
+    quantizationByTensor: {
+      x: { scheme: 'per_tensor', scale: 0.02, zero_point: 127 },
+      w: { scheme: 'per_axis', axis: 0, scales: weightScales, zero_points: weightZeroPoints },
+      out: { scheme: 'per_tensor', scale: 0.05, zero_point: -3 },
     },
   });
-  const bias = g.addWeight('b', [36], 'int32', {
-    buffer: Int32Array.from({ length: 36 }, (_, channel) => (channel % 9 - 4) * 13),
-  });
-  const { out } = g.addOp('QLinear', { input, weight, bias }, {
-    out: {
-      name: 'out', shape: [3, 36], dtype: 'int8',
-      quantization: { scheme: 'per_tensor', scale: 0.05, zero_point: -3 },
-    },
-  });
-  g.setOutputs(out);
-  return g;
 }
 
-function buildW8A8ConvGraph() {
-  const g = new Graph();
-  const input = g.addInput('x', [1, 4, 5, 16], 'uint8', {
-    quantization: { scheme: 'per_tensor', scale: 0.02, zero_point: 127 },
-  });
-  const weight = g.addWeight('w', [16, 3, 3, 16], 'int8', {
-    buffer: Int8Array.from({ length: 16 * 3 * 3 * 16 }, (_, index) => (index * 11) % 15 - 7),
-    quantization: {
-      scheme: 'per_axis', axis: 0,
-      scales: Array.from({ length: 16 }, (_, channel) => 0.015 + (channel % 4) * 0.001),
-      zero_points: Array(16).fill(0),
+function buildW8A8ConvSnapshot() {
+  const weightScales = Array.from(
+    { length: 16 }, (_, channel) => 0.015 + (channel % 4) * 0.001,
+  );
+  const weightZeroPoints = Array(16).fill(0);
+  return buildW8A8ConvSnapshotWithMetadata({
+    inputShape: [1, 4, 5, 16],
+    weightShape: [16, 3, 3, 16],
+    outputShape: [1, 4, 5, 16],
+    inputScale: 0.02,
+    inputZeroPoint: 127,
+    outputDType: 'int8',
+    outputScale: 0.1,
+    outputZeroPoint: 0,
+    weightScales,
+    weightZeroPoints,
+    weightData: Int8Array.from(
+      { length: 16 * 3 * 3 * 16 }, (_, index) => (index * 11) % 15 - 7,
+    ),
+    biasData: Int32Array.from({ length: 16 }, (_, channel) => (channel % 7 - 3) * 17),
+    params: {
+      data_layout: 'NHWC', weight_layout: 'OHWI', stride: [1, 1],
+      padding: [1, 1], dilation: [1, 1], groups: 1, relu: 0,
     },
   });
-  const bias = g.addWeight('b', [16], 'int32', {
-    buffer: Int32Array.from({ length: 16 }, (_, channel) => (channel % 7 - 3) * 17),
-  });
-  const { out } = g.addOp('QConv2D', { input, weight, bias }, {
-    out: {
-      name: 'out', shape: [1, 4, 5, 16], dtype: 'int8',
-      quantization: { scheme: 'per_tensor', scale: 0.1, zero_point: 0 },
-    },
-  }, {
-    data_layout: 'NHWC', weight_layout: 'OHWI', stride: [1, 1],
-    padding: [1, 1], dilation: [1, 1], groups: 1, relu: 0,
-  });
-  g.setOutputs(out);
-  return g;
 }
 
-function buildW8A8ConvTailGraph(inputChannels) {
-  const g = new Graph();
-  const input = g.addInput('x', [1, 3, 5, inputChannels], 'uint8', {
-    quantization: { scheme: 'per_tensor', scale: 0.02, zero_point: 131 },
+function buildW8A8ConvSnapshotWithMetadata({
+  inputShape,
+  weightShape,
+  outputShape,
+  inputScale,
+  inputZeroPoint,
+  outputDType,
+  outputScale,
+  outputZeroPoint,
+  weightScales,
+  weightZeroPoints,
+  weightData,
+  biasData,
+  params,
+}) {
+  const outputZeroPointData = outputDType === 'int8'
+    ? Int8Array.of(outputZeroPoint)
+    : Uint8Array.of(outputZeroPoint);
+  return snapshotFromDefinition({
+    inputs: [{ name: 'x', shape: inputShape, dtype: 'uint8' }],
+    weights: [
+      { name: 'w', shape: weightShape, dtype: 'int8', data: weightData },
+      { name: 'b', shape: [weightShape[0]], dtype: 'int32', data: biasData },
+      { name: 'x_scale', shape: [1], data: Float32Array.of(inputScale) },
+      { name: 'x_zero_point', shape: [1], dtype: 'uint8', data: Uint8Array.of(inputZeroPoint) },
+      { name: 'w_scale', shape: [weightShape[0]], data: Float32Array.from(weightScales) },
+      {
+        name: 'w_zero_point', shape: [weightShape[0]], dtype: 'int8',
+        data: Int8Array.from(weightZeroPoints),
+      },
+      { name: 'out_scale', shape: [1], data: Float32Array.of(outputScale) },
+      {
+        name: 'out_zero_point', shape: [1], dtype: outputDType,
+        data: outputZeroPointData,
+      },
+    ],
+    nodes: [{
+      id: 'qconv', opType: 'QConv2D',
+      inputs: { input: 'x', weight: 'w', bias: 'b' },
+      outputs: { out: { tensor: 'out', dtype: outputDType, shape: outputShape } },
+      params,
+    }],
+    outputs: ['out'],
+    quantization: {
+      format: 'volvox-affine-safetensors/v1',
+      tensors: {
+        x: {
+          scheme: 'per_tensor', scale_tensor: 'x_scale', zero_point_tensor: 'x_zero_point',
+        },
+        w: {
+          scheme: 'per_axis', axis: 0,
+          scale_tensor: 'w_scale', zero_point_tensor: 'w_zero_point',
+        },
+        out: {
+          scheme: 'per_tensor', scale_tensor: 'out_scale', zero_point_tensor: 'out_zero_point',
+        },
+      },
+    },
+    quantizationByTensor: {
+      x: { scheme: 'per_tensor', scale: inputScale, zero_point: inputZeroPoint },
+      w: { scheme: 'per_axis', axis: 0, scales: weightScales, zero_points: weightZeroPoints },
+      out: { scheme: 'per_tensor', scale: outputScale, zero_point: outputZeroPoint },
+    },
   });
+}
+
+function buildW8A8ConvTailSnapshot(inputChannels) {
   const weightZeroPoints = Array.from({ length: 16 }, (_, channel) => channel % 7 - 3);
-  const weight = g.addWeight('w', [16, 1, 1, inputChannels], 'int8', {
-    buffer: Int8Array.from({ length: 16 * inputChannels }, (_, index) => {
+  return buildW8A8ConvSnapshotWithMetadata({
+    inputShape: [1, 3, 5, inputChannels],
+    weightShape: [16, 1, 1, inputChannels],
+    outputShape: [1, 3, 5, 16],
+    inputScale: 0.02,
+    inputZeroPoint: 131,
+    outputDType: 'uint8',
+    outputScale: 0.04,
+    outputZeroPoint: 113,
+    weightScales: Array.from(
+      { length: 16 }, (_, channel) => 0.015 + (channel % 4) * 0.001,
+    ),
+    weightZeroPoints,
+    weightData: Int8Array.from({ length: 16 * inputChannels }, (_, index) => {
       const channel = Math.floor(index / inputChannels);
       return weightZeroPoints[channel] + (index * 11) % 17 - 8;
     }),
-    quantization: {
-      scheme: 'per_axis', axis: 0,
-      scales: Array.from({ length: 16 }, (_, channel) => 0.015 + (channel % 4) * 0.001),
-      zero_points: weightZeroPoints,
+    biasData: Int32Array.from({ length: 16 }, (_, channel) => (channel % 9 - 4) * 19),
+    params: {
+      data_layout: 'NHWC', weight_layout: 'OHWI', stride: [1, 1],
+      padding: [0, 0], dilation: [1, 1], groups: 1, relu: 0,
     },
   });
-  const bias = g.addWeight('b', [16], 'int32', {
-    buffer: Int32Array.from({ length: 16 }, (_, channel) => (channel % 9 - 4) * 19),
-  });
-  const { out } = g.addOp('QConv2D', { input, weight, bias }, {
-    out: {
-      name: 'out', shape: [1, 3, 5, 16], dtype: 'uint8',
-      quantization: { scheme: 'per_tensor', scale: 0.04, zero_point: 113 },
-    },
-  }, {
-    data_layout: 'NHWC', weight_layout: 'OHWI', stride: [1, 1],
-    padding: [0, 0], dilation: [1, 1], groups: 1, relu: 0,
-  });
-  g.setOutputs(out);
-  return g;
 }
 
 const specs = [
@@ -273,32 +529,41 @@ const specs = [
     opInputs: { input: 'x', weight: 'w', bias: 'b' }, outShape: [1, 4, 4, 3],
     params: { stride: [1, 1], padding: [1, 1], groups: 1, relu: 0 },
     inputData: { x: ramp(32, 0.3) } },
-  { name: 'Concat(sigmoid)', opType: 'Concat',
-    inputs: [{ name: 'left', shape: [1, 2, 2] }, { name: 'right', shape: [1, 1, 2] }],
-    opInputs: { input0: 'left', input1: 'right' }, outShape: [1, 3, 2],
-    params: { axis: 1, sigmoid: 1 },
+  { name: 'Conv2D(out16)', opType: 'Conv2D',
+    inputs: [{ name: 'x', shape: [1, 6, 7, 5] }],
+    weights: [
+      { name: 'w', shape: [3, 3, 5, 16], data: ramp(3 * 3 * 5 * 16, 0.03) },
+      { name: 'b', shape: [16], data: ramp(16, 0.02) },
+    ],
+    opInputs: { input: 'x', weight: 'w', bias: 'b' }, outShape: [1, 3, 3, 16],
+    params: {
+      stride: [2, 2], pads: [1, 0, 2, 1], dilation: [2, 1],
+      groups: 1, weight_layout: 'HWIO', relu: 0,
+    },
+    inputData: { x: ramp(6 * 7 * 5, 0.07) } },
+  { name: 'Concat+Sigmoid', buildSnapshot: buildConcatSigmoidSnapshot,
     inputData: {
       left: Float32Array.of(-8, -2, 0, 2), right: Float32Array.of(8, 0.5),
     } },
   { name: 'Add', opType: 'Add',
-    inputs: [{ name: 'a', shape: [1, 4] }, { name: 'b', shape: [4] }],
+    inputs: [{ name: 'a', shape: [1, 4] }, { name: 'b', shape: [1, 4] }],
     opInputs: { a: 'a', b: 'b' }, outShape: [1, 4],
     inputData: { a: Float32Array.of(-4, -1, 5, 10), b: Float32Array.of(1, 3, 4, -7) } },
   { name: 'Add(ReLU)', opType: 'Add',
-    inputs: [{ name: 'a', shape: [1, 4] }, { name: 'b', shape: [4] }],
+    inputs: [{ name: 'a', shape: [1, 4] }, { name: 'b', shape: [1, 4] }],
     opInputs: { a: 'a', b: 'b' }, outShape: [1, 4], params: { relu: 1 },
     inputData: { a: Float32Array.of(-4, -1, 5, 10), b: Float32Array.of(1, 3, 4, -7) } },
   { name: 'Add(ReLU6)', opType: 'Add',
-    inputs: [{ name: 'a', shape: [1, 4] }, { name: 'b', shape: [4] }],
+    inputs: [{ name: 'a', shape: [1, 4] }, { name: 'b', shape: [1, 4] }],
     opInputs: { a: 'a', b: 'b' }, outShape: [1, 4], params: { relu: 2 },
     inputData: { a: Float32Array.of(-4, -1, 5, 10), b: Float32Array.of(1, 3, 4, -7) } },
-  { name: 'QLinear(W8A8 dot)', buildGraph: buildW8A8LinearGraph,
+  { name: 'QLinear(W8A8 dot)', buildSnapshot: buildW8A8LinearSnapshot,
     inputData: { x: Uint8Array.from({ length: 3 * 19 }, (_, index) => 112 + (index * 13) % 31) } },
-  { name: 'QConv2D(W8A8 dot)', buildGraph: buildW8A8ConvGraph,
+  { name: 'QConv2D(W8A8 dot)', buildSnapshot: buildW8A8ConvSnapshot,
     inputData: { x: Uint8Array.from({ length: 4 * 5 * 16 }, (_, index) => 112 + (index * 13) % 31) } },
   ...[17, 18, 19].map((inputChannels) => ({
     name: `QConv tail${inputChannels % 4}(dot)`,
-    buildGraph: () => buildW8A8ConvTailGraph(inputChannels),
+    buildSnapshot: () => buildW8A8ConvTailSnapshot(inputChannels),
     inputData: {
       x: Uint8Array.from({ length: 3 * 5 * inputChannels },
         (_, index) => 119 + (index * 13) % 25),
@@ -310,8 +575,15 @@ const specs = [
     inputs: [{ name: 'q', shape: [2, 2, 2] }, { name: 'k', shape: [2, 3, 2] }, { name: 'v', shape: [2, 3, 2] }],
     opInputs: { q: 'q', k: 'k', v: 'v' }, outShape: [2, 2, 2],
     params: { heads: 1, causal: false, scale: 0.6 }, inputData: { q: ramp(8, 0.2), k: ramp(12, -0.15), v: ramp(12, 0.1) } },
-  { name: 'MoE router+expert', buildGraph: buildMoEGraph,
+  { name: 'MoE router+expert', buildSnapshot: buildMoESnapshot,
     inputData: { x: Float32Array.from([0.4, -0.2, -0.1, 0.6]) } },
+  { name: 'MoE banked(slots 0,2)', buildSnapshot: buildBankedMoESnapshot,
+    inputData: {
+      x: Float32Array.from([1, 0, 0, 1]),
+      // Global slot ids: both rows mix the two resident experts.
+      route_indices: Float32Array.from([0, 2, 2, 0]),
+      route_weights: Float32Array.from([0.25, 0.75, 0.5, 0.5]),
+    } },
   { name: 'CrossAttention', opType: 'CrossAttention',
     inputs: [{ name: 'q', shape: [1, 2, 4] }, { name: 'kv', shape: [1, 3, 4] }],
     weights: [{ name: 'w', shape: [12, 4], data: ramp(48, 0.05) }],
@@ -332,46 +604,31 @@ const specs = [
   { name: 'MeanHeight', opType: 'MeanHeight', inputs: [{ name: 'x', shape: [2, 3, 2, 2] }], opInputs: { input: 'x' },
     outShape: [2, 2, 2], inputData: { x: ramp(24, 0.2) } },
   { name: 'ArgMax(axis=1)', opType: 'ArgMax', inputs: [{ name: 'x', shape: [2, 3, 2] }], opInputs: { input: 'x' },
-    outShape: [2, 2], outDtype: 'int32', params: { axis: 1, keepdims: 0 },
+    outShape: [2, 2], outDtype: 'int32', params: { axis: 1, keepdims: false },
     inputData: { x: Float32Array.from([1, 9, 5, 3, 5, 4, 2, 0, 8, 7, 6, 10]) } },
-  { name: 'NMS(stable)', opType: 'NonMaxSuppression',
-    inputs: [{ name: 'boxes', shape: [1, 3, 4] }, { name: 'scores', shape: [1, 1, 3] }],
-    weights: [
-      { name: 'maximum', shape: [1], dtype: 'int32', data: Int32Array.of(3) },
-      { name: 'iou', shape: [1], data: Float32Array.of(0.5) },
-      { name: 'threshold', shape: [1], data: Float32Array.of(0) },
-    ],
-    opInputs: {
-      boxes: 'boxes', scores: 'scores', max_output_boxes_per_class: 'maximum',
-      iou_threshold: 'iou', score_threshold: 'threshold',
-    }, outShape: [3, 3],
-    inputData: {
-      boxes: Float32Array.from([0, 0, 1, 1, 0, 0.1, 1, 1.1, 2, 2, 3, 3]),
-      scores: Float32Array.from([0.9, 0.9, 0.7]),
-    } },
   // newly wired ops
   { name: 'Slice', opType: 'Slice', inputs: [{ name: 'x', shape: [1, 1, 4, 4] }], opInputs: { input: 'x' },
-    outShape: [1, 1, 2, 2], params: { axes: [2, 3], starts: [1, 1], steps: [1, 1] }, inputData: { x: ramp(16) } },
+    outShape: [1, 1, 2, 2], params: { axes: [2, 3], starts: [1, 1], ends: [3, 3], steps: [1, 1] }, inputData: { x: ramp(16) } },
   { name: 'Slice(ND rank5)', opType: 'Slice', inputs: [{ name: 'x', shape: [1, 2, 2, 2, 3] }], opInputs: { input: 'x' },
-    outShape: [1, 1, 2, 2, 2], params: { axes: [-4, -1], starts: [-1, -3], steps: [1, 2] },
+    outShape: [1, 1, 2, 2, 2], params: { axes: [-4, -1], starts: [-1, -3], ends: [2, 3], steps: [1, 2] },
     inputData: { x: Float32Array.from({ length: 24 }, (_, index) => index) } },
   { name: 'Pad', opType: 'Pad', inputs: [{ name: 'x', shape: [1, 1, 2, 2] }], opInputs: { input: 'x' },
     outShape: [1, 1, 4, 4], params: { pads: [0, 0, 1, 1, 0, 0, 1, 1], value: 0 }, inputData: { x: Float32Array.from([1, 2, 3, 4]) } },
   { name: 'ConvTranspose2D', opType: 'ConvTranspose2D',
     inputs: [{ name: 'x', shape: [1, 2, 2, 1] }],
-    weights: [{ name: 'w', shape: [1, 1, 2, 2], data: Float32Array.from([1, 2, 3, 4]) }],
+    weights: [{ name: 'w', shape: [2, 2, 1, 1], data: Float32Array.from([1, 2, 3, 4]) }],
     opInputs: { input: 'x', weight: 'w' }, outShape: [1, 4, 4, 1],
     params: { kernel: [2, 2], stride: [2, 2], padding: [0, 0] }, inputData: { x: Float32Array.from([1, 2, 3, 4]) } },
   { name: 'Conv1D(grouped)', opType: 'Conv1D',
-    inputs: [{ name: 'x', shape: [1, 2, 4] }],
-    weights: [{ name: 'w', shape: [2, 1, 3], data: Float32Array.from([.1,.2,-.1, -.2,.1,.3]) }, { name: 'b', shape: [2], data: Float32Array.from([.05,-.1]) }],
-    opInputs: { input: 'x', weight: 'w', bias: 'b' }, outShape: [1, 2, 4],
+    inputs: [{ name: 'x', shape: [1, 4, 2] }],
+    weights: [{ name: 'w', shape: [3, 1, 2], data: Float32Array.from([.1,.2,-.1, -.2,.1,.3]) }, { name: 'b', shape: [2], data: Float32Array.from([.05,-.1]) }],
+    opInputs: { input: 'x', weight: 'w', bias: 'b' }, outShape: [1, 4, 2],
     params: { stride: 1, padding: 1, groups: 2 }, inputData: { x: Float32Array.from([.2,-.1,.4,.3,.5,.1,-.2,.6]) } },
   { name: 'Interpolate1D(batch)', opType: 'Interpolate1D', inputs: [{ name: 'x', shape: [2, 1, 2] }], opInputs: { input: 'x' },
     outShape: [2, 1, 4], params: { size: 4 }, inputData: { x: Float32Array.from([0, 2, 10, 14]) } },
   { name: 'Where', opType: 'Where',
     inputs: [{ name: 'c', shape: [8] }, { name: 'a', shape: [8] }, { name: 'b', shape: [8] }],
-    opInputs: { cond: 'c', x: 'a', y: 'b' }, outShape: [8],
+    opInputs: { condition: 'c', a: 'a', b: 'b' }, outShape: [8],
     inputData: { c: Float32Array.from([1, 0, 1, 0, 1, 1, 0, 0]), a: ramp(8), b: ramp(8, -1) } },
   { name: 'Mask(I32)', opType: 'Mask',
     inputs: [{ name: 'mask', shape: [4], dtype: 'int32' }, { name: 'a', shape: [4] }, { name: 'b', shape: [4] }],
@@ -400,35 +657,13 @@ const specs = [
       indices: Int32Array.of(-1, -2, 0, 1, -3, -1),
     } },
   { name: 'ReduceSum', opType: 'ReduceSum', inputs: [{ name: 'x', shape: [2, 3] }], opInputs: { input: 'x' },
-    outShape: [2], params: {}, inputData: { x: Float32Array.from([1, 2, 3, 4, 5, 6]) } },
+    outShape: [2], params: { axis: -1, keepdims: false }, inputData: { x: Float32Array.from([1, 2, 3, 4, 5, 6]) } },
   { name: 'ReduceMean', opType: 'ReduceMean', inputs: [{ name: 'x', shape: [2, 3] }], opInputs: { input: 'x' },
-    outShape: [2], params: {}, inputData: { x: Float32Array.from([1, 2, 3, 4, 5, 6]) } },
+    outShape: [2], params: { axis: -1, keepdims: false }, inputData: { x: Float32Array.from([1, 2, 3, 4, 5, 6]) } },
   { name: 'AveragePool2D', opType: 'AveragePool2D', inputs: [{ name: 'x', shape: [1, 4, 4, 1] }], opInputs: { input: 'x' },
     outShape: [1, 2, 2, 1], params: { kernel: [2, 2], stride: [2, 2] }, inputData: { x: ramp(16) } },
-  { name: 'DequantizeLinear', opType: 'DequantizeLinear',
-    inputs: [{ name: 'x', shape: [4] }], weights: [{ name: 's', shape: [1], data: Float32Array.from([0.5]) }],
-    opInputs: { input: 'x', scale: 's' }, outShape: [4], inputData: { x: Float32Array.from([2, 4, 6, 8]) } },
-  { name: 'Dequantize(I8)', opType: 'DequantizeLinear',
-    inputs: [{ name: 'x', shape: [5], dtype: 'int8' }],
-    weights: [
-      { name: 's', shape: [1], data: Float32Array.of(0.25) },
-      { name: 'z', shape: [1], dtype: 'int8', data: Int8Array.of(-1) },
-    ], opInputs: { input: 'x', scale: 's', zero_point: 'z' }, outShape: [5], outDtype: 'float32',
+  { name: 'Dequantize(I8)', buildSnapshot: buildDequantI8Snapshot,
     inputData: { x: Int8Array.of(-4, -1, 0, 3, 7) } },
-  { name: 'Dequantize(I32 exact)', opType: 'DequantizeLinear',
-    inputs: [{ name: 'x', shape: [2], dtype: 'int32' }],
-    weights: [
-      { name: 's', shape: [1], data: Float32Array.of(1) },
-      { name: 'z', shape: [1], dtype: 'int32', data: Int32Array.of(16_777_216) },
-    ], opInputs: { input: 'x', scale: 's', zero_point: 'z' }, outShape: [2], outDtype: 'float32',
-    inputData: { x: Int32Array.of(16_777_217, 16_777_218) } },
-  { name: 'Dequantize(I32/F32 zp)', opType: 'DequantizeLinear',
-    inputs: [{ name: 'x', shape: [2], dtype: 'int32' }],
-    weights: [
-      { name: 's', shape: [1], data: Float32Array.of(1) },
-      { name: 'z', shape: [1], data: Float32Array.of(16_777_216) },
-    ], opInputs: { input: 'x', scale: 's', zero_point: 'z' }, outShape: [2], outDtype: 'float32',
-    inputData: { x: Int32Array.of(16_777_217, 16_777_218) } },
   { name: 'Cast(F32→I8)', opType: 'Cast', inputs: [{ name: 'x', shape: [5] }], opInputs: { input: 'x' },
     outShape: [5], outDtype: 'int8', params: { to: 'int8' },
     inputData: { x: Float32Array.of(-129.7, -2.9, 0, 127.9, 130.1) } },
@@ -442,7 +677,8 @@ const specs = [
     outShape: [4], outDtype: 'int32', params: { to: 'int32' },
     inputData: { x: Int32Array.of(16_777_217, -1, -2_147_483_648, 2_147_483_647) } },
   { name: 'Expand(chan)', opType: 'Expand', inputs: [{ name: 'x', shape: [1, 2, 1, 1] }], opInputs: { input: 'x' },
-    outShape: [1, 2, 2, 2], inputData: { x: Float32Array.from([10, 20]) } },
+    outShape: [1, 2, 2, 2], params: { shape: [1, 2, 2, 2] },
+    inputData: { x: Float32Array.from([10, 20]) } },
 ];
 
 (async () => {
@@ -465,8 +701,8 @@ const specs = [
       catch (e) { fail++; log(`FAIL  ${spec.name.padEnd(18)} threw: ${failureMessage(e)}`); }
     }
     for (const [zeroPoint, zeroPointType, label] of [
-      [Int32Array.of(16_777_216), 1, 'Dequant dScale(I32)'],
-      [Float32Array.of(16_777_216), 0, 'Dequant dScale(F32 zp)'],
+      [Int32Array.of(16_777_216), 16, 'Dequant dScale(I32)'],
+      [Float32Array.of(16_777_216), 18, 'Dequant dScale(F32 zp)'],
     ]) {
       try { (await runI32DequantScaleBackwardCase(validationDevice, zeroPoint, zeroPointType, label)) ? pass++ : fail++; }
       catch (e) { fail++; log(`FAIL  ${label.padEnd(18)} threw: ${failureMessage(e)}`); }

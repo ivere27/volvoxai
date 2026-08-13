@@ -20,6 +20,9 @@
     } \
 } while (0)
 
+extern int vx_public_api_test_private_engine_init(
+    const char* graph_path, const char* weights_path);
+
 static int closef32(float left, float right) {
     return fabsf(left - right) <=
         1.0e-6f * (1.0f + fabsf(left) + fabsf(right));
@@ -179,19 +182,23 @@ static int test_public_materialization_uses_cuda(void) {
     const char* output_weights_path =
         "/tmp/volvox-cuda-ptq-output.safetensors";
     const char* graph =
-        "{\"format\":\"volvox-graph/v1\",\"inputs\":{\"x\":{\"shape\":[1,3],\"dtype\":\"float32\"}},"
-        "\"nodes\":[{\"opType\":\"Linear\",\"inputs\":{"
+        "{\"format\":\"volvox-graph/v1\","
+        "\"dimensions\":{},"
+        "\"inputs\":{\"x\":{\"shape\":[1,3],\"dtype\":\"float32\"}},"
+        "\"nodes\":[{\"id\":\"linear\",\"opType\":\"Linear\",\"inputs\":{"
         "\"input\":\"x\",\"weight\":\"weight\",\"bias\":\"bias\"},"
-        "\"outputs\":{\"out\":\"y\"},\"outputs_shape\":{\"out\":[1,2]},"
-        "\"params\":{\"weight_layout\":\"OUT_IN\"}}],\"outputs\":[\"y\"]}";
+        "\"outputs\":{\"out\":{\"tensor\":\"y\",\"dtype\":\"float32\","
+        "\"shape\":[1,2]}},"
+        "\"params\":{\"weight_layout\":\"dout_din\"}}],\"outputs\":[\"y\"]}";
     const char* quantized_template =
-        "{\"format\":\"volvox-graph/v1\",\"inputs\":{\"x\":{\"shape\":[1,3],\"dtype\":\"int8\"}},"
-        "\"nodes\":[{\"opType\":\"QLinear\",\"inputs\":{"
+        "{\"format\":\"volvox-graph/v1\","
+        "\"dimensions\":{},"
+        "\"inputs\":{\"x\":{\"shape\":[1,3],\"dtype\":\"int8\"}},"
+        "\"nodes\":[{\"id\":\"qlinear\",\"opType\":\"QLinear\",\"inputs\":{"
         "\"input\":\"x\",\"weight\":\"weight.i8\","
-        "\"bias\":\"bias.i32\"},\"outputs\":{\"out\":\"y\"},"
-        "\"outputs_shape\":{\"out\":[1,2]},"
-        "\"outputs_dtype\":{\"out\":\"int8\"},"
-        "\"params\":{\"weight_layout\":\"OUT_IN\"}}],\"outputs\":[\"y\"]}";
+        "\"bias\":\"bias.i32\"},\"outputs\":{\"out\":{\"tensor\":\"y\","
+        "\"dtype\":\"int8\",\"shape\":[1,2]}},"
+        "\"params\":{}}],\"outputs\":[\"y\"]}";
     const int shape[2] = {2, 3};
     const int bias_shape[1] = {2};
     const float source[6] = {1.0f, 2.0f, -1.0f,
@@ -219,7 +226,8 @@ static int test_public_materialization_uses_cuda(void) {
                                  bias_shape, 1, bias, sizeof(bias)) == 0);
     CHECK(safetensors_save(weights_path, &weights) == 0);
     safetensors_free(&weights);
-    CHECK(volvoxai_engine_init(graph_path, weights_path) == 0);
+    CHECK(vx_public_api_test_private_engine_init(
+              graph_path, weights_path) == 0);
 
     /* Exercise the literal post-training path: update the loaded F32 master
      * with the strict public CUDA TrainStep, then feed that updated master to

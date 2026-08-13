@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
-import { Graph } from '../ts/core/Graph.js';
+import { RuntimeGraph } from '../ts/core/RuntimeGraph.js';
 import { CPUEngine } from '../ts/backends/CPUEngine.js';
 
 function quantization(dtype) {
@@ -17,7 +17,7 @@ function transposeGraph(dtype, {
   outputQuantization = quantization(dtype),
   perm = [0, 2, 3, 1],
 } = {}) {
-  const graph = new Graph();
+  const graph = new RuntimeGraph();
   const input = graph.addInput('input', [1, 2, 2, 3], dtype, {
     quantization: quantization(dtype),
   });

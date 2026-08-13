@@ -45,11 +45,11 @@ extern int qlayernorm_i8u8(const void* input, const float* weight,
         uint32_t output_dtype);
 
 enum {
-    /* Keep decoder prefixes on the caller: the largest TinyReceipt decoder
-     * SiLU is 192*1280 elements, where a pool dispatch per layer costs more
+    /* Keep bounded decoder prefixes on the caller: at 192*1280 elements a
+     * pool dispatch per layer costs more
      * than the byte-LUT work.  Encoder feature maps still clear this limit. */
     VX_QSILU_PARALLEL_ELEMENTS = 512u * 1024u,
-    /* TinyReceipt's encoder has 402 final-axis rows, while a full decoder
+    /* Large encoders can have 402 final-axis rows while a bounded decoder
      * prefix has at most 192.  This keeps row-level pool dispatches confined
      * to the encoder without coupling the kernel to either graph shape. */
     VX_QLAYERNORM_PARALLEL_ELEMENTS = 96u * 1024u,

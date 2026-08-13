@@ -10,7 +10,7 @@
 import { signature } from './lib/extract.mjs';
 import { requirePhysicalWebGPU } from './lib/backend.mjs';
 import { createRuntimeEvidence } from './lib/artifact.mjs';
-import { captureStableResult } from './lib/runmodel.mjs';
+import { captureStableResult, concreteExecutionInputs } from './lib/runmodel.mjs';
 import fs from 'node:fs';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
@@ -73,24 +73,26 @@ for (const id of ids) {
       skipped++;
       continue;
     }
-    const inputs = {};
-    for (const name of meta.inputs) inputs[name] = loadInput(pkg, name);
+    const rawInputs = {};
+    for (const name of meta.inputs) rawInputs[name] = loadInput(pkg, name);
     const modelUrl = pathToFileURL(path.join(pkg, 'model.safetensors')).href;
-    const graph = new module.Graph();
-    await module.GraphLoader.load(graph, modelUrl);
-    const model = runtime.createModel(graph);
+    const snapshot = module.Model.capture(
+      await module.ModelLoader.load(modelUrl),
+    );
+    const graph = snapshot.graph;
+    const inputs = concreteExecutionInputs(snapshot, rawInputs);
     let compiled;
     let context;
     let result;
     try {
-      compiled = await model.compile({
+      compiled = await runtime.compile(snapshot, {
         backend: { mode: 'require', backend: 'webgpu', operatorFallback: 'forbid' },
       });
       const adapterInfo = requirePhysicalWebGPU(compiled, 'WebGPU matrix');
       context = await compiled.createContext();
       result = await context.execute(inputs);
-      const name = (graph.outputNames && graph.outputNames[0]) || 'y';
-      const tensor = graph.getTensor(name);
+      const name = meta.output || snapshot.outputNames[0] || 'y';
+      const tensor = graph.tensors[name];
       if (!tensor) throw new Error(`graph has no output tensor '${name}'`);
       const execution = result.report;
       const captured = await captureStableResult(
@@ -98,7 +100,7 @@ for (const id of ids) {
         result,
         context,
         'webgpu',
-        graph.outputNames,
+        snapshot.outputNames,
       );
       result = null;
       const values = captured.outputs[name];
@@ -121,7 +123,6 @@ for (const id of ids) {
       await result?.close();
       await context?.close();
       await compiled?.close();
-      await model.close();
     }
   } catch (e) { console.error(`  webgpu ${id}: ${String(e.message || e).split('\n')[0].slice(0, 160)}`); fail++; }
 }

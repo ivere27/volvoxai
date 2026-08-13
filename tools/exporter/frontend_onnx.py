@@ -23,7 +23,9 @@ from .optimizer.typed_pipeline import (
     optimize_runtime_package,
     serialize_pipeline_report,
 )
+from .operator_shape_contracts import prove_operator_shape_domain
 from .quantization_storage import externalize_quantization
+from .shape_system import ShapeEnvironment
 
 
 _RUNTIME_DTYPES = {"float32", "int32", "int8", "uint8"}
@@ -76,17 +78,47 @@ def _runtime_dtype_for_array(array: np.ndarray) -> str:
     return str(dtype)
 
 
-def _shape(value_info) -> list[int]:
-    dimensions = []
+def _shape(value_info) -> list[int | str]:
+    dimensions: list[int | str] = []
     for dimension in value_info.type.tensor_type.shape.dim:
-        dimensions.append(int(dimension.dim_value) if dimension.HasField("dim_value") else 0)
+        if dimension.HasField("dim_value"):
+            dimensions.append(int(dimension.dim_value))
+        elif dimension.HasField("dim_param") and dimension.dim_param:
+            dimensions.append(dimension.dim_param)
+        else:
+            dimensions.append(0)
     return dimensions
 
 
-def _product(shape: Iterable[int]) -> int:
+def _set_value_info_shape(value_info, shape: Iterable[int | str]) -> None:
+    tensor_shape = value_info.type.tensor_type.shape
+    del tensor_shape.dim[:]
+    for extent in shape:
+        dimension = tensor_shape.dim.add()
+        if isinstance(extent, str):
+            dimension.dim_param = extent
+        else:
+            dimension.dim_value = int(extent)
+
+
+def _product(shape: Iterable[int | str], *, node: str = "shape algebra") -> int:
+    dimensions = tuple(shape)
     result = 1
-    for dimension in shape:
-        result *= int(dimension)
+    for dimension in dimensions:
+        if (
+            not isinstance(dimension, int)
+            or isinstance(dimension, bool)
+            or dimension <= 0
+        ):
+            raise ExporterError(Diagnostic(
+                "VXONNX_SYMBOLIC_PRODUCT",
+                f"{node} cannot collapse symbolic shape {list(dimensions)!r} into "
+                "one v1 dimension",
+                "logical-shapes",
+                source_node=node,
+                constraint="derived shape products require explicit canonical support",
+            ))
+        result *= dimension
     return result
 
 
@@ -103,13 +135,22 @@ def _normalize_axis(axis: int, rank: int, *, node: str) -> int:
     return normalized
 
 
-def _broadcast_shape(left: list[int], right: list[int], *, node: str) -> list[int]:
-    result = []
+def _broadcast_shape(
+    left: list[int | str],
+    right: list[int | str],
+    *,
+    node: str,
+) -> list[int | str]:
+    result: list[int | str] = []
     for offset in range(1, max(len(left), len(right)) + 1):
         a = left[-offset] if offset <= len(left) else 1
         b = right[-offset] if offset <= len(right) else 1
-        if a == b or a == 1 or b == 1:
-            result.append(max(a, b))
+        if a == b:
+            result.append(a)
+        elif a == 1:
+            result.append(b)
+        elif b == 1:
+            result.append(a)
         else:
             raise ExporterError(Diagnostic(
                 "VXONNX_BROADCAST",
@@ -119,6 +160,55 @@ def _broadcast_shape(left: list[int], right: list[int], *, node: str) -> list[in
                 constraint="ONNX multidirectional broadcasting",
             ))
     return list(reversed(result))
+
+
+def _concat_shape(
+    shapes: Iterable[list[int | str]],
+    axis: int,
+    *,
+    node: str,
+    dtype: str = "float32",
+    environment: ShapeEnvironment | None = None,
+    declared_output: list[int | str] | None = None,
+) -> list[int | str]:
+    operands = [list(shape) for shape in shapes]
+    if not operands:
+        raise ExporterError(Diagnostic(
+            "VXCONCAT_SHAPE", f"{node} has no concat operands", "logical-shapes",
+            source_node=node,
+        ))
+    request: dict[str, Any] = {
+        "environment": environment or ShapeEnvironment(()),
+        "inputs": {
+            f"input{position}": {"shape": shape, "dtype": dtype}
+            for position, shape in enumerate(operands)
+        },
+        "params": {"axis": axis},
+    }
+    if declared_output:
+        request["declaredOutputs"] = {
+            "out": {"shape": list(declared_output), "dtype": dtype}
+        }
+    proof = prove_operator_shape_domain("Concat", request)
+    if not proof.supported:
+        diagnostic_code = (
+            "VXDYNAMIC_CONCAT_AXIS"
+            if proof.code == "UNPROVABLE_DYNAMIC_SHAPE_FORMULA"
+            else "VXCONCAT_SHAPE"
+        )
+        raise ExporterError(Diagnostic(
+            diagnostic_code,
+            f"{node} failed canonical Concat whole-domain inference "
+            f"({proof.code}): {proof.reason}",
+            "logical-shapes",
+            source_node=node,
+            source_op="Concat",
+            constraint=(
+                "one dynamic Concat-axis symbol plus fixed extents requires "
+                "one exact declared output-only affine symbol"
+            ),
+        ))
+    return list(proof.outputs["out"].shape)
 
 
 def _quantization(scale: np.ndarray, zero_point: np.ndarray, axis: int) -> dict[str, Any]:
@@ -317,6 +407,8 @@ class OnnxCompiler:
         output_names: Optional[Iterable[str]] = None,
         image_normalizations: Optional[Iterable[str]] = None,
         input_shapes: Optional[Mapping[str, Iterable[int]]] = None,
+        dimension_bounds: Optional[Mapping[str, Any]] = None,
+        anonymous_dimension_bounds: Optional[Mapping[tuple[str, int], Any]] = None,
         input_dtypes: Optional[Mapping[str, str]] = None,
         output_dtypes: Optional[Mapping[str, str]] = None,
         specialize_inputs: Optional[Mapping[str, int]] = None,
@@ -352,8 +444,23 @@ class OnnxCompiler:
             ))
         self.weight_dtype = weight_dtype
         self.output_names_requested = list(output_names) if output_names is not None else None
-        self.image_normalizations = list(image_normalizations or ())
+        requested_normalizations = list(image_normalizations or ())
+        if requested_normalizations:
+            raise ExporterError(Diagnostic(
+                "VXIMAGE_NORMALIZATION",
+                "application image preprocessing cannot be embedded in the "
+                "closed volvox-graph/v1 input schema",
+                "usage",
+                constraint="configure preprocessing in the consuming application",
+            ))
         self.input_shape_bindings = {key: [int(value) for value in values] for key, values in (input_shapes or {}).items()}
+        # Explicit static input views can resolve a source dim_param for every
+        # public value that carries the same ONNX symbol.  Keep that proof
+        # separate from dimension_bounds: a caller binding specializes the
+        # package to one extent, while bounds describe a retained dynamic ABI.
+        self.static_dimension_bindings: dict[str, int] = {}
+        self.dimension_bounds = dict(dimension_bounds or {})
+        self.anonymous_dimension_bounds = dict(anonymous_dimension_bounds or {})
         self.input_dtype_bindings = dict(input_dtypes or {})
         self.output_dtype_bindings = dict(output_dtypes or {})
         self.specializations = {key: int(value) for key, value in (specialize_inputs or {}).items()}
@@ -362,7 +469,11 @@ class OnnxCompiler:
         self.alias: dict[str, str] = {}
         self.dq: dict[str, _DQ] = {}
         self.folded: set[int] = set()
-        self.shape_map: dict[str, list[int]] = {}
+        self.structural_shape_nodes: set[int] = set()
+        self.structural_shape_targets: set[tuple[int, int]] = set()
+        self.identity_bool_casts: set[int] = set()
+        self.identity_int64_casts: set[int] = set()
+        self.shape_map: dict[str, list[int | str]] = {}
         self.dtype_map: dict[str, str] = {}
         self.names = _Names()
         self.weights: dict[str, np.ndarray] = {}
@@ -370,6 +481,8 @@ class OnnxCompiler:
         self.nodes: list[dict[str, Any]] = []
         self.features: dict[str, list[dict[str, Any]]] = defaultdict(list)
         self.abi_changes: list[dict[str, Any]] = []
+        self.node_sources: list[dict[str, str]] = []
+        self.publication_report: dict[str, Any] = {}
         self.skipped_nodes = 0
         self.opset = 0
         self.attention_replacements: dict[int, _Attention] = {}
@@ -390,10 +503,24 @@ class OnnxCompiler:
         self.graph_output_names = {value.name for value in self.model.graph.output}
         self._apply_shape_bindings()
         self._infer_shapes()
+        self.publication_ir = import_onnx_source(
+            self.model,
+            dimension_bounds=self.dimension_bounds,
+            anonymous_dimension_bounds=self.anonymous_dimension_bounds,
+        )
+        self.shape_environment = self.publication_ir.shape_environment
+        for name, tensor in self.publication_ir.tensors.items():
+            if tensor.shape and all(
+                isinstance(dimension, (int, str)) and dimension != 0
+                for dimension in tensor.shape
+            ):
+                self.shape_map[name] = list(tensor.shape)
         self._load_constants()
         self._prepare_public_names()
         self._validate_dtype_binding_names()
         self._apply_specializations_and_fold()
+        self._recognize_structural_shape_programs()
+        self._recognize_identity_abi_casts()
         self._recognize_w8a8()
         self._recognize_exact_gelu()
         self._recognize_group_norm()
@@ -409,7 +536,7 @@ class OnnxCompiler:
             name = self.alias[name]
         return name
 
-    def shape_of(self, name: str) -> list[int]:
+    def shape_of(self, name: str) -> list[int | str]:
         resolved = self.resolve(name)
         if resolved in self.arrays:
             return list(np.asarray(self.arrays[resolved]).shape)
@@ -480,6 +607,7 @@ class OnnxCompiler:
         initializer_names = set(self.arrays)
         inputs = [value for value in self.model.graph.input if value.name not in initializer_names]
         known = {value.name for value in inputs}
+        explicit_shapes: dict[str, list[int]] = {}
         for index, value in enumerate(inputs):
             canonical = f"input{index}"
             binding = self._binding(self.input_shape_bindings, value.name, canonical)
@@ -493,10 +621,56 @@ class OnnxCompiler:
                     "bind-shapes",
                     source_node=value.name,
                 ))
-            tensor_shape = value.type.tensor_type.shape
-            del tensor_shape.dim[:]
-            for dimension in shape:
-                tensor_shape.dim.add().dim_value = dimension
+            declared_shape = _shape(value)
+            if len(shape) != len(declared_shape):
+                raise ExporterError(Diagnostic(
+                    "VXSHAPE_BINDING",
+                    f"input shape binding for {value.name!r} has rank {len(shape)}, "
+                    f"but the source input declares rank {len(declared_shape)}",
+                    "bind-shapes",
+                    source_node=value.name,
+                    constraint="explicit static bindings preserve the source input rank",
+                ))
+            for axis, (declared, extent) in enumerate(zip(declared_shape, shape)):
+                if isinstance(declared, int) and declared > 0 and declared != extent:
+                    raise ExporterError(Diagnostic(
+                        "VXSHAPE_BINDING",
+                        f"input shape binding for {value.name!r} axis {axis} has "
+                        f"extent {extent}, but the source input declares {declared}",
+                        "bind-shapes",
+                        source_node=value.name,
+                        constraint="explicit static bindings preserve source concrete extents",
+                    ))
+                if not isinstance(declared, str):
+                    continue
+                previous = self.static_dimension_bindings.get(declared)
+                if previous is not None and previous != extent:
+                    raise ExporterError(Diagnostic(
+                        "VXSHAPE_BINDING",
+                        f"input shape bindings assign conflicting extents {previous} "
+                        f"and {extent} to source symbol {declared!r}",
+                        "bind-shapes",
+                        source_node=value.name,
+                        constraint="one exact extent per source dimension symbol",
+                    ))
+                self.static_dimension_bindings[declared] = extent
+            explicit_shapes[value.name] = shape
+
+        # A repeated dim_param is one source-level equality constraint.  Once
+        # an explicit binding proves its exact extent, specialize every public
+        # input occurrence before ONNX shape inference so downstream values
+        # receive the same concrete ABI.
+        for value in inputs:
+            declared_shape = _shape(value)
+            shape = explicit_shapes.get(value.name)
+            if shape is None:
+                shape = [
+                    self.static_dimension_bindings.get(dimension, dimension)
+                    if isinstance(dimension, str) else dimension
+                    for dimension in declared_shape
+                ]
+            if shape != declared_shape:
+                _set_value_info_shape(value, shape)
         unknown = sorted(set(self.input_shape_bindings) - known - {f"input{i}" for i in range(len(inputs))})
         if unknown:
             raise ExporterError(Diagnostic(
@@ -508,6 +682,11 @@ class OnnxCompiler:
     def _infer_shapes(self) -> None:
         from onnx import shape_inference
 
+        source_public_shapes = {
+            value.name: _shape(value)
+            for value in [*self.model.graph.input, *self.model.graph.output]
+            if value.type.HasField("tensor_type")
+        }
         try:
             self.model = shape_inference.infer_shapes(self.model, strict_mode=True, data_prop=True)
         except Exception as error:
@@ -516,6 +695,94 @@ class OnnxCompiler:
                 f"ONNX shape inference failed: {error}",
                 "infer-shapes",
             )) from error
+        environment: ShapeEnvironment | None = None
+        for value in [*self.model.graph.input, *self.model.graph.output]:
+            source_shape = source_public_shapes.get(value.name)
+            if source_shape is None or not value.type.HasField("tensor_type"):
+                continue
+            inferred_shape = _shape(value)
+            if len(source_shape) != len(inferred_shape):
+                raise ExporterError(Diagnostic(
+                    "VXONNX_PUBLIC_SHAPE_CONFLICT",
+                    f"public value {value.name!r} declared rank {len(source_shape)}, "
+                    f"but ONNX shape inference produced rank {len(inferred_shape)}",
+                    "infer-shapes",
+                    source_node=value.name,
+                    constraint="source-declared public rank must agree with ONNX inference",
+                ))
+            reconciled = list(inferred_shape)
+            for axis, (declared, inferred) in enumerate(
+                zip(source_shape, inferred_shape)
+            ):
+                if declared == inferred or declared == 0:
+                    continue
+                if isinstance(declared, int):
+                    raise ExporterError(Diagnostic(
+                        "VXONNX_PUBLIC_SHAPE_CONFLICT",
+                        f"public value {value.name!r} axis {axis} declared concrete "
+                        f"extent {declared}, but ONNX shape inference produced {inferred!r}",
+                        "infer-shapes",
+                        source_node=value.name,
+                        constraint="source-declared public concrete extents must agree with ONNX inference",
+                    ))
+                if not isinstance(inferred, int) or inferred <= 0:
+                    raise ExporterError(Diagnostic(
+                        "VXONNX_PUBLIC_SHAPE_CONFLICT",
+                        f"public value {value.name!r} axis {axis} declared symbol "
+                        f"{declared!r}, but ONNX shape inference produced {inferred!r}",
+                        "infer-shapes",
+                        source_node=value.name,
+                        constraint="a changed public symbol requires an exact singleton domain proof",
+                    ))
+                bound_extent = self.static_dimension_bindings.get(declared)
+                if bound_extent is not None:
+                    if bound_extent != inferred:
+                        raise ExporterError(Diagnostic(
+                            "VXONNX_PUBLIC_SHAPE_CONFLICT",
+                            f"public value {value.name!r} axis {axis} declared symbol "
+                            f"{declared!r}, but explicit input binding proves "
+                            f"extent {bound_extent} and ONNX inferred {inferred}",
+                            "infer-shapes",
+                            source_node=value.name,
+                            constraint="public symbol inference must equal its explicit static binding",
+                        ))
+                    # Keep the inferred concrete extent.  Unlike a singleton
+                    # retained domain, an input_shapes binding deliberately
+                    # authors a static package ABI.
+                    continue
+                if environment is None:
+                    try:
+                        environment = ShapeEnvironment(tuple(
+                            {"name": name, **dict(bounds)}
+                            for name, bounds in self.dimension_bounds.items()
+                        ))
+                    except Exception as error:
+                        raise ExporterError(Diagnostic(
+                            "VXONNX_PUBLIC_SHAPE_CONFLICT",
+                            "public symbolic shape reconciliation has an invalid "
+                            f"dimension environment: {error}",
+                            "infer-shapes",
+                            source_node=value.name,
+                            constraint="canonical bounded-shape environment",
+                        )) from error
+                constraint = environment.get(declared)
+                if (
+                    constraint is None
+                    or constraint.min != inferred
+                    or constraint.max != inferred
+                ):
+                    raise ExporterError(Diagnostic(
+                        "VXONNX_PUBLIC_SHAPE_CONFLICT",
+                        f"public value {value.name!r} axis {axis} declared symbol "
+                        f"{declared!r}, but inferred extent {inferred} is not exactly "
+                        "equivalent over its complete bounded domain",
+                        "infer-shapes",
+                        source_node=value.name,
+                        constraint="changed public symbols require min=max=inferred extent",
+                    ))
+                reconciled[axis] = declared
+            if reconciled != inferred_shape:
+                _set_value_info_shape(value, reconciled)
         values = [*self.model.graph.input, *self.model.graph.value_info, *self.model.graph.output]
         for value in values:
             if not value.type.HasField("tensor_type"):
@@ -619,8 +886,13 @@ class OnnxCompiler:
             shape = list(self.shape_map[candidate])
             # Shape inference represents both symbolic and otherwise unknown
             # dimensions as zero, so zero cannot safely be folded as a value.
-            if all(int(dimension) > 0 for dimension in shape):
-                return shape
+            if all(
+                isinstance(dimension, int)
+                and not isinstance(dimension, bool)
+                and dimension > 0
+                for dimension in shape
+            ):
+                return [int(dimension) for dimension in shape]
         return None
 
     @staticmethod
@@ -1068,6 +1340,801 @@ class OnnxCompiler:
         return producers
 
     @staticmethod
+    def _shape_extent(value: object) -> int | str | None:
+        if isinstance(value, str):
+            return value
+        if isinstance(value, (int, np.integer)) and not isinstance(
+            value, (bool, np.bool_)
+        ):
+            return int(value)
+        if isinstance(value, (float, np.floating)) and math.isfinite(float(value)):
+            integer = int(value)
+            if float(value) == integer:
+                return integer
+        return None
+
+    def _shape_products_equal(
+        self,
+        left: Iterable[int | str],
+        right: Iterable[int | str],
+    ) -> bool:
+        """Compare tensor element counts without inventing symbolic algebra."""
+
+        def factors(shape: Iterable[int | str]):
+            fixed = 1
+            symbols: dict[str, int] = defaultdict(int)
+            for dimension in shape:
+                if isinstance(dimension, int):
+                    if dimension <= 0:
+                        return None
+                    fixed *= dimension
+                elif isinstance(dimension, str):
+                    constraint = self.shape_environment.get(dimension)
+                    if constraint is not None and constraint.min == constraint.max:
+                        fixed *= constraint.min
+                    else:
+                        symbols[dimension] += 1
+                else:
+                    return None
+            return fixed, dict(symbols)
+
+        return factors(left) == factors(right)
+
+    def _canonical_affine_shape_extent(
+        self,
+        source: str,
+        *,
+        scale: int = 1,
+        offset: int = 0,
+    ) -> int | str | None:
+        """Resolve one scalar affine shape expression to an existing symbol."""
+
+        constraint = self.shape_environment.get(source)
+        if constraint is None or scale <= 0:
+            return None
+
+        def progression(item):
+            step = item.multiple_of or 1
+            remainder = item.min % step
+            first = item.min + (0 if remainder == 0 else step - remainder)
+            last = item.max - (item.max % step)
+            if first > last:
+                return None
+            return first, last, step, ((last - first) // step) + 1
+
+        source_progression = progression(constraint)
+        if source_progression is None:
+            return None
+        first, last, step, count = source_progression
+        expected = (
+            first * scale + offset,
+            last * scale + offset,
+            step * scale,
+            count,
+        )
+        if count == 1:
+            return expected[0] if expected[0] > 0 else None
+        matches = [
+            item.name
+            for item in self.shape_environment.dimensions
+            if progression(item) == expected
+        ]
+        return matches[0] if len(matches) == 1 else None
+
+    def _evaluate_symbolic_shape_arithmetic(
+        self,
+        op: str,
+        left: np.ndarray,
+        right: np.ndarray,
+    ) -> np.ndarray | None:
+        """Evaluate scalar affine arithmetic without publishing expressions."""
+
+        try:
+            left_values, right_values = np.broadcast_arrays(left, right)
+        except ValueError:
+            return None
+        result = np.empty(left_values.shape, dtype=object)
+        for index in np.ndindex(result.shape):
+            a = self._shape_extent(left_values[index])
+            b = self._shape_extent(right_values[index])
+            if a is None or b is None:
+                return None
+
+            # Singleton bounded symbols are exact constants inside arithmetic,
+            # while their direct Shape value remains the authored ABI symbol.
+            if isinstance(a, str):
+                constraint = self.shape_environment.get(a)
+                if constraint is not None and constraint.min == constraint.max:
+                    a = constraint.min
+            if isinstance(b, str):
+                constraint = self.shape_environment.get(b)
+                if constraint is not None and constraint.min == constraint.max:
+                    b = constraint.min
+
+            value: int | str | None
+            if isinstance(a, int) and isinstance(b, int):
+                if op == "Add":
+                    value = a + b
+                elif op == "Sub":
+                    value = a - b
+                elif op == "Mul":
+                    value = a * b
+                elif op == "Div" and b != 0:
+                    quotient = abs(a) // abs(b)
+                    value = quotient if (a < 0) == (b < 0) else -quotient
+                else:
+                    value = None
+            elif op == "Add" and isinstance(a, str) and isinstance(b, int):
+                value = self._canonical_affine_shape_extent(a, offset=b)
+            elif op == "Add" and isinstance(a, int) and isinstance(b, str):
+                value = self._canonical_affine_shape_extent(b, offset=a)
+            elif op == "Sub" and isinstance(a, str) and isinstance(b, int):
+                value = self._canonical_affine_shape_extent(a, offset=-b)
+            elif op == "Mul" and isinstance(a, str) and isinstance(b, int):
+                value = self._canonical_affine_shape_extent(a, scale=b)
+            elif op == "Mul" and isinstance(a, int) and isinstance(b, str):
+                value = self._canonical_affine_shape_extent(b, scale=a)
+            else:
+                value = None
+            if value is None or (isinstance(value, int) and value <= 0):
+                return None
+            result[index] = value
+        return result
+
+    def _evaluate_symbolic_shape_value(
+        self,
+        name: str,
+        *,
+        producers,
+        memo: dict[str, tuple[np.ndarray, frozenset[int]] | None],
+        visiting: set[str],
+    ) -> tuple[np.ndarray, frozenset[int]] | None:
+        """Evaluate an ONNX shape-tensor program over bounded symbols.
+
+        Values are object arrays whose scalar members are either exact integers
+        or existing ONNX dimension symbols.  Deliberately, this evaluator does
+        not create expression strings: an affine runtime dimension must still
+        be authored as one caller-bounded canonical symbol.
+        """
+
+        resolved = self.resolve(name)
+        if resolved in memo:
+            return memo[resolved]
+        array = self._array(resolved)
+        if array is not None:
+            result = (np.asarray(array, dtype=object), frozenset())
+            memo[resolved] = result
+            return result
+        if resolved in visiting:
+            memo[resolved] = None
+            return None
+        produced = producers.get(resolved)
+        if produced is None:
+            memo[resolved] = None
+            return None
+        index, node = produced
+        if len(node.output) != 1:
+            memo[resolved] = None
+            return None
+
+        visiting.add(resolved)
+
+        def operand(position: int):
+            if position >= len(node.input) or not node.input[position]:
+                return None
+            return self._evaluate_symbolic_shape_value(
+                node.input[position],
+                producers=producers,
+                memo=memo,
+                visiting=visiting,
+            )
+
+        value: np.ndarray | None = None
+        dependencies: set[int] = set()
+        op = node.op_type
+        try:
+            if op == "Shape" and node.input:
+                source_shape = self.shape_of(node.input[0])
+                if source_shape and all(
+                    self._shape_extent(dimension) is not None
+                    for dimension in source_shape
+                ):
+                    rank = len(source_shape)
+                    start = int(_attribute(node, "start", 0))
+                    end = int(_attribute(node, "end", rank))
+                    value = np.asarray(
+                        source_shape[slice(start, end)], dtype=object
+                    )
+            elif op == "Identity":
+                source = operand(0)
+                if source is not None:
+                    value = np.asarray(source[0], dtype=object)
+                    dependencies.update(source[1])
+            elif op == "Cast":
+                source = operand(0)
+                source_dtype = self.dtype_of(node.input[0]) if node.input else ""
+                target_dtype = _onnx_dtype_name(int(_attribute(node, "to")))
+                # Shape-program erasure must preserve the source program for
+                # every bounded extent.  Even apparently harmless casts to
+                # BOOL, float, or a narrower integer can change a dimension
+                # value (truth conversion, rounding, or overflow).  Keep those
+                # programs executable/fail closed; only an authored integer
+                # identity cast is representation preserving without another
+                # value-domain proof.
+                if (
+                    source is not None
+                    and source_dtype == target_dtype
+                    and target_dtype in {"int32", "int64"}
+                ):
+                    value = np.asarray(source[0], dtype=object)
+                    dependencies.update(source[1])
+            elif op == "Gather":
+                source = operand(0)
+                indices = operand(1)
+                if source is not None and indices is not None:
+                    index_values = np.asarray(indices[0]).reshape(-1)
+                    if all(self._shape_extent(item) is not None for item in index_values):
+                        numeric_indices = np.asarray(
+                            [int(item) for item in index_values], dtype=np.int64
+                        ).reshape(np.asarray(indices[0]).shape)
+                        value = np.take(
+                            source[0],
+                            numeric_indices,
+                            axis=int(_attribute(node, "axis", 0)),
+                        )
+                        dependencies.update(source[1])
+                        dependencies.update(indices[1])
+            elif op in {"Squeeze", "Unsqueeze"}:
+                source = operand(0)
+                axes_source = operand(1) if len(node.input) > 1 else None
+                axes = list(_attribute(node, "axes", ()))
+                if not axes and axes_source is not None:
+                    axes = [int(item) for item in axes_source[0].reshape(-1)]
+                if source is not None:
+                    value = np.asarray(source[0], dtype=object)
+                    if op == "Squeeze":
+                        value = np.squeeze(
+                            value,
+                            axis=(
+                                tuple(int(axis) for axis in axes)
+                                if axes else None
+                            ),
+                        )
+                    elif axes:
+                        output_rank = value.ndim + len(axes)
+                        normalized = sorted(
+                            int(axis) + output_rank if int(axis) < 0 else int(axis)
+                            for axis in axes
+                        )
+                        for axis in normalized:
+                            value = np.expand_dims(value, axis)
+                    else:
+                        value = None
+                    dependencies.update(source[1])
+                    if axes_source is not None:
+                        dependencies.update(axes_source[1])
+            elif op == "Concat":
+                sources = [operand(position) for position in range(len(node.input))]
+                if sources and all(source is not None for source in sources):
+                    value = np.concatenate(
+                        [source[0] for source in sources if source is not None],
+                        axis=int(_attribute(node, "axis", 0)),
+                    )
+                    for source in sources:
+                        assert source is not None
+                        dependencies.update(source[1])
+            elif op == "Slice":
+                sources = [operand(position) for position in range(len(node.input))]
+                if len(sources) >= 3 and all(
+                    source is not None for source in sources[:3]
+                ):
+                    starts = [int(item) for item in sources[1][0].reshape(-1)]
+                    ends = [int(item) for item in sources[2][0].reshape(-1)]
+                    axes = (
+                        [int(item) for item in sources[3][0].reshape(-1)]
+                        if len(sources) > 3 and sources[3] is not None
+                        else list(range(len(starts)))
+                    )
+                    steps = (
+                        [int(item) for item in sources[4][0].reshape(-1)]
+                        if len(sources) > 4 and sources[4] is not None
+                        else [1] * len(starts)
+                    )
+                    slices = [slice(None)] * sources[0][0].ndim
+                    for start, end, axis, step in zip(starts, ends, axes, steps):
+                        slices[axis] = slice(start, end, step)
+                    value = sources[0][0][tuple(slices)]
+                    for source in sources:
+                        if source is not None:
+                            dependencies.update(source[1])
+            elif op == "Reshape":
+                source = operand(0)
+                target = operand(1)
+                if source is not None and target is not None:
+                    requested = tuple(int(item) for item in target[0].reshape(-1))
+                    value = np.reshape(source[0], requested)
+                    dependencies.update(source[1])
+                    dependencies.update(target[1])
+            elif op in {"Add", "Sub", "Mul", "Div"}:
+                left = operand(0)
+                right = operand(1)
+                if left is not None and right is not None:
+                    value = self._evaluate_symbolic_shape_arithmetic(
+                        op, left[0], right[0]
+                    )
+                    dependencies.update(left[1])
+                    dependencies.update(right[1])
+        except (IndexError, TypeError, ValueError, OverflowError):
+            value = None
+
+        visiting.remove(resolved)
+        if value is None:
+            memo[resolved] = None
+            return None
+        if index not in self.folded:
+            dependencies.add(index)
+        result = (np.asarray(value, dtype=object), frozenset(dependencies))
+        memo[resolved] = result
+        return result
+
+    def _structural_target_matches(
+        self,
+        node,
+        target: np.ndarray,
+        *,
+        source_node: str,
+    ) -> bool:
+        requested = [
+            self._shape_extent(value) for value in target.reshape(-1)
+        ]
+        if not requested or any(value is None for value in requested):
+            return False
+        requested = [value for value in requested if value is not None]
+        output_shape = self.shape_of(node.output[0])
+        if node.op_type == "Expand":
+            try:
+                expected = _broadcast_shape(
+                    self.shape_of(node.input[0]), requested, node=source_node
+                )
+            except ExporterError:
+                return False
+            return self._replace_opaque_shape(node.output[0], expected)
+
+        if node.op_type != "Reshape" or len(requested) != len(output_shape):
+            return False
+        allowzero = bool(int(_attribute(node, "allowzero", 0)))
+        source_shape = self.shape_of(node.input[0])
+        expected: list[int | str] = []
+        inferred_axis: int | None = None
+        for axis, dimension in enumerate(requested):
+            if isinstance(dimension, str) or dimension > 0:
+                expected.append(dimension)
+            elif dimension == 0 and not allowzero and axis < len(source_shape):
+                expected.append(source_shape[axis])
+            elif dimension == -1 and inferred_axis is None:
+                inferred_axis = axis
+                expected.append(output_shape[axis])
+            else:
+                return False
+        if not self._shape_products_equal(source_shape, expected):
+            return False
+        return self._replace_opaque_shape(node.output[0], expected)
+
+    def _replace_opaque_shape(
+        self,
+        output: str,
+        expected: Iterable[int | str],
+    ) -> bool:
+        """Refine only ONNX shape-inference ``unk__N`` dimensions."""
+
+        candidate = list(expected)
+        declared = self.shape_of(output)
+        if len(candidate) != len(declared) or any(
+            not (
+                isinstance(dimension, int)
+                and not isinstance(dimension, bool)
+                and dimension > 0
+            ) and not (
+                isinstance(dimension, str)
+                and self.shape_environment.get(dimension) is not None
+            )
+            for dimension in candidate
+        ):
+            return False
+        if any(
+            actual != refined
+            and not (
+                isinstance(actual, str)
+                and re.fullmatch(r"unk__[0-9]+", actual) is not None
+            )
+            for actual, refined in zip(declared, candidate)
+        ):
+            return False
+        self.shape_map[output] = candidate
+        return True
+
+    def _shape_factor_quotient(
+        self,
+        dividend: Iterable[int | str],
+        divisor: Iterable[int | str],
+    ) -> int | str | None:
+        def factors(shape: Iterable[int | str]):
+            fixed = 1
+            symbols: dict[str, int] = defaultdict(int)
+            for dimension in shape:
+                if isinstance(dimension, int) and dimension > 0:
+                    fixed *= dimension
+                elif isinstance(dimension, str):
+                    constraint = self.shape_environment.get(dimension)
+                    if constraint is None:
+                        return None
+                    if constraint.min == constraint.max:
+                        fixed *= constraint.min
+                    else:
+                        symbols[dimension] += 1
+                else:
+                    return None
+            return fixed, symbols
+
+        numerator = factors(dividend)
+        denominator = factors(divisor)
+        if numerator is None or denominator is None:
+            return None
+        numerator_fixed, numerator_symbols = numerator
+        denominator_fixed, denominator_symbols = denominator
+        if denominator_fixed <= 0 or numerator_fixed % denominator_fixed:
+            return None
+        for symbol, count in denominator_symbols.items():
+            if numerator_symbols[symbol] < count:
+                return None
+            numerator_symbols[symbol] -= count
+        remaining = [
+            symbol
+            for symbol, count in numerator_symbols.items()
+            for _ in range(count)
+        ]
+        fixed = numerator_fixed // denominator_fixed
+        if not remaining:
+            return fixed if fixed > 0 else None
+        if fixed == 1 and len(remaining) == 1:
+            return remaining[0]
+        return None
+
+    def _logical_reshape_candidate(self, node) -> list[int | str] | None:
+        if len(node.input) < 2:
+            return None
+        target = self._array(node.input[1])
+        if target is None or np.asarray(target).ndim != 1:
+            return None
+        requested = [int(value) for value in np.asarray(target).reshape(-1)]
+        source_shape = self.shape_of(node.input[0])
+        allowzero = bool(int(_attribute(node, "allowzero", 0)))
+        expected: list[int | str] = []
+        inferred_axis: int | None = None
+        for axis, dimension in enumerate(requested):
+            if dimension > 0:
+                expected.append(dimension)
+            elif dimension == 0 and not allowzero and axis < len(source_shape):
+                expected.append(source_shape[axis])
+            elif dimension == -1 and inferred_axis is None:
+                inferred_axis = axis
+                expected.append(-1)
+            else:
+                return None
+        if inferred_axis is not None:
+            inferred = self._shape_factor_quotient(
+                source_shape,
+                [
+                    dimension
+                    for axis, dimension in enumerate(expected)
+                    if axis != inferred_axis
+                ],
+            )
+            if inferred is None:
+                return None
+            expected[inferred_axis] = inferred
+        if not self._shape_products_equal(source_shape, expected):
+            return None
+        return expected
+
+    def _logical_shape_candidate(self, node) -> list[int | str] | None:
+        if not node.input or not node.output:
+            return None
+        input_shape = self.shape_of(node.input[0])
+        if not input_shape:
+            return None
+        shape_preserving = {
+            "Identity", "Cast", "Clip", "Not", "Relu", "Sigmoid", "Tanh",
+            "Erf", "LayerNormalization", "Softmax", "LogSoftmax",
+            "QuantizeLinear", "DequantizeLinear",
+        }
+        if node.op_type in shape_preserving:
+            return input_shape
+        if node.op_type == "Reshape":
+            return self._logical_reshape_candidate(node)
+        if node.op_type == "Transpose":
+            permutation = list(
+                _attribute(
+                    node,
+                    "perm",
+                    list(reversed(range(len(input_shape)))),
+                )
+            )
+            if sorted(permutation) == list(range(len(input_shape))):
+                return [input_shape[axis] for axis in permutation]
+            return None
+        if node.op_type in {"Add", "Sub", "Mul", "Div", "Equal", "GreaterOrEqual"}:
+            if len(node.input) < 2:
+                return None
+            try:
+                return _broadcast_shape(
+                    input_shape,
+                    self.shape_of(node.input[1]),
+                    node=_source_name(node, -1),
+                )
+            except ExporterError:
+                return None
+        if node.op_type == "Where" and len(node.input) == 3:
+            try:
+                values = _broadcast_shape(
+                    self.shape_of(node.input[1]),
+                    self.shape_of(node.input[2]),
+                    node=_source_name(node, -1),
+                )
+                return _broadcast_shape(
+                    input_shape, values, node=_source_name(node, -1)
+                )
+            except ExporterError:
+                return None
+        if node.op_type == "MatMul" and len(node.input) == 2:
+            right_shape = self.shape_of(node.input[1])
+            if (
+                len(input_shape) < 2
+                or len(right_shape) < 2
+                or input_shape[-1] != right_shape[-2]
+            ):
+                return None
+            try:
+                batch = _broadcast_shape(
+                    input_shape[:-2],
+                    right_shape[:-2],
+                    node=_source_name(node, -1),
+                )
+            except ExporterError:
+                return None
+            return [*batch, input_shape[-2], right_shape[-1]]
+        if node.op_type == "Gemm" and len(node.input) >= 2:
+            right_shape = self.shape_of(node.input[1])
+            if len(input_shape) != 2 or len(right_shape) != 2:
+                return None
+            trans_a = bool(int(_attribute(node, "transA", 0)))
+            trans_b = bool(int(_attribute(node, "transB", 0)))
+            rows = input_shape[1] if trans_a else input_shape[0]
+            inner_left = input_shape[0] if trans_a else input_shape[1]
+            inner_right = right_shape[1] if trans_b else right_shape[0]
+            columns = right_shape[0] if trans_b else right_shape[1]
+            return [rows, columns] if inner_left == inner_right else None
+        return None
+
+    def _refine_opaque_passthrough_shapes(self) -> None:
+        """Propagate exact operator shapes through producer-opaque ValueInfo."""
+
+        for _ in range(len(self.model.graph.node) + 1):
+            changed = False
+            for node in self.model.graph.node:
+                if not node.output:
+                    continue
+                candidate = self._logical_shape_candidate(node)
+                if candidate is None:
+                    continue
+                before = self.shape_of(node.output[0])
+                if self._replace_opaque_shape(node.output[0], candidate):
+                    changed = changed or before != candidate
+            if not changed:
+                return
+        raise ExporterError(Diagnostic(
+            "VXONNX_SHAPE_REFINEMENT",
+            "opaque ONNX shape refinement did not reach a fixed point",
+            "logical-shapes",
+            constraint="acyclic exact operator-shape propagation",
+        ))
+
+    def _recognize_structural_shape_programs(self) -> None:
+        """Erase proven symbolic shape programs represented by output metadata.
+
+        VolvoxAI Reshape/Expand operators carry their logical output shape in
+        the closed runtime descriptor.  PyTorch ONNX commonly computes the same
+        descriptor through a Shape/Gather/Concat subgraph.  Retain that program
+        in the lossless source IR, but omit it from executable lowering only
+        after evaluating it over canonical bounded symbols and proving that it
+        matches the authored output shape.
+        """
+
+        producers = self._producer_map()
+        consumers: dict[str, list[tuple[int, int]]] = defaultdict(list)
+        for index, node in enumerate(self.model.graph.node):
+            for position, name in enumerate(node.input):
+                if name:
+                    consumers[name].append((index, position))
+        graph_outputs = {value.name for value in self.model.graph.output}
+        memo: dict[str, tuple[np.ndarray, frozenset[int]] | None] = {}
+        recognized: dict[tuple[int, int], frozenset[int]] = {}
+        candidates: set[int] = set()
+        for index, node in enumerate(self.model.graph.node):
+            if node.op_type not in {"Reshape", "Expand"} or len(node.input) < 2:
+                continue
+            target_name = self.resolve(node.input[1])
+            if self._array(target_name) is not None:
+                continue
+            evaluated = self._evaluate_symbolic_shape_value(
+                target_name,
+                producers=producers,
+                memo=memo,
+                visiting=set(),
+            )
+            if evaluated is None or not evaluated[1]:
+                continue
+            if not self._structural_target_matches(
+                node,
+                evaluated[0],
+                source_node=_source_name(node, index),
+            ):
+                continue
+            recognized[(index, 1)] = evaluated[1]
+            candidates.update(evaluated[1])
+
+        # A program is executable metadata only when none of its values escape
+        # to a data operand or public output.  Prune transitively if one does.
+        changed = True
+        while changed:
+            changed = False
+            for index in tuple(candidates):
+                node = self.model.graph.node[index]
+                escapes = any(
+                    output in graph_outputs
+                    or any(
+                        consumer not in candidates
+                        and (consumer, position) not in recognized
+                        for consumer, position in consumers.get(output, ())
+                    )
+                    for output in node.output
+                    if output
+                )
+                if escapes:
+                    candidates.remove(index)
+                    changed = True
+
+        self.structural_shape_targets = {
+            target for target, dependencies in recognized.items()
+            if dependencies <= candidates
+        }
+        self.structural_shape_nodes = set().union(
+            *(recognized[target] for target in self.structural_shape_targets)
+        ) if self.structural_shape_targets else set()
+        self._refine_opaque_passthrough_shapes()
+
+    def _canonical_concat_output_shape(
+        self,
+        node,
+        input_shapes: list[list[int | str]],
+        *,
+        axis: int,
+        dtype: str,
+        source_node: str,
+    ) -> list[int | str]:
+        """Recover one producer-opaque Concat axis from the bounded ABI.
+
+        ONNX shape inference often replaces ``P + 1`` with an anonymous
+        ``unk__N`` dim_param on an intermediate Q/DQ edge even when the public
+        output is canonically declared as ``R``.  An opaque name is never
+        trusted.  It may be replaced only when exactly one output-only symbol
+        in the caller's environment satisfies the complete affine Concat
+        domain proof.
+        """
+
+        declared = self.shape_of(node.output[0])
+        original_error: ExporterError | None = None
+        try:
+            return _concat_shape(
+                input_shapes,
+                axis,
+                node=source_node,
+                dtype=dtype,
+                environment=self.shape_environment,
+                declared_output=declared or None,
+            )
+        except ExporterError as error:
+            original_error = error
+        assert original_error is not None
+
+        if not input_shapes:
+            raise original_error
+        rank = len(input_shapes[0])
+        normalized_axis = axis + rank if axis < 0 else axis
+        if (
+            len(declared) != rank
+            or normalized_axis < 0
+            or normalized_axis >= rank
+            or not isinstance(declared[normalized_axis], str)
+            or re.fullmatch(r"unk__[0-9]+", declared[normalized_axis]) is None
+            or self.shape_environment.get(declared[normalized_axis]) is not None
+            or any(
+                not (
+                    isinstance(dimension, int)
+                    and not isinstance(dimension, bool)
+                    and dimension > 0
+                ) and not (
+                    isinstance(dimension, str)
+                    and self.shape_environment.get(dimension) is not None
+                )
+                for position, dimension in enumerate(declared)
+                if position != normalized_axis
+            )
+        ):
+            raise original_error
+
+        input_symbols = {
+            dimension
+            for shape in input_shapes
+            for dimension in shape
+            if isinstance(dimension, str)
+        }
+        matches: list[list[int | str]] = []
+        for constraint in self.shape_environment.dimensions:
+            if constraint.name in input_symbols:
+                continue
+            candidate = list(declared)
+            candidate[normalized_axis] = constraint.name
+            try:
+                inferred = _concat_shape(
+                    input_shapes,
+                    axis,
+                    node=source_node,
+                    dtype=dtype,
+                    environment=self.shape_environment,
+                    declared_output=candidate,
+                )
+            except ExporterError:
+                continue
+            matches.append(inferred)
+        if len(matches) == 1:
+            self.shape_map[node.output[0]] = list(matches[0])
+            return list(matches[0])
+        if len(matches) > 1:
+            symbols = ", ".join(shape[normalized_axis] for shape in matches)
+            raise ExporterError(Diagnostic(
+                "VXCONCAT_SHAPE",
+                f"{source_node} opaque output axis "
+                f"{declared[normalized_axis]!r} has multiple exact canonical "
+                f"symbol matches: {symbols}",
+                "logical-shapes",
+                source_node=source_node,
+                source_op="Concat",
+                constraint="one unique output-only affine symbol",
+            ))
+        raise original_error
+
+    def _recognize_identity_abi_casts(self) -> None:
+        """Record source identity Casts before runtime dtype legalization."""
+
+        for index, node in enumerate(self.model.graph.node):
+            if node.op_type != "Cast" or not node.input or not node.output:
+                continue
+            target = _onnx_dtype_name(int(_attribute(node, "to")))
+            if (
+                target == "bool"
+                and self.dtype_of(node.input[0]) == target
+                and self.dtype_of(node.output[0]) == target
+            ):
+                self.identity_bool_casts.add(index)
+            elif (
+                target == "int64"
+                and self.dtype_of(node.input[0]) == target
+                and self.dtype_of(node.output[0]) == target
+            ):
+                self.identity_int64_casts.add(index)
+
+    @staticmethod
     def _byte_range(dtype: str) -> tuple[int, int]:
         return (-128, 127) if dtype == "int8" else (0, 255)
 
@@ -1358,9 +2425,9 @@ class OnnxCompiler:
 
     def _qbatch_matmul_geometry(
         self,
-        left_shape: list[int],
-        right_shape: list[int],
-        output_shape: list[int],
+        left_shape: list[int | str],
+        right_shape: list[int | str],
+        output_shape: list[int | str],
         *,
         source_node: str,
     ) -> Optional[list[int]]:
@@ -1369,6 +2436,8 @@ class OnnxCompiler:
             or len(right_shape) < 2
             or len(left_shape) > 8
             or len(right_shape) > 8
+            or not isinstance(left_shape[-1], int)
+            or isinstance(left_shape[-1], bool)
             or left_shape[-1] <= 0
             or left_shape[-1] != right_shape[-2]
         ):
@@ -1528,12 +2597,29 @@ class OnnxCompiler:
                     int(value)
                     for value in _attribute(conv, "dilations", [1, 1])
                 ]
+                batch_dimension = input_shape[0] if input_shape else None
                 if (
                     len(input_shape) != 4
                     or len(output_shape) != 4
                     or conv_shape != output_shape
                     or input_shape[0] != output_shape[0]
-                    or any(dimension <= 0 for dimension in input_shape + output_shape)
+                    or not (
+                        (
+                            isinstance(batch_dimension, int)
+                            and not isinstance(batch_dimension, bool)
+                            and batch_dimension > 0
+                        )
+                        or (
+                            isinstance(batch_dimension, str)
+                            and bool(batch_dimension)
+                        )
+                    )
+                    or any(
+                        isinstance(dimension, bool)
+                        or not isinstance(dimension, int)
+                        or dimension <= 0
+                        for dimension in input_shape[1:] + output_shape[1:]
+                    )
                     or auto_pad not in {"", "NOTSET"}
                     or pads != [1, 1, 1, 1]
                     or strides not in ([1, 1], [2, 2])
@@ -1718,6 +2804,8 @@ class OnnxCompiler:
                     or len(output_shape) != 2
                     or gemm_shape != output_shape
                     or input_shape[0] != output_shape[0]
+                    or not isinstance(input_shape[1], int)
+                    or not isinstance(output_shape[1], int)
                     or input_shape[1] <= 0
                     or output_shape[1] <= 0
                     or consumers.get(gemm.output[0], []) != [quantize_index]
@@ -1849,7 +2937,11 @@ class OnnxCompiler:
                 continue
             d_in = input_shape[-1]
             d_out = matmul_shape[-1]
-            if d_in <= 0 or d_out <= 0:
+            if (
+                not isinstance(d_in, int)
+                or isinstance(d_in, bool)
+                or d_in <= 0
+            ):
                 continue
             expected_matmul_consumer = add_index if add_index is not None else quantize_index
             if consumers.get(matmul.output[0], []) != [expected_matmul_consumer]:
@@ -1865,10 +2957,6 @@ class OnnxCompiler:
                 zero_name=self.resolve(activation_dq.input[2]) if len(activation_dq.input) > 2 and activation_dq.input[2] else "",
                 storage_dtype=input_dtype,
             )
-            weight = self._per_axis_linear_weight(
-                weight_entry, d_in=d_in, d_out=d_out
-            )
-
             # Both decoded operands are dynamic byte tensors: preserve exact
             # ONNX rank-N MatMul broadcasting as a QBatchMatMul descriptor.
             if self._array(raw_input) is None and self._array(raw_right) is None:
@@ -1943,6 +3031,16 @@ class OnnxCompiler:
                     "source_node": region.source_node
                 })
                 continue
+
+            if (
+                not isinstance(d_out, int)
+                or isinstance(d_out, bool)
+                or d_out <= 0
+            ):
+                continue
+            weight = self._per_axis_linear_weight(
+                weight_entry, d_in=d_in, d_out=d_out
+            )
 
             if (
                 input_dtype != "uint8"
@@ -2384,7 +3482,12 @@ class OnnxCompiler:
         if not node.input or not node.output or node.output[0] not in self.graph_output_names:
             return None
         logits_shape = self.shape_of(node.input[0])
-        if len(logits_shape) != 2 or logits_shape[0] != 1 or logits_shape[1] <= 1:
+        if (
+            len(logits_shape) != 2
+            or logits_shape[0] != 1
+            or not isinstance(logits_shape[1], int)
+            or logits_shape[1] <= 1
+        ):
             return None
         axis = _normalize_axis(
             int(_attribute(node, "axis", 0)), len(logits_shape),
@@ -2844,6 +3947,11 @@ class OnnxCompiler:
             runtime_mask = None
             mask_indices: set[int] = set()
             if mask_name is not None:
+                if any(
+                    not isinstance(dimension, int)
+                    for dimension in (q_shape[0], queries, keys)
+                ):
+                    continue
                 mask = self._attention_mask(
                     mask_name,
                     producers,
@@ -3040,10 +4148,10 @@ class OnnxCompiler:
             ))
         value = self._array(resolved)
         derived = f"{stem}__{role}_expanded"
-        if value is not None:
+        if value is not None and all(isinstance(axis, int) for axis in output_shape):
             try:
                 expanded = np.broadcast_to(np.asarray(value), output_shape)
-            except ValueError as error:
+            except (TypeError, ValueError) as error:
                 raise ExporterError(Diagnostic(
                     "VXBROADCAST_SHAPE",
                     f"{source_node} {role} cannot broadcast to {output_shape}: {error}",
@@ -3058,7 +4166,13 @@ class OnnxCompiler:
             )
         self._add_node(
             "Expand",
-            {"input": self.names.get(resolved)},
+            {
+                "input": (
+                    self.ensure_weight(resolved)
+                    if value is not None
+                    else self.names.get(resolved)
+                )
+            },
             derived,
             shape=output_shape,
             dtype=dtype,
@@ -3115,7 +4229,7 @@ class OnnxCompiler:
         inputs: Mapping[str, str],
         output: str,
         *,
-        shape: Optional[Iterable[int]] = None,
+        shape: Optional[Iterable[int | str]] = None,
         dtype: Optional[str] = None,
         params: Optional[Mapping[str, Any]] = None,
         source_node: str,
@@ -3123,14 +4237,22 @@ class OnnxCompiler:
         quantization: Optional[Mapping[str, Any]] = None,
     ) -> str:
         output_shape = list(shape if shape is not None else self.shape_of(output))
-        if not output_shape or any(not isinstance(value, int) or value <= 0 for value in output_shape):
+        if not output_shape or any(
+            not (
+                isinstance(value, int) and not isinstance(value, bool) and value > 0
+            ) and not (
+                isinstance(value, str)
+                and self.shape_environment.get(value) is not None
+            )
+            for value in output_shape
+        ):
             raise ExporterError(Diagnostic(
-                "VXSTATIC_SHAPE",
+                "VXBOUNDED_SHAPE",
                 f"{source_node} output {output!r} has unresolved shape {output_shape}",
-                "staticize",
+                "logical-shapes",
                 source_node=source_node,
                 source_op=source_op,
-                constraint="positive concrete execution shape",
+                constraint="positive constants or caller-bounded dimension symbols",
             ))
         output_dtype = self._output_dtype(output, dtype)
         if output_dtype not in _RUNTIME_DTYPES:
@@ -3142,20 +4264,29 @@ class OnnxCompiler:
                 source_op=source_op,
             ))
         exported_output = self.names.get(output)
+        canonical_params = dict(params or {})
+        if op_type in {"Reshape", "Expand"}:
+            canonical_params.setdefault("shape", list(output_shape))
+        node_id = f"node_{len(self.nodes)}"
         node = {
+            "id": node_id,
             "opType": op_type,
             "inputs": dict(inputs),
-            "outputs": {"out": exported_output},
-            "outputs_shape": {"out": output_shape},
-            "outputs_dtype": {"out": output_dtype},
-            "source_name": source_node,
-            "source_op": source_op,
+            "outputs": {"out": {
+                "tensor": exported_output,
+                "dtype": output_dtype,
+                "shape": output_shape,
+            }},
+            "params": canonical_params,
         }
-        if params:
-            node["params"] = dict(params)
         if quantization is not None:
             self.tensor_quantization[exported_output] = dict(quantization)
         self.nodes.append(node)
+        self.node_sources.append({
+            "id": node_id,
+            "source_node": source_node,
+            "source_op": source_op,
+        })
         self.shape_map[output] = output_shape
         self.dtype_map[output] = output_dtype
         return exported_output
@@ -3165,43 +4296,35 @@ class OnnxCompiler:
         dq = self.dq.get(weight_name) or self.dq.get(resolved)
         if dq and self._array(dq.raw) is not None:
             raw = np.asarray(self._array(dq.raw))
-            scale = np.asarray(self._array(dq.scale))
-            zero = np.asarray(self._array(dq.zero_point) if dq.zero_point else np.asarray(0, dtype=raw.dtype))
-            if raw.ndim != 2:
+            scale = self._array(dq.scale)
+            zero = self._array(dq.zero_point) if dq.zero_point else None
+            if raw.ndim != 2 or scale is None:
                 raise ExporterError(Diagnostic(
-                    "VXW8A32_WEIGHT", f"{source_node} weight-only QDQ requires rank-2 weights", "quant-fold", source_node=source_node
-                ))
-            if dq.axis not in {0, 1}:
-                raise ExporterError(Diagnostic(
-                    "VXW8A32_AXIS", f"{source_node} weight quantization axis {dq.axis} is invalid", "quant-fold", source_node=source_node
-                ))
-            # ONNX MatMul uses [d_in,d_out]. Volvox W8A32 is explicit [d_out,d_in].
-            raw_out_in = np.ascontiguousarray(raw.T)
-            if scale.size > 1 and dq.axis != 1:
-                raise ExporterError(Diagnostic(
-                    "VXW8A32_AXIS",
-                    f"{source_node} per-axis MatMul weight descriptors must use source axis 1",
+                    "VXWEIGHT_QDQ",
+                    f"{source_node} weight-only QDQ requires immutable rank-2 "
+                    "weight and scale tensors",
                     "quant-fold",
                     source_node=source_node,
-                    constraint="per-output scale after OUT_IN normalization",
+                    source_op=node.op_type,
                 ))
-            weight = self.ensure_weight(dq.raw, array=raw_out_in, preferred=f"{self.names.get(dq.raw, weight=True)}_out_in")
-            scale_weight = self.ensure_weight(
-                dq.scale,
-                array=scale.astype(np.float32),
-                preferred=f"{weight}_scale",
-                force_float32=True,
+            zero_value = (
+                np.asarray(zero)
+                if zero is not None
+                else np.asarray(0, dtype=raw.dtype)
             )
-            inputs = {"weight": weight, "weight_scale": scale_weight}
-            if zero.size and np.any(zero != 0):
-                if zero.size > 1 and dq.axis != 1:
-                    raise ExporterError(Diagnostic("VXW8A32_ZERO", f"{source_node} zero-point axis is not per-output", "quant-fold"))
-                inputs["weight_zero_point"] = self.ensure_weight(
-                    dq.zero_point,
-                    array=zero.astype(raw.dtype),
-                    preferred=f"{weight}_zero_point",
-                )
-            return inputs, "OUT_IN", "w8a32"
+            decoded = _dequantize(
+                raw, np.asarray(scale), zero_value, dq.axis,
+            ).astype(np.float32)
+            exported = self.ensure_weight(
+                resolved,
+                array=decoded,
+                preferred=f"{self.names.get(resolved, weight=True)}_decoded_f32",
+            )
+            self.features["dequantized_weight_linear"].append({
+                "source_node": source_node,
+                "reason": "closed-v1 Linear has no runtime affine weight ports",
+            })
+            return {"weight": exported}, "din_dout", "fp32"
         value = self._array(weight_name)
         if value is None or np.asarray(value).ndim != 2:
             raise ExporterError(Diagnostic(
@@ -3212,7 +4335,7 @@ class OnnxCompiler:
                 source_op=node.op_type,
                 constraint="constant linear-compatible RHS",
             ))
-        return {"weight": self.ensure_weight(weight_name)}, "IN_OUT", "fp32"
+        return {"weight": self.ensure_weight(weight_name)}, "din_dout", "fp32"
 
     def _emit_matmul(self, node, index: int) -> None:
         source_node = _source_name(node, index)
@@ -3346,7 +4469,7 @@ class OnnxCompiler:
             normalized = np.asarray(weight).T if trans_b else np.asarray(weight)
             normalized = np.asarray(normalized, dtype=np.float32) * alpha
             exported = self.ensure_weight(weight_name, array=normalized, preferred=f"{self.names.get(self.resolve(weight_name), weight=True)}_gemm")
-            inputs, layout, mode = {"weight": exported}, "IN_OUT", "fp32"
+            inputs, layout, mode = {"weight": exported}, "din_dout", "fp32"
         inputs = {"input": self.names.get(self.resolve(node.input[0])), **inputs}
         if len(node.input) > 2 and node.input[2]:
             bias = self._array(node.input[2])
@@ -3383,7 +4506,7 @@ class OnnxCompiler:
         )
         input_shape = self.shape_of(input_name)
         if not input_shape:
-            raise ExporterError(Diagnostic("VXSOFTMAX_SHAPE", f"{source_node} input shape is unresolved", "staticize"))
+            raise ExporterError(Diagnostic("VXSOFTMAX_SHAPE", f"{source_node} input shape is unresolved", "logical-shapes"))
         axis_default = 1 if self.opset <= 12 else -1
         axis = _normalize_axis(int(_attribute(node, "axis", axis_default)), len(input_shape), node=source_node)
         current = input_name
@@ -3498,6 +4621,16 @@ class OnnxCompiler:
             self.arrays[indices_name] = _to_i32_checked(indices, label=source_node)
         if indices is not None and np.asarray(indices).ndim == 0:
             data_shape = self.shape_of(data_name)
+            if not isinstance(data_shape[axis], int):
+                raise ExporterError(Diagnostic(
+                    "VXDYNAMIC_GATHER_INDEX",
+                    f"{source_node} cannot normalize a scalar index against "
+                    f"symbolic axis {data_shape[axis]!r}",
+                    "logical-shapes",
+                    source_node=source_node,
+                    source_op=node.op_type,
+                    constraint="bounded-domain scalar-index proof is not implemented",
+                ))
             selected = int(np.asarray(indices).item())
             if selected < 0:
                 selected += data_shape[axis]
@@ -3523,7 +4656,10 @@ class OnnxCompiler:
                 slice_output,
                 shape=slice_shape,
                 dtype="float32",
-                params={"starts": [selected], "axes": [axis], "steps": [1]},
+                params={
+                    "starts": [selected], "ends": [selected + 1],
+                    "axes": [axis], "steps": [1],
+                },
                 source_node=source_node,
                 source_op=node.op_type,
             )
@@ -3709,7 +4845,7 @@ class OnnxCompiler:
         )
         self._add_node(
             "Where",
-            {"condition": condition_ref, "x": x_ref, "y": y_ref},
+            {"condition": condition_ref, "a": x_ref, "b": y_ref},
             node.output[0],
             shape=output_shape,
             dtype=x_dtype,
@@ -3733,9 +4869,21 @@ class OnnxCompiler:
             if target is not None
             else []
         )
+        if target is None and (index, 1) in self.structural_shape_targets:
+            target_shape = list(output_shape)
         if (
             not target_shape
-            or any(dimension <= 0 for dimension in target_shape)
+            or any(
+                not (
+                    isinstance(dimension, int)
+                    and not isinstance(dimension, bool)
+                    and dimension > 0
+                ) and not (
+                    isinstance(dimension, str)
+                    and self.shape_environment.get(dimension) is not None
+                )
+                for dimension in target_shape
+            )
             or _broadcast_shape(
                 self.shape_of(node.input[0]), target_shape, node=source_node
             ) != output_shape
@@ -3743,8 +4891,8 @@ class OnnxCompiler:
             raise ExporterError(Diagnostic(
                 "VXEXPAND_SHAPE",
                 f"{source_node} requires an immutable target whose broadcast "
-                f"result equals its static output shape",
-                "staticize",
+                f"result equals its declared bounded output shape",
+                "logical-shapes",
                 source_node=source_node,
                 source_op=node.op_type,
             ))
@@ -3832,6 +4980,7 @@ class OnnxCompiler:
             return
         normalized_axes: list[int] = []
         normalized_starts: list[int] = []
+        normalized_ends: list[int] = []
         normalized_steps: list[int] = []
         expected_shape = list(input_shape)
         seen: set[int] = set()
@@ -3839,6 +4988,16 @@ class OnnxCompiler:
             starts_raw, ends_raw, axes_raw, steps_raw
         ):
             axis = _normalize_axis(raw_axis, len(input_shape), node=source_node)
+            if not isinstance(input_shape[axis], int):
+                raise ExporterError(Diagnostic(
+                    "VXDYNAMIC_SLICE_AXIS",
+                    f"{source_node} cannot normalize static slice bounds against "
+                    f"symbolic axis {input_shape[axis]!r}",
+                    "logical-shapes",
+                    source_node=source_node,
+                    source_op=node.op_type,
+                    constraint="bounded-domain slice proof is not implemented",
+                ))
             if axis in seen or raw_step <= 0:
                 raise ExporterError(Diagnostic(
                     "VXSLICE_PARAMS",
@@ -3862,6 +5021,7 @@ class OnnxCompiler:
             expected_shape[axis] = length
             normalized_axes.append(axis)
             normalized_starts.append(start)
+            normalized_ends.append(stop)
             normalized_steps.append(step)
             seen.add(axis)
         if output_shape != expected_shape:
@@ -3880,6 +5040,7 @@ class OnnxCompiler:
             dtype=dtype,
             params={
                 "starts": normalized_starts,
+                "ends": normalized_ends,
                 "axes": normalized_axes,
                 "steps": normalized_steps,
             },
@@ -4079,6 +5240,14 @@ class OnnxCompiler:
         }
         if self._attention_is_self(attention):
             q_shape = self.shape_of(attention.q)
+            if not q_shape or not isinstance(q_shape[-1], int):
+                raise ExporterError(Diagnostic(
+                    "VXDYNAMIC_ATTENTION_PACK",
+                    f"{attention.source_node} cannot encode three times symbolic "
+                    "attention width in v1",
+                    "logical-shapes",
+                    source_node=attention.source_node,
+                ))
             packed = f"{attention.output}__packed_qkv"
             concat_inputs = {
                 "input0": self.names.get(attention.q),
@@ -4087,7 +5256,7 @@ class OnnxCompiler:
             }
             self._add_node(
                 "Concat", concat_inputs, packed, shape=[*q_shape[:-1], q_shape[-1] * 3], dtype="float32",
-                params={"axis": len(q_shape) - 1, "count": 3},
+                params={"axis": len(q_shape) - 1},
                 source_node=attention.source_node, source_op="attention-pack",
             )
             inputs = {"qkv": self.names.get(packed)}
@@ -4161,7 +5330,7 @@ class OnnxCompiler:
         weight = np.asarray(weight)
         output_shape = self.shape_of(node.output[0])
         if len(output_shape) != 4:
-            raise ExporterError(Diagnostic("VXCONV_OUTPUT", f"{source_node} output shape is not rank-4 NCHW", "staticize"))
+            raise ExporterError(Diagnostic("VXCONV_OUTPUT", f"{source_node} output shape is not rank-4 NCHW", "logical-shapes"))
         pads = [int(value) for value in _attribute(node, "pads", [0, 0, 0, 0])]
         if len(pads) != 4 or pads[0] != pads[2] or pads[1] != pads[3]:
             raise ExporterError(Diagnostic(
@@ -4175,9 +5344,33 @@ class OnnxCompiler:
         nhwc_input, _ = self._nchw_to_nhwc(
             input_name, stem=node.output[0], source_node=source_node, source_op=node.op_type
         )
-        ohwi = np.ascontiguousarray(np.transpose(weight, (0, 2, 3, 1)))
+        # Emit the image-layout form the Conv2D microkernels index directly. OHWI
+        # would force every runtime to transpose into HWIO/HWCM at load and hold a
+        # second copy of the weight; the byte order is settled here instead.
+        groups = int(_attribute(node, "group", 1))
+        stem = self.names.get(self.resolve(node.input[1]), weight=True)
+        if groups > 1 and weight.shape[1] == 1:
+            # Depthwise: OIHW [C*M,1,kh,kw] -> HWCM [kh,kw,C,M]. Only this shape
+            # reaches the specialised depthwise kernels; HWIO would fall back to
+            # the generic grouped loop.
+            multiplier, remainder = divmod(weight.shape[0], groups)
+            if remainder:
+                raise ExporterError(Diagnostic(
+                    "VXCONV_WEIGHT",
+                    f"{source_node} depthwise output channels {weight.shape[0]} are not a multiple of group {groups}",
+                    "lower", source_node=source_node,
+                ))
+            image = np.ascontiguousarray(np.transpose(
+                weight.reshape(groups, multiplier, weight.shape[2], weight.shape[3]),
+                (2, 3, 0, 1),
+            ))
+            weight_layout = "HWCM"
+        else:
+            # OIHW [O,I/g,kh,kw] -> HWIO [kh,kw,I/g,O].
+            image = np.ascontiguousarray(np.transpose(weight, (2, 3, 1, 0)))
+            weight_layout = "HWIO"
         weight_ref = self.ensure_weight(
-            node.input[1], array=ohwi, preferred=f"{self.names.get(self.resolve(node.input[1]), weight=True)}_ohwi"
+            node.input[1], array=image, preferred=f"{stem}_{weight_layout.lower()}"
         )
         inputs = {"input": self.names.get(nhwc_input), "weight": weight_ref}
         if len(node.input) > 2 and node.input[2]:
@@ -4193,11 +5386,11 @@ class OnnxCompiler:
             params={
                 "stride": [int(value) for value in _attribute(node, "strides", [1, 1])],
                 "dilation": [int(value) for value in _attribute(node, "dilations", [1, 1])],
-                "groups": int(_attribute(node, "group", 1)),
+                "groups": groups,
                 "pads": pads,
                 "padding": pads[:2],
                 "data_layout": "NHWC",
-                "weight_layout": "OHWI",
+                "weight_layout": weight_layout,
             },
             source_node=source_node,
             source_op=node.op_type,
@@ -4250,7 +5443,6 @@ class OnnxCompiler:
             params={
                 "num_groups": groups,
                 "eps": float(_attribute(node, "epsilon", _attribute(node, "eps", 1e-5))),
-                "data_layout": "NHWC",
             },
             source_node=source_node,
             source_op=node.op_type,
@@ -4285,7 +5477,6 @@ class OnnxCompiler:
             params={
                 "num_groups": region.groups,
                 "eps": region.epsilon,
-                "data_layout": "NHWC",
             },
             source_node=region.source_node,
             source_op="GroupNorm-pattern",
@@ -4372,11 +5563,22 @@ class OnnxCompiler:
             if value.name in self.arrays and any(key in {value.name, canonical} for key in specialized):
                 continue
             shape = self.shape_map.get(value.name, [])
-            if not shape or any(dimension <= 0 for dimension in shape):
+            if not shape or any(
+                not (
+                    isinstance(dimension, int)
+                    and not isinstance(dimension, bool)
+                    and dimension > 0
+                ) and not (
+                    isinstance(dimension, str)
+                    and self.shape_environment.get(dimension) is not None
+                )
+                for dimension in shape
+            ):
                 raise ExporterError(Diagnostic(
                     "VXINPUT_SHAPE",
-                    f"public input {value.name!r} has unresolved shape {shape}; provide --input-shape",
-                    "bind-shapes",
+                    f"public input {value.name!r} has unresolved shape {shape}; "
+                    "provide a concrete input shape or caller bounds",
+                    "logical-shapes",
                     source_node=value.name,
                 ))
             source_dtype = self.dtype_map.get(value.name, "")
@@ -4400,7 +5602,7 @@ class OnnxCompiler:
                         source_node=value.name,
                     ))
                 self.abi_changes.append({"kind": "input-dtype", "name": value.name, "source": source_dtype, "exported": binding})
-            definitions[canonical] = {"shape": shape, "dtype": dtype, "source_name": value.name}
+            definitions[canonical] = {"shape": shape, "dtype": dtype}
             descriptor = self.activation_quantization.get(self.resolve(value.name))
             if descriptor is not None:
                 if dtype not in {"int8", "uint8"}:
@@ -4411,19 +5613,17 @@ class OnnxCompiler:
                         source_node=value.name,
                     ))
                 self.tensor_quantization[canonical] = dict(descriptor)
-        for request in self.image_normalizations:
-            if "=" not in request:
-                raise ExporterError(Diagnostic("VXIMAGE_NORMALIZATION", "image normalization expects INPUT=MODE", "usage"))
-            name, mode = request.split("=", 1)
-            if name not in definitions or mode not in {"zero-one", "minus-one-one", "raw-255"}:
-                raise ExporterError(Diagnostic("VXIMAGE_NORMALIZATION", f"invalid image normalization {request!r}", "usage"))
-            definitions[name]["image_normalization"] = mode
         return definitions
 
     def lower(
         self,
         *,
+        allow_silu_numerical_migration: bool = False,
+        allow_quantized_bias_folding_numerical_migration: bool = False,
+        allow_static_qdq_qbatch_matmul_numerical_migration: bool = False,
+        allow_static_qdq_groupnorm_silu_numerical_migration: bool = False,
         enable_static_qdq_layout_optimization: bool = True,
+        enable_exact_common_subexpression_elimination: bool = False,
     ) -> tuple[dict[str, Any], dict[str, np.ndarray]]:
         consumers: dict[str, list[int]] = defaultdict(list)
         public_input_sources = {
@@ -4433,6 +5633,9 @@ class OnnxCompiler:
             for name in node.input:
                 consumers[name].append(index)
         for index, node in enumerate(self.model.graph.node):
+            if index in self.structural_shape_nodes:
+                self.skipped_nodes += 1
+                continue
             if index in self.qconv_replacements:
                 self._emit_qconv_region(self.qconv_replacements[index])
                 continue
@@ -4533,7 +5736,8 @@ class OnnxCompiler:
                 self._add_node(
                     "DequantizeLinear",
                     {"input": self.names.get(raw), "scale": self.ensure_weight(scale, force_float32=True), "zero_point": self.ensure_weight(zero_name)},
-                    output, dtype="float32", source_node=source_node, source_op=op,
+                    output, shape=self.shape_of(raw), dtype="float32",
+                    source_node=source_node, source_op=op,
                 )
                 continue
             if op == "QuantizeLinear":
@@ -4555,7 +5759,9 @@ class OnnxCompiler:
                 self._add_node(
                     "QuantizeLinear",
                     {"input": self.names.get(self.resolve(node.input[0])), "scale": self.ensure_weight(node.input[1], force_float32=True), "zero_point": self.ensure_weight(zero_name)},
-                    output, dtype=dtype, quantization=descriptor, source_node=source_node, source_op=op,
+                    output, shape=self.shape_of(node.input[0]), dtype=dtype,
+                    quantization=descriptor, source_node=source_node,
+                    source_op=op,
                 )
                 continue
             if op == "MatMul":
@@ -4591,14 +5797,35 @@ class OnnxCompiler:
                     right, {"float32"}, source_node=source_node,
                     source_op=op, role="right operand",
                 )
-                left_array = self._array(left)
-                right_array = self._array(right)
+                inferred = _broadcast_shape(
+                    self.shape_of(left), self.shape_of(right), node=source_node,
+                )
+                output_shape = self.shape_of(output) or inferred
+                if output_shape != inferred:
+                    raise ExporterError(Diagnostic(
+                        "VXBROADCAST_OUTPUT",
+                        f"{source_node} output shape {output_shape} does not match "
+                        f"broadcast result {inferred}",
+                        "logical-shapes",
+                        source_node=source_node,
+                        source_op=op,
+                    ))
                 inputs = {
-                    "a": self.ensure_weight(left) if left_array is not None else self.names.get(left),
-                    "b": self.ensure_weight(right) if right_array is not None else self.names.get(right),
+                    "a": self._broadcast_execution_ref(
+                        left, output_shape=output_shape, dtype="float32",
+                        stem=output, role="left", source_node=source_node,
+                        source_op=op,
+                    ),
+                    "b": self._broadcast_execution_ref(
+                        right, output_shape=output_shape, dtype="float32",
+                        stem=output, role="right", source_node=source_node,
+                        source_op=op,
+                    ),
                 }
-                inferred = _broadcast_shape(self.shape_of(left), self.shape_of(right), node=source_node)
-                self._add_node(op, inputs, output, shape=self.shape_of(output) or inferred, dtype="float32", source_node=source_node, source_op=op)
+                self._add_node(
+                    op, inputs, output, shape=output_shape, dtype="float32",
+                    source_node=source_node, source_op=op,
+                )
             elif op in {"Softmax", "LogSoftmax"}:
                 self._emit_softmax(node, index)
             elif op == "Gather":
@@ -4663,8 +5890,51 @@ class OnnxCompiler:
                     source_op=op,
                     role="input",
                 )
+                output_shape = self.shape_of(output)
+                if op == "Identity" and (
+                    not output_shape or any(
+                        not isinstance(dimension, (int, str)) or dimension == 0
+                        for dimension in output_shape
+                    )
+                ):
+                    output_shape = self.shape_of(input_name)
+                params: dict[str, Any] = {}
+                if op == "Reshape":
+                    params = {"shape": list(output_shape)}
+                elif op == "Flatten":
+                    params = {"axis": int(_attribute(node, "axis", 1))}
+                elif op in {"Squeeze", "Unsqueeze"}:
+                    axes_value = (
+                        self._array(node.input[1])
+                        if len(node.input) > 1 and node.input[1]
+                        else None
+                    )
+                    axes = list(_attribute(node, "axes", ())) or (
+                        [int(value) for value in np.asarray(axes_value).reshape(-1)]
+                        if axes_value is not None
+                        else []
+                    )
+                    if op == "Squeeze" and not axes:
+                        axes = [
+                            axis for axis, dimension in enumerate(
+                                self.shape_of(input_name)
+                            )
+                            if dimension == 1
+                        ]
+                    if not axes:
+                        raise ExporterError(Diagnostic(
+                            "VXSHAPE_AXES",
+                            f"{source_node} requires immutable {op} axes",
+                            "logical-shapes",
+                            source_node=source_node,
+                            source_op=op,
+                        ))
+                    params = {"axes": axes}
                 self._add_node(
-                    op, {"input": input_ref}, output, dtype=dtype,
+                    op, {"input": input_ref}, output,
+                    shape=output_shape,
+                    dtype=dtype,
+                    params=params,
                     source_node=source_node, source_op=op,
                 )
             elif op == "Transpose":
@@ -4684,6 +5954,7 @@ class OnnxCompiler:
             elif op == "Concat":
                 inputs = {}
                 dtypes = set()
+                input_shapes: list[list[int | str]] = []
                 for position, name in enumerate(node.input):
                     resolved = self.resolve(name)
                     reference, dtype = self._execution_ref(
@@ -4695,11 +5966,23 @@ class OnnxCompiler:
                     )
                     inputs[f"input{position}"] = reference
                     dtypes.add(dtype)
+                    input_shapes.append(self.shape_of(resolved))
                 if len(dtypes) != 1:
                     raise ExporterError(Diagnostic("VXCONCAT_DTYPE", f"{source_node} inputs have different dtypes", "dtype-legalize"))
+                axis = int(_attribute(node, "axis"))
+                output_shape = self.shape_of(output)
+                expected_shape = self._canonical_concat_output_shape(
+                    node,
+                    input_shapes,
+                    axis=axis,
+                    dtype=next(iter(dtypes)),
+                    source_node=source_node,
+                )
+                output_shape = expected_shape
                 self._add_node(
-                    "Concat", inputs, output, dtype=next(iter(dtypes)),
-                    params={"axis": int(_attribute(node, "axis")), "count": len(inputs)}, source_node=source_node, source_op=op,
+                    "Concat", inputs, output, shape=output_shape,
+                    dtype=next(iter(dtypes)),
+                    params={"axis": axis}, source_node=source_node, source_op=op,
                 )
             elif op == "Clip":
                 input_name = self.resolve(node.input[0])
@@ -4741,6 +6024,26 @@ class OnnxCompiler:
                 )
             elif op == "Cast":
                 target = _onnx_dtype_name(int(_attribute(node, "to")))
+                if index in self.identity_bool_casts | self.identity_int64_casts:
+                    input_name = self.resolve(node.input[0])
+                    if self.execution_dtype_of(input_name) != "int32":
+                        raise ExporterError(Diagnostic(
+                            "VXCAST_I32_REPRESENTATION",
+                            f"{source_node} source {target} identity Cast is not "
+                            "represented as runtime int32",
+                            "dtype-legalize",
+                            source_node=source_node,
+                            source_op=op,
+                            constraint=(
+                                "source BOOL/INT64 represented by an exact "
+                                "public int32 ABI binding"
+                            ),
+                        ))
+                    self.alias[output] = input_name
+                    self.shape_map[output] = self.shape_of(input_name)
+                    self.dtype_map[output] = "int32"
+                    self.skipped_nodes += 1
+                    continue
                 if target not in _RUNTIME_DTYPES:
                     raise ExporterError(Diagnostic("VXCAST_DTYPE", f"{source_node} casts to unsupported {target}", "dtype-legalize"))
                 input_ref, _ = self._execution_ref(
@@ -4757,7 +6060,7 @@ class OnnxCompiler:
             elif op in {"If", "Loop", "Scan"}:
                 raise ExporterError(Diagnostic(
                     "VXCONTROL_FLOW", f"{source_node} retains unsupported ONNX {op}", "control-flow",
-                    source_node=source_node, source_op=op, constraint="branch-free static DAG", required_pass="control_flow",
+                    source_node=source_node, source_op=op, constraint="branch-free DAG", required_pass="control_flow",
                 ))
             else:
                 raise ExporterError(Diagnostic(
@@ -4771,9 +6074,11 @@ class OnnxCompiler:
 
         exported_outputs = []
         produced_exports = {
-            value
+            descriptor.get("tensor")
             for lowered in self.nodes
-            for value in (lowered.get("outputs") or {}).values()
+            for descriptor in (lowered.get("outputs") or {}).values()
+            if isinstance(descriptor, Mapping)
+            and isinstance(descriptor.get("tensor"), str)
         }
         for output in self.model.graph.output:
             resolved = self.resolve(output.name)
@@ -4798,30 +6103,19 @@ class OnnxCompiler:
             exported_outputs.append(wanted)
 
         inputs = self._input_definitions()
-        package_class = classify_package(
-            {"inputs": inputs, "nodes": self.nodes},
-            self.weights,
-        )
         graph = {
             "format": "volvox-graph/v1",
-            "source": {
-                "onnx": Path(self.model_path).name,
-                "opset": self.opset,
-                "frontend": "target-aware-onnx/v1",
-                "source_ir": {
-                    "dialect": self.source_ir.dialect.value,
-                    "fingerprint": self.source_ir.fingerprint(),
-                    "nodes": len(self.source_ir.nodes),
-                    "tensors": len(self.source_ir.tensors),
-                    "opsets": dict(self.source_ir.opsets),
-                },
-                "float_storage": self._float_storage(),
-                "package_class": package_class,
-                **({"quantized_graph_contract": "w8a8-v1"} if package_class == "w8a8-v1" else {}),
-                "folded_nodes": len(self.folded),
-                "skipped_nodes": self.skipped_nodes,
-                "features": dict(self.features),
-                "abi_changes": self.abi_changes,
+            "dimensions": {
+                constraint.name: {
+                    "min": constraint.min,
+                    "max": constraint.max,
+                    **(
+                        {"multiple_of": constraint.multiple_of}
+                        if constraint.multiple_of is not None
+                        else {}
+                    ),
+                }
+                for constraint in self.shape_environment.dimensions
             },
             "inputs": inputs,
             "outputs": exported_outputs,
@@ -4830,25 +6124,60 @@ class OnnxCompiler:
         quantization_report = externalize_quantization(
             graph, self.weights, self.tensor_quantization
         )
-        graph["source"]["quantization_parameters"] = {
-            "tensors": quantization_report.tensors,
-            "scales_created": quantization_report.scales_created,
-            "zero_points_created": quantization_report.zero_points_created,
-            "parameters_reused": quantization_report.parameters_reused,
-        }
         graph, optimized_weights, typed_report = optimize_runtime_package(
             graph,
             self.weights,
             source_name=f"{Path(self.model_path).name}:lowered",
+            allow_silu_numerical_migration=allow_silu_numerical_migration,
+            allow_quantized_bias_folding_numerical_migration=(
+                allow_quantized_bias_folding_numerical_migration
+            ),
+            allow_static_qdq_qbatch_matmul_numerical_migration=(
+                allow_static_qdq_qbatch_matmul_numerical_migration
+            ),
+            allow_static_qdq_groupnorm_silu_numerical_migration=(
+                allow_static_qdq_groupnorm_silu_numerical_migration
+            ),
             enable_static_qdq_layout_optimization=(
                 enable_static_qdq_layout_optimization
+            ),
+            enable_exact_common_subexpression_elimination=(
+                enable_exact_common_subexpression_elimination
+            ),
+            shape_profile=(
+                None if self.shape_environment.dimensions else {}
             ),
         )
         self.weights = {
             name: np.asarray(value) for name, value in optimized_weights.items()
         }
-        graph["source"]["typed_optimizer"] = serialize_pipeline_report(
-            typed_report)
+        package_class = classify_package(graph, self.weights)
+        self.publication_report = {
+            "onnx": Path(self.model_path).name,
+            "opset": self.opset,
+            "frontend": "target-aware-onnx/v1",
+            "source_ir": {
+                "dialect": self.source_ir.dialect.value,
+                "fingerprint": self.source_ir.fingerprint(),
+                "nodes": len(self.source_ir.nodes),
+                "tensors": len(self.source_ir.tensors),
+                "opsets": dict(self.source_ir.opsets),
+            },
+            "float_storage": self._float_storage(),
+            "package_class": package_class,
+            "folded_nodes": len(self.folded),
+            "skipped_nodes": self.skipped_nodes,
+            "features": dict(self.features),
+            "abi_changes": list(self.abi_changes),
+            "node_sources": list(self.node_sources),
+            "quantization_parameters": {
+                "tensors": quantization_report.tensors,
+                "scales_created": quantization_report.scales_created,
+                "zero_points_created": quantization_report.zero_points_created,
+                "parameters_reused": quantization_report.parameters_reused,
+            },
+            "typed_optimizer": serialize_pipeline_report(typed_report),
+        }
         return graph, self.weights
 
 
@@ -4860,14 +6189,27 @@ def compile_onnx_model(
     output_names=None,
     image_normalizations=None,
     input_shapes=None,
+    dimension_bounds=None,
+    anonymous_dimension_bounds=None,
     input_dtypes=None,
     output_dtypes=None,
     specialize_inputs=None,
     registered_domains=None,
+    allow_silu_numerical_migration: bool = False,
+    allow_quantized_bias_folding_numerical_migration: bool = False,
+    allow_static_qdq_qbatch_matmul_numerical_migration: bool = False,
+    allow_static_qdq_groupnorm_silu_numerical_migration: bool = False,
     enable_static_qdq_layout_optimization: bool = True,
+    enable_exact_common_subexpression_elimination: bool = False,
+    report_callback: Optional[Callable[[Mapping[str, Any]], None]] = None,
     log: Optional[Callable[[str], None]] = None,
 ) -> dict[str, Any]:
-    """Compile one static ONNX DAG and write a Volvox graph package."""
+    """Compile one bounded or constant-only ONNX DAG into closed current v1.
+
+    ``report_callback`` receives a detached JSON-compatible provenance,
+    optimizer, and affine-publication report. Executable ``graph.json`` never
+    carries those non-runtime fields.
+    """
 
     import json
     from safetensors.numpy import save_file
@@ -4880,16 +6222,37 @@ def compile_onnx_model(
         output_names=output_names,
         image_normalizations=image_normalizations,
         input_shapes=input_shapes,
+        dimension_bounds=dimension_bounds,
+        anonymous_dimension_bounds=anonymous_dimension_bounds,
         input_dtypes=input_dtypes,
         output_dtypes=output_dtypes,
         specialize_inputs=specialize_inputs,
         registered_domains=registered_domains,
     )
     graph, weights = compiler.lower(
+        allow_silu_numerical_migration=allow_silu_numerical_migration,
+        allow_quantized_bias_folding_numerical_migration=(
+            allow_quantized_bias_folding_numerical_migration
+        ),
+        allow_static_qdq_qbatch_matmul_numerical_migration=(
+            allow_static_qdq_qbatch_matmul_numerical_migration
+        ),
+        allow_static_qdq_groupnorm_silu_numerical_migration=(
+            allow_static_qdq_groupnorm_silu_numerical_migration
+        ),
         enable_static_qdq_layout_optimization=(
             enable_static_qdq_layout_optimization
         ),
+        enable_exact_common_subexpression_elimination=(
+            enable_exact_common_subexpression_elimination
+        ),
     )
+    if report_callback is not None:
+        report_callback(json.loads(json.dumps(
+            compiler.publication_report,
+            sort_keys=True,
+            allow_nan=False,
+        )))
     destination = Path(out_path)
     destination.parent.mkdir(parents=True, exist_ok=True)
     save_file(weights, str(destination))
@@ -4900,7 +6263,8 @@ def compile_onnx_model(
     )
     logger(
         f"[Export] ONNX lowered nodes={len(graph['nodes'])} weights={len(weights)} "
-        f"features={','.join(sorted(graph['source']['features'])) or 'none'}"
+        f"package_class={compiler.publication_report['package_class']} "
+        f"features={','.join(sorted(compiler.publication_report['features'])) or 'none'}"
     )
     logger(f"[Export] Wrote {destination} and {graph_path}")
     return graph

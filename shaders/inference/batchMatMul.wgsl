@@ -1,4 +1,3 @@
-// @volvoxai-browser-only
 // Canonical rank-2..8 ONNX matrix multiplication with broadcast batch axes.
 @group(0) @binding(0) var<storage, read> a : array<f32>;
 @group(0) @binding(1) var<storage, read> b : array<f32>;

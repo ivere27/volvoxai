@@ -48,6 +48,8 @@ VOLVOXAI_CUDA_FORWARD_FUNCTION(
 VOLVOXAI_CUDA_FORWARD_FUNCTION(
     REQUIRED, k_qlinear, "vx_cuda_qlinear_i8u8")
 VOLVOXAI_CUDA_FORWARD_FUNCTION(
+    REQUIRED, k_qlinear_warp_dp4a, "vx_cuda_qlinear_warp_dp4a_i8u8")
+VOLVOXAI_CUDA_FORWARD_FUNCTION(
     REQUIRED, k_qembedding, "vx_cuda_qembedding_i8u8")
 VOLVOXAI_CUDA_FORWARD_FUNCTION(
     REQUIRED, k_qadd, "vx_cuda_qadd_i8u8")
@@ -109,6 +111,8 @@ VOLVOXAI_CUDA_FORWARD_FUNCTION(
     REQUIRED, k_sdpa, "vx_cuda_sdpa_f32")
 VOLVOXAI_CUDA_FORWARD_FUNCTION(
     REQUIRED, k_qconv2d, "vx_cuda_qconv2d_i8u8")
+VOLVOXAI_CUDA_FORWARD_FUNCTION(
+    REQUIRED, k_qconv2d_warp_dp4a, "vx_cuda_qconv2d_warp_dp4a_i8u8")
 VOLVOXAI_CUDA_FORWARD_FUNCTION(
     REQUIRED, k_qgroupnorm, "vx_cuda_qgroupnorm_i8u8")
 VOLVOXAI_CUDA_FORWARD_FUNCTION(

@@ -102,7 +102,7 @@ class RuntimeSequenceLayoutTests(unittest.TestCase):
         expected = execute_reference(graph, tensors, {"x": sample}).outputs["y"]
 
         pass_ = RuntimeSequenceLayoutPass()
-        report = VerifiedPipeline((pass_,)).run(graph)
+        report = VerifiedPipeline((pass_,), shape_profile={}).run(graph)
 
         self.assertEqual(report.total_changes, 8)
         self.assertEqual((pass_.rewritten, pass_.removed), (4, 4))
@@ -113,7 +113,9 @@ class RuntimeSequenceLayoutTests(unittest.TestCase):
         actual = execute_reference(graph, tensors, {"x": sample}).outputs["y"]
         np.testing.assert_array_equal(actual, expected)
 
-        second = VerifiedPipeline((RuntimeSequenceLayoutPass(),)).run(graph)
+        second = VerifiedPipeline(
+            (RuntimeSequenceLayoutPass(),), shape_profile={},
+        ).run(graph)
         self.assertEqual(second.total_changes, 0)
 
     def test_axis_sensitive_consumer_pins_its_operand(self):
@@ -136,7 +138,9 @@ class RuntimeSequenceLayoutTests(unittest.TestCase):
         graph.verify(IRDialect.RUNTIME)
         before = graph.fingerprint()
 
-        report = VerifiedPipeline((RuntimeSequenceLayoutPass(),)).run(graph)
+        report = VerifiedPipeline(
+            (RuntimeSequenceLayoutPass(),), shape_profile={},
+        ).run(graph)
 
         self.assertEqual(report.total_changes, 0)
         self.assertEqual(graph.fingerprint(), before)
@@ -153,7 +157,7 @@ class RuntimeSequenceLayoutTests(unittest.TestCase):
             "Linear",
             {"input": "x", "weight": "weight"},
             {"out": "hidden"},
-            attributes=_params(weight_layout="IN_OUT"),
+            attributes=_params(weight_layout="din_dout"),
         ))
         graph.add_node(OpNode.from_maps(
             "reshape", "Reshape", {"input": "hidden"}, {"out": "y"},
@@ -162,7 +166,9 @@ class RuntimeSequenceLayoutTests(unittest.TestCase):
         graph.verify(IRDialect.RUNTIME)
         before = graph.fingerprint()
 
-        report = VerifiedPipeline((RuntimeSequenceLayoutPass(),)).run(graph)
+        report = VerifiedPipeline(
+            (RuntimeSequenceLayoutPass(),), shape_profile={},
+        ).run(graph)
 
         self.assertEqual(report.total_changes, 0)
         self.assertEqual(graph.fingerprint(), before)
@@ -188,7 +194,9 @@ class RuntimeSequenceLayoutTests(unittest.TestCase):
         real.verify(IRDialect.RUNTIME)
         before = real.fingerprint()
         self.assertEqual(
-            VerifiedPipeline((RuntimeSequenceLayoutPass(),)).run(real).total_changes,
+            VerifiedPipeline(
+                (RuntimeSequenceLayoutPass(),), shape_profile={},
+            ).run(real).total_changes,
             0,
         )
         self.assertEqual(real.fingerprint(), before)
@@ -200,7 +208,9 @@ class RuntimeSequenceLayoutTests(unittest.TestCase):
         ))
         shared.outputs.append("side")
         shared.verify(IRDialect.RUNTIME)
-        VerifiedPipeline((RuntimeSequenceLayoutPass(),)).run(shared)
+        VerifiedPipeline(
+            (RuntimeSequenceLayoutPass(),), shape_profile={},
+        ).run(shared)
         self.assertIn("Transpose", [node.op_type for node in shared.nodes])
         shared.verify(IRDialect.RUNTIME)
 

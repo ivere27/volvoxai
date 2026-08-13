@@ -45,7 +45,7 @@ class DispatchRecorder extends WebGPUAutograd {
 function makeTrainer(node, tensors) {
   const device = mockDevice();
   const gpuBuffers = new Map(tensors.map((value) => [value.name, { tensor: value.name }]));
-  return new DispatchRecorder(device, { nodes: [node] }, { gpuBuffers, _dinWeights: new Map() });
+  return new DispatchRecorder(device, { nodes: [node] }, { gpuBuffers });
 }
 
 function entry(dispatch, binding) {

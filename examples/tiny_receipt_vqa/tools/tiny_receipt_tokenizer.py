@@ -1,8 +1,8 @@
-"""Validated TinyReceipt tokenizer contracts shared by Python example tools.
+"""Validated TinyReceipt byte-fallback BPE contract for Python example tools.
 
-The release supports the original 760-entry character vocabulary and the
-1536-entry NFC byte-fallback BPE vocabulary.  This module intentionally has no
-training or third-party tokenizer dependency.
+The explicit-KV package-v1 contract has one tokenizer: the 1536-entry NFC
+byte-fallback BPE vocabulary.  This module intentionally has no training or
+third-party tokenizer dependency.
 """
 
 from __future__ import annotations
@@ -14,7 +14,6 @@ from collections.abc import Iterable, Mapping, Sequence
 from typing import Any
 
 
-CHAR_VOCAB_SIZE = 760
 BPE_VOCAB_SIZE = 1536
 SPECIAL_TOKENS = ("<pad>", "<bos>", "<eos>", "<unk>")
 SPECIAL_TOKEN_IDS = {"pad": 0, "bos": 1, "eos": 2, "unk": 3}
@@ -65,7 +64,6 @@ _BPE_VOCAB_KEYS = frozenset(
         "tokenizer_hash",
     }
 )
-_CHAR_MANIFEST_KEYS = frozenset({"type", "version", "itos_key", "token_ids"})
 _BPE_MANIFEST_KEYS = frozenset(
     {
         "type",
@@ -121,7 +119,7 @@ def _validate_token_ids(value: object) -> dict[str, int]:
 
 
 class TinyReceiptTokenizer:
-    """Inference-only encoder/decoder for both TinyReceipt tokenizers."""
+    """Inference-only encoder/decoder for the TinyReceipt BPE tokenizer."""
 
     def __init__(
         self,
@@ -135,6 +133,10 @@ class TinyReceiptTokenizer:
         unused_tokens: Sequence[str] = (),
         tokenizer_hash: str | None = None,
     ) -> None:
+        if kind != "byte_fallback_bpe":
+            raise TokenizerContractError(
+                "TinyReceiptTokenizer supports only byte_fallback_bpe v1"
+            )
         self.kind = kind
         self.vocabulary = tuple(vocabulary)
         self.stoi = {token: index for index, token in enumerate(self.vocabulary)}
@@ -166,19 +168,11 @@ class TinyReceiptTokenizer:
     def package_vocabulary_sha256(self) -> str:
         """Return the package identity digest for this tokenizer contract."""
 
-        if self.kind == "byte_fallback_bpe":
-            if self.tokenizer_hash is None:  # Defensive: construction is internal.
-                raise TokenizerContractError(
-                    "byte_fallback_bpe tokenizer identity is unavailable"
-                )
-            return self.tokenizer_hash
-        encoded = json.dumps(
-            self.vocabulary,
-            allow_nan=False,
-            ensure_ascii=False,
-            separators=(",", ":"),
-        ).encode("utf-8")
-        return hashlib.sha256(encoded).hexdigest()
+        if self.tokenizer_hash is None:  # Defensive: construction is internal.
+            raise TokenizerContractError(
+                "byte_fallback_bpe tokenizer identity is unavailable"
+            )
+        return self.tokenizer_hash
 
     @classmethod
     def from_documents(
@@ -190,55 +184,7 @@ class TinyReceiptTokenizer:
             raise TokenizerContractError("package tokenizer must be an object")
         if not isinstance(vocabulary_document, Mapping):
             raise TokenizerContractError("vocab.json must contain an object")
-        kind = manifest.get("type")
-        if kind == "char-vocab":
-            return cls._from_char_documents(manifest, vocabulary_document)
-        if kind == "byte_fallback_bpe":
-            return cls._from_bpe_documents(manifest, vocabulary_document)
-        raise TokenizerContractError(
-            "package tokenizer must be char-vocab v1 or byte_fallback_bpe v1"
-        )
-
-    @classmethod
-    def _from_char_documents(
-        cls,
-        manifest: Mapping[str, Any],
-        vocabulary_document: Mapping[str, Any],
-    ) -> "TinyReceiptTokenizer":
-        if (
-            set(manifest) != _CHAR_MANIFEST_KEYS
-            or manifest.get("type") != "char-vocab"
-            or not _exact_integer(manifest.get("version"))
-            or manifest.get("version") != 1
-            or manifest.get("itos_key") != "itos"
-        ):
-            raise TokenizerContractError(
-                "package tokenizer must be the exact char-vocab v1 contract"
-            )
-        token_ids = _validate_token_ids(manifest.get("token_ids"))
-        if set(vocabulary_document) != {"itos"}:
-            raise TokenizerContractError(
-                "legacy vocab.json must contain exactly the itos field"
-            )
-        vocabulary = vocabulary_document.get("itos")
-        if (
-            not isinstance(vocabulary, list)
-            or len(vocabulary) != CHAR_VOCAB_SIZE
-            or any(not isinstance(token, str) for token in vocabulary)
-            or len(set(vocabulary)) != len(vocabulary)
-        ):
-            raise TokenizerContractError(
-                "vocab.json itos must contain exactly 760 unique strings"
-            )
-        if vocabulary[: len(SPECIAL_TOKENS)] != list(SPECIAL_TOKENS):
-            raise TokenizerContractError(
-                "vocab token IDs 0 through 3 must be pad, bos, eos, and unk"
-            )
-        return cls(
-            kind="char-vocab",
-            vocabulary=vocabulary,
-            token_ids=token_ids,
-        )
+        return cls._from_bpe_documents(manifest, vocabulary_document)
 
     @classmethod
     def _from_bpe_documents(
@@ -440,50 +386,44 @@ class TinyReceiptTokenizer:
         add_eos: bool = False,
         max_len: int = 0,
     ) -> list[int]:
-        if self.kind == "char-vocab":
-            ids = [
-                self.stoi.get(character, self.token_ids["unk"])
-                for character in str(text)
-            ]
-        else:
-            normalized = unicodedata.normalize("NFC", str(text))
-            ids = []
-            span_start = 0
-            cursor = 0
-            while cursor < len(normalized):
-                tag = next(
-                    (
-                        token
-                        for token in self._tags_longest_first
-                        if normalized.startswith(token, cursor)
-                    ),
-                    None,
+        normalized = unicodedata.normalize("NFC", str(text))
+        ids = []
+        span_start = 0
+        cursor = 0
+        while cursor < len(normalized):
+            tag = next(
+                (
+                    token
+                    for token in self._tags_longest_first
+                    if normalized.startswith(token, cursor)
+                ),
+                None,
+            )
+            is_digit = normalized[cursor] in DIGIT_TOKENS
+            is_space = _is_whitespace(normalized[cursor])
+            if tag is None and not is_digit and not is_space:
+                cursor += 1
+                continue
+            if span_start < cursor:
+                ids.extend(
+                    self._encode_mergeable_span(normalized[span_start:cursor])
                 )
-                is_digit = normalized[cursor] in DIGIT_TOKENS
-                is_space = _is_whitespace(normalized[cursor])
-                if tag is None and not is_digit and not is_space:
-                    cursor += 1
-                    continue
-                if span_start < cursor:
-                    ids.extend(
-                        self._encode_mergeable_span(normalized[span_start:cursor])
-                    )
-                if tag is not None:
-                    ids.append(self.stoi[tag])
-                    cursor += len(tag)
-                elif is_digit:
-                    ids.append(self.stoi[normalized[cursor]])
-                    cursor += 1
+            if tag is not None:
+                ids.append(self.stoi[tag])
+                cursor += len(tag)
+            elif is_digit:
+                ids.append(self.stoi[normalized[cursor]])
+                cursor += 1
+            else:
+                character = normalized[cursor]
+                if character in self.stoi and character not in self._byte_set:
+                    ids.append(self.stoi[character])
                 else:
-                    character = normalized[cursor]
-                    if character in self.stoi and character not in self._byte_set:
-                        ids.append(self.stoi[character])
-                    else:
-                        ids.extend(self._fallback_ids(character))
-                    cursor += 1
-                span_start = cursor
-            if span_start < len(normalized):
-                ids.extend(self._encode_mergeable_span(normalized[span_start:]))
+                    ids.extend(self._fallback_ids(character))
+                cursor += 1
+            span_start = cursor
+        if span_start < len(normalized):
+            ids.extend(self._encode_mergeable_span(normalized[span_start:]))
         if add_bos:
             ids.insert(0, self.token_ids["bos"])
         if add_eos:
@@ -495,18 +435,6 @@ class TinyReceiptTokenizer:
         return ids
 
     def decode(self, token_ids: Iterable[int], *, errors: str = "replace") -> str:
-        if self.kind == "char-vocab":
-            result: list[str] = []
-            for raw_token_id in token_ids:
-                token_id = int(raw_token_id)
-                if token_id == self.token_ids["eos"]:
-                    break
-                if token_id in (self.token_ids["pad"], self.token_ids["bos"]):
-                    continue
-                if 0 <= token_id < len(self.vocabulary):
-                    result.append(self.vocabulary[token_id])
-            return "".join(result)
-
         output = bytearray()
         for raw_token_id in token_ids:
             token_id = int(raw_token_id)

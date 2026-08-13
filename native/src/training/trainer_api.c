@@ -45,6 +45,7 @@ struct VxTrainer {
     uint64_t optimizer_step;
     uint64_t baseline_optimizer_step;
     char* baseline_optimizer_path;
+    char* accumulation_shape_signature;
     int working_dirty;
     uint32_t accumulated_microbatches;
 };
@@ -59,13 +60,17 @@ static char* trainer_string_copy(const char* value) {
     return copy;
 }
 
+static int trainer_report_argument_valid(const VxReport* report) {
+    return !report || report->struct_size == sizeof(*report);
+}
+
 static void trainer_report(VxTrainer* trainer,
                            VxReport* report,
                            VxStatus status,
                            VxStage stage,
                            const char* reason,
                            const char* message) {
-    if (!report || report->struct_size < sizeof(*report)) return;
+    if (!report || report->struct_size != sizeof(*report)) return;
     if (trainer && trainer->model) {
         (void)vx_model_revision_info(trainer->model,
                                      &(VxRevisionInfo)VX_REVISION_INFO_INIT,
@@ -120,6 +125,17 @@ static uint32_t trainer_rng_stream_key(uint64_t seed) {
     value *= UINT64_C(0x94d049bb133111eb);
     value ^= value >> 31u;
     return (uint32_t)(value ^ (value >> 32u));
+}
+
+static uint32_t trainer_shape_stream_key(const char* signature) {
+    uint32_t value = UINT32_C(2166136261);
+    if (!signature) return 0u;
+    for (const unsigned char* cursor = (const unsigned char*)signature;
+         *cursor; cursor++) {
+        value ^= *cursor;
+        value *= UINT32_C(16777619);
+    }
+    return value;
 }
 
 static int trainer_temp_path(char** out_path) {
@@ -213,6 +229,8 @@ static VxStatus trainer_restore_baseline_locked(VxTrainer* trainer,
     trainer->optimizer_step = trainer->baseline_optimizer_step;
     trainer->working_dirty = 0;
     trainer->accumulated_microbatches = 0;
+    free(trainer->accumulation_shape_signature);
+    trainer->accumulation_shape_signature = NULL;
     trainer->poisoned = 0;
     return VX_STATUS_OK;
 }
@@ -293,8 +311,10 @@ VxStatus vx_model_create_trainer(VxModel* model,
     VxTrainer* trainer;
     VxStatus status;
     const char* backend_name;
+    if (!trainer_report_argument_valid(report))
+        return VX_STATUS_INVALID_ARGUMENT;
     if (!model || !out_trainer ||
-        (options && options->struct_size < sizeof(*options))) {
+        (options && options->struct_size != sizeof(*options))) {
         trainer_report(NULL, report, VX_STATUS_INVALID_ARGUMENT,
                        VX_STAGE_TRAINER_CREATE, "INVALID_TRAINER_OPTIONS",
                        "model, options, or trainer output is invalid");
@@ -390,6 +410,9 @@ VxStatus vx_trainer_close(VxTrainer* trainer, VxReport* report) {
     VxEngineState* engine;
     VxWeightRevisionRecord* base;
     char* optimizer_path;
+    char* accumulation_shape_signature;
+    if (!trainer_report_argument_valid(report))
+        return VX_STATUS_INVALID_ARGUMENT;
     if (!trainer) {
         trainer_report(NULL, report, VX_STATUS_INVALID_ARGUMENT,
                        VX_STAGE_CLOSE, "INVALID_TRAINER", "trainer is NULL");
@@ -406,13 +429,16 @@ VxStatus vx_trainer_close(VxTrainer* trainer, VxReport* report) {
     engine = trainer->engine;
     base = trainer->base_revision;
     optimizer_path = trainer->baseline_optimizer_path;
+    accumulation_shape_signature = trainer->accumulation_shape_signature;
     trainer->engine = NULL;
     trainer->base_revision = NULL;
     trainer->baseline_optimizer_path = NULL;
+    trainer->accumulation_shape_signature = NULL;
     pthread_mutex_unlock(&trainer->mutex);
     vx_model_internal_destroy_authoring_engine(engine);
     vx_model_internal_release_weight_revision(base);
     trainer_owned_path_release(optimizer_path);
+    free(accumulation_shape_signature);
     trainer_report(trainer, report, VX_STATUS_OK, VX_STAGE_CLOSE, "OK",
                    "trainer closed and private training state released");
     return VX_STATUS_OK;
@@ -430,70 +456,32 @@ void vx_trainer_release(VxTrainer* trainer) {
 
 size_t vx_trainer_input_count(VxTrainer* trainer) {
     size_t count = 0;
-    VxEngineStateScope scope;
     if (!trainer) return 0;
     pthread_mutex_lock(&trainer->mutex);
-    if (!trainer->closed && trainer->engine) {
-        scope = vx_engine_state_scope_enter(trainer->engine);
-        {
-            int value = volvoxai_engine_graph_input_count();
-            if (value > 0) count = (size_t)value;
-        }
-        vx_engine_state_scope_leave(scope);
-    }
+    if (!trainer->closed && trainer->model)
+        count = vx_model_internal_input_count(trainer->model);
     pthread_mutex_unlock(&trainer->mutex);
     return count;
 }
 
-VxStatus vx_trainer_input_info(VxTrainer* trainer,
+VxStatus vx_trainer_input_spec(VxTrainer* trainer,
                                size_t index,
-                               VxTensorInfo* info,
+                               VxTensorSpec* spec,
                                VxReport* report) {
-    VxEngineStateScope scope;
     VxStatus status = VX_STATUS_NOT_FOUND;
-    if (!trainer || !info || info->struct_size < sizeof(*info)) {
+    if (!trainer_report_argument_valid(report))
+        return VX_STATUS_INVALID_ARGUMENT;
+    if (!trainer || !spec || spec->struct_size != sizeof(*spec)) {
         trainer_report(trainer, report, VX_STATUS_INVALID_ARGUMENT,
                        VX_STAGE_TRAINER_INPUT, "INVALID_INPUT_QUERY",
-                       "trainer or tensor info buffer is invalid");
+                       "trainer or tensor spec buffer is invalid");
         return VX_STATUS_INVALID_ARGUMENT;
     }
     pthread_mutex_lock(&trainer->mutex);
     if (trainer->closed) {
         status = VX_STATUS_HANDLE_DISPOSED;
-    } else if (trainer->engine) {
-        int count;
-        scope = vx_engine_state_scope_enter(trainer->engine);
-        count = volvoxai_engine_graph_input_count();
-        if (index < (size_t)(count > 0 ? count : 0)) {
-            const char* name = volvoxai_engine_graph_input_name((int)index);
-            long numel = 0;
-            int shape[VX_MAX_TENSOR_RANK] = {0};
-            int rank = 0;
-            int dtype = -1;
-            size_t element_size = 0;
-            if (name && volvoxai_engine_tensor_info_ex(
-                    name, &numel, shape, &rank, &dtype, &element_size) == 0 &&
-                numel >= 0 && rank >= 0 && rank <= (int)VX_MAX_TENSOR_RANK &&
-                element_size > 0 &&
-                (size_t)numel <= SIZE_MAX / element_size) {
-                size_t struct_size = info->struct_size;
-                memset(info, 0, sizeof(*info));
-                info->struct_size = struct_size;
-                info->name = name;
-                info->dtype = (VxDataType)dtype;
-                info->rank = (uint32_t)rank;
-                for (int axis = 0; axis < rank; axis++)
-                    info->shape[axis] = shape[axis];
-                info->byte_size = (size_t)numel * element_size;
-                info->location = VX_MEMORY_HOST;
-                status = VX_STATUS_OK;
-            } else {
-                status = VX_STATUS_INTERNAL;
-            }
-        }
-        vx_engine_state_scope_leave(scope);
     } else {
-        status = VX_STATUS_INTERNAL;
+        status = vx_model_internal_input_spec(trainer->model, index, spec);
     }
     pthread_mutex_unlock(&trainer->mutex);
     trainer_report(trainer, report, status, VX_STAGE_TRAINER_INPUT,
@@ -501,55 +489,17 @@ VxStatus vx_trainer_input_info(VxTrainer* trainer,
                    status == VX_STATUS_HANDLE_DISPOSED ? "HANDLE_DISPOSED" :
                    status == VX_STATUS_NOT_FOUND ? "INPUT_NOT_FOUND" :
                    "INPUT_QUERY_FAILED",
-                   status == VX_STATUS_OK ? "trainer input metadata returned" :
-                   "trainer input metadata is unavailable");
-    return status;
-}
-
-VxStatus vx_trainer_set_input(VxTrainer* trainer,
-                              const char* name,
-                              VxDataType dtype,
-                              const void* data,
-                              size_t byte_size,
-                              VxReport* report) {
-    VxEngineStateScope scope;
-    VxStatus status;
-    if (!trainer || !name || !name[0] || (!data && byte_size) ||
-        (dtype != VX_DTYPE_F32 && dtype != VX_DTYPE_I8 &&
-         dtype != VX_DTYPE_U8 && dtype != VX_DTYPE_I32)) {
-        trainer_report(trainer, report, VX_STATUS_INVALID_ARGUMENT,
-                       VX_STAGE_TRAINER_INPUT, "INVALID_INPUT",
-                       "typed trainer input binding is invalid");
-        return VX_STATUS_INVALID_ARGUMENT;
-    }
-    pthread_mutex_lock(&trainer->mutex);
-    if (trainer->closed) {
-        status = VX_STATUS_HANDLE_DISPOSED;
-    } else if (trainer->poisoned || !trainer->engine) {
-        status = VX_STATUS_INTERNAL;
-    } else {
-        scope = vx_engine_state_scope_enter(trainer->engine);
-        status = volvoxai_engine_set_input_raw(
-            name, (int)dtype, data, byte_size) == 0
-            ? VX_STATUS_OK : VX_STATUS_INVALID_ARGUMENT;
-        vx_engine_state_scope_leave(scope);
-    }
-    pthread_mutex_unlock(&trainer->mutex);
-    trainer_report(trainer, report, status, VX_STAGE_TRAINER_INPUT,
-                   status == VX_STATUS_OK ? "OK" :
-                   status == VX_STATUS_HANDLE_DISPOSED ? "HANDLE_DISPOSED" :
-                   status == VX_STATUS_INTERNAL ? "TRAINER_POISONED" :
-                   "INPUT_MISMATCH",
-                   status == VX_STATUS_OK ? "trainer input copied" :
-                   "trainer input was not accepted");
+                   status == VX_STATUS_OK ? "logical trainer input spec returned" :
+                   "logical trainer input spec is unavailable");
     return status;
 }
 
 static int trainer_step_options_valid(const VxTrainStepOptions* options,
                                       const VxTrainStepResult* result) {
-    if (!options || options->struct_size < sizeof(*options) ||
-        !result || result->struct_size < sizeof(*result) ||
-        options->optimizer.struct_size < sizeof(options->optimizer) ||
+    if (!options || options->struct_size != sizeof(*options) ||
+        !result || result->struct_size != sizeof(*result) ||
+        options->optimizer.struct_size != sizeof(options->optimizer) ||
+        !options->inputs || !options->input_count ||
         !options->losses || !options->loss_count ||
         options->loss_count > VX_MAX_TRAINING_LOSSES ||
         options->loss_count > (size_t)INT_MAX ||
@@ -580,7 +530,7 @@ static int trainer_step_options_valid(const VxTrainStepOptions* options,
         return 0;
     for (size_t index = 0; index < options->loss_count; index++) {
         const VxCrossEntropyLoss* loss = &options->losses[index];
-        if (loss->struct_size < sizeof(*loss) || !loss->name || !loss->name[0] ||
+        if (loss->struct_size != sizeof(*loss) || !loss->name || !loss->name[0] ||
             strlen(loss->name) >= VX_TRAINING_NAME_CAPACITY ||
             !loss->logits_name || !loss->logits_name[0] ||
             !loss->targets || !loss->target_count ||
@@ -615,6 +565,9 @@ VxStatus vx_trainer_train_step(VxTrainer* trainer,
     int update_applied = 0;
     int update_mode;
     int core_status;
+    char* shape_signature = NULL;
+    if (!trainer_report_argument_valid(report))
+        return VX_STATUS_INVALID_ARGUMENT;
     if (!trainer || !trainer_step_options_valid(options, result)) {
         trainer_report(trainer, report, VX_STATUS_INVALID_ARGUMENT,
                        VX_STAGE_TRAINER_STEP, "INVALID_TRAIN_STEP",
@@ -650,6 +603,15 @@ VxStatus vx_trainer_train_step(VxTrainer* trainer,
         status = VX_STATUS_INTERNAL;
         goto done;
     }
+    status = vx_model_internal_bind_authoring_inputs(
+        trainer->model, trainer->engine, trainer->backend,
+        options->inputs, options->input_count,
+        trainer->accumulated_microbatches && !options->reset_accumulation
+            ? trainer->accumulation_shape_signature : NULL,
+        &shape_signature, report);
+    if (status != VX_STATUS_OK) goto done;
+    trainer->engine->native_training_shape_hash =
+        trainer_shape_stream_key(shape_signature);
     scope = vx_engine_state_scope_enter(trainer->engine);
     core_status = volvoxai_engine_train_step_multi(
         losses, (int)options->loss_count,
@@ -674,6 +636,12 @@ VxStatus vx_trainer_train_step(VxTrainer* trainer,
     trainer->accumulated_microbatches =
         trainer->engine->training_accumulation.active
             ? (uint32_t)trainer->engine->training_accumulation.microbatches : 0u;
+    free(trainer->accumulation_shape_signature);
+    trainer->accumulation_shape_signature = NULL;
+    if (trainer->accumulated_microbatches) {
+        trainer->accumulation_shape_signature = shape_signature;
+        shape_signature = NULL;
+    }
     if (update_applied) {
         trainer->optimizer_step++;
         trainer->working_dirty = 1;
@@ -700,6 +668,7 @@ VxStatus vx_trainer_train_step(VxTrainer* trainer,
     status = VX_STATUS_OK;
 
 done:
+    free(shape_signature);
     pthread_mutex_unlock(&trainer->mutex);
     trainer_report(trainer, report, status, VX_STAGE_TRAINER_STEP,
                    status == VX_STATUS_OK ? "OK" :
@@ -722,7 +691,10 @@ VxStatus vx_trainer_commit(VxTrainer* trainer,
     size_t weight_path_count = 0;
     char* optimizer_path = NULL;
     VxStatus status;
-    if (!trainer || (published && published->struct_size < sizeof(*published))) {
+    if (!trainer_report_argument_valid(report))
+        return VX_STATUS_INVALID_ARGUMENT;
+    if (!trainer ||
+        (published && published->struct_size != sizeof(*published))) {
         trainer_report(trainer, report, VX_STATUS_INVALID_ARGUMENT,
                        VX_STAGE_TRAINER_COMMIT, "INVALID_COMMIT",
                        "trainer or revision output is invalid");
@@ -811,6 +783,8 @@ done:
 
 VxStatus vx_trainer_rollback(VxTrainer* trainer, VxReport* report) {
     VxStatus status;
+    if (!trainer_report_argument_valid(report))
+        return VX_STATUS_INVALID_ARGUMENT;
     if (!trainer) {
         trainer_report(NULL, report, VX_STATUS_INVALID_ARGUMENT,
                        VX_STAGE_TRAINER_ROLLBACK, "INVALID_TRAINER",
@@ -840,6 +814,8 @@ VxStatus vx_trainer_export_weights(VxTrainer* trainer,
                                    VxReport* report) {
     VxEngineStateScope scope;
     VxStatus status = VX_STATUS_OK;
+    if (!trainer_report_argument_valid(report))
+        return VX_STATUS_INVALID_ARGUMENT;
     if (!trainer || !output_paths || !output_path_count) {
         trainer_report(trainer, report, VX_STATUS_INVALID_ARGUMENT,
                        VX_STAGE_TRAINER_EXPORT, "INVALID_EXPORT",

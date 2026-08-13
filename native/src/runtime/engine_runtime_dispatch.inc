@@ -12,13 +12,18 @@ static int linear_node_weight_layout(Node* node, const T* input, const T* output
     const char* layout = p_str(node->params, "weight_layout", "");
     int transposed = -1;
     if (layout[0]) {
-        if (!strcmp(layout, "OUT_IN") || !strcmp(layout, "out_in") || !strcmp(layout, "OI") || !strcmp(layout, "peft")) transposed = 1;
-        else if (!strcmp(layout, "IN_OUT") || !strcmp(layout, "in_out") || !strcmp(layout, "IO") || !strcmp(layout, "din_dout")) transposed = 0;
+        if (!strcmp(layout, "dout_din")) transposed = 1;
+        else if (!strcmp(layout, "din_dout")) transposed = 0;
         else return -1;
     }
     if (transposed < 0 && p_int(node->params, "transB", 0)) transposed = 1;
     int canonical = weight->shape[0] == d_in && weight->shape[1] == d_out;
     int out_in_shape = weight->shape[0] == d_out && weight->shape[1] == d_in;
+    /* Shape only disambiguates the two layouts when it is not square; a square
+     * weight satisfies both readings. Falling through to `canonical` makes
+     * din_dout the default there, which the browser tier matches exactly so
+     * the same graph cannot mean different things on different tiers.
+     * Exported packages and ModelBuilder always state the layout outright. */
     if (transposed < 0) transposed = out_in_shape && !canonical ? 1 : canonical ? 0 : -1;
     if (transposed < 0 || (!transposed && !canonical) || (transposed && !out_in_shape)) return -1;
     *out_in = transposed;
@@ -134,7 +139,9 @@ static int moe_linear_forward(Node* n, T* out, int use_cuda) {
     if (out->numel != tokens * d_out || tokens <= 0 || indices->numel != weights->numel ||
         indices->numel % tokens) return -1;
     int top_k = (int)(indices->numel / tokens);
-    if (top_k <= 0 || top_k > num_experts || tokens > INT_MAX ||
+    if (top_k <= 0 ||
+        (n->resident_slot_rows ? top_k > (int)n->resident_slot_domain
+                               : top_k > num_experts) || tokens > INT_MAX ||
         indices->numel > UINT32_MAX ||
         (size_t)indices->numel > SIZE_MAX / sizeof(float) ||
         ew->numel != (long)num_experts * d_in * d_out) return -1;
@@ -144,7 +151,8 @@ static int moe_linear_forward(Node* n, T* out, int use_cuda) {
             !cuda_graph_moe_linear_f32(
                 in->data, ew->data, eb ? eb->data : NULL, indices->data,
                 weights->data, out->data, (int)tokens, d_in, d_out,
-                num_experts, top_k))
+                num_experts, top_k, n->resident_slot_rows,
+                n->resident_slot_domain))
             return -1;
         return 0;
     }
@@ -155,20 +163,24 @@ static int moe_linear_forward(Node* n, T* out, int use_cuda) {
         (float*)malloc((size_t)indices->numel * sizeof(float));
     if (!kernel_indices) return -1;
     if (indices->dtype == T_I32) {
+        const int route_domain = n->resident_slot_rows
+            ? (int)n->resident_slot_domain
+            : num_experts;
         for (long index = 0; index < indices->numel; index++) {
             int expert;
             if (route_index_read(indices, index, &expert) != 0 || expert < 0 ||
-                expert >= num_experts) {
+                expert >= route_domain) {
                 free(kernel_indices);
                 return -1;
             }
             kernel_indices[index] = (float)expert;
         }
     }
-    int ok = moe_linear_f32(
+    int ok = vx_moe_linear_banked_f32(
         in->data, ew->data, eb ? eb->data : NULL, kernel_indices,
         weights->data, out->data, (uint32_t)tokens, (uint32_t)d_in,
-        (uint32_t)d_out, (uint32_t)num_experts, (uint32_t)top_k);
+        (uint32_t)d_out, (uint32_t)num_experts, (uint32_t)top_k,
+        n->resident_slot_rows, n->resident_slot_domain);
     if (kernel_indices != indices->data) free(kernel_indices);
     return ok ? 0 : -1;
 }
@@ -398,7 +410,7 @@ static const VxDeviceRoute g_vx_cuda_route = {
     .w8a8_ops = vx_w8a8_cuda_ops,
     .try_graph_node = try_cuda_graph_node,
     .qlinear_label = "cuda-qlinear-w8a8",
-    .qbatch_matmul_label = "cuda-qbatch-matmul-w8a8",
+    .qbatch_matmul_label = "cuda-qbatch-matmul-dp4a-w8a8",
     .qembedding_label = "cuda-qembedding-w8a8",
     .qconv_label = "cuda-qconv-w8a8",
     .qadd_label = "cuda-qadd-w8a8",
@@ -505,6 +517,7 @@ static int vx_cuda_graph_run(void* user_data, const Node* node, T* input, T* out
 
 typedef struct {
     const char* weight_name;
+    const char* bias_name;
     const float* input;
     const float* weight;
     const float* bias;
@@ -592,6 +605,7 @@ static int vx_prepare_one_shot_linear(const Node* node, T* input, T* output,
     cost = (long)row_count * d_in * d_out;
     if (minimum_cost > 0 && cost < minimum_cost) return 0;
     call->weight_name = weight->name;
+    call->bias_name = bias ? bias->name : NULL;
     call->input = input->data + (long)row_start * d_in;
     call->weight = prepared_weight->data;
     call->bias = prepared_bias ? prepared_bias->data : NULL;
@@ -617,10 +631,14 @@ static int vx_nnapi_linear_run(void* user_data, const Node* node, T* input, T* o
     if (vk_sync_node_inputs((Node*)node) != 0) return VX_BACKEND_ERROR;
     if (!vx_prepare_one_shot_linear(node, input, output, &call,
                                     1L << 20, 0, 0) ||
-        call.out_in)
+        call.out_in ||
+        !volvoxai_engine_tensor_is_model_weight_locked(call.weight_name) ||
+        (call.bias_name &&
+         !volvoxai_engine_tensor_is_model_weight_locked(call.bias_name)))
         return VX_BACKEND_DECLINED;
-    nnapi_matmul(call.input, call.weight, call.bias, call.output,
-                 call.rows, call.d_in, call.d_out);
+    if (!nnapi_matmul(call.input, call.weight, call.bias, call.output,
+                      call.rows, call.d_in, call.d_out))
+        return VX_BACKEND_ERROR;
     if (g_vx_runtime_node.node_backend) *g_vx_runtime_node.node_backend = "nnapi";
     return VX_BACKEND_HANDLED;
 }
@@ -984,6 +1002,7 @@ int vx_runtime_backend_cuda_replay_eligible(void) {
     return 0;
 #else
     if (!g_use_cuda || g_debug || g_nn <= 0 ||
+        vx_engine_state_current()->dynamic_shape_maximum_layout.configured ||
         !vx_runtime_full_graph_execution_eligible() ||
         volvoxai_engine_adapter_effect_active_locked()) return 0;
 #if VOLVOXAI_ENABLE_VULKAN
@@ -1024,6 +1043,101 @@ void vx_runtime_backend_reset_transients(void) {
     }
 #endif
     vx_runtime_backend_reset();
+}
+int vx_runtime_backend_bind_shape(const char* signature) {
+    int result = 0;
+    if (!signature || !signature[0]) return -1;
+#if VOLVOXAI_ENABLE_VULKAN
+    if (g_use_vulkan) result = vk_graph_bind_shape(signature);
+    else
+#endif
+#if VOLVOXAI_ENABLE_OPENGL
+    if (g_use_opengl) result = opengl_graph_bind_shape(signature);
+    else
+#endif
+#if VOLVOXAI_ENABLE_METAL
+    if (g_use_metal) result = metal_graph_bind_shape(signature);
+    else
+#endif
+#if VOLVOXAI_ENABLE_CUDA
+    if (g_use_cuda) result = cuda_graph_bind_shape(signature);
+    else
+#endif
+    result = 0;
+    if (result == 0) release_retired_f16_storage();
+    return result;
+}
+int vx_runtime_backend_bind_shape_domain(
+        const char* signature,
+        const VolvoxAIEnginePhysicalSpan* spans,
+        size_t span_count,
+        size_t qgroupnorm_stats_bytes,
+        size_t qlayernorm_stats_bytes) {
+    int result = 0;
+    if (!signature || !signature[0] || (span_count && !spans)) return -1;
+#if VOLVOXAI_ENABLE_VULKAN
+    if (g_use_vulkan)
+        result = vk_graph_bind_shape_domain(
+            signature, spans, span_count, qgroupnorm_stats_bytes,
+            qlayernorm_stats_bytes);
+    else
+#endif
+#if VOLVOXAI_ENABLE_OPENGL
+    if (g_use_opengl)
+        result = opengl_graph_bind_shape_domain(
+            signature, spans, span_count, qgroupnorm_stats_bytes,
+            qlayernorm_stats_bytes);
+    else
+#endif
+#if VOLVOXAI_ENABLE_METAL
+    if (g_use_metal)
+        result = metal_graph_bind_shape_domain(
+            signature, spans, span_count, qgroupnorm_stats_bytes,
+            qlayernorm_stats_bytes);
+    else
+#endif
+#if VOLVOXAI_ENABLE_CUDA
+    if (g_use_cuda)
+        result = cuda_graph_bind_shape_domain(signature, spans, span_count);
+    else
+#endif
+    result = vx_runtime_backend_bind_shape(signature);
+    (void)qgroupnorm_stats_bytes;
+    (void)qlayernorm_stats_bytes;
+    if (result == 0) release_retired_f16_storage();
+    return result;
+}
+int vx_runtime_backend_append_dynamic_telemetry(char* output,
+                                                size_t output_capacity) {
+    if (!output || !output_capacity) return -1;
+    output[0] = '\0';
+#if VOLVOXAI_ENABLE_NNAPI
+    if (g_use_nnapi) {
+        NnapiCacheTelemetry telemetry;
+        if (nnapi_cache_telemetry(&telemetry) != 0) return -1;
+        (void)snprintf(
+            output, output_capacity,
+            ";nnapi_cache=%llu/%llu;nnapi_hit_rate=%.6f;nnapi_builds=%llu;"
+            "nnapi_evictions=%llu;nnapi_build_ms=%.3f",
+            (unsigned long long)telemetry.cache_hits,
+            (unsigned long long)telemetry.cache_misses,
+            telemetry.cache_hit_rate,
+            (unsigned long long)telemetry.model_builds,
+            (unsigned long long)telemetry.evictions,
+            telemetry.last_model_build_time_ms);
+    }
+#endif
+#if VOLVOXAI_ENABLE_CUDA
+    if (g_use_cuda)
+        return cuda_graph_append_dynamic_telemetry(
+            output, output_capacity);
+#endif
+#if VOLVOXAI_ENABLE_VULKAN
+    if (g_use_vulkan)
+        return vk_graph_append_dynamic_telemetry(
+            output, output_capacity);
+#endif
+    return 0;
 }
 void vx_runtime_backend_teardown(void) {
     vx_backend_registry_teardown(&g_vx_backend_registry);
@@ -1068,6 +1182,62 @@ int vx_runtime_backend_sync_host(const void* host, size_t bytes, int is_weight) 
     return vx_runtime_backend_registry_ensure() == 0
         ? vx_backend_registry_sync_host(&g_vx_backend_registry, host, bytes, is_weight) : -1;
 }
+void vx_runtime_backend_retain_weight(const void* host, size_t bytes) {
+#if VOLVOXAI_ENABLE_VULKAN
+    if (g_use_vulkan) {
+        vk_graph_retain_weight(host, bytes);
+        return;
+    }
+#endif
+#if VOLVOXAI_ENABLE_OPENGL
+    if (g_use_opengl) {
+        opengl_graph_retain_weight(host, bytes);
+        return;
+    }
+#endif
+#if VOLVOXAI_ENABLE_METAL
+    if (g_use_metal) {
+        metal_graph_retain_weight(host, bytes);
+        return;
+    }
+#endif
+#if VOLVOXAI_ENABLE_CUDA
+    if (g_use_cuda) {
+        cuda_graph_retain_weight(host, bytes);
+        return;
+    }
+#endif
+    (void)host;
+    (void)bytes;
+}
+void vx_runtime_backend_demote_weight(const void* host, size_t bytes) {
+#if VOLVOXAI_ENABLE_VULKAN
+    if (g_use_vulkan) {
+        vk_graph_demote_weight(host, bytes);
+        return;
+    }
+#endif
+#if VOLVOXAI_ENABLE_OPENGL
+    if (g_use_opengl) {
+        opengl_graph_demote_weight(host, bytes);
+        return;
+    }
+#endif
+#if VOLVOXAI_ENABLE_METAL
+    if (g_use_metal) {
+        metal_graph_demote_weight(host, bytes);
+        return;
+    }
+#endif
+#if VOLVOXAI_ENABLE_CUDA
+    if (g_use_cuda) {
+        cuda_graph_demote_weight(host, bytes);
+        return;
+    }
+#endif
+    (void)host;
+    (void)bytes;
+}
 int vx_runtime_backend_has_graph(void) {
     return
 #if VOLVOXAI_ENABLE_VULKAN
@@ -1085,9 +1255,67 @@ int vx_runtime_backend_has_graph(void) {
         0;
 }
 
-static int vx_incremental_row_tensor_3d(const T* tensor, int row) {
-    return tensor && tensor->ndim == 3 && tensor->shape[0] == 1 &&
-        tensor->shape[1] > row && tensor->shape[2] > 0;
+/*
+ * Row addressability, stated once.
+ *
+ * A decoder activation carries one token per row, but the optimizer spells the
+ * same token stream as [B,T,D], [T,B,D], [T,D] or [1,T,B,D] depending on which
+ * block produced it. With B == 1 those are one contiguous buffer: leading unit
+ * axes cost nothing, the first non-unit axis is the token axis, and token `r`
+ * is the contiguous run of `width` elements at offset `r * width`.
+ *
+ * Accepting only the [1,T,D] spelling rejected most of an otherwise row-safe
+ * decoder for a difference that does not exist in memory, which is what forced
+ * every step onto whole-tensor execution.
+ */
+/*
+ * A permutation only relabels axes when the non-unit axes keep their relative
+ * order. The contiguous flattening is then identical, so the output buffer
+ * equals the input buffer and one row is one memcpy. Axis indices are compared
+ * rather than extents, so two axes of equal size cannot be mistaken for each
+ * other.
+ */
+static int vx_incremental_permutation_preserves_layout(const T* input,
+                                                       const int* perm) {
+    int source_order[8];
+    int permuted_order[8];
+    int sources = 0;
+    int permuted = 0;
+    if (!input || !perm || input->ndim <= 0 || input->ndim > 8) return 0;
+    for (int axis = 0; axis < input->ndim; axis++)
+        if (input->shape[axis] != 1) source_order[sources++] = axis;
+    for (int axis = 0; axis < input->ndim; axis++) {
+        int source = perm[axis];
+        if (source < 0 || source >= input->ndim) return 0;
+        if (input->shape[source] != 1) permuted_order[permuted++] = source;
+    }
+    if (sources != permuted) return 0;
+    for (int index = 0; index < sources; index++)
+        if (source_order[index] != permuted_order[index]) return 0;
+    return 1;
+}
+
+/* Resolve a Transpose node's permutation, defaulting to a full reversal. */
+static int vx_incremental_transpose_permutation(Node* node, const T* input,
+                                                int* perm) {
+    if (!node || !input || !perm || input->ndim <= 0 || input->ndim > 8) return 0;
+    for (int axis = 0; axis < input->ndim; axis++) perm[axis] = input->ndim - 1 - axis;
+    if (node->params && cJSON_GetObjectItem(node->params, "perm"))
+        p_iarr(node->params, "perm", perm, input->ndim, 0);
+    return 1;
+}
+
+/* An elementwise operand is row-safe when it is the same token stream as the
+ * output or a broadcast scalar; anything else could make one output row depend
+ * on a token other than its own. */
+static int vx_incremental_row_operand_matches(const T* operand, const T* output) {
+    long operand_width = 0;
+    long output_width = 0;
+    if (!operand || !output) return 0;
+    if (operand->numel == 1) return 1;
+    return vx_incremental_row_extent(operand, &operand_width) ==
+               vx_incremental_row_extent(output, &output_width) &&
+        operand_width == output_width;
 }
 
 /* Compatibility is queried before the hybrid GPU-to-CPU ownership handoff,
@@ -1131,26 +1359,75 @@ static int vx_incremental_tensor_dirty_before_node(
  * already covered by that implementation. Keep this preflight beside the
  * strict validators it calls: accepting a new op here is an explicit cache
  * ownership decision, not a generic shape heuristic. */
+/* Whether a tensor avoids the one layout the W8A8 row kernels cannot narrow.
+ *
+ * They index the token axis as shape[1] above rank two, so a rank-three
+ * sequence-major [S,1,D] would have them stepping the wrong axis.  Rank two
+ * [S,D] is fine — test_incremental_static_qdq_token_rows runs it — and so is
+ * batch-major [1,S,...].  The float kernels ask vx_incremental_row_extent and
+ * handle every spelling, which is why this belongs to particular operators
+ * rather than to row execution. */
+static int vx_incremental_row_batch_major(const T* tensor) {
+    return tensor && tensor->ndim >= 2 &&
+        (tensor->ndim == 2 || tensor->shape[0] == 1);
+}
+
+/* The operators whose row kernels carry that restriction.
+ *
+ * Only QAdd, as it turns out.  The list started as every quantized operator,
+ * on the assumption that the restriction was a property of the W8A8 route; two
+ * tests said otherwise.  test_incremental_static_qdq_token_rows runs rank-two
+ * [S,D] through QuantizeLinear and DequantizeLinear, and
+ * test_incremental_sequence_major_static_qdq_rows runs rank-three [S,1,D]
+ * through both.  So the restriction belongs to one kernel, which is exactly
+ * the reason to state it per operator instead of inferring it from dtype or
+ * element width somewhere else. */
+static int vx_incremental_row_batch_major_op(const char* op) {
+    return op && !strcmp(op, "QAdd");
+}
+
 int vx_runtime_node_incremental_row_compatible(Node* node, int idx, int row) {
     T* output;
-    if (!node || row < 0 || node->skip || node->disabled) return 0;
+    if (!node || row < 0) return 0;
+    /* A fused or aliased node performs no work: `graph_opt_fusion` points its
+     * output at the producer's buffer and clears the node, and the dispatcher
+     * returns before executing it. Row execution therefore has nothing to do
+     * for it either, and treating "does nothing" as "cannot do rows" made a
+     * single elided Reshape refuse the whole decoder. */
+    if (node->skip || node->disabled) return 1;
     output = t_find(node->out);
     if (!output) return 0;
+
+    /* Said once, here, rather than inferred from element width inside the row
+     * planner's prefix arithmetic — where it silently refused every float
+     * decoder whose tensors are sequence-major. */
+    if (vx_incremental_row_batch_major_op(node->op) &&
+        !vx_incremental_row_batch_major(output)) return 0;
 
     if (native_qlinear_op(node->op)) {
         QLinearMetadata* meta;
         T* input;
         T* weight;
         T* bias;
+        long input_width = 0;
+        long output_width = 0;
+        int input_rows;
+        int output_rows;
         if (idx < 0 || idx >= MAXN) return 0;
         meta = &g_qlinear_meta[idx];
         input = qlinear_node_input(node);
         weight = nin(node, "weight");
         bias = nin(node, "bias");
-        if (!meta->valid || !vx_incremental_row_tensor_3d(input, row) ||
-            !vx_incremental_row_tensor_3d(output, row) ||
-            input->shape[1] != output->shape[1] ||
-            input->shape[2] != meta->d_in || output->shape[2] != meta->d_out ||
+        /* Through vx_incremental_row_extent rather than shape[1] and shape[2].
+         * Those indices assume rank three, so a sequence-major [T,D] read
+         * d_in from past the end of the shape and refused every row -- the
+         * fourth place the header's warning about restating the token axis per
+         * caller has now come true. Both spellings answer the same here. */
+        input_rows = vx_incremental_row_extent(input, &input_width);
+        output_rows = vx_incremental_row_extent(output, &output_width);
+        if (!meta->valid || input_rows <= row || output_rows <= row ||
+            input_rows != output_rows ||
+            input_width != (long)meta->d_in || output_width != (long)meta->d_out ||
             !weight || !bias || weight->ndim != 2 || bias->ndim != 1 ||
             input->dtype != meta->input_dtype || weight->dtype != meta->weight_dtype ||
             output->dtype != meta->output_dtype || bias->dtype != T_I32 ||
@@ -1161,9 +1438,26 @@ int vx_runtime_node_incremental_row_compatible(Node* node, int idx, int row) {
         return 1;
     }
 
+    /* The float twin of QEmbedding below, which was row-aware while this was
+     * not.  The kernel already narrows — it takes its rows from seq_range like
+     * every other node — so only this admission was missing, and it was the one
+     * node left refusing the plan once the QKV split stopped producing a Slice
+     * chain.  Row r of the output reads token r and nothing else, so the
+     * lookup is row-local by construction. */
+    if (!strcmp(node->op, "Embedding")) {
+        T* tokens = node_input_default(node);
+        T* weight = nin(node, "weight");
+        return tokens && weight && tokens->dtype == T_I32 &&
+            weight->dtype == T_F32 && tokens->ndim == 2 &&
+            tokens->shape[0] == 1 && tokens->shape[1] > row &&
+            vx_incremental_row_tensor_3d(output, row);
+    }
+
     if (!strcmp(node->op, "QEmbedding")) {
         QEmbeddingPhysicalDescriptor descriptor;
-        return qembedding_physical_validate(idx, node, output, &descriptor) == 0 &&
+        return qembedding_physical_validate(
+                   idx, node, output,
+                   !g_bounded_gpu_value_domain_proven, &descriptor) == 0 &&
             descriptor.tokens->ndim == 2 && descriptor.tokens->shape[0] == 1 &&
             descriptor.tokens->shape[1] > row &&
             vx_incremental_row_tensor_3d(output, row);
@@ -1208,6 +1502,31 @@ int vx_runtime_node_incremental_row_compatible(Node* node, int idx, int row) {
     }
 
     if (!strcmp(node->op, "Expand")) {
+        /*
+         * Two expansions besides the byte-path one below are row-local, and
+         * both appear in every decoder here.
+         *
+         * A uniform source has the same value at every position, so any row is
+         * valid.  A source that already has the output's token extent and
+         * trailing width is only being widened over leading unit axes — a
+         * singleton batch, typically — so row r still comes from row r.  The
+         * rule underneath covers the remaining case, broadcasting one token
+         * across the sequence, and it states rank three literally, which the
+         * sequence-major [S,D] spelling never satisfies.
+         */
+        T* source = node_input_default(node);
+        if (source && vx_incremental_row_tensor_3d(output, row)) {
+            long source_width = 0;
+            long output_width = 0;
+            const int source_rows =
+                vx_incremental_row_extent(source, &source_width);
+            const int output_rows =
+                vx_incremental_row_extent(output, &output_width);
+            if (source->numel == 1) return 1;
+            if (source_rows == output_rows && source_width == output_width &&
+                source->numel == output->numel) return 1;
+        }
+        {
         PhysicalByteExpandDescriptor descriptor;
         if (physical_shape_expand_validate(node, output, &descriptor) != 0 ||
             descriptor.input_rank != 3 || descriptor.output_rank != 3 ||
@@ -1218,6 +1537,168 @@ int vx_runtime_node_incremental_row_compatible(Node* node, int idx, int row) {
             descriptor.input_shape[2] != descriptor.output_shape[2] ||
             (g_cache_valid && vx_incremental_tensor_dirty_before_node(
                 descriptor.input, idx))) return 0;
+        return 1;
+        }
+    }
+
+    if (!strcmp(node->op, "Reshape") || !strcmp(node->op, "Flatten") ||
+        !strcmp(node->op, "Squeeze") || !strcmp(node->op, "Unsqueeze") ||
+        !strcmp(node->op, "Identity")) {
+        /* Pure metadata: the contiguous flattening is identical by definition,
+         * so token `row` occupies the same run in both buffers. */
+        T* input = node_input_default(node);
+        long input_width = 0;
+        long output_width = 0;
+        if (!input || input->dtype != output->dtype ||
+            input->numel != output->numel) return 0;
+        return vx_incremental_row_extent(input, &input_width) > row &&
+            vx_incremental_row_extent(output, &output_width) > row &&
+            input_width == output_width && input_width > 0;
+    }
+
+    if (!strcmp(node->op, "Transpose")) {
+        T* input = node_input_default(node);
+        int perm[8];
+        long input_width = 0;
+        long output_width = 0;
+        if (!input || input->dtype != output->dtype ||
+            input->numel != output->numel ||
+            !vx_incremental_transpose_permutation(node, input, perm) ||
+            !vx_incremental_permutation_preserves_layout(input, perm)) return 0;
+        return vx_incremental_row_extent(input, &input_width) > row &&
+            vx_incremental_row_extent(output, &output_width) > row &&
+            input_width == output_width && input_width > 0;
+    }
+
+    if (!strcmp(node->op, "Equal") || !strcmp(node->op, "GreaterOrEqual")) {
+        /* Elementwise I32 comparison over the token stream. Row-safe when both
+         * operands are either the same token stream or a broadcast scalar. */
+        T* a = nin(node, "a");
+        T* b = nin(node, "b");
+        if (!a || !b || a->dtype != T_I32 || b->dtype != T_I32 ||
+            output->dtype != T_I32 || !vx_incremental_row_tensor_3d(output, row))
+            return 0;
+        return vx_incremental_row_operand_matches(a, output) &&
+            vx_incremental_row_operand_matches(b, output);
+    }
+
+    /*
+     * The float twins of the quantized rules below.
+     *
+     * Row execution was built for the W8A8 route, so every case here was a
+     * Q-prefixed operator and the float route fell through to the closing
+     * `return 0`.  The kernels were already row-aware — Linear, LayerNorm,
+     * Embedding and the elementwise binaries all take their rows from
+     * seq_range — so the FP32 decoder was recomputing its whole prefix every
+     * step for want of an admission rule, not for want of a kernel.
+     *
+     * Each rule states the same thing: every operand and the output are
+     * sequence tensors long enough to hold this row, and the operator relates
+     * them elementwise along the token axis.
+     */
+    if (!strcmp(node->op, "Add") || !strcmp(node->op, "Mul") ||
+        !strcmp(node->op, "Sub") || !strcmp(node->op, "Div")) {
+        T* a = nin(node, "a");
+        T* b = nin(node, "b");
+        if (!a) a = nin(node, "input");
+        if (!a) a = nin(node, "x");
+        if (!b) b = nin(node, "y");
+        /* Only the unbroadcast form narrows; a broadcasting operand would make
+         * one row of the output depend on a different row of an input. */
+        return a && b && a->dtype == T_F32 && b->dtype == T_F32 &&
+            output->dtype == T_F32 &&
+            a->numel == output->numel && b->numel == output->numel &&
+            vx_incremental_row_tensor_3d(a, row) &&
+            vx_incremental_row_tensor_3d(b, row) &&
+            vx_incremental_row_tensor_3d(output, row);
+    }
+
+    if (!strcmp(node->op, "GELU") || !strcmp(node->op, "SiLU") ||
+        !strcmp(node->op, "ReLU") || !strcmp(node->op, "Sigmoid") ||
+        !strcmp(node->op, "Tanh")) {
+        T* input = node_input_default(node);
+        return input && input->dtype == T_F32 && output->dtype == T_F32 &&
+            input->numel == output->numel &&
+            vx_incremental_row_tensor_3d(input, row) &&
+            vx_incremental_row_tensor_3d(output, row);
+    }
+
+    if (!strcmp(node->op, "LayerNorm") || !strcmp(node->op, "RMSNorm")) {
+        T* input = node_input_default(node);
+        /* Normalization reduces over the feature axis only, so a row is
+         * self-contained; the token axis must be the one seq_range windows. */
+        return input && input->dtype == T_F32 && output->dtype == T_F32 &&
+            input->numel == output->numel && input->ndim == output->ndim &&
+            input->shape[input->ndim - 1] == output->shape[output->ndim - 1] &&
+            vx_incremental_row_tensor_3d(input, row) &&
+            vx_incremental_row_tensor_3d(output, row);
+    }
+
+    if (!strcmp(node->op, "Linear") || !strcmp(node->op, "Gemm")) {
+        T* input = nin(node, "input");
+        T* weight = nin(node, "weight");
+        return input && weight && input->dtype == T_F32 &&
+            weight->dtype == T_F32 && output->dtype == T_F32 &&
+            weight->ndim == 2 && input->ndim == output->ndim &&
+            vx_incremental_row_tensor_3d(input, row) &&
+            vx_incremental_row_tensor_3d(output, row);
+    }
+
+    if (!strcmp(node->op, "BatchMatMul")) {
+        T* a = nin(node, "a");
+        T* b = nin(node, "b");
+        long a_width = 0;
+        long output_width = 0;
+        /* Row r of the output reads row r of `a` against the whole of `b`, so
+         * this is row-local whenever `b` carries no per-token axis.  Note that
+         * batch_matmul_f32_forward does not itself narrow: admitting this node
+         * keeps the plan correct and still recomputes its own token range, so
+         * the two low-rank adapter nodes here stay O(T).  Making the kernel
+         * take the active row is the remaining win, not a correctness gap. */
+        if (!a || !b || a->dtype != T_F32 || b->dtype != T_F32 ||
+            output->dtype != T_F32) return 0;
+        if (b->ndim < 2 || (b->ndim == 3 && b->shape[0] != 1)) return 0;
+        if (vx_incremental_row_extent(a, &a_width) !=
+            vx_incremental_row_extent(output, &output_width)) return 0;
+        return vx_incremental_row_tensor_3d(a, row) &&
+            vx_incremental_row_tensor_3d(output, row);
+    }
+
+    if (!strcmp(node->op, "CrossSDPA")) {
+        T* q = nin(node, "q");
+        T* k = nin(node, "k");
+        T* v = nin(node, "v");
+        /* The kernel already slices to one query row; it declines and
+         * recomputes whenever the mask is query-dependent, which stays correct
+         * but costs the whole prefix.  Admit only what it will actually
+         * narrow, so a plan that proves out also runs as one row. */
+        const int batched = q && q->ndim == 3 && q->shape[0] != 1;
+        return q && k && v && !batched && q->dtype == T_F32 &&
+            k->dtype == T_F32 && v->dtype == T_F32 &&
+            output->dtype == T_F32 && (q->ndim == 2 || q->ndim == 3) &&
+            k->ndim == q->ndim && v->ndim == q->ndim &&
+            vx_incremental_row_tensor_3d(q, row) &&
+            vx_incremental_row_tensor_3d(output, row) &&
+            output->numel == q->numel;
+    }
+
+    /* Elementwise over every operand, so one output row reads one input row
+     * from each.  Where's condition and both branches are checked the same
+     * way; a broadcasting operand is refused rather than indexed. */
+    if (!strcmp(node->op, "Where") || !strcmp(node->op, "Clip")) {
+        int index;
+        if (!vx_incremental_row_tensor_3d(output, row)) return 0;
+        for (index = 0; index < node->nin; index++) {
+            T* operand = t_find(node->ins[index].name);
+            if (!operand) return 0;
+            /* A scalar or per-feature bound is uniform across tokens and stays
+             * valid for any row; anything else has to be a full-size operand. */
+            if (operand->numel == output->numel) {
+                if (!vx_incremental_row_tensor_3d(operand, row)) return 0;
+                continue;
+            }
+            if (operand->numel != 1) return 0;
+        }
         return 1;
     }
 
@@ -1253,15 +1734,23 @@ int vx_runtime_node_incremental_row_compatible(Node* node, int idx, int row) {
 
     if (!strcmp(node->op, "QLayerNorm")) {
         QLayerNormPhysicalDescriptor descriptor;
-        return qlayernorm_physical_validate(node, output, &descriptor) == 0 &&
+        return qlayernorm_physical_validate(
+                   node, output, !g_bounded_gpu_value_domain_proven,
+                   &descriptor) == 0 &&
             vx_incremental_row_tensor_3d(descriptor.input, row) &&
             vx_incremental_row_tensor_3d(output, row);
     }
 
     if (!strcmp(node->op, "QSDPA")) {
         QSDPAPhysicalDescriptor descriptor;
+        /* No ndim guard: qsdpa_physical_validate already accepts rank two and
+         * rank three and reports batch as 1 for the former, so restating "rank
+         * three" here only refused the sequence-major [T,D] spelling a split
+         * projection produces. CrossSDPA lost the same redundant guard; the
+         * quantized twin kept it, and a whole quantized decoder fell back to
+         * dependency mode at 53.3 ms a step against the float path's 2.25. */
         return qsdpa_physical_validate(node, output, &descriptor) == 0 &&
-            descriptor.batch == 1 && descriptor.q->ndim == 3 &&
+            descriptor.batch == 1 &&
             descriptor.seq_q > (uint32_t)row &&
             (!descriptor.causal || (uint32_t)row + 1u <= descriptor.seq_kv) &&
             vx_incremental_row_tensor_3d(output, row);
@@ -1586,7 +2075,8 @@ int run_node(Node* n, int idx, int is_last) {
             int packed_ran = 0;
             /* Only immutable model weights enter the persistent node cache.
              * Dynamic graph values retain the scalar reference path. */
-            if (volvoxai_engine_tensor_is_model_weight_locked(w->name)) {
+            if (vx_engine_state_current()->gemm_f32_packed_enabled &&
+                volvoxai_engine_tensor_is_model_weight_locked(w->name)) {
                 const float* packed_weight = vx_gemm_f32_pack_cache(
                     &vx_engine_state_current()->gemm_f32_cache,
                     idx, wp->data, (uint32_t)d_in, (uint32_t)d_out, out_in);
@@ -1641,7 +2131,10 @@ int run_node(Node* n, int idx, int is_last) {
         if (groupnorm_forward_f32(in, weight, bias, o, groups,
                                   p_flt(p, "eps", 1.0e-5f)) != 0) return -1;
     } else if (!strcmp(op, "MaxPool2D")) {
-        int ky, kx, sy, sx, py, px; p_pair(p, "kernel", 1, &ky, &kx); p_pair(p, "stride", 1, &sy, &sx); p_pair(p, "padding", 0, &py, &px);
+        int ky, kx, sy, sx, py, px;
+        p_pair(p, "kernel", 1, &ky, &kx);
+        p_pair(p, "stride", 1, &sy, &sx);
+        p_spatial_pad_origin(p, &py, &px);
         materialize_tensor_f32(in);
         maxpool2d_f32_image(in, o, ky, kx, sy, sx, py, px);
         node_backend = "cpu-maxpool";
@@ -1673,8 +2166,36 @@ int run_node(Node* n, int idx, int is_last) {
         materialize_tensor_f32(node_input_default(n));
         if (gather_f32_i32_forward(n) != 0) return -1;
     } else if (!strcmp(op, "Expand")) {
-        materialize_tensor_f32(node_input_default(n));
-        if (expand_plain_32_forward(n) != 0) return -1;
+        T* source = node_input_default(n);
+        long expand_width = 0;
+        materialize_tensor_f32(source);
+        /*
+         * Row execution admits two expansions, and both narrow to one row.
+         *
+         * Without this the generic broadcast rewrote the whole tensor each
+         * token: measured on the decoder here, eight Expand nodes cost 0.76 ms
+         * of a 2.9 ms step, a quarter of it, for eight rows of real work.  A
+         * uniform source fills the row; a source that already carries the
+         * output's token extent and width copies it.
+         */
+        if (g_active_row >= 0 && source && o && source->dtype == o->dtype &&
+            o->dtype == T_F32 &&
+            vx_incremental_row_extent(o, &expand_width) > g_active_row &&
+            expand_width > 0) {
+            const size_t offset = (size_t)g_active_row * (size_t)expand_width;
+            long source_width = 0;
+            if (source->numel == 1) {
+                float* out = o->data + offset;
+                const float value = source->data[0];
+                for (long lane = 0; lane < expand_width; lane++) out[lane] = value;
+            } else if (source->numel == o->numel &&
+                       vx_incremental_row_extent(source, &source_width) ==
+                           vx_incremental_row_extent(o, &expand_width) &&
+                       source_width == expand_width) {
+                memcpy(o->data + offset, source->data + offset,
+                       (size_t)expand_width * sizeof(float));
+            } else if (expand_plain_32_forward(n) != 0) return -1;
+        } else if (expand_plain_32_forward(n) != 0) return -1;
     } else if (!strcmp(op, "Slice")) {
         materialize_tensor_f32(node_input_default(n));
         if (slice_plain_32_forward(n) != 0) return -1;
@@ -1723,7 +2244,17 @@ int run_node(Node* n, int idx, int is_last) {
         for (int i = 0; i < in->ndim; i++) perm[i] = in->ndim - 1 - i;
         if (p && cJSON_GetObjectItem(p, "perm"))
             p_iarr(p, "perm", perm, in->ndim, 0);
-        if (transpose_tensor(in, o, perm) != 0) return -1;
+        long row_width = 0;
+        if (g_active_row >= 0 && in->dtype == o->dtype &&
+            in->numel == o->numel &&
+            vx_incremental_permutation_preserves_layout(in, perm) &&
+            vx_incremental_row_extent(in, &row_width) > g_active_row &&
+            row_width > 0) {
+            size_t offset = (size_t)g_active_row * (size_t)row_width;
+            memcpy((char*)o->data + offset * o->elem_size,
+                   (const char*)in->data + offset * in->elem_size,
+                   (size_t)row_width * in->elem_size);
+        } else if (transpose_tensor(in, o, perm) != 0) return -1;
     } else if (!strcmp(op, "Concat")) {
         materialize_node_inputs(n);
         int fused_sigmoid = idx >= 0 && idx < MAXN ? g_concat_sigmoid_fuse[idx] : -1;
@@ -1741,6 +2272,13 @@ int run_node(Node* n, int idx, int is_last) {
         }
     } else if (!strcmp(op, "Split")) {
         if (cpu_split(n, in) != 0) return -1;
+    } else if (!strcmp(op, "Resize")) {
+        int nearest = 0;
+        materialize_tensor_f32(in);
+        if (resize_f32_parameters(n, &nearest) != 0 ||
+            (nearest ? resize_nearest2d_image(in, o) :
+                       resize_bilinear2d_image(in, o)) != 0) return -1;
+        node_backend = nearest ? "cpu-resize-nearest" : "cpu-resize-linear";
     } else if (!strcmp(op, "ResizeNearest2D") || !strcmp(op, "UpsampleNearest2D")) {
         materialize_tensor_f32(in);
         if (resize_nearest2d_image(in, o) != 0) return -1;
@@ -1762,7 +2300,15 @@ int run_node(Node* n, int idx, int is_last) {
     } else if (!strcmp(op, "Reshape") || !strcmp(op, "Flatten") || !strcmp(op, "Squeeze")
             || !strcmp(op, "Unsqueeze") || !strcmp(op, "Identity")) {
         materialize_tensor_f32(in);
-        if (tensor_copy_plain_32(in, o) != 0) return -1;
+        long reshape_width = 0;
+        if (g_active_row >= 0 && in->dtype == o->dtype && in->numel == o->numel &&
+            vx_incremental_row_extent(in, &reshape_width) > g_active_row &&
+            reshape_width > 0) {
+            size_t offset = (size_t)g_active_row * (size_t)reshape_width;
+            memcpy((char*)o->data + offset * o->elem_size,
+                   (const char*)in->data + offset * in->elem_size,
+                   (size_t)reshape_width * in->elem_size);
+        } else if (tensor_copy_plain_32(in, o) != 0) return -1;
     } else if (!strcmp(op, "LayerNorm")) {
         T* w = nin(n, "weight"); T* b = nin(n, "bias");
         if (!in || !o || !w || in->ndim <= 0) return -1;
@@ -1938,7 +2484,12 @@ int run_node(Node* n, int idx, int is_last) {
 #endif
         {
             int row_ran = 0;
-            if (g_active_row >= 0 && q->ndim == 3 && batch == 1) {
+            /* Rank is not the question, batch is.  Every extent this kernel
+             * uses comes from the last two axes, so [S,D] is [1,S,D] with the
+             * batch already implied; requiring rank three made the sliced path
+             * unreachable for the sequence-major spelling the decoder actually
+             * carries, and it recomputed the whole prefix per token instead. */
+            if (g_active_row >= 0 && batch == 1) {
                 int row = g_active_row;
                 if (row >= seq_q) return -1;
                 /* A key-only mask remains valid when the query tensor is

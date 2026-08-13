@@ -25,7 +25,8 @@ Graph 루트에는 정확한 판별자가 있습니다:
 
 ~~~json
 {
-  "format": "volvox-graph/v1"
+  "format": "volvox-graph/v1",
+  "dimensions": {}
 }
 ~~~
 
@@ -134,28 +135,29 @@ VX_BACKEND_REQUIRE 는 backends 항목을 정확히 하나 요구합니다. VX_B
 ~~~c
 VxContextOptions context_options = VX_CONTEXT_OPTIONS_INIT;
 VxExecutionContext* context = NULL;
+VxTensorBinding input = VX_TENSOR_BINDING_INIT;
 
 status = vx_compiled_model_create_context(
     compiled, &context_options, &context, &report);
 
-if (status == VX_STATUS_OK) {
-    status = vx_execution_context_set_input(
-        context,
-        "input",
-        VX_DTYPE_F32,
-        input_values,
-        input_bytes,
-        &report);
-}
+input.name = "input";
+input.dtype = VX_DTYPE_F32;
+input.rank = 2;
+input.shape[0] = batch;
+input.shape[1] = sequence;
+input.data = input_values;
+input.byte_size = input_bytes;
+input.location = VX_MEMORY_HOST;
 
 VxResult* result = NULL;
 if (status == VX_STATUS_OK) {
-    status = vx_execution_context_execute(context, &result, &report);
+    status = vx_execution_context_execute(
+        context, &input, 1, &result, &report);
 }
 ~~~
 
-vx_execution_context_input_count 와 vx_execution_context_input_info 로 선언된 입력을 살핍니다.
-set_input 은 Graph 선언과 다른 이름, dtype, 바이트 수를 거부합니다.
+vx_execution_context_input_count 와 vx_execution_context_input_spec 으로 선언된 입력을 살핍니다.
+실행은 Graph 선언과 다른 바인딩 이름, dtype, shape, 바이트 수를 거부합니다.
 
 실행은 모든 선언 출력을 정확히 한 번 게시합니다. 변경 가능한 중간 텐서나 빌린 작업 공간 포인터는
 노출하지 않습니다.
@@ -207,16 +209,18 @@ VxBackendProvider provider = {
     .abi_version = VX_BACKEND_ABI_VERSION,
     .name = "my-npu",
     .user_data = &driver,
+    .shape_domain = VX_BACKEND_SHAPE_DOMAIN_CAPABILITY_INIT,
     .runtime_create = provider_runtime_create,
     .runtime_destroy = provider_runtime_destroy,
     .compile = provider_compile,
     .compiled_destroy = provider_compiled_destroy,
     .context_create = provider_context_create,
-    .context_set_input = provider_context_set_input,
     .context_execute = provider_context_execute,
     .context_close = provider_context_close,
     .context_destroy = provider_context_destroy,
 };
+
+provider.shape_domain.support = VX_BACKEND_SHAPE_DOMAIN_FULL;
 
 VxStatus registration =
     vx_runtime_register_provider(runtime, &provider, &report);

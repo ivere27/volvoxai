@@ -9,15 +9,16 @@ from tools.exporter.generated import kernel_registry
 def identity_graph() -> dict[str, object]:
     return {
         "format": "volvox-graph/v1",
+        "dimensions": {},
         "inputs": {"x": {"shape": [1, 4], "dtype": "float32"}},
         "outputs": ["y"],
         "nodes": [{
             "id": "identity",
             "opType": "Identity",
             "inputs": {"input": "x"},
-            "outputs": {"out": "y"},
-            "outputs_shape": {"out": [1, 4]},
-            "outputs_dtype": {"out": "float32"},
+            "outputs": {"out": {
+                "tensor": "y", "shape": [1, 4], "dtype": "float32",
+            }},
             "params": {},
         }],
     }
@@ -55,13 +56,25 @@ class GeneratedCapabilitySourceTests(unittest.TestCase):
                 else:
                     self.assertIn("VXCAP001", capability_codes)
 
-        for target in (
+        native_gpu_targets = (
             "backend:vulkan",
             "backend:opengl",
             "backend:metal",
             "backend:cuda",
-        ):
-            self.assertEqual(kernel_registry.OPS_BY_TARGET[target], frozenset())
+        )
+        expected = kernel_registry.OPS_BY_TARGET["backend:cuda"]
+        self.assertTrue(expected)
+        self.assertNotIn("Identity", expected)
+        for target in native_gpu_targets:
+            with self.subTest(native_gpu_target=target):
+                self.assertEqual(kernel_registry.OPS_BY_TARGET[target], expected)
+                result = capabilities.validate_graph(graph, [target])
+                capability_codes = {
+                    diagnostic.code
+                    for diagnostic in result.diagnostics
+                    if diagnostic.stage == "capability"
+                }
+                self.assertIn("VXCAP001", capability_codes)
 
 
 if __name__ == "__main__":

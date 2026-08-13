@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Export a GPT-Neo checkpoint as the TinyStories VolvoxAI example package.
 
-The exporter owns the family-specific checkpoint names, graph topology, fixed
-sequence length, and seed inputs. Generic ONNX/TFLite lowering remains in the
+The exporter owns the family-specific checkpoint names, graph topology, bounded
+sequence capacity, and seed inputs. Generic ONNX/TFLite lowering remains in the
 repository-level ``tools/export_safetensors.py``.
 """
 
@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import math
 from pathlib import Path
 from typing import Any, Mapping, MutableMapping, Sequence
 
@@ -20,7 +19,8 @@ from safetensors.torch import save_file
 from transformers import AutoModelForCausalLM
 
 
-SEQUENCE_LENGTH = 256
+MAX_SEQUENCE_LENGTH = 256
+SEQUENCE_SYMBOL = "S"
 DEFAULT_EOS_TOKEN_ID = 50256
 
 
@@ -64,24 +64,38 @@ def build_gptneo_graph(
 ) -> list[dict[str, Any]]:
     nodes: list[dict[str, Any]] = []
     d_model = config.hidden_size
-    hidden_shape = [1, SEQUENCE_LENGTH, d_model]
+    hidden_shape = [1, SEQUENCE_SYMBOL, d_model]
+    activation_function = getattr(config, "activation_function", None)
+    if activation_function == "gelu_new":
+        gelu_params = {"approximate": "tanh"}
+    elif activation_function == "gelu":
+        gelu_params = {"approximate": "none"}
+    else:
+        raise ValueError(
+            "TinyStories GPT-Neo export supports only activation_function "
+            f"'gelu_new' or 'gelu', got {activation_function!r}"
+        )
 
     def add_node(
         op: str,
         inputs: Mapping[str, str],
         output: str,
-        shape: Sequence[int],
+        shape: Sequence[int | str],
         params: Mapping[str, Any] | None = None,
     ) -> None:
         node: dict[str, Any] = {
+            "id": f"node_{len(nodes)}",
             "opType": op,
             "inputs": dict(inputs),
-            "outputs": {"out": output},
-            "outputs_shape": {"out": list(shape)},
-            "outputs_dtype": {"out": "float32"},
+            "outputs": {
+                "out": {
+                    "tensor": output,
+                    "shape": list(shape),
+                    "dtype": "float32",
+                }
+            },
+            "params": dict(params or {}),
         }
-        if params is not None:
-            node["params"] = dict(params)
         nodes.append(node)
 
     for name, tensor in state_dict.items():
@@ -125,8 +139,8 @@ def build_gptneo_graph(
                 "weight": f"{prefix}.attn.qkv_proj.weight",
             },
             f"qkv_{index}",
-            [1, SEQUENCE_LENGTH, d_model * 3],
-            {"weight_layout": "IN_OUT"},
+            [1, SEQUENCE_SYMBOL, d_model * 3],
+            {"weight_layout": "din_dout"},
         )
         add_node(
             "SDPA",
@@ -135,7 +149,10 @@ def build_gptneo_graph(
             hidden_shape,
             {
                 "heads": config.num_heads,
-                "scale": 1.0 / math.sqrt(d_model // config.num_heads),
+                # GPT-Neo's source attention computes QK^T without the usual
+                # inverse-square-root head scaling. Keep the explicit value so
+                # the runtime SDPA default cannot change checkpoint semantics.
+                "scale": 1.0,
                 "causal": True,
             },
         )
@@ -156,7 +173,7 @@ def build_gptneo_graph(
             },
             f"attn_proj_{index}",
             hidden_shape,
-            {"weight_layout": "IN_OUT"},
+            {"weight_layout": "din_dout"},
         )
         add_node(
             "Add",
@@ -182,7 +199,7 @@ def build_gptneo_graph(
         output_tensors[f"{prefix}.mlp.c_fc.bias"] = output_tensors.pop(
             f"{prefix}.mlp.c_fc.bias"
         ).contiguous()
-        feed_forward_shape = [1, SEQUENCE_LENGTH, d_model * 4]
+        feed_forward_shape = [1, SEQUENCE_SYMBOL, d_model * 4]
         add_node(
             "MatMul",
             {
@@ -192,13 +209,14 @@ def build_gptneo_graph(
             },
             f"mlp1_{index}",
             feed_forward_shape,
-            {"weight_layout": "IN_OUT"},
+            {"weight_layout": "din_dout"},
         )
         add_node(
             "GELU",
             {"input": f"mlp1_{index}"},
             f"mlp_act_{index}",
             feed_forward_shape,
+            gelu_params,
         )
 
         output_tensors[f"{prefix}.mlp.c_proj.weight"] = output_tensors.pop(
@@ -216,7 +234,7 @@ def build_gptneo_graph(
             },
             f"mlp2_{index}",
             hidden_shape,
-            {"weight_layout": "IN_OUT"},
+            {"weight_layout": "din_dout"},
         )
         add_node(
             "Add",
@@ -241,8 +259,8 @@ def build_gptneo_graph(
         "MatMul",
         {"input": "final_norm", "weight": "lm_head.weight"},
         "logits",
-        [1, SEQUENCE_LENGTH, config.vocab_size],
-        {"weight_layout": "IN_OUT"},
+        [1, SEQUENCE_SYMBOL, config.vocab_size],
+        {"weight_layout": "din_dout"},
     )
     return nodes
 
@@ -260,9 +278,11 @@ def export_model(model_id_or_path: str, output_path: Path) -> None:
     eos_token_id = getattr(config, "eos_token_id", None)
     if eos_token_id is None:
         eos_token_id = DEFAULT_EOS_TOKEN_ID
-    token_input = np.full((1, SEQUENCE_LENGTH), eos_token_id, dtype=np.int32)
+    token_input = np.full((1, MAX_SEQUENCE_LENGTH), eos_token_id, dtype=np.int32)
     token_input[0, :5] = [123, 456, 789, 1011, 1213]
-    position_input = np.arange(SEQUENCE_LENGTH, dtype=np.int32).reshape(1, SEQUENCE_LENGTH)
+    position_input = np.arange(MAX_SEQUENCE_LENGTH, dtype=np.int32).reshape(
+        1, MAX_SEQUENCE_LENGTH
+    )
     (output_path.parent / "tokens.i32").write_bytes(token_input.tobytes())
     (output_path.parent / "positions.i32").write_bytes(position_input.tobytes())
 
@@ -273,9 +293,12 @@ def export_model(model_id_or_path: str, output_path: Path) -> None:
 
     graph = {
         "format": "volvox-graph/v1",
+        "dimensions": {
+            SEQUENCE_SYMBOL: {"min": 1, "max": MAX_SEQUENCE_LENGTH},
+        },
         "inputs": {
-            "tokens": {"shape": [1, SEQUENCE_LENGTH], "dtype": "int32"},
-            "positions": {"shape": [1, SEQUENCE_LENGTH], "dtype": "int32"},
+            "tokens": {"shape": [1, SEQUENCE_SYMBOL], "dtype": "int32"},
+            "positions": {"shape": [1, SEQUENCE_SYMBOL], "dtype": "int32"},
         },
         "nodes": nodes,
         "outputs": ["logits"],

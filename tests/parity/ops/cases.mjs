@@ -17,22 +17,22 @@ export const cases = [
   // fast approximation (~8e-3 vs exact). Documented, not hidden — the PyTorch oracle
   // matches the exact pure-JS reference, confirming which tier is approximate.
   { id: 'sigmoid_1x64', op: 'Sigmoid', kind: 'unary', shape: [1, 64], approxTol: { atol: 1.2e-2 } },
-  { id: 'tanh_1x64', op: 'Tanh', kind: 'unary', shape: [1, 64] },
+  // These six runtime registrations lack native-cpu exporter qualification
+  // (`+Q`) in generated v1. Strict native package admission rejects them by
+  // design; expected skips are not portable-coverage passes.
+  { id: 'tanh_1x64', op: 'Tanh', kind: 'unary', shape: [1, 64], skip: ['native-cpu'] },
   { id: 'add_1x64', op: 'Add', kind: 'binary', shape: [1, 64] },
   { id: 'mul_1x64', op: 'Mul', kind: 'binary', shape: [1, 64] },
-  // Sub/Div: operation_list.md marks them [Missing] on native CPU — expected skip.
-  { id: 'sub_1x64', op: 'Sub', kind: 'binary', shape: [1, 64], skip: ['native-cpu'] },
-  { id: 'div_1x64', op: 'Div', kind: 'binary', shape: [1, 64], skip: ['native-cpu'] },
+  { id: 'sub_1x64', op: 'Sub', kind: 'binary', shape: [1, 64] },
+  { id: 'div_1x64', op: 'Div', kind: 'binary', shape: [1, 64] },
   // Activations with params / fixed hard variants — all exact torch equivalents.
-  { id: 'leakyrelu_1x64', op: 'LeakyReLU', kind: 'unary', shape: [1, 64], params: { alpha: 0.1 } },
+  { id: 'leakyrelu_1x64', op: 'LeakyReLU', kind: 'unary', shape: [1, 64], params: { alpha: 0.1 }, skip: ['native-cpu'] },
   { id: 'clip_1x64', op: 'Clip', kind: 'unary', shape: [1, 64], params: { min: -1, max: 1 } },
-  { id: 'hardsigmoid_1x64', op: 'HardSigmoid', kind: 'unary', shape: [1, 64] },
-  { id: 'hardswish_1x64', op: 'HardSwish', kind: 'unary', shape: [1, 64] },
-  // Sin/Cos are [Missing] on WebGPU + all GPU backends (docs/operation_list.md); native-cpu
-  // has them (portable C). The op matrix flagged that WebGPU silently passes wrong data for
-  // these rather than rejecting — tracked as a GPU-coverage gap; marked skip here, not a FAIL.
-  { id: 'sin_1x64', op: 'Sin', kind: 'unary', shape: [1, 64], skip: ['webgpu', 'native-vulkan', 'native-opengl'] },
-  { id: 'cos_1x64', op: 'Cos', kind: 'unary', shape: [1, 64], skip: ['webgpu', 'native-vulkan', 'native-opengl'] },
+  { id: 'hardsigmoid_1x64', op: 'HardSigmoid', kind: 'unary', shape: [1, 64], skip: ['native-cpu'] },
+  { id: 'hardswish_1x64', op: 'HardSwish', kind: 'unary', shape: [1, 64], skip: ['native-cpu'] },
+  // Sin/Cos also have no WebGPU registration or native GPU qualification.
+  { id: 'sin_1x64', op: 'Sin', kind: 'unary', shape: [1, 64], skip: ['native-cpu', 'webgpu', 'native-vulkan', 'native-opengl'] },
+  { id: 'cos_1x64', op: 'Cos', kind: 'unary', shape: [1, 64], skip: ['native-cpu', 'webgpu', 'native-vulkan', 'native-opengl'] },
 ];
 
 // Deterministic per-case seeds so every backend + the torch oracle see identical bytes.
@@ -74,6 +74,7 @@ export function authorCase(dir, c) {
       op: c.op,
       kind: c.kind,
       shape: c.shape,
+      output: 'y',
       outputShape: c.shape,
       outputDtype: 'float32',
       inputs: Object.keys(values),

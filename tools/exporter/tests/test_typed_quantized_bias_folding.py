@@ -9,6 +9,7 @@ from tools.exporter.ir import (
     AffineQuantization,
     GraphIR,
     IRDialect,
+    OpAttribute,
     OpNode,
     TensorValue,
 )
@@ -17,9 +18,14 @@ from tools.exporter.reference_executor import execute_reference
 from tools.exporter.optimizer.typed_quantized_bias_folding import (
     RuntimeQuantizedBiasFoldingPass,
 )
+from tools.exporter.optimizer.typed_pipeline import optimize_runtime_graph
 
 
-def _graph(*, shared_float: bool = False) -> tuple[GraphIR, dict[str, np.ndarray]]:
+def _graph(
+    *,
+    shared_float: bool = False,
+    requantize: bool = False,
+) -> tuple[GraphIR, dict[str, np.ndarray]]:
     graph = GraphIR("volvoxai", "quantized-bias.json", IRDialect.RUNTIME)
     quantization = {
         "x": AffineQuantization("per_tensor", "x_scale", "x_zero"),
@@ -27,6 +33,9 @@ def _graph(*, shared_float: bool = False) -> tuple[GraphIR, dict[str, np.ndarray
             "per_axis", "weight_scale", "weight_zero", axis=0,
         ),
         "projected": AffineQuantization(
+            "per_tensor", "output_scale", "output_zero",
+        ),
+        "requantized": AffineQuantization(
             "per_tensor", "output_scale", "output_zero",
         ),
     }
@@ -43,8 +52,13 @@ def _graph(*, shared_float: bool = False) -> tuple[GraphIR, dict[str, np.ndarray
         ("projected", (2, 2), "int8", False, False, False),
         ("dequantized", (2, 2), "float32", False, False, False),
         ("post_bias", (1, 2), "float32", True, False, False),
-        ("y", (2, 2), "float32", False, False, True),
+        ("y", (2, 2), "float32", False, False, not requantize),
     )
+    if requantize:
+        specs += (
+            ("expanded_post_bias", (2, 2), "float32", False, False, False),
+            ("requantized", (2, 2), "int8", False, False, True),
+        )
     if shared_float:
         specs += (("leak", (2, 2), "float32", False, False, True),)
     for name, shape, dtype, initializer, public_input, public_output in specs:
@@ -59,7 +73,6 @@ def _graph(*, shared_float: bool = False) -> tuple[GraphIR, dict[str, np.ndarray
             quantization=quantization.get(name),
         ))
     graph.inputs.append("x")
-    graph.outputs.append("y")
     graph.add_node(OpNode.from_maps(
         "dense", "QLinear",
         {"input": "x", "weight": "weight", "bias": "old_bias"},
@@ -70,11 +83,32 @@ def _graph(*, shared_float: bool = False) -> tuple[GraphIR, dict[str, np.ndarray
         {"input": "projected", "scale": "output_scale", "zero_point": "output_zero"},
         {"out": "dequantized"},
     ))
+    if requantize:
+        graph.add_node(OpNode.from_maps(
+            "expand-post-bias", "Expand",
+            {"input": "post_bias"},
+            {"out": "expanded_post_bias"},
+            attributes=(OpAttribute(
+                "params", "volvox.params", {"shape": [2, 2]},
+            ),),
+        ))
     graph.add_node(OpNode.from_maps(
         "post-add", "Add",
-        {"a": "post_bias", "b": "dequantized"},
+        {
+            "a": "expanded_post_bias" if requantize else "post_bias",
+            "b": "dequantized",
+        },
         {"out": "y"},
     ))
+    if requantize:
+        graph.add_node(OpNode.from_maps(
+            "requantize", "QuantizeLinear",
+            {"input": "y", "scale": "output_scale", "zero_point": "output_zero"},
+            {"out": "requantized"},
+        ))
+        graph.outputs.append("requantized")
+    else:
+        graph.outputs.append("y")
     if shared_float:
         graph.add_node(OpNode.from_maps(
             "leak", "Identity", {"input": "dequantized"}, {"out": "leak"},
@@ -105,7 +139,7 @@ class RuntimeQuantizedBiasFoldingPassTests(unittest.TestCase):
 
         report = VerifiedPipeline((RuntimeQuantizedBiasFoldingPass(
             tensors, allow_numerical_migration=True,
-        ),)).run(graph)
+        ),), shape_profile={}).run(graph)
 
         self.assertEqual(report.total_changes, 1)
         self.assertEqual([node.op_type for node in graph.nodes], [
@@ -132,12 +166,59 @@ class RuntimeQuantizedBiasFoldingPassTests(unittest.TestCase):
 
         report = VerifiedPipeline((RuntimeQuantizedBiasFoldingPass(
             tensors, allow_numerical_migration=True,
-        ),)).run(graph)
+        ),), shape_profile={}).run(graph)
 
         self.assertEqual(report.total_changes, 0)
         self.assertEqual(graph.fingerprint(), fingerprint)
         for name, value in before.items():
             np.testing.assert_array_equal(tensors[name], value)
+
+    def test_narrow_pipeline_closes_only_the_post_bias_q_boundary(self):
+        graph, tensors = _graph(requantize=True)
+        original = graph.clone()
+        original_tensors = {
+            name: np.array(value, copy=True) for name, value in tensors.items()
+        }
+        inputs = {
+            "x": np.asarray([[2, -3, 1], [4, 0, -2]], dtype=np.int8),
+        }
+        expected = execute_reference(original, original_tensors, inputs)
+
+        report = optimize_runtime_graph(
+            graph,
+            tensors,
+            allow_quantized_bias_folding_numerical_migration=True,
+            shape_profile={},
+        )
+
+        bias_run = next(
+            run for run in report.runs
+            if run.name == "runtime-quantized-bias-folding"
+        )
+        self.assertEqual(bias_run.changes, 1)
+        self.assertFalse(any(
+            run.name == "runtime-static-qdq-compute-fusion"
+            for run in report.runs
+        ))
+        operator_types = [node.op_type for node in graph.nodes]
+        self.assertNotIn("Add", operator_types)
+        self.assertNotIn("DequantizeLinear", operator_types)
+        self.assertNotIn("QuantizeLinear", operator_types)
+
+        actual = execute_reference(
+            graph,
+            {name: value for name, value in tensors.items() if name in graph.tensors},
+            inputs,
+        )
+        expected_codes = expected.outputs["requantized"]
+        actual_codes = actual.outputs["requantized"]
+        self.assertEqual(actual_codes.dtype, expected_codes.dtype)
+        np.testing.assert_array_less(
+            np.abs(
+                actual_codes.astype(np.int16) - expected_codes.astype(np.int16)
+            ),
+            2,
+        )
 
     def test_requires_explicit_numerical_migration(self):
         _, tensors = _graph()

@@ -1,4 +1,4 @@
-import { ModelBuilder } from '../core/ModelBuilder.js';
+import { RuntimeGraphBuilder } from '../core/RuntimeGraphBuilder.js';
 import { initializeTensor } from './Initializers.js';
 import type { TensorInitializer } from './Initializers.js';
 import { ensureTrainingGraphState, TrainingGraph } from './TrainingGraph.js';
@@ -44,7 +44,7 @@ export interface LoRALinearResult {
 }
 
 /** Model authoring extensions that create training metadata and trainable graphs. */
-export class TrainingModelBuilder extends ModelBuilder {
+export class TrainingModelBuilder extends RuntimeGraphBuilder {
   constructor(graph: TrainingGraph = new TrainingGraph()) {
     super(graph);
     ensureTrainingGraphState(this.graph);

@@ -2,8 +2,8 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 
 import { CPUEngine } from '../ts/backends/CPUEngine.js';
-import { Graph } from '../ts/core/Graph.js';
-import { GraphLoader } from '../ts/core/GraphLoader.js';
+import { RuntimeGraph } from '../ts/core/RuntimeGraph.js';
+import { RuntimeGraphLoader } from '../ts/core/RuntimeGraphLoader.js';
 import { _cpuQMaskedMean } from '../ts/ops/qMaskedMean.js';
 
 function qMaskedMeanGraph({
@@ -20,7 +20,7 @@ function qMaskedMeanGraph({
   outputShape = null,
 } = {}) {
   const [batch, sequence, width] = inputShape;
-  const graph = new Graph();
+  const graph = new RuntimeGraph();
   const input = graph.addInput('input', inputShape, inputDtype, {
     buffer: inputDtype === 'int8' ? Int8Array.from(inputValues) : Uint8Array.from(inputValues),
     quantization: inputQuantization,
@@ -99,8 +99,8 @@ test('QMaskedMean validates complete descriptors before output writes', () => {
   assert.deepEqual([...mutable.output.buffer], new Array(4).fill(73));
 });
 
-test('GraphLoader and CPUEngine retain QMaskedMean as a typed byte-domain router edge', async () => {
-  const graph = new Graph();
+test('RuntimeGraphLoader and CPUEngine retain QMaskedMean as a typed byte-domain router edge', async () => {
+  const graph = new RuntimeGraph();
   const tensors = new Map();
   const inputQuantization = { scheme: 'per_tensor', scale: 0.5, zero_point: -1 };
   const outputQuantization = { scheme: 'per_tensor', scale: 0.5, zero_point: 128 };
@@ -118,7 +118,7 @@ test('GraphLoader and CPUEngine retain QMaskedMean as a typed byte-domain router
   ]) {
     tensors.set(name, graph.addWeight(name, shape, dtype, { buffer }));
   }
-  GraphLoader._buildFromGraphDocument(graph, {
+  RuntimeGraphLoader._buildFromGraphDocument(graph, {
     format: 'volvox-graph/v1',
     quantization: {
       format: 'volvox-affine-safetensors/v1',

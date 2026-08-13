@@ -383,7 +383,6 @@ static VX_W8A8_QCONV_TARGET_AVX2 void vx_w8a8_qconv_avx2_range(
                     const float product_scale = input_scale *
                         weight_scales[output_channel];
                     const float multiplier = product_scale / output_scale;
-                    float scaled;
                     float transformed;
                     int transformed_nan;
                     int32_t quantized;
@@ -391,8 +390,8 @@ static VX_W8A8_QCONV_TARGET_AVX2 void vx_w8a8_qconv_avx2_range(
                                          sums[block_channel]);
                     for (uint32_t lane = 0; lane < 8u; lane++)
                         accumulator += lanes[lane];
-                    scaled = (float)accumulator * multiplier;
-                    transformed = scaled + (float)output_zero_point;
+                    transformed = vx_w8a8_transform_accumulator(
+                        accumulator, multiplier, output_zero_point);
                     transformed_nan = transformed != transformed;
                     quantized = vx_w8a8_requantize(transformed,
                         output_minimum, output_maximum, output_zero_point);
@@ -507,9 +506,10 @@ static VX_W8A8_QCONV_TARGET_AVX2 void vx_w8a8_qconv_avx2_small_c_range(
                         const float product_scale = call->input_scale *
                             call->weight_scales[channel];
                         const float multiplier = product_scale / call->output_scale;
-                        const float scaled = (float)(int64_t)lanes[lane] * multiplier;
-                        const float transformed = scaled +
-                            (float)call->output_zero_point;
+                        const float transformed =
+                            vx_w8a8_transform_accumulator(
+                                (int64_t)lanes[lane], multiplier,
+                                call->output_zero_point);
                         const int transformed_nan = transformed != transformed;
                         int32_t quantized = vx_w8a8_requantize(
                             transformed, output_minimum, output_maximum,
@@ -682,8 +682,9 @@ static VX_W8A8_QCONV_TARGET_AVXVNNI void vx_w8a8_qconv_avxvnni_range(
                             (int64_t)valid_terms * input_zero_unsigned * weight_zero_signed;
                         const float product_scale = input_scale * weight_scales[output_channel];
                         const float multiplier = product_scale / output_scale;
-                        const float scaled = (float)accumulator * multiplier;
-                        const float transformed = scaled + (float)output_zero_point;
+                        const float transformed =
+                            vx_w8a8_transform_accumulator(
+                                accumulator, multiplier, output_zero_point);
                         const int transformed_nan = transformed != transformed;
                         int32_t quantized = vx_w8a8_requantize(transformed,
                             output_minimum, output_maximum, output_zero_point);
@@ -844,8 +845,9 @@ static VX_W8A8_QCONV_TARGET_AVX512VNNI void vx_w8a8_qconv_avx512vnni_range(
                             (int64_t)valid_terms * input_zero_unsigned * weight_zero_signed;
                         const float product_scale = input_scale * weight_scales[output_channel];
                         const float multiplier = product_scale / output_scale;
-                        const float scaled = (float)accumulator * multiplier;
-                        const float transformed = scaled + (float)output_zero_point;
+                        const float transformed =
+                            vx_w8a8_transform_accumulator(
+                                accumulator, multiplier, output_zero_point);
                         const int transformed_nan = transformed != transformed;
                         int32_t quantized = vx_w8a8_requantize(transformed,
                             output_minimum, output_maximum, output_zero_point);
@@ -865,17 +867,14 @@ static void vx_w8a8_qconv_parallel_worker(void *opaque, int begin, int end) {
     context->function(context->call, (size_t)begin, (size_t)end);
 }
 
-static unsigned char *vx_w8a8_qconv_pack_small_c_weight(
-        const VxW8A8QConvCall *call) {
-    const size_t terms_per_channel = (size_t)call->kernel_height *
-                                     call->kernel_width * call->input_per_group;
-    const uint32_t output_channels_per_group =
-        call->output_channels / call->groups;
-    const size_t weight_elements = terms_per_channel * call->output_channels;
-    const unsigned char *weight = (const unsigned char *)call->weight;
-    unsigned char *packed = (unsigned char *)malloc(weight_elements);
-    if (!packed) return NULL;
-    for (uint32_t group = 0; group < call->groups; group++) {
+static void vx_w8a8_qconv_pack_small_c_into(unsigned char *packed,
+        const unsigned char *weight, uint32_t kernel_height,
+        uint32_t kernel_width, uint32_t input_per_group,
+        uint32_t output_channels, uint32_t groups) {
+    const size_t terms_per_channel = (size_t)kernel_height *
+                                     kernel_width * input_per_group;
+    const uint32_t output_channels_per_group = output_channels / groups;
+    for (uint32_t group = 0; group < groups; group++) {
         const size_t source_group_offset =
             (size_t)group * output_channels_per_group * terms_per_channel;
         const size_t packed_group_offset =
@@ -890,6 +889,18 @@ static unsigned char *vx_w8a8_qconv_pack_small_c_weight(
             }
         }
     }
+}
+
+static unsigned char *vx_w8a8_qconv_pack_small_c_weight(
+        const VxW8A8QConvCall *call) {
+    const size_t terms_per_channel = (size_t)call->kernel_height *
+                                     call->kernel_width * call->input_per_group;
+    const size_t weight_elements = terms_per_channel * call->output_channels;
+    unsigned char *packed = (unsigned char *)malloc(weight_elements);
+    if (!packed) return NULL;
+    vx_w8a8_qconv_pack_small_c_into(packed, (const unsigned char *)call->weight,
+        call->kernel_height, call->kernel_width, call->input_per_group,
+        call->output_channels, call->groups);
     return packed;
 }
 
@@ -939,9 +950,50 @@ static int vx_w8a8_qconv_parallel_alias_safe(const VxW8A8QConvCall *call,
     return 1;
 }
 
-static void vx_w8a8_qconv_im2col_worker(void *opaque, int begin, int end) {
-    const VxW8A8QConvIm2ColContext *context =
-        (const VxW8A8QConvIm2ColContext *)opaque;
+/* U8 activations reach the packed PMADDUBSW kernels through a general-purpose
+ * xor performed inside the innermost K step, one broadcast operand at a time.
+ * im2col already writes every activation byte exactly once, so applying that
+ * same remap here instead lets the GEMM broadcast its operand straight from
+ * memory.  The transform is information preserving rather than a
+ * reinterpretation: the matrix becomes a genuine signed tensor, and the caller
+ * shifts the zero point by the same 128 so every downstream affine term is
+ * unchanged. */
+static VX_W8A8_QCONV_TARGET_AVX2 __attribute__((always_inline)) inline void
+vx_w8a8_qconv_im2col_copy(
+        unsigned char *destination, const unsigned char *source, size_t count,
+        const int remap) {
+    size_t index = 0;
+    if (!remap) {
+        memcpy(destination, source, count);
+        return;
+    }
+    /* A scalar remap loop costs more than the GEMM step it saves: im2col
+     * writes tens of megabytes per encoder pass, so this has to stay within
+     * reach of the library memcpy it replaces. */
+    const __m256i sign_bit = _mm256_set1_epi8((char)0x80);
+    for (; index + 32u <= count; index += 32u) {
+        _mm256_storeu_si256((__m256i *)(void *)(destination + index),
+            _mm256_xor_si256(_mm256_loadu_si256(
+                (const __m256i *)(const void *)(source + index)), sign_bit));
+    }
+    for (; index < count; index++)
+        destination[index] = (unsigned char)(source[index] ^ 0x80u);
+}
+
+static VX_W8A8_QCONV_TARGET_AVX2 __attribute__((always_inline)) inline void
+vx_w8a8_qconv_im2col_fill(unsigned char *destination,
+        unsigned char value, size_t count, const int remap) {
+    memset(destination, remap ? (unsigned char)(value ^ 0x80u) : value, count);
+}
+
+/* Instantiate the hot im2col loop with a literal activation domain.  Keeping
+ * the wrappers AVX2-targeted lets both the remap and its branch inline into the
+ * worker; the baseline dispatcher only selects a function pointer after its
+ * AVX2 eligibility proof. */
+static VX_W8A8_QCONV_TARGET_AVX2 __attribute__((always_inline)) inline void
+vx_w8a8_qconv_im2col_worker_body(
+        const VxW8A8QConvIm2ColContext *context, int begin, int end,
+        const int remap) {
     const VxW8A8QConvCall *call = context->call;
     const unsigned char padding_value =
         (unsigned char)call->input_zero_point;
@@ -973,7 +1025,8 @@ static void vx_w8a8_qconv_im2col_worker(void *opaque, int begin, int end) {
                     padded_y - call->padding_top >= call->input_height ||
                     padded_x < call->padding_left ||
                     padded_x - call->padding_left >= call->input_width) {
-                    memset(block, padding_value, call->input_channels);
+                    vx_w8a8_qconv_im2col_fill(block, padding_value,
+                        call->input_channels, remap);
                 } else {
                     const size_t input_index =
                         (((size_t)batch_index * call->input_height +
@@ -981,11 +1034,24 @@ static void vx_w8a8_qconv_im2col_worker(void *opaque, int begin, int end) {
                          call->input_width +
                          (uint32_t)(padded_x - call->padding_left)) *
                         call->input_channels;
-                    memcpy(block, input + input_index, call->input_channels);
+                    vx_w8a8_qconv_im2col_copy(block, input + input_index,
+                        call->input_channels, remap);
                 }
             }
         }
     }
+}
+
+static VX_W8A8_QCONV_TARGET_AVX2 void
+vx_w8a8_qconv_im2col_worker_plain(void *opaque, int begin, int end) {
+    vx_w8a8_qconv_im2col_worker_body(
+        (const VxW8A8QConvIm2ColContext *)opaque, begin, end, 0);
+}
+
+static VX_W8A8_QCONV_TARGET_AVX2 void
+vx_w8a8_qconv_im2col_worker_remap(void *opaque, int begin, int end) {
+    vx_w8a8_qconv_im2col_worker_body(
+        (const VxW8A8QConvIm2ColContext *)opaque, begin, end, 1);
 }
 
 /* Common encoder 3x3 convolutions are contiguous within each input row.
@@ -993,10 +1059,10 @@ static void vx_w8a8_qconv_im2col_worker(void *opaque, int begin, int end) {
  * location, and copy each interior 3*C strip at once instead of performing
  * three independently checked C-byte copies.  Border bytes remain the exact
  * input zero point used by the canonical im2col spelling. */
-static void vx_w8a8_qconv_im2col_3x3_rows_worker(
-        void *opaque, int begin, int end) {
-    const VxW8A8QConvIm2ColContext *context =
-        (const VxW8A8QConvIm2ColContext *)opaque;
+static VX_W8A8_QCONV_TARGET_AVX2 __attribute__((always_inline)) inline void
+vx_w8a8_qconv_im2col_3x3_rows_worker_body(
+        const VxW8A8QConvIm2ColContext *context, int begin, int end,
+        const int remap) {
     const VxW8A8QConvCall *call = context->call;
     const unsigned char padding_value =
         (unsigned char)call->input_zero_point;
@@ -1026,35 +1092,50 @@ static void vx_w8a8_qconv_im2col_3x3_rows_worker(
                     (size_t)kernel_y * strip_bytes;
                 const int64_t input_y = input_y_origin + kernel_y;
                 if (input_y < 0 || input_y >= call->input_height) {
-                    memset(block, padding_value, strip_bytes);
+                    vx_w8a8_qconv_im2col_fill(block, padding_value, strip_bytes, remap);
                 } else if (input_x_origin >= 0 &&
                            input_x_origin + 2 < call->input_width) {
                     const size_t input_index =
                         ((size_t)batch_index * input_plane +
                          (size_t)input_y * call->input_width +
                          (size_t)input_x_origin) * call->input_channels;
-                    memcpy(block, input + input_index, strip_bytes);
+                    vx_w8a8_qconv_im2col_copy(block, input + input_index,
+                                              strip_bytes, remap);
                 } else {
                     for (uint32_t kernel_x = 0; kernel_x < 3u; kernel_x++) {
                         const int64_t input_x = input_x_origin + kernel_x;
                         unsigned char *channel_block = block +
                             (size_t)kernel_x * call->input_channels;
                         if (input_x < 0 || input_x >= call->input_width) {
-                            memset(channel_block, padding_value,
-                                   call->input_channels);
+                            vx_w8a8_qconv_im2col_fill(channel_block,
+                                padding_value, call->input_channels, remap);
                         } else {
                             const size_t input_index =
                                 ((size_t)batch_index * input_plane +
                                  (size_t)input_y * call->input_width +
                                  (size_t)input_x) * call->input_channels;
-                            memcpy(channel_block, input + input_index,
-                                   call->input_channels);
+                            vx_w8a8_qconv_im2col_copy(channel_block,
+                                input + input_index, call->input_channels, remap);
                         }
                     }
                 }
             }
         }
     }
+}
+
+static VX_W8A8_QCONV_TARGET_AVX2 void
+vx_w8a8_qconv_im2col_3x3_rows_worker_plain(
+        void *opaque, int begin, int end) {
+    vx_w8a8_qconv_im2col_3x3_rows_worker_body(
+        (const VxW8A8QConvIm2ColContext *)opaque, begin, end, 0);
+}
+
+static VX_W8A8_QCONV_TARGET_AVX2 void
+vx_w8a8_qconv_im2col_3x3_rows_worker_remap(
+        void *opaque, int begin, int end) {
+    vx_w8a8_qconv_im2col_3x3_rows_worker_body(
+        (const VxW8A8QConvIm2ColContext *)opaque, begin, end, 1);
 }
 
 /* Dense 3x3 encoder convolutions benefit from reusing the QLinear ISA
@@ -1084,6 +1165,13 @@ static int vx_w8a8_qconv_im2col_qlinear_try(
         matrix_bytes > VX_W8A8_QCONV_IM2COL_MAX_BYTES) return 0;
     matrix = (unsigned char *)malloc(matrix_bytes);
     if (!matrix) return 0;
+    /* Only the signed-absolute spelling profits from receiving signed bytes;
+     * the plain spelling wants them unsigned, and handing it the wrong domain
+     * merely moves the remap back into its inner loop. */
+    const int matrix_remapped = call->input_dtype == VX_W8A8_QCONV_U8 &&
+        vx_packed_q8_prefers_signed_activations(call->packed_qlinear_weight,
+            call->weight_zero_points, call->output_channels);
+
     {
         const int threads = vx_kernels_thread_count();
         VxW8A8QConvIm2ColContext context = {call, matrix, row_bytes};
@@ -1092,33 +1180,39 @@ static int vx_w8a8_qconv_im2col_qlinear_try(
             (uint64_t)call->batch * call->output_height <= INT_MAX;
         const size_t tasks = use_3x3_rows
             ? (size_t)call->batch * call->output_height : locations;
+        VxKernelParallelFn worker = use_3x3_rows
+            ? (matrix_remapped
+                ? vx_w8a8_qconv_im2col_3x3_rows_worker_remap
+                : vx_w8a8_qconv_im2col_3x3_rows_worker_plain)
+            : (matrix_remapped
+                ? vx_w8a8_qconv_im2col_worker_remap
+                : vx_w8a8_qconv_im2col_worker_plain);
         if (threads > 1 && tasks > 1u) {
             const size_t target_tiles = (size_t)threads * 4u;
             size_t grain = (tasks + target_tiles - 1u) / target_tiles;
             if (grain > INT_MAX) grain = INT_MAX;
-            vx_kernels_parallel_for((int)tasks, (int)grain,
-                use_3x3_rows ? vx_w8a8_qconv_im2col_3x3_rows_worker :
-                               vx_w8a8_qconv_im2col_worker,
-                &context);
-        } else if (use_3x3_rows) {
-            vx_w8a8_qconv_im2col_3x3_rows_worker(
-                &context, 0, (int)tasks);
+            vx_kernels_parallel_for(
+                (int)tasks, (int)grain, worker, &context);
         } else {
-            vx_w8a8_qconv_im2col_worker(&context, 0, (int)locations);
+            worker(&context, 0, (int)tasks);
         }
     }
+    const int32_t matrix_zero_point = matrix_remapped
+        ? call->input_zero_point - 128 : call->input_zero_point;
+    const uint32_t matrix_dtype = matrix_remapped
+        ? (uint32_t)VX_W8A8_QCONV_I8 : call->input_dtype;
     result = call->packed_qlinear_weight
         ? vx_qlinear_i8u8_packed(matrix, call->packed_qlinear_weight,
             call->bias, call->weight_scales, call->weight_zero_points,
             call->output, (uint32_t)locations, (uint32_t)row_bytes,
-            call->output_channels, call->input_scale, call->input_zero_point,
-            call->output_scale, call->output_zero_point, call->input_dtype,
+            call->output_channels, call->input_scale, matrix_zero_point,
+            call->output_scale, call->output_zero_point, matrix_dtype,
             call->weight_dtype, call->output_dtype)
         : vx_qlinear_i8u8_native(matrix, call->weight, call->bias,
             call->weight_scales, call->weight_zero_points, call->output,
             (uint32_t)locations, (uint32_t)row_bytes, call->output_channels,
-            call->input_scale, call->input_zero_point, call->output_scale,
-            call->output_zero_point, call->input_dtype, call->weight_dtype,
+            call->input_scale, matrix_zero_point, call->output_scale,
+            call->output_zero_point, matrix_dtype, call->weight_dtype,
             call->output_dtype);
     free(matrix);
     return result == 1;
@@ -1149,6 +1243,49 @@ static int vx_w8a8_qconv_run(const VxW8A8QConvCall *call,
 
 #endif
 
+/* Load-time prepack for the narrow-input AVX2 path.
+ *
+ * That kernel reads eight adjacent output channels per input load, which OHWI
+ * cannot serve contiguously. The transpose used to run inside every call and be
+ * freed again; for an immutable model weight it is the same bytes every time, so
+ * the runtime hoists it into QConv2D node metadata instead. Returns 0 bytes when
+ * the geometry can never take the path, which tells the caller not to allocate.
+ */
+size_t vx_w8a8_qconv_small_c_pack_size(uint32_t kernel_height,
+        uint32_t kernel_width, uint32_t input_per_group,
+        uint32_t output_channels, uint32_t groups) {
+#if VX_W8A8_QCONV_X86_AVX2
+    if (!groups || !output_channels || output_channels % groups) return 0u;
+    if (!kernel_height || !kernel_width || !input_per_group) return 0u;
+    if (input_per_group >= 16u || (output_channels / groups) % 8u) return 0u;
+    return (size_t)kernel_height * kernel_width * input_per_group *
+           output_channels;
+#else
+    (void)kernel_height; (void)kernel_width; (void)input_per_group;
+    (void)output_channels; (void)groups;
+    return 0u;
+#endif
+}
+
+int vx_w8a8_qconv_pack_small_c(void *packed, size_t bytes, const void *weight,
+        uint32_t kernel_height, uint32_t kernel_width, uint32_t input_per_group,
+        uint32_t output_channels, uint32_t groups) {
+#if VX_W8A8_QCONV_X86_AVX2
+    const size_t needed = vx_w8a8_qconv_small_c_pack_size(kernel_height,
+        kernel_width, input_per_group, output_channels, groups);
+    if (!packed || !weight || !needed || bytes != needed) return 0;
+    vx_w8a8_qconv_pack_small_c_into((unsigned char *)packed,
+        (const unsigned char *)weight, kernel_height, kernel_width,
+        input_per_group, output_channels, groups);
+    return 1;
+#else
+    (void)packed; (void)bytes; (void)weight; (void)kernel_height;
+    (void)kernel_width; (void)input_per_group; (void)output_channels;
+    (void)groups;
+    return 0;
+#endif
+}
+
 int vx_qconv2d_i8u8_native_prepacked(const void *input, const void *weight,
         const int32_t *bias, const float *weight_scales,
         const int32_t *weight_zero_points, void *output,
@@ -1161,7 +1298,7 @@ int vx_qconv2d_i8u8_native_prepacked(const void *input, const void *weight,
         uint32_t groups, uint32_t relu, float input_scale,
         int32_t input_zero_point, float output_scale, int32_t output_zero_point,
         uint32_t input_dtype, uint32_t weight_dtype, uint32_t output_dtype,
-        const void *packed_qlinear_weight) {
+        const void *packed_qlinear_weight, const void *small_c_packed_weight) {
 #if defined(__aarch64__) || defined(__arm__)
     if (vx_qconv2d_i8u8_arm_try(input, weight, bias, weight_scales,
             weight_zero_points, output, batch, input_height, input_width,
@@ -1243,6 +1380,14 @@ int vx_qconv2d_i8u8_native_prepacked(const void *input, const void *weight,
         const uint32_t output_channels_per_group = output_channels / groups;
         if (input_per_group < 16u && output_channels_per_group % 8u == 0u &&
             vx_w8a8_qconv_parallel_alias_safe(&call, locations)) {
+            /* The runtime hoists this transpose into node metadata for
+             * immutable weights; only dynamic weights still pay per call. */
+            if (small_c_packed_weight) {
+                call.small_c_packed_weight =
+                    (const unsigned char *)small_c_packed_weight;
+                return vx_w8a8_qconv_run(&call,
+                    vx_w8a8_qconv_avx2_small_c_range);
+            }
             unsigned char *packed_weight =
                 vx_w8a8_qconv_pack_small_c_weight(&call);
             if (packed_weight) {
@@ -1284,5 +1429,5 @@ int vx_qconv2d_i8u8_native(const void *input, const void *weight,
         stride_y, stride_x, dilation_y, dilation_x, padding_top, padding_left,
         padding_bottom, padding_right, groups, relu, input_scale,
         input_zero_point, output_scale, output_zero_point, input_dtype,
-        weight_dtype, output_dtype, NULL);
+        weight_dtype, output_dtype, NULL, NULL);
 }

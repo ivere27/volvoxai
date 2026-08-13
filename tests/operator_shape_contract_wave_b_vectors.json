@@ -1,0 +1,315 @@
+{
+  "format": "volvox-operator-shape-vectors/v1",
+  "families": [
+    {"id": "broadcast-arithmetic", "operators": ["Sub", "Div"]},
+    {"id": "broadcast-comparison", "operators": ["Equal", "GreaterOrEqual"]},
+    {"id": "where", "operators": ["Where"]},
+    {"id": "reduction", "operators": ["ReduceSum", "ReduceMean"]},
+    {"id": "arg-max", "operators": ["ArgMax"]},
+    {"id": "transpose", "operators": ["Transpose"]},
+    {"id": "flatten", "operators": ["Flatten"]},
+    {"id": "squeeze", "operators": ["Squeeze"]},
+    {"id": "unsqueeze", "operators": ["Unsqueeze"]},
+    {"id": "reshape", "operators": ["Reshape"]},
+    {"id": "expand", "operators": ["Expand"]},
+    {"id": "concat", "operators": ["Concat"]},
+    {"id": "split", "operators": ["Split"]},
+    {"id": "slice", "operators": ["Slice"]},
+    {"id": "pad", "operators": ["Pad"]},
+    {"id": "gather", "operators": ["Gather"]},
+    {"id": "gather-elements", "operators": ["GatherElements"]}
+  ],
+  "success_cases": [
+    {
+      "id": "broadcast-arithmetic-ranked", "family": "broadcast-arithmetic", "operators": ["Sub", "Div"],
+      "request": {"inputs": {"a": {"shape": [2, 1, 4], "dtype": "float32"}, "b": {"shape": [1, 3, 4], "dtype": "float32"}}},
+      "expected_shape_function_id": "volvox.shape.broadcast-arithmetic.v1",
+      "expected": {"out": {"shape": [2, 3, 4], "dtype": "float32"}}
+    },
+    {
+      "id": "broadcast-arithmetic-scalar", "family": "broadcast-arithmetic", "operators": ["Sub", "Div"],
+      "request": {"inputs": {"a": {"shape": [], "dtype": "float32"}, "b": {"shape": [5], "dtype": "float32"}}},
+      "expected_shape_function_id": "volvox.shape.broadcast-arithmetic.v1",
+      "expected": {"out": {"shape": [5], "dtype": "float32"}}
+    },
+    {
+      "id": "broadcast-comparison-ranked", "family": "broadcast-comparison", "operators": ["Equal", "GreaterOrEqual"],
+      "request": {"inputs": {"a": {"shape": [2, 1, 4], "dtype": "int32"}, "b": {"shape": [1, 3, 4], "dtype": "int32"}}},
+      "expected_shape_function_id": "volvox.shape.broadcast-comparison.v1",
+      "expected": {"out": {"shape": [2, 3, 4], "dtype": "int32"}}
+    },
+    {
+      "id": "broadcast-comparison-scalar", "family": "broadcast-comparison", "operators": ["Equal", "GreaterOrEqual"],
+      "request": {"inputs": {"a": {"shape": [], "dtype": "int32"}, "b": {"shape": [7], "dtype": "int32"}}},
+      "expected_shape_function_id": "volvox.shape.broadcast-comparison.v1",
+      "expected": {"out": {"shape": [7], "dtype": "int32"}}
+    },
+    {
+      "id": "where-float-broadcast", "family": "where", "operators": ["Where"],
+      "request": {"inputs": {"condition": {"shape": [2, 1], "dtype": "int32"}, "a": {"shape": [1, 3], "dtype": "float32"}, "b": {"shape": [2, 3], "dtype": "float32"}}},
+      "expected_shape_function_id": "volvox.shape.where-broadcast.v1",
+      "expected": {"out": {"shape": [2, 3], "dtype": "float32"}}
+    },
+    {
+      "id": "where-int-scalar-condition", "family": "where", "operators": ["Where"],
+      "request": {"inputs": {"condition": {"shape": [], "dtype": "float32"}, "a": {"shape": [2, 3], "dtype": "int32"}, "b": {"shape": [3], "dtype": "int32"}}},
+      "expected_shape_function_id": "volvox.shape.where-broadcast.v1",
+      "expected": {"out": {"shape": [2, 3], "dtype": "int32"}}
+    },
+    {
+      "id": "reduction-default", "family": "reduction", "operators": ["ReduceSum", "ReduceMean"],
+      "request": {"inputs": {"input": {"shape": [2, 3, 4], "dtype": "float32"}}},
+      "expected_shape_function_id": "volvox.shape.reduction.v1",
+      "expected": {"out": {"shape": [2, 3, 1], "dtype": "float32"}}
+    },
+    {
+      "id": "reduction-drop-last", "family": "reduction", "operators": ["ReduceSum", "ReduceMean"],
+      "request": {"inputs": {"input": {"shape": [2, 3, 4], "dtype": "float32"}}, "params": {"axis": -1, "keepdims": false}},
+      "expected_shape_function_id": "volvox.shape.reduction.v1",
+      "expected": {"out": {"shape": [2, 3], "dtype": "float32"}}
+    },
+    {
+      "id": "arg-max-default", "family": "arg-max", "operators": ["ArgMax"],
+      "request": {"inputs": {"input": {"shape": [2, 3, 4], "dtype": "float32"}}},
+      "expected_shape_function_id": "volvox.shape.arg-max.v1",
+      "expected": {"out": {"shape": [1, 3, 4], "dtype": "int32"}}
+    },
+    {
+      "id": "arg-max-drop-last", "family": "arg-max", "operators": ["ArgMax"],
+      "request": {"inputs": {"input": {"shape": [2, 3, 4], "dtype": "float32"}}, "params": {"axis": -1, "keepdims": false, "select_last_index": 0}},
+      "expected_shape_function_id": "volvox.shape.arg-max.v1",
+      "expected": {"out": {"shape": [2, 3], "dtype": "int32"}}
+    },
+    {
+      "id": "transpose-explicit", "family": "transpose", "operators": ["Transpose"],
+      "request": {"inputs": {"input": {"shape": [2, 3, 4], "dtype": "float32"}}, "params": {"perm": [1, 2, 0]}},
+      "expected_shape_function_id": "volvox.shape.transpose.v1",
+      "expected": {"out": {"shape": [3, 4, 2], "dtype": "float32"}}
+    },
+    {
+      "id": "transpose-per-axis", "family": "transpose", "operators": ["Transpose"],
+      "request": {"inputs": {"input": {"shape": [2, 3], "dtype": "int8", "quantization": {"scheme": "per_axis", "axis": 1, "scales": [0.25, 0.5, 1.0], "zero_points": [0, 1, 2]}}}},
+      "expected_shape_function_id": "volvox.shape.transpose.v1",
+      "expected": {"out": {"shape": [3, 2], "dtype": "int8", "quantization": {"scheme": "per_axis", "axis": 0, "scales": [0.25, 0.5, 1.0], "zero_points": [0, 1, 2]}}}
+    },
+    {
+      "id": "flatten-default", "family": "flatten", "operators": ["Flatten"],
+      "request": {"inputs": {"input": {"shape": [2, 3, 4], "dtype": "float32"}}},
+      "expected_shape_function_id": "volvox.shape.flatten.v1",
+      "expected": {"out": {"shape": [2, 12], "dtype": "float32"}}
+    },
+    {
+      "id": "flatten-per-axis", "family": "flatten", "operators": ["Flatten"],
+      "request": {"inputs": {"input": {"shape": [2, 3, 4], "dtype": "uint8", "quantization": {"scheme": "per_axis", "axis": 2, "scales": [0.25, 0.5, 1.0, 2.0], "zero_points": [1, 2, 3, 4]}}}, "params": {"axis": 2}},
+      "expected_shape_function_id": "volvox.shape.flatten.v1",
+      "expected": {"out": {"shape": [6, 4], "dtype": "uint8", "quantization": {"scheme": "per_axis", "axis": 1, "scales": [0.25, 0.5, 1.0, 2.0], "zero_points": [1, 2, 3, 4]}}}
+    },
+    {
+      "id": "squeeze-single", "family": "squeeze", "operators": ["Squeeze"],
+      "request": {"inputs": {"input": {"shape": [2, 1, 3], "dtype": "float32"}}, "params": {"axes": [1]}},
+      "expected_shape_function_id": "volvox.shape.squeeze.v1",
+      "expected": {"out": {"shape": [2, 3], "dtype": "float32"}}
+    },
+    {
+      "id": "squeeze-per-axis", "family": "squeeze", "operators": ["Squeeze"],
+      "request": {"inputs": {"input": {"shape": [1, 4, 1], "dtype": "int8", "quantization": {"scheme": "per_axis", "axis": 1, "scales": [0.25, 0.5, 1.0, 2.0], "zero_points": [-1, 0, 1, 2]}}}, "params": {"axes": [0, 2]}},
+      "expected_shape_function_id": "volvox.shape.squeeze.v1",
+      "expected": {"out": {"shape": [4], "dtype": "int8", "quantization": {"scheme": "per_axis", "axis": 0, "scales": [0.25, 0.5, 1.0, 2.0], "zero_points": [-1, 0, 1, 2]}}}
+    },
+    {
+      "id": "unsqueeze-multiple", "family": "unsqueeze", "operators": ["Unsqueeze"],
+      "request": {"inputs": {"input": {"shape": [2, 3], "dtype": "float32"}}, "params": {"axes": [0, 3]}},
+      "expected_shape_function_id": "volvox.shape.unsqueeze.v1",
+      "expected": {"out": {"shape": [1, 2, 3, 1], "dtype": "float32"}}
+    },
+    {
+      "id": "unsqueeze-per-axis", "family": "unsqueeze", "operators": ["Unsqueeze"],
+      "request": {"inputs": {"input": {"shape": [2, 3], "dtype": "uint8", "quantization": {"scheme": "per_axis", "axis": 1, "scales": [0.25, 0.5, 1.0], "zero_points": [1, 2, 3]}}}, "params": {"axes": [1]}},
+      "expected_shape_function_id": "volvox.shape.unsqueeze.v1",
+      "expected": {"out": {"shape": [2, 1, 3], "dtype": "uint8", "quantization": {"scheme": "per_axis", "axis": 2, "scales": [0.25, 0.5, 1.0], "zero_points": [1, 2, 3]}}}
+    },
+    {
+      "id": "reshape-ranked", "family": "reshape", "operators": ["Reshape"],
+      "request": {"inputs": {"input": {"shape": [2, 3, 4], "dtype": "float32"}}, "params": {"shape": [6, 4]}},
+      "expected_shape_function_id": "volvox.shape.reshape-static-target.v1",
+      "expected": {"out": {"shape": [6, 4], "dtype": "float32"}}
+    },
+    {
+      "id": "reshape-per-axis", "family": "reshape", "operators": ["Reshape"],
+      "request": {"inputs": {"input": {"shape": [2, 3, 4], "dtype": "int8", "quantization": {"scheme": "per_axis", "axis": 2, "scales": [0.25, 0.5, 1.0, 2.0], "zero_points": [-1, 0, 1, 2]}}}, "params": {"shape": [6, 4]}},
+      "expected_shape_function_id": "volvox.shape.reshape-static-target.v1",
+      "expected": {"out": {"shape": [6, 4], "dtype": "int8", "quantization": {"scheme": "per_axis", "axis": 1, "scales": [0.25, 0.5, 1.0, 2.0], "zero_points": [-1, 0, 1, 2]}}}
+    },
+    {
+      "id": "expand-leading", "family": "expand", "operators": ["Expand"],
+      "request": {"inputs": {"input": {"shape": [1, 3], "dtype": "float32"}}, "params": {"shape": [2, 3]}},
+      "expected_shape_function_id": "volvox.shape.expand-static-target.v1",
+      "expected": {"out": {"shape": [2, 3], "dtype": "float32"}}
+    },
+    {
+      "id": "expand-per-axis", "family": "expand", "operators": ["Expand"],
+      "request": {"inputs": {"input": {"shape": [2, 1, 3], "dtype": "uint8", "quantization": {"scheme": "per_axis", "axis": 2, "scales": [0.25, 0.5, 1.0], "zero_points": [1, 2, 3]}}}, "params": {"shape": [4, 2, 5, 3]}},
+      "expected_shape_function_id": "volvox.shape.expand-static-target.v1",
+      "expected": {"out": {"shape": [4, 2, 5, 3], "dtype": "uint8", "quantization": {"scheme": "per_axis", "axis": 3, "scales": [0.25, 0.5, 1.0], "zero_points": [1, 2, 3]}}}
+    },
+    {
+      "id": "concat-ranked", "family": "concat", "operators": ["Concat"],
+      "request": {"inputs": {"input0": {"shape": [2, 3], "dtype": "float32"}, "input1": {"shape": [2, 4], "dtype": "float32"}}, "params": {"axis": 1}},
+      "expected_shape_function_id": "volvox.shape.concat.v1",
+      "expected": {"out": {"shape": [2, 7], "dtype": "float32"}}
+    },
+    {
+      "id": "concat-per-axis", "family": "concat", "operators": ["Concat"],
+      "request": {"inputs": {"input0": {"shape": [1, 2], "dtype": "int8", "quantization": {"scheme": "per_axis", "axis": 1, "scales": [0.25, 0.5], "zero_points": [-1, 0]}}, "input1": {"shape": [1, 1], "dtype": "int8", "quantization": {"scheme": "per_axis", "axis": 1, "scales": [1.0], "zero_points": [1]}}}, "params": {"axis": 1}},
+      "expected_shape_function_id": "volvox.shape.concat.v1",
+      "expected": {"out": {"shape": [1, 3], "dtype": "int8", "quantization": {"scheme": "per_axis", "axis": 1, "scales": [0.25, 0.5, 1.0], "zero_points": [-1, 0, 1]}}}
+    },
+    {
+      "id": "split-explicit", "family": "split", "operators": ["Split"],
+      "request": {"inputs": {"input": {"shape": [2, 6], "dtype": "float32"}}, "params": {"axis": 1, "split": [2, 4]}},
+      "expected_shape_function_id": "volvox.shape.split.v1",
+      "expected": {"out0": {"shape": [2, 2], "dtype": "float32"}, "out1": {"shape": [2, 4], "dtype": "float32"}}
+    },
+    {
+      "id": "split-per-axis", "family": "split", "operators": ["Split"],
+      "request": {"inputs": {"input": {"shape": [1, 4], "dtype": "uint8", "quantization": {"scheme": "per_axis", "axis": 1, "scales": [0.25, 0.5, 1.0, 2.0], "zero_points": [1, 2, 3, 4]}}}, "params": {"axis": 1, "num_outputs": 2}},
+      "expected_shape_function_id": "volvox.shape.split.v1",
+      "expected": {"out0": {"shape": [1, 2], "dtype": "uint8", "quantization": {"scheme": "per_axis", "axis": 1, "scales": [0.25, 0.5], "zero_points": [1, 2]}}, "out1": {"shape": [1, 2], "dtype": "uint8", "quantization": {"scheme": "per_axis", "axis": 1, "scales": [1.0, 2.0], "zero_points": [3, 4]}}}
+    },
+    {
+      "id": "slice-ranked", "family": "slice", "operators": ["Slice"],
+      "request": {"inputs": {"input": {"shape": [4, 6], "dtype": "float32"}}, "params": {"starts": [1], "ends": [4], "axes": [0]}},
+      "expected_shape_function_id": "volvox.shape.slice-static.v1",
+      "expected": {"out": {"shape": [3, 6], "dtype": "float32"}}
+    },
+    {
+      "id": "slice-per-axis", "family": "slice", "operators": ["Slice"],
+      "request": {"inputs": {"input": {"shape": [5, 2], "dtype": "int8", "quantization": {"scheme": "per_axis", "axis": 0, "scales": [0.25, 0.5, 1.0, 2.0, 4.0], "zero_points": [-2, -1, 0, 1, 2]}}}, "params": {"starts": [1], "ends": [5], "axes": [0], "steps": [2]}},
+      "expected_shape_function_id": "volvox.shape.slice-static.v1",
+      "expected": {"out": {"shape": [2, 2], "dtype": "int8", "quantization": {"scheme": "per_axis", "axis": 0, "scales": [0.5, 2.0], "zero_points": [-1, 1]}}}
+    },
+    {
+      "id": "pad-ranked", "family": "pad", "operators": ["Pad"],
+      "request": {"inputs": {"input": {"shape": [2, 3], "dtype": "float32"}}, "params": {"pads": [1, 0, 1, 2]}},
+      "expected_shape_function_id": "volvox.shape.pad-static.v1",
+      "expected": {"out": {"shape": [4, 5], "dtype": "float32"}}
+    },
+    {
+      "id": "pad-per-axis-preserved", "family": "pad", "operators": ["Pad"],
+      "request": {"inputs": {"input": {"shape": [2, 3], "dtype": "uint8", "quantization": {"scheme": "per_axis", "axis": 1, "scales": [0.25, 0.5, 1.0], "zero_points": [1, 2, 3]}}}, "params": {"pads": [1, 0, 0, 0]}},
+      "expected_shape_function_id": "volvox.shape.pad-static.v1",
+      "expected": {"out": {"shape": [3, 3], "dtype": "uint8", "quantization": {"scheme": "per_axis", "axis": 1, "scales": [0.25, 0.5, 1.0], "zero_points": [1, 2, 3]}}}
+    },
+    {
+      "id": "gather-vector-indices", "family": "gather", "operators": ["Gather"],
+      "request": {"inputs": {"input": {"shape": [2, 3, 4], "dtype": "float32"}, "indices": {"shape": [5], "dtype": "int32"}}, "params": {"axis": 1}},
+      "expected_shape_function_id": "volvox.shape.gather.v1",
+      "expected": {"out": {"shape": [2, 5, 4], "dtype": "float32"}}
+    },
+    {
+      "id": "gather-scalar-remaps-axis", "family": "gather", "operators": ["Gather"],
+      "request": {"inputs": {"input": {"shape": [2, 3, 4], "dtype": "int8", "quantization": {"scheme": "per_axis", "axis": 2, "scales": [0.25, 0.5, 1.0, 2.0], "zero_points": [-1, 0, 1, 2]}}, "indices": {"shape": [], "dtype": "int32"}}, "params": {"axis": 1}},
+      "expected_shape_function_id": "volvox.shape.gather.v1",
+      "expected": {"out": {"shape": [2, 4], "dtype": "int8", "quantization": {"scheme": "per_axis", "axis": 1, "scales": [0.25, 0.5, 1.0, 2.0], "zero_points": [-1, 0, 1, 2]}}}
+    },
+    {
+      "id": "gather-elements-ranked", "family": "gather-elements", "operators": ["GatherElements"],
+      "request": {"inputs": {"input": {"shape": [2, 3], "dtype": "float32"}, "indices": {"shape": [2, 2], "dtype": "int32"}}, "params": {"axis": 1}},
+      "expected_shape_function_id": "volvox.shape.gather-elements.v1",
+      "expected": {"out": {"shape": [2, 2], "dtype": "float32"}}
+    },
+    {
+      "id": "gather-elements-per-axis-slice", "family": "gather-elements", "operators": ["GatherElements"],
+      "request": {"inputs": {"input": {"shape": [3, 4], "dtype": "uint8", "quantization": {"scheme": "per_axis", "axis": 0, "scales": [0.25, 0.5, 1.0], "zero_points": [1, 2, 3]}}, "indices": {"shape": [2, 4], "dtype": "int32"}}, "params": {"axis": 1}},
+      "expected_shape_function_id": "volvox.shape.gather-elements.v1",
+      "expected": {"out": {"shape": [2, 4], "dtype": "uint8", "quantization": {"scheme": "per_axis", "axis": 0, "scales": [0.25, 0.5], "zero_points": [1, 2]}}}
+    }
+  ],
+  "failure_cases": [
+    {
+      "id": "broadcast-arithmetic-incompatible", "family": "broadcast-arithmetic", "operators": ["Sub", "Div"],
+      "request": {"inputs": {"a": {"shape": [2, 3], "dtype": "float32"}, "b": {"shape": [4, 3], "dtype": "float32"}}},
+      "expected_shape_function_id": "volvox.shape.broadcast-arithmetic.v1", "expected_error": {"code": "SHAPE_MISMATCH", "path": "operator inputs"}
+    },
+    {
+      "id": "broadcast-comparison-wrong-dtype", "family": "broadcast-comparison", "operators": ["Equal", "GreaterOrEqual"],
+      "request": {"inputs": {"a": {"shape": [2, 3], "dtype": "float32"}, "b": {"shape": [2, 3], "dtype": "int32"}}},
+      "expected_shape_function_id": "volvox.shape.broadcast-comparison.v1", "expected_error": {"code": "INVALID_DTYPE", "path": "operator inputs"}
+    },
+    {
+      "id": "where-data-dtype-mismatch", "family": "where", "operators": ["Where"],
+      "request": {"inputs": {"condition": {"shape": [2, 3], "dtype": "int32"}, "a": {"shape": [2, 3], "dtype": "float32"}, "b": {"shape": [2, 3], "dtype": "int32"}}},
+      "expected_shape_function_id": "volvox.shape.where-broadcast.v1", "expected_error": {"code": "INVALID_DTYPE", "path": "operator inputs 'a' and 'b'"}
+    },
+    {
+      "id": "reduction-non-last-axis", "family": "reduction", "operators": ["ReduceSum", "ReduceMean"],
+      "request": {"inputs": {"input": {"shape": [2, 3, 4], "dtype": "float32"}}, "params": {"axis": 0}},
+      "expected_shape_function_id": "volvox.shape.reduction.v1", "expected_error": {"code": "INVALID_PARAMS", "path": "operator params.axis"}
+    },
+    {
+      "id": "arg-max-last-index", "family": "arg-max", "operators": ["ArgMax"],
+      "request": {"inputs": {"input": {"shape": [2, 3], "dtype": "float32"}}, "params": {"select_last_index": 1}},
+      "expected_shape_function_id": "volvox.shape.arg-max.v1", "expected_error": {"code": "INVALID_PARAMS", "path": "operator params.select_last_index"}
+    },
+    {
+      "id": "transpose-duplicate-axis", "family": "transpose", "operators": ["Transpose"],
+      "request": {"inputs": {"input": {"shape": [2, 3, 4], "dtype": "float32"}}, "params": {"perm": [0, 0, 2]}},
+      "expected_shape_function_id": "volvox.shape.transpose.v1", "expected_error": {"code": "INVALID_PARAMS", "path": "operator params.perm"}
+    },
+    {
+      "id": "flatten-axis-out-of-range", "family": "flatten", "operators": ["Flatten"],
+      "request": {"inputs": {"input": {"shape": [2, 3, 4], "dtype": "float32"}}, "params": {"axis": 4}},
+      "expected_shape_function_id": "volvox.shape.flatten.v1", "expected_error": {"code": "INVALID_PARAMS", "path": "operator params.axis"}
+    },
+    {
+      "id": "squeeze-non-singleton", "family": "squeeze", "operators": ["Squeeze"],
+      "request": {"inputs": {"input": {"shape": [2, 3], "dtype": "float32"}}, "params": {"axes": [0]}},
+      "expected_shape_function_id": "volvox.shape.squeeze.v1", "expected_error": {"code": "SHAPE_MISMATCH", "path": "operator input 'input'.shape[0]"}
+    },
+    {
+      "id": "unsqueeze-duplicate-axis", "family": "unsqueeze", "operators": ["Unsqueeze"],
+      "request": {"inputs": {"input": {"shape": [2, 3], "dtype": "float32"}}, "params": {"axes": [0, 0]}},
+      "expected_shape_function_id": "volvox.shape.unsqueeze.v1", "expected_error": {"code": "INVALID_PARAMS", "path": "operator params.axes"}
+    },
+    {
+      "id": "reshape-element-mismatch", "family": "reshape", "operators": ["Reshape"],
+      "request": {"inputs": {"input": {"shape": [2, 3], "dtype": "float32"}}, "params": {"shape": [5]}},
+      "expected_shape_function_id": "volvox.shape.reshape-static-target.v1", "expected_error": {"code": "SHAPE_MISMATCH", "path": "operator params.shape"}
+    },
+    {
+      "id": "expand-invalid-target", "family": "expand", "operators": ["Expand"],
+      "request": {"inputs": {"input": {"shape": [2, 3], "dtype": "float32"}}, "params": {"shape": [2, 4]}},
+      "expected_shape_function_id": "volvox.shape.expand-static-target.v1", "expected_error": {"code": "SHAPE_MISMATCH", "path": "operator params.shape[1]"}
+    },
+    {
+      "id": "concat-non-axis-mismatch", "family": "concat", "operators": ["Concat"],
+      "request": {"inputs": {"input0": {"shape": [2, 3], "dtype": "float32"}, "input1": {"shape": [4, 2], "dtype": "float32"}}, "params": {"axis": 1}},
+      "expected_shape_function_id": "volvox.shape.concat.v1", "expected_error": {"code": "SHAPE_MISMATCH", "path": "operator input 'input1'.shape[0]"}
+    },
+    {
+      "id": "split-size-mismatch", "family": "split", "operators": ["Split"],
+      "request": {"inputs": {"input": {"shape": [2, 6], "dtype": "float32"}}, "params": {"axis": 1, "split": [2, 3]}},
+      "expected_shape_function_id": "volvox.shape.split.v1", "expected_error": {"code": "SHAPE_MISMATCH", "path": "operator params.split"}
+    },
+    {
+      "id": "slice-empty-axis", "family": "slice", "operators": ["Slice"],
+      "request": {"inputs": {"input": {"shape": [5, 3], "dtype": "float32"}}, "params": {"starts": [4], "ends": [4], "axes": [0]}},
+      "expected_shape_function_id": "volvox.shape.slice-static.v1", "expected_error": {"code": "SHAPE_MISMATCH", "path": "operator params.ends[0]"}
+    },
+    {
+      "id": "pad-wrong-rank", "family": "pad", "operators": ["Pad"],
+      "request": {"inputs": {"input": {"shape": [2, 3], "dtype": "float32"}}, "params": {"pads": [1, 1, 1]}},
+      "expected_shape_function_id": "volvox.shape.pad-static.v1", "expected_error": {"code": "INVALID_PARAMS", "path": "operator params.pads"}
+    },
+    {
+      "id": "gather-indices-dtype", "family": "gather", "operators": ["Gather"],
+      "request": {"inputs": {"input": {"shape": [2, 3], "dtype": "float32"}, "indices": {"shape": [2], "dtype": "float32"}}},
+      "expected_shape_function_id": "volvox.shape.gather.v1", "expected_error": {"code": "INVALID_DTYPE", "path": "operator input 'indices'.dtype"}
+    },
+    {
+      "id": "gather-elements-non-axis-overflow", "family": "gather-elements", "operators": ["GatherElements"],
+      "request": {"inputs": {"input": {"shape": [2, 3], "dtype": "float32"}, "indices": {"shape": [3, 2], "dtype": "int32"}}, "params": {"axis": 1}},
+      "expected_shape_function_id": "volvox.shape.gather-elements.v1", "expected_error": {"code": "SHAPE_MISMATCH", "path": "operator input 'indices'.shape[0]"}
+    }
+  ]
+}

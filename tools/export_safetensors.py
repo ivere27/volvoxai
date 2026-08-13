@@ -6,8 +6,16 @@ Model-family graph construction and vocabulary policy live with their examples.
 import importlib
 import json
 import re
+import sys
 from pathlib import Path
 from safetensors.numpy import save_file
+
+
+_REPOSITORY_ROOT = str(Path(__file__).resolve().parent.parent)
+if __package__ is None and _REPOSITORY_ROOT not in sys.path:
+    # Direct script execution otherwise exposes only tools/ as sys.path[0],
+    # while exporter modules consistently use their repository package name.
+    sys.path.insert(0, _REPOSITORY_ROOT)
 
 
 def _exporter_module(name: str):
@@ -94,37 +102,50 @@ def _resolve_output_names(output_count: int, requested=None):
     return names
 
 
-_IMAGE_NORMALIZATION_MODES = {"zero-one", "minus-one-one", "raw-255"}
-
-
 def _apply_image_normalizations(inputs, requested=None):
-    """Attach explicit application preprocessing contracts to graph inputs."""
-    if requested is None:
+    """Reject application preprocessing at the closed graph boundary."""
+    if not requested:
         return
-    seen = set()
-    for value in requested:
-        if not isinstance(value, str) or "=" not in value:
-            raise ValueError(
-                "--image-normalization expects INPUT=MODE, where MODE is "
-                "zero-one, minus-one-one, or raw-255"
-            )
-        name, mode = value.split("=", 1)
-        name = name.strip()
-        mode = mode.strip()
-        if not name or mode not in _IMAGE_NORMALIZATION_MODES:
-            raise ValueError(
-                "--image-normalization expects INPUT=MODE, where MODE is "
-                "zero-one, minus-one-one, or raw-255"
-            )
-        if name not in inputs:
-            raise ValueError(
-                f"Image normalization names unknown exported input {name!r}; "
-                f"available inputs: {', '.join(inputs) or '<none>'}"
-            )
-        if name in seen:
-            raise ValueError(f"Image normalization for input {name!r} was specified more than once")
-        seen.add(name)
-        inputs[name]["image_normalization"] = mode
+    raise ValueError(
+        "--image-normalization is application preprocessing and cannot be "
+        "embedded in closed volvox-graph/v1 input descriptors; configure it "
+        "in the consuming application"
+    )
+
+
+def _require_closed_dynamic_v1(graph):
+    """Accept only the sole executable package schema from delegated frontends."""
+
+    required_root = {
+        "format", "dimensions", "inputs", "nodes", "outputs",
+    }
+    if not isinstance(graph, dict):
+        raise RuntimeError("delegated exporter did not return a graph object")
+    if graph.get("format") != GRAPH_FORMAT:
+        raise RuntimeError("delegated exporter returned a non-current graph discriminator")
+    if not required_root <= set(graph) or set(graph) - required_root - {"banks", "quantization"}:
+        raise RuntimeError("delegated exporter returned a non-closed graph root")
+    if not isinstance(graph.get("dimensions"), dict) or not isinstance(graph.get("inputs"), dict):
+        raise RuntimeError("delegated exporter returned malformed shape declarations")
+    for name, descriptor in graph["inputs"].items():
+        if not isinstance(name, str) or not isinstance(descriptor, dict) or set(descriptor) != {"shape", "dtype"}:
+            raise RuntimeError("delegated exporter returned a non-closed input descriptor")
+    if not isinstance(graph.get("nodes"), list):
+        raise RuntimeError("delegated exporter returned malformed nodes")
+    for node in graph["nodes"]:
+        if not isinstance(node, dict) or set(node) != {"id", "opType", "inputs", "outputs", "params"}:
+            raise RuntimeError("delegated exporter returned a non-closed node descriptor")
+        outputs = node.get("outputs")
+        if not isinstance(outputs, dict) or not outputs:
+            raise RuntimeError("delegated exporter returned malformed node outputs")
+        if any(
+            not isinstance(descriptor, dict)
+            or set(descriptor) != {"tensor", "dtype", "shape"}
+            for descriptor in outputs.values()
+        ):
+            raise RuntimeError("delegated exporter returned split or extended node outputs")
+    if not isinstance(graph.get("outputs"), list):
+        raise RuntimeError("delegated exporter returned malformed public outputs")
 
 
 def export_onnx_model(
@@ -134,11 +155,19 @@ def export_onnx_model(
     output_names=None,
     image_normalizations=None,
     input_shapes=None,
+    dimension_bounds=None,
+    anonymous_dimension_bounds=None,
     input_dtypes=None,
     output_dtypes=None,
     specialize_inputs=None,
     quant_mode: str = "preserve",
+    allow_silu_numerical_migration: bool = False,
+    allow_quantized_bias_folding_numerical_migration: bool = False,
+    allow_static_qdq_qbatch_matmul_numerical_migration: bool = False,
+    allow_static_qdq_groupnorm_silu_numerical_migration: bool = False,
     enable_static_qdq_layout_optimization: bool = True,
+    enable_exact_common_subexpression_elimination: bool = False,
+    report_callback=None,
 ):
     """Compile a static ONNX graph through the typed current frontend.
 
@@ -156,13 +185,30 @@ def export_onnx_model(
         output_names=output_names,
         image_normalizations=image_normalizations,
         input_shapes=input_shapes,
+        dimension_bounds=dimension_bounds,
+        anonymous_dimension_bounds=anonymous_dimension_bounds,
         input_dtypes=input_dtypes,
         output_dtypes=output_dtypes,
         specialize_inputs=specialize_inputs,
+        allow_silu_numerical_migration=allow_silu_numerical_migration,
+        allow_quantized_bias_folding_numerical_migration=(
+            allow_quantized_bias_folding_numerical_migration
+        ),
+        allow_static_qdq_qbatch_matmul_numerical_migration=(
+            allow_static_qdq_qbatch_matmul_numerical_migration
+        ),
+        allow_static_qdq_groupnorm_silu_numerical_migration=(
+            allow_static_qdq_groupnorm_silu_numerical_migration
+        ),
         enable_static_qdq_layout_optimization=(
             enable_static_qdq_layout_optimization
         ),
+        enable_exact_common_subexpression_elimination=(
+            enable_exact_common_subexpression_elimination
+        ),
+        report_callback=report_callback,
     )
+    _require_closed_dynamic_v1(graph)
     package_class = classify_package(graph)
     if quant_mode == "require-w8a8" and package_class != "w8a8-v1":
         raise RuntimeError(
@@ -178,7 +224,12 @@ def export_tflite_model(
     weight_dtype: str = "auto",
     output_names=None,
     image_normalizations=None,
+    allow_silu_numerical_migration: bool = False,
+    allow_quantized_bias_folding_numerical_migration: bool = False,
+    allow_static_qdq_qbatch_matmul_numerical_migration: bool = False,
+    allow_static_qdq_groupnorm_silu_numerical_migration: bool = False,
     enable_static_qdq_layout_optimization: bool = True,
+    enable_exact_common_subexpression_elimination: bool = False,
 ):
     import math
     import struct
@@ -453,7 +504,7 @@ def export_tflite_model(
         name = short(tkey(tid), f"input{idx}")
         shape = tensors_meta[tid]["shape"]
         dtype = dtype_names.get(tensors_meta[tid]["dtype"], "float32")
-        inputs_def[name] = {"shape": shape, "dtype": dtype, "source_name": tensors_meta[tid]["name"]}
+        inputs_def[name] = {"shape": shape, "dtype": dtype}
         quantization = tensor_quantization(tid)
         if quantization is not None:
             affine_descriptors[name] = quantization
@@ -493,9 +544,9 @@ def export_tflite_model(
         values = q.get(key, [])
         return values[0] if values else default
 
-    def ensure_weight(tid, transform="raw"):
+    def ensure_weight(tid, transform="raw", channels=None):
         source_tid = resolve_const(tid)
-        key = (source_tid, transform)
+        key = (source_tid, transform, channels)
         if key in weight_names:
             return weight_names[key]
         arr = tensor_array(tid)
@@ -506,11 +557,30 @@ def export_tflite_model(
                 raise RuntimeError(f"Conv weight tensor {tid} is rank {arr.ndim}, expected 4")
             # TFLite stores Conv2D filters as OHWI. Keep that artifact layout;
             # native prepares a compute cache for the image-layout microkernels.
+        elif transform == "conv_hwio":
+            if arr.ndim != 4:
+                raise RuntimeError(f"Conv weight tensor {tid} is rank {arr.ndim}, expected 4")
+            # OHWI [O,H,W,I] -> HWIO, the layout the ordinary Conv2D microkernels
+            # index directly, so no runtime transpose or second copy is needed.
+            arr = np.ascontiguousarray(np.transpose(arr, (1, 2, 3, 0)))
         elif transform == "depthwise":
             if arr.ndim != 4 or arr.shape[0] != 1:
                 raise RuntimeError(f"Depthwise weight tensor {tid} has unsupported shape {list(arr.shape)}")
             # TFLite depthwise filters are 1HWO, where O = input_channels * multiplier.
             # Keep that artifact layout; native prepares HWCM for compute.
+        elif transform == "depthwise_hwcm":
+            if arr.ndim != 4 or arr.shape[0] != 1:
+                raise RuntimeError(f"Depthwise weight tensor {tid} has unsupported shape {list(arr.shape)}")
+            # 1HWO -> HWCM. O is already channel-major over the multiplier, so the
+            # split is a reshape; HWCM is what selects the depthwise microkernels.
+            if not channels or arr.shape[3] % channels:
+                raise RuntimeError(
+                    f"Depthwise weight tensor {tid} output channels {arr.shape[3]} "
+                    f"are not a multiple of input channels {channels}"
+                )
+            arr = np.ascontiguousarray(
+                arr.reshape(arr.shape[1], arr.shape[2], channels, arr.shape[3] // channels)
+            )
         elif transform == "depthwise_q":
             if arr.ndim != 4 or arr.shape[0] != 1:
                 raise RuntimeError(f"Quantized depthwise weight tensor {tid} has unsupported shape {list(arr.shape)}")
@@ -583,25 +653,29 @@ def export_tflite_model(
         op, inputs, out_name, out_shape, params=None, out_tid=None, *,
         out_dtype=None,
     ):
-        node = {
-            "opType": op,
-            "inputs": inputs,
-            "outputs": {"out": out_name},
-            "outputs_shape": {"out": [int(v) for v in out_shape]},
-        }
+        shape = [int(v) for v in out_shape]
         dtype = tensor_dtype(out_tid) if out_tid is not None else out_dtype
         if dtype not in ("float32", "int32", "int8", "uint8"):
             source = f"TFLite tensor {out_tid}" if out_tid is not None else "synthetic output"
             raise RuntimeError(
                 f"Unsupported exported tensor dtype {dtype!r} on {source}"
             )
-        node["outputs_dtype"] = {"out": dtype}
+        canonical_params = dict(params or {})
+        if op in {"Reshape", "Expand"}:
+            canonical_params.setdefault("shape", list(shape))
+        node = {
+            "id": f"node_{len(nodes)}",
+            "opType": op,
+            "inputs": inputs,
+            "outputs": {
+                "out": {"tensor": out_name, "dtype": dtype, "shape": shape},
+            },
+            "params": canonical_params,
+        }
         if out_tid is not None:
             quantization = tensor_quantization(out_tid)
             if quantization is not None:
                 affine_descriptors[out_name] = quantization
-        if params:
-            node["params"] = params
         nodes.append(node)
 
     def set_value(tid, name, shape, layout):
@@ -668,9 +742,7 @@ def export_tflite_model(
                 "input": in_name,
                 "scale": scale,
                 "zero_point": ensure_typed_zero_point(inputs[0]),
-            }, out_name, out_shape, {
-                "data_layout": "NHWC" if len(out_shape) == 4 else "other",
-            }, out_tid=outputs[0])
+            }, out_name, out_shape, out_tid=outputs[0])
             set_value(outputs[0], out_name, out_shape, "NHWC" if len(out_shape) == 4 else "other")
             continue
 
@@ -692,15 +764,16 @@ def export_tflite_model(
                 input_quantization = tensor_quantization(inputs[0])
                 if input_quantization is None or input_quantization.get("scheme") != "per_tensor":
                     raise RuntimeError(f"TFLite QUANTIZE input {inputs[0]} needs scalar I8/U8 quantization metadata")
-                add_node("RequantizeLinear", {"input": in_name}, out_name, out_tflite_shape,
-                         {"data_layout": "NHWC" if len(out_tflite_shape) == 4 else "other"}, out_tid=out_tid)
+                add_node(
+                    "RequantizeLinear", {"input": in_name}, out_name,
+                    out_tflite_shape, out_tid=out_tid,
+                )
             elif input_dtype == "float32":
                 add_node("QuantizeLinear", {
                     "input": in_name,
                     "scale": ensure_qparam_weight(out_tid, "scale"),
                     "zero_point": ensure_typed_zero_point(out_tid),
-                }, out_name, out_tflite_shape,
-                {"data_layout": "NHWC" if len(out_tflite_shape) == 4 else "other"}, out_tid=out_tid)
+                }, out_name, out_tflite_shape, out_tid=out_tid)
             else:
                 raise RuntimeError(f"TFLite QUANTIZE input {inputs[0]} has unsupported dtype {input_dtype}")
             set_value(out_tid, out_name, out_tflite_shape, "NHWC" if len(out_tflite_shape) == 4 else "other")
@@ -722,11 +795,15 @@ def export_tflite_model(
                 and tensor_quantization(out_tid) is not None
             )
             if op_name == "CONV_2D":
-                weight = ensure_quantized_conv_weight(inputs[1], "conv") if use_qconv else ensure_weight(inputs[1], "conv")
+                if use_qconv:
+                    weight = ensure_quantized_conv_weight(inputs[1], "conv")
+                    weight_layout = "OHWI"
+                else:
+                    weight = ensure_weight(inputs[1], "conv_hwio")
+                    weight_layout = "HWIO"
                 weight_shape = list(tensors[weight].shape)
-                kernel = weight_shape[1:3]
+                kernel = weight_shape[1:3] if weight_layout == "OHWI" else weight_shape[0:2]
                 groups = 1
-                weight_layout = "OHWI"
                 stride = [
                     scalar(options, 2, 1, N.Int32Flags) if options else 1,
                     scalar(options, 1, 1, N.Int32Flags) if options else 1,
@@ -737,11 +814,15 @@ def export_tflite_model(
                 ]
                 act = scalar(options, 3, 0, N.Int8Flags) if options else 0
             else:
-                weight = ensure_quantized_conv_weight(inputs[1], "depthwise_q") if use_qconv else ensure_weight(inputs[1], "depthwise")
-                weight_shape = list(tensors[weight].shape)
-                kernel = weight_shape[1:3]
                 groups = int(in_shape[3])
-                weight_layout = "OHWI" if use_qconv else "1HWO"
+                if use_qconv:
+                    weight = ensure_quantized_conv_weight(inputs[1], "depthwise_q")
+                    weight_layout = "OHWI"
+                else:
+                    weight = ensure_weight(inputs[1], "depthwise_hwcm", channels=groups)
+                    weight_layout = "HWCM"
+                weight_shape = list(tensors[weight].shape)
+                kernel = weight_shape[1:3] if weight_layout == "OHWI" else weight_shape[0:2]
                 stride = [
                     scalar(options, 2, 1, N.Int32Flags) if options else 1,
                     scalar(options, 1, 1, N.Int32Flags) if options else 1,
@@ -763,7 +844,6 @@ def export_tflite_model(
                 "dilation": dilation,
                 "groups": groups,
                 "pads": pads,
-                "padding": [pads[0], pads[1]],
                 "data_layout": "NHWC",
                 "weight_layout": weight_layout,
             }
@@ -842,7 +922,6 @@ def export_tflite_model(
                 "kernel": kernel,
                 "stride": stride,
                 "pads": pads,
-                "padding": [pads[0], pads[1]],
                 "data_layout": "NHWC",
             }, out_tid=out_tid)
             set_value(out_tid, out_name, out_shape, "NHWC")
@@ -880,7 +959,7 @@ def export_tflite_model(
                 out_shape = out_tflite_shape
                 node_inputs = {f"input{i}": name_for_value(tid) for i, tid in enumerate(inputs)}
                 layout = "other"
-            add_node("Concat", node_inputs, out_name, out_shape, {"axis": axis, "count": len(inputs)}, out_tid=out_tid)
+            add_node("Concat", node_inputs, out_name, out_shape, {"axis": axis}, out_tid=out_tid)
             set_value(out_tid, out_name, out_shape, layout)
             continue
 
@@ -894,9 +973,7 @@ def export_tflite_model(
                     "input": in_name,
                     "scale": ensure_qparam_weight(inputs[0], "scale"),
                     "zero_point": ensure_typed_zero_point(inputs[0]),
-                }, f32_input, in_shape,
-                {"data_layout": "NHWC" if len(in_shape) == 4 else "other"},
-                out_dtype="float32")
+                }, f32_input, in_shape, out_dtype="float32")
                 add_node(
                     "Sigmoid", {"input": f32_input}, f32_output, in_shape,
                     out_dtype="float32",
@@ -905,7 +982,7 @@ def export_tflite_model(
                     "input": f32_output,
                     "scale": ensure_qparam_weight(out_tid, "scale"),
                     "zero_point": ensure_typed_zero_point(out_tid),
-                }, out_name, in_shape, {"data_layout": "NHWC" if len(in_shape) == 4 else "other"}, out_tid=out_tid)
+                }, out_name, in_shape, out_tid=out_tid)
             else:
                 add_node("Sigmoid", {"input": in_name}, out_name, in_shape, out_tid=out_tid)
             set_value(out_tid, out_name, in_shape, value_layout.get(inputs[0], "other"))
@@ -924,8 +1001,10 @@ def export_tflite_model(
     declared_tensors = set(inputs_def) | set(tensors)
     for node in nodes:
         declared_tensors.update(
-            name for name in (node.get("outputs") or {}).values()
-            if isinstance(name, str)
+            descriptor.get("tensor")
+            for descriptor in (node.get("outputs") or {}).values()
+            if isinstance(descriptor, dict)
+            and isinstance(descriptor.get("tensor"), str)
         )
     affine_descriptors = {
         name: descriptor for name, descriptor in affine_descriptors.items()
@@ -938,27 +1017,7 @@ def export_tflite_model(
 
     graph = {
         "format": GRAPH_FORMAT,
-        "source": {
-            "tflite": Path(model_path).name,
-            "source_ir": {
-                "dialect": source_ir.dialect.value,
-                "fingerprint": source_ir.fingerprint(),
-                "nodes": len(source_ir.nodes),
-                "tensors": len(source_ir.tensors),
-                "subgraphs": len(source_ir.metadata.get("tflite_additional_subgraphs", ())) + 1,
-            },
-            "float_storage": float_storage,
-            "raw_tflite_ops": len(op_tables),
-            "folded_dequantize_nodes": folded_dequantize,
-            "lowered_quantize_nodes": lowered_quantize,
-            "raw_nodes": raw_node_count,
-            "op_histogram": dict(op_counter),
-            "internal_layout": "NHWC",
-            "conv_weight_layout": "OHWI",
-            "depthwise_weight_layout": "OHWI",
-            "package_class": package_class,
-            **({"quantized_graph_contract": "w8a8-v1"} if package_class == "w8a8-v1" else {}),
-        },
+        "dimensions": {},
         "inputs": inputs_def,
         "outputs": [short(tkey(tid)) for tid in output_tids],
         "nodes": nodes,
@@ -970,26 +1029,32 @@ def export_tflite_model(
     quantization_report = externalize_quantization(
         graph, tensors, affine_descriptors
     )
-    graph["source"]["quantization_parameters"] = {
-        "tensors": quantization_report.tensors,
-        "scales_created": quantization_report.scales_created,
-        "zero_points_created": quantization_report.zero_points_created,
-        "parameters_reused": quantization_report.parameters_reused,
-    }
 
     typed_pipeline = _exporter_module("optimizer.typed_pipeline")
     optimize_runtime_package = typed_pipeline.optimize_runtime_package
-    serialize_pipeline_report = typed_pipeline.serialize_pipeline_report
     graph, optimized_tensors, typed_report = optimize_runtime_package(
         graph,
         tensors,
         source_name=f"{Path(model_path).name}:lowered",
+        allow_silu_numerical_migration=allow_silu_numerical_migration,
+        allow_quantized_bias_folding_numerical_migration=(
+            allow_quantized_bias_folding_numerical_migration
+        ),
+        allow_static_qdq_qbatch_matmul_numerical_migration=(
+            allow_static_qdq_qbatch_matmul_numerical_migration
+        ),
+        allow_static_qdq_groupnorm_silu_numerical_migration=(
+            allow_static_qdq_groupnorm_silu_numerical_migration
+        ),
         enable_static_qdq_layout_optimization=(
             enable_static_qdq_layout_optimization
         ),
+        enable_exact_common_subexpression_elimination=(
+            enable_exact_common_subexpression_elimination
+        ),
+        shape_profile={},
     )
     tensors = {name: np.asarray(value) for name, value in optimized_tensors.items()}
-    graph["source"]["typed_optimizer"] = serialize_pipeline_report(typed_report)
 
     save_file(tensors, str(out_path))
     graph_path = out_dir / "graph.json"
@@ -998,7 +1063,12 @@ def export_tflite_model(
         f"[Export] TFLite ops={len(op_tables)} "
         f"folded_dequantize={folded_dequantize} "
         f"lowered_nodes={raw_node_count} "
-        f"optimized_nodes={len(graph['nodes'])} weights={len(tensors)}"
+        f"optimized_nodes={len(graph['nodes'])} weights={len(tensors)} "
+        f"package_class={package_class} "
+        f"affine_parameters={quantization_report.scales_created + quantization_report.zero_points_created} "
+        f"optimizer_runs={len(typed_report.runs)} "
+        f"source_ir_nodes={len(source_ir.nodes)} "
+        f"ops={','.join(f'{name}:{count}' for name, count in sorted(op_counter.items())) or 'none'}"
     )
     print(f"[Export] Wrote {out_path} and {graph_path}")
 
@@ -1010,11 +1080,19 @@ def export_model(
     output_names=None,
     image_normalizations=None,
     input_shapes=None,
+    dimension_bounds=None,
+    anonymous_dimension_bounds=None,
     input_dtypes=None,
     output_dtypes=None,
     specialize_inputs=None,
     quant_mode: str = "preserve",
+    allow_silu_numerical_migration: bool = False,
+    allow_quantized_bias_folding_numerical_migration: bool = False,
+    allow_static_qdq_qbatch_matmul_numerical_migration: bool = False,
+    allow_static_qdq_groupnorm_silu_numerical_migration: bool = False,
     enable_static_qdq_layout_optimization: bool = True,
+    enable_exact_common_subexpression_elimination: bool = False,
+    report_callback=None,
 ):
     if quant_mode not in ("preserve", "require-w8a8"):
         raise ValueError(f"Unsupported quant mode: {quant_mode}")
@@ -1027,19 +1105,36 @@ def export_model(
             output_names=output_names,
             image_normalizations=image_normalizations,
             input_shapes=input_shapes,
+            dimension_bounds=dimension_bounds,
+            anonymous_dimension_bounds=anonymous_dimension_bounds,
             input_dtypes=input_dtypes,
             output_dtypes=output_dtypes,
             specialize_inputs=specialize_inputs,
             quant_mode=quant_mode,
+            allow_silu_numerical_migration=allow_silu_numerical_migration,
+            allow_quantized_bias_folding_numerical_migration=(
+                allow_quantized_bias_folding_numerical_migration
+            ),
+            allow_static_qdq_qbatch_matmul_numerical_migration=(
+                allow_static_qdq_qbatch_matmul_numerical_migration
+            ),
+            allow_static_qdq_groupnorm_silu_numerical_migration=(
+                allow_static_qdq_groupnorm_silu_numerical_migration
+            ),
             enable_static_qdq_layout_optimization=(
                 enable_static_qdq_layout_optimization
             ),
+            enable_exact_common_subexpression_elimination=(
+                enable_exact_common_subexpression_elimination
+            ),
+            report_callback=report_callback,
         )
         return
     if suffix == ".tflite":
-        if input_shapes or input_dtypes or output_dtypes or specialize_inputs:
+        if (input_shapes or dimension_bounds or anonymous_dimension_bounds or
+                input_dtypes or output_dtypes or specialize_inputs):
             raise ValueError(
-                "TFLite input shape/dtype bindings and specialization are not "
+                "TFLite dimension/input shape/dtype bindings and specialization are not "
                 "enabled until the TFLite frontend uses the shared static IR"
             )
         export_tflite_model(
@@ -1048,8 +1143,21 @@ def export_model(
             weight_dtype=weight_dtype,
             output_names=output_names,
             image_normalizations=image_normalizations,
+            allow_silu_numerical_migration=allow_silu_numerical_migration,
+            allow_quantized_bias_folding_numerical_migration=(
+                allow_quantized_bias_folding_numerical_migration
+            ),
+            allow_static_qdq_qbatch_matmul_numerical_migration=(
+                allow_static_qdq_qbatch_matmul_numerical_migration
+            ),
+            allow_static_qdq_groupnorm_silu_numerical_migration=(
+                allow_static_qdq_groupnorm_silu_numerical_migration
+            ),
             enable_static_qdq_layout_optimization=(
                 enable_static_qdq_layout_optimization
+            ),
+            enable_exact_common_subexpression_elimination=(
+                enable_exact_common_subexpression_elimination
             ),
         )
         if quant_mode == "require-w8a8":

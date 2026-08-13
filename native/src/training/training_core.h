@@ -320,10 +320,12 @@ typedef struct volvoxai_ptq_package_options {
     const char* source_weights_path;
     const char* output_graph_path;
     const char* output_weights_path;
+    const char* logical_fingerprint;
+    const char* profile_coverage_json;
 } volvoxai_ptq_package_options_t;
 
 #define VOLVOXAI_PTQ_PACKAGE_OPTIONS_INIT \
-    { sizeof(volvoxai_ptq_package_options_t), NULL, NULL, NULL, NULL }
+    { sizeof(volvoxai_ptq_package_options_t), NULL, NULL, NULL, NULL, NULL, NULL }
 
 /* Returns NULL unless an FP32 model is loaded with no active/merged adapter.
    Operations on a stale plan return -1; its sample-count query returns zero. */

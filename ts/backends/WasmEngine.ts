@@ -2,7 +2,7 @@ import { Tensor } from '../core/Tensor.js';
 import { DataType } from '../generated/volvoxaiEnums.js';
 import { kernelRoute } from '../generated/kernelRegistry.js';
 import { normalizeSpatialPair } from '../ops/spatialParameters.js';
-import type { Graph } from '../core/Graph.js';
+import type { RuntimeGraph } from '../core/RuntimeGraph.js';
 import { assertInferenceExecutionOptions, BackendEngine } from './BackendEngine.js';
 import { geluApproximation } from '../ops/gELU.js';
 import { ropeDescriptor } from '../ops/roPE.js';
@@ -10,6 +10,12 @@ import { ssmScanDescriptor } from '../ops/ssmScan.js';
 import { batchMatMulDescriptor } from '../ops/batchMatMul.js';
 import { qBatchMatMulDescriptor } from '../ops/qBatchMatMul.js';
 import { comparisonDescriptor, logicalNotDescriptor } from '../ops/comparison.js';
+import { SHAPE_SYMBOL_PATTERN, runtimeDTypeBytes } from '../ops/shapeSystem.js';
+import {
+  checkedWindowOutput,
+  fullSpatialPads,
+  spatialPair,
+} from '../ops/spatialKernelValidation.js';
 import { incrementalExecutionEnabled, incrementalNodeSelection } from './incrementalExecution.js';
 import {
   incrementalRowPosition,
@@ -17,7 +23,7 @@ import {
   quantizedRowNode,
 } from './quantizedRowExecution.js';
 import type { BackendExecutionOptions } from './BackendEngine.js';
-import type { GraphNode, RuntimeTypedArray } from '../types.js';
+import type { GraphNode, RuntimeDType, RuntimeTypedArray } from '../types.js';
 
 declare const __VOLVOXAI_BROWSER_ONLY__: boolean | undefined;
 
@@ -26,6 +32,8 @@ type WasmNumericExport = (...args: WasmAbiArgument[]) => number;
 
 interface WasmKernelExports extends WebAssembly.Exports {
   memory: WebAssembly.Memory;
+  __heap_base: WebAssembly.Global;
+  wasm_runtime_abi_version: WasmNumericExport;
   alloc_bytes: WasmNumericExport;
   argmax_axis_typed: WasmNumericExport;
   averagepool2d_f32: WasmNumericExport;
@@ -75,10 +83,13 @@ interface WasmKernelExports extends WebAssembly.Exports {
   maxpool2d_i8u8: WasmNumericExport;
   mean_height_f32: WasmNumericExport;
   moe_linear_f32: WasmNumericExport;
+  vx_moe_linear_banked_f32: WasmNumericExport;
   moe_router_f32: WasmNumericExport;
   non_max_suppression_typed: WasmNumericExport;
   pack_q8_weight: WasmNumericExport;
+  pack_q8_weight_canonical: WasmNumericExport;
   packed_q8_weight_size: WasmNumericExport;
+  packed_q8_weight_canonical_size: WasmNumericExport;
   pad_2d_f32: WasmNumericExport;
   prelu_generic_f32: WasmNumericExport;
   profile_x_f32: WasmNumericExport;
@@ -104,6 +115,8 @@ interface WasmKernelExports extends WebAssembly.Exports {
   relu_f32: WasmNumericExport;
   requantize_linear_i8u8: WasmNumericExport;
   reset_heap: WasmNumericExport;
+  heap_mark: WasmNumericExport;
+  heap_rewind: WasmNumericExport;
   resize_bilinear_f32: WasmNumericExport;
   resize_nearest2d_f32: WasmNumericExport;
   resize_nearest2d_i8u8: WasmNumericExport;
@@ -127,6 +140,7 @@ interface WasmKernelExports extends WebAssembly.Exports {
   upsample_nearest2x_f32: WasmNumericExport;
   where_typed_f32: WasmNumericExport;
   where_typed_32: WasmNumericExport;
+  where_broadcast_32: WasmNumericExport;
 }
 
 interface RelaxedSimdExports extends WebAssembly.Exports {
@@ -147,9 +161,10 @@ interface RelaxedSimdInstantiation {
 }
 
 type WasmNode = GraphNode<Tensor> & { params: Record<string, any> };
-type WasmGraph = Graph & { nodes: WasmNode[] };
+type WasmGraph = RuntimeGraph & { nodes: WasmNode[] };
 
 const WASM_PREPARED_GRAPH = Symbol('WasmPreparedGraph');
+const WASM_INVARIANT_SCHEDULE = Symbol('WasmInvariantSchedule');
 
 interface WasmPreparedStep {
   readonly nodeIndex: number;
@@ -163,6 +178,21 @@ interface WasmPreparedInputPreflights {
   readonly qLayerNorm: readonly number[];
   readonly qSDPA: readonly number[];
   readonly qMaskedMean: readonly number[];
+  readonly rope: readonly number[];
+}
+
+interface WasmInvariantSchedule {
+  readonly [WASM_INVARIANT_SCHEDULE]: true;
+  readonly tensorCount: number;
+  readonly outputNames: readonly string[];
+  readonly schedule: readonly WasmPreparedStep[];
+  readonly inputPreflights: WasmPreparedInputPreflights;
+}
+
+interface WasmInvariantScheduleInput {
+  readonly nodes: readonly Readonly<{ readonly id: string | number; readonly opType: string }>[];
+  readonly tensorCount: number;
+  readonly outputNames: readonly string[];
 }
 
 interface WasmPreparedGraph extends Readonly<object> {
@@ -177,13 +207,135 @@ interface WasmPreparedGraph extends Readonly<object> {
 
 interface PackedF32WeightDescriptor {
   readonly pointer: number;
+  readonly bytes: number;
   readonly dIn: number;
   readonly dOut: number;
   readonly doutFirst: boolean;
   readonly cacheKey: string;
 }
 
+interface PackedQ8WeightDescriptor {
+  readonly pointer: number;
+  readonly bytes: number;
+  readonly cacheKey: string;
+}
+
+interface WasmTensorCapacity {
+  readonly dtype: RuntimeDType;
+  readonly capacityBytes: number;
+  readonly isWeight: boolean;
+  readonly owner: string;
+  /** Present only for topology-liveness activation storage. */
+  readonly arena?: RuntimeDType;
+  /** Byte offset from the dtype arena base. */
+  readonly offsetBytes?: number;
+}
+
+type WasmActivationStorage = 'persistent' | 'liveness';
+
+interface WasmActivationLivenessRegion {
+  readonly owner: string;
+  readonly dtype: RuntimeDType;
+  readonly offsetBytes: number;
+  readonly sizeBytes: number;
+  readonly birth: number;
+  readonly lastUse: number;
+}
+
+interface WasmActivationLivenessLayout {
+  readonly capacityByArena: ReadonlyMap<RuntimeDType, number>;
+  readonly capacityBytes: number;
+  readonly uniqueBytes: number;
+  readonly regions: ReadonlyMap<string, WasmActivationLivenessRegion>;
+}
+
+interface WasmAllocationMeasurement {
+  cursor: number;
+}
+
+interface WasmStagedMetadataWrite {
+  readonly pointer: number;
+  readonly bytes: Uint8Array;
+}
+
+interface WasmCapacityCandidate {
+  readonly capacities: Map<string, WasmTensorCapacity>;
+  readonly currentBytes: number;
+  readonly requiredBytes: number;
+  readonly grew: boolean;
+  readonly arenaCapacities: ReadonlyMap<RuntimeDType, number> | null;
+}
+
+export interface WasmGraphAllocationOptions {
+  /** Optional initial capacity targets. Omitted names start at logical bytes. */
+  readonly tensorCapacityBytes?: Readonly<Record<string, number>>;
+  /** Hard per-tensor capacity ceilings proved for the complete shape domain. */
+  readonly tensorMaximumBytes?: Readonly<Record<string, number>>;
+  /** Geometric activation growth factor. Default: 2. */
+  readonly capacityGrowthFactor?: number;
+  /**
+   * Ordinary inference may reuse storage across topology-disjoint activation
+   * lifetimes. Incremental decode must retain every intermediate instead.
+   * The direct engine defaults to the conservative persistent mode.
+   */
+  readonly activationStorage?: WasmActivationStorage;
+  readonly shapeSignature?: string;
+}
+
+export interface WasmArenaInspection {
+  readonly reusable: boolean;
+  readonly currentSignature: string | null;
+  readonly activationStorage: WasmActivationStorage;
+  readonly persistentWeightBytes: number;
+  readonly packedWeightBytes: number;
+  readonly logicalActivationBytes: number;
+  readonly activationRequiredBytes: number;
+  readonly activationReuseBytes: number;
+  readonly activationArenaCount: number;
+  readonly activationCapacityBytes: number;
+  readonly activationCapacityHighWaterBytes: number;
+  readonly activationGrowCount: number;
+  readonly variantBytes: number;
+  readonly variantHighWaterBytes: number;
+  readonly heapBytes: number;
+  readonly heapHighWaterBytes: number;
+  readonly memoryGrowCount: number;
+  readonly variantRebindCount: number;
+  readonly f32PackCount: number;
+  readonly q8PackCount: number;
+}
+
 type WasmNodeMetadata = { kind: string } & Record<string, any>;
+type WasmQ8PackMode = 'w8a8-wide' | 'canonical';
+
+/**
+ * compile() phase breakdown, opt-in via `globalThis.__VOLVOX_WASM_COMPILE_PROFILE`.
+ *
+ * The phase fields partition compile(); `unattributedMs` is whatever the phases
+ * did not claim. `growMs`/`growCount`/`growPages` are *nested* inside the
+ * allocator phases (tensorAllocMs, packWeightMs, metadataAllocMs) rather than
+ * being a phase of their own, so they must not be added to the phase sum.
+ */
+interface WasmCompileProfile {
+  preflightMs: number;
+  tensorAllocMs: number;
+  descriptorMs: number;
+  packWeightMs: number;
+  viewRefreshMs: number;
+  metadataAllocMs: number;
+  totalMs: number;
+  unattributedMs: number;
+  /* Nested inside the allocator phases above. */
+  growMs: number;
+  growCount: number;
+  growPages: number;
+  allocBytesCount: number;
+  viewRefreshCount: number;
+  descriptorCount: number;
+  tensorCopyBytes: number;
+  packBytes: number;
+  finalHeapBytes: number;
+}
 
 interface WasmAdapterSelector {
   name: string;
@@ -199,6 +351,13 @@ interface WasmExecutionOptions extends BackendExecutionOptions {
 const WASM_RELAXED_SIMD_SECTION = 'volvoxai.relaxed_simd.v1';
 const WASM_RELAXED_QLINEAR_EXPORT = 'qlinear_i8u8_relaxed';
 const WASM_QCONV_IM2COL_MAX_BYTES = 64 * 1024 * 1024;
+const wasmW8A8PackMode = (dOut: number): WasmQ8PackMode =>
+  dOut >= 8 ? 'w8a8-wide' : 'canonical';
+/* Route ids are F32 today, so a dense lookup beyond the contiguous F32 integer
+ * domain is neither useful nor safe. Keep a malformed sparse global slot from
+ * materializing a near-wasm32-sized JavaScript typed array before the arena
+ * allocator gets a chance to reject it. */
+const WASM_MOE_SLOT_TABLE_MAX_BYTES = 64 * 1024 * 1024;
 
 async function instantiateRelaxedSimdChild(
   parentModule: unknown,
@@ -305,10 +464,404 @@ function localMaskBinding(
 
 const WASM_PORTABLE_MAX_RANK = 8;
 const WASM_PORTABLE_MAX_U32 = 0xffffffff;
+/* wasm32 addresses 4 GiB in 64 KiB pages, so the heap can never exceed this. */
+const WASM_MAX_MEMORY_PAGES = 65536;
+/* Reshape-family operators that only reinterpret a tensor's shape. Their output
+ * is the input's bytes, so compile() aliases the heap pointer instead of
+ * copying. Transpose is deliberately absent: it permutes storage. */
+const WASM_LAYOUT_INVARIANT_OPS = new Set([
+  'Reshape', 'Flatten', 'Squeeze', 'Unsqueeze', 'Identity',
+]);
+/* Largest single geometric step, in pages (64 MiB). Doubling below this keeps
+ * the grow count logarithmic; capping above it bounds the leftover headroom to
+ * one chunk instead of one whole doubling. */
+const WASM_GROW_MAX_STEP_PAGES = 1024;
+const WASM_NAME_ENCODER = new TextEncoder();
+
+function compareWasmNames(left: string, right: string): number {
+  if (left === right) return 0;
+  const leftBytes = WASM_NAME_ENCODER.encode(left);
+  const rightBytes = WASM_NAME_ENCODER.encode(right);
+  const shared = Math.min(leftBytes.length, rightBytes.length);
+  for (let index = 0; index < shared; index++) {
+    if (leftBytes[index] !== rightBytes[index]) return leftBytes[index] - rightBytes[index];
+  }
+  return leftBytes.length - rightBytes.length || (left < right ? -1 : 1);
+}
+
+function checkedWasmActivationAdd(left: number, right: number, label: string): number {
+  if (!Number.isSafeInteger(left) || left < 0 || !Number.isSafeInteger(right) || right < 0 ||
+      left > 0x7ffffff0 - right) {
+    throw new Error(`WASM ${label} exceeds the signed allocator address range.`);
+  }
+  return left + right;
+}
+
+function sameWasmAliasMap(
+  left: ReadonlyMap<string, string>,
+  right: ReadonlyMap<string, string>,
+): boolean {
+  return left.size === right.size && [...left.entries()].every(
+    ([name, source]) => right.get(name) === source,
+  );
+}
+
+/**
+ * Storage-view operators are represented as one physical lifetime. Extending
+ * the source lifetime through every aliased consumer is essential: merely
+ * assigning the same pointer after packing could let an unrelated tensor
+ * overwrite a still-live view.
+ */
+function wasmActivationAliases(
+  graph: WasmGraph,
+  prepared: WasmPreparedGraph,
+): ReadonlyMap<string, string> {
+  const aliases = new Map<string, string>();
+  for (const step of prepared.schedule) {
+    const node = graph.nodes[step.nodeIndex];
+    const viewOnly = WASM_LAYOUT_INVARIANT_OPS.has(node.opType);
+    if (node.opType !== 'Dropout' && !viewOnly) continue;
+    const input = node.inputs.input || node.inputs.x || node.inputs.data;
+    const output = node.outputs.out || Object.values(node.outputs || {})[0];
+    if (!input || !output || input.dtype !== output.dtype ||
+        input.sizeBytes !== output.sizeBytes) {
+      if (viewOnly) continue;
+      throw new Error(`Dropout node ${node.id} requires equal-size input/output tensors.`);
+    }
+    aliases.set(output.name, input.name);
+  }
+  return aliases;
+}
+
+function wasmActivationAliasRoots(
+  graph: WasmGraph,
+  aliases: ReadonlyMap<string, string>,
+): ReadonlyMap<string, string> {
+  const roots = new Map<string, string>();
+  const resolve = (name: string, visiting = new Set<string>()): string => {
+    const cached = roots.get(name);
+    if (cached !== undefined) return cached;
+    const source = aliases.get(name);
+    if (source === undefined) {
+      roots.set(name, name);
+      return name;
+    }
+    if (!graph.tensors.has(source)) {
+      throw new Error(`WASM storage alias '${name}' references unknown tensor '${source}'.`);
+    }
+    if (visiting.has(name)) {
+      throw new Error(`WASM storage alias cycle contains tensor '${name}'.`);
+    }
+    visiting.add(name);
+    const root = resolve(source, visiting);
+    visiting.delete(name);
+    roots.set(name, root);
+    return root;
+  };
+  for (const [name, tensor] of graph.tensors) {
+    if (tensor.isWeight !== true) resolve(name);
+  }
+  return roots;
+}
+
+interface MutableWasmLivenessRegion {
+  readonly owner: string;
+  readonly dtype: RuntimeDType;
+  readonly birth: number;
+  readonly lastUse: number;
+  readonly sizeBytes: number;
+  offsetBytes: number;
+}
+
+interface MutableWasmFreeRegion {
+  offsetBytes: number;
+  sizeBytes: number;
+}
+
+function coalesceWasmFreeRegions(regions: MutableWasmFreeRegion[]): void {
+  regions.sort((left, right) => left.offsetBytes - right.offsetBytes);
+  for (let index = 1; index < regions.length;) {
+    const previous = regions[index - 1];
+    const current = regions[index];
+    if (previous.offsetBytes + previous.sizeBytes === current.offsetBytes) {
+      previous.sizeBytes += current.sizeBytes;
+      regions.splice(index, 1);
+    } else {
+      index++;
+    }
+  }
+}
+
+/** Deterministic best-fit packing of exact or bounded activation sizes. */
+function planWasmActivationLiveness(
+  graph: WasmGraph,
+  prepared: WasmPreparedGraph,
+  aliases: ReadonlyMap<string, string>,
+  sizes: ReadonlyMap<string, number>,
+): WasmActivationLivenessLayout {
+  const roots = wasmActivationAliasRoots(graph, aliases);
+  const birth = new Map<string, number>();
+  const lastUse = new Map<string, number>();
+  const dtypeByRoot = new Map<string, RuntimeDType>();
+  const bytesByRoot = new Map<string, number>();
+  const invariantRoots = new Set<string>();
+  let uniqueBytes = 0;
+
+  for (const [name, tensor] of graph.tensors) {
+    if (tensor.isWeight === true) continue;
+    const sizeBytes = sizes.get(name);
+    if (!Number.isSafeInteger(sizeBytes) || sizeBytes! < tensor.sizeBytes ||
+        sizeBytes! > 0x7ffffff0 || sizeBytes! % runtimeDTypeBytes(tensor.dtype) !== 0) {
+      throw new Error(`WASM activation '${name}' has an invalid planned byte size.`);
+    }
+    const root = roots.get(name)!;
+    const rootTensor = graph.tensors.get(root);
+    if (!rootTensor) {
+      throw new Error(`WASM activation alias '${name}' has unknown root '${root}'.`);
+    }
+    if (rootTensor.isWeight === true) {
+      if (rootTensor.dtype !== tensor.dtype || sizeBytes !== rootTensor.sizeBytes) {
+        throw new Error(
+          `WASM activation alias '${name}' exceeds or disagrees with invariant root '${root}'.`,
+        );
+      }
+      invariantRoots.add(root);
+      continue;
+    }
+    const dtype = dtypeByRoot.get(root);
+    if (dtype !== undefined && dtype !== tensor.dtype) {
+      throw new Error(`WASM activation alias '${name}' changes storage dtype.`);
+    }
+    dtypeByRoot.set(root, tensor.dtype);
+    bytesByRoot.set(root, Math.max(bytesByRoot.get(root) ?? 0, sizeBytes!));
+    if (tensor.isInput) {
+      birth.set(root, -1);
+      lastUse.set(root, -1);
+    }
+  }
+
+  const producedInvariantAliases = new Set<string>();
+  for (let scheduleIndex = 0; scheduleIndex < prepared.schedule.length; scheduleIndex++) {
+    const step = prepared.schedule[scheduleIndex];
+    const node = graph.nodes[step.nodeIndex];
+    for (const tensor of Object.values(node.inputs)) {
+      if (tensor.isWeight === true) continue;
+      const root = roots.get(tensor.name);
+      if (root !== undefined && invariantRoots.has(root)) {
+        if (!aliases.has(tensor.name) || !producedInvariantAliases.has(tensor.name)) {
+          throw new Error(`WASM topology consumes '${tensor.name}' before it is produced.`);
+        }
+        continue;
+      }
+      if (root === undefined || !birth.has(root)) {
+        throw new Error(`WASM topology consumes '${tensor.name}' before it is produced.`);
+      }
+      lastUse.set(root, Math.max(lastUse.get(root)!, scheduleIndex));
+    }
+    for (const tensor of Object.values(node.outputs)) {
+      if (tensor.isWeight === true) {
+        throw new Error(`WASM topology node '${node.id}' produces weight '${tensor.name}'.`);
+      }
+      const root = roots.get(tensor.name);
+      if (root === undefined) {
+        throw new Error(`WASM topology node '${node.id}' has unknown output '${tensor.name}'.`);
+      }
+      if (invariantRoots.has(root)) {
+        const source = aliases.get(tensor.name);
+        if (source === undefined) {
+          throw new Error(
+            `WASM topology node '${node.id}' produces invariant-root activation ` +
+            `'${tensor.name}' without a storage alias.`,
+          );
+        }
+        const sourceTensor = graph.tensors.get(source);
+        if (!sourceTensor || (sourceTensor.isWeight !== true &&
+            !producedInvariantAliases.has(source))) {
+          throw new Error(`WASM topology aliases '${tensor.name}' before its source is live.`);
+        }
+        producedInvariantAliases.add(tensor.name);
+        continue;
+      }
+      if (aliases.has(tensor.name)) {
+        if (!birth.has(root)) {
+          throw new Error(`WASM topology aliases '${tensor.name}' before its source is live.`);
+        }
+        lastUse.set(root, Math.max(lastUse.get(root)!, scheduleIndex));
+      } else {
+        if (birth.has(root)) {
+          throw new Error(`WASM topology produces activation '${tensor.name}' more than once.`);
+        }
+        birth.set(root, scheduleIndex);
+        lastUse.set(root, scheduleIndex);
+      }
+    }
+  }
+  for (const name of graph.outputNames) {
+    const tensor = graph.tensors.get(name);
+    if (!tensor) throw new Error(`WASM topology declares unknown output '${name}'.`);
+    if (tensor.isWeight === true) continue;
+    const root = roots.get(name)!;
+    if (invariantRoots.has(root)) {
+      if (!producedInvariantAliases.has(name)) {
+        throw new Error(`WASM topology output '${name}' is never produced.`);
+      }
+      continue;
+    }
+    if (!birth.has(root)) throw new Error(`WASM topology output '${name}' is never produced.`);
+    lastUse.set(root, prepared.schedule.length);
+  }
+  const valuesByDtype = new Map<RuntimeDType, MutableWasmLivenessRegion[]>();
+  for (const owner of [...bytesByRoot.keys()].sort(compareWasmNames)) {
+    const ownerBirth = birth.get(owner);
+    const ownerLastUse = lastUse.get(owner);
+    if (ownerBirth === undefined || ownerLastUse === undefined) {
+      throw new Error(`WASM activation '${owner}' has no complete topology lifetime.`);
+    }
+    const sizeBytes = bytesByRoot.get(owner)!;
+    uniqueBytes = checkedWasmActivationAdd(uniqueBytes, sizeBytes,
+      'unique logical activation bytes');
+    const dtype = dtypeByRoot.get(owner)!;
+    const values = valuesByDtype.get(dtype) ?? [];
+    values.push({
+      owner,
+      dtype,
+      birth: ownerBirth,
+      lastUse: ownerLastUse,
+      sizeBytes,
+      offsetBytes: 0,
+    });
+    valuesByDtype.set(dtype, values);
+  }
+
+  const capacityByArena = new Map<RuntimeDType, number>();
+  const regions = new Map<string, WasmActivationLivenessRegion>();
+  let capacityBytes = 0;
+  for (const [dtype, values] of [...valuesByDtype.entries()]
+    .sort(([left], [right]) => compareWasmNames(left, right))) {
+    values.sort((left, right) => left.birth - right.birth ||
+      right.sizeBytes - left.sizeBytes || compareWasmNames(left.owner, right.owner));
+    const live: MutableWasmLivenessRegion[] = [];
+    const free: MutableWasmFreeRegion[] = [];
+    let highWater = 0;
+    for (const value of values) {
+      for (let index = live.length - 1; index >= 0; index--) {
+        if (live[index].lastUse < value.birth) {
+          free.push({
+            offsetBytes: live[index].offsetBytes,
+            sizeBytes: live[index].sizeBytes,
+          });
+          live.splice(index, 1);
+        }
+      }
+      coalesceWasmFreeRegions(free);
+      let best = -1;
+      for (let index = 0; index < free.length; index++) {
+        if (free[index].sizeBytes < value.sizeBytes) continue;
+        if (best === -1 || free[index].sizeBytes < free[best].sizeBytes ||
+            (free[index].sizeBytes === free[best].sizeBytes &&
+             free[index].offsetBytes < free[best].offsetBytes)) {
+          best = index;
+        }
+      }
+      if (best === -1) {
+        value.offsetBytes = highWater;
+        highWater = checkedWasmActivationAdd(highWater, value.sizeBytes,
+          `${dtype} liveness arena capacity`);
+      } else {
+        const selected = free[best];
+        value.offsetBytes = selected.offsetBytes;
+        selected.offsetBytes += value.sizeBytes;
+        selected.sizeBytes -= value.sizeBytes;
+        if (selected.sizeBytes === 0) free.splice(best, 1);
+      }
+      live.push(value);
+      regions.set(value.owner, Object.freeze({ ...value }));
+    }
+    capacityByArena.set(dtype, highWater);
+    capacityBytes = checkedWasmActivationAdd(capacityBytes, highWater,
+      'liveness arena capacity');
+  }
+  return Object.freeze({
+    capacityByArena,
+    capacityBytes,
+    uniqueBytes,
+    regions,
+  });
+}
+
+/**
+ * Concrete best-fit fragmentation is not monotone. If it exceeds the
+ * independently packed maximum-domain arena, project the exact sizes onto the
+ * maximum offsets instead of violating the compiled allocation proof.
+ */
+function planWasmActivationWithinMaximum(
+  graph: WasmGraph,
+  prepared: WasmPreparedGraph,
+  aliases: ReadonlyMap<string, string>,
+  sizes: ReadonlyMap<string, number>,
+  maximum: WasmActivationLivenessLayout,
+): WasmActivationLivenessLayout {
+  const concrete = planWasmActivationLiveness(graph, prepared, aliases, sizes);
+  const fits = [...concrete.capacityByArena].every(([arena, bytes]) =>
+    bytes <= (maximum.capacityByArena.get(arena) ?? -1));
+  if (fits) return concrete;
+  const regions = new Map<string, WasmActivationLivenessRegion>();
+  const capacityByArena = new Map<RuntimeDType, number>();
+  let capacityBytes = 0;
+  for (const [owner, region] of concrete.regions) {
+    const maximumRegion = maximum.regions.get(owner);
+    if (!maximumRegion || maximumRegion.dtype !== region.dtype ||
+        maximumRegion.birth !== region.birth || maximumRegion.lastUse !== region.lastUse ||
+        maximumRegion.sizeBytes < region.sizeBytes) {
+      throw new Error(`WASM maximum liveness layout cannot project activation '${owner}'.`);
+    }
+    const projected = Object.freeze({ ...region, offsetBytes: maximumRegion.offsetBytes });
+    regions.set(owner, projected);
+    const end = checkedWasmActivationAdd(projected.offsetBytes, projected.sizeBytes,
+      `projected activation '${owner}' end`);
+    capacityByArena.set(region.dtype, Math.max(capacityByArena.get(region.dtype) ?? 0, end));
+  }
+  for (const [arena, bytes] of capacityByArena) {
+    const maximumBytes = maximum.capacityByArena.get(arena);
+    if (maximumBytes === undefined || bytes > maximumBytes) {
+      throw new Error(`WASM projected '${arena}' arena exceeds its maximum layout.`);
+    }
+    capacityBytes = checkedWasmActivationAdd(capacityBytes, bytes,
+      'projected liveness arena capacity');
+  }
+  return Object.freeze({
+    capacityByArena,
+    capacityBytes,
+    uniqueBytes: concrete.uniqueBytes,
+    regions,
+  });
+}
 
 function sameShape(left, right) {
   return Array.isArray(left) && Array.isArray(right) && left.length === right.length &&
     left.every((dimension, index) => dimension === right[index]);
+}
+
+function normalizedTargetMatchesConcreteShape(target, shape) {
+  if (target === undefined) return true;
+  if (!Array.isArray(target) || !Array.isArray(shape) || target.length !== shape.length) {
+    return false;
+  }
+  const symbols = new Map();
+  for (let axis = 0; axis < target.length; axis++) {
+    const dimension = target[axis];
+    if (typeof dimension === 'number') {
+      if (!Number.isSafeInteger(dimension) || dimension <= 0 || dimension !== shape[axis]) {
+        return false;
+      }
+      continue;
+    }
+    if (typeof dimension !== 'string' || !SHAPE_SYMBOL_PATTERN.test(dimension)) return false;
+    const previous = symbols.get(dimension);
+    if (previous !== undefined && previous !== shape[axis]) return false;
+    symbols.set(dimension, shape[axis]);
+  }
+  return true;
 }
 
 function portableElementCount(shape) {
@@ -445,21 +998,44 @@ function portableGatherElementsDescriptor(node) {
 }
 
 function portableWhereDescriptor(node) {
-  const condition = node.inputs.cond || node.inputs.condition || node.inputs.mask;
-  const a = node.inputs.x || node.inputs.a || node.inputs.input;
-  const b = node.inputs.y || node.inputs.b;
+  const condition = node.opType === 'Where' ? node.inputs.condition : node.inputs.mask;
+  const a = node.inputs.a;
+  const b = node.inputs.b;
   const output = node.outputs.out || Object.values(node.outputs || {})[0];
   const elements = portableTensorElements(output);
-  if (!condition || !a || !b || !output || !['float32', 'int32'].includes(condition.dtype) ||
+  const conditionRank = condition?.shape?.length;
+  const aRank = a?.shape?.length;
+  const bRank = b?.shape?.length;
+  const outputRank = output?.shape?.length;
+  if (!condition || !a || !b || !output || !portable32BitTensor(condition) ||
       !portable32BitTensor(a) || b.dtype !== a.dtype || output.dtype !== a.dtype ||
       !portable32BitTensor(b) || !portable32BitTensor(output) ||
-      portableTensorElements(condition) !== elements || portableTensorElements(a) !== elements ||
-      portableTensorElements(b) !== elements || elements == null || !sameShape(condition.shape, output.shape) ||
-      !sameShape(a.shape, output.shape) || !sameShape(b.shape, output.shape)) {
-    throw new Error(`WASM ${node.opType} node ${node.id} requires exact-shape same-dtype F32/I32 operands/output and an F32 or I32 condition.`);
+      elements == null || !Number.isInteger(conditionRank) || !Number.isInteger(aRank) ||
+      !Number.isInteger(bRank) || !Number.isInteger(outputRank) ||
+      conditionRank > WASM_PORTABLE_MAX_RANK || aRank > WASM_PORTABLE_MAX_RANK ||
+      bRank > WASM_PORTABLE_MAX_RANK || outputRank > WASM_PORTABLE_MAX_RANK ||
+      outputRank !== Math.max(conditionRank, aRank, bRank)) {
+    throw new Error(`WASM ${node.opType} node ${node.id} requires rank-0..8 same-dtype F32/I32 branches/output and an F32 or I32 condition.`);
+  }
+  const inputs = [condition, a, b];
+  for (let axis = 0; axis < outputRank; axis++) {
+    const expected = Math.max(...inputs.map((tensor) => {
+      const offset = outputRank - tensor.shape.length;
+      return axis < offset ? 1 : tensor.shape[axis - offset];
+    }));
+    if (output.shape[axis] !== expected || inputs.some((tensor) => {
+      const offset = outputRank - tensor.shape.length;
+      const dimension = axis < offset ? 1 : tensor.shape[axis - offset];
+      return dimension !== 1 && dimension !== expected;
+    })) {
+      throw new Error(`WASM ${node.opType} node ${node.id} has incompatible broadcast shapes.`);
+    }
+  }
+  if (node.opType === 'Mask' && inputs.some((tensor) => !sameShape(tensor.shape, output.shape))) {
+    throw new Error(`WASM Mask node ${node.id} requires exact-shape inputs and output.`);
   }
   return {
-    condition, a, b, output, elements,
+    condition, a, b, output, elements, conditionRank, aRank, bRank, outputRank,
     conditionType: wasmDtypeCode(condition.dtype),
     dataType: wasmDtypeCode(a.dtype),
   };
@@ -1474,6 +2050,57 @@ function portableFalseOrAbsent(value) {
   return value == null || value === false || value === 0;
 }
 
+function portableF32Pool2DDescriptor(node) {
+  if (node.opType !== 'MaxPool2D' && node.opType !== 'AveragePool2D') return null;
+  const operation = `WASM ${node.opType} node ${node.id}`;
+  const input = node.inputs?.input || node.inputs?.x || node.inputs?.data;
+  const output = portableOutput(node);
+  const params = node.params ?? {};
+  if (!portableF32Tensor(input) || !portableF32Tensor(output) ||
+      input.shape.length !== 4 || output.shape.length !== 4 ||
+      input.shape[0] !== output.shape[0] || input.shape[3] !== output.shape[3]) {
+    throw new Error(`${operation} requires compatible F32 NHWC input/output tensors.`);
+  }
+  if (params == null || typeof params !== 'object' || Array.isArray(params) ||
+      (params.data_layout != null && params.data_layout !== 'NHWC') ||
+      !portableFalseOrAbsent(params.ceil_mode)) {
+    throw new Error(`${operation} requires canonical NHWC floor-window parameters.`);
+  }
+  if (node.opType === 'AveragePool2D' &&
+      (!portableFalseOrAbsent(params.count_include_pad) ||
+       (params.auto_pad != null && params.auto_pad !== '' && params.auto_pad !== 'NOTSET'))) {
+    throw new Error(`${operation} does not support count_include_pad or automatic padding.`);
+  }
+  const [kernelY, kernelX] = spatialPair(
+    params.kernel, 1, operation, 'kernel', false, true,
+  );
+  const [strideY, strideX] = spatialPair(
+    params.stride, 1, operation, 'stride', false,
+  );
+  const [dilationY, dilationX] = spatialPair(
+    params.dilation, 1, operation, 'dilation', false,
+  );
+  if (dilationY !== 1 || dilationX !== 1) {
+    throw new Error(`${operation} supports only unit dilation.`);
+  }
+  const pads = fullSpatialPads(params, operation, node.opType === 'AveragePool2D');
+  const [batch, inputHeight, inputWidth, channels] = input.shape;
+  const outputHeight = checkedWindowOutput(
+    inputHeight, kernelY, strideY, pads[0], pads[2], 1, `${operation} output height`,
+  );
+  const outputWidth = checkedWindowOutput(
+    inputWidth, kernelX, strideX, pads[1], pads[3], 1, `${operation} output width`,
+  );
+  if (!sameShape(output.shape, [batch, outputHeight, outputWidth, channels])) {
+    throw new Error(`${operation} output shape is incompatible with its canonical descriptor.`);
+  }
+  return {
+    kind: 'f32Pool2D', opType: node.opType, input, output,
+    batch, inputHeight, inputWidth, channels, outputHeight, outputWidth,
+    kernelY, kernelX, strideY, strideX, paddingY: pads[0], paddingX: pads[1],
+  };
+}
+
 function portableQuantizedNearestParameters(node) {
   const params = node.params || {};
   if (node.opType === 'Resize') {
@@ -1641,10 +2268,16 @@ function portableExpandDescriptor(node) {
   const byteStorage = byteDescriptor?.quantization?.scheme === 'per_tensor';
   const plainStorage = portable32BitTensor(input) && output?.dtype === input?.dtype &&
     portable32BitTensor(output);
+  const params = node.params ?? {};
+  const paramsAreRecord = params !== null && typeof params === 'object' && !Array.isArray(params);
+  const paramNames = paramsAreRecord ? Reflect.ownKeys(params) : [];
+  const validParams = paramsAreRecord &&
+    paramNames.every((name) => name === 'shape') &&
+    normalizedTargetMatchesConcreteShape(params.shape, output?.shape);
   if ((!plainStorage && !byteStorage) || !Number.isInteger(inputRank) ||
       !Number.isInteger(outputRank) || inputRank < 1 || outputRank < inputRank ||
       outputRank > WASM_PORTABLE_MAX_RANK || elements == null || input === output ||
-      Object.keys(node.params || {}).length !== 0) {
+      !validParams) {
     throw new Error(`WASM ${node.opType} node ${node.id} requires distinct rank-1..8 same-dtype F32/I32 or descriptor-preserving per-tensor I8/U8 tensors.`);
   }
   const offset = outputRank - inputRank;
@@ -1846,8 +2479,17 @@ function portableMoELinearDescriptor(node) {
       portableTensorElements(output) !== rows * dOut || (expertBias && !sameShape(expertBias.shape, [experts, dOut]))) {
     throw new Error(`WASM MoELinear node ${node.id} requires canonical F32 expert and route tensors.`);
   }
+  const residentSlots = node.residentSlots || null;
+  if (residentSlots && (residentSlots.length !== experts ||
+      !residentSlots.every((slot, index) =>
+        Number.isInteger(slot) && slot >= 0 &&
+        (index === 0 || slot > residentSlots[index - 1])))) {
+    throw new Error(
+      `WASM MoELinear node ${node.id} requires ascending resident slot ids ` +
+      `matching its ${experts} staged experts.`);
+  }
   return { input, expertWeight, expertBias, routeIndices, routeWeights, output,
-    rows, dIn, dOut, experts, topK };
+    rows, dIn, dOut, experts, topK, residentSlots };
 }
 
 
@@ -1855,6 +2497,16 @@ export class WasmEngine extends BackendEngine {
   declare graph: WasmGraph;
   preparedGraph!: WasmPreparedGraph;
   compiledTopologyRevision = 0;
+  static _newCompileProfile(): WasmCompileProfile {
+    return {
+      preflightMs: 0, tensorAllocMs: 0, descriptorMs: 0, packWeightMs: 0,
+      viewRefreshMs: 0, metadataAllocMs: 0, totalMs: 0, unattributedMs: 0,
+      growMs: 0, growCount: 0, growPages: 0,
+      allocBytesCount: 0, viewRefreshCount: 0, descriptorCount: 0,
+      tensorCopyBytes: 0, packBytes: 0, finalHeapBytes: 0,
+    };
+  }
+
   readonly wasmModule: WasmInstantiation;
   readonly api: WasmKernelExports;
   readonly mem: WebAssembly.Memory;
@@ -1863,11 +2515,41 @@ export class WasmEngine extends BackendEngine {
   qbatchMatMulSimdEnabled: boolean;
   readonly pointers: Map<string, number>;
   readonly f32PackedWeights: Map<string, PackedF32WeightDescriptor>;
+  readonly q8PackedWeights: Map<string, PackedQ8WeightDescriptor>;
   readonly f32PackedNodes: Map<WasmNode, PackedF32WeightDescriptor>;
+  readonly tensorCapacities: Map<string, WasmTensorCapacity>;
+  readonly tensorMaximumBytes: Map<string, number>;
   nodeMetadata!: Map<WasmNode, WasmNodeMetadata>;
   qconvIm2ColPointer: number;
   qconvIm2ColBytes: number;
   compiledWeightRevision = 0;
+  _variantArenaMark: number | null = null;
+  _activationArenaMark: number | null = null;
+  _metadataArenaMark: number | null = null;
+  _allocationMeasurement: WasmAllocationMeasurement | null = null;
+  _variantMetadataStaging: WasmStagedMetadataWrite[] | null = null;
+  _currentShapeSignature: string | null = null;
+  _persistentWeightBytes = 0;
+  _activationStorage: WasmActivationStorage = 'persistent';
+  _activationAliases: ReadonlyMap<string, string> = new Map();
+  _maximumLivenessLayout: WasmActivationLivenessLayout | null = null;
+  _activationArenaCapacities: ReadonlyMap<RuntimeDType, number> = new Map();
+  _activationCapacityBytes = 0;
+  _activationCapacityHighWaterBytes = 0;
+  _activationRequiredBytes = 0;
+  _activationGrowCount = 0;
+  _capacityGrowthFactor = 2;
+  _variantBytes = 0;
+  _variantHighWaterBytes = 0;
+  _heapHighWaterBytes = 0;
+  _memoryGrowCount = 0;
+  _variantRebindCount = 0;
+  _f32PackCount = 0;
+  _q8PackCount = 0;
+  _disposed = false;
+  /* Non-null only while an opted-in compile() is running, so every
+   * instrumentation site costs one field read when profiling is off. */
+  _compileProfile: WasmCompileProfile | null = null;
 
   constructor(
     wasmModule: WasmInstantiation,
@@ -1876,6 +2558,11 @@ export class WasmEngine extends BackendEngine {
     super('wasm', {
       incrementalExecution: true,
       incrementalRows: true,
+      /* The WASM row executor takes its rows from a contiguous offset and a
+       * width, so it reads [S,D] and [S,1,D] exactly as it reads [1,S,D]. A
+       * decoder whose optimizer left it sequence-major would otherwise fall
+       * back to recomputing its whole prefix each token. */
+      sequenceMajorRows: true,
       outputLocation: 'host',
     });
     this.wasmModule = wasmModule;
@@ -1888,9 +2575,13 @@ export class WasmEngine extends BackendEngine {
       typeof this.api.qbatch_matmul_i8u8_simd128 === 'function';
     this.pointers = new Map();
     this.f32PackedWeights = new Map();
+    this.q8PackedWeights = new Map();
     this.f32PackedNodes = new Map();
+    this.tensorCapacities = new Map();
+    this.tensorMaximumBytes = new Map();
     this.qconvIm2ColPointer = 0;
     this.qconvIm2ColBytes = 0;
+    this._heapHighWaterBytes = this.mem.buffer.byteLength;
     console.log("[VolvoxAI] WASM Engine ready (Tier 2 C kernels).");
   }
   static async init(wasmUrl: string | URL): Promise<WasmEngine | null> {
@@ -1968,23 +2659,134 @@ export class WasmEngine extends BackendEngine {
       : null;
     return new WasmEngine(wasmModule, relaxedSimdModule);
   }
-  _alloc(tensor) {
-    if (!this.pointers.has(tensor.name)) {
-      const ptr = this.api.alloc_bytes(tensor.sizeBytes);
-      // Grow WASM memory if the allocation exceeds current buffer
-      const needed = ptr + tensor.sizeBytes;
-      const currentBytes = this.mem.buffer.byteLength;
-      if (needed > currentBytes) {
-        const pagesNeeded = Math.ceil((needed - currentBytes) / 65536);
-        this.mem.grow(pagesNeeded);
+
+  /** Release all host-side graph ownership and reset the instance allocator. */
+  dispose(): void {
+    if (this._disposed) return;
+    this._disposed = true;
+    this._setDecodeCacheGenerationListener(null);
+    this._incrementalCacheValid = false;
+    this.api.reset_heap?.();
+    this.pointers.clear();
+    this.f32PackedWeights.clear();
+    this.q8PackedWeights.clear();
+    this.f32PackedNodes.clear();
+    this.tensorCapacities.clear();
+    this.tensorMaximumBytes.clear();
+    this.nodeMetadata?.clear();
+    this.graph = null as unknown as WasmGraph;
+    this.preparedGraph = undefined as unknown as WasmPreparedGraph;
+  }
+  /**
+   * The single place this backend grows the WASM heap.
+   *
+   * Growing a non-shared WebAssembly.Memory may copy the whole heap, so
+   * extending by just the shortfall makes a compile that allocates n times cost
+   * O(n²) in bytes copied — measured at 725 grows and 41% of compile() for the
+   * a large bounded encoder+decoder pair.
+   *
+   * The policy is therefore geometric: take at least the current size, so the
+   * heap doubles and the grow count is logarithmic in the final size rather
+   * than linear in the allocation count.
+   *
+   * Doubling is capped, because unbounded doubling trades the time back for
+   * memory that WASM never returns to the OS: on this workload it reached
+   * 639.6 MB against a 388.2 MB requirement (+251 MB) for no extra speed.
+   * Past the cap the heap grows by fixed chunks instead, which keeps the grow
+   * count in the same range while bounding the waste to one chunk.
+   */
+  _growFor(needed: number): void {
+    const currentBytes = this.mem.buffer.byteLength;
+    if (needed <= currentBytes) {
+      this._heapHighWaterBytes = Math.max(this._heapHighWaterBytes, currentBytes);
+      return;
+    }
+    const shortfallPages = Math.ceil((needed - currentBytes) / 65536);
+    const currentPages = currentBytes / 65536;
+    const stepPages = Math.min(currentPages, WASM_GROW_MAX_STEP_PAGES);
+    /* wasm32 addresses 4 GiB, so the heap can never exceed 65536 pages. */
+    const headroomPages = Math.max(0, WASM_MAX_MEMORY_PAGES - currentPages);
+    const pages = Math.min(
+      Math.max(shortfallPages, stepPages), Math.max(shortfallPages, headroomPages),
+    );
+    const profile = this._compileProfile;
+    const started = profile ? performance.now() : 0;
+    try {
+      this.mem.grow(pages);
+    } catch (error) {
+      /* The geometric request can be refused where the exact shortfall still
+       * fits (an engine-imposed cap, or memory pressure). grow() leaves the
+       * memory untouched when it throws, so retrying smaller is safe. */
+      if (pages === shortfallPages) throw error;
+      this.mem.grow(shortfallPages);
+      this._memoryGrowCount++;
+      this._heapHighWaterBytes = Math.max(this._heapHighWaterBytes, this.mem.buffer.byteLength);
+      if (profile) {
+        profile.growMs += performance.now() - started;
+        profile.growCount++;
+        profile.growPages += shortfallPages;
       }
+      return;
+    }
+    this._memoryGrowCount++;
+    this._heapHighWaterBytes = Math.max(this._heapHighWaterBytes, this.mem.buffer.byteLength);
+    if (profile) {
+      profile.growMs += performance.now() - started;
+      profile.growCount++;
+      profile.growPages += pages;
+    }
+  }
+
+  _allocateBytes(bytes: number, label: string): number {
+    if (!Number.isSafeInteger(bytes) || bytes <= 0 || bytes > 0x7ffffff0) {
+      throw new Error(`WASM ${label} size is not representable by the signed allocator ABI.`);
+    }
+    const alignedBytes = Math.ceil(bytes / 16) * 16;
+    const measurement = this._allocationMeasurement;
+    if (measurement) {
+      const pointer = measurement.cursor;
+      const end = pointer + alignedBytes;
+      if (!Number.isSafeInteger(pointer) || pointer < 0 ||
+          !Number.isSafeInteger(end) || end > WASM_PORTABLE_MAX_U32) {
+        throw new Error(`WASM ${label} allocation exceeds the wasm32 address space.`);
+      }
+      measurement.cursor = end;
+      return pointer;
+    }
+    const pointer = Number(this.api.alloc_bytes(bytes));
+    if (!Number.isSafeInteger(pointer) || pointer < 0) {
+      throw new Error(`WASM allocator returned an invalid ${label} pointer.`);
+    }
+    const needed = pointer + bytes;
+    if (!Number.isSafeInteger(needed) || needed > WASM_PORTABLE_MAX_U32) {
+      throw new Error(`WASM ${label} allocation exceeds the wasm32 address space.`);
+    }
+    this._growFor(needed);
+    return pointer;
+  }
+
+  _alloc(tensor, capacityBytes = tensor.sizeBytes) {
+    if (!this.pointers.has(tensor.name)) {
+      if (!Number.isSafeInteger(capacityBytes) || capacityBytes < tensor.sizeBytes) {
+        throw new Error(`WASM tensor '${tensor.name}' capacity is smaller than its logical bytes.`);
+      }
+      const ptr = this._allocateBytes(capacityBytes, `tensor '${tensor.name}'`);
+      if (this._compileProfile) this._compileProfile.allocBytesCount++;
       this.pointers.set(tensor.name, ptr);
+      this.tensorCapacities.set(tensor.name, Object.freeze({
+        dtype: tensor.dtype,
+        capacityBytes,
+        isWeight: tensor.isWeight === true,
+        owner: tensor.name,
+      }));
+      if (this._allocationMeasurement) return ptr;
       // Keep integer token/mask tensors integer-typed while sharing the same
       // WASM heap with JavaScript fallbacks.
       const wasmView = wasmTensorView(tensor, this.mem.buffer, ptr);
       if (tensor.isWeight && tensor.buffer) {
          const src = new Uint8Array(tensor.buffer.buffer, tensor.buffer.byteOffset, tensor.buffer.byteLength);
          const bytesToCopy = Math.min(tensor.buffer.byteLength, tensor.sizeBytes);
+         if (this._compileProfile) this._compileProfile.tensorCopyBytes += bytesToCopy;
          new Uint8Array(this.mem.buffer, ptr, bytesToCopy).set(src.subarray(0, bytesToCopy));
       }
       tensor.buffer = wasmView;
@@ -1992,81 +2794,104 @@ export class WasmEngine extends BackendEngine {
     return this.pointers.get(tensor.name)!;
   }
   _allocMetadata(values) {
+    const profileStart = this._compileProfile ? performance.now() : 0;
     if (!(values instanceof Uint32Array) || values.length === 0) {
       throw new Error('WASM metadata must be a non-empty Uint32Array.');
     }
-    const ptr = Number(this.api.alloc_bytes(values.byteLength));
-    if (!Number.isSafeInteger(ptr) || ptr < 0) {
-      throw new Error('WASM allocator returned an invalid metadata pointer.');
+    const ptr = this._allocateBytes(values.byteLength, 'metadata');
+    if (this._allocationMeasurement) {
+      this._variantMetadataStaging?.push(Object.freeze({
+        pointer: ptr,
+        bytes: new Uint8Array(
+          new Uint8Array(values.buffer, values.byteOffset, values.byteLength),
+        ),
+      }));
+    } else {
+      new Uint32Array(this.mem.buffer, ptr, values.length).set(values);
     }
-    const needed = ptr + values.byteLength;
-    if (needed > this.mem.buffer.byteLength) {
-      this.mem.grow(Math.ceil((needed - this.mem.buffer.byteLength) / 65536));
+    if (this._compileProfile) {
+      this._compileProfile.metadataAllocMs += performance.now() - profileStart;
+      this._compileProfile.allocBytesCount++;
     }
-    new Uint32Array(this.mem.buffer, ptr, values.length).set(values);
     return ptr;
   }
   _allocTypedMetadata(values) {
+    const profileStart = this._compileProfile ? performance.now() : 0;
     if (!ArrayBuffer.isView(values) || values instanceof DataView || values.byteLength === 0) {
       throw new Error('WASM typed metadata must be a non-empty typed array.');
     }
-    const ptr = Number(this.api.alloc_bytes(values.byteLength));
-    if (!Number.isSafeInteger(ptr) || ptr < 0) {
-      throw new Error('WASM allocator returned an invalid typed metadata pointer.');
+    const ptr = this._allocateBytes(values.byteLength, 'typed metadata');
+    if (this._allocationMeasurement) {
+      this._variantMetadataStaging?.push(Object.freeze({
+        pointer: ptr,
+        bytes: new Uint8Array(
+          new Uint8Array(values.buffer, values.byteOffset, values.byteLength),
+        ),
+      }));
+    } else {
+      new Uint8Array(this.mem.buffer, ptr, values.byteLength).set(
+        new Uint8Array(values.buffer, values.byteOffset, values.byteLength),
+      );
     }
-    const needed = ptr + values.byteLength;
-    if (needed > this.mem.buffer.byteLength) {
-      this.mem.grow(Math.ceil((needed - this.mem.buffer.byteLength) / 65536));
+    if (this._compileProfile) {
+      this._compileProfile.metadataAllocMs += performance.now() - profileStart;
+      this._compileProfile.allocBytesCount++;
     }
-    new Uint8Array(this.mem.buffer, ptr, values.byteLength).set(
-      new Uint8Array(values.buffer, values.byteOffset, values.byteLength),
-    );
     return ptr;
   }
   _allocScratchBytes(bytes, label) {
-    if (!Number.isSafeInteger(bytes) || bytes <= 0 || bytes > 0x7ffffff0) {
-      throw new Error(`WASM ${label} size is not representable by the allocator.`);
-    }
-    const ptr = Number(this.api.alloc_bytes(bytes));
-    if (!Number.isSafeInteger(ptr) || ptr < 0) {
-      throw new Error(`WASM allocator returned an invalid ${label} pointer.`);
-    }
-    const needed = ptr + bytes;
-    if (!Number.isSafeInteger(needed) || needed > WASM_PORTABLE_MAX_U32) {
-      throw new Error(`WASM ${label} allocation exceeds the wasm32 address space.`);
-    }
-    if (needed > this.mem.buffer.byteLength) {
-      this.mem.grow(Math.ceil((needed - this.mem.buffer.byteLength) / 65536));
-    }
+    const ptr = this._allocateBytes(bytes, label);
+    if (this._compileProfile) this._compileProfile.allocBytesCount++;
     return ptr;
   }
-  _allocPackedQ8Weight(weight, dIn, dOut, outIn = true) {
+  _allocPackedQ8Weight(
+    weight,
+    dIn,
+    dOut,
+    outIn = true,
+    mode: WasmQ8PackMode = 'w8a8-wide',
+  ) {
+    const profileStart = this._compileProfile ? performance.now() : 0;
+    const sizeKernel = mode === 'canonical'
+      ? this.api.packed_q8_weight_canonical_size
+      : this.api.packed_q8_weight_size;
+    const packKernel = mode === 'canonical'
+      ? this.api.pack_q8_weight_canonical
+      : this.api.pack_q8_weight;
     if (!weight || !Number.isInteger(dIn) || dIn <= 0 ||
         !Number.isInteger(dOut) || dOut <= 0 ||
-        typeof this.api.packed_q8_weight_size !== 'function' ||
-        typeof this.api.pack_q8_weight !== 'function') return 0;
-    const bytes = Number(this.api.packed_q8_weight_size(dIn, dOut));
+        typeof sizeKernel !== 'function' || typeof packKernel !== 'function') return 0;
+    const cacheKey = `${weight.name}:${weight.dtype}:${dIn}:${dOut}:${outIn ? 1 : 0}:${mode}`;
+    const cached = this.q8PackedWeights.get(cacheKey);
+    if (cached) return cached.pointer;
+    if (this._allocationMeasurement) {
+      throw new Error(`WASM invariant Q8 weight '${weight.name}' was not packed during initial compilation.`);
+    }
+    const bytes = Number(sizeKernel(dIn, dOut));
     /* alloc_bytes has a signed-i32 ABI and rounds up by 15 internally. */
     if (!Number.isSafeInteger(bytes) || bytes <= 0 || bytes > 0x7ffffff0) {
-      throw new Error(`WASM packed Q8 weight size overflow for [${dOut},${dIn}].`);
+      throw new Error(
+        `WASM ${mode} packed Q8 weight size overflow for [${dOut},${dIn}].`,
+      );
     }
-    const ptr = Number(this.api.alloc_bytes(bytes));
-    if (!Number.isSafeInteger(ptr) || ptr < 0) {
-      throw new Error('WASM allocator returned an invalid packed-weight pointer.');
-    }
-    const needed = ptr + bytes;
-    if (needed > this.mem.buffer.byteLength) {
-      this.mem.grow(Math.ceil((needed - this.mem.buffer.byteLength) / 65536));
-    }
+    const ptr = this._allocateBytes(bytes, 'packed Q8 weight');
     const weightPointer = this.pointers.get(weight.name);
     if (weightPointer == null || !Number.isSafeInteger(weightPointer) || weightPointer < 0 ||
-        this.api.pack_q8_weight(ptr, bytes, weightPointer, dIn, dOut,
+        packKernel(ptr, bytes, weightPointer, dIn, dOut,
           wasmDtypeCode(weight.dtype), outIn ? 1 : 0) !== 1) {
-      throw new Error(`WASM failed to pack Q8 weight '${weight.name}'.`);
+      throw new Error(`WASM failed to create ${mode} Q8 pack for weight '${weight.name}'.`);
+    }
+    this.q8PackedWeights.set(cacheKey, Object.freeze({ pointer: ptr, bytes, cacheKey }));
+    this._q8PackCount++;
+    if (this._compileProfile) {
+      this._compileProfile.packWeightMs += performance.now() - profileStart;
+      this._compileProfile.packBytes += bytes;
+      this._compileProfile.allocBytesCount++;
     }
     return ptr;
   }
   _compilePackedF32Linear(node) {
+    const profileStart = this._compileProfile ? performance.now() : 0;
     if (!['MatMul', 'Linear', 'Gemm'].includes(node.opType) ||
         node.inputs.scale || node.inputs.weight_scale ||
         typeof this.api.gemm_f32_packed_elements !== 'function' ||
@@ -2092,6 +2917,9 @@ export class WasmEngine extends BackendEngine {
     const cacheKey = `${weight.name}:${dIn}:${dOut}:${doutFirst ? 1 : 0}`;
     const cached = this.f32PackedWeights.get(cacheKey);
     if (cached) return cached;
+    if (this._allocationMeasurement) {
+      throw new Error(`WASM invariant F32 weight '${weight.name}' was not packed during initial compilation.`);
+    }
     const packedElements = Number(this.api.gemm_f32_packed_elements(dIn, dOut));
     const packedBytes = packedElements * Float32Array.BYTES_PER_ELEMENT;
     // alloc_bytes takes a signed i32 byte count in the freestanding kernel ABI.
@@ -2100,23 +2928,44 @@ export class WasmEngine extends BackendEngine {
         !Number.isSafeInteger(packedBytes) || packedBytes > 0x7ffffff0) {
       throw new Error(`WASM ${node.opType} node ${node.id} has an unrepresentable packed F32 weight.`);
     }
-    const pointer = Number(this.api.alloc_bytes(packedBytes));
-    if (!Number.isSafeInteger(pointer) || pointer < 0) {
-      throw new Error(`WASM ${node.opType} node ${node.id} received an invalid packed-weight pointer.`);
-    }
-    const needed = pointer + packedBytes;
-    if (needed > this.mem.buffer.byteLength) {
-      this.mem.grow(Math.ceil((needed - this.mem.buffer.byteLength) / 65536));
-    }
+    const pointer = this._allocateBytes(packedBytes, `packed F32 weight at node ${node.id}`);
     const weightPointer = this.pointers.get(weight.name);
     if (this.api.gemm_f32_pack_b(weightPointer, pointer, dIn, dOut, doutFirst ? 1 : 0) !== 1) {
       throw new Error(`WASM ${node.opType} node ${node.id} could not pack its immutable F32 weight.`);
     }
-    const descriptor = Object.freeze({ pointer, dIn, dOut, doutFirst, cacheKey });
+    const descriptor = Object.freeze({
+      pointer, bytes: packedBytes, dIn, dOut, doutFirst, cacheKey,
+    });
     this.f32PackedWeights.set(cacheKey, descriptor);
+    this._f32PackCount++;
+    if (this._compileProfile) {
+      this._compileProfile.packWeightMs += performance.now() - profileStart;
+      this._compileProfile.packBytes += packedBytes;
+      this._compileProfile.allocBytesCount++;
+    }
     return descriptor;
   }
   _compilePortableMetadata(node) {
+    if (node.opType === 'MoELinear') {
+      const descriptor = portableMoELinearDescriptor(node);
+      const slots = descriptor.residentSlots;
+      if (!slots) return { kind: 'moeLinear', ...descriptor };
+      const domain = slots[slots.length - 1] + 1;
+      const slotTableBytes = domain * Uint32Array.BYTES_PER_ELEMENT;
+      if (!Number.isSafeInteger(domain) || domain <= 0 ||
+          !Number.isSafeInteger(slotTableBytes) ||
+          slotTableBytes > WASM_MOE_SLOT_TABLE_MAX_BYTES) {
+        throw new Error(`WASM MoELinear node ${node.id} has an unrepresentable resident slot domain.`);
+      }
+      const rows = new Uint32Array(domain).fill(0xffffffff);
+      for (let row = 0; row < slots.length; row++) rows[slots[row]] = row;
+      return {
+        kind: 'moeLinear',
+        ...descriptor,
+        slotTablePointer: this._allocMetadata(rows),
+        slotTableDomain: domain,
+      };
+    }
     const qlinearDescriptor = portableQLinearDescriptor(node);
     if (qlinearDescriptor) {
       return {
@@ -2125,7 +2974,8 @@ export class WasmEngine extends BackendEngine {
         weightZeroPointsPointer: this._allocTypedMetadata(qlinearDescriptor.weightZeroPoints),
         packedWeightPointer: qlinearDescriptor.weight.isWeight === true
           ? this._allocPackedQ8Weight(qlinearDescriptor.weight,
-            qlinearDescriptor.dIn, qlinearDescriptor.dOut, true)
+            qlinearDescriptor.dIn, qlinearDescriptor.dOut, true,
+            wasmW8A8PackMode(qlinearDescriptor.dOut))
           : 0,
       };
     }
@@ -2143,7 +2993,9 @@ export class WasmEngine extends BackendEngine {
             portableTensorElements(weight) === dIn * dOut) {
           return {
             kind: 'w8a32',
-            packedWeightPointer: this._allocPackedQ8Weight(weight, dIn, dOut, true),
+            packedWeightPointer: this._allocPackedQ8Weight(
+              weight, dIn, dOut, true, 'canonical',
+            ),
           };
         }
       }
@@ -2218,12 +3070,14 @@ export class WasmEngine extends BackendEngine {
         im2colBytes: packedEligible ? im2colBytes : 0,
         packedWeightPointer: packedEligible
           ? this._allocPackedQ8Weight(qconv2dDescriptor.weight, packedDIn,
-            qconv2dDescriptor.outputChannels, true)
+            qconv2dDescriptor.outputChannels, true, 'w8a8-wide')
           : 0,
       };
     }
     const quantizedDescriptor = portableQuantizedNodeDescriptor(node);
     if (quantizedDescriptor) return quantizedDescriptor;
+    const f32Pool2DDescriptor = portableF32Pool2DDescriptor(node);
+    if (f32Pool2DDescriptor) return f32Pool2DDescriptor;
     if (node.opType === 'BatchMatMul') {
       const descriptor = batchMatMulDescriptor(node);
       let incrementalRow: any = null;
@@ -2348,7 +3202,33 @@ export class WasmEngine extends BackendEngine {
       };
     }
     if (node.opType === 'Where' || node.opType === 'Mask') {
-      return { kind: 'where', ...portableWhereDescriptor(node) };
+      const descriptor = portableWhereDescriptor(node);
+      // The C ABI represents a rank-zero scalar as rank-one [1].
+      const conditionShape = descriptor.conditionRank ? descriptor.condition.shape : [1];
+      const aShape = descriptor.aRank ? descriptor.a.shape : [1];
+      const bShape = descriptor.bRank ? descriptor.b.shape : [1];
+      const outputShape = descriptor.outputRank ? descriptor.output.shape : [1];
+      const words = new Uint32Array(
+        conditionShape.length + aShape.length + bShape.length + outputShape.length,
+      );
+      words.set(conditionShape, 0);
+      words.set(aShape, conditionShape.length);
+      words.set(bShape, conditionShape.length + aShape.length);
+      words.set(outputShape, conditionShape.length + aShape.length + bShape.length);
+      const pointer = this._allocMetadata(words);
+      return {
+        kind: 'where', ...descriptor,
+        conditionRank: conditionShape.length,
+        aRank: aShape.length,
+        bRank: bShape.length,
+        outputRank: outputShape.length,
+        conditionShapePointer: pointer,
+        aShapePointer: pointer + conditionShape.length * Uint32Array.BYTES_PER_ELEMENT,
+        bShapePointer: pointer +
+          (conditionShape.length + aShape.length) * Uint32Array.BYTES_PER_ELEMENT,
+        outputShapePointer: pointer +
+          (conditionShape.length + aShape.length + bShape.length) * Uint32Array.BYTES_PER_ELEMENT,
+      };
     }
     if (node.opType === 'Gather') {
       return { kind: 'gather', ...portableGatherDescriptor(node) };
@@ -2388,7 +3268,15 @@ export class WasmEngine extends BackendEngine {
       return portableUnaryF32Descriptor(node);
     }
     if (node.opType === 'RoPE') {
-      return { kind: 'rope', ...ropeDescriptor(node) };
+      return {
+        kind: 'rope',
+        ...ropeDescriptor(node, {
+          // RuntimeGraph-input values arrive only after specialization. They are
+          // validated against caller storage in execute() before upload;
+          // reading the reusable arena here would inspect stale capacity bytes.
+          validatePositionValues: node.inputs.position_ids?.isWeight === true,
+        }),
+      };
     }
     if (node.opType === 'SSMScan' || node.opType === 'SelectiveScan') {
       const descriptor = ssmScanDescriptor(node);
@@ -2400,37 +3288,88 @@ export class WasmEngine extends BackendEngine {
     }
     return null;
   }
-  prepareGraph(graph: WasmGraph): WasmPreparedGraph {
-    this._assertPortableQuantizedGraph(graph);
-    if (graph.activeAdapter?.()) {
-      throw new Error("WASM adapter execution is unsupported; compile this graph with the CPU backend.");
+  prepareInvariantSchedule(input: WasmInvariantScheduleInput): WasmInvariantSchedule {
+    if (!input || typeof input !== 'object' || !Array.isArray(input.nodes) ||
+        !Number.isSafeInteger(input.tensorCount) || input.tensorCount < 0 ||
+        !Array.isArray(input.outputNames)) {
+      throw new Error('WASM invariant schedule input is invalid.');
     }
     const qGroupNorm: number[] = [];
     const qLayerNorm: number[] = [];
     const qSDPA: number[] = [];
     const qMaskedMean: number[] = [];
-    const schedule = graph.nodes.map((node, nodeIndex): WasmPreparedStep => {
+    const rope: number[] = [];
+    const schedule = input.nodes.map((node, nodeIndex): WasmPreparedStep => {
       const route = kernelRoute('wasm', node.opType);
       if (!route) throw new Error(`WASM operator '${node.opType}' is unsupported.`);
       if (node.opType === 'QGroupNorm') qGroupNorm.push(nodeIndex);
       if (node.opType === 'QLayerNorm') qLayerNorm.push(nodeIndex);
       if (node.opType === 'QSDPA') qSDPA.push(nodeIndex);
       if (node.opType === 'QMaskedMean') qMaskedMean.push(nodeIndex);
+      if (node.opType === 'RoPE') rope.push(nodeIndex);
       return Object.freeze({ nodeIndex, nodeId: node.id, opType: node.opType, kernelRoute: route });
     });
     return Object.freeze({
-      [WASM_PREPARED_GRAPH]: true as const,
-      topologyRevision: graph.topologyRevision || 0,
-      weightRevision: graph.weightRevision || 0,
-      tensorCount: graph.tensors.size,
-      outputNames: Object.freeze([...graph.outputNames]),
+      [WASM_INVARIANT_SCHEDULE]: true as const,
+      tensorCount: input.tensorCount,
+      outputNames: Object.freeze([...input.outputNames]),
       schedule: Object.freeze(schedule),
       inputPreflights: Object.freeze({
         qGroupNorm: Object.freeze(qGroupNorm),
         qLayerNorm: Object.freeze(qLayerNorm),
         qSDPA: Object.freeze(qSDPA),
         qMaskedMean: Object.freeze(qMaskedMean),
+        rope: Object.freeze(rope),
       }),
+    });
+  }
+  _assertInvariantSchedule(graph: WasmGraph, value: Readonly<object>): WasmInvariantSchedule {
+    const invariant = value as Partial<WasmInvariantSchedule>;
+    const preflights = invariant?.inputPreflights as
+      Partial<WasmPreparedInputPreflights> | undefined;
+    const invalid = !invariant || invariant[WASM_INVARIANT_SCHEDULE] !== true ||
+      !Object.isFrozen(invariant) || !Array.isArray(invariant.schedule) ||
+      !Object.isFrozen(invariant.schedule) || !Array.isArray(invariant.outputNames) ||
+      !Object.isFrozen(invariant.outputNames) || !preflights || !Object.isFrozen(preflights) ||
+      !Array.isArray(preflights.qGroupNorm) || !Object.isFrozen(preflights.qGroupNorm) ||
+      !Array.isArray(preflights.qLayerNorm) || !Object.isFrozen(preflights.qLayerNorm) ||
+      !Array.isArray(preflights.qSDPA) || !Object.isFrozen(preflights.qSDPA) ||
+      !Array.isArray(preflights.qMaskedMean) || !Object.isFrozen(preflights.qMaskedMean) ||
+      !Array.isArray(preflights.rope) || !Object.isFrozen(preflights.rope) ||
+      invariant.tensorCount !== graph.tensors.size ||
+      invariant.schedule.length !== graph.nodes.length ||
+      invariant.outputNames.length !== graph.outputNames.length ||
+      invariant.outputNames.some((name, index) => name !== graph.outputNames[index]) ||
+      invariant.schedule.some((step, index) => {
+        const node = graph.nodes[index];
+        return !Object.isFrozen(step) || step.nodeIndex !== index || step.nodeId !== node?.id ||
+          step.opType !== node?.opType || typeof step.kernelRoute !== 'string' || !step.kernelRoute;
+      });
+    if (invalid) {
+      throw new Error('WASM invariant prepared schedule does not match this graph topology.');
+    }
+    return invariant as WasmInvariantSchedule;
+  }
+  prepareGraph(
+    graph: WasmGraph,
+    invariantSchedule?: Readonly<object>,
+  ): WasmPreparedGraph {
+    this._assertPortableQuantizedGraph(graph);
+    const invariant = invariantSchedule
+      ? this._assertInvariantSchedule(graph, invariantSchedule)
+      : this.prepareInvariantSchedule({
+          nodes: graph.nodes,
+          tensorCount: graph.tensors.size,
+          outputNames: graph.outputNames,
+        });
+    return Object.freeze({
+      [WASM_PREPARED_GRAPH]: true as const,
+      topologyRevision: graph.topologyRevision || 0,
+      weightRevision: graph.weightRevision || 0,
+      tensorCount: invariant.tensorCount,
+      outputNames: invariant.outputNames,
+      schedule: invariant.schedule,
+      inputPreflights: invariant.inputPreflights,
     });
   }
   _assertPreparedGraph(graph: WasmGraph, value: Readonly<object>): WasmPreparedGraph {
@@ -2444,6 +3383,7 @@ export class WasmEngine extends BackendEngine {
       !Array.isArray(preflights.qLayerNorm) || !Object.isFrozen(preflights.qLayerNorm) ||
       !Array.isArray(preflights.qSDPA) || !Object.isFrozen(preflights.qSDPA) ||
       !Array.isArray(preflights.qMaskedMean) || !Object.isFrozen(preflights.qMaskedMean) ||
+      !Array.isArray(preflights.rope) || !Object.isFrozen(preflights.rope) ||
       prepared.topologyRevision !== (graph.topologyRevision || 0) ||
       prepared.weightRevision !== (graph.weightRevision || 0) ||
       prepared.tensorCount !== graph.tensors.size || prepared.schedule.length !== graph.nodes.length ||
@@ -2546,35 +3486,62 @@ export class WasmEngine extends BackendEngine {
         `QMaskedMean node ${node.id} mask`);
     }
   }
-  compile(graph: WasmGraph, preparedGraph: Readonly<object> = this.prepareGraph(graph)) {
-    const prepared = this._assertPreparedGraph(graph, preparedGraph);
-    this.resetDecodeCache();
-    if (graph.activeAdapter?.()) {
-      throw new Error("WASM adapter execution is unsupported; compile this graph with the CPU backend.");
-    }
-    console.log("[VolvoxAI WASM] Allocating graph tensors on WASM heap...");
-    if (this.api.reset_heap) this.api.reset_heap();
-    this.pointers.clear();
-    this.nodeMetadata = new Map();
-    this.f32PackedWeights.clear();
-    this.f32PackedNodes.clear();
-    this.qconvIm2ColPointer = 0;
-    this.qconvIm2ColBytes = 0;
-    // WASM is an inference backend. Eliminate standalone Dropout before heap
-    // allocation so it consumes neither a separate activation nor a runtime
-    // call. Chained Dropout aliases are resolved after ordinary tensors.
-    const dropoutAliases = new Map();
-    for (const step of prepared.schedule) {
-      const node = graph.nodes[step.nodeIndex];
-      if (node.opType !== "Dropout") continue;
-      const input = node.inputs.input || node.inputs.x || node.inputs.data;
-      const output = node.outputs.out || Object.values(node.outputs || {})[0];
-      if (!input || !output || input.dtype !== output.dtype ||
-          input.sizeBytes !== output.sizeBytes) {
-        throw new Error(`Dropout node ${node.id} requires equal-size input/output tensors.`);
+  _preflightRoPEPositions(inputs: Record<string, RuntimeTypedArray>) {
+    for (const nodeIndex of this.preparedGraph.inputPreflights.rope) {
+      const node = this.graph.nodes[nodeIndex];
+      const positions = node.inputs.position_ids;
+      if (!positions?.isInput) continue;
+      const supplied = Object.prototype.hasOwnProperty.call(inputs, positions.name)
+        ? inputs[positions.name]
+        : null;
+      if (!supplied) {
+        throw new Error(`WASM RoPE node ${node.id} requires graph-input I32 position_ids supplied on every execution.`);
       }
-      dropoutAliases.set(output.name, input.name);
+      Tensor.assertCompatibleInput('int32', supplied, positions.sizeBytes,
+        `RoPE node ${node.id} position_ids`);
+      if (supplied.some((position) => position < 0)) {
+        throw new Error(`WASM RoPE node ${node.id} position_ids must be non-negative before execution.`);
+      }
     }
+  }
+
+  _refreshGraphTensorViews(graph: WasmGraph): void {
+    for (const [name, tensor] of graph.tensors.entries()) {
+      const pointer = this.pointers.get(name);
+      const capacity = this.tensorCapacities.get(name);
+      if (pointer == null || !capacity || capacity.dtype !== tensor.dtype ||
+          tensor.sizeBytes > capacity.capacityBytes) {
+        throw new Error(`WASM tensor '${name}' exceeds or disagrees with its committed capacity.`);
+      }
+      tensor.buffer = wasmTensorView(tensor, this.mem.buffer, pointer);
+    }
+  }
+
+  _assertReusableGraph(graph: WasmGraph): void {
+    if (!this.graph || graph.tensors.size !== this.graph.tensors.size) {
+      throw new Error('WASM shape variant does not match the compiled tensor topology.');
+    }
+    if ((graph.topologyRevision || 0) !== this.compiledTopologyRevision ||
+        (graph.weightRevision || 0) !== this.compiledWeightRevision) {
+      throw new Error('WASM shape variant does not match the compiled model revision.');
+    }
+    for (const [name, tensor] of graph.tensors.entries()) {
+      const previous = this.graph.tensors.get(name);
+      const capacity = this.tensorCapacities.get(name);
+      const maximum = this.tensorMaximumBytes.get(name);
+      if (!previous || !capacity || previous.dtype !== tensor.dtype ||
+          maximum == null || capacity.dtype !== tensor.dtype || tensor.sizeBytes > maximum ||
+          (tensor.isWeight === true) !== capacity.isWeight) {
+        throw new Error(`WASM shape variant tensor '${name}' is incompatible with the compiled arena.`);
+      }
+      if (tensor.isWeight === true &&
+          (!sameShape(previous.shape, tensor.shape) || previous.sizeBytes !== tensor.sizeBytes)) {
+        throw new Error(`WASM invariant weight '${name}' changed across shape variants.`);
+      }
+    }
+  }
+
+  _preflightVariantGraph(graph: WasmGraph, prepared: WasmPreparedGraph): void {
     for (const step of prepared.schedule) {
       const node = graph.nodes[step.nodeIndex];
       preflightPortableQGroupNormStorage(node);
@@ -2583,23 +3550,787 @@ export class WasmEngine extends BackendEngine {
       preflightPortableQArgMaxStorage(node);
       preflightPortableQMaskedMeanStorage(node);
     }
-    for (const [name, tensor] of graph.tensors.entries()) {
-      if (!dropoutAliases.has(name)) this._alloc(tensor);
+  }
+
+  _buildVariantResources(graph: WasmGraph, prepared: WasmPreparedGraph) {
+    this._refreshGraphTensorViews(graph);
+    const nodeMetadata = new Map<WasmNode, WasmNodeMetadata>();
+    const f32PackedNodes = new Map<WasmNode, PackedF32WeightDescriptor>();
+    for (const step of prepared.schedule) {
+      const node = graph.nodes[step.nodeIndex];
+      const metadata = this._compilePortableMetadata(node);
+      if (metadata) nodeMetadata.set(node, metadata);
+      const packedF32 = this._compilePackedF32Linear(node);
+      if (packedF32) f32PackedNodes.set(node, packedF32);
     }
-    const resolveDropoutAlias = (name: string, visiting = new Set<string>()): number => {
-      if (this.pointers.has(name)) return this.pointers.get(name)!;
-      if (visiting.has(name)) throw new Error(`Dropout alias cycle contains tensor '${name}'.`);
-      const sourceName = dropoutAliases.get(name);
-      if (!sourceName) throw new Error(`Dropout alias '${name}' has no allocated source.`);
-      visiting.add(name);
-      const pointer = resolveDropoutAlias(sourceName, visiting);
-      visiting.delete(name);
-      this.pointers.set(name, pointer);
-      return pointer;
+    let qconvIm2ColBytes = 0;
+    for (const metadata of nodeMetadata.values()) {
+      if (metadata?.kind === 'qconv2d' && metadata.packedWeightPointer &&
+          metadata.im2colBytes > qconvIm2ColBytes) {
+        qconvIm2ColBytes = metadata.im2colBytes;
+      }
+    }
+    const qconvIm2ColPointer = qconvIm2ColBytes > 0
+      ? this._allocScratchBytes(qconvIm2ColBytes, 'QConv2D im2col scratch')
+      : 0;
+    return { nodeMetadata, f32PackedNodes, qconvIm2ColPointer, qconvIm2ColBytes };
+  }
+
+  _commitStagedVariantResources(
+    writes: readonly WasmStagedMetadataWrite[],
+    metadataMark: number,
+    measuredEnd: number,
+  ): void {
+    if (!Number.isSafeInteger(metadataMark) || !Number.isSafeInteger(measuredEnd) ||
+        metadataMark < 0 || measuredEnd < metadataMark) {
+      throw new Error('WASM staged variant has invalid arena bounds.');
+    }
+    const bytes = measuredEnd - metadataMark;
+    if (bytes > 0) {
+      const pointer = this._allocateBytes(bytes, 'shape-variant metadata and scratch');
+      if (pointer !== metadataMark) {
+        throw new Error('WASM staged variant allocation did not begin at its measured mark.');
+      }
+    }
+    for (const write of writes) {
+      const end = write.pointer + write.bytes.byteLength;
+      if (!Number.isSafeInteger(write.pointer) || write.pointer < metadataMark ||
+          !Number.isSafeInteger(end) || end > measuredEnd) {
+        throw new Error('WASM staged metadata write exceeds its measured variant arena.');
+      }
+      new Uint8Array(this.mem.buffer, write.pointer, write.bytes.byteLength).set(write.bytes);
+    }
+    const actualEnd = Number(this.api.heap_mark?.());
+    if (!Number.isSafeInteger(actualEnd) || actualEnd !== measuredEnd) {
+      throw new Error('WASM staged variant allocation disagreed with its preflight measurement.');
+    }
+  }
+
+  _prepareInvariantWeightPacks(graph: WasmGraph, prepared: WasmPreparedGraph): void {
+    for (const step of prepared.schedule) {
+      const node = graph.nodes[step.nodeIndex];
+      this._compilePackedF32Linear(node);
+      const qlinear = portableQLinearDescriptor(node);
+      if (qlinear?.weight.isWeight === true) {
+        this._allocPackedQ8Weight(
+          qlinear.weight,
+          qlinear.dIn,
+          qlinear.dOut,
+          true,
+          wasmW8A8PackMode(qlinear.dOut),
+        );
+      }
+      if (['MatMul', 'Linear', 'Gemm'].includes(node.opType)) {
+        const input = node.inputs.input || node.inputs.x || node.inputs.a;
+        const weight = node.inputs.weight;
+        const output = portableOutput(node);
+        const scale = node.inputs.scale || node.inputs.weight_scale;
+        if (portableF32Tensor(input) && portableF32Tensor(output) && scale &&
+            weight?.isWeight === true && ['int8', 'uint8'].includes(weight.dtype) &&
+            input.shape.length >= 1 && output.shape.length >= 1) {
+          const dIn = input.shape[input.shape.length - 1];
+          const dOut = output.shape[output.shape.length - 1];
+          if (sameShape(weight.shape, [dOut, dIn]) &&
+              portableTensorElements(weight) === dIn * dOut) {
+            this._allocPackedQ8Weight(weight, dIn, dOut, true, 'canonical');
+          }
+        }
+      }
+      const descriptor = portableQConv2DDescriptor(node);
+      if (!descriptor) continue;
+      const packedDIn = descriptor.kernelHeight * descriptor.kernelWidth *
+        descriptor.inputChannels;
+      const invariantlyEligible = descriptor.groups === 1 && descriptor.relu === 0 &&
+        descriptor.bias != null && descriptor.weight.isWeight === true &&
+        descriptor.outputChannels >= 8 && Number.isSafeInteger(packedDIn) &&
+        packedDIn > 0 && typeof this.api.qconv2d_im2col_i8u8 === 'function' &&
+        typeof this.api.qlinear_i8u8_packed === 'function' &&
+        typeof this.api.packed_q8_weight_size === 'function' &&
+        typeof this.api.pack_q8_weight === 'function';
+      if (invariantlyEligible) {
+        this._allocPackedQ8Weight(
+          descriptor.weight,
+          packedDIn,
+          descriptor.outputChannels,
+          true,
+          'w8a8-wide',
+        );
+      }
+    }
+  }
+
+  _prepareLivenessCapacityCandidate(
+    graph: WasmGraph,
+    prepared: WasmPreparedGraph,
+    requested: Readonly<Record<string, number>> | undefined = undefined,
+  ): WasmCapacityCandidate {
+    const maximumLayout = this._maximumLivenessLayout;
+    if (maximumLayout === null) {
+      throw new Error('WASM liveness arena has no maximum-domain layout.');
+    }
+    const aliases = wasmActivationAliases(graph, prepared);
+    if (!sameWasmAliasMap(aliases, this._activationAliases)) {
+      throw new Error('WASM shape variant changes its activation storage-view topology.');
+    }
+    const sizes = new Map<string, number>();
+    for (const [name, tensor] of graph.tensors) {
+      if (tensor.isWeight === true) continue;
+      const bytes = requested?.[name] ?? tensor.sizeBytes;
+      const maximum = this.tensorMaximumBytes.get(name);
+      if (!Number.isSafeInteger(bytes) || bytes < tensor.sizeBytes ||
+          !Number.isSafeInteger(maximum) || maximum! < bytes) {
+        throw new Error(`WASM activation '${name}' exceeds its proved domain maximum.`);
+      }
+      sizes.set(name, bytes);
+    }
+    const layout = planWasmActivationWithinMaximum(
+      graph, prepared, aliases, sizes, maximumLayout,
+    );
+    const arenaCapacities = new Map<RuntimeDType, number>();
+    let currentBytes = 0;
+    let grew = false;
+    for (const [arena, maximum] of maximumLayout.capacityByArena) {
+      const required = layout.capacityByArena.get(arena) ?? 0;
+      let target = this._activationArenaCapacities.get(arena) ?? required;
+      if (required > target) {
+        while (target < required) {
+          const next = Math.ceil(target * this._capacityGrowthFactor);
+          if (!Number.isSafeInteger(next) || next <= target) {
+            target = required;
+            break;
+          }
+          target = Math.min(maximum, next);
+          if (target === maximum && target < required) break;
+        }
+      }
+      if (target < required || target > maximum || target > 0x7ffffff0) {
+        throw new Error(`WASM '${arena}' liveness arena cannot grow within its proved maximum.`);
+      }
+      if (target > 0) arenaCapacities.set(arena, target);
+      currentBytes = checkedWasmActivationAdd(currentBytes, target,
+        'activation arena capacity');
+      if ((this._activationArenaCapacities.get(arena) ?? target) !== target) grew = true;
+    }
+
+    const roots = wasmActivationAliasRoots(graph, aliases);
+    const capacities = new Map<string, WasmTensorCapacity>();
+    for (const [name, current] of this.tensorCapacities) {
+      if (current.isWeight) capacities.set(name, current);
+    }
+    for (const [name, tensor] of graph.tensors) {
+      if (tensor.isWeight === true) continue;
+      const owner = roots.get(name)!;
+      const invariantCapacity = capacities.get(owner);
+      if (invariantCapacity?.isWeight === true) {
+        if (invariantCapacity.owner !== owner || invariantCapacity.dtype !== tensor.dtype ||
+            tensor.sizeBytes > invariantCapacity.capacityBytes) {
+          throw new Error(
+            `WASM invariant-root alias '${name}' has no compatible weight capacity.`,
+          );
+        }
+        capacities.set(name, Object.freeze({
+          dtype: tensor.dtype,
+          capacityBytes: invariantCapacity.capacityBytes,
+          isWeight: false,
+          owner,
+        }));
+        continue;
+      }
+      const region = layout.regions.get(owner);
+      if (!region || region.dtype !== tensor.dtype || tensor.sizeBytes > region.sizeBytes) {
+        throw new Error(`WASM liveness layout omits activation '${name}'.`);
+      }
+      capacities.set(name, Object.freeze({
+        dtype: tensor.dtype,
+        capacityBytes: region.sizeBytes,
+        isWeight: false,
+        owner,
+        arena: region.dtype,
+        offsetBytes: region.offsetBytes,
+      }));
+    }
+    return {
+      capacities,
+      currentBytes,
+      requiredBytes: layout.capacityBytes,
+      grew,
+      arenaCapacities,
     };
-    for (const name of dropoutAliases.keys()) {
-      resolveDropoutAlias(name);
+  }
+
+  _prepareCapacityCandidate(
+    graph: WasmGraph,
+    prepared: WasmPreparedGraph,
+  ): WasmCapacityCandidate {
+    if (this._activationStorage === 'liveness') {
+      return this._prepareLivenessCapacityCandidate(graph, prepared);
     }
+    const requiredByOwner = new Map<string, number>();
+    for (const [name, tensor] of graph.tensors.entries()) {
+      const current = this.tensorCapacities.get(name);
+      if (!current || current.dtype !== tensor.dtype) {
+        throw new Error(`WASM tensor '${name}' has no compatible committed capacity.`);
+      }
+      if (!current.isWeight) {
+        requiredByOwner.set(
+          current.owner,
+          Math.max(requiredByOwner.get(current.owner) ?? 0, tensor.sizeBytes),
+        );
+      }
+    }
+
+    const targetByOwner = new Map<string, number>();
+    let currentBytes = 0;
+    let grew = false;
+    for (const [name, current] of this.tensorCapacities.entries()) {
+      if (current.isWeight || current.owner !== name) continue;
+      const required = requiredByOwner.get(name) ?? 0;
+      const maximum = this.tensorMaximumBytes.get(name);
+      if (!Number.isSafeInteger(maximum) || maximum! < required) {
+        throw new Error(`WASM tensor capacity '${name}' exceeds its proved domain maximum.`);
+      }
+      let target = current.capacityBytes;
+      if (required > target) {
+        while (target < required) {
+          const next = Math.ceil(target * this._capacityGrowthFactor);
+          if (!Number.isSafeInteger(next) || next <= target) {
+            target = required;
+            break;
+          }
+          target = Math.min(maximum!, next);
+          if (target === maximum! && target < required) break;
+        }
+      }
+      const dtypeBytes = runtimeDTypeBytes(current.dtype);
+      const remainder = target % dtypeBytes;
+      if (remainder !== 0) {
+        const rounded = target + dtypeBytes - remainder;
+        target = rounded <= maximum!
+          ? rounded
+          : maximum! - (maximum! % dtypeBytes);
+      }
+      if (target < required || target > maximum! || target > 0x7ffffff0) {
+        throw new Error(`WASM tensor capacity '${name}' cannot grow within its proved maximum.`);
+      }
+      targetByOwner.set(name, target);
+      currentBytes += target;
+      if (!Number.isSafeInteger(currentBytes) || currentBytes > 0x7ffffff0) {
+        throw new Error('WASM activation arena exceeds the signed allocator address range.');
+      }
+      if (target !== current.capacityBytes) grew = true;
+    }
+
+    const capacities = new Map<string, WasmTensorCapacity>();
+    for (const [name, current] of this.tensorCapacities.entries()) {
+      if (current.isWeight) {
+        capacities.set(name, current);
+        continue;
+      }
+      const target = targetByOwner.get(current.owner);
+      if (target == null) throw new Error(`WASM capacity owner '${current.owner}' is missing.`);
+      capacities.set(name, Object.freeze({
+        dtype: current.dtype,
+        capacityBytes: target,
+        isWeight: false,
+        owner: current.owner,
+      }));
+    }
+    const requiredBytes = [...requiredByOwner.values()].reduce(
+      (total, bytes) => checkedWasmActivationAdd(total, bytes,
+        'required persistent activation bytes'),
+      0,
+    );
+    return {
+      capacities,
+      currentBytes,
+      requiredBytes,
+      grew,
+      arenaCapacities: null,
+    };
+  }
+
+  _installActivationLayout(
+    graph: WasmGraph,
+    capacities: ReadonlyMap<string, WasmTensorCapacity>,
+    arenaCapacities: ReadonlyMap<RuntimeDType, number> | null = null,
+  ): void {
+    const persistentPointers = new Map<string, number>();
+    const persistentCapacities = new Map<string, WasmTensorCapacity>();
+    for (const [name, capacity] of this.tensorCapacities.entries()) {
+      if (!capacity.isWeight) continue;
+      const pointer = this.pointers.get(name);
+      if (pointer == null) throw new Error(`WASM invariant weight '${name}' lost its pointer.`);
+      persistentPointers.set(name, pointer);
+      persistentCapacities.set(name, capacity);
+    }
+    this.pointers.clear();
+    this.tensorCapacities.clear();
+    for (const [name, pointer] of persistentPointers) this.pointers.set(name, pointer);
+    for (const [name, capacity] of persistentCapacities) {
+      this.tensorCapacities.set(name, capacity);
+    }
+
+    if (this._activationStorage === 'liveness') {
+      if (arenaCapacities === null) {
+        throw new Error('WASM liveness activation layout omits its dtype arenas.');
+      }
+      const arenaPointers = new Map<RuntimeDType, number>();
+      for (const [arena, bytes] of [...arenaCapacities.entries()]
+        .sort(([left], [right]) => compareWasmNames(left, right))) {
+        if (!Number.isSafeInteger(bytes) || bytes <= 0 || bytes > 0x7ffffff0) {
+          throw new Error(`WASM '${arena}' liveness arena has invalid capacity.`);
+        }
+        arenaPointers.set(arena,
+          this._allocateBytes(bytes, `${arena} activation liveness arena`));
+      }
+      for (const [name, tensor] of graph.tensors) {
+        const capacity = capacities.get(name);
+        if (!capacity) throw new Error(`WASM activation layout omits tensor '${name}'.`);
+        if (capacity.isWeight) continue;
+        const invariantCapacity = capacities.get(capacity.owner);
+        if (invariantCapacity?.isWeight === true) {
+          const invariantPointer = this.pointers.get(capacity.owner);
+          if (invariantPointer == null || invariantCapacity.owner !== capacity.owner ||
+              invariantCapacity.dtype !== tensor.dtype ||
+              tensor.sizeBytes > invariantCapacity.capacityBytes ||
+              capacity.capacityBytes !== invariantCapacity.capacityBytes) {
+            throw new Error(
+              `WASM invariant-root alias '${name}' has no compatible weight storage.`,
+            );
+          }
+          this.pointers.set(name, invariantPointer);
+          this.tensorCapacities.set(name, capacity);
+          continue;
+        }
+        const arena = capacity.arena;
+        const offset = capacity.offsetBytes;
+        const arenaPointer = arena === undefined ? undefined : arenaPointers.get(arena);
+        const arenaBytes = arena === undefined ? undefined : arenaCapacities.get(arena);
+        if (arenaPointer === undefined || arenaBytes === undefined ||
+            !Number.isSafeInteger(offset) || offset! < 0 ||
+            tensor.sizeBytes > capacity.capacityBytes ||
+            offset! > arenaBytes - capacity.capacityBytes) {
+          throw new Error(`WASM liveness activation '${name}' exceeds its dtype arena.`);
+        }
+        this.pointers.set(name, arenaPointer + offset!);
+        this.tensorCapacities.set(name, capacity);
+      }
+      return;
+    }
+
+    for (const [name, tensor] of graph.tensors.entries()) {
+      const capacity = capacities.get(name);
+      if (!capacity) throw new Error(`WASM activation layout omits tensor '${name}'.`);
+      if (!capacity.isWeight && capacity.owner === name) {
+        this._alloc(tensor, capacity.capacityBytes);
+      }
+    }
+    for (const [name, tensor] of graph.tensors.entries()) {
+      const capacity = capacities.get(name)!;
+      if (capacity.isWeight || capacity.owner === name) continue;
+      const ownerPointer = this.pointers.get(capacity.owner);
+      const ownerCapacity = this.tensorCapacities.get(capacity.owner);
+      if (ownerPointer == null || !ownerCapacity || ownerCapacity.dtype !== tensor.dtype ||
+          tensor.sizeBytes > ownerCapacity.capacityBytes) {
+        throw new Error(`WASM alias '${name}' has no compatible activation owner.`);
+      }
+      this.pointers.set(name, ownerPointer);
+      this.tensorCapacities.set(name, Object.freeze({
+        dtype: tensor.dtype,
+        capacityBytes: ownerCapacity.capacityBytes,
+        isWeight: false,
+        owner: capacity.owner,
+      }));
+    }
+  }
+
+  _restoreVariantResources(
+    graph: WasmGraph,
+    prepared: WasmPreparedGraph,
+    capacities: ReadonlyMap<string, WasmTensorCapacity>,
+    arenaCapacities: ReadonlyMap<RuntimeDType, number> | null,
+  ): void {
+    const mark = this._activationArenaMark;
+    if (mark == null || typeof this.api.heap_rewind !== 'function' ||
+        this.api.heap_rewind(mark) !== 1) {
+      throw new Error('WASM reusable arena could not rewind while restoring its previous variant.');
+    }
+    this._installActivationLayout(graph, capacities, arenaCapacities);
+    const metadataMark = Number(this.api.heap_mark?.());
+    if (!Number.isSafeInteger(metadataMark) || metadataMark < mark) {
+      throw new Error('WASM reusable arena returned an invalid restored metadata mark.');
+    }
+    this._metadataArenaMark = metadataMark;
+    const restored = this._buildVariantResources(graph, prepared);
+    this.nodeMetadata = restored.nodeMetadata;
+    this.f32PackedNodes.clear();
+    for (const [node, descriptor] of restored.f32PackedNodes) {
+      this.f32PackedNodes.set(node, descriptor);
+    }
+    this.qconvIm2ColPointer = restored.qconvIm2ColPointer;
+    this.qconvIm2ColBytes = restored.qconvIm2ColBytes;
+    this._refreshGraphTensorViews(graph);
+  }
+
+  rebindGraph(
+    graph: WasmGraph,
+    preparedGraph: Readonly<object> = this.prepareGraph(graph),
+    options: Pick<WasmGraphAllocationOptions, 'shapeSignature'> = {},
+  ) {
+    const mark = this._activationArenaMark;
+    if (mark == null || typeof this.api.heap_mark !== 'function' ||
+        typeof this.api.heap_rewind !== 'function') {
+      throw new Error('WASM module does not expose the reusable dynamic-shape arena ABI.');
+    }
+    if (!options || typeof options !== 'object' || Array.isArray(options) ||
+        (options.shapeSignature !== undefined &&
+          (typeof options.shapeSignature !== 'string' || options.shapeSignature.length === 0))) {
+      throw new Error('WASM shape-variant options are invalid.');
+    }
+    const prepared = this._assertPreparedGraph(graph, preparedGraph);
+    this._assertReusableGraph(graph);
+    this._preflightVariantGraph(graph, prepared);
+    const capacityCandidate = this._prepareCapacityCandidate(graph, prepared);
+    const previousGraph = this.graph;
+    const previousPrepared = this.preparedGraph;
+    const previousSignature = this._currentShapeSignature;
+    const previousCapacities = new Map(this.tensorCapacities);
+    const previousPointers = new Map(this.pointers);
+    const previousCapacityBytes = this._activationCapacityBytes;
+    const previousRequiredBytes = this._activationRequiredBytes;
+    const previousArenaCapacities = this._activationArenaCapacities;
+    const previousMetadataMark = this._metadataArenaMark;
+    const previousVariantBytes = this._variantBytes;
+
+    /* Dry-run the complete activation layout, descriptors, and scratch against
+     * the immutable pack cache. The first grow covers candidate tensor views;
+     * the second covers metadata/scratch. Neither changes the allocator mark
+     * or committed graph, so an allocation failure leaves the old variant. */
+    this._allocationMeasurement = { cursor: mark };
+    const stagedMetadataWrites: WasmStagedMetadataWrite[] = [];
+    this._variantMetadataStaging = stagedMetadataWrites;
+    let measuredEnd: number;
+    let measuredMetadataMark: number;
+    let candidate: ReturnType<WasmEngine['_buildVariantResources']>;
+    try {
+      this._installActivationLayout(
+        graph,
+        capacityCandidate.capacities,
+        capacityCandidate.arenaCapacities,
+      );
+      measuredMetadataMark = this._allocationMeasurement.cursor;
+      this._growFor(measuredMetadataMark);
+      candidate = this._buildVariantResources(graph, prepared);
+      measuredEnd = this._allocationMeasurement.cursor;
+      this._growFor(measuredEnd);
+    } finally {
+      this._variantMetadataStaging = null;
+      this._allocationMeasurement = null;
+      this.pointers.clear();
+      this.tensorCapacities.clear();
+      for (const [name, pointer] of previousPointers) this.pointers.set(name, pointer);
+      for (const [name, capacity] of previousCapacities) {
+        this.tensorCapacities.set(name, capacity);
+      }
+      this._refreshGraphTensorViews(previousGraph);
+    }
+    try {
+      if (this.api.heap_rewind(mark) !== 1) {
+        throw new Error('WASM reusable arena rejected its committed mark.');
+      }
+      this._installActivationLayout(
+        graph,
+        capacityCandidate.capacities,
+        capacityCandidate.arenaCapacities,
+      );
+      const actualMetadataMark = Number(this.api.heap_mark());
+      if (!Number.isSafeInteger(actualMetadataMark) ||
+          actualMetadataMark !== measuredMetadataMark) {
+        throw new Error('WASM activation layout disagreed with its preflight measurement.');
+      }
+      this._commitStagedVariantResources(
+        stagedMetadataWrites,
+        actualMetadataMark,
+        measuredEnd,
+      );
+      this._refreshGraphTensorViews(graph);
+      this.graph = graph;
+      this.preparedGraph = prepared;
+      this.nodeMetadata = candidate.nodeMetadata;
+      this.f32PackedNodes.clear();
+      for (const [node, descriptor] of candidate.f32PackedNodes) {
+        this.f32PackedNodes.set(node, descriptor);
+      }
+      this.qconvIm2ColPointer = candidate.qconvIm2ColPointer;
+      this.qconvIm2ColBytes = candidate.qconvIm2ColBytes;
+      this._currentShapeSignature = options.shapeSignature ?? null;
+      this._metadataArenaMark = actualMetadataMark;
+      this._activationCapacityBytes = capacityCandidate.currentBytes;
+      this._activationRequiredBytes = capacityCandidate.requiredBytes;
+      this._activationArenaCapacities = capacityCandidate.arenaCapacities ?? new Map();
+      this._activationCapacityHighWaterBytes = Math.max(
+        this._activationCapacityHighWaterBytes,
+        capacityCandidate.currentBytes,
+      );
+      if (capacityCandidate.grew) this._activationGrowCount++;
+      this._variantBytes = measuredEnd - actualMetadataMark;
+      this._variantHighWaterBytes = Math.max(this._variantHighWaterBytes, this._variantBytes);
+      this._variantRebindCount++;
+      this.resetDecodeCache();
+      return this;
+    } catch (error) {
+      try {
+        this._restoreVariantResources(
+          previousGraph,
+          previousPrepared,
+          previousCapacities,
+          this._activationStorage === 'liveness' ? previousArenaCapacities : null,
+        );
+        this.graph = previousGraph;
+        this.preparedGraph = previousPrepared;
+        this._currentShapeSignature = previousSignature;
+        this._activationCapacityBytes = previousCapacityBytes;
+        this._activationRequiredBytes = previousRequiredBytes;
+        this._activationArenaCapacities = previousArenaCapacities;
+        this._metadataArenaMark = previousMetadataMark;
+        this._variantBytes = previousVariantBytes;
+      } catch (restoreError) {
+        throw new AggregateError(
+          [error, restoreError],
+          'WASM shape specialization failed and its previous variant could not be restored.',
+        );
+      }
+      throw error;
+    }
+  }
+
+  compile(
+    graph: WasmGraph,
+    preparedGraph: Readonly<object> = this.prepareGraph(graph),
+    allocationOptions: WasmGraphAllocationOptions = {},
+  ) {
+    /* Opt-in phase breakdown. Reading the global once here is the only cost
+     * when it is unset; every site below then tests one null field. */
+    const profile = (globalThis as any).__VOLVOX_WASM_COMPILE_PROFILE
+      ? WasmEngine._newCompileProfile() : null;
+    this._compileProfile = profile;
+    const compileStart = profile ? performance.now() : 0;
+    const prepared = this._assertPreparedGraph(graph, preparedGraph);
+    if (!allocationOptions || typeof allocationOptions !== 'object' ||
+        Array.isArray(allocationOptions)) {
+      throw new Error('WASM graph allocation options must be an object.');
+    }
+    const requestedCapacities = allocationOptions.tensorCapacityBytes;
+    const maximumCapacities = allocationOptions.tensorMaximumBytes;
+    if (requestedCapacities !== undefined &&
+        (!requestedCapacities || typeof requestedCapacities !== 'object' ||
+          Array.isArray(requestedCapacities))) {
+      throw new Error('WASM tensor capacities must be a name-to-byte-count record.');
+    }
+    if (maximumCapacities !== undefined &&
+        (!maximumCapacities || typeof maximumCapacities !== 'object' ||
+          Array.isArray(maximumCapacities))) {
+      throw new Error('WASM tensor maximums must be a name-to-byte-count record.');
+    }
+    const capacityGrowthFactor = allocationOptions.capacityGrowthFactor ?? 2;
+    if (typeof capacityGrowthFactor !== 'number' || !Number.isFinite(capacityGrowthFactor) ||
+        capacityGrowthFactor <= 1) {
+      throw new Error('WASM capacity growth factor must be finite and greater than one.');
+    }
+    const activationStorage = allocationOptions.activationStorage ?? 'persistent';
+    if (activationStorage !== 'persistent' && activationStorage !== 'liveness') {
+      throw new Error("WASM activation storage must be 'persistent' or 'liveness'.");
+    }
+    if (allocationOptions.shapeSignature !== undefined &&
+        (typeof allocationOptions.shapeSignature !== 'string' ||
+          allocationOptions.shapeSignature.length === 0)) {
+      throw new Error('WASM shape signature must be a non-empty string.');
+    }
+    for (const name of new Set([
+      ...Object.keys(requestedCapacities ?? {}),
+      ...Object.keys(maximumCapacities ?? {}),
+    ])) {
+      if (!graph.tensors.has(name)) {
+        throw new Error(`WASM tensor capacity references unknown tensor '${name}'.`);
+      }
+      for (const [label, bytes] of [
+        ['capacity', requestedCapacities?.[name]],
+        ['maximum', maximumCapacities?.[name]],
+      ] as const) {
+        if (bytes !== undefined &&
+            (!Number.isSafeInteger(bytes) || bytes <= 0 || bytes > 0x7ffffff0)) {
+          throw new Error(`WASM tensor '${name}' ${label} is not representable.`);
+        }
+      }
+    }
+    this.resetDecodeCache();
+    console.log("[VolvoxAI WASM] Allocating graph tensors on WASM heap...");
+    if (this.api.reset_heap) this.api.reset_heap();
+    this.pointers.clear();
+    this.tensorCapacities.clear();
+    this.tensorMaximumBytes.clear();
+    this.nodeMetadata = new Map();
+    this.f32PackedWeights.clear();
+    this.q8PackedWeights.clear();
+    this.f32PackedNodes.clear();
+    this.qconvIm2ColPointer = 0;
+    this.qconvIm2ColBytes = 0;
+    this._variantArenaMark = null;
+    this._activationArenaMark = null;
+    this._metadataArenaMark = null;
+    this._allocationMeasurement = null;
+    this._variantMetadataStaging = null;
+    this._currentShapeSignature = null;
+    this._persistentWeightBytes = 0;
+    this._activationStorage = activationStorage;
+    this._activationAliases = new Map();
+    this._maximumLivenessLayout = null;
+    this._activationArenaCapacities = new Map();
+    this._activationCapacityBytes = 0;
+    this._activationCapacityHighWaterBytes = 0;
+    this._activationRequiredBytes = 0;
+    this._activationGrowCount = 0;
+    this._capacityGrowthFactor = capacityGrowthFactor;
+    this._variantBytes = 0;
+    this._variantHighWaterBytes = 0;
+    this._variantRebindCount = 0;
+    this._f32PackCount = 0;
+    this._q8PackCount = 0;
+    // WASM is an inference backend. Eliminate standalone Dropout before heap
+    // allocation so it consumes neither a separate activation nor a runtime
+    // call. Chained Dropout aliases are resolved after ordinary tensors.
+    const dropoutAliases = wasmActivationAliases(graph, prepared);
+    this._activationAliases = dropoutAliases;
+    const preflightStart = profile ? performance.now() : 0;
+    for (const step of prepared.schedule) {
+      const node = graph.nodes[step.nodeIndex];
+      preflightPortableQGroupNormStorage(node);
+      preflightPortableQLayerNormStorage(node);
+      preflightPortableQSDPAStorage(node);
+      preflightPortableQArgMaxStorage(node);
+      preflightPortableQMaskedMeanStorage(node);
+    }
+    if (profile) profile.preflightMs = performance.now() - preflightStart;
+    const tensorAllocStart = profile ? performance.now() : 0;
+    const aliasRoots = new Map<string, string>();
+    const resolveAliasRootName = (name: string, visiting = new Set<string>()): string => {
+      const cached = aliasRoots.get(name);
+      if (cached) return cached;
+      const sourceName = dropoutAliases.get(name);
+      if (!sourceName) {
+        aliasRoots.set(name, name);
+        return name;
+      }
+      if (visiting.has(name)) throw new Error(`WASM storage alias cycle contains tensor '${name}'.`);
+      visiting.add(name);
+      const root = resolveAliasRootName(sourceName, visiting);
+      visiting.delete(name);
+      aliasRoots.set(name, root);
+      return root;
+    };
+    const capacityByRoot = new Map<string, number>();
+    const maximumByRoot = new Map<string, number>();
+    for (const [name, tensor] of graph.tensors.entries()) {
+      const requested = requestedCapacities?.[name] ?? tensor.sizeBytes;
+      const maximum = maximumCapacities?.[name] ?? requested;
+      if (!Number.isSafeInteger(requested) || requested < tensor.sizeBytes ||
+          requested > 0x7ffffff0) {
+        throw new Error(`WASM tensor '${name}' capacity must cover its logical bytes within the signed allocator ABI.`);
+      }
+      if (!Number.isSafeInteger(maximum) || maximum < requested ||
+          maximum > 0x7ffffff0) {
+        throw new Error(`WASM tensor '${name}' maximum must cover its initial capacity.`);
+      }
+      if (tensor.isWeight === true &&
+          (requested !== tensor.sizeBytes || maximum !== tensor.sizeBytes)) {
+        throw new Error(`WASM invariant weight '${name}' must use its exact logical byte size.`);
+      }
+      const root = resolveAliasRootName(name);
+      capacityByRoot.set(root, Math.max(capacityByRoot.get(root) ?? 0, requested));
+      maximumByRoot.set(root, Math.max(maximumByRoot.get(root) ?? 0, maximum));
+      this.tensorMaximumBytes.set(name, maximum);
+    }
+    for (const name of graph.tensors.keys()) {
+      const root = resolveAliasRootName(name);
+      this.tensorMaximumBytes.set(name, maximumByRoot.get(root)!);
+    }
+    /* Invariant storage is a true prefix. Packed panels are prepared before
+     * any activation pointer so the complete activation/metadata/scratch
+     * suffix can later be rewound and geometrically replanned without copying
+     * or repacking a weight. */
+    for (const [name, tensor] of graph.tensors.entries()) {
+      if (tensor.isWeight === true && !dropoutAliases.has(name)) {
+        this._alloc(tensor, capacityByRoot.get(name));
+      }
+    }
+    this._prepareInvariantWeightPacks(graph, prepared);
+    if (typeof this.api.heap_mark === 'function') {
+      const activationMark = Number(this.api.heap_mark());
+      if (!Number.isSafeInteger(activationMark) || activationMark < 0 ||
+          activationMark > WASM_PORTABLE_MAX_U32 || (activationMark & 15) !== 0) {
+        throw new Error('WASM allocator returned an invalid activation-arena mark.');
+      }
+      this._activationArenaMark = activationMark;
+    }
+    if (activationStorage === 'liveness') {
+      const maximumSizes = new Map<string, number>();
+      for (const [name, tensor] of graph.tensors) {
+        if (tensor.isWeight !== true) maximumSizes.set(name, this.tensorMaximumBytes.get(name)!);
+      }
+      this._maximumLivenessLayout = planWasmActivationLiveness(
+        graph, prepared, dropoutAliases, maximumSizes,
+      );
+      const initial = this._prepareLivenessCapacityCandidate(
+        graph, prepared, requestedCapacities,
+      );
+      this._installActivationLayout(graph, initial.capacities, initial.arenaCapacities);
+      this._activationArenaCapacities = initial.arenaCapacities ?? new Map();
+      this._activationCapacityBytes = initial.currentBytes;
+      this._activationRequiredBytes = initial.requiredBytes;
+      this._activationCapacityHighWaterBytes = initial.currentBytes;
+    } else {
+      for (const [name, tensor] of graph.tensors.entries()) {
+        if (tensor.isWeight !== true && !dropoutAliases.has(name)) {
+          this._alloc(tensor, capacityByRoot.get(name));
+        }
+      }
+      const resolveDropoutAlias = (name: string, visiting = new Set<string>()): number => {
+        if (this.pointers.has(name)) return this.pointers.get(name)!;
+        if (visiting.has(name)) throw new Error(`Dropout alias cycle contains tensor '${name}'.`);
+        const sourceName = dropoutAliases.get(name);
+        if (!sourceName) throw new Error(`Dropout alias '${name}' has no allocated source.`);
+        visiting.add(name);
+        const pointer = resolveDropoutAlias(sourceName, visiting);
+        visiting.delete(name);
+        this.pointers.set(name, pointer);
+        return pointer;
+      };
+      for (const name of dropoutAliases.keys()) {
+        const pointer = resolveDropoutAlias(name);
+        const tensor = graph.tensors.get(name)!;
+        const root = resolveAliasRootName(name);
+        const rootCapacity = this.tensorCapacities.get(root);
+        if (!rootCapacity || this.pointers.get(root) !== pointer ||
+            rootCapacity.dtype !== tensor.dtype) {
+          throw new Error(`WASM storage alias '${name}' has no compatible capacity owner.`);
+        }
+        this.tensorCapacities.set(name, Object.freeze({
+          dtype: tensor.dtype,
+          capacityBytes: rootCapacity.capacityBytes,
+          isWeight: tensor.isWeight === true,
+          owner: root,
+        }));
+      }
+    }
+    if (typeof this.api.heap_mark === 'function') {
+      const metadataMark = Number(this.api.heap_mark());
+      if (!Number.isSafeInteger(metadataMark) || metadataMark < 0 ||
+          metadataMark > WASM_PORTABLE_MAX_U32 || (metadataMark & 15) !== 0) {
+        throw new Error('WASM allocator returned an invalid metadata-arena mark.');
+      }
+      this._metadataArenaMark = metadataMark;
+    }
+    if (profile) profile.tensorAllocMs = performance.now() - tensorAllocStart;
     // Metadata validation for canonical byte operators deliberately inspects
     // the physical typed views to reject malformed/overlapping storage.  A
     // WASM memory grow detaches every earlier view; metadata allocations for
@@ -2609,19 +4340,37 @@ export class WasmEngine extends BackendEngine {
     let viewedMemory: ArrayBuffer | null = null;
     const refreshTensorViews = () => {
       if (viewedMemory === this.mem.buffer) return;
+      const started = profile ? performance.now() : 0;
       for (const [name, tensor] of graph.tensors.entries()) {
         const ptr = this.pointers.get(name);
         tensor.buffer = wasmTensorView(tensor, this.mem.buffer, ptr);
       }
       viewedMemory = this.mem.buffer;
+      if (profile) {
+        profile.viewRefreshMs += performance.now() - started;
+        profile.viewRefreshCount++;
+      }
     };
+    const descriptorStart = profile ? performance.now() : 0;
+    const nestedBefore = profile ? profile.viewRefreshMs + profile.packWeightMs +
+      profile.metadataAllocMs : 0;
     for (const step of prepared.schedule) {
       const node = graph.nodes[step.nodeIndex];
       refreshTensorViews();
       const metadata = this._compilePortableMetadata(node);
-      if (metadata) this.nodeMetadata.set(node, metadata);
+      if (metadata) {
+        this.nodeMetadata.set(node, metadata);
+        if (profile) profile.descriptorCount++;
+      }
       const packedF32 = this._compilePackedF32Linear(node);
       if (packedF32) this.f32PackedNodes.set(node, packedF32);
+    }
+    if (profile) {
+      /* Descriptor construction is what the loop spends outside the phases it
+       * nests (view refresh, weight packing, metadata allocation). */
+      const nested = profile.viewRefreshMs + profile.packWeightMs +
+        profile.metadataAllocMs - nestedBefore;
+      profile.descriptorMs = performance.now() - descriptorStart - nested;
     }
     for (const metadata of this.nodeMetadata.values()) {
       if (metadata?.kind === 'qconv2d' && metadata.packedWeightPointer &&
@@ -2637,29 +4386,131 @@ export class WasmEngine extends BackendEngine {
     // The final node may have allocated metadata and grown memory after its
     // descriptor was built, so publish one final coherent set of views.
     refreshTensorViews();
+    this._persistentWeightBytes = [...this.tensorCapacities.entries()]
+      .filter(([name, capacity]) => capacity.isWeight && capacity.owner === name)
+      .reduce((total, [, capacity]) => total + capacity.capacityBytes, 0);
+    if (activationStorage === 'persistent') {
+      this._activationCapacityBytes = [...this.tensorCapacities.entries()]
+        .filter(([name, capacity]) => !capacity.isWeight && capacity.owner === name)
+        .reduce((total, [, capacity]) => total + capacity.capacityBytes, 0);
+      const requiredByOwner = new Map<string, number>();
+      for (const [name, tensor] of graph.tensors) {
+        const capacity = this.tensorCapacities.get(name);
+        if (tensor.isWeight !== true && capacity) {
+          requiredByOwner.set(capacity.owner,
+            Math.max(requiredByOwner.get(capacity.owner) ?? 0, tensor.sizeBytes));
+        }
+      }
+      this._activationRequiredBytes = [...requiredByOwner.values()].reduce(
+        (total, bytes) => checkedWasmActivationAdd(total, bytes,
+          'required persistent activation bytes'),
+        0,
+      );
+      this._activationCapacityHighWaterBytes = this._activationCapacityBytes;
+    }
+    if (typeof this.api.heap_mark === 'function' &&
+        typeof this.api.heap_rewind === 'function') {
+      const end = Number(this.api.heap_mark());
+      if (!Number.isSafeInteger(end) || end < 0 || end > WASM_PORTABLE_MAX_U32 ||
+          (end & 15) !== 0 || this._activationArenaMark == null ||
+          this._metadataArenaMark == null || this._metadataArenaMark < this._activationArenaMark ||
+          end < this._metadataArenaMark) {
+        throw new Error('WASM allocator returned an invalid reusable-arena mark.');
+      }
+      this._variantArenaMark = this._activationArenaMark;
+      this._variantBytes = end - this._metadataArenaMark;
+      this._variantHighWaterBytes = this._variantBytes;
+    }
+    this._currentShapeSignature = allocationOptions.shapeSignature ?? null;
+    this._heapHighWaterBytes = Math.max(this._heapHighWaterBytes, this.mem.buffer.byteLength);
     this.graph = graph;
     this.preparedGraph = prepared;
     this.compiledWeightRevision = graph.weightRevision || 0;
     this.compiledTopologyRevision = graph.topologyRevision || 0;
-    graph.adapters?._markAcceleratedBackend("wasm");
+    if (profile) {
+      profile.totalMs = performance.now() - compileStart;
+      profile.finalHeapBytes = this.mem.buffer.byteLength;
+      profile.unattributedMs = profile.totalMs -
+        (profile.preflightMs + profile.tensorAllocMs + profile.descriptorMs +
+         profile.packWeightMs + profile.viewRefreshMs + profile.metadataAllocMs);
+      /* A session compiles several graphs (encoder, decoder, ...). Append so a
+       * later compile cannot erase an earlier one's breakdown. */
+      const sink = (globalThis as any);
+      sink.__VOLVOX_WASM_COMPILE_PROFILE_RESULT = profile;
+      (sink.__VOLVOX_WASM_COMPILE_PROFILE_RESULTS ||= []).push(profile);
+      this._compileProfile = null;
+    }
     return this;
   }
+
+  inspectArena(): Readonly<WasmArenaInspection> {
+    const logicalActivationBytes = this.graph
+      ? [...this.graph.tensors.values()]
+        .filter((tensor) => tensor.isWeight !== true)
+        .reduce((total, tensor) => total + tensor.sizeBytes, 0)
+      : 0;
+    const packedWeightBytes = [...this.f32PackedWeights.values()]
+      .reduce((total, descriptor) => total + descriptor.bytes, 0) +
+      [...this.q8PackedWeights.values()]
+        .reduce((total, descriptor) => total + descriptor.bytes, 0);
+    return Object.freeze({
+      reusable: this._variantArenaMark !== null,
+      currentSignature: this._currentShapeSignature,
+      activationStorage: this._activationStorage,
+      persistentWeightBytes: this._persistentWeightBytes,
+      packedWeightBytes,
+      logicalActivationBytes,
+      activationRequiredBytes: this._activationRequiredBytes,
+      activationReuseBytes: Math.max(0, logicalActivationBytes - this._activationRequiredBytes),
+      activationArenaCount: this._activationStorage === 'liveness'
+        ? this._activationArenaCapacities.size
+        : [...this.tensorCapacities.entries()]
+          .filter(([name, capacity]) => !capacity.isWeight && capacity.owner === name)
+          .length,
+      activationCapacityBytes: this._activationCapacityBytes,
+      activationCapacityHighWaterBytes: this._activationCapacityHighWaterBytes,
+      activationGrowCount: this._activationGrowCount,
+      variantBytes: this._variantBytes,
+      variantHighWaterBytes: this._variantHighWaterBytes,
+      heapBytes: this.mem.buffer.byteLength,
+      heapHighWaterBytes: this._heapHighWaterBytes,
+      memoryGrowCount: this._memoryGrowCount,
+      variantRebindCount: this._variantRebindCount,
+      f32PackCount: this._f32PackCount,
+      q8PackCount: this._q8PackCount,
+    });
+  }
+
   async execute(
     inputs: Record<string, RuntimeTypedArray>,
     options: WasmExecutionOptions = {},
   ): Promise<Record<string, RuntimeTypedArray>> {
     assertInferenceExecutionOptions(options, 'WASM inference');
+    const incremental = incrementalExecutionEnabled(options, null);
+    if (incremental && this._activationStorage === 'liveness') {
+      throw new Error(
+        'WASM incremental execution requires persistent activation storage.',
+      );
+    }
+    /* Opt-in execution-phase profiling, the companion to the per-operator map
+     * below. Summing operator times answers "which kernel is slow"; it cannot
+     * answer "why is the request slower than its kernels", because everything
+     * before the schedule loop is outside every operator timer. Set
+     * `globalThis.__VOLVOX_WASM_PHASES` to a Map before execute(). */
+    const phases = (globalThis as any).__VOLVOX_WASM_PHASES as
+      Map<string, number> | undefined;
+    const phase = phases
+      ? (name: string, since: number) => {
+          phases.set(name, (phases.get(name) || 0) + performance.now() - since);
+        }
+      : null;
+    let mark = phase ? performance.now() : 0;
     this.graph.assertTopologyRevision?.(this.compiledTopologyRevision, "WASM");
     this._beginDecodeExecution(options);
-    const adapterPlan = this.graph.adapters?._pinExecution(options) || null;
-    if (adapterPlan) {
-      throw new Error("WASM adapter execution is unsupported; use the CPU backend or merge before compilation.");
-    }
     if ((this.graph.weightRevision || 0) !== this.compiledWeightRevision) {
       throw new Error("WASM weights changed after compilation; recompile the graph before execution.");
     }
     const preparedGraph = this._preparedGraphForExecution();
-    const incremental = incrementalExecutionEnabled(options, adapterPlan);
     const cacheWasValid = this._incrementalCacheValid;
     const selectedNodes = incremental
       ? incrementalNodeSelection(this.graph, inputs, options, cacheWasValid)
@@ -2671,17 +4522,29 @@ export class WasmEngine extends BackendEngine {
       : prepareQuantizedRows(this.graph, selectedNodes, rowPosition, {
           changedInputs: options.changedInputs ?? Object.keys(inputs),
         });
+    const copiedInputs = selectedNodes === null
+      ? null
+      : new Set(options.changedInputs ?? Object.keys(inputs));
+    if (phase) { phase('prepare', mark); mark = performance.now(); }
     for (const [name, data] of Object.entries(inputs)) {
       const tensor = this.graph.tensors.get(name);
       if (!tensor?.isInput) throw new Error(`Unknown graph input '${name}'.`);
       Tensor.assertCompatibleInput(tensor.dtype, data, tensor.sizeBytes, `Input '${name}'`);
-      const ptr = this.pointers.get(name);
-      wasmTensorView(tensor, this.mem.buffer, ptr).set(data);
     }
+    if (phase) { phase('validate-inputs', mark); mark = performance.now(); }
     this._preflightQGroupNormDynamicAffines(inputs);
     this._preflightQLayerNormDynamicAffines(inputs);
     this._preflightQSDPAMasks(inputs);
     this._preflightQMaskedMeanMasks(inputs);
+    this._preflightRoPEPositions(inputs);
+    if (phase) { phase('preflight', mark); mark = performance.now(); }
+    for (const [name, data] of Object.entries(inputs)) {
+      if (copiedInputs !== null && !copiedInputs.has(name)) continue;
+      const tensor = this.graph.tensors.get(name)!;
+      const ptr = this.pointers.get(name);
+      wasmTensorView(tensor, this.mem.buffer, ptr).set(data);
+    }
+    if (phase) { phase('upload-inputs', mark); mark = performance.now(); }
     
     for (const step of preparedGraph.schedule) {
       const nodeIndex = step.nodeIndex;
@@ -3192,15 +5055,49 @@ export class WasmEngine extends BackendEngine {
           );
           if (result !== 1) throw new Error(`WASM MoERouter node ${node.id} rejected its canonical descriptor.`);
        } else if (kernelRoute === "moe-linear") {
-          const descriptor = portableMoELinearDescriptor(node);
-          const result = this.api.moe_linear_f32(
-            this.pointers.get(descriptor.input.name), this.pointers.get(descriptor.expertWeight.name),
-            descriptor.expertBias ? this.pointers.get(descriptor.expertBias.name) : 0,
-            this.pointers.get(descriptor.routeIndices.name), this.pointers.get(descriptor.routeWeights.name),
-            this.pointers.get(descriptor.output.name), descriptor.rows, descriptor.dIn, descriptor.dOut,
-            descriptor.experts, descriptor.topK,
-          );
-          if (result !== 1) throw new Error(`WASM MoELinear node ${node.id} rejected its canonical descriptor.`);
+          let metadata = this.nodeMetadata.get(node);
+          if (metadata?.kind !== 'moeLinear') {
+            /* Preserve the historical direct-engine contract for callers that
+             * install an allocated graph without compile(). Normal compiled
+             * and rebound graphs already own this metadata in their variant
+             * arena, so this fallback is not on the provider path. */
+            const compiled = this._compilePortableMetadata(node);
+            if (compiled?.kind === 'moeLinear') {
+              this.nodeMetadata.set(node, compiled);
+              metadata = compiled;
+            }
+          }
+          const descriptor: any = metadata?.kind === 'moeLinear'
+            ? metadata
+            : portableMoELinearDescriptor(node);
+          const hasSlotTable = descriptor.residentSlots != null;
+          if (hasSlotTable &&
+              (!Number.isSafeInteger(descriptor.slotTablePointer) ||
+               !Number.isSafeInteger(descriptor.slotTableDomain))) {
+            throw new Error(`WASM MoELinear node ${node.id} has no compiled resident slot table.`);
+          }
+          const result = !hasSlotTable
+            ? this.api.moe_linear_f32(
+              this.pointers.get(descriptor.input.name), this.pointers.get(descriptor.expertWeight.name),
+              descriptor.expertBias ? this.pointers.get(descriptor.expertBias.name) : 0,
+              this.pointers.get(descriptor.routeIndices.name), this.pointers.get(descriptor.routeWeights.name),
+              this.pointers.get(descriptor.output.name), descriptor.rows, descriptor.dIn, descriptor.dOut,
+              descriptor.experts, descriptor.topK,
+            )
+            : this.api.vx_moe_linear_banked_f32(
+              this.pointers.get(descriptor.input.name), this.pointers.get(descriptor.expertWeight.name),
+              descriptor.expertBias ? this.pointers.get(descriptor.expertBias.name) : 0,
+              this.pointers.get(descriptor.routeIndices.name), this.pointers.get(descriptor.routeWeights.name),
+              this.pointers.get(descriptor.output.name), descriptor.rows, descriptor.dIn, descriptor.dOut,
+              descriptor.experts, descriptor.topK,
+              descriptor.slotTablePointer, descriptor.slotTableDomain,
+            );
+          if (result !== 1) {
+            throw new Error(!hasSlotTable
+              ? `WASM MoELinear node ${node.id} rejected its canonical descriptor.`
+              : `WASM MoELinear node ${node.id} routed to an expert that is not ` +
+                `resident in this context.`);
+          }
        } else if (kernelRoute === "sdpa") {
           const qkvPtr = this.pointers.get(node.inputs.qkv.name)!;
           const qkvShape = node.inputs.qkv.shape;
@@ -3680,9 +5577,10 @@ export class WasmEngine extends BackendEngine {
           const inputBatchBytes = inShape[1] * inShape[2] * 4;
           const outputBatchBytes = outShape[1] * outShape[2] * 4;
           for (let batch = 0; batch < inShape[0]; batch++) {
+            // NLC input [batch, l, c]; WIO weight [k, in_per_group, out_c].
             this.api.conv1d_f32(
                 inPtr + batch * inputBatchBytes, outPtr + batch * outputBatchBytes, wPtr, bPtr,
-                inShape[1], inShape[2], wShape[0], wShape[1], wShape[2], st, pd, groups, relu
+                inShape[2], inShape[1], wShape[2], wShape[1], wShape[0], st, pd, groups, relu
             );
           }
        } else if (kernelRoute === "upsample-nearest2d") {
@@ -4126,10 +6024,13 @@ export class WasmEngine extends BackendEngine {
            if (!descriptor || descriptor.kind !== 'where') {
              throw new Error(`WASM ${node.opType} node ${node.id} has no compiled portable descriptor.`);
            }
-           const result = this.api.where_typed_32(
+           const result = this.api.where_broadcast_32(
              this.pointers.get(descriptor.condition.name), descriptor.conditionType,
              this.pointers.get(descriptor.a.name), this.pointers.get(descriptor.b.name),
-             this.pointers.get(descriptor.output.name), descriptor.elements, descriptor.dataType,
+             this.pointers.get(descriptor.output.name), descriptor.conditionShapePointer,
+             descriptor.aShapePointer, descriptor.bShapePointer, descriptor.outputShapePointer,
+             descriptor.conditionRank, descriptor.aRank, descriptor.bRank, descriptor.outputRank,
+             descriptor.elements, descriptor.dataType,
            );
            if (result !== 1) throw new Error(`WASM ${node.opType} node ${node.id} rejected its canonical descriptor.`);
          } else if (kernelRoute === "pad") {
@@ -4150,43 +6051,59 @@ export class WasmEngine extends BackendEngine {
            const s = inShape.length === 4 ? inShape : [1, inShape[0] || 1, inShape[1] || 1, 1];
            this.api.pad_2d_f32(inputPtr, outputPtr, val, s[0], s[1], s[2], s[3], pt, pb, pl, pr);
          } else if (kernelRoute === "average-pool2d") {
-           const input = node.inputs.input || node.inputs.x;
-           const output = node.outputs.out;
-           const inputPtr = this.pointers.get(input.name);
-           const outputPtr = this.pointers.get(output?.name);
-           if (inputPtr == null || outputPtr == null) {
-             throw new Error(`WASM ${node.opType} node ${node.id} has an unallocated input or output tensor.`);
+           const descriptor = this.nodeMetadata.get(node);
+           if (!descriptor || descriptor.kind !== 'f32Pool2D' ||
+               descriptor.opType !== 'AveragePool2D') {
+             throw new Error(`WASM AveragePool2D node ${node.id} has no canonical F32 descriptor.`);
            }
-           const [b, in_h, in_w, c] = input.shape;
-           const [ob, out_h, out_w] = output.shape;
-           const ky = node.params.kernel[0], kx = node.params.kernel[1];
-           const sy = node.params.stride ? node.params.stride[0] : 1;
-           const sx = node.params.stride ? node.params.stride[1] : 1;
-           const py = node.params.padding ? node.params.padding[0] : 0;
-           const px = node.params.padding ? node.params.padding[1] : 0;
-           this.api.averagepool2d_f32(inputPtr, outputPtr, b, in_h, in_w, c, ky, kx, sy, sx, py, px, out_h, out_w);
+           const inputPtr = this.pointers.get(descriptor.input.name);
+           const outputPtr = this.pointers.get(descriptor.output.name);
+           if (inputPtr == null || outputPtr == null) {
+             throw new Error(`WASM AveragePool2D node ${node.id} has an unallocated input or output tensor.`);
+           }
+           this.api.averagepool2d_f32(
+             inputPtr, outputPtr, descriptor.batch, descriptor.inputHeight,
+             descriptor.inputWidth, descriptor.channels, descriptor.kernelY,
+             descriptor.kernelX, descriptor.strideY, descriptor.strideX,
+             descriptor.paddingY, descriptor.paddingX, descriptor.outputHeight,
+             descriptor.outputWidth,
+           );
         } else if (kernelRoute === "max-pool2d") {
-           const quantizedDescriptor = this.nodeMetadata.get(node);
-           if (quantizedDescriptor?.kind === 'quantizedMaxPool') {
+           const descriptor = this.nodeMetadata.get(node);
+           if (descriptor?.kind === 'quantizedMaxPool') {
              const result = this.api.maxpool2d_i8u8(
-               this.pointers.get(quantizedDescriptor.input.name),
-               this.pointers.get(quantizedDescriptor.output.name), quantizedDescriptor.batch,
-               quantizedDescriptor.inputHeight, quantizedDescriptor.inputWidth,
-               quantizedDescriptor.channels, quantizedDescriptor.outputHeight,
-               quantizedDescriptor.outputWidth, quantizedDescriptor.kernelY,
-               quantizedDescriptor.kernelX, quantizedDescriptor.strideY,
-               quantizedDescriptor.strideX, quantizedDescriptor.paddingY,
-               quantizedDescriptor.paddingX, quantizedDescriptor.dtype,
+               this.pointers.get(descriptor.input.name),
+               this.pointers.get(descriptor.output.name), descriptor.batch,
+               descriptor.inputHeight, descriptor.inputWidth,
+               descriptor.channels, descriptor.outputHeight,
+               descriptor.outputWidth, descriptor.kernelY,
+               descriptor.kernelX, descriptor.strideY,
+               descriptor.strideX, descriptor.paddingY,
+               descriptor.paddingX, descriptor.dtype,
              );
              if (result !== 1) throw new Error(`WASM MaxPool2D node ${node.id} rejected its I8/U8 descriptor.`);
+           } else if (descriptor?.kind === 'f32Pool2D' && descriptor.opType === 'MaxPool2D') {
+             const inputPointer = this.pointers.get(descriptor.input.name);
+             const outputPointer = this.pointers.get(descriptor.output.name);
+             if (inputPointer == null || outputPointer == null) {
+               throw new Error(`WASM MaxPool2D node ${node.id} has an unallocated input or output tensor.`);
+             }
+             const inputBatchBytes = descriptor.inputHeight * descriptor.inputWidth *
+               descriptor.channels * Float32Array.BYTES_PER_ELEMENT;
+             const outputBatchBytes = descriptor.outputHeight * descriptor.outputWidth *
+               descriptor.channels * Float32Array.BYTES_PER_ELEMENT;
+             for (let batch = 0; batch < descriptor.batch; batch++) {
+               this.api.maxpool2d_f32(
+                 inputPointer + batch * inputBatchBytes,
+                 outputPointer + batch * outputBatchBytes,
+                 descriptor.inputHeight, descriptor.inputWidth, descriptor.channels,
+                 descriptor.outputHeight, descriptor.outputWidth, descriptor.kernelY,
+                 descriptor.kernelX, descriptor.strideY, descriptor.strideX,
+                 descriptor.paddingY, descriptor.paddingX,
+               );
+             }
            } else {
-             const inShape = node.inputs.input.shape;
-             const outShape = node.outputs.out.shape;
-             const ky = node.params.kernel[0], kx = node.params.kernel[1];
-             const sy = node.params.stride[0], sx = node.params.stride[1];
-             const py = node.params.padding ? node.params.padding[0] : 0;
-             const px = node.params.padding ? node.params.padding[1] : 0;
-             this.api.maxpool2d_f32(inPtr, outPtr, inShape[1], inShape[2], inShape[3], outShape[1], outShape[2], ky, kx, sy, sx, py, px);
+             throw new Error(`WASM MaxPool2D node ${node.id} has no canonical descriptor.`);
            }
         } else if (kernelRoute === "mean-height") {
            const inShape = node.inputs.input.shape;
@@ -4201,7 +6118,15 @@ export class WasmEngine extends BackendEngine {
             // compile() aliases the output heap pointer to the input.
         } else if (kernelRoute === "shape-copy") {
             const quantizedDescriptor = this.nodeMetadata.get(node);
-            if (decodeNode) {
+            const aliasedInput = node.inputs.input || node.inputs.x || node.inputs.data;
+            const aliasedOutput = node.outputs.out || Object.values(node.outputs || {})[0];
+            if (aliasedInput && aliasedOutput &&
+                this.pointers.get(aliasedInput.name) ===
+                this.pointers.get(aliasedOutput.name)) {
+              /* compile() aliased this view onto its input, so the bytes are
+               * already in place. These reshape-family nodes move 28 MB per
+               * inference on this model purely to leave the layout unchanged. */
+            } else if (decodeNode) {
               const input = decodeNode.inputs.input || decodeNode.inputs.x ||
                 decodeNode.inputs.data;
               const output = portableOutput(decodeNode);
@@ -4279,6 +6204,7 @@ export class WasmEngine extends BackendEngine {
       }
     }
 
+    if (phase) { phase('schedule', mark); mark = performance.now(); }
     if (incremental) this._incrementalCacheValid = true;
     const results = {};
     for (const name of this.graph.outputNames) {
@@ -4290,6 +6216,7 @@ export class WasmEngine extends BackendEngine {
         // public ExecutionResult remains a stable snapshot.
         results[name] = wasmTensorView(tensor, this.mem.buffer, ptr);
     }
+    if (phase) phase('publish-outputs', mark);
     return results;
   }
 };

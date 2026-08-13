@@ -192,7 +192,7 @@ prevents the remaining commands from running.
 > engine keeps a little notebook: for each pile of numbers on the card, it writes down which pile on
 > the computer it matches, and whether the freshest copy is on the card or on the computer.
 
-🔧 Callers never see device memory. `vx_execution_context_set_input` copies input bytes into
+🔧 Callers never see device memory. `vx_execution_context_execute` receives a complete host binding batch and copies input bytes into
 runtime-owned storage, and `vx_result_read` copies an immutable result snapshot back to the caller.
 Inside the CUDA provider, a private **slot table** maps runtime-owned tensor storage to device
 allocations. Its typed entry points are implementation details:

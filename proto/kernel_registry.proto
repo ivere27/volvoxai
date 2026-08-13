@@ -52,6 +52,18 @@ enum RuntimeSupportMode {
   RUNTIME_SUPPORT_MODE_DYNAMIC = 2;
 }
 
+// CANONICAL selects the authoritative contract for the current implementation
+// tranche; it is not an attestation of cross-language, backend, or release-gate
+// coverage. DEFERRED reserves a stable route for a later tranche.
+// BOUNDED_VALUE_DEPENDENT marks the fixed-capacity plus valid-count/padding
+// convention; compact data-dependent cardinality remains outside v1.
+enum ShapeContractClassification {
+  SHAPE_CONTRACT_CLASSIFICATION_UNSPECIFIED = 0;
+  SHAPE_CONTRACT_CLASSIFICATION_CANONICAL = 1;
+  SHAPE_CONTRACT_CLASSIFICATION_DEFERRED = 2;
+  SHAPE_CONTRACT_CLASSIFICATION_BOUNDED_VALUE_DEPENDENT = 3;
+}
+
 message OperatorRoute {
   volvoxai.runtime.OperatorKind operator = 1;
   string route = 2;
@@ -61,6 +73,12 @@ message OperatorRoute {
 message OperatorSet {
   string name = 1;
   repeated volvoxai.runtime.OperatorKind operator = 2;
+}
+
+message OperatorShapeContractRoute {
+  volvoxai.runtime.OperatorKind operator = 1;
+  string shape_function_id = 2;
+  ShapeContractClassification classification = 3;
 }
 
 message BackendInventory {
@@ -113,6 +131,7 @@ message KernelRegistry {
   repeated TargetProfile target_profile = 3;
   repeated KernelVariant variant = 4;
   repeated OperatorSet operator_set = 5;
+  repeated OperatorShapeContractRoute shape_contract = 6;
 }
 
 extend google.protobuf.FileOptions {
@@ -123,6 +142,118 @@ extend google.protobuf.FileOptions {
 // inventory changes are reviewed atomically.
 option (volvoxai.kernel_registry.registry) = {
   schema_version: 1
+
+  // Stable logical shape routes. Reusing an ID means the operators share one
+  // output-shape inference identity; port/dtype/quantization rules may differ.
+  // Linear algebra and attention.
+  shape_contract: { operator: OPERATOR_KIND_MATMUL shape_function_id: "volvox.shape.dense-last-axis.v1" classification: SHAPE_CONTRACT_CLASSIFICATION_CANONICAL }
+  shape_contract: { operator: OPERATOR_KIND_LINEAR shape_function_id: "volvox.shape.dense-last-axis.v1" classification: SHAPE_CONTRACT_CLASSIFICATION_CANONICAL }
+  shape_contract: { operator: OPERATOR_KIND_Q_LINEAR shape_function_id: "volvox.shape.q-dense-last-axis.v1" classification: SHAPE_CONTRACT_CLASSIFICATION_CANONICAL }
+  shape_contract: { operator: OPERATOR_KIND_BATCH_MATMUL shape_function_id: "volvox.shape.batch-matmul.v1" classification: SHAPE_CONTRACT_CLASSIFICATION_CANONICAL }
+  shape_contract: { operator: OPERATOR_KIND_Q_BATCH_MATMUL shape_function_id: "volvox.shape.q-batch-matmul.v1" classification: SHAPE_CONTRACT_CLASSIFICATION_CANONICAL }
+  shape_contract: { operator: OPERATOR_KIND_Q_GEMM shape_function_id: "volvox.shape.q-dense-last-axis.v1" classification: SHAPE_CONTRACT_CLASSIFICATION_CANONICAL }
+  shape_contract: { operator: OPERATOR_KIND_GEMM shape_function_id: "volvox.shape.dense-last-axis.v1" classification: SHAPE_CONTRACT_CLASSIFICATION_CANONICAL }
+  shape_contract: { operator: OPERATOR_KIND_Q_MATMUL shape_function_id: "volvox.shape.q-dense-last-axis.v1" classification: SHAPE_CONTRACT_CLASSIFICATION_CANONICAL }
+  shape_contract: { operator: OPERATOR_KIND_MOE_ROUTER shape_function_id: "volvox.shape.moe-router.v1" classification: SHAPE_CONTRACT_CLASSIFICATION_CANONICAL }
+  shape_contract: { operator: OPERATOR_KIND_MOE_LINEAR shape_function_id: "volvox.shape.moe-linear.v1" classification: SHAPE_CONTRACT_CLASSIFICATION_CANONICAL }
+  shape_contract: { operator: OPERATOR_KIND_SDPA shape_function_id: "volvox.shape.sdpa.v1" classification: SHAPE_CONTRACT_CLASSIFICATION_CANONICAL }
+  shape_contract: { operator: OPERATOR_KIND_Q_SDPA shape_function_id: "volvox.shape.q-sdpa.v1" classification: SHAPE_CONTRACT_CLASSIFICATION_CANONICAL }
+  shape_contract: { operator: OPERATOR_KIND_CROSS_SDPA shape_function_id: "volvox.shape.cross-sdpa.v1" classification: SHAPE_CONTRACT_CLASSIFICATION_CANONICAL }
+  shape_contract: { operator: OPERATOR_KIND_CROSS_ATTENTION shape_function_id: "volvox.shape.cross-attention.v1" classification: SHAPE_CONTRACT_CLASSIFICATION_CANONICAL }
+
+  // Normalization.
+  shape_contract: { operator: OPERATOR_KIND_LAYER_NORM shape_function_id: "volvox.shape.feature-norm.v1" classification: SHAPE_CONTRACT_CLASSIFICATION_CANONICAL }
+  shape_contract: { operator: OPERATOR_KIND_Q_LAYER_NORM shape_function_id: "volvox.shape.q-feature-norm.v1" classification: SHAPE_CONTRACT_CLASSIFICATION_CANONICAL }
+  shape_contract: { operator: OPERATOR_KIND_GROUP_NORM shape_function_id: "volvox.shape.group-norm-nhwc.v1" classification: SHAPE_CONTRACT_CLASSIFICATION_CANONICAL }
+  shape_contract: { operator: OPERATOR_KIND_Q_GROUP_NORM shape_function_id: "volvox.shape.q-group-norm-nhwc.v1" classification: SHAPE_CONTRACT_CLASSIFICATION_CANONICAL }
+  shape_contract: { operator: OPERATOR_KIND_RMS_NORM shape_function_id: "volvox.shape.feature-norm.v1" classification: SHAPE_CONTRACT_CLASSIFICATION_CANONICAL }
+  shape_contract: { operator: OPERATOR_KIND_BATCH_NORM_2D shape_function_id: "volvox.shape.batch-norm-2d.v1" classification: SHAPE_CONTRACT_CLASSIFICATION_CANONICAL }
+
+  // Convolution, pooling, and resampling.
+  shape_contract: { operator: OPERATOR_KIND_CONV_2D shape_function_id: "volvox.shape.conv-2d.v1" classification: SHAPE_CONTRACT_CLASSIFICATION_CANONICAL }
+  shape_contract: { operator: OPERATOR_KIND_Q_CONV_2D shape_function_id: "volvox.shape.q-conv-2d.v1" classification: SHAPE_CONTRACT_CLASSIFICATION_CANONICAL }
+  shape_contract: { operator: OPERATOR_KIND_CONV_1D shape_function_id: "volvox.shape.conv-1d.v1" classification: SHAPE_CONTRACT_CLASSIFICATION_CANONICAL }
+  shape_contract: { operator: OPERATOR_KIND_CONV_TRANSPOSE_2D shape_function_id: "volvox.shape.conv-transpose-2d.v1" classification: SHAPE_CONTRACT_CLASSIFICATION_CANONICAL }
+  shape_contract: { operator: OPERATOR_KIND_MAX_POOL_2D shape_function_id: "volvox.shape.max-pool-2d.v1" classification: SHAPE_CONTRACT_CLASSIFICATION_CANONICAL }
+  shape_contract: { operator: OPERATOR_KIND_AVERAGE_POOL_2D shape_function_id: "volvox.shape.average-pool-2d.v1" classification: SHAPE_CONTRACT_CLASSIFICATION_CANONICAL }
+  shape_contract: { operator: OPERATOR_KIND_GLOBAL_AVERAGE_POOL shape_function_id: "volvox.shape.global-average-pool.v1" classification: SHAPE_CONTRACT_CLASSIFICATION_CANONICAL }
+  shape_contract: { operator: OPERATOR_KIND_RESIZE shape_function_id: "volvox.shape.resize.v1" classification: SHAPE_CONTRACT_CLASSIFICATION_CANONICAL }
+  shape_contract: { operator: OPERATOR_KIND_INTERPOLATE_1D shape_function_id: "volvox.shape.interpolate-1d.v1" classification: SHAPE_CONTRACT_CLASSIFICATION_CANONICAL }
+  shape_contract: { operator: OPERATOR_KIND_RESIZE_NEAREST_2D shape_function_id: "volvox.shape.resize-nearest-2d.v1" classification: SHAPE_CONTRACT_CLASSIFICATION_CANONICAL }
+  shape_contract: { operator: OPERATOR_KIND_UPSAMPLE_NEAREST_2D shape_function_id: "volvox.shape.upsample-nearest-2d.v1" classification: SHAPE_CONTRACT_CLASSIFICATION_CANONICAL }
+
+  // Activation and unary elementwise. PReLU shares the shape function even
+  // though its port contract additionally validates the slope tensor.
+  shape_contract: { operator: OPERATOR_KIND_RELU shape_function_id: "volvox.shape.activation-preserve.v1" classification: SHAPE_CONTRACT_CLASSIFICATION_CANONICAL }
+  shape_contract: { operator: OPERATOR_KIND_LEAKY_RELU shape_function_id: "volvox.shape.activation-preserve.v1" classification: SHAPE_CONTRACT_CLASSIFICATION_CANONICAL }
+  shape_contract: { operator: OPERATOR_KIND_PRELU shape_function_id: "volvox.shape.activation-preserve.v1" classification: SHAPE_CONTRACT_CLASSIFICATION_CANONICAL }
+  shape_contract: { operator: OPERATOR_KIND_GELU shape_function_id: "volvox.shape.activation-preserve.v1" classification: SHAPE_CONTRACT_CLASSIFICATION_CANONICAL }
+  shape_contract: { operator: OPERATOR_KIND_Q_GELU shape_function_id: "volvox.shape.q-activation-preserve.v1" classification: SHAPE_CONTRACT_CLASSIFICATION_CANONICAL }
+  shape_contract: { operator: OPERATOR_KIND_SILU shape_function_id: "volvox.shape.activation-preserve.v1" classification: SHAPE_CONTRACT_CLASSIFICATION_CANONICAL }
+  shape_contract: { operator: OPERATOR_KIND_Q_SILU shape_function_id: "volvox.shape.q-activation-preserve.v1" classification: SHAPE_CONTRACT_CLASSIFICATION_CANONICAL }
+  shape_contract: { operator: OPERATOR_KIND_SIGMOID shape_function_id: "volvox.shape.activation-preserve.v1" classification: SHAPE_CONTRACT_CLASSIFICATION_CANONICAL }
+  shape_contract: { operator: OPERATOR_KIND_HARD_SWISH shape_function_id: "volvox.shape.activation-preserve.v1" classification: SHAPE_CONTRACT_CLASSIFICATION_CANONICAL }
+  shape_contract: { operator: OPERATOR_KIND_HARD_SIGMOID shape_function_id: "volvox.shape.activation-preserve.v1" classification: SHAPE_CONTRACT_CLASSIFICATION_CANONICAL }
+  shape_contract: { operator: OPERATOR_KIND_TANH shape_function_id: "volvox.shape.activation-preserve.v1" classification: SHAPE_CONTRACT_CLASSIFICATION_CANONICAL }
+  shape_contract: { operator: OPERATOR_KIND_SIN shape_function_id: "volvox.shape.activation-preserve.v1" classification: SHAPE_CONTRACT_CLASSIFICATION_CANONICAL }
+  shape_contract: { operator: OPERATOR_KIND_COS shape_function_id: "volvox.shape.activation-preserve.v1" classification: SHAPE_CONTRACT_CLASSIFICATION_CANONICAL }
+  shape_contract: { operator: OPERATOR_KIND_CLIP shape_function_id: "volvox.shape.activation-preserve.v1" classification: SHAPE_CONTRACT_CLASSIFICATION_CANONICAL }
+
+  // Binary, reduction, comparison, and logic.
+  shape_contract: { operator: OPERATOR_KIND_ADD shape_function_id: "volvox.shape.exact-binary.v1" classification: SHAPE_CONTRACT_CLASSIFICATION_CANONICAL }
+  shape_contract: { operator: OPERATOR_KIND_Q_ADD shape_function_id: "volvox.shape.q-exact-binary.v1" classification: SHAPE_CONTRACT_CLASSIFICATION_CANONICAL }
+  shape_contract: { operator: OPERATOR_KIND_SUB shape_function_id: "volvox.shape.broadcast-arithmetic.v1" classification: SHAPE_CONTRACT_CLASSIFICATION_CANONICAL }
+  shape_contract: { operator: OPERATOR_KIND_MUL shape_function_id: "volvox.shape.exact-binary.v1" classification: SHAPE_CONTRACT_CLASSIFICATION_CANONICAL }
+  shape_contract: { operator: OPERATOR_KIND_DIV shape_function_id: "volvox.shape.broadcast-arithmetic.v1" classification: SHAPE_CONTRACT_CLASSIFICATION_CANONICAL }
+  shape_contract: { operator: OPERATOR_KIND_SOFTMAX shape_function_id: "volvox.shape.activation-preserve.v1" classification: SHAPE_CONTRACT_CLASSIFICATION_CANONICAL }
+  shape_contract: { operator: OPERATOR_KIND_LOG_SOFTMAX shape_function_id: "volvox.shape.activation-preserve.v1" classification: SHAPE_CONTRACT_CLASSIFICATION_CANONICAL }
+  shape_contract: { operator: OPERATOR_KIND_REDUCE_SUM shape_function_id: "volvox.shape.reduction.v1" classification: SHAPE_CONTRACT_CLASSIFICATION_CANONICAL }
+  shape_contract: { operator: OPERATOR_KIND_REDUCE_MEAN shape_function_id: "volvox.shape.reduction.v1" classification: SHAPE_CONTRACT_CLASSIFICATION_CANONICAL }
+  shape_contract: { operator: OPERATOR_KIND_Q_MASKED_MEAN shape_function_id: "volvox.shape.q-masked-mean.v1" classification: SHAPE_CONTRACT_CLASSIFICATION_CANONICAL }
+  shape_contract: { operator: OPERATOR_KIND_ARG_MAX shape_function_id: "volvox.shape.arg-max.v1" classification: SHAPE_CONTRACT_CLASSIFICATION_CANONICAL }
+  shape_contract: { operator: OPERATOR_KIND_Q_ARG_MAX shape_function_id: "volvox.shape.q-arg-max.v1" classification: SHAPE_CONTRACT_CLASSIFICATION_CANONICAL }
+  shape_contract: { operator: OPERATOR_KIND_EQUAL shape_function_id: "volvox.shape.broadcast-comparison.v1" classification: SHAPE_CONTRACT_CLASSIFICATION_CANONICAL }
+  shape_contract: { operator: OPERATOR_KIND_GREATER_OR_EQUAL shape_function_id: "volvox.shape.broadcast-comparison.v1" classification: SHAPE_CONTRACT_CLASSIFICATION_CANONICAL }
+  shape_contract: { operator: OPERATOR_KIND_NOT shape_function_id: "volvox.shape.logical-not.v1" classification: SHAPE_CONTRACT_CLASSIFICATION_CANONICAL }
+  shape_contract: { operator: OPERATOR_KIND_WHERE shape_function_id: "volvox.shape.where-broadcast.v1" classification: SHAPE_CONTRACT_CLASSIFICATION_CANONICAL }
+  shape_contract: { operator: OPERATOR_KIND_MASK shape_function_id: "volvox.shape.mask.v1" classification: SHAPE_CONTRACT_CLASSIFICATION_CANONICAL }
+
+  // Shape, structural, and data movement.
+  shape_contract: { operator: OPERATOR_KIND_RESHAPE shape_function_id: "volvox.shape.reshape-static-target.v1" classification: SHAPE_CONTRACT_CLASSIFICATION_CANONICAL }
+  shape_contract: { operator: OPERATOR_KIND_FLATTEN shape_function_id: "volvox.shape.flatten.v1" classification: SHAPE_CONTRACT_CLASSIFICATION_CANONICAL }
+  shape_contract: { operator: OPERATOR_KIND_SQUEEZE shape_function_id: "volvox.shape.squeeze.v1" classification: SHAPE_CONTRACT_CLASSIFICATION_CANONICAL }
+  shape_contract: { operator: OPERATOR_KIND_UNSQUEEZE shape_function_id: "volvox.shape.unsqueeze.v1" classification: SHAPE_CONTRACT_CLASSIFICATION_CANONICAL }
+  shape_contract: { operator: OPERATOR_KIND_TRANSPOSE shape_function_id: "volvox.shape.transpose.v1" classification: SHAPE_CONTRACT_CLASSIFICATION_CANONICAL }
+  shape_contract: { operator: OPERATOR_KIND_CONCAT shape_function_id: "volvox.shape.concat.v1" classification: SHAPE_CONTRACT_CLASSIFICATION_CANONICAL }
+  shape_contract: { operator: OPERATOR_KIND_SPLIT shape_function_id: "volvox.shape.split.v1" classification: SHAPE_CONTRACT_CLASSIFICATION_CANONICAL }
+  shape_contract: { operator: OPERATOR_KIND_SLICE shape_function_id: "volvox.shape.slice-static.v1" classification: SHAPE_CONTRACT_CLASSIFICATION_CANONICAL }
+  shape_contract: { operator: OPERATOR_KIND_PAD shape_function_id: "volvox.shape.pad-static.v1" classification: SHAPE_CONTRACT_CLASSIFICATION_CANONICAL }
+  shape_contract: { operator: OPERATOR_KIND_EXPAND shape_function_id: "volvox.shape.expand-static-target.v1" classification: SHAPE_CONTRACT_CLASSIFICATION_CANONICAL }
+  shape_contract: { operator: OPERATOR_KIND_GATHER shape_function_id: "volvox.shape.gather.v1" classification: SHAPE_CONTRACT_CLASSIFICATION_CANONICAL }
+  shape_contract: { operator: OPERATOR_KIND_GATHER_ELEMENTS shape_function_id: "volvox.shape.gather-elements.v1" classification: SHAPE_CONTRACT_CLASSIFICATION_CANONICAL }
+  shape_contract: { operator: OPERATOR_KIND_IDENTITY shape_function_id: "volvox.shape.identity.v1" classification: SHAPE_CONTRACT_CLASSIFICATION_CANONICAL }
+  shape_contract: { operator: OPERATOR_KIND_BROADCAST shape_function_id: "volvox.shape.broadcast-static-target.v1" classification: SHAPE_CONTRACT_CLASSIFICATION_CANONICAL }
+  shape_contract: { operator: OPERATOR_KIND_CONCAT2 shape_function_id: "volvox.shape.concat-2.v1" classification: SHAPE_CONTRACT_CLASSIFICATION_CANONICAL }
+
+  // Quantization boundaries and cast.
+  shape_contract: { operator: OPERATOR_KIND_QUANTIZE_LINEAR shape_function_id: "volvox.shape.quantize-linear.v1" classification: SHAPE_CONTRACT_CLASSIFICATION_CANONICAL }
+  shape_contract: { operator: OPERATOR_KIND_DEQUANTIZE_LINEAR shape_function_id: "volvox.shape.dequantize-linear.v1" classification: SHAPE_CONTRACT_CLASSIFICATION_CANONICAL }
+  shape_contract: { operator: OPERATOR_KIND_REQUANTIZE_LINEAR shape_function_id: "volvox.shape.requantize-linear.v1" classification: SHAPE_CONTRACT_CLASSIFICATION_CANONICAL }
+  shape_contract: { operator: OPERATOR_KIND_CAST shape_function_id: "volvox.shape.cast-preserve.v1" classification: SHAPE_CONTRACT_CLASSIFICATION_CANONICAL }
+
+  // Embedding, positional, sequence, and task-specific.
+  shape_contract: { operator: OPERATOR_KIND_EMBEDDING shape_function_id: "volvox.shape.embedding-prefix.v1" classification: SHAPE_CONTRACT_CLASSIFICATION_CANONICAL }
+  shape_contract: { operator: OPERATOR_KIND_Q_EMBEDDING shape_function_id: "volvox.shape.q-embedding-prefix.v1" classification: SHAPE_CONTRACT_CLASSIFICATION_CANONICAL }
+  shape_contract: { operator: OPERATOR_KIND_ROPE shape_function_id: "volvox.shape.rope-preserve.v1" classification: SHAPE_CONTRACT_CLASSIFICATION_CANONICAL }
+  shape_contract: { operator: OPERATOR_KIND_SSM_SCAN shape_function_id: "volvox.shape.ssm-scan.v1" classification: SHAPE_CONTRACT_CLASSIFICATION_CANONICAL }
+  shape_contract: { operator: OPERATOR_KIND_SELECTIVE_SCAN shape_function_id: "volvox.shape.selective-scan.v1" classification: SHAPE_CONTRACT_CLASSIFICATION_CANONICAL }
+  shape_contract: { operator: OPERATOR_KIND_NON_MAX_SUPPRESSION shape_function_id: "volvox.shape.non-max-suppression-bounded.v1" classification: SHAPE_CONTRACT_CLASSIFICATION_BOUNDED_VALUE_DEPENDENT }
+  shape_contract: { operator: OPERATOR_KIND_SPATIAL_SOFTARGMAX_Y shape_function_id: "volvox.shape.spatial-softargmax-y.v1" classification: SHAPE_CONTRACT_CLASSIFICATION_CANONICAL }
+  shape_contract: { operator: OPERATOR_KIND_MEAN_HEIGHT shape_function_id: "volvox.shape.mean-height.v1" classification: SHAPE_CONTRACT_CLASSIFICATION_CANONICAL }
+  shape_contract: { operator: OPERATOR_KIND_PROFILE_X shape_function_id: "volvox.shape.profile-x.v1" classification: SHAPE_CONTRACT_CLASSIFICATION_CANONICAL }
+  shape_contract: { operator: OPERATOR_KIND_PROFILE_Y shape_function_id: "volvox.shape.profile-y.v1" classification: SHAPE_CONTRACT_CLASSIFICATION_CANONICAL }
+  shape_contract: { operator: OPERATOR_KIND_DROPOUT shape_function_id: "volvox.shape.dropout-preserve.v1" classification: SHAPE_CONTRACT_CLASSIFICATION_CANONICAL }
+
   backend: {
     kind: BACKEND_KIND_CPU_JS
     runtime_id: "cpu-js"
@@ -625,7 +756,7 @@ option (volvoxai.kernel_registry.registry) = {
     kind: BACKEND_KIND_NATIVE_CPU
     runtime_id: "native-cpu"
     exporter_target: "native-cpu"
-    support_mode: RUNTIME_SUPPORT_MODE_DIRECT
+    support_mode: RUNTIME_SUPPORT_MODE_DYNAMIC
     default_route: "native-run-node"
     default_predicate_id: "native.descriptor-predicate"
     runtime_operator_set: "runtime-native-cpu"
@@ -639,6 +770,7 @@ option (volvoxai.kernel_registry.registry) = {
     default_route: "native-vulkan-device-route"
     default_predicate_id: "vulkan.device-route-predicate"
     runtime_operator_set: "runtime-all"
+    exporter_qualified_operator_set: "qualified-native-gpu"
   }
   backend: {
     kind: BACKEND_KIND_OPENGL
@@ -648,6 +780,7 @@ option (volvoxai.kernel_registry.registry) = {
     default_route: "native-opengl-device-route"
     default_predicate_id: "opengl.device-route-predicate"
     runtime_operator_set: "runtime-all"
+    exporter_qualified_operator_set: "qualified-native-gpu"
   }
   backend: {
     kind: BACKEND_KIND_METAL
@@ -657,6 +790,7 @@ option (volvoxai.kernel_registry.registry) = {
     default_route: "native-metal-device-route"
     default_predicate_id: "metal.device-route-predicate"
     runtime_operator_set: "runtime-all"
+    exporter_qualified_operator_set: "qualified-native-gpu"
   }
   backend: {
     kind: BACKEND_KIND_CUDA
@@ -666,6 +800,7 @@ option (volvoxai.kernel_registry.registry) = {
     default_route: "native-cuda-device-route"
     default_predicate_id: "cuda.device-route-predicate"
     runtime_operator_set: "runtime-all"
+    exporter_qualified_operator_set: "qualified-native-gpu"
   }
   backend: {
     kind: BACKEND_KIND_NNAPI
@@ -788,6 +923,97 @@ option (volvoxai.kernel_registry.registry) = {
     phase: KERNEL_PHASE_FORWARD
     entrypoint_id: "qLinearInt8.wgsl"
     predicate_id: "qlinear.canonical-w8a8-v1"
+    priority: 100
+  }
+  variant: {
+    id: "webgpu.qbatch-matmul.dot"
+    backend: BACKEND_KIND_WEBGPU
+    operator: OPERATOR_KIND_Q_BATCH_MATMUL
+    profile: KERNEL_PROFILE_INFERENCE
+    phase: KERNEL_PHASE_FORWARD
+    entrypoint_id: "qBatchMatMulDot.wgsl"
+    predicate_id: "qbatch-matmul.canonical-w8a8-i32-safe"
+    required_feature: "webgpu.packed-4x8-integer-dot-product"
+    priority: 300
+  }
+  variant: {
+    id: "webgpu.qbatch-matmul.scalar"
+    backend: BACKEND_KIND_WEBGPU
+    operator: OPERATOR_KIND_Q_BATCH_MATMUL
+    profile: KERNEL_PROFILE_INFERENCE
+    phase: KERNEL_PHASE_FORWARD
+    entrypoint_id: "qBatchMatMul.wgsl"
+    predicate_id: "qbatch-matmul.canonical-w8a8-i32-safe"
+    priority: 100
+  }
+  variant: {
+    id: "webgpu.conv2d.c3-out16"
+    backend: BACKEND_KIND_WEBGPU
+    operator: OPERATOR_KIND_CONV_2D
+    profile: KERNEL_PROFILE_INFERENCE
+    phase: KERNEL_PHASE_FORWARD
+    entrypoint_id: "conv2DRegularC3Out16.wgsl"
+    predicate_id: "webgpu.conv.groups1-input-channels3-output-channels16-workgroup-8x8"
+    priority: 280
+  }
+  variant: {
+    id: "webgpu.conv2d.regular-out16"
+    backend: BACKEND_KIND_WEBGPU
+    operator: OPERATOR_KIND_CONV_2D
+    profile: KERNEL_PROFILE_INFERENCE
+    phase: KERNEL_PHASE_FORWARD
+    entrypoint_id: "conv2DRegularOut16.wgsl"
+    predicate_id: "webgpu.conv.groups1-output-channels16-workgroup-8x8"
+    priority: 250
+  }
+  variant: {
+    id: "webgpu.conv2d.depthwise8"
+    backend: BACKEND_KIND_WEBGPU
+    operator: OPERATOR_KIND_CONV_2D
+    profile: KERNEL_PROFILE_INFERENCE
+    phase: KERNEL_PHASE_FORWARD
+    entrypoint_id: "conv2DDepthwise8.wgsl"
+    predicate_id: "webgpu.conv.depthwise-hwcm-output-channels8-workgroup-8x8"
+    priority: 270
+  }
+  variant: {
+    id: "webgpu.conv2d.pointwise16-tile"
+    backend: BACKEND_KIND_WEBGPU
+    operator: OPERATOR_KIND_CONV_2D
+    profile: KERNEL_PROFILE_INFERENCE
+    phase: KERNEL_PHASE_FORWARD
+    entrypoint_id: "conv2DPointwise16Tile.wgsl"
+    predicate_id: "webgpu.conv.groups1-pointwise-output-channels16-workgroup-8x8"
+    priority: 265
+  }
+  variant: {
+    id: "webgpu.conv2d.pointwise8-vec4"
+    backend: BACKEND_KIND_WEBGPU
+    operator: OPERATOR_KIND_CONV_2D
+    profile: KERNEL_PROFILE_INFERENCE
+    phase: KERNEL_PHASE_FORWARD
+    entrypoint_id: "conv2DPointwise8Vec4.wgsl"
+    predicate_id: "webgpu.conv.groups1-pointwise-output-channels4-workgroup-8x8"
+    priority: 264
+  }
+  variant: {
+    id: "webgpu.conv2d.pointwise8-vec2"
+    backend: BACKEND_KIND_WEBGPU
+    operator: OPERATOR_KIND_CONV_2D
+    profile: KERNEL_PROFILE_INFERENCE
+    phase: KERNEL_PHASE_FORWARD
+    entrypoint_id: "conv2DPointwise8Vec2.wgsl"
+    predicate_id: "webgpu.conv.groups1-pointwise-output-channels2-workgroup-8x8"
+    priority: 263
+  }
+  variant: {
+    id: "webgpu.conv2d.scalar"
+    backend: BACKEND_KIND_WEBGPU
+    operator: OPERATOR_KIND_CONV_2D
+    profile: KERNEL_PROFILE_INFERENCE
+    phase: KERNEL_PHASE_FORWARD
+    entrypoint_id: "conv2D.wgsl"
+    predicate_id: "conv2d.canonical-nhwc-hwio"
     priority: 100
   }
   variant: {
@@ -930,6 +1156,88 @@ option (volvoxai.kernel_registry.registry) = {
     priority: 100
   }
   variant: {
+    id: "vulkan.qbatch-matmul.dot"
+    backend: BACKEND_KIND_VULKAN
+    operator: OPERATOR_KIND_Q_BATCH_MATMUL
+    profile: KERNEL_PROFILE_INFERENCE
+    phase: KERNEL_PHASE_FORWARD
+    entrypoint_id: "qBatchMatMulDot"
+    predicate_id: "qbatch-matmul.canonical-w8a8-i32-safe"
+    required_feature: "vulkan.packed-4x8-integer-dot-product"
+    priority: 300
+  }
+  variant: {
+    id: "vulkan.qbatch-matmul.scalar"
+    backend: BACKEND_KIND_VULKAN
+    operator: OPERATOR_KIND_Q_BATCH_MATMUL
+    profile: KERNEL_PROFILE_INFERENCE
+    phase: KERNEL_PHASE_FORWARD
+    entrypoint_id: "qBatchMatMul"
+    predicate_id: "qbatch-matmul.canonical-w8a8-i32-safe"
+    priority: 100
+  }
+  variant: {
+    id: "vulkan.qconv2d.dot-tiled"
+    backend: BACKEND_KIND_VULKAN
+    operator: OPERATOR_KIND_Q_CONV_2D
+    profile: KERNEL_PROFILE_INFERENCE
+    phase: KERNEL_PHASE_FORWARD
+    entrypoint_id: "qConv2DInt8DotTiled"
+    predicate_id: "qconv.groups1-output-channels4-i32-safe-and-packed-dot"
+    required_feature: "vulkan.packed-4x8-integer-dot-product"
+    priority: 300
+  }
+  variant: {
+    id: "vulkan.conv2d.c3-out16"
+    backend: BACKEND_KIND_VULKAN
+    operator: OPERATOR_KIND_CONV_2D
+    profile: KERNEL_PROFILE_INFERENCE
+    phase: KERNEL_PHASE_FORWARD
+    entrypoint_id: "conv2DRegularC3Out16"
+    predicate_id: "vulkan.conv.groups1-input-channels3-output-channels16-workgroup-8x8"
+    priority: 260
+  }
+  variant: {
+    id: "vulkan.conv2d.regular-out16"
+    backend: BACKEND_KIND_VULKAN
+    operator: OPERATOR_KIND_CONV_2D
+    profile: KERNEL_PROFILE_INFERENCE
+    phase: KERNEL_PHASE_FORWARD
+    entrypoint_id: "conv2DRegularOut16"
+    predicate_id: "vulkan.conv.groups1-output-channels16-workgroup-8x8"
+    priority: 250
+  }
+  variant: {
+    id: "vulkan.conv2d.scalar"
+    backend: BACKEND_KIND_VULKAN
+    operator: OPERATOR_KIND_CONV_2D
+    profile: KERNEL_PROFILE_INFERENCE
+    phase: KERNEL_PHASE_FORWARD
+    entrypoint_id: "conv2D"
+    predicate_id: "conv2d.canonical-nhwc-hwio"
+    priority: 100
+  }
+  variant: {
+    id: "vulkan.qconv2d.tiled"
+    backend: BACKEND_KIND_VULKAN
+    operator: OPERATOR_KIND_Q_CONV_2D
+    profile: KERNEL_PROFILE_INFERENCE
+    phase: KERNEL_PHASE_FORWARD
+    entrypoint_id: "qConv2DInt8Tiled"
+    predicate_id: "vulkan.qconv.groups1-tiled-shape-workgroup-8x4"
+    priority: 200
+  }
+  variant: {
+    id: "vulkan.qconv2d.scalar"
+    backend: BACKEND_KIND_VULKAN
+    operator: OPERATOR_KIND_Q_CONV_2D
+    profile: KERNEL_PROFILE_INFERENCE
+    phase: KERNEL_PHASE_FORWARD
+    entrypoint_id: "qConv2DInt8"
+    predicate_id: "qconv.canonical-w8a8-i32-safe"
+    priority: 100
+  }
+  variant: {
     id: "opengl.qlinear.tiled"
     backend: BACKEND_KIND_OPENGL
     operator: OPERATOR_KIND_Q_LINEAR
@@ -951,6 +1259,36 @@ option (volvoxai.kernel_registry.registry) = {
     phase: KERNEL_PHASE_FORWARD
     entrypoint_id: "qLinearInt8"
     predicate_id: "qlinear.canonical-w8a8-v1"
+    priority: 100
+  }
+  variant: {
+    id: "opengl.qconv2d.tiled"
+    backend: BACKEND_KIND_OPENGL
+    operator: OPERATOR_KIND_Q_CONV_2D
+    profile: KERNEL_PROFILE_INFERENCE
+    phase: KERNEL_PHASE_FORWARD
+    entrypoint_id: "qConv2DInt8Tiled"
+    predicate_id: "opengl.qconv.groups1-tiled-shape-workgroup-8x4"
+    priority: 200
+  }
+  variant: {
+    id: "opengl.qconv2d.scalar"
+    backend: BACKEND_KIND_OPENGL
+    operator: OPERATOR_KIND_Q_CONV_2D
+    profile: KERNEL_PROFILE_INFERENCE
+    phase: KERNEL_PHASE_FORWARD
+    entrypoint_id: "qConv2DInt8"
+    predicate_id: "qconv.canonical-w8a8-i32-safe"
+    priority: 100
+  }
+  variant: {
+    id: "opengl.qbatch-matmul.scalar"
+    backend: BACKEND_KIND_OPENGL
+    operator: OPERATOR_KIND_Q_BATCH_MATMUL
+    profile: KERNEL_PROFILE_INFERENCE
+    phase: KERNEL_PHASE_FORWARD
+    entrypoint_id: "qBatchMatMul"
+    predicate_id: "qbatch-matmul.canonical-w8a8-i32-safe"
     priority: 100
   }
   variant: {
@@ -978,7 +1316,21 @@ option (volvoxai.kernel_registry.registry) = {
     priority: 100
   }
   variant: {
-    id: "cuda.qlinear.w8a8"
+    id: "cuda.qlinear.warp-dp4a"
+    backend: BACKEND_KIND_CUDA
+    operator: OPERATOR_KIND_Q_LINEAR
+    operator: OPERATOR_KIND_Q_MATMUL
+    operator: OPERATOR_KIND_Q_GEMM
+    profile: KERNEL_PROFILE_INFERENCE
+    phase: KERNEL_PHASE_FORWARD
+    entrypoint_id: "vx_cuda_qlinear_warp_dp4a_i8u8"
+    predicate_id: "cuda.qlinear.canonical-resident-nonoverlap-int32-bound-k-ge32-warp-launch-capacity-arbitrary-k-tail"
+    required_feature: "cuda.device-residency"
+    required_feature: "cuda.sm61-dp4a"
+    priority: 300
+  }
+  variant: {
+    id: "cuda.qlinear.thread-dp4a"
     backend: BACKEND_KIND_CUDA
     operator: OPERATOR_KIND_Q_LINEAR
     operator: OPERATOR_KIND_Q_MATMUL
@@ -986,9 +1338,46 @@ option (volvoxai.kernel_registry.registry) = {
     profile: KERNEL_PROFILE_INFERENCE
     phase: KERNEL_PHASE_FORWARD
     entrypoint_id: "vx_cuda_qlinear_i8u8"
-    predicate_id: "cuda.qlinear.canonical-resident-nonoverlap-int32-bound"
+    predicate_id: "cuda.qlinear.canonical-resident-nonoverlap-int32-bound-small-k-or-warp-launch-capacity-arbitrary-k-tail"
     required_feature: "cuda.device-residency"
-    priority: 100
+    required_feature: "cuda.sm61-dp4a"
+    priority: 200
+  }
+  variant: {
+    id: "cuda.qconv2d.warp-dp4a"
+    backend: BACKEND_KIND_CUDA
+    operator: OPERATOR_KIND_Q_CONV_2D
+    profile: KERNEL_PROFILE_INFERENCE
+    phase: KERNEL_PHASE_FORWARD
+    entrypoint_id: "vx_cuda_qconv2d_warp_dp4a_i8u8"
+    predicate_id: "cuda.qconv2d.canonical-resident-nonoverlap-int32-bound-input-per-group-ge4-terms-ge64-warp-launch-capacity-per-spatial-tail"
+    required_feature: "cuda.device-residency"
+    required_feature: "cuda.sm61-dp4a"
+    priority: 300
+  }
+  variant: {
+    id: "cuda.qconv2d.thread-dp4a"
+    backend: BACKEND_KIND_CUDA
+    operator: OPERATOR_KIND_Q_CONV_2D
+    profile: KERNEL_PROFILE_INFERENCE
+    phase: KERNEL_PHASE_FORWARD
+    entrypoint_id: "vx_cuda_qconv2d_i8u8"
+    predicate_id: "cuda.qconv2d.canonical-resident-nonoverlap-int32-bound-small-reduction-or-warp-launch-capacity-per-spatial-tail"
+    required_feature: "cuda.device-residency"
+    required_feature: "cuda.sm61-dp4a"
+    priority: 200
+  }
+  variant: {
+    id: "cuda.qbatch-matmul.dp4a"
+    backend: BACKEND_KIND_CUDA
+    operator: OPERATOR_KIND_Q_BATCH_MATMUL
+    profile: KERNEL_PROFILE_INFERENCE
+    phase: KERNEL_PHASE_FORWARD
+    entrypoint_id: "vx_cuda_qbatch_matmul_i8u8"
+    predicate_id: "cuda.qbatch-matmul.canonical-resident-nonoverlap-int32-bound-arbitrary-k-tail"
+    required_feature: "cuda.device-residency"
+    required_feature: "cuda.sm61-dp4a"
+    priority: 300
   }
   variant: {
     id: "nnapi.linear.one-shot"
@@ -1299,6 +1688,7 @@ option (volvoxai.kernel_registry.registry) = {
     operator: OPERATOR_KIND_ARG_MAX
     operator: OPERATOR_KIND_AVERAGE_POOL_2D
     operator: OPERATOR_KIND_BATCH_MATMUL
+    operator: OPERATOR_KIND_BATCH_NORM_2D
     operator: OPERATOR_KIND_CAST
     operator: OPERATOR_KIND_CLIP
     operator: OPERATOR_KIND_CONCAT
@@ -1326,6 +1716,7 @@ option (volvoxai.kernel_registry.registry) = {
     operator: OPERATOR_KIND_MAX_POOL_2D
     operator: OPERATOR_KIND_MUL
     operator: OPERATOR_KIND_NOT
+    operator: OPERATOR_KIND_PRELU
     operator: OPERATOR_KIND_Q_ADD
     operator: OPERATOR_KIND_Q_ARG_MAX
     operator: OPERATOR_KIND_Q_BATCH_MATMUL
@@ -1346,6 +1737,7 @@ option (volvoxai.kernel_registry.registry) = {
     operator: OPERATOR_KIND_REDUCE_SUM
     operator: OPERATOR_KIND_REQUANTIZE_LINEAR
     operator: OPERATOR_KIND_RESHAPE
+    operator: OPERATOR_KIND_RMS_NORM
     operator: OPERATOR_KIND_RESIZE
     operator: OPERATOR_KIND_RESIZE_NEAREST_2D
     operator: OPERATOR_KIND_SDPA
@@ -1358,6 +1750,56 @@ option (volvoxai.kernel_registry.registry) = {
     operator: OPERATOR_KIND_SUB
     operator: OPERATOR_KIND_TRANSPOSE
     operator: OPERATOR_KIND_UNSQUEEZE
+    operator: OPERATOR_KIND_UPSAMPLE_NEAREST_2D
+    operator: OPERATOR_KIND_WHERE
+  }
+  operator_set: {
+    name: "qualified-native-gpu"
+    operator: OPERATOR_KIND_ADD
+    operator: OPERATOR_KIND_ARG_MAX
+    operator: OPERATOR_KIND_BATCH_MATMUL
+    operator: OPERATOR_KIND_CAST
+    operator: OPERATOR_KIND_CLIP
+    operator: OPERATOR_KIND_CONCAT
+    operator: OPERATOR_KIND_CONV_2D
+    operator: OPERATOR_KIND_DEQUANTIZE_LINEAR
+    operator: OPERATOR_KIND_DIV
+    operator: OPERATOR_KIND_EMBEDDING
+    operator: OPERATOR_KIND_EQUAL
+    operator: OPERATOR_KIND_EXPAND
+    operator: OPERATOR_KIND_GELU
+    operator: OPERATOR_KIND_GATHER
+    operator: OPERATOR_KIND_GREATER_OR_EQUAL
+    operator: OPERATOR_KIND_GROUP_NORM
+    operator: OPERATOR_KIND_LAYER_NORM
+    operator: OPERATOR_KIND_LINEAR
+    operator: OPERATOR_KIND_MUL
+    operator: OPERATOR_KIND_NOT
+    operator: OPERATOR_KIND_Q_ADD
+    operator: OPERATOR_KIND_Q_ARG_MAX
+    operator: OPERATOR_KIND_Q_BATCH_MATMUL
+    operator: OPERATOR_KIND_Q_CONV_2D
+    operator: OPERATOR_KIND_Q_EMBEDDING
+    operator: OPERATOR_KIND_Q_GELU
+    operator: OPERATOR_KIND_Q_GEMM
+    operator: OPERATOR_KIND_Q_GROUP_NORM
+    operator: OPERATOR_KIND_Q_LAYER_NORM
+    operator: OPERATOR_KIND_Q_LINEAR
+    operator: OPERATOR_KIND_Q_MASKED_MEAN
+    operator: OPERATOR_KIND_Q_MATMUL
+    operator: OPERATOR_KIND_Q_SDPA
+    operator: OPERATOR_KIND_Q_SILU
+    operator: OPERATOR_KIND_QUANTIZE_LINEAR
+    operator: OPERATOR_KIND_REDUCE_SUM
+    operator: OPERATOR_KIND_REQUANTIZE_LINEAR
+    operator: OPERATOR_KIND_RESHAPE
+    operator: OPERATOR_KIND_SILU
+    operator: OPERATOR_KIND_SLICE
+    operator: OPERATOR_KIND_SOFTMAX
+    operator: OPERATOR_KIND_SQUEEZE
+    operator: OPERATOR_KIND_SUB
+    operator: OPERATOR_KIND_TRANSPOSE
+    operator: OPERATOR_KIND_UNSQUEEZE
     operator: OPERATOR_KIND_WHERE
   }
   operator_set: {
@@ -1365,6 +1807,7 @@ option (volvoxai.kernel_registry.registry) = {
     operator: OPERATOR_KIND_ADD
     operator: OPERATOR_KIND_ARG_MAX
     operator: OPERATOR_KIND_BATCH_MATMUL
+    operator: OPERATOR_KIND_BATCH_NORM_2D
     operator: OPERATOR_KIND_CAST
     operator: OPERATOR_KIND_CLIP
     operator: OPERATOR_KIND_CONCAT
@@ -1391,6 +1834,7 @@ option (volvoxai.kernel_registry.registry) = {
     operator: OPERATOR_KIND_MAX_POOL_2D
     operator: OPERATOR_KIND_MUL
     operator: OPERATOR_KIND_NOT
+    operator: OPERATOR_KIND_PRELU
     operator: OPERATOR_KIND_Q_ADD
     operator: OPERATOR_KIND_Q_ARG_MAX
     operator: OPERATOR_KIND_Q_BATCH_MATMUL
@@ -1411,6 +1855,7 @@ option (volvoxai.kernel_registry.registry) = {
     operator: OPERATOR_KIND_REDUCE_SUM
     operator: OPERATOR_KIND_REQUANTIZE_LINEAR
     operator: OPERATOR_KIND_RESHAPE
+    operator: OPERATOR_KIND_RMS_NORM
     operator: OPERATOR_KIND_RESIZE
     operator: OPERATOR_KIND_RESIZE_NEAREST_2D
     operator: OPERATOR_KIND_SDPA
@@ -1423,6 +1868,7 @@ option (volvoxai.kernel_registry.registry) = {
     operator: OPERATOR_KIND_SUB
     operator: OPERATOR_KIND_TRANSPOSE
     operator: OPERATOR_KIND_UNSQUEEZE
+    operator: OPERATOR_KIND_UPSAMPLE_NEAREST_2D
     operator: OPERATOR_KIND_WHERE
   }
   operator_set: {

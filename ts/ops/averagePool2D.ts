@@ -1,38 +1,122 @@
-export function _cpuAveragePool2D(node) {
-    const input = node.inputs.input || node.inputs.x;
-    const inBuf = input.buffer;
-    const outBuf = node.outputs.out.buffer;
-    
-    const [b, in_h, in_w, c] = input.shape;
-    const [out_b, out_h, out_w, out_c] = node.outputs.out.shape;
-    
-    const kh = node.params.kernel[0], kw = node.params.kernel[1];
-    const sh = node.params.stride ? node.params.stride[0] : 1;
-    const sw = node.params.stride ? node.params.stride[1] : 1;
-    const ph = node.params.padding ? node.params.padding[0] : 0;
-    const pw = node.params.padding ? node.params.padding[1] : 0;
+import {
+  assertShapeKernelOutput,
+  assertShapeKernelParams,
+  assertShapeKernelTensor,
+} from './shapeKernelValidation.js';
+import {
+  assertCanonicalLayout,
+  assertDistinctOutputStorage,
+  assertFalseOrAbsent,
+  checkedWindowOutput,
+  fullSpatialPads,
+  spatialKernelPorts,
+  spatialPair,
+} from './spatialKernelValidation.js';
 
-    for (let batch = 0; batch < b; batch++) {
-        for (let y = 0; y < out_h; y++) {
-            for (let x = 0; x < out_w; x++) {
-                for (let chan = 0; chan < c; chan++) {
-                    let sum = 0.0;
-                    let count = 0;
-                    for (let ky = 0; ky < kh; ky++) {
-                        for (let kx = 0; kx < kw; kx++) {
-                            const in_y = y * sh - ph + ky;
-                            const in_x = x * sw - pw + kx;
-                            if (in_y >= 0 && in_y < in_h && in_x >= 0 && in_x < in_w) {
-                                const inIdx = ((batch * in_h + in_y) * in_w + in_x) * c + chan;
-                                sum += inBuf[inIdx];
-                                count++;
-                            }
-                        }
-                    }
-                    const outIdx = ((batch * out_h + y) * out_w + x) * out_c + chan;
-                    outBuf[outIdx] = count > 0 ? sum / count : 0.0;
-                }
+export function _cpuAveragePool2D(node) {
+  const operation = 'AveragePool2D';
+  const ports = spatialKernelPorts(node, [['input', 'x']], [], operation);
+  const input = ports.inputs[0];
+  const output = ports.output;
+  assertShapeKernelTensor(input, `${operation} input`, {
+    dtypes: ['float32'], minimumRank: 4, maximumRank: 4,
+  });
+  const params = assertShapeKernelParams(
+    node,
+    [
+      'kernel', 'stride', 'padding', 'pads', 'dilation', 'ceil_mode',
+      'count_include_pad', 'auto_pad', 'data_layout',
+    ],
+    operation,
+  );
+  assertCanonicalLayout(params.data_layout, 'NHWC', operation, 'data_layout');
+  assertFalseOrAbsent(params.ceil_mode, operation, 'ceil_mode');
+  assertFalseOrAbsent(params.count_include_pad, operation, 'count_include_pad');
+  if (params.auto_pad !== undefined && params.auto_pad !== '' && params.auto_pad !== 'NOTSET') {
+    throw new Error(`${operation} auto_pad must be 'NOTSET', empty, or absent.`);
+  }
+  const [kernelHeight, kernelWidth] = spatialPair(
+    params.kernel,
+    1,
+    operation,
+    'kernel',
+    false,
+    true,
+  );
+  const [strideHeight, strideWidth] = spatialPair(
+    params.stride,
+    1,
+    operation,
+    'stride',
+    false,
+  );
+  const [dilationHeight, dilationWidth] = spatialPair(
+    params.dilation,
+    1,
+    operation,
+    'dilation',
+    false,
+  );
+  if (dilationHeight !== 1 || dilationWidth !== 1) {
+    throw new Error(`${operation} supports only unit dilation.`);
+  }
+  const pads = fullSpatialPads(params, operation, true);
+  const [batch, inputHeight, inputWidth, channels] = input.shape;
+  const outputHeight = checkedWindowOutput(
+    inputHeight,
+    kernelHeight,
+    strideHeight,
+    pads[0],
+    pads[2],
+    1,
+    `${operation} output height`,
+  );
+  const outputWidth = checkedWindowOutput(
+    inputWidth,
+    kernelWidth,
+    strideWidth,
+    pads[1],
+    pads[3],
+    1,
+    `${operation} output width`,
+  );
+  assertShapeKernelOutput(
+    output,
+    [batch, outputHeight, outputWidth, channels],
+    'float32',
+    undefined,
+    operation,
+  );
+  assertDistinctOutputStorage(output, [input], operation);
+
+  const inputBuffer = input.buffer;
+  const outputBuffer = output.buffer;
+  for (let batchIndex = 0; batchIndex < batch; batchIndex++) {
+    for (let outputY = 0; outputY < outputHeight; outputY++) {
+      for (let outputX = 0; outputX < outputWidth; outputX++) {
+        for (let channel = 0; channel < channels; channel++) {
+          let sum = 0;
+          let count = 0;
+          for (let kernelY = 0; kernelY < kernelHeight; kernelY++) {
+            for (let kernelX = 0; kernelX < kernelWidth; kernelX++) {
+              const inputY = outputY * strideHeight - pads[0] + kernelY;
+              const inputX = outputX * strideWidth - pads[1] + kernelX;
+              if (inputY >= 0 && inputY < inputHeight &&
+                  inputX >= 0 && inputX < inputWidth) {
+                const inputIndex =
+                  ((batchIndex * inputHeight + inputY) * inputWidth + inputX) *
+                    channels + channel;
+                sum += inputBuffer[inputIndex];
+                count++;
+              }
             }
+          }
+          const outputIndex =
+            ((batchIndex * outputHeight + outputY) * outputWidth + outputX) *
+              channels + channel;
+          outputBuffer[outputIndex] = count > 0 ? sum / count : 0;
         }
+      }
     }
+  }
 }

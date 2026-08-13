@@ -8,8 +8,8 @@
  * defined(__AVX2__)`.  That is a compile-time question, so a binary configured
  * at VOLVOXAI_CPU_TARGET=baseline — the default — had the AVX2 code removed by
  * the preprocessor and ran the scalar fallback on machines that support AVX2.
- * Measured on a Ryzen 5 5600U at one thread, that cost 23.5x on the thirteen
- * Conv2D nodes of the TinyReceiptVQA encoder, which is 88% of its FP32 time.
+ * Measured on a Ryzen 5 5600U at one thread, that cost 23.5x on a representative
+ * thirteen-node image encoder, which is 88% of its FP32 time.
  *
  * The fix keeps the bodies untouched and compiles the file twice: once at the
  * build's baseline ISA, once with -mavx2 -mfma.  Each copy's exported symbols
@@ -51,6 +51,7 @@
     VX_CONV_F32_SYM(vx_conv2d_depthwise_pointwise_f32)
 #define vx_f32_igemm_indirection_cache \
     VX_CONV_F32_SYM(vx_f32_igemm_indirection_cache)
+#define vx_f32_igemm_pack_cache VX_CONV_F32_SYM(vx_f32_igemm_pack_cache)
 #define vx_conv2d_spatial_igemm_f32 VX_CONV_F32_SYM(vx_conv2d_spatial_igemm_f32)
 #define vx_conv_f32_opt_free_all VX_CONV_F32_SYM(vx_conv_f32_opt_free_all)
 #endif

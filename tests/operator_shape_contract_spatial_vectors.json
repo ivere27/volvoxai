@@ -1,0 +1,199 @@
+{
+  "format": "volvox-operator-shape-spatial-vectors/v1",
+  "success_cases": [
+    {
+      "id": "batch-matmul-rank-2",
+      "operator": "BatchMatMul",
+      "request": {"inputs": {"a": {"shape": [2, 3], "dtype": "float32"}, "b": {"shape": [3, 4], "dtype": "float32"}}},
+      "expected": {"out": {"shape": [2, 4], "dtype": "float32"}}
+    },
+    {
+      "id": "batch-matmul-broadcast",
+      "operator": "BatchMatMul",
+      "request": {"inputs": {"a": {"shape": [2, 1, 3, 4], "dtype": "float32"}, "b": {"shape": [1, 5, 4, 6], "dtype": "float32"}}},
+      "expected": {"out": {"shape": [2, 5, 3, 6], "dtype": "float32"}}
+    },
+    {
+      "id": "conv1d-same",
+      "operator": "Conv1D",
+      "request": {"inputs": {"input": {"shape": [2, 7, 4], "dtype": "float32"}, "weight": {"shape": [3, 4, 6], "dtype": "float32"}, "bias": {"shape": [6], "dtype": "float32"}}, "params": {"padding": 1, "weight_layout": "WIO"}},
+      "expected": {"out": {"shape": [2, 7, 6], "dtype": "float32"}}
+    },
+    {
+      "id": "conv1d-grouped-stride",
+      "operator": "Conv1D",
+      "request": {"inputs": {"input": {"shape": [1, 8, 4], "dtype": "float32"}, "weight": {"shape": [3, 2, 8], "dtype": "float32"}}, "params": {"stride": 2, "padding": 1, "groups": 2, "relu": 1}},
+      "expected": {"out": {"shape": [1, 4, 8], "dtype": "float32"}}
+    },
+    {
+      "id": "conv2d-hwio",
+      "operator": "Conv2D",
+      "request": {"inputs": {"input": {"shape": [2, 8, 9, 4], "dtype": "float32"}, "weight": {"shape": [3, 3, 4, 6], "dtype": "float32"}, "bias": {"shape": [6], "dtype": "float32"}}, "params": {"padding": [1, 1], "weight_layout": "HWIO"}},
+      "expected": {"out": {"shape": [2, 8, 9, 6], "dtype": "float32"}}
+    },
+    {
+      "id": "conv2d-hwcm-depthwise",
+      "operator": "Conv2D",
+      "request": {"inputs": {"input": {"shape": [1, 5, 7, 3], "dtype": "float32"}, "weight": {"shape": [3, 3, 3, 2], "dtype": "float32"}}, "params": {"padding": [1, 1], "groups": 3, "weight_layout": "HWCM", "relu": 2}},
+      "expected": {"out": {"shape": [1, 5, 7, 6], "dtype": "float32"}}
+    },
+    {
+      "id": "conv2d-grayscale-hwio",
+      "operator": "Conv2D",
+      "request": {"inputs": {"input": {"shape": [2, 5, 7, 1], "dtype": "float32"}, "weight": {"shape": [1, 1, 1, 4], "dtype": "float32"}}, "params": {"groups": 1, "weight_layout": "HWIO"}},
+      "expected": {"out": {"shape": [2, 5, 7, 4], "dtype": "float32"}}
+    },
+    {
+      "id": "conv-transpose-strided",
+      "operator": "ConvTranspose2D",
+      "request": {"inputs": {"input": {"shape": [1, 2, 3, 2], "dtype": "float32"}, "weight": {"shape": [3, 2, 2, 4], "dtype": "float32"}, "bias": {"shape": [4], "dtype": "float32"}}, "params": {"kernel": [3, 2], "stride": [2, 2], "padding": [1, 1]}},
+      "expected": {"out": {"shape": [1, 3, 4, 4], "dtype": "float32"}}
+    },
+    {
+      "id": "conv-transpose-identity-spatial",
+      "operator": "ConvTranspose2D",
+      "request": {"inputs": {"input": {"shape": [2, 5, 6, 3], "dtype": "float32"}, "weight": {"shape": [3, 3, 3, 2], "dtype": "float32"}}, "params": {"kernel": [3, 3], "padding": [1, 1], "weight_layout": "HWIO"}},
+      "expected": {"out": {"shape": [2, 5, 6, 2], "dtype": "float32"}}
+    },
+    {
+      "id": "max-pool-float-same",
+      "operator": "MaxPool2D",
+      "request": {"inputs": {"input": {"shape": [2, 5, 6, 3], "dtype": "float32"}}, "params": {"kernel": [3, 3], "padding": [1, 1]}},
+      "expected": {"out": {"shape": [2, 5, 6, 3], "dtype": "float32"}}
+    },
+    {
+      "id": "max-pool-byte",
+      "operator": "MaxPool2D",
+      "request": {"inputs": {"input": {"shape": [1, 4, 4, 2], "dtype": "int8", "quantization": {"scheme": "per_tensor", "scale": 0.25, "zero_point": -3}}}, "params": {"kernel": [2, 2], "stride": [2, 2]}},
+      "expected": {"out": {"shape": [1, 2, 2, 2], "dtype": "int8", "quantization": {"scheme": "per_tensor", "scale": 0.25, "zero_point": -3}}}
+    },
+    {
+      "id": "average-pool-same",
+      "operator": "AveragePool2D",
+      "request": {"inputs": {"input": {"shape": [2, 5, 6, 3], "dtype": "float32"}}, "params": {"kernel": [3, 3], "padding": [1, 1]}},
+      "expected": {"out": {"shape": [2, 5, 6, 3], "dtype": "float32"}}
+    },
+    {
+      "id": "average-pool-strided",
+      "operator": "AveragePool2D",
+      "request": {"inputs": {"input": {"shape": [1, 4, 6, 2], "dtype": "float32"}}, "params": {"kernel": [2, 2], "stride": [2, 2], "count_include_pad": 0}},
+      "expected": {"out": {"shape": [1, 2, 3, 2], "dtype": "float32"}}
+    },
+    {
+      "id": "global-average-pool-image",
+      "operator": "GlobalAveragePool",
+      "request": {"inputs": {"input": {"shape": [2, 5, 6, 3], "dtype": "float32"}}},
+      "expected": {"out": {"shape": [2, 1, 1, 3], "dtype": "float32"}}
+    },
+    {
+      "id": "global-average-pool-single-height",
+      "operator": "GlobalAveragePool",
+      "request": {"inputs": {"input": {"shape": [1, 1, 7, 4], "dtype": "float32"}}, "params": {"data_layout": "NHWC"}},
+      "expected": {"out": {"shape": [1, 1, 1, 4], "dtype": "float32"}}
+    },
+    {
+      "id": "resize-linear-float",
+      "operator": "Resize",
+      "request": {"inputs": {"input": {"shape": [2, 2, 3, 4], "dtype": "float32"}}, "params": {"mode": "linear", "coordinate_transformation_mode": "half_pixel"}, "declaredOutputs": {"out": {"shape": [2, 3, 5, 4], "dtype": "float32"}}},
+      "expected": {"out": {"shape": [2, 3, 5, 4], "dtype": "float32"}}
+    },
+    {
+      "id": "resize-nearest-byte",
+      "operator": "Resize",
+      "request": {"inputs": {"input": {"shape": [1, 2, 3, 2], "dtype": "uint8", "quantization": {"scheme": "per_tensor", "scale": 0.5, "zero_point": 7}}}, "params": {"mode": "nearest", "coordinate_transformation_mode": "asymmetric", "nearest_mode": "floor"}, "declaredOutputs": {"out": {"shape": [1, 4, 6, 2], "dtype": "uint8", "quantization": {"scheme": "per_tensor", "scale": 0.5, "zero_point": 7}}}},
+      "expected": {"out": {"shape": [1, 4, 6, 2], "dtype": "uint8", "quantization": {"scheme": "per_tensor", "scale": 0.5, "zero_point": 7}}}
+    },
+    {
+      "id": "resize-nearest-operator-float",
+      "operator": "ResizeNearest2D",
+      "request": {"inputs": {"input": {"shape": [2, 2, 3, 4], "dtype": "float32"}}, "params": {"mode": "nearest"}, "declaredOutputs": {"out": {"shape": [2, 5, 7, 4], "dtype": "float32"}}},
+      "expected": {"out": {"shape": [2, 5, 7, 4], "dtype": "float32"}}
+    },
+    {
+      "id": "resize-nearest-operator-byte",
+      "operator": "ResizeNearest2D",
+      "request": {"inputs": {"input": {"shape": [1, 3, 2, 1], "dtype": "int8", "quantization": {"scheme": "per_tensor", "scale": 0.125, "zero_point": 0}}}, "declaredOutputs": {"out": {"shape": [1, 6, 4, 1], "dtype": "int8", "quantization": {"scheme": "per_tensor", "scale": 0.125, "zero_point": 0}}}},
+      "expected": {"out": {"shape": [1, 6, 4, 1], "dtype": "int8", "quantization": {"scheme": "per_tensor", "scale": 0.125, "zero_point": 0}}}
+    },
+    {
+      "id": "upsample-nearest-batched",
+      "operator": "UpsampleNearest2D",
+      "request": {"inputs": {"input": {"shape": [2, 2, 3, 4], "dtype": "float32"}}},
+      "expected": {"out": {"shape": [2, 4, 6, 4], "dtype": "float32"}}
+    },
+    {
+      "id": "upsample-nearest-narrow",
+      "operator": "UpsampleNearest2D",
+      "request": {"inputs": {"input": {"shape": [1, 5, 1, 3], "dtype": "float32"}}, "params": {"data_layout": "NHWC"}},
+      "expected": {"out": {"shape": [1, 10, 2, 3], "dtype": "float32"}}
+    }
+  ],
+  "failure_cases": [
+    {
+      "id": "batch-matmul-contraction-mismatch",
+      "operator": "BatchMatMul",
+      "request": {"inputs": {"a": {"shape": [2, 3], "dtype": "float32"}, "b": {"shape": [4, 5], "dtype": "float32"}}},
+      "expected_error": {"code": "SHAPE_MISMATCH", "path": "operator input 'b'.shape"}
+    },
+    {
+      "id": "conv1d-group-channel-mismatch",
+      "operator": "Conv1D",
+      "request": {"inputs": {"input": {"shape": [1, 8, 4], "dtype": "float32"}, "weight": {"shape": [3, 3, 8], "dtype": "float32"}}, "params": {"groups": 2}},
+      "expected_error": {"code": "SHAPE_MISMATCH", "path": "operator input 'weight'.shape[1]"}
+    },
+    {
+      "id": "conv2d-hwcm-groups-mismatch",
+      "operator": "Conv2D",
+      "request": {"inputs": {"input": {"shape": [1, 5, 5, 4], "dtype": "float32"}, "weight": {"shape": [3, 3, 4, 2], "dtype": "float32"}}, "params": {"groups": 2, "weight_layout": "HWCM"}},
+      "expected_error": {"code": "SHAPE_MISMATCH", "path": "operator input 'weight'.shape"}
+    },
+    {
+      "id": "conv2d-contradictory-padding-forms",
+      "operator": "Conv2D",
+      "request": {"inputs": {"input": {"shape": [1, 5, 5, 2], "dtype": "float32"}, "weight": {"shape": [3, 3, 2, 4], "dtype": "float32"}}, "params": {"padding": [1, 1], "pads": [1, 1, 2, 2]}},
+      "expected_error": {"code": "INVALID_PARAMS", "path": "operator params"}
+    },
+    {
+      "id": "conv-transpose-kernel-mismatch",
+      "operator": "ConvTranspose2D",
+      "request": {"inputs": {"input": {"shape": [1, 2, 2, 1], "dtype": "float32"}, "weight": {"shape": [3, 3, 1, 2], "dtype": "float32"}}, "params": {"kernel": [2, 3]}},
+      "expected_error": {"code": "SHAPE_MISMATCH", "path": "operator params.kernel"}
+    },
+    {
+      "id": "max-pool-dilation",
+      "operator": "MaxPool2D",
+      "request": {"inputs": {"input": {"shape": [1, 5, 5, 1], "dtype": "float32"}}, "params": {"kernel": [2, 2], "dilation": [2, 1]}},
+      "expected_error": {"code": "INVALID_PARAMS", "path": "operator params.dilation"}
+    },
+    {
+      "id": "average-pool-byte",
+      "operator": "AveragePool2D",
+      "request": {"inputs": {"input": {"shape": [1, 4, 4, 1], "dtype": "int8", "quantization": {"scheme": "per_tensor", "scale": 0.25, "zero_point": 0}}}, "params": {"kernel": [2, 2]}},
+      "expected_error": {"code": "INVALID_DTYPE", "path": "operator input 'input'.dtype"}
+    },
+    {
+      "id": "global-average-pool-rank",
+      "operator": "GlobalAveragePool",
+      "request": {"inputs": {"input": {"shape": [2, 5, 3], "dtype": "float32"}}},
+      "expected_error": {"code": "INVALID_RANK", "path": "operator input 'input'.shape"}
+    },
+    {
+      "id": "resize-missing-declared-output",
+      "operator": "Resize",
+      "request": {"inputs": {"input": {"shape": [1, 2, 2, 1], "dtype": "float32"}}, "params": {"mode": "nearest"}},
+      "expected_error": {"code": "INVALID_OUTPUT_PORTS", "path": "declared outputs"}
+    },
+    {
+      "id": "resize-nearest-linear-mode",
+      "operator": "ResizeNearest2D",
+      "request": {"inputs": {"input": {"shape": [1, 2, 2, 1], "dtype": "float32"}}, "params": {"mode": "linear"}, "declaredOutputs": {"out": {"shape": [1, 4, 4, 1], "dtype": "float32"}}},
+      "expected_error": {"code": "INVALID_PARAMS", "path": "operator params.mode"}
+    },
+    {
+      "id": "upsample-nearest-byte",
+      "operator": "UpsampleNearest2D",
+      "request": {"inputs": {"input": {"shape": [1, 2, 2, 1], "dtype": "uint8", "quantization": {"scheme": "per_tensor", "scale": 0.5, "zero_point": 3}}}},
+      "expected_error": {"code": "INVALID_DTYPE", "path": "operator input 'input'.dtype"}
+    }
+  ]
+}

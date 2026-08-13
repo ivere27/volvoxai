@@ -62,7 +62,7 @@ VolvoxAIDecodeSession* volvoxai_engine_decode_session_create(
     int took_model_lock;
 
     if (options) {
-        if (options->struct_size < sizeof(*options) ||
+        if (options->struct_size != sizeof(*options) ||
             options->row_mode < VOLVOXAI_DECODE_ROW_AUTO ||
             options->row_mode > VOLVOXAI_DECODE_ROW_DISABLED) return NULL;
         resolved = *options;

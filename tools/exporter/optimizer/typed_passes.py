@@ -20,6 +20,7 @@ from ..ir import (
 )
 from ..pipeline import IRPass, PassContract, PassResult
 from .op_registry import OP_STRING_TO_KIND
+from .typed_attention_common import element_signature, resolved_shape
 
 
 # Runtime operators are functional inference descriptors. Dropout is excluded
@@ -79,7 +80,7 @@ class RuntimeOutputArgMaxPass(IRPass):
     """
 
     name = "runtime-output-qargmax"
-    contract = PassContract.preserving(IRDialect.RUNTIME)
+    contract = PassContract.symbolic_abi_changing(IRDialect.RUNTIME)
 
     def __init__(self, specializations, *, monotonic_byte_tensors=()):
         self.specializations = tuple(specializations)
@@ -127,10 +128,11 @@ class RuntimeOutputArgMaxPass(IRPass):
                     request.output,
                 )
             output = graph.tensors[request.output]
-            if output.dtype != "float32" or not output.concrete or not 2 <= output.rank <= 8:
+            if output.dtype != "float32" or not 2 <= output.rank <= 8:
                 self._fail(
                     "VXOUTARG003",
-                    f"public output {request.output!r} must be a concrete rank-2..8 F32 tensor",
+                    f"public output {request.output!r} must be a bounded "
+                    "rank-2..8 F32 tensor",
                     request.output,
                 )
             axis = request.axis + output.rank if request.axis < 0 else request.axis
@@ -323,7 +325,7 @@ class RuntimePackedQLinearSplitPass(IRPass):
     Keeping the packed layout movement forces every incremental decoder step to
     transform the full sequence.  This rewrite proves, with an element-index
     simulation, that every Slice is one contiguous output-channel group.  It
-    then slices the immutable OUT_IN byte weight, I32 accumulator bias, and
+    then slices the immutable dout_din byte weight, I32 accumulator bias, and
     axis-0 affine parameters and emits one canonical QLinear/DQ branch per
     group.  The packed output's per-tensor affine is reused exactly.  A
     post-dequantization F32 bias remains a post-dequantization Add; it is never
@@ -356,7 +358,7 @@ class RuntimePackedQLinearSplitPass(IRPass):
             touched.extend(emitted)
             notes.append(
                 f"split packed QLinear {source!r} into {len(plan.assignments)} "
-                "exact OUT_IN projections"
+                "exact dout_din projections"
             )
         return PassResult(
             changes,
@@ -459,7 +461,7 @@ class RuntimePackedQLinearSplitPass(IRPass):
             possible_add_index = current_uses[0].node_index
             possible_add = graph.nodes[possible_add_index]
             float_bias_name = self._post_dequant_bias(
-                graph, possible_add, current, width,
+                graph, possible_add, current,
             )
             if float_bias_name is not None:
                 add_index = possible_add_index
@@ -573,7 +575,7 @@ class RuntimePackedQLinearSplitPass(IRPass):
             float_bias=float_bias_name,
         )
 
-    def _post_dequant_bias(self, graph, node, dynamic: str, width: int):
+    def _post_dequant_bias(self, graph, node, dynamic: str):
         if node.op_type != "Add" or set(node.output_map()) != {"out"}:
             return None
         inputs = node.input_map()
@@ -589,16 +591,8 @@ class RuntimePackedQLinearSplitPass(IRPass):
         if (
             bias is None
             or bias.dtype != np.dtype(np.float32)
-            or bias.ndim < 1
-            or bias.shape[-1] != width
-            or any(int(dimension) != 1 for dimension in bias.shape[:-1])
+            or tuple(bias.shape) != tuple(graph.tensors[dynamic].shape)
         ):
-            return None
-        dynamic_shape = graph.tensors[dynamic].shape
-        try:
-            if np.broadcast_shapes(dynamic_shape, bias.shape) != dynamic_shape:
-                return None
-        except ValueError:
             return None
         return candidate
 
@@ -802,6 +796,11 @@ class RuntimePackedQLinearSplitPass(IRPass):
                     op_type="Reshape",
                     inputs={"input": current},
                     outputs={"out": assignment.output},
+                    attributes=(OpAttribute(
+                        "params",
+                        "volvox.params",
+                        {"shape": list(assignment.shape)},
+                    ),),
                     provenance=tuple(
                         provenance
                         for node in (*movement_nodes, slice_node)
@@ -882,11 +881,18 @@ def _apply_typed_movement(values: np.ndarray, node: OpNode, graph):
         values = values.transpose(permutation)
         if tuple(target_shape) != values.shape:
             return None
+    elif node.op_type == "Reshape":
+        if params != {"shape": list(target_shape)}:
+            return None
+    elif node.op_type == "Identity":
+        if params or tuple(target_shape) != values.shape:
+            return None
     else:
-        if params:
-            return None
-        if node.op_type == "Identity" and tuple(target_shape) != values.shape:
-            return None
+        # Packed-projection v1 authoring currently proves only canonical
+        # Transpose, Reshape, and Identity movement. Other registered movement
+        # operators remain fail-closed until their parameter semantics are
+        # represented here exactly.
+        return None
     if int(prod(target_shape)) != values.size:
         return None
     try:
@@ -903,12 +909,10 @@ def _apply_typed_slice(values: np.ndarray, node: OpNode, graph):
     if len(output_shape) != values.ndim:
         return None
     params = _params(node)
-    # Runtime Slice has no `ends` field: the verified output shape is the
-    # selection length.  Reject every unknown key so source-style Slice attrs
-    # cannot be silently interpreted as that canonical runtime contract.
-    if not set(params).issubset({"starts", "axes", "steps"}):
+    if not set(params).issubset({"starts", "ends", "axes", "steps"}):
         return None
     starts = params.get("starts")
+    ends = params.get("ends")
     axes = params.get("axes")
     steps = params.get("steps")
     if steps is None and isinstance(starts, list):
@@ -917,26 +921,28 @@ def _apply_typed_slice(values: np.ndarray, node: OpNode, graph):
         axes = list(range(len(starts)))
     if (
         not isinstance(starts, list)
+        or not isinstance(ends, list)
         or not isinstance(axes, list)
         or not isinstance(steps, list)
-        or not (len(starts) == len(axes) == len(steps))
+        or not (len(starts) == len(ends) == len(axes) == len(steps))
         or any(isinstance(item, bool) or not isinstance(item, int)
-               for item in (*starts, *axes, *steps))
+               for item in (*starts, *ends, *axes, *steps))
     ):
         return None
     selectors = [slice(None)] * values.ndim
     seen: set[int] = set()
-    for raw_start, raw_axis, step in zip(starts, axes, steps):
+    for raw_start, raw_end, raw_axis, step in zip(starts, ends, axes, steps):
         axis = raw_axis + values.ndim if raw_axis < 0 else raw_axis
         if axis < 0 or axis >= values.ndim or axis in seen or step <= 0:
             return None
         start = raw_start + values.shape[axis] if raw_start < 0 else raw_start
-        if start < 0 or start >= values.shape[axis]:
+        end = raw_end + values.shape[axis] if raw_end < 0 else raw_end
+        extent = values.shape[axis]
+        start = min(extent, max(0, start))
+        end = min(extent, max(0, end))
+        if end <= start:
             return None
-        length = int(output_shape[axis])
-        if start + (length - 1) * step >= values.shape[axis]:
-            return None
-        selectors[axis] = slice(start, start + length * step, step)
+        selectors[axis] = slice(start, end, step)
         seen.add(axis)
     if any(
         axis not in seen and int(output_shape[axis]) != values.shape[axis]
@@ -980,7 +986,9 @@ class RuntimeCanonicalizePass(IRPass):
     """Eliminate locally provable no-op storage transformations."""
 
     name = "runtime-canonicalize"
-    contract = PassContract.preserving(IRDialect.RUNTIME, repeatable=True)
+    contract = PassContract.preserving(
+        IRDialect.RUNTIME, repeatable=True
+    )
 
     def run(self, graph):
         aliases: dict[str, str] = {}
@@ -1042,7 +1050,9 @@ class RuntimeShapeChainPass(IRPass):
     """Compose every locally safe shape-only or transpose chain."""
 
     name = "runtime-shape-chain"
-    contract = PassContract.preserving(IRDialect.RUNTIME, repeatable=True)
+    contract = PassContract.preserving(
+        IRDialect.RUNTIME, repeatable=True
+    )
 
     def run(self, graph):
         reshape_like = {"Reshape", "Flatten", "Squeeze", "Unsqueeze"}
@@ -1077,22 +1087,19 @@ class RuntimeShapeChainPass(IRPass):
                         source.quantization != middle.quantization or
                         middle.quantization != output.quantization):
                     continue
-                source_elements = 1
-                middle_elements = 1
-                output_elements = 1
-                for dimension in source.shape:
-                    source_elements *= int(dimension)
-                for dimension in middle.shape:
-                    middle_elements *= int(dimension)
-                for dimension in output.shape:
-                    output_elements *= int(dimension)
+                source_elements = element_signature(
+                    resolved_shape(graph, source.shape))
+                middle_elements = element_signature(
+                    resolved_shape(graph, middle.shape))
+                output_elements = element_signature(
+                    resolved_shape(graph, output.shape))
                 if (source_elements != middle_elements or
                         middle_elements != output_elements):
                     continue
 
                 if first.op_type in reshape_like and second.op_type in reshape_like:
                     second.op_type = "Reshape"
-                    _replace_params(second, {})
+                    _replace_params(second, {"shape": list(output.shape)})
                 elif first.op_type == "Transpose" and second.op_type == "Transpose":
                     first_perm = _params(first).get("perm")
                     second_perm = _params(second).get("perm")

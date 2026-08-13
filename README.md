@@ -17,6 +17,8 @@ The repository is also a from-scratch textbook:
 
 - One explicit inference lifecycle: Runtime → Model → CompiledModel →
   ExecutionContext → ExecutionResult.
+- Bounded fixed-rank dynamic shapes with explicit concrete input views, whole-domain
+  backend qualification, and context-local specialization caches.
 - Stable named outputs on every backend. Host reads return caller-owned arrays;
   WebGPU results may also expose result-owned device buffers.
 - Independent execution and decode contexts with immutable compiled model and
@@ -46,17 +48,17 @@ npm run build:all
 
 ## Release artifacts
 
-The fixed browser release files for package version 0.3.0 are:
+The fixed browser release files for package version 0.4.0 are:
 
 ~~~text
-dist/0.3.0/volvoxai.js
-dist/0.3.0/volvoxai.min.js
-dist/0.3.0/volvoxai.full.js
-dist/0.3.0/volvoxai.full.min.js
-dist/0.3.0/volvoxai.wasm.js
-dist/0.3.0/volvoxai.wasm.min.js
-dist/0.3.0/volvoxai.wasm
-dist/0.3.0/volvoxai.full.wasm
+dist/0.4.0/volvoxai.js
+dist/0.4.0/volvoxai.min.js
+dist/0.4.0/volvoxai.full.js
+dist/0.4.0/volvoxai.full.min.js
+dist/0.4.0/volvoxai.wasm.js
+dist/0.4.0/volvoxai.wasm.min.js
+dist/0.4.0/volvoxai.wasm
+dist/0.4.0/volvoxai.full.wasm
 ~~~
 
 The standard JavaScript entry is inference-only and resolves the forward-only
@@ -80,22 +82,27 @@ model.safetensors
 ~~~
 
 Every graph root, including named subgraphs, must carry the exact
-case-sensitive discriminator:
+case-sensitive format discriminator:
 
 ~~~json
 {
-  "format": "volvox-graph/v1"
+  "format": "volvox-graph/v1",
+  "dimensions": {}
 }
 ~~~
 
-The loader rejects a missing or different discriminator before allocating
-weights or backend resources. Every node input must resolve to a declared graph
-input, a named weight, or an earlier node output.
+Dynamic shape is intrinsic to `volvox-graph/v1`. Every symbol has finite
+bounds. Every node output uses one `{ tensor, dtype, shape }` descriptor, and
+every input resolves to a declared graph input, a named fixed weight, or an
+earlier output.
 
 ## Inference
 
 ~~~javascript
-import { VolvoxAI } from 'volvoxai';
+import {
+  Model,
+  VolvoxAI,
+} from 'volvoxai';
 
 const runtime = await VolvoxAI.createRuntime({
   backends: ['webnn', 'webgpu', 'wasm', 'cpu'],
@@ -104,10 +111,10 @@ const runtime = await VolvoxAI.createRuntime({
   },
 });
 
-const model = await runtime.loadModel(
+const snapshot = await Model.load(
   './models/my-model/model.safetensors',
 );
-const compiled = await model.compile({
+const compiled = await runtime.compile(snapshot, {
   backend: {
     mode: 'prefer',
     order: ['webgpu', 'wasm', 'cpu'],
@@ -117,35 +124,46 @@ const compiled = await model.compile({
 const context = await compiled.createContext();
 
 const result = await context.execute({
-  images: new Float32Array(1 * 224 * 224 * 3),
+  images: {
+    data: new Float32Array(2 * 224 * 224 * 3),
+    shape: [2, 224, 224, 3],
+  },
 });
 const scores = await result.output('scores').read();
 
 await result.close();
 await context.close();
 await compiled.close();
-await model.close();
 await runtime.close();
 ~~~
 
-Runtime loading resolves graph.json beside the first safetensors URL. Pass
-graphUrl in the loader options when the graph is stored elsewhere; its basename
-must be `graph.json` or a named `*.graph.json` document.
+ModelLoader resolves graph.json beside the first safetensors URL. Pass
+graphUrl in its options when the graph is stored elsewhere; its basename must
+be `graph.json` or a named `*.graph.json` document.
 
-Compilation pins an immutable topology and weight revision. Create multiple
-contexts from one compiled model for independent request or decode state. Each
-context serializes its own accepted operations, while different contexts may
-progress concurrently.
+Compilation pins an immutable logical topology and weight revision and admits
+only a provider that attests the complete bounded shape domain. Every execution
+input carries explicit data and concrete shape; raw typed-array shorthand is
+not accepted. Create multiple contexts from one compiled model for independent
+shape specialization, request, or decode state. Each context serializes its own
+accepted operations, while different contexts may progress concurrently.
 
 ExecutionResult owns a stable snapshot of every declared graph output. A result
 remains usable after later executions and after its context closes. Each read()
 returns a fresh typed array. A device result may expose deviceBuffer; that
 buffer remains owned by the result and must not be destroyed by the caller.
+Ordinary execution may pass a live device `TensorResult` back as the `data` of
+another shaped input. The built-in WebGPU provider accepts only results issued
+by VolvoxAI on the same physical `GPUDevice`, with an exact matching dtype,
+shape, and logical byte count. The source result must stay open until the
+consumer execution has been accepted; VolvoxAI then retains it through the GPU
+queue fence. CPU, WASM, WebNN, cross-device, forged, closed, and decode
+seed/step device inputs fail explicitly rather than copying or falling back.
 
 Use a strict policy when execution must stay on one provider:
 
 ~~~javascript
-const compiled = await model.compile({
+const compiled = await runtime.compile(snapshot, {
   backend: {
     mode: 'require',
     backend: 'webgpu',
@@ -162,48 +180,60 @@ and is never retried on another provider.
 Training is available only from the full and WASM-only profiles. Trainer owns
 gradients, optimizer slots, accumulation, and a private working
 revision. `trainStep()` mutates only that private revision. `commit()` atomically
-publishes it as a new Model weight revision; already compiled models and
-contexts remain pinned to their original revision.
+returns an immutable successor snapshot; the source snapshot and already
+compiled contexts remain pinned to their original weights.
 
 ~~~javascript
 import {
   ModelBuilder,
+  Model,
+  Trainer,
   VolvoxAI,
 } from 'volvoxai/full';
 
-const builder = new ModelBuilder();
-const x = builder.input('x', [1, 4]);
-const weight = builder.weight('projection', [4, 8], 'float32', {
-  initializer: { type: 'xavierUniform', seed: 17 },
+const builder = new ModelBuilder({
+  dimensions: { B: { min: 1, max: 8 } },
+  inputs: { x: { dtype: 'float32', shape: ['B', 4] } },
+  weights: [{ name: 'projection', dtype: 'float32', shape: [4, 8] }],
+  nodes: [{
+    id: 'projection',
+    opType: 'MatMul',
+    inputs: { input: 'x', weight: 'projection' },
+    outputs: {
+      out: { tensor: 'logits', dtype: 'float32', shape: ['B', 8] },
+    },
+    params: {},
+  }],
+  outputs: ['logits'],
 });
-const logits = builder.addOp(
-  'MatMul',
-  { input: x, weight },
-  { out: { name: 'logits', shape: [1, 8] } },
-  {},
-  { id: 'projection', wLayout: 'din' },
-).out;
-builder.outputs(logits);
-const graph = builder.build();
-
-const runtime = await VolvoxAI.createRuntime({ backends: ['cpu'] });
-const model = runtime.createModel(graph);
-const trainer = await VolvoxAI.createTrainer(model, {
-  backend: 'cpu',
+const source = Model.capture({
+  graph: builder.snapshot(),
+  weights: {
+    projection: {
+      name: 'projection', dtype: 'float32', shape: [4, 8],
+      data: Float32Array.from({ length: 32 }, (_, i) => (i - 16) / 64),
+    },
+  },
 });
+const trainer = await Trainer.create(source, { backend: 'cpu' });
 
 const step = await trainer.trainStep({
-  inputs: { x: new Float32Array([1, 2, 3, 4]) },
+  inputs: {
+    x: { data: new Float32Array([1, 2, 3, 4]), shape: [1, 4] },
+  },
   logitsTensor: 'logits',
   targets: new Int32Array([3]),
   trainableTensors: ['projection'],
   updateMode: 'adamw',
   optimizer: { learningRate: 1e-3, maxGradNorm: 1 },
 });
-await trainer.commit();
+const successor = await trainer.commit();
 
 await trainer.close();
-await model.close();
+
+const runtime = await VolvoxAI.createRuntime({ backends: ['cpu'] });
+const compiled = await runtime.compile(successor);
+await compiled.close();
 await runtime.close();
 ~~~
 
@@ -211,8 +241,8 @@ The same Trainer contract accepts backend: 'webgpu' or backend: 'wasm'. WASM
 training is strict and rejects an unsupported graph before mutating weights.
 There is no implicit publication: call `commit()` before compiling inference
 against the update, or `rollback()` to restore the last committed baseline.
-The full profile also exports training builders, checkpoints, gradient
-accumulation controls, LoRA helpers, and PTQ authoring tools. See
+The full profile also exports logical authoring, checkpoints, gradient
+accumulation controls, and PTQ authoring tools. See
 [model construction and training](docs/model_builder_training.md) and the
 [operation matrix](docs/operation_list.md).
 
@@ -229,15 +259,21 @@ model/model.safetensors
 ~~~
 
 ~~~javascript
-import { VolvoxAI } from './vendor/volvoxai.wasm.min.js';
+import {
+  Model,
+  VolvoxAI,
+} from './vendor/volvoxai.wasm.min.js';
 
 const runtime = await VolvoxAI.createRuntime({
   wasmUrl: chrome.runtime.getURL('vendor/volvoxai.full.wasm'),
 });
-const model = await runtime.loadModel(
+const snapshot = await Model.load(
   chrome.runtime.getURL('model/model.safetensors'),
   { graphUrl: chrome.runtime.getURL('model/graph.json') },
 );
+const compiled = await runtime.compile(snapshot, {
+  backend: { mode: 'require', backend: 'wasm', operatorFallback: 'forbid' },
+});
 ~~~
 
 Extension pages need wasm-unsafe-eval in their content security policy. The

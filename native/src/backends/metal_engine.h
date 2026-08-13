@@ -4,6 +4,7 @@
 #include <stddef.h>
 #include <stdint.h>
 #include "../../include/volvoxai_enums.h"
+#include "../runtime/engine_core.h"
 
 #ifndef VOLVOXAI_ENABLE_TRAINING
 #define VOLVOXAI_ENABLE_TRAINING 0
@@ -16,15 +17,50 @@ extern "C" {
 int metal_init(void);
 void metal_cleanup(void);
 void metal_set_shader_root(const char* root);
+/* Metal exposes an immutable per-buffer ceiling but no portable aggregate
+ * device-memory cap. Dispatch dimensions are further constrained by each
+ * compiled pipeline's maxTotalThreadsPerThreadgroup. */
+typedef struct MetalDomainLimits {
+    uint64_t maximum_buffer_bytes;
+    uint32_t maximum_workgroups[3];
+    uint32_t maximum_workgroup_size[3];
+    uint32_t maximum_threads_per_workgroup;
+    uint32_t maximum_tensor_slots;
+    uint32_t maximum_bindings;
+} MetalDomainLimits;
+
+int metal_query_domain_limits(MetalDomainLimits* limits);
 void metal_graph_reset(void);
+int metal_graph_bind_shape(const char* signature);
+int metal_graph_bind_shape_domain(
+    const char* signature,
+    const VolvoxAIEnginePhysicalSpan* spans,
+    size_t span_count,
+    size_t qgroupnorm_stats_bytes,
+    size_t qlayernorm_stats_bytes);
 void metal_graph_begin_forward(void);
 int metal_graph_end_forward(void);
 void metal_graph_mark_host(const void* host, size_t bytes, int is_weight);
 int metal_graph_sync_host(const void* host, size_t bytes, int is_weight);
+/* Classification-only promotion used after the invariant bootstrap pass. */
+void metal_graph_retain_weight(const void* host, size_t bytes);
+void metal_graph_demote_weight(const void* host, size_t bytes);
 #ifdef VOLVOX_METAL_TESTING
+typedef struct {
+    uint64_t shape_generation;
+    uint64_t capacity_generation;
+    size_t active_capacity_bytes;
+    size_t pooled_capacity_bytes;
+    size_t domain_span_count;
+    size_t domain_scratch_capacity_bytes;
+    int slot_count;
+    int domain_enforced;
+} MetalGraphDynamicStateProbe;
 void metal_graph_debug_reset_counters(void);
 void metal_graph_debug_counters(uint64_t* dispatches, uint64_t* commits,
                                 uint64_t* waits);
+int metal_graph_debug_dynamic_state(MetalGraphDynamicStateProbe* probe);
+int metal_test_fail_domain_allocation_after(size_t successful_allocations);
 #endif
 int metal_graph_alias_f32(const float* in, float* out, long n);
 int metal_graph_copy_f32(const float* in, float* out, long n);
@@ -68,6 +104,12 @@ int metal_graph_transpose_f32(const float* in, float* out, const int* in_shape,
                               const int* perm, int rank);
 int metal_graph_expand_f32(const float* in, float* out, const int* in_shape,
                            int in_rank, const int* out_shape, int out_rank);
+int metal_graph_expand_32(const void* in, void* out, const int* in_shape,
+                          int in_rank, const int* out_shape, int out_rank);
+int metal_graph_batch_matmul_f32(
+    const float* a, const int* a_shape, int a_rank,
+    const float* b, const int* b_shape, int b_rank,
+    float* output, const int* output_shape, int output_rank);
 int metal_graph_gather_i32_f32(const float* input, const int32_t* indices,
                                float* output, int outer, int axis_size,
                                int inner, int indices_elements,
@@ -96,6 +138,13 @@ int metal_graph_split_f32(const float* in, float* out, long input_numel, long ou
 int metal_graph_conv1d_f32(const float* in, const float* weight, const float* bias, float* out,
                            int batch, int in_c, int in_l, int out_c, int out_l, int kernel,
                            int stride, int pad, int relu);
+/* Routed expert linear with an optional resident-slot table (NULL/0 = fully
+ * resident bank; route indices are then already staged rows). */
+int metal_graph_moe_router_f32(const float*, const float*, const float*,
+                               float*, float*, int, int, int, int, float, int);
+int metal_graph_moe_linear_f32(const float*, const float*, const float*,
+                               const float*, const float*, float*, int, int,
+                               int, int, int, const uint32_t*, uint32_t);
 int metal_graph_embedding_f32(const int32_t* tokens, const float* weight, float* out,
                               int tokens_len, int d_model, int vocab_size);
 int metal_graph_sdpa_f32(const float* qkv, const int32_t* mask, long mask_numel,

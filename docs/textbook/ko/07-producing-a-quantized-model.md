@@ -144,7 +144,8 @@ const artifact = materializePTQWeights(trainingGraph, [{
 }]);
 ```
 
-출력은 1장에서 만난 **패키지** 입니다 — 정확한 루트 판별자 `"format": "volvox-graph/v1"`,
+출력은 1장에서 만난 **패키지** 입니다 — 정확한 루트 판별자
+`"format": "volvox-graph/v1"`,
 `QLinear`/`QConv2D` 노드, 스케일/제로 포인트 텐서를 가리키는 단 하나의 중앙 테이블이 있는
 `graph.json`, 그리고 패킹된 int8 가중치와 모든 수치 affine 파라미터를 담은
 `model.safetensors`. 수치 스케일이나 제로 포인트는 JSON 또는 safetensors 메타데이터에 저장하지

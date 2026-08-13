@@ -57,7 +57,7 @@ def _graph(*, rank_three_bias: bool = False) -> tuple[GraphIR, dict[str, np.ndar
         {"input": "x", "weight": "w"},
         {"out": "matmul"},
         attributes=(OpAttribute(
-            "params", "volvox.params", {"weight_layout": "IN_OUT"},
+            "params", "volvox.params", {"weight_layout": "din_dout"},
         ),),
     ))
     graph.add_node(OpNode.from_maps(
@@ -83,7 +83,9 @@ class RuntimeBiasFoldingTests(unittest.TestCase):
         )
         expected = execute_reference(graph, tensors, {"x": sample}).outputs["y"]
 
-        report = VerifiedPipeline((RuntimeBiasFoldingPass(tensors),)).run(graph)
+        report = VerifiedPipeline(
+            (RuntimeBiasFoldingPass(tensors),), shape_profile={},
+        ).run(graph)
 
         self.assertEqual(report.total_changes, 1)
         self.assertEqual([node.op_type for node in graph.nodes], ["Linear"])
@@ -95,7 +97,9 @@ class RuntimeBiasFoldingTests(unittest.TestCase):
 
     def test_flattens_only_leading_singleton_broadcast_bias(self):
         graph, tensors = _graph(rank_three_bias=True)
-        report = VerifiedPipeline((RuntimeBiasFoldingPass(tensors),)).run(graph)
+        report = VerifiedPipeline(
+            (RuntimeBiasFoldingPass(tensors),), shape_profile={},
+        ).run(graph)
 
         self.assertEqual(report.total_changes, 1)
         alias = graph.nodes[0].input_map()["bias"]
@@ -117,7 +121,9 @@ class RuntimeBiasFoldingTests(unittest.TestCase):
                 else:
                     tensors["bias"][0] = np.nan
                 before = graph.fingerprint()
-                report = VerifiedPipeline((RuntimeBiasFoldingPass(tensors),)).run(graph)
+                report = VerifiedPipeline(
+                    (RuntimeBiasFoldingPass(tensors),), shape_profile={},
+                ).run(graph)
                 self.assertEqual(report.total_changes, 0)
                 self.assertEqual(graph.fingerprint(), before)
 
@@ -134,7 +140,9 @@ class RuntimeBiasFoldingTests(unittest.TestCase):
                     graph.tensors["matmul"].public_output = True
                     graph.outputs.insert(0, "matmul")
                 graph.verify(IRDialect.RUNTIME)
-                report = VerifiedPipeline((RuntimeBiasFoldingPass(tensors),)).run(graph)
+                report = VerifiedPipeline(
+                    (RuntimeBiasFoldingPass(tensors),), shape_profile={},
+                ).run(graph)
                 self.assertEqual(report.total_changes, 0)
 
 

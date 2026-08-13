@@ -1,506 +1,425 @@
-# TinyReceiptVQA BPE1536 CPU and WASM benchmark
+# TinyReceiptVQA BPE1536 explicit-KV benchmark
 
-- Status: current local performance and correctness report
-- Release: VolvoxAI `0.3.0`
+TinyReceiptVQA supports only the producer's cache-enabled split ABI:
 
-This report covers the BPE1536 TinyReceiptVQA split encoder/decoder release at
-[`ivere27/tiny-receipt-vqa-structured-qa-21m`](https://huggingface.co/ivere27/tiny-receipt-vqa-structured-qa-21m).
-It compares ONNX Runtime CPU, VolvoxAI native CPU, and VolvoxAI WASM on one
-content-addressed real receipt with full generation. It is a deployment-path
-comparison on one machine, not an isolated-kernel or general hardware ranking.
+```text
+source:  tiny_receipt_vqa_split_kv_onnx_v1
+package: volvoxai-tiny-receipt-vqa-split-kv-onnx-package-v1
+```
 
-ONNX Runtime below means the native `CPUExecutionProvider`. This repository
-does not depend on `onnxruntime-web`, so the report does not invent an ONNX
-Runtime Web/WASM result. The WASM rows are VolvoxAI's strict WASM backend.
+The FP32 and static INT8 packages are imported directly from the producer ONNX
+directory and use explicit F32 KV
+caches in ONNX Runtime and every VolvoxAI route in this note. Native JavaScript
+CPU and NNAPI are deliberately excluded.
 
-## Executive result
+The canonical imported package manifests are:
 
-Every measured run used the release-owned `receipt_en.jpg`, the question
-`What is the store phone number?`, AUTO routing, batch one, and generation to
-EOS or 191 new tokens. Every run selected `phone` and produced exactly:
+| Package | Manifest SHA-256 | Encoder nodes | Decoder nodes |
+| --- | --- | ---: | ---: |
+| FP32 | `5c2c32eee248f0991f30e6c2688ea458792cc28f07712593307f961cc937a816` | 409 | 236 |
+| INT8 | `be1b68bd3a4615bc8e6f61b6480c83d34cc9e8090243f83f9cc75511ba39d9ff` | 480 | 271 |
 
-~~~text
-<field>phone</field><op>identity</op><answer>6533831</answer>
-~~~
+These hashes identify the current re-export after the redundant secondary
+graph discriminator was removed. The timed reports below remain bound
+to the immediately preceding manifests (`875d9f90...` FP32 and `7eb27743...`
+INT8). After deleting only that discriminator, all four graph documents are
+semantically identical, every safetensors payload is byte-identical, and the
+CPU strict smoke emits the same family/token decision. Therefore the retained
+latencies remain execution-path evidence, but their content-addressed reports
+are not relabelled as fresh measurements of the new manifest bytes.
 
-Primary latency results are medians. Session/model construction is excluded
-from the three compute rows; native process wall and WASM cold generation are
-shown separately.
+See the [TinyReceipt example](../examples/tiny_receipt_vqa/README.md) for the
+import and runtime contracts.
 
-| Runtime / deployment path | Timed scope | Samples per precision | FP32 ms | INT8 ms | FP32 / INT8 |
-| --- | --- | ---: | ---: | ---: | ---: |
-| ONNX Runtime CPU, 1 thread | encoder + dynamic-prefix generation | 51 | 326.074 | 207.982 | 1.568x |
-| VolvoxAI native CPU, 1 thread | encoder + retained-row generation | 11 | 888.641 | 438.217 | 2.028x |
-| VolvoxAI native CPU, 1 thread | complete fresh process wall | 11 | 1,726.983 | 904.366 | 1.910x |
-| VolvoxAI WASM, single-thread | hot retained-row generation | 5 | 16,223.514 | 1,610.283 | 10.075x |
-| VolvoxAI WASM, single-thread | cold retained-row generation | 5 | 18,061.239 | 3,059.640 | 5.903x |
+## Workload and timing rules
 
-For the directly timed compute/generation rows, ONNX Runtime remains fastest:
+All tables use the same generated 672x320 grayscale input, normalized F32 input
+SHA-256 `7a6f7eb153434868b1685c4fd96fc63f1004cae356d15bd58404dccdc2c15963`,
+prompt `phone number last one`, requested family `phone`, active shape
+`B=1/Q=8/M=218/T=5`, and greedy four-token decode. Every measured entry selected
+family ID 0, emitted `[4, 1038, 5, 6]`, and proved the explicit-cache transition
+`P=1 -> R=2 -> 3 -> 4 -> 5`. The initial `P=1` row is the blocked zero sentinel.
 
-| Precision | ONNX CPU | VolvoxAI native CPU | VolvoxAI WASM hot | Native / ONNX | WASM / ONNX | WASM / native |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| FP32 | 326.074 ms | 888.641 ms | 16,223.514 ms | 2.725x | 49.754x | 18.257x |
-| INT8 | 207.982 ms | 438.217 ms | 1,610.283 ms | 2.107x | 7.742x | 3.675x |
+`Component` is the median of each sample's encoder time plus its four decoder
+calls. It is not formed by adding independently computed column medians.
+Encoder and decoder timings include execution, synchronization, shape binding,
+and owned output snapshotting where the runtime exposes those phases. Model
+loading, context/session creation, graph compilation, image preprocessing,
+tokenization, and process startup are excluded. Process-wall time is therefore
+not an inference-latency comparison.
 
-These cross-runtime ratios are not pure kernel comparisons. ONNX uses a
-dynamic decoder prefix, while native and WASM seed their fixed decoder once,
-retain dependency/KV state, and execute one new row for every later token.
-WASM hot generation and native compute both exclude graph loading and
-compilation; the native complete-process row shows the additional startup
-boundary separately.
+The CPU and GPU reports have intentionally different lifecycle questions:
 
-## Model and measured artifact identities
+- The current CPU report measures fresh-session/runtime first execution.
+  `--warmup 1` discards
+  one complete matrix, but every measured ORT session and native/WASM child is
+  new. Before warmup it also runs an untimed canonical dynamic-rebind proof for
+  native CPU and WASM at both precisions.
+- The current GPU report performs one untimed full request on the same runtime and encoder /
+  decoder contexts immediately before every measured request. It resets the
+  cache to the sentinel and proves token/cache parity. This removes lazy device
+  initialization and first-shape compilation from the comparison.
 
-The producer contract is `tiny_receipt_vqa_split_onnx_v1`: `d_model=320`,
-eight heads, six encoder layers, four decoder layers, input
-`[1,1,320,672]`, question/decoder length 192, memory length 402, and vocabulary
-size 1536.
+The CPU and GPU reports use their `v1` schemas. Dynamic qualification uses
+`volvoxai.tiny-receipt-dynamic-shape-qualification/v1`. The `explicit_kv_v1`
+artifact name is the producer model/package ABI.
 
-The tokenizer is `byte_fallback_bpe` v1 with NFC normalization, 256 byte
-fallback tokens, 517 ordered merges, and fingerprint
-`5801826ac9092bdc984210af805d2ff20f0398b80adaf5963ef13b04771a8584`.
+The current CPU and AMD GPU harnesses counterbalance tier order with
+deterministic forward/reverse pairs and rotation, and record the exact order
+for every matrix. Their spawned children inherit non-Volvox environment
+variables, remove every uppercase `VOLVOX*` runtime override, and force common
+nested-library thread variables to the requested harness thread count (one for
+the one-core and GPU matrices, six for the six-core matrix); no such override
+was present in these runs. The CPU ORT sessions remain in the parent Python
+process, while the current AMD GPU policy covers every benchmark and
+dynamic-qualification child.
 
-| Producer artifact | SHA-256 |
-| --- | --- |
-| `manifest.json` | `4094a28d67604c646b035e9eb398fa7537090279686b09dd2b09105de057b066` |
-| `config.json` | `e18e266da200b9b915628c1b8f633cb523520287e2d8f75c8093e3f4d6575f7e` |
-| `vocab.json` | `ae19bf56556649d75e72450ff6c7d43895190404c15dffeb6412dce5cc4d2c80` |
-| FP32 encoder ONNX | `0c6469ef75eeb266c3dbc77c414d658f98f704264b72bdc7dfeed9cf37217db7` |
-| FP32 decoder ONNX | `3fff897777fa5e9805c01a6779812f4adf33e1294f4e2003dd823c04a3300b05` |
-| INT8 encoder ONNX | `924a60cfa8172456131aedb2e672af2ad1de7e4fa975bf14f4837a49e09cec94` |
-| INT8 decoder ONNX | `24dbf7411719fea928f1f249db9b981eedf4b3af6751bec0970f242ca3f99d0a` |
+The browser runners use fresh origins/profiles and serve every artifact with
+`Cache-Control: no-store`. VolvoxAI preloads both graphs and contexts before
+warmup; ORT fetches each selected ONNX model once into immutable bytes before
+creating both sessions. Those setup phases remain outside execution timing.
 
-The measured VolvoxAI packages were generated afresh from those exact files:
+## Physical W8A8 graph
 
-| Package | Measured manifest SHA-256 | Encoder / decoder nodes | Decoder ABI |
-| --- | --- | ---: | --- |
-| Optimized FP32 | `c9e45078fb88868459a088aa1263688be31cf33b3242d76769f0eee1f66a93fe` | 197 / 128 | F32 logits, host first-index argmax |
-| Canonical INT8, native copy | `c68550ccf2a2b0271f4aeb473c9933944d19ad032f79ca77ade3cd205fbe18b5` | 327 / 235 | I32 token IDs, in-graph `QArgMax` |
-| Canonical INT8, WASM copy | `19fbd163ace123c720dfbe0a9818edf2c248abf6349c05f198ccf45ed40d4aac` | 327 / 235 | I32 token IDs, in-graph `QArgMax` |
+The INT8 package is deliberately described as hybrid W8A8 because its public
+cache/logit interface and numerically sensitive regions remain F32;
+`complete_w8a8_fusion=false` is correct. Hybrid does not mean the large compute
+fell back to FP32.
 
-The two INT8 manifest hashes differ only through non-executable optimizer
-report fingerprints. Their runtime graph and weight assets are byte-identical:
-
-| Runtime asset | SHA-256 |
-| --- | --- |
-| FP32 encoder graph / weights | `a2600527441d58c57ee49a078c74b8527f31d91b05822c433ce7eaea9e8ee71b` / `21be9f3c4611b3ee6585ef5d655c30c4cac866ce46953a8a7ed4a0ef8994eb0e` |
-| FP32 decoder graph / weights | `544efd83ad73d31fe84de892a22c154a1442ce5c0616d65c68c6b29c18690403` / `ae4e6026903c70ec6e8fc64687429612d4c338f075d8095c2dd9ee13fc480a7b` |
-| INT8 encoder graph / weights | `a89ae9e30499c9bda07fd6f675cb0f680da6387cfa6f1f2d93cd4a90354815a7` / `46af98fcd96d9644f5b8e0ee9886024c551f0a9effe6cf8590454fd6a09d3a18` |
-| INT8 decoder graph / weights | `7410f71098e3c82763e4f0ea54bfd23c11ae104b73f1fc583dcc10352a6014a9` / `8f9bc097aab3b2573b4d166b54203baeae8984ea5b7df689f7ed6e5832e757e8` |
-
-The direct INT8 package remains correctly classified as `hybrid`: quantized
-regions use the producer's U8S8 affines while required floating-point
-boundaries remain F32.
-
-## Test machine and measurement policy
-
-| Item | Value |
-| --- | --- |
-| CPU | AMD Ryzen 5 5600U, 6 cores / 12 hardware threads, AVX2/FMA |
-| OS | Linux 6.8.0-124-generic x86-64 |
-| VolvoxAI source | commit `290dd3db8a948157fb2ee221cfb6d72dc0f288a9` plus the runtime changes hashed below |
-| ONNX Runtime | 1.23.2, `CPUExecutionProvider` only |
-| Python / NumPy | 3.10.12 / 2.2.6 |
-| Node.js | 20.11.1 |
-| Native benchmark executable | 1,684,488 bytes, SHA-256 `29aa411313430e78701f822a8fe54c8af46e0478cdfd183a484a362becaf287c` |
-| Native inference / full release executables | 1,389,640 / 1,970,320 bytes; SHA-256 `c218ec78ec2d84ac25d32122005212e6657685b6a1129f39f3db4e1fdd919149` / `3b91b4e69b0e5c08202fb6686e06b426c19cf0692b41f1fe22d359f06ec7e5e9` |
-| WASM inference / full executables | 199,583 / 311,002 bytes; SHA-256 `99d6ac675cfc26d922c2a971603b3cdc020ae08a22c1978f8ceb332b0d286212` / `4a6da8ece1a53cf79a545f6472e845e0d42d76e429dfe7296b6f2b0c1fdd0fed` |
-| CPU affinity | logical CPU 2 for every timed process |
-| Frequency policy | `amd-pstate-epp`, `powersave`; boost/frequency scaling left enabled |
-
-Runtime-affecting dirty-source identities were stable before and after the
-final benchmark campaigns:
-
-| Source | SHA-256 |
-| --- | --- |
-| `attention_f32_core.h` | `d59e929027cd2d61bccc33c1611bb1cb4ac26a43d44ca4cbd4af5e503f191db2` |
-| `attention_f32_isa.h` | `7e6e6e00e91cdec024215aefbacf3930a2846966830b3d1c2aede0f3eca606c6` |
-| `attention_f32_tiled.h` | `7ca61137e2213d225b7f87c1dbfa89db54763d313c7663f3a7a1dc17a12bdb41` |
-| `cross_sdpa.c` | `97c0cca4ff8cb7e8a757af2cb2de838358cb55cad157458c11ee64f1c111bb60` |
-| `sdpa.c` | `7076cb8c01689fb64b92cf49a98472f2a235e1f8f3f9b22ef83930d23cfd188b` |
-| `packed_quant_gemm.c` / `.h` | `67481de6b3b80989c33744a4ed1e1646ca482b9e31139154057b600f5203b1bb` / `748d1b2294563eabab94750f5a61a7448fc3a2d3450c9ea96384b5e808adae08` |
-| `qlinear_w8a8_wasm_relaxed.c` | `19d598eb12b1a32906f46d4338162e4736b50a1166db6541702b7d0b08ac211f` |
-| `TinyReceiptSplitSession.js` | `2a2a384d8c10693cb3d25431778d862701806c4b1949d9c212baad29611544ae` |
-| `CPUEngine.ts` / `WasmEngine.ts` | `e32ef16621920fe29e65b2af99f6677896a9d859f49b8f2854c397fafd9d92df` / `97992427c146eb24f8d540244b76594a1d05307c1662fac7225ac1ed19f6367d` |
-| `quantizedRowExecution.ts` | `89b8922949eaf77958fba10347cff9390c33f4a0ef5d613431da55b7263b12a7` |
-
-All paths were explicitly single-threaded:
-
-- ONNX Runtime used `ORT_SEQUENTIAL`, `intra_op_num_threads=1`, and
-  `inter_op_num_threads=1`.
-- Native used `--cpu --threads 1 --incremental --require-row`.
-- WASM required one full incremental seed followed by retained-row execution,
-  was structurally single-threaded, and also received `VOLVOXAI_THREADS=1`.
-- `OMP_NUM_THREADS`, `OPENBLAS_NUM_THREADS`, `MKL_NUM_THREADS`,
-  `NUMEXPR_NUM_THREADS`, and `VECLIB_MAXIMUM_THREADS` were set to one for the
-  ONNX and native runs. The WASM runs additionally set `BLIS_NUM_THREADS=1`
-  and `OMP_DYNAMIC=FALSE`.
-
-No other build or benchmark was allowed to overlap a timed campaign. CPU
-frequency scaling and ordinary desktop services remained enabled, so small
-differences should still be treated as noise.
-
-## ONNX Runtime CPU result
-
-Sessions, image preprocessing, and tokenization were completed before timing.
-Each sample contains one encoder call and 16 dynamic-prefix decoder calls
-through EOS. Ten complete warmups per precision were discarded, followed by
-51 measured generations.
-
-| Precision | Encoder median | Decoder median | Total median | Total mean | Total p05-p95 | Session creation, excluded |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| FP32 | 216.519 ms | 109.712 ms | 326.074 ms | 326.944 ms | 322.341-333.282 ms | 272.246 ms |
-| INT8 | 141.323 ms | 66.282 ms | 207.982 ms | 208.190 ms | 203.223-213.239 ms | 117.090 ms |
-
-INT8 is 1.532x faster in the encoder, 1.655x in the decoder, and
-1.568x end to end. All 102 measured generations were deterministic and FP32
-and INT8 produced identical token IDs.
-
-## VolvoxAI native CPU result
-
-The native executable was built in a fresh CMake directory. Before timing,
-the packed-GEMM, incremental-runtime, backend-composition, inference/full
-profile-boundary, training-boundary, and real TinyReceipt example checks passed
-6/6. Eleven fresh processes were measured per precision using one five-repeat
-FP32-first campaign and one six-repeat INT8-first campaign.
-
-`compute` is paired encoder plus generation time and excludes package
-load/compile. `process wall` covers the complete fresh process. The median of
-paired totals is reported, so it need not equal the sum of component medians.
-
-| Precision | Encoder | First token | Steady token | Generation | Compute | Process wall |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| FP32 | 593.617 ms | 145.954 ms | 9.754 ms | 296.270 ms | 888.641 ms | 1,726.983 ms |
-| INT8 | 364.178 ms | 59.364 ms | 0.937 ms | 73.801 ms | 438.217 ms | 904.366 ms |
-| FP32 / INT8 | 1.630x | 2.459x | 10.410x | 4.014x | 2.028x | 1.910x |
-
-Dispersion was narrow:
-
-| Precision | Compute p05-p95 | Process wall p05-p95 |
+| Runtime operator | Encoder | Decoder |
 | --- | ---: | ---: |
-| FP32 | 860.491-899.074 ms | 1,689.738-1,744.927 ms |
-| INT8 | 433.866-448.584 ms | 898.104-920.133 ms |
+| `QConv2D` | 13 | 0 |
+| `QLinear` | 26 | 33 |
+| `QGemm` | 8 | 0 |
+| `QBatchMatMul` | 14 | 18 |
+| F32 `Conv2D` / `Linear` / `Gemm` / `MatMul` / `BatchMatMul` | 0 | 0 |
+| `QuantizeLinear` / `DequantizeLinear` | 62 / 61 | 53 / 48 |
+| `GroupNorm` / `SiLU` | 13 / 13 | 0 / 0 |
+| `LayerNorm` / `Softmax` / `GELU` | 12 / 6 / 8 | 13 / 8 / 5 |
 
-The retained-row decoder is especially effective for INT8: after the first
-token, its median steady step is 0.937 ms. Native INT8 generation is therefore
-close to ONNX Runtime's entire 66.282 ms dynamic-prefix decoder total
-(73.801 versus 66.282 ms), even though native encoder and process-level
-overhead keep total latency higher.
+The exporter migrated all four decoder BatchMatMul regions previously left at
+the cache boundary; the decoder now has 18 physical `QBatchMatMul` nodes and no
+F32 `BatchMatMul`. It also folded 26 encoder and 33 decoder immutable F32 biases
+into I32 quantized accumulators. Direct, redundant `DequantizeLinear ->
+QuantizeLinear` round trips are absent. Public memory, cross/self KV caches,
+logits, LayerNorm, Softmax, GELU, and the encoder GroupNorm/SiLU islands remain
+F32 by policy.
 
-## VolvoxAI WASM result
+The generic GroupNorm/SiLU byte-island migration remains opt-in and is not
+enabled for this package. A reproduced local 32-request qualification tied to
+producer INT8 encoder/decoder SHA-256 values `a5be30f7...` / `75437bee...`
+changed greedy tokens in 3 of 32 requests (family selection stayed 32/32), with
+up to 32.46% pre-SiLU saturation and 39.66% terminal byte mismatch. This is a
+local qualification, not a checked-in corpus accuracy report, so it supports
+rejecting that migration but not a corpus-level accuracy claim.
 
-Five fresh Node processes were measured per precision, with package order
-alternated by round. Each process performed one `cold-graphs` generation and
-then one `hot-graphs` generation. All ten fresh processes compiled successfully
-with `mode=require`, `backend=wasm`, and `operatorFallback=forbid`; all 20
-cold/hot generations completed without a reported tier or operator fallback.
+## CPU: one physical core
 
-Every generation executed exactly one full decoder seed and 15 retained rows;
-no ordinary full-decoder step was accepted. The real optimized FP32 decoder
-prepared all 102/102 selected dependency nodes, and the canonical INT8 decoder
-prepared all 185/185.
+The process is pinned to one logical CPU that maps to one physical core.
+ONNX Runtime and native C use one requested execution thread. VolvoxAI WASM has
+one engine thread and zero workers.
 
-`hot decoder total` is the directly recorded sum of seed and row execution
-times inside each process, then medianed across processes. `hot generation` is
-the directly measured application wall time and is the primary total.
-Displayed component medians are independently medianed and therefore need not
-add exactly.
+| Runtime | Precision | Encoder | Seed | Steady / token | Decoder total | Component | x ORT |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| ONNX Runtime CPU | FP32 | 247.790 | 2.618 | 2.468 | 9.834 | 257.520 | 1.000 |
+| VolvoxAI native C CPU | FP32 | 272.356 | 5.184 | 3.299 | 14.984 | 286.967 | 1.114 |
+| VolvoxAI WASM | FP32 | 1095.780 | 50.177 | 60.533 | 231.775 | 1325.460 | 5.147 |
+| ONNX Runtime CPU | INT8 | 147.688 | 1.570 | 1.004 | 4.583 | 153.290 | 1.000 |
+| VolvoxAI native C CPU | INT8 | 188.372 | 4.320 | 4.011 | 16.350 | 204.812 | 1.336 |
+| VolvoxAI WASM | INT8 | 588.990 | 60.477 | 61.127 | 244.959 | 839.373 | 5.476 |
 
-| Precision | Cold generation | Hot generation | Hot encoder | Decoder seed | Retained row | Hot decoder total | Graph load | Compile |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| FP32 | 18,061.239 ms | 16,223.514 ms | 15,794.937 ms | 286.676 ms | 7.770 ms | 404.644 ms | 626.723 ms | 581.052 ms |
-| INT8 | 3,059.640 ms | 1,610.283 ms | 1,292.071 ms | 229.222 ms | 6.023 ms | 321.354 ms | 324.348 ms | 762.123 ms |
-| FP32 / INT8 | 5.903x | 10.075x | 12.225x | 1.251x | 1.290x | 1.259x | 1.932x | 0.762x |
+ONNX Runtime remains faster at one thread because the thread count limits
+parallel workers, not graph quality or microkernel quality. ORT optimizes and
+packs during session creation outside the execution timer and uses MLAS
+packing/cache blocking. Native C includes binding commit and exact output
+snapshot work and, on this pre-VNNI CPU, uses an exact full-range U8/S8 AVX2
+route that avoids `VPMADDUBSW` I16 saturation. The latter costs more arithmetic
+than a reduced-range path but preserves the authored quantization contract.
 
-Hot-generation dispersion:
+The WASM encoder gap is predominantly provider compute, not just binding. The
+FP32 encoder medians split into 18.235 ms binding and 1076.945 ms provider work;
+INT8 splits into 40.029 and 548.631 ms. WASM uses one thread and SIMD128, while
+native uses wider AVX2 plus a multithread-capable engine. Its decoder also pays
+for each new `P/R` signature, JavaScript/WASM boundary work, and exact host
+snapshots. Explicit KV is active in all rows, so the gap is not a missing-cache
+failure.
 
-| Precision | Mean | Sample SD | p05-p95 | Min-max |
-| --- | ---: | ---: | ---: | ---: |
-| FP32 | 16,182.246 ms | 203.167 ms | 15,920.727-16,382.823 ms | 15,859.975-16,416.703 ms |
-| INT8 | 1,609.970 ms | 8.343 ms | 1,599.122-1,617.646 ms | 1,596.631-1,618.128 ms |
+## CPU: six-physical-core process envelope
 
-The retained-row/KV change is visible in the decoder rather than the encoder:
+This report pins `0,2,4,6,8,10`, which topology maps to six physical cores, and
+requests six ORT/native threads. WASM remains one engine thread; wider affinity
+only gives Node/V8 auxiliary threads more scheduling room and is not WASM
+inference-worker scaling.
 
-| Precision and scope | Before retained row | Current | Speedup | Reduction |
-| --- | ---: | ---: | ---: | ---: |
-| FP32 steady decoder step | 266.697 ms | 7.770 ms | 34.324x | 97.09% |
-| FP32 decoder total | 4,263.401 ms | 404.644 ms | 10.536x | 90.51% |
-| FP32 hot generation | 18,592.195 ms | 16,223.514 ms | 1.146x | 12.74% |
-| INT8 steady decoder step | 213.784 ms | 6.023 ms | 35.495x | 97.18% |
-| INT8 decoder total | 3,410.801 ms | 321.354 ms | 10.614x | 90.58% |
-| INT8 hot generation | 4,579.629 ms | 1,610.283 ms | 2.844x | 64.84% |
+| Runtime | Precision | Encoder | Seed | Steady / token | Decoder total | Component | x ORT |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| ONNX Runtime CPU | FP32 | 79.891 | 2.495 | 3.415 | 12.741 | 91.859 | 1.000 |
+| VolvoxAI native C CPU | FP32 | 111.926 | 5.090 | 3.322 | 15.057 | 126.699 | 1.379 |
+| VolvoxAI WASM | FP32 | 1048.073 | 25.434 | 22.522 | 93.427 | 1138.566 | 12.395 |
+| ONNX Runtime CPU | INT8 | 62.889 | 1.811 | 2.565 | 9.506 | 72.395 | 1.000 |
+| VolvoxAI native C CPU | INT8 | 95.437 | 4.351 | 3.902 | 16.080 | 111.517 | 1.540 |
+| VolvoxAI WASM | INT8 | 465.993 | 31.331 | 28.683 | 117.395 | 584.616 | 8.075 |
 
-FP32 end-to-end improves less because its 15,794.937 ms encoder dominates the
-remaining time. INT8 compilation is 1.312x slower than FP32 compilation
-because the canonical hybrid graph is larger, partially offsetting its lower
-graph-load and inference costs.
+From the one-core to six-core envelope, component latency improves 2.803x /
+2.117x for ORT FP32/INT8 and 2.265x / 1.837x for native C. Three repeats are
+enough to preserve a reproducible observation, not to characterize all host
+noise or deployment tail latency.
 
-### Relaxed-SIMD validation and ablation
+## Physical AMD GPU observation
 
-The optional M=1 Relaxed-SIMD child now consumes the exact V8Q2 packed-weight
-header emitted by the parent. The shipped inference and full WASM artifacts
-passed shared-memory, final-dot-opcode, all eight input/weight/output signedness
-combinations, corrupt-header rejection, and fail-closed fallback tests.
+The current GPU report used a physical AMD Renoir GPU for Vulkan and OpenGL. The
+isolated ORT and VolvoxAI browser processes both reported the normalized
+WebGPU adapter class `{vendor: amd, architecture: gcn-5}`. WebGPU exposes no
+stable physical-adapter identifier here, so the report attests the adapter
+class match, not that both processes opened the same physical adapter.
 
-This makes the path correct and usable, but it is not the source of the
-end-to-end gain above. In the validation microbenchmark, Relaxed-SIMD measured
-0.0228 ms, baseline packed SIMD128 0.0130 ms, and portable W8A8 0.1152 ms for
-the 320x320 M=1 case. A separate five-pair real-INT8 ablation found essentially
-the same application behavior with child-first and baseline-only dispatch:
-steady-row medians were 5.676 versus 5.537 ms, while hot-generation medians
-were 1,502.227 versus 1,497.412 ms. The small, inconsistent differences are
-within the overlapping run-to-run distributions. Because the isolated child
-also lost, current dispatch tries the faster packed SIMD128 kernel first and
-uses the optional child only as a fail-closed row fallback. The measured
-application speedup is therefore attributed to retained-row/KV execution, not
-to the optional child.
+The direct WebGPU comparison is ONNX Runtime Web 1.27.0 with WebGPU plus CPU
+partitions against strict VolvoxAI WebGPU. All values are median milliseconds.
 
-## Why ONNX Runtime remains faster
+| Runtime route | Precision | Encoder | Seed | Steady / token | Decoder total | Component | x ORT Web |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| ONNX Runtime Web 1.27.0 WebGPU + CPU partitions | FP32 | 216.500 | 71.600 | 52.167 | 235.000 | 452.700 | 1.000 |
+| VolvoxAI strict WebGPU | FP32 | 601.800 | 36.400 | 31.167 | 130.500 | 731.800 | 1.617 |
+| ONNX Runtime Web 1.27.0 WebGPU + CPU partitions | INT8 | 1029.000 | 447.900 | 454.233 | 1813.200 | 2842.200 | 1.000 |
+| VolvoxAI strict WebGPU | physical W8A8 | 615.900 | 51.500 | 55.800 | 219.100 | 832.300 | 0.293 |
 
-The timing breakdown localizes most of the native gap to the encoder. Relative
-to ONNX Runtime, the VolvoxAI native encoder is 2.742x slower in FP32
-(593.617 versus 216.519 ms) and 2.577x slower in INT8 (364.178 versus
-141.323 ms). The native INT8 retained-row generation path is already close to
-the ONNX dynamic-prefix decoder total: 73.801 versus 66.282 ms, 1.113x slower.
-Native process wall also includes graph loading, compilation, and host startup
-that the compute row and ONNX timing exclude.
+ORT's optimized-session diagnostics report exact aggregate provider-assignment
+counts, not an exact per-operation CPU attribution: FP32 encoder CPU 70 /
+WebGPU 504 and decoder CPU 3 / WebGPU 244; INT8 encoder CPU 282 / WebGPU 1223
+and decoder CPU 133 / WebGPU 676. The pinned ONNX Runtime Web 1.27.0 build
+cannot instantiate any of these four graphs as strict all-WebGPU. Missing FP32
+Conv or MatMul kernels are not the cause. The shipped ORT operator table itself
+marks `Reshape` and `Shape` as having no GPU kernel, and the captured missing-
+kernel events contain both operations plus other shape/control operations.
+Inspection of the model's INT64/BOOL shape/control tensors explains additional
+type-constrained CPU islands. INT8 additionally has no registered WebGPU
+`QuantizeLinear` kernel. This is a report/table/model cross-check, not exact
+per-node attribution. The reported `unsupportedKernelEvents` values are repeated capability-
+probe log events, not counts of nodes, executions, transfers, or partition
+boundaries. VolvoxAI requires WebGPU and reports fallback zero.
 
-The likely implementation-level explanation is that ONNX Runtime's mature
-graph optimizer, memory planner, and vectorized CPU operator kernels execute
-this model's large dense encoder more efficiently. The current benchmark does
-not contain per-operator ablations, so this is an inference from the component
-timings rather than a causal kernel proof. ONNX is not intrinsically faster as
-a format; these numbers compare the measured runtime implementations and their
-different execution plans.
+Both harnesses reuse public KV GPU buffers and perform zero KV readbacks in the
+measured request. ORT exposes eight cross-cache and eight present-cache outputs
+as `gpu-buffer` tensors and passes those tensor objects forward. Its internal
+transfers across WebGPU/CPU execution-provider partitions are not attested.
+Separate untimed qualification requests read caches back and prove token and
+cache-transition correctness.
 
-The earlier WASM structural disadvantage has been removed: native and WASM
-now both retain dependency/KV state and execute one later decoder row. The
-remaining native-versus-WASM difference is:
+The former FP32 encoder anomaly was a model-neutral WebGPU selector defect.
+This encoder has thirteen groups=1 regular 3x3 FP32 convolutions, about 8.190
+GMAC in total, and every output-channel count is divisible by 16. They
+previously used the scalar `conv2D` schedule: 155,520 workgroups and 9,953,280
+invocations. The browser compiler now selects the shared regular-out16 kernel,
+which emits 9,720 workgroups and 622,080 invocations and shares each input load
+across sixteen adjacent output channels. Every one of the five measured FP32
+samples records exactly thirteen `webgpu.conv2d.regular-out16` encoder tactics.
+An actual hardware WebGPU correctness test covering asymmetric padding, stride,
+and dilation agrees with the CPU reference within `2.98e-8`; bounded-domain
+tests execute B=1 -> 2 -> 1 in one context and retain the same precompiled
+regular-out16 pipeline while rewriting exact shape metadata.
 
-| Precision | Native compute | WASM hot generation | WASM / native compute | Native fresh-process wall | WASM hot / native fresh wall |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| FP32 | 888.641 ms | 16,223.514 ms | 18.257x | 1,726.983 ms | 9.394x |
-| INT8 | 438.217 ms | 1,610.283 ms | 3.675x | 904.366 ms | 1.781x |
+Against the previous same-harness observation, the VolvoxAI FP32 encoder fell
+from 6533.6 ms to 601.8 ms, a 10.86x speedup; component latency fell from
+6661.2 ms to 731.8 ms. The remaining FP32 component gap is 1.617x, concentrated
+in the encoder: 2.780x ORT, while VolvoxAI's decoder total is 0.555x ORT. Its
+601.8 ms encoder is also close to the current strict Vulkan result, 594.359 ms.
+Compilation is warmed and measured execution has no KV readback. Host-side
+execution telemetry remains only 8.4 ms shape binding, 1.2 ms provider enqueue,
+and 10.1 ms through submission, so the remaining encoder interval is queued GPU
+compute plus the required small control-output readback, not dynamic rebind.
+ORT retains mature graph fusion, layout planning, and kernel/tactic selection;
+VolvoxAI still submits a fine-grained model-neutral graph without equivalent
+fusion. Per-kernel GPU timestamps are still required for an exact residual
+breakdown.
 
-The compute-to-hot column is the closest available direct comparison. The last
-two columns deliberately mix scopes—hot preprocessed WASM generation versus a
-complete fresh native process—and are startup context, not a wall-to-wall
-runtime ratio.
+ORT Web INT8 is 6.278x its FP32 component time. Its much larger CPU/WebGPU
+partition counts and unsupported-`QuantizeLinear` diagnostics (398 encoder,
+260 decoder events) are consistent with graph fragmentation and boundary
+overhead. Those repeated capability-probe events are not executed-node or
+transfer counts, so this report does not claim that every event denotes a CPU
+node or identify a measured internal-copy cost. VolvoxAI's packed-dot4 W8A8
+route avoids that ORT partition pattern and records 0.293x the ORT Web INT8
+component time. Its encoder is 0.599x and its decoder total is 0.121x the
+corresponding ORT Web INT8 medians.
 
-For INT8, the WASM encoder is 3.548x slower than native (1,292.071 versus
-364.178 ms) and its retained-row decoder total is 4.354x slower (321.354
-versus 73.801 ms). Seed is 3.861x slower, and each steady row is 6.428x slower.
-The likely residual causes are native x86 AVX2-specialized quantized kernels
-and lower native dispatch/memory overhead versus V8's single-threaded
-SIMD128/WASM execution. This is a component-level inference, not a per-operator
-profile.
+This INT8 reversal is therefore not evidence that VolvoxAI generally beats an
+optimized ORT all-WebGPU W8A8 implementation. It compares ORT's producer QDQ
+graph partitioned across WebGPU and CPU with VolvoxAI's strict physical W8A8
+graph. VolvoxAI routes 99.72% of the encoder Conv2D MACs through packed-dot
+tiled QConv; only the first 3x3x1 convolution is below the packed-dot reduction
+threshold. ORT's strict WebGPU probes reject both graphs. A strict physical
+W8A8 ORT WebGPU route is not available in this measurement.
 
-FP32 is more extreme because its WASM encoder alone takes 15,794.937 ms,
-26.608x the native FP32 encoder. Its retained-row decoder total is only 1.366x
-native, so further FP32 WASM work should target the encoder's large dense and
-attention operations rather than decoder caching.
+Vulkan and OpenGL have no ONNX Runtime native peer in this harness, so these
+strict VolvoxAI measurements are observations rather than ORT ratios:
 
-## Interpretation and change from the previous report
+| Runtime route | Precision | Encoder | Seed | Steady / token | Decoder total | Component | ORT native peer |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | --- |
+| VolvoxAI strict Vulkan | FP32 | 594.359 | 16.221 | 16.451 | 65.598 | 660.074 | N/A |
+| VolvoxAI strict OpenGL | FP32 | 3764.764 | 15.726 | 15.794 | 63.782 | 3828.865 | N/A |
+| VolvoxAI strict Vulkan | physical W8A8 | 645.542 | 38.341 | 38.318 | 152.888 | 799.635 | N/A |
+| VolvoxAI strict OpenGL | physical W8A8 | 647.283 | 42.104 | 42.754 | 170.266 | 820.772 | N/A |
 
-The earlier revision of this document used one hot same-example observation
-for several paths. The current report uses medians, fixed CPU affinity, explicit
-thread environment variables, and order balancing for the native and WASM
-campaigns. ONNX Runtime used one complete FP32 block followed by one INT8 block.
-Direct deltas include that methodology change, but the native FP32 difference
-is much larger than the observed variance:
+Every native row requires its named backend and reports `fallback=0;missing=0`.
+The Vulkan device reports `packedInt8Dot=false` and therefore uses its
+tiled/scalar W8A8 route; the OpenGL evidence has no packed-dot tactic counter.
+The slow OpenGL FP32 encoder is not a dynamic-shape or fallback result, but the
+matrix does not isolate the responsible kernel or driver cost.
 
-| Path | Previous FP32 | Current FP32 | Previous / current | Current reduction |
-| --- | ---: | ---: | ---: | ---: |
-| ONNX Runtime CPU | 355.764 ms | 326.074 ms | 1.091x | 8.35% |
-| VolvoxAI native CPU compute | 9,196.749 ms | 888.641 ms | 10.349x | 90.34% |
-| VolvoxAI WASM hot generation | 22,206.836 ms | 16,223.514 ms | 1.369x | 26.94% |
+ONNX Runtime also offers a [native WebGPU plugin](https://onnxruntime.ai/docs/execution-providers/WebGPU-ExecutionProvider.html)
+that can run through Dawn's Vulkan backend on Linux. That remains WebGPU over
+Dawn rather than a direct Vulkan execution provider, just as ORT Web's WebGL
+route is not a native OpenGL execution provider, so neither is used as a
+same-backend denominator here.
 
-The native FP32 gain is consistent with the current shared online-softmax
-attention implementation and x86 tiled AVX2/FMA path, which remove repeated
-Q.K work and let full and retained-row execution share the optimized
-recurrence. This campaign is not a controlled code-path ablation, so the full
-gain cannot be attributed to those changes alone.
+## RTX 3090 CUDA observation
 
-INT8 remains the best VolvoxAI deployment choice on this machine. Native INT8
-cuts compute by 50.7% versus native FP32; WASM INT8 cuts hot generation by
-90.1%. ONNX Runtime is still faster than VolvoxAI native for both precisions,
-especially in the encoder.
+The values below are retained from an earlier RTX 3090 run and were not
+remeasured after the current harness updates. They are not a fresh current
+qualification; the report records the original settings and provenance.
 
-## Correctness status and limitations
+| Runtime route | Precision | Encoder | Seed | Steady / token | Decoder total | Component | x ORT |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| ONNX Runtime CUDA-first + CPU fallback | FP32 | 5.427 | 1.774 | 2.096 | 8.054 | 13.482 | 1.000 |
+| VolvoxAI strict CUDA | FP32 | 36.261 | 4.593 | 4.436 | 17.952 | 54.213 | 4.021 |
+| ONNX Runtime CUDA-first + CPU fallback | INT8 artifact | 7.425 | 2.482 | 2.801 | 10.894 | 18.252 | 1.000 |
+| VolvoxAI strict CUDA | physical W8A8 | 31.952 | 5.318 | 5.219 | 20.993 | 52.953 | 2.901 |
 
-- ONNX Runtime: 102/102 measured generations passed; FP32 and INT8 token IDs,
-  family, structured text, and answer were identical.
-- Native: 22/22 measured fresh processes reached EOS, retained row execution,
-  selected `phone`, and returned the exact answer.
-- WASM: 20/20 cold/hot generations passed strict WASM execution with exact
-  output and no reported operator fallback.
-- This is a one-example latency report. It does not replace the release's
-  2,000-record accuracy evaluation or a multi-case latency distribution.
-- ONNX uses a dynamic prefix. Native and WASM both use a full seed plus
-  retained rows, but their graph boundaries and runtime implementations still
-  differ. The end-to-end rows describe shipping deployment paths, not
-  identical operator workloads.
-- WASM required retained-row execution and rejected ordinary decoder fallback.
-  Dirty noncausal K/V/mask, invariant matrix, or broadcast inputs fail before
-  input/output writes, invalidating the seed cache instead of reusing unsafe
-  state.
-- The optional Relaxed-SIMD M=1 QLinear child is now V8Q2-compatible and
-  correctness-tested. Its real-model ablation was neutral within noise, so it
-  is not credited for the reported KV speedup.
-- No ONNX Runtime Web/WASM number is included because `onnxruntime-web` is not
-  a project dependency in this repository.
+Only VolvoxAI's rows are strict all-CUDA: every selected encoder/decoder node
+reports `fallback=0;missing=0`. The ORT reference is CUDA-first with explicit
+CPU fallback. Separate untimed profiling sessions with the same provider and
+session configuration recorded exact executed-node placement: FP32 encoder
+CUDA 473 / CPU 48 and decoder CUDA 202 / CPU 0; INT8 encoder CUDA 943 / CPU 56
+and decoder CUDA 530 / CPU 0. Separate strict probes reject both encoders and
+accept both decoders. The measured sessions themselves are deliberately not
+profiled, so this evidence attests the invariant configuration and canonical
+request, not the exact execution instance. ORT INT8 is therefore the producer
+QDQ artifact under CUDA-first partitioning, not proof of an all-CUDA
+tensor-core INT8 path.
 
-## Content-addressed measurement evidence
+Both processes selected visible CUDA ordinal 0, but this retained report does
+not expose a comparable physical-device UUID across runtimes. The pairing is
+therefore by ordinal and reported RTX 3090 identity, not a cryptographic
+same-device attestation.
 
-The raw reports were retained in local temporary benchmark directories during
-this run. Their digests identify the exact evidence used for this document:
+VolvoxAI CUDA INT8 improves encoder latency by 11.9% over its FP32 route, but
+its decoder total is 16.9% slower; component totals improve by only 2.3%
+(52.953 vs 54.213 ms). Route counters prove DP4A execution, including
+139,889,120 DP4A dot4 groups and 2,889,600 scalar-tail operations for the
+representative encoder. This does not claim IMMA or tensor-core use: those tiers
+are not implemented in this result.
 
-| Evidence | SHA-256 |
-| --- | --- |
-| ONNX Runtime 51-sample report | `3e3101de86538291dbed00fdfdf6bdf94c79267cc1119b3f85b604bb8b5faa3d` |
-| ONNX timing harness | `dc8cafdf832277460dd38427fa8ff683c273ce49ca29b3cbe79605416c230431` |
-| Native report, FP32-first five samples | `3fcb65e54818db976673962063bebcade1237428403b5f4ef73272fb4d317395` |
-| Native report, INT8-first six samples | `693c2f32550a27f3daa9b8f01b2064c8d9869d9232065a18b0d9f3af793114d8` |
-| WASM five-round ordered raw-log checksum listing | `9ac6a235c21578a3efd1d83734226be3bf047ed7581740f89e5f84371b93894b` |
-| Relaxed/baseline SIMD five-pair checksum listing | `8a34fafe534e4584b9d0adc66a60721fe8843965a348d32420ae93f1e50590eb` |
-| Strict FP32 / INT8 smoke logs | `d888f0924f4dc762e1bbc8b1fc4433baaaeeec4050fdd569c12e2f71dfaf8553` / `c1f2d15c3ddaaeac21e3d6c31d5a3fdbb134ec58c1980a0d6993b205c221f804` |
-| Versioned WASM benchmark harness | `859575a0c083373c01c831d88c8c72fa8296c566b53cd4153d83e42fea1e5ef2` |
-| Receipt image | `24d7dde7d28bec844fee9134e6cc8d3180ee85315d6d493cc39c7cf0e1ebf328` |
+ORT is still faster because it brings mature CUDA graph optimization, fusion,
+library kernels, packing, and tactic selection. VolvoxAI is a model-neutral
+engine executing a much more granular per-node schedule with manual generic
+kernels; its FP32 path does not use cuBLAS/cuDNN, TF32, or tensor cores. DP4A
+helps the large encoder, while the one-row decoder remains dispatch/binding
+limited and crosses Q/DQ/F32 boundaries often. Explicit KV is active on both
+runtimes and does not explain the remaining gap.
 
-The ordered-listing digests are the SHA-256 of the textual `sha256sum`
-listing in round order (`round-{1..5}-{fp32,int8}` and
-`ablation-{1..5}-{relaxed,baseline}` respectively), so all ten constituent
-logs are covered without selecting a single favorable run.
+## Dynamic-shape qualification
 
-## Representative commands and aggregation protocol
+Dynamic shape support is a bounded backend/operator contract, not a claim that
+every conceivable shape of every kernel is accepted. For this model's declared
+domain, FP32 and INT8 currently pass the complete dynamic-shape v1
+qualification on native CPU and WASM in the current CPU reports and on strict
+WebGPU, Vulkan, and OpenGL in the current AMD GPU report. Each backend/precision pair
+reuses one runtime plus one encoder and decoder context for this untimed
+sequence:
 
-Use new output directories; package tools deliberately refuse to overwrite an
-existing artifact. The commands below reproduce package construction and the
-native/WASM runtime invocations. The published aggregate values use the sample
-counts and order shown below, rather than the result of any single command.
+```text
+active Q=2/M=212
+active Q=8/M=218
+maximum-padded Q=192/M=402 (logical Q=8/M=218)
+active Q=2/M=212
+```
 
-~~~bash
-MODEL_SOURCE=/path/to/tiny_receipt_vqa_bpe1536_onnx
-EVAL_ROOT=/path/to/eval/heldout
-FP32_IMPORTED_PACKAGE=build/tiny-receipt-bpe1536-fp32-imported
-FP32_PACKAGE=build/tiny-receipt-bpe1536-fp32
-INT8_IMPORTED_PACKAGE=build/tiny-receipt-bpe1536-int8-imported
-INT8_PACKAGE=build/tiny-receipt-bpe1536-int8
+Every current sequence also records the exact question-token input, grows
+decoder cache `P=1..4`, returns exact logical output shapes, preserves cache
+prefixes, produces finite appended rows, selects the same family, and emits the
+same tokens after shrinking. Unsupported bounded domains fail
+compilation/execution as unsupported; execution never silently switches
+backend. The retained CUDA run records strict shape/cache/output-token evidence,
+but a current complete qualification needs a fresh RTX 3090 run.
 
-python3 -m examples.tiny_receipt_vqa.tools.import_hf_split_onnx \
-  --source "$MODEL_SOURCE" --out-dir "$FP32_IMPORTED_PACKAGE" \
-  --variant fp32 --target portable
-python3 -m examples.tiny_receipt_vqa.tools.optimize_split_fp32 \
-  --source "$FP32_IMPORTED_PACKAGE" --out "$FP32_PACKAGE" \
-  --hoist-input v4_keep:int32
+## Reproduction
 
-python3 -m examples.tiny_receipt_vqa.tools.import_hf_split_onnx \
-  --source "$MODEL_SOURCE" --out-dir "$INT8_IMPORTED_PACKAGE" \
-  --variant int8-w8a8 --target portable
-python3 -m examples.tiny_receipt_vqa.tools.optimize_direct_int8 \
-  --source "$INT8_IMPORTED_PACKAGE" --out "$INT8_PACKAGE" \
-  --fuse-attention --fuse-static-qdq-compute --canonical-deployment
-~~~
+Build with at most `CPU count - 2` parallel jobs (10 on a 12-logical-CPU host):
 
-Build the relevant VolvoxAI runtime and opt-in example targets:
-
-~~~bash
-make build_native
-make build_tiny_receipt_split_native_example
-make test_wasm_relaxed_simd
+```bash
+cmake --build build/gpu-dynamic-release \
+  --target tiny_receipt_split_w8a8 --parallel 10
+make -j10 build_wasm
 npm run build:all
-~~~
+```
 
-Apply the single-thread and affinity policy before timing:
+CPU first-execution matrix:
 
-~~~bash
-export OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1
-export NUMEXPR_NUM_THREADS=1 VECLIB_MAXIMUM_THREADS=1 BLIS_NUM_THREADS=1
-export OMP_DYNAMIC=FALSE VOLVOXAI_THREADS=1
-BENCH_CPU=2
-~~~
+```bash
+: "${KV_MODEL_SOURCE:?set KV_MODEL_SOURCE to the cache-enabled ONNX directory}"
 
-Reproduce the native 5+6 campaign. The second command reverses package order;
-pool the eleven per-run observations for each precision before calculating the
-median and linear-interpolated p05/p95 values:
+taskset -c 0 python3 -m examples.tiny_receipt_vqa.tools.benchmark_explicit_kv \
+  --source "$KV_MODEL_SOURCE" \
+  --fp32-package build/tiny-receipt-kv-f32 \
+  --int8-package build/tiny-receipt-kv-int8 \
+  --native-binary build/gpu-dynamic-release/native/tiny_receipt_split_w8a8 \
+  --max-new 4 --warmup 1 --repeat 3 --threads 1 \
+  --report examples/tiny_receipt_vqa/reports/explicit_kv_v1_runtime_matrix.json
 
-~~~bash
-taskset -c "$BENCH_CPU" python3 -m \
-  examples.tiny_receipt_vqa.tools.benchmark_native_heldout \
-  --eval "$EVAL_ROOT" \
-  --binary examples/target/bin/tiny_receipt_split_w8a8 \
-  --ids receipt_en \
-  --package fp32="$FP32_PACKAGE" --package int8="$INT8_PACKAGE" \
-  --max-new 191 --repeat 5 --threads 1 \
-  --report build/tiny-receipt-native-fp32-first.json
+taskset -c 0,2,4,6,8,10 \
+  python3 -m examples.tiny_receipt_vqa.tools.benchmark_explicit_kv \
+  --source "$KV_MODEL_SOURCE" \
+  --fp32-package build/tiny-receipt-kv-f32 \
+  --int8-package build/tiny-receipt-kv-int8 \
+  --native-binary build/gpu-dynamic-release/native/tiny_receipt_split_w8a8 \
+  --max-new 4 --warmup 1 --repeat 3 --threads 6 \
+  --report examples/tiny_receipt_vqa/reports/explicit_kv_v1_runtime_matrix_6c.json
+```
 
-taskset -c "$BENCH_CPU" python3 -m \
-  examples.tiny_receipt_vqa.tools.benchmark_native_heldout \
-  --eval "$EVAL_ROOT" \
-  --binary examples/target/bin/tiny_receipt_split_w8a8 \
-  --ids receipt_en \
-  --package int8="$INT8_PACKAGE" --package fp32="$FP32_PACKAGE" \
-  --max-new 191 --repeat 6 --threads 1 \
-  --report build/tiny-receipt-native-int8-first.json
-~~~
+Vulkan/OpenGL/WebGPU same-context warmed matrix:
 
-For WASM, each invocation below is one fresh Node process containing a cold/hot
-pair. The call order matches the measured five-round campaign:
+```bash
+: "${KV_MODEL_SOURCE:?set KV_MODEL_SOURCE to the cache-enabled ONNX directory}"
 
-~~~bash
-run_wasm() {
-  local package_path="$1" label="$2" round="$3"
-  taskset -c "$BENCH_CPU" \
-    node --experimental-wasm-relaxed-simd --import tsx \
-    examples/tiny_receipt_vqa/tools/benchmark_wasm_cold_hot.mjs \
-    "$package_path" "$MODEL_SOURCE/examples/receipt_en.jpg" \
-    'What is the store phone number?' \
-    dist/0.3.0/volvoxai.wasm 191 \
-    > "build/round-${round}-${label}.log"
-}
+ORT_WEB_TMP="$(mktemp -d)"
+npm install --prefix "$ORT_WEB_TMP" \
+  --ignore-scripts --no-save --package-lock=false \
+  onnxruntime-web@1.27.0
+ORT_WEB_ROOT="$ORT_WEB_TMP/node_modules/onnxruntime-web"
 
-run_wasm "$FP32_PACKAGE" fp32 1
-run_wasm "$INT8_PACKAGE" int8 1
-run_wasm "$INT8_PACKAGE" int8 2
-run_wasm "$FP32_PACKAGE" fp32 2
-run_wasm "$FP32_PACKAGE" fp32 3
-run_wasm "$INT8_PACKAGE" int8 3
-run_wasm "$INT8_PACKAGE" int8 4
-run_wasm "$FP32_PACKAGE" fp32 4
-run_wasm "$FP32_PACKAGE" fp32 5
-run_wasm "$INT8_PACKAGE" int8 5
-~~~
+taskset -c 0-9 \
+  python3 -m examples.tiny_receipt_vqa.tools.benchmark_explicit_kv_gpu \
+  --source "$KV_MODEL_SOURCE" \
+  --fp32-package build/tiny-receipt-kv-f32 \
+  --int8-package build/tiny-receipt-kv-int8 \
+  --ort-web-root "$ORT_WEB_ROOT" \
+  --native-binary build/gpu-dynamic-release/native/tiny_receipt_split_w8a8 \
+  --native-backend vulkan --native-backend opengl \
+  --warmup 1 --repeat 5 \
+  --report examples/tiny_receipt_vqa/reports/explicit_kv_v1_gpu_matrix.json
+```
 
-Extract the final `WASM_TINYRECEIPT_COLD_HOT` JSON record from every log and
-calculate each reported median over the five observations for that precision.
-The harness itself requires strict WASM selection, exact cold/hot output,
-one decoder seed, 15 monotonically positioned retained rows, zero ordinary
-decoder executions, and no operator fallback. It reports encoder, seed,
-steady-total/mean, decoder-total, and application end-to-end times separately.
+RTX 3090 CUDA remeasurement with the current GPU report harness:
 
-The campaign evidence digest can be reproduced without discarding any raw log:
+```bash
+taskset -c 0-1 \
+  python3 -m examples.tiny_receipt_vqa.tools.benchmark_explicit_kv_gpu \
+  --source "$KV_MODEL_SOURCE" \
+  --fp32-package build/tiny-receipt-kv-f32 \
+  --int8-package build/tiny-receipt-kv-int8 \
+  --native-binary build/gpu-dynamic-release/native/tiny_receipt_split_w8a8 \
+  --native-backend cuda --no-webgpu \
+  --ort-provider CUDAExecutionProvider --allow-ort-cpu-fallback \
+  --warmup 1 --repeat 5 \
+  --report examples/tiny_receipt_vqa/reports/explicit_kv_v1_cuda_matrix.json
+```
 
-~~~bash
-cd build
-sha256sum round-{1..5}-{fp32,int8}.log | sha256sum
-~~~
+Content-addressed reports:
 
-For the SIMD ablation, compile the same parent without embedding the optional
-custom section, then run five order-balanced INT8 pairs with the shipped and
-baseline artifacts:
+- [one-core CPU/native/WASM](../examples/tiny_receipt_vqa/reports/explicit_kv_v1_runtime_matrix.json), SHA-256 `06d09752777b421ca9383d2c73740bf4afbe274b741488a374ff861eedfb7d7b`
+- [six-core CPU/native/WASM](../examples/tiny_receipt_vqa/reports/explicit_kv_v1_runtime_matrix_6c.json), SHA-256 `be3d2df5399abe965b3e7bf4d1acca6aa425e5ccf67aa4596a96bde95cc26588`
+- [Vulkan/OpenGL/WebGPU](../examples/tiny_receipt_vqa/reports/explicit_kv_v1_gpu_matrix.json), SHA-256 `a6707b8f9556c15503fb59c54cb73f2c53e8563d7f0ce0bf8408efa9f575685f`
+- [RTX 3090 CUDA retained measurement](../examples/tiny_receipt_vqa/reports/explicit_kv_v1_cuda_matrix.json), SHA-256 `23fb02af2f9543ccab192342b190f083e6d65da15d90fb6081ef1cd80d13133c`
 
-~~~bash
-clang-17 --target=wasm32 -O3 -msimd128 -nostdlib \
-  -Wl,--no-entry -Wl,--export-all -Wl,--allow-undefined \
-  -o build/volvoxai.baseline-simd.wasm native/src/kernels/kernels.c
-~~~
-
-The exact ONNX measurement used the one-off timing harness identified by hash
-above; that harness is not currently checked into the repository. Its exact
-protocol creates FP32 or INT8 sessions once with
-`CPUExecutionProvider`, `ORT_SEQUENTIAL`, and both thread counts set to one;
-preprocesses and tokenizes once; discards ten complete generations; and then
-times 51 encoder-plus-dynamic-prefix generations. Session construction and
-preprocessing stay outside the timed loop. Future release automation should
-promote this harness into a versioned tool before treating the ONNX aggregate
-as independently command-reproducible.
+All four report paths are tracked publication evidence. Staging and publication
+remain explicit maintainer decisions.

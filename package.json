@@ -1,17 +1,17 @@
 {
   "name": "volvoxai",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "A Zero-Dependency, Bare-Metal Deep Learning Engine for the Browser and Node.js",
-  "main": "./dist/0.3.0/volvoxai.js",
+  "main": "./dist/0.4.0/volvoxai.js",
   "exports": {
-    ".": "./dist/0.3.0/volvoxai.js",
-    "./min": "./dist/0.3.0/volvoxai.min.js",
-    "./full": "./dist/0.3.0/volvoxai.full.js",
-    "./full/min": "./dist/0.3.0/volvoxai.full.min.js",
-    "./wasm": "./dist/0.3.0/volvoxai.wasm.js",
-    "./wasm/min": "./dist/0.3.0/volvoxai.wasm.min.js",
-    "./volvoxai.wasm": "./dist/0.3.0/volvoxai.wasm",
-    "./volvoxai.full.wasm": "./dist/0.3.0/volvoxai.full.wasm"
+    ".": "./dist/0.4.0/volvoxai.js",
+    "./min": "./dist/0.4.0/volvoxai.min.js",
+    "./full": "./dist/0.4.0/volvoxai.full.js",
+    "./full/min": "./dist/0.4.0/volvoxai.full.min.js",
+    "./wasm": "./dist/0.4.0/volvoxai.wasm.js",
+    "./wasm/min": "./dist/0.4.0/volvoxai.wasm.min.js",
+    "./volvoxai.wasm": "./dist/0.4.0/volvoxai.wasm",
+    "./volvoxai.full.wasm": "./dist/0.4.0/volvoxai.full.wasm"
   },
   "type": "module",
   "bin": {
@@ -19,7 +19,7 @@
   },
   "files": [
     "bin/",
-    "dist/0.3.0/"
+    "dist/0.4.0/"
   ],
   "scripts": {
     "clean:dist": "node tools/build_web.mjs clean",
@@ -28,6 +28,12 @@
     "build:all": "npm run typecheck && node tools/build_web.mjs all",
     "check:release": "node tools/check_release_artifacts.mjs",
     "baseline:runtime": "node --expose-gc --import tsx tools/runtime_baseline.mjs",
+    "baseline:cpu-shape": "node --import tsx tools/cpu_shape_context_baseline.mjs",
+    "baseline:cpu-public": "node --import tsx tools/cpu_public_runtime_baseline.mjs",
+    "baseline:dynamic": "node --import tsx tools/dynamic_shape_performance.mjs",
+    "baseline:native-dynamic": "node tools/native_dynamic_shape_performance.mjs",
+    "baseline:webgpu": "node --experimental-websocket tools/run_webgpu_tests.mjs --adapter=hardware --url=http://localhost:8091/tools/webgpu_runtime_baseline.html",
+    "baseline:padded-static": "node --import tsx tools/padded_static_baseline.mjs",
     "prepack": "npm run check:release",
     "typecheck": "python3 tools/generate_proto_enums.py --check && python3 tools/generate_kernel_registry.py --check && tsc --project tsconfig.json",
     "test": "tsx --test tests/*.test.mjs examples/*/tests/*.test.mjs",

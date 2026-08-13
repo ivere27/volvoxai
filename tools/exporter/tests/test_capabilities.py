@@ -7,11 +7,11 @@ from types import SimpleNamespace
 import numpy as np
 
 from tools.exporter.capabilities import (
-    classify_package,
+    classify_package as _classify_package,
     expand_targets,
     normalize_targets,
-    validate_graph,
-    validate_runtime_descriptors,
+    validate_graph as _validate_graph,
+    validate_runtime_descriptors as _validate_runtime_descriptors,
 )
 from tools.exporter.quantization_storage import externalize_quantization
 
@@ -42,8 +42,58 @@ class ArrayFixture(SimpleNamespace):
         return value.copy() if copy else value
 
 
+def closed_graph_fixture(graph):
+    """Author test descriptors in the sole bounded, unified-output v1 shape."""
+
+    if not isinstance(graph, dict) or graph.get("format") != "volvox-graph/v1":
+        return copy.deepcopy(graph)
+    document = copy.deepcopy(graph)
+    document.setdefault("dimensions", {})
+    for index, node in enumerate(document.get("nodes", ())):
+        if not isinstance(node, dict):
+            continue
+        node.setdefault("id", f"node-{index}")
+        node.setdefault("params", {})
+        outputs = node.get("outputs")
+        shapes = node.pop("outputs_shape", {})
+        dtypes = node.pop("outputs_dtype", {})
+        if isinstance(outputs, dict) and all(
+            isinstance(tensor, str) for tensor in outputs.values()
+        ):
+            node["outputs"] = {
+                port: {
+                    "tensor": tensor,
+                    "shape": copy.deepcopy(shapes.get(port)),
+                    "dtype": dtypes.get(port),
+                }
+                for port, tensor in outputs.items()
+            }
+        if node.get("opType") in {"Reshape", "Expand"}:
+            out = node.get("outputs", {}).get("out")
+            params = node.get("params")
+            if isinstance(out, dict) and isinstance(params, dict):
+                params.setdefault("shape", copy.deepcopy(out.get("shape")))
+    return document
+
+
+def classify_package(graph, weights=None):
+    return _classify_package(closed_graph_fixture(graph), weights)
+
+
+def validate_graph(graph, targets=None, *, weights=None):
+    return _validate_graph(
+        closed_graph_fixture(graph), targets, weights=weights,
+    )
+
+
+def validate_runtime_descriptors(graph, *, weights=None):
+    return _validate_runtime_descriptors(
+        closed_graph_fixture(graph), weights=weights,
+    )
+
+
 def canonical_quantized_graph(graph, descriptors, weights=None):
-    authored = copy.deepcopy(graph)
+    authored = closed_graph_fixture(graph)
     tensors = dict(weights or {})
     externalize_quantization(authored, tensors, descriptors)
     return authored, tensors
@@ -128,13 +178,14 @@ def graph_with_node(
         "id": "node0",
         "opType": op_type,
         "inputs": inputs or {"input": "x"},
-        "outputs": {"out": "y"},
-        "outputs_shape": {"out": [1, 4]},
-        "outputs_dtype": {"out": output_dtype},
+        "outputs": {"out": {
+            "tensor": "y", "shape": [1, 4], "dtype": output_dtype,
+        }},
         "params": params or {},
     }
     return {
         "format": "volvox-graph/v1",
+        "dimensions": {},
         "inputs": {"x": {"shape": [1, 4], "dtype": input_dtype}},
         "outputs": ["y"],
         "nodes": [node],
@@ -159,20 +210,20 @@ class TargetExpansionTests(unittest.TestCase):
 
 
 class PackageClassificationTests(unittest.TestCase):
-    def test_classifier_uses_live_descriptors_and_ignores_stale_declaration(self):
+    def test_classifier_uses_only_live_descriptors(self):
         graph = graph_with_node(
             "QGELU", input_dtype="int8", output_dtype="int8",
         )
-        graph["source"] = {"package_class": "fp32"}
         self.assertEqual(classify_package(graph), "w8a8-v1")
 
         graph["nodes"].append({
             "id": "dequantize",
             "opType": "DequantizeLinear",
             "inputs": {"input": "y", "scale": "s", "zero_point": "z"},
-            "outputs": {"out": "float_y"},
-            "outputs_shape": {"out": [1, 4]},
-            "outputs_dtype": {"out": "float32"},
+            "outputs": {"out": {
+                "tensor": "float_y", "shape": [1, 4], "dtype": "float32",
+            }},
+            "params": {},
         })
         self.assertEqual(classify_package(graph), "hybrid")
 
@@ -180,7 +231,7 @@ class PackageClassificationTests(unittest.TestCase):
         graph = graph_with_node(
             "Linear",
             inputs={"input": "x", "weight": "weight"},
-            params={"weight_layout": "OUT_IN"},
+            params={"weight_layout": "dout_din"},
         )
         self.assertEqual(classify_package(graph), "fp32")
         self.assertEqual(
@@ -213,6 +264,101 @@ class CapabilityValidationTests(unittest.TestCase):
         result = validate_runtime_descriptors(malformed)
         self.assertFalse(result.supported)
         self.assertIn("VXDESC_PORTS", {item.code for item in result.diagnostics})
+
+    def test_runtime_descriptor_gate_closes_reexported_parity_operator_routes(self):
+        def graph(
+            op_type,
+            input_shape,
+            output_shape,
+            *,
+            node_inputs=None,
+            params=None,
+        ):
+            return {
+                "format": "volvox-graph/v1",
+                "dimensions": {},
+                "inputs": {"x": {"shape": input_shape, "dtype": "float32"}},
+                "nodes": [{
+                    "id": op_type.lower(),
+                    "opType": op_type,
+                    "inputs": node_inputs or {"input": "x"},
+                    "outputs": {"out": {
+                        "tensor": "y",
+                        "shape": output_shape,
+                        "dtype": "float32",
+                    }},
+                    "params": params or {},
+                }],
+                "outputs": ["y"],
+            }
+
+        cases = (
+            ("Cos", graph("Cos", [2, 4], [2, 4]), {}),
+            ("PReLU", graph(
+                "PReLU", [2, 4], [2, 4],
+                node_inputs={"input": "x", "slope": "slope"},
+            ), {"slope": np.ones((4,), dtype=np.float32)}),
+            ("Conv1D", graph(
+                "Conv1D", [1, 5, 2], [1, 3, 4],
+                node_inputs={"input": "x", "weight": "w", "bias": "b"},
+                params={"stride": 1, "padding": 0, "groups": 1},
+            ), {
+                "w": np.ones((3, 2, 4), dtype=np.float32),
+                "b": np.zeros((4,), dtype=np.float32),
+            }),
+            ("ConvTranspose2D", graph(
+                "ConvTranspose2D", [1, 2, 3, 2], [1, 3, 5, 4],
+                node_inputs={"input": "x", "weight": "w", "bias": "b"},
+                params={"kernel": [3, 3], "stride": [2, 2], "padding": [1, 1]},
+            ), {
+                "w": np.ones((3, 3, 2, 4), dtype=np.float32),
+                "b": np.zeros((4,), dtype=np.float32),
+            }),
+            ("BatchNorm2D", graph(
+                "BatchNorm2D", [1, 2, 3, 4], [1, 2, 3, 4],
+                node_inputs={
+                    "input": "x", "weight": "weight", "bias": "bias",
+                    "running_mean": "mean", "running_var": "variance",
+                },
+                params={"eps": 1e-5},
+            ), {
+                "weight": np.ones((4,), dtype=np.float32),
+                "bias": np.zeros((4,), dtype=np.float32),
+                "mean": np.zeros((4,), dtype=np.float32),
+                "variance": np.ones((4,), dtype=np.float32),
+            }),
+            ("MeanHeight", graph("MeanHeight", [1, 2, 3, 4], [1, 4, 3]), {}),
+            ("Pad", graph(
+                "Pad", [1, 2], [1, 5],
+                params={"pads": [0, 1, 0, 2], "value": 0.0},
+            ), {}),
+            ("RMSNorm", graph(
+                "RMSNorm", [2, 4], [2, 4],
+                node_inputs={"input": "x", "weight": "weight"},
+                params={"eps": 1e-5, "d_model": 4},
+            ), {"weight": np.ones((4,), dtype=np.float32)}),
+            ("UpsampleNearest2D", graph(
+                "UpsampleNearest2D", [1, 2, 3, 4], [1, 4, 6, 4],
+            ), {}),
+        )
+        for label, document, weights in cases:
+            with self.subTest(operator=label):
+                result = validate_runtime_descriptors(document, weights=weights)
+                self.assertTrue(result.supported, result.diagnostics)
+                self.assertNotIn(
+                    "VXDESC_UNVALIDATED",
+                    {item.code for item in result.diagnostics},
+                )
+
+        malformed = copy.deepcopy(cases[4][1])
+        malformed_weights = dict(cases[4][2])
+        malformed_weights["variance"] = np.ones((3,), dtype=np.float32)
+        self.assertIn(
+            "VXDESC_BATCH_NORM",
+            {item.code for item in validate_runtime_descriptors(
+                malformed, weights=malformed_weights,
+            ).diagnostics},
+        )
 
     def test_quantized_dense_aliases_share_one_descriptor_contract(self):
         for op_type in ("QLinear", "QMatMul", "QGemm"):
@@ -376,7 +522,7 @@ class CapabilityValidationTests(unittest.TestCase):
             "nodes": [{
                 "id": "where",
                 "opType": "Where",
-                "inputs": {"condition": "condition", "x": "x", "y": "y"},
+                "inputs": {"condition": "condition", "a": "x", "b": "y"},
                 "outputs": {"out": "selected"},
                 "outputs_shape": {"out": [2, 3]},
                 "outputs_dtype": {"out": "int32"},
@@ -489,7 +635,7 @@ class CapabilityValidationTests(unittest.TestCase):
         graph = graph_with_node(
             "Linear",
             inputs={"input": "x", "weight": "w", "weight_scale": "s"},
-            params={"weight_layout": "OUT_IN"},
+            params={"weight_layout": "dout_din"},
         )
         weights = {
             "w": SimpleNamespace(shape=(4, 4), dtype="int8"),
@@ -538,7 +684,7 @@ class CapabilityValidationTests(unittest.TestCase):
 
         qargmax = graph_with_node("QArgMax", params={"axis": -1})
         self.assertIn("VXQUANT001", self.diagnostic_codes(qargmax, ["cpu-js"]))
-        qargmax["nodes"][0]["outputs_dtype"] = {"out": "int32"}
+        qargmax["nodes"][0]["outputs"]["out"]["dtype"] = "int32"
         self.assertNotIn("VXQUANT001", self.diagnostic_codes(qargmax, ["cpu-js"]))
 
     def test_malformed_root_contract_is_reported_without_throwing(self):
@@ -546,8 +692,21 @@ class CapabilityValidationTests(unittest.TestCase):
         self.assertFalse(result.supported)
         self.assertEqual(
             {item.code for item in result.diagnostics},
-            {"VXPKG001", "VXPKG002", "VXPKG003", "VXPKG004"},
+            {
+                "VXPKG001", "VXPKG002", "VXPKG003", "VXPKG004",
+                "VXPKG023", "VXPKG024",
+            },
         )
+
+    def test_retired_shape_system_field_is_rejected_as_unknown(self):
+        graph = graph_with_node("Identity")
+        graph["shape_system"] = "volvox-bounded-shape/v1"
+        result = validate_graph(graph, ["cpu-js"])
+        self.assertIn("VXPKG022", {item.code for item in result.diagnostics})
+        self.assertTrue(any(
+            "unsupported field 'shape_system'" in item.message
+            for item in result.diagnostics
+        ))
 
     def test_topology_and_public_outputs_fail_before_publication(self):
         aliased_op = graph_with_node("Identity")
@@ -576,7 +735,7 @@ class CapabilityValidationTests(unittest.TestCase):
         )
 
         collision = graph_with_node("Identity")
-        collision["nodes"][0]["outputs"] = {"out": "x"}
+        collision["nodes"][0]["outputs"]["out"]["tensor"] = "x"
         collision["outputs"] = ["x"]
         self.assertIn(
             "VXPKG014",
@@ -764,9 +923,8 @@ class CapabilityValidationTests(unittest.TestCase):
         })
         self.assertTrue(validate_graph(graph, ["portable"], weights=weights).supported)
 
-        malformed = dict(graph)
-        malformed["nodes"] = [dict(graph["nodes"][0])]
-        malformed["nodes"][0]["outputs_shape"] = {"out": [2, 1, 3, 6]}
+        malformed = copy.deepcopy(graph)
+        malformed["nodes"][0]["outputs"]["out"]["shape"] = [2, 1, 3, 6]
         self.assertIn(
             "VXDESC_QBATCH_MATMUL",
             self.diagnostic_codes(malformed, ["portable"], weights=weights),
@@ -795,9 +953,10 @@ class CapabilityValidationTests(unittest.TestCase):
             },
             "nodes": [{
                 **graph["nodes"][0],
-                "outputs_shape": {
-                    "out": [1, 1, 1, 1, 1, 1, 1, 3, 6],
-                },
+                "outputs": {"out": {
+                    **graph["nodes"][0]["outputs"]["out"],
+                    "shape": [1, 1, 1, 1, 1, 1, 1, 3, 6],
+                }},
             }],
         }
         self.assertIn(
@@ -819,7 +978,10 @@ class CapabilityValidationTests(unittest.TestCase):
             },
             "nodes": [{
                 **graph["nodes"][0],
-                "outputs_shape": {"out": [1, 1, 1]},
+                "outputs": {"out": {
+                    **graph["nodes"][0]["outputs"]["out"],
+                    "shape": [1, 1, 1],
+                }},
             }],
         }
         self.assertIn(
@@ -851,7 +1013,6 @@ class CapabilityValidationTests(unittest.TestCase):
     def test_qconv_validates_exact_byte_layout_bounds_and_multipliers(self):
         graph = {
             "format": "volvox-graph/v1",
-            "source": {"package_class": "w8a8-v1"},
             "inputs": {
                 "x": {
                     "shape": [1, 3, 4, 2],
@@ -1115,7 +1276,7 @@ class CapabilityValidationTests(unittest.TestCase):
         oversized["inputs"]["q"]["shape"] = [65_536, 65_536, 4]
         oversized["inputs"]["k"]["shape"] = [65_536, 65_536, 4]
         oversized["inputs"]["v"]["shape"] = [65_536, 65_536, 4]
-        oversized["nodes"][0]["outputs_shape"]["out"] = [65_536, 65_536, 4]
+        oversized["nodes"][0]["outputs"]["out"]["shape"] = [65_536, 65_536, 4]
         oversized["nodes"][0]["params"]["heads"] = 1
         self.assertIn(
             "VXDESC_QSDPA_BOUND",
@@ -1127,7 +1288,7 @@ class CapabilityValidationTests(unittest.TestCase):
         oversized_mask["inputs"]["k"]["shape"] = [65_536, 256, 4]
         oversized_mask["inputs"]["v"]["shape"] = [65_536, 256, 4]
         oversized_mask["inputs"]["mask"]["shape"] = [65_536, 256, 256]
-        oversized_mask["nodes"][0]["outputs_shape"]["out"] = [65_536, 256, 4]
+        oversized_mask["nodes"][0]["outputs"]["out"]["shape"] = [65_536, 256, 4]
         oversized_mask["nodes"][0]["params"]["heads"] = 1
         self.assertIn(
             "VXDESC_QSDPA_BOUND",
@@ -1220,7 +1381,7 @@ class CapabilityValidationTests(unittest.TestCase):
         rank_nine = copy.deepcopy(layer_graph)
         rank_nine_shape = [1, 1, 1, 1, 1, 1, 1, 1, 8]
         rank_nine["inputs"]["x"]["shape"] = rank_nine_shape
-        rank_nine["nodes"][0]["outputs_shape"]["out"] = rank_nine_shape
+        rank_nine["nodes"][0]["outputs"]["out"]["shape"] = rank_nine_shape
         self.assertIn(
             "VXDESC_QLAYERNORM_GEOMETRY",
             self.diagnostic_codes(
@@ -1231,7 +1392,7 @@ class CapabilityValidationTests(unittest.TestCase):
         oversized = copy.deepcopy(layer_graph)
         oversized_shape = [65_536, 65_536, 8]
         oversized["inputs"]["x"]["shape"] = oversized_shape
-        oversized["nodes"][0]["outputs_shape"]["out"] = oversized_shape
+        oversized["nodes"][0]["outputs"]["out"]["shape"] = oversized_shape
         self.assertIn(
             "VXDESC_QLAYERNORM_BOUND",
             self.diagnostic_codes(
@@ -1239,13 +1400,10 @@ class CapabilityValidationTests(unittest.TestCase):
             ),
         )
 
-    def test_declared_package_class_must_match_live_descriptors(self):
+    def test_package_class_remains_out_of_band(self):
         graph = graph_with_node("Identity")
-        graph["source"] = {"package_class": "w8a8-v1"}
-        self.assertIn(
-            "VXPKG_CLASS",
-            self.diagnostic_codes(graph, ["portable"]),
-        )
+        self.assertEqual(classify_package(graph), "fp32")
+        self.assertNotIn("source", graph)
 
 
 if __name__ == "__main__":

@@ -9,6 +9,7 @@
  * head's arithmetic order remain unchanged.
  */
 #include "quant_cpu_opt.h"
+#include "fast_exp.h"
 #include "w8a8_affine.h"
 #include "cpu_features.h"
 #include "kernel_platform.h"
@@ -127,50 +128,10 @@ typedef struct {
     uint32_t has_tail8;
     uint32_t scalar_begin;
     uint32_t scalar_count;
+    int32_t query_sum;
 } VxQSDPACenteredQuery;
 
-/* The query row is invariant across every key in the row, so centering it once
- * removes one load, one widening convert, and one subtract per key per block
- * from the hot loop.  Values are identical to the per-key spelling. */
-static VX_QSDPA_TARGET_AVX2 void vx_qsdpa_center_query_avx2(
-        VxQSDPACenteredQuery* centered, const unsigned char* q,
-        uint32_t dimensions, uint32_t q_dtype, int32_t q_zero_point) {
-    const __m256i q_zero = _mm256_set1_epi16((int16_t)q_zero_point);
-    uint32_t dimension = 0;
-    centered->block_count = 0;
-    centered->has_tail8 = 0;
-    centered->scalar_count = 0;
-    for (; dimension + 16u <= dimensions; dimension += 16u) {
-        const __m128i q8 = _mm_loadu_si128(
-            (const __m128i*)(const void*)(q + dimension));
-        const __m256i q16 = q_dtype == VX_DTYPE_I8
-            ? _mm256_cvtepi8_epi16(q8) : _mm256_cvtepu8_epi16(q8);
-        centered->blocks[centered->block_count++] =
-            _mm256_sub_epi16(q16, q_zero);
-    }
-    if (dimension + 8u <= dimensions) {
-        const __m128i q8 = _mm_loadl_epi64(
-            (const __m128i*)(const void*)(q + dimension));
-        const __m128i q16 = q_dtype == VX_DTYPE_I8
-            ? _mm_cvtepi8_epi16(q8) : _mm_cvtepu8_epi16(q8);
-        centered->tail8 = _mm_sub_epi16(q16,
-            _mm_set1_epi16((int16_t)q_zero_point));
-        centered->has_tail8 = 1;
-        dimension += 8u;
-    }
-    centered->scalar_begin = dimension;
-    for (; dimension < dimensions; dimension++) {
-        centered->scalar[centered->scalar_count++] =
-            vx_w8a8_byte_value(q, q_dtype, dimension) - q_zero_point;
-    }
-}
-
-/* Integer accumulation is associative and the validator has already proven the
- * worst-case centered magnitude fits I32, so every partial sum is exact and any
- * reduction order yields the same value.  A register reduction avoids the
- * store-to-load forwarding stall the previous spill-and-add sequence paid on
- * every single key. */
-static VX_QSDPA_TARGET_AVX2 int32_t vx_qsdpa_reduce_i32_avx2(__m256i sums) {
+static inline __attribute__((always_inline)) VX_QSDPA_TARGET_AVX2 int32_t vx_qsdpa_reduce_i32_avx2(__m256i sums) {
     __m128i folded = _mm_add_epi32(_mm256_castsi256_si128(sums),
                                    _mm256_extracti128_si256(sums, 1));
     folded = _mm_add_epi32(folded,
@@ -180,10 +141,58 @@ static VX_QSDPA_TARGET_AVX2 int32_t vx_qsdpa_reduce_i32_avx2(__m256i sums) {
     return _mm_cvtsi128_si32(folded);
 }
 
-static VX_QSDPA_TARGET_AVX2 int32_t vx_qsdpa_centered_dot_avx2(
+/* The query row is invariant across every key in the row, so centering it once
+ * removes one load, one widening convert, and one subtract per key per block
+ * from the hot loop.  Values are identical to the per-key spelling. */
+static VX_QSDPA_TARGET_AVX2 void vx_qsdpa_center_query_avx2(
+        VxQSDPACenteredQuery* centered, const unsigned char* q,
+        uint32_t dimensions, uint32_t q_dtype, int32_t q_zero_point) {
+    const __m256i q_zero = _mm256_set1_epi16((int16_t)q_zero_point);
+    const __m256i ones = _mm256_set1_epi16(1);
+    __m256i sums = _mm256_setzero_si256();
+    uint32_t dimension = 0;
+    centered->block_count = 0;
+    centered->has_tail8 = 0;
+    centered->scalar_count = 0;
+    for (; dimension + 16u <= dimensions; dimension += 16u) {
+        const __m128i q8 = _mm_loadu_si128(
+            (const __m128i*)(const void*)(q + dimension));
+        const __m256i q16 = q_dtype == VX_DTYPE_I8
+            ? _mm256_cvtepi8_epi16(q8) : _mm256_cvtepu8_epi16(q8);
+        const __m256i q_centered = _mm256_sub_epi16(q16, q_zero);
+        centered->blocks[centered->block_count++] = q_centered;
+        sums = _mm256_add_epi32(sums, _mm256_madd_epi16(q_centered, ones));
+    }
+    if (dimension + 8u <= dimensions) {
+        const __m128i q8 = _mm_loadl_epi64(
+            (const __m128i*)(const void*)(q + dimension));
+        const __m128i q16 = q_dtype == VX_DTYPE_I8
+            ? _mm_cvtepi8_epi16(q8) : _mm_cvtepu8_epi16(q8);
+        const __m128i q_centered = _mm_sub_epi16(q16,
+            _mm_set1_epi16((int16_t)q_zero_point));
+        centered->tail8 = q_centered;
+        centered->has_tail8 = 1;
+        sums = _mm256_add_epi32(sums, _mm256_inserti128_si256(
+            _mm256_setzero_si256(), _mm_madd_epi16(q_centered, _mm_set1_epi16(1)), 0));
+        dimension += 8u;
+    }
+    centered->scalar_begin = dimension;
+    centered->query_sum = vx_qsdpa_reduce_i32_avx2(sums);
+    for (; dimension < dimensions; dimension++) {
+        const int32_t q_value = vx_w8a8_byte_value(q, q_dtype, dimension) - q_zero_point;
+        centered->scalar[centered->scalar_count++] = q_value;
+        centered->query_sum += q_value;
+    }
+}
+
+/* Integer accumulation is associative and the validator has already proven the
+ * worst-case centered magnitude fits I32, so every partial sum is exact and any
+ * reduction order yields the same value.  A register reduction avoids the
+ * store-to-load forwarding stall the previous spill-and-add sequence paid on
+ * every single key. */
+static inline __attribute__((always_inline)) VX_QSDPA_TARGET_AVX2 int32_t vx_qsdpa_centered_dot_avx2(
         const VxQSDPACenteredQuery* centered, const unsigned char* k,
-        uint32_t k_dtype, int32_t k_zero_point) {
-    const __m256i k_zero = _mm256_set1_epi16((int16_t)k_zero_point);
+        uint32_t k_dtype) {
     __m256i sums = _mm256_setzero_si256();
     int32_t result;
     for (uint32_t block = 0; block < centered->block_count; block++) {
@@ -191,7 +200,6 @@ static VX_QSDPA_TARGET_AVX2 int32_t vx_qsdpa_centered_dot_avx2(
             (const __m128i*)(const void*)(k + block * 16u));
         __m256i k16 = k_dtype == VX_DTYPE_I8
             ? _mm256_cvtepi8_epi16(k8) : _mm256_cvtepu8_epi16(k8);
-        k16 = _mm256_sub_epi16(k16, k_zero);
         sums = _mm256_add_epi32(sums,
             _mm256_madd_epi16(centered->blocks[block], k16));
     }
@@ -200,14 +208,13 @@ static VX_QSDPA_TARGET_AVX2 int32_t vx_qsdpa_centered_dot_avx2(
             (const __m128i*)(const void*)(k + centered->block_count * 16u));
         __m128i k16 = k_dtype == VX_DTYPE_I8
             ? _mm_cvtepi8_epi16(k8) : _mm_cvtepu8_epi16(k8);
-        k16 = _mm_sub_epi16(k16, _mm_set1_epi16((int16_t)k_zero_point));
         sums = _mm256_add_epi32(sums, _mm256_inserti128_si256(
             _mm256_setzero_si256(), _mm_madd_epi16(centered->tail8, k16), 0));
     }
     result = vx_qsdpa_reduce_i32_avx2(sums);
     for (uint32_t index = 0; index < centered->scalar_count; index++) {
         const int32_t k_value = vx_w8a8_byte_value(
-            k, k_dtype, centered->scalar_begin + index) - k_zero_point;
+            k, k_dtype, centered->scalar_begin + index);
         result += centered->scalar[index] * k_value;
     }
     return result;
@@ -247,8 +254,10 @@ static VX_QSDPA_TARGET_AVX2 void vx_qsdpa_row_avx2(
         float sum = 0.0f;
         int have_key = 0;
         VxQSDPACenteredQuery centered_query;
+        int32_t query_sum_k_zp;
         vx_qsdpa_center_query_avx2(&centered_query, q + head_base, head_dim,
                                    context->q_dtype, context->q_zero_point);
+        query_sum_k_zp = centered_query.query_sum * context->k_zero_point;
         for (uint32_t key = 0; key < seq_kv; key++) {
             const size_t kv_base = (size_t)key * context->d_model + head_base;
             float score;
@@ -256,7 +265,8 @@ static VX_QSDPA_TARGET_AVX2 void vx_qsdpa_row_avx2(
             int32_t dot;
             if (mask && vx_qsdpa_mask_value(mask, key) == 0) continue;
             dot = vx_qsdpa_centered_dot_avx2(&centered_query, k + kv_base,
-                context->k_dtype, context->k_zero_point);
+                context->k_dtype);
+            dot -= query_sum_k_zp;
             score = (float)dot * score_scale;
             if (!have_key) {
                 uint32_t dimension = 0;
@@ -282,7 +292,7 @@ static VX_QSDPA_TARGET_AVX2 void vx_qsdpa_row_avx2(
             if (score > maximum_score) {
                 uint32_t dimension = 0;
                 const __m256 weights = _mm256_set1_ps(weight =
-                    expf(maximum_score - score));
+                    accurate_expf(maximum_score - score));
                 sum = sum * weight + 1.0f;
                 for (; dimension + 8u <= head_dim; dimension += 8u) {
                     const __m256 values = vx_qsdpa_centered_v8_f32_avx2(
@@ -306,7 +316,7 @@ static VX_QSDPA_TARGET_AVX2 void vx_qsdpa_row_avx2(
             } else {
                 uint32_t dimension = 0;
                 const __m256 weights = _mm256_set1_ps(weight =
-                    expf(score - maximum_score));
+                    accurate_expf(score - maximum_score));
                 sum += weight;
                 for (; dimension + 8u <= head_dim; dimension += 8u) {
                     const __m256 values = vx_qsdpa_centered_v8_f32_avx2(
@@ -418,6 +428,7 @@ static int vx_qsdpa_i8u8_native_rows_validated(
     uint64_t rows;
     unsigned char* failed;
     const int use_avx2 = VX_QSDPA_X86_AVX2 && vx_kernel_platform()->has_avx2;
+
     int result = 1;
     if (!query_count || query_start >= seq_q || query_count > seq_q - query_start)
         return 0;
@@ -468,6 +479,7 @@ int vx_qsdpa_i8u8_native_validated(const void* q, const void* k, const void* v,
         uint32_t k_dtype, uint32_t v_dtype, uint32_t output_dtype,
         uint32_t causal, uint32_t mask_mode) {
     const int use_avx2 = VX_QSDPA_X86_AVX2 && vx_kernel_platform()->has_avx2;
+
     if (!use_avx2 &&
         !vx_qsdpa_parallel_worthwhile(batch, seq_q, seq_kv, d_model)) {
         return qsdpa_i8u8(q, k, v, mask, output, batch, seq_q, seq_kv,

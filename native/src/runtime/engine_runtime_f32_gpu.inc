@@ -28,12 +28,19 @@ typedef int (*VxCompareI32Fn)(const int32_t*, long, const int32_t*, long,
 typedef int (*VxNotI32Fn)(const int32_t*, int32_t*, long);
 typedef int (*VxClipI32Fn)(const int32_t*, int32_t*, long, int32_t, int32_t);
 typedef int (*VxWhere32Fn)(const int32_t*, const void*, const void*, void*, long);
+typedef int (*VxExpand32Fn)(const void*, void*, const int*, int,
+                            const int*, int);
+typedef int (*VxBatchMatMulF32Fn)(
+    const float*, const int*, int, const float*, const int*, int,
+    float*, const int*, int);
 typedef int (*VxCastTypedFn)(const void*, int, void*, int, long);
 typedef int (*VxCopy32Fn)(const void*, void*, long);
 typedef int (*VxConcat32Fn)(const void* const*, const long*, const int*, int,
                             void*, int, int);
 typedef int (*VxArgMaxF32I32Fn)(const float*, int32_t*, uint32_t, uint32_t,
                                 uint32_t);
+typedef int (*VxLinearF32Fn)(const float*, const float*, const float*, float*,
+                             int, int, int, int);
 #if VOLVOXAI_ENABLE_TRAINING
 typedef int (*VxSdpaTrainingF32Fn)(const float*, const int32_t*, long, float*,
                                    int, int, int, int, int, float, int, int,
@@ -43,6 +50,12 @@ typedef int (*VxCrossSdpaTrainingF32Fn)(const float*, const float*, const float*
                                         int, int, int, int, float, int, int,
                                         uint32_t, uint32_t, uint32_t, float);
 #endif
+
+typedef int (*VxMoERouterF32Fn)(const float*, const float*, const float*,
+                                float*, float*, int, int, int, int, float, int);
+typedef int (*VxMoELinearF32Fn)(const float*, const float*, const float*,
+                                const float*, const float*, float*, int, int,
+                                int, int, int, const uint32_t*, uint32_t);
 
 typedef struct {
     VxBinaryF32Fn binary;
@@ -69,10 +82,15 @@ typedef struct {
     VxNotI32Fn not_i32;
     VxClipI32Fn clip_i32;
     VxWhere32Fn where_32;
+    VxExpand32Fn expand_32;
+    VxBatchMatMulF32Fn batch_matmul_f32;
     VxCastTypedFn cast_typed;
     VxCopy32Fn copy_32;
     VxConcat32Fn concat_32;
     VxArgMaxF32I32Fn argmax_f32_i32;
+    VxLinearF32Fn linear_f32;
+    VxMoELinearF32Fn moe_linear;
+    VxMoERouterF32Fn moe_router;
 } VxF32Ops;
 
 #if VOLVOXAI_ENABLE_VULKAN
@@ -91,8 +109,12 @@ static const VxF32Ops g_vulkan_f32_ops = {
     vk_graph_spatial_softargmax_y_f32, vk_graph_profile_x_f32,
     vk_graph_profile_y_f32, vk_graph_mean_height_f32, vk_graph_nms_f32,
     vk_graph_compare_i32, vk_graph_not_i32, vk_graph_clip_i32,
-    vk_graph_where_32, vk_graph_cast_typed, vk_graph_copy_32,
-    vk_graph_concat_32, vk_graph_argmax_f32
+    vk_graph_where_32, vk_graph_expand_32, vk_graph_batch_matmul_f32,
+    vk_graph_cast_typed, vk_graph_copy_32,
+    vk_graph_concat_32, vk_graph_argmax_f32,
+    vk_graph_linear_f32,
+    vk_graph_moe_linear_f32,
+    vk_graph_moe_router_f32
 };
 #endif
 
@@ -112,8 +134,13 @@ static const VxF32Ops g_opengl_f32_ops = {
     opengl_graph_spatial_softargmax_y_f32, opengl_graph_profile_x_f32,
     opengl_graph_profile_y_f32, opengl_graph_mean_height_f32, opengl_graph_nms_f32,
     opengl_graph_compare_i32, opengl_graph_not_i32, opengl_graph_clip_i32,
-    opengl_graph_where_32, opengl_graph_cast_typed, opengl_graph_copy_32,
-    opengl_graph_concat_32, opengl_graph_argmax_f32
+    opengl_graph_where_32, opengl_graph_expand_32,
+    opengl_graph_batch_matmul_f32,
+    opengl_graph_cast_typed, opengl_graph_copy_32,
+    opengl_graph_concat_32, opengl_graph_argmax_f32,
+    opengl_graph_linear_f32,
+    opengl_graph_moe_linear_f32,
+    opengl_graph_moe_router_f32
 };
 #endif
 
@@ -133,8 +160,13 @@ static const VxF32Ops g_metal_f32_ops = {
     metal_graph_spatial_softargmax_y_f32, metal_graph_profile_x_f32,
     metal_graph_profile_y_f32, metal_graph_mean_height_f32, metal_graph_nms_f32,
     metal_graph_compare_i32, metal_graph_not_i32, metal_graph_clip_i32,
-    metal_graph_where_32, metal_graph_cast_typed, metal_graph_copy_32,
-    metal_graph_concat_32, metal_graph_argmax_f32
+    metal_graph_where_32, metal_graph_expand_32,
+    metal_graph_batch_matmul_f32,
+    metal_graph_cast_typed, metal_graph_copy_32,
+    metal_graph_concat_32, metal_graph_argmax_f32,
+    metal_graph_linear_f32,
+    metal_graph_moe_linear_f32,
+    metal_graph_moe_router_f32
 };
 #endif
 
@@ -164,10 +196,13 @@ static const VxF32Ops g_cuda_f32_ops = {
     .not_i32 = cuda_graph_not_i32,
     .clip_i32 = cuda_graph_clip_i32,
     .where_32 = cuda_graph_where_32,
+    .expand_32 = cuda_graph_expand_32,
+    .batch_matmul_f32 = cuda_graph_batch_matmul_f32,
     .cast_typed = cuda_graph_cast_typed,
     .copy_32 = cuda_graph_copy_32,
     .concat_32 = cuda_graph_concat_32,
     .argmax_f32_i32 = NULL,
+    .linear_f32 = NULL,
 };
 #endif
 
@@ -372,6 +407,15 @@ static int try_gpu_graph_typed_control(Node* node, T* input, T* output,
             ops->where_32((const int32_t*)condition->data, a->data, b->data,
                           output->data, output->numel);
     }
+    if (!strcmp(op, "Expand")) {
+        T* source = input ? input : node_input_default(node);
+        return ops->expand_32 && source && source->dtype == T_I32 &&
+            output->dtype == T_I32 && tensor_plain_32(source) &&
+            tensor_plain_32(output) &&
+            ops->expand_32(
+                source->data, output->data, source->shape, source->ndim,
+                output->shape, output->ndim);
+    }
     if (!strcmp(op, "Cast")) {
         T* source = input ? input : node_input_default(node);
         cJSON* target = node->params
@@ -399,6 +443,63 @@ static int try_gpu_graph_typed_control(Node* node, T* input, T* output,
     if (!strcmp(op, "ArgMax"))
         return try_gpu_graph_argmax_f32_i32(node, output, ops);
     return 0;
+}
+
+static int try_gpu_graph_batch_matmul_f32(
+        Node* node, T* output, const VxF32Ops* ops) {
+    T* a;
+    T* b;
+    if (!node || !output || !ops || !ops->batch_matmul_f32 ||
+        strcmp(node->op, "BatchMatMul"))
+        return 0;
+    a = nin(node, "a");
+    b = nin(node, "b");
+    if (!a || !b || a->dtype != T_F32 || b->dtype != T_F32 ||
+        output->dtype != T_F32)
+        return 0;
+    materialize_tensor_f32(a);
+    materialize_tensor_f32(b);
+    return ops->batch_matmul_f32(
+        a->data, a->shape, a->ndim,
+        b->data, b->shape, b->ndim,
+        output->data, output->shape, output->ndim);
+}
+
+static int try_gpu_graph_linear_f32(
+        Node* node, T* input, T* output, const VxF32Ops* ops) {
+    T* weight;
+    T* bias;
+    long rows;
+    int d_in;
+    int d_out;
+    int output_major_weight = 0;
+    if (!node || !input || !output || !ops || !ops->linear_f32 ||
+        (strcmp(node->op, "MatMul") && strcmp(node->op, "Gemm") &&
+         strcmp(node->op, "Linear")) || input->dtype != T_F32 ||
+        output->dtype != T_F32 || input->ndim <= 0 || output->ndim <= 0)
+        return 0;
+    weight = nin(node, "weight");
+    bias = nin(node, "bias");
+    if (!weight || weight->dtype != T_F32 || weight->ndim != 2 ||
+        (bias && bias->dtype != T_F32))
+        return 0;
+    d_in = input->shape[input->ndim - 1];
+    d_out = output->shape[output->ndim - 1];
+    if (d_in <= 0 || d_out <= 0 || input->numel <= 0 ||
+        output->numel <= 0 || input->numel % d_in ||
+        output->numel % d_out)
+        return 0;
+    rows = input->numel / d_in;
+    if (rows <= 0 || rows > INT_MAX || output->numel / d_out != rows ||
+        d_in > LONG_MAX / d_out ||
+        weight->numel != (long)d_in * d_out ||
+        (bias && bias->numel != d_out) ||
+        linear_node_weight_layout(
+            node, input, output, weight, &output_major_weight) != 0)
+        return 0;
+    return ops->linear_f32(
+        input->data, weight->data, bias ? bias->data : NULL, output->data,
+        (int)rows, d_in, d_out, output_major_weight);
 }
 
 static int gather_i32_dimensions(const T* data, const T* indices,
@@ -474,24 +575,26 @@ static int try_gpu_graph_conv1d(Node* n, T* in, T* o, const VxF32Ops* ops) {
     materialize_tensor_f32(w);
     if (b) materialize_tensor_f32(b);
     if (x->dtype != T_F32 || w->dtype != T_F32 || (b && b->dtype != T_F32)) return 0;
-    int in_c = x->ndim == 3 ? x->shape[1] : x->shape[0];
-    int in_l = x->ndim == 3 ? x->shape[2] : x->shape[1];
-    int out_c = o->ndim == 3 ? o->shape[1] : o->shape[0];
-    int out_l = o->ndim == 3 ? o->shape[2] : o->shape[1];
+    /* NLC activations [batch, l, c]; WIO weights [k, in_c, out_c]. */
+    int in_l = x->ndim == 3 ? x->shape[1] : x->shape[0];
+    int in_c = x->ndim == 3 ? x->shape[2] : x->shape[1];
+    int out_l = o->ndim == 3 ? o->shape[1] : o->shape[0];
+    int out_c = o->ndim == 3 ? o->shape[2] : o->shape[1];
     int batch = x->ndim == 3 ? x->shape[0] : 1;
     int output_batch = o->ndim == 3 ? o->shape[0] : 1;
+    int kernel = w->shape[0];
     if (batch <= 0 || batch != output_batch || in_c <= 0 || in_l <= 0 || out_c <= 0 || out_l <= 0 ||
         x->numel != (long)batch * in_c * in_l || o->numel != (long)batch * out_c * out_l ||
-        w->shape[0] != out_c || w->shape[1] != in_c || (b && b->numel < out_c)) return 0;
+        w->shape[1] != in_c || w->shape[2] != out_c || (b && b->numel < out_c)) return 0;
     int sy, sx, py, px;
     p_pair(n->params, "stride", 1, &sy, &sx);
     p_pair(n->params, "padding", 0, &py, &px);
     int relu = p_int(n->params, "relu", 0) ? 1 : 0;
     long padded_l = (long)in_l + 2L * py;
-    if (sy <= 0 || py < 0 || w->shape[2] <= 0 || padded_l < w->shape[2] ||
-        (padded_l - w->shape[2]) / sy + 1 != out_l) return 0;
+    if (sy <= 0 || py < 0 || kernel <= 0 || padded_l < kernel ||
+        (padded_l - kernel) / sy + 1 != out_l) return 0;
     return ops && ops->conv1d && ops->conv1d(x->data, w->data, b ? b->data : NULL, o->data,
-                                              batch, in_c, in_l, out_c, out_l, w->shape[2], sy, py, relu);
+                                              batch, in_c, in_l, out_c, out_l, kernel, sy, py, relu);
 }
 
 static int try_gpu_graph_embedding(Node* n, T* in, T* o, const VxF32Ops* ops) {
@@ -506,11 +609,98 @@ static int try_gpu_graph_embedding(Node* n, T* in, T* o, const VxF32Ops* ops) {
         ? (int)(weight->numel / d_model) : 0;
     if (d_model <= 0 || vocab <= 0 || o->numel != tokens->numel * (long)d_model) return 0;
     const int32_t* ids = (const int32_t*)tokens->data;
-    for (long token = 0; token < tokens->numel; token++) {
-        if (ids[token] < 0 || ids[token] >= vocab) return 0;
-    }
+    if (!g_bounded_gpu_value_domain_proven)
+        for (long token = 0; token < tokens->numel; token++) {
+            int32_t id;
+            memcpy(&id,
+                   (const unsigned char*)tokens->data +
+                       (size_t)token * sizeof(id),
+                   sizeof(id));
+            if (id < 0 || id >= vocab) return 0;
+        }
     return ops && ops->embedding && ops->embedding(ids, weight->data, o->data,
                                                     (int)tokens->numel, d_model, vocab);
+}
+
+/* Shared MoERouter validation for the device routes. The router weight is
+ * [d_model, experts], so no slot table is involved. */
+static int try_gpu_graph_moe_router(Node* n, T* o, const VxF32Ops* ops) {
+    T* in = nin(n, "input");
+    T* weight = nin(n, "weight");
+    T* bias = nin(n, "bias");
+    T* indices = nout(n, "indices");
+    T* routes = nout(n, "weights");
+    if (!in) in = nin(n, "x");
+    if (!weight) weight = nin(n, "router_weight");
+    if (!indices) indices = nout(n, "route_indices");
+    if (!routes) routes = nout(n, "route_weights");
+    (void)o;
+    if (!in || !weight || !indices || !routes) return 0;
+    if (in->dtype != T_F32 || weight->dtype != T_F32 ||
+        indices->dtype != T_F32 || routes->dtype != T_F32 ||
+        (bias && bias->dtype != T_F32)) return 0;
+    if (in->ndim <= 0 || weight->ndim != 2 || indices->ndim <= 0) return 0;
+    materialize_tensor_f32(in);
+    materialize_tensor_f32(weight);
+    if (bias) materialize_tensor_f32(bias);
+    int d_model = in->shape[in->ndim - 1];
+    int experts = p_int(n->params, "num_experts", weight->shape[1]);
+    if (d_model <= 0 || experts <= 0 || weight->shape[0] != d_model ||
+        weight->shape[1] != experts || (bias && bias->numel != experts)) return 0;
+    long rows = in->numel / d_model;
+    if (rows <= 0 || rows > INT_MAX || indices->numel != routes->numel ||
+        indices->numel % rows) return 0;
+    long top_k = indices->numel / rows;
+    if (top_k <= 0 || top_k > experts || top_k > 8 ||
+        top_k != p_int(n->params, "top_k", (int)top_k)) return 0;
+    float temperature = p_flt(n->params, "temperature", 1.0f);
+    int normalize = p_int(n->params, "normalize", 1) ? 1 : 0;
+    if (!(temperature > 0.0f)) return 0;
+    return ops && ops->moe_router && ops->moe_router(
+        in->data, weight->data, bias ? bias->data : NULL, indices->data,
+        routes->data, (int)rows, d_model, experts, (int)top_k, temperature,
+        normalize);
+}
+
+/* Shared MoELinear validation for the device routes. Mirrors the portable
+ * kernel's contract, including the resident-slot table a partially resident
+ * bank carries on the node. */
+static int try_gpu_graph_moe_linear(Node* n, T* o, const VxF32Ops* ops) {
+    T* in = nin(n, "input");
+    T* ew = nin(n, "expert_weight");
+    T* eb = nin(n, "expert_bias");
+    T* indices = nin(n, "route_indices");
+    T* weights = nin(n, "route_weights");
+    if (!in) in = nin(n, "x");
+    if (!ew) ew = nin(n, "weight");
+    if (!eb) eb = nin(n, "bias");
+    if (!indices) indices = nin(n, "indices");
+    if (!weights) weights = nin(n, "weights");
+    if (!in || !ew || !indices || !weights || !o) return 0;
+    if (in->dtype != T_F32 || ew->dtype != T_F32 || indices->dtype != T_F32 ||
+        weights->dtype != T_F32 || o->dtype != T_F32 ||
+        (eb && eb->dtype != T_F32)) return 0;
+    if (in->ndim <= 0 || ew->ndim != 3 || o->ndim <= 0) return 0;
+    materialize_tensor_f32(in);
+    materialize_tensor_f32(ew);
+    materialize_tensor_f32(indices);
+    materialize_tensor_f32(weights);
+    if (eb) materialize_tensor_f32(eb);
+    int experts = ew->shape[0];
+    int d_in = ew->shape[1];
+    int d_out = ew->shape[2];
+    if (experts <= 0 || d_in <= 0 || d_out <= 0 ||
+        in->shape[in->ndim - 1] != d_in || o->shape[o->ndim - 1] != d_out ||
+        (eb && eb->numel != (long)experts * d_out)) return 0;
+    long tokens = in->numel / d_in;
+    if (tokens <= 0 || tokens > INT_MAX || o->numel != tokens * d_out ||
+        indices->numel != weights->numel || indices->numel % tokens) return 0;
+    long top_k = indices->numel / tokens;
+    if (top_k <= 0 || top_k > INT_MAX) return 0;
+    return ops && ops->moe_linear && ops->moe_linear(
+        in->data, ew->data, eb ? eb->data : NULL, indices->data, weights->data,
+        o->data, (int)tokens, d_in, d_out, experts, (int)top_k,
+        n->resident_slot_rows, n->resident_slot_domain);
 }
 
 static int try_gpu_graph_sdpa(Node* n, T* in, T* o, const VxF32Ops* ops) {
@@ -757,6 +947,11 @@ static int try_gpu_graph_nms(Node* n, T* o, const VxF32Ops* ops) {
                                        max_output, output_rows, iou, score);
 }
 
+/* Vulkan/OpenGL/Metal domain slots are keyed by complete host-span bases.
+ * Incremental row and prefix execution deliberately crosses the established
+ * hybrid host boundary instead of presenting an interior pointer as a new
+ * graph allocation. In particular, Linear is full-span here; only CUDA has a
+ * proved resident subspan route. */
 #if VOLVOXAI_ENABLE_VULKAN
 static int try_vulkan_graph_node(Node* n, int idx, const char** node_backend) {
     if (!n || g_active_row >= 0 || g_prefix_rows > 0) return 0;
@@ -766,6 +961,14 @@ static int try_vulkan_graph_node(Node* n, int idx, const char** node_backend) {
     const char* op = n->op;
     if (!o) return 0;
     if (try_gpu_graph_typed_control(n, in, o, &g_vulkan_f32_ops)) {
+        *node_backend = "vulkan-graph";
+        return 1;
+    }
+    if (try_gpu_graph_batch_matmul_f32(n, o, &g_vulkan_f32_ops)) {
+        *node_backend = "vulkan-graph";
+        return 1;
+    }
+    if (try_gpu_graph_linear_f32(n, in, o, &g_vulkan_f32_ops)) {
         *node_backend = "vulkan-graph";
         return 1;
     }
@@ -1018,7 +1221,8 @@ static int try_vulkan_graph_node(Node* n, int idx, const char** node_backend) {
         if (!in || in->ndim != 4 || o->ndim != 4) return 0;
         materialize_tensor_f32(in);
         int ky, kx, sy, sx, py, px;
-        p_pair(p, "kernel", 1, &ky, &kx); p_pair(p, "stride", 1, &sy, &sx); p_pair(p, "padding", 0, &py, &px);
+        p_pair(p, "kernel", 1, &ky, &kx); p_pair(p, "stride", 1, &sy, &sx);
+        p_spatial_pad_origin(p, &py, &px);
         if (in->dtype == T_F32 &&
             vk_graph_average_pool2d_f32(in->data, o->data, in->shape[0], in->shape[1], in->shape[2], in->shape[3],
                                         o->shape[1], o->shape[2], ky, kx, sy, sx, py, px)) {
@@ -1056,7 +1260,7 @@ static int try_vulkan_graph_node(Node* n, int idx, const char** node_backend) {
         int ky, kx, sy, sx, py, px;
         p_pair(p, "kernel", 1, &ky, &kx);
         p_pair(p, "stride", 1, &sy, &sx);
-        p_pair(p, "padding", 0, &py, &px);
+        p_spatial_pad_origin(p, &py, &px);
         if (vk_graph_maxpool2d_f32(in->data, o->data, in->shape[0], in->shape[1], in->shape[2], in->shape[3],
                                    o->shape[1], o->shape[2], ky, kx, sy, sx, py, px)) {
             *node_backend = "vulkan-graph";
@@ -1191,6 +1395,22 @@ static int try_vulkan_graph_node(Node* n, int idx, const char** node_backend) {
             vk_graph_conv_transpose2d_f32(in->data, w->data, b ? b->data : NULL, o->data,
                 in->shape[0], in->shape[1], in->shape[2], in->shape[3],
                 o->shape[1], o->shape[2], o->shape[3], ky, kx, sy, sx, py, px)) {
+            *node_backend = "vulkan-graph";
+            return 1;
+        }
+        return 0;
+    }
+
+    if (!strcmp(op, "MoERouter")) {
+        if (try_gpu_graph_moe_router(n, o, &g_vulkan_f32_ops)) {
+            *node_backend = "vulkan-graph";
+            return 1;
+        }
+        return 0;
+    }
+
+    if (!strcmp(op, "MoELinear")) {
+        if (try_gpu_graph_moe_linear(n, o, &g_vulkan_f32_ops)) {
             *node_backend = "vulkan-graph";
             return 1;
         }
@@ -1336,6 +1556,14 @@ static int try_opengl_graph_node(Node* n, int idx, const char** node_backend) {
     const char* op = n->op;
     if (!o) return 0;
     if (try_gpu_graph_typed_control(n, in, o, &g_opengl_f32_ops)) {
+        *node_backend = "opengl-graph";
+        return 1;
+    }
+    if (try_gpu_graph_batch_matmul_f32(n, o, &g_opengl_f32_ops)) {
+        *node_backend = "opengl-graph";
+        return 1;
+    }
+    if (try_gpu_graph_linear_f32(n, in, o, &g_opengl_f32_ops)) {
         *node_backend = "opengl-graph";
         return 1;
     }
@@ -1603,7 +1831,8 @@ static int try_opengl_graph_node(Node* n, int idx, const char** node_backend) {
         if (!in || in->ndim != 4 || o->ndim != 4) return 0;
         materialize_tensor_f32(in);
         int ky, kx, sy, sx, py, px;
-        p_pair(p, "kernel", 1, &ky, &kx); p_pair(p, "stride", 1, &sy, &sx); p_pair(p, "padding", 0, &py, &px);
+        p_pair(p, "kernel", 1, &ky, &kx); p_pair(p, "stride", 1, &sy, &sx);
+        p_spatial_pad_origin(p, &py, &px);
         if (in->dtype == T_F32 &&
             opengl_graph_average_pool2d_f32(in->data, o->data, in->shape[0], in->shape[1], in->shape[2], in->shape[3],
                                             o->shape[1], o->shape[2], ky, kx, sy, sx, py, px)) {
@@ -1641,7 +1870,7 @@ static int try_opengl_graph_node(Node* n, int idx, const char** node_backend) {
         int ky, kx, sy, sx, py, px;
         p_pair(p, "kernel", 1, &ky, &kx);
         p_pair(p, "stride", 1, &sy, &sx);
-        p_pair(p, "padding", 0, &py, &px);
+        p_spatial_pad_origin(p, &py, &px);
         if (opengl_graph_maxpool2d_f32(in->data, o->data, in->shape[0], in->shape[1], in->shape[2], in->shape[3],
                                        o->shape[1], o->shape[2], ky, kx, sy, sx, py, px)) {
             *node_backend = "opengl-graph";
@@ -1777,6 +2006,22 @@ static int try_opengl_graph_node(Node* n, int idx, const char** node_backend) {
             opengl_graph_conv_transpose2d_f32(in->data, w->data, b ? b->data : NULL, o->data,
                 in->shape[0], in->shape[1], in->shape[2], in->shape[3],
                 o->shape[1], o->shape[2], o->shape[3], ky, kx, sy, sx, py, px)) {
+            *node_backend = "opengl-graph";
+            return 1;
+        }
+        return 0;
+    }
+
+    if (!strcmp(op, "MoERouter")) {
+        if (try_gpu_graph_moe_router(n, o, &g_opengl_f32_ops)) {
+            *node_backend = "opengl-graph";
+            return 1;
+        }
+        return 0;
+    }
+
+    if (!strcmp(op, "MoELinear")) {
+        if (try_gpu_graph_moe_linear(n, o, &g_opengl_f32_ops)) {
             *node_backend = "opengl-graph";
             return 1;
         }
@@ -1927,6 +2172,14 @@ static int try_metal_graph_node(Node* n, int idx, const char** node_backend) {
         *node_backend = "metal-graph";
         return 1;
     }
+    if (try_gpu_graph_batch_matmul_f32(n, o, &g_metal_f32_ops)) {
+        *node_backend = "metal-graph";
+        return 1;
+    }
+    if (try_gpu_graph_linear_f32(n, in, o, &g_metal_f32_ops)) {
+        *node_backend = "metal-graph";
+        return 1;
+    }
     if (o->dtype != T_F32) return 0;
 
     if (!strcmp(op, "Conv2D")) {
@@ -1955,27 +2208,6 @@ static int try_metal_graph_node(Node* n, int idx, const char** node_backend) {
                                    prepared_weight->shape[0], prepared_weight->shape[1],
                                    o->shape[1], o->shape[2], sy, sx, pads[0], pads[1],
                                    groups, relu, dy, dx)) {
-            *node_backend = "metal-graph";
-            return 1;
-        }
-        return 0;
-    }
-
-    if (!strcmp(op, "MatMul") || !strcmp(op, "Gemm") || !strcmp(op, "Linear")) {
-        T* weight = nin(n, "weight");
-        T* bias = nin(n, "bias");
-        if (!in || !weight || in->dtype != T_F32 || weight->dtype != T_F32 ||
-            in->ndim <= 0 || o->ndim <= 0 || (bias && bias->dtype != T_F32)) return 0;
-        int d_in = in->shape[in->ndim - 1];
-        int d_out = o->shape[o->ndim - 1];
-        long rows = d_out > 0 ? o->numel / d_out : 0;
-        int out_in = 0;
-        if (d_in <= 0 || d_out <= 0 || rows <= 0 || rows > INT32_MAX ||
-            in->numel != rows * d_in || weight->numel != (long)d_in * d_out ||
-            (bias && bias->numel != d_out) ||
-            linear_node_weight_layout(n, in, o, weight, &out_in) != 0) return 0;
-        if (metal_graph_linear_f32(in->data, weight->data, bias ? bias->data : NULL,
-                                   o->data, (int)rows, d_in, d_out, out_in)) {
             *node_backend = "metal-graph";
             return 1;
         }
@@ -2306,6 +2538,22 @@ static int try_metal_graph_node(Node* n, int idx, const char** node_backend) {
 
     if (!strcmp(op, "Embedding")) {
         if (try_gpu_graph_embedding(n, in, o, &g_metal_f32_ops)) {
+            *node_backend = "metal-graph";
+            return 1;
+        }
+        return 0;
+    }
+
+    if (!strcmp(op, "MoERouter")) {
+        if (try_gpu_graph_moe_router(n, o, &g_metal_f32_ops)) {
+            *node_backend = "metal-graph";
+            return 1;
+        }
+        return 0;
+    }
+
+    if (!strcmp(op, "MoELinear")) {
+        if (try_gpu_graph_moe_linear(n, o, &g_metal_f32_ops)) {
             *node_backend = "metal-graph";
             return 1;
         }

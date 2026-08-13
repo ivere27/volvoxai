@@ -33,6 +33,9 @@
 typedef struct Binding {
     char name[128];
     char path[PATH_MAX];
+    int64_t shape[VX_MAX_TENSOR_RANK];
+    uint32_t rank;
+    int has_shape;
 } Binding;
 
 typedef struct ModelPaths {
@@ -124,6 +127,7 @@ static int resolve_model_paths(const char* model, ModelPaths* paths) {
 static int parse_binding(const char* argument, Binding* binding,
                          int require_name) {
     const char* equals;
+    const char* shape_open = NULL;
     size_t name_length;
     if (!argument || !binding) return -1;
     memset(binding, 0, sizeof(*binding));
@@ -134,6 +138,32 @@ static int parse_binding(const char* argument, Binding* binding,
         return binding->path[0] ? 0 : -1;
     }
     name_length = (size_t)(equals - argument);
+    if (name_length && argument[name_length - 1u] == ']') {
+        const char* cursor;
+        const char* shape_end = equals - 1;
+        for (cursor = shape_end; cursor > argument; cursor--)
+            if (cursor[-1] == '[') {
+                shape_open = cursor - 1;
+                break;
+            }
+        if (!shape_open || shape_open == argument) return -1;
+        cursor = shape_open + 1;
+        while (cursor < shape_end) {
+            char* parsed_end = NULL;
+            long long extent;
+            if (binding->rank == VX_MAX_TENSOR_RANK) return -1;
+            errno = 0;
+            extent = strtoll(cursor, &parsed_end, 10);
+            if (errno == ERANGE || !parsed_end || parsed_end == cursor ||
+                extent <= 0 || extent > INT64_MAX || parsed_end > shape_end ||
+                (parsed_end < shape_end && *parsed_end != ',')) return -1;
+            binding->shape[binding->rank++] = (int64_t)extent;
+            cursor = parsed_end < shape_end ? parsed_end + 1 : parsed_end;
+        }
+        if (!binding->rank) return -1;
+        binding->has_shape = 1;
+        name_length = (size_t)(shape_open - argument);
+    }
     if (!name_length || name_length >= sizeof(binding->name) || !equals[1]) return -1;
     memcpy(binding->name, argument, name_length);
     binding->name[name_length] = 0;
@@ -215,7 +245,9 @@ static int parse_run_option(int argc, char** argv, int* index,
     if (!strcmp(argument, "--input")) {
         if (*index + 1 >= argc || options->input_count == MAX_BINDINGS ||
             parse_binding(argv[++(*index)], &options->inputs[options->input_count], 1) != 0) {
-            fprintf(stderr, "--input expects name=file.\n");
+            fprintf(stderr,
+                    "--input expects name=file for a fixed input or "
+                    "name[d0,d1,...]=file for a dynamic input.\n");
             return -1;
         }
         options->input_count++;
@@ -316,13 +348,14 @@ static int read_exact_file(const char* path, size_t expected, void** data) {
 }
 
 static int find_input(VxExecutionContext* context, const char* name,
-                      VxTensorInfo* found, VxReport* report) {
+                      VxTensorSpec* found, VxReport* report) {
     size_t count = vx_execution_context_input_count(context);
     for (size_t index = 0; index < count; index++) {
-        VxTensorInfo info = VX_TENSOR_INFO_INIT;
-        if (vx_execution_context_input_info(context, index, &info, report) == VX_STATUS_OK &&
-            info.name && !strcmp(info.name, name)) {
-            *found = info;
+        VxTensorSpec spec = VX_TENSOR_SPEC_INIT;
+        if (vx_execution_context_input_spec(context, index, &spec, report) ==
+                VX_STATUS_OK &&
+            spec.name && !strcmp(spec.name, name)) {
+            *found = spec;
             return 0;
         }
     }
@@ -330,34 +363,78 @@ static int find_input(VxExecutionContext* context, const char* name,
     return -1;
 }
 
-static int set_input_binding(VxExecutionContext* context, const Binding* binding,
-                             VxReport* report) {
-    VxTensorInfo info = VX_TENSOR_INFO_INIT;
+static size_t dtype_byte_size(VxDataType dtype) {
+    switch (dtype) {
+        case VX_DTYPE_I8:
+        case VX_DTYPE_U8: return 1u;
+        case VX_DTYPE_F32:
+        case VX_DTYPE_I32: return 4u;
+        default: return 0u;
+    }
+}
+
+static int prepare_input_binding(VxExecutionContext* context,
+                                 const Binding* binding,
+                                 VxTensorBinding* prepared,
+                                 void** storage,
+                                 VxReport* report) {
+    VxTensorSpec spec = VX_TENSOR_SPEC_INIT;
     const char* suffix;
     void* bytes = NULL;
-    VxStatus status;
-    if (find_input(context, binding->name, &info, report) != 0) return -1;
-    suffix = dtype_suffix(info.dtype);
+    size_t byte_size;
+    size_t element_size;
+    if (!prepared || !storage ||
+        find_input(context, binding->name, &spec, report) != 0) return -1;
+    if (binding->has_shape && binding->rank != spec.rank) {
+        fprintf(stderr, "Input %s expects rank %u, got rank %u.\n",
+                binding->name, spec.rank, binding->rank);
+        return -1;
+    }
+    *prepared = (VxTensorBinding)VX_TENSOR_BINDING_INIT;
+    prepared->name = binding->name;
+    prepared->dtype = spec.dtype;
+    prepared->rank = spec.rank;
+    byte_size = element_size = dtype_byte_size(spec.dtype);
+    if (!element_size) return -1;
+    for (uint32_t axis = 0; axis < spec.rank; axis++) {
+        int64_t extent;
+        if (binding->has_shape) {
+            extent = binding->shape[axis];
+        } else {
+            if (spec.dimensions[axis].kind != VX_DIMENSION_FIXED) {
+                fprintf(stderr,
+                        "Dynamic input %s requires an explicit shape: "
+                        "--input %s[d0,d1,...]=%s\n",
+                        binding->name, binding->name, binding->path);
+                return -1;
+            }
+            extent = spec.dimensions[axis].min;
+        }
+        if (extent <= 0 || (uint64_t)extent > SIZE_MAX / byte_size) {
+            fprintf(stderr, "Input %s shape is too large.\n", binding->name);
+            return -1;
+        }
+        prepared->shape[axis] = extent;
+        byte_size *= (size_t)extent;
+    }
+    suffix = dtype_suffix(spec.dtype);
     if (!suffix || !has_suffix(binding->path, suffix)) {
         fprintf(stderr, "Input %s has dtype %s and requires a %s file: %s\n",
-                binding->name, dtype_name(info.dtype), suffix ? suffix : "supported raw",
+                binding->name, dtype_name(spec.dtype), suffix ? suffix : "supported raw",
                 binding->path);
         return -1;
     }
-    if (read_exact_file(binding->path, info.byte_size, &bytes) != 0) {
+    if (read_exact_file(binding->path, byte_size, &bytes) != 0) {
         if (file_exists(binding->path)) {
             fprintf(stderr, "Input %s expects %zu raw bytes.\n",
-                    binding->name, info.byte_size);
+                    binding->name, byte_size);
         }
         return -1;
     }
-    status = vx_execution_context_set_input(context, binding->name, info.dtype,
-                                            bytes, info.byte_size, report);
-    free(bytes);
-    if (status != VX_STATUS_OK) {
-        print_failure("Setting input", status, report);
-        return -1;
-    }
+    prepared->data = bytes;
+    prepared->byte_size = byte_size;
+    prepared->location = VX_MEMORY_HOST;
+    *storage = bytes;
     return 0;
 }
 
@@ -451,6 +528,23 @@ static const char* runtime_dtype_name(VxDataType dtype) {
     }
 }
 
+static const char* runtime_stage_name(VxStage stage) {
+    switch (stage) {
+        case VX_STAGE_NONE: return "none";
+        case VX_STAGE_RUNTIME_CREATE: return "runtime-create";
+        case VX_STAGE_MODEL_LOAD: return "model-load";
+        case VX_STAGE_COMPILE: return "compile";
+        case VX_STAGE_CONTEXT_CREATE: return "context-create";
+        case VX_STAGE_INPUT: return "input";
+        case VX_STAGE_EXECUTE: return "execute";
+        case VX_STAGE_READBACK: return "readback";
+        case VX_STAGE_CLOSE: return "close";
+        case VX_STAGE_DECODE: return "decode";
+        case VX_STAGE_ADAPTER: return "adapter";
+        default: return "unknown";
+    }
+}
+
 static int json_add_uint64_string(cJSON* object, const char* key,
                                   uint64_t value) {
     char text[32];
@@ -467,6 +561,18 @@ static int json_add_identity(cJSON* object, const char* key,
                            (unsigned long long)identity);
     if (written < 0 || (size_t)written >= sizeof(text)) return -1;
     return cJSON_AddStringToObject(object, key, text) ? 0 : -1;
+}
+
+static int json_add_optional_uint64_string(cJSON* object, const char* key,
+                                           uint64_t value) {
+    if (!value) return cJSON_AddNullToObject(object, key) ? 0 : -1;
+    return json_add_uint64_string(object, key, value);
+}
+
+static int json_add_optional_identity(cJSON* object, const char* key,
+                                      const char* kind, uint64_t identity) {
+    if (!identity) return cJSON_AddNullToObject(object, key) ? 0 : -1;
+    return json_add_identity(object, key, kind, identity);
 }
 
 static int json_add_adapter_identity(cJSON* object, const char* key,
@@ -851,6 +957,137 @@ fail:
     return NULL;
 }
 
+/* `--report-json` also carries typed public-runtime/API failures when a
+ * VxReport is available. A strict physical backend probe can therefore
+ * distinguish a proved compile rejection from missing-device or execution
+ * infrastructure without scraping human text. CLI parsing, path resolution,
+ * local binding validation, and output-file failures are not VxReport events.
+ * Keep this schema separate from successful lifecycle evidence: a failed API
+ * operation has no stable result and must never look like partial success. */
+static cJSON* runtime_failure_evidence_json(const VxReport* report,
+                                            const char* requested_backend,
+                                            const VxModelSource* source) {
+    cJSON* root = cJSON_CreateObject();
+    cJSON* request = cJSON_CreateObject();
+    cJSON* policy = cJSON_CreateObject();
+    cJSON* source_json = cJSON_CreateObject();
+    cJSON* weight_paths = cJSON_CreateArray();
+    cJSON* reported = cJSON_CreateObject();
+    cJSON* device = NULL;
+    cJSON* lineage = cJSON_CreateObject();
+    if (!report || report->status == VX_STATUS_OK ||
+        !source || !source->graph_path || !source->graph_path[0] ||
+        !root || !request || !policy || !source_json || !weight_paths ||
+        !reported || !lineage ||
+        !cJSON_AddStringToObject(
+            root, "schema", "volvoxai.runtime-failure-evidence") ||
+        !cJSON_AddNumberToObject(root, "version", 1) ||
+        !cJSON_AddStringToObject(root, "outcome", "failure") ||
+        !cJSON_AddStringToObject(root, "status",
+                                 vx_status_string(report->status)) ||
+        !cJSON_AddStringToObject(root, "stage",
+                                 runtime_stage_name(report->stage)))
+        goto fail;
+    if (requested_backend) {
+        if (!cJSON_AddStringToObject(request, "backend", requested_backend) ||
+            !cJSON_AddStringToObject(policy, "mode", "require") ||
+            !cJSON_AddStringToObject(policy, "operatorFallback", "forbid"))
+            goto fail;
+    } else if (!cJSON_AddNullToObject(request, "backend") ||
+               !cJSON_AddStringToObject(policy, "mode", "prefer") ||
+               !cJSON_AddStringToObject(policy, "operatorFallback", "allow")) {
+        goto fail;
+    }
+    if (!cJSON_AddItemToObject(request, "policy", policy)) goto fail;
+    policy = NULL;
+    if (!cJSON_AddItemToObject(root, "request", request)) goto fail;
+    request = NULL;
+
+    if (!cJSON_AddStringToObject(source_json, "graphPath",
+                                 source->graph_path))
+        goto fail;
+    for (size_t index = 0; index < source->weight_path_count; index++) {
+        cJSON* weight_path;
+        if (!source->weight_paths || !source->weight_paths[index] ||
+            !source->weight_paths[index][0])
+            goto fail;
+        weight_path = cJSON_CreateString(source->weight_paths[index]);
+        if (!weight_path || !cJSON_AddItemToArray(weight_paths, weight_path)) {
+            cJSON_Delete(weight_path);
+            goto fail;
+        }
+    }
+    if (!cJSON_AddItemToObject(source_json, "weightPaths", weight_paths))
+        goto fail;
+    weight_paths = NULL;
+    if (!cJSON_AddItemToObject(root, "source", source_json)) goto fail;
+    source_json = NULL;
+
+    if (report->backend[0]) {
+        if (!cJSON_AddStringToObject(reported, "backend", report->backend))
+            goto fail;
+    } else if (!cJSON_AddNullToObject(reported, "backend")) {
+        goto fail;
+    }
+    device = report_device_json(report);
+    if (!device || !cJSON_AddItemToObject(reported, "device", device))
+        goto fail;
+    device = NULL;
+#define ADD_REPORT_TEXT(name, field) \
+    do { \
+        if (report->field[0]) { \
+            if (!cJSON_AddStringToObject(reported, name, report->field)) \
+                goto fail; \
+        } else if (!cJSON_AddNullToObject(reported, name)) { \
+            goto fail; \
+        } \
+    } while (0)
+    ADD_REPORT_TEXT("reason", reason);
+    ADD_REPORT_TEXT("message", message);
+    ADD_REPORT_TEXT("offendingNode", offending_node);
+    ADD_REPORT_TEXT("candidateOutcomes", candidate_outcomes);
+    ADD_REPORT_TEXT("routeEvidence", route_evidence);
+    ADD_REPORT_TEXT("fallbackEvidence", fallback_evidence);
+#undef ADD_REPORT_TEXT
+    if (!cJSON_AddBoolToObject(reported, "tierFallback",
+                               report->tier_fallback_used != 0) ||
+        !cJSON_AddBoolToObject(reported, "operatorFallbackUsed",
+                               report->operator_fallback_used != 0) ||
+        !cJSON_AddBoolToObject(reported, "routeAttested",
+                               report->route_attested != 0) ||
+        !cJSON_AddItemToObject(root, "report", reported))
+        goto fail;
+    reported = NULL;
+
+    if (json_add_optional_identity(lineage, "runtimeId", "runtime",
+                                   report->runtime_id) != 0 ||
+        json_add_optional_identity(lineage, "modelId", "model",
+                                   report->model_id) != 0 ||
+        json_add_optional_identity(lineage, "compilationId", "compiled",
+                                   report->compiled_model_id) != 0 ||
+        json_add_optional_identity(lineage, "definitionId", "graph",
+                                   report->graph_id) != 0 ||
+        json_add_optional_identity(lineage, "weightRevisionId", "weight",
+                                   report->weight_id) != 0 ||
+        json_add_optional_uint64_string(lineage, "topologyRevision",
+                                        report->graph_revision) != 0 ||
+        json_add_optional_uint64_string(lineage, "weightRevision",
+                                        report->weight_revision) != 0 ||
+        !cJSON_AddItemToObject(root, "lineage", lineage))
+        goto fail;
+    return root;
+fail:
+    cJSON_Delete(lineage);
+    cJSON_Delete(device);
+    cJSON_Delete(reported);
+    cJSON_Delete(weight_paths);
+    cJSON_Delete(source_json);
+    cJSON_Delete(policy);
+    cJSON_Delete(request);
+    cJSON_Delete(root);
+    return NULL;
+}
+
 static int write_runtime_evidence(const char* path, cJSON* evidence) {
     char* serialized;
     int result;
@@ -886,10 +1123,10 @@ static void print_run_help(const char* argv0) {
     printf("Usage: %s run <model-dir|graph.json> [options]\n\n", argv0);
     printf("Options:\n");
     printf("  --weights <file>             Add a safetensors weight shard (repeatable).\n");
-    printf("  --input <name=file>          Load exact typed raw input data.\n");
+    printf("  --input <name[shape]=file>   Bind one exact typed input; shape is required for dynamic axes.\n");
     printf("  --output <name=file|file>    Write exact typed raw output data.\n");
     printf("  --row <index>                Write one row from each selected F32 output.\n");
-    printf("  --report-json <file>         Verify and write machine-readable lifecycle evidence.\n");
+    printf("  --report-json <file>         Write lifecycle success or typed runtime/API failure evidence when available.\n");
     printf("  --threads <n>                Set the CPU worker count.\n");
     printf("  --cpu | --vulkan | --opengl | --metal | --nnapi | --cuda\n");
     printf("  --debug\n");
@@ -932,11 +1169,15 @@ static int command_run(int argc, char** argv) {
     VxCompiledModel* compiled = NULL;
     VxExecutionContext* context = NULL;
     VxResult* result = NULL;
+    VxTensorBinding input_bindings[MAX_BINDINGS];
+    void* input_storage[MAX_BINDINGS] = {0};
     cJSON* stable_result = NULL;
     cJSON* runtime_evidence = NULL;
+    cJSON* runtime_failure_evidence = NULL;
     const char* selected_backends[1];
     VxStatus status;
     int return_code = 1;
+    int report_json_written = 0;
 
     if (argc < 3 || !strcmp(argv[2], "--help") || !strcmp(argv[2], "-h")) {
         print_run_help(argv[0]);
@@ -994,11 +1235,24 @@ static int command_run(int argc, char** argv) {
         print_failure("Native init", status, &report);
         goto cleanup;
     }
+    if (options.input_count != vx_execution_context_input_count(context)) {
+        fprintf(stderr,
+                "Execution requires one atomic binding for each of the %zu graph inputs; got %zu.\n",
+                vx_execution_context_input_count(context), options.input_count);
+        goto cleanup;
+    }
     for (size_t index = 0; index < options.input_count; index++) {
-        if (set_input_binding(context, &options.inputs[index], &report) != 0)
+        if (prepare_input_binding(context, &options.inputs[index],
+                                  &input_bindings[index],
+                                  &input_storage[index], &report) != 0)
             goto cleanup;
     }
-    status = vx_execution_context_execute(context, &result, &report);
+    status = vx_execution_context_execute(
+        context, input_bindings, options.input_count, &result, &report);
+    for (size_t index = 0; index < options.input_count; index++) {
+        free(input_storage[index]);
+        input_storage[index] = NULL;
+    }
     if (status != VX_STATUS_OK) {
         print_failure("Native inference", status, &report);
         goto cleanup;
@@ -1029,10 +1283,24 @@ static int command_run(int argc, char** argv) {
         if (!runtime_evidence ||
             write_runtime_evidence(options.report_json, runtime_evidence) != 0)
             goto cleanup;
+        report_json_written = 1;
     }
     return_code = 0;
 
 cleanup:
+    if (return_code != 0 && options.report_json && !report_json_written &&
+        report.status != VX_STATUS_OK) {
+        runtime_failure_evidence = runtime_failure_evidence_json(
+            &report, options.backend, &source);
+        if (!runtime_failure_evidence ||
+            write_runtime_evidence(options.report_json,
+                                   runtime_failure_evidence) != 0) {
+            fprintf(stderr, "Cannot write machine-readable failure evidence.\n");
+        }
+    }
+    for (size_t index = 0; index < MAX_BINDINGS; index++)
+        free(input_storage[index]);
+    cJSON_Delete(runtime_failure_evidence);
     cJSON_Delete(runtime_evidence);
     cJSON_Delete(stable_result);
     vx_result_release(result);
@@ -1105,13 +1373,13 @@ static int read_whole_file(const char* path, void** data, size_t* byte_size) {
 }
 
 static int find_trainer_input(VxTrainer* trainer, const char* name,
-                              VxTensorInfo* found, VxReport* report) {
+                              VxTensorSpec* found, VxReport* report) {
     size_t count = vx_trainer_input_count(trainer);
     for (size_t index = 0; index < count; index++) {
-        VxTensorInfo info = VX_TENSOR_INFO_INIT;
-        if (vx_trainer_input_info(trainer, index, &info, report) == VX_STATUS_OK &&
-            info.name && !strcmp(info.name, name)) {
-            *found = info;
+        VxTensorSpec spec = VX_TENSOR_SPEC_INIT;
+        if (vx_trainer_input_spec(trainer, index, &spec, report) == VX_STATUS_OK &&
+            spec.name && !strcmp(spec.name, name)) {
+            *found = spec;
             return 0;
         }
     }
@@ -1119,31 +1387,61 @@ static int find_trainer_input(VxTrainer* trainer, const char* name,
     return -1;
 }
 
-static int set_trainer_input_binding(VxTrainer* trainer,
-                                     const Binding* binding,
-                                     VxReport* report) {
-    VxTensorInfo info = VX_TENSOR_INFO_INIT;
+static int prepare_trainer_input_binding(VxTrainer* trainer,
+                                         const Binding* binding,
+                                         VxTensorBinding* prepared,
+                                         void** storage,
+                                         VxReport* report) {
+    VxTensorSpec spec = VX_TENSOR_SPEC_INIT;
     const char* suffix;
     void* bytes = NULL;
-    VxStatus status;
-    if (find_trainer_input(trainer, binding->name, &info, report) != 0)
+    size_t byte_size;
+    size_t element_size;
+    if (!prepared || !storage ||
+        find_trainer_input(trainer, binding->name, &spec, report) != 0)
         return -1;
-    suffix = dtype_suffix(info.dtype);
+    if (binding->has_shape && binding->rank != spec.rank) {
+        fprintf(stderr, "Training input %s expects rank %u, got rank %u.\n",
+                binding->name, spec.rank, binding->rank);
+        return -1;
+    }
+    *prepared = (VxTensorBinding)VX_TENSOR_BINDING_INIT;
+    prepared->name = binding->name;
+    prepared->dtype = spec.dtype;
+    prepared->rank = spec.rank;
+    byte_size = element_size = dtype_byte_size(spec.dtype);
+    if (!element_size) return -1;
+    for (uint32_t axis = 0; axis < spec.rank; axis++) {
+        int64_t extent;
+        if (binding->has_shape) {
+            extent = binding->shape[axis];
+        } else {
+            if (spec.dimensions[axis].kind != VX_DIMENSION_FIXED) {
+                fprintf(stderr,
+                        "Dynamic training input %s requires an explicit shape.\n",
+                        binding->name);
+                return -1;
+            }
+            extent = spec.dimensions[axis].min;
+        }
+        if (extent <= 0 || (uint64_t)extent > SIZE_MAX / byte_size)
+            return -1;
+        prepared->shape[axis] = extent;
+        byte_size *= (size_t)extent;
+    }
+    suffix = dtype_suffix(spec.dtype);
     if (!suffix || !has_suffix(binding->path, suffix)) {
         fprintf(stderr, "Training input %s has dtype %s and requires a %s file: %s\n",
-                binding->name, dtype_name(info.dtype),
+                binding->name, dtype_name(spec.dtype),
                 suffix ? suffix : "supported raw", binding->path);
         return -1;
     }
-    if (read_exact_file(binding->path, info.byte_size, &bytes) != 0)
+    if (read_exact_file(binding->path, byte_size, &bytes) != 0)
         return -1;
-    status = vx_trainer_set_input(trainer, binding->name, info.dtype,
-                                  bytes, info.byte_size, report);
-    free(bytes);
-    if (status != VX_STATUS_OK) {
-        print_failure("Setting training input", status, report);
-        return -1;
-    }
+    prepared->data = bytes;
+    prepared->byte_size = byte_size;
+    prepared->location = VX_MEMORY_HOST;
+    *storage = bytes;
     return 0;
 }
 
@@ -1167,6 +1465,8 @@ static int command_train(int argc, char** argv) {
     VxRuntime* runtime = NULL;
     VxModel* model = NULL;
     VxTrainer* trainer = NULL;
+    VxTensorBinding input_bindings[MAX_BINDINGS];
+    void* input_storage[MAX_BINDINGS] = {0};
     void* targets_storage = NULL;
     size_t targets_bytes = 0;
     const char* selected_backend;
@@ -1313,9 +1613,16 @@ static int command_train(int argc, char** argv) {
         print_failure("Trainer creation", status, &report);
         goto cleanup;
     }
+    if (options.run.input_count != vx_trainer_input_count(trainer)) {
+        fprintf(stderr,
+                "Training requires one atomic shaped binding for each of the %zu graph inputs; got %zu.\n",
+                vx_trainer_input_count(trainer), options.run.input_count);
+        goto cleanup;
+    }
     for (size_t index = 0; index < options.run.input_count; index++)
-        if (set_trainer_input_binding(
-                trainer, &options.run.inputs[index], &report) != 0)
+        if (prepare_trainer_input_binding(
+                trainer, &options.run.inputs[index], &input_bindings[index],
+                &input_storage[index], &report) != 0)
             goto cleanup;
 
     loss.logits_name = options.logits_name;
@@ -1326,6 +1633,8 @@ static int command_train(int argc, char** argv) {
     if (options.accumulation_steps > 1u)
         loss.normalizer = (float)loss.target_count *
                           (float)options.accumulation_steps;
+    step_options.inputs = input_bindings;
+    step_options.input_count = options.run.input_count;
     step_options.losses = &loss;
     step_options.loss_count = 1;
     step_options.trainable_names = options.trainable_names;
@@ -1377,6 +1686,8 @@ usage_error:
     return_code = 2;
 
 cleanup:
+    for (size_t index = 0; index < MAX_BINDINGS; index++)
+        free(input_storage[index]);
     free(targets_storage);
     if (trainer) (void)vx_trainer_close(trainer, NULL);
     vx_trainer_release(trainer);

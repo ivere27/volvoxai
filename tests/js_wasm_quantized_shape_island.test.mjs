@@ -7,7 +7,7 @@ import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
 
-import { Graph } from '../ts/core/Graph.js';
+import { RuntimeGraph } from '../ts/core/RuntimeGraph.js';
 import { WasmEngine } from '../ts/backends/WasmEngine.js';
 
 const run = promisify(execFile);
@@ -46,7 +46,7 @@ function forbidCpuFallbacks(engine) {
 }
 
 function byteTransposeGraph(dtype) {
-  const graph = new Graph();
+  const graph = new RuntimeGraph();
   const zeroPoint = dtype === 'int8' ? -3 : 123;
   const input = graph.addInput('input', [1, 2, 2, 3], dtype, {
     quantization: quantization(0.125, zeroPoint),
@@ -62,7 +62,7 @@ function byteTransposeGraph(dtype) {
 }
 
 function signedShapeIslandGraph() {
-  const graph = new Graph();
+  const graph = new RuntimeGraph();
   const input = graph.addInput('input', [1, 2, 2, 2], 'int8', {
     quantization: quantization(0.25, 0),
   });
@@ -98,7 +98,7 @@ function signedShapeIslandGraph() {
 }
 
 function unsignedMaxPoolResizeGraph() {
-  const graph = new Graph();
+  const graph = new RuntimeGraph();
   const input = graph.addInput('input', [1, 2, 2, 1], 'uint8', {
     quantization: quantization(0.125, 128),
   });
@@ -113,7 +113,7 @@ function unsignedMaxPoolResizeGraph() {
 }
 
 function asymmetricPadMaxPoolGraph() {
-  const graph = new Graph();
+  const graph = new RuntimeGraph();
   const input = graph.addInput('input', [1, 3, 3, 1], 'int8', {
     quantization: quantization(0.25, 0),
   });
@@ -125,7 +125,7 @@ function asymmetricPadMaxPoolGraph() {
 }
 
 function mismatchedConcatGraph() {
-  const graph = new Graph();
+  const graph = new RuntimeGraph();
   const input = graph.addInput('input', [1, 1], 'int8', {
     quantization: quantization(0.25, 0),
   });

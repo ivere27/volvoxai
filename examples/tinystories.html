@@ -10,16 +10,24 @@
 <div id="story"></div>
 <pre id="out" style="position:absolute;left:-9999px"></pre>
     <script type="module">
-    import { Graph, GraphLoader, Tokenizer, VolvoxAI } from '../dist/0.3.0/volvoxai.js';
+    import {
+      ModelLoader,
+      Model,
+      Tokenizer,
+      VolvoxAI,
+    } from '../dist/0.4.0/volvoxai.js';
+    import {
+      createTinyStoriesDecodeState,
+      resolveTinyStoriesSequenceContract,
+    } from './tinystories/browser_session.js';
 
 const q = new URLSearchParams(location.search);
     const backend = q.get('backend') || 'wasm';          // webgpu | wasm | cpu
     const prompt = q.get('prompt') || 'Once upon a time, Lily';
-    const nNew = parseInt(q.get('n') || '32', 10);
+    const requestedNewTokens = Number(q.get('n') ?? '32');
     const MODEL = '../models/tinystories_1m/model.safetensors';
     const VOCAB = '../models/tinystories_1m/vocab.bin';
     const MERGES = '../models/tinystories_1m/merges.txt';
-    const SEQ = 256, VOCAB_SIZE = 50257, EOS = 50256;
 
 const statusEl = document.getElementById('status');
 const storyEl = document.getElementById('story');
@@ -31,9 +39,8 @@ const fail = (e) => { setStatus('ERROR ' + e.message); outEl.textContent = 'FATA
       setStatus(`init(${backend})…`);
       const runtime = await VolvoxAI.createRuntime({
         backends: [backend],
-        wasmUrl: '../dist/0.3.0/volvoxai.wasm',
+        wasmUrl: '../dist/0.4.0/volvoxai.wasm',
       });
-      let model;
       let compiled;
       let context;
       try {
@@ -43,53 +50,66 @@ const fail = (e) => { setStatus('ERROR ' + e.message); outEl.textContent = 'FATA
       await tokenizer.load(VOCAB, MERGES);
 
   setStatus('loading model…');
-  const graph = new Graph();
-  await GraphLoader.load(graph, MODEL);
-  model = runtime.createModel(graph);
-  compiled = await model.compile({
-    backend: { mode: 'require', backend, operatorFallback: 'forbid' },
-  });
-  context = await compiled.createContext();
-  const usedBackend = compiled.backend;
-  document.getElementById('backend').textContent = usedBackend;
-  const outName = graph.outputNames[graph.outputNames.length - 1];
-
-  // inputs: tokens/positions as float ids (the f32 shaders/kernels read + truncate them)
-  const tokens = new Float32Array(SEQ);
-  const positions = new Float32Array(SEQ);
-  for (let i = 0; i < SEQ; i++) positions[i] = i;
-      const ids = tokenizer.encode(prompt, SEQ);
-      for (let i = 0; i < SEQ; i++) tokens[i] = i < ids.length ? ids[i] : EOS;
-      let last = ids.length - 1;
+      const snapshot = Model.capture(
+        await ModelLoader.load(MODEL),
+      );
+      const contract = resolveTinyStoriesSequenceContract(snapshot);
+      const eosTokenId = tokenizer.findTokenByText('<|endoftext|>');
+      const promptTokenIds = tokenizer.encode(prompt, contract.maximumSequenceCapacity);
+      const decodeState = createTinyStoriesDecodeState(promptTokenIds, {
+        requestedNewTokens,
+        eosTokenId,
+        contract,
+      });
+      compiled = await runtime.compile(snapshot, {
+        backend: { mode: 'require', backend, operatorFallback: 'forbid' },
+      });
+      context = await compiled.createContext({
+        decode: {
+          changedInputs: ['tokens'],
+          rowMode: 'auto',
+          requireIncremental: true,
+        },
+      });
+      const usedBackend = compiled.backend;
+      document.getElementById('backend').textContent = usedBackend;
+      let last = decodeState.promptLength - 1;
 
   const outIds = [];
-  const argmaxRow = (logits, row) => { let b = 0, bv = -1e30; const o = row * VOCAB_SIZE; for (let i = 0; i < VOCAB_SIZE; i++) if (logits[o + i] > bv) { bv = logits[o + i]; b = i; } return b; };
+  const argmaxRow = (logits, row) => { let b = 0, bv = -1e30; const o = row * contract.vocabularySize; for (let i = 0; i < contract.vocabularySize; i++) if (logits[o + i] > bv) { bv = logits[o + i]; b = i; } return b; };
 
       setStatus('generating…');
       storyEl.textContent = prompt;
       const t0 = performance.now();
-      for (let step = 0; step < nNew && last < SEQ - 1; step++) {
-        const result = await context.execute({ tokens, positions });
+      for (let step = 0; step < decodeState.generationLimit; step++) {
+        const result = step === 0
+          ? await context.decode.seed(decodeState.inputs, { position: last })
+          : await context.decode.step(
+            { tokens: decodeState.inputs.tokens },
+            { position: last },
+          );
         let logits;
         try {
-          logits = await result.output(outName).read();
+          logits = await result.output(contract.outputName).read();
         } finally {
           await result.close();
         }
         const best = argmaxRow(logits, last);
         outIds.push(best);
-        last++; tokens[last] = best;
         storyEl.textContent = prompt + tokenizer.decode(outIds);
+        if (best === eosTokenId) break;
+        last++;
+        decodeState.tokens[last] = best;
       }
   const dt = (performance.now() - t0) / 1000;
-  document.getElementById('tps').textContent = (nNew / dt).toFixed(1);
+  const tokensPerSecond = outIds.length / Math.max(dt, Number.EPSILON);
+  document.getElementById('tps').textContent = tokensPerSecond.toFixed(1);
   const text = storyEl.textContent;
   setStatus(`done (${usedBackend}, ${dt.toFixed(1)}s)`);
-  outEl.textContent = `DONE backend=${usedBackend} tps=${(nNew / dt).toFixed(2)}\n` + text;
+  outEl.textContent = `DONE backend=${usedBackend} tps=${tokensPerSecond.toFixed(2)}\n` + text;
       } finally {
         await context?.close();
         await compiled?.close();
-        await model?.close();
         await runtime.close();
       }
 }

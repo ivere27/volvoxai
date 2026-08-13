@@ -1,12 +1,12 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
-import { Graph } from '../ts/core/Graph.js';
-import { GraphLoader } from '../ts/core/GraphLoader.js';
+import { RuntimeGraph } from '../ts/core/RuntimeGraph.js';
+import { RuntimeGraphLoader } from '../ts/core/RuntimeGraphLoader.js';
 import { CPUEngine } from '../ts/backends/CPUEngine.js';
 
 function qLayerNormGraph() {
-  const graph = new Graph();
+  const graph = new RuntimeGraph();
   const input = graph.addInput('input', [2, 4], 'int8', {
     quantization: { scheme: 'per_tensor', scale: 0.25, zero_point: -1 },
   });
@@ -28,7 +28,7 @@ function qLayerNormGraph() {
 
 test('CPU dispatches QLayerNorm through the byte-domain kernel, not F32 LayerNorm', async () => {
   const { graph } = qLayerNormGraph();
-  assert.doesNotThrow(() => GraphLoader._assertBrowserQuantizationSupported(graph));
+  assert.doesNotThrow(() => RuntimeGraphLoader._assertBrowserQuantizationSupported(graph));
 
   const engine = new CPUEngine();
   engine.allocateGraph(graph);
@@ -48,18 +48,18 @@ test('CPU dispatches QLayerNorm through the byte-domain kernel, not F32 LayerNor
   assert.deepEqual([...result.out], [-12, -4, 6, 7, 9, -6, 5, -20]);
 });
 
-test('GraphLoader rejects non-canonical QLayerNorm byte boundaries', () => {
+test('RuntimeGraphLoader rejects non-canonical QLayerNorm byte boundaries', () => {
   const invalidDModel = qLayerNormGraph();
   invalidDModel.node.params.d_model = 3;
   assert.throws(
-    () => GraphLoader._assertBrowserQuantizationSupported(invalidDModel.graph),
+    () => RuntimeGraphLoader._assertBrowserQuantizationSupported(invalidDModel.graph),
     /same-shape rank-at-least-1 per-tensor I8\/U8 activation edges/,
   );
 
   const unexpectedInput = qLayerNormGraph();
   unexpectedInput.node.inputs.extra = unexpectedInput.input;
   assert.throws(
-    () => GraphLoader._assertBrowserQuantizationSupported(unexpectedInput.graph),
+    () => RuntimeGraphLoader._assertBrowserQuantizationSupported(unexpectedInput.graph),
     /exact input\/weight\/bias inputs/,
   );
 });

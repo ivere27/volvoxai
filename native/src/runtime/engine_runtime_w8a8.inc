@@ -291,6 +291,7 @@ typedef struct {
 } QEmbeddingPhysicalDescriptor;
 
 static int qembedding_physical_validate(int node_index, Node* node, T* output,
+                                        int validate_host_values,
                                         QEmbeddingPhysicalDescriptor* descriptor) {
     QEmbeddingMetadata* meta;
     T* tokens;
@@ -324,10 +325,15 @@ static int qembedding_physical_validate(int node_index, Node* node, T* output,
     if (weight_elements > (uint64_t)LONG_MAX || output_elements > (uint64_t)LONG_MAX ||
         weight->numel != (long)weight_elements || output->numel != (long)output_elements)
         return -1;
-    for (long token = 0; token < tokens->numel; token++) {
-        const int32_t id = ((const int32_t*)tokens->data)[token];
-        if (id < 0 || (uint32_t)id >= meta->vocab) return -1;
-    }
+    if (validate_host_values)
+        for (long token = 0; token < tokens->numel; token++) {
+            int32_t id;
+            memcpy(&id,
+                   (const unsigned char*)tokens->data +
+                       (size_t)token * sizeof(id),
+                   sizeof(id));
+            if (id < 0 || (uint32_t)id >= meta->vocab) return -1;
+        }
     weight_dtype = physical_byte_dtype(weight->dtype);
     output_dtype = physical_byte_dtype(output->dtype);
     if (!weight_dtype || !output_dtype ||
@@ -349,7 +355,8 @@ static int qembedding_physical_forward(int node_index, Node* node, T* output) {
     const int32_t* tokens;
     void* output_data;
     uint32_t token_count;
-    if (qembedding_physical_validate(node_index, node, output, &descriptor) != 0) return -1;
+    if (qembedding_physical_validate(
+            node_index, node, output, 1, &descriptor) != 0) return -1;
     tokens = (const int32_t*)descriptor.tokens->data;
     output_data = output->data;
     token_count = descriptor.tokens_count;
@@ -391,7 +398,9 @@ static int qembedding_physical_gpu_forward(int node_index, Node* node, T* output
     int row_start = 0;
     int row_count = 0;
     if (!node_backend || physical_gpu_partial_execution_declined() ||
-        qembedding_physical_validate(node_index, node, output, &descriptor) != 0) return 0;
+        qembedding_physical_validate(
+            node_index, node, output,
+            !g_bounded_gpu_value_domain_proven, &descriptor) != 0) return 0;
     tokens = (const int32_t*)descriptor.tokens->data;
     output_data = output->data;
     token_count = descriptor.tokens_count;
@@ -421,15 +430,40 @@ static int qembedding_physical_gpu_forward(int node_index, Node* node, T* output
     return 0;
 }
 
-/* Canonical QConv2D is the matching physical-byte dense spatial path. The
- * activation mappings are immutable metadata and T.data is byte storage. */
-static int qconv2d_physical_forward(int node_index, Node* node, T* output) {
+typedef struct {
+    QConv2DMetadata* meta;
+    T* input;
+    T* weight;
+    uint32_t batch;
+    uint32_t input_height;
+    uint32_t input_width;
+    uint32_t output_height;
+    uint32_t output_width;
+    uint32_t input_dtype;
+    uint32_t weight_dtype;
+    uint32_t output_dtype;
+} QConv2DPhysicalDescriptor;
+
+/* QConv packing and affine metadata are invariant, but activation geometry is
+ * a property of the current BoundExecutionGraph.  Never compare a rebound
+ * tensor against the bootstrap shape cached while the package was loaded. */
+static int qconv2d_physical_validate(
+        int node_index, Node* node, T* output,
+        QConv2DPhysicalDescriptor* descriptor) {
     QConv2DMetadata* meta;
     T* input;
     T* weight;
     T* bias;
-    uint32_t input_dtype, weight_dtype, output_dtype;
-    if (node_index < 0 || node_index >= MAXN || !node || !output) return -1;
+    uint64_t effective_height;
+    uint64_t effective_width;
+    uint64_t padded_height;
+    uint64_t padded_width;
+    uint64_t expected_height;
+    uint64_t expected_width;
+    uint64_t input_elements;
+    uint64_t output_elements;
+    if (node_index < 0 || node_index >= MAXN || !node || !output ||
+        !descriptor) return -1;
     meta = &g_qconv_meta[node_index];
     input = qconv2d_node_input(node);
     weight = nin(node, "weight");
@@ -438,36 +472,97 @@ static int qconv2d_physical_forward(int node_index, Node* node, T* output) {
         !input->data || !weight->data || !output->data ||
         input->dtype != meta->input_dtype || weight->dtype != meta->weight_dtype ||
         output->dtype != meta->output_dtype || !input->quantization.valid ||
-        !output->quantization.valid || input->elem_size != 1 || weight->elem_size != 1 ||
-        output->elem_size != 1 || input->ndim != 4 || weight->ndim != 4 || output->ndim != 4 ||
-        input->shape[0] != (int)meta->batch || input->shape[1] != (int)meta->input_height ||
-        input->shape[2] != (int)meta->input_width || input->shape[3] != (int)meta->input_channels ||
-        output->shape[0] != (int)meta->batch || output->shape[1] != (int)meta->output_height ||
-        output->shape[2] != (int)meta->output_width || output->shape[3] != (int)meta->output_channels ||
-        weight->shape[0] != (int)meta->output_channels || weight->shape[1] != (int)meta->kernel_height ||
-        weight->shape[2] != (int)meta->kernel_width || weight->shape[3] != (int)meta->input_per_group ||
+        !output->quantization.valid || input->elem_size != 1 ||
+        weight->elem_size != 1 || output->elem_size != 1 ||
+        input->ndim != 4 || weight->ndim != 4 || output->ndim != 4 ||
+        input->shape[0] <= 0 || input->shape[1] <= 0 ||
+        input->shape[2] <= 0 || input->shape[3] != (int)meta->input_channels ||
+        output->shape[0] != input->shape[0] || output->shape[1] <= 0 ||
+        output->shape[2] <= 0 ||
+        output->shape[3] != (int)meta->output_channels ||
+        weight->shape[0] != (int)meta->output_channels ||
+        weight->shape[1] != (int)meta->kernel_height ||
+        weight->shape[2] != (int)meta->kernel_width ||
+        weight->shape[3] != (int)meta->input_per_group ||
         !meta->weight_scales || !meta->weight_zero_points ||
-        ((bias != NULL) != (meta->bias != NULL)) ||
+        !meta->stride_y || !meta->stride_x || !meta->dilation_y ||
+        !meta->dilation_x || !meta->kernel_height || !meta->kernel_width ||
+        !meta->groups || ((bias != NULL) != (meta->bias != NULL)) ||
         (bias && (bias->dtype != T_I32 || bias->ndim != 1 ||
                   bias->shape[0] != (int)meta->output_channels ||
                   bias->numel != (long)meta->output_channels))) return -1;
-    input_dtype = physical_byte_dtype(input->dtype);
-    weight_dtype = physical_byte_dtype(weight->dtype);
-    output_dtype = physical_byte_dtype(output->dtype);
-    if (!input_dtype || !weight_dtype || !output_dtype) return -1;
-    return vx_qconv2d_i8u8_native_prepacked(input->data, weight->data,
-                                   meta->bias, meta->weight_scales,
-                                   meta->weight_zero_points, output->data, meta->batch,
-                                   meta->input_height, meta->input_width, meta->input_channels,
-                                   meta->output_height, meta->output_width, meta->output_channels,
-                                   meta->kernel_height, meta->kernel_width, meta->input_per_group,
-                                   meta->stride_y, meta->stride_x, meta->dilation_y, meta->dilation_x,
-                                   meta->padding_top, meta->padding_left, meta->padding_bottom,
-                                   meta->padding_right, meta->groups, meta->relu,
-                                   input->quantization.scale, input->quantization.zero_point,
-                                   output->quantization.scale, output->quantization.zero_point,
-                                   input_dtype, weight_dtype, output_dtype,
-                                   meta->packed_weight) == 1 ? 0 : -1;
+    effective_height = (uint64_t)(meta->kernel_height - 1u) *
+        meta->dilation_y + 1u;
+    effective_width = (uint64_t)(meta->kernel_width - 1u) *
+        meta->dilation_x + 1u;
+    padded_height = (uint64_t)(uint32_t)input->shape[1] +
+        meta->padding_top + meta->padding_bottom;
+    padded_width = (uint64_t)(uint32_t)input->shape[2] +
+        meta->padding_left + meta->padding_right;
+    if (padded_height < effective_height || padded_width < effective_width)
+        return -1;
+    expected_height =
+        (padded_height - effective_height) / meta->stride_y + 1u;
+    expected_width =
+        (padded_width - effective_width) / meta->stride_x + 1u;
+    if (expected_height != (uint32_t)output->shape[1] ||
+        expected_width != (uint32_t)output->shape[2]) return -1;
+    input_elements = (uint32_t)input->shape[0];
+    if (input_elements > UINT64_MAX / (uint32_t)input->shape[1]) return -1;
+    input_elements *= (uint32_t)input->shape[1];
+    if (input_elements > UINT64_MAX / (uint32_t)input->shape[2]) return -1;
+    input_elements *= (uint32_t)input->shape[2];
+    if (input_elements > UINT64_MAX / meta->input_channels) return -1;
+    input_elements *= meta->input_channels;
+    output_elements = (uint32_t)output->shape[0];
+    if (output_elements > UINT64_MAX / (uint32_t)output->shape[1]) return -1;
+    output_elements *= (uint32_t)output->shape[1];
+    if (output_elements > UINT64_MAX / (uint32_t)output->shape[2]) return -1;
+    output_elements *= (uint32_t)output->shape[2];
+    if (output_elements > UINT64_MAX / meta->output_channels) return -1;
+    output_elements *= meta->output_channels;
+    if (input_elements > (uint64_t)LONG_MAX ||
+        output_elements > (uint64_t)LONG_MAX ||
+        input->numel != (long)input_elements ||
+        output->numel != (long)output_elements) return -1;
+    descriptor->meta = meta;
+    descriptor->input = input;
+    descriptor->weight = weight;
+    descriptor->batch = (uint32_t)input->shape[0];
+    descriptor->input_height = (uint32_t)input->shape[1];
+    descriptor->input_width = (uint32_t)input->shape[2];
+    descriptor->output_height = (uint32_t)output->shape[1];
+    descriptor->output_width = (uint32_t)output->shape[2];
+    descriptor->input_dtype = physical_byte_dtype(input->dtype);
+    descriptor->weight_dtype = physical_byte_dtype(weight->dtype);
+    descriptor->output_dtype = physical_byte_dtype(output->dtype);
+    return descriptor->input_dtype && descriptor->weight_dtype &&
+        descriptor->output_dtype ? 0 : -1;
+}
+
+/* Canonical QConv2D is the matching physical-byte dense spatial path. */
+static int qconv2d_physical_forward(int node_index, Node* node, T* output) {
+    QConv2DPhysicalDescriptor descriptor;
+    QConv2DMetadata* meta;
+    if (qconv2d_physical_validate(
+            node_index, node, output, &descriptor) != 0) return -1;
+    meta = descriptor.meta;
+    return vx_qconv2d_i8u8_native_prepacked(
+            descriptor.input->data, descriptor.weight->data, meta->bias,
+            meta->weight_scales, meta->weight_zero_points, output->data,
+            descriptor.batch, descriptor.input_height, descriptor.input_width,
+            meta->input_channels, descriptor.output_height,
+            descriptor.output_width, meta->output_channels,
+            meta->kernel_height, meta->kernel_width, meta->input_per_group,
+            meta->stride_y, meta->stride_x, meta->dilation_y, meta->dilation_x,
+            meta->padding_top, meta->padding_left, meta->padding_bottom,
+            meta->padding_right, meta->groups, meta->relu,
+            descriptor.input->quantization.scale,
+            descriptor.input->quantization.zero_point,
+            output->quantization.scale, output->quantization.zero_point,
+            descriptor.input_dtype, descriptor.weight_dtype,
+            descriptor.output_dtype, meta->packed_weight,
+            meta->small_c_packed_weight) == 1 ? 0 : -1;
 }
 
 /* Keep the canonical QConv2D activation chain on its selected device.  This
@@ -477,49 +572,27 @@ static int qconv2d_physical_gpu_forward(int node_index, Node* node, T* output,
                                         const VxW8A8Ops* ops,
                                         const char* backend_label,
                                         const char** node_backend) {
+    QConv2DPhysicalDescriptor descriptor;
     QConv2DMetadata* meta;
-    T* input;
-    T* weight;
-    T* bias;
-    uint32_t input_dtype, weight_dtype, output_dtype;
-    if (node_index < 0 || node_index >= MAXN || !node || !output || !node_backend ||
-        physical_gpu_partial_execution_declined()) return 0;
-    meta = &g_qconv_meta[node_index];
-    input = qconv2d_node_input(node);
-    weight = nin(node, "weight");
-    bias = nin(node, "bias");
-    if (!meta->valid || !input || !weight || output != t_find(node->out) ||
-        !input->data || !weight->data || !output->data ||
-        input->dtype != meta->input_dtype || weight->dtype != meta->weight_dtype ||
-        output->dtype != meta->output_dtype || !input->quantization.valid ||
-        !output->quantization.valid || input->elem_size != 1 || weight->elem_size != 1 ||
-        output->elem_size != 1 || input->ndim != 4 || weight->ndim != 4 || output->ndim != 4 ||
-        input->shape[0] != (int)meta->batch || input->shape[1] != (int)meta->input_height ||
-        input->shape[2] != (int)meta->input_width || input->shape[3] != (int)meta->input_channels ||
-        output->shape[0] != (int)meta->batch || output->shape[1] != (int)meta->output_height ||
-        output->shape[2] != (int)meta->output_width || output->shape[3] != (int)meta->output_channels ||
-        weight->shape[0] != (int)meta->output_channels || weight->shape[1] != (int)meta->kernel_height ||
-        weight->shape[2] != (int)meta->kernel_width || weight->shape[3] != (int)meta->input_per_group ||
-        !meta->weight_scales || !meta->weight_zero_points ||
-        ((bias != NULL) != (meta->bias != NULL)) ||
-        (bias && (bias->dtype != T_I32 || bias->ndim != 1 ||
-                  bias->shape[0] != (int)meta->output_channels ||
-                  bias->numel != (long)meta->output_channels))) return 0;
-    input_dtype = physical_byte_dtype(input->dtype);
-    weight_dtype = physical_byte_dtype(weight->dtype);
-    output_dtype = physical_byte_dtype(output->dtype);
-    if (!input_dtype || !weight_dtype || !output_dtype) return 0;
+    if (!node_backend || physical_gpu_partial_execution_declined() ||
+        qconv2d_physical_validate(
+            node_index, node, output, &descriptor) != 0) return 0;
+    meta = descriptor.meta;
     if (ops && ops->qconv2d_i8u8 && ops->qconv2d_i8u8(
-            input->data, weight->data, meta->weight_scales, meta->weight_zero_points,
-            meta->bias, output->data, meta->batch, meta->input_height,
-            meta->input_width, meta->input_channels, meta->output_height,
-            meta->output_width, meta->output_channels, meta->kernel_height,
+            descriptor.input->data, descriptor.weight->data,
+            meta->weight_scales, meta->weight_zero_points,
+            meta->bias, output->data, descriptor.batch,
+            descriptor.input_height, descriptor.input_width,
+            meta->input_channels, descriptor.output_height,
+            descriptor.output_width, meta->output_channels, meta->kernel_height,
             meta->kernel_width, meta->input_per_group, meta->stride_y, meta->stride_x,
             meta->dilation_y, meta->dilation_x, meta->padding_top, meta->padding_left,
             meta->padding_bottom, meta->padding_right, meta->groups, meta->relu,
-            input->quantization.scale, input->quantization.zero_point,
+            descriptor.input->quantization.scale,
+            descriptor.input->quantization.zero_point,
             output->quantization.scale, output->quantization.zero_point,
-            input_dtype, weight_dtype, output_dtype)) {
+            descriptor.input_dtype, descriptor.weight_dtype,
+            descriptor.output_dtype)) {
         *node_backend = backend_label;
         return 1;
     }
@@ -682,6 +755,9 @@ static int qbatch_matmul_physical_forward(Node* node, T* output) {
     size_t a_matrix_elements;
     size_t b_matrix_elements;
     size_t output_matrix_elements;
+    size_t workspace_capacity = 0u;
+    void* workspace = volvoxai_engine_cpu_typed_workspace(
+        &workspace_capacity);
     if (qbatch_matmul_physical_validate(node, output, &descriptor) != 0)
         return -1;
     if (g_active_row >= 0 || g_prefix_rows > 0) {
@@ -710,7 +786,7 @@ static int qbatch_matmul_physical_forward(Node* node, T* output) {
             size_t output_row_offset =
                 (size_t)matrix * row_descriptor.output_matrix_elements +
                 (size_t)row_start * descriptor.n;
-            if (!vx_qbatch_matmul_i8u8_native(
+            if (!vx_qbatch_matmul_i8u8_native_with_workspace(
                     (const uint8_t*)descriptor.a->data + a_row_offset,
                     (const uint8_t*)descriptor.b->data + b_matrix_offset,
                     (uint8_t*)descriptor.output->data + output_row_offset,
@@ -722,7 +798,8 @@ static int qbatch_matmul_physical_forward(Node* node, T* output) {
                     descriptor.output->quantization.scale,
                     descriptor.output->quantization.zero_point,
                     descriptor.a_dtype, descriptor.b_dtype,
-                    descriptor.output_dtype))
+                    descriptor.output_dtype,
+                    workspace, workspace_capacity))
                 return -1;
         }
         return 0;
@@ -760,7 +837,7 @@ full_matrix:
                 extent == 1u ? 0u : coordinates[b_offset + dimension];
             b_batch = b_batch * extent + coordinate;
         }
-        if (!vx_qbatch_matmul_i8u8_native(
+        if (!vx_qbatch_matmul_i8u8_native_with_workspace(
                 (const uint8_t*)descriptor.a->data +
                     a_batch * a_matrix_elements,
                 (const uint8_t*)descriptor.b->data +
@@ -775,7 +852,8 @@ full_matrix:
                 descriptor.output->quantization.scale,
                 descriptor.output->quantization.zero_point,
                 descriptor.a_dtype, descriptor.b_dtype,
-                descriptor.output_dtype))
+                descriptor.output_dtype,
+                workspace, workspace_capacity))
             return -1;
     }
     return 0;
@@ -1602,6 +1680,7 @@ static int qmaskedmean_exact_inputs(Node* node, T** input_out, T** mask_out) {
  * must remain physical I8/U8 bytes.  Validate the complete three-input NHWC
  * contract before CPU or GPU code can allocate/write an output buffer. */
 static int qgroupnorm_physical_validate(Node* node, T* output,
+                                        int validate_host_values,
                                         QGroupNormPhysicalDescriptor* descriptor) {
     T* input;
     T* weight;
@@ -1646,10 +1725,11 @@ static int qgroupnorm_physical_validate(Node* node, T* output,
     elements *= channels;
     if (elements > UINT32_MAX || input->numel != (long)elements ||
         output->numel != (long)elements) return -1;
-    for (uint32_t channel = 0; channel < channels; channel++) {
-        if (!isfinite(tensor_scalar_f32(weight, channel)) ||
-            !isfinite(tensor_scalar_f32(bias, channel))) return -1;
-    }
+    if (validate_host_values)
+        for (uint32_t channel = 0; channel < channels; channel++) {
+            if (!isfinite(tensor_scalar_f32(weight, channel)) ||
+                !isfinite(tensor_scalar_f32(bias, channel))) return -1;
+        }
     descriptor->input = input;
     descriptor->weight = weight;
     descriptor->bias = bias;
@@ -1666,7 +1746,8 @@ static int qgroupnorm_physical_validate(Node* node, T* output,
 
 static int qgroupnorm_physical_forward(Node* node, T* output) {
     QGroupNormPhysicalDescriptor descriptor;
-    if (qgroupnorm_physical_validate(node, output, &descriptor) != 0) return -1;
+    if (qgroupnorm_physical_validate(
+            node, output, 1, &descriptor) != 0) return -1;
     return vx_qgroupnorm_i8u8_native_validated(
                            descriptor.input->data, descriptor.weight->data,
                            descriptor.bias->data, output->data, descriptor.batch,
@@ -1688,7 +1769,9 @@ static int qgroupnorm_physical_gpu_forward(Node* node, T* output,
                                            const char** node_backend) {
     QGroupNormPhysicalDescriptor descriptor;
     if (!node_backend || physical_gpu_partial_execution_declined() ||
-        qgroupnorm_physical_validate(node, output, &descriptor) != 0) return 0;
+        qgroupnorm_physical_validate(
+            node, output, !g_bounded_gpu_value_domain_proven,
+            &descriptor) != 0) return 0;
     VX_RUN_W8A8(ops, qgroupnorm_i8u8,
             descriptor.input->data, descriptor.weight->data, descriptor.bias->data,
             output->data, descriptor.batch, descriptor.height, descriptor.width,
@@ -1716,6 +1799,7 @@ typedef struct {
  * tensor.  Validate row shape, affine metadata, and all scalar attributes
  * before CPU/GPU allocation or an output write can occur. */
 static int qlayernorm_physical_validate(Node* node, T* output,
+                                        int validate_host_values,
                                         QLayerNormPhysicalDescriptor* descriptor) {
     T* input;
     T* weight;
@@ -1749,10 +1833,11 @@ static int qlayernorm_physical_validate(Node* node, T* output,
         physical_qlayernorm_parameters(node->params, d_model, &epsilon) != 0 ||
         weight->shape[0] != (int)d_model || bias->shape[0] != (int)d_model ||
         weight->numel != (long)d_model || bias->numel != (long)d_model) return -1;
-    for (uint32_t channel = 0; channel < d_model; channel++) {
-        if (!isfinite(tensor_scalar_f32(weight, channel)) ||
-            !isfinite(tensor_scalar_f32(bias, channel))) return -1;
-    }
+    if (validate_host_values)
+        for (uint32_t channel = 0; channel < d_model; channel++) {
+            if (!isfinite(tensor_scalar_f32(weight, channel)) ||
+                !isfinite(tensor_scalar_f32(bias, channel))) return -1;
+        }
     descriptor->input = input;
     descriptor->weight = weight;
     descriptor->bias = bias;
@@ -1769,7 +1854,8 @@ static int qlayernorm_physical_forward(Node* node, T* output) {
     const void* input_data;
     void* output_data;
     uint32_t rows;
-    if (qlayernorm_physical_validate(node, output, &descriptor) != 0) return -1;
+    if (qlayernorm_physical_validate(
+            node, output, 1, &descriptor) != 0) return -1;
     input_data = descriptor.input->data;
     output_data = output->data;
     rows = descriptor.rows;
@@ -1810,7 +1896,9 @@ static int qlayernorm_physical_gpu_forward(Node* node, T* output,
     int row_count = 0;
     int partial;
     if (!node_backend || physical_gpu_partial_execution_declined() ||
-        qlayernorm_physical_validate(node, output, &descriptor) != 0) return 0;
+        qlayernorm_physical_validate(
+            node, output, !g_bounded_gpu_value_domain_proven,
+            &descriptor) != 0) return 0;
     partial = physical_sequence_window(descriptor.input,
         descriptor.d_model, &row_start, &row_count);
     if (partial < 0) return 0;

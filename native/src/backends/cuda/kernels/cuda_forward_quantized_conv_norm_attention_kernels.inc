@@ -26,6 +26,14 @@ extern "C" VX_CUDA_GLOBAL void vx_cuda_qconv2d_i8u8(
     vx_u32 outputs_per_group = output_channels / groups;
     vx_u32 group = output_channel / outputs_per_group;
     vx_i32 accumulator = bias ? bias[output_channel] : 0;
+    vx_i32 input_center = input_zero_point -
+        (input_dtype == VX_DTYPE_U8 ? 128 : 0);
+    vx_i32 weight_center = weight_zero_points[output_channel] -
+        (weight_dtype == VX_DTYPE_U8 ? 128 : 0);
+    vx_u32 packed_end = input_per_group & ~3u;
+    vx_u32 aligned =
+        ((input_channels | input_per_group) & 3u) == 0u &&
+        (((vx_u64)input | (vx_u64)weight) & 3u) == 0u ? 1u : 0u;
     for (vx_u32 ky = 0; ky < kernel_height; ky++) {
         vx_i32 input_y = (vx_i32)(output_y * stride_y +
             ky * dilation_y) - (vx_i32)padding_top;
@@ -34,18 +42,29 @@ extern "C" VX_CUDA_GLOBAL void vx_cuda_qconv2d_i8u8(
             vx_i32 input_x = (vx_i32)(output_x * stride_x +
                 kx * dilation_x) - (vx_i32)padding_left;
             if (input_x < 0 || input_x >= (vx_i32)input_width) continue;
-            for (vx_u32 local_channel = 0; local_channel < input_per_group;
-                 local_channel++) {
-                vx_u32 input_channel = group * input_per_group + local_channel;
-                vx_u32 input_index = ((batch_index * input_height +
-                    (vx_u32)input_y) * input_width + (vx_u32)input_x) *
-                    input_channels + input_channel;
-                vx_u32 weight_index = (((output_channel * kernel_height + ky) *
-                    kernel_width + kx) * input_per_group) + local_channel;
-                vx_i32 input_value = vx_typed_byte(input, input_index,
-                                                    input_dtype);
-                vx_i32 weight_value = vx_typed_byte(weight, weight_index,
-                                                     weight_dtype);
+            vx_u32 input_base = ((batch_index * input_height +
+                (vx_u32)input_y) * input_width + (vx_u32)input_x) *
+                input_channels + group * input_per_group;
+            vx_u32 weight_base = (((output_channel * kernel_height + ky) *
+                kernel_width + kx) * input_per_group);
+            for (vx_u32 local_channel = 0u;
+                 local_channel < packed_end; local_channel += 4u) {
+                vx_u32 input_packed = vx_cuda_pack4_s8(
+                    input, input_base + local_channel, 1u,
+                    input_dtype, aligned);
+                vx_u32 weight_packed = vx_cuda_pack4_s8(
+                    weight, weight_base + local_channel, 1u,
+                    weight_dtype, aligned);
+                accumulator += vx_cuda_centered_dot4_s8(
+                    input_packed, weight_packed,
+                    input_center, weight_center);
+            }
+            for (vx_u32 local_channel = packed_end;
+                 local_channel < input_per_group; local_channel++) {
+                vx_i32 input_value = vx_typed_byte(
+                    input, input_base + local_channel, input_dtype);
+                vx_i32 weight_value = vx_typed_byte(
+                    weight, weight_base + local_channel, weight_dtype);
                 accumulator += (input_value - input_zero_point) *
                     (weight_value - weight_zero_points[output_channel]);
             }
@@ -70,6 +89,136 @@ extern "C" VX_CUDA_GLOBAL void vx_cuda_qconv2d_i8u8(
         }
     }
     output[index] = (vx_u8)quantized;
+}
+
+/* Large canonical QConv2D reductions use one warp per NHWC output. Packed
+ * channel groups are distributed across lanes over the complete kernel
+ * footprint, then the K % 4 values at each valid spatial point are retained
+ * as an exact scalar tail. Grouping never crosses a spatial/padding boundary,
+ * so implicit padding continues to represent the input zero point exactly. */
+extern "C" VX_CUDA_GLOBAL void vx_cuda_qconv2d_warp_dp4a_i8u8(
+        const vx_u8* input, const vx_u8* weight,
+        const float* weight_scales, const vx_i32* weight_zero_points,
+        const vx_i32* bias, vx_u8* output, vx_u32 batch,
+        vx_u32 input_height, vx_u32 input_width, vx_u32 input_channels,
+        vx_u32 output_height, vx_u32 output_width,
+        vx_u32 output_channels, vx_u32 kernel_height, vx_u32 kernel_width,
+        vx_u32 input_per_group, vx_u32 stride_y, vx_u32 stride_x,
+        vx_u32 dilation_y, vx_u32 dilation_x, vx_u32 padding_top,
+        vx_u32 padding_left, vx_u32 padding_bottom, vx_u32 padding_right,
+        vx_u32 groups, vx_u32 relu, float input_scale,
+        vx_i32 input_zero_point, float output_scale,
+        vx_i32 output_zero_point, vx_u32 input_dtype,
+        vx_u32 weight_dtype, vx_u32 output_dtype) {
+    vx_u32 thread = vx_global_x();
+    vx_u32 index = thread >> 5u;
+    vx_u32 lane = thread & 31u;
+    vx_u32 elements = batch * output_height * output_width * output_channels;
+    if (index >= elements) return;
+    (void)padding_bottom;
+    (void)padding_right;
+    vx_u32 output_channel = index % output_channels;
+    vx_u32 spatial = index / output_channels;
+    vx_u32 output_x = spatial % output_width;
+    vx_u32 row = spatial / output_width;
+    vx_u32 output_y = row % output_height;
+    vx_u32 batch_index = row / output_height;
+    vx_u32 outputs_per_group = output_channels / groups;
+    vx_u32 group = output_channel / outputs_per_group;
+    vx_i32 input_center = input_zero_point -
+        (input_dtype == VX_DTYPE_U8 ? 128 : 0);
+    vx_i32 weight_center = weight_zero_points[output_channel] -
+        (weight_dtype == VX_DTYPE_U8 ? 128 : 0);
+    vx_u32 packed_end = input_per_group & ~3u;
+    vx_u32 packed_groups_per_position = input_per_group >> 2u;
+    vx_u32 kernel_positions = kernel_height * kernel_width;
+    vx_u32 packed_groups = kernel_positions * packed_groups_per_position;
+    vx_u32 aligned =
+        ((input_channels | input_per_group) & 3u) == 0u &&
+        (((vx_u64)input | (vx_u64)weight) & 3u) == 0u ? 1u : 0u;
+    vx_i32 accumulator = 0;
+    for (vx_u32 packed_index = lane; packed_index < packed_groups;
+         packed_index += 32u) {
+        vx_u32 kernel_position =
+            packed_index / packed_groups_per_position;
+        vx_u32 local_channel =
+            (packed_index -
+             kernel_position * packed_groups_per_position) * 4u;
+        vx_u32 ky = kernel_position / kernel_width;
+        vx_u32 kx = kernel_position - ky * kernel_width;
+        vx_i32 input_y = (vx_i32)(output_y * stride_y +
+            ky * dilation_y) - (vx_i32)padding_top;
+        vx_i32 input_x = (vx_i32)(output_x * stride_x +
+            kx * dilation_x) - (vx_i32)padding_left;
+        if (input_y >= 0 && input_y < (vx_i32)input_height &&
+            input_x >= 0 && input_x < (vx_i32)input_width) {
+            vx_u32 input_base = ((batch_index * input_height +
+                (vx_u32)input_y) * input_width + (vx_u32)input_x) *
+                input_channels + group * input_per_group;
+            vx_u32 weight_base = (((output_channel * kernel_height + ky) *
+                kernel_width + kx) * input_per_group);
+            vx_u32 input_packed = vx_cuda_pack4_s8(
+                input, input_base + local_channel, 1u,
+                input_dtype, aligned);
+            vx_u32 weight_packed = vx_cuda_pack4_s8(
+                weight, weight_base + local_channel, 1u,
+                weight_dtype, aligned);
+            accumulator += vx_cuda_centered_dot4_s8(
+                input_packed, weight_packed,
+                input_center, weight_center);
+        }
+    }
+    for (vx_u32 kernel_position = lane;
+         kernel_position < kernel_positions; kernel_position += 32u) {
+        vx_u32 ky = kernel_position / kernel_width;
+        vx_u32 kx = kernel_position - ky * kernel_width;
+        vx_i32 input_y = (vx_i32)(output_y * stride_y +
+            ky * dilation_y) - (vx_i32)padding_top;
+        vx_i32 input_x = (vx_i32)(output_x * stride_x +
+            kx * dilation_x) - (vx_i32)padding_left;
+        if (input_y >= 0 && input_y < (vx_i32)input_height &&
+            input_x >= 0 && input_x < (vx_i32)input_width) {
+            vx_u32 input_base = ((batch_index * input_height +
+                (vx_u32)input_y) * input_width + (vx_u32)input_x) *
+                input_channels + group * input_per_group;
+            vx_u32 weight_base = (((output_channel * kernel_height + ky) *
+                kernel_width + kx) * input_per_group);
+            for (vx_u32 local_channel = packed_end;
+                 local_channel < input_per_group; local_channel++) {
+                vx_i32 input_value = vx_typed_byte(
+                    input, input_base + local_channel, input_dtype);
+                vx_i32 weight_value = vx_typed_byte(
+                    weight, weight_base + local_channel, weight_dtype);
+                accumulator += (input_value - input_zero_point) *
+                    (weight_value - weight_zero_points[output_channel]);
+            }
+        }
+    }
+    if (lane == 0u && bias) accumulator += bias[output_channel];
+    accumulator = vx_cuda_warp_sum_i32(accumulator);
+    if (lane == 0u) {
+        float product_scale = vx_mul_rn(
+            input_scale, weight_scales[output_channel]);
+        float multiplier = product_scale / output_scale;
+        float transformed = vx_add_rn(
+            vx_mul_rn((float)accumulator, multiplier),
+            (float)output_zero_point);
+        vx_i32 quantized = vx_quantized_value(
+            transformed, output_zero_point, output_dtype);
+        if (relu != 0u) {
+            if (quantized < output_zero_point)
+                quantized = output_zero_point;
+            if (relu >= 2u) {
+                float upper = vx_add_rn(
+                    6.0f / output_scale, (float)output_zero_point);
+                vx_i32 quantized_upper = vx_quantized_value(
+                    upper, output_zero_point, output_dtype);
+                if (quantized > quantized_upper)
+                    quantized = quantized_upper;
+            }
+        }
+        output[index] = (vx_u8)quantized;
+    }
 }
 
 extern "C" VX_CUDA_GLOBAL void vx_cuda_qgroupnorm_i8u8(

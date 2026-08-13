@@ -7,7 +7,7 @@ import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
 
-import { Graph } from '../ts/index.js';
+import { TrainingGraph as Graph } from '../ts/training/TrainingGraph.js';
 import { createWasmStepRunner } from './helpers/training_session.mjs';
 import { CPUAutograd } from '../ts/training/CPUAutograd.js';
 
@@ -24,11 +24,10 @@ function whereGraph(opType, conditionDtype) {
   const right = graph.addWeight('right', [1, 3], 'float32', {
     buffer: Float32Array.of(-0.3, 0.6, 0.1),
   });
-  const { out } = graph.addOp(opType, {
-    condition,
-    x: left,
-    y: right,
-  }, { out: [1, 3] });
+  const inputs = opType === 'Mask'
+    ? { mask: condition, a: left, b: right }
+    : { condition, x: left, y: right };
+  const { out } = graph.addOp(opType, inputs, { out: [1, 3] });
   graph.setOutputs([out.name]);
   return graph;
 }
@@ -41,6 +40,7 @@ function sliceGraph() {
   const { out } = graph.addOp('Slice', { input }, { out: [2, 2] }, {
     axes: [1],
     starts: [1],
+    ends: [4],
     steps: [2],
   });
   graph.setOutputs([out.name]);

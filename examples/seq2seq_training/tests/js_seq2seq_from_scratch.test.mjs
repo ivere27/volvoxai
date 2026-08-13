@@ -2,13 +2,17 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 
 import {
-  ModelBuilder,
   exportModelCheckpoint,
   importModelCheckpoint,
   initializeTensor,
 } from '../../../ts/full.js';
 import { CPUEngine } from '../../../ts/backends/CPUEngine.js';
-import { createCPUTrainingHarness } from '../../../tests/helpers/training_session.mjs';
+import { TrainingModelBuilder as ModelBuilder } from '../../../ts/training/TrainingModelBuilder.js';
+import {
+  createCPUTrainingHarness,
+  trainingGraphFromCheckpoint,
+} from '../../../tests/helpers/training_session.mjs';
+import { logicalSnapshotFromTrainingGraph } from '../../../tests/helpers/training_fixture.mjs';
 import {
   buildEncoderDecoderTransformer,
   createTeacherForcingBatchForGraph,
@@ -91,7 +95,7 @@ test('empty JS model builds, teacher-forces, trains, and checkpoints a full enco
     tokenizerMetadata: { type: 'test-tokenizer', bosTokenId: 1, padTokenId: 0 },
     metadata: { epoch: 1 },
   });
-  const trained = importModelCheckpoint(checkpoint).graph;
+  const trained = trainingGraphFromCheckpoint(checkpoint);
   const trainedProbe = trained.getTensor(probe.name);
   assert.equal(trained.trainingStep, 1);
   assert.ok(trainedProbe.buffer.some((value, index) => value !== before[index]));
@@ -119,17 +123,17 @@ test('empty JS model builds, teacher-forces, trains, and checkpoints a full enco
   }), /cannot be overridden/);
   assert.throws(
     () => importModelCheckpoint({ ...checkpoint, optimizerEntries: [] }),
-    /optimizer state has no entries/,
+    /AdamW state is incomplete/,
   );
   assert.throws(
     () => importModelCheckpoint({ ...checkpoint, trainingStep: 0 }),
-    /invalid step/,
+    /optimizer entry is invalid/,
   );
   const corruptMetadata = structuredClone(checkpoint);
   corruptMetadata.trainingMetadata.teacherForcingSpec.logitsName = probe.name;
-  const corruptRestored = importModelCheckpoint(corruptMetadata);
+  const corruptRestored = trainingGraphFromCheckpoint(corruptMetadata);
   assert.throws(
-    () => validateEncoderDecoderTrainingMetadata(corruptRestored.graph),
+    () => validateEncoderDecoderTrainingMetadata(corruptRestored),
     /logitsName/,
   );
   for (const field of ['trainingStep', 'trainingMetadata', 'optimizerDescriptor']) {
@@ -137,60 +141,56 @@ test('empty JS model builds, teacher-forces, trains, and checkpoints a full enco
     delete truncated[field];
     assert.throws(() => importModelCheckpoint(truncated), new RegExp(`missing required field '${field}'`));
   }
-  const stateForValidation = trained.optimizerState.get(probe.name);
-  const savedSecondMoment = stateForValidation.v[0];
-  stateForValidation.v[0] = -1;
-  assert.throws(() => exportModelCheckpoint(trained), /negative/);
-  stateForValidation.v[0] = savedSecondMoment;
-  const checkpointWeightBytes = new Uint8Array(checkpoint.weights.slice(0));
+  const corruptOptimizerEntry = structuredClone(checkpoint);
+  corruptOptimizerEntry.optimizerEntries[0].step = -1;
+  assert.throws(() => importModelCheckpoint(corruptOptimizerEntry), /optimizer entry is invalid/);
+  const checkpointWeightBytes = new Uint8Array(checkpoint.parameters.slice(0));
   const restored = importModelCheckpoint(checkpoint);
-  assert.equal(restored.graph.trainingStep, 1);
+  const restoredGraph = trainingGraphFromCheckpoint(checkpoint);
+  assert.equal(restored.trainingStep, 1);
   assert.deepEqual(restored.tokenizerMetadata, {
     type: 'test-tokenizer', bosTokenId: 1, padTokenId: 0,
   });
   assert.deepEqual(restored.metadata, { epoch: 1 });
   assert.deepEqual(
-    restored.graph.getTensor(probe.name).buffer,
+    restoredGraph.getTensor(probe.name).buffer,
     trainedProbe.buffer,
   );
-  assert.equal(restored.graph.optimizerState.size, trained.optimizerState.size);
-  assert.equal(restored.graph.optimizerState.get(probe.name).step, 1);
-  assert.equal(restored.graph.outputNames[0], model.logits.name);
+  assert.ok(checkpoint.optimizerEntries.length > 0);
+  assert.equal(checkpoint.optimizerEntries.find(({ name }) => name === probe.name).step, 1);
+  assert.equal(restoredGraph.outputNames[0], model.logits.name);
 
   const resumedBatch = createTeacherForcingBatchForGraph(
-    restored.graph,
+    restoredGraph,
     [2, 3, 0, 3, 2, 4],
     [4, 5, 0, 5, 4, 3],
   );
   const uninterrupted = await training.runStep(graph, {
     ...batch,
   });
-  const continued = await training.runStep(restored.graph, {
+  const continued = await training.runStep(restoredGraph, {
     ...resumedBatch,
   });
   assert.equal(uninterrupted.loss, continued.loss);
   assert.ok(Number.isFinite(continued.loss));
-  const uninterruptedGraph = importModelCheckpoint(
-    await training.exportCheckpoint(graph),
-  ).graph;
-  const continuedGraph = importModelCheckpoint(
-    await training.exportCheckpoint(restored.graph),
-  ).graph;
+  const uninterruptedCheckpoint = await training.exportCheckpoint(graph);
+  const continuedCheckpoint = await training.exportCheckpoint(restoredGraph);
+  const uninterruptedGraph = trainingGraphFromCheckpoint(uninterruptedCheckpoint);
+  const continuedGraph = trainingGraphFromCheckpoint(continuedCheckpoint);
   assert.equal(graph.trainingStep, 0);
-  assert.equal(restored.graph.trainingStep, 1);
+  assert.equal(restoredGraph.trainingStep, 1);
   assert.equal(uninterruptedGraph.trainingStep, 2);
   assert.equal(continuedGraph.trainingStep, 2);
-  assert.equal(continuedGraph.optimizerState.get(probe.name).step, 2);
   for (const tensor of uninterruptedGraph.tensors.values()) {
     if (!tensor.isWeight) continue;
     assert.deepEqual(continuedGraph.getTensor(tensor.name).buffer, tensor.buffer, tensor.name);
-    const expectedState = uninterruptedGraph.optimizerState.get(tensor.name);
-    const actualState = continuedGraph.optimizerState.get(tensor.name);
-    assert.equal(actualState.step, expectedState.step, `${tensor.name} optimizer step`);
-    assert.deepEqual(actualState.m, expectedState.m, `${tensor.name} first moment`);
-    assert.deepEqual(actualState.v, expectedState.v, `${tensor.name} second moment`);
   }
-  assert.deepEqual(new Uint8Array(checkpoint.weights), checkpointWeightBytes);
+  assert.deepEqual(continuedCheckpoint.optimizerEntries, uninterruptedCheckpoint.optimizerEntries);
+  assert.deepEqual(
+    new Uint8Array(continuedCheckpoint.optimizer),
+    new Uint8Array(uninterruptedCheckpoint.optimizer),
+  );
+  assert.deepEqual(new Uint8Array(checkpoint.parameters), checkpointWeightBytes);
 
   const switched = await training.runStep(graph, {
     ...batch,
@@ -199,9 +199,9 @@ test('empty JS model builds, teacher-forces, trains, and checkpoints a full enco
   });
   assert.equal(switched.examples, 5);
   const switchedCheckpoint = await training.exportCheckpoint(graph);
-  const switchedGraph = importModelCheckpoint(switchedCheckpoint).graph;
+  const switchedGraph = trainingGraphFromCheckpoint(switchedCheckpoint);
   assert.equal(switchedGraph.trainingStep, 3);
-  assert.equal(switchedGraph.optimizerState, null,
+  assert.equal(switchedCheckpoint.optimizer, null,
     'switching away from AdamW drops incompatible moments');
   assert.equal(switchedCheckpoint.optimizerDescriptor.updateMode, 'sgd');
   await training.close();
@@ -284,7 +284,7 @@ test('encoder-decoder accepts a precomputed feature prefix and shared source/tar
   assert.ok(Number.isFinite(result.loss));
   assert.equal(result.examples, 1);
 
-  const restored = importModelCheckpoint(await training.exportCheckpoint(graph)).graph;
+  const restored = trainingGraphFromCheckpoint(await training.exportCheckpoint(graph));
   const resumed = createTeacherForcingBatchForGraph(restored, [2, 0, 3], [4, 0]);
   assert.deepEqual([...resumed.inputs['receipt.source_mask']], [1, 1, 1, 0, 1]);
   assert.equal(restored.trainingMetadata.teacherForcingSpec.sourceFeatureLength, 2);
@@ -337,7 +337,7 @@ test('encoder-decoder builder validates special IDs and rolls back late failures
   }
 });
 
-test('checkpoints preserve explicit square-linear layouts, params, and standalone values', async () => {
+test('logical checkpoints preserve explicit square-linear layouts, params, and fixed values', async () => {
   const builder = new ModelBuilder();
   const input = builder.input('x', [1, 2]);
   const weight = builder.weight('w', [2, 2], 'float32', Float32Array.of(1, 2, 3, 4));
@@ -345,7 +345,7 @@ test('checkpoints preserve explicit square-linear layouts, params, and standalon
     'Linear',
     { input, weight },
     { out: { name: 'y', shape: [1, 2] } },
-    { weight_layout: 'IN_OUT', nested: { marker: 7 } },
+    { weight_layout: 'IN_OUT' },
   );
   builder.outputs(out);
   const graph = builder.build();
@@ -355,10 +355,10 @@ test('checkpoints preserve explicit square-linear layouts, params, and standalon
   const before = new Float32Array((await engine.execute({ x: Float32Array.of(1, 2) })).y);
   assert.deepEqual(before, Float32Array.of(7, 10));
 
-  const checkpoint = exportModelCheckpoint(graph);
-  const restored = importModelCheckpoint(checkpoint).graph;
-  checkpoint.graph.nodes[0].params.nested.marker = 99;
-  assert.equal(restored.nodes[0].params.nested.marker, 7);
+  const checkpoint = exportModelCheckpoint(logicalSnapshotFromTrainingGraph(graph));
+  const restored = trainingGraphFromCheckpoint(checkpoint);
+  checkpoint.logicalGraph.nodes[0].params.weight_layout = 'dout_din';
+  assert.equal(restored.nodes[0].params.weight_layout, 'din_dout');
   const restoredEngine = new CPUEngine();
   restoredEngine.allocateGraph(restored);
   assert.deepEqual(
@@ -367,14 +367,12 @@ test('checkpoints preserve explicit square-linear layouts, params, and standalon
   );
 
   const values = new ModelBuilder();
-  const constant = values.tensor('constant', [2], 'float32', {
-    buffer: Float32Array.of(3, -2),
-  });
+  const constant = values.weight('constant', [2], 'float32', Float32Array.of(3, -2));
   values.outputs(constant);
-  const valueCheckpoint = exportModelCheckpoint(values.build());
-  const valueGraph = importModelCheckpoint(valueCheckpoint).graph;
+  const valueCheckpoint = exportModelCheckpoint(logicalSnapshotFromTrainingGraph(values.build()));
+  const valueGraph = trainingGraphFromCheckpoint(valueCheckpoint);
   const restoredConstant = valueGraph.getTensor('constant');
-  assert.equal(restoredConstant.isWeight, false);
+  assert.equal(restoredConstant.isWeight, true);
   assert.equal(restoredConstant.isInput, false);
   assert.deepEqual(restoredConstant.buffer, constant.buffer);
   assert.deepEqual(valueGraph.outputNames, ['constant']);
@@ -383,18 +381,18 @@ test('checkpoints preserve explicit square-linear layouts, params, and standalon
     assert.throws(
       () => importModelCheckpoint({
         ...valueCheckpoint,
-        graph: { ...valueCheckpoint.graph, outputs },
+        logicalGraph: { ...valueCheckpoint.logicalGraph, outputs },
       }),
-      /outputs and outputsExplicit/,
+      /outputs|logical graph/i,
     );
   }
-  for (const field of ['inputs', 'nodes', 'standaloneTensors']) {
+  for (const field of ['inputs', 'nodes']) {
     assert.throws(
       () => importModelCheckpoint({
         ...valueCheckpoint,
-        graph: { ...valueCheckpoint.graph, [field]: null },
+        logicalGraph: { ...valueCheckpoint.logicalGraph, [field]: null },
       }),
-      /inputs, nodes, and standaloneTensors/,
+      new RegExp(field, 'i'),
     );
   }
 
@@ -406,27 +404,29 @@ test('checkpoints preserve explicit square-linear layouts, params, and standalon
     inputs: { input: typedInput },
     outputs: { out: { name: 'typed-output', shape: [1], dtype: 'int32' } },
   });
-  const typedCheckpoint = exportModelCheckpoint(typed.build());
+  const typedCheckpoint = exportModelCheckpoint(logicalSnapshotFromTrainingGraph(typed.build()));
   const missingInputDType = structuredClone(typedCheckpoint);
-  delete missingInputDType.graph.inputs.tokens.dtype;
-  assert.throws(() => importModelCheckpoint(missingInputDType), /explicit shape and dtype/);
+  delete missingInputDType.logicalGraph.inputs.tokens.dtype;
+  assert.throws(() => importModelCheckpoint(missingInputDType), /dtype/i);
   const missingOutputDType = structuredClone(typedCheckpoint);
-  delete missingOutputDType.graph.nodes[0].outputs_dtype.out;
-  assert.throws(() => importModelCheckpoint(missingOutputDType), /explicit shape and dtype/);
+  delete missingOutputDType.logicalGraph.nodes[0].outputs.out.dtype;
+  assert.throws(() => importModelCheckpoint(missingOutputDType), /dtype/i);
   const missingNodeId = structuredClone(typedCheckpoint);
-  delete missingNodeId.graph.nodes[0].id;
-  assert.throws(() => importModelCheckpoint(missingNodeId), /explicit id and opType/);
+  delete missingNodeId.logicalGraph.nodes[0].id;
+  assert.throws(() => importModelCheckpoint(missingNodeId), /id/i);
 
   const automatic = new ModelBuilder();
   const autoInput = automatic.input('auto.x', [1]);
   automatic.addOp('Identity', { input: autoInput }, { out: { name: 'auto.a', shape: [1] } });
   assert.equal(automatic.graph._outputsExplicit, false);
-  const autoRestored = importModelCheckpoint(exportModelCheckpoint(automatic.build()));
-  assert.equal(autoRestored.graph._outputsExplicit, false);
-  autoRestored.model.addOp(
+  const automaticSnapshot = logicalSnapshotFromTrainingGraph(automatic.build());
+  const autoRestored = importModelCheckpoint(exportModelCheckpoint(automaticSnapshot));
+  automatic.addOp(
     'Identity',
-    { input: autoRestored.graph.getTensor('auto.x') },
+    { input: automatic.graph.getTensor('auto.x') },
     { out: { name: 'auto.b', shape: [1] } },
   );
-  assert.deepEqual(autoRestored.graph.outputNames, ['auto.a', 'auto.b']);
+  assert.deepEqual(autoRestored.snapshot.graph.outputs, ['auto.a']);
+  assert.equal(autoRestored.model, undefined);
+  assert.equal(autoRestored.graph, undefined);
 });

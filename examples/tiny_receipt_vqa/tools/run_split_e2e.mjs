@@ -26,14 +26,12 @@ import {
   runTinyReceiptSplitE2E,
   tinyReceiptSplitE2ERawBytes,
 } from '../TinyReceiptSplitE2E.js';
-import { TinyReceiptByteFallbackBPEVocab } from '../TinyReceiptSplitSession.js';
-import { TinyReceiptCharVocab } from '../TinyReceiptW8A8Session.js';
+import {
+  TinyReceiptByteFallbackBPEVocab,
+  TINY_RECEIPT_SPLIT_KV_PACKAGE_FORMAT,
+} from '../TinyReceiptSplitSession.js';
 
 const repository = fileURLToPath(new URL('../../../', import.meta.url));
-const defaultReference = join(
-  repository,
-  'examples/tiny_receipt_vqa/references/split_int8_e2e_ort_cpu.json',
-);
 
 function fail(message) {
   throw new Error(`[run_split_e2e] ${message}`);
@@ -142,27 +140,25 @@ async function packageVocabulary(packageManifestUrl) {
   if (packageManifestUrl.protocol !== 'file:') fail('fixture emission requires a local package.');
   const filename = fileURLToPath(packageManifestUrl);
   const manifest = await readJson(filename, 'package manifest');
+  if (manifest?.format !== TINY_RECEIPT_SPLIT_KV_PACKAGE_FORMAT) {
+    fail('fixture emission requires an explicit-KV v1 package.');
+  }
   const vocabPath = assetPath(manifest?.assets?.vocab?.path, 'manifest assets.vocab.path');
   const value = await readJson(join(dirname(filename), vocabPath), 'vocab');
   const tokenizer = manifest?.tokenizer;
   const tokenIds = tokenizer?.token_ids;
-  if (tokenizer?.type === 'byte_fallback_bpe') {
-    if (!hasExactKeys(tokenizer, [
-      'type', 'version', 'vocab_size', 'normalization', 'tokenizer_hash',
-      'itos_key', 'merges_key', 'token_ids',
-    ]) || !hasExactKeys(tokenIds, ['pad', 'bos', 'eos', 'unk'])) {
-      fail('BPE package tokenizer must use the exact published eight-field contract.');
-    }
-    return TinyReceiptByteFallbackBPEVocab.fromJSON(value, tokenIds, {
-      vocabSize: tokenizer.vocab_size,
-      normalization: tokenizer.normalization,
-      tokenizerHash: tokenizer.tokenizer_hash,
-    });
+  if (!hasExactKeys(tokenizer, [
+    'type', 'version', 'vocab_size', 'normalization', 'tokenizer_hash',
+    'itos_key', 'merges_key', 'token_ids',
+  ]) || tokenizer.type !== 'byte_fallback_bpe' || tokenizer.version !== 1 ||
+      !hasExactKeys(tokenIds, ['pad', 'bos', 'eos', 'unk'])) {
+    fail('package tokenizer must use the canonical byte_fallback_bpe v1 contract.');
   }
-  if (tokenizer?.type !== 'char-vocab' || !Array.isArray(value?.itos)) {
-    fail('package must contain a supported char-vocab or byte_fallback_bpe vocabulary.');
-  }
-  return new TinyReceiptCharVocab(value.itos, tokenIds);
+  return TinyReceiptByteFallbackBPEVocab.fromJSON(value, tokenIds, {
+    vocabSize: tokenizer.vocab_size,
+    normalization: tokenizer.normalization,
+    tokenizerHash: tokenizer.tokenizer_hash,
+  });
 }
 
 function sha256(bytes) {
@@ -176,8 +172,17 @@ async function emitFixtures(directory, packageManifestUrl) {
   const names = {
     image: 'image.f32',
     question_ids: 'question_ids.i32',
+    question_position_ids: 'question_position_ids.i32',
     family_ids: 'family_ids.i32',
     decoder_input_ids: 'decoder_input_ids.i32',
+    position_ids: 'position_ids.i32',
+    past_padding_mask: 'past_padding_mask.i32',
+    ...Object.fromEntries(
+      [...Array(4).keys()].flatMap((layer) => [
+        [`past_k_${layer}`, `past_k_${layer}.f32`],
+        [`past_v_${layer}`, `past_v_${layer}.f32`],
+      ]),
+    ),
   };
   const output = resolve(directory);
   await mkdir(dirname(output), { recursive: true });
@@ -245,15 +250,12 @@ async function main() {
     }, options.out);
     return;
   }
-  if (options.reference && options['no-reference']) {
-    fail('--reference and --no-reference are mutually exclusive.');
+  if (Boolean(options.reference) === Boolean(options['no-reference'])) {
+    fail('pass exactly one of --reference <v1-oracle> or --no-reference.');
   }
   const reference = options['no-reference']
     ? null
-    : await readJson(
-      options.reference ? localFilename(options.reference) : defaultReference,
-      'reference',
-    );
+    : await readJson(localFilename(options.reference), 'reference');
 
   const packageMetadata = JSON.parse(await readFile(join(repository, 'package.json'), 'utf8'));
   const api = await import(pathToFileURL(

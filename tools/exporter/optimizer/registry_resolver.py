@@ -32,6 +32,7 @@ from ..capabilities import validate_graph
 from ..errors import ExporterError
 from ..ir import GraphIR
 from ..pipeline import (
+    ConcretePassPolicy,
     IRPass,
     PassGroup,
     PipelineMetadata,
@@ -39,7 +40,10 @@ from ..pipeline import (
 )
 from ..typed_ptq import CalibrationProfile, PTQConfig
 from .candidate import RewritePolicy, RewriteSemantics
-from .static_qdq_fusion import RuntimeStaticQDQComputeFusionPass
+from .static_qdq_fusion import (
+    RuntimeStaticQDQBatchMatMulFusionPass,
+    RuntimeStaticQDQComputeFusionPass,
+)
 from .target import TargetEnvironment
 from .typed_affine_canonicalization import (
     RuntimeAffineReferenceCanonicalizationPass,
@@ -51,8 +55,14 @@ from .typed_attention import (
 )
 from .typed_bias_folding import RuntimeBiasFoldingPass
 from .typed_constant_folding import RuntimeConstantFoldingPass
+from .typed_common_subexpression import (
+    RuntimeCommonSubexpressionEliminationPass,
+)
 from .typed_elementwise_transpose import RuntimeElementwiseTransposePass
 from .typed_grouped_projection import RuntimeGroupedProjectionSplitPass
+from .typed_groupnorm_silu_island import (
+    RuntimeStaticQDQGroupNormSiLUFusionPass,
+)
 from .typed_passes import (
     OutputArgMaxSpecialization,
     RedundantQDQPass,
@@ -79,6 +89,7 @@ from .typed_singleton_transpose import RuntimeSingletonTransposePass
 from .typed_silu_fusion import RuntimeSiluFusionPass
 from .typed_specialization import (
     InputHoistingSpec,
+    RuntimeDeclaredInputPruningPass,
     RuntimeInputHoistingPass,
     RuntimeInputSpecializationPass,
 )
@@ -101,6 +112,7 @@ class RuntimePassFactoryContext:
     monotonic_argmax_inputs: frozenset[str] = field(default_factory=frozenset)
     input_specializations: Mapping[str, Any] = field(default_factory=dict)
     input_hoistings: tuple[InputHoistingSpec, ...] = ()
+    causal_mask_inputs: frozenset[str] = field(default_factory=frozenset)
     ptq_calibration: Optional[CalibrationProfile] = None
     ptq_config: PTQConfig = field(default_factory=PTQConfig)
     ptq_selected_nodes: Optional[tuple[str, ...]] = None
@@ -141,6 +153,17 @@ class RuntimePassFactoryContext:
             for item in self.input_hoistings
         ):
             raise TypeError("input hoistings must contain InputHoistingSpec values")
+        if isinstance(self.causal_mask_inputs, str):
+            raise TypeError("causal mask inputs must be a collection")
+        causal = frozenset(self.causal_mask_inputs)
+        if any(
+            not isinstance(name, str) or not name or name != name.strip()
+            for name in causal
+        ):
+            raise ValueError(
+                "causal mask inputs must be non-empty trimmed strings"
+            )
+        object.__setattr__(self, "causal_mask_inputs", causal)
         if self.ptq_calibration is not None and not isinstance(
             self.ptq_calibration, CalibrationProfile,
         ):
@@ -175,6 +198,8 @@ class RegistryPipelineRequest:
     allow_calibration: bool = False
     selection_features: frozenset[str] = field(default_factory=frozenset)
     recipe_id: Optional[str] = None
+    shape_profile: Optional[Mapping[str, int]] = None
+    concrete_pass_policy: ConcretePassPolicy = ConcretePassPolicy.FAIL
 
     def __post_init__(self) -> None:
         if not isinstance(self.factory_context, RuntimePassFactoryContext):
@@ -200,6 +225,25 @@ class RegistryPipelineRequest:
             or self.recipe_id != self.recipe_id.strip()
         ):
             raise ValueError("recipe_id must be None or a non-empty trimmed string")
+        if self.shape_profile is not None:
+            if not isinstance(self.shape_profile, Mapping) or any(
+                not isinstance(name, str)
+                or isinstance(value, bool)
+                or not isinstance(value, int)
+                for name, value in self.shape_profile.items()
+            ):
+                raise TypeError(
+                    "shape_profile must map symbol names to integer bindings"
+                )
+            object.__setattr__(
+                self,
+                "shape_profile",
+                MappingProxyType(dict(self.shape_profile)),
+            )
+        if not isinstance(self.concrete_pass_policy, ConcretePassPolicy):
+            raise TypeError(
+                "concrete_pass_policy must be a ConcretePassPolicy"
+            )
 
 
 @dataclass(frozen=True)
@@ -235,10 +279,15 @@ def _affine_canonicalization(context: RuntimePassFactoryContext) -> IRPass:
     return RuntimeAffineReferenceCanonicalizationPass(context.tensor_data)
 
 
+def _declared_input_pruning(context: RuntimePassFactoryContext) -> IRPass:
+    return RuntimeDeclaredInputPruningPass(context.causal_mask_inputs)
+
+
 def _float_attention_fusion(context: RuntimePassFactoryContext) -> IRPass:
     return RuntimeFloatAttentionFusionPass(
         context.tensor_data,
         allow_numerical_migration=True,
+        causal_mask_inputs=context.causal_mask_inputs,
     )
 
 
@@ -260,6 +309,24 @@ def _keep_mask(context: RuntimePassFactoryContext) -> IRPass:
 def _static_qdq_fusion(context: RuntimePassFactoryContext) -> IRPass:
     del context
     return RuntimeStaticQDQComputeFusionPass(allow_numerical_migration=True)
+
+
+def _static_qdq_qbatch_matmul_fusion(
+    context: RuntimePassFactoryContext,
+) -> IRPass:
+    return RuntimeStaticQDQBatchMatMulFusionPass(
+        allow_numerical_migration=True,
+        tensor_data=context.tensor_data,
+    )
+
+
+def _static_qdq_groupnorm_silu_fusion(
+    context: RuntimePassFactoryContext,
+) -> IRPass:
+    return RuntimeStaticQDQGroupNormSiLUFusionPass(
+        allow_numerical_migration=True,
+        tensor_data=context.tensor_data,
+    )
 
 
 def _bias_folding(context: RuntimePassFactoryContext) -> IRPass:
@@ -292,6 +359,10 @@ def _quantized_bias_folding(context: RuntimePassFactoryContext) -> IRPass:
 
 def _constant_folding(context: RuntimePassFactoryContext) -> IRPass:
     return RuntimeConstantFoldingPass(context.tensor_data)
+
+
+def _common_subexpression(context: RuntimePassFactoryContext) -> IRPass:
+    return RuntimeCommonSubexpressionEliminationPass(context.tensor_data)
 
 
 def _input_specialization(context: RuntimePassFactoryContext) -> IRPass:
@@ -331,8 +402,18 @@ PASS_FACTORIES: Mapping[str, RegisteredPassFactory] = MappingProxyType({
         ),
     "tools.exporter.optimizer.typed_specialization:RuntimeInputHoistingPass":
         RegisteredPassFactory(RuntimeInputHoistingPass, _input_hoisting),
+    "tools.exporter.optimizer.typed_specialization:RuntimeDeclaredInputPruningPass":
+        RegisteredPassFactory(
+            RuntimeDeclaredInputPruningPass,
+            _declared_input_pruning,
+        ),
     "tools.exporter.optimizer.typed_constant_folding:RuntimeConstantFoldingPass":
         RegisteredPassFactory(RuntimeConstantFoldingPass, _constant_folding),
+    "tools.exporter.optimizer.typed_common_subexpression:RuntimeCommonSubexpressionEliminationPass":
+        RegisteredPassFactory(
+            RuntimeCommonSubexpressionEliminationPass,
+            _common_subexpression,
+        ),
     "tools.exporter.optimizer.typed_passes:RuntimeOutputArgMaxPass":
         RegisteredPassFactory(RuntimeOutputArgMaxPass, _output_qargmax),
     "tools.exporter.optimizer.typed_passes:RuntimePackedQLinearSplitPass":
@@ -393,6 +474,16 @@ PASS_FACTORIES: Mapping[str, RegisteredPassFactory] = MappingProxyType({
         RegisteredPassFactory(RuntimeShapeChainPass, _without_context(RuntimeShapeChainPass)),
     "tools.exporter.optimizer.static_qdq_fusion:RuntimeStaticQDQComputeFusionPass":
         RegisteredPassFactory(RuntimeStaticQDQComputeFusionPass, _static_qdq_fusion),
+    "tools.exporter.optimizer.static_qdq_fusion:RuntimeStaticQDQBatchMatMulFusionPass":
+        RegisteredPassFactory(
+            RuntimeStaticQDQBatchMatMulFusionPass,
+            _static_qdq_qbatch_matmul_fusion,
+        ),
+    "tools.exporter.optimizer.typed_groupnorm_silu_island:RuntimeStaticQDQGroupNormSiLUFusionPass":
+        RegisteredPassFactory(
+            RuntimeStaticQDQGroupNormSiLUFusionPass,
+            _static_qdq_groupnorm_silu_fusion,
+        ),
     "tools.exporter.optimizer.typed_passes:RuntimeCanonicalizePass":
         RegisteredPassFactory(
             RuntimeCanonicalizePass,
@@ -714,6 +805,10 @@ def _graph_profile_legality(
     """Validate exact persisted descriptors against every profile member."""
 
     document, packaged_tensors = export_runtime_package(graph, tensor_data)
+    # The target validator proves every symbolic operator formula and generated
+    # route over the complete bounded domain for every profile member, then
+    # applies conservative maximum-resource checks.  It never qualifies from a
+    # warm profile or a maximum-shape sample.
     validation = validate_graph(
         document,
         profile_members,
@@ -910,6 +1005,8 @@ def resolve_runtime_pipeline(
             request.factory_context.tensor_data,
         ),
         mutable_stores=(request.factory_context.tensor_data,),
+        shape_profile=request.shape_profile,
+        concrete_pass_policy=request.concrete_pass_policy,
     )
 
 

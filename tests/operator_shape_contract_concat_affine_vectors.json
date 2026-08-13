@@ -1,0 +1,159 @@
+{
+  "format": "volvox-concat-affine-domain-vectors/v1",
+  "cases": [
+    {
+      "id": "constant-prefix-memory-length",
+      "environment": {
+        "B": {"min": 1, "max": 1},
+        "Q": {"min": 1, "max": 12},
+        "M": {"min": 7, "max": 18}
+      },
+      "request": {
+        "inputs": {
+          "input0": {"shape": ["B", 6, 16], "dtype": "float32"},
+          "input1": {"shape": ["B", "Q", 16], "dtype": "float32"}
+        },
+        "params": {"axis": 1},
+        "declaredOutputs": {
+          "out": {"shape": ["B", "M", 16], "dtype": "float32"}
+        }
+      },
+      "expected": {
+        "out": {"shape": ["B", "M", 16], "dtype": "float32"}
+      },
+      "facts": ["M=Q+6 exactly over the complete bounded Concat domain"],
+      "relations": [{"target": "M", "source": "Q", "offset": 6}]
+    },
+    {
+      "id": "singleton-literal-preserves-declared-batch-symbol",
+      "environment": {
+        "B": {"min": 1, "max": 1},
+        "Q": {"min": 1, "max": 12},
+        "M": {"min": 7, "max": 18}
+      },
+      "request": {
+        "inputs": {
+          "input0": {"shape": [1, 6], "dtype": "int32"},
+          "input1": {"shape": ["B", "Q"], "dtype": "int32"}
+        },
+        "params": {"axis": 1},
+        "declaredOutputs": {
+          "out": {"shape": ["B", "M"], "dtype": "int32"}
+        }
+      },
+      "expected": {
+        "out": {"shape": ["B", "M"], "dtype": "int32"}
+      },
+      "facts": ["M=Q+6 exactly over the complete bounded Concat domain"],
+      "relations": [{"target": "M", "source": "Q", "offset": 6}]
+    },
+    {
+      "id": "translated-divisibility",
+      "environment": {
+        "B": {"min": 1, "max": 1},
+        "Q": {"min": 2, "max": 12, "multiple_of": 2},
+        "M": {"min": 8, "max": 18, "multiple_of": 2}
+      },
+      "request": {
+        "inputs": {
+          "input0": {"shape": ["B", "Q", 16], "dtype": "float32"},
+          "input1": {"shape": ["B", 6, 16], "dtype": "float32"}
+        },
+        "params": {"axis": 1},
+        "declaredOutputs": {
+          "out": {"shape": ["B", "M", 16], "dtype": "float32"}
+        }
+      },
+      "expected": {
+        "out": {"shape": ["B", "M", 16], "dtype": "float32"}
+      },
+      "facts": ["M=Q+6 exactly over the complete bounded Concat domain"],
+      "relations": [{"target": "M", "source": "Q", "offset": 6}]
+    },
+    {
+      "id": "tampered-output-bounds",
+      "environment": {
+        "B": {"min": 1, "max": 1},
+        "Q": {"min": 1, "max": 12},
+        "M": {"min": 7, "max": 17}
+      },
+      "request": {
+        "inputs": {
+          "input0": {"shape": ["B", 6, 16], "dtype": "float32"},
+          "input1": {"shape": ["B", "Q", 16], "dtype": "float32"}
+        },
+        "params": {"axis": 1},
+        "declaredOutputs": {
+          "out": {"shape": ["B", "M", 16], "dtype": "float32"}
+        }
+      },
+      "expected_error": {
+        "code": "UNPROVABLE_DYNAMIC_SHAPE_FORMULA",
+        "path": "declared output 'out'.shape[1]"
+      }
+    },
+    {
+      "id": "tampered-output-divisibility",
+      "environment": {
+        "B": {"min": 1, "max": 1},
+        "Q": {"min": 1, "max": 12},
+        "M": {"min": 7, "max": 18, "multiple_of": 2}
+      },
+      "request": {
+        "inputs": {
+          "input0": {"shape": ["B", 6, 16], "dtype": "float32"},
+          "input1": {"shape": ["B", "Q", 16], "dtype": "float32"}
+        },
+        "params": {"axis": 1},
+        "declaredOutputs": {
+          "out": {"shape": ["B", "M", 16], "dtype": "float32"}
+        }
+      },
+      "expected_error": {
+        "code": "UNPROVABLE_DYNAMIC_SHAPE_FORMULA",
+        "path": "declared output 'out'.shape[1]"
+      }
+    },
+    {
+      "id": "two-dynamic-axis-terms",
+      "environment": {
+        "B": {"min": 1, "max": 1},
+        "Q": {"min": 1, "max": 12},
+        "T": {"min": 1, "max": 12},
+        "M": {"min": 2, "max": 24}
+      },
+      "request": {
+        "inputs": {
+          "input0": {"shape": ["B", "Q", 16], "dtype": "float32"},
+          "input1": {"shape": ["B", "T", 16], "dtype": "float32"}
+        },
+        "params": {"axis": 1},
+        "declaredOutputs": {
+          "out": {"shape": ["B", "M", 16], "dtype": "float32"}
+        }
+      },
+      "expected_error": {
+        "code": "UNPROVABLE_DYNAMIC_SHAPE_FORMULA",
+        "path": "operator input 'input1'.shape[1]"
+      }
+    },
+    {
+      "id": "missing-output-symbol",
+      "environment": {
+        "B": {"min": 1, "max": 1},
+        "Q": {"min": 1, "max": 12}
+      },
+      "request": {
+        "inputs": {
+          "input0": {"shape": ["B", 6, 16], "dtype": "float32"},
+          "input1": {"shape": ["B", "Q", 16], "dtype": "float32"}
+        },
+        "params": {"axis": 1}
+      },
+      "expected_error": {
+        "code": "UNPROVABLE_DYNAMIC_SHAPE_FORMULA",
+        "path": "operator input 'input1'.shape[1]"
+      }
+    }
+  ]
+}
