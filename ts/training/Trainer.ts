@@ -15,7 +15,7 @@ import {
 import { WasmAutograd } from './WasmAutograd.js';
 import { WebGPUAutograd } from './WebGPUAutograd.js';
 
-export type TrainingBackend = 'cpu' | 'wasm' | 'webgpu';
+export type TrainingBackend = 'cpu-js' | 'wasm' | 'webgpu';
 
 export interface TrainerOptions extends TrainerCoreOptions {
   readonly backend?: TrainingBackend;
@@ -66,11 +66,11 @@ export class Trainer extends TrainerCore<TrainingBackend> {
   ): Promise<Trainer> {
     assertTrainerRequest(snapshot, options);
     const {
-      backend = 'cpu',
+      backend = 'cpu-js',
       wasmUrl = new URL('./volvoxai.full.wasm', import.meta.url),
       device = null,
     } = options;
-    if (backend !== 'cpu' && backend !== 'wasm' && backend !== 'webgpu') {
+    if (backend !== 'cpu-js' && backend !== 'wasm' && backend !== 'webgpu') {
       throw new VolvoxAIError(
         'INVALID_ARGUMENT',
         `Unsupported training backend '${String(backend)}'.`,
@@ -80,7 +80,7 @@ export class Trainer extends TrainerCore<TrainingBackend> {
     const prepared = prepareTrainer(snapshot, options, backend);
     let ownedDevice: GPUDevice | null = null;
     try {
-      if (backend === 'cpu') {
+      if (backend === 'cpu-js') {
         const factory: TrainingDriverFactory = (graph) => ({
           graph,
           trainStep: (step) => CPUAutograd.trainStep(graph, step),

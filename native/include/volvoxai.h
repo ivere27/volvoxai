@@ -31,11 +31,36 @@ extern "C" {
 #define VX_REPORT_DECODE_CAPACITY 128u
 #define VX_MAX_BACKEND_CANDIDATES 16u
 
+/* Process-envelope sampling is an optional, read-only diagnostic surface.
+ * A successful call reports each acquired signal through available_mask;
+ * unavailable or failed platform samplers leave the corresponding bit clear
+ * and value zero. This makes an available exact zero distinct from an
+ * unavailable value without introducing sampling failures into inference. */
+#define VX_PROCESS_MEMORY_SAMPLE_ABI_VERSION UINT32_C(1)
+#define VX_PROCESS_MEMORY_AVAILABLE_CURRENT_RSS UINT32_C(1)
+#define VX_PROCESS_MEMORY_AVAILABLE_PEAK_RSS UINT32_C(2)
+#define VX_PROCESS_MEMORY_AVAILABLE_MONOTONIC_TIME UINT32_C(4)
+
+typedef struct VxProcessMemorySampleV1 {
+    size_t struct_size;
+    uint32_t abi_version;
+    uint32_t available_mask;
+    uint64_t rss_bytes;
+    uint64_t peak_rss_bytes;
+    uint64_t monotonic_nanoseconds;
+} VxProcessMemorySampleV1;
+
+#define VX_PROCESS_MEMORY_SAMPLE_V1_INIT { \
+    sizeof(VxProcessMemorySampleV1), VX_PROCESS_MEMORY_SAMPLE_ABI_VERSION, \
+    0, 0, 0, 0 \
+}
+
 typedef struct VxRuntime VxRuntime;
 typedef struct VxModel VxModel;
 typedef struct VxCompiledModel VxCompiledModel;
 typedef struct VxExecutionContext VxExecutionContext;
 typedef struct VxResult VxResult;
+typedef struct VxRequest VxRequest;
 
 typedef struct VxReport {
     size_t struct_size;
@@ -85,17 +110,36 @@ typedef struct VxRuntimeOptions {
     size_t struct_size;
     int32_t debug;
     int32_t cpu_threads;
+    /* DIRECT disables scheduled submission. SCHEDULED permits both direct
+     * vx_runtime_run calls and scheduled vx_runtime_submit calls. The enum is
+     * generated from proto/volvoxai.proto. */
+    VxExecutionMode execution_mode;
+    size_t max_scheduled_requests;
+    size_t max_scheduled_input_bytes;
+    /* Maximum coalescing delay for scheduled requests. Zero dispatches
+     * immediately; deadlines may shorten a nonzero delay. */
+    uint32_t max_batch_delay_milliseconds;
+    /* Queued, in-flight, and caller-retained results share these Runtime-wide
+     * bounds. Admission precharges each route's declared worst-case output sum;
+     * a validated success shrinks that charge to its owned snapshot bytes. The
+     * slot and remaining bytes return on failure or final VxResult release. */
+    size_t max_unconsumed_results;
+    size_t max_unconsumed_result_bytes;
 } VxRuntimeOptions;
 
-#define VX_RUNTIME_OPTIONS_INIT { sizeof(VxRuntimeOptions), 0, 0 }
+#define VX_RUNTIME_OPTIONS_INIT \
+    { sizeof(VxRuntimeOptions), 0, 0, VX_EXECUTION_MODE_SCHEDULED, 64u, \
+      64u * 1024u * 1024u, 0u, 64u, 64u * 1024u * 1024u }
 
 /* Which slots of a declared weight bank to materialize.
  *
  * Residency is part of the immutable loaded Model source. Every compiled
- * context owns a private engine/weight snapshot and materializes the same
- * selected rows. Slot ids are ascending, unique, and index the bank's full
- * extent. Route indices stay in that global slot space at execution, so a
- * model loaded with a subset still routes by the ids the exporter emitted. */
+ * context owns a private engine and descriptor table, borrows the compiled
+ * immutable weight blobs, and materializes the same selected rows in a
+ * context-owned copy-on-write overlay. Slot ids are ascending, unique, and
+ * index the bank's full extent. Route indices stay in that global slot space
+ * at execution, so a model loaded with a subset still routes by the ids the
+ * exporter emitted. */
 typedef struct VxBankResidency {
     size_t struct_size;
     /* Weight tensor named by the graph document's "banks" table. */
@@ -248,6 +292,67 @@ typedef struct VxTensorBinding {
     { sizeof(VxTensorBinding), NULL, VX_DTYPE_F32, 0, {0}, NULL, 0, \
       VX_MEMORY_HOST }
 
+typedef enum VxRuntimeFreshness {
+    /* Every admitted request remains eligible until cancelled or completed. */
+    VX_RUNTIME_FRESHNESS_ALL = 0,
+    /* A request with the same compiled route and nonzero stream key is
+     * superseded by a newer admitted LATEST request. Queued replacement is
+     * transactional: equal payload storage may be reused across dynamic shapes,
+     * while a larger payload requires temporary byte-budget headroom. Already
+     * submitted work remains physical but its result is discarded at completion. */
+    VX_RUNTIME_FRESHNESS_LATEST = 1,
+    /* Refuse or retire queued/completed work whose monotonic deadline elapsed. */
+    VX_RUNTIME_FRESHNESS_DROP_IF_LATE = 2
+} VxRuntimeFreshness;
+
+#define VX_RUNTIME_PRIORITY_MIN (-1000)
+#define VX_RUNTIME_PRIORITY_MAX 1000
+
+typedef struct VxRuntimeSubmitOptions {
+    size_t struct_size;
+    /* Higher values run first. Queued age raises effective priority; equal
+     * effective priorities use earliest-deadline-first, then request id. */
+    int32_t priority;
+    /* Absolute CLOCK_MONOTONIC microseconds. Zero disables the deadline. It is
+     * always an admission/EDF target; only DROP_IF_LATE makes it a hard
+     * queued/completion cutoff. */
+    uint64_t deadline_monotonic_micros;
+    VxRuntimeFreshness freshness;
+    /* Required and nonzero for LATEST. Numeric identity is bounded and copied
+     * by value; it is never interpreted as a caller-owned string. */
+    uint64_t stream_key;
+} VxRuntimeSubmitOptions;
+
+#define VX_RUNTIME_SUBMIT_OPTIONS_INIT \
+    { sizeof(VxRuntimeSubmitOptions), 0, 0, VX_RUNTIME_FRESHNESS_ALL, 0 }
+
+typedef enum VxRuntimeRequestState {
+    VX_RUNTIME_REQUEST_QUEUED = 0,
+    VX_RUNTIME_REQUEST_RUNNING = 1,
+    VX_RUNTIME_REQUEST_SUCCEEDED = 2,
+    VX_RUNTIME_REQUEST_CANCELLED = 3,
+    VX_RUNTIME_REQUEST_FAILED = 4,
+    VX_RUNTIME_REQUEST_SUPERSEDED = 5
+} VxRuntimeRequestState;
+
+typedef struct VxRequestInfo {
+    size_t struct_size;
+    uint64_t request_id;
+    VxRuntimeRequestState state;
+    /* BUSY while queued/running; otherwise the terminal execution status. */
+    VxStatus status;
+    size_t owned_input_bytes;
+    /* Set when accepted work crossed its target. ALL/LATEST still publish a
+     * successful result; DROP_IF_LATE instead returns DEADLINE_EXCEEDED. */
+    int32_t deadline_missed;
+} VxRequestInfo;
+
+#define VX_REQUEST_INFO_INIT \
+    { sizeof(VxRequestInfo), 0, VX_RUNTIME_REQUEST_QUEUED, \
+      VX_STATUS_BUSY, 0, 0 }
+
+#define VX_REQUEST_WAIT_INFINITE UINT64_MAX
+
 /* Resolved per-tensor affine metadata. Numeric values are loaded from the
  * safetensors tensors referenced by graph.quantization.tensors; they are not
  * graph JSON parameters. */
@@ -262,6 +367,15 @@ typedef struct VxAffineQuantization {
     { sizeof(VxAffineQuantization), 0, 0.0f, 0 }
 
 VX_API const char* vx_status_string(VxStatus status);
+/* Current CLOCK_MONOTONIC time in microseconds, or zero when unavailable.
+ * Submit deadlines use this clock domain. */
+VX_API uint64_t vx_runtime_monotonic_time_micros(void);
+
+/* Returns one when the exact v1 descriptor was accepted, even if no platform
+ * signal was available, and zero for NULL, struct-size, or ABI-version
+ * negotiation failure. The function has no runtime handle and cannot change
+ * inference state. */
+VX_API int vx_process_memory_sample_v1(VxProcessMemorySampleV1* sample);
 
 VX_API VxStatus vx_runtime_create(const VxRuntimeOptions* options,
                            VxRuntime** out_runtime,
@@ -295,6 +409,51 @@ VX_API void vx_compiled_model_retain(VxCompiledModel* compiled);
 VX_API void vx_compiled_model_release(VxCompiledModel* compiled);
 VX_API VxStatus vx_compiled_model_report(const VxCompiledModel* compiled,
                                   VxReport* report);
+
+/* Direct synchronous execution of one logical request, including a
+ * caller-authored bulk B=N binding. The Runtime borrows inputs only until this
+ * call returns, reuses the exact compiled route's retained mutable context,
+ * and allocates neither a request handle nor the Runtime coordinator. It still
+ * reserves one bounded result ticket before entering the provider. A busy
+ * route returns VX_STATUS_BUSY and never falls back to scheduling. */
+VX_API VxStatus vx_runtime_run(
+    VxRuntime* runtime,
+    VxCompiledModel* compiled,
+    const VxTensorBinding* inputs,
+    size_t input_count,
+    VxResult** out_result,
+    VxReport* report);
+
+/* Scheduled stateless Runtime execution. A Runtime created in DIRECT mode
+ * rejects submission. SCHEDULED validates normalized metadata, reserves the
+ * Runtime request/input and result budgets, then copies HOST payload bytes.
+ * Normalized names borrow the retained model's immutable storage; caller
+ * descriptors, names, and payloads may be released once submit returns. */
+VX_API VxStatus vx_runtime_submit(
+    VxRuntime* runtime,
+    VxCompiledModel* compiled,
+    const VxTensorBinding* inputs,
+    size_t input_count,
+    const VxRuntimeSubmitOptions* options,
+    VxRequest** out_request,
+    VxReport* report);
+VX_API VxStatus vx_request_poll(const VxRequest* request,
+                                VxRequestInfo* info,
+                                VxReport* report);
+/* Zero is a non-blocking wait. VX_REQUEST_WAIT_INFINITE waits without a
+ * timeout. A finite timeout returns BUSY while the request remains live. */
+VX_API VxStatus vx_request_wait(VxRequest* request,
+                                uint64_t timeout_milliseconds,
+                                VxReport* report);
+/* Queued work is removed immediately. Running device/CPU work is logically
+ * cancelled and its result suppressed after the physical execution returns. */
+VX_API VxStatus vx_request_cancel(VxRequest* request, VxReport* report);
+/* Returns a retained immutable result on success. The caller releases it with
+ * vx_result_release(). */
+VX_API VxStatus vx_request_result(VxRequest* request,
+                                  VxResult** out_result,
+                                  VxReport* report);
+VX_API void vx_request_release(VxRequest* request);
 
 VX_API VxStatus vx_compiled_model_create_context(
     VxCompiledModel* compiled,

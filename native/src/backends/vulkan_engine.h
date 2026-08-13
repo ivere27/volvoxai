@@ -28,6 +28,8 @@ typedef struct VulkanDomainLimits {
     uint64_t maximum_storage_buffer_bytes;
     uint64_t maximum_uniform_buffer_bytes;
     uint64_t maximum_total_span_bytes;
+    uint64_t compute_arena_allocation_bytes;
+    uint64_t staging_allocation_bytes;
     uint64_t maximum_scratch_bytes;
     uint64_t current_graph_scratch_bytes;
     uint64_t storage_alignment;
@@ -43,6 +45,9 @@ typedef struct VulkanDomainLimits {
 int vk_query_domain_limits(VulkanDomainLimits* limits);
 
 #if defined(VOLVOXAI_VULKAN_TESTING)
+int vk_test_parse_arena_mebibytes(const char* text, size_t alignment,
+                                  size_t* bytes);
+
 typedef struct {
     int slot_count;
     size_t arena_cursor;
@@ -74,6 +79,29 @@ typedef struct {
     uint64_t scalar_dispatches;
 } VkConvTacticProbe;
 
+typedef struct {
+    uint64_t prepared_pipeline_creates;
+    uint64_t prepared_kernel_count;
+    uint64_t pipeline_cache_available;
+} VkPipelineCacheProbe;
+
+typedef struct {
+    uint64_t arena_bytes;
+    uint64_t arena_allocation_bytes;
+    uint64_t staging_bytes;
+    uint64_t staging_allocation_bytes;
+    uint64_t noncoherent_atom_bytes;
+    uint64_t upload_count;
+    uint64_t upload_bytes;
+    uint64_t download_count;
+    uint64_t download_bytes;
+    uint64_t submit_count;
+    int compute_device_local;
+    int compute_host_visible;
+    int staging_host_visible;
+    int staging_host_coherent;
+} VkMemoryPlacementProbe;
+
 int vk_test_context_state_write(const VkContextStateProbe* probe);
 int vk_test_context_state_read(VkContextStateProbe* probe);
 int vk_test_graph_dynamic_state(VkGraphDynamicStateProbe* probe);
@@ -83,6 +111,12 @@ void vk_test_qconv_tactic_reset(void);
 int vk_test_qconv_tactic_read(VkQConvTacticProbe* probe);
 void vk_test_conv_tactic_reset(void);
 int vk_test_conv_tactic_read(VkConvTacticProbe* probe);
+int vk_test_pipeline_cache_read(VkPipelineCacheProbe* probe);
+int vk_test_memory_placement_read(VkMemoryPlacementProbe* probe);
+int vk_test_staging_round_trip(const void* input, void* output, size_t bytes);
+int vk_test_staging_mapped_range(size_t offset, size_t bytes,
+                                 size_t* aligned_offset,
+                                 size_t* aligned_bytes);
 #endif
 
 void vk_graph_reset(void);
@@ -98,9 +132,11 @@ int vk_graph_bind_shape_domain(
 void vk_graph_begin_forward(void);
 int vk_graph_end_forward(void);
 /* Append compact nonzero per-forward physical tactic counts to public route
- * evidence: c16/cs, ql[dts], qb[ds], and qc[dts]. */
+ * evidence: c16/cs, ql[dts], qb[ds], qc[dts], and pipeline creates. */
 int vk_graph_append_dynamic_telemetry(char* output,
                                       size_t output_capacity);
+/* Exact live placement/copy proof kept ahead of the fixed report tail. */
+int vk_graph_execution_evidence(char* output, size_t output_capacity);
 void vk_graph_mark_host(const void* host, size_t bytes, int is_weight);
 int vk_graph_sync_host(const void* host, size_t bytes, int is_weight);
 /* Classification-only promotion used after the invariant bootstrap pass. */
@@ -254,7 +290,7 @@ int vk_graph_quantize_linear_i8(const float* in, signed char* out, long n,
                                 float output_scale, int output_zp);
 int vk_graph_dequantize_linear_f32(const float* in, const float* scale, const float* zero_point,
                                    float* out, long n, int has_zero_point);
-/* Canonical physical-byte W8A8 dense dispatch.  Activations, weights, and
+/* Canonical W8A8 dense dispatch.  Activations, weights, and
  * outputs are raw I8/U8 buffers; scales and zero points are per output
  * channel and bias is in the input_scale*weight_scale accumulator domain. */
 int vk_graph_qlinear_i8u8(const void* input, const void* weight,
@@ -274,7 +310,7 @@ int vk_graph_qembedding_i8u8(const int32_t* tokens, const void* weight,
                              uint32_t token_count, uint32_t vocab, uint32_t hidden,
                              float output_scale, int32_t output_zero_point,
                              uint32_t weight_dtype, uint32_t output_dtype);
-/* Canonical physical-byte W8A8 Conv2D.  Activations use NHWC and weights use
+/* Canonical W8A8 Conv2D.  Activations use NHWC and weights use
  * [O,H,W,I/group] OHWI.  `bias` may be NULL; the backend binds persistent
  * zero I32 storage in that case. Dtypes use canonical VxDataType values. */
 int vk_graph_qconv2d_i8u8(const void* input, const void* weight,
@@ -300,7 +336,7 @@ int vk_graph_quantize_typed_f32_i8u8(const float* input, uint32_t elements,
 int vk_graph_dequantize_typed_i8u8_f32(const void* input, uint32_t elements,
                                        float input_scale, int32_t input_zero_point,
                                        uint32_t input_dtype, float* output);
-/* Shape-only physical-byte operations preserve the exact scalar activation
+/* Shape-only byte operations preserve the exact scalar activation
  * descriptor (I8/U8 dtype, F32 scale, and zero point) across every operand. */
 int vk_graph_copy_i8u8(const void* input, uint32_t input_elements,
                        void* output, uint32_t output_elements,
@@ -339,7 +375,7 @@ int vk_graph_resize_nearest_i8u8(const void* input, void* output,
                                  float input_scale, int32_t input_zero_point,
                                  float output_scale, int32_t output_zero_point,
                                  uint32_t input_dtype, uint32_t output_dtype);
-/* Canonical physical-byte W8A8 elementwise add.  The three logical element
+/* Canonical W8A8 elementwise add.  The three logical element
  * counts must be identical; raw device storage is internally rounded only for
  * the packed-u32 shader ABI. Dtypes use canonical VxDataType values. */
 int vk_graph_qadd_i8u8(const void* a, uint32_t a_elements,
@@ -399,6 +435,12 @@ int vk_graph_qsdpa_i8u8(const void* q, const void* k, const void* v,
                         uint32_t output_dtype, uint32_t causal,
                         uint32_t mask_mode);
 /* Raw-byte I8/U8 ArgMax, emitting one I32 first-tie index per [outer,inner]. */
+int vk_graph_row_index_transfer(const void* source, size_t source_bytes,
+                                const int32_t* indices, uint32_t rows,
+                                void* destination, size_t destination_bytes,
+                                uint32_t row_words, uint32_t indexed_rows,
+                                uint32_t mode);
+
 int vk_graph_qargmax_i8u8(const void* input, int32_t* output,
                            uint32_t outer, uint32_t axis_size,
                            uint32_t inner, uint32_t input_dtype);

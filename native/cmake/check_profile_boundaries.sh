@@ -74,7 +74,7 @@ for binary in "$inf" "$full"; do
   if nm -g --defined-only "$binary" | grep -Eq " (tiny_receipt_split_w8a8_run|kie_chat|kie_config_is_tiny_receipt|volvoxai_tokenizer_[A-Za-z0-9_]*)$"; then
     echo "$binary unexpectedly contains a model-specific session symbol."; exit 1
   fi
-  if strings "$binary" | grep -Eq "volvoxai-tiny-receipt-vqa-split-kv-onnx-package-v1|tiny_receipt_kie|vocab\.bin|merges\.txt"; then
+  if strings "$binary" | grep -Eq "volvoxai-tiny-receipt-vqa-split-kv-onnx-package-v2|tiny_receipt_kie|vocab\.bin|merges\.txt"; then
     echo "$binary unexpectedly contains model or vocabulary policy."; exit 1
   fi
 done

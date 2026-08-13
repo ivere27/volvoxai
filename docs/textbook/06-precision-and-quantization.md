@@ -103,7 +103,7 @@ integer     q  =  round(r / scale) + zero_point      ← QUANTIZE   (float → i
 out[i] = (in[i] - zero_point) * scale;     // int8 → float
 ```
 
-Quantize (`native/src/kernels/quant_cpu_opt.c`, `quantize_scalar_i8`):
+Quantize (`native/src/kernels/quant_cpu_isa.c`, `quantize_scalar_i8`):
 
 ```c
 q = clamp_i8( lrintf(x / scale) + zero_point );   // float → int8, clamped to [-128,127]
@@ -170,7 +170,7 @@ errors mostly cancel — which is why an 8-bit model still detects dogs correctl
 
 🔬 A quantized conv does its heavy multiply-accumulate loop in **cheap integer arithmetic**, and
 only converts back to a real number once at the very end. The pipeline for one output value
-(`native/src/kernels/quant_cpu_opt.c`):
+(`native/src/kernels/quant_cpu_isa.c`):
 
 ```mermaid
 flowchart LR
@@ -196,7 +196,7 @@ flowchart LR
 The key insight: **activations stay int8 from layer to layer** ("a quantized island"), so the
 whole backbone runs in bytes. Only at the very end does `DequantizeLinear` turn the final
 `scores`/`boxes` back into floats you can read. This is exactly what VolvoxAI's native CPU path
-does (`native/src/kernels/quant_cpu_opt.c`); the browser tiers instead fold int8 conv weights back to fp32 at
+does (`native/src/kernels/quant_cpu_isa.c`); the browser tiers instead fold int8 conv weights back to fp32 at
 load time (simpler, still small on disk).
 
 > 🔬 **Under the hood: why int32, and the requantize multiplier.** The accumulator is **int32** because

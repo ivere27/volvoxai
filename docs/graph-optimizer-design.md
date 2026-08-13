@@ -60,7 +60,7 @@ release policy.
 
 TinyReceipt-specific encoder/decoder composition, package manifests, routing,
 and qualification live under `examples/tiny_receipt_vqa/`. Its current
-explicit-KV package-v1 path imports the producer-authored FP32 or static INT8
+explicit-KV package-v2 path imports the producer-authored FP32 or static INT8
 ONNX variant directly.
 
 The release rules are:

@@ -1,13 +1,13 @@
 // Level 1-B / 2-B: cross-tier BACKWARD (gradient) parity.
 //
-//   node tests/parity/backward/run_backward.mjs           # produce cpu+wasm grads + dump tensors
-//   node tests/parity/backward/run_backward.mjs compare   # compare cpu/wasm/torch grad signatures
+//   node tests/parity/backward/run_backward.mjs           # produce cpu-js+wasm grads + dump tensors
+//   node tests/parity/backward/run_backward.mjs compare   # compare cpu-js/wasm/torch grad signatures
 //
 // The engine ships autograd + optimizer + loss but nothing checked gradients across
 // tiers or against an external oracle. Each case runs one forward + cross-entropy +
-// backward via Model -> Trainer on cpu and wasm (webgpu on a GPU
+// backward via Model -> Trainer on cpu-js and wasm (webgpu on a GPU
 // box), and dumps the exact weights/inputs/targets so backward_torch_oracle.py can
-// compute the PyTorch reference. Gates wasm vs cpu (consistency) + both vs PyTorch.
+// compute the PyTorch reference. Gates wasm vs cpu-js (consistency) + both vs PyTorch.
 import { signature, compareSignature } from '../lib/extract.mjs';
 import {
   atomicWriteJsonSync,
@@ -30,7 +30,7 @@ import { pathToFileURL, fileURLToPath } from 'node:url';
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(HERE, '..', '..', '..');
 const OUT = path.join(HERE, 'out');
-const KNOWN_TIERS = ['cpu', 'wasm', 'webgpu'];
+const KNOWN_TIERS = ['cpu-js', 'wasm', 'webgpu'];
 const RESULT_TIERS = [...KNOWN_TIERS, 'torch'];
 const MANIFEST_DIR = 'manifests';
 
@@ -262,7 +262,7 @@ async function produce(tiers) {
 
   let campaignRunId;
   if (attachWebgpu) {
-    const cpuManifest = readTierManifest('cpu', fingerprint);
+    const cpuManifest = readTierManifest('cpu-js', fingerprint);
     readTierManifest('wasm', fingerprint, cpuManifest.runId);
     campaignRunId = cpuManifest.runId;
   }
@@ -405,10 +405,10 @@ function compare() {
   const policy = JSON.parse(fs.readFileSync(path.join(HERE, '..', 'policy.json'), 'utf8'));
   const ver = JSON.parse(fs.readFileSync(path.join(ROOT, 'package.json'), 'utf8')).version;
   const fingerprint = backwardFingerprint(ver);
-  const cpuManifest = readTierManifest('cpu', fingerprint);
+  const cpuManifest = readTierManifest('cpu-js', fingerprint);
   const runId = cpuManifest.runId;
   const manifests = {
-    cpu: cpuManifest,
+    'cpu-js': cpuManifest,
     wasm: readTierManifest('wasm', fingerprint, runId),
   };
   for (const tier of ['webgpu', 'torch']) {
@@ -421,12 +421,12 @@ function compare() {
   );
   let fail = 0, ran = 0;
   const lines = ['# Backward + optimizer-step cross-tier parity', '',
-    'oracle: pure-JS (cpu). wasm/webgpu vs cpu gate (when present); torch = external correctness (gates cpu).'];
+    'oracle: pure-JS (cpu-js). wasm/webgpu vs cpu-js gate (when present); torch = external correctness (gates cpu-js).'];
   // Two tables: gradients (`sigs`) and one SGD step's updated weights (`stepSigs`).
   for (const [key, title] of [['sigs', 'Gradients'], ['stepSigs', `Updated weights after one SGD step (lr=${LR})`]]) {
-    lines.push('', `## ${title}`, '', '| case | tensor | wasm vs cpu | webgpu vs cpu | torch (ext) |', '|---|---|---|---|---|');
+    lines.push('', `## ${title}`, '', '| case | tensor | wasm vs cpu-js | webgpu vs cpu-js | torch (ext) |', '|---|---|---|---|---|');
     for (const c of CASES) {
-      const cpu = results.cpu[c.id];
+      const cpu = results['cpu-js'][c.id];
       for (const name of c.trainable) {
         const cell = { wasm: '—', webgpu: '—', torch: '—' };
         for (const tier of ['wasm', 'webgpu']) {
@@ -458,4 +458,4 @@ function compare() {
 
 const args = process.argv.slice(2);
 if (args[0] === 'compare') compare();
-else await produce(args.length ? args : ['cpu', 'wasm']); // e.g. `produce webgpu` on a GPU box
+else await produce(args.length ? args : ['cpu-js', 'wasm']); // e.g. `produce webgpu` on a GPU box

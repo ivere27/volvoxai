@@ -806,6 +806,21 @@ export function checkedWebGPUPhysicalDomain(
     ceilDivide(descriptorElements(input, descriptor, true), divisor), 1n, 1n,
   ], workgroupLimit);
 
+  const dispatchLinear2D = (
+    node: NodeDescriptor,
+    descriptor: LogicalDomainTensorDescriptor,
+    divisor: bigint,
+    label = node.opType,
+  ): void => {
+    const groups = ceilDivide(descriptorElements(input, descriptor, true), divisor);
+    const strideLimit = U32_MAX / divisor;
+    const x = groups < workgroupLimit
+      ? (groups < strideLimit ? groups : strideLimit)
+      : (workgroupLimit < strideLimit ? workgroupLimit : strideLimit);
+    const y = ceilDivide(groups, x);
+    assertDispatchBound(node, label, [x, y, 1n], workgroupLimit);
+  };
+
   for (let index = 0; index < input.graph.nodes.length; index++) {
     const node = input.graph.nodes[index];
     const proof = input.shapeDomainProof.nodes[index];
@@ -841,7 +856,7 @@ export function checkedWebGPUPhysicalDomain(
       assertDType(node, inputs.input, new Set(['float32']), 'input');
       assertDType(node, output, new Set(['float32']), 'output');
       required.add(WEBGPU_UNIFORM_ELEMENTWISE_ROUTES[node.opType]);
-      dispatch1D(node, output, 64n, 'uniform elementwise');
+      dispatchLinear2D(node, output, 64n, 'uniform elementwise');
       charge(node, 16n, 'uniform', 'elementwise parameters');
       continue;
     }
@@ -881,11 +896,11 @@ export function checkedWebGPUPhysicalDomain(
         if (source.quantization?.scheme === 'per_axis' &&
             !shapesProvablyEqual(input, source, output)) {
           unsupportedPhysicalDomain(node,
-            'the physical byte-copy route cannot remap per-axis metadata across a shape change.');
+            'the byte-copy route cannot remap per-axis metadata across a shape change.');
         }
       }
       required.add(packed ? 'getTypedCopyShader' : 'getCopy32Shader');
-      dispatch1D(node, output, packed ? 256n : 64n, node.opType);
+      dispatchLinear2D(node, output, packed ? 256n : 64n, node.opType);
       charge(node, 16n, 'uniform', 'shape-copy parameters');
       continue;
     }
@@ -948,7 +963,7 @@ export function checkedWebGPUPhysicalDomain(
           weight.shape.length !== 2 || bias.shape.length !== 1 ||
           !BYTE_DTYPES.has(activation.dtype) || !BYTE_DTYPES.has(weight.dtype) ||
           !BYTE_DTYPES.has(output.dtype) || bias.dtype !== 'int32') {
-        unsupportedPhysicalDomain(node, 'QLinear physical dtype/rank contract is not canonical W8A8.');
+        unsupportedPhysicalDomain(node, 'QLinear dtype/rank contract is not canonical W8A8.');
       }
       const dIn = fixedExtent(input, activation.shape.at(-1)!, node, 'contracted dimension');
       const dOut = fixedExtent(input, output.shape.at(-1)!, node, 'output-feature dimension');
@@ -1336,16 +1351,22 @@ export function checkedWebGPUPhysicalDomain(
       const outHeight = axisBound(input, output, 1);
       const outWidth = axisBound(input, output, 2);
       const outputElements = descriptorElements(input, output, true);
-      assertDispatchBound(node, 'QConv2D scalar', [
-        ceilDivide(outputElements, 256n), 1n, 1n,
-      ], workgroupLimit);
+      dispatchLinear2D(node, output, 256n, 'QConv2D scalar');
       if (groups === 1 && outChannels % 4 === 0 && terms >= 16n) {
-        assertDispatchBound(node, 'QConv2D tiled', [
+        const tiled = [
           ceilDivide(BigInt(outChannels), 32n),
           ceilDivide(batch * outHeight * outWidth, 4n), 1n,
-        ], workgroupLimit);
-        if (outChannels >= 32) required.add('getQConv2DTiledShader');
-        packedDot4.add('getQConv2DDotTiledShader');
+        ] as const;
+        // The concrete compiler deliberately falls back to the scalar route
+        // when a cooperative tile exceeds a device axis. The complete-domain
+        // proof must attest that same choice instead of rejecting a graph for
+        // an optional tactic that will never be selected.
+        const tiledDispatchSupported = tiled.every((count) =>
+          count > 0n && count <= workgroupLimit && count <= U32_MAX);
+        if (tiledDispatchSupported) {
+          if (outChannels >= 32) required.add('getQConv2DTiledShader');
+          if (outChannels >= 16) packedDot4.add('getQConv2DDotTiledShader');
+        }
       }
       required.add('getQConv2DShader');
       charge(node, BigInt(Math.max(4, outChannels * 4)), 'storage', 'QConv2D scales');
@@ -1536,8 +1557,8 @@ export function checkedWebGPUPhysicalDomain(
       assertDType(node, inputs.b, new Set(['float32']), 'b');
       assertDType(node, output, new Set(['float32']), 'output');
       required.add(physicalMethodForBinary(node));
-      dispatch1D(node, output, 64n);
-      charge(node, BigInt((2 + output.shape.length * 3) * 4),
+      dispatchLinear2D(node, output, 64n);
+      charge(node, BigInt((3 + output.shape.length * 3) * 4),
         'storage', `${node.opType} broadcast strides`);
       continue;
     }
@@ -1673,8 +1694,8 @@ export function checkedWebGPUPhysicalDomain(
         }
       }
       required.add(packed ? 'getTypedTransposeShader' : 'getGeneralTransposeShader');
-      dispatch1D(node, output, packed ? 256n : 64n);
-      charge(node, BigInt((2 + source.shape.length * 2) * 4),
+      dispatchLinear2D(node, output, packed ? 256n : 64n);
+      charge(node, BigInt((3 + source.shape.length * 2) * 4),
         'storage', 'Transpose stride metadata');
       continue;
     }
@@ -1784,7 +1805,7 @@ export function checkedWebGPUPhysicalDomain(
         }
       }
       required.add(packed ? 'getTypedExpandShader' : 'getExpandShader');
-      dispatch1D(node, output, packed ? 256n : 64n);
+      dispatchLinear2D(node, output, packed ? 256n : 64n);
       charge(node, 80n, 'uniform', `${node.opType} shape/stride parameters`);
       continue;
     }
@@ -1894,7 +1915,7 @@ export function checkedWebGPUPhysicalDomain(
         input, node, inputs.scale, inputs.zero_point, quantization,
       );
       required.add('getQuantizeLinearShader');
-      dispatch1D(node, output, 256n);
+      dispatchLinear2D(node, output, 256n);
       charge(node, 16n, 'uniform', 'QuantizeLinear parameters');
       continue;
     }
@@ -1907,7 +1928,7 @@ export function checkedWebGPUPhysicalDomain(
         input, node, inputs.scale, inputs.zero_point, quantization,
       );
       required.add('getDequantizeLinearShader');
-      dispatch1D(node, output, 64n);
+      dispatchLinear2D(node, output, 64n);
       charge(node, 32n, 'uniform', 'DequantizeLinear parameters');
       continue;
     }

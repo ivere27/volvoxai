@@ -456,3 +456,35 @@ extern "C" VX_CUDA_GLOBAL void vx_cuda_qmaskedmean_i8u8(
     output[output_index] = vx_quantize_transformed(
         transformed, output_zero_point, output_dtype);
 }
+
+extern "C" VX_CUDA_GLOBAL void vx_cuda_row_index_transfer(
+        const vx_u32* source_words, const vx_i32* row_indices,
+        vx_u32* destination_words, vx_u32 rows, vx_u32 row_words,
+        vx_u32 indexed_rows, vx_u32 mode) {
+    vx_u32 gid = vx_global_x();
+    vx_u32 total = rows * row_words;
+    if (gid >= total) return;
+    vx_u32 row = gid / row_words;
+    vx_u32 word = gid - row * row_words;
+    vx_i32 indexed = row_indices[row];
+
+    if (mode == 0u) {
+        if (indexed < 0) {
+            destination_words[row * row_words + word] = 0u;
+            return;
+        }
+        vx_u32 source_row = (vx_u32)indexed;
+        if (source_row >= indexed_rows) {
+            destination_words[row * row_words + word] = 0u;
+            return;
+        }
+        destination_words[row * row_words + word] =
+            source_words[source_row * row_words + word];
+    } else {
+        if (indexed < 0) return;
+        vx_u32 dest_row = (vx_u32)indexed;
+        if (dest_row >= indexed_rows) return;
+        destination_words[dest_row * row_words + word] =
+            source_words[row * row_words + word];
+    }
+}

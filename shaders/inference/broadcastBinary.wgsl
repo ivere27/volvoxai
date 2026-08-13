@@ -4,10 +4,10 @@
         @group(0) @binding(3) var<storage, read> md : array<u32>;
         @compute @workgroup_size(64)
         fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
-            let idx = gid.x;
             let total = md[0];
-            if (idx >= total) { return; }
             let rank = md[1];
+            let idx = gid.x + gid.y * md[2u + 3u * rank];
+            if (idx >= total) { return; }
             var rem = idx;
             var a_idx = 0u;
             var b_idx = 0u;

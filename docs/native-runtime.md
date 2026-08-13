@@ -19,15 +19,19 @@ The public C API uses only opaque handles:
 
 ~~~text
 VxRuntime
-  VxModel
-    VxCompiledModel
-      VxExecutionContext
-        VxResult
+├─ VxModel
+│  └─ VxCompiledModel
+│     └─ VxExecutionContext       (explicit stateful/low-level owner)
+└─ lazy Runtime coordinator       (ordinary stateless SCHEDULED work)
+   └─ VxRequest
+      └─ VxResult
 ~~~
 
 Every operation receives its scope explicitly. A child retains the parent state
 needed for its work, and results own immutable output snapshots independently
-from their execution context.
+from their execution context or request. All scheduled models in one Runtime
+enter the same coordinator. Compatibility is still exact: different compiled
+models share arbitration, never a physical batch or mutable context state.
 
 ## Build
 
@@ -59,7 +63,8 @@ stay in opt-in applications under examples/.
 
 Include the public header:
 
-`VX_NATIVE_API_VERSION` is 1.
+`VX_NATIVE_API_VERSION` is 1. The current unreleased v1 contract is replaced in
+place; there is no compatibility shim for an earlier draft.
 
 ~~~c
 #include "volvoxai.h"
@@ -146,6 +151,155 @@ vx_model_publish_adapter(model, &adapter, &published, &report);
 Compiled models remain pinned to the revision captured at compile time. Use
 vx_compiled_model_report() to retrieve their stored policy and route evidence.
 
+### Stateless Runtime execution
+
+Before `vx_runtime_create()`, choose the execution-mode capability. The
+`VxExecutionMode` constants are generated from `proto/volvoxai.proto`; the C
+header does not maintain a handwritten duplicate enum. A DIRECT Runtime cannot
+submit scheduled work, while a SCHEDULED Runtime also permits direct
+`vx_runtime_run()` calls:
+
+~~~c
+VxRuntimeOptions runtime_options = VX_RUNTIME_OPTIONS_INIT;
+runtime_options.execution_mode = VX_EXECUTION_MODE_SCHEDULED;
+runtime_options.max_scheduled_requests = 64;
+runtime_options.max_scheduled_input_bytes = 64u * 1024u * 1024u;
+runtime_options.max_batch_delay_milliseconds = 1;
+runtime_options.max_unconsumed_results = 64;
+runtime_options.max_unconsumed_result_bytes = 64u * 1024u * 1024u;
+~~~
+
+`vx_runtime_run()` is the minimal one-shot path. It leases the compiled
+target's single retained route context, performs one synchronous logical call
+(including caller-authored bulk B=N), and creates no coordinator, queue,
+worker, timer, request handle or queued-input copy:
+
+~~~c
+VxResult* result = NULL;
+status = vx_runtime_run(runtime, compiled, &input, 1, &result, &report);
+~~~
+
+This is DIRECT: an explicit opt-out from Runtime-wide arbitration. It does not
+mean zero allocation or bypass of the provider/device queue. Different compiled
+routes may enter their provider concurrently and are not coalesced or fairly
+ordered against one another. Use `vx_runtime_submit()` in a SCHEDULED Runtime
+for concurrent multi-model work.
+
+For concurrent ordinary inference, `vx_runtime_submit()` first validates HOST
+binding metadata and computes the exact owned byte count, atomically reserves
+the Runtime request, input and result budgets, and only then copies payload
+bytes before returning a request handle. A rejected oversized/invalid request
+is never copied. SCHEDULED always uses the bounded queue and admission policy;
+`max_batch_delay_milliseconds=0` dispatches work-conservingly, while a positive
+value permits a bounded coalescing window that a deadline may shorten.
+
+~~~c
+VxRuntimeSubmitOptions submit = VX_RUNTIME_SUBMIT_OPTIONS_INIT;
+submit.priority = 100;
+submit.deadline_monotonic_micros =
+    vx_runtime_monotonic_time_micros() + 20u * 1000u;
+submit.freshness = VX_RUNTIME_FRESHNESS_LATEST;
+submit.stream_key = 7; /* stable stateless camera-stream identity */
+
+VxRequest* request = NULL;
+status = vx_runtime_submit(
+    runtime, compiled, &input, 1, &submit, &request, &report);
+if (status == VX_STATUS_OK) {
+    status = vx_request_wait(request, VX_REQUEST_WAIT_INFINITE, &report);
+}
+if (status == VX_STATUS_OK) {
+    status = vx_request_result(request, &result, &report);
+}
+vx_request_release(request);
+~~~
+
+Admission bounds active request count, owned host-input snapshots, the extra
+dense-stack bytes reserved for a physical B>1 callback, and unconsumed results.
+Every accepted execution reserves one result slot and the compiled model's
+declared worst-case host-output byte sum before an input payload copy or provider
+entry. A validated success shrinks that byte ticket to the exact owned snapshot;
+failure or the final `VxResult` release returns it. A terminal `VxRequest` keeps
+its result ticket until the request and all extracted result references are
+released. `vx_runtime_close()` does not wait for caller-held results, which stay
+readable and keep the small ledger lifetime they need.
+
+`OVERLOADED` means one of those declared bounds could not be reserved.
+Cancellation removes queued work immediately; already-running work is
+suppressed logically and its physical resources remain live until execution
+returns. The queue uses priority, earliest deadline and aging. `LATEST`
+transactionally supersedes older queued work with the same compiled identity and
+nonzero stream key, including dynamic-shape changes. Equal name/dtype/byte-size
+storage can transfer in place under a full cap; a larger payload needs temporary
+input-byte headroom so rejection can preserve the predecessor. A successfully
+admitted LATEST request also marks same-stream work already submitted to the
+provider; that callback continues to own its resources, but completion discards
+its result and settles the old request as `SUPERSEDED`.
+`DROP_IF_LATE` is the hard queued/completion cutoff and requires a monotonic
+deadline. For `ALL` and `LATEST`, the deadline remains an admission/EDF target
+and a late accepted result is still published with
+`VxRequestInfo.deadline_missed` set.
+
+The result-byte bound covers Runtime-owned host output snapshots, not provider
+workspace, device allocations or KV pages. Per-resource-domain asynchronous
+dispatch, device fences/recovery, device/workspace/KV accounting and aggregate
+deadline-miss telemetry remain promotion work. The current coordinator has one
+synchronous worker, so different resource domains share arbitration but do not
+execute concurrently through it.
+
+Native core proves the exact graph's typed independent leading-B semantics and
+binds the proof identity to its graph fingerprint. An external provider may
+narrow that proved range with `VxBackendBatchContract`, but must echo the exact
+fingerprint, proof, axis and contained range before compatible requests can
+enter one `context_execute_batch` callback. Provider self-attestation is not
+sufficient. The Vulkan, OpenGL, and CUDA built-ins consume the same proof after
+their bounded-domain qualification: the coordinator stacks compatible B1
+inputs, performs one built-in engine forward at B=N, and splits the aggregate
+snapshot into owned lane results. A repeated B1 host loop is never accepted as
+batching. CPU, Metal, fixed-B1 graphs, unproved operators, and mismatched routes
+remain scheduler B=1.
+
+`vx_compiled_model_report()` exposes that current built-in qualification as a
+bounded `route_evidence` prefix containing `batchProtocol`, `batchAxis`,
+`batchMin`, `batchMax`, `batchMultiple`, and the graph-bound `batchProof`
+identity. Each successful built-in scheduled B=N lane report starts with
+`trueBackendInvocations=1;batchSize=N;physicalExecutionId=X`, followed by the
+same compiled contract evidence. All lanes from one physical forward have the
+same nonzero N and X; a later physical forward has a different X. X is an
+opaque process-local Runtime execution counter, not a device identity, GPU
+UUID, or PCI identifier, and it cannot be compared across processes. Auditing
+must reject missing, duplicate, malformed, or truncated required keys. DIRECT
+results do not carry these physical-batch keys. The evidence buffer is bounded;
+the required prefixes are retained before optional trailing route diagnostics.
+
+Built-in execution also preserves a compact live-backend proof ahead of the
+compiled route. Vulkan reports `vk_mem=device-local`, the actual compute-arena
+and staging allocation bytes, staging coherence, and positive upload/download
+operation counts only after successful staged execution. CUDA reports
+`cuda_graph_replay=1` only after a cached GraphExec launch and its stream
+synchronization both succeed for that physical forward; observe, capture, and
+ordinary-launch forwards report `0`. OpenGL emits neither backend-specific
+token. Publication harnesses must require each applicable key exactly once and
+reject a token belonging to another backend.
+
+Native currently has no separate physical `max_batch_size` option. For an
+eligible route, the authored/proved `max_batch` and
+`max_scheduled_requests` jointly cap a selected group; the latter also bounds
+the Runtime's active scheduled-request capacity. Use a narrower authored batch
+domain when queue capacity must exceed the desired physical batch ceiling.
+
+Batch policy cannot be copied from the browser route even on the same GPU. The
+RTX 3090 Deno/WebGPU receipt-reader sweep has a static B19 ceiling but an
+observed B15 operating boundary, with FP32/INT8 useful-throughput gains of
+6.39x/5.67x over DIRECT B1; its B16 failure is an effective
+Deno/wgpu/Vulkan/NVIDIA-driver-535 allocation boundary, not VRAM exhaustion.
+Tiny Receipt VQA is instead producer-capped at B8 and its component gains range
+from 1.74x to 4.05x. Those measurements are evidence for separate
+model/provider/device `T(B)` curves; they do not configure or qualify the
+native operating selector; the current built-in GPU path uses the proved graph
+ceiling together with `max_scheduled_requests`, not a measured `T(B)` curve.
+
+### Explicit execution contexts
+
 Create a context and execute one atomic batch of shaped bindings:
 
 ~~~c
@@ -219,7 +373,9 @@ status = vx_result_read(
 ~~~
 
 vx_result_output_count() and vx_result_output_info() expose output metadata.
-The result remains readable after its context and parents are released.
+The result remains readable after Runtime close and after its context and parent
+handles are released. Its Runtime-wide result slot and actual snapshot-byte
+charge return only on the final `vx_result_release()`.
 
 Release handles when ownership ends:
 
@@ -246,6 +402,31 @@ vx_runtime_close() similarly rejects new root work while retained children keep
 the resources they require. An already-created full-profile Trainer may finish
 private work, rollback its private engine, and commit a successor after logical
 Runtime close; creating a new Trainer after close is rejected.
+
+### Built-in compiled weight ownership
+
+Compiling a built-in native backend loads and parses each shard of the accepted
+safetensors revision once into a reference-counted `VxCompiledWeightStore`.
+This compiled load is separate from the earlier source-validation reads
+performed while the Model is created. Compile validation and every subsequently
+created execution context borrow the compiled store's immutable serialized
+blobs and metadata; context creation performs no `fopen`/`fread`/parse cycle.
+
+Each context owns a cloned tensor descriptor table, so shape/residency metadata
+can remain private while tensor payload pointers still address the compiled
+blobs. A partial weight-bank selection copies only its selected rows into a
+context-owned copy-on-write overlay. Mutating or closing that overlay cannot
+change the compiled bytes or a sibling context. Closing the last context leaves
+the compiled store resident, and reopening a context borrows the same blobs; the
+final compiled-model release frees it.
+
+This boundary is intentionally narrower than a claim that every prepared
+native weight is shared. Native CPU F16 widening, CPU prepacked caches, and
+selected-bank overlays are still per-context. Built-in Vulkan/OpenGL/Metal/CUDA
+graph and device resources are also still prepared per context. Their immutable
+parts and physical high-water proof remain open in `TODO.md`. Full-profile
+training authoring uses a separate private writable load and never mutates the
+compiled inference store.
 
 ## CPU worker threads
 
@@ -288,8 +469,11 @@ diagnostic text.
 ## Native provider SPI
 
 External devices implement VxBackendProvider from volvoxai_backend.h.
-`VX_BACKEND_ABI_VERSION` is 1, and provider descriptors use exact structure
-sizes. The descriptor creates explicit provider-runtime, compiled-model, and
+`VX_BACKEND_ABI_VERSION` is an opaque discriminator for the current exact
+contract (currently numeric 1), not a compatibility generation. A matching
+number does not admit an older layout: provider descriptors use exact structure
+sizes and must be rebuilt against the host headers whenever the contract
+changes. The descriptor creates explicit provider-runtime, compiled-model, and
 execution-context instances. Context execution writes every declared output
 through a copying VxBackendOutputSink. The sink accepts only the graph's exact
 name, F32/I32/I8/U8 dtype, rank, dimensions, and byte size for each output;
@@ -313,6 +497,8 @@ VxBackendProvider provider = {
     .context_execute = provider_context_execute,
     .context_close = provider_context_close,
     .context_destroy = provider_context_destroy,
+    .exact_contract_marker = VX_BACKEND_PROVIDER_EXACT_CONTRACT_MARKER,
+    .exact_contract_extent = sizeof(VxBackendProvider),
 };
 
 provider.shape_domain.support = VX_BACKEND_SHAPE_DOMAIN_FULL;
@@ -431,6 +617,23 @@ discards private weight, optimizer, gradient, accumulation, and RNG progress.
 publishing. Existing CompiledModels and ExecutionContexts stay pinned to the
 revision they retained.
 
+Canonical persisted LayerNorm and RMSNorm affine descriptors still have to
+match the normalized feature width exactly. Internally, a private Trainer may
+retain a larger rank-one optimizer-backed storage tensor; normalization reads
+and updates only its first feature-width values, leaving the capacity tail
+untouched. This internal training allowance does not widen the graph or
+inference ABI.
+
+CUDA AdamW moment buffers remain device-authoritative across gradient windows.
+A public boundary that needs host state—including a switch to a CPU AdamW
+update or optimizer checkpoint save—materializes the current first/second
+moment mirrors even when CUDA is no longer the selected route, then retires the
+mirror before CPU mutation. A CPU-only engine with no CUDA context takes a
+side-effect-free no-mirror path. The CUDA-enabled full-profile regressions cover
+the oversized private normalization capacity, CUDA-to-CPU AdamW handoff,
+optimizer save/load replay against an uninterrupted update, and the expected
+host/device transfer boundaries.
+
 ## Task applications
 
 Build the separate model-specific command application with:
@@ -466,7 +669,7 @@ Build the TinyReceipt encoder/decoder application separately:
 make -C examples native_receipt_split_inference_example
 ~~~
 
-The application accepts the explicit-KV v1 package and chooses either active
+The application accepts the explicit-KV v2 package and chooses either active
 or maximum-padded encoder extents:
 
 ~~~bash
@@ -500,12 +703,11 @@ VOLVOXAI_ENABLE_VULKAN
 VOLVOXAI_ENABLE_OPENGL
 VOLVOXAI_ENABLE_CUDA
 VOLVOXAI_ENABLE_METAL
-VOLVOXAI_ENABLE_NNAPI
 ~~~
 
 Each accepts ON or OFF. Disabled backend source, registration, and shader
 blocks are omitted. Linux defaults to Vulkan and OpenGL; macOS also defaults to
-Metal; Android enables NNAPI. CUDA is opt-in.
+Metal. CUDA is opt-in.
 
 Driver libraries are resolved at runtime:
 
@@ -513,14 +715,12 @@ Driver libraries are resolved at runtime:
 - OpenGL: libGL, opengl32, or the macOS OpenGL framework.
 - CUDA: the NVIDIA Driver API; neither cudart nor libcuda is linked.
 - Metal: the default MTLDevice through the Objective-C runtime.
-- NNAPI: Android Neural Networks device integration.
 
 An explicitly required provider that was not compiled or cannot initialize
 fails with a backend status. It does not silently switch to CPU.
 
-Android 15 deprecates NNAPI. Current Android device integrations should expose
-QNN, LiteRT delegates, or another vendor driver through VxBackendProvider when
-that is the selected deployment interface.
+Android device integrations can expose a vendor runtime or delegate through
+VxBackendProvider when that is the selected deployment interface.
 
 ## CPU kernels
 
@@ -531,9 +731,10 @@ OS support the required state. Portable scalar kernels remain the fallback.
 The AVX2 QLinear route uses an exact U8-by-I8 `VPMADDUBSW` decomposition rather
 than relying on its saturating I16 pair result directly; arbitrary I8/U8
 zero-points therefore remain byte-identical to the portable kernel. Immutable
-weights are packed while the native model is prepared. In addition to the
-portable K-by-8 pack, x86 keeps a derived K4-by-8 companion pack. Symmetric I8
-multi-row calls consume two panels at a time in an MR4/N16 microkernel. The
+weights are currently packed while each native execution context is prepared.
+In addition to the portable K-by-8 pack, x86 keeps a derived K4-by-8 companion
+pack. Symmetric I8 multi-row calls consume two panels at a time in an MR4/N16
+microkernel. The
 pack records whether any weight is -128. When none is present, signed input
 bytes use `abs(input) * sign(weight,input)`; each pair is bounded by
 `2*128*127` and cannot saturate. Packs containing -128 retain the two-part
@@ -541,8 +742,9 @@ unsigned decomposition. Both routes apply exact affine zero-point correction.
 This extra pack is runtime state, not serialized model data. Benchmark policy
 leaves ordinary M=1 decode on the faster raw GEMV route.
 
-Dense groups=1 3x3 QConv2D builds the same flattened pack once for symmetric
-I8 weights and reuses it through a bounded zero-point-padded im2col buffer.
+Dense groups=1 3x3 QConv2D builds the same flattened pack once per context for
+symmetric I8 weights and reuses it through a bounded zero-point-padded im2col
+buffer.
 For dilation-one convolutions, the im2col producer partitions output rows and
 copies each in-bounds 3*C input strip contiguously; border strips are still
 filled with the declared input zero point.
@@ -578,7 +780,7 @@ evaluate four independent groups in SIMD lanes while preserving the scalar
 spatial/channel reduction order within each group. Both are runtime-gated;
 the baseline dispatcher and non-AVX2 fallback contain no AVX instructions.
 
-QSiLU and QGELU may cache all 256 physical byte results for an immutable
+QSiLU and QGELU may cache all 256 byte results for an immutable
 input/output quantization descriptor. The table uses the same activation and
 ties-to-even requantization math as the scalar route.
 
@@ -614,8 +816,7 @@ data and reserves one fixed maximum-domain host arena plus its backend device
 spans. Concrete executions project onto that layout and only rebind semantic
 shape metadata; min/max/min execution does not grow activation capacity.
 Vulkan, OpenGL, and Metal use the same common proof protocol as CUDA, with
-backend-specific limits and allocation lifetimes. NNAPI is deliberately not a
-bounded-dynamic backend.
+backend-specific limits and allocation lifetimes.
 
 An operand's kernel port does not determine its lifetime. After the minimum
 bootstrap forward, VolvoxAI first reclassifies every logical tensor identity as
@@ -628,9 +829,10 @@ backend constants are not logical tensors and remain invariant.
 Qualified F32 Conv2D uses canonical `HWIO`/`HWCM` layouts. Public weights stay
 direct F32 storage and may change on every execution; non-canonical transformed
 layouts fail compilation. An immutable canonical F16 model weight may own one
-preloaded F32 widening cache. CPU convolution packs and indirection caches are
-not constructed in a native-GPU context. Physical QLinear/QMatMul/QGemm and an
-optional physical QConv2D bias require immutable safetensors-backed I32 storage,
+preloaded per-context F32 widening cache. CPU convolution packs and indirection
+caches are not constructed in a native-GPU context. Physical QLinear,
+QMatMul, QGemm, and an optional physical QConv2D bias require immutable
+safetensors-backed I32 storage,
 because their normalized metadata is cached at load. The compile proof includes
 that bias in each output channel's exact I32 accumulator bound.
 
@@ -643,7 +845,7 @@ conversion caches, LUTs, and backend synthetic constants remain invariant.
 
 Native-GPU Conv2D accepts only the canonical `HWIO`/`HWCM` layouts used by the
 public shape contract. A public weight must be direct F32; immutable F16 may
-own a one-time F32 widening cache. Physical QLinear/QMatMul/QGemm and QConv2D
+own a per-context F32 widening cache. Physical QLinear/QMatMul/QGemm and QConv2D
 cache aligned I32 bias metadata, so any present bias must be an immutable model
 tensor. Their bounded-domain proof includes the exact centered-byte product
 and per-channel bias in the I32 accumulator limit; a route whose worst case can
@@ -686,7 +888,7 @@ WGSL pack.
 
 Desktop OpenGL and GLES share a portable W8A8 contract. They do not expose one
 common, standard hardware 4x8 integer-dot capability that VolvoxAI can safely
-negotiate across GL 4.3 and GLES 3.1. Consequently their physical-byte
+negotiate across GL 4.3 and GLES 3.1. Consequently their
 QLinear/QMatMul/QGemm, QConv2D, and QBatchMatMul shaders use exact scalar I32
 MACs after byte unpack; the tiled variants reduce repeated indexing and share
 loads but do not claim hardware integer-dot execution. Vulkan selects its

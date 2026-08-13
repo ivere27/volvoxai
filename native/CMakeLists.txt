@@ -45,7 +45,6 @@ if(APPLE)
 else()
   option(VOLVOXAI_ENABLE_METAL "Link the Metal device backend" OFF)
 endif()
-option(VOLVOXAI_ENABLE_NNAPI "Link the NNAPI device backend" OFF)
 set(VOLVOXAI_CPU_TARGET "baseline" CACHE STRING "baseline or avx2")
 set(VOLVOXAI_CUDA_ARCH "75" CACHE STRING
     "CUDA compute capability used for embedded PTX (for example 75 or 86)")
@@ -55,15 +54,6 @@ if(VOLVOXAI_CUDA_FAST_FP32)
   set(_cuda_fp32_contract fast-fma)
 else()
   set(_cuda_fp32_contract strict-no-fma)
-endif()
-
-# Android release builds enable NNAPI by default.
-# Cross-compile with the NDK toolchain file:
-#   cmake -S . -B build/android -DCMAKE_C_COMPILER=clang \
-#     -DCMAKE_TOOLCHAIN_FILE=$ANDROID_NDK/build/cmake/android.toolchain.cmake \
-#     -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=android-29
-if(CMAKE_SYSTEM_NAME STREQUAL "Android")
-  set(VOLVOXAI_ENABLE_NNAPI ON)
 endif()
 
 # Objective-C is only needed for the Metal backend.
@@ -78,13 +68,16 @@ if(_arch MATCHES "x86_64|amd64|i386|i686")
 else()
   set(VOLVOX_X86 FALSE)
 endif()
-# Armv8.2 SDOT objects are used on aarch64 Linux and Android. macOS arm64 uses
-# its platform-specific kernels.
+# Optional Arm objects are used on aarch64 Linux and Android. macOS arm64 uses
+# its platform-specific kernels.  Each higher ISA remains in a separate object
+# library so the baseline executable still starts on Armv8-A CPUs.
 if(_arch MATCHES "aarch64|arm64" AND
    (CMAKE_SYSTEM_NAME STREQUAL "Linux" OR CMAKE_SYSTEM_NAME STREQUAL "Android"))
   set(VOLVOX_ARM_DOTPROD TRUE)
+  set(VOLVOX_ARM_I8MM TRUE)
 else()
   set(VOLVOX_ARM_DOTPROD FALSE)
+  set(VOLVOX_ARM_I8MM FALSE)
 endif()
 
 # CPU baseline flags (NATIVE_CPU_FLAGS).
@@ -130,34 +123,22 @@ if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
 endif()
 target_link_options(volvox_common INTERFACE -pthread)
 target_link_libraries(volvox_common INTERFACE m ${CMAKE_DL_LIBS})
-# metal_engine.m needs the Apple frameworks; NNAPI needs libneuralnetworks.
+# metal_engine.m needs the Apple frameworks.
 if(APPLE AND VOLVOXAI_ENABLE_METAL)
   target_link_libraries(volvox_common INTERFACE "-framework Foundation" "-framework Metal")
 endif()
-if(CMAKE_SYSTEM_NAME STREQUAL "Android")
-  target_compile_definitions(volvox_common INTERFACE USE_NNAPI)
-  target_link_libraries(volvox_common INTERFACE neuralnetworks)
-endif()
-
 # Backend-define bundles used by target_compile_definitions below.
 set(BK_DEFAULT
   VOLVOXAI_ENABLE_VULKAN=$<IF:$<BOOL:${VOLVOXAI_ENABLE_VULKAN}>,1,0>
   VOLVOXAI_ENABLE_OPENGL=$<IF:$<BOOL:${VOLVOXAI_ENABLE_OPENGL}>,1,0>
   VOLVOXAI_ENABLE_CUDA=$<IF:$<BOOL:${VOLVOXAI_ENABLE_CUDA}>,1,0>
-  VOLVOXAI_ENABLE_METAL=$<IF:$<BOOL:${VOLVOXAI_ENABLE_METAL}>,1,0>
-  VOLVOXAI_ENABLE_NNAPI=$<IF:$<BOOL:${VOLVOXAI_ENABLE_NNAPI}>,1,0>)
+  VOLVOXAI_ENABLE_METAL=$<IF:$<BOOL:${VOLVOXAI_ENABLE_METAL}>,1,0>)
 set(BK_CPU_ONLY VOLVOXAI_ENABLE_VULKAN=0 VOLVOXAI_ENABLE_OPENGL=0
-                VOLVOXAI_ENABLE_CUDA=0 VOLVOXAI_ENABLE_METAL=0
-                VOLVOXAI_ENABLE_NNAPI=0)
+                VOLVOXAI_ENABLE_CUDA=0 VOLVOXAI_ENABLE_METAL=0)
 set(BK_MANAGER  VOLVOXAI_ENABLE_VULKAN=1 VOLVOXAI_ENABLE_OPENGL=1
-                VOLVOXAI_ENABLE_CUDA=1 VOLVOXAI_ENABLE_METAL=0
-                VOLVOXAI_ENABLE_NNAPI=0)
-set(BK_NNAPI    VOLVOXAI_ENABLE_VULKAN=0 VOLVOXAI_ENABLE_OPENGL=0
-                VOLVOXAI_ENABLE_CUDA=0 VOLVOXAI_ENABLE_METAL=0
-                VOLVOXAI_ENABLE_NNAPI=1)
+                VOLVOXAI_ENABLE_CUDA=1 VOLVOXAI_ENABLE_METAL=0)
 set(BK_CUDA     VOLVOXAI_ENABLE_VULKAN=0 VOLVOXAI_ENABLE_OPENGL=0
-                VOLVOXAI_ENABLE_CUDA=1 VOLVOXAI_ENABLE_METAL=0
-                VOLVOXAI_ENABLE_NNAPI=0)
+                VOLVOXAI_ENABLE_CUDA=1 VOLVOXAI_ENABLE_METAL=0)
 
 # --- ARM dotprod objects (Armv8.2 SDOT), separately-attributed like the .o's --
 set(ARM_OBJS "")
@@ -167,8 +148,32 @@ if(VOLVOX_ARM_DOTPROD)
     src/kernels/qconv_w8a8_arm_dotprod.c)
   target_include_directories(volvox_arm_dotprod PRIVATE ${INC})
   target_compile_options(volvox_arm_dotprod PRIVATE -O3 -march=armv8.2-a+dotprod -fno-lto)
-  set(ARM_OBJS $<TARGET_OBJECTS:volvox_arm_dotprod>)
+  list(APPEND ARM_OBJS $<TARGET_OBJECTS:volvox_arm_dotprod>)
   add_compile_definitions(VOLVOXAI_ARM_DOTPROD_OBJECT=1)
+endif()
+
+# Arm I8MM is an independent architectural extension and is never enabled for
+# the baseline or SDOT objects.  Keep the source discovery explicit: adding an
+# I8MM implementation under either canonical kernel name makes it available to
+# all native compositions without forcing an empty placeholder file.
+if(VOLVOX_ARM_I8MM)
+  set(_arm_i8mm_sources "")
+  foreach(_arm_i8mm_source IN ITEMS
+      src/kernels/qlinear_w8a8_arm_i8mm.c
+      src/kernels/qconv_w8a8_arm_i8mm.c
+      src/kernels/qbatch_matmul_w8a8_arm_i8mm.c)
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/${_arm_i8mm_source}")
+      list(APPEND _arm_i8mm_sources ${_arm_i8mm_source})
+    endif()
+  endforeach()
+  if(_arm_i8mm_sources)
+    add_library(volvox_arm_i8mm OBJECT ${_arm_i8mm_sources})
+    target_include_directories(volvox_arm_i8mm PRIVATE ${INC})
+    target_compile_options(volvox_arm_i8mm PRIVATE
+      -O3 -march=armv8.2-a+i8mm -fno-lto -ffp-contract=off)
+    list(APPEND ARM_OBJS $<TARGET_OBJECTS:volvox_arm_i8mm>)
+    add_compile_definitions(VOLVOXAI_ARM_I8MM_OBJECT=1)
+  endif()
 endif()
 
 # --- Source groups (mirror NATIVE_*_SRCS) -------------------------------------
@@ -178,20 +183,23 @@ set(RUNTIME_SRCS
   src/runtime/sequence_runtime.c src/runtime/backend.c src/runtime/arena.c
   src/runtime/backend_sdk.c src/runtime/runtime_state.c src/runtime/public_api.c
   src/runtime/shape_contract.c
+  src/runtime/paged_kv.c src/runtime/paged_binding.c src/runtime/batch_scheduler.c src/runtime/continuous_batch_scheduler.c
+  src/runtime/decode_row_set.c src/runtime/batch_decode.c
   src/runtime/incremental_runtime.c src/runtime/decode_session.c
-  src/backends/w8a8_device_ops.c src/runtime/engine_runtime.c src/runtime/engine.c)
+  src/backends/w8a8_device_ops.c src/runtime/engine_runtime.c src/runtime/engine_state.c)
 set(KERNEL_SRCS
-  src/kernels/kernels.c src/kernels/cpu_features.c src/kernels/quant_cpu_opt.c
+  src/kernels/kernels.c src/kernels/cpu_features.c src/kernels/quant_cpu_isa.c
   src/kernels/qlinear_w8a8_x86.c src/kernels/qlinear_w8a8_arm.c
   src/kernels/qconv_w8a8_x86.c src/kernels/qconv_w8a8_arm.c
   src/kernels/qbatch_matmul_w8a8_native.c
   src/kernels/qsdpa_w8a8_native.c src/kernels/qgroupnorm_w8a8_native.c
   src/kernels/qnorm_activation_w8a8_native.c
   src/kernels/transpose_w8a8_native.c
-  src/kernels/conv_f32_opt_baseline.c src/kernels/conv_f32_opt_avx2.c
-  src/kernels/conv_f32_dispatch.c src/kernels/tensor_f32_opt.c)
+  src/kernels/paged_attention.c
+  src/kernels/conv_f32_isa_baseline.c src/kernels/conv_f32_isa_avx2.c
+  src/kernels/conv_f32_dispatch.c src/kernels/tensor_f32_isa.c)
 
-# conv_f32_opt.c holds hand-written AVX2 conv bodies behind `#if
+# conv_f32_isa.c holds hand-written AVX2 conv bodies behind `#if
 # defined(__AVX2__)`.  Compiling it only at VOLVOXAI_CPU_TARGET (default
 # `baseline`) preprocessed them away, so AVX2 machines ran the scalar fallback —
 # substantially slower on representative encoder Conv2D nodes.  Build the same
@@ -199,10 +207,10 @@ set(KERNEL_SRCS
 # runtime.  Only this one file gets the flags, and it is reached only after a
 # vx_kernel_platform() check, so the binary's own CPU requirement is unchanged.
 #
-# These are plain sources, not a shared OBJECT library: conv_f32_opt.c reads
+# These are plain sources, not a shared OBJECT library: conv_f32_isa.c reads
 # VxEngineState, whose layout depends on each target's VOLVOXAI_ENABLE_TRAINING.
 if(VOLVOX_X86)
-  set_source_files_properties(src/kernels/conv_f32_opt_avx2.c
+  set_source_files_properties(src/kernels/conv_f32_isa_avx2.c
     PROPERTIES COMPILE_OPTIONS "-mavx2;-mfma")
 endif()
 set(BACKEND_CORE_SRCS src/backends/backend_manager.c)
@@ -422,9 +430,6 @@ endif()
 if(VOLVOXAI_ENABLE_CUDA)
   list(APPEND BACKEND_DEVICE_SRCS ${CUDA_BACKEND_SRCS})
 endif()
-if(VOLVOXAI_ENABLE_NNAPI)
-  list(APPEND BACKEND_DEVICE_SRCS src/backends/nnapi_engine.c)
-endif()
 if(VOLVOXAI_ENABLE_METAL)
   list(APPEND BACKEND_DEVICE_SRCS src/backends/metal_engine.m)
 endif()
@@ -542,10 +547,27 @@ target_link_options(volvoxai_cpu_only PRIVATE -Wl,--gc-sections)
 
 # --- Test-executable helper ---------------------------------------------------
 # volvox_test(<name> SOURCES ... [DEFS ...] [OPTS ...] [GEN <profile>]
-#             [LABELS ...] [RUN_ARGS ...] [NO_AUTOTEST])
+#             [LABELS ...] [RUN_ARGS ...] [NO_AUTOTEST] [EXCLUDE_FROM_ALL])
 function(volvox_test name)
-  cmake_parse_arguments(T "NO_AUTOTEST" "GEN" "SOURCES;DEFS;OPTS;LABELS;RUN_ARGS" ${ARGN})
-  add_executable(${name} ${T_SOURCES})
+  cmake_parse_arguments(T "NO_AUTOTEST;EXCLUDE_FROM_ALL" "GEN"
+    "SOURCES;DEFS;OPTS;LABELS;RUN_ARGS" ${ARGN})
+  # Optional Arm archives are advertised to kernels.c through compile
+  # definitions.  Every test which compiles that amalgamation therefore links
+  # the matching objects too; this keeps focused kernel tests from acquiring an
+  # unresolved I8MM reference merely because they did not spell out the global
+  # composition.
+  set(_volvox_test_sources ${T_SOURCES})
+  list(FIND _volvox_test_sources "src/kernels/kernels.c"
+       _volvox_test_has_kernels)
+  if(NOT _volvox_test_has_kernels EQUAL -1)
+    list(APPEND _volvox_test_sources ${ARM_OBJS})
+  endif()
+  list(REMOVE_DUPLICATES _volvox_test_sources)
+  if(T_EXCLUDE_FROM_ALL)
+    add_executable(${name} EXCLUDE_FROM_ALL ${_volvox_test_sources})
+  else()
+    add_executable(${name} ${_volvox_test_sources})
+  endif()
   volvox_cuda_codegen_before(${name})
   target_link_libraries(${name} PRIVATE volvox_common)
   if(T_DEFS)
@@ -575,7 +597,7 @@ volvox_test(test_runtime_state
   OPTS -std=c11 -O2 -Wall -Wextra -Werror)
 
 volvox_test(test_wasm_heap_arena
-  SOURCES src/kernels/core.c tests/test_wasm_heap_arena.c
+  SOURCES src/kernels/wasm_heap_arena.c tests/test_wasm_heap_arena.c
   DEFS VOLVOXAI_ENABLE_TRAINING=0
   OPTS -std=c11 -O2 -Wall -Wextra -Werror)
 
@@ -589,10 +611,10 @@ add_test(NAME test_shape_contract_spatial_vectors
   COMMAND $<TARGET_FILE:test_shape_contract_vectors>
           ${REPO}/tests/operator_shape_contract_spatial_vectors.json)
 set_tests_properties(test_shape_contract_spatial_vectors PROPERTIES LABELS native)
-add_test(NAME test_shape_contract_wave_b_vectors
+add_test(NAME test_shape_contract_structural_vectors
   COMMAND $<TARGET_FILE:test_shape_contract_vectors>
-          ${REPO}/tests/operator_shape_contract_wave_b_vectors.json)
-set_tests_properties(test_shape_contract_wave_b_vectors PROPERTIES LABELS native)
+          ${REPO}/tests/operator_shape_contract_structural_vectors.json)
+set_tests_properties(test_shape_contract_structural_vectors PROPERTIES LABELS native)
 add_test(NAME test_shape_contract_attention_vectors
   COMMAND $<TARGET_FILE:test_shape_contract_vectors>
           ${REPO}/tests/operator_shape_contract_attention_vectors.json)
@@ -601,19 +623,50 @@ add_test(NAME test_shape_contract_quantized_vectors
   COMMAND $<TARGET_FILE:test_shape_contract_vectors>
           ${REPO}/tests/operator_shape_contract_quantized_vectors.json)
 set_tests_properties(test_shape_contract_quantized_vectors PROPERTIES LABELS native)
-add_test(NAME test_shape_contract_final_vectors
+add_test(NAME test_shape_contract_extended_vectors
   COMMAND $<TARGET_FILE:test_shape_contract_vectors>
-          ${REPO}/tests/operator_shape_contract_final_vectors.json)
-set_tests_properties(test_shape_contract_final_vectors PROPERTIES LABELS native)
+          ${REPO}/tests/operator_shape_contract_extended_vectors.json)
+set_tests_properties(test_shape_contract_extended_vectors PROPERTIES LABELS native)
 
-volvox_test(test_nnapi_state_ownership
-  SOURCES src/runtime/runtime_state.c src/kernels/thread_pool.c
-          src/backends/nnapi_engine.c tests/test_nnapi_state_ownership.c
-  DEFS VOLVOXAI_ENABLE_TRAINING=0 __ANDROID__=1
-       VOLVOXAI_NNAPI_TESTING=1
+# Paged KV runs the same tests/paged_kv_vectors.json the TypeScript test runs.
+# The allocator is deliberately free of engine dependencies so this stays a
+# two-file binary: KV ownership must not require the tensor table to exist.
+volvox_test(test_paged_kv
+  SOURCES third_party/cJSON.c src/runtime/paged_kv.c tests/test_paged_kv.c
+  DEFS VOLVOXAI_ENABLE_TRAINING=0
+  OPTS -std=c11 -O2 -Wall -Wextra -Werror
+  RUN_ARGS ${REPO}/tests/paged_kv_vectors.json)
+
+# Paged attention is where "identical, not close" is actually checked: the
+# paged and contiguous forms are one implementation, so their results must
+# compare bit-for-bit rather than within a tolerance.
+volvox_test(test_paged_attention
+  SOURCES src/kernels/paged_attention.c tests/test_paged_attention.c
+  DEFS VOLVOXAI_ENABLE_TRAINING=0
   OPTS -std=c11 -O2 -Wall -Wextra -Werror)
-target_include_directories(test_nnapi_state_ownership PRIVATE
-  ${CMAKE_CURRENT_SOURCE_DIR}/tests/fake_android)
+
+# The row-set addressing contract for a B>1 step, over the same
+# tests/decode_row_set_vectors.json the TypeScript test reads.  This is the
+# shared corpus the decode/row proofs never had, and per-lane lengths plus page
+# tables are exactly the surface that was about to be written twice.
+volvox_test(test_decode_row_set
+  SOURCES third_party/cJSON.c src/runtime/decode_row_set.c tests/test_decode_row_set.c
+  DEFS VOLVOXAI_ENABLE_TRAINING=0
+  OPTS -std=c11 -O2 -Wall -Wextra -Werror
+  RUN_ARGS ${REPO}/tests/decode_row_set_vectors.json)
+
+volvox_test(test_continuous_batch_scheduler
+  SOURCES third_party/cJSON.c src/runtime/paged_kv.c src/runtime/batch_scheduler.c src/runtime/continuous_batch_scheduler.c
+          tests/test_continuous_batch_scheduler.c
+  DEFS VOLVOXAI_ENABLE_TRAINING=0
+  OPTS -std=c11 -O2 -Wall -Wextra -Werror
+  RUN_ARGS ${REPO}/tests/continuous_batching_vectors.json)
+
+volvox_test(test_batch_scheduler
+  SOURCES src/runtime/paged_kv.c src/runtime/batch_scheduler.c
+          tests/test_batch_scheduler.c
+  DEFS VOLVOXAI_ENABLE_TRAINING=0
+  OPTS -std=c11 -O2 -Wall -Wextra -Werror)
 
 volvox_test(test_backend_registry
   SOURCES src/runtime/backend.c tests/test_backend_registry.c
@@ -621,18 +674,18 @@ volvox_test(test_backend_registry
 
 volvox_test(test_packed_quant_gemm
   SOURCES src/kernels/kernels.c src/kernels/cpu_features.c
-          src/kernels/quant_cpu_opt.c tests/test_packed_quant_gemm.c
+          src/kernels/quant_cpu_isa.c tests/test_packed_quant_gemm.c
   OPTS -std=c11 -O3)
 
 volvox_test(test_quantize_linear
   SOURCES src/kernels/kernels.c src/kernels/cpu_features.c
-          src/kernels/quant_cpu_opt.c
+          src/kernels/quant_cpu_isa.c
           tests/test_quantize_linear.c
   OPTS -std=c11 -O3)
 
 volvox_test(test_qsdpa_w8a8_native
   SOURCES src/kernels/kernels.c src/kernels/cpu_features.c
-          src/kernels/quant_cpu_opt.c
+          src/kernels/quant_cpu_isa.c
           src/kernels/qsdpa_w8a8_native.c tests/test_qsdpa_w8a8_native.c
   OPTS -std=c11 -O3)
 
@@ -645,6 +698,9 @@ add_test(NAME test_public_api_affine_concat_domain
   COMMAND $<TARGET_FILE:test_public_api> --affine-concat-domain)
 set_tests_properties(test_public_api_affine_concat_domain
   PROPERTIES LABELS native)
+add_test(NAME test_process_memory_sampler
+  COMMAND $<TARGET_FILE:test_public_api> --process-memory-sampler)
+set_tests_properties(test_process_memory_sampler PROPERTIES LABELS native)
 
 volvox_test(test_trainer_api
   SOURCES ${CPU_ONLY_SRCS} ${FULL_PROFILE_SRCS} ${FULL_SHADER_SRCS}
@@ -661,16 +717,12 @@ volvox_test(test_ptq_api
 volvox_test(test_backend_provider_examples
   SOURCES ${CPU_ONLY_SRCS} ${SHADER_STORE_SRCS} ${EMB_CPU_ONLY}
           ../examples/backend_sdk/host_backend.c
-          ../examples/backend_sdk/android_nnapi_backend.c
+          tests/provider_stale_layout_fixture.c
           tests/test_backend_provider_examples.c
   DEFS VOLVOXAI_ENABLE_TRAINING=0 VOLVOXAI_PUBLIC_API_TESTING=1 ${BK_CPU_ONLY}
   OPTS -std=c11 -O2 GEN cpu_only)
 target_include_directories(test_backend_provider_examples PRIVATE
   ${REPO}/examples/backend_sdk)
-if(ANDROID)
-  target_link_libraries(test_backend_provider_examples PRIVATE neuralnetworks)
-endif()
-
 volvox_test(test_backend_manager
   SOURCES src/runtime/runtime_state.c src/kernels/thread_pool.c
           src/backends/backend_manager.c
@@ -700,7 +752,7 @@ volvox_test(test_sequence_ops
 
 volvox_test(test_moe_bank
   SOURCES src/kernels/kernels.c src/kernels/cpu_features.c
-    src/kernels/quant_cpu_opt.c src/kernels/training_kernels.c
+    src/kernels/quant_cpu_isa.c src/kernels/training_kernels.c
     tests/test_moe_bank.c
   DEFS VOLVOXAI_ENABLE_TRAINING=1
   OPTS -std=c11 -O2)
@@ -725,10 +777,64 @@ volvox_test(test_incremental_runtime
   DEFS VOLVOXAI_ENABLE_TRAINING=0 ${BK_DEFAULT}
   OPTS -O2 GEN inference)
 
-volvox_test(test_incremental_runtime_nnapi
-  SOURCES ${CPU_ONLY_SRCS} tests/test_incremental_runtime.c
-  DEFS VOLVOXAI_ENABLE_TRAINING=0 ${BK_NNAPI} VOLVOXAI_INCREMENTAL_FAKE_NNAPI_TEST=1
-  OPTS -O2)
+# Paged KV through the whole engine. test_paged_attention covers the kernel;
+# this covers the plumbing -- that a bound page table reaches the projection's
+# write and attention's read, which fail differently.
+volvox_test(test_paged_decode
+  SOURCES ${ENGINE_SRCS} ${INFERENCE_SHADER_SRCS} tests/test_paged_decode.c
+  DEFS VOLVOXAI_ENABLE_TRAINING=0 ${BK_DEFAULT}
+  OPTS -O2 GEN inference)
+
+# Several lanes advanced by one row in a single step, each lane checked against
+# its own one-lane decode. Pure CPU, so no adapter and no skip.
+volvox_test(test_batched_row_decode
+  SOURCES ${ENGINE_SRCS} ${INFERENCE_SHADER_SRCS} tests/test_batched_row_decode.c
+  DEFS VOLVOXAI_ENABLE_TRAINING=0 ${BK_DEFAULT}
+  OPTS -O2 GEN inference)
+
+# A batched decode whose attention runs on the device. QSDPA's batch form
+# stages a *set* of rows, which no binding names, so B>1 attention ran on the
+# host on every backend until rowIndexTransfer existed. Both labels: it skips
+# (77) where there is no adapter.
+volvox_test(test_device_batch_attention
+  SOURCES ${ENGINE_SRCS} ${INFERENCE_SHADER_SRCS} tests/test_device_batch_attention.c
+  DEFS VOLVOXAI_ENABLE_TRAINING=0 ${BK_DEFAULT}
+  LABELS native gpu
+  OPTS -O2 GEN inference)
+set_tests_properties(test_device_batch_attention PROPERTIES SKIP_RETURN_CODE 77)
+
+# The same join on the W8A8 path, which had no paged addressing at all: the
+# projections write through the page table and the attention gathers back
+# through it, at one lane and at several.
+volvox_test(test_w8a8_paged_decode
+  SOURCES ${ENGINE_SRCS} ${INFERENCE_SHADER_SRCS} tests/test_w8a8_paged_decode.c
+  DEFS VOLVOXAI_ENABLE_TRAINING=0 ${BK_DEFAULT}
+  OPTS -O2 GEN inference)
+
+# Paged addressing and a declared batch in the same step, which nothing
+# exercised before: paged was F32-only and batching W8A8-only.
+volvox_test(test_paged_batch_decode
+  SOURCES ${ENGINE_SRCS} ${INFERENCE_SHADER_SRCS} tests/test_paged_batch_decode.c
+  DEFS VOLVOXAI_ENABLE_TRAINING=0 ${BK_DEFAULT}
+  OPTS -O2 GEN inference)
+
+# The F32 half of the same claim. Every other batched operator is W8A8, so
+# CrossSDPA needed a fixture those could not provide.
+volvox_test(test_cross_sdpa_batch_rows
+  SOURCES ${ENGINE_SRCS} ${INFERENCE_SHADER_SRCS} tests/test_cross_sdpa_batch_rows.c
+  DEFS VOLVOXAI_ENABLE_TRAINING=0 ${BK_DEFAULT}
+  OPTS -O2 GEN inference)
+
+# A decode row executed on the device rather than handed back to the host.
+# Both labels: it needs a real Vulkan adapter to assert anything, so it belongs
+# to the gpu sweep, but it skips (77) rather than failing where there is none,
+# so it is also safe to leave in the default native one.
+volvox_test(test_device_row_decode
+  SOURCES ${ENGINE_SRCS} ${INFERENCE_SHADER_SRCS} tests/test_device_row_decode.c
+  DEFS VOLVOXAI_ENABLE_TRAINING=0 ${BK_DEFAULT}
+  LABELS native gpu
+  OPTS -O2 GEN inference)
+set_tests_properties(test_device_row_decode PROPERTIES SKIP_RETURN_CODE 77)
 
 # cpu_features.c backs kernel_platform.h, which gemm_f32.c now consults so its
 # microkernel selection honours VOLVOXAI_CPU_ISA like every other kernel.
@@ -826,10 +932,17 @@ add_test(NAME cuda_state_ownership_audit
 set_tests_properties(cuda_state_ownership_audit PROPERTIES
   LABELS native WORKING_DIRECTORY ${REPO})
 
-add_test(NAME metal_nnapi_state_ownership_audit
-  COMMAND ${PY} ${REPO}/tools/tests/test_metal_nnapi_state_ownership.py -v)
-set_tests_properties(metal_nnapi_state_ownership_audit PROPERTIES
+add_test(NAME metal_state_ownership_audit
+  COMMAND ${PY} ${REPO}/tools/tests/test_metal_state_ownership.py -v)
+set_tests_properties(metal_state_ownership_audit PROPERTIES
   LABELS native WORKING_DIRECTORY ${REPO})
+
+add_test(NAME native_dynamic_batch_matrix_wrapper
+  COMMAND ${PY}
+          ${REPO}/examples/native_dynamic_batch_benchmark/tests/test_run_matrix.py
+          -v)
+set_tests_properties(native_dynamic_batch_matrix_wrapper PROPERTIES
+  LABELS "native;example" WORKING_DIRECTORY ${REPO})
 
 # --- Opt-in example policies (label: example) ---------------------------------
 add_executable(volvoxai-tasks
@@ -872,6 +985,30 @@ add_test(NAME test_tiny_receipt_split_native_example
     -P ${CMAKE_CURRENT_SOURCE_DIR}/../examples/tiny_receipt_vqa/native/run_tiny_receipt.cmake)
 set_tests_properties(test_tiny_receipt_split_native_example PROPERTIES LABELS example)
 
+foreach(_variant receipt_digit_reader:main_receipt_digit_reader
+                 test_receipt_digit_reader:test_receipt_digit_reader)
+  string(REPLACE ":" ";" _pair ${_variant})
+  list(GET _pair 0 _bin)
+  list(GET _pair 1 _entry)
+  add_executable(${_bin}
+    ${ENGINE_SRCS} ${INFERENCE_SHADER_SRCS}
+    ${REPO}/examples/receipt_digit_reader/native/receipt_digit_reader.c
+    ${REPO}/examples/receipt_digit_reader/native/${_entry}.c)
+  add_dependencies(${_bin} volvoxai_pack_inference_shaders)
+  volvox_cuda_codegen_before(${_bin})
+  target_link_libraries(${_bin} PRIVATE volvox_common)
+  target_compile_definitions(${_bin} PRIVATE VOLVOXAI_ENABLE_TRAINING=0 ${BK_DEFAULT})
+  target_include_directories(${_bin} PRIVATE
+    ${GEN}/inference ${REPO}/examples/receipt_digit_reader/native)
+  target_compile_options(${_bin} PRIVATE -O3)
+endforeach()
+add_test(NAME test_receipt_digit_reader_native_example
+  COMMAND ${CMAKE_COMMAND}
+    -DBIN=$<TARGET_FILE:receipt_digit_reader>
+    -DTEST_BIN=$<TARGET_FILE:test_receipt_digit_reader>
+    -P ${CMAKE_CURRENT_SOURCE_DIR}/../examples/receipt_digit_reader/native/run_receipt_digit_reader.cmake)
+set_tests_properties(test_receipt_digit_reader_native_example PROPERTIES LABELS example)
+
 # Canonical W8A8 affine contract. Proves the shared header before any kernel is
 # migrated onto it, including bit equality with the device backends' multiplier.
 volvox_test(test_w8a8_affine
@@ -888,13 +1025,13 @@ volvox_test(test_kernel_platform
   LABELS native)
 
 # The unpacked dense kernels against a reference stated in the test, sweeping
-# output widths rather than sampling one model's.  broadcast_ops.c is a member
+# output widths rather than sampling one model's.  broadcast_ops.inc is a member
 # of the kernels.c amalgamation and is compiled through it, not on its own.
 # Deliberately no BENCH_CPU_FLAGS: matmul_f32 selects its ISA at runtime, so
 # fixing the flags here would only decide which tier the test can reach.
 volvox_test(test_matmul_f32_shapes
   SOURCES src/kernels/kernels.c src/kernels/cpu_features.c
-          src/kernels/quant_cpu_opt.c
+          src/kernels/quant_cpu_isa.c
           tests/test_matmul_f32_shapes.c
   OPTS -O2
   LABELS native)
@@ -905,7 +1042,7 @@ volvox_test(test_matmul_f32_shapes
 # exist, which is why they print the tier list.
 volvox_test(test_qlinear_isa_parity
   SOURCES src/kernels/kernels.c src/kernels/cpu_features.c
-          src/kernels/quant_cpu_opt.c
+          src/kernels/quant_cpu_isa.c
           src/kernels/qlinear_w8a8_x86.c src/kernels/qlinear_w8a8_arm.c
           src/kernels/qconv_w8a8_x86.c src/kernels/qconv_w8a8_arm.c ${ARM_OBJS}
           tests/test_qlinear_isa_parity.c
@@ -926,7 +1063,7 @@ volvox_test(test_conv2d_hwc_dense_parity
 
 volvox_test(test_qbatch_matmul_isa_parity
   SOURCES src/kernels/kernels.c src/kernels/cpu_features.c
-          src/kernels/quant_cpu_opt.c
+          src/kernels/quant_cpu_isa.c
           src/kernels/qbatch_matmul_w8a8_native.c
           tests/test_qbatch_matmul_isa_parity.c
   OPTS -O2 ${BENCH_CPU_FLAGS}
@@ -938,8 +1075,18 @@ volvox_test(test_qbatch_matmul_isa_parity
 # a tier at run time needs that number first.
 volvox_test(test_gemm_f32_isa_parity
   SOURCES src/kernels/kernels.c src/kernels/cpu_features.c
-          src/kernels/quant_cpu_opt.c
+          src/kernels/quant_cpu_isa.c
           tests/test_gemm_f32_isa_parity.c
+  OPTS -O2 ${BENCH_CPU_FLAGS}
+  LABELS native)
+
+# The attention pair, which differs from the GEMM one in what can go wrong: the
+# tiled body folds masks in as a vector bit pattern, so a mask layout can be
+# wrong by a factor while the unmasked arithmetic stays right. Every layout, on
+# one set of inputs, against the portable body WASM also ships.
+volvox_test(test_attention_f32_isa_parity
+  SOURCES src/kernels/cpu_features.c
+          tests/test_attention_f32_isa_parity.c
   OPTS -O2 ${BENCH_CPU_FLAGS}
   LABELS native)
 
@@ -951,16 +1098,24 @@ set_tests_properties(verify_wasm_build PROPERTIES LABELS verify)
 
 # --- Benchmarks (label: benchmark; on demand, not a gate) ---------------------
 volvox_test(benchmark_w8a8_native
-  SOURCES src/kernels/kernels.c src/kernels/quant_cpu_opt.c src/kernels/cpu_features.c
+  SOURCES src/kernels/kernels.c src/kernels/quant_cpu_isa.c src/kernels/cpu_features.c
           src/kernels/qlinear_w8a8_x86.c src/kernels/qlinear_w8a8_arm.c
           src/kernels/qconv_w8a8_x86.c src/kernels/qconv_w8a8_arm.c ${ARM_OBJS}
           ${CMAKE_CURRENT_SOURCE_DIR}/../examples/tiny_receipt_vqa/native/benchmark_w8a8_native.c
   OPTS -O3 ${BENCH_CPU_FLAGS}
   LABELS benchmark)
 
+# What batching a decode step is worth: one dispatch of B lanes against B
+# dispatches of one, at equal total work.
+volvox_test(benchmark_batched_decode
+  SOURCES ${ENGINE_SRCS} ${INFERENCE_SHADER_SRCS} tests/benchmark_batched_decode.c
+  DEFS VOLVOXAI_ENABLE_TRAINING=0 ${BK_DEFAULT}
+  OPTS -O2 GEN inference
+  LABELS benchmark)
+
 volvox_test(benchmark_qsdpa_w8a8_native
   SOURCES src/kernels/kernels.c src/kernels/cpu_features.c
-          src/kernels/quant_cpu_opt.c
+          src/kernels/quant_cpu_isa.c
           src/kernels/qsdpa_w8a8_native.c tests/benchmark_qsdpa_w8a8_native.c
   OPTS -std=c11 -O3
   LABELS benchmark)
@@ -978,21 +1133,21 @@ volvox_test(benchmark_gemm_f32
 # shapes run by ONNX Runtime.
 volvox_test(benchmark_kernel_unit
   SOURCES src/kernels/kernels.c src/kernels/cpu_features.c
-          src/kernels/quant_cpu_opt.c
+          src/kernels/quant_cpu_isa.c
           src/kernels/qlinear_w8a8_x86.c src/kernels/qlinear_w8a8_arm.c
           src/kernels/qconv_w8a8_x86.c src/kernels/qconv_w8a8_arm.c
           src/kernels/qsdpa_w8a8_native.c src/kernels/qgroupnorm_w8a8_native.c
           src/kernels/qnorm_activation_w8a8_native.c
           src/kernels/qbatch_matmul_w8a8_native.c
-          src/kernels/transpose_w8a8_native.c src/kernels/tensor_f32_opt.c
-          src/kernels/conv_f32_opt_baseline.c src/kernels/conv_f32_opt_avx2.c
+          src/kernels/transpose_w8a8_native.c src/kernels/tensor_f32_isa.c
+          src/kernels/conv_f32_isa_baseline.c src/kernels/conv_f32_isa_avx2.c
           src/kernels/conv_f32_dispatch.c src/runtime/runtime_state.c
           ${ARM_OBJS}
           tests/benchmark_kernel_unit.c
   # Deliberately no BENCH_CPU_FLAGS.  Every kernel this target measures selects
   # its ISA at runtime, so giving the whole target -mavx2 would only make
   # VOLVOXAI_CPU_ISA=baseline meaningless: the "baseline" copy of
-  # conv_f32_opt.c would be compiled with AVX2 too and the clamp would compare
+  # conv_f32_isa.c would be compiled with AVX2 too and the clamp would compare
   # a tier against itself.  Without the flags the two copies really differ, and
   # one binary can report both tiers.
   OPTS -O3
@@ -1031,7 +1186,7 @@ if(VOLVOXAI_ENABLE_CUDA)
             tests/test_cuda_training.c
     DEFS VOLVOXAI_ENABLE_TRAINING=1 VOLVOXAI_ENABLE_CUDA=1
          VOLVOXAI_ENABLE_VULKAN=0 VOLVOXAI_ENABLE_OPENGL=0
-         VOLVOXAI_ENABLE_METAL=0 VOLVOXAI_ENABLE_NNAPI=0
+         VOLVOXAI_ENABLE_METAL=0
          VOLVOXAI_CUDA_TESTING=1
          VOLVOXAI_CUDA_FAST_FP32=$<BOOL:${VOLVOXAI_CUDA_FAST_FP32}>
     LABELS "native;gpu")
@@ -1100,6 +1255,20 @@ if(VOLVOXAI_ENABLE_VULKAN OR VOLVOXAI_ENABLE_OPENGL OR
     LABELS gpu)
   set_tests_properties(test_native_gpu_public_dynamic
     PROPERTIES SKIP_RETURN_CODE 77)
+endif()
+if(VOLVOXAI_ENABLE_VULKAN OR VOLVOXAI_ENABLE_OPENGL OR
+   VOLVOXAI_ENABLE_CUDA)
+  # Opt-in publication harness. It uses only the public Runtime API, and is
+  # deliberately not a CTest because it requires private example artifacts and
+  # a real GPU. run_matrix.py supplies provenance, redaction, and the matrix.
+  volvox_test(native_dynamic_batch_benchmark
+    SOURCES ${ENGINE_SRCS} ${INFERENCE_SHADER_SRCS}
+            ../examples/native_dynamic_batch_benchmark/main.c
+    DEFS VOLVOXAI_ENABLE_TRAINING=0 ${BK_DEFAULT}
+    OPTS -std=c11 -O3 GEN inference
+    LABELS "benchmark;gpu"
+    EXCLUDE_FROM_ALL
+    NO_AUTOTEST)
 endif()
 if(APPLE AND VOLVOXAI_ENABLE_METAL)
   volvox_test(test_metal_training

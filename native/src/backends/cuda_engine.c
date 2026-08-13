@@ -109,7 +109,7 @@ enum {
 #undef VOLVOXAI_CUDA_FORWARD_FUNCTION
     CUDA_FORWARD_FUNCTION_COUNT
 };
-_Static_assert(CUDA_FORWARD_FUNCTION_COUNT == 90,
+_Static_assert(CUDA_FORWARD_FUNCTION_COUNT == 91,
                "CUDA forward function registry coverage");
 
 #if VOLVOXAI_ENABLE_TRAINING
@@ -264,6 +264,7 @@ static CudaDeviceState cuda_device_state = {
 #define CUDA_GRAPH_MAX_TENSORS 8192
 #define CUDA_GRAPH_SLOT_HASH_CAPACITY (CUDA_GRAPH_MAX_TENSORS * 2)
 #define CUDA_GRAPH_MAX_LAUNCHES 16384
+#define CUDA_GRAPH_REPLAY_PLAN_CAPACITY 4
 _Static_assert((CUDA_GRAPH_SLOT_HASH_CAPACITY &
                 (CUDA_GRAPH_SLOT_HASH_CAPACITY - 1)) == 0,
                "CUDA tensor-slot hash capacity must be a power of two");
@@ -376,11 +377,15 @@ typedef struct {
     int failed;
     int unsafe;
     int prestaging;
+    int destroy_pending;
+    int invalidation_counted;
     uint64_t generation;
     uint64_t slot_epoch;
     uint64_t shape_generation;
     uint64_t capacity_generation;
-    const char* shape_signature;
+    int domain_enforced;
+    char* shape_signature;
+    uint64_t last_used;
     uint32_t launch_count;
     uint32_t launch_index;
     CUgraph captured_graph;
@@ -444,6 +449,15 @@ typedef struct {
     int domain_enforced;
     int graph_allocation_failed;
     CudaReplayState replay;
+    CudaReplayState* replay_plans[CUDA_GRAPH_REPLAY_PLAN_CAPACITY];
+    size_t replay_plan_count;
+    CudaReplayState* replay_active;
+    uint64_t replay_clock;
+    uint64_t replay_capture_total;
+    uint64_t replay_launch_total;
+    uint64_t replay_hit_total;
+    uint64_t replay_invalidation_total;
+    int replay_last_forward_hit;
     CudaQactLutCache qact_lut_cache;
     CudaContextGuard forward_context_guard;
     int forward_scope_active;
@@ -506,6 +520,7 @@ typedef struct {
     uint64_t graph_launch_count;
     uint64_t graph_replay_count;
     uint64_t graph_invalidation_count;
+    uint64_t graph_exec_destroy_count;
     uint64_t slot_exact_lookup_count;
     uint64_t slot_hash_probe_count;
     uint64_t slot_containing_scan_count;
@@ -513,6 +528,7 @@ typedef struct {
     int transient_release_failure;
     int graph_allocation_failure;
     int graph_growth_rollback_failure;
+    int graph_exec_destroy_failure;
 #endif
 } CudaContextState;
 
@@ -537,6 +553,9 @@ static CudaContextState* cuda_context_state_require(void) {
     state->graph_slot_epoch = 1;
     state->shape_generation = 1;
     state->capacity_generation = 1;
+    state->replay_plans[0] = &state->replay;
+    state->replay_plan_count = 1u;
+    state->replay_active = &state->replay;
     engine_state->cuda_context_state = state;
     engine_state->cuda_context_state_destroy = cuda_context_state_destroy;
     return state;
@@ -566,7 +585,22 @@ static inline CudaContextState* cuda_context_state_current(void) {
 #define cuda_domain_enforced CUDA_CONTEXT_FIELD(domain_enforced)
 #define cuda_graph_allocation_failed \
     CUDA_CONTEXT_FIELD(graph_allocation_failed)
-#define cuda_replay CUDA_CONTEXT_FIELD(replay)
+static inline CudaReplayState* cuda_replay_state_current(void) {
+    CudaContextState* state = cuda_context_state_current();
+    return state->replay_active ? state->replay_active : &state->replay;
+}
+#define cuda_replay (*cuda_replay_state_current())
+#define cuda_replay_plans CUDA_CONTEXT_FIELD(replay_plans)
+#define cuda_replay_plan_count CUDA_CONTEXT_FIELD(replay_plan_count)
+#define cuda_replay_active CUDA_CONTEXT_FIELD(replay_active)
+#define cuda_replay_clock CUDA_CONTEXT_FIELD(replay_clock)
+#define cuda_replay_capture_total CUDA_CONTEXT_FIELD(replay_capture_total)
+#define cuda_replay_launch_total CUDA_CONTEXT_FIELD(replay_launch_total)
+#define cuda_replay_hit_total CUDA_CONTEXT_FIELD(replay_hit_total)
+#define cuda_replay_invalidation_total \
+    CUDA_CONTEXT_FIELD(replay_invalidation_total)
+#define cuda_replay_last_forward_hit \
+    CUDA_CONTEXT_FIELD(replay_last_forward_hit)
 #define qact_lut_cache CUDA_CONTEXT_FIELD(qact_lut_cache)
 #define cuda_forward_context_guard CUDA_CONTEXT_FIELD(forward_context_guard)
 #define cuda_forward_scope_active CUDA_CONTEXT_FIELD(forward_scope_active)
@@ -658,6 +692,8 @@ static inline CudaContextState* cuda_context_state_current(void) {
 #define cuda_graph_launch_count CUDA_CONTEXT_FIELD(graph_launch_count)
 #define cuda_graph_replay_count CUDA_CONTEXT_FIELD(graph_replay_count)
 #define cuda_graph_invalidation_count CUDA_CONTEXT_FIELD(graph_invalidation_count)
+#define cuda_graph_exec_destroy_count \
+    CUDA_CONTEXT_FIELD(graph_exec_destroy_count)
 #define cuda_slot_exact_lookup_count CUDA_CONTEXT_FIELD(slot_exact_lookup_count)
 #define cuda_slot_hash_probe_count CUDA_CONTEXT_FIELD(slot_hash_probe_count)
 #define cuda_slot_containing_scan_count \
@@ -670,6 +706,8 @@ static inline CudaContextState* cuda_context_state_current(void) {
     CUDA_CONTEXT_FIELD(graph_allocation_failure)
 #define cuda_test_graph_growth_rollback_failure \
     CUDA_CONTEXT_FIELD(graph_growth_rollback_failure)
+#define cuda_test_graph_exec_destroy_failure \
+    CUDA_CONTEXT_FIELD(graph_exec_destroy_failure)
 #endif
 
 #include "cuda/host/cuda_profile_host.inc"

@@ -62,12 +62,18 @@ class GeneratedCapabilitySourceTests(unittest.TestCase):
             "backend:metal",
             "backend:cuda",
         )
+        # Metal has no F32 MaxPool2D or ResizeNearest2D kernel, so it alone is
+        # not qualified for them; every other native GPU target agrees.
         expected = kernel_registry.OPS_BY_TARGET["backend:cuda"]
+        metal_expected = expected - {"MaxPool2D", "ResizeNearest2D"}
         self.assertTrue(expected)
         self.assertNotIn("Identity", expected)
         for target in native_gpu_targets:
             with self.subTest(native_gpu_target=target):
-                self.assertEqual(kernel_registry.OPS_BY_TARGET[target], expected)
+                self.assertEqual(
+                    kernel_registry.OPS_BY_TARGET[target],
+                    metal_expected if target == "backend:metal" else expected,
+                )
                 result = capabilities.validate_graph(graph, [target])
                 capability_codes = {
                     diagnostic.code

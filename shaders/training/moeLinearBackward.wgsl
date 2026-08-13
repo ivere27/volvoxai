@@ -13,8 +13,8 @@
 // staged row (VX_MOE_SLOT_ABSENT when the context did not materialize it) and
 // `row_slots` is the inverse, needed by the entries that iterate staged rows.
 // A zero slot_domain means the bank is fully resident and ids are already rows.
-@group(0) @binding(11) var<storage, read> slot_rows : array<u32>;
-@group(0) @binding(12) var<storage, read> row_slots : array<u32>;
+@group(0) @binding(10) var<storage, read> slot_rows : array<u32>;
+@group(0) @binding(11) var<storage, read> row_slots : array<u32>;
 
 struct Params {
     rows : u32,
@@ -25,7 +25,7 @@ struct Params {
     has_bias : u32,
     slot_domain : u32,
 }
-@group(0) @binding(10) var<uniform> params : Params;
+@group(0) @binding(12) var<uniform> params : Params;
 
 const VX_MOE_SLOT_ABSENT : u32 = 0xffffffffu;
 

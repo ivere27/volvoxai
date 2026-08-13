@@ -1,4 +1,4 @@
-/* Lives beside matmul_f32 in broadcast_ops.c so both layouts share one runtime
+/* Lives beside matmul_f32 in broadcast_ops.inc so both layouts share one runtime
  * ISA dispatch; it used to be a scalar loop here and was the only Linear
  * fallback left unvectorized. */
 void matmul_f32_out_in(const float* input, const float* weight, const float* bias,
@@ -620,29 +620,6 @@ static int vx_prepare_one_shot_linear(const Node* node, T* input, T* output,
     return 1;
 }
 
-#if VOLVOXAI_ENABLE_NNAPI
-static int vx_nnapi_linear_supports(void* user_data, const Node* node) {
-    (void)user_data;
-    return node && g_use_nnapi ? VX_BACKEND_HANDLED : VX_BACKEND_DECLINED;
-}
-static int vx_nnapi_linear_run(void* user_data, const Node* node, T* input, T* output) {
-    VxOneShotLinear call;
-    (void)user_data;
-    if (vk_sync_node_inputs((Node*)node) != 0) return VX_BACKEND_ERROR;
-    if (!vx_prepare_one_shot_linear(node, input, output, &call,
-                                    1L << 20, 0, 0) ||
-        call.out_in ||
-        !volvoxai_engine_tensor_is_model_weight_locked(call.weight_name) ||
-        (call.bias_name &&
-         !volvoxai_engine_tensor_is_model_weight_locked(call.bias_name)))
-        return VX_BACKEND_DECLINED;
-    if (!nnapi_matmul(call.input, call.weight, call.bias, call.output,
-                      call.rows, call.d_in, call.d_out))
-        return VX_BACKEND_ERROR;
-    if (g_vx_runtime_node.node_backend) *g_vx_runtime_node.node_backend = "nnapi";
-    return VX_BACKEND_HANDLED;
-}
-#endif
 #if VOLVOXAI_ENABLE_VULKAN
 static int vx_vulkan_linear_supports(void* user_data, const Node* node) {
     (void)user_data;
@@ -896,13 +873,6 @@ static const VxBackend g_vx_cuda_graph_backend = {
     .sync_host = vx_cuda_graph_sync, .teardown = vx_backend_detach,
 };
 #endif
-#if VOLVOXAI_ENABLE_NNAPI
-static const VxBackend g_vx_nnapi_linear_backend = {
-    .name = "nnapi-linear", .init = vx_backend_attach,
-    .supports = vx_nnapi_linear_supports, .run = vx_nnapi_linear_run,
-    .teardown = vx_backend_detach,
-};
-#endif
 #if VOLVOXAI_ENABLE_VULKAN
 static const VxBackend g_vx_vulkan_linear_backend = {
     .name = "vulkan-linear", .init = vx_backend_attach,
@@ -950,9 +920,6 @@ static int vx_runtime_backend_registry_init(VxBackendRegistry* registry) {
 #if VOLVOXAI_ENABLE_CUDA
     backends[count++] = &g_vx_cuda_graph_backend;
 #endif
-#if VOLVOXAI_ENABLE_NNAPI
-    backends[count++] = &g_vx_nnapi_linear_backend;
-#endif
 #if VOLVOXAI_ENABLE_VULKAN
     backends[count++] = &g_vx_vulkan_linear_backend;
 #endif
@@ -995,16 +962,42 @@ static int vx_cuda_replay_safe_op(const char* op) {
         !strcmp(op, "DequantizeLinear") ||
         !strcmp(op, "RequantizeLinear");
 }
+
+/* A maximum-domain context has already proved and reserved every activation
+ * span, so these additional routes cannot allocate or change device pointers
+ * between observation and capture. Their scalar launch arguments come only
+ * from immutable node parameters and the exact ShapeSignature; request values
+ * remain device-buffer contents uploaded before graph launch. Data-dependent
+ * MoE/bank routing is intentionally absent. */
+static int vx_cuda_bounded_replay_safe_op(const char* op) {
+    if (!op || !op[0]) return 0;
+    return vx_cuda_replay_safe_op(op) ||
+        !strcmp(op, "ArgMax") || !strcmp(op, "BatchMatMul") ||
+        !strcmp(op, "Cast") || !strcmp(op, "Clip") ||
+        !strcmp(op, "Div") || !strcmp(op, "Embedding") ||
+        !strcmp(op, "Equal") || !strcmp(op, "Expand") ||
+        !strcmp(op, "GELU") || !strcmp(op, "Gather") ||
+        !strcmp(op, "GreaterOrEqual") || !strcmp(op, "GroupNorm") ||
+        !strcmp(op, "LayerNorm") || !strcmp(op, "Mul") ||
+        !strcmp(op, "Not") || !strcmp(op, "QGemm") ||
+        !strcmp(op, "QLinear") || !strcmp(op, "ReduceSum") ||
+        !strcmp(op, "SiLU") || !strcmp(op, "Slice") ||
+        !strcmp(op, "Softmax") || !strcmp(op, "Squeeze") ||
+        !strcmp(op, "Sub") || !strcmp(op, "Unsqueeze") ||
+        !strcmp(op, "Where");
+}
 #endif
 
 int vx_runtime_backend_cuda_replay_eligible(void) {
 #if !VOLVOXAI_ENABLE_CUDA
     return 0;
 #else
+    int bounded_dynamic;
     if (!g_use_cuda || g_debug || g_nn <= 0 ||
-        vx_engine_state_current()->dynamic_shape_maximum_layout.configured ||
         !vx_runtime_full_graph_execution_eligible() ||
         volvoxai_engine_adapter_effect_active_locked()) return 0;
+    bounded_dynamic =
+        vx_engine_state_current()->dynamic_shape_maximum_layout.configured;
 #if VOLVOXAI_ENABLE_VULKAN
     if (g_use_vulkan) return 0;
 #endif
@@ -1017,7 +1010,10 @@ int vx_runtime_backend_cuda_replay_eligible(void) {
     for (int node = 0; node < g_nn; node++) {
         Node* current = &g_n[node];
         if (current->skip || current->disabled) continue;
-        if (!vx_cuda_replay_safe_op(current->op)) return 0;
+        if (!(bounded_dynamic
+                ? vx_cuda_bounded_replay_safe_op(current->op)
+                : vx_cuda_replay_safe_op(current->op)) ||
+            current->resident_slot_rows) return 0;
         for (int input = 0; input < current->nin; input++)
             if (vx_adapter_run_has_target(current->ins[input].name)) return 0;
     }
@@ -1111,22 +1107,6 @@ int vx_runtime_backend_append_dynamic_telemetry(char* output,
                                                 size_t output_capacity) {
     if (!output || !output_capacity) return -1;
     output[0] = '\0';
-#if VOLVOXAI_ENABLE_NNAPI
-    if (g_use_nnapi) {
-        NnapiCacheTelemetry telemetry;
-        if (nnapi_cache_telemetry(&telemetry) != 0) return -1;
-        (void)snprintf(
-            output, output_capacity,
-            ";nnapi_cache=%llu/%llu;nnapi_hit_rate=%.6f;nnapi_builds=%llu;"
-            "nnapi_evictions=%llu;nnapi_build_ms=%.3f",
-            (unsigned long long)telemetry.cache_hits,
-            (unsigned long long)telemetry.cache_misses,
-            telemetry.cache_hit_rate,
-            (unsigned long long)telemetry.model_builds,
-            (unsigned long long)telemetry.evictions,
-            telemetry.last_model_build_time_ms);
-    }
-#endif
 #if VOLVOXAI_ENABLE_CUDA
     if (g_use_cuda)
         return cuda_graph_append_dynamic_telemetry(
@@ -1136,6 +1116,20 @@ int vx_runtime_backend_append_dynamic_telemetry(char* output,
     if (g_use_vulkan)
         return vk_graph_append_dynamic_telemetry(
             output, output_capacity);
+#endif
+    return 0;
+}
+int vx_runtime_backend_execution_evidence(char* output,
+                                          size_t output_capacity) {
+    if (!output || !output_capacity) return -1;
+    output[0] = '\0';
+#if VOLVOXAI_ENABLE_CUDA
+    if (g_use_cuda)
+        return cuda_graph_execution_evidence(output, output_capacity);
+#endif
+#if VOLVOXAI_ENABLE_VULKAN
+    if (g_use_vulkan)
+        return vk_graph_execution_evidence(output, output_capacity);
 #endif
     return 0;
 }
@@ -1238,6 +1232,44 @@ void vx_runtime_backend_demote_weight(const void* host, size_t bytes) {
     (void)host;
     (void)bytes;
 }
+/*
+ * Backends that can execute a decode row *on the device*.
+ *
+ * The question is not "does this backend have kernels" -- every graph backend
+ * does, and they already take a row count. It is whether an interior host
+ * pointer resolves to a device buffer view: a row is a slice of an activation,
+ * and a backend whose slot map is keyed by complete host-span bases has no way
+ * to name it. Vulkan and OpenGL resolve one through `graph_find_containing_slot`
+ * (a descriptor range and a glBindBufferRange respectively); CUDA through
+ * `graph_get_view`; Metal through `mtl_graph_window_*` onto `setBuffer:offset:`.
+ *
+ * Answering yes is a claim about resolution, not about kernels, and it does not
+ * promise every row binds: the alignment rule still refuses a row whose stride
+ * is not a multiple of the device's storage alignment, and that one falls back
+ * to the host path per node.
+ *
+ * The override exists because this decides where decode runs, and "is it the
+ * device path or the host path?" must be answerable without a debugger.
+ */
+int vx_runtime_backend_has_device_rows(void) {
+    const char* disabled = getenv("VOLVOXAI_DISABLE_GPU_DEVICE_ROW");
+    if (disabled && disabled[0] && strcmp(disabled, "0")) return 0;
+    return
+#if VOLVOXAI_ENABLE_VULKAN
+        g_use_vulkan ||
+#endif
+#if VOLVOXAI_ENABLE_OPENGL
+        g_use_opengl ||
+#endif
+#if VOLVOXAI_ENABLE_METAL
+        g_use_metal ||
+#endif
+#if VOLVOXAI_ENABLE_CUDA
+        g_use_cuda ||
+#endif
+        0;
+}
+
 int vx_runtime_backend_has_graph(void) {
     return
 #if VOLVOXAI_ENABLE_VULKAN
@@ -1386,6 +1418,51 @@ static int vx_incremental_row_batch_major_op(const char* op) {
     return op && !strcmp(op, "QAdd");
 }
 
+/*
+ * The operators whose row path stages a declared batch's lanes.
+ *
+ * A list rather than a capability inferred from the operator's shapes: every
+ * row path in this file is *shaped* like it could take a batch, and the ones
+ * not on this list would run without complaint and address lane zero's rows
+ * for every lane. Adding an operator here is a claim that its physical forward
+ * consults `g_decode_lanes`, and `test_batched_row_decode` is where that claim
+ * is checked against the same lanes decoded one at a time.
+ */
+int vx_runtime_node_decode_batch_supported(const char* op) {
+    return op && (native_qlinear_op(op) || native_qembedding_op(op) ||
+                  !strcmp(op, "QSDPA") || !strcmp(op, "QAdd") ||
+                  !strcmp(op, "QSiLU") || !strcmp(op, "QGELU") ||
+                  !strcmp(op, "QLayerNorm") || !strcmp(op, "QArgMax") ||
+                  /* RoPE narrows nothing -- it recomputes the whole sequence
+                   * every call. Admitted because that is *correct* for a batch
+                   * (rotating an unchanged row reproduces it, and the operator
+                   * now refuses to work in place, which is what makes that
+                   * true), not because it is cheap. A graph with RoPE gets a
+                   * working B>1 decode whose RoPE node costs O(lanes * S). */
+                  !strcmp(op, "RoPE") ||
+                  /* The F32 projection, and the only operator here that writes
+                   * into a paged pool. Its batch branch resolves one (input
+                   * row, output row) pair per lane, and takes the output row
+                   * from `vx_decode_row_set_write_rows` so that the page
+                   * arithmetic lives where TypeScript and WebGPU already share
+                   * a corpus for it rather than in a second copy here. */
+                  !strcmp(op, "Linear") || !strcmp(op, "MatMul") ||
+                  !strcmp(op, "Gemm") ||
+                  /* CrossSDPA is the F32 one. Its batch branch runs each lane's
+                   * row through the same kernel call the one-lane path makes --
+                   * for every mask layout, including the query-dependent ones,
+                   * because the mask row is resolved before the kernel sees it,
+                   * and for paged K/V, whose prefix is gathered into logical
+                   * order per lane. What it still cannot narrow is a causal node
+                   * that is not causal over its own cache; that falls through to
+                   * the whole-sequence loop, which recomputes every lane's every
+                   * row from the operands as they stand. That is the RoPE
+                   * argument again: expensive, and right.
+                   * `test_cross_sdpa_batch_rows` is what makes this entry a
+                   * claim rather than a hope. */
+                  !strcmp(op, "CrossSDPA"));
+}
+
 int vx_runtime_node_incremental_row_compatible(Node* node, int idx, int row) {
     T* output;
     if (!node || row < 0) return 0;
@@ -1403,6 +1480,21 @@ int vx_runtime_node_incremental_row_compatible(Node* node, int idx, int row) {
      * decoder whose tensors are sequence-major. */
     if (vx_incremental_row_batch_major_op(node->op) &&
         !vx_incremental_row_batch_major(output)) return 0;
+
+    /*
+     * A declared batch admits only the operators that have been converted to
+     * stage their lanes.
+     *
+     * Fail-closed rather than fail-open, and stated here rather than left to
+     * each operator, because the failure of the other arrangement is silent:
+     * every unconverted row path computes its offsets as one contiguous span
+     * from `seq_range`, which for `[lanes,S,W]` names row `position` of lane
+     * zero for every lane. That reads and writes plausible bytes belonging to
+     * the wrong request. Refusing sends the step down the whole-sequence path,
+     * which is slower and correct.
+     */
+    if (g_decode_lanes > 1 && !vx_runtime_node_decode_batch_supported(node->op))
+        return 0;
 
     if (native_qlinear_op(node->op)) {
         QLinearMetadata* meta;
@@ -1449,7 +1541,8 @@ int vx_runtime_node_incremental_row_compatible(Node* node, int idx, int row) {
         T* weight = nin(node, "weight");
         return tokens && weight && tokens->dtype == T_I32 &&
             weight->dtype == T_F32 && tokens->ndim == 2 &&
-            tokens->shape[0] == 1 && tokens->shape[1] > row &&
+            tokens->shape[0] == (g_decode_lanes > 1 ? g_decode_lanes : 1) &&
+            tokens->shape[1] > row &&
             vx_incremental_row_tensor_3d(output, row);
     }
 
@@ -1458,7 +1551,8 @@ int vx_runtime_node_incremental_row_compatible(Node* node, int idx, int row) {
         return qembedding_physical_validate(
                    idx, node, output,
                    !g_bounded_gpu_value_domain_proven, &descriptor) == 0 &&
-            descriptor.tokens->ndim == 2 && descriptor.tokens->shape[0] == 1 &&
+            descriptor.tokens->ndim == 2 &&
+            descriptor.tokens->shape[0] == (g_decode_lanes > 1 ? g_decode_lanes : 1) &&
             descriptor.tokens->shape[1] > row &&
             vx_incremental_row_tensor_3d(output, row);
     }
@@ -1668,10 +1762,11 @@ int vx_runtime_node_incremental_row_compatible(Node* node, int idx, int row) {
         T* q = nin(node, "q");
         T* k = nin(node, "k");
         T* v = nin(node, "v");
-        /* The kernel already slices to one query row; it declines and
-         * recomputes whenever the mask is query-dependent, which stays correct
-         * but costs the whole prefix.  Admit only what it will actually
-         * narrow, so a plan that proves out also runs as one row. */
+        /* The kernel already slices to one query row, and every mask layout
+         * now comes with it: the row branch resolves the mask's own row from
+         * the query's absolute position before the kernel is called, so a
+         * query-dependent mask no longer forces the whole prefix.  What is left
+         * to admit is the shape of the operands. */
         const int batched = q && q->ndim == 3 && q->shape[0] != 1;
         return q && k && v && !batched && q->dtype == T_F32 &&
             k->dtype == T_F32 && v->dtype == T_F32 &&
@@ -1749,8 +1844,14 @@ int vx_runtime_node_incremental_row_compatible(Node* node, int idx, int row) {
          * projection produces. CrossSDPA lost the same redundant guard; the
          * quantized twin kept it, and a whole quantized decoder fell back to
          * dependency mode at 53.3 ms a step against the float path's 2.25. */
+        /* The batch extent is the declared lane count, not one. Demanding one
+         * here refused the whole closure the moment a device backend was asked
+         * for a B>1 step -- the planner runs only for a device closure, so the
+         * CPU path never saw it and the two disagreed about the same graph.
+         * `vx_incremental_row_tensor_3d` already skips the batch axis the same
+         * way; this clause was the one place that had not been told. */
         return qsdpa_physical_validate(node, output, &descriptor) == 0 &&
-            descriptor.batch == 1 &&
+            descriptor.batch == (uint32_t)(g_decode_lanes > 1 ? g_decode_lanes : 1) &&
             descriptor.seq_q > (uint32_t)row &&
             (!descriptor.causal || (uint32_t)row + 1u <= descriptor.seq_kv) &&
             vx_incremental_row_tensor_3d(output, row);
@@ -1875,7 +1976,19 @@ int run_node(Node* n, int idx, int is_last) {
 #endif
         if (dispatch_result != VX_BACKEND_HANDLED || !selected) return -1;
         if (selected == &g_vx_cpu_backend) {
-            if (idx >= 0 && idx < MAXN)
+            /*
+             * Keep whichever answer is more specific.
+             *
+             * The CPU backend runs a node by re-entering run_node, and that
+             * inner call records what it actually did -- "cpu-cross-sdpa-row"
+             * rather than "cpu". Overwriting it here with the registry's
+             * backend name replaced a statement about which path ran with one
+             * about which backend owned it, and the first is the one the route
+             * exists to answer. The slot was cleared at the top of both calls,
+             * so a non-null value can only be the inner one's.
+             */
+            if (idx >= 0 && idx < MAXN &&
+                !vx_engine_state_current()->runtime_route_backend[idx])
                 vx_engine_state_current()->runtime_route_backend[idx] =
                     selected->name;
             return 0;
@@ -2062,42 +2175,117 @@ int run_node(Node* n, int idx, int is_last) {
         // A selected graph-output row lets the final projection compute only
         // that row.
         if (is_last && g_active_row < 0 && g_execution_row >= 0 && total > 1) { r0 = g_execution_row; rc = 1; }
-        const float* in_p = in->data + (long)r0 * d_in;
-        float* out_p = o->data + (long)r0 * d_out;
-        const float* base_bias = adapter_linear ? NULL : (bp ? bp->data : NULL);
-        if (w->dtype == T_I8 || w->dtype == T_U8) {
-            if (quantized_linear_f32(idx, n, in, w, bp, o, r0, rc, d_in, d_out, out_in, !adapter_linear) != 0) return -1;
-            node_backend = adapter_linear ? "cpu-qlinear+adapter" : "cpu-qlinear";
-        } else if (wp->dtype != T_F32) {
-            return -1;
+        /*
+         * The rows this call computes, as (input row, output row) pairs.
+         *
+         * One pair is the scalar case, and it is the only one until a batch is
+         * declared. `seq_range` produces a single contiguous run, which for a
+         * `[lanes,S,W]` activation is lane zero's row repeated for every lane --
+         * so a batch cannot use it and builds one pair per lane instead.
+         *
+         * The two rows are resolved separately because they mean different
+         * things. A K/V projection reads its logical token row and writes the
+         * physical slot the page table maps it to; for every tensor outside the
+         * page pool the two coincide, which is what keeps an unpaged context
+         * running exactly the code it ran before.
+         */
+        int segment_in[VX_DECODE_ROW_SET_MAX_LANES];
+        int segment_out[VX_DECODE_ROW_SET_MAX_LANES];
+        int segment_count = 1;
+        int segment_rows = rc;
+        int paged_out = vx_paged_tensor_locked(o);
+        segment_in[0] = r0;
+        segment_out[0] = vx_paged_row_locked(o, r0);
+        if (g_decode_lanes > 1) {
+            int in_rows[VX_DECODE_ROW_SET_MAX_LANES];
+            int out_rows[VX_DECODE_ROW_SET_MAX_LANES];
+            /* The input is an ordinary `[lanes,S,d_in]` activation; the output
+             * is either the same geometry or the page pool, and only the row
+             * set knows how to say both. Its `paged` argument is per tensor for
+             * exactly this reason: a lane owns a page table, but applying it to
+             * an unpaged activation would send that row into a K/V slot. */
+            if (decode_lane_rows(in, d_in, in_rows) != g_decode_lanes) return -1;
+            if (paged_out) {
+                /* `quantized_linear_f32` derives its own destination from the
+                 * logical row, so it would write a paged output to the slot the
+                 * page table was there to redirect. Refusing keeps this branch
+                 * from extending that to a batch. */
+                if (w->dtype == T_I8 || w->dtype == T_U8) return -1;
+                /* Without page tables in the row set every lane would answer
+                 * with linear addressing, which for a shared pool is another
+                 * lane's slot. A lane stride of zero is deliberate: the paged
+                 * answer does not use one, and passing the sequence length
+                 * would suggest it did. */
+                if (!vx_paged_bound_locked() ||
+                    vx_paged_lanes_locked() < g_decode_lanes ||
+                    g_decode_rows.unpaged) return -1;
+                if (vx_decode_row_set_write_rows(&g_decode_rows, 0, 1,
+                                                 out_rows) != VX_DECODE_ROW_SET_OK)
+                    return -1;
+            } else if (decode_lane_rows(o, d_out, out_rows) != g_decode_lanes) {
+                return -1;
+            }
+            segment_count = 0;
+            for (int lane = 0; lane < g_decode_lanes; lane++) {
+                if (g_decode_rows.parked[lane]) continue;
+                if (in_rows[lane] < 0 || out_rows[lane] < 0) return -1;
+                segment_in[segment_count] = in_rows[lane];
+                segment_out[segment_count] = out_rows[lane];
+                segment_count++;
+            }
+            segment_rows = 1;
         }
-        else if (wp->dtype == T_F32) {
-            int packed_ran = 0;
-            /* Only immutable model weights enter the persistent node cache.
-             * Dynamic graph values retain the scalar reference path. */
-            if (vx_engine_state_current()->gemm_f32_packed_enabled &&
-                volvoxai_engine_tensor_is_model_weight_locked(w->name)) {
-                const float* packed_weight = vx_gemm_f32_pack_cache(
-                    &vx_engine_state_current()->gemm_f32_cache,
-                    idx, wp->data, (uint32_t)d_in, (uint32_t)d_out, out_in);
-                if (packed_weight) {
-                    packed_ran = vx_gemm_f32_run_packed(
-                        in_p, packed_weight, base_bias, out_p,
-                        (uint32_t)rc, (uint32_t)d_in, (uint32_t)d_out);
+        for (int segment = 0; segment < segment_count; segment++) {
+            const float* in_p;
+            float* out_p;
+            const float* base_bias;
+            r0 = segment_in[segment];
+            rc = segment_rows;
+            /* The cache's page budget and the tensor backing the pool are
+             * configured separately, so a mapping that runs past the tensor is
+             * a caller error this has to catch rather than write through. */
+            if (segment_out[segment] < 0 ||
+                (long)segment_out[segment] + rc > o->numel / d_out) return -1;
+            in_p = in->data + (long)r0 * d_in;
+            out_p = o->data + (long)segment_out[segment] * d_out;
+            base_bias = adapter_linear ? NULL : (bp ? bp->data : NULL);
+            if (w->dtype == T_I8 || w->dtype == T_U8) {
+                if (quantized_linear_f32(idx, n, in, w, bp, o, r0, rc, d_in, d_out, out_in, !adapter_linear) != 0) return -1;
+                node_backend = adapter_linear ? "cpu-qlinear+adapter" : "cpu-qlinear";
+            } else if (wp->dtype != T_F32) {
+                return -1;
+            }
+            else if (wp->dtype == T_F32) {
+                int packed_ran = 0;
+                /* Only immutable model weights enter the persistent node cache.
+                 * Dynamic graph values retain the scalar reference path. */
+                if (vx_engine_state_current()->gemm_f32_packed_enabled &&
+                    volvoxai_engine_tensor_is_model_weight_locked(w->name)) {
+                    const float* packed_weight = vx_gemm_f32_pack_cache(
+                        &vx_engine_state_current()->gemm_f32_cache,
+                        idx, wp->data, (uint32_t)d_in, (uint32_t)d_out, out_in);
+                    if (packed_weight) {
+                        packed_ran = vx_gemm_f32_run_packed(
+                            in_p, packed_weight, base_bias, out_p,
+                            (uint32_t)rc, (uint32_t)d_in, (uint32_t)d_out);
+                    }
                 }
+                if (!packed_ran) {
+                    if (out_in) matmul_f32_out_in(in_p, wp->data, base_bias, out_p, rc, d_in, d_out);
+                    else matmul_f32(in_p, wp->data, base_bias, out_p, rc, d_in, d_out);
+                }
+                if (adapter_linear) node_backend = "cpu-linear+adapter";
             }
-            if (!packed_ran) {
-                if (out_in) matmul_f32_out_in(in_p, wp->data, base_bias, out_p, rc, d_in, d_out);
-                else matmul_f32(in_p, wp->data, base_bias, out_p, rc, d_in, d_out);
+            if (adapter_linear && vx_adapter_apply_linear(w->name, in_p, wp->data, wp->dtype,
+                                                           bp ? bp->data : NULL, out_p, rc, d_in, d_out,
+                                                           out_in, in->ndim >= 2 ? in->shape[0] : 1,
+                                                           r0, total) < 0) {
+                return -1;
             }
-            if (adapter_linear) node_backend = "cpu-linear+adapter";
         }
-        if (adapter_linear && vx_adapter_apply_linear(w->name, in_p, wp->data, wp->dtype,
-                                                       bp ? bp->data : NULL, out_p, rc, d_in, d_out,
-                                                       out_in, in->ndim >= 2 ? in->shape[0] : 1,
-                                                       r0, total) < 0) {
-            return -1;
-        }
+        if (g_decode_lanes > 1)
+            node_backend = paged_out ? "cpu-linear-paged-batch-row"
+                                     : "cpu-linear-batch-row";
     } else if (!strcmp(op, "ReduceSum") || !strcmp(op, "ReduceMean")) {
         T* source = NULL;
         long rows = 0;
@@ -2458,25 +2646,59 @@ int run_node(Node* n, int idx, int is_last) {
         int d_model = q->shape[q->ndim - 1];
         int batch = q->ndim == 3 ? q->shape[0] : 1;
         int seq_q = q->shape[q->ndim - 2];
-        int seq_kv = k->shape[k->ndim - 2];
+        /*
+         * A paged K/V operand is a pool, and a pool has no batch axis.
+         *
+         * Every other operand carries one slice per lane, so its second-to-last
+         * extent is that lane's key count. The page pool is shared: lane 1's
+         * token may sit in the physical row between two of lane 0's, which is
+         * the whole point of paging, and no axis of it means "lane". Its extent
+         * is therefore its total row count however the graph spells the shape,
+         * and the per-lane key count comes from the published length instead.
+         *
+         * Both operands or neither: one paged and one not would address the two
+         * halves of the same attention under two different meanings.
+         */
+        int paged_kv = vx_paged_tensor_locked(k);
+        int seq_kv;
         if (num_heads <= 0 || d_model <= 0 || d_model % num_heads) return -1;
+        if (paged_kv != vx_paged_tensor_locked(v)) return -1;
+        seq_kv = paged_kv ? (int)(k->numel / d_model) : k->shape[k->ndim - 2];
+        if (seq_kv <= 0) return -1;
         int head_dim = d_model / num_heads;
         float scale = p_flt(p, "scale", 1.0f / sqrtf((float)head_dim));
         int causal = p_int(p, "causal", 0) ? 1 : 0;
         T* mask = nin(n, "mask");
+        /*
+         * The mask's key axis is `seq_kv`, which for a paged operand is the
+         * pool's total row count. That is an axis size, not a claim that a mask
+         * index names a physical slot: paged or not, index `t` is this lane's
+         * logical token `t`, and the lane's published length says how far into
+         * the axis it may read. Sizing the axis from the cache instead would tie
+         * the graph's static shape to a bound cache, and the same graph runs
+         * unbound during a seed forward.
+         */
         int mask_mode = attention_mask_mode(mask, batch, seq_q, seq_kv);
         if (mask_mode < 0) return -1;
 #if VOLVOXAI_ENABLE_TRAINING
         NativeAttentionDropoutParams dropout;
         if (native_attention_dropout_params(n, idx, &dropout) != 0) return -1;
 #endif
-        if (batch <= 0 || (q->ndim == 3 && (k->shape[0] != batch || v->shape[0] != batch)) ||
+        if (batch <= 0 ||
+            (q->ndim == 3 && !paged_kv &&
+             (k->shape[0] != batch || v->shape[0] != batch)) ||
             k->shape[k->ndim - 1] != d_model || v->shape[v->ndim - 1] != d_model ||
-            v->shape[v->ndim - 2] != seq_kv || !o || o->ndim != q->ndim ||
+            (paged_kv ? v->numel != k->numel : v->shape[v->ndim - 2] != seq_kv) ||
+            !o || o->ndim != q->ndim ||
             (o->ndim == 3 && o->shape[0] != batch) || o->shape[o->ndim - 2] != seq_q ||
             o->shape[o->ndim - 1] != d_model || o->numel != (long)batch * seq_q * d_model) return -1;
 #if VOLVOXAI_ENABLE_TRAINING
         if (g_native_training_mode && dropout.enabled) {
+            /* This one indexes the mask with `seq_kv`, which is the pool's row
+             * count when the K/V are paged and not the axis the mask was
+             * classified against. Refused rather than given a second extent:
+             * training does not decode through a page table. */
+            if (paged_kv) return -1;
             if (cross_sdpa_attention_dropout_forward(q, k, v, mask, o, batch,
                     seq_q, seq_kv, d_model, num_heads, head_dim, scale, causal,
                     mask_mode, &dropout) != 0) return -1;
@@ -2484,44 +2706,193 @@ int run_node(Node* n, int idx, int is_last) {
 #endif
         {
             int row_ran = 0;
+            /*
+             * Every layout reaches the row branches, including the
+             * query-dependent ones they used to refuse.
+             *
+             * The refusal was never about the layout: a sliced query loses its
+             * absolute position, and the kernel would then index a `[Sq,K]` mask
+             * at row zero for every row. `attention_mask_query_view` resolves
+             * the row here, where the position is still known, so what the
+             * kernel receives is a key-only mask in every case. The row paths
+             * below each compute exactly one query per lane, which is what makes
+             * that resolution total rather than an approximation.
+             */
+            /*
+             * "Causal over its own K/V cache", which for an ordinary operand is
+             * spelled `seq_q == seq_kv`. A paged operand cannot say it that
+             * way: its extent is the pool's row count, shared by every lane, so
+             * it equals the query length only by coincidence. Being paged *is*
+             * the statement -- the pool is the self-attention cache, and the
+             * extent a row may see comes from the lane's published length
+             * rather than from any shape.
+             */
+            int causal_self = causal && (paged_kv || seq_q == seq_kv);
+            /*
+             * A declared batch: one row per lane, each computed exactly as the
+             * one-lane path below computes its row.
+             *
+             * That is deliberate rather than incidental. Lane `b`'s query row is
+             * `b * seq_q + position[b]` and its memory is the whole of its own
+             * `[seq_kv, d_model]` slice, so a lane's inputs to `cross_sdpa_f32`
+             * are byte-for-byte the inputs it would have alone -- which makes
+             * "each lane is bit-identical to its own one-lane decode" a property
+             * of the loop's shape and not something a tolerance has to check.
+             *
+             * Cross-attention memory has no per-lane length: every lane reads
+             * its encoder memory whole, which is why the row set's
+             * `clamp_to_length` is zero for this operand and why the key extent
+             * here is `seq_kv` unless the node is self-attention spelled as a
+             * cross node (`causal_self`), where the lane's own position bounds
+             * it just as it does at one lane.
+             *
+             * Paged K/V joins here rather than being refused. A paged lane's
+             * prefix is not a contiguous span, so it is gathered into logical
+             * order per lane and handed to the *same* kernel -- which is what
+             * the one-lane path below does, and what keeps "paged K/V is
+             * numerically identical to contiguous K/V" a structural property
+             * rather than a tolerance. The gather scratch is per slot, so a
+             * lane's prefix is consumed before the next lane's is built.
+             *
+             * This is the point where paged addressing and B>1 decode actually
+             * meet: paged addressing was F32-only and batching was W8A8-only,
+             * so before this the two never appeared in the same step.
+             */
+            if (g_decode_lanes > 1 && batch == g_decode_lanes && q->ndim == 3 &&
+                (!causal || causal_self)) {
+                int rows[VX_DECODE_ROW_SET_MAX_LANES];
+                int paged = paged_kv;
+                int paged_ok = !paged || vx_paged_lanes_locked() >= g_decode_lanes;
+                if (paged_ok && decode_lane_rows(q, d_model, rows) == g_decode_lanes &&
+                    o->ndim == 3 && o->shape[1] == seq_q) {
+                    int lane;
+                    for (lane = 0; lane < g_decode_lanes; lane++) {
+                        int position = rows[lane] - lane * seq_q;
+                        int row_seq_kv;
+                        int local_mask_mode = 0;
+                        const int32_t* batch_mask;
+                        const float* key_rows;
+                        const float* value_rows;
+                        long q_offset;
+                        if (g_decode_rows.parked[lane]) continue;
+                        if (position < 0 || position >= seq_q) break;
+                        /* A paged lane publishes its own length; an unpaged
+                         * causal one derives it from its own position. Either
+                         * way it is this lane's, which is the whole difference
+                         * from the scalar path. */
+                        row_seq_kv = paged && causal_self
+                            ? vx_paged_kv_length_lane_locked(lane)
+                            : (causal_self ? position + 1 : seq_kv);
+                        /* A published length longer than the tensor would
+                         * gather past the pool: the cache's page budget and the
+                         * tensor backing it are configured separately. */
+                        if (row_seq_kv <= 0 || row_seq_kv > seq_kv) break;
+                        /* The mask row for this lane's own query position. It
+                         * refuses rather than returning a row that would not
+                         * hold `seq_kv` keys, which is the second half of the
+                         * bound above -- the kernel reads `row_seq_kv` of
+                         * them. */
+                        batch_mask = attention_mask_query_view(
+                            mask, mask_mode, lane, position, seq_q, seq_kv,
+                            &local_mask_mode);
+                        if (mask && !batch_mask) break;
+                        q_offset = (long)rows[lane] * d_model;
+                        if (paged) {
+                            key_rows = vx_paged_gather_lane_f32_locked(
+                                k->data, seq_kv, d_model, row_seq_kv, 0, lane);
+                            value_rows = vx_paged_gather_lane_f32_locked(
+                                v->data, seq_kv, d_model, row_seq_kv, 1, lane);
+                            if (!key_rows || !value_rows) break;
+                        } else {
+                            key_rows = k->data + (long)lane * seq_kv * d_model;
+                            value_rows = v->data + (long)lane * seq_kv * d_model;
+                        }
+                        /* The causal row sees only its K/V prefix, so the
+                         * sliced one-query kernel itself must be noncausal. */
+                        cross_sdpa_f32(q->data + q_offset, key_rows, value_rows,
+                                       o->data + q_offset, 1, row_seq_kv, d_model,
+                                       num_heads, head_dim, scale, batch_mask,
+                                       local_mask_mode, 0);
+                    }
+                    /* All lanes or none: a partial pass would leave the rest of
+                     * the batch holding the previous step's rows while the
+                     * route claimed the step ran. */
+                    if (lane == g_decode_lanes) {
+                        node_backend = paged ? "cpu-cross-sdpa-paged-batch-row"
+                                             : "cpu-cross-sdpa-batch-row";
+                        row_ran = 1;
+                    }
+                }
+            }
             /* Rank is not the question, batch is.  Every extent this kernel
              * uses comes from the last two axes, so [S,D] is [1,S,D] with the
              * batch already implied; requiring rank three made the sliced path
              * unreachable for the sequence-major spelling the decoder actually
              * carries, and it recomputed the whole prefix per token instead. */
-            if (g_active_row >= 0 && batch == 1) {
+            if (!row_ran && g_active_row >= 0 && batch == 1) {
                 int row = g_active_row;
                 if (row >= seq_q) return -1;
-                /* A key-only mask remains valid when the query tensor is
-                 * sliced to one row. Query-dependent layouts keep the full
-                 * path below so their original query indexing is preserved. */
-                int row_mask_safe = mask_mode == ATTN_MASK_NONE ||
-                    mask_mode == ATTN_MASK_KEY || mask_mode == ATTN_MASK_BATCH_KEY;
-                int causal_self = causal && seq_q == seq_kv;
-                if (row_mask_safe && (!causal || causal_self)) {
+                if (!causal || causal_self) {
                     int local_mask_mode = 0;
-                    const int32_t* batch_mask = attention_mask_batch_view(
-                        mask, mask_mode, 0, seq_q, seq_kv, &local_mask_mode);
-                    int row_seq_kv = causal_self ? row + 1 : seq_kv;
+                    const int32_t* batch_mask = attention_mask_query_view(
+                        mask, mask_mode, 0, row, seq_q, seq_kv,
+                        &local_mask_mode);
+                    int paged = vx_paged_tensor_locked(k);
+                    int row_seq_kv = causal_self
+                        ? (paged ? vx_paged_kv_length_locked() : row + 1)
+                        : seq_kv;
                     long q_offset = (long)row * d_model;
+                    /* A published length longer than the tensor would gather
+                     * past the pool: the cache's page budget and the tensor
+                     * backing it are configured separately.  A mask row the
+                     * view could not resolve is refused for the same reason it
+                     * refuses: there is no shorter answer that is still right. */
+                    if (row_seq_kv <= 0 || row_seq_kv > seq_kv) return -1;
+                    if (mask && !batch_mask) return -1;
+                    const float* key_rows = k->data;
+                    const float* value_rows = v->data;
+                    if (paged) {
+                        /* Gather the lane's active prefix into logical order and
+                         * hand it to the *same* kernel the contiguous path uses.
+                         * A page-table-aware rewrite would not reproduce that
+                         * kernel's online-softmax accumulation order, and
+                         * "identical to contiguous" would degrade to "close". */
+                        if (!vx_paged_tensor_locked(v)) return -1;
+                        key_rows = vx_paged_gather_f32_locked(k->data, seq_kv, d_model,
+                                                              row_seq_kv, 0);
+                        value_rows = vx_paged_gather_f32_locked(v->data, seq_kv, d_model,
+                                                                row_seq_kv, 1);
+                        if (!key_rows || !value_rows) return -1;
+                    }
                     /* The causal row sees only its K/V prefix, so the sliced
                      * one-query kernel itself must be noncausal (query 0
                      * would otherwise be limited to key 0). */
-                    cross_sdpa_f32(q->data + q_offset, k->data, v->data,
+                    cross_sdpa_f32(q->data + q_offset, key_rows, value_rows,
                                    o->data + q_offset, 1, row_seq_kv, d_model,
                                    num_heads, head_dim, scale, batch_mask,
                                    local_mask_mode, 0);
+                    node_backend = paged ? "cpu-cross-sdpa-paged-row"
+                                         : "cpu-cross-sdpa-row";
                     row_ran = 1;
-                    node_backend = "cpu-cross-sdpa-row";
                 }
             }
+            /*
+             * The whole-sequence fallback reads K/V linearly, which is what a
+             * page table exists to prevent: it would attend over whatever
+             * physical rows sit at `[0, seq_kv)`, some of them another lane's.
+             * Refusing is the fail-closed rule the rest of the row path
+             * follows, and it is the honest answer here -- for a scattered
+             * mapping there is no correct linear reading to fall back to.
+             */
+            if (!row_ran && paged_kv) return -1;
             if (!row_ran) {
                 for (int batch_index = 0; batch_index < batch; batch_index++) {
                     long q_offset = (long)batch_index * seq_q * d_model;
                     long kv_offset = (long)batch_index * seq_kv * d_model;
                     int local_mask_mode = 0;
                     const int32_t* batch_mask = attention_mask_batch_view(
-                        mask, mask_mode, batch_index, seq_q, seq_kv, &local_mask_mode);
+                        mask, mask_mode, batch_index, seq_q, seq_kv,
+                        &local_mask_mode);
                     cross_sdpa_f32(q->data + q_offset, k->data + kv_offset,
                                    v->data + kv_offset, o->data + q_offset,
                                    seq_q, seq_kv, d_model, num_heads, head_dim,

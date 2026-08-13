@@ -30,8 +30,7 @@ static int cuda_training_moe_supports(
         uint32_t groups_x, uint32_t groups_y, uint32_t groups_z) {
     if ((!cuda_training_moe_linear_command(command) &&
          !cuda_training_moe_router_command(command)) ||
-        !bytes || binding_count != 11 || !groups_x || groups_y != 1u ||
-        groups_z != 1u || bytes[10] != 8u * sizeof(uint32_t)) return 0;
+        !bytes || !groups_x || groups_y != 1u || groups_z != 1u) return 0;
 
     for (int binding = 0; binding < 10; ++binding) {
         if (!bytes[binding] || bytes[binding] % sizeof(float) != 0u)
@@ -39,13 +38,52 @@ static int cuda_training_moe_supports(
     }
 
     if (cuda_training_moe_linear_command(command)) {
-        return bytes[0] == bytes[6] && bytes[1] == bytes[7] &&
+        return binding_count == 13 &&
+            bytes[10] != 0u && bytes[10] % sizeof(uint32_t) == 0u &&
+            bytes[11] != 0u && bytes[11] % sizeof(uint32_t) == 0u &&
+            bytes[12] == 8u * sizeof(uint32_t) &&
+            bytes[0] == bytes[6] && bytes[1] == bytes[7] &&
             bytes[2] == bytes[8] && bytes[3] == bytes[4] &&
             bytes[3] == bytes[9];
     }
-    return bytes[0] == bytes[7] && bytes[1] == bytes[8] &&
+    return binding_count == 11 && bytes[10] == 8u * sizeof(uint32_t) &&
+        bytes[0] == bytes[7] && bytes[1] == bytes[8] &&
         bytes[2] == bytes[9] && bytes[3] == bytes[4] &&
         bytes[3] == bytes[5];
+}
+
+static uint32_t cuda_training_moe_read_u32(const void* data, uint32_t index) {
+    uint32_t value;
+    memcpy(&value, (const unsigned char*)data + (size_t)index * sizeof(value),
+           sizeof(value));
+    return value;
+}
+
+static int cuda_training_moe_linear_mapping_valid(
+        void* const* hosts, const size_t* bytes, const uint32_t* params) {
+    const uint32_t experts = params[3];
+    const uint32_t top_k = params[4];
+    const uint32_t domain = params[6];
+    if (!domain) {
+        return bytes[10] == sizeof(uint32_t) &&
+            bytes[11] == sizeof(uint32_t);
+    }
+    if (domain < experts || top_k > domain ||
+        (size_t)domain > SIZE_MAX / sizeof(uint32_t) ||
+        bytes[10] != (size_t)domain * sizeof(uint32_t) ||
+        bytes[11] != (size_t)experts * sizeof(uint32_t)) return 0;
+    for (uint32_t row = 0; row < experts; ++row) {
+        const uint32_t slot = cuda_training_moe_read_u32(hosts[11], row);
+        if (slot >= domain ||
+            cuda_training_moe_read_u32(hosts[10], slot) != row) return 0;
+    }
+    for (uint32_t slot = 0; slot < domain; ++slot) {
+        const uint32_t row = cuda_training_moe_read_u32(hosts[10], slot);
+        if (row == UINT32_MAX) continue;
+        if (row >= experts ||
+            cuda_training_moe_read_u32(hosts[11], row) != slot) return 0;
+    }
+    return 1;
 }
 
 static int cuda_training_moe_stage(
@@ -85,10 +123,11 @@ static int cuda_training_dispatch_moe_linear(
     int destination;
     CUfunction function;
 
-    memcpy(params, hosts[10], sizeof(params));
+    memcpy(params, hosts[12], sizeof(params));
     if (!params[0] || !params[1] || !params[2] || !params[3] ||
         !params[4] || params[4] > params[3] || params[4] > 8u ||
-        params[5] > 1u || params[6] != 0u || params[7] != 0u) return -1;
+        params[5] > 1u || params[7] != 0u ||
+        !cuda_training_moe_linear_mapping_valid(hosts, bytes, params)) return -1;
 
     input_factors[0] = params[0];
     input_factors[1] = params[1];
@@ -145,8 +184,10 @@ static int cuda_training_dispatch_moe_linear(
     }
     if (groups_x != expected_groups) return -1;
 
-    if (!cuda_training_moe_stage(10, hosts, bytes, is_weight, views,
-                                 devices)) return -1;
+    if (!cuda_training_moe_stage(10, hosts, bytes, is_weight, views, devices) ||
+        !cuda_training_moe_stage(11, hosts, bytes, is_weight, views, devices) ||
+        !cuda_training_moe_stage(12, hosts, bytes, is_weight, views, devices))
+        return -1;
     if (command == CUDA_TRAINING_COMMAND_MOE_LINEAR_INPUT_BACKWARD) {
         int required[] = {1, 3, 4, 5, 6};
         for (int index = 0; index < 5; ++index)
@@ -172,7 +213,7 @@ static int cuda_training_dispatch_moe_linear(
                 2, hosts, bytes, is_weight, views, devices)) return -1;
     }
 
-    for (int binding = 0; binding < 11; ++binding)
+    for (int binding = 0; binding < 13; ++binding)
         args[binding] = &devices[binding];
     if (!cuda_launch(function, groups_x, 1u, 1u,
                      CUDA_TRAINING_WORKGROUP_SIZE, 1u, 1u, 0u, args))
@@ -319,18 +360,19 @@ static int cuda_training_dispatch_moe(
         const size_t* bytes, const unsigned char* access,
         const unsigned char* is_weight, uint32_t groups_x,
         uint32_t groups_y, uint32_t groups_z) {
-    CudaTensorView views[11];
-    CUdeviceptr devices[11];
-    void* args[11];
+    CudaTensorView views[13];
+    CUdeviceptr devices[13];
+    void* args[13];
+    const int binding_count = cuda_training_moe_linear_command(command) ? 13 : 11;
 
     if (!hosts || !bytes || !access || !is_weight ||
-        !cuda_training_moe_supports(command, bytes, 11, groups_x, groups_y,
+        !cuda_training_moe_supports(command, bytes, binding_count, groups_x, groups_y,
                                     groups_z)) return -1;
-    for (int binding = 0; binding < 11; ++binding) {
+    for (int binding = 0; binding < binding_count; ++binding) {
         unsigned char expected = binding >= 6 && binding <= 9
             ? CUDA_TRAINING_READ_WRITE : CUDA_TRAINING_READ;
         if (!hosts[binding] || access[binding] != expected) return -1;
-        if (binding == 10) {
+        if (binding >= 10) {
             if (is_weight[binding] != 0u) return -1;
         } else if (is_weight[binding] > 1u) {
             return -1;

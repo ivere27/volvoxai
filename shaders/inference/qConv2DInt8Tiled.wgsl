@@ -149,15 +149,20 @@ fn typed_byte(word : u32, lane : u32, dtype : u32) -> i32 {
   return i32(value);
 }
 
-fn centered_dot(input_word : u32, weight_word : u32,
-                weight_zero_point : i32) -> i32 {
-  var result = 0;
+fn centered_dot4(input_word : u32,
+                 weight_word0 : u32, weight_word1 : u32,
+                 weight_word2 : u32, weight_word3 : u32,
+                 weight_zero_point : vec4<i32>) -> vec4<i32> {
+  var result = vec4<i32>(0);
   for (var lane = 0u; lane < 4u; lane = lane + 1u) {
     let input_value = typed_byte(input_word, lane, params.input_type) -
       params.input_zero_point;
-    let weight_value = typed_byte(weight_word, lane, params.weight_type) -
-      weight_zero_point;
-    result = result + input_value * weight_value;
+    let weight_value = vec4<i32>(
+      typed_byte(weight_word0, lane, params.weight_type),
+      typed_byte(weight_word1, lane, params.weight_type),
+      typed_byte(weight_word2, lane, params.weight_type),
+      typed_byte(weight_word3, lane, params.weight_type)) - weight_zero_point;
+    result = result + vec4<i32>(input_value) * weight_value;
   }
   return result;
 }
@@ -210,23 +215,19 @@ fn main(@builtin(workgroup_id) group_id : vec3<u32>,
   let output_channel = word_in_spatial * 4u;
   let valid_word = spatial < spatial_count && word_in_spatial < words_per_spatial;
   let reduction_size = params.kernel_height * params.kernel_width * params.input_channels;
-  var accumulator0 = 0;
-  var accumulator1 = 0;
-  var accumulator2 = 0;
-  var accumulator3 = 0;
-  var weight_zero0 = 0;
-  var weight_zero1 = 0;
-  var weight_zero2 = 0;
-  var weight_zero3 = 0;
+  var accumulator = vec4<i32>(0);
+  var weight_zero_point = vec4<i32>(0);
   if (valid_word) {
-    accumulator0 = bias_values[output_channel];
-    accumulator1 = bias_values[output_channel + 1u];
-    accumulator2 = bias_values[output_channel + 2u];
-    accumulator3 = bias_values[output_channel + 3u];
-    weight_zero0 = weight_zero_points[output_channel];
-    weight_zero1 = weight_zero_points[output_channel + 1u];
-    weight_zero2 = weight_zero_points[output_channel + 2u];
-    weight_zero3 = weight_zero_points[output_channel + 3u];
+    accumulator = vec4<i32>(
+      bias_values[output_channel],
+      bias_values[output_channel + 1u],
+      bias_values[output_channel + 2u],
+      bias_values[output_channel + 3u]);
+    weight_zero_point = vec4<i32>(
+      weight_zero_points[output_channel],
+      weight_zero_points[output_channel + 1u],
+      weight_zero_points[output_channel + 2u],
+      weight_zero_points[output_channel + 3u]);
   }
   for (var reduction_base = 0u; reduction_base < reduction_size;
        reduction_base = reduction_base + 32u) {
@@ -244,23 +245,22 @@ fn main(@builtin(workgroup_id) group_id : vec3<u32>,
         let weight_base1 = weight_base0 + reduction_size;
         let weight_base2 = weight_base1 + reduction_size;
         let weight_base3 = weight_base2 + reduction_size;
-        accumulator0 = accumulator0 + centered_dot(input_word,
-          weight_word_padded(weight_base0, count, weight_zero0), weight_zero0);
-        accumulator1 = accumulator1 + centered_dot(input_word,
-          weight_word_padded(weight_base1, count, weight_zero1), weight_zero1);
-        accumulator2 = accumulator2 + centered_dot(input_word,
-          weight_word_padded(weight_base2, count, weight_zero2), weight_zero2);
-        accumulator3 = accumulator3 + centered_dot(input_word,
-          weight_word_padded(weight_base3, count, weight_zero3), weight_zero3);
+        accumulator = accumulator + centered_dot4(
+          input_word,
+          weight_word_padded(weight_base0, count, weight_zero_point.x),
+          weight_word_padded(weight_base1, count, weight_zero_point.y),
+          weight_word_padded(weight_base2, count, weight_zero_point.z),
+          weight_word_padded(weight_base3, count, weight_zero_point.w),
+          weight_zero_point);
       }
     }
     workgroupBarrier();
   }
   if (valid_word) {
-    var packed = requantize(accumulator0, output_channel);
-    packed = packed | (requantize(accumulator1, output_channel + 1u) << 8u);
-    packed = packed | (requantize(accumulator2, output_channel + 2u) << 16u);
-    packed = packed | (requantize(accumulator3, output_channel + 3u) << 24u);
+    var packed = requantize(accumulator.x, output_channel);
+    packed = packed | (requantize(accumulator.y, output_channel + 1u) << 8u);
+    packed = packed | (requantize(accumulator.z, output_channel + 2u) << 16u);
+    packed = packed | (requantize(accumulator.w, output_channel + 3u) << 24u);
     output_words[spatial * words_per_spatial + word_in_spatial] = packed;
   }
 }

@@ -88,8 +88,7 @@ static int provider_name_valid(const char* name) {
     size_t length;
     if (!name || !name[0] || !strcmp(name, "cpu") ||
         !strcmp(name, "vulkan") || !strcmp(name, "opengl") ||
-        !strcmp(name, "metal") || !strcmp(name, "nnapi") ||
-        !strcmp(name, "cuda")) return 0;
+        !strcmp(name, "metal") || !strcmp(name, "cuda")) return 0;
     length = strlen(name);
     if (length >= VX_BACKEND_NAME_CAPACITY || name[0] < 'a' || name[0] > 'z')
         return 0;
@@ -116,10 +115,15 @@ static int provider_shape_domain_valid(
 static int provider_descriptor_valid(const VxBackendProvider* provider) {
     return provider && provider->struct_size == sizeof(*provider) &&
         provider->abi_version == VX_BACKEND_ABI_VERSION &&
+        provider->exact_contract_marker ==
+            VX_BACKEND_PROVIDER_EXACT_CONTRACT_MARKER &&
+        provider->exact_contract_extent == sizeof(*provider) &&
         provider_name_valid(provider->name) && provider->flags == 0 &&
         provider_shape_domain_valid(&provider->shape_domain) &&
         provider->runtime_create && provider->runtime_destroy &&
         provider->compile && provider->compiled_destroy &&
+        (!!provider->compiled_batch_contract ==
+         !!provider->context_execute_batch) &&
         provider->context_create && provider->context_execute &&
         provider->context_destroy;
 }
@@ -162,12 +166,12 @@ VxStatus vx_provider_registry_register(VxProviderRegistry* registry,
     if (provider && provider->struct_size == sizeof(*provider) &&
         provider->abi_version != VX_BACKEND_ABI_VERSION) {
         provider_report(report, VX_STATUS_ABI_UNSUPPORTED, "ABI_UNSUPPORTED",
-                        "backend provider ABI version is unsupported");
+                        "backend provider does not match the current exact ABI");
         return VX_STATUS_ABI_UNSUPPORTED;
     }
     if (!provider_descriptor_valid(provider)) {
         provider_report(report, status, "INVALID_PROVIDER",
-                        "backend provider descriptor is invalid");
+                        "backend provider descriptor does not match the current exact contract");
         return status;
     }
     pthread_mutex_lock(&registry->mutex);

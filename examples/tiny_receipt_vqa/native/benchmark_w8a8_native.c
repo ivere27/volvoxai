@@ -8,7 +8,7 @@
  */
 #define _POSIX_C_SOURCE 200809L
 
-#include "quant_cpu_opt.h"
+#include "quant_cpu_isa.h"
 #include "packed_quant_gemm.h"
 #include "cpu_features.h"
 #include "thread_pool.h"
@@ -657,7 +657,7 @@ static int run_tiny_vqa_quantized_activations(void) {
         {"QGELU decoder row [1,1,1280]", benchmark_qgelu_scalar, qgelu_i8u8,
             1280u, 0.0234375f, 0.01953125f, 2000},
     };
-    puts("TinyReceipt physical quantized activation proxy (exact scalar vs LUT-aware kernel):");
+    puts("TinyReceipt quantized activation proxy (exact scalar vs LUT-aware kernel):");
     for (size_t index = 0; index < sizeof(cases) / sizeof(cases[0]); index++) {
         if (!run_activation_case(&cases[index])) return 0;
     }

@@ -42,9 +42,9 @@ function runtimeEvidenceFixture() {
     compilation: {
       compilationId: 'compilation-1',
       requestedPolicy: {
-        mode: 'require', backend: 'cpu', operatorFallback: 'forbid',
+        mode: 'require', backend: 'cpu-js', operatorFallback: 'forbid',
       },
-      selectedBackend: 'cpu',
+      selectedBackend: 'cpu-js',
       selectedDevice: { type: 'host' },
       definitionId: 'definition-1',
       topologyRevision: 0,
@@ -60,7 +60,7 @@ function runtimeEvidenceFixture() {
     execution: {
       executionId: 'execution-2',
       contextId: 'context-1',
-      backend: 'cpu',
+      backend: 'cpu-js',
       device: { type: 'host' },
       outcome: 'success',
       topologyRevision: 0,
@@ -281,7 +281,7 @@ test('canonical JSON is key-order stable and rejects cyclic arrays', () => {
 test('runtime evidence binds selection, revisions, routing, context, and stable outputs', () => {
   const evidence = runtimeEvidenceFixture();
   assert.equal(validateRuntimeEvidence(evidence), evidence);
-  assert.equal(evidence.compilation.selectedBackend, 'cpu');
+  assert.equal(evidence.compilation.selectedBackend, 'cpu-js');
   assert.equal(evidence.execution.contextId, 'context-1');
   assert.equal(evidence.execution.revisions.weightRevisionId, 'definition-1:weight:3');
   assert.equal(evidence.stableResult.readableAfterContextClose, true);
@@ -305,12 +305,15 @@ test('runtime evidence binds selection, revisions, routing, context, and stable 
   const native = structuredClone(exactNativeRevisions);
   native.compilation.compilationId = 'native-compiled-11';
   native.compilation.definitionId = 'native-graph-7';
+  native.compilation.policy.backend = 'cpu';
+  native.compilation.selectedBackend = 'cpu';
   native.compilation.revisions.weightRevisionId = 'native-weight-9';
   native.compilation.revisions.adapterRevisionId = 'native-adapter-10:1';
   native.compilation.revisions.adapterRevisionIds = ['native-adapter-10:1'];
   native.compilation.route.operator.attestation = 'reported';
   native.execution.executionId = 'native-execution-13';
   native.execution.contextId = 'native-context-12';
+  native.execution.backend = 'cpu';
   native.execution.revisions.weightRevisionId = 'native-weight-9';
   native.execution.revisions.adapterRevisionId = 'native-adapter-10:1';
   native.execution.revisions.adapterRevisionIds = ['native-adapter-10:1'];
@@ -352,7 +355,7 @@ test('runtime evidence binds selection, revisions, routing, context, and stable 
   assert.throws(() => validateRuntimeEvidence(unstable), /must be true/);
 
   const extraField = structuredClone(evidence);
-  extraField.execution.retry = 'cpu';
+  extraField.execution.retry = 'cpu-js';
   assert.throws(() => validateRuntimeEvidence(extraField), /must contain exactly/);
 });
 
@@ -397,7 +400,7 @@ test('native capability wire evidence is strict and embeds the typed CLI failure
   );
 
   const extra = structuredClone(evidence);
-  extra.runtimeFailureEvidence.report.retryBackend = 'cpu';
+  extra.runtimeFailureEvidence.report.retryBackend = 'cpu-js';
   assert.throws(() => validateNativeCapabilityEvidence(extra), /must contain exactly/);
 
   const successExit = structuredClone(evidence);
@@ -441,36 +444,36 @@ test('run manifests reject stale or modified artifacts', (t) => {
   const { options, outputRoot } = fixture(t);
   const fingerprint = createParityFingerprintSync(options);
   const manifest = createRunManifest({
-    command: 'produce cpu',
+    command: 'produce cpu-js',
     fingerprint,
     jobs: [
-      { case: 'toy', tier: 'cpu', expectation: 'required' },
-      { case: 'missing-op', tier: 'cpu', expectation: 'expected-skip' },
+      { case: 'toy', tier: 'cpu-js', expectation: 'required' },
+      { case: 'missing-op', tier: 'cpu-js', expectation: 'expected-skip' },
     ],
-    producer: { kind: 'node', backend: 'cpu' },
+    producer: { kind: 'node', backend: 'cpu-js' },
     runId: 'run-current',
     startedAt: '2026-07-20T00:00:00.000Z',
   });
   const artifactFile = writeRunArtifactSync({
     manifest,
-    file: 'results/toy.cpu.json',
+    file: 'results/toy.cpu-js.json',
     case: 'toy',
-    tier: 'cpu',
+    tier: 'cpu-js',
     payload: { sigs: { y: { n: 1 } } },
     outputRoot,
     createdAt: '2026-07-20T00:00:01.000Z',
   });
   recordRunResult(manifest, {
     case: 'missing-op',
-    tier: 'cpu',
+    tier: 'cpu-js',
     status: 'expected-skip',
     reason: 'declared unsupported operator',
   });
   finalizeRunManifest(manifest, { completedAt: '2026-07-20T00:00:02.000Z' });
   assert.equal(manifest.outcome, 'success');
 
-  writeRunManifestSync('manifests/produce-cpu.json', manifest, { outputRoot });
-  const loaded = readRunManifestSync('manifests/produce-cpu.json', {
+  writeRunManifestSync('manifests/produce-cpu-js.json', manifest, { outputRoot });
+  const loaded = readRunManifestSync('manifests/produce-cpu-js.json', {
     outputRoot,
     requireComplete: true,
     requireFinalized: true,
@@ -478,14 +481,14 @@ test('run manifests reject stale or modified artifacts', (t) => {
     expectedRunId: 'run-current',
   });
   assert.deepEqual(
-    readRunArtifactSync(artifactFile, loaded, { case: 'toy', tier: 'cpu', outputRoot }),
+    readRunArtifactSync(artifactFile, loaded, { case: 'toy', tier: 'cpu-js', outputRoot }),
     { sigs: { y: { n: 1 } } },
   );
 
   writeFileSync(options.fixtureFiles[0], 'fixture-v2');
   const currentFingerprint = createParityFingerprintSync(options);
   assert.throws(
-    () => readRunManifestSync('manifests/produce-cpu.json', {
+    () => readRunManifestSync('manifests/produce-cpu-js.json', {
       outputRoot,
       expectedFingerprint: currentFingerprint,
     }),
@@ -494,13 +497,13 @@ test('run manifests reject stale or modified artifacts', (t) => {
   const staleManifest = structuredClone(loaded);
   staleManifest.fingerprint = currentFingerprint;
   assert.throws(
-    () => readRunArtifactSync(artifactFile, staleManifest, { case: 'toy', tier: 'cpu', outputRoot }),
+    () => readRunArtifactSync(artifactFile, staleManifest, { case: 'toy', tier: 'cpu-js', outputRoot }),
     /current run fingerprint/,
   );
 
   writeFileSync(artifactFile, `${readFileSync(artifactFile, 'utf8')} `);
   assert.throws(
-    () => readRunArtifactSync(artifactFile, loaded, { case: 'toy', tier: 'cpu', outputRoot }),
+    () => readRunArtifactSync(artifactFile, loaded, { case: 'toy', tier: 'cpu-js', outputRoot }),
     /bytes do not match manifest/,
   );
 });
@@ -508,11 +511,11 @@ test('run manifests reject stale or modified artifacts', (t) => {
 test('runtime producer manifests require validated lifecycle evidence before writing', (t) => {
   const { options, outputRoot } = fixture(t);
   const manifest = createRunManifest({
-    command: 'produce cpu',
+    command: 'produce cpu-js',
     fingerprint: createParityFingerprintSync(options),
-    jobs: [{ case: 'toy', tier: 'cpu' }],
+    jobs: [{ case: 'toy', tier: 'cpu-js' }],
     producer: {
-      kind: 'node', backend: 'cpu', strictBackend: true, runtimeEvidenceRequired: true,
+      kind: 'node', backend: 'cpu-js', strictBackend: true, runtimeEvidenceRequired: true,
     },
   });
   const file = 'results/toy.runtime.json';
@@ -520,7 +523,7 @@ test('runtime producer manifests require validated lifecycle evidence before wri
     manifest,
     file,
     case: 'toy',
-    tier: 'cpu',
+    tier: 'cpu-js',
     payload: { sigs: {} },
     outputRoot,
   }), /must include runtime evidence/);
@@ -531,7 +534,7 @@ test('runtime producer manifests require validated lifecycle evidence before wri
     manifest,
     file,
     case: 'toy',
-    tier: 'cpu',
+    tier: 'cpu-js',
     payload: { sigs: {}, runtimeEvidence },
     metadata: { runtimeEvidence },
     outputRoot,
@@ -544,13 +547,13 @@ test('runtime producer manifests require validated lifecycle evidence before wri
 test('runtime evidence can be required for execution tiers but not fixture tiers', (t) => {
   const { options, outputRoot } = fixture(t);
   const manifest = createRunManifest({
-    command: 'decode produce cpu',
+    command: 'decode produce cpu-js',
     fingerprint: createParityFingerprintSync(options),
     jobs: [
       { case: 'toy', tier: 'prompt' },
-      { case: 'toy', tier: 'cpu' },
+      { case: 'toy', tier: 'cpu-js' },
     ],
-    producer: { kind: 'node', runtimeEvidenceTiers: ['cpu'] },
+    producer: { kind: 'node', runtimeEvidenceTiers: ['cpu-js'] },
   });
   writeRunArtifactSync({
     manifest,
@@ -562,9 +565,9 @@ test('runtime evidence can be required for execution tiers but not fixture tiers
   });
   assert.throws(() => writeRunArtifactSync({
     manifest,
-    file: 'results/cpu.json',
+    file: 'results/cpu-js.json',
     case: 'toy',
-    tier: 'cpu',
+    tier: 'cpu-js',
     payload: { tokens: [2] },
     outputRoot,
   }), /must include runtime evidence/);

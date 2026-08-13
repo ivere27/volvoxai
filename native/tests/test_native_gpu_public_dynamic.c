@@ -1,11 +1,15 @@
 #include "volvoxai.h"
+#include "volvoxai_backend.h"
 #include "batch_matmul_f32_plan.h"
 #include "safetensors.h"
+#include "../../examples/native_dynamic_batch_benchmark/evidence_tokens.h"
 
+#include <errno.h>
 #include <inttypes.h>
 #include <math.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #define CHECK(expression) do { \
@@ -27,11 +31,124 @@ extern int vx_public_api_test_fill_engine_i32_tensor(
 extern int vx_public_api_test_conv_cache_state(
     const VxExecutionContext* context, int node_index,
     int* transformed_weight, int* cpu_pack, int* cpu_indirection);
+typedef void (*VxPublicApiCpuExecuteHook)(void* user_data);
+extern void vx_public_api_test_set_cpu_execute_hook(
+    VxPublicApiCpuExecuteHook hook, void* user_data);
+extern int vx_public_api_test_runtime_coordinator_stats(
+    const VxRuntime* runtime, size_t* active_requests,
+    size_t* active_input_bytes, uint64_t* dispatches);
+extern int vx_public_api_test_compiled_batch_contract(
+    const VxCompiledModel* compiled, uint32_t* min_batch,
+    uint32_t* max_batch, uint32_t* multiple_of, int32_t* batch_axis,
+    int32_t* device_resident, uint64_t* device_epoch,
+    const char** graph_fingerprint, const char** proof_identity);
 
 typedef struct {
     const char* name;
     int enabled;
 } NativeGpuCase;
+
+static void count_physical_forward(void* user_data) {
+    int* count = (int*)user_data;
+    (*count)++;
+}
+
+static int report_token(const char* evidence, const char* key,
+                        char* value, size_t value_capacity) {
+    size_t key_length;
+    const char* cursor;
+    int found = 0;
+    if (!evidence || !key || !key[0] || !value || value_capacity < 2u)
+        return 0;
+    key_length = strlen(key);
+    cursor = evidence;
+    while (*cursor) {
+        const char* end = strchr(cursor, ';');
+        size_t length = end ? (size_t)(end - cursor) : strlen(cursor);
+        if (length > key_length + 1u &&
+            !memcmp(cursor, key, key_length) && cursor[key_length] == '=') {
+            size_t value_length = length - key_length - 1u;
+            if (found || value_length >= value_capacity) return 0;
+            memcpy(value, cursor + key_length + 1u, value_length);
+            value[value_length] = '\0';
+            found = 1;
+        }
+        if (!end) break;
+        cursor = end + 1u;
+    }
+    return found;
+}
+
+static int report_u64_token(const VxReport* report, const char* key,
+                            uint64_t* value) {
+    char text[64];
+    char* end = NULL;
+    unsigned long long parsed;
+    if (!report || !value ||
+        !report_token(report->route_evidence, key, text, sizeof(text)))
+        return 0;
+    errno = 0;
+    parsed = strtoull(text, &end, 10);
+    if (errno || !end || *end) return 0;
+    *value = (uint64_t)parsed;
+    return 1;
+}
+
+static int report_string_token(const VxReport* report, const char* key,
+                               const char* expected) {
+    char value[192];
+    return report && expected &&
+        report_token(report->route_evidence, key, value, sizeof(value)) &&
+        !strcmp(value, expected);
+}
+
+static int report_vulkan_execution_evidence(const VxReport* report) {
+    uint64_t arena = 0u;
+    uint64_t staging = 0u;
+    uint64_t coherent = 0u;
+    uint64_t uploads = 0u;
+    uint64_t downloads = 0u;
+    return report &&
+        report_string_token(report, "vk_mem", "device-local") &&
+        report_u64_token(report, "vk_arena", &arena) && arena > 0u &&
+        report_u64_token(report, "vk_stage", &staging) &&
+        staging >= UINT64_C(32) * 1024u * 1024u &&
+        report_u64_token(report, "vk_stage_coherent", &coherent) &&
+        coherent <= 1u &&
+        report_u64_token(report, "vk_up", &uploads) && uploads > 0u &&
+        report_u64_token(report, "vk_down", &downloads) && downloads > 0u;
+}
+
+static int test_vulkan_duplicate_execution_evidence_rejected(void) {
+    const char* duplicate =
+        "vk_mem=device-local;vk_arena=1073741824;vk_stage=33554432;"
+        "vk_stage_coherent=1;vk_up=;vk_down=1;vk_up=2";
+    char value[64];
+    CHECK(vx_native_batch_evidence_key_count(duplicate, "vk_up") == 2u);
+    CHECK(!vx_native_batch_evidence_token(
+        duplicate, "vk_up", value, sizeof(value)));
+    return 0;
+}
+
+static int report_builtin_route_exact(const VxReport* report,
+                                      const char* backend,
+                                      uint64_t expected_nodes) {
+    char provider[64];
+    uint64_t nodes = 0u;
+    uint64_t selected = 0u;
+    uint64_t fallback = UINT64_MAX;
+    uint64_t missing = UINT64_MAX;
+    if (!report || !backend ||
+        snprintf(provider, sizeof(provider), "builtin:%s", backend) <= 0)
+        return 0;
+    return report_string_token(report, "provider", provider) &&
+        report_u64_token(report, "nodes", &nodes) &&
+        nodes == expected_nodes &&
+        report_u64_token(report, "selected", &selected) &&
+        selected == expected_nodes &&
+        report_u64_token(report, "fallback", &fallback) && fallback == 0u &&
+        report_u64_token(report, "missing", &missing) && missing == 0u;
+}
 
 static int test_batch_matmul_plan_validation(void) {
     const int a_shape[3] = {2, 2, 3};
@@ -127,6 +244,11 @@ static int execute_shape(VxExecutionContext* context,
           strstr(report.fallback_evidence, "operator=none") &&
           strstr(report.route_evidence,
                  expect_cache_hit ? "shape_plan=hit" : "shape_plan=cold"));
+    if (!strcmp(backend, "vulkan")) {
+        CHECK(!strncmp(report.route_evidence, "vk_mem=device-local;",
+                       strlen("vk_mem=device-local;")) &&
+              report_vulkan_execution_evidence(&report));
+    }
     CHECK(vx_result_output_info(result, 0u, &info, &report) == VX_STATUS_OK);
     CHECK(!strcmp(info.name, "y") && info.dtype == VX_DTYPE_F32 &&
           info.rank == 1u && info.shape[0] == count &&
@@ -174,7 +296,11 @@ static int run_backend(VxRuntime* runtime,
           strstr(report.route_evidence, "dynamic=1") &&
           strstr(report.route_evidence, "native_gpu_domain_spans=") &&
           strstr(report.route_evidence,
-                 "native_gpu_storage_alignment="));
+                 "native_gpu_storage_alignment=") &&
+          strstr(report.route_evidence, "cuda_graph_") == NULL);
+    if (!strcmp(backend, "vulkan"))
+        CHECK(strstr(report.route_evidence,
+                     "native_gpu_fixed_alloc=") != NULL);
     CHECK(vx_compiled_model_create_context(
               compiled, &options, &context, &report) == VX_STATUS_OK);
     CHECK(vx_public_api_test_dynamic_shape_state(
@@ -191,6 +317,298 @@ static int run_backend(VxRuntime* runtime,
           generation == 3 && high_water == capacity && grow_count == 1);
     CHECK(vx_execution_context_close(context, &report) == VX_STATUS_OK);
     vx_execution_context_release(context);
+    vx_compiled_model_release(compiled);
+    vx_model_release(model);
+    return 0;
+}
+
+static int run_scheduled_batch_backend(VxRuntime* runtime,
+                                       const char* graph_path,
+                                       const char* backend) {
+    const float first_value = 3.0f;
+    const float second_value = 8.0f;
+    VxTensorBinding first_binding = {
+        sizeof(VxTensorBinding), "x", VX_DTYPE_F32, 1u, {1},
+        &first_value, sizeof(first_value), VX_MEMORY_HOST,
+    };
+    VxTensorBinding second_binding = {
+        sizeof(VxTensorBinding), "x", VX_DTYPE_F32, 1u, {1},
+        &second_value, sizeof(second_value), VX_MEMORY_HOST,
+    };
+    VxRuntimeSubmitOptions submit = VX_RUNTIME_SUBMIT_OPTIONS_INIT;
+    VxReport report = VX_REPORT_INIT;
+    VxModel* model = NULL;
+    VxCompiledModel* compiled = NULL;
+    VxRequest* first = NULL;
+    VxRequest* second = NULL;
+    VxResult* first_result = NULL;
+    VxResult* second_result = NULL;
+    VxReport first_lane_report = VX_REPORT_INIT;
+    VxReport second_lane_report = VX_REPORT_INIT;
+    uint32_t min_batch = 0;
+    uint32_t max_batch = 0;
+    uint32_t multiple = 0;
+    int32_t batch_axis = -1;
+    int32_t device_resident = 0;
+    uint64_t device_epoch = 0;
+    uint64_t dispatches_before = 0;
+    uint64_t dispatches_after = 0;
+    uint64_t first_physical_execution = 0;
+    uint64_t second_physical_execution = 0;
+    uint64_t token = 0;
+    const char* graph_fingerprint = NULL;
+    const char* proof_identity = NULL;
+    float first_output = 0.0f;
+    float second_output = 0.0f;
+    int physical_forwards = 0;
+    VxStatus status = compile_backend(
+        runtime, graph_path, NULL, backend, &model, &compiled, &report);
+    if (status == VX_STATUS_BACKEND_UNAVAILABLE) {
+        vx_compiled_model_release(compiled);
+        vx_model_release(model);
+        return 77;
+    }
+    CHECK(status == VX_STATUS_OK && compiled &&
+          vx_public_api_test_compiled_batch_contract(
+              compiled, &min_batch, &max_batch, &multiple, &batch_axis,
+              &device_resident, &device_epoch, &graph_fingerprint,
+              &proof_identity) == 1 &&
+          min_batch == 1u && max_batch == 4u && multiple == 1u &&
+          batch_axis == 0 && device_resident == 1 && device_epoch == 1u &&
+          graph_fingerprint && graph_fingerprint[0] && proof_identity &&
+          strstr(proof_identity,
+                 VX_BACKEND_INDEPENDENT_BATCH_PROOF_PROTOCOL));
+    CHECK(vx_compiled_model_report(compiled, &report) == VX_STATUS_OK &&
+          report_string_token(&report, "batchProtocol",
+                              VX_BACKEND_BATCH_PROTOCOL) &&
+          report_string_token(&report, "batchProof", proof_identity) &&
+          report_u64_token(&report, "batchAxis", &token) && token == 0u &&
+          report_u64_token(&report, "batchMin", &token) && token == 1u &&
+          report_u64_token(&report, "batchMax", &token) && token == 4u &&
+          report_u64_token(&report, "batchMultiple", &token) && token == 1u);
+    CHECK(vx_public_api_test_runtime_coordinator_stats(
+              runtime, NULL, NULL, &dispatches_before) >= 0);
+    vx_public_api_test_set_cpu_execute_hook(
+        count_physical_forward, &physical_forwards);
+    CHECK(vx_runtime_submit(runtime, compiled, &first_binding, 1u, &submit,
+                            &first, &report) == VX_STATUS_OK);
+    CHECK(vx_runtime_submit(runtime, compiled, &second_binding, 1u, &submit,
+                            &second, &report) == VX_STATUS_OK);
+    CHECK(vx_request_wait(first, VX_REQUEST_WAIT_INFINITE, &report) ==
+          VX_STATUS_OK);
+    CHECK(vx_request_wait(second, VX_REQUEST_WAIT_INFINITE, &report) ==
+          VX_STATUS_OK);
+    vx_public_api_test_set_cpu_execute_hook(NULL, NULL);
+    CHECK(vx_request_result(first, &first_result, &first_lane_report) ==
+              VX_STATUS_OK && first_result &&
+          !strncmp(first_lane_report.route_evidence,
+                   "trueBackendInvocations=1;batchSize=2;"
+                   "physicalExecutionId=",
+                   strlen("trueBackendInvocations=1;batchSize=2;"
+                          "physicalExecutionId=")) &&
+          strstr(first_lane_report.message, "trueBackendInvocations=1") &&
+          report_u64_token(&first_lane_report, "trueBackendInvocations",
+                           &token) && token == 1u &&
+          report_u64_token(&first_lane_report, "batchSize", &token) &&
+          token == 2u &&
+          report_u64_token(&first_lane_report, "physicalExecutionId",
+                           &first_physical_execution) &&
+          first_physical_execution != 0u &&
+          report_string_token(&first_lane_report, "batchProtocol",
+                              VX_BACKEND_BATCH_PROTOCOL) &&
+          report_string_token(&first_lane_report, "batchProof",
+                              proof_identity) &&
+          report_builtin_route_exact(&first_lane_report, backend, 1u));
+    CHECK(vx_request_result(second, &second_result, &second_lane_report) ==
+              VX_STATUS_OK && second_result &&
+          strstr(second_lane_report.message, "trueBackendInvocations=1") &&
+          report_u64_token(&second_lane_report, "trueBackendInvocations",
+                           &token) && token == 1u &&
+          report_u64_token(&second_lane_report, "batchSize", &token) &&
+          token == 2u &&
+          report_u64_token(&second_lane_report, "physicalExecutionId",
+                           &second_physical_execution) &&
+          second_physical_execution == first_physical_execution &&
+          report_string_token(&second_lane_report, "batchProtocol",
+                              VX_BACKEND_BATCH_PROTOCOL) &&
+          report_string_token(&second_lane_report, "batchProof",
+                              proof_identity) &&
+          report_builtin_route_exact(&second_lane_report, backend, 1u));
+    if (!strcmp(backend, "vulkan")) {
+        const char* first_memory = strstr(
+            first_lane_report.route_evidence, ";vk_mem=device-local;");
+        const char* first_contract = strstr(
+            first_lane_report.route_evidence, ";batchProtocol=");
+        const char* first_provider = strstr(
+            first_lane_report.route_evidence, ";provider=builtin:vulkan;");
+        const char* second_memory = strstr(
+            second_lane_report.route_evidence, ";vk_mem=device-local;");
+        const char* second_contract = strstr(
+            second_lane_report.route_evidence, ";batchProtocol=");
+        const char* second_provider = strstr(
+            second_lane_report.route_evidence, ";provider=builtin:vulkan;");
+        if (!report_vulkan_execution_evidence(&first_lane_report) ||
+            !report_vulkan_execution_evidence(&second_lane_report) ||
+            !first_memory || !first_contract || !first_provider ||
+            !second_memory || !second_contract || !second_provider)
+            fprintf(stderr, "vulkan scheduled evidence: first=%s\nsecond=%s\n",
+                    first_lane_report.route_evidence,
+                    second_lane_report.route_evidence);
+        CHECK(report_vulkan_execution_evidence(&first_lane_report) &&
+              report_vulkan_execution_evidence(&second_lane_report) &&
+              first_memory && first_contract && first_provider &&
+              first_memory < first_contract && first_contract < first_provider &&
+              second_memory && second_contract && second_provider &&
+              second_memory < second_contract &&
+              second_contract < second_provider);
+    }
+    CHECK(vx_result_read(first_result, "y", &first_output,
+                         sizeof(first_output), NULL, &report) == VX_STATUS_OK);
+    CHECK(vx_result_read(second_result, "y", &second_output,
+                         sizeof(second_output), NULL, &report) == VX_STATUS_OK);
+    CHECK(fabsf(first_output - first_value /
+                    (1.0f + expf(-first_value))) <= 2.0e-5f);
+    CHECK(fabsf(second_output - second_value /
+                    (1.0f + expf(-second_value))) <= 2.0e-5f);
+    CHECK(physical_forwards == 1);
+    CHECK(vx_public_api_test_runtime_coordinator_stats(
+              runtime, NULL, NULL, &dispatches_after) == 1 &&
+          dispatches_after == dispatches_before + 1u);
+    vx_result_release(first_result);
+    vx_result_release(second_result);
+    vx_request_release(first);
+    vx_request_release(second);
+    first = NULL;
+    second = NULL;
+    first_result = NULL;
+    second_result = NULL;
+    vx_public_api_test_set_cpu_execute_hook(
+        count_physical_forward, &physical_forwards);
+    CHECK(vx_runtime_submit(runtime, compiled, &first_binding, 1u, &submit,
+                            &first, &report) == VX_STATUS_OK);
+    CHECK(vx_runtime_submit(runtime, compiled, &second_binding, 1u, &submit,
+                            &second, &report) == VX_STATUS_OK);
+    CHECK(vx_request_wait(first, VX_REQUEST_WAIT_INFINITE, &report) ==
+          VX_STATUS_OK);
+    CHECK(vx_request_wait(second, VX_REQUEST_WAIT_INFINITE, &report) ==
+          VX_STATUS_OK);
+    vx_public_api_test_set_cpu_execute_hook(NULL, NULL);
+    CHECK(vx_request_result(first, &first_result, &first_lane_report) ==
+              VX_STATUS_OK && first_result &&
+          report_u64_token(&first_lane_report, "batchSize", &token) &&
+          token == 2u &&
+          report_u64_token(&first_lane_report, "physicalExecutionId",
+                           &second_physical_execution) &&
+          second_physical_execution != 0u &&
+          second_physical_execution != first_physical_execution);
+    CHECK(vx_request_result(second, &second_result, &second_lane_report) ==
+              VX_STATUS_OK && second_result &&
+          report_u64_token(&second_lane_report, "physicalExecutionId",
+                           &token) && token == second_physical_execution);
+    CHECK(physical_forwards == 2);
+    CHECK(vx_public_api_test_runtime_coordinator_stats(
+              runtime, NULL, NULL, &dispatches_after) == 1 &&
+          dispatches_after == dispatches_before + 2u);
+    vx_result_release(first_result);
+    vx_result_release(second_result);
+    vx_request_release(first);
+    vx_request_release(second);
+    vx_compiled_model_release(compiled);
+    vx_model_release(model);
+    return 0;
+}
+
+static int expect_independent_batch_contract_backend(
+        VxRuntime* runtime, const char* graph_path,
+        const char* weight_path, const char* backend) {
+    VxReport report = VX_REPORT_INIT;
+    VxModel* model = NULL;
+    VxCompiledModel* compiled = NULL;
+    uint32_t min_batch = 0;
+    uint32_t max_batch = 0;
+    uint32_t multiple = 0;
+    int32_t batch_axis = -1;
+    const char* graph_fingerprint = NULL;
+    const char* proof_identity = NULL;
+    VxStatus status = compile_backend(
+        runtime, graph_path, weight_path, backend,
+        &model, &compiled, &report);
+    CHECK(status == VX_STATUS_OK && compiled &&
+          vx_public_api_test_compiled_batch_contract(
+              compiled, &min_batch, &max_batch, &multiple, &batch_axis,
+              NULL, NULL, &graph_fingerprint, &proof_identity) == 1 &&
+          min_batch == 1u && max_batch == 4u && multiple == 1u &&
+          batch_axis == 0 && graph_fingerprint && proof_identity &&
+          strstr(proof_identity,
+                 VX_BACKEND_INDEPENDENT_BATCH_PROOF_PROTOCOL));
+    vx_compiled_model_release(compiled);
+    vx_model_release(model);
+    return 0;
+}
+
+static int run_unproved_batch_fail_closed_backend(
+        VxRuntime* runtime, const char* graph_path, const char* backend) {
+    const float first_values[2] = {1.0f, 2.0f};
+    const float second_values[2] = {10.0f, 20.0f};
+    VxTensorBinding first_binding = {
+        sizeof(VxTensorBinding), "x", VX_DTYPE_F32, 2u, {1, 2},
+        first_values, sizeof(first_values), VX_MEMORY_HOST,
+    };
+    VxTensorBinding second_binding = {
+        sizeof(VxTensorBinding), "x", VX_DTYPE_F32, 2u, {1, 2},
+        second_values, sizeof(second_values), VX_MEMORY_HOST,
+    };
+    VxRuntimeSubmitOptions submit = VX_RUNTIME_SUBMIT_OPTIONS_INIT;
+    VxReport report = VX_REPORT_INIT;
+    VxModel* model = NULL;
+    VxCompiledModel* compiled = NULL;
+    VxRequest* first = NULL;
+    VxRequest* second = NULL;
+    VxResult* first_result = NULL;
+    VxResult* second_result = NULL;
+    uint32_t max_batch = 0;
+    uint64_t dispatches_before = 0;
+    uint64_t dispatches_after = 0;
+    float first_output[2] = {0};
+    float second_output[2] = {0};
+    int physical_forwards = 0;
+    VxStatus status = compile_backend(
+        runtime, graph_path, NULL, backend, &model, &compiled, &report);
+    CHECK(status == VX_STATUS_OK && compiled &&
+          vx_public_api_test_compiled_batch_contract(
+              compiled, NULL, &max_batch, NULL, NULL, NULL, NULL,
+              NULL, NULL) == 0 && max_batch == 1u);
+    CHECK(vx_public_api_test_runtime_coordinator_stats(
+              runtime, NULL, NULL, &dispatches_before) >= 0);
+    vx_public_api_test_set_cpu_execute_hook(
+        count_physical_forward, &physical_forwards);
+    CHECK(vx_runtime_submit(runtime, compiled, &first_binding, 1u, &submit,
+                            &first, &report) == VX_STATUS_OK);
+    CHECK(vx_runtime_submit(runtime, compiled, &second_binding, 1u, &submit,
+                            &second, &report) == VX_STATUS_OK);
+    CHECK(vx_request_wait(first, VX_REQUEST_WAIT_INFINITE, &report) ==
+          VX_STATUS_OK);
+    CHECK(vx_request_wait(second, VX_REQUEST_WAIT_INFINITE, &report) ==
+          VX_STATUS_OK);
+    vx_public_api_test_set_cpu_execute_hook(NULL, NULL);
+    CHECK(vx_request_result(first, &first_result, &report) == VX_STATUS_OK &&
+          first_result);
+    CHECK(vx_request_result(second, &second_result, &report) == VX_STATUS_OK &&
+          second_result);
+    CHECK(vx_result_read(first_result, "y", first_output,
+                         sizeof(first_output), NULL, &report) == VX_STATUS_OK);
+    CHECK(vx_result_read(second_result, "y", second_output,
+                         sizeof(second_output), NULL, &report) == VX_STATUS_OK);
+    CHECK(!memcmp(first_output, first_values, sizeof(first_output)) &&
+          !memcmp(second_output, second_values, sizeof(second_output)) &&
+          physical_forwards == 2);
+    CHECK(vx_public_api_test_runtime_coordinator_stats(
+              runtime, NULL, NULL, &dispatches_after) == 1 &&
+          dispatches_after == dispatches_before + 2u);
+    vx_result_release(first_result);
+    vx_result_release(second_result);
+    vx_request_release(first);
+    vx_request_release(second);
     vx_compiled_model_release(compiled);
     vx_model_release(model);
     return 0;
@@ -1147,15 +1565,88 @@ static int run_immutable_widened_conv_backend(
     return 0;
 }
 
+static int execute_sigmoid_shape(VxExecutionContext* context,
+                                 const char* backend,
+                                 const float* values,
+                                 int64_t count) {
+    float output[4] = {0};
+    VxTensorBinding inputs[1] = {
+        {sizeof(VxTensorBinding), "x", VX_DTYPE_F32, 1u, {count},
+         values, (size_t)count * sizeof(float), VX_MEMORY_HOST},
+    };
+    VxReport report = VX_REPORT_INIT;
+    VxResult* result = NULL;
+    VxStatus status = vx_execution_context_execute(
+        context, inputs, 1u, &result, &report);
+    if (status != VX_STATUS_OK)
+        fprintf(stderr, "%s sigmoid execute shape=%" PRId64
+                " failed: status=%s reason=%s message=%s route=%s\n",
+                backend, count, vx_status_string(status), report.reason,
+                report.message, report.route_evidence);
+    CHECK(status == VX_STATUS_OK);
+    CHECK(result && !strcmp(report.backend, backend) &&
+          report.route_attested && !report.operator_fallback_used &&
+          strstr(report.fallback_evidence, "operator=none"));
+    CHECK(vx_result_read(result, "y", output, sizeof(output), NULL,
+                         &report) == VX_STATUS_OK);
+    for (int64_t index = 0; index < count; index++) {
+        float expected = 1.0f / (1.0f + expf(-values[index]));
+        CHECK(output[index] > 0.0f && output[index] < 1.0f);
+        CHECK(fabsf(output[index] - expected) <= 1.0e-4f);
+    }
+    vx_result_release(result);
+    return 0;
+}
+
+/* Sigmoid carries the same canonical activation-preserve shape contract as
+ * SiLU and has a device kernel on every native GPU backend, but it was left
+ * out of the bounded-domain proof and the exporter-qualified operator set, so
+ * every graph containing one was refused outright on these backends. */
+static int run_sigmoid_backend(VxRuntime* runtime,
+                               const char* graph_path,
+                               const char* backend) {
+    const float values[4] = {-2.0f, 0.0f, 2.0f, 4.0f};
+    VxContextOptions options = VX_CONTEXT_OPTIONS_INIT;
+    VxReport report = VX_REPORT_INIT;
+    VxModel* model = NULL;
+    VxCompiledModel* compiled = NULL;
+    VxExecutionContext* context = NULL;
+    VxStatus status = compile_backend(
+        runtime, graph_path, NULL, backend, &model, &compiled, &report);
+    if (status != VX_STATUS_OK) {
+        fprintf(stderr, "%s sigmoid compile failed: status=%s reason=%s "
+                "message=%s route=%s\n", backend, vx_status_string(status),
+                report.reason, report.message, report.route_evidence);
+        vx_compiled_model_release(compiled);
+        vx_model_release(model);
+        return 1;
+    }
+    CHECK(vx_compiled_model_create_context(
+              compiled, &options, &context, &report) == VX_STATUS_OK);
+    CHECK(execute_sigmoid_shape(context, backend, values, 4) == 0);
+    CHECK(execute_sigmoid_shape(context, backend, values, 1) == 0);
+    CHECK(vx_execution_context_close(context, &report) == VX_STATUS_OK);
+    vx_execution_context_release(context);
+    vx_compiled_model_release(compiled);
+    vx_model_release(model);
+    return 0;
+}
+
 int main(void) {
     static const char* const graph_path =
         "/tmp/volvox-native-gpu-public-dynamic.graph.json";
+    static const char* const sigmoid_graph_path =
+        "/tmp/volvox-native-gpu-public-dynamic-sigmoid.graph.json";
     static const char* const odd_graph_path =
         "/tmp/volvox-native-gpu-public-dynamic-odd.graph.json";
     static const char* const odd_weight_path =
         "/tmp/volvox-native-gpu-public-dynamic-odd.safetensors";
     static const char* const typed_batch_graph_path =
         "/tmp/volvox-native-gpu-public-dynamic-typed-batch.graph.json";
+    static const char* const independent_shape_graph_path =
+        "/tmp/volvox-native-gpu-independent-shape.graph.json";
+    static const char* const mixed_batch_graph_path =
+        "/tmp/volvox-native-gpu-mixed-batch.graph.json";
     static const char* const linear_graph_path =
         "/tmp/volvox-native-gpu-public-dynamic-linear.graph.json";
     static const char* const linear_weight_path =
@@ -1196,6 +1687,16 @@ int main(void) {
         "\"outputs\":{\"out\":{\"tensor\":\"y\","
         "\"dtype\":\"float32\",\"shape\":[\"Q\"]}},"
         "\"params\":{}}],\"outputs\":[\"y\"]}";
+    static const char* const sigmoid_graph =
+        "{\"format\":\"volvox-graph/v1\","
+        "\"dimensions\":{\"Q\":{\"min\":1,\"max\":4}},"
+        "\"inputs\":{"
+        "\"x\":{\"shape\":[\"Q\"],\"dtype\":\"float32\"}},"
+        "\"nodes\":[{\"id\":\"sigmoid\",\"opType\":\"Sigmoid\","
+        "\"inputs\":{\"input\":\"x\"},"
+        "\"outputs\":{\"out\":{\"tensor\":\"y\","
+        "\"dtype\":\"float32\",\"shape\":[\"Q\"]}},"
+        "\"params\":{}}],\"outputs\":[\"y\"]}";
     static const char* const odd_graph =
         "{\"format\":\"volvox-graph/v1\","
         "\"dimensions\":{\"Q\":{\"min\":1,\"max\":5}},"
@@ -1231,6 +1732,58 @@ int main(void) {
         "\"outputs\":{\"out\":{\"tensor\":\"product\","
         "\"dtype\":\"float32\",\"shape\":[1,2,1,2]}},"
         "\"params\":{}}],\"outputs\":[\"expanded\",\"product\"]}";
+    static const char* const independent_shape_graph =
+        "{\"format\":\"volvox-graph/v1\","
+        "\"dimensions\":{\"B\":{\"min\":1,\"max\":4}},"
+        "\"inputs\":{\"x\":{\"shape\":[\"B\",2,3],"
+        "\"dtype\":\"float32\"}},\"nodes\":["
+        "{\"id\":\"move\",\"opType\":\"Transpose\","
+        "\"inputs\":{\"input\":\"x\"},\"outputs\":{\"out\":{"
+        "\"tensor\":\"a\",\"dtype\":\"float32\","
+        "\"shape\":[2,\"B\",3]}},\"params\":{\"perm\":[1,0,2]}},"
+        "{\"id\":\"reshape\",\"opType\":\"Reshape\","
+        "\"inputs\":{\"input\":\"a\"},\"outputs\":{\"out\":{"
+        "\"tensor\":\"b\",\"dtype\":\"float32\","
+        "\"shape\":[2,\"B\",1,3]}},"
+        "\"params\":{\"shape\":[2,\"B\",1,3]}},"
+        "{\"id\":\"squeeze\",\"opType\":\"Squeeze\","
+        "\"inputs\":{\"input\":\"b\"},\"outputs\":{\"out\":{"
+        "\"tensor\":\"c\",\"dtype\":\"float32\","
+        "\"shape\":[2,\"B\",3]}},\"params\":{\"axes\":[2]}},"
+        "{\"id\":\"restore\",\"opType\":\"Transpose\","
+        "\"inputs\":{\"input\":\"c\"},\"outputs\":{\"out\":{"
+        "\"tensor\":\"d\",\"dtype\":\"float32\","
+        "\"shape\":[\"B\",2,3]}},\"params\":{\"perm\":[1,0,2]}},"
+        "{\"id\":\"softmax\",\"opType\":\"Softmax\","
+        "\"inputs\":{\"input\":\"d\"},\"outputs\":{\"out\":{"
+        "\"tensor\":\"e\",\"dtype\":\"float32\","
+        "\"shape\":[\"B\",2,3]}},\"params\":{\"axis\":2}},"
+        "{\"id\":\"reduce\",\"opType\":\"ReduceSum\","
+        "\"inputs\":{\"input\":\"e\"},\"outputs\":{\"out\":{"
+        "\"tensor\":\"y\",\"dtype\":\"float32\","
+        "\"shape\":[\"B\",2,1]}},"
+        "\"params\":{\"axis\":2,\"keepdims\":true}}],"
+        "\"outputs\":[\"y\"]}";
+    static const char* const mixed_batch_graph =
+        "{\"format\":\"volvox-graph/v1\","
+        "\"dimensions\":{\"B\":{\"min\":1,\"max\":4}},"
+        "\"inputs\":{\"x\":{\"shape\":[\"B\",2],"
+        "\"dtype\":\"float32\"}},\"nodes\":["
+        "{\"id\":\"mix-lanes\",\"opType\":\"Reshape\","
+        "\"inputs\":{\"input\":\"x\"},\"outputs\":{\"out\":{"
+        "\"tensor\":\"mixed\",\"dtype\":\"float32\","
+        "\"shape\":[2,\"B\"]}},\"params\":{\"shape\":[2,\"B\"]}},"
+        "{\"id\":\"cross-lane-sum\",\"opType\":\"ReduceSum\","
+        "\"inputs\":{\"input\":\"mixed\"},\"outputs\":{\"out\":{"
+        "\"tensor\":\"summed\",\"dtype\":\"float32\","
+        "\"shape\":[2]}},\"params\":{\"axis\":1,"
+        "\"keepdims\":false}},"
+        "{\"id\":\"restore-public-shape\",\"opType\":\"Expand\","
+        "\"inputs\":{\"input\":\"summed\"},\"outputs\":{\"out\":{"
+        "\"tensor\":\"y\",\"dtype\":\"float32\","
+        "\"shape\":[\"B\",2]}},"
+        "\"params\":{\"shape\":[\"B\",2]}}],"
+        "\"outputs\":[\"y\"]}";
     static const char* const linear_graph =
         "{\"format\":\"volvox-graph/v1\","
         "\"dimensions\":{\"Q\":{\"min\":1,\"max\":4}},"
@@ -1396,10 +1949,15 @@ int main(void) {
     VxReport report = VX_REPORT_INIT;
     VxRuntime* runtime = NULL;
     int ran = 0;
+    CHECK(test_vulkan_duplicate_execution_evidence_rejected() == 0);
     CHECK(test_batch_matmul_plan_validation() == 0);
     CHECK(write_text(graph_path, graph) == 0);
+    CHECK(write_text(sigmoid_graph_path, sigmoid_graph) == 0);
     CHECK(write_text(odd_graph_path, odd_graph) == 0);
     CHECK(write_text(typed_batch_graph_path, typed_batch_graph) == 0);
+    CHECK(write_text(independent_shape_graph_path,
+                     independent_shape_graph) == 0);
+    CHECK(write_text(mixed_batch_graph_path, mixed_batch_graph) == 0);
     CHECK(write_text(linear_graph_path, linear_graph) == 0);
     CHECK(write_text(f16_weight_graph_path, f16_weight_graph) == 0);
     CHECK(write_text(f16_bias_graph_path, f16_bias_graph) == 0);
@@ -1422,6 +1980,7 @@ int main(void) {
     CHECK(write_linear_f16_rejection_weights(f16_linear_weight_path) == 0);
     CHECK(write_embedding_weights(embedding_weight_path) == 0);
     CHECK(write_conv_f16_weights(conv_f16_weight_path) == 0);
+    options.max_batch_delay_milliseconds = 50u;
     CHECK(vx_runtime_create(&options, &runtime, &report) == VX_STATUS_OK);
     for (size_t index = 0; index < sizeof(cases) / sizeof(cases[0]); index++) {
         int result;
@@ -1433,6 +1992,19 @@ int main(void) {
             continue;
         }
         CHECK(result == 0);
+        if (strcmp(cases[index].name, "metal"))
+            CHECK(run_scheduled_batch_backend(
+                      runtime, graph_path, cases[index].name) == 0);
+        if (strcmp(cases[index].name, "metal")) {
+            CHECK(expect_independent_batch_contract_backend(
+                      runtime, independent_shape_graph_path, NULL,
+                      cases[index].name) == 0);
+            CHECK(run_unproved_batch_fail_closed_backend(
+                      runtime, mixed_batch_graph_path,
+                      cases[index].name) == 0);
+        }
+        CHECK(run_sigmoid_backend(
+                  runtime, sigmoid_graph_path, cases[index].name) == 0);
         CHECK(run_odd_byte_backend(
                   runtime, odd_graph_path, odd_weight_path,
                   cases[index].name) == 0);
@@ -1479,6 +2051,8 @@ int main(void) {
     CHECK(remove(odd_graph_path) == 0);
     CHECK(remove(odd_weight_path) == 0);
     CHECK(remove(typed_batch_graph_path) == 0);
+    CHECK(remove(independent_shape_graph_path) == 0);
+    CHECK(remove(mixed_batch_graph_path) == 0);
     CHECK(remove(linear_graph_path) == 0);
     CHECK(remove(linear_weight_path) == 0);
     CHECK(remove(f16_weight_graph_path) == 0);

@@ -43,8 +43,8 @@ token's **Key** and blends their **Values** by similarity. "Which earlier words 
 
 **Backbone** — the feature-extractor stage of a vision model (here, EfficientNet-Lite0).
 
-**Backend** — a concrete executor for the graph's ops. Browser backends are the four *tiers*;
-native backends are CPU, Vulkan, OpenGL/GLES, Metal, and NNAPI. VolvoxAI picks one per node.
+**Backend** — a concrete executor for the graph's ops. Browser backends are the three *tiers*;
+native backends are CPU, Vulkan, OpenGL/GLES, Metal, and CUDA. VolvoxAI picks one per node.
 
 **Backpropagation** — computing every weight's gradient by applying the chain rule one op at a time,
 walking the graph in reverse; each forward op has a *backward twin* (Chapter 4).
@@ -82,7 +82,16 @@ backend uses only the NVIDIA **Driver API** plus its own **PTX** kernels — no 
 recording with far less per-launch overhead. VolvoxAI uses it as a conservative inference speed-up that
 never changes the answer (Chapter 9C §9C.7).
 
+**Capacity pool** — a context's reusable activation memory. A tensor slot grows geometrically when a
+binding needs more than it holds, never shrinks during the context's life, and is bounded; results
+are copied out to exact storage so callers never see unused capacity (Chapter 8 §8.6).
+
 **Dequantize** — convert int8 back to float: `r = (q − zero_point) × scale`.
+
+**Dimension symbol** — a *named*, *bounded* axis in `graph.json`, e.g.
+`"S": { "min": 1, "max": 256 }`. Named, so repeating `S` asserts the two extents are the same value;
+bounded, so worst-case sizes are computable. Both properties are required — see **shape domain**
+(Chapters 1, 2, 8).
 
 **dlopen / dlsym** — load a shared library and look up its functions *at runtime* (not link
 time). How VolvoxAI's native binary uses a GPU driver (`libvulkan`, `libGL`) without linking any
@@ -120,7 +129,8 @@ step, to emulate a large batch that wouldn't fit in memory (Chapter 5).
 **Gradient checkpointing** — saving only some forward activations and *recomputing* the rest during
 the backward pass, trading extra compute for much lower memory (Chapter 4).
 
-**Graph** — the model's op list: nodes (ops) connected by named tensors. Stored as `graph.json`.
+**Graph** — the model's op list: nodes (ops) connected by named tensors, plus the `dimensions` table
+declaring its **shape domain**. Stored as `graph.json`.
 
 **Head** — the final task-specific layer(s): the LM head (→ vocabulary logits) or the detector's
 class/box heads.
@@ -153,6 +163,14 @@ low-rank adapter beside each Linear: a fraction of the cost, and a tiny shareabl
 **MBConv** — Mobile inverted BOTTLENECK conv block: expand → depthwise → project, with a residual.
 The backbone's repeating unit.
 
+**Model / CompiledModel / ExecutionContext / ExecutionResult** — the runtime lifecycle, each stage
+owning strictly less-shared state than the last. **Model** is an immutable snapshot: topology, shape
+constraints, fixed weights — it never acquires a "current shape." **CompiledModel** adds one selected
+provider and its proof over the whole shape domain. **ExecutionContext** privately owns the current
+shape binding, plan cache, and capacity pool, so two contexts can run different shapes concurrently.
+**ExecutionResult** owns output storage that outlives context reuse. Native mirrors this exactly as
+`VxRuntime → VxModel → VxCompiledModel → VxExecutionContext → VxResult` (Chapters 8, 9).
+
 **NHWC / NCHW** — tensor dimension order (batch, height, width, channels) vs (batch, channels,
 height, width). VolvoxAI vision models use NHWC.
 
@@ -163,13 +181,20 @@ support; the native dispatcher must wire a backend wrapper for an op to run ther
 **NMS (Non-Max Suppression)** — postprocess that removes overlapping duplicate detections,
 keeping the highest-scoring box per object.
 
-**NNAPI** — Android's Neural Networks API; VolvoxAI's native engine can dispatch to it on Android
-(`native/src/backends/nnapi_engine.c`; built with the Android NDK CMake toolchain).
-
-**Node** — one entry in the graph: an op plus its input/output tensor names and parameters.
+**Node** — one entry in the graph: an op plus its input/output tensor names and parameters. Its `id`
+identifies the *node*; the names under `outputs` identify the *tensors it writes* — two different
+things.
 
 **Op / Operation / Kernel** — a single math routine (Add, Conv2D, SDPA…). "Op" is the graph-level
 name; "kernel" is a specific implementation of it.
+
+**Padding (shape padding)** — the pre-dynamic workaround of inflating every request to a fixed
+maximum shape so a static graph would accept it. Costs real compute and memory on data that is not
+there; binding a **dimension symbol** to the true size removes it (Chapter 2 §2.3).
+
+**Plan cache** — a per-context LRU of resolved shape plans, keyed by exact **shape signature** and
+bounded on both entry count and metadata bytes. A hit skips symbol binding and graph-wide shape
+inference (Chapter 8 §8.6).
 
 **Optimizer** — the rule that turns each weight's gradient into an actual update. VolvoxAI ships
 **SGD** and **AdamW** (Chapter 5).
@@ -198,6 +223,18 @@ information and gradients survive deep stacks. In both models.
 **Scale / Zero-point** — the two numbers of a quantization recipe: tick size, and which integer
 means real 0.
 
+**Shape binding** — assigning one concrete value to each dimension symbol from a request's actual
+inputs (`tokens [1,6]` → `S = 6`). Validated and committed atomically before any backend state is
+touched (Chapter 8 §8.6).
+
+**Shape domain** — the complete set of shapes a graph declares it accepts, given by its `dimensions`
+table. Compilation must prove a working route over the *whole* domain, not one sample shape — that
+is what makes "no silent fallback at run time" possible (Chapter 8 §8.1).
+
+**Shape signature** — the canonical string identifying one concrete input shape set, e.g.
+`v1|9:positions|2:1,6|6:tokens|2:1,6`. It is the correctness key for the **plan cache**; a hash of it
+may be used for lookup but never to establish shape equality.
+
 **SGD (Stochastic Gradient Descent)** — the simplest optimizer: step each weight opposite its
 gradient, `w -= lr·grad` (Chapter 5).
 
@@ -216,8 +253,9 @@ as the identity in the backward pass, so gradients keep flowing (Chapter 7).
 
 **Tensor** — a multi-dimensional array of numbers with a shape; the only data type in the engine.
 
-**Tier** — one of VolvoxAI's browser providers (WebNN / WebGPU / WASM / CPU), selected and fixed by
-`Runtime.compile(snapshot, policy)`.
+**Tier** — one of VolvoxAI's browser providers (`webgpu` / `wasm` / `cpu-js`), selected and fixed by
+`Runtime.compile(snapshot, policy)`. The native engine's CPU backend is a separate thing and is
+still named `cpu`.
 
 **Token** — a chunk of text (word/sub-word/byte) mapped to an integer id.
 
@@ -263,11 +301,11 @@ Read in this order to go from "I get the concepts" to "I can modify the engine":
 4. **The two models' graph documents** — skim `models/tinystories_1m/graph.json` and
    `models/efficientdet_lite0_fp32/graph.json`. Match nodes to Chapters 2–3.
 5. **The attention + conv kernels** — `ts/ops/sDPA.ts`, `ts/ops/conv2D.ts`.
-6. **Quantization** — `ts/ops/dequantizeLinear.ts`, then `native/src/kernels/quant_cpu_opt.c`.
-7. **Optimization** — diff `ts/ops/conv2D.ts` against `native/src/kernels/conv_f32_opt.c` while reading
+6. **Quantization** — `ts/ops/dequantizeLinear.ts`, then `native/src/kernels/quant_cpu_isa.c`.
+7. **Optimization** — diff `ts/ops/conv2D.ts` against `native/src/kernels/conv_f32_isa.c` while reading
    `docs/microkernel_optimization_guide.md` and `docs/xnnpack_optimization_guide.md`.
 8. **The GPU tier** — `shaders/{inference,training}/*.wgsl` and `ts/backends/GraphExecutor.ts`.
-9. **The native engine** (Chapter 9) — `native/include/volvoxai.h` + `native/src/runtime/engine.c`,
+9. **The native engine** (Chapter 9) — `native/include/volvoxai.h` + `native/src/runtime/engine_state.c`,
    `native/src/runtime/engine_runtime.c` (`run_node`), then `native/src/backends/vulkan_engine.c` (see the
    `dlopen` at the top). `native/cli/main.c` is the fixed runner;
    `examples/native_task_cli/main.c` the opt-in task wrappers.
@@ -364,9 +402,9 @@ Listing these keeps the scope honest: a strong inference **and** training/optimi
 not a complete training-and-research curriculum.
 
 > 🔬 **Engine gaps vs. this list.** The table above is *capability-level*. For the concrete,
-> near-term **engine** gaps that are already on the to-do list — missing GPU/WebNN op coverage,
+> near-term **engine** gaps that are already on the to-do list — missing GPU op coverage,
 > INT4 weights, a browser streaming helper, parity/benchmark harnesses — see the live
-> [`docs/roadmap.md`](../roadmap.md).
+> [`TODO.md`](../../TODO.md).
 
 ---
 
@@ -374,7 +412,7 @@ not a complete training-and-research curriculum.
 
 The natural next steps split into two tracks:
 
-- **Deepen this repo's inference path.** Compare `native/src/kernels/conv_f32_opt.c` to Google's **XNNPACK**;
+- **Deepen this repo's inference path.** Compare `native/src/kernels/conv_f32_isa.c` to Google's **XNNPACK**;
   `docs/xnnpack_optimization_guide.md` in this repo is a guided tour. Then inspect
   `shaders/{inference,training}/*.wgsl` and the native GPU backends.
 - **Scale the transformer.** GPT-2/3, LLaMA, Mistral, Qwen are Chapter 2's graph, wider/deeper,

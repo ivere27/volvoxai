@@ -87,14 +87,17 @@ static int normalization_dimensions(const T* in, const T* out,
                                     const T* weight, const T* bias,
                                     int width, long* rows) {
     long row_count;
+    /* Private training tensors may retain optimizer-backed tail capacity. The
+       normalization kernels consume only the first width affine values; the
+       canonical graph validator still requires exact persisted shapes. */
     if (!in || !out || !weight || in->dtype != T_F32 ||
         out->dtype != T_F32 || weight->dtype != T_F32 ||
         in->ndim <= 0 || !tensor_same_shape(in, out) ||
         width <= 0 || in->shape[in->ndim - 1] != width ||
-        weight->ndim != 1 || weight->shape[0] != width ||
-        weight->numel != width ||
+        weight->ndim != 1 || weight->shape[0] < width ||
+        weight->numel < width ||
         (bias && (bias->dtype != T_F32 || bias->ndim != 1 ||
-                  bias->shape[0] != width || bias->numel != width)))
+                  bias->shape[0] < width || bias->numel < width)))
         return -1;
     row_count = in->numel / width;
     if (row_count <= 0 || row_count > INT32_MAX ||

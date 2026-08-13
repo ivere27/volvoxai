@@ -191,15 +191,108 @@ fn qlinear_one(index : u32) -> u32 {
     scaled_bits, params.output_zero_point, minimum, maximum));
 }
 
+// A packed output word normally contains four adjacent channels from one row.
+// Fuse those four dot products so the input byte and row/channel addressing are
+// evaluated once per K element. Each accumulator still advances in canonical K
+// order, and the arbitrary-width fallback preserves words which cross a row.
+fn qlinear_word(first_element : u32) -> u32 {
+  let elements = params.rows * params.d_out;
+  if (first_element >= elements) { return 0u; }
+  let row = first_element / params.d_out;
+  let output_channel = first_element % params.d_out;
+  if (first_element + 3u >= elements ||
+      output_channel + 3u >= params.d_out) {
+    var packed = qlinear_one(first_element);
+    packed = packed | (qlinear_one(first_element + 1u) << 8u);
+    packed = packed | (qlinear_one(first_element + 2u) << 16u);
+    packed = packed | (qlinear_one(first_element + 3u) << 24u);
+    return packed;
+  }
+
+  var accumulator0 = bias_values[output_channel];
+  var accumulator1 = bias_values[output_channel + 1u];
+  var accumulator2 = bias_values[output_channel + 2u];
+  var accumulator3 = bias_values[output_channel + 3u];
+  let input_base = row * params.d_in;
+  let weight_base0 = output_channel * params.d_in;
+  let weight_base1 = weight_base0 + params.d_in;
+  let weight_base2 = weight_base1 + params.d_in;
+  let weight_base3 = weight_base2 + params.d_in;
+  let weight_zero0 = weight_zero_points[output_channel];
+  let weight_zero1 = weight_zero_points[output_channel + 1u];
+  let weight_zero2 = weight_zero_points[output_channel + 2u];
+  let weight_zero3 = weight_zero_points[output_channel + 3u];
+  var input_channel = 0u;
+  // Dense model dimensions are normally four-byte aligned. Consume packed
+  // storage words directly in that case, reducing both input and weight SSBO
+  // transactions fourfold while preserving lane-by-lane accumulation order.
+  if ((params.d_in & 3u) == 0u) {
+    for (; input_channel < params.d_in;
+         input_channel = input_channel + 4u) {
+      let input_word = input_words[(input_base + input_channel) / 4u];
+      let weight_word0 = weight_words[(weight_base0 + input_channel) / 4u];
+      let weight_word1 = weight_words[(weight_base1 + input_channel) / 4u];
+      let weight_word2 = weight_words[(weight_base2 + input_channel) / 4u];
+      let weight_word3 = weight_words[(weight_base3 + input_channel) / 4u];
+      for (var lane = 0u; lane < 4u; lane = lane + 1u) {
+        let input_element = typed_byte(
+          word_byte(input_word, lane), params.input_type) -
+          params.input_zero_point;
+        accumulator0 = accumulator0 + input_element *
+          (typed_byte(word_byte(weight_word0, lane), params.weight_type) -
+            weight_zero0);
+        accumulator1 = accumulator1 + input_element *
+          (typed_byte(word_byte(weight_word1, lane), params.weight_type) -
+            weight_zero1);
+        accumulator2 = accumulator2 + input_element *
+          (typed_byte(word_byte(weight_word2, lane), params.weight_type) -
+            weight_zero2);
+        accumulator3 = accumulator3 + input_element *
+          (typed_byte(word_byte(weight_word3, lane), params.weight_type) -
+            weight_zero3);
+      }
+    }
+  } else {
+    for (; input_channel < params.d_in;
+         input_channel = input_channel + 1u) {
+      let input_element = input_value(input_base + input_channel) -
+        params.input_zero_point;
+      accumulator0 = accumulator0 + input_element *
+        (weight_value(weight_base0 + input_channel) - weight_zero0);
+      accumulator1 = accumulator1 + input_element *
+        (weight_value(weight_base1 + input_channel) - weight_zero1);
+      accumulator2 = accumulator2 + input_element *
+        (weight_value(weight_base2 + input_channel) - weight_zero2);
+      accumulator3 = accumulator3 + input_element *
+        (weight_value(weight_base3 + input_channel) - weight_zero3);
+    }
+  }
+
+  let minimum = select(0, -128, params.output_type == 6u);
+  let maximum = select(255, 127, params.output_type == 6u);
+  let scaled0 = bitcast<u32>(f32(accumulator0) *
+    requant_multipliers[output_channel]);
+  let scaled1 = bitcast<u32>(f32(accumulator1) *
+    requant_multipliers[output_channel + 1u]);
+  let scaled2 = bitcast<u32>(f32(accumulator2) *
+    requant_multipliers[output_channel + 2u]);
+  let scaled3 = bitcast<u32>(f32(accumulator3) *
+    requant_multipliers[output_channel + 3u]);
+  return output_byte(requantize_scaled_bits(
+      scaled0, params.output_zero_point, minimum, maximum)) |
+    (output_byte(requantize_scaled_bits(
+      scaled1, params.output_zero_point, minimum, maximum)) << 8u) |
+    (output_byte(requantize_scaled_bits(
+      scaled2, params.output_zero_point, minimum, maximum)) << 16u) |
+    (output_byte(requantize_scaled_bits(
+      scaled3, params.output_zero_point, minimum, maximum)) << 24u);
+}
+
 @compute @workgroup_size(64)
 fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
   let output_word = gid.x;
   let first_element = output_word * 4u;
   let elements = params.rows * params.d_out;
   if (first_element >= elements) { return; }
-  var packed = qlinear_one(first_element);
-  packed = packed | (qlinear_one(first_element + 1u) << 8u);
-  packed = packed | (qlinear_one(first_element + 2u) << 16u);
-  packed = packed | (qlinear_one(first_element + 3u) << 24u);
-  output_words[output_word] = packed;
+  output_words[output_word] = qlinear_word(first_element);
 }

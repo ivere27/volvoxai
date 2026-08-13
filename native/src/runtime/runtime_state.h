@@ -2,6 +2,7 @@
 #define VOLVOXAI_RUNTIME_STATE_H
 
 #include "cJSON.h"
+#include "decode_row_set.h"
 #include "gemm_f32.h"
 #include "safetensors.h"
 #include "thread_pool.h"
@@ -35,7 +36,7 @@ enum {
     T_F16 = VX_DTYPE_F16
 };
 
-/* Physical I8/U8 activation storage owns its real-value mapping here. */
+/* I8/U8 activation storage owns its real-value mapping here. */
 typedef struct {
     int valid;
     float scale;
@@ -57,6 +58,33 @@ typedef struct {
 
 typedef struct { char key[24]; char name[128]; } Ref;
 
+/* Longest paged-tensor set a context binds: the attention K and V operands of
+ * every attention node in one decoder. */
+#define VX_PAGED_BINDING_MAX_TENSORS 16
+
+/*
+ * One lane of one paged KV cache, bound to this context.
+ *
+ * Context state rather than a global, so two contexts paging independently
+ * cannot observe each other's page tables. The cache is borrowed; the caller
+ * that bound it outlives the binding.
+ */
+typedef struct {
+    struct VxPagedKVCache* cache;
+    int lane;
+    int bound;
+    int name_count;
+    char names[VX_PAGED_BINDING_MAX_TENSORS][128];
+    /* Two gather buffers, one per attention operand, grown geometrically and
+     * never returned: a decode loop's prefix grows by one token per generated
+     * token, so an exact-fit buffer would reallocate once per token.
+     *
+     * Bytes rather than floats: a W8A8 pool gathers int8 rows through the same
+     * arithmetic, and the element type only ever decided how wide a row is. */
+    unsigned char* gather[2];
+    size_t gather_bytes[2];
+} VxPagedBindingState;
+
 typedef struct {
     char op[40];
     Ref ins[MAXIN];
@@ -77,7 +105,7 @@ typedef struct {
 } Node;
 
 /* Parsed once from the safetensors-backed affine descriptor table for an
- * explicit physical-byte QLinear node. The aligned bias copy also avoids
+ * explicit byte QLinear node. The aligned bias copy also avoids
  * assuming safetensors byte offsets satisfy I32 alignment. */
 typedef struct {
     int valid;
@@ -94,7 +122,7 @@ typedef struct {
     uint32_t packed_weight_bytes;
 } QLinearMetadata;
 
-/* Canonical physical-byte QConv2D metadata.  The direct CPU path accepts only
+/* Canonical byte QConv2D metadata.  The direct CPU path accepts only
  * NHWC activations and [O,H,W,I/group] OHWI weights; the optional bias has an
  * aligned I32 copy in the accumulator domain. */
 typedef struct {
@@ -132,7 +160,7 @@ typedef struct {
     void* small_c_packed_weight;
 } QConv2DMetadata;
 
-/* Canonical physical-byte QEmbedding metadata. Token IDs remain conventional
+/* Canonical byte QEmbedding metadata. Token IDs remain conventional
  * I32 storage; the rank-2 [vocab, hidden] table owns per-row quantization and
  * the output owns its immutable per-tensor I8/U8 descriptor. */
 typedef struct {
@@ -320,6 +348,9 @@ typedef struct VxEngineState {
     SafetensorsFile weight_files[MAX_WEIGHT_FILES];
     char weight_paths[MAX_WEIGHT_FILES][4096];
     int weight_file_count;
+    /* Set only for compiled-model contexts. Their file table is a shallow
+     * immutable view retained by the compiled weight store. */
+    int weight_files_borrowed;
     cJSON* graph_root;
     char first_input[128];
     int loaded;
@@ -330,15 +361,39 @@ typedef struct VxEngineState {
 
     int backend;
     int use_vulkan;
-    int use_nnapi;
     int use_opengl;
     int use_metal;
     int use_cuda;
+
+    VxPagedBindingState paged;
 
     int active_row;
     int prefix_rows;
     long prefix_row_capacity;
     int execution_row;
+    /*
+     * The lanes a decode step declares, and where each one writes.
+     *
+     * Zero for every ordinary forward and for the scalar `active_row` path, so
+     * a context that never asks for a batch is untouched. Above one it is what
+     * the *caller* declared, never what a shape suggested: the leading extent
+     * of `[S,1,D]` is S, so inferring the lane count from a shape compiles an
+     * S-lane pipeline for a one-lane context. `decode_rows` is only meaningful
+     * while `decode_lanes` exceeds one.
+     */
+    int decode_lanes;
+    VxDecodeRowSet decode_rows;
+    /*
+     * Scratch for one step's staged rows, grown on demand and never shrunk.
+     *
+     * A batch's write rows are `lane * S + position[lane]`, which is contiguous
+     * only when the batch has one lane, so a kernel that wants `lanes` adjacent
+     * rows needs them copied somewhere first. Per context because two contexts
+     * may decode at once; kept across steps because the size is a function of
+     * the model, not of the step.
+     */
+    unsigned char* decode_stage;
+    size_t decode_stage_bytes;
     int debug;
 
     float* kcache[MAXN];
@@ -465,8 +520,6 @@ typedef struct VxEngineState {
     void (*opengl_context_state_destroy)(void* state);
     void* metal_context_state;
     void (*metal_context_state_destroy)(void* state);
-    void* nnapi_context_state;
-    void (*nnapi_context_state_destroy)(void* state);
     void* cuda_context_state;
     void (*cuda_context_state_destroy)(void* state);
 

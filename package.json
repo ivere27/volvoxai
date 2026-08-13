@@ -28,6 +28,8 @@
     "build:all": "npm run typecheck && node tools/build_web.mjs all",
     "check:release": "node tools/check_release_artifacts.mjs",
     "baseline:runtime": "node --expose-gc --import tsx tools/runtime_baseline.mjs",
+    "baseline:scheduler": "node --expose-gc --import tsx tools/runtime_scheduler_baseline.mjs",
+    "baseline:batch": "node --expose-gc --import tsx tools/runtime_batch_throughput.mjs",
     "baseline:cpu-shape": "node --import tsx tools/cpu_shape_context_baseline.mjs",
     "baseline:cpu-public": "node --import tsx tools/cpu_public_runtime_baseline.mjs",
     "baseline:dynamic": "node --import tsx tools/dynamic_shape_performance.mjs",

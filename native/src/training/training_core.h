@@ -41,9 +41,8 @@ typedef enum {
     VOLVOXAI_TRAINING_BACKEND_VULKAN = 1,
     VOLVOXAI_TRAINING_BACKEND_OPENGL = 2,
     VOLVOXAI_TRAINING_BACKEND_METAL = 3,
-    /* Keep this equal to VOLVOXAI_BACKEND_CUDA. Values 4 and 5 remain
-       reserved for the non-training NNAPI and custom-backend entries. */
-    VOLVOXAI_TRAINING_BACKEND_CUDA = 6
+    /* Keep this equal to VOLVOXAI_BACKEND_CUDA. */
+    VOLVOXAI_TRAINING_BACKEND_CUDA = 4
 } VolvoxAITrainingBackend;
 
 /* Full-profile eager, first-order reverse-mode autograd.  A context owns an
@@ -62,8 +61,8 @@ typedef struct volvoxai_autograd_options {
     uint32_t struct_size;
     /* VOLVOXAI_AUTOGRAD_CURRENT_BACKEND binds the context to the currently
        configured built-in backend.  A concrete VOLVOXAI_BACKEND_* value is an
-       assertion, not a request to reconfigure the engine.  CPU and native GPU
-       backends are accepted; NNAPI and custom backends are not differentiable. */
+       assertion, not a request to reconfigure the engine. CPU and native GPU
+       backends are accepted; custom backends are not differentiable. */
     int32_t backend;
     /* Deterministic counter mixed into Dropout/attention-dropout masks. */
     uint32_t training_counter;
@@ -293,7 +292,7 @@ typedef struct volvoxai_ptq_layer_spec {
     const char* source_weight_name;
     const char* packed_weight_name;
     /* QLinear requires both bias names. QConv2D accepts either both names or
-       neither, matching the physical-byte runtime contract. */
+       neither, matching the byte runtime contract. */
     const char* source_bias_name;
     const char* packed_bias_name;
 } volvoxai_ptq_layer_spec_t;

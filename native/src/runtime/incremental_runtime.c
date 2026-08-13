@@ -1,6 +1,7 @@
 #include "incremental_runtime.h"
 
 #include "adapter_runtime_internal.h"
+#include "paged_binding.h"
 #include "backend_manager.h"
 
 #include <stddef.h>
@@ -149,6 +150,12 @@ static int hybrid_device_backend_selected(void) {
         backend == VOLVOXAI_BACKEND_METAL;
 }
 
+/* A backend that executes rows on the device never relinquishes its prefix to
+ * the host, so the one-way GPU-seed/CPU-row handoff does not apply to it. */
+static int device_row_backend_selected(void) {
+    return vx_runtime_backend_has_graph() && vx_runtime_backend_has_device_rows();
+}
+
 static int cuda_resident_backend_selected(void) {
 #if VOLVOXAI_ENABLE_CUDA
     return vx_runtime_backend_has_graph() &&
@@ -286,10 +293,15 @@ static int hybrid_model_has_row_closure_locked(void) {
      * image/question inputs used only for the seed do not make a compatible
      * token-input closure appear unsupported. The actual changed closure is
      * checked again, atomically, before ownership is transferred. */
+    /* The batch axis is the caller's declaration, so a `[lanes,S]` token input
+     * is a decode input exactly when the step says it has that many lanes. One
+     * is the ordinary case and stays first, which keeps a context that never
+     * declares a batch reading precisely as it did. */
+    const int lanes = g_decode_lanes > 1 ? g_decode_lanes : 1;
     for (int index = 0; index < g_nt; index++) {
         T* tensor = &g_t[index];
         if (!tensor->is_graph_input || tensor->ndim != 2 ||
-            tensor->shape[0] != 1 || tensor->shape[1] <= 1) continue;
+            tensor->shape[0] != lanes || tensor->shape[1] <= 1) continue;
         memset(&plan, 0, sizeof(plan));
         plan.tensors[index] = 1;
         if (hybrid_row_plan_expand_locked(1, &plan) == 1) return 1;
@@ -317,6 +329,17 @@ int vx_incremental_prepare_hybrid_row_locked(int row) {
      * public row API fail-closed there instead of transferring ownership with
      * device-dirty outputs whose current row has not been synchronized. */
     if (row < 1) return 0;
+    /* A device-row backend still has to prove the closure is row-compatible --
+     * the operators narrow themselves the same way either way -- but there is
+     * no ownership to transfer, so the readback below is skipped entirely.
+     * This is the whole difference between "decode runs on the GPU" and
+     * "decode runs on the CPU that the GPU seeded". */
+    if (device_row_backend_selected()) {
+        if (!g_cache_valid || g_weight_caches_dirty) return -1;
+        status = hybrid_row_plan_build_locked(row, &plan);
+        if (status == 1) g_hybrid_prepared_row = row;
+        return status;
+    }
     if (!was_active && !hybrid_device_backend_selected()) return 0;
     if (!g_cache_valid || g_weight_caches_dirty) return -1;
     status = hybrid_row_plan_build_locked(row, &plan);
@@ -402,7 +425,7 @@ int vx_incremental_forward_locked(int row) {
         return -1;
     }
     if (row_execution && vx_runtime_backend_has_graph() &&
-        !cuda_resident_backend_selected() &&
+        !device_row_backend_selected() &&
         g_hybrid_prepared_row != row) {
         if (vx_incremental_prepare_hybrid_row_locked(row) != 1) {
             vx_incremental_invalidate_locked();
@@ -422,7 +445,7 @@ int vx_incremental_forward_locked(int row) {
     /* Once a device prefix has been synchronized, direct CPU dispatch is the
      * ownership boundary: no row wrapper may accidentally re-enter the GPU
      * with whole-tensor semantics. Ordinary CPU sessions retain the existing
-     * registry-elision shortcut; host-resident NNAPI still uses the registry. */
+     * registry-elision shortcut. */
     direct_cpu = g_hybrid_row_active ||
         (vx_decode_session_active_locked() &&
          vx_incremental_row_supported_locked() &&
@@ -451,6 +474,25 @@ int vx_incremental_forward_locked(int row) {
             0, volvoxai_engine_model_generation_locked());
         backend_forward_started = 1;
     }
+    /*
+     * The paged domain, checked once for the step rather than per node.
+     *
+     * Every operator in the row path computes its offsets as `row * width`,
+     * which is correct only for a tensor whose logical order is its physical
+     * order. An operator that touches a paged tensor without going through
+     * `paged_binding.h` therefore reads the wrong slot and produces a decoder
+     * that is wrong and looks plausible -- the failure this whole surface is
+     * arranged to make impossible.
+     *
+     * `vx_paged_domain_supported_locked` was written for exactly that and had
+     * no caller: the paged set was narrow enough that reasoning about it by
+     * hand still worked. It stopped being narrow when the W8A8 operators
+     * joined, so the check is enforced here instead of remembered.
+     */
+    if (vx_paged_bound_locked() && !vx_paged_domain_supported_locked(NULL)) {
+        rc = -1;
+        goto done;
+    }
     if (g_debug) prof_reset();
     double t0 = g_debug ? volvoxai_engine_now_ms() : 0.0;
     for (int node = 0; node < g_nn; node++) {
@@ -459,6 +501,26 @@ int vx_incremental_forward_locked(int row) {
             skipped++;
             continue;
         }
+        /*
+         * The declared-batch admission, applied to the nodes that actually run.
+         *
+         * The row planner asks the same question, but only for a device
+         * closure: a CPU row step has no backend graph, so it never builds a
+         * plan and reaches this loop with nothing having checked. An
+         * unconverted operator here would not fail — it would narrow to one
+         * contiguous span from `seq_range`, which for `[lanes,S,W]` is row
+         * `position` of lane zero, and every lane would read and write another
+         * request's bytes while looking entirely plausible.
+         *
+         * A fused or disabled node is exempt for the same reason it is exempt
+         * from `vx_runtime_node_incremental_row_compatible`: `graph_opt_fusion`
+         * points its output at the producer's buffer and clears the node, so
+         * `run_node` returns before executing anything. It addresses no rows,
+         * and reading "does nothing" as "cannot do a batch" would let one
+         * elided Reshape refuse an entire decoder.
+         */
+        if (g_decode_lanes > 1 && !g_n[node].skip && !g_n[node].disabled &&
+            !vx_runtime_node_decode_batch_supported(g_n[node].op)) goto done;
         /* Invalidate an old sidecar before the operator has a chance to
          * publish a replacement, then propagate dirtiness topologically. */
         prepare_dirty_outputs(node);
@@ -493,13 +555,18 @@ done:
 int vx_incremental_row_supported_locked(void) {
     if (!g_loaded) return 0;
     if (!vx_runtime_backend_has_graph()) return 1;
-    if (cuda_resident_backend_selected())
+    if (device_row_backend_selected())
         return hybrid_model_has_row_closure_locked();
     return hybrid_device_backend_selected() && hybrid_model_has_row_closure_locked();
 }
 
 void vx_incremental_shutdown_locked(void) {
     vx_incremental_invalidate_locked();
+    /* A page table names tensors by name. Shutdown frees those tensors, so a
+     * surviving binding would resolve names against the next model -- and its
+     * gather buffers would leak. Drop it here rather than trusting every
+     * caller to unbind. */
+    vx_paged_unbind_locked();
     /* The engine has already freed every tensor and arena allocation. */
     g_arena_detached = 0;
 }

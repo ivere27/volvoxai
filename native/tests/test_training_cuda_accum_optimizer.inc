@@ -102,9 +102,10 @@ static int run_cuda_accum_optimizer_case(
     CHECK(result != NULL);
     memset(result, 0, sizeof(*result));
     begin_graph();
-    g_use_vulkan = g_use_nnapi = g_use_opengl = g_use_metal = 0;
+    g_use_vulkan = g_use_opengl = g_use_metal = 0;
     g_use_cuda = use_cuda;
-    if (use_cuda && cuda_init() != 0) {
+    if (use_cuda &&
+        vx_backend_manager_activate(VOLVOXAI_BACKEND_CUDA) != 0) {
         CHECK(finish_graph() == 0);
         return cuda_init_failure_is_unavailable() ? 1 : -1;
     }
@@ -384,9 +385,10 @@ static int run_cuda_optimizer_handoff_checkpoint_case(
     memset(handoff, 0, sizeof(*handoff));
     remove(checkpoint_path);
     begin_graph();
-    g_use_vulkan = g_use_nnapi = g_use_opengl = g_use_metal = 0;
+    g_use_vulkan = g_use_opengl = g_use_metal = 0;
     g_use_cuda = use_cuda;
-    if (use_cuda && cuda_init() != 0) {
+    if (use_cuda &&
+        vx_backend_manager_activate(VOLVOXAI_BACKEND_CUDA) != 0) {
         CHECK(finish_graph() == 0);
         return cuda_init_failure_is_unavailable() ? 1 : -1;
     }

@@ -18,7 +18,7 @@ export class TrainingSessionHarness {
   #records = new Map();
   #closed = false;
 
-  constructor({ backend = 'cpu', wasmUrl } = {}) {
+  constructor({ backend = 'cpu-js', wasmUrl } = {}) {
     this.#backend = backend;
     this.#wasmUrl = wasmUrl;
   }
@@ -70,7 +70,7 @@ export class TrainingSessionHarness {
 }
 
 export function createCPUTrainingHarness() {
-  return new TrainingSessionHarness({ backend: 'cpu' });
+  return new TrainingSessionHarness({ backend: 'cpu-js' });
 }
 
 export function createWasmTrainingHarness(wasmUrl) {

@@ -14,7 +14,7 @@
  *   node --import tsx examples/tiny_receipt_vqa/tools/verify_split_package.mjs \
  *     --package build/tiny-receipt-int8-from-fp32 \
  *     [--reference build/tiny-receipt-fp32] [--tokens 8] \
- *     [--backend cpu|wasm] [--wasm dist/0.4.0/volvoxai.wasm]
+ *     [--backend cpu-js|wasm] [--wasm dist/0.4.0/volvoxai.wasm]
  */
 
 import { readFile } from 'node:fs/promises';
@@ -108,7 +108,7 @@ function requireExplicitKVDecode(answer, label) {
         || report.pastLength !== index + 1
         || report.presentLength !== index + 2
         || report.sentinelMaskValue !== 1) {
-      throw new Error(`${label} explicit KV report ${index} is not the exact v1 contract`);
+      throw new Error(`${label} explicit KV report ${index} is not the exact v2 contract`);
     }
   }
 }
@@ -307,9 +307,9 @@ async function defaultWasmPath() {
 async function main() {
   const options = parseArguments(process.argv.slice(2));
   if (typeof options.package !== 'string') throw new Error('pass --package <dir>');
-  const backend = options.backend ?? 'cpu';
-  if (backend !== 'cpu' && backend !== 'wasm') {
-    throw new Error("--backend must be 'cpu' or 'wasm'");
+  const backend = options.backend ?? 'cpu-js';
+  if (backend !== 'cpu-js' && backend !== 'wasm') {
+    throw new Error("--backend must be 'cpu-js' or 'wasm'");
   }
   const maxNewTokens = Number(options.tokens ?? TINY_RECEIPT_SPLIT_E2E_WORKLOAD.maxNewTokens);
   if (!Number.isSafeInteger(maxNewTokens) || maxNewTokens < 1 || maxNewTokens > 191) {

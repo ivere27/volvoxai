@@ -11,9 +11,6 @@
 //      frameworks. CUDA uses only dlopen/GetProcAddress for the Driver API; the
 //      plugin never links CUDA SDK or runtime libraries.
 //
-// native/src/backends/nnapi_engine.c's Android include is guarded off unless
-// USE_NNAPI is defined (as in the Android native build).
-
 use std::collections::BTreeSet;
 use std::env;
 use std::ffi::OsString;
@@ -97,7 +94,10 @@ fn emit_transitive_fragment_rerun_paths(source: &Path, reject_host_fragments: bo
                 continue;
             };
             let include = &include[..end];
-            if !include.ends_with(".inc") {
+            // C amalgamations use both .inc fragments and nested .c units.
+            // Follow both so edits to an included .c (and any .inc it includes)
+            // invalidate the Cargo native archive as well.
+            if !include.ends_with(".inc") && !include.ends_with(".c") {
                 continue;
             }
             if reject_host_fragments && include.ends_with("_host.inc") {
@@ -460,7 +460,8 @@ fn main() {
         .expect("Cargo did not provide CARGO_CFG_TARGET_ARCH to build.rs");
     let target_is_macos = target_os == "macos";
     let target_is_windows = target_os == "windows";
-    let target_has_android_dotprod = target_os == "android" && target_arch == "aarch64";
+    let target_has_arm_optional_isa =
+        (target_os == "android" || target_os == "linux") && target_arch == "aarch64";
     let out_dir =
         PathBuf::from(env::var_os("OUT_DIR").expect("Cargo did not provide OUT_DIR to build.rs"));
     let embedded_shaders_c = generate_embedded_shaders(&out_dir);
@@ -484,12 +485,18 @@ fn main() {
         "src/runtime/runtime_state.c",
         "src/runtime/public_api.c",
         "src/runtime/shape_contract.c",
+        "src/runtime/paged_kv.c",
+        "src/runtime/paged_binding.c",
+        "src/runtime/batch_scheduler.c",
+        "src/runtime/continuous_batch_scheduler.c",
+        "src/runtime/decode_row_set.c",
+        "src/runtime/batch_decode.c",
         "src/runtime/incremental_runtime.c",
         "src/runtime/decode_session.c",
         "src/backends/w8a8_device_ops.c",
         "src/kernels/kernels.c",
         "src/kernels/cpu_features.c",
-        "src/kernels/quant_cpu_opt.c",
+        "src/kernels/quant_cpu_isa.c",
         "src/kernels/qlinear_w8a8_x86.c",
         "src/kernels/qlinear_w8a8_arm.c",
         "src/kernels/qconv_w8a8_x86.c",
@@ -499,10 +506,11 @@ fn main() {
         "src/kernels/qgroupnorm_w8a8_native.c",
         "src/kernels/qnorm_activation_w8a8_native.c",
         "src/kernels/transpose_w8a8_native.c",
-        "src/kernels/conv_f32_opt.c",
-        "src/kernels/tensor_f32_opt.c",
+        "src/kernels/paged_attention.c",
+        "src/kernels/conv_f32_isa.c",
+        "src/kernels/tensor_f32_isa.c",
         "src/runtime/engine_runtime.c",
-        "src/runtime/engine.c",
+        "src/runtime/engine_state.c",
         "src/training/trainer_api.c",
         "src/training/ptq_api.c",
         "src/training/quantization.c",
@@ -511,7 +519,6 @@ fn main() {
         "src/backends/backend_manager.c",
         "src/backends/vulkan_engine.c",
         "src/backends/opengl_engine.c",
-        "src/backends/nnapi_engine.c",
     ];
 
     let mut build = cc::Build::new();
@@ -554,16 +561,37 @@ fn main() {
             "0"
         }),
     );
-    if target_has_android_dotprod {
+    if target_has_arm_optional_isa {
         build.define("VOLVOXAI_ARM_DOTPROD_OBJECT", Some("1"));
+    }
+    let arm_i8mm_candidates = [
+        "src/kernels/qlinear_w8a8_arm_i8mm.c",
+        "src/kernels/qconv_w8a8_arm_i8mm.c",
+        "src/kernels/qbatch_matmul_w8a8_arm_i8mm.c",
+    ];
+    for source in arm_i8mm_candidates {
+        let path = native.join(source);
+        if path.is_file() {
+            emit_transitive_fragment_rerun_paths(&path, false);
+        } else {
+            println!("cargo:rerun-if-changed={}", path.display());
+        }
+    }
+    let arm_i8mm_sources = arm_i8mm_candidates
+        .into_iter()
+        .filter(|source| native.join(source).is_file())
+        .collect::<Vec<_>>();
+    if target_has_arm_optional_isa && !arm_i8mm_sources.is_empty() {
+        build.define("VOLVOXAI_ARM_I8MM_OBJECT", Some("1"));
     }
     build.warnings(false);
     for s in srcs {
         build.file(native.join(s));
-        println!("cargo:rerun-if-changed=../native/{s}");
+        // Several native roots are amalgamations. Track every reachable
+        // implementation fragment from every compiled root so a future source
+        // split cannot silently leave an incremental Cargo artifact stale.
+        emit_transitive_fragment_rerun_paths(&native.join(s), false);
     }
-    emit_transitive_fragment_rerun_paths(&native.join("src/runtime/engine.c"), false);
-    emit_transitive_fragment_rerun_paths(&native.join("src/runtime/engine_runtime.c"), false);
     build.file(&embedded_shaders_c);
     if let Some(cuda) = cuda.as_ref() {
         build.file(native.join("src/backends/cuda_engine.c"));
@@ -576,9 +604,8 @@ fn main() {
         build.file(native.join("src/backends/metal_engine.m"));
         println!("cargo:rerun-if-changed=../native/src/backends/metal_engine.m");
     }
-    // kernels.c is a portable amalgamation, so track its included units as well
-    // as ordinary headers. Otherwise Cargo would not rebuild after editing one
-    // of those implementation files.
+    // The recursive source walk above owns implementation fragments. Headers
+    // remain explicit because Cargo does not consume the C compiler depfiles.
     for dependency in [
         "include/volvoxai.h",
         "include/volvoxai_enums.h",
@@ -592,50 +619,34 @@ fn main() {
         "src/runtime/backend.h",
         "src/runtime/backend_sdk.h",
         "src/runtime/backend_config.h",
+        "src/runtime/batch_decode.h",
+        "src/runtime/batch_scheduler.h",
+        "src/runtime/continuous_batch_scheduler.h",
+        "src/runtime/decode_row_set.h",
         "src/runtime/engine_internal.h",
         "src/runtime/incremental_runtime.h",
+        "src/runtime/paged_binding.h",
+        "src/runtime/paged_kv.h",
         "src/runtime/safetensors.h",
         "src/runtime/sequence_runtime.h",
         "src/training/training_core.h",
         "src/training/training_state.h",
-        "src/kernels/conv_f32_opt.h",
+        "src/kernels/conv_f32_isa.h",
         "src/kernels/fusion_ops.h",
         "src/kernels/inference_kernels.h",
-        "src/kernels/lora_linear.c",
         "src/kernels/lora_linear.h",
         "src/kernels/mathcompat.h",
-        "src/kernels/quant_cpu_opt.h",
+        "src/kernels/paged_attention.h",
+        "src/kernels/quant_cpu_isa.h",
         "src/kernels/qlinear_w8a8_arm.h",
         "src/kernels/qlinear_w8a8_arm_internal.h",
         "src/kernels/qconv_w8a8_arm.h",
-        "src/kernels/qconv_w8a8_arm_dotprod.c",
-        "src/kernels/tensor_f32_opt.h",
-        "src/kernels/thread_pool.c",
+        "src/kernels/tensor_f32_isa.h",
         "src/kernels/thread_pool.h",
         "src/kernels/wasm_simd128_polyfill.h",
-        "src/kernels/activations.c",
-        "src/kernels/broadcast_ops.c",
-        "src/kernels/core.c",
-        "src/kernels/cross_sdpa.c",
-        "src/kernels/cross_attention.c",
-        "src/kernels/cv_nlp.c",
-        "src/kernels/edge_primitives.c",
-        "src/kernels/embedding.c",
-        "src/kernels/fast_math.c",
-        "src/kernels/fusion_ops.c",
-        "src/kernels/layernorm.c",
-        "src/kernels/math_nlp.c",
-        "src/kernels/matmul.c",
-        "src/kernels/misc_ops.c",
-        "src/kernels/portable_inference_kernels.c",
-        "src/kernels/sdpa.c",
-        "src/kernels/shape_math.c",
-        "src/kernels/sequence_ops.c",
-        "src/kernels/vision_ops.c",
         "src/backends/backend_manager.h",
         "src/backends/cuda_engine.h",
         "src/backends/metal_engine.h",
-        "src/backends/nnapi_engine.h",
         "src/backends/opengl_engine.h",
         "src/backends/vulkan_engine.h",
         "src/backends/w8a8_device_ops.h",
@@ -654,19 +665,48 @@ fn main() {
     // the baseline engine archive so static linking resolves the optional
     // references from the baseline ARM kernels, while runtime HWCAP gating
     // prevents the instructions from executing on older ARM CPUs.
-    if target_has_android_dotprod {
+    if target_has_arm_optional_isa {
         let mut dotprod = cc::Build::new();
         for include in ["include", "src", "src/runtime", "src/kernels"] {
             dotprod.include(native.join(include));
         }
         dotprod.flag_if_supported("-O3");
         dotprod.flag("-march=armv8.2-a+dotprod");
+        dotprod.flag("-fno-lto");
+        dotprod.flag_if_supported("-fvisibility=hidden");
         dotprod.warnings(false);
         dotprod.file(native.join("src/kernels/qlinear_w8a8_arm_dotprod.c"));
         dotprod.file(native.join("src/kernels/qconv_w8a8_arm_dotprod.c"));
-        println!("cargo:rerun-if-changed=../native/src/kernels/qlinear_w8a8_arm_dotprod.c");
-        println!("cargo:rerun-if-changed=../native/src/kernels/qconv_w8a8_arm_dotprod.c");
+        emit_transitive_fragment_rerun_paths(
+            &native.join("src/kernels/qlinear_w8a8_arm_dotprod.c"),
+            false,
+        );
+        emit_transitive_fragment_rerun_paths(
+            &native.join("src/kernels/qconv_w8a8_arm_dotprod.c"),
+            false,
+        );
         dotprod.compile("volvoxarmdotprod");
+    }
+
+    // I8MM is compiled into a second optional archive rather than raising the
+    // ISA of the engine or SDOT archive. Runtime HWCAP2 dispatch is therefore
+    // the only route to SMMLA. The explicit source names mirror native CMake.
+    if target_has_arm_optional_isa && !arm_i8mm_sources.is_empty() {
+        let mut i8mm = cc::Build::new();
+        i8mm.define("VOLVOXAI_ARM_I8MM_OBJECT", Some("1"));
+        for include in ["include", "src", "src/runtime", "src/kernels"] {
+            i8mm.include(native.join(include));
+        }
+        i8mm.flag_if_supported("-O3");
+        i8mm.flag("-march=armv8.2-a+i8mm");
+        i8mm.flag("-fno-lto");
+        i8mm.flag("-ffp-contract=off");
+        i8mm.flag_if_supported("-fvisibility=hidden");
+        i8mm.warnings(false);
+        for source in arm_i8mm_sources {
+            i8mm.file(native.join(source));
+        }
+        i8mm.compile("volvoxarmi8mm");
     }
 
     // The engine dlopen's GPU/NPU backends and uses libm.

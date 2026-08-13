@@ -795,7 +795,7 @@ class GraphIR:
         Keeping them equal to the central ``volvox-graph/v1`` descriptor makes
         later rewrites locally checkable and prevents a graph mutation from
         silently changing quantization semantics after package import.  The
-        physical QLinear form is checked here as well: unlike an ordinary
+        QLinear form is checked here as well: unlike an ordinary
         Linear node, its storage layout and accumulator domain are semantics.
         """
 

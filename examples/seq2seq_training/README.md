@@ -21,7 +21,7 @@ import {
 } from 'volvoxai/full';
 
 const source = await Model.load('./seq2seq/model.safetensors');
-const trainer = await Trainer.create(source, { backend: 'cpu' });
+const trainer = await Trainer.create(source, { backend: 'cpu-js' });
 
 // Teacher forcing is application policy. Each input is a shaped view; these
 // example arrays represent one B=2, source-length=4, target-length=3 batch.
@@ -62,7 +62,7 @@ await trainer.close();
 // concrete graph.
 const restored = importModelCheckpoint(checkpoint);
 const resumed = await Trainer.create(restored.snapshot, {
-  backend: 'cpu',
+  backend: 'cpu-js',
   checkpoint,
 });
 await resumed.close();

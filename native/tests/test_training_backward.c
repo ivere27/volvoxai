@@ -1,5 +1,6 @@
 #include "cJSON.h"
 #include "adapter_runtime_internal.h"
+#include "backend_manager.h"
 #include "engine_core.h"
 #include "runtime_state.h"
 #include "training/training_core.h"
@@ -168,9 +169,7 @@ static float reference_gelu_derivative(float x, int approximate_tanh) {
 
 static int test_training_backend_policy_ids(void) {
     CHECK(volvoxai_engine_require_training_backend(0) == 0);
-    /* Native backend values 4 and 5 are NNAPI/custom, not strict native
-       training backends. CUDA preserves its stable native ABI value 6. */
-    CHECK(volvoxai_engine_require_training_backend(4) != 0);
+    /* Values beyond the built-in backend enum are not training backends. */
     CHECK(volvoxai_engine_require_training_backend(5) != 0);
 #if VOLVOXAI_ENABLE_CUDA
     CHECK(VOLVOXAI_TRAINING_BACKEND_CUDA == VOLVOXAI_BACKEND_CUDA);
@@ -188,7 +187,7 @@ static int test_training_backend_policy_ids(void) {
 
 static int test_gelu_mode_case(int approximate_tanh) {
     begin_graph();
-    g_use_vulkan = g_use_nnapi = g_use_opengl = g_use_metal = 0;
+    g_use_vulkan = g_use_opengl = g_use_metal = 0;
     const int shape[2] = {1, 5};
     const float input[5] = {-2.0f, -0.75f, 0.0f, 0.5f, 1.5f};
     CHECK(add_tensor("gelu.input", shape, 2, input));
@@ -304,14 +303,13 @@ static int test_transformer_backward(void) {
     /* Exercise backend-policy restoration without fabricating initialized GPU
        devices. The dedicated optional Vulkan case below covers a live device. */
     g_use_vulkan = 0;
-    g_use_nnapi = 1;
     g_use_opengl = 0;
     g_use_metal = 0;
     CHECK(volvoxai_engine_train_step("logits", targets, 2, INT_MIN, trainable, 1,
                                           2, 0.05f, 0.9f, 0.999f, 1e-8f,
                                           0.0f, 0.0f, 1, &loss, &correct, &examples) == 0);
-    CHECK(g_use_vulkan == 0 && g_use_nnapi == 1 && g_use_opengl == 0 && g_use_metal == 0);
-    g_use_vulkan = g_use_nnapi = g_use_opengl = g_use_metal = 0;
+    CHECK(g_use_vulkan == 0 && g_use_opengl == 0 && g_use_metal == 0);
+    g_use_vulkan = g_use_opengl = g_use_metal = 0;
     CHECK(isfinite(loss) && loss > 0.0f && examples == 2 && correct >= 0 && correct <= 2);
     T* trained = t_find("embedding.weight");
     int changed = 0;
@@ -574,13 +572,12 @@ static int test_vulkan_engine_train_step_optional(void) {
     float loss = 0.0f;
     int examples = 0;
     g_use_vulkan = 1;
-    g_use_nnapi = 1;
     g_use_opengl = 0;
     g_use_metal = 0;
     CHECK(volvoxai_engine_train_step("logits", targets, 2, INT_MIN, trainable, 1,
                                      2, 0.05f, 0.9f, 0.999f, 1.0e-8f,
                                      0.0f, 0.0f, 1, &loss, NULL, &examples) == 0);
-    CHECK(g_use_vulkan == 1 && g_use_nnapi == 1 && g_use_opengl == 0 && g_use_metal == 0);
+    CHECK(g_use_vulkan == 1 && g_use_opengl == 0 && g_use_metal == 0);
     CHECK(isfinite(loss) && examples == 2);
     int changed = 0;
     for (int i = 0; i < 4; i++) {
@@ -588,7 +585,7 @@ static int test_vulkan_engine_train_step_optional(void) {
     }
     CHECK(changed);
 
-    g_use_vulkan = g_use_nnapi = g_use_opengl = g_use_metal = 0;
+    g_use_vulkan = g_use_opengl = g_use_metal = 0;
     CHECK(finish_graph() == 0);
     vk_cleanup();
     return 0;
@@ -1141,7 +1138,7 @@ static int test_explicit_graph_lora_training(void) {
 
 static int test_attention_masks_and_ignored_targets(void) {
     begin_graph();
-    g_use_vulkan = g_use_nnapi = g_use_opengl = g_use_metal = 0;
+    g_use_vulkan = g_use_opengl = g_use_metal = 0;
     const int qkv_shape[3] = {1, 2, 3};
     const int out_shape[3] = {1, 2, 1};
     const int mask_shape[3] = {1, 2, 2};
@@ -1198,7 +1195,7 @@ static int test_attention_masks_and_ignored_targets(void) {
 
 static int test_native_seq2seq_training(void) {
     begin_graph();
-    g_use_vulkan = g_use_nnapi = g_use_opengl = g_use_metal = 0;
+    g_use_vulkan = g_use_opengl = g_use_metal = 0;
     const int ids_shape[2] = {1, 2};
     const int hidden_shape[3] = {1, 2, 2};
     const int qkv_shape[3] = {1, 2, 6};
@@ -1375,7 +1372,7 @@ static int test_optimized_dropout_alias_training(void) {
     CHECK(safetensors_save(weights_path, &weights) == 0);
     safetensors_free(&weights);
 
-    g_use_vulkan = g_use_nnapi = g_use_opengl = g_use_metal = 0;
+    g_use_vulkan = g_use_opengl = g_use_metal = 0;
     CHECK(volvoxai_engine_init(graph_path, weights_path) == 0);
     T* feature_tensor = t_find("features");
     T* dropped_tensor = t_find("dropped");
@@ -1412,7 +1409,7 @@ static int test_optimized_dropout_alias_training(void) {
 
 static int test_groupnorm_training(void) {
     begin_graph();
-    g_use_vulkan = g_use_nnapi = g_use_opengl = g_use_metal = 0;
+    g_use_vulkan = g_use_opengl = g_use_metal = 0;
     const int image_shape[4] = {1, 2, 2, 4};
     const int channel_shape[1] = {4};
     const int pooled_shape[2] = {1, 4};
@@ -1483,7 +1480,7 @@ static int test_groupnorm_training(void) {
 
 static int test_dropout_training_and_inference(void) {
     begin_graph();
-    g_use_vulkan = g_use_nnapi = g_use_opengl = g_use_metal = 0;
+    g_use_vulkan = g_use_opengl = g_use_metal = 0;
     const int feature_shape[2] = {1, 64};
     const int head_shape[2] = {64, 2};
     const int logits_shape[2] = {1, 2};
@@ -1546,9 +1543,10 @@ static int run_dropout_runtime_parity_case(int use_cuda, float* updated) {
     for (int index = 0; index < 64; index++)
         features[index] = ((float)(index % 13) - 6.0f) * 0.125f;
     begin_graph();
-    g_use_vulkan = g_use_nnapi = g_use_opengl = g_use_metal = 0;
+    g_use_vulkan = g_use_opengl = g_use_metal = 0;
     g_use_cuda = use_cuda;
-    if (use_cuda && cuda_init() != 0) {
+    if (use_cuda &&
+        vx_backend_manager_activate(VOLVOXAI_BACKEND_CUDA) != 0) {
         CHECK(finish_graph() == 0);
         return cuda_init_failure_is_unavailable() ? 1 : -1;
     }
@@ -1599,9 +1597,10 @@ static int run_linear_runtime_parity_case(int use_cuda, float* updated_weight,
     const char* trainables[2] = {"linear.weight", "linear.bias"};
 
     begin_graph();
-    g_use_vulkan = g_use_nnapi = g_use_opengl = g_use_metal = 0;
+    g_use_vulkan = g_use_opengl = g_use_metal = 0;
     g_use_cuda = use_cuda;
-    if (use_cuda && cuda_init() != 0) {
+    if (use_cuda &&
+        vx_backend_manager_activate(VOLVOXAI_BACKEND_CUDA) != 0) {
         CHECK(finish_graph() == 0);
         return cuda_init_failure_is_unavailable() ? 1 : -1;
     }
@@ -1666,9 +1665,10 @@ static int run_composed_runtime_parity_case(int use_cuda, float* updated_weight,
     };
 
     begin_graph();
-    g_use_vulkan = g_use_nnapi = g_use_opengl = g_use_metal = 0;
+    g_use_vulkan = g_use_opengl = g_use_metal = 0;
     g_use_cuda = use_cuda;
-    if (use_cuda && cuda_init() != 0) {
+    if (use_cuda &&
+        vx_backend_manager_activate(VOLVOXAI_BACKEND_CUDA) != 0) {
         CHECK(finish_graph() == 0);
         return cuda_init_failure_is_unavailable() ? 1 : -1;
     }
@@ -1749,9 +1749,10 @@ static int run_attention_runtime_parity_case(
     };
 
     begin_graph();
-    g_use_vulkan = g_use_nnapi = g_use_opengl = g_use_metal = 0;
+    g_use_vulkan = g_use_opengl = g_use_metal = 0;
     g_use_cuda = use_cuda;
-    if (use_cuda && cuda_init() != 0) {
+    if (use_cuda &&
+        vx_backend_manager_activate(VOLVOXAI_BACKEND_CUDA) != 0) {
         CHECK(finish_graph() == 0);
         return cuda_init_failure_is_unavailable() ? 1 : -1;
     }
@@ -1776,9 +1777,10 @@ static int run_attention_runtime_parity_case(
     CHECK(finish_graph() == 0);
 
     begin_graph();
-    g_use_vulkan = g_use_nnapi = g_use_opengl = g_use_metal = 0;
+    g_use_vulkan = g_use_opengl = g_use_metal = 0;
     g_use_cuda = use_cuda;
-    if (use_cuda) CHECK(cuda_init() == 0);
+    if (use_cuda)
+        CHECK(vx_backend_manager_activate(VOLVOXAI_BACKEND_CUDA) == 0);
     CHECK(volvoxai_engine_require_training_backend(
         use_cuda ? VOLVOXAI_BACKEND_CUDA : VOLVOXAI_BACKEND_CPU) == 0);
     CHECK(add_tensor("attention.q", vector_shape, 2, q));
@@ -1854,7 +1856,7 @@ static int test_attention_dropout_training_and_inference(void) {
     const float learning_rate = 0.1f;
 
     begin_graph();
-    g_use_vulkan = g_use_nnapi = g_use_opengl = g_use_metal = 0;
+    g_use_vulkan = g_use_opengl = g_use_metal = 0;
     CHECK(add_tensor("qkv", qkv_shape, 2, qkv_values));
     CHECK(add_tensor("logits", attention_shape, 2, NULL));
     Node* node = add_node("SDPA", "logits",
@@ -1902,7 +1904,7 @@ static int test_attention_dropout_training_and_inference(void) {
     };
     const char* cross_trainables[3] = {"q", "k", "v"};
     begin_graph();
-    g_use_vulkan = g_use_nnapi = g_use_opengl = g_use_metal = 0;
+    g_use_vulkan = g_use_opengl = g_use_metal = 0;
     CHECK(add_tensor("q", q_shape, 2, q_values));
     CHECK(add_tensor("k", q_shape, 2, k_values));
     CHECK(add_tensor("v", q_shape, 2, v_values));
@@ -1931,7 +1933,7 @@ static int test_attention_dropout_training_and_inference(void) {
 
 static int test_train_step_global_gradient_clipping(void) {
     begin_graph();
-    g_use_vulkan = g_use_nnapi = g_use_opengl = g_use_metal = 0;
+    g_use_vulkan = g_use_opengl = g_use_metal = 0;
     const int input_shape[2] = {1, 1};
     const int weight_shape[2] = {1, 2};
     const int logits_shape[2] = {1, 2};
@@ -1966,7 +1968,7 @@ static int test_train_step_global_gradient_clipping(void) {
 
 static int test_shape_aware_broadcast_and_reduction_backward(void) {
     begin_graph();
-    g_use_vulkan = g_use_nnapi = g_use_opengl = g_use_metal = 0;
+    g_use_vulkan = g_use_opengl = g_use_metal = 0;
     const int output_shape[3] = {2, 3, 2};
     const int batch_mask_shape[3] = {2, 1, 2};
     const int position_shape[3] = {1, 3, 2};
@@ -2021,7 +2023,7 @@ static int test_shape_aware_broadcast_and_reduction_backward(void) {
 
 static int test_weighted_multi_loss_accumulation(void) {
     begin_graph();
-    g_use_vulkan = g_use_nnapi = g_use_opengl = g_use_metal = 0;
+    g_use_vulkan = g_use_opengl = g_use_metal = 0;
     const int input_shape[2] = {1, 2};
     const int hidden_shape[2] = {1, 2};
     const int shared_shape[2] = {2, 2};

@@ -1,7 +1,7 @@
 #!/bin/bash
 # Compile the wasm32 inference artifacts from the current sources.
 #
-# kernels.c amalgamates qbatch_matmul_wasm_simd.c only under __wasm_simd128__,
+# kernels.c amalgamates qbatch_matmul_wasm_simd.inc only under __wasm_simd128__,
 # and qlinear_w8a8_wasm_relaxed.c is a separate freestanding artifact, so neither
 # is reachable from any CMake target. A rename or a new header include in the
 # shared kernels can therefore break the web build while every native test still

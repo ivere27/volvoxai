@@ -709,6 +709,64 @@ static void reference_softmax_f32(const float* input, float* output,
     }
 }
 
+static int test_silu_numerical_contract(void) {
+    enum { ELEMENTS = 37, SPECIAL_ELEMENTS = 21 };
+    float input[ELEMENTS];
+    float expected[ELEMENTS];
+    float output[ELEMENTS];
+    float in_place[ELEMENTS];
+    float special[SPECIAL_ELEMENTS];
+    float special_expected[SPECIAL_ELEMENTS];
+    float special_output[SPECIAL_ELEMENTS];
+    for (int index = 0; index < ELEMENTS; index++) {
+        input[index] = (float)((index * 47) % 173 - 86) / 11.0f;
+        expected[index] = input[index] *
+            (1.0f / (1.0f + accurate_expf(-input[index])));
+    }
+    silu_f32(input, output, ELEMENTS);
+    CHECK(memcmp(output, expected, sizeof(output)) == 0);
+    memcpy(in_place, input, sizeof(input));
+    silu_f32(in_place, in_place, ELEMENTS);
+    CHECK(memcmp(in_place, expected, sizeof(in_place)) == 0);
+    for (int index = 0; index < SPECIAL_ELEMENTS; index++)
+        special[index] = (float)(index - 10) * 0.75f;
+    special[2] = NAN;
+    special[7] = INFINITY;
+    special[15] = -INFINITY;
+    for (int index = 0; index < SPECIAL_ELEMENTS; index++)
+        special_expected[index] = special[index] *
+            (1.0f / (1.0f + accurate_expf(-special[index])));
+    silu_f32(special, special_output, SPECIAL_ELEMENTS);
+    for (int index = 0; index < SPECIAL_ELEMENTS; index++) {
+        if (isnan(special_expected[index])) CHECK(isnan(special_output[index]));
+        else CHECK(memcmp(special_output + index, special_expected + index,
+                          sizeof(float)) == 0);
+    }
+    return 0;
+}
+
+static int test_gelu_numerical_contract(void) {
+    enum { ELEMENTS = 37 };
+    float input[ELEMENTS];
+    float expected[ELEMENTS];
+    float output[ELEMENTS];
+    float in_place[ELEMENTS];
+    const float inverse_sqrt_two = 0.7071067811865475f;
+    for (int index = 0; index < ELEMENTS; index++) {
+        input[index] = (float)((index * 61) % 191 - 95) / 13.0f;
+        expected[index] = 0.5f * input[index] *
+            (1.0f + erff(input[index] * inverse_sqrt_two));
+    }
+    gelu_f32(input, output, ELEMENTS);
+    for (int index = 0; index < ELEMENTS; index++)
+        CHECK(fabsf(output[index] - expected[index]) <= 2.0e-6f);
+    memcpy(in_place, input, sizeof(input));
+    gelu_f32(in_place, in_place, ELEMENTS);
+    for (int index = 0; index < ELEMENTS; index++)
+        CHECK(fabsf(in_place[index] - expected[index]) <= 2.0e-6f);
+    return 0;
+}
+
 static int test_softmax_numerical_contract(void) {
     enum { ROWS = 7, WIDTH = 33, SPECIAL_ROWS = 5, SPECIAL_WIDTH = 8 };
     float input[ROWS * WIDTH];
@@ -1055,6 +1113,8 @@ int main(void) {
     CHECK(test_graph_contract_validation(weights_path) == 0);
     CHECK(test_inputs_have_no_name_based_defaults(weights_path) == 0);
     CHECK(test_argmax_f32_to_i32(weights_path) == 0);
+    CHECK(test_silu_numerical_contract() == 0);
+    CHECK(test_gelu_numerical_contract() == 0);
     CHECK(test_softmax_numerical_contract() == 0);
     CHECK(test_parallel_f32_row_and_batch_parity(weights_path) == 0);
     CHECK(test_required_onnx_operator_graph(weights_path) == 0);

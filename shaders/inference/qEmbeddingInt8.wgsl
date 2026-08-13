@@ -9,6 +9,18 @@
 @group(0) @binding(3) var<storage, read> weight_zero_points : array<i32>;
 @group(0) @binding(4) var<storage, read_write> output_words : array<u32>;
 
+// `token_offset` is where this dispatch starts reading `token_ids`, and it is
+// what lets a decode row run here at all. Every other activation binding can be
+// a window into its tensor, because a row's byte offset is a multiple of the
+// device's storage alignment whenever the row stride is. A token row is one i32
+// -- four bytes -- so no row past the first ever satisfies a 256-byte alignment,
+// and the ids window could never resolve. Binding the ids whole and naming the
+// first token as a scalar moves that address out of the descriptor, where the
+// alignment rule does not reach.
+//
+// It occupies the padding word the 32-byte uniform already carried, so the ABI
+// shared with Vulkan, OpenGL, Metal and CUDA keeps its size and every existing
+// writer, which left that word zero, keeps meaning "start at token 0".
 struct Params {
   tokens : u32,
   vocab : u32,
@@ -17,7 +29,7 @@ struct Params {
   output_type : u32,
   output_zero_point : i32,
   output_scale : f32,
-  _pad : u32,
+  token_offset : u32,
 }
 @group(0) @binding(5) var<uniform> params : Params;
 
@@ -58,7 +70,7 @@ fn qembedding_one(index : u32) -> u32 {
   if (index >= elements) { return 0u; }
   let token_index = index / params.hidden;
   let hidden_index = index % params.hidden;
-  let signed_id = token_ids[token_index];
+  let signed_id = token_ids[params.token_offset + token_index];
   if (signed_id < 0 || u32(signed_id) >= params.vocab) {
     return output_byte(params.output_zero_point);
   }

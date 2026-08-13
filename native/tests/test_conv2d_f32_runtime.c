@@ -1,5 +1,5 @@
 #include "engine_internal.h"
-#include "conv_f32_opt.h"
+#include "conv_f32_isa.h"
 #include "safetensors.h"
 #include "engine_core.h"
 #include "runtime_state.h"
@@ -239,6 +239,56 @@ static int test_spatial_igemm_thread_parity(void) {
     return 0;
 }
 
+static int test_dense_interior_pixel_tile(void) {
+    enum {
+        height = 4, width = 8, input_channels = 5,
+        output_channels = 16, kernel = 3,
+    };
+    const int pads[4] = {1, 1, 1, 1};
+    float input[height * width * input_channels];
+    float weight[kernel * kernel * input_channels * output_channels];
+    float bias[output_channels];
+    float output[height * width * output_channels];
+    float reference[height * width * output_channels];
+    for (size_t index = 0; index < sizeof(input) / sizeof(input[0]); index++)
+        input[index] = (float)((int)((index * 11u + 3u) % 31u) - 15) / 32.0f;
+    for (size_t index = 0; index < sizeof(weight) / sizeof(weight[0]); index++)
+        weight[index] = (float)((int)((index * 7u + 5u) % 29u) - 14) / 64.0f;
+    for (int channel = 0; channel < output_channels; channel++)
+        bias[channel] = (float)(channel - 8) / 128.0f;
+    for (int oy = 0; oy < height; oy++) {
+        for (int ox = 0; ox < width; ox++) {
+            for (int oc = 0; oc < output_channels; oc++) {
+                float sum = bias[oc];
+                for (int ky = 0; ky < kernel; ky++) {
+                    const int iy = oy + ky - 1;
+                    if ((unsigned)iy >= height) continue;
+                    for (int kx = 0; kx < kernel; kx++) {
+                        const int ix = ox + kx - 1;
+                        if ((unsigned)ix >= width) continue;
+                        for (int ic = 0; ic < input_channels; ic++) {
+                            sum += input[((size_t)iy * width + ix) *
+                                input_channels + ic] *
+                                weight[(((size_t)ky * kernel + kx) *
+                                input_channels + ic) * output_channels + oc];
+                        }
+                    }
+                }
+                reference[((size_t)oy * width + ox) * output_channels + oc] =
+                    sum;
+            }
+        }
+    }
+    vx_set_num_threads(1);
+    vx_conv2d_generic_f32(
+        0, input, output, weight, bias, 1, height, width, input_channels,
+        height, width, output_channels, kernel, kernel, input_channels, 1,
+        1, 1, pads, 1, 1, 0);
+    CHECK(close_array(output, reference,
+        sizeof(output) / sizeof(output[0])));
+    return 0;
+}
+
 int main(void) {
     VxEngineState* state = (VxEngineState*)calloc(1, sizeof(*state));
     VxEngineStateScope scope;
@@ -257,6 +307,7 @@ int main(void) {
     CHECK(test_explicit_hwcm_depthwise_conv() == 0);
     CHECK(test_maxpool_canonical_pads_and_batch() == 0);
     CHECK(test_spatial_igemm_thread_parity() == 0);
+    CHECK(test_dense_interior_pixel_tile() == 0);
     vx_engine_state_scope_leave(scope);
     vx_engine_state_deinit(state);
     free(state);

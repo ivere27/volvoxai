@@ -28,7 +28,7 @@ The readable and minified variants have the same API:
 | volvoxai.wasm.js | Strict WASM inference and training | volvoxai.full.wasm |
 
 The standard inference entry imports and exports no training code. The
-WASM-only entry contains no CPU, WebNN, WebGPU, WGSL, or Node filesystem
+WASM-only entry contains no CPU JS, WebGPU, WGSL, or Node filesystem
 implementation.
 
 The inference entry exports `Runtime`, `ModelLoader`,
@@ -45,7 +45,7 @@ the retired concrete package loader are not inference exports.
 import { VolvoxAI } from 'volvoxai';
 
 const runtime = await VolvoxAI.createRuntime({
-  backends: ['webnn', 'webgpu', 'wasm', 'cpu'],
+  backends: ['webgpu', 'wasm', 'cpu-js'],
   wasmUrl: new URL('./volvoxai.wasm', import.meta.url),
   onDiagnostic(event) {
     console.debug(event);
@@ -55,10 +55,10 @@ const runtime = await VolvoxAI.createRuntime({
 
 The backends option selects which providers to initialize and records
 unavailable providers for later compilation reports. Omitting it uses the
-explicit built-in order WebNN, WebGPU, WASM, then CPU.
+explicit built-in order WebGPU, WASM, then CPU JS (`cpu-js`).
 
-The value is always a non-empty ordered array. It does not add CPU unless cpu
-is present; there are no string or `auto` shorthands.
+The value is always a non-empty ordered array. It does not add CPU JS unless
+`cpu-js` is present; there are no string or `auto` shorthands.
 
 Runtime.listBackends() returns the selected provider names, including providers
 whose initialization outcome is retained for diagnostics.
@@ -113,7 +113,7 @@ Preferred selection tries candidates in order until one compiles:
 const compiled = await runtime.compile(snapshot, {
   backend: {
     mode: 'prefer',
-    order: ['webgpu', 'wasm', 'cpu'],
+    order: ['webgpu', 'wasm', 'cpu-js'],
     operatorFallback: 'allow',
   },
 });
@@ -239,7 +239,7 @@ context. A provider that does not support a requested decode operation rejects
 with BACKEND_UNSUPPORTED.
 
 Fixed-shape B=1 W8A8 decode has dependency, row, and K/V-cache implementations
-on CPU, WASM, and WebGPU. WebNN provides ordinary forward execution.
+on CPU JS, WASM, and WebGPU.
 
 ## Weight revisions and adapters
 
@@ -256,6 +256,58 @@ Compilation and execution reports are frozen and serializable. Execution
 reports include execution/context identities, backend and device, pinned model
 and adapter revisions, elapsed time, tier/operator route evidence, and
 decode/cache state. Stable VolvoxAIError codes include:
+
+Memory evidence is an explicit runtime-scoped opt-in. The public DTO mirrors
+the protobuf contract while keeping uint64 fields as safe-integer numbers so
+`JSON.stringify(report)` remains valid:
+
+~~~javascript
+import {
+  MEMORY_CAPTURE_PROTOCOL,
+  MemoryEnvelopeKind,
+  VolvoxAI,
+} from 'volvoxai';
+
+const runtime = await VolvoxAI.createRuntime({
+  memoryCapture: {
+    protocol: MEMORY_CAPTURE_PROTOCOL,
+    includeResourceInventory: true,
+    includeDomainAttestation: true,
+    requestedEnvelopes: [
+      MemoryEnvelopeKind.ProcessRss,
+      MemoryEnvelopeKind.ProcessManagedHeapUsed,
+      MemoryEnvelopeKind.DeviceProcessUsed,
+    ],
+  },
+});
+~~~
+
+Absence leaves report shapes unchanged and performs no sampling. A successful
+compile/execute/decode report carries one `AFTER` snapshot; an execution error
+report carries `FAILURE`. Every requested but unsupported envelope is retained
+with `UNAVAILABLE` and no byte value. Envelopes overlap one another and resource
+records, so consumers compare them as separate series and never add them.
+
+`PROCESS_MANAGED_HEAP_USED` comes from the Node heap counter as an `EXACT`
+`typescript-runtime-memory/v1` value. Where that counter is absent, browsers
+supply `performance.memory` instead, which is quantized rather than live: the
+fallback is reported as `ESTIMATED` under its own
+`browser-performance-memory/v1` sampler, so a consumer can tell the two
+collectors apart before comparing their series. Capture never changes the
+report fields it sits beside; in particular `executionTimeMs` continues to
+measure the execution and excludes collector cost.
+
+The WASM provider exposes the complete linear-memory allocation only once as an
+exact `WASM_LINEAR` capacity root. Its arena counters are subregions of that
+root and are not additional physical bytes. The inventory is still `PARTIAL`
+because JavaScript-side weights and result snapshots are outside the root.
+WebGPU does not expose portable process VRAM or residency; API-requested buffer
+sizes must not be relabeled as physical VRAM. Periodic capture is rejected until
+an operation-window sampler is implemented.
+
+The package entry uses only the inference-safe enum projection and handwritten
+DTOs. It does not import the generated Synurang codec or its full-profile
+Trainer/PTQ surface.
 
 ~~~text
 BACKEND_UNAVAILABLE
@@ -358,18 +410,6 @@ supported portable subset before forward execution or optimizer mutation.
 
 ## Backend characteristics
 
-### WebNN
-
-WebNN builds through navigator.ml. The browser may route work to NPU, GPU, or
-CPU depending on platform support.
-
-Current mapped operations include MatMul, Linear, Gemm, Add, Mul, ReLU, GELU,
-SiLU, Sigmoid, Softmax, Reshape/Flatten, LayerNorm, Conv2D, Embedding, and
-SDPA decomposed into lower-level WebNN operations.
-
-WebNN requires a secure context. Requesting deviceType: npu does not prove
-physical NPU execution; use provider evidence when device identity matters.
-
 ### WebGPU
 
 WebGPU owns device buffers outside the portable Tensor model, compiles an
@@ -423,7 +463,7 @@ parents retain the scalar export, and N tails remain scalar inside the same
 validated call. Neither route dequantizes through F32 MatMul or retries in the
 JavaScript CPU provider.
 
-### CPU
+### CPU JS (`cpu-js`)
 
 The JavaScript CPU provider is the portable reference. It is dependency-free
 and is used for correctness comparisons and CPU-only deployment.
@@ -433,7 +473,7 @@ inference, and training coverage.
 
 ## Node behavior
 
-The standard and full entries can use WASM or CPU in Node. The WASM-only
+The standard and full entries can use WASM or CPU JS in Node. The WASM-only
 package subpaths are browser-only because they omit the filesystem loader.
 
 Inference WGSL is bundled only into the browser release and is loaded only when

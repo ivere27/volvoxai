@@ -1,5 +1,5 @@
 #include "inference_kernels.h"
-#include "quant_cpu_opt.h"
+#include "quant_cpu_isa.h"
 #include "thread_pool.h"
 
 #include <stdint.h>

@@ -75,6 +75,9 @@ typedef struct {
     size_t domain_scratch_capacity_bytes;
     int slot_count;
     int domain_enforced;
+    int dispatch_params_buffer_count;
+    uint64_t dispatch_params_upload_count;
+    uint64_t conv_out16_dispatch_count;
 } OpenGLGraphDynamicStateProbe;
 int opengl_graph_debug_dynamic_state(OpenGLGraphDynamicStateProbe* probe);
 int opengl_test_fail_domain_allocation_after(size_t successful_allocations);
@@ -274,7 +277,7 @@ int opengl_graph_quantize_linear_i8(const float* in, signed char* out, long n,
                                     float output_scale, int output_zp);
 int opengl_graph_dequantize_linear_f32(const float* in, const float* scale, const float* zero_point,
                                        float* out, long n, int has_zero_point);
-/* Canonical physical-byte W8A8 dense dispatch. Dtypes use canonical
+/* Canonical W8A8 dense dispatch. Dtypes use canonical
  * VX_DTYPE_I8/VX_DTYPE_U8 values. */
 int opengl_graph_qlinear_i8u8(const void* input, const void* weight,
                               const float* weight_scales, const int32_t* weight_zero_points,
@@ -292,7 +295,7 @@ int opengl_graph_qembedding_i8u8(const int32_t* tokens, const void* weight,
                                  uint32_t token_count, uint32_t vocab, uint32_t hidden,
                                  float output_scale, int32_t output_zero_point,
                                  uint32_t weight_dtype, uint32_t output_dtype);
-/* Canonical physical-byte W8A8 Conv2D with NHWC activations and OHWI weights.
+/* Canonical W8A8 Conv2D with NHWC activations and OHWI weights.
  * A NULL bias binds persistent zero I32 storage for every output channel. */
 int opengl_graph_qconv2d_i8u8(const void* input, const void* weight,
                                const float* weight_scales, const int32_t* weight_zero_points,
@@ -356,7 +359,7 @@ int opengl_graph_resize_nearest_i8u8(const void* input, void* output,
                                      float input_scale, int32_t input_zero_point,
                                      float output_scale, int32_t output_zero_point,
                                      uint32_t input_dtype, uint32_t output_dtype);
-/* Canonical physical-byte W8A8 elementwise add.  All three logical element
+/* Canonical W8A8 elementwise add.  All three logical element
  * counts must agree; only device allocations are padded for packed-u32 WGSL. */
 int opengl_graph_qadd_i8u8(const void* a, uint32_t a_elements,
                            const void* b, uint32_t b_elements,
@@ -413,6 +416,12 @@ int opengl_graph_qsdpa_i8u8(const void* q, const void* k, const void* v,
                             uint32_t output_dtype, uint32_t causal,
                             uint32_t mask_mode);
 /* Raw-byte I8/U8 ArgMax, emitting one I32 first-tie index per [outer,inner]. */
+int opengl_graph_row_index_transfer(const void* source, size_t source_bytes,
+                                    const int32_t* indices, uint32_t rows,
+                                    void* destination, size_t destination_bytes,
+                                    uint32_t row_words, uint32_t indexed_rows,
+                                    uint32_t mode);
+
 int opengl_graph_qargmax_i8u8(const void* input, int32_t* output,
                                uint32_t outer, uint32_t axis_size,
                                uint32_t inner, uint32_t input_dtype);

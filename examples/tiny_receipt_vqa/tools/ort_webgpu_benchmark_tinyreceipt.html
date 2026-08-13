@@ -439,7 +439,7 @@ try {
     ]);
     if (Object.keys(encoded).length !== expectedEncoder.size ||
         Object.keys(encoded).some((name) => !expectedEncoder.has(name))) {
-      fail('encoder output signature is not explicit-KV v1.');
+      fail('encoder output signature is not explicit-KV v2.');
     }
     gpuTensor(encoded.memory, 'float32', [1, memoryLength, 320], 'encoder memory');
     const memoryMask = cpuData(
@@ -517,7 +517,7 @@ try {
         const expectedDecoder = new Set(['logits', 'present_padding_mask', ...PRESENT_NAMES]);
         if (Object.keys(outputs).length !== expectedDecoder.size ||
             Object.keys(outputs).some((name) => !expectedDecoder.has(name))) {
-          fail('decoder output signature is not explicit-KV v1.');
+          fail('decoder output signature is not explicit-KV v2.');
         }
         const logits = cpuData(outputs.logits, 'float32', [1, 1, 1536], 'logits');
         const next = firstIndexArgmax(logits);

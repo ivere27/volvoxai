@@ -608,7 +608,7 @@ class ReferenceExecutor:
         return result
 
     def _qlinear(self, node: OpNode, inputs: Mapping[str, np.ndarray]) -> np.ndarray:
-        """Execute the canonical physical W8A8 dense contract exactly."""
+        """Execute the canonical W8A8 dense contract exactly."""
 
         self._params(node, ())
         self._require_ports(node, inputs, ("input", "weight", "bias"))

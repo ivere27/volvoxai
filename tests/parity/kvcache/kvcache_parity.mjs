@@ -3,10 +3,10 @@
 // encoder-decoder — entirely separate code from a full forward, with its own cache
 // indexing. This drives a small W8A8 decoder (QEmbedding/QLayerNorm/QLinear/QSDPA
 // self+cross/QGELU/QSiLU) through the KV-cache decode and checks its final retained
-// self-attention K/V against a CPU full recompute. The graph mirrors
-// tests/js_w8a8_decode_cache.test.mjs.
+// self-attention K/V against a CPU-JS full recompute. The graph mirrors
+// tests/w8a8_decode_cache.test.mjs.
 //
-//   node tests/parity/kvcache/kvcache_parity.mjs [backend ...]   # default cpu wasm
+//   node tests/parity/kvcache/kvcache_parity.mjs [backend ...]   # default cpu-js wasm
 //   node tests/parity/kvcache/kvcache_parity.mjs compare
 import fs from 'node:fs';
 import path from 'node:path';
@@ -40,7 +40,7 @@ const nf = globalThis.fetch;
 globalThis.fetch = async (u, i) => { const h = typeof u === 'string' ? u : u?.url; if (h && h.startsWith('file://')) return new Response(await fs.promises.readFile(fileURLToPath(h))); return nf(u, i); };
 
 const SEQ = 3, WIDTH = 4, MEMORY = 2, VOCAB = 7;
-const KNOWN_BACKENDS = ['cpu', 'wasm', 'webgpu'];
+const KNOWN_BACKENDS = ['cpu-js', 'wasm', 'webgpu'];
 const ver = JSON.parse(fs.readFileSync(path.join(ROOT, 'package.json'), 'utf8')).version;
 const wasmPath = path.join(ROOT, 'dist', ver, 'volvoxai.wasm');
 const bundlePath = path.join(ROOT, 'dist', ver, 'volvoxai.js');
@@ -249,12 +249,12 @@ function requireManifestRuntimeEvidence(manifest, tier, payload) {
 // Full-recompute ground truth: one causal forward with the final y_ids fills every row.
 async function referenceCache(module) {
   const snapshot = decoderSnapshot(module);
-  const runtime = await module.VolvoxAI.createRuntime({ backends: ['cpu'], wasmUrl: wasmPath });
+  const runtime = await module.VolvoxAI.createRuntime({ backends: ['cpu-js'], wasmUrl: wasmPath });
   let compiled;
   let context;
   try {
     compiled = await runtime.compile(snapshot, {
-      backend: { mode: 'require', backend: 'cpu', operatorFallback: 'forbid' },
+      backend: { mode: 'require', backend: 'cpu-js', operatorFallback: 'forbid' },
     });
     context = await compiled.createContext();
     const yIds = Int32Array.of(1, 0, 0), yKeep = Int32Array.of(1, 0, 0);
@@ -264,7 +264,7 @@ async function referenceCache(module) {
     ));
     const execution = result.report;
     const captured = await captureStableResult(
-      snapshot.graph, result, context, 'cpu', snapshot.outputNames,
+      snapshot.graph, result, context, 'cpu-js', snapshot.outputNames,
     );
     context = null;
     return {
@@ -430,7 +430,7 @@ async function produce(backends) {
   const module = await import(pathToFileURL(path.join(ROOT, 'dist', ver, 'volvoxai.js')).href);
   fs.mkdirSync(OUT, { recursive: true });
   removeParityOutputsSync([
-    'reference.json', 'cpu.json', 'wasm.json', 'webgpu.json',
+    'reference.json', 'cpu-js.json', 'wasm.json', 'webgpu.json',
     'run.json', 'kvcache_matrix.md', 'kvcache_matrix.json',
   ], { outputRoot: OUT });
   const fingerprint = kvCacheCampaignFingerprint();
@@ -605,5 +605,5 @@ function exitWith(code) {
 }
 
 const args = globalThis.Deno?.args ?? globalThis.process?.argv.slice(2) ?? [];
-if (args[0] === 'compare') exitWith(compare(args.slice(1).length ? args.slice(1) : ['cpu', 'wasm']));
-else if (!await produce(args.length ? args : ['cpu', 'wasm'])) exitWith(1);
+if (args[0] === 'compare') exitWith(compare(args.slice(1).length ? args.slice(1) : ['cpu-js', 'wasm']));
+else if (!await produce(args.length ? args : ['cpu-js', 'wasm'])) exitWith(1);

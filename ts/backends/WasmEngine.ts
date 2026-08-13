@@ -1,11 +1,12 @@
+import { runtimeIdentity } from '../core/Identity.js';
 import { Tensor } from '../core/Tensor.js';
 import { DataType } from '../generated/volvoxaiEnums.js';
 import { kernelRoute } from '../generated/kernelRegistry.js';
 import { normalizeSpatialPair } from '../ops/spatialParameters.js';
 import type { RuntimeGraph } from '../core/RuntimeGraph.js';
 import { assertInferenceExecutionOptions, BackendEngine } from './BackendEngine.js';
-import { geluApproximation } from '../ops/gELU.js';
-import { ropeDescriptor } from '../ops/roPE.js';
+import { geluApproximation } from '../ops/gelu.js';
+import { ropeDescriptor } from '../ops/rope.js';
 import { ssmScanDescriptor } from '../ops/ssmScan.js';
 import { batchMatMulDescriptor } from '../ops/batchMatMul.js';
 import { qBatchMatMulDescriptor } from '../ops/qBatchMatMul.js';
@@ -18,12 +19,62 @@ import {
 } from '../ops/spatialKernelValidation.js';
 import { incrementalExecutionEnabled, incrementalNodeSelection } from './incrementalExecution.js';
 import {
-  incrementalRowPosition,
+  decodeRowSetFromOptions,
   prepareQuantizedRows,
   quantizedRowNode,
 } from './quantizedRowExecution.js';
+import { kvScratchCapacity } from './kvPageAddressing.js';
+import { singleLaneRowSet } from './decodeRowSet.js';
 import type { BackendExecutionOptions } from './BackendEngine.js';
 import type { GraphNode, RuntimeDType, RuntimeTypedArray } from '../types.js';
+import {
+  WASM_PORTABLE_MAX_RANK,
+  WASM_PORTABLE_MAX_U32,
+  portableByteQuantizedTensor,
+  portableElementCount,
+  portableF32Tensor,
+  portableOutput,
+  portablePairParameter,
+  portableTensorElements,
+  sameShape,
+  wasmDtypeCode,
+} from './WasmPortablePrimitives.js';
+import {
+  immutableQuantizationDescriptor,
+  portableQAddDescriptor,
+  portableQArgMaxDescriptor,
+  portableQConv2DDescriptor,
+  portableQEmbeddingDescriptor,
+  portableQGELUDescriptor,
+  portableQGroupNormDescriptor,
+  portableQLayerNormDescriptor,
+  portableQLinearDescriptor,
+  portableQMaskedMeanDescriptor,
+  portableQSDPADescriptor,
+  portableQSiLUDescriptor,
+  portableRequantizeLinearDescriptor,
+  preflightPortableQArgMaxStorage,
+  preflightPortableQGroupNormStorage,
+  preflightPortableQLayerNormStorage,
+  preflightPortableQMaskedMeanStorage,
+  preflightPortableQSDPAStorage,
+  qArgMaxByteStorageIsCanonical,
+  qArgMaxInt32StorageIsCanonical,
+  qArgMaxStorageRangesOverlap,
+  qGroupNormAffineStorageIsCanonical,
+  qGroupNormByteStorageIsCanonical,
+  qGroupNormStorageRangesOverlap,
+  qLayerNormAffineStorageIsCanonical,
+  qLayerNormByteStorageIsCanonical,
+  qLayerNormStorageRangesOverlap,
+  qMaskedMeanByteStorageIsCanonical,
+  qMaskedMeanInt32StorageIsCanonical,
+  qMaskedMeanMaximumCenteredMagnitude,
+  qMaskedMeanStorageRangesOverlap,
+  qSDPAByteStorageIsCanonical,
+  qSDPAInt32StorageIsCanonical,
+  qSDPAStorageRangesOverlap,
+} from './WasmQuantizedDescriptors.js';
 
 declare const __VOLVOXAI_BROWSER_ONLY__: boolean | undefined;
 
@@ -206,6 +257,7 @@ interface WasmPreparedGraph extends Readonly<object> {
 }
 
 interface PackedF32WeightDescriptor {
+  readonly weightName: string;
   readonly pointer: number;
   readonly bytes: number;
   readonly dIn: number;
@@ -215,6 +267,7 @@ interface PackedF32WeightDescriptor {
 }
 
 interface PackedQ8WeightDescriptor {
+  readonly weightName: string;
   readonly pointer: number;
   readonly bytes: number;
   readonly cacheKey: string;
@@ -266,6 +319,306 @@ interface WasmCapacityCandidate {
   readonly arenaCapacities: ReadonlyMap<RuntimeDType, number> | null;
 }
 
+type WasmSharedLinearRegionKind = 'compiled-invariants' | 'context-mutable';
+
+interface WasmSharedLinearRegion {
+  readonly id: string;
+  readonly kind: WasmSharedLinearRegionKind;
+  readonly base: number;
+  readonly limit: number;
+  readonly maximumBytes: number;
+  cursor: number;
+  highWater: number;
+  released: boolean;
+}
+
+interface WasmFreeLinearRange {
+  base: number;
+  bytes: number;
+}
+
+interface WasmSharedEngineOptions {
+  readonly pool: WasmSharedLinearPool;
+  readonly region: WasmSharedLinearRegion;
+  readonly invariantPrefix?: WasmCompiledInvariantPrefix;
+  readonly releaseRegionOnDispose?: boolean;
+  readonly releasePrefixOnDispose?: boolean;
+}
+
+/**
+ * One address allocator over the sidecar's exported linear memory.
+ *
+ * Production provider contexts share the same pointer-only kernel instance.
+ * Their mutable allocator cursors live in JavaScript and are confined to
+ * disjoint, bounded ranges, so the module-global C allocator is never shared
+ * between contexts. The C allocator remains available to direct low-level and
+ * full-profile scratch users, which continue to use independent fork() memory.
+ */
+class WasmSharedLinearPool {
+  readonly memory: WebAssembly.Memory;
+  readonly rootId = runtimeIdentity('wasm-linear-root');
+  #next: number;
+  #free: WasmFreeLinearRange[] = [];
+  #rootBuffer: ArrayBufferLike;
+  #rootBytes: number;
+  #generation = 1;
+  #liveRegions = 0;
+  readonly #growthListeners = new Set<() => void>();
+
+  constructor(memory: WebAssembly.Memory, heapBase: number) {
+    if (!(memory instanceof WebAssembly.Memory) || !Number.isSafeInteger(heapBase) ||
+        heapBase <= 0 || heapBase > WASM_PORTABLE_MAX_U32 || (heapBase & 15) !== 0) {
+      throw new Error('WASM shared linear pool requires a positive aligned heap base.');
+    }
+    this.memory = memory;
+    this.#next = heapBase;
+    this.#rootBuffer = memory.buffer;
+    this.#rootBytes = this.#rootBuffer.byteLength;
+  }
+
+  reserve(maximumBytes: number, kind: WasmSharedLinearRegionKind): WasmSharedLinearRegion {
+    if (!Number.isSafeInteger(maximumBytes) || maximumBytes <= 0 ||
+        maximumBytes > 0x7ffffff0) {
+      throw new Error(`WASM ${kind} region maximum is not representable.`);
+    }
+    const bytes = Math.ceil(maximumBytes / 16) * 16;
+    let base: number | null = null;
+    for (let index = 0; index < this.#free.length; index++) {
+      const candidate = this.#free[index];
+      if (candidate.bytes < bytes) continue;
+      base = candidate.base;
+      candidate.base += bytes;
+      candidate.bytes -= bytes;
+      if (candidate.bytes === 0) this.#free.splice(index, 1);
+      break;
+    }
+    if (base === null) {
+      base = this.#next;
+      const next = base + bytes;
+      if (!Number.isSafeInteger(next) || next > WASM_PORTABLE_MAX_U32) {
+        throw new Error('WASM shared linear-memory address space is exhausted.');
+      }
+      this.#next = next;
+    }
+    /* A fresh WebAssembly.Memory page is zero-filled, but a free-list range
+     * can contain bytes written by a closed context or compiled model. Restore
+     * fresh-memory semantics before publishing the range to another owner.
+     * Bytes beyond the current extent will be zero-filled by memory.grow(). */
+    const materializedEnd = Math.min(base + bytes, this.memory.buffer.byteLength);
+    if (materializedEnd > base) {
+      new Uint8Array(this.memory.buffer, base, materializedEnd - base).fill(0);
+    }
+    this.#liveRegions++;
+    return {
+      id: runtimeIdentity(`wasm-${kind}`),
+      kind,
+      base,
+      limit: base + bytes,
+      maximumBytes: bytes,
+      cursor: base,
+      highWater: base,
+      released: false,
+    };
+  }
+
+  release(region: WasmSharedLinearRegion): void {
+    if (region.released) return;
+    if (this.#liveRegions <= 0) {
+      throw new Error('WASM shared linear pool live-region accounting underflow.');
+    }
+    region.released = true;
+    this.#liveRegions--;
+    region.cursor = region.base;
+    this.#free.push({ base: region.base, bytes: region.maximumBytes });
+    this.#free.sort((left, right) => left.base - right.base);
+    const merged: WasmFreeLinearRange[] = [];
+    for (const range of this.#free) {
+      const previous = merged.at(-1);
+      if (previous && previous.base + previous.bytes === range.base) {
+        previous.bytes += range.bytes;
+      } else {
+        merged.push({ ...range });
+      }
+    }
+    this.#free = merged;
+  }
+
+  registerGrowthListener(listener: () => void): () => void {
+    this.#growthListeners.add(listener);
+    return () => this.#growthListeners.delete(listener);
+  }
+
+  get liveRegionCount(): number { return this.#liveRegions; }
+
+  notifyGrowth(origin: (() => void) | null): void {
+    for (const listener of this.#growthListeners) {
+      if (listener !== origin) listener();
+    }
+  }
+
+  inspectRoot(): WasmMemoryRootInspection {
+    const buffer = this.memory.buffer;
+    const addressableBytes = buffer.byteLength;
+    if (buffer !== this.#rootBuffer || addressableBytes !== this.#rootBytes) {
+      if (this.#generation === Number.MAX_SAFE_INTEGER) {
+        throw new Error('WASM linear-memory root generation exceeds exact JavaScript arithmetic.');
+      }
+      this.#rootBuffer = buffer;
+      this.#rootBytes = addressableBytes;
+      this.#generation++;
+    }
+    return Object.freeze({
+      engineId: this.rootId,
+      generation: this.#generation,
+      addressableBytes,
+    });
+  }
+}
+
+export interface WasmCompiledInvariantInspection {
+  readonly prefixId: string;
+  readonly rawWeightBytes: number;
+  readonly rawWeightPhysicalBytes: number;
+  readonly packedWeightBytes: number;
+  readonly packedWeightPhysicalBytes: number;
+  readonly rawWeightCopyCount: number;
+  readonly rawWeightCopyBytes: number;
+  readonly f32PackCount: number;
+  readonly q8PackCount: number;
+  readonly physicalAllocationCount: 1;
+  readonly borrowerCount: number;
+  readonly backingOffsetBytes: number;
+  readonly backingLengthBytes: number;
+  readonly backingRootId: string;
+}
+
+/** Opaque compiled-model-owned immutable raw/packed linear-memory prefix. */
+export class WasmCompiledInvariantPrefix {
+  readonly #pool: WasmSharedLinearPool;
+  readonly #region: WasmSharedLinearRegion;
+  readonly #topologyRevision: number;
+  readonly #weightRevision: number;
+  readonly #weightPointers: ReadonlyMap<string, number>;
+  readonly #weightCapacities: ReadonlyMap<string, WasmTensorCapacity>;
+  readonly #f32PackedWeights: ReadonlyMap<string, PackedF32WeightDescriptor>;
+  readonly #q8PackedWeights: ReadonlyMap<string, PackedQ8WeightDescriptor>;
+  readonly #bankedWeightNames: ReadonlySet<string>;
+  readonly #inspectionBase: Omit<WasmCompiledInvariantInspection, 'borrowerCount'>;
+  #borrowers = 0;
+  #closed = false;
+
+  constructor(options: {
+    pool: WasmSharedLinearPool;
+    region: WasmSharedLinearRegion;
+    topologyRevision: number;
+    weightRevision: number;
+    weightPointers: ReadonlyMap<string, number>;
+    weightCapacities: ReadonlyMap<string, WasmTensorCapacity>;
+    f32PackedWeights: ReadonlyMap<string, PackedF32WeightDescriptor>;
+    q8PackedWeights: ReadonlyMap<string, PackedQ8WeightDescriptor>;
+    bankedWeightNames: ReadonlySet<string>;
+    rawWeightBytes: number;
+    rawWeightPhysicalBytes: number;
+    packedWeightBytes: number;
+    packedWeightPhysicalBytes: number;
+    rawWeightCopyCount: number;
+    rawWeightCopyBytes: number;
+    f32PackCount: number;
+    q8PackCount: number;
+  }) {
+    this.#pool = options.pool;
+    this.#region = options.region;
+    this.#topologyRevision = options.topologyRevision;
+    this.#weightRevision = options.weightRevision;
+    this.#weightPointers = options.weightPointers;
+    this.#weightCapacities = options.weightCapacities;
+    this.#f32PackedWeights = options.f32PackedWeights;
+    this.#q8PackedWeights = options.q8PackedWeights;
+    this.#bankedWeightNames = options.bankedWeightNames;
+    this.#inspectionBase = Object.freeze({
+      prefixId: options.region.id,
+      rawWeightBytes: options.rawWeightBytes,
+      rawWeightPhysicalBytes: options.rawWeightPhysicalBytes,
+      packedWeightBytes: options.packedWeightBytes,
+      packedWeightPhysicalBytes: options.packedWeightPhysicalBytes,
+      rawWeightCopyCount: options.rawWeightCopyCount,
+      rawWeightCopyBytes: options.rawWeightCopyBytes,
+      f32PackCount: options.f32PackCount,
+      q8PackCount: options.q8PackCount,
+      physicalAllocationCount: 1 as const,
+      backingOffsetBytes: options.region.base,
+      backingLengthBytes: options.region.highWater - options.region.base,
+      backingRootId: options.pool.rootId,
+    });
+  }
+
+  belongsTo(pool: unknown): boolean { return this.#pool === pool; }
+
+  retain(): void {
+    if (this.#closed) throw new Error('WASM compiled invariant prefix is closed.');
+    this.#borrowers++;
+  }
+
+  release(): void {
+    if (this.#borrowers <= 0) {
+      throw new Error('WASM compiled invariant prefix lease underflow.');
+    }
+    this.#borrowers--;
+  }
+
+  close(): void {
+    if (this.#closed) return;
+    if (this.#borrowers !== 0) {
+      throw new Error('WASM compiled invariant prefix still has live context borrowers.');
+    }
+    this.#closed = true;
+    this.#pool.release(this.#region);
+  }
+
+  install(
+    graph: WasmGraph,
+    pointers: Map<string, number>,
+    capacities: Map<string, WasmTensorCapacity>,
+    f32PackedWeights: Map<string, PackedF32WeightDescriptor>,
+    q8PackedWeights: Map<string, PackedQ8WeightDescriptor>,
+  ): void {
+    if (this.#closed || (graph.topologyRevision || 0) !== this.#topologyRevision ||
+        (graph.weightRevision || 0) !== this.#weightRevision) {
+      throw new Error('WASM graph does not match its compiled invariant prefix.');
+    }
+    const declaredWeightNames = new Set(
+      [...graph.tensors.values()]
+        .filter((tensor) => tensor.isWeight === true)
+        .map((tensor) => tensor.name),
+    );
+    if (declaredWeightNames.size !== this.#weightPointers.size ||
+        [...declaredWeightNames].some((name) => !this.#weightPointers.has(name))) {
+      throw new Error('WASM graph weight inventory disagrees with its compiled invariant prefix.');
+    }
+    for (const [name, pointer] of this.#weightPointers) {
+      const tensor = graph.tensors.get(name);
+      const capacity = this.#weightCapacities.get(name);
+      if (!tensor || !capacity || tensor.isWeight !== true ||
+          tensor.dtype !== capacity.dtype || tensor.sizeBytes !== capacity.capacityBytes) {
+        if (this.#bankedWeightNames.has(name) && tensor?.isWeight === true) continue;
+        throw new Error(`WASM invariant weight '${name}' disagrees with its compiled prefix.`);
+      }
+      pointers.set(name, pointer);
+      capacities.set(name, capacity);
+    }
+    for (const [key, descriptor] of this.#f32PackedWeights) {
+      if (pointers.has(descriptor.weightName)) f32PackedWeights.set(key, descriptor);
+    }
+    for (const [key, descriptor] of this.#q8PackedWeights) {
+      if (pointers.has(descriptor.weightName)) q8PackedWeights.set(key, descriptor);
+    }
+  }
+
+  inspect(): Readonly<WasmCompiledInvariantInspection> {
+    return Object.freeze({ ...this.#inspectionBase, borrowerCount: this.#borrowers });
+  }
+}
+
 export interface WasmGraphAllocationOptions {
   /** Optional initial capacity targets. Omitted names start at logical bytes. */
   readonly tensorCapacityBytes?: Readonly<Record<string, number>>;
@@ -303,6 +656,20 @@ export interface WasmArenaInspection {
   readonly variantRebindCount: number;
   readonly f32PackCount: number;
   readonly q8PackCount: number;
+  readonly rawWeightCopyCount: number;
+  readonly rawWeightCopyBytes: number;
+  readonly sharedInvariant: Readonly<WasmCompiledInvariantInspection> | null;
+  readonly mutableArenaOffsetBytes: number | null;
+  readonly mutableArenaBytes: number;
+  readonly mutableArenaMaximumBytes: number;
+}
+
+/** Identity and current extent of this engine's physical linear-memory root. */
+export interface WasmMemoryRootInspection {
+  /** Shared by production contexts that borrow one compiled invariant prefix. */
+  readonly engineId: string;
+  readonly generation: number;
+  readonly addressableBytes: number;
 }
 
 type WasmNodeMetadata = { kind: string } & Record<string, any>;
@@ -410,13 +777,6 @@ function wasmTensorPointer(tensor, memory, label) {
   return storage.byteOffset;
 }
 
-function wasmDtypeCode(dtype) {
-  if (dtype === 'float32') return DataType.F32;
-  if (dtype === 'int32') return DataType.I32;
-  if (dtype === 'int8') return DataType.I8;
-  if (dtype === 'uint8') return DataType.U8;
-  throw new Error(`Unsupported WASM kernel dtype '${dtype}'.`);
-}
 
 function wasmKernelDtype(tensor, label) {
   switch (tensor?.dtype) {
@@ -462,9 +822,6 @@ function localMaskBinding(
   return [base + batchIndex * seqQ * seqKV * 4, 2];
 }
 
-const WASM_PORTABLE_MAX_RANK = 8;
-const WASM_PORTABLE_MAX_U32 = 0xffffffff;
-/* wasm32 addresses 4 GiB in 64 KiB pages, so the heap can never exceed this. */
 const WASM_MAX_MEMORY_PAGES = 65536;
 /* Reshape-family operators that only reinterpret a tensor's shape. Their output
  * is the input's bytes, so compile() aliases the heap pointer instead of
@@ -837,10 +1194,6 @@ function planWasmActivationWithinMaximum(
   });
 }
 
-function sameShape(left, right) {
-  return Array.isArray(left) && Array.isArray(right) && left.length === right.length &&
-    left.every((dimension, index) => dimension === right[index]);
-}
 
 function normalizedTargetMatchesConcreteShape(target, shape) {
   if (target === undefined) return true;
@@ -864,29 +1217,7 @@ function normalizedTargetMatchesConcreteShape(target, shape) {
   return true;
 }
 
-function portableElementCount(shape) {
-  if (!Array.isArray(shape)) return null;
-  let elements = 1;
-  for (const dimension of shape) {
-    if (!Number.isInteger(dimension) || dimension <= 0 || dimension > WASM_PORTABLE_MAX_U32 ||
-        elements > Math.floor(WASM_PORTABLE_MAX_U32 / dimension)) return null;
-    elements *= dimension;
-  }
-  return elements;
-}
 
-function portableTensorElements(tensor) {
-  if (!tensor) return null;
-  const elements = portableElementCount(tensor.shape);
-  if (elements == null) return null;
-  let bytes;
-  try {
-    bytes = Tensor.dtypeBytes(tensor.dtype);
-  } catch {
-    return null;
-  }
-  return tensor.sizeBytes === elements * bytes ? elements : null;
-}
 
 function portable32BitTensor(tensor) {
   return !!tensor && (tensor.dtype === 'float32' || tensor.dtype === 'int32') &&
@@ -1041,13 +1372,7 @@ function portableWhereDescriptor(node) {
   };
 }
 
-function portableOutput(node) {
-  return node.outputs?.out || Object.values(node.outputs || {})[0];
-}
 
-function portableF32Tensor(tensor) {
-  return !!tensor && tensor.dtype === 'float32' && portableTensorElements(tensor) != null;
-}
 
 function portableDenseBias(tensor, dOut) {
   if (!tensor) return true;
@@ -1068,918 +1393,35 @@ function portableUnaryF32Descriptor(node) {
   return { kind: 'unaryF32', input, output, elements };
 }
 
-function portableByteQuantizedTensor(tensor) {
-  return !!tensor && (tensor.dtype === 'int8' || tensor.dtype === 'uint8') &&
-    portableTensorElements(tensor) != null;
-}
 
-function immutableQuantizationDescriptor(tensor) {
-  if (!portableByteQuantizedTensor(tensor)) return null;
-  const descriptor = tensor.quantization;
-  const minimum = tensor.dtype === 'int8' ? -128 : 0;
-  const maximum = tensor.dtype === 'int8' ? 127 : 255;
-  const validScale = (value) => typeof value === 'number' && Number.isFinite(value) && value > 0;
-  const validZeroPoint = (value) => Number.isInteger(value) && value >= minimum && value <= maximum;
-  if (!descriptor || typeof descriptor !== 'object' || !Object.isFrozen(descriptor)) return null;
-  if (descriptor.scheme === 'per_tensor') {
-    return validScale(descriptor.scale) && validZeroPoint(descriptor.zero_point) ? descriptor : null;
-  }
-  if (descriptor.scheme === 'per_axis') {
-    const axis = descriptor.axis;
-    if (!Number.isInteger(axis) || axis < 0 || axis >= tensor.shape.length ||
-        !Array.isArray(descriptor.scales) || !Array.isArray(descriptor.zero_points) ||
-        !Object.isFrozen(descriptor.scales) || !Object.isFrozen(descriptor.zero_points) ||
-        descriptor.scales.length !== tensor.shape[axis] ||
-        descriptor.zero_points.length !== tensor.shape[axis] ||
-        !descriptor.scales.every(validScale) || !descriptor.zero_points.every(validZeroPoint)) return null;
-    return descriptor;
-  }
-  return null;
-}
 
-function portableQLinearDescriptor(node) {
-  if (!['QLinear', 'QMatMul', 'QGemm'].includes(node.opType)) return null;
-  const input = node.inputs.input || node.inputs.x || node.inputs.a;
-  const weight = node.inputs.weight;
-  const bias = node.inputs.bias;
-  const output = portableOutput(node);
-  const inputElements = portableTensorElements(input);
-  const weightElements = portableTensorElements(weight);
-  const biasElements = portableTensorElements(bias);
-  const outputElements = portableTensorElements(output);
-  if (!portableByteQuantizedTensor(input) || !portableByteQuantizedTensor(weight) ||
-      !portableByteQuantizedTensor(output) || !bias || bias.dtype !== 'int32' ||
-      inputElements == null || weightElements == null || biasElements == null ||
-      outputElements == null || input.shape.length < 1 ||
-      output.shape.length !== input.shape.length ||
-      input.shape.slice(0, -1).some((dimension, index) => dimension !== output.shape[index]) ||
-      weight.shape.length !== 2 || bias.shape.length !== 1) {
-    throw new Error(`WASM ${node.opType} node ${node.id} requires typed [...,d_in] input/output, [d_out,d_in] I8/U8 weights, and I32 bias.`);
-  }
-  const dIn = input.shape.at(-1);
-  const dOut = output.shape.at(-1);
-  const rows = inputElements / dIn;
-  if (!Number.isInteger(rows) || rows <= 0 || !Number.isInteger(dIn) || dIn <= 0 ||
-      !Number.isInteger(dOut) || dOut <= 0 || inputElements !== rows * dIn ||
-      outputElements !== rows * dOut || !sameShape(weight.shape, [dOut, dIn]) ||
-      weightElements !== dOut * dIn || !sameShape(bias.shape, [dOut]) || biasElements !== dOut) {
-    throw new Error(`WASM ${node.opType} node ${node.id} has incompatible [d_out,d_in] dimensions or I32 bias.`);
-  }
-  const inputQuantization = immutableQuantizationDescriptor(input);
-  const outputQuantization = immutableQuantizationDescriptor(output);
-  const weightQuantization = immutableQuantizationDescriptor(weight);
-  if (!inputQuantization || !outputQuantization || !weightQuantization) {
-    throw new Error(`WASM ${node.opType} node ${node.id} requires immutable I8/U8 quantization metadata.`);
-  }
-  if (inputQuantization.scheme !== 'per_tensor' || outputQuantization.scheme !== 'per_tensor' ||
-      weightQuantization.scheme !== 'per_axis' || weightQuantization.axis !== 0 ||
-      weightQuantization.scales.length !== dOut || weightQuantization.zero_points.length !== dOut) {
-    throw new Error(`WASM ${node.opType} node ${node.id} requires per-tensor input/output and axis-0 per-channel weight quantization.`);
-  }
-  const f32Scale = (value) => Math.fround(value);
-  const inputScale = f32Scale(inputQuantization.scale);
-  const outputScale = f32Scale(outputQuantization.scale);
-  const weightScales = Float32Array.from(weightQuantization.scales, f32Scale);
-  if (!Number.isFinite(inputScale) || inputScale <= 0 || !Number.isFinite(outputScale) ||
-      outputScale <= 0 || !weightScales.every((scale) => Number.isFinite(scale) && scale > 0)) {
-    throw new Error(`WASM ${node.opType} node ${node.id} requires scales representable as positive F32.`);
-  }
-  if (!weightScales.every((scale) => {
-    const multiplier = Math.fround(Math.fround(inputScale * scale) / outputScale);
-    return Number.isFinite(multiplier) && multiplier > 0;
-  })) {
-    throw new Error(
-      `WASM ${node.opType} node ${node.id} requantization multiplier is not representable as positive F32.`,
-    );
-  }
-  return {
-    kind: 'qlinear', input, weight, bias, output, rows, dIn, dOut,
-    inputDtype: wasmDtypeCode(input.dtype), weightDtype: wasmDtypeCode(weight.dtype),
-    outputDtype: wasmDtypeCode(output.dtype), inputScale, outputScale,
-    inputZeroPoint: inputQuantization.zero_point, outputZeroPoint: outputQuantization.zero_point,
-    weightScales, weightZeroPoints: Int32Array.from(weightQuantization.zero_points),
-  };
-}
 
-function portableQEmbeddingDescriptor(node) {
-  if (node.opType !== 'QEmbedding') return null;
-  const input = node.inputs.input;
-  const weight = node.inputs.weight;
-  const output = portableOutput(node);
-  const inputElements = portableTensorElements(input);
-  const weightElements = portableTensorElements(weight);
-  const outputElements = portableTensorElements(output);
-  const outputCount = Object.values(node.outputs || {}).filter(Boolean).length;
-  if (Object.keys(node.inputs || {}).length !== 2 || !input || !weight || outputCount !== 1 ||
-      input.dtype !== 'int32' || inputElements == null || input.shape.length < 1 ||
-      !portableByteQuantizedTensor(weight) || !portableByteQuantizedTensor(output) ||
-      weightElements == null || outputElements == null || weight.shape.length !== 2) {
-    throw new Error(`WASM QEmbedding node ${node.id} requires preflight-complete I32 [...token] IDs, rank-2 I8/U8 [vocab,hidden] weights, and an I8/U8 output.`);
-  }
-  const [vocab, hidden] = weight.shape;
-  const expectedOutputShape = [...input.shape, hidden];
-  if (!Number.isInteger(vocab) || vocab <= 0 || !Number.isInteger(hidden) || hidden <= 0 ||
-      !sameShape(output.shape, expectedOutputShape) || weightElements !== vocab * hidden ||
-      outputElements !== inputElements * hidden) {
-    throw new Error(`WASM QEmbedding node ${node.id} has incompatible ID, [vocab,hidden] weight, or output dimensions.`);
-  }
-  const outputQuantization = immutableQuantizationDescriptor(output);
-  const weightQuantization = immutableQuantizationDescriptor(weight);
-  if (!outputQuantization || !weightQuantization || outputQuantization.scheme !== 'per_tensor' ||
-      weightQuantization.scheme !== 'per_axis' || weightQuantization.axis !== 0 ||
-      weightQuantization.scales.length !== vocab || weightQuantization.zero_points.length !== vocab) {
-    throw new Error(`WASM QEmbedding node ${node.id} requires immutable per-tensor output and axis-0 per-row weight quantization metadata.`);
-  }
-  const outputScale = Math.fround(outputQuantization.scale);
-  const weightScales = Float32Array.from(weightQuantization.scales, Math.fround);
-  if (!Number.isFinite(outputScale) || outputScale <= 0 ||
-      !weightScales.every((scale) => Number.isFinite(scale) && scale > 0)) {
-    throw new Error(`WASM QEmbedding node ${node.id} requires scales representable as positive F32.`);
-  }
-  return {
-    kind: 'qembedding', input, weight, output, tokens: inputElements, vocab, hidden,
-    weightDtype: wasmDtypeCode(weight.dtype), outputDtype: wasmDtypeCode(output.dtype),
-    outputScale, outputZeroPoint: outputQuantization.zero_point,
-    weightScales, weightZeroPoints: Int32Array.from(weightQuantization.zero_points),
-  };
-}
 
-function portableQAddDescriptor(node) {
-  if (node.opType !== 'QAdd') return null;
-  const a = node.inputs.a || node.inputs.input || node.inputs.x;
-  const b = node.inputs.b || node.inputs.y;
-  const output = portableOutput(node);
-  const elements = portableTensorElements(output);
-  const relu = node.params?.relu ?? 0;
-  if (!portableByteQuantizedTensor(a) || !portableByteQuantizedTensor(b) ||
-      !portableByteQuantizedTensor(output) || elements == null ||
-      portableTensorElements(a) !== elements || portableTensorElements(b) !== elements ||
-      !sameShape(a.shape, b.shape) || !sameShape(a.shape, output.shape) ||
-      !Number.isInteger(relu) || relu < 0 || relu > 2) {
-    throw new Error(`WASM QAdd node ${node.id} requires exact-shape I8/U8 input/output tensors.`);
-  }
-  const aQuantization = immutableQuantizationDescriptor(a);
-  const bQuantization = immutableQuantizationDescriptor(b);
-  const outputQuantization = immutableQuantizationDescriptor(output);
-  if (!aQuantization || !bQuantization || !outputQuantization ||
-      aQuantization.scheme !== 'per_tensor' || bQuantization.scheme !== 'per_tensor' ||
-      outputQuantization.scheme !== 'per_tensor') {
-    throw new Error(`WASM QAdd node ${node.id} requires immutable per-tensor I8/U8 quantization metadata.`);
-  }
-  const aScale = Math.fround(aQuantization.scale);
-  const bScale = Math.fround(bQuantization.scale);
-  const outputScale = Math.fround(outputQuantization.scale);
-  if (![aScale, bScale, outputScale].every((scale) => Number.isFinite(scale) && scale > 0)) {
-    throw new Error(`WASM QAdd node ${node.id} requires scales representable as positive F32.`);
-  }
-  return {
-    kind: 'qadd', a, b, output, elements,
-    aDtype: wasmDtypeCode(a.dtype), bDtype: wasmDtypeCode(b.dtype),
-    outputDtype: wasmDtypeCode(output.dtype),
-    aScale, bScale, outputScale,
-    aZeroPoint: aQuantization.zero_point, bZeroPoint: bQuantization.zero_point,
-    outputZeroPoint: outputQuantization.zero_point, relu,
-  };
-}
 
-function portableQSiLUDescriptor(node) {
-  if (node.opType !== 'QSiLU') return null;
-  const input = node.inputs.input || node.inputs.x || node.inputs.data;
-  const output = portableOutput(node);
-  const inputEntries = Object.entries(node.inputs || {}).filter(([, tensor]) => !!tensor);
-  const outputEntries = Object.values(node.outputs || {}).filter(Boolean);
-  const inputElements = portableTensorElements(input);
-  const outputElements = portableTensorElements(output);
-  if (!input || !output || inputEntries.length !== 1 || inputEntries[0][1] !== input ||
-      outputEntries.length !== 1 || input === output || !portableByteQuantizedTensor(input) ||
-      !portableByteQuantizedTensor(output) || inputElements == null ||
-      outputElements !== inputElements || !sameShape(input.shape, output.shape) ||
-      Object.keys(node.params || {}).length !== 0) {
-    throw new Error(`WASM QSiLU node ${node.id} requires distinct same-shape I8/U8 input/output tensors and no parameters.`);
-  }
-  const inputQuantization = immutableQuantizationDescriptor(input);
-  const outputQuantization = immutableQuantizationDescriptor(output);
-  if (!inputQuantization || !outputQuantization || inputQuantization.scheme !== 'per_tensor' ||
-      outputQuantization.scheme !== 'per_tensor') {
-    throw new Error(`WASM QSiLU node ${node.id} requires immutable per-tensor I8/U8 quantization metadata.`);
-  }
-  const inputScale = Math.fround(inputQuantization.scale);
-  const outputScale = Math.fround(outputQuantization.scale);
-  if (!Number.isFinite(inputScale) || inputScale <= 0 || !Number.isFinite(outputScale) || outputScale <= 0) {
-    throw new Error(`WASM QSiLU node ${node.id} requires scales representable as positive F32.`);
-  }
-  return {
-    kind: 'qsilu', input, output, elements: inputElements,
-    inputDtype: wasmDtypeCode(input.dtype), outputDtype: wasmDtypeCode(output.dtype),
-    inputScale, outputScale,
-    inputZeroPoint: inputQuantization.zero_point, outputZeroPoint: outputQuantization.zero_point,
-  };
-}
 
-function portableQGELUDescriptor(node) {
-  if (node.opType !== 'QGELU') return null;
-  const input = node.inputs.input || node.inputs.x || node.inputs.data;
-  const output = portableOutput(node);
-  const inputEntries = Object.entries(node.inputs || {}).filter(([, tensor]) => !!tensor);
-  const outputEntries = Object.values(node.outputs || {}).filter(Boolean);
-  const inputElements = portableTensorElements(input);
-  const outputElements = portableTensorElements(output);
-  const parameterNames = Object.keys(node.params || {});
-  const canonicalParameters = parameterNames.length === 0 ||
-    (parameterNames.length === 1 && parameterNames[0] === 'approximate' &&
-      node.params.approximate === 'none');
-  if (!input || !output || inputEntries.length !== 1 || inputEntries[0][1] !== input ||
-      outputEntries.length !== 1 || input === output || !portableByteQuantizedTensor(input) ||
-      !portableByteQuantizedTensor(output) || inputElements == null ||
-      outputElements !== inputElements || !sameShape(input.shape, output.shape) ||
-      !canonicalParameters) {
-    throw new Error(`WASM QGELU node ${node.id} requires distinct same-shape I8/U8 input/output tensors and only omitted parameters or approximate='none'.`);
-  }
-  const inputQuantization = immutableQuantizationDescriptor(input);
-  const outputQuantization = immutableQuantizationDescriptor(output);
-  if (!inputQuantization || !outputQuantization || inputQuantization.scheme !== 'per_tensor' ||
-      outputQuantization.scheme !== 'per_tensor') {
-    throw new Error(`WASM QGELU node ${node.id} requires immutable per-tensor I8/U8 quantization metadata.`);
-  }
-  const inputScale = Math.fround(inputQuantization.scale);
-  const outputScale = Math.fround(outputQuantization.scale);
-  if (!Number.isFinite(inputScale) || inputScale <= 0 || !Number.isFinite(outputScale) || outputScale <= 0) {
-    throw new Error(`WASM QGELU node ${node.id} requires scales representable as positive F32.`);
-  }
-  return {
-    kind: 'qgelu', input, output, elements: inputElements,
-    inputDtype: wasmDtypeCode(input.dtype), outputDtype: wasmDtypeCode(output.dtype),
-    inputScale, outputScale,
-    inputZeroPoint: inputQuantization.zero_point, outputZeroPoint: outputQuantization.zero_point,
-  };
-}
 
-function qGroupNormByteStorageIsCanonical(tensor) {
-  if (!tensor || tensor.buffer == null) return true;
-  const storage = tensor.buffer;
-  const matches = tensor.dtype === 'int8'
-    ? storage instanceof Int8Array
-    : tensor.dtype === 'uint8' && (storage instanceof Uint8Array || storage instanceof Uint8ClampedArray);
-  return matches && storage.byteLength === tensor.sizeBytes;
-}
 
-function qGroupNormAffineStorageIsCanonical(tensor) {
-  if (!tensor || tensor.buffer == null) return true;
-  const storage = tensor.buffer;
-  return storage instanceof Float32Array && storage.byteLength === tensor.sizeBytes &&
-    storage.length === tensor.sizeBytes / Float32Array.BYTES_PER_ELEMENT;
-}
 
-function qGroupNormStorageRangesOverlap(left, right) {
-  const leftStorage = left?.buffer;
-  const rightStorage = right?.buffer;
-  if (!ArrayBuffer.isView(leftStorage) || leftStorage instanceof DataView ||
-      !ArrayBuffer.isView(rightStorage) || rightStorage instanceof DataView ||
-      leftStorage.buffer !== rightStorage.buffer) return false;
-  const leftStart = leftStorage.byteOffset;
-  const leftEnd = leftStart + leftStorage.byteLength;
-  const rightStart = rightStorage.byteOffset;
-  const rightEnd = rightStart + rightStorage.byteLength;
-  return leftStart < rightEnd && rightStart < leftEnd;
-}
 
-// Do this before `_alloc` converts every tensor to a fresh WASM typed view.
-// It preserves the portable operator's typed-storage and no-overlap contract
-// for graph inputs supplied as ArrayBuffer views, while still allowing normal
-// unallocated graph values to receive their expected typed storage.
-function preflightPortableQGroupNormStorage(node) {
-  if (node.opType !== 'QGroupNorm') return;
-  const input = node.inputs?.input;
-  const weight = node.inputs?.weight;
-  const bias = node.inputs?.bias;
-  const output = node.outputs?.out || Object.values(node.outputs || {})[0];
-  if (!qGroupNormByteStorageIsCanonical(input) || !qGroupNormByteStorageIsCanonical(output) ||
-      !qGroupNormAffineStorageIsCanonical(weight) || !qGroupNormAffineStorageIsCanonical(bias) ||
-      qGroupNormStorageRangesOverlap(input, output) ||
-      qGroupNormStorageRangesOverlap(weight, output) ||
-      qGroupNormStorageRangesOverlap(bias, output)) {
-    throw new Error(`WASM QGroupNorm node ${node.id} requires canonical typed input/output storage, finite F32 [C] affine storage, and output storage distinct from every input.`);
-  }
-}
 
-function portableQGroupNormDescriptor(node, affineValues = (tensor) => tensor?.buffer) {
-  if (node.opType !== 'QGroupNorm') return null;
-  const inputNames = Object.keys(node.inputs || {}).sort();
-  const outputNames = Object.keys(node.outputs || {});
-  const input = node.inputs?.input;
-  const weight = node.inputs?.weight;
-  const bias = node.inputs?.bias;
-  const output = node.outputs?.out || Object.values(node.outputs || {})[0];
-  const inputElements = portableTensorElements(input);
-  const outputElements = portableTensorElements(output);
-  const params = node.params;
-  const paramsAreObject = params == null || (typeof params === 'object' && !Array.isArray(params));
-  const parameterNames = paramsAreObject ? Object.keys(params || {}) : [];
-  const allowedParameters = paramsAreObject && parameterNames.every((name) =>
-    ['num_groups', 'eps', 'data_layout'].includes(name));
-  const groups = params?.num_groups;
-  const epsilonSource = params?.eps ?? 1e-5;
-  const epsilon = Math.fround(epsilonSource);
-  const [batch, height, width, channels] = input?.shape || [];
-  const validAffine = (tensor) => {
-    const values = affineValues(tensor);
-    return portableF32Tensor(tensor) && sameShape(tensor.shape, [channels]) &&
-      tensor.sizeBytes === channels * Float32Array.BYTES_PER_ELEMENT &&
-      values instanceof Float32Array && values.length === channels &&
-      (tensor.isWeight !== true || values.every(Number.isFinite));
-  };
 
-  if (inputNames.length !== 3 || inputNames[0] !== 'bias' || inputNames[1] !== 'input' ||
-      inputNames[2] !== 'weight' || outputNames.length !== 1 || !input || !weight || !bias || !output ||
-      input === output || weight === output || bias === output || !portableByteQuantizedTensor(input) ||
-      !portableByteQuantizedTensor(output) || inputElements == null || outputElements !== inputElements ||
-      input.shape.length !== 4 || !sameShape(input.shape, output.shape) || !allowedParameters ||
-      !Number.isInteger(groups) || groups <= 0 || !Number.isInteger(channels) || channels <= 0 ||
-      channels % groups !== 0 || (params?.data_layout != null && params.data_layout !== 'NHWC') ||
-      typeof epsilonSource !== 'number' || !Number.isFinite(epsilonSource) ||
-      !Number.isFinite(epsilon) || epsilon <= 0 || !validAffine(weight) || !validAffine(bias)) {
-    throw new Error(`WASM QGroupNorm node ${node.id} requires exact input/weight/bias inputs, matching rank-4 NHWC I8/U8 activation tensors, finite F32 [C] affine tensors, and positive num_groups/eps parameters.`);
-  }
 
-  const inputQuantization = immutableQuantizationDescriptor(input);
-  const outputQuantization = immutableQuantizationDescriptor(output);
-  if (!inputQuantization || !outputQuantization || inputQuantization.scheme !== 'per_tensor' ||
-      outputQuantization.scheme !== 'per_tensor') {
-    throw new Error(`WASM QGroupNorm node ${node.id} requires immutable per-tensor I8/U8 quantization metadata.`);
-  }
-  const inputScale = Math.fround(inputQuantization.scale);
-  const outputScale = Math.fround(outputQuantization.scale);
-  if (!Number.isFinite(inputScale) || inputScale <= 0 ||
-      !Number.isFinite(outputScale) || outputScale <= 0) {
-    throw new Error(`WASM QGroupNorm node ${node.id} requires scales representable as positive F32.`);
-  }
-  return {
-    kind: 'qgroupnorm', input, weight, bias, output,
-    batch, height, width, channels, groups, inputScale, outputScale, epsilon,
-    inputZeroPoint: inputQuantization.zero_point, outputZeroPoint: outputQuantization.zero_point,
-    inputDtype: wasmDtypeCode(input.dtype), outputDtype: wasmDtypeCode(output.dtype),
-  };
-}
 
-function qLayerNormByteStorageIsCanonical(tensor) {
-  if (!tensor || tensor.buffer == null) return true;
-  const storage = tensor.buffer;
-  const matches = tensor.dtype === 'int8'
-    ? storage instanceof Int8Array
-    : tensor.dtype === 'uint8' && (storage instanceof Uint8Array || storage instanceof Uint8ClampedArray);
-  return matches && storage.byteLength === tensor.sizeBytes;
-}
 
-function qLayerNormAffineStorageIsCanonical(tensor) {
-  if (!tensor || tensor.buffer == null) return true;
-  const storage = tensor.buffer;
-  return storage instanceof Float32Array && storage.byteLength === tensor.sizeBytes &&
-    storage.length === tensor.sizeBytes / Float32Array.BYTES_PER_ELEMENT;
-}
 
-function qLayerNormStorageRangesOverlap(left, right) {
-  const leftStorage = left?.buffer;
-  const rightStorage = right?.buffer;
-  if (!ArrayBuffer.isView(leftStorage) || leftStorage instanceof DataView ||
-      !ArrayBuffer.isView(rightStorage) || rightStorage instanceof DataView ||
-      leftStorage.buffer !== rightStorage.buffer) return false;
-  const leftStart = leftStorage.byteOffset;
-  const leftEnd = leftStart + leftStorage.byteLength;
-  const rightStart = rightStorage.byteOffset;
-  const rightEnd = rightStart + rightStorage.byteLength;
-  return leftStart < rightEnd && rightStart < leftEnd;
-}
 
-// Preserve the source-storage contract before `_alloc` gives every tensor a
-// separate WASM heap view. This keeps direct graph aliases and raw ArrayBuffer
-// affine storage from being hidden by the copy into linear WASM memory.
-function preflightPortableQLayerNormStorage(node) {
-  if (node.opType !== 'QLayerNorm') return;
-  const input = node.inputs?.input;
-  const weight = node.inputs?.weight;
-  const bias = node.inputs?.bias;
-  const output = node.outputs?.out || Object.values(node.outputs || {})[0];
-  if (!qLayerNormByteStorageIsCanonical(input) || !qLayerNormByteStorageIsCanonical(output) ||
-      !qLayerNormAffineStorageIsCanonical(weight) || !qLayerNormAffineStorageIsCanonical(bias) ||
-      qLayerNormStorageRangesOverlap(input, output) ||
-      qLayerNormStorageRangesOverlap(weight, output) ||
-      qLayerNormStorageRangesOverlap(bias, output)) {
-    throw new Error(`WASM QLayerNorm node ${node.id} requires canonical typed input/output storage, finite F32 [D] affine storage, and output storage distinct from every input.`);
-  }
-}
 
-function portableQLayerNormDescriptor(node, affineValues = (tensor) => tensor?.buffer) {
-  if (node.opType !== 'QLayerNorm') return null;
-  const inputNames = Object.keys(node.inputs || {}).sort();
-  const outputNames = Object.keys(node.outputs || {});
-  const input = node.inputs?.input;
-  const weight = node.inputs?.weight;
-  const bias = node.inputs?.bias;
-  const output = node.outputs?.out || Object.values(node.outputs || {})[0];
-  const inputElements = portableTensorElements(input);
-  const outputElements = portableTensorElements(output);
-  const params = node.params;
-  const paramsAreObject = params == null || (typeof params === 'object' && !Array.isArray(params));
-  const parameterNames = paramsAreObject ? Object.keys(params || {}) : [];
-  const allowedParameters = paramsAreObject && parameterNames.every((name) =>
-    ['eps', 'd_model'].includes(name));
-  const epsilonSource = params?.eps ?? 1e-5;
-  const epsilon = Math.fround(epsilonSource);
-  const dModel = input?.shape?.at(-1);
-  const validAffine = (tensor) => {
-    const values = affineValues(tensor);
-    return portableF32Tensor(tensor) && sameShape(tensor.shape, [dModel]) &&
-      tensor.sizeBytes === dModel * Float32Array.BYTES_PER_ELEMENT &&
-      values instanceof Float32Array && values.length === dModel &&
-      (tensor.isWeight !== true || values.every(Number.isFinite));
-  };
 
-  if (inputNames.length !== 3 || inputNames[0] !== 'bias' || inputNames[1] !== 'input' ||
-      inputNames[2] !== 'weight' || outputNames.length !== 1 || !input || !weight || !bias || !output ||
-      input === output || weight === output || bias === output || !portableByteQuantizedTensor(input) ||
-      !portableByteQuantizedTensor(output) || inputElements == null || outputElements !== inputElements ||
-      input.shape.length < 1 || !sameShape(input.shape, output.shape) || !allowedParameters ||
-      !Number.isInteger(dModel) || dModel <= 0 ||
-      (params?.d_model != null && (!Number.isInteger(params.d_model) || params.d_model !== dModel)) ||
-      typeof epsilonSource !== 'number' || !Number.isFinite(epsilonSource) ||
-      !Number.isFinite(epsilon) || epsilon <= 0 || !validAffine(weight) || !validAffine(bias)) {
-    throw new Error(`WASM QLayerNorm node ${node.id} requires exact input/weight/bias inputs, matching rank-at-least-1 I8/U8 activation tensors, finite F32 [D] affine tensors, and positive eps with optional d_model matching D.`);
-  }
 
-  const rows = inputElements / dModel;
-  if (!Number.isInteger(rows) || rows <= 0 || rows > WASM_PORTABLE_MAX_U32 ||
-      inputElements !== rows * dModel) {
-    throw new Error(`WASM QLayerNorm node ${node.id} has an invalid contiguous [...,D] row layout.`);
-  }
-  const inputQuantization = immutableQuantizationDescriptor(input);
-  const outputQuantization = immutableQuantizationDescriptor(output);
-  if (!inputQuantization || !outputQuantization || inputQuantization.scheme !== 'per_tensor' ||
-      outputQuantization.scheme !== 'per_tensor') {
-    throw new Error(`WASM QLayerNorm node ${node.id} requires immutable per-tensor I8/U8 quantization metadata.`);
-  }
-  const inputScale = Math.fround(inputQuantization.scale);
-  const outputScale = Math.fround(outputQuantization.scale);
-  if (!Number.isFinite(inputScale) || inputScale <= 0 ||
-      !Number.isFinite(outputScale) || outputScale <= 0) {
-    throw new Error(`WASM QLayerNorm node ${node.id} requires scales representable as positive F32.`);
-  }
-  return {
-    kind: 'qlayernorm', input, weight, bias, output, rows, dModel, inputScale, outputScale, epsilon,
-    inputZeroPoint: inputQuantization.zero_point, outputZeroPoint: outputQuantization.zero_point,
-    inputDtype: wasmDtypeCode(input.dtype), outputDtype: wasmDtypeCode(output.dtype),
-  };
-}
 
-function qSDPAByteStorageIsCanonical(tensor) {
-  if (!tensor || tensor.buffer == null) return true;
-  const storage = tensor.buffer;
-  const matches = tensor.dtype === 'int8'
-    ? storage instanceof Int8Array
-    : tensor.dtype === 'uint8' && (storage instanceof Uint8Array || storage instanceof Uint8ClampedArray);
-  return matches && storage.byteLength === tensor.sizeBytes;
-}
 
-function qSDPAInt32StorageIsCanonical(tensor) {
-  if (!tensor || tensor.buffer == null) return true;
-  return tensor.buffer instanceof Int32Array && tensor.buffer.byteLength === tensor.sizeBytes;
-}
 
-function qSDPAStorageRangesOverlap(left, right) {
-  const leftStorage = left?.buffer;
-  const rightStorage = right?.buffer;
-  if (!ArrayBuffer.isView(leftStorage) || leftStorage instanceof DataView ||
-      !ArrayBuffer.isView(rightStorage) || rightStorage instanceof DataView ||
-      leftStorage.buffer !== rightStorage.buffer) return false;
-  const leftStart = leftStorage.byteOffset;
-  const leftEnd = leftStart + leftStorage.byteLength;
-  const rightStart = rightStorage.byteOffset;
-  const rightEnd = rightStart + rightStorage.byteLength;
-  return leftStart < rightEnd && rightStart < leftEnd;
-}
 
-// Keep source alias checks before `_alloc` gives every tensor a fresh linear
-// WASM view. Without this, overlapping graph views would be hidden by copies
-// before qsdpa_i8u8 can preserve its no-partial-write boundary.
-function preflightPortableQSDPAStorage(node) {
-  if (node.opType !== 'QSDPA') return;
-  const q = node.inputs?.q;
-  const k = node.inputs?.k;
-  const v = node.inputs?.v;
-  const mask = node.inputs?.mask || null;
-  const output = node.outputs?.out || Object.values(node.outputs || {})[0];
-  if (!qSDPAByteStorageIsCanonical(q) || !qSDPAByteStorageIsCanonical(k) ||
-      !qSDPAByteStorageIsCanonical(v) || !qSDPAByteStorageIsCanonical(output) ||
-      (mask && !qSDPAInt32StorageIsCanonical(mask)) || qSDPAStorageRangesOverlap(q, output) ||
-      qSDPAStorageRangesOverlap(k, output) || qSDPAStorageRangesOverlap(v, output) ||
-      (mask && qSDPAStorageRangesOverlap(mask, output))) {
-    throw new Error(`WASM QSDPA node ${node.id} requires canonical typed q/k/v/output storage, optional I32 mask storage, and output storage distinct from every input.`);
-  }
-}
 
-function portableQSDPADescriptor(node) {
-  if (node.opType !== 'QSDPA') return null;
-  const inputNames = Object.keys(node.inputs || {}).sort();
-  const outputNames = Object.keys(node.outputs || {});
-  const q = node.inputs?.q;
-  const k = node.inputs?.k;
-  const v = node.inputs?.v;
-  const hasMask = Object.prototype.hasOwnProperty.call(node.inputs || {}, 'mask');
-  const mask = node.inputs?.mask;
-  const output = node.outputs?.out || Object.values(node.outputs || {})[0];
-  const qElements = portableTensorElements(q);
-  const kElements = portableTensorElements(k);
-  const vElements = portableTensorElements(v);
-  const outputElements = portableTensorElements(output);
-  const maskElements = hasMask ? portableTensorElements(mask) : 0;
-  const params = node.params;
-  const paramsAreObject = params != null && typeof params === 'object' && !Array.isArray(params);
-  const parameterNames = paramsAreObject ? Object.keys(params) : [];
-  const allowedParameters = paramsAreObject && parameterNames.every((name) =>
-    ['heads', 'causal', 'scale'].includes(name));
-  const rank = q?.shape?.length;
-  const batch = rank === 2 ? 1 : q?.shape?.[0];
-  const seqQ = q?.shape?.[rank - 2];
-  const seqKV = k?.shape?.[rank - 2];
-  const dModel = q?.shape?.[rank - 1];
-  const heads = params?.heads;
-  const headDim = dModel / heads;
-  const scaleSource = params?.scale ?? 1 / Math.sqrt(headDim);
-  const attentionScale = Math.fround(scaleSource);
-  const exactInputs = (inputNames.length === 3 && inputNames[0] === 'k' && inputNames[1] === 'q' &&
-    inputNames[2] === 'v') || (inputNames.length === 4 && inputNames[0] === 'k' &&
-    inputNames[1] === 'mask' && inputNames[2] === 'q' && inputNames[3] === 'v');
-  if (!exactInputs || outputNames.length !== 1 || !q || !k || !v || !output ||
-      output === q || output === k || output === v || output === mask ||
-      !portableByteQuantizedTensor(q) || !portableByteQuantizedTensor(k) ||
-      !portableByteQuantizedTensor(v) || !portableByteQuantizedTensor(output) ||
-      qElements == null || kElements == null || vElements == null || outputElements == null ||
-      (hasMask && (mask?.dtype !== 'int32' || maskElements == null)) ||
-      (rank !== 2 && rank !== 3) || k.shape.length !== rank || v.shape.length !== rank ||
-      output.shape.length !== rank || !sameShape(q.shape, output.shape) || !allowedParameters ||
-      !Object.prototype.hasOwnProperty.call(params || {}, 'heads') ||
-      !Number.isInteger(heads) || heads <= 0 ||
-      !Object.prototype.hasOwnProperty.call(params || {}, 'causal') || typeof params?.causal !== 'boolean' ||
-      !Number.isInteger(headDim) || headDim <= 0 || dModel % 4 !== 0 || headDim % 4 !== 0 ||
-      headDim > 64 || typeof scaleSource !== 'number' || !Number.isFinite(scaleSource) ||
-      scaleSource <= 0 || !Number.isFinite(attentionScale) || attentionScale <= 0) {
-    throw new Error(`WASM QSDPA node ${node.id} requires exact q/k/v and optional I32 mask inputs, rank-2/3 I8/U8 tensors, D/head dimensions divisible by 4 with head_dim <= 64, and explicit heads/causal.`);
-  }
 
-  const kBatch = rank === 2 ? 1 : k.shape[0];
-  const vBatch = rank === 2 ? 1 : v.shape[0];
-  if (kBatch !== batch || vBatch !== batch || k.shape[rank - 1] !== dModel ||
-      v.shape[rank - 1] !== dModel || v.shape[rank - 2] !== seqKV ||
-      qElements !== batch * seqQ * dModel || kElements !== batch * seqKV * dModel ||
-      vElements !== batch * seqKV * dModel || outputElements !== qElements) {
-    throw new Error(`WASM QSDPA node ${node.id} has incompatible Q/K/V/output dimensions.`);
-  }
 
-  let maskMode = 0;
-  if (hasMask) {
-    if (mask.shape.length === 1 && mask.shape[0] === seqKV) maskMode = 1;
-    // Preserve established B,K precedence if B and Q have the same value.
-    else if (mask.shape.length === 2 && mask.shape[1] === seqKV && mask.shape[0] === batch) maskMode = 2;
-    else if (mask.shape.length === 2 && mask.shape[1] === seqKV && mask.shape[0] === seqQ) maskMode = 3;
-    else if (mask.shape.length === 3 && mask.shape[0] === batch && mask.shape[1] === seqQ &&
-        mask.shape[2] === seqKV) maskMode = 4;
-    else throw new Error(`WASM QSDPA node ${node.id} mask requires I32 [K], [B,K], [Q,K], or [B,Q,K] storage.`);
-  }
 
-  const qQuantization = immutableQuantizationDescriptor(q);
-  const kQuantization = immutableQuantizationDescriptor(k);
-  const vQuantization = immutableQuantizationDescriptor(v);
-  const outputQuantization = immutableQuantizationDescriptor(output);
-  if (!qQuantization || !kQuantization || !vQuantization || !outputQuantization ||
-      qQuantization.scheme !== 'per_tensor' || kQuantization.scheme !== 'per_tensor' ||
-      vQuantization.scheme !== 'per_tensor' || outputQuantization.scheme !== 'per_tensor') {
-    throw new Error(`WASM QSDPA node ${node.id} requires immutable per-tensor I8/U8 quantization metadata.`);
-  }
-  const qScale = Math.fround(qQuantization.scale);
-  const kScale = Math.fround(kQuantization.scale);
-  const vScale = Math.fround(vQuantization.scale);
-  const outputScale = Math.fround(outputQuantization.scale);
-  const scoreMultiplier = Math.fround(Math.fround(qScale * kScale) * attentionScale);
-  const maximumCenteredMagnitude = (tensor, descriptor) => {
-    const minimum = tensor.dtype === 'int8' ? -128 : 0;
-    const maximum = tensor.dtype === 'int8' ? 127 : 255;
-    return Math.max(Math.abs(minimum - descriptor.zero_point), Math.abs(maximum - descriptor.zero_point));
-  };
-  const maximumRawDot = headDim * maximumCenteredMagnitude(q, qQuantization) *
-    maximumCenteredMagnitude(k, kQuantization);
-  const maximumScore = Math.fround(Math.fround(maximumRawDot) * scoreMultiplier);
-  if (![qScale, kScale, vScale, outputScale, scoreMultiplier].every((value) =>
-    Number.isFinite(value) && value > 0) || !Number.isFinite(maximumScore)) {
-    throw new Error(`WASM QSDPA node ${node.id} requires scales and score range representable as finite positive F32.`);
-  }
-  return {
-    kind: 'qsdpa', q, k, v, mask: hasMask ? mask : null, output, batch, seqQ, seqKV, dModel, heads,
-    headDim, maskMode, causal: params.causal ? 1 : 0, qScale, kScale, vScale, outputScale,
-    attentionScale, qZeroPoint: qQuantization.zero_point, kZeroPoint: kQuantization.zero_point,
-    vZeroPoint: vQuantization.zero_point, outputZeroPoint: outputQuantization.zero_point,
-    qDtype: wasmDtypeCode(q.dtype), kDtype: wasmDtypeCode(k.dtype),
-    vDtype: wasmDtypeCode(v.dtype), outputDtype: wasmDtypeCode(output.dtype),
-  };
-}
 
-function qArgMaxByteStorageIsCanonical(tensor) {
-  if (!tensor || tensor.buffer == null) return true;
-  const storage = tensor.buffer;
-  const matches = tensor.dtype === 'int8'
-    ? storage instanceof Int8Array
-    : tensor.dtype === 'uint8' && (storage instanceof Uint8Array || storage instanceof Uint8ClampedArray);
-  return matches && storage.byteLength === tensor.sizeBytes;
-}
-
-function qArgMaxInt32StorageIsCanonical(tensor) {
-  if (!tensor || tensor.buffer == null) return true;
-  return tensor.buffer instanceof Int32Array && tensor.buffer.byteLength === tensor.sizeBytes;
-}
-
-function qArgMaxStorageRangesOverlap(left, right) {
-  const leftStorage = left?.buffer;
-  const rightStorage = right?.buffer;
-  if (!ArrayBuffer.isView(leftStorage) || leftStorage instanceof DataView ||
-      !ArrayBuffer.isView(rightStorage) || rightStorage instanceof DataView ||
-      leftStorage.buffer !== rightStorage.buffer) return false;
-  const leftStart = leftStorage.byteOffset;
-  const leftEnd = leftStart + leftStorage.byteLength;
-  const rightStart = rightStorage.byteOffset;
-  const rightEnd = rightStart + rightStorage.byteLength;
-  return leftStart < rightEnd && rightStart < leftEnd;
-}
-
-// Preserve the native kernel's no-partial-write contract before per-tensor
-// WASM allocation turns overlapping source views into independent copies.
-function preflightPortableQArgMaxStorage(node) {
-  if (node.opType !== 'QArgMax') return;
-  const input = node.inputs?.input;
-  const output = node.outputs?.out;
-  if (!qArgMaxByteStorageIsCanonical(input) || !qArgMaxInt32StorageIsCanonical(output) ||
-      qArgMaxStorageRangesOverlap(input, output)) {
-    throw new Error(`WASM QArgMax node ${node.id} requires canonical I8/U8 input and I32 output storage distinct from input storage.`);
-  }
-}
-
-function portableQArgMaxDescriptor(node) {
-  if (node.opType !== 'QArgMax') return null;
-  const inputNames = Object.keys(node.inputs || {});
-  const outputNames = Object.keys(node.outputs || {});
-  const input = node.inputs?.input;
-  const output = node.outputs?.out;
-  const inputElements = portableTensorElements(input);
-  const outputElements = portableTensorElements(output);
-  const params = node.params;
-  const paramsAreExact = params != null && typeof params === 'object' && !Array.isArray(params) &&
-    Object.keys(params).length === 1 && Object.prototype.hasOwnProperty.call(params, 'axis') &&
-    Number.isInteger(params.axis);
-  const rank = input?.shape?.length;
-  let axis = params?.axis;
-  if (axis < 0) axis += rank;
-  const outer = Number.isInteger(axis) ? portableElementCount(input?.shape?.slice(0, axis)) : null;
-  const inner = Number.isInteger(axis) ? portableElementCount(input?.shape?.slice(axis + 1)) : null;
-  const axisSize = input?.shape?.[axis];
-  const expectedOutputShape = Number.isInteger(axis) && Array.isArray(input?.shape)
-    ? [...input.shape.slice(0, axis), ...input.shape.slice(axis + 1)] : null;
-  const inputQuantization = immutableQuantizationDescriptor(input);
-  const inputScale = Math.fround(inputQuantization?.scale);
-  if (inputNames.length !== 1 || inputNames[0] !== 'input' || outputNames.length !== 1 ||
-      outputNames[0] !== 'out' || !input || !output || input === output ||
-      !portableByteQuantizedTensor(input) || inputQuantization?.scheme !== 'per_tensor' ||
-      !Number.isFinite(inputScale) || inputScale <= 0 || output.dtype !== 'int32' ||
-      output.quantization != null || inputElements == null || outputElements == null ||
-      !Number.isInteger(rank) || rank < 2 || rank > WASM_PORTABLE_MAX_RANK || !paramsAreExact ||
-      !Number.isInteger(axis) || axis < 0 || axis >= rank || !Number.isInteger(axisSize) ||
-      axisSize <= 0 || axisSize > 0x7fffffff || outer == null || inner == null || outer <= 0 || inner <= 0 ||
-      inputElements !== outer * axisSize * inner || outputElements !== outer * inner ||
-      !sameShape(output.shape, expectedOutputShape) || !qArgMaxByteStorageIsCanonical(input) ||
-      !qArgMaxInt32StorageIsCanonical(output) || qArgMaxStorageRangesOverlap(input, output)) {
-    throw new Error(`WASM QArgMax node ${node.id} requires exactly { input } -> { out }, immutable per-tensor rank-2..8 I8/U8 input, exact { axis: integer } parameters, and an unquantized I32 output with the axis removed.`);
-  }
-  return {
-    kind: 'qargmax', input, output, axis, outer, axisSize, inner, outputElements,
-    inputDtype: wasmDtypeCode(input.dtype),
-  };
-}
-
-function qMaskedMeanByteStorageIsCanonical(tensor) {
-  if (!tensor || tensor.buffer == null) return true;
-  const storage = tensor.buffer;
-  const matches = tensor.dtype === 'int8'
-    ? storage instanceof Int8Array
-    : tensor.dtype === 'uint8' && (storage instanceof Uint8Array || storage instanceof Uint8ClampedArray);
-  return matches && storage.byteLength === tensor.sizeBytes;
-}
-
-function qMaskedMeanInt32StorageIsCanonical(tensor) {
-  if (!tensor || tensor.buffer == null) return true;
-  return tensor.buffer instanceof Int32Array && tensor.buffer.byteLength === tensor.sizeBytes;
-}
-
-function qMaskedMeanStorageRangesOverlap(left, right) {
-  const leftStorage = left?.buffer;
-  const rightStorage = right?.buffer;
-  if (!ArrayBuffer.isView(leftStorage) || leftStorage instanceof DataView ||
-      !ArrayBuffer.isView(rightStorage) || rightStorage instanceof DataView ||
-      leftStorage.buffer !== rightStorage.buffer) return false;
-  const leftStart = leftStorage.byteOffset;
-  const leftEnd = leftStart + leftStorage.byteLength;
-  const rightStart = rightStorage.byteOffset;
-  const rightEnd = rightStart + rightStorage.byteLength;
-  return leftStart < rightEnd && rightStart < leftEnd;
-}
-
-// Preserve the native kernel's typed-storage and no-overlap contract before
-// `_alloc` turns graph tensors into disjoint WASM heap views.
-function preflightPortableQMaskedMeanStorage(node) {
-  if (node.opType !== 'QMaskedMean') return;
-  const input = node.inputs?.input;
-  const mask = node.inputs?.mask;
-  const output = node.outputs?.out;
-  if (!qMaskedMeanByteStorageIsCanonical(input) || !qMaskedMeanInt32StorageIsCanonical(mask) ||
-      !qMaskedMeanByteStorageIsCanonical(output) || qMaskedMeanStorageRangesOverlap(input, output) ||
-      qMaskedMeanStorageRangesOverlap(mask, output)) {
-    throw new Error(`WASM QMaskedMean node ${node.id} requires canonical I8/U8 input/output and I32 mask storage, with output storage distinct from input and mask.`);
-  }
-}
-
-function qMaskedMeanMaximumCenteredMagnitude(dtype, zeroPoint) {
-  const minimum = dtype === 'int8' ? -128 : 0;
-  const maximum = dtype === 'int8' ? 127 : 255;
-  return Math.max(Math.abs(minimum - zeroPoint), Math.abs(maximum - zeroPoint));
-}
-
-function portableQMaskedMeanDescriptor(node) {
-  if (node.opType !== 'QMaskedMean') return null;
-  const inputNames = Object.keys(node.inputs || {}).sort();
-  const outputNames = Object.keys(node.outputs || {});
-  const input = node.inputs?.input;
-  const mask = node.inputs?.mask;
-  const output = node.outputs?.out;
-  const inputElements = portableTensorElements(input);
-  const maskElements = portableTensorElements(mask);
-  const outputElements = portableTensorElements(output);
-  const params = node.params;
-  const paramsAreExact = params != null && typeof params === 'object' && !Array.isArray(params) &&
-    Object.keys(params).length === 0;
-  const [batch, sequence, width] = input?.shape || [];
-  const inputQuantization = immutableQuantizationDescriptor(input);
-  const outputQuantization = immutableQuantizationDescriptor(output);
-  const inputScale = Math.fround(inputQuantization?.scale);
-  const outputScale = Math.fround(outputQuantization?.scale);
-  const multiplier = Math.fround(inputScale / outputScale);
-
-  if (inputNames.length !== 2 || inputNames[0] !== 'input' || inputNames[1] !== 'mask' ||
-      outputNames.length !== 1 || outputNames[0] !== 'out' || !input || !mask || !output ||
-      input === output || mask === output || !portableByteQuantizedTensor(input) ||
-      !portableByteQuantizedTensor(output) || mask.dtype !== 'int32' || mask.quantization != null ||
-      inputElements == null || maskElements == null || outputElements == null ||
-      input.shape.length !== 3 || mask.shape.length !== 2 || output.shape.length !== 2 ||
-      !paramsAreExact || !Number.isInteger(batch) || !Number.isInteger(sequence) ||
-      !Number.isInteger(width) || batch <= 0 || sequence <= 0 || width <= 0 ||
-      batch > WASM_PORTABLE_MAX_U32 || sequence > WASM_PORTABLE_MAX_U32 || width > WASM_PORTABLE_MAX_U32 ||
-      mask.shape[0] !== batch || mask.shape[1] !== sequence ||
-      output.shape[0] !== batch || output.shape[1] !== width ||
-      inputElements !== batch * sequence * width || maskElements !== batch * sequence ||
-      outputElements !== batch * width || inputQuantization?.scheme !== 'per_tensor' ||
-      outputQuantization?.scheme !== 'per_tensor' || !Number.isFinite(inputScale) || inputScale <= 0 ||
-      !Number.isFinite(outputScale) || outputScale <= 0 || !Number.isFinite(multiplier) ||
-      multiplier <= 0 || !qMaskedMeanByteStorageIsCanonical(input) ||
-      !qMaskedMeanInt32StorageIsCanonical(mask) || !qMaskedMeanByteStorageIsCanonical(output) ||
-      qMaskedMeanStorageRangesOverlap(input, output) || qMaskedMeanStorageRangesOverlap(mask, output)) {
-    throw new Error(`WASM QMaskedMean node ${node.id} requires exactly { input, mask } -> { out }, immutable per-tensor I8/U8 [B,S,D] input/output [B,D], unquantized I32 [B,S] mask, and no parameters.`);
-  }
-
-  const maximumCenteredSum = sequence * qMaskedMeanMaximumCenteredMagnitude(
-    input.dtype, inputQuantization.zero_point,
-  );
-  if (!Number.isSafeInteger(maximumCenteredSum) || maximumCenteredSum > 0x7fffffff) {
-    throw new Error(`WASM QMaskedMean node ${node.id} sequence is too large for an exact I32 centered sum.`);
-  }
-  return {
-    kind: 'qmaskedmean', input, mask, output, batch, sequence, width,
-    inputScale, inputZeroPoint: inputQuantization.zero_point,
-    outputScale, outputZeroPoint: outputQuantization.zero_point,
-    inputDtype: wasmDtypeCode(input.dtype), outputDtype: wasmDtypeCode(output.dtype),
-  };
-}
-
-function portableRequantizeLinearDescriptor(node) {
-  if (node.opType !== 'RequantizeLinear') return null;
-  const input = node.inputs.input || node.inputs.x || node.inputs.data;
-  const output = portableOutput(node);
-  const inputEntries = Object.entries(node.inputs || {});
-  const inputElements = portableTensorElements(input);
-  const outputElements = portableTensorElements(output);
-  if (inputEntries.length !== 1 || !portableByteQuantizedTensor(input) || !portableByteQuantizedTensor(output) ||
-      inputElements == null || outputElements !== inputElements) {
-    throw new Error(`WASM RequantizeLinear node ${node.id} requires one metadata-only I8/U8 input and an equal-size output.`);
-  }
-  const inputQuantization = immutableQuantizationDescriptor(input);
-  const outputQuantization = immutableQuantizationDescriptor(output);
-  if (!inputQuantization || !outputQuantization || inputQuantization.scheme !== 'per_tensor' ||
-      outputQuantization.scheme !== 'per_tensor') {
-    throw new Error(`WASM RequantizeLinear node ${node.id} requires immutable per-tensor I8/U8 quantization metadata.`);
-  }
-  const inputScale = Math.fround(inputQuantization.scale);
-  const outputScale = Math.fround(outputQuantization.scale);
-  const multiplier = Math.fround(inputScale / outputScale);
-  if (!Number.isFinite(inputScale) || inputScale <= 0 || !Number.isFinite(outputScale) ||
-      outputScale <= 0 || !Number.isFinite(multiplier) || multiplier <= 0) {
-    throw new Error(`WASM RequantizeLinear node ${node.id} has a non-representable positive scale ratio.`);
-  }
-  return {
-    kind: 'requantizeLinear', input, output, elements: inputElements,
-    inputDtype: wasmDtypeCode(input.dtype), outputDtype: wasmDtypeCode(output.dtype),
-    inputScale, outputScale,
-    inputZeroPoint: inputQuantization.zero_point, outputZeroPoint: outputQuantization.zero_point,
-  };
-}
-
-function portableQConv2DDescriptor(node) {
-  if (node.opType !== 'QConv2D') return null;
-  const input = node.inputs.input || node.inputs.x;
-  const weight = node.inputs.weight;
-  const bias = node.inputs.bias || null;
-  const output = portableOutput(node);
-  const inputElements = portableTensorElements(input);
-  const weightElements = portableTensorElements(weight);
-  const outputElements = portableTensorElements(output);
-  const biasElements = bias ? portableTensorElements(bias) : 0;
-  if (!portableByteQuantizedTensor(input) || !portableByteQuantizedTensor(weight) ||
-      !portableByteQuantizedTensor(output) || inputElements == null || weightElements == null ||
-      outputElements == null || input.shape.length !== 4 || weight.shape.length !== 4 ||
-      output.shape.length !== 4 || (bias && (bias.dtype !== 'int32' || biasElements == null)) ||
-      (node.params?.data_layout && node.params.data_layout !== 'NHWC') ||
-      (node.params?.weight_layout && node.params.weight_layout !== 'OHWI')) {
-    throw new Error(`WASM QConv2D node ${node.id} requires canonical NHWC I8/U8 activations and OHWI I8/U8 weights.`);
-  }
-  const inputQuantization = immutableQuantizationDescriptor(input);
-  const outputQuantization = immutableQuantizationDescriptor(output);
-  const weightQuantization = immutableQuantizationDescriptor(weight);
-  if (!inputQuantization || !outputQuantization || !weightQuantization ||
-      inputQuantization.scheme !== 'per_tensor' || outputQuantization.scheme !== 'per_tensor' ||
-      weightQuantization.scheme !== 'per_axis') {
-    throw new Error(`WASM QConv2D node ${node.id} requires immutable per-tensor activation and per-axis weight metadata.`);
-  }
-  const [batch, inputHeight, inputWidth, inputChannels] = input.shape;
-  const [outputChannels, kernelHeight, kernelWidth, inputPerGroup] = weight.shape;
-  const [outputBatch, outputHeight, outputWidth, outputChannelsFromOutput] = output.shape;
-  const groups = node.params?.groups ?? 1;
-  const [strideY, strideX] = portablePairParameter(node, 'stride', 1);
-  const [dilationY, dilationX] = portablePairParameter(node, 'dilation', 1);
-  const [paddingY, paddingX] = portablePairParameter(node, 'padding', 0, true);
-  const pads = node.params?.pads || [paddingY, paddingX, paddingY, paddingX];
-  const relu = node.params?.relu ?? 0;
-  if (!Number.isInteger(groups) || groups <= 0 || groups > WASM_PORTABLE_MAX_U32 ||
-      inputChannels !== inputPerGroup * groups || outputChannels !== outputChannelsFromOutput ||
-      outputBatch !== batch || outputChannels % groups !== 0 || !Array.isArray(pads) ||
-      pads.length !== 4 || pads.some((value) => !Number.isInteger(value) || value < 0 ||
-        value > WASM_PORTABLE_MAX_U32) || !Number.isInteger(relu) || relu < 0 || relu > 2) {
-    throw new Error(`WASM QConv2D node ${node.id} has incompatible grouped-convolution parameters.`);
-  }
-  const effectiveHeight = dilationY * (kernelHeight - 1) + 1;
-  const effectiveWidth = dilationX * (kernelWidth - 1) + 1;
-  const paddedHeight = inputHeight + pads[0] + pads[2];
-  const paddedWidth = inputWidth + pads[1] + pads[3];
-  if (![effectiveHeight, effectiveWidth, paddedHeight, paddedWidth].every(Number.isSafeInteger) ||
-      paddedHeight < effectiveHeight || paddedWidth < effectiveWidth) {
-    throw new Error(`WASM QConv2D node ${node.id} has non-representable stride, padding, or dilation geometry.`);
-  }
-  const expectedHeight = Math.floor((paddedHeight - effectiveHeight) / strideY) + 1;
-  const expectedWidth = Math.floor((paddedWidth - effectiveWidth) / strideX) + 1;
-  if (expectedHeight !== outputHeight || expectedWidth !== outputWidth ||
-      weightElements !== outputChannels * kernelHeight * kernelWidth * inputPerGroup ||
-      inputElements !== batch * inputHeight * inputWidth * inputChannels ||
-      outputElements !== batch * outputHeight * outputWidth * outputChannels) {
-    throw new Error(`WASM QConv2D node ${node.id} has an output shape incompatible with its canonical descriptor.`);
-  }
-  if (bias && (!sameShape(bias.shape, [outputChannels]) || biasElements !== outputChannels)) {
-    throw new Error(`WASM QConv2D node ${node.id} bias must be an I32 vector with one value per output channel.`);
-  }
-  if (weightQuantization.axis !== 0 || weightQuantization.scales.length !== outputChannels ||
-      weightQuantization.zero_points.length !== outputChannels) {
-    throw new Error(`WASM QConv2D node ${node.id} requires per_axis weight quantization along output-channel axis 0.`);
-  }
-  const inputScale = Math.fround(inputQuantization.scale);
-  const outputScale = Math.fround(outputQuantization.scale);
-  const weightScales = Float32Array.from(weightQuantization.scales, Math.fround);
-  if (!Number.isFinite(inputScale) || inputScale <= 0 || !Number.isFinite(outputScale) ||
-      outputScale <= 0 || !weightScales.every((scale) => Number.isFinite(scale) && scale > 0)) {
-    throw new Error(`WASM QConv2D node ${node.id} requires scales representable as positive F32.`);
-  }
-  return {
-    kind: 'qconv2d', input, weight, bias, output,
-    batch, inputHeight, inputWidth, inputChannels,
-    outputHeight, outputWidth, outputChannels, kernelHeight, kernelWidth, inputPerGroup,
-    strideY, strideX, dilationY, dilationX,
-    paddingTop: pads[0], paddingLeft: pads[1], paddingBottom: pads[2], paddingRight: pads[3],
-    groups, relu, inputScale, outputScale,
-    inputZeroPoint: inputQuantization.zero_point, outputZeroPoint: outputQuantization.zero_point,
-    inputDtype: wasmDtypeCode(input.dtype), weightDtype: wasmDtypeCode(weight.dtype),
-    outputDtype: wasmDtypeCode(output.dtype),
-    weightScales, weightZeroPoints: Int32Array.from(weightQuantization.zero_points),
-  };
-}
 
 function sameQuantizationDescriptor(left, right) {
   if (!left || !right || left.scheme !== right.scheme) return false;
@@ -2028,23 +1470,6 @@ function portableQuantizedShapeDescriptor(node) {
   return { kind: 'quantizedShapeCopy', input, output, elements, dtype: common.dtype };
 }
 
-function portablePairParameter(node, name, fallback, allowZero = false) {
-  const value = node.params?.[name];
-  let pair;
-  if (value == null) pair = [fallback, fallback];
-  else if (Array.isArray(value)) {
-    if (value.length < 1 || value.length > 2) {
-      throw new Error(`WASM ${node.opType} node ${node.id} ${name} must be a scalar or one/two-element array.`);
-    }
-    pair = [value[0], value[1] ?? value[0]];
-  } else pair = [value, value];
-  const minimum = allowZero ? 0 : 1;
-  if (pair.some((dimension) => !Number.isInteger(dimension) || dimension < minimum ||
-      dimension > WASM_PORTABLE_MAX_U32)) {
-    throw new Error(`WASM ${node.opType} node ${node.id} ${name} must contain ${allowZero ? 'non-negative' : 'positive'} U32 values.`);
-  }
-  return pair;
-}
 
 function portableFalseOrAbsent(value) {
   return value == null || value === false || value === 0;
@@ -2507,7 +1932,12 @@ export class WasmEngine extends BackendEngine {
     };
   }
 
-  readonly wasmModule: WasmInstantiation;
+  /** Compiled code is public for independent scratch/training instantiation;
+   * the provider root's raw instance exports stay private once pooled. */
+  readonly wasmModule: Readonly<{ readonly module: WebAssembly.Module }>;
+  readonly #wasmInstantiation: WasmInstantiation;
+  readonly #relaxedSimdModule: Readonly<RelaxedSimdInstantiation> | null;
+  readonly #kernelApi: WasmKernelExports;
   readonly api: WasmKernelExports;
   readonly mem: WebAssembly.Memory;
   readonly relaxedApi: RelaxedSimdExports | null;
@@ -2542,11 +1972,28 @@ export class WasmEngine extends BackendEngine {
   _variantBytes = 0;
   _variantHighWaterBytes = 0;
   _heapHighWaterBytes = 0;
+  readonly _kvScratch = new Map<string, { pointer: number; bytes: number }>();
   _memoryGrowCount = 0;
   _variantRebindCount = 0;
   _f32PackCount = 0;
   _q8PackCount = 0;
+  _rawWeightCopyCount = 0;
+  _rawWeightCopyBytes = 0;
   _disposed = false;
+  #sharedPool: WasmSharedLinearPool | null = null;
+  #sharedRegion: WasmSharedLinearRegion | null = null;
+  #invariantPrefix: WasmCompiledInvariantPrefix | null = null;
+  #releaseRegionOnDispose = false;
+  #releasePrefixOnDispose = false;
+  #viewedMemoryBuffer: ArrayBufferLike;
+  #growthListener: (() => void) | null = null;
+  #unregisterGrowthListener: (() => void) | null = null;
+  #memoryRootBuffer: ArrayBufferLike;
+  #memoryRootAddressableBytes: number;
+  #memoryRootGeneration = 1;
+  /* Minted on first inspection so an engine costs nothing when the optional
+   * memory-snapshot SPI is never called. */
+  #memoryRootEngineIdentity: string | null = null;
   /* Non-null only while an opted-in compile() is running, so every
    * instrumentation site costs one field read when profiling is off. */
   _compileProfile: WasmCompileProfile | null = null;
@@ -2554,6 +2001,7 @@ export class WasmEngine extends BackendEngine {
   constructor(
     wasmModule: WasmInstantiation,
     relaxedSimdModule: Readonly<RelaxedSimdInstantiation> | null = null,
+    shared: WasmSharedEngineOptions | null = null,
   ) {
     super('wasm', {
       incrementalExecution: true,
@@ -2565,8 +2013,26 @@ export class WasmEngine extends BackendEngine {
       sequenceMajorRows: true,
       outputLocation: 'host',
     });
-    this.wasmModule = wasmModule;
-    this.api = wasmModule.instance.exports;
+    this.#wasmInstantiation = wasmModule;
+    this.wasmModule = Object.freeze({ module: wasmModule.module });
+    this.#relaxedSimdModule = relaxedSimdModule;
+    this.#kernelApi = wasmModule.instance.exports;
+    const sealedAllocatorCall = (name: 'alloc_bytes' | 'reset_heap' | 'heap_rewind') =>
+      (...args: WasmAbiArgument[]): number => {
+        if (this.#sharedPool !== null) {
+          throw new Error('WASM provider root C allocator is sealed by its shared linear pool.');
+        }
+        return this.#kernelApi[name](...args);
+      };
+    /* WebAssembly.Exports fields are non-configurable, so wrap a detached
+     * facade rather than proxying the exports object and violating Proxy's
+     * invariant for the three allocator mutators. */
+    this.api = Object.freeze({
+      ...this.#kernelApi,
+      alloc_bytes: sealedAllocatorCall('alloc_bytes'),
+      reset_heap: sealedAllocatorCall('reset_heap'),
+      heap_rewind: sealedAllocatorCall('heap_rewind'),
+    }) as WasmKernelExports;
     this.mem = this.api.memory;
     this.relaxedApi = relaxedSimdModule?.instance?.exports || null;
     this.relaxedSimdEnabled =
@@ -2581,7 +2047,26 @@ export class WasmEngine extends BackendEngine {
     this.tensorMaximumBytes = new Map();
     this.qconvIm2ColPointer = 0;
     this.qconvIm2ColBytes = 0;
-    this._heapHighWaterBytes = this.mem.buffer.byteLength;
+    if (shared !== null) {
+      if (shared.pool.memory !== this.mem || shared.region.released) {
+        throw new Error('WASM shared engine requires a live region in its module memory.');
+      }
+      this.#sharedPool = shared.pool;
+      this.#sharedRegion = shared.region;
+      this.#invariantPrefix = shared.invariantPrefix ?? null;
+      this.#releaseRegionOnDispose = shared.releaseRegionOnDispose === true;
+      this.#releasePrefixOnDispose = shared.releasePrefixOnDispose === true;
+      this.#growthListener = () => {
+        if (!this._disposed && this.graph && this.pointers.size === this.graph.tensors.size) {
+          this._refreshGraphTensorViews(this.graph);
+        }
+      };
+      this.#unregisterGrowthListener = shared.pool.registerGrowthListener(this.#growthListener);
+    }
+    this.#memoryRootBuffer = this.mem.buffer;
+    this.#viewedMemoryBuffer = this.mem.buffer;
+    this.#memoryRootAddressableBytes = this.#memoryRootBuffer.byteLength;
+    this._heapHighWaterBytes = this.#memoryRootAddressableBytes;
     console.log("[VolvoxAI] WASM Engine ready (Tier 2 C kernels).");
   }
   static async init(wasmUrl: string | URL): Promise<WasmEngine | null> {
@@ -2639,7 +2124,7 @@ export class WasmEngine extends BackendEngine {
   async fork(
     { relaxedSimd = true }: { relaxedSimd?: boolean } = {},
   ) {
-    const compiledModule = this.wasmModule?.module;
+    const compiledModule = this.#wasmInstantiation?.module;
     if (!(compiledModule instanceof WebAssembly.Module)) {
       throw new Error('WasmEngine.fork requires the compiled parent module.');
     }
@@ -2660,13 +2145,177 @@ export class WasmEngine extends BackendEngine {
     return new WasmEngine(wasmModule, relaxedSimdModule);
   }
 
+  #requireSharedPool(): WasmSharedLinearPool {
+    if (this._disposed) throw new Error('WASM engine is disposed.');
+    if (this.#sharedPool) return this.#sharedPool;
+    const heapBase = Number(this.api.__heap_base?.value);
+    const heapMark = Number(this.api.heap_mark?.());
+    if (!Number.isSafeInteger(heapBase) || heapMark !== heapBase) {
+      throw new Error(
+        'WASM shared linear pool requires a pristine root allocator at __heap_base.',
+      );
+    }
+    this.#sharedPool = new WasmSharedLinearPool(this.mem, heapBase);
+    return this.#sharedPool;
+  }
+
+  /**
+   * Materialize the exact full-residency raw/packed prefix once for a compiled
+   * model. Contexts borrow pointers into this range; a partially resident bank
+   * alone is staged in that context's mutable range.
+   */
+  prepareCompiledInvariantPrefix(
+    graph: RuntimeGraph,
+    preparedGraph: Readonly<object>,
+    maximumBytes: number,
+    bankedWeightNames: ReadonlySet<string> = new Set(),
+  ): WasmCompiledInvariantPrefix {
+    if (this.#sharedRegion !== null) {
+      throw new Error('Only the root WASM engine can own compiled invariant prefixes.');
+    }
+    const typedGraph = graph as WasmGraph;
+    const prepared = this._assertPreparedGraph(typedGraph, preparedGraph);
+    const pool = this.#requireSharedPool();
+    const region = pool.reserve(maximumBytes, 'compiled-invariants');
+    const builder = new WasmEngine(this.#wasmInstantiation, this.#relaxedSimdModule, {
+      pool,
+      region,
+      releaseRegionOnDispose: true,
+    });
+    try {
+      const declaredWeights = new Set(
+        [...typedGraph.tensors.values()]
+          .filter((tensor) => tensor.isWeight === true)
+          .map((tensor) => tensor.name),
+      );
+      for (const name of bankedWeightNames) {
+        if (!declaredWeights.has(name)) {
+          throw new Error(`WASM banked prefix name '${name}' is not a graph weight.`);
+        }
+      }
+      for (const tensor of typedGraph.tensors.values()) {
+        if (tensor.isWeight === true) builder._alloc(tensor, tensor.sizeBytes);
+      }
+      builder._refreshAllocatedTensorViews(typedGraph);
+      const rawEnd = builder._heapMark();
+      const rawWeightBytes = [...builder.tensorCapacities.values()]
+        .reduce((total, capacity) => total + capacity.capacityBytes, 0);
+      const rawWeightPhysicalBytes = rawEnd - region.base;
+      builder._prepareInvariantWeightPacks(typedGraph, prepared);
+      const end = builder._heapMark();
+      const packedWeightBytes = [...builder.f32PackedWeights.values()]
+        .reduce((total, descriptor) => total + descriptor.bytes, 0) +
+        [...builder.q8PackedWeights.values()]
+          .reduce((total, descriptor) => total + descriptor.bytes, 0);
+      const prefix = new WasmCompiledInvariantPrefix({
+        pool,
+        region,
+        topologyRevision: typedGraph.topologyRevision || 0,
+        weightRevision: typedGraph.weightRevision || 0,
+        weightPointers: new Map(builder.pointers),
+        weightCapacities: new Map(builder.tensorCapacities),
+        f32PackedWeights: new Map(builder.f32PackedWeights),
+        q8PackedWeights: new Map(builder.q8PackedWeights),
+        bankedWeightNames: new Set(bankedWeightNames),
+        rawWeightBytes,
+        rawWeightPhysicalBytes,
+        packedWeightBytes,
+        packedWeightPhysicalBytes: end - rawEnd,
+        rawWeightCopyCount: builder._rawWeightCopyCount,
+        rawWeightCopyBytes: builder._rawWeightCopyBytes,
+        f32PackCount: builder._f32PackCount,
+        q8PackCount: builder._q8PackCount,
+      });
+      builder.#releaseRegionOnDispose = false;
+      builder.dispose();
+      return prefix;
+    } catch (error) {
+      builder.dispose();
+      throw error;
+    }
+  }
+
+  /** Create a production context over this root's instance and memory. */
+  forkWithCompiledInvariants(
+    prefix: WasmCompiledInvariantPrefix,
+    maximumMutableBytes: number,
+  ): WasmEngine {
+    if (this.#sharedRegion !== null) {
+      throw new Error('Only the root WASM engine can create shared contexts.');
+    }
+    const pool = this.#requireSharedPool();
+    if (!(prefix instanceof WasmCompiledInvariantPrefix) || !prefix.belongsTo(pool)) {
+      throw new Error('WASM compiled invariant prefix belongs to another linear-memory root.');
+    }
+    prefix.retain();
+    let region: WasmSharedLinearRegion | null = null;
+    try {
+      region = pool.reserve(maximumMutableBytes, 'context-mutable');
+      return new WasmEngine(this.#wasmInstantiation, this.#relaxedSimdModule, {
+        pool,
+        region,
+        invariantPrefix: prefix,
+        releaseRegionOnDispose: true,
+        releasePrefixOnDispose: true,
+      });
+    } catch (error) {
+      if (region) pool.release(region);
+      prefix.release();
+      throw error;
+    }
+  }
+
+  _heapMark(): number {
+    const region = this.#sharedRegion;
+    if (region) {
+      if (region.released) throw new Error('WASM shared allocator region is released.');
+      return region.cursor;
+    }
+    if (this.#sharedPool !== null) {
+      throw new Error('WASM provider root allocator is sealed by its shared linear pool.');
+    }
+    return Number(this.api.heap_mark?.());
+  }
+
+  _heapRewind(mark: number): boolean {
+    const region = this.#sharedRegion;
+    if (region) {
+      if (region.released || !Number.isSafeInteger(mark) || (mark & 15) !== 0 ||
+          mark < region.base || mark > region.cursor) return false;
+      region.cursor = mark;
+      return true;
+    }
+    if (this.#sharedPool !== null) {
+      throw new Error('WASM provider root allocator is sealed by its shared linear pool.');
+    }
+    return typeof this.api.heap_rewind === 'function' && this.api.heap_rewind(mark) === 1;
+  }
+
+  _resetAllocator(): void {
+    const region = this.#sharedRegion;
+    if (region) {
+      if (region.released) throw new Error('WASM shared allocator region is released.');
+      region.cursor = region.base;
+      return;
+    }
+    if (this.#sharedPool !== null) {
+      throw new Error('WASM provider root allocator is sealed by its shared linear pool.');
+    }
+    this.api.reset_heap?.();
+  }
+
   /** Release all host-side graph ownership and reset the instance allocator. */
   dispose(): void {
     if (this._disposed) return;
+    if (this.#sharedRegion === null && this.#sharedPool?.liveRegionCount) {
+      throw new Error(
+        'WASM provider root cannot close before every compiled prefix and context region.',
+      );
+    }
     this._disposed = true;
     this._setDecodeCacheGenerationListener(null);
     this._incrementalCacheValid = false;
-    this.api.reset_heap?.();
+    if (this.#sharedRegion === null) this.#kernelApi.reset_heap?.();
     this.pointers.clear();
     this.f32PackedWeights.clear();
     this.q8PackedWeights.clear();
@@ -2676,6 +2325,17 @@ export class WasmEngine extends BackendEngine {
     this.nodeMetadata?.clear();
     this.graph = null as unknown as WasmGraph;
     this.preparedGraph = undefined as unknown as WasmPreparedGraph;
+    const region = this.#sharedRegion;
+    this.#sharedRegion = null;
+    if (region && this.#releaseRegionOnDispose) this.#sharedPool?.release(region);
+    this.#releaseRegionOnDispose = false;
+    const prefix = this.#invariantPrefix;
+    this.#invariantPrefix = null;
+    if (prefix && this.#releasePrefixOnDispose) prefix.release();
+    this.#releasePrefixOnDispose = false;
+    this.#unregisterGrowthListener?.();
+    this.#unregisterGrowthListener = null;
+    this.#growthListener = null;
   }
   /**
    * The single place this backend grows the WASM heap.
@@ -2719,6 +2379,7 @@ export class WasmEngine extends BackendEngine {
        * memory untouched when it throws, so retrying smaller is safe. */
       if (pages === shortfallPages) throw error;
       this.mem.grow(shortfallPages);
+      this.#sharedPool?.notifyGrowth(this.#growthListener);
       this._memoryGrowCount++;
       this._heapHighWaterBytes = Math.max(this._heapHighWaterBytes, this.mem.buffer.byteLength);
       if (profile) {
@@ -2728,6 +2389,7 @@ export class WasmEngine extends BackendEngine {
       }
       return;
     }
+    this.#sharedPool?.notifyGrowth(this.#growthListener);
     this._memoryGrowCount++;
     this._heapHighWaterBytes = Math.max(this._heapHighWaterBytes, this.mem.buffer.byteLength);
     if (profile) {
@@ -2738,6 +2400,9 @@ export class WasmEngine extends BackendEngine {
   }
 
   _allocateBytes(bytes: number, label: string): number {
+    if (this.#sharedRegion === null && this.#sharedPool !== null) {
+      throw new Error('WASM provider root allocator is sealed by its shared linear pool.');
+    }
     if (!Number.isSafeInteger(bytes) || bytes <= 0 || bytes > 0x7ffffff0) {
       throw new Error(`WASM ${label} size is not representable by the signed allocator ABI.`);
     }
@@ -2750,16 +2415,28 @@ export class WasmEngine extends BackendEngine {
           !Number.isSafeInteger(end) || end > WASM_PORTABLE_MAX_U32) {
         throw new Error(`WASM ${label} allocation exceeds the wasm32 address space.`);
       }
+      const region = this.#sharedRegion;
+      if (region && (region.released || pointer < region.base || end > region.limit)) {
+        throw new Error(`WASM ${label} exceeds its context-private mutable region.`);
+      }
       measurement.cursor = end;
       return pointer;
     }
-    const pointer = Number(this.api.alloc_bytes(bytes));
+    const region = this.#sharedRegion;
+    const pointer = region ? region.cursor : Number(this.api.alloc_bytes(bytes));
     if (!Number.isSafeInteger(pointer) || pointer < 0) {
       throw new Error(`WASM allocator returned an invalid ${label} pointer.`);
     }
-    const needed = pointer + bytes;
+    const needed = pointer + alignedBytes;
     if (!Number.isSafeInteger(needed) || needed > WASM_PORTABLE_MAX_U32) {
       throw new Error(`WASM ${label} allocation exceeds the wasm32 address space.`);
+    }
+    if (region) {
+      if (region.released || pointer < region.base || needed > region.limit) {
+        throw new Error(`WASM ${label} exceeds its bounded ${region.kind} region.`);
+      }
+      region.cursor = needed;
+      region.highWater = Math.max(region.highWater, needed);
     }
     this._growFor(needed);
     return pointer;
@@ -2788,6 +2465,8 @@ export class WasmEngine extends BackendEngine {
          const bytesToCopy = Math.min(tensor.buffer.byteLength, tensor.sizeBytes);
          if (this._compileProfile) this._compileProfile.tensorCopyBytes += bytesToCopy;
          new Uint8Array(this.mem.buffer, ptr, bytesToCopy).set(src.subarray(0, bytesToCopy));
+         this._rawWeightCopyCount++;
+         this._rawWeightCopyBytes += bytesToCopy;
       }
       tensor.buffer = wasmView;
     }
@@ -2844,6 +2523,30 @@ export class WasmEngine extends BackendEngine {
     if (this._compileProfile) this._compileProfile.allocBytesCount++;
     return ptr;
   }
+
+  /* Gather storage for a paged K/V prefix.
+   *
+   * The pointer is cached, never the view: an allocation can grow the memory
+   * and detach every existing view, so the view is rebuilt from the current
+   * buffer each step. Growth only happens the first time a key is seen at a
+   * given size, so a decode loop allocates once and reuses -- the bounded
+   * growth a sustained-churn workload requires. */
+  _allocateKVScratch(key: string, elements: number, sample: any) {
+    const bytes = elements * sample.BYTES_PER_ELEMENT;
+    let entry = this._kvScratch.get(key);
+    if (!entry || entry.bytes < bytes) {
+      /* Geometric, and never returned to the heap: a gather grows by one token
+       * per generated token, so an exact-fit allocation would bump the heap
+       * once per token for the whole generation. */
+      const capacity = kvScratchCapacity(bytes, entry?.bytes ?? 0);
+      entry = {
+        pointer: this._allocScratchBytes(capacity, `paged K/V gather '${key}'`),
+        bytes: capacity,
+      };
+      this._kvScratch.set(key, entry);
+    }
+    return new (sample.constructor as any)(this.mem.buffer, entry.pointer, elements);
+  }
   _allocPackedQ8Weight(
     weight,
     dIn,
@@ -2861,7 +2564,9 @@ export class WasmEngine extends BackendEngine {
     if (!weight || !Number.isInteger(dIn) || dIn <= 0 ||
         !Number.isInteger(dOut) || dOut <= 0 ||
         typeof sizeKernel !== 'function' || typeof packKernel !== 'function') return 0;
-    const cacheKey = `${weight.name}:${weight.dtype}:${dIn}:${dOut}:${outIn ? 1 : 0}:${mode}`;
+    const cacheKey = JSON.stringify([
+      weight.name, weight.dtype, dIn, dOut, outIn ? 1 : 0, mode,
+    ]);
     const cached = this.q8PackedWeights.get(cacheKey);
     if (cached) return cached.pointer;
     if (this._allocationMeasurement) {
@@ -2881,7 +2586,9 @@ export class WasmEngine extends BackendEngine {
           wasmDtypeCode(weight.dtype), outIn ? 1 : 0) !== 1) {
       throw new Error(`WASM failed to create ${mode} Q8 pack for weight '${weight.name}'.`);
     }
-    this.q8PackedWeights.set(cacheKey, Object.freeze({ pointer: ptr, bytes, cacheKey }));
+    this.q8PackedWeights.set(cacheKey, Object.freeze({
+      weightName: weight.name, pointer: ptr, bytes, cacheKey,
+    }));
     this._q8PackCount++;
     if (this._compileProfile) {
       this._compileProfile.packWeightMs += performance.now() - profileStart;
@@ -2914,7 +2621,7 @@ export class WasmEngine extends BackendEngine {
         !Number.isInteger(dOut) || dOut <= 0 || !sameShape(weight.shape, expectedWeightShape) ||
         portableTensorElements(input) !== rows * dIn ||
         portableTensorElements(output) !== rows * dOut) return null;
-    const cacheKey = `${weight.name}:${dIn}:${dOut}:${doutFirst ? 1 : 0}`;
+    const cacheKey = JSON.stringify([weight.name, dIn, dOut, doutFirst ? 1 : 0]);
     const cached = this.f32PackedWeights.get(cacheKey);
     if (cached) return cached;
     if (this._allocationMeasurement) {
@@ -2934,6 +2641,7 @@ export class WasmEngine extends BackendEngine {
       throw new Error(`WASM ${node.opType} node ${node.id} could not pack its immutable F32 weight.`);
     }
     const descriptor = Object.freeze({
+      weightName: weight.name,
       pointer, bytes: packedBytes, dIn, dOut, doutFirst, cacheKey,
     });
     this.f32PackedWeights.set(cacheKey, descriptor);
@@ -3083,7 +2791,7 @@ export class WasmEngine extends BackendEngine {
       let incrementalRow: any = null;
       try {
         incrementalRow = batchMatMulDescriptor(quantizedRowNode(
-          node, 1, { allowUnprovenInvariantInputs: true },
+          node, singleLaneRowSet(1), { allowUnprovenInvariantInputs: true },
         ));
       } catch {
         // The ordinary descriptor remains valid. Dependency-aware row
@@ -3096,7 +2804,7 @@ export class WasmEngine extends BackendEngine {
       let incrementalRow: any = null;
       try {
         incrementalRow = qBatchMatMulDescriptor(quantizedRowNode(
-          node, 1, { allowUnprovenInvariantInputs: true },
+          node, singleLaneRowSet(1), { allowUnprovenInvariantInputs: true },
         ));
       } catch {
         // Preserve full-sequence compilation for descriptors outside the
@@ -3151,7 +2859,7 @@ export class WasmEngine extends BackendEngine {
       if (node.opType === 'Add' || node.opType === 'Mul') {
         try {
           incrementalRow = compileBinaryDescriptor(quantizedRowNode(
-            node, 1, { allowUnprovenInvariantInputs: true },
+            node, singleLaneRowSet(1), { allowUnprovenInvariantInputs: true },
           ));
         } catch {
           // Row execution is opt-in. The full graph remains valid even when an
@@ -3180,7 +2888,7 @@ export class WasmEngine extends BackendEngine {
       if (node.opType === 'Expand') {
         try {
           incrementalRow = compileExpandDescriptor(quantizedRowNode(
-            node, 1, { allowUnprovenInvariantInputs: true },
+            node, singleLaneRowSet(1), { allowUnprovenInvariantInputs: true },
           ));
         } catch {
           // Fixed-shape row execution is optional; its preflight reports the
@@ -3505,6 +3213,19 @@ export class WasmEngine extends BackendEngine {
     }
   }
 
+  _refreshAllocatedTensorViews(graph: WasmGraph): void {
+    for (const [name, pointer] of this.pointers) {
+      const tensor = graph.tensors.get(name);
+      const capacity = this.tensorCapacities.get(name);
+      if (!tensor || !capacity || capacity.dtype !== tensor.dtype ||
+          tensor.sizeBytes > capacity.capacityBytes) {
+        throw new Error(`WASM tensor '${name}' exceeds or disagrees with its committed capacity.`);
+      }
+      tensor.buffer = wasmTensorView(tensor, this.mem.buffer, pointer);
+    }
+    this.#viewedMemoryBuffer = this.mem.buffer;
+  }
+
   _refreshGraphTensorViews(graph: WasmGraph): void {
     for (const [name, tensor] of graph.tensors.entries()) {
       const pointer = this.pointers.get(name);
@@ -3515,6 +3236,7 @@ export class WasmEngine extends BackendEngine {
       }
       tensor.buffer = wasmTensorView(tensor, this.mem.buffer, pointer);
     }
+    this.#viewedMemoryBuffer = this.mem.buffer;
   }
 
   _assertReusableGraph(graph: WasmGraph): void {
@@ -3600,7 +3322,7 @@ export class WasmEngine extends BackendEngine {
       }
       new Uint8Array(this.mem.buffer, write.pointer, write.bytes.byteLength).set(write.bytes);
     }
-    const actualEnd = Number(this.api.heap_mark?.());
+    const actualEnd = this._heapMark();
     if (!Number.isSafeInteger(actualEnd) || actualEnd !== measuredEnd) {
       throw new Error('WASM staged variant allocation disagreed with its preflight measurement.');
     }
@@ -3608,6 +3330,9 @@ export class WasmEngine extends BackendEngine {
 
   _prepareInvariantWeightPacks(graph: WasmGraph, prepared: WasmPreparedGraph): void {
     for (const step of prepared.schedule) {
+      if (this.#viewedMemoryBuffer !== this.mem.buffer) {
+        this._refreshAllocatedTensorViews(graph);
+      }
       const node = graph.nodes[step.nodeIndex];
       this._compilePackedF32Linear(node);
       const qlinear = portableQLinearDescriptor(node);
@@ -3951,12 +3676,11 @@ export class WasmEngine extends BackendEngine {
     arenaCapacities: ReadonlyMap<RuntimeDType, number> | null,
   ): void {
     const mark = this._activationArenaMark;
-    if (mark == null || typeof this.api.heap_rewind !== 'function' ||
-        this.api.heap_rewind(mark) !== 1) {
+    if (mark == null || !this._heapRewind(mark)) {
       throw new Error('WASM reusable arena could not rewind while restoring its previous variant.');
     }
     this._installActivationLayout(graph, capacities, arenaCapacities);
-    const metadataMark = Number(this.api.heap_mark?.());
+    const metadataMark = this._heapMark();
     if (!Number.isSafeInteger(metadataMark) || metadataMark < mark) {
       throw new Error('WASM reusable arena returned an invalid restored metadata mark.');
     }
@@ -3978,8 +3702,7 @@ export class WasmEngine extends BackendEngine {
     options: Pick<WasmGraphAllocationOptions, 'shapeSignature'> = {},
   ) {
     const mark = this._activationArenaMark;
-    if (mark == null || typeof this.api.heap_mark !== 'function' ||
-        typeof this.api.heap_rewind !== 'function') {
+    if (mark == null) {
       throw new Error('WASM module does not expose the reusable dynamic-shape arena ABI.');
     }
     if (!options || typeof options !== 'object' || Array.isArray(options) ||
@@ -4035,7 +3758,7 @@ export class WasmEngine extends BackendEngine {
       this._refreshGraphTensorViews(previousGraph);
     }
     try {
-      if (this.api.heap_rewind(mark) !== 1) {
+      if (!this._heapRewind(mark)) {
         throw new Error('WASM reusable arena rejected its committed mark.');
       }
       this._installActivationLayout(
@@ -4043,7 +3766,7 @@ export class WasmEngine extends BackendEngine {
         capacityCandidate.capacities,
         capacityCandidate.arenaCapacities,
       );
-      const actualMetadataMark = Number(this.api.heap_mark());
+      const actualMetadataMark = this._heapMark();
       if (!Number.isSafeInteger(actualMetadataMark) ||
           actualMetadataMark !== measuredMetadataMark) {
         throw new Error('WASM activation layout disagreed with its preflight measurement.');
@@ -4109,6 +3832,11 @@ export class WasmEngine extends BackendEngine {
     preparedGraph: Readonly<object> = this.prepareGraph(graph),
     allocationOptions: WasmGraphAllocationOptions = {},
   ) {
+    if (this.#sharedRegion === null && this.#sharedPool !== null) {
+      throw new Error(
+        'WASM provider root owns shared compiled/context regions and cannot compile a graph directly.',
+      );
+    }
     /* Opt-in phase breakdown. Reading the global once here is the only cost
      * when it is unset; every site below then tests one null field. */
     const profile = (globalThis as any).__VOLVOX_WASM_COMPILE_PROFILE
@@ -4165,7 +3893,7 @@ export class WasmEngine extends BackendEngine {
     }
     this.resetDecodeCache();
     console.log("[VolvoxAI WASM] Allocating graph tensors on WASM heap...");
-    if (this.api.reset_heap) this.api.reset_heap();
+    this._resetAllocator();
     this.pointers.clear();
     this.tensorCapacities.clear();
     this.tensorMaximumBytes.clear();
@@ -4196,6 +3924,15 @@ export class WasmEngine extends BackendEngine {
     this._variantRebindCount = 0;
     this._f32PackCount = 0;
     this._q8PackCount = 0;
+    this._rawWeightCopyCount = 0;
+    this._rawWeightCopyBytes = 0;
+    this.#invariantPrefix?.install(
+      graph,
+      this.pointers,
+      this.tensorCapacities,
+      this.f32PackedWeights,
+      this.q8PackedWeights,
+    );
     // WASM is an inference backend. Eliminate standalone Dropout before heap
     // allocation so it consumes neither a separate activation nor a runtime
     // call. Chained Dropout aliases are resolved after ordinary tensors.
@@ -4264,8 +4001,8 @@ export class WasmEngine extends BackendEngine {
       }
     }
     this._prepareInvariantWeightPacks(graph, prepared);
-    if (typeof this.api.heap_mark === 'function') {
-      const activationMark = Number(this.api.heap_mark());
+    if (this.#sharedRegion !== null || typeof this.api.heap_mark === 'function') {
+      const activationMark = this._heapMark();
       if (!Number.isSafeInteger(activationMark) || activationMark < 0 ||
           activationMark > WASM_PORTABLE_MAX_U32 || (activationMark & 15) !== 0) {
         throw new Error('WASM allocator returned an invalid activation-arena mark.');
@@ -4322,8 +4059,8 @@ export class WasmEngine extends BackendEngine {
         }));
       }
     }
-    if (typeof this.api.heap_mark === 'function') {
-      const metadataMark = Number(this.api.heap_mark());
+    if (this.#sharedRegion !== null || typeof this.api.heap_mark === 'function') {
+      const metadataMark = this._heapMark();
       if (!Number.isSafeInteger(metadataMark) || metadataMark < 0 ||
           metadataMark > WASM_PORTABLE_MAX_U32 || (metadataMark & 15) !== 0) {
         throw new Error('WASM allocator returned an invalid metadata-arena mark.');
@@ -4408,9 +4145,10 @@ export class WasmEngine extends BackendEngine {
       );
       this._activationCapacityHighWaterBytes = this._activationCapacityBytes;
     }
-    if (typeof this.api.heap_mark === 'function' &&
-        typeof this.api.heap_rewind === 'function') {
-      const end = Number(this.api.heap_mark());
+    if (this.#sharedRegion !== null ||
+        (typeof this.api.heap_mark === 'function' &&
+         typeof this.api.heap_rewind === 'function')) {
+      const end = this._heapMark();
       if (!Number.isSafeInteger(end) || end < 0 || end > WASM_PORTABLE_MAX_U32 ||
           (end & 15) !== 0 || this._activationArenaMark == null ||
           this._metadataArenaMark == null || this._metadataArenaMark < this._activationArenaMark ||
@@ -4453,6 +4191,7 @@ export class WasmEngine extends BackendEngine {
       .reduce((total, descriptor) => total + descriptor.bytes, 0) +
       [...this.q8PackedWeights.values()]
         .reduce((total, descriptor) => total + descriptor.bytes, 0);
+    const region = this.#sharedRegion;
     return Object.freeze({
       reusable: this._variantArenaMark !== null,
       currentSignature: this._currentShapeSignature,
@@ -4478,13 +4217,51 @@ export class WasmEngine extends BackendEngine {
       variantRebindCount: this._variantRebindCount,
       f32PackCount: this._f32PackCount,
       q8PackCount: this._q8PackCount,
+      rawWeightCopyCount: this._rawWeightCopyCount,
+      rawWeightCopyBytes: this._rawWeightCopyBytes,
+      sharedInvariant: this.#invariantPrefix?.inspect() ?? null,
+      mutableArenaOffsetBytes: region?.kind === 'context-mutable' ? region.base : null,
+      mutableArenaBytes: region?.kind === 'context-mutable'
+        ? region.highWater - region.base : 0,
+      mutableArenaMaximumBytes: region?.kind === 'context-mutable'
+        ? region.maximumBytes : 0,
     });
   }
 
-  async execute(
+  /**
+   * Inspect the one independent WebAssembly linear-memory backing owned by this
+   * engine. A grow can replace the JavaScript buffer object, so immutable
+   * resource geometry must use a new generation after either identity or extent
+   * changes. Arena totals remain separate accounting inside this root.
+   */
+  inspectMemoryRoot(): Readonly<WasmMemoryRootInspection> {
+    if (this.#sharedPool) return this.#sharedPool.inspectRoot();
+    const buffer = this.mem.buffer;
+    const addressableBytes = buffer.byteLength;
+    this.#memoryRootEngineIdentity ??= runtimeIdentity('wasm-engine');
+    if (buffer !== this.#memoryRootBuffer ||
+        addressableBytes !== this.#memoryRootAddressableBytes) {
+      if (this.#memoryRootGeneration === Number.MAX_SAFE_INTEGER) {
+        throw new Error('WASM linear-memory root generation exceeds exact JavaScript arithmetic.');
+      }
+      this.#memoryRootBuffer = buffer;
+      this.#memoryRootAddressableBytes = addressableBytes;
+      this.#memoryRootGeneration++;
+    }
+    return Object.freeze({
+      engineId: this.#memoryRootEngineIdentity,
+      generation: this.#memoryRootGeneration,
+      addressableBytes,
+    });
+  }
+
+  executePinned(
     inputs: Record<string, RuntimeTypedArray>,
     options: WasmExecutionOptions = {},
-  ): Promise<Record<string, RuntimeTypedArray>> {
+  ): Record<string, RuntimeTypedArray> {
+    if (this.#sharedRegion === null && this.#sharedPool !== null) {
+      throw new Error('WASM provider root execution is sealed by its shared linear pool.');
+    }
     assertInferenceExecutionOptions(options, 'WASM inference');
     const incremental = incrementalExecutionEnabled(options, null);
     if (incremental && this._activationStorage === 'liveness') {
@@ -4506,6 +4283,9 @@ export class WasmEngine extends BackendEngine {
       : null;
     let mark = phase ? performance.now() : 0;
     this.graph.assertTopologyRevision?.(this.compiledTopologyRevision, "WASM");
+    if (this.#viewedMemoryBuffer !== this.mem.buffer) {
+      this._refreshGraphTensorViews(this.graph);
+    }
     this._beginDecodeExecution(options);
     if ((this.graph.weightRevision || 0) !== this.compiledWeightRevision) {
       throw new Error("WASM weights changed after compilation; recompile the graph before execution.");
@@ -4516,11 +4296,14 @@ export class WasmEngine extends BackendEngine {
       ? incrementalNodeSelection(this.graph, inputs, options, cacheWasValid)
       : null;
     this._incrementalCacheValid = false;
-    const rowPosition = incrementalRowPosition(options, selectedNodes, cacheWasValid);
-    const incrementalRows = rowPosition == null
+    const rowSet = decodeRowSetFromOptions(options, selectedNodes, cacheWasValid);
+    const rowPosition = rowSet == null ? null : rowSet.positions[0];
+    const incrementalRows = rowSet == null
       ? null
-      : prepareQuantizedRows(this.graph, selectedNodes, rowPosition, {
+      : prepareQuantizedRows(this.graph, selectedNodes, rowSet, {
           changedInputs: options.changedInputs ?? Object.keys(inputs),
+          allocateKVScratch: (key, elements, sample) =>
+            this._allocateKVScratch(key, elements, sample),
         });
     const copiedInputs = selectedNodes === null
       ? null
@@ -4552,6 +4335,11 @@ export class WasmEngine extends BackendEngine {
       const node = this.graph.nodes[nodeIndex];
       const kernelRoute = step.kernelRoute;
       const decodeNode = incrementalRows?.get(nodeIndex) || null;
+      /* Staged operands are filled here rather than when the row plan was
+       * built: the last token of a visible K/V prefix, and every lane's own
+       * input row, are produced by this same step, and a plan-time copy would
+       * read the previous step's bytes for them. */
+      decodeNode?.gatherRows?.();
       // Opt-in per-operator profiling. Set `globalThis.__VOLVOX_WASM_PROFILE`
       // to a Map before execute() and each node's elapsed time accumulates
       // under its opType; leave it unset and this costs one truthiness check.
@@ -4562,6 +4350,7 @@ export class WasmEngine extends BackendEngine {
       const profile = (globalThis as any).__VOLVOX_WASM_PROFILE as
         Map<string, { ms: number; count: number }> | undefined;
       const profileStart = profile ? performance.now() : 0;
+      let failed = false;
       try {
        const inPtr = this.pointers.get(node.inputs.input?.name)!;
        const outPtr = this.pointers.get(node.outputs.out?.name)!;
@@ -4765,7 +4554,7 @@ export class WasmEngine extends BackendEngine {
             this.pointers.get(descriptor.bias.name), descriptor.weightScalesPointer,
             descriptor.weightZeroPointsPointer,
             outputPointer,
-            decodeNode ? 1 : descriptor.rows, descriptor.dIn, descriptor.dOut,
+            decodeNode ? rowSet!.lanes : descriptor.rows, descriptor.dIn, descriptor.dOut,
             descriptor.inputScale, descriptor.inputZeroPoint,
             descriptor.outputScale, descriptor.outputZeroPoint,
             descriptor.inputDtype, descriptor.weightDtype, descriptor.outputDtype,
@@ -4798,7 +4587,14 @@ export class WasmEngine extends BackendEngine {
             this.pointers.get(descriptor.bias.name), descriptor.weightScalesPointer,
             descriptor.weightZeroPointsPointer,
             outputPointer,
-            decodeNode ? 1 : descriptor.rows, descriptor.dIn, descriptor.dOut,
+            /* `rowSet.lanes`, not one: a batched step stages every lane's row
+             * into one contiguous span, so the kernel walks `lanes` rows. This
+             * read `1`, which computed lane zero and left the other lanes'
+             * staged output rows uninitialised -- then scattered them into the
+             * retained image. The FP32 routes derive their extents from the row
+             * node's own shapes and were unaffected, which is why only the
+             * quantized decode routes carried it. */
+            decodeNode ? rowSet!.lanes : descriptor.rows, descriptor.dIn, descriptor.dOut,
             descriptor.inputScale, descriptor.inputZeroPoint,
             descriptor.outputScale, descriptor.outputZeroPoint,
             descriptor.inputDtype, descriptor.weightDtype, descriptor.outputDtype,
@@ -5232,7 +5028,7 @@ export class WasmEngine extends BackendEngine {
             descriptor.weightScalesPointer, descriptor.weightZeroPointsPointer,
             decodeNode ? wasmTensorPointer(decodeOutput, this.mem, 'QEmbedding row output') :
               this.pointers.get(descriptor.output.name),
-            decodeNode ? 1 : descriptor.tokens, descriptor.vocab, descriptor.hidden,
+            decodeNode ? rowSet!.lanes : descriptor.tokens, descriptor.vocab, descriptor.hidden,
             descriptor.outputScale, descriptor.outputZeroPoint,
             descriptor.weightDtype, descriptor.outputDtype,
           );
@@ -5373,7 +5169,7 @@ export class WasmEngine extends BackendEngine {
             this.pointers.get(descriptor.weight.name), this.pointers.get(descriptor.bias.name),
             decodeNode ? wasmTensorPointer(decodeOutput, this.mem, 'QLayerNorm row output') :
               this.pointers.get(descriptor.output.name),
-            decodeNode ? 1 : descriptor.rows, descriptor.dModel,
+            decodeNode ? rowSet!.lanes : descriptor.rows, descriptor.dModel,
             descriptor.inputScale, descriptor.inputZeroPoint,
             descriptor.outputScale, descriptor.outputZeroPoint, descriptor.epsilon,
             descriptor.inputDtype, descriptor.outputDtype,
@@ -6185,6 +5981,7 @@ export class WasmEngine extends BackendEngine {
              throw new Error(`WASM operator '${node.opType}' is unsupported.`);
         }
       } catch (e) {
+          failed = true;
           console.error("[WasmEngine] Execution failed at node:", node, e);
           throw e;
       } finally {
@@ -6201,6 +5998,11 @@ export class WasmEngine extends BackendEngine {
           entry.count += 1;
           profile.set(key, entry);
         }
+        /* Staged outputs are written back before the next node gathers, so a
+         * consumer inside the same step sees this node's rows. In `finally`
+         * for the same reason the profile entry is: a node that threw leaves
+         * the retained image untouched rather than half-updated. */
+        if (!failed) decodeNode?.scatterRows?.();
       }
     }
 
@@ -6218,5 +6020,21 @@ export class WasmEngine extends BackendEngine {
     }
     if (phase) phase('publish-outputs', mark);
     return results;
+  }
+
+  /** Public direct-engine surface. Provider contexts use executePinned so
+   * output ownership is captured before the first asynchronous yield. */
+  async execute(
+    inputs: Record<string, RuntimeTypedArray>,
+    options: WasmExecutionOptions = {},
+  ): Promise<Record<string, RuntimeTypedArray>> {
+    const outputs = this.executePinned(inputs, options);
+    if (this.#sharedRegion === null) return outputs;
+    return Object.fromEntries(Object.entries(outputs).map(([name, value]) => [
+      name,
+      new (value.constructor as {
+        new(source: ArrayLike<number>): RuntimeTypedArray;
+      })(value),
+    ]));
   }
 };

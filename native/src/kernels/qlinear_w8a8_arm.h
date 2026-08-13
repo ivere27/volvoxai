@@ -3,10 +3,10 @@
 
 #include <stdint.h>
 
-/* Native-only ARM candidate for the canonical physical W8A8 QLinear ABI.
+/* Native-only ARM candidate for the canonical W8A8 QLinear ABI.
  * It returns 1 only after writing a complete result; 0 means that the caller
  * must use the authoritative portable qlinear_i8u8 implementation instead.
- * The declaration is intentionally separate from quant_cpu_opt.h so the ARM
+ * The declaration is intentionally separate from quant_cpu_isa.h so the ARM
  * implementation can evolve without coupling to the W8A32 kernels. */
 int vx_qlinear_i8u8_arm_try(const void* input, const void* weight,
                             const int32_t* bias, const float* weight_scales,

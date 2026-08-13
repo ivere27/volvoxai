@@ -5,6 +5,7 @@ import type { ResolvedTensorDescriptor } from './ResolvedShapePlan.js';
 import type { RuntimeDType, RuntimeTypedArray } from '../types.js';
 import { memoryLocations, runtimeDTypes } from '../generated/volvoxaiEnums.js';
 import type { MemoryLocationValue } from '../generated/volvoxaiEnums.js';
+import type { RuntimeMemoryEvidence } from './MemoryCapture.js';
 import {
   DEVICE_TENSOR_REFERENCE_BRAND,
   registerDeviceTensorReference,
@@ -14,6 +15,14 @@ import {
 const RUNTIME_DTYPES = new Set<unknown>(runtimeDTypes);
 const MEMORY_LOCATIONS = new Set<unknown>(memoryLocations);
 const INTERNAL_RESULT_CONSTRUCTION_TOKEN = Symbol('volvoxai.internal-result-construction');
+const INTERNAL_RESULT_HOST_TAKE_TOKEN = Symbol('volvoxai.internal-result-host-take');
+
+interface ExecutionResultInternalState {
+  acceptingCloseFinalizers: boolean;
+  readonly closeFinalizers: Set<() => void>;
+}
+
+const EXECUTION_RESULT_INTERNALS = new WeakMap<ExecutionResult, ExecutionResultInternalState>();
 
 interface BackendTensorSnapshotBase {
   readonly name: string;
@@ -37,6 +46,7 @@ export interface BackendDeviceTensorSnapshot extends BackendTensorSnapshotBase {
   readonly deviceType?: 'webgpu';
   /** Exact physical owner used for same-device input validation. */
   readonly device?: GPUDevice;
+  /** Every successful call transfers fresh caller-owned exact host storage. */
   read(): Promise<RuntimeTypedArray>;
   release(): void;
 }
@@ -65,7 +75,16 @@ export interface ExecutionDecodeState {
   readonly cacheState: 'not-applicable' | 'seeded' | 'advanced';
   readonly cacheGeneration: number | null;
   readonly position: number | null;
+  /** Lane zero's active length; the one-lane spelling of the array below. */
   readonly activeSequenceLength: number | null;
+  /**
+   * Every decode lane's active key/value length, in lane order.
+   *
+   * A value and never a shape: lanes at different lengths are what B>1 decode
+   * is about, and deriving an output shape from them would make a public ragged
+   * tensor. Null when the operation carried no decode state.
+   */
+  readonly activeSequenceLengths: readonly number[] | null;
   readonly kvCapacity: number | null;
   readonly kvCapacityClass: number | null;
   readonly semanticSeedSignature: string | null;
@@ -113,6 +132,7 @@ export interface ExecutionReport {
   readonly decodeState: ExecutionDecodeState;
   readonly operatorFallback: 'none' | 'reported' | 'unknown';
   readonly backendReport: Readonly<Record<string, unknown>> | null;
+  readonly memoryEvidence?: RuntimeMemoryEvidence;
 }
 
 function cloneSerializable(
@@ -396,6 +416,31 @@ export class TensorResult implements DeviceTensorReference {
     return pending;
   }
 
+  /** @internal Transfer unpublished result-owned host storage without a public read clone. */
+  async _takeHostStorage(token: symbol): Promise<RuntimeTypedArray> {
+    if (token !== INTERNAL_RESULT_HOST_TAKE_TOKEN || this.#isDisposed() || this.#released) {
+      throw new VolvoxAIError('RESULT_DISPOSED',
+        `Result tensor '${this.name}' cannot transfer its storage.`, {
+          phase: 'readback',
+        });
+    }
+    if (this.#data !== null) {
+      const data = this.#data;
+      this.#data = null;
+      this.#released = true;
+      return data;
+    }
+    const operation = async (): Promise<RuntimeTypedArray> => {
+      const data = await this.#deviceRead!();
+      Tensor.assertCompatibleBuffer(this.dtype, data, this.logicalSizeBytes,
+        `Result tensor '${this.name}' readback`);
+      return data;
+    };
+    const pending = this.#tail.then(operation, operation);
+    this.#tail = pending.then(() => undefined, () => undefined);
+    return pending;
+  }
+
   /** @internal Drain accepted reads before releasing result-owned storage. */
   async _close(): Promise<void> {
     await this.#tail;
@@ -432,6 +477,7 @@ class ResultOutputMap implements ReadonlyMap<string, TensorResult> {
 
 /** Stable host/device snapshot owned independently from its execution context. */
 export class ExecutionResult {
+  readonly id: string;
   readonly backend: string;
   readonly report: ExecutionReport;
   readonly outputs: ReadonlyMap<string, TensorResult>;
@@ -446,9 +492,10 @@ export class ExecutionResult {
     report: ExecutionReport,
     expectedOutputs: readonly ResolvedTensorDescriptor[],
     constructionToken?: symbol,
+    finalizeReport?: (result: ExecutionResult) => ExecutionReport,
   ) {
+    this.id = runtimeIdentity('result');
     this.backend = backend;
-    this.report = Object.freeze({ ...report });
     if (!snapshot || typeof snapshot !== 'object' || !Array.isArray(snapshot.outputs)) {
       throw new VolvoxAIError('EXECUTION_FAILED',
         `Backend '${backend}' returned an invalid execution snapshot.`, {
@@ -496,6 +543,15 @@ export class ExecutionResult {
     }
     this.#ownedOutputs = outputs;
     this.outputs = new ResultOutputMap(outputs);
+    EXECUTION_RESULT_INTERNALS.set(this, {
+      acceptingCloseFinalizers: true,
+      closeFinalizers: new Set(),
+    });
+    const publishedReport = constructionToken === INTERNAL_RESULT_CONSTRUCTION_TOKEN &&
+        finalizeReport !== undefined
+      ? finalizeReport(this)
+      : report;
+    this.report = Object.freeze({ ...publishedReport });
   }
 
   get closed(): boolean {
@@ -520,20 +576,86 @@ export class ExecutionResult {
   close(): Promise<void> {
     if (this.#closePromise) return this.#closePromise;
     this.#state = 'closing';
+    const internal = EXECUTION_RESULT_INTERNALS.get(this)!;
+    internal.acceptingCloseFinalizers = false;
     this.#closePromise = Promise.all(
       Array.from(this.#ownedOutputs.values(), (output) => output._close()),
-    ).then(() => {
-      this.#state = 'closed';
-    }, (error) => {
-      this.#state = 'closed';
+    ).then(() => undefined, (error) => {
       throw error;
+    }).finally(() => {
+      this.#state = 'closed';
+      for (const finalize of internal.closeFinalizers) {
+        try {
+          finalize();
+        } catch {
+          // Retention accounting is best-effort cleanup and cannot replace a
+          // physical output close failure or strand the remaining callbacks.
+        }
+      }
+      internal.closeFinalizers.clear();
     });
     return this.#closePromise;
+  }
+
+  /** @internal Extract exact unpublished host output storage for batch splitting. */
+  async _takeHostOutputs(
+    names: readonly string[],
+    token: symbol,
+  ): Promise<ReadonlyMap<string, RuntimeTypedArray>> {
+    if (token !== INTERNAL_RESULT_HOST_TAKE_TOKEN || this.#state !== 'open') {
+      throw new VolvoxAIError('RESULT_DISPOSED',
+        'ExecutionResult cannot transfer its output storage.', {
+          phase: 'readback', backend: this.backend,
+        });
+    }
+    const outputs = names.map((name) => {
+      const output = this.#ownedOutputs.get(name);
+      if (!output) {
+        throw new VolvoxAIError('INVALID_ARGUMENT',
+          `Execution result has no output named '${name}'.`, {
+            phase: 'readback', backend: this.backend,
+          });
+      }
+      return output;
+    });
+    const storage = await Promise.all(outputs.map((output) =>
+      output._takeHostStorage(INTERNAL_RESULT_HOST_TAKE_TOKEN)));
+    return new Map(names.map((name, index) => [name, storage[index]]));
   }
 
   dispose(): Promise<void> {
     return this.close();
   }
+}
+
+/** @internal Attach Runtime retention accounting before a result is published. */
+export function registerExecutionResultCloseFinalizer(
+  result: ExecutionResult,
+  finalize: () => void,
+): () => void {
+  const internal = EXECUTION_RESULT_INTERNALS.get(result);
+  if (!internal || !internal.acceptingCloseFinalizers || result.closed ||
+      typeof finalize !== 'function') {
+    throw new VolvoxAIError('ABI_UNSUPPORTED',
+      'ExecutionResult cannot accept a Runtime retention lease.', {
+        phase: 'execution', backend: result?.backend,
+      });
+  }
+  internal.closeFinalizers.add(finalize);
+  let registered = true;
+  return () => {
+    if (!registered) return;
+    registered = false;
+    internal.closeFinalizers.delete(finalize);
+  };
+}
+
+/** @internal One readback/transfer of unpublished B=N output storage. */
+export function takeExecutionResultHostOutputs(
+  result: ExecutionResult,
+  names: readonly string[],
+): Promise<ReadonlyMap<string, RuntimeTypedArray>> {
+  return result._takeHostOutputs(names, INTERNAL_RESULT_HOST_TAKE_TOKEN);
 }
 
 /** @internal Construct the only ExecutionResult allowed to issue device inputs. */
@@ -542,6 +664,7 @@ export function createExecutionResult(
   snapshot: BackendExecutionSnapshot,
   report: ExecutionReport,
   expectedOutputs: readonly ResolvedTensorDescriptor[],
+  finalizeReport?: (result: ExecutionResult) => ExecutionReport,
 ): ExecutionResult {
   return new ExecutionResult(
     backend,
@@ -549,5 +672,6 @@ export function createExecutionResult(
     report,
     expectedOutputs,
     INTERNAL_RESULT_CONSTRUCTION_TOKEN,
+    finalizeReport,
   );
 }

@@ -80,9 +80,10 @@ static int cuda_conv_norm_shape_any_changed(const float* before,
 
 static int cuda_conv_norm_shape_begin(int use_cuda) {
     begin_graph();
-    g_use_vulkan = g_use_nnapi = g_use_opengl = g_use_metal = 0;
+    g_use_vulkan = g_use_opengl = g_use_metal = 0;
     g_use_cuda = use_cuda;
-    if (use_cuda && cuda_init() != 0) {
+    if (use_cuda &&
+        vx_backend_manager_activate(VOLVOXAI_BACKEND_CUDA) != 0) {
         int unavailable = cuda_init_failure_is_unavailable();
         if (finish_graph() != 0) return -1;
         return unavailable ? 1 : -1;
@@ -547,6 +548,11 @@ static int test_cuda_conv_norm_shape_runtime_optional(void) {
     CudaOptionalContractTrainingSnapshot cpu_optional, cuda_optional;
     CudaConvLayoutTrainingSnapshot cpu_layout, cuda_layout;
 
+    /* Run the oversized private-training-storage regression before the CUDA
+       availability gate. Persisted graph affine descriptors remain exact. */
+    CHECK(run_cuda_optional_contract_training_parity_case(
+        0, &cpu_optional) == 0);
+
     CHECK(run_cuda_cnn_training_parity_case(0, &cpu_cnn) == 0);
     int cuda_result = run_cuda_cnn_training_parity_case(1, &cuda_cnn);
     if (cuda_result == 1) {
@@ -612,8 +618,6 @@ static int test_cuda_conv_norm_shape_runtime_optional(void) {
     }
     CHECK(test_cuda_fused_add_malformed_contract() == 0);
 
-    CHECK(run_cuda_optional_contract_training_parity_case(
-        0, &cpu_optional) == 0);
     CHECK(run_cuda_optional_contract_training_parity_case(
         1, &cuda_optional) == 0);
     CHECK(cuda_conv_norm_shape_arrays_close(

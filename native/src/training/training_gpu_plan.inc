@@ -33,7 +33,7 @@ int volvoxai_engine_last_training_backend(void) {
 enum {
     GPU_TRAINING_READ = 1,
     GPU_TRAINING_READ_WRITE = 3,
-    GPU_TRAINING_MAX_BINDINGS = 11,
+    GPU_TRAINING_MAX_BINDINGS = 13,
     GPU_TRAINING_CUDA_BASIC_SCALAR_ITEMS_PER_PARTIAL = 4096
 };
 
@@ -1225,6 +1225,8 @@ static int gpu_plan_moe_linear(GpuTrainingPlan* plan, float** grads, Node* n, T*
         out->numel != rows * d_out || indices->numel != gates->numel || top_k <= 0 ||
         top_k > experts || top_k > 8 || (bias && bias->numel != (long)experts * d_out)) return -1;
     uint32_t* params = (uint32_t*)gpu_training_plan_alloc(plan, 8 * sizeof(uint32_t));
+    uint32_t* slot_rows = NULL;
+    uint32_t* row_slots = NULL;
     float* gi = grad_for(grads, in); float* gw = grad_for(grads, weight);
     float* gb = bias ? grad_for(grads, bias) : NULL; float* gg = grad_for(grads, gates);
     uint32_t input_groups = gpu_groups_64(rows * d_in);
@@ -1235,8 +1237,37 @@ static int gpu_plan_moe_linear(GpuTrainingPlan* plan, float** grads, Node* n, T*
         !bias_groups || !gate_groups) return -1;
     params[0] = (uint32_t)rows; params[1] = (uint32_t)d_in; params[2] = (uint32_t)d_out;
     params[3] = (uint32_t)experts; params[4] = (uint32_t)top_k; params[5] = bias ? 1u : 0u;
-    void* hosts[11]; size_t bytes[11]; unsigned char access[11];
-    gpu_bindings_init(hosts, bytes, access, 11);
+    if (n->resident_slot_rows) {
+        const uint32_t domain = n->resident_slot_domain;
+        if (domain < (uint32_t)experts || top_k > (int)domain ||
+            (size_t)domain > SIZE_MAX / sizeof(*slot_rows)) return -1;
+        slot_rows = (uint32_t*)gpu_training_plan_alloc(
+            plan, (size_t)domain * sizeof(*slot_rows));
+        row_slots = (uint32_t*)gpu_training_plan_alloc(
+            plan, (size_t)experts * sizeof(*row_slots));
+        if (!slot_rows || !row_slots) return -1;
+        memcpy(slot_rows, n->resident_slot_rows,
+               (size_t)domain * sizeof(*slot_rows));
+        for (int row = 0; row < experts; row++) row_slots[row] = VX_MOE_SLOT_ABSENT;
+        for (uint32_t slot = 0; slot < domain; slot++) {
+            const uint32_t row = slot_rows[slot];
+            if (row == VX_MOE_SLOT_ABSENT) continue;
+            if (row >= (uint32_t)experts || row_slots[row] != VX_MOE_SLOT_ABSENT)
+                return -1;
+            row_slots[row] = slot;
+        }
+        for (int row = 0; row < experts; row++)
+            if (row_slots[row] == VX_MOE_SLOT_ABSENT) return -1;
+        params[6] = domain;
+    } else {
+        slot_rows = (uint32_t*)gpu_training_plan_alloc(plan, sizeof(*slot_rows));
+        row_slots = (uint32_t*)gpu_training_plan_alloc(plan, sizeof(*row_slots));
+        if (!slot_rows || !row_slots) return -1;
+        params[6] = 0u;
+    }
+    params[7] = 0u;
+    void* hosts[13]; size_t bytes[13]; unsigned char access[13];
+    gpu_bindings_init(hosts, bytes, access, 13);
     gpu_binding_tensor(hosts, bytes, 0, in); gpu_binding_tensor(hosts, bytes, 1, weight);
     gpu_binding_tensor(hosts, bytes, 2, bias); gpu_binding_tensor(hosts, bytes, 3, indices);
     gpu_binding_tensor(hosts, bytes, 4, gates); gpu_binding_gradient(hosts, bytes, 5, go, out->numel);
@@ -1244,15 +1275,23 @@ static int gpu_plan_moe_linear(GpuTrainingPlan* plan, float** grads, Node* n, T*
     gpu_binding_gradient(hosts, bytes, 7, gw, weight->numel);
     gpu_binding_gradient(hosts, bytes, 8, gb, bias ? bias->numel : 0);
     gpu_binding_gradient(hosts, bytes, 9, gg, gates->numel);
-    gpu_binding_params(hosts, bytes, 10, params, 8 * sizeof(uint32_t));
+    hosts[10] = slot_rows;
+    bytes[10] = n->resident_slot_rows
+        ? (size_t)n->resident_slot_domain * sizeof(*slot_rows)
+        : sizeof(*slot_rows);
+    hosts[11] = row_slots;
+    bytes[11] = n->resident_slot_rows
+        ? (size_t)experts * sizeof(*row_slots)
+        : sizeof(*row_slots);
+    gpu_binding_params(hosts, bytes, 12, params, 8 * sizeof(uint32_t));
     access[6] = access[7] = access[8] = access[9] = GPU_TRAINING_READ_WRITE;
-    if (gpu_training_plan_add(plan, "moeLinearBackward", "input_main", hosts, bytes, access, 11,
+    if (gpu_training_plan_add(plan, "moeLinearBackward", "input_main", hosts, bytes, access, 13,
                               input_groups, 1, 1) != 0 ||
-        gpu_training_plan_add(plan, "moeLinearBackward", "weight_main", hosts, bytes, access, 11,
+        gpu_training_plan_add(plan, "moeLinearBackward", "weight_main", hosts, bytes, access, 13,
                               weight_groups, 1, 1) != 0) return -1;
-    if (bias && gpu_training_plan_add(plan, "moeLinearBackward", "bias_main", hosts, bytes, access, 11,
+    if (bias && gpu_training_plan_add(plan, "moeLinearBackward", "bias_main", hosts, bytes, access, 13,
                                       bias_groups, 1, 1) != 0) return -1;
-    return gpu_training_plan_add(plan, "moeLinearBackward", "route_main", hosts, bytes, access, 11,
+    return gpu_training_plan_add(plan, "moeLinearBackward", "route_main", hosts, bytes, access, 13,
                                  gate_groups, 1, 1);
 }
 

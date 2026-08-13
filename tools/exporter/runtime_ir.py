@@ -473,7 +473,7 @@ def _verify_node_output_assertions(graph: GraphIR) -> None:
             # reference-free request here would necessarily be incomplete.
             continue
         if not symbolic:
-            # Concrete Wave-A operators use the shared generated-ID-backed
+            # Concrete direct operators use the shared generated-ID-backed
             # canonical implementation directly.  Quantized descriptors need
             # resolved numeric affine values and continue through the exact
             # package descriptor validator below.

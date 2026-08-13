@@ -150,7 +150,6 @@ typedef struct {
     int* concat_sigmoid_fuse;
     int node_count;
     int use_vulkan;
-    int use_nnapi;
     int use_opengl;
     int use_metal;
     int use_cuda;
@@ -172,7 +171,6 @@ static void training_graph_release_base_route(TrainingGraphState* state) {
 static void training_graph_restore_backends(TrainingGraphState* state) {
     if (!state || !state->backends_saved) return;
     g_use_vulkan = state->use_vulkan;
-    g_use_nnapi = state->use_nnapi;
     g_use_opengl = state->use_opengl;
     g_use_metal = state->use_metal;
 #if VOLVOXAI_ENABLE_CUDA
@@ -291,7 +289,6 @@ static int training_graph_prepare(TrainingGraphState* state, uint32_t training_c
      * must know whether CUDA weights can remain resident or whether a CPU/
      * other-backend handoff must first materialize them. */
     state->use_vulkan = g_use_vulkan;
-    state->use_nnapi = g_use_nnapi;
     state->use_opengl = g_use_opengl;
     state->use_metal = g_use_metal;
 #if VOLVOXAI_ENABLE_CUDA
@@ -300,7 +297,6 @@ static int training_graph_prepare(TrainingGraphState* state, uint32_t training_c
     state->backends_saved = 1;
     state->gpu_training_backend = gpu_training_select_backend();
     g_use_vulkan = state->gpu_training_backend == NATIVE_GPU_TRAINING_VULKAN;
-    g_use_nnapi = 0;
     g_use_opengl = state->gpu_training_backend == NATIVE_GPU_TRAINING_OPENGL;
     g_use_metal = state->gpu_training_backend == NATIVE_GPU_TRAINING_METAL;
 #if VOLVOXAI_ENABLE_CUDA

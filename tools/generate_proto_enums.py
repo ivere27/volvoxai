@@ -71,6 +71,97 @@ SPECS = (
         "base",
     ),
     EnumSpec(
+        "ExecutionMode",
+        "EXECUTION_MODE_",
+        "VxExecutionMode",
+        "VX_EXECUTION_MODE_",
+        "base",
+    ),
+    EnumSpec(
+        "MemorySpace",
+        "MEMORY_SPACE_",
+        "VxMemorySpace",
+        "VX_MEMORY_SPACE_",
+        "base",
+    ),
+    EnumSpec(
+        "MemoryOwnerKind",
+        "MEMORY_OWNER_KIND_",
+        "VxMemoryOwnerKind",
+        "VX_MEMORY_OWNER_",
+        "mixed",
+    ),
+    EnumSpec(
+        "MemoryResourceRole",
+        "MEMORY_RESOURCE_ROLE_",
+        "VxMemoryResourceRole",
+        "VX_MEMORY_RESOURCE_ROLE_",
+        "mixed",
+    ),
+    EnumSpec(
+        "MemoryBackingRelation",
+        "MEMORY_BACKING_RELATION_",
+        "VxMemoryBackingRelation",
+        "VX_MEMORY_BACKING_RELATION_",
+        "base",
+    ),
+    EnumSpec(
+        "MemoryBoundKind",
+        "MEMORY_BOUND_KIND_",
+        "VxMemoryBoundKind",
+        "VX_MEMORY_BOUND_",
+        "base",
+    ),
+    EnumSpec(
+        "MemorySnapshotPoint",
+        "MEMORY_SNAPSHOT_POINT_",
+        "VxMemorySnapshotPoint",
+        "VX_MEMORY_SNAPSHOT_",
+        "base",
+    ),
+    EnumSpec(
+        "MemoryMetric",
+        "MEMORY_METRIC_",
+        "VxMemoryMetric",
+        "VX_MEMORY_METRIC_",
+        "base",
+    ),
+    EnumSpec(
+        "MemoryEvidenceSource",
+        "MEMORY_EVIDENCE_SOURCE_",
+        "VxMemoryEvidenceSource",
+        "VX_MEMORY_EVIDENCE_SOURCE_",
+        "base",
+    ),
+    EnumSpec(
+        "MemoryValueRelation",
+        "MEMORY_VALUE_RELATION_",
+        "VxMemoryValueRelation",
+        "VX_MEMORY_VALUE_RELATION_",
+        "base",
+    ),
+    EnumSpec(
+        "MemoryTemporalCoverage",
+        "MEMORY_TEMPORAL_COVERAGE_",
+        "VxMemoryTemporalCoverage",
+        "VX_MEMORY_TEMPORAL_COVERAGE_",
+        "base",
+    ),
+    EnumSpec(
+        "MemoryEnvelopeKind",
+        "MEMORY_ENVELOPE_KIND_",
+        "VxMemoryEnvelopeKind",
+        "VX_MEMORY_ENVELOPE_",
+        "base",
+    ),
+    EnumSpec(
+        "MemoryInventoryKind",
+        "MEMORY_INVENTORY_KIND_",
+        "VxMemoryInventoryKind",
+        "VX_MEMORY_INVENTORY_",
+        "base",
+    ),
+    EnumSpec(
         "TrainingOptimizerKind",
         "TRAINING_OPTIMIZER_KIND_",
         "VxOptimizerKind",
@@ -223,6 +314,10 @@ def is_full_only_entry(spec: EnumSpec, name: str) -> bool:
         return False
     if spec.proto_name == "OperationStage":
         return "_TRAINER_" in name or "_PTQ_" in name
+    if spec.proto_name == "MemoryOwnerKind":
+        return name.endswith("_TRAINER") or name.endswith("_PTQ_PLAN")
+    if spec.proto_name == "MemoryResourceRole":
+        return "_TRAINING_" in name or "_PTQ_" in name
     raise ValueError(f"mixed enum {spec.proto_name} has no value classifier")
 
 
@@ -370,6 +465,7 @@ def render_ts_base(
         ("BackendPolicyModeValue", "backendPolicyModes", "BackendPolicyMode", None),
         ("OperatorFallbackValue", "operatorFallbackValues", "OperatorFallback", None),
         ("DecodeRowModeValue", "decodeRowModes", "DecodeRowMode", None),
+        ("ExecutionModeValue", "executionModes", "ExecutionMode", None),
     )
     by_spec = {spec.proto_name: spec for spec in SPECS}
     for type_name, const_name, enum_name, mapping in semantic_specs:
@@ -397,7 +493,7 @@ def render_ts_base(
         )
         rendered = ", ".join(repr(value) for value in values)
         sections.append(
-            f"export const {const_name} = [{rendered}] as const;\n"
+            f"export const {const_name} = Object.freeze([{rendered}] as const);\n"
             f"export type {type_name} = (typeof {const_name})[number];"
         )
     sections.append(
@@ -406,9 +502,9 @@ def render_ts_base(
     operator_entries = operator_graph_entries(enums)
     runtime_names = [name for _, _, name in operator_entries]
     sections.append(
-        "export const runtimeOperatorNames = ["
+        "export const runtimeOperatorNames = Object.freeze(["
         + ", ".join(repr(name) for name in runtime_names)
-        + "] as const;\n"
+        + "] as const);\n"
         "export type RuntimeOperatorName = (typeof runtimeOperatorNames)[number];"
     )
 
@@ -469,7 +565,7 @@ def render_ts_full(
         values = semantic_values(entries, spec.proto_prefix, mapping=mapping)
         rendered = ", ".join(repr(value) for value in values)
         sections.append(
-            f"export const {const_name} = [{rendered}] as const;\n"
+            f"export const {const_name} = Object.freeze([{rendered}] as const);\n"
             f"export type {type_name} = (typeof {const_name})[number];"
         )
 

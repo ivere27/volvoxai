@@ -141,6 +141,23 @@ static int test_w8a8_threaded_all_byte_types(void) {
     return ok;
 }
 
+/* Arm I8MM's complete-panel body pairs adjacent N8 blocks into one MR6xNR16
+ * tile.  M=13 executes two full tiles and one row tail; K=40 has no K8 tail;
+ * N=48 executes three N16 block pairs.  Symmetric I8 weights admit the route,
+ * while all activation/output byte domains and asymmetric zero points remain
+ * graph-visible and must match the portable reference exactly. */
+static int test_w8a8_full_k_n16_all_activation_types(void) {
+    static const uint32_t types[] = {VX_DTYPE_I8, VX_DTYPE_U8};
+    int ok = 1;
+    for (uint32_t input = 0; input < 2u && ok; input++) {
+        for (uint32_t output = 0; output < 2u && ok; output++) {
+            ok = test_w8a8(13u, 40u, 48u, types[input], VX_DTYPE_I8,
+                           types[output]);
+        }
+    }
+    return ok;
+}
+
 /* Exercise the exact AVX2 K4/N16 panel directly: full-domain activations force
  * both the general split and no--128 signed-absolute PMADDUBSW dots. K=37
  * covers the padded K4 tail, and N=257 covers the scalar output tail. */
@@ -620,7 +637,11 @@ int main(int argc, char** argv) {
             1u, 8u, 320u, VX_DTYPE_I8, 1) != !!vx_cpu_has_avx2()) return 1;
 #else
     if (vx_packed_q8_preferred_for_native_w8a8(
-            2u, 320u, 320u, VX_DTYPE_I8, 1)) return 1;
+            2u, 320u, 320u, VX_DTYPE_I8, 1) !=
+        !!vx_kernel_platform()->has_arm_i8mm) return 1;
+    if (vx_packed_q8_preferred_for_native_w8a8(
+            2u, 37u, 48u, VX_DTYPE_I8, 1) !=
+        !!vx_kernel_platform()->has_arm_i8mm) return 1;
 #endif
     if (vx_packed_q8_preferred_for_native_w8a8(
             2u, 320u, 320u, VX_DTYPE_U8, 1) ||
@@ -635,6 +656,7 @@ int main(int argc, char** argv) {
                     VX_DTYPE_U8) ||
         !test_w8a8(3, 19, 13, VX_DTYPE_I8, VX_DTYPE_U8,
                     VX_DTYPE_U8) ||
+        !test_w8a8_full_k_n16_all_activation_types() ||
         !test_w8a8_threaded_all_byte_types() ||
         !test_w8a8_symmetric_i8_exact_panel() ||
         !test_w8a8_signed_n32_single_thread() ||

@@ -1,4 +1,4 @@
-// Run a model through the built JS bundle (pure-JS 'cpu' or 'wasm' tier) in Node,
+// Run a model through the built JS bundle (pure-JS 'cpu-js' or 'wasm' tier) in Node,
 // and return named output tensors + wall-clock timing. Uses the same file://
 // fetch shim as bin/volvox.js so the browser bundle runs headless.
 import fs from 'fs';

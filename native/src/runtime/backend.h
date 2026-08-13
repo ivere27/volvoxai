@@ -42,7 +42,7 @@ typedef struct VxBackend {
     void (*download)(void* user_data, void* destination, const void* source, size_t bytes);
 
     /* A graph route writes its output into backend-owned storage. One-shot
-     * routes (NNAPI/Vulkan/OpenGL Linear) write host memory and therefore need
+     * routes (Vulkan/OpenGL Linear) write host memory and therefore need
      * the normal host-dirty propagation after dispatch. */
     int outputs_device_resident;
 

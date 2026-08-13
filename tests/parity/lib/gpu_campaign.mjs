@@ -73,7 +73,7 @@ function generatedFixtureFiles(policy, names) {
 }
 
 function wholeBuildFiles(tier) {
-  if (tier === 'cpu') return [distFile('volvoxai.js')];
+  if (tier === 'cpu-js') return [distFile('volvoxai.js')];
   if (tier === 'wasm') return [distFile('volvoxai.js'), distFile('volvoxai.wasm')];
   if (tier === 'webgpu') return [distFile('volvoxai.js')];
   if (tier.startsWith('native-')) {

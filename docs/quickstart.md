@@ -73,7 +73,7 @@ import {
 } from 'volvoxai';
 
 const runtime = await VolvoxAI.createRuntime({
-  backends: ['webgpu', 'wasm', 'cpu'],
+  backends: ['webgpu', 'wasm', 'cpu-js'],
 });
 const snapshot = await Model.load(
   './models/my-model/model.safetensors',
@@ -81,7 +81,7 @@ const snapshot = await Model.load(
 const compiled = await runtime.compile(snapshot, {
   backend: {
     mode: 'prefer',
-    order: ['webgpu', 'wasm', 'cpu'],
+    order: ['webgpu', 'wasm', 'cpu-js'],
     operatorFallback: 'allow',
   },
 });
@@ -156,7 +156,7 @@ const source = Model.capture({
     },
   },
 });
-const trainer = await Trainer.create(source, { backend: 'cpu' });
+const trainer = await Trainer.create(source, { backend: 'cpu-js' });
 
 const step = await trainer.trainStep({
   inputs: {
@@ -172,11 +172,11 @@ const successor = await trainer.commit();
 
 await trainer.close();
 
-const runtime = await VolvoxAI.createRuntime({ backends: ['cpu'] });
+const runtime = await VolvoxAI.createRuntime({ backends: ['cpu-js'] });
 const compiled = await runtime.compile(successor, {
   backend: {
     mode: 'require',
-    backend: 'cpu',
+    backend: 'cpu-js',
     operatorFallback: 'forbid',
   },
 });

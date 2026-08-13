@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 // Real-image EfficientDet parity: decode dog.jpg/cat.jpg once (via image_oracle.py),
-// feed the IDENTICAL input to VolvoxAI cpu/wasm/native + ONNX Runtime. VolvoxAI
+// feed the IDENTICAL input to VolvoxAI cpu-js/wasm/native + ONNX Runtime. VolvoxAI
 // tiers compare every output element. The fp32 ONNX oracle does too; the int8
 // ONNX graph is a different true-quantized numeric domain, so it gates on the
 // selected detections while reporting raw-tensor deltas as diagnostics.
@@ -190,15 +190,15 @@ const onnx = validateOutput('onnx', {
   boxes: readTensor(path.join(runDir, 'onnx.boxes.f32'), 'f32'),
 });
 const runs = {
-  cpu: validateOutput('cpu', await runVolvox('cpu')),
+  'cpu-js': validateOutput('cpu-js', await runVolvox('cpu-js')),
   wasm: validateOutput('wasm', await runVolvox('wasm')),
   'native-cpu': validateOutput('native-cpu', runNative()),
   onnx,
 };
 
-const ref = runs.cpu;
+const ref = runs['cpu-js'];
 console.log(`\n=== ${path.basename(imgRel)} · efficientdet ${model} · all ${ref.boxes.length / 4} anchors ===`);
-console.log('| tier | max|Δscores| vs cpu | max|Δboxes| vs cpu | top detections |');
+console.log('| tier | max|Δscores| vs cpu-js | max|Δboxes| vs cpu-js | top detections |');
 console.log('|---|---|---|---|');
 let failed = 0;
 for (const [tier, r] of Object.entries(runs)) {
@@ -212,9 +212,9 @@ for (const [tier, r] of Object.entries(runs)) {
     ...baseTolerance,
     ...(modelPolicy.toleranceOverrides?.[tier]?.boxes ?? {}),
   };
-  const scores = tier === 'cpu' ? { pass: true, maxAbs: 0, exceed: 0 }
+  const scores = tier === 'cpu-js' ? { pass: true, maxAbs: 0, exceed: 0 }
     : compareFull(r.scores, ref.scores, scoresTolerance);
-  const boxes = tier === 'cpu' ? { pass: true, maxAbs: 0, exceed: 0 }
+  const boxes = tier === 'cpu-js' ? { pass: true, maxAbs: 0, exceed: 0 }
     : compareFull(r.boxes, ref.boxes, boxesTolerance);
   const task = tier === 'onnx' && model === 'int8'
     ? detectionTask(r, ref, baseTolerance)

@@ -82,7 +82,7 @@ function storageRangesOverlap(left, right) {
 }
 
 /**
- * Physical-byte ONNX MatMul for rank-2..8 operands.
+ * W8A8 ONNX MatMul for rank-2..8 operands.
  *
  * Both operands and the output use immutable per-tensor affine descriptors.
  * Batch axes follow right-aligned ONNX broadcasting; the matrix axes are
@@ -215,7 +215,7 @@ function qBatchMatMulDescriptorImpl(node, requireHostStorage) {
 
 /**
  * Validate the complete host-executable contract, including exact typed-array
- * storage for every physical byte tensor.
+ * storage for every byte tensor.
  */
 export function qBatchMatMulDescriptor(node) {
   return qBatchMatMulDescriptorImpl(node, true);

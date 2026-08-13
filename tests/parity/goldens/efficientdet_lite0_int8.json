@@ -2,12 +2,12 @@
   "schema": "volvoxai.parity-artifact",
   "version": 1,
   "provenance": {
-    "runId": "44585284-e192-4459-a4ce-2502753f4607",
+    "runId": "4085dd06-72be-451d-88f8-d2d6aed09da0",
     "command": "golden",
-    "fingerprint": "49bc4ad4a6a11491b1546675bf090c53770ddced163ef7fc0dce34b1a6324f86",
+    "fingerprint": "c6c2184ab22b3fe4960d3c6d7461d14db94761bb191c10026c27d7027737c677",
     "case": "efficientdet_lite0_int8",
-    "tier": "cpu-reference",
-    "createdAt": "2026-08-02T16:56:38.718Z"
+    "tier": "cpu-js-reference",
+    "createdAt": "2026-08-13T08:14:29.331Z"
   },
   "payload": {
     "model": "efficientdet_lite0_int8",
@@ -20,15 +20,15 @@
         "policy": [
           {
             "path": "tests/parity/policy.json",
-            "sha256": "2909cc971c77e27149f51ea3337368615d9e2c285bc7bb8605bbd387d0b5782c",
-            "size": 6621
+            "sha256": "a6d43c713a3ac37a436a3bb08fafb45e414a10f40c4bd08e5d2e5a053499e814",
+            "size": 6639
           }
         ],
         "models": [
           {
             "path": "models/efficientdet_lite0_int8/graph.json",
-            "sha256": "5b361a6568bb7a9232015c799434fe6d153853b8284b64bf02a2f0a37609d285",
-            "size": 200185
+            "sha256": "65b7e7ab938c9d66c1ccabbc3c80ec3f3e4d3534c57f790258ae3f0ed0f02146",
+            "size": 200140
           },
           {
             "path": "models/efficientdet_lite0_int8/model.safetensors",
@@ -51,7 +51,7 @@
           "statusSha256": null
         }
       },
-      "digest": "2fdcae8bcac6c6ce8512dc561f1117260763d2f569ae624cd1c5e4f05c1fb101"
+      "digest": "4cb54b877c98ed33513cb3ec8d62a9109dd961b4d5d4ea63c74c4b8d8314f28c"
     },
     "sigs": {
       "scores": {
@@ -2212,10 +2212,10 @@
     },
     "runtimeEvidence": {
       "compilation": {
-        "compilationId": "compilation-995c209b-549b-42ca-b14a-0bb5d86c0e95",
-        "definitionId": "model-definition-2c135eb4-4b57-4d0b-812d-02d4b659eae0",
+        "compilationId": "compilation-f0028725-f885-411c-90fa-b2a401c202d1",
+        "definitionId": "model-definition-8182cca7-0061-44b8-acbd-a0ee11741187",
         "policy": {
-          "backend": "cpu",
+          "backend": "cpu-js",
           "mode": "require",
           "operatorFallback": "forbid"
         },
@@ -2224,7 +2224,7 @@
           "adapterRevisionIds": [],
           "topologyRevision": 1,
           "weightRevision": 1,
-          "weightRevisionId": "model-definition-2c135eb4-4b57-4d0b-812d-02d4b659eae0:weight:1:weight-revision-d03dc7e2-30c3-4986-b82e-5efe146340c9"
+          "weightRevisionId": "model-definition-8182cca7-0061-44b8-acbd-a0ee11741187:weight:1:weight-revision-43d4892a-f95d-4fa8-b9cd-e21740376921"
         },
         "route": {
           "operator": {
@@ -2234,15 +2234,15 @@
           },
           "tierFallback": false
         },
-        "selectedBackend": "cpu",
+        "selectedBackend": "cpu-js",
         "selectedDevice": {
-          "backend": "cpu",
+          "backend": "cpu-js",
           "device": "host"
         }
       },
       "execution": {
-        "backend": "cpu",
-        "contextId": "context-953338d7-5f17-4569-ba93-a3a997a72383",
+        "backend": "cpu-js",
+        "contextId": "context-12bfa7d1-4670-4ecb-833f-880b032df523",
         "decodeState": {
           "cacheGeneration": null,
           "cacheState": "not-applicable",
@@ -2251,17 +2251,17 @@
           "position": null
         },
         "device": {
-          "backend": "cpu",
+          "backend": "cpu-js",
           "device": "host"
         },
-        "executionId": "execution-67413041-c054-47ea-bd45-a7d08d0a1ae7",
+        "executionId": "execution-61200365-fa5e-489b-a96c-3218507575d4",
         "outcome": "success",
         "revisions": {
           "adapterRevisionId": null,
           "adapterRevisionIds": [],
           "topologyRevision": 1,
           "weightRevision": 1,
-          "weightRevisionId": "model-definition-2c135eb4-4b57-4d0b-812d-02d4b659eae0:weight:1:weight-revision-d03dc7e2-30c3-4986-b82e-5efe146340c9"
+          "weightRevisionId": "model-definition-8182cca7-0061-44b8-acbd-a0ee11741187:weight:1:weight-revision-43d4892a-f95d-4fa8-b9cd-e21740376921"
         },
         "route": {
           "operator": {

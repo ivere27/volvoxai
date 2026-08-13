@@ -21,10 +21,10 @@
 #include <math.h>
 
 /* Same translation-unit prefix the shipped WASM build uses. */
-#include "core.c"
-#include "fast_math.c"
+#include "wasm_heap_arena.c"
+#include "fast_math.inc"
 #include "thread_pool.c"
-#include "vision_ops.c"
+#include "vision_ops.inc"
 
 static uint32_t seed = 0x12345678u;
 static float nextf(void) {

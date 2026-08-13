@@ -250,22 +250,44 @@ model/
   model.safetensors    # the WEIGHTS: the learned numbers, in a standard binary format
 ```
 
-- **`graph.json`** is the graph document: an ordered list of nodes. Each node names its op, its
-  input/output tensors, its parameters, and a typed logical output-shape assertion. Symbols name
-  finite constraints in the graph's `dimensions` table, so compilation can prove every legal
-  shape before a request binds one concrete value. Here is one TinyStories node:
+- **`graph.json`** is the graph document. It opens by declaring which shapes the model accepts, then
+  lists its nodes in order. TinyStories takes sentences of *any* length up to 256 tokens, and it says
+  so with a named, bounded **dimension symbol**:
 
   ```json
   {
-    "id": "ln1_0",
+    "format": "volvox-graph/v1",
+    "dimensions": { "S": { "min": 1, "max": 256 } },
+    "inputs": {
+      "tokens":    { "shape": [1, "S"], "dtype": "int32" },
+      "positions": { "shape": [1, "S"], "dtype": "int32" }
+    }
+  }
+  ```
+
+  🌱 `S` is a blank left in the recipe: *"however many words you actually give me — at least 1, at
+  most 256."* Writing `S` in two places means **the same number in both**, so a 12-word prompt is 12
+  everywhere, and nothing has to be padded out to 256 just to fit a fixed slot.
+
+  Each node then names its op, its input/output tensors, its parameters, and a typed output-shape
+  assertion that may use those same symbols. Here is one real TinyStories node:
+
+  ```json
+  {
+    "id": "node_3",
     "opType": "LayerNorm",
     "inputs":  { "input": "hidden_0", "weight": "h.0.ln_1.weight", "bias": "h.0.ln_1.bias" },
     "outputs": {
-      "out": { "tensor": "ln1_0", "shape": [1, 256, 64], "dtype": "float32" }
+      "out": { "tensor": "ln1_0", "shape": [1, "S", 64], "dtype": "float32" }
     },
     "params": { "eps": 1e-05, "d_model": 64 }
   }
   ```
+
+  🔧 Note that `id` and the output `tensor` name are different things: `node_3` identifies the *node*,
+  `ln1_0` names the *tensor it writes*. Because every symbol is both named and bounded, compilation
+  can prove a working route for every length in `1..256` **once**, before any request arrives — the
+  subject of Chapter 8.
 
 - **`model.safetensors`** holds the raw weight tensors (`h.0.ln_1.weight`, `wte.weight`, …) in
   [safetensors](https://github.com/huggingface/safetensors) format — a simple, safe, standard
@@ -290,7 +312,7 @@ as Part II shows — let VolvoxAI **train and write the package itself**.
 
 ---
 
-## 1.6 One model, four ways to run it (the "tiers")
+## 1.6 One model, three ways to run it (the "tiers")
 
 > 🌱 **Idea.** The same recipe can be cooked in different kitchens: a fast fancy oven, a normal
 > stove, a tiny camp stove — the dish comes out the same, just faster or slower. VolvoxAI can run
@@ -306,19 +328,17 @@ flowchart TD
     G[Graph + weights] --> S[Model]
     R[VolvoxAI.createRuntime] --> SEL{Runtime.compile snapshot<br/>applies backend policy}
     S --> SEL
-    SEL -->|browser NPU/GPU| T1[Tier 1 · WebNN]
-    SEL -->|browser GPU| T2[Tier 2 · WebGPU<br/>WGSL compute shaders]
-    SEL -->|any CPU, fast| T3[Tier 3 · WASM SIMD<br/>compiled C kernels]
-    SEL -->|any CPU, always works| T4[Tier 4 · Pure JS<br/>reference kernels]
+    SEL -->|browser GPU| T1[Tier 1 · WebGPU<br/>WGSL compute shaders]
+    SEL -->|any CPU, fast| T2[Tier 2 · WASM SIMD<br/>compiled C kernels]
+    SEL -->|any CPU, always works| T3[Tier 3 · Pure JS<br/>reference kernels]
     N[Native binary · C<br/>Vulkan/OpenGL/CUDA/Metal/CPU] -.same graph package.-> G
 ```
 
-- **Tier 4 (Pure JS, `ts/ops/*.ts`)** is the *reference*: slow but obviously-correct, and the
+- **Tier 3 (Pure JS, `ts/ops/*.ts`)** is the *reference*: slow but obviously-correct, and the
   ground truth every other tier is checked against. **We use it as our teaching text** because
   it is the most readable.
-- **Tier 3 (WASM)** runs the same math as compiled C for a big speedup.
-- **Tier 2 (WebGPU)** re-expresses each op as a GPU compute shader (`shaders/{inference,training}/*.wgsl`).
-- **Tier 1 (WebNN)** hands the graph to the browser's own neural-network API (can hit an NPU).
+- **Tier 2 (WASM)** runs the same math as compiled C for a big speedup.
+- **Tier 1 (WebGPU)** re-expresses each op as a GPU compute shader (`shaders/{inference,training}/*.wgsl`).
 - **Native** (`native/`) is a standalone C program that runs the *same* graph package on a desktop,
   phone, or robot, optionally on Vulkan/OpenGL/CUDA/Metal. CUDA is an opt-in manual-kernel backend
   (forward inference, plus training in the full build; see Chapter 9C). This is the path to
@@ -332,6 +352,35 @@ flowchart TD
 > *answer* because the pure-JS CPU implementation is the **reference**, and parity checks every other
 > tier — and the native providers of Chapter 9 — against it within a tight tolerance. "Same
 > graph package, same answer, many kitchens" is a tested contract, not a hope.
+
+🔧 End to end, running TinyStories on six tokens is this much code:
+
+```javascript
+import { Model, VolvoxAI } from 'volvoxai';
+
+const runtime  = await VolvoxAI.createRuntime({ backends: ['webgpu', 'wasm', 'cpu-js'] });
+const snapshot = await Model.load('./models/tinystories_1m/model.safetensors');
+const compiled = await runtime.compile(snapshot, {
+  backend: { mode: 'prefer', order: ['webgpu', 'wasm', 'cpu-js'], operatorFallback: 'allow' },
+});
+const context  = await compiled.createContext();
+
+const result = await context.execute({
+  tokens:    { data: Int32Array.from([7454, 2402, 257, 640, 11, 20037]), shape: [1, 6] },
+  positions: { data: Int32Array.from([0, 1, 2, 3, 4, 5]),                shape: [1, 6] },
+});
+const logits = await result.output('logits').read();
+
+await result.close();
+await context.close();
+await compiled.close();
+await runtime.close();
+```
+
+Note the shape of every input is **stated, never guessed**. `{ data, shape }` is the required form —
+the engine will not infer `[1, 6]` from "the buffer holds 6 int32s," because a 6-element buffer is
+equally `[1,6]`, `[6,1]`, or `[2,3]`, and quietly picking one is how a wrong answer becomes a silent
+answer. Those two `[1, 6]`s are what bind `S = 6` from §1.5.
 
 For the rest of the book, when we "trace an op," we read the pure-JS or portable-C version,
 because they say most directly *what the math is*.

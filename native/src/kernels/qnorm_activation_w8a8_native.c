@@ -1,5 +1,5 @@
 /*
- * Native CPU work partitioning for canonical physical-byte QSiLU and
+ * Native CPU work partitioning for canonical byte QSiLU and
  * QLayerNorm.
  *
  * The portable exports remain the authoritative scalar/WASM implementations.
@@ -9,7 +9,7 @@
  * canonical implementation for its contiguous slice, preserving its exact
  * F32 operation and ties-to-even requantization order within every output.
  */
-#include "quant_cpu_opt.h"
+#include "quant_cpu_isa.h"
 #include "w8a8_affine.h"
 #include "cpu_features.h"
 #include "kernel_platform.h"

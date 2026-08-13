@@ -8,8 +8,8 @@
 // drives a real GPU with no display and no root. Headless Chrome can't on a bare
 // server (its Vulkan needs a WSI surface -> navigator.gpu falls back to SwiftShader).
 //
-// For each model it runs cpu (pure-JS oracle), wasm, and webgpu, then gates webgpu
-// (and wasm) against cpu per output at the model's dtype tolerance. Every declared
+// For each model it runs cpu-js (pure-JS oracle), wasm, and webgpu, then gates webgpu
+// (and wasm) against cpu-js per output at the model's dtype tolerance. Every declared
 // output is read through its stable ExecutionResult tensor. When an external oracle signature exists
 // (out/<model>.onnx.json), webgpu is also gated against it at `external` tol.
 import { signature, compareSignature } from './lib/extract.mjs';
@@ -214,7 +214,7 @@ for (const name of wanted) {
   const tol = policy.tolerances[model.dtype] || policy.tolerances.fp32;
   console.log(`\n## ${name} [${model.dtype}]`);
   const res = {};
-  for (const be of ['cpu', 'wasm', 'webgpu']) {
+  for (const be of ['cpu-js', 'wasm', 'webgpu']) {
     try {
       res[be] = await run(model, be);
       const lens = model.outputs.map((s) => `${s.name}=${res[be].outputs[s.name].len}`).join(' ');
@@ -226,11 +226,11 @@ for (const name of wanted) {
       modelErrors.push(`${be}: ${message}`);
     }
   }
-  if (!res.cpu) modelErrors.push('strict CPU reference was not produced');
+  if (!res['cpu-js']) modelErrors.push('strict CPU-JS reference was not produced');
 
   // gate each output vs the pure-JS oracle. A true-int8 GPU backend legitimately
-  // differs from the int8-folded-to-fp32 CPU reference in raw magnitudes (and on a
-  // *random* input the argmax is meaningless), so int8-GPU-vs-CPU is DIAGNOSTIC, not
+  // differs from the int8-folded-to-fp32 CPU-JS reference in raw magnitudes (and on a
+  // *random* input the argmax is meaningless), so int8-GPU-vs-CPU-JS is DIAGNOSTIC, not
   // a gate -- the real int8 GPU check is GPU-vs-GPU (webgpu == opengl == vulkan,
   // bit-identical) on a real image; see the native cross-GPU comparison / README.
   const sig = (r, spec) => signature(sliceForSpec(r.outputs[spec.name].flat, spec), {
@@ -239,12 +239,12 @@ for (const name of wanted) {
     sampleAxes: spec.sampleAxes ?? [],
   });
   for (const be of ['wasm', 'webgpu']) {
-    if (!res.cpu || !res[be]) { console.log(`  [${be}] SKIP`); continue; }
+    if (!res['cpu-js'] || !res[be]) { console.log(`  [${be}] SKIP`); continue; }
     const diag = model.dtype === 'int8' && be === 'webgpu';
     for (const spec of model.outputs) {
-      const c = compareSignature(sig(res[be], spec), sig(res.cpu, spec), tol);
+      const c = compareSignature(sig(res[be], spec), sig(res['cpu-js'], spec), tol);
       const tag = diag ? '[diag]' : (c.pass ? 'PASS' : 'FAIL');
-      console.log(`  ${be} vs cpu  ${spec.name}: ${tag} maxAbs=${c.numeric.maxAbs}${spec.topk ? ` top1=${c.task.top1Match}` : ''}${diag ? '  (true-int8 vs folded-fp32; gate is GPU-vs-GPU)' : ''}`);
+      console.log(`  ${be} vs cpu-js  ${spec.name}: ${tag} maxAbs=${c.numeric.maxAbs}${spec.topk ? ` top1=${c.task.top1Match}` : ''}${diag ? '  (true-int8 vs folded-fp32; gate is GPU-vs-GPU)' : ''}`);
       if (!diag && !c.pass) {
         console.log(`     problems: ${c.problems.join('; ')}`);
         modelErrors.push(`${be}/${spec.name}: ${c.problems.join('; ')}`);

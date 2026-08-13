@@ -8,9 +8,20 @@ import {
   compileWebGPUGraphPlan,
   type WebGPUCompiledGraphPlan,
 } from './WebGPUGraphCompiler.js';
-import { createWebGPUBufferOrOOM, WebGPUResources } from './WebGPUResources.js';
+import {
+  createWebGPUBufferOrOOM,
+  releaseWebGPUBufferLeases,
+  WebGPUResources,
+  type WebGPUBufferLease,
+} from './WebGPUResources.js';
 import { WebGPUDispatch } from './WebGPUDispatch.js';
 import { WebGPUDecodeState } from './WebGPUDecodeState.js';
+import {
+  captureWebGPUErrorScopesSync,
+  runWebGPUErrorScopedSync,
+} from './WebGPUErrorScopes.js';
+import type { KVPagePlan } from './kvPageAddressing.js';
+import type { DecodeRowSet } from './decodeRowSet.js';
 import { WebGPUResults, type WebGPUOutputSnapshot } from './WebGPUResults.js';
 import type {
   AdapterExecutionPlan,
@@ -58,6 +69,7 @@ interface ActiveWebGPUSpecializationStage {
   readonly resources: Set<GPUBuffer>;
   readonly created: Set<GPUBuffer>;
   readonly writes: DeferredWebGPUWrite[];
+  readonly errorChecks: Promise<void>[];
 }
 
 interface PreparedWebGPUSpecializationWrites {
@@ -192,6 +204,8 @@ export class GraphExecutor extends BackendEngine {
   declare incrementalRowPlans: Map<number, IncrementalRowPlan>;
   declare incrementalRowCandidates: Map<number, IncrementalRowCandidate>;
   declare incrementalRowCopyTensorNames: Set<string>;
+  /** Graph inputs a batched keep mask reads host-side; see WebGPUDecodeState. */
+  declare incrementalRowMirrorNames: Set<string>;
   declare decodeState: WebGPUDecodeState;
   declare adapterPipeline: GPUComputePipeline | null;
   declare compiledWeightRevision: number | undefined;
@@ -204,6 +218,8 @@ export class GraphExecutor extends BackendEngine {
   declare specializationBindGroups: Map<string, GPUBindGroup>;
   declare specializationBufferContents: Map<GPUBuffer, Uint8Array>;
   declare pendingRetiredBuffers: Set<GPUBuffer>;
+  declare pendingRetiredTensorLeases: Set<WebGPUBufferLease>;
+  declare pendingRetiredPrivateBuffers: Set<GPUBuffer>;
   declare pendingRetirementFence: Promise<void> | null;
   declare retirementFenceUnavailable: boolean;
   declare _specializationObjectIds: WeakMap<object, number>;
@@ -224,6 +240,7 @@ export class GraphExecutor extends BackendEngine {
   declare specializationWriteBytes: number;
   declare specializationWriteSkipCount: number;
   declare specializationWriteSkipBytes: number;
+  declare pendingDeviceErrorChecks: Set<Promise<void>>;
 
   readonly graphCompiler: WebGPUGraphCompiler;
   readonly resources: WebGPUResources;
@@ -234,6 +251,7 @@ export class GraphExecutor extends BackendEngine {
     shaderLibrary = null,
     wgslLanguageFeatures = globalThis.navigator?.gpu?.wgslLanguageFeatures,
     deviceState = null,
+    invariantWeightBorrow = null,
   }: GraphExecutorOptions = {}) {
     super('webgpu', {
       incrementalExecution: true,
@@ -261,6 +279,8 @@ export class GraphExecutor extends BackendEngine {
     this.specializationBindGroups = new Map();
     this.specializationBufferContents = new Map();
     this.pendingRetiredBuffers = new Set();
+    this.pendingRetiredTensorLeases = new Set();
+    this.pendingRetiredPrivateBuffers = new Set();
     this.pendingRetirementFence = null;
     this.retirementFenceUnavailable = false;
     this._specializationObjectIds = new WeakMap();
@@ -282,15 +302,17 @@ export class GraphExecutor extends BackendEngine {
     this.specializationWriteBytes = 0;
     this.specializationWriteSkipCount = 0;
     this.specializationWriteSkipBytes = 0;
+    this.pendingDeviceErrorChecks = new Set();
 
     this.graphCompiler = new WebGPUGraphCompiler(this);
-    this.resources = new WebGPUResources(this);
+    this.resources = new WebGPUResources(this, invariantWeightBorrow);
     this.dispatch = new WebGPUDispatch(this);
     this.decodeState = new WebGPUDecodeState(this);
     this.results = new WebGPUResults(this);
     this.incrementalRowPlans = this.decodeState.rowPlans;
     this.incrementalRowCandidates = this.decodeState.rowCandidates;
     this.incrementalRowCopyTensorNames = this.decodeState.rowCopyTensorNames;
+    this.incrementalRowMirrorNames = this.decodeState.rowMirrorNames;
     this.graphCompiler.installShaderLibrary(shaderLibrary);
     console.log('[VolvoxAI WebGPU] Starting RuntimeGraph Compilation...');
   }
@@ -367,11 +389,14 @@ export class GraphExecutor extends BackendEngine {
         this.specializationBufferReuseCount++;
         return previous.buffer;
       }
-      const buffer = createWebGPUBufferOrOOM(
-        this.device,
-        descriptor,
-        `WebGPU specialization '${descriptor.label || stage.scope}'`,
-      );
+      const allocation = `WebGPU specialization '${descriptor.label || stage.scope}'`;
+      const captured = captureWebGPUErrorScopesSync(this.device, { label: allocation }, () =>
+        createWebGPUBufferOrOOM(this.device, descriptor, allocation));
+      stage.errorChecks.push(captured.check);
+      // Avoid an unhandled rejection if pipeline compilation itself fails
+      // before the transactional rebind reaches its explicit check barrier.
+      void captured.check.catch(() => {});
+      const buffer = captured.value;
       const slot = Object.freeze({ buffer, size, usage });
       stage.slots.set(key, slot);
       stage.resources.add(buffer);
@@ -380,11 +405,11 @@ export class GraphExecutor extends BackendEngine {
       this.specializationBufferCreateCount++;
       return buffer;
     }
-    const buffer = createWebGPUBufferOrOOM(
-      this.device,
-      descriptor,
-      `WebGPU specialization '${descriptor.label || 'buffer'}'`,
-    );
+    const allocation = `WebGPU specialization '${descriptor.label || 'buffer'}'`;
+    const captured = captureWebGPUErrorScopesSync(this.device, { label: allocation }, () =>
+      createWebGPUBufferOrOOM(this.device, descriptor, allocation));
+    this._trackPendingDeviceErrorCheck(captured.check);
+    const buffer = captured.value;
     (this._activeSpecializationResources || this.auxiliaryBuffers).add(buffer);
     this.specializationBufferCreateCount++;
     return buffer;
@@ -427,7 +452,12 @@ export class GraphExecutor extends BackendEngine {
     // internal caller targets a previously mirrored buffer, force its next
     // specialization to establish exact contents again.
     this.specializationBufferContents.delete(buffer);
-    this.device.queue.writeBuffer(buffer, bufferOffset, bytes);
+    const captured = captureWebGPUErrorScopesSync(
+      this.device,
+      { label: 'WebGPU specialization buffer write' },
+      () => this.device.queue.writeBuffer(buffer, bufferOffset, bytes),
+    );
+    this._trackPendingDeviceErrorCheck(captured.check);
   }
 
   private _specializationObjectId(value: object): number {
@@ -446,7 +476,13 @@ export class GraphExecutor extends BackendEngine {
     const stage = this._activeSpecializationStage;
     if (!stage) {
       this.bindGroupCreateCount++;
-      return this.device.createBindGroup(descriptor);
+      const captured = captureWebGPUErrorScopesSync(
+        this.device,
+        { label: 'WebGPU specialization bind group' },
+        () => this.device.createBindGroup(descriptor),
+      );
+      this._trackPendingDeviceErrorCheck(captured.check);
+      return captured.value;
     }
     const entries = [...descriptor.entries]
       .sort((left, right) => left.binding - right.binding)
@@ -470,10 +506,31 @@ export class GraphExecutor extends BackendEngine {
       this.bindGroupReuseCount++;
       return previous;
     }
-    const bindGroup = this.device.createBindGroup(descriptor);
+    const captured = captureWebGPUErrorScopesSync(
+      this.device,
+      { label: `WebGPU specialization '${stage.scope}' bind group` },
+      () => this.device.createBindGroup(descriptor),
+    );
+    stage.errorChecks.push(captured.check);
+    void captured.check.catch(() => {});
+    const bindGroup = captured.value;
     stage.bindGroups.set(key, bindGroup);
     this.bindGroupCreateCount++;
     return bindGroup;
+  }
+
+  private _trackPendingDeviceErrorCheck(check: Promise<void>): void {
+    this.pendingDeviceErrorChecks.add(check);
+    // A lazy decode specialization can finish its error check before control
+    // returns to the executor's drain barrier. Mark it handled without losing
+    // the original rejecting promise that the barrier will inspect.
+    void check.catch(() => {});
+  }
+
+  private async _drainPendingDeviceErrorChecks(): Promise<void> {
+    const pending = [...this.pendingDeviceErrorChecks];
+    this.pendingDeviceErrorChecks.clear();
+    if (pending.length !== 0) await Promise.all(pending);
   }
 
   private _prepareSpecializationWrites(
@@ -558,15 +615,30 @@ export class GraphExecutor extends BackendEngine {
     }
   }
 
-  private _retireAfterSubmittedWork(buffers: Iterable<GPUBuffer>): void {
-    const retired = [...new Set(buffers)];
-    if (retired.length === 0) return;
-    for (const buffer of retired) this.pendingRetiredBuffers.add(buffer);
-    const destroy = () => {
-      for (const buffer of retired) {
-        this.pendingRetiredBuffers.delete(buffer);
+  private _retireAfterSubmittedWork(
+    tensorLeases: Iterable<WebGPUBufferLease>,
+    privateBuffers: Iterable<GPUBuffer>,
+  ): void {
+    const leases = [...new Set(tensorLeases)];
+    const buffers = [...new Set(privateBuffers)];
+    if (leases.length === 0 && buffers.length === 0) return;
+    for (const lease of leases) {
+      this.pendingRetiredTensorLeases.add(lease);
+      this.pendingRetiredBuffers.add(lease.buffer);
+    }
+    for (const buffer of buffers) {
+      this.pendingRetiredPrivateBuffers.add(buffer);
+      this.pendingRetiredBuffers.add(buffer);
+    }
+    const release = () => {
+      releaseWebGPUBufferLeases(leases);
+      for (const lease of leases) this.pendingRetiredTensorLeases.delete(lease);
+      for (const buffer of buffers) {
+        this.pendingRetiredPrivateBuffers.delete(buffer);
         buffer.destroy?.();
       }
+      for (const lease of leases) this.pendingRetiredBuffers.delete(lease.buffer);
+      for (const buffer of buffers) this.pendingRetiredBuffers.delete(buffer);
     };
     let settled: Promise<void> | undefined;
     try {
@@ -586,12 +658,25 @@ export class GraphExecutor extends BackendEngine {
       return;
     }
     let retirement: Promise<void>;
-    retirement = settled.then(destroy, destroy).then(() => {
+    retirement = settled.then(release, release).then(() => {
       if (this.pendingRetirementFence === retirement) {
         this.pendingRetirementFence = null;
       }
     });
     this.pendingRetirementFence = retirement;
+  }
+
+  private _releasePendingRetirement(): void {
+    /* A live fence owns these references until it settles. `dispose()` is
+     * synchronous, so leave them with its closure rather than reclaiming work
+     * the device may still be reading. A missing fence deliberately falls
+     * through: that path retained resources until explicit disposal. */
+    if (this.pendingRetirementFence) return;
+    releaseWebGPUBufferLeases(this.pendingRetiredTensorLeases);
+    for (const buffer of this.pendingRetiredPrivateBuffers) buffer.destroy?.();
+    this.pendingRetiredTensorLeases.clear();
+    this.pendingRetiredPrivateBuffers.clear();
+    this.pendingRetiredBuffers.clear();
   }
 
   private async _awaitPendingRetirement(): Promise<void> {
@@ -705,10 +790,12 @@ export class GraphExecutor extends BackendEngine {
       resources: candidateAuxiliary,
       created: candidateSpecializationCreated,
       writes: [],
+      errorChecks: [],
     };
     let staged: ReturnType<WebGPUResources['stageTensorBuffers']> | null = null;
     let incrementalRows: ReturnType<WebGPUDecodeState['_collectIncrementalRows']> | null = null;
     let commitStarted = false;
+    let tensorResourcesCommitted = false;
     try {
       // Descriptor construction consults these fields while candidate buffers
       // and uniforms are staged. They are restored on every failure path.
@@ -719,15 +806,21 @@ export class GraphExecutor extends BackendEngine {
       // candidate generation. Publish the analysis only after all allocation
       // and pipeline preparation succeeds, preserving transactional rebinds.
       incrementalRows = this.decodeState._collectIncrementalRows();
-      staged = this.resources.stageTensorBuffers(
-        graph,
-        tensorMaximumBytes,
-        capacityGrowthFactor,
-        !includeDropoutNodes,
-        candidatePlan.resultCopyTensorNames,
-        incrementalRows.copyTensorNames,
-        changedBankWeightNames(previousBankResidency, candidateBankResidency),
+      const capturedTensorGeneration = captureWebGPUErrorScopesSync(
+        this.device,
+        { label: `WebGPU tensor generation '${shapeSignature}'` },
+        () => this.resources.stageTensorBuffers(
+          graph,
+          tensorMaximumBytes,
+          capacityGrowthFactor,
+          !includeDropoutNodes,
+          candidatePlan.resultCopyTensorNames,
+          incrementalRows!.copyTensorNames,
+          changedBankWeightNames(previousBankResidency, candidateBankResidency),
+        ),
       );
+      staged = capturedTensorGeneration.value;
+      await capturedTensorGeneration.check;
       this._activeSpecializationStage = specializationStage;
       const candidatePipelines: CompiledWebGPUPipeline[] = [];
       const nodeRecipe = forwardNodeRecipe ?? graph.nodes.map((node, nodeIndex) => ({
@@ -755,12 +848,20 @@ export class GraphExecutor extends BackendEngine {
           candidatePipelines[index].graphNodeIndex = nodeIndex;
         }
       }
+      // createBuffer/createBindGroup return objects before WebGPU resolves
+      // their error scopes. Candidate resources remain rollback-owned until
+      // every already-popped scope confirms that those objects are valid.
+      await Promise.all(specializationStage.errorChecks);
       this._assertPipelineWorkgroupLimits(candidatePipelines);
       this._activeSpecializationStage = undefined;
       const specializationWrites = this._prepareSpecializationWrites(specializationStage);
       beforeCommit?.();
       commitStarted = true;
-      this._commitSpecializationWrites(specializationWrites.writes);
+      await runWebGPUErrorScopedSync(
+        this.device,
+        { label: `WebGPU specialization writes for '${shapeSignature}'` },
+        () => this._commitSpecializationWrites(specializationWrites.writes),
+      );
 
       this.pipelines = candidatePipelines;
       this.gpuBuffers = staged.buffers;
@@ -794,21 +895,14 @@ export class GraphExecutor extends BackendEngine {
       this.resetDecodeCache();
       this.decodeState._publishIncrementalRows(incrementalRows);
 
-      const retained = new Set(this.gpuBuffers.values());
-      for (const buffer of this.auxiliaryBuffers) retained.add(buffer);
-      const retired = [
-        ...[...new Set(previousBuffers.values())].filter((buffer) => !retained.has(buffer)),
-        ...[...previousAuxiliary].filter((buffer) => !retained.has(buffer)),
-      ];
-      this._retireAfterSubmittedWork(retired);
+      const retiredTensorLeases = this.resources.commitTensorBuffers(staged);
+      tensorResourcesCommitted = true;
+      const retiredAuxiliary = [...previousAuxiliary]
+        .filter((buffer) => !this.auxiliaryBuffers.has(buffer));
+      this._retireAfterSubmittedWork(retiredTensorLeases, retiredAuxiliary);
     } catch (error) {
       this._activeSpecializationStage = undefined;
-      if (staged) {
-        const committed = new Set(previousBuffers.values());
-        for (const buffer of staged.created) {
-          if (!committed.has(buffer)) buffer.destroy?.();
-        }
-      }
+      if (staged && !tensorResourcesCommitted) this.resources.rollbackTensorBuffers(staged);
       for (const buffer of candidateSpecializationCreated) buffer.destroy?.();
       this.graph = previousGraph;
       this.compiledGraphPlan = previousPlan;
@@ -890,20 +984,25 @@ export class GraphExecutor extends BackendEngine {
     this._assertPortableQuantizedGraph(this.graph);
     this.resetDecodeCache();
     await this.graphCompiler.ensureShaderLibrary();
+    await this._awaitPendingRetirement();
     this.resources.resetCompilationResources();
     this.currentBankResidency = EMPTY_BANK_RESIDENCY;
     this.pipelines = [];
     this.specializationBufferSlots.clear();
     this.specializationBindGroups.clear();
     this.specializationBufferContents.clear();
-    for (const buffer of this.pendingRetiredBuffers) buffer.destroy?.();
-    this.pendingRetiredBuffers.clear();
+    this.pendingDeviceErrorChecks.clear();
+    this._releasePendingRetirement();
     this.pendingRetirementFence = null;
     this.retirementFenceUnavailable = false;
     this.decodeState.resetCompilation();
     this.compiledGraphPlan = compileWebGPUGraphPlan(this.graph as RuntimeGraph);
     this._analyzeIncrementalRows();
-    this._allocateBuffers();
+    await runWebGPUErrorScopedSync(
+      this.device,
+      { label: 'WebGPU graph tensor allocation', phase: 'compilation' },
+      () => this._allocateBuffers(),
+    );
     this._aliasInferenceDropoutBuffers();
     for (let nodeIndex = 0; nodeIndex < this.graph.nodes.length; nodeIndex++) {
       const node = this.graph.nodes[nodeIndex];
@@ -914,6 +1013,7 @@ export class GraphExecutor extends BackendEngine {
         this.pipelines[i].graphNodeIndex = nodeIndex;
       }
     }
+    await this._drainPendingDeviceErrorChecks();
     this._assertPipelineWorkgroupLimits(this.pipelines);
     this.compiledWeightRevision = this.graph.weightRevision || 0;
     this.compiledTopologyRevision = this.graph.topologyRevision || 0;
@@ -923,8 +1023,7 @@ export class GraphExecutor extends BackendEngine {
   dispose(): void {
     this.resetDecodeCache();
     this.resources.resetCompilationResources();
-    for (const buffer of this.pendingRetiredBuffers) buffer.destroy?.();
-    this.pendingRetiredBuffers.clear();
+    this._releasePendingRetirement();
     this.decodeState.resetCompilation();
     this.pipelines = [];
     this.specializationBufferSlots.clear();
@@ -940,12 +1039,18 @@ export class GraphExecutor extends BackendEngine {
     return this.decodeState._rowTypedStorage(tensor, sizeBytes);
   }
 
-  _prepareIncrementalRowNode(node: ExecutorNode, position: number): ExecutorNode {
-    return this.decodeState._prepareIncrementalRowNode(node, position);
+  _prepareIncrementalRowNode(node: ExecutorNode, rowSet: DecodeRowSet): ExecutorNode {
+    return this.decodeState._prepareIncrementalRowNode(node, rowSet);
   }
 
-  _incrementalRowCandidate(node: ExecutorNode, nodeIndex: number): IncrementalRowCandidate | null {
-    return this.decodeState._incrementalRowCandidate(node, nodeIndex);
+  _incrementalRowCandidate(
+    node: ExecutorNode, nodeIndex: number, lanes = 1,
+  ): IncrementalRowCandidate | null {
+    return this.decodeState._incrementalRowCandidate(node, nodeIndex, lanes);
+  }
+
+  _ensureIncrementalRowLanes(lanes: number): void {
+    return this.decodeState._ensureIncrementalRowLanes(lanes);
   }
 
   _assertIncrementalRowInvariants(
@@ -959,10 +1064,33 @@ export class GraphExecutor extends BackendEngine {
     return this.decodeState._analyzeIncrementalRows();
   }
 
-  _compileIncrementalRowPipelines(
+  async _compileIncrementalRowPipelines(
     nodeIndices: Iterable<number> = this.incrementalRowCandidates.keys(),
   ): Promise<void> {
-    return this.graphCompiler._compileIncrementalRowPipelines(nodeIndices);
+    const previousPlans = new Map(this.incrementalRowPlans);
+    const previousResources = new Set(this.auxiliaryBuffers);
+    const previousBufferCreateCount = this.specializationBufferCreateCount;
+    const previousBindGroupCreateCount = this.bindGroupCreateCount;
+    try {
+      await this.graphCompiler._compileIncrementalRowPipelines(nodeIndices);
+      // Lazy plans publish inside the compiler, but dispatch is still waiting
+      // on this method. Resolve every per-create scope here, before any invalid
+      // buffer or bind group can be encoded into a command stream.
+      await this._drainPendingDeviceErrorChecks();
+    } catch (error) {
+      for (const buffer of [...this.auxiliaryBuffers]) {
+        if (previousResources.has(buffer)) continue;
+        this.auxiliaryBuffers.delete(buffer);
+        buffer.destroy?.();
+      }
+      this.incrementalRowPlans.clear();
+      for (const [nodeIndex, plan] of previousPlans) {
+        this.incrementalRowPlans.set(nodeIndex, plan);
+      }
+      this.specializationBufferCreateCount = previousBufferCreateCount;
+      this.bindGroupCreateCount = previousBindGroupCreateCount;
+      throw error;
+    }
   }
 
   _ensureAdapterPipeline(): Promise<GPUComputePipeline> {
@@ -1039,14 +1167,6 @@ export class GraphExecutor extends BackendEngine {
     return this.dispatch._preflightExecutionInputs(inputs);
   }
 
-  _incrementalRowRange(
-    rowTensor: ExecutorTensor | null,
-    fullTensor: ExecutorTensor,
-    position: number,
-    label: string,
-  ): { offset: number; size: number } {
-    return this.decodeState._incrementalRowRange(rowTensor, fullTensor, position, label);
-  }
 
   _uploadExecutionInputs(
     inputs: WebGPUExecutionInputs,
@@ -1066,13 +1186,14 @@ export class GraphExecutor extends BackendEngine {
     commandEncoder: GPUCommandEncoder,
     pipeline: GPUComputePipeline | null,
     copy: IncrementalRowByteCopy | undefined,
+    index: number,
     sourceOffset: number,
     destinationOffset: number,
     size: number,
     label: string,
   ): void {
     return this.decodeState._encodeIncrementalRowByteCopy(
-      commandEncoder, pipeline, copy, sourceOffset, destinationOffset, size, label,
+      commandEncoder, pipeline, copy, index, sourceOffset, destinationOffset, size, label,
     );
   }
 
@@ -1086,16 +1207,60 @@ export class GraphExecutor extends BackendEngine {
   _encodeIncrementalRowsInto(
     commandEncoder: GPUCommandEncoder,
     selectedNodes: Iterable<number>,
-    rowPosition: number,
+    rowSet: DecodeRowSet,
     options: { qsdpaControlBuffer?: GPUBuffer | null } = {},
   ): void {
     return this.decodeState._encodeIncrementalRowsInto(
-      commandEncoder, selectedNodes, rowPosition, options,
+      commandEncoder, selectedNodes, rowSet, options,
     );
   }
 
-  _encodeIncrementalRows(selectedNodes: Iterable<number>, rowPosition: number): void {
-    return this.decodeState._encodeIncrementalRows(selectedNodes, rowPosition);
+  _attentionRowBytes(tensor: ExecutorTensor | undefined, label: string): number {
+    return this.decodeState._attentionRowBytes(tensor, label);
+  }
+
+  async _compilePagedRowVariants(
+    nodeIndices: Iterable<number>,
+    pagedTensors: ReadonlySet<string>,
+  ): Promise<void> {
+    const previousResources = new Set(this.auxiliaryBuffers);
+    const previousBufferCreateCount = this.specializationBufferCreateCount;
+    const previousBindGroupCreateCount = this.bindGroupCreateCount;
+    const previousPlans = new Map([...this.incrementalRowPlans].map(([nodeIndex, plan]) => [
+      nodeIndex,
+      {
+        pagedStaging: plan.pagedStaging,
+        pagedPipelines: plan.pagedPipelines,
+        pagedQsdpaParamsBuffer: plan.pagedQsdpaParamsBuffer,
+      },
+    ] as const));
+    try {
+      await this.graphCompiler._compilePagedRowVariants(nodeIndices, pagedTensors);
+      await this._drainPendingDeviceErrorChecks();
+    } catch (error) {
+      for (const buffer of [...this.auxiliaryBuffers]) {
+        if (previousResources.has(buffer)) continue;
+        this.auxiliaryBuffers.delete(buffer);
+        buffer.destroy?.();
+      }
+      for (const [nodeIndex, previous] of previousPlans) {
+        const plan = this.incrementalRowPlans.get(nodeIndex);
+        if (!plan) continue;
+        plan.pagedStaging = previous.pagedStaging;
+        plan.pagedPipelines = previous.pagedPipelines;
+        plan.pagedQsdpaParamsBuffer = previous.pagedQsdpaParamsBuffer;
+      }
+      this.specializationBufferCreateCount = previousBufferCreateCount;
+      this.bindGroupCreateCount = previousBindGroupCreateCount;
+      throw error;
+    }
+  }
+
+  _encodeIncrementalRows(
+    selectedNodes: Iterable<number>,
+    rowSet: DecodeRowSet,
+  ): void {
+    return this.decodeState._encodeIncrementalRows(selectedNodes, rowSet);
   }
 
   _deviceFeedbackDescriptor(
@@ -1121,7 +1286,7 @@ export class GraphExecutor extends BackendEngine {
     options: WebGPUExecutionOptions = {},
   ): Promise<GPUBuffer | undefined> {
     assertInferenceExecutionOptions(options, 'WebGPU inference');
-    return this.dispatch.execute(inputs, options);
+    return this._executeFailClosed(inputs, options, false);
   }
 
   /** @internal The caller completed pure value preflight for this graph. */
@@ -1130,10 +1295,38 @@ export class GraphExecutor extends BackendEngine {
     options: WebGPUExecutionOptions = {},
   ): Promise<GPUBuffer | undefined> {
     assertInferenceExecutionOptions(options, 'WebGPU inference');
-    return this.dispatch.execute(inputs, options, null, true);
+    return this._executeFailClosed(inputs, options, true);
   }
 
-  snapshotOutputs(): ReadonlyMap<string, WebGPUOutputSnapshot> {
+  private async _executeFailClosed(
+    inputs: WebGPUExecutionInputs,
+    options: WebGPUExecutionOptions,
+    preflightComplete: boolean,
+  ): Promise<GPUBuffer | undefined> {
+    try {
+      const output = await this.dispatch.execute(inputs, options, null, preflightComplete);
+      await this._drainPendingDeviceErrorChecks();
+      return output;
+    } catch (error) {
+      // Input writes or a rejected command stream may have partially touched
+      // mutable execution storage. Force the provider to specialize again and
+      // never reuse decode state from the rejected submission.
+      this.currentShapeSignature = null;
+      this._webGPUIncrementalCacheValid = false;
+      this.deviceFeedbackState = null;
+      // Drain any lazy row-specialization checks so they cannot leak an
+      // unhandled rejection after the public operation has already failed.
+      try {
+        await this._drainPendingDeviceErrorChecks();
+      } catch {
+        // Preserve the first execution failure; the physical signature above
+        // already makes the complete binding ineligible for reuse.
+      }
+      throw error;
+    }
+  }
+
+  async snapshotOutputs(): Promise<ReadonlyMap<string, WebGPUOutputSnapshot>> {
     return this.results.snapshotOutputs();
   }
 

@@ -22,7 +22,7 @@
 #define PATH_MAX 4096
 #endif
 
-#define SPLIT_PACKAGE_FORMAT "volvoxai-tiny-receipt-vqa-split-kv-onnx-package-v1"
+#define SPLIT_PACKAGE_FORMAT "volvoxai-tiny-receipt-vqa-split-kv-onnx-package-v2"
 #define SPLIT_FAMILY_COUNT 8
 #define SPLIT_BPE_VOCAB_COUNT 1536
 #define SPLIT_IMAGE_HEIGHT 320
@@ -388,7 +388,7 @@ static void split_help(const char* argv0) {
     printf("Usage: %s <package-dir|package_manifest.json> --image <png|jpg> --prompt <text> [options]\n\n",
            argv0);
     printf("Run a qualified TinyReceiptVQA split encoder/decoder package.\n");
-    printf("Requires the explicit KV-cache v1 package ABI.\n");
+    printf("Requires the explicit KV-cache v2 package ABI.\n");
     printf("F32 logits use host first-index argmax; cache tensors advance explicitly.\n\n");
     printf("Options:\n");
     printf("  --image <file>               Receipt PNG/JPEG (required).\n");
@@ -403,7 +403,7 @@ static void split_help(const char* argv0) {
     printf("  --timing                     Emit application timings without per-node tracing.\n");
     printf("  --qualify-dynamic            Untimed short/grow/maximum-padded/shrink qualification.\n");
     printf("  --threads <n>                Set the positive CPU worker count.\n");
-    printf("  --cpu | --vulkan | --opengl | --metal | --nnapi | --cuda\n");
+    printf("  --cpu | --vulkan | --opengl | --metal | --cuda\n");
     printf("  --debug\n");
 }
 
@@ -921,7 +921,7 @@ static int split_parse_routing(const cJSON* root, SplitPackage* package) {
         strcmp(encoder_input, package->encoder.family_ids) != 0 ||
         strcmp(decoder_input, package->decoder.family_ids) != 0) {
         fprintf(stderr,
-                "[tinyreceipt] explicit-KV v1 routing must exactly name both graph family_ids inputs\n");
+                "[tinyreceipt] explicit-KV v2 routing must exactly name both graph family_ids inputs\n");
         return -1;
     }
     return 0;
@@ -1088,7 +1088,7 @@ static int split_validate_generation_v1(const cJSON* root) {
 
 invalid:
     fprintf(stderr,
-            "[tinyreceipt] generation must match the explicit KV-cache v1 contract\n");
+            "[tinyreceipt] generation must match the explicit KV-cache v2 contract\n");
     return -1;
 }
 
@@ -1201,7 +1201,7 @@ static int split_validate_shape_contract_v1(const cJSON* root) {
     relations = split_object(contract, "relations", "shape_contract.relations");
     semantics = split_object(contract, "semantic_inputs",
                              "shape_contract.semantic_inputs");
-    if (!graph_mode || strcmp(graph_mode, "bounded-explicit-kv-v1") != 0 ||
+    if (!graph_mode || strcmp(graph_mode, "bounded-explicit-kv-v2") != 0 ||
         !dimensions || split_exact_keys(dimensions, dimension_keys, 5,
                                         "shape_contract.dimensions") != 0 ||
         split_exact_dimension(dimensions, "B", 1, 1) ||
@@ -1288,7 +1288,7 @@ static int split_validate_shape_contract_v1(const cJSON* root) {
 
 invalid:
     fprintf(stderr,
-            "[tinyreceipt] shape_contract must be the bounded explicit-KV v1 ABI\n");
+            "[tinyreceipt] shape_contract must be the bounded explicit-KV v2 ABI\n");
     return -1;
 }
 
@@ -1340,7 +1340,7 @@ static int split_load_package(const char* package_arg, SplitPackage* package) {
     format = split_string(root, "format", "format");
     if (!format || strcmp(format, SPLIT_PACKAGE_FORMAT) != 0) {
         fprintf(stderr,
-                "[tinyreceipt] unsupported package format; expected explicit-KV v1\n");
+                "[tinyreceipt] unsupported package format; expected explicit-KV v2\n");
         goto cleanup;
     }
     assets = split_object(root, "assets", "assets");
@@ -2344,7 +2344,6 @@ static int split_parse_engine_flag(const char* arg, SplitCommand* command) {
     if (!strcmp(arg, "--vulkan")) return split_select_backend(command, "vulkan");
     if (!strcmp(arg, "--opengl")) return split_select_backend(command, "opengl");
     if (!strcmp(arg, "--metal")) return split_select_backend(command, "metal");
-    if (!strcmp(arg, "--nnapi")) return split_select_backend(command, "nnapi");
     if (!strcmp(arg, "--cuda")) return split_select_backend(command, "cuda");
     if (!strcmp(arg, "--debug")) {
         command->runtime_options.debug = 1;
@@ -3666,7 +3665,7 @@ int tiny_receipt_split_w8a8_run(int argc, char** argv) {
     if (emit_timing) {
         fprintf(stderr,
                 "[debug] tinyreceipt split ABI=%s routing=%s decoder_output=%s shape_mode=%s argmax=%s\n",
-                "explicit-kv-v1",
+                "explicit-kv-v2",
                 "runtime",
                 "f32_logits",
                 command.shape_mode == SPLIT_SHAPE_MODE_MAXIMUM_PADDED ?

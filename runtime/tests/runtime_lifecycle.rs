@@ -349,6 +349,7 @@ fn create_runtime() -> RuntimeHandle {
         &CreateRuntimeRequest {
             debug: false,
             cpu_threads: 1,
+            memory_capture: None,
         },
     )
 }
@@ -479,6 +480,234 @@ fn trainer_step(
             accumulation_steps,
         ),
     )
+}
+
+fn process_memory_capture(envelopes: &[MemoryEnvelopeKind]) -> MemoryCaptureOptions {
+    MemoryCaptureOptions {
+        protocol: "volvoxai-memory-capture/v1".to_string(),
+        include_resource_inventory: true,
+        include_domain_attestation: true,
+        requested_envelopes: envelopes.iter().map(|kind| *kind as i32).collect(),
+        sampling_interval_nanoseconds: None,
+        max_periodic_snapshots: None,
+    }
+}
+
+fn create_runtime_with_memory_capture(envelopes: &[MemoryEnvelopeKind]) -> RuntimeHandle {
+    call(
+        "/volvoxai.runtime.RuntimeService/CreateRuntime",
+        &CreateRuntimeRequest {
+            debug: false,
+            cpu_threads: 1,
+            memory_capture: Some(process_memory_capture(envelopes)),
+        },
+    )
+}
+
+#[test]
+fn memory_capture_is_opt_in_and_inherited_by_native_reports() {
+    let ordinary = create_runtime();
+    assert!(ordinary
+        .report
+        .as_ref()
+        .expect("ordinary creation report")
+        .memory_evidence
+        .is_none());
+    let _: Empty = call(
+        "/volvoxai.runtime.RuntimeService/ReleaseRuntime",
+        &RuntimeRef {
+            runtime_id: ordinary.runtime_id,
+        },
+    );
+
+    let requested = [
+        MemoryEnvelopeKind::ProcessRss,
+        MemoryEnvelopeKind::ProcessPeakRss,
+        MemoryEnvelopeKind::ProcessPss,
+        MemoryEnvelopeKind::ProcessManagedHeapUsed,
+        MemoryEnvelopeKind::DeviceProcessUsed,
+    ];
+    let runtime = create_runtime_with_memory_capture(&requested);
+    let create_report = runtime.report.as_ref().expect("creation report");
+    let create_evidence = create_report
+        .memory_evidence
+        .as_ref()
+        .expect("creation memory evidence");
+    volvoxai::memory_evidence::validate_memory_evidence(create_evidence).unwrap();
+    assert_eq!(create_evidence.format, "volvoxai-memory-evidence/v1");
+    assert_eq!(create_evidence.snapshots.len(), 1);
+    let create_snapshot = &create_evidence.snapshots[0];
+    assert_eq!(create_snapshot.sequence, 1);
+    assert_eq!(create_snapshot.stage, OperationStage::RuntimeCreate as i32);
+    assert_eq!(create_snapshot.point, MemorySnapshotPoint::After as i32);
+    assert_eq!(
+        create_snapshot.resource_inventory,
+        MemoryInventoryKind::Partial as i32
+    );
+    assert!(create_snapshot.resources.is_empty());
+    assert!(create_snapshot.domain_attestation.is_none());
+    let subject = create_snapshot.subject.as_ref().expect("snapshot subject");
+    assert_eq!(subject.kind, MemoryOwnerKind::Runtime as i32);
+    assert_eq!(subject.owner_id, create_report.runtime_id.to_string());
+    assert_eq!(
+        create_snapshot
+            .envelopes
+            .iter()
+            .map(|envelope| envelope.kind)
+            .collect::<Vec<_>>(),
+        requested.iter().map(|kind| *kind as i32).collect::<Vec<_>>()
+    );
+    for envelope in &create_snapshot.envelopes {
+        let relation = MemoryValueRelation::try_from(envelope.value_relation).unwrap();
+        match MemoryEnvelopeKind::try_from(envelope.kind).unwrap() {
+            MemoryEnvelopeKind::ProcessRss | MemoryEnvelopeKind::ProcessPeakRss => {
+                assert!(matches!(
+                    relation,
+                    MemoryValueRelation::Exact | MemoryValueRelation::Unavailable
+                ));
+                assert_eq!(
+                    envelope.bytes.is_some(),
+                    relation == MemoryValueRelation::Exact
+                );
+            }
+            _ => {
+                assert_eq!(relation, MemoryValueRelation::Unavailable);
+                assert!(envelope.bytes.is_none());
+            }
+        }
+    }
+
+    let fixture = Fixture::graph(Some("volvox-graph/v1"));
+    let model: ModelHandle = call(
+        "/volvoxai.runtime.RuntimeService/LoadModel",
+        &LoadModelRequest {
+            runtime_id: runtime.runtime_id.clone(),
+            graph_path: path_string(&fixture.graph_path),
+            weight_paths: Vec::new(),
+        },
+    );
+    let model_report = model.report.as_ref().expect("model report");
+    let model_evidence = model_report
+        .memory_evidence
+        .as_ref()
+        .expect("inherited model memory evidence");
+    volvoxai::memory_evidence::validate_memory_evidence(model_evidence).unwrap();
+    let model_subject = model_evidence.snapshots[0]
+        .subject
+        .as_ref()
+        .expect("model snapshot subject");
+    assert_eq!(model_subject.kind, MemoryOwnerKind::Model as i32);
+    assert_eq!(model_subject.owner_id, model_report.model_id.to_string());
+    assert_ne!(create_evidence.capture_id, model_evidence.capture_id);
+
+    let _: Empty = call(
+        "/volvoxai.runtime.RuntimeService/ReleaseRuntime",
+        &RuntimeRef {
+            runtime_id: runtime.runtime_id,
+        },
+    );
+    let revision: RevisionInfo = call(
+        "/volvoxai.runtime.RuntimeService/GetModelRevision",
+        &ModelRef {
+            model_id: model.model_id.clone(),
+        },
+    );
+    let retained_report = revision.report.as_ref().expect("retained model report");
+    let retained_evidence = retained_report
+        .memory_evidence
+        .as_ref()
+        .expect("child capture after runtime handle release");
+    volvoxai::memory_evidence::validate_memory_evidence(retained_evidence).unwrap();
+    let retained_subject = retained_evidence.snapshots[0]
+        .subject
+        .as_ref()
+        .expect("retained model subject");
+    assert_eq!(retained_subject.kind, MemoryOwnerKind::Model as i32);
+    assert_eq!(retained_subject.owner_id, retained_report.model_id.to_string());
+
+    let _: Empty = call(
+        "/volvoxai.runtime.RuntimeService/ReleaseModel",
+        &ModelRef {
+            model_id: model.model_id,
+        },
+    );
+}
+
+#[test]
+fn concurrent_runtime_release_cannot_race_a_child_capture_lease() {
+    let fixture = Fixture::graph(Some("volvox-graph/v1"));
+    let runtime = create_runtime_with_memory_capture(&[]);
+    let model: ModelHandle = call(
+        "/volvoxai.runtime.RuntimeService/LoadModel",
+        &LoadModelRequest {
+            runtime_id: runtime.runtime_id.clone(),
+            graph_path: path_string(&fixture.graph_path),
+            weight_paths: Vec::new(),
+        },
+    );
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
+    let report_barrier = std::sync::Arc::clone(&barrier);
+    let model_id = model.model_id.clone();
+    let reporter = std::thread::spawn(move || {
+        report_barrier.wait();
+        call::<_, RevisionInfo>(
+            "/volvoxai.runtime.RuntimeService/GetModelRevision",
+            &ModelRef {
+                model_id: model_id.clone(),
+            },
+        )
+    });
+    let release_barrier = std::sync::Arc::clone(&barrier);
+    let runtime_id = runtime.runtime_id;
+    let releaser = std::thread::spawn(move || {
+        release_barrier.wait();
+        call::<_, Empty>(
+            "/volvoxai.runtime.RuntimeService/ReleaseRuntime",
+            &RuntimeRef { runtime_id },
+        )
+    });
+    barrier.wait();
+    let revision = reporter.join().expect("child report thread");
+    releaser.join().expect("runtime release thread");
+
+    let report = revision.report.as_ref().expect("child report");
+    let evidence = report
+        .memory_evidence
+        .as_ref()
+        .expect("child lease memory evidence");
+    volvoxai::memory_evidence::validate_memory_evidence(evidence).unwrap();
+    let subject = evidence.snapshots[0]
+        .subject
+        .as_ref()
+        .expect("child lease subject");
+    assert_eq!(subject.kind, MemoryOwnerKind::Model as i32);
+    assert_eq!(subject.owner_id, report.model_id.to_string());
+
+    let _: Empty = call(
+        "/volvoxai.runtime.RuntimeService/ReleaseModel",
+        &ModelRef {
+            model_id: model.model_id,
+        },
+    );
+}
+
+#[test]
+fn native_adapter_rejects_periodic_memory_capture_explicitly() {
+    let mut capture = process_memory_capture(&[MemoryEnvelopeKind::ProcessRss]);
+    capture.sampling_interval_nanoseconds = Some(1);
+    capture.max_periodic_snapshots = Some(1);
+    let failure = invoke::<_, RuntimeHandle>(
+        "/volvoxai.runtime.RuntimeService/CreateRuntime",
+        &CreateRuntimeRequest {
+            debug: false,
+            cpu_threads: 1,
+            memory_capture: Some(capture),
+        },
+    )
+    .unwrap_err();
+    assert_eq!(failure.grpc_code, 3);
+    assert!(failure.message.contains("periodic memory sampling"));
+    assert!(failure.message.contains("not supported"));
 }
 
 #[test]
@@ -1057,7 +1286,7 @@ fn revisions_and_adapter_selection_are_explicit() {
 fn trainer_lifecycle_keeps_steps_private_and_publishes_exact_revisions() {
     let fixture = Fixture::training();
     let weight_path = fixture.weight_path.as_ref().expect("training weights");
-    let runtime = create_runtime();
+    let runtime = create_runtime_with_memory_capture(&[]);
     let model: ModelHandle = call(
         "/volvoxai.runtime.RuntimeService/LoadModel",
         &LoadModelRequest {
@@ -1092,6 +1321,16 @@ fn trainer_lifecycle_keeps_steps_private_and_publishes_exact_revisions() {
     assert_eq!(create_report.stage, OperationStage::TrainerCreate as i32);
     assert_eq!(create_report.backend, "cpu");
     assert_eq!(create_report.weight_revision, initial.weight_revision);
+    let trainer_subject = create_report
+        .memory_evidence
+        .as_ref()
+        .expect("Trainer create memory evidence")
+        .snapshots[0]
+        .subject
+        .as_ref()
+        .expect("Trainer subject");
+    assert_eq!(trainer_subject.kind, MemoryOwnerKind::Trainer as i32);
+    assert_eq!(trainer_subject.owner_id, trainer.trainer_id);
 
     let mut wrong_shape = f32_training_tensor([1.0, -0.5]);
     wrong_shape.shape = vec![2];
@@ -1133,6 +1372,14 @@ fn trainer_lifecycle_keeps_steps_private_and_publishes_exact_revisions() {
         first.report.as_ref().expect("step report").stage,
         OperationStage::TrainerStep as i32
     );
+    let step_subject = first
+        .report
+        .as_ref()
+        .and_then(|report| report.memory_evidence.as_ref())
+        .and_then(|evidence| evidence.snapshots[0].subject.as_ref())
+        .expect("Trainer step subject");
+    assert_eq!(step_subject.kind, MemoryOwnerKind::Trainer as i32);
+    assert_eq!(step_subject.owner_id, trainer.trainer_id);
 
     let pending = invoke::<_, RevisionInfo>(
         "/volvoxai.runtime.RuntimeService/CommitTrainer",
@@ -1333,7 +1580,7 @@ fn ptq_plan_is_proto_owned_snapshot_scoped_and_revision_checked() {
     let output_graph_path = output_directory.join("graph.json");
     let output_weights_path = output_directory.join("model.safetensors");
     std::fs::create_dir(&output_directory).expect("create PTQ output directory");
-    let runtime = create_runtime();
+    let runtime = create_runtime_with_memory_capture(&[]);
     let model: ModelHandle = call(
         "/volvoxai.runtime.RuntimeService/LoadModel",
         &LoadModelRequest {
@@ -1394,6 +1641,16 @@ fn ptq_plan_is_proto_owned_snapshot_scoped_and_revision_checked() {
     assert_eq!(create_report.backend, "cpu");
     assert!(create_report.route_attested);
     assert_eq!(create_report.weight_revision, initial.weight_revision);
+    let plan_subject = create_report
+        .memory_evidence
+        .as_ref()
+        .expect("PTQ create memory evidence")
+        .snapshots[0]
+        .subject
+        .as_ref()
+        .expect("PTQ plan subject");
+    assert_eq!(plan_subject.kind, MemoryOwnerKind::PtqPlan as i32);
+    assert_eq!(plan_subject.owner_id, plan.ptq_plan_id);
 
     let before_calibration: PtqPlanInfo = call(
         "/volvoxai.runtime.RuntimeService/InspectPtqPlan",
@@ -1415,6 +1672,14 @@ fn ptq_plan_is_proto_owned_snapshot_scoped_and_revision_checked() {
         .tensors
         .iter()
         .all(|parameters| parameters.observed_values == 0 && parameters.scale == 0.0));
+    let inspect_subject = before_calibration
+        .report
+        .as_ref()
+        .and_then(|report| report.memory_evidence.as_ref())
+        .and_then(|evidence| evidence.snapshots[0].subject.as_ref())
+        .expect("PTQ inspect subject");
+    assert_eq!(inspect_subject.kind, MemoryOwnerKind::PtqPlan as i32);
+    assert_eq!(inspect_subject.owner_id, plan.ptq_plan_id);
 
     // Native creation copied a private template snapshot. Mutating the caller
     // file now cannot alter the package emitted later.

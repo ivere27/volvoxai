@@ -3,6 +3,7 @@ import { validatePortableQuantizedGraph } from '../ops/quantizedGraphValidation.
 import { memoryLocations } from '../generated/volvoxaiEnums.js';
 import type { PortableQuantizedGraph } from '../ops/quantizedGraphValidation.js';
 import type { MemoryLocationValue } from '../generated/volvoxaiEnums.js';
+import type { KVPagePlan } from './kvPageAddressing.js';
 
 export type BackendOutputLocation = MemoryLocationValue;
 
@@ -25,8 +26,32 @@ export interface BackendExecutionOptions {
   incremental?: boolean;
   incrementalReset?: boolean;
   incrementalRowPosition?: number;
+  /**
+   * Every lane's row this step, for a context that owns more than one slot.
+   *
+   * The batched spelling of `incrementalRowPosition`; both build the same
+   * `DecodeRowSet` inside the engine, so a one-lane step cannot drift from a
+   * batched one. Declaring both is refused rather than resolved by precedence.
+   * A backend that cannot execute this must refuse it: silently falling back to
+   * a full recompute would report a row step it did not run.
+   */
+  incrementalRowLanes?: readonly {
+    readonly position?: number;
+    readonly kvPages?: KVPagePlan | null;
+    /** This lane holds no request; it occupies a row and its output is dropped. */
+    readonly parked?: boolean;
+  }[];
   changedInputs?: string[];
   position?: number;
+  /**
+   * Page table and active K/V length for the lane this step advances. Null or
+   * absent keeps the established contiguous slice — which is also what the
+   * identity mapping produces, so the two are one code path, not two.
+   *
+   * The one-lane spelling. A batched step carries one plan per lane inside
+   * `incrementalRowLanes`, because lanes hold different pages.
+   */
+  kvPages?: KVPagePlan | null;
   [name: string | symbol]: any;
 }
 

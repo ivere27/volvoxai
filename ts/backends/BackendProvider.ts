@@ -1,7 +1,15 @@
 import { assertBuiltInEngine } from './BackendEngine.js';
 import { Model } from '../core/Model.js';
 import type { BackendExecutionSnapshot } from '../core/ExecutionResult.js';
-import type { Graph, InputDescriptor, TensorDescriptor } from '../core/Graph.js';
+import type {
+  BackendMemoryCaptureRequest,
+  BackendMemorySnapshot,
+} from '../core/MemoryCapture.js';
+import type {
+  Graph,
+  InputDescriptor,
+  TensorDescriptor,
+} from '../core/Graph.js';
 import type {
   AcceptedGraphShapeDomainProof,
   ResolvedShapePlan,
@@ -21,10 +29,22 @@ import type {
   OperatorFallbackValue,
 } from '../generated/volvoxaiEnums.js';
 import type { DeviceTensorInputLease } from '../ops/deviceTensorReference.js';
+import {
+  inspectIndependentPublicBatchSemantics,
+} from '../ops/independentBatchSemantics.js';
+import type { IndependentBatchSemanticsEvidence } from '../ops/independentBatchSemantics.js';
 import type { ShapedRuntimeTensorView } from '../ops/shapeSystem.js';
 
-/** JavaScript provider composition SPI version. */
+/**
+ * Opaque discriminator for the current exact JavaScript provider contract.
+ * The numeric value is not a promise that historical layouts with the same
+ * value remain compatible; providers must be built against these sources.
+ */
 export const VOLVOXAI_BACKEND_PROVIDER_VERSION = 1;
+export const BACKEND_PROVIDER_INVARIANT_RESOURCE_OWNER_PROTOCOL =
+  'compiled-invariant-resource-owner/v1' as const;
+export const BACKEND_PROVIDER_INVARIANT_RESOURCE_LEASE_PROTOCOL =
+  'compiled-invariant-resource-lease/v1' as const;
 
 export type OperatorFallbackAttestation = 'none' | 'reported' | 'unknown';
 export type DynamicShapeDomainSupport = 'full' | 'unsupported';
@@ -34,6 +54,12 @@ const DYNAMIC_SHAPE_CAPABILITY_MEMBERS = [
   'proofProtocol',
   'resourceProtocol',
   'support',
+] as const;
+const PROVIDER_CAPABILITY_MEMBERS = [
+  'contextIsolation',
+  'operatorFallback',
+  'outputLocation',
+  'dynamicShapeDomain',
 ] as const;
 
 function hasExactOwnMembers(value: object, expected: readonly string[]): boolean {
@@ -71,8 +97,142 @@ export interface BackendProviderCompilationEvidence {
   readonly device: BackendDeviceIdentity | null;
   readonly allocationBytes: number | null;
   readonly shapeDomain: BackendShapeDomainCompilationAttestation;
+  /**
+   * Core-owned proof bound to the exact canonical graph fingerprint. Required
+   * whenever `batchContract.independentBatch` is `compiler-proved/v1`.
+   */
+  readonly batchSemantics?: Readonly<IndependentBatchSemanticsEvidence>;
   readonly operatorFallbackUsed?: boolean | null;
   readonly offendingNode?: string | number | null;
+}
+
+/**
+ * Provider attestation for an explicitly declared public batch axis.
+ * `single-invocation` forbids a provider from hiding B independent executes in
+ * a loop and calling that dynamic batching.
+ */
+export interface BackendProviderBatchContract {
+  readonly protocol: 'dense-public-batch/v1';
+  readonly densePublicBatch: 'single-invocation' | 'unsupported';
+  /** Provider compiler attestation; core still requires an independent operator proof. */
+  readonly independentBatch: 'compiler-proved/v1' | 'unsupported';
+  readonly deviceResident: boolean;
+  readonly hostFallback: 'forbidden' | 'possible' | 'not-applicable';
+}
+
+
+export function createBackendProviderBatchContract(
+  densePublicBatch: BackendProviderBatchContract['densePublicBatch'],
+  options: Readonly<{
+    independentBatch?: BackendProviderBatchContract['independentBatch'];
+    deviceResident?: boolean;
+    hostFallback?: BackendProviderBatchContract['hostFallback'];
+  }> = {},
+): Readonly<BackendProviderBatchContract> {
+  if (densePublicBatch !== 'single-invocation' && densePublicBatch !== 'unsupported') {
+    throw new VolvoxAIError('INVALID_ARGUMENT', 'Provider dense batch mode is invalid.', {
+      phase: 'initialization',
+    });
+  }
+  const independentBatch = options.independentBatch ?? 'unsupported';
+  const deviceResident = options.deviceResident ?? false;
+  const hostFallback = options.hostFallback ?? 'not-applicable';
+  if ((independentBatch !== 'compiler-proved/v1' && independentBatch !== 'unsupported') ||
+      typeof deviceResident !== 'boolean' ||
+      !['forbidden', 'possible', 'not-applicable'].includes(hostFallback)) {
+    throw new VolvoxAIError('INVALID_ARGUMENT', 'Provider dense batch attestation is invalid.', {
+      phase: 'initialization',
+    });
+  }
+  if ((deviceResident && hostFallback === 'not-applicable') ||
+      (!deviceResident && hostFallback !== 'not-applicable')) {
+    throw new VolvoxAIError('INVALID_ARGUMENT',
+      'Batch host-fallback evidence must match device residency.', {
+        phase: 'initialization',
+      });
+  }
+  if (densePublicBatch === 'unsupported' && independentBatch !== 'unsupported') {
+    throw new VolvoxAIError('INVALID_ARGUMENT',
+      'An unsupported dense batch route cannot attest independent batch execution.', {
+        phase: 'initialization',
+      });
+  }
+  return Object.freeze({
+    protocol: 'dense-public-batch/v1',
+    densePublicBatch,
+    independentBatch,
+    deviceResident,
+    hostFallback,
+  });
+}
+
+/**
+ * Provider-owned scheduling identities for one exact prepared batch route.
+ * A compatibility token may be a structural string so providers do not need
+ * an unbounded object interner; opaque objects retain identity semantics.
+ * Resource domains and device generations always use object identity.
+ */
+export type BackendProviderCompatibilityToken = string | object;
+
+export interface BackendProviderPreparedBatchRoute {
+  readonly resourceDomain: object;
+  readonly compatibilityToken: BackendProviderCompatibilityToken;
+  readonly deviceEpoch: object;
+}
+
+function isFrozenOpaqueIdentity(value: unknown): value is object {
+  return value !== null && typeof value === 'object' && Object.isFrozen(value);
+}
+
+function isCompatibilityToken(value: unknown): value is BackendProviderCompatibilityToken {
+  return (typeof value === 'string' && value.length > 0) || isFrozenOpaqueIdentity(value);
+}
+
+/** Construct a frozen provider route without exposing how its identities are derived. */
+export function createBackendProviderPreparedBatchRoute(
+  resourceDomain: object,
+  compatibilityToken: BackendProviderCompatibilityToken,
+  deviceEpoch: object,
+): Readonly<BackendProviderPreparedBatchRoute> {
+  if (!isFrozenOpaqueIdentity(resourceDomain) ||
+      !isCompatibilityToken(compatibilityToken) ||
+      !isFrozenOpaqueIdentity(deviceEpoch)) {
+    throw new VolvoxAIError('INVALID_ARGUMENT',
+      'Provider batch-route identities must be a non-empty structural token and frozen objects.', {
+        phase: 'initialization',
+      });
+  }
+  return Object.freeze({ resourceDomain, compatibilityToken, deviceEpoch });
+}
+
+/** @internal Validate the exact route returned by an untrusted provider. */
+export function assertProviderPreparedBatchRoute(
+  value: unknown,
+  backendName: string,
+): Readonly<BackendProviderPreparedBatchRoute> {
+  const route = value as Partial<BackendProviderPreparedBatchRoute> | null;
+  if (!route || typeof route !== 'object' || !Object.isFrozen(route) ||
+      !hasExactOwnMembers(route, [
+        'resourceDomain', 'compatibilityToken', 'deviceEpoch',
+      ])) {
+    throw new VolvoxAIError('ABI_UNSUPPORTED',
+      `Backend provider '${backendName}' returned an invalid prepared batch route.`, {
+        phase: 'execution', backend: backendName,
+      });
+  }
+  // Capture provider accessors once, then publish only core-owned data fields.
+  const resourceDomain = route.resourceDomain;
+  const compatibilityToken = route.compatibilityToken;
+  const deviceEpoch = route.deviceEpoch;
+  if (!isFrozenOpaqueIdentity(resourceDomain) ||
+      !isCompatibilityToken(compatibilityToken) ||
+      !isFrozenOpaqueIdentity(deviceEpoch)) {
+    throw new VolvoxAIError('ABI_UNSUPPORTED',
+      `Backend provider '${backendName}' returned an invalid prepared batch route.`, {
+        phase: 'execution', backend: backendName,
+      });
+  }
+  return Object.freeze({ resourceDomain, compatibilityToken, deviceEpoch });
 }
 
 /** Copy provider-owned device metadata into a stable serializable identity. */
@@ -153,6 +313,8 @@ export interface BackendLogicalCompileInput {
   readonly snapshot: Model;
   readonly graph: Graph;
   readonly graphFingerprint: string;
+  /** Exact core-owned semantic proof providers may echo in compile evidence. */
+  readonly batchSemantics: Readonly<IndependentBatchSemanticsEvidence>;
   readonly shapeDomainProof: AcceptedGraphShapeDomainProof;
   readonly definitionId: string;
   readonly topologyRevision: number;
@@ -176,10 +338,12 @@ export function createBackendCompileInput(
         phase: 'compilation',
       });
   }
+  const batchSemantics = inspectIndependentPublicBatchSemantics(snapshot);
   return Object.freeze({
     snapshot,
     graph: snapshot.graph,
     graphFingerprint: snapshot.definitionFingerprint,
+    batchSemantics,
     shapeDomainProof: snapshot.shapeDomainProof,
     definitionId: snapshot.definitionId,
     topologyRevision: snapshot.topologyRevision,
@@ -252,10 +416,150 @@ export interface BackendProviderExecutionContext {
   decodeSeed?(request: BackendResolvedExecutionRequest): Promise<BackendExecutionSnapshot>;
   decodeStep?(request: BackendResolvedExecutionRequest): Promise<BackendExecutionSnapshot>;
   decodeReset?(): Promise<void>;
+  /** Optional synchronous, versioned snapshot of provider-owned resources. */
+  captureMemorySnapshot?(request: BackendMemoryCaptureRequest): BackendMemorySnapshot;
   close(): Promise<void> | void;
 }
 
+/** Counted compiled-artifact owner exposed by every provider compiled model. */
+export interface BackendProviderInvariantResourceOwner {
+  readonly protocol: typeof BACKEND_PROVIDER_INVARIANT_RESOURCE_OWNER_PROTOCOL;
+  readonly ownerIdentity: object;
+  /** Exact device/resource generation accepted by leases opened right now. */
+  readonly deviceEpoch: object;
+  /** Number of physically materialized invariant resources. */
+  readonly resourceCount: number;
+  /** Physical invariant bytes owned once by the compiled model. */
+  readonly ownedBytes: number;
+  /** Number of live context leases, including leases that borrowed no entries. */
+  readonly borrowerCount: number;
+  open(): BackendProviderInvariantResourceLease;
+  close(): Promise<void> | void;
+}
+
+/**
+ * Borrow-only context capability. Provider-specific leases may add typed
+ * lookup methods, but creation/mutation authority must remain on the owner.
+ */
+export interface BackendProviderInvariantResourceLease {
+  readonly protocol: typeof BACKEND_PROVIDER_INVARIANT_RESOURCE_LEASE_PROTOCOL;
+  readonly ownerIdentity: object;
+  readonly deviceEpoch: object;
+  readonly borrowedResourceCount: number;
+  readonly borrowedBytes: number;
+  release(): void;
+}
+
+function validInvariantCount(value: unknown): value is number {
+  return Number.isSafeInteger(value) && (value as number) >= 0;
+}
+
+export interface ValidatedProviderInvariantResources {
+  readonly owner: BackendProviderInvariantResourceOwner;
+  readonly ownerIdentity: object;
+  readonly deviceEpoch: object;
+  readonly open: BackendProviderInvariantResourceOwner['open'];
+  readonly close: BackendProviderInvariantResourceOwner['close'];
+}
+
+const CAPTURED_COMPILED_INVARIANT_RESOURCES =
+  new WeakMap<object, Readonly<ValidatedProviderInvariantResources>>();
+
+function captureProviderInvariantResourceOwner(
+  value: unknown,
+  backendName: string,
+): Readonly<ValidatedProviderInvariantResources> {
+  const owner = value as Partial<BackendProviderInvariantResourceOwner> | null;
+  const protocol = owner?.protocol;
+  const ownerIdentity = owner?.ownerIdentity;
+  const deviceEpoch = owner?.deviceEpoch;
+  const resourceCount = owner?.resourceCount;
+  const ownedBytes = owner?.ownedBytes;
+  const borrowerCount = owner?.borrowerCount;
+  const open = owner?.open;
+  const close = owner?.close;
+  if (!owner || typeof owner !== 'object' ||
+      protocol !== BACKEND_PROVIDER_INVARIANT_RESOURCE_OWNER_PROTOCOL ||
+      !isFrozenOpaqueIdentity(ownerIdentity) ||
+      !isFrozenOpaqueIdentity(deviceEpoch) ||
+      !validInvariantCount(resourceCount) ||
+      !validInvariantCount(ownedBytes) ||
+      !validInvariantCount(borrowerCount) ||
+      typeof open !== 'function' || typeof close !== 'function') {
+    throw new VolvoxAIError('ABI_UNSUPPORTED',
+      `Backend provider '${backendName}' returned an invalid invariant resource owner.`, {
+        phase: 'compilation', backend: backendName,
+      });
+  }
+  return Object.freeze({
+    owner: owner as BackendProviderInvariantResourceOwner,
+    ownerIdentity,
+    deviceEpoch,
+    open,
+    close,
+  });
+}
+
+/** @internal Validate the mandatory compiled-model invariant owner seam. */
+export function assertProviderInvariantResourceOwner(
+  value: unknown,
+  backendName: string,
+): BackendProviderInvariantResourceOwner {
+  return captureProviderInvariantResourceOwner(value, backendName).owner;
+}
+
+/** @internal Validate and bind one context lease to its exact compiled owner. */
+export function assertProviderInvariantResourceLease(
+  value: unknown,
+  owner: BackendProviderInvariantResourceOwner,
+  backendName: string,
+  expected: Readonly<Pick<ValidatedProviderInvariantResources,
+    'ownerIdentity' | 'deviceEpoch'>> = owner,
+): BackendProviderInvariantResourceLease {
+  const lease = value as Partial<BackendProviderInvariantResourceLease> | null;
+  if (!lease || typeof lease !== 'object' || !Object.isFrozen(lease) ||
+      lease.protocol !== BACKEND_PROVIDER_INVARIANT_RESOURCE_LEASE_PROTOCOL ||
+      lease.ownerIdentity !== expected.ownerIdentity ||
+      lease.deviceEpoch !== expected.deviceEpoch ||
+      !validInvariantCount(lease.borrowedResourceCount) ||
+      !validInvariantCount(lease.borrowedBytes) ||
+      typeof lease.release !== 'function') {
+    throw new VolvoxAIError('ABI_UNSUPPORTED',
+      `Backend provider '${backendName}' returned an invalid invariant resource lease.`, {
+        phase: 'compilation', backend: backendName,
+      });
+  }
+  return lease as BackendProviderInvariantResourceLease;
+}
+
+/** @internal Retrieve the owner captured by compiled-model validation without rereading getters. */
+export function validatedProviderInvariantResources(
+  compiled: BackendProviderCompiledModel,
+  backendName: string,
+): Readonly<ValidatedProviderInvariantResources> {
+  const resources = CAPTURED_COMPILED_INVARIANT_RESOURCES.get(compiled);
+  if (resources === undefined) {
+    throw new VolvoxAIError('ABI_UNSUPPORTED',
+      `Backend provider '${backendName}' compiled model was not validated by core.`, {
+        phase: 'compilation', backend: backendName,
+      });
+  }
+  return resources;
+}
+
+/** @internal Retrieve an owner captured before the rest of compiled validation. */
+export function capturedProviderInvariantResources(
+  value: unknown,
+): Readonly<ValidatedProviderInvariantResources> | null {
+  if ((typeof value !== 'object' && typeof value !== 'function') || value === null) {
+    return null;
+  }
+  return CAPTURED_COMPILED_INVARIANT_RESOURCES.get(value) ?? null;
+}
+
 export interface BackendProviderContextOptions {
+  /** Exact borrow-only lease opened by core from this compiled model. */
+  readonly invariantResources: BackendProviderInvariantResourceLease;
   /**
    * Canonical metadata-only plan for eager physical preparation. Providers
    * may ignore it, but must never treat it as synthetic execution input or as
@@ -266,13 +570,26 @@ export interface BackendProviderContextOptions {
     changedInputs?: readonly string[] | null;
     rowMode?: DecodeRowModeValue;
     requireIncremental?: boolean;
+    /** Dense decode slot capacity, declared by the context. Defaults to one. */
+    lanes?: number;
   }>;
 }
 
 export interface BackendProviderCompiledModel {
   readonly backendName: string;
   readonly compilationEvidence: Readonly<BackendProviderCompilationEvidence>;
-  createContext(options?: BackendProviderContextOptions):
+  readonly batchContract: Readonly<BackendProviderBatchContract>;
+  readonly invariantResources: BackendProviderInvariantResourceOwner;
+  /**
+   * Pure, synchronous metadata attestation for this exact plan.
+   *
+   * This boundary runs before Runtime reserves/copies request payload storage.
+   * It must not execute, mutate a context/device, retain request data, or grow
+   * an unbounded per-request cache. Returned identities remain stable for every
+   * admitted request that carries them.
+   */
+  prepareBatchRoute(plan: ResolvedShapePlan): Readonly<BackendProviderPreparedBatchRoute>;
+  createContext(options: BackendProviderContextOptions):
     Promise<BackendProviderExecutionContext> | BackendProviderExecutionContext;
   close(): Promise<void> | void;
 }
@@ -312,6 +629,7 @@ export function assertBackendProvider(value: unknown, label = 'Backend provider'
   const provider = value as Partial<BackendProvider> | null;
   const capabilities = provider?.capabilities;
   const validCapabilities = capabilities && Object.isFrozen(capabilities) &&
+    hasExactOwnMembers(capabilities, PROVIDER_CAPABILITY_MEMBERS) &&
     capabilities.contextIsolation === true &&
     ['none', 'reported', 'unknown'].includes(capabilities.operatorFallback) &&
     MEMORY_LOCATIONS.has(capabilities.outputLocation) &&
@@ -321,8 +639,9 @@ export function assertBackendProvider(value: unknown, label = 'Backend provider'
       !validCapabilities || typeof provider.compile !== 'function' ||
       typeof provider.close !== 'function') {
     throw new VolvoxAIError('ABI_UNSUPPORTED',
-      `${label} must use VOLVOXAI_BACKEND_PROVIDER_VERSION ` +
-        `${VOLVOXAI_BACKEND_PROVIDER_VERSION}.`, {
+      `${label} must match the current exact provider contract ` +
+        `(VOLVOXAI_BACKEND_PROVIDER_VERSION ` +
+        `${VOLVOXAI_BACKEND_PROVIDER_VERSION}); historical layouts are unsupported.`, {
         phase: 'initialization',
       });
   }
@@ -368,13 +687,43 @@ export function assertProviderCompiledModel(
 ): BackendProviderCompiledModel {
   const compiled = value as Partial<BackendProviderCompiledModel> | null;
   if (!compiled || compiled.backendName !== backendName ||
+      typeof compiled.prepareBatchRoute !== 'function' ||
       typeof compiled.createContext !== 'function' || typeof compiled.close !== 'function') {
     throw new VolvoxAIError('ABI_UNSUPPORTED',
       `Backend provider '${backendName}' returned an invalid compiled model.`, {
         phase: 'compilation', backend: backendName,
       });
   }
+  const invariantResources = captureProviderInvariantResourceOwner(
+    compiled.invariantResources,
+    backendName,
+  );
+  /* Publish the captured callbacks before validating the remaining compiled
+   * contract. Runtime.compile must be able to close this exact owner when a
+   * later batch/evidence check rejects the candidate, without rereading a
+   * hostile invariantResources getter. */
+  CAPTURED_COMPILED_INVARIANT_RESOURCES.set(compiled, invariantResources);
+  const batch = compiled.batchContract as Partial<BackendProviderBatchContract> | undefined;
+  if (!batch || !Object.isFrozen(batch) || !hasExactOwnMembers(batch, [
+    'protocol', 'densePublicBatch', 'independentBatch', 'deviceResident', 'hostFallback',
+  ]) || batch.protocol !== 'dense-public-batch/v1' ||
+      (batch.densePublicBatch !== 'single-invocation' && batch.densePublicBatch !== 'unsupported') ||
+      (batch.independentBatch !== 'compiler-proved/v1' &&
+        batch.independentBatch !== 'unsupported') ||
+      (batch.densePublicBatch === 'unsupported' &&
+        batch.independentBatch !== 'unsupported') ||
+      typeof batch.deviceResident !== 'boolean' ||
+      !['forbidden', 'possible', 'not-applicable'].includes(batch.hostFallback as string) ||
+      ((batch.deviceResident && batch.hostFallback === 'not-applicable') ||
+        (!batch.deviceResident && batch.hostFallback !== 'not-applicable'))) {
+    throw new VolvoxAIError('ABI_UNSUPPORTED',
+      `Backend provider '${backendName}' returned an invalid batch contract.`, {
+        phase: 'compilation', backend: backendName,
+      });
+  }
   const evidence = compiled.compilationEvidence;
+  const batchEvidence = evidence?.batchSemantics;
+  const expectedBatchEvidence = input.batchSemantics;
   if (!evidence || typeof evidence !== 'object' || !Object.isFrozen(evidence) ||
       (evidence.allocationBytes !== null &&
         (!Number.isSafeInteger(evidence.allocationBytes) || evidence.allocationBytes < 0)) ||
@@ -383,7 +732,11 @@ export function assertProviderCompiledModel(
         typeof evidence.operatorFallbackUsed !== 'boolean') ||
       (evidence.offendingNode !== undefined && evidence.offendingNode !== null &&
         typeof evidence.offendingNode !== 'string' &&
-        typeof evidence.offendingNode !== 'number')) {
+        typeof evidence.offendingNode !== 'number') ||
+      (batch.independentBatch === 'compiler-proved/v1' && batchEvidence === undefined) ||
+      (batchEvidence !== undefined && batchEvidence !== expectedBatchEvidence) ||
+      (batch.independentBatch === 'compiler-proved/v1' &&
+        expectedBatchEvidence.supported !== true)) {
     throw new VolvoxAIError('ABI_UNSUPPORTED',
       `Backend provider '${backendName}' returned invalid compilation evidence.`, {
         phase: 'compilation', backend: backendName,
@@ -400,7 +753,9 @@ export function assertProviderExecutionContext(
 ): BackendProviderExecutionContext {
   const context = value as Partial<BackendProviderExecutionContext> | null;
   if (!context || context.backendName !== backendName ||
-      typeof context.execute !== 'function' || typeof context.close !== 'function') {
+      typeof context.execute !== 'function' || typeof context.close !== 'function' ||
+      (context.captureMemorySnapshot !== undefined &&
+        typeof context.captureMemorySnapshot !== 'function')) {
     throw new VolvoxAIError('ABI_UNSUPPORTED',
       `Backend provider '${backendName}' returned an invalid execution context.`, {
         phase: 'compilation', backend: backendName,
@@ -444,7 +799,7 @@ export class BuiltInBackendProvider implements BackendProvider {
     this.deviceIdentity = createBackendDeviceIdentity(this.#source.adapterInfo) ||
       Object.freeze({
         backend: this.backendName,
-        device: this.backendName === 'cpu' ? 'host' : this.backendName,
+        device: this.backendName === 'cpu-js' ? 'host' : this.backendName,
       });
   }
 

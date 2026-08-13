@@ -1484,6 +1484,22 @@ static int check_direct_guards(void) {
                 error.code == VX_SHAPE_CONTRACT_ERROR_SHAPE_MISMATCH &&
                 !strcmp(error.path, "operator params.d_model"),
                 "normalization d_model diagnostic mismatch");
+
+        /* The private Trainer may own spare affine capacity, but canonical
+           persisted graph descriptors remain exact-width vectors. */
+        request.params = NULL;
+        request.param_count = 0;
+        weight_shape[0] = 4;
+        REQUIRE(vx_shape_contract_infer("LayerNorm", &request,
+                                        &result, &error) != 0 &&
+                error.code == VX_SHAPE_CONTRACT_ERROR_SHAPE_MISMATCH &&
+                !strcmp(error.path, "operator input 'weight'.shape"),
+                "canonical LayerNorm oversized affine was accepted");
+        REQUIRE(vx_shape_contract_infer("RMSNorm", &request,
+                                        &result, &error) != 0 &&
+                error.code == VX_SHAPE_CONTRACT_ERROR_SHAPE_MISMATCH &&
+                !strcmp(error.path, "operator input 'weight'.shape"),
+                "canonical RMSNorm oversized affine was accepted");
     }
 
     {

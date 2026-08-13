@@ -4,22 +4,43 @@ import {
   type BoundExecutionGraphMaterializer,
 } from '../core/BoundExecutionGraph.js';
 import type { BackendExecutionSnapshot } from '../core/ExecutionResult.js';
+import {
+  BACKEND_MEMORY_SNAPSHOT_PROTOCOL,
+  type BackendMemoryCaptureRequest,
+  type BackendMemorySnapshot,
+  type RuntimeMemoryOwnerRef,
+} from '../core/MemoryCapture.js';
 import { Model } from '../core/Model.js';
 import type { ResolvedShapePlan } from '../core/ResolvedShapePlan.js';
+import { resolveMinimumGraphShapes } from '../core/ResolvedShapePlan.js';
 import { VolvoxAIError } from '../core/RuntimeErrors.js';
 import { kernelRoute, operatorShapeContract } from '../generated/kernelRegistry.js';
+import {
+  MemoryBackingRelation,
+  MemoryEvidenceSource,
+  MemoryInventoryKind,
+  MemoryMetric,
+  MemoryOwnerKind,
+  MemoryResourceRole,
+  MemorySpace,
+  MemoryTemporalCoverage,
+  MemoryValueRelation,
+} from '../generated/volvoxaiEnums.js';
 import {
   runtimeDTypeBytes,
 } from '../ops/shapeSystem.js';
 import type { RuntimeDType, RuntimeTypedArray } from '../types.js';
 import {
   VOLVOXAI_BACKEND_PROVIDER_VERSION,
+  createBackendProviderBatchContract,
+  createBackendProviderPreparedBatchRoute,
   createBackendDeviceIdentity,
   createBackendProviderCapabilities,
   requireHostExecutionInputs,
   type BackendDeviceIdentity,
   type BackendLogicalCompileInput,
   type BackendProvider,
+  type BackendProviderBatchContract,
   type BackendProviderCapabilities,
   type BackendProviderCompilationEvidence,
   type BackendProviderCompiledModel,
@@ -29,14 +50,35 @@ import {
   type BackendResolvedExecutionRequest,
 } from './BackendProvider.js';
 import {
+  InvariantResourceStore,
+  type InvariantResourceLease,
+} from './InvariantResources.js';
+import {
   ProviderDecodeLifecycle,
   type PreparedProviderDecode,
   type ProviderDecodeTelemetry,
 } from './ProviderDecodeLifecycle.js';
 import {
   WasmEngine,
+  WasmCompiledInvariantPrefix,
   type WasmArenaInspection,
 } from './WasmEngine.js';
+
+
+/**
+ * Host-side invariant weight storage, shared by every context over one model
+ * revision.
+ *
+ * `docs/adr-dynamic-shape-v1.md` assigns invariant packed weights to the
+ * compiled model rather than to a context; `snapshot.copyWeightData(name)` per
+ * context is the copy that assignment forbids. Sharing is safe because nothing
+ * writes to these buffers during execution — a single context already reuses
+ * one buffer across every execution and replan.
+ *
+ * The exact `WasmProviderCompiledModel` owns both this host map and one
+ * immutable raw/packed prefix in the provider's linear-memory root. It is
+ * never keyed by a logical Model shared across independent compilations.
+ */
 
 const WASM_SIGNED_ALLOCATOR_MAX_BYTES = 0x7ffffff0;
 const WASM_RUNTIME_ABI_VERSION = 1;
@@ -52,12 +94,52 @@ const WASM_MAX_GROWTH_HEADROOM_BYTES = 64 * 1024 * 1024;
 const WASM_PAGE_BYTES = 64 * 1024;
 const WASM32_MAX_MEMORY_BYTES = 0x100000000;
 const UTF8_ENCODER = new TextEncoder();
+const WASM_HOST_INVARIANT_WEIGHTS_KEY = 'wasm-host-invariant-weights/v1';
+const WASM_LINEAR_INVARIANT_PREFIX_KEY = 'wasm-linear-invariant-prefix/v1';
+
+class WasmCompiledHostWeights {
+  readonly #weights = new Map<string, RuntimeTypedArray>();
+  readonly ownedBytes: number;
+  #closed = false;
+
+  constructor(snapshot: Model) {
+    let ownedBytes = 0;
+    for (const name of snapshot.weightNames) {
+      const value = snapshot.copyWeightData(name);
+      this.#weights.set(name, value);
+      ownedBytes += value.byteLength;
+    }
+    this.ownedBytes = ownedBytes;
+  }
+
+  get(name: string): RuntimeTypedArray {
+    if (this.#closed) throw new Error('WASM compiled host weights are closed.');
+    const value = this.#weights.get(name);
+    if (value === undefined) {
+      throw new Error(`WASM compiled host weight '${name}' is not owned by this revision.`);
+    }
+    return value;
+  }
+
+  close(): void {
+    if (this.#closed) return;
+    this.#closed = true;
+    this.#weights.clear();
+  }
+}
+
+type WasmCompiledInvariantResource =
+  | WasmCompiledHostWeights
+  | WasmCompiledInvariantPrefix;
 
 interface WasmResourceDomainProof {
   readonly maximumTensorBytes: number;
   readonly staticPrefixBytes: number;
   readonly initialMemoryBytes: number;
   readonly maximumLinearResidentBytes: number;
+  readonly maximumInvariantPrefixBytes: number;
+  readonly maximumMutableArenaBytes: number;
+  readonly maximumBankedMutableArenaBytes: number;
   readonly maximumPersistentMetadataBytes: number;
   readonly maximumSharedScratchBytes: number;
   readonly weightBytes: number;
@@ -256,8 +338,9 @@ function possiblePackedPartitions(shape: readonly number[]): readonly (readonly 
 function checkedInvariantPackUpperBytes(
   input: BackendLogicalCompileInput,
   source: WasmEngine,
-): bigint {
+): Readonly<{ total: bigint; banked: bigint }> {
   let packedBytes = 0n;
+  let bankedPackedBytes = 0n;
   for (const node of input.graph.nodes) {
     const weightName = node.inputs.weight;
     const weight = weightName === undefined ? undefined : input.graph.weights[weightName];
@@ -304,9 +387,11 @@ function checkedInvariantPackUpperBytes(
     /* Charge every potentially packed node independently. The engine may
      * deduplicate identical pack keys, but relying on that would under-prove a
      * graph that legally references one weight through multiple layouts. */
-    packedBytes += align16(BigInt(maximum));
+    const charged = align16(BigInt(maximum));
+    packedBytes += charged;
+    if (weight.bank !== null) bankedPackedBytes += charged;
   }
-  return packedBytes;
+  return Object.freeze({ total: packedBytes, banked: bankedPackedBytes });
 }
 
 interface WasmExtentBounds {
@@ -626,6 +711,7 @@ function checkedWasmResourceDomain(
   let maximumTensorBytes = 0n;
   let activationCapacityBytes = 0n;
   let linearWeightBytes = 0n;
+  let linearBankWeightBytes = 0n;
   let weightBytes = 0n;
   let maximumBankResidentBytes = 0n;
   let maximumBankStagingTransactionBytes = 0n;
@@ -667,6 +753,7 @@ function checkedWasmResourceDomain(
       weightBytes += bytes;
       linearWeightBytes += align16(bytes);
       if (descriptor.bank !== null) {
+        linearBankWeightBytes += align16(bytes);
         /* stageWeights visits weights in this same canonical name order. At
          * the transient peak for this bank, every earlier bank's resident
          * slice and both full copies made by stageWeight are simultaneously
@@ -696,12 +783,19 @@ function checkedWasmResourceDomain(
   const invariantPackBytes = checkedInvariantPackUpperBytes(input, source);
   const maximumPersistentMetadataBytes = checkedWasmPersistentMetadataBytes(input);
   const maximumSharedScratchBytes = checkedWasmSharedScratchBytes(input, source);
-  const allocatorResident = staticPrefixBytes + activationCapacityBytes + linearWeightBytes +
-    invariantPackBytes + maximumPersistentMetadataBytes + maximumSharedScratchBytes +
-    BigInt(WASM_MAX_GROWTH_HEADROOM_BYTES);
+  const maximumInvariantPrefixBytes = linearWeightBytes + invariantPackBytes.total;
+  const maximumMutableArenaBytes = activationCapacityBytes +
+    maximumPersistentMetadataBytes + maximumSharedScratchBytes;
+  /* A partially resident bank is a context selection rather than a compiled
+   * invariant. Bound it as a private mutable suffix; full residency borrows
+   * the already materialized full-bank bytes/panels from the prefix. */
+  const maximumBankedMutableArenaBytes = maximumMutableArenaBytes +
+    linearBankWeightBytes + invariantPackBytes.banked;
+  const allocatorResident = staticPrefixBytes + maximumInvariantPrefixBytes +
+    maximumBankedMutableArenaBytes + BigInt(WASM_MAX_GROWTH_HEADROOM_BYTES);
   const wasmResident = initialMemoryBytes > allocatorResident
     ? initialMemoryBytes : allocatorResident;
-  /* The Model and provider context each retain one complete raw weight
+  /* The Model and compiled provider owner each retain one complete raw weight
    * revision. A context with explicit bank residency additionally retains its
    * selected slices, whose domain maximum is every slot of every bank. WASM
    * output views are cloned once into result-owned host storage. Compare that
@@ -734,6 +828,12 @@ function checkedWasmResourceDomain(
     initialMemoryBytes: checkedBigIntNumber(initialMemoryBytes, 'initial memory bytes'),
     maximumLinearResidentBytes: checkedBigIntNumber(
       wasmResident, 'maximum linear resident bytes'),
+    maximumInvariantPrefixBytes: checkedBigIntNumber(
+      maximumInvariantPrefixBytes, 'maximum compiled invariant prefix bytes'),
+    maximumMutableArenaBytes: checkedBigIntNumber(
+      maximumMutableArenaBytes, 'maximum context mutable arena bytes'),
+    maximumBankedMutableArenaBytes: checkedBigIntNumber(
+      maximumBankedMutableArenaBytes, 'maximum banked context mutable arena bytes'),
     maximumPersistentMetadataBytes: checkedBigIntNumber(
       maximumPersistentMetadataBytes, 'maximum persistent metadata bytes'),
     maximumSharedScratchBytes: checkedBigIntNumber(
@@ -791,7 +891,8 @@ class WasmProviderExecutionContext implements BackendProviderExecutionContext {
   #engine: WasmEngine | null;
   readonly #tensorCapacityBytes: Readonly<Record<string, number>>;
   readonly #invariantSchedule: Readonly<object>;
-  readonly #invariantWeights = new Map<string, RuntimeTypedArray>();
+  /** Borrowed from the compiled invariant owner; this context cannot mutate its index. */
+  readonly #invariantWeights: WasmCompiledHostWeights;
   readonly #boundMaterializer: BoundExecutionGraphMaterializer;
   readonly #decode: ProviderDecodeLifecycle;
   readonly #decodeEnabled: boolean;
@@ -809,6 +910,7 @@ class WasmProviderExecutionContext implements BackendProviderExecutionContext {
     engine: WasmEngine,
     tensorCapacityBytes: Readonly<Record<string, number>>,
     invariantSchedule: Readonly<object>,
+    invariantWeights: WasmCompiledHostWeights,
     options?: BackendProviderContextOptions,
   ) {
     this.#snapshot = snapshot;
@@ -823,10 +925,13 @@ class WasmProviderExecutionContext implements BackendProviderExecutionContext {
        * the sequence-major spellings as well as the batch-major one. WebGPU
        * has no row candidate for them, which is why this is per provider. */
       sequenceMajorRows: true,
+      /* Shares `quantizedRowExecution` with the CPU provider, and its staging
+       * buffers come from the WASM heap so the kernels can take pointers into
+       * them. Sequence-major spellings carry one lane only, which the row
+       * attestation refuses to combine with a declared capacity above one. */
+      batchedRows: true,
     }, options?.decode);
-    for (const name of snapshot.weightNames) {
-      this.#invariantWeights.set(name, snapshot.copyWeightData(name));
-    }
+    this.#invariantWeights = invariantWeights;
     this.#boundMaterializer = createBoundExecutionGraphMaterializer(snapshot, {
       invariantWeightStorageFactory: ({ name }) => this.#invariantWeights.get(name),
     });
@@ -877,6 +982,114 @@ class WasmProviderExecutionContext implements BackendProviderExecutionContext {
     this.#assertDecodeEnabled();
     this.#engine.resetDecodeCache();
     this.#decode.reset();
+  }
+
+  captureMemorySnapshot(request: BackendMemoryCaptureRequest): BackendMemorySnapshot {
+    const engine = this.#engine;
+    if (this.#closed || !engine) {
+      throw new VolvoxAIError('HANDLE_DISPOSED', 'WASM execution context is closed.', {
+        phase: 'lifecycle', backend: this.backendName,
+      });
+    }
+    if (request.protocol !== BACKEND_MEMORY_SNAPSHOT_PROTOCOL) {
+      throw new VolvoxAIError('ABI_UNSUPPORTED', 'Unsupported backend memory snapshot protocol.', {
+        phase: 'execution', backend: this.backendName,
+      });
+    }
+    const root = engine.inspectMemoryRoot();
+    const arena = engine.inspectArena();
+    const invariant = arena.sharedInvariant;
+    if (invariant === null || invariant.backingRootId !== root.engineId) {
+      throw new VolvoxAIError('EXECUTION_FAILED',
+        'WASM context lost its compiled invariant linear-memory ownership.', {
+          phase: 'execution', backend: this.backendName,
+        });
+    }
+    const measuredBytes = Object.freeze({ bytes: root.addressableBytes });
+    const rootResourceId = `wasm-linear-${root.engineId}-${root.generation}`;
+    const compiledOwner = Object.freeze({
+      kind: MemoryOwnerKind.CompiledModel,
+      ownerId: invariant.prefixId,
+    });
+    const exactCapacity = (bytes: number) => Object.freeze([Object.freeze({
+      metric: MemoryMetric.Capacity,
+      bytes: Object.freeze({ bytes }),
+      source: MemoryEvidenceSource.RuntimeCounter,
+      valueRelation: MemoryValueRelation.Exact,
+      temporalCoverage: MemoryTemporalCoverage.Instant,
+    })]);
+    const resources: BackendMemorySnapshot['resources'][number][] = [Object.freeze({
+      resourceId: rootResourceId,
+      backingResourceId: '',
+      backingRelation: MemoryBackingRelation.Independent,
+      owner: Object.freeze({
+        kind: MemoryOwnerKind.BackendShared,
+        ownerId: root.engineId,
+      }),
+      role: MemoryResourceRole.Arena,
+      space: MemorySpace.WasmLinear,
+      allocator: 'WebAssembly.Memory',
+      consumers: Object.freeze([compiledOwner, Object.freeze({ ...request.subject })]),
+      measurements: exactCapacity(root.addressableBytes),
+      addressableBytes: measuredBytes,
+    })];
+    const addSuballocation = (
+      resourceId: string,
+      owner: RuntimeMemoryOwnerRef,
+      role: MemoryResourceRole,
+      offset: number,
+      bytes: number,
+      consumers: readonly RuntimeMemoryOwnerRef[],
+    ) => {
+      if (bytes <= 0) return;
+      resources.push(Object.freeze({
+        resourceId,
+        backingResourceId: rootResourceId,
+        backingRelation: MemoryBackingRelation.Suballocation,
+        backingOffsetBytes: Object.freeze({ bytes: offset }),
+        backingLengthBytes: Object.freeze({ bytes }),
+        owner,
+        role,
+        space: MemorySpace.WasmLinear,
+        allocator: 'WasmSharedLinearPool',
+        consumers: Object.freeze([...consumers]),
+        measurements: exactCapacity(bytes),
+        addressableBytes: Object.freeze({ bytes }),
+      }));
+    };
+    addSuballocation(
+      `wasm-prefix-raw-${invariant.prefixId}`,
+      compiledOwner,
+      MemoryResourceRole.Weights,
+      invariant.backingOffsetBytes,
+      invariant.rawWeightPhysicalBytes,
+      [Object.freeze({ ...request.subject })],
+    );
+    addSuballocation(
+      `wasm-prefix-packed-${invariant.prefixId}`,
+      compiledOwner,
+      MemoryResourceRole.PackedWeights,
+      invariant.backingOffsetBytes + invariant.rawWeightPhysicalBytes,
+      invariant.packedWeightPhysicalBytes,
+      [Object.freeze({ ...request.subject })],
+    );
+    if (arena.mutableArenaOffsetBytes !== null) {
+      addSuballocation(
+        `wasm-mutable-${request.subject.ownerId}`,
+        Object.freeze({ ...request.subject }),
+        MemoryResourceRole.Arena,
+        arena.mutableArenaOffsetBytes,
+        arena.mutableArenaBytes,
+        [],
+      );
+    }
+    return Object.freeze({
+      protocol: BACKEND_MEMORY_SNAPSHOT_PROTOCOL,
+      resources: Object.freeze(resources),
+      // JS-side invariant weights and exact result clones live outside the
+      // linear-memory root, so this backend-wide inventory remains partial.
+      resourceInventory: MemoryInventoryKind.Partial,
+    });
   }
 
   #assertDecodeEnabled(): void {
@@ -1087,7 +1300,10 @@ class WasmProviderExecutionContext implements BackendProviderExecutionContext {
     const rawInputs = Object.fromEntries(
       this.#snapshot.inputNames.map((name) => [name, hostInputs[name].data]),
     );
-    const rawOutputs = await engine.execute(rawInputs, executionOptions);
+    /* Kernels and the result clone are one synchronous pinning interval. A
+     * sibling context may grow the shared memory only after these host-owned
+     * result bytes have been captured. */
+    const rawOutputs = engine.executePinned(rawInputs, executionOptions);
     const outputs = request.outputDescriptors.map((descriptor) => {
       const data = rawOutputs[descriptor.name];
       if (!data || runtimeStorageDType(data) !== descriptor.dtype ||
@@ -1136,6 +1352,27 @@ class WasmProviderExecutionContext implements BackendProviderExecutionContext {
         specializationRebindCount: arena.variantRebindCount,
         invariantF32PackCount: arena.f32PackCount,
         invariantQ8PackCount: arena.q8PackCount,
+        invariantRawWeightCopyCount: arena.rawWeightCopyCount,
+        invariantRawWeightCopyBytes: arena.rawWeightCopyBytes,
+        sharedInvariantPrefixId: arena.sharedInvariant?.prefixId ?? null,
+        sharedInvariantPhysicalAllocationCount:
+          arena.sharedInvariant?.physicalAllocationCount ?? 0,
+        sharedInvariantRawWeightBytes: arena.sharedInvariant?.rawWeightBytes ?? 0,
+        sharedInvariantRawWeightPhysicalBytes:
+          arena.sharedInvariant?.rawWeightPhysicalBytes ?? 0,
+        sharedInvariantPackedWeightBytes: arena.sharedInvariant?.packedWeightBytes ?? 0,
+        sharedInvariantPackedWeightPhysicalBytes:
+          arena.sharedInvariant?.packedWeightPhysicalBytes ?? 0,
+        sharedInvariantRawWeightCopyCount:
+          arena.sharedInvariant?.rawWeightCopyCount ?? 0,
+        sharedInvariantRawWeightCopyBytes:
+          arena.sharedInvariant?.rawWeightCopyBytes ?? 0,
+        sharedInvariantF32PackCount: arena.sharedInvariant?.f32PackCount ?? 0,
+        sharedInvariantQ8PackCount: arena.sharedInvariant?.q8PackCount ?? 0,
+        sharedInvariantBorrowerCount: arena.sharedInvariant?.borrowerCount ?? 0,
+        mutableArenaOffsetBytes: arena.mutableArenaOffsetBytes,
+        mutableArenaBytes: arena.mutableArenaBytes,
+        mutableArenaMaximumBytes: arena.mutableArenaMaximumBytes,
       }),
     });
   }
@@ -1149,7 +1386,8 @@ class WasmProviderExecutionContext implements BackendProviderExecutionContext {
     this.#cache.clear();
     this.#cacheBytes = 0;
     this.#boundMaterializer.clearInvariantStorage();
-    this.#invariantWeights.clear();
+    /* The compiled invariant-resource owner, not a context, owns host weights
+     * and the raw/packed linear prefix borrowed by this engine. */
     this.#preparedSchedule = null;
     engine?.dispose();
   }
@@ -1157,10 +1395,13 @@ class WasmProviderExecutionContext implements BackendProviderExecutionContext {
 
 class WasmProviderCompiledModel implements BackendProviderCompiledModel {
   readonly backendName = 'wasm';
+  readonly batchContract: Readonly<BackendProviderBatchContract>;
   readonly compilationEvidence: Readonly<BackendProviderCompilationEvidence>;
+  readonly invariantResources: InvariantResourceStore<WasmCompiledInvariantResource>;
   readonly #snapshot: Model;
   #source: WasmEngine | null;
   readonly #resources: WasmResourceDomainProof;
+  readonly #resourceDomain: object;
   readonly #invariantSchedule: Readonly<object>;
   #closed = false;
 
@@ -1169,20 +1410,65 @@ class WasmProviderCompiledModel implements BackendProviderCompiledModel {
     source: WasmEngine,
     deviceIdentity: BackendDeviceIdentity | null,
     resources: WasmResourceDomainProof,
+    resourceDomain: object,
   ) {
+    const batchSemantics = input.batchSemantics;
+    this.batchContract = createBackendProviderBatchContract('single-invocation', {
+      independentBatch: batchSemantics.supported
+        ? 'compiler-proved/v1'
+        : 'unsupported',
+    });
     this.#snapshot = input.snapshot;
     this.#source = source;
     this.#resources = resources;
+    this.#resourceDomain = resourceDomain;
     this.#invariantSchedule = source.prepareInvariantSchedule({
       nodes: input.graph.nodes,
       tensorCount: input.tensorCount,
       outputNames: input.outputNames,
     });
+    this.invariantResources = new InvariantResourceStore(
+      (resource) => resource instanceof WasmCompiledInvariantPrefix
+        ? resource.inspect().backingLengthBytes
+        : resource.ownedBytes,
+      (resource) => resource.close(),
+    );
+    const hostWeights = new WasmCompiledHostWeights(this.#snapshot);
+    this.invariantResources.define(WASM_HOST_INVARIANT_WEIGHTS_KEY, hostWeights);
+    try {
+      const prefixMaterializer = createBoundExecutionGraphMaterializer(this.#snapshot, {
+        invariantWeightStorageFactory: ({ name }) => hostWeights.get(name),
+      });
+      try {
+        const prefixPlan = this.#snapshot.staticShapePlan ?? resolveMinimumGraphShapes(
+          this.#snapshot.graph,
+          this.#snapshot.quantizationByTensor,
+        );
+        const bound = prefixMaterializer.materialize(prefixPlan);
+        const prepared = source.prepareGraph(bound.graph, this.#invariantSchedule);
+        const bankedWeightNames = new Set(Object.entries(input.graph.weights)
+          .filter(([, descriptor]) => descriptor.bank !== null)
+          .map(([name]) => name));
+        const prefix = source.prepareCompiledInvariantPrefix(
+          bound.graph,
+          prepared,
+          Math.max(16, resources.maximumInvariantPrefixBytes),
+          bankedWeightNames,
+        );
+        this.invariantResources.define(WASM_LINEAR_INVARIANT_PREFIX_KEY, prefix);
+      } finally {
+        prefixMaterializer.clearInvariantStorage();
+      }
+    } catch (error) {
+      this.invariantResources.close();
+      throw error;
+    }
     this.compilationEvidence = Object.freeze({
       device: deviceIdentity,
-      allocationBytes: 0,
+      allocationBytes: this.invariantResources.ownedBytes,
       operatorFallbackUsed: false,
       offendingNode: null,
+      batchSemantics,
       shapeDomain: Object.freeze({
         proofProtocol: 'canonical-symbolic-domain-proof/v1' as const,
         resourceProtocol: 'bounded-resource-maxima/v1' as const,
@@ -1193,6 +1479,9 @@ class WasmProviderCompiledModel implements BackendProviderCompiledModel {
         staticPrefixBytes: resources.staticPrefixBytes,
         initialMemoryBytes: resources.initialMemoryBytes,
         maximumLinearResidentBytes: resources.maximumLinearResidentBytes,
+        maximumInvariantPrefixBytes: resources.maximumInvariantPrefixBytes,
+        maximumMutableArenaBytes: resources.maximumMutableArenaBytes,
+        maximumBankedMutableArenaBytes: resources.maximumBankedMutableArenaBytes,
         maximumPersistentMetadataBytes: resources.maximumPersistentMetadataBytes,
         maximumSharedScratchBytes: resources.maximumSharedScratchBytes,
         weightBytes: resources.weightBytes,
@@ -1209,7 +1498,26 @@ class WasmProviderCompiledModel implements BackendProviderCompiledModel {
     });
   }
 
-  async createContext(options?: BackendProviderContextOptions): Promise<BackendProviderExecutionContext> {
+  prepareBatchRoute(plan: ResolvedShapePlan) {
+    if (this.#closed) {
+      throw new VolvoxAIError('HANDLE_DISPOSED', 'Compiled WASM model is closed.', {
+        phase: 'lifecycle', backend: this.backendName,
+      });
+    }
+    if (plan.graphFingerprint !== this.#snapshot.definitionFingerprint) {
+      throw new VolvoxAIError('INVALID_ARGUMENT',
+        'WASM batch route requires a plan from its compiled logical model.', {
+          phase: 'execution', backend: this.backendName,
+        });
+    }
+    return createBackendProviderPreparedBatchRoute(
+      this.#resourceDomain, plan.signature, this.invariantResources.deviceEpoch,
+    );
+  }
+
+  async createContext(
+    options: BackendProviderContextOptions,
+  ): Promise<BackendProviderExecutionContext> {
     if (this.#closed) {
       throw new VolvoxAIError('HANDLE_DISPOSED', 'Compiled WASM model is closed.', {
         phase: 'lifecycle', backend: this.backendName,
@@ -1221,7 +1529,7 @@ class WasmProviderCompiledModel implements BackendProviderCompiledModel {
         phase: 'lifecycle', backend: this.backendName,
       });
     }
-    if (options?.decode !== undefined && !this.#resources.decodeContextSupported) {
+    if (options.decode !== undefined && !this.#resources.decodeContextSupported) {
       throw new VolvoxAIError('BACKEND_UNSUPPORTED',
         `WASM retained decode resources require ` +
         `${this.#resources.maximumDecodeResidentBytes} bytes, exceeding the ` +
@@ -1229,7 +1537,34 @@ class WasmProviderCompiledModel implements BackendProviderCompiledModel {
           phase: 'compilation', backend: this.backendName,
         });
     }
-    const engine = await source.fork();
+    const lease = options.invariantResources as InvariantResourceLease<WasmCompiledInvariantResource>;
+    if (typeof lease.borrow !== 'function' ||
+        lease.ownerIdentity !== this.invariantResources.ownerIdentity ||
+        lease.deviceEpoch !== this.invariantResources.deviceEpoch) {
+      throw new VolvoxAIError('ABI_UNSUPPORTED',
+        'WASM context requires the exact compiled invariant-resource lease.', {
+          phase: 'compilation', backend: this.backendName,
+        });
+    }
+    const hostWeights = lease.borrow(WASM_HOST_INVARIANT_WEIGHTS_KEY);
+    const prefix = lease.borrow(WASM_LINEAR_INVARIANT_PREFIX_KEY);
+    if (!(hostWeights instanceof WasmCompiledHostWeights) ||
+        !(prefix instanceof WasmCompiledInvariantPrefix)) {
+      throw new VolvoxAIError('ABI_UNSUPPORTED',
+        'WASM compiled invariant-resource kinds are invalid.', {
+          phase: 'compilation', backend: this.backendName,
+        });
+    }
+    const selectedBanks = options.initialPlan === undefined
+      ? true
+      : Object.keys(options.initialPlan.bankResidency).length !== 0;
+    const maximumMutableBytes = selectedBanks
+      ? this.#resources.maximumBankedMutableArenaBytes
+      : this.#resources.maximumMutableArenaBytes;
+    const engine = source.forkWithCompiledInvariants(
+      prefix,
+      Math.max(16, maximumMutableBytes),
+    );
     let context: WasmProviderExecutionContext | null = null;
     try {
       context = new WasmProviderExecutionContext(
@@ -1237,6 +1572,7 @@ class WasmProviderCompiledModel implements BackendProviderCompiledModel {
         engine,
         this.#resources.tensorCapacityBytes,
         this.#invariantSchedule,
+        hostWeights,
         options,
       );
       if (options?.initialPlan) context.preload(options.initialPlan);
@@ -1249,6 +1585,8 @@ class WasmProviderCompiledModel implements BackendProviderCompiledModel {
   }
 
   close(): void {
+    if (this.#closed) return;
+    this.invariantResources.close();
     this.#closed = true;
     this.#source = null;
   }
@@ -1260,6 +1598,7 @@ export class WasmBackendProvider implements BackendProvider {
   readonly backendName = 'wasm';
   readonly capabilities: Readonly<BackendProviderCapabilities>;
   readonly deviceIdentity: BackendDeviceIdentity | null;
+  readonly #resourceDomain = Object.freeze({});
   #source: WasmEngine | null;
   #closed = false;
 
@@ -1315,11 +1654,25 @@ export class WasmBackendProvider implements BackendProvider {
     const abi = checkedWasmRuntimeAbi(source);
     wasmRegistryPreflight(input);
     const resources = checkedWasmResourceDomain(input, source, abi);
-    return new WasmProviderCompiledModel(input, source, this.deviceIdentity, resources);
+    return new WasmProviderCompiledModel(
+      input,
+      source,
+      this.deviceIdentity,
+      resources,
+      this.#resourceDomain,
+    );
   }
 
   close(): void {
+    if (this.#closed) return;
+    const source = this.#source;
     this.#closed = true;
     this.#source = null;
+    source?.dispose();
+  }
+
+  /** @internal Construction cleanup uses this to preserve one close owner. */
+  _isClosed(): boolean {
+    return this.#closed;
   }
 }

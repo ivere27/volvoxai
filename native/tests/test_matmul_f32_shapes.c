@@ -104,6 +104,11 @@ int main(void) {
     failures += check(101, 333, 257, 1);
     failures += check(1, 512, 129, 1);
     failures += check(7, 1, 33, 0);
+    /* TinyReceipt's attention matrices in both orientations.  M=218 and
+     * N=218 leave ragged AArch64 row and column tiles; the width sweep above
+     * separately crosses combined vector and scalar column tails. */
+    failures += check(218, 40, 218, 0);
+    failures += check(218, 218, 40, 0);
     /* The widths a model with power-of-two features actually uses, which is
      * what used to be the whole of the coverage. */
     failures += check(4, 320, 320, 1);

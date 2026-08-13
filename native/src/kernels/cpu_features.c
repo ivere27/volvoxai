@@ -12,6 +12,7 @@
 
 #if defined(__aarch64__) && (defined(__linux__) || defined(__ANDROID__))
 #include <sys/auxv.h>
+#include <sys/prctl.h>
 #ifndef AT_HWCAP
 #define AT_HWCAP 16
 #endif
@@ -20,6 +21,27 @@
 #endif
 #ifndef HWCAP_ASIMDDP
 #define HWCAP_ASIMDDP (1UL << 20)
+#endif
+#ifndef HWCAP_SVE
+#define HWCAP_SVE (1UL << 22)
+#endif
+#ifndef AT_HWCAP2
+#define AT_HWCAP2 26
+#endif
+#ifndef HWCAP2_SVE2
+#define HWCAP2_SVE2 (1UL << 1)
+#endif
+#ifndef HWCAP2_SVEI8MM
+#define HWCAP2_SVEI8MM (1UL << 9)
+#endif
+#ifndef HWCAP2_I8MM
+#define HWCAP2_I8MM (1UL << 13)
+#endif
+#ifndef PR_SVE_GET_VL
+#define PR_SVE_GET_VL 51
+#endif
+#ifndef PR_SVE_VL_LEN_MASK
+#define PR_SVE_VL_LEN_MASK 0xffff
 #endif
 #define VX_CPU_ARM_RUNTIME_QUERY 1
 #else
@@ -185,4 +207,105 @@ int vx_cpu_has_arm_dotprod(void) {
         cached = value;
     }
     return value;
+}
+
+static int vx_cpu_probe_arm_i8mm(void) {
+#if VX_CPU_ARM_RUNTIME_QUERY
+    return (getauxval(AT_HWCAP2) & HWCAP2_I8MM) != 0;
+#elif defined(__ARM_FEATURE_MATMUL_INT8)
+    return 1;
+#else
+    return 0;
+#endif
+}
+
+int vx_cpu_has_arm_i8mm(void) {
+    static int cached = VX_CPU_FEATURE_UNKNOWN;
+    int value = cached;
+    if (value == VX_CPU_FEATURE_UNKNOWN) {
+        value = vx_cpu_probe_arm_i8mm();
+        cached = value;
+    }
+    return value;
+}
+
+static int vx_cpu_probe_arm_sve(void) {
+#if VX_CPU_ARM_RUNTIME_QUERY
+    return (getauxval(AT_HWCAP) & HWCAP_SVE) != 0;
+#elif defined(__ARM_FEATURE_SVE)
+    return 1;
+#else
+    return 0;
+#endif
+}
+
+int vx_cpu_has_arm_sve(void) {
+    static int cached = VX_CPU_FEATURE_UNKNOWN;
+    int value = cached;
+    if (value == VX_CPU_FEATURE_UNKNOWN) {
+        value = vx_cpu_probe_arm_sve();
+        cached = value;
+    }
+    return value;
+}
+
+static int vx_cpu_probe_arm_sve2(void) {
+#if VX_CPU_ARM_RUNTIME_QUERY
+    return (getauxval(AT_HWCAP2) & HWCAP2_SVE2) != 0;
+#elif defined(__ARM_FEATURE_SVE2)
+    return 1;
+#else
+    return 0;
+#endif
+}
+
+int vx_cpu_has_arm_sve2(void) {
+    static int cached = VX_CPU_FEATURE_UNKNOWN;
+    int value = cached;
+    if (value == VX_CPU_FEATURE_UNKNOWN) {
+        value = vx_cpu_probe_arm_sve2();
+        cached = value;
+    }
+    return value;
+}
+
+static int vx_cpu_probe_arm_sve_i8mm(void) {
+#if VX_CPU_ARM_RUNTIME_QUERY
+    return (getauxval(AT_HWCAP2) & HWCAP2_SVEI8MM) != 0;
+#elif defined(__ARM_FEATURE_SVE_MATMUL_INT8)
+    return 1;
+#else
+    return 0;
+#endif
+}
+
+int vx_cpu_has_arm_sve_i8mm(void) {
+    static int cached = VX_CPU_FEATURE_UNKNOWN;
+    int value = cached;
+    if (value == VX_CPU_FEATURE_UNKNOWN) {
+        value = vx_cpu_probe_arm_sve_i8mm();
+        cached = value;
+    }
+    return value;
+}
+
+uint32_t vx_cpu_arm_sve_vl_bytes(void) {
+#if VX_CPU_ARM_RUNTIME_QUERY
+    long value;
+    uint32_t bytes;
+    if (!vx_cpu_has_arm_sve()) return 0u;
+    value = prctl(PR_SVE_GET_VL);
+    if (value < 0) return 0u;
+    bytes = (uint32_t)value & (uint32_t)PR_SVE_VL_LEN_MASK;
+    /* The Linux arm64 ABI admits 128..2048 bits in 128-bit increments.  Reject
+     * a malformed kernel/libc result rather than passing an unsafe tile size to
+     * a future SVE dispatcher. */
+    if (bytes < 16u || bytes > 256u || bytes % 16u != 0u) return 0u;
+    return bytes;
+#elif defined(__ARM_FEATURE_SVE) && defined(__ARM_FEATURE_SVE_BITS) && \
+      __ARM_FEATURE_SVE_BITS > 0
+    return (uint32_t)__ARM_FEATURE_SVE_BITS / 8u;
+#else
+    return 0u;
+#endif
 }

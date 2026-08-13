@@ -120,6 +120,8 @@ VOLVOXAI_CUDA_FORWARD_FUNCTION(
 VOLVOXAI_CUDA_FORWARD_FUNCTION(
     REQUIRED, k_qsdpa, "vx_cuda_qsdpa_i8u8")
 VOLVOXAI_CUDA_FORWARD_FUNCTION(
+    REQUIRED, k_row_index_transfer, "vx_cuda_row_index_transfer")
+VOLVOXAI_CUDA_FORWARD_FUNCTION(
     REQUIRED, k_qargmax, "vx_cuda_qargmax_i8u8")
 VOLVOXAI_CUDA_FORWARD_FUNCTION(
     REQUIRED, k_qmaskedmean, "vx_cuda_qmaskedmean_i8u8")

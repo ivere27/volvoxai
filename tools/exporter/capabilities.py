@@ -2470,18 +2470,6 @@ def _validate_graph(
                         "VXW8A32_DTYPE", f"{label} W8A32 output must be float32", "capability",
                         source_node=label, source_op=op,
                     ))
-            if "backend:webnn" in atomic_targets and any(
-                name in ports for name in ("scale", "weight_scale", "zero_point", "weight_zero_point")
-            ):
-                diagnostics.append(Diagnostic(
-                    "VXW8A32_TARGET",
-                    f"{label} weight-only quantized linear is not admitted by target backend:webnn",
-                    "capability",
-                    source_node=label,
-                    source_op=op,
-                    target="backend:webnn",
-                    constraint="float WebNN constants only",
-                ))
         if op in {"Softmax", "LogSoftmax", "ReduceSum", "ReduceMean"}:
             input_name = ports.get("input") or ports.get("data")
             input_shape = tensor_shapes.get(str(input_name))
@@ -2538,9 +2526,7 @@ def _validate_graph(
 
     native_targets = tuple(
         target for target in atomic_targets
-        if target == "native-cpu" or (
-            target.startswith("backend:") and target != "backend:webnn"
-        )
+        if target == "native-cpu" or target.startswith("backend:")
     )
     for target in native_targets:
         if len(nodes) > 1024:

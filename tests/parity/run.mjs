@@ -63,7 +63,7 @@ const MANIFESTS = path.join(OUT, 'manifests');
 const POLICY_FILE = path.join(HERE, 'policy.json');
 const policy = JSON.parse(fs.readFileSync(POLICY_FILE, 'utf8'));
 validateGpuCampaignPolicy(policy);
-const MATRIX_TIERS = ['cpu', 'wasm', 'native-cpu', 'webgpu', 'native-vulkan', 'native-opengl', 'torch'];
+const MATRIX_TIERS = ['cpu-js', 'wasm', 'native-cpu', 'webgpu', 'native-vulkan', 'native-opengl', 'torch'];
 const MATRIX_DTYPES = Object.freeze({
   float32: Object.freeze({ ext: 'f32', read: 'f32' }),
   int32: Object.freeze({ ext: 'i32', read: 'i32' }),
@@ -201,20 +201,20 @@ async function cmdGolden(only) {
     removeParityOutputsSync([artifactFile, manifestFile], { outputRoot: GOLD });
     const manifest = createRunManifest({
       command: 'golden',
-      fingerprint: wholeFingerprint('cpu', [name]),
-      jobs: [{ case: name, tier: 'cpu-reference', expectation: 'required' }],
+      fingerprint: wholeFingerprint('cpu-js', [name]),
+      jobs: [{ case: name, tier: 'cpu-js-reference', expectation: 'required' }],
       producer: {
-        kind: 'node', backend: 'cpu', strictBackend: true, runtimeEvidenceRequired: true,
+        kind: 'node', backend: 'cpu-js', strictBackend: true, runtimeEvidenceRequired: true,
       },
     });
-    process.stdout.write(`golden ${name} (strict cpu reference)… `);
+    process.stdout.write(`golden ${name} (strict cpu-js reference)… `);
     try {
-      const result = await runTierJs(name, model, 'cpu');
+      const result = await runTierJs(name, model, 'cpu-js');
       writeRunArtifactSync({
         manifest,
         file: artifactFile,
         case: name,
-        tier: 'cpu-reference',
+        tier: 'cpu-js-reference',
         payload: {
           model: name,
           dtype: model.dtype,
@@ -237,7 +237,7 @@ async function cmdGolden(only) {
 }
 
 async function cmdProduce(tier, only) {
-  if (!['cpu', 'wasm'].includes(tier)) throw new Error('produce handles only cpu|wasm; use native-sig for native tiers');
+  if (!['cpu-js', 'wasm'].includes(tier)) throw new Error('produce handles only cpu-js|wasm; use native-sig for native tiers');
   const entries = selectedPolicyModels(only).filter(([, model]) => model.tiers.includes(tier));
   if (entries.length === 0) throw new Error(`no policy models selected for tier ${tier}`);
   const names = entries.map(([name]) => name);
@@ -452,7 +452,7 @@ function loadGolden(name) {
   if (manifest.outcome !== 'success') throw new Error(`golden manifest failed for ${name}`);
   const payload = readRunArtifactSync(goldenArtifactFile(name), manifest, {
     case: name,
-    tier: 'cpu-reference',
+    tier: 'cpu-js-reference',
     outputRoot: GOLD,
   });
   if (payload.referenceFingerprint?.digest !== referenceFingerprint(name).digest) {
@@ -687,7 +687,7 @@ function cmdCompare() {
   const lines = [
     '# Cross-tier parity report',
     '',
-    `oracle: strict pure-JS CPU golden. compared ${ran} current tier-runs.`,
+    `oracle: strict pure-JS CPU-JS golden. compared ${ran} current tier-runs.`,
     '',
     '| model | tier | status | maxAbs | maxRel | top1 | required |',
     '|---|---|---|---|---|---|---|',
@@ -742,7 +742,7 @@ function walkFiles(dir) {
 }
 
 function matrixBuildFiles(tier) {
-  if (tier === 'cpu') return [distFile('volvoxai.js')];
+  if (tier === 'cpu-js') return [distFile('volvoxai.js')];
   if (tier === 'wasm') return [distFile('volvoxai.js'), distFile('volvoxai.wasm')];
   if (tier === 'webgpu') return [distFile('volvoxai.js')];
   if (tier.startsWith('native-')) {
@@ -801,7 +801,7 @@ async function cmdMatrix(kind) {
   for (const item of config.list) authored.set(item.id, config.author(path.join(config.packages, item.id), item).inputs);
   const nativeBin = path.join(ROOT, 'native', 'volvoxai');
   const haveNative = fs.existsSync(nativeBin);
-  const tiers = ['cpu', 'wasm', 'native-cpu'];
+  const tiers = ['cpu-js', 'wasm', 'native-cpu'];
   const manifests = new Map(tiers.map((tier) => [tier, createRunManifest({
     command: `${kind}-matrix ${tier}`,
     fingerprint: matrixFingerprint(config, tier),
@@ -822,7 +822,7 @@ async function cmdMatrix(kind) {
   for (const item of config.list) {
     const packageDir = path.join(config.packages, item.id);
     const shape = matrixShape(config, item);
-    for (const tier of ['cpu', 'wasm']) {
+    for (const tier of ['cpu-js', 'wasm']) {
       const manifest = manifests.get(tier);
       if (item.skip?.includes(tier)) {
         recordRunResult(manifest, { case: item.id, tier, status: 'expected-skip', reason: 'declared unsupported in case policy' });
@@ -929,7 +929,7 @@ function findMatrixInput(packageDir, name) {
 }
 
 function cmdMatrixBegin(kind, tier) {
-  if (!MATRIX_TIERS.includes(tier) || ['cpu', 'wasm', 'native-cpu'].includes(tier)) {
+  if (!MATRIX_TIERS.includes(tier) || ['cpu-js', 'wasm', 'native-cpu'].includes(tier)) {
     throw new Error('matrix-begin tier must be webgpu|native-vulkan|native-opengl|torch');
   }
   const config = matrixConfig(kind);
@@ -945,7 +945,7 @@ function cmdMatrixBegin(kind, tier) {
 }
 
 function cmdMatrixImport(kind, tier) {
-  if (!MATRIX_TIERS.includes(tier) || ['cpu', 'wasm', 'native-cpu'].includes(tier)) {
+  if (!MATRIX_TIERS.includes(tier) || ['cpu-js', 'wasm', 'native-cpu'].includes(tier)) {
     throw new Error('matrix-import tier must be webgpu|native-vulkan|native-opengl|torch');
   }
   const config = matrixConfig(kind);
@@ -1057,7 +1057,7 @@ function cmdMatrixCompare(kind) {
       failed++;
     }
   }
-  for (const required of ['cpu', 'wasm', 'native-cpu']) {
+  for (const required of ['cpu-js', 'wasm', 'native-cpu']) {
     if (!manifests.get(required)) {
       manifests.set(required, new Error(`missing current ${required} manifest`));
       failed++;
@@ -1070,18 +1070,18 @@ function cmdMatrixCompare(kind) {
   let ran = 0;
   for (const item of config.list) {
     const row = { label: kind === 'ops' ? item.op : item.id, cells: {} };
-    const cpuManifest = manifests.get('cpu');
+    const cpuManifest = manifests.get('cpu-js');
     let reference = null;
     if (!(cpuManifest instanceof Error) && cpuManifest) {
       try {
-        reference = readRunArtifactSync(matrixArtifactFile(config, item.id, 'cpu'), cpuManifest, { case: item.id, tier: 'cpu' }).sig;
-        if (item.portableOperator) portableClosureExecution.get(item.id)?.add('cpu');
+        reference = readRunArtifactSync(matrixArtifactFile(config, item.id, 'cpu-js'), cpuManifest, { case: item.id, tier: 'cpu-js' }).sig;
+        if (item.portableOperator) portableClosureExecution.get(item.id)?.add('cpu-js');
       } catch (error) {
         failed++;
-        row.cells.cpu = `INVALID ${errorText(error)}`;
+        row.cells['cpu-js'] = `INVALID ${errorText(error)}`;
       }
     }
-    for (const tier of MATRIX_TIERS.filter((value) => value !== 'cpu')) {
+    for (const tier of MATRIX_TIERS.filter((value) => value !== 'cpu-js')) {
       const manifest = manifests.get(tier);
       if (manifest instanceof Error) { row.cells[tier] = `INVALID ${errorText(manifest)}`; continue; }
       if (!manifest) { row.cells[tier] = '—'; continue; }
@@ -1091,7 +1091,7 @@ function cmdMatrixCompare(kind) {
         if (result?.status === 'error' || (!result && tier !== 'torch')) failed++;
         continue;
       }
-      if (!reference) { row.cells[tier] = 'no cpu reference'; failed++; continue; }
+      if (!reference) { row.cells[tier] = 'no cpu-js reference'; failed++; continue; }
       try {
         const candidate = readRunArtifactSync(matrixArtifactFile(config, item.id, tier), manifest, { case: item.id, tier }).sig;
         const { approximate, tolerance } = matrixComparisonPolicy(item, tier);
@@ -1115,7 +1115,7 @@ function cmdMatrixCompare(kind) {
       : kind === 'portable' ? '# Portable qualified-operator numerical closure'
         : '# Mixed-graph cross-tier matrix (Level 2)',
     '',
-    'oracle: strict pure-JS CPU. Every requested non-Torch tier is a numeric gate; Torch is optional but gates when present.',
+    'oracle: strict pure-JS CPU-JS. Every requested non-Torch tier is a numeric gate; Torch is optional but gates when present.',
     '',
     `| ${kind === 'ops' ? 'op' : 'graph'} | wasm | native-cpu | webgpu | native-vk | native-gl | torch (ext) |`,
     '|---|---|---|---|---|---|---|',
@@ -1147,7 +1147,7 @@ function generatedPortableOperators() {
   return portable;
 }
 
-const PORTABLE_REQUIRED_TIERS = Object.freeze(['cpu', 'wasm', 'native-cpu', 'webgpu']);
+const PORTABLE_REQUIRED_TIERS = Object.freeze(['cpu-js', 'wasm', 'native-cpu', 'webgpu']);
 
 function portableParityBaseline() {
   const isolated = new Set();
@@ -1259,7 +1259,7 @@ function writePortableClosureReport(execution, manifests) {
     if (!item.nodes.some((node) => node.opType === item.portableOperator)) {
       closureProblems.push(`${item.id} does not execute ${item.portableOperator}`);
     }
-    for (const tier of ['cpu', 'wasm', 'native-cpu']) {
+    for (const tier of ['cpu-js', 'wasm', 'native-cpu']) {
       if (!execution.get(item.id)?.has(tier)) {
         closureProblems.push(`${item.id}/${tier} lacks a current numerically verified artifact`);
       }
@@ -1287,7 +1287,7 @@ function writePortableClosureReport(execution, manifests) {
     .map(([operator, model]) => `${operator} -> ${model}`)
     .join(', ');
   const fullCampaignStatus = !physicalClosureRequested
-    ? 'NOT CERTIFIED by the focused CPU/WASM/native closure; run current whole-model parity, physical whole-model WebGPU parity, and the physical closure campaign together'
+    ? 'NOT CERTIFIED by the focused CPU-JS/WASM/native closure; run current whole-model parity, physical whole-model WebGPU parity, and the physical closure campaign together'
     : problems.length === 0
       ? 'PASS'
       : 'FAIL';
@@ -1300,11 +1300,11 @@ function writePortableClosureReport(execution, manifests) {
     `Audited execution gaps closed here: ${declared.size} operators in ${portableClosureCases.length} cases.`,
     `Total inventory-bound case coverage: ${[...inventory].filter((operator) => totalCoverage.has(operator)).length}/${inventory.size} operators.`,
     '',
-    '- CPU: required current provenance-bound execution artifact',
-    '- WASM: required current provenance-bound execution artifact and numerical comparison to CPU',
-    '- native-cpu: required when the native binary is present, with strict route evidence and numerical comparison to CPU',
+    '- CPU-JS: required current provenance-bound execution artifact',
+    '- WASM: required current provenance-bound execution artifact and numerical comparison to CPU-JS',
+    '- native-cpu: required when the native binary is present, with strict route evidence and numerical comparison to CPU-JS',
     `- WebGPU: ${webgpuStatus}`,
-    `- L3-only evidence: requires current whole-model CPU/WASM/native-cpu manifests and physical WebGPU artifacts in addition to this focused closure`,
+    `- L3-only evidence: requires current whole-model CPU-JS/WASM/native-cpu manifests and physical WebGPU artifacts in addition to this focused closure`,
     '',
     `Closure operators: ${[...declared].sort().join(', ')}`,
     '',
@@ -1416,7 +1416,7 @@ function cmdGpuBegin() {
 
   const kvOut = path.join(HERE, 'kvcache', 'out');
   removeParityOutputsSync([
-    'reference.json', 'cpu.json', 'wasm.json', 'webgpu.json', 'run.json',
+    'reference.json', 'cpu-js.json', 'wasm.json', 'webgpu.json', 'run.json',
     'kvcache_matrix.md', 'kvcache_matrix.json',
   ], { outputRoot: kvOut });
   console.log('required GPU campaign: previous selected evidence invalidated');
@@ -1504,12 +1504,12 @@ function validateKvCacheCampaign() {
     requireFinalized: true,
     expectedFingerprint: kvCacheCampaignFingerprint(),
   });
-  const jobs = ['reference', 'cpu', 'wasm', 'webgpu'].map((tier) => ({
+  const jobs = ['reference', 'cpu-js', 'wasm', 'webgpu'].map((tier) => ({
     case: 'w8a8-kvcache', tier, expectation: 'required',
   }));
   assertExactSuccessfulJobs(manifest, jobs, 'KV-cache GPU campaign');
   const payloads = {};
-  for (const tier of ['reference', 'cpu', 'wasm', 'webgpu']) {
+  for (const tier of ['reference', 'cpu-js', 'wasm', 'webgpu']) {
     const payload = readRunArtifactSync(`${tier}.json`, manifest, {
       case: 'w8a8-kvcache', tier, outputRoot,
     });
@@ -1584,7 +1584,7 @@ function validateKvCacheCampaign() {
     payloads[tier] = payload;
   }
   const reference = ['self.k', 'self.v'].flatMap((name) => payloads.reference.cache[name]);
-  for (const tier of ['cpu', 'wasm', 'webgpu']) {
+  for (const tier of ['cpu-js', 'wasm', 'webgpu']) {
     const actual = ['self.k', 'self.v'].flatMap((name) => payloads[tier].cache[name]);
     if (!actual.every((value, index) => value === reference[index])) {
       throw new Error(`KV-cache ${tier}: cache differs from full recompute`);
@@ -1603,8 +1603,8 @@ function validateKvCacheCampaign() {
   const matrix = JSON.parse(fs.readFileSync(path.join(outputRoot, 'kvcache_matrix.json'), 'utf8'));
   if (matrix?.runId !== manifest.runId || matrix.passed !== true ||
       matrix.fingerprint !== manifest.fingerprint.digest ||
-      JSON.stringify(matrix.requiredBackends) !== JSON.stringify(['cpu', 'wasm', 'webgpu'])) {
-    throw new Error('KV-cache GPU comparison summary is missing or does not require cpu/wasm/webgpu');
+      JSON.stringify(matrix.requiredBackends) !== JSON.stringify(['cpu-js', 'wasm', 'webgpu'])) {
+    throw new Error('KV-cache GPU comparison summary is missing or does not require cpu-js/wasm/webgpu');
   }
   const matrixAdapter = requirePhysicalAdapterIdentity(
     matrix.webgpuAdapterInfo,
@@ -1636,17 +1636,17 @@ function validatePortableGpuCampaign() {
 
   const execution = new Map(config.list.map((item) => [item.id, new Set()]));
   for (const item of config.list) {
-    const cpuManifest = manifests.get('cpu');
+    const cpuManifest = manifests.get('cpu-js');
     const cpuPayload = readRunArtifactSync(
-      matrixArtifactFile(config, item.id, 'cpu'),
+      matrixArtifactFile(config, item.id, 'cpu-js'),
       cpuManifest,
-      { case: item.id, tier: 'cpu' },
+      { case: item.id, tier: 'cpu-js' },
     );
-    if (cpuPayload?.id !== item.id || cpuPayload?.tier !== 'cpu') {
-      throw new Error(`portable closure ${item.id}/cpu has invalid artifact identity`);
+    if (cpuPayload?.id !== item.id || cpuPayload?.tier !== 'cpu-js') {
+      throw new Error(`portable closure ${item.id}/cpu-js has invalid artifact identity`);
     }
-    assertSignatureValid(cpuPayload.sig, `portable/${item.id}/cpu`);
-    execution.get(item.id).add('cpu');
+    assertSignatureValid(cpuPayload.sig, `portable/${item.id}/cpu-js`);
+    execution.get(item.id).add('cpu-js');
     for (const tier of ['wasm', 'native-cpu', 'webgpu']) {
       const manifest = manifests.get(tier);
       const payload = readRunArtifactSync(
@@ -1775,9 +1775,9 @@ function cmdGpuVerify() {
   for (const kind of ['ops', 'graphs']) {
     const config = matrixConfig(kind);
     matrices[kind] = {};
-    const cpuManifest = loadMatrixManifest(config, 'cpu');
-    const cpuJobs = matrixJobs(config, 'cpu');
-    assertExactSuccessfulJobs(cpuManifest, cpuJobs, `${kind} matrix cpu reference`);
+    const cpuManifest = loadMatrixManifest(config, 'cpu-js');
+    const cpuJobs = matrixJobs(config, 'cpu-js');
+    assertExactSuccessfulJobs(cpuManifest, cpuJobs, `${kind} matrix cpu-js reference`);
     for (const tier of REQUIRED_EXECUTION_GPU_TIERS) {
       const manifest = loadMatrixManifest(config, tier);
       const jobs = matrixJobs(config, tier);
@@ -1792,19 +1792,19 @@ function cmdGpuVerify() {
         const item = config.list.find((candidate) => candidate.id === job.case);
         if (!item) throw new Error(`${kind} matrix policy lacks case ${job.case}`);
         const cpuResult = cpuManifest.results.find((candidate) =>
-          candidate.case === job.case && candidate.tier === 'cpu');
+          candidate.case === job.case && candidate.tier === 'cpu-js');
         if (cpuResult?.status !== 'success') {
-          throw new Error(`${kind} matrix ${job.case}: current CPU reference did not succeed`);
+          throw new Error(`${kind} matrix ${job.case}: current CPU-JS reference did not succeed`);
         }
         const cpuPayload = readRunArtifactSync(
-          matrixArtifactFile(config, job.case, 'cpu'),
+          matrixArtifactFile(config, job.case, 'cpu-js'),
           cpuManifest,
-          { case: job.case, tier: 'cpu' },
+          { case: job.case, tier: 'cpu-js' },
         );
-        if (cpuPayload?.id !== job.case || cpuPayload?.tier !== 'cpu') {
-          throw new Error(`${kind} matrix ${job.case}/cpu has invalid artifact identity`);
+        if (cpuPayload?.id !== job.case || cpuPayload?.tier !== 'cpu-js') {
+          throw new Error(`${kind} matrix ${job.case}/cpu-js has invalid artifact identity`);
         }
-        assertSignatureValid(cpuPayload.sig, `${kind}/${job.case}/cpu`);
+        assertSignatureValid(cpuPayload.sig, `${kind}/${job.case}/cpu-js`);
         const payload = readRunArtifactSync(matrixArtifactFile(config, job.case, tier), manifest, {
           case: job.case, tier,
         });
@@ -1838,7 +1838,7 @@ function cmdGpuVerify() {
         runId: manifest.runId,
         fingerprint: manifest.fingerprint.digest,
         runs: {
-          cpu: { runId: cpuManifest.runId, fingerprint: cpuManifest.fingerprint.digest },
+          'cpu-js': { runId: cpuManifest.runId, fingerprint: cpuManifest.fingerprint.digest },
           [tier]: { runId: manifest.runId, fingerprint: manifest.fingerprint.digest },
         },
         requiredJobs,
@@ -1900,7 +1900,7 @@ try {
   else if (command === 'gpu-begin') cmdGpuBegin();
   else if (command === 'gpu-verify') cmdGpuVerify();
   else {
-    console.error('usage: run.mjs golden [model] | produce <cpu|wasm> [model] | fixtures | native-sig [tier ...] | external-begin|external-sig|compare | opmatrix|graphmatrix|portablematrix | matrix-begin <ops|graphs|portable> <tier> | matrix-import <ops|graphs|portable> <tier> | opmatrix-compare|graphmatrix-compare|portablematrix-compare|coverage | gpu-begin|gpu-verify');
+    console.error('usage: run.mjs golden [model] | produce <cpu-js|wasm> [model] | fixtures | native-sig [tier ...] | external-begin|external-sig|compare | opmatrix|graphmatrix|portablematrix | matrix-begin <ops|graphs|portable> <tier> | matrix-import <ops|graphs|portable> <tier> | opmatrix-compare|graphmatrix-compare|portablematrix-compare|coverage | gpu-begin|gpu-verify');
     process.exit(2);
   }
 } catch (error) {

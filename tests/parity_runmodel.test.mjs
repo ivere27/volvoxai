@@ -82,7 +82,7 @@ test('stable parity capture validates symbolic outputs against concrete results'
     },
   };
   const result = {
-    report: { contextId: 'context-1', backend: 'cpu' },
+    report: { contextId: 'context-1', backend: 'cpu-js' },
     output(name) {
       assert.equal(name, 'logits');
       return tensorResult;
@@ -102,7 +102,7 @@ test('stable parity capture validates symbolic outputs against concrete results'
     graph,
     result,
     context,
-    'cpu',
+    'cpu-js',
     ['logits'],
   );
   assert.deepEqual([...captured.outputs.logits], [...values]);

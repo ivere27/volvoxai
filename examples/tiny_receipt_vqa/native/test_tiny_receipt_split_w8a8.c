@@ -874,7 +874,7 @@ static int write_kv_manifest(const SplitFixture* fixture) {
     if (!file) return -1;
     if (fprintf(
             file,
-            "{\"format\":\"volvoxai-tiny-receipt-vqa-split-kv-onnx-package-v1\","
+            "{\"format\":\"volvoxai-tiny-receipt-vqa-split-kv-onnx-package-v2\","
             "\"assets\":{"
             "\"config\":{\"path\":\"config.json\",\"bytes\":%ld,\"sha256\":\"%s\"},"
             "\"vocab\":{\"path\":\"vocab.json\",\"bytes\":%ld,\"sha256\":\"%s\"}},"
@@ -898,7 +898,7 @@ static int write_kv_manifest(const SplitFixture* fixture) {
             "\"bos_token_id\":1,\"eos_token_id\":2,\"pad_token_id\":0,"
             "\"logits_row\":\"current_token\",\"tie_policy\":\"first-index\"},"
             "\"shape_contract\":{"
-            "\"graph_shape_mode\":\"bounded-explicit-kv-v1\","
+            "\"graph_shape_mode\":\"bounded-explicit-kv-v2\","
             "\"dimensions\":{\"B\":{\"min\":1,\"max\":1},"
             "\"Q\":{\"min\":1,\"max\":192},"
             "\"M\":{\"min\":211,\"max\":402},"
@@ -1446,7 +1446,7 @@ static int test_wrong_package_format_rejected(void) {
     argv[6] = NULL;
     if (replace_once_in_file(
             fixture.manifest,
-            "volvoxai-tiny-receipt-vqa-split-kv-onnx-package-v1",
+            "volvoxai-tiny-receipt-vqa-split-kv-onnx-package-v2",
             "unsupported-package-format") != 0 ||
         run_and_capture(6, argv, 1, NULL) != 0)
         goto done;

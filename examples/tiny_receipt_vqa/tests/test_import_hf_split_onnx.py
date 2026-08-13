@@ -188,6 +188,7 @@ def _write_source(root: Path) -> Path:
             "pad_token_id": 0,
             "max_length": 192,
         },
+        "exporter": {"max_batch_size": 8},
         "variants": {
             "fp32": {
                 "activation_dtype": "float32",
@@ -325,7 +326,7 @@ def _upgrade_source_to_kv(source: Path) -> Path:
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     manifest["format"] = importer.SOURCE_FORMAT
     manifest["kv_cache"] = {
-        "format": "tiny_receipt_vqa_default_kv_cache_v1",
+        "format": "tiny_receipt_vqa_default_kv_cache_v2",
         "default_for": ["fp32", "int8_w8a8"],
     }
     manifest["generation"]["strategy"] = (
@@ -840,6 +841,11 @@ class FakeKVExporter(FakeExporter):
             },
             "source": {"path": self._option(command, "--model"), "format": "onnx"},
         }), encoding="utf-8")
+        batch_bound = next(
+            value for value in self._options(command, "--dimension-bound")
+            if value.startswith("B=")
+        )
+        batch_maximum = int(batch_bound.split("=", 1)[1].split(":")[1])
 
         nodes = []
         if output_path.parent.name == "encoder":
@@ -850,7 +856,7 @@ class FakeKVExporter(FakeExporter):
                 "input3": {"shape": ["B", "Q"], "dtype": "int32"},
             }
             dimensions = {
-                "B": {"min": 1, "max": 1},
+                "B": {"min": 1, "max": batch_maximum},
                 "Q": {"min": 1, "max": 192},
                 "M": {"min": 211, "max": 402},
             }
@@ -910,7 +916,7 @@ class FakeKVExporter(FakeExporter):
                     "shape": ["B", 8, "P", 40], "dtype": "float32",
                 }
             dimensions = {
-                "B": {"min": 1, "max": 1},
+                "B": {"min": 1, "max": batch_maximum},
                 "M": {"min": 211, "max": 402},
                 "P": {"min": 1, "max": 191},
                 "R": {"min": 2, "max": 192},
@@ -1112,7 +1118,7 @@ class TinyReceiptSplitImporterTests(unittest.TestCase):
             with self.assertRaisesRegex(importer.ImportFailure, "invalid logits"):
                 importer.verify_explicit_kv_sentinel(validated)
 
-    def test_explicit_kv_source_proves_sentinel_and_publishes_typed_v1_package(self):
+    def test_explicit_kv_source_proves_sentinel_and_publishes_typed_v2_package(self):
         with tempfile.TemporaryDirectory(prefix="volvoxai-split-kv-import-") as temporary:
             root = Path(temporary)
             source = _upgrade_source_to_kv(_write_source(root / "source"))
@@ -1396,6 +1402,74 @@ class TinyReceiptSplitImporterTests(unittest.TestCase):
                 "--out-dir", "package",
             ]).targets
         )
+        self.assertEqual(
+            importer.parse_args([
+                "--source", "source",
+                "--out-dir", "package",
+            ]).max_batch_size,
+            1,
+        )
+        self.assertEqual(
+            importer.parse_args([
+                "--source", "source",
+                "--out-dir", "package",
+                "--max-batch-size", "2",
+            ]).max_batch_size,
+            2,
+        )
+
+    def test_opt_in_batch_bound_is_one_package_transaction(self):
+        with tempfile.TemporaryDirectory(
+            prefix="volvoxai-split-kv-batch-two-"
+        ) as temporary:
+            root = Path(temporary)
+            source = _upgrade_source_to_kv(_write_source(root / "source"))
+            fake = FakeKVExporter()
+            parity = {
+                "status": "passed",
+                "provider": "fixture",
+                "cases": [{"case": "batch_max_distinct_lanes", "B": 2}],
+                "maximum_absolute_difference": 0.0,
+                "greedy_argmax": "not_applicable",
+            }
+            output = root / "package"
+            with patch.object(
+                importer,
+                "_verify_dynamic_authoring_parity",
+                return_value=parity,
+            ):
+                importer.import_package(
+                    source,
+                    output,
+                    max_batch_size=2,
+                    exporter=fake,
+                    parity_verifier=lambda _source: {},
+                )
+
+            manifest = json.loads(
+                (output / "package_manifest.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(
+                manifest["shape_contract"]["dimensions"]["B"],
+                {"min": 1, "max": 2},
+            )
+            self.assertEqual(
+                manifest["validation"]["kv_authoring_parity"]["encoder"],
+                parity,
+            )
+            for command in fake.commands:
+                self.assertIn("B=1:2", [
+                    command[index + 1]
+                    for index, value in enumerate(command)
+                    if value == "--dimension-bound"
+                ])
+            for role in ("encoder", "decoder"):
+                graph = json.loads(
+                    (output / role / "graph.json").read_text(encoding="utf-8")
+                )
+                self.assertEqual(
+                    graph["dimensions"]["B"], {"min": 1, "max": 2}
+                )
 
     def test_explicit_kv_int8_enables_narrow_quantized_migrations_for_both_graphs(self):
         with tempfile.TemporaryDirectory(prefix="volvoxai-split-kv-int8-") as temporary:

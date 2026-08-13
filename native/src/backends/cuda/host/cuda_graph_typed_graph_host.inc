@@ -219,16 +219,48 @@ int cuda_graph_qbatch_matmul_i8u8(
     return 1;
 }
 
+int cuda_graph_execution_evidence(char* output,
+                                  size_t output_capacity) {
+    CudaContextState* state = cuda_context_state_get();
+    int written;
+    if (!output || !output_capacity || !state) return -1;
+    written = snprintf(output, output_capacity, ";cuda_graph_replay=%d",
+                       state->replay_last_forward_hit ? 1 : 0);
+    return written >= 0 && (size_t)written < output_capacity ? 0 : -1;
+}
+
 int cuda_graph_append_dynamic_telemetry(char* output,
                                         size_t output_capacity) {
     CudaContextState* state = cuda_context_state_get();
+    size_t plans = 0u;
+    size_t ready = 0u;
+    size_t pending = 0u;
     if (!output || !output_capacity || !state) return -1;
+    for (size_t index = 0; index < state->replay_plan_count; index++) {
+        CudaReplayState* replay = state->replay_plans[index];
+        if (replay && replay->destroy_pending) {
+            pending++;
+            continue;
+        }
+        if (!replay || replay->plan == CUDA_REPLAY_PLAN_EMPTY) continue;
+        plans++;
+        if (replay->plan == CUDA_REPLAY_PLAN_READY && replay->executable)
+            ready++;
+    }
     (void)snprintf(
         output, output_capacity,
+        ";cuda_graph_ready=%zu;cuda_graph_plans=%zu"
+        ";cuda_graph_destroy_pending=%zu"
         ";cuda_qbatch_dp4a=%" PRIu64 ";cuda_qbatch_tail=%" PRIu64,
+        ready, plans, pending,
         state->qbatch_matmul_dp4a_group_count,
         state->qbatch_matmul_scalar_tail_count);
     return 0;
+}
+
+int cuda_graph_last_forward_replayed(void) {
+    CudaContextState* state = cuda_context_state_get();
+    return state && state->ready && state->replay_last_forward_hit;
 }
 
 int cuda_graph_argmax_f32(const float* input, int32_t* output,

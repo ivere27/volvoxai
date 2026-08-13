@@ -81,7 +81,7 @@ For exported models, load `volvox-graph/v1` and safetensors bytes with
 ## Create and use a Trainer
 
 ~~~javascript
-const trainer = await Trainer.create(source, { backend: 'cpu' });
+const trainer = await Trainer.create(source, { backend: 'cpu-js' });
 
 const first = await trainer.trainStep({
   inputs: {
@@ -168,7 +168,7 @@ before changing the concrete shape.
 
 ## Backend selection
 
-The full profile supports explicit `cpu`, `webgpu`, and `wasm` training:
+The full profile supports explicit `cpu-js`, `webgpu`, and `wasm` training:
 
 ~~~javascript
 const gpuTrainer = await Trainer.create(source, {
@@ -183,7 +183,7 @@ const wasmTrainer = await Trainer.create(source, {
 ~~~
 
 Strict WASM training is also available from the WASM-only JavaScript profile.
-It contains no CPU, WebGPU, or training fallback implementation. WASM and
+It contains no CPU JS, WebGPU, or training fallback implementation. WASM and
 WebGPU preflight their supported graph/layout subset before optimizer mutation.
 A step never switches backend after execution starts.
 
@@ -195,11 +195,11 @@ mutable Model object.
 
 ~~~javascript
 const successor = await trainer.commit();
-const runtime = await VolvoxAI.createRuntime({ backends: ['cpu'] });
+const runtime = await VolvoxAI.createRuntime({ backends: ['cpu-js'] });
 const compiled = await runtime.compile(successor, {
   backend: {
     mode: 'require',
-    backend: 'cpu',
+    backend: 'cpu-js',
     operatorFallback: 'forbid',
   },
 });
@@ -286,7 +286,7 @@ const checkpoint = await trainer.exportCheckpoint({
 
 const restored = importModelCheckpoint(checkpoint);
 const resumed = await Trainer.create(restored.snapshot, {
-  backend: 'cpu',
+  backend: 'cpu-js',
   checkpoint,
 });
 ~~~

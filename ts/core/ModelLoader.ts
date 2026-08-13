@@ -43,11 +43,38 @@ export interface SafetensorsCache {
   ): Promise<SafetensorsFile>;
 }
 
+/** One symbol's replacement bounds. Omitted fields keep the authored value. */
+export interface DimensionBoundOverride {
+  readonly min?: number;
+  readonly max?: number;
+  readonly multiple_of?: number;
+}
+
 export interface ModelLoadOptions {
   readonly graphUrl?: string;
   readonly fetch?: GraphFetch;
   readonly safetensors?: SafetensorsOpenOptions;
   readonly safetensorsCache?: SafetensorsCache;
+  /**
+   * Replace declared shape-domain bounds at load time.
+   *
+   * `B.max` is a deployment property, not a model property: a phone wants one
+   * row and a server wants thirty-two, from the same package. Baking it into
+   * the artifact means shipping one package per deployment, and widening it
+   * costs arena bytes whether or not the rows are used — so the bound belongs
+   * to whoever knows the memory budget, which is the caller, not the exporter.
+   *
+   * The override is applied to the document *before* it is parsed, so the
+   * graph fingerprint, the shape domain proof and every backend attestation
+   * derive from the bounds actually in force. A widened domain therefore
+   * produces a different compiled artifact, which is correct — it is one.
+   *
+   * Nothing here can make an unsound domain pass: a graph whose operators only
+   * hold at the authored bound is refused by the proof rather than silently
+   * executed. Widening a package that folded a bound into an operator's
+   * constants fails at load with the offending node named.
+   */
+  readonly dimensionBounds?: Readonly<Record<string, DimensionBoundOverride>>;
 }
 
 export type WeightRole = 'model_weight' | 'quantization_parameter';
@@ -307,6 +334,52 @@ const GRAPH_ROOT_FIELDS = new Set([
   'format', 'dimensions', 'inputs', 'nodes', 'outputs', 'banks', 'quantization',
 ]);
 
+/**
+ * Apply caller-supplied bounds to a graph document's declared dimensions.
+ *
+ * Returns a copy; the fetched document is left alone. Only the bounds move —
+ * a symbol that is not declared is a caller error rather than a new symbol,
+ * because a symbol nothing references cannot constrain anything and silently
+ * accepting it would hide a typo in the one place it matters.
+ */
+function applyDimensionBounds(
+  document: unknown,
+  bounds: Readonly<Record<string, DimensionBoundOverride>> | undefined,
+): unknown {
+  const names = bounds === undefined ? [] : Object.keys(bounds);
+  if (names.length === 0) return document;
+  if (!isRecord(document) || !isRecord(document.dimensions)) {
+    // Let the authoritative parser produce the diagnostic for a malformed
+    // document rather than inventing a second one here.
+    return document;
+  }
+  const declared = document.dimensions;
+  const dimensions: Record<string, unknown> = { ...declared };
+  for (const name of names) {
+    if (!hasOwn(declared, name)) {
+      throw new Error(
+        `[ModelLoader] dimensionBounds names '${name}', which the graph does not declare. ` +
+        `Declared symbols: ${Object.keys(declared).sort().join(', ') || '(none)'}.`,
+      );
+    }
+    const authored = declared[name];
+    if (!isRecord(authored)) {
+      throw new Error(`[ModelLoader] graph dimension '${name}' is not an object.`);
+    }
+    const override = bounds![name];
+    if (!isRecord(override)) {
+      throw new Error(`[ModelLoader] dimensionBounds.${name} must be an object.`);
+    }
+    dimensions[name] = {
+      ...authored,
+      ...(override.min === undefined ? {} : { min: override.min }),
+      ...(override.max === undefined ? {} : { max: override.max }),
+      ...(override.multiple_of === undefined ? {} : { multiple_of: override.multiple_of }),
+    };
+  }
+  return { ...document, dimensions };
+}
+
 function assertGraphDocumentContract(document: unknown): void {
   const required = ['format', 'dimensions', 'inputs', 'nodes', 'outputs'];
   if (!isRecord(document) || document.format !== VOLVOX_LOGICAL_GRAPH_FORMAT ||
@@ -388,7 +461,8 @@ export class ModelLoader {
         `${graphResponse.statusText ?? 'unknown error'}`,
       );
     }
-    const graphDocument = await decodeGraphDocument(graphResponse, graphUrl);
+    const fetchedDocument = await decodeGraphDocument(graphResponse, graphUrl);
+    const graphDocument = applyDimensionBounds(fetchedDocument, options.dimensionBounds);
     assertGraphDocumentContract(graphDocument);
 
     const safetensorsOptions: SafetensorsOpenOptions = Object.freeze({

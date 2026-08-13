@@ -1,6 +1,5 @@
 #include "volvoxai.h"
 #include "host_backend.h"
-#include "android_nnapi_backend.h"
 #include "safetensors.h"
 
 #include <math.h>
@@ -157,6 +156,10 @@ static void failed_runtime_destroy(void* runtime) {
 typedef VxStatus (*RuntimeCreateCallback)(void*, const VxRuntimeOptions*,
                                           void**, VxReport*);
 
+extern const void* vx_stale_backend_provider_fixture(void);
+extern size_t vx_stale_backend_provider_fixture_size(void);
+extern int vx_stale_backend_provider_runtime_create_calls(void);
+
 static VxStatus register_runtime_create_fixture(
     VxRuntime* runtime,
     const char* name,
@@ -179,6 +182,8 @@ static VxStatus register_runtime_create_fixture(
         .context_create = bad_context_create,
         .context_execute = bad_context_execute,
         .context_destroy = bad_context_destroy,
+        .exact_contract_marker = VX_BACKEND_PROVIDER_EXACT_CONTRACT_MARKER,
+        .exact_contract_extent = sizeof(VxBackendProvider),
     };
     return vx_runtime_register_provider(runtime, &provider, report);
 }
@@ -268,6 +273,8 @@ static VxStatus register_bad_output(VxRuntime* runtime, VxReport* report) {
         .context_create = bad_output_context_create,
         .context_execute = bad_output_execute,
         .context_destroy = bad_runtime_destroy,
+        .exact_contract_marker = VX_BACKEND_PROVIDER_EXACT_CONTRACT_MARKER,
+        .exact_contract_extent = sizeof(VxBackendProvider),
     };
     return vx_runtime_register_provider(runtime, &provider, report);
 }
@@ -291,6 +298,8 @@ static VxStatus register_bad_attestation(VxRuntime* runtime,
         .context_create = bad_context_create,
         .context_execute = bad_context_execute,
         .context_destroy = bad_context_destroy,
+        .exact_contract_marker = VX_BACKEND_PROVIDER_EXACT_CONTRACT_MARKER,
+        .exact_contract_extent = sizeof(VxBackendProvider),
     };
     return vx_runtime_register_provider(runtime, &provider, report);
 }
@@ -804,8 +813,19 @@ int main(void) {
 
     CHECK(write_graph(graph_path) == 0);
     CHECK(volvoxai_example_host_backend_test_oversized_descriptors() == 0);
-    CHECK(volvoxai_example_nnapi_backend_test_oversized_descriptors() == 0);
     CHECK(vx_runtime_create(&runtime_options, &runtime, &report) == VX_STATUS_OK);
+    report = (VxReport)VX_REPORT_INIT;
+    CHECK(vx_stale_backend_provider_fixture_size() ==
+          offsetof(VxBackendProvider, exact_contract_marker));
+    CHECK(vx_runtime_register_provider(
+              runtime,
+              (const VxBackendProvider*)vx_stale_backend_provider_fixture(),
+              &report) ==
+          VX_STATUS_INVALID_ARGUMENT);
+    CHECK(report.status == VX_STATUS_INVALID_ARGUMENT &&
+          !strcmp(report.reason, "INVALID_PROVIDER") &&
+          strstr(report.message, "current exact contract") != NULL);
+    CHECK(vx_stale_backend_provider_runtime_create_calls() == 0);
     {
         VxReport oversized_report = VX_REPORT_INIT;
         oversized_report.struct_size++;
@@ -851,10 +871,6 @@ int main(void) {
     CHECK(volvoxai_example_host_backend_register(runtime, &report) == VX_STATUS_OK);
     CHECK(register_bad_attestation(runtime, &report) == VX_STATUS_OK);
     CHECK(register_bad_output(runtime, &report) == VX_STATUS_OK);
-#ifndef __ANDROID__
-    CHECK(volvoxai_example_nnapi_backend_register(runtime, &report) ==
-          VX_STATUS_BACKEND_UNAVAILABLE);
-#endif
     source.graph_path = graph_path;
     CHECK(vx_runtime_load_model(runtime, &source, &model, &report) == VX_STATUS_OK);
     policy.mode = VX_BACKEND_REQUIRE;

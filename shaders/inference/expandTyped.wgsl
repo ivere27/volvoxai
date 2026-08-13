@@ -6,7 +6,7 @@
 @group(0) @binding(1) var<storage, read_write> output_words : array<u32>;
 
 struct Params {
-  dimensions : vec4<u32>, // input_rank, output_rank, unused, output_elements
+  dimensions : vec4<u32>, // input_rank, output_rank, dispatch_stride, output_elements
   input_shape0 : vec4<u32>,
   input_shape1 : vec4<u32>,
   output_shape0 : vec4<u32>,
@@ -64,7 +64,7 @@ fn expanded_byte(output_index : u32) -> u32 {
 
 @compute @workgroup_size(64)
 fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
-  let output_word = gid.x;
+  let output_word = gid.x + gid.y * params.dimensions.z;
   let first_element = output_word * 4u;
   if (first_element >= params.dimensions.w) { return; }
   var packed = expanded_byte(first_element);

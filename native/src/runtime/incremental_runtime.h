@@ -24,6 +24,19 @@ static inline int vx_incremental_row_extent(const T* tensor, long* width) {
     int axis;
     if (!tensor || tensor->ndim <= 0) return 0;
     for (axis = 0; axis < tensor->ndim && tensor->shape[axis] == 1; axis++) {}
+    /*
+     * A declared batch's leading axis is lanes, not tokens.
+     *
+     * The loop above skips leading *unit* axes, which is exactly right until a
+     * step declares more than one lane: the leading extent of `[B,S,D]` is then
+     * B, and every caller would read B tokens of width S*D. Nothing in the
+     * shape distinguishes that from a genuine `[S,1,D]` whose token axis really
+     * is leading -- which is why the lane count is a declaration and is
+     * consulted here rather than inferred. Answering in one place keeps the
+     * dispatcher, the row planner and the operators from disagreeing.
+     */
+    if (g_decode_lanes > 1 && axis + 1 < tensor->ndim &&
+        tensor->shape[axis] == g_decode_lanes) axis++;
     if (axis >= tensor->ndim) return 0;
     for (int rest = axis + 1; rest < tensor->ndim; rest++)
         trailing *= tensor->shape[rest];

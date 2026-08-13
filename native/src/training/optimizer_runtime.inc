@@ -10,7 +10,7 @@
 static void volvoxai_engine_free_optimizer_states(void) {
     for (int i = 0; i < MAXT; i++) {
 #if VOLVOXAI_ENABLE_CUDA
-        if (g_use_cuda && g_opt_states[i].m && g_opt_states[i].v)
+        if (g_opt_states[i].m && g_opt_states[i].v)
             cuda_training_optimizer_forget(g_opt_states[i].m,
                                            g_opt_states[i].v);
 #endif
@@ -27,7 +27,7 @@ static EngineOptimizerState* optimizer_state_for(const char* name, long numel) {
             EngineOptimizerState* state = &g_opt_states[i];
             if (state->numel != numel) {
 #if VOLVOXAI_ENABLE_CUDA
-                if (g_use_cuda && state->m && state->v)
+                if (state->m && state->v)
                     cuda_training_optimizer_forget(state->m, state->v);
 #endif
                 free(state->m);
@@ -63,7 +63,7 @@ static void optimizer_state_remove(const char* name) {
     for (int i = 0; i < MAXT; i++) {
         if (g_opt_states[i].name[0] && !strcmp(g_opt_states[i].name, name)) {
 #if VOLVOXAI_ENABLE_CUDA
-            if (g_use_cuda && g_opt_states[i].m && g_opt_states[i].v)
+            if (g_opt_states[i].m && g_opt_states[i].v)
                 cuda_training_optimizer_forget(g_opt_states[i].m,
                                                g_opt_states[i].v);
 #endif
@@ -117,7 +117,7 @@ static int optimizer_publish_updated_weight(const char* name, T* tensor,
 int volvoxai_engine_finalize_device_tensor_update_f32(const char* name,
                                                        long numel) {
     T* tensor;
-    if (!name || !name[0] || numel <= 0 ||
+    if (g_weight_files_borrowed || !name || !name[0] || numel <= 0 ||
         !volvoxai_engine_tensor_is_model_weight_locked(name)) return -1;
     tensor = t_find(name);
     return optimizer_publish_updated_weight(name, tensor, numel, 0);
@@ -127,7 +127,7 @@ static int volvoxai_engine_apply_tensor_update_f32_impl(
         const char* name, const float* update, long numel, int mode,
         float learning_rate, float beta1, float beta2, float epsilon,
         float weight_decay, float max_grad_norm, long step) {
-    if (!name || !update || numel < 0) return -1;
+    if (g_weight_files_borrowed || !name || !update || numel < 0) return -1;
     if (volvoxai_engine_tensor_is_removed_output(name)) return -1;
     if (volvoxai_engine_tensor_is_quantization_parameter_locked(name)) return -1;
     if (volvoxai_engine_merged_contains_tensor(name)) return -1;
@@ -173,17 +173,17 @@ static int volvoxai_engine_apply_tensor_update_f32_impl(
         EngineOptimizerState* state = optimizer_state_for(name, numel);
         if (!state) return -1;
 #if VOLVOXAI_ENABLE_CUDA
-        /* A compiled CUDA backend does not give a CPU-owned engine a CUDA
-           context capsule. Only a CUDA-routed engine can own optimizer
-           mirrors that need to be materialized or forgotten here. */
-        if (g_use_cuda && cuda_training_optimizer_materialize(
+        /* Route selection may have changed since CUDA made these moments
+           device-authoritative. The mirror lookup is a safe no-op for a
+           CPU-only engine, and a CPU update must materialize and retire any
+           mirror before modifying its host storage. */
+        if (cuda_training_optimizer_materialize(
                 state->m, state->v, (size_t)numel * sizeof(float)) != 0)
             return -1;
         /* The CPU update below makes the host moments authoritative again.
            Drop the old device mirror so a later CUDA step seeds from these
            newly updated values instead of reusing stale device state. */
-        if (g_use_cuda)
-            cuda_training_optimizer_forget(state->m, state->v);
+        cuda_training_optimizer_forget(state->m, state->v);
 #endif
         float bias_correction1 = 1.0f - powf(beta1, (float)step);
         float bias_correction2 = 1.0f - powf(beta2, (float)step);
@@ -218,7 +218,8 @@ int volvoxai_engine_apply_tensor_update_f32_locked(
 }
 
 int volvoxai_engine_prepare_tensor_update_f32(const char* name, long numel, int mode) {
-    if (!name || !name[0] || numel <= 0 || (mode != 2 && mode != 3)) return -1;
+    if (g_weight_files_borrowed || !name || !name[0] || numel <= 0 ||
+        (mode != 2 && mode != 3)) return -1;
     if (volvoxai_engine_tensor_is_removed_output(name)) return -1;
     if (volvoxai_engine_tensor_is_quantization_parameter_locked(name)) return -1;
     if (volvoxai_engine_merged_contains_tensor(name)) return -1;
@@ -283,8 +284,9 @@ int volvoxai_engine_save_optimizer_state(const char* path, long training_step) {
         if (!state->name[0] || state->numel <= 0 || !state->m || !state->v ||
             state->numel > INT_MAX) continue;
 #if VOLVOXAI_ENABLE_CUDA
-        /* CPU-owned optimizer states have no CUDA capsule or mirror. */
-        if (g_use_cuda && cuda_training_optimizer_materialize(
+        /* A route switch does not make a dirty CUDA mirror host-authoritative.
+           No-mirror CPU states take the side-effect-free fast path. */
+        if (cuda_training_optimizer_materialize(
                 state->m, state->v,
                 (size_t)state->numel * sizeof(float)) != 0) goto done;
 #endif

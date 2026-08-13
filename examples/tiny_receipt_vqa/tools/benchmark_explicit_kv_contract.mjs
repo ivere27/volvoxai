@@ -68,7 +68,7 @@ export function validateDynamicRebindAnswer(answer, maximumNewTokens, expectedSh
     fail("expected shape mode must be 'active' or 'maximum-padded'.");
   }
   if (answer?.execution !== 'explicit-kv-cache' || answer.decodeMode !== 'explicit-kv-cache') {
-    fail('session did not use the explicit KV-cache v1 execution path.');
+    fail('session did not use the explicit KV-cache v2 execution path.');
   }
   const tokens = answer.tokenIds;
   if (!Array.isArray(tokens) || tokens.length < 2 || tokens.length > maximumNewTokens ||

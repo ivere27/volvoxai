@@ -51,13 +51,13 @@ import {
 } from 'volvoxai/full';
 
 const runtime = await VolvoxAI.createRuntime({
-  backends: ['webgpu', 'wasm', 'cpu'],
+  backends: ['webgpu', 'wasm', 'cpu-js'],
 });
 const snapshot = Model.capture(calibrationPackage);
 const compiled = await runtime.compile(snapshot, {
   backend: {
     mode: 'require',
-    backend: 'cpu',
+    backend: 'cpu-js',
     operatorFallback: 'forbid',
   },
 });

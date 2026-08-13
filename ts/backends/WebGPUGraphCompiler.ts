@@ -2,7 +2,7 @@ import { Tensor } from '../core/Tensor.js';
 import { DataType } from '../generated/volvoxaiEnums.js';
 import type { RuntimeGraph } from '../core/RuntimeGraph.js';
 import type { ShaderLibrary as ShaderLibraryClass } from './ShaderLibrary.js';
-import { geluApproximation } from '../ops/gELU.js';
+import { geluApproximation } from '../ops/gelu.js';
 import { normalizeSpatialPair } from '../ops/spatialParameters.js';
 import { fullSpatialPads, spatialPair } from '../ops/spatialKernelValidation.js';
 import { batchMatMulDescriptor } from '../ops/batchMatMul.js';
@@ -91,6 +91,36 @@ function nodeOutput(node: RuntimeGraph['nodes'][number]) {
 
 function dropoutInput(node: RuntimeGraph['nodes'][number]) {
   return node.inputs?.input || node.inputs?.x || node.inputs?.data;
+}
+
+function linearDispatch2D(
+  elements: number,
+  workgroupSize: number,
+  device: GPUDevice,
+): { readonly workgroupCount: [number, number, number]; readonly invocationStride: number } {
+  const advertisedLimit = device?.limits?.maxComputeWorkgroupsPerDimension;
+  const limit = Number.isInteger(advertisedLimit) && advertisedLimit > 0
+    ? advertisedLimit
+    : 65535;
+  const groups = Math.ceil(elements / workgroupSize);
+  // The shader reconstructs its linear index with a u32 invocation stride.
+  // A future adapter may expose a dimension limit above today's 65,535
+  // minimum, so cap X independently of the device limit rather than allowing
+  // `x * workgroupSize` to wrap at the shader ABI boundary.
+  const maximumStrideGroups = Math.floor(0xffffffff / workgroupSize);
+  const x = Math.min(groups, limit, maximumStrideGroups);
+  const y = Math.ceil(groups / x);
+  if (!Number.isSafeInteger(elements) || elements <= 0 ||
+      !Number.isSafeInteger(workgroupSize) || workgroupSize <= 0 ||
+      !Number.isSafeInteger(groups) || groups <= 0 || y > limit) {
+    throw new Error(
+      `WebGPU linear dispatch for ${elements} elements exceeds the device's ${limit}x${limit} workgroup domain.`,
+    );
+  }
+  return {
+    workgroupCount: [x, y, 1],
+    invocationStride: x * workgroupSize,
+  };
 }
 
 /** Pure, immutable planning performed before context resources are allocated. */
@@ -945,22 +975,30 @@ export class WebGPUGraphCompiler {
               if (!byteCopyPipeline || !full || !scratch) {
                 throw new Error(`WebGPU incremental row byte-copy resources for '${name}' are incomplete.`);
               }
-              const paramsBuffer = this.host._createSpecializationBuffer({
-                label: `IncrementalRow_${nodeIndex}_${name}_${input ? 'input' : 'output'}_copy_params`,
-                size: 16,
-                usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
-              });
-              copies.set(name, {
-                paramsBuffer,
-                bindGroup: this.host._createSpecializationBindGroup(byteCopyPipeline, {
+              const paramsBuffers: GPUBuffer[] = [];
+              const bindGroups: GPUBindGroup[] = [];
+              /* One set per staged row. A batched step issues one unaligned
+               * copy per lane, and `queue.writeBuffer` is ordered against the
+               * submit rather than against the passes already encoded -- so a
+               * shared params buffer would give every lane the last lane's
+               * range. At one lane this is the single set it always was. */
+              for (let lane = 0; lane < candidate.lanes; lane++) {
+                const paramsBuffer = this.host._createSpecializationBuffer({
+                  label: `IncrementalRow_${nodeIndex}_${name}_${input ? 'input' : 'output'}_copy_params_${lane}`,
+                  size: 16,
+                  usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+                });
+                paramsBuffers.push(paramsBuffer);
+                bindGroups.push(this.host._createSpecializationBindGroup(byteCopyPipeline, {
                   layout: byteCopyPipeline.getBindGroupLayout(0),
                   entries: [
                     { binding: 0, resource: { buffer: input ? full : scratch } },
                     { binding: 1, resource: { buffer: input ? scratch : full } },
                     { binding: 2, resource: { buffer: paramsBuffer } },
                   ],
-                }),
-              });
+                }));
+              }
+              copies.set(name, { paramsBuffers, bindGroups });
             }
             return copies;
           };
@@ -977,6 +1015,9 @@ export class WebGPUGraphCompiler {
             byteCopyPipeline,
             inputByteCopies,
             outputByteCopies,
+            pagedStaging: null,
+            pagedPipelines: null,
+            pagedQsdpaParamsBuffer: null,
           };
           stagedPlans.push([nodeIndex, plan]);
         }
@@ -996,6 +1037,76 @@ export class WebGPUGraphCompiler {
         this.host._activeSpecializationResources = previousResources;
       }
     }
+    /**
+     * Compile the paged binding of every attention row plan that needs one.
+     *
+     * Separate from `_compileIncrementalRowPipelines` because it is demand
+     * driven: a context that never pages never allocates the staging buffers,
+     * and a context that does pays for them once rather than per step. The
+     * staging buffer is sized like the K/V tensor itself, so any active prefix
+     * the lane can legally reach fits without a second allocation.
+     */
+    async _compilePagedRowVariants(
+      nodeIndices: Iterable<number>,
+      pagedTensors: ReadonlySet<string>,
+    ): Promise<void> {
+      const resources = new Set<GPUBuffer>();
+      const previousResources = this.host._activeSpecializationResources;
+      this.host._activeSpecializationResources = resources;
+      try {
+        for (const nodeIndex of nodeIndices) {
+          const plan = this.host.incrementalRowPlans.get(nodeIndex);
+          if (!plan || plan.pagedPipelines) continue;
+          const keyName = plan.node.inputs?.k?.name;
+          const valueName = plan.node.inputs?.v?.name;
+          /* Only causal self-attention retains a growing K/V. A cross-attention
+           * memory is read whole and never appended to, so it has no page table
+           * and needs no second binding. */
+          if (plan.node.opType !== 'QSDPA' || plan.node.params?.causal !== true ||
+              !keyName || !valueName ||
+              !pagedTensors.has(keyName) || !pagedTensors.has(valueName)) continue;
+
+          const buffers = new Map(plan.buffers);
+          const pagedStaging = new Map<string, GPUBuffer>();
+          for (const name of [keyName, valueName]) {
+            const pool = this.host.gpuBuffers.get(name);
+            const tensor = this.host.graph.tensors.get(name) as ExecutorTensor | undefined;
+            if (!pool || !tensor?.sizeBytes) {
+              throw new Error(`WebGPU paged K/V staging for '${name}' has no pool buffer.`);
+            }
+            const staging = this.host._createSpecializationBuffer({
+              label: `PagedKV_${nodeIndex}_${name}`,
+              size: Math.max(4, Math.ceil(tensor.sizeBytes / 4) * 4),
+              usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST,
+            });
+            pagedStaging.set(name, staging);
+            buffers.set(name, staging);
+          }
+          const pipelines: CompiledWebGPUPipeline[] = [];
+          await this.host._buildNodePipeline(plan.sampleNode, {
+            pipelines,
+            buffers,
+            resources,
+          });
+          if (pipelines.length === 0) {
+            throw new Error(
+              `WebGPU paged row node ${String(plan.node?.id ?? nodeIndex)} produced no pipeline.`);
+          }
+          for (const pipeline of pipelines) pipeline.graphNodeIndex = nodeIndex;
+          plan.pagedStaging = pagedStaging;
+          plan.pagedPipelines = pipelines;
+          plan.pagedQsdpaParamsBuffer =
+            pipelines.find((pipeline) => pipeline.paramsBuffer)?.paramsBuffer || null;
+        }
+        for (const buffer of resources) this.host.auxiliaryBuffers.add(buffer);
+      } catch (error) {
+        for (const buffer of resources) buffer.destroy?.();
+        throw error;
+      } finally {
+        this.host._activeSpecializationResources = previousResources;
+      }
+    }
+
     /**
      * Allocate VRAM for all tensors and compile shaders.
      */
@@ -1130,7 +1241,12 @@ export class WebGPUGraphCompiler {
         const zeroPointBuffer = this.host._createAuxiliaryStorageBuffer(`QConv2D_zero_points_${node.id}`, zeroPoints);
         const biasBuffer = this.host._buffer(bias) || this.host._createAuxiliaryStorageBuffer(
           `QConv2D_bias_${node.id}`, new Int32Array(outputChannels));
-        const scalarWorkgroupCount = [Math.ceil(Math.ceil(outputElements / 4) / 64), 1, 1];
+        const scalarDispatch = linearDispatch2D(
+          Math.ceil(outputElements / 4),
+          64,
+          this.host.device,
+        );
+        const scalarWorkgroupCount = scalarDispatch.workgroupCount;
         const tiledWorkgroupCount = [
           Math.ceil((outputChannels / 4) / 8),
           Math.ceil((batch * outputHeight * outputWidth) / 4),
@@ -1169,6 +1285,7 @@ export class WebGPUGraphCompiler {
         ]);
         pi[20] = inputQuantization.zero_point;
         pi[21] = outputQuantization.zero_point;
+        pu[22] = scalarDispatch.invocationStride;
         pf[24] = inputQuantization.scale;
         pf[25] = outputQuantization.scale;
         const paramsBuf = this.host._createSpecializationBuffer({ size: 112, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
@@ -1945,6 +2062,14 @@ export class WebGPUGraphCompiler {
         pu[4] = webGpuTypedDtypeCode(output.dtype);
         pi[5] = outputQuantization.zero_point;
         pf[6] = outputQuantization.scale;
+        // token_offset. The native backends set this when a decode row binds the
+        // ids tensor whole and names its row as a scalar, because a four-byte
+        // token row can never satisfy a storage-buffer offset alignment. WebGPU
+        // narrows a row through its own row-set resolver and always binds the
+        // ids from element zero, so this stays zero -- written rather than left
+        // implicit, because the word used to be padding and a reader should not
+        // have to infer which of the two it is.
+        pu[7] = 0;
         const paramsBuf = this.host._createSpecializationBuffer({ size: 32, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
         this.host._writeSpecializationBuffer(paramsBuf, 0, p);
         bindGroupEntries = [
@@ -2693,7 +2818,16 @@ export class WebGPUGraphCompiler {
           else wgslCode = ShaderLibrary.getCopyShader();
           elements = output.shape.reduce((a, b) => a * b, 1);
         }
-        const p = new Uint32Array([elements]);
+        const dispatch = linearDispatch2D(
+          hasTypedStorage ? Math.ceil(elements / 4) : elements,
+          64,
+          this.host.device,
+        );
+        const p = new Uint32Array(
+          hasTypedStorage || shapeOnly
+            ? [elements, dispatch.invocationStride]
+            : [elements],
+        );
         const paramsBuf = this.host._createSpecializationBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
         this.host._writeSpecializationBuffer(paramsBuf, 0, p);
         bindGroupEntries = [
@@ -2701,10 +2835,7 @@ export class WebGPUGraphCompiler {
           { binding: 1, resource: { buffer: this.host._buffer(output) } },
           { binding: 2, resource: { buffer: paramsBuf } }
         ];
-        workgroupCount = [
-          hasTypedStorage ? Math.ceil(Math.ceil(elements / 4) / 64) : Math.ceil(elements / 64),
-          1, 1,
-        ];
+        workgroupCount = dispatch.workgroupCount;
       } else if (node.opType === "QAdd") {
         const a = node.inputs.a || node.inputs.input || node.inputs.x;
         const b = node.inputs.b || node.inputs.y;
@@ -2780,13 +2911,15 @@ export class WebGPUGraphCompiler {
         const aStrides = bcastStrides(node.inputs.a.shape);
         const bStrides = bcastStrides(node.inputs.b.shape);
         const total = outShape.reduce((a, b) => a * b, 1);
-        const meta = new Uint32Array(2 + rank * 3);
+        const dispatch = linearDispatch2D(total, 64, this.host.device);
+        const meta = new Uint32Array(3 + rank * 3);
         meta[0] = total; meta[1] = rank;
         for (let d = 0; d < rank; d++) {
           meta[2 + d] = outStrides[d];
           meta[2 + rank + d] = aStrides[d];
           meta[2 + 2 * rank + d] = bStrides[d];
         }
+        meta[2 + rank * 3] = dispatch.invocationStride;
         const metaBuf = this.host._createSpecializationBuffer({ size: Math.ceil(meta.byteLength / 4) * 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
         this.host._writeSpecializationBuffer(metaBuf, 0, meta);
         bindGroupEntries = [
@@ -2795,7 +2928,7 @@ export class WebGPUGraphCompiler {
           { binding: 2, resource: { buffer: this.host._buffer(node.outputs.out) } },
           { binding: 3, resource: { buffer: metaBuf } }
         ];
-        workgroupCount = [Math.ceil(total / 64), 1, 1];
+        workgroupCount = dispatch.workgroupCount;
       } else if (node.opType === "Equal" || node.opType === "GreaterOrEqual") {
         const descriptor = comparisonDescriptor(node);
         const metadata = new Uint32Array(3 + descriptor.rank * 3);
@@ -2875,6 +3008,11 @@ export class WebGPUGraphCompiler {
         const outStrides = new Array(rank);
         { let s = 1; for (let i = rank - 1; i >= 0; i--) { outStrides[i] = s; s *= outShape[i]; } }
         const total = inShape.reduce((a, b) => a * b, 1);
+        const dispatch = linearDispatch2D(
+          byteTranspose ? Math.ceil(total / 4) : total,
+          64,
+          this.host.device,
+        );
         const meta = new Uint32Array(2 + rank * 2);
         meta[0] = total; meta[1] = rank;
         for (let d = 0; d < rank; d++) { meta[2 + d] = outStrides[d]; meta[2 + rank + d] = inStrides[perm[d]]; }
@@ -2888,9 +3026,7 @@ export class WebGPUGraphCompiler {
           { binding: 1, resource: { buffer: this.host._buffer(output) } },
           { binding: 2, resource: { buffer: metaBuf } }
         ];
-        workgroupCount = [
-          Math.ceil((byteTranspose ? Math.ceil(total / 4) : total) / 64), 1, 1,
-        ];
+        workgroupCount = dispatch.workgroupCount;
       } else if (node.opType === "Softmax" || node.opType === "LogSoftmax") {
         // Normalizes over the last (innermost) axis: rows of `d`, `b` rows total.
         wgslCode = node.opType === "Softmax" ? ShaderLibrary.getSoftmaxShader() : ShaderLibrary.getLogSoftmaxShader();
@@ -2916,6 +3052,7 @@ export class WebGPUGraphCompiler {
         wgslCode = ShaderLibrary.getLeakyReLUShader();
         const elements = node.outputs.out.shape.reduce((a, b) => a * b, 1);
         const alpha = node.params.alpha !== undefined ? node.params.alpha : 0.01;
+        const dispatch = linearDispatch2D(elements, 64, this.host.device);
         const p = new ArrayBuffer(16);
         new Uint32Array(p, 0, 1)[0] = elements;
         new Float32Array(p, 4, 1)[0] = alpha;
@@ -2926,7 +3063,7 @@ export class WebGPUGraphCompiler {
           { binding: 1, resource: { buffer: this.host._buffer(node.outputs.out) } },
           { binding: 2, resource: { buffer: paramsBuf } }
         ];
-        workgroupCount = [Math.ceil(elements / 64), 1, 1];
+        workgroupCount = dispatch.workgroupCount;
       } else if (node.opType === "PReLU") {
         wgslCode = ShaderLibrary.getPReLUShader();
         const input = node.inputs.input || node.inputs.x;
@@ -3332,6 +3469,7 @@ export class WebGPUGraphCompiler {
         }
         const hasZeroPoint = zeroPoint ? 1 : 0;
         wgslCode = ShaderLibrary.getDequantizeLinearShader();
+        const dispatch = linearDispatch2D(outputElements, 64, this.host.device);
         const p = new Uint32Array([
           outputElements,
           webGpuTypedDtypeCode(input.dtype),
@@ -3340,7 +3478,7 @@ export class WebGPUGraphCompiler {
             DataType.Unspecified,
           webGpuTypedDtypeCode(output.dtype),
           hasZeroPoint,
-          0,
+          dispatch.invocationStride,
           0,
         ]);
         const paramsBuf = this.host._createSpecializationBuffer({ size: 32, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
@@ -3354,7 +3492,7 @@ export class WebGPUGraphCompiler {
           { binding: 3, resource: { buffer: this.host._buffer(output) } },
           { binding: 4, resource: { buffer: paramsBuf } }
         ];
-        workgroupCount = [Math.ceil(outputElements / 64), 1, 1];
+        workgroupCount = dispatch.workgroupCount;
       } else if (node.opType === "QuantizeLinear") {
         const input = node.inputs.input || node.inputs.x || node.inputs.data;
         const scale = node.inputs.scale;
@@ -3376,6 +3514,11 @@ export class WebGPUGraphCompiler {
           throw new Error(`QuantizeLinear node ${node.id} scale/zero_point inputs do not match its output quantization metadata.`);
         }
         wgslCode = ShaderLibrary.getQuantizeLinearShader();
+        const dispatch = linearDispatch2D(
+          Math.ceil(outputElements / 4),
+          64,
+          this.host.device,
+        );
         const p = new Uint32Array([
           outputElements,
           webGpuTypedDtypeCode(output.dtype),
@@ -3394,7 +3537,7 @@ export class WebGPUGraphCompiler {
           { binding: 3, resource: { buffer: this.host._buffer(output) } },
           { binding: 4, resource: { buffer: paramsBuf } },
         ];
-        workgroupCount = [Math.ceil(Math.ceil(outputElements / 4) / 64), 1, 1];
+        workgroupCount = dispatch.workgroupCount;
       } else if (node.opType === "RequantizeLinear") {
         const input = node.inputs.input || node.inputs.x || node.inputs.data;
         const output = node.outputs.out || Object.values(node.outputs || {})[0];
@@ -3470,8 +3613,13 @@ export class WebGPUGraphCompiler {
         wgslCode = byteStorage
           ? ShaderLibrary.getTypedExpandShader()
           : ShaderLibrary.getExpandShader();
+        const dispatch = linearDispatch2D(
+          byteStorage ? Math.ceil(elements / 4) : elements,
+          64,
+          this.host.device,
+        );
         const p = new Uint32Array(20);
-        p.set([inp.shape.length, outShape.length, 0, elements]);
+        p.set([inp.shape.length, outShape.length, dispatch.invocationStride, elements]);
         p.set(inp.shape, 4);
         p.set(outShape, 12);
         const paramsBuf = this.host._createSpecializationBuffer({ size: 80, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
@@ -3481,11 +3629,7 @@ export class WebGPUGraphCompiler {
           { binding: 1, resource: { buffer: this.host._buffer(output) } },
           { binding: 2, resource: { buffer: paramsBuf } }
         ];
-        workgroupCount = [
-          Math.ceil((byteStorage ? Math.ceil(elements / 4) : elements) / 64),
-          1,
-          1,
-        ];
+        workgroupCount = dispatch.workgroupCount;
       } else if (node.opType === "Pad") {
         wgslCode = ShaderLibrary.getPadShader();
         const inp = node.inputs.input || node.inputs.data;

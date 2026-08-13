@@ -1,4 +1,4 @@
-import { _cpuPReLU } from '../ops/pReLU.js';
+import { _cpuPReLU } from '../ops/prelu.js';
 import { _cpuExpand } from '../ops/expand.js';
 import { _cpuDequantizeLinear } from '../ops/dequantizeLinear.js';
 import { _cpuQuantizeLinear } from '../ops/quantizeLinear.js';
@@ -16,10 +16,10 @@ import { _cpuQSiLU } from '../ops/qSiLU.js';
 import { _cpuTanh } from '../ops/tanh.js';
 import { _cpuSin } from '../ops/sin.js';
 import { _cpuCos } from '../ops/cos.js';
-import { _cpuRoPE } from '../ops/roPE.js';
+import { _cpuRoPE } from '../ops/rope.js';
 import { _cpuSSMScan } from '../ops/ssmScan.js';
-import { _cpuRMSNorm } from '../ops/rMSNorm.js';
-import { _cpuSiLU } from '../ops/siLU.js';
+import { _cpuRMSNorm } from '../ops/rmsNorm.js';
+import { _cpuSiLU } from '../ops/silu.js';
 import { _cpuSub } from '../ops/sub.js';
 import { _cpuLogSoftmax } from '../ops/logSoftmax.js';
 import { _cpuSoftmax } from '../ops/softmax.js';
@@ -46,7 +46,7 @@ import { _cpuProfileX } from '../ops/profileX.js';
 import { _cpuProfileY } from '../ops/profileY.js';
 import { _cpuConcat2 } from '../ops/concat2.js';
 import { _cpuUpsample2x } from '../ops/upsample2x.js';
-import { _cpuSDPA } from '../ops/sDPA.js';
+import { _cpuSDPA } from '../ops/sdpa.js';
 import { _cpuEmbedding } from '../ops/embedding.js';
 import { _cpuMul } from '../ops/mul.js';
 import { _cpuAdd } from '../ops/add.js';
@@ -58,9 +58,9 @@ import { _cpuResize } from '../ops/resize.js';
 import { _cpuSigmoid } from '../ops/sigmoid.js';
 import { _cpuHardSigmoid } from '../ops/hardSigmoid.js';
 import { _cpuHardSwish } from '../ops/hardSwish.js';
-import { _cpuReLU } from '../ops/reLU.js';
+import { _cpuReLU } from '../ops/relu.js';
 import { _cpuLeakyReLU } from '../ops/leakyReLU.js';
-import { _cpuGELU } from '../ops/gELU.js';
+import { _cpuGELU } from '../ops/gelu.js';
 import { _cpuLayerNorm } from '../ops/layerNorm.js';
 import { _cpuGroupNorm } from '../ops/groupNorm.js';
 import { _cpuConv2D } from '../ops/conv2D.js';
@@ -79,7 +79,7 @@ import { Tensor } from '../core/Tensor.js';
 import { assertInferenceExecutionOptions, BackendEngine } from './BackendEngine.js';
 import { incrementalExecutionEnabled, incrementalNodeSelection } from './incrementalExecution.js';
 import {
-  incrementalRowPosition,
+  decodeRowSetFromOptions,
   prepareQuantizedRows,
 } from './quantizedRowExecution.js';
 import type { RuntimeGraph } from '../core/RuntimeGraph.js';
@@ -186,7 +186,7 @@ export class CPUEngine extends BackendEngine {
   declare _cpuWhere: typeof _cpuWhere;
 
   constructor() {
-    super('cpu', {
+    super('cpu-js', {
       incrementalExecution: true,
       incrementalRows: true,
       outputLocation: 'host',
@@ -251,10 +251,10 @@ export class CPUEngine extends BackendEngine {
     /* Publish validity only after every selected node completes. A reset or
      * partial failure must never expose intermediates from the prior image. */
     this._incrementalCacheValid = false;
-    const rowPosition = incrementalRowPosition(options, selectedNodes, cacheWasValid);
-    const incrementalRows = rowPosition == null
+    const rowSet = decodeRowSetFromOptions(options, selectedNodes, cacheWasValid);
+    const incrementalRows = rowSet == null
       ? null
-      : prepareQuantizedRows(graph, selectedNodes, rowPosition, {
+      : prepareQuantizedRows(graph, selectedNodes, rowSet, {
           changedInputs: options.changedInputs ?? Object.keys(inputs),
         });
     const copiedInputs = selectedNodes === null
@@ -268,9 +268,18 @@ export class CPUEngine extends BackendEngine {
     }
     for (let nodeIndex = 0; nodeIndex < graph.nodes.length; nodeIndex++) {
       if (selectedNodes && !selectedNodes.has(nodeIndex)) continue;
-      this._runNode(incrementalRows?.get(nodeIndex) || graph.nodes[nodeIndex], {
-        graph, adapterPlan, nodeIndex, rowPosition,
+      const rowNode = incrementalRows?.get(nodeIndex) || graph.nodes[nodeIndex];
+      /* Staged operands are filled here rather than when the row plan was
+       * built: the last token of a visible K/V prefix, and every lane's own
+       * input row, are produced by this same step, and a plan-time copy would
+       * read the previous step's bytes for them. */
+      rowNode.gatherRows?.();
+      this._runNode(rowNode, {
+        graph, adapterPlan, nodeIndex, rowPosition: rowSet ? rowSet.positions[0] : null,
       });
+      /* And staged outputs are written back before the next node gathers, so a
+       * consumer inside the same step sees this node's rows. */
+      rowNode.scatterRows?.();
     }
     const result: Record<string, any> = {};
     if (graph.outputNames && graph.outputNames.length > 0) {

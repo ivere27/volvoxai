@@ -82,6 +82,62 @@ static int test_graph_linear_tails_and_fallback(void) {
     return 0;
 }
 
+static int test_moe_partial_residency_backward(void) {
+    float input = 2.0f;
+    float expert_weight = 3.0f;
+    float expert_bias = 4.0f;
+    float route_index = 2.0f;
+    float route_weight = 0.5f;
+    float grad_output = 7.0f;
+    float grad_input = 0.0f;
+    float grad_expert_weight = 0.0f;
+    float grad_expert_bias = 0.0f;
+    float grad_route_weight = 0.0f;
+    uint32_t slot_rows[3] = {UINT32_MAX, UINT32_MAX, 0u};
+    uint32_t row_slots[1] = {2u};
+    uint32_t params[8] = {1u, 1u, 1u, 1u, 1u, 1u, 3u, 0u};
+    void* hosts[13] = {
+        &input, &expert_weight, &expert_bias, &route_index, &route_weight,
+        &grad_output, &grad_input, &grad_expert_weight, &grad_expert_bias,
+        &grad_route_weight, slot_rows, row_slots, params
+    };
+    size_t bytes[13] = {
+        sizeof(float), sizeof(float), sizeof(float), sizeof(float), sizeof(float),
+        sizeof(float), sizeof(float), sizeof(float), sizeof(float), sizeof(float),
+        sizeof(slot_rows), sizeof(row_slots), sizeof(params)
+    };
+    unsigned char access[13] = {
+        METAL_TRAINING_READ, METAL_TRAINING_READ, METAL_TRAINING_READ,
+        METAL_TRAINING_READ, METAL_TRAINING_READ, METAL_TRAINING_READ,
+        METAL_TRAINING_READ | METAL_TRAINING_WRITE,
+        METAL_TRAINING_READ | METAL_TRAINING_WRITE,
+        METAL_TRAINING_READ | METAL_TRAINING_WRITE,
+        METAL_TRAINING_READ | METAL_TRAINING_WRITE,
+        METAL_TRAINING_READ, METAL_TRAINING_READ, METAL_TRAINING_READ
+    };
+    unsigned char weights[13] = {0, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+    const char* entries[4] = {"input_main", "weight_main", "bias_main", "route_main"};
+    CHECK(metal_training_begin() == 0);
+    for (int index = 0; index < 4; index++) {
+        CHECK(metal_training_dispatch(
+                  "moeLinearBackward", entries[index], hosts, bytes, access,
+                  weights, 13, 1, 1, 1) == 0);
+    }
+    CHECK(metal_training_sync(&grad_input, sizeof(grad_input)) == 0);
+    CHECK(metal_training_sync(&grad_expert_weight,
+                              sizeof(grad_expert_weight)) == 0);
+    CHECK(metal_training_sync(&grad_expert_bias,
+                              sizeof(grad_expert_bias)) == 0);
+    CHECK(metal_training_sync(&grad_route_weight,
+                              sizeof(grad_route_weight)) == 0);
+    metal_training_end();
+    CHECK(close_enough(grad_input, 10.5f));
+    CHECK(close_enough(grad_expert_weight, 7.0f));
+    CHECK(close_enough(grad_expert_bias, 3.5f));
+    CHECK(close_enough(grad_route_weight, 70.0f));
+    return 0;
+}
+
 static int test_graph_f32_shape_and_activation_closure(void) {
     const float sigmoid_input[5] = {-4.0f, -1.0f, 0.0f, 1.0f, 4.0f};
     float sigmoid_output[5] = {0};
@@ -1754,6 +1810,7 @@ int main(void) {
     CHECK(test_dynamic_domain_reservation() == 0);
     CHECK(test_activation_backward() == 0);
     CHECK(test_multi_entry_matmul_backward() == 0);
+    CHECK(test_moe_partial_residency_backward() == 0);
     CHECK(test_prelu_logsoftmax_split_backward() == 0);
     CHECK(test_engine_state_isolation(engine_state) == 0);
     metal_cleanup();

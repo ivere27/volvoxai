@@ -236,6 +236,32 @@ export interface ExecutionOptions {
 export interface DecodeExecutionOptions extends ExecutionOptions {
   readonly changedInputs?: readonly string[];
   readonly position?: number;
+  /**
+   * One row position per declared decode lane, or `null` for a lane that
+   * produces no new token this step.
+   *
+   * The batched spelling of `position`, for a context that owns more than one
+   * slot. Lanes are independent: a lane's position is its own next token, so
+   * two requests admitted a step apart stay a step apart instead of one of them
+   * padding to the other's length. A context with one lane uses `position`;
+   * declaring both is refused rather than resolved by precedence, because the
+   * two would disagree about how many slots exist.
+   *
+   * A `[B,S,D]` batch cannot drop a lane without changing every operand's
+   * shape, so a lane that produces no token this step still occupies one. There
+   * are two ways to say that and they differ:
+   *
+   *   `null`  idles a lane that still holds its request. Its active length stops
+   *           moving and its row is left exactly as it was.
+   *   `-1`    parks a lane that holds no request. It has no row to preserve, so
+   *           it occupies a row for shape and its output is discarded -- which
+   *           is what lets a slot whose request retired, and whose pages went
+   *           back to the pool, stay in the batch at all.
+   *
+   * At least one lane must advance, since a step in which nothing advances is
+   * not a step.
+   */
+  readonly positions?: readonly (number | null)[];
 }
 
 export interface GraphContract {

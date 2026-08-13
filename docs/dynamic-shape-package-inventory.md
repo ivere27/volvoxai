@@ -1,7 +1,7 @@
 # Dynamic-shape package migration inventory
 
 This is the DS0 inventory for the breaking dynamic-shape redesign in
-[`PLAN.md`](../PLAN.md). It records where the legacy static
+[`TODO.md`](../TODO.md). It records where the legacy static
 `volvox-graph/v1` contract is authored, generated, validated, tested, and
 documented. The intended cutover has no compatibility reader: authored sources
 are changed first, generated packages are rebuilt from those sources, and old
@@ -37,7 +37,6 @@ git ls-files | rg '(^|/)(graph\.json|[^/]+\.graph\.json)$' | wc -l
 # Tracked sources/docs that spell the legacy discriminator (117).
 git ls-files -z \
   | xargs -0 rg -l 'volvox-graph/v1' \
-  | rg -v '^PLAN\.md$' \
   | wc -l
 
 # Tracked code that embeds the legacy split node-output maps (80).
@@ -58,7 +57,6 @@ find tests/parity/out/opcases -type f -name graph.json | wc -l
 # Review every tracked discriminator site, grouped naturally by path.
 git ls-files -z \
   | xargs -0 rg -l 'volvox-graph/v1' \
-  | rg -v '^PLAN\.md$' \
   | sort
 
 # Find shape-schema sites even when the discriminator is imported indirectly.
@@ -67,7 +65,7 @@ rg -n 'outputs_shape|outputs_dtype|VOLVOX_GRAPH_FORMAT|GRAPH_FORMAT|GraphDocumen
   --glob '*.{ts,js,mjs,py,c,h,rs,proto}'
 ```
 
-The second count intentionally excludes `PLAN.md`, which names the
+The second count intentionally excludes `TODO.md`, which names the
 discriminator only when describing schema work rather than authoring a
 package. The discriminator
 search is a sentinel rather than a complete dependency graph: for example,
@@ -196,13 +194,13 @@ The following groups require a deliberate rewrite.
 
 ### JavaScript core and package tests
 
-- `tests/js_context_runtime.test.mjs`
-- `tests/js_graph_loader_cache.test.mjs`
-- `tests/js_graph_loader_quantization_refs.test.mjs`
-- `tests/js_model_builder.test.mjs`
-- `tests/js_ptq.test.mjs`
-- `tests/js_qmaskedmean.test.mjs`
-- `tests/js_w8a8_graph_e2e.test.mjs`
+- `tests/context_runtime.test.mjs`
+- `tests/runtime_graph_loader_cache.test.mjs`
+- `tests/runtime_graph_loader_quantization_refs.test.mjs`
+- `tests/model_builder.test.mjs`
+- `tests/ptq.test.mjs`
+- `tests/qmaskedmean.test.mjs`
+- `tests/w8a8_graph_e2e.test.mjs`
 - `tests/model_package_validation.test.mjs`
 - `tests/parity/graphs/cases.mjs`
 - `tests/parity/ops/cases.mjs`

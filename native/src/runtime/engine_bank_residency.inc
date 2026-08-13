@@ -1,8 +1,10 @@
 /* Load-time weight-bank residency.
  *
- * Each private engine state owns its weight table and the matching residency
- * maps. Slicing happens after the safetensors files are loaded and before
- * build_graph, so every downstream shape check sees the staged extent.
+ * Each private engine state owns its tensor descriptor table and the matching
+ * residency maps. A standalone mutable engine compacts its loaded file bytes
+ * in place. A compiled-model context instead borrows immutable file bytes and
+ * copies only selected bank rows into a context-owned overlay. Both happen
+ * before build_graph, so every downstream shape check sees the staged extent.
  *
  * Route indices keep the exporter's global slot ids at execution; each node that
  * reads a sliced bank carries a global-id -> staged-row table. */
@@ -75,14 +77,15 @@ static VxBankResidencyState* vx_bank_residency_find(const char* name) {
     return NULL;
 }
 
-/* Compact each requested bank in place: resident slot s moves to row r, and r
- * is never greater than s, so a forward pass never overwrites a slot it still
- * has to read. Payloads are heap-owned by the safetensors loader, and the slice
- * only shrinks the tensor, so no reallocation or ownership change is involved. */
+/* Stage each requested bank. Mutable standalone engines compact in place:
+ * resident slot s moves to row r, and r is never greater than s. Compiled
+ * contexts keep the owner's source bytes untouched and allocate only the
+ * selected rows; the borrowed descriptor table is private to the context. */
 static int vx_bank_residency_apply(void) {
     for (size_t index = 0; index < g_bank_residency_count; index++) {
         VxBankResidencyState* state = &g_bank_residency[index];
         SafetensorsTensor* stored = NULL;
+        T* tensor;
         size_t slot_bytes;
         int file_index;
         state->applied = 0;
@@ -107,27 +110,47 @@ static int vx_bank_residency_apply(void) {
         if (!stored->data || !stored->nbytes ||
             stored->nbytes % (size_t)stored->shape[0]) return -1;
         slot_bytes = stored->nbytes / (size_t)stored->shape[0];
-        for (uint32_t slot = 0; slot < state->slot_domain; slot++) {
-            uint32_t row = state->slot_rows[slot];
-            if (row == VX_MOE_SLOT_ABSENT || row == slot) continue;
-            memmove((unsigned char*)stored->data + (size_t)row * slot_bytes,
-                    (const unsigned char*)stored->data + (size_t)slot * slot_bytes,
-                    slot_bytes);
+        if ((size_t)state->staged_rows > SIZE_MAX / slot_bytes) return -1;
+        tensor = t_find(state->bank);
+        if (!tensor || tensor->owns || tensor->data != stored->data) return -1;
+        if (g_weight_files_borrowed) {
+            size_t staged_bytes = (size_t)state->staged_rows * slot_bytes;
+            unsigned char* staged = (unsigned char*)malloc(staged_bytes);
+            if (!staged) return -1;
+            for (uint32_t slot = 0; slot < state->slot_domain; slot++) {
+                uint32_t row = state->slot_rows[slot];
+                if (row == VX_MOE_SLOT_ABSENT) continue;
+                memcpy(staged + (size_t)row * slot_bytes,
+                       (const unsigned char*)stored->data +
+                           (size_t)slot * slot_bytes,
+                       slot_bytes);
+            }
+            tensor->data = (float*)staged;
+            tensor->owns = 1;
+            stored->data = staged;
+        } else {
+            for (uint32_t slot = 0; slot < state->slot_domain; slot++) {
+                uint32_t row = state->slot_rows[slot];
+                if (row == VX_MOE_SLOT_ABSENT || row == slot) continue;
+                memmove((unsigned char*)stored->data +
+                            (size_t)row * slot_bytes,
+                        (const unsigned char*)stored->data +
+                            (size_t)slot * slot_bytes,
+                        slot_bytes);
+            }
         }
         stored->shape[0] = (int)state->staged_rows;
         stored->nbytes = (size_t)state->staged_rows * slot_bytes;
         /* The engine registers a T for each safetensors entry while loading, so
-         * the already-published tensor has to follow the staged extent. Both
-         * alias the same heap payload (owns = 0), so only metadata changes. */
+         * the already-published tensor has to follow the staged extent. The
+         * standalone path still aliases its blob; the compiled path points both
+         * private descriptors at the context-owned overlay. */
         {
-            T* tensor = t_find(state->bank);
-            if (tensor) {
-                long numel = 1;
-                tensor->shape[0] = (int)state->staged_rows;
-                for (int axis = 0; axis < tensor->ndim; axis++)
-                    numel *= tensor->shape[axis];
-                tensor->numel = numel;
-            }
+            long numel = 1;
+            tensor->shape[0] = (int)state->staged_rows;
+            for (int axis = 0; axis < tensor->ndim; axis++)
+                numel *= tensor->shape[axis];
+            tensor->numel = numel;
         }
         state->applied = 1;
     }

@@ -2,12 +2,12 @@
   "schema": "volvoxai.parity-artifact",
   "version": 1,
   "provenance": {
-    "runId": "7679f801-fad6-4d21-ab54-fa4b2ef06aea",
+    "runId": "364b3970-5802-4656-adae-3e7259fabc6a",
     "command": "golden",
-    "fingerprint": "911764bd458efbc194938d1d130ce7aa490c9a7ae6020c63e451dac316bea6f4",
+    "fingerprint": "7cdbcf09c14ca5164db96af3c9576c40730aaf27f7ac62e36c6bbc1f42d763bc",
     "case": "tinystories_1m",
-    "tier": "cpu-reference",
-    "createdAt": "2026-08-02T16:56:27.794Z"
+    "tier": "cpu-js-reference",
+    "createdAt": "2026-08-13T08:14:19.618Z"
   },
   "payload": {
     "model": "tinystories_1m",
@@ -20,15 +20,15 @@
         "policy": [
           {
             "path": "tests/parity/policy.json",
-            "sha256": "2909cc971c77e27149f51ea3337368615d9e2c285bc7bb8605bbd387d0b5782c",
-            "size": 6621
+            "sha256": "a6d43c713a3ac37a436a3bb08fafb45e414a10f40c4bd08e5d2e5a053499e814",
+            "size": 6639
           }
         ],
         "models": [
           {
             "path": "models/tinystories_1m/graph.json",
-            "sha256": "f7657197c5fb4658fec97e20f62066a82f405deb03d784f9d5105d0ffdc4e5e3",
-            "size": 31487
+            "sha256": "50e5e54d969dbdf7df35ef1f6b20e7df8991bca57620ad90a2a4d1689669a102",
+            "size": 31442
           },
           {
             "path": "models/tinystories_1m/model.safetensors",
@@ -56,7 +56,7 @@
           "statusSha256": null
         }
       },
-      "digest": "85192cce555cd6790266cdce49b12c05c41f1d7343f541411e4f3d934fbdf5a7"
+      "digest": "86234f042b5c06cb0393a17e02d52fd2534649ed801e0c61c046a223191671ae"
     },
     "sigs": {
       "logits": {
@@ -1157,10 +1157,10 @@
     },
     "runtimeEvidence": {
       "compilation": {
-        "compilationId": "compilation-5e182852-3173-4cc5-84f9-0d5bf04b13d4",
-        "definitionId": "model-definition-1d6b7fd4-b7b0-46f2-b686-3ea70c3da265",
+        "compilationId": "compilation-ff6d22e7-413b-4330-90ae-d53048a5c595",
+        "definitionId": "model-definition-d570b9ca-4bc3-4ebe-9d28-16f8a7769d60",
         "policy": {
-          "backend": "cpu",
+          "backend": "cpu-js",
           "mode": "require",
           "operatorFallback": "forbid"
         },
@@ -1169,7 +1169,7 @@
           "adapterRevisionIds": [],
           "topologyRevision": 1,
           "weightRevision": 1,
-          "weightRevisionId": "model-definition-1d6b7fd4-b7b0-46f2-b686-3ea70c3da265:weight:1:weight-revision-bccc8e53-34d5-4264-aa47-cd95119c643a"
+          "weightRevisionId": "model-definition-d570b9ca-4bc3-4ebe-9d28-16f8a7769d60:weight:1:weight-revision-fb5cae6b-8612-4f5d-b447-d4f1afbfd4a3"
         },
         "route": {
           "operator": {
@@ -1179,15 +1179,15 @@
           },
           "tierFallback": false
         },
-        "selectedBackend": "cpu",
+        "selectedBackend": "cpu-js",
         "selectedDevice": {
-          "backend": "cpu",
+          "backend": "cpu-js",
           "device": "host"
         }
       },
       "execution": {
-        "backend": "cpu",
-        "contextId": "context-dc3e775b-f041-4d34-8dd0-ea67ba6376bb",
+        "backend": "cpu-js",
+        "contextId": "context-eccefe12-8cc8-49f9-b9b2-8c83c7c3d54b",
         "decodeState": {
           "cacheGeneration": null,
           "cacheState": "not-applicable",
@@ -1196,17 +1196,17 @@
           "position": null
         },
         "device": {
-          "backend": "cpu",
+          "backend": "cpu-js",
           "device": "host"
         },
-        "executionId": "execution-1794a805-b10e-4220-9470-7968ae7be495",
+        "executionId": "execution-be3620bb-4aab-4e72-b19b-c7b52480e853",
         "outcome": "success",
         "revisions": {
           "adapterRevisionId": null,
           "adapterRevisionIds": [],
           "topologyRevision": 1,
           "weightRevision": 1,
-          "weightRevisionId": "model-definition-1d6b7fd4-b7b0-46f2-b686-3ea70c3da265:weight:1:weight-revision-bccc8e53-34d5-4264-aa47-cd95119c643a"
+          "weightRevisionId": "model-definition-d570b9ca-4bc3-4ebe-9d28-16f8a7769d60:weight:1:weight-revision-fb5cae6b-8612-4f5d-b447-d4f1afbfd4a3"
         },
         "route": {
           "operator": {

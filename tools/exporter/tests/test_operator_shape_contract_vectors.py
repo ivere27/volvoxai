@@ -12,7 +12,7 @@ from tools.exporter.operator_shape_contracts import (
     OperatorTensorDescriptor,
     PerAxisQuantization,
     PerTensorQuantization,
-    WAVE_A_OPERATOR_SHAPE_CONTRACTS,
+    DIRECT_OPERATOR_SHAPE_CONTRACTS,
     get_operator_shape_contract,
     infer_concrete_operator_shapes,
 )
@@ -220,7 +220,7 @@ class OperatorShapeCorpusSchemaTests(unittest.TestCase):
 
         self.assertEqual(
             all_manifest_operators,
-            set(WAVE_A_OPERATOR_SHAPE_CONTRACTS),
+            set(DIRECT_OPERATOR_SHAPE_CONTRACTS),
         )
 
         all_case_ids: set[str] = set()
@@ -396,7 +396,7 @@ class OperatorShapeSymbolicDomainTests(unittest.TestCase):
             {"environment": self.environment, **request}
         )
 
-    def test_every_wave_a_operator_accepts_a_genuinely_symbolic_domain(self):
+    def test_every_direct_operator_accepts_a_genuinely_symbolic_domain(self):
         dynamic = _logical_tensor(["B", "S", 4])
         requests: dict[str, tuple[dict, tuple[object, ...], str]] = {
             "Identity": ({"inputs": {"input": dynamic}}, ("B", "S", 4), "float32"),
@@ -537,7 +537,7 @@ class OperatorShapeSymbolicDomainTests(unittest.TestCase):
                 "float32",
             )
 
-        self.assertEqual(set(requests), set(WAVE_A_OPERATOR_SHAPE_CONTRACTS))
+        self.assertEqual(set(requests), set(DIRECT_OPERATOR_SHAPE_CONTRACTS))
         for operator, (request, expected_shape, expected_dtype) in requests.items():
             with self.subTest(operator=operator):
                 proof = self._prove(operator, request)
@@ -545,7 +545,7 @@ class OperatorShapeSymbolicDomainTests(unittest.TestCase):
                 self.assertEqual(proof.outputs["out"].shape, expected_shape)
                 self.assertEqual(proof.outputs["out"].dtype, expected_dtype)
 
-    def test_unprovable_wave_a_dynamic_relations_fail_closed(self):
+    def test_unprovable_direct_dynamic_relations_fail_closed(self):
         per_axis = {
             "scheme": "per_axis",
             "axis": 1,

@@ -602,15 +602,6 @@ class CapabilityValidationTests(unittest.TestCase):
                     quantization_failures[0].message,
                 )
 
-    def test_webnn_rejects_cross_attention_without_fallback(self):
-        result = validate_graph(
-            graph_with_node("CrossSDPA", inputs={"q": "x", "k": "x", "v": "x"}),
-            ["backend:webnn"],
-        )
-        self.assertFalse(result.supported)
-        self.assertEqual(result.diagnostics[0].code, "VXCAP001")
-        self.assertEqual(result.diagnostics[0].target, "backend:webnn")
-
     def test_unqualified_backend_routes_and_native_average_pool_fail_closed(self):
         average_pool = graph_with_node("AveragePool2D")
         portable = validate_graph(average_pool, ["portable"])
@@ -619,10 +610,6 @@ class CapabilityValidationTests(unittest.TestCase):
             [(item.code, item.target) for item in portable.diagnostics],
         )
 
-        transpose = graph_with_node("Transpose")
-        webnn = validate_graph(transpose, ["backend:webnn"])
-        self.assertIn("VXCAP001", [item.code for item in webnn.diagnostics])
-
         for target in (
             "backend:vulkan", "backend:opengl", "backend:metal", "backend:cuda",
         ):
@@ -630,26 +617,6 @@ class CapabilityValidationTests(unittest.TestCase):
                 result = validate_graph(graph_with_node("Identity"), [target])
                 self.assertFalse(result.supported)
                 self.assertEqual(result.diagnostics[0].target, target)
-
-    def test_webnn_w8a32_rejection_does_not_depend_on_target_order(self):
-        graph = graph_with_node(
-            "Linear",
-            inputs={"input": "x", "weight": "w", "weight_scale": "s"},
-            params={"weight_layout": "dout_din"},
-        )
-        weights = {
-            "w": SimpleNamespace(shape=(4, 4), dtype="int8"),
-            "s": SimpleNamespace(shape=(4,), dtype="float32"),
-        }
-        for targets in (
-            ["backend:webnn", "cpu-js"],
-            ["cpu-js", "backend:webnn"],
-        ):
-            with self.subTest(targets=targets):
-                diagnostics = validate_graph(graph, targets, weights=weights).diagnostics
-                failures = [item for item in diagnostics if item.code == "VXW8A32_TARGET"]
-                self.assertEqual(len(failures), 1)
-                self.assertEqual(failures[0].target, "backend:webnn")
 
     def test_control_flow_has_a_stable_diagnostic(self):
         result = validate_graph(graph_with_node("If"), ["cpu-js"])

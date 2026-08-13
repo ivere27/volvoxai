@@ -1,8 +1,11 @@
 import type { RuntimeGraph } from '../core/RuntimeGraph.js';
-import { VolvoxAIError } from '../core/RuntimeErrors.js';
+import {
+  VolvoxAIError,
+  type RuntimeFailurePhase,
+} from '../core/RuntimeErrors.js';
 import type { Tensor } from '../core/Tensor.js';
 import type { GraphExecutor } from './GraphExecutor.js';
-import type { AdapterTarget } from './WebGPUContracts.js';
+import type { AdapterTarget, WebGPUInvariantWeightBorrow } from './WebGPUContracts.js';
 import { compileWebGPUGraphPlan } from './WebGPUGraphCompiler.js';
 
 /** Classify synchronous dynamic-provider device allocation failures uniformly. */
@@ -10,6 +13,7 @@ export function createWebGPUBufferOrOOM(
   device: GPUDevice,
   descriptor: GPUBufferDescriptor,
   allocation: string,
+  phase: RuntimeFailurePhase = 'execution',
 ): GPUBuffer {
   try {
     return device.createBuffer(descriptor);
@@ -19,7 +23,7 @@ export function createWebGPUBufferOrOOM(
       : '';
     throw new VolvoxAIError('OUT_OF_MEMORY',
       `${allocation} allocation of ${String(descriptor.size)} bytes failed.${detail}`, {
-        phase: 'execution', backend: 'webgpu', cause: error,
+        phase, backend: 'webgpu', cause: error,
       });
   }
 }
@@ -28,11 +32,21 @@ export interface StagedWebGPUTensorResources {
   readonly buffers: Map<string, GPUBuffer>;
   readonly usages: Map<string, GPUBufferUsageFlags>;
   readonly capacities: Map<string, number>;
-  /** Buffers created by this candidate and safe to destroy on rollback. */
+  /** Physical buffers acquired by this candidate. Telemetry/debugging only. */
   readonly created: Set<GPUBuffer>;
+  /** One ownership lease per non-aliased tensor binding in this generation. */
+  readonly leases: Map<string, WebGPUBufferLease>;
+  /** Leases acquired by this candidate rather than carried from the old one. */
+  readonly acquiredLeases: readonly WebGPUBufferLease[];
   readonly logicalActivationBytes: number;
   readonly activationCapacityBytes: number;
   readonly grew: boolean;
+}
+
+/** One symmetric ownership reference, whether the buffer is private or shared. */
+export interface WebGPUBufferLease {
+  readonly buffer: GPUBuffer;
+  release(): void;
 }
 
 interface WebGPUResourcePlanOptions {
@@ -67,6 +81,7 @@ export function webGPUBufferUsage({
 export function aliasInferenceDropoutBuffers(
   graph: RuntimeGraph,
   buffers: Map<string, GPUBuffer>,
+  releaseAllocated: (buffer: GPUBuffer) => void = (buffer) => buffer.destroy?.(),
 ): void {
   for (const node of graph.nodes) {
     if (node.opType !== 'Dropout') continue;
@@ -78,13 +93,33 @@ export function aliasInferenceDropoutBuffers(
         input.sizeBytes !== output.sizeBytes) {
       throw new Error(`Dropout node ${String(node.id)} requires equal-size input/output tensors.`);
     }
-    if (allocated !== source) allocated.destroy?.();
+    if (allocated !== source) releaseAllocated(allocated);
     buffers.set(output.name, source);
   }
 }
 
 export function destroyDistinctWebGPUBuffers(buffers: Iterable<GPUBuffer>): void {
   for (const buffer of new Set(buffers)) buffer.destroy?.();
+}
+
+function bufferLease(buffer: GPUBuffer, releaseBuffer: () => void): WebGPUBufferLease {
+  let released = false;
+  return Object.freeze({
+    buffer,
+    release() {
+      if (released) return;
+      released = true;
+      releaseBuffer();
+    },
+  });
+}
+
+function privateBufferLease(buffer: GPUBuffer): WebGPUBufferLease {
+  return bufferLease(buffer, () => buffer.destroy?.());
+}
+
+export function releaseWebGPUBufferLeases(leases: Iterable<WebGPUBufferLease>): void {
+  for (const lease of leases) lease.release();
 }
 
 function alignedBufferBytes(sizeBytes: number, label: string): number {
@@ -139,10 +174,28 @@ function aliasRoot(aliases: ReadonlyMap<string, string>, name: string): string {
 
 /** Context-owned allocation, upload, aliasing, and destruction policy. */
 export class WebGPUResources {
-  constructor(readonly host: GraphExecutor) {}
+  #committedTensorLeases = new Map<string, WebGPUBufferLease>();
+  readonly #invariantWeightBorrow: WebGPUInvariantWeightBorrow | null;
+
+  constructor(
+    readonly host: GraphExecutor,
+    invariantWeightBorrow: WebGPUInvariantWeightBorrow | null = null,
+  ) {
+    this.#invariantWeightBorrow = invariantWeightBorrow;
+  }
 
   resetCompilationResources(): void {
-    destroyDistinctWebGPUBuffers(this.host.gpuBuffers.values());
+    const leasedBuffers = new Set(
+      [...this.#committedTensorLeases.values()].map((lease) => lease.buffer),
+    );
+    releaseWebGPUBufferLeases(this.#committedTensorLeases.values());
+    this.#committedTensorLeases.clear();
+    /* Keep legacy/directly-installed buffers safe as well. Aliases are
+     * deliberately distinct here: they never received an ownership lease. */
+    destroyDistinctWebGPUBuffers(
+      [...new Set(this.host.gpuBuffers.values())]
+        .filter((buffer) => !leasedBuffers.has(buffer)),
+    );
     for (const buffers of this.host.adapterTargetBuffers.values()) {
       buffers.a?.destroy?.();
       buffers.b?.destroy?.();
@@ -193,6 +246,8 @@ export class WebGPUResources {
       const usages = new Map<string, GPUBufferUsageFlags>();
       const capacities = new Map<string, number>();
       const created = new Set<GPUBuffer>();
+      const leases = new Map<string, WebGPUBufferLease>();
+      const acquiredLeases: WebGPUBufferLease[] = [];
       let logicalActivationBytes = 0;
       for (const tensor of graph.tensors.values()) {
         if (tensor.isWeight) continue;
@@ -228,6 +283,13 @@ export class WebGPUResources {
           if (canReuse) {
             buffer = previous;
             capacityBytes = previousCapacity;
+            const previousLease = this.#committedTensorLeases.get(name);
+            if (!previousLease || previousLease.buffer !== buffer) {
+              throw new Error(
+                `WebGPU tensor '${name}' has a committed buffer without its ownership lease.`,
+              );
+            }
+            leases.set(name, previousLease);
           } else {
             capacityBytes = checkedCapacityTarget(
               requiredBytes,
@@ -236,20 +298,45 @@ export class WebGPUResources {
               growthFactor,
               `Tensor '${name}'`,
             );
-            buffer = createWebGPUBufferOrOOM(
-              this.host.device,
-              {
-                label: `Tensor_${name}`,
-                size: capacityBytes,
-                usage,
-              },
-              `WebGPU tensor '${name}' capacity`,
-            );
-            created.add(buffer);
+            const invariant = tensor.isWeight && !replaceWeight &&
+                this.#invariantWeightBorrow &&
+                !this.#invariantWeightBorrow.isContextPrivateWeight(name)
+              ? this.#invariantWeightBorrow.borrowDeviceWeight(name)
+              : null;
+            let lease: WebGPUBufferLease;
+            if (invariant !== null) {
+              if (invariant.name !== name || invariant.capacityBytes < requiredBytes ||
+                  (invariant.usage & usage) !== usage ||
+                  (invariant.buffer as { destroyed?: boolean }).destroyed === true) {
+                throw new Error(
+                  `Compiled WebGPU invariant weight '${name}' does not satisfy its binding.`,
+                );
+              }
+              buffer = invariant.buffer;
+              capacityBytes = invariant.capacityBytes;
+              // Physical ownership remains with the compiled-model lease.
+              lease = bufferLease(buffer, () => undefined);
+            } else {
+              buffer = createWebGPUBufferOrOOM(
+                this.host.device,
+                {
+                  label: `Tensor_${name}`,
+                  size: capacityBytes,
+                  usage,
+                },
+                `WebGPU tensor '${name}' capacity`,
+              );
+              lease = privateBufferLease(buffer);
+              created.add(buffer);
+            }
+            leases.set(name, lease);
+            acquiredLeases.push(lease);
             if (!tensor.isWeight && previous !== undefined && capacityBytes > previousCapacity) {
               grew = true;
             }
-            if (tensor.isWeight && tensor.buffer) this.uploadWeight(buffer, tensor);
+            if (tensor.isWeight && tensor.buffer && invariant === null) {
+              this.uploadWeight(buffer, tensor);
+            }
           }
           buffers.set(name, buffer);
           usages.set(name, usage);
@@ -279,14 +366,34 @@ export class WebGPUResources {
           usages,
           capacities,
           created,
+          leases,
+          acquiredLeases: Object.freeze(acquiredLeases),
           logicalActivationBytes,
           activationCapacityBytes,
           grew,
         };
       } catch (error) {
-        destroyDistinctWebGPUBuffers(created);
+        releaseWebGPUBufferLeases(acquiredLeases);
         throw error;
       }
+    }
+
+    /**
+     * Publish staged tensor ownership and return the old generation's leases.
+     * The caller retires those leases only after submitted work completes.
+     */
+    commitTensorBuffers(staged: StagedWebGPUTensorResources): WebGPUBufferLease[] {
+      const retired: WebGPUBufferLease[] = [];
+      for (const [name, lease] of this.#committedTensorLeases) {
+        if (staged.leases.get(name) !== lease) retired.push(lease);
+      }
+      this.#committedTensorLeases = new Map(staged.leases);
+      return retired;
+    }
+
+    /** A rejected generation never published its newly acquired references. */
+    rollbackTensorBuffers(staged: StagedWebGPUTensorResources): void {
+      releaseWebGPUBufferLeases(staged.acquiredLeases);
     }
 
     private uploadWeight(buffer: GPUBuffer, tensor: Tensor): void {
@@ -372,6 +479,7 @@ export class WebGPUResources {
           // Align to 4 bytes
           usage
         });
+        this.#committedTensorLeases.set(name, privateBufferLease(buffer));
         this.host.gpuBuffers.set(name, buffer);
         this.host.tensorBufferUsages.set(name, usage);
         this.host.tensorCapacityBytes.set(
@@ -388,7 +496,19 @@ export class WebGPUResources {
     }
 
     _aliasInferenceDropoutBuffers(): void {
-      aliasInferenceDropoutBuffers(this.host.graph as RuntimeGraph, this.host.gpuBuffers);
+      aliasInferenceDropoutBuffers(
+        this.host.graph as RuntimeGraph,
+        this.host.gpuBuffers,
+        (buffer) => {
+          for (const [name, lease] of this.#committedTensorLeases) {
+            if (lease.buffer !== buffer) continue;
+            lease.release();
+            this.#committedTensorLeases.delete(name);
+            return;
+          }
+          buffer.destroy?.();
+        },
+      );
       for (const node of this.host.graph.nodes) {
         if (node.opType !== 'Dropout') continue;
         const input = node.inputs.input || node.inputs.x || node.inputs.data;

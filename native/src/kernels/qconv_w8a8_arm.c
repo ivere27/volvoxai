@@ -1,5 +1,5 @@
 /*
- * Baseline ARM NEON acceleration for canonical physical W8A8 QConv2D.
+ * Baseline ARM NEON acceleration for canonical W8A8 QConv2D.
  *
  * The implementation intentionally targets only contiguous NHWC/OHWI channel
  * blocks. It keeps all geometry, group, padding, dilation, dtype, zero-point,
@@ -33,6 +33,12 @@
 #define VX_W8A8_QCONV_ARM_HAS_DOTPROD_OBJECT 0
 #endif
 
+#if defined(VOLVOXAI_ARM_I8MM_OBJECT) && defined(__aarch64__)
+#define VX_W8A8_QCONV_ARM_HAS_I8MM_OBJECT 1
+#else
+#define VX_W8A8_QCONV_ARM_HAS_I8MM_OBJECT 0
+#endif
+
 #if VX_W8A8_QCONV_ARM_NEON
 enum {
     VX_W8A8_QCONV_ARM_I8 = VX_DTYPE_I8,
@@ -62,7 +68,7 @@ static int vx_w8a8_qconv_arm_eligible(const void* input, const void* weight,
     if (!input || !weight || !weight_scales || !weight_zero_points || !output ||
         !batch || !input_height || !input_width || !input_channels ||
         !output_height || !output_width || !output_channels || !kernel_height ||
-        !kernel_width || input_per_group < 8u || !stride_y || !stride_x ||
+        !kernel_width || !input_per_group || !stride_y || !stride_x ||
         !dilation_y || !dilation_x || !groups || relu > 2u ||
         !vx_w8a8_byte_dtype(input_dtype) ||
         !vx_w8a8_byte_dtype(weight_dtype) ||
@@ -259,11 +265,131 @@ static int vx_w8a8_qconv_arm_neon(const void* input, const void* weight,
     }
     return 1;
 }
+
+/* For grayscale/RGB stems, transpose immutable OHWI weights to
+ * [tap][output-channel] once at load time. Eight output channels can then
+ * share each scalar input instead of running scalar channel dots. */
+static int vx_w8a8_qconv_arm_small_c(const void* input,
+        const int32_t* bias, const float* weight_scales,
+        const int32_t* weight_zero_points, void* output,
+        uint32_t batch, uint32_t input_height, uint32_t input_width,
+        uint32_t input_channels, uint32_t output_height, uint32_t output_width,
+        uint32_t output_channels, uint32_t kernel_height, uint32_t kernel_width,
+        uint32_t input_per_group, uint32_t stride_y, uint32_t stride_x,
+        uint32_t dilation_y, uint32_t dilation_x, uint32_t padding_top,
+        uint32_t padding_left, uint32_t groups, uint32_t relu,
+        float input_scale, int32_t input_zero_point, float output_scale,
+        int32_t output_zero_point, uint32_t input_dtype, uint32_t weight_dtype,
+        uint32_t output_dtype, const void* packed_weight) {
+    const uint8_t* packed = (const uint8_t*)packed_weight;
+    const uint32_t outputs_per_group = output_channels / groups;
+    const size_t terms = (size_t)kernel_height * kernel_width * input_per_group;
+    const int32_t output_minimum =
+        output_dtype == VX_W8A8_QCONV_ARM_I8 ? -128 : 0;
+    const int32_t output_maximum =
+        output_dtype == VX_W8A8_QCONV_ARM_I8 ? 127 : 255;
+    int32_t relu6_upper = 0;
+    if (!packed || input_per_group >= 16u || outputs_per_group % 8u) return 0;
+    if (relu >= 2u) {
+        relu6_upper = vx_w8a8_requantize(
+            6.0f / output_scale + (float)output_zero_point,
+            output_minimum, output_maximum, 0);
+    }
+    for (uint32_t b = 0; b < batch; b++) {
+        for (uint32_t oy = 0; oy < output_height; oy++) {
+            for (uint32_t ox = 0; ox < output_width; ox++) {
+                for (uint32_t group = 0; group < groups; group++) {
+                    const uint32_t group_output = group * outputs_per_group;
+                    const size_t packed_group =
+                        (size_t)group * terms * outputs_per_group;
+                    for (uint32_t oc = 0; oc < outputs_per_group; oc += 8u) {
+                        const uint32_t channel = group_output + oc;
+                        int32x4_t accum_lo = bias
+                            ? vld1q_s32(bias + channel) : vdupq_n_s32(0);
+                        int32x4_t accum_hi = bias
+                            ? vld1q_s32(bias + channel + 4u) : vdupq_n_s32(0);
+                        const int32x4_t zero_lo =
+                            vld1q_s32(weight_zero_points + channel);
+                        const int32x4_t zero_hi =
+                            vld1q_s32(weight_zero_points + channel + 4u);
+                        for (uint32_t ky = 0; ky < kernel_height; ky++) {
+                            const uint64_t py = (uint64_t)oy * stride_y +
+                                (uint64_t)ky * dilation_y;
+                            if (py < padding_top ||
+                                py - padding_top >= input_height) continue;
+                            for (uint32_t kx = 0; kx < kernel_width; kx++) {
+                                const uint64_t px = (uint64_t)ox * stride_x +
+                                    (uint64_t)kx * dilation_x;
+                                if (px < padding_left ||
+                                    px - padding_left >= input_width) continue;
+                                const size_t input_base =
+                                    (((size_t)b * input_height +
+                                    (uint32_t)(py - padding_top)) * input_width +
+                                    (uint32_t)(px - padding_left)) * input_channels +
+                                    (size_t)group * input_per_group;
+                                const size_t tap =
+                                    ((size_t)ky * kernel_width + kx) *
+                                    input_per_group;
+                                for (uint32_t ic = 0; ic < input_per_group; ic++) {
+                                    const int32_t input_value =
+                                        vx_w8a8_byte_value(input, input_dtype,
+                                            input_base + ic) - input_zero_point;
+                                    const uint8x8_t bytes = vld1_u8(packed +
+                                        packed_group + (tap + ic) *
+                                        outputs_per_group + oc);
+                                    const int16x8_t weights =
+                                        weight_dtype == VX_W8A8_QCONV_ARM_I8
+                                        ? vmovl_s8(vreinterpret_s8_u8(bytes))
+                                        : vreinterpretq_s16_u16(vmovl_u8(bytes));
+                                    accum_lo = vmlaq_n_s32(accum_lo,
+                                        vsubq_s32(vmovl_s16(vget_low_s16(weights)),
+                                            zero_lo), input_value);
+                                    accum_hi = vmlaq_n_s32(accum_hi,
+                                        vsubq_s32(vmovl_s16(vget_high_s16(weights)),
+                                            zero_hi), input_value);
+                                }
+                            }
+                        }
+                        int32_t sums[8];
+                        vst1q_s32(sums, accum_lo);
+                        vst1q_s32(sums + 4, accum_hi);
+                        for (uint32_t lane = 0; lane < 8u; lane++) {
+                            const uint32_t out_channel = channel + lane;
+                            volatile float product_scale =
+                                input_scale * weight_scales[out_channel];
+                            volatile float multiplier =
+                                product_scale / output_scale;
+                            const float transformed =
+                                vx_w8a8_transform_accumulator(sums[lane],
+                                    multiplier, output_zero_point);
+                            const int transformed_nan = transformed != transformed;
+                            int32_t quantized = vx_w8a8_requantize(transformed,
+                                output_minimum, output_maximum,
+                                output_zero_point);
+                            if (!transformed_nan && relu) {
+                                if (quantized < output_zero_point)
+                                    quantized = output_zero_point;
+                                if (relu >= 2u && quantized > relu6_upper)
+                                    quantized = relu6_upper;
+                            }
+                            const size_t output_index =
+                                (((size_t)b * output_height + oy) * output_width +
+                                ox) * output_channels + out_channel;
+                            vx_w8a8_store_byte(output, output_dtype,
+                                output_index, quantized);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    return 1;
+}
 #endif
 
 #endif /* VX_W8A8_QCONV_ARM_NEON */
 
-int vx_qconv2d_i8u8_arm_try(const void* input, const void* weight,
+int vx_qconv2d_i8u8_arm_prepacked_try(const void* input, const void* weight,
                              const int32_t* bias, const float* weight_scales,
                              const int32_t* weight_zero_points, void* output,
                              uint32_t batch, uint32_t input_height,
@@ -278,8 +404,12 @@ int vx_qconv2d_i8u8_arm_try(const void* input, const void* weight,
                              uint32_t groups, uint32_t relu, float input_scale,
                              int32_t input_zero_point, float output_scale,
                              int32_t output_zero_point, uint32_t input_dtype,
-                             uint32_t weight_dtype, uint32_t output_dtype) {
+                             uint32_t weight_dtype, uint32_t output_dtype,
+                             const void* packed_qlinear_weight,
+                             const void* small_c_packed_weight) {
 #if VX_W8A8_QCONV_ARM_NEON
+    const VxKernelPlatform* platform = vx_kernel_platform();
+    if (!platform->has_neon) return 0;
     if (!vx_w8a8_qconv_arm_eligible(input, weight, bias, weight_scales,
             weight_zero_points, output, batch, input_height, input_width,
             input_channels, output_height, output_width, output_channels,
@@ -288,6 +418,25 @@ int vx_qconv2d_i8u8_arm_try(const void* input, const void* weight,
             padding_right, groups, relu, input_scale, input_zero_point,
             output_scale, output_zero_point, input_dtype, weight_dtype,
             output_dtype)) return 0;
+#if VX_W8A8_QCONV_ARM_HAS_I8MM_OBJECT
+    if (platform->has_arm_i8mm &&
+        vx_qconv2d_i8u8_arm_i8mm_prepacked_try(input, bias, weight_scales,
+            weight_zero_points, output, batch, input_height, input_width,
+            input_channels, output_height, output_width, output_channels,
+            kernel_height, kernel_width, input_per_group, stride_y, stride_x,
+            dilation_y, dilation_x, padding_top, padding_left, groups, relu,
+            input_scale, input_zero_point, output_scale, output_zero_point,
+            input_dtype, weight_dtype, output_dtype,
+            packed_qlinear_weight)) return 1;
+#endif
+    if (vx_w8a8_qconv_arm_small_c(input, bias, weight_scales,
+            weight_zero_points, output, batch, input_height, input_width,
+            input_channels, output_height, output_width, output_channels,
+            kernel_height, kernel_width, input_per_group, stride_y, stride_x,
+            dilation_y, dilation_x, padding_top, padding_left, groups, relu,
+            input_scale, input_zero_point, output_scale, output_zero_point,
+            input_dtype, weight_dtype, output_dtype,
+            small_c_packed_weight)) return 1;
 #if VX_W8A8_QCONV_ARM_HAS_DOTPROD_OBJECT && (defined(__linux__) || defined(__ANDROID__))
     if (vx_w8a8_qconv_arm_dotprod_eligible(kernel_height, kernel_width,
             input_per_group) && vx_kernel_platform()->has_arm_dotprod &&
@@ -341,6 +490,34 @@ int vx_qconv2d_i8u8_arm_try(const void* input, const void* weight,
     (void)input_dtype;
     (void)weight_dtype;
     (void)output_dtype;
+    (void)packed_qlinear_weight;
+    (void)small_c_packed_weight;
     return 0;
 #endif
+}
+
+int vx_qconv2d_i8u8_arm_try(const void* input, const void* weight,
+                             const int32_t* bias, const float* weight_scales,
+                             const int32_t* weight_zero_points, void* output,
+                             uint32_t batch, uint32_t input_height,
+                             uint32_t input_width, uint32_t input_channels,
+                             uint32_t output_height, uint32_t output_width,
+                             uint32_t output_channels, uint32_t kernel_height,
+                             uint32_t kernel_width, uint32_t input_per_group,
+                             uint32_t stride_y, uint32_t stride_x,
+                             uint32_t dilation_y, uint32_t dilation_x,
+                             uint32_t padding_top, uint32_t padding_left,
+                             uint32_t padding_bottom, uint32_t padding_right,
+                             uint32_t groups, uint32_t relu, float input_scale,
+                             int32_t input_zero_point, float output_scale,
+                             int32_t output_zero_point, uint32_t input_dtype,
+                             uint32_t weight_dtype, uint32_t output_dtype) {
+    return vx_qconv2d_i8u8_arm_prepacked_try(input, weight, bias,
+        weight_scales, weight_zero_points, output, batch, input_height,
+        input_width, input_channels, output_height, output_width,
+        output_channels, kernel_height, kernel_width, input_per_group,
+        stride_y, stride_x, dilation_y, dilation_x, padding_top, padding_left,
+        padding_bottom, padding_right, groups, relu, input_scale,
+        input_zero_point, output_scale, output_zero_point, input_dtype,
+        weight_dtype, output_dtype, NULL, NULL);
 }

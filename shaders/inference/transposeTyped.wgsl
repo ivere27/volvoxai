@@ -25,8 +25,11 @@ fn transposed_byte(output_index : u32) -> u32 {
 }
 
 @compute @workgroup_size(64)
-fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
-  let output_word = gid.x;
+fn main(
+  @builtin(global_invocation_id) gid : vec3<u32>,
+  @builtin(num_workgroups) grid : vec3<u32>,
+) {
+  let output_word = gid.x + gid.y * (grid.x * 64u);
   let first_element = output_word * 4u;
   if (first_element >= md[0]) { return; }
   var packed = transposed_byte(first_element);

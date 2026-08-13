@@ -1,5 +1,6 @@
 import { Model } from './Model.js';
 import {
+  hasCanonicalResolvedShapePlanProvenance,
   resolveMinimumGraphShapes,
   type ResolvedShapePlan,
   type ResolvedTensorDescriptor,
@@ -10,26 +11,49 @@ import {
   createExecutionResult,
   executionIdentity,
   normalizeBackendReport,
+  registerExecutionResultCloseFinalizer,
   releaseBackendExecutionSnapshot,
+  takeExecutionResultHostOutputs,
   type BackendExecutionSnapshot,
+  type BackendHostTensorSnapshot,
   type ExecutionDecodeState,
   type ExecutionReport,
   type ExecutionRouteEvidence,
 } from './ExecutionResult.js';
 import { VolvoxAIError, runtimeError, type VolvoxAIErrorCode } from './RuntimeErrors.js';
 import {
+  BACKEND_MEMORY_SNAPSHOT_PROTOCOL,
+  normalizeMemoryCaptureOptions,
+  normalizeBackendMemorySnapshot,
+  RuntimeMemoryCaptureSession,
+  type BackendMemorySnapshot,
+  type MemoryCaptureOptions,
+  type RuntimeMemoryCaptureInput,
+  type RuntimeMemoryEvidence,
+} from './MemoryCapture.js';
+import {
   assertBackendProvider,
   assertProviderCompiledModel,
   assertProviderExecutionContext,
+  assertProviderInvariantResourceLease,
+  assertProviderPreparedBatchRoute,
+  capturedProviderInvariantResources,
   createBackendCompileInput,
   createBackendDeviceIdentity,
+  validatedProviderInvariantResources,
   type BackendProvider,
   type BackendProviderCapabilities,
   type BackendProviderCompiledModel,
   type BackendProviderExecutionContext,
+  type BackendProviderInvariantResourceLease,
+  type ValidatedProviderInvariantResources,
   type BackendResolvedAdapterSelection,
   type BackendResolvedExecutionRequest,
 } from '../backends/BackendProvider.js';
+import {
+  hasConservativeIndependentPublicBatchSemantics,
+  type IndependentBatchSemanticsEvidence,
+} from '../ops/independentBatchSemantics.js';
 import type {
   AdapterSelector,
   DecodeExecutionOptions,
@@ -40,9 +64,17 @@ import type {
 import type {
   BackendPolicyModeValue,
   DecodeRowModeValue,
+  ExecutionModeValue,
   OperatorFallbackValue,
 } from '../generated/volvoxaiEnums.js';
-import { decodeRowModes } from '../generated/volvoxaiEnums.js';
+import {
+  ExecutionMode,
+  MemoryOwnerKind,
+  MemorySnapshotPoint,
+  OperationStage,
+  decodeRowModes,
+  executionModes,
+} from '../generated/volvoxaiEnums.js';
 import {
   acquireDeviceTensorInputLease,
   deviceTensorInputLeaseMatches,
@@ -50,6 +82,25 @@ import {
   releaseDeviceTensorInputLease,
   type DeviceTensorInputLease,
 } from '../ops/deviceTensorReference.js';
+import {
+  RuntimeRequestHandle,
+  RuntimeResultBudget,
+  RuntimeScheduler,
+  abortSignalIsAborted,
+  addAbortSignalListener,
+  captureRuntimeSubmitOptions,
+  normalizeRuntimeExecutionConfiguration,
+  removeAbortSignalListener,
+  type PreparedScheduledExecution,
+  type RuntimeExecutionConfiguration,
+  type RuntimeResultBudgetLease,
+  type RuntimeRunOptions,
+  type RuntimeSubmitOptions,
+  type ScheduledCompatibilityToken,
+  type ScheduledExecutionPreflight,
+  type ScheduledExecutionRequest,
+  type ScheduledExecutionTarget,
+} from './RuntimeScheduler.js';
 
 export type BackendPolicy =
   | {
@@ -65,6 +116,10 @@ export type BackendPolicy =
 
 export interface RuntimeOptions {
   readonly onDiagnostic?: ((event: RuntimeDiagnostic) => void) | null;
+  /** Absence preserves the zero-sampling legacy report path. */
+  readonly memoryCapture?: MemoryCaptureOptions;
+  /** DIRECT is allocation-minimal; SCHEDULED allocates scheduling lazily. */
+  readonly execution?: RuntimeExecutionConfiguration;
 }
 
 export interface ModelCompileOptions {
@@ -82,6 +137,16 @@ export interface ExecutionContextOptions {
     changedInputs?: readonly string[] | null;
     rowMode?: DecodeRowModeValue;
     requireIncremental?: boolean;
+    /**
+     * Dense decode slot capacity. Defaults to one.
+     *
+     * Declared rather than inferred: a scheduler slot exists whether or not a
+     * binding happens to carry that leading extent, so a capacity read out of
+     * the first sample would make a two-slot context decode one lane and report
+     * success. Every step then carries one position per lane through
+     * `DecodeExecutionOptions.positions`.
+     */
+    lanes?: number;
   }>;
   /**
    * Global slot ids to keep resident per declared weight bank, ascending. A
@@ -125,7 +190,10 @@ export interface CompilationReport {
   readonly compileTimeMs: number;
   readonly allocationBytes: number | null;
   readonly routeEvidence: CompilationCandidateReport['routeEvidence'] | null;
+  /** Core-generated, exact-fingerprint evidence for scheduler batch safety. */
+  readonly batchSemantics: Readonly<IndependentBatchSemanticsEvidence>;
   readonly candidates: readonly CompilationCandidateReport[];
+  readonly memoryEvidence?: RuntimeMemoryEvidence;
 }
 
 export interface ExecutionFailureReport {
@@ -147,6 +215,7 @@ export interface ExecutionFailureReport {
   readonly executionTimeMs: number;
   readonly routeEvidence: ExecutionRouteEvidence;
   readonly decodeState: ExecutionDecodeState;
+  readonly memoryEvidence?: RuntimeMemoryEvidence;
 }
 
 export type RuntimeDiagnostic =
@@ -168,6 +237,127 @@ const EMPTY_ADAPTER_SELECTION = Object.freeze({
   batchSize: null,
   selectors: EMPTY_ADAPTER_SELECTORS,
 }) as Readonly<BackendResolvedAdapterSelection>;
+const DIRECT_MODE = executionModes[ExecutionMode.Direct];
+const SCHEDULED_MODE = executionModes[ExecutionMode.Scheduled];
+
+function runtimeExecutionOptions(options: RuntimeRunOptions): Readonly<ExecutionOptions> {
+  const result: {
+    adapter?: ExecutionOptions['adapter'];
+    adapters?: ExecutionOptions['adapters'];
+  } = {};
+  if (Object.prototype.hasOwnProperty.call(options, 'adapter')) result.adapter = options.adapter;
+  if (Object.prototype.hasOwnProperty.call(options, 'adapters')) result.adapters = options.adapters;
+  return Object.freeze(result);
+}
+
+function captureRuntimeRunOptions(value: RuntimeRunOptions): Readonly<RuntimeRunOptions> {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    throw new VolvoxAIError('INVALID_ARGUMENT', 'Runtime run options must be an object.', {
+      phase: 'execution',
+    });
+  }
+  try {
+    const result: {
+      mode?: RuntimeRunOptions['mode'];
+      priority?: number;
+      deadlineMonotonicMs?: number;
+      freshness?: RuntimeRunOptions['freshness'];
+      streamKey?: string | null;
+      signal?: AbortSignal | null;
+      adapter?: ExecutionOptions['adapter'];
+      adapters?: ExecutionOptions['adapters'];
+    } = {
+      mode: value.mode,
+      priority: value.priority,
+      deadlineMonotonicMs: value.deadlineMonotonicMs,
+      freshness: value.freshness,
+      streamKey: value.streamKey,
+      signal: value.signal,
+    };
+    if (Object.prototype.hasOwnProperty.call(value, 'adapter')) result.adapter = value.adapter;
+    if (Object.prototype.hasOwnProperty.call(value, 'adapters')) result.adapters = value.adapters;
+    return Object.freeze(result);
+  } catch (error) {
+    throw new VolvoxAIError('INVALID_ARGUMENT', 'Could not snapshot Runtime run options.', {
+      phase: 'execution', cause: error,
+    });
+  }
+}
+
+const RUNTIME_TYPED_ARRAY_BYTE_LENGTH = Object.getOwnPropertyDescriptor(
+  Object.getPrototypeOf(Uint8Array.prototype) as object,
+  'byteLength',
+)?.get;
+
+function runtimeTypedArrayByteLength(data: RuntimeTypedArray): number {
+  const byteLength = RUNTIME_TYPED_ARRAY_BYTE_LENGTH?.call(data) as number | undefined;
+  if (!Number.isSafeInteger(byteLength) || (byteLength as number) < 0) {
+    throw new VolvoxAIError('INVALID_ARGUMENT',
+      'Scheduled input storage has an invalid byte length.', { phase: 'execution' });
+  }
+  return byteLength as number;
+}
+
+type RuntimeHostStorageKind =
+  | 'float32'
+  | 'int32'
+  | 'int8'
+  | 'uint8'
+  | 'uint8-clamped';
+
+function runtimeHostStorageKind(data: RuntimeTypedArray): RuntimeHostStorageKind | null {
+  if (data instanceof Float32Array) return 'float32';
+  if (data instanceof Int32Array) return 'int32';
+  if (data instanceof Int8Array) return 'int8';
+  if (data instanceof Uint8ClampedArray) return 'uint8-clamped';
+  if (data instanceof Uint8Array) return 'uint8';
+  return null;
+}
+
+function assertRuntimeRunControlOptions(options: RuntimeRunOptions): void {
+  if (options.priority !== undefined &&
+      (!Number.isSafeInteger(options.priority) || options.priority < -1_000 ||
+        options.priority > 1_000)) {
+    throw new VolvoxAIError('INVALID_ARGUMENT', 'Runtime request priority is invalid.', {
+      phase: 'execution',
+    });
+  }
+  if (options.deadlineMonotonicMs !== undefined &&
+      (!Number.isFinite(options.deadlineMonotonicMs) || options.deadlineMonotonicMs < 0)) {
+    throw new VolvoxAIError('INVALID_ARGUMENT', 'Runtime request deadline is invalid.', {
+      phase: 'execution',
+    });
+  }
+  if (options.freshness !== undefined && options.freshness !== 'all' &&
+      options.freshness !== 'latest' && options.freshness !== 'drop-if-late') {
+    throw new VolvoxAIError('INVALID_ARGUMENT', 'Runtime request freshness is invalid.', {
+      phase: 'execution',
+    });
+  }
+  if (options.streamKey !== undefined && options.streamKey !== null &&
+      (typeof options.streamKey !== 'string' || options.streamKey.length === 0 ||
+        options.streamKey.length > 1024)) {
+    throw new VolvoxAIError('INVALID_ARGUMENT', 'Runtime request streamKey is invalid.', {
+      phase: 'execution',
+    });
+  }
+  if (options.freshness === 'latest' && !options.streamKey) {
+    throw new VolvoxAIError('INVALID_ARGUMENT',
+      'Runtime request freshness latest requires streamKey.', { phase: 'execution' });
+  }
+  if (options.freshness === 'drop-if-late' && options.deadlineMonotonicMs === undefined) {
+    throw new VolvoxAIError('INVALID_ARGUMENT',
+      'Runtime request freshness drop-if-late requires deadlineMonotonicMs.', {
+        phase: 'execution',
+      });
+  }
+  if (options.signal !== undefined && options.signal !== null &&
+      !(typeof AbortSignal !== 'undefined' && options.signal instanceof AbortSignal)) {
+    throw new VolvoxAIError('INVALID_ARGUMENT', 'Runtime request signal is invalid.', {
+      phase: 'execution',
+    });
+  }
+}
 
 function identity(prefix: 'compilation' | 'context'): string {
   return runtimeIdentity(prefix);
@@ -260,6 +450,8 @@ function elapsedMilliseconds(started: number): number {
   return Math.max(0, monotonicMilliseconds() - started);
 }
 
+const EXECUTE_PREPARED_SHAPE_PLAN = Symbol('executePreparedShapePlan');
+
 function routeEvidence(
   tierFallback: boolean,
   attestation: BackendProviderCapabilities['operatorFallback'] | null,
@@ -279,6 +471,8 @@ function freezeCompilationReport(
   selectedBackend: string | null,
   candidates: readonly CompilationCandidateReport[],
   compileTimeMs: number,
+  batchSemantics: Readonly<IndependentBatchSemanticsEvidence>,
+  memoryEvidence?: RuntimeMemoryEvidence,
 ): CompilationReport {
   const selected = candidates.find((candidate) => candidate.outcome === 'selected') || null;
   return Object.freeze({
@@ -295,8 +489,54 @@ function freezeCompilationReport(
     compileTimeMs,
     allocationBytes: selected?.allocationBytes ?? null,
     routeEvidence: selected?.routeEvidence || null,
+    batchSemantics,
     candidates: Object.freeze(candidates.map(freezeCandidate)),
+    ...(memoryEvidence === undefined ? {} : { memoryEvidence }),
   });
+}
+
+function captureMemoryEvidence(
+  session: RuntimeMemoryCaptureSession | null,
+  input: RuntimeMemoryCaptureInput,
+): RuntimeMemoryEvidence | undefined {
+  if (session === null) return undefined;
+  try {
+    return session.capture(input);
+  } catch {
+    // A best-effort collector must never replace a valid lifecycle outcome.
+    return undefined;
+  }
+}
+
+function captureBackendMemorySnapshot(
+  session: RuntimeMemoryCaptureSession | null,
+  context: BackendProviderExecutionContext,
+  point: MemorySnapshotPoint,
+  ownerId: string,
+  resultId?: string,
+): BackendMemorySnapshot | null {
+  if (session === null || !session.policy.includeResourceInventory ||
+      typeof context.captureMemorySnapshot !== 'function') {
+    return null;
+  }
+  try {
+    return normalizeBackendMemorySnapshot(context.captureMemorySnapshot(Object.freeze({
+      protocol: BACKEND_MEMORY_SNAPSHOT_PROTOCOL,
+      point,
+      subject: Object.freeze({
+        kind: MemoryOwnerKind.ExecutionContext,
+        ownerId,
+      }),
+      ...(resultId === undefined ? {} : {
+        result: Object.freeze({
+          kind: MemoryOwnerKind.Result,
+          ownerId: resultId,
+        }),
+      }),
+    })));
+  } catch {
+    return null;
+  }
 }
 
 function cloneSelector<T>(value: T): T {
@@ -343,10 +583,12 @@ function assertExactOptionObject(
 const CONTEXT_OPTION_NAMES = new Set([
   'adapter', 'adapterBatchDimension', 'decode', 'bankResidency',
 ]);
-const DECODE_CONTEXT_OPTION_NAMES = new Set(['changedInputs', 'rowMode', 'requireIncremental']);
+const DECODE_CONTEXT_OPTION_NAMES = new Set([
+  'changedInputs', 'rowMode', 'requireIncremental', 'lanes',
+]);
 const EXECUTION_OPTION_NAMES = new Set(['adapter', 'adapters']);
 const DECODE_EXECUTION_OPTION_NAMES = new Set([
-  'adapter', 'adapters', 'changedInputs', 'position',
+  'adapter', 'adapters', 'changedInputs', 'position', 'positions',
 ]);
 
 function cloneRuntimeData(data: ExecutionInputs[string]['data']): RuntimeTypedArray {
@@ -369,6 +611,18 @@ function assertExecutionContextOptions(options: unknown): void {
   if (decode !== undefined) {
     assertExactOptionObject(decode, DECODE_CONTEXT_OPTION_NAMES,
       'Execution context decode options');
+    /* The context's dense slot capacity, declared here because it is a property
+     * of the context and not of whichever binding happens to arrive first. The
+     * decode lifecycle verifies each binding against it instead of inferring
+     * one, which is what stops a two-slot context from quietly decoding one
+     * lane of a two-lane batch. */
+    const lanes = (decode as { lanes?: unknown }).lanes;
+    if (lanes !== undefined && (!Number.isSafeInteger(lanes) || (lanes as number) < 1)) {
+      throw new VolvoxAIError('INVALID_ARGUMENT',
+        'Execution context decode lanes must be a positive integer.', {
+          phase: 'compilation',
+        });
+    }
   }
   const residency = (options as ExecutionContextOptions).bankResidency;
   if (residency !== undefined && (residency === null || typeof residency !== 'object' ||
@@ -483,6 +737,12 @@ function executionDecodeState(
   const positiveDecodeInteger = (value: unknown): number | null =>
     Number.isSafeInteger(value) && (value as number) > 0 ? value as number : null;
   const activeSequenceLength = positiveDecodeInteger(backendDecode?.activeSequenceLength);
+  const reportedLengths = backendDecode?.activeSequenceLengths;
+  const activeSequenceLengths = Array.isArray(reportedLengths) &&
+      reportedLengths.length > 0 &&
+      reportedLengths.every((length) => Number.isSafeInteger(length) && length > 0)
+    ? Object.freeze([...reportedLengths as readonly number[]])
+    : null;
   const kvCapacity = positiveDecodeInteger(backendDecode?.kvCapacity);
   const kvCapacityClass = positiveDecodeInteger(backendDecode?.kvCapacityClass);
   const automaticResetCount = Number.isSafeInteger(backendDecode?.automaticResetCount) &&
@@ -500,6 +760,7 @@ function executionDecodeState(
     cacheGeneration,
     position: operation === 'step' ? reportPosition ?? optionPosition : null,
     activeSequenceLength,
+    activeSequenceLengths,
     kvCapacity,
     kvCapacityClass,
     semanticSeedSignature:
@@ -517,24 +778,139 @@ function executionDecodeState(
   });
 }
 
+function explicitPublicBatchContract(
+  snapshot: Model,
+  compiled: BackendProviderCompiledModel,
+): Readonly<{
+  symbol: string;
+  maximumBatchSize: number;
+}> | null {
+  if (compiled.batchContract.densePublicBatch !== 'single-invocation' ||
+      compiled.batchContract.independentBatch !== 'compiler-proved/v1') {
+    return null;
+  }
+  const symbol = snapshot.inputDescriptors[0]?.shape[0];
+  if (typeof symbol !== 'string' ||
+      snapshot.inputDescriptors.some((descriptor) => descriptor.shape[0] !== symbol) ||
+      snapshot.outputDescriptors.some((descriptor) => descriptor.shape[0] !== symbol)) {
+    return null;
+  }
+  const dimension = snapshot.graph.dimensions[symbol];
+  if (!dimension || dimension.min !== 1 || dimension.multiple_of !== 1 ||
+      !Number.isSafeInteger(dimension.max) || dimension.max < 1) {
+    return null;
+  }
+  if (!hasConservativeIndependentPublicBatchSemantics(snapshot)) return null;
+  return Object.freeze({ symbol, maximumBatchSize: dimension.max });
+}
+
+function exactPlanOutputBytes(plan: ResolvedShapePlan): number {
+  let bytes = 0;
+  for (const output of plan.outputs) {
+    if (!Number.isSafeInteger(output.sizeBytes) || output.sizeBytes < 0 ||
+        output.sizeBytes > Number.MAX_SAFE_INTEGER - bytes) {
+      throw new VolvoxAIError('OUT_OF_MEMORY',
+        'Resolved output byte count exceeds the safe integer range.', {
+          phase: 'execution',
+        });
+    }
+    bytes += output.sizeBytes;
+  }
+  return bytes;
+}
+
+function captureDirectExecutionInputs(
+  inputs: ExecutionInputs,
+  backend: string,
+): ExecutionInputs {
+  if (!inputs || typeof inputs !== 'object' || Array.isArray(inputs) ||
+      ArrayBuffer.isView(inputs)) {
+    throw new VolvoxAIError('INVALID_ARGUMENT',
+      'DIRECT execution inputs must be a named tensor-view record.', {
+        phase: 'execution', backend,
+      });
+  }
+  try {
+    if (Object.getOwnPropertySymbols(inputs).length !== 0) {
+      throw new VolvoxAIError('INVALID_ARGUMENT',
+        'DIRECT execution inputs cannot contain symbol keys.', {
+          phase: 'execution', backend,
+        });
+    }
+    const captured = Object.create(null) as Record<string, ExecutionInputs[string]>;
+    for (const name of Object.getOwnPropertyNames(inputs)) {
+      const view = inputs[name];
+      if (!view || typeof view !== 'object') {
+        throw new VolvoxAIError('INVALID_ARGUMENT',
+          `DIRECT execution input '${name}' must contain data and an array shape.`, {
+            phase: 'execution', backend,
+          });
+      }
+      const data = view.data;
+      const shape = view.shape;
+      if (!Array.isArray(shape)) {
+        throw new VolvoxAIError('INVALID_ARGUMENT',
+          `DIRECT execution input '${name}' must contain data and an array shape.`, {
+            phase: 'execution', backend,
+          });
+      }
+      // DIRECT intentionally does not copy payload bytes. Capture the data
+      // identity and a detached immutable shape once so a lazy context-create
+      // await cannot change the plan/provider metadata through object mutation.
+      captured[name] = Object.freeze({
+        data,
+        shape: Object.freeze([...shape]),
+      });
+    }
+    return Object.freeze(captured);
+  } catch (error) {
+    throw runtimeError(error, 'INVALID_ARGUMENT',
+      'Could not capture DIRECT execution input metadata.', {
+        phase: 'execution', backend,
+      });
+  }
+}
+
+function allocateRuntimeArrayLike(
+  source: RuntimeTypedArray,
+  length: number,
+): RuntimeTypedArray {
+  if (source instanceof Float32Array) return new Float32Array(length);
+  if (source instanceof Int32Array) return new Int32Array(length);
+  if (source instanceof Int8Array) return new Int8Array(length);
+  if (source instanceof Uint8ClampedArray) return new Uint8ClampedArray(length);
+  return new Uint8Array(length);
+}
+
 /** Context-aware runtime returned by `VolvoxAI.createRuntime()`. */
 export class Runtime {
   readonly #providers = new Map<string, ProviderEntry>();
   readonly #initializationFailures = new Map<string, string>();
   readonly #order: string[] = [];
   readonly #onDiagnostic: ((event: RuntimeDiagnostic) => void) | null;
+  readonly #memoryCapture: RuntimeMemoryCaptureSession | null;
+  readonly #defaultExecutionMode: ExecutionModeValue;
+  readonly #schedulerOptions: RuntimeExecutionConfiguration['scheduler'];
+  readonly #resultBudget: RuntimeResultBudget;
+  #scheduler: RuntimeScheduler | null = null;
   #state: 'open' | 'closing' | 'closed' = 'open';
   #retainedChildren = 0;
   #resolveChildDrain: (() => void) | null = null;
   #closePromise: Promise<void> | null = null;
 
-  constructor({ onDiagnostic = null }: RuntimeOptions = {}) {
+  constructor({ onDiagnostic = null, memoryCapture, execution }: RuntimeOptions = {}) {
     if (onDiagnostic != null && typeof onDiagnostic !== 'function') {
       throw new VolvoxAIError('INVALID_ARGUMENT', 'Runtime onDiagnostic must be a function or null.', {
         phase: 'initialization',
       });
     }
     this.#onDiagnostic = onDiagnostic;
+    const policy = normalizeMemoryCaptureOptions(memoryCapture);
+    this.#memoryCapture = policy === null ? null : new RuntimeMemoryCaptureSession(policy);
+    const executionConfiguration = normalizeRuntimeExecutionConfiguration(execution);
+    this.#defaultExecutionMode = executionConfiguration.mode;
+    this.#schedulerOptions = executionConfiguration.scheduler;
+    this.#resultBudget = new RuntimeResultBudget(executionConfiguration.results);
   }
 
   /** @internal Register one already-initialized context-aware provider. */
@@ -553,7 +929,10 @@ export class Runtime {
         phase: 'initialization', backend: name,
       });
     }
-    this.#providers.set(name, { name, provider });
+    this.#providers.set(name, {
+      name,
+      provider,
+    });
     if (!this.#order.includes(name)) this.#order.push(name);
   }
 
@@ -567,6 +946,138 @@ export class Runtime {
 
   listBackends(): readonly string[] {
     return Object.freeze([...this.#order]);
+  }
+
+  /** Lightweight proof that DIRECT has not allocated scheduling state. */
+  inspectExecution(): Readonly<{
+    defaultMode: ExecutionModeValue;
+    schedulerAllocated: boolean;
+    admittedRequests: number;
+    admittedInputBytes: number;
+    admittingInputBytes: number;
+    stagingInputBytes: number;
+    totalInputBytes: number;
+    inputSnapshotCopies: number;
+    retainedResults: number;
+    retainedOutputBytes: number;
+    maxRetainedResults: number;
+    maxRetainedOutputBytes: number;
+  }> {
+    return Object.freeze({
+      defaultMode: this.#defaultExecutionMode,
+      schedulerAllocated: this.#scheduler !== null,
+      admittedRequests: this.#scheduler?.requestCount ?? 0,
+      admittedInputBytes: this.#scheduler?.inputBytes ?? 0,
+      admittingInputBytes: this.#scheduler?.admittingInputBytes ?? 0,
+      stagingInputBytes: this.#scheduler?.stagingInputBytes ?? 0,
+      totalInputBytes: this.#scheduler?.totalInputBytes ?? 0,
+      inputSnapshotCopies: this.#scheduler?.inputSnapshotCopies ?? 0,
+      retainedResults: this.#resultBudget.retainedResults,
+      retainedOutputBytes: this.#resultBudget.retainedOutputBytes,
+      maxRetainedResults: this.#resultBudget.maxRetainedResults,
+      maxRetainedOutputBytes: this.#resultBudget.maxRetainedOutputBytes,
+    });
+  }
+
+  /**
+   * Execute through the selected Runtime mode.
+   *
+   * DIRECT holds no queue-owned copy and creates no RuntimeScheduler. SCHEDULED
+   * snapshots inputs at admission because execution outlives this call.
+   */
+  async run(
+    compiled: CompiledModel,
+    inputs: ExecutionInputs,
+    suppliedOptions: RuntimeRunOptions = {},
+  ): Promise<ExecutionResult> {
+    this._assertAcceptingWork();
+    this.#assertCompiledTarget(compiled);
+    const options = captureRuntimeRunOptions(suppliedOptions);
+    this._assertAcceptingWork();
+    const mode = options.mode ?? this.#defaultExecutionMode;
+    if (!executionModes.includes(mode)) {
+      throw new VolvoxAIError('INVALID_ARGUMENT', 'Runtime execution mode is invalid.', {
+        phase: 'execution', backend: compiled.backend,
+      });
+    }
+    if (this.#defaultExecutionMode === DIRECT_MODE && mode === SCHEDULED_MODE) {
+      throw new VolvoxAIError('INVALID_ARGUMENT',
+        `Runtime mode '${this.#defaultExecutionMode}' cannot be widened to '${mode}'.`, {
+          phase: 'execution', backend: compiled.backend,
+        });
+    }
+    assertRuntimeRunControlOptions(options);
+    const providerOptions = runtimeExecutionOptions(options);
+    const signal = options.signal ?? null;
+    const deadline = options.deadlineMonotonicMs;
+    const freshness = options.freshness;
+    if (mode === DIRECT_MODE) {
+      if (signal && abortSignalIsAborted(signal)) {
+        throw new VolvoxAIError('CANCELLED', 'Runtime DIRECT execution was already aborted.', {
+          phase: 'execution', backend: compiled.backend,
+        });
+      }
+      if (deadline !== undefined && deadline <= monotonicMilliseconds()) {
+        throw new VolvoxAIError('DEADLINE_EXCEEDED',
+          'Runtime DIRECT execution deadline has already elapsed.', {
+            phase: 'execution', backend: compiled.backend,
+          });
+      }
+      let aborted = false;
+      const onAbort = () => { aborted = true; };
+      if (signal) addAbortSignalListener(signal, onAbort);
+      try {
+        const result = await compiled.runDirect(inputs, providerOptions);
+        if (aborted || (freshness === 'drop-if-late' &&
+            deadline !== undefined && deadline <= monotonicMilliseconds())) {
+          await result.close().catch(() => undefined);
+          throw new VolvoxAIError(
+            aborted ? 'CANCELLED' : 'DEADLINE_EXCEEDED',
+            aborted
+              ? 'Runtime DIRECT execution was cancelled after dispatch.'
+              : 'Runtime DIRECT execution completed after its freshness deadline.', {
+              phase: 'execution', backend: compiled.backend,
+            });
+        }
+        return result;
+      } finally {
+        if (signal) {
+          try {
+            removeAbortSignalListener(signal, onAbort);
+          } catch {
+            // Listener cleanup must not replace a successful owned result or
+            // strand its Runtime retained-output reservation.
+          }
+        }
+      }
+    }
+    return this.submit(compiled, inputs, {
+      ...providerOptions,
+      priority: options.priority,
+      deadlineMonotonicMs: deadline,
+      freshness,
+      streamKey: options.streamKey,
+      signal,
+    }).result;
+  }
+
+  /** Admit stateless work into this Runtime's one lazily-created coordinator. */
+  submit(
+    compiled: CompiledModel,
+    inputs: ExecutionInputs,
+    suppliedOptions: RuntimeSubmitOptions = {},
+  ): RuntimeRequestHandle {
+    this._assertAcceptingWork();
+    this.#assertCompiledTarget(compiled);
+    const options = captureRuntimeSubmitOptions(suppliedOptions);
+    this._assertAcceptingWork();
+    if (this.#defaultExecutionMode !== SCHEDULED_MODE) {
+      throw new VolvoxAIError('INVALID_ARGUMENT',
+        'DIRECT Runtime execution uses run(); submit() requires SCHEDULED mode.', {
+          phase: 'execution', backend: compiled.backend,
+        });
+    }
+    return this.#ensureScheduler().submit(compiled, inputs, options);
   }
 
   /** Compile one exact immutable logical model revision through the provider SPI. */
@@ -583,6 +1094,7 @@ export class Runtime {
     }
     const policy = normalizePolicy(options.backend, this.#order);
     const compileInput = createBackendCompileInput(snapshot);
+    const batchSemantics = compileInput.batchSemantics;
     const releaseRuntime = this.#retainChild();
     let transferred = false;
     try {
@@ -657,12 +1169,16 @@ export class Runtime {
 
         try {
           let candidate: unknown = null;
-          let compiled: BackendProviderCompiledModel;
+          let compiled: BackendProviderCompiledModel | null = null;
+          let invariantResources: Readonly<ValidatedProviderInvariantResources> | null = null;
+          let candidateTransferred = false;
+          let selectedCandidateRecorded = false;
           try {
             candidate = await entry.provider.compile(compileInput, Object.freeze({
               operatorFallback: policy.operatorFallback,
             }));
             compiled = assertProviderCompiledModel(candidate, name, compileInput);
+            invariantResources = validatedProviderInvariantResources(compiled, name);
             if (entry.provider.capabilities.operatorFallback === 'none' &&
                 compiled.compilationEvidence?.operatorFallbackUsed === true) {
               throw new VolvoxAIError(
@@ -676,55 +1192,87 @@ export class Runtime {
                 },
               );
             }
+            const device = createBackendDeviceIdentity(
+              compiled.compilationEvidence?.device ?? entry.provider.deviceIdentity,
+            );
+            const allocationBytes = compiled.compilationEvidence?.allocationBytes ?? null;
+            candidates.push({
+              backend: name,
+              outcome: 'selected',
+              code: null,
+              message: `Backend '${name}' compiled the model.`,
+              operatorFallback: entry.provider.capabilities.operatorFallback,
+              device,
+              elapsedMs: elapsedMilliseconds(candidateStarted),
+              allocationBytes,
+              routeEvidence: routeEvidence(
+                reachedByTierFallback,
+                entry.provider.capabilities.operatorFallback,
+                entry.provider.capabilities.operatorFallback === 'none'
+                  ? false
+                  : compiled.compilationEvidence?.operatorFallbackUsed ?? null,
+                compiled.compilationEvidence?.offendingNode ?? null,
+              ),
+            });
+            selectedCandidateRecorded = true;
+            const memoryEvidence = captureMemoryEvidence(this.#memoryCapture, {
+              stage: OperationStage.Compile,
+              point: MemorySnapshotPoint.After,
+              subject: Object.freeze({
+                kind: MemoryOwnerKind.CompiledModel,
+                ownerId: compilationId,
+              }),
+              backend: name,
+              device,
+              domainAttestation: compiled.compilationEvidence.shapeDomain,
+            });
+            const report = freezeCompilationReport(
+              compilationId,
+              policy,
+              snapshot,
+              name,
+              candidates,
+              elapsedMilliseconds(compilationStarted),
+              batchSemantics,
+              memoryEvidence,
+            );
+            const result = new CompiledModel(
+              this,
+              snapshot,
+              compiled,
+              entry.provider.capabilities,
+              report,
+              this.#onDiagnostic,
+              this.#memoryCapture,
+              this.#resultBudget,
+              releaseRuntime,
+            );
+            candidateTransferred = true;
+            transferred = true;
+            this.#emit({ kind: 'compilation', report });
+            return result;
           } catch (error) {
-            const close = (candidate as Partial<BackendProviderCompiledModel> | null)?.close;
-            if (typeof close === 'function') {
-              try { await close.call(candidate); } catch { /* Preserve the contract failure. */ }
+            if (!candidateTransferred) {
+              if (selectedCandidateRecorded) candidates.pop();
+              invariantResources ??= capturedProviderInvariantResources(candidate);
+              try {
+                const close = (candidate as Partial<BackendProviderCompiledModel> | null)?.close;
+                if (typeof close === 'function') await close.call(candidate);
+              } catch {
+                // Preserve the construction failure, including when a hostile
+                // compiled close accessor throws on this cleanup read.
+              } finally {
+                if (invariantResources !== null) {
+                  try {
+                    await invariantResources.close.call(invariantResources.owner);
+                  } catch {
+                    // Preserve the failure that prevented ownership transfer.
+                  }
+                }
+              }
             }
             throw error;
           }
-          const device = createBackendDeviceIdentity(
-            compiled.compilationEvidence?.device ?? entry.provider.deviceIdentity,
-          );
-          const allocationBytes = compiled.compilationEvidence?.allocationBytes ?? null;
-          candidates.push({
-            backend: name,
-            outcome: 'selected',
-            code: null,
-            message: `Backend '${name}' compiled the model.`,
-            operatorFallback: entry.provider.capabilities.operatorFallback,
-            device,
-            elapsedMs: elapsedMilliseconds(candidateStarted),
-            allocationBytes,
-            routeEvidence: routeEvidence(
-              reachedByTierFallback,
-              entry.provider.capabilities.operatorFallback,
-              entry.provider.capabilities.operatorFallback === 'none'
-                ? false
-                : compiled.compilationEvidence?.operatorFallbackUsed ?? null,
-              compiled.compilationEvidence?.offendingNode ?? null,
-            ),
-          });
-          const report = freezeCompilationReport(
-            compilationId,
-            policy,
-            snapshot,
-            name,
-            candidates,
-            elapsedMilliseconds(compilationStarted),
-          );
-          this.#emit({ kind: 'compilation', report });
-          const result = new CompiledModel(
-            this,
-            snapshot,
-            compiled,
-            entry.provider.capabilities,
-            report,
-            this.#onDiagnostic,
-            releaseRuntime,
-          );
-          transferred = true;
-          return result;
         } catch (error) {
           const failure = runtimeError(error, 'BACKEND_UNSUPPORTED',
             `Backend '${name}' compilation failed.`, {
@@ -761,6 +1309,17 @@ export class Runtime {
         null,
         candidates,
         elapsedMilliseconds(compilationStarted),
+        batchSemantics,
+        captureMemoryEvidence(this.#memoryCapture, {
+          stage: OperationStage.Compile,
+          point: MemorySnapshotPoint.Failure,
+          subject: Object.freeze({
+            kind: MemoryOwnerKind.Model,
+            ownerId: snapshot.definitionId,
+          }),
+          backend: candidates.at(-1)?.backend ?? '',
+          device: candidates.at(-1)?.device ?? null,
+        }),
       );
       this.#emit({ kind: 'compilation', report });
       const last = candidates.at(-1);
@@ -786,6 +1345,14 @@ export class Runtime {
     if (this.#closePromise) return this.#closePromise;
     this.#state = 'closing';
     this.#closePromise = (async () => {
+      let firstError: unknown = null;
+      // The coordinator owns route contexts. It must stop admission, settle
+      // queued work and await submitted batches before child/provider teardown.
+      try {
+        await this.#scheduler?.close();
+      } catch (error) {
+        firstError = error;
+      }
       if (this.#retainedChildren > 0) {
         await new Promise<void>((resolve) => {
           this.#resolveChildDrain = resolve;
@@ -799,8 +1366,9 @@ export class Runtime {
       const failed = closures.find(
         (closure): closure is PromiseRejectedResult => closure.status === 'rejected',
       );
-      if (failed) {
-        throw runtimeError(failed.reason, 'EXECUTION_FAILED', 'Runtime provider close failed.', {
+      if (firstError === null && failed) firstError = failed.reason;
+      if (firstError !== null) {
+        throw runtimeError(firstError, 'EXECUTION_FAILED', 'Runtime close failed.', {
           phase: 'lifecycle',
         });
       }
@@ -818,6 +1386,27 @@ export class Runtime {
       throw new VolvoxAIError('HANDLE_DISPOSED', 'Runtime is closing or closed.', {
         phase: 'lifecycle',
       });
+    }
+  }
+
+  /** @internal A CompiledModel closes its persistent route before provider state. */
+  _retireScheduledTarget(target: CompiledModel): Promise<void> {
+    return this.#scheduler?.retireTarget(target) ?? target.closeScheduledExecutionRoute();
+  }
+
+  #ensureScheduler(): RuntimeScheduler {
+    if (!this.#scheduler) {
+      this.#scheduler = new RuntimeScheduler(this.#schedulerOptions, this.#resultBudget);
+    }
+    return this.#scheduler;
+  }
+
+  #assertCompiledTarget(compiled: CompiledModel): void {
+    if (!(compiled instanceof CompiledModel) || !compiled._belongsToRuntime(this)) {
+      throw new VolvoxAIError('INVALID_ARGUMENT',
+        'Runtime execution requires a CompiledModel owned by this Runtime.', {
+          phase: 'execution',
+        });
     }
   }
 
@@ -845,7 +1434,7 @@ export class Runtime {
   }
 }
 
-export class CompiledModel {
+export class CompiledModel implements ScheduledExecutionTarget {
   readonly backend: string;
   readonly report: CompilationReport;
   readonly definitionId: string;
@@ -857,9 +1446,49 @@ export class CompiledModel {
   readonly #runtime: Runtime;
   readonly #snapshot: Model;
   readonly #compiled: BackendProviderCompiledModel;
+  readonly #invariantResources: Readonly<ValidatedProviderInvariantResources>;
   readonly #capabilities: BackendProviderCapabilities;
   readonly #onDiagnostic: ((event: RuntimeDiagnostic) => void) | null;
+  readonly #memoryCapture: RuntimeMemoryCaptureSession | null;
+  readonly #resultBudget: RuntimeResultBudget;
   readonly #releaseRuntime: () => void;
+  readonly #batchAxisSymbol: string | null;
+  readonly #maximumBatchSize: number;
+  readonly #scheduledPreflightPlans = new WeakMap<object, Readonly<{
+    options: Readonly<ExecutionOptions>;
+    plan: ResolvedShapePlan;
+    inputs: readonly Readonly<{
+      name: string;
+      shape: readonly number[];
+      storageKind: RuntimeHostStorageKind;
+      byteLength: number;
+    }>[];
+    inputBytes: number;
+    outputBytes: number;
+    compatibilityToken: ScheduledCompatibilityToken;
+    resourceDomain: object;
+    deviceEpoch: object;
+  }>>();
+  readonly #scheduledPreparedPlans = new WeakMap<object, Readonly<{
+    inputs: ExecutionInputs;
+    options: Readonly<ExecutionOptions>;
+    plan: ResolvedShapePlan;
+    compatibilityToken: ScheduledCompatibilityToken;
+    resourceDomain: object;
+    deviceEpoch: object;
+    outputBytes: number;
+  }>>();
+  /*
+   * Intentional minimal context pool, default size one. The route lock leases
+   * this single mutable context across shapes; measured domain parallelism may
+   * justify a separately bounded pool later, but implicit per-shape contexts do not.
+   */
+  #scheduledContext: ExecutionContext | null = null;
+  #scheduledContextPromise: Promise<ExecutionContext> | null = null;
+  #scheduledRouteClosePromise: Promise<void> | null = null;
+  #routeBusy = false;
+  #routeWaiters: (() => void)[] | null = null;
+  #scheduledRouteClaims = 0;
   #state: 'open' | 'closing' | 'closed' = 'open';
   #retainedContexts = 0;
   #resolveContextDrain: (() => void) | null = null;
@@ -872,6 +1501,8 @@ export class CompiledModel {
     capabilities: BackendProviderCapabilities,
     report: CompilationReport,
     onDiagnostic: ((event: RuntimeDiagnostic) => void) | null,
+    memoryCapture: RuntimeMemoryCaptureSession | null,
+    resultBudget: RuntimeResultBudget,
     releaseRuntime: () => void,
   ) {
     this.backend = compiled.backendName;
@@ -883,9 +1514,609 @@ export class CompiledModel {
     this.#runtime = runtime;
     this.#snapshot = snapshot;
     this.#compiled = compiled;
+    this.#invariantResources = validatedProviderInvariantResources(
+      compiled,
+      compiled.backendName,
+    );
     this.#capabilities = capabilities;
     this.#onDiagnostic = onDiagnostic;
+    this.#memoryCapture = memoryCapture;
+    this.#resultBudget = resultBudget;
+    const batchContract = explicitPublicBatchContract(snapshot, compiled);
+    this.#batchAxisSymbol = batchContract?.symbol ?? null;
+    this.#maximumBatchSize = batchContract?.maximumBatchSize ?? 1;
     this.#releaseRuntime = releaseRuntime;
+  }
+
+  /** Execute through this model's owning Runtime without exposing a route context. */
+  run(
+    inputs: ExecutionInputs,
+    options: RuntimeRunOptions = {},
+  ): Promise<ExecutionResult> {
+    return this.#runtime.run(this, inputs, options);
+  }
+
+  /** Admit work to this model's owning Runtime coordinator. */
+  submit(
+    inputs: ExecutionInputs,
+    options: RuntimeSubmitOptions = {},
+  ): RuntimeRequestHandle {
+    return this.#runtime.submit(this, inputs, options);
+  }
+
+  /** @internal Exact Runtime identity check; display/model strings are irrelevant. */
+  _belongsToRuntime(runtime: Runtime): boolean { return this.#runtime === runtime; }
+
+  preflightScheduledExecution(
+    inputs: ExecutionInputs,
+    options: Readonly<ExecutionOptions>,
+  ): ScheduledExecutionPreflight {
+    if (this.#state !== 'open') {
+      throw new VolvoxAIError('HANDLE_DISPOSED', 'CompiledModel is closing or closed.', {
+        phase: 'lifecycle', backend: this.backend,
+      });
+    }
+    if (Object.prototype.hasOwnProperty.call(options, 'adapters') || options.adapter != null) {
+      throw new VolvoxAIError('BACKEND_UNSUPPORTED',
+        'Scheduled adapter arrays require an exact compiled adapter route contract.', {
+          phase: 'execution', backend: this.backend,
+        });
+    }
+    let plan: ResolvedShapePlan;
+    try {
+      plan = this.#snapshot.bindShapes(inputs);
+    } catch (error) {
+      throw runtimeError(error, 'INVALID_ARGUMENT',
+        'Scheduled inputs do not satisfy the logical shape contract.', {
+          phase: 'execution', backend: this.backend,
+        });
+    }
+    let inputBytes = 0;
+    const outputBytes = exactPlanOutputBytes(plan);
+    const inputMetadata: {
+      name: string;
+      shape: readonly number[];
+      storageKind: RuntimeHostStorageKind;
+      byteLength: number;
+    }[] = [];
+    for (const name of this.#snapshot.inputNames) {
+      const view = inputs[name];
+      if (!view || !ArrayBuffer.isView(view.data) || view.data instanceof DataView) {
+        throw new VolvoxAIError('BACKEND_UNSUPPORTED',
+          'Scheduled execution currently requires host inputs that can be snapshotted.', {
+            phase: 'execution', backend: this.backend,
+          });
+      }
+      const byteLength = runtimeTypedArrayByteLength(view.data as RuntimeTypedArray);
+      const storageKind = runtimeHostStorageKind(view.data as RuntimeTypedArray);
+      if (storageKind === null) {
+        throw new VolvoxAIError('BACKEND_UNSUPPORTED',
+          `Scheduled input '${name}' uses unsupported host storage.`, {
+            phase: 'execution', backend: this.backend,
+          });
+      }
+      if (byteLength > Number.MAX_SAFE_INTEGER - inputBytes) {
+        throw new VolvoxAIError('OUT_OF_MEMORY', 'Scheduled input byte count overflowed.', {
+          phase: 'execution', backend: this.backend,
+        });
+      }
+      inputBytes += byteLength;
+      inputMetadata.push(Object.freeze({
+        name,
+        shape: view.shape,
+        storageKind,
+        byteLength,
+      }));
+    }
+    let providerRoute;
+    try {
+      providerRoute = assertProviderPreparedBatchRoute(
+        this.#compiled.prepareBatchRoute(plan),
+        this.backend,
+      );
+    } catch (error) {
+      throw runtimeError(error, 'ABI_UNSUPPORTED',
+        `Backend '${this.backend}' could not prepare a scheduled batch route.`, {
+          phase: 'execution', backend: this.backend,
+        });
+    }
+    if (this.#state !== 'open') {
+      throw new VolvoxAIError('HANDLE_DISPOSED', 'CompiledModel is closing or closed.', {
+        phase: 'lifecycle', backend: this.backend,
+      });
+    }
+    if (providerRoute.deviceEpoch !== this.#invariantResources.deviceEpoch ||
+        this.#invariantResources.owner.deviceEpoch !== this.#invariantResources.deviceEpoch) {
+      throw new VolvoxAIError('ABI_UNSUPPORTED',
+        `Backend '${this.backend}' prepared a route outside its invariant resource epoch.`, {
+          phase: 'execution', backend: this.backend,
+        });
+    }
+    const preparedPlan = Object.freeze({});
+    this.#scheduledPreflightPlans.set(preparedPlan, Object.freeze({
+      options,
+      plan,
+      inputs: Object.freeze(inputMetadata),
+      inputBytes,
+      outputBytes,
+      compatibilityToken: providerRoute.compatibilityToken,
+      resourceDomain: providerRoute.resourceDomain,
+      deviceEpoch: providerRoute.deviceEpoch,
+    }));
+    return Object.freeze({
+      preparedPlan,
+      inputBytes,
+      outputBytes,
+    });
+  }
+
+  prepareScheduledExecution(
+    inputs: ExecutionInputs,
+    options: Readonly<ExecutionOptions>,
+    preflightPlan?: object,
+  ): PreparedScheduledExecution {
+    if (this.#state !== 'open') {
+      throw new VolvoxAIError('HANDLE_DISPOSED', 'CompiledModel is closing or closed.', {
+        phase: 'lifecycle', backend: this.backend,
+      });
+    }
+    const token = preflightPlan ??
+      this.preflightScheduledExecution(inputs, options).preparedPlan;
+    if (this.#state !== 'open') {
+      throw new VolvoxAIError('HANDLE_DISPOSED', 'CompiledModel is closing or closed.', {
+        phase: 'lifecycle', backend: this.backend,
+      });
+    }
+    const prepared = token && typeof token === 'object'
+      ? this.#scheduledPreflightPlans.get(token)
+      : undefined;
+    if (prepared) this.#scheduledPreflightPlans.delete(token);
+    const exactInputSet = prepared !== undefined && prepared.options === options &&
+      Object.keys(inputs).length === prepared.inputs.length &&
+      prepared.inputs.every((expected) => {
+        const view = inputs[expected.name];
+        return view !== undefined && view.shape === expected.shape &&
+          runtimeHostStorageKind(view.data as RuntimeTypedArray) === expected.storageKind &&
+          runtimeTypedArrayByteLength(view.data as RuntimeTypedArray) === expected.byteLength;
+      });
+    if (!prepared || !exactInputSet) {
+      throw new VolvoxAIError('ABI_UNSUPPORTED',
+        'Scheduled execution did not carry its exact metadata preflight capability.', {
+          phase: 'execution', backend: this.backend,
+        });
+    }
+    const requestBatch = this.#batchAxisSymbol === null
+      ? null
+      : prepared.plan.symbols[this.#batchAxisSymbol];
+    const maximumBatchSize = requestBatch === 1 ? this.#maximumBatchSize : 1;
+    // Move the same one-shot token from metadata preflight to the exact owned
+    // snapshot; no second shape resolution or provider route preparation.
+    this.#scheduledPreparedPlans.set(token, Object.freeze({
+      inputs,
+      options,
+      plan: prepared.plan,
+      compatibilityToken: prepared.compatibilityToken,
+      resourceDomain: prepared.resourceDomain,
+      deviceEpoch: prepared.deviceEpoch,
+      outputBytes: prepared.outputBytes,
+    }));
+    return Object.freeze({
+      compatibilityToken: prepared.compatibilityToken,
+      resourceDomain: prepared.resourceDomain,
+      deviceEpoch: prepared.deviceEpoch,
+      preparedPlan: token,
+      maxBatchSize: maximumBatchSize,
+      inputBytes: prepared.inputBytes,
+      outputBytes: prepared.outputBytes,
+    });
+  }
+
+  /** @internal Synchronously fence accepted scheduled work against DIRECT barging. */
+  reserveScheduledExecutionRoute(): () => void {
+    if (this.#state !== 'open') {
+      throw new VolvoxAIError('HANDLE_DISPOSED', 'CompiledModel is closing or closed.', {
+        phase: 'lifecycle', backend: this.backend,
+      });
+    }
+    this.#scheduledRouteClaims++;
+    let released = false;
+    return () => {
+      if (released) return;
+      released = true;
+      this.#scheduledRouteClaims--;
+    };
+  }
+
+  async runDirect(
+    inputs: ExecutionInputs,
+    options: Readonly<ExecutionOptions>,
+  ): Promise<ExecutionResult> {
+    const release = await this.#acquireRoute(false, false);
+    let outputBudgetLease: RuntimeResultBudgetLease | null = null;
+    let outputBudgetTransferred = false;
+    try {
+      assertExecutionOptions(options, 'execute');
+      const capturedInputs = captureDirectExecutionInputs(inputs, this.backend);
+      let plan: ResolvedShapePlan;
+      try {
+        plan = this.#snapshot.bindShapes(capturedInputs);
+      } catch (error) {
+        throw runtimeError(error, 'INVALID_ARGUMENT',
+          'DIRECT inputs do not satisfy the complete logical shape contract.', {
+            phase: 'execution', backend: this.backend,
+          });
+      }
+      if (this.#state !== 'open') {
+        throw new VolvoxAIError('HANDLE_DISPOSED', 'CompiledModel is closing or closed.', {
+          phase: 'lifecycle', backend: this.backend,
+        });
+      }
+      outputBudgetLease = this.#resultBudget.reserve(
+        exactPlanOutputBytes(plan), this.backend,
+      );
+      const context = await this.#ensureScheduledContext();
+      const result = await context[EXECUTE_PREPARED_SHAPE_PLAN](
+        capturedInputs,
+        options,
+        plan,
+        outputBudgetLease,
+      );
+      outputBudgetTransferred = true;
+      return result;
+    } finally {
+      if (!outputBudgetTransferred) outputBudgetLease?.releaseAll();
+      release();
+    }
+  }
+
+  async executeScheduledBatch(
+    requests: readonly Readonly<ScheduledExecutionRequest>[],
+  ): Promise<readonly ExecutionResult[]> {
+    if (!Array.isArray(requests) || requests.length === 0 ||
+        requests.length > this.#maximumBatchSize) {
+      throw new VolvoxAIError('INVALID_ARGUMENT',
+        'Scheduled batch size is outside the compiled route contract.', {
+          phase: 'execution', backend: this.backend,
+        });
+    }
+    const plans = this.#takeScheduledPlans(requests);
+    const release = await this.#acquireRoute(true, true);
+    try {
+      for (let index = 0; index < requests.length; index++) {
+        let currentRoute;
+        try {
+          currentRoute = assertProviderPreparedBatchRoute(
+            this.#compiled.prepareBatchRoute(plans[index]),
+            this.backend,
+          );
+        } catch (error) {
+          throw runtimeError(error, 'ABI_UNSUPPORTED',
+            `Backend '${this.backend}' could not re-attest the scheduled route.`, {
+              phase: 'execution', backend: this.backend,
+            });
+        }
+        if (currentRoute.deviceEpoch !== this.#invariantResources.deviceEpoch ||
+            this.#invariantResources.owner.deviceEpoch !== this.#invariantResources.deviceEpoch) {
+          throw new VolvoxAIError('ABI_UNSUPPORTED',
+            `Backend '${this.backend}' invalidated its invariant resource epoch before dispatch.`, {
+              phase: 'execution', backend: this.backend,
+            });
+        }
+        if (currentRoute.compatibilityToken !== requests[index].compatibilityToken ||
+            currentRoute.resourceDomain !== requests[index].resourceDomain ||
+            currentRoute.deviceEpoch !== requests[index].deviceEpoch) {
+          throw new VolvoxAIError('ABI_UNSUPPORTED',
+            `Backend '${this.backend}' changed a prepared route identity before dispatch.`, {
+              phase: 'execution', backend: this.backend,
+            });
+        }
+      }
+      const context = await this.#ensureScheduledContext();
+      if (requests.length === 1) {
+        return Object.freeze([
+          await context[EXECUTE_PREPARED_SHAPE_PLAN](
+            requests[0].inputs,
+            requests[0].options,
+            plans[0],
+          ),
+        ]);
+      }
+      if (this.#batchAxisSymbol === null) {
+        throw new VolvoxAIError('BACKEND_UNSUPPORTED',
+          'Compiled model does not declare a provable public batch axis.', {
+            phase: 'execution', backend: this.backend,
+          });
+      }
+      const batchedInputs = this.#stackScheduledInputs(requests);
+      let batchPlan: ResolvedShapePlan;
+      try {
+        batchPlan = this.#snapshot.bindShapes(batchedInputs);
+      } catch (error) {
+        throw runtimeError(error, 'INVALID_ARGUMENT',
+          'Stacked scheduled inputs do not satisfy the logical batch shape contract.', {
+            phase: 'execution', backend: this.backend,
+          });
+      }
+      let batchRoute;
+      try {
+        batchRoute = assertProviderPreparedBatchRoute(
+          this.#compiled.prepareBatchRoute(batchPlan),
+          this.backend,
+        );
+      } catch (error) {
+        throw runtimeError(error, 'ABI_UNSUPPORTED',
+          `Backend '${this.backend}' could not attest the stacked batch route.`, {
+            phase: 'execution', backend: this.backend,
+          });
+      }
+      if (batchRoute.deviceEpoch !== this.#invariantResources.deviceEpoch ||
+          this.#invariantResources.owner.deviceEpoch !== this.#invariantResources.deviceEpoch) {
+        throw new VolvoxAIError('ABI_UNSUPPORTED',
+          `Backend '${this.backend}' invalidated its invariant resource epoch before dispatch.`, {
+            phase: 'execution', backend: this.backend,
+          });
+      }
+      if (batchRoute.resourceDomain !== requests[0].resourceDomain ||
+          batchRoute.deviceEpoch !== requests[0].deviceEpoch) {
+        throw new VolvoxAIError('ABI_UNSUPPORTED',
+          `Backend '${this.backend}' changed resource domain or device epoch before dispatch.`, {
+            phase: 'execution', backend: this.backend,
+          });
+      }
+      const batchResult = await context[EXECUTE_PREPARED_SHAPE_PLAN](
+        batchedInputs,
+        requests[0].options,
+        batchPlan,
+      );
+      let laneResults: readonly ExecutionResult[];
+      try {
+        laneResults = await this.#splitScheduledResult(batchResult, requests, plans);
+      } catch (error) {
+        await batchResult.close().catch(() => undefined);
+        throw error;
+      }
+      try {
+        await batchResult.close();
+      } catch (error) {
+        // The lanes have not crossed the scheduler publication boundary yet.
+        // If retiring their shared batch owner fails, close every lane so no
+        // detached host backing survives an execution that is reported failed.
+        await Promise.allSettled(laneResults.map((result) => result.close()));
+        throw runtimeError(error, 'EXECUTION_FAILED',
+          `Backend '${this.backend}' batch-result retirement failed.`, {
+            phase: 'execution', backend: this.backend,
+          });
+      }
+      return laneResults;
+    } finally {
+      release();
+    }
+  }
+
+  closeScheduledExecutionRoute(): Promise<void> {
+    if (this.#scheduledRouteClosePromise) return this.#scheduledRouteClosePromise;
+    const pendingContext = this.#scheduledContextPromise;
+    if (!this.#scheduledContext && !pendingContext) return Promise.resolve();
+    this.#scheduledRouteClosePromise = (async () => {
+      const release = await this.#acquireRoute(true, true);
+      try {
+        try {
+          const context = this.#scheduledContext ?? await pendingContext!;
+          await context.close();
+        } finally {
+          this.#scheduledContext = null;
+          this.#scheduledContextPromise = null;
+        }
+      } finally {
+        release();
+      }
+    })();
+    return this.#scheduledRouteClosePromise;
+  }
+
+  #ensureScheduledContext(): Promise<ExecutionContext> {
+    if (this.#scheduledContext) return Promise.resolve(this.#scheduledContext);
+    if (!this.#scheduledContextPromise) {
+      this.#scheduledContextPromise = this.createContext(
+        this.#batchAxisSymbol === null
+          ? {}
+          : { adapterBatchDimension: this.#batchAxisSymbol },
+      ).then((context) => {
+        this.#scheduledContext = context;
+        return context;
+      }, (error) => {
+        this.#scheduledContextPromise = null;
+        throw error;
+      });
+    }
+    return this.#scheduledContextPromise;
+  }
+
+  #takeScheduledPlans(
+    requests: readonly Readonly<ScheduledExecutionRequest>[],
+  ): readonly ResolvedShapePlan[] {
+    const tokens = new Set<object>();
+    const plans: ResolvedShapePlan[] = [];
+    for (const request of requests) {
+      const token = request.preparedPlan;
+      const prepared = token && typeof token === 'object'
+        ? this.#scheduledPreparedPlans.get(token)
+        : undefined;
+      if (!prepared || tokens.has(token) ||
+          prepared.inputs !== request.inputs || prepared.options !== request.options ||
+          prepared.compatibilityToken !== request.compatibilityToken ||
+          prepared.resourceDomain !== request.resourceDomain ||
+          prepared.deviceEpoch !== request.deviceEpoch ||
+          prepared.outputBytes !== request.outputBytes) {
+        throw new VolvoxAIError('ABI_UNSUPPORTED',
+          'Scheduled request does not carry its exact prepared shape-plan capability.', {
+            phase: 'execution', backend: this.backend,
+          });
+      }
+      tokens.add(token);
+      plans.push(prepared.plan);
+    }
+    for (const token of tokens) this.#scheduledPreparedPlans.delete(token);
+    return Object.freeze(plans);
+  }
+
+  async #acquireRoute(wait: boolean, scheduled: boolean): Promise<() => void> {
+    if (!scheduled && this.#scheduledRouteClaims > 0) {
+      throw new VolvoxAIError('BUSY',
+        'DIRECT execution cannot barge ahead of an accepted scheduled request.', {
+          phase: 'execution', backend: this.backend,
+        });
+    }
+    if (this.#routeBusy) {
+      if (!wait) {
+        throw new VolvoxAIError('BUSY',
+          'DIRECT execution route is busy.', {
+            phase: 'execution', backend: this.backend,
+          });
+      }
+      await new Promise<void>((resolve) => (this.#routeWaiters ??= []).push(resolve));
+      // Ownership is handed directly from the releasing holder. Keeping the
+      // busy bit set prevents a DIRECT caller from barging between wake-up and
+      // this continuation.
+    } else {
+      this.#routeBusy = true;
+    }
+    let released = false;
+    return () => {
+      if (released) return;
+      released = true;
+      const next = this.#routeWaiters?.shift();
+      if (this.#routeWaiters?.length === 0) this.#routeWaiters = null;
+      if (next) next();
+      else this.#routeBusy = false;
+    };
+  }
+
+  #stackScheduledInputs(
+    requests: readonly Readonly<ScheduledExecutionRequest>[],
+  ): ExecutionInputs {
+    const stacked = Object.create(null) as Record<string, ExecutionInputs[string]>;
+    for (const name of this.#snapshot.inputNames) {
+      const first = requests[0].inputs[name];
+      if (!first || !ArrayBuffer.isView(first.data) || first.data instanceof DataView ||
+          first.shape[0] !== 1) {
+        throw new VolvoxAIError('INVALID_ARGUMENT',
+          `Scheduled input '${name}' is not a host B=1 tensor.`, {
+            phase: 'execution', backend: this.backend,
+          });
+      }
+      const source = first.data as RuntimeTypedArray;
+      const stackedLength = source.length * requests.length;
+      if (!Number.isSafeInteger(stackedLength)) {
+        throw new VolvoxAIError('OUT_OF_MEMORY',
+          `Scheduled input '${name}' exceeds the host array index range.`, {
+            phase: 'execution', backend: this.backend,
+          });
+      }
+      let data: RuntimeTypedArray;
+      try {
+        data = allocateRuntimeArrayLike(source, stackedLength);
+      } catch (error) {
+        throw new VolvoxAIError('OUT_OF_MEMORY',
+          `Scheduled input '${name}' batch storage could not be allocated.`, {
+            phase: 'execution', backend: this.backend, cause: error,
+          });
+      }
+      for (let index = 0; index < requests.length; index++) {
+        const view = requests[index].inputs[name];
+        const sameShape = view?.shape.length === first.shape.length &&
+          first.shape.every((dimension, axis) => view.shape[axis] === dimension);
+        if (!view || !ArrayBuffer.isView(view.data) || view.data instanceof DataView ||
+            view.data.constructor !== source.constructor || !sameShape ||
+            view.data.length !== source.length) {
+          throw new VolvoxAIError('INVALID_ARGUMENT',
+            `Scheduled input '${name}' is incompatible with its batch route.`, {
+              phase: 'execution', backend: this.backend,
+            });
+        }
+        data.set(view.data as RuntimeTypedArray, index * source.length);
+      }
+      stacked[name] = Object.freeze({
+        data,
+        shape: Object.freeze([requests.length, ...first.shape.slice(1)]),
+      });
+    }
+    return Object.freeze(stacked);
+  }
+
+  async #splitScheduledResult(
+    batchResult: ExecutionResult,
+    requests: readonly Readonly<ScheduledExecutionRequest>[],
+    plans: readonly ResolvedShapePlan[],
+  ): Promise<readonly ExecutionResult[]> {
+    const batchSize = requests.length;
+    // The B=N result is unpublished. Transfer its host storage directly, or
+    // perform one device readback, then give lanes views over that one backing.
+    const batchOutputs = await takeExecutionResultHostOutputs(
+      batchResult,
+      this.#snapshot.outputNames,
+    );
+    const created: ExecutionResult[] = [];
+    try {
+      for (let lane = 0; lane < batchSize; lane++) {
+        const plan = plans[lane];
+        const outputs: BackendHostTensorSnapshot[] = [];
+        for (const expected of plan.outputs) {
+          const batchTensor = batchResult.output(expected.name);
+          const data = batchOutputs.get(expected.name)!;
+          if (batchTensor.shape[0] !== batchSize || data.length % batchSize !== 0) {
+            throw new VolvoxAIError('EXECUTION_FAILED',
+              `Batched output '${expected.name}' does not expose the declared batch axis.`, {
+                phase: 'execution', backend: this.backend,
+              });
+          }
+          const laneElements = data.length / batchSize;
+          const begin = lane * laneElements;
+          const laneData = data.subarray(begin, begin + laneElements) as RuntimeTypedArray;
+          outputs.push(Object.freeze({
+            name: expected.name,
+            shape: expected.shape,
+            dtype: expected.dtype,
+            location: 'host',
+            ownership: 'transfer',
+            data: laneData,
+          }));
+        }
+        const scheduling = Object.freeze({
+          plan: 'runtime-batch',
+          batchSize,
+          lane,
+          // Every split result points at the one physical provider execution.
+          // Only the owner lane contributes to additive invocation totals.
+          dispatchId: batchResult.report.executionId,
+          dispatchOwnerLane: 0,
+          invocationAccounting: 'dispatch-owner/v1',
+          trueBackendInvocations: lane === 0 ? 1 : 0,
+        });
+        const backendReport = Object.freeze({
+          ...(batchResult.report.backendReport ?? {}),
+          scheduling,
+        });
+        const report: ExecutionReport = Object.freeze({
+          ...batchResult.report,
+          executionId: executionIdentity(),
+          shapeSignature: plan.signature,
+          adapterRevisionId: null,
+          adapterRevisionIds: EMPTY_ADAPTER_REVISION_IDS,
+          backendReport,
+        });
+        created.push(createExecutionResult(
+          this.backend,
+          Object.freeze({ outputs: Object.freeze(outputs), backendReport }),
+          report,
+          plan.outputs,
+        ));
+      }
+      return Object.freeze(created);
+    } catch (error) {
+      await Promise.allSettled(created.map((result) => result.close()));
+      throw error;
+    }
   }
 
   async createContext(options: ExecutionContextOptions = {}): Promise<ExecutionContext> {
@@ -953,6 +2184,18 @@ export class CompiledModel {
     const releaseContext = this.#retainContext();
     let candidate: unknown = null;
     let backendContext: BackendProviderExecutionContext | null = null;
+    let invariantResources: BackendProviderInvariantResourceLease | null = null;
+    let invariantResourceRelease: (() => void) | null = null;
+    let ownershipReleased = false;
+    const releaseOwnership = () => {
+      if (ownershipReleased) return;
+      ownershipReleased = true;
+      try {
+        invariantResourceRelease?.();
+      } finally {
+        releaseContext();
+      }
+    };
     try {
       const decode = options.decode;
       const initialPlan = options.bankResidency === undefined && this.#snapshot.staticShapePlan
@@ -962,7 +2205,33 @@ export class CompiledModel {
           this.#snapshot.quantizationByTensor,
           options.bankResidency,
         );
+      if (this.#compiled.invariantResources !== this.#invariantResources.owner) {
+        throw new VolvoxAIError('ABI_UNSUPPORTED',
+          `Backend '${this.backend}' changed its compiled invariant resource owner.`, {
+            phase: 'compilation', backend: this.backend,
+          });
+      }
+      const invariantOwner = this.#invariantResources.owner;
+      if (invariantOwner.deviceEpoch !== this.#invariantResources.deviceEpoch) {
+        throw new VolvoxAIError('DEVICE_LOST',
+          `Backend '${this.backend}' invalidated its compiled resource generation.`, {
+          phase: 'compilation', backend: this.backend,
+        });
+      }
+      const rawInvariantResources = this.#invariantResources.open.call(invariantOwner);
+      const rawInvariantRelease = (rawInvariantResources as
+        Partial<BackendProviderInvariantResourceLease> | null)?.release;
+      if (typeof rawInvariantRelease === 'function') {
+        invariantResourceRelease = () => rawInvariantRelease.call(rawInvariantResources);
+      }
+      invariantResources = assertProviderInvariantResourceLease(
+        rawInvariantResources,
+        invariantOwner,
+        this.backend,
+        this.#invariantResources,
+      );
       const providerOptions = Object.freeze({
+        invariantResources,
         initialPlan,
         ...(decode === undefined
           ? {}
@@ -979,6 +2248,7 @@ export class CompiledModel {
               ...(decode.requireIncremental === undefined
                 ? {}
                 : { requireIncremental: decode.requireIncremental }),
+              ...(decode.lanes === undefined ? {} : { lanes: decode.lanes }),
             }),
           }),
       });
@@ -994,7 +2264,9 @@ export class CompiledModel {
         this.report,
         options,
         this.#onDiagnostic,
-        releaseContext,
+        this.#memoryCapture,
+        this.#resultBudget,
+        releaseOwnership,
       );
     } catch (error) {
       try {
@@ -1003,8 +2275,12 @@ export class CompiledModel {
         if (typeof close === 'function') await close.call(backendContext || candidate);
       } catch {
         // Preserve the provider contract/construction failure.
-      } finally {
-        releaseContext();
+      }
+      try {
+        releaseOwnership();
+      } catch {
+        // Preserve the provider contract/construction failure even when a
+        // malformed raw invariant lease has a hostile release callback.
       }
       throw runtimeError(error, 'BACKEND_UNSUPPORTED',
         `Backend '${this.backend}' could not create an execution context.`, {
@@ -1017,15 +2293,30 @@ export class CompiledModel {
     if (this.#closePromise) return this.#closePromise;
     this.#state = 'closing';
     this.#closePromise = (async () => {
+      let firstError: unknown = null;
       try {
+        try {
+          await this.#runtime._retireScheduledTarget(this);
+        } catch (error) {
+          firstError = error;
+        }
         if (this.#retainedContexts > 0) {
           await new Promise<void>((resolve) => {
             this.#resolveContextDrain = resolve;
           });
         }
-        await this.#compiled.close();
-      } catch (error) {
-        throw runtimeError(error, 'EXECUTION_FAILED',
+        try {
+          await this.#compiled.close();
+        } catch (error) {
+          if (firstError === null) firstError = error;
+        } finally {
+          try {
+            await this.#invariantResources.close.call(this.#invariantResources.owner);
+          } catch (error) {
+            if (firstError === null) firstError = error;
+          }
+        }
+        if (firstError !== null) throw runtimeError(firstError, 'EXECUTION_FAILED',
           `Backend '${this.backend}' compiled-model close failed.`, {
             phase: 'lifecycle', backend: this.backend,
           });
@@ -1095,6 +2386,8 @@ export class ExecutionContext {
   readonly #capabilities: BackendProviderCapabilities;
   readonly #compilationReport: CompilationReport;
   readonly #onDiagnostic: ((event: RuntimeDiagnostic) => void) | null;
+  readonly #memoryCapture: RuntimeMemoryCaptureSession | null;
+  readonly #resultBudget: RuntimeResultBudget;
   readonly #releaseCompiled: () => void;
   #adapter: ExecutionContextOptions['adapter'];
   readonly #adapterBatchDimension: string | null;
@@ -1112,6 +2405,8 @@ export class ExecutionContext {
     compilationReport: CompilationReport,
     options: ExecutionContextOptions,
     onDiagnostic: ((event: RuntimeDiagnostic) => void) | null,
+    memoryCapture: RuntimeMemoryCaptureSession | null,
+    resultBudget: RuntimeResultBudget,
     releaseCompiled: () => void,
   ) {
     this.id = identity('context');
@@ -1125,6 +2420,8 @@ export class ExecutionContext {
     this.#capabilities = capabilities;
     this.#compilationReport = compilationReport;
     this.#onDiagnostic = onDiagnostic;
+    this.#memoryCapture = memoryCapture;
+    this.#resultBudget = resultBudget;
     this.#releaseCompiled = releaseCompiled;
     this.#adapter = cloneSelector(options.adapter);
     this.#adapterBatchDimension = options.adapterBatchDimension ?? null;
@@ -1145,6 +2442,42 @@ export class ExecutionContext {
     inputs: ExecutionInputs,
     options: ExecutionOptions = EMPTY_EXECUTION_OPTIONS,
   ): Promise<ExecutionResult> {
+    return this.#execute(inputs, options, null);
+  }
+
+  /** Module-private capability: only CompiledModel can name this symbol. */
+  [EXECUTE_PREPARED_SHAPE_PLAN](
+    inputs: ExecutionInputs,
+    options: Readonly<ExecutionOptions>,
+    plan: ResolvedShapePlan,
+    outputBudgetLease: RuntimeResultBudgetLease | null = null,
+  ): Promise<ExecutionResult> {
+    if (!hasCanonicalResolvedShapePlanProvenance(
+      plan,
+      this.#snapshot.graph,
+      this.#snapshot.quantizationByTensor,
+    )) {
+      outputBudgetLease?.releaseAll();
+      return Promise.reject(new VolvoxAIError('ABI_UNSUPPORTED',
+        'Prepared scheduled execution supplied a non-canonical shape plan.', {
+          phase: 'execution', backend: this.backend,
+        }));
+    }
+    const execution = this.#execute(inputs, options, plan, outputBudgetLease);
+    return outputBudgetLease === null
+      ? execution
+      : execution.catch((error) => {
+          outputBudgetLease.releaseAll();
+          throw error;
+        });
+  }
+
+  #execute(
+    inputs: ExecutionInputs,
+    options: Readonly<ExecutionOptions>,
+    preparedPlan: ResolvedShapePlan | null,
+    preReservedOutputBudgetLease: RuntimeResultBudgetLease | null = null,
+  ): Promise<ExecutionResult> {
     let deviceInputs: Readonly<Record<string, DeviceTensorInputLease>>;
     try {
       deviceInputs = this.#acquireDeviceInputs(inputs, 'execute');
@@ -1155,6 +2488,8 @@ export class ExecutionContext {
       (request) => this.#backendContext.execute(request),
       options,
       deviceInputs,
+      preparedPlan,
+      preReservedOutputBudgetLease,
     )).finally(() => {
       for (const lease of Object.values(deviceInputs)) releaseDeviceTensorInputLease(lease);
     });
@@ -1287,6 +2622,8 @@ export class ExecutionContext {
     operation: (request: BackendResolvedExecutionRequest) => Promise<BackendExecutionSnapshot>,
     options: DecodeExecutionOptions,
     deviceInputs: Readonly<Record<string, DeviceTensorInputLease>>,
+    preparedPlan: ResolvedShapePlan | null = null,
+    preReservedOutputBudgetLease: RuntimeResultBudgetLease | null = null,
   ): Promise<ExecutionResult> {
     const executionId = executionIdentity();
     const executionStarted = monotonicMilliseconds();
@@ -1296,6 +2633,8 @@ export class ExecutionContext {
     let resolvedOptions: Readonly<DecodeExecutionOptions> = EMPTY_EXECUTION_OPTIONS;
     let adapterRevisionIds: readonly (string | null)[] = EMPTY_ADAPTER_REVISION_IDS;
     let plan: ResolvedShapePlan | null = null;
+    let outputBudgetLease = preReservedOutputBudgetLease;
+    let outputBudgetTransferred = false;
     let shapeBindTimeMs: number | null = null;
     let providerTimeMs: number | null = null;
     try {
@@ -1306,6 +2645,30 @@ export class ExecutionContext {
           'Decode position must be a non-negative safe integer.', {
             phase: 'execution', backend: this.backend,
           });
+      }
+      if (options.positions !== undefined) {
+        /* Refused rather than resolved by precedence: a caller that sent both
+         * has two beliefs about how many slots this context owns, and picking
+         * one of them silently decodes a batch it did not ask for. */
+        if (options.position !== undefined) {
+          throw new VolvoxAIError('INVALID_ARGUMENT',
+            'Decode accepts a scalar position or per-lane positions, not both.', {
+              phase: 'execution', backend: this.backend,
+            });
+        }
+        /* Three spellings, and the decode lifecycle separates them against the
+         * declared lane count: a position advances the lane, `null` idles a
+         * lane that still holds its request, and `-1` parks a lane that holds
+         * none. A step where no lane advances is not a step. */
+        if (!Array.isArray(options.positions) || options.positions.length === 0 ||
+            options.positions.some((position) => position !== null &&
+              (!Number.isSafeInteger(position) || position < -1))) {
+          throw new VolvoxAIError('INVALID_ARGUMENT',
+            'Decode positions must be a non-empty array of non-negative safe integers, ' +
+            'null to idle a lane, or -1 to park one.', {
+              phase: 'execution', backend: this.backend,
+            });
+        }
       }
       const optionChangedInputs = this.#normalizeChangedInputs(options.changedInputs);
       let bindingInputs = inputs;
@@ -1331,17 +2694,37 @@ export class ExecutionContext {
             });
         }
       }
-      const shapeBindStarted = monotonicMilliseconds();
-      try {
-        plan = this.#snapshot.bindShapes(bindingInputs, this.#bankResidency);
-      } catch (error) {
+      if (preparedPlan !== null) {
+        plan = preparedPlan;
+        shapeBindTimeMs = 0;
+      } else {
+        const shapeBindStarted = monotonicMilliseconds();
+        try {
+          plan = this.#snapshot.bindShapes(bindingInputs, this.#bankResidency);
+        } catch (error) {
+          shapeBindTimeMs = elapsedMilliseconds(shapeBindStarted);
+          throw runtimeError(error, 'INVALID_ARGUMENT',
+            'Execution inputs do not satisfy the complete logical shape contract.', {
+              phase: 'execution', backend: this.backend,
+            });
+        }
         shapeBindTimeMs = elapsedMilliseconds(shapeBindStarted);
-        throw runtimeError(error, 'INVALID_ARGUMENT',
-          'Execution inputs do not satisfy the complete logical shape contract.', {
+      }
+      // Public DIRECT/context/decode paths reserve from the Runtime-wide
+      // ledger after exact shape resolution and before provider mutation.
+      // Scheduled prepared plans already carry an admission-time reservation.
+      if (outputBudgetLease !== null &&
+          outputBudgetLease.outputBytes !== exactPlanOutputBytes(plan)) {
+        throw new VolvoxAIError('ABI_UNSUPPORTED',
+          'Prepared execution result reservation does not match its exact shape plan.', {
             phase: 'execution', backend: this.backend,
           });
       }
-      shapeBindTimeMs = elapsedMilliseconds(shapeBindStarted);
+      if (preparedPlan === null && outputBudgetLease === null) {
+        outputBudgetLease = this.#resultBudget.reserve(
+          exactPlanOutputBytes(plan), this.backend,
+        );
+      }
 
       const mutableOptions: {
         -readonly [Key in keyof DecodeExecutionOptions]: DecodeExecutionOptions[Key]
@@ -1420,7 +2803,10 @@ export class ExecutionContext {
         ? EMPTY_EXECUTION_OPTIONS
         : Object.freeze(mutableOptions);
 
-      const normalizedInputRecord: Record<string, ExecutionInputs[string]> = {};
+      const normalizedInputRecord = Object.create(null) as Record<
+        string,
+        ExecutionInputs[string]
+      >;
       const mutableInputDescriptors: ResolvedTensorDescriptor[] = [];
       for (const name of this.#snapshot.inputNames) {
         const descriptor = plan.tensors[name];
@@ -1495,7 +2881,7 @@ export class ExecutionContext {
         backendReport,
       );
       const decodeState = executionDecodeState(executionOperation, resolvedOptions, backendReport);
-      const report: ExecutionReport = Object.freeze({
+      const reportBase: ExecutionReport = Object.freeze({
         executionId,
         contextId: this.id,
         backend: this.backend,
@@ -1515,11 +2901,85 @@ export class ExecutionContext {
         operatorFallback: this.#capabilities.operatorFallback,
         backendReport,
       });
-      const result = createExecutionResult(this.backend, snapshot, report, plan.outputs);
+      const result = this.#memoryCapture === null
+        ? createExecutionResult(this.backend, snapshot, reportBase, plan.outputs)
+        : createExecutionResult(
+          this.backend,
+          snapshot,
+          reportBase,
+          plan.outputs,
+          (ownedResult) => {
+            const backendMemory = captureBackendMemorySnapshot(
+              this.#memoryCapture,
+              this.#backendContext,
+              MemorySnapshotPoint.After,
+              this.id,
+              ownedResult.id,
+            );
+            const memoryEvidence = captureMemoryEvidence(this.#memoryCapture, {
+              stage: executionOperation === 'execute'
+                ? OperationStage.Execute
+                : OperationStage.Decode,
+              point: MemorySnapshotPoint.After,
+              subject: Object.freeze({
+                kind: MemoryOwnerKind.ExecutionContext,
+                ownerId: this.id,
+              }),
+              backend: this.backend,
+              device: this.#compilationReport.selectedDevice,
+              ...(backendMemory === null ? {} : {
+                resources: backendMemory.resources,
+                resourceInventory: backendMemory.resourceInventory,
+              }),
+            });
+            // reportBase already carries the elapsed time measured before this
+            // opt-in collector ran. Re-measuring here would charge sampling
+            // cost to the execution the same report is timing, so an opt-in
+            // diagnostic would silently change a published performance number.
+            return Object.freeze({
+              ...reportBase,
+              ...(memoryEvidence === undefined ? {} : { memoryEvidence }),
+            });
+          },
+        );
       snapshotTransferred = true;
+      if (outputBudgetLease !== null) {
+        try {
+          registerExecutionResultCloseFinalizer(
+            result,
+            () => outputBudgetLease!.releaseAll(),
+          );
+          outputBudgetTransferred = true;
+        } catch (error) {
+          await result.close().catch(() => undefined);
+          throw error;
+        }
+      }
+      const report = result.report;
       this.#emit({ kind: 'execution', report });
       return result;
     } catch (error) {
+      if (!outputBudgetTransferred) outputBudgetLease?.releaseAll();
+      const backendMemory = captureBackendMemorySnapshot(
+        this.#memoryCapture,
+        this.#backendContext,
+        MemorySnapshotPoint.Failure,
+        this.id,
+      );
+      const memoryEvidence = captureMemoryEvidence(this.#memoryCapture, {
+        stage: executionOperation === 'execute' ? OperationStage.Execute : OperationStage.Decode,
+        point: MemorySnapshotPoint.Failure,
+        subject: Object.freeze({
+          kind: MemoryOwnerKind.ExecutionContext,
+          ownerId: this.id,
+        }),
+        backend: this.backend,
+        device: this.#compilationReport.selectedDevice,
+        ...(backendMemory === null ? {} : {
+          resources: backendMemory.resources,
+          resourceInventory: backendMemory.resourceInventory,
+        }),
+      });
       if (snapshot && !snapshotTransferred) releaseBackendExecutionSnapshot(snapshot);
       const failure = runtimeError(error, 'EXECUTION_FAILED',
         `Backend '${this.backend}' execution failed.`, {
@@ -1549,6 +3009,7 @@ export class ExecutionContext {
           failure.node,
         ),
         decodeState: executionDecodeState(executionOperation, resolvedOptions, null),
+        ...(memoryEvidence === undefined ? {} : { memoryEvidence }),
       });
       this.#emit({ kind: 'execution-error', report: failureReport });
       throw new VolvoxAIError(failure.code, failure.message, {

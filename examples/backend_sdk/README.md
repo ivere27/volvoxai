@@ -48,6 +48,8 @@ VxBackendProvider provider = {
     .context_select_adapter = NULL,
     .context_close = example_context_close,
     .context_destroy = example_context_destroy,
+    .exact_contract_marker = VX_BACKEND_PROVIDER_EXACT_CONTRACT_MARKER,
+    .exact_contract_extent = sizeof(VxBackendProvider),
 };
 
 VxRuntimeOptions runtime_options = VX_RUNTIME_OPTIONS_INIT;
@@ -94,10 +96,6 @@ before publishing the output.
 Providers that support adapter revisions implement context_select_adapter.
 The callback receives the exact adapter identity/revision pinned by the
 context; leaving it NULL makes non-base adapter selection fail explicitly.
-
-The Android example shows where an NNAPI-backed implementation fits. Android
-15 deprecates NNAPI, so new deployments should expose QNN, LiteRT delegates,
-or another vendor runtime through the same provider seam.
 
 A production provider should:
 

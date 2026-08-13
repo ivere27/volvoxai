@@ -68,6 +68,12 @@ export type CPUShapeCapacityAllocator = (
   request: CPUShapeCapacityAllocationRequest,
 ) => RuntimeTypedArray;
 
+/** @internal Provider-issued borrow-only view of compiled invariant weights. */
+export interface CPUInvariantWeightBorrow {
+  readonly borrowedBytes: number;
+  borrow(name: string): RuntimeTypedArray;
+}
+
 export interface CPUShapeExecutionContextOptions {
   /** Maximum metadata-only dynamic plan entries. Default: 8. */
   readonly planCacheEntries?: number;
@@ -85,6 +91,8 @@ export interface CPUShapeExecutionContextOptions {
   readonly activationStorage?: 'liveness' | 'persistent';
   /** Optional context-private allocator, primarily for embedding and deterministic tests. */
   readonly capacityAllocator?: CPUShapeCapacityAllocator;
+  /** @internal Exact compiled-artifact-owned immutable weight lease. */
+  readonly invariantWeightBorrow?: CPUInvariantWeightBorrow;
 }
 
 export interface CPUShapeOutputSnapshot {
@@ -189,6 +197,8 @@ export interface CPUShapeExecutionContextInspection {
   readonly invariantWeights: Readonly<{
     readonly tensorCount: number;
     readonly sizeBytes: number;
+    /** Bytes borrowed from compiled ownership rather than context allocation. */
+    readonly sharedSizeBytes: number;
   }>;
   readonly capacities: CPUShapeCapacityInspection;
   readonly executions: CPUShapeExecutionInspection;
@@ -251,6 +261,35 @@ const DEFAULT_PLAN_CACHE_METADATA_BYTES = 16 * 1024 * 1024;
 const DEFAULT_MAX_CAPACITY_BYTES = 512 * 1024 * 1024;
 const DEFAULT_CAPACITY_GROWTH_FACTOR = 2;
 const UTF8_ENCODER = new TextEncoder();
+
+/**
+ * Invariant weight storage, shared by every context over one model revision.
+ *
+ * `docs/adr-dynamic-shape-v1.md` assigns invariant packed weights to the
+ * compiled model rather than to a context, and this is where that assignment
+ * is honoured: opening a second context over the same revision costs its
+ * activations, not another copy of the weights. Concurrency for throughput
+ * that pays for itself in weight bytes is not throughput.
+ *
+ * Sharing is safe because these buffers are never written during execution —
+ * a single context already reuses one buffer across every execution and every
+ * replan, so a kernel that wrote to a weight would already drift between two
+ * executions of one context.
+ *
+ * The WeakMap is retained only for direct low-level contexts. Production
+ * providers pass an exact compiled-artifact-owned borrow-only lease through
+ * options.
+ */
+const SHARED_INVARIANT_WEIGHTS = new WeakMap<Model, Map<string, RuntimeTypedArray>>();
+
+function sharedInvariantWeightsFor(snapshot: Model): Map<string, RuntimeTypedArray> {
+  let store = SHARED_INVARIANT_WEIGHTS.get(snapshot);
+  if (store === undefined) {
+    store = new Map<string, RuntimeTypedArray>();
+    SHARED_INVARIANT_WEIGHTS.set(snapshot, store);
+  }
+  return store;
+}
 
 function fail(
   code: CPUShapeExecutionContextErrorCode,
@@ -461,6 +500,8 @@ export class CPUShapeExecutionContext {
   readonly #maximumTensorBytes: ReadonlyMap<string, number>;
   readonly #maximumArenaBytes: ReadonlyMap<string, number>;
   readonly #maximumArenaLayout: BoundActivationLivenessLayout | null;
+  readonly #sharedInvariantWeights: Map<string, RuntimeTypedArray>;
+  readonly #compiledInvariantWeights: CPUInvariantWeightBorrow | null;
   #state: CPUShapeExecutionContextState = 'open';
   #tail: Promise<void> = Promise.resolve();
   #closePromise: Promise<void> | null = null;
@@ -469,6 +510,8 @@ export class CPUShapeExecutionContext {
   #capacities = new Map<string, CapacitySlot>();
   #invariantWeights = new Map<string, RuntimeTypedArray>();
   #invariantWeightBytes = 0;
+  /** Bytes this context took from the shared store instead of allocating. */
+  #sharedInvariantWeightBytes = 0;
   #capacityBytes = 0;
   #capacityHighWaterBytes = 0;
   #capacityGrowEvents = 0;
@@ -588,6 +631,14 @@ export class CPUShapeExecutionContext {
         shape: input.shape,
       })),
     );
+    if (options.invariantWeightBorrow !== undefined &&
+        (typeof options.invariantWeightBorrow !== 'object' ||
+         typeof options.invariantWeightBorrow.borrow !== 'function')) {
+      fail('INVALID_OPTIONS', 'options.invariantWeightBorrow',
+        'must be a compiled borrow-only invariant weight lease.');
+    }
+    this.#compiledInvariantWeights = options.invariantWeightBorrow ?? null;
+    this.#sharedInvariantWeights = sharedInvariantWeightsFor(snapshot);
   }
 
   get state(): CPUShapeExecutionContextState {
@@ -689,6 +740,11 @@ export class CPUShapeExecutionContext {
       invariantWeights: Object.freeze({
         tensorCount: this.#invariantWeights.size,
         sizeBytes: this.#invariantWeightBytes,
+        /* Of `sizeBytes`, how much this context borrowed from compiled
+         * ownership rather than allocating. Reported separately so a
+         * memory comparison can add the contexts up without counting one
+         * buffer N times. */
+        sharedSizeBytes: this.#sharedInvariantWeightBytes,
       }),
       capacities: Object.freeze({
         currentBytes: this.#capacityBytes,
@@ -793,13 +849,28 @@ export class CPUShapeExecutionContext {
       let candidateEngine = this.#engine;
       let candidateInvariantWeights: Map<string, RuntimeTypedArray> =
         this.#invariantWeights;
+      let candidateSharedWeightBytes = this.#sharedInvariantWeightBytes;
       if (!canReuseMaterialization) {
         candidateBound = null;
         candidateEngine = null;
         try {
+          const sharedWeights = this.#sharedInvariantWeights;
+          const compiledWeights = this.#compiledInvariantWeights;
+          const borrowed = new Set<string>();
           candidateBound = createBoundExecutionGraph(this.snapshot, planCandidate.plan, {
-            invariantWeightStorageFactory: (request) =>
-              this.#invariantWeights.get(request.name),
+            /* Provider contexts can only borrow compiled-owned storage. Direct
+             * low-level contexts retain the WeakMap fallback for embeddings. */
+            invariantWeightStorageFactory: (request) => {
+              if (compiledWeights !== null) {
+                borrowed.add(request.name);
+                return compiledWeights.borrow(request.name);
+              }
+              const own = this.#invariantWeights.get(request.name);
+              if (own !== undefined) return own;
+              const shared = sharedWeights.get(request.name);
+              if (shared !== undefined) borrowed.add(request.name);
+              return shared;
+            },
             activationStorageFactory: (request) => {
               const region = planCandidate.layout?.regions[request.name];
               const slotName = region === undefined
@@ -837,8 +908,17 @@ export class CPUShapeExecutionContext {
               );
             }
             stagedInvariantWeights.set(name, storage);
+            /* Publish for the next context over this revision. Setting an
+             * entry that is already this exact buffer is a no-op, which is the
+             * common case once one context has materialized. */
+            if (compiledWeights === null) sharedWeights.set(name, storage);
           }
           candidateInvariantWeights = stagedInvariantWeights;
+          candidateSharedWeightBytes = compiledWeights?.borrowedBytes ??
+            [...borrowed].reduce(
+              (total, name) => total + (stagedInvariantWeights.get(name)?.byteLength ?? 0),
+              0,
+            );
         } catch (error) {
           candidateEngine?.dispose();
           if (error instanceof CPUShapeExecutionContextError) throw error;
@@ -859,6 +939,7 @@ export class CPUShapeExecutionContext {
       this.#publishPlanCandidate(planCandidate);
       this.#capacities = capacityCandidate.slots;
       this.#invariantWeights = candidateInvariantWeights;
+      this.#sharedInvariantWeightBytes = candidateSharedWeightBytes;
       if (this.#invariantWeightBytes === 0 && candidateInvariantWeights.size !== 0) {
         this.#invariantWeightBytes = [...candidateInvariantWeights.values()].reduce(
           (total, storage) => total + storage.byteLength,
@@ -1093,7 +1174,12 @@ export class CPUShapeExecutionContext {
       beforeDispatch?.();
       rawOutputs = await engine.execute(rawInputs, executionOptions) as Record<string, unknown>;
     } catch (error) {
-      fail('EXECUTION_FAILED', 'CPU dispatch', 'failed after binding was committed.', error);
+      /* Carry the engine's own message: "failed after binding was committed"
+       * says when it broke and nothing about what, which turns every dispatch
+       * bug into a bisect. */
+      fail('EXECUTION_FAILED', 'CPU dispatch',
+        `failed after binding was committed: ${(error as Error)?.message ?? String(error)}`,
+        error);
     }
     const outputs = plan.outputs.map((descriptor) => {
       const storage = rawOutputs[descriptor.name];

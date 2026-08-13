@@ -122,13 +122,13 @@ async function measureWorker(samples, warmup, width) {
   const shapedInputs = Object.freeze({
     x: Object.freeze({ data: input, shape: Object.freeze([1, width]) }),
   });
-  const runtime = await createRuntime({ backends: ['cpu'] });
+  const runtime = await createRuntime({ backends: ['cpu-js'] });
   let compiled;
   let context;
   let retainedResult;
   try {
     compiled = await runtime.compile(snapshot, {
-      backend: { mode: 'require', backend: 'cpu', operatorFallback: 'forbid' },
+      backend: { mode: 'require', backend: 'cpu-js', operatorFallback: 'forbid' },
     });
     await collectGarbageBeforeContext();
     const contextStarted = performance.now();
@@ -141,7 +141,7 @@ async function measureWorker(samples, warmup, width) {
     const firstOutput = await retainedResult.output('y').read();
     const observedDigest = byteDigest(firstOutput);
     const shapeSignature = retainedResult.report.shapeSignature;
-    if (retainedResult.backend !== 'cpu' || typeof shapeSignature !== 'string' ||
+    if (retainedResult.backend !== 'cpu-js' || typeof shapeSignature !== 'string' ||
         shapeSignature.length === 0 || observedDigest !== expectedDigest) {
       throw new Error('public CPU cold execution returned invalid route or parity evidence');
     }
@@ -259,7 +259,7 @@ async function main() {
       version: process.version,
       platform: process.platform,
       architecture: process.arch,
-      backend: 'public-runtime/cpu-provider',
+      backend: 'public-runtime/cpu-js-provider',
     }),
     workload: Object.freeze({
       operation: 'Identity',

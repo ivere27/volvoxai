@@ -827,7 +827,7 @@ class BenchmarkProvenanceTests(unittest.TestCase):
             "Fixture GPU; packed INT8 dot: enabled\n"
         ).encode()
         stderr = (
-            "[debug] tinyreceipt split ABI=explicit-kv-v1 routing=runtime "
+            "[debug] tinyreceipt split ABI=explicit-kv-v2 routing=runtime "
             "decoder_output=f32_logits shape_mode=active argmax=host-first-index\n"
             "[debug] tinyreceipt split input_f32_sha256=" + "a" * 64 + "\n"
             "[debug] tinyreceipt split router=phone selected=phone (requested) "

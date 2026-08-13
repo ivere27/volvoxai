@@ -15,7 +15,7 @@ const RESULT_SCHEMA = 'volvoxai.tiny-receipt-split-e2e-result/v1';
 const REFERENCE_SCHEMA = 'volvoxai.tiny-receipt-split-e2e-reference/v1';
 const FIXTURE_SCHEMA = 'volvoxai.tiny-receipt-split-e2e-fixture/v1';
 const WORKLOAD_ID = 'synthetic-exact-f32-kv-v1';
-const BACKENDS = Object.freeze(['cpu', 'wasm', 'webgpu']);
+const BACKENDS = Object.freeze(['cpu-js', 'wasm', 'webgpu']);
 const FAMILY_ORDER = Object.freeze([
   'phone', 'address', 'store', 'item_row', 'item_math', 'item_lookup', 'math', 'other',
 ]);
@@ -29,7 +29,7 @@ const PAST_CACHE_NAMES = Object.freeze(
   [...Array(4).keys()].flatMap((layer) => [`past_k_${layer}`, `past_v_${layer}`]),
 );
 const IMAGE_SHA256 = '028acedd12b13cfcd706b8c364f41e82dd80fd34218e61612e31c0c9ad5474fa';
-const SOURCE_FORMAT = 'tiny_receipt_vqa_split_kv_onnx_v1';
+const SOURCE_FORMAT = 'tiny_receipt_vqa_split_kv_onnx_v2';
 
 export const TINY_RECEIPT_SPLIT_E2E_WORKLOAD = Object.freeze({
   id: WORKLOAD_ID,

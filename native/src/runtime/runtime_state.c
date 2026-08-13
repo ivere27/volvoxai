@@ -79,6 +79,10 @@ void vx_engine_state_deinit(VxEngineState* state) {
     state->bank_residency = NULL;
     state->bank_residency_count = 0;
     state->bank_residency_capacity = 0;
+    free(state->decode_stage);
+    state->decode_stage = NULL;
+    state->decode_stage_bytes = 0;
+    state->decode_lanes = 0;
     if (state->adapter_registry_state_destroy)
         state->adapter_registry_state_destroy(state->adapter_registry_state);
     state->adapter_registry_state = NULL;
@@ -95,10 +99,6 @@ void vx_engine_state_deinit(VxEngineState* state) {
         state->metal_context_state_destroy(state->metal_context_state);
     state->metal_context_state = NULL;
     state->metal_context_state_destroy = NULL;
-    if (state->nnapi_context_state_destroy)
-        state->nnapi_context_state_destroy(state->nnapi_context_state);
-    state->nnapi_context_state = NULL;
-    state->nnapi_context_state_destroy = NULL;
     if (state->cuda_context_state_destroy)
         state->cuda_context_state_destroy(state->cuda_context_state);
     state->cuda_context_state = NULL;

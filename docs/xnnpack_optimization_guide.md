@@ -194,4 +194,4 @@ void microkernel_conv2d_fp32_avx2(
 To implement this in VolvoxAI:
 1. **Create an `indirection.c` module**: To pre-calculate pointer buffers during the graph build phase (not runtime).
 2. **Create a `pack_weights.c` module**: To permute weights offline during the `export_safetensors.py` step or at graph initialization.
-3. **Rewrite `quant_cpu_opt.c`**: Strip out the generic C loops. Replace them with discrete microkernels `vx_ukernel_qconv2d_int8_sdot`, `vx_ukernel_conv2d_fp32_avx2`, etc., routed dynamically based on CPU feature detection (`CPUID` / `getauxval`).
+3. **Rewrite `quant_cpu_isa.c`**: Strip out the generic C loops. Replace them with discrete microkernels `vx_ukernel_qconv2d_int8_sdot`, `vx_ukernel_conv2d_fp32_avx2`, etc., routed dynamically based on CPU feature detection (`CPUID` / `getauxval`).

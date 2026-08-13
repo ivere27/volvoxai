@@ -97,12 +97,54 @@ The generated projections are:
 Generated files are never edited by hand. CMake, Cargo, npm type checking, and
 CI fail when tracked projections do not match the protobuf schema.
 
+`typescript/MemoryEvidenceValidation.ts` and
+`typescript/MemoryEvidenceValidatingPluginHost.ts` are handwritten
+consumer-side validation code, not generated projections. TypeScript consumers
+must construct the generated `RuntimeServiceFfi` with the validating
+`PluginHost` decorator. For each report-bearing unary response, the decorator
+rejects an over-limit raw payload before decoding, recursively validates every
+direct or nested `OperationReport`, and returns a stable byte-for-byte snapshot
+of the response. The snapshot prevents validation/use races and ensures that
+unknown protobuf wire fields are not lost by the decorator's validation decode.
+No full FFI codec or validation code is imported by a `ts/` package entry.
+
 ## Implementation boundary
 
-Handwritten Rust has two roles:
+Handwritten Rust has four roles:
 
 - `src/lib.rs` implements the generated plugin trait and owns FFI ID registries;
 - `src/abi.rs` declares only the native full-profile ABI used by that adapter.
+- `src/memory_evidence.rs` fail-closed validates typed memory evidence before
+  a successful `OperationReport` crosses the Synurang boundary.
+- `src/memory_capture.rs` validates the runtime-scoped capture policy and maps
+  the versioned native process sampler into typed envelope snapshots.
+
+Capture is disabled when `CreateRuntimeRequest.memory_capture` is absent. The
+current adapter supports one best-effort `AFTER` snapshot per successful
+reported operation. It can publish exact instant RSS and exact
+process-lifetime peak RSS when the platform sampler makes them available; each
+other requested envelope is present with `UNAVAILABLE` and no byte value.
+Periodic capture is rejected explicitly rather than silently ignored. Resource
+records and domain attestations still need backend-specific collectors, so the
+adapter emits only an empty `PARTIAL` inventory and never reinterprets legacy
+`allocated_bytes` as live, reserved, RSS, or VRAM.
+
+Capture state is leased by every descendant handle and by in-flight retained
+calls. Releasing a Runtime handle does not disable capture for a surviving
+Model, Context, Trainer, or PTQPlan and cannot race a child report. Subjects use
+canonical decimal native IDs where the native report exposes them; Trainer and
+PTQPlan use their opaque Synurang handle IDs.
+
+Native sampling uses the separate `VxProcessMemorySampleV1` read-only ABI. It
+does not extend the exact-size `VxReport`, `VxRuntimeOptions`, or provider-v1
+structures, and sampling failure cannot change native inference state. On Linux
+both resident sizes come from one `/proc/self/status` pass. That keeps the cost
+independent of how much memory is resident, unlike the smaps page-table walk,
+and it keeps the exact peak that `getrusage`'s lazily refreshed `ru_maxrss`
+cannot supply. The
+TypeScript package runtime does not enable this Synurang/native adapter; its
+separate direct-runtime collector follows the same protobuf vocabulary without
+importing the generated FFI codec into package entries.
 
 The native C lifecycle is an implementation layer, not a competing public FFI.
 Provider callback contracts are composition SPIs: deployment code supplies
@@ -110,6 +152,15 @@ provider implementations before serving application calls. A Synurang caller
 does not install executable callbacks. It selects already-composed providers
 through protobuf `BackendPolicy`, then controls their use and reads their
 reports through generated `RuntimeService` operations.
+
+The Rust adapter mirrors the current in-place native v1 `VxRuntimeOptions`
+layout exactly. Runtime creation currently selects generated protobuf
+`ExecutionMode.SCHEDULED` and the C defaults of 64 scheduled requests, 64 MiB
+of owned scheduled inputs, zero batch delay, 64 unconsumed results, and 64 MiB
+of Runtime-owned host result snapshots. The result limits are conservative
+pre-provider reservations from the compiled output maxima and shrink to the
+validated snapshot bytes; they do not claim provider workspace, device-memory,
+or KV-page accounting.
 
 ## Build
 

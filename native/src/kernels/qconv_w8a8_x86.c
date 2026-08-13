@@ -1,12 +1,12 @@
 /*
- * Native-only x86 acceleration for the canonical physical W8A8 QConv2D ABI.
+ * Native-only x86 acceleration for the canonical W8A8 QConv2D ABI.
  *
  * The portable qconv2d_i8u8() kernel remains the authoritative ABI and the
  * sole WASM implementation.  This native path only vectorizes contiguous
  * NHWC/OHWI input-channel blocks after proving that its regrouped I32 lanes
  * cannot change the portable overflow behavior.
  */
-#include "quant_cpu_opt.h"
+#include "quant_cpu_isa.h"
 #include "w8a8_affine.h"
 #include "packed_quant_gemm.h"
 #include "qconv_w8a8_arm.h"
@@ -1243,7 +1243,7 @@ static int vx_w8a8_qconv_run(const VxW8A8QConvCall *call,
 
 #endif
 
-/* Load-time prepack for the narrow-input AVX2 path.
+/* Load-time prepack for narrow-input x86 and Arm paths.
  *
  * That kernel reads eight adjacent output channels per input load, which OHWI
  * cannot serve contiguously. The transpose used to run inside every call and be
@@ -1254,7 +1254,7 @@ static int vx_w8a8_qconv_run(const VxW8A8QConvCall *call,
 size_t vx_w8a8_qconv_small_c_pack_size(uint32_t kernel_height,
         uint32_t kernel_width, uint32_t input_per_group,
         uint32_t output_channels, uint32_t groups) {
-#if VX_W8A8_QCONV_X86_AVX2
+#if VX_W8A8_QCONV_X86_AVX2 || defined(__aarch64__) || defined(__ARM_NEON)
     if (!groups || !output_channels || output_channels % groups) return 0u;
     if (!kernel_height || !kernel_width || !input_per_group) return 0u;
     if (input_per_group >= 16u || (output_channels / groups) % 8u) return 0u;
@@ -1270,13 +1270,25 @@ size_t vx_w8a8_qconv_small_c_pack_size(uint32_t kernel_height,
 int vx_w8a8_qconv_pack_small_c(void *packed, size_t bytes, const void *weight,
         uint32_t kernel_height, uint32_t kernel_width, uint32_t input_per_group,
         uint32_t output_channels, uint32_t groups) {
-#if VX_W8A8_QCONV_X86_AVX2
+#if VX_W8A8_QCONV_X86_AVX2 || defined(__aarch64__) || defined(__ARM_NEON)
     const size_t needed = vx_w8a8_qconv_small_c_pack_size(kernel_height,
         kernel_width, input_per_group, output_channels, groups);
     if (!packed || !weight || !needed || bytes != needed) return 0;
-    vx_w8a8_qconv_pack_small_c_into((unsigned char *)packed,
-        (const unsigned char *)weight, kernel_height, kernel_width,
-        input_per_group, output_channels, groups);
+    const size_t terms = (size_t)kernel_height * kernel_width * input_per_group;
+    const uint32_t outputs_per_group = output_channels / groups;
+    for (uint32_t group = 0; group < groups; group++) {
+        const size_t source_group =
+            (size_t)group * outputs_per_group * terms;
+        const size_t packed_group =
+            (size_t)group * terms * outputs_per_group;
+        for (size_t term = 0; term < terms; term++)
+            for (uint32_t output_local = 0;
+                    output_local < outputs_per_group; output_local++)
+                ((unsigned char*)packed)[packed_group +
+                    term * outputs_per_group + output_local] =
+                    ((const unsigned char*)weight)[source_group +
+                    (size_t)output_local * terms + term];
+    }
     return 1;
 #else
     (void)packed; (void)bytes; (void)weight; (void)kernel_height;
@@ -1300,14 +1312,15 @@ int vx_qconv2d_i8u8_native_prepacked(const void *input, const void *weight,
         uint32_t input_dtype, uint32_t weight_dtype, uint32_t output_dtype,
         const void *packed_qlinear_weight, const void *small_c_packed_weight) {
 #if defined(__aarch64__) || defined(__arm__)
-    if (vx_qconv2d_i8u8_arm_try(input, weight, bias, weight_scales,
+    if (vx_qconv2d_i8u8_arm_prepacked_try(input, weight, bias, weight_scales,
             weight_zero_points, output, batch, input_height, input_width,
             input_channels, output_height, output_width, output_channels,
             kernel_height, kernel_width, input_per_group, stride_y, stride_x,
             dilation_y, dilation_x, padding_top, padding_left, padding_bottom,
             padding_right, groups, relu, input_scale, input_zero_point,
             output_scale, output_zero_point, input_dtype, weight_dtype,
-            output_dtype)) return 1;
+            output_dtype, packed_qlinear_weight,
+            small_c_packed_weight)) return 1;
 #endif
 #if VX_W8A8_QCONV_X86_AVX2
     VxW8A8QConvCall call = {

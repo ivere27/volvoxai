@@ -13,7 +13,7 @@ struct Params {
   zero_point_type : u32,
   output_type : u32,
   has_zero_point : u32,
-  _pad0 : u32,
+  dispatch_stride : u32,
   _pad1 : u32,
 }
 @group(0) @binding(4) var<uniform> params : Params;
@@ -168,7 +168,7 @@ fn dequantize_one(index : u32) -> u32 {
 
 @compute @workgroup_size(64)
 fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
-  let output_word = gid.x;
+  let output_word = gid.x + gid.y * params.dispatch_stride;
   if (params.output_type == 18u || params.output_type == 16u) {
     if (output_word >= params.size) { return; }
     output_words[output_word] = dequantize_one(output_word);

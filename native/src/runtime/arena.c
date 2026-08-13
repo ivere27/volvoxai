@@ -9,7 +9,7 @@
 
 // ---- Activation arena: reuse physical buffers across non-overlapping lifetimes ----
 // Similar to planned tensor arenas in optimized inference runtimes. Transient F32 and
-// physical I8/U8 activations are pooled: owned (calloc'd by us -> NOT weights, which
+// I8/U8 activations are pooled: owned (calloc'd by us -> NOT weights, which
 // point into the blob), with a non-skipped producer node (excludes graph
 // inputs/constants), at least one consumer (excludes dead tensors), not declared as a
 // graph output, and not aliased by another tensor (excludes Reshape/Flatten
@@ -1304,7 +1304,7 @@ done:
 static void plan_memory_arena(void) {
     const char* en = getenv("VOLVOX_ARENA");
     if (en && en[0] && !strcmp(en, "0")) return;   // default-on; VOLVOX_ARENA=0 disables
-    if (g_use_vulkan || g_use_opengl || g_use_metal || g_use_nnapi
+    if (g_use_vulkan || g_use_opengl || g_use_metal
 #if VOLVOXAI_ENABLE_CUDA
         || g_use_cuda
 #endif

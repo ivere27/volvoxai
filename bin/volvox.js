@@ -27,7 +27,7 @@ program
   .command('run')
   .description('Run inference with a given model and input')
   .requiredOption('-m, --model <path>', 'Path to the safetensors model file')
-  .option('-b, --backend <type>', 'Backend to use (wasm, cpu)', 'wasm')
+  .option('-b, --backend <type>', 'Backend to use (wasm, cpu-js)', 'wasm')
   .action(async (options) => {
     let runtime = null;
     let compiled = null;
@@ -81,7 +81,7 @@ program
   .action(async () => {
     console.log('Volvox AI Engine CLI');
     console.log('Node.js:', process.version);
-    console.log('Available backends: wasm, cpu');
+    console.log('Available backends: wasm, cpu-js');
   });
 
 await program.parseAsync();

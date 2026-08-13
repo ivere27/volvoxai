@@ -28,6 +28,111 @@ static int probe_equal(const VkContextStateProbe* left,
         left->is_training == right->is_training;
 }
 
+static int test_arena_size_configuration(void) {
+    const size_t mib = (size_t)1024u * 1024u;
+    const size_t maximum_mib = SIZE_MAX / mib;
+    char maximum_text[64];
+    char overflow_text[65];
+    size_t bytes = 0u;
+    int length;
+
+    CHECK(vk_test_parse_arena_mebibytes("130", 256u, &bytes) == 0 &&
+          bytes == (size_t)130u * mib);
+    if (maximum_mib >= (size_t)6144u) {
+        CHECK(vk_test_parse_arena_mebibytes("4096", 256u, &bytes) == 0 &&
+              bytes == (size_t)4096u * mib);
+        CHECK(vk_test_parse_arena_mebibytes("4097", 256u, &bytes) == 0 &&
+              bytes == (size_t)4097u * mib);
+        CHECK(vk_test_parse_arena_mebibytes("6144", 256u, &bytes) == 0 &&
+              bytes == (size_t)6144u * mib);
+    } else {
+        CHECK(vk_test_parse_arena_mebibytes("4096", 256u, &bytes) == -1);
+        CHECK(vk_test_parse_arena_mebibytes("4097", 256u, &bytes) == -1);
+        CHECK(vk_test_parse_arena_mebibytes("6144", 256u, &bytes) == -1);
+    }
+
+    length = snprintf(maximum_text, sizeof(maximum_text), "%zu", maximum_mib);
+    CHECK(length > 0 && (size_t)length < sizeof(maximum_text));
+    CHECK(vk_test_parse_arena_mebibytes(
+              maximum_text, 256u, &bytes) == 0 &&
+          bytes == maximum_mib * mib);
+    CHECK((size_t)length + 1u < sizeof(overflow_text));
+    memcpy(overflow_text, maximum_text, (size_t)length);
+    overflow_text[length] = '0';
+    overflow_text[length + 1] = '\0';
+
+    CHECK(vk_test_parse_arena_mebibytes("129", 256u, &bytes) == -1);
+    CHECK(vk_test_parse_arena_mebibytes("", 256u, &bytes) == -1);
+    CHECK(vk_test_parse_arena_mebibytes(NULL, 256u, &bytes) == -1);
+    CHECK(vk_test_parse_arena_mebibytes(" 6144", 256u, &bytes) == -1);
+    CHECK(vk_test_parse_arena_mebibytes("+6144", 256u, &bytes) == -1);
+    CHECK(vk_test_parse_arena_mebibytes("-6144", 256u, &bytes) == -1);
+    CHECK(vk_test_parse_arena_mebibytes("6144MiB", 256u, &bytes) == -1);
+    CHECK(vk_test_parse_arena_mebibytes(overflow_text, 256u, &bytes) == -1);
+    CHECK(vk_test_parse_arena_mebibytes("6144", 0u, &bytes) == -1);
+    CHECK(vk_test_parse_arena_mebibytes("6144", 256u, NULL) == -1);
+    return 0;
+}
+
+static int test_device_local_staging_path(void) {
+    VkMemoryPlacementProbe before = {0};
+    VkMemoryPlacementProbe after = {0};
+    char telemetry[512] = {0};
+    unsigned char* input = NULL;
+    unsigned char* guarded_output = NULL;
+    size_t bytes;
+    size_t range_offset = 0u;
+    size_t range_bytes = 0u;
+    size_t range_end;
+    CHECK(vk_test_memory_placement_read(&before) == 0 &&
+          before.compute_device_local && before.arena_bytes > 0u &&
+          before.arena_allocation_bytes >= before.arena_bytes &&
+          before.staging_host_visible &&
+          before.staging_bytes == (uint64_t)32u * 1024u * 1024u &&
+          before.staging_allocation_bytes >= before.staging_bytes &&
+          before.noncoherent_atom_bytes > 0u &&
+          before.staging_bytes <= SIZE_MAX - 5u);
+    bytes = (size_t)before.staging_bytes + 5u;
+    CHECK(bytes <= SIZE_MAX - 2u);
+    input = (unsigned char*)malloc(bytes);
+    guarded_output = (unsigned char*)malloc(bytes + 2u);
+    CHECK(input && guarded_output);
+    for (size_t index = 0u; index < bytes; index++)
+        input[index] = (unsigned char)(index * 131u + 17u);
+    memset(guarded_output, 0xa5, bytes + 2u);
+    vk_graph_begin_forward();
+    CHECK(vk_test_staging_round_trip(
+              input, guarded_output + 1u, bytes) == 0);
+    CHECK(guarded_output[0] == 0xa5 &&
+          guarded_output[bytes + 1u] == 0xa5 &&
+          memcmp(input, guarded_output + 1u, bytes) == 0);
+    CHECK(vk_test_memory_placement_read(&after) == 0 &&
+          after.upload_count == 1u && after.upload_bytes == bytes &&
+          after.download_count == 1u && after.download_bytes == bytes &&
+          after.submit_count >= 3u);
+    CHECK(vk_test_staging_mapped_range(
+              (size_t)after.staging_bytes - 3u, 3u,
+              &range_offset, &range_bytes) == 0 &&
+          range_offset <= (size_t)after.staging_bytes - 3u &&
+          range_offset % (size_t)after.noncoherent_atom_bytes == 0u &&
+          range_offset <= SIZE_MAX - range_bytes);
+    range_end = range_offset + range_bytes;
+    CHECK(range_end >= (size_t)after.staging_bytes &&
+          range_end <= (size_t)after.staging_allocation_bytes &&
+          (range_bytes % (size_t)after.noncoherent_atom_bytes == 0u ||
+           range_end == (size_t)after.staging_allocation_bytes));
+    CHECK(vk_graph_execution_evidence(
+              telemetry, sizeof(telemetry)) == 0 &&
+          strstr(telemetry, ";vk_mem=device-local;") &&
+          strstr(telemetry, ";vk_stage=33554432;") &&
+          strstr(telemetry, ";vk_up=1;") &&
+          strstr(telemetry, ";vk_down=1"));
+    free(guarded_output);
+    free(input);
+    vk_graph_reset();
+    return 0;
+}
+
 static int test_context_capsule_isolation(void) {
     VxEngineState* first = (VxEngineState*)calloc(1, sizeof(*first));
     VxEngineState* second = (VxEngineState*)calloc(1, sizeof(*second));
@@ -74,6 +179,8 @@ static int test_physical_context_isolation(VxEngineState* first) {
     VkContextStateProbe first_after = {0};
     VkContextStateProbe first_observed = {0};
     VkContextStateProbe second_before = {0};
+    VkPipelineCacheProbe first_pipeline = {0};
+    VkPipelineCacheProbe second_pipeline = {0};
     float first_input[2] = {2.0f, -3.0f};
     float first_output[2] = {0.0f, 0.0f};
     float second_input[2] = {7.0f, 11.0f};
@@ -85,6 +192,9 @@ static int test_physical_context_isolation(VxEngineState* first) {
     if (!vk_graph_copy_f32(first_input, first_output, 2) ||
         vk_graph_end_forward() != 0 ||
         vk_test_context_state_read(&first_after) != 0 ||
+        vk_test_pipeline_cache_read(&first_pipeline) != 0 ||
+        first_pipeline.prepared_kernel_count == 0u ||
+        first_pipeline.prepared_pipeline_creates == 0u ||
         vk_training_begin() != 0) goto fail;
 
     second_scope = vx_engine_state_scope_enter(second);
@@ -101,6 +211,12 @@ static int test_physical_context_isolation(VxEngineState* first) {
     vk_graph_begin_forward();
     if (!vk_graph_copy_f32(second_input, second_output, 2) ||
         vk_graph_end_forward() != 0 ||
+        vk_test_pipeline_cache_read(&second_pipeline) != 0 ||
+        second_pipeline.prepared_kernel_count == 0u ||
+        second_pipeline.prepared_pipeline_creates <=
+            first_pipeline.prepared_pipeline_creates ||
+        second_pipeline.pipeline_cache_available !=
+            first_pipeline.pipeline_cache_available ||
         !vk_graph_sync_host(second_output, sizeof(second_output), 0) ||
         !close_enough(second_output[0], second_input[0]) ||
         !close_enough(second_output[1], second_input[1])) {
@@ -377,6 +493,48 @@ static int test_tiled_qlinear_i8u8_tails(void) {
                                 ROWS, D_IN, D_OUT, 1.0f, 0, 1.0f, 0,
                                 VX_DTYPE_I8, VX_DTYPE_I8,
                                 VX_DTYPE_I8) == 1);
+    CHECK(vk_graph_end_forward() == 0);
+    CHECK(vk_graph_sync_host(output, sizeof(output), 0) == 1);
+    CHECK(memcmp(output, expected, sizeof(output)) == 0);
+    vk_graph_reset();
+    return 0;
+}
+
+static int test_scalar_qlinear_i8u8_fused_word(void) {
+    enum { ROWS = 1, D_IN = 12, D_OUT = 6 };
+    uint8_t input[D_IN];
+    int8_t weight[D_OUT * D_IN];
+    float scales[D_OUT];
+    int32_t zero_points[D_OUT];
+    int32_t bias[D_OUT];
+    uint8_t output[D_OUT];
+    uint8_t expected[D_OUT];
+    const int32_t input_zero_point = 127;
+    const int32_t output_zero_point = 119;
+    for (int k = 0; k < D_IN; k++) input[k] = (uint8_t)(123 + (k * 7) % 11);
+    for (int column = 0; column < D_OUT; column++) {
+        scales[column] = 1.0f;
+        zero_points[column] = column - 3;
+        bias[column] = column * 5 - 9;
+        for (int k = 0; k < D_IN; k++)
+            weight[column * D_IN + k] =
+                (int8_t)(zero_points[column] + (k * 3 + column) % 7 - 3);
+        int accumulator = bias[column];
+        for (int k = 0; k < D_IN; k++)
+            accumulator += ((int)input[k] - input_zero_point) *
+                ((int)weight[column * D_IN + k] - zero_points[column]);
+        int quantized = accumulator + output_zero_point;
+        if (quantized < 0) quantized = 0;
+        if (quantized > 255) quantized = 255;
+        expected[column] = (uint8_t)quantized;
+    }
+    memset(output, 0, sizeof(output));
+    vk_graph_reset();
+    vk_graph_begin_forward();
+    CHECK(vk_graph_qlinear_i8u8(
+        input, weight, scales, zero_points, bias, output,
+        ROWS, D_IN, D_OUT, 1.0f, input_zero_point, 1.0f,
+        output_zero_point, VX_DTYPE_U8, VX_DTYPE_I8, VX_DTYPE_U8) == 1);
     CHECK(vk_graph_end_forward() == 0);
     CHECK(vk_graph_sync_host(output, sizeof(output), 0) == 1);
     CHECK(memcmp(output, expected, sizeof(output)) == 0);
@@ -674,6 +832,71 @@ static int test_qlinear_i8u8_packed_chain(void) {
     CHECK(vk_graph_sync_host(output, sizeof(output), 0) == 1);
     CHECK(hidden[0] == 125u && hidden[1] == 134u);
     CHECK(output[0] == -12);
+    vk_graph_reset();
+    return 0;
+}
+
+/* The portable qLinear shader fuses the first four channels of each packed
+ * word. D_OUT=5 makes the second word cross a row and use qlinear_one, while
+ * K=5 exercises the non-word-aligned reduction with asymmetric U8/I8
+ * zero-points. Disable optional dot kernels so both paths are deterministic. */
+static int test_qlinear_i8u8_scalar_fused_tail(void) {
+    enum { ROWS = 2, D_IN = 5, D_OUT = 5 };
+    const int32_t input_zero_point = 131;
+    const int32_t output_zero_point = -9;
+    uint8_t input[ROWS * D_IN];
+    int8_t weight[D_OUT * D_IN];
+    float scales[D_OUT];
+    int32_t zero_points[D_OUT];
+    int32_t bias[D_OUT];
+    int8_t output[ROWS * D_OUT];
+    int8_t expected[ROWS * D_OUT];
+    char telemetry[128] = {0};
+
+    for (int index = 0; index < ROWS * D_IN; index++)
+        input[index] = (uint8_t)(input_zero_point + (index * 3) % 7 - 3);
+    for (int channel = 0; channel < D_OUT; channel++) {
+        scales[channel] = 1.0f;
+        zero_points[channel] = -5 + channel;
+        bias[channel] = channel - 2;
+        for (int k = 0; k < D_IN; k++)
+            weight[channel * D_IN + k] = (int8_t)(
+                zero_points[channel] + (channel * 2 + k * 3) % 7 - 3);
+    }
+    for (int row = 0; row < ROWS; row++) {
+        for (int channel = 0; channel < D_OUT; channel++) {
+            int32_t accumulator = bias[channel];
+            for (int k = 0; k < D_IN; k++) {
+                accumulator +=
+                    ((int32_t)input[row * D_IN + k] - input_zero_point) *
+                    ((int32_t)weight[channel * D_IN + k] -
+                     zero_points[channel]);
+            }
+            accumulator += output_zero_point;
+            if (accumulator < -128) accumulator = -128;
+            if (accumulator > 127) accumulator = 127;
+            expected[row * D_OUT + channel] = (int8_t)accumulator;
+        }
+    }
+
+    vk_graph_reset();
+    const int previous_dot_disabled = vk_test_set_packed_dot_disabled(1);
+    CHECK(previous_dot_disabled >= 0);
+    vk_graph_begin_forward();
+    CHECK(vk_graph_qlinear_i8u8(
+              input, weight, scales, zero_points, bias, output,
+              ROWS, D_IN, D_OUT, 0.5f, input_zero_point, 0.5f,
+              output_zero_point, VX_DTYPE_U8, VX_DTYPE_I8,
+              VX_DTYPE_I8) == 1);
+    CHECK(vk_graph_end_forward() == 0);
+    CHECK(vk_graph_sync_host(output, sizeof(output), 0) == 1);
+    CHECK(vk_graph_append_dynamic_telemetry(
+              telemetry, sizeof(telemetry)) == 0);
+    CHECK(strstr(telemetry, ";vk_qls=1") != NULL &&
+          strstr(telemetry, "vk_qld=") == NULL &&
+          strstr(telemetry, "vk_qlt=") == NULL);
+    CHECK(memcmp(output, expected, sizeof(output)) == 0);
+    CHECK(vk_test_set_packed_dot_disabled(previous_dot_disabled) == 1);
     vk_graph_reset();
     return 0;
 }
@@ -1312,6 +1535,77 @@ static int test_qconv2d_i8u8_packed_chain(void) {
     return 0;
 }
 
+/* The scalar QConv shader fuses channels 0..3 into one packed word. Five
+ * output channels force the next word to cross a pixel and take qconv_one;
+ * five input channels cover the odd-K byte tail with asymmetric U8/I8 ZPs. */
+static int test_qconv2d_i8u8_scalar_fused_tail(void) {
+    enum { INPUT_CHANNELS = 5, OUTPUT_CHANNELS = 5 };
+    const int32_t input_zero_point = 129;
+    const int32_t output_zero_point = -7;
+    uint8_t input[2 * INPUT_CHANNELS];
+    int8_t weight[OUTPUT_CHANNELS * INPUT_CHANNELS];
+    float scales[OUTPUT_CHANNELS];
+    int32_t zero_points[OUTPUT_CHANNELS];
+    int32_t bias[OUTPUT_CHANNELS];
+    int8_t output[2 * OUTPUT_CHANNELS];
+    int8_t expected[2 * OUTPUT_CHANNELS];
+    VkQConvTacticProbe tactic = {0};
+
+    for (int index = 0; index < 2 * INPUT_CHANNELS; index++)
+        input[index] = (uint8_t)(input_zero_point + (index * 5) % 7 - 3);
+    for (int channel = 0; channel < OUTPUT_CHANNELS; channel++) {
+        scales[channel] = 1.0f;
+        zero_points[channel] = -4 + channel;
+        bias[channel] = channel - 2;
+        for (int k = 0; k < INPUT_CHANNELS; k++)
+            weight[channel * INPUT_CHANNELS + k] = (int8_t)(
+                zero_points[channel] + (channel * 3 + k * 2) % 7 - 3);
+    }
+    for (int pixel = 0; pixel < 2; pixel++) {
+        for (int channel = 0; channel < OUTPUT_CHANNELS; channel++) {
+            int32_t accumulator = bias[channel];
+            for (int k = 0; k < INPUT_CHANNELS; k++) {
+                accumulator +=
+                    ((int32_t)input[pixel * INPUT_CHANNELS + k] -
+                     input_zero_point) *
+                    ((int32_t)weight[channel * INPUT_CHANNELS + k] -
+                     zero_points[channel]);
+            }
+            accumulator += output_zero_point;
+            if (accumulator < -128) accumulator = -128;
+            if (accumulator > 127) accumulator = 127;
+            expected[pixel * OUTPUT_CHANNELS + channel] =
+                (int8_t)accumulator;
+        }
+    }
+
+    vk_graph_reset();
+    const int previous_dot_disabled = vk_test_set_packed_dot_disabled(1);
+    CHECK(previous_dot_disabled >= 0);
+    vk_test_qconv_tactic_reset();
+    vk_graph_begin_forward();
+    CHECK(vk_graph_qconv2d_i8u8(
+              input, weight, scales, zero_points, bias, output,
+              1u, 1u, 2u, INPUT_CHANNELS,
+              1u, 2u, OUTPUT_CHANNELS,
+              1u, 1u, INPUT_CHANNELS,
+              1u, 1u, 1u, 1u,
+              0u, 0u, 0u, 0u,
+              1u, 0u,
+              0.5f, input_zero_point, 0.5f, output_zero_point,
+              VX_DTYPE_U8, VX_DTYPE_I8, VX_DTYPE_I8) == 1);
+    CHECK(vk_graph_end_forward() == 0);
+    CHECK(vk_graph_sync_host(output, sizeof(output), 0) == 1);
+    CHECK(vk_test_qconv_tactic_read(&tactic) == 0);
+    CHECK(tactic.dot_tiled_dispatches == 0u &&
+          tactic.tiled_dispatches == 0u &&
+          tactic.scalar_dispatches == 1u);
+    CHECK(memcmp(output, expected, sizeof(output)) == 0);
+    CHECK(vk_test_set_packed_dot_disabled(previous_dot_disabled) == 1);
+    vk_graph_reset();
+    return 0;
+}
+
 static int test_conv2d_f32_regular_out16(void) {
     enum {
         INPUT_HEIGHT = 3,
@@ -1362,9 +1656,12 @@ static int test_conv2d_f32_regular_out16(void) {
                         }
                     }
                 }
+                float value = sum + bias[output_channel];
+                if (value < 0.0f) value = 0.0f;
+                if (value > 6.0f) value = 6.0f;
                 expected[((size_t)output_y * OUTPUT_WIDTH +
                           (size_t)output_x) * OUTPUT_CHANNELS +
-                         (size_t)output_channel] = sum + bias[output_channel];
+                         (size_t)output_channel] = value;
             }
         }
     }
@@ -1376,7 +1673,7 @@ static int test_conv2d_f32_regular_out16(void) {
               input, output, weight, bias,
               1, INPUT_HEIGHT, INPUT_WIDTH, INPUT_CHANNELS, OUTPUT_CHANNELS,
               KERNEL_HEIGHT, KERNEL_WIDTH, OUTPUT_HEIGHT, OUTPUT_WIDTH,
-              1, 2, 1, 1, 1, 0, 2, 1) == 1);
+              1, 2, 1, 1, 1, 2, 2, 1) == 1);
     CHECK(vk_graph_end_forward() == 0);
     CHECK(vk_graph_sync_host(output, sizeof(output), 0) == 1);
     CHECK(vk_test_conv_tactic_read(&tactic) == 0);
@@ -1961,38 +2258,40 @@ static int test_moe_backward_bindings(void) {
     float input = 2.0f;
     float expert_weight = 3.0f;
     float expert_bias = 4.0f;
-    float route_index = 0.0f;
+    float route_index = 2.0f;
     float route_weight = 0.5f;
     float grad_output = 7.0f;
     float grad_input = 0.0f;
     float grad_expert_weight = 0.0f;
     float grad_expert_bias = 0.0f;
     float grad_route_weight = 0.0f;
-    uint32_t params[6] = {1u, 1u, 1u, 1u, 1u, 1u};
-    void* hosts[11] = {
+    uint32_t slot_rows[3] = {UINT32_MAX, UINT32_MAX, 0u};
+    uint32_t row_slots[1] = {2u};
+    uint32_t params[8] = {1u, 1u, 1u, 1u, 1u, 1u, 3u, 0u};
+    void* hosts[13] = {
         &input, &expert_weight, &expert_bias, &route_index, &route_weight,
         &grad_output, &grad_input, &grad_expert_weight, &grad_expert_bias,
-        &grad_route_weight, params
+        &grad_route_weight, slot_rows, row_slots, params
     };
-    size_t bytes[11] = {
+    size_t bytes[13] = {
         sizeof(float), sizeof(float), sizeof(float), sizeof(float), sizeof(float),
         sizeof(float), sizeof(float), sizeof(float), sizeof(float), sizeof(float),
-        sizeof(params)
+        sizeof(slot_rows), sizeof(row_slots), sizeof(params)
     };
-    unsigned char access[11] = {
+    unsigned char access[13] = {
         VK_TRAINING_READ, VK_TRAINING_READ, VK_TRAINING_READ,
         VK_TRAINING_READ, VK_TRAINING_READ, VK_TRAINING_READ,
         VK_TRAINING_READ | VK_TRAINING_WRITE,
         VK_TRAINING_READ | VK_TRAINING_WRITE,
         VK_TRAINING_READ | VK_TRAINING_WRITE,
         VK_TRAINING_READ | VK_TRAINING_WRITE,
-        VK_TRAINING_READ
+        VK_TRAINING_READ, VK_TRAINING_READ, VK_TRAINING_READ
     };
-    unsigned char weights[11] = {0, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0};
+    unsigned char weights[13] = {0, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
     const char* entries[4] = {"input_main", "weight_main", "bias_main", "route_main"};
     for (int i = 0; i < 4; i++) {
         CHECK(vk_training_dispatch("moeLinearBackward", entries[i], hosts, bytes,
-                                   access, weights, 11, 1, 1, 1) == 0);
+                                   access, weights, 13, 1, 1, 1) == 0);
     }
     CHECK(vk_training_sync(&grad_input, sizeof(grad_input)) == 0);
     CHECK(vk_training_sync(&grad_expert_weight, sizeof(grad_expert_weight)) == 0);
@@ -2558,6 +2857,10 @@ static int test_dynamic_domain_reservation(void) {
     CHECK(limits.maximum_storage_buffer_bytes >= spans[0].capacity_bytes &&
           limits.maximum_uniform_buffer_bytes > 0u &&
           limits.maximum_total_span_bytes >= spans[0].capacity_bytes * 2u &&
+          limits.compute_arena_allocation_bytes >
+              limits.maximum_total_span_bytes &&
+          limits.staging_allocation_bytes >=
+              (uint64_t)32u * 1024u * 1024u &&
           limits.maximum_scratch_bytes > 0u &&
           limits.current_graph_scratch_bytes <=
               limits.maximum_scratch_bytes &&
@@ -2689,9 +2992,49 @@ static int test_dynamic_domain_reservation(void) {
     return 0;
 }
 
+/* A storage-view node (Reshape/Flatten/Squeeze/Unsqueeze/Identity/Dropout)
+ * whose input and output have distinct host storage must receive independent
+ * device storage. Device slots are keyed by host pointer and the runtime pools
+ * many disjoint-lifetime activations into one host span, so sharing a device
+ * range across two spans does not extend one tensor's lifetime -- it merges
+ * the spans, and every later tensor planned into either one writes through
+ * both. The regression this pins: SiLU -> Reshape -> Transpose returned a
+ * different wrong answer on every run. */
+static int test_storage_view_alias_isolation(void) {
+    float source[8];
+    float view[8];
+    float successor[8];
+    vk_graph_reset();
+    for (int index = 0; index < 8; index++) {
+        source[index] = (float)(index + 1);
+        view[index] = 0.0f;
+        successor[index] = -1.0f - (float)index;
+    }
+    vk_graph_mark_host(source, sizeof(source), 0);
+    vk_graph_mark_host(successor, sizeof(successor), 0);
+    vk_graph_begin_forward();
+    CHECK(vk_graph_alias_f32(source, view, 8) == 1);
+    /* The planner reuses the source span once the view's producer is dead. */
+    CHECK(vk_graph_copy_f32(successor, source, 8) == 1);
+    CHECK(vk_graph_end_forward() == 0);
+    CHECK(vk_graph_sync_host(view, sizeof(view), 0) == 1);
+    for (int index = 0; index < 8; index++)
+        CHECK(view[index] == (float)(index + 1));
+    /* A view the runtime already aliased on the host stays a free view. */
+    vk_graph_begin_forward();
+    CHECK(vk_graph_alias_f32(source, source, 8) == 1);
+    CHECK(vk_graph_end_forward() == 0);
+    CHECK(vk_graph_sync_host(source, sizeof(source), 0) == 1);
+    for (int index = 0; index < 8; index++)
+        CHECK(source[index] == -1.0f - (float)index);
+    vk_graph_reset();
+    return 0;
+}
+
 int main(void) {
     VxEngineState* state;
     VxEngineStateScope state_scope;
+    CHECK(test_arena_size_configuration() == 0);
     CHECK(test_context_capsule_isolation() == 0);
     state = (VxEngineState*)calloc(1, sizeof(*state));
     CHECK(state && vx_engine_state_init(state) == 0);
@@ -2704,6 +3047,7 @@ int main(void) {
         return 77;
     }
     CHECK(vk_training_available() == 1);
+    CHECK(test_device_local_staging_path() == 0);
     CHECK(test_physical_context_isolation(state) == 0);
     float host_current = 1.0f;
     vk_graph_reset();
@@ -2731,10 +3075,12 @@ int main(void) {
     CHECK(test_one_shot_matmul_tails_and_fallback() == 0);
     CHECK(test_graph_linear_dynamic_domain() == 0);
     CHECK(test_tiled_qlinear_i8u8_tails() == 0);
+    CHECK(test_scalar_qlinear_i8u8_fused_word() == 0);
     CHECK(test_tiled_qlinear_staged_rounding() == 0);
     CHECK(test_qbatch_matmul_i8u8_arbitrary_k() == 0);
     CHECK(test_layernorm_epsilon() == 0);
     CHECK(test_qlinear_i8u8_packed_chain() == 0);
+    CHECK(test_qlinear_i8u8_scalar_fused_tail() == 0);
     CHECK(test_qembedding_i8u8_packed_gather() == 0);
     CHECK(test_qadd_requantize_i8u8_packed_chain() == 0);
     CHECK(test_qsilu_i8u8_packed_chain() == 0);
@@ -2747,6 +3093,7 @@ int main(void) {
     CHECK(test_conv2d_f32_regular_out16() == 0);
     CHECK(test_conv2d_f32_pointwise_precedes_regular_out16() == 0);
     CHECK(test_qconv2d_i8u8_packed_chain() == 0);
+    CHECK(test_qconv2d_i8u8_scalar_fused_tail() == 0);
     CHECK(test_qconv2d_i8u8_scalar_tiled_tail() == 0);
     CHECK(test_typed_i8u8_shape_qdq_chain() == 0);
     CHECK(test_general_gather_i32() == 0);
@@ -2754,6 +3101,7 @@ int main(void) {
     CHECK(test_expand_f32_uniform_abi() == 0);
     CHECK(test_dynamic_shape_capacity_lifecycle() == 0);
     CHECK(test_dynamic_domain_reservation() == 0);
+    CHECK(test_storage_view_alias_isolation() == 0);
     CHECK(vk_training_begin() == 0);
 
     float dummy = 0.0f;

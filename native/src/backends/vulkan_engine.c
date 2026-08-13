@@ -55,12 +55,16 @@ VK_FUNC(vkFreeMemory)
 VK_FUNC(vkBindBufferMemory)
 VK_FUNC(vkMapMemory)
 VK_FUNC(vkUnmapMemory)
+VK_FUNC(vkFlushMappedMemoryRanges)
+VK_FUNC(vkInvalidateMappedMemoryRanges)
 VK_FUNC(vkCreateShaderModule)
 VK_FUNC(vkDestroyShaderModule)
 VK_FUNC(vkCreateDescriptorSetLayout)
 VK_FUNC(vkDestroyDescriptorSetLayout)
 VK_FUNC(vkCreatePipelineLayout)
 VK_FUNC(vkDestroyPipelineLayout)
+VK_FUNC(vkCreatePipelineCache)
+VK_FUNC(vkDestroyPipelineCache)
 VK_FUNC(vkCreateComputePipelines)
 VK_FUNC(vkDestroyPipeline)
 VK_FUNC(vkCreateDescriptorPool)
@@ -75,6 +79,7 @@ VK_FUNC(vkCmdBindPipeline)
 VK_FUNC(vkCmdBindDescriptorSets)
 VK_FUNC(vkCmdPushConstants)
 VK_FUNC(vkCmdDispatch)
+VK_FUNC(vkCmdCopyBuffer)
 VK_FUNC(vkCmdPipelineBarrier)
 VK_FUNC(vkEndCommandBuffer)
 VK_FUNC(vkQueueSubmit)
@@ -199,6 +204,7 @@ static VkKernel k_qlayernorm_stats = {"qLayerNormStats", "spv/qLayerNormStats.sp
 static VkKernel k_qlayernorm_apply = {"qLayerNormApply", "spv/qLayerNormApply.spv", 6, 5, VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE, 0};
 static VkKernel k_qsdpa_int8 = {"qSDPAInt8", "spv/qSDPAInt8.spv", 6, 5, VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE, 0};
 static VkKernel k_qargmax_int8 = {"qArgMaxInt8", "spv/qArgMaxInt8.spv", 3, 2, VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE, 0};
+static VkKernel k_row_index_transfer = {"rowIndexTransfer", "spv/rowIndexTransfer.spv", 4, 3, VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE, 0};
 static VkKernel k_qmaskedmean_int8 = {"qMaskedMeanInt8", "spv/qMaskedMeanInt8.spv", 4, 3, VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE, 0};
 static VkKernel k_requantize_linear_i8u8 = {"requantizeLinearTyped", "spv/requantizeLinearTyped.spv", 3, 2, VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE, 0};
 static VkKernel k_copy_typed_i8u8 = {"copyTyped", "spv/copyTyped.spv", 3, 2, VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE, 0};
@@ -223,11 +229,61 @@ static VkKernel k_resize    = {"resize",      "spv/resize.spv",      3, 2, VK_NU
 #define VK_GRAPH_MAX_FREE_RANGES (VK_GRAPH_MAX_TENSORS + 1)
 #define VK_GRAPH_MAX_DISPATCH_SETS 4096
 #define VK_GRAPH_SCRATCH_BYTES ((size_t)1024 * 1024)
+#define VK_GRAPH_STAGING_BYTES ((size_t)32 * 1024 * 1024)
 #define VK_GRAPH_BASE ((size_t)128 * 1024 * 1024)
+#define VK_GRAPH_MIB ((size_t)1024 * 1024)
 #define VK_GRAPH_ALIGN 256
 #define VK_PREPARED_KERNEL_MAX 160
 #define WT_CACHE_MAX 512
 #define WEIGHTS_LIMIT ((size_t)64 * 1024 * 1024)
+
+static int vk_graph_align_up(size_t value, size_t alignment, size_t* out) {
+    size_t remainder;
+    if (!out || !alignment) return 0;
+    remainder = value % alignment;
+    if (remainder && value > SIZE_MAX - (alignment - remainder)) return 0;
+    *out = remainder ? value + (alignment - remainder) : value;
+    return 1;
+}
+
+static int vk_graph_arena_size_valid(size_t bytes, size_t alignment) {
+    size_t arena_start;
+    size_t scratch_start;
+    size_t arena_limit;
+    if (!alignment || bytes < VK_GRAPH_SCRATCH_BYTES ||
+        !vk_graph_align_up(VK_GRAPH_BASE, alignment, &arena_start) ||
+        !vk_graph_align_up(bytes - VK_GRAPH_SCRATCH_BYTES,
+                           alignment, &scratch_start) ||
+        scratch_start > bytes)
+        return 0;
+    arena_limit = bytes - VK_GRAPH_SCRATCH_BYTES;
+    arena_limit -= arena_limit % alignment;
+    return arena_start < arena_limit;
+}
+
+static int vk_graph_parse_arena_mebibytes(const char* text,
+                                           size_t alignment,
+                                           size_t* bytes) {
+    const unsigned char* cursor = (const unsigned char*)text;
+    const size_t maximum = SIZE_MAX / VK_GRAPH_MIB;
+    size_t value = 0u;
+    if (!cursor || !cursor[0] || !bytes) return 0;
+    for (; *cursor; cursor++) {
+        size_t digit;
+        if (*cursor < (unsigned char)'0' ||
+            *cursor > (unsigned char)'9')
+            return 0;
+        digit = (size_t)(*cursor - (unsigned char)'0');
+        if (value > maximum / 10u ||
+            (value == maximum / 10u && digit > maximum % 10u))
+            return 0;
+        value = value * 10u + digit;
+    }
+    value *= VK_GRAPH_MIB;
+    if (!vk_graph_arena_size_valid(value, alignment)) return 0;
+    *bytes = value;
+    return 1;
+}
 
 typedef struct {
     const void* host;
@@ -309,6 +365,7 @@ typedef struct {
     uint32_t max_uniform_bindings;
     VkDeviceSize max_storage_range;
     VkDeviceSize max_uniform_range;
+    VkDeviceSize non_coherent_atom_size;
     size_t graph_alignment;
     int packed_dot;
     int packed_dot_warned;
@@ -322,8 +379,10 @@ typedef struct {
 #endif
     VkDescriptorSetLayout matmul_desc_layout;
     VkPipelineLayout matmul_pipeline_layout;
+    VkPipelineCache pipeline_cache;
     VkPipeline matmul_pipeline;
     VkPipeline matmul_tiled_pipeline;
+    uint64_t prepared_pipeline_creates;
     unsigned context_count;
     int initialized;
     /* The device is shared across engine states and released at process exit,
@@ -337,8 +396,23 @@ typedef struct {
     int device_acquired;
     VkBuffer buffer;
     VkDeviceMemory memory;
-    void* mapped;
     size_t arena_size;
+    size_t arena_allocation_size;
+    uint32_t compute_memory_type_index;
+    VkMemoryPropertyFlags compute_memory_flags;
+    VkBuffer staging_buffer;
+    VkDeviceMemory staging_memory;
+    void* staging_mapped;
+    size_t staging_size;
+    size_t staging_allocation_size;
+    size_t staging_cursor;
+    uint32_t staging_memory_type_index;
+    VkMemoryPropertyFlags staging_memory_flags;
+    uint64_t staging_upload_count;
+    uint64_t staging_upload_bytes;
+    uint64_t staging_download_count;
+    uint64_t staging_download_bytes;
+    uint64_t staging_submit_count;
     VkDescriptorPool graph_descriptor_pool;
     VkDescriptorSet matmul_set;
     VkCommandPool pool;
@@ -368,6 +442,8 @@ typedef struct {
     uint64_t qconv_scalar_dispatches;
     uint64_t conv_out16_dispatches;
     uint64_t conv_scalar_dispatches;
+    uint64_t prepared_pipeline_creates;
+    uint64_t prepared_pipeline_creates_at_forward;
     VkPreparedKernel prepared_kernels[VK_PREPARED_KERNEL_MAX];
     int prepared_kernel_count;
     VkWeightCacheEntry weight_cache[WT_CACHE_MAX];
@@ -435,12 +511,16 @@ static VulkanContextState* vk_context_current(void) {
 #define vkBindBufferMemory (g_vulkan_device.api.p_vkBindBufferMemory)
 #define vkMapMemory (g_vulkan_device.api.p_vkMapMemory)
 #define vkUnmapMemory (g_vulkan_device.api.p_vkUnmapMemory)
+#define vkFlushMappedMemoryRanges (g_vulkan_device.api.p_vkFlushMappedMemoryRanges)
+#define vkInvalidateMappedMemoryRanges (g_vulkan_device.api.p_vkInvalidateMappedMemoryRanges)
 #define vkCreateShaderModule (g_vulkan_device.api.p_vkCreateShaderModule)
 #define vkDestroyShaderModule (g_vulkan_device.api.p_vkDestroyShaderModule)
 #define vkCreateDescriptorSetLayout (g_vulkan_device.api.p_vkCreateDescriptorSetLayout)
 #define vkDestroyDescriptorSetLayout (g_vulkan_device.api.p_vkDestroyDescriptorSetLayout)
 #define vkCreatePipelineLayout (g_vulkan_device.api.p_vkCreatePipelineLayout)
 #define vkDestroyPipelineLayout (g_vulkan_device.api.p_vkDestroyPipelineLayout)
+#define vkCreatePipelineCache (g_vulkan_device.api.p_vkCreatePipelineCache)
+#define vkDestroyPipelineCache (g_vulkan_device.api.p_vkDestroyPipelineCache)
 #define vkCreateComputePipelines (g_vulkan_device.api.p_vkCreateComputePipelines)
 #define vkDestroyPipeline (g_vulkan_device.api.p_vkDestroyPipeline)
 #define vkCreateDescriptorPool (g_vulkan_device.api.p_vkCreateDescriptorPool)
@@ -453,6 +533,7 @@ static VulkanContextState* vk_context_current(void) {
 #define vkCmdBindDescriptorSets (g_vulkan_device.api.p_vkCmdBindDescriptorSets)
 #define vkCmdPushConstants (g_vulkan_device.api.p_vkCmdPushConstants)
 #define vkCmdDispatch (g_vulkan_device.api.p_vkCmdDispatch)
+#define vkCmdCopyBuffer (g_vulkan_device.api.p_vkCmdCopyBuffer)
 #define vkCmdPipelineBarrier (g_vulkan_device.api.p_vkCmdPipelineBarrier)
 #define vkEndCommandBuffer (g_vulkan_device.api.p_vkEndCommandBuffer)
 #define vkQueueSubmit (g_vulkan_device.api.p_vkQueueSubmit)
@@ -472,11 +553,13 @@ static VulkanContextState* vk_context_current(void) {
 #define max_compute_workgroups (g_vulkan_device.max_workgroups)
 #define max_storage_buffer_range (g_vulkan_device.max_storage_range)
 #define max_uniform_buffer_range (g_vulkan_device.max_uniform_range)
+#define non_coherent_atom_size (g_vulkan_device.non_coherent_atom_size)
 #define graph_alignment (g_vulkan_device.graph_alignment)
 #define vulkan_packed_dot (g_vulkan_device.packed_dot)
 #define vulkan_packed_dot_warned (g_vulkan_device.packed_dot_warned)
 #define desc_layout (g_vulkan_device.matmul_desc_layout)
 #define pipeline_layout (g_vulkan_device.matmul_pipeline_layout)
+#define pipeline_cache (g_vulkan_device.pipeline_cache)
 #define matmul_pipeline (g_vulkan_device.matmul_pipeline)
 #define matmul_tiled_pipeline (g_vulkan_device.matmul_tiled_pipeline)
 #if VOLVOXAI_ENABLE_TRAINING
@@ -491,8 +574,12 @@ static VulkanContextState* vk_context_current(void) {
 #define VX_VK_CONTEXT (*vk_context_current())
 #define io_buffer (VX_VK_CONTEXT.buffer)
 #define io_memory (VX_VK_CONTEXT.memory)
-#define io_mapped (VX_VK_CONTEXT.mapped)
 #define io_size (VX_VK_CONTEXT.arena_size)
+#define vk_stage_buffer (VX_VK_CONTEXT.staging_buffer)
+#define vk_stage_memory (VX_VK_CONTEXT.staging_memory)
+#define vk_stage_mapped (VX_VK_CONTEXT.staging_mapped)
+#define vk_stage_size (VX_VK_CONTEXT.staging_size)
+#define vk_stage_cursor (VX_VK_CONTEXT.staging_cursor)
 #define desc_pool (VX_VK_CONTEXT.graph_descriptor_pool)
 #define desc_set (VX_VK_CONTEXT.matmul_set)
 #define cmd_pool (VX_VK_CONTEXT.pool)
@@ -532,6 +619,12 @@ static VulkanContextState* vk_context_current(void) {
 #endif
 
 static int vk_graph_flush_wait(void);
+static int vk_graph_begin_recording(void);
+static int vk_staging_upload(size_t device_offset, const void* source,
+                             size_t bytes);
+static int vk_staging_zero(size_t device_offset, size_t bytes);
+static int vk_staging_download(size_t device_offset, void* destination,
+                               size_t bytes);
 static int vk_is_ready(void);
 static void vk_context_destroy(void* opaque);
 static int vk_graph_allocator_reset(void);
@@ -549,23 +642,7 @@ static uint32_t find_preferred_memory_type(uint32_t type_filter,
         if ((flags & preferred) == preferred) return i;
         if (fallback == UINT32_MAX) fallback = i;
     }
-    return fallback != UINT32_MAX ? fallback : 0;
-}
-
-// First memory type that has all `required` flags but none of `avoid`. Used to fall
-// back from a device-local host-visible type (a small PCIe BAR heap on discrete GPUs)
-// to plain host-visible system memory when the BAR is too small for io_size.
-static uint32_t find_memory_type_avoiding(uint32_t type_filter,
-                                          VkMemoryPropertyFlags required,
-                                          VkMemoryPropertyFlags avoid) {
-    for (uint32_t i = 0; i < mem_props.memoryTypeCount; i++) {
-        if (!(type_filter & (1u << i))) continue;
-        VkMemoryPropertyFlags flags = mem_props.memoryTypes[i].propertyFlags;
-        if ((flags & required) != required) continue;
-        if (flags & avoid) continue;
-        return i;
-    }
-    return UINT32_MAX;
+    return fallback;
 }
 
 
@@ -608,7 +685,8 @@ static int create_matmul_pipeline(const char* path, VkPipeline* output) {
     pipeline_info.stage.module = shader_module;
     pipeline_info.stage.pName = "main";
     pipeline_info.layout = pipeline_layout;
-    result = vkCreateComputePipelines(device, VK_NULL_HANDLE, 1, &pipeline_info, NULL, output);
+    result = vkCreateComputePipelines(device, pipeline_cache, 1,
+                                      &pipeline_info, NULL, output);
     if (vkDestroyShaderModule) vkDestroyShaderModule(device, shader_module, NULL);
     return result == VK_SUCCESS;
 }
@@ -682,12 +760,16 @@ static int vk_device_initialize_locked(void) {
     LOAD_INST(vkBindBufferMemory)
     LOAD_INST(vkMapMemory)
     LOAD_INST(vkUnmapMemory)
+    LOAD_INST(vkFlushMappedMemoryRanges)
+    LOAD_INST(vkInvalidateMappedMemoryRanges)
     LOAD_INST(vkCreateShaderModule)
     LOAD_INST(vkDestroyShaderModule)
     LOAD_INST(vkCreateDescriptorSetLayout)
     LOAD_INST(vkDestroyDescriptorSetLayout)
     LOAD_INST(vkCreatePipelineLayout)
     LOAD_INST(vkDestroyPipelineLayout)
+    LOAD_INST(vkCreatePipelineCache)
+    LOAD_INST(vkDestroyPipelineCache)
     LOAD_INST(vkCreateComputePipelines)
     LOAD_INST(vkDestroyPipeline)
     LOAD_INST(vkCreateDescriptorPool)
@@ -702,6 +784,7 @@ static int vk_device_initialize_locked(void) {
     LOAD_INST(vkCmdBindDescriptorSets)
     LOAD_INST(vkCmdPushConstants)
     LOAD_INST(vkCmdDispatch)
+    LOAD_INST(vkCmdCopyBuffer)
     LOAD_INST(vkCmdPipelineBarrier)
     LOAD_INST(vkEndCommandBuffer)
     LOAD_INST(vkQueueSubmit)
@@ -775,6 +858,7 @@ static int vk_device_initialize_locked(void) {
         best_props.limits.maxComputeWorkGroupInvocations;
     max_storage_buffer_range = best_props.limits.maxStorageBufferRange;
     max_uniform_buffer_range = best_props.limits.maxUniformBufferRange;
+    non_coherent_atom_size = best_props.limits.nonCoherentAtomSize;
     g_vulkan_device.max_storage_bindings =
         best_props.limits.maxPerStageDescriptorStorageBuffers <
                 best_props.limits.maxDescriptorSetStorageBuffers
@@ -838,6 +922,18 @@ static int vk_device_initialize_locked(void) {
     if (vkCreateDevice(physical_device, &device_info, NULL, &device) != VK_SUCCESS) return -1;
     vkGetDeviceQueue(device, queue_family_index, 0, &compute_queue);
 
+    /* Keep the driver's process-local compile cache alive across encoder and
+     * decoder contexts. Contexts still own their descriptor sets and prepared
+     * pipeline handles; the shared cache only reuses driver compilation data. */
+    if (vkCreatePipelineCache) {
+        VkPipelineCacheCreateInfo cache_info = {0};
+        cache_info.sType = VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO;
+        if (vkCreatePipelineCache(device, &cache_info, NULL,
+                                  &pipeline_cache) != VK_SUCCESS) {
+            pipeline_cache = VK_NULL_HANDLE;
+        }
+    }
+
     /* Model-independent matmul pipelines are immutable after initialization
      * and shared through the synchronized device state. */
     VkDescriptorSetLayoutBinding bindings[6];
@@ -893,6 +989,8 @@ static void vk_device_destroy_locked(void) {
             vkDestroyPipeline(device, matmul_pipeline, NULL);
         if (matmul_tiled_pipeline != VK_NULL_HANDLE && vkDestroyPipeline)
             vkDestroyPipeline(device, matmul_tiled_pipeline, NULL);
+        if (pipeline_cache != VK_NULL_HANDLE && vkDestroyPipelineCache)
+            vkDestroyPipelineCache(device, pipeline_cache, NULL);
         if (pipeline_layout != VK_NULL_HANDLE && vkDestroyPipelineLayout)
             vkDestroyPipelineLayout(device, pipeline_layout, NULL);
         if (desc_layout != VK_NULL_HANDLE && vkDestroyDescriptorSetLayout)
@@ -915,6 +1013,7 @@ static void vk_device_destroy_locked(void) {
     g_vulkan_device.max_uniform_bindings = 0;
     max_storage_buffer_range = 0;
     max_uniform_buffer_range = 0;
+    non_coherent_atom_size = 0;
     graph_alignment = VK_GRAPH_ALIGN;
     vulkan_packed_dot = 0;
     vulkan_packed_dot_warned = 0;
@@ -922,6 +1021,8 @@ static void vk_device_destroy_locked(void) {
     pipeline_layout = VK_NULL_HANDLE;
     matmul_pipeline = VK_NULL_HANDLE;
     matmul_tiled_pipeline = VK_NULL_HANDLE;
+    pipeline_cache = VK_NULL_HANDLE;
+    g_vulkan_device.prepared_pipeline_creates = 0u;
 #if VOLVOXAI_ENABLE_TRAINING
     training_max_storage_bindings = 0;
     training_max_uniform_bindings = 0;
@@ -966,6 +1067,11 @@ static VulkanContextState* vk_context_allocate(VxEngineState* owner) {
 }
 
 #if defined(VOLVOXAI_VULKAN_TESTING)
+int vk_test_parse_arena_mebibytes(const char* text, size_t alignment,
+                                  size_t* bytes) {
+    return vk_graph_parse_arena_mebibytes(text, alignment, bytes) ? 0 : -1;
+}
+
 int vk_test_context_state_write(const VkContextStateProbe* probe) {
     VxEngineState* owner = vx_engine_state_current();
     VulkanContextState* context;
@@ -1077,61 +1183,180 @@ int vk_test_conv_tactic_read(VkConvTacticProbe* probe) {
     probe->scalar_dispatches = context->conv_scalar_dispatches;
     return 0;
 }
+
+int vk_test_pipeline_cache_read(VkPipelineCacheProbe* probe) {
+    VulkanContextState* context = vk_context_current();
+    if (!context || !probe) return -1;
+    pthread_mutex_lock(&g_vulkan_device.mutex);
+    probe->prepared_pipeline_creates =
+        g_vulkan_device.prepared_pipeline_creates;
+    probe->prepared_kernel_count =
+        (uint64_t)context->prepared_kernel_count;
+    probe->pipeline_cache_available =
+        pipeline_cache != VK_NULL_HANDLE ? 1u : 0u;
+    pthread_mutex_unlock(&g_vulkan_device.mutex);
+    return 0;
+}
+
+int vk_test_memory_placement_read(VkMemoryPlacementProbe* probe) {
+    VulkanContextState* context = vk_context_current();
+    if (!context || !probe) return -1;
+    memset(probe, 0, sizeof(*probe));
+    probe->arena_bytes = (uint64_t)context->arena_size;
+    probe->arena_allocation_bytes =
+        (uint64_t)context->arena_allocation_size;
+    probe->staging_bytes = (uint64_t)context->staging_size;
+    probe->staging_allocation_bytes =
+        (uint64_t)context->staging_allocation_size;
+    probe->noncoherent_atom_bytes = (uint64_t)non_coherent_atom_size;
+    probe->upload_count = context->staging_upload_count;
+    probe->upload_bytes = context->staging_upload_bytes;
+    probe->download_count = context->staging_download_count;
+    probe->download_bytes = context->staging_download_bytes;
+    probe->submit_count = context->staging_submit_count;
+    probe->compute_device_local =
+        !!(context->compute_memory_flags &
+           VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    probe->compute_host_visible =
+        !!(context->compute_memory_flags &
+           VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT);
+    probe->staging_host_visible =
+        !!(context->staging_memory_flags &
+           VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT);
+    probe->staging_host_coherent =
+        !!(context->staging_memory_flags &
+           VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+    return 0;
+}
 #endif
 
 static int vk_context_create_resources_locked(VulkanContextState* context) {
     VkBufferCreateInfo buffer_info = {0};
     VkMemoryRequirements memory_requirements;
+    VkMemoryRequirements staging_requirements;
     VkMemoryAllocateInfo allocation_info = {0};
-    VkResult allocation_result;
     VkDescriptorPoolSize pool_sizes[2] = {0};
     VkDescriptorPoolCreateInfo pool_info = {0};
     VkDescriptorSetAllocateInfo set_info = {0};
     VkCommandPoolCreateInfo command_pool_info = {0};
     VkCommandBufferAllocateInfo command_buffer_info = {0};
     VkFenceCreateInfo fence_info = {0};
-    const VkMemoryPropertyFlags host_requirements =
-        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
     const char* mb_env;
-    uint32_t primary_type;
     if (!context || !g_vulkan_device.initialized) return -1;
+    if (!vkCmdCopyBuffer || !vkFlushMappedMemoryRanges ||
+        !vkInvalidateMappedMemoryRanges || !non_coherent_atom_size) {
+        fprintf(stderr,
+                "[Vulkan] required staging/copy synchronization functions are unavailable\n");
+        return -1;
+    }
 
     mb_env = getenv("VOLVOX_VULKAN_MB");
-    if (mb_env && mb_env[0]) {
-        long mb = strtol(mb_env, NULL, 10);
-        if (mb >= 192 && mb <= 4096)
-            context->arena_size = (size_t)mb * 1024 * 1024;
+    if (mb_env) {
+        size_t configured_arena_size;
+        if (!vk_graph_parse_arena_mebibytes(
+                mb_env, graph_alignment, &configured_arena_size)) {
+            fprintf(stderr,
+                    "[Vulkan] invalid VOLVOX_VULKAN_MB; expected an exact decimal MiB size representable by size_t and large enough for the graph base and scratch regions\n");
+            return -1;
+        }
+        context->arena_size = configured_arena_size;
     }
     buffer_info.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
     buffer_info.size = context->arena_size;
-    buffer_info.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+    buffer_info.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+        VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT |
+        VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
     buffer_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
-    if (vkCreateBuffer(device, &buffer_info, NULL, &context->buffer) != VK_SUCCESS)
+    if (vkCreateBuffer(device, &buffer_info, NULL, &context->buffer) != VK_SUCCESS) {
+        fprintf(stderr,
+                "[Vulkan] compute arena buffer creation failed (%zu bytes)\n",
+                context->arena_size);
         return -1;
+    }
     vkGetBufferMemoryRequirements(device, context->buffer, &memory_requirements);
+    if (memory_requirements.size > (VkDeviceSize)SIZE_MAX) {
+        fprintf(stderr,
+                "[Vulkan] compute arena allocation exceeds host size_t range\n");
+        return -1;
+    }
     allocation_info.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
     allocation_info.allocationSize = memory_requirements.size;
-    primary_type = find_preferred_memory_type(
-        memory_requirements.memoryTypeBits, host_requirements,
-        VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-    allocation_info.memoryTypeIndex = primary_type;
-    allocation_result = vkAllocateMemory(
-        device, &allocation_info, NULL, &context->memory);
-    if (allocation_result != VK_SUCCESS) {
-        uint32_t fallback_type = find_memory_type_avoiding(
-            memory_requirements.memoryTypeBits, host_requirements,
-            VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-        if (fallback_type != UINT32_MAX && fallback_type != primary_type) {
-            allocation_info.memoryTypeIndex = fallback_type;
-            allocation_result = vkAllocateMemory(
-                device, &allocation_info, NULL, &context->memory);
-        }
+    context->compute_memory_type_index = find_preferred_memory_type(
+        memory_requirements.memoryTypeBits,
+        VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, 0u);
+    if (context->compute_memory_type_index == UINT32_MAX) {
+        fprintf(stderr,
+                "[Vulkan] no DEVICE_LOCAL memory type can back the compute arena\n");
+        return -1;
     }
-    if (allocation_result != VK_SUCCESS) return -1;
+    allocation_info.memoryTypeIndex = context->compute_memory_type_index;
+    if (vkAllocateMemory(device, &allocation_info, NULL,
+                         &context->memory) != VK_SUCCESS) {
+        fprintf(stderr,
+                "[Vulkan] DEVICE_LOCAL compute arena allocation failed (%zu bytes); refusing host-memory fallback\n",
+                (size_t)memory_requirements.size);
+        return -1;
+    }
+    context->compute_memory_flags = mem_props.memoryTypes[
+        context->compute_memory_type_index].propertyFlags;
+    context->arena_allocation_size = (size_t)memory_requirements.size;
     if (vkBindBufferMemory(device, context->buffer,
-                           context->memory, 0) != VK_SUCCESS) return -1;
-    if (vkMapMemory(device, context->memory, 0, context->arena_size, 0,
-                    &context->mapped) != VK_SUCCESS || !context->mapped) return -1;
+                           context->memory, 0) != VK_SUCCESS) {
+        fprintf(stderr,
+                "[Vulkan] DEVICE_LOCAL compute arena bind failed\n");
+        return -1;
+    }
+
+    context->staging_size = VK_GRAPH_STAGING_BYTES;
+    buffer_info.size = context->staging_size;
+    buffer_info.usage =
+        VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+    if (vkCreateBuffer(device, &buffer_info, NULL,
+                       &context->staging_buffer) != VK_SUCCESS) {
+        fprintf(stderr,
+                "[Vulkan] staging buffer creation failed (%zu bytes)\n",
+                context->staging_size);
+        return -1;
+    }
+    vkGetBufferMemoryRequirements(
+        device, context->staging_buffer, &staging_requirements);
+    if (staging_requirements.size > (VkDeviceSize)SIZE_MAX) {
+        fprintf(stderr,
+                "[Vulkan] staging allocation exceeds host size_t range\n");
+        return -1;
+    }
+    allocation_info.allocationSize = staging_requirements.size;
+    context->staging_memory_type_index = find_preferred_memory_type(
+        staging_requirements.memoryTypeBits,
+        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT,
+        VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+    if (context->staging_memory_type_index == UINT32_MAX) {
+        fprintf(stderr,
+                "[Vulkan] no HOST_VISIBLE memory type can back the staging buffer\n");
+        return -1;
+    }
+    allocation_info.memoryTypeIndex = context->staging_memory_type_index;
+    if (vkAllocateMemory(device, &allocation_info, NULL,
+                         &context->staging_memory) != VK_SUCCESS) {
+        fprintf(stderr,
+                "[Vulkan] HOST_VISIBLE staging allocation failed (%zu bytes)\n",
+                (size_t)staging_requirements.size);
+        return -1;
+    }
+    context->staging_memory_flags = mem_props.memoryTypes[
+        context->staging_memory_type_index].propertyFlags;
+    context->staging_allocation_size = (size_t)staging_requirements.size;
+    if (vkBindBufferMemory(device, context->staging_buffer,
+                           context->staging_memory, 0) != VK_SUCCESS) {
+        fprintf(stderr, "[Vulkan] staging buffer bind failed\n");
+        return -1;
+    }
+    if (vkMapMemory(device, context->staging_memory, 0, VK_WHOLE_SIZE, 0,
+                    &context->staging_mapped) != VK_SUCCESS ||
+        !context->staging_mapped) {
+        fprintf(stderr, "[Vulkan] staging memory map failed\n");
+        return -1;
+    }
 
     pool_sizes[0].type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
     pool_sizes[0].descriptorCount = 16384;
@@ -1190,8 +1415,12 @@ static void vk_context_destroy(void* opaque) {
                 vkDestroyFence(device, context->fence, NULL);
             if (context->pool != VK_NULL_HANDLE && vkDestroyCommandPool)
                 vkDestroyCommandPool(device, context->pool, NULL);
-            if (context->mapped && vkUnmapMemory)
-                vkUnmapMemory(device, context->memory);
+            if (context->staging_mapped && vkUnmapMemory)
+                vkUnmapMemory(device, context->staging_memory);
+            if (context->staging_buffer != VK_NULL_HANDLE && vkDestroyBuffer)
+                vkDestroyBuffer(device, context->staging_buffer, NULL);
+            if (context->staging_memory != VK_NULL_HANDLE && vkFreeMemory)
+                vkFreeMemory(device, context->staging_memory, NULL);
             if (context->buffer != VK_NULL_HANDLE && vkDestroyBuffer)
                 vkDestroyBuffer(device, context->buffer, NULL);
             if (context->memory != VK_NULL_HANDLE && vkFreeMemory)
@@ -1280,7 +1509,11 @@ static int vk_is_ready(void) {
     VulkanContextState* context = vk_context_current();
     return context && context->device_acquired &&
         device != VK_NULL_HANDLE && context->buffer != VK_NULL_HANDLE &&
-        context->mapped != NULL;
+        context->memory != VK_NULL_HANDLE &&
+        (context->compute_memory_flags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) &&
+        context->staging_buffer != VK_NULL_HANDLE &&
+        context->staging_memory != VK_NULL_HANDLE &&
+        context->staging_mapped != NULL && context->staging_size > 0u;
 }
 
 static int graph_find_slot(const void* host) {
@@ -1297,15 +1530,6 @@ static int graph_find_slot(const void* host) {
 static uint64_t vk_graph_generation_next(uint64_t generation) {
     generation++;
     return generation ? generation : 1u;
-}
-
-static int vk_graph_align_up(size_t value, size_t alignment, size_t* out) {
-    size_t remainder;
-    if (!out || !alignment) return 0;
-    remainder = value % alignment;
-    if (remainder && value > SIZE_MAX - (alignment - remainder)) return 0;
-    *out = remainder ? value + (alignment - remainder) : value;
-    return 1;
 }
 
 static size_t vk_graph_arena_limit(void) {
@@ -1340,6 +1564,10 @@ int vk_query_domain_limits(VulkanDomainLimits* limits) {
             (uint64_t)max_uniform_buffer_range;
         limits->maximum_total_span_bytes = arena_limit > arena_start
             ? (uint64_t)(arena_limit - arena_start) : 0u;
+        limits->compute_arena_allocation_bytes =
+            (uint64_t)context->arena_allocation_size;
+        limits->staging_allocation_bytes =
+            (uint64_t)context->staging_allocation_size;
         limits->maximum_scratch_bytes = (uint64_t)(io_size - scratch_start);
         limits->current_graph_scratch_bytes = scratch_high_water
             ? (uint64_t)(scratch_high_water - scratch_start) : 0u;
@@ -1361,6 +1589,9 @@ int vk_query_domain_limits(VulkanDomainLimits* limits) {
         ready = limits->maximum_storage_buffer_bytes > 0u &&
             limits->maximum_uniform_buffer_bytes > 0u &&
             limits->maximum_total_span_bytes > 0u &&
+            limits->compute_arena_allocation_bytes >= (uint64_t)io_size &&
+            limits->staging_allocation_bytes >=
+                (uint64_t)context->staging_size &&
             limits->maximum_scratch_bytes > 0u &&
             limits->current_graph_scratch_bytes <=
                 limits->maximum_scratch_bytes &&
@@ -1541,11 +1772,29 @@ static VkTensorSlot* graph_get_slot(const void* host, size_t bytes, int is_weigh
     if (idx >= 0) {
         VkTensorSlot* s = &graph_slots[idx];
         if (bytes <= s->capacity) {
+            /*
+             * Grow, never shrink.
+             *
+             * A slot's byte extent is a property of the tensor for as long as
+             * the shape generation lasts; a caller asking for fewer bytes is
+             * asking about part of it, not redefining it. Assigning the request
+             * made a partial write shrink the tensor, and the next whole-tensor
+             * read then looked like a *growth* -- which sets host_dirty and
+             * re-uploads the host copy over rows the device had just written.
+             *
+             * A batched decode row is exactly that shape: one dispatch per
+             * contiguous run of lane rows, each naming the tensor base with one
+             * run's worth of bytes. The first run shrank the slot, the second
+             * found nothing containing it and minted an orphan, and attention
+             * then read a tensor re-uploaded from a host mirror that never had
+             * the rows. A real shape change retires the slot by generation, so
+             * nothing here needs shrinking to express it.
+             */
             if (bytes > s->bytes) {
                 s->host_dirty = 1;
                 s->device_dirty = 0;
+                s->bytes = bytes;
             }
-            s->bytes = bytes;
             if (is_weight) s->is_weight = 1;
             return s;
         }
@@ -1612,7 +1861,7 @@ static VkTensorSlot* graph_ensure_device(const void* host, size_t bytes, int is_
     VkTensorSlot* s = graph_get_slot(host, bytes, is_weight);
     if (!s) return NULL;
     if (s->host_dirty) {
-        memcpy((char*)io_mapped + s->offset, host, bytes);
+        if (!vk_staging_upload(s->offset, host, bytes)) return NULL;
         s->host_dirty = 0;
         s->device_dirty = 0;
     }
@@ -1635,11 +1884,7 @@ static VkTensorSlot* graph_ensure_packed_bytes(const void* host, size_t logical_
     VkTensorSlot* s = graph_get_slot(host, storage_bytes, is_weight);
     if (!s) return NULL;
     if (s->host_dirty) {
-        memcpy((char*)io_mapped + s->offset, host, logical_bytes);
-        if (storage_bytes > logical_bytes) {
-            memset((char*)io_mapped + s->offset + logical_bytes, 0,
-                   storage_bytes - logical_bytes);
-        }
+        if (!vk_staging_upload(s->offset, host, logical_bytes)) return NULL;
         s->host_dirty = 0;
         s->device_dirty = 0;
     }
@@ -1654,6 +1899,159 @@ static VkTensorSlot* graph_output_packed_bytes(const void* host, size_t logical_
 
 static VkTensorSlot* graph_output_slot(const void* host, size_t bytes) {
     return graph_get_slot(host, bytes, 0);
+}
+
+/* A binding into part of a resident tensor.
+ *
+ * Row execution asks for a *slice* of an activation, not for a tensor. The slot
+ * map is keyed by complete host-span bases, so an interior pointer finds
+ * nothing on an exact lookup, and minting a slot for it would give the same
+ * bytes two device allocations that then drift. Resolving it as an offset into
+ * the containing slot is what CUDA already does (`graph_get_view`), and it is
+ * what stands between this backend and a decode row that stays on the device.
+ *
+ * `offset` is an `io_buffer` byte offset, which is what every binding here
+ * already is -- so a window costs no new machinery at dispatch, only at
+ * resolution. */
+typedef struct {
+    VkTensorSlot* slot;
+    size_t offset;
+    size_t bytes;
+} VkGraphWindow;
+
+/*
+ * The resident slot whose span contains `[host, host + bytes)`.
+ *
+ * Exact base first, then the smallest containing span: a tensor and an arena
+ * span that both cover the pointer are both legal answers, and the tighter one
+ * is the tensor. Returns -1 when nothing contains it, which is the ordinary
+ * "this is a new tensor" case and not an error.
+ */
+static int graph_find_containing_slot(const void* host, size_t bytes, size_t* inner) {
+    uintptr_t start = (uintptr_t)host;
+    uintptr_t end;
+    int best = -1;
+    int exact;
+    if (!host || !bytes || start > UINTPTR_MAX - bytes) return -1;
+    end = start + bytes;
+    exact = graph_find_slot(host);
+    if (exact >= 0 && graph_slots[exact].bytes >= bytes) {
+        if (inner) *inner = 0;
+        return exact;
+    }
+    for (int index = 0; index < graph_slot_count; index++) {
+        VkTensorSlot* slot = &graph_slots[index];
+        uintptr_t slot_start = (uintptr_t)slot->host;
+        uintptr_t slot_end;
+        if (!slot->host || !slot->bytes || !slot->owns_range ||
+            slot_start > UINTPTR_MAX - slot->bytes) continue;
+        if (!slot->is_weight && slot->shape_generation != graph_shape_generation) continue;
+        slot_end = slot_start + slot->bytes;
+        if (start < slot_start || end > slot_end) continue;
+        if (best < 0 || slot->bytes < graph_slots[best].bytes) best = index;
+    }
+    if (best >= 0 && inner) {
+        *inner = (size_t)((uintptr_t)host - (uintptr_t)graph_slots[best].host);
+    }
+    return best;
+}
+
+/*
+ * Finish a window against a slot that is already resident.
+ *
+ * The alignment check is the one real constraint a device row carries.
+ * `VkDescriptorBufferInfo.offset` must be a multiple of the device's storage
+ * alignment, and a row offset is `row * width * element size` -- so a row is
+ * bindable exactly when its *stride* is a multiple of that alignment. Refusing
+ * here names the constraint; the caller falls back to the host row path, which
+ * is what happens today for every row.
+ */
+static int graph_window_finish(VkTensorSlot* slot, size_t inner, size_t bytes,
+                               VkGraphWindow* out) {
+    if (!slot || !out || !bytes || inner > slot->bytes ||
+        bytes > slot->bytes - inner) return 0;
+    if (graph_alignment && (slot->offset + inner) % graph_alignment) return 0;
+    out->slot = slot;
+    out->offset = slot->offset + inner;
+    out->bytes = bytes;
+    return 1;
+}
+
+/*
+ * Whether `host` names an interior slice, and of which base.
+ *
+ * Resolution goes through the ordinary `graph_ensure_*` on the *base* pointer
+ * rather than around it, so a window inherits every domain, capacity and
+ * dirty-state rule a whole tensor obeys. The only thing that differs is where
+ * the binding starts.
+ */
+static int graph_window_base(const void* host, size_t bytes,
+                             const void** base, size_t* base_bytes, size_t* inner) {
+    int index = graph_find_containing_slot(host, bytes, inner);
+    if (index < 0 || *inner == 0) return 0;
+    *base = graph_slots[index].host;
+    *base_bytes = graph_slots[index].bytes;
+    return 1;
+}
+
+static int graph_window_device(const void* host, size_t bytes, int is_weight,
+                               VkGraphWindow* out) {
+    const void* base = host;
+    size_t base_bytes = bytes;
+    size_t inner = 0;
+    VkTensorSlot* slot;
+    if (!host || !bytes || !out) return 0;
+    if (!graph_window_base(host, bytes, &base, &base_bytes, &inner)) {
+        base = host;
+        base_bytes = bytes;
+        inner = 0;
+    }
+    slot = graph_ensure_device(base, base_bytes, is_weight);
+    return graph_window_finish(slot, inner, bytes, out);
+}
+
+/* The packed spelling. A window's own bytes stay logical: only the containing
+ * slot is rounded up to whole words, and the tail it pads belongs to the
+ * tensor rather than to any one row. */
+static int graph_window_packed_bytes(const void* host, size_t logical_bytes,
+                                     int is_weight, VkGraphWindow* out) {
+    const void* base = host;
+    size_t base_bytes = logical_bytes;
+    size_t inner = 0;
+    size_t storage_bytes;
+    VkTensorSlot* slot;
+    if (!host || !out || !graph_packed_bytes(logical_bytes, &storage_bytes)) return 0;
+    if (graph_window_base(host, logical_bytes, &base, &base_bytes, &inner)) {
+        slot = graph_ensure_packed_bytes(base, base_bytes, is_weight);
+        return graph_window_finish(slot, inner, storage_bytes, out);
+    }
+    slot = graph_ensure_packed_bytes(host, logical_bytes, is_weight);
+    return graph_window_finish(slot, 0, storage_bytes, out);
+}
+
+/*
+ * An output window.
+ *
+ * A row writes part of a tensor, so the rest has to already be on the device --
+ * otherwise the next read of an untouched row sees whatever the arena held.
+ * When the containing slot is host-dirty this uploads it whole first and the
+ * kernel then overwrites one row, which is the same order the host row path
+ * achieves by syncing before it runs.
+ */
+static int graph_window_output_packed(const void* host, size_t logical_bytes,
+                                      VkGraphWindow* out) {
+    const void* base = host;
+    size_t base_bytes = logical_bytes;
+    size_t inner = 0;
+    size_t storage_bytes;
+    VkTensorSlot* slot;
+    if (!host || !out || !graph_packed_bytes(logical_bytes, &storage_bytes)) return 0;
+    if (graph_window_base(host, logical_bytes, &base, &base_bytes, &inner)) {
+        slot = graph_ensure_packed_bytes(base, base_bytes, 0);
+        return graph_window_finish(slot, inner, storage_bytes, out);
+    }
+    slot = graph_output_packed_bytes(host, logical_bytes);
+    return graph_window_finish(slot, 0, storage_bytes, out);
 }
 
 static void graph_mark_device(VkTensorSlot* s) {
@@ -1689,7 +2087,7 @@ static size_t graph_scratch_alloc(size_t bytes) {
 static size_t graph_scratch_upload(const void* data, size_t bytes) {
     size_t off = graph_scratch_alloc(bytes);
     if (off == SIZE_MAX) return SIZE_MAX;
-    memcpy((char*)io_mapped + off, data, bytes);
+    if (!vk_staging_upload(off, data, bytes)) return SIZE_MAX;
     return off;
 }
 
@@ -1697,7 +2095,7 @@ static size_t graph_scratch_upload(const void* data, size_t bytes) {
 static size_t graph_scratch_zero(size_t bytes) {
     size_t off = graph_scratch_alloc(bytes);
     if (off == SIZE_MAX) return SIZE_MAX;
-    memset((char*)io_mapped + off, 0, bytes);
+    if (!vk_staging_zero(off, bytes)) return SIZE_MAX;
     return off;
 }
 
@@ -2084,6 +2482,13 @@ void vk_graph_begin_forward(void) {
     context->qconv_scalar_dispatches = 0u;
     context->conv_out16_dispatches = 0u;
     context->conv_scalar_dispatches = 0u;
+    context->staging_upload_count = 0u;
+    context->staging_upload_bytes = 0u;
+    context->staging_download_count = 0u;
+    context->staging_download_bytes = 0u;
+    context->staging_submit_count = 0u;
+    context->prepared_pipeline_creates_at_forward =
+        context->prepared_pipeline_creates;
 #if defined(VOLVOXAI_VULKAN_TESTING)
     context->test_conv_pointwise_selections = 0u;
 #endif
@@ -2112,8 +2517,8 @@ static void vk_graph_append_counter(char* output, size_t output_capacity,
 int vk_graph_append_dynamic_telemetry(char* output,
                                       size_t output_capacity) {
     VulkanContextState* context = vk_context_current();
-    if (!output || !output_capacity || !context) return -1;
     size_t offset = 0u;
+    if (!output || !output_capacity || !context) return -1;
     output[0] = '\0';
     vk_graph_append_counter(output, output_capacity, &offset, "vk_c16",
                             context->conv_out16_dispatches);
@@ -2135,6 +2540,36 @@ int vk_graph_append_dynamic_telemetry(char* output,
                             context->qconv_tiled_dispatches);
     vk_graph_append_counter(output, output_capacity, &offset, "vk_qcs",
                             context->qconv_scalar_dispatches);
+    vk_graph_append_counter(
+        output, output_capacity, &offset, "vk_pc",
+        context->prepared_pipeline_creates -
+            context->prepared_pipeline_creates_at_forward);
+    return 0;
+}
+
+int vk_graph_execution_evidence(char* output, size_t output_capacity) {
+    VulkanContextState* context = vk_context_current();
+    int written;
+    if (!output || !output_capacity || !context || !vk_is_ready() ||
+        !(context->compute_memory_flags &
+          VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) ||
+        !(context->staging_memory_flags &
+          VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT))
+        return -1;
+    written = snprintf(
+        output, output_capacity,
+        ";vk_mem=device-local;vk_arena=%zu;vk_stage=%zu;"
+        "vk_stage_coherent=%u;vk_up=%" PRIu64 ";vk_down=%" PRIu64,
+        context->arena_allocation_size,
+        context->staging_allocation_size,
+        !!(context->staging_memory_flags &
+           VK_MEMORY_PROPERTY_HOST_COHERENT_BIT),
+        context->staging_upload_count,
+        context->staging_download_count);
+    if (written < 0 || (size_t)written >= output_capacity) {
+        output[0] = '\0';
+        return -1;
+    }
     return 0;
 }
 
@@ -2163,8 +2598,7 @@ int vk_graph_sync_host(const void* host, size_t bytes, int is_weight) {
     VkTensorSlot* s = &graph_slots[idx];
     if (bytes > s->bytes) return 0;
     if (s->device_dirty) {
-        if (!vk_graph_flush_wait()) return 0;
-        memcpy((void*)host, (char*)io_mapped + s->offset, bytes);
+        if (!vk_staging_download(s->offset, (void*)host, bytes)) return 0;
         s->device_dirty = 0;
         s->host_dirty = 0;
     }
@@ -2228,9 +2662,11 @@ static VkPreparedKernel* vk_prepare_kernel(VkKernel* k) {
     pipe_info.stage.pName = vk_kernel_entry_point(k);
     pipe_info.layout = prepared.prepared_pipeline_layout;
     VkResult pipeline_result = vkCreateComputePipelines(
-        device, VK_NULL_HANDLE, 1, &pipe_info, NULL, &prepared.pipeline);
+        device, pipeline_cache, 1, &pipe_info, NULL, &prepared.pipeline);
     if (vkDestroyShaderModule) vkDestroyShaderModule(device, shader_module, NULL);
     if (pipeline_result != VK_SUCCESS) goto fail;
+    g_vulkan_device.prepared_pipeline_creates++;
+    context->prepared_pipeline_creates++;
 
     prepared.ready = 1;
     context->prepared_kernels[context->prepared_kernel_count] = prepared;
@@ -2300,6 +2736,7 @@ static int vk_graph_submit_recording(void) {
     }
     graph_cmd_recording = 0;
     graph_cmd_pending = 1;
+    vk_context_current()->staging_submit_count++;
     return 1;
 }
 
@@ -2310,8 +2747,294 @@ static int vk_graph_flush_wait(void) {
         if (vkWaitForFences(device, 1, &compute_fence, VK_TRUE, UINT64_MAX) != VK_SUCCESS) return 0;
         graph_cmd_pending = 0;
     }
+    /* Every staging range recorded before this point is now retired.  Reuse
+     * starts only after the fence, never merely after queue submission. */
+    vk_stage_cursor = 0u;
     return 1;
 }
+
+static int vk_staging_aligned_copy_span(size_t device_offset, size_t bytes,
+                                        size_t* copy_span) {
+    if (!copy_span || !bytes || (device_offset & 3u) != 0u ||
+        !vk_graph_align_up(bytes, 4u, copy_span) ||
+        device_offset > io_size || *copy_span > io_size - device_offset)
+        return 0;
+    return 1;
+}
+
+static int vk_staging_mapped_range(size_t offset, size_t bytes,
+                                   VkMappedMemoryRange* range) {
+    VulkanContextState* context = vk_context_current();
+    size_t atom;
+    size_t end;
+    size_t aligned_begin;
+    size_t aligned_end;
+    if (!context || !range || !bytes ||
+        non_coherent_atom_size > (VkDeviceSize)SIZE_MAX)
+        return 0;
+    atom = (size_t)non_coherent_atom_size;
+    if (!atom || offset > context->staging_allocation_size ||
+        bytes > context->staging_allocation_size - offset)
+        return 0;
+    end = offset + bytes;
+    aligned_begin = offset - offset % atom;
+    if (end == context->staging_allocation_size) {
+        aligned_end = end;
+    } else {
+        if (!vk_graph_align_up(end, atom, &aligned_end)) return 0;
+        if (aligned_end > context->staging_allocation_size)
+            aligned_end = context->staging_allocation_size;
+    }
+    if (aligned_end <= aligned_begin) return 0;
+    memset(range, 0, sizeof(*range));
+    range->sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE;
+    range->memory = vk_stage_memory;
+    range->offset = (VkDeviceSize)aligned_begin;
+    range->size = (VkDeviceSize)(aligned_end - aligned_begin);
+    return 1;
+}
+
+static int vk_staging_flush_host_write(size_t offset, size_t bytes) {
+    VulkanContextState* context = vk_context_current();
+    VkMappedMemoryRange range;
+    if (!context ||
+        (context->staging_memory_flags &
+         VK_MEMORY_PROPERTY_HOST_COHERENT_BIT))
+        return context != NULL;
+    if (!vk_staging_mapped_range(offset, bytes, &range)) return 0;
+    return vkFlushMappedMemoryRanges(device, 1u, &range) == VK_SUCCESS;
+}
+
+static int vk_staging_invalidate_host_read(size_t offset, size_t bytes) {
+    VulkanContextState* context = vk_context_current();
+    VkMappedMemoryRange range;
+    if (!context ||
+        (context->staging_memory_flags &
+         VK_MEMORY_PROPERTY_HOST_COHERENT_BIT))
+        return context != NULL;
+    if (!vk_staging_mapped_range(offset, bytes, &range)) return 0;
+    return vkInvalidateMappedMemoryRanges(device, 1u, &range) == VK_SUCCESS;
+}
+
+static int vk_staging_reserve(size_t bytes, size_t* offset) {
+    size_t reservation_alignment;
+    size_t reservation_bytes;
+    size_t aligned_cursor;
+    if (!offset || !bytes || (bytes & 3u) != 0u || bytes > vk_stage_size)
+        return 0;
+    if (non_coherent_atom_size > (VkDeviceSize)SIZE_MAX) return 0;
+    reservation_alignment = (size_t)non_coherent_atom_size;
+    if (reservation_alignment < 4u) reservation_alignment = 4u;
+    if (!vk_graph_align_up(bytes, reservation_alignment, &reservation_bytes) ||
+        reservation_bytes > vk_stage_size ||
+        !vk_graph_align_up(vk_stage_cursor, reservation_alignment,
+                           &aligned_cursor))
+        return 0;
+    if (aligned_cursor > vk_stage_size ||
+        reservation_bytes > vk_stage_size - aligned_cursor) {
+        if (!vk_graph_flush_wait()) return 0;
+        aligned_cursor = 0u;
+    }
+    if (reservation_bytes > vk_stage_size - aligned_cursor) return 0;
+    *offset = aligned_cursor;
+    vk_stage_cursor = aligned_cursor + reservation_bytes;
+    return 1;
+}
+
+static void vk_staging_barrier_before_device_write(size_t offset,
+                                                    size_t bytes) {
+    VkBufferMemoryBarrier barrier = {0};
+    barrier.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+    barrier.srcAccessMask =
+        VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+    barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barrier.buffer = io_buffer;
+    barrier.offset = (VkDeviceSize)offset;
+    barrier.size = (VkDeviceSize)bytes;
+    vkCmdPipelineBarrier(cmd_buf, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                         VK_PIPELINE_STAGE_TRANSFER_BIT, 0u,
+                         0u, NULL, 1u, &barrier, 0u, NULL);
+}
+
+static void vk_staging_barrier_after_device_write(size_t offset,
+                                                   size_t bytes) {
+    VkBufferMemoryBarrier barrier = {0};
+    barrier.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+    barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    barrier.dstAccessMask =
+        VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+    barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barrier.buffer = io_buffer;
+    barrier.offset = (VkDeviceSize)offset;
+    barrier.size = (VkDeviceSize)bytes;
+    vkCmdPipelineBarrier(cmd_buf, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0u,
+                         0u, NULL, 1u, &barrier, 0u, NULL);
+}
+
+static void vk_staging_barrier_before_device_read(size_t offset,
+                                                   size_t bytes) {
+    VkBufferMemoryBarrier barrier = {0};
+    barrier.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+    barrier.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT;
+    barrier.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+    barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barrier.buffer = io_buffer;
+    barrier.offset = (VkDeviceSize)offset;
+    barrier.size = (VkDeviceSize)bytes;
+    vkCmdPipelineBarrier(cmd_buf, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                         VK_PIPELINE_STAGE_TRANSFER_BIT, 0u,
+                         0u, NULL, 1u, &barrier, 0u, NULL);
+}
+
+static int vk_staging_upload(size_t device_offset, const void* source,
+                             size_t bytes) {
+    VulkanContextState* context = vk_context_current();
+    const unsigned char* input = (const unsigned char*)source;
+    size_t copy_span;
+    size_t consumed = 0u;
+    if (!context || !source ||
+        !vk_staging_aligned_copy_span(device_offset, bytes, &copy_span))
+        return 0;
+    while (consumed < bytes) {
+        size_t remaining = bytes - consumed;
+        size_t logical = remaining > vk_stage_size ? vk_stage_size : remaining;
+        size_t copied;
+        size_t stage_offset;
+        VkBufferCopy copy;
+        if (!vk_graph_align_up(logical, 4u, &copied) || copied > vk_stage_size ||
+            !vk_graph_begin_recording() ||
+            !vk_staging_reserve(copied, &stage_offset) ||
+            !vk_graph_begin_recording())
+            return 0;
+        memcpy((unsigned char*)vk_stage_mapped + stage_offset,
+               input + consumed, logical);
+        if (copied > logical)
+            memset((unsigned char*)vk_stage_mapped + stage_offset + logical,
+                   0, copied - logical);
+        if (!vk_staging_flush_host_write(stage_offset, copied)) return 0;
+        vk_staging_barrier_before_device_write(
+            device_offset + consumed, copied);
+        copy.srcOffset = (VkDeviceSize)stage_offset;
+        copy.dstOffset = (VkDeviceSize)(device_offset + consumed);
+        copy.size = (VkDeviceSize)copied;
+        vkCmdCopyBuffer(cmd_buf, vk_stage_buffer, io_buffer, 1u, &copy);
+        vk_staging_barrier_after_device_write(
+            device_offset + consumed, copied);
+        consumed += logical;
+    }
+    context->staging_upload_count++;
+    context->staging_upload_bytes += (uint64_t)bytes;
+    (void)copy_span;
+    return 1;
+}
+
+static int vk_staging_zero(size_t device_offset, size_t bytes) {
+    VulkanContextState* context = vk_context_current();
+    size_t copy_span;
+    size_t consumed = 0u;
+    if (!context ||
+        !vk_staging_aligned_copy_span(device_offset, bytes, &copy_span))
+        return 0;
+    while (consumed < bytes) {
+        size_t remaining = bytes - consumed;
+        size_t logical = remaining > vk_stage_size ? vk_stage_size : remaining;
+        size_t copied;
+        size_t stage_offset;
+        VkBufferCopy copy;
+        if (!vk_graph_align_up(logical, 4u, &copied) || copied > vk_stage_size ||
+            !vk_graph_begin_recording() ||
+            !vk_staging_reserve(copied, &stage_offset) ||
+            !vk_graph_begin_recording())
+            return 0;
+        memset((unsigned char*)vk_stage_mapped + stage_offset, 0, copied);
+        if (!vk_staging_flush_host_write(stage_offset, copied)) return 0;
+        vk_staging_barrier_before_device_write(
+            device_offset + consumed, copied);
+        copy.srcOffset = (VkDeviceSize)stage_offset;
+        copy.dstOffset = (VkDeviceSize)(device_offset + consumed);
+        copy.size = (VkDeviceSize)copied;
+        vkCmdCopyBuffer(cmd_buf, vk_stage_buffer, io_buffer, 1u, &copy);
+        vk_staging_barrier_after_device_write(
+            device_offset + consumed, copied);
+        consumed += logical;
+    }
+    context->staging_upload_count++;
+    context->staging_upload_bytes += (uint64_t)bytes;
+    (void)copy_span;
+    return 1;
+}
+
+static int vk_staging_download(size_t device_offset, void* destination,
+                               size_t bytes) {
+    VulkanContextState* context = vk_context_current();
+    unsigned char* output = (unsigned char*)destination;
+    size_t copy_span;
+    size_t consumed = 0u;
+    if (!context || !destination ||
+        !vk_staging_aligned_copy_span(device_offset, bytes, &copy_span))
+        return 0;
+    while (consumed < bytes) {
+        size_t remaining = bytes - consumed;
+        size_t logical = remaining > vk_stage_size ? vk_stage_size : remaining;
+        size_t copied;
+        size_t stage_offset;
+        VkBufferCopy copy;
+        if (!vk_graph_align_up(logical, 4u, &copied) || copied > vk_stage_size ||
+            !vk_graph_begin_recording() ||
+            !vk_staging_reserve(copied, &stage_offset) ||
+            !vk_graph_begin_recording())
+            return 0;
+        vk_staging_barrier_before_device_read(
+            device_offset + consumed, copied);
+        copy.srcOffset = (VkDeviceSize)(device_offset + consumed);
+        copy.dstOffset = (VkDeviceSize)stage_offset;
+        copy.size = (VkDeviceSize)copied;
+        vkCmdCopyBuffer(cmd_buf, io_buffer, vk_stage_buffer, 1u, &copy);
+        if (!vk_graph_flush_wait() ||
+            !vk_staging_invalidate_host_read(stage_offset, copied))
+            return 0;
+        memcpy(output + consumed,
+               (unsigned char*)vk_stage_mapped + stage_offset, logical);
+        consumed += logical;
+    }
+    context->staging_download_count++;
+    context->staging_download_bytes += (uint64_t)bytes;
+    (void)copy_span;
+    return 1;
+}
+
+#if defined(VOLVOXAI_VULKAN_TESTING)
+int vk_test_staging_round_trip(const void* input, void* output, size_t bytes) {
+    size_t offset;
+    if (!input || !output || !bytes ||
+        !vk_graph_align_up(VK_GRAPH_BASE, graph_alignment, &offset) ||
+        offset > io_size || bytes > io_size - offset ||
+        !vk_graph_flush_wait() ||
+        !vk_staging_upload(offset, input, bytes) ||
+        !vk_staging_download(offset, output, bytes))
+        return -1;
+    return 0;
+}
+
+int vk_test_staging_mapped_range(size_t offset, size_t bytes,
+                                 size_t* aligned_offset,
+                                 size_t* aligned_bytes) {
+    VkMappedMemoryRange range;
+    if (!aligned_offset || !aligned_bytes ||
+        !vk_staging_mapped_range(offset, bytes, &range) ||
+        range.offset > (VkDeviceSize)SIZE_MAX ||
+        range.size > (VkDeviceSize)SIZE_MAX)
+        return -1;
+    *aligned_offset = (size_t)range.offset;
+    *aligned_bytes = (size_t)range.size;
+    return 0;
+}
+#endif
 
 static int vk_dispatch_dimensions_valid(uint32_t gx, uint32_t gy, uint32_t gz) {
     return gx > 0 && gy > 0 && gz > 0 &&
@@ -2457,10 +3180,10 @@ static const VkTrainingSpec training_specs[] = {
     VK_TRAIN_SPEC("matMulBackward", "input_main", 7, 6, 6, 0x038u),
     VK_TRAIN_SPEC("matMulBackward", "weight_main", 7, 6, 6, 0x038u),
     VK_TRAIN_SPEC("matMulBackward", "bias_main", 7, 6, 6, 0x038u),
-    VK_TRAIN_SPEC("moeLinearBackward", "input_main", 11, 10, 10, 0x3c0u),
-    VK_TRAIN_SPEC("moeLinearBackward", "weight_main", 11, 10, 10, 0x3c0u),
-    VK_TRAIN_SPEC("moeLinearBackward", "bias_main", 11, 10, 10, 0x3c0u),
-    VK_TRAIN_SPEC("moeLinearBackward", "route_main", 11, 10, 10, 0x3c0u),
+    VK_TRAIN_SPEC("moeLinearBackward", "input_main", 13, 12, 12, 0x3c0u),
+    VK_TRAIN_SPEC("moeLinearBackward", "weight_main", 13, 12, 12, 0x3c0u),
+    VK_TRAIN_SPEC("moeLinearBackward", "bias_main", 13, 12, 12, 0x3c0u),
+    VK_TRAIN_SPEC("moeLinearBackward", "route_main", 13, 12, 12, 0x3c0u),
     VK_TRAIN_SPEC("moeRouterBackward", "logit_main", 11, 10, 10, 0x3c0u),
     VK_TRAIN_SPEC("moeRouterBackward", "input_main", 11, 10, 10, 0x3c0u),
     VK_TRAIN_SPEC("moeRouterBackward", "weight_main", 11, 10, 10, 0x3c0u),
@@ -2503,3706 +3226,11 @@ static const char* vk_kernel_entry_point(VkKernel* kernel) {
     return "main";
 }
 
-#if VOLVOXAI_ENABLE_TRAINING
-static void vk_training_track_tensor(VkTensorSlot* tensor) {
-    if (!tensor) return;
-    for (int i = 0; i < training_touched_count; i++) {
-        if (training_touched_slots[i] == tensor) return;
-    }
-    if (training_touched_count < VK_GRAPH_MAX_TENSORS) {
-        training_touched_slots[training_touched_count++] = tensor;
-    }
-}
+#include "vulkan_training.inc"
 
-static const VkTrainingSpec* vk_training_find_spec(const char* shader, const char* entry) {
-    if (!shader || !entry) return NULL;
-    size_t count = sizeof(training_specs) / sizeof(training_specs[0]);
-    for (size_t i = 0; i < count; i++) {
-        if (!strcmp(shader, training_specs[i].shader) &&
-            !strcmp(entry, training_specs[i].entry)) {
-            return &training_specs[i];
-        }
-    }
-    return NULL;
-}
+#include "vulkan_graph_f32.inc"
 
-static int vk_training_prepare_pool(void) {
-    if (training_desc_pool != VK_NULL_HANDLE) return 1;
-    VkTrainingKernelSlot* kernels = (VkTrainingKernelSlot*)calloc(
-        VK_TRAINING_MAX_KERNELS, sizeof(*kernels));
-    VkGraphDispatchSet* sets = (VkGraphDispatchSet*)calloc(
-        VK_TRAINING_MAX_DISPATCH_SETS, sizeof(*sets));
-    VkTensorSlot** touched = (VkTensorSlot**)calloc(
-        VK_GRAPH_MAX_TENSORS, sizeof(*touched));
-    if (!kernels || !sets || !touched) {
-        free(kernels);
-        free(sets);
-        free(touched);
-        return 0;
-    }
-    VkDescriptorPoolSize sizes[2];
-    memset(sizes, 0, sizeof(sizes));
-    sizes[0].type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-    sizes[0].descriptorCount = VK_TRAINING_MAX_DISPATCH_SETS * 12u +
-                               VK_TRAINING_MAX_KERNELS * 12u;
-    sizes[1].type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
-    sizes[1].descriptorCount = VK_TRAINING_MAX_DISPATCH_SETS +
-                               VK_TRAINING_MAX_KERNELS;
-    VkDescriptorPoolCreateInfo info = {0};
-    info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
-    info.maxSets = VK_TRAINING_MAX_DISPATCH_SETS + VK_TRAINING_MAX_KERNELS;
-    info.poolSizeCount = 2;
-    info.pPoolSizes = sizes;
-    pthread_mutex_lock(&g_vulkan_device.mutex);
-    VkResult pool_result = vkCreateDescriptorPool(
-        device, &info, NULL, &training_desc_pool);
-    pthread_mutex_unlock(&g_vulkan_device.mutex);
-    if (pool_result != VK_SUCCESS) {
-        free(kernels);
-        free(sets);
-        free(touched);
-        return 0;
-    }
-    training_kernels = kernels;
-    training_dispatch_sets = sets;
-    training_touched_slots = touched;
-    return 1;
-}
-
-static VkKernel* vk_training_kernel(const VkTrainingSpec* spec) {
-    if (!spec || training_desc_pool == VK_NULL_HANDLE) return NULL;
-    for (int i = 0; i < training_kernel_count; i++) {
-        if (training_kernels[i].spec == spec) return &training_kernels[i].kernel;
-    }
-    if (training_kernel_count >= VK_TRAINING_MAX_KERNELS) return NULL;
-    VkTrainingKernelSlot* slot = &training_kernels[training_kernel_count++];
-    memset(slot, 0, sizeof(*slot));
-    slot->spec = spec;
-    int n = snprintf(slot->path, sizeof(slot->path),
-                     "spv/%s.spv", spec->shader);
-    if (n <= 0 || (size_t)n >= sizeof(slot->path)) {
-        training_kernel_count--;
-        memset(slot, 0, sizeof(*slot));
-        return NULL;
-    }
-    slot->kernel.name = spec->shader;
-    slot->kernel.path = slot->path;
-    slot->kernel.binding_count = spec->binding_count;
-    slot->kernel.uniform_binding = spec->uniform_binding;
-    return &slot->kernel;
-}
-
-static VkDescriptorSet vk_training_dispatch_set(
-        VkKernel* kernel, const VkPreparedKernel* prepared) {
-    if (!kernel || !prepared || prepared->prepared_desc_layout == VK_NULL_HANDLE ||
-        training_dispatch_set_cursor >= VK_TRAINING_MAX_DISPATCH_SETS) {
-        return VK_NULL_HANDLE;
-    }
-    int index = training_dispatch_set_cursor++;
-    VkGraphDispatchSet* slot = &training_dispatch_sets[index];
-    if (slot->descriptor_set != VK_NULL_HANDLE && slot->kernel == kernel) return slot->descriptor_set;
-
-    VkDescriptorSetAllocateInfo info = {0};
-    info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
-    info.descriptorPool = training_desc_pool;
-    info.descriptorSetCount = 1;
-    info.pSetLayouts = &prepared->prepared_desc_layout;
-    if (vkAllocateDescriptorSets(device, &info, &slot->descriptor_set) != VK_SUCCESS) {
-        slot->descriptor_set = VK_NULL_HANDLE;
-        slot->kernel = NULL;
-        return VK_NULL_HANDLE;
-    }
-    slot->kernel = kernel;
-    if (index >= training_dispatch_set_count) training_dispatch_set_count = index + 1;
-    return slot->descriptor_set;
-}
-
-static int vk_training_dispatch_kernel(VkKernel* kernel,
-                                       const VkGraphBinding* bindings,
-                                       uint32_t gx, uint32_t gy, uint32_t gz) {
-    VkPreparedKernel* prepared;
-    if (!vk_dispatch_dimensions_valid(gx, gy, gz) || !bindings ||
-        kernel->binding_count > 16) return 0;
-    prepared = vk_prepare_kernel(kernel);
-    if (!prepared) return 0;
-    VkDescriptorSet set = vk_training_dispatch_set(kernel, prepared);
-    if (set == VK_NULL_HANDLE) return 0;
-
-    VkDescriptorBufferInfo infos[16];
-    VkWriteDescriptorSet writes[16];
-    memset(infos, 0, sizeof(infos));
-    memset(writes, 0, sizeof(writes));
-    for (int i = 0; i < kernel->binding_count; i++) {
-        infos[i].buffer = io_buffer;
-        infos[i].offset = bindings[i].offset;
-        infos[i].range = bindings[i].bytes;
-        writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-        writes[i].dstSet = set;
-        writes[i].dstBinding = (uint32_t)i;
-        writes[i].descriptorType = i == kernel->uniform_binding ?
-            VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER : VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-        writes[i].descriptorCount = 1;
-        writes[i].pBufferInfo = &infos[i];
-    }
-    vkUpdateDescriptorSets(device, (uint32_t)kernel->binding_count, writes, 0, NULL);
-
-    if (!vk_graph_begin_recording()) return 0;
-    vkCmdBindPipeline(cmd_buf, VK_PIPELINE_BIND_POINT_COMPUTE,
-                      prepared->pipeline);
-    vkCmdBindDescriptorSets(cmd_buf, VK_PIPELINE_BIND_POINT_COMPUTE,
-                            prepared->prepared_pipeline_layout, 0, 1, &set, 0, NULL);
-    vkCmdDispatch(cmd_buf, gx, gy, gz);
-    if (vkCmdPipelineBarrier) {
-        VkMemoryBarrier barrier = {0};
-        barrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
-        barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
-        barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
-        vkCmdPipelineBarrier(cmd_buf, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0,
-                             1, &barrier, 0, NULL, 0, NULL);
-    }
-    return 1;
-}
-
-int vk_training_available(void) {
-    return vk_is_ready() ? 1 : 0;
-}
-
-int vk_training_supports(const char* shader_name, const char* entry_point,
-                         const size_t* bytes, int binding_count,
-                         uint32_t groups_x, uint32_t groups_y, uint32_t groups_z) {
-    const VkTrainingSpec* spec = vk_training_find_spec(shader_name, entry_point);
-    if (!vk_training_available() || !spec || !bytes ||
-        binding_count != spec->binding_count || binding_count <= 0 ||
-        binding_count > 16 || spec->params_binding != binding_count - 1 ||
-        !vk_dispatch_dimensions_valid(groups_x, groups_y, groups_z) ||
-        training_max_workgroup_size_x < 64 ||
-        training_max_workgroup_invocations < 64) return 0;
-
-    uint32_t storage_bindings = spec->uniform_binding >= 0
-        ? (uint32_t)(binding_count - 1) : (uint32_t)binding_count;
-    uint32_t uniform_bindings = spec->uniform_binding >= 0 ? 1u : 0u;
-    if (storage_bindings > training_max_storage_bindings ||
-        uniform_bindings > training_max_uniform_bindings) return 0;
-    for (int i = 0; i < binding_count; i++) {
-        VkDeviceSize limit = i == spec->uniform_binding
-            ? training_max_uniform_range : training_max_storage_range;
-        if (bytes[i] == 0 || (VkDeviceSize)bytes[i] > limit) return 0;
-    }
-    return 1;
-}
-
-int vk_training_plan_supported(int command_count, const size_t* params_bytes,
-                               const VkTrainingTensorRequirement* tensors,
-                               int tensor_count) {
-    if (!vk_training_available() || command_count <= 0 ||
-        command_count > VK_TRAINING_MAX_DISPATCH_SETS || !params_bytes ||
-        tensor_count < 0 || (tensor_count > 0 && !tensors) ||
-        graph_alignment == 0 || io_size < VK_GRAPH_SCRATCH_BYTES) return 0;
-
-    size_t arena_limit = io_size - VK_GRAPH_SCRATCH_BYTES;
-    size_t arena_cursor = graph_bump;
-    int additional_slots = 0;
-    for (int i = 0; i < tensor_count; i++) {
-        if (!tensors[i].host || tensors[i].bytes == 0) return 0;
-        int slot = graph_find_slot(tensors[i].host);
-        if (slot >= 0 && tensors[i].bytes <= graph_slots[slot].bytes) continue;
-        if (slot < 0) additional_slots++;
-        if (arena_cursor > SIZE_MAX - (graph_alignment - 1)) return 0;
-        arena_cursor = ALIGN_UP(arena_cursor, graph_alignment);
-        if (arena_cursor > arena_limit ||
-            tensors[i].bytes > arena_limit - arena_cursor) return 0;
-        arena_cursor += tensors[i].bytes;
-        if (arena_cursor > SIZE_MAX - (graph_alignment - 1)) return 0;
-        arena_cursor = ALIGN_UP(arena_cursor, graph_alignment);
-    }
-    if (additional_slots > VK_GRAPH_MAX_TENSORS - graph_slot_count) return 0;
-
-    size_t cursor = io_size - VK_GRAPH_SCRATCH_BYTES;
-    if (cursor > SIZE_MAX - (graph_alignment - 1)) return 0;
-    cursor = ALIGN_UP(cursor, graph_alignment);
-    for (int i = 0; i < command_count; i++) {
-        size_t bytes = params_bytes[i];
-        if (bytes == 0 || cursor > io_size || bytes > io_size - cursor) return 0;
-        cursor += bytes;
-        if (cursor > SIZE_MAX - (graph_alignment - 1)) return 0;
-        cursor = ALIGN_UP(cursor, graph_alignment);
-    }
-    return cursor <= io_size;
-}
-
-int vk_training_begin(void) {
-    if (!vk_is_ready() || training_active || !vk_graph_flush_wait()) return -1;
-    int reuse_pool = training_desc_pool != VK_NULL_HANDLE;
-    if (!vk_training_prepare_pool()) return -1;
-    if (reuse_pool) {
-        if (!vkResetDescriptorPool ||
-            vkResetDescriptorPool(device, training_desc_pool, 0) != VK_SUCCESS) return -1;
-        memset(training_dispatch_sets, 0,
-               VK_TRAINING_MAX_DISPATCH_SETS * sizeof(*training_dispatch_sets));
-        training_dispatch_set_count = 0;
-    }
-    scratch_bump = 0;
-    scratch_high_water = 0;
-    training_dispatch_set_cursor = 0;
-    training_touched_count = 0;
-    training_active = 1;
-    return 0;
-}
-
-int vk_training_dispatch(const char* shader_name, const char* entry_point,
-                         void* const* hosts, const size_t* bytes,
-                         const unsigned char* access,
-                         const unsigned char* is_weight,
-                         int binding_count,
-                         uint32_t groups_x, uint32_t groups_y, uint32_t groups_z) {
-    const VkTrainingSpec* spec = vk_training_find_spec(shader_name, entry_point);
-    if (!training_active || !spec || !hosts || !bytes || !access ||
-        !vk_training_supports(shader_name, entry_point, bytes, binding_count,
-                              groups_x, groups_y, groups_z)) return -1;
-
-    graph_scratch_begin();
-    VkGraphBinding bindings[16];
-    VkTensorSlot* writable[16];
-    memset(bindings, 0, sizeof(bindings));
-    memset(writable, 0, sizeof(writable));
-    for (int i = 0; i < binding_count; i++) {
-        unsigned char mode = access[i];
-        if (!hosts[i] || !bytes[i] || (is_weight && is_weight[i] > 1) ||
-            mode < VK_TRAINING_READ ||
-            mode > (VK_TRAINING_READ | VK_TRAINING_WRITE)) return -1;
-        unsigned char expected = spec->read_write_mask & (1u << i) ?
-            (VK_TRAINING_READ | VK_TRAINING_WRITE) : VK_TRAINING_READ;
-        if (mode != expected) return -1;
-        if (i == spec->params_binding) {
-            if (mode != VK_TRAINING_READ) return -1;
-            size_t offset = graph_scratch_upload(hosts[i], bytes[i]);
-            if (offset == SIZE_MAX) return -1;
-            bindings[i].offset = offset;
-            bindings[i].bytes = bytes[i];
-            continue;
-        }
-
-        VkTensorSlot* tensor = NULL;
-        if (mode & VK_TRAINING_READ) {
-            tensor = graph_ensure_device(hosts[i], bytes[i], is_weight ? is_weight[i] != 0 : 0);
-        } else {
-            tensor = graph_get_slot(hosts[i], bytes[i], is_weight ? is_weight[i] != 0 : 0);
-            if (tensor && tensor->host_dirty) {
-                memset((char*)io_mapped + tensor->offset, 0, bytes[i]);
-                tensor->host_dirty = 0;
-                tensor->device_dirty = 0;
-            }
-        }
-        if (!tensor) return -1;
-        vk_training_track_tensor(tensor);
-        bindings[i].offset = tensor->offset;
-        bindings[i].bytes = bytes[i];
-        if (mode & VK_TRAINING_WRITE) writable[i] = tensor;
-    }
-
-    VkKernel* kernel = vk_training_kernel(spec);
-    if (!kernel || !vk_training_dispatch_kernel(kernel, bindings,
-                                                 groups_x, groups_y, groups_z)) return -1;
-    for (int i = 0; i < binding_count; i++) {
-        if (writable[i]) {
-            graph_mark_device(writable[i]);
-        }
-    }
-    return 0;
-}
-
-int vk_training_sync(void* host, size_t bytes) {
-    if (!training_active || !host || !bytes) return -1;
-    return vk_graph_sync_host(host, bytes, 0) ? 0 : -1;
-}
-
-void vk_training_end(void) {
-    if (!training_active) return;
-    (void)vk_graph_flush_wait();
-    /* Training arrays are normally released after a step.  Mark every host
-       identity touched by training as a new generation so malloc/stack
-       address reuse cannot retain old inputs or gradients.  device_dirty is
-       intentionally preserved: callers that kept a buffer can still download
-       it through vk_graph_sync_host().  A later GPU forward output clears the
-       host-dirty bit when it overwrites the same stable model tensor. */
-    for (int i = 0; i < training_touched_count; i++) {
-        if (training_touched_slots[i]) training_touched_slots[i]->host_dirty = 1;
-        training_touched_slots[i] = NULL;
-    }
-    training_touched_count = 0;
-    scratch_bump = 0;
-    scratch_high_water = 0;
-    training_dispatch_set_cursor = 0;
-    training_active = 0;
-}
-#endif
-
-int vk_graph_alias_f32(const float* in, float* out, long n) {
-    if (n <= 0 || !in || !out) return 0;
-    if (graph_domain_enforced && in != out)
-        return vk_graph_copy_f32(in, out, n);
-    size_t bytes = (size_t)n * sizeof(float);
-    VkTensorSlot* src = graph_ensure_device(in, bytes, 0);
-    if (!src) return 0;
-    VkTensorSlot* dst = graph_output_slot(out, bytes);
-    if (!dst) return 0;
-    if (dst == src) {
-        graph_mark_device(dst);
-        return 1;
-    }
-    if (dst->owns_range && dst->capacity &&
-        !vk_graph_range_free(dst->offset, dst->capacity)) return 0;
-    dst->offset = src->offset;
-    dst->bytes = bytes;
-    dst->capacity = src->capacity;
-    dst->capacity_generation = src->capacity_generation;
-    dst->owns_range = 0;
-    graph_mark_device(dst);
-    return 1;
-}
-
-int vk_graph_copy_f32(const float* in, float* out, long n) {
-    if (n <= 0 || !in || !out) return 0;
-    size_t bytes = (size_t)n * sizeof(float);
-    graph_scratch_begin();
-    VkTensorSlot* src = graph_ensure_device(in, bytes, 0);
-    VkTensorSlot* dst = graph_output_slot(out, bytes);
-    if (!src || !dst) return 0;
-    uint32_t params[1] = {(uint32_t)n};
-    size_t p_off = graph_scratch_upload(params, sizeof(params));
-    if (p_off == SIZE_MAX) return 0;
-    VkGraphBinding b[3] = {
-        {src->offset, bytes}, {dst->offset, bytes}, {p_off, sizeof(params)}
-    };
-    if (!vk_dispatch_kernel(&k_copy, b, ((uint32_t)n + 63u) / 64u, 1, 1)) return 0;
-    graph_mark_device(dst);
-    return 1;
-}
-
-int vk_graph_add_f32(const float* a, const float* bptr, float* out, long n) {
-    return vk_graph_add_relu_f32(a, bptr, out, n, 0);
-}
-
-int vk_graph_add_relu_f32(const float* a, const float* bptr, float* out, long n, int relu) {
-    if (n <= 0 || !a || !bptr || !out) return 0;
-    size_t bytes = (size_t)n * sizeof(float);
-    graph_scratch_begin();
-    VkTensorSlot* sa = graph_ensure_device(a, bytes, 0);
-    VkTensorSlot* sb = graph_ensure_device(bptr, bytes, 0);
-    VkTensorSlot* so = graph_output_slot(out, bytes);
-    if (!sa || !sb || !so) return 0;
-    uint32_t params[2] = {(uint32_t)n, (uint32_t)relu};
-    size_t p_off = graph_scratch_upload(params, sizeof(params));
-    if (p_off == SIZE_MAX) return 0;
-    VkGraphBinding binds[4] = {
-        {sa->offset, bytes}, {sb->offset, bytes}, {so->offset, bytes}, {p_off, sizeof(params)}
-    };
-    if (!vk_dispatch_kernel(relu ? &k_add_relu : &k_add, binds, ((uint32_t)n + 63u) / 64u, 1, 1)) return 0;
-    graph_mark_device(so);
-    return 1;
-}
-
-int vk_graph_clip_f32(const float* in, float* out, long n, float min_v, float max_v) {
-    if (n <= 0 || !in || !out) return 0;
-    size_t bytes = (size_t)n * sizeof(float);
-    graph_scratch_begin();
-    VkTensorSlot* src = graph_ensure_device(in, bytes, 0);
-    VkTensorSlot* dst = graph_output_slot(out, bytes);
-    if (!src || !dst) return 0;
-    struct { uint32_t size; float min_v; float max_v; } params = {(uint32_t)n, min_v, max_v};
-    size_t p_off = graph_scratch_upload(&params, sizeof(params));
-    if (p_off == SIZE_MAX) return 0;
-    VkGraphBinding binds[3] = {
-        {src->offset, bytes}, {dst->offset, bytes}, {p_off, sizeof(params)}
-    };
-    if (!vk_dispatch_kernel(&k_clip, binds, ((uint32_t)n + 63u) / 64u, 1, 1)) return 0;
-    graph_mark_device(dst);
-    return 1;
-}
-
-static int vk_graph_typed_control_32(
-        const void* a, size_t a_bytes, const void* b, size_t b_bytes,
-        void* output, size_t output_bytes,
-        const VxTypedControlMetadata* metadata) {
-    graph_scratch_begin();
-    VkTensorSlot* a_slot = graph_ensure_device(a, a_bytes, 0);
-    VkTensorSlot* b_slot = graph_ensure_device(b, b_bytes, 0);
-    VkTensorSlot* output_slot = graph_output_slot(output, output_bytes);
-    if (!a_slot || !b_slot || !output_slot || !metadata) return 0;
-    size_t metadata_offset =
-        graph_scratch_upload(metadata, sizeof(*metadata));
-    if (metadata_offset == SIZE_MAX) return 0;
-    VkGraphBinding bindings[4] = {
-        {a_slot->offset, a_bytes},
-        {b_slot->offset, b_bytes},
-        {output_slot->offset, output_bytes},
-        {metadata_offset, sizeof(*metadata)},
-    };
-    uint32_t elements = metadata->values[0];
-    if (!vk_dispatch_kernel(
-            &k_typed_control_32, bindings,
-            (elements + 63u) / 64u, 1u, 1u))
-        return 0;
-    graph_mark_device(output_slot);
-    return 1;
-}
-
-int vk_graph_compare_i32(
-        const int32_t* a, long a_elements,
-        const int32_t* b, long b_elements,
-        int32_t* output, long output_elements,
-        const uint32_t* output_strides,
-        const uint32_t* a_strides,
-        const uint32_t* b_strides,
-        int rank, int operation) {
-    VxTypedControlMetadata metadata;
-    size_t a_bytes;
-    size_t b_bytes;
-    size_t output_bytes;
-    if (!vx_typed_control_compare_plan(
-            a, a_elements, b, b_elements, output, output_elements,
-            output_strides, a_strides, b_strides, rank, operation,
-            &metadata, &a_bytes, &b_bytes, &output_bytes))
-        return 0;
-    return vk_graph_typed_control_32(
-        a, a_bytes, b, b_bytes, output, output_bytes, &metadata);
-}
-
-static int vk_graph_unary_i32(
-        const int32_t* input, int32_t* output, long elements,
-        int operation, int32_t minimum, int32_t maximum) {
-    VxTypedControlMetadata metadata;
-    size_t bytes;
-    if (!vx_typed_control_unary_plan(
-            input, output, elements, operation, minimum, maximum,
-            &metadata, &bytes))
-        return 0;
-    return vk_graph_typed_control_32(
-        input, bytes, input, bytes, output, bytes, &metadata);
-}
-
-int vk_graph_not_i32(
-        const int32_t* input, int32_t* output, long elements) {
-    return vk_graph_unary_i32(
-        input, output, elements, VX_TYPED_CONTROL_NOT_I32, 0, 0);
-}
-
-int vk_graph_clip_i32(
-        const int32_t* input, int32_t* output, long elements,
-        int32_t minimum, int32_t maximum) {
-    return vk_graph_unary_i32(
-        input, output, elements, VX_TYPED_CONTROL_CLIP_I32,
-        minimum, maximum);
-}
-
-int vk_graph_copy_32(const void* input, void* output, long elements) {
-    VxTypedControlMetadata metadata;
-    size_t bytes;
-    if (!vx_typed_control_copy_plan(
-            input, output, elements, &metadata, &bytes))
-        return 0;
-    return vk_graph_typed_control_32(
-        input, bytes, input, bytes, output, bytes, &metadata);
-}
-
-int vk_graph_cast_typed(
-        const void* input, int input_dtype,
-        void* output, int output_dtype, long elements) {
-    VxTypedControlMetadata metadata;
-    size_t bytes;
-    if (!vx_typed_control_cast_plan(
-            input, input_dtype, output, output_dtype, elements,
-            &metadata, &bytes))
-        return 0;
-    return vk_graph_typed_control_32(
-        input, bytes, input, bytes, output, bytes, &metadata);
-}
-
-int vk_graph_sigmoid_f32(const float* in, float* out, long n) {
-    if (n <= 0 || !in || !out) return 0;
-    size_t bytes = (size_t)n * sizeof(float);
-    graph_scratch_begin();
-    VkTensorSlot* src = graph_ensure_device(in, bytes, 0);
-    VkTensorSlot* dst = graph_output_slot(out, bytes);
-    if (!src || !dst) return 0;
-    uint32_t params[1] = {(uint32_t)n};
-    size_t p_off = graph_scratch_upload(params, sizeof(params));
-    if (p_off == SIZE_MAX) return 0;
-    VkGraphBinding binds[3] = {
-        {src->offset, bytes}, {dst->offset, bytes}, {p_off, sizeof(params)}
-    };
-    if (!vk_dispatch_kernel(&k_sigmoid, binds, ((uint32_t)n + 63u) / 64u, 1, 1)) return 0;
-    graph_mark_device(dst);
-    return 1;
-}
-
-static int vk_graph_unary_size_f32(VkKernel* k, const float* in, float* out, long n) {
-    if (n <= 0 || !in || !out) return 0;
-    size_t bytes = (size_t)n * sizeof(float);
-    graph_scratch_begin();
-    VkTensorSlot* src = graph_ensure_device(in, bytes, 0);
-    VkTensorSlot* dst = graph_output_slot(out, bytes);
-    if (!src || !dst) return 0;
-    uint32_t params[1] = {(uint32_t)n};
-    size_t p_off = graph_scratch_upload(params, sizeof(params));
-    if (p_off == SIZE_MAX) return 0;
-    VkGraphBinding binds[3] = {
-        {src->offset, bytes}, {dst->offset, bytes}, {p_off, sizeof(params)}
-    };
-    if (!vk_dispatch_kernel(k, binds, ((uint32_t)n + 63u) / 64u, 1, 1)) return 0;
-    graph_mark_device(dst);
-    return 1;
-}
-
-int vk_graph_relu_f32(const float* in, float* out, long n) { return vk_graph_unary_size_f32(&k_relu, in, out, n); }
-int vk_graph_gelu_f32(const float* in, float* out, long n, int approximate_tanh) {
-    if (n <= 0 || (uint64_t)n > UINT32_MAX || !in || !out ||
-        (approximate_tanh != 0 && approximate_tanh != 1)) return 0;
-    size_t bytes = (size_t)n * sizeof(float);
-    graph_scratch_begin();
-    VkTensorSlot* src = graph_ensure_device(in, bytes, 0);
-    VkTensorSlot* dst = graph_output_slot(out, bytes);
-    if (!src || !dst) return 0;
-    uint32_t params[4] = {(uint32_t)n, (uint32_t)approximate_tanh, 0u, 0u};
-    size_t p_off = graph_scratch_upload(params, sizeof(params));
-    if (p_off == SIZE_MAX) return 0;
-    VkGraphBinding binds[3] = {
-        {src->offset, bytes}, {dst->offset, bytes}, {p_off, sizeof(params)}
-    };
-    if (!vk_dispatch_kernel(&k_gelu, binds, ((uint32_t)n + 63u) / 64u, 1, 1)) return 0;
-    graph_mark_device(dst);
-    return 1;
-}
-int vk_graph_silu_f32(const float* in, float* out, long n) { return vk_graph_unary_size_f32(&k_silu, in, out, n); }
-int vk_graph_tanh_f32(const float* in, float* out, long n) { return vk_graph_unary_size_f32(&k_tanh, in, out, n); }
-int vk_graph_hardswish_f32(const float* in, float* out, long n) { return vk_graph_unary_size_f32(&k_hardswish, in, out, n); }
-int vk_graph_hardsigmoid_f32(const float* in, float* out, long n) { return vk_graph_unary_size_f32(&k_hardsigmoid, in, out, n); }
-int vk_graph_cast_copy_f32(const float* in, float* out, long n) { return vk_graph_copy_f32(in, out, n); }
-
-int vk_graph_leaky_relu_f32(const float* in, float* out, long n, float alpha) {
-    if (n <= 0 || !in || !out) return 0;
-    size_t bytes = (size_t)n * sizeof(float);
-    graph_scratch_begin();
-    VkTensorSlot* src = graph_ensure_device(in, bytes, 0);
-    VkTensorSlot* dst = graph_output_slot(out, bytes);
-    if (!src || !dst) return 0;
-    struct { uint32_t size; float alpha; } params = {(uint32_t)n, alpha};
-    size_t p_off = graph_scratch_upload(&params, sizeof(params));
-    if (p_off == SIZE_MAX) return 0;
-    VkGraphBinding binds[3] = {
-        {src->offset, bytes}, {dst->offset, bytes}, {p_off, sizeof(params)}
-    };
-    if (!vk_dispatch_kernel(&k_leaky_relu, binds, ((uint32_t)n + 63u) / 64u, 1, 1)) return 0;
-    graph_mark_device(dst);
-    return 1;
-}
-
-int vk_graph_prelu_f32(const float* in, const float* weight, float* out, long n, int channels) {
-    if (n <= 0 || channels <= 0 || !in || !weight || !out) return 0;
-    size_t bytes = (size_t)n * sizeof(float);
-    size_t wbytes = (size_t)channels * sizeof(float);
-    graph_scratch_begin();
-    VkTensorSlot* src = graph_ensure_device(in, bytes, 0);
-    VkTensorSlot* w = graph_ensure_device(weight, wbytes, 1);
-    VkTensorSlot* dst = graph_output_slot(out, bytes);
-    if (!src || !w || !dst) return 0;
-    uint32_t params[4] = {(uint32_t)n, (uint32_t)channels, (uint32_t)channels, 0u};
-    size_t p_off = graph_scratch_upload(params, sizeof(params));
-    if (p_off == SIZE_MAX) return 0;
-    VkGraphBinding binds[4] = {
-        {src->offset, bytes}, {w->offset, wbytes}, {dst->offset, bytes}, {p_off, sizeof(params)}
-    };
-    if (!vk_dispatch_kernel(&k_prelu, binds, ((uint32_t)n + 63u) / 64u, 1, 1)) return 0;
-    graph_mark_device(dst);
-    return 1;
-}
-
-int vk_graph_layernorm_f32(const float* in, const float* weight, const float* bias,
-                           float* out, int rows, int d_model, float eps) {
-    if (rows <= 0 || d_model <= 0 || !in || !weight || !bias || !out ||
-        !(eps > 0.0f) || !isfinite(eps)) return 0;
-    size_t bytes = (size_t)rows * d_model * sizeof(float);
-    size_t wbytes = (size_t)d_model * sizeof(float);
-    graph_scratch_begin();
-    VkTensorSlot* src = graph_ensure_device(in, bytes, 0);
-    VkTensorSlot* w = graph_ensure_device(weight, wbytes, 1);
-    VkTensorSlot* b = graph_ensure_device(bias, wbytes, 1);
-    VkTensorSlot* dst = graph_output_slot(out, bytes);
-    if (!src || !w || !b || !dst) return 0;
-    struct {
-        uint32_t rows;
-        uint32_t d_model;
-        float eps;
-        uint32_t pad;
-    } params = {(uint32_t)rows, (uint32_t)d_model, eps, 0u};
-    _Static_assert(sizeof(params) == 16, "LayerNorm uniform ABI");
-    size_t p_off = graph_scratch_upload(&params, sizeof(params));
-    if (p_off == SIZE_MAX) return 0;
-    VkGraphBinding binds[5] = {
-        {src->offset, bytes}, {w->offset, wbytes}, {b->offset, wbytes},
-        {dst->offset, bytes}, {p_off, sizeof(params)}
-    };
-    if (!vk_dispatch_kernel(&k_layernorm, binds, ((uint32_t)rows + 63u) / 64u, 1, 1)) return 0;
-    graph_mark_device(dst);
-    return 1;
-}
-
-int vk_graph_rmsnorm_f32(const float* in, const float* weight, float* out,
-                         int rows, int d_model, float eps) {
-    if (rows <= 0 || d_model <= 0 || !in || !weight || !out) return 0;
-    size_t bytes = (size_t)rows * d_model * sizeof(float);
-    size_t wbytes = (size_t)d_model * sizeof(float);
-    graph_scratch_begin();
-    VkTensorSlot* src = graph_ensure_device(in, bytes, 0);
-    VkTensorSlot* w = graph_ensure_device(weight, wbytes, 1);
-    VkTensorSlot* dst = graph_output_slot(out, bytes);
-    if (!src || !w || !dst) return 0;
-    struct { uint32_t rows; uint32_t d_model; float eps; } params = {(uint32_t)rows, (uint32_t)d_model, eps};
-    size_t p_off = graph_scratch_upload(&params, sizeof(params));
-    if (p_off == SIZE_MAX) return 0;
-    VkGraphBinding binds[4] = {
-        {src->offset, bytes}, {w->offset, wbytes}, {dst->offset, bytes}, {p_off, sizeof(params)}
-    };
-    if (!vk_dispatch_kernel(&k_rmsnorm, binds, ((uint32_t)rows + 63u) / 64u, 1, 1)) return 0;
-    graph_mark_device(dst);
-    return 1;
-}
-
-static int vk_graph_softmax_like_f32(VkKernel* k, const float* in, float* out, int rows, int d) {
-    if (rows <= 0 || d <= 0 || !in || !out) return 0;
-    size_t bytes = (size_t)rows * d * sizeof(float);
-    graph_scratch_begin();
-    VkTensorSlot* src = graph_ensure_device(in, bytes, 0);
-    VkTensorSlot* dst = graph_output_slot(out, bytes);
-    if (!src || !dst) return 0;
-    uint32_t params[2] = {(uint32_t)rows, (uint32_t)d};
-    size_t p_off = graph_scratch_upload(params, sizeof(params));
-    if (p_off == SIZE_MAX) return 0;
-    VkGraphBinding binds[3] = {
-        {src->offset, bytes}, {dst->offset, bytes}, {p_off, sizeof(params)}
-    };
-    if (!vk_dispatch_kernel(k, binds, ((uint32_t)rows + 63u) / 64u, 1, 1)) return 0;
-    graph_mark_device(dst);
-    return 1;
-}
-
-int vk_graph_softmax_f32(const float* in, float* out, int rows, int d) {
-    return vk_graph_softmax_like_f32(&k_softmax, in, out, rows, d);
-}
-
-int vk_graph_logsoftmax_f32(const float* in, float* out, int rows, int d) {
-    return vk_graph_softmax_like_f32(&k_logsoftmax, in, out, rows, d);
-}
-
-int vk_graph_reduce_f32(const float* in, float* out, int rows, int d, float inv) {
-    if (rows <= 0 || d <= 0 || !in || !out) return 0;
-    size_t in_bytes = (size_t)rows * d * sizeof(float);
-    size_t out_bytes = (size_t)rows * sizeof(float);
-    graph_scratch_begin();
-    VkTensorSlot* src = graph_ensure_device(in, in_bytes, 0);
-    VkTensorSlot* dst = graph_output_slot(out, out_bytes);
-    if (!src || !dst) return 0;
-    struct { uint32_t rows; uint32_t d; float inv; } params = {(uint32_t)rows, (uint32_t)d, inv};
-    size_t p_off = graph_scratch_upload(&params, sizeof(params));
-    if (p_off == SIZE_MAX) return 0;
-    VkGraphBinding binds[3] = {
-        {src->offset, in_bytes}, {dst->offset, out_bytes}, {p_off, sizeof(params)}
-    };
-    if (!vk_dispatch_kernel(&k_reduce, binds, ((uint32_t)rows + 63u) / 64u, 1, 1)) return 0;
-    graph_mark_device(dst);
-    return 1;
-}
-
-int vk_graph_global_average_pool_f32(const float* in, float* out, int n, int h, int w, int c) {
-    if (n <= 0 || h <= 0 || w <= 0 || c <= 0 || !in || !out) return 0;
-    size_t in_bytes = (size_t)n * h * w * c * sizeof(float);
-    size_t out_bytes = (size_t)n * c * sizeof(float);
-    graph_scratch_begin();
-    VkTensorSlot* src = graph_ensure_device(in, in_bytes, 0);
-    VkTensorSlot* dst = graph_output_slot(out, out_bytes);
-    if (!src || !dst) return 0;
-    uint32_t params[4] = {(uint32_t)n, (uint32_t)h, (uint32_t)w, (uint32_t)c};
-    size_t p_off = graph_scratch_upload(params, sizeof(params));
-    if (p_off == SIZE_MAX) return 0;
-    VkGraphBinding binds[3] = {
-        {src->offset, in_bytes}, {dst->offset, out_bytes}, {p_off, sizeof(params)}
-    };
-    if (!vk_dispatch_kernel(&k_globalavg, binds, ((uint32_t)c + 63u) / 64u, (uint32_t)n, 1)) return 0;
-    graph_mark_device(dst);
-    return 1;
-}
-
-int vk_graph_average_pool2d_f32(const float* in, float* out, int n, int h, int w, int c,
-                                int out_h, int out_w, int ky, int kx, int sy, int sx,
-                                int py, int px) {
-    if (n <= 0 || h <= 0 || w <= 0 || c <= 0 || out_h <= 0 || out_w <= 0 ||
-        ky <= 0 || kx <= 0 || sy <= 0 || sx <= 0 || !in || !out) return 0;
-    size_t in_bytes = (size_t)n * h * w * c * sizeof(float);
-    size_t out_bytes = (size_t)n * out_h * out_w * c * sizeof(float);
-    graph_scratch_begin();
-    VkTensorSlot* src = graph_ensure_device(in, in_bytes, 0);
-    VkTensorSlot* dst = graph_output_slot(out, out_bytes);
-    if (!src || !dst) return 0;
-    uint32_t params[12] = {(uint32_t)n, (uint32_t)h, (uint32_t)w, (uint32_t)c,
-                           (uint32_t)out_h, (uint32_t)out_w, (uint32_t)ky, (uint32_t)kx,
-                           (uint32_t)sy, (uint32_t)sx, (uint32_t)py, (uint32_t)px};
-    size_t p_off = graph_scratch_upload(params, sizeof(params));
-    if (p_off == SIZE_MAX) return 0;
-    VkGraphBinding binds[3] = {
-        {src->offset, in_bytes}, {dst->offset, out_bytes}, {p_off, sizeof(params)}
-    };
-    if (!vk_dispatch_kernel(&k_avgpool, binds, ((uint32_t)out_w + 7u) / 8u,
-                            ((uint32_t)out_h + 7u) / 8u, (uint32_t)(n * c))) return 0;
-    graph_mark_device(dst);
-    return 1;
-}
-
-int vk_graph_batchnorm2d_f32(const float* in, const float* weight, const float* bias,
-                             const float* mean, const float* var, float* out,
-                             int n, int h, int w, int c, float eps) {
-    if (n <= 0 || h <= 0 || w <= 0 || c <= 0 || !in || !weight || !bias || !mean || !var || !out) return 0;
-    size_t bytes = (size_t)n * h * w * c * sizeof(float);
-    size_t cbytes = (size_t)c * sizeof(float);
-    graph_scratch_begin();
-    VkTensorSlot* src = graph_ensure_device(in, bytes, 0);
-    VkTensorSlot* sw = graph_ensure_device(weight, cbytes, 1);
-    VkTensorSlot* sb = graph_ensure_device(bias, cbytes, 1);
-    VkTensorSlot* sm = graph_ensure_device(mean, cbytes, 1);
-    VkTensorSlot* sv = graph_ensure_device(var, cbytes, 1);
-    VkTensorSlot* dst = graph_output_slot(out, bytes);
-    if (!src || !sw || !sb || !sm || !sv || !dst) return 0;
-    struct { uint32_t n; uint32_t c; uint32_t h; uint32_t w; float eps; uint32_t pad[3]; } params =
-        {(uint32_t)n, (uint32_t)c, (uint32_t)h, (uint32_t)w, eps, {0, 0, 0}};
-    size_t p_off = graph_scratch_upload(&params, sizeof(params));
-    if (p_off == SIZE_MAX) return 0;
-    VkGraphBinding binds[7] = {
-        {src->offset, bytes}, {sw->offset, cbytes}, {sb->offset, cbytes},
-        {sm->offset, cbytes}, {sv->offset, cbytes}, {dst->offset, bytes},
-        {p_off, sizeof(params)}
-    };
-    if (!vk_dispatch_kernel(&k_batchnorm, binds, ((uint32_t)(n * h * w * c) + 63u) / 64u, 1, 1)) return 0;
-    graph_mark_device(dst);
-    return 1;
-}
-
-int vk_graph_groupnorm_f32(const float* in, const float* weight, const float* bias,
-                           float* out, int n, int h, int w, int c, int groups,
-                           float eps) {
-    if (n <= 0 || h <= 0 || w <= 0 || c <= 0 || groups <= 0 || c % groups ||
-        !in || !weight || !bias || !out || !(eps > 0.0f)) return 0;
-    size_t bytes = (size_t)n * h * w * c * sizeof(float);
-    size_t cbytes = (size_t)c * sizeof(float);
-    graph_scratch_begin();
-    VkTensorSlot* src = graph_ensure_device(in, bytes, 0);
-    VkTensorSlot* sw = graph_ensure_device(weight, cbytes, 1);
-    VkTensorSlot* sb = graph_ensure_device(bias, cbytes, 1);
-    VkTensorSlot* dst = graph_output_slot(out, bytes);
-    if (!src || !sw || !sb || !dst) return 0;
-    struct {
-        uint32_t n, h, w, c, groups, has_bias;
-        float eps;
-        uint32_t pad;
-    } params = {(uint32_t)n, (uint32_t)h, (uint32_t)w, (uint32_t)c,
-                (uint32_t)groups, 1u, eps, 0u};
-    size_t p_off = graph_scratch_upload(&params, sizeof(params));
-    if (p_off == SIZE_MAX) return 0;
-    VkGraphBinding binds[5] = {
-        {src->offset, bytes}, {sw->offset, cbytes}, {sb->offset, cbytes},
-        {dst->offset, bytes}, {p_off, sizeof(params)}
-    };
-    uint32_t total_groups = (uint32_t)n * (uint32_t)groups;
-    if (!vk_dispatch_kernel(&k_groupnorm, binds, (total_groups + 63u) / 64u, 1, 1)) return 0;
-    graph_mark_device(dst);
-    return 1;
-}
-
-#if VOLVOXAI_ENABLE_TRAINING
-int vk_graph_dropout_f32(const float* in, float* out, long n, uint32_t threshold,
-                         uint32_t seed, uint32_t counter, float scale) {
-    if (n <= 0 || (uint64_t)n > UINT32_MAX || !in || !out || !(scale >= 1.0f)) return 0;
-    size_t bytes = (size_t)n * sizeof(float);
-    graph_scratch_begin();
-    VkTensorSlot* src = graph_ensure_device(in, bytes, 0);
-    VkTensorSlot* dst = graph_output_slot(out, bytes);
-    if (!src || !dst) return 0;
-    struct {
-        uint32_t length, threshold, seed, counter;
-        float scale;
-        uint32_t pad[3];
-    } params = {(uint32_t)n, threshold, seed, counter, scale, {0u, 0u, 0u}};
-    size_t p_off = graph_scratch_upload(&params, sizeof(params));
-    if (p_off == SIZE_MAX) return 0;
-    VkGraphBinding binds[3] = {
-        {src->offset, bytes}, {dst->offset, bytes}, {p_off, sizeof(params)}
-    };
-    if (!vk_dispatch_kernel(&k_dropout, binds, ((uint32_t)n + 63u) / 64u, 1, 1)) return 0;
-    graph_mark_device(dst);
-    return 1;
-}
-#endif
-
-int vk_graph_embedding_f32(const int32_t* tokens, const float* weight, float* out,
-                           int tokens_len, int d_model, int vocab_size) {
-    if (tokens_len <= 0 || d_model <= 0 || vocab_size <= 0 || !tokens || !weight || !out) return 0;
-    size_t tbytes = (size_t)tokens_len * sizeof(int32_t);
-    size_t wbytes = (size_t)vocab_size * d_model * sizeof(float);
-    size_t obytes = (size_t)tokens_len * d_model * sizeof(float);
-    graph_scratch_begin();
-    VkTensorSlot* st = graph_ensure_device(tokens, tbytes, 0);
-    VkTensorSlot* sw = graph_ensure_device(weight, wbytes, 1);
-    VkTensorSlot* so = graph_output_slot(out, obytes);
-    if (!st || !sw || !so) return 0;
-    uint32_t params[4] = {(uint32_t)tokens_len, (uint32_t)d_model,
-                          (uint32_t)vocab_size, 0u};
-    size_t p_off = graph_scratch_upload(params, sizeof(params));
-    if (p_off == SIZE_MAX) return 0;
-    VkGraphBinding binds[4] = {
-        {st->offset, tbytes}, {sw->offset, wbytes}, {so->offset, obytes}, {p_off, sizeof(params)}
-    };
-    if (!vk_dispatch_kernel(&k_embedding, binds, ((uint32_t)tokens_len + 63u) / 64u, 1, 1)) return 0;
-    graph_mark_device(so);
-    return 1;
-}
-
-/* Routed expert linear. `experts` counts the staged rows of a possibly
- * partially resident bank; route indices stay in global slot space and the
- * shader maps them through slot_rows when slot_domain is non-zero. */
-int vk_graph_moe_linear_f32(const float* input, const float* expert_weight,
-                            const float* expert_bias, const float* route_indices,
-                            const float* route_weights, float* out, int rows,
-                            int d_in, int d_out, int experts, int top_k,
-                            const uint32_t* slot_rows, uint32_t slot_domain) {
-    if (rows <= 0 || d_in <= 0 || d_out <= 0 || experts <= 0 || top_k <= 0 ||
-        !input || !expert_weight || !route_indices || !route_weights || !out) return 0;
-    if (slot_rows ? (slot_domain < (uint32_t)experts ||
-                     (uint32_t)top_k > slot_domain)
-                  : top_k > experts) return 0;
-    size_t in_bytes = (size_t)rows * (size_t)d_in * sizeof(float);
-    size_t w_bytes = (size_t)experts * (size_t)d_in * (size_t)d_out * sizeof(float);
-    size_t bias_bytes = (size_t)experts * (size_t)d_out * sizeof(float);
-    size_t route_bytes = (size_t)rows * (size_t)top_k * sizeof(float);
-    size_t out_bytes = (size_t)rows * (size_t)d_out * sizeof(float);
-    size_t slot_bytes = (size_t)(slot_domain ? slot_domain : 1u) * sizeof(uint32_t);
-    graph_scratch_begin();
-    VkTensorSlot* si = graph_ensure_device(input, in_bytes, 0);
-    VkTensorSlot* sw = graph_ensure_device(expert_weight, w_bytes, 1);
-    VkTensorSlot* sri = graph_ensure_device(route_indices, route_bytes, 0);
-    VkTensorSlot* srw = graph_ensure_device(route_weights, route_bytes, 0);
-    VkTensorSlot* so = graph_output_slot(out, out_bytes);
-    if (!si || !sw || !sri || !srw || !so) return 0;
-    /* The shader always binds a bias and a slot table; absent ones become
-     * scratch zeros so the descriptor set stays complete. */
-    size_t bias_off;
-    if (expert_bias) {
-        VkTensorSlot* sb = graph_ensure_device(expert_bias, bias_bytes, 1);
-        if (!sb) return 0;
-        bias_off = sb->offset;
-    } else {
-        bias_off = graph_scratch_zero(bias_bytes);
-        if (bias_off == SIZE_MAX) return 0;
-    }
-    size_t slot_off = slot_domain
-        ? graph_scratch_upload(slot_rows, slot_bytes)
-        : graph_scratch_zero(slot_bytes);
-    if (slot_off == SIZE_MAX) return 0;
-    uint32_t params[8] = {
-        (uint32_t)rows, (uint32_t)d_in, (uint32_t)d_out, (uint32_t)experts,
-        (uint32_t)top_k, expert_bias ? 1u : 0u, slot_domain, 0u,
-    };
-    size_t p_off = graph_scratch_upload(params, sizeof(params));
-    if (p_off == SIZE_MAX) return 0;
-    VkGraphBinding binds[8] = {
-        {si->offset, in_bytes}, {sw->offset, w_bytes}, {bias_off, bias_bytes},
-        {sri->offset, route_bytes}, {srw->offset, route_bytes},
-        {so->offset, out_bytes}, {p_off, sizeof(params)}, {slot_off, slot_bytes},
-    };
-    if (!vk_dispatch_kernel(&k_moe_linear, binds,
-                            ((uint32_t)d_out + 63u) / 64u, (uint32_t)rows, 1)) return 0;
-    graph_mark_device(so);
-    return 1;
-}
-
-/* Top-k expert routing. The router weight is [d_model, experts], so its expert
- * axis is 1 and it is never a slot-indexed bank. */
-int vk_graph_moe_router_f32(const float* input, const float* weight,
-                            const float* bias, float* route_indices,
-                            float* route_weights, int rows, int d_model,
-                            int experts, int top_k, float temperature,
-                            int normalize) {
-    if (rows <= 0 || d_model <= 0 || experts <= 0 || top_k <= 0 ||
-        top_k > experts || top_k > 8 || !(temperature > 0.0f) ||
-        !input || !weight || !route_indices || !route_weights) return 0;
-    size_t in_bytes = (size_t)rows * (size_t)d_model * sizeof(float);
-    size_t w_bytes = (size_t)d_model * (size_t)experts * sizeof(float);
-    size_t bias_bytes = (size_t)experts * sizeof(float);
-    size_t route_bytes = (size_t)rows * (size_t)top_k * sizeof(float);
-    graph_scratch_begin();
-    VkTensorSlot* si = graph_ensure_device(input, in_bytes, 0);
-    VkTensorSlot* sw = graph_ensure_device(weight, w_bytes, 1);
-    VkTensorSlot* sidx = graph_output_slot(route_indices, route_bytes);
-    VkTensorSlot* srw = graph_output_slot(route_weights, route_bytes);
-    if (!si || !sw || !sidx || !srw) return 0;
-    size_t bias_off;
-    if (bias) {
-        VkTensorSlot* sb = graph_ensure_device(bias, bias_bytes, 1);
-        if (!sb) return 0;
-        bias_off = sb->offset;
-    } else {
-        bias_off = graph_scratch_zero(bias_bytes);
-        if (bias_off == SIZE_MAX) return 0;
-    }
-    uint32_t params[8];
-    params[0] = (uint32_t)rows;
-    params[1] = (uint32_t)d_model;
-    params[2] = (uint32_t)experts;
-    params[3] = (uint32_t)top_k;
-    params[4] = normalize ? 1u : 0u;
-    params[5] = bias ? 1u : 0u;
-    memcpy(&params[6], &temperature, sizeof(float));
-    params[7] = 0u;
-    size_t p_off = graph_scratch_upload(params, sizeof(params));
-    if (p_off == SIZE_MAX) return 0;
-    VkGraphBinding binds[6] = {
-        {si->offset, in_bytes}, {sw->offset, w_bytes}, {bias_off, bias_bytes},
-        {sidx->offset, route_bytes}, {srw->offset, route_bytes},
-        {p_off, sizeof(params)},
-    };
-    if (!vk_dispatch_kernel(&k_moe_router, binds,
-                            ((uint32_t)rows + 63u) / 64u, 1, 1)) return 0;
-    graph_mark_device(sidx);
-    graph_mark_device(srw);
-    return 1;
-}
-
-int vk_graph_transpose_f32(const float* in, float* out, const int* in_shape,
-                           const int* perm, int rank) {
-    if (rank <= 0 || rank > 8 || !in || !out || !in_shape || !perm) return 0;
-    uint32_t in_stride[8] = {0}, out_shape[8] = {0}, out_stride[8] = {0};
-    long total = 1;
-    for (int i = 0; i < rank; i++) {
-        if (in_shape[i] <= 0 || perm[i] < 0 || perm[i] >= rank) return 0;
-        out_shape[i] = (uint32_t)in_shape[perm[i]];
-        total *= out_shape[i];
-    }
-    in_stride[rank - 1] = 1;
-    out_stride[rank - 1] = 1;
-    for (int i = rank - 2; i >= 0; i--) {
-        in_stride[i] = in_stride[i + 1] * (uint32_t)in_shape[i + 1];
-        out_stride[i] = out_stride[i + 1] * out_shape[i + 1];
-    }
-    size_t bytes = (size_t)total * sizeof(float);
-    graph_scratch_begin();
-    VkTensorSlot* src = graph_ensure_device(in, bytes, 0);
-    VkTensorSlot* dst = graph_output_slot(out, bytes);
-    if (!src || !dst) return 0;
-    uint32_t meta[2 + 16] = {0};
-    meta[0] = (uint32_t)total;
-    meta[1] = (uint32_t)rank;
-    for (int d = 0; d < rank; d++) {
-        meta[2 + d] = out_stride[d];
-        meta[2 + rank + d] = in_stride[perm[d]];
-    }
-    size_t mbytes = (size_t)(2 + 2 * rank) * sizeof(uint32_t);
-    size_t m_off = graph_scratch_upload(meta, mbytes);
-    if (m_off == SIZE_MAX) return 0;
-    VkGraphBinding binds[3] = {
-        {src->offset, bytes}, {dst->offset, bytes}, {m_off, mbytes}
-    };
-    if (!vk_dispatch_kernel(&k_transpose, binds, ((uint32_t)total + 63u) / 64u, 1, 1)) return 0;
-    graph_mark_device(dst);
-    return 1;
-}
-
-int vk_graph_where_f32(const float* cond, const float* a, const float* b, float* out, long n) {
-    if (n <= 0 || !cond || !a || !b || !out) return 0;
-    size_t bytes = (size_t)n * sizeof(float);
-    graph_scratch_begin();
-    VkTensorSlot* sc = graph_ensure_device(cond, bytes, 0);
-    VkTensorSlot* sa = graph_ensure_device(a, bytes, 0);
-    VkTensorSlot* sb = graph_ensure_device(b, bytes, 0);
-    VkTensorSlot* so = graph_output_slot(out, bytes);
-    if (!sc || !sa || !sb || !so) return 0;
-    uint32_t params[1] = {(uint32_t)n};
-    size_t p_off = graph_scratch_upload(params, sizeof(params));
-    if (p_off == SIZE_MAX) return 0;
-    VkGraphBinding binds[5] = {
-        {sc->offset, bytes}, {sa->offset, bytes}, {sb->offset, bytes}, {so->offset, bytes},
-        {p_off, sizeof(params)}
-    };
-    if (!vk_dispatch_kernel(&k_where, binds, ((uint32_t)n + 63u) / 64u, 1, 1)) return 0;
-    graph_mark_device(so);
-    return 1;
-}
-
-int vk_graph_where_32(
-        const int32_t* condition, const void* a,
-        const void* b, void* output, long elements) {
-    uint32_t count;
-    size_t bytes;
-    if (!vx_typed_control_where_plan(
-            condition, a, b, output, elements, &count, &bytes))
-        return 0;
-    graph_scratch_begin();
-    VkTensorSlot* condition_slot =
-        graph_ensure_device(condition, bytes, 0);
-    VkTensorSlot* a_slot = graph_ensure_device(a, bytes, 0);
-    VkTensorSlot* b_slot = graph_ensure_device(b, bytes, 0);
-    VkTensorSlot* output_slot = graph_output_slot(output, bytes);
-    if (!condition_slot || !a_slot || !b_slot || !output_slot) return 0;
-    uint32_t params[4] = {count, 0u, 0u, 0u};
-    size_t params_offset = graph_scratch_upload(params, sizeof(params));
-    if (params_offset == SIZE_MAX) return 0;
-    VkGraphBinding bindings[5] = {
-        {condition_slot->offset, bytes},
-        {a_slot->offset, bytes},
-        {b_slot->offset, bytes},
-        {output_slot->offset, bytes},
-        {params_offset, sizeof(params)},
-    };
-    if (!vk_dispatch_kernel(
-            &k_where_32, bindings, (count + 63u) / 64u, 1u, 1u))
-        return 0;
-    graph_mark_device(output_slot);
-    return 1;
-}
-
-int vk_graph_argmax_f32(
-        const float* input, int32_t* output,
-        uint32_t outer, uint32_t axis_size, uint32_t inner) {
-    uint32_t input_elements;
-    uint32_t output_elements;
-    size_t input_bytes;
-    size_t output_bytes;
-    if (!vx_typed_control_argmax_plan(
-            input, output, outer, axis_size, inner,
-            &input_elements, &output_elements,
-            &input_bytes, &output_bytes))
-        return 0;
-    graph_scratch_begin();
-    VkTensorSlot* input_slot =
-        graph_ensure_device(input, input_bytes, 0);
-    VkTensorSlot* output_slot =
-        graph_output_slot(output, output_bytes);
-    if (!input_slot || !output_slot) return 0;
-    uint32_t params[4] = {outer, axis_size, inner, 0u};
-    size_t params_offset = graph_scratch_upload(params, sizeof(params));
-    if (params_offset == SIZE_MAX) return 0;
-    VkGraphBinding bindings[3] = {
-        {input_slot->offset, input_bytes},
-        {output_slot->offset, output_bytes},
-        {params_offset, sizeof(params)},
-    };
-    if (!vk_dispatch_kernel(
-            &k_argmax_f32_i32, bindings,
-            (output_elements + 63u) / 64u, 1u, 1u))
-        return 0;
-    graph_mark_device(output_slot);
-    return 1;
-}
-
-int vk_graph_upsample2x_f32(const float* in, float* out, int n, int h, int w, int c) {
-    if (n <= 0 || c <= 0 || h <= 0 || w <= 0 || !in || !out) return 0;
-    size_t in_bytes = (size_t)n * h * w * c * sizeof(float);
-    size_t out_bytes = (size_t)n * h * 2 * w * 2 * c * sizeof(float);
-    graph_scratch_begin();
-    VkTensorSlot* src = graph_ensure_device(in, in_bytes, 0);
-    VkTensorSlot* dst = graph_output_slot(out, out_bytes);
-    if (!src || !dst) return 0;
-    uint32_t params[4] = {(uint32_t)n, (uint32_t)h, (uint32_t)w, (uint32_t)c};
-    size_t p_off = graph_scratch_upload(params, sizeof(params));
-    if (p_off == SIZE_MAX) return 0;
-    VkGraphBinding binds[3] = {
-        {src->offset, in_bytes}, {dst->offset, out_bytes}, {p_off, sizeof(params)}
-    };
-    if (!vk_dispatch_kernel(&k_upsample, binds, ((uint32_t)(w * 2) + 7u) / 8u,
-                            ((uint32_t)(h * 2) + 7u) / 8u, (uint32_t)(n * c))) return 0;
-    graph_mark_device(dst);
-    return 1;
-}
-
-int vk_graph_resize_nearest_f32(const float* in, float* out, int n, int h, int w, int c,
-                                int out_h, int out_w) {
-    return vk_graph_resize_f32(in, out, n, h, w, c, out_h, out_w, 0);
-}
-
-int vk_graph_resize_f32(const float* in, float* out, int n, int h, int w, int c,
-                        int out_h, int out_w, int mode) {
-    if (n <= 0 || c <= 0 || h <= 0 || w <= 0 || out_h <= 0 || out_w <= 0 || !in || !out ||
-        (uint64_t)(uint32_t)n * (uint32_t)c > UINT32_MAX) return 0;
-    size_t in_bytes = (size_t)n * h * w * c * sizeof(float);
-    size_t out_bytes = (size_t)n * out_h * out_w * c * sizeof(float);
-    graph_scratch_begin();
-    VkTensorSlot* src = graph_ensure_device(in, in_bytes, 0);
-    VkTensorSlot* dst = graph_output_slot(out, out_bytes);
-    if (!src || !dst) return 0;
-    uint32_t params[8] = {(uint32_t)n, (uint32_t)h, (uint32_t)w, (uint32_t)c,
-                          (uint32_t)out_h, (uint32_t)out_w, (uint32_t)mode, 0u};
-    size_t p_off = graph_scratch_upload(params, sizeof(params));
-    if (p_off == SIZE_MAX) return 0;
-    VkGraphBinding binds[3] = {
-        {src->offset, in_bytes}, {dst->offset, out_bytes}, {p_off, sizeof(params)}
-    };
-    if (!vk_dispatch_kernel(&k_resize, binds, ((uint32_t)out_w + 7u) / 8u,
-                            ((uint32_t)out_h + 7u) / 8u, (uint32_t)(n * c))) return 0;
-    graph_mark_device(dst);
-    return 1;
-}
-
-static void pad4_shape(const int* shape, int rank, uint32_t out[4]) {
-    for (int i = 0; i < 4; i++) out[i] = 1u;
-    if (!shape || rank <= 0) return;
-    int base = 4 - rank;
-    if (base < 0) base = 0;
-    for (int i = 0; i < rank && i < 4; i++) out[base + i] = (uint32_t)shape[i];
-}
-
-int vk_graph_expand_f32(const float* in, float* out, const int* in_shape, int in_rank,
-                        const int* out_shape, int out_rank) {
-    VxExpandF32Plan plan;
-    if (!vx_expand_f32_plan(
-            in, out, in_shape, in_rank, out_shape, out_rank, &plan))
-        return 0;
-    graph_scratch_begin();
-    VkTensorSlot* src = graph_ensure_device(in, plan.input_bytes, 0);
-    VkTensorSlot* dst = graph_output_slot(out, plan.output_bytes);
-    if (!src || !dst) return 0;
-    size_t p_off = graph_scratch_upload(plan.params, sizeof(plan.params));
-    if (p_off == SIZE_MAX) return 0;
-    VkGraphBinding binds[3] = {
-        {src->offset, plan.input_bytes},
-        {dst->offset, plan.output_bytes},
-        {p_off, sizeof(plan.params)}
-    };
-    if (!vk_dispatch_kernel(
-            &k_expand, binds, (plan.output_elements + 63u) / 64u, 1u, 1u))
-        return 0;
-    graph_mark_device(dst);
-    return 1;
-}
-
-int vk_graph_expand_32(const void* in, void* out, const int* in_shape,
-                       int in_rank, const int* out_shape, int out_rank) {
-    /* expand.wgsl copies u32 words, so the F32 host path is also the exact
-     * bit-preserving I32 implementation. */
-    return vk_graph_expand_f32(
-        (const float*)in, (float*)out,
-        in_shape, in_rank, out_shape, out_rank);
-}
-
-int vk_graph_batch_matmul_f32(
-        const float* a, const int* a_shape, int a_rank,
-        const float* b, const int* b_shape, int b_rank,
-        float* output, const int* output_shape, int output_rank) {
-    VxBatchMatMulF32Plan plan;
-    size_t metadata_bytes;
-    size_t metadata_offset;
-    if (!vx_batch_matmul_f32_plan(
-            a, a_shape, a_rank, b, b_shape, b_rank,
-            output, output_shape, output_rank, &plan))
-        return 0;
-    metadata_bytes = (size_t)plan.metadata_words * sizeof(uint32_t);
-    graph_scratch_begin();
-    VkTensorSlot* a_slot = graph_ensure_device(a, plan.a_bytes, 0);
-    VkTensorSlot* b_slot = graph_ensure_device(b, plan.b_bytes, 0);
-    VkTensorSlot* output_slot =
-        graph_output_slot(output, plan.output_bytes);
-    if (!a_slot || !b_slot || !output_slot) return 0;
-    metadata_offset = graph_scratch_upload(plan.metadata, metadata_bytes);
-    if (metadata_offset == SIZE_MAX) return 0;
-    VkGraphBinding bindings[4] = {
-        {a_slot->offset, plan.a_bytes},
-        {b_slot->offset, plan.b_bytes},
-        {output_slot->offset, plan.output_bytes},
-        {metadata_offset, metadata_bytes},
-    };
-    if (!vk_dispatch_kernel(
-            &k_batch_matmul, bindings,
-            (plan.n + 7u) / 8u, (plan.m + 7u) / 8u,
-            plan.output_batches))
-        return 0;
-    graph_mark_device(output_slot);
-    return 1;
-}
-
-int vk_graph_gather_i32_f32(const float* input, const int32_t* indices,
-                            float* output, int outer, int axis_size, int inner,
-                            int indices_elements, int output_elements) {
-    uint64_t input_count;
-    uint64_t expected_output;
-    size_t input_bytes;
-    size_t index_bytes;
-    size_t output_bytes;
-    if (!input || !indices || !output || outer <= 0 || axis_size <= 0 ||
-        inner <= 0 || indices_elements <= 0 || output_elements <= 0) return 0;
-    input_count = (uint64_t)(uint32_t)outer * (uint32_t)axis_size *
-        (uint32_t)inner;
-    expected_output = (uint64_t)(uint32_t)outer * (uint32_t)indices_elements *
-        (uint32_t)inner;
-    if (input_count > SIZE_MAX / sizeof(float) ||
-        expected_output != (uint32_t)output_elements ||
-        expected_output > SIZE_MAX / sizeof(float)) return 0;
-    input_bytes = (size_t)input_count * sizeof(float);
-    index_bytes = (size_t)(uint32_t)indices_elements * sizeof(int32_t);
-    if (index_bytes / sizeof(int32_t) !=
-        (size_t)(uint32_t)indices_elements) return 0;
-    output_bytes = (size_t)expected_output * sizeof(float);
-    graph_scratch_begin();
-    VkTensorSlot* src = graph_ensure_device(input, input_bytes, 0);
-    VkTensorSlot* idx = graph_ensure_device(indices, index_bytes, 0);
-    VkTensorSlot* dst = graph_output_slot(output, output_bytes);
-    if (!src || !idx || !dst) return 0;
-    uint32_t params[5] = {
-        (uint32_t)outer, (uint32_t)axis_size, (uint32_t)inner,
-        (uint32_t)indices_elements, (uint32_t)output_elements,
-    };
-    size_t p_off = graph_scratch_upload(params, sizeof(params));
-    if (p_off == SIZE_MAX) return 0;
-    VkGraphBinding binds[4] = {
-        {src->offset, input_bytes}, {idx->offset, index_bytes},
-        {dst->offset, output_bytes}, {p_off, sizeof(params)}
-    };
-    if (!vk_dispatch_kernel(&k_gather, binds,
-                            ((uint32_t)output_elements + 63u) / 64u,
-                            1, 1)) return 0;
-    graph_mark_device(dst);
-    return 1;
-}
-
-int vk_graph_pad4d_f32(const float* in, float* out, const int* in_shape, int in_rank,
-                       const int* out_shape, int out_rank, int pad_top, int pad_left, float value) {
-    if (!in || !out || !in_shape || !out_shape || in_rank <= 0 || out_rank <= 0 || in_rank > 4 || out_rank > 4) return 0;
-    uint32_t is[4], os[4];
-    pad4_shape(in_shape, in_rank, is);
-    pad4_shape(out_shape, out_rank, os);
-    size_t in_elems = (size_t)is[0] * is[1] * is[2] * is[3];
-    size_t out_elems = (size_t)os[0] * os[1] * os[2] * os[3];
-    graph_scratch_begin();
-    VkTensorSlot* src = graph_ensure_device(in, in_elems * sizeof(float), 0);
-    VkTensorSlot* dst = graph_output_slot(out, out_elems * sizeof(float));
-    if (!src || !dst) return 0;
-    struct {
-        uint32_t b, in_h, in_w, c, out_h, out_w, pt, pl;
-        float val;
-        uint32_t pad[3];
-    } params = {is[0], is[1], is[2], is[3], os[1], os[2], (uint32_t)pad_top, (uint32_t)pad_left, value, {0, 0, 0}};
-    size_t p_off = graph_scratch_upload(&params, sizeof(params));
-    if (p_off == SIZE_MAX) return 0;
-    VkGraphBinding binds[3] = {
-        {src->offset, in_elems * sizeof(float)}, {dst->offset, out_elems * sizeof(float)}, {p_off, sizeof(params)}
-    };
-    if (!vk_dispatch_kernel(&k_pad, binds, ((uint32_t)out_elems + 63u) / 64u, 1, 1)) return 0;
-    graph_mark_device(dst);
-    return 1;
-}
-
-int vk_graph_slice4d_f32(const float* in, float* out, const int* in_shape, int in_rank,
-                         const int* out_shape, int out_rank, const int* starts,
-                         const int* steps) {
-    if (!in || !out || !in_shape || !out_shape || !starts || !steps ||
-        in_rank <= 0 || out_rank <= 0 || in_rank > 4 || out_rank > 4) return 0;
-    uint32_t is[4], os[4];
-    pad4_shape(in_shape, in_rank, is);
-    pad4_shape(out_shape, out_rank, os);
-    size_t in_elems = (size_t)is[0] * is[1] * is[2] * is[3];
-    size_t out_elems = (size_t)os[0] * os[1] * os[2] * os[3];
-    graph_scratch_begin();
-    VkTensorSlot* src = graph_ensure_device(in, in_elems * sizeof(float), 0);
-    VkTensorSlot* dst = graph_output_slot(out, out_elems * sizeof(float));
-    if (!src || !dst) return 0;
-    uint32_t params[16] = {
-        os[0], os[1], os[2], os[3], is[1], is[2], is[3],
-        (uint32_t)starts[0], (uint32_t)starts[1], (uint32_t)starts[2], (uint32_t)starts[3],
-        (uint32_t)steps[0], (uint32_t)steps[1], (uint32_t)steps[2], (uint32_t)steps[3],
-        (uint32_t)out_elems
-    };
-    size_t p_off = graph_scratch_upload(params, sizeof(params));
-    if (p_off == SIZE_MAX) return 0;
-    VkGraphBinding binds[3] = {
-        {src->offset, in_elems * sizeof(float)}, {dst->offset, out_elems * sizeof(float)}, {p_off, sizeof(params)}
-    };
-    if (!vk_dispatch_kernel(&k_slice, binds, ((uint32_t)out_elems + 63u) / 64u, 1, 1)) return 0;
-    graph_mark_device(dst);
-    return 1;
-}
-
-int vk_graph_conv_transpose2d_f32(const float* in, const float* weight, const float* bias,
-                                  float* out, int n, int in_h, int in_w, int in_c,
-                                  int out_h, int out_w, int out_c, int kh, int kw,
-                                  int sh, int sw, int ph, int pw) {
-    if (n <= 0 || in_h <= 0 || in_w <= 0 || in_c <= 0 || out_h <= 0 || out_w <= 0 ||
-        out_c <= 0 || kh <= 0 || kw <= 0 || sh <= 0 || sw <= 0 || !in || !weight || !out) return 0;
-    size_t in_bytes = (size_t)n * in_h * in_w * in_c * sizeof(float);
-    size_t wbytes = (size_t)in_c * out_c * kh * kw * sizeof(float);
-    size_t bbytes = (size_t)out_c * sizeof(float);
-    size_t out_bytes = (size_t)n * out_h * out_w * out_c * sizeof(float);
-    graph_scratch_begin();
-    VkTensorSlot* src = graph_ensure_device(in, in_bytes, 0);
-    VkTensorSlot* swt = graph_ensure_device(weight, wbytes, 1);
-    static const float zero_bias[1] = {0.0f};
-    VkTensorSlot* sb = graph_ensure_device(bias ? bias : zero_bias, bias ? bbytes : sizeof(float), 1);
-    VkTensorSlot* dst = graph_output_slot(out, out_bytes);
-    if (!src || !swt || !sb || !dst) return 0;
-    uint32_t params[16] = {(uint32_t)n, (uint32_t)in_h, (uint32_t)in_w, (uint32_t)in_c,
-                           (uint32_t)out_h, (uint32_t)out_w, (uint32_t)out_c,
-                           (uint32_t)kh, (uint32_t)kw, (uint32_t)sh, (uint32_t)sw,
-                           (uint32_t)ph, (uint32_t)pw, bias ? 1u : 0u, 0u, 0u};
-    size_t p_off = graph_scratch_upload(params, sizeof(params));
-    if (p_off == SIZE_MAX) return 0;
-    VkGraphBinding binds[5] = {
-        {src->offset, in_bytes}, {swt->offset, wbytes}, {sb->offset, bias ? bbytes : sizeof(float)},
-        {dst->offset, out_bytes}, {p_off, sizeof(params)}
-    };
-    if (!vk_dispatch_kernel(&k_convtranspose, binds, ((uint32_t)out_w + 7u) / 8u,
-                            ((uint32_t)out_h + 7u) / 8u, (uint32_t)(n * out_c))) return 0;
-    graph_mark_device(dst);
-    return 1;
-}
-
-int vk_graph_interp1d_f32(const float* in, float* out, int channels, int in_l, int out_l) {
-    if (channels <= 0 || in_l <= 0 || out_l <= 0 || !in || !out) return 0;
-    size_t in_bytes = (size_t)channels * in_l * sizeof(float);
-    size_t out_bytes = (size_t)channels * out_l * sizeof(float);
-    graph_scratch_begin();
-    VkTensorSlot* src = graph_ensure_device(in, in_bytes, 0);
-    VkTensorSlot* dst = graph_output_slot(out, out_bytes);
-    if (!src || !dst) return 0;
-    uint32_t params[3] = {(uint32_t)channels, (uint32_t)in_l, (uint32_t)out_l};
-    size_t p_off = graph_scratch_upload(params, sizeof(params));
-    if (p_off == SIZE_MAX) return 0;
-    VkGraphBinding binds[3] = {
-        {src->offset, in_bytes}, {dst->offset, out_bytes}, {p_off, sizeof(params)}
-    };
-    if (!vk_dispatch_kernel(&k_interp1d, binds, ((uint32_t)out_l + 63u) / 64u, (uint32_t)channels, 1)) return 0;
-    graph_mark_device(dst);
-    return 1;
-}
-
-int vk_graph_binary_f32(const float* a, long a_numel, const float* b, long b_numel,
-                        float* out, long out_numel, const uint32_t* output_strides,
-                        const uint32_t* a_strides, const uint32_t* b_strides,
-                        int rank, int op) {
-    if (!a || !b || !out || !output_strides || !a_strides || !b_strides ||
-        a_numel <= 0 || b_numel <= 0 || out_numel <= 0 ||
-        (uint64_t)out_numel > UINT32_MAX || rank <= 0 || rank > 8 || op < 0 || op > 3)
-        return 0;
-    size_t a_bytes = (size_t)a_numel * sizeof(float);
-    size_t b_bytes = (size_t)b_numel * sizeof(float);
-    size_t out_bytes = (size_t)out_numel * sizeof(float);
-    graph_scratch_begin();
-    VkTensorSlot* sa = graph_ensure_device(a, a_bytes, 0);
-    VkTensorSlot* sb = graph_ensure_device(b, b_bytes, 0);
-    VkTensorSlot* so = graph_output_slot(out, out_bytes);
-    if (!sa || !sb || !so) return 0;
-    uint32_t metadata[28] = {(uint32_t)out_numel, (uint32_t)rank, (uint32_t)op, 0u};
-    memcpy(metadata + 4, output_strides, 8 * sizeof(uint32_t));
-    memcpy(metadata + 12, a_strides, 8 * sizeof(uint32_t));
-    memcpy(metadata + 20, b_strides, 8 * sizeof(uint32_t));
-    size_t p_off = graph_scratch_upload(metadata, sizeof(metadata));
-    if (p_off == SIZE_MAX) return 0;
-    VkGraphBinding binds[4] = {
-        {sa->offset, a_bytes}, {sb->offset, b_bytes}, {so->offset, out_bytes}, {p_off, sizeof(metadata)}
-    };
-    if (!vk_dispatch_kernel(&k_broadcast_binary, binds, ((uint32_t)out_numel + 63u) / 64u, 1, 1)) return 0;
-    graph_mark_device(so);
-    return 1;
-}
-
-int vk_graph_split_f32(const float* in, float* out, long input_numel, long output_numel,
-                       int inner, int split_size, int axis_in, int offset) {
-    if (!in || !out || input_numel <= 0 || output_numel <= 0 ||
-        inner <= 0 || split_size <= 0 || axis_in <= 0 || offset < 0 || offset + split_size > axis_in) return 0;
-    size_t in_bytes = (size_t)input_numel * sizeof(float);
-    size_t out_bytes = (size_t)output_numel * sizeof(float);
-    graph_scratch_begin();
-    VkTensorSlot* src = graph_ensure_device(in, in_bytes, 0);
-    VkTensorSlot* dst = graph_output_slot(out, out_bytes);
-    if (!src || !dst) return 0;
-    uint32_t params[5] = {(uint32_t)output_numel, (uint32_t)inner, (uint32_t)split_size,
-                          (uint32_t)axis_in, (uint32_t)offset};
-    size_t p_off = graph_scratch_upload(params, sizeof(params));
-    if (p_off == SIZE_MAX) return 0;
-    VkGraphBinding binds[3] = {{src->offset, in_bytes}, {dst->offset, out_bytes}, {p_off, sizeof(params)}};
-    if (!vk_dispatch_kernel(&k_split, binds, ((uint32_t)output_numel + 63u) / 64u, 1, 1)) return 0;
-    graph_mark_device(dst);
-    return 1;
-}
-
-int vk_graph_conv1d_f32(const float* in, const float* weight, const float* bias, float* out,
-                        int batch, int in_c, int in_l, int out_c, int out_l, int kernel,
-                        int stride, int pad, int relu) {
-    if (!in || !weight || !out || batch <= 0 || in_c <= 0 || in_l <= 0 || out_c <= 0 || out_l <= 0 ||
-        kernel <= 0 || stride <= 0 || pad < 0 || relu < 0 || relu > 1) return 0;
-    int64_t padded_l = (int64_t)in_l + 2LL * pad;
-    if (padded_l < kernel || (padded_l - kernel) / stride + 1 != out_l) return 0;
-    size_t in_bytes = (size_t)batch * (size_t)in_c * in_l * sizeof(float);
-    size_t wbytes = (size_t)out_c * in_c * kernel * sizeof(float);
-    size_t bbytes = (size_t)out_c * sizeof(float);
-    size_t out_bytes = (size_t)batch * (size_t)out_c * out_l * sizeof(float);
-    graph_scratch_begin();
-    VkTensorSlot* src = graph_ensure_device(in, in_bytes, 0);
-    VkTensorSlot* sw = graph_ensure_device(weight, wbytes, 1);
-    VkTensorSlot* dst = graph_output_slot(out, out_bytes);
-    if (!src || !sw || !dst) return 0;
-    size_t b_off = SIZE_MAX;
-    if (bias) {
-        VkTensorSlot* sb = graph_ensure_device(bias, bbytes, 1);
-        if (!sb) return 0;
-        b_off = sb->offset;
-    } else {
-        float* zeros = (float*)calloc((size_t)out_c, sizeof(float));
-        if (!zeros) return 0;
-        b_off = graph_scratch_upload(zeros, bbytes);
-        free(zeros);
-        if (b_off == SIZE_MAX) return 0;
-    }
-    uint32_t params[12] = {(uint32_t)in_c, (uint32_t)in_l, (uint32_t)out_c,
-                           (uint32_t)kernel, (uint32_t)stride, (uint32_t)pad,
-                           (uint32_t)relu, (uint32_t)batch, 1u, (uint32_t)in_c,
-                           (uint32_t)out_l, 0u};
-    size_t p_off = graph_scratch_upload(params, sizeof(params));
-    if (p_off == SIZE_MAX) return 0;
-    VkGraphBinding binds[5] = {
-        {src->offset, in_bytes}, {sw->offset, wbytes}, {b_off, bbytes}, {dst->offset, out_bytes}, {p_off, sizeof(params)}
-    };
-    if (!vk_dispatch_kernel(&k_conv1d, binds, ((uint32_t)out_l + 63u) / 64u,
-                            (uint32_t)out_c, (uint32_t)batch)) return 0;
-    graph_mark_device(dst);
-    return 1;
-}
-
-static long attention_mask_numel(int mask_mode, int batch, int seq_q, int seq_kv) {
-    if (mask_mode == 0) return 0;
-    if (mask_mode == 1) return seq_kv;
-    if (mask_mode == 2) return (long)batch * seq_kv;
-    if (mask_mode == 3) return (long)seq_q * seq_kv;
-    if (mask_mode == 4) return (long)batch * seq_q * seq_kv;
-    return -1;
-}
-
-int vk_graph_sdpa_f32(const float* qkv, const int32_t* mask, long mask_numel,
-                      float* out, int seq_len, int d_model, int num_heads,
-                      int head_dim, int batch, float scale, int causal, int mask_mode) {
-    if (!qkv || !out || seq_len <= 0 || d_model <= 0 || num_heads <= 0 || head_dim <= 0 ||
-        batch <= 0 || head_dim > 64 || d_model != num_heads * head_dim) return 0;
-    long expected_mask = attention_mask_numel(mask_mode, batch, seq_len, seq_len);
-    if (expected_mask < 0 || (mask_mode != 0 && (!mask || mask_numel != expected_mask))) return 0;
-    size_t qkv_bytes = (size_t)batch * (size_t)seq_len * 3u * (size_t)d_model * sizeof(float);
-    size_t out_bytes = (size_t)batch * (size_t)seq_len * (size_t)d_model * sizeof(float);
-    size_t mask_bytes = mask_mode ? (size_t)expected_mask * sizeof(int32_t) : qkv_bytes;
-    graph_scratch_begin();
-    VkTensorSlot* src = graph_ensure_device(qkv, qkv_bytes, 0);
-    VkTensorSlot* sm = mask_mode ? graph_ensure_device(mask, mask_bytes, 0) : src;
-    VkTensorSlot* dst = graph_output_slot(out, out_bytes);
-    if (!src || !sm || !dst) return 0;
-    struct {
-        uint32_t seq_len, d_model, num_heads, head_dim, batch;
-        float scale;
-        uint32_t causal, mask_mode;
-    } params = {(uint32_t)seq_len, (uint32_t)d_model, (uint32_t)num_heads,
-                (uint32_t)head_dim, (uint32_t)batch, scale,
-                causal ? 1u : 0u, (uint32_t)mask_mode};
-    size_t p_off = graph_scratch_upload(&params, sizeof(params));
-    if (p_off == SIZE_MAX) return 0;
-    VkGraphBinding binds[4] = {
-        {src->offset, qkv_bytes}, {sm->offset, mask_bytes},
-        {dst->offset, out_bytes}, {p_off, sizeof(params)}
-    };
-    if (!vk_dispatch_kernel(&k_sdpa, binds, ((uint32_t)seq_len + 63u) / 64u,
-                            (uint32_t)num_heads, (uint32_t)batch)) return 0;
-    graph_mark_device(dst);
-    return 1;
-}
-
-#if VOLVOXAI_ENABLE_TRAINING
-int vk_graph_sdpa_training_f32(const float* qkv, const int32_t* mask, long mask_numel,
-                               float* out, int seq_len, int d_model, int num_heads,
-                               int head_dim, int batch, float scale, int causal, int mask_mode,
-                               uint32_t threshold, uint32_t seed, uint32_t counter,
-                               float dropout_scale) {
-    if (!qkv || !out || seq_len <= 0 || d_model <= 0 || num_heads <= 0 || head_dim <= 0 ||
-        batch <= 0 || head_dim > 64 || d_model != num_heads * head_dim ||
-        !isfinite(dropout_scale) || dropout_scale < 1.0f) return 0;
-    long expected_mask = attention_mask_numel(mask_mode, batch, seq_len, seq_len);
-    if (expected_mask < 0 || (mask_mode != 0 && (!mask || mask_numel != expected_mask))) return 0;
-    size_t qkv_bytes = (size_t)batch * (size_t)seq_len * 3u * (size_t)d_model * sizeof(float);
-    size_t out_bytes = (size_t)batch * (size_t)seq_len * (size_t)d_model * sizeof(float);
-    size_t mask_bytes = mask_mode ? (size_t)expected_mask * sizeof(int32_t) : qkv_bytes;
-    graph_scratch_begin();
-    VkTensorSlot* src = graph_ensure_device(qkv, qkv_bytes, 0);
-    VkTensorSlot* sm = mask_mode ? graph_ensure_device(mask, mask_bytes, 0) : src;
-    VkTensorSlot* dst = graph_output_slot(out, out_bytes);
-    if (!src || !sm || !dst) return 0;
-    struct {
-        uint32_t seq_len, d_model, num_heads, head_dim, batch;
-        float scale;
-        uint32_t causal, mask_mode, threshold, seed, counter;
-        float dropout_scale;
-    } params = {(uint32_t)seq_len, (uint32_t)d_model, (uint32_t)num_heads,
-                (uint32_t)head_dim, (uint32_t)batch, scale, causal ? 1u : 0u,
-                (uint32_t)mask_mode, threshold, seed, counter, dropout_scale};
-    size_t p_off = graph_scratch_upload(&params, sizeof(params));
-    if (p_off == SIZE_MAX) return 0;
-    VkGraphBinding binds[4] = {
-        {src->offset, qkv_bytes}, {sm->offset, mask_bytes},
-        {dst->offset, out_bytes}, {p_off, sizeof(params)}
-    };
-    if (!vk_dispatch_kernel(&k_sdpa_training, binds, ((uint32_t)seq_len + 63u) / 64u,
-                            (uint32_t)num_heads, (uint32_t)batch)) return 0;
-    graph_mark_device(dst);
-    return 1;
-}
-#endif
-
-int vk_graph_cross_sdpa_f32(const float* q, const float* k, const float* v,
-                            const int32_t* mask, long mask_numel, float* out,
-                            int seq_q, int seq_kv, int d_model, int num_heads,
-                            int head_dim, int batch, float scale, int causal, int mask_mode) {
-    if (!q || !k || !v || !out || seq_q <= 0 || seq_kv <= 0 || d_model <= 0 ||
-        num_heads <= 0 || head_dim <= 0 || batch <= 0 || head_dim > 64 ||
-        d_model != num_heads * head_dim) return 0;
-    long expected_mask = attention_mask_numel(mask_mode, batch, seq_q, seq_kv);
-    if (expected_mask < 0 || (mask_mode != 0 && (!mask || mask_numel != expected_mask))) return 0;
-    size_t q_bytes = (size_t)batch * (size_t)seq_q * (size_t)d_model * sizeof(float);
-    size_t kv_bytes = (size_t)batch * (size_t)seq_kv * (size_t)d_model * sizeof(float);
-    size_t out_bytes = q_bytes;
-    size_t mask_bytes = mask_mode ? (size_t)expected_mask * sizeof(int32_t) : q_bytes;
-    graph_scratch_begin();
-    VkTensorSlot* sq = graph_ensure_device(q, q_bytes, 0);
-    VkTensorSlot* sk = graph_ensure_device(k, kv_bytes, 0);
-    VkTensorSlot* sv = graph_ensure_device(v, kv_bytes, 0);
-    VkTensorSlot* sm = mask_mode ? graph_ensure_device(mask, mask_bytes, 0) : sq;
-    VkTensorSlot* dst = graph_output_slot(out, out_bytes);
-    if (!sq || !sk || !sv || !sm || !dst) return 0;
-    struct {
-        uint32_t seq_q, seq_kv, d_model, num_heads, head_dim, batch;
-        float scale;
-        uint32_t causal, mask_mode, pad[3];
-    } params = {(uint32_t)seq_q, (uint32_t)seq_kv, (uint32_t)d_model,
-                (uint32_t)num_heads, (uint32_t)head_dim, (uint32_t)batch, scale,
-                causal ? 1u : 0u, (uint32_t)mask_mode, {0u, 0u, 0u}};
-    size_t p_off = graph_scratch_upload(&params, sizeof(params));
-    if (p_off == SIZE_MAX) return 0;
-    VkGraphBinding binds[6] = {
-        {sq->offset, q_bytes}, {sk->offset, kv_bytes}, {sv->offset, kv_bytes},
-        {sm->offset, mask_bytes}, {dst->offset, out_bytes}, {p_off, sizeof(params)}
-    };
-    if (!vk_dispatch_kernel(&k_cross_sdpa, binds, ((uint32_t)seq_q + 63u) / 64u,
-                            (uint32_t)num_heads, (uint32_t)batch)) return 0;
-    graph_mark_device(dst);
-    return 1;
-}
-
-#if VOLVOXAI_ENABLE_TRAINING
-int vk_graph_cross_sdpa_training_f32(const float* q, const float* k, const float* v,
-                                     const int32_t* mask, long mask_numel, float* out,
-                                     int seq_q, int seq_kv, int d_model, int num_heads,
-                                     int head_dim, int batch, float scale, int causal, int mask_mode,
-                                     uint32_t threshold, uint32_t seed, uint32_t counter,
-                                     float dropout_scale) {
-    if (!q || !k || !v || !out || seq_q <= 0 || seq_kv <= 0 || d_model <= 0 ||
-        num_heads <= 0 || head_dim <= 0 || batch <= 0 || head_dim > 64 ||
-        d_model != num_heads * head_dim || !isfinite(dropout_scale) || dropout_scale < 1.0f) return 0;
-    long expected_mask = attention_mask_numel(mask_mode, batch, seq_q, seq_kv);
-    if (expected_mask < 0 || (mask_mode != 0 && (!mask || mask_numel != expected_mask))) return 0;
-    size_t q_bytes = (size_t)batch * (size_t)seq_q * (size_t)d_model * sizeof(float);
-    size_t kv_bytes = (size_t)batch * (size_t)seq_kv * (size_t)d_model * sizeof(float);
-    size_t out_bytes = q_bytes;
-    size_t mask_bytes = mask_mode ? (size_t)expected_mask * sizeof(int32_t) : q_bytes;
-    graph_scratch_begin();
-    VkTensorSlot* sq = graph_ensure_device(q, q_bytes, 0);
-    VkTensorSlot* sk = graph_ensure_device(k, kv_bytes, 0);
-    VkTensorSlot* sv = graph_ensure_device(v, kv_bytes, 0);
-    VkTensorSlot* sm = mask_mode ? graph_ensure_device(mask, mask_bytes, 0) : sq;
-    VkTensorSlot* dst = graph_output_slot(out, out_bytes);
-    if (!sq || !sk || !sv || !sm || !dst) return 0;
-    struct {
-        uint32_t seq_q, seq_kv, d_model, num_heads, head_dim, batch;
-        float scale;
-        uint32_t causal, mask_mode, threshold, seed, counter;
-        float dropout_scale;
-        uint32_t pad[3];
-    } params = {(uint32_t)seq_q, (uint32_t)seq_kv, (uint32_t)d_model,
-                (uint32_t)num_heads, (uint32_t)head_dim, (uint32_t)batch, scale,
-                causal ? 1u : 0u, (uint32_t)mask_mode, threshold, seed, counter,
-                dropout_scale, {0u, 0u, 0u}};
-    size_t p_off = graph_scratch_upload(&params, sizeof(params));
-    if (p_off == SIZE_MAX) return 0;
-    VkGraphBinding binds[6] = {
-        {sq->offset, q_bytes}, {sk->offset, kv_bytes}, {sv->offset, kv_bytes},
-        {sm->offset, mask_bytes}, {dst->offset, out_bytes}, {p_off, sizeof(params)}
-    };
-    if (!vk_dispatch_kernel(&k_cross_sdpa_training, binds, ((uint32_t)seq_q + 63u) / 64u,
-                            (uint32_t)num_heads, (uint32_t)batch)) return 0;
-    graph_mark_device(dst);
-    return 1;
-}
-#endif
-
-int vk_graph_cross_attention_f32(const float* q, const float* kv, const float* weight,
-                                 const float* scale, const float* bias, float* out,
-                                 int seq_q, int seq_kv, int d_model, int num_heads,
-                                 int head_dim, int batch, int has_scale, int has_bias) {
-    if (!q || !kv || !weight || !out || seq_q <= 0 || seq_kv <= 0 || d_model <= 0 ||
-        num_heads <= 0 || head_dim <= 0 || batch <= 0 || head_dim > 64 || d_model != num_heads * head_dim ||
-        d_model > 64) return 0;
-    size_t q_bytes = (size_t)batch * (size_t)seq_q * (size_t)d_model * sizeof(float);
-    size_t kv_bytes = (size_t)batch * (size_t)seq_kv * (size_t)d_model * sizeof(float);
-    size_t wbytes = (size_t)3 * (size_t)d_model * (size_t)d_model * sizeof(float);
-    size_t sb_bytes = (size_t)3 * (size_t)d_model * sizeof(float);
-    size_t out_bytes = q_bytes;
-    static const float zero[1] = {0.0f};
-    graph_scratch_begin();
-    VkTensorSlot* sq = graph_ensure_device(q, q_bytes, 0);
-    VkTensorSlot* skv = graph_ensure_device(kv, kv_bytes, 0);
-    VkTensorSlot* sw = graph_ensure_device(weight, wbytes, 1);
-    VkTensorSlot* ss = graph_ensure_device(has_scale && scale ? scale : zero, has_scale && scale ? sb_bytes : sizeof(float), 1);
-    VkTensorSlot* sb = graph_ensure_device(has_bias && bias ? bias : zero, has_bias && bias ? sb_bytes : sizeof(float), 1);
-    VkTensorSlot* dst = graph_output_slot(out, out_bytes);
-    if (!sq || !skv || !sw || !ss || !sb || !dst) return 0;
-    struct {
-        uint32_t seq_q, seq_kv, d_model, num_heads, head_dim;
-        float scale_factor;
-        uint32_t has_scale, has_bias, batch, pad[3];
-    } params = {(uint32_t)seq_q, (uint32_t)seq_kv, (uint32_t)d_model, (uint32_t)num_heads,
-                (uint32_t)head_dim, 1.0f / sqrtf((float)head_dim),
-                (uint32_t)(has_scale && scale), (uint32_t)(has_bias && bias), (uint32_t)batch, {0u, 0u, 0u}};
-    size_t p_off = graph_scratch_upload(&params, sizeof(params));
-    if (p_off == SIZE_MAX) return 0;
-    VkGraphBinding binds[7] = {
-        {sq->offset, q_bytes}, {skv->offset, kv_bytes}, {sw->offset, wbytes},
-        {ss->offset, ss->bytes}, {sb->offset, sb->bytes}, {dst->offset, out_bytes}, {p_off, sizeof(params)}
-    };
-    if (!vk_dispatch_kernel(&k_cross_attention, binds, ((uint32_t)seq_q + 63u) / 64u,
-                            (uint32_t)num_heads, (uint32_t)batch)) return 0;
-    graph_mark_device(dst);
-    return 1;
-}
-
-int vk_graph_dequantize_linear_f32(const float* in, const float* scale, const float* zero_point,
-                                   float* out, long n, int has_zero_point) {
-    if (!in || !scale || !out || n <= 0) return 0;
-    static const float zero[1] = {0.0f};
-    size_t bytes = (size_t)n * sizeof(float);
-    graph_scratch_begin();
-    VkTensorSlot* src = graph_ensure_device(in, bytes, 0);
-    VkTensorSlot* ss = graph_ensure_device(scale, sizeof(float), 1);
-    VkTensorSlot* sz = graph_ensure_device(has_zero_point && zero_point ? zero_point : zero, sizeof(float), 1);
-    VkTensorSlot* dst = graph_output_slot(out, bytes);
-    if (!src || !ss || !sz || !dst) return 0;
-    uint32_t params[4] = {(uint32_t)n, (uint32_t)(has_zero_point && zero_point), 0u, 0u};
-    size_t p_off = graph_scratch_upload(params, sizeof(params));
-    if (p_off == SIZE_MAX) return 0;
-    VkGraphBinding binds[5] = {
-        {src->offset, bytes}, {ss->offset, sizeof(float)}, {sz->offset, sizeof(float)}, {dst->offset, bytes}, {p_off, sizeof(params)}
-    };
-    if (!vk_dispatch_kernel(&k_dequantize, binds, ((uint32_t)n + 63u) / 64u, 1, 1)) return 0;
-    graph_mark_device(dst);
-    return 1;
-}
-
-typedef struct {
-    uint32_t rows;
-    uint32_t d_in;
-    uint32_t d_out;
-    uint32_t input_type;
-    uint32_t weight_type;
-    uint32_t output_type;
-    uint32_t pad0;
-    uint32_t pad1;
-    int32_t input_zero_point;
-    int32_t output_zero_point;
-    int32_t pad2;
-    int32_t pad3;
-    float input_scale;
-    float output_scale;
-    float pad4;
-    float pad5;
-} VkQLinearParams;
-
-_Static_assert(sizeof(VkQLinearParams) == 64, "qLinearInt8 uniform ABI");
-
-static void vk_disable_packed_dot_after_failure(const char* kernel_name) {
-    VulkanContextState* context = vk_context_current();
-    if (context) context->packed_dot_disabled = 1;
-    pthread_mutex_lock(&g_vulkan_device.mutex);
-    if (!vulkan_packed_dot_warned) {
-        fprintf(stderr,
-                "[Vulkan] packed INT8 dot kernel '%s' unavailable; using portable shader path\n",
-                kernel_name ? kernel_name : "unknown");
-        vulkan_packed_dot_warned = 1;
-    }
-    pthread_mutex_unlock(&g_vulkan_device.mutex);
-}
-
-static int vk_packed_dot_enabled(void) {
-    VulkanContextState* context = vk_context_current();
-    return vulkan_packed_dot && context && !context->packed_dot_disabled;
-}
-
-static int qlinear_dtype_bounds(uint32_t dtype, int32_t zero_point,
-                                int64_t* maximum_distance) {
-    int32_t minimum;
-    int32_t maximum;
-    if (dtype == VX_DTYPE_I8) {
-        minimum = -128;
-        maximum = 127;
-    } else if (dtype == VX_DTYPE_U8) {
-        minimum = 0;
-        maximum = 255;
-    } else {
-        return 0;
-    }
-    if (zero_point < minimum || zero_point > maximum) return 0;
-    int64_t lower = (int64_t)minimum - zero_point;
-    int64_t upper = (int64_t)maximum - zero_point;
-    *maximum_distance = llabs(lower) > llabs(upper) ? llabs(lower) : llabs(upper);
-    return 1;
-}
-
-static int qlinear_gpu_args_valid(const void* input, const void* weight,
-                                  const float* weight_scales,
-                                  const int32_t* weight_zero_points,
-                                  const int32_t* bias, void* output,
-                                  uint32_t rows, uint32_t d_in, uint32_t d_out,
-                                  float input_scale, int32_t input_zero_point,
-                                  float output_scale, int32_t output_zero_point,
-                                  uint32_t input_dtype, uint32_t weight_dtype,
-                                  uint32_t output_dtype,
-                                  size_t* input_bytes, size_t* weight_bytes,
-                                  size_t* output_bytes) {
-    if (!input || !weight || !weight_scales || !weight_zero_points || !bias || !output ||
-        rows == 0 || d_in == 0 || d_out == 0 || !isfinite(input_scale) ||
-        !isfinite(output_scale) || input_scale <= 0.0f || output_scale <= 0.0f) return 0;
-    int64_t input_distance = 0;
-    int64_t output_distance = 0;
-    if (!qlinear_dtype_bounds(input_dtype, input_zero_point, &input_distance) ||
-        !qlinear_dtype_bounds(output_dtype, output_zero_point, &output_distance)) return 0;
-    (void)output_distance;
-    if (weight_dtype != VX_DTYPE_I8 && weight_dtype != VX_DTYPE_U8) return 0;
-    if (rows > UINT32_MAX / d_in || rows > UINT32_MAX / d_out ||
-        d_out > UINT32_MAX / d_in) return 0;
-    uint64_t input_elements = (uint64_t)rows * d_in;
-    uint64_t weight_elements = (uint64_t)d_out * d_in;
-    uint64_t output_elements = (uint64_t)rows * d_out;
-    if (input_elements > SIZE_MAX || weight_elements > SIZE_MAX ||
-        output_elements > SIZE_MAX ||
-        (size_t)d_out > SIZE_MAX / sizeof(*weight_scales) ||
-        (size_t)d_out > SIZE_MAX / sizeof(*weight_zero_points) ||
-        (size_t)d_out > SIZE_MAX / sizeof(*bias)) return 0;
-    for (uint32_t channel = 0; channel < d_out; channel++) {
-        int64_t weight_distance = 0;
-        if (!isfinite(weight_scales[channel]) || weight_scales[channel] <= 0.0f ||
-            !qlinear_dtype_bounds(weight_dtype, weight_zero_points[channel],
-                                  &weight_distance)) return 0;
-        int64_t bias_distance = bias[channel] < 0 ? -(int64_t)bias[channel] : bias[channel];
-        if (bias_distance > INT32_MAX) return 0;
-        int64_t term_distance = input_distance * weight_distance;
-        if (term_distance > 0 &&
-            (uint64_t)d_in > (uint64_t)(INT32_MAX - bias_distance) /
-                                  (uint64_t)term_distance) return 0;
-    }
-    *input_bytes = (size_t)input_elements;
-    *weight_bytes = (size_t)weight_elements;
-    *output_bytes = (size_t)output_elements;
-    return 1;
-}
-
-int vk_graph_qlinear_i8u8(const void* input, const void* weight,
-                          const float* weight_scales, const int32_t* weight_zero_points,
-                          const int32_t* bias, void* output,
-                          uint32_t rows, uint32_t d_in, uint32_t d_out,
-                          float input_scale, int32_t input_zero_point,
-                          float output_scale, int32_t output_zero_point,
-                          uint32_t input_dtype, uint32_t weight_dtype,
-                          uint32_t output_dtype) {
-    size_t input_bytes, weight_bytes, output_bytes;
-    size_t multiplier_bytes;
-    float* multipliers;
-    if (!qlinear_gpu_args_valid(input, weight, weight_scales, weight_zero_points, bias, output,
-                                rows, d_in, d_out, input_scale, input_zero_point,
-                                output_scale, output_zero_point, input_dtype, weight_dtype,
-                                output_dtype, &input_bytes, &weight_bytes, &output_bytes)) return 0;
-    size_t packed_output_bytes;
-    if (!graph_packed_bytes(output_bytes, &packed_output_bytes)) return 0;
-    multiplier_bytes = (size_t)d_out * sizeof(*multipliers);
-    multipliers = (float*)malloc(multiplier_bytes);
-    if (!multipliers ||
-        !vx_qlinear_build_multipliers(
-            input_scale, weight_scales, output_scale, d_out, multipliers)) {
-        free(multipliers);
-        return 0;
-    }
-    graph_scratch_begin();
-    VkTensorSlot* src = graph_ensure_packed_bytes(input, input_bytes, 0);
-    VkTensorSlot* wt = graph_ensure_packed_bytes(weight, weight_bytes, 1);
-    VkTensorSlot* zero_points = graph_ensure_device(weight_zero_points,
-                                                     (size_t)d_out * sizeof(*weight_zero_points), 1);
-    VkTensorSlot* biases = graph_ensure_device(bias, (size_t)d_out * sizeof(*bias), 1);
-    VkTensorSlot* dst = graph_output_packed_bytes(output, output_bytes);
-    if (!src || !wt || !zero_points || !biases || !dst) {
-        free(multipliers);
-        return 0;
-    }
-    size_t multiplier_offset =
-        graph_scratch_upload(multipliers, multiplier_bytes);
-    free(multipliers);
-    if (multiplier_offset == SIZE_MAX) return 0;
-    VkQLinearParams params = {
-        rows, d_in, d_out,
-        input_dtype,
-        weight_dtype,
-        output_dtype, 0u, 0u,
-        input_zero_point, output_zero_point, 0, 0,
-        input_scale, output_scale, 0.0f, 0.0f
-    };
-    size_t params_offset = graph_scratch_upload(&params, sizeof(params));
-    if (params_offset == SIZE_MAX) return 0;
-    VkGraphBinding binds[7] = {
-        {src->offset, src->bytes}, {wt->offset, wt->bytes},
-        {multiplier_offset, multiplier_bytes},
-        {zero_points->offset, zero_points->bytes},
-        {biases->offset, biases->bytes}, {dst->offset, packed_output_bytes},
-        {params_offset, sizeof(params)}
-    };
-    uint32_t packed_words = (uint32_t)(packed_output_bytes / sizeof(uint32_t));
-    int tiled = rows > 1u && d_in >= 16u && d_out >= 32u && (d_out & 3u) == 0u;
-    uint32_t groups_x = tiled ? ((d_out / 4u + 7u) / 8u) : ((packed_words + 63u) / 64u);
-    uint32_t groups_y = tiled ? ((rows + 7u) / 8u) : 1u;
-    int dispatched = 0;
-    if (vk_packed_dot_enabled()) {
-        VkKernel* dot_kernel = tiled
-            ? &k_qlinear_int8_dot_tiled : &k_qlinear_int8_dot;
-        dispatched = vk_dispatch_kernel(dot_kernel, binds,
-                                        groups_x, groups_y, 1u);
-        if (!dispatched) vk_disable_packed_dot_after_failure(dot_kernel->name);
-        else vk_context_current()->qlinear_dot_dispatches++;
-    }
-    if (!dispatched) {
-        VkKernel* kernel = tiled ? &k_qlinear_int8_tiled : &k_qlinear_int8;
-        if (!vk_dispatch_kernel(kernel, binds, groups_x, groups_y, 1u)) return 0;
-        if (tiled) vk_context_current()->qlinear_tiled_dispatches++;
-        else vk_context_current()->qlinear_scalar_dispatches++;
-    }
-    graph_mark_device(dst);
-    return 1;
-}
-
-typedef struct {
-    uint32_t tokens;
-    uint32_t vocab;
-    uint32_t hidden;
-    uint32_t weight_type;
-    uint32_t output_type;
-    int32_t output_zero_point;
-    float output_scale;
-    uint32_t pad0;
-} VkQEmbeddingParams;
-
-_Static_assert(sizeof(VkQEmbeddingParams) == 32, "qEmbeddingInt8 uniform ABI");
-
-static int qembedding_gpu_args_valid(const int32_t* tokens, const void* weight,
-                                     const float* weight_scales,
-                                     const int32_t* weight_zero_points, void* output,
-                                     uint32_t token_count, uint32_t vocab, uint32_t hidden,
-                                     float output_scale, int32_t output_zero_point,
-                                     uint32_t weight_dtype, uint32_t output_dtype,
-                                     size_t* token_bytes, size_t* weight_bytes,
-                                     size_t* output_bytes) {
-    int64_t distance = 0;
-    uint64_t weight_elements;
-    uint64_t output_elements;
-    if (!tokens || !weight || !weight_scales || !weight_zero_points || !output ||
-        !token_count || !vocab || !hidden || !isfinite(output_scale) ||
-        output_scale <= 0.0f || !qlinear_dtype_bounds(output_dtype, output_zero_point,
-                                                        &distance) ||
-        (weight_dtype != VX_DTYPE_I8 && weight_dtype != VX_DTYPE_U8) ||
-        token_count > UINT32_MAX / hidden || vocab > UINT32_MAX / hidden) return 0;
-    weight_elements = (uint64_t)vocab * hidden;
-    output_elements = (uint64_t)token_count * hidden;
-    if (weight_elements > SIZE_MAX || output_elements > SIZE_MAX ||
-        (size_t)token_count > SIZE_MAX / sizeof(*tokens) ||
-        (size_t)vocab > SIZE_MAX / sizeof(*weight_scales) ||
-        (size_t)vocab > SIZE_MAX / sizeof(*weight_zero_points)) return 0;
-    for (uint32_t row = 0; row < vocab; row++) {
-        if (!isfinite(weight_scales[row]) || weight_scales[row] <= 0.0f ||
-            !qlinear_dtype_bounds(weight_dtype, weight_zero_points[row], &distance)) return 0;
-    }
-    for (uint32_t token = 0; token < token_count; token++) {
-        if (tokens[token] < 0 || (uint32_t)tokens[token] >= vocab) return 0;
-    }
-    *token_bytes = (size_t)token_count * sizeof(*tokens);
-    *weight_bytes = (size_t)weight_elements;
-    *output_bytes = (size_t)output_elements;
-    return 1;
-}
-
-int vk_graph_qembedding_i8u8(const int32_t* tokens, const void* weight,
-                             const float* weight_scales,
-                             const int32_t* weight_zero_points, void* output,
-                             uint32_t token_count, uint32_t vocab, uint32_t hidden,
-                             float output_scale, int32_t output_zero_point,
-                             uint32_t weight_dtype, uint32_t output_dtype) {
-    size_t token_bytes;
-    size_t weight_bytes;
-    size_t output_bytes;
-    size_t packed_output_bytes;
-    if (!qembedding_gpu_args_valid(tokens, weight, weight_scales, weight_zero_points,
-                                   output, token_count, vocab, hidden, output_scale,
-                                   output_zero_point, weight_dtype, output_dtype,
-                                   &token_bytes, &weight_bytes, &output_bytes) ||
-        !graph_packed_bytes(output_bytes, &packed_output_bytes)) return 0;
-    graph_scratch_begin();
-    VkTensorSlot* ids = graph_ensure_device(tokens, token_bytes, 0);
-    VkTensorSlot* table = graph_ensure_packed_bytes(weight, weight_bytes, 1);
-    VkTensorSlot* scales = graph_ensure_device(weight_scales,
-                                                (size_t)vocab * sizeof(*weight_scales), 1);
-    VkTensorSlot* zero_points = graph_ensure_device(weight_zero_points,
-                                                     (size_t)vocab * sizeof(*weight_zero_points), 1);
-    VkTensorSlot* dst = graph_output_packed_bytes(output, output_bytes);
-    if (!ids || !table || !scales || !zero_points || !dst) return 0;
-    VkQEmbeddingParams params = {
-        token_count, vocab, hidden,
-        weight_dtype,
-        output_dtype, output_zero_point,
-        output_scale, 0u
-    };
-    size_t params_offset = graph_scratch_upload(&params, sizeof(params));
-    if (params_offset == SIZE_MAX) return 0;
-    VkGraphBinding binds[6] = {
-        {ids->offset, ids->bytes}, {table->offset, table->bytes},
-        {scales->offset, scales->bytes}, {zero_points->offset, zero_points->bytes},
-        {dst->offset, packed_output_bytes}, {params_offset, sizeof(params)}
-    };
-    uint32_t packed_words = (uint32_t)(packed_output_bytes / sizeof(uint32_t));
-    if (!vk_dispatch_kernel(&k_qembedding_int8, binds,
-                            (packed_words + 63u) / 64u, 1u, 1u)) return 0;
-    graph_mark_device(dst);
-    return 1;
-}
-
-typedef struct {
-    uint32_t elements;
-    uint32_t a_type;
-    uint32_t b_type;
-    uint32_t output_type;
-    int32_t a_zero_point;
-    int32_t b_zero_point;
-    int32_t output_zero_point;
-    int32_t pad0;
-    float a_scale;
-    float b_scale;
-    float output_scale;
-    uint32_t relu;
-} VkQAddParams;
-
-_Static_assert(sizeof(VkQAddParams) == 48, "qAdd uniform ABI");
-
-typedef struct {
-    uint32_t batch_rank;
-    uint32_t m;
-    uint32_t k;
-    uint32_t n;
-    uint32_t output_elements;
-    uint32_t a_type;
-    uint32_t b_type;
-    uint32_t output_type;
-    int32_t a_zero_point;
-    int32_t b_zero_point;
-    int32_t output_zero_point;
-    int32_t pad0;
-    float a_scale;
-    float b_scale;
-    float output_scale;
-    float pad1;
-} VkQBatchMatMulParams;
-
-_Static_assert(sizeof(VkQBatchMatMulParams) == 64,
-               "qBatchMatMul uniform ABI");
-
-typedef struct {
-    uint32_t elements;
-    uint32_t input_type;
-    uint32_t output_type;
-    uint32_t pad0;
-    int32_t input_zero_point;
-    int32_t output_zero_point;
-    int32_t pad1;
-    int32_t pad2;
-    float input_scale;
-    float output_scale;
-    float pad3;
-    float pad4;
-} VkQByteUnaryParams;
-
-_Static_assert(sizeof(VkQByteUnaryParams) == 48,
-               "qSiLUInt8/qGELUInt8 uniform ABI");
-
-typedef struct {
-    uint32_t batch;
-    uint32_t height;
-    uint32_t width;
-    uint32_t channels;
-    uint32_t groups;
-    uint32_t input_type;
-    uint32_t output_type;
-    uint32_t pad0;
-    int32_t input_zero_point;
-    int32_t output_zero_point;
-    int32_t pad1;
-    int32_t pad2;
-    float input_scale;
-    float output_scale;
-    float epsilon;
-    float pad3;
-} VkQGroupNormParams;
-
-_Static_assert(sizeof(VkQGroupNormParams) == 64,
-               "qGroupNormStats/qGroupNormApply uniform ABI");
-
-typedef struct {
-    uint32_t rows;
-    uint32_t d_model;
-    uint32_t input_type;
-    uint32_t output_type;
-    int32_t input_zero_point;
-    int32_t output_zero_point;
-    int32_t pad0;
-    int32_t pad1;
-    float input_scale;
-    float output_scale;
-    float epsilon;
-    float pad2;
-} VkQLayerNormParams;
-
-_Static_assert(sizeof(VkQLayerNormParams) == 48,
-               "qLayerNormStats/qLayerNormApply uniform ABI");
-
-/* Five tightly packed 16-byte blocks shared verbatim with qSDPAInt8.wgsl.
- * The four canonical protobuf dtype values occupy byte lanes in one u32 so
- * every backend uses the same 80-byte uniform layout. */
-typedef struct {
-    uint32_t seq_q;
-    uint32_t seq_kv;
-    uint32_t d_model;
-    uint32_t heads;
-    uint32_t batch;
-    uint32_t mask_mode;
-    uint32_t causal;
-    uint32_t dtypes;
-    int32_t q_zero_point;
-    int32_t k_zero_point;
-    int32_t v_zero_point;
-    int32_t output_zero_point;
-    float q_scale;
-    float k_scale;
-    float v_scale;
-    float output_scale;
-    float attention_scale;
-    float pad0;
-    float pad1;
-    float pad2;
-} VkQSDPAParams;
-
-_Static_assert(sizeof(VkQSDPAParams) == 80, "qSDPAInt8 uniform ABI");
-
-typedef struct {
-    uint32_t outer;
-    uint32_t axis_size;
-    uint32_t inner;
-    uint32_t input_dtype;
-} VkQArgMaxParams;
-
-_Static_assert(sizeof(VkQArgMaxParams) == 16, "qArgMaxInt8 uniform ABI");
-
-/* Eight u32 fields followed by two I32 zero points and two F32 scales.  This
- * 48-byte block is shared verbatim with qMaskedMeanInt8.wgsl and the browser
- * WebGPU dispatcher. */
-typedef struct {
-    uint32_t batch;
-    uint32_t sequence;
-    uint32_t width;
-    uint32_t input_dtype;
-    uint32_t output_dtype;
-    uint32_t pad0;
-    uint32_t pad1;
-    uint32_t pad2;
-    int32_t input_zero_point;
-    int32_t output_zero_point;
-    float input_scale;
-    float output_scale;
-} VkQMaskedMeanParams;
-
-_Static_assert(sizeof(VkQMaskedMeanParams) == 48,
-               "qMaskedMeanInt8 uniform ABI");
-
-typedef struct {
-    uint32_t elements;
-    uint32_t input_type;
-    uint32_t output_type;
-    uint32_t pad0;
-    int32_t input_zero_point;
-    int32_t output_zero_point;
-    int32_t pad1;
-    int32_t pad2;
-    float multiplier;
-    float pad3;
-    float pad4;
-    float pad5;
-} VkRequantizeLinearParams;
-
-_Static_assert(sizeof(VkRequantizeLinearParams) == 48,
-               "requantizeLinearTyped uniform ABI");
-
-static int qbyte_dtype_zero_point_valid(uint32_t dtype, int32_t zero_point) {
-    if (dtype == VX_DTYPE_I8) return zero_point >= -128 && zero_point <= 127;
-    if (dtype == VX_DTYPE_U8) return zero_point >= 0 && zero_point <= 255;
-    return 0;
-}
-
-static int qadd_gpu_args_valid(const void* a, uint32_t a_elements,
-                               const void* b, uint32_t b_elements,
-                               void* output, uint32_t output_elements,
-                               float a_scale, int32_t a_zero_point,
-                               float b_scale, int32_t b_zero_point,
-                               float output_scale, int32_t output_zero_point,
-                               uint32_t a_dtype, uint32_t b_dtype,
-                               uint32_t output_dtype, uint32_t relu,
-                               size_t* logical_bytes) {
-    if (!a || !b || !output || output == a || output == b ||
-        a_elements == 0 || a_elements != b_elements ||
-        a_elements != output_elements || relu > 2u ||
-        !isfinite(a_scale) || !isfinite(b_scale) || !isfinite(output_scale) ||
-        a_scale <= 0.0f || b_scale <= 0.0f || output_scale <= 0.0f ||
-        !qbyte_dtype_zero_point_valid(a_dtype, a_zero_point) ||
-        !qbyte_dtype_zero_point_valid(b_dtype, b_zero_point) ||
-        !qbyte_dtype_zero_point_valid(output_dtype, output_zero_point)) return 0;
-    if ((uint64_t)a_elements > SIZE_MAX) return 0;
-    *logical_bytes = (size_t)a_elements;
-    return 1;
-}
-
-static int qbyte_unary_gpu_args_valid(const void* input, void* output, uint32_t elements,
-                                      float input_scale, int32_t input_zero_point,
-                                      float output_scale, int32_t output_zero_point,
-                                      uint32_t input_dtype, uint32_t output_dtype,
-                                      size_t* logical_bytes) {
-    if (!input || !output || input == output || !elements ||
-        !isfinite(input_scale) || !isfinite(output_scale) ||
-        input_scale <= 0.0f || output_scale <= 0.0f ||
-        !qbyte_dtype_zero_point_valid(input_dtype, input_zero_point) ||
-        !qbyte_dtype_zero_point_valid(output_dtype, output_zero_point) ||
-        (uint64_t)elements > SIZE_MAX) return 0;
-    *logical_bytes = (size_t)elements;
-    return 1;
-}
-
-static float qnorm_f32_at(const float* values, uint32_t index) {
-    float value;
-    memcpy(&value, (const unsigned char*)values + (size_t)index * sizeof(value),
-           sizeof(value));
-    return value;
-}
-
-static int qgroupnorm_gpu_args_valid(const void* input, const float* weight,
-                                     const float* bias, void* output,
-                                     uint32_t batch, uint32_t height,
-                                     uint32_t width, uint32_t channels,
-                                     uint32_t groups, float input_scale,
-                                     int32_t input_zero_point, float output_scale,
-                                     int32_t output_zero_point, float epsilon,
-                                     uint32_t input_dtype, uint32_t output_dtype,
-                                     size_t* logical_bytes, size_t* affine_bytes,
-                                     size_t* stats_bytes) {
-    uint64_t elements;
-    uint64_t group_count;
-    if (!input || !weight || !bias || !output || output == input ||
-        output == (const void*)weight || output == (const void*)bias ||
-        !batch || !height || !width || !channels || !groups || channels % groups ||
-        !isfinite(input_scale) || input_scale <= 0.0f ||
-        !isfinite(output_scale) || output_scale <= 0.0f ||
-        !isfinite(epsilon) || epsilon <= 0.0f ||
-        !qbyte_dtype_zero_point_valid(input_dtype, input_zero_point) ||
-        !qbyte_dtype_zero_point_valid(output_dtype, output_zero_point) ||
-        batch > UINT32_MAX / groups) return 0;
-    elements = batch;
-    if (elements > UINT32_MAX / height) return 0;
-    elements *= height;
-    if (elements > UINT32_MAX / width) return 0;
-    elements *= width;
-    if (elements > UINT32_MAX / channels) return 0;
-    elements *= channels;
-    group_count = (uint64_t)batch * groups;
-    if (elements == 0 || elements > SIZE_MAX || group_count == 0 ||
-        group_count > SIZE_MAX / (2u * sizeof(float)) ||
-        (size_t)channels > SIZE_MAX / sizeof(float)) return 0;
-    for (uint32_t channel = 0; channel < channels; channel++) {
-        if (!isfinite(qnorm_f32_at(weight, channel)) ||
-            !isfinite(qnorm_f32_at(bias, channel))) return 0;
-    }
-    *logical_bytes = (size_t)elements;
-    *affine_bytes = (size_t)channels * sizeof(float);
-    *stats_bytes = (size_t)group_count * 2u * sizeof(float);
-    return 1;
-}
-
-static int qlayernorm_gpu_args_valid(const void* input, const float* weight,
-                                     const float* bias, void* output,
-                                     uint32_t rows, uint32_t d_model,
-                                     float input_scale, int32_t input_zero_point,
-                                     float output_scale, int32_t output_zero_point,
-                                     float epsilon, uint32_t input_dtype,
-                                     uint32_t output_dtype, size_t* logical_bytes,
-                                     size_t* affine_bytes, size_t* stats_bytes) {
-    uint64_t elements;
-    size_t row_count;
-    if (!input || !weight || !bias || !output || output == input ||
-        output == (const void*)weight || output == (const void*)bias ||
-        !rows || !d_model || !isfinite(input_scale) || input_scale <= 0.0f ||
-        !isfinite(output_scale) || output_scale <= 0.0f ||
-        !isfinite(epsilon) || epsilon <= 0.0f ||
-        !qbyte_dtype_zero_point_valid(input_dtype, input_zero_point) ||
-        !qbyte_dtype_zero_point_valid(output_dtype, output_zero_point) ||
-        rows > UINT32_MAX / d_model) return 0;
-    elements = (uint64_t)rows * d_model;
-    row_count = (size_t)rows;
-    if (elements == 0 || elements > SIZE_MAX ||
-        row_count > SIZE_MAX / (2u * sizeof(float)) ||
-        (size_t)d_model > SIZE_MAX / sizeof(float)) return 0;
-    for (uint32_t channel = 0; channel < d_model; channel++) {
-        if (!isfinite(qnorm_f32_at(weight, channel)) ||
-            !isfinite(qnorm_f32_at(bias, channel))) return 0;
-    }
-    *logical_bytes = (size_t)elements;
-    *affine_bytes = (size_t)d_model * sizeof(float);
-    *stats_bytes = row_count * 2u * sizeof(float);
-    return 1;
-}
-
-static int qsdpa_ranges_overlap(const void* left, size_t left_bytes,
-                                const void* right, size_t right_bytes) {
-    uintptr_t left_start = (uintptr_t)left;
-    uintptr_t right_start = (uintptr_t)right;
-    if (left_start > UINTPTR_MAX - left_bytes ||
-        right_start > UINTPTR_MAX - right_bytes) return 1;
-    return left_start < right_start + right_bytes &&
-        right_start < left_start + left_bytes;
-}
-
-static int qsdpa_centered_magnitude(uint32_t dtype, int32_t zero_point,
-                                    uint64_t* magnitude_out) {
-    int64_t low;
-    int64_t high;
-    uint64_t magnitude;
-    if (!magnitude_out) return 0;
-    if (dtype == VX_DTYPE_I8) {
-        low = -128 - (int64_t)zero_point;
-        high = 127 - (int64_t)zero_point;
-    } else if (dtype == VX_DTYPE_U8) {
-        low = -(int64_t)zero_point;
-        high = 255 - (int64_t)zero_point;
-    } else {
-        return 0;
-    }
-    magnitude = (uint64_t)(low < 0 ? -low : low);
-    if ((uint64_t)(high < 0 ? -high : high) > magnitude)
-        magnitude = (uint64_t)(high < 0 ? -high : high);
-    *magnitude_out = magnitude;
-    return 1;
-}
-
-static int qsdpa_mask_bytes(uint32_t batch, uint32_t seq_q, uint32_t seq_kv,
-                            uint32_t mask_mode, size_t* mask_bytes) {
-    uint64_t elements = seq_kv;
-    if (!mask_bytes) return 0;
-    if (mask_mode == 0u) {
-        *mask_bytes = 0;
-        return 1;
-    }
-    if (mask_mode == 2u) {
-        if (elements > UINT32_MAX / batch) return 0;
-        elements *= batch;
-    } else if (mask_mode == 3u) {
-        if (elements > UINT32_MAX / seq_q) return 0;
-        elements *= seq_q;
-    } else if (mask_mode == 4u) {
-        if (elements > UINT32_MAX / seq_q) return 0;
-        elements *= seq_q;
-        if (elements > UINT32_MAX / batch) return 0;
-        elements *= batch;
-    } else if (mask_mode != 1u) {
-        return 0;
-    }
-    if (elements == 0 || elements > UINT32_MAX ||
-        elements > SIZE_MAX / sizeof(int32_t)) return 0;
-    *mask_bytes = (size_t)elements * sizeof(int32_t);
-    return 1;
-}
-
-/* Validate all descriptor arithmetic before residency/upload.  The finite
- * worst-case score test guarantees qSDPAInt8's online recurrence never sees
- * +/-infinity and therefore cannot evaluate an invalid infinity subtraction. */
-static int qsdpa_gpu_args_valid(const void* q, const void* k, const void* v,
-                                const int32_t* mask, void* output,
-                                uint32_t batch, uint32_t seq_q,
-                                uint32_t seq_kv, uint32_t d_model,
-                                uint32_t heads, float q_scale,
-                                int32_t q_zero_point, float k_scale,
-                                int32_t k_zero_point, float v_scale,
-                                int32_t v_zero_point, float output_scale,
-                                int32_t output_zero_point, float attention_scale,
-                                uint32_t q_dtype, uint32_t k_dtype,
-                                uint32_t v_dtype, uint32_t output_dtype,
-                                uint32_t causal, uint32_t mask_mode,
-                                size_t* q_bytes, size_t* kv_bytes,
-                                size_t* mask_bytes) {
-    uint64_t q_elements = batch;
-    uint64_t kv_elements = batch;
-    uint64_t q_magnitude;
-    uint64_t k_magnitude;
-    uint64_t maximum_dot;
-    uint32_t head_dim;
-    float qk_scale;
-    float score_scale;
-    if (!q || !k || !v || !output || !batch || !seq_q || !seq_kv ||
-        !d_model || !heads || causal > 1u || d_model % heads ||
-        d_model % 4u || !isfinite(q_scale) || q_scale <= 0.0f ||
-        !isfinite(k_scale) || k_scale <= 0.0f || !isfinite(v_scale) ||
-        v_scale <= 0.0f || !isfinite(output_scale) || output_scale <= 0.0f ||
-        !isfinite(attention_scale) || attention_scale <= 0.0f ||
-        !qbyte_dtype_zero_point_valid(q_dtype, q_zero_point) ||
-        !qbyte_dtype_zero_point_valid(k_dtype, k_zero_point) ||
-        !qbyte_dtype_zero_point_valid(v_dtype, v_zero_point) ||
-        !qbyte_dtype_zero_point_valid(output_dtype, output_zero_point) ||
-        !q_bytes || !kv_bytes || !mask_bytes) return 0;
-    head_dim = d_model / heads;
-    if (!head_dim || head_dim % 4u || head_dim > 64u ||
-        q_elements > UINT32_MAX / seq_q) return 0;
-    q_elements *= seq_q;
-    if (q_elements > UINT32_MAX / d_model) return 0;
-    q_elements *= d_model;
-    if (kv_elements > UINT32_MAX / seq_kv) return 0;
-    kv_elements *= seq_kv;
-    if (kv_elements > UINT32_MAX / d_model) return 0;
-    kv_elements *= d_model;
-    if (q_elements == 0 || kv_elements == 0 || q_elements > SIZE_MAX ||
-        kv_elements > SIZE_MAX || !qsdpa_mask_bytes(batch, seq_q, seq_kv,
-                                                     mask_mode, mask_bytes) ||
-        (mask_mode == 0u ? mask != NULL : mask == NULL)) return 0;
-    qk_scale = q_scale * k_scale;
-    score_scale = qk_scale * attention_scale;
-    if (!isfinite(qk_scale) || qk_scale <= 0.0f ||
-        !isfinite(score_scale) || score_scale <= 0.0f ||
-        !qsdpa_centered_magnitude(q_dtype, q_zero_point, &q_magnitude) ||
-        !qsdpa_centered_magnitude(k_dtype, k_zero_point, &k_magnitude)) return 0;
-    maximum_dot = q_magnitude * k_magnitude * head_dim;
-    if (!isfinite((float)maximum_dot * score_scale)) return 0;
-    *q_bytes = (size_t)q_elements;
-    *kv_bytes = (size_t)kv_elements;
-    if (qsdpa_ranges_overlap(output, *q_bytes, q, *q_bytes) ||
-        qsdpa_ranges_overlap(output, *q_bytes, k, *kv_bytes) ||
-        qsdpa_ranges_overlap(output, *q_bytes, v, *kv_bytes) ||
-        (*mask_bytes && qsdpa_ranges_overlap(output, *q_bytes, mask,
-                                             *mask_bytes))) return 0;
-    return 1;
-}
-
-static int qargmax_gpu_args_valid(const void* input, int32_t* output,
-                                  uint32_t outer, uint32_t axis_size,
-                                  uint32_t inner, uint32_t input_dtype,
-                                  size_t* input_bytes, size_t* output_bytes,
-                                  uint32_t* output_elements_out) {
-    uint64_t input_elements = outer;
-    uint64_t output_elements = outer;
-    if (!input || !output || !outer || !axis_size || !inner ||
-        axis_size > (uint32_t)INT32_MAX ||
-        (input_dtype != VX_DTYPE_I8 && input_dtype != VX_DTYPE_U8) ||
-        !input_bytes || !output_bytes || !output_elements_out ||
-        input_elements > UINT32_MAX / axis_size) return 0;
-    input_elements *= axis_size;
-    if (input_elements > UINT32_MAX / inner ||
-        output_elements > UINT32_MAX / inner) return 0;
-    input_elements *= inner;
-    output_elements *= inner;
-    if (!input_elements || !output_elements || input_elements > SIZE_MAX ||
-        output_elements > UINT32_MAX ||
-        output_elements > SIZE_MAX / sizeof(*output)) return 0;
-    *input_bytes = (size_t)input_elements;
-    *output_bytes = (size_t)output_elements * sizeof(*output);
-    *output_elements_out = (uint32_t)output_elements;
-    return !qsdpa_ranges_overlap(output, *output_bytes, input, *input_bytes);
-}
-
-/* Validate the exact scalar byte-reduction envelope before allocating device
- * residency.  qMaskedMeanInt8 accumulates centered values in I32, so sequence
- * length is bounded by the declared signed/unsigned zero point rather than
- * relying on an implementation-defined overflow. */
-static int qmaskedmean_gpu_args_valid(const void* input, const int32_t* mask,
-                                      void* output, uint32_t batch,
-                                      uint32_t sequence, uint32_t width,
-                                      float input_scale, int32_t input_zero_point,
-                                      float output_scale, int32_t output_zero_point,
-                                      uint32_t input_dtype, uint32_t output_dtype,
-                                      size_t* input_bytes, size_t* mask_bytes,
-                                      size_t* output_bytes) {
-    uint64_t input_elements = batch;
-    uint64_t mask_elements = batch;
-    uint64_t output_elements = batch;
-    int64_t low;
-    int64_t high;
-    uint64_t magnitude;
-    float multiplier;
-    if (!input || !mask || !output || !batch || !sequence || !width ||
-        !isfinite(input_scale) || input_scale <= 0.0f ||
-        !isfinite(output_scale) || output_scale <= 0.0f ||
-        !qbyte_dtype_zero_point_valid(input_dtype, input_zero_point) ||
-        !qbyte_dtype_zero_point_valid(output_dtype, output_zero_point) ||
-        !input_bytes || !mask_bytes || !output_bytes ||
-        input_elements > UINT32_MAX / sequence) return 0;
-    input_elements *= sequence;
-    if (input_elements > UINT32_MAX / width ||
-        mask_elements > UINT32_MAX / sequence ||
-        output_elements > UINT32_MAX / width) return 0;
-    input_elements *= width;
-    mask_elements *= sequence;
-    output_elements *= width;
-    if (!input_elements || !mask_elements || !output_elements ||
-        input_elements > SIZE_MAX || mask_elements > SIZE_MAX / sizeof(*mask) ||
-        output_elements > SIZE_MAX) return 0;
-    if (input_dtype == VX_DTYPE_I8) {
-        low = -128 - (int64_t)input_zero_point;
-        high = 127 - (int64_t)input_zero_point;
-    } else {
-        low = -(int64_t)input_zero_point;
-        high = 255 - (int64_t)input_zero_point;
-    }
-    magnitude = (uint64_t)(low < 0 ? -low : low);
-    if ((uint64_t)(high < 0 ? -high : high) > magnitude)
-        magnitude = (uint64_t)(high < 0 ? -high : high);
-    multiplier = input_scale / output_scale;
-    if ((magnitude != 0 && (uint64_t)sequence > (uint64_t)INT32_MAX / magnitude) ||
-        !isfinite(multiplier) || multiplier <= 0.0f) return 0;
-    *input_bytes = (size_t)input_elements;
-    *mask_bytes = (size_t)mask_elements * sizeof(*mask);
-    *output_bytes = (size_t)output_elements;
-    return !qsdpa_ranges_overlap(output, *output_bytes, input, *input_bytes) &&
-        !qsdpa_ranges_overlap(output, *output_bytes, mask, *mask_bytes);
-}
-
-static int requantize_gpu_args_valid(const void* input, uint32_t input_elements,
-                                     void* output, uint32_t output_elements,
-                                     float input_scale, int32_t input_zero_point,
-                                     float output_scale, int32_t output_zero_point,
-                                     uint32_t input_dtype, uint32_t output_dtype,
-                                     float* multiplier, size_t* logical_bytes) {
-    if (!input || !output || input == output || input_elements == 0 ||
-        input_elements != output_elements || !isfinite(input_scale) ||
-        !isfinite(output_scale) || input_scale <= 0.0f || output_scale <= 0.0f ||
-        !qbyte_dtype_zero_point_valid(input_dtype, input_zero_point) ||
-        !qbyte_dtype_zero_point_valid(output_dtype, output_zero_point)) return 0;
-    float ratio = input_scale / output_scale;
-    if (!isfinite(ratio) || ratio <= 0.0f || (uint64_t)input_elements > SIZE_MAX) return 0;
-    *multiplier = ratio;
-    *logical_bytes = (size_t)input_elements;
-    return 1;
-}
-
-int vk_graph_qbatch_matmul_i8u8(
-        const void* a, const int* a_shape, int a_rank,
-        float a_scale, int32_t a_zero_point, uint32_t a_dtype,
-        const void* b, const int* b_shape, int b_rank,
-        float b_scale, int32_t b_zero_point, uint32_t b_dtype,
-        void* output, const int* output_shape, int output_rank,
-        float output_scale, int32_t output_zero_point,
-        uint32_t output_dtype) {
-    VxQBatchMatMulDevicePlan plan;
-    uint32_t metadata[24] = {0};
-    uint32_t metadata_words;
-    size_t metadata_bytes;
-    size_t a_packed_bytes;
-    size_t b_packed_bytes;
-    size_t output_packed_bytes;
-    if (!vx_qbatch_matmul_device_plan(
-            a, a_shape, a_rank, a_scale, a_zero_point, a_dtype,
-            b, b_shape, b_rank, b_scale, b_zero_point, b_dtype,
-            output, output_shape, output_rank, output_scale,
-            output_zero_point, output_dtype, &plan) ||
-        !graph_packed_bytes(plan.a_bytes, &a_packed_bytes) ||
-        !graph_packed_bytes(plan.b_bytes, &b_packed_bytes) ||
-        !graph_packed_bytes(plan.output_bytes, &output_packed_bytes))
-        return 0;
-    graph_scratch_begin();
-    VkTensorSlot* a_slot =
-        graph_ensure_packed_bytes(a, plan.a_bytes, 0);
-    VkTensorSlot* b_slot =
-        graph_ensure_packed_bytes(b, plan.b_bytes, 0);
-    VkTensorSlot* output_slot =
-        graph_output_packed_bytes(output, plan.output_bytes);
-    if (!a_slot || !b_slot || !output_slot) return 0;
-    memcpy(metadata, plan.output_batch_strides,
-           plan.batch_rank * sizeof(uint32_t));
-    memcpy(metadata + plan.batch_rank, plan.a_batch_strides,
-           plan.batch_rank * sizeof(uint32_t));
-    memcpy(metadata + 2u * plan.batch_rank, plan.b_batch_strides,
-           plan.batch_rank * sizeof(uint32_t));
-    metadata_words = plan.batch_rank ? 3u * plan.batch_rank : 1u;
-    metadata_bytes = (size_t)metadata_words * sizeof(uint32_t);
-    VkQBatchMatMulParams params = {
-        plan.batch_rank, plan.m, plan.k, plan.n,
-        plan.output_elements, a_dtype, b_dtype, output_dtype,
-        a_zero_point, b_zero_point, output_zero_point, 0,
-        a_scale, b_scale, output_scale, 0.0f,
-    };
-    size_t metadata_offset =
-        graph_scratch_upload(metadata, metadata_bytes);
-    size_t params_offset = graph_scratch_upload(&params, sizeof(params));
-    if (metadata_offset == SIZE_MAX || params_offset == SIZE_MAX) return 0;
-    VkGraphBinding binds[5] = {
-        {a_slot->offset, a_packed_bytes},
-        {b_slot->offset, b_packed_bytes},
-        {output_slot->offset, output_packed_bytes},
-        {metadata_offset, metadata_bytes},
-        {params_offset, sizeof(params)},
-    };
-    uint32_t packed_words =
-        (uint32_t)(output_packed_bytes / sizeof(uint32_t));
-    int dispatched = 0;
-    uint32_t groups = (packed_words + 63u) / 64u;
-    if (vk_packed_dot_enabled()) {
-        dispatched = vk_dispatch_kernel(
-            &k_qbatch_matmul_i8u8_dot, binds, groups, 1u, 1u);
-        if (!dispatched) {
-            vk_disable_packed_dot_after_failure(
-                k_qbatch_matmul_i8u8_dot.name);
-        }
-        else vk_context_current()->qbatch_dot_dispatches++;
-    }
-    if (!dispatched && !vk_dispatch_kernel(
-            &k_qbatch_matmul_i8u8, binds, groups, 1u, 1u))
-        return 0;
-    if (!dispatched) vk_context_current()->qbatch_scalar_dispatches++;
-    graph_mark_device(output_slot);
-    return 1;
-}
-
-int vk_graph_qadd_i8u8(const void* a, uint32_t a_elements,
-                       const void* b, uint32_t b_elements,
-                       void* output, uint32_t output_elements,
-                       float a_scale, int32_t a_zero_point,
-                       float b_scale, int32_t b_zero_point,
-                       float output_scale, int32_t output_zero_point,
-                       uint32_t a_dtype, uint32_t b_dtype,
-                       uint32_t output_dtype, uint32_t relu) {
-    size_t logical_bytes;
-    if (!qadd_gpu_args_valid(a, a_elements, b, b_elements, output, output_elements,
-                             a_scale, a_zero_point, b_scale, b_zero_point,
-                             output_scale, output_zero_point, a_dtype, b_dtype,
-                             output_dtype, relu, &logical_bytes)) return 0;
-    size_t packed_bytes;
-    if (!graph_packed_bytes(logical_bytes, &packed_bytes)) return 0;
-    graph_scratch_begin();
-    VkTensorSlot* a_slot = graph_ensure_packed_bytes(a, logical_bytes, 0);
-    VkTensorSlot* b_slot = graph_ensure_packed_bytes(b, logical_bytes, 0);
-    VkTensorSlot* output_slot = graph_output_packed_bytes(output, logical_bytes);
-    if (!a_slot || !b_slot || !output_slot) return 0;
-    VkQAddParams params = {
-        a_elements, a_dtype,
-        b_dtype,
-        output_dtype,
-        a_zero_point, b_zero_point, output_zero_point, 0,
-        a_scale, b_scale, output_scale, relu
-    };
-    size_t params_offset = graph_scratch_upload(&params, sizeof(params));
-    if (params_offset == SIZE_MAX) return 0;
-    VkGraphBinding binds[4] = {
-        {a_slot->offset, a_slot->bytes}, {b_slot->offset, b_slot->bytes},
-        {output_slot->offset, packed_bytes}, {params_offset, sizeof(params)}
-    };
-    uint32_t packed_words = (uint32_t)(packed_bytes / sizeof(uint32_t));
-    if (!vk_dispatch_kernel(&k_qadd_i8u8, binds, (packed_words + 63u) / 64u,
-                            1u, 1u)) return 0;
-    graph_mark_device(output_slot);
-    return 1;
-}
-
-int vk_graph_qsilu_i8u8(const void* input, void* output, uint32_t elements,
-                        float input_scale, int32_t input_zero_point,
-                        float output_scale, int32_t output_zero_point,
-                        uint32_t input_dtype, uint32_t output_dtype) {
-    size_t logical_bytes;
-    if (!qbyte_unary_gpu_args_valid(input, output, elements, input_scale,
-                                    input_zero_point, output_scale, output_zero_point,
-                                    input_dtype, output_dtype, &logical_bytes)) return 0;
-    size_t packed_bytes;
-    if (!graph_packed_bytes(logical_bytes, &packed_bytes)) return 0;
-    graph_scratch_begin();
-    VkTensorSlot* input_slot = graph_ensure_packed_bytes(input, logical_bytes, 0);
-    VkTensorSlot* output_slot = graph_output_packed_bytes(output, logical_bytes);
-    if (!input_slot || !output_slot) return 0;
-    VkQByteUnaryParams params = {
-        elements, input_dtype,
-        output_dtype, 0u,
-        input_zero_point, output_zero_point, 0, 0,
-        input_scale, output_scale, 0.0f, 0.0f
-    };
-    size_t params_offset = graph_scratch_upload(&params, sizeof(params));
-    if (params_offset == SIZE_MAX) return 0;
-    VkGraphBinding binds[3] = {
-        {input_slot->offset, input_slot->bytes},
-        {output_slot->offset, packed_bytes}, {params_offset, sizeof(params)}
-    };
-    uint32_t packed_words = (uint32_t)(packed_bytes / sizeof(uint32_t));
-    if (!vk_dispatch_kernel(&k_qsilu_i8u8, binds, (packed_words + 63u) / 64u,
-                            1u, 1u)) return 0;
-    graph_mark_device(output_slot);
-    return 1;
-}
-
-int vk_graph_qgelu_i8u8(const void* input, void* output, uint32_t elements,
-                        float input_scale, int32_t input_zero_point,
-                        float output_scale, int32_t output_zero_point,
-                        uint32_t input_dtype, uint32_t output_dtype) {
-    size_t logical_bytes;
-    if (!qbyte_unary_gpu_args_valid(input, output, elements, input_scale,
-                                    input_zero_point, output_scale, output_zero_point,
-                                    input_dtype, output_dtype, &logical_bytes)) return 0;
-    size_t packed_bytes;
-    if (!graph_packed_bytes(logical_bytes, &packed_bytes)) return 0;
-    graph_scratch_begin();
-    VkTensorSlot* input_slot = graph_ensure_packed_bytes(input, logical_bytes, 0);
-    VkTensorSlot* output_slot = graph_output_packed_bytes(output, logical_bytes);
-    if (!input_slot || !output_slot) return 0;
-    VkQByteUnaryParams params = {
-        elements, input_dtype,
-        output_dtype, 0u,
-        input_zero_point, output_zero_point, 0, 0,
-        input_scale, output_scale, 0.0f, 0.0f
-    };
-    size_t params_offset = graph_scratch_upload(&params, sizeof(params));
-    if (params_offset == SIZE_MAX) return 0;
-    VkGraphBinding binds[3] = {
-        {input_slot->offset, input_slot->bytes},
-        {output_slot->offset, packed_bytes}, {params_offset, sizeof(params)}
-    };
-    uint32_t packed_words = (uint32_t)(packed_bytes / sizeof(uint32_t));
-    if (!vk_dispatch_kernel(&k_qgelu_i8u8, binds, (packed_words + 63u) / 64u,
-                            1u, 1u)) return 0;
-    graph_mark_device(output_slot);
-    return 1;
-}
-
-/* The statistics pass owns one [batch, group] workgroup; the apply pass owns
- * complete packed output words.  Keeping them separate prevents byte-lane
- * races whenever a channel-group boundary crosses a u32 word. */
-int vk_graph_qgroupnorm_i8u8(const void* input, const float* weight,
-                             const float* bias, void* output, uint32_t batch,
-                             uint32_t height, uint32_t width, uint32_t channels,
-                             uint32_t groups, float input_scale,
-                             int32_t input_zero_point, float output_scale,
-                             int32_t output_zero_point, float epsilon,
-                             uint32_t input_dtype, uint32_t output_dtype) {
-    size_t logical_bytes;
-    size_t affine_bytes;
-    size_t stats_bytes;
-    size_t packed_bytes;
-    if (!qgroupnorm_gpu_args_valid(input, weight, bias, output, batch, height,
-                                   width, channels, groups, input_scale,
-                                   input_zero_point, output_scale,
-                                   output_zero_point, epsilon, input_dtype,
-                                   output_dtype, &logical_bytes, &affine_bytes,
-                                   &stats_bytes) ||
-        !graph_packed_bytes(logical_bytes, &packed_bytes)) return 0;
-    graph_scratch_begin();
-    VkTensorSlot* input_slot = graph_ensure_packed_bytes(input, logical_bytes, 0);
-    VkTensorSlot* weight_slot = graph_ensure_device(weight, affine_bytes, 1);
-    VkTensorSlot* bias_slot = graph_ensure_device(bias, affine_bytes, 1);
-    VkTensorSlot* output_slot = graph_output_packed_bytes(output, logical_bytes);
-    if (!input_slot || !weight_slot || !bias_slot || !output_slot) return 0;
-    VulkanContextState* context = vk_context_current();
-    size_t stats_offset;
-    if (context && context->domain_enforced) {
-        if (!context->domain_qgroupnorm_stats_bytes ||
-            stats_bytes > context->domain_qgroupnorm_stats_bytes)
-            return 0;
-        stats_offset = context->domain_qgroupnorm_stats_offset;
-    } else {
-        stats_offset = graph_scratch_alloc(stats_bytes);
-        if (stats_offset == SIZE_MAX) return 0;
-    }
-    VkQGroupNormParams params = {
-        batch, height, width, channels, groups,
-        input_dtype,
-        output_dtype, 0u,
-        input_zero_point, output_zero_point, 0, 0,
-        input_scale, output_scale, epsilon, 0.0f
-    };
-    size_t params_offset = graph_scratch_upload(&params, sizeof(params));
-    if (params_offset == SIZE_MAX) return 0;
-    VkGraphBinding stats_binds[3] = {
-        {input_slot->offset, input_slot->bytes}, {stats_offset, stats_bytes},
-        {params_offset, sizeof(params)}
-    };
-    VkGraphBinding apply_binds[6] = {
-        {input_slot->offset, input_slot->bytes},
-        {weight_slot->offset, weight_slot->bytes}, {bias_slot->offset, bias_slot->bytes},
-        {stats_offset, stats_bytes}, {output_slot->offset, packed_bytes},
-        {params_offset, sizeof(params)}
-    };
-    uint32_t total_groups = batch * groups;
-    uint32_t packed_words = (uint32_t)(packed_bytes / sizeof(uint32_t));
-    uint32_t apply_groups = packed_words / 64u + (packed_words % 64u != 0u);
-    if (!vk_dispatch_kernel(&k_qgroupnorm_stats, stats_binds, total_groups, 1u, 1u) ||
-        !vk_dispatch_kernel(&k_qgroupnorm_apply, apply_binds, apply_groups, 1u, 1u)) return 0;
-    graph_mark_device(output_slot);
-    return 1;
-}
-
-/* One 64-lane workgroup produces a [mean_raw, inverse_stddev] pair for each
- * final-axis row; the apply pass then owns whole packed destination words. */
-int vk_graph_qlayernorm_i8u8(const void* input, const float* weight,
-                             const float* bias, void* output, uint32_t rows,
-                             uint32_t d_model, float input_scale,
-                             int32_t input_zero_point, float output_scale,
-                             int32_t output_zero_point, float epsilon,
-                             uint32_t input_dtype, uint32_t output_dtype) {
-    size_t logical_bytes;
-    size_t affine_bytes;
-    size_t stats_bytes;
-    size_t packed_bytes;
-    if (!qlayernorm_gpu_args_valid(input, weight, bias, output, rows, d_model,
-                                   input_scale, input_zero_point, output_scale,
-                                   output_zero_point, epsilon, input_dtype,
-                                   output_dtype, &logical_bytes, &affine_bytes,
-                                   &stats_bytes) ||
-        !graph_packed_bytes(logical_bytes, &packed_bytes)) return 0;
-    graph_scratch_begin();
-    VkTensorSlot* input_slot = graph_ensure_packed_bytes(input, logical_bytes, 0);
-    VkTensorSlot* weight_slot = graph_ensure_device(weight, affine_bytes, 1);
-    VkTensorSlot* bias_slot = graph_ensure_device(bias, affine_bytes, 1);
-    VkTensorSlot* output_slot = graph_output_packed_bytes(output, logical_bytes);
-    if (!input_slot || !weight_slot || !bias_slot || !output_slot) return 0;
-    VulkanContextState* context = vk_context_current();
-    size_t stats_offset;
-    if (context && context->domain_enforced) {
-        if (!context->domain_qlayernorm_stats_bytes ||
-            stats_bytes > context->domain_qlayernorm_stats_bytes)
-            return 0;
-        stats_offset = context->domain_qlayernorm_stats_offset;
-    } else {
-        stats_offset = graph_scratch_alloc(stats_bytes);
-        if (stats_offset == SIZE_MAX) return 0;
-    }
-    VkQLayerNormParams params = {
-        rows, d_model, input_dtype,
-        output_dtype,
-        input_zero_point, output_zero_point, 0, 0,
-        input_scale, output_scale, epsilon, 0.0f
-    };
-    size_t params_offset = graph_scratch_upload(&params, sizeof(params));
-    if (params_offset == SIZE_MAX) return 0;
-    VkGraphBinding stats_binds[3] = {
-        {input_slot->offset, input_slot->bytes}, {stats_offset, stats_bytes},
-        {params_offset, sizeof(params)}
-    };
-    VkGraphBinding apply_binds[6] = {
-        {input_slot->offset, input_slot->bytes},
-        {weight_slot->offset, weight_slot->bytes}, {bias_slot->offset, bias_slot->bytes},
-        {stats_offset, stats_bytes}, {output_slot->offset, packed_bytes},
-        {params_offset, sizeof(params)}
-    };
-    uint32_t packed_words = (uint32_t)(packed_bytes / sizeof(uint32_t));
-    uint32_t apply_groups = packed_words / 64u + (packed_words % 64u != 0u);
-    if (!vk_dispatch_kernel(&k_qlayernorm_stats, stats_binds, rows, 1u, 1u) ||
-        !vk_dispatch_kernel(&k_qlayernorm_apply, apply_binds, apply_groups, 1u, 1u)) return 0;
-    graph_mark_device(output_slot);
-    return 1;
-}
-
-/* One [query, head, batch] workgroup performs its own online softmax and
- * writes only its head's bytes.  No graph-visible F32 score/value storage is
- * allocated; absent masks bind the dedicated static I32 dummy buffer. */
-int vk_graph_qsdpa_i8u8(const void* q, const void* k, const void* v,
-                        const int32_t* mask, void* output, uint32_t batch,
-                        uint32_t seq_q, uint32_t seq_kv, uint32_t d_model,
-                        uint32_t heads, float q_scale, int32_t q_zero_point,
-                        float k_scale, int32_t k_zero_point, float v_scale,
-                        int32_t v_zero_point, float output_scale,
-                        int32_t output_zero_point, float attention_scale,
-                        uint32_t q_dtype, uint32_t k_dtype, uint32_t v_dtype,
-                        uint32_t output_dtype, uint32_t causal,
-                        uint32_t mask_mode) {
-    size_t q_bytes;
-    size_t kv_bytes;
-    size_t mask_bytes;
-    size_t packed_output_bytes;
-    if (!qsdpa_gpu_args_valid(q, k, v, mask, output, batch, seq_q, seq_kv,
-                               d_model, heads, q_scale, q_zero_point, k_scale,
-                               k_zero_point, v_scale, v_zero_point, output_scale,
-                               output_zero_point, attention_scale, q_dtype, k_dtype,
-                               v_dtype, output_dtype, causal, mask_mode, &q_bytes,
-                               &kv_bytes, &mask_bytes) ||
-        !graph_packed_bytes(q_bytes, &packed_output_bytes)) return 0;
-    graph_scratch_begin();
-    VkTensorSlot* q_slot = graph_ensure_packed_bytes(q, q_bytes, 0);
-    VkTensorSlot* k_slot = graph_ensure_packed_bytes(k, kv_bytes, 0);
-    VkTensorSlot* v_slot = graph_ensure_packed_bytes(v, kv_bytes, 0);
-    VkTensorSlot* mask_slot = mask_mode ? graph_ensure_device(mask, mask_bytes, 0) :
-        graph_ensure_device(qsdpa_dummy_mask, sizeof(qsdpa_dummy_mask), 1);
-    VkTensorSlot* output_slot = graph_output_packed_bytes(output, q_bytes);
-    if (!q_slot || !k_slot || !v_slot || !mask_slot || !output_slot) return 0;
-    VkQSDPAParams params = {
-        seq_q, seq_kv, d_model, heads,
-        batch, mask_mode, causal,
-        q_dtype |
-            (k_dtype << 8u) |
-            (v_dtype << 16u) |
-            (output_dtype << 24u),
-        q_zero_point, k_zero_point, v_zero_point, output_zero_point,
-        q_scale, k_scale, v_scale, output_scale,
-        attention_scale, 0.0f, 0.0f, 0.0f
-    };
-    size_t params_offset = graph_scratch_upload(&params, sizeof(params));
-    if (params_offset == SIZE_MAX) return 0;
-    VkGraphBinding binds[6] = {
-        {q_slot->offset, q_slot->bytes}, {k_slot->offset, k_slot->bytes},
-        {v_slot->offset, v_slot->bytes}, {mask_slot->offset, mask_slot->bytes},
-        {output_slot->offset, packed_output_bytes}, {params_offset, sizeof(params)}
-    };
-    if (!vk_dispatch_kernel(&k_qsdpa_int8, binds, seq_q, heads, batch)) return 0;
-    graph_mark_device(output_slot);
-    return 1;
-}
-
-/* qArgMaxInt8 owns one output index per [outer,inner] coordinate. Input stays
- * byte-packed, output is conventional I32 storage, and the 16-byte uniform
- * exactly mirrors the WebGPU ABI. */
-int vk_graph_qargmax_i8u8(const void* input, int32_t* output,
-                          uint32_t outer, uint32_t axis_size,
-                          uint32_t inner, uint32_t input_dtype) {
-    size_t input_bytes;
-    size_t output_bytes;
-    uint32_t output_elements;
-    if (!qargmax_gpu_args_valid(input, output, outer, axis_size, inner,
-                                input_dtype, &input_bytes, &output_bytes,
-                                &output_elements)) return 0;
-    graph_scratch_begin();
-    VkTensorSlot* input_slot = graph_ensure_packed_bytes(input, input_bytes, 0);
-    VkTensorSlot* output_slot = graph_output_slot(output, output_bytes);
-    if (!input_slot || !output_slot) return 0;
-    VkQArgMaxParams params = {
-        outer, axis_size, inner, input_dtype
-    };
-    size_t params_offset = graph_scratch_upload(&params, sizeof(params));
-    if (params_offset == SIZE_MAX) return 0;
-    VkGraphBinding binds[3] = {
-        {input_slot->offset, input_slot->bytes},
-        {output_slot->offset, output_slot->bytes},
-        {params_offset, sizeof(params)}
-    };
-    if (!vk_dispatch_kernel(&k_qargmax_int8, binds,
-                            output_elements / 64u + (output_elements % 64u != 0u),
-                            1u, 1u)) return 0;
-    graph_mark_device(output_slot);
-    return 1;
-}
-
-/* qMaskedMeanInt8 owns complete packed output words, so byte lanes never
- * race while producing [B,D] output from the [B,S,D] activation and I32
- * [B,S] keep mask.  The reduction's F32 arithmetic is shader-private. */
-int vk_graph_qmaskedmean_i8u8(const void* input, const int32_t* mask,
-                              void* output, uint32_t batch,
-                              uint32_t sequence, uint32_t width,
-                              float input_scale, int32_t input_zero_point,
-                              float output_scale, int32_t output_zero_point,
-                              uint32_t input_dtype, uint32_t output_dtype) {
-    size_t input_bytes;
-    size_t mask_bytes;
-    size_t output_bytes;
-    size_t packed_output_bytes;
-    if (!qmaskedmean_gpu_args_valid(input, mask, output, batch, sequence, width,
-                                    input_scale, input_zero_point, output_scale,
-                                    output_zero_point, input_dtype, output_dtype,
-                                    &input_bytes, &mask_bytes, &output_bytes) ||
-        !graph_packed_bytes(output_bytes, &packed_output_bytes)) return 0;
-    graph_scratch_begin();
-    VkTensorSlot* input_slot = graph_ensure_packed_bytes(input, input_bytes, 0);
-    VkTensorSlot* mask_slot = graph_ensure_device(mask, mask_bytes, 0);
-    VkTensorSlot* output_slot = graph_output_packed_bytes(output, output_bytes);
-    if (!input_slot || !mask_slot || !output_slot) return 0;
-    VkQMaskedMeanParams params = {
-        batch, sequence, width, input_dtype,
-        output_dtype, 0u, 0u, 0u,
-        input_zero_point, output_zero_point, input_scale, output_scale
-    };
-    size_t params_offset = graph_scratch_upload(&params, sizeof(params));
-    if (params_offset == SIZE_MAX) return 0;
-    VkGraphBinding binds[4] = {
-        {input_slot->offset, input_slot->bytes},
-        {mask_slot->offset, mask_slot->bytes},
-        {output_slot->offset, packed_output_bytes},
-        {params_offset, sizeof(params)}
-    };
-    uint32_t packed_words = (uint32_t)(packed_output_bytes / sizeof(uint32_t));
-    if (!vk_dispatch_kernel(&k_qmaskedmean_int8, binds,
-                            (packed_words + 63u) / 64u, 1u, 1u)) return 0;
-    graph_mark_device(output_slot);
-    return 1;
-}
-
-int vk_graph_requantize_linear_i8u8(const void* input, uint32_t input_elements,
-                                    void* output, uint32_t output_elements,
-                                    float input_scale, int32_t input_zero_point,
-                                    float output_scale, int32_t output_zero_point,
-                                    uint32_t input_dtype, uint32_t output_dtype) {
-    float multiplier;
-    size_t logical_bytes;
-    if (!requantize_gpu_args_valid(input, input_elements, output, output_elements,
-                                   input_scale, input_zero_point,
-                                   output_scale, output_zero_point,
-                                   input_dtype, output_dtype,
-                                   &multiplier, &logical_bytes)) return 0;
-    size_t packed_bytes;
-    if (!graph_packed_bytes(logical_bytes, &packed_bytes)) return 0;
-    graph_scratch_begin();
-    VkTensorSlot* input_slot = graph_ensure_packed_bytes(input, logical_bytes, 0);
-    VkTensorSlot* output_slot = graph_output_packed_bytes(output, logical_bytes);
-    if (!input_slot || !output_slot) return 0;
-    VkRequantizeLinearParams params = {
-        input_elements, input_dtype,
-        output_dtype, 0u,
-        input_zero_point, output_zero_point, 0, 0,
-        multiplier, 0.0f, 0.0f, 0.0f
-    };
-    size_t params_offset = graph_scratch_upload(&params, sizeof(params));
-    if (params_offset == SIZE_MAX) return 0;
-    VkGraphBinding binds[3] = {
-        {input_slot->offset, input_slot->bytes},
-        {output_slot->offset, packed_bytes}, {params_offset, sizeof(params)}
-    };
-    uint32_t packed_words = (uint32_t)(packed_bytes / sizeof(uint32_t));
-    if (!vk_dispatch_kernel(&k_requantize_linear_i8u8, binds,
-                            (packed_words + 63u) / 64u, 1u, 1u)) return 0;
-    graph_mark_device(output_slot);
-    return 1;
-}
-
-typedef struct {
-    uint32_t batch;
-    uint32_t input_height;
-    uint32_t input_width;
-    uint32_t input_channels;
-    uint32_t output_height;
-    uint32_t output_width;
-    uint32_t output_channels;
-    uint32_t kernel_height;
-    uint32_t kernel_width;
-    uint32_t stride_y;
-    uint32_t stride_x;
-    uint32_t dilation_y;
-    uint32_t dilation_x;
-    uint32_t pad_top;
-    uint32_t pad_left;
-    uint32_t groups;
-    uint32_t input_type;
-    uint32_t weight_type;
-    uint32_t output_type;
-    uint32_t relu;
-    int32_t input_zero_point;
-    int32_t output_zero_point;
-    int32_t pad0;
-    int32_t pad1;
-    float input_scale;
-    float output_scale;
-    float pad2;
-    float pad3;
-} VkQConv2DParams;
-
-_Static_assert(sizeof(VkQConv2DParams) == 112, "qConv2DInt8 uniform ABI");
-
-static const int32_t* qconv_zero_bias_get(uint32_t output_channels) {
-    if (output_channels == 0 ||
-        (size_t)output_channels > SIZE_MAX / sizeof(int32_t)) return NULL;
-    for (QConvZeroBiasBacking* block = qconv_zero_bias_backings; block;
-         block = block->next) {
-        /* A graph weight slot records the exact readable byte range retained
-         * at domain bind. Distinct channel widths therefore need distinct
-         * durable keys; reusing a larger block for a later smaller node would
-         * shrink that slot and make the earlier node invalid after bind. */
-        if (block->elements == output_channels) return block->values;
-    }
-    QConvZeroBiasBacking* block = (QConvZeroBiasBacking*)calloc(1, sizeof(*block));
-    if (!block) return NULL;
-    block->values = (int32_t*)calloc((size_t)output_channels, sizeof(*block->values));
-    if (!block->values) {
-        free(block);
-        return NULL;
-    }
-    block->elements = output_channels;
-    block->next = qconv_zero_bias_backings;
-    qconv_zero_bias_backings = block;
-    return block->values;
-}
-
-static int qconv_mul_u64(uint64_t left, uint64_t right, uint64_t* out) {
-    if (!out || (left != 0 && right > UINT64_MAX / left)) return 0;
-    *out = left * right;
-    return 1;
-}
-
-static int32_t qconv_i32_at(const int32_t* values, uint32_t index) {
-    int32_t value;
-    memcpy(&value, (const unsigned char*)values + (size_t)index * sizeof(value),
-           sizeof(value));
-    return value;
-}
-
-static float qconv_f32_at(const float* values, uint32_t index) {
-    float value;
-    memcpy(&value, (const unsigned char*)values + (size_t)index * sizeof(value),
-           sizeof(value));
-    return value;
-}
-
-static int qconv_gpu_args_valid(const void* input, const void* weight,
-                                const float* weight_scales,
-                                const int32_t* weight_zero_points,
-                                const int32_t* bias, void* output,
-                                uint32_t batch, uint32_t input_height,
-                                uint32_t input_width, uint32_t input_channels,
-                                uint32_t output_height, uint32_t output_width,
-                                uint32_t output_channels, uint32_t kernel_height,
-                                uint32_t kernel_width, uint32_t input_per_group,
-                                uint32_t stride_y, uint32_t stride_x,
-                                uint32_t dilation_y, uint32_t dilation_x,
-                                uint32_t padding_top, uint32_t padding_left,
-                                uint32_t padding_bottom, uint32_t padding_right,
-                                uint32_t groups, uint32_t relu,
-                                float input_scale, int32_t input_zero_point,
-                                float output_scale, int32_t output_zero_point,
-                                uint32_t input_dtype, uint32_t weight_dtype,
-                                uint32_t output_dtype,
-                                size_t* input_bytes, size_t* weight_bytes,
-                                size_t* output_bytes, size_t* metadata_bytes) {
-    uint64_t input_elements = 1, weight_elements = 1, output_elements = 1;
-    uint64_t terms = 1, padded_height, padded_width;
-    uint64_t effective_height, effective_width;
-    uint64_t expected_height, expected_width;
-    uint64_t input_magnitude;
-    if (!input || !weight || !weight_scales || !weight_zero_points || !output ||
-        output == input || output == weight || !batch || !input_height ||
-        !input_width || !input_channels || !output_height || !output_width ||
-        !output_channels || !kernel_height || !kernel_width || !input_per_group ||
-        !stride_y || !stride_x || !dilation_y || !dilation_x || !groups || relu > 2u ||
-        !isfinite(input_scale) || input_scale <= 0.0f ||
-        !isfinite(output_scale) || output_scale <= 0.0f ||
-        !qbyte_dtype_zero_point_valid(input_dtype, input_zero_point) ||
-        !qbyte_dtype_zero_point_valid(output_dtype, output_zero_point) ||
-        (weight_dtype != VX_DTYPE_I8 && weight_dtype != VX_DTYPE_U8) ||
-        input_channels % groups || output_channels % groups ||
-        (uint64_t)input_per_group * groups != input_channels) return 0;
-    if (!qconv_mul_u64(input_elements, batch, &input_elements) ||
-        !qconv_mul_u64(input_elements, input_height, &input_elements) ||
-        !qconv_mul_u64(input_elements, input_width, &input_elements) ||
-        !qconv_mul_u64(input_elements, input_channels, &input_elements) ||
-        !qconv_mul_u64(weight_elements, output_channels, &weight_elements) ||
-        !qconv_mul_u64(weight_elements, kernel_height, &weight_elements) ||
-        !qconv_mul_u64(weight_elements, kernel_width, &weight_elements) ||
-        !qconv_mul_u64(weight_elements, input_per_group, &weight_elements) ||
-        !qconv_mul_u64(output_elements, batch, &output_elements) ||
-        !qconv_mul_u64(output_elements, output_height, &output_elements) ||
-        !qconv_mul_u64(output_elements, output_width, &output_elements) ||
-        !qconv_mul_u64(output_elements, output_channels, &output_elements) ||
-        !qconv_mul_u64(terms, kernel_height, &terms) ||
-        !qconv_mul_u64(terms, kernel_width, &terms) ||
-        !qconv_mul_u64(terms, input_per_group, &terms) ||
-        input_elements > UINT32_MAX || weight_elements > UINT32_MAX ||
-        output_elements > UINT32_MAX || input_elements > SIZE_MAX ||
-        weight_elements > SIZE_MAX || output_elements > SIZE_MAX ||
-        (size_t)output_channels > SIZE_MAX / sizeof(float) ||
-        (size_t)output_channels > SIZE_MAX / sizeof(int32_t)) return 0;
-    if ((uint64_t)(kernel_height - 1u) > (UINT64_MAX - 1u) / dilation_y ||
-        (uint64_t)(kernel_width - 1u) > (UINT64_MAX - 1u) / dilation_x) return 0;
-    padded_height = (uint64_t)input_height + padding_top + padding_bottom;
-    padded_width = (uint64_t)input_width + padding_left + padding_right;
-    effective_height = (uint64_t)(kernel_height - 1u) * dilation_y + 1u;
-    effective_width = (uint64_t)(kernel_width - 1u) * dilation_x + 1u;
-    if (padded_height < effective_height || padded_width < effective_width) return 0;
-    expected_height = (padded_height - effective_height) / stride_y + 1u;
-    expected_width = (padded_width - effective_width) / stride_x + 1u;
-    if (expected_height != output_height || expected_width != output_width) return 0;
-    {
-        int64_t low = (int64_t)(input_dtype == VX_DTYPE_I8 ? -128 : 0) -
-            input_zero_point;
-        int64_t high = (int64_t)(input_dtype == VX_DTYPE_I8 ? 127 : 255) -
-            input_zero_point;
-        uint64_t low_magnitude = (uint64_t)(low < 0 ? -low : low);
-        uint64_t high_magnitude = (uint64_t)(high < 0 ? -high : high);
-        input_magnitude = low_magnitude > high_magnitude ? low_magnitude : high_magnitude;
-    }
-    for (uint32_t output_channel = 0; output_channel < output_channels;
-         output_channel++) {
-        const float weight_scale = qconv_f32_at(weight_scales, output_channel);
-        const int32_t weight_zero_point = qconv_i32_at(weight_zero_points, output_channel);
-        int64_t low, high;
-        uint64_t weight_magnitude, accumulator_bound, bias_magnitude = 0;
-        if (!isfinite(weight_scale) || weight_scale <= 0.0f ||
-            !qbyte_dtype_zero_point_valid(weight_dtype, weight_zero_point)) return 0;
-        low = (int64_t)(weight_dtype == VX_DTYPE_I8 ? -128 : 0) -
-            weight_zero_point;
-        high = (int64_t)(weight_dtype == VX_DTYPE_I8 ? 127 : 255) -
-            weight_zero_point;
-        weight_magnitude = (uint64_t)(low < 0 ? -low : low);
-        {
-            uint64_t high_magnitude = (uint64_t)(high < 0 ? -high : high);
-            if (high_magnitude > weight_magnitude) weight_magnitude = high_magnitude;
-        }
-        if (input_magnitude && weight_magnitude &&
-            terms > (uint64_t)INT32_MAX / input_magnitude / weight_magnitude) return 0;
-        accumulator_bound = input_magnitude * weight_magnitude * terms;
-        if (bias) {
-            int64_t bias_value = qconv_i32_at(bias, output_channel);
-            bias_magnitude = (uint64_t)(bias_value < 0 ? -bias_value : bias_value);
-        }
-        if (accumulator_bound > (uint64_t)INT32_MAX ||
-            bias_magnitude > (uint64_t)INT32_MAX - accumulator_bound) return 0;
-    }
-    *input_bytes = (size_t)input_elements;
-    *weight_bytes = (size_t)weight_elements;
-    *output_bytes = (size_t)output_elements;
-    *metadata_bytes = (size_t)output_channels * sizeof(int32_t);
-    return 1;
-}
-
-int vk_graph_qconv2d_i8u8(const void* input, const void* weight,
-                           const float* weight_scales,
-                           const int32_t* weight_zero_points,
-                           const int32_t* bias, void* output,
-                           uint32_t batch, uint32_t input_height,
-                           uint32_t input_width, uint32_t input_channels,
-                           uint32_t output_height, uint32_t output_width,
-                           uint32_t output_channels, uint32_t kernel_height,
-                           uint32_t kernel_width, uint32_t input_per_group,
-                           uint32_t stride_y, uint32_t stride_x,
-                           uint32_t dilation_y, uint32_t dilation_x,
-                           uint32_t padding_top, uint32_t padding_left,
-                           uint32_t padding_bottom, uint32_t padding_right,
-                           uint32_t groups, uint32_t relu,
-                           float input_scale, int32_t input_zero_point,
-                           float output_scale, int32_t output_zero_point,
-                           uint32_t input_dtype, uint32_t weight_dtype,
-                           uint32_t output_dtype) {
-    size_t input_bytes, weight_bytes, output_bytes, metadata_bytes;
-    if (!qconv_gpu_args_valid(input, weight, weight_scales, weight_zero_points,
-                              bias, output, batch, input_height, input_width,
-                              input_channels, output_height, output_width,
-                              output_channels, kernel_height, kernel_width,
-                              input_per_group, stride_y, stride_x, dilation_y,
-                              dilation_x, padding_top, padding_left,
-                              padding_bottom, padding_right, groups, relu,
-                              input_scale, input_zero_point, output_scale,
-                              output_zero_point, input_dtype, weight_dtype,
-                              output_dtype, &input_bytes, &weight_bytes,
-                              &output_bytes, &metadata_bytes)) return 0;
-    const int32_t* bound_bias = bias ? bias : qconv_zero_bias_get(output_channels);
-    if (!bound_bias) return 0;
-    size_t packed_output_bytes;
-    if (!graph_packed_bytes(output_bytes, &packed_output_bytes)) return 0;
-    graph_scratch_begin();
-    VkTensorSlot* input_slot = graph_ensure_packed_bytes(input, input_bytes, 0);
-    VkTensorSlot* weight_slot = graph_ensure_packed_bytes(weight, weight_bytes, 1);
-    VkTensorSlot* scales_slot = graph_ensure_device(weight_scales,
-                                                     (size_t)output_channels * sizeof(float), 1);
-    VkTensorSlot* zero_points_slot = graph_ensure_device(weight_zero_points, metadata_bytes, 1);
-    VkTensorSlot* bias_slot = graph_ensure_device(bound_bias, metadata_bytes, 1);
-    VkTensorSlot* output_slot = graph_output_packed_bytes(output, output_bytes);
-    if (!input_slot || !weight_slot || !scales_slot || !zero_points_slot ||
-        !bias_slot || !output_slot) return 0;
-    VkQConv2DParams params = {
-        batch, input_height, input_width, input_channels,
-        output_height, output_width, output_channels, kernel_height,
-        kernel_width, stride_y, stride_x, dilation_y,
-        dilation_x, padding_top, padding_left, groups,
-        input_dtype,
-        weight_dtype,
-        output_dtype, relu,
-        input_zero_point, output_zero_point, 0, 0,
-        input_scale, output_scale, 0.0f, 0.0f
-    };
-    size_t params_offset = graph_scratch_upload(&params, sizeof(params));
-    if (params_offset == SIZE_MAX) return 0;
-    VkGraphBinding binds[7] = {
-        {input_slot->offset, input_slot->bytes}, {weight_slot->offset, weight_slot->bytes},
-        {scales_slot->offset, scales_slot->bytes}, {zero_points_slot->offset, zero_points_slot->bytes},
-        {bias_slot->offset, bias_slot->bytes}, {output_slot->offset, packed_output_bytes},
-        {params_offset, sizeof(params)}
-    };
-    uint32_t packed_words = (uint32_t)(packed_output_bytes / sizeof(uint32_t));
-    const uint64_t reduction_size =
-        (uint64_t)kernel_height * kernel_width * input_per_group;
-    const int dot_tiled = groups == 1u &&
-        (output_channels & 3u) == 0u &&
-        vk_workgroup_shape_supported(8u, 4u, 1u);
-    const int tiled = groups == 1u && output_channels >= 32u &&
-        reduction_size >= 16u && (output_channels & 3u) == 0u &&
-        vk_workgroup_shape_supported(8u, 4u, 1u);
-    int dispatched = 0;
-    if (vk_packed_dot_enabled() && dot_tiled) {
-        const uint32_t spatial = batch * output_height * output_width;
-        const uint32_t output_words_per_spatial = output_channels / 4u;
-        const uint32_t groups_x = (output_words_per_spatial + 7u) / 8u;
-        const uint32_t groups_y = (spatial + 3u) / 4u;
-        dispatched = vk_dispatch_kernel(&k_qconv2d_int8_dot_tiled, binds,
-                                        groups_x, groups_y, 1u);
-        if (!dispatched) {
-            vk_disable_packed_dot_after_failure(k_qconv2d_int8_dot_tiled.name);
-        }
-        else {
-            vk_context_current()->qconv_dot_tiled_dispatches++;
-        }
-    }
-    if (!dispatched && tiled) {
-        const uint32_t spatial = batch * output_height * output_width;
-        const uint32_t output_words_per_spatial = output_channels / 4u;
-        dispatched = vk_dispatch_kernel(
-            &k_qconv2d_int8_tiled, binds,
-            (output_words_per_spatial + 7u) / 8u,
-            (spatial + 3u) / 4u, 1u);
-        if (dispatched)
-            vk_context_current()->qconv_tiled_dispatches++;
-    }
-    if (!dispatched && !vk_dispatch_kernel(&k_qconv2d_int8, binds,
-                                            (packed_words + 63u) / 64u,
-                                            1u, 1u)) return 0;
-    if (!dispatched)
-        vk_context_current()->qconv_scalar_dispatches++;
-    graph_mark_device(output_slot);
-    return 1;
-}
-
-typedef struct { uint32_t elements, pad0, pad1, pad2; } VkTypedCopyParams;
-typedef struct {
-    uint32_t size, axis_offset, input_axis, output_axis;
-    uint32_t inner, pad0, pad1, pad2;
-} VkTypedConcatParams;
-typedef struct {
-    uint32_t n, h, w, c, out_h, out_w, ky, kx;
-    uint32_t sy, sx, py, px, dtype, pad0, pad1, pad2;
-} VkTypedMaxPoolParams;
-typedef struct { uint32_t n, h, w, c, out_h, out_w, pad0, pad1; } VkTypedResizeParams;
-typedef struct { uint32_t elements, output_type, zero_point_type, has_zero_point; } VkTypedQuantizeParams;
-typedef struct {
-    uint32_t size, input_type, scale_type, zero_point_type;
-    uint32_t output_type, has_zero_point, pad0, pad1;
-} VkTypedDequantizeParams;
-
-_Static_assert(sizeof(VkTypedCopyParams) == 16, "copyTyped uniform ABI");
-_Static_assert(sizeof(VkTypedConcatParams) == 32, "concatCopyTyped uniform ABI");
-_Static_assert(sizeof(VkTypedMaxPoolParams) == 64, "maxPool2DTyped uniform ABI");
-_Static_assert(sizeof(VkTypedResizeParams) == 32, "resizeNearestTyped uniform ABI");
-_Static_assert(sizeof(VkTypedQuantizeParams) == 16, "quantizeLinearTyped uniform ABI");
-_Static_assert(sizeof(VkTypedDequantizeParams) == 32, "dequantizeLinearTyped uniform ABI");
-
-static int typed_shape_qdesc_valid(float scale, int32_t zero_point, uint32_t dtype) {
-    return isfinite(scale) && scale > 0.0f &&
-        qbyte_dtype_zero_point_valid(dtype, zero_point);
-}
-
-static int typed_shape_qdesc_same(float input_scale, int32_t input_zero_point,
-                                  uint32_t input_dtype, float output_scale,
-                                  int32_t output_zero_point, uint32_t output_dtype) {
-    return typed_shape_qdesc_valid(input_scale, input_zero_point, input_dtype) &&
-        typed_shape_qdesc_valid(output_scale, output_zero_point, output_dtype) &&
-        input_dtype == output_dtype && input_zero_point == output_zero_point &&
-        input_scale == output_scale;
-}
-
-static int typed_shape_nhwc_elements(uint32_t n, uint32_t h, uint32_t w,
-                                     uint32_t c, uint32_t* elements) {
-    uint64_t value = n;
-    if (!n || !h || !w || !c || !elements ||
-        !qconv_mul_u64(value, h, &value) || !qconv_mul_u64(value, w, &value) ||
-        !qconv_mul_u64(value, c, &value) || value > UINT32_MAX) return 0;
-    *elements = (uint32_t)value;
-    return 1;
-}
-
-static uint32_t typed_shape_groups(uint32_t elements) {
-    return elements / 64u + (elements % 64u != 0u);
-}
-
-static uint32_t typed_shape_packed_groups(size_t packed_bytes) {
-    uint32_t words = (uint32_t)(packed_bytes / sizeof(uint32_t));
-    return typed_shape_groups(words);
-}
-
-static uint32_t typed_shape_zero_word(int32_t zero_point, uint32_t dtype) {
-    return dtype == VX_DTYPE_I8 ? (uint32_t)(uint8_t)(int8_t)zero_point :
-        (uint32_t)(uint8_t)zero_point;
-}
-
-int vk_graph_quantize_typed_f32_i8u8(const float* input, uint32_t elements,
-                                     void* output, float output_scale,
-                                     int32_t output_zero_point, uint32_t output_dtype) {
-    if (!input || !output || input == output || elements == 0 ||
-        !typed_shape_qdesc_valid(output_scale, output_zero_point, output_dtype) ||
-        (uint64_t)elements > SIZE_MAX / sizeof(float)) return 0;
-    size_t output_bytes = (size_t)elements;
-    size_t packed_output_bytes;
-    if (!graph_packed_bytes(output_bytes, &packed_output_bytes)) return 0;
-    graph_scratch_begin();
-    VkTensorSlot* input_slot = graph_ensure_device(input, (size_t)elements * sizeof(float), 0);
-    VkTensorSlot* output_slot = graph_output_packed_bytes(output, output_bytes);
-    if (!input_slot || !output_slot) return 0;
-    uint32_t zero_word = typed_shape_zero_word(output_zero_point, output_dtype);
-    VkTypedQuantizeParams params = {
-        elements, output_dtype, output_dtype, 1u
-    };
-    size_t scale_offset = graph_scratch_upload(&output_scale, sizeof(output_scale));
-    size_t zero_offset = graph_scratch_upload(&zero_word, sizeof(zero_word));
-    size_t params_offset = graph_scratch_upload(&params, sizeof(params));
-    if (scale_offset == SIZE_MAX || zero_offset == SIZE_MAX || params_offset == SIZE_MAX) return 0;
-    VkGraphBinding binds[5] = {
-        {input_slot->offset, input_slot->bytes}, {scale_offset, sizeof(output_scale)},
-        {zero_offset, sizeof(zero_word)}, {output_slot->offset, packed_output_bytes},
-        {params_offset, sizeof(params)}
-    };
-    if (!vk_dispatch_kernel(&k_quantize_typed_i8u8, binds,
-                            typed_shape_packed_groups(packed_output_bytes), 1u, 1u)) return 0;
-    graph_mark_device(output_slot);
-    return 1;
-}
-
-int vk_graph_dequantize_typed_i8u8_f32(const void* input, uint32_t elements,
-                                       float input_scale, int32_t input_zero_point,
-                                       uint32_t input_dtype, float* output) {
-    if (!input || !output || input == output || elements == 0 ||
-        !typed_shape_qdesc_valid(input_scale, input_zero_point, input_dtype) ||
-        (uint64_t)elements > SIZE_MAX / sizeof(float)) return 0;
-    size_t input_bytes = (size_t)elements;
-    size_t packed_input_bytes;
-    if (!graph_packed_bytes(input_bytes, &packed_input_bytes)) return 0;
-    graph_scratch_begin();
-    VkTensorSlot* input_slot = graph_ensure_packed_bytes(input, input_bytes, 0);
-    VkTensorSlot* output_slot = graph_output_slot(output, (size_t)elements * sizeof(float));
-    if (!input_slot || !output_slot) return 0;
-    uint32_t zero_word = typed_shape_zero_word(input_zero_point, input_dtype);
-    VkTypedDequantizeParams params = {
-        elements, input_dtype, VX_DTYPE_F32, input_dtype,
-        VX_DTYPE_F32, 1u, 0u, 0u
-    };
-    size_t scale_offset = graph_scratch_upload(&input_scale, sizeof(input_scale));
-    size_t zero_offset = graph_scratch_upload(&zero_word, sizeof(zero_word));
-    size_t params_offset = graph_scratch_upload(&params, sizeof(params));
-    if (scale_offset == SIZE_MAX || zero_offset == SIZE_MAX || params_offset == SIZE_MAX) return 0;
-    VkGraphBinding binds[5] = {
-        {input_slot->offset, packed_input_bytes}, {scale_offset, sizeof(input_scale)},
-        {zero_offset, sizeof(zero_word)}, {output_slot->offset, output_slot->bytes},
-        {params_offset, sizeof(params)}
-    };
-    if (!vk_dispatch_kernel(&k_dequantize_typed_i8u8, binds,
-                            typed_shape_groups(elements), 1u, 1u)) return 0;
-    graph_mark_device(output_slot);
-    return 1;
-}
-
-int vk_graph_copy_i8u8(const void* input, uint32_t input_elements,
-                       void* output, uint32_t output_elements,
-                       float input_scale, int32_t input_zero_point,
-                       float output_scale, int32_t output_zero_point,
-                       uint32_t input_dtype, uint32_t output_dtype) {
-    if (!input || !output || input == output || input_elements == 0 ||
-        input_elements != output_elements || !typed_shape_qdesc_same(input_scale,
-        input_zero_point, input_dtype, output_scale, output_zero_point, output_dtype)) return 0;
-    size_t packed_bytes;
-    if (!graph_packed_bytes((size_t)input_elements, &packed_bytes)) return 0;
-    graph_scratch_begin();
-    VkTensorSlot* input_slot = graph_ensure_packed_bytes(input, input_elements, 0);
-    VkTensorSlot* output_slot = graph_output_packed_bytes(output, output_elements);
-    if (!input_slot || !output_slot) return 0;
-    VkTypedCopyParams params = {input_elements, 0u, 0u, 0u};
-    size_t params_offset = graph_scratch_upload(&params, sizeof(params));
-    if (params_offset == SIZE_MAX) return 0;
-    VkGraphBinding binds[3] = {
-        {input_slot->offset, input_slot->bytes}, {output_slot->offset, packed_bytes},
-        {params_offset, sizeof(params)}
-    };
-    if (!vk_dispatch_kernel(&k_copy_typed_i8u8, binds,
-                            typed_shape_packed_groups(packed_bytes), 1u, 1u)) return 0;
-    graph_mark_device(output_slot);
-    return 1;
-}
-
-int vk_graph_transpose_i8u8(const void* input, void* output,
-                            const uint32_t* input_shape,
-                            const uint32_t* permutation, uint32_t rank,
-                            uint32_t elements, float input_scale,
-                            int32_t input_zero_point, float output_scale,
-                            int32_t output_zero_point, uint32_t input_dtype,
-                            uint32_t output_dtype) {
-    uint32_t input_strides[8] = {0};
-    uint32_t output_shape[8] = {0};
-    uint32_t output_strides[8] = {0};
-    uint32_t metadata[18] = {0};
-    uint32_t seen = 0;
-    uint64_t product = 1;
-    uint64_t stride = 1;
-    size_t packed_bytes;
-    if (!input || !output || !input_shape || !permutation ||
-        rank == 0 || rank > 8 || elements == 0 ||
-        !typed_shape_qdesc_same(input_scale, input_zero_point, input_dtype,
-                                output_scale, output_zero_point, output_dtype) ||
-        qsdpa_ranges_overlap(output, elements, input, elements)) return 0;
-    for (uint32_t reverse = rank; reverse-- > 0;) {
-        if (!input_shape[reverse] || stride > UINT32_MAX) return 0;
-        input_strides[reverse] = (uint32_t)stride;
-        stride *= input_shape[reverse];
-        if (stride > UINT32_MAX) return 0;
-    }
-    if (stride != elements) return 0;
-    for (uint32_t dimension = 0; dimension < rank; dimension++) {
-        uint32_t source = permutation[dimension];
-        if (source >= rank || (seen & (1u << source))) return 0;
-        seen |= 1u << source;
-        output_shape[dimension] = input_shape[source];
-        if (product > UINT32_MAX / output_shape[dimension]) return 0;
-        product *= output_shape[dimension];
-    }
-    if (product != elements) return 0;
-    stride = 1;
-    for (uint32_t reverse = rank; reverse-- > 0;) {
-        output_strides[reverse] = (uint32_t)stride;
-        stride *= output_shape[reverse];
-    }
-    if (!graph_packed_bytes(elements, &packed_bytes)) return 0;
-    graph_scratch_begin();
-    VkTensorSlot* input_slot =
-        graph_ensure_packed_bytes(input, elements, 0);
-    VkTensorSlot* output_slot =
-        graph_output_packed_bytes(output, elements);
-    if (!input_slot || !output_slot) return 0;
-    metadata[0] = elements;
-    metadata[1] = rank;
-    for (uint32_t dimension = 0; dimension < rank; dimension++) {
-        metadata[2 + dimension] = output_strides[dimension];
-        metadata[2 + rank + dimension] =
-            input_strides[permutation[dimension]];
-    }
-    size_t metadata_bytes = (size_t)(2 + 2 * rank) * sizeof(uint32_t);
-    size_t metadata_offset =
-        graph_scratch_upload(metadata, metadata_bytes);
-    if (metadata_offset == SIZE_MAX) return 0;
-    VkGraphBinding binds[3] = {
-        {input_slot->offset, packed_bytes},
-        {output_slot->offset, packed_bytes},
-        {metadata_offset, metadata_bytes},
-    };
-    if (!vk_dispatch_kernel(&k_transpose_typed_i8u8, binds,
-                            typed_shape_packed_groups(packed_bytes),
-                            1u, 1u)) return 0;
-    graph_mark_device(output_slot);
-    return 1;
-}
-
-int vk_graph_concat_i8u8(const void* const* inputs, const uint32_t* input_elements,
-                         const uint32_t* input_axes, const float* input_scales,
-                         const int32_t* input_zero_points, const uint32_t* input_dtypes,
-                         uint32_t input_count, void* output, uint32_t output_elements,
-                         uint32_t output_axis, uint32_t inner,
-                         float output_scale, int32_t output_zero_point,
-                         uint32_t output_dtype) {
-    if (!inputs || !input_elements || !input_axes || !input_scales ||
-        !input_zero_points || !input_dtypes || !output || !input_count ||
-        !output_elements || !output_axis || !inner ||
-        !typed_shape_qdesc_valid(output_scale, output_zero_point, output_dtype)) return 0;
-    uint64_t output_width = (uint64_t)output_axis * inner;
-    if (!output_width || output_width > output_elements || output_elements % output_width) return 0;
-    uint64_t outer = output_elements / output_width;
-    uint64_t axis_sum = 0;
-    for (uint32_t index = 0; index < input_count; index++) {
-        uint64_t expected = 0;
-        if (!qconv_mul_u64(outer, input_axes[index], &expected) ||
-            !qconv_mul_u64(expected, inner, &expected)) {
-            return 0;
-        }
-        if (!inputs[index] || inputs[index] == output || !input_axes[index] ||
-            expected != input_elements[index] ||
-            !typed_shape_qdesc_same(input_scales[index], input_zero_points[index],
-                                    input_dtypes[index], output_scale,
-                                    output_zero_point, output_dtype) ||
-            axis_sum > UINT32_MAX - input_axes[index]) return 0;
-        axis_sum += input_axes[index];
-    }
-    if (axis_sum != output_axis) return 0;
-    size_t packed_output_bytes;
-    if (!graph_packed_bytes(output_elements, &packed_output_bytes)) return 0;
-    graph_scratch_begin();
-    VkTensorSlot* output_slot = graph_output_packed_bytes(output, output_elements);
-    if (!output_slot) return 0;
-    memset((char*)io_mapped + output_slot->offset, 0, packed_output_bytes);
-    output_slot->host_dirty = 0;
-    output_slot->device_dirty = 0;
-    uint32_t axis_offset = 0;
-    for (uint32_t index = 0; index < input_count; index++) {
-        size_t packed_input_bytes;
-        if (!graph_packed_bytes(input_elements[index], &packed_input_bytes)) return 0;
-        VkTensorSlot* input_slot = graph_ensure_packed_bytes(inputs[index], input_elements[index], 0);
-        if (!input_slot) return 0;
-        VkTypedConcatParams params = {
-            input_elements[index], axis_offset, input_axes[index], output_axis,
-            inner, 0u, 0u, 0u
-        };
-        size_t params_offset = graph_scratch_upload(&params, sizeof(params));
-        if (params_offset == SIZE_MAX) return 0;
-        VkGraphBinding binds[3] = {
-            {input_slot->offset, packed_input_bytes}, {output_slot->offset, packed_output_bytes},
-            {params_offset, sizeof(params)}
-        };
-        if (!vk_dispatch_kernel(&k_concat_typed_i8u8, binds,
-                                typed_shape_groups(input_elements[index]), 1u, 1u)) return 0;
-        axis_offset += input_axes[index];
-    }
-    graph_mark_device(output_slot);
-    return 1;
-}
-
-int vk_graph_maxpool2d_i8u8(const void* input, void* output,
-                            uint32_t batch, uint32_t input_height,
-                            uint32_t input_width, uint32_t channels,
-                            uint32_t output_height, uint32_t output_width,
-                            uint32_t kernel_y, uint32_t kernel_x,
-                            uint32_t stride_y, uint32_t stride_x,
-                            uint32_t padding_top, uint32_t padding_left,
-                            uint32_t padding_bottom, uint32_t padding_right,
-                            float input_scale, int32_t input_zero_point,
-                            float output_scale, int32_t output_zero_point,
-                            uint32_t input_dtype, uint32_t output_dtype) {
-    uint32_t input_elements, output_elements;
-    uint64_t padded_height, padded_width, expected_height, expected_width;
-    if (!input || !output || input == output || !kernel_y || !kernel_x ||
-        !stride_y || !stride_x || !typed_shape_qdesc_same(input_scale,
-        input_zero_point, input_dtype, output_scale, output_zero_point, output_dtype) ||
-        !typed_shape_nhwc_elements(batch, input_height, input_width, channels, &input_elements) ||
-        !typed_shape_nhwc_elements(batch, output_height, output_width, channels, &output_elements)) return 0;
-    padded_height = (uint64_t)input_height + padding_top + padding_bottom;
-    padded_width = (uint64_t)input_width + padding_left + padding_right;
-    if (padded_height < kernel_y || padded_width < kernel_x) return 0;
-    expected_height = (padded_height - kernel_y) / stride_y + 1u;
-    expected_width = (padded_width - kernel_x) / stride_x + 1u;
-    if (expected_height != output_height || expected_width != output_width) return 0;
-    size_t packed_output_bytes;
-    if (!graph_packed_bytes(output_elements, &packed_output_bytes)) return 0;
-    graph_scratch_begin();
-    VkTensorSlot* input_slot = graph_ensure_packed_bytes(input, input_elements, 0);
-    VkTensorSlot* output_slot = graph_output_packed_bytes(output, output_elements);
-    if (!input_slot || !output_slot) return 0;
-    VkTypedMaxPoolParams params = {
-        batch, input_height, input_width, channels, output_height, output_width,
-        kernel_y, kernel_x, stride_y, stride_x, padding_top, padding_left,
-        input_dtype, 0u, 0u, 0u
-    };
-    size_t params_offset = graph_scratch_upload(&params, sizeof(params));
-    if (params_offset == SIZE_MAX) return 0;
-    VkGraphBinding binds[3] = {
-        {input_slot->offset, input_slot->bytes}, {output_slot->offset, packed_output_bytes},
-        {params_offset, sizeof(params)}
-    };
-    if (!vk_dispatch_kernel(&k_maxpool_typed_i8u8, binds,
-                            typed_shape_packed_groups(packed_output_bytes), 1u, 1u)) return 0;
-    graph_mark_device(output_slot);
-    return 1;
-}
-
-int vk_graph_resize_nearest_i8u8(const void* input, void* output,
-                                 uint32_t batch, uint32_t input_height,
-                                 uint32_t input_width, uint32_t channels,
-                                 uint32_t output_height, uint32_t output_width,
-                                 float input_scale, int32_t input_zero_point,
-                                 float output_scale, int32_t output_zero_point,
-                                 uint32_t input_dtype, uint32_t output_dtype) {
-    uint32_t input_elements, output_elements;
-    if (!input || !output || input == output ||
-        !typed_shape_qdesc_same(input_scale, input_zero_point, input_dtype,
-                                output_scale, output_zero_point, output_dtype) ||
-        !typed_shape_nhwc_elements(batch, input_height, input_width, channels, &input_elements) ||
-        !typed_shape_nhwc_elements(batch, output_height, output_width, channels, &output_elements)) return 0;
-    size_t packed_output_bytes;
-    if (!graph_packed_bytes(output_elements, &packed_output_bytes)) return 0;
-    graph_scratch_begin();
-    VkTensorSlot* input_slot = graph_ensure_packed_bytes(input, input_elements, 0);
-    VkTensorSlot* output_slot = graph_output_packed_bytes(output, output_elements);
-    if (!input_slot || !output_slot) return 0;
-    VkTypedResizeParams params = {
-        batch, input_height, input_width, channels, output_height, output_width, 0u, 0u
-    };
-    size_t params_offset = graph_scratch_upload(&params, sizeof(params));
-    if (params_offset == SIZE_MAX) return 0;
-    VkGraphBinding binds[3] = {
-        {input_slot->offset, input_slot->bytes}, {output_slot->offset, packed_output_bytes},
-        {params_offset, sizeof(params)}
-    };
-    if (!vk_dispatch_kernel(&k_resize_nearest_typed_i8u8, binds,
-                            typed_shape_packed_groups(packed_output_bytes), 1u, 1u)) return 0;
-    graph_mark_device(output_slot);
-    return 1;
-}
-
-int vk_graph_quantize_linear_i8(const float* in, signed char* out, long n,
-                                float input_scale, int input_zp,
-                                float output_scale, int output_zp) {
-    if (!in || !out || n <= 0 || output_scale <= 0.0f) return 0;
-    size_t in_bytes = (size_t)n * sizeof(float);
-    size_t packed_words = ((size_t)n + 3u) / 4u;
-    size_t out_bytes = packed_words * sizeof(uint32_t);
-    graph_scratch_begin();
-    VkTensorSlot* src = graph_ensure_device(in, in_bytes, 0);
-    VkTensorSlot* dst = graph_output_slot(out, out_bytes);
-    if (!src || !dst) return 0;
-    struct {
-        uint32_t size;
-        int32_t input_zp;
-        int32_t output_zp;
-        uint32_t has_input_scale;
-        float input_scale;
-        float output_scale;
-        uint32_t pad0;
-        uint32_t pad1;
-    } params = {
-        (uint32_t)n, (int32_t)input_zp, (int32_t)output_zp,
-        input_scale > 0.0f ? 1u : 0u, input_scale, output_scale, 0u, 0u
-    };
-    size_t p_off = graph_scratch_upload(&params, sizeof(params));
-    if (p_off == SIZE_MAX) return 0;
-    VkGraphBinding binds[3] = {
-        {src->offset, in_bytes}, {dst->offset, out_bytes}, {p_off, sizeof(params)}
-    };
-    if (!vk_dispatch_kernel(&k_quantize, binds, (uint32_t)((packed_words + 63u) / 64u), 1, 1)) return 0;
-    graph_mark_device(dst);
-    return vk_graph_sync_host(out, (size_t)n, 0);
-}
-
-static int vk_graph_profile_common(VkKernel* kernel, const float* in, float* out,
-                                   int n, int h, int w, int c, long out_elems_per_batch,
-                                   uint32_t gx, uint32_t gy) {
-    if (!kernel || !in || !out || n <= 0 || h <= 0 || w <= 0 || c <= 0 || out_elems_per_batch <= 0) return 0;
-    size_t in_bytes = (size_t)n * (size_t)h * (size_t)w * (size_t)c * sizeof(float);
-    size_t out_bytes = (size_t)n * (size_t)out_elems_per_batch * sizeof(float);
-    graph_scratch_begin();
-    VkTensorSlot* src = graph_ensure_device(in, in_bytes, 0);
-    VkTensorSlot* dst = graph_output_slot(out, out_bytes);
-    if (!src || !dst) return 0;
-    uint32_t params[4] = {(uint32_t)h, (uint32_t)w, (uint32_t)c, (uint32_t)n};
-    size_t p_off = graph_scratch_upload(params, sizeof(params));
-    if (p_off == SIZE_MAX) return 0;
-    VkGraphBinding binds[3] = {{src->offset, in_bytes}, {dst->offset, out_bytes}, {p_off, sizeof(params)}};
-    if (!vk_dispatch_kernel(kernel, binds, gx, gy, (uint32_t)n)) return 0;
-    graph_mark_device(dst);
-    return 1;
-}
-
-int vk_graph_spatial_softargmax_y_f32(const float* in, float* out, int n, int h, int w, int c) {
-    return vk_graph_profile_common(&k_spatial_softargmax_y, in, out, n, h, w, c,
-                                   (long)c * w, ((uint32_t)w + 63u) / 64u, (uint32_t)c);
-}
+#include "vulkan_graph_quantized.inc"
 
 int vk_graph_profile_x_f32(const float* in, float* out, int n, int h, int w, int c) {
     return vk_graph_profile_common(&k_profile_x, in, out, n, h, w, c,
@@ -6425,7 +3453,7 @@ int vk_graph_conv2d_f32(const float* in, float* out, const float* w, const float
     } else {
         bias_off = graph_scratch_alloc(bias_bytes);
         if (bias_off == SIZE_MAX) return 0;
-        memset((char*)io_mapped + bias_off, 0, bias_bytes);
+        if (!vk_staging_zero(bias_off, bias_bytes)) return 0;
     }
 
     uint32_t params[17] = {
@@ -6442,7 +3470,8 @@ int vk_graph_conv2d_f32(const float* in, float* out, const float* w, const float
         {dst->offset, out_bytes}, {p_off, sizeof(params)}
     };
     VkKernel* kernel = &k_conv2d;
-    uint32_t gz = (uint32_t)(n * out_c);
+    uint32_t generic_gz = (uint32_t)(n * out_c);
+    uint32_t gz = generic_gz;
     if (groups == 1 && kh == 1 && kw == 1 && sy == 1 && sx == 1 &&
         pt == 0 && pl == 0 && dy == 1 && dx == 1 && out_h == h && out_w == width) {
         if ((out_c & 15) == 0) {
@@ -6480,21 +3509,26 @@ int vk_graph_conv2d_f32(const float* in, float* out, const float* w, const float
 #endif
     uint32_t gx = ((uint32_t)out_w + 7u) / 8u;
     uint32_t gy = ((uint32_t)out_h + 7u) / 8u;
+    int generic_geometry_valid =
+        vk_dispatch_dimensions_valid(gx, gy, generic_gz);
     int ok = vk_dispatch_kernel(kernel, binds, gx, gy, gz);
     if (ok && (kernel == &k_conv2d_out16 || kernel == &k_conv2d_c3out16))
         vk_context_current()->conv_out16_dispatches++;
     else if (ok && kernel == &k_conv2d)
         vk_context_current()->conv_scalar_dispatches++;
     if (!ok && kernel != &k_conv2d) {
-        if (kernel == &k_conv2d_out16 || kernel == &k_conv2d_c3out16)
-            ok = vk_dispatch_kernel(&k_conv2d, binds, gx, gy,
-                                    (uint32_t)(n * out_c));
+        if (generic_geometry_valid &&
+            (kernel == &k_conv2d_out16 || kernel == &k_conv2d_c3out16))
+            ok = vk_dispatch_kernel(
+                &k_conv2d, binds, gx, gy, generic_gz);
         if (kernel == &k_conv2d_pw16tile) ok = vk_dispatch_kernel(&k_conv2d_pw16, binds, gx, gy, (uint32_t)(n * (out_c / 16)));
         if (!ok && kernel == &k_conv2d_dw8 && (out_c & 3) == 0) ok = vk_dispatch_kernel(&k_conv2d_dw4, binds, gx, gy, (uint32_t)(n * ((out_c + 3) / 4)));
         if (!ok && (kernel == &k_conv2d_pw8v4 || kernel == &k_conv2d_pw8v2)) {
             ok = vk_dispatch_kernel(&k_conv2d_pw8, binds, gx, gy, (uint32_t)(n * ((out_c + 7) / 8)));
         }
-        if (!ok) ok = vk_dispatch_kernel(&k_conv2d, binds, gx, gy, (uint32_t)(n * out_c));
+        if (!ok && generic_geometry_valid)
+            ok = vk_dispatch_kernel(
+                &k_conv2d, binds, gx, gy, generic_gz);
         if (ok && kernel != &k_conv2d)
             vk_context_current()->conv_scalar_dispatches++;
     }
@@ -6619,10 +3653,15 @@ int vk_graph_linear_f32(const float* input, const float* weight,
  * preserves the declared layout and selects the matching shader instead. */
 static int upload_weight(const float* w, int d_in, int d_out, size_t weight_bytes,
                          size_t* output_offset) {
+    const size_t transpose_chunk_bytes = (size_t)1024 * 1024;
+    float* transpose_chunk = NULL;
+    size_t weight_elements;
     size_t off;
     size_t end;
     size_t next;
-    if (!w || !output_offset || weight_bytes == 0) return 0;
+    if (!w || !output_offset || weight_bytes == 0 || d_in <= 0 || d_out <= 0 ||
+        weight_bytes % sizeof(float) != 0u)
+        return 0;
     for (int i = 0; i < wt_cache_n; i++) {
         if (wt_cache[i].src == w && wt_cache[i].d_in == d_in &&
             wt_cache[i].d_out == d_out && wt_cache[i].bytes == weight_bytes) {
@@ -6632,15 +3671,34 @@ static int upload_weight(const float* w, int d_in, int d_out, size_t weight_byte
     }
     if (wt_cache_n >= WT_CACHE_MAX) return 0;
     off = wt_bump;
-    /* Validate the complete aligned allocation before touching mapped memory.
-       The transient input arena starts at WEIGHTS_LIMIT. */
+    /* Validate the complete aligned allocation before staging the transposed
+       bytes. The transient input arena starts at WEIGHTS_LIMIT. */
     if (off > WEIGHTS_LIMIT || weight_bytes > WEIGHTS_LIMIT - off ||
         !checked_add_size(off, weight_bytes, &end) ||
         !checked_align_size(end, 65536u, &next) || next > WEIGHTS_LIMIT) return 0;
-    float* dst = (float*)((char*)io_mapped + off);
-    for (int i = 0; i < d_in; i++)
-        for (int j = 0; j < d_out; j++)
-            dst[j * d_in + i] = w[i * d_out + j];
+    weight_elements = weight_bytes / sizeof(float);
+    size_t chunk_elements = transpose_chunk_bytes / sizeof(float);
+    if (chunk_elements > weight_elements) chunk_elements = weight_elements;
+    transpose_chunk = (float*)malloc(chunk_elements * sizeof(float));
+    if (!transpose_chunk) return 0;
+    for (size_t base = 0u; base < weight_elements; base += chunk_elements) {
+        size_t count = weight_elements - base;
+        if (count > chunk_elements) count = chunk_elements;
+        for (size_t local = 0u; local < count; local++) {
+            size_t transposed = base + local;
+            size_t output_column = transposed / (size_t)d_in;
+            size_t input_column = transposed % (size_t)d_in;
+            transpose_chunk[local] =
+                w[input_column * (size_t)d_out + output_column];
+        }
+        if (!vk_staging_upload(
+                off + base * sizeof(float), transpose_chunk,
+                count * sizeof(float))) {
+            free(transpose_chunk);
+            return 0;
+        }
+    }
+    free(transpose_chunk);
     wt_bump = next;
     wt_cache[wt_cache_n].src = w;
     wt_cache[wt_cache_n].d_in = d_in;
@@ -6675,7 +3733,7 @@ int vk_matmul(const float* in, const float* w, const float* b, float* out,
     uint32_t groups_x;
     uint32_t groups_y;
     if (!vk_context_current() || !in || !w || !out ||
-        !io_mapped || io_buffer == VK_NULL_HANDLE ||
+        !vk_is_ready() || io_buffer == VK_NULL_HANDLE ||
         seq <= 0 || d_in <= 0 || d_out <= 0 || !vk_graph_flush_wait() ||
         !checked_float_matrix_bytes(seq, d_in, &in_sz) ||
         !checked_float_matrix_bytes(d_in, d_out, &w_sz) ||
@@ -6703,11 +3761,13 @@ int vk_matmul(const float* in, const float* w, const float* b, float* out,
         !checked_add_size(offset_params, param_sz, &end) || end > io_size) return 0;
 
     // Bias binding always covers d_out columns; zero it when absent.
-    memcpy((char*)io_mapped + offset_in, in, in_sz);
-    if (b) memcpy((char*)io_mapped + offset_b, b, b_sz);
-    else memset((char*)io_mapped + offset_b, 0, b_sz);
+    if (!vk_staging_upload(offset_in, in, in_sz) ||
+        !vk_staging_zero(offset_dummy, sizeof(float)) ||
+        !(b ? vk_staging_upload(offset_b, b, b_sz)
+            : vk_staging_zero(offset_b, b_sz)))
+        return 0;
     uint32_t params[3] = {(uint32_t)seq, (uint32_t)d_in, (uint32_t)d_out};
-    memcpy((char*)io_mapped + offset_params, params, sizeof(params));
+    if (!vk_staging_upload(offset_params, params, sizeof(params))) return 0;
 
     VkDescriptorBufferInfo buf_infos[6];
     VkWriteDescriptorSet writes[6];
@@ -6729,29 +3789,10 @@ int vk_matmul(const float* in, const float* w, const float* b, float* out,
     }
     vkUpdateDescriptorSets(device, 6, writes, 0, NULL);
 
-    VkCommandBufferBeginInfo begin_info = {0};
-    begin_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
-    begin_info.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-    if (vkBeginCommandBuffer(cmd_buf, &begin_info) != VK_SUCCESS) return 0;
+    if (!vk_graph_begin_recording()) return 0;
     vkCmdBindPipeline(cmd_buf, VK_PIPELINE_BIND_POINT_COMPUTE, selected_pipeline);
     vkCmdBindDescriptorSets(cmd_buf, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline_layout,
                             0, 1, &desc_set, 0, NULL);
     vkCmdDispatch(cmd_buf, groups_x, groups_y, 1);
-    if (vkEndCommandBuffer(cmd_buf) != VK_SUCCESS) return 0;
-
-    VkSubmitInfo submit_info = {0};
-    submit_info.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
-    submit_info.commandBufferCount = 1;
-    submit_info.pCommandBuffers = &cmd_buf;
-    pthread_mutex_lock(&g_vulkan_device.mutex);
-    VkResult reset_result = vkResetFences(device, 1, &compute_fence);
-    VkResult submit_result = reset_result == VK_SUCCESS
-        ? vkQueueSubmit(compute_queue, 1, &submit_info, compute_fence)
-        : reset_result;
-    pthread_mutex_unlock(&g_vulkan_device.mutex);
-    if (submit_result != VK_SUCCESS ||
-        vkWaitForFences(device, 1, &compute_fence,
-                        VK_TRUE, UINT64_MAX) != VK_SUCCESS) return 0;
-    memcpy(out, (char*)io_mapped + offset_out, out_sz);
-    return 1;
+    return vk_staging_download(offset_out, out, out_sz);
 }

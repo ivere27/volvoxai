@@ -25,7 +25,7 @@ Legend: ✅ supported, ⚠️ supported with stated restrictions, ❌ unsupporte
 | PTQ authoring absent from inference | ✅ | ✅ | ✅ |
 
 The WASM-only browser module contains strict WASM inference and Trainer but no
-CPU, WebNN, WebGPU, WGSL, or Node filesystem implementation.
+CPU JS, WebGPU, WGSL, or Node filesystem implementation.
 
 ## Training ownership
 
@@ -77,7 +77,7 @@ Use:
 
 ~~~javascript
 const trainer = await VolvoxAI.createTrainer(sourceSnapshot, {
-  backend: 'cpu', // or 'webgpu' / 'wasm'
+  backend: 'cpu-js', // or 'webgpu' / 'wasm'
 });
 
 const step = await trainer.trainStep(options);

@@ -105,7 +105,7 @@ class NativeTrainingBoundaryTests(unittest.TestCase):
         cls.symbols = {"runtime": {}, "optimizer": {}, "cli": {}}
         sources = {
             "runtime": "native/src/runtime/engine_runtime.c",
-            "optimizer": "native/src/runtime/engine.c",
+            "optimizer": "native/src/runtime/engine_state.c",
             "cli": "native/cli/main.c",
         }
         for unit, source in sources.items():
@@ -119,7 +119,6 @@ class NativeTrainingBoundaryTests(unittest.TestCase):
                     "-DVOLVOXAI_ENABLE_VULKAN=1",
                     "-DVOLVOXAI_ENABLE_OPENGL=1",
                     "-DVOLVOXAI_ENABLE_METAL=0",
-                    "-DVOLVOXAI_ENABLE_NNAPI=0",
                 ]
                 command.append(f"-DVOLVOXAI_ENABLE_TRAINING={training_enabled}")
                 for include in (
