@@ -1582,7 +1582,7 @@ function concreteWeightLayout(
   if (params.weight_layout === 'din_dout') return 'din';
   if (params.transB === true) return 'dout';
   if (params.transB === false) return 'din';
-  // Canonical Wave-A semantics distinguish Linear's output-major default from
+  // Canonical direct semantics distinguish Linear's output-major default from
   // MatMul/Gemm's input-major default even when square weights cannot reveal it.
   return opType === 'Linear' ? 'dout' : 'din';
 }

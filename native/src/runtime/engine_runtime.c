@@ -12,9 +12,11 @@
 #include "cJSON.h"
 #include "fusion_ops.h"
 #include "inference_kernels.h"
+#include "paged_attention.h"
+#include "paged_binding.h"
 #include "generated/kernel_registry.h"
 #include "json_validation.h"
-#include "quant_cpu_opt.h"
+#include "quant_cpu_isa.h"
 #include "safetensors.h"
 #include "thread_pool.h"
 #if VOLVOXAI_ENABLE_VULKAN
@@ -29,8 +31,8 @@
 #if VOLVOXAI_ENABLE_CUDA
 #include "cuda_engine.h"
 #endif
-#include "conv_f32_opt.h"
-#include "tensor_f32_opt.h"
+#include "conv_f32_isa.h"
+#include "tensor_f32_isa.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -41,10 +43,6 @@
 #include <time.h>
 #ifdef _WIN32
 #include <windows.h>
-#endif
-
-#if VOLVOXAI_ENABLE_NNAPI
-#include "nnapi_engine.h"
 #endif
 
 #if VOLVOXAI_ENABLE_VULKAN

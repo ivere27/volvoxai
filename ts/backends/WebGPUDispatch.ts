@@ -1,7 +1,7 @@
 import { Tensor } from '../core/Tensor.js';
 import type { RuntimeGraph } from '../core/RuntimeGraph.js';
 import { incrementalExecutionEnabled, incrementalNodeSelection } from './incrementalExecution.js';
-import { incrementalRowPosition } from './quantizedRowExecution.js';
+import { decodeRowSetFromOptions } from './quantizedRowExecution.js';
 import type { GraphExecutor } from './GraphExecutor.js';
 import {
   isDeviceTensorInputLease,
@@ -406,6 +406,11 @@ export class WebGPUDispatch {
           continue;
         }
         Tensor.assertCompatibleInput(tensor.dtype, data, tensor.sizeBytes, `Input '${name}'`);
+        /* Before the changed-input filter: a batched keep mask is built from
+         * this input's values on the host, and a step that left it unchanged
+         * still needs them. Mirroring only what a compiled plan asked for keeps
+         * this free for every other input. */
+        this.host.decodeState.mirrorRowInput(name, data);
         if (changed !== null && !changed.has(name)) continue;
         let destinationOffset = 0;
         let sourceOffset = 0;
@@ -475,13 +480,33 @@ export class WebGPUDispatch {
         ? incrementalNodeSelection(this.host.graph as RuntimeGraph, inputs, options, cacheWasValid)
         : null;
       this.host._webGPUIncrementalCacheValid = false;
-      const rowPosition = incrementalRowPosition(options, selectedNodes, cacheWasValid);
-      if (rowPosition != null) {
+      /* One row set for both spellings, built by the shared resolver. WebGPU
+       * used to refuse a lane list outright, because `incrementalRowPosition`
+       * returned null for a batched step and null means "not a row step" -- so
+       * the step would quietly recompute the whole prefix while the decode
+       * report still said `incremental-row`. What removed that refusal was not
+       * accepting the lanes here but making the row descriptors carry geometry
+       * instead of a back-derived stride; see `RowStorageDescriptor`. */
+      const rowSet = decodeRowSetFromOptions(options, selectedNodes, cacheWasValid);
+      if (rowSet != null) {
         const rowNodes = selectedNodes!;
         this.host._assertIncrementalRowInvariants(
           rowNodes, options.changedInputs ?? Object.keys(inputs),
         );
+        /* The lane count is compiled into the bind group, the scratch
+         * capacities and the workgroup count, so a change re-analyses. Once per
+         * context, not once per step. */
+        this.host._ensureIncrementalRowLanes(rowSet.lanes);
         await this.host._compileIncrementalRowPipelines(rowNodes);
+        /* Demand driven: a context that never pages never allocates the
+         * staging buffers, and one that does pays for them once. A batched step
+         * stages its K/V through the ordinary binding, so the second binding is
+         * a one-lane affair. */
+        if (options.kvPages && rowSet.lanes === 1) {
+          await this.host._compilePagedRowVariants(
+            rowNodes, options.kvPages.pagedTensors,
+          );
+        }
         for (const nodeIndex of rowNodes) {
           if (!this.host.incrementalRowPlans.has(nodeIndex)) {
             const node = this.host.graph.nodes[nodeIndex];
@@ -489,11 +514,20 @@ export class WebGPUDispatch {
           }
           const sequence = (this.host.graph.nodes[nodeIndex].outputs?.out ||
             Object.values(this.host.graph.nodes[nodeIndex].outputs || {})[0])?.shape?.[1];
-          if (typeof sequence !== 'number' || !Number.isInteger(sequence) || rowPosition >= sequence) {
-            throw new Error(`WebGPU W8A8 incremental row node ${this.host.graph.nodes[nodeIndex].id} position ${rowPosition} is outside its fixed sequence.`);
+          for (let lane = 0; lane < rowSet.lanes; lane++) {
+            if (typeof sequence !== 'number' || !Number.isInteger(sequence) ||
+                rowSet.positions[lane] >= sequence) {
+              throw new Error(`WebGPU W8A8 incremental row node ${this.host.graph.nodes[nodeIndex].id} position ${rowSet.positions[lane]} is outside its fixed sequence.`);
+            }
           }
         }
       }
+      /* Row uploads address one lane's slice of a `[1,S,...]` input, which a
+       * batched step has no single answer for -- each lane writes its own row.
+       * A batched decode supplies its changed inputs whole, so the upload takes
+       * the ordinary path and the row set does the addressing. */
+      const rowPosition = rowSet != null && rowSet.lanes === 1
+        ? rowSet.positions[0] : null;
       const adapterResources: GPUBuffer[] = [];
       this.host._uploadExecutionInputs(
         inputs,
@@ -501,8 +535,8 @@ export class WebGPUDispatch {
         options.changedInputs,
         selectedNodes !== null,
       );
-      if (rowPosition != null) {
-        this.host._encodeIncrementalRows(selectedNodes!, rowPosition);
+      if (rowSet != null) {
+        this.host._encodeIncrementalRows(selectedNodes!, rowSet);
         this.host._webGPUIncrementalCacheValid = true;
         const lastNode = this.host.graph.nodes[this.host.graph.nodes.length - 1];
         const outName = Object.keys(lastNode.outputs)[0];

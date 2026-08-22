@@ -8,34 +8,250 @@ static uint64_t cuda_generation_next(uint64_t generation) {
     return generation ? generation : 1u;
 }
 
-static void cuda_replay_destroy_graph_current(void) {
-    if (cuda_replay.captured_graph && p_cuGraphDestroy)
-        (void)p_cuGraphDestroy(cuda_replay.captured_graph);
-    cuda_replay.captured_graph = NULL;
-    if (cuda_replay.executable && p_cuGraphExecDestroy)
-        (void)p_cuGraphExecDestroy(cuda_replay.executable);
-    cuda_replay.executable = NULL;
+static int cuda_replay_destroy_graph_plan(CudaReplayState* replay) {
+    int destroyed = 1;
+    if (!replay) return 1;
+    if (replay->captured_graph) {
+        if (!p_cuGraphDestroy ||
+            p_cuGraphDestroy(replay->captured_graph) != CUDA_SUCCESS) {
+            destroyed = 0;
+        } else {
+            replay->captured_graph = NULL;
+        }
+    }
+    if (replay->executable) {
+#if defined(VOLVOXAI_CUDA_TESTING)
+        if (cuda_test_graph_exec_destroy_failure) {
+            cuda_test_graph_exec_destroy_failure = 0;
+            destroyed = 0;
+        } else
+#endif
+        if (!p_cuGraphExecDestroy ||
+            p_cuGraphExecDestroy(replay->executable) != CUDA_SUCCESS) {
+            destroyed = 0;
+        } else {
+            replay->executable = NULL;
+#if defined(VOLVOXAI_CUDA_TESTING)
+            cuda_graph_exec_destroy_count++;
+#endif
+        }
+    }
+    return destroyed && !replay->captured_graph && !replay->executable;
 }
 
-static void cuda_replay_clear_plan_current(int count_invalidation) {
-    int had_plan = cuda_replay.plan != CUDA_REPLAY_PLAN_EMPTY ||
-        cuda_replay.captured_graph || cuda_replay.executable;
-    cuda_replay_destroy_graph_current();
-    cuda_replay.plan = CUDA_REPLAY_PLAN_EMPTY;
-    cuda_replay.generation = 0;
-    cuda_replay.slot_epoch = 0;
-    cuda_replay.shape_generation = 0;
-    cuda_replay.capacity_generation = 0;
-    cuda_replay.shape_signature = NULL;
-    cuda_replay.launch_count = 0;
-    cuda_replay.launch_index = 0;
-    memset(cuda_replay.initial_reads, 0, sizeof(cuda_replay.initial_reads));
+static int cuda_replay_clear_plan(CudaReplayState* replay,
+                                  int count_invalidation) {
+    int had_plan;
+    if (!replay) return 1;
+    had_plan = replay->plan != CUDA_REPLAY_PLAN_EMPTY ||
+        replay->captured_graph || replay->executable;
+    if (had_plan && count_invalidation &&
+        !replay->invalidation_counted) {
+        cuda_replay_invalidation_total++;
 #if defined(VOLVOXAI_CUDA_TESTING)
-    if (had_plan && count_invalidation) cuda_graph_invalidation_count++;
-#else
+        cuda_graph_invalidation_count++;
+#endif
+        replay->invalidation_counted = 1;
+    }
+    if (!cuda_replay_destroy_graph_plan(replay)) {
+        /* A failed Driver destroy keeps ownership in this cache entry. It is
+         * quarantined from exact-key selection and cannot be replaced by a
+         * fifth executable; a later selection/cleanup retries destruction. */
+        replay->destroy_pending = 1;
+        replay->pass = CUDA_REPLAY_PASS_INELIGIBLE;
+        replay->prepared = 0;
+        replay->capture_active = 0;
+        replay->failed = 0;
+        replay->unsafe = 0;
+        replay->prestaging = 0;
+        return 0;
+    }
+    free(replay->shape_signature);
+    memset(replay, 0, sizeof(*replay));
+#if !defined(VOLVOXAI_CUDA_TESTING)
     (void)had_plan;
     (void)count_invalidation;
 #endif
+    return 1;
+}
+
+static int cuda_replay_clear_plan_current(int count_invalidation) {
+    return cuda_replay_clear_plan(
+        cuda_replay_active, count_invalidation);
+}
+
+static int cuda_replay_clear_all_plans_current(int count_invalidation) {
+    int cleared = 1;
+    for (size_t index = 0; index < cuda_replay_plan_count; index++)
+        if (!cuda_replay_clear_plan(
+                cuda_replay_plans[index], count_invalidation))
+            cleared = 0;
+    cuda_replay_active = cuda_replay_plans[0];
+    cuda_replay_clock = 0;
+    return cleared;
+}
+
+static int cuda_replay_driver_handles_empty(void) {
+    for (size_t index = 0; index < cuda_replay_plan_count; index++) {
+        CudaReplayState* replay = cuda_replay_plans[index];
+        if (replay && (replay->captured_graph || replay->executable))
+            return 0;
+    }
+    return 1;
+}
+
+/* Host-only release. Every Driver handle must have been successfully destroyed
+ * while the owning primary context was current. */
+static int cuda_replay_release_cache_storage_current(void) {
+    if (!cuda_replay_driver_handles_empty()) return 0;
+    for (size_t index = 0; index < cuda_replay_plan_count; index++) {
+        CudaReplayState* replay = cuda_replay_plans[index];
+        if (!replay) continue;
+        free(replay->shape_signature);
+        memset(replay, 0, sizeof(*replay));
+    }
+    for (size_t index = 1; index < cuda_replay_plan_count; index++) {
+        free(cuda_replay_plans[index]);
+        cuda_replay_plans[index] = NULL;
+    }
+    cuda_replay_plan_count = 1u;
+    cuda_replay_plans[0] = &cuda_context_state_current()->replay;
+    cuda_replay_active = cuda_replay_plans[0];
+    return 1;
+}
+
+static int cuda_replay_plan_global_key_matches(
+        const CudaReplayState* replay, uint64_t model_generation) {
+    if (!replay || replay->plan == CUDA_REPLAY_PLAN_EMPTY ||
+        replay->destroy_pending) return 0;
+    return replay->generation == model_generation &&
+        replay->slot_epoch == graph_slot_epoch &&
+        replay->capacity_generation == cuda_capacity_generation &&
+        replay->domain_enforced == cuda_domain_enforced &&
+        (cuda_domain_enforced ||
+         replay->shape_generation == cuda_shape_generation);
+}
+
+static int cuda_replay_plan_exact_key_matches(
+        const CudaReplayState* replay, const char* shape_signature,
+        uint64_t model_generation) {
+    return cuda_replay_plan_global_key_matches(replay, model_generation) &&
+        replay->shape_signature && shape_signature &&
+        !strcmp(replay->shape_signature, shape_signature);
+}
+
+static void cuda_replay_touch_plan(CudaReplayState* replay) {
+    if (!replay) return;
+    cuda_replay_clock++;
+    if (!cuda_replay_clock) {
+        for (size_t index = 0; index < cuda_replay_plan_count; index++)
+            if (cuda_replay_plans[index])
+                cuda_replay_plans[index]->last_used = 0;
+        cuda_replay_clock = 1u;
+    }
+    replay->last_used = cuda_replay_clock;
+}
+
+/* Select one exact replay plan while the forward owns the CUDA context. The
+ * fixed bounded-domain device spans make plans for different signatures safe
+ * to retain together; model, domain mode, slot epoch, and capacity generation
+ * remain global invalidation keys. Additional working states are allocated
+ * lazily and the total number of Driver graph executables is strictly bounded.
+ */
+static CudaReplayState* cuda_replay_select_plan_current(
+        const char* shape_signature, uint64_t model_generation) {
+    CudaReplayState* selected = NULL;
+    CudaReplayState* victim = NULL;
+    char* owned_signature;
+    size_t signature_length;
+    int global_mismatch = 0;
+    if (!shape_signature || !model_generation) return NULL;
+    /* Retry quarantined Driver handles before selecting or allocating any
+     * plan. A persistent destroy failure makes this forward run directly and
+     * cannot consume another cache entry or GraphExec. */
+    for (size_t index = 0; index < cuda_replay_plan_count; index++) {
+        CudaReplayState* replay = cuda_replay_plans[index];
+        if (replay && replay->destroy_pending &&
+            !cuda_replay_clear_plan(replay, 1))
+            return NULL;
+    }
+    for (size_t index = 0; index < cuda_replay_plan_count; index++) {
+        CudaReplayState* replay = cuda_replay_plans[index];
+        if (!replay) continue;
+        if (replay->plan != CUDA_REPLAY_PLAN_EMPTY &&
+            !cuda_replay_plan_global_key_matches(replay, model_generation))
+            global_mismatch = 1;
+    }
+    if (global_mismatch &&
+        !cuda_replay_clear_all_plans_current(1))
+        return NULL;
+    for (size_t index = 0; index < cuda_replay_plan_count; index++) {
+        CudaReplayState* replay = cuda_replay_plans[index];
+        if (!replay) continue;
+        if (cuda_replay_plan_exact_key_matches(
+                replay, shape_signature, model_generation)) {
+            selected = replay;
+            break;
+        }
+    }
+    if (selected) {
+        selected->shape_generation = cuda_shape_generation;
+        cuda_replay_active = selected;
+        cuda_replay_touch_plan(selected);
+        return selected;
+    }
+
+    signature_length = strlen(shape_signature);
+    if (signature_length > 1024u * 1024u) return NULL;
+    owned_signature = (char*)malloc(signature_length + 1u);
+    if (!owned_signature) return NULL;
+    memcpy(owned_signature, shape_signature, signature_length + 1u);
+
+    for (size_t index = 0; index < cuda_replay_plan_count; index++) {
+        CudaReplayState* replay = cuda_replay_plans[index];
+        if (replay && replay->plan == CUDA_REPLAY_PLAN_EMPTY &&
+            !replay->captured_graph && !replay->executable) {
+            selected = replay;
+            break;
+        }
+    }
+    if (!selected &&
+        cuda_replay_plan_count < CUDA_GRAPH_REPLAY_PLAN_CAPACITY) {
+        selected = (CudaReplayState*)calloc(1, sizeof(*selected));
+        if (!selected) {
+            free(owned_signature);
+            return NULL;
+        }
+        cuda_replay_plans[cuda_replay_plan_count++] = selected;
+    }
+    if (!selected) {
+        for (size_t index = 0; index < cuda_replay_plan_count; index++) {
+            CudaReplayState* replay = cuda_replay_plans[index];
+            if (!replay) continue;
+            if (replay->destroy_pending) {
+                victim = replay;
+                break;
+            }
+            if (!victim || replay->last_used < victim->last_used)
+                victim = replay;
+        }
+        selected = victim;
+        if (!cuda_replay_clear_plan(selected, 1)) selected = NULL;
+    }
+    if (!selected) {
+        free(owned_signature);
+        return NULL;
+    }
+    selected->generation = model_generation;
+    selected->slot_epoch = graph_slot_epoch;
+    selected->shape_generation = cuda_shape_generation;
+    selected->capacity_generation = cuda_capacity_generation;
+    selected->domain_enforced = cuda_domain_enforced;
+    selected->shape_signature = owned_signature;
+    selected->pass = CUDA_REPLAY_PASS_OBSERVE;
+    cuda_replay_active = selected;
+    cuda_replay_touch_plan(selected);
+    return selected;
 }
 
 static int cuda_replay_memory_locked(void) {
@@ -205,14 +421,16 @@ static void graph_quarantine_transient_identities(void) {
     graph_slot_epoch_advance();
 }
 
-static void graph_release_slots(void) {
+static int graph_release_slots(void) {
     CudaContextGuard guard;
+    int replay_handles_cleared = cuda_replay_driver_handles_empty();
     if (cuda_context_enter(&guard)) {
         if (cuda_stream && p_cuStreamSynchronize)
             (void)p_cuStreamSynchronize(cuda_stream);
         else if (p_cuCtxSynchronize)
             (void)p_cuCtxSynchronize();
-        cuda_replay_clear_plan_current(1);
+        replay_handles_cleared =
+            cuda_replay_clear_all_plans_current(1);
         if (p_cuMemFree) {
             for (int i = 0; i < graph_slot_count; i++)
                 if (graph_slots[i].device)
@@ -225,6 +443,7 @@ static void graph_release_slots(void) {
     memset(graph_slot_hash, 0, sizeof(graph_slot_hash));
     graph_slot_hash_valid = 1;
     graph_slot_epoch_advance();
+    return replay_handles_cleared;
 }
 
 /* Forward and backward passes own short-lived activation and gradient
@@ -278,7 +497,7 @@ void cuda_graph_release_transients(void) {
         (void)cuda_context_leave(&guard);
         return;
     }
-    cuda_replay_clear_plan_current(1);
+    cuda_replay_clear_all_plans_current(1);
     for (int index = 0; index < graph_slot_count; index++) {
         CudaTensorSlot slot = graph_slots[index];
         if (!graph_slot_is_resident_weight(&slot)) {
@@ -362,7 +581,7 @@ int cuda_graph_bind_shape(const char* signature) {
         free(candidate);
         return -1;
     }
-    cuda_replay_clear_plan_current(1);
+    cuda_replay_clear_all_plans_current(1);
     if (!cuda_context_leave(&guard)) {
         /* Synchronization invalidates replay, but the exact key and every
          * live slot remain committed to the old binding when restoration of

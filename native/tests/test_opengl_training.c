@@ -70,6 +70,177 @@ static int check_one_shot_matmul_tails_and_fallback(void) {
     return 0;
 }
 
+static int check_dispatch_params_buffer_reuse(void) {
+    const float input[5] = {-3.0f, -0.5f, 0.0f, 0.5f, 3.0f};
+    float clipped[5] = {0};
+    float leaky[5] = {0};
+    const float expected_clipped[5] = {-1.0f, -0.5f, 0.0f, 0.5f, 1.0f};
+    const float expected_leaky[5] = {-0.75f, -0.125f, 0.0f, 0.5f, 3.0f};
+    OpenGLGraphDynamicStateProbe before = {0};
+    OpenGLGraphDynamicStateProbe after = {0};
+    OpenGLGraphDynamicStateProbe reset = {0};
+
+    opengl_graph_reset();
+    CHECK(opengl_graph_debug_dynamic_state(&before) == 0);
+    opengl_graph_begin_forward();
+    /* These two queued kernels use different uniform layouts and contents.
+     * Correct output verifies that the second orphan upload cannot overwrite
+     * the first dispatch's parameter store. */
+    CHECK(opengl_graph_clip_f32(input, clipped, 5, -1.0f, 1.0f) == 1);
+    CHECK(opengl_graph_leaky_relu_f32(input, leaky, 5, 0.25f) == 1);
+    CHECK(opengl_graph_end_forward() == 0);
+    CHECK(opengl_graph_sync_host(clipped, sizeof(clipped), 0) == 1);
+    CHECK(opengl_graph_sync_host(leaky, sizeof(leaky), 0) == 1);
+    CHECK(memcmp(clipped, expected_clipped, sizeof(clipped)) == 0);
+    CHECK(memcmp(leaky, expected_leaky, sizeof(leaky)) == 0);
+    CHECK(opengl_graph_debug_dynamic_state(&after) == 0);
+    CHECK(after.dispatch_params_buffer_count == 1);
+    CHECK(after.dispatch_params_upload_count ==
+          before.dispatch_params_upload_count + 2u);
+
+    opengl_graph_reset();
+    CHECK(opengl_graph_debug_dynamic_state(&reset) == 0);
+    CHECK(reset.dispatch_params_buffer_count == 1);
+    CHECK(reset.dispatch_params_upload_count ==
+          after.dispatch_params_upload_count);
+    return 0;
+}
+
+static int check_moe_partial_residency_backward(void) {
+    float input = 2.0f;
+    float expert_weight = 3.0f;
+    float expert_bias = 4.0f;
+    float route_index = 2.0f;
+    float route_weight = 0.5f;
+    float grad_output = 7.0f;
+    float grad_input = 0.0f;
+    float grad_expert_weight = 0.0f;
+    float grad_expert_bias = 0.0f;
+    float grad_route_weight = 0.0f;
+    uint32_t slot_rows[3] = {UINT32_MAX, UINT32_MAX, 0u};
+    uint32_t row_slots[1] = {2u};
+    uint32_t params[8] = {1u, 1u, 1u, 1u, 1u, 1u, 3u, 0u};
+    void* hosts[13] = {
+        &input, &expert_weight, &expert_bias, &route_index, &route_weight,
+        &grad_output, &grad_input, &grad_expert_weight, &grad_expert_bias,
+        &grad_route_weight, slot_rows, row_slots, params
+    };
+    size_t bytes[13] = {
+        sizeof(float), sizeof(float), sizeof(float), sizeof(float), sizeof(float),
+        sizeof(float), sizeof(float), sizeof(float), sizeof(float), sizeof(float),
+        sizeof(slot_rows), sizeof(row_slots), sizeof(params)
+    };
+    unsigned char access[13] = {
+        OPENGL_TRAINING_ACCESS_READ, OPENGL_TRAINING_ACCESS_READ,
+        OPENGL_TRAINING_ACCESS_READ, OPENGL_TRAINING_ACCESS_READ,
+        OPENGL_TRAINING_ACCESS_READ, OPENGL_TRAINING_ACCESS_READ,
+        OPENGL_TRAINING_ACCESS_READ_WRITE, OPENGL_TRAINING_ACCESS_READ_WRITE,
+        OPENGL_TRAINING_ACCESS_READ_WRITE, OPENGL_TRAINING_ACCESS_READ_WRITE,
+        OPENGL_TRAINING_ACCESS_READ, OPENGL_TRAINING_ACCESS_READ,
+        OPENGL_TRAINING_ACCESS_READ
+    };
+    unsigned char weights[13] = {0, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+    const char* entries[4] = {"input_main", "weight_main", "bias_main", "route_main"};
+    CHECK(opengl_training_begin() == 0);
+    for (int index = 0; index < 4; index++) {
+        CHECK(opengl_training_dispatch(
+                  "moeLinearBackward", entries[index], hosts, bytes, access,
+                  weights, 13, 1, 1, 1) == 0);
+    }
+    CHECK(opengl_training_sync(&grad_input, sizeof(grad_input)) == 0);
+    CHECK(opengl_training_sync(&grad_expert_weight,
+                               sizeof(grad_expert_weight)) == 0);
+    CHECK(opengl_training_sync(&grad_expert_bias,
+                               sizeof(grad_expert_bias)) == 0);
+    CHECK(opengl_training_sync(&grad_route_weight,
+                               sizeof(grad_route_weight)) == 0);
+    opengl_training_end();
+    CHECK(fabsf(grad_input - 10.5f) <= 1.0e-4f);
+    CHECK(fabsf(grad_expert_weight - 7.0f) <= 1.0e-4f);
+    CHECK(fabsf(grad_expert_bias - 3.5f) <= 1.0e-4f);
+    CHECK(fabsf(grad_route_weight - 70.0f) <= 1.0e-4f);
+    return 0;
+}
+
+static int check_conv2d_f32_regular_out16(void) {
+    enum {
+        INPUT_HEIGHT = 3, INPUT_WIDTH = 4, INPUT_CHANNELS = 5,
+        OUTPUT_HEIGHT = 3, OUTPUT_WIDTH = 3, OUTPUT_CHANNELS = 16,
+        KERNEL_HEIGHT = 2, KERNEL_WIDTH = 2,
+    };
+    float input[INPUT_HEIGHT * INPUT_WIDTH * INPUT_CHANNELS];
+    float weight[KERNEL_HEIGHT * KERNEL_WIDTH * INPUT_CHANNELS *
+                 OUTPUT_CHANNELS];
+    float bias[OUTPUT_CHANNELS];
+    float output[OUTPUT_HEIGHT * OUTPUT_WIDTH * OUTPUT_CHANNELS];
+    float expected[OUTPUT_HEIGHT * OUTPUT_WIDTH * OUTPUT_CHANNELS];
+    OpenGLGraphDynamicStateProbe before = {0};
+    OpenGLGraphDynamicStateProbe after = {0};
+
+    for (size_t index = 0; index < sizeof(input) / sizeof(input[0]); index++)
+        input[index] = (float)((int)(index * 3u + 1u) % 11 - 5) * 0.0625f;
+    for (size_t index = 0; index < sizeof(weight) / sizeof(weight[0]); index++)
+        weight[index] = (float)((int)(index * 5u + 2u) % 13 - 6) * 0.03125f;
+    for (int channel = 0; channel < OUTPUT_CHANNELS; channel++)
+        bias[channel] = (float)(channel % 5 - 2) * 0.125f;
+
+    for (int output_y = 0; output_y < OUTPUT_HEIGHT; output_y++) {
+        for (int output_x = 0; output_x < OUTPUT_WIDTH; output_x++) {
+            for (int output_channel = 0; output_channel < OUTPUT_CHANNELS;
+                 output_channel++) {
+                float sum = 0.0f;
+                for (int input_channel = 0; input_channel < INPUT_CHANNELS;
+                     input_channel++) {
+                    for (int kernel_y = 0; kernel_y < KERNEL_HEIGHT;
+                         kernel_y++) {
+                        const int input_y = output_y + kernel_y * 2 - 1;
+                        if (input_y < 0 || input_y >= INPUT_HEIGHT) continue;
+                        for (int kernel_x = 0; kernel_x < KERNEL_WIDTH;
+                             kernel_x++) {
+                            const int input_x = output_x * 2 + kernel_x - 1;
+                            if (input_x < 0 || input_x >= INPUT_WIDTH) continue;
+                            const size_t input_index =
+                                ((size_t)input_y * INPUT_WIDTH +
+                                 (size_t)input_x) * INPUT_CHANNELS +
+                                (size_t)input_channel;
+                            const size_t weight_index =
+                                (((size_t)kernel_y * KERNEL_WIDTH +
+                                  (size_t)kernel_x) * INPUT_CHANNELS +
+                                 (size_t)input_channel) * OUTPUT_CHANNELS +
+                                (size_t)output_channel;
+                            sum += input[input_index] * weight[weight_index];
+                        }
+                    }
+                }
+                float value = sum + bias[output_channel];
+                if (value < 0.0f) value = 0.0f;
+                if (value > 6.0f) value = 6.0f;
+                expected[((size_t)output_y * OUTPUT_WIDTH +
+                          (size_t)output_x) * OUTPUT_CHANNELS +
+                         (size_t)output_channel] = value;
+            }
+        }
+    }
+
+    opengl_graph_reset();
+    CHECK(opengl_graph_debug_dynamic_state(&before) == 0);
+    opengl_graph_begin_forward();
+    CHECK(opengl_graph_conv2d_f32(
+              input, output, weight, bias,
+              1, INPUT_HEIGHT, INPUT_WIDTH, INPUT_CHANNELS, OUTPUT_CHANNELS,
+              KERNEL_HEIGHT, KERNEL_WIDTH, OUTPUT_HEIGHT, OUTPUT_WIDTH,
+              1, 2, 1, 1, 1, 2, 2, 1) == 1);
+    CHECK(opengl_graph_end_forward() == 0);
+    CHECK(opengl_graph_sync_host(output, sizeof(output), 0) == 1);
+    CHECK(opengl_graph_debug_dynamic_state(&after) == 0);
+    CHECK(after.conv_out16_dispatch_count ==
+          before.conv_out16_dispatch_count + 1u);
+    for (size_t index = 0; index < sizeof(output) / sizeof(output[0]); index++)
+        CHECK(fabsf(output[index] - expected[index]) <= 1.0e-4f);
+    opengl_graph_reset();
+    return 0;
+}
+
 static void reference_graph_linear(const float* input, const float* weight,
                                    const float* bias, float* output, int rows,
                                    int d_in, int d_out,
@@ -240,6 +411,48 @@ static int check_tiled_qlinear_i8u8_tails(void) {
                                     ROWS, D_IN, D_OUT, 1.0f, 0, 1.0f, 0,
                                     VX_DTYPE_I8, VX_DTYPE_I8,
                                     VX_DTYPE_I8) == 1);
+    CHECK(opengl_graph_end_forward() == 0);
+    CHECK(opengl_graph_sync_host(output, sizeof(output), 0) == 1);
+    CHECK(memcmp(output, expected, sizeof(output)) == 0);
+    opengl_graph_reset();
+    return 0;
+}
+
+static int check_scalar_qlinear_i8u8_fused_word(void) {
+    enum { ROWS = 1, D_IN = 12, D_OUT = 6 };
+    uint8_t input[D_IN];
+    int8_t weight[D_OUT * D_IN];
+    float scales[D_OUT];
+    int32_t zero_points[D_OUT];
+    int32_t bias[D_OUT];
+    uint8_t output[D_OUT];
+    uint8_t expected[D_OUT];
+    const int32_t input_zero_point = 127;
+    const int32_t output_zero_point = 119;
+    for (int k = 0; k < D_IN; k++) input[k] = (uint8_t)(123 + (k * 7) % 11);
+    for (int column = 0; column < D_OUT; column++) {
+        scales[column] = 1.0f;
+        zero_points[column] = column - 3;
+        bias[column] = column * 5 - 9;
+        for (int k = 0; k < D_IN; k++)
+            weight[column * D_IN + k] =
+                (int8_t)(zero_points[column] + (k * 3 + column) % 7 - 3);
+        int accumulator = bias[column];
+        for (int k = 0; k < D_IN; k++)
+            accumulator += ((int)input[k] - input_zero_point) *
+                ((int)weight[column * D_IN + k] - zero_points[column]);
+        int quantized = accumulator + output_zero_point;
+        if (quantized < 0) quantized = 0;
+        if (quantized > 255) quantized = 255;
+        expected[column] = (uint8_t)quantized;
+    }
+    memset(output, 0, sizeof(output));
+    opengl_graph_reset();
+    opengl_graph_begin_forward();
+    CHECK(opengl_graph_qlinear_i8u8(
+        input, weight, scales, zero_points, bias, output,
+        ROWS, D_IN, D_OUT, 1.0f, input_zero_point, 1.0f,
+        output_zero_point, VX_DTYPE_U8, VX_DTYPE_I8, VX_DTYPE_U8) == 1);
     CHECK(opengl_graph_end_forward() == 0);
     CHECK(opengl_graph_sync_host(output, sizeof(output), 0) == 1);
     CHECK(memcmp(output, expected, sizeof(output)) == 0);
@@ -2342,6 +2555,45 @@ static int check_dynamic_domain_reservation(void) {
     return 0;
 }
 
+/* A storage-view node (Reshape/Flatten/Squeeze/Unsqueeze/Identity/Dropout)
+ * whose input and output have distinct host storage must receive independent
+ * device storage. Device slots are keyed by host pointer and the runtime pools
+ * many disjoint-lifetime activations into one host span, so sharing a device
+ * buffer across two spans does not extend one tensor's lifetime -- it merges
+ * the spans, and every later tensor planned into either one writes through
+ * both. The regression this pins: SiLU -> Reshape -> Transpose returned a
+ * different wrong answer on every run. */
+static int check_storage_view_alias_isolation(void) {
+    float source[8];
+    float view[8];
+    float successor[8];
+    opengl_graph_reset();
+    for (int index = 0; index < 8; index++) {
+        source[index] = (float)(index + 1);
+        view[index] = 0.0f;
+        successor[index] = -1.0f - (float)index;
+    }
+    opengl_graph_mark_host(source, sizeof(source), 0);
+    opengl_graph_mark_host(successor, sizeof(successor), 0);
+    opengl_graph_begin_forward();
+    CHECK(opengl_graph_alias_f32(source, view, 8) == 1);
+    /* The planner reuses the source span once the view's producer is dead. */
+    CHECK(opengl_graph_copy_f32(successor, source, 8) == 1);
+    CHECK(opengl_graph_end_forward() == 0);
+    CHECK(opengl_graph_sync_host(view, sizeof(view), 0) == 1);
+    for (int index = 0; index < 8; index++)
+        CHECK(view[index] == (float)(index + 1));
+    /* A view the runtime already aliased on the host stays a free view. */
+    opengl_graph_begin_forward();
+    CHECK(opengl_graph_alias_f32(source, source, 8) == 1);
+    CHECK(opengl_graph_end_forward() == 0);
+    CHECK(opengl_graph_sync_host(source, sizeof(source), 0) == 1);
+    for (int index = 0; index < 8; index++)
+        CHECK(source[index] == -1.0f - (float)index);
+    opengl_graph_reset();
+    return 0;
+}
+
 int main(void) {
     VxEngineState* engine_state =
         (VxEngineState*)calloc(1, sizeof(*engine_state));
@@ -2459,11 +2711,15 @@ int main(void) {
                                    1, 1, 1) == 0);
     CHECK(opengl_training_supports("notARealShader", "main", copy_bytes, 3,
                                    1, 1, 1) == 0);
+    CHECK(check_dispatch_params_buffer_reuse() == 0);
+    CHECK(check_conv2d_f32_regular_out16() == 0);
     CHECK(check_one_shot_matmul_tails_and_fallback() == 0);
     CHECK(check_graph_linear_dynamic_domain() == 0);
     CHECK(check_tiled_qlinear_i8u8_tails() == 0);
+    CHECK(check_scalar_qlinear_i8u8_fused_word() == 0);
     CHECK(check_tiled_qlinear_staged_rounding() == 0);
     CHECK(check_lazy_training_dispatch() == 0);
+    CHECK(check_moe_partial_residency_backward() == 0);
     CHECK(check_prelu_logsoftmax_split_backward() == 0);
     CHECK(check_groupnorm_dropout_reduce_and_broadcast() == 0);
     CHECK(check_gelu_modes() == 0);
@@ -2486,6 +2742,7 @@ int main(void) {
     CHECK(check_qbatch_and_typed_transpose() == 0);
     CHECK(check_dynamic_shape_capacity_lifecycle() == 0);
     CHECK(check_dynamic_domain_reservation() == 0);
+    CHECK(check_storage_view_alias_isolation() == 0);
     CHECK(opengl_training_debug_compile_all() == 0);
     int programs = 0, buffers = -1, inference_buffers = -1;
     opengl_training_debug_resource_counts(&programs, &buffers, &inference_buffers);

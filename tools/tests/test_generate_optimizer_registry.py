@@ -543,12 +543,16 @@ class OptimizerRegistryGeneratorTests(unittest.TestCase):
         mutated = source.replace(
             needle,
             "backend: BACKEND_KIND_NATIVE_CPU\n"
-            "      backend: BACKEND_KIND_WEBNN\n"
-            "      required_operator: OPERATOR_KIND_Q_ARG_MAX",
+            "      backend: BACKEND_KIND_VULKAN\n"
+            "      required_operator: OPERATOR_KIND_Q_ARG_MAX\n"
+            "      required_operator: OPERATOR_KIND_GEMM",
             1,
         )
         self.assertNotEqual(mutated, source)
-        with self.assertRaisesRegex(ValueError, "absent from webnn exporter qualification"):
+        with self.assertRaisesRegex(
+            ValueError,
+            "OPERATOR_KIND_GEMM.*absent from vulkan exporter qualification",
+        ):
             self._load_mutated(mutated)
 
     def test_rejects_recipe_that_omits_selected_pass_semantics(self):

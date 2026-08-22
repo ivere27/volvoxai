@@ -40,8 +40,8 @@
 
 **백본(Backbone)** — 비전 모델의 특징 추출 단계(여기선 EfficientNet-Lite0).
 
-**백엔드(Backend)** — 그래프 연산의 구체적 실행기. 브라우저 백엔드는 네 *계층*, 네이티브 백엔드는 CPU,
-Vulkan, OpenGL/GLES, Metal, NNAPI. VolvoxAI가 노드마다 하나를 고름.
+**백엔드(Backend)** — 그래프 연산의 구체적 실행기. 브라우저 백엔드는 세 *계층*, 네이티브 백엔드는 CPU,
+Vulkan, OpenGL/GLES, Metal, CUDA. VolvoxAI가 노드마다 하나를 고름.
 
 **역전파(Backpropagation)** — 연쇄 법칙을 연산마다 적용해, 그래프를 역순으로 걸으며 모든 가중치의 기울기를
 계산; 각 순방향 연산에 *역방향 쌍* 이 있음(4장).
@@ -75,7 +75,15 @@ NVIDIA **Driver API** 와 자기 **PTX** 커널만 씀 — cuBLAS/cuDNN/cudart �
 **CUDA 그래프(캡처/리플레이)** — 고정된 GPU 런치 순서를 한 번 녹화한 뒤, 런치별 부대비용을 크게 줄여 전체를
 다시 재생. VolvoxAI는 답을 절대 바꾸지 않는 보수적 추론 속도 향상으로 씀(9C장 §9C.7).
 
+**capacity 풀(Capacity pool)** — 컨텍스트가 재사용하는 활성값 메모리. 바인딩이 현재 가진 것보다 더
+필요할 때만 텐서 칸이 기하급수적으로 자라고, 컨텍스트가 사는 동안 줄지 않으며, 상한이 있음. 결과는
+정확한 저장소로 복사돼 나가므로 호출자가 남는 용량을 보는 일은 없음(8장 §8.6).
+
 **역양자화(Dequantize)** — int8을 실수로 변환: `r = (q − zero_point) × scale`.
+
+**차원 심볼(Dimension symbol)** — `graph.json` 안의 *이름 있고* *경계 있는* 축. 예:
+`"S": { "min": 1, "max": 256 }`. 이름이 있으므로 `S` 를 반복하면 두 크기가 같은 값임을 단언하고, 경계가
+있으므로 최악 크기를 계산할 수 있음. 두 성질 모두 필요함 — **shape 도메인** 항목 참고(1·2·8장).
 
 **dlopen / dlsym** — 공유 라이브러리를 로드하고 그 함수를 *실행 시점* 에 찾음(링크 시점 아님). VolvoxAI
 네이티브 바이너리가 GPU 드라이버(`libvulkan`, `libGL`)를 어떤 GPU SDK 링크 없이 쓰는 방법 — "정적 GPU
@@ -110,7 +118,8 @@ NVIDIA **Driver API** 와 자기 **PTX** 커널만 씀 — cuBLAS/cuDNN/cudart �
 **그래디언트 체크포인팅(Gradient checkpointing)** — 순방향 활성화 일부만 저장하고 나머지는 역전파 중에
 *재계산* 해, 추가 계산과 훨씬 낮은 메모리를 맞바꾸는 것(4장).
 
-**그래프(Graph)** — 모델의 연산 목록: 이름 붙은 텐서로 연결된 노드(연산). `graph.json` 으로 저장.
+**그래프(Graph)** — 모델의 연산 목록: 이름 붙은 텐서로 연결된 노드(연산), 그리고 **shape 도메인** 을
+선언하는 `dimensions` 표. `graph.json` 으로 저장.
 
 **헤드(Head)** — 마지막 과제별 층: LM 헤드(→ 어휘 로짓) 또는 탐지기의 클래스/박스 헤드.
 
@@ -137,6 +146,14 @@ ExecutionContext가 소유하고 context.decode.seed(), step(), reset() 으로 �
 
 **MBConv** — 모바일 역병목 conv 블록: 확장 → 뎁스와이즈 → 투영, 잔차 포함. 백본의 반복 단위.
 
+**Model / CompiledModel / ExecutionContext / ExecutionResult** — 런타임 수명주기. 뒤로 갈수록 공유
+범위가 좁은 상태를 소유함. **Model** 은 불변 스냅숏(토폴로지, 형태 제약, 고정 가중치)이며 "현재 형태"를
+결코 갖지 않음. **CompiledModel** 은 선택된 프로바이더 하나와 shape 도메인 전체에 대한 증명을 더함.
+**ExecutionContext** 는 현재 shape 바인딩·plan 캐시·capacity 풀을 비공개로 소유하므로, 두 컨텍스트가
+서로 다른 형태를 동시에 돌릴 수 있음. **ExecutionResult** 는 컨텍스트 재사용보다 오래 사는 출력 저장소를
+소유함. 네이티브가 이를 그대로 반영:
+`VxRuntime → VxModel → VxCompiledModel → VxExecutionContext → VxResult`(8·9장).
+
 **NHWC / NCHW** — 텐서 차원 순서(배치, 높이, 너비, 채널) 대 (배치, 채널, 높이, 너비). VolvoxAI 비전 모델은
 NHWC를 씀.
 
@@ -146,10 +163,16 @@ NHWC를 씀.
 
 **NMS(비최대 억제)** — 겹치는 중복 탐지를 제거하고 객체별 최고 점수 박스를 남기는 후처리.
 
-**NNAPI** — Android 신경망 API; VolvoxAI 네이티브 엔진이 Android에서 여기로 디스패치 가능
-(`native/src/backends/nnapi_engine.c`; Android NDK CMake 툴체인으로 빌드).
+**노드(Node)** — 그래프의 한 항목: 연산 + 그 입력/출력 텐서 이름 + 파라미터. `id` 는 *노드* 를
+가리키고 `outputs` 아래 이름은 *그 노드가 쓰는 텐서* 를 가리킴 — 서로 다른 것.
 
-**노드(Node)** — 그래프의 한 항목: 연산 + 그 입력/출력 텐서 이름 + 파라미터.
+**패딩(Padding, shape padding)** — 정적 그래프가 받아들이도록 모든 요청을 고정 최대 형태로 부풀리던,
+동적 shape 이전의 우회책. 존재하지도 않는 데이터에 실제 계산과 메모리를 씀. **차원 심볼** 을 실제 크기에
+바인딩하면 사라짐(2장 §2.3).
+
+**plan 캐시(Plan cache)** — 컨텍스트마다 두는, 해석된 shape plan의 LRU. 정확한 **shape 서명** 을 키로
+하고 항목 수와 메타데이터 바이트 양쪽으로 제한됨. 적중하면 심볼 바인딩과 그래프 전역 형태 추론을
+건너뜀(8장 §8.6).
 
 **연산/Operation/커널(Op / Operation / Kernel)** — 하나의 수학 루틴(Add, Conv2D, SDPA…). "연산" 은 그래프
 수준 이름; "커널" 은 그것의 특정 구현.
@@ -176,6 +199,17 @@ VolvoxAI의 CUDA 백엔드는 각 호스트 포인터를 디바이스 슬롯에 
 
 **Safetensors** — 가중치의 표준 바이너리 파일 형식.
 
+**shape 바인딩(Shape binding)** — 요청의 실제 입력에서 각 차원 심볼에 구체 값 하나를 부여하는 것
+(`tokens [1,6]` → `S = 6`). 백엔드 상태를 건드리기 전에 검증되고 원자적으로 커밋됨(8장 §8.6).
+
+**shape 도메인(Shape domain)** — 그래프가 받아들인다고 선언한 형태 전체이며, `dimensions` 표가 정함.
+컴파일은 샘플 형태 하나가 아니라 *도메인 전체* 에 대해 동작하는 경로를 증명해야 함 — "실행 시점의 조용한
+폴백 없음"이 가능한 이유(8장 §8.1).
+
+**shape 서명(Shape signature)** — 구체 입력 형태 집합 하나를 식별하는 정규 문자열. 예:
+`v1|9:positions|2:1,6|6:tokens|2:1,6`. **plan 캐시** 의 정확성 키이며, 조회에 해시를 쓸 수는 있어도
+형태 동일성을 성립시키는 데 쓰면 안 됨.
+
 **스케일 / 제로포인트(Scale / Zero-point)** — 양자화 레시피의 두 숫자: 눈금 크기, 그리고 어느 정수가 실수 0을
 뜻하는지.
 
@@ -196,8 +230,9 @@ prefix/row 함수를 노출하지 않음.
 
 **텐서(Tensor)** — 형태를 지닌 다차원 숫자 배열; 엔진의 유일한 자료형.
 
-**계층(Tier)** — VolvoxAI의 브라우저 프로바이더(WebNN / WebGPU / WASM / CPU) 중 하나로,
-`Runtime.compile(snapshot, policy)` 에서 선택하고 고정함.
+**계층(Tier)** — VolvoxAI의 브라우저 프로바이더(`webgpu` / `wasm` / `cpu-js`) 중 하나로,
+`Runtime.compile(snapshot, policy)` 에서 선택하고 고정함. 네이티브 엔진의 CPU 백엔드는 별개이며 이름은
+여전히 `cpu` 임.
 
 **토큰(Token)** — 정수 id에 매핑된 텍스트 조각(단어/서브워드/바이트).
 
@@ -242,11 +277,11 @@ prefix/row 함수를 노출하지 않음.
 4. **두 모델의 설계도** — `models/tinystories_1m/graph.json` 과
    `models/efficientdet_lite0_fp32/graph.json` 을 훑고 2–3장의 노드와 맞추기.
 5. **어텐션 + conv 커널** — `ts/ops/sDPA.ts`, `ts/ops/conv2D.ts`.
-6. **양자화** — `ts/ops/dequantizeLinear.ts`, 그다음 `native/src/kernels/quant_cpu_opt.c`.
-7. **최적화** — `ts/ops/conv2D.ts` 를 `native/src/kernels/conv_f32_opt.c` 와 diff하며
+6. **양자화** — `ts/ops/dequantizeLinear.ts`, 그다음 `native/src/kernels/quant_cpu_isa.c`.
+7. **최적화** — `ts/ops/conv2D.ts` 를 `native/src/kernels/conv_f32_isa.c` 와 diff하며
    `docs/microkernel_optimization_guide.md` 와 `docs/xnnpack_optimization_guide.md` 읽기.
 8. **GPU 계층** — `shaders/{inference,training}/*.wgsl` 과 `ts/backends/GraphExecutor.ts`.
-9. **네이티브 엔진**(9장) — `native/include/volvoxai.h` + `native/src/runtime/engine.c`,
+9. **네이티브 엔진**(9장) — `native/include/volvoxai.h` + `native/src/runtime/engine_state.c`,
    `native/src/runtime/engine_runtime.c`(`run_node`), 그다음 `native/src/backends/vulkan_engine.c`(맨 위
    `dlopen` 보기). `native/cli/main.c` 는 고정 러너, `examples/native_task_cli/main.c` 는 옵트인 과제
    래퍼.
@@ -336,8 +371,8 @@ node bin/volvox.js run --model models/tinystories_1m/model.safetensors --backend
 학습-연구 커리큘럼이 아닙니다.
 
 > 🔬 **엔진 빈틈 vs. 이 목록.** 위 표는 *능력 수준* 입니다. 이미 할 일 목록에 있는 구체적이고 단기적인
-> **엔진** 빈틈 — 빠진 GPU/WebNN 연산 커버리지, INT4 가중치, 브라우저 스트리밍 헬퍼, 패리티/벤치마크
-> 하니스 — 은 살아있는 [`docs/roadmap.md`](../../roadmap.md) 를 보세요.
+> **엔진** 빈틈 — 빠진 GPU 연산 커버리지, INT4 가중치, 브라우저 스트리밍 헬퍼, 패리티/벤치마크
+> 하니스 — 은 살아있는 [`TODO.md`](../../../TODO.md) 를 보세요.
 
 ---
 
@@ -345,7 +380,7 @@ node bin/volvox.js run --model models/tinystories_1m/model.safetensors --backend
 
 자연스러운 다음 단계는 두 갈래로 나뉩니다:
 
-- **이 저장소의 추론 경로 깊이 파기.** `native/src/kernels/conv_f32_opt.c` 를 구글 **XNNPACK** 과 비교;
+- **이 저장소의 추론 경로 깊이 파기.** `native/src/kernels/conv_f32_isa.c` 를 구글 **XNNPACK** 과 비교;
   저장소의 `docs/xnnpack_optimization_guide.md` 가 안내 투어입니다. 그다음
   `shaders/{inference,training}/*.wgsl` 과 네이티브 GPU 백엔드를 살피세요.
 - **트랜스포머 키우기.** GPT-2/3, LLaMA, Mistral, Qwen은 2장의 그래프를 넓고/깊게 한 것에 변형을 더한

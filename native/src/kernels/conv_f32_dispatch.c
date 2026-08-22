@@ -2,7 +2,7 @@
  * Runtime ISA selection for the FP32 convolution kernels.
  *
  * Owns the unsuffixed conv entry points and forwards each to the highest-ISA
- * copy of conv_f32_opt.c the CPU actually supports.  See conv_f32_opt.h for why
+ * copy of conv_f32_isa.c the CPU actually supports.  See conv_f32_isa.h for why
  * the kernels are built as one translation unit per ISA.
  *
  * The choice is a single load from the resolved platform record, so it costs a
@@ -12,7 +12,7 @@
  * scalar behaviour from the same binary, which is what makes the two paths
  * comparable in benchmark_kernel_unit without a rebuild.
  */
-#include "conv_f32_opt.h"
+#include "conv_f32_isa.h"
 #include "kernel_platform.h"
 
 /* Both copies exist in every x86 binary; on other architectures only the
@@ -26,12 +26,12 @@
 
 #define VX_CONV_F32_ENTRY(ret, name, params, args) ret name##_baseline params;
 #define VX_CONV_F32_ENTRY_VOID(ret, name, params, args) ret name##_baseline params;
-#include "conv_f32_opt_entrypoints.h"
+#include "conv_f32_isa_entrypoints.h"
 
 #if VX_CONV_F32_HAVE_AVX2_COPY
 #define VX_CONV_F32_ENTRY(ret, name, params, args) ret name##_avx2 params;
 #define VX_CONV_F32_ENTRY_VOID(ret, name, params, args) ret name##_avx2 params;
-#include "conv_f32_opt_entrypoints.h"
+#include "conv_f32_isa_entrypoints.h"
 #endif
 
 #if VX_CONV_F32_HAVE_AVX2_COPY
@@ -51,4 +51,4 @@
 #define VX_CONV_F32_ENTRY_VOID(ret, name, params, args) \
     ret name params { name##_baseline args; }
 #endif
-#include "conv_f32_opt_entrypoints.h"
+#include "conv_f32_isa_entrypoints.h"

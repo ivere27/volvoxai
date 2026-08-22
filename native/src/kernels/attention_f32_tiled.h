@@ -303,17 +303,17 @@ static VX_SDPA_TARGET_AVX2 void vx_attention_tiled_avx2(
                                             keep_high = _mm256_setzero_ps();
                                         }
                                     } else if (mask_mode == 2) {
-                                        float per_lane[VX_ATTN_MR];
+                                        int32_t per_lane[VX_ATTN_MR];
                                         int lane;
                                         for (lane = 0; lane < VX_ATTN_MR; lane++)
                                             per_lane[lane] =
                                                 (lane < mr &&
                                                  mask[(long)(q0 + lane) * seq_kv +
-                                                      key]) ? -1.0f : 0.0f;
+                                                      key]) ? -1 : 0;
                                         keep_low = _mm256_and_ps(keep_low,
-                                            _mm256_loadu_ps(per_lane));
+                                            _mm256_castsi256_ps(_mm256_loadu_si256((const __m256i*)per_lane)));
                                         keep_high = _mm256_and_ps(keep_high,
-                                            _mm256_loadu_ps(per_lane + 8));
+                                            _mm256_castsi256_ps(_mm256_loadu_si256((const __m256i*)(per_lane + 8))));
                                     } else if (mask_mode != 0) {
                                         keep_low = _mm256_setzero_ps();
                                         keep_high = _mm256_setzero_ps();

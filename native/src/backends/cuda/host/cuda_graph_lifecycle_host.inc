@@ -3,7 +3,7 @@ void cuda_graph_reset(void) {
      * selected route is CPU.  A fresh CPU engine has no CUDA state and
      * therefore cannot own graph slots that need releasing. */
     if (!cuda_context_state_get()) return;
-    graph_release_slots();
+    (void)graph_release_slots();
     free(cuda_shape_signature);
     cuda_shape_signature = NULL;
     cuda_domain_span_count = 0;
@@ -27,13 +27,14 @@ void cuda_graph_reset(void) {
 
 void cuda_graph_begin_runtime_forward(int replay_eligible,
                                       uint64_t model_generation) {
+    CudaReplayState* selected = NULL;
     const char* current_shape_signature =
         cuda_shape_signature ? cuda_shape_signature : "";
     if (cuda_forward_scope_active) {
         cuda_forward_context_failed = 1;
         return;
     }
-    if (cuda_domain_enforced) replay_eligible = 0;
+    cuda_replay_last_forward_hit = 0;
     memset(&cuda_forward_context_guard, 0,
            sizeof(cuda_forward_context_guard));
     cuda_forward_scope_active = 1;
@@ -55,6 +56,17 @@ void cuda_graph_begin_runtime_forward(int replay_eligible,
      * execute every forward kernel directly for an honest complete scope. */
     if (cuda_profile.enabled) replay_eligible = 0;
 #endif
+    if (!replay_eligible || !cuda_graph_api_available || !model_generation) {
+        cuda_replay_clear_all_plans_current(1);
+        cuda_replay.pass = CUDA_REPLAY_PASS_INELIGIBLE;
+        return;
+    }
+    selected = cuda_replay_select_plan_current(
+        current_shape_signature, model_generation);
+    if (!selected) {
+        cuda_replay.pass = CUDA_REPLAY_PASS_INELIGIBLE;
+        return;
+    }
     cuda_replay.pass = CUDA_REPLAY_PASS_INELIGIBLE;
     cuda_replay.prepared = 0;
     cuda_replay.capture_active = 0;
@@ -63,19 +75,6 @@ void cuda_graph_begin_runtime_forward(int replay_eligible,
     cuda_replay.prestaging = 0;
     cuda_replay.launch_index = 0;
     memset(cuda_replay.pass_writes, 0, sizeof(cuda_replay.pass_writes));
-    if (!replay_eligible || !cuda_graph_api_available || !model_generation) {
-        cuda_replay_clear_plan_current(1);
-        return;
-    }
-    if (cuda_replay.plan != CUDA_REPLAY_PLAN_EMPTY &&
-        (cuda_replay.generation != model_generation ||
-         cuda_replay.slot_epoch != graph_slot_epoch ||
-         cuda_replay.shape_generation != cuda_shape_generation ||
-         cuda_replay.capacity_generation != cuda_capacity_generation ||
-         !cuda_replay.shape_signature ||
-         strcmp(cuda_replay.shape_signature,
-                current_shape_signature)))
-        cuda_replay_clear_plan_current(1);
     if (cuda_replay.plan == CUDA_REPLAY_PLAN_READY &&
         cuda_replay.executable) {
         cuda_replay.pass = CUDA_REPLAY_PASS_VALIDATE;
@@ -85,11 +84,6 @@ void cuda_graph_begin_runtime_forward(int replay_eligible,
         cuda_replay.pass = CUDA_REPLAY_PASS_CAPTURE;
         return;
     }
-    cuda_replay_clear_plan_current(0);
-    cuda_replay.generation = model_generation;
-    cuda_replay.shape_generation = cuda_shape_generation;
-    cuda_replay.capacity_generation = cuda_capacity_generation;
-    cuda_replay.shape_signature = current_shape_signature;
     cuda_replay.pass = CUDA_REPLAY_PASS_OBSERVE;
 }
 
@@ -105,12 +99,9 @@ int cuda_graph_prepare_runtime_forward(void) {
         cuda_replay.pass == CUDA_REPLAY_PASS_VALIDATE) {
         const char* current_shape_signature =
             cuda_shape_signature ? cuda_shape_signature : "";
-        if (cuda_replay.slot_epoch != graph_slot_epoch ||
-            cuda_replay.shape_generation != cuda_shape_generation ||
-            cuda_replay.capacity_generation != cuda_capacity_generation ||
-            !cuda_replay.shape_signature ||
-            strcmp(cuda_replay.shape_signature,
-                   current_shape_signature)) {
+        if (!cuda_replay_plan_exact_key_matches(
+                &cuda_replay, current_shape_signature,
+                cuda_replay.generation)) {
             cuda_replay_fail();
             return -1;
         }
@@ -139,7 +130,7 @@ int cuda_graph_prepare_runtime_forward(void) {
             /* Graph replay is an optimization. A driver that exports the API
              * but cannot capture this stream falls back before any kernel was
              * withheld, leaving this forward fully executable. */
-            cuda_replay_clear_plan_current(1);
+            cuda_replay_clear_all_plans_current(1);
             cuda_graph_api_available = 0;
             cuda_replay.pass = CUDA_REPLAY_PASS_INELIGIBLE;
             cuda_replay.failed = 0;
@@ -148,6 +139,7 @@ int cuda_graph_prepare_runtime_forward(void) {
             return 0;
         }
         cuda_replay.capture_active = 1;
+        cuda_replay_capture_total++;
 #if defined(VOLVOXAI_CUDA_TESTING)
         cuda_graph_capture_count++;
 #endif
@@ -199,15 +191,19 @@ int cuda_graph_end_runtime_forward(int forward_ok) {
                 int instantiated = cuda_ok(p_cuGraphInstantiateWithFlags(
                         &cuda_replay.executable, captured, 0),
                     "cuGraphInstantiateWithFlags");
-                (void)p_cuGraphDestroy(captured);
-                cuda_replay.captured_graph = NULL;
-                if (!instantiated || !cuda_replay.executable ||
+                int graph_destroyed = p_cuGraphDestroy &&
+                    cuda_ok(p_cuGraphDestroy(captured), "cuGraphDestroy");
+                if (graph_destroyed)
+                    cuda_replay.captured_graph = NULL;
+                if (!instantiated || !graph_destroyed ||
+                    !cuda_replay.executable ||
                     !cuda_ok(p_cuGraphLaunch(cuda_replay.executable,
                                             cuda_stream),
                              "cuGraphLaunch")) {
                     failed = 1;
                     cuda_replay_clear_plan_current(1);
                 } else {
+                    cuda_replay_launch_total++;
 #if defined(VOLVOXAI_CUDA_TESTING)
                     cuda_graph_launch_count++;
 #endif
@@ -234,6 +230,7 @@ int cuda_graph_end_runtime_forward(int forward_ok) {
                 failed = 1;
                 cuda_replay_clear_plan_current(1);
             } else {
+                cuda_replay_launch_total++;
 #if defined(VOLVOXAI_CUDA_TESTING)
                 cuda_graph_launch_count++;
                 cuda_graph_replay_count++;
@@ -242,6 +239,9 @@ int cuda_graph_end_runtime_forward(int forward_ok) {
                 if (!synchronized) {
                     failed = 1;
                     cuda_replay_clear_plan_current(1);
+                } else {
+                    cuda_replay_hit_total++;
+                    cuda_replay_last_forward_hit = 1;
                 }
             }
         } else {

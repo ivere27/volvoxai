@@ -443,9 +443,9 @@ function workloads() {
 
 async function main() {
   rejectUnknownArguments();
-  const backend = argument('backend', 'cpu');
-  if (backend !== 'cpu' && backend !== 'wasm') {
-    throw new Error("--backend must be 'cpu' or 'wasm'; use the browser WebGPU harness for webgpu");
+  const backend = argument('backend', 'cpu-js');
+  if (backend !== 'cpu-js' && backend !== 'wasm') {
+    throw new Error("--backend must be 'cpu-js' or 'wasm'; use the browser WebGPU harness for webgpu");
   }
   const samples = integerArgument('samples', 15, 3, 1001);
   const warmup = integerArgument('warmup', 3, 0, 1000);

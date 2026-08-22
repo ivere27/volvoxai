@@ -110,7 +110,7 @@ to that Trainer, never to an inference context.
 
 ```javascript
 const trainer = await VolvoxAI.createTrainer(sourceSnapshot, {
-  backend: 'cpu',
+  backend: 'cpu-js',
 });
 
 const step = await trainer.trainStep({

@@ -71,6 +71,20 @@ typedef int (*VxQMaskedMeanI8U8Fn)(const void*, const int32_t*, void*, uint32_t,
                                    uint32_t, float, int32_t, float, int32_t,
                                    uint32_t, uint32_t);
 
+/*
+ * Move `rows` rows between two resident buffers, choosing them by index.
+ *
+ * `mode` 0 gathers (index selects the source of destination row i), 1 scatters
+ * (index selects the destination of source row i). A negative index zeroes the
+ * destination row on a gather and skips the row on a scatter, which are a
+ * lane's padding and a parked lane respectively.
+ */
+typedef int (*VxRowIndexTransferFn)(const void* source, size_t source_bytes,
+                                    const int32_t* indices, uint32_t rows,
+                                    void* destination, size_t destination_bytes,
+                                    uint32_t row_words, uint32_t indexed_rows,
+                                    uint32_t mode);
+
 typedef struct {
     VxQLinearI8U8Fn qlinear_i8u8;
     VxQBatchMatMulI8U8Fn qbatch_matmul_i8u8;
@@ -85,6 +99,17 @@ typedef struct {
     /* Optional query-window entry. Backends without resident incremental
      * execution leave this null and retain their established CPU boundary. */
     VxQSdpaRangeI8U8Fn qsdpa_range_i8u8;
+    /*
+     * Optional device row gather/scatter, which is what a *batched* row step
+     * needs and a scalar one does not: a batch names its rows as a set, and a
+     * set has no binding that expresses it. A backend that leaves this null
+     * declines the batch and the host runs it -- correct, and the boundary
+     * every backend had before this existed.
+     *
+     * Rows are measured in words so the entry says nothing about what a row
+     * contains; the caller turns a width and a dtype into `row_words`.
+     */
+    VxRowIndexTransferFn row_index_transfer;
     VxQArgMaxI8U8Fn qargmax_i8u8;
     VxQMaskedMeanI8U8Fn qmaskedmean_i8u8;
     VxCopyI8U8Fn requantize_linear_i8u8;

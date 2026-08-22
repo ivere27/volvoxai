@@ -2,8 +2,8 @@ import { CPUEngine } from '../backends/CPUEngine.js';
 import type { RuntimeGraph } from '../core/RuntimeGraph.js';
 import type { Tensor } from '../core/Tensor.js';
 import { normalizeSpatialPair } from '../ops/spatialParameters.js';
-import { geluApproximation, geluDerivative } from '../ops/gELU.js';
-import { _cpuAttentionMask } from '../ops/sDPA.js';
+import { geluApproximation, geluDerivative } from '../ops/gelu.js';
+import { _cpuAttentionMask } from '../ops/sdpa.js';
 import { _cpuDropout, dropoutContext, dropoutMultiplier } from '../ops/dropout.js';
 import { attentionDropout, attentionProbabilityIndex } from '../ops/attentionDropout.js';
 import {
@@ -167,6 +167,100 @@ function concatInputEntries(node) {
       return left.localeCompare(right);
     }));
   return entries;
+}
+
+/**
+ * Backward for the two-activation `BatchMatMul`.
+ *
+ * `Linear`/`MatMul` backward covers the static-RHS form, where the right
+ * operand is an immutable weight. Attention contracts two live activations
+ * instead, so both operands need a gradient and a batch axis broadcast in the
+ * forward has to be summed back here. Batch offsets are computed exactly as
+ * the forward kernel does, so a broadcast operand contributes stride 0 and
+ * therefore accumulates across every batch it was shared with.
+ */
+function backwardBatchMatMul(node, go, grads) {
+  const a = node.inputs.a;
+  const b = node.inputs.b;
+  const out = firstOutput(node);
+  if (a?.dtype !== "float32" || b?.dtype !== "float32" || out?.dtype !== "float32" ||
+      !a.buffer || !b.buffer || !a.shape || !b.shape || !out.shape) {
+    backwardFailure(node, "BatchMatMul backward requires two F32 activation operands and one F32 output");
+  }
+  if (a.shape.length < 2 || b.shape.length < 2 || out.shape.length < 2) {
+    backwardFailure(node, "BatchMatMul backward requires rank >= 2 operands");
+  }
+  const batchRank = out.shape.length - 2;
+  const m = out.shape[batchRank];
+  const n = out.shape[batchRank + 1];
+  const k = a.shape[a.shape.length - 1];
+  if (a.shape[a.shape.length - 2] !== m || b.shape[b.shape.length - 2] !== k ||
+      b.shape[b.shape.length - 1] !== n) {
+    backwardFailure(node, `operand shapes [${a.shape}] x [${b.shape}] do not contract to [${out.shape}]`);
+  }
+  const outputBatch = out.shape.slice(0, batchRank);
+  const padded = (shape) => {
+    const batch = shape.slice(0, shape.length - 2);
+    return [...new Array(batchRank - batch.length).fill(1), ...batch];
+  };
+  const paddedA = padded(a.shape);
+  const paddedB = padded(b.shape);
+  if (paddedA.length !== batchRank || paddedB.length !== batchRank) {
+    backwardFailure(node, "an operand batch rank exceeds the output batch rank");
+  }
+  for (let axis = 0; axis < batchRank; axis++) {
+    if ((paddedA[axis] !== 1 && paddedA[axis] !== outputBatch[axis]) ||
+        (paddedB[axis] !== 1 && paddedB[axis] !== outputBatch[axis])) {
+      backwardFailure(node, `batch axis ${axis} does not broadcast to [${outputBatch}]`);
+    }
+  }
+  const batchCount = elementCount(outputBatch);
+  if (a.buffer.length !== elementCount(paddedA) * m * k ||
+      b.buffer.length !== elementCount(paddedB) * k * n ||
+      go.length !== batchCount * m * n) {
+    backwardFailure(node, "BatchMatMul backward storage does not match its shapes");
+  }
+  const strides = (shape) => {
+    const result = new Array(batchRank);
+    let stride = 1;
+    for (let axis = batchRank - 1; axis >= 0; axis--) {
+      result[axis] = stride;
+      stride *= shape[axis];
+    }
+    return result;
+  };
+  const outputStrides = strides(outputBatch);
+  const aContiguous = strides(paddedA);
+  const bContiguous = strides(paddedB);
+  const aBatchStrides = paddedA.map((dimension, axis) =>
+    dimension === 1 && outputBatch[axis] !== 1 ? 0 : aContiguous[axis] * m * k);
+  const bBatchStrides = paddedB.map((dimension, axis) =>
+    dimension === 1 && outputBatch[axis] !== 1 ? 0 : bContiguous[axis] * k * n);
+
+  const ga = gradFor(grads, a);
+  const gb = gradFor(grads, b);
+  for (let batch = 0; batch < batchCount; batch++) {
+    let remaining = batch;
+    let aBase = 0;
+    let bBase = 0;
+    for (let axis = 0; axis < batchRank; axis++) {
+      const coordinate = Math.floor(remaining / outputStrides[axis]);
+      remaining %= outputStrides[axis];
+      aBase += coordinate * aBatchStrides[axis];
+      bBase += coordinate * bBatchStrides[axis];
+    }
+    const outputBase = batch * m * n;
+    for (let row = 0; row < m; row++) {
+      for (let column = 0; column < n; column++) {
+        const dy = go[outputBase + row * n + column];
+        if (dy === 0) continue;
+        for (let inner = 0; inner < k; inner++) {
+          ga[aBase + row * k + inner] += dy * b.buffer[bBase + inner * n + column];
+          gb[bBase + inner * n + column] += dy * a.buffer[aBase + row * k + inner];
+        }
+      }
+    }
+  }
 }
 
 function backwardConcat(node, go, grads) {
@@ -1282,7 +1376,7 @@ export class CPUAutograd {
     } else {
       await this._forward(graph, inputs, trainingDropout);
     }
-    const backendName = execution?.backend || "cpu";
+    const backendName = execution?.backend || "cpu-js";
     const backendResult = execution?.backend ? { backend: backendName } : {};
     graph.assertTopologyRevision?.(topologyRevision, `${backendName.toUpperCase()} training`);
     if (graph.weightRevision !== weightRevision) {
@@ -1398,6 +1492,8 @@ export class CPUAutograd {
             }
           }
         }
+      } else if (node.opType === "BatchMatMul") {
+        backwardBatchMatMul(node, go, grads);
       } else if (node.opType === "Embedding") {
         backwardEmbedding(node, go, grads);
       } else if (node.opType === "LayerNorm") {

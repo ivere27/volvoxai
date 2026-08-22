@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Reproducible explicit-KV benchmark matrix for TinyReceipt v1 packages.
+"""Reproducible explicit-KV benchmark matrix for TinyReceipt v2 packages.
 
 The harness compares the producer ONNX Runtime CPU path, native C CPU, and
 VolvoxAI WASM for both FP32 and static INT8.  Every measured
@@ -44,8 +44,8 @@ DYNAMIC_QUALIFICATION_SCHEMA = (
 )
 DYNAMIC_QUALIFICATION_PREFIX = "TINYRECEIPT_DYNAMIC_REBIND_QUALIFICATION "
 CANONICAL_MAX_NEW = 4
-PACKAGE_FORMAT = "volvoxai-tiny-receipt-vqa-split-kv-onnx-package-v1"
-SOURCE_FORMAT = "tiny_receipt_vqa_split_kv_onnx_v1"
+PACKAGE_FORMAT = "volvoxai-tiny-receipt-vqa-split-kv-onnx-package-v2"
+SOURCE_FORMAT = "tiny_receipt_vqa_split_kv_onnx_v2"
 IMAGE_WIDTH = 672
 IMAGE_HEIGHT = 320
 MAXIMUM_NEW_TOKENS = 191
@@ -78,7 +78,7 @@ PUBLICATION_OUTPUT_PATHS = (
     "examples/tiny_receipt_vqa/reports/explicit_kv_v1_runtime_matrix_6c.json",
 )
 USER_OWNED_PROVENANCE_EXCLUSIONS = (
-    "PLAN.md",
+    "TODO.md",
     "docs/frontier-llm-support-plan.md",
     "docs/tiny-receipt-vqa-wasm-int8-plan.md",
     "docs/wip-tinyreceipt-optimization.md",
@@ -106,7 +106,7 @@ WARMUP_ISOLATION_SCOPE = (
 )
 
 _ABI_RE = re.compile(
-    r"^\[debug\] tinyreceipt split ABI=explicit-kv-v1 routing=(runtime|specialized) "
+    r"^\[debug\] tinyreceipt split ABI=explicit-kv-v2 routing=(runtime|specialized) "
     r"decoder_output=f32_logits shape_mode=active argmax=host-first-index$",
     re.MULTILINE,
 )
@@ -1915,7 +1915,7 @@ def run_ort_sample(
             decoder_step_ms.append((time.perf_counter_ns() - started) / 1_000_000.0)
             present_length = past_length + 1
             if set(outputs) != {"logits", "present_padding_mask", *PRESENT_NAMES}:
-                raise BenchmarkFailure("ONNX decoder output signature is not explicit-KV v1")
+                raise BenchmarkFailure("ONNX decoder output signature is not explicit-KV v2")
             logits = outputs["logits"]
             next_token = int(np.argmax(logits[0, 0, :]))
             present_mask = outputs["present_padding_mask"]
@@ -3426,7 +3426,7 @@ def build_report(args: argparse.Namespace) -> dict[str, Any]:
 def parse_arguments(argv: Sequence[str] | None = None) -> argparse.Namespace:
     repository = Path(__file__).resolve().parents[3]
     parser = argparse.ArgumentParser(
-        description="Benchmark the six-entry TinyReceipt explicit-KV v1 matrix."
+        description="Benchmark the six-entry TinyReceipt explicit-KV v2 matrix."
     )
     parser.add_argument("--source", type=Path, required=True)
     parser.add_argument("--fp32-package", type=Path, required=True)

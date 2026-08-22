@@ -138,8 +138,19 @@ static int sequence_rope(Node* node) {
     int position_mode = 0;
     float theta;
     if (!input) input = sequence_input(node, "x");
+    /*
+     * Distinct buffers, stated rather than assumed.
+     *
+     * This recomputes the whole sequence on every call, including a row step
+     * that changed one token -- which is correct only because a rotation of an
+     * unchanged row reproduces that row. In place it would not: rope(rope(x))
+     * is not rope(x), so each step would rotate every retained row again. The
+     * scalar row path has always depended on this; a declared batch depends on
+     * it for every lane at once, so it is worth refusing rather than trusting.
+     */
     if (!input || !output || input->dtype != T_F32 || output->dtype != T_F32 ||
-        !input->data || !output->data || !sequence_same_shape(input, output) ||
+        !input->data || !output->data || input->data == output->data ||
+        !sequence_same_shape(input, output) ||
         (input->ndim != 2 && input->ndim != 3)) return VX_SEQUENCE_ERROR;
     rank = input->ndim;
     batch = rank == 2 ? 1 : input->shape[0];

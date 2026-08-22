@@ -239,22 +239,43 @@ model/
   model.safetensors    # 가중치: 학습된 숫자들, 표준 바이너리 형식
 ```
 
-- **`graph.json`** 은 그래프 문서입니다: 순서가 있는 노드 목록이지요. 각 노드는 자신의
-  연산, 입력/출력 텐서, 파라미터, 그리고 타입이 붙은 논리 출력 형태 단언을 이름 붙입니다. 심볼은
-  그래프 `dimensions` 표의 유한 제약을 가리키므로, 컴파일은 요청이 구체적인 값을 바인딩하기 전에
-  가능한 모든 형태를 증명할 수 있습니다. 다음은 TinyStories 노드 하나입니다:
+- **`graph.json`** 은 그래프 문서입니다. 맨 앞에서 이 모델이 어떤 형태를 받아들이는지 선언하고, 그다음
+  노드를 순서대로 나열합니다. TinyStories는 256 토큰까지 *어떤* 길이의 문장이든 받는데, 이를 이름과
+  경계를 가진 **차원 심볼(dimension symbol)** 로 적습니다:
 
   ```json
   {
-    "id": "ln1_0",
+    "format": "volvox-graph/v1",
+    "dimensions": { "S": { "min": 1, "max": 256 } },
+    "inputs": {
+      "tokens":    { "shape": [1, "S"], "dtype": "int32" },
+      "positions": { "shape": [1, "S"], "dtype": "int32" }
+    }
+  }
+  ```
+
+  🌱 `S` 는 조리법에 남겨 둔 빈칸입니다: *"실제로 주는 단어 수만큼 — 최소 1개, 최대 256개."* `S` 를 두
+  군데에 쓴다는 건 **두 곳이 같은 숫자** 라는 뜻이라, 12단어짜리 프롬프트는 어디서나 12이고, 고정된 칸을
+  채우려고 256까지 패딩할 일이 없습니다.
+
+  그다음 각 노드가 자기 연산, 입출력 텐서, 파라미터, 그리고 같은 심볼을 쓸 수 있는 타입 있는 출력 형태
+  단언을 적습니다. 다음은 실제 TinyStories 노드 하나입니다:
+
+  ```json
+  {
+    "id": "node_3",
     "opType": "LayerNorm",
     "inputs":  { "input": "hidden_0", "weight": "h.0.ln_1.weight", "bias": "h.0.ln_1.bias" },
     "outputs": {
-      "out": { "tensor": "ln1_0", "shape": [1, 256, 64], "dtype": "float32" }
+      "out": { "tensor": "ln1_0", "shape": [1, "S", 64], "dtype": "float32" }
     },
     "params": { "eps": 1e-05, "d_model": 64 }
   }
   ```
+
+  🔧 `id` 와 출력 `tensor` 이름은 서로 다른 것입니다: `node_3` 은 *노드* 를 가리키고, `ln1_0` 은 *그
+  노드가 쓰는 텐서* 의 이름입니다. 모든 심볼이 이름과 경계를 함께 가지므로, 컴파일은 요청이 오기 전에
+  `1..256` 의 모든 길이에 대해 동작하는 경로를 **한 번에** 증명할 수 있습니다 — 8장의 주제입니다.
 
 - **`model.safetensors`** 는 원시 가중치 텐서(`h.0.ln_1.weight`, `wte.weight`, …)를
   [safetensors](https://github.com/huggingface/safetensors) 형식으로 담습니다 — ML 세계 전반에서
@@ -278,7 +299,7 @@ PyTorch나 ONNX Runtime 의존성 없이 말이지요. 프로바이더는 그 �
 
 ---
 
-## 1.6 하나의 모델, 실행하는 네 가지 방법 ("계층")
+## 1.6 하나의 모델, 실행하는 세 가지 방법 ("계층")
 
 > 🌱 **아이디어.** 같은 조리법을 다른 주방에서 요리할 수 있습니다: 빠르고 근사한 오븐, 평범한 가스레인지,
 > 아주 작은 캠핑 스토브 — 요리는 똑같이 나오고, 속도만 빠르거나 느릴 뿐입니다. VolvoxAI는 *같은* 모델을
@@ -294,20 +315,19 @@ flowchart TD
     G["그래프 + 가중치"] --> S["Model"]
     R["VolvoxAI.createRuntime"] --> SEL{"Runtime.compile(snapshot)<br/>백엔드 정책 적용"}
     S --> SEL
-    SEL -->|브라우저 NPU/GPU| T1["Tier 1 · WebNN"]
-    SEL -->|브라우저 GPU| T2["Tier 2 · WebGPU<br/>WGSL 컴퓨트 셰이더"]
-    SEL -->|모든 CPU, 빠름| T3["Tier 3 · WASM SIMD<br/>컴파일된 C 커널"]
-    SEL -->|모든 CPU, 항상 동작| T4["Tier 4 · 순수 JS<br/>참조 커널"]
-    N["네이티브 바이너리 · C<br/>Vulkan/OpenGL/Metal/CPU"] -.같은 설계도.-> G
+    SEL -->|브라우저 GPU| T1["Tier 1 · WebGPU<br/>WGSL 컴퓨트 셰이더"]
+    SEL -->|모든 CPU, 빠름| T2["Tier 2 · WASM SIMD<br/>컴파일된 C 커널"]
+    SEL -->|모든 CPU, 항상 동작| T3["Tier 3 · 순수 JS<br/>참조 커널"]
+    N["네이티브 바이너리 · C<br/>Vulkan/OpenGL/CUDA/Metal/CPU"] -.같은 설계도.-> G
 ```
 
-- **Tier 4 (순수 JS, `ts/ops/*.ts`)** 는 *참조(reference)* 입니다: 느리지만 명백히 올바르며, 다른 모든
+- **Tier 3 (순수 JS, `ts/ops/*.ts`)** 는 *참조(reference)* 입니다: 느리지만 명백히 올바르며, 다른 모든
   계층이 대조하는 기준(ground truth)입니다. **가장 읽기 쉬워서 이 책의 교재로 사용합니다.**
-- **Tier 3 (WASM)** 은 같은 수학을 컴파일된 C로 실행해 크게 빨라집니다.
-- **Tier 2 (WebGPU)** 는 각 연산을 GPU 컴퓨트 셰이더(`shaders/{inference,training}/*.wgsl`)로 다시 표현합니다.
-- **Tier 1 (WebNN)** 은 그래프를 브라우저 자체의 신경망 API에 넘깁니다(NPU에 도달할 수 있음).
+- **Tier 2 (WASM)** 은 같은 수학을 컴파일된 C로 실행해 크게 빨라집니다.
+- **Tier 1 (WebGPU)** 는 각 연산을 GPU 컴퓨트 셰이더(`shaders/{inference,training}/*.wgsl`)로 다시 표현합니다.
 - **네이티브**(`native/`)는 데스크톱, 폰, 또는 로봇에서 *같은* 설계도를 실행하는 독립 C 프로그램이며,
-  선택적으로 Vulkan/OpenGL/Metal 위에서 돕니다. **온디바이스 / 엣지 AI** 로 가는 길이며, 9장의 주제입니다.
+  선택적으로 Vulkan/OpenGL/CUDA/Metal 위에서 돕니다. CUDA는 옵트인 수동 커널 백엔드입니다(순방향 추론,
+  그리고 full 빌드에서는 학습까지; 9C장 참고). **온디바이스 / 엣지 AI** 로 가는 길이며, 9장의 주제입니다.
 
 > 🔬 **뜯어보기: 계층은 어떻게 선택되고, 왜 답은 그대로인가.**
 > `VolvoxAI.createRuntime({ backends })` 는 선택한 공급자를 초기화합니다.
@@ -316,6 +336,35 @@ flowchart TD
 > 공급자로 바꾸지 않습니다. 모든 계층이 *속도* 는 달라도 *답* 은 다르지 않은 이유는 순수 JS CPU가
 > **참조** 이고, 패리티 하니스가 다른 모든 계층 — 그리고 9장의 네이티브 공급자 — 을 그것과 좁은
 > 허용오차 안에서 대조하기 때문입니다. "같은 설계도, 같은 답, 여러 주방"은 시험되는 계약입니다.
+
+🔧 처음부터 끝까지, TinyStories를 토큰 여섯 개로 돌리는 코드는 이만큼입니다:
+
+```javascript
+import { Model, VolvoxAI } from 'volvoxai';
+
+const runtime  = await VolvoxAI.createRuntime({ backends: ['webgpu', 'wasm', 'cpu-js'] });
+const snapshot = await Model.load('./models/tinystories_1m/model.safetensors');
+const compiled = await runtime.compile(snapshot, {
+  backend: { mode: 'prefer', order: ['webgpu', 'wasm', 'cpu-js'], operatorFallback: 'allow' },
+});
+const context  = await compiled.createContext();
+
+const result = await context.execute({
+  tokens:    { data: Int32Array.from([7454, 2402, 257, 640, 11, 20037]), shape: [1, 6] },
+  positions: { data: Int32Array.from([0, 1, 2, 3, 4, 5]),                shape: [1, 6] },
+});
+const logits = await result.output('logits').read();
+
+await result.close();
+await context.close();
+await compiled.close();
+await runtime.close();
+```
+
+모든 입력의 형태를 **짐작하지 않고 명시한다** 는 점을 보세요. `{ data, shape }` 가 필수 형식입니다 —
+엔진은 "버퍼에 int32가 6개 들었으니까"로 `[1, 6]` 을 추론하지 않습니다. 원소 6개짜리 버퍼는 `[1,6]` 일
+수도 `[6,1]` 일 수도 `[2,3]` 일 수도 있고, 그중 하나를 조용히 고르는 것이 틀린 답을 조용한 답으로 만드는
+길이니까요. 저 두 개의 `[1, 6]` 이 §1.5의 `S = 6` 을 바인딩합니다.
 
 이 책의 나머지 부분에서 "연산을 따라간다"고 할 때는, *수학이 무엇인지* 를 가장 직접적으로 말해주는
 순수 JS 또는 이식성 있는 C 버전을 읽습니다.

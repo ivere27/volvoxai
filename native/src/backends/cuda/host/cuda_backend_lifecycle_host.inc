@@ -224,6 +224,14 @@ int cuda_query_domain_limits(CudaDomainLimits* limits) {
         limits->maximum_shared_memory_per_block =
             cuda_max_shared_memory_per_block;
         limits->maximum_tensor_slots = CUDA_GRAPH_MAX_TENSORS;
+        limits->replay_plan_capacity =
+            CUDA_GRAPH_REPLAY_PLAN_CAPACITY;
+        limits->replay_fixed_host_metadata_bytes =
+            (uint64_t)sizeof(CudaReplayState) *
+                CUDA_GRAPH_REPLAY_PLAN_CAPACITY +
+            (uint64_t)sizeof(state->replay_plans) +
+            sizeof(state->replay_plan_count) +
+            sizeof(state->replay_active) + sizeof(state->replay_clock);
         ready = limits->total_memory_bytes > 0u &&
             limits->maximum_grid[0] > 0u &&
             limits->maximum_grid[1] > 0u &&
@@ -233,7 +241,10 @@ int cuda_query_domain_limits(CudaDomainLimits* limits) {
             limits->maximum_block[2] > 0u &&
             limits->maximum_threads_per_block > 0u &&
             limits->maximum_shared_memory_per_block > 0u &&
-            limits->maximum_tensor_slots > 0u;
+            limits->maximum_tensor_slots > 0u &&
+            limits->replay_plan_capacity ==
+                CUDA_GRAPH_REPLAY_PLAN_CAPACITY &&
+            limits->replay_fixed_host_metadata_bytes > 0u;
     }
     (void)pthread_mutex_unlock(&cuda_device_state.mutex);
     return ready ? 0 : -1;
@@ -374,6 +385,10 @@ uint64_t cuda_test_graph_invalidation_count(void) {
     return cuda_graph_invalidation_count;
 }
 
+uint64_t cuda_test_graph_exec_destroy_count(void) {
+    return cuda_graph_exec_destroy_count;
+}
+
 uint64_t cuda_test_slot_exact_lookup_count(void) {
     return cuda_slot_exact_lookup_count;
 }
@@ -395,13 +410,39 @@ int cuda_test_graph_domain_reservation(size_t* span_count,
                                        int* enforced,
                                        int* replay_plan) {
     CudaContextState* state = cuda_context_state_get();
+    CudaReplayState* replay;
     if (!state || !state->ready) return -1;
+    replay = state->replay_active ? state->replay_active : &state->replay;
     if (span_count) *span_count = state->domain_span_count;
     if (preload_complete)
         *preload_complete = state->invariant_preload_complete;
     if (enforced) *enforced = state->domain_enforced;
-    if (replay_plan) *replay_plan = state->replay.plan;
+    if (replay_plan) *replay_plan = replay->plan;
     return 0;
+}
+
+void cuda_test_advance_graph_slot_epoch(void) {
+    if (!cuda_forward_scope_active) graph_slot_epoch_advance();
+}
+
+void cuda_test_advance_graph_capacity_generation(void) {
+    if (!cuda_forward_scope_active)
+        cuda_capacity_generation =
+            cuda_generation_next(cuda_capacity_generation);
+}
+
+void cuda_test_mismatch_graph_replay_model_generation(void) {
+    if (cuda_forward_scope_active) return;
+    for (size_t index = 0; index < cuda_replay_plan_count; index++) {
+        CudaReplayState* replay = cuda_replay_plans[index];
+        if (replay && replay->plan != CUDA_REPLAY_PLAN_EMPTY)
+            replay->generation = cuda_generation_next(replay->generation);
+    }
+}
+
+void cuda_test_fail_next_graph_exec_destroy(void) {
+    if (!cuda_forward_scope_active)
+        cuda_test_graph_exec_destroy_failure = 1;
 }
 
 uint64_t cuda_test_graph_slot_count(void) {
@@ -495,14 +536,32 @@ int cuda_test_graph_api_available(void) {
 int cuda_test_graph_dynamic_state(const char* expected_signature,
                                   CudaGraphDynamicStateProbe* probe) {
     CudaContextState* state = cuda_context_state_get();
+    CudaReplayState* replay;
     if (!state || !probe) return -1;
+    replay = state->replay_active ? state->replay_active : &state->replay;
     memset(probe, 0, sizeof(*probe));
     probe->shape_generation = state->shape_generation;
     probe->capacity_generation = state->capacity_generation;
     probe->slot_epoch = graph_slot_epoch;
-    probe->replay_shape_generation = state->replay.shape_generation;
-    probe->replay_capacity_generation = state->replay.capacity_generation;
-    probe->replay_plan = state->replay.plan;
+    probe->replay_shape_generation = replay->shape_generation;
+    probe->replay_capacity_generation = replay->capacity_generation;
+    probe->replay_slot_epoch = replay->slot_epoch;
+    probe->replay_plan = replay->plan;
+    probe->replay_domain_enforced = replay->domain_enforced;
+    probe->replay_exact_signature_match = expected_signature &&
+        replay->shape_signature &&
+        !strcmp(expected_signature, replay->shape_signature);
+    for (size_t index = 0; index < state->replay_plan_count; index++) {
+        CudaReplayState* candidate = state->replay_plans[index];
+        if (candidate && candidate->destroy_pending) {
+            probe->replay_destroy_pending_count++;
+            continue;
+        }
+        if (!candidate || candidate->plan == CUDA_REPLAY_PLAN_EMPTY) continue;
+        probe->replay_plan_count++;
+        if (candidate->plan == CUDA_REPLAY_PLAN_READY &&
+            candidate->executable) probe->replay_ready_plan_count++;
+    }
     probe->slot_count = graph_slot_count;
     for (int index = 0; index < graph_slot_count; index++) {
         CudaTensorSlot* slot = &graph_slots[index];
@@ -531,6 +590,7 @@ int cuda_test_caller_context_is_clear(void) {
 void cuda_cleanup(void) {
     CudaContextState* state = cuda_context_state_get();
     CudaContextGuard guard;
+    int replay_handles_cleared;
     if (!state) return;
 #if VOLVOXAI_ENABLE_TRAINING
     if (cuda_training_active) cuda_training_end();
@@ -538,7 +598,19 @@ void cuda_cleanup(void) {
 #endif
     if (cuda_forward_scope_active)
         (void)cuda_graph_end_runtime_forward(0);
-    graph_release_slots();
+    replay_handles_cleared = graph_release_slots();
+    if (!replay_handles_cleared && cuda_context_enter(&guard)) {
+        replay_handles_cleared =
+            cuda_replay_clear_all_plans_current(1);
+        if (!cuda_context_leave(&guard)) replay_handles_cleared = 0;
+    }
+    /* Never issue graph-destroy calls without the owning context. A permanent
+     * Driver/context failure leaves handles owned by the context state for the
+     * existing device-loss teardown path; normal cleanup must release every
+     * handle before freeing the host cache. */
+    if (replay_handles_cleared)
+        replay_handles_cleared =
+            cuda_replay_release_cache_storage_current();
     free(cuda_shape_signature);
     cuda_shape_signature = NULL;
 #if VOLVOXAI_ENABLE_TRAINING
@@ -589,11 +661,11 @@ void cuda_cleanup(void) {
         (void)pthread_mutex_unlock(&cuda_device_state.mutex);
     }
     cuda_graph_api_available = 0;
-    memset(&cuda_replay, 0, sizeof(cuda_replay));
 #if defined(VOLVOXAI_CUDA_TESTING)
     cuda_test_transient_release_failure = 0;
     cuda_test_graph_allocation_failure = 0;
     cuda_test_graph_growth_rollback_failure = 0;
+    cuda_test_graph_exec_destroy_failure = 0;
 #endif
     memset(&cuda_forward_context_guard, 0,
            sizeof(cuda_forward_context_guard));
@@ -607,6 +679,7 @@ void cuda_cleanup(void) {
     cuda_training_context_ready = 0;
     cuda_training_failed = 0;
 #endif
+    assert(replay_handles_cleared);
 }
 
 /* Every graph slot must have released its device allocation before the owning
@@ -643,6 +716,10 @@ static void cuda_context_state_destroy(void* opaque_state) {
     assert(graph_slots_empty);
     (void)graph_slots_empty;
     assert(!state->lora_workspace);
+    assert(state->replay_plan_count == 1u);
+    assert(state->replay_active == &state->replay);
+    assert(!state->replay.shape_signature &&
+           !state->replay.captured_graph && !state->replay.executable);
 #if VOLVOXAI_ENABLE_TRAINING
     assert(!state->training_active);
     assert(!state->training_attention_workspace);

@@ -1,4 +1,4 @@
-"""Migrate one narrowly qualified GroupNorm/SiLU island to physical bytes.
+"""Migrate one narrowly qualified GroupNorm/SiLU island to bytes.
 
 Already-quantized vision graphs sometimes retain the closed region::
 

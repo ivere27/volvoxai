@@ -1,6 +1,6 @@
 // Autoregressive decode-path parity for TinyStories-1M.
 //
-//   node tests/parity/decode/decode_parity.mjs [backend ...]   # default cpu wasm; produce token seqs
+//   node tests/parity/decode/decode_parity.mjs [backend ...]   # default cpu-js wasm; produce token seqs
 //   node tests/parity/decode/decode_parity.mjs compare         # compare tiers + PyTorch greedy generate
 //
 // The whole-model campaign keeps a separate explicit [1,256] maximum-capacity
@@ -36,7 +36,7 @@ const OUT = path.join(HERE, 'out');
 const CASE_ID = 'tinystories-decode';
 const MANIFEST_FILE = path.join(OUT, 'run.json');
 const TORCH_MANIFEST_FILE = path.join(OUT, 'torch_run.json');
-const KNOWN_BACKENDS = ['cpu', 'wasm', 'webgpu'];
+const KNOWN_BACKENDS = ['cpu-js', 'wasm', 'webgpu'];
 globalThis.window ??= globalThis; globalThis.self ??= globalThis;
 globalThis.document ??= { createElement: () => ({}), querySelector: () => null };
 const nf = globalThis.fetch;
@@ -90,10 +90,10 @@ function selectedBackends(args) {
       new Set(args).size !== args.length) {
     throw new Error(`backends must be a unique subset of: ${KNOWN_BACKENDS.join(', ')}`);
   }
-  // CPU is the reference and WASM is the default required portability tier.
+  // CPU-JS is the reference and WASM is the default required portability tier.
   // Asking for WebGPU adds it to the same fresh campaign; it never reuses an
-  // earlier CPU reference.
-  return ['cpu', 'wasm', ...(args.includes('webgpu') ? ['webgpu'] : [])];
+  // earlier CPU-JS reference.
+  return ['cpu-js', 'wasm', ...(args.includes('webgpu') ? ['webgpu'] : [])];
 }
 
 function validateTokens(payload, backend) {
@@ -217,7 +217,7 @@ async function produce(backends) {
   const module = await import(pathToFileURL(path.join(ROOT, 'dist', ver, 'volvoxai.js')).href);
   fs.mkdirSync(OUT, { recursive: true });
   removeParityOutputsSync([
-    'prompt.json', 'cpu.json', 'wasm.json', 'webgpu.json', 'torch.json',
+    'prompt.json', 'cpu-js.json', 'wasm.json', 'webgpu.json', 'torch.json',
     'run.json', 'torch_run.json', 'decode_matrix.md', 'decode_matrix.json',
   ], { outputRoot: OUT });
   const fingerprint = campaignFingerprint();
@@ -317,9 +317,9 @@ function compare() {
   const selected = manifest.selection.jobs
     .filter((job) => job.case === CASE_ID && KNOWN_BACKENDS.includes(job.tier))
     .map((job) => job.tier);
-  if (!selected.includes('cpu') || !selected.includes('wasm') ||
+  if (!selected.includes('cpu-js') || !selected.includes('wasm') ||
       selected.some((tier) => !KNOWN_BACKENDS.includes(tier))) {
-    throw new Error('current decode manifest must require CPU and WASM, with optional WebGPU');
+    throw new Error('current decode manifest must require CPU-JS and WASM, with optional WebGPU');
   }
   const prompt = readRunArtifactSync('prompt.json', manifest, {
     case: CASE_ID, tier: 'prompt', outputRoot: OUT,
@@ -337,14 +337,14 @@ function compare() {
       case: CASE_ID, tier, outputRoot: OUT,
     }), tier);
   }
-  const cpu = current.cpu;
+  const cpu = current['cpu-js'];
   const rows = [];
   let fail = 0;
-  for (const tier of selected.filter((candidate) => candidate !== 'cpu')) {
+  for (const tier of selected.filter((candidate) => candidate !== 'cpu-js')) {
     const d = current[tier];
     const match = d.tokens.length === cpu.tokens.length && d.tokens.every((t, i) => t === cpu.tokens[i]);
     const firstDiff = d.tokens.findIndex((t, i) => t !== cpu.tokens[i]);
-    rows.push(`| ${tier} vs cpu | ${match ? 'MATCH' : `DIFF@${firstDiff}`} |`);
+    rows.push(`| ${tier} vs cpu-js | ${match ? 'MATCH' : `DIFF@${firstDiff}`} |`);
     if (!match) fail++;
   }
 
@@ -368,14 +368,14 @@ function compare() {
     }), 'torch');
     const match = torch.tokens.length === cpu.tokens.length && torch.tokens.every((token, i) => token === cpu.tokens[i]);
     const firstDiff = torch.tokens.findIndex((token, i) => token !== cpu.tokens[i]);
-    rows.push(`| torch vs cpu | ${match ? 'MATCH' : `DIFF@${firstDiff}`} |`);
+    rows.push(`| torch vs cpu-js | ${match ? 'MATCH' : `DIFF@${firstDiff}`} |`);
     if (!match) fail++;
   } else {
-    rows.push('| torch vs cpu | — (optional oracle absent) |');
+    rows.push('| torch vs cpu-js | — (optional oracle absent) |');
   }
   const lines = ['# Autoregressive decode-path parity (TinyStories greedy)', '',
-    `prompt ${PROMPT_LEN} tokens, ${N_NEW} new; exact token-sequence match vs pure-JS cpu (torch = external).`, '',
-    `run: ${manifest.runId}`, `cpu: ${cpu.tokens.join(',')}`, '', '| comparison | result |', '|---|---|', ...rows];
+    `prompt ${PROMPT_LEN} tokens, ${N_NEW} new; exact token-sequence match vs pure-JS cpu-js (torch = external).`, '',
+    `run: ${manifest.runId}`, `cpu-js: ${cpu.tokens.join(',')}`, '', '| comparison | result |', '|---|---|', ...rows];
   atomicWriteJsonSync('decode_matrix.json', { runId: manifest.runId, rows, fail }, { outputRoot: OUT });
   atomicWriteText(path.join(OUT, 'decode_matrix.md'), lines.join('\n') + '\n');
   console.log(lines.join('\n'));

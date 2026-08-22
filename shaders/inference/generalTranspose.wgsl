@@ -2,11 +2,14 @@
         @group(0) @binding(1) var<storage, read_write> output : array<u32>;
         @group(0) @binding(2) var<storage, read> md : array<u32>;
         @compute @workgroup_size(64)
-        fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
-            let idx = gid.x;
+        fn main(
+            @builtin(global_invocation_id) gid : vec3<u32>,
+            @builtin(num_workgroups) grid : vec3<u32>,
+        ) {
             let total = md[0];
-            if (idx >= total) { return; }
             let rank = md[1];
+            let idx = gid.x + gid.y * (grid.x * 64u);
+            if (idx >= total) { return; }
             var rem = idx;
             var in_idx = 0u;
             for (var d = 0u; d < rank; d = d + 1u) {

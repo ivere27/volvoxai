@@ -1,4 +1,4 @@
-import { _cpuAttentionMask } from './sDPA.js';
+import { _cpuAttentionMask } from './sdpa.js';
 
 export function _cpuCrossSDPA(node, execution: {
   probabilityMultiplier?: (index: number) => number;

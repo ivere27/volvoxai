@@ -25,6 +25,8 @@ _Static_assert(VX_STATUS_BACKEND_REQUIRED == -8, "protobuf status contract");
 _Static_assert(VX_STATUS_OPERATOR_FALLBACK_FORBIDDEN == -9,
                "protobuf status contract");
 _Static_assert(VX_STATUS_EXECUTION_FAILED == -10, "protobuf status contract");
+_Static_assert(VX_STATUS_DEADLINE_EXCEEDED == -21 &&
+               VX_STATUS_SUPERSEDED == -22, "runtime QoS status contract");
 _Static_assert(VX_STATUS_RESULT_DISPOSED == -11, "protobuf status contract");
 _Static_assert(VX_STATUS_DEVICE_LOST == -12, "protobuf status contract");
 _Static_assert(VX_STATUS_ABI_UNSUPPORTED == -13, "protobuf status contract");
@@ -67,10 +69,47 @@ _Static_assert(VX_MEMORY_HOST == 0 && VX_MEMORY_DEVICE == 1,
                "protobuf memory contract");
 _Static_assert(VX_DECODE_ROW_DISABLED == 0 && VX_DECODE_ROW_AUTO == 1 &&
                VX_DECODE_ROW_REQUIRED == 2, "protobuf decode contract");
+_Static_assert(VX_PROCESS_MEMORY_SAMPLE_ABI_VERSION == 1,
+               "process memory sampler ABI contract");
+_Static_assert((VX_PROCESS_MEMORY_AVAILABLE_CURRENT_RSS &
+                VX_PROCESS_MEMORY_AVAILABLE_PEAK_RSS) == 0 &&
+               (VX_PROCESS_MEMORY_AVAILABLE_CURRENT_RSS &
+                VX_PROCESS_MEMORY_AVAILABLE_MONOTONIC_TIME) == 0 &&
+               (VX_PROCESS_MEMORY_AVAILABLE_PEAK_RSS &
+                VX_PROCESS_MEMORY_AVAILABLE_MONOTONIC_TIME) == 0,
+               "process memory availability bits must be disjoint");
 
 typedef void (*VxPublicApiCpuExecuteHook)(void* user_data);
 extern void vx_public_api_test_set_cpu_execute_hook(
     VxPublicApiCpuExecuteHook hook, void* user_data);
+extern void vx_public_api_test_set_direct_route_locked_hook(
+    VxPublicApiCpuExecuteHook hook, void* user_data);
+extern void vx_public_api_test_set_latest_replace_hook(
+    VxPublicApiCpuExecuteHook hook, void* user_data);
+extern void vx_public_api_test_set_batch_delay_wait_hook(
+    VxPublicApiCpuExecuteHook hook, void* user_data);
+extern void vx_public_api_test_set_coordinator_before_select_hook(
+    VxPublicApiCpuExecuteHook hook, void* user_data);
+extern void vx_public_api_test_set_batch_after_completion_hook(
+    VxPublicApiCpuExecuteHook hook, void* user_data);
+extern void vx_public_api_test_fail_next_scheduled_snapshot(void);
+extern int vx_public_api_test_runtime_closed(const VxRuntime* runtime);
+extern int vx_public_api_test_runtime_set_input_budget(VxRuntime* runtime,
+                                                       size_t bytes);
+extern int vx_public_api_test_runtime_set_request_budget(VxRuntime* runtime,
+                                                         size_t requests);
+extern int vx_public_api_test_runtime_set_result_budget(VxRuntime* runtime,
+                                                        size_t results,
+                                                        size_t bytes);
+extern int vx_public_api_test_runtime_coordinator_allocated(
+    const VxRuntime* runtime);
+extern int vx_public_api_test_runtime_coordinator_stats(
+    const VxRuntime* runtime, size_t* active_requests,
+    size_t* active_input_bytes, uint64_t* dispatches);
+extern uintptr_t vx_public_api_test_compiled_route_context(
+    const VxCompiledModel* compiled);
+extern unsigned vx_public_api_test_compiled_scheduled_claims(
+    const VxCompiledModel* compiled);
 extern VxStatus vx_public_api_test_evaluate_builtin_route(
     const char* selected_backend,
     const char* actual_route,
@@ -84,8 +123,29 @@ extern int vx_public_api_test_cpu_typed_workspace_reconfigure(
 extern int vx_public_api_test_compiled_resource_bounds(
     const VxCompiledModel* compiled, size_t* maximum_typed_scratch_bytes,
     uint64_t* maximum_resident_bytes);
+extern int vx_public_api_test_compiled_weight_store_state(
+    const VxCompiledModel* compiled, unsigned* references,
+    size_t* file_count, uint64_t* raw_bytes,
+    uint64_t* store_allocated_bytes, uint64_t* compiled_allocated_bytes);
+extern int vx_public_api_test_compiled_weight_tensor_state(
+    const VxCompiledModel* compiled, const char* name,
+    uintptr_t* blob_address, uintptr_t* descriptor_table_address,
+    uintptr_t* data_address, VxDataType* dtype, int* first_dimension,
+    size_t* byte_size);
+extern int vx_public_api_test_context_weight_tensor_state(
+    const VxExecutionContext* context, const char* name,
+    uintptr_t* blob_address, uintptr_t* descriptor_table_address,
+    uintptr_t* stored_data_address, uintptr_t* execution_data_address,
+    VxDataType* stored_dtype, int* execution_dtype, int* execution_owns,
+    int* first_dimension, int* borrowed);
+extern int vx_public_api_test_copy_tensor(
+    const VxExecutionContext* context, const char* name,
+    void* bytes, size_t byte_size);
 extern int vx_public_api_test_native_gpu_align_resource_bytes(
     uint64_t bytes, uint64_t alignment, uint64_t* aligned_out);
+extern int vx_public_api_test_native_gpu_tensor_size_domain_proven(
+    int backend, VxDataType dtype, uint32_t rank,
+    uint64_t maximum_elements, uint64_t maximum_byte_size);
 extern int vx_public_api_test_native_gpu_immutable_components(
     uint64_t component_bytes, uint64_t component_count,
     uint64_t device_alignment, uint64_t* resident_out,
@@ -117,6 +177,9 @@ extern int vx_public_api_test_native_gpu_device_capacity_proven(
     uint64_t immutable_device_bytes, uint64_t bootstrap_device_bytes,
     uint64_t candidate_device_bytes, uint64_t hard_limit_bytes,
     uint64_t* peak_out);
+extern int vx_public_api_test_native_gpu_fixed_allocation_bound(
+    uint64_t compute_allocation_bytes, uint64_t staging_allocation_bytes,
+    uint64_t* total_out);
 extern int vx_public_api_test_native_gpu_slot_capacity_proven(
     uint64_t tensor_count, uint64_t node_count,
     uint64_t physical_span_count, uint64_t slot_limit,
@@ -128,6 +191,12 @@ extern int vx_public_api_test_native_gpu_dynamic_metadata_peak(
     uint64_t signature_bytes, uint64_t input_count,
     uint64_t logical_tensor_count, uint64_t engine_tensor_count,
     uint64_t physical_span_count, uint64_t* peak_out);
+extern int vx_public_api_test_native_gpu_cuda_replay_metadata_peak(
+    uint64_t fixed_host_metadata_bytes,
+    uint64_t maximum_signature_bytes,
+    uint64_t replay_plan_capacity,
+    uint64_t* peak_out);
+
 extern int vx_public_api_test_native_gpu_resident_capacity_proven(
     uint64_t base_bytes, uint64_t result_publication_bytes,
     uint64_t dynamic_metadata_bytes, uint64_t hard_limit_bytes,
@@ -137,6 +206,20 @@ extern int vx_public_api_test_native_gpu_dense_launch_proven(
     int quantized, int backend, uint64_t maximum_grid_x,
     uint64_t maximum_grid_y, uint64_t maximum_block_x,
     uint64_t maximum_block_y, uint64_t maximum_threads_per_block);
+extern int vx_public_api_test_native_gpu_cuda_conv2d_launch_proven(
+    uint64_t minimum_rows, uint64_t maximum_rows,
+    uint64_t input_channels, uint64_t output_channels,
+    int tiled_1x1_route, uint64_t maximum_grid_x,
+    uint64_t maximum_grid_y, uint64_t maximum_grid_z,
+    uint64_t maximum_block_x, uint64_t maximum_block_y,
+    uint64_t maximum_block_z, uint64_t maximum_threads_per_block);
+extern int vx_public_api_test_native_gpu_vom_conv2d_launch_proven(
+    uint64_t batch, uint64_t output_height, uint64_t output_width,
+    uint64_t output_channels, int groups_one, int backend,
+    uint64_t maximum_grid_x, uint64_t maximum_grid_y,
+    uint64_t maximum_grid_z, uint64_t maximum_block_x,
+    uint64_t maximum_block_y, uint64_t maximum_block_z,
+    uint64_t maximum_threads_per_block);
 extern int vx_public_api_test_native_gpu_quantized_accumulator_channel_proven(
     uint64_t terms, VxDataType input_dtype, int32_t input_zero_point,
     VxDataType weight_dtype, int32_t weight_zero_point,
@@ -149,16 +232,121 @@ extern int vx_public_api_test_native_gpu_quantized_accumulator_channel_proven(
     } \
 } while (0)
 
+static int test_process_memory_sampler(void) {
+    const uint32_t known_mask =
+        VX_PROCESS_MEMORY_AVAILABLE_CURRENT_RSS |
+        VX_PROCESS_MEMORY_AVAILABLE_PEAK_RSS |
+        VX_PROCESS_MEMORY_AVAILABLE_MONOTONIC_TIME;
+    VxProcessMemorySampleV1 sample = VX_PROCESS_MEMORY_SAMPLE_V1_INIT;
+    VxProcessMemorySampleV1 second = VX_PROCESS_MEMORY_SAMPLE_V1_INIT;
+    VxProcessMemorySampleV1 invalid;
+
+    CHECK(vx_process_memory_sample_v1(NULL) == 0);
+
+    invalid = sample;
+    invalid.struct_size = sizeof(invalid) - 1u;
+    invalid.available_mask = UINT32_MAX;
+    invalid.rss_bytes = UINT64_MAX;
+    CHECK(vx_process_memory_sample_v1(&invalid) == 0);
+    CHECK(invalid.available_mask == UINT32_MAX &&
+          invalid.rss_bytes == UINT64_MAX);
+
+    invalid = sample;
+    invalid.struct_size = sizeof(invalid) + 1u;
+    invalid.peak_rss_bytes = UINT64_MAX;
+    CHECK(vx_process_memory_sample_v1(&invalid) == 0);
+    CHECK(invalid.peak_rss_bytes == UINT64_MAX);
+
+    invalid = sample;
+    invalid.abi_version = VX_PROCESS_MEMORY_SAMPLE_ABI_VERSION + 1u;
+    invalid.monotonic_nanoseconds = UINT64_MAX;
+    CHECK(vx_process_memory_sample_v1(&invalid) == 0);
+    CHECK(invalid.monotonic_nanoseconds == UINT64_MAX);
+
+    sample.available_mask = UINT32_MAX;
+    sample.rss_bytes = UINT64_MAX;
+    sample.peak_rss_bytes = UINT64_MAX;
+    sample.monotonic_nanoseconds = UINT64_MAX;
+    CHECK(vx_process_memory_sample_v1(&sample) == 1);
+    CHECK((sample.available_mask & ~known_mask) == 0);
+    CHECK((sample.available_mask & VX_PROCESS_MEMORY_AVAILABLE_CURRENT_RSS) ||
+          sample.rss_bytes == 0);
+    CHECK((sample.available_mask & VX_PROCESS_MEMORY_AVAILABLE_PEAK_RSS) ||
+          sample.peak_rss_bytes == 0);
+    CHECK((sample.available_mask &
+           VX_PROCESS_MEMORY_AVAILABLE_MONOTONIC_TIME) ||
+          sample.monotonic_nanoseconds == 0);
+
+    CHECK(vx_process_memory_sample_v1(&second) == 1);
+    if ((sample.available_mask &
+         VX_PROCESS_MEMORY_AVAILABLE_MONOTONIC_TIME) &&
+        (second.available_mask &
+         VX_PROCESS_MEMORY_AVAILABLE_MONOTONIC_TIME))
+        CHECK(second.monotonic_nanoseconds >= sample.monotonic_nanoseconds);
+
+#if defined(__linux__)
+    /* Linux reports statm in whole pages and ru_maxrss in KiB, and every
+     * supported page size is a multiple of one KiB. The bit remains the source
+     * of truth if a restricted process environment denies procfs. */
+    if (sample.available_mask & VX_PROCESS_MEMORY_AVAILABLE_CURRENT_RSS)
+        CHECK(sample.rss_bytes % UINT64_C(1024) == 0);
+    if (sample.available_mask & VX_PROCESS_MEMORY_AVAILABLE_PEAK_RSS)
+        CHECK(sample.peak_rss_bytes % UINT64_C(1024) == 0);
+    /* A live process holds resident pages, and the process-lifetime high-water
+     * mark can never sit below the instant sample taken from the same counter.
+     * Together these catch a page/byte or KiB/byte unit error in either
+     * direction, which a modulo check alone cannot see. */
+    if (sample.available_mask & VX_PROCESS_MEMORY_AVAILABLE_CURRENT_RSS)
+        CHECK(sample.rss_bytes > 0);
+    if ((sample.available_mask & VX_PROCESS_MEMORY_AVAILABLE_CURRENT_RSS) &&
+        (sample.available_mask & VX_PROCESS_MEMORY_AVAILABLE_PEAK_RSS))
+        CHECK(sample.rss_bytes <= sample.peak_rss_bytes);
+#endif
+    return 0;
+}
+
 static int test_native_gpu_resource_peak_projection(void) {
     enum {
         TEST_BACKEND_VULKAN = 1,
         TEST_BACKEND_OPENGL = 2,
         TEST_BACKEND_METAL = 3,
-        TEST_BACKEND_CUDA = 6,
+        TEST_BACKEND_CUDA = 4,
+        TEST_CUDA_CONV_TILED_NEVER = 0,
+        TEST_CUDA_CONV_TILED_POSSIBLE = 1,
+        TEST_CUDA_CONV_TILED_FIXED = 2,
+        TEST_CUDA_CONV_TILED_INVALID = 3,
     };
     uint64_t value = 0u;
     uint64_t device_value = 0u;
     uint64_t snapshot_value = 0u;
+    const uint64_t receipt_b625_elements =
+        UINT64_C(625) * 160u * 336u * 32u;
+    const uint64_t receipt_b625_bytes =
+        receipt_b625_elements * sizeof(float);
+    CHECK(receipt_b625_elements == UINT64_C(1075200000));
+    CHECK(receipt_b625_bytes == UINT64_C(4300800000));
+    CHECK(vx_public_api_test_native_gpu_tensor_size_domain_proven(
+              TEST_BACKEND_CUDA, VX_DTYPE_F32, 4u,
+              receipt_b625_elements, receipt_b625_bytes) == 1);
+    CHECK(vx_public_api_test_native_gpu_tensor_size_domain_proven(
+              TEST_BACKEND_CUDA, VX_DTYPE_F32, 4u,
+              (uint64_t)UINT32_MAX + 1u, 1u) == 0);
+    CHECK(vx_public_api_test_native_gpu_tensor_size_domain_proven(
+              TEST_BACKEND_CUDA, VX_DTYPE_F32, 9u, 1u,
+              sizeof(float)) == 0);
+    CHECK(vx_public_api_test_native_gpu_tensor_size_domain_proven(
+              TEST_BACKEND_CUDA, VX_DTYPE_F16, 4u,
+              (uint64_t)UINT32_MAX / sizeof(float) + 1u,
+              UINT32_MAX) == 0);
+    CHECK(vx_public_api_test_native_gpu_tensor_size_domain_proven(
+              TEST_BACKEND_VULKAN, VX_DTYPE_F32, 4u,
+              receipt_b625_elements, receipt_b625_bytes) == 0);
+    CHECK(vx_public_api_test_native_gpu_tensor_size_domain_proven(
+              TEST_BACKEND_OPENGL, VX_DTYPE_F32, 4u,
+              receipt_b625_elements, receipt_b625_bytes) == 0);
+    CHECK(vx_public_api_test_native_gpu_tensor_size_domain_proven(
+              TEST_BACKEND_METAL, VX_DTYPE_F32, 4u,
+              receipt_b625_elements, receipt_b625_bytes) == 0);
     CHECK(vx_public_api_test_native_gpu_align_resource_bytes(
               5u, 64u, &value) == 1 && value == 64u);
     CHECK(vx_public_api_test_native_gpu_align_resource_bytes(
@@ -234,6 +422,12 @@ static int test_native_gpu_resource_peak_projection(void) {
               256u, 64u, 512u, 767u, &value) == 0 && value == 768u);
     CHECK(vx_public_api_test_native_gpu_device_capacity_proven(
               UINT64_MAX, 1u, 1u, 0u, &value) == 0);
+    CHECK(vx_public_api_test_native_gpu_fixed_allocation_bound(
+              1024u, 32u, &value) == 1 && value == 1056u);
+    CHECK(vx_public_api_test_native_gpu_fixed_allocation_bound(
+              UINT64_MAX, 1u, &value) == 0);
+    CHECK(vx_public_api_test_native_gpu_fixed_allocation_bound(
+              1024u, 0u, &value) == 0);
     /* Bootstrap T slots and published physical spans are different phases;
      * charging the complete tensor table twice can spuriously reject a large
      * graph even though its true conservative slot bound fits. */
@@ -292,6 +486,14 @@ static int test_native_gpu_resource_peak_projection(void) {
                   1u, 1u, UINT64_MAX, 1u, 1u, &value) == 0);
     }
 
+    CHECK(vx_public_api_test_native_gpu_cuda_replay_metadata_peak(
+              100u, 17u, 4u, &value) == 1 &&
+          value == 100u + 5u * 17u);
+    CHECK(vx_public_api_test_native_gpu_cuda_replay_metadata_peak(
+              100u, 17u, UINT64_MAX, &value) == 0);
+    CHECK(vx_public_api_test_native_gpu_cuda_replay_metadata_peak(
+              UINT64_MAX, 1u, 4u, &value) == 0);
+
     CHECK(vx_public_api_test_native_gpu_resident_capacity_proven(
               100u, 50u, 25u, 175u, &value) == 1 && value == 175u);
     CHECK(vx_public_api_test_native_gpu_resident_capacity_proven(
@@ -300,7 +502,7 @@ static int test_native_gpu_resource_peak_projection(void) {
               UINT64_MAX, 1u, 0u, 0u, &value) == 0);
 
     /* CUDA F32 dense is exactly 16x16 and independently caps grid-y at
-     * 65535. CUDA physical QLinear uses the common 256-thread 1-D launcher;
+     * 65535. CUDA QLinear uses the common 256-thread 1-D launcher;
      * V/O/M retain their 64-lane scalar/tiled contracts. */
     CHECK(vx_public_api_test_native_gpu_dense_launch_proven(
               65535u * 16u, 32u, 32u, 0, TEST_BACKEND_CUDA,
@@ -320,6 +522,116 @@ static int test_native_gpu_resource_peak_projection(void) {
     CHECK(vx_public_api_test_native_gpu_dense_launch_proven(
               32u, 32u, 32u, 0, TEST_BACKEND_VULKAN,
               128u, 128u, 64u, 64u, 64u) == 1);
+
+    /* Receipt's limiting regular Conv2D selects the V/O out16 family, whose
+     * physical grid-z is B*(C/16), not the generic B*C fallback geometry. */
+    CHECK(vx_public_api_test_native_gpu_vom_conv2d_launch_proven(
+              256u, 10u, 42u, 256u, 1, TEST_BACKEND_VULKAN,
+              65535u, 65535u, 65535u, 1024u, 1024u, 64u, 1024u) == 1);
+    CHECK(vx_public_api_test_native_gpu_vom_conv2d_launch_proven(
+              256u, 10u, 42u, 256u, 1, TEST_BACKEND_OPENGL,
+              65535u, 65535u, 65535u, 1024u, 1024u, 64u, 1024u) == 1);
+    CHECK(vx_public_api_test_native_gpu_vom_conv2d_launch_proven(
+              4095u, 10u, 42u, 256u, 1, TEST_BACKEND_VULKAN,
+              65535u, 65535u, 65535u, 1024u, 1024u, 64u, 1024u) == 1);
+    CHECK(vx_public_api_test_native_gpu_vom_conv2d_launch_proven(
+              4096u, 10u, 42u, 256u, 1, TEST_BACKEND_VULKAN,
+              65535u, 65535u, 65535u, 1024u, 1024u, 64u, 1024u) == 0);
+    /* Other V/O routes and Metal retain generic B*C proof. */
+    CHECK(vx_public_api_test_native_gpu_vom_conv2d_launch_proven(
+              256u, 10u, 42u, 256u, 0, TEST_BACKEND_VULKAN,
+              65535u, 65535u, 65535u, 1024u, 1024u, 64u, 1024u) == 0);
+    CHECK(vx_public_api_test_native_gpu_vom_conv2d_launch_proven(
+              256u, 10u, 42u, 256u, 1, TEST_BACKEND_METAL,
+              65535u, 65535u, 65535u, 1024u, 1024u, 64u, 1024u) == 0);
+    CHECK(vx_public_api_test_native_gpu_vom_conv2d_launch_proven(
+              257u, 10u, 42u, 255u, 1, TEST_BACKEND_OPENGL,
+              65535u, 65535u, 65535u, 1024u, 1024u, 64u, 1024u) == 1);
+    CHECK(vx_public_api_test_native_gpu_vom_conv2d_launch_proven(
+              258u, 10u, 42u, 255u, 1, TEST_BACKEND_OPENGL,
+              65535u, 65535u, 65535u, 1024u, 1024u, 64u, 1024u) == 0);
+    /* Selected dispatch must not bypass the entry point's u32 n*out_c ABI,
+     * its 8x8 workgroup, or either spatial grid boundary. */
+    CHECK(vx_public_api_test_native_gpu_vom_conv2d_launch_proven(
+              UINT32_MAX / 256u + 1u, 1u, 1u, 256u, 1,
+              TEST_BACKEND_VULKAN, UINT32_MAX, UINT32_MAX, UINT32_MAX,
+              1024u, 1024u, 64u, 1024u) == 0);
+    CHECK(vx_public_api_test_native_gpu_vom_conv2d_launch_proven(
+              256u, 10u, 42u, 256u, 1, TEST_BACKEND_VULKAN,
+              5u, 65535u, 65535u, 1024u, 1024u, 64u, 1024u) == 0);
+    CHECK(vx_public_api_test_native_gpu_vom_conv2d_launch_proven(
+              256u, 10u, 42u, 256u, 1, TEST_BACKEND_VULKAN,
+              65535u, 1u, 65535u, 1024u, 1024u, 64u, 1024u) == 0);
+    CHECK(vx_public_api_test_native_gpu_vom_conv2d_launch_proven(
+              256u, 10u, 42u, 256u, 1, TEST_BACKEND_VULKAN,
+              65535u, 65535u, 65535u, 7u, 8u, 1u, 64u) == 0);
+    CHECK(vx_public_api_test_native_gpu_vom_conv2d_launch_proven(
+              256u, 10u, 42u, 256u, 1, TEST_BACKEND_VULKAN,
+              65535u, 65535u, 65535u, 8u, 8u, 1u, 63u) == 0);
+
+    /* CUDA Conv2D flattens generic/depthwise work into grid-x and gives 1x1
+     * tactics a row/channel grid with z=1. In particular, B256 x C256 is legal
+     * when grid-z is only 65535; the former V/O/M proof treated B*C as z. */
+    CHECK(vx_public_api_test_native_gpu_cuda_conv2d_launch_proven(
+              255u, 255u, 32u, 256u, TEST_CUDA_CONV_TILED_FIXED,
+              UINT32_MAX, 65535u, 65535u,
+              1024u, 1024u, 64u, 1024u) == 1);
+    CHECK(vx_public_api_test_native_gpu_cuda_conv2d_launch_proven(
+              256u, 256u, 32u, 256u, TEST_CUDA_CONV_TILED_FIXED,
+              UINT32_MAX, 65535u, 65535u,
+              1024u, 1024u, 64u, 1024u) == 1);
+    /* The corresponding physical grid-x boundary remains enforced. */
+    CHECK(vx_public_api_test_native_gpu_cuda_conv2d_launch_proven(
+              255u, 255u, 32u, 256u, TEST_CUDA_CONV_TILED_NEVER,
+              255u, 65535u, 1u,
+              256u, 1u, 1u, 256u) == 1);
+    CHECK(vx_public_api_test_native_gpu_cuda_conv2d_launch_proven(
+              256u, 256u, 32u, 256u, TEST_CUDA_CONV_TILED_NEVER,
+              255u, 65535u, 1u,
+              256u, 1u, 1u, 256u) == 0);
+    /* Tiled 1x1 admission proves the selected 8x16 BM32/BN32 launch, while
+     * zero device dimensions and u32 output-element overflow fail closed. */
+    CHECK(vx_public_api_test_native_gpu_cuda_conv2d_launch_proven(
+              17u, 17u, 32u, 64u, TEST_CUDA_CONV_TILED_FIXED,
+              2u, 1u, 1u,
+              8u, 16u, 1u, 128u) == 1);
+    CHECK(vx_public_api_test_native_gpu_cuda_conv2d_launch_proven(
+              17u, 17u, 32u, 64u, TEST_CUDA_CONV_TILED_FIXED,
+              2u, 1u, 1u,
+              8u, 15u, 1u, 128u) == 0);
+    CHECK(vx_public_api_test_native_gpu_cuda_conv2d_launch_proven(
+              17u, 17u, 32u, 64u, TEST_CUDA_CONV_TILED_FIXED,
+              2u, 0u, 1u,
+              8u, 16u, 1u, 128u) == 0);
+    CHECK(vx_public_api_test_native_gpu_cuda_conv2d_launch_proven(
+              17u, 17u, 32u, 64u, TEST_CUDA_CONV_TILED_POSSIBLE,
+              5u, 1u, 1u,
+              256u, 16u, 1u, 256u) == 1);
+    CHECK(vx_public_api_test_native_gpu_cuda_conv2d_launch_proven(
+              17u, 17u, 32u, 64u, TEST_CUDA_CONV_TILED_POSSIBLE,
+              5u, 1u, 1u,
+              255u, 16u, 1u, 256u) == 0);
+    /* A fixed BM32 route crosses to the generic 256-thread kernel only above
+     * 65535 row tiles; that fallback's block-x requirement is still proven. */
+    CHECK(vx_public_api_test_native_gpu_cuda_conv2d_launch_proven(
+              32u * 65535u + 1u, 32u * 65535u + 1u,
+              32u, 64u, TEST_CUDA_CONV_TILED_FIXED,
+              UINT32_MAX, 65535u, 1u,
+              256u, 16u, 1u, 256u) == 1);
+    CHECK(vx_public_api_test_native_gpu_cuda_conv2d_launch_proven(
+              32u * 65535u + 1u, 32u * 65535u + 1u,
+              32u, 64u, TEST_CUDA_CONV_TILED_FIXED,
+              UINT32_MAX, 65535u, 1u,
+              255u, 16u, 1u, 256u) == 0);
+    CHECK(vx_public_api_test_native_gpu_cuda_conv2d_launch_proven(
+              1u, UINT32_MAX / 256u + 1u, 32u, 256u,
+              TEST_CUDA_CONV_TILED_NEVER,
+              UINT32_MAX, 65535u, 65535u,
+              1024u, 1024u, 64u, 1024u) == 0);
+    CHECK(vx_public_api_test_native_gpu_cuda_conv2d_launch_proven(
+              1u, 1u, 32u, 256u, TEST_CUDA_CONV_TILED_INVALID,
+              UINT32_MAX, 65535u, 65535u,
+              1024u, 1024u, 64u, 1024u) == 0);
     {
         const int32_t fitting_bias = 16383;
         const int32_t overflowing_bias = 16384;
@@ -395,6 +707,29 @@ static int write_bank_weights(const char* path,
 
 static int write_provider_bank_weights(const char* path) {
     return write_bank_weights(path, "experts", 4, 2);
+}
+
+static int write_shared_weight_store_fixture(const char* path) {
+    const int bank_shape[2] = {4, 1};
+    const int scalar_shape[1] = {1};
+    const float experts[4] = {1.0f, 2.0f, 3.0f, 4.0f};
+    const uint16_t f16_two = UINT16_C(0x4000);
+    SafetensorsFile file;
+    int status;
+    if (safetensors_init_empty(&file, SAFETENSORS_OPEN_READ_WRITE) != 0)
+        return -1;
+    if (safetensors_add_tensor(&file, "experts", SAFETENSORS_DTYPE_F32,
+                               bank_shape, 2, experts,
+                               sizeof(experts)) != 0 ||
+        safetensors_add_tensor(&file, "w", SAFETENSORS_DTYPE_F16,
+                               scalar_shape, 1, &f16_two,
+                               sizeof(f16_two)) != 0) {
+        safetensors_free(&file);
+        return -1;
+    }
+    status = safetensors_save(path, &file);
+    safetensors_free(&file);
+    return status;
 }
 
 static int write_zero_payload_bank_weights(const char* path,
@@ -560,6 +895,38 @@ typedef struct CpuInputCommitProbe {
     int called;
 } CpuInputCommitProbe;
 
+typedef struct CpuGateProbe {
+    pthread_mutex_t mutex;
+    pthread_cond_t condition;
+    int entered;
+    int released;
+} CpuGateProbe;
+
+typedef struct RuntimeRunThreadCase {
+    VxRuntime* runtime;
+    VxCompiledModel* compiled;
+    VxTensorBinding binding;
+    VxResult* result;
+    VxStatus status;
+    VxReport report;
+} RuntimeRunThreadCase;
+
+typedef struct RuntimeSubmitThreadCase {
+    VxRuntime* runtime;
+    VxCompiledModel* compiled;
+    VxTensorBinding binding;
+    VxRuntimeSubmitOptions options;
+    VxRequest* request;
+    VxStatus status;
+    VxReport report;
+} RuntimeSubmitThreadCase;
+
+typedef struct RuntimeCloseThreadCase {
+    VxRuntime* runtime;
+    VxStatus status;
+    VxReport report;
+} RuntimeCloseThreadCase;
+
 static void cpu_input_commit_hook(void* opaque) {
     CpuInputCommitProbe* probe = (CpuInputCommitProbe*)opaque;
     if (!probe || !probe->values) return;
@@ -585,6 +952,46 @@ static void cpu_overlap_hook(void* opaque) {
         pthread_cond_broadcast(&probe->condition);
     }
     pthread_mutex_unlock(&probe->mutex);
+}
+
+static void cpu_gate_hook(void* opaque) {
+    CpuGateProbe* probe = (CpuGateProbe*)opaque;
+    pthread_mutex_lock(&probe->mutex);
+    probe->entered++;
+    pthread_cond_broadcast(&probe->condition);
+    while (!probe->released)
+        pthread_cond_wait(&probe->condition, &probe->mutex);
+    pthread_mutex_unlock(&probe->mutex);
+}
+
+static void cpu_delay_hook(void* opaque) {
+    const struct timespec* pause = (const struct timespec*)opaque;
+    if (pause) nanosleep(pause, NULL);
+}
+
+static void* runtime_run_thread(void* opaque) {
+    RuntimeRunThreadCase* test = (RuntimeRunThreadCase*)opaque;
+    test->report = (VxReport)VX_REPORT_INIT;
+    test->status = vx_runtime_run(test->runtime, test->compiled,
+                                  &test->binding, 1u, &test->result,
+                                  &test->report);
+    return NULL;
+}
+
+static void* runtime_submit_thread(void* opaque) {
+    RuntimeSubmitThreadCase* test = (RuntimeSubmitThreadCase*)opaque;
+    test->report = (VxReport)VX_REPORT_INIT;
+    test->status = vx_runtime_submit(test->runtime, test->compiled,
+                                     &test->binding, 1u, &test->options,
+                                     &test->request, &test->report);
+    return NULL;
+}
+
+static void* runtime_close_thread(void* opaque) {
+    RuntimeCloseThreadCase* test = (RuntimeCloseThreadCase*)opaque;
+    test->report = (VxReport)VX_REPORT_INIT;
+    test->status = vx_runtime_close(test->runtime, &test->report);
+    return NULL;
 }
 
 static void* run_thread_case(void* opaque) {
@@ -620,13 +1027,21 @@ typedef struct MockRuntime {
     int marker;
     char provider_name[VX_BACKEND_NAME_CAPACITY];
 } MockRuntime;
-typedef struct MockCompiled { int marker; } MockCompiled;
-typedef struct MockContext { float input; } MockContext;
+typedef struct MockCompiled {
+    int marker;
+    char graph_fingerprint[64];
+    char independent_batch_proof_identity[128];
+} MockCompiled;
+typedef struct MockContext {
+    float input[4];
+    size_t input_count;
+} MockContext;
 
 static int mock_runtime_destroyed;
 static int mock_compiled_destroyed;
 static int mock_context_destroyed;
 static int mock_context_closed;
+static int mock_context_create_calls;
 static int mock_adapter_selected;
 static uint64_t mock_adapter_id;
 static uint64_t mock_adapter_revision;
@@ -637,6 +1052,58 @@ static const VxBankResidency* mock_caller_bank_residency;
 static const char* mock_caller_bank_name;
 static const uint32_t* mock_caller_bank_slots;
 static int mock_bank_source_seen;
+static int mock_batch_resource_domain;
+static int mock_batch_execute_calls;
+static size_t mock_batch_last_size;
+static float mock_batch_last_values[4];
+static int mock_batch_fail_after_first;
+static int mock_batch_proof_mismatch;
+static int mock_single_execute_calls;
+static CpuGateProbe* mock_execute_gate;
+static uint64_t mock_batch_attested_tensor_bytes = 4u * sizeof(float);
+static uint32_t mock_batch_contract_min = 2u;
+static uint32_t mock_batch_contract_max = 4u;
+static uint32_t mock_batch_contract_multiple = 2u;
+static int32_t mock_batch_contract_axis;
+static unsigned mock_poison_report_mask;
+
+enum {
+    MOCK_POISON_COMPILE_REPORT = 1u << 0,
+    MOCK_POISON_EXECUTE_REPORT = 1u << 1,
+    MOCK_POISON_BATCH_REPORT = 1u << 2
+};
+
+static void mock_poison_report_strings(VxReport* report) {
+    if (!report) return;
+    memset(report->backend, 'b', sizeof(report->backend));
+    memset(report->device, 'd', sizeof(report->device));
+    memset(report->reason, 'r', sizeof(report->reason));
+    memset(report->message, 'm', sizeof(report->message));
+    memset(report->candidate_outcomes, 'c',
+           sizeof(report->candidate_outcomes));
+    memset(report->route_evidence, 'e', sizeof(report->route_evidence));
+    memset(report->fallback_evidence, 'f',
+           sizeof(report->fallback_evidence));
+    memset(report->offending_node, 'o', sizeof(report->offending_node));
+    memset(report->decode_state, 's', sizeof(report->decode_state));
+}
+
+static int report_strings_terminated(const VxReport* report) {
+    return report &&
+        report->backend[sizeof(report->backend) - 1u] == '\0' &&
+        report->device[sizeof(report->device) - 1u] == '\0' &&
+        report->reason[sizeof(report->reason) - 1u] == '\0' &&
+        report->message[sizeof(report->message) - 1u] == '\0' &&
+        report->candidate_outcomes[
+            sizeof(report->candidate_outcomes) - 1u] == '\0' &&
+        report->route_evidence[
+            sizeof(report->route_evidence) - 1u] == '\0' &&
+        report->fallback_evidence[
+            sizeof(report->fallback_evidence) - 1u] == '\0' &&
+        report->offending_node[
+            sizeof(report->offending_node) - 1u] == '\0' &&
+        report->decode_state[sizeof(report->decode_state) - 1u] == '\0';
+}
 
 typedef enum MockOutputViolation {
     MOCK_OUTPUT_VALID = 0,
@@ -706,6 +1173,9 @@ static VxStatus mock_compile(void* runtime_instance,
     if (!runtime || !mock_compile_input_layout_valid(input) ||
         !input->source->graph_path ||
         !input->graph_fingerprint || !input->shape_domain_proof_identity ||
+        !input->independent_batch_proof_protocol ||
+        strcmp(input->independent_batch_proof_protocol,
+               VX_BACKEND_INDEPENDENT_BATCH_PROOF_PROTOCOL) ||
         !policy || !policy->backends || !policy->backend_count ||
         !attestation || attestation->struct_size != sizeof(*attestation))
         return VX_STATUS_INVALID_ARGUMENT;
@@ -732,12 +1202,20 @@ static VxStatus mock_compile(void* runtime_instance,
     MockCompiled* compiled = (MockCompiled*)calloc(1, sizeof(*compiled));
     if (!compiled) return VX_STATUS_OUT_OF_MEMORY;
     compiled->marker = 22;
+    snprintf(compiled->graph_fingerprint,
+             sizeof(compiled->graph_fingerprint), "%s",
+             input->graph_fingerprint);
+    if (input->independent_batch_proof_identity)
+        snprintf(compiled->independent_batch_proof_identity,
+                 sizeof(compiled->independent_batch_proof_identity), "%s",
+                 input->independent_batch_proof_identity);
     *out = compiled;
     attestation->graph_fingerprint = input->graph_fingerprint;
     attestation->shape_domain_proof_identity =
         input->shape_domain_proof_identity;
-    attestation->maximum_tensor_bytes = sizeof(float);
-    attestation->maximum_resident_bytes = 2u * sizeof(float);
+    attestation->maximum_tensor_bytes = mock_batch_attested_tensor_bytes;
+    attestation->maximum_resident_bytes =
+        2u * mock_batch_attested_tensor_bytes;
     attestation->resource_limit_bytes = 1024u;
     attestation->has_resource_limit = 1;
     if (!strcmp(runtime->provider_name, "test-provider")) {
@@ -749,12 +1227,37 @@ static VxStatus mock_compile(void* runtime_instance,
         snprintf(report->fallback_evidence, sizeof(report->fallback_evidence),
                  "%s", "operator=none");
     }
+    if (mock_poison_report_mask & MOCK_POISON_COMPILE_REPORT)
+        mock_poison_report_strings(report);
     return VX_STATUS_OK;
 }
 
 static void mock_compiled_destroy(void* instance) {
     mock_compiled_destroyed++;
     free(instance);
+}
+
+static VxStatus mock_compiled_batch_contract(
+    void* compiled_instance,
+    VxBackendBatchContract* contract,
+    VxReport* report) {
+    MockCompiled* compiled = (MockCompiled*)compiled_instance;
+    (void)report;
+    if (!compiled || compiled->marker != 22 || !contract ||
+        contract->struct_size != sizeof(*contract))
+        return VX_STATUS_INVALID_ARGUMENT;
+    *contract = (VxBackendBatchContract)VX_BACKEND_BATCH_CONTRACT_INIT;
+    contract->graph_fingerprint = compiled->graph_fingerprint;
+    contract->independent_batch_proof_identity = mock_batch_proof_mismatch
+        ? "typed-independent-batch-proof/v1:mismatch"
+        : compiled->independent_batch_proof_identity;
+    contract->resource_domain = &mock_batch_resource_domain;
+    contract->compatibility_token = compiled;
+    contract->min_batch = mock_batch_contract_min;
+    contract->max_batch = mock_batch_contract_max;
+    contract->multiple_of = mock_batch_contract_multiple;
+    contract->batch_axis = mock_batch_contract_axis;
+    return VX_STATUS_OK;
 }
 
 static VxStatus mock_context_create(void* compiled_instance,
@@ -766,6 +1269,7 @@ static VxStatus mock_context_create(void* compiled_instance,
     if (!compiled_instance) return VX_STATUS_INVALID_ARGUMENT;
     MockContext* context = (MockContext*)calloc(1, sizeof(*context));
     if (!context) return VX_STATUS_OUT_OF_MEMORY;
+    mock_context_create_calls++;
     *out = context;
     return VX_STATUS_OK;
 }
@@ -775,18 +1279,30 @@ static VxStatus mock_context_execute(void* instance,
                                      size_t input_count,
                                      const VxBackendOutputSink* sink,
                                      VxReport* report) {
+    size_t element_count;
+    MockContext* context = (MockContext*)instance;
+    float output[4] = {0};
+    int64_t shape[1];
+    VxStatus status;
     if (!instance || !inputs || input_count != 1u ||
         inputs[0].struct_size != sizeof(inputs[0]) || !inputs[0].name ||
         strcmp(inputs[0].name, "value") || inputs[0].dtype != VX_DTYPE_F32 ||
-        inputs[0].rank != 1u || inputs[0].shape[0] != 1 ||
+        inputs[0].rank != 1u || inputs[0].shape[0] < 1 ||
+        inputs[0].shape[0] > 4 ||
         inputs[0].location != VX_MEMORY_HOST || !inputs[0].data ||
-        inputs[0].byte_size != sizeof(float) ||
         !sink || sink->struct_size != sizeof(*sink) || !sink->write)
         return VX_STATUS_INVALID_ARGUMENT;
-    memcpy(&((MockContext*)instance)->input, inputs[0].data, sizeof(float));
-    float output[2] = {((MockContext*)instance)->input * 2.0f, -1.0f};
-    int64_t shape[1] = {1};
-    VxStatus status;
+    element_count = (size_t)inputs[0].shape[0];
+    if (inputs[0].byte_size != element_count * sizeof(float))
+        return VX_STATUS_INVALID_ARGUMENT;
+    mock_single_execute_calls++;
+    if (mock_execute_gate) cpu_gate_hook(mock_execute_gate);
+    memcpy(context->input, inputs[0].data,
+           element_count * sizeof(float));
+    context->input_count = element_count;
+    for (size_t index = 0; index < element_count; index++)
+        output[index] = context->input[index] * 2.0f;
+    shape[0] = (int64_t)element_count;
     switch (mock_output_violation) {
         case MOCK_OUTPUT_MISSING:
             return VX_STATUS_OK;
@@ -823,9 +1339,65 @@ static VxStatus mock_context_execute(void* instance,
                                shape, 1, output, sizeof(output[0]));
         case MOCK_OUTPUT_VALID:
         default:
-            return sink->write(sink->user_data, "mock-out", VX_DTYPE_F32,
-                               shape, 1, output, sizeof(output[0]));
+            status = sink->write(sink->user_data, "mock-out", VX_DTYPE_F32,
+                                 shape, 1, output,
+                                 element_count * sizeof(output[0]));
+            if (mock_poison_report_mask & MOCK_POISON_EXECUTE_REPORT)
+                mock_poison_report_strings(report);
+            return status;
     }
+}
+
+static VxStatus mock_context_execute_batch(
+    void* instance,
+    const VxBackendBatchInvocation* invocation,
+    VxReport* report) {
+    const VxTensorBinding* input;
+    const float* values;
+    int64_t lane_shape[1] = {1};
+    if (!instance || !invocation ||
+        invocation->struct_size != sizeof(*invocation) ||
+        invocation->batch_size < 2u || invocation->batch_size > 4u ||
+        invocation->stacked_input_count != 1u ||
+        !invocation->stacked_inputs || !invocation->request_ids ||
+        !invocation->lane_output_sinks ||
+        invocation->lane_output_sink_count != invocation->batch_size)
+        return VX_STATUS_INVALID_ARGUMENT;
+    input = &invocation->stacked_inputs[0];
+    if (input->struct_size != sizeof(*input) || !input->name ||
+        strcmp(input->name, "value") || input->dtype != VX_DTYPE_F32 ||
+        input->rank != 1u || input->shape[0] != invocation->batch_size ||
+        input->location != VX_MEMORY_HOST || !input->data ||
+        input->byte_size != invocation->batch_size * sizeof(float))
+        return VX_STATUS_INVALID_ARGUMENT;
+    values = (const float*)input->data;
+    mock_batch_execute_calls++;
+    mock_batch_last_size = invocation->batch_size;
+    memset(mock_batch_last_values, 0, sizeof(mock_batch_last_values));
+    memcpy(mock_batch_last_values, values,
+           invocation->batch_size * sizeof(*values));
+    report->route_attested = 1;
+    report->operator_fallback_used = 0;
+    snprintf(report->device, sizeof(report->device), "%s", "mock-device-0");
+    snprintf(report->route_evidence, sizeof(report->route_evidence), "%s",
+             "provider=test-provider;batch=single-entry");
+    for (size_t lane = 0; lane < invocation->batch_size; lane++) {
+        const VxBackendOutputSink* sink =
+            &invocation->lane_output_sinks[lane];
+        float output = values[lane] * 2.0f;
+        VxStatus status;
+        if (!invocation->request_ids[lane] ||
+            sink->struct_size != sizeof(*sink) || !sink->write)
+            return VX_STATUS_INVALID_ARGUMENT;
+        status = sink->write(sink->user_data, "mock-out", VX_DTYPE_F32,
+                             lane_shape, 1u, &output, sizeof(output));
+        if (status != VX_STATUS_OK) return status;
+        if (mock_batch_fail_after_first && lane == 0u)
+            return VX_STATUS_EXECUTION_FAILED;
+    }
+    if (mock_poison_report_mask & MOCK_POISON_BATCH_REPORT)
+        mock_poison_report_strings(report);
+    return VX_STATUS_OK;
 }
 
 static VxStatus mock_layout_sink_write(void* user_data,
@@ -1090,10 +1662,269 @@ static int test_many_bank_residencies(void) {
     return 0;
 }
 
+static int test_compiled_weight_store_ownership(void) {
+    enum { CONTEXT_COUNT = 4 };
+    const char* graph_path =
+        "/tmp/volvox-public-api-shared-weight-store.graph.json";
+    const char* weights_path =
+        "/tmp/volvox-public-api-shared-weight-store.safetensors";
+    const char* graph =
+        "{\"format\":\"volvox-graph/v1\","
+        "\"dimensions\":{\"F\":{\"min\":4,\"max\":4,"
+        "\"multiple_of\":1}},"
+        "\"inputs\":{\"x\":{\"shape\":[1],\"dtype\":\"float32\"}},"
+        "\"nodes\":[{\"id\":\"add\",\"opType\":\"Add\","
+        "\"inputs\":{\"a\":\"x\",\"b\":\"w\"},"
+        "\"outputs\":{\"out\":{\"tensor\":\"y\","
+        "\"dtype\":\"float32\",\"shape\":[1]}},\"params\":{}}],"
+        "\"outputs\":[\"y\"],\"banks\":{\"experts\":\"F\"}}";
+    const char* weight_paths[1] = {weights_path};
+    const uint32_t selected_slots[2] = {1u, 3u};
+    VxBankResidency residency = VX_BANK_RESIDENCY_INIT;
+    VxModelSource source = VX_MODEL_SOURCE_INIT;
+    VxRuntimeOptions runtime_options = VX_RUNTIME_OPTIONS_INIT;
+    VxBackendPolicy policy = VX_BACKEND_POLICY_INIT;
+    VxContextOptions context_options = VX_CONTEXT_OPTIONS_INIT;
+    VxReport report = VX_REPORT_INIT;
+    VxRuntime* runtime = NULL;
+    VxModel* model = NULL;
+    VxCompiledModel* compiled = NULL;
+    VxExecutionContext* contexts[CONTEXT_COUNT] = {0};
+    uintptr_t descriptor_tables[CONTEXT_COUNT] = {0};
+    uintptr_t bank_overlays[CONTEXT_COUNT] = {0};
+    uintptr_t f16_overlays[CONTEXT_COUNT] = {0};
+    uintptr_t owner_blob = 0;
+    uintptr_t owner_descriptors = 0;
+    uintptr_t owner_experts = 0;
+    uintptr_t owner_f16 = 0;
+    unsigned char* owner_snapshot = NULL;
+    uint64_t raw_bytes = 0;
+    uint64_t store_allocated_bytes = 0;
+    uint64_t compiled_allocated_bytes = 0;
+    size_t file_count = 0;
+    unsigned references = 0;
+    int first_dimension = 0;
+    size_t byte_size = 0;
+    VxDataType dtype = VX_DTYPE_UNSPECIFIED;
+
+    CHECK(write_text(graph_path, graph) == 0);
+    CHECK(write_shared_weight_store_fixture(weights_path) == 0);
+    safetensors_test_reset_file_read_count();
+    safetensors_test_reset_storage_release_count();
+    residency.bank = "experts";
+    residency.slots = selected_slots;
+    residency.slot_count = 2u;
+    source.graph_path = graph_path;
+    source.weight_paths = weight_paths;
+    source.weight_path_count = 1u;
+    source.bank_residency = &residency;
+    source.bank_residency_count = 1u;
+    runtime_options.cpu_threads = 1;
+    CHECK(vx_runtime_create(&runtime_options, &runtime, &report) ==
+          VX_STATUS_OK);
+    CHECK(vx_runtime_load_model(runtime, &source, &model, &report) ==
+          VX_STATUS_OK);
+    CHECK(safetensors_test_file_read_count() == 1u);
+    CHECK(safetensors_test_storage_release_count() == 1u);
+    CHECK(vx_model_compile(model, &policy, &compiled, &report) ==
+          VX_STATUS_OK);
+    CHECK(safetensors_test_file_read_count() == 2u);
+    CHECK(safetensors_test_storage_release_count() == 1u);
+    CHECK(vx_public_api_test_compiled_weight_store_state(
+              compiled, &references, &file_count, &raw_bytes,
+              &store_allocated_bytes, &compiled_allocated_bytes) == 0);
+    CHECK(references == 1u && file_count == 1u && raw_bytes > 0u &&
+          store_allocated_bytes > raw_bytes &&
+          compiled_allocated_bytes >= store_allocated_bytes);
+    CHECK(vx_public_api_test_compiled_weight_tensor_state(
+              compiled, "experts", &owner_blob, &owner_descriptors,
+              &owner_experts, &dtype, &first_dimension, &byte_size) == 0);
+    CHECK(owner_blob && owner_descriptors && owner_experts &&
+          dtype == VX_DTYPE_F32 && first_dimension == 4 &&
+          byte_size == 4u * sizeof(float));
+    CHECK(raw_bytes <= SIZE_MAX);
+    owner_snapshot = (unsigned char*)malloc((size_t)raw_bytes);
+    CHECK(owner_snapshot != NULL);
+    memcpy(owner_snapshot, (const void*)owner_blob, (size_t)raw_bytes);
+    {
+        float values[4] = {0};
+        memcpy(values, (const void*)owner_experts, sizeof(values));
+        CHECK(closef(values[0], 1.0f) && closef(values[1], 2.0f) &&
+              closef(values[2], 3.0f) && closef(values[3], 4.0f));
+    }
+    CHECK(vx_public_api_test_compiled_weight_tensor_state(
+              compiled, "w", NULL, NULL, &owner_f16, &dtype,
+              &first_dimension, &byte_size) == 0);
+    CHECK(owner_f16 && dtype == VX_DTYPE_F16 && first_dimension == 1 &&
+          byte_size == sizeof(uint16_t));
+
+    for (int index = 0; index < CONTEXT_COUNT; index++) {
+        uintptr_t blob = 0;
+        uintptr_t stored = 0;
+        int execution_dtype = 0;
+        int execution_owns = 0;
+        int borrowed = 0;
+        float staged[2] = {0};
+        CHECK(vx_compiled_model_create_context(
+                  compiled, &context_options, &contexts[index], &report) ==
+              VX_STATUS_OK);
+        CHECK(vx_public_api_test_context_weight_tensor_state(
+                  contexts[index], "experts", &blob,
+                  &descriptor_tables[index], &stored,
+                  &bank_overlays[index], &dtype, &execution_dtype,
+                  &execution_owns, &first_dimension, &borrowed) == 0);
+        CHECK(blob == owner_blob && descriptor_tables[index] &&
+              descriptor_tables[index] != owner_descriptors &&
+              stored == bank_overlays[index] && stored != owner_experts &&
+              dtype == VX_DTYPE_F32 && execution_dtype == VX_DTYPE_F32 &&
+              execution_owns && first_dimension == 2 && borrowed);
+        CHECK(vx_public_api_test_copy_tensor(
+                  contexts[index], "experts", staged, sizeof(staged)) == 0);
+        CHECK(closef(staged[0], 2.0f) && closef(staged[1], 4.0f));
+        {
+            const float input = 3.0f;
+            float output = 0.0f;
+            const VxTensorBinding binding = {
+                sizeof(VxTensorBinding), "x", VX_DTYPE_F32, 1u, {1},
+                &input, sizeof(input), VX_MEMORY_HOST,
+            };
+            VxResult* result = NULL;
+            CHECK(vx_execution_context_execute(
+                      contexts[index], &binding, 1u, &result, &report) ==
+                  VX_STATUS_OK);
+            CHECK(vx_result_read(result, "y", &output, sizeof(output), NULL,
+                                 &report) == VX_STATUS_OK);
+            CHECK(closef(output, 5.0f));
+            vx_result_release(result);
+        }
+        CHECK(vx_public_api_test_context_weight_tensor_state(
+                  contexts[index], "w", &blob, NULL, &stored,
+                  &f16_overlays[index], &dtype, &execution_dtype,
+                  &execution_owns, &first_dimension, &borrowed) == 0);
+        CHECK(blob == owner_blob && stored == owner_f16 &&
+              f16_overlays[index] != owner_f16 && dtype == VX_DTYPE_F16 &&
+              execution_dtype == VX_DTYPE_F32 && execution_owns &&
+              first_dimension == 1 && borrowed);
+        for (int prior = 0; prior < index; prior++) {
+            CHECK(descriptor_tables[index] != descriptor_tables[prior]);
+            CHECK(bank_overlays[index] != bank_overlays[prior]);
+            CHECK(f16_overlays[index] != f16_overlays[prior]);
+        }
+    }
+    CHECK(safetensors_test_file_read_count() == 2u);
+    CHECK(safetensors_test_storage_release_count() == 1u);
+    CHECK(vx_public_api_test_compiled_weight_store_state(
+              compiled, &references, NULL, NULL, NULL, NULL) == 0);
+    CHECK(references == CONTEXT_COUNT + 1u);
+
+    /* RSS ownership is asserted structurally, without a flaky process sampler:
+     * all contexts alias one charged owner blob, while descriptor tables and
+     * the selected bank/F16 mutable overlays are context-local. Mutating A's
+     * COW bank must leave B and the compiled source untouched. */
+    {
+        const float changed = 99.0f;
+        float first[2] = {0};
+        float second[2] = {0};
+        float original[4] = {0};
+        memcpy((void*)bank_overlays[0], &changed, sizeof(changed));
+        CHECK(vx_public_api_test_copy_tensor(
+                  contexts[0], "experts", first, sizeof(first)) == 0);
+        CHECK(vx_public_api_test_copy_tensor(
+                  contexts[1], "experts", second, sizeof(second)) == 0);
+        memcpy(original, (const void*)owner_experts, sizeof(original));
+        CHECK(closef(first[0], changed) && closef(first[1], 4.0f));
+        CHECK(closef(second[0], 2.0f) && closef(second[1], 4.0f));
+        CHECK(closef(original[0], 1.0f) && closef(original[1], 2.0f) &&
+              closef(original[2], 3.0f) && closef(original[3], 4.0f));
+        CHECK(!memcmp(owner_snapshot, (const void*)owner_blob,
+                      (size_t)raw_bytes));
+    }
+    for (int index = 0; index < CONTEXT_COUNT; index++) {
+        CHECK(vx_execution_context_close(contexts[index], &report) ==
+              VX_STATUS_OK);
+        vx_execution_context_release(contexts[index]);
+        contexts[index] = NULL;
+    }
+    CHECK(vx_public_api_test_compiled_weight_store_state(
+              compiled, &references, NULL, NULL, NULL, NULL) == 0);
+    CHECK(references == 1u && safetensors_test_file_read_count() == 2u &&
+          safetensors_test_storage_release_count() == 1u);
+
+    /* Zero live contexts does not evict the compiled owner. Reopening must
+     * borrow the exact same blob without another fopen/fread/parse cycle. */
+    CHECK(vx_compiled_model_create_context(
+              compiled, &context_options, &contexts[0], &report) ==
+          VX_STATUS_OK);
+    {
+        uintptr_t reopened_blob = 0;
+        int borrowed = 0;
+        CHECK(vx_public_api_test_context_weight_tensor_state(
+                  contexts[0], "experts", &reopened_blob, NULL, NULL, NULL,
+                  NULL, NULL, NULL, NULL, &borrowed) == 0);
+        CHECK(reopened_blob == owner_blob && borrowed);
+    }
+    CHECK(vx_public_api_test_compiled_weight_store_state(
+              compiled, &references, NULL, NULL, NULL, NULL) == 0);
+    CHECK(references == 2u && safetensors_test_file_read_count() == 2u);
+    CHECK(vx_execution_context_close(contexts[0], &report) == VX_STATUS_OK);
+    vx_execution_context_release(contexts[0]);
+    contexts[0] = NULL;
+    CHECK(vx_public_api_test_compiled_weight_store_state(
+              compiled, &references, NULL, NULL, NULL, NULL) == 0);
+    CHECK(references == 1u && safetensors_test_storage_release_count() == 1u);
+    CHECK(!memcmp(owner_snapshot, (const void*)owner_blob,
+                  (size_t)raw_bytes));
+    free(owner_snapshot);
+    owner_snapshot = NULL;
+
+    vx_compiled_model_release(compiled);
+    compiled = NULL;
+    CHECK(safetensors_test_file_read_count() == 2u);
+    CHECK(safetensors_test_storage_release_count() == 2u);
+    vx_model_release(model);
+    CHECK(vx_runtime_close(runtime, &report) == VX_STATUS_OK);
+    vx_runtime_release(runtime);
+    CHECK(remove(graph_path) == 0);
+    CHECK(remove(weights_path) == 0);
+    return 0;
+}
+
 static int test_provider(const char* readable_graph,
                          const char* readable_weights) {
     CHECK(VX_NATIVE_API_VERSION == 1u);
     CHECK(VX_BACKEND_ABI_VERSION == 1u);
+    CHECK(VX_EXECUTION_MODE_DIRECT == 0);
+    CHECK(VX_EXECUTION_MODE_SCHEDULED == 1);
+    CHECK(offsetof(VxRuntimeOptions, execution_mode) ==
+          offsetof(VxRuntimeOptions, cpu_threads) + sizeof(int32_t));
+    CHECK(offsetof(VxRuntimeOptions, max_batch_delay_milliseconds) >
+          offsetof(VxRuntimeOptions, max_scheduled_input_bytes));
+    CHECK(offsetof(VxRuntimeOptions, max_unconsumed_results) >
+          offsetof(VxRuntimeOptions, max_batch_delay_milliseconds));
+    CHECK(offsetof(VxRuntimeSubmitOptions, priority) >
+          offsetof(VxRuntimeSubmitOptions, struct_size));
+    CHECK(offsetof(VxRuntimeSubmitOptions, deadline_monotonic_micros) >
+          offsetof(VxRuntimeSubmitOptions, priority));
+    CHECK(offsetof(VxRequestInfo, state) >
+          offsetof(VxRequestInfo, request_id));
+    if (sizeof(size_t) == 8u) {
+        CHECK(sizeof(VxRuntimeOptions) == 64u);
+        CHECK(offsetof(VxRuntimeOptions, execution_mode) == 16u);
+        CHECK(offsetof(VxRuntimeOptions, max_scheduled_requests) == 24u);
+        CHECK(offsetof(VxRuntimeOptions,
+                       max_batch_delay_milliseconds) == 40u);
+        CHECK(offsetof(VxRuntimeOptions, max_unconsumed_results) == 48u);
+        CHECK(sizeof(VxRuntimeSubmitOptions) == 40u);
+        CHECK(offsetof(VxRuntimeSubmitOptions, priority) == 8u);
+        CHECK(offsetof(VxRuntimeSubmitOptions,
+                       deadline_monotonic_micros) == 16u);
+        CHECK(offsetof(VxRuntimeSubmitOptions, freshness) == 24u);
+        CHECK(offsetof(VxRuntimeSubmitOptions, stream_key) == 32u);
+        CHECK(sizeof(VxRequestInfo) == 40u);
+        CHECK(offsetof(VxRequestInfo, state) == 16u);
+        CHECK(offsetof(VxRequestInfo, owned_input_bytes) == 24u);
+        CHECK(offsetof(VxRequestInfo, deadline_missed) == 32u);
+    }
     CHECK(test_mock_provider_oversized_descriptors() == 0);
     VxBackendProvider provider = {
         .struct_size = sizeof(VxBackendProvider),
@@ -1110,11 +1941,15 @@ static int test_provider(const char* readable_graph,
         .runtime_destroy = mock_runtime_destroy,
         .compile = mock_compile,
         .compiled_destroy = mock_compiled_destroy,
+        .compiled_batch_contract = mock_compiled_batch_contract,
+        .context_execute_batch = mock_context_execute_batch,
         .context_create = mock_context_create,
         .context_execute = mock_context_execute,
         .context_select_adapter = mock_context_select_adapter,
         .context_close = mock_context_close,
         .context_destroy = mock_context_destroy,
+        .exact_contract_marker = VX_BACKEND_PROVIDER_EXACT_CONTRACT_MARKER,
+        .exact_contract_extent = sizeof(VxBackendProvider),
     };
     VxBackendProvider invalid = provider;
     VxBackendProvider unattested = provider;
@@ -1145,6 +1980,38 @@ static int test_provider(const char* readable_graph,
         sizeof(VxBankResidency), bank_name, bank_slots, 2u,
     };
     const char* adapter_path = "/tmp/volvox-public-api-provider-adapter.bin";
+    const char* alternate_axis_path =
+        "/tmp/volvox-public-api-provider-axis.graph.json";
+    const char* alternate_axis_graph =
+        "{\"format\":\"volvox-graph/v1\","
+        "\"dimensions\":{\"F\":{\"min\":4,\"max\":8,"
+        "\"multiple_of\":4},\"B\":{\"min\":1,\"max\":4},"
+        "\"S\":{\"min\":1,\"max\":4}},"
+        "\"inputs\":{\"value\":{\"shape\":[\"B\",\"S\"],"
+        "\"dtype\":\"float32\"}},"
+        "\"nodes\":[{\"id\":\"identity\",\"opType\":\"Identity\","
+        "\"inputs\":{\"input\":\"value\"},\"outputs\":{\"out\":{"
+        "\"tensor\":\"mock-out\",\"dtype\":\"float32\","
+        "\"shape\":[\"B\",\"S\"]}},\"params\":{}}],"
+        "\"outputs\":[\"mock-out\"],\"banks\":{\"experts\":\"F\"}}";
+    const char* unproved_batch_graph =
+        "{\"format\":\"volvox-graph/v1\","
+        "\"dimensions\":{\"F\":{\"min\":4,\"max\":8,"
+        "\"multiple_of\":4},\"B\":{\"min\":1,\"max\":4}},"
+        "\"inputs\":{\"value\":{\"shape\":[\"B\",2],"
+        "\"dtype\":\"float32\"}},\"nodes\":["
+        "{\"id\":\"mix-lanes\",\"opType\":\"Reshape\","
+        "\"inputs\":{\"input\":\"value\"},\"outputs\":{\"out\":{"
+        "\"tensor\":\"mixed\",\"dtype\":\"float32\","
+        "\"shape\":[2,\"B\"]}},\"params\":{\"shape\":[2,\"B\"]}},"
+        "{\"id\":\"restore\",\"opType\":\"Reshape\","
+        "\"inputs\":{\"input\":\"mixed\"},\"outputs\":{\"out\":{"
+        "\"tensor\":\"mock-out\",\"dtype\":\"float32\","
+        "\"shape\":[\"B\",2]}},\"params\":{\"shape\":[\"B\",2]}}],"
+        "\"outputs\":[\"mock-out\"],\"banks\":{\"experts\":\"F\"}}";
+
+    CHECK(runtime_options.execution_mode == VX_EXECUTION_MODE_SCHEDULED);
+    CHECK(runtime_options.max_batch_delay_milliseconds == 0u);
 
     {
         VxRuntimeOptions invalid_options = runtime_options;
@@ -1154,12 +2021,21 @@ static int test_provider(const char* readable_graph,
         CHECK(vx_runtime_create(&invalid_options, &rejected, &report) ==
               VX_STATUS_INVALID_ARGUMENT);
         CHECK(rejected == NULL);
+        invalid_options = runtime_options;
+        invalid_options.execution_mode = INT32_MAX;
+        CHECK(vx_runtime_create(&invalid_options, &rejected, &report) ==
+              VX_STATUS_INVALID_ARGUMENT);
+        CHECK(rejected == NULL);
         invalid_report.struct_size++;
         CHECK(vx_runtime_create(&runtime_options, &rejected,
                                 &invalid_report) ==
               VX_STATUS_INVALID_ARGUMENT);
         CHECK(rejected == NULL);
     }
+    runtime_options.execution_mode = VX_EXECUTION_MODE_SCHEDULED;
+    runtime_options.max_scheduled_requests = 4u;
+    runtime_options.max_scheduled_input_bytes = 4096u;
+    runtime_options.max_batch_delay_milliseconds = 50u;
     CHECK(vx_runtime_create(&runtime_options, &runtime, &report) == VX_STATUS_OK);
     invalid.struct_size--;
     CHECK(vx_runtime_register_provider(runtime, &invalid, &report) ==
@@ -1170,6 +2046,18 @@ static int test_provider(const char* readable_graph,
           VX_STATUS_INVALID_ARGUMENT);
     invalid = provider;
     invalid.shape_domain.struct_size++;
+    CHECK(vx_runtime_register_provider(runtime, &invalid, &report) ==
+          VX_STATUS_INVALID_ARGUMENT);
+    invalid = provider;
+    invalid.exact_contract_marker++;
+    CHECK(vx_runtime_register_provider(runtime, &invalid, &report) ==
+          VX_STATUS_INVALID_ARGUMENT);
+    invalid = provider;
+    invalid.exact_contract_extent--;
+    CHECK(vx_runtime_register_provider(runtime, &invalid, &report) ==
+          VX_STATUS_INVALID_ARGUMENT);
+    invalid = provider;
+    invalid.context_execute_batch = NULL;
     CHECK(vx_runtime_register_provider(runtime, &invalid, &report) ==
           VX_STATUS_INVALID_ARGUMENT);
     invalid = provider;
@@ -1290,12 +2178,968 @@ static int test_provider(const char* readable_graph,
           VX_STATUS_INVALID_ARGUMENT);
     CHECK(compiled == NULL);
     policy.struct_size = sizeof(policy);
+    mock_batch_contract_max = 8u;
+    CHECK(vx_model_compile(model, &policy, &compiled, &report) ==
+          VX_STATUS_ABI_UNSUPPORTED);
+    CHECK(compiled == NULL &&
+          !strcmp(report.reason, "BATCH_PROOF_MISMATCH"));
+    mock_batch_contract_max = 4u;
+    mock_batch_proof_mismatch = 1;
+    CHECK(vx_model_compile(model, &policy, &compiled, &report) ==
+          VX_STATUS_ABI_UNSUPPORTED);
+    CHECK(compiled == NULL &&
+          !strcmp(report.reason, "BATCH_PROOF_MISMATCH"));
+    mock_batch_proof_mismatch = 0;
+    {
+        VxModelSource alternate_source = source;
+        uint32_t alternate_slots[2] = {1u, 3u};
+        VxBankResidency alternate_residency = {
+            sizeof(VxBankResidency), "experts", alternate_slots, 2u,
+        };
+        VxModel* alternate_model = NULL;
+        VxCompiledModel* rejected = NULL;
+        CHECK(write_text(alternate_axis_path, alternate_axis_graph) == 0);
+        alternate_source.graph_path = alternate_axis_path;
+        alternate_source.bank_residency = &alternate_residency;
+        alternate_source.bank_residency_count = 1u;
+        CHECK(vx_runtime_load_model(runtime, &alternate_source,
+                                    &alternate_model, &report) == VX_STATUS_OK);
+        mock_batch_attested_tensor_bytes = 16u * sizeof(float);
+        mock_batch_contract_axis = 1;
+        CHECK(vx_model_compile(alternate_model, &policy, &rejected, &report) ==
+              VX_STATUS_ABI_UNSUPPORTED);
+        CHECK(rejected == NULL &&
+              !strcmp(report.reason, "BATCH_PROOF_MISMATCH"));
+        mock_batch_contract_axis = 0;
+        vx_model_release(alternate_model);
+        alternate_model = NULL;
+        CHECK(write_text(alternate_axis_path, unproved_batch_graph) == 0);
+        CHECK(vx_runtime_load_model(runtime, &alternate_source,
+                                    &alternate_model, &report) == VX_STATUS_OK);
+        mock_batch_attested_tensor_bytes = 8u * sizeof(float);
+        CHECK(vx_model_compile(alternate_model, &policy, &rejected, &report) ==
+              VX_STATUS_ABI_UNSUPPORTED);
+        CHECK(rejected == NULL &&
+              !strcmp(report.reason, "BATCH_PROOF_MISMATCH"));
+        mock_batch_attested_tensor_bytes = 4u * sizeof(float);
+        vx_model_release(alternate_model);
+        CHECK(remove(alternate_axis_path) == 0);
+    }
     CHECK(vx_model_compile(model, &policy, &compiled, &report) == VX_STATUS_OK);
-    CHECK(mock_bank_source_seen == 1);
+    CHECK(mock_bank_source_seen == 5);
     CHECK(!strcmp(report.backend, "test-provider"));
     CHECK(!strcmp(report.device, "mock-device-0") && report.route_attested &&
           !report.operator_fallback_used && report.route_evidence[0] &&
           report.operator_fallback == VX_OPERATOR_FALLBACK_ALLOW);
+    {
+        const float direct_bulk_input[2] = {2.0f, 4.0f};
+        float direct_bulk_output[2] = {0.0f, 0.0f};
+        VxTensorBinding direct_bulk_binding = {
+            sizeof(VxTensorBinding), "value", VX_DTYPE_F32, 1u, {2},
+            direct_bulk_input, sizeof(direct_bulk_input), VX_MEMORY_HOST,
+        };
+        VxResult* direct_bulk_result = NULL;
+        int calls_before_direct_bulk = mock_single_execute_calls;
+
+        CHECK(vx_runtime_run(runtime, compiled, &direct_bulk_binding, 1u,
+                             &direct_bulk_result, &report) == VX_STATUS_OK);
+        CHECK(direct_bulk_result != NULL &&
+              mock_single_execute_calls == calls_before_direct_bulk + 1);
+        CHECK(vx_result_read(direct_bulk_result, "mock-out",
+                             direct_bulk_output, sizeof(direct_bulk_output),
+                             NULL, &report) == VX_STATUS_OK);
+        CHECK(closef(direct_bulk_output[0], 4.0f) &&
+              closef(direct_bulk_output[1], 8.0f));
+        vx_result_release(direct_bulk_result);
+    }
+    {
+        VxCompiledModel* hostile_compiled = NULL;
+        mock_poison_report_mask = MOCK_POISON_COMPILE_REPORT;
+        CHECK(vx_model_compile(model, &policy, &hostile_compiled, &report) ==
+              VX_STATUS_OK);
+        CHECK(hostile_compiled != NULL && report_strings_terminated(&report));
+        mock_poison_report_mask = 0;
+        vx_compiled_model_release(hostile_compiled);
+    }
+    {
+        VxCompiledModel* cold_compiled = NULL;
+        VxRuntimeSubmitOptions scheduled = VX_RUNTIME_SUBMIT_OPTIONS_INIT;
+        VxResult* held = NULL;
+        VxResult* recovered = NULL;
+        VxRequest* rejected = NULL;
+        int creates_before_rejection;
+
+        CHECK(vx_model_compile(model, &policy, &cold_compiled, &report) ==
+              VX_STATUS_OK);
+        CHECK(vx_public_api_test_runtime_set_result_budget(runtime, 1u, 16u) ==
+              0);
+        CHECK(vx_runtime_run(runtime, compiled, &input_binding, 1u, &held,
+                             &report) == VX_STATUS_OK);
+        creates_before_rejection = mock_context_create_calls;
+        CHECK(vx_runtime_run(runtime, cold_compiled, &input_binding, 1u,
+                             &recovered, &report) == VX_STATUS_OVERLOADED);
+        CHECK(recovered == NULL && mock_context_create_calls ==
+              creates_before_rejection);
+        CHECK(vx_runtime_submit(runtime, cold_compiled, &input_binding, 1u,
+                                &scheduled, &rejected, &report) ==
+              VX_STATUS_OVERLOADED);
+        CHECK(rejected == NULL && mock_context_create_calls ==
+              creates_before_rejection &&
+              vx_public_api_test_runtime_coordinator_allocated(runtime) == 1);
+        vx_result_release(held);
+        CHECK(vx_runtime_run(runtime, cold_compiled, &input_binding, 1u,
+                             &recovered, &report) == VX_STATUS_OK);
+        CHECK(mock_context_create_calls == creates_before_rejection + 1);
+        vx_result_release(recovered);
+        vx_compiled_model_release(cold_compiled);
+        CHECK(vx_public_api_test_runtime_set_result_budget(
+                  runtime, 64u, 64u * 1024u * 1024u) == 0);
+    }
+    {
+        VxRuntimeSubmitOptions submit_options =
+            VX_RUNTIME_SUBMIT_OPTIONS_INIT;
+        VxRequest* first_request = NULL;
+        VxRequest* second_request = NULL;
+        VxResult* first_result = NULL;
+        VxResult* second_result = NULL;
+        float first_value = 2.5f;
+        float second_value = 4.5f;
+        float first_output = 0.0f;
+        float second_output = 0.0f;
+        VxTensorBinding first_binding = {
+            sizeof(VxTensorBinding), "value", VX_DTYPE_F32, 1u, {1},
+            &first_value, sizeof(first_value), VX_MEMORY_HOST,
+        };
+        VxTensorBinding second_binding = {
+            sizeof(VxTensorBinding), "value", VX_DTYPE_F32, 1u, {1},
+            &second_value, sizeof(second_value), VX_MEMORY_HOST,
+        };
+        size_t active_requests = 0;
+        size_t active_input_bytes = 0;
+        uint64_t dispatches = 0;
+        mock_batch_execute_calls = 0;
+        mock_batch_last_size = 0;
+        mock_batch_fail_after_first = 0;
+        mock_single_execute_calls = 0;
+        mock_poison_report_mask = MOCK_POISON_BATCH_REPORT;
+        CHECK(vx_public_api_test_runtime_set_result_budget(runtime, 2u,
+                                                           32u) == 0);
+        CHECK(vx_runtime_submit(runtime, compiled, &first_binding, 1u,
+                                &submit_options, &first_request, &report) ==
+              VX_STATUS_OK);
+        CHECK(vx_runtime_submit(runtime, compiled, &second_binding, 1u,
+                                &submit_options, &second_request, &report) ==
+              VX_STATUS_OK);
+        CHECK(vx_request_wait(first_request, VX_REQUEST_WAIT_INFINITE,
+                              &report) == VX_STATUS_OK);
+        CHECK(vx_request_wait(second_request, VX_REQUEST_WAIT_INFINITE,
+                              &report) == VX_STATUS_OK);
+        CHECK(report_strings_terminated(&report));
+        mock_poison_report_mask = 0;
+        CHECK(mock_batch_execute_calls == 1 && mock_batch_last_size == 2u);
+        CHECK(vx_request_result(first_request, &first_result, &report) ==
+              VX_STATUS_OK);
+        CHECK(vx_request_result(second_request, &second_result, &report) ==
+              VX_STATUS_OK);
+        CHECK(vx_result_read(first_result, "mock-out", &first_output,
+                             sizeof(first_output), NULL, &report) ==
+              VX_STATUS_OK);
+        CHECK(vx_result_read(second_result, "mock-out", &second_output,
+                             sizeof(second_output), NULL, &report) ==
+              VX_STATUS_OK);
+        CHECK(closef(first_output, 5.0f) && closef(second_output, 9.0f));
+        CHECK(vx_public_api_test_runtime_coordinator_stats(
+                  runtime, &active_requests, &active_input_bytes,
+                  &dispatches) == 1);
+        CHECK(active_requests == 0 && active_input_bytes == 0 &&
+              dispatches == 1u);
+        {
+            VxRequest* rejected = NULL;
+            CHECK(vx_runtime_submit(runtime, compiled, &first_binding, 1u,
+                                    &submit_options, &rejected, &report) ==
+                  VX_STATUS_OVERLOADED);
+            CHECK(rejected == NULL && !strcmp(report.reason, "OVERLOADED"));
+        }
+        vx_result_release(second_result);
+        vx_result_release(first_result);
+        vx_request_release(second_request);
+        vx_request_release(first_request);
+        CHECK(vx_public_api_test_runtime_set_result_budget(
+                  runtime, 64u, 64u * 1024u * 1024u) == 0);
+
+        first_request = NULL;
+        second_request = NULL;
+        first_result = NULL;
+        second_result = NULL;
+        mock_batch_fail_after_first = 1;
+        CHECK(vx_runtime_submit(runtime, compiled, &first_binding, 1u,
+                                &submit_options, &first_request, &report) ==
+              VX_STATUS_OK);
+        CHECK(vx_runtime_submit(runtime, compiled, &second_binding, 1u,
+                                &submit_options, &second_request, &report) ==
+              VX_STATUS_OK);
+        CHECK(vx_request_wait(first_request, VX_REQUEST_WAIT_INFINITE,
+                              &report) == VX_STATUS_EXECUTION_FAILED);
+        CHECK(vx_request_wait(second_request, VX_REQUEST_WAIT_INFINITE,
+                              &report) == VX_STATUS_EXECUTION_FAILED);
+        CHECK(vx_request_result(first_request, &first_result, &report) ==
+              VX_STATUS_EXECUTION_FAILED);
+        CHECK(vx_request_result(second_request, &second_result, &report) ==
+              VX_STATUS_EXECUTION_FAILED);
+        CHECK(first_result == NULL && second_result == NULL &&
+              mock_batch_execute_calls == 2 && mock_batch_last_size == 2u);
+        mock_batch_fail_after_first = 0;
+        vx_request_release(second_request);
+        vx_request_release(first_request);
+
+        {
+            VxRequest* third_request = NULL;
+            VxResult* third_result = NULL;
+            float third_value = 6.5f;
+            float third_output = 0.0f;
+            VxTensorBinding third_binding = {
+                sizeof(VxTensorBinding), "value", VX_DTYPE_F32, 1u, {1},
+                &third_value, sizeof(third_value), VX_MEMORY_HOST,
+            };
+            first_request = NULL;
+            second_request = NULL;
+            CHECK(vx_runtime_submit(runtime, compiled, &first_binding, 1u,
+                                    &submit_options, &first_request, &report) ==
+                  VX_STATUS_OK);
+            CHECK(vx_runtime_submit(runtime, compiled, &second_binding, 1u,
+                                    &submit_options, &second_request, &report) ==
+                  VX_STATUS_OK);
+            CHECK(vx_runtime_submit(runtime, compiled, &third_binding, 1u,
+                                    &submit_options, &third_request, &report) ==
+                  VX_STATUS_OK);
+            CHECK(vx_request_wait(first_request, VX_REQUEST_WAIT_INFINITE,
+                                  &report) == VX_STATUS_OK);
+            CHECK(vx_request_wait(second_request, VX_REQUEST_WAIT_INFINITE,
+                                  &report) == VX_STATUS_OK);
+            CHECK(vx_request_wait(third_request, VX_REQUEST_WAIT_INFINITE,
+                                  &report) == VX_STATUS_OK);
+            CHECK(mock_batch_execute_calls == 3 &&
+                  mock_batch_last_size == 2u &&
+                  mock_single_execute_calls == 1);
+            CHECK(vx_request_result(third_request, &third_result, &report) ==
+                  VX_STATUS_OK);
+            CHECK(vx_result_read(third_result, "mock-out", &third_output,
+                                 sizeof(third_output), NULL, &report) ==
+                  VX_STATUS_OK);
+            CHECK(closef(third_output, 13.0f));
+            vx_result_release(third_result);
+            vx_request_release(third_request);
+            vx_request_release(second_request);
+            vx_request_release(first_request);
+        }
+
+        {
+            CpuGateProbe gate = {0};
+            VxRuntimeSubmitOptions scheduled =
+                VX_RUNTIME_SUBMIT_OPTIONS_INIT;
+            VxRequestInfo cancelled_info = VX_REQUEST_INFO_INIT;
+            VxRequestInfo succeeded_info = VX_REQUEST_INFO_INIT;
+            VxRequest* cancelled_request = NULL;
+            VxRequest* succeeded_request = NULL;
+            VxRequest* recovery_request = NULL;
+            VxRequest* overloaded_request = NULL;
+            VxResult* cancelled_result = NULL;
+            VxResult* succeeded_result = NULL;
+            float cancelled_value = 18.0f;
+            float succeeded_value = 19.0f;
+            float recovery_value = 20.0f;
+            float succeeded_output = 0.0f;
+            VxTensorBinding cancelled_binding = {
+                sizeof(VxTensorBinding), "value", VX_DTYPE_F32, 1u, {1},
+                &cancelled_value, sizeof(cancelled_value), VX_MEMORY_HOST,
+            };
+            VxTensorBinding succeeded_binding = {
+                sizeof(VxTensorBinding), "value", VX_DTYPE_F32, 1u, {1},
+                &succeeded_value, sizeof(succeeded_value), VX_MEMORY_HOST,
+            };
+            VxTensorBinding recovery_binding = {
+                sizeof(VxTensorBinding), "value", VX_DTYPE_F32, 1u, {1},
+                &recovery_value, sizeof(recovery_value), VX_MEMORY_HOST,
+            };
+            VxStatus cancelled_poll_status;
+            VxStatus succeeded_poll_status;
+            VxStatus cancel_status;
+            VxStatus recovery_submit_status = VX_STATUS_OVERLOADED;
+            size_t active_requests = 0;
+            size_t active_input_bytes = 0;
+            uint64_t dispatches_before = 0;
+            uint64_t dispatches_after = 0;
+            uint64_t ownership_deadline;
+            struct timespec entered_deadline;
+            struct timespec retry_pause = {0, 1000000L};
+            int wait_status = 0;
+            int gate_entered;
+            int batch_calls_before = mock_batch_execute_calls;
+            int single_calls_before = mock_single_execute_calls;
+            int contexts_closed_before = mock_context_closed;
+            int contexts_destroyed_before = mock_context_destroyed;
+            int compiled_destroyed_before = mock_compiled_destroyed;
+            int runtimes_destroyed_before = mock_runtime_destroyed;
+            int budget_reset = -1;
+
+            CHECK(vx_public_api_test_runtime_coordinator_stats(
+                      runtime, &active_requests, &active_input_bytes,
+                      &dispatches_before) == 1);
+            CHECK(active_requests == 0 && active_input_bytes == 0);
+            CHECK(vx_public_api_test_runtime_set_result_budget(runtime, 2u,
+                                                               32u) == 0);
+            CHECK(pthread_mutex_init(&gate.mutex, NULL) == 0);
+            CHECK(pthread_cond_init(&gate.condition, NULL) == 0);
+            vx_public_api_test_set_batch_after_completion_hook(
+                cpu_gate_hook, &gate);
+            CHECK(vx_runtime_submit(runtime, compiled, &cancelled_binding, 1u,
+                                    &scheduled, &cancelled_request, &report) ==
+                  VX_STATUS_OK);
+            CHECK(vx_runtime_submit(runtime, compiled, &succeeded_binding, 1u,
+                                    &scheduled, &succeeded_request, &report) ==
+                  VX_STATUS_OK);
+            pthread_mutex_lock(&gate.mutex);
+            timespec_get(&entered_deadline, TIME_UTC);
+            entered_deadline.tv_sec += 3;
+            while (!gate.entered && wait_status != ETIMEDOUT)
+                wait_status = pthread_cond_timedwait(
+                    &gate.condition, &gate.mutex, &entered_deadline);
+            gate_entered = gate.entered;
+            pthread_mutex_unlock(&gate.mutex);
+
+            cancelled_poll_status = vx_request_poll(
+                cancelled_request, &cancelled_info, &report);
+            succeeded_poll_status = vx_request_poll(
+                succeeded_request, &succeeded_info, &report);
+            cancel_status = vx_request_cancel(cancelled_request, &report);
+            pthread_mutex_lock(&gate.mutex);
+            gate.released = 1;
+            pthread_cond_broadcast(&gate.condition);
+            pthread_mutex_unlock(&gate.mutex);
+
+            CHECK(gate_entered == 1 && wait_status != ETIMEDOUT);
+            CHECK(cancelled_poll_status == VX_STATUS_BUSY &&
+                  cancelled_info.state == VX_RUNTIME_REQUEST_RUNNING);
+            CHECK(succeeded_poll_status == VX_STATUS_BUSY &&
+                  succeeded_info.state == VX_RUNTIME_REQUEST_RUNNING);
+            CHECK(cancel_status == VX_STATUS_OK);
+            CHECK(mock_batch_execute_calls == batch_calls_before + 1 &&
+                  mock_batch_last_size == 2u &&
+                  closef(mock_batch_last_values[0], cancelled_value) &&
+                  closef(mock_batch_last_values[1], succeeded_value));
+            CHECK(vx_request_wait(cancelled_request,
+                                  VX_REQUEST_WAIT_INFINITE, &report) ==
+                  VX_STATUS_CANCELLED);
+            CHECK(vx_request_wait(succeeded_request,
+                                  VX_REQUEST_WAIT_INFINITE, &report) ==
+                  VX_STATUS_OK);
+            vx_public_api_test_set_batch_after_completion_hook(NULL, NULL);
+            CHECK(vx_request_poll(cancelled_request, &cancelled_info,
+                                  &report) == VX_STATUS_CANCELLED);
+            CHECK(cancelled_info.state == VX_RUNTIME_REQUEST_CANCELLED);
+            CHECK(vx_request_poll(succeeded_request, &succeeded_info,
+                                  &report) == VX_STATUS_OK);
+            CHECK(succeeded_info.state == VX_RUNTIME_REQUEST_SUCCEEDED);
+            CHECK(vx_request_result(cancelled_request, &cancelled_result,
+                                    &report) == VX_STATUS_CANCELLED);
+            CHECK(cancelled_result == NULL);
+            CHECK(vx_request_result(succeeded_request, &succeeded_result,
+                                    &report) == VX_STATUS_OK);
+            CHECK(vx_result_read(succeeded_result, "mock-out",
+                                 &succeeded_output, sizeof(succeeded_output),
+                                 NULL, &report) == VX_STATUS_OK);
+            CHECK(closef(succeeded_output, 38.0f));
+            CHECK(vx_public_api_test_runtime_coordinator_stats(
+                      runtime, &active_requests, &active_input_bytes,
+                      &dispatches_after) == 1);
+            CHECK(active_requests == 0 && active_input_bytes == 0 &&
+                  dispatches_after == dispatches_before + 1u);
+
+            /* The cancelled lane's result ticket is released after the
+             * physical callback, while the successful lane keeps exactly one
+             * ticket until its published result is destroyed. */
+            ownership_deadline = vx_runtime_monotonic_time_micros() +
+                UINT64_C(3000000);
+            do {
+                recovery_request = NULL;
+                recovery_submit_status = vx_runtime_submit(
+                    runtime, compiled, &recovery_binding, 1u, &scheduled,
+                    &recovery_request, &report);
+                if (recovery_submit_status == VX_STATUS_OVERLOADED)
+                    nanosleep(&retry_pause, NULL);
+            } while (recovery_submit_status == VX_STATUS_OVERLOADED &&
+                     vx_runtime_monotonic_time_micros() < ownership_deadline);
+            CHECK(recovery_submit_status == VX_STATUS_OK && recovery_request);
+            CHECK(vx_runtime_submit(runtime, compiled, &recovery_binding, 1u,
+                                    &scheduled, &overloaded_request, &report) ==
+                  VX_STATUS_OVERLOADED);
+            CHECK(overloaded_request == NULL);
+            CHECK(vx_request_wait(recovery_request, VX_REQUEST_WAIT_INFINITE,
+                                  &report) == VX_STATUS_OK);
+            CHECK(mock_batch_execute_calls == batch_calls_before + 1 &&
+                  mock_single_execute_calls == single_calls_before + 1);
+            CHECK(mock_context_closed == contexts_closed_before &&
+                  mock_context_destroyed == contexts_destroyed_before &&
+                  mock_compiled_destroyed == compiled_destroyed_before &&
+                  mock_runtime_destroyed == runtimes_destroyed_before);
+
+            vx_request_release(recovery_request);
+            vx_result_release(succeeded_result);
+            vx_request_release(succeeded_request);
+            vx_request_release(cancelled_request);
+            ownership_deadline = vx_runtime_monotonic_time_micros() +
+                UINT64_C(3000000);
+            do {
+                budget_reset = vx_public_api_test_runtime_set_result_budget(
+                    runtime, 64u, 64u * 1024u * 1024u);
+                if (budget_reset != 0) nanosleep(&retry_pause, NULL);
+            } while (budget_reset != 0 &&
+                     vx_runtime_monotonic_time_micros() < ownership_deadline);
+            CHECK(budget_reset == 0);
+            pthread_cond_destroy(&gate.condition);
+            pthread_mutex_destroy(&gate.mutex);
+        }
+
+        {
+            CpuGateProbe gate = {0};
+            VxRuntimeSubmitOptions latest =
+                VX_RUNTIME_SUBMIT_OPTIONS_INIT;
+            VxRequestInfo old_info = VX_REQUEST_INFO_INIT;
+            VxRequest* old_request = NULL;
+            VxRequest* new_request = NULL;
+            VxResult* old_result = NULL;
+            VxResult* new_result = NULL;
+            float old_value = 16.0f;
+            float new_value = 17.0f;
+            float new_output = 0.0f;
+            VxTensorBinding old_binding = {
+                sizeof(VxTensorBinding), "value", VX_DTYPE_F32, 1u, {1},
+                &old_value, sizeof(old_value), VX_MEMORY_HOST,
+            };
+            VxTensorBinding new_binding = {
+                sizeof(VxTensorBinding), "value", VX_DTYPE_F32, 1u, {1},
+                &new_value, sizeof(new_value), VX_MEMORY_HOST,
+            };
+            struct timespec entered_deadline;
+            int wait_status = 0;
+
+            CHECK(pthread_mutex_init(&gate.mutex, NULL) == 0);
+            CHECK(pthread_cond_init(&gate.condition, NULL) == 0);
+            latest.freshness = VX_RUNTIME_FRESHNESS_LATEST;
+            latest.stream_key = UINT64_C(1701);
+            mock_execute_gate = &gate;
+            CHECK(vx_runtime_submit(runtime, compiled, &old_binding, 1u,
+                                    &latest, &old_request, &report) ==
+                  VX_STATUS_OK);
+            pthread_mutex_lock(&gate.mutex);
+            timespec_get(&entered_deadline, TIME_UTC);
+            entered_deadline.tv_sec += 3;
+            while (!gate.entered && wait_status != ETIMEDOUT)
+                wait_status = pthread_cond_timedwait(
+                    &gate.condition, &gate.mutex, &entered_deadline);
+            pthread_mutex_unlock(&gate.mutex);
+            CHECK(gate.entered == 1 && wait_status != ETIMEDOUT);
+
+            CHECK(vx_runtime_submit(runtime, compiled, &new_binding, 1u,
+                                    &latest, &new_request, &report) ==
+                  VX_STATUS_OK);
+            CHECK(vx_request_poll(old_request, &old_info, &report) ==
+                  VX_STATUS_BUSY);
+            CHECK(old_info.state == VX_RUNTIME_REQUEST_RUNNING);
+            pthread_mutex_lock(&gate.mutex);
+            gate.released = 1;
+            pthread_cond_broadcast(&gate.condition);
+            pthread_mutex_unlock(&gate.mutex);
+
+            CHECK(vx_request_wait(old_request, VX_REQUEST_WAIT_INFINITE,
+                                  &report) == VX_STATUS_SUPERSEDED);
+            CHECK(vx_request_poll(old_request, &old_info, &report) ==
+                  VX_STATUS_SUPERSEDED);
+            CHECK(old_info.state == VX_RUNTIME_REQUEST_SUPERSEDED &&
+                  !strcmp(report.reason, "SUPERSEDED"));
+            CHECK(vx_request_result(old_request, &old_result, &report) ==
+                  VX_STATUS_SUPERSEDED);
+            CHECK(old_result == NULL);
+            CHECK(vx_request_wait(new_request, VX_REQUEST_WAIT_INFINITE,
+                                  &report) == VX_STATUS_OK);
+            CHECK(vx_request_result(new_request, &new_result, &report) ==
+                  VX_STATUS_OK);
+            CHECK(vx_result_read(new_result, "mock-out", &new_output,
+                                 sizeof(new_output), NULL, &report) ==
+                  VX_STATUS_OK);
+            CHECK(closef(new_output, 34.0f));
+            mock_execute_gate = NULL;
+            vx_result_release(new_result);
+            vx_request_release(new_request);
+            vx_request_release(old_request);
+            pthread_cond_destroy(&gate.condition);
+            pthread_mutex_destroy(&gate.mutex);
+        }
+
+        {
+            CpuGateProbe gate = {0};
+            VxRuntimeSubmitOptions latest =
+                VX_RUNTIME_SUBMIT_OPTIONS_INIT;
+            VxRuntimeSubmitOptions replacement_latest =
+                VX_RUNTIME_SUBMIT_OPTIONS_INIT;
+            VxRequestInfo old_info = VX_REQUEST_INFO_INIT;
+            VxRequestInfo new_info = VX_REQUEST_INFO_INIT;
+            VxRequest* old_request = NULL;
+            VxRequest* new_request = NULL;
+            VxRequest* rejected = NULL;
+            VxResult* new_result = NULL;
+            float old_value = 14.0f;
+            float new_values[2] = {15.0f, 16.0f};
+            float new_output[2] = {0};
+            VxTensorBinding old_binding = {
+                sizeof(VxTensorBinding), "value", VX_DTYPE_F32, 1u, {1},
+                &old_value, sizeof(old_value), VX_MEMORY_HOST,
+            };
+            VxTensorBinding new_binding = {
+                sizeof(VxTensorBinding), "value", VX_DTYPE_F32, 1u, {2},
+                new_values, sizeof(new_values), VX_MEMORY_HOST,
+            };
+            size_t active_requests = 0;
+            size_t active_input_bytes = 0;
+            uint64_t dispatches = 0;
+            size_t replacement_budget;
+            struct timespec deadline;
+            int wait_status = 0;
+
+            CHECK(pthread_mutex_init(&gate.mutex, NULL) == 0);
+            CHECK(pthread_cond_init(&gate.condition, NULL) == 0);
+            latest.freshness = VX_RUNTIME_FRESHNESS_LATEST;
+            latest.stream_key = UINT64_C(1401);
+            replacement_latest = latest;
+            CHECK(vx_public_api_test_runtime_set_request_budget(runtime, 1u) ==
+                  0);
+            CHECK(vx_public_api_test_runtime_set_result_budget(runtime, 1u,
+                                                               4096u) == 0);
+            vx_public_api_test_set_coordinator_before_select_hook(
+                cpu_gate_hook, &gate);
+            CHECK(vx_runtime_submit(runtime, compiled, &old_binding, 1u,
+                                    &latest, &old_request, &report) ==
+                  VX_STATUS_OK);
+            pthread_mutex_lock(&gate.mutex);
+            timespec_get(&deadline, TIME_UTC);
+            deadline.tv_sec += 3;
+            while (!gate.entered && wait_status != ETIMEDOUT)
+                wait_status = pthread_cond_timedwait(
+                    &gate.condition, &gate.mutex, &deadline);
+            pthread_mutex_unlock(&gate.mutex);
+            CHECK(gate.entered == 1 && wait_status != ETIMEDOUT);
+            CHECK(vx_request_poll(old_request, &old_info, &report) ==
+                  VX_STATUS_BUSY);
+            CHECK(old_info.state == VX_RUNTIME_REQUEST_QUEUED);
+            CHECK(vx_public_api_test_runtime_coordinator_stats(
+                      runtime, &active_requests, &active_input_bytes,
+                      &dispatches) == 1);
+            CHECK(active_requests == 1u &&
+                  active_input_bytes == old_info.owned_input_bytes);
+
+            /* The logical request slot is transferable, but a larger frame
+             * cannot discount the still-live predecessor's payload bytes. */
+            CHECK(vx_public_api_test_runtime_set_input_budget(
+                      runtime, active_input_bytes) == 0);
+            CHECK(vx_runtime_submit(runtime, compiled, &new_binding, 1u,
+                                    &latest, &rejected, &report) ==
+                  VX_STATUS_OVERLOADED);
+            CHECK(rejected == NULL);
+            CHECK(vx_request_poll(old_request, &old_info, &report) ==
+                  VX_STATUS_BUSY &&
+                  old_info.state == VX_RUNTIME_REQUEST_QUEUED);
+
+            replacement_budget = active_input_bytes * 2u + sizeof(float);
+            CHECK(vx_public_api_test_runtime_set_input_budget(
+                      runtime, replacement_budget) == 0);
+            CHECK(vx_runtime_submit(runtime, compiled, &new_binding, 1u,
+                                    &replacement_latest, &new_request, &report) ==
+                  VX_STATUS_OK);
+            CHECK(vx_request_wait(old_request, VX_REQUEST_WAIT_INFINITE,
+                                  &report) == VX_STATUS_SUPERSEDED);
+            CHECK(vx_request_poll(new_request, &new_info, &report) ==
+                  VX_STATUS_BUSY);
+            CHECK(new_info.state == VX_RUNTIME_REQUEST_QUEUED);
+            CHECK(vx_public_api_test_runtime_coordinator_stats(
+                      runtime, &active_requests, &active_input_bytes,
+                      &dispatches) == 1);
+            CHECK(active_requests == 1u &&
+                  active_input_bytes == old_info.owned_input_bytes +
+                      sizeof(float));
+            vx_public_api_test_set_coordinator_before_select_hook(NULL, NULL);
+            pthread_mutex_lock(&gate.mutex);
+            gate.released = 1;
+            pthread_cond_broadcast(&gate.condition);
+            pthread_mutex_unlock(&gate.mutex);
+            CHECK(vx_request_wait(new_request, VX_REQUEST_WAIT_INFINITE,
+                                  &report) == VX_STATUS_OK);
+            CHECK(vx_request_result(new_request, &new_result, &report) ==
+                  VX_STATUS_OK);
+            CHECK(vx_result_read(new_result, "mock-out", new_output,
+                                 sizeof(new_output), NULL, &report) ==
+                  VX_STATUS_OK);
+            CHECK(closef(new_output[0], 30.0f) &&
+                  closef(new_output[1], 32.0f));
+            vx_result_release(new_result);
+            vx_request_release(new_request);
+            vx_request_release(old_request);
+            CHECK(vx_public_api_test_runtime_set_result_budget(
+                      runtime, 64u, 64u * 1024u * 1024u) == 0);
+            CHECK(vx_public_api_test_runtime_set_input_budget(runtime, 4096u) ==
+                  0);
+            CHECK(vx_public_api_test_runtime_set_request_budget(runtime, 4u) ==
+                  0);
+            pthread_cond_destroy(&gate.condition);
+            pthread_mutex_destroy(&gate.mutex);
+        }
+
+        {
+            VxRuntimeSubmitOptions deadline_options =
+                VX_RUNTIME_SUBMIT_OPTIONS_INIT;
+            VxRequestInfo deadline_info = VX_REQUEST_INFO_INIT;
+            VxRequest* deadline_request = NULL;
+            int single_calls_before = mock_single_execute_calls;
+
+            deadline_options.freshness =
+                VX_RUNTIME_FRESHNESS_DROP_IF_LATE;
+            deadline_options.deadline_monotonic_micros =
+                vx_runtime_monotonic_time_micros() + UINT64_C(40000);
+            CHECK(vx_runtime_submit(runtime, compiled, &first_binding, 1u,
+                                    &deadline_options, &deadline_request,
+                                    &report) == VX_STATUS_OK);
+            CHECK(vx_request_wait(deadline_request,
+                                  VX_REQUEST_WAIT_INFINITE,
+                                  &report) == VX_STATUS_OK);
+            CHECK(vx_request_poll(deadline_request, &deadline_info,
+                                  &report) == VX_STATUS_OK);
+            CHECK(deadline_info.state == VX_RUNTIME_REQUEST_SUCCEEDED &&
+                  deadline_info.deadline_missed == 0 &&
+                  mock_single_execute_calls == single_calls_before + 1);
+            vx_request_release(deadline_request);
+        }
+
+        {
+            CpuGateProbe gate = {0};
+            VxRuntimeSubmitOptions blocker_options =
+                VX_RUNTIME_SUBMIT_OPTIONS_INIT;
+            VxRuntimeSubmitOptions low_options =
+                VX_RUNTIME_SUBMIT_OPTIONS_INIT;
+            VxRuntimeSubmitOptions high_options =
+                VX_RUNTIME_SUBMIT_OPTIONS_INIT;
+            VxRuntimeSubmitOptions medium_options =
+                VX_RUNTIME_SUBMIT_OPTIONS_INIT;
+            VxRequest* blocker_request = NULL;
+            VxRequest* low_request = NULL;
+            VxRequest* high_request = NULL;
+            VxRequest* medium_request = NULL;
+            float blocker_value = 10.0f;
+            float low_value = 1.0f;
+            float high_value = 3.0f;
+            float medium_value = 2.0f;
+            VxTensorBinding blocker_binding = {
+                sizeof(VxTensorBinding), "value", VX_DTYPE_F32, 1u, {1},
+                &blocker_value, sizeof(blocker_value), VX_MEMORY_HOST,
+            };
+            VxTensorBinding low_binding = {
+                sizeof(VxTensorBinding), "value", VX_DTYPE_F32, 1u, {1},
+                &low_value, sizeof(low_value), VX_MEMORY_HOST,
+            };
+            VxTensorBinding high_binding = {
+                sizeof(VxTensorBinding), "value", VX_DTYPE_F32, 1u, {1},
+                &high_value, sizeof(high_value), VX_MEMORY_HOST,
+            };
+            VxTensorBinding medium_binding = {
+                sizeof(VxTensorBinding), "value", VX_DTYPE_F32, 1u, {1},
+                &medium_value, sizeof(medium_value), VX_MEMORY_HOST,
+            };
+            struct timespec entered_deadline;
+            int batch_calls_before = mock_batch_execute_calls;
+            int wait_status = 0;
+
+            CHECK(pthread_mutex_init(&gate.mutex, NULL) == 0);
+            CHECK(pthread_cond_init(&gate.condition, NULL) == 0);
+            low_options.priority = -100;
+            high_options.priority = 100;
+            medium_options.priority = 50;
+            mock_execute_gate = &gate;
+            CHECK(vx_runtime_submit(runtime, compiled, &blocker_binding, 1u,
+                                    &blocker_options, &blocker_request,
+                                    &report) == VX_STATUS_OK);
+            pthread_mutex_lock(&gate.mutex);
+            timespec_get(&entered_deadline, TIME_UTC);
+            entered_deadline.tv_sec += 3;
+            while (!gate.entered && wait_status != ETIMEDOUT)
+                wait_status = pthread_cond_timedwait(
+                    &gate.condition, &gate.mutex, &entered_deadline);
+            pthread_mutex_unlock(&gate.mutex);
+            CHECK(gate.entered == 1 && wait_status != ETIMEDOUT);
+            CHECK(vx_runtime_submit(runtime, compiled, &low_binding, 1u,
+                                    &low_options, &low_request,
+                                    &report) == VX_STATUS_OK);
+            CHECK(vx_runtime_submit(runtime, compiled, &high_binding, 1u,
+                                    &high_options, &high_request,
+                                    &report) == VX_STATUS_OK);
+            CHECK(vx_runtime_submit(runtime, compiled, &medium_binding, 1u,
+                                    &medium_options, &medium_request,
+                                    &report) == VX_STATUS_OK);
+            pthread_mutex_lock(&gate.mutex);
+            gate.released = 1;
+            pthread_cond_broadcast(&gate.condition);
+            pthread_mutex_unlock(&gate.mutex);
+            CHECK(vx_request_wait(blocker_request,
+                                  VX_REQUEST_WAIT_INFINITE,
+                                  &report) == VX_STATUS_OK);
+            CHECK(vx_request_wait(high_request, VX_REQUEST_WAIT_INFINITE,
+                                  &report) == VX_STATUS_OK);
+            CHECK(vx_request_wait(medium_request, VX_REQUEST_WAIT_INFINITE,
+                                  &report) == VX_STATUS_OK);
+            CHECK(vx_request_wait(low_request, VX_REQUEST_WAIT_INFINITE,
+                                  &report) == VX_STATUS_OK);
+            CHECK(mock_batch_execute_calls == batch_calls_before + 1 &&
+                  mock_batch_last_size == 2u &&
+                  closef(mock_batch_last_values[0], high_value) &&
+                  closef(mock_batch_last_values[1], medium_value));
+            mock_execute_gate = NULL;
+            vx_request_release(medium_request);
+            vx_request_release(high_request);
+            vx_request_release(low_request);
+            vx_request_release(blocker_request);
+            pthread_cond_destroy(&gate.condition);
+            pthread_mutex_destroy(&gate.mutex);
+        }
+
+        {
+            CpuGateProbe wait_probe = {0};
+            VxRuntimeSubmitOptions waiting_options =
+                VX_RUNTIME_SUBMIT_OPTIONS_INIT;
+            VxRuntimeSubmitOptions ready_options =
+                VX_RUNTIME_SUBMIT_OPTIONS_INIT;
+            VxRequest* waiting = NULL;
+            VxRequest* ready = NULL;
+            struct timespec deadline;
+            int wait_status = 0;
+
+            CHECK(pthread_mutex_init(&wait_probe.mutex, NULL) == 0);
+            CHECK(pthread_cond_init(&wait_probe.condition, NULL) == 0);
+            wait_probe.released = 1;
+            vx_public_api_test_set_batch_delay_wait_hook(cpu_gate_hook,
+                                                     &wait_probe);
+            CHECK(vx_runtime_submit(runtime, compiled, &first_binding, 1u,
+                                    &waiting_options, &waiting, &report) ==
+                  VX_STATUS_OK);
+            pthread_mutex_lock(&wait_probe.mutex);
+            timespec_get(&deadline, TIME_UTC);
+            deadline.tv_sec += 3;
+            while (wait_probe.entered < 1 && wait_status != ETIMEDOUT)
+                wait_status = pthread_cond_timedwait(
+                    &wait_probe.condition, &wait_probe.mutex, &deadline);
+            pthread_mutex_unlock(&wait_probe.mutex);
+            CHECK(wait_probe.entered >= 1 && wait_status != ETIMEDOUT);
+            CHECK(vx_runtime_submit(runtime, compiled, &second_binding, 1u,
+                                    &ready_options, &ready, &report) ==
+                  VX_STATUS_OK);
+            pthread_mutex_lock(&wait_probe.mutex);
+            while (wait_probe.entered < 2 && wait_status != ETIMEDOUT)
+                wait_status = pthread_cond_timedwait(
+                    &wait_probe.condition, &wait_probe.mutex, &deadline);
+            pthread_mutex_unlock(&wait_probe.mutex);
+            CHECK(wait_probe.entered >= 2 && wait_status != ETIMEDOUT);
+            CHECK(vx_request_cancel(waiting, &report) == VX_STATUS_OK);
+            CHECK(vx_request_wait(waiting, VX_REQUEST_WAIT_INFINITE, &report) ==
+                  VX_STATUS_CANCELLED);
+            CHECK(vx_request_wait(ready, 25u, &report) == VX_STATUS_OK);
+            vx_public_api_test_set_batch_delay_wait_hook(NULL, NULL);
+            vx_request_release(ready);
+            vx_request_release(waiting);
+            pthread_cond_destroy(&wait_probe.condition);
+            pthread_mutex_destroy(&wait_probe.mutex);
+        }
+
+        {
+            CpuGateProbe gate = {0};
+            VxCompiledModel* budget_compiled = NULL;
+            VxRuntimeSubmitOptions blocker_options =
+                VX_RUNTIME_SUBMIT_OPTIONS_INIT;
+            VxRuntimeSubmitOptions batch_options =
+                VX_RUNTIME_SUBMIT_OPTIONS_INIT;
+            VxRequestInfo request_info = VX_REQUEST_INFO_INIT;
+            VxRequest* blocker = NULL;
+            VxRequest* first = NULL;
+            VxRequest* second = NULL;
+            VxRequest* third = NULL;
+            float blocker_value = 30.0f;
+            float first_value = 31.0f;
+            float second_value = 32.0f;
+            float third_value = 33.0f;
+            VxTensorBinding blocker_binding = {
+                sizeof(VxTensorBinding), "value", VX_DTYPE_F32, 1u, {1},
+                &blocker_value, sizeof(blocker_value), VX_MEMORY_HOST,
+            };
+            VxTensorBinding first_binding_local = {
+                sizeof(VxTensorBinding), "value", VX_DTYPE_F32, 1u, {1},
+                &first_value, sizeof(first_value), VX_MEMORY_HOST,
+            };
+            VxTensorBinding second_binding_local = {
+                sizeof(VxTensorBinding), "value", VX_DTYPE_F32, 1u, {1},
+                &second_value, sizeof(second_value), VX_MEMORY_HOST,
+            };
+            VxTensorBinding third_binding_local = {
+                sizeof(VxTensorBinding), "value", VX_DTYPE_F32, 1u, {1},
+                &third_value, sizeof(third_value), VX_MEMORY_HOST,
+            };
+            struct timespec deadline;
+            int wait_status = 0;
+            int batch_calls_before;
+            size_t constrained_budget;
+
+            mock_batch_contract_min = 1u;
+            mock_batch_contract_max = 3u;
+            mock_batch_contract_multiple = 1u;
+            CHECK(vx_model_compile(model, &policy, &budget_compiled, &report) ==
+                  VX_STATUS_OK);
+            mock_batch_contract_min = 2u;
+            mock_batch_contract_max = 4u;
+            mock_batch_contract_multiple = 2u;
+            CHECK(pthread_mutex_init(&gate.mutex, NULL) == 0);
+            CHECK(pthread_cond_init(&gate.condition, NULL) == 0);
+            mock_execute_gate = &gate;
+            CHECK(vx_runtime_submit(runtime, budget_compiled, &blocker_binding,
+                                    1u, &blocker_options, &blocker,
+                                    &report) == VX_STATUS_OK);
+            pthread_mutex_lock(&gate.mutex);
+            timespec_get(&deadline, TIME_UTC);
+            deadline.tv_sec += 3;
+            while (!gate.entered && wait_status != ETIMEDOUT)
+                wait_status = pthread_cond_timedwait(
+                    &gate.condition, &gate.mutex, &deadline);
+            pthread_mutex_unlock(&gate.mutex);
+            CHECK(gate.entered == 1 && wait_status != ETIMEDOUT);
+            CHECK(vx_runtime_submit(runtime, budget_compiled,
+                                    &first_binding_local, 1u, &batch_options,
+                                    &first, &report) == VX_STATUS_OK);
+            CHECK(vx_runtime_submit(runtime, budget_compiled,
+                                    &second_binding_local, 1u, &batch_options,
+                                    &second, &report) == VX_STATUS_OK);
+            CHECK(vx_runtime_submit(runtime, budget_compiled,
+                                    &third_binding_local, 1u, &batch_options,
+                                    &third, &report) == VX_STATUS_OK);
+            CHECK(vx_request_poll(first, &request_info, &report) ==
+                  VX_STATUS_BUSY);
+            constrained_budget = 3u * request_info.owned_input_bytes +
+                sizeof(VxTensorBinding) + 2u * sizeof(float);
+            CHECK(vx_public_api_test_runtime_set_input_budget(
+                      runtime, constrained_budget) == 0);
+            batch_calls_before = mock_batch_execute_calls;
+            pthread_mutex_lock(&gate.mutex);
+            gate.released = 1;
+            pthread_cond_broadcast(&gate.condition);
+            pthread_mutex_unlock(&gate.mutex);
+            CHECK(vx_request_wait(blocker, VX_REQUEST_WAIT_INFINITE, &report) ==
+                  VX_STATUS_OK);
+            CHECK(vx_request_wait(first, VX_REQUEST_WAIT_INFINITE, &report) ==
+                  VX_STATUS_OK);
+            CHECK(vx_request_wait(second, VX_REQUEST_WAIT_INFINITE, &report) ==
+                  VX_STATUS_OK);
+            CHECK(vx_request_wait(third, VX_REQUEST_WAIT_INFINITE, &report) ==
+                  VX_STATUS_OK);
+            CHECK(mock_batch_execute_calls == batch_calls_before + 1 &&
+                  mock_batch_last_size == 2u &&
+                  closef(mock_batch_last_values[0], first_value) &&
+                  closef(mock_batch_last_values[1], second_value));
+            CHECK(vx_public_api_test_runtime_set_input_budget(runtime, 4096u) ==
+                  0);
+            mock_execute_gate = NULL;
+            vx_request_release(third);
+            vx_request_release(second);
+            vx_request_release(first);
+            vx_request_release(blocker);
+            pthread_cond_destroy(&gate.condition);
+            pthread_mutex_destroy(&gate.mutex);
+            vx_compiled_model_release(budget_compiled);
+        }
+
+        {
+            CpuGateProbe gate = {0};
+            VxRuntimeSubmitOptions blocker_options =
+                VX_RUNTIME_SUBMIT_OPTIONS_INIT;
+            VxRuntimeSubmitOptions deadline_options =
+                VX_RUNTIME_SUBMIT_OPTIONS_INIT;
+            VxRequestInfo first_info = VX_REQUEST_INFO_INIT;
+            VxRequestInfo second_info = VX_REQUEST_INFO_INIT;
+            VxRequest* blocker = NULL;
+            VxRequest* first = NULL;
+            VxRequest* second = NULL;
+            float blocker_value = 40.0f;
+            float first_value = 41.0f;
+            float second_value = 42.0f;
+            VxTensorBinding blocker_binding = {
+                sizeof(VxTensorBinding), "value", VX_DTYPE_F32, 1u, {1},
+                &blocker_value, sizeof(blocker_value), VX_MEMORY_HOST,
+            };
+            VxTensorBinding first_binding_local = {
+                sizeof(VxTensorBinding), "value", VX_DTYPE_F32, 1u, {1},
+                &first_value, sizeof(first_value), VX_MEMORY_HOST,
+            };
+            VxTensorBinding second_binding_local = {
+                sizeof(VxTensorBinding), "value", VX_DTYPE_F32, 1u, {1},
+                &second_value, sizeof(second_value), VX_MEMORY_HOST,
+            };
+            struct timespec entered_deadline;
+            struct timespec post_completion_pause = {0, 250000000L};
+            int wait_status = 0;
+            uint64_t physical_deadline;
+
+            CHECK(pthread_mutex_init(&gate.mutex, NULL) == 0);
+            CHECK(pthread_cond_init(&gate.condition, NULL) == 0);
+            mock_execute_gate = &gate;
+            CHECK(vx_runtime_submit(runtime, compiled, &blocker_binding, 1u,
+                                    &blocker_options, &blocker, &report) ==
+                  VX_STATUS_OK);
+            pthread_mutex_lock(&gate.mutex);
+            timespec_get(&entered_deadline, TIME_UTC);
+            entered_deadline.tv_sec += 3;
+            while (!gate.entered && wait_status != ETIMEDOUT)
+                wait_status = pthread_cond_timedwait(
+                    &gate.condition, &gate.mutex, &entered_deadline);
+            pthread_mutex_unlock(&gate.mutex);
+            CHECK(gate.entered == 1 && wait_status != ETIMEDOUT);
+            physical_deadline = vx_runtime_monotonic_time_micros() +
+                UINT64_C(200000);
+            deadline_options.freshness =
+                VX_RUNTIME_FRESHNESS_DROP_IF_LATE;
+            deadline_options.deadline_monotonic_micros = physical_deadline;
+            CHECK(vx_runtime_submit(runtime, compiled, &first_binding_local,
+                                    1u, &deadline_options, &first,
+                                    &report) == VX_STATUS_OK);
+            CHECK(vx_runtime_submit(runtime, compiled, &second_binding_local,
+                                    1u, &deadline_options, &second,
+                                    &report) == VX_STATUS_OK);
+            vx_public_api_test_set_batch_after_completion_hook(
+                cpu_delay_hook, &post_completion_pause);
+            pthread_mutex_lock(&gate.mutex);
+            gate.released = 1;
+            pthread_cond_broadcast(&gate.condition);
+            pthread_mutex_unlock(&gate.mutex);
+            CHECK(vx_request_wait(blocker, VX_REQUEST_WAIT_INFINITE, &report) ==
+                  VX_STATUS_OK);
+            CHECK(vx_request_wait(first, VX_REQUEST_WAIT_INFINITE, &report) ==
+                  VX_STATUS_OK);
+            CHECK(vx_request_wait(second, VX_REQUEST_WAIT_INFINITE, &report) ==
+                  VX_STATUS_OK);
+            CHECK(vx_request_poll(first, &first_info, &report) == VX_STATUS_OK);
+            CHECK(vx_request_poll(second, &second_info, &report) == VX_STATUS_OK);
+            CHECK(first_info.deadline_missed == 0 &&
+                  second_info.deadline_missed == 0 &&
+                  vx_runtime_monotonic_time_micros() > physical_deadline);
+            vx_public_api_test_set_batch_after_completion_hook(NULL, NULL);
+            mock_execute_gate = NULL;
+            vx_request_release(second);
+            vx_request_release(first);
+            vx_request_release(blocker);
+            pthread_cond_destroy(&gate.condition);
+            pthread_mutex_destroy(&gate.mutex);
+        }
+    }
     context_options.struct_size++;
     CHECK(vx_compiled_model_create_context(compiled, &context_options,
                                             &context, &report) ==
@@ -1377,10 +3221,43 @@ static int test_provider(const char* readable_graph,
               VX_STATUS_INVALID_ARGUMENT);
         CHECK(result == NULL);
     }
+    {
+        VxResult* first_shrunk = NULL;
+        VxResult* second_shrunk = NULL;
+        VxResult* recovered = NULL;
+        VxResult* rejected = NULL;
+
+        /* The route declares a 16-byte maximum, while this concrete shape
+         * publishes four bytes. A 20-byte cap therefore admits two retained
+         * results only when successful snapshots shrink their precharge. */
+        CHECK(vx_public_api_test_runtime_set_result_budget(runtime, 2u, 20u) ==
+              0);
+        CHECK(vx_execution_context_execute(
+                  context, &input_binding, 1u, &first_shrunk, &report) ==
+              VX_STATUS_OK);
+        CHECK(vx_execution_context_execute(
+                  context, &input_binding, 1u, &second_shrunk, &report) ==
+              VX_STATUS_OK);
+        CHECK(vx_execution_context_execute(
+                  context, &input_binding, 1u, &rejected, &report) ==
+              VX_STATUS_OVERLOADED);
+        CHECK(rejected == NULL && !strcmp(report.reason, "OVERLOADED"));
+        vx_result_release(first_shrunk);
+        CHECK(vx_execution_context_execute(
+                  context, &input_binding, 1u, &recovered, &report) ==
+              VX_STATUS_OK);
+        vx_result_release(recovered);
+        vx_result_release(second_shrunk);
+        CHECK(vx_public_api_test_runtime_set_result_budget(
+                  runtime, 64u, 64u * 1024u * 1024u) == 0);
+    }
+    mock_poison_report_mask = MOCK_POISON_EXECUTE_REPORT;
     CHECK(vx_execution_context_execute(
               context, &input_binding, 1u, &result, &report) == VX_STATUS_OK);
     CHECK(report.context_id && report.execution_id && report.route_attested &&
-          !report.operator_fallback_used && report.execution_time_ms >= 0.0);
+          !report.operator_fallback_used && report.execution_time_ms >= 0.0 &&
+          report_strings_terminated(&report));
+    mock_poison_report_mask = 0;
     CHECK(vx_result_output_count(result) == 1);
     {
         VxTensorInfo info = VX_TENSOR_INFO_INIT;
@@ -1430,7 +3307,155 @@ static int test_provider(const char* readable_graph,
     }
     CHECK(vx_execution_context_close(context, &report) == VX_STATUS_OK);
     CHECK(vx_execution_context_close(context, &report) == VX_STATUS_OK);
-    CHECK(vx_runtime_close(runtime, &report) == VX_STATUS_OK);
+    {
+        CpuGateProbe execute_gate = {0};
+        CpuGateProbe replace_gate = {0};
+        CpuGateProbe direct_gate = {0};
+        VxCompiledModel* direct_compiled = NULL;
+        VxRuntimeSubmitOptions blocker_options =
+            VX_RUNTIME_SUBMIT_OPTIONS_INIT;
+        VxRuntimeSubmitOptions latest_options =
+            VX_RUNTIME_SUBMIT_OPTIONS_INIT;
+        VxRequest* blocker = NULL;
+        VxRequest* previous = NULL;
+        RuntimeSubmitThreadCase replacement = {0};
+        RuntimeCloseThreadCase close_case = {0};
+        RuntimeRunThreadCase direct_run = {0};
+        pthread_t submit_thread;
+        pthread_t close_thread;
+        pthread_t direct_thread;
+        struct timespec deadline;
+        struct timespec pause = {0, 1000000L};
+        int wait_status = 0;
+        float blocker_value = 21.0f;
+        float previous_value = 22.0f;
+        float replacement_value = 23.0f;
+        VxTensorBinding blocker_binding = {
+            sizeof(VxTensorBinding), "value", VX_DTYPE_F32, 1u, {1},
+            &blocker_value, sizeof(blocker_value), VX_MEMORY_HOST,
+        };
+        VxTensorBinding previous_binding = {
+            sizeof(VxTensorBinding), "value", VX_DTYPE_F32, 1u, {1},
+            &previous_value, sizeof(previous_value), VX_MEMORY_HOST,
+        };
+        VxTensorBinding replacement_binding = {
+            sizeof(VxTensorBinding), "value", VX_DTYPE_F32, 1u, {1},
+            &replacement_value, sizeof(replacement_value), VX_MEMORY_HOST,
+        };
+
+        CHECK(pthread_mutex_init(&execute_gate.mutex, NULL) == 0);
+        CHECK(pthread_cond_init(&execute_gate.condition, NULL) == 0);
+        CHECK(pthread_mutex_init(&replace_gate.mutex, NULL) == 0);
+        CHECK(pthread_cond_init(&replace_gate.condition, NULL) == 0);
+        CHECK(pthread_mutex_init(&direct_gate.mutex, NULL) == 0);
+        CHECK(pthread_cond_init(&direct_gate.condition, NULL) == 0);
+        CHECK(vx_model_compile(model, &policy, &direct_compiled, &report) ==
+              VX_STATUS_OK);
+        latest_options.freshness = VX_RUNTIME_FRESHNESS_LATEST;
+        latest_options.stream_key = UINT64_C(991);
+        direct_run.runtime = runtime;
+        direct_run.compiled = direct_compiled;
+        direct_run.binding = replacement_binding;
+        vx_public_api_test_set_direct_route_locked_hook(cpu_gate_hook,
+                                                        &direct_gate);
+        CHECK(pthread_create(&direct_thread, NULL, runtime_run_thread,
+                             &direct_run) == 0);
+        pthread_mutex_lock(&direct_gate.mutex);
+        timespec_get(&deadline, TIME_UTC);
+        deadline.tv_sec += 3;
+        while (!direct_gate.entered && wait_status != ETIMEDOUT)
+            wait_status = pthread_cond_timedwait(
+                &direct_gate.condition, &direct_gate.mutex, &deadline);
+        pthread_mutex_unlock(&direct_gate.mutex);
+        CHECK(direct_gate.entered == 1 && wait_status != ETIMEDOUT);
+        mock_execute_gate = &execute_gate;
+        CHECK(vx_runtime_submit(runtime, compiled, &blocker_binding, 1u,
+                                &blocker_options, &blocker, &report) ==
+              VX_STATUS_OK);
+        pthread_mutex_lock(&execute_gate.mutex);
+        timespec_get(&deadline, TIME_UTC);
+        deadline.tv_sec += 3;
+        while (!execute_gate.entered && wait_status != ETIMEDOUT)
+            wait_status = pthread_cond_timedwait(
+                &execute_gate.condition, &execute_gate.mutex, &deadline);
+        pthread_mutex_unlock(&execute_gate.mutex);
+        CHECK(execute_gate.entered == 1 && wait_status != ETIMEDOUT);
+        CHECK(vx_runtime_submit(runtime, compiled, &previous_binding, 1u,
+                                &latest_options, &previous, &report) ==
+              VX_STATUS_OK);
+
+        replacement.runtime = runtime;
+        replacement.compiled = compiled;
+        replacement.binding = replacement_binding;
+        replacement.options = latest_options;
+        vx_public_api_test_set_latest_replace_hook(cpu_gate_hook,
+                                                   &replace_gate);
+        CHECK(pthread_create(&submit_thread, NULL, runtime_submit_thread,
+                             &replacement) == 0);
+        wait_status = 0;
+        pthread_mutex_lock(&replace_gate.mutex);
+        timespec_get(&deadline, TIME_UTC);
+        deadline.tv_sec += 3;
+        while (!replace_gate.entered && wait_status != ETIMEDOUT)
+            wait_status = pthread_cond_timedwait(
+                &replace_gate.condition, &replace_gate.mutex, &deadline);
+        pthread_mutex_unlock(&replace_gate.mutex);
+        CHECK(replace_gate.entered == 1 && wait_status != ETIMEDOUT);
+
+        close_case.runtime = runtime;
+        CHECK(pthread_create(&close_thread, NULL, runtime_close_thread,
+                             &close_case) == 0);
+        deadline.tv_sec = (time_t)(vx_runtime_monotonic_time_micros() /
+                                   UINT64_C(1000000) + 3u);
+        while (!vx_public_api_test_runtime_closed(runtime) &&
+               vx_runtime_monotonic_time_micros() <
+                   (uint64_t)deadline.tv_sec * UINT64_C(1000000))
+            nanosleep(&pause, NULL);
+        CHECK(vx_public_api_test_runtime_closed(runtime) == 1);
+        pthread_mutex_lock(&replace_gate.mutex);
+        replace_gate.released = 1;
+        pthread_cond_broadcast(&replace_gate.condition);
+        pthread_mutex_unlock(&replace_gate.mutex);
+        CHECK(pthread_join(submit_thread, NULL) == 0);
+        CHECK(replacement.status == VX_STATUS_OK &&
+              replacement.request != NULL);
+        CHECK(vx_request_wait(previous, VX_REQUEST_WAIT_INFINITE, &report) ==
+              VX_STATUS_SUPERSEDED);
+        CHECK(vx_request_poll(replacement.request,
+                              &(VxRequestInfo)VX_REQUEST_INFO_INIT,
+                              &report) == VX_STATUS_BUSY);
+        mock_execute_gate = NULL;
+        pthread_mutex_lock(&direct_gate.mutex);
+        direct_gate.released = 1;
+        pthread_cond_broadcast(&direct_gate.condition);
+        pthread_mutex_unlock(&direct_gate.mutex);
+        CHECK(pthread_join(direct_thread, NULL) == 0);
+        CHECK(direct_run.status == VX_STATUS_OK && direct_run.result != NULL);
+        vx_result_release(direct_run.result);
+        CHECK(vx_request_wait(replacement.request,
+                              VX_REQUEST_WAIT_INFINITE,
+                              &report) == VX_STATUS_CANCELLED);
+        pthread_mutex_lock(&execute_gate.mutex);
+        execute_gate.released = 1;
+        pthread_cond_broadcast(&execute_gate.condition);
+        pthread_mutex_unlock(&execute_gate.mutex);
+        CHECK(pthread_join(close_thread, NULL) == 0);
+        CHECK(close_case.status == VX_STATUS_OK);
+        CHECK(vx_request_wait(blocker, VX_REQUEST_WAIT_INFINITE, &report) ==
+              VX_STATUS_OK);
+        vx_public_api_test_set_latest_replace_hook(NULL, NULL);
+        vx_public_api_test_set_direct_route_locked_hook(NULL, NULL);
+        vx_request_release(replacement.request);
+        vx_request_release(previous);
+        vx_request_release(blocker);
+        vx_compiled_model_release(direct_compiled);
+        pthread_cond_destroy(&direct_gate.condition);
+        pthread_mutex_destroy(&direct_gate.mutex);
+        pthread_cond_destroy(&replace_gate.condition);
+        pthread_mutex_destroy(&replace_gate.mutex);
+        pthread_cond_destroy(&execute_gate.condition);
+        pthread_mutex_destroy(&execute_gate.mutex);
+    }
     CHECK(vx_runtime_register_provider(runtime, &provider, &report) ==
           VX_STATUS_HANDLE_DISPOSED);
     vx_execution_context_release(context);
@@ -1441,9 +3466,9 @@ static int test_provider(const char* readable_graph,
           VX_STATUS_OK);
     CHECK(closef(output, 15.0f));
     vx_result_release(result);
-    CHECK(mock_context_closed == 1);
-    CHECK(mock_context_destroyed == 1);
-    CHECK(mock_compiled_destroyed == 2);
+    CHECK(mock_context_closed == 5);
+    CHECK(mock_context_destroyed == 5);
+    CHECK(mock_compiled_destroyed == 10);
     CHECK(mock_runtime_destroyed == 2);
     mock_caller_bank_residency = NULL;
     mock_caller_bank_name = NULL;
@@ -2411,6 +4436,549 @@ static int test_qbatch_context_workspace_resource_proof(void) {
     return 0;
 }
 
+static int test_runtime_request_surface(VxRuntime* runtime,
+                                        VxCompiledModel* compiled_a,
+                                        VxCompiledModel* compiled_b) {
+    VxReport report = VX_REPORT_INIT;
+    VxRuntimeSubmitOptions scheduled_options = VX_RUNTIME_SUBMIT_OPTIONS_INIT;
+    VxRuntimeSubmitOptions latest_options = VX_RUNTIME_SUBMIT_OPTIONS_INIT;
+    VxRequestInfo info = VX_REQUEST_INFO_INIT;
+    VxRequest* scheduled_request = NULL;
+    VxRequest* first_request = NULL;
+    VxRequest* second_request = NULL;
+    VxRequest* third_request = NULL;
+    VxRequest* rejected_request = NULL;
+    VxResult* result = NULL;
+    float direct_input[3] = {1.0f, 2.0f, 3.0f};
+    float direct_output[3] = {0};
+    VxTensorBinding direct_binding = {
+        sizeof(VxTensorBinding), "x", VX_DTYPE_F32, 1u, {3},
+        direct_input, sizeof(direct_input), VX_MEMORY_HOST,
+    };
+    uintptr_t retained_route;
+
+    CHECK(vx_public_api_test_runtime_coordinator_allocated(runtime) == 0);
+    {
+        VxTensorBinding invalid = direct_binding;
+        VxRequest* invalid_request = NULL;
+        /* Shape/size preflight must reject before reading this payload or
+         * lazily allocating the coordinator. */
+        invalid.data = (const void*)(uintptr_t)1u;
+        invalid.byte_size--;
+        CHECK(vx_runtime_submit(runtime, compiled_b, &invalid, 1u,
+                                &scheduled_options, &invalid_request, &report) ==
+              VX_STATUS_INVALID_ARGUMENT);
+        CHECK(invalid_request == NULL);
+        CHECK(vx_public_api_test_runtime_coordinator_allocated(runtime) == 0);
+    }
+    CHECK(vx_runtime_run(runtime, compiled_b, &direct_binding, 1u,
+                         &result, &report) == VX_STATUS_OK);
+    CHECK(result != NULL &&
+          vx_result_read(result, "y", direct_output, sizeof(direct_output),
+                         NULL, &report) == VX_STATUS_OK);
+    CHECK(!memcmp(direct_input, direct_output, sizeof(direct_input)));
+    vx_result_release(result);
+    result = NULL;
+    retained_route = vx_public_api_test_compiled_route_context(compiled_b);
+    CHECK(retained_route != 0);
+    CHECK(vx_public_api_test_runtime_coordinator_allocated(runtime) == 0);
+
+    CHECK(vx_runtime_submit(runtime, compiled_b, &direct_binding, 1u,
+                            &scheduled_options, &scheduled_request, &report) ==
+          VX_STATUS_OK);
+    CHECK(scheduled_request != NULL &&
+          vx_request_wait(scheduled_request, VX_REQUEST_WAIT_INFINITE,
+                          &report) == VX_STATUS_OK);
+    CHECK(vx_request_poll(scheduled_request, &info, &report) == VX_STATUS_OK);
+    CHECK(info.state == VX_RUNTIME_REQUEST_SUCCEEDED &&
+          info.owned_input_bytes == 0);
+    CHECK(vx_public_api_test_runtime_coordinator_allocated(runtime) == 1);
+    CHECK(vx_public_api_test_compiled_route_context(compiled_b) ==
+          retained_route);
+    CHECK(vx_request_result(scheduled_request, &result, &report) == VX_STATUS_OK);
+    vx_result_release(result);
+    result = NULL;
+    vx_request_release(scheduled_request);
+
+    {
+        CpuGateProbe gate = {0};
+        float first_input[3] = {10.0f, 11.0f, 12.0f};
+        float second_input[3] = {20.0f, 21.0f, 22.0f};
+        float third_input[3] = {30.0f, 31.0f, 32.0f};
+        const float expected_third[3] = {30.0f, 31.0f, 32.0f};
+        float third_output[3] = {0};
+        VxTensorBinding first_binding = {
+            sizeof(VxTensorBinding), "x", VX_DTYPE_F32, 1u, {3},
+            first_input, sizeof(first_input), VX_MEMORY_HOST,
+        };
+        VxTensorBinding second_binding = {
+            sizeof(VxTensorBinding), "x", VX_DTYPE_F32, 1u, {3},
+            second_input, sizeof(second_input), VX_MEMORY_HOST,
+        };
+        VxTensorBinding third_binding = {
+            sizeof(VxTensorBinding), "x", VX_DTYPE_F32, 1u, {3},
+            third_input, sizeof(third_input), VX_MEMORY_HOST,
+        };
+        struct timespec deadline;
+        int wait_status = 0;
+        size_t active_requests = 0;
+        size_t active_input_bytes = 0;
+        uint64_t dispatches = 0;
+
+        CHECK(pthread_mutex_init(&gate.mutex, NULL) == 0);
+        CHECK(pthread_cond_init(&gate.condition, NULL) == 0);
+        latest_options.freshness = VX_RUNTIME_FRESHNESS_LATEST;
+        latest_options.stream_key = UINT64_C(77);
+        vx_public_api_test_set_cpu_execute_hook(cpu_gate_hook, &gate);
+        CHECK(vx_runtime_submit(runtime, compiled_b, &first_binding, 1u,
+                                &scheduled_options, &first_request, &report) ==
+              VX_STATUS_OK);
+        pthread_mutex_lock(&gate.mutex);
+        timespec_get(&deadline, TIME_UTC);
+        deadline.tv_sec += 3;
+        while (!gate.entered && wait_status != ETIMEDOUT)
+            wait_status = pthread_cond_timedwait(
+                &gate.condition, &gate.mutex, &deadline);
+        pthread_mutex_unlock(&gate.mutex);
+        CHECK(gate.entered == 1 && wait_status != ETIMEDOUT);
+
+        CHECK(vx_runtime_submit(runtime, compiled_b, &second_binding, 1u,
+                                &latest_options, &second_request, &report) ==
+              VX_STATUS_OK);
+        CHECK(vx_public_api_test_compiled_scheduled_claims(compiled_b) == 2u);
+        CHECK(vx_runtime_run(runtime, compiled_b, &direct_binding, 1u,
+                             &result, &report) == VX_STATUS_BUSY);
+        CHECK(result == NULL);
+        info = (VxRequestInfo)VX_REQUEST_INFO_INIT;
+        CHECK(vx_request_poll(second_request, &info, &report) ==
+              VX_STATUS_BUSY);
+        CHECK(info.state == VX_RUNTIME_REQUEST_QUEUED &&
+              info.owned_input_bytes > sizeof(second_input));
+        /* Capacity is reserved before payload copy. A full queue must reject
+         * this otherwise-valid descriptor without touching the address. */
+        third_binding.data = (const void*)(uintptr_t)1u;
+        CHECK(vx_runtime_submit(runtime, compiled_b, &third_binding, 1u,
+                                &scheduled_options, &rejected_request, &report) ==
+              VX_STATUS_OVERLOADED);
+        CHECK(rejected_request == NULL);
+        third_binding.data = third_input;
+        vx_public_api_test_fail_next_scheduled_snapshot();
+        CHECK(vx_runtime_submit(runtime, compiled_b, &third_binding, 1u,
+                                &latest_options, &rejected_request, &report) ==
+              VX_STATUS_OUT_OF_MEMORY);
+        CHECK(rejected_request == NULL &&
+              !strcmp(report.reason, "OUT_OF_MEMORY"));
+        info = (VxRequestInfo)VX_REQUEST_INFO_INIT;
+        CHECK(vx_request_poll(second_request, &info, &report) ==
+              VX_STATUS_BUSY);
+        CHECK(info.state == VX_RUNTIME_REQUEST_QUEUED &&
+              vx_public_api_test_compiled_scheduled_claims(compiled_b) == 2u);
+        CHECK(vx_runtime_submit(runtime, compiled_b, &third_binding, 1u,
+                                &latest_options, &third_request, &report) ==
+              VX_STATUS_OK);
+        CHECK(vx_public_api_test_compiled_scheduled_claims(compiled_b) == 2u);
+        CHECK(vx_request_wait(second_request, VX_REQUEST_WAIT_INFINITE,
+                              &report) == VX_STATUS_SUPERSEDED);
+        CHECK(!strcmp(report.reason, "SUPERSEDED") &&
+              strstr(report.message, "superseded"));
+        info = (VxRequestInfo)VX_REQUEST_INFO_INIT;
+        CHECK(vx_request_poll(second_request, &info, &report) ==
+              VX_STATUS_SUPERSEDED);
+        CHECK(info.state == VX_RUNTIME_REQUEST_SUPERSEDED &&
+              info.status == VX_STATUS_SUPERSEDED);
+        CHECK(vx_request_result(second_request, &result, &report) ==
+              VX_STATUS_SUPERSEDED);
+        CHECK(result == NULL);
+        for (size_t index = 0; index < 3u; index++) third_input[index] = -1.0f;
+        pthread_mutex_lock(&gate.mutex);
+        gate.released = 1;
+        pthread_cond_broadcast(&gate.condition);
+        pthread_mutex_unlock(&gate.mutex);
+        CHECK(vx_request_wait(first_request, VX_REQUEST_WAIT_INFINITE,
+                              &report) == VX_STATUS_OK);
+        CHECK(vx_request_wait(third_request, VX_REQUEST_WAIT_INFINITE,
+                              &report) == VX_STATUS_OK);
+        vx_public_api_test_set_cpu_execute_hook(NULL, NULL);
+        CHECK(vx_request_result(third_request, &result, &report) ==
+              VX_STATUS_OK);
+        CHECK(vx_result_read(result, "y", third_output,
+                             sizeof(third_output), NULL, &report) ==
+              VX_STATUS_OK);
+        CHECK(!memcmp(expected_third, third_output, sizeof(expected_third)));
+        vx_result_release(result);
+        result = NULL;
+        CHECK(vx_public_api_test_runtime_coordinator_stats(
+                  runtime, &active_requests, &active_input_bytes,
+                  &dispatches) == 1);
+        CHECK(active_requests == 0 && active_input_bytes == 0 &&
+              dispatches == 3u);
+        CHECK(vx_public_api_test_compiled_scheduled_claims(compiled_b) == 0u);
+        CHECK(vx_public_api_test_compiled_route_context(compiled_b) ==
+              retained_route);
+
+        vx_request_release(third_request);
+        vx_request_release(second_request);
+        vx_request_release(first_request);
+        third_request = NULL;
+        second_request = NULL;
+        first_request = NULL;
+        pthread_cond_destroy(&gate.condition);
+        pthread_mutex_destroy(&gate.mutex);
+    }
+
+    {
+        CpuGateProbe gate = {0};
+        RuntimeRunThreadCase run = {0};
+        VxRequest* scheduled = NULL;
+        pthread_t thread;
+        struct timespec deadline;
+        int wait_status = 0;
+
+        CHECK(pthread_mutex_init(&gate.mutex, NULL) == 0);
+        CHECK(pthread_cond_init(&gate.condition, NULL) == 0);
+        run.runtime = runtime;
+        run.compiled = compiled_b;
+        run.binding = direct_binding;
+        vx_public_api_test_set_direct_route_locked_hook(cpu_gate_hook, &gate);
+        CHECK(pthread_create(&thread, NULL, runtime_run_thread, &run) == 0);
+        pthread_mutex_lock(&gate.mutex);
+        timespec_get(&deadline, TIME_UTC);
+        deadline.tv_sec += 3;
+        while (!gate.entered && wait_status != ETIMEDOUT)
+            wait_status = pthread_cond_timedwait(
+                &gate.condition, &gate.mutex, &deadline);
+        pthread_mutex_unlock(&gate.mutex);
+        CHECK(gate.entered == 1 && wait_status != ETIMEDOUT);
+        CHECK(vx_runtime_submit(runtime, compiled_b, &direct_binding, 1u,
+                                &scheduled_options, &scheduled, &report) ==
+              VX_STATUS_OK);
+        CHECK(vx_public_api_test_compiled_scheduled_claims(compiled_b) == 1u);
+        pthread_mutex_lock(&gate.mutex);
+        gate.released = 1;
+        pthread_cond_broadcast(&gate.condition);
+        pthread_mutex_unlock(&gate.mutex);
+        CHECK(pthread_join(thread, NULL) == 0);
+        CHECK(run.status == VX_STATUS_BUSY && run.result == NULL);
+        vx_public_api_test_set_direct_route_locked_hook(NULL, NULL);
+        CHECK(vx_request_wait(scheduled, VX_REQUEST_WAIT_INFINITE, &report) ==
+              VX_STATUS_OK);
+        vx_request_release(scheduled);
+        pthread_cond_destroy(&gate.condition);
+        pthread_mutex_destroy(&gate.mutex);
+    }
+
+    {
+        VxRuntimeSubmitOptions late = VX_RUNTIME_SUBMIT_OPTIONS_INIT;
+        VxRequest* late_request = NULL;
+        uint64_t now = vx_runtime_monotonic_time_micros();
+        CHECK(now != 0);
+        late.freshness = VX_RUNTIME_FRESHNESS_DROP_IF_LATE;
+        late.deadline_monotonic_micros = now;
+        CHECK(vx_runtime_submit(runtime, compiled_b, &direct_binding, 1u,
+                                &late, &late_request, &report) ==
+              VX_STATUS_DEADLINE_EXCEEDED);
+        CHECK(late_request == NULL &&
+              !strcmp(report.reason, "DEADLINE_EXCEEDED"));
+    }
+
+    {
+        VxRuntimeSubmitOptions soft = VX_RUNTIME_SUBMIT_OPTIONS_INIT;
+        VxRuntimeSubmitOptions hard = VX_RUNTIME_SUBMIT_OPTIONS_INIT;
+        VxRequestInfo soft_info = VX_REQUEST_INFO_INIT;
+        VxRequestInfo hard_info = VX_REQUEST_INFO_INIT;
+        VxRequest* soft_request = NULL;
+        VxRequest* hard_request = NULL;
+        VxResult* soft_result = NULL;
+        struct timespec pause = {0, 30000000L};
+
+        soft.deadline_monotonic_micros =
+            vx_runtime_monotonic_time_micros() + UINT64_C(5000);
+        vx_public_api_test_set_cpu_execute_hook(cpu_delay_hook, &pause);
+        CHECK(vx_runtime_submit(runtime, compiled_b, &direct_binding, 1u,
+                                &soft, &soft_request, &report) == VX_STATUS_OK);
+        CHECK(vx_request_wait(soft_request, VX_REQUEST_WAIT_INFINITE,
+                              &report) == VX_STATUS_OK);
+        CHECK(vx_request_poll(soft_request, &soft_info, &report) == VX_STATUS_OK);
+        CHECK(soft_info.state == VX_RUNTIME_REQUEST_SUCCEEDED &&
+              soft_info.deadline_missed == 1);
+        CHECK(vx_request_result(soft_request, &soft_result, &report) ==
+              VX_STATUS_OK);
+        vx_result_release(soft_result);
+
+        hard = soft;
+        hard.freshness = VX_RUNTIME_FRESHNESS_DROP_IF_LATE;
+        hard.deadline_monotonic_micros =
+            vx_runtime_monotonic_time_micros() + UINT64_C(5000);
+        CHECK(vx_runtime_submit(runtime, compiled_b, &direct_binding, 1u,
+                                &hard, &hard_request, &report) == VX_STATUS_OK);
+        CHECK(vx_request_wait(hard_request, VX_REQUEST_WAIT_INFINITE,
+                              &report) == VX_STATUS_DEADLINE_EXCEEDED);
+        CHECK(vx_request_poll(hard_request, &hard_info, &report) ==
+              VX_STATUS_DEADLINE_EXCEEDED);
+        CHECK(hard_info.state == VX_RUNTIME_REQUEST_FAILED &&
+              hard_info.deadline_missed == 1 &&
+              !strcmp(report.reason, "DEADLINE_EXCEEDED"));
+        CHECK(vx_request_result(hard_request, &soft_result, &report) ==
+              VX_STATUS_DEADLINE_EXCEEDED);
+        CHECK(soft_result == NULL);
+        vx_public_api_test_set_cpu_execute_hook(NULL, NULL);
+        vx_request_release(hard_request);
+        vx_request_release(soft_request);
+    }
+
+    {
+        CpuGateProbe gate = {0};
+        VxRuntimeSubmitOptions deadline = VX_RUNTIME_SUBMIT_OPTIONS_INIT;
+        VxRequest* blocker = NULL;
+        VxRequest* expiring = NULL;
+        struct timespec entered_deadline;
+        struct timespec pause = {0, 30000000L};
+        int wait_status = 0;
+        uint64_t before_dispatches = 0;
+        uint64_t after_dispatches = 0;
+
+        CHECK(pthread_mutex_init(&gate.mutex, NULL) == 0);
+        CHECK(pthread_cond_init(&gate.condition, NULL) == 0);
+        vx_public_api_test_set_cpu_execute_hook(cpu_gate_hook, &gate);
+        CHECK(vx_public_api_test_runtime_coordinator_stats(
+                  runtime, NULL, NULL, &before_dispatches) == 1);
+        CHECK(vx_runtime_submit(runtime, compiled_b, &direct_binding, 1u,
+                                &scheduled_options, &blocker, &report) ==
+              VX_STATUS_OK);
+        pthread_mutex_lock(&gate.mutex);
+        timespec_get(&entered_deadline, TIME_UTC);
+        entered_deadline.tv_sec += 3;
+        while (!gate.entered && wait_status != ETIMEDOUT)
+            wait_status = pthread_cond_timedwait(
+                &gate.condition, &gate.mutex, &entered_deadline);
+        pthread_mutex_unlock(&gate.mutex);
+        CHECK(gate.entered && wait_status != ETIMEDOUT);
+        deadline.freshness = VX_RUNTIME_FRESHNESS_DROP_IF_LATE;
+        deadline.deadline_monotonic_micros =
+            vx_runtime_monotonic_time_micros() + UINT64_C(10000);
+        CHECK(vx_runtime_submit(runtime, compiled_b, &direct_binding, 1u,
+                                &deadline, &expiring, &report) == VX_STATUS_OK);
+        nanosleep(&pause, NULL);
+        pthread_mutex_lock(&gate.mutex);
+        gate.released = 1;
+        pthread_cond_broadcast(&gate.condition);
+        pthread_mutex_unlock(&gate.mutex);
+        CHECK(vx_request_wait(blocker, VX_REQUEST_WAIT_INFINITE, &report) ==
+              VX_STATUS_OK);
+        CHECK(vx_request_wait(expiring, VX_REQUEST_WAIT_INFINITE, &report) ==
+              VX_STATUS_DEADLINE_EXCEEDED);
+        CHECK(!strcmp(report.reason, "DEADLINE_EXCEEDED"));
+        CHECK(vx_public_api_test_runtime_coordinator_stats(
+                  runtime, NULL, NULL, &after_dispatches) == 1);
+        CHECK(after_dispatches == before_dispatches + 1u);
+        CHECK(vx_public_api_test_compiled_scheduled_claims(compiled_b) == 0u);
+        vx_public_api_test_set_cpu_execute_hook(NULL, NULL);
+        vx_request_release(expiring);
+        vx_request_release(blocker);
+        pthread_cond_destroy(&gate.condition);
+        pthread_mutex_destroy(&gate.mutex);
+    }
+
+    {
+        const float a[2] = {2.0f, 4.0f};
+        const float b[2] = {3.0f, 5.0f};
+        float identity_input[3] = {7.0f, 8.0f, 9.0f};
+        float sum[2] = {0};
+        float identity_output[3] = {0};
+        const VxTensorBinding add_bindings[2] = {
+            {sizeof(VxTensorBinding), "a", VX_DTYPE_F32, 1u, {2},
+             a, sizeof(a), VX_MEMORY_HOST},
+            {sizeof(VxTensorBinding), "b", VX_DTYPE_F32, 1u, {2},
+             b, sizeof(b), VX_MEMORY_HOST},
+        };
+        const VxTensorBinding identity_binding = {
+            sizeof(VxTensorBinding), "x", VX_DTYPE_F32, 1u, {3},
+            identity_input, sizeof(identity_input), VX_MEMORY_HOST,
+        };
+        VxRequest* model_a_request = NULL;
+        VxRequest* model_b_request = NULL;
+        VxResult* model_a_result = NULL;
+        VxResult* model_b_result = NULL;
+        uint64_t before_dispatches = 0;
+        uint64_t after_dispatches = 0;
+
+        CHECK(vx_public_api_test_runtime_coordinator_stats(
+                  runtime, NULL, NULL, &before_dispatches) == 1);
+        CHECK(vx_runtime_submit(runtime, compiled_a, add_bindings, 2u,
+                                &scheduled_options, &model_a_request, &report) ==
+              VX_STATUS_OK);
+        CHECK(vx_runtime_submit(runtime, compiled_b, &identity_binding, 1u,
+                                &scheduled_options, &model_b_request, &report) ==
+              VX_STATUS_OK);
+        CHECK(vx_request_wait(model_a_request, VX_REQUEST_WAIT_INFINITE,
+                              &report) == VX_STATUS_OK);
+        CHECK(vx_request_wait(model_b_request, VX_REQUEST_WAIT_INFINITE,
+                              &report) == VX_STATUS_OK);
+        CHECK(vx_request_result(model_a_request, &model_a_result, &report) ==
+              VX_STATUS_OK);
+        CHECK(vx_request_result(model_b_request, &model_b_result, &report) ==
+              VX_STATUS_OK);
+        CHECK(vx_result_read(model_a_result, "sum", sum, sizeof(sum), NULL,
+                             &report) == VX_STATUS_OK);
+        CHECK(closef(sum[0], 5.0f) && closef(sum[1], 9.0f));
+        CHECK(vx_result_read(model_b_result, "y", identity_output,
+                             sizeof(identity_output), NULL, &report) ==
+              VX_STATUS_OK);
+        CHECK(!memcmp(identity_input, identity_output,
+                      sizeof(identity_input)));
+        CHECK(vx_public_api_test_runtime_coordinator_stats(
+                  runtime, NULL, NULL, &after_dispatches) == 1);
+        /* Exact compiled identities are separate physical B=1 dispatches. */
+        CHECK(after_dispatches == before_dispatches + 2u);
+        vx_result_release(model_b_result);
+        vx_result_release(model_a_result);
+        vx_request_release(model_b_request);
+        vx_request_release(model_a_request);
+    }
+    return 0;
+}
+
+static int test_runtime_result_budget(const char* graph_path) {
+    VxRuntimeOptions options = VX_RUNTIME_OPTIONS_INIT;
+    VxModelSource source = VX_MODEL_SOURCE_INIT;
+    VxBackendPolicy policy = VX_BACKEND_POLICY_INIT;
+    VxContextOptions context_options = VX_CONTEXT_OPTIONS_INIT;
+    VxRuntimeSubmitOptions submit = VX_RUNTIME_SUBMIT_OPTIONS_INIT;
+    VxReport report = VX_REPORT_INIT;
+    VxRuntime* runtime = NULL;
+    VxModel* model = NULL;
+    VxCompiledModel* compiled = NULL;
+    VxExecutionContext* context = NULL;
+    VxResult* direct = NULL;
+    VxResult* explicit_result = NULL;
+    VxResult* retained = NULL;
+    VxRequest* first_request = NULL;
+    VxRequest* second_request = NULL;
+    VxRequest* rejected_request = NULL;
+    float input[3] = {71.0f, 72.0f, 73.0f};
+    float output[3] = {0};
+    VxTensorBinding binding = {
+        sizeof(VxTensorBinding), "x", VX_DTYPE_F32, 1u, {3},
+        input, sizeof(input), VX_MEMORY_HOST,
+    };
+
+    options.execution_mode = VX_EXECUTION_MODE_SCHEDULED;
+    options.max_unconsumed_results = 1u;
+    options.max_unconsumed_result_bytes = sizeof(input);
+    source.graph_path = graph_path;
+    CHECK(vx_runtime_create(&options, &runtime, &report) == VX_STATUS_OK);
+    CHECK(vx_runtime_load_model(runtime, &source, &model, &report) ==
+          VX_STATUS_OK);
+    CHECK(vx_model_compile(model, &policy, &compiled, &report) ==
+          VX_STATUS_OK);
+    CHECK(vx_compiled_model_create_context(
+              compiled, &context_options, &context, &report) == VX_STATUS_OK);
+
+    CHECK(vx_runtime_run(runtime, compiled, &binding, 1u, &direct, &report) ==
+          VX_STATUS_OK);
+    CHECK(direct != NULL &&
+          vx_public_api_test_runtime_coordinator_allocated(runtime) == 0);
+    CHECK(vx_execution_context_execute(
+              context, &binding, 1u, &explicit_result, &report) ==
+          VX_STATUS_OVERLOADED);
+    CHECK(explicit_result == NULL && !strcmp(report.reason, "OVERLOADED"));
+    CHECK(vx_runtime_run(runtime, compiled, &binding, 1u,
+                         &explicit_result, &report) == VX_STATUS_OVERLOADED);
+    CHECK(explicit_result == NULL &&
+          vx_public_api_test_runtime_coordinator_allocated(runtime) == 0);
+    vx_result_release(direct);
+    direct = NULL;
+
+    CHECK(vx_execution_context_execute(
+              context, &binding, 1u, &explicit_result, &report) ==
+          VX_STATUS_OK);
+    CHECK(vx_result_read(explicit_result, "y", output, sizeof(output),
+                         NULL, &report) == VX_STATUS_OK);
+    CHECK(!memcmp(input, output, sizeof(input)));
+    vx_result_release(explicit_result);
+    explicit_result = NULL;
+
+    CHECK(vx_runtime_submit(runtime, compiled, &binding, 1u, &submit,
+                            &first_request, &report) == VX_STATUS_OK);
+    CHECK(vx_request_wait(first_request, VX_REQUEST_WAIT_INFINITE, &report) ==
+          VX_STATUS_OK);
+    CHECK(vx_runtime_submit(runtime, compiled, &binding, 1u, &submit,
+                            &rejected_request, &report) ==
+          VX_STATUS_OVERLOADED);
+    CHECK(rejected_request == NULL && !strcmp(report.reason, "OVERLOADED"));
+    vx_request_release(first_request);
+    first_request = NULL;
+    CHECK(vx_runtime_submit(runtime, compiled, &binding, 1u, &submit,
+                            &second_request, &report) == VX_STATUS_OK);
+    CHECK(vx_request_wait(second_request, VX_REQUEST_WAIT_INFINITE, &report) ==
+          VX_STATUS_OK);
+    CHECK(vx_request_result(second_request, &retained, &report) ==
+          VX_STATUS_OK);
+    vx_request_release(second_request);
+    second_request = NULL;
+
+    CHECK(vx_runtime_close(runtime, &report) == VX_STATUS_OK);
+    CHECK(vx_execution_context_close(context, &report) == VX_STATUS_OK);
+    vx_execution_context_release(context);
+    vx_compiled_model_release(compiled);
+    vx_model_release(model);
+    vx_runtime_release(runtime);
+    memset(output, 0, sizeof(output));
+    CHECK(vx_result_read(retained, "y", output, sizeof(output), NULL,
+                         &report) == VX_STATUS_OK);
+    CHECK(!memcmp(input, output, sizeof(input)));
+    vx_result_release(retained);
+
+    options.max_unconsumed_result_bytes = sizeof(input) - 1u;
+    runtime = NULL;
+    model = NULL;
+    compiled = NULL;
+    direct = NULL;
+    CHECK(vx_runtime_create(&options, &runtime, &report) == VX_STATUS_OK);
+    CHECK(vx_runtime_load_model(runtime, &source, &model, &report) ==
+          VX_STATUS_OK);
+    CHECK(vx_model_compile(model, &policy, &compiled, &report) ==
+          VX_STATUS_OK);
+    CHECK(vx_runtime_run(runtime, compiled, &binding, 1u, &direct, &report) ==
+          VX_STATUS_OVERLOADED);
+    CHECK(direct == NULL && !strcmp(report.reason, "OVERLOADED") &&
+          vx_public_api_test_runtime_coordinator_allocated(runtime) == 0);
+    CHECK(vx_runtime_close(runtime, &report) == VX_STATUS_OK);
+    vx_compiled_model_release(compiled);
+    vx_model_release(model);
+    vx_runtime_release(runtime);
+
+    options.execution_mode = VX_EXECUTION_MODE_DIRECT;
+    options.max_unconsumed_result_bytes = sizeof(input);
+    runtime = NULL;
+    model = NULL;
+    compiled = NULL;
+    direct = NULL;
+    rejected_request = NULL;
+    CHECK(vx_runtime_create(&options, &runtime, &report) == VX_STATUS_OK);
+    CHECK(vx_runtime_load_model(runtime, &source, &model, &report) ==
+          VX_STATUS_OK);
+    CHECK(vx_model_compile(model, &policy, &compiled, &report) ==
+          VX_STATUS_OK);
+    CHECK(vx_runtime_run(runtime, compiled, &binding, 1u, &direct, &report) ==
+          VX_STATUS_OK);
+    CHECK(direct != NULL &&
+          vx_public_api_test_runtime_coordinator_allocated(runtime) == 0);
+    vx_result_release(direct);
+    direct = NULL;
+    CHECK(vx_runtime_submit(runtime, compiled, &binding, 1u, &submit,
+                            &rejected_request, &report) ==
+          VX_STATUS_INVALID_ARGUMENT);
+    CHECK(rejected_request == NULL &&
+          !strcmp(report.reason, "SCHEDULED_MODE_DISABLED") &&
+          vx_public_api_test_runtime_coordinator_allocated(runtime) == 0);
+    CHECK(vx_runtime_close(runtime, &report) == VX_STATUS_OK);
+    vx_compiled_model_release(compiled);
+    vx_model_release(model);
+    vx_runtime_release(runtime);
+    return 0;
+}
+
 int main(int argc, char** argv) {
     const char* graph_a = "/tmp/volvox-public-api-a.graph.json";
     const char* graph_b = "/tmp/volvox-public-api-b.graph.json";
@@ -2445,12 +5013,12 @@ int main(int argc, char** argv) {
     const char* provider_graph =
         "{\"format\":\"volvox-graph/v1\","
         "\"dimensions\":{\"F\":{\"min\":4,\"max\":8,"
-        "\"multiple_of\":4}},"
-        "\"inputs\":{\"value\":{\"shape\":[1],\"dtype\":\"float32\"}},"
+        "\"multiple_of\":4},\"B\":{\"min\":1,\"max\":4}},"
+        "\"inputs\":{\"value\":{\"shape\":[\"B\"],\"dtype\":\"float32\"}},"
         "\"nodes\":[{\"id\":\"identity\",\"opType\":\"Identity\","
         "\"inputs\":{\"input\":\"value\"},"
         "\"outputs\":{\"out\":{\"tensor\":\"mock-out\","
-        "\"dtype\":\"float32\",\"shape\":[1]}},\"params\":{}}],"
+        "\"dtype\":\"float32\",\"shape\":[\"B\"]}},\"params\":{}}],"
         "\"outputs\":[\"mock-out\"],"
         "\"banks\":{\"experts\":\"F\"}}";
     VxRuntimeOptions runtime_options = VX_RUNTIME_OPTIONS_INIT;
@@ -2473,6 +5041,11 @@ int main(int argc, char** argv) {
     ThreadCase second = {0};
     CpuOverlapProbe overlap = {0};
 
+    if (argc == 2 && !strcmp(argv[1], "--process-memory-sampler")) {
+        CHECK(test_process_memory_sampler() == 0);
+        puts("native process memory sampler tests passed");
+        return 0;
+    }
     if (argc == 2 && !strcmp(argv[1], "--affine-concat-domain")) {
         CHECK(test_affine_concat_domain_proof() == 0);
         puts("native public affine Concat domain tests passed");
@@ -2485,6 +5058,10 @@ int main(int argc, char** argv) {
     CHECK(write_provider_bank_weights(provider_weights_path) == 0);
     CHECK(write_text(invalid_graph_path, "{\"inputs\":{},\"nodes\":[],\"outputs\":[]}") == 0);
     runtime_options.cpu_threads = 2;
+    runtime_options.execution_mode = VX_EXECUTION_MODE_SCHEDULED;
+    runtime_options.max_scheduled_requests = 2u;
+    runtime_options.max_scheduled_input_bytes = 1024u;
+    runtime_options.max_batch_delay_milliseconds = 50u;
     CHECK(vx_runtime_create(&runtime_options, &runtime, &report) == VX_STATUS_OK);
     {
         VxModelSource noncanonical = VX_MODEL_SOURCE_INIT;
@@ -2734,6 +5311,7 @@ int main(int argc, char** argv) {
                                                 &context_b, &report) == VX_STATUS_OK);
     }
     CHECK(create_cpu_context(runtime, graph_b, &model_b, &compiled_b, &context_c) == 0);
+    CHECK(test_runtime_request_surface(runtime, compiled_a, compiled_b) == 0);
     {
         VxContextOptions options = VX_CONTEXT_OPTIONS_INIT;
         options.decode_row_mode = VX_DECODE_ROW_AUTO;
@@ -3038,7 +5616,9 @@ int main(int argc, char** argv) {
     CHECK(test_native_gpu_resource_peak_projection() == 0);
     CHECK(test_graph_bank_package_validation(provider_graph_path) == 0);
     CHECK(test_many_bank_residencies() == 0);
+    CHECK(test_compiled_weight_store_ownership() == 0);
     CHECK(test_provider(provider_graph_path, provider_weights_path) == 0);
+    CHECK(test_runtime_result_budget(graph_b) == 0);
     vx_runtime_release(NULL);
     vx_model_release(NULL);
     vx_compiled_model_release(NULL);

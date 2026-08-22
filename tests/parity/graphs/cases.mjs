@@ -34,7 +34,7 @@ const affineTable = (tensors) => ({
 // exporter-qualified inventories for cpu-js, wasm, webgpu, and native-cpu.
 // Every entry is an executable graph case, not a registry/source-count claim.
 // run.mjs binds this list back to the generated portable inventory and requires
-// current CPU/WASM/native artifacts; the physical WebGPU campaign imports the
+// current CPU-JS/WASM/native artifacts; the physical WebGPU campaign imports the
 // same authored packages and inputs.
 export const portableClosureOperators = Object.freeze([
   'BatchMatMul',

@@ -24,7 +24,7 @@ export async function createRuntime(options: WasmRuntimeOptions = {}): Promise<W
   }
   const {
     wasmUrl = new URL('./volvoxai.full.wasm', import.meta.url),
-    onDiagnostic = null,
+    ...runtimeOptions
   } = options;
   if (!((typeof wasmUrl === 'string' && wasmUrl.length > 0) || wasmUrl instanceof URL)) {
     throw new VolvoxAIError('INVALID_ARGUMENT',
@@ -32,7 +32,8 @@ export async function createRuntime(options: WasmRuntimeOptions = {}): Promise<W
         phase: 'initialization', backend: 'wasm',
       });
   }
-  if (onDiagnostic != null && typeof onDiagnostic !== 'function') {
+  if (runtimeOptions.onDiagnostic != null &&
+      typeof runtimeOptions.onDiagnostic !== 'function') {
     throw new VolvoxAIError('INVALID_ARGUMENT',
       '[VolvoxAI] WASM runtime onDiagnostic must be a function or null.', {
         phase: 'initialization', backend: 'wasm',
@@ -54,9 +55,36 @@ export async function createRuntime(options: WasmRuntimeOptions = {}): Promise<W
         phase: 'initialization', backend: 'wasm',
       });
   }
-  const runtime = new Runtime({ onDiagnostic });
-  runtime._addProvider('wasm', new WasmBackendProvider(engine));
-  return runtime;
+
+  let runtime: Runtime | null = null;
+  let provider: WasmBackendProvider | null = null;
+  try {
+    // Keep this as the complete profile-independent option object. Adding a
+    // RuntimeOption must not require a second allowlist in the strict entry.
+    runtime = new Runtime(runtimeOptions);
+    provider = new WasmBackendProvider(engine);
+    runtime._addProvider('wasm', provider);
+    return runtime;
+  } catch (error) {
+    // Close the Runtime first: _addProvider may have transferred ownership
+    // before reporting a later construction failure. If it did not, the
+    // provider remains open and is reclaimed explicitly below.
+    try {
+      if (runtime) await runtime.close();
+    } catch {
+      // Preserve the construction failure; cleanup failure is secondary.
+    }
+    try {
+      if (provider) {
+        if (!provider._isClosed()) provider.close();
+      } else {
+        engine.dispose();
+      }
+    } catch {
+      // Preserve the construction failure; cleanup failure is secondary.
+    }
+    throw error;
+  }
 }
 
 export function createTrainer(

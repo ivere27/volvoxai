@@ -24,8 +24,7 @@ VxModel
 capsule. CPU is the default. A requested Vulkan, OpenGL, Metal, or CUDA backend
 is an exact requirement: device initialization and the differentiable graph
 plan must succeed, and training never retries another backend after work
-starts. NNAPI and external inference providers are not differentiable through
-this API.
+starts. External inference providers are not differentiable through this API.
 
 Inputs are copied through `vx_trainer_set_input()`. A
 `VxTrainStepOptions` value names one or more cross-entropy losses, the F32 model

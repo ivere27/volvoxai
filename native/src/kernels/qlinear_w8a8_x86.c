@@ -1,5 +1,5 @@
 /*
- * Native-only x86 acceleration for the canonical physical W8A8 QLinear ABI.
+ * Native-only x86 acceleration for the canonical W8A8 QLinear ABI.
  *
  * qlinear_i8u8() in portable_inference_kernels.c remains the authoritative
  * implementation and is what the freestanding WASM build exports.  This file
@@ -8,7 +8,7 @@
  * candidate is consulted on ARM builds; WASM and unsupported CPUs retain the
  * portable implementation.
  */
-#include "quant_cpu_opt.h"
+#include "quant_cpu_isa.h"
 #include "w8a8_affine.h"
 #include "cpu_features.h"
 #include "kernel_platform.h"
@@ -865,7 +865,7 @@ int vx_qlinear_i8u8_native_will_parallelize(const void *input,
 #endif
 }
 
-/* Native physical QLinear dispatcher.  It is deliberately not used by the
+/* Native QLinear dispatcher.  It is deliberately not used by the
  * WASM build, which links only kernels.c and continues to export the portable
  * qlinear_i8u8 implementation. */
 int vx_qlinear_i8u8_native(const void *input, const void *weight,

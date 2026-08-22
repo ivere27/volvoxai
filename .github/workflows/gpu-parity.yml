@@ -63,7 +63,9 @@ jobs:
           mkdir -p tests/parity/out
           {
             echo 'expected_adapter=RTX 3090'
-            nvidia-smi --query-gpu=name,uuid,driver_version --format=csv,noheader
+            # Record the model/driver needed to audit the physical route, but
+            # do not publish the runner's stable per-device UUID.
+            nvidia-smi --query-gpu=name,driver_version --format=csv,noheader
             node --version
             deno --version
             python3 --version

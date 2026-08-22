@@ -104,7 +104,7 @@ SGD는 동작하지만, 모든 가중치·모든 방향에 같은 무딘 걸음 
 
 ```javascript
 const trainer = await VolvoxAI.createTrainer(sourceSnapshot, {
-  backend: 'cpu',
+  backend: 'cpu-js',
 });
 
 const step = await trainer.trainStep({

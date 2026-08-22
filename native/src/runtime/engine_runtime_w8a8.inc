@@ -111,6 +111,122 @@ static int quantized_linear_f32(int node_index, Node* node, const T* input, cons
     return 0;
 }
 
+/*
+ * One QLinear over a declared batch's rows.
+ *
+ * The lanes are gathered into `lanes` adjacent rows, the ordinary kernel runs
+ * over them as if they had always been adjacent, and the results are scattered
+ * back to the rows each lane owns. A batched row step has to be bit-identical
+ * to the same lanes decoded one at a time, and the surest way to get that is
+ * for the arithmetic to be the same arithmetic on the same bytes in the same
+ * order.
+ *
+ * The kernel preference is the scalar path's, repeated rather than avoided.
+ * That preference is a function of the row count -- `M=1 retains the raw GEMV
+ * policy` -- so a one-lane decode and a four-lane decode do go through
+ * different kernels, and the first version of this function called the raw
+ * kernel unconditionally to keep bit-identity resting on there being one
+ * kernel rather than on two agreeing. That was over-cautious: the two agreeing
+ * is an invariant this repository already asserts, byte for byte across shapes,
+ * dtypes and zero points, in `test_packed_quant_gemm`. Declining to use it cost
+ * a measured 2.4x at two lanes and 1024 wide -- 0.205 against 0.085 ms per
+ * lane-step -- which is most of what batching was supposed to buy.
+ *
+ * A parked lane still occupies a staged row, because the operand's shape says
+ * `lanes` rows exist and a short batch is a different call. Its result is
+ * dropped by the scatter.
+ */
+static int qlinear_physical_forward_batch(QLinearMetadata* meta, T* input,
+                                          T* weight, T* output, long rows) {
+    int input_rows[VX_DECODE_ROW_SET_MAX_LANES];
+    int output_rows[VX_DECODE_ROW_SET_MAX_LANES];
+    const int lanes = g_decode_lanes;
+    size_t input_row_bytes;
+    size_t output_row_bytes;
+    size_t input_total_bytes;
+    size_t output_total_bytes;
+    size_t input_bytes;
+    size_t output_bytes;
+    unsigned char* stage;
+    unsigned char* staged_input;
+    unsigned char* staged_output;
+    uint32_t input_dtype = physical_byte_dtype(input->dtype);
+    uint32_t weight_dtype = physical_byte_dtype(weight->dtype);
+    uint32_t output_dtype = physical_byte_dtype(output->dtype);
+    if (!input_dtype || !weight_dtype || !output_dtype) return -1;
+    /* Row extents come from the dtype rather than from `elem_size`, so a
+     * sub-byte activation is addressed correctly or refused, never rounded. */
+    if (!tensor_span_bytes(input, meta->d_in, &input_row_bytes) ||
+        !tensor_span_bytes(output, meta->d_out, &output_row_bytes) ||
+        !tensor_total_bytes(input, &input_total_bytes) ||
+        !tensor_total_bytes(output, &output_total_bytes) ||
+        (size_t)lanes > SIZE_MAX / (input_row_bytes ? input_row_bytes : 1) ||
+        (size_t)lanes > SIZE_MAX / (output_row_bytes ? output_row_bytes : 1)) return -1;
+    input_bytes = (size_t)lanes * input_row_bytes;
+    output_bytes = (size_t)lanes * output_row_bytes;
+    if (decode_lane_rows(input, meta->d_in, input_rows) != lanes) return -1;
+    /*
+     * A paged output is a K/V pool, and the row a lane writes there is the slot
+     * its page table names -- not `lane * S + position`, which is where the row
+     * would be if the tensor carried one slice per lane. The pool is shared, so
+     * that address belongs to whichever lane happens to own it.
+     *
+     * The mapping comes from `vx_decode_row_set_write_rows` rather than from
+     * page arithmetic written out here, so the native path and its TypeScript
+     * and WebGPU twins keep sharing one implementation and one corpus. A lane
+     * stride of zero is deliberate: the paged answer does not use one, and
+     * passing the sequence length would suggest it did.
+     */
+    if (vx_paged_tensor_locked(output)) {
+        if (!vx_paged_bound_locked() || vx_paged_lanes_locked() < lanes ||
+            g_decode_rows.unpaged) return -1;
+        if (vx_decode_row_set_write_rows(&g_decode_rows, 0, 1, output_rows) !=
+            VX_DECODE_ROW_SET_OK) return -1;
+        for (int lane = 0; lane < lanes; lane++) {
+            if (input_rows[lane] >= rows || output_rows[lane] < 0 ||
+                (long)output_rows[lane] >= output->numel / meta->d_out) return -1;
+        }
+    } else {
+        if (decode_lane_rows(output, meta->d_out, output_rows) != lanes) return -1;
+        /* Both operands must name the same lanes of the same batch; the widths
+         * differ but the row each lane owns does not. */
+        for (int lane = 0; lane < lanes; lane++) {
+            if (input_rows[lane] >= rows || output_rows[lane] >= rows) return -1;
+        }
+    }
+    stage = (unsigned char*)decode_stage_bytes(input_bytes + output_bytes);
+    if (!stage) return -1;
+    staged_input = stage;
+    staged_output = stage + input_bytes;
+    if (vx_decode_row_gather(staged_input, input->data, input_total_bytes,
+                             input_row_bytes,
+                             input_rows, lanes) != VX_DECODE_ROW_SET_OK) return -1;
+    if (!(vx_packed_q8_preferred_for_native_w8a8(
+              (uint32_t)lanes, (uint32_t)meta->d_in, (uint32_t)meta->d_out,
+              weight_dtype, meta->weight_zero_all_zero) &&
+          meta->packed_weight &&
+          vx_qlinear_i8u8_packed(staged_input, meta->packed_weight, meta->bias,
+              meta->weight_scales, meta->weight_zero_points, staged_output,
+              (uint32_t)lanes, (uint32_t)meta->d_in, (uint32_t)meta->d_out,
+              input->quantization.scale, input->quantization.zero_point,
+              output->quantization.scale, output->quantization.zero_point,
+              input_dtype, weight_dtype, output_dtype) == 1) &&
+        vx_qlinear_i8u8_native(staged_input, weight->data, meta->bias,
+                               meta->weight_scales, meta->weight_zero_points,
+                               staged_output, (uint32_t)lanes,
+                               (uint32_t)meta->d_in, (uint32_t)meta->d_out,
+                               input->quantization.scale,
+                               input->quantization.zero_point,
+                               output->quantization.scale,
+                               output->quantization.zero_point,
+                               input_dtype, weight_dtype, output_dtype) != 1) return -1;
+    return vx_decode_row_scatter(output->data, output_total_bytes,
+                                 staged_output, output_row_bytes,
+                                 output_rows, lanes,
+                                 g_decode_rows.parked) == VX_DECODE_ROW_SET_OK
+        ? 0 : -1;
+}
+
 /* Explicit QLinear/QMatMul/QGemm is a physical-byte path. It deliberately
  * does not call materialize_tensor_f32(): input and output T.data hold their
  * declared I8/U8 bytes for the entire operation. */
@@ -123,6 +239,8 @@ static int qlinear_physical_forward(int node_index, Node* node, T* output,
     long rows;
     int row_start, row_count;
     uint32_t input_dtype, weight_dtype, output_dtype;
+    size_t input_offset;
+    size_t output_row_bytes;
     const unsigned char* input_data;
     unsigned char* output_data;
     if (node_index < 0 || node_index >= MAXN || !node || !output) return -1;
@@ -146,6 +264,12 @@ static int qlinear_physical_forward(int node_index, Node* node, T* output,
     rows = input->numel / meta->d_in;
     if (rows <= 0 || input->numel != rows * meta->d_in ||
         output->numel != rows * meta->d_out || (unsigned long)rows > UINT32_MAX) return -1;
+    /* A declared batch's rows are not one span, so they are staged rather than
+     * pointed at. The kernel below is untouched: it still receives `row_count`
+     * adjacent rows, which is exactly what staging makes true. */
+    if (g_decode_lanes > 1) {
+        return qlinear_physical_forward_batch(meta, input, weight, output, rows);
+    }
     seq_range(rows, &row_start, &row_count);
     if (is_last && g_active_row < 0 && g_execution_row >= 0 && rows > 1) {
         row_start = g_execution_row;
@@ -156,10 +280,30 @@ static int qlinear_physical_forward(int node_index, Node* node, T* output,
     weight_dtype = physical_byte_dtype(weight->dtype);
     output_dtype = physical_byte_dtype(output->dtype);
     if (!input_dtype || !weight_dtype || !output_dtype) return -1;
-    input_data = (const unsigned char*)input->data +
-        (size_t)row_start * (size_t)meta->d_in * input->elem_size;
-    output_data = (unsigned char*)output->data +
-        (size_t)row_start * (size_t)meta->d_out * output->elem_size;
+    if (!tensor_span_bytes(input, (long)row_start * meta->d_in, &input_offset) ||
+        !tensor_span_bytes(output, meta->d_out, &output_row_bytes)) return -1;
+    input_data = (const unsigned char*)input->data + input_offset;
+    /*
+     * The output row is resolved per tensor, the input row is not: a K/V
+     * projection reads its logical token row and writes the physical slot the
+     * page table maps it to. Identity for every tensor outside the page pool,
+     * so a context that does not page runs the arithmetic it always ran.
+     *
+     * More than one row at a time is refused rather than mapped: consecutive
+     * logical rows of a paged tensor need not be consecutive physical rows, and
+     * the kernel below writes `row_count` adjacent ones. A decode row step asks
+     * for exactly one, which is the case this exists for.
+     */
+    {
+        const int out_row = vx_paged_row_locked(output, row_start);
+        /* The page budget and the tensor backing the pool are configured
+         * separately, so a mapping that runs past the tensor is a caller error
+         * this has to catch rather than write through. */
+        if (out_row < 0 || (out_row != row_start && row_count != 1) ||
+            (long)out_row + row_count > output->numel / meta->d_out) return -1;
+        output_data = (unsigned char*)output->data +
+            (size_t)out_row * output_row_bytes;
+    }
     /* Immutable multi-row x86 weights use the packed N-panel microkernel.
      * It partitions output panels through the same context-owned pool and
      * avoids rescanning raw N-by-K rows. M=1 retains the raw GEMV policy;
@@ -193,8 +337,12 @@ static int qlinear_physical_forward(int node_index, Node* node, T* output,
 /* Vulkan/OpenGL/Metal keep their established CPU boundary for prefix/row
  * execution. Strict CUDA resolves canonical sequence slices as views of the
  * complete resident allocation and never crosses a hidden CPU boundary. */
+/* A row window is executable wherever an interior pointer has a device
+ * address. This used to name CUDA directly, which read as "only CUDA can do
+ * this" when what it meant was "only CUDA resolves a subspan". */
 static int physical_gpu_partial_execution_declined(void) {
-    return (g_active_row >= 0 || g_prefix_rows > 0) && !g_use_cuda;
+    return (g_active_row >= 0 || g_prefix_rows > 0) &&
+        !vx_runtime_backend_has_device_rows();
 }
 
 static int physical_sequence_window(const T* tensor, uint32_t width,
@@ -225,6 +373,9 @@ static int qlinear_physical_gpu_forward(int node_index, Node* node, T* output,
     int row_start = 0;
     int row_count = 0;
     int partial;
+    size_t input_row_bytes;
+    size_t output_row_bytes;
+    size_t input_offset;
     const void* input_data;
     void* output_data;
     uint32_t input_dtype, weight_dtype, output_dtype;
@@ -251,6 +402,85 @@ static int qlinear_physical_gpu_forward(int node_index, Node* node, T* output,
     rows = input->numel / meta->d_in;
     if (rows <= 0 || input->numel != rows * meta->d_in ||
         output->numel != rows * meta->d_out || rows > INT_MAX) return 0;
+    input_dtype = physical_byte_dtype(input->dtype);
+    weight_dtype = physical_byte_dtype(weight->dtype);
+    output_dtype = physical_byte_dtype(output->dtype);
+    if (!input_dtype || !weight_dtype || !output_dtype) return 0;
+    /*
+     * A declared batch dispatches once per contiguous run of lane rows.
+     *
+     * Unlike the host path this stages nothing: every run is already a
+     * contiguous span of the resident activation, which is precisely what a
+     * device window can bind. Two adjacent lanes therefore cost one dispatch
+     * and two scattered ones cost two -- `vx_decode_row_copy_runs` decides
+     * which, per step, from the positions the scheduler produced.
+     *
+     * Either every run binds or none does: a row's window offset is
+     * `row * width * element size`, so when the width clears the device's
+     * binding alignment every row does, and when it does not, no row does.
+     * That is what makes a partial dispatch not a case to handle here.
+     */
+    if (g_decode_lanes > 1) {
+        VxDecodeRowRun runs[VX_DECODE_ROW_SET_MAX_LANES];
+        int count;
+        if (!ops || !ops->qlinear_i8u8) return 0;
+        if (!tensor_span_bytes(input, meta->d_in, &input_row_bytes) ||
+            !tensor_span_bytes(output, meta->d_out, &output_row_bytes)) return 0;
+        /*
+         * A paged output has no runs to find. Its rows are the slots the lanes'
+         * page tables name, which are not the input's rows and not contiguous
+         * with each other, so each lane is its own dispatch: read the lane's
+         * logical row, write the physical one. Coalescing is what runs buy, and
+         * a page table is precisely the thing that stops them coalescing.
+         */
+        if (vx_paged_tensor_locked(output)) {
+            int in_rows[VX_DECODE_ROW_SET_MAX_LANES];
+            int out_rows[VX_DECODE_ROW_SET_MAX_LANES];
+            const long output_rows = output->numel / meta->d_out;
+            if (!vx_paged_bound_locked() ||
+                vx_paged_lanes_locked() < g_decode_lanes ||
+                g_decode_rows.unpaged ||
+                decode_lane_rows(input, meta->d_in, in_rows) != g_decode_lanes ||
+                vx_decode_row_set_write_rows(&g_decode_rows, 0, 1, out_rows) !=
+                    VX_DECODE_ROW_SET_OK) return 0;
+            for (int lane = 0; lane < g_decode_lanes; lane++) {
+                if (g_decode_rows.parked[lane]) continue;
+                if (in_rows[lane] < 0 || (long)in_rows[lane] >= rows ||
+                    out_rows[lane] < 0 || (long)out_rows[lane] >= output_rows)
+                    return 0;
+                if (!ops->qlinear_i8u8(
+                        (const unsigned char*)input->data +
+                            (size_t)in_rows[lane] * input_row_bytes,
+                        weight->data, meta->weight_scales,
+                        meta->weight_zero_points, meta->bias,
+                        (unsigned char*)output->data +
+                            (size_t)out_rows[lane] * output_row_bytes,
+                        1u, (uint32_t)meta->d_in, (uint32_t)meta->d_out,
+                        input->quantization.scale, input->quantization.zero_point,
+                        output->quantization.scale, output->quantization.zero_point,
+                        input_dtype, weight_dtype, output_dtype)) return 0;
+            }
+            *node_backend = backend_label;
+            return 1;
+        }
+        count = decode_lane_runs(input, meta->d_in, runs);
+        if (count <= 0) return 0;
+        for (int index = 0; index < count; index++) {
+            const size_t row = (size_t)runs[index].source;
+            if (!ops->qlinear_i8u8(
+                    (const unsigned char*)input->data + row * input_row_bytes,
+                    weight->data, meta->weight_scales, meta->weight_zero_points,
+                    meta->bias,
+                    (unsigned char*)output->data + row * output_row_bytes,
+                    (uint32_t)runs[index].rows, (uint32_t)meta->d_in,
+                    (uint32_t)meta->d_out, input->quantization.scale,
+                    input->quantization.zero_point, output->quantization.scale,
+                    output->quantization.zero_point,
+                    input_dtype, weight_dtype, output_dtype)) return 0;
+        }
+        *node_backend = backend_label;
+        return 1;
+    }
     partial = physical_sequence_window(input, (uint32_t)meta->d_in,
                                        &row_start, &row_count);
     if (partial < 0) return 0;
@@ -261,14 +491,19 @@ static int qlinear_physical_gpu_forward(int node_index, Node* node, T* output,
         row_start = g_execution_row;
         row_count = 1;
     }
-    input_data = (const unsigned char*)input->data +
-        (size_t)row_start * (size_t)meta->d_in * input->elem_size;
-    output_data = (unsigned char*)output->data +
-        (size_t)row_start * (size_t)meta->d_out * output->elem_size;
-    input_dtype = physical_byte_dtype(input->dtype);
-    weight_dtype = physical_byte_dtype(weight->dtype);
-    output_dtype = physical_byte_dtype(output->dtype);
-    if (!input_dtype || !weight_dtype || !output_dtype) return 0;
+    if (!tensor_span_bytes(input, (long)row_start * meta->d_in, &input_offset) ||
+        !tensor_span_bytes(output, meta->d_out, &output_row_bytes)) return 0;
+    input_data = (const unsigned char*)input->data + input_offset;
+    /* The paged substitution the CPU path above explains. The interior pointer
+     * this produces resolves to the pool's device slot at that slot's offset,
+     * which is the same window every other activation row binds through. */
+    {
+        const int out_row = vx_paged_row_locked(output, row_start);
+        if (out_row < 0 || (out_row != row_start && row_count != 1) ||
+            (long)out_row + row_count > output->numel / meta->d_out) return 0;
+        output_data = (unsigned char*)output->data +
+            (size_t)out_row * output_row_bytes;
+    }
     if (ops && ops->qlinear_i8u8 && ops->qlinear_i8u8(
             input_data, weight->data, meta->weight_scales, meta->weight_zero_points,
             meta->bias, output_data, (uint32_t)row_count, (uint32_t)meta->d_in,
@@ -350,13 +585,67 @@ static int qembedding_physical_validate(int node_index, Node* node, T* output,
 
 /* QEmbedding gathers directly from an I8/U8 table. No F32 materialization
  * occurs between the table and output tensor. */
+/*
+ * One QEmbedding over a declared batch's rows.
+ *
+ * The token operand is `[lanes,S]` and the output `[lanes,S,hidden]`, so both
+ * name the same rows -- `lane * S + position[lane]` -- and differ only in how
+ * wide a row is. Resolving the indices once and applying them at two widths is
+ * what keeps the token a lane reads and the row that lane writes from drifting
+ * apart, which is the failure this would have if each operand did its own
+ * arithmetic.
+ */
+static int qembedding_physical_forward_batch(
+        const QEmbeddingPhysicalDescriptor* descriptor, T* output) {
+    int rows[VX_DECODE_ROW_SET_MAX_LANES];
+    const int lanes = g_decode_lanes;
+    const T* tokens = descriptor->tokens;
+    size_t hidden_bytes;
+    size_t token_total_bytes;
+    size_t output_total_bytes;
+    size_t token_bytes = (size_t)lanes * sizeof(int32_t);
+    size_t output_bytes;
+    unsigned char* stage;
+    if (!tensor_span_bytes(output, descriptor->meta->hidden, &hidden_bytes) ||
+        !tensor_total_bytes(tokens, &token_total_bytes) ||
+        !tensor_total_bytes(output, &output_total_bytes) ||
+        (size_t)lanes > SIZE_MAX / (hidden_bytes ? hidden_bytes : 1)) return -1;
+    output_bytes = (size_t)lanes * hidden_bytes;
+    if (decode_lane_rows(output, descriptor->meta->hidden, rows) != lanes)
+        return -1;
+    /* The token operand carries the same lanes with the same stride; saying so
+     * here rather than deriving a second set of indices from its own shape. */
+    if (tokens->ndim != 2 || tokens->shape[0] != lanes ||
+        tokens->shape[1] != output->shape[1]) return -1;
+    stage = (unsigned char*)decode_stage_bytes(token_bytes + output_bytes);
+    if (!stage) return -1;
+    if (vx_decode_row_gather(stage, tokens->data, token_total_bytes,
+                             sizeof(int32_t), rows, lanes) != VX_DECODE_ROW_SET_OK)
+        return -1;
+    if (qembedding_i8u8((const int32_t*)stage, descriptor->weight->data,
+                        descriptor->meta->weight_scales,
+                        descriptor->meta->weight_zero_points,
+                        stage + token_bytes, (uint32_t)lanes,
+                        descriptor->meta->vocab, descriptor->meta->hidden,
+                        output->quantization.scale, output->quantization.zero_point,
+                        descriptor->weight_dtype, descriptor->output_dtype) != 1)
+        return -1;
+    return vx_decode_row_scatter(output->data, output_total_bytes,
+                                 stage + token_bytes, hidden_bytes,
+                                 rows, lanes, g_decode_rows.parked) ==
+        VX_DECODE_ROW_SET_OK ? 0 : -1;
+}
+
 static int qembedding_physical_forward(int node_index, Node* node, T* output) {
     QEmbeddingPhysicalDescriptor descriptor;
     const int32_t* tokens;
     void* output_data;
     uint32_t token_count;
+    size_t row_offset;
     if (qembedding_physical_validate(
             node_index, node, output, 1, &descriptor) != 0) return -1;
+    if (g_decode_lanes > 1)
+        return qembedding_physical_forward_batch(&descriptor, output);
     tokens = (const int32_t*)descriptor.tokens->data;
     output_data = output->data;
     token_count = descriptor.tokens_count;
@@ -372,8 +661,9 @@ static int qembedding_physical_forward(int node_index, Node* node, T* output) {
             (long)row_start + row_count > descriptor.tokens->numel)
             return -1;
         tokens += row_start;
-        output_data = (unsigned char*)output_data +
-            (size_t)row_start * descriptor.meta->hidden * output->elem_size;
+        if (!tensor_span_bytes(output, (long)row_start * descriptor.meta->hidden,
+                               &row_offset)) return -1;
+        output_data = (unsigned char*)output_data + row_offset;
         token_count = (uint32_t)row_count;
     }
     return qembedding_i8u8(tokens,
@@ -397,6 +687,7 @@ static int qembedding_physical_gpu_forward(int node_index, Node* node, T* output
     uint32_t token_count;
     int row_start = 0;
     int row_count = 0;
+    size_t hidden_bytes;
     if (!node_backend || physical_gpu_partial_execution_declined() ||
         qembedding_physical_validate(
             node_index, node, output,
@@ -404,6 +695,49 @@ static int qembedding_physical_gpu_forward(int node_index, Node* node, T* output
     tokens = (const int32_t*)descriptor.tokens->data;
     output_data = output->data;
     token_count = descriptor.tokens_count;
+    /*
+     * A declared batch dispatches once per contiguous run of lane rows, and
+     * stages nothing -- the same shape QLinear takes above, for the same
+     * reason: a run is already a contiguous span of both operands.
+     *
+     * The two operands have different widths and the same rows. Resolving the
+     * runs once from the output and applying `runs[i].source` to the tokens at
+     * one element per row is what keeps the token a lane reads and the row it
+     * writes from drifting apart; deriving a second set of indices from the
+     * token shape is the way that goes wrong.
+     *
+     * Note this is where the token binding earns its keep. A run starts at row
+     * `source`, so the ids pointer handed down is interior whenever that is not
+     * zero -- which no alignment rule would let a descriptor name, and which
+     * `graph_token_window` now expresses as a shader-side token offset instead.
+     */
+    if (g_decode_lanes > 1) {
+        VxDecodeRowRun runs[VX_DECODE_ROW_SET_MAX_LANES];
+        const T* token_tensor = descriptor.tokens;
+        const int count = decode_lane_runs(output, descriptor.meta->hidden, runs);
+        if (count <= 0 || !ops || !ops->qembedding_i8u8) return 0;
+        /* The token operand carries the same lanes over the same sequence;
+         * said here rather than inferred from its own leading extent. */
+        if (token_tensor->ndim != 2 || token_tensor->shape[0] != g_decode_lanes ||
+            token_tensor->shape[1] != output->shape[1] ||
+            token_tensor->elem_size != sizeof(int32_t)) return 0;
+        if (!tensor_span_bytes(output, descriptor.meta->hidden, &hidden_bytes))
+            return 0;
+        for (int index = 0; index < count; index++) {
+            const size_t row = (size_t)runs[index].source;
+            if (!ops->qembedding_i8u8(
+                    (const int32_t*)token_tensor->data + row,
+                    descriptor.weight->data, descriptor.meta->weight_scales,
+                    descriptor.meta->weight_zero_points,
+                    (unsigned char*)output->data + row * hidden_bytes,
+                    (uint32_t)runs[index].rows, descriptor.meta->vocab,
+                    descriptor.meta->hidden, output->quantization.scale,
+                    output->quantization.zero_point, descriptor.weight_dtype,
+                    descriptor.output_dtype)) return 0;
+        }
+        *node_backend = backend_label;
+        return 1;
+    }
     if (g_active_row >= 0 ||
         (g_prefix_rows > 0 &&
          descriptor.tokens->numel == g_prefix_row_capacity)) {
@@ -413,8 +747,9 @@ static int qembedding_physical_gpu_forward(int node_index, Node* node, T* output
         if (row_start < 0 || row_count <= 0 ||
             (long)row_start + row_count > descriptor.tokens->numel) return 0;
         tokens += row_start;
-        output_data = (unsigned char*)output_data +
-            (size_t)row_start * descriptor.meta->hidden * output->elem_size;
+        if (!tensor_span_bytes(output, (long)row_start * descriptor.meta->hidden,
+                               &hidden_bytes)) return 0;
+        output_data = (unsigned char*)output_data + hidden_bytes;
         token_count = (uint32_t)row_count;
     }
     if (ops && ops->qembedding_i8u8 && ops->qembedding_i8u8(
@@ -606,6 +941,26 @@ static T* physical_node_data_input(Node* node) {
     return input;
 }
 
+/*
+ * The gate every W8A8 operand passes, and the one place a narrower dtype has to
+ * be let in.
+ *
+ * `elem_size != 1` is what keeps a sub-byte activation out. That is deliberate
+ * and not an oversight: these kernels index one byte per element, so a 4-bit
+ * tensor reaching them would read two values as one.
+ *
+ * What an int4 kernel would have to change, stated so it does not have to be
+ * rediscovered:
+ *
+ *   - this predicate and `physical_byte_dtype` below it;
+ *   - the elementwise operators (QAdd, QSiLU, QGELU, the norms), which turn an
+ *     element offset into a byte offset by multiplying by `elem_size`. Correct
+ *     only while that is one, which this gate guarantees today;
+ *   - nothing in the row, page, staging or gather addressing. Those ask
+ *     `tensor_span_bytes`, which answers from the dtype's bit width and refuses
+ *     a row that does not end on a byte boundary rather than rounding it into
+ *     its neighbour.
+ */
 static int physical_byte_tensor(const T* tensor, uint32_t* dtype_out) {
     uint32_t dtype;
     if (!tensor || !tensor->data || tensor->numel <= 0 || tensor->numel > UINT32_MAX ||
@@ -1311,6 +1666,24 @@ static int qadd_physical_forward(Node* node, T* output) {
     b_data = b->data;
     output_data = output->data;
     elements = (uint32_t)output->numel;
+    if (g_decode_lanes > 1) {
+        const long width = output->ndim > 0 ? output->shape[output->ndim - 1] : 0;
+        VxDecodeRowRun runs[VX_DECODE_ROW_SET_MAX_LANES];
+        const int count = decode_lane_runs(output, width, runs);
+        if (count < 0) return -1;
+        for (int index = 0; index < count; index++) {
+            const size_t offset = (size_t)runs[index].source * (size_t)width;
+            if (qadd_i8u8((const unsigned char*)a_data + offset * a->elem_size,
+                    (const unsigned char*)b_data + offset * b->elem_size,
+                    (unsigned char*)output_data + offset * output->elem_size,
+                    (uint32_t)((long)runs[index].rows * width),
+                    a->quantization.scale, a->quantization.zero_point,
+                    b->quantization.scale, b->quantization.zero_point,
+                    output->quantization.scale, output->quantization.zero_point,
+                    a_dtype, b_dtype, output_dtype, relu) != 1) return -1;
+        }
+        return 0;
+    }
     if (g_active_row >= 0 || g_prefix_rows > 0) {
         const uint32_t width = output->ndim > 0
             ? (uint32_t)output->shape[output->ndim - 1] : 0u;
@@ -1410,6 +1783,23 @@ static int qsilu_physical_forward(Node* node, T* output) {
     input_data = input->data;
     output_data = output->data;
     elements = (uint32_t)output->numel;
+    if (g_decode_lanes > 1) {
+        const long width = output->ndim > 0 ? output->shape[output->ndim - 1] : 0;
+        VxDecodeRowRun runs[VX_DECODE_ROW_SET_MAX_LANES];
+        const int count = decode_lane_runs(output, width, runs);
+        if (count < 0) return -1;
+        for (int index = 0; index < count; index++) {
+            const size_t offset = (size_t)runs[index].source * (size_t)width;
+            if (vx_qsilu_i8u8_native_validated(
+                    (const unsigned char*)input_data + offset * input->elem_size,
+                    (unsigned char*)output_data + offset * output->elem_size,
+                    (uint32_t)((long)runs[index].rows * width),
+                    input->quantization.scale, input->quantization.zero_point,
+                    output->quantization.scale, output->quantization.zero_point,
+                    input_dtype, output_dtype) != 1) return -1;
+        }
+        return 0;
+    }
     if (g_active_row >= 0 || g_prefix_rows > 0) {
         const uint32_t width = output->ndim > 0
             ? (uint32_t)output->shape[output->ndim - 1] : 0u;
@@ -1503,6 +1893,23 @@ static int qgelu_physical_forward(Node* node, T* output) {
     input_data = input->data;
     output_data = output->data;
     elements = (uint32_t)output->numel;
+    if (g_decode_lanes > 1) {
+        const long width = output->ndim > 0 ? output->shape[output->ndim - 1] : 0;
+        VxDecodeRowRun runs[VX_DECODE_ROW_SET_MAX_LANES];
+        const int count = decode_lane_runs(output, width, runs);
+        if (count < 0) return -1;
+        for (int index = 0; index < count; index++) {
+            const size_t offset = (size_t)runs[index].source * (size_t)width;
+            if (qgelu_i8u8(
+                    (const unsigned char*)input_data + offset * input->elem_size,
+                    (unsigned char*)output_data + offset * output->elem_size,
+                    (uint32_t)((long)runs[index].rows * width),
+                    input->quantization.scale, input->quantization.zero_point,
+                    output->quantization.scale, output->quantization.zero_point,
+                    input_dtype, output_dtype) != 1) return -1;
+        }
+        return 0;
+    }
     if (g_active_row >= 0 || g_prefix_rows > 0) {
         const uint32_t width = output->ndim > 0
             ? (uint32_t)output->shape[output->ndim - 1] : 0u;
@@ -1859,6 +2266,27 @@ static int qlayernorm_physical_forward(Node* node, T* output) {
     input_data = descriptor.input->data;
     output_data = output->data;
     rows = descriptor.rows;
+    if (g_decode_lanes > 1) {
+        VxDecodeRowRun runs[VX_DECODE_ROW_SET_MAX_LANES];
+        const int count = decode_lane_runs(descriptor.input,
+                                           (long)descriptor.d_model, runs);
+        if (count < 0) return -1;
+        for (int index = 0; index < count; index++) {
+            const size_t offset = (size_t)runs[index].source * descriptor.d_model;
+            if (vx_qlayernorm_i8u8_native_validated(
+                    (const unsigned char*)input_data +
+                        offset * descriptor.input->elem_size,
+                    descriptor.weight->data, descriptor.bias->data,
+                    (unsigned char*)output_data + offset * output->elem_size,
+                    (uint32_t)runs[index].rows, descriptor.d_model,
+                    descriptor.input->quantization.scale,
+                    descriptor.input->quantization.zero_point,
+                    output->quantization.scale, output->quantization.zero_point,
+                    descriptor.epsilon, descriptor.input_dtype,
+                    descriptor.output_dtype) != 1) return -1;
+        }
+        return 0;
+    }
     if (g_active_row >= 0 || g_prefix_rows > 0) {
         int row_start;
         int row_count;
@@ -2051,6 +2479,17 @@ static int qsdpa_physical_validate(Node* node, T* output,
                                   &attention_scale) != 0 ||
         !qsdpa_score_scale_valid(q, k, q_dtype, k_dtype, d_model / heads,
                                  attention_scale)) return -1;
+    /*
+     * One key axis, the operand's, whether or not the K/V are paged.
+     *
+     * Paging changes what a mask index *means* -- a lane-local logical token
+     * rather than a row of this operand -- but not how wide the axis is. It
+     * cannot: the graph declares the mask's shape once and the same graph runs
+     * both with a cache bound and without (a seed forward binds nothing), so an
+     * extent only a bound cache could supply would make the unbound execution
+     * of that graph refuse. How far into the axis a lane may read is the lane's
+     * published length, which the paged branches bound below.
+     */
     mask_mode_value = attention_mask_mode(mask, (int)batch, (int)seq_q,
                                           (int)seq_kv);
     if (mask_mode_value < 0) return -1;
@@ -2096,23 +2535,279 @@ static int qsdpa_physical_validate(Node* node, T* output,
     return 0;
 }
 
+/*
+ * One QSDPA over a declared batch's lanes.
+ *
+ * The kernel already takes a batch axis and a query range, but the range is one
+ * range for every lane, and lanes at different positions want different query
+ * rows. So the queries are staged: each lane's row is gathered into a
+ * `[lanes,1,D]` operand, and the kernel runs one query per lane.
+ *
+ * K and V are *not* staged -- unless they are paged. Lane b's keys ordinarily
+ * occupy rows `b*S .. b*S+S-1` of a `[lanes,S,D]` tensor, which is exactly the
+ * layout the kernel's `batch_index * seq_kv * d_model` addressing expects, and
+ * staging them would copy the entire prefix of every lane on every token to
+ * reproduce bytes that were already in the right place.
+ *
+ * A paged pool breaks that and nothing cheaper is available: lane b's prefix is
+ * the physical slots its page table names, in an order shared with no other
+ * lane, so there is no addressing the kernel could be given instead. The prefix
+ * is gathered into `[lanes, key_capacity, D]` logical order --
+ * `vx_decode_row_set_prefix_rows` says which source row each staged row takes,
+ * and pads the tail of a lane shorter than the capacity -- and the keep mask
+ * below already stops any lane reading into that padding.
+ *
+ * Causality moves into the keep mask, and this is the part that has to be
+ * argued rather than assumed. The kernel implements causal by truncating the
+ * key extent to `query + 1`; a staged query sits at index 0 and no longer knows
+ * its absolute position, so truncation would admit key 0 alone. What makes the
+ * substitution exact is that `vx_pf_qsdpa_key_allowed` returning zero makes the
+ * loop `continue`: a masked key is not scored, does not enter the running
+ * maximum, and does not enter the sum. A key excluded by the mask is therefore
+ * indistinguishable from a key the extent never reached. `kv_lengths[lane]` is
+ * `position + 1` -- the causal extent -- so a mask clamped to it admits keys
+ * `0..position` in ascending order, which is the same set the one-lane decode
+ * visits in the same order, through the same online-softmax recurrence.
+ */
+static int qsdpa_physical_forward_batch(const QSDPAPhysicalDescriptor* descriptor,
+                                        T* output) {
+    const int lanes = g_decode_lanes;
+    T* q = descriptor->q;
+    const uint32_t sequence = descriptor->seq_q;
+    size_t row_bytes;
+    const int paged = vx_paged_tensor_locked(descriptor->k);
+    /* A paged pool has no lane axis, so its extent is its own row count and the
+     * key axis the kernel sees is the staged capacity instead. */
+    const uint32_t key_extent = paged
+        ? (uint32_t)g_decode_rows.key_capacity : descriptor->seq_kv;
+    size_t kv_row_bytes;
+    size_t q_total_bytes;
+    size_t output_total_bytes;
+    int rows[VX_DECODE_ROW_SET_MAX_LANES];
+    VxDecodeKeepMask graph_mask = {0};
+    size_t query_bytes;
+    size_t mask_bytes = (size_t)lanes * key_extent * sizeof(int32_t);
+    size_t kv_bytes;
+    /* The staged prefix's source rows live in the same scratch as the rows
+     * themselves. On the stack they would have had to be sized for the largest
+     * context this could ever see, which is the sequence length -- and a fixed
+     * bound there would refuse a long decode rather than a wrong one. */
+    size_t prefix_row_bytes = paged
+        ? (size_t)lanes * key_extent * sizeof(int) : 0;
+    const void* keys;
+    const void* values;
+    unsigned char* stage;
+    unsigned char* staged_q;
+    unsigned char* staged_output;
+    int32_t* staged_mask;
+    /* Q and the output share the sequence axis; K and V carry the whole
+     * prefix, so their extent is the tensor's and not the batch's. */
+    if (q->ndim != 3 || (uint32_t)descriptor->batch != (uint32_t)lanes ||
+        (!paged && descriptor->seq_kv != sequence)) return -1;
+    /* Row extents come from the dtype, so a sub-byte activation is addressed
+     * exactly or refused -- never rounded into its neighbour's row. */
+    if (!tensor_span_bytes(q, descriptor->d_model, &row_bytes) ||
+        !tensor_span_bytes(descriptor->k, descriptor->d_model, &kv_row_bytes) ||
+        !tensor_total_bytes(q, &q_total_bytes) ||
+        !tensor_total_bytes(output, &output_total_bytes) ||
+        (size_t)lanes > SIZE_MAX / (row_bytes ? row_bytes : 1)) return -1;
+    query_bytes = (size_t)lanes * row_bytes;
+    kv_bytes = 0;
+    if (paged) {
+        if (key_extent == 0 || (size_t)lanes * key_extent >
+                SIZE_MAX / (kv_row_bytes ? kv_row_bytes : 1)) return -1;
+        kv_bytes = (size_t)lanes * key_extent * kv_row_bytes;
+    }
+    if (decode_lane_rows(q, descriptor->d_model, rows) != lanes ||
+        decode_lane_rows(output, descriptor->d_model, rows) != lanes) return -1;
+    if (paged) {
+        if (!vx_paged_tensor_locked(descriptor->v) ||
+            descriptor->v->elem_size != descriptor->k->elem_size ||
+            descriptor->v->numel != descriptor->k->numel ||
+            vx_paged_lanes_locked() < lanes || g_decode_rows.unpaged ||
+            key_extent == 0) return -1;
+    }
+    if (descriptor->mask) {
+        /*
+         * `keep_mask_reads` indexes `(lane, key)` with `key` a lane-local
+         * logical token, which is what a staged paged prefix already is:
+         * staged row `lane * key_capacity + token` holds that lane's logical
+         * token `token`. So the graph mask joins by naming its own key stride
+         * and nothing else has to move.
+         *
+         * The stride is the operand's declared key axis, the one validate
+         * classified the mask against. `key_extent` is what this step actually
+         * reads -- `key_capacity`, the widest live lane -- and it has to lie
+         * inside that axis, or a lane's row would be read past the mask
+         * validate sized.
+         */
+        if (key_extent > descriptor->seq_kv) return -1;
+        graph_mask.layout = (VxDecodeKeepMaskLayout)descriptor->mask_mode;
+        graph_mask.values = (const int*)descriptor->mask->data;
+        graph_mask.keys = (int)descriptor->seq_kv;
+        graph_mask.queries = (int)sequence;
+    }
+    stage = (unsigned char*)decode_stage_bytes(query_bytes * 2 + mask_bytes +
+                                               kv_bytes * 2 + prefix_row_bytes);
+    if (!stage) return -1;
+    staged_q = stage;
+    staged_output = stage + query_bytes;
+    staged_mask = (int32_t*)(stage + query_bytes * 2);
+    keys = descriptor->k->data;
+    values = descriptor->v->data;
+    if (vx_decode_row_gather(staged_q, q->data, q_total_bytes, row_bytes,
+                             rows, lanes) != VX_DECODE_ROW_SET_OK) return -1;
+    if (paged) {
+        unsigned char* staged_k = stage + query_bytes * 2 + mask_bytes;
+        unsigned char* staged_v = staged_k + kv_bytes;
+        int* prefix_rows = (int*)(staged_v + kv_bytes);
+        size_t pool_bytes;
+        if (!tensor_total_bytes(descriptor->k, &pool_bytes)) return -1;
+        /* `lane_stride` is unused by the paged answer, and a K/V pool has no
+         * lane stride to pass; the page table is the whole of the mapping. */
+        if (vx_decode_row_set_prefix_rows(&g_decode_rows, 0, 1, prefix_rows) !=
+            VX_DECODE_ROW_SET_OK) return -1;
+        if (vx_decode_row_gather(staged_k, descriptor->k->data, pool_bytes,
+                                 kv_row_bytes, prefix_rows,
+                                 lanes * (int)key_extent) != VX_DECODE_ROW_SET_OK ||
+            vx_decode_row_gather(staged_v, descriptor->v->data, pool_bytes,
+                                 kv_row_bytes, prefix_rows,
+                                 lanes * (int)key_extent) != VX_DECODE_ROW_SET_OK)
+            return -1;
+        keys = staged_k;
+        values = staged_v;
+    }
+    /* Clamped only when the node is causal, or whenever the keys are staged --
+     * a staged lane's rows past its own length are padding, and the clamp is
+     * what keeps every lane out of them. A non-causal contiguous attention has
+     * no per-lane visible length to publish: every lane reads the memory whole,
+     * and clamping would silently shorten it. */
+    if (vx_decode_row_set_keep_mask(&g_decode_rows, (int)key_extent,
+                                    (descriptor->causal || paged) ? 1 : 0,
+                                    descriptor->mask ? &graph_mask : NULL,
+                                    (int*)staged_mask) != VX_DECODE_ROW_SET_OK)
+        return -1;
+    if (vx_qsdpa_i8u8_native_range_validated(
+            staged_q, keys, values, staged_mask,
+            staged_output, (uint32_t)lanes, 1u, key_extent,
+            descriptor->d_model, descriptor->heads,
+            q->quantization.scale, q->quantization.zero_point,
+            descriptor->k->quantization.scale,
+            descriptor->k->quantization.zero_point,
+            descriptor->v->quantization.scale,
+            descriptor->v->quantization.zero_point,
+            output->quantization.scale, output->quantization.zero_point,
+            descriptor->attention_scale, descriptor->q_dtype,
+            descriptor->k_dtype, descriptor->v_dtype, descriptor->output_dtype,
+            0u, ATTN_MASK_BATCH_KEY, 0u, 1u) != 1) return -1;
+    return vx_decode_row_scatter(output->data, output_total_bytes,
+                                 staged_output, row_bytes, rows, lanes,
+                                 g_decode_rows.parked) == VX_DECODE_ROW_SET_OK
+        ? 0 : -1;
+}
+
+/*
+ * One lane's paged prefix, gathered into logical order.
+ *
+ * A gather rather than a page-table-aware kernel, for the reason the F32 path
+ * gives: the kernel runs an online-softmax recurrence whose accumulation order
+ * a rewrite would not reproduce, and "paged K/V is numerically identical to
+ * contiguous K/V" would then hold only to a tolerance. Handing the *same*
+ * kernel the same bytes in the same order makes it identical by construction.
+ *
+ * Both operands or neither, and the two gathers use different slots so the
+ * second does not overwrite the first.
+ */
+static int qsdpa_paged_prefix(const QSDPAPhysicalDescriptor* descriptor, int lane,
+                              const void** keys, const void** values,
+                              uint32_t* kv_length) {
+    size_t row_bytes;
+    const int pool_rows = (int)(descriptor->k->numel / descriptor->d_model);
+    const int length = vx_paged_kv_length_lane_locked(lane);
+    if (descriptor->v->elem_size != descriptor->k->elem_size ||
+        descriptor->v->numel != descriptor->k->numel ||
+        !tensor_span_bytes(descriptor->k, descriptor->d_model, &row_bytes)) return -1;
+    /* A published length longer than the tensor would gather past the pool:
+     * the cache's page budget and the tensor backing it are configured
+     * separately. */
+    if (length <= 0 || length > pool_rows) return -1;
+    *keys = vx_paged_gather_lane_bytes_locked(descriptor->k->data, pool_rows,
+                                              row_bytes, length, 0, lane);
+    *values = vx_paged_gather_lane_bytes_locked(descriptor->v->data, pool_rows,
+                                                row_bytes, length, 1, lane);
+    if (!*keys || !*values) return -1;
+    *kv_length = (uint32_t)length;
+    return 0;
+}
+
 static int qsdpa_physical_forward(Node* node, T* output) {
     QSDPAPhysicalDescriptor descriptor;
     int query_start = 0;
     int query_count = 0;
     if (qsdpa_physical_validate(node, output, &descriptor) != 0) return -1;
+    if (g_decode_lanes > 1) return qsdpa_physical_forward_batch(&descriptor, output);
     if (g_active_row >= 0 || g_prefix_rows > 0) {
+        const void* keys = descriptor.k->data;
+        const void* values = descriptor.v->data;
+        uint32_t seq_kv = descriptor.seq_kv;
+        uint32_t causal = descriptor.causal;
         if (descriptor.batch != 1 ||
             (descriptor.q->ndim != 2 && descriptor.q->ndim != 3)) return -1;
         seq_range(descriptor.seq_q, &query_start, &query_count);
         if (query_start < 0 || query_count <= 0 ||
             (uint32_t)query_start + (uint32_t)query_count > descriptor.seq_q)
             return -1;
+        const int32_t* mask_data = descriptor.mask
+            ? (const int32_t*)descriptor.mask->data : NULL;
+        uint32_t mask_mode = descriptor.mask_mode;
+        if (vx_paged_tensor_locked(descriptor.k)) {
+            /*
+             * The gathered prefix is `kv_length` rows long and already ends at
+             * this row's last visible key, so the extent *is* the causal bound
+             * and the kernel must not truncate again: query `query_start` sits
+             * at its absolute index but the keys no longer do, and `query + 1`
+             * would admit a prefix of a prefix.
+             */
+            if (!vx_paged_tensor_locked(descriptor.v) || query_count != 1 ||
+                qsdpa_paged_prefix(&descriptor, vx_engine_state_current()->paged.lane,
+                                   &keys, &values, &seq_kv) != 0) return -1;
+            causal = 0u;
+            if (descriptor.mask) {
+                /*
+                 * The mask joins by being sliced, not staged.
+                 *
+                 * The gather replaced the key extent with this lane's length,
+                 * and the kernel indexes the mask with whatever extent it is
+                 * handed -- so the four layouts collapse to the one the kernel
+                 * can read at that extent: the single key row belonging to this
+                 * (batch, query) pair. `attention_mask_query_view` names it,
+                 * and keys `0..kv_length-1` of that row are exactly this lane's
+                 * logical tokens -- the gather put them in logical order, so
+                 * the mask's own indexing needs no translation.
+                 *
+                 * The batch index is zero and not the bound cache lane. This
+                 * path admits only `batch == 1`, so the mask has one row along
+                 * its batch axis however many lanes the cache holds; indexing
+                 * it by the cache lane would read another operand's bytes as
+                 * soon as a scheduler bound anything but lane zero.
+                 */
+                int local_mode = 0;
+                /* The gathered length is how many entries of the resolved row
+                 * the kernel reads; it has to fit inside the declared axis. */
+                if (seq_kv > descriptor.seq_kv) return -1;
+                mask_data = attention_mask_query_view(
+                    descriptor.mask, (int)descriptor.mask_mode, 0, query_start,
+                    (int)descriptor.seq_q, (int)descriptor.seq_kv,
+                    &local_mode);
+                if (!mask_data || local_mode != VX_ATTN_MASK_LOCAL_KEY) return -1;
+                mask_mode = ATTN_MASK_KEY;
+            }
+        }
         return vx_qsdpa_i8u8_native_range_validated(
-                    descriptor.q->data, descriptor.k->data, descriptor.v->data,
-                    descriptor.mask ? (const int32_t*)descriptor.mask->data : NULL,
+                    descriptor.q->data, keys, values,
+                    mask_data,
                     output->data, descriptor.batch, descriptor.seq_q,
-                    descriptor.seq_kv, descriptor.d_model, descriptor.heads,
+                    seq_kv, descriptor.d_model, descriptor.heads,
                     descriptor.q->quantization.scale,
                     descriptor.q->quantization.zero_point,
                     descriptor.k->quantization.scale,
@@ -2123,10 +2818,16 @@ static int qsdpa_physical_forward(Node* node, T* output) {
                     output->quantization.zero_point,
                     descriptor.attention_scale, descriptor.q_dtype,
                     descriptor.k_dtype, descriptor.v_dtype,
-                    descriptor.output_dtype, descriptor.causal,
-                    descriptor.mask_mode, (uint32_t)query_start,
+                    descriptor.output_dtype, causal,
+                    mask_mode, (uint32_t)query_start,
                     (uint32_t)query_count) == 1 ? 0 : -1;
     }
+    /* The whole-sequence path reads K/V linearly, which is what a page table
+     * exists to prevent: it would attend over whatever physical rows sit at
+     * `[0, seq_kv)`, some of them another lane's. There is no correct linear
+     * reading of a scattered mapping to fall back to. */
+    if (vx_paged_tensor_locked(descriptor.k) ||
+        vx_paged_tensor_locked(descriptor.v)) return -1;
     return vx_qsdpa_i8u8_native_validated(
                       descriptor.q->data, descriptor.k->data, descriptor.v->data,
                       descriptor.mask ? (const int32_t*)descriptor.mask->data : NULL,
@@ -2146,6 +2847,157 @@ static int qsdpa_physical_forward(Node* node, T* output) {
                       descriptor.mask_mode) == 1 ? 0 : -1;
 }
 
+/*
+ * One QSDPA over a declared batch, on the device.
+ *
+ * The same staging the host path does, done where the bytes already are. That
+ * is the whole reason this exists rather than deferring to the host one: on a
+ * device-row backend the activations are resident, so a host gather would read
+ * a mirror the device has moved past, and a host scatter would write one the
+ * device is about to overwrite.
+ *
+ * Four dispatches in the contiguous case and six when the K/V are paged:
+ * gather the queries, gather each lane's prefix if it is scattered, attend,
+ * scatter the answers back. The keep mask is small and built on the host --
+ * it is `lanes * key_extent` int32 and depends on the scheduler's positions,
+ * not on any resident tensor -- so it is uploaded rather than computed here,
+ * and marked host-dirty every step because its slot would otherwise be clean
+ * from the first upload onward and serve a previous step's lengths.
+ *
+ * Everything is measured in words, so nothing here knows what a row contains.
+ * A row whose bytes are not a whole number of words is refused to the host
+ * path instead: the transfer kernel owns whole words to keep two lanes' rows
+ * from sharing one, and a partial word would need read-modify-write.
+ */
+static int qsdpa_physical_gpu_forward_batch(const QSDPAPhysicalDescriptor* descriptor,
+                                            T* output, const VxW8A8Ops* ops) {
+    const int lanes = g_decode_lanes;
+    T* q = descriptor->q;
+    const uint32_t sequence = descriptor->seq_q;
+    const int paged = vx_paged_tensor_locked(descriptor->k);
+    const uint32_t key_extent = paged
+        ? (uint32_t)g_decode_rows.key_capacity : descriptor->seq_kv;
+    size_t row_bytes;
+    size_t kv_row_bytes;
+    size_t q_total_bytes;
+    size_t output_total_bytes;
+    size_t pool_bytes = 0;
+    size_t query_bytes;
+    size_t mask_bytes = (size_t)lanes * key_extent * sizeof(int32_t);
+    size_t kv_bytes = 0;
+    size_t prefix_row_bytes = 0;
+    int rows[VX_DECODE_ROW_SET_MAX_LANES];
+    int scatter_rows[VX_DECODE_ROW_SET_MAX_LANES];
+    unsigned char* stage;
+    unsigned char* staged_q;
+    unsigned char* staged_output;
+    int32_t* staged_mask;
+    const void* keys;
+    const void* values;
+    uint32_t q_rows;
+    uint32_t output_rows;
+    uint32_t row_words;
+    uint32_t kv_row_words = 0;
+
+    if (!ops || !ops->qsdpa_i8u8 || !ops->row_index_transfer) return -1;
+    if (q->ndim != 3 || (uint32_t)descriptor->batch != (uint32_t)lanes ||
+        (!paged && descriptor->seq_kv != sequence)) return -1;
+    if (!tensor_span_bytes(q, descriptor->d_model, &row_bytes) ||
+        !tensor_span_bytes(descriptor->k, descriptor->d_model, &kv_row_bytes) ||
+        !tensor_total_bytes(q, &q_total_bytes) ||
+        !tensor_total_bytes(output, &output_total_bytes) ||
+        row_bytes % sizeof(uint32_t) || kv_row_bytes % sizeof(uint32_t) ||
+        !row_bytes || (size_t)lanes > SIZE_MAX / row_bytes) return -1;
+    row_words = (uint32_t)(row_bytes / sizeof(uint32_t));
+    kv_row_words = (uint32_t)(kv_row_bytes / sizeof(uint32_t));
+    query_bytes = (size_t)lanes * row_bytes;
+    q_rows = (uint32_t)(q->numel / descriptor->d_model);
+    output_rows = (uint32_t)(output->numel / descriptor->d_model);
+    if (!q_rows || !output_rows) return -1;
+    if (decode_lane_rows(q, descriptor->d_model, rows) != lanes ||
+        decode_lane_rows(output, descriptor->d_model, scatter_rows) != lanes)
+        return -1;
+    /* A parked lane occupies a row so the shape holds, and takes none back. */
+    for (int lane = 0; lane < lanes; lane++)
+        if (g_decode_rows.parked[lane]) scatter_rows[lane] = -1;
+    if (paged) {
+        if (!vx_paged_tensor_locked(descriptor->v) ||
+            descriptor->v->elem_size != descriptor->k->elem_size ||
+            descriptor->v->numel != descriptor->k->numel ||
+            vx_paged_lanes_locked() < lanes || g_decode_rows.unpaged ||
+            !key_extent || !kv_row_words ||
+            !tensor_total_bytes(descriptor->k, &pool_bytes) ||
+            (size_t)lanes * key_extent > SIZE_MAX / kv_row_bytes) return -1;
+        kv_bytes = (size_t)lanes * key_extent * kv_row_bytes;
+        prefix_row_bytes = (size_t)lanes * key_extent * sizeof(int);
+    }
+    stage = (unsigned char*)decode_stage_bytes(query_bytes * 2 + mask_bytes +
+                                               kv_bytes * 2 + prefix_row_bytes);
+    if (!stage) return -1;
+    staged_q = stage;
+    staged_output = stage + query_bytes;
+    staged_mask = (int32_t*)(stage + query_bytes * 2);
+    keys = descriptor->k->data;
+    values = descriptor->v->data;
+
+    if (!ops->row_index_transfer(q->data, q_total_bytes, rows, (uint32_t)lanes,
+                                 staged_q, query_bytes, row_words, q_rows, 0u))
+        return -1;
+    if (paged) {
+        unsigned char* staged_k = stage + query_bytes * 2 + mask_bytes;
+        unsigned char* staged_v = staged_k + kv_bytes;
+        int* prefix_rows = (int*)(staged_v + kv_bytes);
+        const uint32_t staged_rows = (uint32_t)lanes * key_extent;
+        const uint32_t pool_rows = (uint32_t)(descriptor->k->numel / descriptor->d_model);
+        if (vx_decode_row_set_prefix_rows(&g_decode_rows, 0, 1, prefix_rows) !=
+            VX_DECODE_ROW_SET_OK) return -1;
+        if (!ops->row_index_transfer(descriptor->k->data, pool_bytes, prefix_rows,
+                                     staged_rows, staged_k, kv_bytes,
+                                     kv_row_words, pool_rows, 0u) ||
+            !ops->row_index_transfer(descriptor->v->data, pool_bytes, prefix_rows,
+                                     staged_rows, staged_v, kv_bytes,
+                                     kv_row_words, pool_rows, 0u)) return -1;
+        keys = staged_k;
+        values = staged_v;
+    }
+    {
+        VxDecodeKeepMask graph_mask = {0};
+        if (descriptor->mask) {
+            /* The same stride and the same bound as the host batch above: the
+             * keep mask is built on the host either way, so the two paths
+             * differ only in where the result is consumed. */
+            if (key_extent > descriptor->seq_kv) return -1;
+            graph_mask.layout = (VxDecodeKeepMaskLayout)descriptor->mask_mode;
+            graph_mask.values = (const int*)descriptor->mask->data;
+            graph_mask.keys = (int)descriptor->seq_kv;
+            graph_mask.queries = (int)sequence;
+        }
+        if (vx_decode_row_set_keep_mask(&g_decode_rows, (int)key_extent,
+                                        (descriptor->causal || paged) ? 1 : 0,
+                                        descriptor->mask ? &graph_mask : NULL,
+                                        (int*)staged_mask) != VX_DECODE_ROW_SET_OK)
+            return -1;
+        vx_runtime_backend_mark_host(staged_mask, mask_bytes, 0);
+    }
+    if (!ops->qsdpa_i8u8(staged_q, keys, values, staged_mask, staged_output,
+                         (uint32_t)lanes, 1u, key_extent, descriptor->d_model,
+                         descriptor->heads, q->quantization.scale,
+                         q->quantization.zero_point,
+                         descriptor->k->quantization.scale,
+                         descriptor->k->quantization.zero_point,
+                         descriptor->v->quantization.scale,
+                         descriptor->v->quantization.zero_point,
+                         output->quantization.scale, output->quantization.zero_point,
+                         descriptor->attention_scale, descriptor->q_dtype,
+                         descriptor->k_dtype, descriptor->v_dtype,
+                         descriptor->output_dtype, 0u, ATTN_MASK_BATCH_KEY))
+        return -1;
+    return ops->row_index_transfer(staged_output, query_bytes, scatter_rows,
+                                   (uint32_t)lanes, output->data,
+                                   output_total_bytes, row_words, output_rows, 1u)
+        ? 0 : -1;
+}
+
 /* QSDPA keeps scores and dequantized values kernel-local. CUDA's optional
  * range entry maps selected logical queries to their absolute sequence rows,
  * so resident K/V prefixes remain usable without an activation transfer. */
@@ -2158,6 +3010,11 @@ static int qsdpa_physical_gpu_forward(Node* node, T* output,
     int query_count = 0;
     if (!node_backend || physical_gpu_partial_execution_declined() ||
         qsdpa_physical_validate(node, output, &descriptor) != 0) return 0;
+    if (g_decode_lanes > 1) {
+        if (qsdpa_physical_gpu_forward_batch(&descriptor, output, ops) != 0) return 0;
+        *node_backend = backend_label;
+        return 1;
+    }
     if (g_active_row >= 0 || g_prefix_rows > 0) {
         if (!ops || !ops->qsdpa_range_i8u8 || descriptor.batch != 1 ||
             descriptor.q->ndim != 3) return 0;
@@ -2279,6 +3136,32 @@ static int qargmax_physical_validate(Node* node, T* output,
 static int qargmax_physical_forward(Node* node, T* output) {
     QArgMaxPhysicalDescriptor descriptor;
     if (qargmax_physical_validate(node, output, &descriptor) != 0) return -1;
+    /*
+     * Row-local like the elementwise operators, but with two widths: a row of
+     * the input is `axis_size` bytes and a row of the output is one int32. The
+     * row *indices* are the same for both -- they are the same lanes at the
+     * same positions -- so they are resolved once, from the input, and applied
+     * at each operand's own width. Resolving them twice is how an argmax ends
+     * up writing lane 0's token id into lane 1's slot.
+     */
+    if (g_decode_lanes > 1) {
+        VxDecodeRowRun runs[VX_DECODE_ROW_SET_MAX_LANES];
+        int count;
+        if (output->ndim != 2 || output->shape[0] != g_decode_lanes ||
+            descriptor.inner != 1) return -1;
+        count = decode_lane_runs(descriptor.input, (long)descriptor.axis_size, runs);
+        if (count < 0) return -1;
+        for (int index = 0; index < count; index++) {
+            const size_t row = (size_t)runs[index].source;
+            if (qargmax_i8u8((const unsigned char*)descriptor.input->data +
+                                 row * descriptor.axis_size *
+                                     descriptor.input->elem_size,
+                             (int32_t*)output->data + row,
+                             (uint32_t)runs[index].rows, descriptor.axis_size,
+                             1, descriptor.input_dtype) != 1) return -1;
+        }
+        return 0;
+    }
     if (g_active_row >= 0 || g_prefix_rows > 0) {
         int row_start;
         int row_count;

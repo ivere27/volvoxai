@@ -8,11 +8,14 @@ import {
 } from '../ops/shapeSystem.js';
 import {
   VOLVOXAI_BACKEND_PROVIDER_VERSION,
+  createBackendProviderBatchContract,
+  createBackendProviderPreparedBatchRoute,
   createBackendDeviceIdentity,
   createBackendProviderCapabilities,
   type BackendDeviceIdentity,
   type BackendLogicalCompileInput,
   type BackendProvider,
+  type BackendProviderBatchContract,
   type BackendProviderCapabilities,
   type BackendProviderCompilationEvidence,
   type BackendProviderCompiledModel,
@@ -27,6 +30,16 @@ import {
   type ProviderDecodeTelemetry,
 } from './ProviderDecodeLifecycle.js';
 import { WebGPUEngine } from './WebGPUEngine.js';
+import { createWebGPUBufferOrOOM } from './WebGPUResources.js';
+import { captureWebGPUErrorScopesSync } from './WebGPUErrorScopes.js';
+import {
+  InvariantResourceStore,
+  type InvariantResourceLease,
+} from './InvariantResources.js';
+import type {
+  WebGPUInvariantDeviceWeight,
+  WebGPUInvariantWeightBorrow,
+} from './WebGPUContracts.js';
 import {
   checkedWebGPUExtentBounds,
   checkedWebGPUPhysicalDomain,
@@ -42,6 +55,67 @@ import {
 const DEFAULT_PLAN_CACHE_ENTRIES = 8;
 const DEFAULT_PLAN_CACHE_METADATA_BYTES = 1024 * 1024;
 const UTF8_ENCODER = new TextEncoder();
+
+interface WebGPUInvariantHostWeight {
+  readonly kind: 'host-weight';
+  readonly name: string;
+  readonly data: RuntimeTypedArray;
+}
+
+interface WebGPUInvariantDeviceWeightResource extends WebGPUInvariantDeviceWeight {
+  readonly kind: 'device-weight';
+}
+
+type WebGPUInvariantResource =
+  | WebGPUInvariantHostWeight
+  | WebGPUInvariantDeviceWeightResource;
+
+const hostWeightKey = (name: string) => `host-weight:${name}`;
+const deviceWeightKey = (name: string) => `device-weight:${name}`;
+
+function webGPUInvariantResourceBytes(resource: WebGPUInvariantResource): number {
+  return resource.kind === 'host-weight'
+    ? resource.data.byteLength
+    : resource.capacityBytes;
+}
+
+function disposeWebGPUInvariantResource(resource: WebGPUInvariantResource): void {
+  if (resource.kind === 'device-weight') resource.buffer.destroy?.();
+}
+
+function writeInvariantWeight(
+  device: GPUDevice,
+  buffer: GPUBuffer,
+  data: RuntimeTypedArray,
+): void {
+  const source = new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
+  const paddedBytes = Math.ceil(source.byteLength / 4) * 4;
+  if (paddedBytes === source.byteLength) {
+    device.queue.writeBuffer(buffer, 0, source);
+  } else {
+    const padded = new Uint8Array(paddedBytes);
+    padded.set(source);
+    device.queue.writeBuffer(buffer, 0, padded);
+  }
+}
+
+/**
+ * Host-side invariant weight storage, shared by every context over one model
+ * revision.
+ *
+ * `docs/adr-dynamic-shape-v1.md` assigns invariant packed weights to the
+ * compiled model rather than to a context; `snapshot.copyWeightData(name)` per
+ * context is the copy that assignment forbids. Sharing is safe for the same
+ * reason it is on CPU: a context already reuses one buffer across every
+ * execution and replan, so a kernel that wrote to a weight would already drift
+ * between two executions.
+ *
+ * This is also what makes the *device* buffers shareable: the exact compiled
+ * provider owner defines each immutable weight buffer once by tensor name,
+ * and contexts can only borrow it through their validated owner lease.
+ * Independent provider compilations of the same logical Model therefore
+ * never alias by accident.
+ */
 
 function createSubmittedBufferRetirement(queue: GPUQueue): (buffer: GPUBuffer) => void {
   const pending = new Set<GPUBuffer>();
@@ -71,6 +145,10 @@ interface WebGPUResourceDomainProof {
   readonly maximumResidentBytes: number;
   readonly resourceLimitBytes: null;
   readonly tensorMaximumBytes: ReadonlyMap<string, number>;
+}
+
+interface WebGPUCompiledDeviceLossState {
+  info: GPUDeviceLostInfo | null;
 }
 
 interface WebGPULimitsLike {
@@ -255,6 +333,69 @@ function checkedWebGPUResourceDomain(
   });
 }
 
+async function createWebGPUInvariantResources(
+  snapshot: Model,
+  device: GPUDevice,
+  resources: WebGPUResourceDomainProof,
+): Promise<InvariantResourceStore<WebGPUInvariantResource>> {
+  const store = new InvariantResourceStore(
+    webGPUInvariantResourceBytes,
+    disposeWebGPUInvariantResource,
+  );
+  try {
+    for (const name of snapshot.weightNames) {
+      const data = snapshot.copyWeightData(name);
+      store.define(hostWeightKey(name), Object.freeze({
+        kind: 'host-weight' as const,
+        name,
+        data,
+      }));
+      if (Object.prototype.hasOwnProperty.call(snapshot.graph.banks, name)) continue;
+      const capacityBytes = resources.tensorMaximumBytes.get(name);
+      if (capacityBytes === undefined) {
+        throw new Error(`Compiled WebGPU invariant weight '${name}' has no capacity proof.`);
+      }
+      const usage = GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC;
+      const captured = captureWebGPUErrorScopesSync(
+        device,
+        { label: `Compiled WebGPU invariant weight '${name}'`, phase: 'compilation' },
+        () => {
+          let buffer: GPUBuffer | null = null;
+          try {
+            buffer = createWebGPUBufferOrOOM(device, {
+              label: `Tensor_${name}`,
+              size: capacityBytes,
+              usage,
+            }, `Compiled WebGPU invariant weight '${name}'`, 'compilation');
+            writeInvariantWeight(device, buffer, data);
+            return buffer;
+          } catch (error) {
+            buffer?.destroy?.();
+            throw error;
+          }
+        },
+      );
+      try {
+        await captured.check;
+      } catch (error) {
+        captured.value.destroy?.();
+        throw error;
+      }
+      store.define(deviceWeightKey(name), Object.freeze({
+        kind: 'device-weight' as const,
+        name,
+        buffer: captured.value,
+        capacityBytes,
+        usage,
+      }));
+    }
+    return store;
+  } catch (error) {
+    store.close();
+    throw error;
+  }
+}
+
 function planMetadataBytes(plan: ResolvedShapePlan): number {
   let bytes = UTF8_ENCODER.encode(plan.signature).byteLength + 128;
   for (const tensor of Object.values(plan.tensors)) {
@@ -267,8 +408,9 @@ class WebGPUProviderExecutionContext implements BackendProviderExecutionContext 
   readonly backendName = 'webgpu';
   readonly #snapshot: Model;
   readonly #tensorMaximumBytes: ReadonlyMap<string, number>;
-  readonly #invariantWeights = new Map<string, RuntimeTypedArray>();
+  readonly #invariantResources: InvariantResourceLease<WebGPUInvariantResource>;
   readonly #deviceLostPromise: Promise<GPUDeviceLostInfo> | null;
+  readonly #deviceLossState: WebGPUCompiledDeviceLossState;
   readonly #decode: ProviderDecodeLifecycle;
   #engine: WebGPUEngine | null;
   #cache = new Map<string, CachedWebGPUVariant>();
@@ -277,41 +419,43 @@ class WebGPUProviderExecutionContext implements BackendProviderExecutionContext 
   #cacheMisses = 0;
   #cacheEvictions = 0;
   #currentSignature: string | null = null;
-  #deviceLost: GPUDeviceLostInfo | null = null;
   #closed = false;
 
   constructor(
     snapshot: Model,
     engine: WebGPUEngine,
     tensorMaximumBytes: ReadonlyMap<string, number>,
-    options?: BackendProviderContextOptions,
+    invariantResources: InvariantResourceLease<WebGPUInvariantResource>,
+    options: BackendProviderContextOptions,
   ) {
     this.#snapshot = snapshot;
+    this.#invariantResources = invariantResources;
     this.#engine = engine;
     this.#tensorMaximumBytes = tensorMaximumBytes;
+    const deviceLossState: WebGPUCompiledDeviceLossState = { info: null };
+    this.#deviceLossState = deviceLossState;
     this.#decode = new ProviderDecodeLifecycle(snapshot, this.backendName, {
       incrementalExecution: true,
       incrementalRows: true,
+      /* Row pipelines compile for the lane count the context declares, and the
+       * rows a step touches come from the shared `DecodeRowSet` resolver rather
+       * than from a stride back-derived from a one-position sample. The
+       * attention shader already carried a batch axis and a `[B,K]` keep mask,
+       * so the 80-byte ABI five backends share did not move. */
+      batchedRows: true,
     }, options?.decode);
-    for (const name of snapshot.weightNames) {
-      this.#invariantWeights.set(name, snapshot.copyWeightData(name));
-    }
     const lost = (engine.device as GPUDevice & { lost?: Promise<GPUDeviceLostInfo> }).lost;
     if (lost && typeof lost.then === 'function') {
       this.#deviceLostPromise = lost;
       void this.#deviceLostPromise.then((info) => {
-        this.#deviceLost = info || ({ reason: 'unknown', message: 'WebGPU device was lost.' } as GPUDeviceLostInfo);
-        this.#cache.clear();
-        this.#cacheBytes = 0;
-        this.#currentSignature = null;
+        deviceLossState.info = info || ({
+          reason: 'unknown', message: 'WebGPU device was lost.',
+        } as GPUDeviceLostInfo);
       }, (error) => {
-        this.#deviceLost = ({
+        deviceLossState.info = ({
           reason: 'unknown',
           message: error instanceof Error ? error.message : String(error),
         } as GPUDeviceLostInfo);
-        this.#cache.clear();
-        this.#cacheBytes = 0;
-        this.#currentSignature = null;
       });
     } else {
       this.#deviceLostPromise = null;
@@ -319,9 +463,13 @@ class WebGPUProviderExecutionContext implements BackendProviderExecutionContext 
   }
 
   #assertDeviceAvailable(): void {
-    if (!this.#deviceLost) return;
+    const deviceLost = this.#deviceLossState.info;
+    if (!deviceLost) return;
+    this.#cache.clear();
+    this.#cacheBytes = 0;
+    this.#currentSignature = null;
     throw new VolvoxAIError('DEVICE_LOST',
-      `WebGPU device was lost (${String(this.#deviceLost.reason)}): ${this.#deviceLost.message}`, {
+      `WebGPU device was lost (${String(deviceLost.reason)}): ${deviceLost.message}`, {
         phase: 'execution', backend: this.backendName,
       });
   }
@@ -548,7 +696,13 @@ class WebGPUProviderExecutionContext implements BackendProviderExecutionContext 
           });
       }
       const bound = createBoundExecutionGraph(this.#snapshot, variant.plan, {
-        invariantWeightStorageFactory: ({ name }) => this.#invariantWeights.get(name),
+        invariantWeightStorageFactory: ({ name }) => {
+          const resource = this.#invariantResources.borrow(hostWeightKey(name));
+          if (resource.kind !== 'host-weight' || resource.name !== name) {
+            throw new Error(`Compiled WebGPU host weight '${name}' changed identity.`);
+          }
+          return resource.data;
+        },
       });
       // Reject request values against the candidate graph before rebind can
       // publish capacities, specializations, or a new current signature.
@@ -594,9 +748,24 @@ class WebGPUProviderExecutionContext implements BackendProviderExecutionContext 
     this.#cacheEvictions += cacheEvictions;
 
     commitExecution();
-    await engine._executePreflighted(rawInputs, executionOptions);
+    try {
+      await engine._executePreflighted(rawInputs, executionOptions);
+    } catch (error) {
+      // Scoped upload/encode/submit errors invalidate the executor's physical
+      // binding after the provider published its matching logical signature.
+      // Mirror that invalidation so the next same-shape request cannot bypass
+      // a complete transactional rebind.
+      try {
+        if (engine.inspectDynamicResources().shapeSignature === null) {
+          this.#currentSignature = null;
+        }
+      } catch {
+        this.#currentSignature = null;
+      }
+      throw error;
+    }
     this.#assertDeviceAvailable();
-    const snapshots = engine.snapshotOutputs();
+    const snapshots = await engine.snapshotOutputs();
     const device = engine.device;
     // snapshotOutputs submits D2D copies. Result.close() and every construction
     // failure path may request release immediately, but physical destruction
@@ -683,25 +852,26 @@ class WebGPUProviderExecutionContext implements BackendProviderExecutionContext 
     this.#engine = null;
     this.#cache.clear();
     this.#cacheBytes = 0;
-    this.#invariantWeights.clear();
+    // The public ExecutionContext releases the compiled invariant lease after
+    // this provider context and all submitted device work have retired.
     if (!engine) return;
     try {
       await engine.device.queue.onSubmittedWorkDone?.();
     } catch (error) {
-      if (!this.#deviceLost && this.#deviceLostPromise) {
+      if (!this.#deviceLossState.info && this.#deviceLostPromise) {
         try {
           const info = await this.#deviceLostPromise;
-          this.#deviceLost = info || ({
+          this.#deviceLossState.info = info || ({
             reason: 'unknown', message: 'WebGPU device was lost.',
           } as GPUDeviceLostInfo);
         } catch (lostError) {
-          this.#deviceLost = ({
+          this.#deviceLossState.info = ({
             reason: 'unknown',
             message: lostError instanceof Error ? lostError.message : String(lostError),
           } as GPUDeviceLostInfo);
         }
       }
-      if (!this.#deviceLost) throw error;
+      if (!this.#deviceLossState.info) throw error;
     } finally {
       engine.dispose();
     }
@@ -710,9 +880,13 @@ class WebGPUProviderExecutionContext implements BackendProviderExecutionContext 
 
 class WebGPUProviderCompiledModel implements BackendProviderCompiledModel {
   readonly backendName = 'webgpu';
+  readonly batchContract: Readonly<BackendProviderBatchContract>;
   readonly compilationEvidence: Readonly<BackendProviderCompilationEvidence>;
+  readonly invariantResources: InvariantResourceStore<WebGPUInvariantResource>;
   readonly #snapshot: Model;
   readonly #resources: WebGPUResourceDomainProof;
+  readonly #resourceDomain: object;
+  readonly #deviceLossState: WebGPUCompiledDeviceLossState;
   #source: WebGPUEngine | null;
   #closed = false;
 
@@ -721,15 +895,51 @@ class WebGPUProviderCompiledModel implements BackendProviderCompiledModel {
     source: WebGPUEngine,
     deviceIdentity: BackendDeviceIdentity | null,
     resources: WebGPUResourceDomainProof,
+    resourceDomain: object,
+    invariantResources: InvariantResourceStore<WebGPUInvariantResource>,
   ) {
+    const batchSemantics = input.batchSemantics;
+    this.batchContract = createBackendProviderBatchContract('single-invocation', {
+      independentBatch: batchSemantics.supported
+        ? 'compiler-proved/v1'
+        : 'unsupported',
+      deviceResident: true,
+      // Runtime's current dense route stacks host snapshots and reads back once
+      // before lane splitting. Do not attest the future zero-copy device route.
+      hostFallback: 'possible',
+    });
     this.#snapshot = input.snapshot;
     this.#source = source;
     this.#resources = resources;
+    this.#resourceDomain = resourceDomain;
+    this.invariantResources = invariantResources;
+    const deviceLossState: WebGPUCompiledDeviceLossState = { info: null };
+    this.#deviceLossState = deviceLossState;
+    const lost = (source.device as GPUDevice & { lost?: Promise<GPUDeviceLostInfo> }).lost;
+    if (lost && typeof lost.then === 'function') {
+      // Do not capture this compiled model in the device-lifetime promise. A
+      // GPUDevice may outlive many closed models; retaining `this` here would
+      // also retain their snapshots and resource proofs until eventual loss.
+      const owner = invariantResources;
+      void lost.then((info) => {
+        deviceLossState.info = info || ({
+          reason: 'unknown', message: 'WebGPU device was lost.',
+        } as GPUDeviceLostInfo);
+        try { owner.invalidate(); } catch { /* Epoch is terminal regardless. */ }
+      }, (error) => {
+        deviceLossState.info = ({
+          reason: 'unknown',
+          message: error instanceof Error ? error.message : String(error),
+        } as GPUDeviceLostInfo);
+        try { owner.invalidate(); } catch { /* Epoch is terminal regardless. */ }
+      });
+    }
     this.compilationEvidence = Object.freeze({
       device: deviceIdentity,
-      allocationBytes: 0,
+      allocationBytes: invariantResources.ownedBytes,
       operatorFallbackUsed: false,
       offendingNode: null,
+      batchSemantics,
       shapeDomain: Object.freeze({
         proofProtocol: 'canonical-symbolic-domain-proof/v1' as const,
         resourceProtocol: 'bounded-resource-maxima/v1' as const,
@@ -744,21 +954,82 @@ class WebGPUProviderCompiledModel implements BackendProviderCompiledModel {
     });
   }
 
-  createContext(options?: BackendProviderContextOptions): BackendProviderExecutionContext {
+  prepareBatchRoute(plan: ResolvedShapePlan) {
     if (this.#closed || !this.#source) {
       throw new VolvoxAIError('HANDLE_DISPOSED', 'Compiled WebGPU model is closed.', {
         phase: 'lifecycle', backend: this.backendName,
       });
     }
+    const deviceLost = this.#deviceLossState.info;
+    if (deviceLost) {
+      throw new VolvoxAIError('DEVICE_LOST',
+        `WebGPU device was lost (${String(deviceLost.reason)}): ${deviceLost.message}`, {
+          phase: 'execution', backend: this.backendName,
+        });
+    }
+    if (plan.graphFingerprint !== this.#snapshot.definitionFingerprint) {
+      throw new VolvoxAIError('INVALID_ARGUMENT',
+        'WebGPU batch route requires a plan from its compiled logical model.', {
+          phase: 'execution', backend: this.backendName,
+        });
+    }
+    return createBackendProviderPreparedBatchRoute(
+      this.#resourceDomain, plan.signature, this.invariantResources.deviceEpoch,
+    );
+  }
+
+  createContext(options: BackendProviderContextOptions): BackendProviderExecutionContext {
+    if (this.#closed || !this.#source) {
+      throw new VolvoxAIError('HANDLE_DISPOSED', 'Compiled WebGPU model is closed.', {
+        phase: 'lifecycle', backend: this.backendName,
+      });
+    }
+    const deviceLost = this.#deviceLossState.info;
+    if (deviceLost) {
+      throw new VolvoxAIError('DEVICE_LOST',
+        `WebGPU device was lost (${String(deviceLost.reason)}): ${deviceLost.message}`, {
+          phase: 'compilation', backend: this.backendName,
+        });
+    }
+    const invariantResources = options?.invariantResources as
+      Partial<InvariantResourceLease<WebGPUInvariantResource>> | undefined;
+    if (!invariantResources ||
+        invariantResources.ownerIdentity !== this.invariantResources.ownerIdentity ||
+        invariantResources.deviceEpoch !== this.invariantResources.deviceEpoch ||
+        typeof invariantResources.borrow !== 'function') {
+      throw new VolvoxAIError('ABI_UNSUPPORTED',
+        'WebGPU context requires the exact compiled-model invariant resource lease.', {
+          phase: 'compilation', backend: this.backendName,
+        });
+    }
+    const exactLease = invariantResources as InvariantResourceLease<WebGPUInvariantResource>;
+    const banks = this.#snapshot.graph.banks;
+    const deviceWeights: WebGPUInvariantWeightBorrow = Object.freeze({
+      isContextPrivateWeight: (name: string): boolean =>
+        Object.prototype.hasOwnProperty.call(banks, name),
+      borrowDeviceWeight: (name: string): WebGPUInvariantDeviceWeight => {
+        if (Object.prototype.hasOwnProperty.call(banks, name)) {
+          throw new Error(`WebGPU weight bank '${name}' is context-private.`);
+        }
+        const resource = exactLease.borrow(deviceWeightKey(name));
+        if (resource.kind !== 'device-weight' || resource.name !== name) {
+          throw new Error(`Compiled WebGPU device weight '${name}' changed identity.`);
+        }
+        return resource;
+      },
+    });
     return new WebGPUProviderExecutionContext(
       this.#snapshot,
-      this.#source.fork(),
+      this.#source.fork(deviceWeights),
       this.#resources.tensorMaximumBytes,
+      exactLease,
       options,
     );
   }
 
   close(): void {
+    if (this.#closed) return;
+    this.invariantResources.close();
     this.#closed = true;
     this.#source = null;
   }
@@ -770,6 +1041,7 @@ export class WebGPUBackendProvider implements BackendProvider {
   readonly backendName = 'webgpu';
   readonly capabilities: Readonly<BackendProviderCapabilities>;
   readonly deviceIdentity: BackendDeviceIdentity | null;
+  readonly #resourceDomain = Object.freeze({});
   #source: WebGPUEngine | null;
   #closed = false;
 
@@ -834,7 +1106,19 @@ export class WebGPUBackendProvider implements BackendProvider {
           phase: 'compilation', backend: this.backendName, cause: error,
         });
     }
-    return new WebGPUProviderCompiledModel(input, this.#source, this.deviceIdentity, resources);
+    const invariantResources = await createWebGPUInvariantResources(
+      input.snapshot,
+      this.#source.device,
+      resources,
+    );
+    return new WebGPUProviderCompiledModel(
+      input,
+      this.#source,
+      this.deviceIdentity,
+      resources,
+      this.#resourceDomain,
+      invariantResources,
+    );
   }
 
   close(): void {

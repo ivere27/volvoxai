@@ -91,7 +91,7 @@ native/volvoxai-full
 The standard JavaScript bundles and volvoxai.wasm must contain no training
 implementation or training exports. The full artifacts contain the Trainer and
 training/PTQ implementations. The WASM-only JavaScript bundle contains no CPU,
-WebNN, WebGPU, WGSL, or Node filesystem implementation.
+WebGPU, WGSL, or Node filesystem implementation.
 
 Validate model packages separately:
 
@@ -216,10 +216,11 @@ CUDA is opt-in:
 cmake -S . -B build/cuda -DCMAKE_C_COMPILER=clang \
   -DVOLVOXAI_ENABLE_CUDA=ON -DVOLVOXAI_CUDA_ARCH=75
 cmake --build build/cuda --target \
-  test_cuda_kernels test_cuda_runtime test_cuda_training \
-  test_training_backward test_dynamic_autograd test_cuda_ptq
+  test_cuda_kernels test_cuda_runtime test_cuda_public_dynamic \
+  test_cuda_state_ownership test_cuda_training test_training_backward \
+  test_dynamic_autograd test_cuda_ptq
 ctest --test-dir build/cuda --output-on-failure \
-  -R '^(test_cuda_(kernels|runtime|training|ptq)|test_training_backward|test_dynamic_autograd|cuda_source_composition)$'
+  -R '^(test_cuda_(kernels|runtime|public_dynamic|state_ownership|training|ptq)|test_training_backward|test_dynamic_autograd|cuda_source_composition)$'
 ~~~
 
 Strict CUDA builds disable FMA contraction. Performance experiments may set
@@ -285,7 +286,6 @@ operator route evidence, and stable result evidence.
 
 ## Interpreting limits
 
-- WebNN behavior depends on browser, OS, flags, drivers, and device routing.
 - Software WebGPU validates semantics but not physical GPU performance.
 - OpenGL and Metal runtime checks require suitable target hardware.
 - Native GPU performance must be measured on the deployment device.

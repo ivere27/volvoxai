@@ -36,12 +36,9 @@ class KernelRegistryGeneratorTests(unittest.TestCase):
         self.assertEqual(len(by_id["cpu-js"].runtime_operators), 92)
         self.assertEqual(len(by_id["wasm"].runtime_operators), 92)
         self.assertEqual(len(by_id["webgpu"].runtime_operators), 87)
-        self.assertEqual(len(by_id["webnn"].runtime_operators), 16)
         self.assertEqual(len(by_id["native-cpu"].runtime_operators), 77)
-        self.assertEqual(len(by_id["nnapi"].runtime_operators), 3)
         self.assertEqual(len(by_id["cpu-js"].qualified_operators), 68)
         self.assertEqual(len(by_id["native-cpu"].qualified_operators), 66)
-        self.assertEqual(len(by_id["webnn"].qualified_operators), 8)
         cuda_qualified = {
             "OPERATOR_KIND_ADD",
             "OPERATOR_KIND_ARG_MAX",
@@ -61,6 +58,7 @@ class KernelRegistryGeneratorTests(unittest.TestCase):
             "OPERATOR_KIND_GROUP_NORM",
             "OPERATOR_KIND_LAYER_NORM",
             "OPERATOR_KIND_LINEAR",
+            "OPERATOR_KIND_MAX_POOL_2D",
             "OPERATOR_KIND_MUL",
             "OPERATOR_KIND_NOT",
             "OPERATOR_KIND_Q_ADD",
@@ -81,6 +79,8 @@ class KernelRegistryGeneratorTests(unittest.TestCase):
             "OPERATOR_KIND_REDUCE_SUM",
             "OPERATOR_KIND_REQUANTIZE_LINEAR",
             "OPERATOR_KIND_RESHAPE",
+            "OPERATOR_KIND_RESIZE_NEAREST_2D",
+            "OPERATOR_KIND_SIGMOID",
             "OPERATOR_KIND_SILU",
             "OPERATOR_KIND_SLICE",
             "OPERATOR_KIND_SOFTMAX",
@@ -93,7 +93,7 @@ class KernelRegistryGeneratorTests(unittest.TestCase):
         self.assertEqual(set(by_id["cuda"].qualified_operators), cuda_qualified)
         self.assertEqual(by_id["native-cpu"].support_mode, "RUNTIME_SUPPORT_MODE_DYNAMIC")
         self.assertEqual(by_id["cuda"].support_mode, "RUNTIME_SUPPORT_MODE_DYNAMIC")
-        newly_qualified = {
+        qualified_on_every_backend = {
             "OPERATOR_KIND_RMS_NORM",
             "OPERATOR_KIND_BATCH_NORM_2D",
             "OPERATOR_KIND_UPSAMPLE_NEAREST_2D",
@@ -101,7 +101,7 @@ class KernelRegistryGeneratorTests(unittest.TestCase):
         }
         for backend_id in ("cpu-js", "wasm", "webgpu", "native-cpu"):
             self.assertTrue(
-                newly_qualified.issubset(by_id[backend_id].qualified_operators),
+                qualified_on_every_backend.issubset(by_id[backend_id].qualified_operators),
                 backend_id,
             )
         unsupported_native = {
@@ -125,10 +125,9 @@ class KernelRegistryGeneratorTests(unittest.TestCase):
             set(by_id["cpu-js"].runtime_operators) - set(by_id["native-cpu"].runtime_operators),
             unsupported_native,
         )
+        # Parity of the qualified sets themselves, including Metal's F32 gap,
+        # is asserted once in test_native_gpu_qualification_is_shared.
         for backend_id in ("vulkan", "opengl", "metal"):
-            self.assertEqual(
-                set(by_id[backend_id].qualified_operators), cuda_qualified
-            )
             self.assertEqual(by_id[backend_id].support_mode, "RUNTIME_SUPPORT_MODE_DYNAMIC")
 
     def test_wasm_has_an_explicit_route_for_every_runtime_operator(self):
@@ -329,7 +328,7 @@ class KernelRegistryGeneratorTests(unittest.TestCase):
                 "SHAPE_CONTRACT_CLASSIFICATION_BOUNDED_VALUE_DEPENDENT",
             },
         )
-        expected_wave_a = {
+        expected_direct = {
             "Identity": "volvox.shape.identity.v1",
             "ReLU": "volvox.shape.activation-preserve.v1",
             "LeakyReLU": "volvox.shape.activation-preserve.v1",
@@ -358,7 +357,7 @@ class KernelRegistryGeneratorTests(unittest.TestCase):
             "Add": "volvox.shape.exact-binary.v1",
             "Mul": "volvox.shape.exact-binary.v1",
         }
-        expected_wave_b = {
+        expected_structural = {
             "Sub": "volvox.shape.broadcast-arithmetic.v1",
             "Div": "volvox.shape.broadcast-arithmetic.v1",
             "ReduceSum": "volvox.shape.reduction.v1",
@@ -438,7 +437,7 @@ class KernelRegistryGeneratorTests(unittest.TestCase):
                 for operator, contract in by_operator.items()
                 if contract.classification == "SHAPE_CONTRACT_CLASSIFICATION_CANONICAL"
             },
-            expected_wave_a | expected_wave_b | expected_spatial |
+            expected_direct | expected_structural | expected_spatial |
             expected_attention | expected_quantized | expected_final,
         )
         self.assertEqual(
@@ -480,7 +479,7 @@ class KernelRegistryGeneratorTests(unittest.TestCase):
     def test_rejects_duplicate_operator_inside_a_named_set(self):
         source = REGISTRY_PROTO.read_text(encoding="utf-8")
         needle = (
-            'name: "runtime-linear"\n'
+            'name: "runtime-native-cpu"\n'
             "    operator: OPERATOR_KIND_MATMUL\n"
         )
         mutated = source.replace(
@@ -494,8 +493,8 @@ class KernelRegistryGeneratorTests(unittest.TestCase):
     def test_rejects_unknown_operator_runtime_registration(self):
         source = REGISTRY_PROTO.read_text(encoding="utf-8")
         mutated = source.replace(
-            'name: "runtime-linear"\n    operator: OPERATOR_KIND_MATMUL',
-            'name: "runtime-linear"\n    operator: OPERATOR_KIND_NOT_DECLARED',
+            'name: "runtime-native-cpu"\n    operator: OPERATOR_KIND_MATMUL',
+            'name: "runtime-native-cpu"\n    operator: OPERATOR_KIND_NOT_DECLARED',
             1,
         )
         with self.assertRaisesRegex(ValueError, "unknown operator"):
@@ -507,10 +506,22 @@ class KernelRegistryGeneratorTests(unittest.TestCase):
             for backend in self.registry.backends
             if backend.exporter_target
         }
-        expected = by_target["backend:cuda"].qualified_operators
+        expected = set(by_target["backend:cuda"].qualified_operators)
         self.assertTrue(expected)
-        for target in ("backend:vulkan", "backend:opengl", "backend:metal"):
-            self.assertEqual(by_target[target].qualified_operators, expected)
+        for target in ("backend:vulkan", "backend:opengl"):
+            self.assertEqual(set(by_target[target].qualified_operators), expected)
+        # metal_engine.m exports metal_graph_maxpool2d_i8u8 and
+        # metal_graph_resize_nearest_i8u8 with no _f32 counterpart, so Metal
+        # alone stays unqualified for those two.  Everything else is shared,
+        # and this asymmetry is the only one allowed.
+        metal_f32_gap = {
+            "OPERATOR_KIND_MAX_POOL_2D",
+            "OPERATOR_KIND_RESIZE_NEAREST_2D",
+        }
+        self.assertEqual(
+            set(by_target["backend:metal"].qualified_operators),
+            expected - metal_f32_gap,
+        )
 
     def test_rejects_missing_shape_contract_route(self):
         source = REGISTRY_PROTO.read_text(encoding="utf-8")

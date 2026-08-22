@@ -16,7 +16,7 @@ RUNTIME = ROOT / "runtime"
 CUDA_FORWARD_ROOT = NATIVE / "src/backends/cuda_kernels.cu"
 CUDA_TRAINING_ROOT = NATIVE / "src/backends/cuda_training_kernels.cu"
 CUDA_HOST_ROOT = NATIVE / "src/backends/cuda_engine.c"
-ENGINE_ROOT = NATIVE / "src/runtime/engine.c"
+ENGINE_ROOT = NATIVE / "src/runtime/engine_state.c"
 ENGINE_RUNTIME_ROOT = NATIVE / "src/runtime/engine_runtime.c"
 CUDA_RUNTIME_ROOT = NATIVE / "src/runtime/engine_runtime_f32_gpu.inc"
 CUDA_TRAIN_STEP_ROOT = NATIVE / "src/training/training_step.inc"
@@ -30,8 +30,17 @@ INCLUDE_ROOTS = (
 )
 DEVICE_ROOTS = (CUDA_FORWARD_ROOT, CUDA_TRAINING_ROOT)
 CARGO_DEVICE_ROOTS = (CUDA_FORWARD_ROOT,)
-CARGO_COMPILED_ROOTS = (CUDA_HOST_ROOT, ENGINE_ROOT, ENGINE_RUNTIME_ROOT)
-CARGO_RECURSIVE_ROOTS = (*CARGO_DEVICE_ROOTS, *CARGO_COMPILED_ROOTS)
+DYNAMIC_BATCHING_CARGO_SOURCES = frozenset(
+    {
+        "src/runtime/paged_kv.c",
+        "src/runtime/paged_binding.c",
+        "src/runtime/batch_scheduler.c",
+        "src/runtime/continuous_batch_scheduler.c",
+        "src/runtime/decode_row_set.c",
+        "src/runtime/batch_decode.c",
+        "src/kernels/paged_attention.c",
+    }
+)
 CMAKE_DEVICE_GLOBS = (
     (CUDA_FORWARD_ROOT, "CUDA_FORWARD_KERNEL_INCLUDES"),
     (CUDA_TRAINING_ROOT, "CUDA_TRAINING_KERNEL_INCLUDES"),
@@ -58,11 +67,11 @@ CMAKE_CUSTOM_COMMAND_KEYWORDS = frozenset(
 )
 
 LOCAL_INC_RE = re.compile(
-    r'^[ \t]*\#[ \t]*include[ \t]*"(?P<path>[^"\r\n]+\.inc)"',
+    r'^[ \t]*\#[ \t]*include[ \t]*"(?P<path>[^"\r\n]+\.(?:inc|c))"',
     re.MULTILINE,
 )
 CARGO_LOCAL_INC_RE = re.compile(
-    r'^[ \t]*\#include "(?P<path>[^"\r\n]+\.inc)"',
+    r'^[ \t]*\#include "(?P<path>[^"\r\n]+\.(?:inc|c))"',
     re.MULTILINE,
 )
 CMAKE_SET_RE = re.compile(
@@ -198,18 +207,18 @@ class LocalIncGraph:
             pure = PurePosixPath(spelling)
             if pure.is_absolute() or "\\" in spelling:
                 raise CompositionError(
-                    f"{_relative(source)}:{line}: .inc include must use a local "
+                    f"{_relative(source)}:{line}: implementation include must use a local "
                     f"POSIX-relative path, got {spelling!r}"
                 )
             dependency = (source.parent / Path(*pure.parts)).resolve()
             if not _inside_repo(dependency):
                 raise CompositionError(
-                    f"{_relative(source)}:{line}: .inc include escapes the repository: "
+                    f"{_relative(source)}:{line}: implementation include escapes the repository: "
                     f"{spelling!r}"
                 )
             if not dependency.is_file():
                 raise CompositionError(
-                    f"{_relative(source)}:{line}: missing local .inc include "
+                    f"{_relative(source)}:{line}: missing local implementation include "
                     f"{spelling!r} (resolved to {_relative(dependency)})"
                 )
             dependencies.append(dependency)
@@ -227,7 +236,7 @@ class LocalIncGraph:
                 start = active.index(source)
                 cycle = active[start:] + [source]
                 raise CompositionError(
-                    "cyclic local .inc include: "
+                    "cyclic local implementation include: "
                     + " -> ".join(_relative(path) for path in cycle)
                 )
             if source in visited:
@@ -653,6 +662,48 @@ def _rust_path_variables(source: str, code: str) -> dict[str, str]:
     return variables
 
 
+def _rust_string_arrays(source: str, code: str) -> dict[str, tuple[str, ...]]:
+    """Read literal-only Rust arrays used for native source composition."""
+    arrays: dict[str, tuple[str, ...]] = {}
+    pattern = re.compile(
+        r"\blet\s+(?P<name>[A-Za-z_][A-Za-z0-9_]*)\s*=\s*\["
+    )
+    for match in pattern.finditer(code):
+        start = match.end() - 1
+        end = _matching_delimiter(code, start, "[", "]")
+        body = source[start + 1 : end]
+        values = tuple(re.findall(r'"([^"\r\n]+)"', body))
+        if values:
+            arrays[match.group("name")] = values
+    return arrays
+
+
+def _runtime_build_native_sources() -> tuple[Path, ...]:
+    source = _strip_c_comments(
+        (RUNTIME / "build.rs").read_text(encoding="utf-8")
+    )
+    code = _mask_c_literals(source)
+    spellings = _rust_string_arrays(source, code).get("srcs", ())
+    if not spellings:
+        raise CompositionError("runtime/build.rs has no literal `srcs` array")
+    roots = tuple((NATIVE / spelling).resolve() for spelling in spellings)
+    missing = [path for path in roots if not path.is_file()]
+    if missing:
+        raise CompositionError(
+            "runtime/build.rs names missing native sources:\n"
+            + _formatted({_relative(path) for path in missing})
+        )
+    return roots
+
+
+def _cmake_source_set(name: str) -> frozenset[str]:
+    for body in _cmake_command_bodies(_cmake_source(), "set"):
+        tokens = _cmake_tokens(body)
+        if tokens and tokens[0] == name:
+            return frozenset(token for token in tokens[1:] if "${" not in token)
+    raise CompositionError(f"native/CMakeLists.txt has no set({name} ...)")
+
+
 def _first_rust_argument(arguments: str) -> str:
     depths = {"(": 0, "[": 0, "{": 0}
     closing = {")": "(", "]": "[", "}": "{"}
@@ -736,7 +787,7 @@ def _resolve_rust_root_expression(
 
 
 def _rust_recursive_inc_roots() -> frozenset[str]:
-    """Return exact source roots handled by a recursive .inc rerun emitter."""
+    """Return exact source roots handled by a recursive fragment rerun emitter."""
     source = _strip_c_comments(
         (RUNTIME / "build.rs").read_text(encoding="utf-8")
     )
@@ -746,6 +797,7 @@ def _rust_recursive_inc_roots() -> frozenset[str]:
         return frozenset()
 
     variables = _rust_path_variables(source, code)
+    arrays = _rust_string_arrays(source, code)
     roots: set[str] = set()
     for tracker in trackers:
         call = re.compile(r"\b" + re.escape(tracker) + r"\s*\(")
@@ -756,6 +808,42 @@ def _rust_recursive_inc_roots() -> frozenset[str]:
             normalized = _resolve_rust_root_expression(expression, variables)
             if normalized:
                 roots.add(normalized)
+
+    # A source-array loop is the maintainable form of the same contract: every
+    # future member is recursively tracked without another hand-maintained list.
+    for match in re.finditer(
+        r"\bfor\s+(?P<item>[A-Za-z_][A-Za-z0-9_]*)\s+in\s+"
+        r"(?P<array>[A-Za-z_][A-Za-z0-9_]*)\s*\{",
+        code,
+    ):
+        spellings = arrays.get(match.group("array"))
+        if not spellings:
+            continue
+        start = match.end() - 1
+        end = _matching_delimiter(code, start, "{", "}")
+        body = code[start + 1 : end]
+        item = re.escape(match.group("item"))
+        for tracker in trackers:
+            tracked_join = re.search(
+                r"\b"
+                + re.escape(tracker)
+                + r"\s*\(\s*&?\s*(?P<base>[A-Za-z_][A-Za-z0-9_]*)"
+                r"\s*\.\s*join\s*\(\s*"
+                + item
+                + r"\s*\)",
+                body,
+            )
+            if not tracked_join:
+                continue
+            base = variables.get(tracked_join.group("base"))
+            if not base:
+                continue
+            for spelling in spellings:
+                normalized = _normalize_runtime_path(
+                    (PurePosixPath(base) / spelling).as_posix()
+                )
+                if normalized:
+                    roots.add(normalized)
     return frozenset(roots)
 
 
@@ -894,19 +982,21 @@ class CudaSourceCompositionTests(unittest.TestCase):
                 )
 
     def test_runtime_build_recursively_tracks_every_compiled_root(self) -> None:
-        expected = {_relative(root) for root in CARGO_RECURSIVE_ROOTS}
+        compiled_roots = _runtime_build_native_sources()
+        recursive_roots = (*CARGO_DEVICE_ROOTS, *compiled_roots)
+        expected = {_relative(root) for root in recursive_roots}
         missing = expected - set(_rust_recursive_inc_roots())
         self.assertEqual(
             missing,
             set(),
-            "runtime/build.rs must call a recursive .inc rerun tracker for every "
+            "runtime/build.rs must call a recursive fragment rerun tracker for every "
             "CUDA/Cargo composition root:\n"
             + _formatted(missing),
         )
         incompatible: set[str] = set()
         sources = {
             source.resolve()
-            for root in CARGO_RECURSIVE_ROOTS
+            for root in recursive_roots
             for source in (root, *self._dependencies(root))
         }
         for source in sources:
@@ -921,8 +1011,8 @@ class CudaSourceCompositionTests(unittest.TestCase):
         self.assertEqual(
             incompatible,
             set(),
-            "reachable .inc directives must match runtime/build.rs traversal "
-            "syntax (`#include \"relative.inc\"`):\n"
+            "reachable implementation directives must match runtime/build.rs "
+            "traversal syntax (`#include \"relative.inc\"`):\n"
             + _formatted(incompatible),
         )
 
@@ -946,15 +1036,16 @@ class CudaSourceCompositionTests(unittest.TestCase):
         )
 
     def test_runtime_build_tracks_reachable_fragments(self) -> None:
+        compiled_roots = _runtime_build_native_sources()
         fragments = {
             dependency
-            for root in CARGO_COMPILED_ROOTS
+            for root in compiled_roots
             for dependency in self._dependencies(root)
         }
         expected = {_relative(path) for path in fragments}
         tracked: set[str] = set()
         recursively_tracked = set(_rust_recursive_inc_roots())
-        for root in CARGO_COMPILED_ROOTS:
+        for root in compiled_roots:
             if _relative(root) not in recursively_tracked:
                 continue
             tracked.update(_relative(path) for path in self._dependencies(root))
@@ -965,6 +1056,25 @@ class CudaSourceCompositionTests(unittest.TestCase):
             "runtime/build.rs is missing Cargo rerun tracking for reachable "
             "implementation fragments:\n"
             + _formatted(missing),
+        )
+
+    def test_dynamic_batching_sources_match_cmake_and_cargo(self) -> None:
+        cargo = {
+            path.relative_to(NATIVE).as_posix()
+            for path in _runtime_build_native_sources()
+        }
+        cmake = _cmake_source_set("RUNTIME_SRCS") | _cmake_source_set("KERNEL_SRCS")
+        self.assertEqual(
+            DYNAMIC_BATCHING_CARGO_SOURCES - cargo,
+            set(),
+            "runtime/build.rs is missing native dynamic-batching sources:\n"
+            + _formatted(DYNAMIC_BATCHING_CARGO_SOURCES - cargo),
+        )
+        self.assertEqual(
+            DYNAMIC_BATCHING_CARGO_SOURCES - cmake,
+            set(),
+            "native/CMakeLists.txt is missing native dynamic-batching sources:\n"
+            + _formatted(DYNAMIC_BATCHING_CARGO_SOURCES - cmake),
         )
 
 

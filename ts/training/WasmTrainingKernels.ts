@@ -6,7 +6,7 @@ import type {
   StatefulTrainingGraph,
   TrainingTensorUpdateOptions,
 } from './TrainingGraph.js';
-import { geluApproximation } from '../ops/gELU.js';
+import { geluApproximation } from '../ops/gelu.js';
 import { dropoutEffectiveSeed, dropoutProbability, dropoutThreshold } from '../ops/dropout.js';
 import {
   attentionDropoutEffectiveSeed,

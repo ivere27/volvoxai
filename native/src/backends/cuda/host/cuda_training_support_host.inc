@@ -239,6 +239,6 @@ int cuda_training_begin(void) {
         cuda_profile_begin_scope(0);
     /* A training pass changes the launch topology and may later mutate model
      * weights. Never retain an inference replay plan across this boundary. */
-    cuda_replay_clear_plan_current(1);
+    cuda_replay_clear_all_plans_current(1);
     return 0;
 }

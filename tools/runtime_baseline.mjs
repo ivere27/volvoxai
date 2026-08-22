@@ -43,9 +43,9 @@ function rejectUnknownArguments() {
 }
 
 function backendArgument() {
-  const backend = stringArgument('backend', 'cpu');
-  if (!['cpu', 'wasm', 'native-cpu'].includes(backend)) {
-    throw new Error("--backend must be 'cpu', 'wasm', or 'native-cpu'");
+  const backend = stringArgument('backend', 'cpu-js');
+  if (!['cpu-js', 'wasm', 'native-cpu'].includes(backend)) {
+    throw new Error("--backend must be 'cpu-js', 'wasm', or 'native-cpu'");
   }
   return backend;
 }
@@ -645,7 +645,7 @@ function sampledMemoryHighWater(snapshots) {
 }
 
 async function javascriptRuntimeBaseline({ backend, samples, warmup, width, wasmUrl }) {
-  const reference = backend === 'cpu'
+  const reference = backend === 'cpu-js'
     ? await latencyReference(
         stringArgument('reference', DEFAULT_REFERENCE),
         { samples, warmup, width },
@@ -710,7 +710,7 @@ async function javascriptRuntimeBaseline({ backend, samples, warmup, width, wasm
     const allOwnersClosedBytes = memoryDelta(allOwnersClosed, retainedBaseline).arrayBufferBytes;
     const stableSnapshotBytes =
       memoryDelta(stableResultAllocated, beforeStableResult).arrayBufferBytes;
-    const memoryGatePassed = backend === 'cpu' ? oneIdleBytes >= 0 &&
+    const memoryGatePassed = backend === 'cpu-js' ? oneIdleBytes >= 0 &&
       twoIdleBytes <= Math.max(oneIdleBytes, 0) * 2.2 &&
       stableSnapshotBytes <= alignedOutputBytes * 1.1 &&
       idleContextsClosedBytes <= 0 &&
@@ -837,13 +837,13 @@ async function javascriptRuntimeBaseline({ backend, samples, warmup, width, wasm
         acceptedWorkDrained,
         contextCloseIsIdempotent,
         resultCloseIsIdempotent,
-        allOwnersClosed: backend === 'cpu' ? allOwnersClosedBytes <= 0 : null,
+        allOwnersClosed: backend === 'cpu-js' ? allOwnersClosedBytes <= 0 : null,
       },
       runtime: {
         compilation: compilationReport,
         execution: executionReport,
       },
-      budgets: backend === 'cpu' ? {
+      budgets: backend === 'cpu-js' ? {
         medianOneContextLatencyRegressionPercent: reference.maximumRegressionPercent,
         twoIdleContextsToOneMutableStorageRatio: 2.2,
         idleContextAllocation: 'lazy',
@@ -852,13 +852,13 @@ async function javascriptRuntimeBaseline({ backend, samples, warmup, width, wasm
       } : null,
     };
     process.stdout.write(`${JSON.stringify(evidence, null, 2)}\n`);
-    if (backend === 'cpu' && !latencyGatePassed) {
+    if (backend === 'cpu-js' && !latencyGatePassed) {
       throw new Error(
         `median one-context latency ${medianMs.toFixed(6)} ms exceeds the committed ` +
         `${maximumMedianMs.toFixed(6)} ms budget`,
       );
     }
-    if (backend === 'cpu' && !memoryGatePassed) {
+    if (backend === 'cpu-js' && !memoryGatePassed) {
       throw new Error(
         'runtime ownership memory budget failed: ' +
         `oneIdle=${oneIdleBytes}, twoIdle=${twoIdleBytes}, ` +

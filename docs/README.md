@@ -29,10 +29,11 @@ Start with the root [README](../README.md) for the product overview and
 
 | Doc | What it covers |
 | --- | --- |
-| [browser-runtime.md](browser-runtime.md) | Browser and Node runtime tiers: WebNN, WebGPU, WASM SIMD, and CPU. |
+| [browser-runtime.md](browser-runtime.md) | Browser and Node runtime tiers: WebGPU, WASM SIMD, and CPU. |
 | [native-runtime.md](native-runtime.md) | Native C engine, fixed raw-tensor CLI, opt-in task example, GPU/NPU backends, Android cross-build notes. |
 | [cuda.md](cuda.md) | Canonical native CUDA architecture, operator coverage, numeric modes, model validation, RTX 3090 benchmarks, and remaining work. |
 | [backend-sdk.md](backend-sdk.md) | Versioned native and browser contracts for custom GPUs, NPUs, and other devices. |
+| [scheduling-and-dynamic-batching-design.md](scheduling-and-dynamic-batching-design.md) | Runtime ownership, proto-defined execution modes, dynamic batching, stateful contributions, admission, fairness, lifecycle, and performance gates. |
 
 **Model format & data**
 
@@ -63,14 +64,16 @@ Start with the root [README](../README.md) for the product overview and
 
 | Doc | What it covers |
 | --- | --- |
+| [profiling.md](profiling.md) | Instrumentation surfaces: WASM compile phase breakdown, opt-in memory evidence, kernel throughput against ONNX Runtime, what each measurement costs, and how to keep a number honest. |
 | [microkernel_optimization_guide.md](microkernel_optimization_guide.md) | CPU Conv/GEMM microkernel notes. |
 | [operator_fusion_patterns.md](operator_fusion_patterns.md) | A design catalogue of valuable fusion candidates; it is not an implementation or coverage list. |
 | [xnnpack_optimization_guide.md](xnnpack_optimization_guide.md) | XNNPACK-style packing and indirection reference notes. |
 | [efficientdet_tflite_vs_volvoxai.md](efficientdet_tflite_vs_volvoxai.md) | EfficientDet Lite0 CPU/GPU benchmark methodology and results. |
+| [receipt-digit-reader-benchmark.md](receipt-digit-reader-benchmark.md) | Receipt digit reader latency per backend against ONNX Runtime, its optimization backlog, and the host-quiescence requirement. Current numbers are provisional. |
 
 **Project**
 
 | Doc | What it covers |
 | --- | --- |
 | [testing.md](testing.md) | WebGPU op tests, native smoke tests, parity checks, and known validation limits. |
-| [roadmap.md](roadmap.md) | Current gaps and planned work. |
+| [TODO.md](../TODO.md) | Authoritative unfinished work, ordered by kind and priority. |

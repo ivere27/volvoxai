@@ -200,7 +200,6 @@ static int parse_run_option(int argc, char** argv, int* index,
     else if (!strcmp(argument, "--vulkan")) backend = "vulkan";
     else if (!strcmp(argument, "--opengl")) backend = "opengl";
     else if (!strcmp(argument, "--metal")) backend = "metal";
-    else if (!strcmp(argument, "--nnapi")) backend = "nnapi";
     else if (!strcmp(argument, "--cuda")) backend = "cuda";
     if (backend) return select_backend(options, backend) == 0 ? 1 : -1;
     if (!strcmp(argument, "--debug")) {
@@ -1128,7 +1127,7 @@ static void print_run_help(const char* argv0) {
     printf("  --row <index>                Write one row from each selected F32 output.\n");
     printf("  --report-json <file>         Write lifecycle success or typed runtime/API failure evidence when available.\n");
     printf("  --threads <n>                Set the CPU worker count.\n");
-    printf("  --cpu | --vulkan | --opengl | --metal | --nnapi | --cuda\n");
+    printf("  --cpu | --vulkan | --opengl | --metal | --cuda\n");
     printf("  --debug\n");
 }
 

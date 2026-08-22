@@ -4,9 +4,6 @@
 #include "incremental_runtime.h"
 #include "inference_kernels.h"
 #include "runtime_state.h"
-#if defined(VOLVOXAI_INCREMENTAL_FAKE_NNAPI_TEST)
-#include "nnapi_engine.h"
-#endif
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -22,48 +19,6 @@
     } \
 } while (0)
 
-#if defined(VOLVOXAI_INCREMENTAL_FAKE_NNAPI_TEST)
-static int g_fake_nnapi_init_count;
-static int g_fake_nnapi_cleanup_count;
-static int g_fake_nnapi_run_count;
-static int g_fake_nnapi_rows;
-static int g_fake_nnapi_d_in;
-static int g_fake_nnapi_d_out;
-
-void volvoxai_shader_store_shutdown(void) {}
-
-int nnapi_init(void) {
-    g_fake_nnapi_init_count++;
-    return 0;
-}
-
-void nnapi_cleanup(void) {
-    g_fake_nnapi_cleanup_count++;
-}
-
-void nnapi_free_weight_cache(void) {}
-
-int nnapi_matmul(const float* input, const float* weight, const float* bias,
-                 float* output, int rows, int d_in, int d_out) {
-    (void)input;
-    (void)weight;
-    (void)bias;
-    g_fake_nnapi_run_count++;
-    g_fake_nnapi_rows = rows;
-    g_fake_nnapi_d_in = d_in;
-    g_fake_nnapi_d_out = d_out;
-    for (int index = 0; index < rows * d_out; index++) output[index] = 37.0f;
-    return 1;
-}
-
-int nnapi_cache_telemetry(NnapiCacheTelemetry* telemetry) {
-    if (!telemetry) return -1;
-    memset(telemetry, 0, sizeof(*telemetry));
-    telemetry->entry_capacity = NNAPI_MODEL_CACHE_CAPACITY;
-    telemetry->executions = (uint64_t)g_fake_nnapi_run_count;
-    return 0;
-}
-#endif
 
 static int write_text(const char* path, const char* text) {
     FILE* file = fopen(path, "wb");
@@ -125,80 +80,6 @@ static void* create_decode_session_thread(void* opaque) {
     return NULL;
 }
 
-#if defined(VOLVOXAI_INCREMENTAL_FAKE_NNAPI_TEST)
-static int test_decode_session_preserves_nnapi_seed_dispatch(void) {
-    enum { ROWS = 4, K = 512, N = 512 };
-    const char* graph_path = "/tmp/volvox-incremental-nnapi-graph.json";
-    const char* weights_path = "/tmp/volvox-incremental-nnapi-weights.safetensors";
-    const char* graph =
-        "{\"format\":\"volvox-graph/v1\",\"inputs\":{\"x\":{\"shape\":[4,512],\"dtype\":\"float32\"}},"
-        "\"nodes\":[{\"opType\":\"Linear\","
-        "\"inputs\":{\"input\":\"x\",\"weight\":\"w\"},"
-        "\"outputs\":{\"out\":\"y\"},\"outputs_shape\":{\"out\":[4,512]},"
-        "\"params\":{\"weight_layout\":\"din_dout\"}}],"
-        "\"outputs\":[\"y\"]}";
-    const int weight_shape[2] = {N, K};
-    float* input = (float*)calloc((size_t)ROWS * K, sizeof(*input));
-    float* weight = (float*)calloc((size_t)N * K, sizeof(*weight));
-    float* output = (float*)calloc((size_t)ROWS * N, sizeof(*output));
-    VolvoxAIEngineOptions engine_options = {
-        .backend = VOLVOXAI_BACKEND_NNAPI,
-        .debug = 0,
-        .cpu_threads = 2,
-    };
-    VolvoxAIDecodeSessionOptions decode_options = VOLVOXAI_DECODE_SESSION_OPTIONS_INIT;
-    VolvoxAIDecodeSession* session;
-    SafetensorsFile file;
-
-    CHECK(input && weight && output);
-    CHECK(write_text(graph_path, graph) == 0);
-    CHECK(safetensors_init_empty(&file, SAFETENSORS_OPEN_READ_WRITE) == 0);
-    CHECK(safetensors_add_tensor(&file, "w", SAFETENSORS_DTYPE_F32,
-                                 weight_shape, 2, weight,
-                                 (size_t)N * K * sizeof(*weight)) == 0);
-    CHECK(safetensors_save(weights_path, &file) == 0);
-    safetensors_free(&file);
-
-    g_fake_nnapi_init_count = 0;
-    g_fake_nnapi_cleanup_count = 0;
-    g_fake_nnapi_run_count = 0;
-    CHECK(volvoxai_engine_configure(&engine_options) == 0);
-    CHECK(g_fake_nnapi_init_count == 1);
-    CHECK(!strcmp(volvoxai_engine_backend_name(), "NNAPI"));
-    CHECK(volvoxai_engine_init(graph_path, weights_path) == 0);
-    CHECK(volvoxai_engine_set_input_raw("x", VOLVOXAI_DTYPE_F32, input,
-                                        (size_t)ROWS * K * sizeof(*input)) == 0);
-
-    decode_options.row_mode = VOLVOXAI_DECODE_ROW_DISABLED;
-    session = volvoxai_engine_decode_session_create(&decode_options);
-    CHECK(session != NULL);
-    CHECK(volvoxai_engine_decode_session_seed(session) == 0);
-    CHECK(g_fake_nnapi_run_count == 1);
-    CHECK(g_fake_nnapi_rows == ROWS && g_fake_nnapi_d_in == K &&
-          g_fake_nnapi_d_out == N);
-    CHECK(volvoxai_engine_copy_tensor_f32("y", output, ROWS * N) == 0);
-    for (int index = 0; index < ROWS * N; index++) CHECK(output[index] == 37.0f);
-    {
-        char telemetry[192] = {0};
-        CHECK(vx_runtime_backend_append_dynamic_telemetry(
-                  telemetry, sizeof(telemetry)) == 0);
-        CHECK(strstr(telemetry, "nnapi_cache=0/0") != NULL);
-        CHECK(strstr(telemetry, "nnapi_build_ms=0.000") != NULL);
-    }
-
-    volvoxai_engine_decode_session_destroy(session);
-    volvoxai_engine_shutdown();
-    engine_options.backend = VOLVOXAI_BACKEND_CPU;
-    CHECK(volvoxai_engine_configure(&engine_options) == 0);
-    CHECK(g_fake_nnapi_cleanup_count == 1);
-    free(output);
-    free(weight);
-    free(input);
-    remove(weights_path);
-    remove(graph_path);
-    return 0;
-}
-#endif
 
 static int test_incremental_dependency_cache_and_arena_lifetime(void) {
     const char* graph_path = "/tmp/volvox-incremental-cache-graph.json";
@@ -472,15 +353,15 @@ static int test_incremental_cross_sdpa_rows(void) {
                     cross_reference[4 + column]) < 1.0e-6f);
         CHECK(fabsf(causal_output->data[4 + column] -
                     causal_reference[4 + column]) < 1.0e-6f);
+        CHECK(fabsf(query_output->data[4 + column] -
+                    query_reference[4 + column]) < 1.0e-6f);
         CHECK(cross_output->data[column] == 101.0f + (float)column);
         CHECK(cross_output->data[8 + column] == 109.0f + (float)column);
         CHECK(causal_output->data[column] == -101.0f - (float)column);
         CHECK(causal_output->data[8 + column] == -109.0f - (float)column);
+        CHECK(query_output->data[column] == 303.0f + (float)column);
+        CHECK(query_output->data[8 + column] == 311.0f + (float)column);
     }
-    /* Query-dependent masks deliberately retain the complete reference path;
-     * every row must therefore be refreshed rather than retaining poison. */
-    for (int index = 0; index < 12; index++)
-        CHECK(fabsf(query_output->data[index] - query_reference[index]) < 1.0e-6f);
 
     volvoxai_engine_shutdown();
     CHECK(unsetenv("VOLVOX_ARENA") == 0);
@@ -2073,6 +1954,17 @@ static int test_incremental_static_qdq_attention_chain(void) {
 }
 
 #if VOLVOXAI_ENABLE_OPENGL
+/*
+ * The one-way GPU-seed then CPU-row handoff, on OpenGL.
+ *
+ * OpenGL runs decode rows on the device now (`test_device_row_decode`), and a
+ * device-row backend never takes this branch: it does not relinquish its prefix,
+ * so `VOLVOXAI_DISABLE_GPU_CPU_ROW` no longer decides whether it can do a row at
+ * all. The handoff itself is still live -- it is what any backend without window
+ * resolution uses, and what every backend falls back to when a width's row
+ * stride misses the device's binding alignment -- so this turns device rows off
+ * for the duration rather than dropping the case.
+ */
 static int test_opengl_seed_cpu_row_handoff(void) {
     const char* graph_path = "/tmp/volvox-incremental-opengl-hybrid-graph.json";
     const char* weights_path = "/tmp/volvox-incremental-opengl-hybrid-weights.safetensors";
@@ -2200,6 +2092,7 @@ static int test_opengl_seed_cpu_row_handoff(void) {
         remove(graph_path);
         return 0;
     }
+    CHECK(setenv("VOLVOXAI_DISABLE_GPU_DEVICE_ROW", "1", 1) == 0);
     ids[1] = 0;
     ids[2] = 0;
     keep[1] = 0;
@@ -2294,6 +2187,7 @@ static int test_opengl_seed_cpu_row_handoff(void) {
 
     volvoxai_engine_decode_session_destroy(session);
     volvoxai_engine_shutdown();
+    CHECK(unsetenv("VOLVOXAI_DISABLE_GPU_DEVICE_ROW") == 0);
     remove(weights_path);
     remove(graph_path);
     return 0;
@@ -2320,9 +2214,6 @@ int main(void) {
     CHECK(test_incremental_static_qdq_token_rows() == 0);
     CHECK(test_incremental_sequence_major_static_qdq_rows() == 0);
     CHECK(test_incremental_static_qdq_attention_chain() == 0);
-#if defined(VOLVOXAI_INCREMENTAL_FAKE_NNAPI_TEST)
-    CHECK(test_decode_session_preserves_nnapi_seed_dispatch() == 0);
-#endif
 #if VOLVOXAI_ENABLE_OPENGL
     CHECK(test_opengl_seed_cpu_row_handoff() == 0);
 #endif

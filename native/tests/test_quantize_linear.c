@@ -1,4 +1,5 @@
 #include "../src/kernels/inference_kernels.h"
+#include "../src/kernels/quant_cpu_isa.h"
 
 #include <math.h>
 #include <stdint.h>
@@ -100,10 +101,87 @@ static int test_invalid_descriptors(void) {
     return 0;
 }
 
+static int test_dequantize_byte_domains(void) {
+    enum { COUNT = 1027 };
+    int8_t input_i8[COUNT];
+    uint8_t input_u8[COUNT];
+    float actual[COUNT];
+    float expected[COUNT];
+    const float scales[] = {
+        1.0f, 0.05f, -0.125f, 0.0f, -0.0f,
+        0x1p-149f, 0x1.fffffep+127f,
+    };
+    /* These include both ends of the common I8/U8 SIMD descriptor domain:
+     * every centered byte remains exactly representable as F32. */
+    const int32_t zero_points[] = {0, -16776961, 16777088};
+
+    for (int index = 0; index < COUNT; index++) {
+        input_i8[index] = (int8_t)((index & 255) - 128);
+        input_u8[index] = (uint8_t)(index & 255);
+    }
+    for (uint32_t dtype_index = 0; dtype_index < 2u; dtype_index++) {
+        const void* input = dtype_index == 0u
+            ? (const void*)input_i8 : (const void*)input_u8;
+        const uint32_t dtype = dtype_index == 0u ? VX_DTYPE_I8 : VX_DTYPE_U8;
+        for (uint32_t scale_index = 0;
+             scale_index < sizeof(scales) / sizeof(scales[0]); scale_index++) {
+            for (uint32_t zero_index = 0;
+                 zero_index < sizeof(zero_points) / sizeof(zero_points[0]);
+                 zero_index++) {
+                const float scale = scales[scale_index];
+                const int32_t zero = zero_points[zero_index];
+                CHECK(dequantize_linear_typed(
+                    input, (int)dtype, &scale, &zero, VX_DTYPE_I32,
+                    actual, COUNT) == 1);
+                for (int index = 0; index < COUNT; index++) {
+                    const int value = dtype == VX_DTYPE_I8
+                        ? (int)input_i8[index] : (int)input_u8[index];
+                    expected[index] = (float)(((double)value - (double)zero) *
+                                              (double)scale);
+                }
+                CHECK(memcmp(actual, expected, sizeof(actual)) == 0);
+            }
+        }
+    }
+    return 0;
+}
+
+#if defined(__aarch64__)
+static int test_neon_prefix_route_and_overlap(void) {
+    float input[32] = {0};
+    float dequantized[32];
+    uint8_t quantized[32];
+    union {
+        float alignment;
+        uint8_t bytes[160];
+    } overlap = {0};
+
+    CHECK(vx_quantize_linear_typed_native_prefix(
+        input, 0.25f, 128, quantized, VX_DTYPE_U8, 32u, 0, 255) == 32u);
+    CHECK(vx_dequantize_linear_typed_native_prefix(
+        quantized, VX_DTYPE_U8, 0.25f, 128, dequantized, 32u) == 32u);
+
+    /* A vector block reads farther ahead than the canonical scalar loop.
+     * Overlapping calls therefore decline the prefix and retain that loop's
+     * exact forward traversal rather than inventing a new alias contract. */
+    CHECK(vx_quantize_linear_typed_native_prefix(
+        (const float*)overlap.bytes, 0.25f, 128, overlap.bytes + 4u,
+        VX_DTYPE_U8, 32u, 0, 255) == 0u);
+    CHECK(vx_dequantize_linear_typed_native_prefix(
+        overlap.bytes, VX_DTYPE_U8, 0.25f, 128,
+        (float*)(void*)(overlap.bytes + 4u), 32u) == 0u);
+    return 0;
+}
+#endif
+
 int main(void) {
     CHECK(test_domain(VX_DTYPE_I8, -128, 127, -101) == 0);
     CHECK(test_domain(VX_DTYPE_U8, 0, 255, 231) == 0);
     CHECK(test_invalid_descriptors() == 0);
+    CHECK(test_dequantize_byte_domains() == 0);
+#if defined(__aarch64__)
+    CHECK(test_neon_prefix_route_and_overlap() == 0);
+#endif
     puts("quantize linear tests passed");
     return 0;
 }

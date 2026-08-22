@@ -27,7 +27,7 @@ import {
   normalizeCrossEntropyLosses,
 } from './TrainingLosses.js';
 import { dropoutContext, dropoutEffectiveSeed, dropoutProbability, dropoutThreshold } from '../ops/dropout.js';
-import { geluApproximation } from '../ops/gELU.js';
+import { geluApproximation } from '../ops/gelu.js';
 import {
   attentionDropoutEffectiveSeed,
   attentionDropoutProbability,
@@ -1790,19 +1790,36 @@ export class WebGPUAutograd {
         }
         // A partially resident bank routes by global slot id, so the shader
         // needs both directions of the staged-row mapping.
-        const residentSlots = node.residentSlots || null;
-        if (residentSlots && residentSlots.length !== experts) {
+        const residentSlots = node.residentSlots;
+        const residentSlotDomain = node.residentSlotDomain;
+        if (residentSlots === undefined && residentSlotDomain !== undefined) {
+          throw new Error(
+            `MoELinear node ${node.id} has a resident slot domain without a slot table.`);
+        }
+        if (residentSlots !== undefined && residentSlots.length !== experts) {
           throw new Error(
             `MoELinear node ${node.id} lists ${residentSlots.length} resident slots ` +
             `but stages ${experts} experts.`);
         }
-        if (topK > (residentSlots ? residentSlots[residentSlots.length - 1] + 1 : experts)) {
+        if (residentSlots !== undefined &&
+            (!Number.isSafeInteger(residentSlotDomain) || residentSlotDomain <= 0 ||
+             residentSlotDomain > MAX_U32 ||
+             !residentSlots.every((slot, row) =>
+               Number.isSafeInteger(slot) && slot >= 0 && slot < residentSlotDomain &&
+               (row === 0 || slot > residentSlots[row - 1])))) {
+          throw new Error(
+            `MoELinear node ${node.id} has invalid resident slot-domain metadata.`);
+        }
+        // top-k is bounded by the staged expert rows, not by their largest
+        // global slot id. This is the same contract used by forward and the
+        // native training planner.
+        if (topK > experts) {
           throw new Error(`MoELinear node ${node.id} has incompatible expert or routing shapes.`);
         }
-        const slotDomain = residentSlots ? residentSlots[residentSlots.length - 1] + 1 : 0;
+        const slotDomain = residentSlots === undefined ? 0 : residentSlotDomain;
         const slotRowsTable = new Uint32Array(Math.max(1, slotDomain)).fill(0xffffffff);
         const rowSlotsTable = new Uint32Array(Math.max(1, experts));
-        if (residentSlots) {
+        if (residentSlots !== undefined) {
           for (let row = 0; row < residentSlots.length; row++) {
             slotRowsTable[residentSlots[row]] = row;
             rowSlotsTable[row] = residentSlots[row];
@@ -1810,26 +1827,26 @@ export class WebGPUAutograd {
         }
         const slotRows = this._parameterBuffer(slotRowsTable, true);
         const rowSlots = this._parameterBuffer(rowSlotsTable, true);
-        const banks: Array<[number, GPUBuffer]> = [[11, slotRows], [12, rowSlots]];
+        const banks: Array<[number, GPUBuffer]> = [[10, slotRows], [11, rowSlots]];
         const params = this._parameterBuffer(
           new Uint32Array([rows, dIn, dOut, experts, topK, expertBias ? 1 : 0, slotDomain, 0]));
         await add('moeLinearBackward', 'input_main', [[1, this._buffer(expertWeight)], [3, this._buffer(indices)],
           [4, this._buffer(gates)], [5, go], [6, this._floatGradient(input, node, 'MoELinear input')],
-          [10, params], ...banks],
+          ...banks, [12, params]],
           [Math.ceil(rows * dIn / 64), 1, 1], [params]);
         await add('moeLinearBackward', 'weight_main', [[0, this._buffer(input)], [3, this._buffer(indices)],
           [4, this._buffer(gates)], [5, go],
           [7, this._floatGradient(expertWeight, node, 'MoELinear expert weight')],
-          [10, params], ...banks],
+          ...banks, [12, params]],
           [Math.ceil(product(expertWeight.shape) / 64), 1, 1], [params]);
         if (expertBias) await add('moeLinearBackward', 'bias_main', [[3, this._buffer(indices)], [4, this._buffer(gates)],
           [5, go], [8, this._floatGradient(expertBias, node, 'MoELinear expert bias')],
-          [10, params], ...banks],
+          ...banks, [12, params]],
           [Math.ceil(product(expertBias.shape) / 64), 1, 1], [params]);
         await add('moeLinearBackward', 'route_main', [[0, this._buffer(input)], [1, this._buffer(expertWeight)],
           [2, expertBias ? this._buffer(expertBias) : this._dummy(experts * dOut * 4)], [3, this._buffer(indices)],
           [5, go], [9, this._floatGradient(gates, node, 'MoELinear route weights')],
-          [10, params], ...banks],
+          ...banks, [12, params]],
         [Math.ceil(rows * topK / 64), 1, 1], [params]);
       } else if (node.opType === 'MoERouter') {
         const input = nodeInput(node);

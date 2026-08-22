@@ -1,7 +1,7 @@
 {
   "schema": "volvoxai.parity-run-manifest",
   "version": 1,
-  "runId": "d05f287b-41a6-4708-81db-758b9f8d04ef",
+  "runId": "b2edfab1-0bd9-4533-a8f3-ff36780a981d",
   "command": "golden",
   "fingerprint": {
     "schema": "volvoxai.parity-fingerprint",
@@ -11,15 +11,15 @@
       "policy": [
         {
           "path": "tests/parity/policy.json",
-          "sha256": "2909cc971c77e27149f51ea3337368615d9e2c285bc7bb8605bbd387d0b5782c",
-          "size": 6621
+          "sha256": "a6d43c713a3ac37a436a3bb08fafb45e414a10f40c4bd08e5d2e5a053499e814",
+          "size": 6639
         }
       ],
       "models": [
         {
           "path": "models/efficientdet_lite0_fp32/graph.json",
-          "sha256": "a9a6c3af0c1b4efcfbeae69ecb70c079eb1b84279f4c97249023e906b23da092",
-          "size": 120879
+          "sha256": "0ccf7d98adeb08cafa41fc342adfabc79b687175f1c8bca4d2f8ad9b79c61114",
+          "size": 120834
         },
         {
           "path": "models/efficientdet_lite0_fp32/model.safetensors",
@@ -36,62 +36,62 @@
       ],
       "builds": [
         {
-          "path": "dist/0.3.0/volvoxai.js",
-          "sha256": "a1e492cb98aa12674689ad5928bd861b1fa55d660dbc27a4280d65c9fbb96020",
-          "size": 2170365
+          "path": "dist/0.4.0/volvoxai.js",
+          "sha256": "79e33d1ea321c33a62a1acb1ae3375ed6b843297ea107b4ca9103480b3f0030d",
+          "size": 2267953
         }
       ],
       "sources": [],
       "source": {
-        "revision": "e9696b57c4f74122de7c9d84e36be2c9bcf81871",
+        "revision": "4ffe616b44d43c6fbe20280845f6416b7ef56fa2",
         "state": "dirty",
-        "statusSha256": "4fd334773bfd51ddd70d95ebfb4c9d688038f97f750f39921d253d113f569304"
+        "statusSha256": "05bf37b173740f16ad8fe00d2ffe934649dd6f6a7c8471c8e04911111d79c57f"
       }
     },
-    "digest": "202cf5ea427b9b6809789b094bb4c7a64202fa297164dfb03c1108d5bcacc0d7"
+    "digest": "65d53b9045c7fd4c40331fe7eed65925149734b8ca14d587ff088e70ae2030a4"
   },
   "selection": {
     "cases": [
       "efficientdet_lite0_fp32"
     ],
     "tiers": [
-      "cpu-reference"
+      "cpu-js-reference"
     ],
     "jobs": [
       {
         "case": "efficientdet_lite0_fp32",
-        "tier": "cpu-reference",
+        "tier": "cpu-js-reference",
         "expectation": "required"
       }
     ]
   },
   "producer": {
-    "backend": "cpu",
+    "backend": "cpu-js",
     "kind": "node",
     "runtimeEvidenceRequired": true,
     "strictBackend": true
   },
-  "startedAt": "2026-08-02T16:56:39.331Z",
-  "completedAt": "2026-08-02T16:57:14.675Z",
+  "startedAt": "2026-08-13T08:14:29.415Z",
+  "completedAt": "2026-08-13T08:15:04.803Z",
   "outcome": "success",
   "results": [
     {
       "case": "efficientdet_lite0_fp32",
-      "tier": "cpu-reference",
+      "tier": "cpu-js-reference",
       "status": "success",
       "artifact": {
         "path": "efficientdet_lite0_fp32.json",
-        "sha256": "d8b82308202e1cfec682ab838b6e873f440849a8aba7bc5044bae88ff6b0d9bb",
-        "size": 51287
+        "sha256": "7d5476535e55b57e6760d3a55dc5c99deb212be0ac47c0fa80226d92c695ba92",
+        "size": 51305
       },
-      "durationMs": 16929.74,
+      "durationMs": 16976.51,
       "metadata": {
         "runtimeEvidence": {
           "compilation": {
-            "compilationId": "compilation-78141939-cadb-44e5-ae5e-f8904f832dde",
-            "definitionId": "model-definition-696c1751-a246-4bef-b888-b284308a56f1",
+            "compilationId": "compilation-e044bdb0-2878-4840-9a97-3149f8a67998",
+            "definitionId": "model-definition-2304f19f-f240-4d22-9576-33788af2cab1",
             "policy": {
-              "backend": "cpu",
+              "backend": "cpu-js",
               "mode": "require",
               "operatorFallback": "forbid"
             },
@@ -100,7 +100,7 @@
               "adapterRevisionIds": [],
               "topologyRevision": 1,
               "weightRevision": 1,
-              "weightRevisionId": "model-definition-696c1751-a246-4bef-b888-b284308a56f1:weight:1:weight-revision-2d373176-a7b9-4ca9-8c88-f8584d56ab63"
+              "weightRevisionId": "model-definition-2304f19f-f240-4d22-9576-33788af2cab1:weight:1:weight-revision-c353a945-ab21-4e86-9a00-94f32f730887"
             },
             "route": {
               "operator": {
@@ -110,15 +110,15 @@
               },
               "tierFallback": false
             },
-            "selectedBackend": "cpu",
+            "selectedBackend": "cpu-js",
             "selectedDevice": {
-              "backend": "cpu",
+              "backend": "cpu-js",
               "device": "host"
             }
           },
           "execution": {
-            "backend": "cpu",
-            "contextId": "context-1df1e3f6-c80b-4209-95af-16b01caf4ec5",
+            "backend": "cpu-js",
+            "contextId": "context-94a4c520-db35-460d-b4e8-7cee0acaf3a2",
             "decodeState": {
               "cacheGeneration": null,
               "cacheState": "not-applicable",
@@ -127,17 +127,17 @@
               "position": null
             },
             "device": {
-              "backend": "cpu",
+              "backend": "cpu-js",
               "device": "host"
             },
-            "executionId": "execution-254f8a0e-c03b-4bb4-9f58-39cc3e23d8e3",
+            "executionId": "execution-9df72c03-f384-425c-92b3-79f4d13d2e46",
             "outcome": "success",
             "revisions": {
               "adapterRevisionId": null,
               "adapterRevisionIds": [],
               "topologyRevision": 1,
               "weightRevision": 1,
-              "weightRevisionId": "model-definition-696c1751-a246-4bef-b888-b284308a56f1:weight:1:weight-revision-2d373176-a7b9-4ca9-8c88-f8584d56ab63"
+              "weightRevisionId": "model-definition-2304f19f-f240-4d22-9576-33788af2cab1:weight:1:weight-revision-c353a945-ab21-4e86-9a00-94f32f730887"
             },
             "route": {
               "operator": {

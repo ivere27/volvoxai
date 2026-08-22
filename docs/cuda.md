@@ -16,9 +16,9 @@ build composition, numerical contracts, operator coverage, and validation.
 | Loss and optimization | CUDA cross-entropy, finite checking, accumulation, global-norm clipping, SGD, and AdamW |
 | Training residency | Optimizer-updated weights and Adam moments remain device-authoritative until materialized |
 | F32-to-W8 authoring | Implemented in the full profile, including optional I32 bias packing |
-| Physical W8A8 inference | Implemented with manual I8/U8 kernels |
+| W8A8 inference | Implemented with manual I8/U8 kernels |
 | Public bounded dynamic shapes | Implemented for the qualified CUDA inference subset; complete domain, route, launch, slot, and resident-resource proof is required |
-| CUDA Graph replay | Implemented for a conservative static-inference allowlist |
+| CUDA Graph replay | Implemented for a conservative static-inference allowlist and a proof-qualified bounded-dynamic allowlist with an exact-shape four-entry cache |
 | Native FP16/BF16 arithmetic | Not implemented; F16 package weights are widened and computed as F32 |
 | TF32 and tensor cores | Not used |
 | Quantized backward and QAT | Not implemented |
@@ -272,17 +272,20 @@ onto those fixed offsets and must fit the proved capacities. After context
 publication, shape rebinding neither grows the host arena nor calls
 `cuMemAlloc`; a missing or undersized reserved span fails closed.
 
-A changed shape synchronizes submitted stream work, invalidates replay and
-stale coherence identities, and commits the new semantic signature only after
-the reserved binding succeeds. The previous binding remains usable when
-candidate planning fails. Repeating the current signature resets only its
-per-forward logical/coherence state; the binding fast path issues no additional
-stream synchronization and does not advance shape/capacity generations. CUDA
-Graph capture/replay remains restricted to static inference.
+A changed shape synchronizes submitted stream work, resets the reserved spans'
+logical/coherence views, and commits the new semantic signature only after the
+reserved binding succeeds. The previous binding remains usable when candidate
+planning fails. Repeating the current signature resets only its per-forward
+logical/coherence state; the binding fast path issues no additional stream
+synchronization and does not advance shape/capacity generations. Because the
+physical pointers and capacities remain fixed, a successful bind can select a
+previously captured CUDA Graph for that exact signature instead of invalidating
+graphs for other signatures.
 
 ### CUDA Graph replay
 
-Static inference can capture and replay a conservative graph:
+Qualified static and bounded-dynamic inference can capture and replay a
+conservative graph. Each exact shape follows the same state machine:
 
 1. the first eligible forward records routes, launch signatures, and
    read-before-write slots;
@@ -290,20 +293,49 @@ Static inference can capture and replay a conservative graph:
    instantiates the graph; and
 3. later compatible forwards replay the graph executable.
 
-The allowlist is:
+The static allowlist is:
 
-- Linear, Gemm, and MatMul;
+- Linear, Gemm, MatMul, and QBatchMatMul;
 - PReLU and Sigmoid;
 - Conv2D and Add;
-- Concat, MaxPool2D, ResizeNearest2D, and Reshape; and
+- Concat, MaxPool2D, ResizeNearest2D, Reshape, and Transpose; and
 - QConv2D, QAdd, QuantizeLinear, DequantizeLinear, and RequantizeLinear.
 
-Debug routing, prefix or row execution, SDK backends, adapter effects,
-training, and event profiling exclude replay. A model-generation change,
-tensor-slot epoch change, reset, route/signature mismatch, unsafe
-synchronization, or capture/launch failure invalidates it. If Driver Graph
-functions are unavailable or a plan is ineligible, execution uses ordinary
-CUDA launches while preserving strict CUDA routing.
+The bounded-dynamic allowlist also admits proof-qualified ArgMax,
+BatchMatMul, Cast, Clip, Div, Embedding, Equal, Expand, GELU, Gather,
+GreaterOrEqual, GroupNorm, LayerNorm, Mul, Not, QGemm, QLinear, ReduceSum,
+SiLU, Slice, Softmax, Squeeze, Sub, Unsqueeze, and Where nodes. Their scalar
+launch arguments must derive only from immutable node parameters and the exact
+shape signature; request values remain in the fixed device buffers staged
+before replay. Data-dependent MoE and partial weight-bank routing are excluded.
+
+A bounded context retains at most four replay plans in a deterministic
+context-local LRU. A plan owns its exact shape signature and is additionally
+keyed by model generation, tensor-slot epoch, capacity generation, and domain
+mode. Thus an alternating B1/BN workload can keep both plans, while a fifth
+signature destroys the least-recently-used executable. Model, slot, capacity,
+or domain changes invalidate all retained plans before a direct OBSERVE pass;
+a launch-list mismatch invalidates the selected plan. Debug routing, prefix or
+row execution, SDK backends, adapter effects, training, event profiling, and
+partial weight banks exclude replay. An unavailable Graph API, ineligible
+forward, cache-allocation failure, or failure to begin capture uses ordinary
+CUDA launches. A failure after capture has begun, during graph launch, or at
+stream synchronization destroys the affected plan and returns a strict
+execution failure rather than publishing uncertain output.
+If the CUDA Driver cannot destroy an evicted GraphExec, that cache entry keeps
+ownership and is quarantined. The current forward uses ordinary launches and
+later forwards retry destruction before reusing the entry or requesting
+another GraphExec, so the four-object bound remains strict.
+
+The bounded resident proof charges the fixed host-side state for four plans,
+four retained maximum-size owned signatures, and the transactional fifth
+candidate signature that can coexist until LRU eviction. The CUDA Driver's
+internal allocation for up to four requested GraphExec objects is opaque:
+compile evidence reports the cache capacity, while the opaque bytes are documented as
+requested/unknown and are not silently included in the numeric resident-byte
+claim. Runtime route evidence reports `cuda_graph_replay=1` only after a cached
+VALIDATE launch and its stream synchronization both succeed for that physical
+forward; observe, capture, and fallback passes report `0`.
 
 ## F32 inference operators
 
@@ -333,7 +365,7 @@ ReLU/ReLU6, and eligible Conv2D-plus-residual-Add paths.
 
 ## W8A8 inference
 
-Physical I8/U8 execution covers:
+I8/U8 execution covers:
 
 - QLinear, QMatMul, QGemm, QEmbedding, QConv2D, and QAdd;
 - QBatchMatMul with rank-2–8 right-aligned ONNX batch broadcasting;
@@ -405,7 +437,7 @@ The F32 planner and CUDA dispatcher cover:
 
 Runtime-routed LoRA is a forward overlay. Trainable LoRA uses ordinary F32
 MatMul/Add graph nodes, so its gradients and AdamW updates follow the same
-CUDA contract. Physical W8A8 graphs do not support routed LoRA overlays,
+CUDA contract. W8A8 graphs do not support routed LoRA overlays,
 quantized backward, or QAT.
 
 ### Training attention
@@ -453,7 +485,7 @@ Supported behavior includes:
 - transactional validation of dimensions, metadata, bias, and finite values.
 
 Full-profile materialization and package writing route selected W8 tensors
-through this path. Authored tensors feed the physical W8A8 kernels without a
+through this path. Authored tensors feed the W8A8 kernels without a
 CPU repack.
 
 Authoring stages the F32 source to CUDA, uses temporary device buffers, and
@@ -553,7 +585,6 @@ Build and run the focused CUDA and profile-boundary checks:
 
 ~~~bash
 cmake -S . -B build/cuda-tests -G Ninja \
-  -DCMAKE_BUILD_TYPE=Release \
   -DCMAKE_C_COMPILER=clang \
   -DVOLVOXAI_ENABLE_CUDA=ON \
   -DVOLVOXAI_CUDA_ARCH=86 \
@@ -574,6 +605,10 @@ ctest --test-dir build/cuda-tests --output-on-failure \
   -R '^(test_cuda_(kernels|runtime|public_dynamic|training|ptq|state_ownership)|test_training_backward|test_incremental_runtime|native_profile_boundaries|native_training_boundary|cuda_ptx_embedding|cuda_fp32_build_contract|cuda_source_composition|cuda_state_ownership_audit)$'
 ~~~
 
+Keep this correctness build assertion-enabled (the default empty build type or
+`Debug`). Use a separate `Release` build for benchmark artifacts; several
+native lifecycle tests intentionally rely on assertions.
+
 Run the source-composition and PTX build-contract tests directly with:
 
 ~~~bash
@@ -589,7 +624,9 @@ The focused tests cover:
 - strict runtime routing and no-fallback behavior;
 - public bounded-dynamic proof, fixed reservation, shape-plan reuse, and
   out-of-domain rejection;
-- graph residency, views, aliases, fusions, and replay;
+- graph residency, views, aliases, fusions, exact-shape replay with changed
+  inputs, B1↔BN cache reuse, five-shape LRU eviction, global-key invalidation,
+  GraphExec destruction, and public replay evidence;
 - all CUDA backward command families;
 - loss, accumulation, clipping, SGD, AdamW, and optimizer state;
 - private backward planning and gradient propagation;

@@ -16,7 +16,7 @@
  *   node --import tsx examples/tiny_receipt_vqa/tools/measure_backend_latency.mjs \
  *     --package build/tiny-receipt-f32-from-f32 \
  *     --eval "$RECEIPT_VQA_DATA_ROOT/eval/heldout" --record 00000 \
- *     --backend cpu --backend wasm --out build/backend-latency.json
+ *     --backend cpu-js --backend wasm --out build/backend-latency.json
  */
 
 import { execFileSync } from 'node:child_process';
@@ -48,7 +48,7 @@ function parseArguments(values) {
   if (!options.package || !options.eval) {
     throw new Error('pass --package <dir> --eval <heldout dir>');
   }
-  if (options.backends.length === 0) options.backends = ['cpu', 'wasm'];
+  if (options.backends.length === 0) options.backends = ['cpu-js', 'wasm'];
   return options;
 }
 

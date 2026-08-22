@@ -42,6 +42,7 @@ struct VxKernelThreadPool {
 
 static _Thread_local VxKernelThreadPool* g_current_kernel_pool;
 
+#if !defined(__ARM_NEON) && !defined(__ARM_NEON__)
 /* Count distinct physical cores from the sysfs topology.  Byte-domain GEMM and
  * norm kernels are load/store bound, so a second SMT sibling on the same core
  * adds scheduling and L1 pressure without adding throughput.  Returns 0 when
@@ -100,6 +101,7 @@ static int vx_native_cached_physical_cores(void) {
     }
     return value > 0 ? value : 0;
 }
+#endif
 
 static int vx_native_thread_count(VxKernelThreadPool* pool) {
     int count;

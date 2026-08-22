@@ -3,7 +3,7 @@
 
 For each case freshly dumped by run_backward.mjs it rebuilds the exact forward,
 runs cross-entropy + backward, and atomically publishes a versioned artifact plus
-a manifest linked to the current CPU/WASM campaign. This is the genuine "PyTorch
+a manifest linked to the current CPU-JS/WASM campaign. This is the genuine "PyTorch
 autograd vs VolvoxAI autograd" check.
 """
 import hashlib
@@ -44,7 +44,7 @@ def cleanup_outputs():
 
 def read_campaign():
     manifests = []
-    for tier in ("cpu", "wasm"):
+    for tier in ("cpu-js", "wasm"):
         path = os.path.join(MANIFEST_DIR, f"{tier}.json")
         with open(path, encoding="utf-8") as source:
             manifest = json.load(source)
@@ -55,9 +55,9 @@ def read_campaign():
         manifests.append(manifest)
     cpu, wasm = manifests
     if cpu.get("runId") != wasm.get("runId"):
-        raise RuntimeError("cpu/wasm backward manifests belong to different runs")
+        raise RuntimeError("cpu-js/wasm backward manifests belong to different runs")
     if cpu.get("fingerprint", {}).get("digest") != wasm.get("fingerprint", {}).get("digest"):
-        raise RuntimeError("cpu/wasm backward manifests have different fingerprints")
+        raise RuntimeError("cpu-js/wasm backward manifests have different fingerprints")
     return cpu
 
 
@@ -83,7 +83,7 @@ def forward(arch, x, w, dims):
     if arch == "linear":
         return x @ w["W"] + w["b"]
     if arch == "mlp":
-        h = F.gelu(x @ w["W1"] + w["b1"])          # default approximate='none' (erf) == VolvoxAI CPU GELU
+        h = F.gelu(x @ w["W1"] + w["b1"])          # default approximate='none' (erf) == VolvoxAI CPU-JS GELU
         return h @ w["W2"] + w["b2"]
     if arch == "layernorm":
         ln = F.layer_norm(x, [dims["D"]], w["g"], w["be"], eps=1e-5)

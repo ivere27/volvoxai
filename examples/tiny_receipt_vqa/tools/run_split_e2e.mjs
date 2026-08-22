@@ -141,7 +141,7 @@ async function packageVocabulary(packageManifestUrl) {
   const filename = fileURLToPath(packageManifestUrl);
   const manifest = await readJson(filename, 'package manifest');
   if (manifest?.format !== TINY_RECEIPT_SPLIT_KV_PACKAGE_FORMAT) {
-    fail('fixture emission requires an explicit-KV v1 package.');
+    fail('fixture emission requires an explicit-KV v2 package.');
   }
   const vocabPath = assetPath(manifest?.assets?.vocab?.path, 'manifest assets.vocab.path');
   const value = await readJson(join(dirname(filename), vocabPath), 'vocab');
@@ -229,9 +229,9 @@ async function emitReport(value, output) {
 
 async function main() {
   const options = parseArguments(process.argv.slice(2));
-  const backend = options.backend || 'cpu';
-  if (!['cpu', 'wasm'].includes(backend)) {
-    fail("--backend must be 'cpu' or 'wasm'; use the Deno runner for physical WebGPU.");
+  const backend = options.backend || 'cpu-js';
+  if (!['cpu-js', 'wasm'].includes(backend)) {
+    fail("--backend must be 'cpu-js' or 'wasm'; use the Deno runner for physical WebGPU.");
   }
   const packageManifestUrl = manifestFilename(options.package);
   if (options['fixtures-only'] && !options['fixtures-dir']) {

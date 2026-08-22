@@ -219,7 +219,7 @@ void microkernel_conv2d_fp32_avx2(
 
 1. Add reusable indirection-buffer builders during graph initialization.
 2. Add more per-ISA dense microkernels where benchmarks justify a different MR/NR/KC.
-3. Continue replacing generic convolution loops in `quant_cpu_opt.c` with
+3. Continue replacing generic convolution loops in `quant_cpu_isa.c` with
    CPU-feature-routed microkernels.
 4. Keep the activation arena planner enabled for transient tensors with non-overlapping
    lifetimes.

@@ -153,6 +153,9 @@ fn translate_glsl_entry(
     let options = glsl::Options {
         version,
         binding_map: binding_map.clone(),
+        zero_initialize_workgroup_memory: glsl_zero_initialize_workgroup_memory(
+            label, entry_name, version,
+        ),
         ..glsl::Options::default()
     };
     let pipeline_options = glsl::PipelineOptions {
@@ -183,6 +186,39 @@ fn translate_glsl_entry(
     })?;
     drop(writer);
     Ok(output)
+}
+
+fn glsl_zero_initialize_workgroup_memory(
+    label: &Path,
+    entry_name: &str,
+    version: glsl::Version,
+) -> bool {
+    if !version.is_es() || entry_name != "main" {
+        return true;
+    }
+    let Some(stem) = label.file_stem().and_then(|value| value.to_str()) else {
+        return true;
+    };
+
+    /* Naga's portable default emits a lane-zero clear plus a workgroup
+     * barrier for every workgroup variable. These inference kernels already
+     * overwrite every element they can read before their first barrier. The
+     * tiled linear and convolution kernels cover each complete tile (or its
+     * exact live prefix), the normalization reductions cover every lane, and
+     * qSDPA covers every lane/channel in its live head_dim range. Keep the
+     * conservative default for every shader not audited here. */
+    !matches!(
+        stem,
+        "linearF32Tiled"
+            | "linearF32RowMajorTiled"
+            | "linearInt8Tiled"
+            | "qLinearInt8Tiled"
+            | "qConv2DInt8Tiled"
+            | "conv2DPointwise16Tile"
+            | "qGroupNormStats"
+            | "qLayerNormStats"
+            | "qSDPAInt8"
+    )
 }
 
 fn glsl_output_name(stem: &str, entry_name: &str, entry_count: usize) -> String {
@@ -393,6 +429,82 @@ mod tests {
             assert!(output.contains("layout(std140, binding = 7)"));
             assert!(!output.contains("layout(std430, binding = 0)"));
         }
+    }
+
+    #[test]
+    fn gles_omits_redundant_workgroup_clear_only_for_audited_inference_shaders() {
+        for stem in [
+            "linearF32Tiled",
+            "linearF32RowMajorTiled",
+            "linearInt8Tiled",
+            "qLinearInt8Tiled",
+            "qConv2DInt8Tiled",
+            "conv2DPointwise16Tile",
+            "qGroupNormStats",
+            "qLayerNormStats",
+            "qSDPAInt8",
+        ] {
+            let label = PathBuf::from(format!("{stem}.wgsl"));
+            assert!(!glsl_zero_initialize_workgroup_memory(
+                &label,
+                "main",
+                glsl::Version::new_gles(310),
+            ));
+        }
+        assert!(glsl_zero_initialize_workgroup_memory(
+            Path::new("matMulBackward.wgsl"),
+            "main",
+            glsl::Version::new_gles(310),
+        ));
+
+        let source = r#"
+            @group(0) @binding(0) var<storage, read_write> output : array<u32>;
+            var<workgroup> values : array<u32, 64>;
+
+            @compute @workgroup_size(64)
+            fn main(@builtin(local_invocation_index) lane : u32) {
+                values[lane] = lane;
+                workgroupBarrier();
+                output[lane] = values[lane];
+            }
+        "#;
+        let audited_label = Path::new("qGroupNormStats.wgsl");
+        let module = parse_module(source, audited_label).unwrap();
+        let info = validate_module(&module, audited_label, glsl::supported_capabilities()).unwrap();
+        let bindings = logical_binding_slots(&module).unwrap();
+        let gles = translate_glsl_entry(
+            &module,
+            &info,
+            audited_label,
+            "main",
+            glsl::Version::new_gles(310),
+            &bindings,
+        )
+        .unwrap();
+        assert!(!gles.contains("gl_LocalInvocationID == uvec3(0u)"));
+
+        let conservative_label = Path::new("unreviewedSharedMemory.wgsl");
+        let conservative = translate_glsl_entry(
+            &module,
+            &info,
+            conservative_label,
+            "main",
+            glsl::Version::new_gles(310),
+            &bindings,
+        )
+        .unwrap();
+        assert!(conservative.contains("gl_LocalInvocationID == uvec3(0u)"));
+
+        let desktop = translate_glsl_entry(
+            &module,
+            &info,
+            audited_label,
+            "main",
+            glsl::Version::Desktop(430),
+            &bindings,
+        )
+        .unwrap();
+        assert!(desktop.contains("gl_LocalInvocationID == uvec3(0u)"));
     }
 
     #[test]

@@ -127,9 +127,10 @@ verify_native_isa: build_native
 benchmark_native: build_native
 	$(DOCKER_RUN) ctest --test-dir $(CMAKE_BUILD_DIR) -L benchmark --output-on-failure
 
-# Builds in Docker; running needs a real GPU, so run it where one is attached.
+# Build with the pinned toolchain, then execute on the host so CTest can reach
+# the configured physical GPU and display devices.
 test_native_gpu: build_native
-	$(DOCKER_RUN) ctest --test-dir $(CMAKE_BUILD_DIR) -L gpu --output-on-failure
+	ctest --test-dir $(CMAKE_BUILD_DIR) -L gpu --output-on-failure
 
 clean_native:
 	rm -rf $(CMAKE_BUILD_DIR)
@@ -178,6 +179,8 @@ test_js:
 test_exporter:
 	PYTHONDONTWRITEBYTECODE=1 $(PY) -m unittest discover -s tools/exporter/tests -p 'test_*.py'
 	PYTHONDONTWRITEBYTECODE=1 $(PY) -m unittest discover \
+		-s examples/receipt_digit_reader/tests -p 'test_*.py'
+	PYTHONDONTWRITEBYTECODE=1 $(PY) -m unittest discover \
 		-s examples/tiny_receipt_vqa/tests -p 'test_*.py'
 
 # Full portable regression: exporter contracts + JS suite + native suite.
@@ -185,13 +188,13 @@ test_all: test_exporter test_js test_native_all
 
 # --------------------------------------------------------------------------
 # Cross-tier whole-model parity + benchmark harness (tests/parity/).
-# Runs the two shipped models through pure-JS (the oracle), WASM, and native-CPU
+# Runs the two shipped models through CPU-JS (the oracle), WASM, and native-CPU
 # and gates on numeric tolerance + decision parity. Requires the model packages
 # (see docs/models.md), a built web bundle (npm run build:all), and the native
 # binary. Policy-required tiers fail closed when their producer is unavailable.
 parity:
 	node tests/parity/run.mjs fixtures
-	node tests/parity/run.mjs produce cpu
+	node tests/parity/run.mjs produce cpu-js
 	node tests/parity/run.mjs produce wasm
 	bash tests/parity/produce_native.sh native-cpu
 	node tests/parity/run.mjs native-sig native-cpu
@@ -260,7 +263,7 @@ parity_gpu_consensus:
 	DENO=$(DENO) bash tests/parity/gpu_consensus_check.sh
 
 # Backward + optimizer-step parity: forward + cross-entropy + backward + one SGD step
-# per case (Linear, MLP, LayerNorm) on cpu and wasm, gated vs each other and vs a
+# per case (Linear, MLP, LayerNorm) on cpu-js and wasm, gated vs each other and vs a
 # PyTorch autograd oracle (both gradients and updated weights). WebGPU is produced on a
 # GPU box (`deno run … tests/parity/backward/run_backward.mjs webgpu`) and folds in.
 parity_backward:
@@ -268,7 +271,7 @@ parity_backward:
 	-python3 tests/parity/backward/backward_torch_oracle.py
 	node tests/parity/backward/run_backward.mjs compare
 
-# Autoregressive decode-path parity: greedy-decode TinyStories on cpu and wasm and check
+# Autoregressive decode-path parity: greedy-decode TinyStories on cpu-js and wasm and check
 # the token sequence is identical across tiers and matches PyTorch's greedy generate.
 # WebGPU is produced on a GPU box (`deno run … tests/parity/decode/decode_parity.mjs webgpu`).
 parity_decode:
@@ -277,16 +280,30 @@ parity_decode:
 	node tests/parity/decode/decode_parity.mjs compare
 
 # KV-cache decode parity: drive a small W8A8 decoder through DecodeSession's required
-# row/KV-cache path and compare retained self-attention K/V with a CPU full recompute.
+# row/KV-cache path and compare retained self-attention K/V with a CPU-JS full recompute.
 parity_kvcache:
-	node tests/parity/kvcache/kvcache_parity.mjs cpu wasm
-	node tests/parity/kvcache/kvcache_parity.mjs compare cpu wasm
+	node tests/parity/kvcache/kvcache_parity.mjs cpu-js wasm
+	node tests/parity/kvcache/kvcache_parity.mjs compare cpu-js wasm
+
+# The test-only internals bundle the paged-KV campaign imports: a page table is
+# not on the public surface, and ShaderLibrary imports .wgsl, which only
+# esbuild's text loader resolves. Needs the npm dev dependencies, so it is built
+# on a dev box and shipped to the GPU host the same way the shader packs are.
+parity_paged_kv_bundle:
+	node tools/build_parity_internals.mjs
+
+# Paged KV on a physical WebGPU adapter: a deliberately scattered page table
+# bit-compared against a contiguous CPU decode, plus two requests decoding
+# concurrently on one context from a shared prompt page. Run on a physical-GPU
+# host after `make parity_paged_kv_bundle` has produced the bundle.
+parity_paged_kv_webgpu:
+	$(DENO) run --unstable-webgpu --allow-read --allow-write --allow-env --allow-ffi tests/parity/kvcache/paged_kv_webgpu.mjs
 
 # The same exact-int8 gate including WebGPU device-resident K/V readback. Run on a
 # physical-GPU host through Deno's surfaceless WebGPU implementation.
 parity_kvcache_webgpu:
-	$(DENO) run --unstable-webgpu --allow-read --allow-write --allow-env --allow-ffi tests/parity/kvcache/kvcache_parity.mjs cpu wasm webgpu
-	node tests/parity/kvcache/kvcache_parity.mjs compare cpu wasm webgpu
+	$(DENO) run --unstable-webgpu --allow-read --allow-write --allow-env --allow-ffi tests/parity/kvcache/kvcache_parity.mjs cpu-js wasm webgpu
+	node tests/parity/kvcache/kvcache_parity.mjs compare cpu-js wasm webgpu
 
 # One fail-closed dynamic-v1 hardware campaign for protected self-hosted CI. It
 # requires physical WebGPU whole-model, L1/L2, portable-closure, and KV-cache
@@ -310,12 +327,12 @@ parity_gpu_required:
 	$(MAKE) parity_kvcache_webgpu
 	node tests/parity/run.mjs gpu-verify
 
-# Regenerate committed golden signatures from the pure-JS reference. Review any diff.
+# Regenerate committed golden signatures from the CPU-JS reference. Review any diff.
 parity_goldens:
 	node tests/parity/run.mjs golden
 
 # Level 1: per-op cross-tier matrix. Each op runs as a single-node graph on
-# pure-JS/WASM/native-CPU (gated vs pure-JS) plus a best-effort PyTorch oracle
+# CPU-JS/WASM/native-CPU (gated vs CPU-JS) plus a best-effort PyTorch oracle
 # (correctness). Skipped ops and known approximations are declared in ops/cases.mjs.
 parity_ops:
 	node tests/parity/run.mjs opmatrix
@@ -325,7 +342,7 @@ parity_ops:
 	node tests/parity/run.mjs opmatrix-compare
 
 # Level 2: mixed multi-op graphs (fusion / aliasing / layout / dtype seams).
-# Same gating as L1: WASM + native-CPU vs pure-JS, best-effort PyTorch oracle.
+# Same gating as L1: WASM + native-CPU vs CPU-JS, best-effort PyTorch oracle.
 parity_graphs:
 	node tests/parity/run.mjs graphmatrix
 	node tests/parity/run.mjs matrix-begin graphs torch
@@ -334,7 +351,7 @@ parity_graphs:
 	node tests/parity/run.mjs graphmatrix-compare
 
 # Generated-inventory-bound numerical closure for the audited portable gaps.
-# CPU, strict WASM, and strict native CPU are hard gates; physical WebGPU uses
+# CPU-JS, strict WASM, and strict native CPU are hard gates; physical WebGPU uses
 # these same cases through the protected hardware matrix campaign.
 parity_portable:
 	node tests/parity/run.mjs portablematrix
@@ -355,7 +372,7 @@ parity_coverage:
 	node tests/parity/run.mjs coverage
 
 # Real-image EfficientDet parity: decode dog.jpg/cat.jpg once, feed identical input
-# to VolvoxAI cpu/wasm/native + ONNX Runtime, compare all 19206 anchors + detections.
+# to VolvoxAI cpu-js/wasm/native + ONNX Runtime, compare all 19206 anchors + detections.
 parity_image:
 	node tests/parity/image_check.mjs examples/efficientdet_lite0/assets/dog.jpg int8
 	node tests/parity/image_check.mjs examples/efficientdet_lite0/assets/cat.jpg int8
@@ -401,7 +418,7 @@ build_wasm: build_docker
 	@echo "Built $(WEB_WASM_ARTIFACTS)"
 
 test_wasm_relaxed_simd: build_wasm
-	$(DOCKER_RUN) node --test tests/js_wasm_w8a32_packed_simd.test.mjs
+	$(DOCKER_RUN) node --test tests/wasm_w8a32_packed_simd.test.mjs
 	$(DOCKER_RUN) node tools/test_wasm_relaxed_simd.mjs --baseline-only \
 		$(WEB_WASM_ARTIFACTS)
 	$(DOCKER_RUN) node --experimental-wasm-relaxed-simd \

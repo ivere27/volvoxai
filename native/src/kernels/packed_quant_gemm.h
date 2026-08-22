@@ -75,6 +75,19 @@ int vx_qlinear_i8u8_packed(const void* input, const void* packed_weight,
         float output_scale, int32_t output_zero_point,
         uint32_t input_dtype, uint32_t weight_dtype, uint32_t output_dtype);
 
+/* Separately compiled Arm I8MM consumer for the target-derived pair payload.
+ * The baseline dispatcher calls it only after HWCAP2_I8MM admission and full
+ * packed-header/descriptor validation. */
+#if defined(VOLVOXAI_ARM_I8MM_OBJECT) && defined(__aarch64__)
+int vx_qlinear_i8u8_arm_i8mm_packed_try(const void* input,
+        const VxPackedQ8Header* header, const int32_t* bias,
+        const float* weight_scales, const int32_t* weight_zero_points,
+        void* output, uint32_t rows, float input_scale,
+        int32_t input_zero_point, float output_scale,
+        int32_t output_zero_point, uint32_t input_dtype,
+        uint32_t output_dtype);
+#endif
+
 /* Native physical-QLinear policy. The packed pair layout is available only for
  * symmetric I8 weights. AVX2 uses its exact K4/N16 kernels generally; a
  * single-threaded, wide-enough call uses N32 with either the proved

@@ -218,6 +218,8 @@ VxBackendProvider provider = {
     .context_execute = provider_context_execute,
     .context_close = provider_context_close,
     .context_destroy = provider_context_destroy,
+    .exact_contract_marker = VX_BACKEND_PROVIDER_EXACT_CONTRACT_MARKER,
+    .exact_contract_extent = sizeof(VxBackendProvider),
 };
 
 provider.shape_domain.support = VX_BACKEND_SHAPE_DOMAIN_FULL;
@@ -271,6 +273,15 @@ arena 슬롯 1        [ 숨김 A ][ 출력에 재사용 ]
 이는 Graph 의미를 바꾸지 않고 할당 오버헤드와 최대 메모리를 줄입니다. 컨텍스트가 자기 arena를
 소유하므로 동시 요청은 격리됩니다.
 
+수명 계획이 컴파일 시점인 것은 토폴로지를 따르기 때문이고, 영역의 *크기* 는 그렇지 않습니다. 심볼릭
+차원은 요청이 바인딩하기 전까지 크기가 없기 때문입니다. 따라서 컨텍스트는 현재 shape 바인딩으로부터
+arena 크기를 정하고, 더 큰 합법적 바인딩이 오면 기하급수적으로 키웁니다. 성장은 트랜잭션입니다:
+허용된 예산에 못 들어가는 바인딩은 후보 상태를 되돌린 VX_STATUS_OUT_OF_MEMORY 를 반환하고, 직전
+바인딩은 그대로 쓸 수 있게 남습니다. 엔진은 컨텍스트마다 dynamic_arena_capacity_bytes,
+dynamic_arena_high_water_bytes, dynamic_arena_grow_count 를 추적합니다
+(native/src/runtime/runtime_state.h). 배포 예산은 최악의 경우를 짐작하지 말고 이 high-water 값을
+기준으로 잡아야 합니다. 8장 §8.6 브라우저 동작의 네이티브 형태입니다.
+
 GPU 셰이더 소스는 정규 템플릿에서 생성합니다. 생성 출력과 임베드 바이트 배열은 빌드 산출물이지 편집
 대상이 아닙니다. 개발 중 VOLVOXAI_SHADER_DIR 로 외부 셰이더를 가리킬 수 있고, 런타임은 실제로 그
 오버라이드를 사용할 때 한 번만 로그를 남깁니다.
@@ -321,7 +332,7 @@ make build_native
 옵티마이저 슬롯, 누적 상태, RNG, 작업 가중치를 비공개로 소유합니다. 명시적인 충돌 검사 commit만
 Model 리비전을 게시합니다.
 
-백엔드 소스 구성은 빌드 시점 Vulkan, OpenGL, CUDA, Metal, NNAPI 옵션으로 제어합니다. 컴파일되지
+백엔드 소스 구성은 빌드 시점 Vulkan, OpenGL, CUDA, Metal 옵션으로 제어합니다. 컴파일되지
 않았거나 초기화할 수 없는 프로바이더를 요구하면 백엔드 오류를 반환하며 CPU로 바꾸지 않습니다.
 
 ## 9.11 방금 배운 것

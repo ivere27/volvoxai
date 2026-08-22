@@ -29,8 +29,8 @@
       "outputs": [
         { "name": "logits", "kind": "row", "rows": 256, "cols": 50257, "row": 4, "shape": [50257], "sampleAxes": [0], "topk": 10 }
       ],
-      "tiers": ["cpu", "wasm", "native-cpu", "webgpu", "native-vulkan", "native-opengl"],
-      "gate": ["cpu", "wasm", "native-cpu"],
+      "tiers": ["cpu-js", "wasm", "native-cpu", "webgpu", "native-vulkan", "native-opengl"],
+      "gate": ["cpu-js", "wasm", "native-cpu"],
       "gpuCampaign": {
         "webgpu": { "expectation": "required" },
         "native-vulkan": {
@@ -65,8 +65,8 @@
         { "name": "scores", "kind": "flat", "shape": [1, 19206, 90], "sampleAxes": [1, 2], "topk": 10 },
         { "name": "boxes", "kind": "flat", "shape": [1, 19206, 4], "sampleAxes": [1, 2], "topk": 0 }
       ],
-      "tiers": ["cpu", "wasm", "native-cpu", "webgpu", "native-vulkan", "native-opengl"],
-      "gate": ["cpu", "wasm"],
+      "tiers": ["cpu-js", "wasm", "native-cpu", "webgpu", "native-vulkan", "native-opengl"],
+      "gate": ["cpu-js", "wasm"],
       "diagnosticTiers": ["webgpu", "native-vulkan", "native-opengl", "onnx"],
       "gpuCampaign": {
         "webgpu": { "expectation": "required" },
@@ -101,8 +101,8 @@
         { "name": "scores", "kind": "flat", "shape": [1, 19206, 90], "sampleAxes": [1, 2], "topk": 10 },
         { "name": "boxes", "kind": "flat", "shape": [1, 19206, 4], "sampleAxes": [1, 2], "topk": 0 }
       ],
-      "tiers": ["cpu", "wasm", "native-cpu", "webgpu", "native-vulkan", "native-opengl"],
-      "gate": ["cpu", "wasm"],
+      "tiers": ["cpu-js", "wasm", "native-cpu", "webgpu", "native-vulkan", "native-opengl"],
+      "gate": ["cpu-js", "wasm"],
       "gpuCampaign": {
         "webgpu": { "expectation": "required" },
         "native-vulkan": {

@@ -1,7 +1,7 @@
 # Dynamic-shape redesign baseline
 
 This document records the pre-redesign measurements used by DS0 of
-[`PLAN.md`](../PLAN.md). It is evidence for regression comparisons, not a claim
+[`TODO.md`](../TODO.md). It is evidence for regression comparisons, not a claim
 about every deployment machine.
 
 ## Source state
@@ -18,7 +18,7 @@ about every deployment machine.
 
 ```bash
 npm run typecheck
-npm run baseline:runtime -- --backend=cpu
+npm run baseline:runtime -- --backend=cpu-js
 
 # Regenerate the forward WASM sidecar before recording a release candidate.
 make build_wasm
@@ -263,7 +263,7 @@ report shape-bind/specialization overhead separately.
 
 The first full `npm test` run reported 870 passing and two failing test results.
 Those two results were one stale nested assertion and its parent aggregate in
-`tests/js_wasm_direct_fallback_ops.test.mjs`, not two runtime failures. Commit
+`tests/wasm_direct_fallback_ops.test.mjs`, not two runtime failures. Commit
 `a196aa6` had intentionally widened the tracked F32 GEMM policy from MR 4 to MR
 8, while the older test still expected the MR-4-derived tile geometry.
 
@@ -311,7 +311,7 @@ capacity as a storage view, removing a redundant kernel copy; execution results
 still receive fresh exact storage and remain readable after context closure.
 
 The public lifecycle is gated separately by
-`npm run baseline:cpu-public`. It uses `createRuntime({ backends: ['cpu'] })`,
+`npm run baseline:cpu-public`. It uses `createRuntime({ backends: ['cpu-js'] })`,
 provider compilation, public `ExecutionContext.execute`, and exact
 `ExecutionResult` ownership over the same five-independent-process, 10-warmup,
 51-sample workload. Its timing ends once the public result owns the exact output;
@@ -350,7 +350,7 @@ one latency number.
 
 ### Post-redesign CPU variable-shape result
 
-`npm run baseline:dynamic -- --backend=cpu` runs one polymorphic context against
+`npm run baseline:dynamic -- --backend=cpu-js` runs one polymorphic context against
 independently compiled active-static and padded-maximum references. The
 2026-08-02 campaign used 3 warmups and 15 measured executions per route:
 

@@ -1,5 +1,7 @@
 #include "volvoxai.h"
+#include "volvoxai_backend.h"
 #include "safetensors.h"
+#include "../../examples/native_dynamic_batch_benchmark/evidence_tokens.h"
 
 #include <inttypes.h>
 #include <math.h>
@@ -27,6 +29,91 @@ extern int vx_public_api_test_cuda_dynamic_reservation(
     int* preload_complete,
     int* enforced,
     int* replay_plan);
+extern int vx_public_api_test_cuda_dynamic_replay_state(
+    const VxExecutionContext* context,
+    int* graph_api_available,
+    int* active_plan,
+    size_t* plan_count,
+    size_t* ready_plan_count,
+    size_t* destroy_pending_count,
+    uint64_t* capture_count,
+    uint64_t* replay_count,
+    uint64_t* invalidation_count,
+    uint64_t* graph_exec_destroy_count,
+    uint64_t* slot_epoch,
+    uint64_t* capacity_generation,
+    int* last_forward_replayed);
+extern int vx_public_api_test_cuda_invalidate_replay_key(
+    const VxExecutionContext* context, int key);
+extern int vx_public_api_test_cuda_fail_next_graph_exec_destroy(
+    const VxExecutionContext* context);
+extern int vx_public_api_test_cuda_cleanup(
+    const VxExecutionContext* context);
+extern int vx_public_api_test_cuda_replay_resource_limits(
+    const VxExecutionContext* context,
+    uint32_t* plan_capacity,
+    uint64_t* fixed_host_metadata_bytes);
+
+typedef struct {
+    int graph_api;
+    int active_plan;
+    size_t plans;
+    size_t ready;
+    size_t destroy_pending;
+    uint64_t captures;
+    uint64_t replays;
+    uint64_t invalidations;
+    uint64_t graph_exec_destroys;
+    uint64_t slot_epoch;
+    uint64_t capacity_generation;
+    int last_replayed;
+} PublicCudaReplayState;
+
+enum {
+    PUBLIC_CUDA_REPLAY_EMPTY = 0,
+    PUBLIC_CUDA_REPLAY_OBSERVED = 1,
+    PUBLIC_CUDA_REPLAY_READY = 2,
+};
+
+static int test_cuda_duplicate_execution_evidence_rejected(void) {
+    const char* duplicate =
+        "cuda_graph_replay=;provider=builtin:cuda;cuda_graph_replay=1";
+    char value[8];
+    CHECK(vx_native_batch_evidence_key_count(
+              duplicate, "cuda_graph_replay") == 2u);
+    CHECK(!vx_native_batch_evidence_token(
+        duplicate, "cuda_graph_replay", value, sizeof(value)));
+    return 0;
+}
+
+static int cuda_replay_state(const VxExecutionContext* context,
+                             PublicCudaReplayState* state) {
+    if (!state) return -1;
+    memset(state, 0, sizeof(*state));
+    return vx_public_api_test_cuda_dynamic_replay_state(
+        context, &state->graph_api, &state->active_plan,
+        &state->plans, &state->ready, &state->destroy_pending,
+        &state->captures,
+        &state->replays, &state->invalidations,
+        &state->graph_exec_destroys, &state->slot_epoch,
+        &state->capacity_generation, &state->last_replayed);
+}
+typedef void (*VxPublicApiCpuExecuteHook)(void* user_data);
+extern void vx_public_api_test_set_cpu_execute_hook(
+    VxPublicApiCpuExecuteHook hook, void* user_data);
+extern int vx_public_api_test_runtime_coordinator_stats(
+    const VxRuntime* runtime, size_t* active_requests,
+    size_t* active_input_bytes, uint64_t* dispatches);
+extern int vx_public_api_test_compiled_batch_contract(
+    const VxCompiledModel* compiled, uint32_t* min_batch,
+    uint32_t* max_batch, uint32_t* multiple_of, int32_t* batch_axis,
+    int32_t* device_resident, uint64_t* device_epoch,
+    const char** graph_fingerprint, const char** proof_identity);
+
+static void count_physical_forward(void* user_data) {
+    int* count = (int*)user_data;
+    (*count)++;
+}
 
 static int write_text(const char* path, const char* text) {
     FILE* file = fopen(path, "wb");
@@ -121,7 +208,8 @@ static int cuda_compile_attestation_complete(const VxReport* report) {
         strstr(report->route_evidence, "domain_route=all") &&
         strstr(report->route_evidence, "dynamic=1") &&
         strstr(report->route_evidence, "native_gpu_backend=cuda") &&
-        strstr(report->route_evidence, "native_gpu_domain_spans=");
+        strstr(report->route_evidence, "native_gpu_domain_spans=") &&
+        strstr(report->route_evidence, "cuda_graph_cache=4");
     if (!complete && report)
         fprintf(stderr, "incomplete CUDA compile attestation: %s\n",
                 report->route_evidence);
@@ -131,9 +219,10 @@ static int cuda_compile_attestation_complete(const VxReport* report) {
 static int execute_concat(VxExecutionContext* context,
                           const float* dynamic_values,
                           int64_t dynamic_count,
-                          int expect_cache_hit) {
+                          int expect_cache_hit,
+                          int expect_graph_replay) {
     const float fixed[2] = {10.0f, 11.0f};
-    float output[7] = {0};
+    float output[8] = {0};
     VxTensorBinding inputs[2] = {
         {sizeof(VxTensorBinding), "fixed", VX_DTYPE_F32, 1u, {2},
          fixed, sizeof(fixed), VX_MEMORY_HOST},
@@ -144,6 +233,7 @@ static int execute_concat(VxExecutionContext* context,
     VxTensorInfo info = VX_TENSOR_INFO_INIT;
     VxReport report = VX_REPORT_INIT;
     VxResult* result = NULL;
+    char replay_evidence[32];
     CHECK(vx_execution_context_execute(
               context, inputs, 2u, &result, &report) == VX_STATUS_OK);
     CHECK(result != NULL && !strcmp(report.backend, "cuda") &&
@@ -151,6 +241,9 @@ static int execute_concat(VxExecutionContext* context,
           strstr(report.fallback_evidence, "operator=none") &&
           strstr(report.route_evidence,
                  expect_cache_hit ? "shape_plan=hit" : "shape_plan=cold"));
+    CHECK(snprintf(replay_evidence, sizeof(replay_evidence),
+                   "cuda_graph_replay=%d", expect_graph_replay) > 0 &&
+          strstr(report.route_evidence, replay_evidence));
     CHECK(vx_result_output_info(result, 0u, &info, &report) == VX_STATUS_OK);
     CHECK(!strcmp(info.name, "joined") && info.dtype == VX_DTYPE_F32 &&
           info.rank == 1u && info.shape[0] == dynamic_count + 3 &&
@@ -401,6 +494,107 @@ static int run_public_qbatch(VxRuntime* runtime, const char* graph_path,
     return 0;
 }
 
+static int run_scheduled_cuda_batch(VxRuntime* runtime,
+                                    const char* graph_path) {
+    const float first_value = 3.0f;
+    const float second_value = 8.0f;
+    VxTensorBinding first_binding = {
+        sizeof(VxTensorBinding), "x", VX_DTYPE_F32, 1u, {1},
+        &first_value, sizeof(first_value), VX_MEMORY_HOST,
+    };
+    VxTensorBinding second_binding = {
+        sizeof(VxTensorBinding), "x", VX_DTYPE_F32, 1u, {1},
+        &second_value, sizeof(second_value), VX_MEMORY_HOST,
+    };
+    VxRuntimeSubmitOptions submit = VX_RUNTIME_SUBMIT_OPTIONS_INIT;
+    VxReport report = VX_REPORT_INIT;
+    VxModel* model = NULL;
+    VxCompiledModel* compiled = NULL;
+    VxRequest* first = NULL;
+    VxRequest* second = NULL;
+    VxResult* first_result = NULL;
+    VxResult* second_result = NULL;
+    uint32_t min_batch = 0;
+    uint32_t max_batch = 0;
+    uint32_t multiple = 0;
+    int32_t batch_axis = -1;
+    int32_t device_resident = 0;
+    uint64_t device_epoch = 0;
+    uint64_t dispatches_before = 0;
+    uint64_t dispatches_after = 0;
+    const char* graph_fingerprint = NULL;
+    const char* proof_identity = NULL;
+    float first_output = 0.0f;
+    float second_output = 0.0f;
+    int physical_forwards = 0;
+    CHECK(compile_cuda(runtime, graph_path, NULL, &model, &compiled,
+                       &report) == VX_STATUS_OK);
+    CHECK(compiled && cuda_compile_attestation_complete(&report) &&
+          strstr(report.route_evidence,
+                 "batchProtocol=" VX_BACKEND_BATCH_PROTOCOL) &&
+          vx_public_api_test_compiled_batch_contract(
+              compiled, &min_batch, &max_batch, &multiple, &batch_axis,
+              &device_resident, &device_epoch, &graph_fingerprint,
+              &proof_identity) == 1 &&
+          min_batch == 1u && max_batch == 4u && multiple == 1u &&
+          batch_axis == 0 && device_resident == 1 && device_epoch == 1u &&
+          graph_fingerprint && graph_fingerprint[0] && proof_identity &&
+          strstr(proof_identity,
+                 VX_BACKEND_INDEPENDENT_BATCH_PROOF_PROTOCOL));
+    CHECK(vx_public_api_test_runtime_coordinator_stats(
+              runtime, NULL, NULL, &dispatches_before) >= 0);
+    vx_public_api_test_set_cpu_execute_hook(
+        count_physical_forward, &physical_forwards);
+    CHECK(vx_runtime_submit(runtime, compiled, &first_binding, 1u, &submit,
+                            &first, &report) == VX_STATUS_OK);
+    CHECK(vx_runtime_submit(runtime, compiled, &second_binding, 1u, &submit,
+                            &second, &report) == VX_STATUS_OK);
+    CHECK(vx_request_wait(first, VX_REQUEST_WAIT_INFINITE, &report) ==
+          VX_STATUS_OK);
+    CHECK(vx_request_wait(second, VX_REQUEST_WAIT_INFINITE, &report) ==
+          VX_STATUS_OK);
+    vx_public_api_test_set_cpu_execute_hook(NULL, NULL);
+    CHECK(vx_request_result(first, &first_result, &report) == VX_STATUS_OK &&
+          first_result && report.route_attested &&
+          !report.operator_fallback_used &&
+          strstr(report.message, "trueBackendInvocations=1") &&
+          strstr(report.route_evidence, "trueBackendInvocations=1") &&
+          strstr(report.route_evidence, "cuda_graph_replay=0") &&
+          strstr(report.route_evidence,
+                 "batchProtocol=" VX_BACKEND_BATCH_PROTOCOL) &&
+          strstr(report.route_evidence, "provider=builtin:cuda") &&
+          strstr(report.route_evidence, "cuda_graph_cache=4"));
+    CHECK(vx_request_result(second, &second_result, &report) == VX_STATUS_OK &&
+          second_result && report.route_attested &&
+          !report.operator_fallback_used &&
+          strstr(report.message, "trueBackendInvocations=1") &&
+          strstr(report.route_evidence, "trueBackendInvocations=1") &&
+          strstr(report.route_evidence, "cuda_graph_replay=0") &&
+          strstr(report.route_evidence,
+                 "batchProtocol=" VX_BACKEND_BATCH_PROTOCOL) &&
+          strstr(report.route_evidence, "provider=builtin:cuda") &&
+          strstr(report.route_evidence, "cuda_graph_cache=4"));
+    CHECK(vx_result_read(first_result, "y", &first_output,
+                         sizeof(first_output), NULL, &report) == VX_STATUS_OK);
+    CHECK(vx_result_read(second_result, "y", &second_output,
+                         sizeof(second_output), NULL, &report) == VX_STATUS_OK);
+    CHECK(fabsf(first_output - first_value /
+                    (1.0f + expf(-first_value))) <= 2.0e-5f);
+    CHECK(fabsf(second_output - second_value /
+                    (1.0f + expf(-second_value))) <= 2.0e-5f);
+    CHECK(physical_forwards == 1);
+    CHECK(vx_public_api_test_runtime_coordinator_stats(
+              runtime, NULL, NULL, &dispatches_after) == 1 &&
+          dispatches_after == dispatches_before + 1u);
+    vx_result_release(first_result);
+    vx_result_release(second_result);
+    vx_request_release(first);
+    vx_request_release(second);
+    vx_compiled_model_release(compiled);
+    vx_model_release(model);
+    return 0;
+}
+
 int main(void) {
     static const char* const graph_path =
         "/tmp/volvox-cuda-public-dynamic.graph.json";
@@ -412,11 +606,13 @@ int main(void) {
         "/tmp/volvox-cuda-public-dynamic-layernorm.graph.json";
     static const char* const qbatch_path =
         "/tmp/volvox-cuda-public-dynamic-qbatch.graph.json";
+    static const char* const scheduled_batch_path =
+        "/tmp/volvox-cuda-public-dynamic-scheduled-batch.graph.json";
     static const char* const concat_graph =
         "{\"format\":\"volvox-graph/v1\","
         "\"dimensions\":{"
-        "\"Q\":{\"min\":1,\"max\":4},"
-        "\"M\":{\"min\":4,\"max\":7}},"
+        "\"Q\":{\"min\":1,\"max\":5},"
+        "\"M\":{\"min\":4,\"max\":8}},"
         "\"inputs\":{"
         "\"fixed\":{\"shape\":[2],\"dtype\":\"float32\"},"
         "\"dynamic\":{\"shape\":[\"Q\"],\"dtype\":\"float32\"}},"
@@ -512,10 +708,24 @@ int main(void) {
         "\"y\":{\"scheme\":\"per_tensor\","
         "\"scale_tensor\":\"qbatch.y.scale\","
         "\"zero_point_tensor\":\"qbatch.y.zero\"}}}}";
-    const float small_a[1] = {20.0f};
-    const float small_same[1] = {25.0f};
-    const float large[4] = {30.0f, 31.0f, 32.0f, 33.0f};
-    const float small_b[1] = {40.0f};
+    static const char* const scheduled_batch_graph =
+        "{\"format\":\"volvox-graph/v1\","
+        "\"dimensions\":{\"B\":{\"min\":1,\"max\":4}},"
+        "\"inputs\":{\"x\":{\"shape\":[\"B\"],"
+        "\"dtype\":\"float32\"}},"
+        "\"nodes\":[{\"id\":\"silu\",\"opType\":\"SiLU\","
+        "\"inputs\":{\"input\":\"x\"},"
+        "\"outputs\":{\"out\":{\"tensor\":\"y\","
+        "\"dtype\":\"float32\",\"shape\":[\"B\"]}},"
+        "\"params\":{}}],\"outputs\":[\"y\"]}";
+    const float batch_1_a[1] = {20.0f};
+    const float batch_1_b[1] = {25.0f};
+    const float batch_1_c[1] = {40.0f};
+    const float batch_2[2] = {50.0f, 51.0f};
+    const float batch_3[3] = {60.0f, 61.0f, 62.0f};
+    const float batch_4_a[4] = {30.0f, 31.0f, 32.0f, 33.0f};
+    const float batch_4_b[4] = {34.0f, 35.0f, 36.0f, 37.0f};
+    const float batch_5[5] = {70.0f, 71.0f, 72.0f, 73.0f, 74.0f};
     VxRuntimeOptions runtime_options = VX_RUNTIME_OPTIONS_INIT;
     VxContextOptions context_options = VX_CONTEXT_OPTIONS_INIT;
     VxReport report = VX_REPORT_INIT;
@@ -528,17 +738,25 @@ int main(void) {
     uint64_t current_allocations = 0;
     uint64_t resource_generation = 0;
     uint64_t arena_grow_count = 0;
+    uint64_t replay_fixed_host_metadata = 0;
     size_t span_count = 0;
     size_t arena_capacity = 0;
     size_t arena_high_water = 0;
     int preload_complete = 0;
     int enforced = 0;
     int replay_plan = -1;
+    uint32_t replay_plan_capacity = 0;
+    PublicCudaReplayState replay_state = {0};
+    PublicCudaReplayState replay_checkpoint = {0};
+    int graph_api = 0;
 
+    CHECK(test_cuda_duplicate_execution_evidence_rejected() == 0);
     CHECK(write_text(graph_path, concat_graph) == 0);
     CHECK(write_text(layernorm_path, layernorm_graph) == 0);
     CHECK(write_text(qbatch_path, qbatch_graph) == 0);
+    CHECK(write_text(scheduled_batch_path, scheduled_batch_graph) == 0);
     CHECK(write_dynamic_weights(weight_path) == 0);
+    runtime_options.max_batch_delay_milliseconds = 50u;
     CHECK(vx_runtime_create(
               &runtime_options, &runtime, &report) == VX_STATUS_OK);
     status = compile_cuda(
@@ -551,6 +769,7 @@ int main(void) {
         (void)remove(weight_path);
         (void)remove(layernorm_path);
         (void)remove(qbatch_path);
+        (void)remove(scheduled_batch_path);
         puts("CUDA device unavailable; skipping CUDA public dynamic test");
         return 77;
     }
@@ -563,35 +782,251 @@ int main(void) {
               &preload_complete, &enforced, &replay_plan) == 0 &&
           reserved_allocations > 0 && span_count > 0 && preload_complete &&
           enforced && replay_plan == 0);
+    CHECK(vx_public_api_test_cuda_replay_resource_limits(
+              context, &replay_plan_capacity,
+              &replay_fixed_host_metadata) == 0 &&
+          replay_plan_capacity == 4u && replay_fixed_host_metadata > 0u);
     CHECK(vx_public_api_test_dynamic_shape_state(
               context, &resource_generation, &arena_capacity,
               &arena_high_water, &arena_grow_count) == 0 &&
           resource_generation == 0 && arena_capacity > 0 &&
           arena_high_water == arena_capacity && arena_grow_count == 1);
-    CHECK(execute_concat(context, small_a, 1, 0) == 0);
+    CHECK(cuda_replay_state(context, &replay_state) == 0 &&
+          replay_state.active_plan == PUBLIC_CUDA_REPLAY_EMPTY &&
+          replay_state.plans == 0u && replay_state.ready == 0u &&
+          replay_state.captures == 0u && replay_state.replays == 0u &&
+          !replay_state.last_replayed);
+    graph_api = replay_state.graph_api;
+
+    /* A new exact signature is observed, captured, and only then replayed.
+     * The third forward changes request data without changing any captured
+     * pointer or scalar shape argument. */
+    CHECK(execute_concat(context, batch_1_a, 1, 0, 0) == 0);
     CHECK(vx_public_api_test_cuda_dynamic_reservation(
               context, &current_allocations, NULL, NULL, NULL,
               &replay_plan) == 0 &&
-          current_allocations == reserved_allocations && replay_plan == 0);
+          current_allocations == reserved_allocations &&
+          replay_plan == (graph_api ? PUBLIC_CUDA_REPLAY_OBSERVED
+                                    : PUBLIC_CUDA_REPLAY_EMPTY));
+    CHECK(cuda_replay_state(context, &replay_state) == 0);
+    if (graph_api) {
+        CHECK(replay_state.active_plan == PUBLIC_CUDA_REPLAY_OBSERVED &&
+              replay_state.plans == 1u && replay_state.ready == 0u &&
+              replay_state.captures == 0u && replay_state.replays == 0u &&
+              !replay_state.last_replayed);
+    }
     CHECK(vx_public_api_test_dynamic_shape_state(
               context, NULL, &arena_capacity, &arena_high_water,
               &arena_grow_count) == 0 &&
           arena_high_water == arena_capacity && arena_grow_count == 1);
-    CHECK(execute_concat(context, small_same, 1, 1) == 0);
+    CHECK(execute_concat(context, batch_1_b, 1, 1, 0) == 0);
+    CHECK(cuda_replay_state(context, &replay_state) == 0);
+    if (graph_api) {
+        CHECK(replay_state.active_plan == PUBLIC_CUDA_REPLAY_READY &&
+              replay_state.plans == 1u && replay_state.ready == 1u &&
+              replay_state.captures == 1u && replay_state.replays == 0u &&
+              !replay_state.last_replayed);
+    }
+    CHECK(execute_concat(context, batch_1_c, 1, 1, graph_api ? 1 : 0) == 0);
+    CHECK(cuda_replay_state(context, &replay_state) == 0);
+    if (graph_api) {
+        CHECK(replay_state.active_plan == PUBLIC_CUDA_REPLAY_READY &&
+              replay_state.plans == 1u && replay_state.ready == 1u &&
+              replay_state.captures == 1u && replay_state.replays == 1u &&
+              replay_state.last_replayed);
+    }
+
+    /* The alternating direct-B1/scheduled-BN benchmark pattern must retain
+     * both graph executables. Returning B1 after B4 is an immediate replay,
+     * not a new observe/capture cycle. */
+    CHECK(execute_concat(context, batch_4_a, 4, 0, 0) == 0);
+    CHECK(execute_concat(context, batch_4_a, 4, 1, 0) == 0);
+    CHECK(execute_concat(context, batch_4_b, 4, 1, graph_api ? 1 : 0) == 0);
+    CHECK(cuda_replay_state(context, &replay_state) == 0);
+    if (graph_api) {
+        CHECK(replay_state.active_plan == PUBLIC_CUDA_REPLAY_READY &&
+              replay_state.plans == 2u && replay_state.ready == 2u &&
+              replay_state.captures == 2u && replay_state.replays == 2u &&
+              replay_state.last_replayed);
+    }
+    CHECK(execute_concat(
+              context, batch_1_a, 1, 1, graph_api ? 1 : 0) == 0);
+    CHECK(cuda_replay_state(context, &replay_state) == 0);
+    if (graph_api) {
+        CHECK(replay_state.active_plan == PUBLIC_CUDA_REPLAY_READY &&
+              replay_state.plans == 2u && replay_state.ready == 2u &&
+              replay_state.captures == 2u && replay_state.replays == 3u &&
+              replay_state.last_replayed);
+    }
+
+    /* Every global key mutation invalidates all retained shapes before the
+     * next forward and starts a safe direct OBSERVE pass. */
+    replay_checkpoint = replay_state;
+    CHECK(vx_public_api_test_cuda_invalidate_replay_key(context, 2) == 0);
+    CHECK(execute_concat(context, batch_1_b, 1, 1, 0) == 0);
+    CHECK(cuda_replay_state(context, &replay_state) == 0);
+    if (graph_api) {
+        CHECK(replay_state.slot_epoch != replay_checkpoint.slot_epoch &&
+              replay_state.active_plan == PUBLIC_CUDA_REPLAY_OBSERVED &&
+              replay_state.plans == 1u && replay_state.ready == 0u &&
+              replay_state.captures == replay_checkpoint.captures &&
+              replay_state.replays == replay_checkpoint.replays &&
+              replay_state.invalidations >=
+                  replay_checkpoint.invalidations + 2u &&
+              replay_state.graph_exec_destroys >=
+                  replay_checkpoint.graph_exec_destroys + 2u &&
+              !replay_state.last_replayed);
+    }
+    CHECK(execute_concat(context, batch_1_c, 1, 1, 0) == 0);
+    CHECK(execute_concat(
+              context, batch_1_a, 1, 1, graph_api ? 1 : 0) == 0);
+    CHECK(cuda_replay_state(context, &replay_state) == 0);
+    if (graph_api)
+        CHECK(replay_state.active_plan == PUBLIC_CUDA_REPLAY_READY &&
+              replay_state.ready == 1u && replay_state.last_replayed);
+
+    replay_checkpoint = replay_state;
+    CHECK(vx_public_api_test_cuda_invalidate_replay_key(context, 1) == 0);
+    CHECK(execute_concat(context, batch_1_b, 1, 1, 0) == 0);
+    CHECK(cuda_replay_state(context, &replay_state) == 0);
+    if (graph_api) {
+        CHECK(replay_state.active_plan == PUBLIC_CUDA_REPLAY_OBSERVED &&
+              replay_state.plans == 1u && replay_state.ready == 0u &&
+              replay_state.captures == replay_checkpoint.captures &&
+              replay_state.replays == replay_checkpoint.replays &&
+              replay_state.invalidations >
+                  replay_checkpoint.invalidations &&
+              replay_state.graph_exec_destroys ==
+                  replay_checkpoint.graph_exec_destroys + 1u &&
+              !replay_state.last_replayed);
+    }
+    CHECK(execute_concat(context, batch_1_c, 1, 1, 0) == 0);
+    CHECK(execute_concat(
+              context, batch_1_a, 1, 1, graph_api ? 1 : 0) == 0);
+    CHECK(cuda_replay_state(context, &replay_state) == 0);
+    if (graph_api)
+        CHECK(replay_state.active_plan == PUBLIC_CUDA_REPLAY_READY &&
+              replay_state.ready == 1u && replay_state.last_replayed);
+
+    replay_checkpoint = replay_state;
+    CHECK(vx_public_api_test_cuda_invalidate_replay_key(context, 3) == 0);
+    CHECK(execute_concat(context, batch_1_b, 1, 1, 0) == 0);
+    CHECK(cuda_replay_state(context, &replay_state) == 0);
+    if (graph_api) {
+        CHECK(replay_state.capacity_generation !=
+                  replay_checkpoint.capacity_generation &&
+              replay_state.active_plan == PUBLIC_CUDA_REPLAY_OBSERVED &&
+              replay_state.plans == 1u && replay_state.ready == 0u &&
+              replay_state.captures == replay_checkpoint.captures &&
+              replay_state.replays == replay_checkpoint.replays &&
+              replay_state.invalidations >
+                  replay_checkpoint.invalidations &&
+              replay_state.graph_exec_destroys ==
+                  replay_checkpoint.graph_exec_destroys + 1u &&
+              !replay_state.last_replayed);
+    }
+
+    /* Rebuild B1 and fill the bounded four-entry cache with B1..B4. A failed
+     * Driver destroy during B5 eviction must quarantine B1, execute B5
+     * directly, and preserve ownership without requesting a fifth GraphExec.
+     * The next B5 retries destruction before OBSERVE, then captures normally.
+     * Returning to evicted B1 must observe rather than launch stale work. */
+    CHECK(execute_concat(context, batch_1_c, 1, 1, 0) == 0);
+    CHECK(execute_concat(
+              context, batch_1_a, 1, 1, graph_api ? 1 : 0) == 0);
+    CHECK(execute_concat(context, batch_2, 2, 0, 0) == 0);
+    CHECK(execute_concat(context, batch_2, 2, 1, 0) == 0);
+    CHECK(execute_concat(context, batch_3, 3, 0, 0) == 0);
+    CHECK(execute_concat(context, batch_3, 3, 1, 0) == 0);
+    CHECK(execute_concat(context, batch_4_a, 4, 1, 0) == 0);
+    CHECK(execute_concat(context, batch_4_b, 4, 1, 0) == 0);
+    CHECK(cuda_replay_state(context, &replay_state) == 0);
+    if (graph_api)
+        CHECK(replay_state.plans == 4u && replay_state.ready == 4u &&
+              replay_state.destroy_pending == 0u &&
+              replay_state.active_plan == PUBLIC_CUDA_REPLAY_READY &&
+              !replay_state.last_replayed);
+    replay_checkpoint = replay_state;
+    if (graph_api)
+        CHECK(vx_public_api_test_cuda_fail_next_graph_exec_destroy(
+                  context) == 0);
+    CHECK(execute_concat(context, batch_5, 5, 0, 0) == 0);
+    CHECK(cuda_replay_state(context, &replay_state) == 0);
+    if (graph_api) {
+        CHECK(replay_state.plans == 3u && replay_state.ready == 3u &&
+              replay_state.destroy_pending == 1u &&
+              replay_state.active_plan == PUBLIC_CUDA_REPLAY_READY &&
+              replay_state.captures == replay_checkpoint.captures &&
+              replay_state.replays == replay_checkpoint.replays &&
+              replay_state.invalidations ==
+                  replay_checkpoint.invalidations + 1u &&
+              replay_state.graph_exec_destroys ==
+                  replay_checkpoint.graph_exec_destroys &&
+              !replay_state.last_replayed);
+    }
+    CHECK(execute_concat(context, batch_5, 5, 1, 0) == 0);
+    CHECK(cuda_replay_state(context, &replay_state) == 0);
+    if (graph_api) {
+        CHECK(replay_state.plans == 4u && replay_state.ready == 3u &&
+              replay_state.destroy_pending == 0u &&
+              replay_state.active_plan == PUBLIC_CUDA_REPLAY_OBSERVED &&
+              replay_state.captures == replay_checkpoint.captures &&
+              replay_state.replays == replay_checkpoint.replays &&
+              replay_state.invalidations ==
+                  replay_checkpoint.invalidations + 1u &&
+              replay_state.graph_exec_destroys ==
+                  replay_checkpoint.graph_exec_destroys + 1u &&
+              !replay_state.last_replayed);
+    }
+    CHECK(execute_concat(context, batch_5, 5, 1, 0) == 0);
+    CHECK(cuda_replay_state(context, &replay_state) == 0);
+    if (graph_api) {
+        CHECK(replay_state.plans == 4u && replay_state.ready == 4u &&
+              replay_state.destroy_pending == 0u &&
+              replay_state.active_plan == PUBLIC_CUDA_REPLAY_READY &&
+              replay_state.captures == replay_checkpoint.captures + 1u &&
+              replay_state.replays == replay_checkpoint.replays &&
+              replay_state.invalidations ==
+                  replay_checkpoint.invalidations + 1u &&
+              replay_state.graph_exec_destroys ==
+                  replay_checkpoint.graph_exec_destroys + 1u &&
+              !replay_state.last_replayed);
+    }
+    replay_checkpoint = replay_state;
+    CHECK(execute_concat(context, batch_1_b, 1, 0, 0) == 0);
+    CHECK(cuda_replay_state(context, &replay_state) == 0);
+    if (graph_api) {
+        CHECK(replay_state.plans == 4u && replay_state.ready == 3u &&
+              replay_state.destroy_pending == 0u &&
+              replay_state.active_plan == PUBLIC_CUDA_REPLAY_OBSERVED &&
+              replay_state.captures == replay_checkpoint.captures &&
+              replay_state.replays == replay_checkpoint.replays &&
+              replay_state.invalidations ==
+                  replay_checkpoint.invalidations + 1u &&
+              replay_state.graph_exec_destroys ==
+                  replay_checkpoint.graph_exec_destroys + 1u &&
+              !replay_state.last_replayed);
+    }
     CHECK(vx_public_api_test_cuda_dynamic_reservation(
               context, &current_allocations, NULL, NULL, NULL,
               &replay_plan) == 0 &&
-          current_allocations == reserved_allocations && replay_plan == 0);
-    CHECK(execute_concat(context, large, 4, 0) == 0);
-    CHECK(vx_public_api_test_cuda_dynamic_reservation(
-              context, &current_allocations, NULL, NULL, NULL,
-              &replay_plan) == 0 &&
-          current_allocations == reserved_allocations && replay_plan == 0);
-    CHECK(execute_concat(context, small_b, 1, 1) == 0);
-    CHECK(vx_public_api_test_cuda_dynamic_reservation(
-              context, &current_allocations, NULL, NULL, NULL,
-              &replay_plan) == 0 &&
-          current_allocations == reserved_allocations && replay_plan == 0);
+          current_allocations == reserved_allocations &&
+          replay_plan == (graph_api ? PUBLIC_CUDA_REPLAY_OBSERVED
+                                    : PUBLIC_CUDA_REPLAY_EMPTY));
+    replay_checkpoint = replay_state;
+    if (graph_api)
+        CHECK(vx_public_api_test_cuda_fail_next_graph_exec_destroy(
+                  context) == 0);
+    CHECK(vx_public_api_test_cuda_cleanup(context) == 0);
+    CHECK(cuda_replay_state(context, &replay_state) == 0);
+    if (graph_api) {
+        CHECK(replay_state.plans == 0u && replay_state.ready == 0u &&
+              replay_state.destroy_pending == 0u &&
+              replay_state.active_plan == PUBLIC_CUDA_REPLAY_EMPTY &&
+              replay_state.graph_exec_destroys ==
+              replay_checkpoint.graph_exec_destroys + 3u &&
+              !replay_state.last_replayed);
+    }
     CHECK(vx_execution_context_close(context, &report) == VX_STATUS_OK);
     vx_execution_context_release(context);
     vx_compiled_model_release(compiled);
@@ -599,6 +1034,7 @@ int main(void) {
 
     CHECK(run_public_layernorm_affines(runtime, layernorm_path) == 0);
     CHECK(run_public_qbatch(runtime, qbatch_path, weight_path) == 0);
+    CHECK(run_scheduled_cuda_batch(runtime, scheduled_batch_path) == 0);
 
     CHECK(rejected_domain(runtime, reject_path, softmax_reject_graph,
                           "softmax-last-axis-domain") == 0);
@@ -612,6 +1048,7 @@ int main(void) {
     CHECK(remove(reject_path) == 0);
     CHECK(remove(layernorm_path) == 0);
     CHECK(remove(qbatch_path) == 0);
+    CHECK(remove(scheduled_batch_path) == 0);
     puts("CUDA public dynamic shape tests passed");
     return 0;
 }

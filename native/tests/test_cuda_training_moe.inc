@@ -11,7 +11,7 @@ static int test_moe_linear_backward(void) {
     const float expert_bias[EXPERTS * D_OUT] = {
         0.5f, -0.5f, 1.0f, 2.0f,
     };
-    const float route_indices[ROWS * TOP_K] = {0.0f, 1.0f, 1.0f, 0.0f};
+    const float route_indices[ROWS * TOP_K] = {2.0f, 5.0f, 5.0f, 2.0f};
     const float route_weights[ROWS * TOP_K] = {0.75f, 0.25f, 0.4f, 0.6f};
     const float grad_output[ROWS * D_OUT] = {1.0f, -2.0f, 0.5f, 1.0f};
     const float input_delta[ROWS * D_IN] = {-3.0f, -2.25f, 1.7f, 2.9f};
@@ -27,26 +27,31 @@ static int test_moe_linear_backward(void) {
     float grad_expert_weight[EXPERTS * D_IN * D_OUT];
     float grad_expert_bias[EXPERTS * D_OUT];
     float grad_route_weights[ROWS * TOP_K];
-    uint32_t params[8] = {
-        ROWS, D_IN, D_OUT, EXPERTS, TOP_K, 1u, 0u, 0u,
+    const uint32_t slot_rows[6] = {
+        UINT32_MAX, UINT32_MAX, 0u, UINT32_MAX, UINT32_MAX, 1u,
     };
-    void* hosts[11] = {
+    const uint32_t row_slots[EXPERTS] = {2u, 5u};
+    uint32_t params[8] = {
+        ROWS, D_IN, D_OUT, EXPERTS, TOP_K, 1u, 6u, 0u,
+    };
+    void* hosts[13] = {
         (void*)input, (void*)expert_weight, (void*)expert_bias,
         (void*)route_indices, (void*)route_weights, (void*)grad_output,
         grad_input, grad_expert_weight, grad_expert_bias,
-        grad_route_weights, params,
+        grad_route_weights, (void*)slot_rows, (void*)row_slots, params,
     };
-    size_t bytes[11] = {
+    size_t bytes[13] = {
         sizeof(input), sizeof(expert_weight), sizeof(expert_bias),
         sizeof(route_indices), sizeof(route_weights), sizeof(grad_output),
         sizeof(grad_input), sizeof(grad_expert_weight),
-        sizeof(grad_expert_bias), sizeof(grad_route_weights), sizeof(params),
+        sizeof(grad_expert_bias), sizeof(grad_route_weights), sizeof(slot_rows),
+        sizeof(row_slots), sizeof(params),
     };
-    const unsigned char access[11] = {
-        1u, 1u, 1u, 1u, 1u, 1u, 3u, 3u, 3u, 3u, 1u,
+    const unsigned char access[13] = {
+        1u, 1u, 1u, 1u, 1u, 1u, 3u, 3u, 3u, 3u, 1u, 1u, 1u,
     };
-    const unsigned char is_weight[11] = {
-        0u, 1u, 1u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u,
+    const unsigned char is_weight[13] = {
+        0u, 1u, 1u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u,
     };
 
     cuda_graph_reset();
@@ -60,25 +65,25 @@ static int test_moe_linear_backward(void) {
         grad_route_weights[index] = -0.75f;
 
     CHECK(cuda_training_supports("moeLinearBackward", "input_main", bytes,
-                                 11, 1u, 1u, 1u));
+                                 13, 1u, 1u, 1u));
     CHECK(cuda_training_supports("moeLinearBackward", "weight_main", bytes,
-                                 11, 1u, 1u, 1u));
+                                 13, 1u, 1u, 1u));
     CHECK(cuda_training_supports("moeLinearBackward", "bias_main", bytes,
-                                 11, 1u, 1u, 1u));
+                                 13, 1u, 1u, 1u));
     CHECK(cuda_training_supports("moeLinearBackward", "route_main", bytes,
-                                 11, 1u, 1u, 1u));
+                                 13, 1u, 1u, 1u));
     CHECK(cuda_training_begin() == 0);
     CHECK(cuda_training_dispatch("moeLinearBackward", "input_main", hosts,
-                                 bytes, access, is_weight, 11,
+                                 bytes, access, is_weight, 13,
                                  1u, 1u, 1u) == 0);
     CHECK(cuda_training_dispatch("moeLinearBackward", "weight_main", hosts,
-                                 bytes, access, is_weight, 11,
+                                 bytes, access, is_weight, 13,
                                  1u, 1u, 1u) == 0);
     CHECK(cuda_training_dispatch("moeLinearBackward", "bias_main", hosts,
-                                 bytes, access, is_weight, 11,
+                                 bytes, access, is_weight, 13,
                                  1u, 1u, 1u) == 0);
     CHECK(cuda_training_dispatch("moeLinearBackward", "route_main", hosts,
-                                 bytes, access, is_weight, 11,
+                                 bytes, access, is_weight, 13,
                                  1u, 1u, 1u) == 0);
     CHECK(cuda_training_sync(grad_input, sizeof(grad_input)) == 0);
     CHECK(cuda_training_sync(grad_expert_weight,
@@ -292,24 +297,27 @@ static int test_moe_device_coherence_chain(void) {
     float unused_linear_grad_bias[EXPERTS * WIDTH] = {0.0f};
     float unused_router_grad_weight[WIDTH * EXPERTS] = {0.0f};
     float dummy_router_grad_bias[4] = {0.0f};
+    uint32_t dummy_slot_rows = 0u;
+    uint32_t dummy_row_slots = 0u;
     uint32_t linear_params[8] = {
         ROWS, WIDTH, WIDTH, EXPERTS, TOP_K, 1u, 0u, 0u,
     };
     uint32_t router_params[8] = {
         ROWS, WIDTH, EXPERTS, TOP_K, 1u, 0u, float_bits(1.0f), 0u,
     };
-    void* linear_hosts[11] = {
+    void* linear_hosts[13] = {
         (void*)linear_input, (void*)expert_weight, (void*)expert_bias,
         (void*)route_indices, (void*)route_weights, (void*)grad_output,
         unused_linear_grad_input, unused_linear_grad_weight,
-        unused_linear_grad_bias, grad_route_weights, linear_params,
+        unused_linear_grad_bias, grad_route_weights, &dummy_slot_rows,
+        &dummy_row_slots, linear_params,
     };
-    size_t linear_bytes[11] = {
+    size_t linear_bytes[13] = {
         sizeof(linear_input), sizeof(expert_weight), sizeof(expert_bias),
         sizeof(route_indices), sizeof(route_weights), sizeof(grad_output),
         sizeof(unused_linear_grad_input), sizeof(unused_linear_grad_weight),
         sizeof(unused_linear_grad_bias), sizeof(grad_route_weights),
-        sizeof(linear_params),
+        sizeof(dummy_slot_rows), sizeof(dummy_row_slots), sizeof(linear_params),
     };
     void* router_hosts[11] = {
         (void*)router_input, (void*)router_weight, dummy_router_bias,
@@ -324,6 +332,12 @@ static int test_moe_device_coherence_chain(void) {
         sizeof(router_grad_input), sizeof(unused_router_grad_weight),
         sizeof(dummy_router_grad_bias), sizeof(router_params),
     };
+    const unsigned char linear_access[13] = {
+        1u, 1u, 1u, 1u, 1u, 1u, 3u, 3u, 3u, 3u, 1u, 1u, 1u,
+    };
+    const unsigned char linear_is_weight[13] = {
+        0u, 1u, 1u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u,
+    };
     const unsigned char access[11] = {
         1u, 1u, 1u, 1u, 1u, 1u, 3u, 3u, 3u, 3u, 1u,
     };
@@ -334,8 +348,8 @@ static int test_moe_device_coherence_chain(void) {
     cuda_graph_reset();
     CHECK(cuda_training_begin() == 0);
     CHECK(cuda_training_dispatch("moeLinearBackward", "route_main",
-                                 linear_hosts, linear_bytes, access, is_weight,
-                                 11, 1u, 1u, 1u) == 0);
+                                 linear_hosts, linear_bytes, linear_access,
+                                 linear_is_weight, 13, 1u, 1u, 1u) == 0);
     /* Intentionally no sync: router binding 5 must reuse the device-written
      * route gradient instead of uploading the still-zero host buffer. */
     CHECK(cuda_training_dispatch("moeRouterBackward", "logit_main",
@@ -364,23 +378,28 @@ static int test_moe_device_coherence_chain(void) {
 
 static int test_moe_backward_descriptors(void) {
     float linear_storage[10][4] = {{0.0f}};
+    uint32_t linear_slot_rows = 0u;
+    uint32_t linear_row_slots = 0u;
     uint32_t linear_params[8] = {1u, 1u, 1u, 1u, 1u, 1u, 0u, 0u};
-    void* linear_hosts[11];
-    size_t linear_bytes[11] = {
+    void* linear_hosts[13];
+    size_t linear_bytes[13] = {
         sizeof(float), sizeof(float), sizeof(float), sizeof(float),
         sizeof(float), sizeof(float), sizeof(float), sizeof(float),
-        sizeof(float), sizeof(float), sizeof(linear_params),
+        sizeof(float), sizeof(float), sizeof(linear_slot_rows),
+        sizeof(linear_row_slots), sizeof(linear_params),
     };
-    unsigned char access[11] = {
-        1u, 1u, 1u, 1u, 1u, 1u, 3u, 3u, 3u, 3u, 1u,
+    unsigned char access[13] = {
+        1u, 1u, 1u, 1u, 1u, 1u, 3u, 3u, 3u, 3u, 1u, 1u, 1u,
     };
-    unsigned char is_weight[11] = {0u};
+    unsigned char is_weight[13] = {0u};
     float linear_original[4][4];
-    size_t malformed_bytes[11];
+    size_t malformed_bytes[13];
 
     for (int binding = 0; binding < 10; ++binding)
         linear_hosts[binding] = linear_storage[binding];
-    linear_hosts[10] = linear_params;
+    linear_hosts[10] = &linear_slot_rows;
+    linear_hosts[11] = &linear_row_slots;
+    linear_hosts[12] = linear_params;
     for (int destination = 0; destination < 4; ++destination) {
         for (int index = 0; index < 4; ++index)
             linear_storage[6 + destination][index] =
@@ -390,28 +409,28 @@ static int test_moe_backward_descriptors(void) {
     }
 
     CHECK(cuda_training_supports("moeLinearBackward", "input_main",
-                                 linear_bytes, 11, 1u, 1u, 1u));
+                                 linear_bytes, 13, 1u, 1u, 1u));
     CHECK(!cuda_training_supports("moeLinearBackward", "invalid",
-                                  linear_bytes, 11, 1u, 1u, 1u));
+                                  linear_bytes, 13, 1u, 1u, 1u));
     CHECK(!cuda_training_supports("moeLinearBackward", "input_main",
-                                  linear_bytes, 10, 1u, 1u, 1u));
+                                  linear_bytes, 12, 1u, 1u, 1u));
     CHECK(!cuda_training_supports("moeLinearBackward", "input_main",
-                                  linear_bytes, 11, 1u, 2u, 1u));
+                                  linear_bytes, 13, 1u, 2u, 1u));
     memcpy(malformed_bytes, linear_bytes, sizeof(linear_bytes));
-    malformed_bytes[10] -= sizeof(uint32_t);
+    malformed_bytes[12] -= sizeof(uint32_t);
     CHECK(!cuda_training_supports("moeLinearBackward", "input_main",
-                                  malformed_bytes, 11, 1u, 1u, 1u));
+                                  malformed_bytes, 13, 1u, 1u, 1u));
     memcpy(malformed_bytes, linear_bytes, sizeof(linear_bytes));
     malformed_bytes[4] += sizeof(float);
     CHECK(!cuda_training_supports("moeLinearBackward", "route_main",
-                                  malformed_bytes, 11, 1u, 1u, 1u));
+                                  malformed_bytes, 13, 1u, 1u, 1u));
 
     cuda_graph_reset();
     access[6] = 1u;
     CHECK(cuda_training_begin() == 0);
     CHECK(cuda_training_dispatch("moeLinearBackward", "input_main",
                                  linear_hosts, linear_bytes, access, is_weight,
-                                 11, 1u, 1u, 1u) != 0);
+                                 13, 1u, 1u, 1u) != 0);
     cuda_training_end();
     access[6] = 3u;
     for (int destination = 0; destination < 4; ++destination)
@@ -424,7 +443,7 @@ static int test_moe_backward_descriptors(void) {
     CHECK(cuda_training_begin() == 0);
     CHECK(cuda_training_dispatch("moeLinearBackward", "input_main",
                                  linear_hosts, linear_bytes, access, is_weight,
-                                 11, 1u, 1u, 1u) != 0);
+                                 13, 1u, 1u, 1u) != 0);
     cuda_training_end();
     is_weight[10] = 0u;
 
@@ -433,7 +452,7 @@ static int test_moe_backward_descriptors(void) {
     CHECK(cuda_training_begin() == 0);
     CHECK(cuda_training_dispatch("moeLinearBackward", "input_main",
                                  linear_hosts, linear_bytes, access, is_weight,
-                                 11, 1u, 1u, 1u) != 0);
+                                 13, 1u, 1u, 1u) != 0);
     cuda_training_end();
     linear_params[4] = 1u;
 
@@ -442,15 +461,36 @@ static int test_moe_backward_descriptors(void) {
     CHECK(cuda_training_begin() == 0);
     CHECK(cuda_training_dispatch("moeLinearBackward", "weight_main",
                                  linear_hosts, linear_bytes, access, is_weight,
-                                 11, 1u, 1u, 1u) != 0);
+                                 13, 1u, 1u, 1u) != 0);
     cuda_training_end();
     linear_params[7] = 0u;
+
+    {
+        uint32_t slot_rows[3] = {UINT32_MAX, UINT32_MAX, 0u};
+        uint32_t inconsistent_row_slots[1] = {1u};
+        linear_params[6] = 3u;
+        linear_hosts[10] = slot_rows;
+        linear_hosts[11] = inconsistent_row_slots;
+        linear_bytes[10] = sizeof(slot_rows);
+        linear_bytes[11] = sizeof(inconsistent_row_slots);
+        cuda_graph_reset();
+        CHECK(cuda_training_begin() == 0);
+        CHECK(cuda_training_dispatch("moeLinearBackward", "input_main",
+                                     linear_hosts, linear_bytes, access,
+                                     is_weight, 13, 1u, 1u, 1u) != 0);
+        cuda_training_end();
+        linear_params[6] = 0u;
+        linear_hosts[10] = &linear_slot_rows;
+        linear_hosts[11] = &linear_row_slots;
+        linear_bytes[10] = sizeof(linear_slot_rows);
+        linear_bytes[11] = sizeof(linear_row_slots);
+    }
 
     cuda_graph_reset();
     CHECK(cuda_training_begin() == 0);
     CHECK(cuda_training_dispatch("moeLinearBackward", "input_main",
                                  linear_hosts, linear_bytes, access, is_weight,
-                                 11, 2u, 1u, 1u) != 0);
+                                 13, 2u, 1u, 1u) != 0);
     cuda_training_end();
 
     {
@@ -466,7 +506,7 @@ static int test_moe_backward_descriptors(void) {
         CHECK(cuda_training_begin() == 0);
         CHECK(cuda_training_dispatch("moeLinearBackward", "bias_main",
                                      linear_hosts, linear_bytes, access,
-                                     is_weight, 11, 1u, 1u, 1u) != 0);
+                                     is_weight, 13, 1u, 1u, 1u) != 0);
         cuda_training_end();
         CHECK(memcmp(dummy_grad_bias, original_dummy,
                      sizeof(dummy_grad_bias)) == 0);

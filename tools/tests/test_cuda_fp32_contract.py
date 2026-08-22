@@ -64,7 +64,6 @@ class CudaFp32BuildContractTests(unittest.TestCase):
             "-DVOLVOXAI_ENABLE_OPENGL=OFF",
             "-DVOLVOXAI_ENABLE_CUDA=ON",
             "-DVOLVOXAI_ENABLE_METAL=OFF",
-            "-DVOLVOXAI_ENABLE_NNAPI=OFF",
             "-DCMAKE_EXPORT_COMPILE_COMMANDS=ON",
         ]
         if fast_fp32:

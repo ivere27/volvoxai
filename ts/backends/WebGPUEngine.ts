@@ -14,12 +14,15 @@ import type {
 import type { RuntimeGraph } from '../core/RuntimeGraph.js';
 import type { RuntimeDType, RuntimeTypedArray } from '../types.js';
 import type { ExecutorGraph } from './WebGPUContracts.js';
+import type { WebGPUInvariantWeightBorrow } from './WebGPUContracts.js';
 
 export interface WebGPUEngineOptions {
   shaderLibrary?: GraphExecutorOptions['shaderLibrary'];
   adapterInfo?: WebGPUAdapterIdentity | null;
   /** @internal Shared model-independent state for context forks. */
   deviceState?: WebGPUDeviceState | null;
+  /** @internal Borrow-only compiled-model invariant device weights. */
+  invariantWeightBorrow?: WebGPUInvariantWeightBorrow | null;
 }
 
 export interface WebGPUAdapterIdentity {
@@ -61,6 +64,7 @@ export class WebGPUEngine extends BackendEngine {
   declare _graph: RuntimeGraph | null;
   declare _disposed: boolean;
   declare readonly adapterInfo: Readonly<WebGPUAdapterIdentity> | null;
+  declare readonly invariantWeightBorrow: WebGPUInvariantWeightBorrow | null;
 
   constructor(
     device: GPUDevice,
@@ -68,6 +72,7 @@ export class WebGPUEngine extends BackendEngine {
       shaderLibrary = null,
       adapterInfo = null,
       deviceState = null,
+      invariantWeightBorrow = null,
     }: WebGPUEngineOptions = {},
   ) {
     super('webgpu', {
@@ -85,6 +90,7 @@ export class WebGPUEngine extends BackendEngine {
     // GPUAdapterInfo fields are prototype getters in several implementations
     // (including Deno/wgpu), so an object spread would silently erase them.
     this.adapterInfo = normalizeAdapterIdentity(adapterInfo);
+    this.invariantWeightBorrow = invariantWeightBorrow;
     this.executor = null;
     this._graph = null;
     this._disposed = false;
@@ -102,12 +108,13 @@ export class WebGPUEngine extends BackendEngine {
   }
 
   /** Create an unallocated peer that shares the device but owns independent graph state. */
-  fork(): WebGPUEngine {
+  fork(invariantWeightBorrow: WebGPUInvariantWeightBorrow | null = this.invariantWeightBorrow): WebGPUEngine {
     if (this._disposed) throw new Error('WebGPUEngine is disposed.');
     return new WebGPUEngine(this.device, {
       shaderLibrary: this.shaderLibrary,
       adapterInfo: this.adapterInfo,
       deviceState: this.deviceState,
+      invariantWeightBorrow,
     });
   }
 
@@ -115,6 +122,7 @@ export class WebGPUEngine extends BackendEngine {
     return new GraphExecutor(this.device, graph, {
       shaderLibrary: this.shaderLibrary,
       deviceState: this.deviceState,
+      invariantWeightBorrow: this.invariantWeightBorrow,
     });
   }
 
@@ -301,7 +309,7 @@ export class WebGPUEngine extends BackendEngine {
     return this.executor.readBufferRange(gpuBuffer, byteOffset, sizeBytes, dtype);
   }
 
-  snapshotOutputs(): ReadonlyMap<string, WebGPUOutputSnapshot> {
+  snapshotOutputs(): Promise<ReadonlyMap<string, WebGPUOutputSnapshot>> {
     if (!this.executor) throw new Error('WebGPUEngine.snapshotOutputs requires an allocated graph.');
     return this.executor.snapshotOutputs();
   }

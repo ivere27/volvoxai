@@ -1,5 +1,5 @@
 /*
- * Native-only ARM acceleration for the canonical physical W8A8 QLinear ABI.
+ * Native-only ARM acceleration for the canonical W8A8 QLinear ABI.
  *
  * This translation unit is deliberately baseline-safe: it uses only NEON when
  * the compiler target exposes it, and its optional SDOT implementation is in
@@ -66,10 +66,10 @@ static int vx_qlinear_i8u8_arm_neon_try(const VxW8A8ArmQLinearArgs* args) {
             vst1q_s32(lanes, high_sums);
             for (uint32_t lane = 0; lane < 4u; lane++) accumulator += lanes[lane];
             for (; dimension < args->d_in; dimension++) {
-                int32_t input_value = vx_w8a8_arm_byte_value(args->input, args->input_dtype,
-                                                              input_offset + dimension);
-                int32_t weight_value = vx_w8a8_arm_byte_value(args->weight, args->weight_dtype,
-                                                               weight_offset + dimension);
+                int32_t input_value = vx_w8a8_byte_value(args->input, args->input_dtype,
+                                                          input_offset + dimension);
+                int32_t weight_value = vx_w8a8_byte_value(args->weight, args->weight_dtype,
+                                                           weight_offset + dimension);
                 accumulator += (int64_t)(input_value - args->input_zero_point) *
                     (int64_t)(weight_value - args->weight_zero_points[column]);
             }
@@ -78,10 +78,10 @@ static int vx_qlinear_i8u8_arm_neon_try(const VxW8A8ArmQLinearArgs* args) {
                 const float multiplier = product_scale / args->output_scale;
                 const float scaled = (float)accumulator * multiplier;
                 const float transformed = scaled + (float)args->output_zero_point;
-                int32_t quantized = vx_w8a8_arm_quantize_transformed(transformed,
+                int32_t quantized = vx_w8a8_requantize(transformed,
                     output_minimum, output_maximum, args->output_zero_point);
-                vx_w8a8_arm_store_byte(args->output, args->output_dtype,
-                                        output_offset + column, quantized);
+                vx_w8a8_store_byte(args->output, args->output_dtype,
+                                    output_offset + column, quantized);
             }
         }
     }
@@ -103,6 +103,7 @@ int vx_qlinear_i8u8_arm_try(const void* input, const void* weight,
         output_zero_point, input_dtype, weight_dtype, output_dtype,
     };
 #if VX_W8A8_ARM_NEON
+    if (!vx_kernel_platform()->has_neon) return 0;
     if (!vx_w8a8_arm_eligible(&args, 8u)) return 0;
 #if VX_W8A8_ARM_HAS_DOTPROD_OBJECT && (defined(__linux__) || defined(__ANDROID__))
     if (vx_kernel_platform()->has_arm_dotprod && vx_qlinear_i8u8_arm_dotprod_try(&args)) return 1;

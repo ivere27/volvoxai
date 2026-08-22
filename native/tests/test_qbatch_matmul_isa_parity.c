@@ -1,21 +1,15 @@
 /*
- * Byte-exact parity of every ISA tier the host can run, for QBatchMatMul.
+ * Byte-exact parity of every executable QBatchMatMul ISA tier.
  *
- * test_qlinear_isa_parity covers the QLinear and QConv dispatchers; QBatchMatMul
- * had no equivalent, and it is the operator static-INT8 graphs use for score
- * and other dynamic matrix products.  Its allocation-free AVX2 edge kernel uses
- * _mm256_maddubs_epi16 and must split the unsigned operand to avoid its
- * saturating I16 intermediate.  The multi-row kernel instead packs centered
- * I16 pairs and uses _mm256_madd_epi16; both paths must remain identical to
+ * The x86 path uses centered-I16 AVX2 packing, while Arm I8MM packs bounded
+ * K8xN8 signed-byte panels and applies exact affine compensation after SMMLA.
+ * Shapes cover vector boundaries, ragged K/N, TinyReceipt attention matrices,
+ * and reductions large enough to expose a saturating intermediate.  Operands
+ * span the complete byte domain so every optimized path is compared against
  * the portable I32 accumulation and affine requantization contract.
  *
- * Shapes therefore straddle the reduction lengths where saturation becomes
- * reachable, and operand values include the full byte range rather than a small
- * centered band, because a mid-range-only test cannot reach the saturation
- * bound at all.
- *
  * VOLVOXAI_CPU_ISA lets one binary walk every tier the host supports; the
- * printed tier list is part of the result, not decoration.
+ * printed tier list is part of the result.
  */
 #include "../src/kernels/inference_kernels.h"
 #include "../src/kernels/kernel_platform.h"
@@ -46,11 +40,47 @@ static const Shape SHAPES[] = {
     {  1,  16,  16 }, {  1,  32,  32 }, {  1,  40,  40 }, {  4,  32,  64 },
     {  7,  31,  17 }, {  8,  64,  64 }, { 12,  40, 251 }, { 16,  40,  40 },
     { 17,  65,  33 }, { 32, 128, 128 }, { 41, 210,  40 }, { 64, 320, 320 },
-    /* The centered ABI is still I32-safe here, while the old raw U8xI8
+    /* TinyReceipt attention score and dynamic projection shapes.  The first
+     * also covers an N tail after full N8 I8MM blocks. */
+    { 218,  40, 218 }, { 218, 218,  40 },
+    { 218, 320,  64 }, { 218,  64, 320 },
+    /* The centered ABI is still I32-safe here, while the raw U8xI8 edge
      * compensation bound is not.  This proves the centered-I16 packed route
      * does not accidentally inherit the edge kernel's narrower predicate. */
     {  4, 70000, 16 },
 };
+
+static int workspace_contract(void) {
+#if defined(VOLVOXAI_ARM_I8MM_OBJECT) && defined(__aarch64__)
+    const size_t attention =
+        vx_qbatch_matmul_i8u8_native_workspace_bytes(218u, 40u, 218u);
+    const size_t projection_wide =
+        vx_qbatch_matmul_i8u8_native_workspace_bytes(218u, 320u, 64u);
+    const size_t projection_tall =
+        vx_qbatch_matmul_i8u8_native_workspace_bytes(218u, 64u, 320u);
+    const size_t attention_projection =
+        vx_qbatch_matmul_i8u8_native_workspace_bytes(218u, 218u, 40u);
+    const size_t largest_panel =
+        vx_qbatch_matmul_i8u8_native_workspace_bytes(4u, 8184u, 4096u);
+    const size_t over_limit =
+        vx_qbatch_matmul_i8u8_native_workspace_bytes(4u, 8192u, 4096u);
+    const size_t ragged_k =
+        vx_qbatch_matmul_i8u8_native_workspace_bytes(4u, 31u, 64u);
+    if (attention != 2816u || projection_wide != 20736u ||
+        projection_tall != 4352u || attention_projection != 9120u ||
+        ragged_k != 2304u || !largest_panel ||
+        largest_panel > 64u * 1024u || over_limit != 0u ||
+        vx_qbatch_matmul_i8u8_native_workspace_bytes(1u, 320u, 64u) != 0u) {
+        printf("qbatch_matmul I8MM workspace contract FAILED: "
+               "attention=%zu projection=%zu wide=%zu tall=%zu "
+               "ragged=%zu max=%zu over=%zu\n",
+               attention, attention_projection, projection_wide,
+               projection_tall, ragged_k, largest_panel, over_limit);
+        return 1;
+    }
+#endif
+    return 0;
+}
 
 typedef struct {
     uint32_t a_dtype, b_dtype, output_dtype;
@@ -167,6 +197,8 @@ static const IsaTier TIERS[] = {
     { "avx512vnni", VX_KERNEL_ISA_AVX512_VNNI },
     { "neon", VX_KERNEL_ISA_NEON },
     { "neondotprod", VX_KERNEL_ISA_NEON_DOTPROD },
+    { "neoni8mm", VX_KERNEL_ISA_NEON_I8MM },
+    { "sve2", VX_KERNEL_ISA_SVE2 },
 };
 
 static const IsaTier* find_tier(const char* name) {
@@ -184,6 +216,8 @@ static int host_supports_tier(const VxKernelPlatform* host,
         case VX_KERNEL_ISA_AVX512_VNNI: return host->has_avx512_vnni;
         case VX_KERNEL_ISA_NEON: return host->has_neon;
         case VX_KERNEL_ISA_NEON_DOTPROD: return host->has_arm_dotprod;
+        case VX_KERNEL_ISA_NEON_I8MM: return host->has_arm_i8mm;
+        case VX_KERNEL_ISA_SVE2: return host->has_arm_sve2;
         default: return isa == VX_KERNEL_ISA_BASELINE;
     }
 }
@@ -191,6 +225,7 @@ static int host_supports_tier(const VxKernelPlatform* host,
 int main(int argc, char** argv) {
     VxKernelPlatform platform;
     vx_kernel_platform_resolve(&platform);
+    g_failures += workspace_contract();
 
     const char* pinned = getenv("VOLVOXAI_CPU_ISA");
     if (pinned && pinned[0]) {

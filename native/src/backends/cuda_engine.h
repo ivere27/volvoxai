@@ -33,6 +33,8 @@ typedef struct CudaDomainLimits {
     uint32_t maximum_threads_per_block;
     uint32_t maximum_shared_memory_per_block;
     uint32_t maximum_tensor_slots;
+    uint32_t replay_plan_capacity;
+    uint64_t replay_fixed_host_metadata_bytes;
 } CudaDomainLimits;
 
 int cuda_query_domain_limits(CudaDomainLimits* limits);
@@ -108,10 +110,17 @@ int cuda_graph_qbatch_matmul_i8u8(
     float b_scale, int32_t b_zero_point, uint32_t b_dtype,
     void* output, const int* output_shape, int output_rank,
     float output_scale, int32_t output_zero_point, uint32_t output_dtype);
-/* Append context-local physical QBatchMatMul tactic counters to route
- * evidence. Counts are packed groups of four and scalar K-tail values. */
+/* Emit the mandatory compact proof for the most recently completed physical
+ * forward. Replay is true only after a cached graph launch and its stream
+ * synchronization both succeeded. */
+int cuda_graph_execution_evidence(char* output,
+                                  size_t output_capacity);
+/* Append context-local replay-cache and physical QBatchMatMul tactic counters
+ * to route evidence. Counts are packed groups of four and scalar K-tail
+ * values. */
 int cuda_graph_append_dynamic_telemetry(char* output,
                                         size_t output_capacity);
+int cuda_graph_last_forward_replayed(void);
 /* F32 ArgMax emits the first matching I32 index for every [outer,inner]
  * coordinate in a flattened [outer,axis,inner] view. */
 int cuda_graph_argmax_f32(const float* input, int32_t* output,
@@ -450,6 +459,11 @@ int cuda_graph_qsdpa_range_i8u8(const void* query, const void* key,
                                 uint32_t output_dtype, uint32_t causal,
                                 uint32_t mask_mode, uint32_t query_start,
                                 uint32_t query_count);
+int cuda_graph_row_index_transfer(const void* source, size_t source_bytes,
+                                  const int32_t* indices, uint32_t rows,
+                                  void* destination, size_t destination_bytes,
+                                  uint32_t row_words, uint32_t indexed_rows,
+                                  uint32_t mode);
 int cuda_graph_qargmax_i8u8(const void* input, int32_t* output,
                             uint32_t outer, uint32_t axis_size,
                             uint32_t inner, uint32_t input_dtype);
@@ -636,11 +650,17 @@ typedef struct {
     uint64_t slot_epoch;
     uint64_t replay_shape_generation;
     uint64_t replay_capacity_generation;
+    uint64_t replay_slot_epoch;
     size_t active_capacity_bytes;
     size_t pooled_capacity_bytes;
+    size_t replay_plan_count;
+    size_t replay_ready_plan_count;
+    size_t replay_destroy_pending_count;
     int slot_count;
     int replay_plan;
     int exact_signature_match;
+    int replay_exact_signature_match;
+    int replay_domain_enforced;
 } CudaGraphDynamicStateProbe;
 uintptr_t cuda_test_context_state_identity(void);
 void cuda_test_context_state_set_probe(uint64_t value);
@@ -676,10 +696,15 @@ uint64_t cuda_test_graph_capture_count(void);
 uint64_t cuda_test_graph_launch_count(void);
 uint64_t cuda_test_graph_replay_count(void);
 uint64_t cuda_test_graph_invalidation_count(void);
+uint64_t cuda_test_graph_exec_destroy_count(void);
 uint64_t cuda_test_slot_exact_lookup_count(void);
 uint64_t cuda_test_slot_hash_probe_count(void);
 uint64_t cuda_test_slot_containing_scan_count(void);
 uint64_t cuda_test_graph_allocation_count(void);
+void cuda_test_advance_graph_slot_epoch(void);
+void cuda_test_advance_graph_capacity_generation(void);
+void cuda_test_mismatch_graph_replay_model_generation(void);
+void cuda_test_fail_next_graph_exec_destroy(void);
 int cuda_test_graph_domain_reservation(size_t* span_count,
                                        int* preload_complete,
                                        int* enforced,

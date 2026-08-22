@@ -43,7 +43,19 @@ GPT-2/3/4, LLaMA, and Mistral — those are this graph, scaled up.
 | `n_heads` | **16** | Attention heads per block (so `head_dim = 64/16 = 4`). |
 | `d_mlp` | **256** | Width of the feed-forward hidden layer (`4 × d_model`). |
 | `vocab` | **50257** | Number of distinct tokens it knows (GPT-2 vocabulary). |
-| `context` | **256** | Max tokens it can look at in one pass. |
+| `S` | **1 … 256** | Sequence length. Not a fixed number — a *range*. |
+
+🔧 That last row is different in kind from the others. `d_model` and `n_layers` are baked into the
+weights; `S` is a **dimension symbol** declared in `graph.json`:
+
+```json
+"dimensions": { "S": { "min": 1, "max": 256 } }
+```
+
+You give the model however many tokens you actually have, from 1 to 256, and `S` takes that value
+for the whole run. Every shape in the rest of this chapter is written with `S` in it for that
+reason — `[1, S, 64]`, not `[1, 256, 64]`. Chapter 8 covers how one compiled model serves every
+length in that range.
 
 > The folder is called `tinystories_1m` (~1M transformer parameters), but `model.safetensors`
 > is ~27 MB. Why? The **token embedding table** is `50257 × 64 ≈ 3.2M` numbers, and there are
@@ -121,8 +133,13 @@ positions = [   0,    1,   2,   3,  4,     5, …]     ← "which slot am I?"
 ```
 
 Two integer tensors go into the graph: **`tokens`** (what the words are) and **`positions`**
-(their order, `0,1,2,…`). Both are shape `[1, 256]` — the sequence is padded to the 256-token
-context window.
+(their order, `0,1,2,…`). Both are shape `[1, S]`. Our six-token prompt binds `S = 6`, so both
+tensors really are six long — **there is no padding out to 256**. Writing `S` in both means the
+engine also checks they match: six tokens with five positions is rejected before any kernel runs.
+
+> 🌱 **Why this matters.** Imagine a form with 256 blank lines that you must fill in even when your
+> answer is six words — then someone has to read all 256 lines. Padding is exactly that: fake work on
+> fake data. Telling the model "this one is six" instead lets it do six lines of work.
 
 > 🔬 **Under the hood: byte-level BPE.** BPE starts from the 256 raw **bytes** as base tokens, so no
 > input is ever "unknown" — worst case, a rare character is spelled out one byte at a time. A
@@ -168,12 +185,17 @@ for (let i = 0; i < seq_len; i++) {
 The weight `wte.weight` is the `[50257, 64]` table; row `token_id` *is* that token's meaning
 vector. It runs **twice**:
 
-- `Embedding(tokens, wte)` → `emb_tok` `[1,256,64]` — *what* each token is.
-- `Embedding(positions, wpe)` → `emb_pos` `[1,256,64]` — *where* it is.
+- `Embedding(tokens, wte)` → `emb_tok` `[1,S,64]` — *what* each token is.
+- `Embedding(positions, wpe)` → `emb_pos` `[1,S,64]` — *where* it is.
 
-Then `Add` fuses them: `hidden_0 = emb_tok + emb_pos`. Now every one of the 256 slots holds a
-64-number vector that mixes *word identity* and *position*. This tensor, `hidden_0 [1,256,64]`,
+Then `Add` fuses them: `hidden_0 = emb_tok + emb_pos`. Now every one of the `S` slots holds a
+64-number vector that mixes *word identity* and *position*. This tensor, `hidden_0 [1,S,64]`,
 is the **residual stream** — the "conveyor belt" that every block reads from and writes back to.
+
+🔧 Note where `S` came from. Nobody wrote `S = 6` into `emb_tok`'s descriptor — the graph declares
+`emb_tok` as `[1,"S",64]`, and `S` was **bound once** when `tokens` arrived with six entries. The
+same binding then flows through all 85 nodes. That is the payoff of naming the symbol instead of
+just bounding it.
 
 > 🔬 **Under the hood: gather now, scatter later.** `Embedding` is a pure **gather** — copy row
 > `token_id` out of the table — so it does zero arithmetic. Its training twin is the reverse, a
@@ -183,7 +205,7 @@ is the **residual stream** — the "conveyor belt" that every block reads from a
 > distinct — which, from the note above, is most of the 27 MB.
 
 ```
-hidden_0:  256 rows (one per token position), each a 64-number vector
+hidden_0:  S rows (one per token position), each a 64-number vector
 
  pos 0 "Once"  [ 0.12, -0.4, ...(64) ]
  pos 1 " upon" [-0.03,  0.9, ...(64) ]
@@ -245,7 +267,7 @@ out[j] = (in[j] - mean) * inv_std * weight[j] + bias[j]; // normalize, then re-s
 > listening. That softmax is the *only* step in attention that isn't a plain multiply-and-add.
 
 🔧 This is the heart of a transformer. First a single `MatMul` projects each 64-vector up to **192**
-numbers (`qkv_proj`, shape `[1,256,192]`). Those 192 are three 64-vectors glued together: the
+numbers (`qkv_proj`, shape `[1,S,192]`). Those 192 are three 64-vectors glued together: the
 **Query**, **Key**, and **Value** (Q, K, V). Intuition:
 
 - **Query** = "what am I looking for?"
@@ -334,7 +356,7 @@ out[i] = 0.5 * x * (1 + tanh(0.7978845608 * (x + 0.044715 * x*x*x)));   // the G
 > of linear maps is still one linear map — `A(Bx) = (AB)x` — so without a GELU-like bend the entire
 > 8-block tower would collapse into a single matrix and could only draw straight lines.
 
-The block's output `hidden_next [1,256,64]` has the same shape as its input — which is exactly
+The block's output `hidden_next [1,S,64]` has the same shape as its input — which is exactly
 why we can stack **8** of them. Each block reads the stream and writes a slightly smarter version
 back.
 
@@ -351,19 +373,28 @@ head** — a single `MatMul` by `lm_head.weight [50257, 64]` — turns each 64-v
 scores**, one per vocabulary word:
 
 ```
-final_norm [1,256,64]  ──MatMul lm_head──▶  logits [1,256,50257]
+final_norm [1,S,64]  ──MatMul lm_head──▶  logits [1,S,50257]
 ```
 
 These raw scores are called **logits**. `logits[0, p, w]` = "how strongly the model, having read
-tokens `0..p`, expects word `w` to come next." We only care about the row for the **last real
-token** — that's the prediction for what comes after the prompt.
+tokens `0..p`, expects word `w` to come next." We only care about the row for the **last** token —
+that's the prediction for what comes after the prompt.
 
-> 🔬 **Under the hood: 256 rows computed, one row used.** The head produces `logits [1, 256, 50257]`,
-> but generation reads only the row of the **last real token** — so at decode time 255 of those 256
-> rows are wasted work. That is exactly why the native row APIs (§2.8) compute the head for just the
-> new row. `lm_head` is a bias-free `MatMul` by a `[50257, 64]` matrix; multiplying one 64-vector
-> against 50257 rows is the single biggest matmul in the forward pass, so the vocabulary size drives
-> both the file size *and* the per-token compute.
+> 🔬 **Under the hood: two different kinds of waste, and only one is left.** `lm_head` is a bias-free
+> `MatMul` by a `[50257, 64]` matrix — multiplying one 64-vector against 50257 rows is the single
+> biggest matmul in the forward pass, so the vocabulary drives both the file size *and* the per-token
+> compute. That makes it worth asking how many rows we actually compute.
+>
+> The first kind of waste was **padding**: with a fixed `[1, 256, …]` graph, a six-token prompt still
+> pushed 256 rows through all 85 nodes, 250 of them holding nothing. Binding `S = 6` deletes that
+> waste outright — the tensors *are* six rows, everywhere. `tools/padded_static_baseline.mjs` measures
+> the ceiling this removes: at `S = 64` padded to 512, a width-128 sequence Linear runs **7.9× slower**
+> padded than active (2.76 ms → 21.87 ms p50), with byte-identical output over the active region.
+>
+> The second kind is still real: of the `S` rows the head computes, generation reads only the last
+> one. Dynamic shape shrinks `S` but does not change that ratio, which is why the native row APIs
+> (§2.8) exist — they compute the head for the new row alone. **Right-sizing the tensor and computing
+> fewer rows of it are separate wins**, and you want both.
 
 ---
 
@@ -427,6 +458,12 @@ back in as input.
 > `ExecutionResult`. The math is identical; the cache just avoids repeating work. The trade is
 > memory: the cache holds `2 × n_layers × seq × d_model` floats (a Key and a Value for every past
 > token in every layer), so long contexts cost RAM.
+>
+> Decode is also where a naive reading of Chapter 8's shape system would go wrong. The sequence grows
+> by one every step, so "bind a new shape and re-plan per token" would mean re-specializing 200 times
+> to write 200 words. It doesn't work that way: the decode path allocates KV up to its **bounded
+> capacity** once and then tracks an **active length** inside it. Growing that length is a counter
+> update, not a new shape binding.
 
 ---
 

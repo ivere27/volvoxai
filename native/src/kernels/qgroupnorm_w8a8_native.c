@@ -1,5 +1,5 @@
 /*
- * Native CPU parallelism for canonical physical-byte W8A8 QGroupNorm.
+ * Native CPU parallelism for canonical W8A8 QGroupNorm.
  *
  * qgroupnorm_i8u8() remains the authoritative, fully validating portable
  * implementation and the sole WASM path.  The physical native runtime has
@@ -7,7 +7,7 @@
  * run on the bound kernel pool.  Every reduction keeps the portable loop and
  * F32 operation order, preserving byte-exact output.
  */
-#include "quant_cpu_opt.h"
+#include "quant_cpu_isa.h"
 #include "w8a8_affine.h"
 #include "cpu_features.h"
 #include "kernel_platform.h"
@@ -18,6 +18,7 @@
 #include <math.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <string.h>
 
 #if (defined(__i386__) || defined(__x86_64__)) && \
     (defined(__clang__) || defined(__GNUC__))
@@ -27,6 +28,13 @@
 #else
 #define VX_QGROUPNORM_X86_AVX2 0
 #define VX_QGROUPNORM_TARGET_AVX2
+#endif
+
+#if defined(__aarch64__)
+#include <arm_neon.h>
+#define VX_QGROUPNORM_ARM_NEON 1
+#else
+#define VX_QGROUPNORM_ARM_NEON 0
 #endif
 
 extern int qgroupnorm_i8u8(const void* input, const float* weight,
@@ -298,6 +306,255 @@ static VX_QGROUPNORM_TARGET_AVX2 void vx_qgroupnorm_group4_worker(
 }
 #endif
 
+#if VX_QGROUPNORM_ARM_NEON
+enum {
+    VX_QGROUPNORM_NEON_MAX_GROUPS = 512u,
+    VX_QGROUPNORM_NEON_SPATIAL_TILE = 16u,
+};
+
+/* SafeTensors permits F32 affine storage at a byte-aligned offset.  memcpy is
+ * both defined for that pointer and lowered by AArch64 Clang to one unaligned
+ * vector load. */
+static inline float32x4_t vx_qgroupnorm_neon_load_affine4(
+        const float* values, uint32_t channel) {
+    float32x4_t loaded;
+    memcpy(&loaded, (const unsigned char*)values +
+        (size_t)channel * sizeof(float), sizeof(loaded));
+    return loaded;
+}
+
+static inline float32x4_t vx_qgroupnorm_neon_load_stat4(
+        const float* values, uint32_t channel,
+        uint32_t channels_per_group) {
+    float32x4_t loaded = vdupq_n_f32(
+        values[channel / channels_per_group]);
+    loaded = vsetq_lane_f32(
+        values[(channel + 1u) / channels_per_group], loaded, 1);
+    loaded = vsetq_lane_f32(
+        values[(channel + 2u) / channels_per_group], loaded, 2);
+    return vsetq_lane_f32(
+        values[(channel + 3u) / channels_per_group], loaded, 3);
+}
+
+static inline float32x4_t vx_qgroupnorm_neon_load_raw4(
+        const VxQGroupNormParallelContext* context, size_t index) {
+    uint32_t packed;
+    memcpy(&packed, (const unsigned char*)context->input + index,
+        sizeof(packed));
+    if (context->input_dtype == VX_DTYPE_I8) {
+        const int8x8_t bytes = vreinterpret_s8_u8(vcreate_u8((uint64_t)packed));
+        const int16x8_t words = vmovl_s8(bytes);
+        return vcvtq_f32_s32(vmovl_s16(vget_low_s16(words)));
+    }
+    {
+        const uint8x8_t bytes = vcreate_u8((uint64_t)packed);
+        const uint16x8_t words = vmovl_u8(bytes);
+        return vcvtq_f32_u32(vmovl_u16(vget_low_u16(words)));
+    }
+}
+
+typedef struct {
+    float32x4_t low[3];
+    float32x4_t high[3];
+} VxQGroupNormNeonCpg3Rows;
+
+/* vld3 reads eight contiguous three-channel groups and deinterleaves the
+ * three local-channel streams.  That replaces twenty-four scalar byte loads,
+ * conversions and INS instructions with one structured load plus widening. */
+static inline VxQGroupNormNeonCpg3Rows vx_qgroupnorm_neon_load_cpg3_groups8(
+        const VxQGroupNormParallelContext* context, size_t index) {
+    VxQGroupNormNeonCpg3Rows result;
+    const float32x4_t zero = vdupq_n_f32((float)context->input_zero_point);
+    if (context->input_dtype == VX_DTYPE_I8) {
+        const int8x8x3_t packed = vld3_s8(
+            (const int8_t*)context->input + index);
+        for (uint32_t local = 0; local < 3u; local++) {
+            const int16x8_t words = vmovl_s8(packed.val[local]);
+            result.low[local] = vsubq_f32(
+                vcvtq_f32_s32(vmovl_s16(vget_low_s16(words))), zero);
+            result.high[local] = vsubq_f32(
+                vcvtq_f32_s32(vmovl_s16(vget_high_s16(words))), zero);
+        }
+    } else {
+        const uint8x8x3_t packed = vld3_u8(
+            (const uint8_t*)context->input + index);
+        for (uint32_t local = 0; local < 3u; local++) {
+            const uint16x8_t words = vmovl_u8(packed.val[local]);
+            result.low[local] = vsubq_f32(
+                vcvtq_f32_u32(vmovl_u16(vget_low_u16(words))), zero);
+            result.high[local] = vsubq_f32(
+                vcvtq_f32_u32(vmovl_u16(vget_high_u16(words))), zero);
+        }
+    }
+    return result;
+}
+
+static inline int32x4_t vx_qgroupnorm_neon_quantize4(
+        float32x4_t transformed, int32_t minimum, int32_t maximum,
+        int32_t nan_value) {
+    const uint32x4_t nan_mask = vmvnq_u32(
+        vceqq_f32(transformed, transformed));
+    const float32x4_t clamped = vminq_f32(
+        vmaxq_f32(transformed, vdupq_n_f32((float)minimum)),
+        vdupq_n_f32((float)maximum));
+    /* FCVTNS is round-to-nearest, ties-to-even and ignores the ambient
+     * rounding mode, matching vx_w8a8_round_ties_even(). */
+    const int32x4_t rounded = vcvtnq_s32_f32(clamped);
+    return vbslq_s32(nan_mask, vdupq_n_s32(nan_value), rounded);
+}
+
+static inline void vx_qgroupnorm_neon_store4(
+        VxQGroupNormParallelContext* context, size_t index,
+        int32x4_t quantized) {
+    uint32_t packed;
+    if (context->output_dtype == VX_DTYPE_I8) {
+        const int16x8_t words = vcombine_s16(vqmovn_s32(quantized),
+            vdup_n_s16(0));
+        const int8x8_t bytes = vqmovn_s16(words);
+        packed = vget_lane_u32(vreinterpret_u32_s8(bytes), 0);
+    } else {
+        const uint16x8_t words = vcombine_u16(vqmovun_s32(quantized),
+            vdup_n_u16(0));
+        const uint8x8_t bytes = vqmovn_u16(words);
+        packed = vget_lane_u32(vreinterpret_u32_u8(bytes), 0);
+    }
+    memcpy((unsigned char*)context->output + index, &packed, sizeof(packed));
+}
+
+/* Eight independent C/G=3 groups occupy two F32 vectors.  The row tile is the
+ * important difference from a group-major implementation: all 32 TinyReceipt
+ * groups revisit sixteen resident rows before advancing, instead of streaming
+ * the multi-megabyte activation once per group. */
+static void vx_qgroupnorm_neon_sample_worker(void* opaque, int begin, int end) {
+    VxQGroupNormParallelContext* context =
+        (VxQGroupNormParallelContext*)opaque;
+    float sums[VX_QGROUPNORM_NEON_MAX_GROUPS];
+    float squares[VX_QGROUPNORM_NEON_MAX_GROUPS];
+    float means[VX_QGROUPNORM_NEON_MAX_GROUPS];
+    float inverses[VX_QGROUPNORM_NEON_MAX_GROUPS];
+    const float32x4_t input_scales = vdupq_n_f32(context->input_scale);
+    const float32x4_t output_scales = vdupq_n_f32(context->output_scale);
+    const float32x4_t output_zeros = vdupq_n_f32(
+        (float)context->output_zero_point);
+    const float32x4_t value_count = vdupq_n_f32(
+        (float)context->values_per_group);
+    for (int task = begin; task < end; task++) {
+        const uint32_t sample = (uint32_t)task;
+        const size_t sample_offset =
+            (size_t)sample * context->sample_stride;
+        for (uint32_t group = 0; group < context->groups; group++)
+            sums[group] = 0.0f;
+        for (size_t tile = 0; tile < context->area;
+                tile += VX_QGROUPNORM_NEON_SPATIAL_TILE) {
+            size_t limit = tile + VX_QGROUPNORM_NEON_SPATIAL_TILE;
+            if (limit > context->area) limit = context->area;
+            for (uint32_t group = 0; group < context->groups; group += 8u) {
+                float32x4_t total_low = vld1q_f32(sums + group);
+                float32x4_t total_high = vld1q_f32(sums + group + 4u);
+                const uint32_t channel_start =
+                    group * context->channels_per_group;
+                for (size_t spatial = tile; spatial < limit; spatial++) {
+                    const size_t offset = sample_offset +
+                        spatial * context->channels + channel_start;
+                    const VxQGroupNormNeonCpg3Rows rows =
+                        vx_qgroupnorm_neon_load_cpg3_groups8(context, offset);
+                    total_low = vaddq_f32(total_low, rows.low[0]);
+                    total_high = vaddq_f32(total_high, rows.high[0]);
+                    total_low = vaddq_f32(total_low, rows.low[1]);
+                    total_high = vaddq_f32(total_high, rows.high[1]);
+                    total_low = vaddq_f32(total_low, rows.low[2]);
+                    total_high = vaddq_f32(total_high, rows.high[2]);
+                }
+                vst1q_f32(sums + group, total_low);
+                vst1q_f32(sums + group + 4u, total_high);
+            }
+        }
+        for (uint32_t group = 0; group < context->groups; group += 4u) {
+            vst1q_f32(means + group,
+                vdivq_f32(vld1q_f32(sums + group), value_count));
+            vst1q_f32(squares + group, vdupq_n_f32(0.0f));
+        }
+        for (size_t tile = 0; tile < context->area;
+                tile += VX_QGROUPNORM_NEON_SPATIAL_TILE) {
+            size_t limit = tile + VX_QGROUPNORM_NEON_SPATIAL_TILE;
+            if (limit > context->area) limit = context->area;
+            for (uint32_t group = 0; group < context->groups; group += 8u) {
+                float32x4_t total_low = vld1q_f32(squares + group);
+                float32x4_t total_high = vld1q_f32(squares + group + 4u);
+                const float32x4_t mean_low = vld1q_f32(means + group);
+                const float32x4_t mean_high = vld1q_f32(means + group + 4u);
+                const uint32_t channel_start =
+                    group * context->channels_per_group;
+                for (size_t spatial = tile; spatial < limit; spatial++) {
+                    const size_t offset = sample_offset +
+                        spatial * context->channels + channel_start;
+                    const VxQGroupNormNeonCpg3Rows rows =
+                        vx_qgroupnorm_neon_load_cpg3_groups8(context, offset);
+                    for (uint32_t local = 0; local < 3u; local++) {
+                        const float32x4_t centered_low = vsubq_f32(
+                            rows.low[local], mean_low);
+                        const float32x4_t centered_high = vsubq_f32(
+                            rows.high[local], mean_high);
+                        total_low = vmlaq_f32(
+                            total_low, centered_low, centered_low);
+                        total_high = vmlaq_f32(
+                            total_high, centered_high, centered_high);
+                    }
+                }
+                vst1q_f32(squares + group, total_low);
+                vst1q_f32(squares + group + 4u, total_high);
+            }
+        }
+        for (uint32_t group = 0; group < context->groups; group += 4u) {
+            float32x4_t raw_variance = vdivq_f32(
+                vld1q_f32(squares + group), value_count);
+            float32x4_t real_variance;
+            raw_variance = vmaxq_f32(raw_variance, vdupq_n_f32(0.0f));
+            real_variance = vmulq_f32(
+                vmulq_f32(raw_variance, input_scales), input_scales);
+            real_variance = vmaxq_f32(real_variance, vdupq_n_f32(0.0f));
+            vst1q_f32(inverses + group, vdivq_f32(vdupq_n_f32(1.0f),
+                vsqrtq_f32(vaddq_f32(real_variance,
+                    vdupq_n_f32(context->epsilon)))));
+        }
+        for (size_t tile = 0; tile < context->area;
+                tile += VX_QGROUPNORM_NEON_SPATIAL_TILE) {
+            size_t limit = tile + VX_QGROUPNORM_NEON_SPATIAL_TILE;
+            if (limit > context->area) limit = context->area;
+            for (uint32_t channel = 0; channel < context->channels;
+                    channel += 4u) {
+                const float32x4_t mean = vx_qgroupnorm_neon_load_stat4(
+                    means, channel, context->channels_per_group);
+                const float32x4_t inverse = vx_qgroupnorm_neon_load_stat4(
+                    inverses, channel, context->channels_per_group);
+                const float32x4_t gain = vx_qgroupnorm_neon_load_affine4(
+                    context->weight, channel);
+                const float32x4_t bias = vx_qgroupnorm_neon_load_affine4(
+                    context->bias, channel);
+                for (size_t spatial = tile; spatial < limit; spatial++) {
+                    const size_t index = sample_offset +
+                        spatial * context->channels + channel;
+                    const float32x4_t raw = vsubq_f32(
+                        vx_qgroupnorm_neon_load_raw4(context, index),
+                        vdupq_n_f32((float)context->input_zero_point));
+                    const float32x4_t scaled = vmulq_f32(
+                        vsubq_f32(raw, mean), input_scales);
+                    const float32x4_t normalized = vmulq_f32(scaled, inverse);
+                    const float32x4_t affine = vmlaq_f32(
+                        bias, normalized, gain);
+                    const float32x4_t transformed = vaddq_f32(
+                        vdivq_f32(affine, output_scales), output_zeros);
+                    vx_qgroupnorm_neon_store4(context, index,
+                        vx_qgroupnorm_neon_quantize4(transformed,
+                            context->output_minimum, context->output_maximum,
+                            context->output_zero_point));
+                }
+            }
+        }
+    }
+}
+#endif
+
 int vx_qgroupnorm_i8u8_native_validated(
         const void* input, const float* weight, const float* bias, void* output,
         uint32_t batch, uint32_t height, uint32_t width, uint32_t channels,
@@ -350,6 +607,20 @@ int vx_qgroupnorm_i8u8_native_validated(
      * property of the shape and the CPU, so it must not be withdrawn when the
      * pool is unavailable or when the decomposition cannot fill every worker;
      * a single-threaded call still wants the group-quad kernel. */
+#if VX_QGROUPNORM_ARM_NEON
+    if (channels / groups == 3u && groups % 8u == 0u &&
+        groups <= VX_QGROUPNORM_NEON_MAX_GROUPS && channels % 4u == 0u &&
+        vx_kernel_platform()->has_neon) {
+        if (elements >= VX_QGROUPNORM_PARALLEL_ELEMENTS && threads > 1 &&
+            batch > 1u) {
+            vx_kernels_parallel_for((int)batch, 1,
+                vx_qgroupnorm_neon_sample_worker, &context);
+        } else {
+            vx_qgroupnorm_neon_sample_worker(&context, 0, (int)batch);
+        }
+        return 1;
+    }
+#endif
 #if VX_QGROUPNORM_X86_AVX2
     if (groups % 4u == 0u && vx_kernel_platform()->has_avx2) {
         const uint64_t group4_tasks = (uint64_t)batch * (groups / 4u);

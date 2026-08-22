@@ -236,6 +236,8 @@ VxBackendProvider provider = {
     .context_execute = provider_context_execute,
     .context_close = provider_context_close,
     .context_destroy = provider_context_destroy,
+    .exact_contract_marker = VX_BACKEND_PROVIDER_EXACT_CONTRACT_MARKER,
+    .exact_contract_extent = sizeof(VxBackendProvider),
 };
 
 provider.shape_domain.support = VX_BACKEND_SHAPE_DOMAIN_FULL;
@@ -289,6 +291,16 @@ arena slot 1         [ hidden A ][ reuse for output ]
 This reduces allocation overhead and peak memory without changing Graph semantics. Contexts own
 their arenas, so concurrent requests stay isolated.
 
+The lifetime plan is compile-time because it follows the topology; the region *sizes* are not,
+because a symbolic dimension has no size until a request binds one. A context therefore sizes its
+arena from the current shape binding and grows it geometrically when a larger legal binding arrives.
+Growth is transactional: a binding that cannot fit the admitted budget returns
+VX_STATUS_OUT_OF_MEMORY with candidate state rolled back, leaving the previous binding usable. The
+engine tracks dynamic_arena_capacity_bytes, dynamic_arena_high_water_bytes, and
+dynamic_arena_grow_count per context (native/src/runtime/runtime_state.h); the high-water figure is
+what a deployment should size its budget from, rather than a worst-case guess. This is the native
+form of the browser behavior in Chapter 8 §8.6.
+
 GPU shader sources are generated from canonical templates. Generated outputs and embedded byte
 arrays are build products, not editing surfaces. During development, VOLVOXAI_SHADER_DIR may point
 to external shader files; the runtime logs once only when that override is actually used.
@@ -340,8 +352,8 @@ The command uses the full-only opaque VxTrainer lifecycle. Each Trainer owns
 private inputs, gradients, optimizer slots, accumulation, RNG, and working
 weights. Only an explicit conflict-checked commit publishes a Model revision.
 
-Backend source composition is controlled at build time by the Vulkan, OpenGL, CUDA, Metal, and
-NNAPI options. Requiring a provider that was not compiled or cannot initialize returns a backend
+Backend source composition is controlled at build time by the Vulkan, OpenGL, CUDA, and Metal
+options. Requiring a provider that was not compiled or cannot initialize returns a backend
 error; it does not switch to CPU.
 
 ## 9.11 What you just learned

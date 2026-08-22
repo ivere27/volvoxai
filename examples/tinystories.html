@@ -22,7 +22,7 @@
     } from './tinystories/browser_session.js';
 
 const q = new URLSearchParams(location.search);
-    const backend = q.get('backend') || 'wasm';          // webgpu | wasm | cpu
+    const backend = q.get('backend') || 'wasm';          // webgpu | wasm | cpu-js
     const prompt = q.get('prompt') || 'Once upon a time, Lily';
     const requestedNewTokens = Number(q.get('n') ?? '32');
     const MODEL = '../models/tinystories_1m/model.safetensors';

@@ -111,9 +111,9 @@ This follows the split the runtime already enforces for shapes.
 
 | Owner | Holds |
 |---|---|
-| `Model` | bank layout, slot count bounds, per-slot weight bytes, weight revision |
-| `CompiledModel` | packed per-slot layout, kernel selection, invariant non-bank weights |
-| `ExecutionContext` | **which slots are resident**, slot upload/evict, residency generation |
+| `Model` | logical bank layout, slot-count bounds, portable full-bank payload, weight revision |
+| `CompiledModel` | immutable compiled host backing, slot layout, kernel selection, and every selection-independent raw/packed representation |
+| `ExecutionContext` | **which slots are resident**, selected-row staging/COW, selection-dependent device or packed storage, residency generation |
 
 `CompiledModel` must not own a resident slot set for the same reason it must
 not own a mutable activation arena: two contexts may need different slots
@@ -145,12 +145,14 @@ fingerprint, including bounds, is unchanged."*
 2. **Shape contracts** — `proveMoERouter`/`proveMoELinear` accept a bounded
    expert extent when the weight is a bank; require `top_k <= min`.
 3. **Snapshot** — per-slot weight storage and a slot-granular weight revision.
-4. **CompiledModel** — relax "invariant packed weights" to "invariant non-bank
-   weights + per-slot bank layout".
+4. **CompiledModel** — own the immutable full-bank backing and per-slot layout;
+   share any raw or packed representation that does not depend on the context's
+   selected slot set.
 5. **ExecutionContext** — resident slot set, upload/evict, and a residency
    generation that participates in plan-cache keying.
-6. **Backend SPI** — per-slot upload/evict. Backends that cannot do partial
-   residency declare full-bank residency and keep working unchanged.
+6. **Backend SPI** — pass the exact resolved residency plan into context
+   preparation. Backends that cannot stage a partial bank retain full-bank
+   residency or reject the selection explicitly.
 7. **Kernels** — `MoELinear` indexes a slot table instead of `expert * dIn * dOut`
    into one buffer.
 
@@ -187,7 +189,7 @@ Usefully, the folded stack is already exactly the bank layout: one contiguous
 
 The `banks` table, `WeightDescriptor.bank`, `Model.weightDescriptors[].bank`,
 slot-count-independent fingerprinting, and exporter validation are implemented.
-Covered by `tests/js_graph.test.mjs` and
+Covered by `tests/graph.test.mjs` and
 `tools/exporter/tests/test_dynamic_runtime_ir.py`.
 
 No execution behavior changes yet: a bank is still uploaded and resident as one
@@ -243,14 +245,18 @@ or `VX_MOE_SLOT_ABSENT` (`0xffffffff`) when the context did not materialize it.
 | native C **and** WASM | `vx_moe_linear_banked_f32` in `portable_inference_kernels.c` — one implementation, `WASM_EXPORT`ed |
 | native and WASM training | `volvoxai_training_moe_linear_banked_f32` and `..._backward_banked_f32`; `WasmTrainingKernels` selects the banked entries whenever the node carries a slot table, and uploads the table through the same arena as the gradients |
 | WebGPU inference | `shaders/inference/moeLinear.wgsl` binding 7 plus `params.slot_domain` |
-| WebGPU training | `shaders/training/moeLinearBackward.wgsl` bindings 11/12. `input_main` and `route_main` map global→row; `weight_main` and `bias_main` iterate staged rows and need the inverse, so both directions are bound |
-| native Vulkan / OpenGL / Metal | `vk_graph_moe_linear_f32` / `opengl_graph_moe_linear_f32` / `metal_graph_moe_linear_f32`, dispatching the same `moeLinear` shader through `try_gpu_graph_moe_linear` |
-| native CUDA | `vx_cuda_moe_linear_f32` takes `slot_rows`/`slot_domain`; the host launcher uploads the table through the invariant-input path |
+| WebGPU training | `shaders/training/moeLinearBackward.wgsl` uses binding 10 for global-slot→staged-row, binding 11 for staged-row→global-slot, and binding 12 for the 32-byte params uniform. `input_main` and `route_main` use the first map; `weight_main` and `bias_main` use the inverse |
+| native Vulkan / OpenGL / Metal | `vk_graph_moe_linear_f32` / `opengl_graph_moe_linear_f32` / `metal_graph_moe_linear_f32` dispatch the forward `moeLinear` shader through `try_gpu_graph_moe_linear`; training consumes the same 13-binding backward ABI as WebGPU (maps 10/11, params 12) |
+| native CUDA | `vx_cuda_moe_linear_f32` takes `slot_rows`/`slot_domain` for forward; its manual backward kernels and host launcher use the same 13-binding training ABI (maps 10/11, params 12) |
 
 The native graph schema accepts the same optional `banks` table
 (`vx_graph_schema_valid`), so a banked package loads on native as well as in
 the browser. Gradients accumulate into the staged rows, so a partially resident
 context trains exactly the families it materialized.
+
+The 13-binding training layout is one current cross-backend contract, not a
+legacy 11-binding alternative. Vulkan, OpenGL, Metal, and CUDA validate the
+same two mapping buffers and params position before dispatch.
 
 `moe_linear_f32` keeps its original signature and delegates with a NULL table,
 so the fully resident path is unchanged.
@@ -259,19 +265,21 @@ Routing to a non-resident expert fails on every target rather than reading a
 neighbouring slot: the CPU and WASM kernels raise, the C kernel returns 0, and
 the shader skips the term.
 
-One ownership consequence surfaced here. `WebGPUProviderExecutionContext` and
-`WasmBackendProvider` copy every weight into a shared invariant-weight map at
-construction, but a partially resident bank holds **different bytes per
-context**, so `stageWeights` never takes bank storage from
-`invariantWeightStorageFactory`. This is the same rule as the residency set
-itself: shared where invariant, context-private where not.
+One ownership consequence surfaced here. The CPU JS, WebGPU, and WASM compiled
+owners retain the full immutable host bank once. CPU contexts borrow that
+storage for full residency and stage a private selected slice for partial
+residency. WebGPU additionally shares compiled device buffers only for
+non-banked fixed weights; every bank device buffer is context-private because
+its contents depend on residency. WASM owns one full raw/packed bank in its
+compiled linear-memory prefix, borrows it for full residency, and stages only a
+partial selection and its derived pack in the context's mutable region. This is
+the same rule as the residency set itself: shared where invariant,
+context-private where selected.
 
-## Native residency is a load-time choice
+## Native residency policy and physical ownership
 
-The browser runtime puts residency on `ExecutionContext` because it owns weights
-per context. The native engine cannot: it holds **one global weight table**
-(`g_t`/`g_weight_files`) shared by every context, so per-context slicing has no
-place to live. Native therefore declares residency on `VxModelSource`:
+Native still declares the selected slot set on `VxModelSource`, so every context
+created from that Model/compiled revision receives the same residency policy:
 
 ```c
 typedef struct VxBankResidency {
@@ -282,31 +290,49 @@ typedef struct VxBankResidency {
 } VxBankResidency;
 ```
 
-`vx_runtime_load_model` scans the supplied weight metadata once, requires every
+`vx_runtime_load_model` scans the supplied weight metadata, requires every
 declared bank to occur exactly once with a rank and slot extent allowed by its
-dimension, and validates requested slots against that actual extent. The model
-retains the request and replays it into the engine on every compile, because the
-engine rebuilds its global table each time.
+dimension, and validates requested slots against that actual extent. The Model
+retains the immutable request. Each built-in `VxCompiledModel` then reads and
+parses each accepted safetensors shard once into a reference-counted immutable
+weight store. Compile validation and every context borrow those blobs and
+metadata; context creation does not reopen or parse the files.
+
+`g_t` and `g_weight_files` are accessors for the currently scoped private
+`VxEngineState`, not one process-global table shared by every context. A
+compiled context clones the safetensors tensor descriptor table while retaining
+the compiled blob, which gives residency metadata and selected payloads a
+context-local owner even though the selection API remains on `VxModelSource`.
 
 `engine_bank_residency.inc` then does the work between loading the weight files
 and building the graph:
 
-1. **Compact in place.** Resident slot `s` moves to row `r`, and `r <= s`
-   always, so a forward pass never overwrites a slot it still has to read. The
-   payload is heap-owned by the loader and the slice only shrinks the tensor, so
-   there is no reallocation and no ownership change — the earlier plan to
-   allocate a sliced copy was dropped once that became clear.
-2. **Follow the published tensor.** `volvoxai_engine_load_weight_files`
-   registers a `T` for each safetensors entry as it loads, so the already
-   published tensor's `shape[0]`/`numel` are updated to the staged extent. Both
-   alias the same payload, so only metadata changes.
+1. **Copy on write for compiled contexts.** The context copies the selected
+   rows, in canonical slot order, into its own overlay and points its private
+   safetensors and execution descriptors at that overlay. The compiled full-bank
+   bytes and descriptor table never change. A standalone mutable authoring
+   engine may still compact its private loader-owned bytes in place; that path
+   does not borrow a compiled store.
+2. **Follow the context descriptor.** The published `T` and the context's
+   safetensors descriptor receive the staged `shape[0]`/`numel` and overlay
+   pointer. Sibling contexts keep distinct descriptor tables and overlays while
+   continuing to retain the same compiled source blob.
 3. **Bind the slot table.** Every node reading a sliced bank gets
    `resident_slot_rows`/`resident_slot_domain`, which reaches the CPU-fallback
    and CUDA kernels unchanged.
 
 Because the slice happens before `build_graph`, every downstream shape check
-sees the staged extent rather than the bank's full one. Shutdown clears the
-request, so the next load is fully resident again.
+sees the staged extent rather than the bank's full one. Closing one context
+frees only its descriptor table and selected-row overlay. The compiled store
+survives when the live context count reaches zero, so reopening uses the same
+raw blobs without another file read; final compiled release frees the store.
+
+This fixes raw safetensors duplication but is not a claim that all native
+prepared weights are compiled-owned. CPU F16 widening and CPU prepacked caches
+remain context-private, as do the legitimate selected-bank overlays. Built-in
+Vulkan/OpenGL/Metal/CUDA graph and device caches are also still prepared per
+context. Moving their immutable portions to `VxCompiledModel` and measuring
+their aggregate physical high water remain in `TODO.md`.
 
 ## Device MoELinear routes
 
@@ -375,7 +401,7 @@ Per-tensor quantization is unaffected: one scale covers the whole tensor and
 survives slicing untouched. `resolveGraphShapes` still slices per-axis metadata
 on axis 0 alongside the payload, so the two stay consistent if a future consumer
 ever allows that combination, but nothing reaches it today. Both behaviours are
-pinned in `tests/js_weight_bank.test.mjs`.
+pinned in `tests/weight_bank.test.mjs`.
 
 ## Rejected alternatives
 

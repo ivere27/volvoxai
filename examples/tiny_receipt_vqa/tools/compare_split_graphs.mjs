@@ -89,9 +89,9 @@ function makeInputs(document, seed = 12345) {
 
 async function run(packageDir, kind, inputs) {
   const { snapshot, document } = await loadGraph(packageDir, kind);
-  const runtime = await VolvoxAI.createRuntime({ backends: ['cpu'] });
+  const runtime = await VolvoxAI.createRuntime({ backends: ['cpu-js'] });
   const compiled = await runtime.compile(snapshot, {
-    backend: { mode: 'require', backend: 'cpu', operatorFallback: 'forbid' },
+    backend: { mode: 'require', backend: 'cpu-js', operatorFallback: 'forbid' },
   });
   const context = await compiled.createContext();
   const result = await context.execute(inputs);

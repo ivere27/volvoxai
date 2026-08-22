@@ -11,6 +11,11 @@ typedef struct {
     float expert_bias[6];
 } CudaMoeTrainStepResult;
 
+typedef struct {
+    float loss;
+    float expert_weight[2];
+} CudaBankedMoeTrainStepResult;
+
 static int cuda_moe_any_changed(const float* actual, const float* initial,
                                 int count) {
     for (int index = 0; index < count; index++) {
@@ -68,9 +73,10 @@ static int run_cuda_moe_train_step_case(int use_cuda, int normalize,
           (with_bias == 0 || with_bias == 1));
     memset(result, 0, sizeof(*result));
     begin_graph();
-    g_use_vulkan = g_use_nnapi = g_use_opengl = g_use_metal = 0;
+    g_use_vulkan = g_use_opengl = g_use_metal = 0;
     g_use_cuda = use_cuda;
-    if (use_cuda && cuda_init() != 0) {
+    if (use_cuda &&
+        vx_backend_manager_activate(VOLVOXAI_BACKEND_CUDA) != 0) {
         CHECK(finish_graph() == 0);
         return cuda_init_failure_is_unavailable() ? 1 : -1;
     }
@@ -141,6 +147,58 @@ static int run_cuda_moe_train_step_case(int use_cuda, int normalize,
     return finish_graph();
 }
 
+static int run_cuda_banked_moe_train_step_case(
+        int use_cuda, CudaBankedMoeTrainStepResult* result) {
+    const int input_shape[2] = {1, 1};
+    const int route_shape[2] = {1, 1};
+    const int weight_shape[3] = {1, 1, 2};
+    const int output_shape[2] = {1, 2};
+    const float input[1] = {2.0f};
+    const float route_indices[1] = {2.0f};
+    const float route_weights[1] = {0.5f};
+    const float expert_weight[2] = {3.0f, -1.0f};
+    const uint32_t slot_rows[3] = {UINT32_MAX, UINT32_MAX, 0u};
+    const int targets[1] = {1};
+    const char* trainables[1] = {"banked.expert.weight"};
+
+    CHECK(result);
+    memset(result, 0, sizeof(*result));
+    begin_graph();
+    g_use_vulkan = g_use_opengl = g_use_metal = 0;
+    g_use_cuda = use_cuda;
+    if (use_cuda &&
+        vx_backend_manager_activate(VOLVOXAI_BACKEND_CUDA) != 0) {
+        CHECK(finish_graph() == 0);
+        return cuda_init_failure_is_unavailable() ? 1 : -1;
+    }
+    CHECK(volvoxai_engine_require_training_backend(
+        use_cuda ? VOLVOXAI_BACKEND_CUDA : VOLVOXAI_BACKEND_CPU) == 0);
+    CHECK(add_tensor("banked.input", input_shape, 2, input));
+    CHECK(add_tensor("banked.route.indices", route_shape, 2, route_indices));
+    CHECK(add_tensor("banked.route.weights", route_shape, 2, route_weights));
+    CHECK(add_tensor("banked.expert.weight", weight_shape, 3, expert_weight));
+    CHECK(add_tensor("banked.logits", output_shape, 2, NULL));
+
+    Node* node = add_node("MoELinear", "banked.logits", NULL);
+    CHECK(node && node_input(node, "input", "banked.input") == 0 &&
+          node_input(node, "expert_weight", "banked.expert.weight") == 0 &&
+          node_input(node, "route_indices", "banked.route.indices") == 0 &&
+          node_input(node, "route_weights", "banked.route.weights") == 0);
+    node->resident_slot_rows = slot_rows;
+    node->resident_slot_domain = 3u;
+
+    CHECK(volvoxai_engine_train_step(
+        "banked.logits", targets, 1, INT_MIN, trainables, 1,
+        VOLVOXAI_TENSOR_UPDATE_SGD, 0.02f, 0.9f, 0.999f, 1.0e-8f,
+        0.0f, 0.0f, 23, &result->loss, NULL, NULL) == 0);
+    CHECK(volvoxai_engine_last_training_backend() ==
+          (use_cuda ? VOLVOXAI_BACKEND_CUDA : VOLVOXAI_BACKEND_CPU));
+    CHECK(volvoxai_engine_copy_tensor_f32(
+        "banked.expert.weight", result->expert_weight, 2) == 0);
+    CHECK(volvoxai_engine_require_training_backend(VOLVOXAI_BACKEND_CPU) == 0);
+    return finish_graph();
+}
+
 static int test_cuda_moe_runtime_optional(void) {
     static const float initial_input[4] = {1.0f, 0.2f, -0.3f, 0.8f};
     static const float initial_router_weight[6] = {
@@ -178,6 +236,14 @@ static int test_cuda_moe_runtime_optional(void) {
     CHECK(cuda_moe_any_changed(cpu.router_bias, initial_router_bias, 3));
     CHECK(cuda_moe_any_changed(cpu.expert_weight, initial_expert_weight, 12));
     CHECK(cuda_moe_any_changed(cpu.expert_bias, initial_expert_bias, 6));
+
+    {
+        CudaBankedMoeTrainStepResult cuda_banked;
+        CHECK(run_cuda_banked_moe_train_step_case(1, &cuda_banked) == 0);
+        CHECK(fabsf(cuda_banked.loss - 4.0181499f) < 1.0e-6f);
+        CHECK(fabsf(cuda_banked.expert_weight[0] - 2.9803598f) < 3.0e-6f);
+        CHECK(fabsf(cuda_banked.expert_weight[1] + 0.9803597f) < 3.0e-6f);
+    }
 
     /* Cover the full-softmax derivative and optional-bias bindings too. */
     CHECK(run_cuda_moe_train_step_case(0, 0, 0, &cpu) == 0);

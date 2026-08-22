@@ -5,6 +5,8 @@ import type { ShaderLibrary as ShaderLibraryClass } from './ShaderLibrary.js';
 import type { WebGPUDeviceState } from './WebGPUDeviceState.js';
 import type { RuntimeTypedArray } from '../types.js';
 import type { DeviceTensorInputLease } from '../ops/deviceTensorReference.js';
+import type { RowSpanGeometry } from './decodeRowSet.js';
+import type { KVPagePlan } from './kvPageAddressing.js';
 
 export type ShaderLibraryConstructor = typeof ShaderLibraryClass;
 
@@ -12,9 +14,32 @@ export interface WebGPULanguageFeatures {
   has(feature: string): boolean;
 }
 
+/**
+ * How one operand of a compiled row pipeline is addressed each step.
+ *
+ * This used to be a byte stride back-derived from a position-one sample, on the
+ * premise that "a row's address is a linear function of its position". A page
+ * table falsifies that premise, and a second lane falsifies it again: the rows a
+ * step touches are `b * S + position[b]`, which is a *set* of spans. So the
+ * descriptor now declares geometry the tensor's own shape already fixes, and
+ * the rows come from the shared `DecodeRowSet` resolver every runtime uses.
+ *
+ * Nothing here is derived from a sample execution, which is why there is no
+ * position in it.
+ */
 export interface RowStorageDescriptor {
-  readonly offsetStride: number;
-  readonly constantSize: number;
+  /** Published by the shared row builder; see `RowSpanGeometry`. */
+  readonly geometry: RowSpanGeometry;
+  /** Bytes one row occupies. */
+  readonly rowBytes: number;
+  /** Dense lane count this pipeline was compiled for. */
+  readonly lanes: number;
+  /**
+   * The staged bytes are each lane's causal prefix, not a whole row.
+   *
+   * Only a per-query keep mask of a causal attention node: the row moves with
+   * the position *and* only its first `kvLength` entries are visible.
+   */
   readonly queryMaskPrefix: boolean;
 }
 
@@ -79,10 +104,27 @@ export interface ExecutorNode {
 export type ExecutorGraph = Omit<RuntimeGraph, 'nodes'> & { nodes: ExecutorNode[] };
 export type AdapterExecutionPlan = null;
 
+/** Compiled-model-owned immutable device weight returned through a borrow-only view. */
+export interface WebGPUInvariantDeviceWeight {
+  readonly name: string;
+  readonly buffer: GPUBuffer;
+  readonly capacityBytes: number;
+  readonly usage: GPUBufferUsageFlags;
+}
+
+export interface WebGPUInvariantWeightBorrow {
+  /** Exact compiled-owned immutable device storage; absence is not a fallback. */
+  borrowDeviceWeight(name: string): WebGPUInvariantDeviceWeight;
+  /** Declared weight banks use context-private residency generations. */
+  isContextPrivateWeight(name: string): boolean;
+}
+
 export interface GraphExecutorOptions {
   shaderLibrary?: ShaderLibraryConstructor | null;
   wgslLanguageFeatures?: WebGPULanguageFeatures | null;
   deviceState?: WebGPUDeviceState | null;
+  /** @internal Compiled-model-owned immutable device weight lease. */
+  invariantWeightBorrow?: WebGPUInvariantWeightBorrow | null;
 }
 
 export interface WebGPURebindOptions {
@@ -172,21 +214,55 @@ export interface CompiledWebGPUPipeline {
   tacticId?: string;
 }
 
+/**
+ * A `[lanes, keys]` keep mask the host computes and uploads each step.
+ *
+ * Every other staged operand is a region of a tensor the device already holds,
+ * so the step copies it buffer-to-buffer. This one is not a region of anything:
+ * the current dense-row contract publishes each lane's active length *through*
+ * the keep mask, so its contents depend on the step's `kvLengths` and exist
+ * nowhere until the host builds them. It is therefore uploaded rather than
+ * copied, and it is materialised even when the graph carries no mask at all --
+ * which is where the lengths would otherwise have no way to reach the kernel.
+ */
+export interface IncrementalRowKeepMask {
+  /** Name the pipeline binds. The graph's mask, or a synthesised name. */
+  readonly name: string;
+  /** The graph input whose values the mask reads, or null for length-only. */
+  readonly sourceName: string | null;
+  readonly sourceTensor: ExecutorTensor | null;
+  readonly queryLength: number;
+  readonly keyLength: number;
+  readonly causal: boolean;
+}
+
 export interface IncrementalRowCandidate {
   nodeIndex: number;
   node: ExecutorNode;
   sampleNode: ExecutorNode;
+  /** Dense lane count this candidate's pipeline covers. */
+  lanes: number;
   scratchInputs: Set<string>;
   scratchOutputs: Set<string>;
   scratchCapacities: Map<string, number>;
   byteCopyInputs: Set<string>;
   byteCopyOutputs: Set<string>;
   invariantInputs: Set<string>;
+  keepMask: IncrementalRowKeepMask | null;
 }
 
+/**
+ * Packed-byte copy resources, one entry per staged row.
+ *
+ * One entry sufficed while a step issued a single unaligned copy per operand.
+ * A batched step issues one per lane, and `queue.writeBuffer` on a shared
+ * params buffer is ordered against *submission*, not against the passes encoded
+ * before it -- so every lane would read whichever params were written last.
+ * Giving each row its own buffer is what keeps the copies independent.
+ */
 export interface IncrementalRowByteCopy {
-  paramsBuffer: GPUBuffer;
-  bindGroup: GPUBindGroup;
+  paramsBuffers: GPUBuffer[];
+  bindGroups: GPUBindGroup[];
 }
 
 export interface IncrementalRowPlan extends IncrementalRowCandidate {
@@ -197,6 +273,27 @@ export interface IncrementalRowPlan extends IncrementalRowCandidate {
   byteCopyPipeline: GPUComputePipeline | null;
   inputByteCopies: Map<string, IncrementalRowByteCopy>;
   outputByteCopies: Map<string, IncrementalRowByteCopy>;
+  /**
+   * A second binding of the same attention pipeline whose K/V operands point
+   * at contiguous staging buffers instead of the page pool.
+   *
+   * A bind group is built once and reads its operand from offset zero, so a
+   * lane whose pages are scattered — or merely based somewhere other than slot
+   * zero — cannot be read through the ordinary binding at all. Staging the
+   * lane's active prefix into logical order and binding *that* is what makes
+   * an arbitrary page table executable without changing a shader ABI five
+   * backends share. Null until a paged step asks for it.
+   */
+  pagedStaging: Map<string, GPUBuffer> | null;
+  pagedPipelines: CompiledWebGPUPipeline[] | null;
+  pagedQsdpaParamsBuffer: GPUBuffer | null;
+}
+
+/** Everything a decode step needs from a caller that reaches the engine directly. */
+export interface WebGPURowStepOptions {
+  qsdpaControlBuffer?: GPUBuffer | null;
+  /** The one-lane page table, or null. Batched pages ride on the row set. */
+  kvPages?: KVPagePlan | null;
 }
 
 export interface AdapterTarget {

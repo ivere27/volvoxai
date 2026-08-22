@@ -101,7 +101,6 @@ static int dynamic_autograd_current_backend(void) {
     if (g_use_metal) return VOLVOXAI_BACKEND_METAL;
     if (g_use_opengl) return VOLVOXAI_BACKEND_OPENGL;
     if (g_use_vulkan) return VOLVOXAI_BACKEND_VULKAN;
-    if (g_use_nnapi) return VOLVOXAI_BACKEND_NNAPI;
     return VOLVOXAI_BACKEND_CPU;
 }
 

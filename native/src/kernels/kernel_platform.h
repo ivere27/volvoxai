@@ -20,14 +20,17 @@
  * It is header-only on purpose: the kernels are linked into roughly thirty
  * different test, benchmark and release targets, and a new translation unit
  * would have to be added to each one.  The cache is function-local, so each
- * translation unit resolves at most once and the result is identical because
- * it is a pure function of the CPU and one environment variable.
+ * translation unit resolves at most once.  CPU capabilities and the clamp are
+ * process-stable; the cached SVE length is only a diagnostic snapshot because
+ * Linux permits each thread to change its vector length.  A future SVE kernel
+ * must query vx_cpu_arm_sve_vl_bytes() in the dispatching thread.
  *
- * `VOLVOXAI_CPU_ISA` clamps the tier downward: `baseline`, `avx2`, `avxvnni`,
- * `avx512vnni`, `neon`, `neondotprod`.  Clamping only ever removes capability,
- * so it cannot ask for an instruction the CPU lacks.  This is what makes it
- * possible to exercise and benchmark the AVX2 path on a VNNI machine, which
- * previously required a rebuild.
+ * `VOLVOXAI_CPU_ISA` clamps the tier downward.  The x86 ladder is `baseline`,
+ * `avx2`, `avxvnni`, `avx512vnni`; the Arm ladder is `baseline`, `neon`,
+ * `neondotprod`, `neoni8mm`, `sve2`.  The ladders are deliberately resolved by
+ * architecture rather than compared as one numeric enum: requesting an Arm
+ * name on x86 (or an x86 name on Arm) selects baseline instead of accidentally
+ * admitting a similarly numbered capability.
  */
 
 #include "cpu_features.h"
@@ -43,15 +46,48 @@
 #endif
 
 typedef enum {
+    VX_KERNEL_ISA_INVALID = -2,
+    VX_KERNEL_ISA_AUTO = -1,
     VX_KERNEL_ISA_BASELINE = 0,
     VX_KERNEL_ISA_NEON = 1,
     VX_KERNEL_ISA_NEON_DOTPROD = 2,
-    VX_KERNEL_ISA_AVX2 = 3,
-    VX_KERNEL_ISA_AVX_VNNI = 4,
-    VX_KERNEL_ISA_AVX512_VNNI = 5
+    VX_KERNEL_ISA_NEON_I8MM = 3,
+    VX_KERNEL_ISA_SVE2 = 4,
+    VX_KERNEL_ISA_AVX2 = 5,
+    VX_KERNEL_ISA_AVX_VNNI = 6,
+    VX_KERNEL_ISA_AVX512_VNNI = 7
 } VxKernelIsa;
 
+typedef enum {
+    VX_KERNEL_ARCH_OTHER = 0,
+    VX_KERNEL_ARCH_ARM = 1,
+    VX_KERNEL_ARCH_X86 = 2
+} VxKernelArchitecture;
+
+/* Raw capability input is named so the resolver can be tested with an Arm CPU
+ * description on an x86 build (and vice versa).  Runtime callers use
+ * vx_kernel_platform_resolve(), which fills this from cpu_features.c. */
 typedef struct {
+    int has_avx2;
+    int has_avx_vnni;
+    int has_avx512f;
+    int has_avx512_vnni;
+    int has_neon;
+    int has_arm_dotprod;
+    int has_arm_i8mm;
+    int has_arm_sve;
+    int has_arm_sve2;
+    int has_arm_sve_i8mm;
+    uint32_t arm_sve_vl_bytes;
+} VxKernelCpuCapabilities;
+
+typedef struct {
+    /* The explicit operator request and whether this host can honor it.  AUTO
+     * and BASELINE are always valid; an unknown, cross-architecture, or
+     * unavailable tier is a configuration error rather than a soft clamp. */
+    VxKernelIsa requested_isa;
+    int configuration_valid;
+
     /* Highest tier this process will use, after any clamp. */
     VxKernelIsa isa;
 
@@ -68,6 +104,14 @@ typedef struct {
     int has_avx512_vnni;
     int has_neon;
     int has_arm_dotprod;
+    int has_arm_i8mm;
+    int has_arm_sve;
+    int has_arm_sve2;
+    int has_arm_sve_i8mm;
+    /* Snapshot for the thread which resolved this structure.  SVE kernels
+     * whose callers may alter vector length must query
+     * vx_cpu_arm_sve_vl_bytes() again at dispatch. */
+    uint32_t arm_sve_vl_bytes;
 
     /*
      * ISA selection thresholds, named rather than inlined as literals.
@@ -119,56 +163,151 @@ static inline const char* vx_kernel_isa_name(VxKernelIsa isa) {
         case VX_KERNEL_ISA_AVX512_VNNI: return "avx512vnni";
         case VX_KERNEL_ISA_AVX_VNNI:    return "avxvnni";
         case VX_KERNEL_ISA_AVX2:        return "avx2";
+        case VX_KERNEL_ISA_SVE2:        return "sve2";
+        case VX_KERNEL_ISA_NEON_I8MM:   return "neoni8mm";
         case VX_KERNEL_ISA_NEON_DOTPROD:return "neondotprod";
         case VX_KERNEL_ISA_NEON:        return "neon";
+        case VX_KERNEL_ISA_AUTO:        return "auto";
+        case VX_KERNEL_ISA_INVALID:     return "invalid";
         default:                        return "baseline";
     }
 }
 
-/* Parse the clamp request.  An unset or unrecognized value means "no clamp",
- * which keeps a typo from silently disabling every vector kernel. */
+/* Parse the clamp request. An unset/empty value means AUTO. Unknown values are
+ * explicit configuration failures; silently treating a typo as AUTO would run
+ * a different ISA than the operator requested. */
 static inline VxKernelIsa vx_kernel_isa_clamp_request(void) {
 #if defined(__wasm__)
-    return VX_KERNEL_ISA_AVX512_VNNI;  /* no clamp; nothing to clamp */
+    return VX_KERNEL_ISA_AUTO;  /* no environment and nothing to clamp */
 #else
     const char* requested = getenv("VOLVOXAI_CPU_ISA");
-    if (!requested || !requested[0]) return VX_KERNEL_ISA_AVX512_VNNI;
+    if (!requested || !requested[0] || !strcmp(requested, "auto"))
+        return VX_KERNEL_ISA_AUTO;
     if (!strcmp(requested, "baseline"))    return VX_KERNEL_ISA_BASELINE;
     if (!strcmp(requested, "neon"))        return VX_KERNEL_ISA_NEON;
     if (!strcmp(requested, "neondotprod")) return VX_KERNEL_ISA_NEON_DOTPROD;
+    if (!strcmp(requested, "neoni8mm"))    return VX_KERNEL_ISA_NEON_I8MM;
+    if (!strcmp(requested, "sve2"))        return VX_KERNEL_ISA_SVE2;
     if (!strcmp(requested, "avx2"))        return VX_KERNEL_ISA_AVX2;
     if (!strcmp(requested, "avxvnni"))     return VX_KERNEL_ISA_AVX_VNNI;
     if (!strcmp(requested, "avx512vnni"))  return VX_KERNEL_ISA_AVX512_VNNI;
-    return VX_KERNEL_ISA_AVX512_VNNI;
+    return VX_KERNEL_ISA_INVALID;
 #endif
 }
 
-static inline void vx_kernel_platform_resolve(VxKernelPlatform* platform) {
-    const VxKernelIsa ceiling = vx_kernel_isa_clamp_request();
-    /* x86 and ARM tiers are disjoint, so one ordered enum can carry both: a
-     * clamp naming the other architecture's tier simply leaves this one at
-     * baseline, which is the conservative outcome. */
-    const int allow_avx2 = ceiling >= VX_KERNEL_ISA_AVX2;
-    const int allow_avx_vnni = ceiling >= VX_KERNEL_ISA_AVX_VNNI;
-    const int allow_avx512_vnni = ceiling >= VX_KERNEL_ISA_AVX512_VNNI;
-    const int allow_neon = ceiling == VX_KERNEL_ISA_NEON ||
-        ceiling >= VX_KERNEL_ISA_NEON_DOTPROD;
-    const int allow_dotprod = ceiling >= VX_KERNEL_ISA_NEON_DOTPROD;
+static inline VxKernelArchitecture vx_kernel_architecture(void) {
+#if defined(__i386__) || defined(__x86_64__)
+    return VX_KERNEL_ARCH_X86;
+#elif defined(__aarch64__) || defined(__arm__)
+    return VX_KERNEL_ARCH_ARM;
+#else
+    return VX_KERNEL_ARCH_OTHER;
+#endif
+}
 
-    platform->has_avx2 = allow_avx2 && vx_cpu_has_avx2();
+static inline void vx_kernel_platform_resolve_capabilities(
+        VxKernelPlatform* platform, VxKernelArchitecture architecture,
+        VxKernelIsa ceiling, const VxKernelCpuCapabilities* raw) {
+    int allow_avx2 = 0, allow_avx_vnni = 0, allow_avx512 = 0;
+    int allow_neon = 0, allow_dotprod = 0, allow_i8mm = 0;
+    int allow_sve = 0, allow_sve2 = 0, allow_sve_i8mm = 0;
+
+    platform->requested_isa = ceiling;
+    platform->configuration_valid = 0;
+    platform->isa = VX_KERNEL_ISA_BASELINE;
+    platform->has_avx2 = 0;
+    platform->has_avx_vnni = 0;
+    platform->has_avx512f = 0;
+    platform->has_avx512_vnni = 0;
+    platform->has_neon = 0;
+    platform->has_arm_dotprod = 0;
+    platform->has_arm_i8mm = 0;
+    platform->has_arm_sve = 0;
+    platform->has_arm_sve2 = 0;
+    platform->has_arm_sve_i8mm = 0;
+    platform->arm_sve_vl_bytes = 0u;
+    if (ceiling == VX_KERNEL_ISA_AUTO ||
+        ceiling == VX_KERNEL_ISA_BASELINE) {
+        platform->configuration_valid = 1;
+    } else if (architecture == VX_KERNEL_ARCH_X86) {
+        platform->configuration_valid =
+            (ceiling == VX_KERNEL_ISA_AVX2 && raw->has_avx2) ||
+            (ceiling == VX_KERNEL_ISA_AVX_VNNI && raw->has_avx2 &&
+             raw->has_avx_vnni) ||
+            (ceiling == VX_KERNEL_ISA_AVX512_VNNI && raw->has_avx2 &&
+             raw->has_avx512_vnni);
+    } else if (architecture == VX_KERNEL_ARCH_ARM) {
+        platform->configuration_valid =
+            (ceiling == VX_KERNEL_ISA_NEON && raw->has_neon) ||
+            (ceiling == VX_KERNEL_ISA_NEON_DOTPROD && raw->has_neon &&
+             raw->has_arm_dotprod) ||
+            (ceiling == VX_KERNEL_ISA_NEON_I8MM && raw->has_neon &&
+             raw->has_arm_i8mm) ||
+            (ceiling == VX_KERNEL_ISA_SVE2 && raw->has_arm_sve &&
+             raw->has_arm_sve2);
+    }
+    if (architecture == VX_KERNEL_ARCH_X86) {
+        switch (ceiling) {
+            case VX_KERNEL_ISA_AUTO:
+            case VX_KERNEL_ISA_AVX512_VNNI:
+                allow_avx512 = 1;
+                /* fall through */
+            case VX_KERNEL_ISA_AVX_VNNI:
+                allow_avx_vnni = 1;
+                /* fall through */
+            case VX_KERNEL_ISA_AVX2:
+                allow_avx2 = 1;
+                break;
+            default:
+                break;
+        }
+    } else if (architecture == VX_KERNEL_ARCH_ARM) {
+        switch (ceiling) {
+            case VX_KERNEL_ISA_AUTO:
+            case VX_KERNEL_ISA_SVE2:
+                allow_sve = 1;
+                allow_sve2 = 1;
+                allow_sve_i8mm = 1;
+                /* fall through */
+            case VX_KERNEL_ISA_NEON_I8MM:
+                allow_i8mm = 1;
+                /* fall through */
+            case VX_KERNEL_ISA_NEON_DOTPROD:
+                allow_dotprod = 1;
+                /* fall through */
+            case VX_KERNEL_ISA_NEON:
+                allow_neon = 1;
+                break;
+            default:
+                break;
+        }
+    }
+
+    platform->has_avx2 = allow_avx2 && raw->has_avx2;
     platform->has_avx_vnni = allow_avx_vnni && platform->has_avx2 &&
-        vx_cpu_has_avx_vnni();
-    platform->has_avx512f = allow_avx512_vnni && platform->has_avx2 &&
-        vx_cpu_has_avx512f();
-    platform->has_avx512_vnni = allow_avx512_vnni && platform->has_avx2 &&
-        vx_cpu_has_avx512_vnni();
-    platform->has_neon = allow_neon && vx_cpu_has_neon();
+        raw->has_avx_vnni;
+    platform->has_avx512f = allow_avx512 && platform->has_avx2 &&
+        raw->has_avx512f;
+    platform->has_avx512_vnni = allow_avx512 && platform->has_avx2 &&
+        raw->has_avx512_vnni;
+    platform->has_neon = allow_neon && raw->has_neon;
     platform->has_arm_dotprod = allow_dotprod && platform->has_neon &&
-        vx_cpu_has_arm_dotprod();
+        raw->has_arm_dotprod;
+    platform->has_arm_i8mm = allow_i8mm && platform->has_neon &&
+        raw->has_arm_i8mm;
+    platform->has_arm_sve = allow_sve && raw->has_arm_sve;
+    platform->has_arm_sve2 = allow_sve2 && platform->has_arm_sve &&
+        raw->has_arm_sve2;
+    platform->has_arm_sve_i8mm = allow_sve_i8mm && platform->has_arm_sve &&
+        raw->has_arm_sve_i8mm;
+    platform->arm_sve_vl_bytes = platform->has_arm_sve
+        ? raw->arm_sve_vl_bytes : 0u;
 
     if (platform->has_avx512_vnni)      platform->isa = VX_KERNEL_ISA_AVX512_VNNI;
     else if (platform->has_avx_vnni)    platform->isa = VX_KERNEL_ISA_AVX_VNNI;
     else if (platform->has_avx2)        platform->isa = VX_KERNEL_ISA_AVX2;
+    else if (platform->has_arm_sve2)    platform->isa = VX_KERNEL_ISA_SVE2;
+    else if (platform->has_arm_i8mm)    platform->isa = VX_KERNEL_ISA_NEON_I8MM;
     else if (platform->has_arm_dotprod) platform->isa = VX_KERNEL_ISA_NEON_DOTPROD;
     else if (platform->has_neon)        platform->isa = VX_KERNEL_ISA_NEON;
     else                                platform->isa = VX_KERNEL_ISA_BASELINE;
@@ -180,6 +319,24 @@ static inline void vx_kernel_platform_resolve(VxKernelPlatform* platform) {
     platform->qlinear_maddubs_min_d_in = 32u;
     platform->qconv_avx512_vnni_min_input_per_group = 64u;
     platform->qlinear_avx512_vnni_tail_budget = 8u;
+}
+
+static inline void vx_kernel_platform_resolve(VxKernelPlatform* platform) {
+    const VxKernelCpuCapabilities raw = {
+        .has_avx2 = vx_cpu_has_avx2(),
+        .has_avx_vnni = vx_cpu_has_avx_vnni(),
+        .has_avx512f = vx_cpu_has_avx512f(),
+        .has_avx512_vnni = vx_cpu_has_avx512_vnni(),
+        .has_neon = vx_cpu_has_neon(),
+        .has_arm_dotprod = vx_cpu_has_arm_dotprod(),
+        .has_arm_i8mm = vx_cpu_has_arm_i8mm(),
+        .has_arm_sve = vx_cpu_has_arm_sve(),
+        .has_arm_sve2 = vx_cpu_has_arm_sve2(),
+        .has_arm_sve_i8mm = vx_cpu_has_arm_sve_i8mm(),
+        .arm_sve_vl_bytes = vx_cpu_arm_sve_vl_bytes(),
+    };
+    vx_kernel_platform_resolve_capabilities(platform,
+        vx_kernel_architecture(), vx_kernel_isa_clamp_request(), &raw);
 }
 
 static inline const VxKernelPlatform* vx_kernel_platform(void) {

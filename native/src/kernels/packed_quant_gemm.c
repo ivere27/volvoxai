@@ -28,6 +28,12 @@
 #define VX_QGEMM_WASM_PAIR_PACK 0
 #endif
 
+#if defined(VOLVOXAI_ARM_I8MM_OBJECT) && defined(__aarch64__)
+#define VX_QGEMM_ARM_I8MM 1
+#else
+#define VX_QGEMM_ARM_I8MM 0
+#endif
+
 #if !defined(__wasm__) && (defined(__i386__) || defined(__x86_64__)) && \
     (defined(__clang__) || defined(__GNUC__))
 #include "cpu_features.h"
@@ -213,6 +219,12 @@ uint32_t vx_packed_q8_weight_size(uint32_t d_in, uint32_t d_out) {
     pair_n_blocks = ((uint64_t)d_out + 7u) / 8u;
     pair_k_blocks = ((uint64_t)d_in + 3u) / 4u;
     pair_bytes = pair_n_blocks * pair_k_blocks * 32u;
+#elif VX_QGEMM_ARM_I8MM
+    /* SMMLA consumes two K8 rows and two K8 columns from each pair of
+     * int8x16 operands.  Four column pairs therefore form one K8xN8 panel. */
+    pair_n_blocks = n_blocks;
+    pair_k_blocks = ((uint64_t)d_in + 7u) / 8u;
+    pair_bytes = pair_n_blocks * pair_k_blocks * 64u;
 #elif VX_QGEMM_WASM_PAIR_PACK
     /* SIMD128 consumes adjacent K values for one N8 panel.  Keep the
      * canonical Kx8 bytes for scalar/W8A32 execution and add a target-derived
@@ -268,6 +280,9 @@ static int vx_pack_q8_weight_impl(
 #if VX_QGEMM_X86_AVX2
         pair_n_blocks = (d_out + 7u) / 8u;
         pair_k_blocks = (d_in + 3u) / 4u;
+#elif VX_QGEMM_ARM_I8MM
+        pair_n_blocks = n_blocks;
+        pair_k_blocks = (d_in + 7u) / 8u;
 #elif VX_QGEMM_WASM_PAIR_PACK
         pair_n_blocks = n_blocks;
         pair_k_blocks = (d_in + 1u) / 2u;
@@ -325,6 +340,31 @@ static int vx_pack_q8_weight_impl(
                             16u + lane * 2u + k_lane] =
                         weight_dtype == VX_DTYPE_I8
                             ? (int16_t)(int8_t)raw : (int16_t)raw;
+                }
+            }
+        }
+    }
+#elif VX_QGEMM_ARM_I8MM
+    for (uint32_t block = 0; block < pair_n_blocks; block++) {
+        for (uint32_t k_block = 0; k_block < pair_k_blocks; k_block++) {
+            uint8_t* panel = pair_data +
+                ((size_t)block * pair_k_blocks + k_block) * 64u;
+            for (uint32_t pair = 0; pair < 4u; pair++) {
+                for (uint32_t column_lane = 0; column_lane < 2u;
+                     column_lane++) {
+                    const uint32_t column =
+                        block * VX_QGEMM_NR + pair * 2u + column_lane;
+                    for (uint32_t k_lane = 0; k_lane < 8u; k_lane++) {
+                        const uint32_t dimension = k_block * 8u + k_lane;
+                        uint8_t raw = 0;
+                        if (column < d_out && dimension < d_in) {
+                            const size_t source = out_in
+                                ? (size_t)column * d_in + dimension
+                                : (size_t)dimension * d_out + column;
+                            raw = ((const uint8_t*)weight)[source];
+                        }
+                        panel[pair * 16u + column_lane * 8u + k_lane] = raw;
+                    }
                 }
             }
         }
@@ -400,6 +440,9 @@ static const VxPackedQ8Header* vx_qgemm_validate(const void* packed,
 #if VX_QGEMM_X86_AVX2
     expected_pair_n = (d_out + 7u) / 8u;
     expected_pair_k = (d_in + 3u) / 4u;
+#elif VX_QGEMM_ARM_I8MM
+    expected_pair_n = n_blocks;
+    expected_pair_k = (d_in + 7u) / 8u;
 #elif VX_QGEMM_WASM_PAIR_PACK
     if (!canonical_only) {
         expected_pair_n = n_blocks;
@@ -428,7 +471,7 @@ static const VxPackedQ8Header* vx_qgemm_validate(const void* packed,
 #endif
         (uint64_t)expected_pair_data +
             (uint64_t)expected_pair_n * expected_pair_k *
-                32u != expected)
+                (VX_QGEMM_ARM_I8MM ? 64u : 32u) != expected)
         return NULL;
     return header;
 }
@@ -700,6 +743,12 @@ int vx_packed_q8_preferred_for_native_w8a8(uint32_t rows, uint32_t d_in,
     if (!rows || d_out < 16u || weight_dtype != VX_DTYPE_I8 ||
         !weight_zero_all_zero || !vx_kernel_platform()->has_avx2) return 0;
     return rows > 1u || (d_in < 32u && d_out >= 32u);
+#elif VX_QGEMM_ARM_I8MM
+    /* Pair packing is immutable model state.  At least two rows are required
+     * to fill both row halves of SMMLA; decoder GEMV keeps the SDOT path. */
+    return rows >= 2u && d_out % VX_QGEMM_NR == 0u &&
+        weight_dtype == VX_DTYPE_I8 && weight_zero_all_zero &&
+        vx_kernel_platform()->has_arm_i8mm;
 #else
     /* Keep the existing runtime-gated NEON/SDOT dispatcher on ARM until a
      * benchmark-backed packed-N microkernel is available there. */
@@ -2160,6 +2209,15 @@ int vx_qlinear_i8u8_packed(const void* input, const void* packed_weight,
             weight_zero_points, output, rows, input_scale, input_zero_point,
             output_scale, output_zero_point, input_dtype, output_dtype);
     }
+#endif
+#if VX_QGEMM_ARM_I8MM
+    if (d_out >= VX_QGEMM_NR && vx_kernel_platform()->has_arm_i8mm &&
+        vx_qgemm_w8a8_simd_eligible(
+            header, bias, input_zero_point, input_dtype) &&
+        vx_qlinear_i8u8_arm_i8mm_packed_try(input, header, bias,
+            weight_scales, weight_zero_points, output, rows, input_scale,
+            input_zero_point, output_scale, output_zero_point, input_dtype,
+            output_dtype)) return 1;
 #endif
     for (uint32_t block = 0; block < header->n_blocks; block++) {
         uint32_t base = block * VX_QGEMM_NR;

@@ -223,7 +223,10 @@ int  cuda_graph_sync_host(const void* host, size_t bytes, int is_weight); // "CP
 > 다시 배웁니다. 녹화는 언제나 속도 향상일 뿐, 답을 바꿀 수 없습니다.
 
 🔧 이것이 NVIDIA의 **CUDA 그래프** 캡처-리플레이를, 조심스러운 상태 기계로 감싼 것입니다
-(`cuda/host/cuda_graph_lifecycle_host.inc`). 각 순방향은 몇 패스 중 하나로 돕니다:
+(`cuda/host/cuda_graph_lifecycle_host.inc`). 정적 추론은 하나의 정확한 형상 시그니처를 쓰고,
+증명된 bounded-dynamic 컨텍스트는 결정적인 컨텍스트 로컬 **4-항목 LRU**를 두어 B1과
+BN이 교대로 나와도 둘 다 리플레이에 도달할 수 있게 합니다. 각 정확한 시그니처는 다음
+패스를 거칩니다:
 
 ```
 OBSERVE   → 평범히 돌리되, 정확한 런치 목록과 "쓰기 전 읽기(read-before-write)" 입력을 기록
@@ -232,12 +235,29 @@ VALIDATE  → 빠른 경로: 이미 만든 그래프를 그냥 다시 런치
 (INELIGIBLE → 평범한 런치, 언제나 옳음)
 ```
 
-🔬 허용 목록은 일부러 보수적입니다 — Linear/Gemm/MatMul, PReLU/Sigmoid, Conv2D/Add,
-Concat/MaxPool2D/ResizeNearest2D/Reshape, 그리고 물리 양자화 연산들. 리플레이를 불안전하게 만들 만한 것은
-계획을 **무효화** 합니다: 모델 세대 변경, 슬롯 에포크 변경(메모리 이동), 디버그/프리픽스/행 실행,
-SDK 백엔드나 어댑터 효과, 학습, 이벤트 프로파일링, 또는 캡처/런치/동기 실패. 결정적으로, 드라이버가
-스트림을 캡처하지 못하면 엔진은 **커널을 하나도 붙들기 전에 물러나** 그 순방향은 끝까지 돕니다.
-리플레이는 속도를 위해 정확성을 절대 맞바꾸지 않습니다.
+🔬 정적 허용 목록은 일부러 보수적입니다 — Linear/Gemm/MatMul,
+PReLU/Sigmoid, Conv2D/Add, Concat/MaxPool2D/ResizeNearest2D/Reshape/Transpose,
+그리고 양자화 연산들입니다. bounded domain은 영수증 모델에 필요한 추가 집합을 증명 후
+허용합니다. 캡처된 스칼라 인자는 불변 노드 파라미터와 정확한 형상에서만 나오고,
+변경된 요청 값은 런치 전에 같은 예약 디바이스 포인터로 업로드됩니다. 데이터 의존 MoE와
+부분 가중치 뱅크 경로는 제외됩니다.
+
+각 캐시 계획은 형상 문자열을 소유하고 모델 세대, 슬롯 에포크, 용량 세대, domain 모드로도
+키가 매겨집니다. 다섯 번째 시그니처는 가장 오래 안 쓴 GraphExec을 파기하고, 전역 키가 바뀌면
+직접 OBSERVE 실행 전에 모든 계획을 파기합니다. 디버그/프리픽스/행 실행, SDK 백엔드,
+어댑터 효과, 학습, 이벤트 프로파일링, 런치 목록 불일치, 캡처/런치/동기 실패는 리플레이를
+제외하거나 무효화합니다. 스트림 캡처를 시작할 수 없으면 커널을 하나도 붙들기 전에 직접
+실행으로 돌아갑니다. 공개 증거의 `cuda_graph_replay=1`은 캐시된 런치와 스트림 동기가 둘 다
+성공한 뒤에만 나옵니다.
+
+LRU 희생 GraphExec 파기 중 Driver가 실패하면 handle을 잊지 않고 해당 캐시 항목을 격리합니다.
+현재 forward는 직접 실행하고, 이후 재시도에서 파기에 성공해야만 그 항목을 재사용하거나 새
+GraphExec을 요청할 수 있습니다. 따라서 실패 경로에서도 4개 소유권 상한은 엄격하게 유지됩니다.
+
+상주 증명은 호스트 계획 상태 4개, 유지되는 최대 크기 소유 시그니처 4개, 그리고 LRU 희생자가
+해제될 때까지 함께 존재하는 다섯 번째 트랜잭션 후보 시그니처를 계산합니다. 최대 4개의 요청된
+GraphExec에 대한 Driver 내부 저장소는 불투명하므로, 숫자 상주 바이트 주장에 몰래 넣지 않고
+**requested/unknown**으로 밝힙니다. 리플레이는 속도를 위해 정확성을 절대 맞바꾸지 않습니다.
 
 ---
 
@@ -299,7 +319,7 @@ RoPE, SSM/SelectiveScan, Sin, Cos); 그것이 필요한 모델은 그 노드를 
 > 작고, 정수 계산은 쌉니다. GPU 백엔드는 그 줄인 모델을 **정수로** 돌릴 수 있습니다 — 몰래 다시 소수로
 > 부풀리지 않고요. 각 층이 필요로 하는 작은 "스케일" 표를 지니고 카드 위에서 정수 산술을 바로 합니다.
 
-🔧 물리 I8/U8 실행이 다루는 것: QLinear/QMatMul/QGemm/QEmbedding/QConv2D/QAdd, QSiLU/QGELU(캐시된
+🔧 I8/U8 실행이 다루는 것: QLinear/QMatMul/QGemm/QEmbedding/QConv2D/QAdd, QSiLU/QGELU(캐시된
 256바이트 룩업 테이블 포함), QGroupNorm/QLayerNorm, QSDPA와 쿼리 범위 QSDPA, QArgMax/QMaskedMean,
 타입별 Quantize/Dequantize/Requantize, 바이트 복사와 형상 별칭, 그리고 같은 도메인의 최근접
 Resize/MaxPool2D/Concat. 진입점은 `cuda_engine.h` 의 `cuda_graph_q*_i8u8(...)` 함수들입니다.

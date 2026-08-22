@@ -11,11 +11,12 @@
 
 import { preprocessTinyReceiptImage } from './TinyReceiptInput.js';
 
-const KV_PACKAGE_FORMAT = 'volvoxai-tiny-receipt-vqa-split-kv-onnx-package-v1';
+const KV_PACKAGE_FORMAT = 'volvoxai-tiny-receipt-vqa-split-kv-onnx-package-v2';
 const BPE_VOCAB_SIZE = 1536;
 const IMAGE_TOKENS = 210;
 const MAX_Q = 192;
 const MAX_T = 192;
+const MAX_BATCH_SIZE = 8;
 const CACHE_LAYERS = 4;
 const CACHE_HEADS = 8;
 const CACHE_HEAD_WIDTH = 40;
@@ -104,16 +105,25 @@ function dimension(value, name, minimum, maximum, label) {
   return Object.freeze({ min: minimum, max: maximum });
 }
 
+function batchDimension(value, label) {
+  if (!isRecord(value) || value.min !== 1 || !Number.isInteger(value.max) ||
+      value.max < 1 || value.max > MAX_BATCH_SIZE ||
+      (value.multiple_of != null && value.multiple_of !== 1)) {
+    fail(`${label}.B must be bounded to [1,N] with N in 1..${MAX_BATCH_SIZE}.`);
+  }
+  return Object.freeze({ min: 1, max: value.max });
+}
+
 function normalizeKVShapeContract(value) {
   exactRecordKeys(value, [
     'graph_shape_mode', 'dimensions', 'fixed_geometry', 'relations', 'semantic_inputs',
   ], 'shape_contract');
-  if (!isRecord(value) || value.graph_shape_mode !== 'bounded-explicit-kv-v1') {
-    fail('KV shape_contract must use bounded-explicit-kv-v1.');
+  if (!isRecord(value) || value.graph_shape_mode !== 'bounded-explicit-kv-v2') {
+    fail('KV shape_contract must use bounded-explicit-kv-v2.');
   }
   exactRecordKeys(value.dimensions, ['B', 'Q', 'M', 'P', 'R'], 'shape_contract.dimensions');
   const dimensions = Object.freeze({
-    B: dimension(value.dimensions.B, 'B', 1, 1, 'shape_contract.dimensions'),
+    B: batchDimension(value.dimensions.B, 'shape_contract.dimensions'),
     Q: dimension(value.dimensions.Q, 'Q', 1, MAX_Q, 'shape_contract.dimensions'),
     M: dimension(
       value.dimensions.M,
@@ -803,10 +813,11 @@ function requireExactGraphInterface(graph, inputNames, outputNames, label) {
   }
 }
 
-function requireGraphDimensions(graph, expected, label) {
+function requireGraphDimensions(graph, expected, batchMaximum, label) {
   const dimensions = graph?.dimensions;
   const wanted = {
-    B: [1, 1], Q: [1, MAX_Q], M: [IMAGE_TOKENS + 1, IMAGE_TOKENS + MAX_Q],
+    B: [1, batchMaximum], Q: [1, MAX_Q],
+    M: [IMAGE_TOKENS + 1, IMAGE_TOKENS + MAX_Q],
     P: [1, MAX_T - 1], R: [2, MAX_T],
   };
   const bankDimensions = new Set(
@@ -852,8 +863,8 @@ function requireEncoderConcatWitness(graph, memoryOutput) {
   }
 }
 
-function validateEncoderGraph(graph, definition) {
-  requireGraphDimensions(graph, ['B', 'Q', 'M'], 'encoder');
+function validateEncoderGraph(graph, definition, batchMaximum) {
+  requireGraphDimensions(graph, ['B', 'Q', 'M'], batchMaximum, 'encoder');
   const inputNames = [definition.inputs.image, definition.inputs.question_ids];
   inputNames.push(definition.inputs.question_position_ids);
   inputNames.push(definition.inputs.family_ids);
@@ -892,8 +903,8 @@ function validateEncoderGraph(graph, definition) {
   requireEncoderConcatWitness(graph, definition.outputs.memory);
 }
 
-function validateDecoderGraph(graph, definition, vocabSize) {
-  requireGraphDimensions(graph, ['B', 'M', 'P', 'R'], 'decoder');
+function validateDecoderGraph(graph, definition, vocabSize, batchMaximum) {
+  requireGraphDimensions(graph, ['B', 'M', 'P', 'R'], batchMaximum, 'decoder');
   const inputKeys = [
     'decoder_input_ids', 'position_ids', 'family_ids', 'memory_padding_mask',
     'past_padding_mask', ...CACHE_INPUT_KEYS,
@@ -1104,8 +1115,14 @@ export class TinyReceiptSplitSession {
         || !Array.isArray(snapshot.inputNames) || !Array.isArray(snapshot.outputNames)) {
       fail(`${kind} snapshot loader returned an invalid logical model snapshot.`);
     }
-    if (kind === 'encoder') validateEncoderGraph(graph, definition);
-    else validateDecoderGraph(graph, definition, this.vocab.itos.length);
+    const batchMaximum = this.package.shapeContract.dimensions.B.max;
+    if (kind === 'encoder') validateEncoderGraph(graph, definition, batchMaximum);
+    else validateDecoderGraph(
+      graph,
+      definition,
+      this.vocab.itos.length,
+      batchMaximum,
+    );
     let compiled;
     let context;
     try {

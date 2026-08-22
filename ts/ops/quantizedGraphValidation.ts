@@ -109,7 +109,7 @@ function sameShapeForProof(left: unknown, right: unknown): boolean {
 
 export class PortableQuantizedGraphValidator {
   /* The core engines share a canonical W8A8 contract. Reject non-portable
-   * QTensor representations early, but admit physical-byte graphs whose
+   * QTensor representations early, but admit byte graphs whose
    * scale/zero-point mapping is carried by immutable tensor metadata.
    *
    * This is deliberately a graph-level gate, rather than a collection of
@@ -227,7 +227,7 @@ export class PortableQuantizedGraphValidator {
           embeddedQuantizationParameters.some((name) => node.params?.[name] != null) ||
           (node.params?.data_layout && node.params.data_layout !== 'NHWC') ||
           (node.params?.weight_layout && node.params.weight_layout !== 'OHWI')) {
-        reject(node, 'must use canonical physical I8/U8 NHWC/OHWI storage, per-tensor activation metadata, axis-0 per-channel weight metadata, and optional I32 bias.');
+        reject(node, 'must use canonical I8/U8 NHWC/OHWI storage, per-tensor activation metadata, axis-0 per-channel weight metadata, and optional I32 bias.');
       }
       if (input.shape.length !== 4 || weight.shape.length !== 4 || output.shape.length !== 4 ||
           input.shape[0] !== output.shape[0] || weight.shape[0] !== output.shape[3] ||

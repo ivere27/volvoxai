@@ -41,7 +41,6 @@ native/test_ptq_package
 native/test_gemm_f32
 native/test_gemm_f32_runtime
 native/test_packed_quant_gemm
-native/test_incremental_runtime_nnapi
 native/benchmark_gemm_f32
 native/benchmark_qsdpa_w8a8_native
 native/test_qsdpa_w8a8_native

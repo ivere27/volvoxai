@@ -69,7 +69,7 @@ int main(void) {
         return 1;
     }
     scope = vx_engine_state_scope_enter(state);
-    CHECK(VOLVOXAI_BACKEND_CUDA == 6);
+    CHECK(VOLVOXAI_BACKEND_CUDA == 4);
     CHECK(vx_backend_manager_current() == VOLVOXAI_BACKEND_CPU);
     CHECK(vx_backend_manager_activate((VolvoxAIEngineBackend)5) == -1);
 

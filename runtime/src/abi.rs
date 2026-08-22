@@ -5,8 +5,8 @@
 use std::ffi::{c_char, c_int, c_void};
 
 use crate::pb::{
-    BackendPolicyMode, DataType, DecodeRowMode, MemoryLocation, NativeStatus, OperationStage,
-    OperatorFallback, PtqLayerKind, PtqMode, PtqScheme, TrainingOptimizerKind,
+    BackendPolicyMode, DataType, DecodeRowMode, ExecutionMode, MemoryLocation, NativeStatus,
+    OperationStage, OperatorFallback, PtqLayerKind, PtqMode, PtqScheme, TrainingOptimizerKind,
 };
 
 pub(crate) const VX_STATUS_OK: c_int = NativeStatus::Ok as c_int;
@@ -28,6 +28,13 @@ pub(crate) const VX_STATUS_NOT_FOUND: c_int = NativeStatus::NotFound as c_int;
 pub(crate) const VX_STATUS_BUFFER_TOO_SMALL: c_int = NativeStatus::BufferTooSmall as c_int;
 pub(crate) const VX_STATUS_INTERNAL: c_int = NativeStatus::Internal as c_int;
 pub(crate) const VX_STATUS_REVISION_CONFLICT: c_int = NativeStatus::RevisionConflict as c_int;
+pub(crate) const VX_STATUS_BUSY: c_int = NativeStatus::Busy as c_int;
+pub(crate) const VX_STATUS_OVERLOADED: c_int = NativeStatus::Overloaded as c_int;
+pub(crate) const VX_STATUS_CANCELLED: c_int = NativeStatus::Cancelled as c_int;
+pub(crate) const VX_STATUS_DEADLINE_EXCEEDED: c_int = NativeStatus::DeadlineExceeded as c_int;
+pub(crate) const VX_STATUS_SUPERSEDED: c_int = NativeStatus::Superseded as c_int;
+pub(crate) const VX_STATUS_SESSION_RESET_REQUIRED: c_int =
+    NativeStatus::SessionResetRequired as c_int;
 
 pub(crate) const VX_STAGE_NONE: c_int = OperationStage::None as c_int;
 pub(crate) const VX_STAGE_RUNTIME_CREATE: c_int = OperationStage::RuntimeCreate as c_int;
@@ -61,6 +68,7 @@ pub(crate) const VX_BACKEND_PREFER: c_int = BackendPolicyMode::Prefer as c_int;
 pub(crate) const VX_BACKEND_REQUIRE: c_int = BackendPolicyMode::Require as c_int;
 pub(crate) const VX_OPERATOR_FALLBACK_ALLOW: c_int = OperatorFallback::Allow as c_int;
 pub(crate) const VX_OPERATOR_FALLBACK_FORBID: c_int = OperatorFallback::Forbid as c_int;
+pub(crate) const VX_EXECUTION_MODE_SCHEDULED: c_int = ExecutionMode::Scheduled as c_int;
 
 pub(crate) const VX_MEMORY_HOST: c_int = MemoryLocation::Host as c_int;
 pub(crate) const VX_MEMORY_DEVICE: c_int = MemoryLocation::Device as c_int;
@@ -81,6 +89,11 @@ pub(crate) const VX_PTQ_SCHEME_SYMMETRIC: c_int = PtqScheme::Symmetric as c_int;
 pub(crate) const VX_PTQ_SCHEME_ASYMMETRIC: c_int = PtqScheme::Asymmetric as c_int;
 pub(crate) const VX_PTQ_LAYER_QLINEAR: c_int = PtqLayerKind::Qlinear as c_int;
 pub(crate) const VX_PTQ_LAYER_QCONV2D: c_int = PtqLayerKind::Qconv2d as c_int;
+
+pub(crate) const VX_PROCESS_MEMORY_SAMPLE_ABI_VERSION: u32 = 1;
+pub(crate) const VX_PROCESS_MEMORY_AVAILABLE_CURRENT_RSS: u32 = 1;
+pub(crate) const VX_PROCESS_MEMORY_AVAILABLE_PEAK_RSS: u32 = 2;
+pub(crate) const VX_PROCESS_MEMORY_AVAILABLE_MONOTONIC_TIME: u32 = 4;
 
 const BACKEND_CAPACITY: usize = 64;
 const DEVICE_CAPACITY: usize = 128;
@@ -108,6 +121,31 @@ opaque_handle!(VxExecutionContext);
 opaque_handle!(VxResult);
 opaque_handle!(VxTrainer);
 opaque_handle!(VxPTQPlan);
+
+/// Versioned diagnostic sampler ABI. This is deliberately separate from
+/// `VxReport` so adding memory collection cannot change any lifecycle ABI.
+#[repr(C)]
+pub(crate) struct VxProcessMemorySampleV1 {
+    pub struct_size: usize,
+    pub abi_version: u32,
+    pub available_mask: u32,
+    pub rss_bytes: u64,
+    pub peak_rss_bytes: u64,
+    pub monotonic_nanoseconds: u64,
+}
+
+impl VxProcessMemorySampleV1 {
+    pub(crate) fn new() -> Self {
+        Self {
+            struct_size: std::mem::size_of::<Self>(),
+            abi_version: VX_PROCESS_MEMORY_SAMPLE_ABI_VERSION,
+            available_mask: 0,
+            rss_bytes: 0,
+            peak_rss_bytes: 0,
+            monotonic_nanoseconds: 0,
+        }
+    }
+}
 
 #[repr(C)]
 pub(crate) struct VxReport {
@@ -191,6 +229,12 @@ pub(crate) struct VxRuntimeOptions {
     pub struct_size: usize,
     pub debug: c_int,
     pub cpu_threads: c_int,
+    pub execution_mode: c_int,
+    pub max_scheduled_requests: usize,
+    pub max_scheduled_input_bytes: usize,
+    pub max_batch_delay_milliseconds: u32,
+    pub max_unconsumed_results: usize,
+    pub max_unconsumed_result_bytes: usize,
 }
 
 #[repr(C)]
@@ -576,6 +620,7 @@ pub(crate) struct VxTensorBinding {
 
 extern "C" {
     pub(crate) fn vx_status_string(status: c_int) -> *const c_char;
+    pub(crate) fn vx_process_memory_sample_v1(sample: *mut VxProcessMemorySampleV1) -> c_int;
 
     pub(crate) fn vx_runtime_create(
         options: *const VxRuntimeOptions,
@@ -772,4 +817,88 @@ extern "C" {
         required: *mut usize,
         report: *mut VxReport,
     ) -> c_int;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::mem::{align_of, offset_of, size_of};
+
+    fn place(cursor: &mut usize, size: usize, alignment: usize) -> usize {
+        let offset = (*cursor + alignment - 1) / alignment * alignment;
+        *cursor = offset + size;
+        offset
+    }
+
+    #[test]
+    fn execution_mode_numbers_follow_the_generated_proto_enum() {
+        assert_eq!(ExecutionMode::Direct as c_int, 0);
+        assert_eq!(ExecutionMode::Scheduled as c_int, 1);
+        assert_eq!(
+            VX_EXECUTION_MODE_SCHEDULED,
+            ExecutionMode::Scheduled as c_int
+        );
+    }
+
+    #[test]
+    fn runtime_options_matches_the_native_c_field_layout() {
+        let mut cursor = 0;
+        assert_eq!(
+            offset_of!(VxRuntimeOptions, struct_size),
+            place(&mut cursor, size_of::<usize>(), align_of::<usize>())
+        );
+        assert_eq!(
+            offset_of!(VxRuntimeOptions, debug),
+            place(&mut cursor, size_of::<c_int>(), align_of::<c_int>())
+        );
+        assert_eq!(
+            offset_of!(VxRuntimeOptions, cpu_threads),
+            place(&mut cursor, size_of::<c_int>(), align_of::<c_int>())
+        );
+        assert_eq!(
+            offset_of!(VxRuntimeOptions, execution_mode),
+            place(&mut cursor, size_of::<c_int>(), align_of::<c_int>())
+        );
+        assert_eq!(
+            offset_of!(VxRuntimeOptions, max_scheduled_requests),
+            place(&mut cursor, size_of::<usize>(), align_of::<usize>())
+        );
+        assert_eq!(
+            offset_of!(VxRuntimeOptions, max_scheduled_input_bytes),
+            place(&mut cursor, size_of::<usize>(), align_of::<usize>())
+        );
+        assert_eq!(
+            offset_of!(VxRuntimeOptions, max_batch_delay_milliseconds),
+            place(&mut cursor, size_of::<u32>(), align_of::<u32>())
+        );
+        assert_eq!(
+            offset_of!(VxRuntimeOptions, max_unconsumed_results),
+            place(&mut cursor, size_of::<usize>(), align_of::<usize>())
+        );
+        assert_eq!(
+            offset_of!(VxRuntimeOptions, max_unconsumed_result_bytes),
+            place(&mut cursor, size_of::<usize>(), align_of::<usize>())
+        );
+        let expected_size = (cursor + align_of::<VxRuntimeOptions>() - 1)
+            / align_of::<VxRuntimeOptions>()
+            * align_of::<VxRuntimeOptions>();
+        assert_eq!(size_of::<VxRuntimeOptions>(), expected_size);
+
+        #[cfg(target_pointer_width = "64")]
+        {
+            assert_eq!(size_of::<VxRuntimeOptions>(), 64);
+            assert_eq!(offset_of!(VxRuntimeOptions, execution_mode), 16);
+            assert_eq!(offset_of!(VxRuntimeOptions, max_scheduled_requests), 24);
+            assert_eq!(offset_of!(VxRuntimeOptions, max_scheduled_input_bytes), 32);
+            assert_eq!(
+                offset_of!(VxRuntimeOptions, max_batch_delay_milliseconds),
+                40
+            );
+            assert_eq!(offset_of!(VxRuntimeOptions, max_unconsumed_results), 48);
+            assert_eq!(
+                offset_of!(VxRuntimeOptions, max_unconsumed_result_bytes),
+                56
+            );
+        }
+    }
 }

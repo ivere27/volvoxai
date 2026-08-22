@@ -41,8 +41,8 @@ from tools.exporter.generated.kernel_registry import (  # noqa: E402
     TARGETS as GENERIC_EXPORT_TARGETS,
 )
 
-SOURCE_FORMAT = "tiny_receipt_vqa_split_kv_onnx_v1"
-PACKAGE_FORMAT = "volvoxai-tiny-receipt-vqa-split-kv-onnx-package-v1"
+SOURCE_FORMAT = "tiny_receipt_vqa_split_kv_onnx_v2"
+PACKAGE_FORMAT = "volvoxai-tiny-receipt-vqa-split-kv-onnx-package-v2"
 BPE_VOCAB_SIZE = 1536
 SPECIAL_TOKENS = ("<pad>", "<bos>", "<eos>", "<unk>")
 BPE_ATOMIC_TOKENS = (
@@ -273,6 +273,20 @@ def _positive_int(value: Any, label: str) -> int:
 def _nonnegative_int(value: Any, label: str) -> int:
     if isinstance(value, bool) or not isinstance(value, int) or value < 0:
         raise ImportFailure(f"{label} must be a non-negative integer")
+    return value
+
+
+def _validated_max_batch_size(value: Any, producer_maximum: int) -> int:
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, int)
+        or value < 1
+        or value > producer_maximum
+    ):
+        raise ImportFailure(
+            "max batch size must be an integer from 1 through "
+            f"the producer maximum {producer_maximum}"
+        )
     return value
 
 
@@ -730,10 +744,10 @@ def _validate_onnx(
     return frozenset()
 
 
-_MONOMIAL_ONE = (0, 0, 0)
+_MONOMIAL_ONE = (0, 0, 0, 0)
 
 
-def _poly(items: Mapping[tuple[int, int, int], Fraction | int]):
+def _poly(items: Mapping[tuple[int, ...], Fraction | int]):
     return tuple(sorted(
         (powers, Fraction(coefficient))
         for powers, coefficient in items.items()
@@ -749,12 +763,12 @@ def _poly_add(left, right, *, scale: int = 1):
 
 
 def _poly_multiply(left, right):
-    result: dict[tuple[int, int, int], Fraction] = {}
+    result: dict[tuple[int, ...], Fraction] = {}
     for left_powers, left_coefficient in left:
         for right_powers, right_coefficient in right:
             powers = tuple(
                 left_powers[index] + right_powers[index]
-                for index in range(3)
+                for index in range(len(_MONOMIAL_ONE))
             )
             result[powers] = (
                 result.get(powers, Fraction(0))
@@ -767,8 +781,8 @@ def _poly_multiply(left, right):
 class _SymbolicExtent:
     """Small exact rational-polynomial domain for ONNX shape expressions."""
 
-    numerator: tuple[tuple[tuple[int, int, int], Fraction], ...]
-    denominator: tuple[tuple[tuple[int, int, int], Fraction], ...]
+    numerator: tuple[tuple[tuple[int, ...], Fraction], ...]
+    denominator: tuple[tuple[tuple[int, ...], Fraction], ...]
     preferred_symbol: str | None = None
 
     @staticmethod
@@ -780,12 +794,18 @@ class _SymbolicExtent:
         )
 
     @staticmethod
-    def symbol(index: int) -> "_SymbolicExtent":
-        powers = [0, 0, 0]
+    def symbol(
+        index: int,
+        preferred_symbol: str | None = None,
+    ) -> "_SymbolicExtent":
+        powers = [0] * len(_MONOMIAL_ONE)
+        if index < 0 or index >= len(powers):
+            raise ImportFailure(f"symbolic extent index {index} is outside the domain")
         powers[index] = 1
         return _SymbolicExtent(
             _poly({tuple(powers): Fraction(1)}),
             _poly({_MONOMIAL_ONE: Fraction(1)}),
+            preferred_symbol,
         )
 
     def __add__(self, other: Any) -> "_SymbolicExtent":
@@ -890,8 +910,8 @@ def _as_symbolic_extent(value: Any) -> _SymbolicExtent:
 
 def _parse_symbolic_extent(value: str, *, role: str) -> _SymbolicExtent | None:
     symbols = {
-        "batch": _SymbolicExtent.constant(1, "B"),
-        "B": _SymbolicExtent.constant(1, "B"),
+        "batch": _SymbolicExtent.symbol(3, "B"),
+        "B": _SymbolicExtent.symbol(3, "B"),
         "question_length": _SymbolicExtent.symbol(0),
         "Q": _SymbolicExtent.symbol(0),
         "target_length": _SymbolicExtent.symbol(1),
@@ -1097,7 +1117,9 @@ def _canonical_symbolic_dimension(
     *,
     role: str,
 ) -> int | str:
-    if value.preferred_symbol == "B":
+    if value.preferred_symbol == "B" or value.equivalent(
+        _SymbolicExtent.symbol(3, "B")
+    ):
         return "B"
     integer = value.integer()
     if integer is not None:
@@ -1138,11 +1160,768 @@ def _set_existing_value_shape(
     del tensor_shape.dim[:]
     for extent in shape:
         dimension = tensor_shape.dim.add()
-        canonical = _canonical_symbolic_dimension(extent, role=role)
+        try:
+            canonical = _canonical_symbolic_dimension(extent, role=role)
+        except ImportFailure as error:
+            raise ImportFailure(
+                f"{role} rewritten Reshape output {name!r}: {error}"
+            ) from error
         if isinstance(canonical, int):
             dimension.dim_value = canonical
         else:
             dimension.dim_param = canonical
+
+
+def _symbolic_shapes_equivalent(
+    actual: Sequence[_SymbolicExtent | None] | None,
+    expected: Sequence[_SymbolicExtent | int],
+) -> bool:
+    return (
+        actual is not None
+        and len(actual) == len(expected)
+        and all(
+            left is not None and left.equivalent(right)
+            for left, right in zip(actual, expected)
+        )
+    )
+
+
+def _symbolic_shapes_compatible(
+    actual: Sequence[_SymbolicExtent | None] | None,
+    expected: Sequence[_SymbolicExtent | int],
+) -> bool:
+    """Accept inference-unknown axes, but reject every contradictory known axis."""
+
+    return (
+        actual is not None
+        and len(actual) == len(expected)
+        and all(
+            left is None or left.equivalent(right)
+            for left, right in zip(actual, expected)
+        )
+    )
+
+
+def _set_ints_attribute(node: Any, name: str, values: Sequence[int], *, onnx: Any) -> None:
+    retained = [attribute for attribute in node.attribute if attribute.name != name]
+    del node.attribute[:]
+    node.attribute.extend(retained)
+    node.attribute.extend([onnx.helper.make_attribute(name, list(values))])
+
+
+def _set_int_attribute(node: Any, name: str, value: int, *, onnx: Any) -> None:
+    retained = [attribute for attribute in node.attribute if attribute.name != name]
+    del node.attribute[:]
+    node.attribute.extend(retained)
+    node.attribute.extend([onnx.helper.make_attribute(name, int(value))])
+
+
+def _set_reshape_target(
+    model: Any,
+    node: Any,
+    values: Sequence[int],
+    *,
+    name: str,
+    onnx: Any,
+) -> None:
+    import numpy as np
+
+    existing = {
+        value.name
+        for value in [*model.graph.input, *model.graph.value_info, *model.graph.output]
+    } | {
+        initializer.name for initializer in model.graph.initializer
+    } | {
+        output
+        for graph_node in model.graph.node
+        for output in graph_node.output
+        if output
+    }
+    if name in existing:
+        raise ImportFailure(f"encoder attention initializer collision {name!r}")
+    model.graph.initializer.extend([
+        onnx.numpy_helper.from_array(np.asarray(values, dtype=np.int64), name)
+    ])
+    del node.input[1:]
+    node.input.extend([name])
+    _set_int_attribute(node, "allowzero", 0, onnx=onnx)
+
+
+def _replace_with_identity(node: Any, source: str) -> None:
+    node.op_type = "Identity"
+    node.domain = ""
+    del node.input[:]
+    node.input.extend([source])
+    del node.attribute[:]
+
+
+def _derived_batch_dimensions(model: Any, *, role: str, onnx: Any) -> list[str]:
+    result = []
+    batch = _SymbolicExtent.symbol(3, "B")
+    for value in _nested_value_infos(model, onnx.ValueInfoProto):
+        for dimension in value.type.tensor_type.shape.dim:
+            if not dimension.HasField("dim_param"):
+                continue
+            spelling = str(dimension.dim_param)
+            extent = _parse_symbolic_extent(spelling, role=role)
+            if extent is None or extent.equivalent(batch):
+                continue
+            depends_on_batch = any(
+                powers[3] != 0
+                for polynomial in (extent.numerator, extent.denominator)
+                for powers, _coefficient in polynomial
+            )
+            if depends_on_batch:
+                result.append(f"{value.name}:{spelling}")
+    return sorted(set(result))
+
+
+def _rewrite_encoder_attention_batch_layout(model: Any, *, onnx: Any) -> dict[str, int]:
+    """Keep producer self-attention batch/head axes independently typed.
+
+    The producer temporarily flattens ``B*H`` around Q/K/V and the mask, and
+    ``B*M`` around the output projection. Those products are valid ONNX shape
+    programs but cannot be represented as independent bounded Volvox
+    dimensions. The attention MatMuls already use rank-four operands, so this
+    pass removes only the flatten/unflatten round trips and authors the output
+    projection as a rank-three MatMul plus Add. No product extent is renamed
+    to an unrelated atomic dimension.
+    """
+
+    import numpy as np
+
+    if not _derived_batch_dimensions(model, role="encoder", onnx=onnx):
+        return {
+            "attention_qkv_layouts_rewritten": 0,
+            "attention_mask_layouts_rewritten": 0,
+            "attention_key_transposes_rewritten": 0,
+            "attention_output_projections_rewritten": 0,
+        }
+
+    nodes = list(model.graph.node)
+    producer = {
+        output: index
+        for index, node in enumerate(nodes)
+        for output in node.output
+        if output
+    }
+    consumers = _node_consumers(nodes)
+    tensor_names = {
+        name
+        for node in nodes
+        for name in [*node.input, *node.output]
+        if name
+    } | {
+        value.name
+        for value in [
+            *model.graph.input,
+            *model.graph.value_info,
+            *model.graph.output,
+            *model.graph.initializer,
+        ]
+    }
+    shapes = {
+        value.name: _value_symbolic_shape(value, role="encoder")
+        for value in [*model.graph.input, *model.graph.value_info, *model.graph.output]
+    }
+    shape_values: dict[str, Any] = {}
+    for name, array in _small_constant_arrays(model, onnx=onnx).items():
+        if np.asarray(array).dtype.kind in "iu":
+            shape_values[name] = _symbolic_array(array, np)
+    batch = _SymbolicExtent.symbol(3, "B")
+    memory = _SymbolicExtent.symbol(0) + IMAGE_TOKENS
+    heads = _SymbolicExtent.constant(KV_HEADS)
+    width = _SymbolicExtent.constant(KV_HEAD_WIDTH)
+    feature = _SymbolicExtent.constant(KV_HEADS * KV_HEAD_WIDTH)
+
+    def shape(name: str) -> list[_SymbolicExtent | None] | None:
+        return shapes.get(name)
+
+    def set_shape(name: str, extents: Sequence[_SymbolicExtent | int]) -> None:
+        symbolic = [
+            extent if isinstance(extent, _SymbolicExtent) else _SymbolicExtent.constant(extent)
+            for extent in extents
+        ]
+        _set_existing_value_shape(model, name, symbolic, role="encoder")
+        shapes[name] = symbolic
+
+    def shape_value(name: str) -> Any:
+        cached = shape_values.get(name)
+        if cached is not None:
+            return cached
+        node_index = producer.get(name)
+        if node_index is None:
+            raise ImportFailure(f"encoder attention shape tensor {name!r} has no producer")
+        node = nodes[node_index]
+        if node.op_type == "Shape":
+            source_shape = shape(node.input[0])
+            if source_shape is None or any(extent is None for extent in source_shape):
+                raise ImportFailure("encoder attention Shape input is not symbolically complete")
+            start = _onnx_int_attribute(node, "start", 0)
+            end = _onnx_int_attribute(node, "end", len(source_shape))
+            result = np.asarray(source_shape[start:end], dtype=object)
+        elif node.op_type == "Slice":
+            data = np.asarray(shape_value(node.input[0]), dtype=object)
+            starts = [
+                _symbolic_integer(value, "encoder attention Slice start")
+                for value in np.asarray(shape_value(node.input[1]), dtype=object).reshape(-1)
+            ]
+            ends = [
+                _symbolic_integer(value, "encoder attention Slice end")
+                for value in np.asarray(shape_value(node.input[2]), dtype=object).reshape(-1)
+            ]
+            axes = (
+                [
+                    _symbolic_integer(value, "encoder attention Slice axis")
+                    for value in np.asarray(
+                        shape_value(node.input[3]), dtype=object
+                    ).reshape(-1)
+                ]
+                if len(node.input) > 3 and node.input[3]
+                else list(range(len(starts)))
+            )
+            steps = (
+                [
+                    _symbolic_integer(value, "encoder attention Slice step")
+                    for value in np.asarray(
+                        shape_value(node.input[4]), dtype=object
+                    ).reshape(-1)
+                ]
+                if len(node.input) > 4 and node.input[4]
+                else [1] * len(starts)
+            )
+            if not (
+                len(starts) == len(ends) == len(axes) == len(steps)
+            ):
+                raise ImportFailure(
+                    "encoder attention Slice parameter lengths differ"
+                )
+            normalized_axes: list[int] = []
+            for axis, step in zip(axes, steps):
+                if step == 0:
+                    raise ImportFailure("encoder attention Slice step must be nonzero")
+                normalized_axis = axis + data.ndim if axis < 0 else axis
+                if normalized_axis < 0 or normalized_axis >= data.ndim:
+                    raise ImportFailure("encoder attention Slice axis is out of range")
+                if normalized_axis in normalized_axes:
+                    raise ImportFailure("encoder attention Slice axes must be unique")
+                normalized_axes.append(normalized_axis)
+            slices = [slice(None)] * data.ndim
+            for start, end, axis, step in zip(
+                starts, ends, normalized_axes, steps
+            ):
+                slices[axis] = slice(start, end, step)
+            result = data[tuple(slices)]
+        elif node.op_type == "Concat":
+            result = np.concatenate(
+                [np.atleast_1d(shape_value(input_name)) for input_name in node.input],
+                axis=_onnx_int_attribute(node, "axis", 0),
+            )
+        elif node.op_type in {"Squeeze", "Unsqueeze"}:
+            source = np.asarray(shape_value(node.input[0]), dtype=object)
+            axes = [
+                _symbolic_integer(value, f"encoder attention {node.op_type} axis")
+                for value in np.asarray(
+                    shape_value(node.input[1]), dtype=object
+                ).reshape(-1)
+            ] if len(node.input) > 1 else []
+            if node.op_type == "Squeeze":
+                result = (
+                    np.squeeze(source)
+                    if not axes
+                    else np.squeeze(source, axis=tuple(axes))
+                )
+            else:
+                result = source
+                for axis in sorted(axes):
+                    result = np.expand_dims(result, axis=axis)
+        elif node.op_type == "Gather":
+            indices = np.asarray([
+                _symbolic_integer(value, "encoder attention Gather index")
+                for value in np.asarray(
+                    shape_value(node.input[1]), dtype=object
+                ).reshape(-1)
+            ], dtype=np.int64).reshape(
+                np.asarray(shape_value(node.input[1])).shape
+            )
+            result = np.take(
+                shape_value(node.input[0]),
+                indices,
+                axis=_onnx_int_attribute(node, "axis", 0),
+            )
+        elif node.op_type in {"Add", "Sub", "Mul", "Div"}:
+            left = shape_value(node.input[0])
+            right = shape_value(node.input[1])
+            result = {
+                "Add": lambda: left + right,
+                "Sub": lambda: left - right,
+                "Mul": lambda: left * right,
+                "Div": lambda: left / right,
+            }[node.op_type]()
+        elif node.op_type == "Cast":
+            result = shape_value(node.input[0])
+        elif node.op_type == "Reshape":
+            target = [
+                _symbolic_integer(value, "encoder attention shape-value Reshape")
+                for value in np.asarray(
+                    shape_value(node.input[1]), dtype=object
+                ).reshape(-1)
+            ]
+            result = np.asarray(
+                shape_value(node.input[0]), dtype=object
+            ).reshape(tuple(target))
+        else:
+            raise ImportFailure(
+                f"encoder attention shape tensor {name!r} uses unsupported "
+                f"{node.op_type}"
+            )
+        shape_values[name] = result
+        return result
+
+    def resolved_reshape_shape(
+        node: Any,
+        input_shape: Sequence[_SymbolicExtent | None],
+    ) -> list[_SymbolicExtent]:
+        if len(node.input) < 2:
+            raise ImportFailure("encoder attention Reshape has no target")
+        target = [
+            _as_symbolic_extent(value)
+            for value in np.asarray(shape_value(node.input[1]), dtype=object).reshape(-1)
+        ]
+        return _resolved_reshape_target(
+            input_shape,
+            target,
+            allowzero=bool(_onnx_int_attribute(node, "allowzero", 0)),
+            label=f"encoder attention {node.name or 'Reshape'}",
+        )
+
+    def single_consumer(name: str, op_type: str) -> int:
+        uses = consumers.get(name, [])
+        if (
+            len(uses) != 1
+            or uses[0][1] != 0
+            or nodes[uses[0][0]].op_type != op_type
+        ):
+            raise ImportFailure(
+                f"encoder attention tensor {name!r} must feed input 0 of one "
+                f"{op_type}"
+            )
+        return uses[0][0]
+
+    qkv_count = 0
+    for final_index, final in enumerate(nodes):
+        if (
+            final.op_type != "Reshape"
+            or not final.input
+            or not final.output
+            or not _symbolic_shapes_equivalent(
+                shape(final.output[0]), [batch, heads, memory, width]
+            )
+        ):
+            continue
+        transpose_index = producer.get(final.input[0])
+        if transpose_index is None or nodes[transpose_index].op_type != "Transpose":
+            continue
+        transpose = nodes[transpose_index]
+        first_index = producer.get(transpose.input[0])
+        if first_index is None or nodes[first_index].op_type != "Reshape":
+            continue
+        first = nodes[first_index]
+        if not (
+            _symbolic_shapes_equivalent(shape(first.input[0]), [memory, batch, feature])
+            and _symbolic_shapes_equivalent(
+                shape(first.output[0]), [memory, batch * KV_HEADS, width]
+            )
+            and _symbolic_shapes_equivalent(
+                shape(transpose.output[0]), [batch * KV_HEADS, memory, width]
+            )
+        ):
+            continue
+        if not _symbolic_shapes_equivalent(
+            resolved_reshape_shape(first, [memory, batch, feature]),
+            [memory, batch * KV_HEADS, width],
+        ):
+            raise ImportFailure("encoder attention Q/K/V flatten target changed")
+        transpose_permutation = next(
+            (
+                list(attribute.ints)
+                for attribute in transpose.attribute
+                if attribute.name == "perm"
+            ),
+            None,
+        )
+        if transpose_permutation != [1, 0, 2]:
+            raise ImportFailure("encoder attention Q/K/V transpose changed")
+        if not _symbolic_shapes_equivalent(
+            resolved_reshape_shape(
+                final, [batch * KV_HEADS, memory, width]
+            ),
+            [batch, heads, memory, width],
+        ):
+            raise ImportFailure("encoder attention Q/K/V restore target changed")
+        if consumers.get(first.output[0], []) != [(transpose_index, 0)]:
+            raise ImportFailure("encoder attention Q/K/V head layout is shared")
+        if consumers.get(transpose.output[0], []) != [(final_index, 0)]:
+            raise ImportFailure("encoder attention Q/K/V batch layout is shared")
+        _set_reshape_target(
+            model,
+            first,
+            [0, 0, KV_HEADS, KV_HEAD_WIDTH],
+            name=f"__volvox_encoder_attention_qkv_shape_{first_index}",
+            onnx=onnx,
+        )
+        set_shape(first.output[0], [memory, batch, heads, width])
+        _set_ints_attribute(transpose, "perm", [1, 2, 0, 3], onnx=onnx)
+        set_shape(transpose.output[0], [batch, heads, memory, width])
+        _replace_with_identity(final, transpose.output[0])
+        set_shape(final.output[0], [batch, heads, memory, width])
+        qkv_count += 1
+
+    mask_count = 0
+    for flattened in nodes:
+        if (
+            flattened.op_type != "Reshape"
+            or not flattened.input
+            or not flattened.output
+            or not _symbolic_shapes_equivalent(
+                shape(flattened.input[0]), [batch, heads, 1, memory]
+            )
+            or not _symbolic_shapes_equivalent(
+                shape(flattened.output[0]), [batch * KV_HEADS, 1, memory]
+            )
+        ):
+            continue
+        restored_index = single_consumer(flattened.output[0], "Reshape")
+        restored = nodes[restored_index]
+        if not _symbolic_shapes_equivalent(
+            resolved_reshape_shape(
+                flattened, [batch, heads, 1, memory]
+            ),
+            [batch * KV_HEADS, 1, memory],
+        ):
+            raise ImportFailure("encoder attention mask flatten target changed")
+        if not _symbolic_shapes_equivalent(
+            shape(restored.output[0]), [batch, heads, 1, memory]
+        ):
+            raise ImportFailure("encoder attention mask restored the wrong batch layout")
+        if not _symbolic_shapes_equivalent(
+            resolved_reshape_shape(
+                restored, [batch * KV_HEADS, 1, memory]
+            ),
+            [batch, heads, 1, memory],
+        ):
+            raise ImportFailure("encoder attention mask restore target changed")
+        _replace_with_identity(flattened, flattened.input[0])
+        set_shape(flattened.output[0], [batch, heads, 1, memory])
+        _replace_with_identity(restored, flattened.output[0])
+        set_shape(restored.output[0], [batch, heads, 1, memory])
+        mask_count += 1
+
+    key_count = 0
+    for flattened in nodes:
+        if (
+            flattened.op_type != "Reshape"
+            or not flattened.input
+            or not flattened.output
+            or not _symbolic_shapes_equivalent(
+                shape(flattened.input[0]), [batch, heads, memory, width]
+            )
+        ):
+            continue
+        transpose_index = single_consumer(flattened.output[0], "Transpose")
+        transpose = nodes[transpose_index]
+        restored_index = single_consumer(transpose.output[0], "Reshape")
+        restored = nodes[restored_index]
+        flattened_shape = resolved_reshape_shape(
+            flattened,
+            [batch, heads, memory, width],
+        )
+        if not _symbolic_shapes_equivalent(
+            flattened_shape, [batch * KV_HEADS, memory, width]
+        ):
+            raise ImportFailure("encoder attention key flatten target changed")
+        if not _symbolic_shapes_compatible(
+            shape(flattened.output[0]), [batch * KV_HEADS, memory, width]
+        ):
+            raise ImportFailure("encoder attention key flatten metadata changed")
+        permutation = next(
+            (list(attribute.ints) for attribute in transpose.attribute if attribute.name == "perm"),
+            None,
+        )
+        if permutation != [0, 2, 1]:
+            raise ImportFailure("encoder attention key transpose permutation changed")
+        transposed_shape = [batch * KV_HEADS, width, memory]
+        if not _symbolic_shapes_compatible(
+            shape(transpose.output[0]), transposed_shape
+        ):
+            raise ImportFailure("encoder attention key transpose metadata changed")
+        restored_shape = resolved_reshape_shape(restored, transposed_shape)
+        if not _symbolic_shapes_equivalent(
+            restored_shape, [batch, heads, width, memory]
+        ):
+            raise ImportFailure("encoder attention key restore target changed")
+        if not _symbolic_shapes_compatible(
+            shape(restored.output[0]), [batch, heads, width, memory]
+        ):
+            raise ImportFailure(
+                "encoder attention key restore metadata changed for "
+                f"{restored.output[0]!r}: {shape(restored.output[0])!r}"
+            )
+        _replace_with_identity(flattened, flattened.input[0])
+        set_shape(flattened.output[0], [batch, heads, memory, width])
+        _set_ints_attribute(transpose, "perm", [0, 1, 3, 2], onnx=onnx)
+        set_shape(transpose.output[0], [batch, heads, width, memory])
+        _replace_with_identity(restored, transpose.output[0])
+        set_shape(restored.output[0], [batch, heads, width, memory])
+        key_count += 1
+
+    initializers = {value.name: value for value in model.graph.initializer}
+    projection_replacements: dict[int, list[Any]] = {}
+    projection_count = 0
+    for index, gemm in enumerate(nodes):
+        if (
+            gemm.op_type != "Gemm"
+            or len(gemm.input) != 3
+            or ".self_attn.out_proj.weight" not in gemm.input[1]
+            or not gemm.output
+        ):
+            continue
+        activation_name = gemm.input[0]
+        activation_path: list[Any] = []
+        while activation_name in producer and nodes[producer[activation_name]].op_type in {
+            "QuantizeLinear", "DequantizeLinear",
+        }:
+            passthrough = nodes[producer[activation_name]]
+            activation_path.append(passthrough)
+            activation_name = passthrough.input[0]
+        reshape_index = producer.get(activation_name)
+        if reshape_index is None or nodes[reshape_index].op_type != "Reshape":
+            raise ImportFailure("encoder attention projection input is not a Reshape")
+        reshape = nodes[reshape_index]
+        transpose_index = producer.get(reshape.input[0])
+        if transpose_index is None or nodes[transpose_index].op_type != "Transpose":
+            raise ImportFailure("encoder attention projection input has no layout Transpose")
+        transpose = nodes[transpose_index]
+        if not _symbolic_shapes_equivalent(
+            shape(transpose.input[0]), [batch, heads, memory, width]
+        ) or not _symbolic_shapes_equivalent(
+            shape(transpose.output[0]), [memory, batch, heads, width]
+        ):
+            raise ImportFailure("encoder attention projection has the wrong source layout")
+        transpose_permutation = next(
+            (
+                list(attribute.ints)
+                for attribute in transpose.attribute
+                if attribute.name == "perm"
+            ),
+            None,
+        )
+        if transpose_permutation != [2, 0, 1, 3]:
+            raise ImportFailure("encoder attention projection transpose changed")
+        if consumers.get(transpose.output[0], []) != [(reshape_index, 0)]:
+            raise ImportFailure("encoder attention projection source layout is shared")
+        original_projection_shape = resolved_reshape_shape(
+            reshape,
+            [memory, batch, heads, width],
+        )
+        if not _symbolic_shapes_equivalent(
+            original_projection_shape,
+            [batch * memory, feature],
+        ):
+            raise ImportFailure("encoder attention projection flatten target changed")
+        _set_ints_attribute(transpose, "perm", [0, 2, 1, 3], onnx=onnx)
+        set_shape(transpose.output[0], [batch, memory, heads, width])
+        _set_reshape_target(
+            model,
+            reshape,
+            [0, 0, KV_HEADS * KV_HEAD_WIDTH],
+            name=f"__volvox_encoder_attention_projection_shape_{index}",
+            onnx=onnx,
+        )
+        set_shape(reshape.output[0], [batch, memory, feature])
+        for passthrough in reversed(activation_path):
+            set_shape(passthrough.output[0], [batch, memory, feature])
+        current_activation = reshape.output[0]
+        for passthrough in reversed(activation_path):
+            passthrough_index = producer[passthrough.output[0]]
+            if consumers.get(current_activation, []) != [(passthrough_index, 0)]:
+                raise ImportFailure(
+                    "encoder attention projection quantization layout is shared"
+                )
+            current_activation = passthrough.output[0]
+        if (
+            current_activation != gemm.input[0]
+            or consumers.get(current_activation, []) != [(index, 0)]
+        ):
+            raise ImportFailure("encoder attention projection activation is shared")
+
+        weight_name = gemm.input[1]
+        attributes = {attribute.name: attribute for attribute in gemm.attribute}
+        if set(attributes) != {"transA", "transB", "alpha", "beta"} or (
+            attributes["transA"].i != 0
+            or attributes["transB"].i != 1
+            or attributes["alpha"].f != 1.0
+            or attributes["beta"].f != 1.0
+        ):
+            raise ImportFailure("encoder attention projection Gemm attributes changed")
+        weight_dq = (
+            nodes[producer[weight_name]]
+            if weight_name in producer
+            and nodes[producer[weight_name]].op_type == "DequantizeLinear"
+            else None
+        )
+        raw_weight_name = weight_dq.input[0] if weight_dq is not None else weight_name
+        raw_weight = initializers.get(raw_weight_name)
+        if raw_weight is None or tuple(raw_weight.dims) != (
+            KV_HEADS * KV_HEAD_WIDTH,
+            KV_HEADS * KV_HEAD_WIDTH,
+        ):
+            raise ImportFailure("encoder attention projection weight is not immutable 320x320")
+        if consumers.get(weight_name, []) != [(index, 1)]:
+            raise ImportFailure("encoder attention projection weight is unexpectedly shared")
+        if weight_dq is not None:
+            weight_dq_index = producer[weight_name]
+            if (
+                len(weight_dq.input) != 3
+                or _onnx_int_attribute(weight_dq, "axis", 1) != 0
+                or consumers.get(raw_weight_name, []) != [(weight_dq_index, 0)]
+            ):
+                raise ImportFailure(
+                    "encoder attention projection weight DQ layout is not axis-0 private"
+                )
+            scale = initializers.get(weight_dq.input[1])
+            zero = initializers.get(weight_dq.input[2])
+            if scale is None or zero is None:
+                raise ImportFailure("encoder attention projection weight DQ is not immutable")
+            if (
+                consumers.get(weight_dq.input[1], []) != [(weight_dq_index, 1)]
+                or consumers.get(weight_dq.input[2], []) != [(weight_dq_index, 2)]
+            ):
+                raise ImportFailure(
+                    "encoder attention projection weight DQ parameters are shared"
+                )
+            scale_array = onnx.numpy_helper.to_array(scale)
+            zero_array = onnx.numpy_helper.to_array(zero)
+            if (
+                scale_array.dtype != np.dtype(np.float32)
+                or scale_array.shape != (KV_HEADS * KV_HEAD_WIDTH,)
+                or not np.all(np.isfinite(scale_array))
+                or np.any(scale_array <= 0)
+                or zero_array.dtype != np.dtype(np.int8)
+                or zero_array.shape != (KV_HEADS * KV_HEAD_WIDTH,)
+            ):
+                raise ImportFailure("encoder attention projection weight DQ descriptor changed")
+        transposed_weight = np.ascontiguousarray(
+            onnx.numpy_helper.to_array(raw_weight).T
+        )
+        raw_weight.CopyFrom(
+            onnx.numpy_helper.from_array(transposed_weight, raw_weight_name)
+        )
+        if weight_dq is not None:
+            _set_int_attribute(weight_dq, "axis", 1, onnx=onnx)
+
+        original_output = gemm.output[0]
+        matrix_output = f"__volvox_encoder_attention_projection_{projection_count}"
+        if matrix_output in tensor_names:
+            raise ImportFailure(f"encoder attention tensor collision {matrix_output!r}")
+        tensor_names.add(matrix_output)
+        model.graph.value_info.extend([
+            onnx.helper.make_tensor_value_info(
+                matrix_output,
+                onnx.TensorProto.FLOAT,
+                ["B", "M", KV_HEADS * KV_HEAD_WIDTH],
+            )
+        ])
+        shapes[matrix_output] = [batch, memory, feature]
+        projection_replacements[index] = [
+            onnx.helper.make_node(
+                "MatMul",
+                [gemm.input[0], weight_name],
+                [matrix_output],
+                name=f"{gemm.name or f'Gemm_{index}'}__rank3",
+            ),
+            onnx.helper.make_node(
+                "Add",
+                [matrix_output, gemm.input[2]],
+                [original_output],
+                name=gemm.name or f"volvox_encoder_attention_projection_{index}",
+            ),
+        ]
+        set_shape(original_output, [batch, memory, feature])
+
+        current = original_output
+        while True:
+            uses = consumers.get(current, [])
+            if len(uses) != 1:
+                raise ImportFailure(
+                    f"encoder attention projection tensor {current!r} must have one consumer"
+                )
+            consumer = nodes[uses[0][0]]
+            if consumer.op_type not in {"QuantizeLinear", "DequantizeLinear"}:
+                break
+            set_shape(consumer.output[0], [batch, memory, feature])
+            current = consumer.output[0]
+        restored = consumer
+        if restored.op_type != "Reshape" or not restored.output:
+            raise ImportFailure("encoder attention projection has no restoring Reshape")
+        original_restored_shape = resolved_reshape_shape(
+            restored,
+            [batch * memory, feature],
+        )
+        if not _symbolic_shapes_equivalent(
+            original_restored_shape,
+            [memory, batch, feature],
+        ):
+            raise ImportFailure("encoder attention projection restore target changed")
+        _replace_with_identity(restored, current)
+        set_shape(restored.output[0], [batch, memory, feature])
+        final_index = single_consumer(restored.output[0], "Transpose")
+        final = nodes[final_index]
+        final_permutation = next(
+            (list(attribute.ints) for attribute in final.attribute if attribute.name == "perm"),
+            None,
+        )
+        if final_permutation != [1, 0, 2]:
+            raise ImportFailure("encoder attention projection final transpose changed")
+        _replace_with_identity(final, restored.output[0])
+        set_shape(final.output[0], [batch, memory, feature])
+        projection_count += 1
+
+    if projection_replacements:
+        rewritten_nodes = []
+        for index, node in enumerate(nodes):
+            rewritten_nodes.extend(projection_replacements.get(index, [node]))
+        del model.graph.node[:]
+        model.graph.node.extend(rewritten_nodes)
+
+    expected = {
+        "Q/K/V layouts": (qkv_count, 18),
+        "mask layouts": (mask_count, 1),
+        "key transposes": (key_count, 6),
+        "output projections": (projection_count, 6),
+    }
+    mismatches = [
+        f"{label}={actual}, expected {wanted}"
+        for label, (actual, wanted) in expected.items()
+        if actual != wanted
+    ]
+    if mismatches:
+        raise ImportFailure(
+            "encoder derived batch layout is not the qualified attention pattern: "
+            + "; ".join(mismatches)
+        )
+    remaining = _derived_batch_dimensions(model, role="encoder", onnx=onnx)
+    if remaining:
+        raise ImportFailure(
+            "encoder attention rewrite retained unsafe derived batch extents "
+            f"{remaining}"
+        )
+    return {
+        "attention_qkv_layouts_rewritten": qkv_count,
+        "attention_mask_layouts_rewritten": mask_count,
+        "attention_key_transposes_rewritten": key_count,
+        "attention_output_projections_rewritten": projection_count,
+    }
 
 
 def _canonicalize_derived_dimension_expressions(
@@ -1591,7 +2370,7 @@ def _rewrite_position_slice(
         model,
         node.output[0],
         [
-            _SymbolicExtent.constant(1, preferred_symbol="B"),
+            _SymbolicExtent.symbol(3, preferred_symbol="B"),
             expected_extent,
             _SymbolicExtent.constant(320),
         ],
@@ -1772,7 +2551,9 @@ def _rewrite_mask_shape_programs(
             target_values = list(np.asarray(target, dtype=object).reshape(-1))
             if (
                 len(target_values) == 2
-                and target_values[0].equivalent(1)
+                and target_values[0].equivalent(
+                    _SymbolicExtent.symbol(3, "B")
+                )
                 and target_values[1].equivalent(IMAGE_TOKENS)
             ):
                 axes_name = "__volvox_encoder_image_padding_axes"
@@ -2075,8 +2856,6 @@ def _normalized_kv_onnx_symbols(
             "question_length": "Q",
             "question_length + 210": "M",
             "memory_length": "M",
-            "8*batch": KV_HEADS,
-            "batch*(question_length + 210)": "M",
         }
         required = {"batch", "question_length", "question_length + 210"}
     elif role == "decoder":
@@ -2192,9 +2971,12 @@ def _normalized_kv_onnx_symbols(
             if value.name not in declared_names
         ])
         nodes_before = len(model.graph.node)
+        semantic_rewrite.update(
+            _rewrite_encoder_attention_batch_layout(model, onnx=onnx)
+        )
         semantic_rewrite = _rewrite_dynamic_authoring_graph(
             model, role=role, onnx=onnx
-        )
+        ) | semantic_rewrite
         executable_nodes_rewritten = nodes_before - len(model.graph.node)
         semantic_rewrite["inference_unknowns_refreshed"] = (
             _refresh_inference_unknown_value_infos(model, role=role, onnx=onnx)
@@ -2268,6 +3050,7 @@ def _verify_dynamic_authoring_parity(
     normalized: Path,
     *,
     role: str,
+    max_batch_size: int = 1,
 ) -> dict[str, Any]:
     """Compare the semantic-input rewrite with the producer at active extents."""
 
@@ -2279,47 +3062,71 @@ def _verify_dynamic_authoring_parity(
             "NumPy and ONNX Runtime are required for dynamic authoring parity"
         ) from error
 
+    absolute_tolerance = 4.0e-6
+    relative_tolerance = 1.0e-5
+
     cases = [
-        ("short", SHAPE_PROFILES["short"]),
-        ("representative", SHAPE_PROFILES["representative"]),
-        ("maximum", SHAPE_PROFILES["maximum"]),
-        ("short_after_maximum", SHAPE_PROFILES["short"]),
-        ("representative_after_short", SHAPE_PROFILES["representative"]),
+        ("short", SHAPE_PROFILES["short"], 1),
+        ("representative", SHAPE_PROFILES["representative"], 1),
+        ("maximum", SHAPE_PROFILES["maximum"], 1),
+        ("short_after_maximum", SHAPE_PROFILES["short"], 1),
+        ("representative_after_short", SHAPE_PROFILES["representative"], 1),
     ]
+    if max_batch_size > 1:
+        cases.append((
+            "batch_max_distinct_lanes",
+            SHAPE_PROFILES["short"],
+            max_batch_size,
+        ))
     try:
+        options = ort.SessionOptions()
+        options.intra_op_num_threads = 1
+        options.inter_op_num_threads = 1
         original_session = ort.InferenceSession(
             str(source),
+            sess_options=options,
             providers=["CPUExecutionProvider"],
         )
         normalized_session = ort.InferenceSession(
             str(normalized),
+            sess_options=options,
             providers=["CPUExecutionProvider"],
         )
     except Exception as error:
         raise ImportFailure(f"{role} dynamic authoring parity setup failed: {error}") from error
 
     maximum_difference = 0.0
+    maximum_relative_difference = 0.0
     reports = []
-    for case_name, profile in cases:
+    for case_name, profile, batch_size in cases:
         if role == "encoder":
             active = profile["Q"]
             question_ids = (
-                np.arange(active, dtype=np.int64).reshape(1, active) % 64
+                np.arange(batch_size * active, dtype=np.int64).reshape(
+                    batch_size, active
+                ) % 64
             ) + 4
+            images = np.zeros(
+                (batch_size, IMAGE_CHANNELS, IMAGE_HEIGHT, IMAGE_WIDTH),
+                dtype=np.float32,
+            )
+            family_ids = np.asarray([-1], dtype=np.int64)
+            if batch_size > 1:
+                images += np.arange(batch_size, dtype=np.float32).reshape(
+                    batch_size, 1, 1, 1
+                ) * np.float32(0.03125)
+                family_ids = np.arange(batch_size, dtype=np.int64) % len(FAMILY_ORDER)
             original_inputs = {
-                "image": np.zeros(
-                    (1, IMAGE_CHANNELS, IMAGE_HEIGHT, IMAGE_WIDTH),
-                    dtype=np.float32,
-                ),
+                "image": images,
                 "question_ids": question_ids,
-                "family_ids": np.asarray([-1], dtype=np.int64),
+                "family_ids": family_ids,
             }
             normalized_inputs = {
                 **original_inputs,
-                POSITION_INPUTS[role][0]: np.arange(
-                    active,
-                    dtype=np.int64,
-                ).reshape(1, active),
+                POSITION_INPUTS[role][0]: np.broadcast_to(
+                    np.arange(active, dtype=np.int64),
+                    (batch_size, active),
+                ).copy(),
             }
         else:
             active = profile["T"]
@@ -2328,21 +3135,31 @@ def _verify_dynamic_authoring_parity(
             causal_mask[np.triu_indices(active, 1)] = -np.inf
             original_inputs = {
                 "decoder_input_ids": (
-                    np.arange(active, dtype=np.int64).reshape(1, active) % 64
+                    np.arange(
+                        batch_size * active, dtype=np.int64
+                    ).reshape(batch_size, active) % 64
                 ) + 1,
-                "memory": np.zeros((1, memory_length, 320), dtype=np.float32),
+                "memory": np.zeros(
+                    (batch_size, memory_length, 320), dtype=np.float32
+                ),
                 "memory_padding_mask": np.zeros(
-                    (1, memory_length),
+                    (batch_size, memory_length),
                     dtype=np.bool_,
                 ),
-                "family_ids": np.asarray([0], dtype=np.int64),
+                "family_ids": (
+                    np.arange(batch_size, dtype=np.int64) % len(FAMILY_ORDER)
+                ),
             }
+            if batch_size > 1:
+                original_inputs["memory"] += np.arange(
+                    batch_size, dtype=np.float32
+                ).reshape(batch_size, 1, 1) * np.float32(0.03125)
             normalized_inputs = {
                 **original_inputs,
-                POSITION_INPUTS[role][0]: np.arange(
-                    active,
-                    dtype=np.int64,
-                ).reshape(1, active),
+                POSITION_INPUTS[role][0]: np.broadcast_to(
+                    np.arange(active, dtype=np.int64),
+                    (batch_size, active),
+                ).copy(),
                 CAUSAL_MASK_INPUT: causal_mask,
             }
         try:
@@ -2355,6 +3172,7 @@ def _verify_dynamic_authoring_parity(
         if len(original_outputs) != len(normalized_outputs):
             raise ImportFailure(f"{role} dynamic authoring parity output count changed")
         case_difference = 0.0
+        case_relative_difference = 0.0
         for output_index, (original, authored) in enumerate(
             zip(original_outputs, normalized_outputs)
         ):
@@ -2362,14 +3180,44 @@ def _verify_dynamic_authoring_parity(
                 raise ImportFailure(
                     f"{role} dynamic authoring parity output {output_index} ABI changed"
                 )
+            if original.ndim == 0 or original.shape[0] != batch_size:
+                raise ImportFailure(
+                    f"{role} dynamic authoring parity output {output_index} "
+                    "did not preserve the requested leading batch axis"
+                )
             if original.dtype.kind == "f":
-                difference = float(np.max(np.abs(original - authored), initial=0.0))
-                if not np.array_equal(original, authored):
+                if not (
+                    np.all(np.isfinite(original))
+                    and np.all(np.isfinite(authored))
+                ):
                     raise ImportFailure(
                         f"{role} dynamic authoring parity case {case_name!r} "
-                        f"changed output {output_index} by {difference}"
+                        f"produced non-finite output {output_index}"
+                    )
+                absolute = np.abs(original - authored)
+                difference = float(np.max(absolute, initial=0.0))
+                relative_difference = float(np.max(
+                    absolute / np.maximum(
+                        np.abs(original),
+                        np.asarray(1.0e-6, dtype=original.dtype),
+                    ),
+                    initial=0.0,
+                ))
+                if not np.allclose(
+                    original,
+                    authored,
+                    rtol=relative_tolerance,
+                    atol=absolute_tolerance,
+                ):
+                    raise ImportFailure(
+                        f"{role} dynamic authoring parity case {case_name!r} "
+                        f"changed output {output_index} by abs={difference}, "
+                        f"rel={relative_difference}"
                     )
                 case_difference = max(case_difference, difference)
+                case_relative_difference = max(
+                    case_relative_difference, relative_difference
+                )
             elif not np.array_equal(original, authored):
                 raise ImportFailure(
                     f"{role} dynamic authoring parity case {case_name!r} "
@@ -2383,19 +3231,26 @@ def _verify_dynamic_authoring_parity(
                     f"decoder dynamic authoring parity case {case_name!r} changed greedy IDs"
                 )
         maximum_difference = max(maximum_difference, case_difference)
+        maximum_relative_difference = max(
+            maximum_relative_difference, case_relative_difference
+        )
         reports.append({
             "case": case_name,
-            "B": profile["B"],
+            "B": batch_size,
             "Q": profile["Q"],
             "T": profile["T"],
             "M": profile["M"],
             "max_abs_difference": case_difference,
+            "max_relative_difference": case_relative_difference,
         })
     return {
         "status": "passed",
         "provider": "CPUExecutionProvider",
         "cases": reports,
         "maximum_absolute_difference": maximum_difference,
+        "maximum_relative_difference": maximum_relative_difference,
+        "absolute_tolerance": absolute_tolerance,
+        "relative_tolerance": relative_tolerance,
         "greedy_argmax": "matched" if role == "decoder" else "not_applicable",
     }
 
@@ -3102,6 +3957,13 @@ def _validate_kv_source(
     _validate_kv_variant_manifest(
         manifest, files, has_int8_w8a8=bool(present_int8_keys)
     )
+    exporter_contract = manifest.get("exporter")
+    if not isinstance(exporter_contract, Mapping):
+        raise ImportFailure("KV source manifest requires exporter batch provenance")
+    producer_max_batch_size = _positive_int(
+        exporter_contract.get("max_batch_size"),
+        "KV source manifest exporter.max_batch_size",
+    )
 
     required_config = {
         "vocab_size": BPE_VOCAB_SIZE,
@@ -3144,7 +4006,7 @@ def _validate_kv_source(
         raise ImportFailure("KV source generation contract is invalid")
     cache = manifest.get("kv_cache")
     if not isinstance(cache, Mapping) or (
-        cache.get("format") != "tiny_receipt_vqa_default_kv_cache_v1"
+        cache.get("format") != "tiny_receipt_vqa_default_kv_cache_v2"
         or cache.get("default_for") != ["fp32", "int8_w8a8"]
     ):
         raise ImportFailure("KV source cache declaration is invalid")
@@ -3245,6 +4107,7 @@ def _validate_kv_source(
         "tokenizer": tokenizer,
         "hashes": hashes,
         "memory_length": IMAGE_TOKENS + MAX_Q,
+        "producer_max_batch_size": producer_max_batch_size,
     }
 
 
@@ -3273,7 +4136,7 @@ def validate_source(source: Path, *, variant: str = "fp32") -> dict[str, Any]:
 def verify_explicit_kv_sentinel(source: Mapping[str, Any]) -> dict[str, Any]:
     """Prove the positive P=1 seed is equivalent to the producer's P=0 seed.
 
-    Volvox bounded dimensions intentionally reject zero extents.  The v1
+    Volvox bounded dimensions intentionally reject zero extents.  The v2
     package therefore carries one all-zero self-cache slot whose padding-mask
     bit is true.  This qualification executes every adapter family and proves
     that the visible token and newly appended cache are unchanged.
@@ -4001,6 +4864,7 @@ def _import_kv_package(
     weight_dtype: str,
     exporter: Callable[[Sequence[str]], None],
     parity: Mapping[str, Any],
+    max_batch_size: int,
 ) -> Path:
     """Compile and publish the v1 one-token explicit-cache package."""
 
@@ -4010,12 +4874,12 @@ def _import_kv_package(
     source_hashes_before = dict(source["hashes"])
     original_selected_paths = source["selected_paths"]
     encoder_dimensions = {
-        "B": {"min": 1, "max": 1},
+        "B": {"min": 1, "max": max_batch_size},
         "Q": {"min": 1, "max": MAX_Q},
         "M": {"min": IMAGE_TOKENS + 1, "max": IMAGE_TOKENS + MAX_Q},
     }
     decoder_dimensions = {
-        "B": {"min": 1, "max": 1},
+        "B": {"min": 1, "max": max_batch_size},
         "M": {"min": IMAGE_TOKENS + 1, "max": IMAGE_TOKENS + MAX_Q},
         "P": {"min": 1, "max": MAX_T - 1},
         "R": {"min": 2, "max": MAX_T},
@@ -4047,6 +4911,7 @@ def _import_kv_package(
                 original_selected_paths["encoder"],
                 selected_paths["encoder"],
                 role="encoder",
+                max_batch_size=max_batch_size,
             ),
             "decoder": {
                 "status": "not_applicable",
@@ -4305,9 +5170,9 @@ def _import_kv_package(
                 "tie_policy": "first-index",
             },
             "shape_contract": {
-                "graph_shape_mode": "bounded-explicit-kv-v1",
+                "graph_shape_mode": "bounded-explicit-kv-v2",
                 "dimensions": {
-                    "B": {"min": 1, "max": 1},
+                    "B": {"min": 1, "max": max_batch_size},
                     "Q": {"min": 1, "max": MAX_Q},
                     "M": {"min": IMAGE_TOKENS + 1, "max": IMAGE_TOKENS + MAX_Q},
                     "P": {"min": 1, "max": MAX_T - 1},
@@ -4413,6 +5278,7 @@ def import_package(
     weight_dtype: str = "auto",
     exporter: Callable[[Sequence[str]], None] = _run_exporter,
     parity_verifier: Callable[[Mapping[str, Any]], Mapping[str, Any]] | None = None,
+    max_batch_size: int = 1,
 ) -> Path:
     requested_targets = normalize_targets(targets)
     source_directory = source_directory.resolve(strict=True)
@@ -4424,6 +5290,10 @@ def import_package(
         raise ImportFailure("output directory must not be inside the immutable source")
 
     source = validate_source(source_directory, variant=variant)
+    max_batch_size = _validated_max_batch_size(
+        max_batch_size,
+        source["producer_max_batch_size"],
+    )
     verifier = parity_verifier or verify_explicit_kv_sentinel
     parity = dict(verifier(source))
     return _import_kv_package(
@@ -4434,6 +5304,7 @@ def import_package(
         weight_dtype=weight_dtype,
         exporter=exporter,
         parity=parity,
+        max_batch_size=max_batch_size,
     )
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
@@ -4464,6 +5335,15 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         default="auto",
         choices=("auto", "float32", "float16"),
     )
+    parser.add_argument(
+        "--max-batch-size",
+        type=int,
+        default=1,
+        help=(
+            "retain the producer's leading batch axis with bounded domain "
+            "1..N (bounded by the source manifest; default: 1)"
+        ),
+    )
     return parser.parse_args(argv)
 
 
@@ -4476,6 +5356,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             variant=args.variant,
             targets=args.targets,
             weight_dtype=args.weight_dtype,
+            max_batch_size=args.max_batch_size,
         )
     except (ImportFailure, OSError, ValueError) as error:
         print(f"[TinyReceipt split ONNX import] {error}", file=sys.stderr)

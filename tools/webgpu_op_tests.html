@@ -175,7 +175,7 @@ async function runCase(cpuRuntime, gpuRuntime, spec) {
   // Reference on CPU
   const cpuModel = buildSnapshot(spec);
   const expected = spec.expected || Array.from(
-    await executeSnapshot(cpuRuntime, cpuModel, 'cpu', spec.inputData || {}),
+    await executeSnapshot(cpuRuntime, cpuModel, 'cpu-js', spec.inputData || {}),
   );
 
   // WebGPU
@@ -687,7 +687,7 @@ const specs = [
   let validationDevice;
   try {
     if (!navigator.gpu) { out.textContent = 'FATAL no navigator.gpu'; return; }
-    cpuRuntime = await VolvoxAI.createRuntime({ backends: ['cpu'] });
+    cpuRuntime = await VolvoxAI.createRuntime({ backends: ['cpu-js'] });
     gpuRuntime = await VolvoxAI.createRuntime({ backends: ['webgpu'] });
     const adapter = await navigator.gpu.requestAdapter();
     const info = adapter.info || {};

@@ -152,6 +152,7 @@ static CudaTrainingOptimizerMirror* cuda_training_optimizer_mirror(
 int cuda_training_optimizer_materialize(float* first_moment,
                                         float* second_moment,
                                         size_t bytes) {
+    if (!cuda_context_state_get()) return 0;
     CudaTrainingOptimizerMirror* mirror = cuda_training_optimizer_mirror(
         first_moment, second_moment, bytes, 0);
     if (!mirror || !mirror->device_dirty) return 0;
@@ -166,6 +167,7 @@ int cuda_training_optimizer_materialize(float* first_moment,
 
 void cuda_training_optimizer_forget(float* first_moment,
                                     float* second_moment) {
+    if (!cuda_context_state_get()) return;
     CudaTrainingOptimizerMirror** link = &cuda_training_optimizer_mirrors;
     while (*link) {
         CudaTrainingOptimizerMirror* mirror = *link;

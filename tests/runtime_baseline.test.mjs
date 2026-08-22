@@ -92,7 +92,7 @@ test('portable runtime baseline emits bounded CPU lifecycle evidence', (t) => {
   const evidence = JSON.parse(stdout);
 
   assert.equal(evidence.schema, 'volvoxai.runtime-baseline/v1');
-  assert.equal(evidence.environment.backend, 'cpu');
+  assert.equal(evidence.environment.backend, 'cpu-js');
   assert.equal(evidence.environment.explicitGc, true);
   assert.deepEqual(evidence.workload.shape, [1, 32]);
   assert.equal(evidence.workload.measurementRuns, 2);
@@ -112,8 +112,8 @@ test('portable runtime baseline emits bounded CPU lifecycle evidence', (t) => {
     resultCloseIsIdempotent: true,
     allOwnersClosed: true,
   });
-  assert.equal(evidence.runtime.compilation.selectedBackend, 'cpu');
-  assert.equal(evidence.runtime.execution.backend, 'cpu');
+  assert.equal(evidence.runtime.compilation.selectedBackend, 'cpu-js');
+  assert.equal(evidence.runtime.execution.backend, 'cpu-js');
   assert.match(evidence.runtime.execution.contextId, /^context-/);
   assert.equal(evidence.budgets.twoIdleContextsToOneMutableStorageRatio, 2.2);
   const idleOneBytes = evidence.memory.deltasFromRetainedBaseline.oneIdleContext.arrayBufferBytes;
@@ -170,7 +170,7 @@ test('padded-static baseline records batch, sequence, and spatial parity', () =>
 
   assert.equal(evidence.schema, 'volvoxai.padded-static-baseline/v1');
   assert.deepEqual(evidence.protocol, {
-    backend: 'cpu', samples: 5, warmup: 1, order: 'alternating',
+    backend: 'cpu-js', samples: 5, warmup: 1, order: 'alternating',
   });
   assert.deepEqual(evidence.results.map((result) => result.name), [
     'batch-linear', 'sequence-linear', 'spatial-conv2d',
@@ -193,14 +193,14 @@ test('dynamic-shape performance protocol separates cold, warm, alternating, and 
     '--import',
     'tsx',
     'tools/dynamic_shape_performance.mjs',
-    '--backend=cpu',
+    '--backend=cpu-js',
     '--samples=3',
     '--warmup=0',
   ], { cwd: ROOT, encoding: 'utf8' });
   const evidence = JSON.parse(stdout);
 
   assert.equal(evidence.schema, 'volvoxai.dynamic-shape-performance/v1');
-  assert.equal(evidence.environment.backend, 'cpu');
+  assert.equal(evidence.environment.backend, 'cpu-js');
   assert.deepEqual(evidence.results.map((result) => result.name), [
     'batch-linear', 'sequence-linear', 'spatial-conv2d', 'multi-input-exact-add',
   ]);

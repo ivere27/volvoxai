@@ -13,11 +13,12 @@
  * kernel actually moved when a microkernel changes.
  */
 #include "../src/kernels/inference_kernels.h"
-#include "../src/kernels/quant_cpu_opt.h"
+#include "../src/kernels/quant_cpu_isa.h"
 #include "../src/kernels/thread_pool.h"
 #include "../src/kernels/kernel_platform.h"
-#include "../src/kernels/conv_f32_opt.h"
+#include "../src/kernels/conv_f32_isa.h"
 #include "../src/kernels/gemm_f32.h"
+#include "../src/kernels/tensor_f32_isa.h"
 #include "../src/runtime/runtime_state.h"
 #include "../include/volvoxai_enums.h"
 
@@ -453,6 +454,93 @@ static int vx_bench_dequantize(const VxBenchCase* c, int reps, int reference) {
     return ok;
 }
 
+/* Common native Transpose shapes.  c selects the reverse image permutation;
+ * a == 0 identifies a batched last-two-axis matrix transpose. */
+static int vx_bench_transpose_u8(const VxBenchCase* c, int reps,
+                                 int reference) {
+    const uint32_t image = c->a != 0u;
+    const uint32_t rank = image ? 4u : 3u;
+    const uint32_t shape[4] = {
+        c->m,
+        image && c->c ? c->a : c->k,
+        image && c->c ? c->k : c->n,
+        image && c->c ? c->n : c->a,
+    };
+    const uint32_t forward[4] = {0u, 3u, 1u, 2u};
+    const uint32_t reverse[4] = {0u, 2u, 3u, 1u};
+    const uint32_t matrix[3] = {0u, 2u, 1u};
+    const uint32_t* permutation = image ? (c->c ? reverse : forward) : matrix;
+    const size_t elements = image
+        ? (size_t)c->m * c->k * c->n * c->a
+        : (size_t)c->m * c->k * c->n;
+    uint8_t* in = (uint8_t*)vx_alloc(elements);
+    uint8_t* out = (uint8_t*)vx_alloc(elements);
+    uint8_t* ref = (uint8_t*)vx_alloc(elements);
+    int ok = 1;
+    vx_seed(241u + c->k + c->n + c->a + c->c);
+    vx_fill_u8(in, elements);
+    if (reference) {
+        ok = transpose_nd_i8u8(in, ref, shape, permutation, rank,
+                               (uint32_t)elements, VX_DTYPE_U8);
+        if (ok && (!vx_transpose_nd_i8u8_native_validated(
+                in, out, shape, permutation, rank, (uint32_t)elements,
+                VX_DTYPE_U8) || memcmp(out, ref, elements) != 0))
+            ok = -1;
+    }
+    if (ok > 0) {
+        VX_BENCH_TIME_BEGIN();
+        for (int i = 0; i < reps; i++)
+            vx_transpose_nd_i8u8_native_validated(
+                in, out, shape, permutation, rank, (uint32_t)elements,
+                VX_DTYPE_U8);
+        VX_BENCH_TIME_END(reps);
+    }
+    free(in); free(out); free(ref);
+    return ok;
+}
+
+static int vx_bench_transpose_f32(const VxBenchCase* c, int reps,
+                                  int reference) {
+    const uint32_t image = c->a != 0u;
+    const uint32_t rank = image ? 4u : 3u;
+    const uint32_t shape[4] = {
+        c->m,
+        image && c->c ? c->a : c->k,
+        image && c->c ? c->k : c->n,
+        image && c->c ? c->n : c->a,
+    };
+    const uint32_t forward[4] = {0u, 3u, 1u, 2u};
+    const uint32_t reverse[4] = {0u, 2u, 3u, 1u};
+    const uint32_t matrix[3] = {0u, 2u, 1u};
+    const uint32_t* permutation = image ? (c->c ? reverse : forward) : matrix;
+    const size_t elements = image
+        ? (size_t)c->m * c->k * c->n * c->a
+        : (size_t)c->m * c->k * c->n;
+    float* in = (float*)vx_alloc(elements * sizeof(float));
+    float* out = (float*)vx_alloc(elements * sizeof(float));
+    float* ref = (float*)vx_alloc(elements * sizeof(float));
+    int ok = 1;
+    vx_seed(251u + c->k + c->n + c->a + c->c);
+    vx_fill_f32(in, elements, 8.0f);
+    if (reference) {
+        ok = transpose_nd_f32(in, ref, shape, permutation, rank,
+                              (uint32_t)elements);
+        if (ok && (!vx_transpose_nd_f32_native_validated(
+                in, out, shape, permutation, rank, (uint32_t)elements) ||
+                memcmp(out, ref, elements * sizeof(float)) != 0))
+            ok = -1;
+    }
+    if (ok > 0) {
+        VX_BENCH_TIME_BEGIN();
+        for (int i = 0; i < reps; i++)
+            vx_transpose_nd_f32_native_validated(
+                in, out, shape, permutation, rank, (uint32_t)elements);
+        VX_BENCH_TIME_END(reps);
+    }
+    free(in); free(out); free(ref);
+    return ok;
+}
+
 /* ------------------------------------------------------------- F32 kernels */
 /*
  * The F32 kernels need a different correctness rule than the quantized ones.
@@ -599,7 +687,7 @@ static int vx_bench_conv2d_f32(const VxBenchCase* c, int reps, int reference) {
             vx_conv2d_generic_f32(0, in, out, weight, bias, 1, height, width,
                                   in_c, height, width, out_c, 3, 3, in_c, 1,
                                   1, 1, pads, 1, 1, 0);
-    vx_conv_f32_opt_free_all();
+    vx_conv_f32_isa_free_all();
     free(in); free(weight); free(bias); free(out); free(ref);
     return ok;
 }
@@ -821,12 +909,17 @@ static const VxBenchEntry vx_bench_entries[] = {
   {{"qlinear",         "QLinearMatMul",  "402x320x320",          402,  320,  320,  0,  0, 0, VX_UNIT_MAC, 0}, vx_bench_qlinear},
   {{"qlinear",         "QLinearMatMul",  "402x320x1280",         402,  320, 1280,  0,  0, 0, VX_UNIT_MAC, 0}, vx_bench_qlinear},
   {{"qlinear",         "QLinearMatMul",  "402x1280x320",         402, 1280,  320,  0,  0, 0, VX_UNIT_MAC, 0}, vx_bench_qlinear},
+  {{"qlinear",         "QLinearMatMul",  "218x320x320",          218,  320,  320,  0,  0, 0, VX_UNIT_MAC, 0}, vx_bench_qlinear},
+  {{"qlinear",         "QLinearMatMul",  "218x320x960",          218,  320,  960,  0,  0, 0, VX_UNIT_MAC, 0}, vx_bench_qlinear},
+  {{"qlinear",         "QLinearMatMul",  "218x320x1280",         218,  320, 1280,  0,  0, 0, VX_UNIT_MAC, 0}, vx_bench_qlinear},
+  {{"qlinear",         "QLinearMatMul",  "218x1280x320",         218, 1280,  320,  0,  0, 0, VX_UNIT_MAC, 0}, vx_bench_qlinear},
   {{"qlinear",         "QLinearMatMul",  "1x320x320",              1,  320,  320,  0,  0, 0, VX_UNIT_MAC, 0}, vx_bench_qlinear},
   {{"qlinear",         "QLinearMatMul",  "13440x432x96",       13440,  432,   96,  0,  0, 0, VX_UNIT_MAC, 0}, vx_bench_qlinear},
   {{"qlinear_raw",     "QLinearMatMul",  "402x320x320",          402,  320,  320,  0,  0, 0, VX_UNIT_MAC, 0}, vx_bench_qlinear_raw},
   {{"qlinear_raw",     "QLinearMatMul",  "402x64x320",           402,   64,  320,  0,  0, 0, VX_UNIT_MAC, 0}, vx_bench_qlinear_raw},
   {{"qlinear_raw",     "QLinearMatMul",  "402x1280x320",         402, 1280,  320,  0,  0, 0, VX_UNIT_MAC, 0}, vx_bench_qlinear_raw},
   {{"qbatch_matmul",   "QLinearMatMul",  "attention 218x40x218", 218,   40,  218,  0,  0, 0, VX_UNIT_MAC, 0}, vx_bench_qbatch_matmul},
+  {{"qbatch_matmul",   "QLinearMatMul",  "attention 218x218x40", 218,  218,   40,  0,  0, 0, VX_UNIT_MAC, 0}, vx_bench_qbatch_matmul},
   {{"qbatch_matmul",   "QLinearMatMul",  "dynamic 218x320x64",   218,  320,   64,  0,  0, 0, VX_UNIT_MAC, 0}, vx_bench_qbatch_matmul},
   {{"qbatch_matmul",   "QLinearMatMul",  "dynamic 218x64x320",   218,   64,  320,  0,  0, 0, VX_UNIT_MAC, 0}, vx_bench_qbatch_matmul},
   {{"qbatch_matmul",   "QLinearMatMul",  "decode 1x40x218",        1,   40,  218,  0,  0, 0, VX_UNIT_MAC, 0}, vx_bench_qbatch_matmul},
@@ -844,6 +937,12 @@ static const VxBenchEntry vx_bench_entries[] = {
   {{"qadd",            "QLinearAdd",     "402x320",           128640,    0,    0,  0,  0, 0, VX_UNIT_BYTE,0}, vx_bench_qadd},
   {{"quantizelinear",  "QuantizeLinear", "402x320",           128640,    0,    0,  0,  0, 0, VX_UNIT_BYTE,0}, vx_bench_quantize},
   {{"dequantizelinear","DequantizeLinear","402x320",          128640,    0,    0,  0,  0, 0, VX_UNIT_BYTE,0}, vx_bench_dequantize},
+  {{"transpose_u8",    "Transpose",      "NHWC 1x80x168x96",       1,   80,  168, 96,  0, 0, VX_UNIT_BYTE,0}, vx_bench_transpose_u8},
+  {{"transpose_u8",    "Transpose",      "NCHW 1x96x80x168",       1,   80,  168, 96,  0, 1, VX_UNIT_BYTE,0}, vx_bench_transpose_u8},
+  {{"transpose_u8",    "Transpose",      "matrix 8x218x40",        8,  218,   40,  0,  0, 0, VX_UNIT_BYTE,0}, vx_bench_transpose_u8},
+  {{"transpose_f32",   "Transpose",      "NHWC 1x80x168x96",       1,   80,  168, 96,  0, 0, VX_UNIT_BYTE,0}, vx_bench_transpose_f32},
+  {{"transpose_f32",   "Transpose",      "NCHW 1x96x80x168",       1,   80,  168, 96,  0, 1, VX_UNIT_BYTE,0}, vx_bench_transpose_f32},
+  {{"transpose_f32",   "Transpose",      "matrix 8x218x40",        8,  218,   40,  0,  0, 0, VX_UNIT_BYTE,0}, vx_bench_transpose_f32},
   /* F32 counterparts of the same encoder/decoder shapes.  These are what the
    * FP32 package executes, so they place the FP32 and INT8 kernels for one
    * shape side by side instead of only measuring the quantized half. */
@@ -853,6 +952,9 @@ static const VxBenchEntry vx_bench_entries[] = {
   {{"gemm_f32_packed", "MatMul",         "1x320x320",              1,  320,  320,  0,  0, 0, VX_UNIT_MAC, 0}, vx_bench_gemm_f32_packed},
   {{"matmul_f32",      "MatMul",         "402x320x320",          402,  320,  320,  0,  0, 0, VX_UNIT_MAC, 0}, vx_bench_matmul_f32},
   {{"matmul_f32",      "MatMul",         "192x402x320",          192,  402,  320,  0,  0, 0, VX_UNIT_MAC, 0}, vx_bench_matmul_f32},
+  {{"matmul_f32_attention", "BatchMatMul", "attention 218x40x218", 218,  40,  218,  0,  0, 0, VX_UNIT_MAC, 0}, vx_bench_matmul_f32},
+  {{"matmul_f32_attention", "BatchMatMul", "attention 218x218x40", 218, 218,   40,  0,  0, 0, VX_UNIT_MAC, 0}, vx_bench_matmul_f32},
+  {{"matmul_f32_attention", "BatchMatMul", "decode 1x40x218",         1,  40,  218,  0,  0, 0, VX_UNIT_MAC, 0}, vx_bench_matmul_f32},
   /* Shapes no model in this repository runs today.  They are here because the
    * dense cases above are all one model's encoder, and a kernel tuned only
    * against them looked healthy while collapsing by an order of magnitude as K
@@ -925,6 +1027,18 @@ static double vx_case_work(const VxBenchEntry* e) {
         return 2.0 * c->m * (c->a + 1.0) / 2.0 * c->k;
     if (e->run == vx_bench_groupnorm_f32)
         return (double)c->a * c->b * c->k;
+    if (e->run == vx_bench_transpose_u8) {
+        const double elements = c->a
+            ? (double)c->m * c->k * c->n * c->a
+            : (double)c->m * c->k * c->n;
+        return 2.0 * elements;
+    }
+    if (e->run == vx_bench_transpose_f32) {
+        const double elements = c->a
+            ? (double)c->m * c->k * c->n * c->a
+            : (double)c->m * c->k * c->n;
+        return 2.0 * sizeof(float) * elements;
+    }
     return (double)c->m;
 }
 
@@ -939,8 +1053,9 @@ int main(int argc, char** argv) {
         else if (!strcmp(argv[i], "--help")) {
             printf("Usage: %s [--op <name>] [--threads <n>] [--no-check]\n", argv[0]);
             printf("Emits CSV: kernel,onnx_op,shape,unit,work,ms,throughput,exact\n");
-            printf("Set VOLVOXAI_CPU_ISA=baseline|avx2|avxvnni|avx512vnni to "
-                   "clamp the ISA tier and compare tiers on one machine.\n");
+            printf("Set VOLVOXAI_CPU_ISA=baseline|neon|neondotprod|neoni8mm|"
+                   "sve2|avx2|avxvnni|avx512vnni to clamp the ISA tier and "
+                   "compare tiers on one machine.\n");
             return 0;
         }
     }

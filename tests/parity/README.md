@@ -22,7 +22,7 @@ cannot publish a result under another provider's label.
 
 The suite has two references:
 
-- The portable CPU implementation is the internal consistency reference.
+- The portable CPU JS implementation is the internal consistency reference.
 - ONNX Runtime or pinned PyTorch execution is the independent correctness
   reference where a case provides one.
 
@@ -155,10 +155,10 @@ not already exercised by a required-tier L1/L2 case or a shipped L3 model. The
 combined case inventory covers all 66 operators in the generated portable
 inventory, but six operators are L3-only: Embedding, MaxPool2D, QAdd,
 RequantizeLinear, Reshape, and ResizeNearest2D. Therefore `parity_portable`
-verifies only the focused CPU/WASM/native-CPU closure; it is not a 66-operator
+verifies only the focused CPU-JS/WASM/native-CPU closure; it is not a 66-operator
 four-provider result by itself.
 
-A full portable-inventory claim requires current whole-model CPU/WASM/native-CPU
+A full portable-inventory claim requires current whole-model CPU-JS/WASM/native-CPU
 manifests, current physical whole-model WebGPU artifacts, and the physical
 closure artifacts. Run the campaigns in that order:
 
@@ -177,7 +177,7 @@ Training cases create a retained Trainer from an immutable logical snapshot:
 
 ~~~javascript
 const trainer = await VolvoxAI.createTrainer(sourceSnapshot, {
-  backend: 'cpu',
+  backend: 'cpu-js',
 });
 
 const step = await trainer.trainStep(options);
@@ -191,7 +191,7 @@ effects, and the returned immutable successor revision. Step metadata must
 remain stable after later updates. `trainStep()` never mutates its source;
 `rollback()` restores the last committed baseline.
 
-Run physical WebGPU backward after authoring its CPU/WASM campaign:
+Run physical WebGPU backward after authoring its CPU-JS/WASM campaign:
 
 ~~~bash
 node tests/parity/backward/run_backward.mjs
@@ -251,12 +251,11 @@ addition to tensor closeness.
 
 | Tier | Trigger | Role |
 | --- | --- | --- |
-| CPU, WASM, required native CPU | every CI revision | hard portable gate |
+| CPU JS, WASM, required native CPU | every CI revision | hard portable gate |
 | physical WebGPU execution | trusted protected revision/nightly | hard dynamic-v1 hardware gate |
 | native Vulkan/OpenGL capability probes | trusted protected revision/nightly | exact registry/policy-backed audit; skips are not parity |
 | qualified native Vulkan/OpenGL execution | manual until qualification | future L1/L2 gate; consensus remains diagnostic until lifecycle evidence is sealed |
 | individual GPU targets | manual | development |
-| WebNN hardware | not configured | open work |
 
 Persistent hardware runners execute trusted repository revisions only.
 Repository administrators must also configure branch/deployment protection;

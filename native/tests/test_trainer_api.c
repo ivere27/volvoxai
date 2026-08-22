@@ -323,7 +323,7 @@ int main(void) {
     {
         VxTrainer* unavailable = NULL;
         VxTrainerOptions exact = VX_TRAINER_OPTIONS_INIT;
-        exact.backend = "nnapi";
+        exact.backend = "unsupported-backend";
         CHECK(vx_model_create_trainer(model, &exact, &unavailable, &report) ==
               VX_STATUS_BACKEND_UNSUPPORTED);
         CHECK(unavailable == NULL &&

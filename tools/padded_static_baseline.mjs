@@ -140,7 +140,7 @@ function parity(left, right) {
 
 async function compileGraph(runtime, snapshot) {
   const compiled = await runtime.compile(snapshot, {
-    backend: { mode: 'require', backend: 'cpu', operatorFallback: 'forbid' },
+    backend: { mode: 'require', backend: 'cpu-js', operatorFallback: 'forbid' },
   });
   const context = await compiled.createContext();
   return { compiled, context };
@@ -313,7 +313,7 @@ async function main() {
 
   const originalLog = console.log;
   console.log = (...values) => process.stderr.write(`${values.join(' ')}\n`);
-  const runtime = await VolvoxAI.createRuntime({ backends: ['cpu'] });
+  const runtime = await VolvoxAI.createRuntime({ backends: ['cpu-js'] });
   try {
     const results = [];
     for (const workload of workloads) {
@@ -327,7 +327,7 @@ async function main() {
         platform: process.platform,
         architecture: process.arch,
       },
-      protocol: { backend: 'cpu', samples, warmup, order: 'alternating' },
+      protocol: { backend: 'cpu-js', samples, warmup, order: 'alternating' },
       results,
     }, null, 2));
   } finally {

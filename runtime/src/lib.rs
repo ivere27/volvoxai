@@ -6,13 +6,16 @@ use std::fs;
 use std::path::Path;
 use std::sync::{
     atomic::{AtomicU64, Ordering},
-    Mutex, MutexGuard,
+    Arc, Mutex, MutexGuard,
 };
 
 // prost-generated messages for package `volvoxai.runtime`.
 pub mod pb {
     include!(concat!(env!("OUT_DIR"), "/volvoxai.runtime.rs"));
 }
+
+pub mod memory_evidence;
+mod memory_capture;
 
 // Synurang-generated dispatcher and plugin trait.
 #[path = "gen/volvoxai_ffi_plugin.rs"]
@@ -24,8 +27,11 @@ use abi::*;
 use ffi::{register_runtime_service_plugin, FfiError, RuntimeServicePlugin};
 use pb::*;
 
+const GRPC_CANCELLED: i32 = 1;
 const INVALID_ARGUMENT: i32 = 3;
+const GRPC_DEADLINE_EXCEEDED: i32 = 4;
 const NOT_FOUND: i32 = 5;
+const RESOURCE_EXHAUSTED: i32 = 8;
 const FAILED_PRECONDITION: i32 = 9;
 const ABORTED: i32 = 10;
 const INTERNAL: i32 = 13;
@@ -184,15 +190,36 @@ fn report_message(report: &VxReport) -> OperationReport {
         fallback_evidence: native_text(&report.fallback_evidence),
         offending_node: native_text(&report.offending_node),
         decode_state: native_text(&report.decode_state),
+        // VxReport stays unchanged. The runtime-scoped capture adapter adds
+        // evidence after this lossless native-report conversion.
+        memory_evidence: None,
     }
+}
+
+fn validate_report_memory_evidence(report: OperationReport) -> Result<OperationReport, FfiError> {
+    if let Some(evidence) = report.memory_evidence.as_ref() {
+        memory_evidence::validate_memory_evidence(evidence).map_err(|error| {
+            service_error(
+                format!("native returned invalid memory evidence: {error}"),
+                INTERNAL,
+            )
+        })?;
+    }
+    Ok(report)
 }
 
 fn grpc_code_for_native(status: c_int) -> i32 {
     match status {
         VX_STATUS_INVALID_ARGUMENT | VX_STATUS_INVALID_GRAPH => INVALID_ARGUMENT,
         VX_STATUS_NOT_FOUND => NOT_FOUND,
-        VX_STATUS_HANDLE_DISPOSED | VX_STATUS_RESULT_DISPOSED => FAILED_PRECONDITION,
-        VX_STATUS_REVISION_CONFLICT => ABORTED,
+        VX_STATUS_HANDLE_DISPOSED
+        | VX_STATUS_RESULT_DISPOSED
+        | VX_STATUS_SESSION_RESET_REQUIRED => FAILED_PRECONDITION,
+        VX_STATUS_REVISION_CONFLICT | VX_STATUS_SUPERSEDED => ABORTED,
+        VX_STATUS_BUSY => UNAVAILABLE,
+        VX_STATUS_OVERLOADED => RESOURCE_EXHAUSTED,
+        VX_STATUS_CANCELLED => GRPC_CANCELLED,
+        VX_STATUS_DEADLINE_EXCEEDED => GRPC_DEADLINE_EXCEEDED,
         VX_STATUS_BACKEND_UNAVAILABLE
         | VX_STATUS_BACKEND_UNSUPPORTED
         | VX_STATUS_BACKEND_REQUIRED
@@ -203,7 +230,7 @@ fn grpc_code_for_native(status: c_int) -> i32 {
 
 fn check_native(status: c_int, report: &VxReport) -> Result<OperationReport, FfiError> {
     if status == VX_STATUS_OK {
-        return Ok(report_message(report));
+        return validate_report_memory_evidence(report_message(report));
     }
     let converted = report_message(report);
     let detail = if converted.message.is_empty() {
@@ -820,17 +847,24 @@ fn native_optimizer_options(
 
 macro_rules! retained_handle {
     ($guard:ident, $native:ident, $release:ident) => {
-        struct $guard(*mut $native);
+        struct $guard {
+            pointer: *mut $native,
+            capture: memory_capture::MemoryCaptureToken,
+        }
 
         impl $guard {
             fn pointer(&self) -> *mut $native {
-                self.0
+                self.pointer
+            }
+
+            fn capture(&self) -> &memory_capture::MemoryCaptureToken {
+                &self.capture
             }
         }
 
         impl Drop for $guard {
             fn drop(&mut self) {
-                unsafe { $release(self.0) };
+                unsafe { $release(self.pointer) };
             }
         }
     };
@@ -854,16 +888,33 @@ retained_handle!(PtqPlanGuard, VxPTQPlan, vx_ptq_plan_release);
 
 #[derive(Default)]
 struct HandleRegistry {
-    entries: Mutex<HashMap<String, usize>>,
+    entries: Mutex<HashMap<String, HandleEntry>>,
+}
+
+#[derive(Clone)]
+struct HandleEntry {
+    pointer: usize,
+    capture: memory_capture::MemoryCaptureToken,
 }
 
 impl HandleRegistry {
-    fn insert(&self, id: String, pointer: *mut c_void) {
+    fn insert(
+        &self,
+        id: String,
+        pointer: *mut c_void,
+        capture: memory_capture::MemoryCaptureToken,
+    ) {
         debug_assert!(!pointer.is_null());
-        lock(&self.entries).insert(id, pointer as usize);
+        lock(&self.entries).insert(
+            id,
+            HandleEntry {
+                pointer: pointer as usize,
+                capture,
+            },
+        );
     }
 
-    fn remove(&self, id: &str, kind: &str) -> Result<usize, FfiError> {
+    fn remove(&self, id: &str, kind: &str) -> Result<HandleEntry, FfiError> {
         lock(&self.entries)
             .remove(id)
             .ok_or_else(|| service_error(format!("unknown {kind} handle {id}"), NOT_FOUND))
@@ -873,6 +924,7 @@ impl HandleRegistry {
 struct Plugin {
     next_handle: AtomicU64,
     runtimes: HandleRegistry,
+    memory_capture: Arc<memory_capture::MemoryCaptureRegistry>,
     models: HandleRegistry,
     compiled_models: HandleRegistry,
     contexts: HandleRegistry,
@@ -886,6 +938,7 @@ impl Default for Plugin {
         Self {
             next_handle: AtomicU64::new(1),
             runtimes: HandleRegistry::default(),
+            memory_capture: Arc::new(memory_capture::MemoryCaptureRegistry::default()),
             models: HandleRegistry::default(),
             compiled_models: HandleRegistry::default(),
             contexts: HandleRegistry::default(),
@@ -903,78 +956,140 @@ impl Plugin {
     }
 
     fn runtime(&self, id: &str) -> Result<RuntimeGuard, FfiError> {
-        let entries = lock(&self.runtimes.entries);
-        let pointer = entries
-            .get(id)
-            .copied()
-            .ok_or_else(|| service_error(format!("unknown runtime handle {id}"), NOT_FOUND))?
-            as *mut VxRuntime;
-        unsafe { vx_runtime_retain(pointer) };
-        Ok(RuntimeGuard(pointer))
+        let (pointer, capture) = {
+            let entries = lock(&self.runtimes.entries);
+            let entry = entries
+                .get(id)
+                .ok_or_else(|| service_error(format!("unknown runtime handle {id}"), NOT_FOUND))?;
+            let pointer = entry.pointer as *mut VxRuntime;
+            unsafe { vx_runtime_retain(pointer) };
+            (pointer, entry.capture.clone())
+        };
+        Ok(RuntimeGuard { pointer, capture })
+    }
+
+    fn capture_report(
+        &self,
+        capture: &memory_capture::MemoryCaptureToken,
+        report: OperationReport,
+    ) -> Result<OperationReport, FfiError> {
+        let report = capture.attach(report).map_err(|error| {
+            service_error(format!("memory capture failed: {error}"), INTERNAL)
+        })?;
+        validate_report_memory_evidence(report)
+    }
+
+    fn checked_report(
+        &self,
+        capture: &memory_capture::MemoryCaptureToken,
+        status: c_int,
+        report: &VxReport,
+    ) -> Result<OperationReport, FfiError> {
+        self.capture_report(capture, check_native(status, report)?)
+    }
+
+    fn child_capture(
+        &self,
+        parent: &memory_capture::MemoryCaptureToken,
+        kind: MemoryOwnerKind,
+        owner_id: impl Into<String>,
+    ) -> Result<memory_capture::MemoryCaptureToken, FfiError> {
+        parent.child(kind, owner_id).map_err(|error| {
+            service_error(format!("memory capture subject failed: {error}"), INTERNAL)
+        })
+    }
+
+    fn native_child_capture(
+        &self,
+        parent: &memory_capture::MemoryCaptureToken,
+        kind: MemoryOwnerKind,
+        owner_id: u64,
+    ) -> Result<memory_capture::MemoryCaptureToken, FfiError> {
+        if owner_id == 0 && parent.enabled() {
+            return Err(service_error(
+                "native report has no memory capture subject identity",
+                INTERNAL,
+            ));
+        }
+        self.child_capture(parent, kind, owner_id.to_string())
     }
 
     fn model(&self, id: &str) -> Result<ModelGuard, FfiError> {
-        let entries = lock(&self.models.entries);
-        let pointer = entries
-            .get(id)
-            .copied()
-            .ok_or_else(|| service_error(format!("unknown model handle {id}"), NOT_FOUND))?
-            as *mut VxModel;
-        unsafe { vx_model_retain(pointer) };
-        Ok(ModelGuard(pointer))
+        let (pointer, capture) = {
+            let entries = lock(&self.models.entries);
+            let entry = entries
+                .get(id)
+                .ok_or_else(|| service_error(format!("unknown model handle {id}"), NOT_FOUND))?;
+            let pointer = entry.pointer as *mut VxModel;
+            unsafe { vx_model_retain(pointer) };
+            (pointer, entry.capture.clone())
+        };
+        Ok(ModelGuard { pointer, capture })
     }
 
     fn compiled_model(&self, id: &str) -> Result<CompiledModelGuard, FfiError> {
-        let entries = lock(&self.compiled_models.entries);
-        let pointer = entries.get(id).copied().ok_or_else(|| {
-            service_error(format!("unknown compiled model handle {id}"), NOT_FOUND)
-        })? as *mut VxCompiledModel;
-        unsafe { vx_compiled_model_retain(pointer) };
-        Ok(CompiledModelGuard(pointer))
+        let (pointer, capture) = {
+            let entries = lock(&self.compiled_models.entries);
+            let entry = entries.get(id).ok_or_else(|| {
+                service_error(format!("unknown compiled model handle {id}"), NOT_FOUND)
+            })?;
+            let pointer = entry.pointer as *mut VxCompiledModel;
+            unsafe { vx_compiled_model_retain(pointer) };
+            (pointer, entry.capture.clone())
+        };
+        Ok(CompiledModelGuard { pointer, capture })
     }
 
     fn context(&self, id: &str) -> Result<ContextGuard, FfiError> {
-        let entries = lock(&self.contexts.entries);
-        let pointer = entries
-            .get(id)
-            .copied()
-            .ok_or_else(|| service_error(format!("unknown context handle {id}"), NOT_FOUND))?
-            as *mut VxExecutionContext;
-        unsafe { vx_execution_context_retain(pointer) };
-        Ok(ContextGuard(pointer))
+        let (pointer, capture) = {
+            let entries = lock(&self.contexts.entries);
+            let entry = entries
+                .get(id)
+                .ok_or_else(|| service_error(format!("unknown context handle {id}"), NOT_FOUND))?;
+            let pointer = entry.pointer as *mut VxExecutionContext;
+            unsafe { vx_execution_context_retain(pointer) };
+            (pointer, entry.capture.clone())
+        };
+        Ok(ContextGuard { pointer, capture })
     }
 
     fn result(&self, id: &str) -> Result<ResultGuard, FfiError> {
-        let entries = lock(&self.results.entries);
-        let pointer = entries
-            .get(id)
-            .copied()
-            .ok_or_else(|| service_error(format!("unknown result handle {id}"), NOT_FOUND))?
-            as *mut VxResult;
-        unsafe { vx_result_retain(pointer) };
-        Ok(ResultGuard(pointer))
+        let (pointer, capture) = {
+            let entries = lock(&self.results.entries);
+            let entry = entries
+                .get(id)
+                .ok_or_else(|| service_error(format!("unknown result handle {id}"), NOT_FOUND))?;
+            let pointer = entry.pointer as *mut VxResult;
+            unsafe { vx_result_retain(pointer) };
+            (pointer, entry.capture.clone())
+        };
+        Ok(ResultGuard { pointer, capture })
     }
 
     fn trainer(&self, id: &str) -> Result<TrainerGuard, FfiError> {
-        let entries = lock(&self.trainers.entries);
-        let pointer = entries
-            .get(id)
-            .copied()
-            .ok_or_else(|| service_error(format!("unknown trainer handle {id}"), NOT_FOUND))?
-            as *mut VxTrainer;
-        unsafe { vx_trainer_retain(pointer) };
-        Ok(TrainerGuard(pointer))
+        let (pointer, capture) = {
+            let entries = lock(&self.trainers.entries);
+            let entry = entries
+                .get(id)
+                .ok_or_else(|| service_error(format!("unknown trainer handle {id}"), NOT_FOUND))?;
+            let pointer = entry.pointer as *mut VxTrainer;
+            unsafe { vx_trainer_retain(pointer) };
+            (pointer, entry.capture.clone())
+        };
+        Ok(TrainerGuard { pointer, capture })
     }
 
     fn ptq_plan(&self, id: &str) -> Result<PtqPlanGuard, FfiError> {
-        let entries = lock(&self.ptq_plans.entries);
-        let pointer = entries
-            .get(id)
-            .copied()
-            .ok_or_else(|| service_error(format!("unknown PTQ plan handle {id}"), NOT_FOUND))?
-            as *mut VxPTQPlan;
-        unsafe { vx_ptq_plan_retain(pointer) };
-        Ok(PtqPlanGuard(pointer))
+        let (pointer, capture) = {
+            let entries = lock(&self.ptq_plans.entries);
+            let entry = entries
+                .get(id)
+                .ok_or_else(|| service_error(format!("unknown PTQ plan handle {id}"), NOT_FOUND))?;
+            let pointer = entry.pointer as *mut VxPTQPlan;
+            unsafe { vx_ptq_plan_retain(pointer) };
+            (pointer, entry.capture.clone())
+        };
+        Ok(PtqPlanGuard { pointer, capture })
     }
 
     fn context_inputs(
@@ -1014,7 +1129,11 @@ impl Plugin {
         })
     }
 
-    fn ptq_info(&self, plan: *mut VxPTQPlan) -> Result<PtqPlanInfo, FfiError> {
+    fn ptq_info(
+        &self,
+        plan: *mut VxPTQPlan,
+        capture: &memory_capture::MemoryCaptureToken,
+    ) -> Result<PtqPlanInfo, FfiError> {
         let mut native = VxPTQPlanInfo::new();
         let mut report = VxReport::new();
         let status = unsafe { vx_ptq_plan_info(plan, &mut native, &mut report) };
@@ -1102,6 +1221,7 @@ impl Plugin {
                 observed_values: parameters.observed_values,
             });
         }
+        let report = self.capture_report(capture, report)?;
         Ok(PtqPlanInfo {
             calibration_batches: native.calibration_batches,
             calibration_samples: native.calibration_samples,
@@ -1116,6 +1236,7 @@ impl Plugin {
         &self,
         result: *mut VxResult,
         report: OperationReport,
+        operation_capture: &memory_capture::MemoryCaptureToken,
     ) -> Result<ExecutionResultHandle, FfiError> {
         if result.is_null() {
             return Err(service_error(
@@ -1123,10 +1244,31 @@ impl Plugin {
                 INTERNAL,
             ));
         }
+        let report = match self.capture_report(operation_capture, report) {
+            Ok(report) => report,
+            Err(error) => {
+                unsafe { vx_result_release(result) };
+                return Err(error);
+            }
+        };
         let execution_id = unsafe { vx_result_execution_id(result) };
         let result_id = self.new_id("result");
-        self.results
-            .insert(result_id.clone(), result.cast::<c_void>());
+        let result_capture = match self.child_capture(
+            operation_capture,
+            MemoryOwnerKind::Result,
+            result_id.clone(),
+        ) {
+            Ok(capture) => capture,
+            Err(error) => {
+                unsafe { vx_result_release(result) };
+                return Err(error);
+            }
+        };
+        self.results.insert(
+            result_id.clone(),
+            result.cast::<c_void>(),
+            result_capture,
+        );
         Ok(ExecutionResultHandle {
             result_id,
             execution_id,
@@ -1143,10 +1285,22 @@ impl RuntimeServicePlugin for Plugin {
                 INVALID_ARGUMENT,
             ));
         }
+        let capture_policy = request
+            .memory_capture
+            .as_ref()
+            .map(memory_capture::validate_options)
+            .transpose()
+            .map_err(|error| service_error(error, INVALID_ARGUMENT))?;
         let options = VxRuntimeOptions {
             struct_size: std::mem::size_of::<VxRuntimeOptions>(),
             debug: i32::from(request.debug),
             cpu_threads: request.cpu_threads,
+            execution_mode: VX_EXECUTION_MODE_SCHEDULED,
+            max_scheduled_requests: 64,
+            max_scheduled_input_bytes: 64 * 1024 * 1024,
+            max_batch_delay_milliseconds: 0,
+            max_unconsumed_results: 64,
+            max_unconsumed_result_bytes: 64 * 1024 * 1024,
         };
         let mut runtime = std::ptr::null_mut();
         let mut report = VxReport::new();
@@ -1158,9 +1312,33 @@ impl RuntimeServicePlugin for Plugin {
                 INTERNAL,
             ));
         }
+        let native_runtime_id = report.runtime_id;
+        let runtime_capture = match self
+            .memory_capture
+            .register(native_runtime_id, capture_policy)
+        {
+            Ok(capture) => capture,
+            Err(error) => {
+                unsafe { vx_runtime_release(runtime) };
+                return Err(service_error(
+                    format!("memory capture registration failed: {error}"),
+                    INTERNAL,
+                ));
+            }
+        };
+        let report = match self.capture_report(&runtime_capture, report) {
+            Ok(report) => report,
+            Err(error) => {
+                unsafe { vx_runtime_release(runtime) };
+                return Err(error);
+            }
+        };
         let runtime_id = self.new_id("runtime");
-        self.runtimes
-            .insert(runtime_id.clone(), runtime.cast::<c_void>());
+        self.runtimes.insert(
+            runtime_id.clone(),
+            runtime.cast::<c_void>(),
+            runtime_capture,
+        );
         Ok(RuntimeHandle {
             runtime_id,
             report: Some(report),
@@ -1171,12 +1349,12 @@ impl RuntimeServicePlugin for Plugin {
         let runtime = self.runtime(&request.runtime_id)?;
         let mut report = VxReport::new();
         let status = unsafe { vx_runtime_close(runtime.pointer(), &mut report) };
-        check_native(status, &report)
+        self.checked_report(runtime.capture(), status, &report)
     }
 
     fn release_runtime(&self, request: RuntimeRef) -> Result<Empty, FfiError> {
-        let pointer = self.runtimes.remove(&request.runtime_id, "runtime")? as *mut VxRuntime;
-        unsafe { vx_runtime_release(pointer) };
+        let entry = self.runtimes.remove(&request.runtime_id, "runtime")?;
+        unsafe { vx_runtime_release(entry.pointer as *mut VxRuntime) };
         Ok(Empty {})
     }
 
@@ -1215,8 +1393,27 @@ impl RuntimeServicePlugin for Plugin {
                 INTERNAL,
             ));
         }
+        let model_capture = match self.native_child_capture(
+            runtime.capture(),
+            MemoryOwnerKind::Model,
+            report.model_id,
+        ) {
+            Ok(capture) => capture,
+            Err(error) => {
+                unsafe { vx_model_release(model) };
+                return Err(error);
+            }
+        };
+        let report = match self.capture_report(&model_capture, report) {
+            Ok(report) => report,
+            Err(error) => {
+                unsafe { vx_model_release(model) };
+                return Err(error);
+            }
+        };
         let model_id = self.new_id("model");
-        self.models.insert(model_id.clone(), model.cast::<c_void>());
+        self.models
+            .insert(model_id.clone(), model.cast::<c_void>(), model_capture);
         Ok(ModelHandle {
             model_id,
             report: Some(report),
@@ -1228,7 +1425,7 @@ impl RuntimeServicePlugin for Plugin {
         let mut revision = VxRevisionInfo::new();
         let mut report = VxReport::new();
         let status = unsafe { vx_model_revision_info(model.pointer(), &mut revision, &mut report) };
-        let report = check_native(status, &report)?;
+        let report = self.checked_report(model.capture(), status, &report)?;
         Ok(revision_message(&revision, report))
     }
 
@@ -1252,7 +1449,7 @@ impl RuntimeServicePlugin for Plugin {
         let status = unsafe {
             vx_model_publish_adapter(model.pointer(), &source, &mut published, &mut report)
         };
-        let report = check_native(status, &report)?;
+        let report = self.checked_report(model.capture(), status, &report)?;
         Ok(AdapterRevision {
             adapter_id: published.adapter_id,
             adapter_revision: published.adapter_revision,
@@ -1261,8 +1458,8 @@ impl RuntimeServicePlugin for Plugin {
     }
 
     fn release_model(&self, request: ModelRef) -> Result<Empty, FfiError> {
-        let pointer = self.models.remove(&request.model_id, "model")? as *mut VxModel;
-        unsafe { vx_model_release(pointer) };
+        let entry = self.models.remove(&request.model_id, "model")?;
+        unsafe { vx_model_release(entry.pointer as *mut VxModel) };
         Ok(Empty {})
     }
 
@@ -1300,8 +1497,37 @@ impl RuntimeServicePlugin for Plugin {
             }
         };
         let trainer_id = self.new_id("trainer");
-        self.trainers
-            .insert(trainer_id.clone(), trainer.cast::<c_void>());
+        let trainer_capture = match self.child_capture(
+            model.capture(),
+            MemoryOwnerKind::Trainer,
+            trainer_id.clone(),
+        ) {
+            Ok(capture) => capture,
+            Err(error) => {
+                unsafe {
+                    let mut close_report = VxReport::new();
+                    vx_trainer_close(trainer, &mut close_report);
+                    vx_trainer_release(trainer);
+                }
+                return Err(error);
+            }
+        };
+        let report = match self.capture_report(&trainer_capture, report) {
+            Ok(report) => report,
+            Err(error) => {
+                unsafe {
+                    let mut close_report = VxReport::new();
+                    vx_trainer_close(trainer, &mut close_report);
+                    vx_trainer_release(trainer);
+                }
+                return Err(error);
+            }
+        };
+        self.trainers.insert(
+            trainer_id.clone(),
+            trainer.cast::<c_void>(),
+            trainer_capture,
+        );
         Ok(TrainerHandle {
             trainer_id,
             inputs,
@@ -1313,12 +1539,12 @@ impl RuntimeServicePlugin for Plugin {
         let trainer = self.trainer(&request.trainer_id)?;
         let mut report = VxReport::new();
         let status = unsafe { vx_trainer_close(trainer.pointer(), &mut report) };
-        check_native(status, &report)
+        self.checked_report(trainer.capture(), status, &report)
     }
 
     fn release_trainer(&self, request: TrainerRef) -> Result<Empty, FfiError> {
-        let pointer = self.trainers.remove(&request.trainer_id, "trainer")? as *mut VxTrainer;
-        unsafe { vx_trainer_release(pointer) };
+        let entry = self.trainers.remove(&request.trainer_id, "trainer")?;
+        unsafe { vx_trainer_release(entry.pointer as *mut VxTrainer) };
         Ok(Empty {})
     }
 
@@ -1402,6 +1628,7 @@ impl RuntimeServicePlugin for Plugin {
                 normalizer: metric.normalizer,
             })
             .collect();
+        let report = self.capture_report(trainer.capture(), report)?;
         Ok(TrainStepResult {
             microbatch_id: native_result.microbatch_id,
             optimizer_step: native_result.optimizer_step,
@@ -1419,7 +1646,7 @@ impl RuntimeServicePlugin for Plugin {
         let mut revision = VxRevisionInfo::new();
         let mut report = VxReport::new();
         let status = unsafe { vx_trainer_commit(trainer.pointer(), &mut revision, &mut report) };
-        let report = check_native(status, &report)?;
+        let report = self.checked_report(trainer.capture(), status, &report)?;
         Ok(revision_message(&revision, report))
     }
 
@@ -1427,7 +1654,7 @@ impl RuntimeServicePlugin for Plugin {
         let trainer = self.trainer(&request.trainer_id)?;
         let mut report = VxReport::new();
         let status = unsafe { vx_trainer_rollback(trainer.pointer(), &mut report) };
-        check_native(status, &report)
+        self.checked_report(trainer.capture(), status, &report)
     }
 
     fn export_trainer_weights(
@@ -1451,7 +1678,7 @@ impl RuntimeServicePlugin for Plugin {
                 &mut report,
             )
         };
-        check_native(status, &report)
+        self.checked_report(trainer.capture(), status, &report)
     }
 
     fn create_ptq_plan(&self, request: CreatePtqPlanRequest) -> Result<PtqPlanHandle, FfiError> {
@@ -1650,8 +1877,37 @@ impl RuntimeServicePlugin for Plugin {
             }
         };
         let ptq_plan_id = self.new_id("ptq-plan");
-        self.ptq_plans
-            .insert(ptq_plan_id.clone(), plan.cast::<c_void>());
+        let plan_capture = match self.child_capture(
+            model.capture(),
+            MemoryOwnerKind::PtqPlan,
+            ptq_plan_id.clone(),
+        ) {
+            Ok(capture) => capture,
+            Err(error) => {
+                unsafe {
+                    let mut close_report = VxReport::new();
+                    vx_ptq_plan_close(plan, &mut close_report);
+                    vx_ptq_plan_release(plan);
+                }
+                return Err(error);
+            }
+        };
+        let report = match self.capture_report(&plan_capture, report) {
+            Ok(report) => report,
+            Err(error) => {
+                unsafe {
+                    let mut close_report = VxReport::new();
+                    vx_ptq_plan_close(plan, &mut close_report);
+                    vx_ptq_plan_release(plan);
+                }
+                return Err(error);
+            }
+        };
+        self.ptq_plans.insert(
+            ptq_plan_id.clone(),
+            plan.cast::<c_void>(),
+            plan_capture,
+        );
         Ok(PtqPlanHandle {
             ptq_plan_id,
             inputs,
@@ -1663,12 +1919,12 @@ impl RuntimeServicePlugin for Plugin {
         let plan = self.ptq_plan(&request.ptq_plan_id)?;
         let mut report = VxReport::new();
         let status = unsafe { vx_ptq_plan_close(plan.pointer(), &mut report) };
-        check_native(status, &report)
+        self.checked_report(plan.capture(), status, &report)
     }
 
     fn release_ptq_plan(&self, request: PtqPlanRef) -> Result<Empty, FfiError> {
-        let pointer = self.ptq_plans.remove(&request.ptq_plan_id, "PTQ plan")? as *mut VxPTQPlan;
-        unsafe { vx_ptq_plan_release(pointer) };
+        let entry = self.ptq_plans.remove(&request.ptq_plan_id, "PTQ plan")?;
+        unsafe { vx_ptq_plan_release(entry.pointer as *mut VxPTQPlan) };
         Ok(Empty {})
     }
 
@@ -1705,7 +1961,7 @@ impl RuntimeServicePlugin for Plugin {
                 &mut report,
             )
         };
-        let report = check_native(status, &report)?;
+        let report = self.checked_report(plan.capture(), status, &report)?;
         Ok(PtqCalibrationInfo {
             calibration_batches: info.calibration_batches,
             calibration_samples: info.calibration_samples,
@@ -1716,7 +1972,7 @@ impl RuntimeServicePlugin for Plugin {
 
     fn inspect_ptq_plan(&self, request: PtqPlanRef) -> Result<PtqPlanInfo, FfiError> {
         let plan = self.ptq_plan(&request.ptq_plan_id)?;
-        self.ptq_info(plan.pointer())
+        self.ptq_info(plan.pointer(), plan.capture())
     }
 
     fn write_ptq_package(
@@ -1735,7 +1991,8 @@ impl RuntimeServicePlugin for Plugin {
         let mut report = VxReport::new();
         let status = unsafe { vx_ptq_plan_write_package(plan.pointer(), &options, &mut report) };
         let report = check_native(status, &report)?;
-        let info = self.ptq_info(plan.pointer())?;
+        let info = self.ptq_info(plan.pointer(), plan.capture())?;
+        let report = self.capture_report(plan.capture(), report)?;
         Ok(PtqPackageInfo {
             graph_path: request.output_graph_path,
             safetensors_path: request.output_weights_path,
@@ -1806,9 +2063,30 @@ impl RuntimeServicePlugin for Plugin {
                 INTERNAL,
             ));
         }
+        let compiled_capture = match self.native_child_capture(
+            model.capture(),
+            MemoryOwnerKind::CompiledModel,
+            report.compiled_model_id,
+        ) {
+            Ok(capture) => capture,
+            Err(error) => {
+                unsafe { vx_compiled_model_release(compiled) };
+                return Err(error);
+            }
+        };
+        let report = match self.capture_report(&compiled_capture, report) {
+            Ok(report) => report,
+            Err(error) => {
+                unsafe { vx_compiled_model_release(compiled) };
+                return Err(error);
+            }
+        };
         let compiled_model_id = self.new_id("compiled");
-        self.compiled_models
-            .insert(compiled_model_id.clone(), compiled.cast::<c_void>());
+        self.compiled_models.insert(
+            compiled_model_id.clone(),
+            compiled.cast::<c_void>(),
+            compiled_capture,
+        );
         Ok(CompiledModelHandle {
             compiled_model_id,
             report: Some(report),
@@ -1822,15 +2100,14 @@ impl RuntimeServicePlugin for Plugin {
         let compiled = self.compiled_model(&request.compiled_model_id)?;
         let mut report = VxReport::new();
         let status = unsafe { vx_compiled_model_report(compiled.pointer(), &mut report) };
-        check_native(status, &report)
+        self.checked_report(compiled.capture(), status, &report)
     }
 
     fn release_compiled_model(&self, request: CompiledModelRef) -> Result<Empty, FfiError> {
-        let pointer = self
+        let entry = self
             .compiled_models
-            .remove(&request.compiled_model_id, "compiled model")?
-            as *mut VxCompiledModel;
-        unsafe { vx_compiled_model_release(pointer) };
+            .remove(&request.compiled_model_id, "compiled model")?;
+        unsafe { vx_compiled_model_release(entry.pointer as *mut VxCompiledModel) };
         Ok(Empty {})
     }
 
@@ -1877,9 +2154,38 @@ impl RuntimeServicePlugin for Plugin {
                 return Err(error);
             }
         };
+        let context_capture = match self.native_child_capture(
+            compiled.capture(),
+            MemoryOwnerKind::ExecutionContext,
+            report.context_id,
+        ) {
+            Ok(capture) => capture,
+            Err(error) => {
+                unsafe {
+                    let mut close_report = VxReport::new();
+                    vx_execution_context_close(context, &mut close_report);
+                    vx_execution_context_release(context);
+                }
+                return Err(error);
+            }
+        };
+        let report = match self.capture_report(&context_capture, report) {
+            Ok(report) => report,
+            Err(error) => {
+                unsafe {
+                    let mut close_report = VxReport::new();
+                    vx_execution_context_close(context, &mut close_report);
+                    vx_execution_context_release(context);
+                }
+                return Err(error);
+            }
+        };
         let context_id = self.new_id("context");
-        self.contexts
-            .insert(context_id.clone(), context.cast::<c_void>());
+        self.contexts.insert(
+            context_id.clone(),
+            context.cast::<c_void>(),
+            context_capture,
+        );
         Ok(ExecutionContextHandle {
             context_id,
             inputs,
@@ -1894,13 +2200,12 @@ impl RuntimeServicePlugin for Plugin {
         let context = self.context(&request.context_id)?;
         let mut report = VxReport::new();
         let status = unsafe { vx_execution_context_close(context.pointer(), &mut report) };
-        check_native(status, &report)
+        self.checked_report(context.capture(), status, &report)
     }
 
     fn release_execution_context(&self, request: ExecutionContextRef) -> Result<Empty, FfiError> {
-        let pointer =
-            self.contexts.remove(&request.context_id, "context")? as *mut VxExecutionContext;
-        unsafe { vx_execution_context_release(pointer) };
+        let entry = self.contexts.remove(&request.context_id, "context")?;
+        unsafe { vx_execution_context_release(entry.pointer as *mut VxExecutionContext) };
         Ok(Empty {})
     }
 
@@ -1920,7 +2225,7 @@ impl RuntimeServicePlugin for Plugin {
             )
         };
         let report = check_native(status, &report)?;
-        self.store_result(result, report)
+        self.store_result(result, report, context.capture())
     }
 
     fn decode_seed(&self, request: DecodeSeedRequest) -> Result<ExecutionResultHandle, FfiError> {
@@ -1939,7 +2244,7 @@ impl RuntimeServicePlugin for Plugin {
             )
         };
         let report = check_native(status, &report)?;
-        self.store_result(result, report)
+        self.store_result(result, report, context.capture())
     }
 
     fn decode_step(&self, request: DecodeStepRequest) -> Result<ExecutionResultHandle, FfiError> {
@@ -1966,14 +2271,14 @@ impl RuntimeServicePlugin for Plugin {
             )
         };
         let report = check_native(status, &report)?;
-        self.store_result(result, report)
+        self.store_result(result, report, context.capture())
     }
 
     fn reset_decode(&self, request: ExecutionContextRef) -> Result<OperationReport, FfiError> {
         let context = self.context(&request.context_id)?;
         let mut report = VxReport::new();
         let status = unsafe { vx_execution_context_decode_reset(context.pointer(), &mut report) };
-        check_native(status, &report)
+        self.checked_report(context.capture(), status, &report)
     }
 
     fn select_adapter(&self, request: SelectAdapterRequest) -> Result<OperationReport, FfiError> {
@@ -1987,18 +2292,21 @@ impl RuntimeServicePlugin for Plugin {
         let status = unsafe {
             vx_execution_context_select_adapter(context.pointer(), &revision, &mut report)
         };
-        check_native(status, &report)
+        self.checked_report(context.capture(), status, &report)
     }
 
     fn rebind_adapter(&self, request: ExecutionContextRef) -> Result<OperationReport, FfiError> {
         let context = self.context(&request.context_id)?;
         let mut report = VxReport::new();
         let status = unsafe { vx_execution_context_rebind_adapter(context.pointer(), &mut report) };
-        check_native(status, &report)
+        self.checked_report(context.capture(), status, &report)
     }
 
     fn get_result(&self, request: ResultRef) -> Result<ResultInfo, FfiError> {
         let result = self.result(&request.result_id)?;
+        // The retained result guard's capture token is the in-flight lease;
+        // keep this explicit even though GetResult returns no report.
+        let _capture_lease = result.capture();
         Ok(ResultInfo {
             result_id: request.result_id,
             execution_id: unsafe { vx_result_execution_id(result.pointer()) },
@@ -2067,8 +2375,8 @@ impl RuntimeServicePlugin for Plugin {
     }
 
     fn release_result(&self, request: ResultRef) -> Result<Empty, FfiError> {
-        let pointer = self.results.remove(&request.result_id, "result")? as *mut VxResult;
-        unsafe { vx_result_release(pointer) };
+        let entry = self.results.remove(&request.result_id, "result")?;
+        unsafe { vx_result_release(entry.pointer as *mut VxResult) };
         Ok(Empty {})
     }
 }
@@ -2239,6 +2547,12 @@ mod tests {
                 VX_STATUS_BUFFER_TOO_SMALL,
                 VX_STATUS_INTERNAL,
                 VX_STATUS_REVISION_CONFLICT,
+                VX_STATUS_BUSY,
+                VX_STATUS_OVERLOADED,
+                VX_STATUS_CANCELLED,
+                VX_STATUS_DEADLINE_EXCEEDED,
+                VX_STATUS_SUPERSEDED,
+                VX_STATUS_SESSION_RESET_REQUIRED,
             ],
             [
                 NativeStatus::Ok as i32,
@@ -2259,7 +2573,24 @@ mod tests {
                 NativeStatus::BufferTooSmall as i32,
                 NativeStatus::Internal as i32,
                 NativeStatus::RevisionConflict as i32,
+                NativeStatus::Busy as i32,
+                NativeStatus::Overloaded as i32,
+                NativeStatus::Cancelled as i32,
+                NativeStatus::DeadlineExceeded as i32,
+                NativeStatus::Superseded as i32,
+                NativeStatus::SessionResetRequired as i32,
             ]
+        );
+        assert_eq!(
+            [
+                VX_STATUS_BUSY,
+                VX_STATUS_OVERLOADED,
+                VX_STATUS_CANCELLED,
+                VX_STATUS_DEADLINE_EXCEEDED,
+                VX_STATUS_SUPERSEDED,
+                VX_STATUS_SESSION_RESET_REQUIRED,
+            ],
+            [-18, -19, -20, -21, -22, -23]
         );
         assert_eq!(
             [
@@ -2396,5 +2727,37 @@ mod tests {
         assert!(converted.route_attested);
         assert_eq!(converted.policy_mode, BackendPolicyMode::Require as i32);
         assert_eq!(converted.operator_fallback, OperatorFallback::Forbid as i32);
+    }
+
+    #[test]
+    fn report_boundary_rejects_invalid_memory_evidence_as_internal() {
+        let mut converted = report_message(&VxReport::new());
+        converted.memory_evidence = Some(MemoryEvidence::default());
+        let error = validate_report_memory_evidence(converted).unwrap_err();
+        assert_eq!(error.code, VX_STATUS_INTERNAL);
+        assert_eq!(error.grpc_code, INTERNAL);
+        assert!(error.message.contains("invalid memory evidence"));
+    }
+
+    #[test]
+    fn scheduler_native_statuses_have_intentional_non_internal_grpc_codes() {
+        // BUSY is a transient route-lease condition, while OVERLOADED is an
+        // admission-capacity condition. SUPERSEDED is an aborted logical
+        // attempt, and SESSION_RESET_REQUIRED must be repaired before retry.
+        for (native_status, expected_grpc_code) in [
+            (VX_STATUS_BUSY, UNAVAILABLE),
+            (VX_STATUS_OVERLOADED, RESOURCE_EXHAUSTED),
+            (VX_STATUS_CANCELLED, GRPC_CANCELLED),
+            (VX_STATUS_DEADLINE_EXCEEDED, GRPC_DEADLINE_EXCEEDED),
+            (VX_STATUS_SUPERSEDED, ABORTED),
+            (VX_STATUS_SESSION_RESET_REQUIRED, FAILED_PRECONDITION),
+        ] {
+            let mut report = VxReport::new();
+            report.status = native_status;
+            let error = check_native(native_status, &report).unwrap_err();
+            assert_eq!(error.code, native_status);
+            assert_eq!(error.grpc_code, expected_grpc_code);
+            assert_ne!(error.grpc_code, INTERNAL);
+        }
     }
 }

@@ -1,3 +1,35 @@
+int cuda_graph_row_index_transfer(const void* source, size_t source_bytes,
+                                  const int32_t* indices, uint32_t rows,
+                                  void* destination, size_t destination_bytes,
+                                  uint32_t row_words, uint32_t indexed_rows,
+                                  uint32_t mode) {
+    CudaTensorView src_view, dst_view;
+    CudaTensorSlot* indices_slot;
+    size_t index_bytes;
+    uint32_t invocations;
+    void* args[7];
+    if (!source || !destination || !indices || !rows || !row_words ||
+        !indexed_rows || mode > 1u || !source_bytes || !destination_bytes ||
+        rows > UINT32_MAX / row_words) return 0;
+    invocations = rows * row_words;
+    if (rows > UINT32_MAX / (uint32_t)sizeof(int32_t)) return 0;
+    index_bytes = (size_t)rows * sizeof(int32_t);
+    if (!graph_ensure_input_view(source, source_bytes, 0, &src_view) ||
+        !graph_output_view(destination, destination_bytes, &dst_view)) return 0;
+    indices_slot = graph_ensure_input(indices, index_bytes, 0);
+    if (!indices_slot) return 0;
+    args[0] = &src_view.device;
+    args[1] = &indices_slot->device;
+    args[2] = &dst_view.device;
+    args[3] = &rows;
+    args[4] = &row_words;
+    args[5] = &indexed_rows;
+    args[6] = &mode;
+    if (!cuda_launch_1d(CUDA_FORWARD_FUNCTION(k_row_index_transfer), invocations, args)) return 0;
+    graph_mark_device(dst_view.slot);
+    return 1;
+}
+
 int cuda_graph_qargmax_i8u8(const void* input, int32_t* output,
                             uint32_t outer, uint32_t axis_size,
                             uint32_t inner, uint32_t input_dtype) {

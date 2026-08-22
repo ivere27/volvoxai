@@ -79,7 +79,7 @@ static int test_device_authoring_and_w8a8(void) {
     CHECK(closef32(scales[0], expected_scales[0]));
     CHECK(closef32(scales[1], expected_scales[1]));
 
-    /* The freshly authored buffers must feed the existing physical W8A8
+    /* The freshly authored buffers must feed the existing W8A8
      * kernel directly, without a CPU repack or metadata conversion. */
     const int8_t input[3] = {2, 3, 4};
     int8_t output[2] = {0};

@@ -32,6 +32,10 @@
 
 #define SAFETENSORS_MAX_HEADER_SIZE 100000000L
 static atomic_ulong g_safetensors_temp_counter = 1;
+#if defined(VOLVOXAI_PUBLIC_API_TESTING)
+static atomic_uint_fast64_t g_safetensors_file_read_count;
+static atomic_uint_fast64_t g_safetensors_storage_release_count;
+#endif
 
 static int metadata_values_are_strings(const cJSON* metadata) {
     if (!cJSON_IsObject(metadata)) return 0;
@@ -80,9 +84,35 @@ static char* read_file_bytes(const char* path, long* out_size) {
     }
     data[size] = 0;
     fclose(f);
+#if defined(VOLVOXAI_PUBLIC_API_TESTING)
+    atomic_fetch_add_explicit(&g_safetensors_file_read_count, 1,
+                              memory_order_relaxed);
+#endif
     if (out_size) *out_size = size;
     return data;
 }
+
+#if defined(VOLVOXAI_PUBLIC_API_TESTING)
+void safetensors_test_reset_file_read_count(void) {
+    atomic_store_explicit(&g_safetensors_file_read_count, 0,
+                          memory_order_relaxed);
+}
+
+uint64_t safetensors_test_file_read_count(void) {
+    return atomic_load_explicit(&g_safetensors_file_read_count,
+                                memory_order_relaxed);
+}
+
+void safetensors_test_reset_storage_release_count(void) {
+    atomic_store_explicit(&g_safetensors_storage_release_count, 0,
+                          memory_order_relaxed);
+}
+
+uint64_t safetensors_test_storage_release_count(void) {
+    return atomic_load_explicit(&g_safetensors_storage_release_count,
+                                memory_order_relaxed);
+}
+#endif
 
 VxDataType safetensors_dtype_from_name(const char* dtype) {
     if (!dtype) return SAFETENSORS_DTYPE_UNKNOWN;
@@ -183,15 +213,22 @@ size_t safetensors_dtype_byte_width(VxDataType dtype) {
 
 void safetensors_free(SafetensorsFile* file) {
     if (!file) return;
-    if (file->tensors) {
+    if (!file->borrows_storage && file->tensors) {
         for (int i = 0; i < file->tensor_count; i++) {
             if ((file->tensors[i].flags & SAFETENSORS_TENSOR_OWNED) && file->tensors[i].data) {
                 free(file->tensors[i].data);
             }
         }
     }
-    free(file->blob);
-    free(file->metadata_json);
+    if (!file->borrows_storage) {
+#if defined(VOLVOXAI_PUBLIC_API_TESTING)
+        if (file->blob)
+            atomic_fetch_add_explicit(&g_safetensors_storage_release_count, 1,
+                                      memory_order_relaxed);
+#endif
+        free(file->blob);
+        free(file->metadata_json);
+    }
     free(file->tensors);
     memset(file, 0, sizeof(*file));
 }
@@ -268,6 +305,35 @@ static int compare_name_ptrs(const void* a, const void* b) {
 int safetensors_load(const char* file_path, SafetensorsFile* out) {
     SafetensorsLoadOptions options = { SAFETENSORS_OPEN_READ_ONLY };
     return safetensors_load_with_options(file_path, &options, out);
+}
+
+int safetensors_borrow_immutable(const SafetensorsFile* source,
+                                 SafetensorsFile* out) {
+    if (!source || !out || source == out || source->borrows_storage ||
+        (source->flags & SAFETENSORS_OPEN_READ_WRITE) ||
+        source->tensor_count < 0 ||
+        (source->tensor_count > 0 && !source->tensors))
+        return -1;
+    for (int index = 0; index < source->tensor_count; index++) {
+        if (source->tensors[index].flags &
+            (SAFETENSORS_TENSOR_WRITABLE | SAFETENSORS_TENSOR_OWNED))
+            return -1;
+    }
+    SafetensorsTensor* descriptors = NULL;
+    if (source->tensor_count > 0) {
+        descriptors = (SafetensorsTensor*)malloc(
+            (size_t)source->tensor_count * sizeof(*descriptors));
+        if (!descriptors) return -1;
+        memcpy(descriptors, source->tensors,
+               (size_t)source->tensor_count * sizeof(*descriptors));
+        for (int index = 0; index < source->tensor_count; index++)
+            descriptors[index].flags &=
+                ~(SAFETENSORS_TENSOR_WRITABLE | SAFETENSORS_TENSOR_OWNED);
+    }
+    *out = *source;
+    out->tensors = descriptors;
+    out->borrows_storage = 1;
+    return 0;
 }
 
 int safetensors_init_empty(SafetensorsFile* out, unsigned flags) {

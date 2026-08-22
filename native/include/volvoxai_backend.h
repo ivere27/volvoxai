@@ -7,12 +7,23 @@
 extern "C" {
 #endif
 
-/* Provider ABI version. */
+/* Opaque discriminator for the current exact provider ABI. This value is not
+ * a compatibility generation: providers must use this header's exact
+ * descriptor layouts and callbacks, even if an older header used the same
+ * numeric value. */
 #define VX_BACKEND_ABI_VERSION UINT32_C(1)
 #define VX_BACKEND_NAME_CAPACITY 64u
 #define VX_BACKEND_SHAPE_PROOF_PROTOCOL \
     "canonical-symbolic-domain-proof/v1"
 #define VX_BACKEND_RESOURCE_PROTOCOL "bounded-resource-maxima/v1"
+#define VX_BACKEND_BATCH_PROTOCOL "provider-batch-contract/v1"
+#define VX_BACKEND_INDEPENDENT_BATCH_PROOF_PROTOCOL \
+    "typed-independent-batch-proof/v1"
+/* Update this opaque marker for every provider-contract layout or semantic
+ * change, including same-size changes. It is intentionally not a public
+ * compatibility generation. */
+#define VX_BACKEND_PROVIDER_EXACT_CONTRACT_MARKER \
+    UINT64_C(0x565850524f564944)
 
 /* Provider callback descriptors use exact struct sizes.
  * Provider-host service provider interface (SPI). These callbacks compose a
@@ -35,6 +46,57 @@ typedef struct VxBackendOutputSink {
                       const void* data,
                       size_t byte_size);
 } VxBackendOutputSink;
+
+/* Frozen contract for one exact provider-compiled executable. Opaque identity
+ * pointers remain owned by the provider and stable until compiled_destroy.
+ * Reporting max_batch > 1 is an attestation that context_execute_batch enters
+ * the backend once for the whole invocation; a host loop is not a batch. It
+ * also attests that its dense executor preserves the Runtime's exact
+ * graph-fingerprint-bound independent-request proof. The Runtime owns the
+ * typed semantic proof and bounded axis validation; the provider must echo its
+ * identity and may only narrow the proved batch range. */
+typedef struct VxBackendBatchContract {
+    size_t struct_size;
+    const char* protocol;
+    /* Exact core-authored semantic proof echoed by the compiled provider.
+     * A provider may narrow the proved range, but it cannot promote a graph
+     * for which the core supplied no proof identity. */
+    const char* graph_fingerprint;
+    const char* independent_batch_proof_identity;
+    const void* resource_domain;
+    const void* compatibility_token;
+    uint32_t min_batch;
+    uint32_t max_batch;
+    uint32_t multiple_of;
+    int32_t batch_axis;
+    int32_t device_resident;
+    uint64_t device_epoch;
+} VxBackendBatchContract;
+
+#define VX_BACKEND_BATCH_CONTRACT_INIT \
+    { sizeof(VxBackendBatchContract), VX_BACKEND_BATCH_PROTOCOL, NULL, NULL, \
+      NULL, NULL, 1u, 1u, 1u, 0, 0, 0 }
+
+/* One invocation names exactly one mutable route context and one dense stacked
+ * binding set. The provider may use request_ids for tracing and must publish
+ * lane i through lane_output_sinks[i]. Each stacked input has the contract's
+ * batch_axis dimension equal to batch_size. A callback failure rejects every
+ * lane; the Runtime never publishes a partial batch. Providers therefore
+ * validate the complete invocation before dispatch. The Runtime never
+ * constructs B separate provider contexts or substitutes B calls to
+ * context_execute. */
+typedef struct VxBackendBatchInvocation {
+    size_t struct_size;
+    const VxTensorBinding* stacked_inputs;
+    size_t stacked_input_count;
+    uint32_t batch_size;
+    const uint64_t* request_ids;
+    const VxBackendOutputSink* lane_output_sinks;
+    size_t lane_output_sink_count;
+} VxBackendBatchInvocation;
+
+#define VX_BACKEND_BATCH_INVOCATION_INIT \
+    { sizeof(VxBackendBatchInvocation), NULL, 0, 0, NULL, NULL, 0 }
 
 typedef enum VxBackendShapeDomainSupport {
     VX_BACKEND_SHAPE_DOMAIN_UNSUPPORTED = 0,
@@ -68,10 +130,15 @@ typedef struct VxBackendCompileInput {
     size_t input_count;
     const VxTensorSpec* outputs;
     size_t output_count;
+    /* NULL means the exact graph failed the core's fail-closed typed
+     * independent-request-axis proof and therefore remains scheduler B=1. */
+    const char* independent_batch_proof_protocol;
+    const char* independent_batch_proof_identity;
 } VxBackendCompileInput;
 
 #define VX_BACKEND_COMPILE_INPUT_INIT \
-    { sizeof(VxBackendCompileInput), NULL, NULL, NULL, NULL, 0, NULL, 0 }
+    { sizeof(VxBackendCompileInput), NULL, NULL, NULL, NULL, 0, NULL, 0, \
+      NULL, NULL }
 
 /* A successful provider compile must attest the exact input identities and
  * conservative resource maxima. resource_limit_bytes is meaningful only when
@@ -114,6 +181,18 @@ typedef struct VxBackendProvider {
                         VxBackendShapeDomainAttestation* attestation,
                         VxReport* report);
     void (*compiled_destroy)(void* compiled_instance);
+
+    /* Optional as a pair. Absence is the explicit B=1 contract. The Runtime
+     * currently invokes this batch executor only after it can construct one
+     * legal public binding; it never substitutes repeated context_execute. */
+    VxStatus (*compiled_batch_contract)(
+        void* compiled_instance,
+        VxBackendBatchContract* contract,
+        VxReport* report);
+    VxStatus (*context_execute_batch)(
+        void* context_instance,
+        const VxBackendBatchInvocation* invocation,
+        VxReport* report);
 
     VxStatus (*context_create)(void* compiled_instance,
                                const VxContextOptions* options,
@@ -159,13 +238,20 @@ typedef struct VxBackendProvider {
     /* Optional logical close. context_destroy remains required and runs once. */
     VxStatus (*context_close)(void* context_instance, VxReport* report);
     void (*context_destroy)(void* context_instance);
+
+    /* Required exact-layout discriminator. Both values are validated before
+     * the Runtime reads or invokes any provider callback. This deliberately
+     * rejects descriptors compiled from any other header even when their
+     * opaque numeric ABI discriminator happens to match. */
+    uint64_t exact_contract_marker;
+    size_t exact_contract_extent;
 } VxBackendProvider;
 
 /* Provider-host composition operation. The runtime copies the descriptor and
  * name, then creates exactly one provider runtime instance. Callback code and
  * user_data remain borrowed until the runtime and all retained descendants are
  * released. Names are canonical lower-case ASCII identifiers. The built-in
- * names cpu, vulkan, opengl, metal, nnapi, and cuda are reserved. Synurang
+ * names cpu, vulkan, opengl, metal, and cuda are reserved. Synurang
  * applications select already-composed names through protobuf BackendPolicy. */
 VX_API VxStatus vx_runtime_register_provider(VxRuntime* runtime,
                                       const VxBackendProvider* provider,

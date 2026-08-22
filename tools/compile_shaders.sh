@@ -8,6 +8,9 @@ NATIVE_DIR="$REPO_ROOT/native/shaders"
 SOURCE_ROOTS=("$WGSL_DIR/inference" "$WGSL_DIR/training")
 CARGO_BUILD_DIR="${CARGO_TARGET_DIR:-$NATIVE_DIR/.native-shader-compiler-target}"
 NATIVE_SHADER_COMPILER="${VOLVOXAI_NATIVE_SHADER_COMPILER:-}"
+if [ -z "$NATIVE_SHADER_COMPILER" ] && [ -x "$NATIVE_DIR/volvoxai-native-shader-compiler" ]; then
+    NATIVE_SHADER_COMPILER="$NATIVE_DIR/volvoxai-native-shader-compiler"
+fi
 
 if [ -n "$NATIVE_SHADER_COMPILER" ] && [ ! -x "$NATIVE_SHADER_COMPILER" ]; then
     echo "VOLVOXAI_NATIVE_SHADER_COMPILER is not executable: $NATIVE_SHADER_COMPILER" >&2

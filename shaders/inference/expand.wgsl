@@ -2,7 +2,7 @@
 @group(0) @binding(1) var<storage, read_write> output: array<u32>;
 
 struct Params {
-  dimensions: vec4<u32>, // input_rank, output_rank, unused, output_elements
+  dimensions: vec4<u32>, // input_rank, output_rank, dispatch_stride, output_elements
   input_shape0: vec4<u32>,
   input_shape1: vec4<u32>,
   output_shape0: vec4<u32>,
@@ -50,7 +50,7 @@ fn input_index(output_index: u32) -> u32 {
 
 @compute @workgroup_size(64)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-  let index = gid.x;
+  let index = gid.x + gid.y * params.dimensions.z;
   if (index >= params.dimensions.w) { return; }
   output[index] = input[input_index(index)];
 }

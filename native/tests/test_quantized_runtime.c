@@ -3,10 +3,10 @@
 #include "inference_kernels.h"
 #include "qconv_w8a8_arm.h"
 #include "qlinear_w8a8_arm.h"
-#include "quant_cpu_opt.h"
+#include "quant_cpu_isa.h"
 #include "safetensors.h"
 #include "thread_pool.h"
-#include "tensor_f32_opt.h"
+#include "tensor_f32_isa.h"
 #include "volvoxai_backend.h"
 #include "runtime_state.h"
 #if VOLVOXAI_ENABLE_VULKAN
@@ -303,52 +303,69 @@ static int test_groupnorm_optional_bias_kernel(void) {
 }
 
 static int test_groupnorm_narrow_group_kernel(void) {
-    enum { SPATIAL = 5, CHANNELS = 12, GROUPS = 4, CPG = 3 };
-    float input[SPATIAL * CHANNELS];
-    float weight[CHANNELS];
-    float bias[CHANNELS];
-    float expected[SPATIAL * CHANNELS];
-    float actual[SPATIAL * CHANNELS];
+    /* Nineteen points cross the native 16-row cache tile. C/G=3 crosses group
+     * boundaries in a two-lane affine vector; C/G=10 covers the other narrow
+     * TinyReceipt shape without a tail. */
+    enum { SPATIAL = 19, GROUPS = 4, MAX_CHANNELS = 40 };
+    const int cpg_cases[2] = {3, 10};
+    float input[SPATIAL * MAX_CHANNELS];
+    float weight[MAX_CHANNELS];
+    float bias[MAX_CHANNELS];
+    float expected[SPATIAL * MAX_CHANNELS];
+    float actual[SPATIAL * MAX_CHANNELS];
     const double epsilon = 1.0e-5;
-    for (int index = 0; index < SPATIAL * CHANNELS; index++)
-        input[index] = (float)((index * 17 % 29) - 14) * 0.125f;
-    for (int channel = 0; channel < CHANNELS; channel++) {
-        weight[channel] = 0.5f + (float)(channel % 5) * 0.125f;
-        bias[channel] = (float)(channel - 6) * 0.03125f;
-    }
-    for (int group = 0; group < GROUPS; group++) {
-        double sum = 0.0;
-        double square = 0.0;
-        const int first = group * CPG;
-        for (int point = 0; point < SPATIAL; point++)
-            for (int local = 0; local < CPG; local++)
-                sum += (double)input[point * CHANNELS + first + local];
-        {
-            const double mean = sum / (double)(SPATIAL * CPG);
-            for (int point = 0; point < SPATIAL; point++) {
-                for (int local = 0; local < CPG; local++) {
-                    const double centered =
-                        (double)input[point * CHANNELS + first + local] - mean;
-                    square += centered * centered;
-                }
-            }
+    for (int case_index = 0; case_index < 2; case_index++) {
+        const int cpg = cpg_cases[case_index];
+        const int channels = GROUPS * cpg;
+        for (int index = 0; index < SPATIAL * channels; index++)
+            input[index] = (float)((index * 17 % 29) - 14) * 0.125f;
+        for (int channel = 0; channel < channels; channel++) {
+            weight[channel] = 0.5f + (float)(channel % 5) * 0.125f;
+            bias[channel] = (float)(channel - 6) * 0.03125f;
+        }
+        for (int group = 0; group < GROUPS; group++) {
+            double sum = 0.0;
+            double square = 0.0;
+            const int first = group * cpg;
+            for (int point = 0; point < SPATIAL; point++)
+                for (int local = 0; local < cpg; local++)
+                    sum += (double)input[point * channels + first + local];
             {
-                const double inverse = 1.0 /
-                    sqrt(square / (double)(SPATIAL * CPG) + epsilon);
+                const double mean = sum / (double)(SPATIAL * cpg);
                 for (int point = 0; point < SPATIAL; point++) {
-                    for (int local = 0; local < CPG; local++) {
-                        const int channel = first + local;
-                        const int index = point * CHANNELS + channel;
-                        expected[index] = (float)(((double)input[index] - mean) *
-                            inverse * weight[channel] + bias[channel]);
+                    for (int local = 0; local < cpg; local++) {
+                        const double centered = (double)input[
+                            point * channels + first + local] - mean;
+                        square += centered * centered;
+                    }
+                }
+                {
+                    const double inverse = 1.0 /
+                        sqrt(square / (double)(SPATIAL * cpg) + epsilon);
+                    for (int point = 0; point < SPATIAL; point++) {
+                        for (int local = 0; local < cpg; local++) {
+                            const int channel = first + local;
+                            const int index = point * channels + channel;
+                            expected[index] = (float)(((double)input[index] - mean) *
+                                inverse * weight[channel] + bias[channel]);
+                        }
                     }
                 }
             }
         }
+        CHECK(groupnorm_f32(input, weight, bias, actual, 1, 1, SPATIAL,
+                            (uint32_t)channels, GROUPS, epsilon));
+        if (cpg == 3) {
+            /* Both narrow streamed paths retain the scalar reduction order. */
+            CHECK(memcmp(actual, expected,
+                         (size_t)SPATIAL * channels * sizeof(float)) == 0);
+        } else {
+            /* The wide-group x86 route and the paired AArch64 affine body use
+             * the operator's documented F32 tolerance. */
+            for (int index = 0; index < SPATIAL * channels; index++)
+                CHECK(closef(actual[index], expected[index]));
+        }
     }
-    CHECK(groupnorm_f32(input, weight, bias, actual, 1, 1, SPATIAL,
-                        CHANNELS, GROUPS, epsilon));
-    CHECK(memcmp(actual, expected, sizeof(actual)) == 0);
     return 0;
 }
 
@@ -491,11 +508,13 @@ static int test_transpose_i8u8_native_kernel(void) {
     uint8_t matrix_input[matrix_elements];
     uint8_t matrix_reference[matrix_elements];
     uint8_t matrix_actual[matrix_elements];
+    uint8_t matrix_signed_actual[matrix_elements];
     VxKernelThreadPool* pool;
     VxKernelThreadPoolScope scope;
     int forward_result;
     int reverse_result;
     int matrix_result;
+    int signed_matrix_result;
     for (int index = 0; index < image_elements; index++)
         image_input[index] = (uint8_t)((index * 37 + index / 11) & 0xff);
     for (int index = 0; index < matrix_elements; index++)
@@ -518,14 +537,22 @@ static int test_transpose_i8u8_native_kernel(void) {
     matrix_result = vx_transpose_nd_i8u8_native_validated(
         matrix_input, matrix_actual, matrix_shape, matrix_permutation, 3u,
         matrix_elements, VX_DTYPE_U8);
+    signed_matrix_result = vx_transpose_nd_i8u8_native_validated(
+        matrix_input, matrix_signed_actual, matrix_shape,
+        matrix_permutation, 3u, matrix_elements, VX_DTYPE_I8);
     vx_kernel_thread_pool_scope_leave(scope);
     vx_kernel_thread_pool_destroy(pool);
     CHECK(forward_result == 1);
     CHECK(reverse_result == 1);
     CHECK(matrix_result == 1);
+    CHECK(signed_matrix_result == 1);
     CHECK(memcmp(image_actual, image_reference, image_elements) == 0);
     CHECK(memcmp(image_roundtrip, image_input, image_elements) == 0);
     CHECK(memcmp(matrix_actual, matrix_reference, matrix_elements) == 0);
+    CHECK(memcmp(matrix_signed_actual, matrix_reference, matrix_elements) == 0);
+    CHECK(vx_transpose_nd_i8u8_native_validated(
+        matrix_input, matrix_input, matrix_shape, matrix_permutation, 3u,
+        matrix_elements, VX_DTYPE_U8) == 0);
     return 0;
 }
 
@@ -536,23 +563,51 @@ static int test_transpose_f32_native_kernel(void) {
         width = 19,
         channels = 13,
         elements = batch * height * width * channels,
+        matrix_batch = 2,
+        matrix_rows = 13,
+        matrix_columns = 19,
+        matrix_elements = matrix_batch * matrix_rows * matrix_columns,
     };
     const uint32_t nhwc_shape[4] = {batch, height, width, channels};
     const uint32_t nchw_shape[4] = {batch, channels, height, width};
     const uint32_t nhwc_to_nchw[4] = {0, 3, 1, 2};
     const uint32_t nchw_to_nhwc[4] = {0, 2, 3, 1};
+    const uint32_t matrix_shape[3] = {
+        matrix_batch, matrix_rows, matrix_columns,
+    };
+    const uint32_t matrix_permutation[3] = {0, 2, 1};
     float input[elements];
     float reference[elements];
     float actual[elements];
     float roundtrip[elements];
+    float matrix_input[matrix_elements];
+    float matrix_reference[matrix_elements];
+    float matrix_actual[matrix_elements];
     VxKernelThreadPool* pool;
     VxKernelThreadPoolScope scope;
     int forward_result;
     int reverse_result;
+    int matrix_result;
     for (int index = 0; index < elements; index++)
         input[index] = (float)((index * 37 + index / 11) % 1021) * 0.03125f;
+    for (int index = 0; index < matrix_elements; index++) {
+        /* Transpose is a storage operation.  Quiet-NaN payloads, infinities,
+         * and signed zero must survive the NEON shuffles bit for bit. */
+        uint32_t bits;
+        switch (index & 7) {
+            case 0: bits = 0x7fc00000u | (uint32_t)(index & 0x003fffff); break;
+            case 1: bits = 0xffc00000u | (uint32_t)(index & 0x003fffff); break;
+            case 2: bits = 0x80000000u; break;
+            case 3: bits = 0x7f800000u; break;
+            case 4: bits = 0xff800000u; break;
+            default: bits = 0x3f000000u + (uint32_t)index * 977u; break;
+        }
+        memcpy(&matrix_input[index], &bits, sizeof(bits));
+    }
     CHECK(transpose_nd_f32(input, reference, nhwc_shape, nhwc_to_nchw, 4u,
                            elements) == 1);
+    CHECK(transpose_nd_f32(matrix_input, matrix_reference, matrix_shape,
+                           matrix_permutation, 3u, matrix_elements) == 1);
     pool = vx_kernel_thread_pool_create(4);
     CHECK(pool != NULL);
     scope = vx_kernel_thread_pool_scope_enter(pool);
@@ -560,12 +615,18 @@ static int test_transpose_f32_native_kernel(void) {
         input, actual, nhwc_shape, nhwc_to_nchw, 4u, elements);
     reverse_result = vx_transpose_nd_f32_native_validated(
         actual, roundtrip, nchw_shape, nchw_to_nhwc, 4u, elements);
+    matrix_result = vx_transpose_nd_f32_native_validated(
+        matrix_input, matrix_actual, matrix_shape, matrix_permutation, 3u,
+        matrix_elements);
     vx_kernel_thread_pool_scope_leave(scope);
     vx_kernel_thread_pool_destroy(pool);
     CHECK(forward_result == 1);
     CHECK(reverse_result == 1);
+    CHECK(matrix_result == 1);
     CHECK(memcmp(actual, reference, sizeof(actual)) == 0);
     CHECK(memcmp(roundtrip, input, sizeof(roundtrip)) == 0);
+    CHECK(memcmp(matrix_actual, matrix_reference,
+                 sizeof(matrix_actual)) == 0);
     return 0;
 }
 
@@ -817,7 +878,7 @@ static int test_qgelu_portable_kernel(void) {
     return 0;
 }
 
-/* Exercise all 256 physical input bytes through the cold scalar route, the
+/* Exercise all 256 input bytes through the cold scalar route, the
  * table-building route, and a warm-cache route.  The 768-byte vector crosses
  * the kernel's build threshold and repeats every byte three times. */
 static int test_quantized_activation_lut_exactness(void) {
@@ -1178,7 +1239,7 @@ static int test_qlayernorm_portable_kernel(void) {
     return 0;
 }
 
-/* QSDPA keeps Q/K/V in independent physical byte domains.  The first fixture
+/* QSDPA keeps Q/K/V in independent byte domains.  The first fixture
  * is deliberately invariant under each I8/U8 storage choice, so all sixteen
  * input/output combinations exercise the same raw-dot and requantization
  * result. */
@@ -1533,7 +1594,7 @@ static int test_w8a8_linear_vector_tail(void) {
 }
 
 /* The native dispatcher must agree byte-for-byte with the portable canonical
- * ABI for each physical I8/U8 combination. Five rows exercise one four-row
+ * ABI for each I8/U8 combination. Five rows exercise one four-row
  * seed tile plus its row tail. d_in=67 exercises an AVX-512 VNNI 64-byte dot
  * plus scalar tail, two AVX-VNNI blocks plus tail, or the exact AVX2
  * PMADDUBSW activation split plus its tail according to the runtime gate. */
@@ -2016,7 +2077,7 @@ static int test_physical_qconv_native_dispatch(void) {
 
 /* Mirror the QLinear tie fixture through the direct 1x1 QConv route.  A host
  * selecting the AVX-512-VNNI target must retain the same separate F32
- * multiply/add boundaries as every portable physical W8A8 kernel. */
+ * multiply/add boundaries as every portable W8A8 kernel. */
 static int test_physical_qconv_requantize_no_fma(void) {
     enum { channels = 320 };
     int8_t input[channels];
@@ -2547,6 +2608,53 @@ static int test_physical_qconv_arm_try(void) {
             VX_DTYPE_U8);
         CHECK(arm_handled == 0 || arm_handled == 1);
         if (arm_handled) CHECK(memcmp(reference, arm_actual, sizeof(reference)) == 0);
+    }
+    {
+        /* Dense 3x3 group-1 coverage exercises the TinyReceipt ARM path:
+         * four-pixel/four-channel blocking, a partial final pixel tile,
+         * pointer-table padding, and asymmetric compensation. */
+        enum {
+            dense_h = 5, dense_w = 7, dense_c = 32, dense_out_c = 8,
+            dense_kernel = 3,
+        };
+        int8_t dense_input[dense_h * dense_w * dense_c];
+        int8_t dense_weight[dense_out_c * dense_kernel * dense_kernel * dense_c];
+        int32_t dense_bias[dense_out_c];
+        float dense_scales[dense_out_c];
+        int32_t dense_zero_points[dense_out_c];
+        int8_t dense_reference[dense_h * dense_w * dense_out_c];
+        int8_t dense_actual[dense_h * dense_w * dense_out_c];
+        for (size_t index = 0; index < sizeof(dense_input); index++)
+            dense_input[index] = (int8_t)(((index * 37u + 9u) % 239u) - 119);
+        for (size_t index = 0; index < sizeof(dense_weight); index++)
+            dense_weight[index] = (int8_t)(((index * 23u + 5u) % 223u) - 111);
+        for (uint32_t channel = 0; channel < dense_out_c; channel++) {
+            dense_bias[channel] = (int32_t)channel * 31 - 73;
+            dense_scales[channel] = 0.015625f + (float)channel * 0.001953125f;
+            dense_zero_points[channel] = (int32_t)channel - 4;
+        }
+        memset(dense_reference, 0, sizeof(dense_reference));
+        memset(dense_actual, 0, sizeof(dense_actual));
+        CHECK(qconv2d_i8u8(
+            dense_input, dense_weight, dense_bias, dense_scales,
+            dense_zero_points, dense_reference, 1u, dense_h, dense_w, dense_c,
+            dense_h, dense_w, dense_out_c, dense_kernel, dense_kernel, dense_c,
+            1u, 1u, 1u, 1u, 1u, 1u, 1u, 1u, 1u, 0u,
+            0.03125f, -7, 0.0625f, 3,
+            VX_DTYPE_I8, VX_DTYPE_I8, VX_DTYPE_I8) == 1);
+        {
+            int arm_handled = vx_qconv2d_i8u8_arm_try(
+                dense_input, dense_weight, dense_bias, dense_scales,
+                dense_zero_points, dense_actual, 1u, dense_h, dense_w, dense_c,
+                dense_h, dense_w, dense_out_c, dense_kernel, dense_kernel,
+                dense_c, 1u, 1u, 1u, 1u, 1u, 1u, 1u, 1u, 1u, 0u,
+                0.03125f, -7, 0.0625f, 3,
+                VX_DTYPE_I8, VX_DTYPE_I8, VX_DTYPE_I8);
+            CHECK(arm_handled == 0 || arm_handled == 1);
+            if (arm_handled)
+                CHECK(memcmp(dense_reference, dense_actual,
+                    sizeof(dense_reference)) == 0);
+        }
     }
     {
         const int8_t overflow_input[8] = {127, 127, 127, 127, 127, 127, 127, 127};
@@ -3183,7 +3291,7 @@ static int test_physical_qadd_static_weight_quantization(void) {
     return 0;
 }
 
-/* The engine must keep both QSiLU boundaries physical bytes. A pair of
+/* The engine must keep both QSiLU boundaries in bytes. A pair of
  * differently-quantized activations verifies the descriptor handoff into the
  * portable kernel. */
 static int test_physical_qsilu_chain(void) {
@@ -3945,7 +4053,7 @@ static int test_physical_qargmax(void) {
     return 0;
 }
 
-/* The native graph route must retain a physical byte activation on both sides
+/* The native graph route must retain a byte activation on both sides
  * of the router reduction. Unknown parameters and unsupported input aliases are
  * deliberately rejected before the output buffer is touched. */
 static int test_physical_qmaskedmean(void) {
@@ -4986,7 +5094,6 @@ static int test_concat_sigmoid_fusion_backend_scope(void) {
     g_use_vulkan = 0;
     g_use_opengl = 0;
     g_use_metal = 0;
-    g_use_nnapi = 0;
     CHECK(volvoxai_engine_init(graph_path, NULL) == 0);
     CHECK(g_nn == 2 && g_concat_sigmoid_fuse[0] == 1 && g_n[1].skip);
     CHECK(volvoxai_engine_set_input_raw("a", T_F32, &zero, sizeof(zero)) == 0);
@@ -5112,7 +5219,7 @@ static int test_physical_shape_island_chain(void) {
     volvoxai_engine_shutdown();
     CHECK(unsetenv("VOLVOX_DISABLE_OPERATOR_FUSION") == 0);
 
-    /* The normal optimizer may alias identical physical domains, and must
+    /* The normal optimizer may alias identical byte domains, and must
        still preserve the raw bytes through the same final concat. */
     CHECK(volvoxai_engine_init(graph_path, weights_path) == 0);
     CHECK(g_nn == 10 && g_n[4].skip && g_n[5].skip && g_n[6].skip &&

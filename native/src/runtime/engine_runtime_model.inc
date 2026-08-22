@@ -175,6 +175,76 @@ static size_t dtype_size(int dtype) {
     }
 }
 
+/*
+ * Bits per element.
+ *
+ * `dtype_size` answers in whole bytes and returns zero for anything it cannot,
+ * which is right for allocation and useless for a 4-bit weight: two of those
+ * share a byte, so no whole-byte answer exists. Every address in the decode and
+ * paging paths is `count * element size`, and that product is the one place a
+ * sub-byte dtype has to be understood -- so it is stated once, here, rather
+ * than at each of the twenty-odd sites that multiply by `elem_size`.
+ *
+ * The sub-byte entries name dtypes the enum already carries and no kernel
+ * implements yet. They are here so that adding such a kernel is a change to the
+ * kernel, not a hunt for every place a row's extent was assumed to be a whole
+ * number of bytes per element.
+ */
+static size_t dtype_bits(int dtype) {
+    switch (dtype) {
+        case VX_DTYPE_F4: return 4;
+        case VX_DTYPE_F6_E2M3:
+        case VX_DTYPE_F6_E3M2: return 6;
+        case T_I8:
+        case T_U8: return 8;
+        case T_F16: return 16;
+        case T_I32:
+        case T_F32: return 32;
+        default: return 0;
+    }
+}
+
+/*
+ * Bytes occupied by `count` contiguous elements of `dtype`, or 0 on failure.
+ *
+ * Refuses rather than rounds when the run does not end on a byte boundary. A
+ * 4-bit row of odd width shares its last byte with the row after it, so a
+ * caller handed a rounded answer would name one row and touch two -- and every
+ * row here is a unit that gets copied, bound, gathered and scattered on its
+ * own. "This row is not separately addressable" is a real answer for such a
+ * shape, and the callers already have a host path to fall back to.
+ */
+static int dtype_span_bytes(int dtype, long count, size_t* out_bytes) {
+    size_t bits = dtype_bits(dtype);
+    uint64_t total;
+    if (!out_bytes || !bits || count < 0) return 0;
+    if ((uint64_t)count > (uint64_t)UINT64_MAX / bits) return 0;
+    total = (uint64_t)count * bits;
+    if (total % 8u) return 0;
+    total /= 8u;
+    if (total > SIZE_MAX) return 0;
+    *out_bytes = (size_t)total;
+    return 1;
+}
+
+/* The same question asked of a tensor, cross-checked against the whole-byte
+ * element size it was allocated with. A tensor whose two answers disagree is
+ * one this path cannot address, not one to pick a winner for. */
+static int tensor_span_bytes(const T* tensor, long count, size_t* out_bytes) {
+    if (!tensor || !dtype_span_bytes(tensor->dtype, count, out_bytes)) return 0;
+    if (tensor->elem_size) {
+        if ((uint64_t)count > (uint64_t)SIZE_MAX / tensor->elem_size) return 0;
+        if ((size_t)count * tensor->elem_size != *out_bytes) return 0;
+    }
+    return 1;
+}
+
+/* A whole tensor's bytes, which is the bound every gather and scatter checks
+ * its rows against. */
+static int tensor_total_bytes(const T* tensor, size_t* out_bytes) {
+    return tensor && tensor_span_bytes(tensor, tensor->numel, out_bytes);
+}
+
 static int tensor_dtype_from_safetensor(VxDataType dtype) {
     switch (dtype) {
         case VX_DTYPE_F32:
@@ -293,13 +363,27 @@ static int widen_f16_tensor_to_f32(T* t) {
 
 static T* t_add_ex(const char* name, const int* shape, int ndim, void* data, int dtype) {
     long numel = numel_of(shape, ndim);
+    /*
+     * `elem_size` is zero for a sub-byte dtype, and that is the honest answer
+     * rather than a failure: two 4-bit values share a byte, so there is no
+     * whole-byte size per element. Storage is sized from the total instead,
+     * which `dtype_span_bytes` can express and a per-element size cannot.
+     *
+     * Everything downstream reads the zero the same way -- `tensor_span_bytes`
+     * skips its cross-check, and `physical_byte_tensor` still demands one byte
+     * per element, so a sub-byte activation reaches no W8A8 kernel until one is
+     * written for it. Allocating it correctly is what lets that kernel be the
+     * only change when it arrives.
+     */
     size_t elem_size = dtype_size(dtype);
+    size_t storage_bytes;
     if (!name || !name[0] || strlen(name) >= sizeof(g_t[0].name) ||
-        g_nt >= MAXT || numel < 0 || !elem_size ||
-        (size_t)numel > SIZE_MAX / elem_size) return NULL;
+        g_nt >= MAXT || numel < 0 ||
+        !dtype_span_bytes(dtype, numel > 0 ? numel : 1, &storage_bytes) ||
+        !storage_bytes) return NULL;
     void* storage = data;
     if (!storage) {
-        storage = calloc((size_t)(numel > 0 ? numel : 1), elem_size);
+        storage = calloc(storage_bytes, 1);
         if (!storage) return NULL;
     }
     T* t = &g_t[g_nt];
@@ -332,31 +416,96 @@ static void seq_range(long total_rows, int* r0, int* rc) {
     }
 }
 
-// Incremental attention: one query row attends over cached K/V [0..len).
+/*
+ * Row narrowing for a declared batch, where `seq_range` cannot reach.
+ *
+ * `seq_range` answers with a start and a count, which says a step's rows are
+ * one contiguous span. That is true of every one-lane step and of no other
+ * kind: with `lanes` sequences retained in one `[lanes,S,W]` activation the
+ * rows a step writes are `lane * S + position[lane]`, and two lanes are S rows
+ * apart even when they sit at the same position. Generalising the *arithmetic*
+ * was the wrong move here as it was in WebGPU -- the caller states the geometry
+ * it has, and `decode_row_set.c` resolves the addresses for both runtimes.
+ *
+ * Returns the lane count on success and 0 when this tensor is not the declared
+ * batch geometry, which is the caller's signal to leave the operand alone
+ * rather than to address it under a second meaning.
+ */
+static int decode_lane_rows(const T* tensor, long width, int* out_rows) {
+    long lane_stride;
+    if (g_decode_lanes <= 1 || !tensor || !out_rows || width <= 0) return 0;
+    /* The batch axis is a declaration, so it is checked against the shape
+     * rather than read from it. A tensor whose leading extent is not the
+     * declared lane count is some other operand of the same graph. */
+    if (tensor->ndim != 3 || tensor->shape[0] != g_decode_lanes ||
+        tensor->shape[1] <= 0 || (long)tensor->shape[2] != width) return 0;
+    lane_stride = tensor->shape[1];
+    if (vx_decode_row_set_write_rows(&g_decode_rows, (int)lane_stride, 0,
+                                     out_rows) != VX_DECODE_ROW_SET_OK) return 0;
+    return g_decode_lanes;
+}
+
+/*
+ * A declared batch's rows as contiguous runs, for a row-local operator.
+ *
+ * QAdd, QSiLU, QGELU and the norms all write row r from row r and nothing else,
+ * so unlike QLinear they need no staging at all: the kernel runs once per run
+ * of adjacent lane rows, at that run's own offset. Copying them into scratch
+ * first would move the same bytes twice for no arithmetic saving, because an
+ * elementwise kernel has nothing to amortise across rows -- which is the whole
+ * reason QLinear stages and these do not.
+ *
+ * Parked lanes are excluded rather than computed and discarded. A released
+ * lane's row holds whatever its previous occupant left, and a row-local
+ * operator would faithfully recompute a function of another request's bytes
+ * and store it. Skipping costs one extra run at worst.
+ *
+ * Returns the run count, or a negative value when this tensor is not the
+ * declared batch geometry.
+ */
+static int decode_lane_runs(const T* tensor, long width, VxDecodeRowRun* runs) {
+    int rows[VX_DECODE_ROW_SET_MAX_LANES];
+    if (!runs || decode_lane_rows(tensor, width, rows) != g_decode_lanes) return -1;
+    for (int lane = 0; lane < g_decode_lanes; lane++)
+        if (g_decode_rows.parked[lane]) rows[lane] = -1;
+    return vx_decode_row_copy_runs(rows, g_decode_lanes, runs,
+                                   VX_DECODE_ROW_SET_MAX_LANES);
+}
+
+/* Scratch for one step's staged rows. Grown geometrically and never returned:
+ * the size is a function of the model's widths, so it settles after the first
+ * step of the first decode. */
+static void* decode_stage_bytes(size_t bytes) {
+    VxEngineState* state = vx_engine_state_current();
+    if (!state || !bytes) return NULL;
+    if (state->decode_stage_bytes < bytes) {
+        size_t grown = state->decode_stage_bytes ? state->decode_stage_bytes : 1;
+        unsigned char* replacement;
+        while (grown < bytes) {
+            if (grown > SIZE_MAX / 2) return NULL;
+            grown *= 2;
+        }
+        replacement = (unsigned char*)realloc(state->decode_stage, grown);
+        if (!replacement) return NULL;
+        state->decode_stage = replacement;
+        state->decode_stage_bytes = grown;
+    }
+    return state->decode_stage;
+}
+
+/* Incremental attention: one query row attends over cached K/V [0..len).
+ *
+ * Delegates to the paged kernel with a null page table, which is the identity
+ * mapping — the same expression the paged form evaluates for a contiguous
+ * cache. Keeping one implementation is what makes "paged KV is numerically
+ * identical to contiguous KV" structural instead of a property some later
+ * change can quietly break on one of two paths. */
 static int sdpa_cached_row(const float* q, const float* kc, const float* vc, int len,
                        float* out, int d_model, int heads, int head_dim, float scale) {
-    if (!q || !kc || !vc || !out || len <= 0 || d_model <= 0 || heads <= 0 ||
-        head_dim <= 0 || (size_t)len > SIZE_MAX / sizeof(float)) return -1;
-    float* scores = (float*)malloc((size_t)len * sizeof(float));
-    if (!scores) return -1;
-    for (int h = 0; h < heads; h++) {
-        const float* qh = q + h * head_dim;
-        float maxv = -1e38f;
-        for (int j = 0; j < len; j++) {
-            const float* kh = kc + (long)j * d_model + h * head_dim;
-            float s = 0; for (int d = 0; d < head_dim; d++) s += qh[d] * kh[d];
-            s *= scale; scores[j] = s; if (s > maxv) maxv = s;
-        }
-        float sum = 0; for (int j = 0; j < len; j++) { scores[j] = expf(scores[j] - maxv); sum += scores[j]; }
-        for (int d = 0; d < head_dim; d++) {
-            float acc = 0;
-            for (int j = 0; j < len; j++) acc += scores[j] * vc[(long)j * d_model + h * head_dim + d];
-            out[h * head_dim + d] = acc / sum;
-        }
-    }
-    free(scores);
-    return 0;
+    return vx_sdpa_paged_row_f32(q, kc, vc, NULL, 1, len, NULL, out,
+                                 d_model, heads, head_dim, scale);
 }
+
 
 char* read_file(const char* path, long* out_size) {
     if (out_size) *out_size = 0;
@@ -370,14 +519,20 @@ char* read_file(const char* path, long* out_size) {
 }
 
 // ---- safetensors: load weights; F16 tensors remain half-precision in the blob ----
-int volvoxai_engine_load_weight_files(const char* const* paths, int count) {
+static int volvoxai_engine_load_weight_files_impl(
+        const char* const* paths,
+        const SafetensorsFile* immutable_files,
+        int count) {
     double t0 = g_debug ? volvoxai_engine_now_ms() : 0.0;
-    if (count < 0 || count > MAX_WEIGHT_FILES || (count > 0 && !paths)) return -1;
+    const int borrowed = immutable_files != NULL;
+    if (count < 0 || count > MAX_WEIGHT_FILES ||
+        (count > 0 && !paths)) return -1;
     for (int i = 0; i < g_weight_file_count; i++) {
         safetensors_free(&g_weight_files[i]);
         g_weight_paths[i][0] = 0;
     }
     g_weight_file_count = 0;
+    g_weight_files_borrowed = borrowed;
     g_blob = NULL;
 
     if (count == 0) {
@@ -394,9 +549,15 @@ int volvoxai_engine_load_weight_files(const char* const* paths, int count) {
     long total_size = 0;
     for (int f = 0; f < count; f++) {
         if (!paths[f] || !paths[f][0]) return -1;
-        SafetensorsLoadOptions options = { SAFETENSORS_OPEN_READ_WRITE };
-        SafetensorsFile weights;
-        if (safetensors_load_with_options(paths[f], &options, &weights) != 0) return -1;
+        SafetensorsFile weights = {0};
+        if (borrowed) {
+            if (safetensors_borrow_immutable(&immutable_files[f], &weights) != 0)
+                return -1;
+        } else {
+            SafetensorsLoadOptions options = { SAFETENSORS_OPEN_READ_WRITE };
+            if (safetensors_load_with_options(paths[f], &options, &weights) != 0)
+                return -1;
+        }
         for (int i = 0; i < weights.tensor_count; i++) {
             if (g_nt >= MAXT) {
                 fprintf(stderr, "[engine] too many tensors in safetensors files\n");
@@ -443,6 +604,18 @@ int volvoxai_engine_load_weight_files(const char* const* paths, int count) {
                 count, weight_count, override_count, f16_loaded, total_size, volvoxai_engine_now_ms() - t0);
     }
     return 0;
+}
+
+int volvoxai_engine_load_weight_files(const char* const* paths, int count) {
+    return volvoxai_engine_load_weight_files_impl(paths, NULL, count);
+}
+
+int volvoxai_engine_load_borrowed_weight_files(
+        const SafetensorsFile* files,
+        const char* const* paths,
+        int count) {
+    if (!files) return -1;
+    return volvoxai_engine_load_weight_files_impl(paths, files, count);
 }
 
 // ---- param helpers --------------------------------------------------------
@@ -2570,7 +2743,7 @@ static int free_node_caches_impl(int training_transition) {
     if (!preserve_cuda_weights && g_loaded &&
         volvoxai_engine_sync_model_weights_locked() != 0) return -1;
     if (volvoxai_engine_prepare_tensor_table_mutation() != 0) return -1;
-    vx_conv_f32_opt_free_all();
+    vx_conv_f32_isa_free_all();
     vx_gemm_f32_cache_free_all(&vx_engine_state_current()->gemm_f32_cache);
 #if VOLVOXAI_ENABLE_VULKAN
     vk_free_weight_cache();
@@ -2608,7 +2781,7 @@ int volvoxai_engine_refresh_weight_caches(void) {
     if (vx_dynamic_autograd_active_locked()) return -1;
     if (g_loaded && volvoxai_engine_sync_model_weights_locked() != 0)
         return -1;
-    vx_conv_f32_opt_free_all();
+    vx_conv_f32_isa_free_all();
     vx_gemm_f32_cache_free_all(&vx_engine_state_current()->gemm_f32_cache);
 #if VOLVOXAI_ENABLE_VULKAN
     vk_free_weight_cache();

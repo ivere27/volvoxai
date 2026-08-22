@@ -108,6 +108,34 @@ class OnnxFrontendRegressionTests(unittest.TestCase):
         self.assertEqual(expand["outputs"]["out"]["shape"], ["B", "Q", 3])
         self.assertTrue(validate_graph(graph, ["portable"], weights=weights).supported)
 
+    def test_broadcast_accepts_a_proven_singleton_output_symbol(self):
+        path = _save_model(
+            self.root,
+            "singleton_output_broadcast.onnx",
+            nodes=[helper.make_node(
+                "Add", ["tokens", "bias"], ["result"], name="add_bias",
+            )],
+            inputs=[_value("tokens", TensorProto.FLOAT, ["B", 16, 11])],
+            outputs=[_value("result", TensorProto.FLOAT, ["B", "S", 11])],
+            initializers=[
+                _initializer("bias", np.zeros((11,), dtype=np.float32)),
+            ],
+        )
+
+        graph, weights = OnnxCompiler(
+            str(path),
+            dimension_bounds={
+                "B": {"min": 1, "max": 4},
+                "S": {"min": 16, "max": 16},
+            },
+        ).lower()
+
+        self.assertEqual(
+            graph["nodes"][-1]["outputs"]["out"]["shape"],
+            ["B", 16, 11],
+        )
+        self.assertTrue(validate_graph(graph, ["portable"], weights=weights).supported)
+
     def test_singleton_inference_preserves_proven_public_batch_symbol(self):
         path = _save_model(
             self.root,

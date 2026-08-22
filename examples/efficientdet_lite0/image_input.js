@@ -22,7 +22,7 @@ function requireByteQuantization(tensor) {
 
 /**
  * Convert canvas RGBA bytes to the model's RGB input convention: zero-one F32,
- * physical U8 bytes, or signed I8 source levels centered on zero.
+ * U8 bytes, or signed I8 source levels centered on zero.
  */
 export function efficientDetInputViewFromRgba(rgba, tensor) {
   const { height, width } = imageShape(tensor);
@@ -58,7 +58,7 @@ export function efficientDetInputViewFromRgba(rgba, tensor) {
       input[destination + 1] = rgba[source + 1] / 255;
       input[destination + 2] = rgba[source + 2] / 255;
     } else {
-      // U8 input is already physical quantized storage. Applying the tensor
+      // U8 input is already quantized storage. Applying the tensor
       // scale here would quantize the pixels a second time and saturate them.
       input[destination] = rgba[source];
       input[destination + 1] = rgba[source + 1];

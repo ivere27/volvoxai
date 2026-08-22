@@ -1,0 +1,184 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>VolvoxAI Receipt Digit Reader</title>
+  <style>
+    :root { color-scheme: light dark; --ink: #181a1f; --muted: #667085; --line: #d8dde6; --panel: #f7f8fa; --accent: #0b6bcb; }
+    @media (prefers-color-scheme: dark) {
+      :root { --ink: #e8eaed; --muted: #9aa4b2; --line: #333a45; --panel: #1b1f26; --accent: #6aa9f0; }
+      body { background: #12151a; }
+    }
+    * { box-sizing: border-box; }
+    body { margin: 0; font: 14px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif; color: var(--ink); }
+    header { display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 14px 18px; border-bottom: 1px solid var(--line); }
+    h1 { font-size: 16px; margin: 0; font-weight: 650; }
+    main { padding: 18px; display: grid; gap: 16px; grid-template-columns: minmax(0, 2fr) minmax(240px, 1fr); }
+    @media (max-width: 760px) { main { grid-template-columns: 1fr; } }
+    .panel { border: 1px solid var(--line); border-radius: 8px; padding: 14px; background: var(--panel); }
+    canvas { width: 100%; height: auto; border-radius: 6px; border: 1px solid var(--line); background: #fff; }
+    .record { font: 600 26px/1.3 ui-monospace, SFMono-Regular, Menlo, monospace; letter-spacing: 0.04em; }
+    .label { color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: 0.06em; }
+    .row { display: flex; justify-content: space-between; gap: 12px; padding: 4px 0; }
+    select, button, input[type=file] { font: inherit; padding: 6px 10px; border-radius: 6px; border: 1px solid var(--line); background: transparent; color: inherit; }
+    button { background: var(--accent); color: #fff; border-color: transparent; cursor: pointer; }
+    button:disabled { opacity: 0.5; cursor: default; }
+    #status { color: var(--muted); }
+    #answer { margin-top: 10px; }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>VolvoxAI Receipt Digit Reader</h1>
+    <span id="status">Loading…</span>
+  </header>
+  <main>
+    <div class="panel">
+      <canvas id="canvas" width="672" height="320"></canvas>
+      <div class="row" style="margin-top: 10px">
+        <input type="file" id="file" accept="image/*">
+        <select id="backend">
+          <option value="webgpu">webgpu</option>
+          <option value="wasm">wasm</option>
+          <option value="cpu-js">cpu-js</option>
+        </select>
+        <button id="run" disabled>Read receipt</button>
+      </div>
+      <div id="answer">
+        <div class="label">Question (regex-routed on the host; the graph never sees it)</div>
+        <input id="question" style="width: 100%; margin-top: 6px" value="가게 전화번호의 뒤에서 2번째 숫자는 무엇입니까?">
+        <div class="row"><span class="label">Answer</span><span id="answerValue" class="record">—</span></div>
+      </div>
+    </div>
+    <div class="panel">
+      <div class="label">Record</div>
+      <div class="row"><span>phone</span><span id="phone" class="record">—</span></div>
+      <div class="row"><span>street</span><span id="street" class="record">—</span></div>
+      <hr style="border: none; border-top: 1px solid var(--line); margin: 12px 0">
+      <div class="row"><span class="label">variant</span><span id="variant">—</span></div>
+      <div class="row"><span class="label">backend</span><span id="activeBackend">—</span></div>
+      <div class="row"><span class="label">latency</span><span id="latency">—</span></div>
+    </div>
+  </main>
+
+  <script type="module">
+    import * as volvoxai from '../dist/0.4.0/volvoxai.js';
+    const { VolvoxAI } = volvoxai;
+    import { ReceiptDigitSession } from './receipt_digit_reader/ReceiptDigitSession.js';
+    import { answerFromRecord } from './receipt_digit_reader/questionRouter.js';
+
+    // Point these at a package published by
+    // examples/receipt_digit_reader/tools/import_hf_onnx.py.
+    const PACKAGE = '../build/receipt-digit-reader-fp32';
+
+    const $ = (id) => document.getElementById(id);
+    const canvas = $('canvas');
+    const context2d = canvas.getContext('2d', { willReadFrequently: true });
+    let manifest = null;
+    let session = null;
+    let runtime = null;
+    let hasFrame = false;
+
+    const setStatus = (text) => { $('status').textContent = text; };
+
+    async function openSession(backend) {
+      await session?.close();
+      session = null;
+      await runtime?.close();
+      // WebGPU is only worth requiring when the adapter actually exists;
+      // asking for it on a machine without one should say so plainly rather
+      // than fall back and report a number from a different provider.
+      if (backend === 'webgpu' && !navigator.gpu) {
+        throw new Error('this browser exposes no WebGPU adapter');
+      }
+      runtime = await VolvoxAI.createRuntime({
+        backends: [backend],
+        wasmUrl: '../dist/0.4.0/volvoxai.wasm',
+      });
+      session = await ReceiptDigitSession.open({
+        manifest,
+        graphUrl: `${PACKAGE}/graph.json`,
+        weightsUrl: `${PACKAGE}/model.safetensors`,
+        runtime,
+        backend,
+        api: volvoxai,
+      });
+      $('activeBackend').textContent = backend;
+    }
+
+    async function boot() {
+      const response = await fetch(`${PACKAGE}/manifest.json`);
+      if (!response.ok) {
+        throw new Error(`no package at ${PACKAGE} (manifest.json ${response.status})`);
+      }
+      manifest = await response.json();
+      $('variant').textContent = `${manifest.variant} (${manifest.package_class})`;
+      canvas.width = manifest.preprocess.width;
+      canvas.height = manifest.preprocess.height;
+      await openSession($('backend').value);
+      setStatus('Ready — choose a receipt image');
+    }
+
+    $('file').addEventListener('change', async (event) => {
+      const file = event.target.files?.[0];
+      if (!file) return;
+      const bitmap = await createImageBitmap(file);
+      // Draw into the declared network geometry so the canvas shows exactly
+      // what the model is given, letterboxing included.
+      context2d.clearRect(0, 0, canvas.width, canvas.height);
+      context2d.drawImage(bitmap, 0, 0, canvas.width, canvas.height);
+      bitmap.close();
+      hasFrame = true;
+      $('run').disabled = false;
+      setStatus('Ready');
+    });
+
+    $('backend').addEventListener('change', async (event) => {
+      try {
+        setStatus(`Switching to ${event.target.value}…`);
+        await openSession(event.target.value);
+        setStatus('Ready');
+      } catch (error) {
+        setStatus(`${error.message}`);
+        $('run').disabled = true;
+      }
+    });
+
+    $('run').addEventListener('click', async () => {
+      if (!hasFrame || !session) return;
+      $('run').disabled = true;
+      try {
+        setStatus('Reading…');
+        const frame = context2d.getImageData(0, 0, canvas.width, canvas.height);
+        const started = performance.now();
+        const record = await session.read({
+          data: frame.data, width: canvas.width, height: canvas.height, channels: 4,
+        });
+        const elapsed = performance.now() - started;
+        $('phone').textContent = record.phone || '—';
+        $('street').textContent = record.street || '—';
+        $('latency').textContent = `${elapsed.toFixed(1)} ms`;
+        $('answerValue').textContent =
+          answerFromRecord($('question').value, record.phone, record.street) || '—';
+        setStatus('Ready');
+      } catch (error) {
+        setStatus(`${error.message}`);
+      } finally {
+        $('run').disabled = false;
+      }
+    });
+
+    $('question').addEventListener('input', () => {
+      const phone = $('phone').textContent;
+      const street = $('street').textContent;
+      if (phone === '—' && street === '—') return;
+      $('answerValue').textContent = answerFromRecord(
+        $('question').value, phone === '—' ? '' : phone, street === '—' ? '' : street,
+      ) || '—';
+    });
+
+    boot().catch((error) => setStatus(`${error.message}`));
+  </script>
+</body>
+</html>

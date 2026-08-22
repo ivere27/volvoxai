@@ -20,6 +20,7 @@
   "include": [
     "ts/**/*.ts",
     "ts/**/*.d.ts",
+    "runtime/typescript/**/*.ts",
     "runtime/generated/typescript/**/*.ts"
   ]
 }

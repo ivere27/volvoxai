@@ -38,24 +38,58 @@ int attention_mask_allowed(const T* mask, int mode, int batch_index,
 const int32_t* attention_mask_batch_view(const T* mask, int mode,
                                          int batch_index, int seq_q,
                                          int seq_kv, int* local_mode) {
-    if (local_mode) *local_mode = 0;
+    if (local_mode) *local_mode = VX_ATTN_MASK_LOCAL_NONE;
     if (!mask || mode == ATTN_MASK_NONE) return NULL;
     const int32_t* values = (const int32_t*)mask->data;
     if (mode == ATTN_MASK_KEY) {
-        if (local_mode) *local_mode = 1;
+        if (local_mode) *local_mode = VX_ATTN_MASK_LOCAL_KEY;
         return values;
     }
     if (mode == ATTN_MASK_BATCH_KEY) {
-        if (local_mode) *local_mode = 1;
+        if (local_mode) *local_mode = VX_ATTN_MASK_LOCAL_KEY;
         return values + (long)batch_index * seq_kv;
     }
     if (mode == ATTN_MASK_QUERY_KEY) {
-        if (local_mode) *local_mode = 2;
+        if (local_mode) *local_mode = VX_ATTN_MASK_LOCAL_QUERY_KEY;
         return values;
     }
     if (mode == ATTN_MASK_BATCH_QUERY_KEY) {
-        if (local_mode) *local_mode = 2;
+        if (local_mode) *local_mode = VX_ATTN_MASK_LOCAL_QUERY_KEY;
         return values + (long)batch_index * seq_q * seq_kv;
     }
     return NULL;
+}
+
+/* See the header: every layout leaves here as one key row, so the query index a
+ * kernel would otherwise apply to a sliced operand is resolved while the
+ * absolute position is still in hand. */
+const int32_t* attention_mask_query_view(const T* mask, int mode,
+                                         int batch_index, int query,
+                                         int seq_q, int seq_kv,
+                                         int* local_mode) {
+    const int32_t* values;
+    long offset;
+    if (local_mode) *local_mode = VX_ATTN_MASK_LOCAL_NONE;
+    if (!mask || mode == ATTN_MASK_NONE || !mask->data ||
+        batch_index < 0 || seq_q <= 0 || seq_kv <= 0) return NULL;
+    values = (const int32_t*)mask->data;
+    if (mode == ATTN_MASK_KEY) {
+        offset = 0;
+    } else if (mode == ATTN_MASK_BATCH_KEY) {
+        offset = (long)batch_index * seq_kv;
+    } else if (mode == ATTN_MASK_QUERY_KEY) {
+        if (query < 0 || query >= seq_q) return NULL;
+        offset = (long)query * seq_kv;
+    } else if (mode == ATTN_MASK_BATCH_QUERY_KEY) {
+        if (query < 0 || query >= seq_q) return NULL;
+        offset = ((long)batch_index * seq_q + query) * seq_kv;
+    } else {
+        return NULL;
+    }
+    /* The row must lie inside the tensor validate sized: an extent disagreeing
+     * with the one the mask was classified against turns a wrong stride into a
+     * read of whatever follows the mask. */
+    if (offset < 0 || offset + seq_kv > mask->numel) return NULL;
+    if (local_mode) *local_mode = VX_ATTN_MASK_LOCAL_KEY;
+    return values + offset;
 }

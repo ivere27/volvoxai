@@ -21,12 +21,10 @@ enum BackendKind {
   BACKEND_KIND_WASM = 2;
   BACKEND_KIND_WEBGPU = 3;
   BACKEND_KIND_NATIVE_CPU = 4;
-  BACKEND_KIND_WEBNN = 5;
-  BACKEND_KIND_VULKAN = 6;
-  BACKEND_KIND_OPENGL = 7;
-  BACKEND_KIND_METAL = 8;
-  BACKEND_KIND_CUDA = 9;
-  BACKEND_KIND_NNAPI = 10;
+  BACKEND_KIND_VULKAN = 5;
+  BACKEND_KIND_OPENGL = 6;
+  BACKEND_KIND_METAL = 7;
+  BACKEND_KIND_CUDA = 8;
 }
 
 enum KernelProfile {
@@ -743,16 +741,6 @@ option (volvoxai.kernel_registry.registry) = {
     exporter_qualified_operator_set: "qualified-common"
   }
   backend: {
-    kind: BACKEND_KIND_WEBNN
-    runtime_id: "webnn"
-    exporter_target: "backend:webnn"
-    support_mode: RUNTIME_SUPPORT_MODE_DIRECT
-    default_route: "webnn-builder"
-    default_predicate_id: "webnn.builder-predicate"
-    runtime_operator_set: "runtime-webnn"
-    exporter_qualified_operator_set: "qualified-webnn"
-  }
-  backend: {
     kind: BACKEND_KIND_NATIVE_CPU
     runtime_id: "native-cpu"
     exporter_target: "native-cpu"
@@ -771,6 +759,8 @@ option (volvoxai.kernel_registry.registry) = {
     default_predicate_id: "vulkan.device-route-predicate"
     runtime_operator_set: "runtime-all"
     exporter_qualified_operator_set: "qualified-native-gpu"
+    exporter_qualified_operator: OPERATOR_KIND_MAX_POOL_2D
+    exporter_qualified_operator: OPERATOR_KIND_RESIZE_NEAREST_2D
   }
   backend: {
     kind: BACKEND_KIND_OPENGL
@@ -781,6 +771,8 @@ option (volvoxai.kernel_registry.registry) = {
     default_predicate_id: "opengl.device-route-predicate"
     runtime_operator_set: "runtime-all"
     exporter_qualified_operator_set: "qualified-native-gpu"
+    exporter_qualified_operator: OPERATOR_KIND_MAX_POOL_2D
+    exporter_qualified_operator: OPERATOR_KIND_RESIZE_NEAREST_2D
   }
   backend: {
     kind: BACKEND_KIND_METAL
@@ -801,14 +793,8 @@ option (volvoxai.kernel_registry.registry) = {
     default_predicate_id: "cuda.device-route-predicate"
     runtime_operator_set: "runtime-all"
     exporter_qualified_operator_set: "qualified-native-gpu"
-  }
-  backend: {
-    kind: BACKEND_KIND_NNAPI
-    runtime_id: "nnapi"
-    support_mode: RUNTIME_SUPPORT_MODE_DYNAMIC
-    default_route: "nnapi-matmul"
-    default_predicate_id: "nnapi.one-shot-linear-predicate"
-    runtime_operator_set: "runtime-linear"
+    exporter_qualified_operator: OPERATOR_KIND_MAX_POOL_2D
+    exporter_qualified_operator: OPERATOR_KIND_RESIZE_NEAREST_2D
   }
   target_profile: {
     name: "portable"
@@ -1238,6 +1224,16 @@ option (volvoxai.kernel_registry.registry) = {
     priority: 100
   }
   variant: {
+    id: "opengl.conv2d.regular-out16"
+    backend: BACKEND_KIND_OPENGL
+    operator: OPERATOR_KIND_CONV_2D
+    profile: KERNEL_PROFILE_INFERENCE
+    phase: KERNEL_PHASE_FORWARD
+    entrypoint_id: "conv2DRegularOut16"
+    predicate_id: "opengl.conv.groups1-output-channels16-workgroup-8x8"
+    priority: 250
+  }
+  variant: {
     id: "opengl.qlinear.tiled"
     backend: BACKEND_KIND_OPENGL
     operator: OPERATOR_KIND_Q_LINEAR
@@ -1378,19 +1374,6 @@ option (volvoxai.kernel_registry.registry) = {
     required_feature: "cuda.device-residency"
     required_feature: "cuda.sm61-dp4a"
     priority: 300
-  }
-  variant: {
-    id: "nnapi.linear.one-shot"
-    backend: BACKEND_KIND_NNAPI
-    operator: OPERATOR_KIND_MATMUL
-    operator: OPERATOR_KIND_LINEAR
-    operator: OPERATOR_KIND_GEMM
-    profile: KERNEL_PROFILE_INFERENCE
-    phase: KERNEL_PHASE_FORWARD
-    entrypoint_id: "nnapi_matmul"
-    predicate_id: "nnapi.one-shot-f32-linear-cost-threshold"
-    required_feature: "android.nnapi"
-    priority: 100
   }
   operator_set: {
     name: "runtime-all"
@@ -1658,31 +1641,6 @@ option (volvoxai.kernel_registry.registry) = {
     operator: OPERATOR_KIND_DROPOUT
   }
   operator_set: {
-    name: "runtime-webnn"
-    operator: OPERATOR_KIND_MATMUL
-    operator: OPERATOR_KIND_LINEAR
-    operator: OPERATOR_KIND_GEMM
-    operator: OPERATOR_KIND_SDPA
-    operator: OPERATOR_KIND_LAYER_NORM
-    operator: OPERATOR_KIND_CONV_2D
-    operator: OPERATOR_KIND_RELU
-    operator: OPERATOR_KIND_GELU
-    operator: OPERATOR_KIND_SILU
-    operator: OPERATOR_KIND_SIGMOID
-    operator: OPERATOR_KIND_ADD
-    operator: OPERATOR_KIND_MUL
-    operator: OPERATOR_KIND_SOFTMAX
-    operator: OPERATOR_KIND_RESHAPE
-    operator: OPERATOR_KIND_FLATTEN
-    operator: OPERATOR_KIND_EMBEDDING
-  }
-  operator_set: {
-    name: "runtime-linear"
-    operator: OPERATOR_KIND_MATMUL
-    operator: OPERATOR_KIND_LINEAR
-    operator: OPERATOR_KIND_GEMM
-  }
-  operator_set: {
     name: "qualified-common"
     operator: OPERATOR_KIND_ADD
     operator: OPERATOR_KIND_ARG_MAX
@@ -1793,6 +1751,7 @@ option (volvoxai.kernel_registry.registry) = {
     operator: OPERATOR_KIND_REDUCE_SUM
     operator: OPERATOR_KIND_REQUANTIZE_LINEAR
     operator: OPERATOR_KIND_RESHAPE
+    operator: OPERATOR_KIND_SIGMOID
     operator: OPERATOR_KIND_SILU
     operator: OPERATOR_KIND_SLICE
     operator: OPERATOR_KIND_SOFTMAX
@@ -1870,16 +1829,5 @@ option (volvoxai.kernel_registry.registry) = {
     operator: OPERATOR_KIND_UNSQUEEZE
     operator: OPERATOR_KIND_UPSAMPLE_NEAREST_2D
     operator: OPERATOR_KIND_WHERE
-  }
-  operator_set: {
-    name: "qualified-webnn"
-    operator: OPERATOR_KIND_ADD
-    operator: OPERATOR_KIND_CONV_2D
-    operator: OPERATOR_KIND_GEMM
-    operator: OPERATOR_KIND_LINEAR
-    operator: OPERATOR_KIND_MATMUL
-    operator: OPERATOR_KIND_MUL
-    operator: OPERATOR_KIND_RELU
-    operator: OPERATOR_KIND_RESHAPE
   }
 };

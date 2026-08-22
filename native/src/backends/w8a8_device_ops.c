@@ -1,6 +1,6 @@
 #include "w8a8_device_ops.h"
 
-/* Backend-owned immutable dispatch tables for physical-byte graph kernels. */
+/* Backend-owned immutable dispatch tables for byte graph kernels. */
 
 #if VOLVOXAI_ENABLE_VULKAN
 #include "vulkan_engine.h"
@@ -28,6 +28,7 @@ static const VxW8A8Ops g_vulkan_w8a8_ops = {
     .qlayernorm_i8u8 = vk_graph_qlayernorm_i8u8,
     .qsdpa_i8u8 = vk_graph_qsdpa_i8u8,
     .qargmax_i8u8 = vk_graph_qargmax_i8u8,
+    .row_index_transfer = vk_graph_row_index_transfer,
     .qmaskedmean_i8u8 = vk_graph_qmaskedmean_i8u8,
     .requantize_linear_i8u8 = vk_graph_requantize_linear_i8u8,
     .quantize_typed_f32_i8u8 = vk_graph_quantize_typed_f32_i8u8,
@@ -53,6 +54,7 @@ static const VxW8A8Ops g_opengl_w8a8_ops = {
     .qlayernorm_i8u8 = opengl_graph_qlayernorm_i8u8,
     .qsdpa_i8u8 = opengl_graph_qsdpa_i8u8,
     .qargmax_i8u8 = opengl_graph_qargmax_i8u8,
+    .row_index_transfer = opengl_graph_row_index_transfer,
     .qmaskedmean_i8u8 = opengl_graph_qmaskedmean_i8u8,
     .requantize_linear_i8u8 = opengl_graph_requantize_linear_i8u8,
     .quantize_typed_f32_i8u8 = opengl_graph_quantize_typed_f32_i8u8,
@@ -103,6 +105,7 @@ static const VxW8A8Ops g_cuda_w8a8_ops = {
     .qlayernorm_i8u8 = cuda_graph_qlayernorm_i8u8,
     .qsdpa_i8u8 = cuda_graph_qsdpa_i8u8,
     .qsdpa_range_i8u8 = cuda_graph_qsdpa_range_i8u8,
+    .row_index_transfer = cuda_graph_row_index_transfer,
     .qargmax_i8u8 = cuda_graph_qargmax_i8u8,
     .qmaskedmean_i8u8 = cuda_graph_qmaskedmean_i8u8,
     .requantize_linear_i8u8 = cuda_graph_requantize_linear_i8u8,

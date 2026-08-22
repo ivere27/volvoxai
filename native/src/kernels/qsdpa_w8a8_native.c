@@ -1,5 +1,5 @@
 /*
- * Native CPU parallelism for canonical physical-byte W8A8 QSDPA.
+ * Native CPU parallelism for canonical W8A8 QSDPA.
  *
  * The portable qsdpa_i8u8() kernel remains the authoritative implementation
  * and the sole WASM path.  Whole-tensor native execution can partition its
@@ -8,7 +8,7 @@
  * masks are reduced to the corresponding key row, so key iteration and every
  * head's arithmetic order remain unchanged.
  */
-#include "quant_cpu_opt.h"
+#include "quant_cpu_isa.h"
 #include "fast_exp.h"
 #include "w8a8_affine.h"
 #include "cpu_features.h"

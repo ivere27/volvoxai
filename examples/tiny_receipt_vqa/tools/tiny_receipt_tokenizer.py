@@ -1,6 +1,6 @@
 """Validated TinyReceipt byte-fallback BPE contract for Python example tools.
 
-The explicit-KV package-v1 contract has one tokenizer: the 1536-entry NFC
+The explicit-KV package-v2 contract has one tokenizer: the 1536-entry NFC
 byte-fallback BPE vocabulary.  This module intentionally has no training or
 third-party tokenizer dependency.
 """

@@ -178,7 +178,7 @@ int metal_graph_quantize_linear_i8(const float* in, signed char* out, long n,
                                    float output_scale, int output_zp);
 int metal_graph_dequantize_linear_f32(const float* in, const float* scale, const float* zero_point,
                                       float* out, long n, int has_zero_point);
-/* Canonical physical-byte W8A8 dense dispatch. Dtypes use canonical
+/* Canonical W8A8 dense dispatch. Dtypes use canonical
  * VX_DTYPE_I8/VX_DTYPE_U8 values. */
 int metal_graph_qlinear_i8u8(const void* input, const void* weight,
                              const float* weight_scales, const int32_t* weight_zero_points,
@@ -196,7 +196,7 @@ int metal_graph_qembedding_i8u8(const int32_t* tokens, const void* weight,
                                 uint32_t token_count, uint32_t vocab, uint32_t hidden,
                                 float output_scale, int32_t output_zero_point,
                                 uint32_t weight_dtype, uint32_t output_dtype);
-/* Canonical physical-byte W8A8 Conv2D: NHWC activations and [O,H,W,I/group]
+/* Canonical W8A8 Conv2D: NHWC activations and [O,H,W,I/group]
  * OHWI weights.  NULL bias uses persistent zero I32 backing on the device. */
 int metal_graph_qconv2d_i8u8(const void* input, const void* weight,
                               const float* weight_scales, const int32_t* weight_zero_points,
@@ -260,7 +260,7 @@ int metal_graph_resize_nearest_i8u8(const void* input, void* output,
                                     float input_scale, int32_t input_zero_point,
                                     float output_scale, int32_t output_zero_point,
                                     uint32_t input_dtype, uint32_t output_dtype);
-/* Canonical physical-byte W8A8 elementwise add.  The backend validates the
+/* Canonical W8A8 elementwise add.  The backend validates the
  * exact logical element counts before using padded packed-u32 device storage. */
 int metal_graph_qadd_i8u8(const void* a, uint32_t a_elements,
                           const void* b, uint32_t b_elements,

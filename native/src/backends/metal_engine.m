@@ -23,6 +23,21 @@
 #define METAL_SHADER_DIR "metal"
 #define METAL_GRAPH_MAX_TENSORS 4096
 #define METAL_MAX_BINDINGS 8
+/*
+ * The offset alignment a row window must clear.
+ *
+ * Metal has no runtime query for this the way Vulkan and OpenGL do; it is a
+ * documented rule instead. Every windowed binding here is a naga-emitted
+ * `device` pointer, whose offset must be a multiple of four bytes. The two
+ * `constant` bindings a kernel takes -- Params and the buffer-size block -- are
+ * the ones that would owe 256 on Intel Macs, and both are always bound at
+ * offset zero, so that rule never reaches a row.
+ *
+ * Stated as a constant rather than a literal 4 because a future `constant`
+ * activation binding would have to change it, and this is where the reasoning
+ * that permits 4 is written down.
+ */
+#define METAL_GRAPH_ALIGN 4u
 #define METAL_GRAPH_MAX_RETAINED_BINDINGS (METAL_GRAPH_MAX_TENSORS * METAL_MAX_BINDINGS)
 #if VOLVOXAI_ENABLE_TRAINING
 #define METAL_TRAINING_MAX_BINDINGS 16
@@ -72,9 +87,13 @@ typedef struct {
     int domain_span;
 } MetalTensorSlot;
 
+/* `offset` is last so that every whole-tensor binding stays spelled
+ * `{buffer, bytes}` and means offset zero, which is what all but the decoder
+ * closure want. Only a row window sets it. */
 typedef struct {
     id<MTLBuffer> buffer;
     size_t bytes;
+    size_t offset;
 } MetalBinding;
 
 #if VOLVOXAI_ENABLE_TRAINING
@@ -137,7 +156,7 @@ static const MetalTrainingShaderDesc training_shader_descs[] = {
     {"layerNormBackward", 7, 64, 1, 1, 0x038u, {"input_main", "param_main", NULL}},
     {"matMulBackward", 7, 8, 8, 1, 0x038u,
         {"input_main", "weight_main", "bias_main", NULL}},
-    {"moeLinearBackward", 11, 64, 1, 1, 0x3c0u,
+    {"moeLinearBackward", 13, 64, 1, 1, 0x3c0u,
         {"input_main", "weight_main", "bias_main", "route_main", NULL}},
     {"moeRouterBackward", 11, 64, 1, 1, 0x3c0u,
         {"logit_main", "input_main", "weight_main", "bias_main", NULL}},
@@ -876,7 +895,11 @@ static MetalTensorSlot* graph_get_slot(const void* host, size_t bytes, int is_we
         s->shape_generation = is_weight ? 0 : state->shape_generation;
     }
     MetalTensorSlot* s = &graph_slots[idx];
-    s->bytes = bytes;
+    /* Grow, never shrink -- see the Vulkan twin. A caller asking for fewer
+     * bytes is asking about part of the tensor, not redefining it, and letting
+     * it shrink turns the next whole-tensor read into a growth that re-uploads
+     * a host mirror over rows the device just wrote. */
+    if (bytes > s->bytes) s->bytes = bytes;
     if (is_weight) s->is_weight = 1;
     return s;
 }
@@ -981,6 +1004,202 @@ static void graph_mark_device(MetalTensorSlot* s) {
     s->host_dirty = 0;
 }
 
+/* A binding into part of a resident tensor -- the Metal spelling of Vulkan's
+ * VkGraphWindow. Row execution asks for a *slice* of an activation, not for a
+ * tensor, and the slot map is keyed by complete host-span bases, so an interior
+ * pointer finds nothing on an exact lookup. Resolving it as an offset into the
+ * containing slot is what lets a decode row stay on the device.
+ *
+ * `setBuffer:offset:` already takes an offset, so this costs no new machinery
+ * at dispatch beyond carrying the field -- the same shape the Vulkan port had,
+ * and unlike OpenGL, which had to gain a ranged bind. */
+typedef struct {
+    MetalTensorSlot* slot;
+    size_t offset;
+    size_t bytes;
+} MetalGraphWindow;
+
+/*
+ * The resident slot whose span contains `[host, host + bytes)`.
+ *
+ * Exact base first, then the smallest containing span: a tensor and an arena
+ * span that both cover the pointer are both legal answers, and the tighter one
+ * is the tensor. Returns -1 when nothing contains it, which is the ordinary
+ * "this is a new tensor" case and not an error.
+ */
+static int graph_find_containing_slot(const void* host, size_t bytes, size_t* inner) {
+    MetalContextState* state = metal_context_state_get(0);
+    uintptr_t start = (uintptr_t)host;
+    uintptr_t end;
+    int best = -1;
+    int exact;
+    if (!state || !host || !bytes || start > UINTPTR_MAX - bytes) return -1;
+    end = start + bytes;
+    exact = graph_find_slot(host);
+    if (exact >= 0 && graph_slots[exact].bytes >= bytes) {
+        if (inner) *inner = 0;
+        return exact;
+    }
+    for (int index = 0; index < graph_slot_count; index++) {
+        MetalTensorSlot* slot = &graph_slots[index];
+        uintptr_t slot_start = (uintptr_t)slot->host;
+        uintptr_t slot_end;
+        if (!slot->host || !slot->bytes || !slot->buffer || slot->is_alias ||
+            slot_start > UINTPTR_MAX - slot->bytes) continue;
+        if (!slot->is_weight && slot->shape_generation != state->shape_generation)
+            continue;
+        slot_end = slot_start + slot->bytes;
+        if (start < slot_start || end > slot_end) continue;
+        if (best < 0 || slot->bytes < graph_slots[best].bytes) best = index;
+    }
+    if (best >= 0 && inner) {
+        *inner = (size_t)((uintptr_t)host - (uintptr_t)graph_slots[best].host);
+    }
+    return best;
+}
+
+/*
+ * Finish a window against a slot that is already resident.
+ *
+ * A row offset is `row * width * element size`, so a row is bindable exactly
+ * when its *stride* clears METAL_GRAPH_ALIGN. Refusing here names the
+ * constraint; the caller falls back to the host row path.
+ */
+static int graph_window_finish(MetalTensorSlot* slot, size_t inner, size_t bytes,
+                               MetalGraphWindow* out) {
+    if (!slot || !out || !bytes || !slot->buffer || slot->is_alias ||
+        inner > slot->bytes || bytes > slot->bytes - inner) return 0;
+    if (inner % METAL_GRAPH_ALIGN) return 0;
+    out->slot = slot;
+    out->offset = inner;
+    out->bytes = bytes;
+    return 1;
+}
+
+/*
+ * Whether `host` names an interior slice, and of which base.
+ *
+ * Resolution goes through the ordinary `graph_ensure_*` on the *base* pointer
+ * rather than around it, so a window inherits every domain, capacity and
+ * dirty-state rule a whole tensor obeys. The only thing that differs is where
+ * the binding starts.
+ */
+static int graph_window_base(const void* host, size_t bytes,
+                             const void** base, size_t* base_bytes, size_t* inner) {
+    int index = graph_find_containing_slot(host, bytes, inner);
+    if (index < 0 || *inner == 0) return 0;
+    *base = graph_slots[index].host;
+    *base_bytes = graph_slots[index].bytes;
+    return 1;
+}
+
+/* The packed spelling. A window's own bytes stay logical: only the containing
+ * slot is rounded up to whole words, and the tail it pads belongs to the
+ * tensor rather than to any one row. */
+static int graph_window_packed_bytes(const void* host, size_t logical_bytes,
+                                     int is_weight, MetalGraphWindow* out) {
+    const void* base = host;
+    size_t base_bytes = logical_bytes;
+    size_t inner = 0;
+    size_t storage_bytes;
+    MetalTensorSlot* slot;
+    if (!host || !out || !graph_packed_bytes(logical_bytes, &storage_bytes)) return 0;
+    if (graph_window_base(host, logical_bytes, &base, &base_bytes, &inner)) {
+        slot = graph_ensure_packed_bytes(base, base_bytes, is_weight);
+        return graph_window_finish(slot, inner, storage_bytes, out);
+    }
+    slot = graph_ensure_packed_bytes(host, logical_bytes, is_weight);
+    if (!slot) return 0;
+    out->slot = slot;
+    out->offset = 0;
+    out->bytes = storage_bytes;
+    return 1;
+}
+
+/*
+ * An output window.
+ *
+ * A row writes part of a tensor, so the rest has to already be on the device --
+ * otherwise the next read of an untouched row sees whatever the buffer held.
+ * When the containing slot is host-dirty this uploads it whole first and the
+ * kernel then overwrites one row, which is the same order the host row path
+ * achieves by syncing before it runs.
+ */
+static int graph_window_output_packed(const void* host, size_t logical_bytes,
+                                      MetalGraphWindow* out) {
+    const void* base = host;
+    size_t base_bytes = logical_bytes;
+    size_t inner = 0;
+    size_t storage_bytes;
+    MetalTensorSlot* slot;
+    if (!host || !out || !graph_packed_bytes(logical_bytes, &storage_bytes)) return 0;
+    if (graph_window_base(host, logical_bytes, &base, &base_bytes, &inner)) {
+        slot = graph_ensure_packed_bytes(base, base_bytes, 0);
+        return graph_window_finish(slot, inner, storage_bytes, out);
+    }
+    slot = graph_output_packed_bytes(host, logical_bytes);
+    if (!slot) return 0;
+    out->slot = slot;
+    out->offset = 0;
+    out->bytes = storage_bytes;
+    return 1;
+}
+
+static int graph_window_device(const void* host, size_t bytes, int is_weight,
+                               MetalGraphWindow* out) {
+    const void* base = host;
+    size_t base_bytes = bytes;
+    size_t inner = 0;
+    MetalTensorSlot* slot;
+    if (!host || !bytes || !out) return 0;
+    if (!graph_window_base(host, bytes, &base, &base_bytes, &inner)) {
+        base = host;
+        base_bytes = bytes;
+        inner = 0;
+    }
+    slot = graph_ensure_device(base, base_bytes, is_weight);
+    if (!slot) return 0;
+    if (inner == 0) {
+        out->slot = slot;
+        out->offset = 0;
+        out->bytes = bytes;
+        return 1;
+    }
+    return graph_window_finish(slot, inner, bytes, out);
+}
+
+/*
+ * Where in the ids tensor a dispatch starts, as a token index.
+ *
+ * Every other activation binds as a window, because a row's byte offset is
+ * `row * stride` and that clears the alignment whenever the stride does. A
+ * token row is a single i32, so on a device whose alignment exceeds four bytes
+ * no ids window past row zero would ever resolve. Binding the ids whole and
+ * naming the row as a shader scalar keeps that answer the same on every
+ * backend, which is the point -- see the Vulkan and OpenGL twins of this.
+ */
+static int graph_token_window(const int32_t* tokens, size_t token_bytes,
+                              MetalTensorSlot** slot, uint32_t* token_offset) {
+    const void* base = tokens;
+    size_t base_bytes = token_bytes;
+    size_t inner = 0;
+    int index;
+    if (!tokens || !token_bytes || !slot || !token_offset) return 0;
+    *token_offset = 0;
+    index = graph_find_containing_slot(tokens, token_bytes, &inner);
+    if (index >= 0 && inner) {
+        /* A misaligned interior pointer is not a token boundary, so it is not
+         * a row of this tensor and nothing here can address it. */
+        if (inner % sizeof(int32_t)) return 0;
+        if (inner / sizeof(int32_t) > UINT32_MAX) return 0;
+        base = graph_slots[index].host;
+        base_bytes = graph_slots[index].bytes;
+        *token_offset = (uint32_t)(inner / sizeof(int32_t));
+    }
+    *slot = graph_ensure_device(base, base_bytes, 0);
+    return *slot != NULL;
+}
+
 static void graph_release_retained_bindings(void) {
     for (int index = 0; index < graph_retained_binding_count; index++) {
         VX_METAL_RELEASE(graph_retained_bindings[index]);
@@ -1048,7 +1267,16 @@ static int dispatch_kernel(const MetalKernel* k, const MetalBinding* binds,
     for (int i = 0; i < k->binding_count; i++) {
         if (!binds[i].buffer || !metal_buffer_size_valid(binds[i].bytes))
             return 0;
+        /* A window's length is what the shader bounds-checks against, and its
+         * indices are relative to the bound offset -- so this stays the window's
+         * own byte count, not the containing tensor's. */
         sizes[i] = (uint32_t)binds[i].bytes;
+        if (binds[i].offset) {
+            NSUInteger length = [binds[i].buffer length];
+            if (binds[i].offset % METAL_GRAPH_ALIGN ||
+                binds[i].offset > (size_t)length ||
+                binds[i].bytes > (size_t)length - binds[i].offset) return 0;
+        }
     }
     pipeline = compile_kernel(k);
     if (!pipeline || threads_per_group >
@@ -1077,7 +1305,9 @@ static int dispatch_kernel(const MetalKernel* k, const MetalBinding* binds,
         [enc setComputePipelineState:pipeline];
 
         for (int i = 0; i < k->binding_count; i++) {
-            [enc setBuffer:binds[i].buffer offset:0 atIndex:(NSUInteger)i];
+            [enc setBuffer:binds[i].buffer
+                    offset:(NSUInteger)binds[i].offset
+                   atIndex:(NSUInteger)i];
             int retained_index = graph_retained_binding_count++;
             VX_METAL_RETAIN_ASSIGN(
                 graph_retained_bindings[retained_index], binds[i].buffer);
@@ -1819,29 +2049,17 @@ void metal_cleanup(void) {
     metal_context_state_destroy(state);
 }
 
+/* See opengl_graph_alias_f32: device slots are keyed by host pointer and the
+ * runtime pools many disjoint-lifetime tensors into one host span, so aliasing
+ * across distinct host storage merges two spans on the device instead of
+ * extending one tensor's lifetime. Distinct host storage must be a real copy. */
 int metal_graph_alias_f32(const float* in, float* out, long n) {
     if (!in || !out || n <= 0 || (uint64_t)n > UINT32_MAX) return 0;
-    MetalContextState* state = metal_context_state_get(0);
-    if (state && state->domain_enforced && in != out)
-        return metal_graph_copy_f32(in, out, n);
+    if (in != out) return metal_graph_copy_f32(in, out, n);
     size_t bytes = (size_t)n * sizeof(float);
-    MetalTensorSlot* src = graph_ensure_device(in, bytes, 0);
-    MetalTensorSlot* dst = graph_get_slot(out, bytes, 0);
-    if (!src || !dst || !src->buffer) return 0;
-    if (dst == src) {
-        graph_mark_device(dst);
-        return 1;
-    }
-    if (dst->buffer != src->buffer) {
-        VX_METAL_RELEASE(dst->buffer);
-        VX_METAL_RETAIN_ASSIGN(dst->buffer, src->buffer);
-    }
-    dst->cap = src->cap;
-    dst->capacity_generation = src->capacity_generation;
-    dst->bytes = bytes;
-    dst->is_alias = 1;
-    dst->device_dirty = src->device_dirty;
-    dst->host_dirty = 0;
+    MetalTensorSlot* slot = graph_ensure_device(in, bytes, 0);
+    if (!slot || !slot->buffer) return 0;
+    graph_mark_device(slot);
     return 1;
 }
 
@@ -3289,13 +3507,15 @@ int metal_graph_qlinear_i8u8(const void* input, const void* weight,
         free(multipliers);
         return 0;
     }
-    MetalTensorSlot* src = graph_ensure_packed_bytes(input, input_bytes, 0);
+    /* Activations may be a row window; weights never are. */
+    MetalGraphWindow src, dst;
+    int resolved = graph_window_packed_bytes(input, input_bytes, 0, &src) &&
+        graph_window_output_packed(output, output_bytes, &dst);
     MetalTensorSlot* wt = graph_ensure_packed_bytes(weight, weight_bytes, 1);
     MetalTensorSlot* zero_points = graph_ensure_device(weight_zero_points,
                                                         (size_t)d_out * sizeof(*weight_zero_points), 1);
     MetalTensorSlot* biases = graph_ensure_device(bias, (size_t)d_out * sizeof(*bias), 1);
-    MetalTensorSlot* dst = graph_output_packed_bytes(output, output_bytes);
-    if (!src || !wt || !zero_points || !biases || !dst) {
+    if (!resolved || !wt || !zero_points || !biases) {
         free(multipliers);
         return 0;
     }
@@ -3317,10 +3537,12 @@ int metal_graph_qlinear_i8u8(const void* input, const void* weight,
         return 0;
     }
     MetalBinding binds[7] = {
-        {src->buffer, src->bytes}, {wt->buffer, wt->bytes},
+        {src.slot->buffer, src.bytes, src.offset},
+        {wt->buffer, wt->bytes},
         {multiplier_buffer, multiplier_bytes},
         {zero_points->buffer, zero_points->bytes},
-        {biases->buffer, biases->bytes}, {dst->buffer, packed_output_bytes},
+        {biases->buffer, biases->bytes},
+        {dst.slot->buffer, dst.bytes, dst.offset},
         {pb, sizeof(params)}
     };
     uint32_t packed_words = (uint32_t)(packed_output_bytes / sizeof(uint32_t));
@@ -3333,7 +3555,7 @@ int metal_graph_qlinear_i8u8(const void* input, const void* weight,
     VX_METAL_RELEASE(pb);
     VX_METAL_RELEASE(multiplier_buffer);
     if (!ok) return 0;
-    graph_mark_device(dst);
+    graph_mark_device(dst.slot);
     return 1;
 }
 
@@ -3345,7 +3567,8 @@ typedef struct {
     uint32_t output_type;
     int32_t output_zero_point;
     float output_scale;
-    uint32_t pad0;
+    /* The first token this dispatch reads. See graph_token_window. */
+    uint32_t token_offset;
 } MetalQEmbeddingParams;
 
 _Static_assert(sizeof(MetalQEmbeddingParams) == 32, "qEmbeddingInt8 uniform ABI");
@@ -3401,33 +3624,36 @@ int metal_graph_qembedding_i8u8(const int32_t* tokens, const void* weight,
                                    output_zero_point, weight_dtype, output_dtype,
                                    &token_bytes, &weight_bytes, &output_bytes) ||
         !graph_packed_bytes(output_bytes, &packed_output_bytes)) return 0;
-    MetalTensorSlot* ids = graph_ensure_device(tokens, token_bytes, 0);
+    MetalGraphWindow dst;
+    MetalTensorSlot* ids = NULL;
+    uint32_t token_offset = 0;
+    int resolved = graph_token_window(tokens, token_bytes, &ids, &token_offset) &&
+        graph_window_output_packed(output, output_bytes, &dst);
     MetalTensorSlot* table = graph_ensure_packed_bytes(weight, weight_bytes, 1);
     MetalTensorSlot* scales = graph_ensure_device(weight_scales,
                                                    (size_t)vocab * sizeof(*weight_scales), 1);
     MetalTensorSlot* zero_points = graph_ensure_device(weight_zero_points,
                                                         (size_t)vocab * sizeof(*weight_zero_points), 1);
-    MetalTensorSlot* dst = graph_output_packed_bytes(output, output_bytes);
-    if (!ids || !table || !scales || !zero_points || !dst) return 0;
+    if (!resolved || !table || !scales || !zero_points) return 0;
     MetalQEmbeddingParams params = {
         token_count, vocab, hidden,
         weight_dtype,
         output_dtype, output_zero_point,
-        output_scale, 0u
+        output_scale, token_offset
     };
     id<MTLBuffer> pb = create_buffer(sizeof(params), &params);
     if (!pb) return 0;
     MetalBinding binds[6] = {
         {ids->buffer, ids->bytes}, {table->buffer, table->bytes},
         {scales->buffer, scales->bytes}, {zero_points->buffer, zero_points->bytes},
-        {dst->buffer, packed_output_bytes}, {pb, sizeof(params)}
+        {dst.slot->buffer, dst.bytes, dst.offset}, {pb, sizeof(params)}
     };
     uint32_t packed_words = (uint32_t)(packed_output_bytes / sizeof(uint32_t));
     int ok = dispatch_kernel(&k_qembedding_int8, binds,
                              (packed_words + 63u) / 64u, 1u, 1u);
     VX_METAL_RELEASE(pb);
     if (!ok) return 0;
-    graph_mark_device(dst);
+    graph_mark_device(dst.slot);
     return 1;
 }
 
@@ -4034,10 +4260,10 @@ int metal_graph_qadd_i8u8(const void* a, uint32_t a_elements,
                              output_dtype, relu, &logical_bytes)) return 0;
     size_t packed_bytes;
     if (!graph_packed_bytes(logical_bytes, &packed_bytes)) return 0;
-    MetalTensorSlot* a_slot = graph_ensure_packed_bytes(a, logical_bytes, 0);
-    MetalTensorSlot* b_slot = graph_ensure_packed_bytes(b, logical_bytes, 0);
-    MetalTensorSlot* output_slot = graph_output_packed_bytes(output, logical_bytes);
-    if (!a_slot || !b_slot || !output_slot) return 0;
+    MetalGraphWindow a_slot, b_slot, output_slot;
+    if (!graph_window_packed_bytes(a, logical_bytes, 0, &a_slot) ||
+        !graph_window_packed_bytes(b, logical_bytes, 0, &b_slot) ||
+        !graph_window_output_packed(output, logical_bytes, &output_slot)) return 0;
     MetalQAddParams params = {
         a_elements, a_dtype,
         b_dtype,
@@ -4048,15 +4274,17 @@ int metal_graph_qadd_i8u8(const void* a, uint32_t a_elements,
     id<MTLBuffer> pb = create_buffer(sizeof(params), &params);
     if (!pb) return 0;
     MetalBinding binds[4] = {
-        {a_slot->buffer, a_slot->bytes}, {b_slot->buffer, b_slot->bytes},
-        {output_slot->buffer, packed_bytes}, {pb, sizeof(params)}
+        {a_slot.slot->buffer, a_slot.bytes, a_slot.offset},
+        {b_slot.slot->buffer, b_slot.bytes, b_slot.offset},
+        {output_slot.slot->buffer, output_slot.bytes, output_slot.offset},
+        {pb, sizeof(params)}
     };
     uint32_t packed_words = (uint32_t)(packed_bytes / sizeof(uint32_t));
     int ok = dispatch_kernel(&k_qadd_i8u8, binds, (packed_words + 63u) / 64u,
                              1u, 1u);
     VX_METAL_RELEASE(pb);
     if (!ok) return 0;
-    graph_mark_device(output_slot);
+    graph_mark_device(output_slot.slot);
     return 1;
 }
 
@@ -4071,9 +4299,9 @@ int metal_graph_qsilu_i8u8(const void* input, void* output, uint32_t elements,
                                     input_dtype, output_dtype, &logical_bytes)) return 0;
     size_t packed_bytes;
     if (!graph_packed_bytes(logical_bytes, &packed_bytes)) return 0;
-    MetalTensorSlot* input_slot = graph_ensure_packed_bytes(input, logical_bytes, 0);
-    MetalTensorSlot* output_slot = graph_output_packed_bytes(output, logical_bytes);
-    if (!input_slot || !output_slot) return 0;
+    MetalGraphWindow input_slot, output_slot;
+    if (!graph_window_packed_bytes(input, logical_bytes, 0, &input_slot) ||
+        !graph_window_output_packed(output, logical_bytes, &output_slot)) return 0;
     MetalQByteUnaryParams params = {
         elements, input_dtype,
         output_dtype, 0u,
@@ -4083,15 +4311,16 @@ int metal_graph_qsilu_i8u8(const void* input, void* output, uint32_t elements,
     id<MTLBuffer> pb = create_buffer(sizeof(params), &params);
     if (!pb) return 0;
     MetalBinding binds[3] = {
-        {input_slot->buffer, input_slot->bytes},
-        {output_slot->buffer, packed_bytes}, {pb, sizeof(params)}
+        {input_slot.slot->buffer, input_slot.bytes, input_slot.offset},
+        {output_slot.slot->buffer, output_slot.bytes, output_slot.offset},
+        {pb, sizeof(params)}
     };
     uint32_t packed_words = (uint32_t)(packed_bytes / sizeof(uint32_t));
     int ok = dispatch_kernel(&k_qsilu_i8u8, binds, (packed_words + 63u) / 64u,
                              1u, 1u);
     VX_METAL_RELEASE(pb);
     if (!ok) return 0;
-    graph_mark_device(output_slot);
+    graph_mark_device(output_slot.slot);
     return 1;
 }
 
@@ -4106,9 +4335,9 @@ int metal_graph_qgelu_i8u8(const void* input, void* output, uint32_t elements,
                                     input_dtype, output_dtype, &logical_bytes)) return 0;
     size_t packed_bytes;
     if (!graph_packed_bytes(logical_bytes, &packed_bytes)) return 0;
-    MetalTensorSlot* input_slot = graph_ensure_packed_bytes(input, logical_bytes, 0);
-    MetalTensorSlot* output_slot = graph_output_packed_bytes(output, logical_bytes);
-    if (!input_slot || !output_slot) return 0;
+    MetalGraphWindow input_slot, output_slot;
+    if (!graph_window_packed_bytes(input, logical_bytes, 0, &input_slot) ||
+        !graph_window_output_packed(output, logical_bytes, &output_slot)) return 0;
     MetalQByteUnaryParams params = {
         elements, input_dtype,
         output_dtype, 0u,
@@ -4118,15 +4347,16 @@ int metal_graph_qgelu_i8u8(const void* input, void* output, uint32_t elements,
     id<MTLBuffer> pb = create_buffer(sizeof(params), &params);
     if (!pb) return 0;
     MetalBinding binds[3] = {
-        {input_slot->buffer, input_slot->bytes},
-        {output_slot->buffer, packed_bytes}, {pb, sizeof(params)}
+        {input_slot.slot->buffer, input_slot.bytes, input_slot.offset},
+        {output_slot.slot->buffer, output_slot.bytes, output_slot.offset},
+        {pb, sizeof(params)}
     };
     uint32_t packed_words = (uint32_t)(packed_bytes / sizeof(uint32_t));
     int ok = dispatch_kernel(&k_qgelu_i8u8, binds, (packed_words + 63u) / 64u,
                              1u, 1u);
     VX_METAL_RELEASE(pb);
     if (!ok) return 0;
-    graph_mark_device(output_slot);
+    graph_mark_device(output_slot.slot);
     return 1;
 }
 
@@ -4152,11 +4382,12 @@ int metal_graph_qgroupnorm_i8u8(const void* input, const float* weight,
                                    output_dtype, &logical_bytes, &affine_bytes,
                                    &stats_bytes) ||
         !graph_packed_bytes(logical_bytes, &packed_bytes)) return 0;
-    MetalTensorSlot* input_slot = graph_ensure_packed_bytes(input, logical_bytes, 0);
+    MetalGraphWindow input_slot, output_slot;
     MetalTensorSlot* weight_slot = graph_ensure_device(weight, affine_bytes, 1);
     MetalTensorSlot* bias_slot = graph_ensure_device(bias, affine_bytes, 1);
-    MetalTensorSlot* output_slot = graph_output_packed_bytes(output, logical_bytes);
-    if (!input_slot || !weight_slot || !bias_slot || !output_slot) return 0;
+    if (!graph_window_packed_bytes(input, logical_bytes, 0, &input_slot) ||
+        !graph_window_output_packed(output, logical_bytes, &output_slot) ||
+        !weight_slot || !bias_slot) return 0;
     id<MTLBuffer> stats_buffer = qgroupnorm_stats_ensure(stats_bytes);
     MetalQGroupNormParams params = {
         batch, height, width, channels, groups,
@@ -4171,13 +4402,14 @@ int metal_graph_qgroupnorm_i8u8(const void* input, const float* weight,
         return 0;
     }
     MetalBinding stats_binds[3] = {
-        {input_slot->buffer, input_slot->bytes}, {stats_buffer, stats_bytes},
-        {params_buffer, sizeof(params)}
+        {input_slot.slot->buffer, input_slot.bytes, input_slot.offset},
+        {stats_buffer, stats_bytes}, {params_buffer, sizeof(params)}
     };
     MetalBinding apply_binds[6] = {
-        {input_slot->buffer, input_slot->bytes},
+        {input_slot.slot->buffer, input_slot.bytes, input_slot.offset},
         {weight_slot->buffer, weight_slot->bytes}, {bias_slot->buffer, bias_slot->bytes},
-        {stats_buffer, stats_bytes}, {output_slot->buffer, packed_bytes},
+        {stats_buffer, stats_bytes},
+        {output_slot.slot->buffer, output_slot.bytes, output_slot.offset},
         {params_buffer, sizeof(params)}
     };
     uint32_t total_groups = batch * groups;
@@ -4187,7 +4419,7 @@ int metal_graph_qgroupnorm_i8u8(const void* input, const float* weight,
              dispatch_kernel(&k_qgroupnorm_apply, apply_binds, apply_groups, 1u, 1u);
     VX_METAL_RELEASE(params_buffer);
     if (!ok) return 0;
-    graph_mark_device(output_slot);
+    graph_mark_device(output_slot.slot);
     return 1;
 }
 
@@ -4210,11 +4442,12 @@ int metal_graph_qlayernorm_i8u8(const void* input, const float* weight,
                                    output_dtype, &logical_bytes, &affine_bytes,
                                    &stats_bytes) ||
         !graph_packed_bytes(logical_bytes, &packed_bytes)) return 0;
-    MetalTensorSlot* input_slot = graph_ensure_packed_bytes(input, logical_bytes, 0);
+    MetalGraphWindow input_slot, output_slot;
     MetalTensorSlot* weight_slot = graph_ensure_device(weight, affine_bytes, 1);
     MetalTensorSlot* bias_slot = graph_ensure_device(bias, affine_bytes, 1);
-    MetalTensorSlot* output_slot = graph_output_packed_bytes(output, logical_bytes);
-    if (!input_slot || !weight_slot || !bias_slot || !output_slot) return 0;
+    if (!graph_window_packed_bytes(input, logical_bytes, 0, &input_slot) ||
+        !graph_window_output_packed(output, logical_bytes, &output_slot) ||
+        !weight_slot || !bias_slot) return 0;
     id<MTLBuffer> stats_buffer = qlayernorm_stats_ensure(stats_bytes);
     MetalQLayerNormParams params = {
         rows, d_model, input_dtype,
@@ -4228,13 +4461,14 @@ int metal_graph_qlayernorm_i8u8(const void* input, const float* weight,
         return 0;
     }
     MetalBinding stats_binds[3] = {
-        {input_slot->buffer, input_slot->bytes}, {stats_buffer, stats_bytes},
-        {params_buffer, sizeof(params)}
+        {input_slot.slot->buffer, input_slot.bytes, input_slot.offset},
+        {stats_buffer, stats_bytes}, {params_buffer, sizeof(params)}
     };
     MetalBinding apply_binds[6] = {
-        {input_slot->buffer, input_slot->bytes},
+        {input_slot.slot->buffer, input_slot.bytes, input_slot.offset},
         {weight_slot->buffer, weight_slot->bytes}, {bias_slot->buffer, bias_slot->bytes},
-        {stats_buffer, stats_bytes}, {output_slot->buffer, packed_bytes},
+        {stats_buffer, stats_bytes},
+        {output_slot.slot->buffer, output_slot.bytes, output_slot.offset},
         {params_buffer, sizeof(params)}
     };
     uint32_t packed_words = (uint32_t)(packed_bytes / sizeof(uint32_t));
@@ -4243,7 +4477,7 @@ int metal_graph_qlayernorm_i8u8(const void* input, const float* weight,
              dispatch_kernel(&k_qlayernorm_apply, apply_binds, apply_groups, 1u, 1u);
     VX_METAL_RELEASE(params_buffer);
     if (!ok) return 0;
-    graph_mark_device(output_slot);
+    graph_mark_device(output_slot.slot);
     return 1;
 }
 
@@ -4269,13 +4503,14 @@ int metal_graph_qsdpa_i8u8(const void* q, const void* k, const void* v,
                                v_dtype, output_dtype, causal, mask_mode, &q_bytes,
                                &kv_bytes, &mask_bytes) ||
         !graph_packed_bytes(q_bytes, &packed_output_bytes)) return 0;
-    MetalTensorSlot* q_slot = graph_ensure_packed_bytes(q, q_bytes, 0);
-    MetalTensorSlot* k_slot = graph_ensure_packed_bytes(k, kv_bytes, 0);
-    MetalTensorSlot* v_slot = graph_ensure_packed_bytes(v, kv_bytes, 0);
-    MetalTensorSlot* mask_slot = mask_mode ? graph_ensure_device(mask, mask_bytes, 0) :
-        graph_ensure_device(qsdpa_dummy_mask, sizeof(qsdpa_dummy_mask), 1);
-    MetalTensorSlot* output_slot = graph_output_packed_bytes(output, q_bytes);
-    if (!q_slot || !k_slot || !v_slot || !mask_slot || !output_slot) return 0;
+    MetalGraphWindow q_slot, k_slot, v_slot, mask_slot, output_slot;
+    if (!graph_window_packed_bytes(q, q_bytes, 0, &q_slot) ||
+        !graph_window_packed_bytes(k, kv_bytes, 0, &k_slot) ||
+        !graph_window_packed_bytes(v, kv_bytes, 0, &v_slot) ||
+        !(mask_mode ? graph_window_device(mask, mask_bytes, 0, &mask_slot)
+                    : graph_window_device(qsdpa_dummy_mask,
+                                          sizeof(qsdpa_dummy_mask), 1, &mask_slot)) ||
+        !graph_window_output_packed(output, q_bytes, &output_slot)) return 0;
     MetalQSDPAParams params = {
         seq_q, seq_kv, d_model, heads,
         batch, mask_mode, causal,
@@ -4290,14 +4525,17 @@ int metal_graph_qsdpa_i8u8(const void* q, const void* k, const void* v,
     id<MTLBuffer> params_buffer = create_buffer(sizeof(params), &params);
     if (!params_buffer) return 0;
     MetalBinding binds[6] = {
-        {q_slot->buffer, q_slot->bytes}, {k_slot->buffer, k_slot->bytes},
-        {v_slot->buffer, v_slot->bytes}, {mask_slot->buffer, mask_slot->bytes},
-        {output_slot->buffer, packed_output_bytes}, {params_buffer, sizeof(params)}
+        {q_slot.slot->buffer, q_slot.bytes, q_slot.offset},
+        {k_slot.slot->buffer, k_slot.bytes, k_slot.offset},
+        {v_slot.slot->buffer, v_slot.bytes, v_slot.offset},
+        {mask_slot.slot->buffer, mask_slot.bytes, mask_slot.offset},
+        {output_slot.slot->buffer, output_slot.bytes, output_slot.offset},
+        {params_buffer, sizeof(params)}
     };
     int ok = dispatch_kernel(&k_qsdpa_int8, binds, seq_q, heads, batch);
     VX_METAL_RELEASE(params_buffer);
     if (!ok) return 0;
-    graph_mark_device(output_slot);
+    graph_mark_device(output_slot.slot);
     return 1;
 }
 

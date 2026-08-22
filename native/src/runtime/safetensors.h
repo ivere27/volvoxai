@@ -4,6 +4,7 @@
 #include "volvoxai_enums.h"
 
 #include <stddef.h>
+#include <stdint.h>
 
 /* Safetensors and graph tensors share the protobuf-generated dtype contract.
  * Keep the existing private spellings as source-compatible aliases only. */
@@ -70,11 +71,17 @@ typedef struct {
     SafetensorsTensor* tensors;
     int tensor_count;
     unsigned flags;
+    /* A borrowed file retains an externally owned serialized blob and metadata.
+     * Its tensor descriptor table is context-owned, allowing private metadata
+     * overlays without ever mutating the compiled owner's parsed table. */
+    int borrows_storage;
 } SafetensorsFile;
 
 int safetensors_init_empty(SafetensorsFile* out, unsigned flags);
 int safetensors_load(const char* file_path, SafetensorsFile* out);
 int safetensors_load_with_options(const char* file_path, const SafetensorsLoadOptions* options, SafetensorsFile* out);
+int safetensors_borrow_immutable(const SafetensorsFile* source,
+                                 SafetensorsFile* out);
 int safetensors_save(const char* file_path, SafetensorsFile* file);
 void safetensors_free(SafetensorsFile* file);
 const SafetensorsTensor* safetensors_find_tensor(const SafetensorsFile* file, const char* name);
@@ -90,5 +97,12 @@ const char* safetensors_dtype_name(VxDataType dtype);
 size_t safetensors_dtype_bit_width(VxDataType dtype);
 size_t safetensors_dtype_byte_width(VxDataType dtype);
 int safetensors_tensor_nbytes(VxDataType dtype, const int* shape, int ndim, size_t* out_nbytes);
+
+#if defined(VOLVOXAI_PUBLIC_API_TESTING)
+void safetensors_test_reset_file_read_count(void);
+uint64_t safetensors_test_file_read_count(void);
+void safetensors_test_reset_storage_release_count(void);
+uint64_t safetensors_test_storage_release_count(void);
+#endif
 
 #endif

@@ -23,8 +23,8 @@ test('physical WebGPU parity requires a retained non-software adapter identity',
   assert.equal(formatAdapterIdentity(identity), 'vendor=NVIDIA, device=GeForce RTX 3090, backend=Vulkan');
 
   assert.throws(
-    () => requirePhysicalWebGPU(compiled('cpu', { device: 'RTX' })),
-    /compiled on 'cpu'/,
+    () => requirePhysicalWebGPU(compiled('cpu-js', { device: 'RTX' })),
+    /compiled on 'cpu-js'/,
   );
   assert.throws(
     () => requirePhysicalWebGPU(compiled('webgpu', null)),

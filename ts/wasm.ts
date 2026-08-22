@@ -1,6 +1,6 @@
 // Browser-only, WASM-backend-only entry for deployments that package one JS
 // module and the adjacent volvoxai.full.wasm sidecar. It supports inference
-// plus strict WASM training without Node filesystem, CPU, WebNN, WebGPU, WGSL,
+// plus strict WASM training without Node filesystem, CPU, WebGPU, WGSL,
 // or the duplicate JavaScript PTQ implementation. Generic PTQ math and narrow
 // F32-master weight synchronization both reuse the full sidecar's C routines.
 export type {
@@ -13,6 +13,48 @@ export type {
   ExecutionOptions,
   DecodeExecutionOptions,
 } from './types.js';
+export {
+  BACKEND_MEMORY_SNAPSHOT_PROTOCOL,
+  MEMORY_CAPTURE_PROTOCOL,
+  MEMORY_EVIDENCE_FORMAT,
+  MEMORY_EVIDENCE_PROOF_PROTOCOL,
+  MEMORY_EVIDENCE_RESOURCE_PROTOCOL,
+} from './core/MemoryCapture.js';
+export type {
+  MemoryCaptureOptions,
+  BackendMemoryCaptureRequest,
+  BackendMemorySnapshot,
+  RuntimeMemoryByteSize,
+  RuntimeMemoryMonotonicTime,
+  RuntimeMemoryOwnerRef,
+  RuntimeMemoryBoundTerm,
+  RuntimeMemoryPeakCase,
+  RuntimeMemoryBoundProof,
+  RuntimeMemoryDomainAttestation,
+  RuntimeMemoryMeasurement,
+  RuntimeMemoryResourceEvidence,
+  RuntimeMemoryEnvelopeEvidence,
+  RuntimeMemorySnapshot,
+  RuntimeMemoryEvidence,
+} from './core/MemoryCapture.js';
+export {
+  MemorySpace,
+  MemoryOwnerKind,
+  MemoryResourceRole,
+  MemoryBackingRelation,
+  MemoryBoundKind,
+  MemorySnapshotPoint,
+  MemoryMetric,
+  MemoryEvidenceSource,
+  MemoryValueRelation,
+  MemoryTemporalCoverage,
+  MemoryEnvelopeKind,
+  MemoryInventoryKind,
+  OperationStage,
+  ExecutionMode,
+  executionModes,
+} from './generated/volvoxaiEnums.js';
+export type { ExecutionModeValue } from './generated/volvoxaiEnums.js';
 export * from './core/Graph.js';
 export * from './core/ModelLoader.js';
 export * from './core/ModelBuilder.js';
@@ -35,6 +77,18 @@ export type {
   RuntimeDiagnostic,
   ExecutionContextDecode,
 } from './core/ContextRuntime.js';
+export {
+  RuntimeRequestHandle,
+} from './core/RuntimeScheduler.js';
+export type {
+  RequestFreshness,
+  RuntimeRequestState,
+  RuntimeSchedulerOptions,
+  RuntimeResultBudgetOptions,
+  RuntimeExecutionConfiguration,
+  RuntimeRunOptions,
+  RuntimeSubmitOptions,
+} from './core/RuntimeScheduler.js';
 export {
   ExecutionResult,
   TensorResult,

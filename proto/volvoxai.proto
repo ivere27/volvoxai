@@ -115,6 +115,13 @@ enum DecodeRowMode {
   DECODE_ROW_MODE_REQUIRED = 2;
 }
 
+// Runtime dispatch ownership. DIRECT bypasses Runtime scheduling while
+// SCHEDULED enters the Runtime's bounded coordinator.
+enum ExecutionMode {
+  EXECUTION_MODE_DIRECT = 0;
+  EXECUTION_MODE_SCHEDULED = 1;
+}
+
 enum TrainingOptimizerKind {
   TRAINING_OPTIMIZER_KIND_ADAMW = 0;
   TRAINING_OPTIMIZER_KIND_SGD = 1;
@@ -156,6 +163,12 @@ enum NativeStatus {
   NATIVE_STATUS_BUFFER_TOO_SMALL = -15;
   NATIVE_STATUS_INTERNAL = -16;
   NATIVE_STATUS_REVISION_CONFLICT = -17;
+  NATIVE_STATUS_BUSY = -18;
+  NATIVE_STATUS_OVERLOADED = -19;
+  NATIVE_STATUS_CANCELLED = -20;
+  NATIVE_STATUS_DEADLINE_EXCEEDED = -21;
+  NATIVE_STATUS_SUPERSEDED = -22;
+  NATIVE_STATUS_SESSION_RESET_REQUIRED = -23;
 }
 
 enum OperationStage {
@@ -181,6 +194,188 @@ enum OperationStage {
   OPERATION_STAGE_PTQ_INSPECT = 19;
   OPERATION_STAGE_PTQ_WRITE = 20;
   OPERATION_STAGE_PTQ_CLOSE = 21;
+}
+
+// Memory evidence is deliberately more specific than MemoryLocation. Tensor
+// transport needs only host/device, while accounting must keep overlapping
+// host runtimes, linear memory, device APIs, and unified physical memory
+// distinct. Producers select the most specific space they can prove and do
+// not emit a generic parent space as another additive resource.
+enum MemorySpace {
+  MEMORY_SPACE_UNSPECIFIED = 0;
+  MEMORY_SPACE_HOST = 1;
+  MEMORY_SPACE_JS_HEAP = 2;
+  MEMORY_SPACE_JS_EXTERNAL = 3;
+  MEMORY_SPACE_JS_ARRAY_BUFFER = 4;
+  MEMORY_SPACE_WASM_LINEAR = 5;
+  MEMORY_SPACE_NATIVE_HEAP = 6;
+  MEMORY_SPACE_MAPPED_FILE = 7;
+  // An API-visible device allocation whose physical placement is unknown.
+  MEMORY_SPACE_DEVICE = 8;
+  MEMORY_SPACE_DEVICE_LOCAL = 9;
+  MEMORY_SPACE_HOST_VISIBLE_DEVICE = 10;
+  MEMORY_SPACE_UNIFIED = 11;
+}
+
+// The lifetime owner is not necessarily the object currently using a
+// resource. In particular, contexts can consume one immutable
+// COMPILED_MODEL-owned weight allocation without owning copies of it.
+enum MemoryOwnerKind {
+  MEMORY_OWNER_KIND_UNSPECIFIED = 0;
+  MEMORY_OWNER_KIND_PROCESS = 1;
+  MEMORY_OWNER_KIND_RUNTIME = 2;
+  MEMORY_OWNER_KIND_MODEL = 3;
+  MEMORY_OWNER_KIND_COMPILED_MODEL = 4;
+  MEMORY_OWNER_KIND_EXECUTION_CONTEXT = 5;
+  MEMORY_OWNER_KIND_RESULT = 6;
+  MEMORY_OWNER_KIND_BACKEND_SHARED = 7;
+  // Full-profile private authoring owners. Native inference projections omit
+  // these names while the shared protobuf wire vocabulary retains them.
+  MEMORY_OWNER_KIND_TRAINER = 8;
+  MEMORY_OWNER_KIND_PTQ_PLAN = 9;
+}
+
+enum MemoryResourceRole {
+  MEMORY_RESOURCE_ROLE_UNSPECIFIED = 0;
+  MEMORY_RESOURCE_ROLE_WEIGHTS = 1;
+  MEMORY_RESOURCE_ROLE_PACKED_WEIGHTS = 2;
+  MEMORY_RESOURCE_ROLE_INPUT = 3;
+  MEMORY_RESOURCE_ROLE_ACTIVATION = 4;
+  MEMORY_RESOURCE_ROLE_KV_CACHE = 5;
+  MEMORY_RESOURCE_ROLE_SCRATCH = 6;
+  MEMORY_RESOURCE_ROLE_RESULT_SNAPSHOT = 7;
+  MEMORY_RESOURCE_ROLE_ARENA = 8;
+  MEMORY_RESOURCE_ROLE_PLAN_CACHE = 9;
+  MEMORY_RESOURCE_ROLE_KERNEL_CACHE = 10;
+  MEMORY_RESOURCE_ROLE_METADATA = 11;
+  MEMORY_RESOURCE_ROLE_RUNTIME_OVERHEAD = 12;
+  MEMORY_RESOURCE_ROLE_ALLOCATOR_OVERHEAD = 13;
+  MEMORY_RESOURCE_ROLE_DRIVER_OVERHEAD = 14;
+  MEMORY_RESOURCE_ROLE_OTHER = 15;
+  // Full-profile private authoring state. These are distinct from immutable
+  // published WEIGHTS and ordinary inference ACTIVATION/SCRATCH resources.
+  MEMORY_RESOURCE_ROLE_TRAINING_WORKING_WEIGHTS = 16;
+  MEMORY_RESOURCE_ROLE_TRAINING_GRADIENTS = 17;
+  MEMORY_RESOURCE_ROLE_TRAINING_OPTIMIZER_SLOTS = 18;
+  MEMORY_RESOURCE_ROLE_TRAINING_ACCUMULATION = 19;
+  MEMORY_RESOURCE_ROLE_PTQ_OBSERVER_STATE = 20;
+}
+
+// A resource without a backing resource is INDEPENDENT. ALIAS and
+// SUBALLOCATION both refer to a range of backing_resource_id and add no bytes
+// on top of that backing allocation. SUBALLOCATION ranges may be summed only
+// after proving that they are disjoint; ALIAS ranges may overlap.
+enum MemoryBackingRelation {
+  MEMORY_BACKING_RELATION_UNSPECIFIED = 0;
+  MEMORY_BACKING_RELATION_INDEPENDENT = 1;
+  MEMORY_BACKING_RELATION_ALIAS = 2;
+  MEMORY_BACKING_RELATION_SUBALLOCATION = 3;
+}
+
+// Each bound kind is an independent number. Bounds of different kinds are
+// never summed. A decode bound, for example, is an alternative to the ordinary
+// resident bound rather than an additional allocation.
+enum MemoryBoundKind {
+  MEMORY_BOUND_KIND_UNSPECIFIED = 0;
+  MEMORY_BOUND_KIND_MAXIMUM_TENSOR = 1;
+  MEMORY_BOUND_KIND_CONTEXT_CAPACITY = 2;
+  MEMORY_BOUND_KIND_ORDINARY_RESIDENT = 3;
+  MEMORY_BOUND_KIND_DECODE_RESIDENT = 4;
+}
+
+enum MemorySnapshotPoint {
+  MEMORY_SNAPSHOT_POINT_UNSPECIFIED = 0;
+  MEMORY_SNAPSHOT_POINT_BEFORE = 1;
+  MEMORY_SNAPSHOT_POINT_AFTER = 2;
+  MEMORY_SNAPSHOT_POINT_PERIODIC = 3;
+  MEMORY_SNAPSHOT_POINT_FAILURE = 4;
+}
+
+// Resource measurements describe allocator or API accounting. Proved maxima
+// and external resident envelopes have separate messages so a consumer cannot
+// accidentally add them to current allocations.
+enum MemoryMetric {
+  MEMORY_METRIC_UNSPECIFIED = 0;
+  // Exact payload required by the logical request, excluding reusable slack.
+  MEMORY_METRIC_LOGICAL = 1;
+  // Allocations not yet released at this snapshot.
+  MEMORY_METRIC_LIVE = 2;
+  // Bytes reserved from a backing allocator, including unusable slack.
+  MEMORY_METRIC_RESERVED = 3;
+  // Reusable payload capacity exposed by the resource.
+  MEMORY_METRIC_CAPACITY = 4;
+  // MemoryTemporalCoverage names the epoch represented by high-water values.
+  MEMORY_METRIC_LOGICAL_HIGH_WATER = 5;
+  MEMORY_METRIC_LIVE_HIGH_WATER = 6;
+  MEMORY_METRIC_RESERVED_HIGH_WATER = 7;
+  MEMORY_METRIC_CAPACITY_HIGH_WATER = 8;
+  MEMORY_METRIC_CUMULATIVE_ALLOCATED = 9;
+}
+
+enum MemoryEvidenceSource {
+  MEMORY_EVIDENCE_SOURCE_UNSPECIFIED = 0;
+  MEMORY_EVIDENCE_SOURCE_ALLOCATOR_COUNTER = 1;
+  MEMORY_EVIDENCE_SOURCE_RUNTIME_COUNTER = 2;
+  MEMORY_EVIDENCE_SOURCE_API_REQUEST = 3;
+  MEMORY_EVIDENCE_SOURCE_OS_SAMPLER = 4;
+  MEMORY_EVIDENCE_SOURCE_DRIVER_SAMPLER = 5;
+}
+
+// Relation between the reported number and the quantity it names. REQUESTED
+// is exact API-requested storage but makes no claim about physical residency.
+// UNAVAILABLE carries no MemoryByteSize; every other relation does.
+enum MemoryValueRelation {
+  MEMORY_VALUE_RELATION_UNSPECIFIED = 0;
+  MEMORY_VALUE_RELATION_EXACT = 1;
+  MEMORY_VALUE_RELATION_UPPER_BOUND = 2;
+  MEMORY_VALUE_RELATION_LOWER_BOUND = 3;
+  MEMORY_VALUE_RELATION_REQUESTED = 4;
+  MEMORY_VALUE_RELATION_ESTIMATED = 5;
+  MEMORY_VALUE_RELATION_UNAVAILABLE = 6;
+}
+
+// Temporal coverage is independent from value relation and acquisition
+// source. For example, one RSS sample is EXACT at an INSTANT, while the
+// maximum of periodic RSS samples is only a LOWER_BOUND over SAMPLED_WINDOW.
+// SAMPLED_WINDOW always names that observed maximum, never a mean, last
+// sample, integral, or other statistic.
+enum MemoryTemporalCoverage {
+  MEMORY_TEMPORAL_COVERAGE_UNSPECIFIED = 0;
+  MEMORY_TEMPORAL_COVERAGE_INSTANT = 1;
+  MEMORY_TEMPORAL_COVERAGE_OPERATION_WINDOW = 2;
+  MEMORY_TEMPORAL_COVERAGE_RESOURCE_LIFETIME = 3;
+  MEMORY_TEMPORAL_COVERAGE_CAPTURE_WINDOW = 4;
+  MEMORY_TEMPORAL_COVERAGE_PROCESS_LIFETIME = 5;
+  MEMORY_TEMPORAL_COVERAGE_SAMPLED_WINDOW = 6;
+}
+
+// Envelopes overlap resource accounting and can overlap one another. For
+// example RSS can contain JS heap, ArrayBuffers, WASM linear memory, mapped
+// host-visible device memory, and driver allocations. Envelope values are
+// compared as separate series and are never added to resources or each other.
+enum MemoryEnvelopeKind {
+  MEMORY_ENVELOPE_KIND_UNSPECIFIED = 0;
+  MEMORY_ENVELOPE_KIND_PROCESS_RSS = 1;
+  MEMORY_ENVELOPE_KIND_PROCESS_PEAK_RSS = 2;
+  MEMORY_ENVELOPE_KIND_PROCESS_PSS = 3;
+  MEMORY_ENVELOPE_KIND_PROCESS_PRIVATE_BYTES = 4;
+  MEMORY_ENVELOPE_KIND_PROCESS_MANAGED_HEAP_USED = 5;
+  MEMORY_ENVELOPE_KIND_PROCESS_EXTERNAL_BYTES = 6;
+  MEMORY_ENVELOPE_KIND_PROCESS_ARRAY_BUFFER_BYTES = 7;
+  MEMORY_ENVELOPE_KIND_DEVICE_PROCESS_USED = 8;
+  MEMORY_ENVELOPE_KIND_DEVICE_TOTAL_USED = 9;
+  MEMORY_ENVELOPE_KIND_DEVICE_TOTAL_CAPACITY = 10;
+}
+
+// Whether a snapshot's resources are merely the records available to one
+// collector or the complete live inventory for its subject/backend/device
+// scope. Only COMPLETE inventories may prove physical totals or disjoint
+// active SUBALLOCATION ranges. An empty COMPLETE inventory means exact zero;
+// an empty PARTIAL inventory means that no resource records were observed.
+enum MemoryInventoryKind {
+  MEMORY_INVENTORY_KIND_UNSPECIFIED = 0;
+  MEMORY_INVENTORY_KIND_PARTIAL = 1;
+  MEMORY_INVENTORY_KIND_COMPLETE = 2;
 }
 
 // Canonical operator vocabulary for the volvox-graph/v1 IR.
@@ -327,9 +522,37 @@ message ResultRef { string result_id = 1; }
 message TrainerRef { string trainer_id = 1; }
 message PtqPlanRef { string ptq_plan_id = 1; }
 
+// Opt-in, best-effort memory capture policy. protocol must be exactly
+// "volvoxai-memory-capture/v1". A producer attempts every selected evidence
+// family but does not make runtime creation or an otherwise valid lifecycle
+// operation fail solely because a platform collector is unavailable. A
+// requested envelope without a platform measurement is represented by its
+// typed UNAVAILABLE evidence; resource inventories may remain PARTIAL and a
+// domain attestation may be absent when the selected backend cannot supply it.
+//
+// requested_envelopes contains unique, nonzero MemoryEnvelopeKind values. At
+// least one of include_resource_inventory, include_domain_attestation, or a
+// requested envelope must be selected.
+//
+// sampling_interval_nanoseconds and max_periodic_snapshots are either both
+// absent or both present. When present, the interval is nonzero and the
+// snapshot limit is in [1, 4096]. The limit is a hard per-operation cap on
+// PERIODIC snapshots; BEFORE, AFTER, and FAILURE snapshots do not consume it.
+message MemoryCaptureOptions {
+  string protocol = 1;
+  bool include_resource_inventory = 2;
+  bool include_domain_attestation = 3;
+  repeated MemoryEnvelopeKind requested_envelopes = 4;
+  optional uint64 sampling_interval_nanoseconds = 5;
+  optional uint32 max_periodic_snapshots = 6;
+}
+
 message CreateRuntimeRequest {
   bool debug = 1;
   int32 cpu_threads = 2;
+  // Absence disables memory capture. Presence opts this runtime and the
+  // lifecycle objects it owns into the MemoryCaptureOptions contract.
+  MemoryCaptureOptions memory_capture = 3;
 }
 
 message RuntimeHandle {
@@ -680,6 +903,173 @@ message ReadOutputRequest {
   string name = 2;
 }
 
+// Throughout memory-evidence v1, a "non-empty" string contains at least one
+// byte other than ASCII HT, LF, VT, FF, CR, or SP. Producers and consumers do
+// not apply language-specific Unicode trimming or normalization.
+//
+// Cross-runtime owner identity. IDs are opaque strings: TypeScript uses its
+// native identities, while native numeric lineage IDs use canonical decimal
+// spelling. A generation change creates a different ID.
+message MemoryOwnerRef {
+  MemoryOwnerKind kind = 1;
+  string owner_id = 2;
+}
+
+// Message presence, unlike a proto3 scalar default, distinguishes an omitted
+// measurement from an exact zero in every generated language.
+message MemoryByteSize {
+  uint64 bytes = 1;
+}
+
+message MemoryMonotonicTime {
+  uint64 nanoseconds = 1;
+}
+
+// One disjoint accounting unit in a compile-time peak case. term_id is unique
+// within its case. Shared/aliased physical storage appears once in a case even
+// when multiple objects consume it.
+message MemoryBoundTerm {
+  string term_id = 1;
+  MemoryOwnerKind owner_kind = 2;
+  MemoryResourceRole role = 3;
+  MemorySpace space = 4;
+  MemoryByteSize upper_bound_bytes = 5;
+}
+
+// Every term in one case is simultaneously resident and physically disjoint.
+// A present case contains at least one term; exact-zero cases use a present
+// zero-byte term. total_bytes must equal the checked sum of upper_bound_bytes.
+// Cases are alternatives: callers take their maximum and never sum case totals.
+message MemoryPeakCase {
+  string case_id = 1;
+  repeated MemoryBoundTerm terms = 2;
+  MemoryByteSize total_bytes = 3;
+}
+
+// maximum_bytes must equal max(cases.total_bytes) when cases are present.
+// Empty cases allow a provider to publish its existing coarse attestation
+// before it implements detailed terms. limit_bytes is absent when the backend
+// or device exposes no meaningful limit.
+message MemoryBoundProof {
+  // Stable provider-defined accounting domain, for example
+  // "provider-resident", "activation-capacity", or "wasm-linear". It
+  // disambiguates independent limits with the same canonical kind.
+  string budget_domain_id = 1;
+  MemoryBoundKind kind = 2;
+  repeated MemoryPeakCase cases = 3;
+  MemoryByteSize maximum_bytes = 4;
+  MemoryByteSize limit_bytes = 5;
+}
+
+// Compile-time evidence for the complete bounded shape domain. Bounds are
+// computed proof, not observed allocation or RSS/VRAM measurements. Consumers
+// accept only the canonical proof/resource protocols named below and require
+// at least one bound. They reject missing maxima, missing case/term byte presence, duplicate
+// (budget_domain_id, kind), duplicate case/term IDs, checked-sum or max
+// mismatches, and a maximum above its present limit. Empty cases are allowed
+// only for a coarse maximum supplied by an existing provider attestation.
+message MemoryDomainAttestation {
+  // Exactly "canonical-symbolic-domain-proof/v1" in format v1.
+  string proof_protocol = 1;
+  // Exactly "bounded-resource-maxima/v1" in format v1.
+  string resource_protocol = 2;
+  string graph_fingerprint = 3;
+  string shape_domain_proof_identity = 4;
+  repeated MemoryBoundProof bounds = 5;
+}
+
+message MemoryMeasurement {
+  MemoryMetric metric = 1;
+  MemoryByteSize bytes = 2;
+  MemoryEvidenceSource source = 3;
+  MemoryValueRelation value_relation = 4;
+  MemoryTemporalCoverage temporal_coverage = 5;
+}
+
+// resource_id is opaque, contains no address, and is stable for the resource's
+// lifetime within one capture. ALIAS/SUBALLOCATION records name their physical
+// range within backing_resource_id. Backing links are acyclic and resolve in
+// the same capture. Physical totals count an independent root or a proved set
+// of disjoint descendant ranges, never both. Equal content is not allocation
+// identity: physical copies always have different resource_id values.
+// addressable_bytes is required even when it is exact zero. It is immutable
+// range geometry, not a live/reserved measurement and not independently
+// additive. For ALIAS/SUBALLOCATION it equals backing_length_bytes; for an
+// INDEPENDENT root it supplies the extent needed to validate child ranges.
+// allocator is non-empty and every resource carries at least one measurement.
+// Measurements use allocator/runtime/API sources only; API_REQUEST and
+// REQUESTED occur together. High-water/cumulative metrics never use INSTANT.
+message MemoryResourceEvidence {
+  string resource_id = 1;
+  string backing_resource_id = 2;
+  MemoryBackingRelation backing_relation = 3;
+  MemoryByteSize backing_offset_bytes = 4;
+  MemoryByteSize backing_length_bytes = 5;
+  MemoryOwnerRef owner = 6;
+  MemoryResourceRole role = 7;
+  MemorySpace space = 8;
+  string allocator = 9;
+  repeated MemoryOwnerRef consumers = 10;
+  repeated MemoryMeasurement measurements = 11;
+  MemoryByteSize addressable_bytes = 12;
+}
+
+// sampler is the non-empty provider/method identity. Process RSS/PSS/private
+// envelopes use an OS sampler, managed-heap/external/ArrayBuffer envelopes use
+// a runtime counter, and device envelopes use a driver sampler. Envelopes
+// never use REQUESTED. PROCESS_PEAK_RSS is EXACT over PROCESS_LIFETIME (or is
+// UNAVAILABLE), and available SAMPLED_WINDOW values are LOWER_BOUND.
+message MemoryEnvelopeEvidence {
+  MemoryEnvelopeKind kind = 1;
+  MemoryByteSize bytes = 2;
+  MemoryEvidenceSource source = 3;
+  MemoryValueRelation value_relation = 4;
+  MemoryTemporalCoverage temporal_coverage = 5;
+  string sampler = 6;
+}
+
+// sequence is strictly increasing within one capture. monotonic_time, when
+// present, uses one capture-local clock origin and exists to correlate runtime
+// counters with an external OS or driver sampler. BEFORE and AFTER snapshots
+// for one repeated operation share phase_occurrence_id. subject identifies the
+// lifecycle owner affected by that occurrence. The attestation is normally
+// present after compilation; other snapshots may omit it. Reuse of one
+// phase_occurrence_id keeps stage, subject, backend, and device unchanged;
+// BEFORE, AFTER, and FAILURE occur at most once each while PERIODIC may repeat.
+// resource_inventory is always explicitly PARTIAL or COMPLETE.
+message MemorySnapshot {
+  uint64 sequence = 1;
+  MemoryMonotonicTime monotonic_time = 2;
+  OperationStage stage = 3;
+  MemorySnapshotPoint point = 4;
+  string phase_occurrence_id = 5;
+  MemoryOwnerRef subject = 6;
+  string backend = 7;
+  string device = 8;
+  MemoryDomainAttestation domain_attestation = 9;
+  repeated MemoryResourceEvidence resources = 10;
+  repeated MemoryEnvelopeEvidence envelopes = 11;
+  MemoryInventoryKind resource_inventory = 12;
+}
+
+// One opt-in capture with at least one snapshot. format must be exactly
+// "volvoxai-memory-evidence/v1". Resource IDs are capture-local; snapshots
+// with the same resource_id describe one allocation over time. The three
+// evidence families are intentionally non-interchangeable: bound proofs use
+// max-of-sums, resources use identity/backing-aware accounting, and envelopes
+// remain non-additive observations. Consumers reject unknown required_features
+// and must not decode/re-encode evidence through a proxy that discards unknown
+// fields. required_features are unique canonical tokens beginning with a
+// lowercase ASCII letter and then containing only lowercase letters, digits,
+// dot, underscore, or dash; every one needs a matching semantic validator
+// rather than a string-only allowlist.
+message MemoryEvidence {
+  string format = 1;
+  string capture_id = 2;
+  repeated string required_features = 3;
+  repeated MemorySnapshot snapshots = 4;
+}
+
 message OperationReport {
   NativeStatus native_status = 1;
   string code = 2;
@@ -700,6 +1090,9 @@ message OperationReport {
   uint64 adapter_id = 16;
   uint64 adapter_revision = 17;
 
+  // Existing native lineage estimate retained for wire compatibility. It is
+  // not allocator-live, reserved, RSS, or VRAM and is never combined with the
+  // typed memory_evidence below.
   uint64 allocated_bytes = 18;
   uint64 result_bytes = 19;
   double compile_time_ms = 20;
@@ -716,4 +1109,5 @@ message OperationReport {
   string fallback_evidence = 30;
   string offending_node = 31;
   string decode_state = 32;
+  MemoryEvidence memory_evidence = 33;
 }

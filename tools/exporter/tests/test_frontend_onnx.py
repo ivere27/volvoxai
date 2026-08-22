@@ -626,6 +626,209 @@ class InstalledOnnxFrontendTests(unittest.TestCase):
             validate_graph(graph, ["portable"], weights=weights).supported
         )
 
+    def test_symbolic_shape_program_lowers_pytorch_reshape_and_expand_scaffold(self):
+        path = _save_model(
+            self.root,
+            "pytorch_reshape_expand_shape_program.onnx",
+            nodes=[
+                helper.make_node(
+                    "Shape", ["image"], ["stem_shape"], name="stem_shape"
+                ),
+                helper.make_node(
+                    "Slice",
+                    ["stem_shape", "zero_vector", "two_vector", "axis_zero"],
+                    ["stem_prefix"],
+                    name="stem_prefix",
+                ),
+                helper.make_node(
+                    "Concat", ["stem_prefix", "negative_one_vector"],
+                    ["flatten_shape"], name="flatten_shape", axis=0,
+                ),
+                helper.make_node(
+                    "Reshape", ["image", "flatten_shape"], ["flattened"],
+                    name="flatten_stem",
+                ),
+                helper.make_node(
+                    "Transpose", ["flattened"], ["tokens"],
+                    name="tokens_bsc", perm=[0, 2, 1],
+                ),
+                helper.make_node(
+                    "Add", ["tokens", "positions"], ["encoded"],
+                    name="position_add",
+                ),
+                helper.make_node(
+                    "Shape", ["encoded"], ["token_shape"], name="token_shape"
+                ),
+                helper.make_node(
+                    "Gather", ["token_shape", "zero_scalar"], ["batch"],
+                    name="gather_batch", axis=0,
+                ),
+                helper.make_node(
+                    "Unsqueeze", ["batch", "axis_zero"], ["batch_vector"],
+                    name="batch_vector",
+                ),
+                helper.make_node(
+                    "Concat",
+                    ["batch_vector", "negative_one_vector", "negative_one_vector"],
+                    ["expand_spec"], name="expand_spec", axis=0,
+                ),
+                helper.make_node(
+                    "Reshape", ["expand_spec", "flatten_vector"],
+                    ["canonical_spec"], name="canonical_spec",
+                ),
+                helper.make_node(
+                    "Shape", ["canonical_spec"], ["spec_shape"],
+                    name="spec_shape",
+                ),
+                helper.make_node(
+                    "ConstantOfShape", ["spec_shape"], ["ones"],
+                    name="shape_ones",
+                    value=numpy_helper.from_array(np.asarray([1], dtype=np.int64)),
+                ),
+                helper.make_node(
+                    "Mul", ["ones", "negative_one_scalar"], ["negative_ones"],
+                    name="negative_ones",
+                ),
+                helper.make_node(
+                    "Equal", ["canonical_spec", "negative_ones"], ["infer_axes"],
+                    name="infer_axes",
+                ),
+                helper.make_node(
+                    "Where", ["infer_axes", "ones", "canonical_spec"],
+                    ["expand_shape"], name="normalize_expand_shape",
+                ),
+                helper.make_node(
+                    "Expand", ["slot_seed", "expand_shape"], ["expanded_slots"],
+                    name="expand_slots",
+                ),
+            ],
+            inputs=[_value("image", TensorProto.FLOAT, ["B", 256, 10, 42])],
+            outputs=[
+                _value("expanded_slots", TensorProto.FLOAT, ["B", 16, 256]),
+                _value("encoded", TensorProto.FLOAT, ["B", 420, 256]),
+            ],
+            initializers=[
+                _initializer("zero_vector", np.asarray([0], dtype=np.int64)),
+                _initializer("two_vector", np.asarray([2], dtype=np.int64)),
+                _initializer("axis_zero", np.asarray([0], dtype=np.int64)),
+                _initializer("zero_scalar", np.asarray(0, dtype=np.int64)),
+                _initializer("negative_one_vector", np.asarray([-1], dtype=np.int64)),
+                _initializer("negative_one_scalar", np.asarray(-1, dtype=np.int64)),
+                _initializer("flatten_vector", np.asarray([-1], dtype=np.int64)),
+                _initializer("positions", np.zeros((1, 420, 256), dtype=np.float32)),
+                _initializer("slot_seed", np.zeros((1, 16, 256), dtype=np.float32)),
+            ],
+            value_info=[
+                _value("flattened", TensorProto.FLOAT, ["B", 256, "unk__0"]),
+                _value("tokens", TensorProto.FLOAT, ["B", "unk__0", 256]),
+                # This is the released graph's positional Add: its immutable
+                # [1,420,256] operand proves the flattened token extent.
+                _value("encoded", TensorProto.FLOAT, ["B", 420, 256]),
+                _value("canonical_spec", TensorProto.INT64, [3]),
+                _value("expand_shape", TensorProto.INT64, [3]),
+            ],
+            opset=18,
+        )
+        compiler = OnnxCompiler(
+            str(path), dimension_bounds={"B": {"min": 1, "max": 4}}
+        )
+        graph, weights = compiler.lower()
+
+        structural_sources = {
+            compiler.model.graph.node[index].name
+            for index in compiler.structural_shape_nodes
+        }
+        self.assertTrue({
+            "stem_shape", "stem_prefix", "flatten_shape",
+            "token_shape", "gather_batch", "batch_vector", "expand_spec",
+            "canonical_spec", "infer_axes", "normalize_expand_shape",
+        }.issubset(structural_sources))
+        self.assertEqual(
+            [node["opType"] for node in graph["nodes"]],
+            ["Reshape", "Transpose", "Expand", "Add", "Expand"],
+        )
+        self.assertEqual(
+            graph["nodes"][-1]["outputs"]["out"]["shape"], ["B", 16, 256]
+        )
+        self.assertTrue(validate_graph(graph, ["portable"], weights=weights).supported)
+
+    def test_symbolic_shape_program_rejects_batch_dependent_equal(self):
+        path = _save_model(
+            self.root,
+            "ambiguous_shape_equal.onnx",
+            nodes=[
+                helper.make_node("Shape", ["tokens"], ["shape"], name="shape"),
+                helper.make_node(
+                    "Gather", ["shape", "zero"], ["batch"],
+                    name="batch", axis=0,
+                ),
+                helper.make_node(
+                    "Equal", ["batch", "one"], ["is_one"], name="is_one"
+                ),
+                helper.make_node(
+                    "Unsqueeze", ["batch", "axis_zero"], ["batch_vector"],
+                    name="batch_vector",
+                ),
+                helper.make_node(
+                    "Where", ["is_one", "two_vector", "batch_vector"],
+                    ["target"], name="ambiguous_target",
+                ),
+                helper.make_node(
+                    "Expand", ["seed", "target"], ["expanded"], name="expanded"
+                ),
+            ],
+            inputs=[_value("tokens", TensorProto.FLOAT, ["B"])],
+            outputs=[_value("expanded", TensorProto.FLOAT, ["B"])],
+            initializers=[
+                _initializer("zero", np.asarray(0, dtype=np.int64)),
+                _initializer("one", np.asarray(1, dtype=np.int64)),
+                _initializer("axis_zero", np.asarray([0], dtype=np.int64)),
+                _initializer("two_vector", np.asarray([2], dtype=np.int64)),
+                _initializer("seed", np.zeros((1,), dtype=np.float32)),
+            ],
+        )
+        compiler = OnnxCompiler(
+            str(path), dimension_bounds={"B": {"min": 1, "max": 4}}
+        )
+
+        self.assertEqual(compiler.structural_shape_nodes, set())
+        error = self.assert_diagnostic("VXONNX_UNSUPPORTED", compiler.lower)
+        self.assertEqual(error.diagnostic.source_node, "shape")
+        self.assertEqual(error.diagnostic.source_op, "Shape")
+
+    def test_symbolic_shape_program_rejects_data_dependent_where(self):
+        path = _save_model(
+            self.root,
+            "data_dependent_shape_where.onnx",
+            nodes=[
+                helper.make_node("Shape", ["tokens"], ["shape"], name="shape"),
+                helper.make_node(
+                    "Where", ["selector", "one_vector", "shape"],
+                    ["target"], name="data_dependent_target",
+                ),
+                helper.make_node(
+                    "Expand", ["seed", "target"], ["expanded"], name="expanded"
+                ),
+            ],
+            inputs=[
+                _value("tokens", TensorProto.FLOAT, ["B"]),
+                _value("selector", TensorProto.BOOL, [1]),
+            ],
+            outputs=[_value("expanded", TensorProto.FLOAT, ["B"])],
+            initializers=[
+                _initializer("one_vector", np.asarray([1], dtype=np.int64)),
+                _initializer("seed", np.zeros((1,), dtype=np.float32)),
+            ],
+        )
+        compiler = OnnxCompiler(
+            str(path), dimension_bounds={"B": {"min": 1, "max": 4}}
+        )
+
+        self.assertEqual(compiler.structural_shape_nodes, set())
+        error = self.assert_diagnostic("VXONNX_UNSUPPORTED", compiler.lower)
+        self.assertEqual(error.diagnostic.source_node, "shape")
+        self.assertEqual(error.diagnostic.source_op, "Shape")
+
     def test_symbolic_shape_program_is_not_erased_when_shape_value_escapes(self):
         path = _save_model(
             self.root,

@@ -238,7 +238,10 @@ pinned-memory allocator or async pipeline yet, which keeps the model simple (§9
 > away and re-learns it. The recording is only ever a speed-up; it can never change the answer.
 
 🔧 This is NVIDIA's **CUDA Graph** capture-and-replay, wrapped in a careful state machine
-(`cuda/host/cuda_graph_lifecycle_host.inc`). Each forward runs in one of a few passes:
+(`cuda/host/cuda_graph_lifecycle_host.inc`). Static inference uses one exact
+signature; a proved bounded-dynamic context keeps a deterministic, context-local
+**four-entry LRU**, so alternating B1 and BN signatures can both reach replay.
+Each exact signature runs through these passes:
 
 ```
 OBSERVE   → run normally, but record the exact launch list and which inputs are read-before-written
@@ -247,13 +250,36 @@ VALIDATE  → the fast path: just launch the already-built graph again
 (INELIGIBLE → plain launches, always correct)
 ```
 
-🔬 The allowlist is conservative on purpose — Linear/Gemm/MatMul, PReLU/Sigmoid, Conv2D/Add,
-Concat/MaxPool2D/ResizeNearest2D/Reshape, and the physical quantized ops. Anything that would make
-replay unsafe **invalidates** the plan: a model-generation change, a slot-epoch change (memory moved),
-a debug/prefix/row execution, an SDK-backend or adapter effect, training, event profiling, or any
-capture/launch/sync failure. Crucially, if the driver can't capture a stream, the engine **falls back
-before a single kernel was withheld**, so that forward still runs to completion. Replay never trades
-correctness for speed.
+🔬 The static allowlist is conservative on purpose — Linear/Gemm/MatMul,
+PReLU/Sigmoid, Conv2D/Add, Concat/MaxPool2D/ResizeNearest2D/Reshape/Transpose,
+and the quantized ops. A bounded domain admits an additional proof-qualified
+set used by the receipt models: its captured scalar arguments come only from
+immutable node parameters and the exact shape, while changed request values are
+uploaded to the same reserved device pointers before launch. Data-dependent MoE
+and partial weight-bank routes remain excluded.
+
+Each cached plan owns its shape string and is also keyed by model generation,
+slot epoch, capacity generation, and domain mode. A fifth signature destroys the
+least-recently-used GraphExec; a global-key change destroys every plan before a
+direct OBSERVE run. Debug/prefix/row execution, an SDK backend or adapter effect,
+training, event profiling, a launch-list mismatch, or any capture/launch/sync
+failure excludes or invalidates replay. If stream capture cannot begin, the
+engine falls back before a kernel is withheld. Public evidence says
+`cuda_graph_replay=1` only after a cached launch and stream synchronization both
+succeed.
+
+A Driver failure while destroying an eviction victim quarantines that cache
+entry instead of forgetting its handle. The current forward runs directly,
+and destruction must succeed on a later retry before that entry is reused or
+another GraphExec is requested. The four-object ceiling therefore remains a
+hard ownership bound even on the failure path.
+
+The resident proof charges four host plan states, four retained maximum-size
+owned signatures, and the transactional fifth candidate signature that exists
+until an LRU victim is released. Driver-internal storage for the at-most-four
+requested GraphExecs is opaque, so it is called **requested/unknown** rather
+than being silently added to the numeric resident-byte claim. Replay never
+trades correctness for speed.
 
 ---
 
@@ -321,7 +347,7 @@ those either routes those nodes elsewhere or is out of scope for a pure-CUDA run
 > **as integers**, not by secretly blowing them back up to decimals. It carries the little "scale"
 > tags each layer needs and does the integer arithmetic directly on the card.
 
-🔧 Physical I8/U8 execution covers QLinear/QMatMul/QGemm/QEmbedding/QConv2D/QAdd, QSiLU/QGELU (with
+🔧 I8/U8 execution covers QLinear/QMatMul/QGemm/QEmbedding/QConv2D/QAdd, QSiLU/QGELU (with
 cached 256-byte lookup tables), QGroupNorm/QLayerNorm, QSDPA and query-range QSDPA, QArgMax/QMaskedMean,
 typed Quantize/Dequantize/Requantize, byte copies and shape aliases, and same-domain nearest
 Resize/MaxPool2D/Concat. The entry points are the `cuda_graph_q*_i8u8(...)` functions in

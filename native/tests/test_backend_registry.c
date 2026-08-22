@@ -183,8 +183,6 @@ static int initialize_registry(VxBackendRegistry* registry) {
 static int test_generated_kernel_inventory(void) {
     const VxKernelRegistration* wasm_qlinear =
         vx_kernel_registry_find("wasm", "QLinear");
-    const VxKernelRegistration* webnn_qlinear =
-        vx_kernel_registry_find("webnn", "QLinear");
     const VxKernelRegistration* cuda_qlinear =
         vx_kernel_registry_find("cuda", "QLinear");
     const VxKernelRegistration* cuda_qsdpa =
@@ -198,7 +196,6 @@ static int test_generated_kernel_inventory(void) {
     CHECK(wasm_qlinear != NULL);
     CHECK(!strcmp(wasm_qlinear->route, "qlinear"));
     CHECK(wasm_qlinear->exporter_qualified == 1);
-    CHECK(webnn_qlinear == NULL);
     CHECK(cuda_qlinear != NULL);
     CHECK(cuda_qlinear->dynamic == 1);
     CHECK(cuda_qlinear->exporter_qualified == 1);

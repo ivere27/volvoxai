@@ -95,14 +95,14 @@ const snapshot = Model.capture({
 
 // ---- reference run on the JS CPU runtime ----
 const input = fill(1 * 8 * 8 * 3, 42);
-const runtime = await VolvoxAI.createRuntime({ backends: ['cpu'] });
+const runtime = await VolvoxAI.createRuntime({ backends: ['cpu-js'] });
 let compiled;
 let context;
 let result;
 let expected;
 try {
   compiled = await runtime.compile(snapshot, {
-    backend: { mode: 'require', backend: 'cpu', operatorFallback: 'forbid' },
+    backend: { mode: 'require', backend: 'cpu-js', operatorFallback: 'forbid' },
   });
   context = await compiled.createContext();
   result = await context.execute({ x: { data: input, shape: [1, 8, 8, 3] } });

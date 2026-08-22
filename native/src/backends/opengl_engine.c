@@ -41,6 +41,9 @@ typedef struct {
 
 #define OGL_MAX_PROGRAM_CACHE 256
 #define OGL_GRAPH_MAX_TENSORS 4096
+/* The widest kernel here binds 8. Dispatch refuses anything past this rather
+ * than sizing a stack array from a descriptor field. */
+#define OGL_MAX_BINDINGS 16
 
 #define GL_VENDOR 0x1F00
 #define GL_RENDERER 0x1F01
@@ -58,6 +61,7 @@ typedef struct {
 #define GL_MAX_UNIFORM_BUFFER_BINDINGS 0x8A2F
 #define GL_MAX_SHADER_STORAGE_BUFFER_BINDINGS 0x90DD
 #define GL_MAX_SHADER_STORAGE_BLOCK_SIZE 0x90DE
+#define GL_SHADER_STORAGE_BUFFER_OFFSET_ALIGNMENT 0x90DF
 #define GL_MAX_UNIFORM_BLOCK_SIZE 0x8A30
 #define GL_MAX_COMPUTE_SHADER_STORAGE_BLOCKS 0x90DB
 #define GL_MAX_COMPUTE_UNIFORM_BLOCKS 0x91BB
@@ -121,6 +125,10 @@ typedef struct {
     GLint max_compute_invocations;
     GLint64 max_ssbo_block_size;
     GLint64 max_uniform_block_size;
+    /* GL_SHADER_STORAGE_BUFFER_OFFSET_ALIGNMENT. Unlike Vulkan there is no
+     * arena granularity to fold in: every slot owns a buffer that starts at
+     * zero, so the driver limit is the whole constraint on a row binding. */
+    GLint ssbo_offset_alignment;
     int qconv_tiled_enabled;
     int profile_sync;
 #if VOLVOXAI_ENABLE_TRAINING
@@ -162,6 +170,7 @@ typedef struct {
     void (*p_glBufferData)(GLenum, GLsizeiptr, const void*, GLenum);
     void (*p_glBufferSubData)(GLenum, GLintptr, GLsizeiptr, const void*);
     void (*p_glBindBufferBase)(GLenum, GLuint, GLuint);
+    void (*p_glBindBufferRange)(GLenum, GLuint, GLuint, GLintptr, GLsizeiptr);
     void (*p_glDeleteBuffers)(GLsizei, const GLuint*);
     void (*p_glDispatchCompute)(GLuint, GLuint, GLuint);
     void (*p_glMemoryBarrier)(GLbitfield);
@@ -197,6 +206,7 @@ static OpenGLDeviceState g_opengl_device_state = {
 #define max_compute_invocations OGL_DEVICE_FIELD(max_compute_invocations)
 #define max_ssbo_block_size OGL_DEVICE_FIELD(max_ssbo_block_size)
 #define max_uniform_block_size OGL_DEVICE_FIELD(max_uniform_block_size)
+#define graph_alignment OGL_DEVICE_FIELD(ssbo_offset_alignment)
 #define qconv_tiled_enabled OGL_DEVICE_FIELD(qconv_tiled_enabled)
 #define profile_sync OGL_DEVICE_FIELD(profile_sync)
 #if VOLVOXAI_ENABLE_TRAINING
@@ -238,6 +248,7 @@ static OpenGLDeviceState g_opengl_device_state = {
 #define p_glBufferData OGL_DEVICE_FIELD(p_glBufferData)
 #define p_glBufferSubData OGL_DEVICE_FIELD(p_glBufferSubData)
 #define p_glBindBufferBase OGL_DEVICE_FIELD(p_glBindBufferBase)
+#define p_glBindBufferRange OGL_DEVICE_FIELD(p_glBindBufferRange)
 #define p_glDeleteBuffers OGL_DEVICE_FIELD(p_glDeleteBuffers)
 #define p_glDispatchCompute OGL_DEVICE_FIELD(p_glDispatchCompute)
 #define p_glMemoryBarrier OGL_DEVICE_FIELD(p_glMemoryBarrier)
@@ -298,6 +309,14 @@ typedef struct {
     size_t qgroupnorm_scratch_capacity;
     GLuint qlayernorm_scratch_buffer;
     size_t qlayernorm_scratch_capacity;
+    /* One name is sufficient because every upload below replaces its data
+     * store. Queued dispatches retain the store that was current when their
+     * command was recorded. */
+    GLuint dispatch_params_buffer;
+    uint64_t dispatch_params_upload_count;
+#ifdef VOLVOX_OPENGL_TESTING
+    uint64_t test_conv_out16_dispatch_count;
+#endif
     QConvZeroBiasBacking* qconv_zero_bias_storage;
     char* shape_signature;
     uint64_t shape_generation;
@@ -416,6 +435,7 @@ static const OglKernel k_qlayernorm_stats = {"qLayerNormStats", OGL_SHADER_DIR "
 static const OglKernel k_qlayernorm_apply = {"qLayerNormApply", OGL_SHADER_DIR "/qLayerNormApply.comp", 6, 5};
 static const OglKernel k_qsdpa_int8 = {"qSDPAInt8", OGL_SHADER_DIR "/qSDPAInt8.comp", 6, 5};
 static const OglKernel k_qargmax_int8 = {"qArgMaxInt8", OGL_SHADER_DIR "/qArgMaxInt8.comp", 3, 2};
+static const OglKernel k_row_index_transfer = {"rowIndexTransfer", OGL_SHADER_DIR "/rowIndexTransfer.comp", 4, 3};
 static const OglKernel k_qmaskedmean_int8 = {"qMaskedMeanInt8", OGL_SHADER_DIR "/qMaskedMeanInt8.comp", 4, 3};
 static const OglKernel k_requantize_linear_i8u8 = {"requantizeLinearTyped", OGL_SHADER_DIR "/requantizeLinearTyped.comp", 3, 2};
 static const OglKernel k_copy_typed_i8u8 = {"copyTyped", OGL_SHADER_DIR "/copyTyped.comp", 3, 2};
@@ -439,6 +459,7 @@ static const OglKernel k_groupnorm = {"groupNorm", OGL_SHADER_DIR "/groupNorm.co
 static const OglKernel k_dropout = {"dropout", OGL_SHADER_DIR "/dropout.comp", 3, 2};
 #endif
 static const OglKernel k_conv2d_c3out16 = {"conv2DRegularC3Out16", OGL_SHADER_DIR "/conv2DRegularC3Out16.comp", 5, 4};
+static const OglKernel k_conv2d_out16 = {"conv2DRegularOut16", OGL_SHADER_DIR "/conv2DRegularOut16.comp", 5, 4};
 static const OglKernel k_conv2d_dw4 = {"conv2DDepthwise4", OGL_SHADER_DIR "/conv2DDepthwise4.comp", 5, 4};
 static const OglKernel k_conv2d_dw8 = {"conv2DDepthwise8", OGL_SHADER_DIR "/conv2DDepthwise8.comp", 5, 4};
 static const OglKernel k_conv2d_pw8 = {"conv2DPointwise8", OGL_SHADER_DIR "/conv2DPointwise8.comp", 5, 4};
@@ -489,10 +510,10 @@ static const OglTrainingKernel training_kernels[] = {
     OGL_TRAINING_KERNEL("matMulBackward", "input_main", "matMulBackward_input_main", 7, 6, (1u << 3) | (1u << 4) | (1u << 5)),
     OGL_TRAINING_KERNEL("matMulBackward", "weight_main", "matMulBackward_weight_main", 7, 6, (1u << 3) | (1u << 4) | (1u << 5)),
     OGL_TRAINING_KERNEL("matMulBackward", "bias_main", "matMulBackward_bias_main", 7, 6, (1u << 3) | (1u << 4) | (1u << 5)),
-    OGL_TRAINING_KERNEL("moeLinearBackward", "input_main", "moeLinearBackward_input_main", 11, 10, (1u << 6) | (1u << 7) | (1u << 8) | (1u << 9)),
-    OGL_TRAINING_KERNEL("moeLinearBackward", "weight_main", "moeLinearBackward_weight_main", 11, 10, (1u << 6) | (1u << 7) | (1u << 8) | (1u << 9)),
-    OGL_TRAINING_KERNEL("moeLinearBackward", "bias_main", "moeLinearBackward_bias_main", 11, 10, (1u << 6) | (1u << 7) | (1u << 8) | (1u << 9)),
-    OGL_TRAINING_KERNEL("moeLinearBackward", "route_main", "moeLinearBackward_route_main", 11, 10, (1u << 6) | (1u << 7) | (1u << 8) | (1u << 9)),
+    OGL_TRAINING_KERNEL("moeLinearBackward", "input_main", "moeLinearBackward_input_main", 13, 12, (1u << 6) | (1u << 7) | (1u << 8) | (1u << 9)),
+    OGL_TRAINING_KERNEL("moeLinearBackward", "weight_main", "moeLinearBackward_weight_main", 13, 12, (1u << 6) | (1u << 7) | (1u << 8) | (1u << 9)),
+    OGL_TRAINING_KERNEL("moeLinearBackward", "bias_main", "moeLinearBackward_bias_main", 13, 12, (1u << 6) | (1u << 7) | (1u << 8) | (1u << 9)),
+    OGL_TRAINING_KERNEL("moeLinearBackward", "route_main", "moeLinearBackward_route_main", 13, 12, (1u << 6) | (1u << 7) | (1u << 8) | (1u << 9)),
     OGL_TRAINING_KERNEL("moeRouterBackward", "logit_main", "moeRouterBackward_logit_main", 11, 10, (1u << 6) | (1u << 7) | (1u << 8) | (1u << 9)),
     OGL_TRAINING_KERNEL("moeRouterBackward", "input_main", "moeRouterBackward_input_main", 11, 10, (1u << 6) | (1u << 7) | (1u << 8) | (1u << 9)),
     OGL_TRAINING_KERNEL("moeRouterBackward", "weight_main", "moeRouterBackward_weight_main", 11, 10, (1u << 6) | (1u << 7) | (1u << 8) | (1u << 9)),
@@ -738,6 +759,10 @@ static int load_gl(void) {
     LOAD_GL(glBufferData);
     LOAD_GL(glBufferSubData);
     LOAD_GL(glBindBufferBase);
+    /* Optional on purpose. glBindBufferRange is core wherever compute shaders
+     * are, but a driver that does not hand it over should lose device rows and
+     * keep every whole-tensor binding, not fail to initialize. */
+    p_glBindBufferRange = load_gl_proc("glBindBufferRange");
     LOAD_GL(glDeleteBuffers);
     LOAD_GL(glDispatchCompute);
     LOAD_GL(glMemoryBarrier);
@@ -755,6 +780,12 @@ static int load_gl(void) {
     p_glGetIntegerv(GL_MAX_COMPUTE_WORK_GROUP_INVOCATIONS, &max_compute_invocations);
     p_glGetInteger64v(GL_MAX_SHADER_STORAGE_BLOCK_SIZE, &max_ssbo_block_size);
     p_glGetInteger64v(GL_MAX_UNIFORM_BLOCK_SIZE, &max_uniform_block_size);
+    /* A driver that reports nothing here leaves the query untouched; treating
+     * that as "align to the whole buffer" refuses every window rather than
+     * binding one the device may reject. */
+    graph_alignment = 0;
+    p_glGetIntegerv(GL_SHADER_STORAGE_BUFFER_OFFSET_ALIGNMENT, &graph_alignment);
+    if (graph_alignment <= 0) graph_alignment = 0;
 #if VOLVOXAI_ENABLE_TRAINING
     p_glGetIntegerv(GL_MAX_COMPUTE_SHADER_STORAGE_BLOCKS, &max_compute_ssbo_blocks);
     p_glGetIntegerv(GL_MAX_COMPUTE_UNIFORM_BLOCKS, &max_compute_uniform_blocks);
@@ -1135,7 +1166,11 @@ static OglTensorSlot* graph_get_slot_metadata(const void* host, size_t bytes,
             state->shape_generation;
     }
     OglTensorSlot* s = &graph_slots[idx];
-    s->bytes = bytes;
+    /* Grow, never shrink -- see the Vulkan twin. A caller asking for fewer
+     * bytes is asking about part of the tensor, not redefining it, and letting
+     * it shrink turns the next whole-tensor read into a growth that re-uploads
+     * a host mirror over rows the device just wrote. */
+    if (bytes > s->bytes) s->bytes = bytes;
     if (is_weight) s->is_weight = 1;
     return s;
 }
@@ -1267,16 +1302,256 @@ static void graph_mark_device(OglTensorSlot* s) {
     s->host_dirty = 0;
 }
 
-static int dispatch_kernel(const OglKernel* k, GLuint* buffers, uint32_t gx,
-                           uint32_t gy, uint32_t gz) {
-    if (!k || !buffers || gx == 0 || gy == 0 || gz == 0 ||
-        gx > (uint32_t)max_compute_groups[0] || gy > (uint32_t)max_compute_groups[1] ||
-        gz > (uint32_t)max_compute_groups[2] || k->binding_count <= 0)
+/* A binding into part of a resident tensor -- the OpenGL spelling of Vulkan's
+ * VkGraphWindow, and the reason this backend can keep a decode row on the
+ * device instead of handing the prefix back to the host.
+ *
+ * The two backends differ in exactly one place. Vulkan binds every tensor as
+ * `(io_buffer, offset, bytes)` into one arena, so a window needed no new
+ * machinery at dispatch. Here each slot owns its own buffer and is bound whole
+ * with glBindBufferBase, so a window has to name the buffer as well: it is
+ * `(buffer, offset, bytes)`, and dispatch_kernel_ranges below is what binds it.
+ * `offset` is relative to `buffer`, which is why the alignment check is on
+ * `inner` alone where Vulkan's is on `slot->offset + inner`. */
+typedef struct {
+    OglTensorSlot* slot;
+    GLuint buffer;
+    size_t offset;
+    size_t bytes;
+} OglGraphWindow;
+
+/* One SSBO or UBO binding. `bytes == 0` means the whole buffer, which is what
+ * every call site that never asks for a window gets. */
+typedef struct {
+    GLuint buffer;
+    size_t offset;
+    size_t bytes;
+} OglBufferRange;
+
+/*
+ * The resident slot whose span contains `[host, host + bytes)`.
+ *
+ * Exact base first, then the smallest containing span: a tensor and an arena
+ * span that both cover the pointer are both legal answers, and the tighter one
+ * is the tensor. Returns -1 when nothing contains it, which is the ordinary
+ * "this is a new tensor" case and not an error.
+ */
+static int graph_find_containing_slot(const void* host, size_t bytes, size_t* inner) {
+    OpenGLContextState* state = opengl_context_state_get(0);
+    uintptr_t start = (uintptr_t)host;
+    uintptr_t end;
+    int best = -1;
+    int exact;
+    if (!state || !host || !bytes || start > UINTPTR_MAX - bytes) return -1;
+    end = start + bytes;
+    exact = graph_find_slot(host);
+    if (exact >= 0 && graph_slots[exact].bytes >= bytes) {
+        if (inner) *inner = 0;
+        return exact;
+    }
+    for (int index = 0; index < graph_slot_count; index++) {
+        OglTensorSlot* slot = &graph_slots[index];
+        uintptr_t slot_start = (uintptr_t)slot->host;
+        uintptr_t slot_end;
+        if (!slot->host || !slot->bytes || !slot->owns_buffer || !slot->buffer ||
+            slot_start > UINTPTR_MAX - slot->bytes) continue;
+        if (!slot->is_weight && slot->shape_generation != state->shape_generation)
+            continue;
+        slot_end = slot_start + slot->bytes;
+        if (start < slot_start || end > slot_end) continue;
+        if (best < 0 || slot->bytes < graph_slots[best].bytes) best = index;
+    }
+    if (best >= 0 && inner) {
+        *inner = (size_t)((uintptr_t)host - (uintptr_t)graph_slots[best].host);
+    }
+    return best;
+}
+
+/*
+ * Finish a window against a slot that is already resident.
+ *
+ * The alignment check is the one real constraint a device row carries. A row
+ * offset is `row * width * element size`, so a row is bindable exactly when its
+ * *stride* is a multiple of the device's storage alignment. Refusing here names
+ * the constraint; the caller falls back to the host row path.
+ *
+ * An unreported alignment refuses rather than permits, which is where this
+ * departs from Vulkan's `graph_alignment && ...`: there a zero means an arena
+ * with no granularity to respect, here it means a driver that did not say, and
+ * guessing wrong is a GL_INVALID_VALUE at bind time.
+ */
+static int graph_window_finish(OglTensorSlot* slot, size_t inner, size_t bytes,
+                               OglGraphWindow* out) {
+    if (!slot || !out || !bytes || !slot->owns_buffer || !slot->buffer ||
+        inner > slot->bytes || bytes > slot->bytes - inner ||
+        slot->cap < slot->bytes) return 0;
+    if (!p_glBindBufferRange || graph_alignment <= 0 ||
+        inner % (size_t)graph_alignment) return 0;
+    out->slot = slot;
+    out->buffer = slot->buffer;
+    out->offset = inner;
+    out->bytes = bytes;
+    return 1;
+}
+
+/*
+ * Whether `host` names an interior slice, and of which base.
+ *
+ * Resolution goes through the ordinary `graph_ensure_*` on the *base* pointer
+ * rather than around it, so a window inherits every domain, capacity and
+ * dirty-state rule a whole tensor obeys. The only thing that differs is where
+ * the binding starts.
+ */
+static int graph_window_base(const void* host, size_t bytes,
+                             const void** base, size_t* base_bytes, size_t* inner) {
+    int index = graph_find_containing_slot(host, bytes, inner);
+    if (index < 0 || *inner == 0) return 0;
+    *base = graph_slots[index].host;
+    *base_bytes = graph_slots[index].bytes;
+    return 1;
+}
+
+static int graph_window_device(const void* host, size_t bytes, int is_weight,
+                               OglGraphWindow* out) {
+    const void* base = host;
+    size_t base_bytes = bytes;
+    size_t inner = 0;
+    OglTensorSlot* slot;
+    if (!host || !bytes || !out) return 0;
+    if (!graph_window_base(host, bytes, &base, &base_bytes, &inner)) {
+        base = host;
+        base_bytes = bytes;
+        inner = 0;
+    }
+    slot = graph_ensure_device(base, base_bytes, is_weight);
+    if (!slot) return 0;
+    if (inner == 0) {
+        /* A whole tensor is not a window; bind it the way every other call
+         * site does so a zero-offset dispatch keeps using glBindBufferBase. */
+        out->slot = slot;
+        out->buffer = slot->buffer;
+        out->offset = 0;
+        out->bytes = 0;
+        return out->buffer != 0;
+    }
+    return graph_window_finish(slot, inner, bytes, out);
+}
+
+/* The packed spelling. A window's own bytes stay logical: only the containing
+ * slot is rounded up to whole words, and the tail it pads belongs to the
+ * tensor rather than to any one row. */
+static int graph_window_packed_bytes(const void* host, size_t logical_bytes,
+                                     int is_weight, OglGraphWindow* out) {
+    const void* base = host;
+    size_t base_bytes = logical_bytes;
+    size_t inner = 0;
+    size_t storage_bytes;
+    OglTensorSlot* slot;
+    if (!host || !out || !graph_packed_bytes(logical_bytes, &storage_bytes)) return 0;
+    if (graph_window_base(host, logical_bytes, &base, &base_bytes, &inner)) {
+        slot = graph_ensure_packed_bytes(base, base_bytes, is_weight);
+        return graph_window_finish(slot, inner, storage_bytes, out);
+    }
+    slot = graph_ensure_packed_bytes(host, logical_bytes, is_weight);
+    if (!slot || !slot->buffer) return 0;
+    out->slot = slot;
+    out->buffer = slot->buffer;
+    out->offset = 0;
+    out->bytes = 0;
+    return 1;
+}
+
+/*
+ * An output window.
+ *
+ * A row writes part of a tensor, so the rest has to already be on the device --
+ * otherwise the next read of an untouched row sees whatever the buffer held.
+ * When the containing slot is host-dirty this uploads it whole first and the
+ * kernel then overwrites one row, which is the same order the host row path
+ * achieves by syncing before it runs.
+ */
+static int graph_window_output_packed(const void* host, size_t logical_bytes,
+                                      OglGraphWindow* out) {
+    const void* base = host;
+    size_t base_bytes = logical_bytes;
+    size_t inner = 0;
+    size_t storage_bytes;
+    OglTensorSlot* slot;
+    if (!host || !out || !graph_packed_bytes(logical_bytes, &storage_bytes)) return 0;
+    if (graph_window_base(host, logical_bytes, &base, &base_bytes, &inner)) {
+        slot = graph_ensure_packed_bytes(base, base_bytes, 0);
+        return graph_window_finish(slot, inner, storage_bytes, out);
+    }
+    slot = graph_output_packed_bytes(host, logical_bytes);
+    if (!slot || !slot->buffer) return 0;
+    out->slot = slot;
+    out->buffer = slot->buffer;
+    out->offset = 0;
+    out->bytes = 0;
+    return 1;
+}
+
+/*
+ * Where in the ids tensor a dispatch starts, as a token index.
+ *
+ * Every other activation binds as a window, because a row's byte offset is
+ * `row * stride` and that is a multiple of the storage alignment whenever the
+ * stride is. A token row is a single i32, and four bytes divide some drivers'
+ * alignment and not others' -- which would make "does QEmbedding run on the
+ * device" a property of the adapter rather than of this code.
+ *
+ * So the ids bind whole on every backend and the row is named as a scalar, out
+ * of reach of the alignment rule. The offset is in tokens, not bytes, because
+ * that is what the shader indexes with.
+ */
+static int graph_token_window(const int32_t* tokens, size_t token_bytes,
+                              OglTensorSlot** slot, uint32_t* token_offset) {
+    const void* base = tokens;
+    size_t base_bytes = token_bytes;
+    size_t inner = 0;
+    int index;
+    if (!tokens || !token_bytes || !slot || !token_offset) return 0;
+    *token_offset = 0;
+    index = graph_find_containing_slot(tokens, token_bytes, &inner);
+    if (index >= 0 && inner) {
+        /* A misaligned interior pointer is not a token boundary, so it is not
+         * a row of this tensor and nothing here can address it. */
+        if (inner % sizeof(int32_t)) return 0;
+        if (inner / sizeof(int32_t) > UINT32_MAX) return 0;
+        base = graph_slots[index].host;
+        base_bytes = graph_slots[index].bytes;
+        *token_offset = (uint32_t)(inner / sizeof(int32_t));
+    }
+    *slot = graph_ensure_device(base, base_bytes, 0);
+    return *slot != NULL && (*slot)->buffer != 0;
+}
+
+static int opengl_dispatch_dimensions_valid(
+        uint32_t gx, uint32_t gy, uint32_t gz) {
+    return gx > 0u && gy > 0u && gz > 0u &&
+        max_compute_groups[0] > 0 && max_compute_groups[1] > 0 &&
+        max_compute_groups[2] > 0 &&
+        gx <= (uint32_t)max_compute_groups[0] &&
+        gy <= (uint32_t)max_compute_groups[1] &&
+        gz <= (uint32_t)max_compute_groups[2];
+}
+
+static int dispatch_kernel_ranges(const OglKernel* k, const OglBufferRange* binds,
+                                  uint32_t gx, uint32_t gy, uint32_t gz) {
+    if (!k || !binds ||
+        !opengl_dispatch_dimensions_valid(gx, gy, gz) ||
+        k->binding_count <= 0)
         return 0;
     for (int i = 0; i < k->binding_count; i++) {
         int limit = i == k->uniform_binding
             ? max_uniform_bindings : max_ssbo_bindings;
-        if (!buffers[i] || i >= limit) return 0;
+        if (!binds[i].buffer || i >= limit) return 0;
+        /* A ranged binding needs the entry point and a size the driver will
+         * accept; a zero-length range is a GL error, not an empty read. */
+        if ((binds[i].offset || binds[i].bytes) &&
+            (!p_glBindBufferRange || binds[i].bytes == 0 ||
+             binds[i].bytes > (size_t)INTPTR_MAX ||
+             binds[i].offset > (size_t)INTPTR_MAX)) return 0;
     }
     GLuint prog = compile_kernel(k);
     if (!prog) return 0;
@@ -1287,8 +1562,14 @@ static int dispatch_kernel(const OglKernel* k, GLuint* buffers, uint32_t gx,
     double t0 = profile_sync ? volvoxai_engine_now_ms() : 0.0;
     p_glUseProgram(prog);
     for (int i = 0; i < k->binding_count; i++) {
-        p_glBindBufferBase(i == k->uniform_binding ? GL_UNIFORM_BUFFER : GL_SHADER_STORAGE_BUFFER,
-                           (GLuint)i, buffers[i]);
+        GLenum target = i == k->uniform_binding
+            ? GL_UNIFORM_BUFFER : GL_SHADER_STORAGE_BUFFER;
+        if (binds[i].offset || binds[i].bytes)
+            p_glBindBufferRange(target, (GLuint)i, binds[i].buffer,
+                                (GLintptr)binds[i].offset,
+                                (GLsizeiptr)binds[i].bytes);
+        else
+            p_glBindBufferBase(target, (GLuint)i, binds[i].buffer);
     }
     p_glDispatchCompute((GLuint)gx, (GLuint)gy, (GLuint)gz);
     p_glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
@@ -1299,9 +1580,79 @@ static int dispatch_kernel(const OglKernel* k, GLuint* buffers, uint32_t gx,
     return 1;
 }
 
-static GLuint params_buffer(const void* data, size_t bytes) {
-    return create_buffer_target(GL_UNIFORM_BUFFER, bytes, data);
+/* The whole-buffer spelling, which is what all but the decoder closure use. */
+static int dispatch_kernel(const OglKernel* k, GLuint* buffers, uint32_t gx,
+                           uint32_t gy, uint32_t gz) {
+    OglBufferRange binds[OGL_MAX_BINDINGS];
+    if (!k || !buffers || k->binding_count <= 0 ||
+        k->binding_count > OGL_MAX_BINDINGS) return 0;
+    for (int i = 0; i < k->binding_count; i++) {
+        binds[i].buffer = buffers[i];
+        binds[i].offset = 0;
+        binds[i].bytes = 0;
+    }
+    return dispatch_kernel_ranges(k, binds, gx, gy, gz);
 }
+
+static GLuint params_buffer(const void* data, size_t bytes) {
+    OpenGLContextState* state = opengl_context_state_get(0);
+    if (!ogl_ready() || !state || !data ||
+        (!state->forward_active && !state->transient_active
+#if VOLVOXAI_ENABLE_TRAINING
+         && !state->training_is_active
+#endif
+        ) || bytes == 0 || bytes > (size_t)INTPTR_MAX ||
+        max_uniform_block_size <= 0 ||
+        (uint64_t)bytes > (uint64_t)max_uniform_block_size)
+        return 0;
+
+    opengl_clear_errors();
+    if (!state->dispatch_params_buffer) {
+        p_glGenBuffers(1, &state->dispatch_params_buffer);
+        if (!state->dispatch_params_buffer) return 0;
+    }
+    p_glBindBuffer(GL_UNIFORM_BUFFER, state->dispatch_params_buffer);
+    /* glBufferData replaces the object's data store. This is the specified
+     * orphaning path: an earlier queued dispatch keeps its old store, while
+     * this upload becomes visible to subsequent dispatches without a finish
+     * or a ring-size assumption. */
+    p_glBufferData(GL_UNIFORM_BUFFER, (GLsizeiptr)bytes, data, GL_DYNAMIC_DRAW);
+    GLenum error = p_glGetError();
+    p_glBindBuffer(GL_UNIFORM_BUFFER, 0);
+    if (error != GL_NO_ERROR) return 0;
+    state->dispatch_params_upload_count++;
+    return state->dispatch_params_buffer;
+}
+
+/* Parameter-buffer call sites historically deleted their one-shot UBO after
+ * dispatch. Keep those call sites source-compatible while retaining the one
+ * context-owned name; all unrelated buffers still reach the GL driver. */
+static void opengl_driver_delete_buffers(
+        GLsizei count, const GLuint* buffers) {
+    if (p_glDeleteBuffers) p_glDeleteBuffers(count, buffers);
+}
+#undef p_glDeleteBuffers
+static void opengl_delete_buffers_preserving_params(
+        GLsizei count, const GLuint* buffers) {
+    if (count <= 0 || !buffers)
+        return;
+    OpenGLContextState* state = opengl_context_state_get(0);
+    GLuint pending[16];
+    GLsizei pending_count = 0;
+    for (GLsizei index = 0; index < count; index++) {
+        GLuint buffer = buffers[index];
+        if (!buffer || (state && buffer == state->dispatch_params_buffer))
+            continue;
+        pending[pending_count++] = buffer;
+        if (pending_count == (GLsizei)(sizeof(pending) / sizeof(pending[0]))) {
+            opengl_driver_delete_buffers(pending_count, pending);
+            pending_count = 0;
+        }
+    }
+    if (pending_count)
+        opengl_driver_delete_buffers(pending_count, pending);
+}
+#define p_glDeleteBuffers opengl_delete_buffers_preserving_params
 
 static int read_buffer(GLenum target, size_t bytes, void* out) {
     if (!out || bytes == 0) return 0;
@@ -1318,414 +1669,7 @@ static int read_buffer(GLenum target, size_t bytes, void* out) {
     return 1;
 }
 
-#if VOLVOXAI_ENABLE_TRAINING
-static const OglTrainingKernel* training_find_kernel(const char* shader_name,
-                                                     const char* entry_point) {
-    if (!shader_name || !shader_name[0]) return NULL;
-    const char* entry = entry_point && entry_point[0] ? entry_point : "main";
-    for (size_t i = 0; i < sizeof(training_kernels) / sizeof(training_kernels[0]); i++) {
-        if (!strcmp(training_kernels[i].shader_name, shader_name) &&
-            !strcmp(training_kernels[i].entry_point, entry)) return &training_kernels[i];
-    }
-    return NULL;
-}
-
-static int training_find_slot(const void* host) {
-    if (!host) return -1;
-    for (int i = 0; i < training_slot_count; i++) {
-        if (training_slots[i].host == host) return i;
-    }
-    return -1;
-}
-
-static OglTensorSlot* training_get_slot(void* host, size_t bytes, int is_weight) {
-    int index = training_find_slot(host);
-    if (index < 0) {
-        if (training_slot_count >= OGL_GRAPH_MAX_TENSORS) return NULL;
-        index = training_slot_count++;
-        memset(&training_slots[index], 0, sizeof(training_slots[index]));
-        training_slots[index].host = host;
-        training_slots[index].host_dirty = 1;
-    }
-    OglTensorSlot* slot = &training_slots[index];
-    slot->bytes = bytes;
-    if (is_weight) slot->is_weight = 1;
-    return slot;
-}
-
-static OglTensorSlot* training_prepare_slot(void* host, size_t bytes,
-                                            unsigned char binding_access, int is_weight) {
-    OglTensorSlot* slot = training_get_slot(host, bytes, is_weight);
-    if (!slot) return NULL;
-    int needs_read = (binding_access & OPENGL_TRAINING_ACCESS_READ) != 0;
-    int graph_index = graph_find_slot(host);
-    if (graph_index >= 0) {
-        OglTensorSlot* graph_slot = graph_ensure_device(host, bytes, is_weight);
-        if (!graph_slot || !graph_slot->buffer) return NULL;
-        if (slot->owns_buffer && slot->buffer && slot->buffer != graph_slot->buffer) {
-            p_glDeleteBuffers(1, &slot->buffer);
-        }
-        slot->buffer = graph_slot->buffer;
-        slot->cap = graph_slot->cap;
-        slot->bytes = bytes;
-        slot->owns_buffer = 0;
-        slot->host_dirty = graph_slot->host_dirty;
-        slot->device_dirty = graph_slot->device_dirty;
-        return slot;
-    }
-    int needs_allocation = !slot->owns_buffer || !slot->buffer || slot->cap < bytes;
-    const void* initial = needs_read ? host : NULL;
-    if (needs_allocation) {
-        if (!slot_ensure_owned_buffer(slot, bytes, initial)) return NULL;
-        slot->host_dirty = 0;
-        slot->device_dirty = 0;
-    } else if (needs_read && !slot->device_dirty && (!slot->is_weight || slot->host_dirty)) {
-        p_glBindBuffer(GL_SHADER_STORAGE_BUFFER, slot->buffer);
-        p_glBufferData(GL_SHADER_STORAGE_BUFFER, (GLsizeiptr)bytes, host, GL_DYNAMIC_DRAW);
-        p_glBindBuffer(GL_SHADER_STORAGE_BUFFER, 0);
-        slot->host_dirty = 0;
-    }
-    return slot;
-}
-
-static void training_reset_buffers(void) {
-    if (p_glDeleteBuffers) {
-        for (int i = 0; i < training_slot_count; i++) {
-            if (training_slots[i].owns_buffer && training_slots[i].buffer) {
-                p_glDeleteBuffers(1, &training_slots[i].buffer);
-            }
-        }
-    }
-    memset(training_slots, 0, sizeof(training_slots));
-    training_slot_count = 0;
-}
-
-static int opengl_training_available_locked(void) {
-    return ogl_ready() && max_ssbo_bindings >= 2 && max_uniform_bindings >= 1 &&
-           max_compute_invocations >= 64;
-}
-
-static int opengl_training_supports_locked(
-    const char* shader_name, const char* entry_point, const size_t* bytes,
-    int binding_count, uint32_t groups_x, uint32_t groups_y,
-    uint32_t groups_z) {
-    const OglTrainingKernel* kernel = training_find_kernel(shader_name, entry_point);
-    if (!opengl_training_available_locked() || !kernel || !bytes ||
-        binding_count != kernel->kernel.binding_count ||
-        groups_x == 0 || groups_y == 0 || groups_z == 0 ||
-        groups_x > (uint32_t)max_compute_groups[0] ||
-        groups_y > (uint32_t)max_compute_groups[1] ||
-        groups_z > (uint32_t)max_compute_groups[2]) return 0;
-    int uniform_blocks = kernel->kernel.uniform_binding >= 0 ? 1 : 0;
-    int storage_blocks = binding_count - uniform_blocks;
-    if (storage_blocks > max_compute_ssbo_blocks ||
-        uniform_blocks > max_compute_uniform_blocks) return 0;
-    for (int i = 0; i < kernel->kernel.binding_count; i++) {
-        int limit = i == kernel->kernel.uniform_binding ? max_uniform_bindings : max_ssbo_bindings;
-        GLint64 block_limit = i == kernel->kernel.uniform_binding
-            ? max_uniform_block_size : max_ssbo_block_size;
-        if (i >= limit || bytes[i] == 0 ||
-            (uint64_t)bytes[i] > (uint64_t)block_limit) return 0;
-    }
-    return 1;
-}
-
-int opengl_training_available(void) {
-    OpenGLContextState* state = opengl_context_state_get(0);
-    if (!state) return 0;
-    if (state->training_is_active || state->forward_active)
-        return opengl_training_available_locked();
-    opengl_device_lock();
-    int available = opengl_training_available_locked();
-    opengl_device_unlock();
-    return available;
-}
-
-int opengl_training_supports(const char* shader_name, const char* entry_point,
-                             const size_t* bytes, int binding_count,
-                             uint32_t groups_x, uint32_t groups_y,
-                             uint32_t groups_z) {
-    OpenGLContextState* state = opengl_context_state_get(0);
-    if (!state) return 0;
-    if (state->training_is_active || state->forward_active) {
-        return opengl_training_supports_locked(
-            shader_name, entry_point, bytes, binding_count,
-            groups_x, groups_y, groups_z);
-    }
-    opengl_device_lock();
-    int supported = opengl_training_supports_locked(
-        shader_name, entry_point, bytes, binding_count,
-        groups_x, groups_y, groups_z);
-    opengl_device_unlock();
-    return supported;
-}
-
-int opengl_training_begin(void) {
-    OpenGLContextState* state = opengl_context_state_get(0);
-    if (!state || state->training_is_active) return -1;
-    if (state->forward_active) {
-        if (!state->implicit_forward) return -1;
-        state->forward_active = 0;
-        state->implicit_forward = 0;
-        state->training_is_active = 1;
-        return 0;
-    }
-    opengl_device_lock();
-    if (!opengl_training_available_locked() ||
-        opengl_make_current_locked() != 0) {
-        opengl_device_unlock();
-        return -1;
-    }
-    /* Programs and tensor buffers remain unallocated until the first dispatch. */
-    state->training_is_active = 1;
-    return 0;
-}
-
-int opengl_training_dispatch(const char* shader_name, const char* entry_point,
-                             void* const* hosts, const size_t* bytes,
-                             const unsigned char* access,
-                             const unsigned char* is_weight, int binding_count,
-                             uint32_t groups_x, uint32_t groups_y, uint32_t groups_z) {
-    OpenGLContextState* state = opengl_context_state_get(0);
-    if (!state || !state->training_is_active || !hosts || !bytes || !access ||
-        !is_weight ||
-        binding_count > OGL_TRAINING_MAX_BINDINGS ||
-        !opengl_training_supports_locked(shader_name, entry_point, bytes,
-                                         binding_count, groups_x, groups_y,
-                                         groups_z)) return -1;
-    const OglTrainingKernel* selected = training_find_kernel(shader_name, entry_point);
-    if (!selected || selected->kernel.binding_count != binding_count) return -1;
-
-    for (int i = 0; i < binding_count; i++) {
-        unsigned char expected = (selected->read_write_mask & (1u << i))
-                                     ? OPENGL_TRAINING_ACCESS_READ_WRITE
-                                     : OPENGL_TRAINING_ACCESS_READ;
-        int limit = i == selected->kernel.uniform_binding
-                        ? max_uniform_bindings : max_ssbo_bindings;
-        if (!hosts[i] || bytes[i] == 0 || bytes[i] > (size_t)INTPTR_MAX ||
-            access[i] != expected || is_weight[i] > 1 || i >= limit ||
-            (is_weight[i] && (expected != OPENGL_TRAINING_ACCESS_READ ||
-                              i == selected->kernel.uniform_binding))) return -1;
-    }
-
-    GLuint buffers[OGL_TRAINING_MAX_BINDINGS] = {0};
-    OglTensorSlot* slots[OGL_TRAINING_MAX_BINDINGS] = {0};
-    GLuint params = 0;
-    for (int i = 0; i < binding_count; i++) {
-        if (i == selected->kernel.uniform_binding) {
-            params = params_buffer(hosts[i], bytes[i]);
-            if (!params) return -1;
-            buffers[i] = params;
-        } else {
-            slots[i] = training_prepare_slot(hosts[i], bytes[i], access[i], is_weight[i]);
-            if (!slots[i]) {
-                if (params) p_glDeleteBuffers(1, &params);
-                return -1;
-            }
-            buffers[i] = slots[i]->buffer;
-        }
-    }
-
-    int ok = dispatch_kernel(&selected->kernel, buffers, groups_x, groups_y, groups_z);
-    if (params) p_glDeleteBuffers(1, &params);
-    if (!ok) return -1;
-    for (int i = 0; i < binding_count; i++) {
-        if (slots[i] && (access[i] & OPENGL_TRAINING_ACCESS_WRITE)) {
-            slots[i]->device_dirty = 1;
-            slots[i]->host_dirty = 0;
-            int graph_index = graph_find_slot(hosts[i]);
-            if (graph_index >= 0 && graph_slots[graph_index].buffer == slots[i]->buffer) {
-                graph_mark_device(&graph_slots[graph_index]);
-            }
-        }
-    }
-    return 0;
-}
-
-int opengl_training_sync(void* host, size_t bytes) {
-    OpenGLContextState* state = opengl_context_state_get(0);
-    if (!state || !state->training_is_active ||
-        !opengl_training_available_locked() || !host ||
-        bytes == 0) return -1;
-    int index = training_find_slot(host);
-    if (index < 0) return -1;
-    OglTensorSlot* slot = &training_slots[index];
-    if (!slot->buffer || bytes > slot->bytes) return -1;
-    if (!slot->device_dirty) return 0;
-    p_glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT | GL_BUFFER_UPDATE_BARRIER_BIT);
-    p_glFinish();
-    p_glBindBuffer(GL_SHADER_STORAGE_BUFFER, slot->buffer);
-    int ok = read_buffer(GL_SHADER_STORAGE_BUFFER, bytes, host);
-    p_glBindBuffer(GL_SHADER_STORAGE_BUFFER, 0);
-    if (!ok) return -1;
-    slot->device_dirty = 0;
-    slot->host_dirty = 0;
-    int graph_index = graph_find_slot(host);
-    if (graph_index >= 0 && graph_slots[graph_index].buffer == slot->buffer) {
-        graph_slots[graph_index].device_dirty = 0;
-        graph_slots[graph_index].host_dirty = 0;
-    }
-    return 0;
-}
-
-void opengl_training_end(void) {
-    OpenGLContextState* state = opengl_context_state_get(0);
-    if (!state || !state->training_is_active) return;
-    if (ogl_ready() && p_glFinish) p_glFinish();
-    training_reset_buffers();
-    state->training_is_active = 0;
-    opengl_release_current_locked();
-    opengl_device_unlock();
-}
-
-#ifdef VOLVOX_OPENGL_TESTING
-void opengl_training_debug_resource_counts(int* programs, int* buffers,
-                                           int* inference_buffers) {
-    OpenGLContextState* state = opengl_context_state_get(0);
-    if (!state) {
-        if (programs) *programs = 0;
-        if (buffers) *buffers = 0;
-        if (inference_buffers) *inference_buffers = 0;
-        return;
-    }
-    int owns_lock = state && !state->training_is_active && !state->forward_active;
-    if (owns_lock) opengl_device_lock();
-    int program_count = 0;
-    for (size_t i = 0; i < sizeof(training_kernels) / sizeof(training_kernels[0]); i++) {
-        OglProgramCacheEntry* entry =
-            program_cache_entry(&training_kernels[i].kernel, 0);
-        if (entry && entry->program) program_count++;
-    }
-    if (programs) *programs = program_count;
-    if (buffers) *buffers = training_slot_count;
-    if (inference_buffers) *inference_buffers = graph_slot_count;
-    if (owns_lock) opengl_device_unlock();
-}
-
-int opengl_training_debug_compile_all(void) {
-    OpenGLContextState* state = opengl_context_state_get(0);
-    if (!state) return -1;
-    int owns_lock = !state->training_is_active && !state->forward_active;
-    if (owns_lock) {
-        opengl_device_lock();
-        if (!opengl_training_available_locked() ||
-            opengl_make_current_locked() != 0) {
-            opengl_device_unlock();
-            return -1;
-        }
-    } else if (!opengl_training_available_locked()) {
-        return -1;
-    }
-    for (size_t i = 0; i < sizeof(training_kernels) / sizeof(training_kernels[0]); i++) {
-        if (!compile_kernel(&training_kernels[i].kernel)) {
-            if (owns_lock) {
-                opengl_release_current_locked();
-                opengl_device_unlock();
-            }
-            return -1;
-        }
-    }
-    if (owns_lock) {
-        opengl_release_current_locked();
-        opengl_device_unlock();
-    }
-    return 0;
-}
-#endif
-#endif
-
-void opengl_graph_reset(void) {
-    OpenGLContextState* state = opengl_context_state_get(0);
-    if (!state) return;
-#if VOLVOXAI_ENABLE_TRAINING
-    if (state->training_is_active) opengl_training_end();
-#endif
-    if (state->forward_active) (void)opengl_graph_end_forward();
-    opengl_device_lock();
-    int gl_current = state->device_acquired &&
-        opengl_make_current_locked() == 0;
-    if (gl_current && p_glDeleteBuffers) {
-        for (int i = 0; i < state->graph_slots_count; i++) {
-            if (state->graph_slot_storage[i].owns_buffer &&
-                state->graph_slot_storage[i].buffer) {
-                p_glDeleteBuffers(1, &state->graph_slot_storage[i].buffer);
-            }
-        }
-    }
-    memset(state->graph_slot_storage, 0, sizeof(state->graph_slot_storage));
-    state->graph_slots_count = 0;
-    free(state->shape_signature);
-    state->shape_signature = NULL;
-    state->shape_generation = opengl_generation_next(state->shape_generation);
-    state->capacity_generation =
-        opengl_generation_next(state->capacity_generation);
-    state->domain_span_count = 0;
-    state->domain_qgroupnorm_stats_bytes = 0;
-    state->domain_qlayernorm_stats_bytes = 0;
-    state->domain_enforced = 0;
-#ifdef VOLVOX_OPENGL_TESTING
-    state->test_domain_allocation_failure_after = -1;
-#endif
-    if (gl_current) opengl_release_current_locked();
-    opengl_device_unlock();
-}
-
-int opengl_graph_bind_shape(const char* signature) {
-    OpenGLContextState* state = opengl_context_state_get(0);
-    char* candidate;
-    size_t length;
-    int ended_forward = 0;
-    if (!state || !state->device_acquired || !signature || !signature[0] ||
-        state->domain_enforced)
-        return -1;
-    if (state->shape_signature && !strcmp(state->shape_signature, signature))
-        return 0;
-#if VOLVOXAI_ENABLE_TRAINING
-    if (state->training_is_active) return -1;
-#endif
-    length = strlen(signature);
-    if (length > 1024u * 1024u) return -1;
-    candidate = (char*)malloc(length + 1u);
-    if (!candidate) return -1;
-    memcpy(candidate, signature, length + 1u);
-    if (state->forward_active) {
-        if (opengl_graph_end_forward() != 0) {
-            free(candidate);
-            return -1;
-        }
-        ended_forward = 1;
-    }
-    (void)ended_forward;
-    opengl_device_lock();
-    if (!ogl_ready() || opengl_make_current_locked() != 0) {
-        opengl_device_unlock();
-        free(candidate);
-        return -1;
-    }
-    if (p_glFinish) p_glFinish();
-    uint64_t next_generation =
-        opengl_generation_next(state->shape_generation);
-    for (int index = 0; index < state->graph_slots_count; index++) {
-        OglTensorSlot* slot = &state->graph_slot_storage[index];
-        if (slot->is_weight) continue;
-        slot->host = NULL;
-        slot->bytes = 0;
-        slot->shape_generation = next_generation;
-        slot->host_dirty = 0;
-        slot->device_dirty = 0;
-        if (!slot->owns_buffer) {
-            slot->buffer = 0;
-            slot->cap = 0;
-            slot->capacity_generation = 0;
-        }
-    }
-    free(state->shape_signature);
-    state->shape_signature = candidate;
-    state->shape_generation = next_generation;
-    opengl_release_current_locked();
-    opengl_device_unlock();
-    return 0;
-}
+#include "opengl_training.inc"
 
 static int opengl_graph_domain_spans_match(
         const VolvoxAIEnginePhysicalSpan* spans,
@@ -2018,6 +1962,12 @@ int opengl_graph_debug_dynamic_state(OpenGLGraphDynamicStateProbe* probe) {
         state->qlayernorm_scratch_capacity;
     probe->domain_enforced = state->domain_enforced;
     probe->slot_count = state->graph_slots_count;
+    probe->dispatch_params_buffer_count =
+        state->dispatch_params_buffer ? 1 : 0;
+    probe->dispatch_params_upload_count =
+        state->dispatch_params_upload_count;
+    probe->conv_out16_dispatch_count =
+        state->test_conv_out16_dispatch_count;
     for (int index = 0; index < state->graph_slots_count; index++) {
         OglTensorSlot* slot = &state->graph_slot_storage[index];
         if (!slot->owns_buffer || !slot->buffer) continue;
@@ -2162,3164 +2112,29 @@ void opengl_graph_demote_weight(const void* host, size_t bytes) {
     slot->shape_generation = state->shape_generation;
 }
 
+/* A storage-view node may share one device buffer only when the runtime has
+ * already given both tensors the same host storage. Device slots are keyed by
+ * host pointer, and the runtime pools activations so that many tensors with
+ * disjoint lifetimes share one host span. Pointing a second span's slot at this
+ * span's buffer therefore does not extend one tensor's lifetime -- it merges the
+ * two spans on the device for the rest of the graph, so every later tensor
+ * planned into either span writes through both. The planner proved those
+ * lifetimes against distinct storage, so the result is an unsynchronized
+ * read/write overlap: SiLU -> Reshape -> Transpose reads and writes one buffer
+ * in a single dispatch and returns a different wrong answer on every run.
+ * Distinct host storage must therefore be a real copy. */
 int opengl_graph_alias_f32(const float* in, float* out, long n) {
     if (n <= 0 || !in || !out) return 0;
-    OpenGLContextState* state = opengl_context_state_get(0);
-    if (state && state->domain_enforced && in != out)
-        return opengl_graph_copy_f32(in, out, n);
+    if (in != out) return opengl_graph_copy_f32(in, out, n);
     size_t bytes = (size_t)n * sizeof(float);
-    OglTensorSlot* src = graph_ensure_device(in, bytes, 0);
-    OglTensorSlot* dst = graph_get_slot(out, bytes, 0);
-    if (!src || !dst || !src->buffer) return 0;
-    if (dst == src) {
-        graph_mark_device(dst);
-        return 1;
-    }
-    if (dst->owns_buffer && dst->buffer && dst->buffer != src->buffer) {
-        p_glDeleteBuffers(1, &dst->buffer);
-        state->capacity_generation =
-            opengl_generation_next(state->capacity_generation);
-    }
-    dst->buffer = src->buffer;
-    dst->cap = src->cap;
-    dst->capacity_generation = src->capacity_generation;
-    dst->bytes = bytes;
-    dst->owns_buffer = 0;
-    graph_mark_device(dst);
+    OglTensorSlot* slot = graph_ensure_device(in, bytes, 0);
+    if (!slot || !slot->buffer) return 0;
+    graph_mark_device(slot);
     return 1;
 }
+#include "opengl_graph_f32.inc"
 
-int opengl_graph_copy_f32(const float* in, float* out, long n) {
-    if (n <= 0 || !in || !out) return 0;
-    size_t bytes = (size_t)n * sizeof(float);
-    OglTensorSlot* src = graph_ensure_device(in, bytes, 0);
-    OglTensorSlot* dst = graph_output_slot(out, bytes);
-    if (!src || !dst) return 0;
-    uint32_t params[1] = {(uint32_t)n};
-    GLuint pb = params_buffer(params, sizeof(params));
-    GLuint bufs[3] = {src->buffer, dst->buffer, pb};
-    int ok = dispatch_kernel(&k_copy, bufs, ((uint32_t)n + 63u) / 64u, 1, 1);
-    if (pb) p_glDeleteBuffers(1, &pb);
-    if (!ok) return 0;
-    graph_mark_device(dst);
-    return 1;
-}
-
-int opengl_graph_add_f32(const float* a, const float* bptr, float* out, long n) {
-    return opengl_graph_add_relu_f32(a, bptr, out, n, 0);
-}
-
-int opengl_graph_add_relu_f32(const float* a, const float* bptr, float* out, long n, int relu) {
-    if (n <= 0 || !a || !bptr || !out) return 0;
-    size_t bytes = (size_t)n * sizeof(float);
-    OglTensorSlot* sa = graph_ensure_device(a, bytes, 0);
-    OglTensorSlot* sb = graph_ensure_device(bptr, bytes, 0);
-    OglTensorSlot* so = graph_output_slot(out, bytes);
-    if (!sa || !sb || !so) return 0;
-    uint32_t params[2] = {(uint32_t)n, (uint32_t)relu};
-    GLuint pb = params_buffer(params, sizeof(params));
-    GLuint bufs[4] = {sa->buffer, sb->buffer, so->buffer, pb};
-    int ok = dispatch_kernel(&k_add, bufs, ((uint32_t)n + 63u) / 64u, 1, 1);
-    if (pb) p_glDeleteBuffers(1, &pb);
-    if (!ok) return 0;
-    graph_mark_device(so);
-    return 1;
-}
-
-int opengl_graph_add3_relu_f32(const float* a, const float* bptr, const float* c, float* out, long n, int relu) {
-    if (n <= 0 || !a || !bptr || !c || !out) return 0;
-    size_t bytes = (size_t)n * sizeof(float);
-    OglTensorSlot* sa = graph_ensure_device(a, bytes, 0);
-    OglTensorSlot* sb = graph_ensure_device(bptr, bytes, 0);
-    OglTensorSlot* sc = graph_ensure_device(c, bytes, 0);
-    OglTensorSlot* so = graph_output_slot(out, bytes);
-    if (!sa || !sb || !sc || !so) return 0;
-    uint32_t params[2] = {(uint32_t)n, (uint32_t)relu};
-    GLuint pb = params_buffer(params, sizeof(params));
-    GLuint bufs[5] = {sa->buffer, sb->buffer, sc->buffer, so->buffer, pb};
-    int ok = dispatch_kernel(&k_add3, bufs, ((uint32_t)n + 63u) / 64u, 1, 1);
-    if (pb) p_glDeleteBuffers(1, &pb);
-    if (!ok) return 0;
-    graph_mark_device(so);
-    return 1;
-}
-
-int opengl_graph_clip_f32(const float* in, float* out, long n, float min_v, float max_v) {
-    if (n <= 0 || !in || !out) return 0;
-    size_t bytes = (size_t)n * sizeof(float);
-    OglTensorSlot* src = graph_ensure_device(in, bytes, 0);
-    OglTensorSlot* dst = graph_output_slot(out, bytes);
-    if (!src || !dst) return 0;
-    struct { uint32_t size; float min_v; float max_v; } params = {(uint32_t)n, min_v, max_v};
-    GLuint pb = params_buffer(&params, sizeof(params));
-    GLuint bufs[3] = {src->buffer, dst->buffer, pb};
-    int ok = dispatch_kernel(&k_clip, bufs, ((uint32_t)n + 63u) / 64u, 1, 1);
-    if (pb) p_glDeleteBuffers(1, &pb);
-    if (!ok) return 0;
-    graph_mark_device(dst);
-    return 1;
-}
-
-static int opengl_graph_typed_control_32(
-        const void* a, size_t a_bytes, const void* b, size_t b_bytes,
-        void* output, size_t output_bytes,
-        const VxTypedControlMetadata* metadata) {
-    if (!metadata) return 0;
-    OglTensorSlot* a_slot = graph_ensure_device(a, a_bytes, 0);
-    OglTensorSlot* b_slot = graph_ensure_device(b, b_bytes, 0);
-    OglTensorSlot* output_slot =
-        graph_output_slot(output, output_bytes);
-    if (!a_slot || !b_slot || !output_slot) return 0;
-    GLuint metadata_buffer =
-        create_buffer(sizeof(*metadata), metadata);
-    if (!metadata_buffer) return 0;
-    GLuint buffers[4] = {
-        a_slot->buffer, b_slot->buffer,
-        output_slot->buffer, metadata_buffer,
-    };
-    uint32_t elements = metadata->values[0];
-    int ok = dispatch_kernel(
-        &k_typed_control_32, buffers,
-        (elements + 63u) / 64u, 1u, 1u);
-    p_glDeleteBuffers(1, &metadata_buffer);
-    if (!ok) return 0;
-    graph_mark_device(output_slot);
-    return 1;
-}
-
-int opengl_graph_compare_i32(
-        const int32_t* a, long a_elements,
-        const int32_t* b, long b_elements,
-        int32_t* output, long output_elements,
-        const uint32_t* output_strides,
-        const uint32_t* a_strides,
-        const uint32_t* b_strides,
-        int rank, int operation) {
-    VxTypedControlMetadata metadata;
-    size_t a_bytes;
-    size_t b_bytes;
-    size_t output_bytes;
-    if (!vx_typed_control_compare_plan(
-            a, a_elements, b, b_elements, output, output_elements,
-            output_strides, a_strides, b_strides, rank, operation,
-            &metadata, &a_bytes, &b_bytes, &output_bytes))
-        return 0;
-    return opengl_graph_typed_control_32(
-        a, a_bytes, b, b_bytes, output, output_bytes, &metadata);
-}
-
-static int opengl_graph_unary_i32(
-        const int32_t* input, int32_t* output, long elements,
-        int operation, int32_t minimum, int32_t maximum) {
-    VxTypedControlMetadata metadata;
-    size_t bytes;
-    if (!vx_typed_control_unary_plan(
-            input, output, elements, operation, minimum, maximum,
-            &metadata, &bytes))
-        return 0;
-    return opengl_graph_typed_control_32(
-        input, bytes, input, bytes, output, bytes, &metadata);
-}
-
-int opengl_graph_not_i32(
-        const int32_t* input, int32_t* output, long elements) {
-    return opengl_graph_unary_i32(
-        input, output, elements, VX_TYPED_CONTROL_NOT_I32, 0, 0);
-}
-
-int opengl_graph_clip_i32(
-        const int32_t* input, int32_t* output, long elements,
-        int32_t minimum, int32_t maximum) {
-    return opengl_graph_unary_i32(
-        input, output, elements, VX_TYPED_CONTROL_CLIP_I32,
-        minimum, maximum);
-}
-
-int opengl_graph_copy_32(
-        const void* input, void* output, long elements) {
-    VxTypedControlMetadata metadata;
-    size_t bytes;
-    if (!vx_typed_control_copy_plan(
-            input, output, elements, &metadata, &bytes))
-        return 0;
-    return opengl_graph_typed_control_32(
-        input, bytes, input, bytes, output, bytes, &metadata);
-}
-
-int opengl_graph_cast_typed(
-        const void* input, int input_dtype,
-        void* output, int output_dtype, long elements) {
-    VxTypedControlMetadata metadata;
-    size_t bytes;
-    if (!vx_typed_control_cast_plan(
-            input, input_dtype, output, output_dtype, elements,
-            &metadata, &bytes))
-        return 0;
-    return opengl_graph_typed_control_32(
-        input, bytes, input, bytes, output, bytes, &metadata);
-}
-
-int opengl_graph_sigmoid_f32(const float* in, float* out, long n) {
-    if (n <= 0 || !in || !out) return 0;
-    size_t bytes = (size_t)n * sizeof(float);
-    OglTensorSlot* src = graph_ensure_device(in, bytes, 0);
-    OglTensorSlot* dst = graph_output_slot(out, bytes);
-    if (!src || !dst) return 0;
-    uint32_t params[1] = {(uint32_t)n};
-    GLuint pb = params_buffer(params, sizeof(params));
-    GLuint bufs[3] = {src->buffer, dst->buffer, pb};
-    int ok = dispatch_kernel(&k_sigmoid, bufs, ((uint32_t)n + 63u) / 64u, 1, 1);
-    if (pb) p_glDeleteBuffers(1, &pb);
-    if (!ok) return 0;
-    graph_mark_device(dst);
-    return 1;
-}
-
-static int opengl_graph_unary_size_f32(const OglKernel* k, const float* in,
-                                       float* out, long n) {
-    if (n <= 0 || !in || !out) return 0;
-    size_t bytes = (size_t)n * sizeof(float);
-    OglTensorSlot* src = graph_ensure_device(in, bytes, 0);
-    OglTensorSlot* dst = graph_output_slot(out, bytes);
-    if (!src || !dst) return 0;
-    uint32_t params[1] = {(uint32_t)n};
-    GLuint pb = params_buffer(params, sizeof(params));
-    GLuint bufs[3] = {src->buffer, dst->buffer, pb};
-    int ok = dispatch_kernel(k, bufs, ((uint32_t)n + 63u) / 64u, 1, 1);
-    if (pb) p_glDeleteBuffers(1, &pb);
-    if (!ok) return 0;
-    graph_mark_device(dst);
-    return 1;
-}
-
-int opengl_graph_relu_f32(const float* in, float* out, long n) { return opengl_graph_unary_size_f32(&k_relu, in, out, n); }
-int opengl_graph_gelu_f32(const float* in, float* out, long n, int approximate_tanh) {
-    if (n <= 0 || (uint64_t)n > UINT32_MAX || !in || !out ||
-        (approximate_tanh != 0 && approximate_tanh != 1)) return 0;
-    size_t bytes = (size_t)n * sizeof(float);
-    OglTensorSlot* src = graph_ensure_device(in, bytes, 0);
-    OglTensorSlot* dst = graph_output_slot(out, bytes);
-    if (!src || !dst) return 0;
-    uint32_t params[4] = {(uint32_t)n, (uint32_t)approximate_tanh, 0u, 0u};
-    GLuint pb = params_buffer(params, sizeof(params));
-    GLuint bufs[3] = {src->buffer, dst->buffer, pb};
-    int ok = dispatch_kernel(&k_gelu, bufs, ((uint32_t)n + 63u) / 64u, 1, 1);
-    if (pb) p_glDeleteBuffers(1, &pb);
-    if (!ok) return 0;
-    graph_mark_device(dst);
-    return 1;
-}
-int opengl_graph_silu_f32(const float* in, float* out, long n) { return opengl_graph_unary_size_f32(&k_silu, in, out, n); }
-int opengl_graph_tanh_f32(const float* in, float* out, long n) { return opengl_graph_unary_size_f32(&k_tanh, in, out, n); }
-int opengl_graph_hardswish_f32(const float* in, float* out, long n) { return opengl_graph_unary_size_f32(&k_hardswish, in, out, n); }
-int opengl_graph_hardsigmoid_f32(const float* in, float* out, long n) { return opengl_graph_unary_size_f32(&k_hardsigmoid, in, out, n); }
-int opengl_graph_cast_copy_f32(const float* in, float* out, long n) { return opengl_graph_copy_f32(in, out, n); }
-
-int opengl_graph_leaky_relu_f32(const float* in, float* out, long n, float alpha) {
-    if (n <= 0 || !in || !out) return 0;
-    size_t bytes = (size_t)n * sizeof(float);
-    OglTensorSlot* src = graph_ensure_device(in, bytes, 0);
-    OglTensorSlot* dst = graph_output_slot(out, bytes);
-    if (!src || !dst) return 0;
-    struct { uint32_t size; float alpha; } params = {(uint32_t)n, alpha};
-    GLuint pb = params_buffer(&params, sizeof(params));
-    GLuint bufs[3] = {src->buffer, dst->buffer, pb};
-    int ok = dispatch_kernel(&k_leaky_relu, bufs, ((uint32_t)n + 63u) / 64u, 1, 1);
-    if (pb) p_glDeleteBuffers(1, &pb);
-    if (!ok) return 0;
-    graph_mark_device(dst);
-    return 1;
-}
-
-int opengl_graph_prelu_f32(const float* in, const float* weight, float* out, long n, int channels) {
-    if (n <= 0 || channels <= 0 || !in || !weight || !out) return 0;
-    size_t bytes = (size_t)n * sizeof(float);
-    size_t wbytes = (size_t)channels * sizeof(float);
-    OglTensorSlot* src = graph_ensure_device(in, bytes, 0);
-    OglTensorSlot* w = graph_ensure_device(weight, wbytes, 1);
-    OglTensorSlot* dst = graph_output_slot(out, bytes);
-    if (!src || !w || !dst) return 0;
-    uint32_t params[4] = {(uint32_t)n, (uint32_t)channels, (uint32_t)channels, 0u};
-    GLuint pb = params_buffer(params, sizeof(params));
-    GLuint bufs[4] = {src->buffer, w->buffer, dst->buffer, pb};
-    int ok = dispatch_kernel(&k_prelu, bufs, ((uint32_t)n + 63u) / 64u, 1, 1);
-    if (pb) p_glDeleteBuffers(1, &pb);
-    if (!ok) return 0;
-    graph_mark_device(dst);
-    return 1;
-}
-
-int opengl_graph_layernorm_f32(const float* in, const float* weight, const float* bias,
-                               float* out, int rows, int d_model, float eps) {
-    if (rows <= 0 || d_model <= 0 || !in || !weight || !bias || !out ||
-        !(eps > 0.0f) || !isfinite(eps)) return 0;
-    size_t bytes = (size_t)rows * d_model * sizeof(float);
-    size_t wbytes = (size_t)d_model * sizeof(float);
-    OglTensorSlot* src = graph_ensure_device(in, bytes, 0);
-    OglTensorSlot* w = graph_ensure_device(weight, wbytes, 1);
-    OglTensorSlot* b = graph_ensure_device(bias, wbytes, 1);
-    OglTensorSlot* dst = graph_output_slot(out, bytes);
-    if (!src || !w || !b || !dst) return 0;
-    struct {
-        uint32_t rows;
-        uint32_t d_model;
-        float eps;
-        uint32_t pad;
-    } params = {(uint32_t)rows, (uint32_t)d_model, eps, 0u};
-    _Static_assert(sizeof(params) == 16, "LayerNorm uniform ABI");
-    GLuint pb = params_buffer(&params, sizeof(params));
-    GLuint bufs[5] = {src->buffer, w->buffer, b->buffer, dst->buffer, pb};
-    int ok = dispatch_kernel(&k_layernorm, bufs, ((uint32_t)rows + 63u) / 64u, 1, 1);
-    if (pb) p_glDeleteBuffers(1, &pb);
-    if (!ok) return 0;
-    graph_mark_device(dst);
-    return 1;
-}
-
-int opengl_graph_rmsnorm_f32(const float* in, const float* weight, float* out,
-                             int rows, int d_model, float eps) {
-    if (rows <= 0 || d_model <= 0 || !in || !weight || !out) return 0;
-    size_t bytes = (size_t)rows * d_model * sizeof(float);
-    size_t wbytes = (size_t)d_model * sizeof(float);
-    OglTensorSlot* src = graph_ensure_device(in, bytes, 0);
-    OglTensorSlot* w = graph_ensure_device(weight, wbytes, 1);
-    OglTensorSlot* dst = graph_output_slot(out, bytes);
-    if (!src || !w || !dst) return 0;
-    struct { uint32_t rows; uint32_t d_model; float eps; } params = {(uint32_t)rows, (uint32_t)d_model, eps};
-    GLuint pb = params_buffer(&params, sizeof(params));
-    GLuint bufs[4] = {src->buffer, w->buffer, dst->buffer, pb};
-    int ok = dispatch_kernel(&k_rmsnorm, bufs, ((uint32_t)rows + 63u) / 64u, 1, 1);
-    if (pb) p_glDeleteBuffers(1, &pb);
-    if (!ok) return 0;
-    graph_mark_device(dst);
-    return 1;
-}
-
-static int opengl_graph_softmax_like_f32(const OglKernel* k, const float* in,
-                                         float* out, int rows, int d) {
-    if (rows <= 0 || d <= 0 || !in || !out) return 0;
-    size_t bytes = (size_t)rows * d * sizeof(float);
-    OglTensorSlot* src = graph_ensure_device(in, bytes, 0);
-    OglTensorSlot* dst = graph_output_slot(out, bytes);
-    if (!src || !dst) return 0;
-    uint32_t params[2] = {(uint32_t)rows, (uint32_t)d};
-    GLuint pb = params_buffer(params, sizeof(params));
-    GLuint bufs[3] = {src->buffer, dst->buffer, pb};
-    int ok = dispatch_kernel(k, bufs, ((uint32_t)rows + 63u) / 64u, 1, 1);
-    if (pb) p_glDeleteBuffers(1, &pb);
-    if (!ok) return 0;
-    graph_mark_device(dst);
-    return 1;
-}
-
-int opengl_graph_softmax_f32(const float* in, float* out, int rows, int d) {
-    return opengl_graph_softmax_like_f32(&k_softmax, in, out, rows, d);
-}
-
-int opengl_graph_logsoftmax_f32(const float* in, float* out, int rows, int d) {
-    return opengl_graph_softmax_like_f32(&k_logsoftmax, in, out, rows, d);
-}
-
-int opengl_graph_reduce_f32(const float* in, float* out, int rows, int d, float inv) {
-    if (rows <= 0 || d <= 0 || !in || !out) return 0;
-    size_t in_bytes = (size_t)rows * d * sizeof(float);
-    size_t out_bytes = (size_t)rows * sizeof(float);
-    OglTensorSlot* src = graph_ensure_device(in, in_bytes, 0);
-    OglTensorSlot* dst = graph_output_slot(out, out_bytes);
-    if (!src || !dst) return 0;
-    struct { uint32_t rows; uint32_t d; float inv; } params = {(uint32_t)rows, (uint32_t)d, inv};
-    GLuint pb = params_buffer(&params, sizeof(params));
-    GLuint bufs[3] = {src->buffer, dst->buffer, pb};
-    int ok = dispatch_kernel(&k_reduce, bufs, ((uint32_t)rows + 63u) / 64u, 1, 1);
-    if (pb) p_glDeleteBuffers(1, &pb);
-    if (!ok) return 0;
-    graph_mark_device(dst);
-    return 1;
-}
-
-int opengl_graph_global_average_pool_f32(const float* in, float* out, int n, int h, int w, int c) {
-    if (n <= 0 || h <= 0 || w <= 0 || c <= 0 || !in || !out) return 0;
-    size_t in_bytes = (size_t)n * h * w * c * sizeof(float);
-    size_t out_bytes = (size_t)n * c * sizeof(float);
-    OglTensorSlot* src = graph_ensure_device(in, in_bytes, 0);
-    OglTensorSlot* dst = graph_output_slot(out, out_bytes);
-    if (!src || !dst) return 0;
-    uint32_t params[4] = {(uint32_t)n, (uint32_t)h, (uint32_t)w, (uint32_t)c};
-    GLuint pb = params_buffer(params, sizeof(params));
-    GLuint bufs[3] = {src->buffer, dst->buffer, pb};
-    int ok = dispatch_kernel(&k_globalavg, bufs, ((uint32_t)c + 63u) / 64u, (uint32_t)n, 1);
-    if (pb) p_glDeleteBuffers(1, &pb);
-    if (!ok) return 0;
-    graph_mark_device(dst);
-    return 1;
-}
-
-int opengl_graph_average_pool2d_f32(const float* in, float* out, int n, int h, int w, int c,
-                                    int out_h, int out_w, int ky, int kx, int sy, int sx,
-                                    int py, int px) {
-    if (n <= 0 || h <= 0 || w <= 0 || c <= 0 || out_h <= 0 || out_w <= 0 ||
-        ky <= 0 || kx <= 0 || sy <= 0 || sx <= 0 || !in || !out) return 0;
-    size_t in_bytes = (size_t)n * h * w * c * sizeof(float);
-    size_t out_bytes = (size_t)n * out_h * out_w * c * sizeof(float);
-    OglTensorSlot* src = graph_ensure_device(in, in_bytes, 0);
-    OglTensorSlot* dst = graph_output_slot(out, out_bytes);
-    if (!src || !dst) return 0;
-    uint32_t params[12] = {(uint32_t)n, (uint32_t)h, (uint32_t)w, (uint32_t)c,
-                           (uint32_t)out_h, (uint32_t)out_w, (uint32_t)ky, (uint32_t)kx,
-                           (uint32_t)sy, (uint32_t)sx, (uint32_t)py, (uint32_t)px};
-    GLuint pb = params_buffer(params, sizeof(params));
-    GLuint bufs[3] = {src->buffer, dst->buffer, pb};
-    int ok = dispatch_kernel(&k_avgpool, bufs, ((uint32_t)out_w + 7u) / 8u,
-                             ((uint32_t)out_h + 7u) / 8u, (uint32_t)(n * c));
-    if (pb) p_glDeleteBuffers(1, &pb);
-    if (!ok) return 0;
-    graph_mark_device(dst);
-    return 1;
-}
-
-int opengl_graph_batchnorm2d_f32(const float* in, const float* weight, const float* bias,
-                                 const float* mean, const float* var, float* out,
-                                 int n, int h, int w, int c, float eps) {
-    if (n <= 0 || h <= 0 || w <= 0 || c <= 0 || !in || !weight || !bias || !mean || !var || !out) return 0;
-    size_t bytes = (size_t)n * h * w * c * sizeof(float);
-    size_t cbytes = (size_t)c * sizeof(float);
-    OglTensorSlot* src = graph_ensure_device(in, bytes, 0);
-    OglTensorSlot* sw = graph_ensure_device(weight, cbytes, 1);
-    OglTensorSlot* sb = graph_ensure_device(bias, cbytes, 1);
-    OglTensorSlot* sm = graph_ensure_device(mean, cbytes, 1);
-    OglTensorSlot* sv = graph_ensure_device(var, cbytes, 1);
-    OglTensorSlot* dst = graph_output_slot(out, bytes);
-    if (!src || !sw || !sb || !sm || !sv || !dst) return 0;
-    struct { uint32_t n; uint32_t c; uint32_t h; uint32_t w; float eps; uint32_t pad[3]; } params =
-        {(uint32_t)n, (uint32_t)c, (uint32_t)h, (uint32_t)w, eps, {0, 0, 0}};
-    GLuint pb = params_buffer(&params, sizeof(params));
-    GLuint bufs[7] = {src->buffer, sw->buffer, sb->buffer, sm->buffer, sv->buffer, dst->buffer, pb};
-    int ok = dispatch_kernel(&k_batchnorm, bufs, ((uint32_t)(n * h * w * c) + 63u) / 64u, 1, 1);
-    if (pb) p_glDeleteBuffers(1, &pb);
-    if (!ok) return 0;
-    graph_mark_device(dst);
-    return 1;
-}
-
-int opengl_graph_groupnorm_f32(const float* in, const float* weight, const float* bias,
-                               float* out, int n, int h, int w, int c, int groups,
-                               float eps) {
-    if (n <= 0 || h <= 0 || w <= 0 || c <= 0 || groups <= 0 || c % groups ||
-        !in || !weight || !bias || !out || !(eps > 0.0f)) return 0;
-    size_t bytes = (size_t)n * h * w * c * sizeof(float);
-    size_t cbytes = (size_t)c * sizeof(float);
-    OglTensorSlot* src = graph_ensure_device(in, bytes, 0);
-    OglTensorSlot* sw = graph_ensure_device(weight, cbytes, 1);
-    OglTensorSlot* sb = graph_ensure_device(bias, cbytes, 1);
-    OglTensorSlot* dst = graph_output_slot(out, bytes);
-    if (!src || !sw || !sb || !dst) return 0;
-    struct {
-        uint32_t n, h, w, c, groups, has_bias;
-        float eps;
-        uint32_t pad;
-    } params = {(uint32_t)n, (uint32_t)h, (uint32_t)w, (uint32_t)c,
-                (uint32_t)groups, 1u, eps, 0u};
-    GLuint pb = params_buffer(&params, sizeof(params));
-    GLuint bufs[5] = {src->buffer, sw->buffer, sb->buffer, dst->buffer, pb};
-    uint32_t total_groups = (uint32_t)n * (uint32_t)groups;
-    int ok = dispatch_kernel(&k_groupnorm, bufs, (total_groups + 63u) / 64u, 1, 1);
-    if (pb) p_glDeleteBuffers(1, &pb);
-    if (!ok) return 0;
-    graph_mark_device(dst);
-    return 1;
-}
-
-#if VOLVOXAI_ENABLE_TRAINING
-int opengl_graph_dropout_f32(const float* in, float* out, long n, uint32_t threshold,
-                             uint32_t seed, uint32_t counter, float scale) {
-    if (n <= 0 || (uint64_t)n > UINT32_MAX || !in || !out || !(scale >= 1.0f)) return 0;
-    size_t bytes = (size_t)n * sizeof(float);
-    OglTensorSlot* src = graph_ensure_device(in, bytes, 0);
-    OglTensorSlot* dst = graph_output_slot(out, bytes);
-    if (!src || !dst) return 0;
-    struct {
-        uint32_t length, threshold, seed, counter;
-        float scale;
-        uint32_t pad[3];
-    } params = {(uint32_t)n, threshold, seed, counter, scale, {0u, 0u, 0u}};
-    GLuint pb = params_buffer(&params, sizeof(params));
-    GLuint bufs[3] = {src->buffer, dst->buffer, pb};
-    int ok = dispatch_kernel(&k_dropout, bufs, ((uint32_t)n + 63u) / 64u, 1, 1);
-    if (pb) p_glDeleteBuffers(1, &pb);
-    if (!ok) return 0;
-    graph_mark_device(dst);
-    return 1;
-}
-#endif
-
-/* Routed expert linear. `experts` counts staged rows; route indices stay in
- * global slot space and are mapped through slot_rows when slot_domain != 0. */
-int opengl_graph_moe_linear_f32(const float* input, const float* expert_weight,
-                                const float* expert_bias, const float* route_indices,
-                                const float* route_weights, float* out, int rows,
-                                int d_in, int d_out, int experts, int top_k,
-                                const uint32_t* slot_rows, uint32_t slot_domain) {
-    if (rows <= 0 || d_in <= 0 || d_out <= 0 || experts <= 0 || top_k <= 0 ||
-        !input || !expert_weight || !route_indices || !route_weights || !out) return 0;
-    if (slot_rows ? (slot_domain < (uint32_t)experts ||
-                     (uint32_t)top_k > slot_domain)
-                  : top_k > experts) return 0;
-    size_t in_bytes = (size_t)rows * (size_t)d_in * sizeof(float);
-    size_t w_bytes = (size_t)experts * (size_t)d_in * (size_t)d_out * sizeof(float);
-    size_t bias_bytes = (size_t)experts * (size_t)d_out * sizeof(float);
-    size_t route_bytes = (size_t)rows * (size_t)top_k * sizeof(float);
-    size_t out_bytes = (size_t)rows * (size_t)d_out * sizeof(float);
-    uint32_t slot_extent = slot_domain ? slot_domain : 1u;
-    OglTensorSlot* si = graph_ensure_device(input, in_bytes, 0);
-    OglTensorSlot* sw = graph_ensure_device(expert_weight, w_bytes, 1);
-    OglTensorSlot* sri = graph_ensure_device(route_indices, route_bytes, 0);
-    OglTensorSlot* srw = graph_ensure_device(route_weights, route_bytes, 0);
-    OglTensorSlot* so = graph_output_slot(out, out_bytes);
-    OglTensorSlot* sb = expert_bias
-        ? graph_ensure_device(expert_bias, bias_bytes, 1) : NULL;
-    if (!si || !sw || !sri || !srw || !so || (expert_bias && !sb)) return 0;
-    /* The shader always declares a bias and a slot table; absent ones become
-     * zero-filled transients so the binding set stays complete. */
-    GLuint bias_dummy = 0;
-    if (!expert_bias) {
-        float* zeros = (float*)calloc((size_t)experts * (size_t)d_out, sizeof(float));
-        if (!zeros) return 0;
-        bias_dummy = create_buffer_target(GL_SHADER_STORAGE_BUFFER, bias_bytes, zeros);
-        free(zeros);
-        if (!bias_dummy) return 0;
-    }
-    uint32_t* table = (uint32_t*)calloc(slot_extent, sizeof(uint32_t));
-    if (!table) {
-        if (bias_dummy) p_glDeleteBuffers(1, &bias_dummy);
-        return 0;
-    }
-    if (slot_domain) memcpy(table, slot_rows, (size_t)slot_domain * sizeof(uint32_t));
-    GLuint slot_buffer = create_buffer_target(
-        GL_SHADER_STORAGE_BUFFER, (size_t)slot_extent * sizeof(uint32_t), table);
-    free(table);
-    if (!slot_buffer) {
-        if (bias_dummy) p_glDeleteBuffers(1, &bias_dummy);
-        return 0;
-    }
-    uint32_t params[8] = {
-        (uint32_t)rows, (uint32_t)d_in, (uint32_t)d_out, (uint32_t)experts,
-        (uint32_t)top_k, expert_bias ? 1u : 0u, slot_domain, 0u,
-    };
-    GLuint pb = params_buffer(params, sizeof(params));
-    GLuint bufs[8] = {
-        si->buffer, sw->buffer, expert_bias ? sb->buffer : bias_dummy,
-        sri->buffer, srw->buffer, so->buffer, pb, slot_buffer,
-    };
-    int ok = dispatch_kernel(&k_moe_linear, bufs,
-                             ((uint32_t)d_out + 63u) / 64u, (uint32_t)rows, 1);
-    if (pb) p_glDeleteBuffers(1, &pb);
-    if (bias_dummy) p_glDeleteBuffers(1, &bias_dummy);
-    p_glDeleteBuffers(1, &slot_buffer);
-    if (!ok) return 0;
-    graph_mark_device(so);
-    return 1;
-}
-
-/* Top-k expert routing. The router weight is [d_model, experts], so its expert
- * axis is 1 and it is never a slot-indexed bank. */
-int opengl_graph_moe_router_f32(const float* input, const float* weight,
-                                const float* bias, float* route_indices,
-                                float* route_weights, int rows, int d_model,
-                                int experts, int top_k, float temperature,
-                                int normalize) {
-    if (rows <= 0 || d_model <= 0 || experts <= 0 || top_k <= 0 ||
-        top_k > experts || top_k > 8 || !(temperature > 0.0f) ||
-        !input || !weight || !route_indices || !route_weights) return 0;
-    size_t in_bytes = (size_t)rows * (size_t)d_model * sizeof(float);
-    size_t w_bytes = (size_t)d_model * (size_t)experts * sizeof(float);
-    size_t bias_bytes = (size_t)experts * sizeof(float);
-    size_t route_bytes = (size_t)rows * (size_t)top_k * sizeof(float);
-    OglTensorSlot* si = graph_ensure_device(input, in_bytes, 0);
-    OglTensorSlot* sw = graph_ensure_device(weight, w_bytes, 1);
-    OglTensorSlot* sidx = graph_output_slot(route_indices, route_bytes);
-    OglTensorSlot* srw = graph_output_slot(route_weights, route_bytes);
-    OglTensorSlot* sb = bias ? graph_ensure_device(bias, bias_bytes, 1) : NULL;
-    if (!si || !sw || !sidx || !srw || (bias && !sb)) return 0;
-    GLuint bias_dummy = 0;
-    if (!bias) {
-        float* zeros = (float*)calloc((size_t)experts, sizeof(float));
-        if (!zeros) return 0;
-        bias_dummy = create_buffer_target(GL_SHADER_STORAGE_BUFFER, bias_bytes, zeros);
-        free(zeros);
-        if (!bias_dummy) return 0;
-    }
-    uint32_t params[8];
-    params[0] = (uint32_t)rows;
-    params[1] = (uint32_t)d_model;
-    params[2] = (uint32_t)experts;
-    params[3] = (uint32_t)top_k;
-    params[4] = normalize ? 1u : 0u;
-    params[5] = bias ? 1u : 0u;
-    memcpy(&params[6], &temperature, sizeof(float));
-    params[7] = 0u;
-    GLuint pb = params_buffer(params, sizeof(params));
-    GLuint bufs[6] = {
-        si->buffer, sw->buffer, bias ? sb->buffer : bias_dummy,
-        sidx->buffer, srw->buffer, pb,
-    };
-    int ok = dispatch_kernel(&k_moe_router, bufs, ((uint32_t)rows + 63u) / 64u, 1, 1);
-    if (pb) p_glDeleteBuffers(1, &pb);
-    if (bias_dummy) p_glDeleteBuffers(1, &bias_dummy);
-    if (!ok) return 0;
-    graph_mark_device(sidx);
-    graph_mark_device(srw);
-    return 1;
-}
-
-int opengl_graph_embedding_f32(const int32_t* tokens, const float* weight, float* out,
-                               int tokens_len, int d_model, int vocab_size) {
-    if (tokens_len <= 0 || d_model <= 0 || vocab_size <= 0 || !tokens || !weight || !out) return 0;
-    size_t tbytes = (size_t)tokens_len * sizeof(int32_t);
-    size_t wbytes = (size_t)vocab_size * d_model * sizeof(float);
-    size_t obytes = (size_t)tokens_len * d_model * sizeof(float);
-    OglTensorSlot* st = graph_ensure_device(tokens, tbytes, 0);
-    OglTensorSlot* sw = graph_ensure_device(weight, wbytes, 1);
-    OglTensorSlot* so = graph_output_slot(out, obytes);
-    if (!st || !sw || !so) return 0;
-    uint32_t params[4] = {(uint32_t)tokens_len, (uint32_t)d_model,
-                          (uint32_t)vocab_size, 0u};
-    GLuint pb = params_buffer(params, sizeof(params));
-    GLuint bufs[4] = {st->buffer, sw->buffer, so->buffer, pb};
-    int ok = dispatch_kernel(&k_embedding, bufs, ((uint32_t)tokens_len + 63u) / 64u, 1, 1);
-    if (pb) p_glDeleteBuffers(1, &pb);
-    if (!ok) return 0;
-    graph_mark_device(so);
-    return 1;
-}
-
-int opengl_graph_transpose_f32(const float* in, float* out, const int* in_shape,
-                               const int* perm, int rank) {
-    if (rank <= 0 || rank > 8 || !in || !out || !in_shape || !perm) return 0;
-    uint32_t in_stride[8] = {0}, out_shape[8] = {0}, out_stride[8] = {0};
-    long total = 1;
-    for (int i = 0; i < rank; i++) {
-        if (in_shape[i] <= 0 || perm[i] < 0 || perm[i] >= rank) return 0;
-        out_shape[i] = (uint32_t)in_shape[perm[i]];
-        total *= out_shape[i];
-    }
-    in_stride[rank - 1] = 1;
-    out_stride[rank - 1] = 1;
-    for (int i = rank - 2; i >= 0; i--) {
-        in_stride[i] = in_stride[i + 1] * (uint32_t)in_shape[i + 1];
-        out_stride[i] = out_stride[i + 1] * out_shape[i + 1];
-    }
-    size_t bytes = (size_t)total * sizeof(float);
-    OglTensorSlot* src = graph_ensure_device(in, bytes, 0);
-    OglTensorSlot* dst = graph_output_slot(out, bytes);
-    if (!src || !dst) return 0;
-    uint32_t meta[2 + 16] = {0};
-    meta[0] = (uint32_t)total;
-    meta[1] = (uint32_t)rank;
-    for (int d = 0; d < rank; d++) {
-        meta[2 + d] = out_stride[d];
-        meta[2 + rank + d] = in_stride[perm[d]];
-    }
-    size_t mbytes = (size_t)(2 + 2 * rank) * sizeof(uint32_t);
-    GLuint mb = create_buffer(mbytes, meta);
-    GLuint bufs[3] = {src->buffer, dst->buffer, mb};
-    int ok = dispatch_kernel(&k_transpose, bufs, ((uint32_t)total + 63u) / 64u, 1, 1);
-    if (mb) p_glDeleteBuffers(1, &mb);
-    if (!ok) return 0;
-    graph_mark_device(dst);
-    return 1;
-}
-
-int opengl_graph_where_f32(const float* cond, const float* a, const float* b, float* out, long n) {
-    if (n <= 0 || !cond || !a || !b || !out) return 0;
-    size_t bytes = (size_t)n * sizeof(float);
-    OglTensorSlot* sc = graph_ensure_device(cond, bytes, 0);
-    OglTensorSlot* sa = graph_ensure_device(a, bytes, 0);
-    OglTensorSlot* sb = graph_ensure_device(b, bytes, 0);
-    OglTensorSlot* so = graph_output_slot(out, bytes);
-    if (!sc || !sa || !sb || !so) return 0;
-    uint32_t params[1] = {(uint32_t)n};
-    GLuint pb = params_buffer(params, sizeof(params));
-    GLuint bufs[5] = {sc->buffer, sa->buffer, sb->buffer, so->buffer, pb};
-    int ok = dispatch_kernel(&k_where, bufs, ((uint32_t)n + 63u) / 64u, 1, 1);
-    if (pb) p_glDeleteBuffers(1, &pb);
-    if (!ok) return 0;
-    graph_mark_device(so);
-    return 1;
-}
-
-int opengl_graph_where_32(
-        const int32_t* condition, const void* a,
-        const void* b, void* output, long elements) {
-    uint32_t count;
-    size_t bytes;
-    if (!vx_typed_control_where_plan(
-            condition, a, b, output, elements, &count, &bytes))
-        return 0;
-    OglTensorSlot* condition_slot =
-        graph_ensure_device(condition, bytes, 0);
-    OglTensorSlot* a_slot = graph_ensure_device(a, bytes, 0);
-    OglTensorSlot* b_slot = graph_ensure_device(b, bytes, 0);
-    OglTensorSlot* output_slot =
-        graph_output_slot(output, bytes);
-    if (!condition_slot || !a_slot || !b_slot || !output_slot) return 0;
-    uint32_t params[4] = {count, 0u, 0u, 0u};
-    GLuint params_handle = params_buffer(params, sizeof(params));
-    if (!params_handle) return 0;
-    GLuint buffers[5] = {
-        condition_slot->buffer, a_slot->buffer, b_slot->buffer,
-        output_slot->buffer, params_handle,
-    };
-    int ok = dispatch_kernel(
-        &k_where_32, buffers, (count + 63u) / 64u, 1u, 1u);
-    p_glDeleteBuffers(1, &params_handle);
-    if (!ok) return 0;
-    graph_mark_device(output_slot);
-    return 1;
-}
-
-int opengl_graph_argmax_f32(
-        const float* input, int32_t* output,
-        uint32_t outer, uint32_t axis_size, uint32_t inner) {
-    uint32_t input_elements;
-    uint32_t output_elements;
-    size_t input_bytes;
-    size_t output_bytes;
-    if (!vx_typed_control_argmax_plan(
-            input, output, outer, axis_size, inner,
-            &input_elements, &output_elements,
-            &input_bytes, &output_bytes))
-        return 0;
-    OglTensorSlot* input_slot =
-        graph_ensure_device(input, input_bytes, 0);
-    OglTensorSlot* output_slot =
-        graph_output_slot(output, output_bytes);
-    if (!input_slot || !output_slot) return 0;
-    uint32_t params[4] = {outer, axis_size, inner, 0u};
-    GLuint params_handle = params_buffer(params, sizeof(params));
-    if (!params_handle) return 0;
-    GLuint buffers[3] = {
-        input_slot->buffer, output_slot->buffer, params_handle,
-    };
-    int ok = dispatch_kernel(
-        &k_argmax_f32_i32, buffers,
-        (output_elements + 63u) / 64u, 1u, 1u);
-    p_glDeleteBuffers(1, &params_handle);
-    if (!ok) return 0;
-    graph_mark_device(output_slot);
-    (void)input_elements;
-    return 1;
-}
-
-int opengl_graph_upsample2x_f32(const float* in, float* out, int n, int h, int w, int c) {
-    if (n <= 0 || c <= 0 || h <= 0 || w <= 0 || !in || !out) return 0;
-    size_t in_bytes = (size_t)n * h * w * c * sizeof(float);
-    size_t out_bytes = (size_t)n * h * 2 * w * 2 * c * sizeof(float);
-    OglTensorSlot* src = graph_ensure_device(in, in_bytes, 0);
-    OglTensorSlot* dst = graph_output_slot(out, out_bytes);
-    if (!src || !dst) return 0;
-    uint32_t params[4] = {(uint32_t)n, (uint32_t)h, (uint32_t)w, (uint32_t)c};
-    GLuint pb = params_buffer(params, sizeof(params));
-    GLuint bufs[3] = {src->buffer, dst->buffer, pb};
-    int ok = dispatch_kernel(&k_upsample, bufs, ((uint32_t)(w * 2) + 7u) / 8u,
-                             ((uint32_t)(h * 2) + 7u) / 8u, (uint32_t)(n * c));
-    if (pb) p_glDeleteBuffers(1, &pb);
-    if (!ok) return 0;
-    graph_mark_device(dst);
-    return 1;
-}
-
-int opengl_graph_resize_nearest_f32(const float* in, float* out, int n, int h, int w, int c,
-                                    int out_h, int out_w) {
-    return opengl_graph_resize_f32(in, out, n, h, w, c, out_h, out_w, 0);
-}
-
-int opengl_graph_resize_f32(const float* in, float* out, int n, int h, int w, int c,
-                            int out_h, int out_w, int mode) {
-    if (n <= 0 || c <= 0 || h <= 0 || w <= 0 || out_h <= 0 || out_w <= 0 || !in || !out ||
-        (uint64_t)(uint32_t)n * (uint32_t)c > UINT32_MAX) return 0;
-    size_t in_bytes = (size_t)n * h * w * c * sizeof(float);
-    size_t out_bytes = (size_t)n * out_h * out_w * c * sizeof(float);
-    OglTensorSlot* src = graph_ensure_device(in, in_bytes, 0);
-    OglTensorSlot* dst = graph_output_slot(out, out_bytes);
-    if (!src || !dst) return 0;
-    uint32_t params[8] = {(uint32_t)n, (uint32_t)h, (uint32_t)w, (uint32_t)c,
-                          (uint32_t)out_h, (uint32_t)out_w, (uint32_t)mode, 0u};
-    GLuint pb = params_buffer(params, sizeof(params));
-    GLuint bufs[3] = {src->buffer, dst->buffer, pb};
-    int ok = dispatch_kernel(&k_resize, bufs, ((uint32_t)out_w + 7u) / 8u,
-                             ((uint32_t)out_h + 7u) / 8u, (uint32_t)(n * c));
-    if (pb) p_glDeleteBuffers(1, &pb);
-    if (!ok) return 0;
-    graph_mark_device(dst);
-    return 1;
-}
-
-static void pad4_shape(const int* shape, int rank, uint32_t out[4]) {
-    for (int i = 0; i < 4; i++) out[i] = 1u;
-    if (!shape || rank <= 0) return;
-    int base = 4 - rank;
-    if (base < 0) base = 0;
-    for (int i = 0; i < rank && i < 4; i++) out[base + i] = (uint32_t)shape[i];
-}
-
-int opengl_graph_expand_f32(const float* in, float* out, const int* in_shape, int in_rank,
-                            const int* out_shape, int out_rank) {
-    VxExpandF32Plan plan;
-    if (!vx_expand_f32_plan(
-            in, out, in_shape, in_rank, out_shape, out_rank, &plan))
-        return 0;
-    OglTensorSlot* src = graph_ensure_device(in, plan.input_bytes, 0);
-    OglTensorSlot* dst = graph_output_slot(out, plan.output_bytes);
-    if (!src || !dst) return 0;
-    GLuint pb = params_buffer(plan.params, sizeof(plan.params));
-    if (!pb) return 0;
-    GLuint bufs[3] = {src->buffer, dst->buffer, pb};
-    int ok = dispatch_kernel(
-        &k_expand, bufs, (plan.output_elements + 63u) / 64u, 1u, 1u);
-    p_glDeleteBuffers(1, &pb);
-    if (!ok) return 0;
-    graph_mark_device(dst);
-    return 1;
-}
-
-int opengl_graph_expand_32(const void* in, void* out, const int* in_shape,
-                           int in_rank, const int* out_shape, int out_rank) {
-    /* expand.wgsl is word-typed and therefore preserves every I32 bit. */
-    return opengl_graph_expand_f32(
-        (const float*)in, (float*)out,
-        in_shape, in_rank, out_shape, out_rank);
-}
-
-int opengl_graph_batch_matmul_f32(
-        const float* a, const int* a_shape, int a_rank,
-        const float* b, const int* b_shape, int b_rank,
-        float* output, const int* output_shape, int output_rank) {
-    VxBatchMatMulF32Plan plan;
-    size_t metadata_bytes;
-    if (!vx_batch_matmul_f32_plan(
-            a, a_shape, a_rank, b, b_shape, b_rank,
-            output, output_shape, output_rank, &plan))
-        return 0;
-    metadata_bytes = (size_t)plan.metadata_words * sizeof(uint32_t);
-    OglTensorSlot* a_slot = graph_ensure_device(a, plan.a_bytes, 0);
-    OglTensorSlot* b_slot = graph_ensure_device(b, plan.b_bytes, 0);
-    OglTensorSlot* output_slot =
-        graph_output_slot(output, plan.output_bytes);
-    GLuint metadata_buffer = create_buffer(metadata_bytes, plan.metadata);
-    if (!a_slot || !b_slot || !output_slot || !metadata_buffer) {
-        if (metadata_buffer) p_glDeleteBuffers(1, &metadata_buffer);
-        return 0;
-    }
-    GLuint buffers[4] = {
-        a_slot->buffer, b_slot->buffer, output_slot->buffer, metadata_buffer,
-    };
-    int ok = dispatch_kernel(
-        &k_batch_matmul, buffers,
-        (plan.n + 7u) / 8u, (plan.m + 7u) / 8u,
-        plan.output_batches);
-    p_glDeleteBuffers(1, &metadata_buffer);
-    if (!ok) return 0;
-    graph_mark_device(output_slot);
-    return 1;
-}
-
-int opengl_graph_gather_i32_f32(const float* input, const int32_t* indices,
-                                float* output, int outer, int axis_size,
-                                int inner, int indices_elements,
-                                int output_elements) {
-    uint64_t input_count;
-    uint64_t expected_output;
-    size_t input_bytes;
-    size_t index_bytes;
-    size_t output_bytes;
-    if (!input || !indices || !output || outer <= 0 || axis_size <= 0 ||
-        inner <= 0 || indices_elements <= 0 || output_elements <= 0) return 0;
-    input_count = (uint64_t)(uint32_t)outer * (uint32_t)axis_size *
-        (uint32_t)inner;
-    expected_output = (uint64_t)(uint32_t)outer * (uint32_t)indices_elements *
-        (uint32_t)inner;
-    if (input_count > SIZE_MAX / sizeof(float) ||
-        expected_output != (uint32_t)output_elements ||
-        expected_output > SIZE_MAX / sizeof(float)) return 0;
-    input_bytes = (size_t)input_count * sizeof(float);
-    index_bytes = (size_t)(uint32_t)indices_elements * sizeof(int32_t);
-    if (index_bytes / sizeof(int32_t) !=
-        (size_t)(uint32_t)indices_elements) return 0;
-    output_bytes = (size_t)expected_output * sizeof(float);
-    OglTensorSlot* src = graph_ensure_device(input, input_bytes, 0);
-    OglTensorSlot* idx = graph_ensure_device(indices, index_bytes, 0);
-    OglTensorSlot* dst = graph_output_slot(output, output_bytes);
-    if (!src || !idx || !dst) return 0;
-    uint32_t params[5] = {
-        (uint32_t)outer, (uint32_t)axis_size, (uint32_t)inner,
-        (uint32_t)indices_elements, (uint32_t)output_elements,
-    };
-    GLuint pb = params_buffer(params, sizeof(params));
-    GLuint bufs[4] = {src->buffer, idx->buffer, dst->buffer, pb};
-    int ok = dispatch_kernel(&k_gather, bufs,
-                             ((uint32_t)output_elements + 63u) / 64u, 1, 1);
-    if (pb) p_glDeleteBuffers(1, &pb);
-    if (!ok) return 0;
-    graph_mark_device(dst);
-    return 1;
-}
-
-int opengl_graph_pad4d_f32(const float* in, float* out, const int* in_shape, int in_rank,
-                           const int* out_shape, int out_rank, int pad_top, int pad_left, float value) {
-    if (!in || !out || !in_shape || !out_shape || in_rank <= 0 || out_rank <= 0 || in_rank > 4 || out_rank > 4) return 0;
-    uint32_t is[4], os[4];
-    pad4_shape(in_shape, in_rank, is);
-    pad4_shape(out_shape, out_rank, os);
-    size_t in_elems = (size_t)is[0] * is[1] * is[2] * is[3];
-    size_t out_elems = (size_t)os[0] * os[1] * os[2] * os[3];
-    OglTensorSlot* src = graph_ensure_device(in, in_elems * sizeof(float), 0);
-    OglTensorSlot* dst = graph_output_slot(out, out_elems * sizeof(float));
-    if (!src || !dst) return 0;
-    struct {
-        uint32_t b, in_h, in_w, c, out_h, out_w, pt, pl;
-        float val;
-        uint32_t pad[3];
-    } params = {is[0], is[1], is[2], is[3], os[1], os[2], (uint32_t)pad_top, (uint32_t)pad_left, value, {0, 0, 0}};
-    GLuint pb = params_buffer(&params, sizeof(params));
-    GLuint bufs[3] = {src->buffer, dst->buffer, pb};
-    int ok = dispatch_kernel(&k_pad, bufs, ((uint32_t)out_elems + 63u) / 64u, 1, 1);
-    if (pb) p_glDeleteBuffers(1, &pb);
-    if (!ok) return 0;
-    graph_mark_device(dst);
-    return 1;
-}
-
-int opengl_graph_slice4d_f32(const float* in, float* out, const int* in_shape, int in_rank,
-                             const int* out_shape, int out_rank, const int* starts,
-                             const int* steps) {
-    if (!in || !out || !in_shape || !out_shape || !starts || !steps ||
-        in_rank <= 0 || out_rank <= 0 || in_rank > 4 || out_rank > 4) return 0;
-    uint32_t is[4], os[4];
-    pad4_shape(in_shape, in_rank, is);
-    pad4_shape(out_shape, out_rank, os);
-    size_t in_elems = (size_t)is[0] * is[1] * is[2] * is[3];
-    size_t out_elems = (size_t)os[0] * os[1] * os[2] * os[3];
-    OglTensorSlot* src = graph_ensure_device(in, in_elems * sizeof(float), 0);
-    OglTensorSlot* dst = graph_output_slot(out, out_elems * sizeof(float));
-    if (!src || !dst) return 0;
-    uint32_t params[16] = {
-        os[0], os[1], os[2], os[3], is[1], is[2], is[3],
-        (uint32_t)starts[0], (uint32_t)starts[1], (uint32_t)starts[2], (uint32_t)starts[3],
-        (uint32_t)steps[0], (uint32_t)steps[1], (uint32_t)steps[2], (uint32_t)steps[3],
-        (uint32_t)out_elems
-    };
-    GLuint pb = params_buffer(params, sizeof(params));
-    GLuint bufs[3] = {src->buffer, dst->buffer, pb};
-    int ok = dispatch_kernel(&k_slice, bufs, ((uint32_t)out_elems + 63u) / 64u, 1, 1);
-    if (pb) p_glDeleteBuffers(1, &pb);
-    if (!ok) return 0;
-    graph_mark_device(dst);
-    return 1;
-}
-
-int opengl_graph_conv_transpose2d_f32(const float* in, const float* weight, const float* bias,
-                                      float* out, int n, int in_h, int in_w, int in_c,
-                                      int out_h, int out_w, int out_c, int kh, int kw,
-                                      int sh, int sw, int ph, int pw) {
-    if (n <= 0 || in_h <= 0 || in_w <= 0 || in_c <= 0 || out_h <= 0 || out_w <= 0 ||
-        out_c <= 0 || kh <= 0 || kw <= 0 || sh <= 0 || sw <= 0 || !in || !weight || !out) return 0;
-    size_t in_bytes = (size_t)n * in_h * in_w * in_c * sizeof(float);
-    size_t wbytes = (size_t)in_c * out_c * kh * kw * sizeof(float);
-    size_t bbytes = (size_t)out_c * sizeof(float);
-    size_t out_bytes = (size_t)n * out_h * out_w * out_c * sizeof(float);
-    OglTensorSlot* src = graph_ensure_device(in, in_bytes, 0);
-    OglTensorSlot* swt = graph_ensure_device(weight, wbytes, 1);
-    static const float zero_bias[1] = {0.0f};
-    OglTensorSlot* sb = graph_ensure_device(bias ? bias : zero_bias, bias ? bbytes : sizeof(float), 1);
-    OglTensorSlot* dst = graph_output_slot(out, out_bytes);
-    if (!src || !swt || !sb || !dst) return 0;
-    uint32_t params[16] = {(uint32_t)n, (uint32_t)in_h, (uint32_t)in_w, (uint32_t)in_c,
-                           (uint32_t)out_h, (uint32_t)out_w, (uint32_t)out_c,
-                           (uint32_t)kh, (uint32_t)kw, (uint32_t)sh, (uint32_t)sw,
-                           (uint32_t)ph, (uint32_t)pw, bias ? 1u : 0u, 0u, 0u};
-    GLuint pb = params_buffer(params, sizeof(params));
-    GLuint bufs[5] = {src->buffer, swt->buffer, sb->buffer, dst->buffer, pb};
-    int ok = dispatch_kernel(&k_convtranspose, bufs, ((uint32_t)out_w + 7u) / 8u,
-                             ((uint32_t)out_h + 7u) / 8u, (uint32_t)(n * out_c));
-    if (pb) p_glDeleteBuffers(1, &pb);
-    if (!ok) return 0;
-    graph_mark_device(dst);
-    return 1;
-}
-
-int opengl_graph_interp1d_f32(const float* in, float* out, int channels, int in_l, int out_l) {
-    if (channels <= 0 || in_l <= 0 || out_l <= 0 || !in || !out) return 0;
-    size_t in_bytes = (size_t)channels * in_l * sizeof(float);
-    size_t out_bytes = (size_t)channels * out_l * sizeof(float);
-    OglTensorSlot* src = graph_ensure_device(in, in_bytes, 0);
-    OglTensorSlot* dst = graph_output_slot(out, out_bytes);
-    if (!src || !dst) return 0;
-    uint32_t params[3] = {(uint32_t)channels, (uint32_t)in_l, (uint32_t)out_l};
-    GLuint pb = params_buffer(params, sizeof(params));
-    GLuint bufs[3] = {src->buffer, dst->buffer, pb};
-    int ok = dispatch_kernel(&k_interp1d, bufs, ((uint32_t)out_l + 63u) / 64u, (uint32_t)channels, 1);
-    if (pb) p_glDeleteBuffers(1, &pb);
-    if (!ok) return 0;
-    graph_mark_device(dst);
-    return 1;
-}
-
-int opengl_graph_binary_f32(const float* a, long a_numel, const float* b, long b_numel,
-                            float* out, long out_numel, const uint32_t* output_strides,
-                            const uint32_t* a_strides, const uint32_t* b_strides,
-                            int rank, int op) {
-    if (!a || !b || !out || !output_strides || !a_strides || !b_strides ||
-        a_numel <= 0 || b_numel <= 0 || out_numel <= 0 ||
-        (uint64_t)out_numel > UINT32_MAX || rank <= 0 || rank > 8 || op < 0 || op > 3)
-        return 0;
-    size_t a_bytes = (size_t)a_numel * sizeof(float);
-    size_t b_bytes = (size_t)b_numel * sizeof(float);
-    size_t out_bytes = (size_t)out_numel * sizeof(float);
-    OglTensorSlot* sa = graph_ensure_device(a, a_bytes, 0);
-    OglTensorSlot* sb = graph_ensure_device(b, b_bytes, 0);
-    OglTensorSlot* so = graph_output_slot(out, out_bytes);
-    if (!sa || !sb || !so) return 0;
-    uint32_t metadata[28] = {(uint32_t)out_numel, (uint32_t)rank, (uint32_t)op, 0u};
-    memcpy(metadata + 4, output_strides, 8 * sizeof(uint32_t));
-    memcpy(metadata + 12, a_strides, 8 * sizeof(uint32_t));
-    memcpy(metadata + 20, b_strides, 8 * sizeof(uint32_t));
-    GLuint pb = params_buffer(metadata, sizeof(metadata));
-    GLuint bufs[4] = {sa->buffer, sb->buffer, so->buffer, pb};
-    int ok = dispatch_kernel(&k_broadcast_binary, bufs, ((uint32_t)out_numel + 63u) / 64u, 1, 1);
-    if (pb) p_glDeleteBuffers(1, &pb);
-    if (!ok) return 0;
-    graph_mark_device(so);
-    return 1;
-}
-
-int opengl_graph_split_f32(const float* in, float* out, long input_numel, long output_numel,
-                           int inner, int split_size, int axis_in, int offset) {
-    if (!in || !out || input_numel <= 0 || output_numel <= 0 ||
-        inner <= 0 || split_size <= 0 || axis_in <= 0 || offset < 0 || offset + split_size > axis_in) return 0;
-    size_t in_bytes = (size_t)input_numel * sizeof(float);
-    size_t out_bytes = (size_t)output_numel * sizeof(float);
-    OglTensorSlot* src = graph_ensure_device(in, in_bytes, 0);
-    OglTensorSlot* dst = graph_output_slot(out, out_bytes);
-    if (!src || !dst) return 0;
-    uint32_t params[5] = {(uint32_t)output_numel, (uint32_t)inner, (uint32_t)split_size,
-                          (uint32_t)axis_in, (uint32_t)offset};
-    GLuint pb = params_buffer(params, sizeof(params));
-    GLuint bufs[3] = {src->buffer, dst->buffer, pb};
-    int ok = dispatch_kernel(&k_split, bufs, ((uint32_t)output_numel + 63u) / 64u, 1, 1);
-    if (pb) p_glDeleteBuffers(1, &pb);
-    if (!ok) return 0;
-    graph_mark_device(dst);
-    return 1;
-}
-
-int opengl_graph_conv1d_f32(const float* in, const float* weight, const float* bias, float* out,
-                            int batch, int in_c, int in_l, int out_c, int out_l, int kernel,
-                            int stride, int pad, int relu) {
-    if (!in || !weight || !out || batch <= 0 || in_c <= 0 || in_l <= 0 || out_c <= 0 || out_l <= 0 ||
-        kernel <= 0 || stride <= 0 || pad < 0 || relu < 0 || relu > 1) return 0;
-    int64_t padded_l = (int64_t)in_l + 2LL * pad;
-    if (padded_l < kernel || (padded_l - kernel) / stride + 1 != out_l) return 0;
-    size_t in_bytes = (size_t)batch * (size_t)in_c * in_l * sizeof(float);
-    size_t wbytes = (size_t)out_c * in_c * kernel * sizeof(float);
-    size_t bbytes = (size_t)out_c * sizeof(float);
-    size_t out_bytes = (size_t)batch * (size_t)out_c * out_l * sizeof(float);
-    OglTensorSlot* src = graph_ensure_device(in, in_bytes, 0);
-    OglTensorSlot* sw = graph_ensure_device(weight, wbytes, 1);
-    OglTensorSlot* dst = graph_output_slot(out, out_bytes);
-    if (!src || !sw || !dst) return 0;
-    GLuint bias_buf = 0;
-    int delete_bias = 0;
-    if (bias) {
-        OglTensorSlot* sb = graph_ensure_device(bias, bbytes, 1);
-        if (!sb) return 0;
-        bias_buf = sb->buffer;
-    } else {
-        float* zeros = (float*)calloc((size_t)out_c, sizeof(float));
-        if (!zeros) return 0;
-        bias_buf = create_buffer(bbytes, zeros);
-        free(zeros);
-        delete_bias = 1;
-        if (!bias_buf) return 0;
-    }
-    uint32_t params[12] = {(uint32_t)in_c, (uint32_t)in_l, (uint32_t)out_c,
-                           (uint32_t)kernel, (uint32_t)stride, (uint32_t)pad,
-                           (uint32_t)relu, (uint32_t)batch, 1u, (uint32_t)in_c,
-                           (uint32_t)out_l, 0u};
-    GLuint pb = params_buffer(params, sizeof(params));
-    GLuint bufs[5] = {src->buffer, sw->buffer, bias_buf, dst->buffer, pb};
-    int ok = dispatch_kernel(&k_conv1d, bufs, ((uint32_t)out_l + 63u) / 64u,
-                             (uint32_t)out_c, (uint32_t)batch);
-    if (pb) p_glDeleteBuffers(1, &pb);
-    if (delete_bias && bias_buf) p_glDeleteBuffers(1, &bias_buf);
-    if (!ok) return 0;
-    graph_mark_device(dst);
-    return 1;
-}
-
-static long attention_mask_numel(int mask_mode, int batch, int seq_q, int seq_kv) {
-    if (mask_mode == 0) return 0;
-    if (mask_mode == 1) return seq_kv;
-    if (mask_mode == 2) return (long)batch * seq_kv;
-    if (mask_mode == 3) return (long)seq_q * seq_kv;
-    if (mask_mode == 4) return (long)batch * seq_q * seq_kv;
-    return -1;
-}
-
-int opengl_graph_sdpa_f32(const float* qkv, const int32_t* mask, long mask_numel,
-                          float* out, int seq_len, int d_model, int num_heads,
-                          int head_dim, int batch, float scale, int causal, int mask_mode) {
-    if (!ogl_ready() || !qkv || !out || batch <= 0 || seq_len <= 0 || d_model <= 0 ||
-        num_heads <= 0 || head_dim <= 0 ||
-        head_dim > 64 || d_model != num_heads * head_dim) return 0;
-    long expected_mask = attention_mask_numel(mask_mode, batch, seq_len, seq_len);
-    if (expected_mask < 0 || (mask_mode != 0 && (!mask || mask_numel != expected_mask))) return 0;
-    size_t qkv_bytes = (size_t)batch * (size_t)seq_len * 3u * (size_t)d_model * sizeof(float);
-    size_t out_bytes = (size_t)batch * (size_t)seq_len * (size_t)d_model * sizeof(float);
-    size_t mask_bytes = mask_mode ? (size_t)expected_mask * sizeof(int32_t) : qkv_bytes;
-    OglTensorSlot* src = graph_ensure_device(qkv, qkv_bytes, 0);
-    OglTensorSlot* sm = mask_mode ? graph_ensure_device(mask, mask_bytes, 0) : src;
-    OglTensorSlot* dst = graph_output_slot(out, out_bytes);
-    if (!src || !sm || !dst) return 0;
-    struct {
-        uint32_t seq_len, d_model, num_heads, head_dim, batch;
-        float scale;
-        uint32_t causal, mask_mode;
-    } params = {(uint32_t)seq_len, (uint32_t)d_model, (uint32_t)num_heads,
-                (uint32_t)head_dim, (uint32_t)batch, scale,
-                causal ? 1u : 0u, (uint32_t)mask_mode};
-    GLuint pb = params_buffer(&params, sizeof(params));
-    GLuint bufs[4] = {src->buffer, sm->buffer, dst->buffer, pb};
-    int ok = dispatch_kernel(&k_sdpa, bufs, ((uint32_t)seq_len + 63u) / 64u,
-                             (uint32_t)num_heads, (uint32_t)batch);
-    if (pb) p_glDeleteBuffers(1, &pb);
-    if (!ok) return 0;
-    graph_mark_device(dst);
-    return 1;
-}
-
-#if VOLVOXAI_ENABLE_TRAINING
-int opengl_graph_sdpa_training_f32(const float* qkv, const int32_t* mask, long mask_numel,
-                                   float* out, int seq_len, int d_model, int num_heads,
-                                   int head_dim, int batch, float scale, int causal, int mask_mode,
-                                   uint32_t threshold, uint32_t seed, uint32_t counter,
-                                   float dropout_scale) {
-    if (!ogl_ready() || !qkv || !out || batch <= 0 || seq_len <= 0 || d_model <= 0 ||
-        num_heads <= 0 || head_dim <= 0 || head_dim > 64 || d_model != num_heads * head_dim ||
-        !isfinite(dropout_scale) || dropout_scale < 1.0f) return 0;
-    long expected_mask = attention_mask_numel(mask_mode, batch, seq_len, seq_len);
-    if (expected_mask < 0 || (mask_mode != 0 && (!mask || mask_numel != expected_mask))) return 0;
-    size_t qkv_bytes = (size_t)batch * (size_t)seq_len * 3u * (size_t)d_model * sizeof(float);
-    size_t out_bytes = (size_t)batch * (size_t)seq_len * (size_t)d_model * sizeof(float);
-    size_t mask_bytes = mask_mode ? (size_t)expected_mask * sizeof(int32_t) : qkv_bytes;
-    OglTensorSlot* src = graph_ensure_device(qkv, qkv_bytes, 0);
-    OglTensorSlot* sm = mask_mode ? graph_ensure_device(mask, mask_bytes, 0) : src;
-    OglTensorSlot* dst = graph_output_slot(out, out_bytes);
-    if (!src || !sm || !dst) return 0;
-    struct {
-        uint32_t seq_len, d_model, num_heads, head_dim, batch;
-        float scale;
-        uint32_t causal, mask_mode, threshold, seed, counter;
-        float dropout_scale;
-    } params = {(uint32_t)seq_len, (uint32_t)d_model, (uint32_t)num_heads,
-                (uint32_t)head_dim, (uint32_t)batch, scale, causal ? 1u : 0u,
-                (uint32_t)mask_mode, threshold, seed, counter, dropout_scale};
-    GLuint pb = params_buffer(&params, sizeof(params));
-    GLuint bufs[4] = {src->buffer, sm->buffer, dst->buffer, pb};
-    int ok = dispatch_kernel(&k_sdpa_training, bufs, ((uint32_t)seq_len + 63u) / 64u,
-                             (uint32_t)num_heads, (uint32_t)batch);
-    if (pb) p_glDeleteBuffers(1, &pb);
-    if (!ok) return 0;
-    graph_mark_device(dst);
-    return 1;
-}
-#endif
-
-int opengl_graph_cross_sdpa_f32(const float* q, const float* k, const float* v,
-                                const int32_t* mask, long mask_numel, float* out,
-                                int seq_q, int seq_kv, int d_model, int num_heads,
-                                int head_dim, int batch, float scale, int causal, int mask_mode) {
-    if (!ogl_ready() || !q || !k || !v || !out || batch <= 0 || seq_q <= 0 ||
-        seq_kv <= 0 || d_model <= 0 ||
-        num_heads <= 0 || head_dim <= 0 || head_dim > 64 || d_model != num_heads * head_dim) return 0;
-    long expected_mask = attention_mask_numel(mask_mode, batch, seq_q, seq_kv);
-    if (expected_mask < 0 || (mask_mode != 0 && (!mask || mask_numel != expected_mask))) return 0;
-    size_t q_bytes = (size_t)batch * (size_t)seq_q * (size_t)d_model * sizeof(float);
-    size_t kv_bytes = (size_t)batch * (size_t)seq_kv * (size_t)d_model * sizeof(float);
-    size_t out_bytes = q_bytes;
-    size_t mask_bytes = mask_mode ? (size_t)expected_mask * sizeof(int32_t) : q_bytes;
-    OglTensorSlot* sq = graph_ensure_device(q, q_bytes, 0);
-    OglTensorSlot* sk = graph_ensure_device(k, kv_bytes, 0);
-    OglTensorSlot* sv = graph_ensure_device(v, kv_bytes, 0);
-    OglTensorSlot* sm = mask_mode ? graph_ensure_device(mask, mask_bytes, 0) : sq;
-    OglTensorSlot* dst = graph_output_slot(out, out_bytes);
-    if (!sq || !sk || !sv || !sm || !dst) return 0;
-    struct {
-        uint32_t seq_q, seq_kv, d_model, num_heads, head_dim, batch;
-        float scale;
-        uint32_t causal, mask_mode, pad[3];
-    } params = {(uint32_t)seq_q, (uint32_t)seq_kv, (uint32_t)d_model,
-                (uint32_t)num_heads, (uint32_t)head_dim, (uint32_t)batch, scale,
-                causal ? 1u : 0u, (uint32_t)mask_mode, {0u, 0u, 0u}};
-    GLuint pb = params_buffer(&params, sizeof(params));
-    GLuint bufs[6] = {sq->buffer, sk->buffer, sv->buffer, sm->buffer, dst->buffer, pb};
-    int ok = dispatch_kernel(&k_cross_sdpa, bufs, ((uint32_t)seq_q + 63u) / 64u,
-                             (uint32_t)num_heads, (uint32_t)batch);
-    if (pb) p_glDeleteBuffers(1, &pb);
-    if (!ok) return 0;
-    graph_mark_device(dst);
-    return 1;
-}
-
-#if VOLVOXAI_ENABLE_TRAINING
-int opengl_graph_cross_sdpa_training_f32(const float* q, const float* k, const float* v,
-                                         const int32_t* mask, long mask_numel, float* out,
-                                         int seq_q, int seq_kv, int d_model, int num_heads,
-                                         int head_dim, int batch, float scale, int causal, int mask_mode,
-                                         uint32_t threshold, uint32_t seed, uint32_t counter,
-                                         float dropout_scale) {
-    if (!ogl_ready() || !q || !k || !v || !out || batch <= 0 || seq_q <= 0 ||
-        seq_kv <= 0 || d_model <= 0 || num_heads <= 0 || head_dim <= 0 ||
-        head_dim > 64 || d_model != num_heads * head_dim ||
-        !isfinite(dropout_scale) || dropout_scale < 1.0f) return 0;
-    long expected_mask = attention_mask_numel(mask_mode, batch, seq_q, seq_kv);
-    if (expected_mask < 0 || (mask_mode != 0 && (!mask || mask_numel != expected_mask))) return 0;
-    size_t q_bytes = (size_t)batch * (size_t)seq_q * (size_t)d_model * sizeof(float);
-    size_t kv_bytes = (size_t)batch * (size_t)seq_kv * (size_t)d_model * sizeof(float);
-    size_t out_bytes = q_bytes;
-    size_t mask_bytes = mask_mode ? (size_t)expected_mask * sizeof(int32_t) : q_bytes;
-    OglTensorSlot* sq = graph_ensure_device(q, q_bytes, 0);
-    OglTensorSlot* sk = graph_ensure_device(k, kv_bytes, 0);
-    OglTensorSlot* sv = graph_ensure_device(v, kv_bytes, 0);
-    OglTensorSlot* sm = mask_mode ? graph_ensure_device(mask, mask_bytes, 0) : sq;
-    OglTensorSlot* dst = graph_output_slot(out, out_bytes);
-    if (!sq || !sk || !sv || !sm || !dst) return 0;
-    struct {
-        uint32_t seq_q, seq_kv, d_model, num_heads, head_dim, batch;
-        float scale;
-        uint32_t causal, mask_mode, threshold, seed, counter;
-        float dropout_scale;
-        uint32_t pad[3];
-    } params = {(uint32_t)seq_q, (uint32_t)seq_kv, (uint32_t)d_model,
-                (uint32_t)num_heads, (uint32_t)head_dim, (uint32_t)batch, scale,
-                causal ? 1u : 0u, (uint32_t)mask_mode, threshold, seed, counter,
-                dropout_scale, {0u, 0u, 0u}};
-    GLuint pb = params_buffer(&params, sizeof(params));
-    GLuint bufs[6] = {sq->buffer, sk->buffer, sv->buffer, sm->buffer, dst->buffer, pb};
-    int ok = dispatch_kernel(&k_cross_sdpa_training, bufs, ((uint32_t)seq_q + 63u) / 64u,
-                             (uint32_t)num_heads, (uint32_t)batch);
-    if (pb) p_glDeleteBuffers(1, &pb);
-    if (!ok) return 0;
-    graph_mark_device(dst);
-    return 1;
-}
-#endif
-
-int opengl_graph_cross_attention_f32(const float* q, const float* kv, const float* weight,
-                                     const float* scale, const float* bias, float* out,
-                                     int seq_q, int seq_kv, int d_model, int num_heads,
-                                     int head_dim, int batch, int has_scale, int has_bias) {
-    if (!q || !kv || !weight || !out || seq_q <= 0 || seq_kv <= 0 || d_model <= 0 ||
-        num_heads <= 0 || head_dim <= 0 || batch <= 0 || head_dim > 64 || d_model != num_heads * head_dim ||
-        d_model > 64) return 0;
-    size_t q_bytes = (size_t)batch * (size_t)seq_q * (size_t)d_model * sizeof(float);
-    size_t kv_bytes = (size_t)batch * (size_t)seq_kv * (size_t)d_model * sizeof(float);
-    size_t wbytes = (size_t)3 * (size_t)d_model * (size_t)d_model * sizeof(float);
-    size_t sb_bytes = (size_t)3 * (size_t)d_model * sizeof(float);
-    size_t out_bytes = q_bytes;
-    static const float zero[1] = {0.0f};
-    OglTensorSlot* sq = graph_ensure_device(q, q_bytes, 0);
-    OglTensorSlot* skv = graph_ensure_device(kv, kv_bytes, 0);
-    OglTensorSlot* sw = graph_ensure_device(weight, wbytes, 1);
-    OglTensorSlot* ss = graph_ensure_device(has_scale && scale ? scale : zero, has_scale && scale ? sb_bytes : sizeof(float), 1);
-    OglTensorSlot* sb = graph_ensure_device(has_bias && bias ? bias : zero, has_bias && bias ? sb_bytes : sizeof(float), 1);
-    OglTensorSlot* dst = graph_output_slot(out, out_bytes);
-    if (!sq || !skv || !sw || !ss || !sb || !dst) return 0;
-    struct {
-        uint32_t seq_q, seq_kv, d_model, num_heads, head_dim;
-        float scale_factor;
-        uint32_t has_scale, has_bias, batch, pad[3];
-    } params = {(uint32_t)seq_q, (uint32_t)seq_kv, (uint32_t)d_model, (uint32_t)num_heads,
-                (uint32_t)head_dim, 1.0f / sqrtf((float)head_dim),
-                (uint32_t)(has_scale && scale), (uint32_t)(has_bias && bias), (uint32_t)batch, {0u, 0u, 0u}};
-    GLuint pb = params_buffer(&params, sizeof(params));
-    GLuint bufs[7] = {sq->buffer, skv->buffer, sw->buffer, ss->buffer, sb->buffer, dst->buffer, pb};
-    int ok = dispatch_kernel(&k_cross_attention, bufs, ((uint32_t)seq_q + 63u) / 64u,
-                             (uint32_t)num_heads, (uint32_t)batch);
-    if (pb) p_glDeleteBuffers(1, &pb);
-    if (!ok) return 0;
-    graph_mark_device(dst);
-    return 1;
-}
-
-int opengl_graph_dequantize_linear_f32(const float* in, const float* scale, const float* zero_point,
-                                       float* out, long n, int has_zero_point) {
-    if (!in || !scale || !out || n <= 0) return 0;
-    static const float zero[1] = {0.0f};
-    size_t bytes = (size_t)n * sizeof(float);
-    OglTensorSlot* src = graph_ensure_device(in, bytes, 0);
-    OglTensorSlot* ss = graph_ensure_device(scale, sizeof(float), 1);
-    OglTensorSlot* sz = graph_ensure_device(has_zero_point && zero_point ? zero_point : zero, sizeof(float), 1);
-    OglTensorSlot* dst = graph_output_slot(out, bytes);
-    if (!src || !ss || !sz || !dst) return 0;
-    uint32_t params[4] = {(uint32_t)n, (uint32_t)(has_zero_point && zero_point), 0u, 0u};
-    GLuint pb = params_buffer(params, sizeof(params));
-    GLuint bufs[5] = {src->buffer, ss->buffer, sz->buffer, dst->buffer, pb};
-    int ok = dispatch_kernel(&k_dequantize, bufs, ((uint32_t)n + 63u) / 64u, 1, 1);
-    if (pb) p_glDeleteBuffers(1, &pb);
-    if (!ok) return 0;
-    graph_mark_device(dst);
-    return 1;
-}
-
-typedef struct {
-    uint32_t rows;
-    uint32_t d_in;
-    uint32_t d_out;
-    uint32_t input_type;
-    uint32_t weight_type;
-    uint32_t output_type;
-    uint32_t pad0;
-    uint32_t pad1;
-    int32_t input_zero_point;
-    int32_t output_zero_point;
-    int32_t pad2;
-    int32_t pad3;
-    float input_scale;
-    float output_scale;
-    float pad4;
-    float pad5;
-} OglQLinearParams;
-
-_Static_assert(sizeof(OglQLinearParams) == 64, "qLinearInt8 uniform ABI");
-
-static int qlinear_dtype_bounds(uint32_t dtype, int32_t zero_point,
-                                int64_t* maximum_distance) {
-    int32_t minimum;
-    int32_t maximum;
-    if (dtype == VX_DTYPE_I8) {
-        minimum = -128;
-        maximum = 127;
-    } else if (dtype == VX_DTYPE_U8) {
-        minimum = 0;
-        maximum = 255;
-    } else {
-        return 0;
-    }
-    if (zero_point < minimum || zero_point > maximum) return 0;
-    int64_t lower = (int64_t)minimum - zero_point;
-    int64_t upper = (int64_t)maximum - zero_point;
-    *maximum_distance = llabs(lower) > llabs(upper) ? llabs(lower) : llabs(upper);
-    return 1;
-}
-
-static int qlinear_gpu_args_valid(const void* input, const void* weight,
-                                  const float* weight_scales,
-                                  const int32_t* weight_zero_points,
-                                  const int32_t* bias, void* output,
-                                  uint32_t rows, uint32_t d_in, uint32_t d_out,
-                                  float input_scale, int32_t input_zero_point,
-                                  float output_scale, int32_t output_zero_point,
-                                  uint32_t input_dtype, uint32_t weight_dtype,
-                                  uint32_t output_dtype,
-                                  size_t* input_bytes, size_t* weight_bytes,
-                                  size_t* output_bytes) {
-    if (!input || !weight || !weight_scales || !weight_zero_points || !bias || !output ||
-        rows == 0 || d_in == 0 || d_out == 0 || !isfinite(input_scale) ||
-        !isfinite(output_scale) || input_scale <= 0.0f || output_scale <= 0.0f) return 0;
-    int64_t input_distance = 0;
-    int64_t output_distance = 0;
-    if (!qlinear_dtype_bounds(input_dtype, input_zero_point, &input_distance) ||
-        !qlinear_dtype_bounds(output_dtype, output_zero_point, &output_distance)) return 0;
-    (void)output_distance;
-    if (weight_dtype != VX_DTYPE_I8 && weight_dtype != VX_DTYPE_U8) return 0;
-    if (rows > UINT32_MAX / d_in || rows > UINT32_MAX / d_out ||
-        d_out > UINT32_MAX / d_in) return 0;
-    uint64_t input_elements = (uint64_t)rows * d_in;
-    uint64_t weight_elements = (uint64_t)d_out * d_in;
-    uint64_t output_elements = (uint64_t)rows * d_out;
-    if (input_elements > SIZE_MAX || weight_elements > SIZE_MAX ||
-        output_elements > SIZE_MAX ||
-        (size_t)d_out > SIZE_MAX / sizeof(*weight_scales) ||
-        (size_t)d_out > SIZE_MAX / sizeof(*weight_zero_points) ||
-        (size_t)d_out > SIZE_MAX / sizeof(*bias)) return 0;
-    for (uint32_t channel = 0; channel < d_out; channel++) {
-        int64_t weight_distance = 0;
-        if (!isfinite(weight_scales[channel]) || weight_scales[channel] <= 0.0f ||
-            !qlinear_dtype_bounds(weight_dtype, weight_zero_points[channel],
-                                  &weight_distance)) return 0;
-        int64_t bias_distance = bias[channel] < 0 ? -(int64_t)bias[channel] : bias[channel];
-        if (bias_distance > INT32_MAX) return 0;
-        int64_t term_distance = input_distance * weight_distance;
-        if (term_distance > 0 &&
-            (uint64_t)d_in > (uint64_t)(INT32_MAX - bias_distance) /
-                                  (uint64_t)term_distance) return 0;
-    }
-    *input_bytes = (size_t)input_elements;
-    *weight_bytes = (size_t)weight_elements;
-    *output_bytes = (size_t)output_elements;
-    return 1;
-}
-
-int opengl_graph_qlinear_i8u8(const void* input, const void* weight,
-                              const float* weight_scales, const int32_t* weight_zero_points,
-                              const int32_t* bias, void* output,
-                              uint32_t rows, uint32_t d_in, uint32_t d_out,
-                              float input_scale, int32_t input_zero_point,
-                              float output_scale, int32_t output_zero_point,
-                              uint32_t input_dtype, uint32_t weight_dtype,
-                              uint32_t output_dtype) {
-    size_t input_bytes, weight_bytes, output_bytes;
-    size_t multiplier_bytes;
-    float* multipliers;
-    if (max_ssbo_bindings < 6 || max_uniform_bindings < 1) return 0;
-    if (!qlinear_gpu_args_valid(input, weight, weight_scales, weight_zero_points, bias, output,
-                                rows, d_in, d_out, input_scale, input_zero_point,
-                                output_scale, output_zero_point, input_dtype, weight_dtype,
-                                output_dtype, &input_bytes, &weight_bytes, &output_bytes)) return 0;
-    size_t packed_output_bytes;
-    if (!graph_packed_bytes(output_bytes, &packed_output_bytes)) return 0;
-    multiplier_bytes = (size_t)d_out * sizeof(*multipliers);
-    multipliers = (float*)malloc(multiplier_bytes);
-    if (!multipliers ||
-        !vx_qlinear_build_multipliers(
-            input_scale, weight_scales, output_scale, d_out, multipliers)) {
-        free(multipliers);
-        return 0;
-    }
-    OglTensorSlot* src = graph_ensure_packed_bytes(input, input_bytes, 0);
-    OglTensorSlot* wt = graph_ensure_packed_bytes(weight, weight_bytes, 1);
-    OglTensorSlot* zero_points = graph_ensure_device(weight_zero_points,
-                                                      (size_t)d_out * sizeof(*weight_zero_points), 1);
-    OglTensorSlot* biases = graph_ensure_device(bias, (size_t)d_out * sizeof(*bias), 1);
-    OglTensorSlot* dst = graph_output_packed_bytes(output, output_bytes);
-    if (!src || !wt || !zero_points || !biases || !dst) {
-        free(multipliers);
-        return 0;
-    }
-    GLuint multiplier_buffer = create_buffer(multiplier_bytes, multipliers);
-    free(multipliers);
-    if (!multiplier_buffer) return 0;
-    OglQLinearParams params = {
-        rows, d_in, d_out,
-        input_dtype,
-        weight_dtype,
-        output_dtype, 0u, 0u,
-        input_zero_point, output_zero_point, 0, 0,
-        input_scale, output_scale, 0.0f, 0.0f
-    };
-    GLuint pb = params_buffer(&params, sizeof(params));
-    if (!pb) {
-        p_glDeleteBuffers(1, &multiplier_buffer);
-        return 0;
-    }
-    GLuint bufs[7] = {
-        src->buffer, wt->buffer, multiplier_buffer, zero_points->buffer,
-        biases->buffer, dst->buffer, pb
-    };
-    uint32_t packed_words = (uint32_t)(packed_output_bytes / sizeof(uint32_t));
-    int tiled = rows > 1u && d_in >= 16u && d_out >= 32u && (d_out & 3u) == 0u &&
-                opengl_workgroup_supported(8u, 8u, 1u);
-    uint32_t groups_x = tiled ? ((d_out / 4u + 7u) / 8u) : ((packed_words + 63u) / 64u);
-    uint32_t groups_y = tiled ? ((rows + 7u) / 8u) : 1u;
-    const OglKernel* kernel = tiled ? &k_qlinear_int8_tiled : &k_qlinear_int8;
-    int ok = dispatch_kernel(kernel, bufs, groups_x, groups_y, 1u);
-    p_glDeleteBuffers(1, &pb);
-    p_glDeleteBuffers(1, &multiplier_buffer);
-    if (!ok) return 0;
-    graph_mark_device(dst);
-    return 1;
-}
-
-typedef struct {
-    uint32_t tokens;
-    uint32_t vocab;
-    uint32_t hidden;
-    uint32_t weight_type;
-    uint32_t output_type;
-    int32_t output_zero_point;
-    float output_scale;
-    uint32_t pad0;
-} OglQEmbeddingParams;
-
-_Static_assert(sizeof(OglQEmbeddingParams) == 32, "qEmbeddingInt8 uniform ABI");
-
-static int qembedding_gpu_args_valid(const int32_t* tokens, const void* weight,
-                                     const float* weight_scales,
-                                     const int32_t* weight_zero_points, void* output,
-                                     uint32_t token_count, uint32_t vocab, uint32_t hidden,
-                                     float output_scale, int32_t output_zero_point,
-                                     uint32_t weight_dtype, uint32_t output_dtype,
-                                     size_t* token_bytes, size_t* weight_bytes,
-                                     size_t* output_bytes) {
-    int64_t distance = 0;
-    uint64_t weight_elements;
-    uint64_t output_elements;
-    if (!tokens || !weight || !weight_scales || !weight_zero_points || !output ||
-        !token_count || !vocab || !hidden || !isfinite(output_scale) ||
-        output_scale <= 0.0f || !qlinear_dtype_bounds(output_dtype, output_zero_point,
-                                                        &distance) ||
-        (weight_dtype != VX_DTYPE_I8 && weight_dtype != VX_DTYPE_U8) ||
-        token_count > UINT32_MAX / hidden || vocab > UINT32_MAX / hidden) return 0;
-    weight_elements = (uint64_t)vocab * hidden;
-    output_elements = (uint64_t)token_count * hidden;
-    if (weight_elements > SIZE_MAX || output_elements > SIZE_MAX ||
-        (size_t)token_count > SIZE_MAX / sizeof(*tokens) ||
-        (size_t)vocab > SIZE_MAX / sizeof(*weight_scales) ||
-        (size_t)vocab > SIZE_MAX / sizeof(*weight_zero_points)) return 0;
-    for (uint32_t row = 0; row < vocab; row++) {
-        if (!isfinite(weight_scales[row]) || weight_scales[row] <= 0.0f ||
-            !qlinear_dtype_bounds(weight_dtype, weight_zero_points[row], &distance)) return 0;
-    }
-    for (uint32_t token = 0; token < token_count; token++) {
-        if (tokens[token] < 0 || (uint32_t)tokens[token] >= vocab) return 0;
-    }
-    *token_bytes = (size_t)token_count * sizeof(*tokens);
-    *weight_bytes = (size_t)weight_elements;
-    *output_bytes = (size_t)output_elements;
-    return 1;
-}
-
-int opengl_graph_qembedding_i8u8(const int32_t* tokens, const void* weight,
-                                 const float* weight_scales,
-                                 const int32_t* weight_zero_points, void* output,
-                                 uint32_t token_count, uint32_t vocab, uint32_t hidden,
-                                 float output_scale, int32_t output_zero_point,
-                                 uint32_t weight_dtype, uint32_t output_dtype) {
-    size_t token_bytes;
-    size_t weight_bytes;
-    size_t output_bytes;
-    size_t packed_output_bytes;
-    if (max_ssbo_bindings < 5 || max_uniform_bindings < 1 ||
-        !qembedding_gpu_args_valid(tokens, weight, weight_scales, weight_zero_points,
-                                   output, token_count, vocab, hidden, output_scale,
-                                   output_zero_point, weight_dtype, output_dtype,
-                                   &token_bytes, &weight_bytes, &output_bytes) ||
-        !graph_packed_bytes(output_bytes, &packed_output_bytes)) return 0;
-    OglTensorSlot* ids = graph_ensure_device(tokens, token_bytes, 0);
-    OglTensorSlot* table = graph_ensure_packed_bytes(weight, weight_bytes, 1);
-    OglTensorSlot* scales = graph_ensure_device(weight_scales,
-                                                 (size_t)vocab * sizeof(*weight_scales), 1);
-    OglTensorSlot* zero_points = graph_ensure_device(weight_zero_points,
-                                                      (size_t)vocab * sizeof(*weight_zero_points), 1);
-    OglTensorSlot* dst = graph_output_packed_bytes(output, output_bytes);
-    if (!ids || !table || !scales || !zero_points || !dst) return 0;
-    OglQEmbeddingParams params = {
-        token_count, vocab, hidden,
-        weight_dtype,
-        output_dtype, output_zero_point,
-        output_scale, 0u
-    };
-    GLuint pb = params_buffer(&params, sizeof(params));
-    if (!pb) return 0;
-    GLuint bufs[6] = {
-        ids->buffer, table->buffer, scales->buffer, zero_points->buffer,
-        dst->buffer, pb
-    };
-    uint32_t packed_words = (uint32_t)(packed_output_bytes / sizeof(uint32_t));
-    int ok = dispatch_kernel(&k_qembedding_int8, bufs,
-                             (packed_words + 63u) / 64u, 1u, 1u);
-    p_glDeleteBuffers(1, &pb);
-    if (!ok) return 0;
-    graph_mark_device(dst);
-    return 1;
-}
-
-typedef struct {
-    uint32_t elements;
-    uint32_t a_type;
-    uint32_t b_type;
-    uint32_t output_type;
-    int32_t a_zero_point;
-    int32_t b_zero_point;
-    int32_t output_zero_point;
-    int32_t pad0;
-    float a_scale;
-    float b_scale;
-    float output_scale;
-    uint32_t relu;
-} OglQAddParams;
-
-_Static_assert(sizeof(OglQAddParams) == 48, "qAdd uniform ABI");
-
-typedef struct {
-    uint32_t batch_rank;
-    uint32_t m;
-    uint32_t k;
-    uint32_t n;
-    uint32_t output_elements;
-    uint32_t a_type;
-    uint32_t b_type;
-    uint32_t output_type;
-    int32_t a_zero_point;
-    int32_t b_zero_point;
-    int32_t output_zero_point;
-    int32_t pad0;
-    float a_scale;
-    float b_scale;
-    float output_scale;
-    float pad1;
-} OglQBatchMatMulParams;
-
-_Static_assert(sizeof(OglQBatchMatMulParams) == 64,
-               "qBatchMatMul uniform ABI");
-
-typedef struct {
-    uint32_t elements;
-    uint32_t input_type;
-    uint32_t output_type;
-    uint32_t pad0;
-    int32_t input_zero_point;
-    int32_t output_zero_point;
-    int32_t pad1;
-    int32_t pad2;
-    float input_scale;
-    float output_scale;
-    float pad3;
-    float pad4;
-} OglQByteUnaryParams;
-
-_Static_assert(sizeof(OglQByteUnaryParams) == 48,
-               "qSiLUInt8/qGELUInt8 uniform ABI");
-
-typedef struct {
-    uint32_t batch;
-    uint32_t height;
-    uint32_t width;
-    uint32_t channels;
-    uint32_t groups;
-    uint32_t input_type;
-    uint32_t output_type;
-    uint32_t pad0;
-    int32_t input_zero_point;
-    int32_t output_zero_point;
-    int32_t pad1;
-    int32_t pad2;
-    float input_scale;
-    float output_scale;
-    float epsilon;
-    float pad3;
-} OglQGroupNormParams;
-
-_Static_assert(sizeof(OglQGroupNormParams) == 64,
-               "qGroupNormStats/qGroupNormApply uniform ABI");
-
-typedef struct {
-    uint32_t rows;
-    uint32_t d_model;
-    uint32_t input_type;
-    uint32_t output_type;
-    int32_t input_zero_point;
-    int32_t output_zero_point;
-    int32_t pad0;
-    int32_t pad1;
-    float input_scale;
-    float output_scale;
-    float epsilon;
-    float pad2;
-} OglQLayerNormParams;
-
-_Static_assert(sizeof(OglQLayerNormParams) == 48,
-               "qLayerNormStats/qLayerNormApply uniform ABI");
-
-typedef struct {
-    uint32_t seq_q;
-    uint32_t seq_kv;
-    uint32_t d_model;
-    uint32_t heads;
-    uint32_t batch;
-    uint32_t mask_mode;
-    uint32_t causal;
-    uint32_t dtypes;
-    int32_t q_zero_point;
-    int32_t k_zero_point;
-    int32_t v_zero_point;
-    int32_t output_zero_point;
-    float q_scale;
-    float k_scale;
-    float v_scale;
-    float output_scale;
-    float attention_scale;
-    float pad0;
-    float pad1;
-    float pad2;
-} OglQSDPAParams;
-
-_Static_assert(sizeof(OglQSDPAParams) == 80, "qSDPAInt8 uniform ABI");
-
-typedef struct {
-    uint32_t outer;
-    uint32_t axis_size;
-    uint32_t inner;
-    uint32_t input_dtype;
-} OglQArgMaxParams;
-
-_Static_assert(sizeof(OglQArgMaxParams) == 16, "qArgMaxInt8 uniform ABI");
-
-typedef struct {
-    uint32_t batch;
-    uint32_t sequence;
-    uint32_t width;
-    uint32_t input_dtype;
-    uint32_t output_dtype;
-    uint32_t pad0;
-    uint32_t pad1;
-    uint32_t pad2;
-    int32_t input_zero_point;
-    int32_t output_zero_point;
-    float input_scale;
-    float output_scale;
-} OglQMaskedMeanParams;
-
-_Static_assert(sizeof(OglQMaskedMeanParams) == 48,
-               "qMaskedMeanInt8 uniform ABI");
-
-typedef struct {
-    uint32_t elements;
-    uint32_t input_type;
-    uint32_t output_type;
-    uint32_t pad0;
-    int32_t input_zero_point;
-    int32_t output_zero_point;
-    int32_t pad1;
-    int32_t pad2;
-    float multiplier;
-    float pad3;
-    float pad4;
-    float pad5;
-} OglRequantizeLinearParams;
-
-_Static_assert(sizeof(OglRequantizeLinearParams) == 48,
-               "requantizeLinearTyped uniform ABI");
-
-static int qbyte_dtype_zero_point_valid(uint32_t dtype, int32_t zero_point) {
-    if (dtype == VX_DTYPE_I8) return zero_point >= -128 && zero_point <= 127;
-    if (dtype == VX_DTYPE_U8) return zero_point >= 0 && zero_point <= 255;
-    return 0;
-}
-
-static int qadd_gpu_args_valid(const void* a, uint32_t a_elements,
-                               const void* b, uint32_t b_elements,
-                               void* output, uint32_t output_elements,
-                               float a_scale, int32_t a_zero_point,
-                               float b_scale, int32_t b_zero_point,
-                               float output_scale, int32_t output_zero_point,
-                               uint32_t a_dtype, uint32_t b_dtype,
-                               uint32_t output_dtype, uint32_t relu,
-                               size_t* logical_bytes) {
-    if (!a || !b || !output || output == a || output == b ||
-        a_elements == 0 || a_elements != b_elements ||
-        a_elements != output_elements || relu > 2u ||
-        !isfinite(a_scale) || !isfinite(b_scale) || !isfinite(output_scale) ||
-        a_scale <= 0.0f || b_scale <= 0.0f || output_scale <= 0.0f ||
-        !qbyte_dtype_zero_point_valid(a_dtype, a_zero_point) ||
-        !qbyte_dtype_zero_point_valid(b_dtype, b_zero_point) ||
-        !qbyte_dtype_zero_point_valid(output_dtype, output_zero_point)) return 0;
-    if ((uint64_t)a_elements > SIZE_MAX) return 0;
-    *logical_bytes = (size_t)a_elements;
-    return 1;
-}
-
-static int qbyte_unary_gpu_args_valid(const void* input, void* output, uint32_t elements,
-                                      float input_scale, int32_t input_zero_point,
-                                      float output_scale, int32_t output_zero_point,
-                                      uint32_t input_dtype, uint32_t output_dtype,
-                                      size_t* logical_bytes) {
-    if (!input || !output || input == output || !elements ||
-        !isfinite(input_scale) || !isfinite(output_scale) ||
-        input_scale <= 0.0f || output_scale <= 0.0f ||
-        !qbyte_dtype_zero_point_valid(input_dtype, input_zero_point) ||
-        !qbyte_dtype_zero_point_valid(output_dtype, output_zero_point) ||
-        (uint64_t)elements > SIZE_MAX) return 0;
-    *logical_bytes = (size_t)elements;
-    return 1;
-}
-
-static float qnorm_f32_at(const float* values, uint32_t index) {
-    float value;
-    memcpy(&value, (const unsigned char*)values + (size_t)index * sizeof(value),
-           sizeof(value));
-    return value;
-}
-
-static int qgroupnorm_gpu_args_valid(const void* input, const float* weight,
-                                     const float* bias, void* output,
-                                     uint32_t batch, uint32_t height,
-                                     uint32_t width, uint32_t channels,
-                                     uint32_t groups, float input_scale,
-                                     int32_t input_zero_point, float output_scale,
-                                     int32_t output_zero_point, float epsilon,
-                                     uint32_t input_dtype, uint32_t output_dtype,
-                                     size_t* logical_bytes, size_t* affine_bytes,
-                                     size_t* stats_bytes) {
-    uint64_t elements;
-    uint64_t group_count;
-    if (!input || !weight || !bias || !output || output == input ||
-        output == (const void*)weight || output == (const void*)bias ||
-        !batch || !height || !width || !channels || !groups || channels % groups ||
-        !isfinite(input_scale) || input_scale <= 0.0f ||
-        !isfinite(output_scale) || output_scale <= 0.0f ||
-        !isfinite(epsilon) || epsilon <= 0.0f ||
-        !qbyte_dtype_zero_point_valid(input_dtype, input_zero_point) ||
-        !qbyte_dtype_zero_point_valid(output_dtype, output_zero_point) ||
-        batch > UINT32_MAX / groups) return 0;
-    elements = batch;
-    if (elements > UINT32_MAX / height) return 0;
-    elements *= height;
-    if (elements > UINT32_MAX / width) return 0;
-    elements *= width;
-    if (elements > UINT32_MAX / channels) return 0;
-    elements *= channels;
-    group_count = (uint64_t)batch * groups;
-    if (elements == 0 || elements > SIZE_MAX || group_count == 0 ||
-        group_count > SIZE_MAX / (2u * sizeof(float)) ||
-        (size_t)channels > SIZE_MAX / sizeof(float)) return 0;
-    for (uint32_t channel = 0; channel < channels; channel++) {
-        if (!isfinite(qnorm_f32_at(weight, channel)) ||
-            !isfinite(qnorm_f32_at(bias, channel))) return 0;
-    }
-    *logical_bytes = (size_t)elements;
-    *affine_bytes = (size_t)channels * sizeof(float);
-    *stats_bytes = (size_t)group_count * 2u * sizeof(float);
-    return 1;
-}
-
-static int qlayernorm_gpu_args_valid(const void* input, const float* weight,
-                                     const float* bias, void* output,
-                                     uint32_t rows, uint32_t d_model,
-                                     float input_scale, int32_t input_zero_point,
-                                     float output_scale, int32_t output_zero_point,
-                                     float epsilon, uint32_t input_dtype,
-                                     uint32_t output_dtype, size_t* logical_bytes,
-                                     size_t* affine_bytes, size_t* stats_bytes) {
-    uint64_t elements;
-    size_t row_count;
-    if (!input || !weight || !bias || !output || output == input ||
-        output == (const void*)weight || output == (const void*)bias ||
-        !rows || !d_model || !isfinite(input_scale) || input_scale <= 0.0f ||
-        !isfinite(output_scale) || output_scale <= 0.0f ||
-        !isfinite(epsilon) || epsilon <= 0.0f ||
-        !qbyte_dtype_zero_point_valid(input_dtype, input_zero_point) ||
-        !qbyte_dtype_zero_point_valid(output_dtype, output_zero_point) ||
-        rows > UINT32_MAX / d_model) return 0;
-    elements = (uint64_t)rows * d_model;
-    row_count = (size_t)rows;
-    if (elements == 0 || elements > SIZE_MAX ||
-        row_count > SIZE_MAX / (2u * sizeof(float)) ||
-        (size_t)d_model > SIZE_MAX / sizeof(float)) return 0;
-    for (uint32_t channel = 0; channel < d_model; channel++) {
-        if (!isfinite(qnorm_f32_at(weight, channel)) ||
-            !isfinite(qnorm_f32_at(bias, channel))) return 0;
-    }
-    *logical_bytes = (size_t)elements;
-    *affine_bytes = (size_t)d_model * sizeof(float);
-    *stats_bytes = row_count * 2u * sizeof(float);
-    return 1;
-}
-
-static int qsdpa_ranges_overlap(const void* left, size_t left_bytes,
-                                const void* right, size_t right_bytes) {
-    uintptr_t left_start = (uintptr_t)left;
-    uintptr_t right_start = (uintptr_t)right;
-    if (left_start > UINTPTR_MAX - left_bytes ||
-        right_start > UINTPTR_MAX - right_bytes) return 1;
-    return left_start < right_start + right_bytes &&
-        right_start < left_start + left_bytes;
-}
-
-static int qsdpa_centered_magnitude(uint32_t dtype, int32_t zero_point,
-                                    uint64_t* magnitude_out) {
-    int64_t low;
-    int64_t high;
-    uint64_t magnitude;
-    if (!magnitude_out) return 0;
-    if (dtype == VX_DTYPE_I8) {
-        low = -128 - (int64_t)zero_point;
-        high = 127 - (int64_t)zero_point;
-    } else if (dtype == VX_DTYPE_U8) {
-        low = -(int64_t)zero_point;
-        high = 255 - (int64_t)zero_point;
-    } else {
-        return 0;
-    }
-    magnitude = (uint64_t)(low < 0 ? -low : low);
-    if ((uint64_t)(high < 0 ? -high : high) > magnitude)
-        magnitude = (uint64_t)(high < 0 ? -high : high);
-    *magnitude_out = magnitude;
-    return 1;
-}
-
-static int qsdpa_mask_bytes(uint32_t batch, uint32_t seq_q, uint32_t seq_kv,
-                            uint32_t mask_mode, size_t* mask_bytes) {
-    uint64_t elements = seq_kv;
-    if (!mask_bytes) return 0;
-    if (mask_mode == 0u) {
-        *mask_bytes = 0;
-        return 1;
-    }
-    if (mask_mode == 2u) {
-        if (elements > UINT32_MAX / batch) return 0;
-        elements *= batch;
-    } else if (mask_mode == 3u) {
-        if (elements > UINT32_MAX / seq_q) return 0;
-        elements *= seq_q;
-    } else if (mask_mode == 4u) {
-        if (elements > UINT32_MAX / seq_q) return 0;
-        elements *= seq_q;
-        if (elements > UINT32_MAX / batch) return 0;
-        elements *= batch;
-    } else if (mask_mode != 1u) {
-        return 0;
-    }
-    if (elements == 0 || elements > UINT32_MAX ||
-        elements > SIZE_MAX / sizeof(int32_t)) return 0;
-    *mask_bytes = (size_t)elements * sizeof(int32_t);
-    return 1;
-}
-
-static int qsdpa_gpu_args_valid(const void* q, const void* k, const void* v,
-                                const int32_t* mask, void* output,
-                                uint32_t batch, uint32_t seq_q,
-                                uint32_t seq_kv, uint32_t d_model,
-                                uint32_t heads, float q_scale,
-                                int32_t q_zero_point, float k_scale,
-                                int32_t k_zero_point, float v_scale,
-                                int32_t v_zero_point, float output_scale,
-                                int32_t output_zero_point, float attention_scale,
-                                uint32_t q_dtype, uint32_t k_dtype,
-                                uint32_t v_dtype, uint32_t output_dtype,
-                                uint32_t causal, uint32_t mask_mode,
-                                size_t* q_bytes, size_t* kv_bytes,
-                                size_t* mask_bytes) {
-    uint64_t q_elements = batch;
-    uint64_t kv_elements = batch;
-    uint64_t q_magnitude;
-    uint64_t k_magnitude;
-    uint64_t maximum_dot;
-    uint32_t head_dim;
-    float qk_scale;
-    float score_scale;
-    if (!q || !k || !v || !output || !batch || !seq_q || !seq_kv ||
-        !d_model || !heads || causal > 1u || d_model % heads ||
-        d_model % 4u || !isfinite(q_scale) || q_scale <= 0.0f ||
-        !isfinite(k_scale) || k_scale <= 0.0f || !isfinite(v_scale) ||
-        v_scale <= 0.0f || !isfinite(output_scale) || output_scale <= 0.0f ||
-        !isfinite(attention_scale) || attention_scale <= 0.0f ||
-        !qbyte_dtype_zero_point_valid(q_dtype, q_zero_point) ||
-        !qbyte_dtype_zero_point_valid(k_dtype, k_zero_point) ||
-        !qbyte_dtype_zero_point_valid(v_dtype, v_zero_point) ||
-        !qbyte_dtype_zero_point_valid(output_dtype, output_zero_point) ||
-        !q_bytes || !kv_bytes || !mask_bytes) return 0;
-    head_dim = d_model / heads;
-    if (!head_dim || head_dim % 4u || head_dim > 64u ||
-        q_elements > UINT32_MAX / seq_q) return 0;
-    q_elements *= seq_q;
-    if (q_elements > UINT32_MAX / d_model) return 0;
-    q_elements *= d_model;
-    if (kv_elements > UINT32_MAX / seq_kv) return 0;
-    kv_elements *= seq_kv;
-    if (kv_elements > UINT32_MAX / d_model) return 0;
-    kv_elements *= d_model;
-    if (q_elements == 0 || kv_elements == 0 || q_elements > SIZE_MAX ||
-        kv_elements > SIZE_MAX || !qsdpa_mask_bytes(batch, seq_q, seq_kv,
-                                                     mask_mode, mask_bytes) ||
-        (mask_mode == 0u ? mask != NULL : mask == NULL)) return 0;
-    qk_scale = q_scale * k_scale;
-    score_scale = qk_scale * attention_scale;
-    if (!isfinite(qk_scale) || qk_scale <= 0.0f ||
-        !isfinite(score_scale) || score_scale <= 0.0f ||
-        !qsdpa_centered_magnitude(q_dtype, q_zero_point, &q_magnitude) ||
-        !qsdpa_centered_magnitude(k_dtype, k_zero_point, &k_magnitude)) return 0;
-    maximum_dot = q_magnitude * k_magnitude * head_dim;
-    if (!isfinite((float)maximum_dot * score_scale)) return 0;
-    *q_bytes = (size_t)q_elements;
-    *kv_bytes = (size_t)kv_elements;
-    if (qsdpa_ranges_overlap(output, *q_bytes, q, *q_bytes) ||
-        qsdpa_ranges_overlap(output, *q_bytes, k, *kv_bytes) ||
-        qsdpa_ranges_overlap(output, *q_bytes, v, *kv_bytes) ||
-        (*mask_bytes && qsdpa_ranges_overlap(output, *q_bytes, mask,
-                                             *mask_bytes))) return 0;
-    return 1;
-}
-
-static int qargmax_gpu_args_valid(const void* input, int32_t* output,
-                                  uint32_t outer, uint32_t axis_size,
-                                  uint32_t inner, uint32_t input_dtype,
-                                  size_t* input_bytes, size_t* output_bytes,
-                                  uint32_t* output_elements_out) {
-    uint64_t input_elements = outer;
-    uint64_t output_elements = outer;
-    if (!input || !output || !outer || !axis_size || !inner ||
-        axis_size > (uint32_t)INT32_MAX ||
-        (input_dtype != VX_DTYPE_I8 && input_dtype != VX_DTYPE_U8) ||
-        !input_bytes || !output_bytes || !output_elements_out ||
-        input_elements > UINT32_MAX / axis_size) return 0;
-    input_elements *= axis_size;
-    if (input_elements > UINT32_MAX / inner ||
-        output_elements > UINT32_MAX / inner) return 0;
-    input_elements *= inner;
-    output_elements *= inner;
-    if (!input_elements || !output_elements || input_elements > SIZE_MAX ||
-        output_elements > UINT32_MAX ||
-        output_elements > SIZE_MAX / sizeof(*output)) return 0;
-    *input_bytes = (size_t)input_elements;
-    *output_bytes = (size_t)output_elements * sizeof(*output);
-    *output_elements_out = (uint32_t)output_elements;
-    return !qsdpa_ranges_overlap(output, *output_bytes, input, *input_bytes);
-}
-
-static int qmaskedmean_gpu_args_valid(const void* input, const int32_t* mask,
-                                      void* output, uint32_t batch,
-                                      uint32_t sequence, uint32_t width,
-                                      float input_scale, int32_t input_zero_point,
-                                      float output_scale, int32_t output_zero_point,
-                                      uint32_t input_dtype, uint32_t output_dtype,
-                                      size_t* input_bytes, size_t* mask_bytes,
-                                      size_t* output_bytes) {
-    uint64_t input_elements = batch;
-    uint64_t mask_elements = batch;
-    uint64_t output_elements = batch;
-    int64_t low;
-    int64_t high;
-    uint64_t magnitude;
-    float multiplier;
-    if (!input || !mask || !output || !batch || !sequence || !width ||
-        !isfinite(input_scale) || input_scale <= 0.0f ||
-        !isfinite(output_scale) || output_scale <= 0.0f ||
-        !qbyte_dtype_zero_point_valid(input_dtype, input_zero_point) ||
-        !qbyte_dtype_zero_point_valid(output_dtype, output_zero_point) ||
-        !input_bytes || !mask_bytes || !output_bytes ||
-        input_elements > UINT32_MAX / sequence) return 0;
-    input_elements *= sequence;
-    if (input_elements > UINT32_MAX / width ||
-        mask_elements > UINT32_MAX / sequence ||
-        output_elements > UINT32_MAX / width) return 0;
-    input_elements *= width;
-    mask_elements *= sequence;
-    output_elements *= width;
-    if (!input_elements || !mask_elements || !output_elements ||
-        input_elements > SIZE_MAX || mask_elements > SIZE_MAX / sizeof(*mask) ||
-        output_elements > SIZE_MAX) return 0;
-    if (input_dtype == VX_DTYPE_I8) {
-        low = -128 - (int64_t)input_zero_point;
-        high = 127 - (int64_t)input_zero_point;
-    } else {
-        low = -(int64_t)input_zero_point;
-        high = 255 - (int64_t)input_zero_point;
-    }
-    magnitude = (uint64_t)(low < 0 ? -low : low);
-    if ((uint64_t)(high < 0 ? -high : high) > magnitude)
-        magnitude = (uint64_t)(high < 0 ? -high : high);
-    multiplier = input_scale / output_scale;
-    if ((magnitude != 0 && (uint64_t)sequence > (uint64_t)INT32_MAX / magnitude) ||
-        !isfinite(multiplier) || multiplier <= 0.0f) return 0;
-    *input_bytes = (size_t)input_elements;
-    *mask_bytes = (size_t)mask_elements * sizeof(*mask);
-    *output_bytes = (size_t)output_elements;
-    return !qsdpa_ranges_overlap(output, *output_bytes, input, *input_bytes) &&
-        !qsdpa_ranges_overlap(output, *output_bytes, mask, *mask_bytes);
-}
-
-static int requantize_gpu_args_valid(const void* input, uint32_t input_elements,
-                                     void* output, uint32_t output_elements,
-                                     float input_scale, int32_t input_zero_point,
-                                     float output_scale, int32_t output_zero_point,
-                                     uint32_t input_dtype, uint32_t output_dtype,
-                                     float* multiplier, size_t* logical_bytes) {
-    if (!input || !output || input == output || input_elements == 0 ||
-        input_elements != output_elements || !isfinite(input_scale) ||
-        !isfinite(output_scale) || input_scale <= 0.0f || output_scale <= 0.0f ||
-        !qbyte_dtype_zero_point_valid(input_dtype, input_zero_point) ||
-        !qbyte_dtype_zero_point_valid(output_dtype, output_zero_point)) return 0;
-    float ratio = input_scale / output_scale;
-    if (!isfinite(ratio) || ratio <= 0.0f || (uint64_t)input_elements > SIZE_MAX) return 0;
-    *multiplier = ratio;
-    *logical_bytes = (size_t)input_elements;
-    return 1;
-}
-
-int opengl_graph_qbatch_matmul_i8u8(
-        const void* a, const int* a_shape, int a_rank,
-        float a_scale, int32_t a_zero_point, uint32_t a_dtype,
-        const void* b, const int* b_shape, int b_rank,
-        float b_scale, int32_t b_zero_point, uint32_t b_dtype,
-        void* output, const int* output_shape, int output_rank,
-        float output_scale, int32_t output_zero_point,
-        uint32_t output_dtype) {
-    VxQBatchMatMulDevicePlan plan;
-    uint32_t metadata[24] = {0};
-    uint32_t metadata_words;
-    size_t metadata_bytes;
-    size_t a_packed_bytes;
-    size_t b_packed_bytes;
-    size_t output_packed_bytes;
-    if (!ogl_ready() || max_ssbo_bindings < 4 ||
-        max_uniform_bindings < 1 ||
-        !vx_qbatch_matmul_device_plan(
-            a, a_shape, a_rank, a_scale, a_zero_point, a_dtype,
-            b, b_shape, b_rank, b_scale, b_zero_point, b_dtype,
-            output, output_shape, output_rank, output_scale,
-            output_zero_point, output_dtype, &plan) ||
-        !graph_packed_bytes(plan.a_bytes, &a_packed_bytes) ||
-        !graph_packed_bytes(plan.b_bytes, &b_packed_bytes) ||
-        !graph_packed_bytes(plan.output_bytes, &output_packed_bytes))
-        return 0;
-    OglTensorSlot* a_slot =
-        graph_ensure_packed_bytes(a, plan.a_bytes, 0);
-    OglTensorSlot* b_slot =
-        graph_ensure_packed_bytes(b, plan.b_bytes, 0);
-    OglTensorSlot* output_slot =
-        graph_output_packed_bytes(output, plan.output_bytes);
-    if (!a_slot || !b_slot || !output_slot) return 0;
-    memcpy(metadata, plan.output_batch_strides,
-           plan.batch_rank * sizeof(uint32_t));
-    memcpy(metadata + plan.batch_rank, plan.a_batch_strides,
-           plan.batch_rank * sizeof(uint32_t));
-    memcpy(metadata + 2u * plan.batch_rank, plan.b_batch_strides,
-           plan.batch_rank * sizeof(uint32_t));
-    metadata_words = plan.batch_rank ? 3u * plan.batch_rank : 1u;
-    metadata_bytes = (size_t)metadata_words * sizeof(uint32_t);
-    OglQBatchMatMulParams params = {
-        plan.batch_rank, plan.m, plan.k, plan.n,
-        plan.output_elements, a_dtype, b_dtype, output_dtype,
-        a_zero_point, b_zero_point, output_zero_point, 0,
-        a_scale, b_scale, output_scale, 0.0f,
-    };
-    GLuint metadata_buffer = create_buffer(metadata_bytes, metadata);
-    GLuint params_handle = params_buffer(&params, sizeof(params));
-    if (!metadata_buffer || !params_handle) {
-        if (metadata_buffer) p_glDeleteBuffers(1, &metadata_buffer);
-        if (params_handle) p_glDeleteBuffers(1, &params_handle);
-        return 0;
-    }
-    GLuint buffers[5] = {
-        a_slot->buffer, b_slot->buffer, output_slot->buffer,
-        metadata_buffer, params_handle,
-    };
-    uint32_t packed_words =
-        (uint32_t)(output_packed_bytes / sizeof(uint32_t));
-    int ok = dispatch_kernel(
-        &k_qbatch_matmul_i8u8, buffers,
-        (packed_words + 63u) / 64u, 1u, 1u);
-    p_glDeleteBuffers(1, &metadata_buffer);
-    p_glDeleteBuffers(1, &params_handle);
-    if (!ok) return 0;
-    graph_mark_device(output_slot);
-    return 1;
-}
-
-int opengl_graph_qadd_i8u8(const void* a, uint32_t a_elements,
-                           const void* b, uint32_t b_elements,
-                           void* output, uint32_t output_elements,
-                           float a_scale, int32_t a_zero_point,
-                           float b_scale, int32_t b_zero_point,
-                           float output_scale, int32_t output_zero_point,
-                           uint32_t a_dtype, uint32_t b_dtype,
-                           uint32_t output_dtype, uint32_t relu) {
-    if (!ogl_ready() || max_ssbo_bindings < 3 || max_uniform_bindings < 1) return 0;
-    size_t logical_bytes;
-    if (!qadd_gpu_args_valid(a, a_elements, b, b_elements, output, output_elements,
-                             a_scale, a_zero_point, b_scale, b_zero_point,
-                             output_scale, output_zero_point, a_dtype, b_dtype,
-                             output_dtype, relu, &logical_bytes)) return 0;
-    size_t packed_bytes;
-    if (!graph_packed_bytes(logical_bytes, &packed_bytes)) return 0;
-    OglTensorSlot* a_slot = graph_ensure_packed_bytes(a, logical_bytes, 0);
-    OglTensorSlot* b_slot = graph_ensure_packed_bytes(b, logical_bytes, 0);
-    OglTensorSlot* output_slot = graph_output_packed_bytes(output, logical_bytes);
-    if (!a_slot || !b_slot || !output_slot) return 0;
-    OglQAddParams params = {
-        a_elements, a_dtype,
-        b_dtype,
-        output_dtype,
-        a_zero_point, b_zero_point, output_zero_point, 0,
-        a_scale, b_scale, output_scale, relu
-    };
-    GLuint pb = params_buffer(&params, sizeof(params));
-    GLuint bufs[4] = {
-        a_slot->buffer, b_slot->buffer, output_slot->buffer, pb
-    };
-    uint32_t packed_words = (uint32_t)(packed_bytes / sizeof(uint32_t));
-    int ok = dispatch_kernel(&k_qadd_i8u8, bufs, (packed_words + 63u) / 64u,
-                             1u, 1u);
-    if (pb) p_glDeleteBuffers(1, &pb);
-    if (!ok) return 0;
-    graph_mark_device(output_slot);
-    return 1;
-}
-
-int opengl_graph_qsilu_i8u8(const void* input, void* output, uint32_t elements,
-                            float input_scale, int32_t input_zero_point,
-                            float output_scale, int32_t output_zero_point,
-                            uint32_t input_dtype, uint32_t output_dtype) {
-    if (!ogl_ready() || max_ssbo_bindings < 2 || max_uniform_bindings < 1) return 0;
-    size_t logical_bytes;
-    if (!qbyte_unary_gpu_args_valid(input, output, elements, input_scale,
-                                    input_zero_point, output_scale, output_zero_point,
-                                    input_dtype, output_dtype, &logical_bytes)) return 0;
-    size_t packed_bytes;
-    if (!graph_packed_bytes(logical_bytes, &packed_bytes)) return 0;
-    OglTensorSlot* input_slot = graph_ensure_packed_bytes(input, logical_bytes, 0);
-    OglTensorSlot* output_slot = graph_output_packed_bytes(output, logical_bytes);
-    if (!input_slot || !output_slot) return 0;
-    OglQByteUnaryParams params = {
-        elements, input_dtype,
-        output_dtype, 0u,
-        input_zero_point, output_zero_point, 0, 0,
-        input_scale, output_scale, 0.0f, 0.0f
-    };
-    GLuint pb = params_buffer(&params, sizeof(params));
-    GLuint bufs[3] = {input_slot->buffer, output_slot->buffer, pb};
-    uint32_t packed_words = (uint32_t)(packed_bytes / sizeof(uint32_t));
-    int ok = dispatch_kernel(&k_qsilu_i8u8, bufs, (packed_words + 63u) / 64u,
-                             1u, 1u);
-    if (pb) p_glDeleteBuffers(1, &pb);
-    if (!ok) return 0;
-    graph_mark_device(output_slot);
-    return 1;
-}
-
-int opengl_graph_qgelu_i8u8(const void* input, void* output, uint32_t elements,
-                            float input_scale, int32_t input_zero_point,
-                            float output_scale, int32_t output_zero_point,
-                            uint32_t input_dtype, uint32_t output_dtype) {
-    if (!ogl_ready() || max_ssbo_bindings < 2 || max_uniform_bindings < 1) return 0;
-    size_t logical_bytes;
-    if (!qbyte_unary_gpu_args_valid(input, output, elements, input_scale,
-                                    input_zero_point, output_scale, output_zero_point,
-                                    input_dtype, output_dtype, &logical_bytes)) return 0;
-    size_t packed_bytes;
-    if (!graph_packed_bytes(logical_bytes, &packed_bytes)) return 0;
-    OglTensorSlot* input_slot = graph_ensure_packed_bytes(input, logical_bytes, 0);
-    OglTensorSlot* output_slot = graph_output_packed_bytes(output, logical_bytes);
-    if (!input_slot || !output_slot) return 0;
-    OglQByteUnaryParams params = {
-        elements, input_dtype,
-        output_dtype, 0u,
-        input_zero_point, output_zero_point, 0, 0,
-        input_scale, output_scale, 0.0f, 0.0f
-    };
-    GLuint pb = params_buffer(&params, sizeof(params));
-    GLuint bufs[3] = {input_slot->buffer, output_slot->buffer, pb};
-    uint32_t packed_words = (uint32_t)(packed_bytes / sizeof(uint32_t));
-    int ok = dispatch_kernel(&k_qgelu_i8u8, bufs, (packed_words + 63u) / 64u,
-                             1u, 1u);
-    if (pb) p_glDeleteBuffers(1, &pb);
-    if (!ok) return 0;
-    graph_mark_device(output_slot);
-    return 1;
-}
-
-/* Statistics writes one F32 pair per [batch, group]; apply then owns whole
- * packed output words. The explicit storage barrier in dispatch_kernel makes
- * the first pass visible to the second without exposing an F32 activation. */
-int opengl_graph_qgroupnorm_i8u8(const void* input, const float* weight,
-                                 const float* bias, void* output, uint32_t batch,
-                                 uint32_t height, uint32_t width, uint32_t channels,
-                                 uint32_t groups, float input_scale,
-                                 int32_t input_zero_point, float output_scale,
-                                 int32_t output_zero_point, float epsilon,
-                                 uint32_t input_dtype, uint32_t output_dtype) {
-    size_t logical_bytes;
-    size_t affine_bytes;
-    size_t stats_bytes;
-    size_t packed_bytes;
-    if (!ogl_ready() || max_ssbo_bindings < 5 || max_uniform_bindings < 1 ||
-        !qgroupnorm_gpu_args_valid(input, weight, bias, output, batch, height,
-                                   width, channels, groups, input_scale,
-                                   input_zero_point, output_scale,
-                                   output_zero_point, epsilon, input_dtype,
-                                   output_dtype, &logical_bytes, &affine_bytes,
-                                   &stats_bytes) ||
-        stats_bytes > (size_t)INTPTR_MAX ||
-        !graph_packed_bytes(logical_bytes, &packed_bytes)) return 0;
-    OglTensorSlot* input_slot = graph_ensure_packed_bytes(input, logical_bytes, 0);
-    OglTensorSlot* weight_slot = graph_ensure_device(weight, affine_bytes, 1);
-    OglTensorSlot* bias_slot = graph_ensure_device(bias, affine_bytes, 1);
-    OglTensorSlot* output_slot = graph_output_packed_bytes(output, logical_bytes);
-    if (!input_slot || !weight_slot || !bias_slot || !output_slot) return 0;
-    OglQGroupNormParams params = {
-        batch, height, width, channels, groups,
-        input_dtype,
-        output_dtype, 0u,
-        input_zero_point, output_zero_point, 0, 0,
-        input_scale, output_scale, epsilon, 0.0f
-    };
-    GLuint stats_buffer = qgroupnorm_stats_ensure(stats_bytes);
-    GLuint params_buffer_handle = params_buffer(&params, sizeof(params));
-    if (!stats_buffer || !params_buffer_handle) {
-        if (params_buffer_handle) p_glDeleteBuffers(1, &params_buffer_handle);
-        return 0;
-    }
-    GLuint stats_binds[3] = {input_slot->buffer, stats_buffer, params_buffer_handle};
-    GLuint apply_binds[6] = {
-        input_slot->buffer, weight_slot->buffer, bias_slot->buffer, stats_buffer,
-        output_slot->buffer, params_buffer_handle
-    };
-    uint32_t total_groups = batch * groups;
-    uint32_t packed_words = (uint32_t)(packed_bytes / sizeof(uint32_t));
-    uint32_t apply_groups = packed_words / 64u + (packed_words % 64u != 0u);
-    int ok = dispatch_kernel(&k_qgroupnorm_stats, stats_binds, total_groups, 1u, 1u) &&
-             dispatch_kernel(&k_qgroupnorm_apply, apply_binds, apply_groups, 1u, 1u);
-    p_glDeleteBuffers(1, &params_buffer_handle);
-    if (!ok) return 0;
-    graph_mark_device(output_slot);
-    return 1;
-}
-
-/* Stats and apply are deliberately separate: the first pass owns a final-axis
- * row and the second owns complete packed output words, with the dispatcher
- * storage barrier making F32 row stats visible between them. */
-int opengl_graph_qlayernorm_i8u8(const void* input, const float* weight,
-                                 const float* bias, void* output, uint32_t rows,
-                                 uint32_t d_model, float input_scale,
-                                 int32_t input_zero_point, float output_scale,
-                                 int32_t output_zero_point, float epsilon,
-                                 uint32_t input_dtype, uint32_t output_dtype) {
-    size_t logical_bytes;
-    size_t affine_bytes;
-    size_t stats_bytes;
-    size_t packed_bytes;
-    if (!ogl_ready() || max_ssbo_bindings < 5 || max_uniform_bindings < 1 ||
-        !qlayernorm_gpu_args_valid(input, weight, bias, output, rows, d_model,
-                                   input_scale, input_zero_point, output_scale,
-                                   output_zero_point, epsilon, input_dtype,
-                                   output_dtype, &logical_bytes, &affine_bytes,
-                                   &stats_bytes) || stats_bytes > (size_t)INTPTR_MAX ||
-        !graph_packed_bytes(logical_bytes, &packed_bytes)) return 0;
-    OglTensorSlot* input_slot = graph_ensure_packed_bytes(input, logical_bytes, 0);
-    OglTensorSlot* weight_slot = graph_ensure_device(weight, affine_bytes, 1);
-    OglTensorSlot* bias_slot = graph_ensure_device(bias, affine_bytes, 1);
-    OglTensorSlot* output_slot = graph_output_packed_bytes(output, logical_bytes);
-    if (!input_slot || !weight_slot || !bias_slot || !output_slot) return 0;
-    OglQLayerNormParams params = {
-        rows, d_model, input_dtype,
-        output_dtype,
-        input_zero_point, output_zero_point, 0, 0,
-        input_scale, output_scale, epsilon, 0.0f
-    };
-    GLuint stats_buffer = qlayernorm_stats_ensure(stats_bytes);
-    GLuint params_buffer_handle = params_buffer(&params, sizeof(params));
-    if (!stats_buffer || !params_buffer_handle) {
-        if (params_buffer_handle) p_glDeleteBuffers(1, &params_buffer_handle);
-        return 0;
-    }
-    GLuint stats_binds[3] = {input_slot->buffer, stats_buffer, params_buffer_handle};
-    GLuint apply_binds[6] = {
-        input_slot->buffer, weight_slot->buffer, bias_slot->buffer, stats_buffer,
-        output_slot->buffer, params_buffer_handle
-    };
-    uint32_t packed_words = (uint32_t)(packed_bytes / sizeof(uint32_t));
-    uint32_t apply_groups = packed_words / 64u + (packed_words % 64u != 0u);
-    int ok = dispatch_kernel(&k_qlayernorm_stats, stats_binds, rows, 1u, 1u) &&
-             dispatch_kernel(&k_qlayernorm_apply, apply_binds, apply_groups, 1u, 1u);
-    p_glDeleteBuffers(1, &params_buffer_handle);
-    if (!ok) return 0;
-    graph_mark_device(output_slot);
-    return 1;
-}
-
-int opengl_graph_qsdpa_i8u8(const void* q, const void* k, const void* v,
-                            const int32_t* mask, void* output, uint32_t batch,
-                            uint32_t seq_q, uint32_t seq_kv, uint32_t d_model,
-                            uint32_t heads, float q_scale, int32_t q_zero_point,
-                            float k_scale, int32_t k_zero_point, float v_scale,
-                            int32_t v_zero_point, float output_scale,
-                            int32_t output_zero_point, float attention_scale,
-                            uint32_t q_dtype, uint32_t k_dtype, uint32_t v_dtype,
-                            uint32_t output_dtype, uint32_t causal,
-                            uint32_t mask_mode) {
-    size_t q_bytes;
-    size_t kv_bytes;
-    size_t mask_bytes;
-    size_t packed_output_bytes;
-    if (!ogl_ready() || max_ssbo_bindings < 5 || max_uniform_bindings < 1 ||
-        !qsdpa_gpu_args_valid(q, k, v, mask, output, batch, seq_q, seq_kv,
-                               d_model, heads, q_scale, q_zero_point, k_scale,
-                               k_zero_point, v_scale, v_zero_point, output_scale,
-                               output_zero_point, attention_scale, q_dtype, k_dtype,
-                               v_dtype, output_dtype, causal, mask_mode, &q_bytes,
-                               &kv_bytes, &mask_bytes) ||
-        !graph_packed_bytes(q_bytes, &packed_output_bytes)) return 0;
-    OglTensorSlot* q_slot = graph_ensure_packed_bytes(q, q_bytes, 0);
-    OglTensorSlot* k_slot = graph_ensure_packed_bytes(k, kv_bytes, 0);
-    OglTensorSlot* v_slot = graph_ensure_packed_bytes(v, kv_bytes, 0);
-    OglTensorSlot* mask_slot = mask_mode ? graph_ensure_device(mask, mask_bytes, 0) :
-        graph_ensure_device(qsdpa_dummy_mask, sizeof(qsdpa_dummy_mask), 1);
-    OglTensorSlot* output_slot = graph_output_packed_bytes(output, q_bytes);
-    if (!q_slot || !k_slot || !v_slot || !mask_slot || !output_slot) return 0;
-    OglQSDPAParams params = {
-        seq_q, seq_kv, d_model, heads,
-        batch, mask_mode, causal,
-        q_dtype |
-            (k_dtype << 8u) |
-            (v_dtype << 16u) |
-            (output_dtype << 24u),
-        q_zero_point, k_zero_point, v_zero_point, output_zero_point,
-        q_scale, k_scale, v_scale, output_scale,
-        attention_scale, 0.0f, 0.0f, 0.0f
-    };
-    GLuint params_buffer_handle = params_buffer(&params, sizeof(params));
-    if (!params_buffer_handle) return 0;
-    GLuint binds[6] = {
-        q_slot->buffer, k_slot->buffer, v_slot->buffer, mask_slot->buffer,
-        output_slot->buffer, params_buffer_handle
-    };
-    int ok = dispatch_kernel(&k_qsdpa_int8, binds, seq_q, heads, batch);
-    p_glDeleteBuffers(1, &params_buffer_handle);
-    if (!ok) return 0;
-    graph_mark_device(output_slot);
-    return 1;
-}
-
-/* qArgMaxInt8 owns one output index per [outer,inner] coordinate. Input stays
- * byte-packed, output is conventional I32 storage, and the 16-byte uniform
- * exactly mirrors the WebGPU ABI. */
-int opengl_graph_qargmax_i8u8(const void* input, int32_t* output,
-                              uint32_t outer, uint32_t axis_size,
-                              uint32_t inner, uint32_t input_dtype) {
-    size_t input_bytes;
-    size_t output_bytes;
-    uint32_t output_elements;
-    if (!ogl_ready() || max_ssbo_bindings < 2 || max_uniform_bindings < 1 ||
-        !qargmax_gpu_args_valid(input, output, outer, axis_size, inner,
-                                input_dtype, &input_bytes, &output_bytes,
-                                &output_elements)) return 0;
-    OglTensorSlot* input_slot = graph_ensure_packed_bytes(input, input_bytes, 0);
-    OglTensorSlot* output_slot = graph_output_slot(output, output_bytes);
-    if (!input_slot || !output_slot) return 0;
-    OglQArgMaxParams params = {
-        outer, axis_size, inner, input_dtype
-    };
-    GLuint params_buffer_handle = params_buffer(&params, sizeof(params));
-    if (!params_buffer_handle) return 0;
-    GLuint binds[3] = {
-        input_slot->buffer, output_slot->buffer, params_buffer_handle
-    };
-    int ok = dispatch_kernel(&k_qargmax_int8, binds,
-                             output_elements / 64u + (output_elements % 64u != 0u),
-                             1u, 1u);
-    p_glDeleteBuffers(1, &params_buffer_handle);
-    if (!ok) return 0;
-    graph_mark_device(output_slot);
-    return 1;
-}
-
-int opengl_graph_qmaskedmean_i8u8(const void* input, const int32_t* mask,
-                                  void* output, uint32_t batch,
-                                  uint32_t sequence, uint32_t width,
-                                  float input_scale, int32_t input_zero_point,
-                                  float output_scale, int32_t output_zero_point,
-                                  uint32_t input_dtype, uint32_t output_dtype) {
-    size_t input_bytes;
-    size_t mask_bytes;
-    size_t output_bytes;
-    size_t packed_output_bytes;
-    if (!ogl_ready() || max_ssbo_bindings < 3 || max_uniform_bindings < 1 ||
-        !qmaskedmean_gpu_args_valid(input, mask, output, batch, sequence, width,
-                                    input_scale, input_zero_point, output_scale,
-                                    output_zero_point, input_dtype, output_dtype,
-                                    &input_bytes, &mask_bytes, &output_bytes) ||
-        !graph_packed_bytes(output_bytes, &packed_output_bytes)) return 0;
-    OglTensorSlot* input_slot = graph_ensure_packed_bytes(input, input_bytes, 0);
-    OglTensorSlot* mask_slot = graph_ensure_device(mask, mask_bytes, 0);
-    OglTensorSlot* output_slot = graph_output_packed_bytes(output, output_bytes);
-    if (!input_slot || !mask_slot || !output_slot) return 0;
-    OglQMaskedMeanParams params = {
-        batch, sequence, width, input_dtype,
-        output_dtype, 0u, 0u, 0u,
-        input_zero_point, output_zero_point, input_scale, output_scale
-    };
-    GLuint params_buffer_handle = params_buffer(&params, sizeof(params));
-    if (!params_buffer_handle) return 0;
-    GLuint binds[4] = {
-        input_slot->buffer, mask_slot->buffer, output_slot->buffer,
-        params_buffer_handle
-    };
-    uint32_t packed_words = (uint32_t)(packed_output_bytes / sizeof(uint32_t));
-    int ok = dispatch_kernel(&k_qmaskedmean_int8, binds,
-                             (packed_words + 63u) / 64u, 1u, 1u);
-    p_glDeleteBuffers(1, &params_buffer_handle);
-    if (!ok) return 0;
-    graph_mark_device(output_slot);
-    return 1;
-}
-
-int opengl_graph_requantize_linear_i8u8(const void* input, uint32_t input_elements,
-                                        void* output, uint32_t output_elements,
-                                        float input_scale, int32_t input_zero_point,
-                                        float output_scale, int32_t output_zero_point,
-                                        uint32_t input_dtype, uint32_t output_dtype) {
-    if (!ogl_ready() || max_ssbo_bindings < 2 || max_uniform_bindings < 1) return 0;
-    float multiplier;
-    size_t logical_bytes;
-    if (!requantize_gpu_args_valid(input, input_elements, output, output_elements,
-                                   input_scale, input_zero_point,
-                                   output_scale, output_zero_point,
-                                   input_dtype, output_dtype,
-                                   &multiplier, &logical_bytes)) return 0;
-    size_t packed_bytes;
-    if (!graph_packed_bytes(logical_bytes, &packed_bytes)) return 0;
-    OglTensorSlot* input_slot = graph_ensure_packed_bytes(input, logical_bytes, 0);
-    OglTensorSlot* output_slot = graph_output_packed_bytes(output, logical_bytes);
-    if (!input_slot || !output_slot) return 0;
-    OglRequantizeLinearParams params = {
-        input_elements, input_dtype,
-        output_dtype, 0u,
-        input_zero_point, output_zero_point, 0, 0,
-        multiplier, 0.0f, 0.0f, 0.0f
-    };
-    GLuint pb = params_buffer(&params, sizeof(params));
-    GLuint bufs[3] = {input_slot->buffer, output_slot->buffer, pb};
-    uint32_t packed_words = (uint32_t)(packed_bytes / sizeof(uint32_t));
-    int ok = dispatch_kernel(&k_requantize_linear_i8u8, bufs,
-                             (packed_words + 63u) / 64u, 1u, 1u);
-    if (pb) p_glDeleteBuffers(1, &pb);
-    if (!ok) return 0;
-    graph_mark_device(output_slot);
-    return 1;
-}
-
-static const int32_t* qconv_zero_bias_get(uint32_t output_channels) {
-    if (output_channels == 0 ||
-        (size_t)output_channels > SIZE_MAX / sizeof(int32_t)) return NULL;
-    for (QConvZeroBiasBacking* block = qconv_zero_bias_backings; block;
-         block = block->next) {
-        /* Domain-enforced invariant slots retain an exact readable range.
-         * Give every distinct channel width a stable host key so a later
-         * smaller zero bias cannot narrow an earlier larger binding. */
-        if (block->elements == output_channels) return block->values;
-    }
-    QConvZeroBiasBacking* block = (QConvZeroBiasBacking*)calloc(1, sizeof(*block));
-    if (!block) return NULL;
-    block->values = (int32_t*)calloc((size_t)output_channels, sizeof(*block->values));
-    if (!block->values) {
-        free(block);
-        return NULL;
-    }
-    block->elements = output_channels;
-    block->next = qconv_zero_bias_backings;
-    qconv_zero_bias_backings = block;
-    return block->values;
-}
-
-static void qconv_zero_bias_release_state(OpenGLContextState* state) {
-    if (!state) return;
-    while (state->qconv_zero_bias_storage) {
-        QConvZeroBiasBacking* block = state->qconv_zero_bias_storage;
-        state->qconv_zero_bias_storage = block->next;
-        free(block->values);
-        free(block);
-    }
-}
-
-typedef struct {
-    uint32_t batch;
-    uint32_t input_height;
-    uint32_t input_width;
-    uint32_t input_channels;
-    uint32_t output_height;
-    uint32_t output_width;
-    uint32_t output_channels;
-    uint32_t kernel_height;
-    uint32_t kernel_width;
-    uint32_t stride_y;
-    uint32_t stride_x;
-    uint32_t dilation_y;
-    uint32_t dilation_x;
-    uint32_t pad_top;
-    uint32_t pad_left;
-    uint32_t groups;
-    uint32_t input_type;
-    uint32_t weight_type;
-    uint32_t output_type;
-    uint32_t relu;
-    int32_t input_zero_point;
-    int32_t output_zero_point;
-    int32_t pad0;
-    int32_t pad1;
-    float input_scale;
-    float output_scale;
-    float pad2;
-    float pad3;
-} OglQConv2DParams;
-
-_Static_assert(sizeof(OglQConv2DParams) == 112, "qConv2DInt8 uniform ABI");
-
-static int qconv_mul_u64(uint64_t left, uint64_t right, uint64_t* out) {
-    if (!out || (left != 0 && right > UINT64_MAX / left)) return 0;
-    *out = left * right;
-    return 1;
-}
-
-static int32_t qconv_i32_at(const int32_t* values, uint32_t index) {
-    int32_t value;
-    memcpy(&value, (const unsigned char*)values + (size_t)index * sizeof(value),
-           sizeof(value));
-    return value;
-}
-
-static float qconv_f32_at(const float* values, uint32_t index) {
-    float value;
-    memcpy(&value, (const unsigned char*)values + (size_t)index * sizeof(value),
-           sizeof(value));
-    return value;
-}
-
-static int qconv_gpu_args_valid(const void* input, const void* weight,
-                                const float* weight_scales,
-                                const int32_t* weight_zero_points,
-                                const int32_t* bias, void* output,
-                                uint32_t batch, uint32_t input_height,
-                                uint32_t input_width, uint32_t input_channels,
-                                uint32_t output_height, uint32_t output_width,
-                                uint32_t output_channels, uint32_t kernel_height,
-                                uint32_t kernel_width, uint32_t input_per_group,
-                                uint32_t stride_y, uint32_t stride_x,
-                                uint32_t dilation_y, uint32_t dilation_x,
-                                uint32_t padding_top, uint32_t padding_left,
-                                uint32_t padding_bottom, uint32_t padding_right,
-                                uint32_t groups, uint32_t relu,
-                                float input_scale, int32_t input_zero_point,
-                                float output_scale, int32_t output_zero_point,
-                                uint32_t input_dtype, uint32_t weight_dtype,
-                                uint32_t output_dtype,
-                                size_t* input_bytes, size_t* weight_bytes,
-                                size_t* output_bytes, size_t* metadata_bytes) {
-    uint64_t input_elements = 1, weight_elements = 1, output_elements = 1;
-    uint64_t terms = 1, padded_height, padded_width;
-    uint64_t effective_height, effective_width;
-    uint64_t expected_height, expected_width;
-    uint64_t input_magnitude;
-    if (!input || !weight || !weight_scales || !weight_zero_points || !output ||
-        output == input || output == weight || !batch || !input_height ||
-        !input_width || !input_channels || !output_height || !output_width ||
-        !output_channels || !kernel_height || !kernel_width || !input_per_group ||
-        !stride_y || !stride_x || !dilation_y || !dilation_x || !groups || relu > 2u ||
-        !isfinite(input_scale) || input_scale <= 0.0f ||
-        !isfinite(output_scale) || output_scale <= 0.0f ||
-        !qbyte_dtype_zero_point_valid(input_dtype, input_zero_point) ||
-        !qbyte_dtype_zero_point_valid(output_dtype, output_zero_point) ||
-        (weight_dtype != VX_DTYPE_I8 && weight_dtype != VX_DTYPE_U8) ||
-        input_channels % groups || output_channels % groups ||
-        (uint64_t)input_per_group * groups != input_channels) return 0;
-    if (!qconv_mul_u64(input_elements, batch, &input_elements) ||
-        !qconv_mul_u64(input_elements, input_height, &input_elements) ||
-        !qconv_mul_u64(input_elements, input_width, &input_elements) ||
-        !qconv_mul_u64(input_elements, input_channels, &input_elements) ||
-        !qconv_mul_u64(weight_elements, output_channels, &weight_elements) ||
-        !qconv_mul_u64(weight_elements, kernel_height, &weight_elements) ||
-        !qconv_mul_u64(weight_elements, kernel_width, &weight_elements) ||
-        !qconv_mul_u64(weight_elements, input_per_group, &weight_elements) ||
-        !qconv_mul_u64(output_elements, batch, &output_elements) ||
-        !qconv_mul_u64(output_elements, output_height, &output_elements) ||
-        !qconv_mul_u64(output_elements, output_width, &output_elements) ||
-        !qconv_mul_u64(output_elements, output_channels, &output_elements) ||
-        !qconv_mul_u64(terms, kernel_height, &terms) ||
-        !qconv_mul_u64(terms, kernel_width, &terms) ||
-        !qconv_mul_u64(terms, input_per_group, &terms) ||
-        input_elements > UINT32_MAX || weight_elements > UINT32_MAX ||
-        output_elements > UINT32_MAX || input_elements > SIZE_MAX ||
-        weight_elements > SIZE_MAX || output_elements > SIZE_MAX ||
-        (size_t)output_channels > SIZE_MAX / sizeof(float) ||
-        (size_t)output_channels > SIZE_MAX / sizeof(int32_t)) return 0;
-    if ((uint64_t)(kernel_height - 1u) > (UINT64_MAX - 1u) / dilation_y ||
-        (uint64_t)(kernel_width - 1u) > (UINT64_MAX - 1u) / dilation_x) return 0;
-    padded_height = (uint64_t)input_height + padding_top + padding_bottom;
-    padded_width = (uint64_t)input_width + padding_left + padding_right;
-    effective_height = (uint64_t)(kernel_height - 1u) * dilation_y + 1u;
-    effective_width = (uint64_t)(kernel_width - 1u) * dilation_x + 1u;
-    if (padded_height < effective_height || padded_width < effective_width) return 0;
-    expected_height = (padded_height - effective_height) / stride_y + 1u;
-    expected_width = (padded_width - effective_width) / stride_x + 1u;
-    if (expected_height != output_height || expected_width != output_width) return 0;
-    {
-        int64_t low = (int64_t)(input_dtype == VX_DTYPE_I8 ? -128 : 0) -
-            input_zero_point;
-        int64_t high = (int64_t)(input_dtype == VX_DTYPE_I8 ? 127 : 255) -
-            input_zero_point;
-        uint64_t low_magnitude = (uint64_t)(low < 0 ? -low : low);
-        uint64_t high_magnitude = (uint64_t)(high < 0 ? -high : high);
-        input_magnitude = low_magnitude > high_magnitude ? low_magnitude : high_magnitude;
-    }
-    for (uint32_t output_channel = 0; output_channel < output_channels;
-         output_channel++) {
-        const float weight_scale = qconv_f32_at(weight_scales, output_channel);
-        const int32_t weight_zero_point = qconv_i32_at(weight_zero_points, output_channel);
-        int64_t low, high;
-        uint64_t weight_magnitude, accumulator_bound, bias_magnitude = 0;
-        if (!isfinite(weight_scale) || weight_scale <= 0.0f ||
-            !qbyte_dtype_zero_point_valid(weight_dtype, weight_zero_point)) return 0;
-        low = (int64_t)(weight_dtype == VX_DTYPE_I8 ? -128 : 0) -
-            weight_zero_point;
-        high = (int64_t)(weight_dtype == VX_DTYPE_I8 ? 127 : 255) -
-            weight_zero_point;
-        weight_magnitude = (uint64_t)(low < 0 ? -low : low);
-        {
-            uint64_t high_magnitude = (uint64_t)(high < 0 ? -high : high);
-            if (high_magnitude > weight_magnitude) weight_magnitude = high_magnitude;
-        }
-        if (input_magnitude && weight_magnitude &&
-            terms > (uint64_t)INT32_MAX / input_magnitude / weight_magnitude) return 0;
-        accumulator_bound = input_magnitude * weight_magnitude * terms;
-        if (bias) {
-            int64_t bias_value = qconv_i32_at(bias, output_channel);
-            bias_magnitude = (uint64_t)(bias_value < 0 ? -bias_value : bias_value);
-        }
-        if (accumulator_bound > (uint64_t)INT32_MAX ||
-            bias_magnitude > (uint64_t)INT32_MAX - accumulator_bound) return 0;
-    }
-    *input_bytes = (size_t)input_elements;
-    *weight_bytes = (size_t)weight_elements;
-    *output_bytes = (size_t)output_elements;
-    *metadata_bytes = (size_t)output_channels * sizeof(int32_t);
-    return 1;
-}
-
-int opengl_graph_qconv2d_i8u8(const void* input, const void* weight,
-                               const float* weight_scales,
-                               const int32_t* weight_zero_points,
-                               const int32_t* bias, void* output,
-                               uint32_t batch, uint32_t input_height,
-                               uint32_t input_width, uint32_t input_channels,
-                               uint32_t output_height, uint32_t output_width,
-                               uint32_t output_channels, uint32_t kernel_height,
-                               uint32_t kernel_width, uint32_t input_per_group,
-                               uint32_t stride_y, uint32_t stride_x,
-                               uint32_t dilation_y, uint32_t dilation_x,
-                               uint32_t padding_top, uint32_t padding_left,
-                               uint32_t padding_bottom, uint32_t padding_right,
-                               uint32_t groups, uint32_t relu,
-                               float input_scale, int32_t input_zero_point,
-                               float output_scale, int32_t output_zero_point,
-                               uint32_t input_dtype, uint32_t weight_dtype,
-                               uint32_t output_dtype) {
-    if (!ogl_ready() || max_ssbo_bindings < 6 || max_uniform_bindings < 1) return 0;
-    size_t input_bytes, weight_bytes, output_bytes, metadata_bytes;
-    if (!qconv_gpu_args_valid(input, weight, weight_scales, weight_zero_points,
-                              bias, output, batch, input_height, input_width,
-                              input_channels, output_height, output_width,
-                              output_channels, kernel_height, kernel_width,
-                              input_per_group, stride_y, stride_x, dilation_y,
-                              dilation_x, padding_top, padding_left,
-                              padding_bottom, padding_right, groups, relu,
-                              input_scale, input_zero_point, output_scale,
-                              output_zero_point, input_dtype, weight_dtype,
-                              output_dtype, &input_bytes, &weight_bytes,
-                              &output_bytes, &metadata_bytes)) return 0;
-    const int32_t* bound_bias = bias ? bias : qconv_zero_bias_get(output_channels);
-    if (!bound_bias) return 0;
-    size_t packed_output_bytes;
-    if (!graph_packed_bytes(output_bytes, &packed_output_bytes)) return 0;
-    OglTensorSlot* input_slot = graph_ensure_packed_bytes(input, input_bytes, 0);
-    OglTensorSlot* weight_slot = graph_ensure_packed_bytes(weight, weight_bytes, 1);
-    OglTensorSlot* scales_slot = graph_ensure_device(weight_scales,
-                                                      (size_t)output_channels * sizeof(float), 1);
-    OglTensorSlot* zero_points_slot = graph_ensure_device(weight_zero_points, metadata_bytes, 1);
-    OglTensorSlot* bias_slot = graph_ensure_device(bound_bias, metadata_bytes, 1);
-    OglTensorSlot* output_slot = graph_output_packed_bytes(output, output_bytes);
-    if (!input_slot || !weight_slot || !scales_slot || !zero_points_slot ||
-        !bias_slot || !output_slot) return 0;
-    OglQConv2DParams params = {
-        batch, input_height, input_width, input_channels,
-        output_height, output_width, output_channels, kernel_height,
-        kernel_width, stride_y, stride_x, dilation_y,
-        dilation_x, padding_top, padding_left, groups,
-        input_dtype,
-        weight_dtype,
-        output_dtype, relu,
-        input_zero_point, output_zero_point, 0, 0,
-        input_scale, output_scale, 0.0f, 0.0f
-    };
-    GLuint pb = params_buffer(&params, sizeof(params));
-    GLuint bufs[7] = {
-        input_slot->buffer, weight_slot->buffer, scales_slot->buffer,
-        zero_points_slot->buffer, bias_slot->buffer, output_slot->buffer, pb
-    };
-    uint32_t packed_words = (uint32_t)(packed_output_bytes / sizeof(uint32_t));
-    const uint64_t reduction_size = (uint64_t)kernel_height * kernel_width * input_per_group;
-    int tiled = qconv_tiled_enabled && groups == 1u && output_channels >= 32u &&
-                reduction_size >= 16u && (output_channels & 3u) == 0u &&
-                opengl_workgroup_supported(8u, 4u, 1u);
-    int ok = 0;
-    if (tiled) {
-        const uint32_t spatial = batch * output_height * output_width;
-        const uint32_t words_per_spatial = output_channels / 4u;
-        ok = dispatch_kernel(&k_qconv2d_int8_tiled, bufs,
-                             (words_per_spatial + 7u) / 8u,
-                             (spatial + 3u) / 4u, 1u);
-    }
-    if (!ok) {
-        ok = dispatch_kernel(&k_qconv2d_int8, bufs,
-                             (packed_words + 63u) / 64u, 1u, 1u);
-    }
-    if (pb) p_glDeleteBuffers(1, &pb);
-    if (!ok) return 0;
-    graph_mark_device(output_slot);
-    return 1;
-}
-
-typedef struct { uint32_t elements, pad0, pad1, pad2; } OglTypedCopyParams;
-typedef struct { uint32_t size, axis_offset, input_axis, output_axis, inner, pad0, pad1, pad2; } OglTypedConcatParams;
-typedef struct { uint32_t n, h, w, c, out_h, out_w, ky, kx, sy, sx, py, px, dtype, pad0, pad1, pad2; } OglTypedMaxPoolParams;
-typedef struct { uint32_t n, h, w, c, out_h, out_w, pad0, pad1; } OglTypedResizeParams;
-typedef struct { uint32_t elements, output_type, zero_point_type, has_zero_point; } OglTypedQuantizeParams;
-typedef struct { uint32_t size, input_type, scale_type, zero_point_type, output_type, has_zero_point, pad0, pad1; } OglTypedDequantizeParams;
-
-_Static_assert(sizeof(OglTypedCopyParams) == 16, "copyTyped uniform ABI");
-_Static_assert(sizeof(OglTypedConcatParams) == 32, "concatCopyTyped uniform ABI");
-_Static_assert(sizeof(OglTypedMaxPoolParams) == 64, "maxPool2DTyped uniform ABI");
-_Static_assert(sizeof(OglTypedResizeParams) == 32, "resizeNearestTyped uniform ABI");
-_Static_assert(sizeof(OglTypedQuantizeParams) == 16, "quantizeLinearTyped uniform ABI");
-_Static_assert(sizeof(OglTypedDequantizeParams) == 32, "dequantizeLinearTyped uniform ABI");
-
-static int typed_shape_qdesc_valid(float scale, int32_t zero_point, uint32_t dtype) {
-    return isfinite(scale) && scale > 0.0f && qbyte_dtype_zero_point_valid(dtype, zero_point);
-}
-
-static int typed_shape_qdesc_same(float input_scale, int32_t input_zero_point,
-                                  uint32_t input_dtype, float output_scale,
-                                  int32_t output_zero_point, uint32_t output_dtype) {
-    return typed_shape_qdesc_valid(input_scale, input_zero_point, input_dtype) &&
-        typed_shape_qdesc_valid(output_scale, output_zero_point, output_dtype) &&
-        input_dtype == output_dtype && input_zero_point == output_zero_point && input_scale == output_scale;
-}
-
-static int typed_shape_nhwc_elements(uint32_t n, uint32_t h, uint32_t w, uint32_t c,
-                                     uint32_t* elements) {
-    uint64_t value = n;
-    if (!n || !h || !w || !c || !elements || !qconv_mul_u64(value, h, &value) ||
-        !qconv_mul_u64(value, w, &value) || !qconv_mul_u64(value, c, &value) ||
-        value > UINT32_MAX) return 0;
-    *elements = (uint32_t)value;
-    return 1;
-}
-
-static uint32_t typed_shape_groups(uint32_t elements) { return elements / 64u + (elements % 64u != 0u); }
-static uint32_t typed_shape_packed_groups(size_t bytes) { return typed_shape_groups((uint32_t)(bytes / sizeof(uint32_t))); }
-static uint32_t typed_shape_zero_word(int32_t zero_point, uint32_t dtype) {
-    return dtype == VX_DTYPE_I8 ? (uint32_t)(uint8_t)(int8_t)zero_point :
-        (uint32_t)(uint8_t)zero_point;
-}
-
-static int graph_zero_packed_output(OglTensorSlot* slot, size_t bytes) {
-    unsigned char* zeros = (unsigned char*)calloc(bytes, 1);
-    if (!slot || !zeros) return 0;
-    int ok = slot_ensure_owned_buffer(slot, bytes, zeros);
-    free(zeros);
-    if (!ok) return 0;
-    slot->host_dirty = 0;
-    slot->device_dirty = 0;
-    return 1;
-}
-
-int opengl_graph_quantize_typed_f32_i8u8(const float* input, uint32_t elements,
-                                         void* output, float output_scale,
-                                         int32_t output_zero_point, uint32_t output_dtype) {
-    if (!ogl_ready() || max_ssbo_bindings < 4 || max_uniform_bindings < 1 || !input || !output ||
-        input == output || !elements || !typed_shape_qdesc_valid(output_scale, output_zero_point, output_dtype) ||
-        (uint64_t)elements > SIZE_MAX / sizeof(float)) return 0;
-    size_t packed_output_bytes;
-    if (!graph_packed_bytes(elements, &packed_output_bytes)) return 0;
-    OglTensorSlot* input_slot = graph_ensure_device(input, (size_t)elements * sizeof(float), 0);
-    OglTensorSlot* output_slot = graph_output_packed_bytes(output, elements);
-    if (!input_slot || !output_slot) return 0;
-    uint32_t zero_word = typed_shape_zero_word(output_zero_point, output_dtype);
-    OglTypedQuantizeParams params = {
-        elements, output_dtype, output_dtype, 1u
-    };
-    GLuint scale_buffer = create_buffer(sizeof(output_scale), &output_scale);
-    GLuint zero_buffer = create_buffer(sizeof(zero_word), &zero_word);
-    GLuint pb = params_buffer(&params, sizeof(params));
-    GLuint bufs[5] = {input_slot->buffer, scale_buffer, zero_buffer, output_slot->buffer, pb};
-    int ok = dispatch_kernel(&k_quantize_typed_i8u8, bufs, typed_shape_packed_groups(packed_output_bytes), 1u, 1u);
-    if (scale_buffer) p_glDeleteBuffers(1, &scale_buffer);
-    if (zero_buffer) p_glDeleteBuffers(1, &zero_buffer);
-    if (pb) p_glDeleteBuffers(1, &pb);
-    if (!ok) return 0;
-    graph_mark_device(output_slot);
-    return 1;
-}
-
-int opengl_graph_dequantize_typed_i8u8_f32(const void* input, uint32_t elements,
-                                           float input_scale, int32_t input_zero_point,
-                                           uint32_t input_dtype, float* output) {
-    if (!ogl_ready() || max_ssbo_bindings < 4 || max_uniform_bindings < 1 || !input || !output ||
-        input == output || !elements || !typed_shape_qdesc_valid(input_scale, input_zero_point, input_dtype) ||
-        (uint64_t)elements > SIZE_MAX / sizeof(float)) return 0;
-    size_t packed_input_bytes;
-    if (!graph_packed_bytes(elements, &packed_input_bytes)) return 0;
-    OglTensorSlot* input_slot = graph_ensure_packed_bytes(input, elements, 0);
-    OglTensorSlot* output_slot = graph_output_slot(output, (size_t)elements * sizeof(float));
-    if (!input_slot || !output_slot) return 0;
-    uint32_t zero_word = typed_shape_zero_word(input_zero_point, input_dtype);
-    OglTypedDequantizeParams params = {
-        elements, input_dtype, VX_DTYPE_F32, input_dtype,
-        VX_DTYPE_F32, 1u, 0u, 0u
-    };
-    GLuint scale_buffer = create_buffer(sizeof(input_scale), &input_scale);
-    GLuint zero_buffer = create_buffer(sizeof(zero_word), &zero_word);
-    GLuint pb = params_buffer(&params, sizeof(params));
-    GLuint bufs[5] = {input_slot->buffer, scale_buffer, zero_buffer, output_slot->buffer, pb};
-    int ok = dispatch_kernel(&k_dequantize_typed_i8u8, bufs, typed_shape_groups(elements), 1u, 1u);
-    if (scale_buffer) p_glDeleteBuffers(1, &scale_buffer);
-    if (zero_buffer) p_glDeleteBuffers(1, &zero_buffer);
-    if (pb) p_glDeleteBuffers(1, &pb);
-    if (!ok) return 0;
-    graph_mark_device(output_slot);
-    return 1;
-}
-
-int opengl_graph_copy_i8u8(const void* input, uint32_t input_elements,
-                           void* output, uint32_t output_elements,
-                           float input_scale, int32_t input_zero_point,
-                           float output_scale, int32_t output_zero_point,
-                           uint32_t input_dtype, uint32_t output_dtype) {
-    if (!ogl_ready() || max_ssbo_bindings < 2 || max_uniform_bindings < 1 || !input || !output ||
-        input == output || !input_elements || input_elements != output_elements ||
-        !typed_shape_qdesc_same(input_scale, input_zero_point, input_dtype, output_scale, output_zero_point, output_dtype)) return 0;
-    size_t packed_bytes;
-    if (!graph_packed_bytes(input_elements, &packed_bytes)) return 0;
-    OglTensorSlot* input_slot = graph_ensure_packed_bytes(input, input_elements, 0);
-    OglTensorSlot* output_slot = graph_output_packed_bytes(output, output_elements);
-    if (!input_slot || !output_slot) return 0;
-    OglTypedCopyParams params = {input_elements, 0u, 0u, 0u};
-    GLuint pb = params_buffer(&params, sizeof(params));
-    GLuint bufs[3] = {input_slot->buffer, output_slot->buffer, pb};
-    int ok = dispatch_kernel(&k_copy_typed_i8u8, bufs, typed_shape_packed_groups(packed_bytes), 1u, 1u);
-    if (pb) p_glDeleteBuffers(1, &pb);
-    if (!ok) return 0;
-    graph_mark_device(output_slot);
-    return 1;
-}
-
-int opengl_graph_transpose_i8u8(
-        const void* input, void* output, const uint32_t* input_shape,
-        const uint32_t* permutation, uint32_t rank, uint32_t elements,
-        float input_scale, int32_t input_zero_point, float output_scale,
-        int32_t output_zero_point, uint32_t input_dtype,
-        uint32_t output_dtype) {
-    uint32_t input_strides[8] = {0};
-    uint32_t output_shape[8] = {0};
-    uint32_t output_strides[8] = {0};
-    uint32_t metadata[18] = {0};
-    uint32_t seen = 0;
-    uint64_t product = 1;
-    uint64_t stride = 1;
-    size_t packed_bytes;
-    if (!ogl_ready() || max_ssbo_bindings < 3 || !input || !output ||
-        !input_shape || !permutation || rank == 0 || rank > 8 ||
-        elements == 0 ||
-        !typed_shape_qdesc_same(input_scale, input_zero_point, input_dtype,
-                                output_scale, output_zero_point, output_dtype) ||
-        qsdpa_ranges_overlap(output, elements, input, elements)) return 0;
-    for (uint32_t reverse = rank; reverse-- > 0;) {
-        if (!input_shape[reverse] || stride > UINT32_MAX) return 0;
-        input_strides[reverse] = (uint32_t)stride;
-        stride *= input_shape[reverse];
-        if (stride > UINT32_MAX) return 0;
-    }
-    if (stride != elements) return 0;
-    for (uint32_t dimension = 0; dimension < rank; dimension++) {
-        uint32_t source = permutation[dimension];
-        if (source >= rank || (seen & (1u << source))) return 0;
-        seen |= 1u << source;
-        output_shape[dimension] = input_shape[source];
-        if (product > UINT32_MAX / output_shape[dimension]) return 0;
-        product *= output_shape[dimension];
-    }
-    if (product != elements) return 0;
-    stride = 1;
-    for (uint32_t reverse = rank; reverse-- > 0;) {
-        output_strides[reverse] = (uint32_t)stride;
-        stride *= output_shape[reverse];
-    }
-    if (!graph_packed_bytes(elements, &packed_bytes)) return 0;
-    OglTensorSlot* input_slot =
-        graph_ensure_packed_bytes(input, elements, 0);
-    OglTensorSlot* output_slot =
-        graph_output_packed_bytes(output, elements);
-    if (!input_slot || !output_slot) return 0;
-    metadata[0] = elements;
-    metadata[1] = rank;
-    for (uint32_t dimension = 0; dimension < rank; dimension++) {
-        metadata[2 + dimension] = output_strides[dimension];
-        metadata[2 + rank + dimension] =
-            input_strides[permutation[dimension]];
-    }
-    size_t metadata_bytes = (size_t)(2 + 2 * rank) * sizeof(uint32_t);
-    GLuint metadata_buffer = create_buffer(metadata_bytes, metadata);
-    if (!metadata_buffer) return 0;
-    GLuint buffers[3] = {
-        input_slot->buffer, output_slot->buffer, metadata_buffer,
-    };
-    int ok = dispatch_kernel(
-        &k_transpose_typed_i8u8, buffers,
-        typed_shape_packed_groups(packed_bytes), 1u, 1u);
-    p_glDeleteBuffers(1, &metadata_buffer);
-    if (!ok) return 0;
-    graph_mark_device(output_slot);
-    return 1;
-}
-
-int opengl_graph_concat_i8u8(const void* const* inputs, const uint32_t* input_elements,
-                             const uint32_t* input_axes, const float* input_scales,
-                             const int32_t* input_zero_points, const uint32_t* input_dtypes,
-                             uint32_t input_count, void* output, uint32_t output_elements,
-                             uint32_t output_axis, uint32_t inner,
-                             float output_scale, int32_t output_zero_point,
-                             uint32_t output_dtype) {
-    if (!ogl_ready() || max_ssbo_bindings < 2 || max_uniform_bindings < 1 || !inputs || !input_elements ||
-        !input_axes || !input_scales || !input_zero_points || !input_dtypes || !output || !input_count ||
-        !output_elements || !output_axis || !inner || !typed_shape_qdesc_valid(output_scale, output_zero_point, output_dtype)) return 0;
-    uint64_t output_width = (uint64_t)output_axis * inner;
-    if (!output_width || output_width > output_elements || output_elements % output_width) return 0;
-    uint64_t outer = output_elements / output_width, axis_sum = 0;
-    for (uint32_t index = 0; index < input_count; index++) {
-        uint64_t expected = 0;
-        if (!qconv_mul_u64(outer, input_axes[index], &expected) ||
-            !qconv_mul_u64(expected, inner, &expected)) {
-            return 0;
-        }
-        if (!inputs[index] || inputs[index] == output || !input_axes[index] || expected != input_elements[index] ||
-            !typed_shape_qdesc_same(input_scales[index], input_zero_points[index], input_dtypes[index], output_scale, output_zero_point, output_dtype) ||
-            axis_sum > UINT32_MAX - input_axes[index]) return 0;
-        axis_sum += input_axes[index];
-    }
-    if (axis_sum != output_axis) return 0;
-    size_t packed_output_bytes;
-    if (!graph_packed_bytes(output_elements, &packed_output_bytes)) return 0;
-    OglTensorSlot* output_slot = graph_output_packed_bytes(output, output_elements);
-    if (!output_slot || !graph_zero_packed_output(output_slot, packed_output_bytes)) return 0;
-    uint32_t axis_offset = 0;
-    for (uint32_t index = 0; index < input_count; index++) {
-        OglTensorSlot* input_slot = graph_ensure_packed_bytes(inputs[index], input_elements[index], 0);
-        if (!input_slot) return 0;
-        OglTypedConcatParams params = {input_elements[index], axis_offset, input_axes[index], output_axis, inner, 0u, 0u, 0u};
-        GLuint pb = params_buffer(&params, sizeof(params));
-        GLuint bufs[3] = {input_slot->buffer, output_slot->buffer, pb};
-        int ok = dispatch_kernel(&k_concat_typed_i8u8, bufs, typed_shape_groups(input_elements[index]), 1u, 1u);
-        if (pb) p_glDeleteBuffers(1, &pb);
-        if (!ok) return 0;
-        axis_offset += input_axes[index];
-    }
-    graph_mark_device(output_slot);
-    return 1;
-}
-
-int opengl_graph_maxpool2d_i8u8(const void* input, void* output,
-                                uint32_t batch, uint32_t input_height, uint32_t input_width, uint32_t channels,
-                                uint32_t output_height, uint32_t output_width, uint32_t kernel_y, uint32_t kernel_x,
-                                uint32_t stride_y, uint32_t stride_x, uint32_t padding_top, uint32_t padding_left,
-                                uint32_t padding_bottom, uint32_t padding_right, float input_scale,
-                                int32_t input_zero_point, float output_scale, int32_t output_zero_point,
-                                uint32_t input_dtype, uint32_t output_dtype) {
-    uint32_t input_elements, output_elements;
-    uint64_t padded_height, padded_width, expected_height, expected_width;
-    if (!ogl_ready() || max_ssbo_bindings < 2 || max_uniform_bindings < 1 || !input || !output || input == output ||
-        !kernel_y || !kernel_x || !stride_y || !stride_x || !typed_shape_qdesc_same(input_scale, input_zero_point, input_dtype, output_scale, output_zero_point, output_dtype) ||
-        !typed_shape_nhwc_elements(batch, input_height, input_width, channels, &input_elements) ||
-        !typed_shape_nhwc_elements(batch, output_height, output_width, channels, &output_elements)) return 0;
-    padded_height = (uint64_t)input_height + padding_top + padding_bottom;
-    padded_width = (uint64_t)input_width + padding_left + padding_right;
-    if (padded_height < kernel_y || padded_width < kernel_x) return 0;
-    expected_height = (padded_height - kernel_y) / stride_y + 1u;
-    expected_width = (padded_width - kernel_x) / stride_x + 1u;
-    if (expected_height != output_height || expected_width != output_width) return 0;
-    size_t packed_output_bytes;
-    if (!graph_packed_bytes(output_elements, &packed_output_bytes)) return 0;
-    OglTensorSlot* input_slot = graph_ensure_packed_bytes(input, input_elements, 0);
-    OglTensorSlot* output_slot = graph_output_packed_bytes(output, output_elements);
-    if (!input_slot || !output_slot) return 0;
-    OglTypedMaxPoolParams params = {
-        batch, input_height, input_width, channels, output_height, output_width,
-        kernel_y, kernel_x, stride_y, stride_x, padding_top, padding_left,
-        input_dtype, 0u, 0u, 0u
-    };
-    GLuint pb = params_buffer(&params, sizeof(params));
-    GLuint bufs[3] = {input_slot->buffer, output_slot->buffer, pb};
-    int ok = dispatch_kernel(&k_maxpool_typed_i8u8, bufs, typed_shape_packed_groups(packed_output_bytes), 1u, 1u);
-    if (pb) p_glDeleteBuffers(1, &pb);
-    if (!ok) return 0;
-    graph_mark_device(output_slot);
-    return 1;
-}
-
-int opengl_graph_resize_nearest_i8u8(const void* input, void* output,
-                                     uint32_t batch, uint32_t input_height, uint32_t input_width, uint32_t channels,
-                                     uint32_t output_height, uint32_t output_width, float input_scale,
-                                     int32_t input_zero_point, float output_scale, int32_t output_zero_point,
-                                     uint32_t input_dtype, uint32_t output_dtype) {
-    uint32_t input_elements, output_elements;
-    if (!ogl_ready() || max_ssbo_bindings < 2 || max_uniform_bindings < 1 || !input || !output || input == output ||
-        !typed_shape_qdesc_same(input_scale, input_zero_point, input_dtype, output_scale, output_zero_point, output_dtype) ||
-        !typed_shape_nhwc_elements(batch, input_height, input_width, channels, &input_elements) ||
-        !typed_shape_nhwc_elements(batch, output_height, output_width, channels, &output_elements)) return 0;
-    size_t packed_output_bytes;
-    if (!graph_packed_bytes(output_elements, &packed_output_bytes)) return 0;
-    OglTensorSlot* input_slot = graph_ensure_packed_bytes(input, input_elements, 0);
-    OglTensorSlot* output_slot = graph_output_packed_bytes(output, output_elements);
-    if (!input_slot || !output_slot) return 0;
-    OglTypedResizeParams params = {batch, input_height, input_width, channels, output_height, output_width, 0u, 0u};
-    GLuint pb = params_buffer(&params, sizeof(params));
-    GLuint bufs[3] = {input_slot->buffer, output_slot->buffer, pb};
-    int ok = dispatch_kernel(&k_resize_nearest_typed_i8u8, bufs, typed_shape_packed_groups(packed_output_bytes), 1u, 1u);
-    if (pb) p_glDeleteBuffers(1, &pb);
-    if (!ok) return 0;
-    graph_mark_device(output_slot);
-    return 1;
-}
-
-int opengl_graph_quantize_linear_i8(const float* in, signed char* out, long n,
-                                    float input_scale, int input_zp,
-                                    float output_scale, int output_zp) {
-    if (!in || !out || n <= 0 || output_scale <= 0.0f) return 0;
-    size_t in_bytes = (size_t)n * sizeof(float);
-    size_t packed_words = ((size_t)n + 3u) / 4u;
-    size_t out_bytes = packed_words * sizeof(uint32_t);
-    OglTensorSlot* src = graph_ensure_device(in, in_bytes, 0);
-    OglTensorSlot* dst = graph_output_slot(out, out_bytes);
-    if (!src || !dst) return 0;
-    struct {
-        uint32_t size;
-        int32_t input_zp;
-        int32_t output_zp;
-        uint32_t has_input_scale;
-        float input_scale;
-        float output_scale;
-        uint32_t pad0;
-        uint32_t pad1;
-    } params = {
-        (uint32_t)n, (int32_t)input_zp, (int32_t)output_zp,
-        input_scale > 0.0f ? 1u : 0u, input_scale, output_scale, 0u, 0u
-    };
-    GLuint pb = params_buffer(&params, sizeof(params));
-    GLuint bufs[3] = {src->buffer, dst->buffer, pb};
-    int ok = dispatch_kernel(&k_quantize, bufs, (uint32_t)((packed_words + 63u) / 64u), 1, 1);
-    if (pb) p_glDeleteBuffers(1, &pb);
-    if (!ok) return 0;
-    graph_mark_device(dst);
-    return opengl_graph_sync_host(out, (size_t)n, 0);
-}
-
-static int opengl_graph_profile_common(const OglKernel* kernel, const float* in,
-                                       float* out,
-                                       int n, int h, int w, int c, long out_elems_per_batch,
-                                       uint32_t gx, uint32_t gy) {
-    if (!kernel || !in || !out || n <= 0 || h <= 0 || w <= 0 || c <= 0 || out_elems_per_batch <= 0) return 0;
-    size_t in_bytes = (size_t)n * (size_t)h * (size_t)w * (size_t)c * sizeof(float);
-    size_t out_bytes = (size_t)n * (size_t)out_elems_per_batch * sizeof(float);
-    OglTensorSlot* src = graph_ensure_device(in, in_bytes, 0);
-    OglTensorSlot* dst = graph_output_slot(out, out_bytes);
-    if (!src || !dst) return 0;
-    uint32_t params[4] = {(uint32_t)h, (uint32_t)w, (uint32_t)c, (uint32_t)n};
-    GLuint pb = params_buffer(params, sizeof(params));
-    GLuint bufs[3] = {src->buffer, dst->buffer, pb};
-    int ok = dispatch_kernel(kernel, bufs, gx, gy, (uint32_t)n);
-    if (pb) p_glDeleteBuffers(1, &pb);
-    if (!ok) return 0;
-    graph_mark_device(dst);
-    return 1;
-}
+#include "opengl_graph_quantized.inc"
 
 int opengl_graph_spatial_softargmax_y_f32(const float* in, float* out, int n, int h, int w, int c) {
     return opengl_graph_profile_common(&k_spatial_softargmax_y, in, out, n, h, w, c,
@@ -5546,7 +2361,8 @@ int opengl_graph_conv2d_f32(const float* in, float* out, const float* w, const f
     GLuint pb = params_buffer(params, sizeof(params));
     GLuint bufs[5] = {src->buffer, wt->buffer, bias_buffer, dst->buffer, pb};
     const OglKernel* kernel = &k_conv2d;
-    uint32_t gz = (uint32_t)(n * out_c);
+    uint32_t generic_gz = (uint32_t)(n * out_c);
+    uint32_t gz = generic_gz;
     if (groups == 1 && c == 3 && (out_c & 15) == 0) {
         kernel = &k_conv2d_c3out16;
         gz = (uint32_t)(n * (out_c / 16));
@@ -5568,20 +2384,34 @@ int opengl_graph_conv2d_f32(const float* in, float* out, const float* w, const f
             kernel = &k_conv2d_pw8;
             gz = (uint32_t)(n * ((out_c + 7) / 8));
         }
+    } else if (groups == 1 && (out_c & 15) == 0) {
+        kernel = &k_conv2d_out16;
+        gz = (uint32_t)(n * (out_c / 16));
     }
     uint32_t gx = ((uint32_t)out_w + 7u) / 8u;
     uint32_t gy = ((uint32_t)out_h + 7u) / 8u;
+    int generic_geometry_valid =
+        opengl_dispatch_dimensions_valid(gx, gy, generic_gz);
     int ok = dispatch_kernel(kernel, bufs, gx, gy, gz);
+#ifdef VOLVOX_OPENGL_TESTING
+    if (ok && kernel == &k_conv2d_out16)
+        opengl_context_state_get(0)->test_conv_out16_dispatch_count++;
+#endif
     if (!ok && kernel != &k_conv2d) {
         if (kernel == &k_conv2d_pw16tile) {
             ok = dispatch_kernel(&k_conv2d_pw16, bufs, gx, gy, (uint32_t)(n * (out_c / 16)));
         }
-        if (!ok && kernel == &k_conv2d_c3out16) ok = dispatch_kernel(&k_conv2d, bufs, gx, gy, (uint32_t)(n * out_c));
+        if (!ok && generic_geometry_valid &&
+            kernel == &k_conv2d_c3out16)
+            ok = dispatch_kernel(&k_conv2d, bufs, gx, gy, generic_gz);
+        if (!ok && generic_geometry_valid && kernel == &k_conv2d_out16)
+            ok = dispatch_kernel(&k_conv2d, bufs, gx, gy, generic_gz);
         if (!ok && (kernel == &k_conv2d_pw8v4 || kernel == &k_conv2d_pw8v2)) {
             ok = dispatch_kernel(&k_conv2d_pw8, bufs, gx, gy, (uint32_t)(n * ((out_c + 7) / 8)));
         }
         if (!ok && kernel == &k_conv2d_pw16) ok = dispatch_kernel(&k_conv2d_pw8, bufs, gx, gy, (uint32_t)(n * ((out_c + 7) / 8)));
-        if (!ok) ok = dispatch_kernel(&k_conv2d, bufs, gx, gy, (uint32_t)(n * out_c));
+        if (!ok && generic_geometry_valid)
+            ok = dispatch_kernel(&k_conv2d, bufs, gx, gy, generic_gz);
     }
     if (pb) p_glDeleteBuffers(1, &pb);
     if (temp_bias) p_glDeleteBuffers(1, &temp_bias);
@@ -5802,6 +2632,11 @@ static void opengl_context_resources_release_locked(OpenGLContextState* state,
     }
     state->qlayernorm_scratch_buffer = 0;
     state->qlayernorm_scratch_capacity = 0;
+    if (gl_current && state->dispatch_params_buffer) {
+        opengl_driver_delete_buffers(1, &state->dispatch_params_buffer);
+    }
+    state->dispatch_params_buffer = 0;
+    state->dispatch_params_upload_count = 0;
     qconv_zero_bias_release_state(state);
     free(state->shape_signature);
     state->shape_signature = NULL;

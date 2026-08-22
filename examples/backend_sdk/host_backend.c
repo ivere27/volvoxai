@@ -399,6 +399,8 @@ static void example_context_destroy(void* context_instance) {
 
 VxStatus volvoxai_example_host_backend_register(VxRuntime* runtime,
                                                 VxReport* report) {
+    /* This descriptor is source-level, latest-only composition: the numeric
+     * ABI discriminator never substitutes for exact current field layout. */
     const VxBackendProvider provider = {
         .struct_size = sizeof(VxBackendProvider),
         .abi_version = VX_BACKEND_ABI_VERSION,
@@ -418,6 +420,8 @@ VxStatus volvoxai_example_host_backend_register(VxRuntime* runtime,
         .context_select_adapter = NULL,
         .context_close = example_context_close,
         .context_destroy = example_context_destroy,
+        .exact_contract_marker = VX_BACKEND_PROVIDER_EXACT_CONTRACT_MARKER,
+        .exact_contract_extent = sizeof(VxBackendProvider),
     };
     return vx_runtime_register_provider(runtime, &provider, report);
 }

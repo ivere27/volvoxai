@@ -32,8 +32,7 @@ typedef enum {
     VOLVOXAI_BACKEND_VULKAN = 1,
     VOLVOXAI_BACKEND_OPENGL = 2,
     VOLVOXAI_BACKEND_METAL = 3,
-    VOLVOXAI_BACKEND_NNAPI = 4,
-    VOLVOXAI_BACKEND_CUDA = 6
+    VOLVOXAI_BACKEND_CUDA = 4
 } VolvoxAIEngineBackend;
 
 typedef struct {
@@ -264,6 +263,19 @@ int    volvoxai_engine_forward_incremental(void);
  * reported by incremental_row_supported(); provider-owned contexts and native
  * device graphs use their own complete-node execution contracts. */
 int    volvoxai_engine_forward_incremental_row(int row);
+/* A lane holding no request. It still occupies a row of the dense batch, so
+ * every operand keeps its shape; nothing is written back for it. */
+#define VOLVOXAI_DECODE_LANE_PARKED (-1)
+/* Refresh one row of every lane of a `[lanes,S,...]` batch, where
+ * `positions[lane]` is that lane's row and lanes may sit at different
+ * positions. `lanes` is declared here rather than read from a shape, because
+ * the leading extent of a sequence-major activation is its token count and
+ * inferring from it would run an S-lane step in a one-lane context.
+ *
+ * The per-row contract of forward_incremental_row() applies per lane. Refused
+ * when the graph contains an operator whose row path does not stage lanes; the
+ * caller falls back to forward_incremental(). */
+int    volvoxai_engine_forward_incremental_rows(const int* positions, int lanes);
 int    volvoxai_engine_incremental_row_supported(void);
 void   volvoxai_engine_incremental_reset(void);
 VolvoxAIDecodeSession* volvoxai_engine_decode_session_create(

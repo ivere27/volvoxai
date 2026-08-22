@@ -267,8 +267,10 @@ static void vx_gemm_f32_init_runtime_config(void) {
         nr = VX_GEMM_F32_NR_AVX2;
     }
 #elif VX_GEMM_F32_ARM_NEON
-    mr = VX_GEMM_F32_MR_NEON;
-    nr = VX_GEMM_F32_NR_NEON;
+    if (vx_kernel_platform()->has_neon) {
+        mr = VX_GEMM_F32_MR_NEON;
+        nr = VX_GEMM_F32_NR_NEON;
+    }
 #endif
     g_vx_gemm_f32_tile_config =
         vx_gemm_f32_make_tile_config(vx_gemm_f32_detect_l1_bytes(), mr, nr);
@@ -641,7 +643,8 @@ static int vx_gemm_f32_micro_kind(void) {
 #if VX_GEMM_F32_WASM_SIMD
     return VX_GEMM_F32_MICRO_WASM;
 #elif VX_GEMM_F32_ARM_NEON
-    return VX_GEMM_F32_MICRO_NEON;
+    return vx_kernel_platform()->has_neon
+        ? VX_GEMM_F32_MICRO_NEON : VX_GEMM_F32_MICRO_NONE;
 #elif VX_GEMM_F32_X86_AVX2
     if (vx_gemm_f32_has_avx512f()) return VX_GEMM_F32_MICRO_AVX512;
     return vx_gemm_f32_has_avx2_fma()

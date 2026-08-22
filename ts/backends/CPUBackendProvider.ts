@@ -3,6 +3,7 @@ import { CPUEngine } from './CPUEngine.js';
 import { CPUShapeExecutionContext } from '../core/CPUShapeExecutionContext.js';
 import type { BackendExecutionSnapshot } from '../core/ExecutionResult.js';
 import { Model } from '../core/Model.js';
+import type { ResolvedShapePlan } from '../core/ResolvedShapePlan.js';
 import {
   maximumCPUActivationArenaTensors,
   planCPUActivationArena,
@@ -14,12 +15,15 @@ import {
 import { runtimeSupportsOperator } from '../generated/kernelRegistry.js';
 import {
   VOLVOXAI_BACKEND_PROVIDER_VERSION,
+  createBackendProviderBatchContract,
+  createBackendProviderPreparedBatchRoute,
   createBackendDeviceIdentity,
   createBackendProviderCapabilities,
   requireHostExecutionInputs,
   type BackendDeviceIdentity,
   type BackendLogicalCompileInput,
   type BackendProvider,
+  type BackendProviderBatchContract,
   type BackendProviderCapabilities,
   type BackendProviderCompilationEvidence,
   type BackendProviderCompiledModel,
@@ -33,6 +37,11 @@ import {
   type PreparedProviderDecode,
   type ProviderDecodeTelemetry,
 } from './ProviderDecodeLifecycle.js';
+import type { RuntimeTypedArray } from '../types.js';
+import {
+  InvariantResourceStore,
+  type InvariantResourceLease,
+} from './InvariantResources.js';
 
 const CPU_CONTEXT_CAPACITY_LIMIT_BYTES = 512 * 1024 * 1024;
 const CPU_CONTEXT_RESIDENT_LIMIT_BYTES = 1024 * 1024 * 1024;
@@ -208,8 +217,8 @@ function cpuRegistryPreflight(input: BackendLogicalCompileInput): void {
   for (const node of input.graph.nodes) {
     if (!runtimeSupportsOperator('cpu-js', node.opType)) {
       throw new VolvoxAIError('BACKEND_UNSUPPORTED',
-        `Backend 'cpu' does not support operator '${node.opType}' at node '${node.id}'.`, {
-          phase: 'compilation', backend: 'cpu', node: node.id,
+        `Backend 'cpu-js' does not support operator '${node.opType}' at node '${node.id}'.`, {
+          phase: 'compilation', backend: 'cpu-js', node: node.id,
         });
     }
   }
@@ -244,7 +253,7 @@ function checkedCPUResourceDomain(input: BackendLogicalCompileInput): CPUResourc
   } catch (error) {
     throw new VolvoxAIError('BACKEND_UNSUPPORTED',
       `CPU resource proof failed: ${error instanceof Error ? error.message : String(error)}`, {
-        phase: 'compilation', backend: 'cpu', cause: error,
+        phase: 'compilation', backend: 'cpu-js', cause: error,
       });
   }
   let activationArenaBytes: bigint;
@@ -257,13 +266,13 @@ function checkedCPUResourceDomain(input: BackendLogicalCompileInput): CPUResourc
   } catch (error) {
     throw new VolvoxAIError('BACKEND_UNSUPPORTED',
       `CPU topology-liveness proof failed: ${error instanceof Error ? error.message : String(error)}`, {
-        phase: 'compilation', backend: 'cpu', cause: error,
+        phase: 'compilation', backend: 'cpu-js', cause: error,
       });
   }
 
-  // The compiled Model retains its immutable payload while a
-  // context owns a separate invariant-weight materialization, so every phase
-  // carries two complete raw weight revisions.
+  // The compiled Model retains its immutable payload while the compiled
+  // provider owner holds one invariant-weight materialization, so every phase
+  // carries two complete raw weight revisions regardless of context count.
   const residentWeights = weightBytes * 2n;
   const ordinaryInitial = checkedResourceAdd(residentWeights, activationArenaBytes);
   const ordinaryTransaction = input.snapshot.isStatic
@@ -298,14 +307,14 @@ function checkedCPUResourceDomain(input: BackendLogicalCompileInput): CPUResourc
     throw new VolvoxAIError('BACKEND_UNSUPPORTED',
       `CPU bounded-domain activation arena requires ${activationArenaBytes} bytes, exceeding ` +
       `the committed-capacity limit ${CPU_CONTEXT_CAPACITY_LIMIT_BYTES}.`, {
-        phase: 'compilation', backend: 'cpu',
+        phase: 'compilation', backend: 'cpu-js',
       });
   }
   if (maximumResidentBytes > BigInt(CPU_CONTEXT_RESIDENT_LIMIT_BYTES)) {
     throw new VolvoxAIError('BACKEND_UNSUPPORTED',
       `CPU bounded-domain resident resources require ${maximumResidentBytes} bytes, exceeding ` +
       `the resident/transaction limit ${CPU_CONTEXT_RESIDENT_LIMIT_BYTES}.`, {
-        phase: 'compilation', backend: 'cpu',
+        phase: 'compilation', backend: 'cpu-js',
       });
   }
   const decodeContextSupported = persistentActivationBytes <=
@@ -330,7 +339,7 @@ function checkedCPUResourceDomain(input: BackendLogicalCompileInput): CPUResourc
 
 /** Context-local concrete CPU bridge. Shape inference has already happened. */
 class CPUProviderExecutionContext implements BackendProviderExecutionContext {
-  readonly backendName = 'cpu';
+  readonly backendName = 'cpu-js';
   readonly #context: CPUShapeExecutionContext;
   readonly #decode: ProviderDecodeLifecycle;
   readonly #decodeEnabled: boolean;
@@ -338,16 +347,22 @@ class CPUProviderExecutionContext implements BackendProviderExecutionContext {
 
   constructor(
     snapshot: Model,
-    options: BackendProviderContextOptions | undefined,
+    options: BackendProviderContextOptions,
     decodeEnabled: boolean,
+    invariantWeights: InvariantResourceLease<RuntimeTypedArray>,
   ) {
     this.#context = new CPUShapeExecutionContext(snapshot, {
       activationStorage: decodeEnabled ? 'persistent' : 'liveness',
+      invariantWeightBorrow: invariantWeights,
     });
     this.#decodeEnabled = decodeEnabled;
     this.#decode = new ProviderDecodeLifecycle(snapshot, this.backendName, {
       incrementalExecution: true,
       incrementalRows: true,
+      /* The row executor stages every lane's rows into one dense span and runs
+       * each node once over all of them, so more than one lane costs the same
+       * number of dispatches as one. */
+      batchedRows: true,
     }, options?.decode);
   }
 
@@ -510,24 +525,42 @@ class CPUProviderExecutionContext implements BackendProviderExecutionContext {
 }
 
 class CPUProviderCompiledModel implements BackendProviderCompiledModel {
-  readonly backendName = 'cpu';
+  readonly backendName = 'cpu-js';
+  readonly batchContract: Readonly<BackendProviderBatchContract>;
   readonly compilationEvidence: Readonly<BackendProviderCompilationEvidence>;
+  readonly invariantResources: InvariantResourceStore<RuntimeTypedArray>;
   readonly #snapshot: Model;
   readonly #resources: CPUResourceDomainProof;
+  readonly #resourceDomain: object;
   #closed = false;
 
   constructor(
     input: BackendLogicalCompileInput,
     deviceIdentity: BackendDeviceIdentity | null,
     resources: CPUResourceDomainProof,
+    resourceDomain: object,
   ) {
+    const batchSemantics = input.batchSemantics;
+    this.batchContract = createBackendProviderBatchContract('single-invocation', {
+      independentBatch: batchSemantics.supported
+        ? 'compiler-proved/v1'
+        : 'unsupported',
+    });
     this.#snapshot = input.snapshot;
     this.#resources = resources;
+    this.#resourceDomain = resourceDomain;
+    this.invariantResources = new InvariantResourceStore(
+      (value: RuntimeTypedArray) => value.byteLength,
+    );
+    for (const name of this.#snapshot.weightNames) {
+      this.invariantResources.defineLazy(name, () => this.#snapshot.copyWeightData(name));
+    }
     this.compilationEvidence = Object.freeze({
       device: deviceIdentity,
       allocationBytes: 0,
       operatorFallbackUsed: false,
       offendingNode: null,
+      batchSemantics,
       shapeDomain: Object.freeze({
         proofProtocol: 'canonical-symbolic-domain-proof/v1' as const,
         resourceProtocol: 'bounded-resource-maxima/v1' as const,
@@ -551,11 +584,39 @@ class CPUProviderCompiledModel implements BackendProviderCompiledModel {
     });
   }
 
-  createContext(options?: BackendProviderContextOptions): BackendProviderExecutionContext {
+  prepareBatchRoute(plan: ResolvedShapePlan) {
     if (this.#closed) {
       throw new VolvoxAIError('HANDLE_DISPOSED', 'Compiled backend model is closed.', {
         phase: 'lifecycle', backend: this.backendName,
       });
+    }
+    if (plan.graphFingerprint !== this.#snapshot.definitionFingerprint) {
+      throw new VolvoxAIError('INVALID_ARGUMENT',
+        'CPU batch route requires a plan from its compiled logical model.', {
+          phase: 'execution', backend: this.backendName,
+        });
+    }
+    return createBackendProviderPreparedBatchRoute(
+      this.#resourceDomain, plan.signature, this.invariantResources.deviceEpoch,
+    );
+  }
+
+  createContext(options: BackendProviderContextOptions): BackendProviderExecutionContext {
+    if (this.#closed) {
+      throw new VolvoxAIError('HANDLE_DISPOSED', 'Compiled backend model is closed.', {
+        phase: 'lifecycle', backend: this.backendName,
+      });
+    }
+    const invariantWeights = options?.invariantResources as
+      Partial<InvariantResourceLease<RuntimeTypedArray>> | undefined;
+    if (!invariantWeights ||
+        invariantWeights.ownerIdentity !== this.invariantResources.ownerIdentity ||
+        invariantWeights.deviceEpoch !== this.invariantResources.deviceEpoch ||
+        typeof invariantWeights.borrow !== 'function') {
+      throw new VolvoxAIError('ABI_UNSUPPORTED',
+        'CPU context requires the exact compiled-model invariant resource lease.', {
+          phase: 'compilation', backend: this.backendName,
+        });
     }
     const decodeEnabled = options?.decode !== undefined;
     if (decodeEnabled && !this.#resources.decodeContextSupported) {
@@ -574,10 +635,17 @@ class CPUProviderCompiledModel implements BackendProviderCompiledModel {
           phase: 'compilation', backend: this.backendName,
         });
     }
-    return new CPUProviderExecutionContext(this.#snapshot, options, decodeEnabled);
+    return new CPUProviderExecutionContext(
+      this.#snapshot,
+      options,
+      decodeEnabled,
+      invariantWeights as InvariantResourceLease<RuntimeTypedArray>,
+    );
   }
 
   async close(): Promise<void> {
+    if (this.#closed) return;
+    this.invariantResources.close();
     this.#closed = true;
   }
 }
@@ -585,10 +653,11 @@ class CPUProviderCompiledModel implements BackendProviderCompiledModel {
 /** Main-profile CPU provider, split out so WASM-only composition stays CPU-free. */
 export class CPUBackendProvider implements BackendProvider {
   readonly providerVersion = VOLVOXAI_BACKEND_PROVIDER_VERSION;
-  readonly backendName = 'cpu';
+  readonly backendName = 'cpu-js';
   readonly capabilities: Readonly<BackendProviderCapabilities>;
   readonly deviceIdentity: BackendDeviceIdentity | null;
   readonly #source: CPUEngine;
+  readonly #resourceDomain = Object.freeze({});
   #closed = false;
 
   constructor(source: CPUEngine) {
@@ -601,7 +670,7 @@ export class CPUBackendProvider implements BackendProvider {
     this.deviceIdentity = createBackendDeviceIdentity(
       (source as CPUEngine & { adapterInfo?: Readonly<Record<string, string>> | null }).adapterInfo,
     ) || Object.freeze({
-      backend: 'cpu',
+      backend: 'cpu-js',
       device: 'host',
     });
   }
@@ -611,8 +680,8 @@ export class CPUBackendProvider implements BackendProvider {
     options: BackendProviderCompileOptions,
   ): Promise<BackendProviderCompiledModel> {
     if (this.#closed) {
-      throw new VolvoxAIError('HANDLE_DISPOSED', "Backend provider 'cpu' is closed.", {
-        phase: 'lifecycle', backend: 'cpu',
+      throw new VolvoxAIError('HANDLE_DISPOSED', "Backend provider 'cpu-js' is closed.", {
+        phase: 'lifecycle', backend: 'cpu-js',
       });
     }
     if (!(input?.snapshot instanceof Model) ||
@@ -620,18 +689,23 @@ export class CPUBackendProvider implements BackendProvider {
         input.graphFingerprint !== input.snapshot.definitionFingerprint) {
       throw new VolvoxAIError('INVALID_ARGUMENT',
         'CPU provider compile requires the exact immutable logical compile view.', {
-          phase: 'compilation', backend: 'cpu',
+          phase: 'compilation', backend: 'cpu-js',
         });
     }
     if (options.operatorFallback === 'forbid' && this.capabilities.operatorFallback !== 'none') {
       throw new VolvoxAIError('OPERATOR_FALLBACK_FORBIDDEN',
-        "Backend 'cpu' cannot attest strict operator routing.", {
-          phase: 'compilation', backend: 'cpu',
+        "Backend 'cpu-js' cannot attest strict operator routing.", {
+          phase: 'compilation', backend: 'cpu-js',
         });
     }
     cpuRegistryPreflight(input);
     const resources = checkedCPUResourceDomain(input);
-    return new CPUProviderCompiledModel(input, this.deviceIdentity, resources);
+    return new CPUProviderCompiledModel(
+      input,
+      this.deviceIdentity,
+      resources,
+      this.#resourceDomain,
+    );
   }
 
   async close(): Promise<void> {

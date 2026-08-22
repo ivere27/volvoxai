@@ -96,7 +96,7 @@ fp16  (2바이트)  [S][ 5비트 지수 ][   10비트 가수   ]          ~십�
 out[i] = (in[i] - zero_point) * scale;     // int8 → 실수
 ```
 
-양자화(`native/src/kernels/quant_cpu_opt.c`, `quantize_scalar_i8`):
+양자화(`native/src/kernels/quant_cpu_isa.c`, `quantize_scalar_i8`):
 
 ```c
 q = clamp_i8( lrintf(x / scale) + zero_point );   // 실수 → int8, [-128,127]로 클램프
@@ -157,7 +157,7 @@ q = clamp_i8( lrintf(x / scale) + zero_point );   // 실수 → int8, [-128,127]
 > 틱당 더 많은 곱셈-덧셈을 하게 합니다.
 
 🔬 양자화 합성곱은 무거운 곱셈-누적 루프를 **값싼 정수 산술** 로 하고, 맨 끝에서 딱 한 번만 실수로
-되돌립니다. 출력 값 하나의 파이프라인(`native/src/kernels/quant_cpu_opt.c`):
+되돌립니다. 출력 값 하나의 파이프라인(`native/src/kernels/quant_cpu_isa.c`):
 
 ```mermaid
 flowchart LR
@@ -182,7 +182,7 @@ flowchart LR
 
 핵심 통찰: **활성화가 층에서 층으로 int8로 유지**("양자화 섬")되어 백본 전체가 바이트로 돕니다. 맨
 끝에서만 `DequantizeLinear` 가 최종 `scores`/`boxes` 를 읽을 수 있는 실수로 되돌립니다. 이것이
-정확히 VolvoxAI의 네이티브 CPU 경로가 하는 것이고(`native/src/kernels/quant_cpu_opt.c`), 브라우저
+정확히 VolvoxAI의 네이티브 CPU 경로가 하는 것이고(`native/src/kernels/quant_cpu_isa.c`), 브라우저
 계층은 대신 로드 시점에 int8 conv 가중치를 fp32로 되접습니다(더 단순, 디스크는 여전히 작음).
 
 > 🔬 **뜯어보기: 왜 int32이고, 재양자화 승수.** 누산기가 **int32** 인 이유는 int8들의 닷 프로덕트가

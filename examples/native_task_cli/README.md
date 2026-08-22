@@ -85,7 +85,7 @@ input requires its concrete shape, for example
 rank, bounds, symbol equality, and exact file byte length before execution.
 
 CPU is the default backend. Pass at most one of `--vulkan`, `--opengl`,
-`--metal`, `--nnapi`, or `--cuda`; an explicitly requested unavailable backend is an
+`--metal`, or `--cuda`; an explicitly requested unavailable backend is an
 error. The application translates this choice into `VxBackendPolicy`, compiles
 through `vx_model_compile()`, and executes through opaque
 `VxExecutionContext` handles. It uses only the public runtime and

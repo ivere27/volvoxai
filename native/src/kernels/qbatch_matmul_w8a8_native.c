@@ -1,5 +1,5 @@
 /*
- * Native CPU acceleration for the canonical physical W8A8 QBatchMatMul ABI.
+ * Native CPU acceleration for the canonical W8A8 QBatchMatMul ABI.
  *
  * The portable qbatch_matmul_i8u8() implementation remains the scalar oracle
  * and the WASM export.  Native x86 builds use a centered-I16 AVX2 packed
@@ -42,10 +42,33 @@ extern int qbatch_matmul_i8u8(const void *a, const void *b, void *output,
 #define VX_QBMM_ARM_NEON 0
 #endif
 
+#if defined(VOLVOXAI_ARM_I8MM_OBJECT) && defined(__aarch64__)
+#define VX_QBMM_ARM_I8MM 1
+
+/* This target-specific entry is compiled in a separate +i8mm object.  The
+ * baseline dispatcher passes the already-validated affine descriptor and
+ * reaches it only after HWCAP2_I8MM admission. */
+extern int vx_qbatch_matmul_i8u8_arm_i8mm_try(
+        const void *a, const void *b, void *output,
+        uint32_t m, uint32_t k, uint32_t n,
+        int32_t a_zero_point, int32_t b_zero_point,
+        int32_t output_zero_point, uint32_t a_dtype, uint32_t b_dtype,
+        uint32_t output_dtype, int32_t output_minimum,
+        int32_t output_maximum, float multiplier,
+        void *workspace, size_t workspace_bytes,
+        uint32_t panel_column_blocks);
+#else
+#define VX_QBMM_ARM_I8MM 0
+#endif
+
 enum {
     VX_QBMM_I8 = VX_DTYPE_I8,
     VX_QBMM_U8 = VX_DTYPE_U8,
     VX_QBMM_PARALLEL_PRODUCTS = 1024u * 1024u,
+    /* Dynamic B is packed only for the duration of this call.  The cap keeps
+     * typed context scratch independent of a graph's complete KxN extent. */
+    VX_QBMM_ARM_I8MM_WORKSPACE_LIMIT = 64u * 1024u,
+    VX_QBMM_ARM_I8MM_COLUMN_BLOCKS_MAX = 8u,
 };
 
 typedef struct {
@@ -203,12 +226,48 @@ static int vx_qbmm_workspace_layout(uint32_t m, uint32_t k, uint32_t n,
 }
 #endif
 
+#if VX_QBMM_ARM_I8MM
+/* One N8/K8 SMMLA block contains 64 signed bytes.  Its eight I32 column sums
+ * live in the same caller-owned workspace.  Reducing the number of N8 blocks
+ * per panel, rather than allocating a complete KxN copy, bounds every call at
+ * 64 KiB while still packing each B byte exactly once. */
+static int vx_qbmm_arm_i8mm_workspace_layout(
+        uint32_t m, uint32_t k, uint32_t n,
+        uint32_t *panel_column_blocks, size_t *total_bytes) {
+    uint64_t bytes_per_column_block;
+    uint32_t blocks;
+    uint32_t available_blocks;
+    if (m < 4u || k < 16u || n < 8u)
+        return 0;
+    bytes_per_column_block = (uint64_t)(k / 8u + (k % 8u != 0u)) * 64u +
+        8u * sizeof(int32_t);
+    if (!bytes_per_column_block ||
+        bytes_per_column_block > VX_QBMM_ARM_I8MM_WORKSPACE_LIMIT)
+        return 0;
+    blocks = n / 8u + (n % 8u != 0u);
+    if (blocks > VX_QBMM_ARM_I8MM_COLUMN_BLOCKS_MAX)
+        blocks = VX_QBMM_ARM_I8MM_COLUMN_BLOCKS_MAX;
+    available_blocks = (uint32_t)(
+        VX_QBMM_ARM_I8MM_WORKSPACE_LIMIT / bytes_per_column_block);
+    if (blocks > available_blocks) blocks = available_blocks;
+    if (!blocks) return 0;
+    if (panel_column_blocks) *panel_column_blocks = blocks;
+    if (total_bytes)
+        *total_bytes = (size_t)(bytes_per_column_block * blocks);
+    return 1;
+}
+#endif
+
 size_t vx_qbatch_matmul_i8u8_native_workspace_bytes(
         uint32_t m, uint32_t k, uint32_t n) {
 #if VX_QBMM_X86_AVX2
     size_t total_bytes = 0;
     return vx_qbmm_workspace_layout(
         m, k, n, NULL, NULL, &total_bytes) ? total_bytes : 0u;
+#elif VX_QBMM_ARM_I8MM
+    size_t total_bytes = 0u;
+    return vx_qbmm_arm_i8mm_workspace_layout(
+        m, k, n, NULL, &total_bytes) ? total_bytes : 0u;
 #else
     (void)m;
     (void)k;
@@ -729,12 +788,12 @@ static VX_QBMM_TARGET_AVX2 void vx_qbmm_avx2_packed_range(
 #endif
 
 #if VX_QBMM_ARM_NEON
-/* The K-major right matrix exposes consecutive output columns, so widening
- * eight B bytes and multiplying by one centered activation is preferable to
- * transposing into an SDOT layout.  QLinear/QConv retain their separately
- * compiled SDOT kernels; this dynamic-matrix operation uses baseline NEON. */
-static void vx_qbmm_neon_range(const VxQBatchMatMulCall *call,
-                              uint32_t begin, uint32_t end) {
+/* The allocation-free fallback consumes the K-major right matrix directly.
+ * Widening eight consecutive B bytes and multiplying by one centered
+ * activation avoids a transient transpose when I8MM scratch is unavailable
+ * or the shape is below its admission threshold. */
+static void vx_qbmm_neon_mr1_range(const VxQBatchMatMulCall *call,
+                                   uint32_t begin, uint32_t end) {
     for (uint32_t row = begin; row < end; row++) {
         const size_t a_offset = (size_t)row * call->k;
         uint32_t column = 0;
@@ -770,6 +829,65 @@ static void vx_qbmm_neon_range(const VxQBatchMatMulCall *call,
         }
         vx_qbmm_scalar_tail(call, row, column);
     }
+}
+
+/* Attention multiplies reuse the same K-major B row for many query rows.
+ * Keep four query rows live so each widened B vector feeds four independent
+ * accumulator pairs instead of being loaded and centered four times. */
+static void vx_qbmm_neon_mr4_range(const VxQBatchMatMulCall *call,
+                                   uint32_t begin, uint32_t end) {
+    uint32_t row = begin;
+    for (; row + 4u <= end; row += 4u) {
+        uint32_t column = 0;
+        for (; column + 8u <= call->n; column += 8u) {
+            int32x4_t accumulator_lo[4] = {
+                vdupq_n_s32(0), vdupq_n_s32(0),
+                vdupq_n_s32(0), vdupq_n_s32(0),
+            };
+            int32x4_t accumulator_hi[4] = {
+                vdupq_n_s32(0), vdupq_n_s32(0),
+                vdupq_n_s32(0), vdupq_n_s32(0),
+            };
+            for (uint32_t inner = 0; inner < call->k; inner++) {
+                int16x8_t b_i16;
+                if (call->b_dtype == VX_QBMM_I8) {
+                    b_i16 = vmovl_s8(vld1_s8((const int8_t *)(const void *)(
+                        call->b + (size_t)inner * call->n + column)));
+                } else {
+                    b_i16 = vreinterpretq_s16_u16(vmovl_u8(vld1_u8(
+                        call->b + (size_t)inner * call->n + column)));
+                }
+                b_i16 = vsubq_s16(
+                    b_i16, vdupq_n_s16((int16_t)call->b_zero_point));
+                const int16x4_t b_lo = vget_low_s16(b_i16);
+                const int16x4_t b_hi = vget_high_s16(b_i16);
+                for (uint32_t row_lane = 0; row_lane < 4u; row_lane++) {
+                    const int16_t a_centered = (int16_t)(vx_w8a8_byte_value(
+                        call->a, call->a_dtype,
+                        (size_t)(row + row_lane) * call->k + inner) -
+                        call->a_zero_point);
+                    accumulator_lo[row_lane] = vaddq_s32(
+                        accumulator_lo[row_lane],
+                        vmull_n_s16(b_lo, a_centered));
+                    accumulator_hi[row_lane] = vaddq_s32(
+                        accumulator_hi[row_lane],
+                        vmull_n_s16(b_hi, a_centered));
+                }
+            }
+            for (uint32_t row_lane = 0; row_lane < 4u; row_lane++) {
+                int32_t accumulators[8];
+                vst1q_s32(accumulators, accumulator_lo[row_lane]);
+                vst1q_s32(accumulators + 4, accumulator_hi[row_lane]);
+                for (uint32_t lane = 0; lane < 8u; lane++)
+                    vx_qbmm_store(call,
+                        (size_t)(row + row_lane) * call->n + column + lane,
+                        accumulators[lane]);
+            }
+        }
+        for (uint32_t row_lane = 0; row_lane < 4u; row_lane++)
+            vx_qbmm_scalar_tail(call, row + row_lane, column);
+    }
+    vx_qbmm_neon_mr1_range(call, row, end);
 }
 #endif
 
@@ -829,9 +947,26 @@ int vx_qbatch_matmul_i8u8_native_with_workspace(
                 return vx_qbmm_run(&call, vx_qbmm_avx2_mr4_range);
         }
 #endif
+#if VX_QBMM_ARM_I8MM
+        if (vx_kernel_platform()->has_arm_i8mm) {
+            uint32_t panel_column_blocks = 0u;
+            size_t required_bytes = 0u;
+            if (vx_qbmm_arm_i8mm_workspace_layout(
+                    m, k, n, &panel_column_blocks, &required_bytes) &&
+                workspace && workspace_bytes >= required_bytes &&
+                (uintptr_t)workspace % _Alignof(int32_t) == 0u &&
+                vx_qbatch_matmul_i8u8_arm_i8mm_try(
+                    a, b, output, m, k, n, a_zero_point, b_zero_point,
+                    output_zero_point, a_dtype, b_dtype, output_dtype,
+                    call.output_minimum, call.output_maximum, call.multiplier,
+                    workspace, workspace_bytes, panel_column_blocks))
+                return 1;
+        }
+#endif
 #if VX_QBMM_ARM_NEON
         if (n >= 8u && vx_kernel_platform()->has_neon)
-            return vx_qbmm_run(&call, vx_qbmm_neon_range);
+            return vx_qbmm_run(&call, m >= 4u
+                ? vx_qbmm_neon_mr4_range : vx_qbmm_neon_mr1_range);
 #endif
     }
     return qbatch_matmul_i8u8(

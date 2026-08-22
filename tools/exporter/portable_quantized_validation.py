@@ -298,7 +298,7 @@ class _Validator:
         ):
             self._reject(
                 node,
-                "must use canonical physical I8/U8 NHWC/OHWI storage, per-tensor activation metadata, axis-0 per-channel weight metadata, and optional I32 bias",
+                "must use canonical I8/U8 NHWC/OHWI storage, per-tensor activation metadata, axis-0 per-channel weight metadata, and optional I32 bias",
             )
         if (
             len(activation.shape) != 4

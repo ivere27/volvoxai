@@ -241,7 +241,6 @@ static int parse_common_option(int argc, char** argv, int* index,
     if (!strcmp(argument, "--vulkan")) backend = "vulkan";
     else if (!strcmp(argument, "--opengl")) backend = "opengl";
     else if (!strcmp(argument, "--metal")) backend = "metal";
-    else if (!strcmp(argument, "--nnapi")) backend = "nnapi";
     else if (!strcmp(argument, "--cuda")) backend = "cuda";
     if (backend) return select_backend(options, backend) == 0 ? 1 : -1;
     if (!strcmp(argument, "--debug")) {
@@ -892,7 +891,7 @@ static void print_common_help(void) {
     printf("  --image <name[shape]=file>   Decode an image; shape is required for dynamic axes.\n");
     printf("  --image-normalize <mode>     zero-one, minus-one-one, or raw-255.\n");
     printf("  --output <name=file|file>    Write exact typed raw output data.\n");
-    printf("  --vulkan | --opengl | --metal | --nnapi | --cuda\n");
+    printf("  --vulkan | --opengl | --metal | --cuda\n");
     printf("  --debug\n");
 }
 

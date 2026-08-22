@@ -25,6 +25,8 @@ typedef struct VxBackend VxBackend;
 #define g_weight_files (vx_engine_state_current()->weight_files)
 #define g_weight_paths (vx_engine_state_current()->weight_paths)
 #define g_weight_file_count (vx_engine_state_current()->weight_file_count)
+#define g_weight_files_borrowed \
+    (vx_engine_state_current()->weight_files_borrowed)
 #define g_graph_root (vx_engine_state_current()->graph_root)
 #define g_first_input (vx_engine_state_current()->first_input)
 #define g_loaded (vx_engine_state_current()->loaded)
@@ -38,6 +40,8 @@ typedef struct VxBackend VxBackend;
 #define g_prefix_rows (vx_engine_state_current()->prefix_rows)
 #define g_prefix_row_capacity \
     (vx_engine_state_current()->prefix_row_capacity)
+#define g_decode_lanes (vx_engine_state_current()->decode_lanes)
+#define g_decode_rows (vx_engine_state_current()->decode_rows)
 #define g_kcache (vx_engine_state_current()->kcache)
 #define g_vcache (vx_engine_state_current()->vcache)
 #define g_qwcache (vx_engine_state_current()->qwcache)
@@ -116,7 +120,6 @@ typedef struct VxBackend VxBackend;
 #define g_vx_backend_registry (vx_engine_state_current()->backend_registry)
 
 #define g_use_vulkan (vx_engine_state_current()->use_vulkan)
-#define g_use_nnapi (vx_engine_state_current()->use_nnapi)
 #define g_use_opengl (vx_engine_state_current()->use_opengl)
 #define g_use_metal (vx_engine_state_current()->use_metal)
 #define g_use_cuda (vx_engine_state_current()->use_cuda)
@@ -149,6 +152,9 @@ int vx_runtime_backend_bind_shape_domain(
  * Backends without graph/cache telemetry append an empty string. */
 int vx_runtime_backend_append_dynamic_telemetry(char* output,
                                                 size_t output_capacity);
+/* Compact per-execution proof that must survive the public report prefix. */
+int vx_runtime_backend_execution_evidence(char* output,
+                                          size_t output_capacity);
 void vx_runtime_backend_teardown(void);
 void vx_runtime_backend_begin_forward(int ordinary_static_replay_eligible,
                                       uint64_t model_generation);
@@ -160,6 +166,7 @@ int vx_runtime_backend_sync_host(const void* host, size_t bytes, int is_weight);
 void vx_runtime_backend_retain_weight(const void* host, size_t bytes);
 void vx_runtime_backend_demote_weight(const void* host, size_t bytes);
 int vx_runtime_backend_has_graph(void);
+int vx_runtime_backend_has_device_rows(void);
 int vx_runtime_backend_stage(void);
 int vx_runtime_full_graph_execution_eligible(void);
 void vx_decode_session_invalidate_model_locked(void);
@@ -173,6 +180,11 @@ int vk_sync_host_tensor(T* t);
 void vk_mark_owned_tensors_host_dirty(void);
 char* read_file(const char* path, long* out_size);
 int volvoxai_engine_load_weight_files(const char* const* paths, int count);
+int volvoxai_engine_load_borrowed_weight_files(
+    const SafetensorsFile* files, const char* const* paths, int count);
+int volvoxai_engine_init_with_borrowed_weight_files(
+    const char* graph_path, const SafetensorsFile* weight_files,
+    const char* const* weight_file_paths, int weight_file_count);
 int build_graph(const char* graph_path);
 /* Load-time weight-bank residency; call before engine init. */
 int volvoxai_engine_add_bank_residency(const char* bank,
@@ -238,6 +250,11 @@ int run_node_cpu_direct(Node* n, int idx, int is_last);
 /* Side-effect-free preflight for canonical operators whose CPU implementation
  * can refresh exactly one [1,S,...] row after a device seed. */
 int vx_runtime_node_incremental_row_compatible(Node* n, int idx, int row);
+/* Whether this operator's row path stages the lanes of a declared batch.
+ * Asked by the row planner and again by the executor: the planner covers the
+ * device closure and the executor covers the CPU path, which reaches nodes
+ * without consulting the planner at all. */
+int vx_runtime_node_decode_batch_supported(const char* op);
 void prof_reset(void);
 void prof_add_entry(const char* op, double ms);
 void prof_report(void);

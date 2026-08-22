@@ -16,6 +16,29 @@ The dynamic-shape redesign is intentionally breaking. Existing packages and
 integrations will be rebuilt instead of maintaining two graph readers or an
 adapter that can silently confuse old and new v1 documents.
 
+## Considered alternatives
+
+Three shape systems were available. Each one satisfies half of what
+whole-domain compile-time proof requires, and fails the other half.
+
+| System | Named symbols | Finite bounds | Why it was rejected |
+| --- | :---: | :---: | --- |
+| Fixed concrete shapes | no | no | One package per shape. A variable sequence length or batch size forces either republication or padding to a worst case that is paid on every request. |
+| Unbounded named symbols | yes | no | A symbol carrying no maximum admits an infinite domain. No provider can attest tensor, scratch, address-space, buffer-binding, or dispatch maxima over it, so specialization is necessarily deferred to dispatch. That is the runtime discovery this ADR exists to remove. |
+| Per-tensor bounded profiles | no | yes | Bounds are declared per tensor, so one axis shared by two tensors becomes two independent ranges. The contract cannot state that the two extents are the same value; a mismatch is detected by whichever operator first contracts them, during execution, instead of being rejected at bind. |
+
+`volvox-graph/v1` takes both halves. A dimension symbol is **named**, so
+`["B", "S"]` and `["B", "S", 768]` denote one extent by construction and their
+equality is a schema fact rather than a runtime coincidence. A dimension symbol
+is also **bounded**, so `{ min, max, multiple_of }` closes the domain and makes
+conservative maxima computable.
+
+This pairing is not additive convenience; it is what makes the proof decidable
+at all. Bounds without symbols cannot express the equality and divisibility
+relations that a proof must discharge. Symbols without bounds leave every
+maximum unbounded, so there is nothing to attest. The bounded-domain
+qualification described below assumes both properties hold simultaneously.
+
 ## Decision
 
 ### One bounded, fixed-rank shape system
@@ -158,7 +181,8 @@ consumer's submitted work reaches a queue fence. Other providers and decode
 seed/step reject it explicitly.
 
 `VOLVOXAI_BACKEND_PROVIDER_VERSION`, `VX_BACKEND_ABI_VERSION`, and
-`VX_NATIVE_API_VERSION` are 1.
+`VX_NATIVE_API_VERSION` remain 1. The redesigned unreleased contracts replace
+their earlier drafts in place; no compatibility shim is provided.
 
 The provider shape-domain capability declares the proof and resource protocols
 directly. `volvox-graph/v1` defines the dynamic-shape semantics.
